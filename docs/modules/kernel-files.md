@@ -35,11 +35,23 @@ close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已
 扩容先在锁外分配并清零候选，锁内复查、最多复制 8 KiB 后发布，旧数组及竞争失败候选在锁外释放。
 open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
 共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；FD_CLOEXEC 仍属于各张表。
-`kernel_files_enable_concurrency()`只在 CPU0、独占未发布表上启用同 heap/allocator 匿名 pipe 域；
-启用前核对本表槽引用覆盖全部 OFD 引用，不同 OFD 的端点总数覆盖全部 pipe owner，等待队列没有域外登记或在途借用。
-普通 fork 表别名、重开 OFD、未结束 pin 或观察者使启用返回 STATE，全部检查通过后才发布；本表内 dup 不重复计端点。
+`kernel_files_enable_concurrency()`只在 CPU0、独占未发布表上接纳同 heap/allocator 匿名 pipe、tmpfs及受控ext4普通OFD。
+pipe启用前核对槽引用覆盖全部OFD引用、不同OFD覆盖全部端点，且没有域外登记或在途借用；普通fork别名、重开OFD或观察者使其返回STATE。
+普通OFD在FD raw外核对真实inode、实例预算及受控缓存；调用者必须另持CPU0控制引用，直到任务、请求及MM来源结束。
+多余引用的计数检查只发现缺少控制引用的直接反例，不证明引用的角色；控制owner仍是接口前置条件。
+全部检查后才发布资格；本表内dup不重复计pipe端点。已封存对象不能安装到普通表，受控表安装只读已验证资格。
 这个私有启用检查最多 O(capacity²)，不在 FD raw 内扫描，不加入常见 lookup/close 路径。
-受控任务的 MM/files 引用在发布前准备，退出后在可信栈归还。普通后端、命名 FIFO、socket 和 epoll 业务仍受 CPU0 边界保护。
+受控任务的MM/files引用在发布前准备，退出后在可信栈归还。命名FIFO、socket/epoll、路径/挂载、记录锁及sendfile业务不随普通OFD接纳开放。
+
+tmpfs读写、定位I/O及offset在调用核执行；ext4的整次read/write/readv/writev/pread/pwrite/lseek/fstat/fsync/ftruncate由现有CPU0 cache worker执行。
+请求持调用现场的OFD pin及MM/files owner，不按fd数字重新查找；参数、导入iov及结果地址在DONE和worker借用结束前不能退栈。
+提交者不得持对象保护、用户pin或缓存写入借用，违反返回STATE且不发布请求。回调在cache mutex外、普通CPU0上下文执行，不绑定调用者MM。
+用户复制按已有pin协议处理冷缺页；受控owned fault允许持gate的CPU0服务任务在kernel根上操作，其他活动地址空间检查保留。
+共享offset及错误观察沿已有rank10 mutex保护；定位同步写在写门前取得它，msync固定来源后先释放MM gate25再同步，tmpfs与磁盘均遵守此顺序。
+冷读及普通操作共用FIFO，16项后检查写回并让出；这不是时间上界。关闭取消未执行请求，执行者等待实际完成；最终后端释放仍在CPU0。
+`make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持pin拒绝及控制引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
+host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。OFD保持336字节/512字节slab、FD record160字节/256字节slab；cache entry216字节不变，record728字节仍为1024字节slab。
+宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；冷CPU0复制经fork私有页验证COW隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的cpu0执行交接)。
 `make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
 在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
 `make test-pipe-concurrency-host`另验证真实MM/uaccess的提前wake、fd复用后旧请求、EOF/部分EPIPE、

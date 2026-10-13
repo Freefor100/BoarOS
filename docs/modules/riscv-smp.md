@@ -168,6 +168,23 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 产物默认位于`build/riscv-files-smp-test/`；`FILES_SMP_BUILD`可为独立本地/CI构建选择目录，runner使用Make传入路径。2026-10-13本地QEMU11.1.2及Ubuntu24.04/QEMU8.2.2各完成2/1CPU、512MiB/1GiB的新盘与独立重启8次正常启动，并完成双RAM的原静态/pthread组合。两核使用实际MTTCG线程，无icount；记录各自固件/内核/工具身份，不能由本地容器结果推定远程CI已运行。
 
-实际登记后的提前wake、fd复用后旧请求、EOF/信号仲裁、blocked/off_cpu迁移、两种任务创建OOM和pipe2输出跨页fault均核对原请求内容及owner。持续4KiB包由CPU0写入、CPU1读入真实受控磁盘映射，冷缺页由CPU0 worker前进；原用户组合要求init实际执行且仍存活期间有包接纳。宿主另使用真实tmpfs映射作为缺页读写缓冲，覆盖4/16KiB几何。普通用户仍在CPU0，未开放socket/epoll/FIFO或文件后端业务跨核。
+实际登记后的提前wake、fd复用后旧请求、EOF/信号仲裁、blocked/off_cpu迁移、两种任务创建OOM和pipe2输出跨页fault均核对原请求内容及owner。持续4KiB包由CPU0写入、CPU1读入真实受控磁盘映射，冷缺页由CPU0 worker前进；原用户组合要求init实际执行且仍存活期间有包接纳。宿主另使用真实tmpfs映射作为缺页读写缓冲，覆盖4/16KiB几何。普通用户仍在CPU0；pipe接口不开放socket/epoll/FIFO或一般文件系统业务，普通文件交接见下节。
 
 自然退出同时核对PID1状态、FD/OFD/端点/等待、MM/pin、页/堆/任务栈、私有挂载与根盘设备owner，并运行两盘fsck；不是只检查串口marker。RV产物FD record160字节、pipe504字节、task2784字节，前两者保持256/512字节slab；复用task已有files字段，未新增任务页。扩容锁内复制上限8192字节，pin/close不分配或全表扫描；没有新增数据中转缓冲或worker。OFF工作tick与收尾分别保留，不据此宣称性能提升。
+
+## 普通文件IO的CPU0执行交接
+
+受控FD表可接纳同域、预先打开的tmpfs/ext4普通OFD。CPU0私有校验真实来源后发布稳定资格，控制引用覆盖任务、请求和MM来源；末次后端释放仍由CPU0完成。tmpfs读写及定位操作就地执行；ext4整次操作排入既有cache worker，由它取得offset/write保护并复制用户数据，不改变任务或MM绑定。fsync/fdatasync/ftruncate及共享错误观察保持相同执行规则；tmpfs截断仍由CPU0控制者完成。路径、statx、socket/epoll、记录锁和sendfile不随FD接纳开放，入口在发布或用户输出前返回STATE。
+
+```sh
+make test-file-io-concurrency-host
+make test-file-io-smp-riscv QEMU_RISCV_FIRMWARE=build/data-path-baselines/sync-b3/firmware.bin
+make test-file-io-smp-userland-riscv INIT_CONFIG=config/init.json \
+  QEMU_RISCV_FIRMWARE=build/data-path-baselines/sync-b3/firmware.bin
+```
+
+产物默认`build/riscv-file-io-smp-test/`，可用`FILE_IO_SMP_BUILD`隔离另一工具环境。2026-10-13，本地QEMU11.1.2/OpenSBI1.8.1及Ubuntu24.04/QEMU8.2.2/其实际安装固件各通过2/1CPU、512MiB/1GiB的新盘和独立重启8次，以及双RAM的原静态/pthread组合；实际MTTCG线程、退出状态、页/堆/任务栈/等待、私有挂载和两盘fsck由runner核对。本地容器验证不表示远程CI已经运行。
+
+宿主4/16KiB、2/4线程核对共享offset及独立OFD整次追加的内容隔离；强制暂停实际执行者后close/dup复用、取消排队者并停止worker，原请求仍读原OFD，运行者完成前不得join。真实客户机同时验证磁盘映射作为缓冲区的冷缺页、精确短读写内容/哨兵、tmpfs本地I/O和最后控制引用结束后的arena基线。普通用户仍只在CPU0。
+
+OFD336/FD160/pipe504字节保持512/256/512字节slab；cache entry216字节未变，record672→728字节仍为1024字节slab。执行请求96字节、冷读参数48字节、普通I/O调用现场112字节，均由等待栈及已有owner覆盖；受控task2784/CPU1968字节未变。常见FD pin/close无新分配或扫描，tmpfs无队列交接；每次ext4操作增加一次请求（命中也承担），自动同步及worker内冷缺页不再次排队。没有新数据缓冲或worker。OFF输出分别记录foreground、排队/服务、durability/close和原缓存后台/根退出收尾，不宣称性能提升。

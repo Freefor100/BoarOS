@@ -343,7 +343,7 @@ I/O失败与停止不建立重试循环。宿主反例用已完成后台轮次�
 及changed明确后，在inode写保护下收敛尾零、缓存退休和尺寸发布。无变化失败不丢脏页；
 部分生效按真实尺寸处理。已退休整页的旧pin/快照借用继续固定存储，旧写回不再提交。
 purge/destroy由CPU0独占生命周期owner执行，stop/join不替代外部来源、MM或pin的结束。
-`msync`固定来源及范围后先释放MM gate，由普通CPU0任务执行同步；不开放CPU1 fsync/FD业务。
+`msync`固定来源及范围后先释放MM gate；经过普通OFD域验证的ext4同步及FD操作也交给既有CPU0 worker，在offset保护外发布请求，由执行者取得所需锁。接口与关闭身份见[文件模块](kernel-files.md)。
 
 ```sh
 make test-page-cache-concurrency-host test-mm-disk-concurrency-host

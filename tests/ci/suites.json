@@ -3,7 +3,7 @@
     "host": [
       {"name":"references","targets":["test-references"]},
       {"name":"ci-contracts","targets":["test-ci-host"]},
-      {"name":"allocator","targets":["test-sync-host","test-smp-host","test-mm-pin-host","test-mm-concurrency-host","test-memory-object-concurrency-host","test-mm-shared-concurrency-host","test-file-mapping-concurrency-host","test-mm-file-concurrency-host","test-page-cache-concurrency-host","test-mm-disk-concurrency-host","test-files-concurrency-host","test-pipe-concurrency-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-sched-concurrency-host","test-pid-object-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host","test-cost-match-host"]},
+      {"name":"allocator","targets":["test-sync-host","test-smp-host","test-mm-pin-host","test-mm-concurrency-host","test-memory-object-concurrency-host","test-mm-shared-concurrency-host","test-file-mapping-concurrency-host","test-mm-file-concurrency-host","test-page-cache-concurrency-host","test-mm-disk-concurrency-host","test-files-concurrency-host","test-pipe-concurrency-host","test-file-io-concurrency-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-sched-concurrency-host","test-pid-object-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host","test-cost-match-host"]},
       {"name":"virtio","targets":["test-virtio-framework-host","test-virtio-block-host","test-virtio-rng-host","test-virtio-net-host","test-pci-host"]},
       {"name":"terminal","targets":["test-tty-host","test-pty-host","test-uart-host"]},
       {"name":"random-clock","targets":["test-random-host","test-rtc-host","test-rtc-loongarch-host"]},
@@ -25,7 +25,9 @@
       {"name":"disk-file-mm","targets":["test-mm-disk-smp-riscv"]},
       {"name":"disk-mm-user-composition","targets":["test-mm-disk-smp-userland-riscv"]},
       {"name":"shared-fd-pipe","targets":["test-files-smp-riscv"]},
-      {"name":"shared-fd-user-composition","targets":["test-files-smp-userland-riscv"]}
+      {"name":"shared-fd-user-composition","targets":["test-files-smp-userland-riscv"]},
+      {"name":"ordinary-file-io","targets":["test-file-io-smp-riscv"]},
+      {"name":"ordinary-file-user-composition","targets":["test-file-io-smp-userland-riscv"]}
     ]
   },
   "core": {

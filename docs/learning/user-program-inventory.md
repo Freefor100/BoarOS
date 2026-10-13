@@ -7,7 +7,7 @@
 ## 双架构最近完整结果（2026-10-13）
 
 当前固定输入清单为 **229个相同ID**：BusyBox10项（原9项加已有环境内容案例），
-libc-test107静态、110动态及两项原包装器。BoarOS在RV/LA的512MiB、1GiB下各229项通过，包括原BusyBox包装器55子项及静态/动态libc包装器。联合对照RV两种RAM和LA1GiB均229 pass；LA512MiB为228 pass、1 reference-not-pass。
+libc-test107静态、110动态及两项原包装器。BoarOS在RV/LA的512MiB、1GiB下各229项通过，包括原BusyBox包装器55子项及静态/动态libc包装器。联合对照存在Linux原BusyBox遍历动态`/proc`的参考端竞态：本次RV两种RAM及LA512MiB均229 pass，LA1GiB为228 pass、1 reference-not-pass；此前一次LA512MiB同类参考失败也保留。
 该参考失败是原BusyBox包装器的`du: ./proc/85: No such file or directory`，Linux shell仍退出0，但原内部断言失败；BoarOS同次55子项全部成功。独立同ELF单项复核两边均通过，原完整运行不改成229 pass，也不拼接复核结果。固定BusyBox的`libbb/recursive_action.c`遇stat失败返回失败，Linux动态proc目录不保证遍历期间存活；实际PID85身份未由此次输出固定。
 每ID均保留Linux/BoarOS真实wait、输出与正常root资源退出判定，未修改原程序。
 过去228/227的记录仍属历史，不由本次通过推断当时失败的具体修复归因。
@@ -56,7 +56,7 @@ make test-program-inventory-host test-diff-abi-host
 python3 tests/program-inventory/run.py --reuse-builds --require-pass --output build/program-check
 ```
 
-双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。 原 BusyBox 清单末尾的 find 遍历根目录，也会进入 Linux 动态 `/proc`；一次参考启动的 ps 显示 PID85 为 ext4lazyinit，随后 find 报 `./proc/85: No such file or directory` 并使原断言失败。该记录属于参考端进程退出与目录遍历的竞态，不能靠后一次通过覆盖；BoarOS同脚本成功也不把该次联合结果改成通过。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
+双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。 原 BusyBox 清单末尾的 find 遍历根目录，也会进入 Linux 动态 `/proc`；一次参考启动的 ps 显示 PID85 为 ext4lazyinit，随后 find 报 `./proc/85: No such file or directory` 并使原断言失败。2026-10-13普通文件组合的LA1GiB全量复核再次观察到该命令失败：ps列出PID86为ext4lazyinit，find随后报`./proc/86: No such file or directory`；BoarOS同项55条原断言、退出及回收通过。两次记录分别保留。该记录属于参考端进程退出与目录遍历的竞态，不能靠后一次通过覆盖；BoarOS同脚本成功也不把该次联合结果改成通过。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
 
 ## 当前基线与口径
 

@@ -75,3 +75,11 @@ close 只摘下当前槽 owner，正在执行的读写继续使用自己的 OFD�
 复制资格与短metadata保护也分开；poll回调只读metadata，不等待复制mutex，用户缺页不会占用raw锁。
 等待token在metadata保护内登记，保护释放后才park，提前通知由已有单次仲裁接纳。
 bootstrap阶段调度器尚未启动时，合法非阻塞管道没有可park任务；NOT_INITIALIZED通知与真正的运行期错误分别处理，最终queue销毁仍核对注册/借用归零。
+
+普通文件的CPU0交接必须先固定OFD，不能把fd数字排队后再查。对象锁也由实际执行者取得；提交者持offset或写门等待worker，会与worker取得同一资格形成等待环。
+已有cache worker可借用可恢复调用现场的参数完成整次操作，不需要复制用户数据到另一个请求缓冲或增加线程。普通CPU0 worker不绑定用户MM，冷缺页须使用已启用并发、持gate的owned PTE路径；旧“目标satp必须当前”检查不能直接用于这类物理页访问。
+这个例外只用于受控fault，用户/受控任务及普通MM仍验证活动地址空间。来源、VMA代次、EOF和权限的睡眠后重查及RFENCE退休契约不因此减少。
+OFD同步错误观察使用rank10 offset保护后，所有并发msync都必须先固定来源并结束MM gate25。仅给磁盘来源释放gate会让tmpfs在25→10处违反锁序；真实tmpfs共享映射反例定位并保护了此边界。
+固定依据为本地`references/linux/fs/file.c`、`fs/read_write.c`及`mm/filemap.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；分别核对共享位置、接纳字节和同OFD错误观察。执行适配保持单次操作语义，内部队列与owner由BoarOS维护。
+
+RV PLIC的dispatching由CPU0派发器独占。原查询直接返回全局值，会把CPU0正在处理设备IRQ误报为CPU1的本地IRQ，后者即使没有锁、pin或抢占禁用，也被请求入口拒绝。真实两核原静态程序组合捕获了CPU1读到active并返回STATE的反例；查询现在先核对调用核，CPU1不读取该CPU0独占标记。这个修复只对应当前设备IRQ归CPU0的平台边界，不声明PLIC已支持多核设备派发。

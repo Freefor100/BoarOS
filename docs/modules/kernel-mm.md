@@ -225,7 +225,7 @@ make test-riscv
 
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
 
-已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用策略仅开放受控私有/共享匿名并发域；文件/外部后备仍限CPU0。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
+已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用策略开放受控私有/共享匿名及经域验证的tmpfs/ext4映射；未开放外部后备仍限CPU0。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
 
 ## 驻留文件映射与截断
 
@@ -275,7 +275,7 @@ OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 自持同一 MM pin 的调用者只尝试取得 operation gate；忙时返回 `CONFLICT`，原 pin、映射和未发布的输出保持。新 pin 许可已关闭也不等待；缺页准备后的重取 gate 使用同一规则，冲突归还候选及 COW 临时引用后返回，不在保留 pin 时自旋重试。调用者归还原 pin 后可重试，无争用的自持 pin 撤映射仍有效。零长度 mprotect 不进入 gate。
 
-`kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/未开放外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算；受控ext4来源须核对真实inode/挂载及独立缓存的heap/allocator绑定，登记状态由CPU0在发布前准备。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。普通用户任务仍限 CPU0；LA 仍为单CPU。CPU0 负责文件构造、修改和最终释放；CPU1 只执行已绑定的映射操作，控制者保留独立 OFD/挂载/缓存 owner，命名空间运行期间不修改。内部开关不开放系统压力或普通文件业务跨核。
+`kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/未开放外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算；受控ext4来源须核对真实inode/挂载及独立缓存的heap/allocator绑定，登记状态由CPU0在发布前准备。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。普通用户任务仍限 CPU0；LA 仍为单CPU。CPU0负责文件构造、命名空间/截断和最终释放；CPU1执行已绑定映射及获准FD操作，控制者保留独立 OFD/挂载/缓存 owner，命名空间运行期间不修改。内部MM开关不独自开放系统压力或FD业务，普通文件IO另按[文件表域](kernel-files.md)验证并发布。
 
 每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
 
@@ -285,7 +285,7 @@ fault 先在 gate/raw 下取得 VMA generation 和 PTE/COW 快照，释放保护
 
 撤叶及空表将 owner 转给固定容量为16的退休批次。MM raw 内清 PTE/摘父项、增加代次并采样 active mask；raw 外完成本地 SFENCE 和同步 SBI RFENCE，再释放数据及表页。非叶修改使用全范围失效。取指变化另完成本地/远端 FENCE.I。目标采样后首次进入的 CPU 在同一保护下先登记、切根并完整本地失效；离开者清活动位发生在旧翻译停止之后。固件返回错误 fatal，保留真实 owner，不建立释放重试链。
 
-`kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。并发文件域只接受经域校验的tmpfs及受控ext4映射，拒绝 SysV/未开放外部后备创建与 shmdt。共享 fd/offset、SysV、一般设备和系统压力并发尚未开放，依赖见[路线图](../goals.md#p6c-tlb-完成与页回收)。
+`kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。并发文件域只接受经域校验的tmpfs及受控ext4映射，拒绝 SysV/未开放外部后备创建与 shmdt。一般FD来源与socket/epoll/FIFO、SysV、一般设备和系统压力并发尚未开放，依赖见[路线图](../goals.md#p6c-tlb-完成与页回收)。
 
 ```sh
 make test-mm-pin-host test-mm-concurrency-host
