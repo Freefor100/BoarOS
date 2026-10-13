@@ -78,7 +78,7 @@ PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁
 
 `tests/multi-disk-io-riscv.py --rt-load` 是独立的无故障组合模式，不替代原暂扣 B、错误隔离与断电恢复矩阵。用户程序逐轮创建 FIFO、RR 的持续可运行子任务，明确设置默认 950000/1000000 微秒全局预算；子任务在循环中不 yield、不 sleep，普通父任务的计算和双盘 I/O 因而依赖普通类获得预算余量。
 
-每轮 host 在放行父任务前让两台 NBD 进入 hold。检测到每台盘的真实 READ 后立即 drain，不用固定主机 sleep 消耗设备超时；读回内容由 guest 验证。只有普通父任务确认两盘同步写入/读回、host 同时观察两盘成功 WRITE/FLUSH 后，才允许父任务停止 RT 子任务。随后验证 wait 回收、动态盘卸载、根退出的堆/页/任务栈基线；QEMU 退出后独立 dump 两盘检查字节，并运行 `e2fsck -fn`。这证明组合进展和资源回收，不把 QEMU 墙钟作为实时延迟保证，也不宣称两盘请求必定同时在途。
+每轮 host 在放行父任务前让两台 NBD 进入 hold。检测到每台盘的真实 READ 后立即 drain，不用固定主机 sleep 消耗设备超时；读回内容由 guest 验证。drain提交至其ACK之间，全部暂扣响应由该操作释放，不能再逐项release；两盘ACK均从各自FIFO管道读到后，才能结束当前轮并重置下一轮归属。2026-10-13定时CI的EIO由重复release使严格NBD后端断链引起，真实NBD排列及跨轮ACK反例已保护此边界。只有普通父任务确认两盘同步写入/读回、host 同时观察两盘成功 WRITE/FLUSH 后，才允许父任务停止 RT 子任务。随后验证 wait 回收、动态盘卸载、根退出的堆/页/任务栈基线；QEMU 退出后独立 dump 两盘检查字节，并运行 `e2fsck -fn`。这证明组合进展和资源回收，不把 QEMU 墙钟作为实时延迟保证，也不宣称两盘请求必定同时在途。
 
 固定 musl 1.2.5 的 `src/sched/sched_setscheduler.c` 包装器直接返回 ENOSYS；出处为 `references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。该验收程序明确使用 `syscall(SYS_sched_setscheduler, ...)` 进入内核，避免将 libc 包装器存根误判为内核调度失败。NBD 的普通 event 日志只记录 WRITE/FLUSH，READ 的实际请求由既有 hold/drain 协议证明。
 
