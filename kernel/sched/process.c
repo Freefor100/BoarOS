@@ -2325,6 +2325,16 @@ enum kernel_task_status kernel_task_files_borrow(
     if (task == 0 || files == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
+#if BOAROS_MAX_CPUS > 1
+    if (task==kernel_cpu_current()->current && task->magic==KERNEL_THREAD_MAGIC &&
+        task->state==KERNEL_THREAD_STATE_RUNNING && task->controlled &&
+        task->bound_mm_context && task->arch.user_mode==0U) {
+        if (task->files.state!=KERNEL_FILES_LIVE || !task->files.record)
+            return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+        *files=&task->files;
+        return KERNEL_TASK_STATUS_OK;
+    }
+#endif
     status = validate_task_resource_borrow(task);
     if (status != KERNEL_TASK_STATUS_OK) {
         return status;

@@ -200,7 +200,8 @@ static enum kernel_scheduler_status validate_thread(
             thread->completion.tgid != 0 ||
             thread->tid != 0 || thread->tid_owned != 0U ||
             thread->group_leader != 0 || thread->group_members != 0U ||
-            thread->files.state != KERNEL_FILES_EMPTY ||
+            (thread->files.state != KERNEL_FILES_EMPTY &&
+             !(bound_mm && thread->files.state == KERNEL_FILES_LIVE)) ||
             thread->fs.state != KERNEL_FS_CONTEXT_EMPTY ||
             (!bound_mm && thread->mm.state != KERNEL_MM_EMPTY) ||
             thread->exec_transaction != 0) {
@@ -668,6 +669,8 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 #if BOAROS_MAX_CPUS > 1
     /* join、自动reaper及构造回滚共用可信清理点；不能只在join归还MM。 */
     if (thread && thread->bound_mm_context && thread->mm.state == KERNEL_MM_LIVE) {
+        if (thread->files.state==KERNEL_FILES_LIVE &&
+            kernel_files_release(&thread->files)!=KERNEL_FILES_STATUS_OK) __builtin_trap();
         if (kernel_mm_release(&thread->mm) != KERNEL_MM_STATUS_OK) __builtin_trap();
         thread->bound_mm_context = 0;
     }
@@ -888,7 +891,7 @@ static unsigned available_cpu_mask_locked(void)
 
 static enum kernel_scheduler_status create_kernel_thread(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join,
-    uint32_t cpu_mask, struct kernel_mm *bound_mm)
+    uint32_t cpu_mask, struct kernel_mm *bound_mm, struct kernel_files *bound_files)
 {
     struct kernel_task *thread;
     uintptr_t old_status;
@@ -983,6 +986,8 @@ static enum kernel_scheduler_status create_kernel_thread(
                 __builtin_trap();
 #endif
             }
+            if (bound_files && kernel_files_move(&thread->files,bound_files)!=KERNEL_FILES_STATUS_OK)
+                __builtin_trap();
             if (join) {
                 if (join->task) __builtin_trap();
                 join->task = thread;
@@ -1008,7 +1013,7 @@ restore_interrupts:
 
 enum kernel_scheduler_status kernel_thread_create_joinable(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join)
-{ return create_kernel_thread(entry, argument, join, 0, 0); }
+{ return create_kernel_thread(entry, argument, join, 0, 0, 0); }
 
 #if BOAROS_MAX_CPUS > 1
 int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
@@ -1025,7 +1030,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    return create_kernel_thread(entry, argument, join, mask, 0);
+    return create_kernel_thread(entry, argument, join, mask, 0, 0);
 }
 enum kernel_scheduler_status kernel_thread_create_joinable_mm(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join,
@@ -1036,7 +1041,28 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mm(
     unsigned available;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    return create_kernel_thread(entry, argument, join, mask, mm);
+    return create_kernel_thread(entry, argument, join, mask, mm, 0);
+}
+
+enum kernel_scheduler_status kernel_thread_create_joinable_files(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join,
+    uint32_t mask, const struct kernel_mm *mm, const struct kernel_files *files)
+{
+    kernel_assert_service_context();
+    if (!join || !mm || !files || !mask || (mask & ~3U))
+        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (kernel_files_check_concurrent_domain(files,mm))
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    struct kernel_mm mm_owner={0}; struct kernel_files files_owner={0};
+    enum kernel_mm_status acquired=kernel_mm_acquire(&mm_owner,mm);
+    if (acquired) return acquired==KERNEL_MM_STATUS_NO_MEMORY
+        ? KERNEL_SCHEDULER_STATUS_NO_MEMORY : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+    enum kernel_scheduler_status status;
+    if (kernel_files_acquire(&files_owner,files)) status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    else status=create_kernel_thread(entry,argument,join,mask,&mm_owner,&files_owner);
+    if (files_owner.state==KERNEL_FILES_LIVE && kernel_files_release(&files_owner)) __builtin_trap();
+    if (mm_owner.state==KERNEL_MM_LIVE && kernel_mm_release(&mm_owner)) __builtin_trap();
+    return status;
 }
 
 enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *join,

@@ -78,5 +78,7 @@ EXCLUDED(kernel_proc_task_note_fault)
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)
 EXCLUDED(kernel_socket_destroy)
+#ifndef FILES_PIPE_CASES
 EXCLUDED(kernel_pipe_release_endpoint)
 EXCLUDED(kernel_pipe_destroy)
+#endif

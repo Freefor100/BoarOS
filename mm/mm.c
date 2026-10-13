@@ -3887,6 +3887,22 @@ enum kernel_mm_status kernel_mm_concurrent_context(const struct kernel_mm *mm,
         KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_ADDRESS_SPACE;
 }
 
+enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *mm,
+    const struct kernel_heap *heap)
+{
+    kernel_assert_service_context();
+    struct kernel_mm_record *record;
+    if (!mm || !heap) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    enum kernel_mm_status status=resolve_record_storage(mm,&record);
+    if (status) return status;
+    KERNEL_RAW_SCOPE(guard,&record->metadata);
+    return mm->state==KERNEL_MM_LIVE && record->concurrent &&
+        record->vma_heap==heap && mm->allocator==heap->page_allocator &&
+        !mm->allocator->reclaimer && !mm->allocator->pressure_notify &&
+        !mm->allocator->pressure_wait
+        ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_STATE;
+}
+
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t kernel_context)
 {
     /* 在整个本地交接期间不允许被抢占；这里不分配、不进固件、无两个MM锁嵌套。 */

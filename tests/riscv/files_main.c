@@ -305,6 +305,13 @@ static int dma_physical_address(const void *pointer,
     return 1;
 }
 
+static __attribute__((unused)) uint64_t test_fd_offset(struct kernel_files *files,int64_t fd)
+{
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+    return file ? kernel_open_file_offset(file) : UINT64_MAX;
+}
+
 static void fail_files(unsigned long case_id,
                        long expected,
                        long actual) __attribute__((noreturn));
@@ -2962,7 +2969,8 @@ static void run_epoll_operations(struct kernel_files *files,
     /* A full table reports EMFILE transactionally.  In particular, fd 0 and
      * all counters remain owned by the pre-existing description. */
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 208U);
-    first_description = kernel_files_lookup_description(files, 0);
+    KERNEL_FILES_PIN_SCOPE(first_pin);
+    first_description = kernel_files_hold_fd(files,0,&first_pin);
     for (index = 1U; index < KERNEL_FILES_MAX_CAPACITY; index++) {
         if (kernel_files_dup(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
             result != (int64_t)index) {
@@ -2976,7 +2984,7 @@ static void run_epoll_operations(struct kernel_files *files,
         fail_files(210U, -KERNEL_EMFILE, result);
     }
     kernel_files_get_statistics(files, &after);
-    if (kernel_files_lookup_description(files, 0) != first_description ||
+    if (!kernel_files_fd_matches(files,0,first_description) ||
         after.current_open_fds != before.current_open_fds ||
         after.peak_open_fds != before.peak_open_fds ||
         after.close_on_exec_fds != before.close_on_exec_fds ||
@@ -3360,8 +3368,8 @@ static void check_usercopy_write(struct kernel_files *files,
 {
     const uint64_t boundary = TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE;
     struct kernel_uaccess_iovec vectors[3];
-    struct kernel_open_file_description *description =
-        kernel_files_lookup_description(files, 0);
+    KERNEL_FILES_PIN_SCOPE(selected);
+    struct kernel_open_file_description *description = kernel_files_hold_fd(files,0,&selected);
     struct kernel_vfs_stat stat;
     struct kernel_files_statistics before, after;
     unsigned char payload[80], expected[90], observed[90];
@@ -3616,7 +3624,8 @@ static void run_partial_write_test(const void *dtb)
         result != (int64_t)(sizeof(initial) - 1U)) {
         fail_files(301U, sizeof(initial) - 1U, result);
     }
-    description = kernel_files_lookup_description(&files, 0);
+    KERNEL_FILES_PIN_SCOPE(source_pin);
+    description = kernel_files_hold_fd(&files,0,&source_pin);
     if (description == 0 ||
         kernel_open_file_lookup_page(description, 0U, &cached_page,
                                      &valid_bytes) !=
@@ -3780,7 +3789,7 @@ static void run_partial_write_test(const void *dtb)
         if (kernel_files_write(&files, &mm, 1, TEST_USER_BUFFER, 4U, &result) !=
                 KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
             sync_flush_failures != 0U ||
-            kernel_open_file_offset(kernel_files_lookup_description(&files, 1)) != 4U ||
+            test_fd_offset(&files,1) != 4U ||
             kernel_files_pread(&files, &mm, 1, TEST_USER_BUFFER, 4U, 0,
                                &result) != KERNEL_FILES_STATUS_OK || result != 4 ||
             !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 4U) ||
@@ -3809,7 +3818,8 @@ static void run_partial_write_test(const void *dtb)
                     fail_files(451U, 0, result);
                 int64_t offset = 0, observed_offset = -1;
                 if (!write_user_bytes(&mm, TEST_USER_PATH + 64U, &offset, sizeof(offset))) fail_files(452U, 0, -1);
-                struct kernel_open_file_description *target = kernel_files_lookup_description(&files, 1);
+                KERNEL_FILES_PIN_SCOPE(target_pin);
+                struct kernel_open_file_description *target = kernel_files_hold_fd(&files,1,&target_pin);
                 sendfile_flush_output = target;
                 sendfile_flush_threshold = failed_batch * BOAROS_PAGE_SIZE;
                 int64_t expected = failed_batch == 1 ? -KERNEL_EIO : (int64_t)BOAROS_PAGE_SIZE;
@@ -3826,6 +3836,7 @@ static void run_partial_write_test(const void *dtb)
                     observed_offset != (explicit_offset ? (int64_t)progress : 0))
                     fail_files(458U, explicit_offset ? (int64_t)progress : 0, observed_offset);
                 size_t copied_data = 0;
+                kernel_files_pin_guard_release(&target_pin);
                 if (kernel_open_file_pread(target, (failed_batch - 1U) * BOAROS_PAGE_SIZE, observed,
                         sizeof(observed), &copied_data) != 0 || copied_data != sizeof(observed) ||
                     memcmp(observed, sendfile_data, sizeof(observed)) != 0 ||
@@ -3991,6 +4002,7 @@ static void run_partial_write_test(const void *dtb)
     }
     if (ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, 0) != EOK) fail_files(404U, 0, -1);
 
+    kernel_files_pin_guard_release(&source_pin);
     use_test_satp = 0;
     if (kernel_files_close(&files, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||

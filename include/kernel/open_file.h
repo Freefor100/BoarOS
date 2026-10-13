@@ -171,6 +171,8 @@ uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file);
 uint32_t kernel_open_file_flags(
     const struct kernel_open_file_description *file);
+/* 已有OFD owner覆盖寿命；status共享于dup/fork别名，访问方向不改变。 */
+void kernel_open_file_set_status_flags(struct kernel_open_file_description *, uint32_t);
 /* Access mode is OFD state and therefore survives descriptor duplication. */
 int kernel_open_file_readable(
     const struct kernel_open_file_description *file);

@@ -625,7 +625,7 @@ enum kernel_files_status kernel_files_pselect6(
         int e = (in_efds[widx] & bit) != 0U;
         if (r || w || e) {
             /* Linux select: all queried fds must be open in files! */
-            if (kernel_files_lookup_description(files, fd) == 0) {
+            if (kernel_files_fd_matches(files, fd, 0)) {
                 ret = -KERNEL_EBADF;
                 goto cleanup;
             }

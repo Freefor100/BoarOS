@@ -65,7 +65,7 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     uint64_t deadline = 0;
     uint64_t target_ns = 0;
     uintptr_t saved;
-    if ((description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0U ||
+    if ((kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK) != 0U ||
         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U)
         return -KERNEL_EAGAIN;
     if (socket_operation_ready(socket, events))
@@ -133,12 +133,12 @@ static enum kernel_files_status control_read(
     }
     if (result) {
         *linux_result = result;
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     if (advance && kernel_open_file_advance(description, length) != KERNEL_OPEN_FILE_STATUS_OK)
         return KERNEL_FILES_STATUS_STATE;
-    files->record->statistics.bytes_read += length;
+    KERNEL_FILES_NOTE(files, bytes_read, length);
     *linux_result = (int64_t)length;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -156,7 +156,7 @@ static enum kernel_files_status generated_read(
     int result = kernel_open_file_generate(description);
     if (result) {
         *linux_result = result;
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     uint64_t total = 0U;
@@ -175,17 +175,17 @@ static enum kernel_files_status generated_read(
                            KERNEL_OPEN_FILE_STATUS_OK)
             return KERNEL_FILES_STATUS_STATE;
         total += copied;
-        files->record->statistics.read_chunks++;
+        KERNEL_FILES_NOTE(files, read_chunks, 1);
         if (access == KERNEL_UACCESS_STATUS_FAULT) {
             *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
-            if (!total) files->record->statistics.read_failures++;
-            files->record->statistics.bytes_read += total;
+            if (!total) KERNEL_FILES_NOTE(files, read_failures, 1);
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk)
             return KERNEL_FILES_STATUS_STATE;
     }
-    files->record->statistics.bytes_read += total;
+    KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -201,7 +201,7 @@ static enum kernel_files_status memory_read(
     int error = 0;
     if (offset >= kernel_open_file_size(description)) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
     if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
-        *linux_result = -KERNEL_ENOMEM; files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_ENOMEM; KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     while (total < count) {
@@ -212,13 +212,13 @@ static enum kernel_files_status memory_read(
         enum kernel_uaccess_status status = kernel_copy_to_user_iov(mm, cursor, buffer.data, available, &copied);
         if (advance && kernel_open_file_advance(description, copied) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
         total += copied;
-        files->record->statistics.read_chunks++;
+        KERNEL_FILES_NOTE(files, read_chunks, 1);
         if (status == KERNEL_UACCESS_STATUS_FAULT) { error = -KERNEL_EFAULT; break; }
         if (status != KERNEL_UACCESS_STATUS_OK || copied != available) __builtin_trap();
     }
     kernel_task_io_buffer_release(&buffer);
-    if (error) files->record->statistics.read_failures++;
-    files->record->statistics.bytes_read += total;
+    if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
+    KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = total ? (int64_t)total : error;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -283,12 +283,12 @@ static enum kernel_files_status read_pinned(
 
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         *linux_result = -KERNEL_EINVAL;
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     if (!kernel_open_file_readable(description)) {
         *linux_result = -KERNEL_EBADF;
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
@@ -300,7 +300,7 @@ static enum kernel_files_status read_pinned(
             if (kernel_user_range_check(iov[index].base, (size_t)iov[index].length)
                     != KERNEL_UACCESS_STATUS_OK) {
                 *linux_result = -KERNEL_EFAULT;
-                files->record->statistics.read_failures++;
+                KERNEL_FILES_NOTE(files, read_failures, 1);
                 return KERNEL_FILES_STATUS_OK;
             }
         }
@@ -314,7 +314,7 @@ static enum kernel_files_status read_pinned(
         if (count != 0U && !discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
                 KERNEL_TASK_STATUS_OK) {
             *linux_result = -KERNEL_ENOMEM;
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             return KERNEL_FILES_STATUS_OK;
         }
         while (total < count || (message && total == 0)) {
@@ -323,7 +323,7 @@ static enum kernel_files_status read_pinned(
                 kernel_open_file_socket(description), kernel_task_current(),
                 &read_request, description_owner,
                 remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
-                (description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+                (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK) ||
                     (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT));
             if (received == -KERNEL_EAGAIN && total == 0U) {
                 int waited = socket_wait_ready(description, KERNEL_POLLIN,
@@ -342,7 +342,7 @@ static enum kernel_files_status read_pinned(
                 kernel_socket_copy_read(&read_request, done, buffer.data, chunk);
                 enum kernel_uaccess_status access = kernel_copy_to_user_iov(
                     mm, &cursor, buffer.data, chunk, &copied);
-                files->record->statistics.read_chunks++;
+                KERNEL_FILES_NOTE(files, read_chunks, 1);
                 if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
                     fault = 1;
                     if (access != KERNEL_UACCESS_STATUS_FAULT)
@@ -358,8 +358,8 @@ static enum kernel_files_status read_pinned(
         }
         if (buffer.allocator) kernel_task_io_buffer_release(&buffer);
         *linux_result = total != 0U ? (int64_t)total : received;
-        if (*linux_result < 0) files->record->statistics.read_failures++;
-        else files->record->statistics.bytes_read += total;
+        if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
+        else KERNEL_FILES_NOTE(files, bytes_read, total);
         return result;
     }
     if (description->device) {
@@ -369,14 +369,14 @@ static enum kernel_files_status read_pinned(
             kernel_user_range_check(iov[0].base - 1U, 1U) !=
                 KERNEL_UACCESS_STATUS_OK) {
             *linux_result = -KERNEL_EFAULT;
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             return KERNEL_FILES_STATUS_OK;
         }
         for (size_t index = 0U; index < iov_count; index++) {
             if (kernel_user_range_check(iov[index].base,
                                         (size_t)iov[index].length) !=
                 KERNEL_UACCESS_STATUS_OK) {
-                files->record->statistics.read_failures++;
+                KERNEL_FILES_NOTE(files, read_failures, 1);
                 *linux_result = -KERNEL_EFAULT;
                 return KERNEL_FILES_STATUS_OK;
             }
@@ -385,9 +385,9 @@ static enum kernel_files_status read_pinned(
             enum kernel_files_status status = device->readv(description->device_instance,
                 kernel_task_current(), files, description_owner, 0, mm, iov, iov_count,
                 count > KERNEL_FILES_MAX_RW_COUNT ? KERNEL_FILES_MAX_RW_COUNT : count,
-                description->open_flags, linux_result);
-            if (*linux_result < 0) files->record->statistics.read_failures++;
-            else files->record->statistics.bytes_read += (uint64_t)*linux_result;
+                kernel_open_file_flags(description), linux_result);
+            if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
+            else KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
             return status;
         }
         unsigned char staging[64];
@@ -400,12 +400,12 @@ static enum kernel_files_status read_pinned(
             size_t copied = 0U;
             size_t chunk = request - total < sizeof(staging)
                                ? (size_t)(request - total) : sizeof(staging);
-            int result = device->read(description->device_instance, kernel_task_current(), description->open_flags, staging,
+            int result = device->read(description->device_instance, kernel_task_current(), kernel_open_file_flags(description), staging,
                                       chunk, &received);
             if (result) {
                 *linux_result = total ? (int64_t)total : result;
-                if (!total) files->record->statistics.read_failures++;
-                files->record->statistics.bytes_read += total;
+                if (!total) KERNEL_FILES_NOTE(files, read_failures, 1);
+                KERNEL_FILES_NOTE(files, bytes_read, total);
                 return KERNEL_FILES_STATUS_OK;
             }
             if (received > chunk) return KERNEL_FILES_STATUS_STATE;
@@ -413,18 +413,18 @@ static enum kernel_files_status read_pinned(
             enum kernel_uaccess_status access = kernel_copy_to_user_iov(
                 mm, &cursor, staging, received, &copied);
             total += copied;
-            files->record->statistics.read_chunks++;
+            KERNEL_FILES_NOTE(files, read_chunks, 1);
             if (access == KERNEL_UACCESS_STATUS_FAULT) {
                 *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
-                files->record->statistics.bytes_read += total;
-                if (total == 0U) files->record->statistics.read_failures++;
+                KERNEL_FILES_NOTE(files, bytes_read, total);
+                if (total == 0U) KERNEL_FILES_NOTE(files, read_failures, 1);
                 return KERNEL_FILES_STATUS_OK;
             }
             if (access != KERNEL_UACCESS_STATUS_OK || copied != received)
                 return KERNEL_FILES_STATUS_STATE;
             if (device->read_once || received < chunk) break;
         }
-        files->record->statistics.bytes_read += total;
+        KERNEL_FILES_NOTE(files, bytes_read, total);
         *linux_result = (int64_t)total;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -434,7 +434,7 @@ static enum kernel_files_status read_pinned(
             mm,
             iov, iov_count,
             count,
-            description->open_flags,
+            kernel_open_file_flags(description),
             linux_result);
 
         if (pipe_status != KERNEL_PIPE_STATUS_OK) {
@@ -443,22 +443,22 @@ static enum kernel_files_status read_pinned(
         if (*linux_result > 0 && description->file.private_data)
             kernel_vfs_file_accessed(&description->file);
         if (*linux_result >= 0) {
-            files->record->statistics.bytes_read += (uint64_t)*linux_result;
+            KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
         } else {
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
         }
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) ==
         KERNEL_OPEN_FILE_KIND_DIRECTORY) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
     if ((kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
          kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) &&
         !kernel_open_file_readable(description)) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -466,7 +466,7 @@ static enum kernel_files_status read_pinned(
         if (kernel_user_range_check(iov[index].base,
                                     (size_t)iov[index].length) !=
             KERNEL_UACCESS_STATUS_OK) {
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             *linux_result = -KERNEL_EFAULT;
             return KERNEL_FILES_STATUS_OK;
         }
@@ -509,7 +509,7 @@ static enum kernel_files_status read_pinned(
                                                  page_index,
                                                  &physical_address,
                                                  &valid_bytes);
-        files->record->statistics.read_chunks++;
+        KERNEL_FILES_NOTE(files, read_chunks, 1);
         if (cache_status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) {
             break;
         }
@@ -519,9 +519,9 @@ static enum kernel_files_status read_pinned(
                                  ? -KERNEL_ENOMEM
                                  : -KERNEL_EIO;
 
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             *linux_result = total != 0U ? (int64_t)total : result;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         if (page_offset >= valid_bytes) {
@@ -555,10 +555,10 @@ static enum kernel_files_status read_pinned(
         kernel_open_file_read_progress(description, file_offset, copied);
         total += copied;
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             *linux_result = total != 0U ? (int64_t)total
                                         : -KERNEL_EFAULT;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK ||
@@ -571,7 +571,7 @@ static enum kernel_files_status read_pinned(
         }
     }
 
-    files->record->statistics.bytes_read += total;
+    KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -591,13 +591,13 @@ enum kernel_files_status kernel_files_read(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    files->record->statistics.read_calls++;
+    KERNEL_FILES_NOTE(files, read_calls, 1);
     status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
     if (*linux_result != 0) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     status = read_pinned(files, mm, description, &description, &iov, 1U, count,
@@ -625,13 +625,13 @@ enum kernel_files_status kernel_files_readv(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    files->record->statistics.read_calls++;
+    KERNEL_FILES_NOTE(files, read_calls, 1);
     status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
     if (*linux_result != 0) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
@@ -708,9 +708,9 @@ enum kernel_files_status kernel_files_readv(
         status = description->device->readv(description->device_instance,
             kernel_task_current(), files, &description,
             iov == local ? 0 : (void **)&iov, mm, iov, (size_t)iovcnt,
-            total, description->open_flags, linux_result);
-        if (*linux_result < 0) files->record->statistics.read_failures++;
-        else files->record->statistics.bytes_read += (uint64_t)*linux_result;
+            total, kernel_open_file_flags(description), linux_result);
+        if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
+        else KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
     } else status = read_pinned(files, mm, description, &description,
                          iov, (size_t)iovcnt,
                          total, linux_result, 0U, 0, 0);
@@ -723,7 +723,7 @@ out:
     }
     if (!dispatched && status == KERNEL_FILES_STATUS_OK &&
         *linux_result < 0) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
     }
     return release_io_description(files, &description, status);
 }
@@ -743,32 +743,32 @@ static enum kernel_files_status pread_pinned(
     uint64_t file_size;
 
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
     if ((kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
          kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) &&
         !kernel_open_file_readable(description)) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
     if (offset < 0) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) ==
             KERNEL_OPEN_FILE_KIND_DIRECTORY) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
     if ((description->device && !description->device->positioned) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -780,7 +780,7 @@ static enum kernel_files_status pread_pinned(
         (count == 0U && user_buffer != 0U &&
          kernel_user_range_check(user_buffer - 1U, 1U) !=
              KERNEL_UACCESS_STATUS_OK)) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -840,7 +840,7 @@ static enum kernel_files_status pread_pinned(
                                                   page_index,
                                                   &physical_address,
                                                   &valid_bytes);
-        files->record->statistics.read_chunks++;
+        KERNEL_FILES_NOTE(files, read_chunks, 1);
         if (cache_status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) {
             break;
         }
@@ -849,9 +849,9 @@ static enum kernel_files_status pread_pinned(
                              ? -KERNEL_ENOMEM
                              : -KERNEL_EIO;
 
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             *linux_result = total != 0U ? (int64_t)total : result;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         if (page_offset >= valid_bytes) {
@@ -881,9 +881,9 @@ static enum kernel_files_status pread_pinned(
         kernel_open_file_read_progress(description, position, copied);
         position += copied;
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-            files->record->statistics.read_failures++;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
             *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
@@ -893,7 +893,7 @@ static enum kernel_files_status pread_pinned(
             break;
         }
     }
-    files->record->statistics.bytes_read += total;
+    KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -908,11 +908,11 @@ enum kernel_files_status kernel_files_pread(
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    files->record->statistics.read_calls++;
+    KERNEL_FILES_NOTE(files, read_calls, 1);
     status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
     if (*linux_result != 0) {
-        files->record->statistics.read_failures++;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     status = pread_pinned(files, mm, description, user_buffer, count,
@@ -928,7 +928,7 @@ static int description_writable(
     if (description == 0) {
         return 0;
     }
-    access_mode = description->open_flags & 3U;
+    access_mode = kernel_open_file_flags(description) & 3U;
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
         return access_mode == 1U || access_mode == 2U;
     }
@@ -957,7 +957,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
     if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
         int64_t result;
         if (kernel_pipe_write_buffer(output->pipe, buffer, size,
-                output->open_flags, &result) != KERNEL_PIPE_STATUS_OK)
+                kernel_open_file_flags(output), &result) != KERNEL_PIPE_STATUS_OK)
             __builtin_trap();
         if (result > 0 && output->file.private_data &&
             !kernel_vfs_mount_is_readonly(output->file.mount)) {
@@ -970,7 +970,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
         struct kernel_socket *socket = kernel_open_file_socket(output);
         if (kernel_socket_is_datagram(socket))
             return kernel_socket_write_datagram_buffer(output_owner, buffer, size,
-                (output->open_flags & KERNEL_FILES_O_NONBLOCK) ? KERNEL_SOCKET_MSG_DONTWAIT : 0U);
+                (kernel_open_file_flags(output) & KERNEL_FILES_O_NONBLOCK) ? KERNEL_SOCKET_MSG_DONTWAIT : 0U);
         for (;;) {
             int result = kernel_socket_write_buffer(socket, buffer, (uint32_t)size, 0);
             if (result != -KERNEL_EAGAIN) return result;
@@ -986,7 +986,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
         /* pwrite 每批自取 rank 15；跨输入读取持目标门闩会形成交叉 inode 等待。 */
         error = kernel_vfs_pwrite(&output->file, position, buffer, size, &written);
     } else if (output->device && output->device->write) {
-        error = output->device->write(output->device_instance, kernel_task_current(), output->open_flags, buffer, size, &written);
+        error = output->device->write(output->device_instance, kernel_task_current(), kernel_open_file_flags(output), buffer, size, &written);
     } else return -KERNEL_EINVAL;
     if (written > size) __builtin_trap();
     return written != 0U ? (int64_t)written : error;
@@ -1026,7 +1026,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (count > limit - start) count = limit - start;
     if (output->kind != KERNEL_OPEN_FILE_KIND_PIPE) {
         if (out_start > (uint64_t)INT64_MAX - count) return -KERNEL_EINVAL;
-        if (output->open_flags & KERNEL_FILES_O_APPEND) return -KERNEL_EINVAL;
+        if (kernel_open_file_flags(output) & KERNEL_FILES_O_APPEND) return -KERNEL_EINVAL;
     }
     if (input->kind != KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_EINVAL;
     if (count) kernel_open_file_read_begin(input, start);
@@ -1072,8 +1072,8 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
         if (sent > 0 && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
-            (output->open_flags & KERNEL_FILES_O_DSYNC) != 0U) {
-            int datasync = (output->open_flags & KERNEL_FILES_O_SYNC) != KERNEL_FILES_O_SYNC;
+            (kernel_open_file_flags(output) & KERNEL_FILES_O_DSYNC) != 0U) {
+            int datasync = (kernel_open_file_flags(output) & KERNEL_FILES_O_SYNC) != KERNEL_FILES_O_SYNC;
             int synced = kernel_vfs_sync(&output->file, datasync, &output->observed_writeback_error);
             if (synced != 0) { error = synced; break; }
         }
@@ -1111,8 +1111,8 @@ enum kernel_files_status kernel_files_sendfile(
         *linux_result = -KERNEL_EFAULT; return KERNEL_FILES_STATUS_OK;
     }
     enum kernel_files_status status = kernel_files_pin_data(files, in_fd, &input, linux_result);
-    files->record->statistics.read_calls++;
-    files->record->statistics.write_calls++;
+    KERNEL_FILES_NOTE(files, read_calls, 1);
+    KERNEL_FILES_NOTE(files, write_calls, 1);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
     if (!kernel_open_file_readable(input)) { *linux_result = -KERNEL_EBADF; goto done; }
     if (user_offset != 0U && (input->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
@@ -1130,8 +1130,8 @@ enum kernel_files_status kernel_files_sendfile(
     /* 两份 pin 由仍会恢复的 syscall 栈持有；退出先唤醒等待，正常展开再交还。 */
     *linux_result = sendfile_pinned(files, mm, input, &output, user_offset != 0U, &position, count);
     if (*linux_result > 0) {
-        files->record->statistics.bytes_read += (uint64_t)*linux_result;
-        files->record->statistics.bytes_written += (uint64_t)*linux_result;
+        KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
+        KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
     }
 done:
     if (output != 0) status = release_io_description(files, &output, status);
@@ -1195,7 +1195,7 @@ static enum kernel_files_status buffered_write_request(
 
     if (description->device && description->device->discard_writes) {
         size_t consumed = 0U;
-        int result = description->device->write(description->device_instance, kernel_task_current(), description->open_flags, 0, (size_t)count, &consumed);
+        int result = description->device->write(description->device_instance, kernel_task_current(), kernel_open_file_flags(description), 0, (size_t)count, &consumed);
         if (consumed > count) return KERNEL_FILES_STATUS_STATE;
         *linux_result = result && !consumed ? result : (int64_t)consumed;
         return KERNEL_FILES_STATUS_OK;
@@ -1209,7 +1209,7 @@ static enum kernel_files_status buffered_write_request(
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         if (kernel_pipe_writev(description->pipe, mm, iov, iov_count,
-                count, description->open_flags, linux_result) != KERNEL_PIPE_STATUS_OK)
+                count, kernel_open_file_flags(description), linux_result) != KERNEL_PIPE_STATUS_OK)
             return KERNEL_FILES_STATUS_STATE;
         if (*linux_result > 0 && description->file.private_data &&
             !kernel_vfs_mount_is_readonly(description->file.mount)) {
@@ -1237,7 +1237,7 @@ static enum kernel_files_status buffered_write_request(
                     ((iov[index].base + offset) & BOAROS_PAGE_MASK);
                 if (chunk > page_left) chunk = page_left;
                 if (chunk > count - total) chunk = (size_t)(count - total);
-                files->record->statistics.write_chunks++;
+                KERNEL_FILES_NOTE(files, write_chunks, 1);
                 access = kernel_copy_from_user(mm, staging,
                     iov[index].base + offset, chunk, &copied);
                 if (access == KERNEL_UACCESS_STATUS_FAULT && copied == 0U) {
@@ -1274,7 +1274,7 @@ static enum kernel_files_status buffered_write_request(
                     offset += (uint64_t)sent;
                     /* fault或非阻塞仍返回本次已接受前缀。 */
                     if (access == KERNEL_UACCESS_STATUS_FAULT || (consumed < copied &&
-                        ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+                        ((kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK) ||
                          (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
                         *linux_result = (int64_t)total;
                         return KERNEL_FILES_STATUS_OK;
@@ -1286,7 +1286,7 @@ static enum kernel_files_status buffered_write_request(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        int is_append = (description->open_flags & KERNEL_FILES_O_APPEND) != 0U;
+        int is_append = (kernel_open_file_flags(description) & KERNEL_FILES_O_APPEND) != 0U;
         uint64_t file_offset = positioned ? requested_offset :
                                kernel_open_file_offset(description);
 
@@ -1316,7 +1316,7 @@ static enum kernel_files_status buffered_write_request(
                 if (chunk > capacity) {
                     chunk = capacity;
                 }
-                files->record->statistics.write_chunks++;
+                KERNEL_FILES_NOTE(files, write_chunks, 1);
                 status = kernel_copy_from_user(mm, staging,
                                                 iov[index].base + offset,
                                                 chunk, &copied);
@@ -1328,7 +1328,7 @@ static enum kernel_files_status buffered_write_request(
                 }
                 if (copied == 0U) {
                     if (total != 0U) {
-                        files->record->statistics.write_failures++;
+                        KERNEL_FILES_NOTE(files, write_failures, 1);
                     }
                     *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
                     return KERNEL_FILES_STATUS_OK;
@@ -1366,13 +1366,13 @@ static enum kernel_files_status buffered_write_request(
                 total += (uint64_t)written;
                 offset += (uint64_t)written;
                 if (vfs_result != 0) {
-                    files->record->statistics.write_failures++;
+                    KERNEL_FILES_NOTE(files, write_failures, 1);
                     *linux_result = total != 0U ? (int64_t)total : vfs_result;
                     return KERNEL_FILES_STATUS_OK;
                 }
                 if (status == KERNEL_UACCESS_STATUS_FAULT) {
                     if (total != 0U) {
-                        files->record->statistics.write_failures++;
+                        KERNEL_FILES_NOTE(files, write_failures, 1);
                     }
                     *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
                     return KERNEL_FILES_STATUS_OK;
@@ -1405,7 +1405,7 @@ static enum kernel_files_status buffered_write_request(
                                             iov[index].base + offset,
                                             chunk, &copied);
             size_t written = 0U;
-            int result = description->device->write(description->device_instance, kernel_task_current(), description->open_flags, staging, copied, &written);
+            int result = description->device->write(description->device_instance, kernel_task_current(), kernel_open_file_flags(description), staging, copied, &written);
             if (written > copied) return KERNEL_FILES_STATUS_STATE;
             total += written;
             offset += written;
@@ -1415,7 +1415,7 @@ static enum kernel_files_status buffered_write_request(
             }
             if (status == KERNEL_UACCESS_STATUS_FAULT) {
                 if (total != 0U) {
-                    files->record->statistics.write_failures++;
+                    KERNEL_FILES_NOTE(files, write_failures, 1);
                 }
                 *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
                 return KERNEL_FILES_STATUS_OK;
@@ -1470,7 +1470,7 @@ static enum kernel_files_status tcp_write_request(
                     }
                     COST_IO_ADD(5, BOAROS_PAGE_SIZE);
                 }
-                files->record->statistics.write_chunks++;
+                KERNEL_FILES_NOTE(files, write_chunks, 1);
                 enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
                     buffer.data, chunk, &copied_now);
                 if ((access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT) ||
@@ -1497,7 +1497,7 @@ static enum kernel_files_status tcp_write_request(
         if (!result || (size_t)result > staged - consumed) { status = KERNEL_FILES_STATUS_STATE; break; }
         consumed += (size_t)result; total += (uint64_t)result;
         *linux_result = (int64_t)total;
-        if (fault || (consumed < staged && ((borrowed->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+        if (fault || (consumed < staged && ((kernel_open_file_flags(borrowed) & KERNEL_FILES_O_NONBLOCK) ||
             (flags & KERNEL_SOCKET_MSG_DONTWAIT)))) break;
     } while (total < count);
     kernel_socket_stream_finish(&request);
@@ -1521,7 +1521,7 @@ static enum kernel_files_status write_request(
     if (kernel_socket_is_datagram(kernel_open_file_socket(description))) {
         *linux_result = kernel_socket_write_datagram(&description, mm, iov,
             iov_count, count, socket_flags |
-                ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ? KERNEL_SOCKET_MSG_DONTWAIT : 0U), 0);
+                ((kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK) ? KERNEL_SOCKET_MSG_DONTWAIT : 0U), 0);
         COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1561,8 +1561,8 @@ static enum kernel_files_status write_request(
     if (buffer.allocator != 0) kernel_task_io_buffer_release(&buffer);
     if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&
-        (description->open_flags & KERNEL_FILES_O_DSYNC) != 0U) {
-        int datasync = (description->open_flags & KERNEL_FILES_O_SYNC) !=
+        (kernel_open_file_flags(description) & KERNEL_FILES_O_DSYNC) != 0U) {
+        int datasync = (kernel_open_file_flags(description) & KERNEL_FILES_O_SYNC) !=
                         KERNEL_FILES_O_SYNC;
         int error = kernel_vfs_sync(&description->file, datasync,
                                      &description->observed_writeback_error);
@@ -1585,15 +1585,15 @@ enum kernel_files_status kernel_files_socket_iov_io(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (writing) {
-        files->record->statistics.write_calls++;
+        KERNEL_FILES_NOTE(files, write_calls, 1);
         enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags);
         if (status == KERNEL_FILES_STATUS_OK) {
-            if (*linux_result >= 0) files->record->statistics.bytes_written += (uint64_t)*linux_result;
-            else files->record->statistics.write_failures++;
+            if (*linux_result >= 0) KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
+            else KERNEL_FILES_NOTE(files, write_failures, 1);
         }
         return status;
     }
-    files->record->statistics.read_calls++;
+    KERNEL_FILES_NOTE(files, read_calls, 1);
     return read_pinned(files, mm, *owner, owner, iov, iov_count, count, linux_result, flags, peer, message_size);
 }
 enum kernel_files_status kernel_files_socket_io(
@@ -1608,9 +1608,9 @@ enum kernel_files_status kernel_files_socket_io(
 static void account_write(struct kernel_files *files, int64_t result)
 {
     if (result >= 0) {
-        files->record->statistics.bytes_written += (uint64_t)result;
+        KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)result);
     } else {
-        files->record->statistics.write_failures++;
+        KERNEL_FILES_NOTE(files, write_failures, 1);
     }
 }
 
@@ -1635,7 +1635,7 @@ enum kernel_files_status kernel_files_write(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    files->record->statistics.write_calls++;
+    KERNEL_FILES_NOTE(files, write_calls, 1);
     status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
@@ -1671,7 +1671,7 @@ enum kernel_files_status kernel_files_write(
     if (description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description, 0, mm, &iov, 1U,
-            count, description->open_flags, linux_result);
+            count, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, &iov, 1U, count,
                            0, 0U, linux_result, 0U);
     if (status == KERNEL_FILES_STATUS_OK) {
@@ -1692,7 +1692,7 @@ enum kernel_files_status kernel_files_pwrite(
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    files->record->statistics.write_calls++;
+    KERNEL_FILES_NOTE(files, write_calls, 1);
     status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
     if (*linux_result != 0) {
@@ -1750,7 +1750,7 @@ enum kernel_files_status kernel_files_writev(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    files->record->statistics.write_calls++;
+    KERNEL_FILES_NOTE(files, write_calls, 1);
     status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
@@ -1822,7 +1822,7 @@ enum kernel_files_status kernel_files_writev(
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description,
             iov == local ? 0 : (void **)&iov, mm, iov, iovcnt,
-            total, description->open_flags, linux_result);
+            total, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, iov, iovcnt, total,
                            0, 0U, linux_result, 0U);
 out:
@@ -2053,7 +2053,7 @@ enum kernel_files_status kernel_files_getdents(
             /* Linux returns a completed prefix when a later directory
              * record fails; the failing record remains the next cookie. */
             *linux_result = total != 0U ? (int64_t)total : fill_result;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         name_length = strlen(name);
@@ -2061,7 +2061,7 @@ enum kernel_files_status kernel_files_getdents(
         if ((uint64_t)record_length > request - total) {
             /* Linux answers EINVAL when nothing fits at all. */
             *linux_result = total == 0U ? -KERNEL_EINVAL : (int64_t)total;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         reported_length = (uint16_t)record_length;
@@ -2096,7 +2096,7 @@ enum kernel_files_status kernel_files_getdents(
         if (access_status == KERNEL_UACCESS_STATUS_FAULT ||
             copied != record_length) {
             *linux_result = total == 0U ? -KERNEL_EFAULT : (int64_t)total;
-            files->record->statistics.bytes_read += total;
+            KERNEL_FILES_NOTE(files, bytes_read, total);
             return KERNEL_FILES_STATUS_OK;
         }
         total += record_length;
@@ -2106,7 +2106,7 @@ enum kernel_files_status kernel_files_getdents(
             return KERNEL_FILES_STATUS_STATE;
         }
     }
-    files->record->statistics.bytes_read += total;
+    KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -2114,7 +2114,8 @@ enum kernel_files_status kernel_files_getdents(
 #if BOAROS_COST_DIAGNOSTICS
 int kernel_files_cost_descriptor(struct kernel_files *files, int64_t fd)
 {
-    struct kernel_open_file_description *description = kernel_files_lookup_description(files, fd);
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *description = kernel_files_hold_fd(files, fd, &pin);
     return description && kernel_vfs_file_is_cost(&description->file);
 }
 #endif

@@ -23,6 +23,17 @@
 OFD 引用采用非零/溢出检查的原子取得与归还，只有最后归还者进入后端清理；
 引用计数为零的 detached cleanup owner 仍可处理原有真实清理错误，不能重新 acquire。
 原子引用只保护存储寿命，不使 offset、设备或文件业务自动获得跨核同步。
+每张 FD record 的 rank30 raw 锁保护槽、预留编号、descriptor flags、record 引用及统计。
+lookup 与 OFD acquire 在同一临界区完成；跨解锁消费者持实际 OFD pin，已移除裸 description 查询入口。
+close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已 pin 请求的身份。
+扩容先在锁外分配并清零候选，锁内复查、最多复制 8 KiB 后发布，旧数组及竞争失败候选在锁外释放。
+open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
+共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；FD_CLOEXEC 仍属于各张表。
+`kernel_files_enable_concurrency()`只在 CPU0、独占未发布表上启用同 heap/allocator 匿名 pipe 域；
+受控任务的 MM/files 引用在发布前准备，退出后在可信栈归还。普通后端、命名 FIFO、socket 和 epoll 业务仍受 CPU0 边界保护。
+`make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
+在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
+这项宿主证据不代替真实两核 pipe I/O 验收。
 受控内存文件的控制者保留独立 OFD 引用，直到映射、登记和临时准备 owner 全部结束；
 因此 CPU1 只归还非末次引用，后端最终释放仍由 CPU0 执行。
 
@@ -36,7 +47,7 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 生成式 VFS 普通文件使用独立 OFD kind，不进入普通文件页缓存或 mmap；第一次非空读取从后端取得有 owner 的数据快照。read/readv 共享 OFD offset，pread 保留 offset，短拷贝 fault 只推进已复制字节，seek 到零重新生成，末引用释放快照。当前消费者是 [procfs](procfs.md) 的 meminfo、stat/status 与 mounts；文件元数据 size 为零不决定生成式读取 EOF。
 
-`/proc/<pid>/fd` 通过短关中断区借用目标文件表，普通文件直接取得路径引用；伪对象只复制 kind/身份，不把 OFD pin 留给可能已关闭的目标任务。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
+`/proc/<pid>/fd` 在 CPU0 的目标任务借用范围内，通过 FD 锁取得临时 OFD pin；普通文件再取得路径引用，伪对象只复制 kind/身份，调用结束归还 pin。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
 
 ## 传统与 OFD 记录锁
 

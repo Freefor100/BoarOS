@@ -11,6 +11,7 @@ struct kernel_open_file_description;
 struct kernel_vfs_path;
 struct kernel_elf64_source;
 struct kernel_io_context;
+struct kernel_heap;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
 #define KERNEL_MM_WRITE (UINT32_C(1) << 1U)
@@ -62,6 +63,7 @@ struct kernel_mm {
     enum kernel_mm_state state;
     enum kernel_mm_cleanup_stage cleanup_stage;
 };
+enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *, const struct kernel_heap *);
 
 struct kernel_mm_mapping {
     uint64_t physical_address;

@@ -22,7 +22,8 @@ static int metadata_path(struct kernel_files *files,
     if (!name[0] && (flags & KERNEL_FILES_AT_EMPTY_PATH)) {
         if (dirfd == KERNEL_FS_AT_FDCWD) start = kernel_fs_context_cwd(fs);
         else {
-            struct kernel_open_file_description *file = kernel_files_lookup_description(files, dirfd);
+            KERNEL_FILES_PIN_SCOPE(selected_fd);
+            struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
             if (!file) return -KERNEL_EBADF;
             start = file->file.path;
             if (!start) return -KERNEL_ENOTSUP;
@@ -219,7 +220,8 @@ enum kernel_files_status kernel_files_fchownat(
         if ((!name || !name[0]) && (flags & KERNEL_FILES_AT_EMPTY_PATH) &&
             dirfd != KERNEL_FS_AT_FDCWD) {
             /* 空路径按选定 OFD 修改，也覆盖没有路径的共享 pipe 和已 unlink inode。 */
-            struct kernel_open_file_description *file = kernel_files_lookup_description(files, dirfd);
+            KERNEL_FILES_PIN_SCOPE(selected_fd);
+            struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
             if (file && file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
                 struct kernel_vfs_path *held = file->file.path;
                 result = kernel_vfs_path_acquire(held);

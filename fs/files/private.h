@@ -3,6 +3,7 @@
 
 #include <kernel/files.h>
 #include <kernel/rlimit.h>
+#include <kernel/raw_lock.h>
 
 #include <stdint.h>
 
@@ -31,6 +32,12 @@ int kernel_files_path_start(struct kernel_files *files,
 #define KERNEL_FILES_FD_RESERVED UINT32_C(2)
 struct kernel_files_fd_reservation { struct kernel_files *files; uint32_t fd; };
 void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reservation);
+#define KERNEL_FILES_RESERVATION_SCOPE(name) \
+    struct kernel_files_fd_reservation name __attribute__((cleanup(kernel_files_cancel_reservation))) = {0}
+enum kernel_files_status kernel_files_install_pair_reserved(
+    struct kernel_files_fd_reservation *, struct kernel_files_fd_reservation *,
+    uint32_t flags, struct kernel_open_file_description **,
+    struct kernel_open_file_description **);
 
 struct kernel_file_slot {
     struct kernel_open_file_description *description;
@@ -44,12 +51,19 @@ struct kernel_files_record {
     struct kernel_files_statistics statistics;
     uint32_t references;
     uint32_t next_fd;
+    struct kernel_raw_lock metadata_lock;
+    uint8_t retired;
+    uint8_t concurrent;
 };
+#define KERNEL_FILES_SCOPE(name, files) \
+    KERNEL_RAW_SCOPE(name, &(files)->record->metadata_lock)
+void kernel_files_note(struct kernel_files *, size_t offset, uint64_t value);
+#define KERNEL_FILES_NOTE(files, field, value) \
+    kernel_files_note((files), offsetof(struct kernel_files_statistics, field), (value))
+int kernel_files_fd_matches(struct kernel_files *, int64_t,
+    const struct kernel_open_file_description *);
 
-struct kernel_open_file_description *kernel_files_lookup_description(
-    struct kernel_files *files,
-    int64_t fd);
-
+/* 成功find取得独占预留；调用者随后安装或取消，不能遗弃编号owner。 */
 enum kernel_files_status kernel_files_find_free_fd(
     struct kernel_files *files,
     uint32_t *fd,

@@ -268,6 +268,11 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mask(
  * 受控任务只使用绑定记录；MM与任务栈最终由CPU0可信栈回收。 */
 enum kernel_scheduler_status kernel_thread_create_joinable_mm(
     void (*entry)(void *), void *, struct kernel_thread_join *, uint32_t, struct kernel_mm *);
+/* CPU0私有准备MM/files各一份引用；成功移入任务，失败完整归还。
+ * caller保留原句柄，任务只使用已校验的同域匿名pipe表。 */
+enum kernel_scheduler_status kernel_thread_create_joinable_files(
+    void (*entry)(void *), void *, struct kernel_thread_join *, uint32_t,
+    const struct kernel_mm *, const struct kernel_files *);
 enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *, uint32_t);
 int kernel_scheduler_core_quiescent(struct kernel_cpu *);
 #endif

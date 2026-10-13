@@ -21,6 +21,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/vfs.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/files/private.h"
 #include "../../kernel/sched/private.h"
 #include <string.h>
 
@@ -463,7 +464,8 @@ static void receive_reservation_probe(void *argument)
             kernel_copy_to_user(&sync_mm,OP_USER+512,"xyz",3,&copied)==KERNEL_UACCESS_STATUS_OK,276);
         sync_edit=0;
         check(kernel_files_write(&operation_files,&sync_mm,receive_pair[0],OP_USER+512,3,&result)==KERNEL_FILES_STATUS_OK && result==3,277);
-        struct kernel_socket *socket=kernel_open_file_socket(kernel_files_fd_borrow(&operation_files,receive_pair[1]));
+        KERNEL_FILES_PIN_SCOPE(socket_pin);
+        struct kernel_socket *socket=kernel_open_file_socket(kernel_files_hold_fd(&operation_files,receive_pair[1],&socket_pin));
         kernel_socket_set_receive_timeout(socket,receive_mode==1 ? 100000000 : 0);
         struct kernel_thread_join holder={0},waiter={0};
         check(kernel_thread_create_joinable(receive_owner,0,&holder)==KERNEL_SCHEDULER_STATUS_OK,278);
@@ -488,6 +490,7 @@ static void receive_reservation_probe(void *argument)
         kernel_thread_join(&holder); kernel_thread_join(&waiter);
         sync_edit=1; char bytes[3];
         check(kernel_copy_from_user(&sync_mm,bytes,OP_USER+256,3,&copied)==KERNEL_UACCESS_STATUS_OK && (receive_mode==3 ? bytes[0]==0 && bytes[1]==0 && bytes[2]==0 : !memcmp(bytes,"xyz",3)),287);
+        kernel_files_pin_guard_release(&socket_pin);
         sync_edit=receive_testing=operation_testing=0; sync_satp=0;
         check(kernel_files_release(&operation_files)==KERNEL_FILES_STATUS_OK && kernel_mm_release(&sync_mm)==KERNEL_MM_STATUS_OK &&
             physical_page_release(&allocator,table.root_address)==PHYSICAL_PAGE_STATUS_OK,288);

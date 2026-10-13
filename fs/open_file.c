@@ -776,7 +776,15 @@ uint32_t kernel_open_file_flags(
 {
     /* 创建/终端取得/fd标志不是OFD状态；F_GETFL结果可直接用于F_SETFL。 */
     const uint32_t open_only = 0100U | 0200U | 0400U | 01000U | 02000000U;
-    return open_file_live(file) ? file->open_flags & ~open_only : 0U;
+    return open_file_live(file) ? __atomic_load_n(&file->open_flags, __ATOMIC_RELAXED) & ~open_only : 0U;
+}
+void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
+{
+    if (!open_file_live(file)) __builtin_trap();
+    const uint32_t mask=00002000U | 00004000U;
+    uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&file->open_flags, &old,
+        (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
 int kernel_open_file_readable(
@@ -787,7 +795,7 @@ int kernel_open_file_readable(
     if (!open_file_live(file)) {
         return 0;
     }
-    access_mode = file->open_flags & 3U;
+    access_mode = kernel_open_file_flags(file) & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
@@ -813,8 +821,8 @@ int kernel_open_file_writable(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file) || file->kind == KERNEL_OPEN_FILE_KIND_PATH) return 0;
-    return (file->open_flags & 3U) == 1U ||
-           (file->open_flags & 3U) == 2U;
+    return (kernel_open_file_flags(file) & 3U) == 1U ||
+           (kernel_open_file_flags(file) & 3U) == 2U;
 }
 
 uint64_t kernel_open_file_offset(
@@ -1081,7 +1089,7 @@ uint32_t kernel_open_file_poll(
     if (!open_file_live(file)) {
         return KERNEL_POLLNVAL;
     }
-    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, file->open_flags, requested_events, out_queue) : 0U;
+    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, file->pipe_observed_writers, out_queue);

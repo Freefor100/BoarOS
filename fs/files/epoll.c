@@ -285,6 +285,7 @@ enum kernel_files_status kernel_files_epoll_create1(
         *linux_result = (int64_t)find_result;
         return KERNEL_FILES_STATUS_OK;
     }
+    struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd};
     if (kernel_files_install_new_owned_at(
             files,
             fd,
@@ -295,6 +296,7 @@ enum kernel_files_status kernel_files_epoll_create1(
         (void)kernel_open_file_release(&ofd);
         return KERNEL_FILES_STATUS_STATE;
     }
+    reservation.files=0;
     *linux_result = (int64_t)fd;
     return KERNEL_FILES_STATUS_OK;
 }

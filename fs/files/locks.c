@@ -153,7 +153,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
         *linux_result = -KERNEL_EBADF;
         goto out;
     }
-    if (!query && flock.type == 1 && (file->open_flags & 3U) == 0U) {
+    if (!query && flock.type == 1 && (kernel_open_file_flags(file) & 3U) == 0U) {
         *linux_result = -KERNEL_EBADF;
         goto out;
     }
@@ -204,7 +204,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
                 result = -KERNEL_ERESTARTSYS;
                 break;
             }
-            if (!kind && kernel_files_lookup_description(files, fd) != file) {
+            if (!kind && !kernel_files_fd_matches(files, fd, file)) {
                 result = -KERNEL_EBADF;
                 break;
             }

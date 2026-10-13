@@ -13,7 +13,15 @@ static _Thread_local struct mm_test_actor actor;
 static _Thread_local unsigned actor_id;
 #if BOAROS_MAX_CPUS > 1
 static _Thread_local struct kernel_mm *bound_mm;
+static _Thread_local struct kernel_files *bound_files;
 void mm_test_bind(struct kernel_mm *mm) { bound_mm = mm; }
+void mm_test_bind_files(struct kernel_files *files) { bound_files = files; }
+enum kernel_task_status kernel_task_files_borrow(struct kernel_task *task, struct kernel_files **files)
+{
+    if (task!=&actor.task || !bound_mm || !bound_files || !files)
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    *files=bound_files; return KERNEL_TASK_STATUS_OK;
+}
 enum kernel_task_status kernel_task_mm_borrow(const struct kernel_task *task, const struct kernel_mm **mm)
 {
     if (task != &actor.task || !bound_mm || !mm) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
@@ -39,6 +47,7 @@ void mm_test_attach(unsigned id)
     actor = (struct mm_test_actor){0};
 #if BOAROS_MAX_CPUS > 1
     bound_mm = 0;
+    bound_files = 0;
 #endif
     actor.task.wait.on_cpu = 1;
     kernel_wait_node_init(&actor.task.default_wait_node, &actor.task);

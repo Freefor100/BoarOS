@@ -56,12 +56,15 @@ enum kernel_files_status kernel_files_socket_create(
         *linux_result = find_result;
         return KERNEL_FILES_STATUS_OK;
     }
+    struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd};
     result = kernel_socket_create(files->heap, family, type, &socket);
     if (result != 0) {
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    return install_socket(files, socket, fd, flags, linux_result);
+    status=install_socket(files,socket,fd,flags,linux_result);
+    if (!status && *linux_result>=0) reservation.files=0;
+    return status;
 }
 
 enum kernel_files_status kernel_files_socket_accept(
@@ -83,6 +86,7 @@ enum kernel_files_status kernel_files_socket_accept(
         *linux_result = find_result;
         return KERNEL_FILES_STATUS_OK;
     }
+    struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd};
     result = kernel_socket_accept(kernel_open_file_socket(listener), &accepted);
     if (result != 0) {
         *linux_result = result;
@@ -94,7 +98,9 @@ enum kernel_files_status kernel_files_socket_accept(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    return install_socket(files, accepted, fd, flags, linux_result);
+    status=install_socket(files,accepted,fd,flags,linux_result);
+    if (!status && *linux_result>=0) reservation.files=0;
+    return status;
 }
 
 enum kernel_files_status kernel_files_socketpair_create(
@@ -163,6 +169,8 @@ enum kernel_files_status kernel_files_socketpair_create(
         return KERNEL_FILES_STATUS_OK;
     }
 
+    struct kernel_files_fd_reservation first __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd0};
+    struct kernel_files_fd_reservation second __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd1};
     pair[0] = (int32_t)fd0;
     pair[1] = (int32_t)fd1;
     if (kernel_copy_to_user(mm, user_sv, pair, sizeof(pair), &copied) != KERNEL_UACCESS_STATUS_OK ||
@@ -174,19 +182,8 @@ enum kernel_files_status kernel_files_socketpair_create(
     }
 
     fd_flags = (flags & LINUX_SOCK_CLOEXEC) != 0U ? KERNEL_FILES_FD_CLOEXEC : 0U;
-    status = kernel_files_install_new_owned_at(files, fd0, fd_flags, &ofd0);
-    if (status != KERNEL_FILES_STATUS_OK) {
-        (void)kernel_files_release_uninstalled_description(files, &ofd1);
-        (void)kernel_files_release_uninstalled_description(files, &ofd0);
-        return status;
-    }
-    status = kernel_files_install_new_owned_at(files, fd1, fd_flags, &ofd1);
-    if (status != KERNEL_FILES_STATUS_OK) {
-        int64_t dummy = 0;
-        (void)kernel_files_close(files, (int64_t)fd0, &dummy);
-        (void)kernel_files_release_uninstalled_description(files, &ofd1);
-        return status;
-    }
+    status=kernel_files_install_pair_reserved(&first,&second,fd_flags,&ofd0,&ofd1);
+    if (status) __builtin_trap();
 
     *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;

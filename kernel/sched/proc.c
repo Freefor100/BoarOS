@@ -1,4 +1,5 @@
 #include "private.h"
+#include "../../fs/files/private.h"
 
 #include <arch/context.h>
 #include <kernel/errno.h>
@@ -254,9 +255,10 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
-        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+        ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
     if (file) {
         if (kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_EPOLL) {
             *readable = 1;
@@ -276,9 +278,10 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
-        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+        ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
     struct kernel_vfs_path *path = file ? kernel_open_file_path(file) : 0;
     int result = -KERNEL_ENOENT;
     if (path && !kernel_vfs_path_acquire(path)) {
@@ -296,9 +299,10 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
-        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+        ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
     int result = file ? -KERNEL_ENOTSUP : -KERNEL_ENOENT;
     if (file && !kernel_open_file_path(file)) {
         snapshot->kind = (uint8_t)kernel_open_file_kind(file);
@@ -315,9 +319,10 @@ int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
-        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+        ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
     /* 伪对象的元数据快照不分配也不等待；解锁后不再访问 OFD。 */
     int result = file ? kernel_open_file_pseudo_stat(file, stat)
                       : -KERNEL_ENOENT;
@@ -334,9 +339,10 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     struct kernel_open_file_pipe_pin pin = {0};
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
-        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+        ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
     int result = file ? -KERNEL_ENXIO : -KERNEL_ENOENT;
     /* 解锁后 fd 可关闭；先钉住 pipe endpoint 再分配新 OFD。 */
     if (file && kernel_open_file_path(file)) result = -KERNEL_ENOTSUP;

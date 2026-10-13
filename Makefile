@@ -2208,6 +2208,10 @@ test-riscv: test-wait-riscv
 $(BUILD_DIR)/sync-%.d: ;
 -include $(BUILD_DIR)/wait-native.d $(wildcard $(BUILD_DIR)/sync-*.d)
 
+.PHONY: test-files-concurrency-host
+test-files-concurrency-host:
+	sh tests/files-concurrency-host.sh
+
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host:
 	@mkdir -p build/host
