@@ -98,7 +98,7 @@ int kernel_page_cache_check_domain(const struct kernel_page_cache *cache,
 int kernel_page_cache_is_controlled(const struct kernel_page_cache *);
 struct kernel_page_cache_concurrency_state {
     uint64_t requests_queued, requests_completed, entry_borrows;
-    uint64_t deferred_snapshots;
+    uint64_t deferred_snapshots, writeback_rounds;
     uint32_t pending, running;
     size_t entry_bytes, record_bytes, request_bytes;
 };

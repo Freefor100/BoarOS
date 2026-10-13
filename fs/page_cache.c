@@ -700,6 +700,7 @@ void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *cache,
         .requests_queued = r->requests_queued, .requests_completed = r->requests_completed,
         .entry_borrows = r->entry_borrows, .pending = r->read_requests - r->reads_running,
         .deferred_snapshots = r->deferred_snapshots,
+        .writeback_rounds = r->completed,
         .running = r->reads_running, .entry_bytes = sizeof(struct kernel_page_cache_entry),
         .record_bytes = sizeof(*r), .request_bytes = sizeof(struct cache_read_request)};
 }
@@ -1281,9 +1282,9 @@ static enum kernel_page_cache_status get_page(
     size_t *valid_bytes,
     int for_write, const void *overwrite, int *overwritten)
 {
-    struct kernel_page_cache_entry *entry;
+    struct kernel_page_cache_entry *entry = 0;
     struct kernel_vfs_node *node;
-    void *page;
+    void *page = 0;
     uint64_t offset;
     size_t bytes_read = 0U;
     enum kernel_page_cache_status lookup_status;
@@ -1310,7 +1311,7 @@ static enum kernel_page_cache_status get_page(
         return KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
     }
     { CACHE_SCOPE(miss, cache); cache->record->statistics.misses++; }
-    int created;
+    int created = 0;
     lookup_status = prepare_page(cache, node, page_index, !overwrite, &entry, &page, &created);
     if (lookup_status != KERNEL_PAGE_CACHE_STATUS_OK) return lookup_status;
     if (!created) return kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
@@ -1518,6 +1519,14 @@ static int complete_writeback(struct kernel_page_cache *cache,
     if (!entry->writeback || !cache->record->writeback_active) __builtin_trap();
     entry->writeback_error=result; entry->writeback=0; cache->record->writeback_active--;
     cache_wake(&entry->ready);
+    /* A force round can skip this foreground-owned entry and go to sleep.
+     * Successful completion must republish work if a newer dirty generation
+     * remains. Actual I/O errors retain their owner without a retry loop. */
+    if (!result && cache->record->controlled && cache->record->started &&
+        !cache->record->stopping && cache->record->force_writeback && !entry->retired && entry->dirty_end) {
+        cache->record->requested=1;
+        cache_wake(&cache->record->work);
+    }
     return result;
 }
 /* entry借用覆盖完整提交；关闭只覆盖撤写/排空/复制，不覆盖磁盘等待。 */

@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <sched.h>
+#include <time.h>
 #ifdef CACHE_MM_CASES
 void mm_test_attach(unsigned);
 #include "mm_disk_cases.h"
@@ -150,7 +151,7 @@ static void *drain_alias(void *arg)
     return 0;
 }
 static void alias_snapshot(struct kernel_page_cache *cache, struct kernel_vfs_file *file,
-    struct physical_page_allocator *pages,unsigned count)
+    struct physical_page_allocator *pages,unsigned count,int force_retry)
 {
     uint64_t address; size_t valid;
     assert(!kernel_page_cache_get(cache, file, 0, &address, &valid));
@@ -194,12 +195,39 @@ static void alias_snapshot(struct kernel_page_cache *cache, struct kernel_vfs_fi
     assert(!kernel_page_cache_alias_write_begin(&aliases[0],&writer));
     ((unsigned char *)access_page(address))[0]=0x66;
     kernel_page_cache_alias_mark_dirty(&aliases[0]); kernel_page_cache_write_end(&writer);
+    struct kernel_page_cache_statistics before_retry;
+    if (force_retry) {
+        assert(!kernel_page_cache_start_worker(cache));
+        struct kernel_page_cache_concurrency_state before_round,after_round;
+        kernel_page_cache_get_concurrency_state(cache,&before_round);
+        kernel_page_cache_get_statistics(cache,&before_retry);
+        assert(!kernel_page_cache_request_writeback(cache));
+        /* Only a completed background pass advances this value; mutex
+         * contention or unrelated CPU0 parks cannot satisfy the handshake. */
+        do {
+            kernel_page_cache_get_concurrency_state(cache,&after_round);
+            sched_yield();
+        } while (after_round.writeback_rounds==before_round.writeback_rounds);
+    }
     __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
     assert(!pthread_join(sync,0));
+    if (force_retry) {
+        struct timespec start,now; assert(!clock_gettime(CLOCK_MONOTONIC,&start));
+        for (;;) {
+            struct kernel_page_cache_statistics after;
+            kernel_page_cache_get_statistics(cache,&after);
+            if (after.worker_written>before_retry.worker_written) break;
+            assert(!clock_gettime(CLOCK_MONOTONIC,&now));
+            assert(now.tv_sec-start.tv_sec<5 && "accepted force writeback lost its completion notification");
+            sched_yield();
+        }
+        kernel_page_cache_stop_worker(cache);
+    }
     unsigned char disk_byte; size_t done;
-    assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),0,&disk_byte,1,&done) && done==1 && disk_byte==0x41);
+    assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),0,&disk_byte,1,&done) && done==1 && disk_byte==(force_retry?0x66:0x41));
     uint64_t error=kernel_vfs_error_sequence(file); assert(!kernel_vfs_sync(file,0,&error));
     assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),0,&disk_byte,1,&done) && done==1 && disk_byte==0x66);
+    if (force_retry) printf("PASS forced writeback retry: %u aliases, completed skip round, newer generation persisted\n",count);
     for (unsigned fault=1;fault<=2;fault++) {
         assert(!kernel_page_cache_alias_write_begin(&aliases[0],&writer));
         ((unsigned char *)access_page(address))[0]=(unsigned char)(0x70+fault);
@@ -345,9 +373,11 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     disk_mm_case(cache, heap, pages, &mount, name);
     kernel_page_cache_stop_worker(cache);
 #endif
-    alias_snapshot(cache, &file, pages,1);
-    alias_snapshot(cache, &file, pages,8);
-    alias_snapshot(cache, &file, pages,32);
+    for (unsigned force_retry=0;force_retry<2;force_retry++) {
+        alias_snapshot(cache, &file, pages,1,force_retry);
+        alias_snapshot(cache, &file, pages,8,force_retry);
+        alias_snapshot(cache, &file, pages,32,force_retry);
+    }
     expanded_index_case(cache,&file,pages);
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_unmount(&mount));
