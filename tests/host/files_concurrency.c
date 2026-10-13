@@ -151,6 +151,40 @@ static void reject_external_pipe_owner(struct kernel_heap *heap)
     assert(!kernel_files_release(&files));
     puts("PASS controlled pipe publication rejects ordinary aliases and independent OFDs");
 }
+/* 域接纳不能仍只识别pipe；控制引用保持后端末次释放在CPU0。 */
+static void regular_file_domain(struct kernel_heap *heap)
+{
+    struct kernel_vfs_mount *mount=0;
+    struct kernel_open_file_description *control=0,*slot=0;
+    int error; int64_t result;
+    assert(!kernel_tmpfs_create(heap,0,"",&mount));
+    assert(!kernel_open_file_create_mode(heap,mount,"/regular",0600,&control,&error) && !error);
+    control->open_flags=2;
+    files=(struct kernel_files){0};
+    assert(!kernel_files_create(&files,heap));
+    slot=control; assert(!kernel_open_file_acquire(slot));
+    assert(!kernel_files_install_new_owned_at(&files,0,0,&slot));
+    assert(!kernel_open_file_release(&control));
+    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
+        !files.record->concurrent);
+    assert(!kernel_files_pin(&files,0,&control,&result) && !result);
+    assert(!kernel_files_enable_concurrency(&files,&domain_mm) &&
+        "same-arena regular OFD with a CPU0 control owner was rejected");
+    struct kernel_files ordinary={0};
+    assert(!kernel_files_create(&ordinary,heap));
+    slot=control; assert(!kernel_open_file_acquire(slot));
+    assert(kernel_files_install_shared_acquired_at(&ordinary,0,0,&slot)==KERNEL_FILES_STATUS_STATE && slot);
+    assert(!kernel_open_file_release(&slot) && !kernel_files_release(&ordinary));
+    mm_test_attach(1); mm_test_bind(&domain_mm); mm_test_bind_files(&files);
+    assert(!kernel_files_dup(&files,0,&result) && result==1);
+    assert(!kernel_files_close(&files,0,&result) && !result);
+    assert(!kernel_files_close(&files,1,&result) && !result);
+    assert(__atomic_load_n(&control->references,__ATOMIC_ACQUIRE)==1);
+    mm_test_attach(0);
+    assert(!kernel_files_release(&files));
+    assert(!kernel_open_file_release(&control) && !kernel_vfs_unmount(mount));
+    puts("PASS regular FD domain, cross-CPU dup/close, CPU0 final backend owner");
+}
 static unsigned allocated[4][192], group_ready, group_release;
 static _Thread_local unsigned fail_growth;
 static unsigned maximum_copy, metadata_acquisitions;
@@ -332,6 +366,7 @@ int main(void)
     assert(!kernel_mm_enable_concurrency(&domain_mm));
     directory_pin_handoff(&heap,1);
     reject_external_pipe_owner(&heap);
+    regular_file_domain(&heap);
     concurrent_dup_case(&heap,2); concurrent_dup_case(&heap,4);
 #ifdef PIPE_CONCURRENCY_CASES
     broken_kernel_writer(&heap);

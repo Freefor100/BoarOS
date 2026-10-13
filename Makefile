@@ -29,6 +29,8 @@ MM_FILE_SMP_TEST ?= 0
 MM_DISK_SMP_TEST ?= 0
 FILES_SMP_TEST ?= 0
 FILES_SMP_BUILD ?= build/riscv-files-smp-test
+FILE_IO_SMP_TEST ?= 0
+FILE_IO_SMP_BUILD ?= build/riscv-file-io-smp-test
 SMP_TEST_PROFILE ?= normal
 ifneq ($(filter $(SMP_TEST_PROFILE),normal missing-rfence denied-start guard denied-stop rfence-error mm-fence-i),$(SMP_TEST_PROFILE))
 $(error invalid SMP_TEST_PROFILE)
@@ -100,6 +102,14 @@ endif
 ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
 $(error SMP plus COST is unsupported)
 endif
+ifneq ($(filter $(FILE_IO_SMP_TEST),0 1),$(FILE_IO_SMP_TEST))
+$(error FILE_IO_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(FILE_IO_SMP_TEST),1)
+ifneq ($(FILES_SMP_TEST),1)
+$(error FILE_IO_SMP_TEST requires the controlled FD fixture)
+endif
+endif
 ifneq ($(filter $(COST_DIAGNOSTICS),0 1),$(COST_DIAGNOSTICS))
 $(error COST_DIAGNOSTICS must be 0 or 1)
 endif
@@ -142,6 +152,10 @@ endif
 ifeq ($(FILES_SMP_TEST),1)
 BUILD_DIR := $(FILES_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
 KERNEL_RV := $(FILES_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(FILE_IO_SMP_TEST),1)
+BUILD_DIR := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -401,6 +415,11 @@ ifeq ($(FILES_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/files_smp.o
 LDFLAGS += -Wl,--wrap=kernel_wait_park
 endif
+ifeq ($(FILE_IO_SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/file_io_smp.o
+LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt
+endif
+$(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
 endif
 TEST_RUNTIME_C_SOURCES := \
@@ -2227,6 +2246,10 @@ $(BUILD_DIR)/sync-%.d: ;
 -include $(BUILD_DIR)/wait-native.d $(wildcard $(BUILD_DIR)/sync-*.d)
 
 .PHONY: test-files-concurrency-host
+.PHONY: test-file-io-concurrency-host
+test-file-io-concurrency-host:
+	sh tests/file-io-concurrency-host.sh
+
 test-files-concurrency-host:
 	sh tests/files-concurrency-host.sh
 
@@ -2357,6 +2380,23 @@ test-mm-disk-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PT
 		BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
 		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-disk-smp-test/runs/user-$$memory \
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-disk-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-file-io-smp-riscv test-file-io-smp-userland-riscv
+test-file-io-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 FILE_IO_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,-e,_start tests/riscv/mm_disk_init.S -o $(FILE_IO_SMP_BUILD)/init
+	python3 -B tests/smp/riscv.py --contract file-io --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(FILE_IO_SMP_BUILD)/kernel-rv --init $(FILE_IO_SMP_BUILD)/init --output $(FILE_IO_SMP_BUILD)/runs
+
+test-file-io-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 FILE_IO_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_FILE_IO=1 BOAROS_SMP_FILES=1 BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(abspath $(FILE_IO_SMP_BUILD))/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(abspath $(FILE_IO_SMP_BUILD))/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
 		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \

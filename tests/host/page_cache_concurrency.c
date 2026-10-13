@@ -37,6 +37,33 @@ static enum kernel_page_cache_status expected_status;
 static unsigned watch_stop, stop_entered, stop_done;
 static struct kernel_page_cache *current_cache;
 static struct kernel_vfs_file *current_file;
+static unsigned execute_calls;
+static void execute_on_cpu0(void *argument)
+{
+    assert(kernel_cpu_current()->logical_id==0 && !kernel_cpu_current()->raw_locks &&
+        !kernel_io_context_current()->locks);
+    assert(argument==&execute_calls);
+    execute_calls++;
+}
+static void *execute_client(void *unused)
+{
+    (void)unused; mm_test_attach(1);
+    assert(!kernel_page_cache_run_cpu0(current_cache,execute_on_cpu0,&execute_calls));
+    return 0;
+}
+static void execution_case(struct kernel_page_cache *cache)
+{
+    current_cache=cache; execute_calls=0;
+    assert(!kernel_page_cache_start_worker(cache));
+    pthread_t client;
+    assert(!pthread_create(&client,0,execute_client,0) && !pthread_join(client,0));
+    assert(execute_calls==1);
+    kernel_page_cache_stop_worker(cache);
+    struct kernel_page_cache_concurrency_state state;
+    kernel_page_cache_get_concurrency_state(cache,&state);
+    assert(!state.pending && !state.running && state.requests_queued==state.requests_completed);
+    puts("PASS CPU0 execution completes outside cache protection before caller unwind");
+}
 static uint64_t received[5];
 extern unsigned mm_test_parked(unsigned);
 static enum kernel_block_status image_read(void *context, uint64_t off, void *out, size_t size)
@@ -418,6 +445,7 @@ int main(int argc, char **argv)
         cold_case(&cache, &heap, &pages, argv[1], 2);
         cold_case(&cache, &heap, &pages, argv[1], 4);
     }
+    execution_case(&cache);
     assert(!kernel_page_cache_destroy(&cache));
     assert(!physical_page_allocator_audit(&pages));
     assert(physical_page_available(&pages) == baseline);

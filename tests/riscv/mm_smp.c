@@ -25,6 +25,12 @@ void riscv_files_smp_prepare(struct kernel_heap *,struct kernel_mm *,unsigned,
     struct kernel_open_file_description *,struct kernel_page_cache *);
 void riscv_files_smp_overlap_start(void),riscv_files_smp_overlap_finish(void),riscv_files_smp_run(void);
 #endif
+#if BOAROS_FILE_IO_SMP_TEST
+void riscv_file_io_prepare(struct kernel_heap *,struct kernel_mm *,unsigned,
+    struct kernel_open_file_description *,struct kernel_page_cache *);
+void riscv_file_io_overlap_start(void),riscv_file_io_overlap_finish(void),riscv_file_io_run(void);
+uint64_t riscv_file_io_retained_shared_pages(void);
+#endif
 #define DATA UINT64_C(0x40000)
 #define CODE UINT64_C(0x40000000)
 static struct physical_page_allocator *system_pages;
@@ -768,7 +774,13 @@ static void shared_case(void)
     require(!kernel_vfs_ftruncate(&file_controller->file,0),"file-controller-final-backing-return");
 #endif
     uint32_t refs; require(physical_page_reference_count(&arena,shared_retired[0],&refs)==PHYSICAL_PAGE_STATUS_OK && refs==1 &&
-        !arena.shared_anon_pages,"shared-only-last-pin-remains");
+        arena.shared_anon_pages==
+#if BOAROS_FILE_IO_SMP_TEST
+        riscv_file_io_retained_shared_pages(),
+#else
+        0,
+#endif
+        "shared-only-last-pin-remains");
     __atomic_store_n(&shared_pin_release,1,__ATOMIC_RELEASE); wait_flag(&completed[0],"shared-last-pin-return");
     require(kernel_mm_release(&child)==KERNEL_MM_STATUS_OK,"shared-child-caller-owner-return");
 #if BOAROS_MM_FILE_TEST
@@ -997,6 +1009,9 @@ static void execute(void *unused)
 #if BOAROS_FILES_SMP_TEST
     riscv_files_smp_run();
 #endif
+#if BOAROS_FILE_IO_SMP_TEST
+    riscv_file_io_run();
+#endif
     kernel_mm_get_concurrency_state(&parent, &state);
     require(state.references == 1 && !state.pins && !state.write_pins && !state.active_cpus &&
         !state.pending_retirement, "mm-last-owner-quiescent");
@@ -1073,9 +1088,15 @@ static void start_mm_actors(void *unused)
 #if BOAROS_FILES_SMP_TEST
     riscv_files_smp_prepare(&heap,&parent,cpu_count,file_controller,&disk_cache);
 #endif
+#if BOAROS_FILE_IO_SMP_TEST
+    riscv_file_io_prepare(&heap,&parent,cpu_count,file_controller,&disk_cache);
+#endif
     if (root_mode) {
 #if BOAROS_FILES_SMP_TEST
         riscv_files_smp_overlap_start();
+#endif
+#if BOAROS_FILE_IO_SMP_TEST
+        riscv_file_io_overlap_start();
 #endif
         require(cpu_count == 2 || BOAROS_MM_DISK_TEST, "mm-root-needs-two-CPUs");
         send(1, 11);
@@ -1117,6 +1138,9 @@ void riscv_smp_test_root_finish(void)
 #endif
 #if BOAROS_FILES_SMP_TEST
     riscv_files_smp_overlap_finish();
+#endif
+#if BOAROS_FILE_IO_SMP_TEST
+    riscv_file_io_overlap_finish();
 #endif
     require(root_mode && __atomic_load_n(&background_count, __ATOMIC_ACQUIRE) > background_begin, "mm-real-user-overlap");
     __atomic_store_n(&root_release, 1, __ATOMIC_RELEASE);

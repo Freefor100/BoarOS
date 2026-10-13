@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+build_dir=${FILE_IO_HOST_BUILD:-build/host/file-io}
+mkdir -p "$build_dir"
+set --
+for symbol in $(sed -n 's/^EXCLUDED(\([^)]*\)).*/\1/p' tests/host/file_io_excluded.c); do
+    set -- "$@" "-Wl,--wrap=$symbol"
+done
+for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
+    ${HOST_CC:-cc} -std=gnu11 -O2 -g -Wall -Wextra -Werror -pthread \
+        -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 \
+        -DFILE_IO_CASES -Itests/host/mm -Itests/host/sync -idirafter include \
+        -c kernel/sched/process.c -o "$build_dir/process-$shift.o"
+    # 调度执行由pthread模型提供；该weak化仅移除未链接的客户机join定义，
+    # task定位及scratch acquire/release均使用生产process实现。
+    ${HOST_OBJCOPY:-objcopy} --weaken-symbol=kernel_thread_join "$build_dir/process-$shift.o"
+    ${HOST_CC:-cc} -std=gnu11 -O2 -g -Wall -Wextra -Werror -pthread \
+        -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 \
+        -DFILE_IO_CASES -DFILES_PIPE_CASES -DCONFIG_USE_DEFAULT_CFG=1 \
+        -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
+        -include tests/host/lwext4_memory.h -Wno-unused-but-set-variable -Wno-stringop-truncation \
+        -Ithird_party/lwext4/include -Itests/host/mm -Itests/host/sync -idirafter net/lwip_port/include \
+        -idirafter third_party/lwip/src/include -idirafter include \
+        tests/host/file_io_concurrency.c tests/host/file_io_excluded.c tests/host/mm/context.c tests/host/mm/disk_context.c \
+        kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c "$build_dir/process-$shift.o" \
+        kernel/physical_page.c mm/heap.c mm/memory_object.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
+        fs/files/table.c fs/files/io.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c fs/open_file.c \
+        fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \
+        fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c kernel/block.c net/socket.c \
+        third_party/lwext4/src/*.c ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
+        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=kernel_vfs_file_accessed \
+        -o "$build_dir/concurrency-$shift"
+    truncate -s 32M "$build_dir/image-$shift.img"
+    mkfs.ext4 -q -F -b 4096 "$build_dir/image-$shift.img"
+    timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift.img"
+    e2fsck -fn "$build_dir/image-$shift.img" > "$build_dir/fsck-$shift.log" 2>&1
+done

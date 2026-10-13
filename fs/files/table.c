@@ -153,7 +153,14 @@ enum kernel_files_status kernel_files_create(
 static int description_in_domain(const struct kernel_files *files,
     const struct kernel_open_file_description *file)
 {
-    return !file || (file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->heap==files->heap &&
+    if (!file) return 1;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
+        unsigned domain=__atomic_load_n(&file->io_domain,__ATOMIC_ACQUIRE);
+        if (domain>2) __builtin_trap();
+        return file->heap==files->heap && domain &&
+            !file->ep_items && !file->record_locks && !file->device_opened;
+    }
+    return (file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->heap==files->heap &&
         file->pipe && file->pipe->heap==files->heap && !file->pipe->fifo_node &&
         file->pipe->allocator==files->heap->page_allocator && !file->file.private_data &&
         !file->ep_items && !file->record_locks && !file->device_opened);
@@ -182,6 +189,7 @@ static int private_pipe_owners(const struct kernel_files_record *record,
 static int prepare_pipe_install(struct kernel_open_file_description *a,
     struct kernel_open_file_description *b)
 {
+    if (a->kind==KERNEL_OPEN_FILE_KIND_REGULAR) return b ? -KERNEL_EBUSY : 0;
     if (b && (b==a || b->pipe!=a->pipe)) return -KERNEL_EBUSY;
     if (__atomic_load_n(&a->pipe->concurrent,__ATOMIC_ACQUIRE)) return 0;
     if (__atomic_load_n(&a->references,__ATOMIC_ACQUIRE)!=1 ||
@@ -190,6 +198,27 @@ static int prepare_pipe_install(struct kernel_open_file_description *a,
     return kernel_pipe_enable_concurrency(a->pipe,1+!!b,
         !!(a->pipe_endpoint & 1)+(b && (b->pipe_endpoint & 1)),
         !!(a->pipe_endpoint & 2)+(b && (b->pipe_endpoint & 2)),1);
+}
+static int private_regular_candidate(const struct kernel_files *files,
+    const struct kernel_open_file_description *file)
+{
+    return file && file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && file->heap==files->heap &&
+        !file->ep_items && !file->record_locks && !file->device_opened && !file->generated_ready;
+}
+/* 私有record的槽owner固定此解锁范围。额外引用必须由CPU0控制者持有，
+ * 直到任务/请求/MM结束；引用数检查不能替代调用者的控制owner契约。 */
+static int private_regular_prepare(struct kernel_files *files,
+    struct kernel_open_file_description *file,int commit)
+{
+    uint32_t slots=0;
+    for (uint32_t i=0;i<files->record->statistics.capacity;i++)
+        slots+=files->record->slots[i].description==file;
+    if (__atomic_load_n(&file->references,__ATOMIC_ACQUIRE)<=slots ||
+        kernel_open_file_check_io_domain(file,files->heap,files->heap->page_allocator))
+        return -KERNEL_EBUSY;
+    if (commit) __atomic_store_n(&file->io_domain,
+        kernel_open_file_memory_backed(file)?1:2,__ATOMIC_RELEASE);
+    return 0;
 }
 enum kernel_files_status kernel_files_check_concurrent_domain(
     const struct kernel_files *files, const struct kernel_mm *mm)
@@ -214,7 +243,8 @@ enum kernel_files_status kernel_files_enable_concurrency(
         record->cleanup_files || record->record_locks) return KERNEL_FILES_STATUS_STATE;
     for (uint32_t i=0; i<record->statistics.capacity; i++)
         if (record->slots[i].flags & KERNEL_FILES_FD_RESERVED ||
-            !description_in_domain(files,record->slots[i].description))
+            (!description_in_domain(files,record->slots[i].description) &&
+             !private_regular_candidate(files,record->slots[i].description)))
             return KERNEL_FILES_STATUS_STATE;
     /* 私有、独占record的槽owner覆盖这个解锁范围；FD和pipe raw不嵌套。 */
     kernel_raw_scope_release(&guard);
@@ -225,9 +255,14 @@ enum kernel_files_status kernel_files_enable_concurrency(
             if (!file) continue;
             uint32_t j;
             for (j=0;j<i;j++)
-                if (record->slots[j].description && record->slots[j].description->pipe==file->pipe) break;
+                if (record->slots[j].description &&
+                    (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR ?
+                     record->slots[j].description==file :
+                     record->slots[j].description->kind==KERNEL_OPEN_FILE_KIND_PIPE &&
+                     record->slots[j].description->pipe==file->pipe)) break;
             if (j<i) continue;
-            if (private_pipe_owners(record,file->pipe,commit)) {
+            if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR ?
+                private_regular_prepare(files,file,commit) : private_pipe_owners(record,file->pipe,commit)) {
                 if (commit) __builtin_trap();
                 return KERNEL_FILES_STATUS_STATE;
             }
@@ -489,10 +524,10 @@ static enum kernel_files_status install_owned_locked(
     if (!files->record->concurrent && (*owner)->kind==KERNEL_OPEN_FILE_KIND_PIPE &&
         (*owner)->pipe && __atomic_load_n(&(*owner)->pipe->concurrent,__ATOMIC_ACQUIRE))
         return KERNEL_FILES_STATUS_STATE;
-    if (files->record->concurrent && ((*owner)->kind!=KERNEL_OPEN_FILE_KIND_PIPE ||
-        (*owner)->heap!=files->heap || !(*owner)->pipe ||
-        (*owner)->pipe->heap!=files->heap || (*owner)->pipe->fifo_node ||
-        (*owner)->pipe->allocator!=files->heap->page_allocator))
+    if (!files->record->concurrent && (*owner)->kind==KERNEL_OPEN_FILE_KIND_REGULAR &&
+        __atomic_load_n(&(*owner)->io_domain,__ATOMIC_ACQUIRE))
+        return KERNEL_FILES_STATUS_STATE;
+    if (files->record->concurrent && !description_in_domain(files,*owner))
         return KERNEL_FILES_STATUS_STATE;
     if (fd >= files->record->statistics.capacity ||
         (fd_flags & ~KERNEL_FILES_FD_CLOEXEC) != 0U) {
@@ -692,6 +727,7 @@ enum kernel_files_status kernel_files_open_console(
     int64_t fd,
     int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     struct kernel_open_file_description *description = 0;
     enum kernel_open_file_status open_status;
 
@@ -728,6 +764,7 @@ enum kernel_files_status kernel_files_open_boot_console(
     struct kernel_files *files, struct kernel_vfs_path *root,
     int64_t fd, int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     if (!kernel_files_is_live(files) || !root || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (fd < 0 || (uint64_t)fd >= files->record->statistics.capacity ||

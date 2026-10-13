@@ -76,7 +76,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
         validate_mm_failure(text,profile,contract)
         print(f"RV mm-disk profile={profile} RAM={memory} retained owners; recovery unverified",flush=True)
         return text
-    if contract in ("mm-disk","files"):
+    if contract in ("mm-disk","files","file-io"):
         required=("disk MM CPU0 I/O/cache/alias/mount owners returned",
                   "file MM stale preparation/EOF/regrowth/private COW passed",
                   "MM arena closure live=0x0 heap-pages=0x0",
@@ -87,12 +87,14 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
                   "file MM real ext4 cross-root/source/registration/pin/RFENCE owners passed")
         if any(marker not in text for marker in required) or "SMP failure" in text or "SMP fatal" in text:
             raise RuntimeError(f"missing native disk MM closure:\n{text[-5000:]}")
-        if contract=="files":
+        if contract in ("files","file-io"):
             if ("FILES SMP native FD reuse/early wake/EOF/cancel/content/task rollback passed" not in text or
                 "FILES SMP root overlap packets=" not in text or
                 "FD/OFD/pipe/wait owners returned" not in text or
                 "BoarOS: PID 1 exited status=0x2a" not in text):
                 raise RuntimeError(f"missing native FD/pipe/root closure:\n{text[-5000:]}")
+        if contract=="file-io" and "FILE IO native cold buffer/offset/prefix/sync/close owners passed" not in text:
+            raise RuntimeError("missing ordinary file IO and owner closure")
         for disk in disks:
             subprocess.run(["e2fsck","-fn",str(disk)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
         print(f"RV {contract} cpus={cpus} RAM={memory} actual I/O and owner closure passed",flush=True)
@@ -171,12 +173,12 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build/riscv-smp/runs"))
     parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
-    parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file", "mm-disk", "files"), default="scheduler")
+    parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file", "mm-disk", "files", "file-io"), default="scheduler")
     parser.add_argument("--init",type=Path)
     args = parser.parse_args()
-    if args.contract=="files" and args.profile!="normal":
+    if args.contract in ("files","file-io") and args.profile!="normal":
         parser.error("FD/pipe composition uses the normal profile; RFENCE errors have the existing MM contracts")
-    if args.contract in ("mm-disk","files"):
+    if args.contract in ("mm-disk","files","file-io"):
         if not args.init or args.profile not in ("normal","rfence-error"): parser.error("disk MM requires --init and normal/rfence-error profile")
         for cpus in ((2,1) if args.profile=="normal" else (2,)):
             for memory in ("512M","1G"):
@@ -193,6 +195,8 @@ def main():
                 text=boot(args.qemu,args.firmware,args.kernel,memory,cpus,folder/"restart",contract=args.contract,disks=(root,disk))
                 if "disk MM independent restart durable content passed" not in text:
                     raise RuntimeError("independent restart did not verify the durable bytes")
+                if args.contract=="file-io" and "FILE IO independent restart content passed" not in text:
+                    raise RuntimeError("independent restart did not verify ordinary file content")
         return
     if (args.contract in ("mm-shared", "mm-file", "mm-disk") and args.profile not in ("normal", "rfence-error")) or (args.contract == "mm" and args.profile not in ("normal", "rfence-error", "mm-fence-i")) or (args.contract != "mm" and args.profile == "mm-fence-i"):
         parser.error("profile does not belong to the selected contract")

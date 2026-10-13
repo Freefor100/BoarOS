@@ -6,6 +6,7 @@
 #include "../vfs_internal.h"
 
 #include <kernel/cost.h>
+#include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -27,6 +28,39 @@
 #include <arch/context.h>
 
 #define KERNEL_FILES_WRITE_STAGING 64U
+
+/* 调用现场持OFD pin及MM/files owner；callback结束之前iov与结果地址不退栈。
+ * 队列只借用这些owner，不重查fd或再复制数据。 */
+struct regular_call {
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    struct kernel_open_file_description *description;
+    struct kernel_open_file_description **description_owner;
+    const struct kernel_uaccess_iovec *iov;
+    size_t iov_count;
+    uint64_t count, user_buffer, requested_offset, whence;
+    int64_t offset;
+    int positioned;
+    int64_t *result;
+    enum kernel_files_status status;
+};
+static int regular_remote(struct kernel_open_file_description *file)
+{
+    return kernel_open_file_io_requires_cpu0(file);
+}
+static enum kernel_files_status regular_dispatch(struct regular_call *call,void (*execute)(void *))
+{
+    call->status=KERNEL_FILES_STATUS_STATE;
+    enum kernel_page_cache_status status=kernel_page_cache_run_cpu0(
+        kernel_open_file_page_cache(call->description),execute,call);
+    return status?KERNEL_FILES_STATUS_STATE:call->status;
+}
+static void read_cpu0(void *);
+static void pread_cpu0(void *);
+static void write_cpu0(void *);
+static void seek_cpu0(void *);
+static void sync_cpu0(void *);
+static void truncate_cpu0(void *);
 
 /* 核心只报告接纳/断端；仅真实用户调用有SIGPIPE及syscall restart上下文。 */
 static enum kernel_files_status pipe_user_result(int64_t bytes,unsigned broken)
@@ -235,6 +269,27 @@ static enum kernel_files_status memory_read(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status sync_pinned(struct kernel_open_file_description *description,
+    int datasync,int64_t *linux_result)
+{
+    if (regular_remote(description)) {
+        struct regular_call call={.description=description,.positioned=datasync,.result=linux_result};
+        return regular_dispatch(&call,sync_cpu0);
+    }
+    enum kernel_open_file_kind kind=kernel_open_file_kind(description);
+    KERNEL_LOCK_SCOPE(offset);
+    if ((kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY) &&
+        !kernel_lock_held(&description->offset_lock.lock,1))
+        kernel_mutex_lock(&description->offset_lock,&offset);
+    *linux_result=kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ?
+        kernel_vfs_sync(&description->file,datasync,&description->observed_writeback_error):-KERNEL_EINVAL;
+    return KERNEL_FILES_STATUS_OK;
+}
+static void sync_cpu0(void *argument)
+{
+    struct regular_call *call=argument;
+    call->status=sync_pinned(call->description,call->positioned,call->result);
+}
 enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     int64_t fd, int datasync, int64_t *linux_result)
 {
@@ -244,13 +299,8 @@ enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) return status;
-    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
-    *linux_result = kind == KERNEL_OPEN_FILE_KIND_REGULAR ||
-                    kind == KERNEL_OPEN_FILE_KIND_DIRECTORY
-        ? kernel_vfs_sync(&description->file, datasync,
-                            &description->observed_writeback_error)
-        : -KERNEL_EINVAL;
-    return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+    status=sync_pinned(description,datasync,linux_result);
+    return release_io_description(files,&description,status);
 }
 
 enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
@@ -259,6 +309,7 @@ enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
     struct kernel_open_file_description *description = 0;
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
     if (description->file.mount)
@@ -285,6 +336,11 @@ static enum kernel_files_status read_pinned(
     int64_t *linux_result, uint32_t socket_flags,
     struct kernel_socket_address *peer, uint32_t *message_size)
 {
+    if (regular_remote(description)) {
+        struct regular_call call={.files=files,.mm=mm,.description=description,
+            .description_owner=description_owner,.iov=iov,.iov_count=iov_count,.count=count,.result=linux_result};
+        return regular_dispatch(&call,read_cpu0);
+    }
     KERNEL_LOCK_SCOPE(offset_guard);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
@@ -588,6 +644,12 @@ static enum kernel_files_status read_pinned(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static void read_cpu0(void *argument)
+{
+    struct regular_call *call=argument;
+    call->status=read_pinned(call->files,call->mm,call->description,call->description_owner,
+        call->iov,call->iov_count,call->count,call->result,0,0,0);
+}
 enum kernel_files_status kernel_files_read(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -749,6 +811,11 @@ static enum kernel_files_status pread_pinned(
     int64_t offset,
     int64_t *linux_result)
 {
+    if (regular_remote(description)) {
+        struct regular_call call={.files=files,.mm=mm,.description=description,
+            .user_buffer=user_buffer,.count=count,.offset=offset,.result=linux_result};
+        return regular_dispatch(&call,pread_cpu0);
+    }
     uint64_t position;
     uint64_t request;
     uint64_t total = 0U;
@@ -910,6 +977,12 @@ static enum kernel_files_status pread_pinned(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static void pread_cpu0(void *argument)
+{
+    struct regular_call *call=argument;
+    call->status=pread_pinned(call->files,call->mm,call->description,
+        call->user_buffer,call->count,call->offset,call->result);
+}
 enum kernel_files_status kernel_files_pread(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, uint64_t count, int64_t offset,
@@ -1119,6 +1192,7 @@ enum kernel_files_status kernel_files_sendfile(
     size_t copied = 0;
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     if (user_offset != 0U && (kernel_copy_from_user(mm, &position, user_offset,
             sizeof(position), &copied) != KERNEL_UACCESS_STATUS_OK || copied != sizeof(position))) {
         *linux_result = -KERNEL_EFAULT; return KERNEL_FILES_STATUS_OK;
@@ -1527,6 +1601,12 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result, uint32_t socket_flags)
 {
+    if (regular_remote(description)) {
+        struct regular_call call={.files=files,.mm=mm,.description=description,
+            .iov=iov,.iov_count=iov_count,.count=count,.positioned=positioned,
+            .requested_offset=requested_offset,.result=linux_result};
+        return regular_dispatch(&call,write_cpu0);
+    }
     COST_SCOPE(write_cost, OPERATION_TICKS);
     COST_IO_SCOPE(io_cost,
         kernel_socket_is_datagram(kernel_open_file_socket(description)) ? 2 :
@@ -1547,7 +1627,8 @@ static enum kernel_files_status write_request(
         return status;
     }
     KERNEL_LOCK_SCOPE(offset_guard);
-    if ((!positioned && kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
+    if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
+         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
     KERNEL_LOCK_SCOPE(operation_guard);
@@ -1588,6 +1669,12 @@ static enum kernel_files_status write_request(
     return status;
 }
 
+static void write_cpu0(void *argument)
+{
+    struct regular_call *call=argument;
+    call->status=write_request(call->files,call->mm,call->description,call->iov,call->iov_count,
+        call->count,call->positioned,call->requested_offset,call->result,0);
+}
 enum kernel_files_status kernel_files_socket_iov_io(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description **owner,
@@ -1856,6 +1943,10 @@ static enum kernel_files_status lseek_pinned(
     struct kernel_open_file_description *description, int64_t offset,
     uint64_t whence, int64_t *linux_result)
 {
+    if (regular_remote(description)) {
+        struct regular_call call={.description=description,.offset=offset,.whence=whence,.result=linux_result};
+        return regular_dispatch(&call,seek_cpu0);
+    }
     int64_t current, target;
     KERNEL_LOCK_SCOPE(offset_guard);
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
@@ -1930,6 +2021,11 @@ static enum kernel_files_status lseek_pinned(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static void seek_cpu0(void *argument)
+{
+    struct regular_call *call=argument;
+    call->status=lseek_pinned(call->description,call->offset,call->whence,call->result);
+}
 enum kernel_files_status kernel_files_lseek(
     struct kernel_files *files, int64_t fd, int64_t offset,
     uint64_t whence, int64_t *linux_result)
@@ -1947,42 +2043,50 @@ enum kernel_files_status kernel_files_lseek(
     return release_io_description(files, &description, status);
 }
 
-enum kernel_files_status kernel_files_ftruncate(
-    struct kernel_files *files,
-    int64_t fd,
-    uint64_t length,
-    int64_t *linux_result)
+static enum kernel_files_status truncate_pinned(struct kernel_open_file_description *description,
+    uint64_t length,int64_t *linux_result)
 {
-    struct kernel_open_file_description *description = 0;
-    enum kernel_files_status status;
-    int vfs_result;
-
-    if (!kernel_files_is_live(files) || linux_result == 0) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (regular_remote(description)) {
+        struct regular_call call={.description=description,.count=length,.result=linux_result};
+        return regular_dispatch(&call,truncate_cpu0);
     }
-    status = kernel_files_pin_data(files, fd, &description, linux_result);
-    if (status != KERNEL_FILES_STATUS_OK) {
-        return status;
+#if BOAROS_MAX_CPUS>1
+    if (__atomic_load_n(&description->io_domain,__ATOMIC_ACQUIRE)==1) {
+        struct kernel_task *task=kernel_task_current(); const struct kernel_mm *bound=0;
+        if (kernel_cpu_current()->logical_id ||
+            (task && !kernel_task_has_user_context(task) && !kernel_task_mm_borrow(task,&bound)))
+            return KERNEL_FILES_STATUS_STATE;
     }
-    if (*linux_result != 0) {
-        *linux_result = -KERNEL_EBADF;
-        return KERNEL_FILES_STATUS_OK;
-    }
+#endif
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_DIRECTORY) {
         *linux_result = -KERNEL_EISDIR;
-        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+        return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR) {
         *linux_result = -KERNEL_EINVAL;
-        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+        return KERNEL_FILES_STATUS_OK;
     }
     if (!description_writable(description)) {
         *linux_result = -KERNEL_EINVAL;
-        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+        return KERNEL_FILES_STATUS_OK;
     }
-    vfs_result = kernel_vfs_ftruncate(&description->file, length);
-    *linux_result = vfs_result;
-    return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+    *linux_result=kernel_vfs_ftruncate(&description->file,length);
+    return KERNEL_FILES_STATUS_OK;
+}
+static void truncate_cpu0(void *argument)
+{
+    struct regular_call *call=argument;
+    call->status=truncate_pinned(call->description,call->count,call->result);
+}
+enum kernel_files_status kernel_files_ftruncate(struct kernel_files *files,int64_t fd,
+    uint64_t length,int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    struct kernel_open_file_description *description=0;
+    enum kernel_files_status status=kernel_files_pin_data(files,fd,&description,linux_result);
+    if (status || *linux_result) return status;
+    status=truncate_pinned(description,length,linux_result);
+    return release_io_description(files,&description,status);
 }
 
 enum kernel_files_status kernel_files_getdents(

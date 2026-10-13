@@ -2169,6 +2169,24 @@ static enum kernel_mm_status require_active_space(
     }
     return KERNEL_MM_STATUS_OK;
 }
+/* 受控fault仅使用owned PTE及完成确认后的退休路径。普通CPU0服务任务
+ * 可以在kernel根上复制另一MM；真实owner+gate25固定物理页表，不能借此
+ * 放宽用户任务、受控任务或普通MM的活动地址空间检查。 */
+static enum kernel_mm_status require_fault_space(const struct kernel_mm_record *record)
+{
+    enum kernel_mm_status status=require_active_space(record);
+    if (status==KERNEL_MM_STATUS_OK) return status;
+#if BOAROS_MAX_CPUS>1
+    struct kernel_task *task=kernel_task_current(); const struct kernel_mm *bound=0;
+    if (record->concurrent && !kernel_cpu_current()->logical_id &&
+        kernel_lock_held(&record->operations.lock,1) &&
+        (!task || (!kernel_task_has_user_context(task) && kernel_task_mm_borrow(task,&bound)))) {
+        kernel_assert_service_context();
+        return KERNEL_MM_STATUS_OK;
+    }
+#endif
+    return status;
+}
 
 static enum kernel_mm_status mutable_vma_record(
     struct kernel_mm *mm,
@@ -4218,7 +4236,9 @@ int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
     enum kernel_mm_status status = mm_operation_begin(mm, &operation);
     if (status != KERNEL_MM_STATUS_OK)
         return status == KERNEL_MM_STATUS_CONFLICT ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
-    if (operation.record->concurrent && operation.record->cache_files)
+    /* tmpfs同步也取得OFD rank10；所有并发MM都先固定来源并结束gate25，
+     * 不能仅对磁盘来源释放gate后调用。 */
+    if (operation.record->concurrent)
         return msync_concurrent(mm,address,length,flags,&operation);
     return mm_msync_impl(mm, address, length, flags);
 }
@@ -4349,7 +4369,7 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
     uint32_t targets = 0;
     int shared = vma.kind == KERNEL_VMA_KIND_FILE_SHARED;
     int disk = !kernel_open_file_memory_backed(file);
-    enum kernel_mm_status status = require_active_space(record);
+    enum kernel_mm_status status = require_fault_space(record);
     if (status != KERNEL_MM_STATUS_OK) goto finish;
     if (generation != kernel_vma_set_generation(record->vmas)) {
         status=KERNEL_MM_STATUS_CONFLICT;
@@ -4534,7 +4554,7 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
         __builtin_trap();
     struct kernel_memory_object *object = shared ? vma.backing : 0;
     int created = 0;
-    enum kernel_mm_status status = require_active_space(record);
+    enum kernel_mm_status status = require_fault_space(record);
     if (status != KERNEL_MM_STATUS_OK) return status;
     address &= ~BOAROS_PAGE_MASK;
     uint64_t generation = kernel_vma_set_generation(record->vmas), cookie = 0, old = 0;

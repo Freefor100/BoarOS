@@ -5,13 +5,24 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#ifdef FILE_IO_CASES
+#include "../../../kernel/sched/private.h"
+#endif
 void mm_test_attach(unsigned);
 struct disk_host_thread { pthread_t thread; void (*entry)(void *); void *argument; };
 static void *run_thread(void *p)
 {
     struct disk_host_thread *thread = p;
     mm_test_attach(0);
+#ifdef FILE_IO_CASES
+    void mm_test_activate_task(void);
+    mm_test_activate_task();
+#endif
     thread->entry(thread->argument);
+#ifdef FILE_IO_CASES
+    void mm_test_finish(void);
+    mm_test_finish();
+#endif
     return 0;
 }
 enum kernel_scheduler_status kernel_thread_create_joinable(
@@ -30,11 +41,18 @@ void kernel_thread_join(struct kernel_thread_join *join)
     if (!t || pthread_join(t->thread, 0)) abort();
     free(t); join->task = 0;
 }
+#ifndef FILE_IO_CASES
 int kernel_scheduler_can_sleep(void) { return 1; }
+#endif
 int riscv_plic_in_interrupt(void) { return 0; }
 #if BOAROS_MAX_CPUS > 1
 void kernel_assert_service_context(void)
-{ if (kernel_cpu_current()->logical_id) abort(); }
+{
+    if (kernel_cpu_current()->logical_id) abort();
+#ifdef FILE_IO_CASES
+    if (kernel_cpu_current()->current && kernel_cpu_current()->current->controlled) abort();
+#endif
+}
 /* 宿主park直接向pthread发布dispatch；没有客户机IPI设备。 */
 void kernel_cpu_flush_notifications(void) {}
 #endif
@@ -54,7 +72,9 @@ uint64_t kernel_time_realtime_ns(void)
     return (uint64_t)t.tv_sec * 1000000000U + t.tv_nsec;
 }
 void kernel_console_putc(char c) { fputc(c, stderr); }
+#ifndef FILE_IO_CASES
 uint64_t kernel_task_current_stack_limit(void) { return 0; }
+#endif
 static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort(); }
 #define EXCLUDED(name) void name(void) { excluded(); }
 EXCLUDED(kernel_shm_attachment_close)
@@ -75,9 +95,13 @@ void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int ins
 #endif
 EXCLUDED(kernel_proc_task_block_reads)
 EXCLUDED(kernel_proc_task_note_fault)
+#ifndef FILE_IO_CASES
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)
+#endif
+#ifndef FILE_IO_CASES
 EXCLUDED(kernel_socket_destroy)
+#endif
 #ifndef FILES_PIPE_CASES
 EXCLUDED(kernel_pipe_release_endpoint)
 EXCLUDED(kernel_pipe_destroy)

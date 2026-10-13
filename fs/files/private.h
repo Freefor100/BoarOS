@@ -55,6 +55,12 @@ struct kernel_files_record {
     uint8_t retired;
     uint8_t concurrent;
 };
+/* handle由调用者持有；发布后concurrent只读，不在此借用中修改handle。 */
+static inline int kernel_files_controlled(const struct kernel_files *files)
+{
+    return files && files->state==KERNEL_FILES_LIVE && files->record &&
+        __atomic_load_n(&files->record->concurrent,__ATOMIC_ACQUIRE);
+}
 #define KERNEL_FILES_SCOPE(name, files) \
     KERNEL_RAW_SCOPE(name, &(files)->record->metadata_lock)
 void kernel_files_note(struct kernel_files *, size_t offset, uint64_t value);

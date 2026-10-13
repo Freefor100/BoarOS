@@ -918,6 +918,18 @@ enum kernel_open_file_status kernel_open_file_check_mapping_domain(
         kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_mapping_domain(node,heap,allocator);
     return error ? KERNEL_OPEN_FILE_STATUS_STATE : KERNEL_OPEN_FILE_STATUS_OK;
 }
+enum kernel_open_file_status kernel_open_file_check_io_domain(
+    const struct kernel_open_file_description *file,const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    if (!open_file_live(file) || file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR || file->heap!=heap ||
+        file->ep_items || file->record_locks || file->device_opened || file->generated_ready)
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    int error=kernel_open_file_memory_backed((struct kernel_open_file_description *)file) ?
+        kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_io_domain(node,heap,allocator);
+    return error?KERNEL_OPEN_FILE_STATUS_STATE:KERNEL_OPEN_FILE_STATUS_OK;
+}
 int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
     uint64_t index,struct kernel_open_file_page_preparation *prepared)
 {
@@ -1074,10 +1086,28 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
     return result;
 }
 
+struct sync_range_call {
+    struct kernel_open_file_description *file;
+    uint64_t start,end;
+    int result;
+};
+static void sync_range_cpu0(void *argument)
+{
+    struct sync_range_call *call=argument;
+    call->result=kernel_open_file_sync_range(call->file,call->start,call->end);
+}
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,
     uint64_t start, uint64_t end)
 {
     if (!open_file_live(file)) return -KERNEL_EBADF;
+    if (kernel_open_file_io_requires_cpu0(file)) {
+        struct sync_range_call call={file,start,end,-KERNEL_EIO};
+        if (kernel_page_cache_run_cpu0(kernel_open_file_page_cache(file),sync_range_cpu0,&call))
+            return -KERNEL_EIO;
+        return call.result;
+    }
+    KERNEL_LOCK_SCOPE(offset);
+    if (!kernel_lock_held(&file->offset_lock.lock,1)) kernel_mutex_lock(&file->offset_lock,&offset);
     return kernel_vfs_sync_range(&file->file, start, end,
                                  &file->observed_writeback_error);
 }

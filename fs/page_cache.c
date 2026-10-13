@@ -10,6 +10,7 @@
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
@@ -71,10 +72,13 @@ struct readahead_job {
 struct kernel_page_cache_record {
     struct kernel_mutex metadata;
     uint8_t controlled;
-    struct cache_read_request *reads_head, **reads_tail;
+    struct cache_request *reads_head, **reads_tail;
+    struct kernel_io_context *executor_io;
     uint32_t read_requests, reads_running;
     uint64_t requests_queued, requests_completed, entry_borrows;
     uint64_t deferred_snapshots;
+    uint64_t executions_queued, executions_completed;
+    uint64_t queue_ns, execute_ns, max_queue_ns, max_execute_ns;
     uint8_t force_writeback;
     struct page_cache_group *group;
     struct kernel_page_cache_record *next;
@@ -110,14 +114,22 @@ struct kernel_page_cache_record {
 
 /* caller的等待现场持有节点及file借用，DONE之前不得退栈；worker只借用。
  * 请求发布不等于缓存页loading发布，后者须在CPU0取得inode保护后完成。 */
+struct cache_request {
+    struct cache_request *next;
+    void (*execute)(void *);
+    void *argument;
+    uint64_t queued_at;
+    unsigned observed;
+    enum kernel_page_cache_status status;
+    unsigned done;
+    struct kernel_wait_queue changed;
+};
 struct cache_read_request {
-    struct cache_read_request *next;
+    struct kernel_page_cache *cache;
     const struct kernel_vfs_file *file;
     uint64_t index, address;
     size_t valid;
     enum kernel_page_cache_status status;
-    unsigned done;
-    struct kernel_wait_queue changed;
 };
 struct cache_guard {
     struct kernel_lock_guard lock;
@@ -702,7 +714,11 @@ void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *cache,
         .deferred_snapshots = r->deferred_snapshots,
         .writeback_rounds = r->completed,
         .running = r->reads_running, .entry_bytes = sizeof(struct kernel_page_cache_entry),
-        .record_bytes = sizeof(*r), .request_bytes = sizeof(struct cache_read_request)};
+        .record_bytes = sizeof(*r), .request_bytes = sizeof(struct cache_request)+sizeof(struct cache_read_request),
+        .execution_request_bytes=sizeof(struct cache_request),
+        .executions_queued=r->executions_queued,.executions_completed=r->executions_completed,
+        .queue_ns=r->queue_ns,.execute_ns=r->execute_ns,
+        .max_queue_ns=r->max_queue_ns,.max_execute_ns=r->max_execute_ns};
 }
 
 static enum kernel_page_cache_status lookup_entry(
@@ -1346,10 +1362,17 @@ static enum kernel_page_cache_status get_page(
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
-static enum kernel_page_cache_status remote_read(struct kernel_page_cache *cache,
-    const struct kernel_vfs_file *file, uint64_t index, uint64_t *address, size_t *valid)
+int kernel_page_cache_is_executor(const struct kernel_page_cache *cache)
 {
-    struct cache_read_request request = {.file = file, .index = index};
+    if (!cache || !cache->record || !cache->record->controlled) return 0;
+    struct kernel_io_context *executor=__atomic_load_n(&cache->record->executor_io,__ATOMIC_ACQUIRE);
+    return executor && executor==kernel_io_context_current();
+}
+static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache,
+    void (*execute)(void *),void *argument,unsigned observed)
+{
+    struct cache_request request = {.execute=execute,.argument=argument,.observed=observed,
+        .queued_at=observed?kernel_time_monotonic_ns():0};
     kernel_wait_queue_init(&request.changed);
     struct kernel_page_cache_record *r = cache->record;
     {
@@ -1359,6 +1382,7 @@ static enum kernel_page_cache_status remote_read(struct kernel_page_cache *cache
         if (!r->reads_head) r->reads_tail = &r->reads_head;
         *r->reads_tail = &request; r->reads_tail = &request.next; r->read_requests++;
         r->requests_queued++;
+        if (observed) r->executions_queued++;
         cache_wake(&r->work);
     }
     for (;;) {
@@ -1371,9 +1395,34 @@ static enum kernel_page_cache_status remote_read(struct kernel_page_cache *cache
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    if (!request.status) { *address = request.address; *valid = request.valid; }
     if (kernel_wait_queue_close(&request.changed) ||
         kernel_wait_queue_destroy(&request.changed)) __builtin_trap();
+    return request.status;
+}
+enum kernel_page_cache_status kernel_page_cache_run_cpu0(struct kernel_page_cache *cache,
+    void (*execute)(void *),void *argument)
+{
+    if (!cache_live(cache) || !cache->record->controlled || !execute)
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    if (kernel_page_cache_is_executor(cache)) { execute(argument); return KERNEL_PAGE_CACHE_STATUS_OK; }
+    struct kernel_io_context *io=kernel_io_context_current();
+    if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
+        !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return KERNEL_PAGE_CACHE_STATUS_STATE;
+    return run_request(cache,execute,argument,1);
+}
+static void read_on_cpu0(void *argument)
+{
+    struct cache_read_request *request=argument;
+    request->status=kernel_page_cache_get(request->cache,request->file,request->index,
+        &request->address,&request->valid);
+}
+static enum kernel_page_cache_status remote_read(struct kernel_page_cache *cache,
+    const struct kernel_vfs_file *file, uint64_t index, uint64_t *address, size_t *valid)
+{
+    struct cache_read_request request={.cache=cache,.file=file,.index=index};
+    enum kernel_page_cache_status status=run_request(cache,read_on_cpu0,&request,0);
+    if (status) return status;
+    if (!request.status) { *address=request.address; *valid=request.valid; }
     return request.status;
 }
 
@@ -2318,9 +2367,10 @@ static void controlled_background(struct kernel_page_cache *cache)
 static void controlled_worker(struct kernel_page_cache *cache)
 {
     struct kernel_page_cache_record *r = cache->record;
+    __atomic_store_n(&r->executor_io,kernel_io_context_current(),__ATOMIC_RELEASE);
     unsigned reads=0;
     for (;;) {
-        struct cache_read_request *request = 0;
+        struct cache_request *request = 0;
         struct kernel_wait_token token = {0};
         int cleanup = 0, stopping=0;
         {
@@ -2346,18 +2396,30 @@ static void controlled_worker(struct kernel_page_cache *cache)
             continue;
         }
         enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_STATE;
-        if (!stopping) result = kernel_page_cache_get(cache, request->file,
-            request->index, &request->address, &request->valid);
+        uint64_t started=request->observed?kernel_time_monotonic_ns():0;
+        if (!stopping) {
+            kernel_assert_service_context();
+            request->execute(request->argument);
+            result=KERNEL_PAGE_CACHE_STATUS_OK;
+        }
+        uint64_t finished=request->observed?kernel_time_monotonic_ns():0;
         {
             CACHE_SCOPE(complete, cache);
             if (!r->read_requests || !r->reads_running || request->done) __builtin_trap();
             r->read_requests--; r->reads_running--; r->requests_completed++;
+            if (request->observed) {
+                uint64_t queued=started-request->queued_at,elapsed=finished-started;
+                r->executions_completed++; r->queue_ns+=queued; r->execute_ns+=elapsed;
+                if (queued>r->max_queue_ns) r->max_queue_ns=queued;
+                if (elapsed>r->max_execute_ns) r->max_execute_ns=elapsed;
+            }
             request->status = result; request->done = 1;
             cache_wake(&request->changed);
         }
         uint64_t released = 0; (void)drain_entries(cache, &released);
         cache_yield();
     }
+    __atomic_store_n(&r->executor_io,0,__ATOMIC_RELEASE);
 }
 
 static void page_cache_worker(void *argument)
@@ -2519,11 +2581,12 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
         for (;;) {
             CACHE_SCOPE(cancel,cache);
             for (unsigned count=0;r->reads_head && count<16;count++) {
-                struct cache_read_request *request=r->reads_head;
+                struct cache_request *request=r->reads_head;
                 r->reads_head=request->next;
                 if (!r->reads_head) r->reads_tail=&r->reads_head;
                 if (!r->read_requests || request->done) __builtin_trap();
                 r->read_requests--; r->requests_completed++;
+                if (request->observed) r->executions_completed++;
                 request->status=KERNEL_PAGE_CACHE_STATUS_STATE; request->done=1;
                 cache_wake(&request->changed);
             }

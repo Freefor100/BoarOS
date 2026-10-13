@@ -27,6 +27,8 @@ struct kernel_open_file_description {
     uint32_t references;
     uint8_t kind;
     uint8_t vfs_closed;
+    /* CPU0私有发布：1为同域tmpfs，2为受控磁盘；控制引用固定后端寿命。 */
+    uint8_t io_domain;
     struct kernel_pipe *pipe;
     uint64_t pipe_observed_writers;
     uint8_t pipe_endpoint;
@@ -42,6 +44,16 @@ struct kernel_open_file_description {
     size_t generated_length;
     uint8_t generated_ready;
 };
+/* 已有OFD owner下的私有域验证，不为未映射普通文件分配映射登记状态。 */
+enum kernel_open_file_status kernel_open_file_check_io_domain(
+    const struct kernel_open_file_description *,const struct kernel_heap *,
+    const struct physical_page_allocator *);
+static inline int kernel_open_file_io_requires_cpu0(const struct kernel_open_file_description *file)
+{
+    unsigned domain=__atomic_load_n(&file->io_domain,__ATOMIC_ACQUIRE);
+    if (domain>2) __builtin_trap();
+    return domain==2 && !kernel_page_cache_is_executor(kernel_open_file_page_cache(file));
+}
 
 /* Caller holds offset_lock for a shared OFD snapshot. */
 int kernel_open_file_generate(struct kernel_open_file_description *file);

@@ -161,14 +161,20 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
                               const void *buffer, size_t size, size_t *written);
 
 static struct kernel_vfs_backend ext4_backend;
-int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
+int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
 {
     if (!node || !node->instance || !node->mount ||
         node->closed || node->retired || (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
         node->instance->ops != &ext4_backend || node->mount->private_data != node->instance ||
-        !__atomic_load_n(&node->mapping_state,__ATOMIC_ACQUIRE) ||
         !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
+    return 0;
+}
+int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
+    const struct kernel_heap *heap,const struct physical_page_allocator *allocator)
+{
+    if (kernel_ext4_check_io_domain(node,heap,allocator) ||
+        !__atomic_load_n(&node->mapping_state,__ATOMIC_ACQUIRE)) return -KERNEL_EINVAL;
     return 0;
 }
 static void initialize_backend(void);

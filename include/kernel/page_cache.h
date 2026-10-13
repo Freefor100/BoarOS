@@ -101,10 +101,19 @@ struct kernel_page_cache_concurrency_state {
     uint64_t deferred_snapshots, writeback_rounds;
     uint32_t pending, running;
     size_t entry_bytes, record_bytes, request_bytes;
+    size_t execution_request_bytes;
+    uint64_t executions_queued, executions_completed;
+    uint64_t queue_ns, execute_ns, max_queue_ns, max_execute_ns;
 };
 /* 已有cache owner下的值快照；不固定业务状态，不扫描缓存或取得新引用。 */
 void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *,
     struct kernel_page_cache_concurrency_state *);
+/* 内部同步CPU0执行。cache及argument的真实owner由可恢复的调用现场持有，
+ * DONE及worker借用结束前不得退栈。无锁/用户pin/写入借用时提交；callback
+ * 在普通CPU0任务、缓存保护外执行。关闭取消未执行者，执行者等实际结束。 */
+enum kernel_page_cache_status kernel_page_cache_run_cpu0(struct kernel_page_cache *,
+    void (*execute)(void *),void *argument);
+int kernel_page_cache_is_executor(const struct kernel_page_cache *);
 
 /* Returns an owned physical-page reference that the caller must release. */
 enum kernel_page_cache_status kernel_page_cache_get(
