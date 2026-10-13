@@ -76,6 +76,8 @@ jobs:
             build/ci-run/${{ inputs.arch }}-*
             build/riscv-smp/runs/**/*.log
             build/riscv-smp/runs/**/*.json
+            build/riscv*-smp-test/runs/**/*.log
+            build/riscv*-smp-test/runs/**/*.json
             build/riscv-smp/*.json
             build/${{ inputs.arch }}/**/*.log
             build/${{ inputs.arch }}/**/*.json
@@ -108,6 +110,7 @@ jobs:
           name: native-failed-images-${{ inputs.arch }}-${{ inputs.suite }}
           path: |
             build/${{ inputs.arch }}/**/*.img
+            build/riscv*-smp-test/runs/**/*.img
             build/diff-abi/run/*.img
             build/io-sleep-run.*/root.img
             build/multi-disk-io.*/*.img

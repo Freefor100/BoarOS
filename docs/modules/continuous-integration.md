@@ -27,7 +27,7 @@ loader和kernel路径，不再只运行BoarOS的旧shell smoke。glibc原五形�
 编译；LA LSX/LASX、PCI共享INTx/reset和LS7A RTC。LA普通SQLite重启不代替
 RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占位成功job。
 
-RV的`smp`组独立执行调度核心的`test-smp-riscv`/`test-smp-userland-riscv`和匿名 MM 的私有/共享测试、tmpfs 文件映射测试及各自CPU0用户组合：MTTCG两核、同核一CPU退化、
+RV的`smp`组独立执行调度核心的`test-smp-riscv`/`test-smp-userland-riscv`和匿名 MM 的私有/共享测试、tmpfs及受控ext4文件映射测试及各自CPU0用户组合：MTTCG两核、同核一CPU退化、
 双RAM、独立故障启动和CPU0原程序组合。默认core/runtime/platform保持单CPU，LA没有SMP占位。
 该组从已安装OpenSBI包选择真实generic `fw_dynamic.bin`，显式传给Make；
 保存包版本、QEMU/固件/kernel SHA、实际vCPU线程和完整退出，不能把本地封存执行器身份冒充CI身份。
@@ -38,7 +38,7 @@ RV的`smp`组独立执行调度核心的`test-smp-riscv`/`test-smp-userland-risc
 `always()`检查全部声明job，failure/cancelled/skipped/缺失都失败；工作流不改变分支保护。
 
 host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格、调度/身份/退休，
-另直接链接 MM/VMA/Sv39/uaccess，覆盖复制 pin、许可排空、COW/OOM/竞争候选、活动集合、共享对象配额/引用、真实tmpfs/OFD/登记和跨MM文件缺页/截断的确定性交错。allocator覆盖4/16KiB及2/4逻辑CPU调度握手、非法owner、抢占、有界工作量和借用销毁。
+另直接链接 MM/VMA/Sv39/uaccess，覆盖复制 pin、许可排空、COW/OOM/竞争候选、活动集合、共享对象配额/引用、真实tmpfs/OFD/登记，以及真实ext4镜像的CPU0冷读交接、写入借用、快照/截断和错误的确定性交错。缓存/登记层覆盖4/16KiB，宿主MM为Sv39，LA16KiB由客户机单核门禁覆盖。allocator覆盖4/16KiB及2/4逻辑CPU调度握手、非法owner、抢占、有界工作量和借用销毁。
 同组还运行配对成本的host统计、锁继承和假sysfs恢复门禁；CI不执行需要本机限频权限的正式测量。
 RV完整门禁与LA cpu-state运行真实raw/等待/handoff/lifecycle，含双RAM首次/恢复/退出
 及可信栈归还；宿主并发不代表整个内核SMP-ready。

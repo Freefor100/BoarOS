@@ -11,11 +11,11 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 
 默认生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
 两侧共用 MM、调度、VFS、设备和用户程序策略，架构实现在构建期绑定。
-独立 RV 两核调度核心及受控私有/共享匿名、独立 tmpfs 文件 MM 的 pin/COW/TLB 回收闭环已验证。普通用户程序与现有业务仍在 CPU0。
+独立 RV 两核调度核心及受控私有/共享匿名、独立 tmpfs/磁盘文件 MM 的 pin/COW/TLB 回收闭环已验证。磁盘冷缺页通过CPU0 worker交接，写回按页排空写入借用；普通用户程序、实际磁盘I/O与现有业务仍在CPU0。
 
 | 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
-| 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX；独立 RV 受控两核配置 | 普通用户跨核、磁盘/其他外部后备 MM 并发尚未开放，RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[两核边界](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
+| 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX；独立 RV 受控两核配置 | 普通用户跨核、一般文件/设备及未开放外部后备并发尚未开放，RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[两核边界](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
 | 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；基本 futex、robust-list、标准信号和同步 fault | 用户任务限CPU0；无 PI futex、共享文件 futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
 | 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename | 无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
@@ -24,11 +24,11 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 | 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
 | 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
-2026-10-12 本地组合核对：RV/LA 在 512 MiB、1 GiB 下，各自完成 **229 项原程序**的同 ELF Linux 对照；
-两侧各 **1367 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
+2026-10-13 本地组合核对：RV/LA 在 512 MiB、1 GiB 下，各自完成 **229 项原程序**的同 ELF Linux 对照；
+两侧各 **1368 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
 具体输入与适用范围见[程序基线](docs/learning/user-program-inventory.md)和
 [调度组合核对](docs/learning/threads-and-futex.md#调度域身份发布与退休存储)。
-这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与普通用户/文件及外部后备多核仍需独立验收。
+这些结果限定于上述平台和案例；LA客体原生开发、更多断电/组合矩阵、实板与普通用户/一般文件及外部后备多核仍需独立验收。
 
 主线 [CI](docs/modules/continuous-integration.md)以同一模板覆盖共用 host、双侧 core/ABI、platform 和 glibc/SQLite，
 另有独立RV受控两核结果组；
@@ -59,6 +59,8 @@ make test-memory-object-concurrency-host test-mm-shared-concurrency-host
 make test-mm-shared-smp-riscv test-mm-shared-smp-userland-riscv
 make test-file-mapping-concurrency-host test-mm-file-concurrency-host
 make test-mm-file-smp-riscv test-mm-file-smp-userland-riscv
+make test-page-cache-concurrency-host test-mm-disk-concurrency-host
+make test-mm-disk-smp-riscv test-mm-disk-smp-userland-riscv
 make test-stack-usage test-stack-usage-la
 ```
 
@@ -71,10 +73,10 @@ make test-stack-usage test-stack-usage-la
 
 ## 开发方向与文档
 
-当前主线推进 **磁盘/外部后备 MM 与业务对象并发、普通用户跨核执行**，再扩展RV组合压力和LA多核；
+当前主线推进 **一般文件/页缓存/设备业务对象并发、未开放外部后备与普通用户跨核执行**，再扩展RV组合压力和LA多核；
 具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
 CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；任务选择、身份发布及存储借用在统一短调度域保护，资源清理留在锁外；等待代次、借用游标、
-新栈交接与可睡眠锁内部资格已建立。压力回收、磁盘/外部后备及文件/其他业务对象仍需跨核保护。
+新栈交接与可睡眠锁内部资格已建立。受控磁盘映射保留CPU0 I/O及最终释放；系统压力回收、未开放外部后备及一般文件/其他业务对象仍需跨核保护。
 默认生产继续单CPU；新增[RV受控两核配置](docs/modules/riscv-smp.md)使用独立构建入口，
 2026-10-11在512MiB/1GiB完成MTTCG两核抢占、IPI/WFI交接、双向迁移、执行资格、
 RFENCE后栈回收、私有allocator及CPU0原静态/pthread组合；同一内核的一CPU退化也通过。

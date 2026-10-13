@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -43,10 +43,17 @@ def candidates():
             if kernels.is_dir():
                 result.extend(path for path in kernels.glob('*/build.log'))
 
-    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test'):
+    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test'):
         directory = BUILD / family
         if directory.is_dir():
             result.extend(p for p in directory.iterdir() if p.is_dir() and p.name.startswith('runs'))
+
+    # 保留可复用宿主consumer，镜像/日志/临时诊断源码及内核均是运行现场。
+    for family in ('cache', 'mm-disk'):
+        directory = BUILD / 'host' / family
+        if directory.is_dir():
+            result.extend(p for p in directory.iterdir()
+                          if p.name not in {'concurrency-12', 'concurrency-14'})
 
     riscv = BUILD / 'riscv'
     smp_runs = BUILD / 'riscv-smp' / 'runs'
