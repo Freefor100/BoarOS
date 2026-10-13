@@ -12,6 +12,8 @@ static unsigned char pipe_payload[16*16384+4096];
 static unsigned pause_park,park_ready,resume_park,pause_copy,copy_ready,resume_copy;
 static struct kernel_wait_queue *expected_queue;
 static struct kernel_wait_token observed_token;
+static struct kernel_vfs_mount *buffer_mount;
+static struct kernel_open_file_description *buffer_owner;
 enum kernel_scheduler_status __real_kernel_wait_park(struct kernel_wait_token *,enum kernel_wait_wake_reason *);
 enum kernel_scheduler_status __wrap_kernel_wait_park(struct kernel_wait_token *token,enum kernel_wait_wake_reason *reason)
 {
@@ -243,6 +245,40 @@ static void pipe_geometry_case(struct kernel_heap *heap)
     puts("PASS pipe 4095/4096/4097 vectored geometry, unreadable fragment rollback and munmap after copied prefix");
 }
 
+static void pipe_tmpfs_buffer_case(struct kernel_heap *heap)
+{
+    mm_test_bind_files(0); mm_test_bind(0);
+    int error;
+    assert(!kernel_tmpfs_create(heap,0,"",&buffer_mount));
+    assert(!kernel_open_file_create_mode(heap,buffer_mount,"/buffers",0600,&buffer_owner,&error) && !error);
+    buffer_owner->open_flags=2; /* 私有构造期设置访问方向，发布后只改status位。 */
+    assert(!kernel_vfs_ftruncate(&buffer_owner->file,2*BOAROS_PAGE_SIZE));
+    struct kernel_open_file_description *source=buffer_owner;
+    assert(!kernel_open_file_acquire(source));
+    pipe_bind(0,0);
+    uint64_t address;
+    assert(!kernel_mm_mmap_file_private(&domain_mm,&source,0x800000,2*BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED_NOREPLACE,
+        &address) && !source);
+    pipe_table(heap); mm_test_bind_files(&files);
+    pause_copy=0; pause_park=1;
+    struct pipe_actor actor={.fd=0,.address=address+BOAROS_PAGE_SIZE,.count=4096};
+    expected_queue=&files.record->slots[0].description->pipe->read_queue;
+    pthread_t thread; start_actor(&actor,&thread);
+    while (!__atomic_load_n(&park_ready,__ATOMIC_ACQUIRE)) sched_yield();
+    size_t copied;
+    assert(!kernel_copy_to_user(&domain_mm,address,pipe_payload,4096,&copied) && copied==4096);
+    struct kernel_uaccess_iovec input={address,4096};
+    struct kernel_pipe_result result;
+    assert(!kernel_pipe_writev(files.record->slots[1].description->pipe,&domain_mm,&input,1,4096,1,&result) && result.bytes==4096);
+    __atomic_store_n(&resume_park,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(thread,0) && actor.bytes==4096);
+    assert(!kernel_copy_from_user(&domain_mm,pipe_payload,address+BOAROS_PAGE_SIZE,4096,&copied) && copied==4096);
+    for (unsigned i=0;i<4096;i++) assert(pipe_payload[i]==0x71);
+    assert(!kernel_files_release(&files) && !kernel_mm_munmap(&domain_mm,address,2*BOAROS_PAGE_SIZE));
+    puts("PASS cross-CPU pipe copy faults real tmpfs source/destination and returns exact contents");
+}
+
 static void pipe_cases(struct kernel_heap *heap)
 {
     uint64_t address;
@@ -251,6 +287,7 @@ static void pipe_cases(struct kernel_heap *heap)
     assert(!kernel_mm_mmap_anonymous(&domain_mm,PIPE_TARGET,17*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     memset(pipe_payload,0x71,sizeof(pipe_payload)); size_t done;
     assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_CAPACITY+1,&done) && done==KERNEL_PIPE_CAPACITY+1);
-    pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_packet_case(heap,2); pipe_packet_case(heap,4);
+    pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);
+    pipe_packet_case(heap,2); pipe_packet_case(heap,4);
     mm_test_bind_files(0); mm_test_bind(0); mm_test_context=0;
 }

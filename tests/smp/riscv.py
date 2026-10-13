@@ -76,7 +76,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
         validate_mm_failure(text,profile,contract)
         print(f"RV mm-disk profile={profile} RAM={memory} retained owners; recovery unverified",flush=True)
         return text
-    if contract == "mm-disk":
+    if contract in ("mm-disk","files"):
         required=("disk MM CPU0 I/O/cache/alias/mount owners returned",
                   "file MM stale preparation/EOF/regrowth/private COW passed",
                   "MM arena closure live=0x0 heap-pages=0x0",
@@ -87,9 +87,15 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
                   "file MM real ext4 cross-root/source/registration/pin/RFENCE owners passed")
         if any(marker not in text for marker in required) or "SMP failure" in text or "SMP fatal" in text:
             raise RuntimeError(f"missing native disk MM closure:\n{text[-5000:]}")
+        if contract=="files":
+            if ("FILES SMP native FD reuse/early wake/EOF/cancel/content/task rollback passed" not in text or
+                "FILES SMP root overlap packets=" not in text or
+                "FD/OFD/pipe/wait owners returned" not in text or
+                "BoarOS: PID 1 exited status=0x2a" not in text):
+                raise RuntimeError(f"missing native FD/pipe/root closure:\n{text[-5000:]}")
         for disk in disks:
             subprocess.run(["e2fsck","-fn",str(disk)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-        print(f"RV mm-disk cpus={cpus} RAM={memory} actual I/O and owner closure passed",flush=True)
+        print(f"RV {contract} cpus={cpus} RAM={memory} actual I/O and owner closure passed",flush=True)
         return text
     if contract in ("mm", "mm-shared", "mm-file"):
         if profile != "normal":
@@ -165,10 +171,12 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build/riscv-smp/runs"))
     parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
-    parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file", "mm-disk"), default="scheduler")
+    parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file", "mm-disk", "files"), default="scheduler")
     parser.add_argument("--init",type=Path)
     args = parser.parse_args()
-    if args.contract=="mm-disk":
+    if args.contract=="files" and args.profile!="normal":
+        parser.error("FD/pipe composition uses the normal profile; RFENCE errors have the existing MM contracts")
+    if args.contract in ("mm-disk","files"):
         if not args.init or args.profile not in ("normal","rfence-error"): parser.error("disk MM requires --init and normal/rfence-error profile")
         for cpus in ((2,1) if args.profile=="normal" else (2,)):
             for memory in ("512M","1G"):
@@ -180,9 +188,9 @@ def main():
                     subprocess.run(["mkfs.ext4","-q","-F",str(image)],check=True)
                 subprocess.run(["debugfs","-w","-R",f"write {args.init.resolve()} /init",str(root)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
                 subprocess.run(["debugfs","-w","-R","set_inode_field /init mode 0100755",str(root)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-                boot(args.qemu,args.firmware,args.kernel,memory,cpus,folder/"first",profile=args.profile,contract="mm-disk",disks=(root,disk))
+                boot(args.qemu,args.firmware,args.kernel,memory,cpus,folder/"first",profile=args.profile,contract=args.contract,disks=(root,disk))
                 if args.profile!="normal": continue
-                text=boot(args.qemu,args.firmware,args.kernel,memory,cpus,folder/"restart",contract="mm-disk",disks=(root,disk))
+                text=boot(args.qemu,args.firmware,args.kernel,memory,cpus,folder/"restart",contract=args.contract,disks=(root,disk))
                 if "disk MM independent restart durable content passed" not in text:
                     raise RuntimeError("independent restart did not verify the durable bytes")
         return

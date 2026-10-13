@@ -4,15 +4,15 @@
 
 `build/` 是未纳入 Git 的可重建产物目录，不是永久证据库。本页所列旧 `build/` 路径是当时的运行位置，2026-09-25 已清理，不能直接打开；可复用的结论、固定输入、身份和复现命令记录在 Git 中。运行器在执行期间会保存 JSON、日志和镜像，核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录，只留下可跨轮复用的编译缓存。
 
-## 双架构最近完整结果（2026-10-10）
+## 双架构最近完整结果（2026-10-13）
 
 当前固定输入清单为 **229个相同ID**：BusyBox10项（原9项加已有环境内容案例），
-libc-test107静态、110动态及两项原包装器。RV/LA在512MiB、1GiB下各完整229项通过，
-包括原BusyBox包装器55子项及静态/动态libc包装器。
-每ID均有同一ELF的Linux/BoarOS真实wait/输出判定与正常root资源退出，未修改原程序。
+libc-test107静态、110动态及两项原包装器。BoarOS在RV/LA的512MiB、1GiB下各229项通过，包括原BusyBox包装器55子项及静态/动态libc包装器。联合对照RV两种RAM和LA1GiB均229 pass；LA512MiB为228 pass、1 reference-not-pass。
+该参考失败是原BusyBox包装器的`du: ./proc/85: No such file or directory`，Linux shell仍退出0，但原内部断言失败；BoarOS同次55子项全部成功。独立同ELF单项复核两边均通过，原完整运行不改成229 pass，也不拼接复核结果。固定BusyBox的`libbb/recursive_action.c`遇stat失败返回失败，Linux动态proc目录不保证遍历期间存活；实际PID85身份未由此次输出固定。
+每ID均保留Linux/BoarOS真实wait、输出与正常root资源退出判定，未修改原程序。
 过去228/227的记录仍属历史，不由本次通过推断当时失败的具体修复归因。
-本次原程序核RV SHA`4bac3664d401099e9ead6f1944cc3bc119cf6154c2b09038d26023030fa65906`、
-LA SHA`490f2985de968cec0088c0999fbaebbeff5989b408897161038c707e11bf09d1`；
+本次原程序核RV SHA`f63d308c247ec22df6c8ff79896860203d363647cae1b7f80534726302798acc`、
+LA SHA`a18648c3c595f5152010bea35a9fc8d43afe433065099f4e87b8023bd387b1c0`；
 独立成本核、glibc消费者及托管CI结果不能混作这份清单身份。
 
 LA Linux/QEMU及16KiB/LP64D输入见[平台模块](../modules/loongarch-boot.md)，musl
@@ -25,6 +25,12 @@ LA最初未启用完整LS7A参考模型时，stat的时间关系和两项包装�
 复现使用 `--arch loongarch --reuse-builds --require-pass`；编译缓存按架构独立，
 同一个输出目录只接受相同身份。全部原程序通过的范围是这个共同清单，不是正式
 比赛分数、所有RV程序或完整客体开发环境。
+
+```sh
+python3 -B tests/program-inventory/run.py --arch riscv --reuse-builds --memory 512M --memory 1G --require-pass --output build/program-check-rv
+python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --memory 512M --memory 1G --require-pass --output build/program-check-la
+python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --memory 512M --case busybox.official --require-pass --output build/program-check-la-busybox
+```
 
 ## 固定输入与复现
 
@@ -59,7 +65,7 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 -r/-c/-n、清空后无消息，以及df容量与同一客体statfs一致；dmesg读取真实启动消息，
 hwclock输出真实UTC。BoarOS根来源`/dev/block/252:0`由公共镜像生成器建立。
 环境探针另保护console不回灌、RTC/realtime、OFD独占/dup/fork/CLOEXEC和坏指针；
-最初27条加入后的1118是历史ABI规模，当前1366条由独立ABI门禁验证。
+最初27条加入后的1118是历史ABI规模，当前1372条由独立ABI门禁验证。
 
 原包装器含日期、日志、PID与容量等动态内容，整份stdout跨系统不要求字节相同。
 清单显式选择contract比较：所有55条原断言、顺序、命令与wait status仍必须成立，

@@ -44,6 +44,7 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
 `make test-pipe-concurrency-host`另验证真实MM/uaccess的提前wake、fd复用后旧请求、EOF/部分EPIPE、
 复制期间poll、4095/4096/4097向量几何、故障片段撤销与munmap前缀；2/4线程检查内容隔离、ring wrap及无端点保留的EOF。
+其中tmpfs作为真实缺页复制缓冲，驻留/来源及后备owner在最终MM释放后归还；客户机磁盘缓冲与CPU0 worker的组合见[RV两核](riscv-smp.md#共享-fd-表与匿名-pipe)。
 这些宿主证据不代替真实两核和普通用户组合验收。
 相对 dirfd 和 AT_EMPTY_PATH 定位保持 OFD pin，直到借用路径取得独立引用；共享表 close 后，最后 pin 也不能早于这个交接结束。
 宿主窄反例强制在 guard 归还前关闭槽 owner，并验证路径交接与最终归还；sendfile 来源占独立片段，不并入可合并的 user-write 尾片段。

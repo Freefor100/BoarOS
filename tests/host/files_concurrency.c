@@ -66,9 +66,11 @@ static void directory_pin_handoff(struct kernel_heap *heap,int metadata)
     assert(!kernel_tmpfs_create(heap,0,"",&mount));
     assert(!kernel_vfs_path_root(mount,heap,&root));
     if (metadata) assert(!kernel_fs_context_create(&fs,mount,heap));
-    assert(!kernel_open_file_create_at(heap,root,root,"/",KERNEL_OPEN_PATH_FOLLOW,0,&description,&result) && !result);
+    assert(!kernel_vfs_mkdir_at(root,root,"/dir",0755));
+    assert(!kernel_open_file_create_at(heap,root,root,"/dir",KERNEL_OPEN_PATH_FOLLOW,0,&description,&result) && !result);
     assert(!kernel_files_create(&files,heap));
     watched_path=description->file.path; path_description=description; path_acquired=0;
+    assert(watched_path!=root); /* root/cwd不能替被观察目录额外持path引用。 */
     assert(!kernel_files_install_new_owned_at(&files,5,0,&description));
     if (metadata) {
         uint64_t address;
@@ -336,6 +338,9 @@ int main(void)
     pipe_cases(&heap);
 #endif
     assert(!kernel_mm_release(&domain_mm));
+#ifdef PIPE_CONCURRENCY_CASES
+    assert(!kernel_open_file_release(&buffer_owner) && !kernel_vfs_unmount(buffer_mount));
+#endif
     assert(!physical_page_release(&pages,kernel.root_address));
     assert(!physical_page_allocator_audit(&pages));
     struct kernel_heap_statistics final;

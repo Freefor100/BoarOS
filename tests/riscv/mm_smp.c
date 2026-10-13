@@ -20,6 +20,11 @@
 #include <string.h>
 #include "../../kernel/sched/private.h"
 
+#if BOAROS_FILES_SMP_TEST
+void riscv_files_smp_prepare(struct kernel_heap *,struct kernel_mm *,unsigned,
+    struct kernel_open_file_description *,struct kernel_page_cache *);
+void riscv_files_smp_overlap_start(void),riscv_files_smp_overlap_finish(void),riscv_files_smp_run(void);
+#endif
 #define DATA UINT64_C(0x40000)
 #define CODE UINT64_C(0x40000000)
 static struct physical_page_allocator *system_pages;
@@ -39,6 +44,10 @@ static struct kernel_mm child;
 static struct kernel_thread_join fork_join, cow_join;
 static unsigned fork_done, cow_ready[2], cow_go;
 static unsigned fail_create;
+#if BOAROS_FILES_SMP_TEST
+void riscv_smp_test_fail_task_creation(unsigned value) { fail_create=value; }
+#endif
+
 static unsigned migrated_pin_returned;
 #if BOAROS_MM_SHARED_TEST
 #define SHARED_DATA UINT64_C(0x80000000)
@@ -985,6 +994,9 @@ static void execute(void *unused)
     work_end=riscv_time_read();
 #endif
     for (unsigned id = 0; id < 2; id++) { request(id, 12); kernel_thread_join(&actors[id]); }
+#if BOAROS_FILES_SMP_TEST
+    riscv_files_smp_run();
+#endif
     kernel_mm_get_concurrency_state(&parent, &state);
     require(state.references == 1 && !state.pins && !state.write_pins && !state.active_cpus &&
         !state.pending_retirement, "mm-last-owner-quiescent");
@@ -1058,7 +1070,13 @@ static void start_mm_actors(void *unused)
             "mm-task-owner-publication");
     }
     kernel_wait_queue_init(&fence_gate);
+#if BOAROS_FILES_SMP_TEST
+    riscv_files_smp_prepare(&heap,&parent,cpu_count,file_controller,&disk_cache);
+#endif
     if (root_mode) {
+#if BOAROS_FILES_SMP_TEST
+        riscv_files_smp_overlap_start();
+#endif
         require(cpu_count == 2 || BOAROS_MM_DISK_TEST, "mm-root-needs-two-CPUs");
         send(1, 11);
 #if !BOAROS_MM_DISK_TEST
@@ -1096,6 +1114,9 @@ void riscv_smp_test_root_finish(void)
     wait_flag(&disk_setup_ready,"disk-setup-publication");
     kernel_thread_join(&disk_setup_join);
     while (!__atomic_load_n(&background_count,__ATOMIC_ACQUIRE)) yield();
+#endif
+#if BOAROS_FILES_SMP_TEST
+    riscv_files_smp_overlap_finish();
 #endif
     require(root_mode && __atomic_load_n(&background_count, __ATOMIC_ACQUIRE) > background_begin, "mm-real-user-overlap");
     __atomic_store_n(&root_release, 1, __ATOMIC_RELEASE);

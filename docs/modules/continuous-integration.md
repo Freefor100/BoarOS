@@ -13,7 +13,7 @@ main push等待同组执行收口；PR取消同组旧执行，固定环境冷构
 | 层级 | RV | LA |
 |---|---|---|
 | 固定环境 | 原GNU工具/runtime及Linux缓存 | 原GNU工具/runtime、QEMU、Linux及musl缓存 |
-| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1368 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1368 ABI与栈 |
+| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1372 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1372 ABI与栈 |
 | runtime | glibc五形态、SQLite DELETE/静态动态CLI/独立重启、WAL | 相同消费者与完成条件，保留目标ELF及libc版本差异 |
 | platform | RNG/时钟、network、termios2/TTY/PTY | 相同类别，另含boot random和16KiB pipe geometry |
 | 定时完整消费者 | 229项原程序、TTY应用、实际Ethernet、RT双盘 | 229项原程序、TTY应用、实际Ethernet、PCI设备失败及RTC模型 |
@@ -27,7 +27,7 @@ loader和kernel路径，不再只运行BoarOS的旧shell smoke。glibc原五形�
 编译；LA LSX/LASX、PCI共享INTx/reset和LS7A RTC。LA普通SQLite重启不代替
 RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占位成功job。
 
-RV的`smp`组独立执行调度核心的`test-smp-riscv`/`test-smp-userland-riscv`和匿名 MM 的私有/共享测试、tmpfs及受控ext4文件映射测试及各自CPU0用户组合：MTTCG两核、同核一CPU退化、
+RV的`smp`组独立执行调度核心、私有/共享匿名MM、tmpfs/受控ext4映射及共享FD表/匿名pipe的聚焦测试和CPU0用户组合：MTTCG两核、同核一CPU退化、
 双RAM、独立故障启动和CPU0原程序组合。默认core/runtime/platform保持单CPU，LA没有SMP占位。
 该组从已安装OpenSBI包选择 `riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin`，
 排除同时安装的RV32变体，缺失或重复RV64候选使准备失败；固件显式传给Make。
@@ -42,6 +42,7 @@ runner开启QEMU `debug-threads=on`，在Ubuntu/QEMU8.2.2同样能记录实际vC
 host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格、调度/身份/退休，
 另直接链接 MM/VMA/Sv39/uaccess，覆盖复制 pin、许可排空、COW/OOM/竞争候选、活动集合、共享对象配额/引用、真实tmpfs/OFD/登记，以及真实ext4镜像的CPU0冷读交接、写入借用、快照/截断和错误的确定性交错。缓存/登记层覆盖4/16KiB，宿主MM为Sv39，LA16KiB由客户机单核门禁覆盖。allocator覆盖4/16KiB及2/4逻辑CPU调度握手、非法owner、抢占、有界工作量和借用销毁。
 同组还运行配对成本的host统计、锁继承和假sysfs恢复门禁；CI不执行需要本机限频权限的正式测量。
+`test-files-concurrency-host`和`test-pipe-concurrency-host`直接验证FD原子引用交接、域外别名拒绝、管道内容/等待及末端回收；RV独立`shared-fd-pipe`和`shared-fd-user-composition`组分别保存结果。`FILES_SMP_BUILD`传递实际构建目录，Ubuntu/QEMU8.2.2本地容器验证不计作托管CI已执行。
 RV完整门禁与LA cpu-state运行真实raw/等待/handoff/lifecycle，含双RAM首次/恢复/退出
 及可信栈归还；宿主并发不代表整个内核SMP-ready。
 

@@ -1,5 +1,17 @@
 # 两核启动与执行交接
 
+## 文件表与端点的身份交接
+
+FD编号只标识当前槽，不能覆盖在途I/O。固定Linux `references/linux/fs/file.c`与`fs/pipe.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）分别提供文件取得/替换与管道片段、等待及断端行为依据。BoarOS在FD raw内取得实际OFD引用，锁外复制/睡眠；close摘槽后，旧请求仍持原端点。目录路径也遵循同样交接：OFD pin归还前必须先取得独立path引用。宿主反例让另一关闭消除槽owner，并且root/cwd不额外持被观察目录path，保护相对dirfd和AT_EMPTY_PATH两条路径。
+
+独占record不等于独占其OFD，更不等于独占pipe。普通fork的另一张表可以持同一OFD，重开也可以产生另一个端点或观察者。因此私有启用先核对本表槽数与各OFD引用，再按不同OFD计算端点，最后确认pipe没有域外等待登记/借用；全部通过才sealed。检查使用既有owner，不增加永久反向索引或引用层，最多O(capacity²)，只在未发布构造期执行。后来安装的新pipe同样必须证明未外借，sealed pipe不进入普通表或未同步epoll。
+
+复制mutex保护片段选择到接纳，短metadata锁保护端点与readiness；等待在条件保护内登记，释放二者后park。关闭者在通知完成前仍计入原owner，防止另一末关闭者释放通知目标。16-bit合并位图只改变表示：sendfile来源始终使用新片段，不能并入user-write尾片段。LA真实sendfile组合暴露过遗漏的来源条件，4/16KiB宿主窄反例与双侧同ELF对照保护恢复后的边界。核心返回已接纳前缀和独立断端事实，由有真实用户上下文的调用层发送SIGPIPE，内核任务取得EPIPE/前缀。
+
+当前结果与复建入口见[文件模块](../modules/kernel-files.md)和[受控两核](../modules/riscv-smp.md#共享-fd-表与匿名-pipe)。这些保护不使一般文件后端、socket/epoll业务或普通用户线程自动具备跨核能力。
+
+## CPU 启动与栈交接
+
 HSM start返回成功表示固件接纳请求，不保证目标已经进入内核。固定OpenSBI v1.8.1的
 `references/opensbi/lib/sbi/sbi_ipi.c:sbi_ipi_send_many()`只接受当前可中断的目标集合；
 `sbi_ecall_hsm.c`与`sbi_hsm.c`分别规定请求入口和状态转换。

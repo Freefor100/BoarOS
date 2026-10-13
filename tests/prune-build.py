@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -43,10 +43,13 @@ def candidates():
             if kernels.is_dir():
                 result.extend(path for path in kernels.glob('*/build.log'))
 
-    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test'):
+    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test'):
         directory = BUILD / family
         if directory.is_dir():
             result.extend(p for p in directory.iterdir() if p.is_dir() and p.name.startswith('runs'))
+            if family == 'riscv-files-smp-test':
+                # 自定义CI构建保留编译缓存，嵌套运行镜像仍按同一规则清理。
+                result.extend(p for p in directory.glob('*/runs') if p.is_dir())
 
     # 保留可复用宿主consumer，镜像/日志/临时诊断源码及内核均是运行现场。
     for family in ('cache', 'mm-disk'):

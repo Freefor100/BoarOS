@@ -27,6 +27,8 @@ MM_SMP_TEST ?= 0
 MM_SHARED_SMP_TEST ?= 0
 MM_FILE_SMP_TEST ?= 0
 MM_DISK_SMP_TEST ?= 0
+FILES_SMP_TEST ?= 0
+FILES_SMP_BUILD ?= build/riscv-files-smp-test
 SMP_TEST_PROFILE ?= normal
 ifneq ($(filter $(SMP_TEST_PROFILE),normal missing-rfence denied-start guard denied-stop rfence-error mm-fence-i),$(SMP_TEST_PROFILE))
 $(error invalid SMP_TEST_PROFILE)
@@ -87,6 +89,14 @@ ifneq ($(MM_SHARED_SMP_TEST),1)
 $(error MM_FILE_SMP_TEST requires MM_SHARED_SMP_TEST=1)
 endif
 endif
+ifneq ($(filter $(FILES_SMP_TEST),0 1),$(FILES_SMP_TEST))
+$(error FILES_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(FILES_SMP_TEST),1)
+ifneq ($(MM_DISK_SMP_TEST),1)
+$(error FILES_SMP_TEST requires the controlled disk MM fixture)
+endif
+endif
 ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
 $(error SMP plus COST is unsupported)
 endif
@@ -128,6 +138,10 @@ endif
 ifeq ($(MM_DISK_SMP_TEST),1)
 BUILD_DIR := build/riscv-mm-disk-smp-test/$(SMP_TEST_SUFFIX)riscv
 KERNEL_RV := build/riscv-mm-disk-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(FILES_SMP_TEST),1)
+BUILD_DIR := $(FILES_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := $(FILES_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -383,7 +397,11 @@ LDFLAGS += -Wl,--wrap=sbi_probe_extension,--wrap=sbi_hart_start,--wrap=sbi_hart_
 LDFLAGS += -Wl,--wrap=physical_page_allocate
 $(BUILD_DIR)/tests/riscv/smp_cases.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE)
 endif
-$(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
+ifeq ($(FILES_SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/files_smp.o
+LDFLAGS += -Wl,--wrap=kernel_wait_park
+endif
+$(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
 endif
 TEST_RUNTIME_C_SOURCES := \
 	kernel/cpu.c \
@@ -2339,6 +2357,23 @@ test-mm-disk-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PT
 		BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
 		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-disk-smp-test/runs/user-$$memory \
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-disk-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-files-smp-riscv test-files-smp-userland-riscv
+test-files-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,-e,_start tests/riscv/mm_disk_init.S -o $(FILES_SMP_BUILD)/init
+	python3 -B tests/smp/riscv.py --contract files --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(FILES_SMP_BUILD)/kernel-rv --init $(FILES_SMP_BUILD)/init --output $(FILES_SMP_BUILD)/runs
+
+test-files-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_FILES=1 BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(abspath $(FILES_SMP_BUILD))/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(abspath $(FILES_SMP_BUILD))/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
 		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \

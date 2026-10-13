@@ -143,6 +143,10 @@ mode.umask-shared-fs
 pipe.mode-shared
 pipe.mode-type-preserved
 pipe.stat-fault
+pipe.flags-dup-cloexec
+pipe.flags-ofd-shared
+pipe.flags-fork-shared
+pipe.flags-dup2-descriptor
 fifo.create
 fifo.create-existing
 fifo.nonblock-writer

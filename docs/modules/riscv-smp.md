@@ -1,7 +1,7 @@
 # RV 受控两核调度
 
 默认构建和LA仍为单CPU。`kernel-rv-smp`独立配置最多两个逻辑CPU，CPU0是固件选择的boot hart，
-CPU1运行显式创建的受控内核任务，可绑定匿名及私有arena tmpfs/受控ext4文件映射 MM。CPU0保留文件构造、读写/截断、MM/fork发布和最后后端释放；控制者保留独立OFD、挂载和缓存owner，命名空间运行期间不修改。用户任务、现有worker、实际磁盘I/O、未开放外部后备和系统压力回收仍只在普通CPU0服务上下文执行。
+CPU1运行显式创建的受控内核任务，可绑定匿名及私有arena tmpfs/受控ext4文件映射MM，也可绑定同域共享FD表执行匿名pipe I/O。CPU0保留文件构造、读写/截断、MM/fork发布和最后后端释放；控制者保留独立OFD、挂载和缓存owner，命名空间运行期间不修改。用户任务、现有worker、实际磁盘I/O、未开放外部后备和系统压力回收仍只在普通CPU0服务上下文执行。
 受控任务已验证 fork 后跨 MM 的共享匿名/真实tmpfs/磁盘缓存页与私有COW；普通用户线程跨核执行及其共享 MM ABI 仍未开放。
 
 ## 启动与本地状态
@@ -36,7 +36,7 @@ IPI软件事件使用release发布、exchange消费；接收先清SSIP。通知�
 全部预检后发布叶子，撤销后先摘空表，完成本地SFENCE与在线远端RFENCE，才释放表、栈及槽位。
 发布或摘除非叶父项使用全范围失效，不能只指定某个叶VA；已有父表中的叶修改可使用范围RFENCE。
 RFENCE错误走fatal并保留owner。单页接口仍是批量接口的包装。
-受控任务仅能进入已绑定域的匿名、tmpfs或受控ext4映射MM，不得进入一般文件/FD、设备、协议或系统压力回调；并行allocator/MM与受控缓存使用CPU0预留、无压力hook的私有arena。
+受控任务仅能进入已绑定的MM与匿名pipe文件表域，不得进入一般文件、socket/epoll/FIFO、设备、协议或系统压力回调；并行allocator/MM、pipe与受控缓存使用CPU0预留、无压力hook的私有arena。
 `kernel_thread_create_joinable_mm()`在最终 ONLINE 复查后才转移 caller MM，失败不发布 join 或身份；缓存 root 不取得额外引用。当前任务借用覆盖执行，最后 MM 释放由 CPU0 可信栈的统一 join/reaper 路径完成。活动 MM 借用归零也是 CPU 停止条件。
 
 ## 验证入口与证据边界
@@ -96,7 +96,7 @@ CI身份另记。启动交接及非叶失效依据见[学习说明](../learning/
 
 绑定任务 metadata/stack OOM 保留 caller MM 和空 join；自然退出要求 pin/active/pending 为零、所有任务与等待存储归还，16MiB 私有 arena 的 available 回到 finalize 后4079页并独占 audit，再归还系统 order12 owner。MM RFENCE及FENCE.I错误各用双RAM独立启动，核对新调用链保留 owner 后 fatal；不计自然退出或回收成功。CPU0 原静态/pthread程序与CPU1私有MM工作重叠的组合独立执行。
 
-当前 RV 测试产物的 MM 记录544字节、pin56字节、SMP task2768字节和CPU记录1968字节；默认 task2688、CPU288。记录和任务仍各占一个metadata页，pin与退休批次不动态分配；单页pin增加实际acquire/release及两段raw，COW共享页才复制4KiB。并发gate入口检查当前任务的pin链，成本为O(K)，K仅是该owner尚持片段数，普通逐页复制每次先归还片段。每段退休最多16个owner；页表准备最多两张，竞争可产生 loser 和重试，不能由容量上界宣称应用变快。runner保存整启动OFF时间、实际指令同步和 owner 计数；没有新增匹配性能门槛、并行吞吐或硬件性能结论。
+2026-10-12匿名MM阶段的RV测试产物为MM记录544字节、pin56字节、SMP task2768字节和CPU记录1968字节；当时默认task2688、CPU288，后续磁盘域尺寸见[存储说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。记录和任务仍各占一个metadata页，pin与退休批次不动态分配；单页pin增加实际acquire/release及两段raw，COW共享页才复制4KiB。并发gate入口检查当前任务的pin链，成本为O(K)，K仅是该owner尚持片段数，普通逐页复制每次先归还片段。每段退休最多16个owner；页表准备最多两张，竞争可产生 loser 和重试，不能由容量上界宣称应用变快。runner保存整启动OFF时间、实际指令同步和 owner 计数；没有新增匹配性能门槛、并行吞吐或硬件性能结论。
 
 共享匿名配置位于`build/riscv-mm-shared-smp-test/`，复用同一生产MM和MTTCG runner。
 2026-10-12双RAM的2/1CPU验证父子驻留/未驻留/PROT_NONE共享叶、同页首次缺页仅一次对象发布、
@@ -155,3 +155,19 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 默认RA0/WB1保持，SMP+COST继续拒绝；实际QEMU/OpenSBI身份由runner保存。
 接口、结构成本和竞态背景见[MM](kernel-mm.md#受控-ext4-文件映射)、
 [VFS](vfs-ext4.md#后台写回与水位回收)及[存储学习说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。
+
+## 共享 FD 表与匿名 pipe
+
+`kernel_thread_create_joinable_files()`在CPU0准备独立MM/files引用，最终任务发布移入这些handle；创建失败完整归还。控制者只持record引用，不额外持端点，因此真实最后关闭能产生EOF/EPIPE。退出在可信栈释放handle；匿名pipe末OFD可在CPU1归还，普通文件后端仍由CPU0完成最后释放。域校验与FD/pipe协议见[文件接口](kernel-files.md)。
+
+```sh
+make test-files-concurrency-host test-pipe-concurrency-host
+make test-files-smp-riscv INIT_CONFIG=config/init.json
+make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
+```
+
+产物默认位于`build/riscv-files-smp-test/`；`FILES_SMP_BUILD`可为独立本地/CI构建选择目录，runner使用Make传入路径。2026-10-13本地QEMU11.1.2及Ubuntu24.04/QEMU8.2.2各完成2/1CPU、512MiB/1GiB的新盘与独立重启8次正常启动，并完成双RAM的原静态/pthread组合。两核使用实际MTTCG线程，无icount；记录各自固件/内核/工具身份，不能由本地容器结果推定远程CI已运行。
+
+实际登记后的提前wake、fd复用后旧请求、EOF/信号仲裁、blocked/off_cpu迁移、两种任务创建OOM和pipe2输出跨页fault均核对原请求内容及owner。持续4KiB包由CPU0写入、CPU1读入真实受控磁盘映射，冷缺页由CPU0 worker前进；原用户组合要求init实际执行且仍存活期间有包接纳。宿主另使用真实tmpfs映射作为缺页读写缓冲，覆盖4/16KiB几何。普通用户仍在CPU0，未开放socket/epoll/FIFO或文件后端业务跨核。
+
+自然退出同时核对PID1状态、FD/OFD/端点/等待、MM/pin、页/堆/任务栈、私有挂载与根盘设备owner，并运行两盘fsck；不是只检查串口marker。RV产物FD record160字节、pipe504字节、task2784字节，前两者保持256/512字节slab；复用task已有files字段，未新增任务页。扩容锁内复制上限8192字节，pin/close不分配或全表扫描；没有新增数据中转缓冲或worker。OFF工作tick与收尾分别保留，不据此宣称性能提升。

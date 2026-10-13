@@ -79,6 +79,10 @@ def main():
         return 1
     if "SMP root overlap counter=" not in text or "controller/arena/wait owners returned" not in text:
         return 1
+    if os.environ.get("BOAROS_SMP_FILES")=="1":
+        if ("FILES SMP native FD reuse/early wake/EOF/cancel/content/task rollback passed" not in text or
+            "FILES SMP measured live-user overlap packets=" not in text or
+            "FD/OFD/pipe/wait owners returned" not in text): return 1
     if disk:
         if "disk MM CPU0 I/O/cache/alias/mount owners returned" not in text: return 1
         subprocess.run(["e2fsck","-fn",str(disk)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
