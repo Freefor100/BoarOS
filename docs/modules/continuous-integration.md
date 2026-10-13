@@ -42,6 +42,9 @@ runner开启QEMU `debug-threads=on`，在Ubuntu/QEMU8.2.2同样能记录实际vC
 host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格、调度/身份/退休，
 另直接链接 MM/VMA/Sv39/uaccess，覆盖复制 pin、许可排空、COW/OOM/竞争候选、活动集合、共享对象配额/引用、真实tmpfs/OFD/登记，以及真实ext4镜像的CPU0冷读交接、写入借用、快照/截断和错误的确定性交错。缓存/登记层覆盖4/16KiB，宿主MM为Sv39，LA16KiB由客户机单核门禁覆盖。allocator覆盖4/16KiB及2/4逻辑CPU调度握手、非法owner、抢占、有界工作量和借用销毁。
 同组还运行配对成本的host统计、锁继承和假sysfs恢复门禁；CI不执行需要本机限频权限的正式测量。
+FD扩容成本探针单独编译`fs/files/table.c`，仅该对象关闭宿主Fortify内联，
+保留真实`memcpy`调用供linker wrap计数。其余宿主对象保持原强化策略；
+仍要求观察到非零复制且每次不超过8192字节，不能用编译器绕过观测后的零值判定通过。
 `test-files-concurrency-host`和`test-pipe-concurrency-host`直接验证FD原子引用交接、域外别名拒绝、管道内容/等待及末端回收；RV独立`shared-fd-pipe`和`shared-fd-user-composition`组分别保存结果。`FILES_SMP_BUILD`传递实际构建目录，Ubuntu/QEMU8.2.2本地容器验证不计作托管CI已执行。
 RV完整门禁与LA cpu-state运行真实raw/等待/handoff/lifecycle，含双RAM首次/恢复/退出
 及可信栈归还；宿主并发不代表整个内核SMP-ready。
