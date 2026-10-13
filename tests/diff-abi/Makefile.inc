@@ -43,14 +43,18 @@ build/loongarch/diff-abi-cases: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/c
 test-diff-abi-loongarch: test-diff-abi-host kernel-la build/loongarch/diff-abi-cases prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/diff-abi-cases --timeout 180 $(TEST_MEMORY_ARGS)
 
-build/diff-abi/sched-handoff-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/riscv/user_elf.ld
+build/diff-abi/sched-handoff-rv-delayed: ABI_HANDOFF_FLAGS := -DABI_HANDOFF_DELAY_NS=20000000
+build/diff-abi/sched-handoff-rv build/diff-abi/sched-handoff-rv-delayed: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/riscv/user_elf.ld tests/diff-abi/Makefile.inc
 	@mkdir -p $(@D)
-	$(CC) $(ARCH_FLAGS) -DABI_SCHED_HANDOFF_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c
-build/loongarch/sched-handoff-la: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/common/user.ld
+	$(CC) $(ARCH_FLAGS) -DABI_SCHED_HANDOFF_ONLY $(ABI_HANDOFF_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c
+build/loongarch/sched-handoff-la-delayed: ABI_HANDOFF_FLAGS := -DABI_HANDOFF_DELAY_NS=20000000
+build/loongarch/sched-handoff-la build/loongarch/sched-handoff-la-delayed: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/common/user.ld tests/diff-abi/Makefile.inc
 	@mkdir -p $(@D)
-	$(LA_CC) $(LA_FLAGS) -DABI_SCHED_HANDOFF_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c
+	$(LA_CC) $(LA_FLAGS) -DABI_SCHED_HANDOFF_ONLY $(ABI_HANDOFF_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c
 .PHONY: test-scheduler-handoff-riscv test-scheduler-handoff-loongarch
-test-scheduler-handoff-riscv: $(KERNEL_RV) build/diff-abi/sched-handoff-rv
+test-scheduler-handoff-riscv: $(KERNEL_RV) build/diff-abi/sched-handoff-rv build/diff-abi/sched-handoff-rv-delayed
 	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/sched-handoff-rv --case-manifest tests/diff-abi/sched-handoff-cases.txt --memory 512M --memory 1G --timeout 60 --output build/sched-handoff-rv
-test-scheduler-handoff-loongarch: kernel-la build/loongarch/sched-handoff-la prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/sched-handoff-rv-delayed --case-manifest tests/diff-abi/sched-handoff-cases.txt --memory 512M --memory 1G --timeout 60 --output build/sched-handoff-rv-delayed
+test-scheduler-handoff-loongarch: kernel-la build/loongarch/sched-handoff-la build/loongarch/sched-handoff-la-delayed prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/sched-handoff-la --case-manifest tests/diff-abi/sched-handoff-cases.txt --memory 512M --memory 1G --timeout 60 --output build/sched-handoff-la
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/sched-handoff-la-delayed --case-manifest tests/diff-abi/sched-handoff-cases.txt --memory 512M --memory 1G --timeout 60 --output build/sched-handoff-la-delayed

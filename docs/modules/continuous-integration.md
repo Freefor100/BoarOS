@@ -53,6 +53,8 @@ RV完整门禁与LA cpu-state运行真实raw/等待/handoff/lifecycle，含双RA
 回收标为unverified；取消保留incomplete，未执行项不补成功。host使用宿主PATH和
 空LD_LIBRARY_PATH；输出超时测试先确认真实子进程flush/ready，正式计时预算不变。
 所有native Make命令显式使用`INIT_CONFIG=config/init.json`。
+聚焦调度handoff（含延迟子任务）单独归档Linux/BoarOS串口、身份、normalized和diff，
+失败盘单列；聚合architecture日志中的错误尾部不能替代这些完整输入。
 
 ```sh
 make test-ci-host

@@ -97,6 +97,10 @@ jobs:
             build/diff-abi/run/*.json
             build/diff-abi/run/*.normalized
             build/diff-abi/run/*.diff
+            build/sched-handoff-*/*.log
+            build/sched-handoff-*/*.json
+            build/sched-handoff-*/*.normalized
+            build/sched-handoff-*/*.diff
             build/elf-tail-riscv/**/suite.json
             build/elf-tail-riscv/**/result.json
             build/elf-tail-riscv/**/*.log
@@ -114,6 +118,7 @@ jobs:
             build/${{ inputs.arch }}/**/*.img
             build/riscv*-smp-test/runs/**/*.img
             build/diff-abi/run/*.img
+            build/sched-handoff-*/*.img
             build/io-sleep-run.*/root.img
             build/multi-disk-io.*/*.img
             build/elf-tail-riscv/**/*.img

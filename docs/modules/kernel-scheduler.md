@@ -91,6 +91,8 @@ FIFO yield和RR到期只轮转同级候选；未节流且没有同级竞争者�
 `test-scheduler-handoff-host`直接链接生产决策、队列/策略/raw，覆盖低/同/高优先级、节流和idle；
 `test-scheduler-handoff-riscv/test-scheduler-handoff-loongarch`在512MiB/1GiB以同ELF对照固定Linux，
 高优先级yield/跨RR片时低任务计数保持0，随后高任务阻塞才允许低任务前进并正常回收。
+该用例在放行前准备计时输出，阻塞后通过pipe确认真实子任务进展；不以5ms睡眠
+推断调度完成。另运行子任务延迟20ms的同契约反例，原160ms RR窗口和退出核对保持。
 
 退出在发布 completion、清 TID 并唤醒等待者后，若已注册 cleanup worker，按同一
 ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 或 join owner 在可信栈
