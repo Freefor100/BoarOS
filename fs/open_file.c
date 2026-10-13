@@ -558,6 +558,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file)
 {
+    if (file && file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe &&
+        __atomic_load_n(&file->pipe->concurrent,__ATOMIC_ACQUIRE)) return 0;
     if (file == 0) {
         return 0;
     }
@@ -611,7 +613,12 @@ enum kernel_open_file_status kernel_open_file_release(
         *owner = 0;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    kernel_assert_service_context();
+    /* 匿名pipe没有后端、命名空间或观察者清理；最后endpoint可在受控CPU归还。
+     * 其余对象的真实清理继续由CPU0服务域执行。 */
+    if (!(file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe &&
+          !file->file.private_data && !file->pipe->fifo_node &&
+          !file->ep_items && !file->device_opened && !file->record_locks &&
+          !file->generated_ready)) kernel_assert_service_context();
     if (references == 1U) {
         reset_read_prediction(file);
         release_record_locks(file);
@@ -764,8 +771,10 @@ uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file)) return 0U;
-    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data) {
+        KERNEL_RAW_SCOPE(guard,&file->pipe->metadata_lock);
         return file->pipe->mode;
+    }
     if (file->kind == KERNEL_OPEN_FILE_KIND_PATH)
         return kernel_vfs_path_mode(file->file.path);
     return file->file.mode;

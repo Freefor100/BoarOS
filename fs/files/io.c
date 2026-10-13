@@ -28,6 +28,18 @@
 
 #define KERNEL_FILES_WRITE_STAGING 64U
 
+/* 核心只报告接纳/断端；仅真实用户调用有SIGPIPE及syscall restart上下文。 */
+static enum kernel_files_status pipe_user_result(int64_t bytes,unsigned broken)
+{
+    struct kernel_task *task=kernel_task_current();
+    if (kernel_task_has_user_context(task)) {
+        if (broken && kernel_signal_send_task(task,13,0)!=KERNEL_SIGNAL_STATUS_OK)
+            return KERNEL_FILES_STATUS_STATE;
+        if (bytes==-KERNEL_ERESTARTSYS) kernel_signal_note_syscall_restart(task);
+    }
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status release_io_description(
     struct kernel_files *files,
     struct kernel_open_file_description **owner,
@@ -437,7 +449,7 @@ static enum kernel_files_status read_pinned(
             kernel_open_file_flags(description),
             linux_result);
 
-        if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+        if (pipe_status != KERNEL_PIPE_STATUS_OK || pipe_user_result(*linux_result,0)) {
             return KERNEL_FILES_STATUS_STATE;
         }
         if (*linux_result > 0 && description->file.private_data)
@@ -955,10 +967,11 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
     struct kernel_open_file_description *output = *output_owner;
     enum kernel_open_file_kind kind = kernel_open_file_kind(output);
     if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
-        int64_t result;
+        struct kernel_pipe_result completed;
         if (kernel_pipe_write_buffer(output->pipe, buffer, size,
-                kernel_open_file_flags(output), &result) != KERNEL_PIPE_STATUS_OK)
-            __builtin_trap();
+                kernel_open_file_flags(output), &completed) != KERNEL_PIPE_STATUS_OK ||
+            pipe_user_result(completed.bytes,completed.broken)) __builtin_trap();
+        int64_t result=completed.bytes;
         if (result > 0 && output->file.private_data &&
             !kernel_vfs_mount_is_readonly(output->file.mount)) {
             int error = kernel_vfs_file_modified(&output->file, 0, 0);
@@ -1208,9 +1221,11 @@ static enum kernel_files_status buffered_write_request(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
-        if (kernel_pipe_writev(description->pipe, mm, iov, iov_count,
-                count, kernel_open_file_flags(description), linux_result) != KERNEL_PIPE_STATUS_OK)
-            return KERNEL_FILES_STATUS_STATE;
+        struct kernel_pipe_result completed;
+        if (kernel_pipe_writev(description->pipe,mm,iov,iov_count,count,
+            kernel_open_file_flags(description),&completed)!=KERNEL_PIPE_STATUS_OK ||
+            pipe_user_result(completed.bytes,completed.broken)) return KERNEL_FILES_STATUS_STATE;
+        *linux_result=completed.bytes;
         if (*linux_result > 0 && description->file.private_data &&
             !kernel_vfs_mount_is_readonly(description->file.mount)) {
             int error = kernel_vfs_file_modified(&description->file, 0, 0);

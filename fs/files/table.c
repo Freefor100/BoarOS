@@ -7,6 +7,7 @@
 
 #include <kernel/errno.h>
 #include <kernel/heap.h>
+#include <kernel/irq.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/uaccess.h>
@@ -63,8 +64,15 @@ int kernel_files_is_live(const struct kernel_files *files)
     }
 #endif
     KERNEL_FILES_SCOPE(guard, files);
-    return files->record->references != 0 && files->record->slots &&
-        files->record->statistics.capacity >= KERNEL_FILES_INITIAL_CAPACITY;
+    struct kernel_files_record *record=files->record;
+    uint32_t capacity=record->statistics.capacity;
+    if (!record->references || record->retired || !record->slots ||
+        capacity<KERNEL_FILES_INITIAL_CAPACITY || capacity>KERNEL_FILES_MAX_CAPACITY ||
+        (capacity & (capacity-1)) || record->next_fd>capacity || record->concurrent>1 ||
+        record->statistics.current_open_fds>capacity ||
+        record->statistics.close_on_exec_fds>record->statistics.current_open_fds)
+        __builtin_trap();
+    return 1;
 }
 static struct kernel_open_file_description *lookup_locked(
     const struct kernel_files *files, int64_t fd)
@@ -147,7 +155,8 @@ static int description_in_domain(const struct kernel_files *files,
 {
     return !file || (file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->heap==files->heap &&
         file->pipe && file->pipe->heap==files->heap && !file->pipe->fifo_node &&
-        file->pipe->allocator==files->heap->page_allocator && !file->file.private_data);
+        file->pipe->allocator==files->heap->page_allocator && !file->file.private_data &&
+        !file->ep_items && !file->record_locks && !file->device_opened);
 }
 enum kernel_files_status kernel_files_check_concurrent_domain(
     const struct kernel_files *files, const struct kernel_mm *mm)
@@ -165,6 +174,7 @@ enum kernel_files_status kernel_files_enable_concurrency(
     kernel_assert_service_context();
     if (!kernel_files_is_live(files) || kernel_mm_check_files_domain(mm,files->heap))
         return KERNEL_FILES_STATUS_STATE;
+    KERNEL_IRQ_SCOPE(enable_irq);
     KERNEL_FILES_SCOPE(guard,files);
     struct kernel_files_record *record=files->record;
     if (record->references!=1 || record->retired || record->concurrent ||
@@ -173,6 +183,10 @@ enum kernel_files_status kernel_files_enable_concurrency(
         if (record->slots[i].flags & KERNEL_FILES_FD_RESERVED ||
             !description_in_domain(files,record->slots[i].description))
             return KERNEL_FILES_STATUS_STATE;
+    /* 私有、独占record的槽owner覆盖这个解锁范围；FD和pipe raw不嵌套。 */
+    kernel_raw_scope_release(&guard);
+    for (uint32_t i=0;i<record->statistics.capacity;i++)
+        if (record->slots[i].description) kernel_pipe_enable_concurrency(record->slots[i].description->pipe);
     __atomic_store_n(&record->concurrent,1,__ATOMIC_RELEASE);
     return KERNEL_FILES_STATUS_OK;
 }
@@ -427,6 +441,9 @@ static enum kernel_files_status install_owned_locked(
     if (owner == 0 || *owner == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
+    if (!files->record->concurrent && (*owner)->kind==KERNEL_OPEN_FILE_KIND_PIPE &&
+        (*owner)->pipe && __atomic_load_n(&(*owner)->pipe->concurrent,__ATOMIC_ACQUIRE))
+        return KERNEL_FILES_STATUS_STATE;
     if (files->record->concurrent && ((*owner)->kind!=KERNEL_OPEN_FILE_KIND_PIPE ||
         (*owner)->heap!=files->heap || !(*owner)->pipe ||
         (*owner)->pipe->heap!=files->heap || (*owner)->pipe->fifo_node ||
@@ -476,6 +493,10 @@ enum kernel_files_status kernel_files_install_new_owned_at(
     struct kernel_open_file_description **owner)
 {
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (files->record->concurrent) {
+        if (!owner || !description_in_domain(files,*owner) || !*owner) return KERNEL_FILES_STATUS_STATE;
+        kernel_pipe_enable_concurrency((*owner)->pipe);
+    }
     KERNEL_FILES_SCOPE(guard, files);
     return install_owned_locked(files, fd, fd_flags, owner);
 }
@@ -487,6 +508,10 @@ enum kernel_files_status kernel_files_install_shared_acquired_at(
     struct kernel_open_file_description **owner)
 {
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (files->record->concurrent) {
+        if (!owner || !description_in_domain(files,*owner) || !*owner) return KERNEL_FILES_STATUS_STATE;
+        kernel_pipe_enable_concurrency((*owner)->pipe);
+    }
     KERNEL_FILES_SCOPE(guard, files);
     return install_owned_locked(files, fd, fd_flags, owner);
 }
@@ -500,6 +525,10 @@ enum kernel_files_status kernel_files_install_pair_reserved(
         !first->files || first->files!=second->files || first->fd==second->fd ||
         !a || !*a || !b || !*b) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_files *files=first->files;
+    if (files->record->concurrent) {
+        if (!description_in_domain(files,*a) || !description_in_domain(files,*b)) return KERNEL_FILES_STATUS_STATE;
+        kernel_pipe_enable_concurrency((*a)->pipe); kernel_pipe_enable_concurrency((*b)->pipe);
+    }
     KERNEL_FILES_SCOPE(guard, files);
     if (files->record->concurrent &&
         (!description_in_domain(files,*a) || !description_in_domain(files,*b)))

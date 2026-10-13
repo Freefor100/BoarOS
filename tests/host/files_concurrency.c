@@ -4,6 +4,7 @@
 #include <kernel/cpu.h>
 #include <kernel/open_file.h>
 #include <kernel/mm_backend.h>
+#include <kernel/signal.h>
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
 #include "../../fs/pipe_internal.h"
@@ -12,6 +13,9 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 void mm_test_attach(unsigned);
 void mm_test_bind(struct kernel_mm *);
@@ -24,6 +28,24 @@ static unsigned watch_pin, pin_entered, close_started, release_pin;
 static struct kernel_files files;
 static struct kernel_open_file_description *held;
 static struct kernel_mm domain_mm;
+#ifdef PIPE_CONCURRENCY_CASES
+static unsigned signal_calls;
+enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task,uint32_t sig,kernel_pid_t sender)
+{ (void)task; (void)sig; (void)sender; signal_calls++; return KERNEL_SIGNAL_STATUS_INVALID_STATE; }
+void kernel_signal_note_syscall_restart(struct kernel_task *task)
+{ (void)task; assert(!"pipe core invoked user signal context"); }
+static void broken_kernel_writer(struct kernel_heap *heap)
+{
+    struct kernel_pipe *pipe=0; struct kernel_open_file_description *a=0,*b=0;
+    assert(!kernel_pipe_create(heap,&pipe));
+    assert(!kernel_open_file_create_pipe(heap,pipe,KERNEL_PIPE_ENDPOINT_READ,0,&a));
+    assert(!kernel_open_file_create_pipe(heap,pipe,KERNEL_PIPE_ENDPOINT_WRITE,0,&b));
+    assert(!kernel_open_file_release(&a));
+    struct kernel_pipe_result result;
+    assert(!kernel_pipe_write_buffer(pipe,"x",1,1,&result) && result.bytes==-32 && result.broken && !signal_calls);
+    assert(!kernel_open_file_release(&b));
+}
+#endif
 static struct kernel_files views[4];
 static unsigned allocated[4][192], group_ready, group_release;
 static _Thread_local unsigned fail_growth;
@@ -116,6 +138,15 @@ static void concurrent_dup_case(struct kernel_heap *heap,unsigned actors)
     assert(!kernel_files_close_on_exec(&files));
     kernel_files_get_statistics(&files,&stats);
     assert(stats.current_open_fds==2 && !stats.close_on_exec_fds);
+    pid_t child=fork(); assert(child>=0);
+    if (!child) {
+        files.record->references=0;
+        struct kernel_open_file_description *invalid=0;
+        kernel_files_pin(&files,0,&invalid,&result);
+        _exit(0);
+    }
+    int status; assert(waitpid(child,&status,0)==child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGILL && "live FD record lost ownership without a fatal trap");
     assert(!kernel_files_release(&files));
     printf("PASS %u threads shared FD growth, unique owners, reservations and status flags\n",actors);
 }
@@ -145,6 +176,9 @@ static void *close_thread(void *p)
     assert(!kernel_files_close(&files, 0, &result) && !result);
     return 0;
 }
+#ifdef PIPE_CONCURRENCY_CASES
+#include "pipe_cases.h"
+#endif
 int main(void)
 {
     setvbuf(stdout, 0, _IONBF, 0); mm_test_attach(0);
@@ -155,6 +189,7 @@ int main(void)
         !physical_page_allocator_bind_access(&pages, access_page) &&
         !physical_page_allocator_finalize(&pages) &&
         !kernel_heap_init(&heap, &pages, page_address));
+    uint64_t baseline=physical_page_available(&pages);
     assert(!kernel_files_create(&files, &heap));
     struct kernel_pipe *pipe = 0;
     struct kernel_open_file_description *read = 0, *write = 0;
@@ -188,14 +223,20 @@ int main(void)
     assert(!riscv_sv39_page_table_init(&kernel,&pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
     assert(!arch_mmu_user_space_init(&space,&pages,&kernel) &&
         !kernel_mm_create(&domain_mm,&space) && !kernel_mm_vma_enable(&domain_mm,&heap));
+    assert(!kernel_mm_brk_initialize(&domain_mm,0x10000,0x20000));
     assert(!kernel_mm_enable_concurrency(&domain_mm));
     concurrent_dup_case(&heap,2); concurrent_dup_case(&heap,4);
+#ifdef PIPE_CONCURRENCY_CASES
+    broken_kernel_writer(&heap);
+    pipe_cases(&heap);
+#endif
     assert(!kernel_mm_release(&domain_mm));
     assert(!physical_page_release(&pages,kernel.root_address));
     assert(!physical_page_allocator_audit(&pages));
     struct kernel_heap_statistics final;
     kernel_heap_get_statistics(&heap,&final);
     assert(!final.live_allocations);
+    assert(!final.current_pages && physical_page_available(&pages)==baseline);
     assert(sizeof(struct kernel_files_record)<=256 && sizeof(struct kernel_pipe)<=512);
     assert(maximum_copy && maximum_copy<=8192 && metadata_acquisitions);
     printf("FD record=%zu pipe=%zu max raw copy=%u acquisitions=%u\n",

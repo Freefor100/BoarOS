@@ -2316,6 +2316,12 @@ enum kernel_task_status validate_task_resource_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+int kernel_task_has_user_context(const struct kernel_task *task)
+{
+    return task && task==kernel_cpu_current()->current && task->magic==KERNEL_THREAD_MAGIC &&
+        task->state==KERNEL_THREAD_STATE_RUNNING && task->arch.user_mode==1U;
+}
+
 enum kernel_task_status kernel_task_files_borrow(
     struct kernel_task *task,
     struct kernel_files **files)

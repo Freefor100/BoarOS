@@ -2212,6 +2212,10 @@ $(BUILD_DIR)/sync-%.d: ;
 test-files-concurrency-host:
 	sh tests/files-concurrency-host.sh
 
+.PHONY: test-pipe-concurrency-host
+test-pipe-concurrency-host:
+	sh tests/pipe-concurrency-host.sh
+
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host:
 	@mkdir -p build/host

@@ -57,3 +57,9 @@ close 只摘下当前槽 owner，正在执行的读写继续使用自己的 OFD�
 扩容把 allocation/zero 放在锁外，重查后发布；旧数组不被裸槽指针借用，因而解锁即可归还。
 固定依据是 `references/linux/fs/file.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；
 其摘槽与锁外关闭关系用于核对语义，BoarOS 的短锁和预留表示由本模块自己实现。
+
+管道关闭的端点人数和存储owner有不同的结束点：先更新readiness并通知，通知仍使用管道，所以关闭者的已有owner保留到通知返回，再归还存储引用。
+若先减至零、解锁后通知，另一个关闭者可能在回调前释放对象。
+复制资格与短metadata保护也分开；poll回调只读metadata，不等待复制mutex，用户缺页不会占用raw锁。
+等待token在metadata保护内登记，保护释放后才park，提前通知由已有单次仲裁接纳。
+bootstrap阶段调度器尚未启动时，合法非阻塞管道没有可park任务；NOT_INITIALIZED通知与真正的运行期错误分别处理，最终queue销毁仍核对注册/借用归零。

@@ -7,6 +7,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/page.h>
 #include <kernel/sync.h>
+#include <kernel/raw_lock.h>
 #include <kernel/vfs.h>
 
 struct kernel_heap;
@@ -29,10 +30,11 @@ struct kernel_pipe {
     uint16_t slots;
     uint16_t page_offset[16];
     uint16_t page_length[16];
-    uint8_t can_merge[16];
+    uint16_t can_merge;
     uint64_t bytes;
     struct kernel_vfs_node *fifo_node; /* 弱关联；每个owner另持节点引用。 */
     uint32_t owners;
+    uint8_t concurrent; /* 复用代次前的对齐空隙；受控pipe不接未同步epoll。 */
     uint64_t reader_generation, writer_generation;
     uint32_t readers;
     uint32_t writers;
@@ -40,6 +42,7 @@ struct kernel_pipe {
     struct kernel_wait_queue write_queue;
     struct kernel_wait_queue both_queue;
     struct kernel_mutex copy_lock;
+    struct kernel_raw_lock metadata_lock;
 };
 
 #define KERNEL_PIPE_ENDPOINT_READ 1U
@@ -55,12 +58,16 @@ enum kernel_pipe_status {
     KERNEL_PIPE_STATUS_NO_MEMORY,
     KERNEL_PIPE_STATUS_STATE,
 };
+/* 复制mutex固定片段，metadata raw保护发布；核心不处理用户信号。
+ * bytes保留已接纳前缀，broken独立报告断端，包括部分接纳后的断端。 */
+struct kernel_pipe_result { int64_t bytes; unsigned broken; };
 
 struct kernel_pipe;
 
 enum kernel_pipe_status kernel_pipe_create(
     struct kernel_heap *heap,
     struct kernel_pipe **owner);
+void kernel_pipe_enable_concurrency(struct kernel_pipe *);
 
 int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node,
     uint32_t flags, struct kernel_pipe **owner, uint8_t *endpoint,
@@ -100,7 +107,7 @@ enum kernel_pipe_status kernel_pipe_writev(
     size_t iov_count,
     uint64_t count,
     uint32_t open_flags,
-    int64_t *linux_result);
+    struct kernel_pipe_result *result);
 
 uint32_t kernel_pipe_poll(
     struct kernel_pipe *pipe,
@@ -110,6 +117,6 @@ uint32_t kernel_pipe_poll(
 
 enum kernel_pipe_status kernel_pipe_write_buffer(
     struct kernel_pipe *pipe, const void *buffer, size_t count,
-    uint32_t open_flags, int64_t *linux_result);
+    uint32_t open_flags, struct kernel_pipe_result *result);
 
 #endif
