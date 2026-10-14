@@ -227,7 +227,7 @@ void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
     virt_uart_putc('\n');
 }
 
-static void report_user_execution(void)
+void riscv_smp_report_user_execution(void)
 {
 #if BOAROS_USER_SMP
     for (unsigned i=0; i<cpu_count; i++) {
@@ -249,7 +249,7 @@ static void report_user_execution(void)
 
 void riscv_smp_stop(void)
 {
-    if (cpu_count < 2) { report_user_execution(); return; }
+    if (cpu_count < 2) return;
     if (__atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_STOPPED) return;
     if (kernel_cpu_current()->logical_id) __builtin_trap();
     kernel_preempt_disable();
@@ -263,7 +263,6 @@ void riscv_smp_stop(void)
     if (__atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) != KERNEL_CPU_QUIESCING)
         riscv_smp_fail("stop-kernel-state", cpus[1]->state);
     __atomic_store_n(&cpus[1]->state, KERNEL_CPU_STOPPED, __ATOMIC_RELEASE);
-    report_user_execution();
     kernel_preempt_enable();
 }
 

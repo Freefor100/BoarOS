@@ -389,3 +389,5 @@ make test-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage \
 仍要求行规程echo与cat真实回送分别出现。Linux/BoarOS的LA512MiB/1GiB和
 RV门禁通过，没有修改原BusyBox、TTY核心、超时或结果归一化。固定资料与
 原程序身份沿上述终端验收；该事实是runner同步修复，不是Linux/BoarOS ABI差异。
+
+2026-10-14 USER_SMP主线的默认单核组合复核仍使用固定229项及原程序：BoarOS两侧双RAM全部完成，RV1GiB与LA双RAM同ELF对照全通过。RV512MiB原BusyBox脚本的`du`在Linux动态`/proc`遍历失败，整组标为reference-not-pass；BoarOS内容/退出/回收通过。该首轮未补记通过，也不替此前LA参考失败归因。新USER_SMP原生、1400 ABI和运行时使用另一个固定Linux SMP配置，其结果及CPU0业务边界见[两核模块](../modules/riscv-smp.md#真实用户态与cpu0业务交接)，不把默认229项推广成全部SMP应用已验收。

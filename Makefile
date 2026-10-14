@@ -2307,9 +2307,19 @@ USER_SMP_ELF := build/riscv-user-smp/user-smp-rv
 $(USER_SMP_ELF): tests/userland/user_smp.c tests/userland/user_smp_probe.S build/riscv/musl-root/.shared-built
 	@mkdir -p $(dir $@)
 	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
-test-user-smp-riscv: $(USER_SMP_ELF)
+USER_SMP_DYNAMIC_ELF := build/riscv-user-smp/user-smp-dynamic-rv
+$(USER_SMP_DYNAMIC_ELF): tests/userland/user_smp.c tests/userland/user_smp_probe.S $(MUSL_LDSO)
+	@mkdir -p $(dir $@)
+	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -DBOAROS_SMP_DYNAMIC=1 -Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 -fPIC -pie -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
+test-user-smp-riscv: $(USER_SMP_ELF) $(USER_SMP_DYNAMIC_ELF) $(PTHREAD_TLS_DSO_RV)
 	$(MAKE) kernel-rv-user-smp
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_ELF) $(TEST_MEMORY_ARGS)
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
+.PHONY: test-user-smp-runtime-riscv
+test-user-smp-runtime-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO) $(DIFF_ABI_RV)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(DIFF_ABI_RV) --manifest tests/diff-abi/cases.txt $(TEST_MEMORY_ARGS)
+	python3 -B tests/smp/runtime.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(REAL_USERLAND_RV) --pthread-program $(PTHREAD_USERLAND_RV) --tls $(PTHREAD_TLS_DSO_RV) --loader $(MUSL_LDSO) $(TEST_MEMORY_ARGS)
 .PHONY: test-mm-smp-riscv
 test-mm-smp-riscv:
 	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 COST_DIAGNOSTICS=0 all

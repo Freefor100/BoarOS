@@ -149,6 +149,18 @@ class ArchitectureCoverage(unittest.TestCase):
         self.assertIn('test-cost-match-host', commands)
         self.assertNotIn('test-cost-match-riscv', commands)
 
+    def test_user_smp_has_an_independent_result_suite(self):
+        commands=[argument for case in self.plan('riscv','user-smp') for argument in case['argv']]
+        self.assertIn('test-user-smp-riscv',commands)
+        self.assertIn('test-user-smp-runtime-riscv',commands)
+        host=[argument for case in self.plan('host','host') for argument in case['argv']]
+        self.assertIn('test-user-smp-host',host)
+        controlled=[argument for case in self.plan('riscv','smp') for argument in case['argv']]
+        self.assertIn('test-smp-fpu-setup-riscv',controlled)
+        result=subprocess.run([sys.executable,'-B',str(Path(__file__).with_name('run.py')),
+            '--arch','loongarch','--suite','user-smp','--list'],capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0)
+
     def test_native_template_retains_full_abi_observations_and_failed_disk(self):
         path = Path(__file__).resolve().parents[2] / '.github/workflows/native-contracts.yml'
         steps = yaml.safe_load(path.read_text())['jobs']['contracts']['steps']

@@ -7,7 +7,7 @@ import selectors
 import subprocess
 import sys
 import time
-from riscv import identity
+from riscv import identity,observe_threads
 
 
 def main():
@@ -45,11 +45,7 @@ def main():
     threads, data, timed_out = set(), bytearray(), False
     try:
         while process.poll() is None:
-            for path in Path(f"/proc/{process.pid}/task").glob("*/comm"):
-                try:
-                    threads.add(path.read_text().strip())
-                except FileNotFoundError:
-                    pass
+            threads.update(observe_threads(process.pid))
             for key, _ in selector.select(0.005):
                 data.extend(os.read(key.fd, 65536))
             if time.monotonic() - start >= 180:

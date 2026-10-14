@@ -25,7 +25,7 @@ jobs:
         with:
           arch: ${{ inputs.arch }}
       - name: Record and select the actual SMP firmware
-        if: ${{ inputs.arch == 'riscv' && inputs.suite == 'smp' }}
+        if: ${{ inputs.arch == 'riscv' && (inputs.suite == 'smp' || inputs.suite == 'user-smp') }}
         run: |
           python3 -B - <<'PY'
           import hashlib, json, os, shutil, subprocess
@@ -81,6 +81,10 @@ jobs:
             build/riscv*-smp-test/runs/**/*.log
             build/riscv*-smp-test/runs/**/*.json
             build/riscv-smp/*.json
+            build/riscv-user-smp/**/*.log
+            build/riscv-user-smp/**/*.json
+            build/riscv-user-smp/**/*.normalized
+            build/riscv-user-smp/**/*.diff
             build/${{ inputs.arch }}/**/*.log
             build/${{ inputs.arch }}/**/*.json
             build/${{ inputs.arch }}/**/*.normalized
@@ -125,6 +129,7 @@ jobs:
           path: |
             build/${{ inputs.arch }}/**/*.img
             build/riscv*-smp-test/runs/**/*.img
+            build/riscv-user-smp/**/*.img
             build/diff-abi/run/*.img
             build/sched-handoff-*/*.img
             build/exec-boundary-*/*.img

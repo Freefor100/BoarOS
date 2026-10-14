@@ -70,6 +70,9 @@ static void phase(int kind)
 }
 void abi_sched_handoff_cases(void)
 {
+    unsigned long original_mask=0, cpu0=1;
+    abi_require(SC3(123,0,sizeof(original_mask),&original_mask)==sizeof(original_mask));
+    abi_require(SC3(122,0,sizeof(cpu0),&cpu0)==0);
     long mkdir = SC3(34, -100, "/proc", 0755);
     abi_require(mkdir == 0 || mkdir == -17);
     long mount = SC5(40, "proc", "/proc", "proc", 0, 0);
@@ -78,4 +81,5 @@ void abi_sched_handoff_cases(void)
     abi_require(control >= 0 && SC3(64, control, "-1\n", 3) == 3 && SC1(57, control) == 0);
     phase(1);
     phase(2);
+    abi_require(SC3(122,0,sizeof(original_mask),&original_mask)==0);
 }

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/diff-abi'))
@@ -18,14 +19,17 @@ CASES=('process-affinity-overlap','pthread-tls-registers-nested-signal',
        'nonleader-exec-remote-exit','group-stop-continue-remote-owner','realtime-service-qualification',
        'remote-service-forward-progress')
 
-def results(text, cpus):
+DYNAMIC_CASE="dynamic-musl-dlopen-tls"
+
+def results(text, cpus, dynamic=False):
     rows=[line[line.index('USER-SMP '):] for line in text.replace('\r','').splitlines() if 'USER-SMP ' in line]
-    expected=[f'USER-SMP BEGIN cpus={cpus}',*[f'USER-SMP CASE {name} OK' for name in CASES],f'USER-SMP END {len(CASES)}']
+    cases=CASES+((DYNAMIC_CASE,) if dynamic else ())
+    expected=[f'USER-SMP BEGIN cpus={cpus}',*[f'USER-SMP CASE {name} OK' for name in cases],f'USER-SMP END {len(cases)}']
     if rows!=expected: raise RuntimeError(f'incomplete or failed user SMP stream: {rows}')
     return rows
 
-def validate(text, cpus, boaros):
-    rows=results(text,cpus)
+def validate(text, cpus, boaros, dynamic=False):
+    rows=results(text,cpus,dynamic)
     validate_execution(text,cpus,boaros,require_parallel=True)
     return rows
 
@@ -63,27 +67,44 @@ def boot_user(qemu,firmware,kernel,disk,memory,cpus,folder,linux=False):
     run=json.loads((folder/f'{disk.stem}.json').read_text())
     return text,run,logfile
 
+def create_run_directory(requested,base):
+    if requested is not None:
+        output=Path(requested).resolve()
+        output.mkdir(parents=True,exist_ok=True)
+        if any(output.iterdir()):
+            raise RuntimeError(f'refusing to overwrite preserved user SMP evidence: {output}')
+        return output
+    base=Path(base).resolve();base.mkdir(parents=True,exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix='run-',dir=base))
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kernel',type=Path,default=ROOT/'build/riscv-user-smp/kernel-rv')
     parser.add_argument('--program',type=Path,default=ROOT/'build/riscv-user-smp/user-smp-rv')
+    parser.add_argument('--loader',type=Path,help='fixed musl loader for the dynamic native ELF')
+    parser.add_argument('--library',type=Path,help='original TLS DSO paired with --loader')
     parser.add_argument('--manifest',type=Path,help='ABI record manifest instead of the native case stream')
     parser.add_argument('--qemu',default='qemu-system-riscv64')
     parser.add_argument('--firmware',default='default')
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--cpus',action='append',type=int,choices=(1,2))
-    parser.add_argument('--output',type=Path,default=ROOT/'build/riscv-user-smp/runs')
+    parser.add_argument('--output',type=Path,help='new or empty explicit run directory')
     args=parser.parse_args()
+    if bool(args.loader)!=bool(args.library) or (args.loader and args.manifest):
+        parser.error('native dynamic profile requires both loader and library, without ABI manifest')
     linux,linux_identity=harness.linux_build(Path(__file__).with_name('linux-user.config'))
     actual_config=linux.parents[3]/'.config'
     if 'CONFIG_SMP=y' not in actual_config.read_text(): raise RuntimeError('reference is not SMP-enabled')
-    output=args.output.resolve();output.mkdir(parents=True,exist_ok=True)
+    output=create_run_directory(args.output,ROOT/'build/riscv-user-smp'/('abi' if args.manifest else 'runs'))
     # 冻结双方使用的同一个ELF及核；每次启动拥有独立盘，原fixture只作输入。
     snapshots={}
     for name,path in (('linux',linux),('boaros',args.kernel),('program',args.program)):
         snapshots[name]=output/name
         shutil.copyfile(path,snapshots[name])
-    report={'status':'running','linux':linux_identity,'inputs':{name:identity(path) for name,path in snapshots.items()},'runs':[]}
+    if args.loader:
+        for name,path in (('loader',args.loader),('library',args.library)):
+            snapshots[name]=output/name;shutil.copyfile(path,snapshots[name])
+    report={'status':'running' ,'linux':linux_identity,'inputs':{name:identity(path) for name,path in snapshots.items()},'runs':[]}
     expected=None
     if args.manifest:
         shutil.copyfile(args.manifest,output/'cases.txt')
@@ -94,12 +115,19 @@ def main():
             for cpus in args.cpus or (2,1):
                 folder=output/f'{memory}-{cpus}cpu';folder.mkdir(exist_ok=True)
                 fixture=harness.fixture(folder,snapshots['program'])
+                if args.loader:
+                    commands=['mkdir /lib']
+                    for name,destination in (('loader','/lib/ld-musl-riscv64.so.1'),('library','/lib/libboaros-tls.so')):
+                        source=str(snapshots[name]).replace('\\','\\\\').replace('"','\\"')
+                        commands += [f'write "{source}" {destination}',f'set_inode_field {destination} mode 0100755']
+                    batch=folder/'dynamic.debugfs';batch.write_text('\n'.join(commands)+'\n')
+                    harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'dynamic-install.log')
                 reference=None
                 for target in ('linux','boaros'):
                     disk=folder/f'{target}.img';shutil.copyfile(fixture,disk)
                     text,run,logfile=boot_user(args.qemu,args.firmware,snapshots[target],disk,memory,cpus,folder,target=='linux')
                     report['runs'].append(dict(target=target,memory=memory,cpus=cpus,**run))
-                    if expected is None:rows=validate(text,cpus,target=='boaros')
+                    if expected is None:rows=validate(text,cpus,target=='boaros',dynamic=bool(args.loader))
                     else:
                         rows=harness.normalize(text,expected)
                         validate_execution(text,cpus,target=='boaros')
@@ -116,6 +144,8 @@ def main():
         report['status']='passed'
     except Exception as error:
         report.update(status='failed',error=str(error));raise
-    finally:(output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+    finally:
+        (output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+        print('User SMP report:',output/'report.json',flush=True)
 
 if __name__=='__main__':main()

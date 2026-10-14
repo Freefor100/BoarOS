@@ -81,7 +81,9 @@ runs:
     - name: Prepare RV GNU reference kernel
       if: inputs.arch == 'riscv' && inputs.mode == 'prepare'
       shell: bash
-      run: make build-diff-abi-linux
+      run: |
+        make build-diff-abi-linux
+        python3 -B tests/diff-abi/harness.py --build-linux --linux-config tests/smp/linux-user.config
     - name: Save complete native cache
       if: inputs.mode == 'prepare' && steps.native.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5

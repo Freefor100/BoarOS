@@ -1,7 +1,7 @@
 # 主线双架构 CI
 
 `ci.yml`在main push、面向main的PR和手动触发时执行，保护已经交付的单核QEMU
-契约，并增加独立的RV受控两核组。两侧使用同一个`native-contracts.yml`执行模板及同一个结果runner；
+契约，并增加独立的RV受控两核及真实用户两核组。两侧使用同一个`native-contracts.yml`执行模板及同一个结果runner；
 `tests/ci/suites.json`维护实际命令，不能以job数量或组数推定功能覆盖。
 
 RV保留Ubuntu24.04/QEMU8.2.2回归，LA使用固定QEMU11.1.0及LS7A RTC补丁；
@@ -13,7 +13,7 @@ main push等待同组执行收口；PR取消同组旧执行，固定环境冷构
 | 层级 | RV | LA |
 |---|---|---|
 | 固定环境 | 原GNU工具/runtime及Linux缓存 | 原GNU工具/runtime、QEMU、Linux及musl缓存 |
-| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1372 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1372 ABI与栈 |
+| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1400 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1400 ABI与栈 |
 | runtime | glibc五形态、SQLite DELETE/静态动态CLI/独立重启、WAL | 相同消费者与完成条件，保留目标ELF及libc版本差异 |
 | platform | RNG/时钟、network、termios2/TTY/PTY | 相同类别，另含boot random和16KiB pipe geometry |
 | 定时完整消费者 | 229项原程序、TTY应用、实际Ethernet、RT双盘 | 229项原程序、TTY应用、实际Ethernet、PCI设备失败及RTC模型 |
@@ -29,10 +29,13 @@ RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占�
 
 RV的`smp`组独立执行调度核心、私有/共享匿名MM、tmpfs/受控ext4映射及共享FD表/匿名pipe的聚焦测试和CPU0用户组合：MTTCG两核、同核一CPU退化、
 双RAM、独立故障启动和CPU0原程序组合。默认core/runtime/platform保持单CPU，LA没有SMP占位。
+该组另有独立核强制FPU图像恢复/Dirty发布间隙，保留32寄存器、FCSR及真实owner核对；测试初始化也必须满足任务切换保护。
 该组从已安装OpenSBI包选择 `riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin`，
 排除同时安装的RV32变体，缺失或重复RV64候选使准备失败；固件显式传给Make。
 runner开启QEMU `debug-threads=on`，在Ubuntu/QEMU8.2.2同样能记录实际vCPU线程；
 保存包版本、QEMU/固件/kernel SHA、实际vCPU线程和完整退出，不能把本地封存执行器身份冒充CI身份。
+
+RV的`user-smp`组独立执行实际用户调度与CPU0服务交接：原生进程/线程、上下文、信号、组停止、实时资格及MM退休，同ELF对照包含静态/动态musl、dlopen TLS、1400 ABI及glibc五形态；原static/pthread musl的BoarOS集成另保留原consumer内容和回收核对。两核及一核退化、双RAM均使用独立Linux SMP reference配置`tests/smp/linux-user.config`；environment producer单独封存其配置和工具哈希缓存。runner保存真实U-mode hart采样、完整内容/退出、归还及磁盘核对，不用marker代替案例。服务统计在UART worker排空停止后输出；默认每次运行创建独立目录，显式非空目录拒绝覆盖快照/旧报告；退出期间消失的proc线程忽略ESRCH，权限或其他读取错误仍失败。该配置保留实际调用任务并把内核业务迁CPU0，LA没有用户SMP占位。
 
 两个environment独立生产缓存，各consumer只依赖本架构producer。core的一组
 失败后runner继续收集后续独立组；同模板的platform准备与执行在native环境成功时
@@ -66,6 +69,7 @@ python3 -B tests/ci/run.py --arch loongarch --suite runtime
 python3 -B tests/ci/run.py --arch riscv --suite platform
 python3 -B tests/ci/run.py --arch loongarch --suite platform
 python3 -B tests/ci/run.py --arch riscv --suite smp
+python3 -B tests/ci/run.py --arch riscv --suite user-smp
 ```
 
 ## 固定环境与缓存

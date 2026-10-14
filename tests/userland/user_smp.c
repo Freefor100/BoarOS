@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#ifdef BOAROS_SMP_DYNAMIC
+#include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -213,6 +216,11 @@ static void realtime_qualification(void)
     CHECK(seen!=MAP_FAILED);
     for (unsigned cpu=0;cpu<(online==3 ? 2U : 1U);cpu++) {
         pin(cpu);
+        /* 库代码的首次执行可真实缺页/睡眠；在FIFO非阻塞窗口之前
+         * 完成fork返回与时钟/syscall代码的驻留准备，不把冷I/O当成yield。 */
+        pid_t warm=fork(); CHECK(warm>=0);
+        if (!warm) _exit(0);
+        reap(warm); CHECK(monotonic_ns() && syscall(SYS_getpid)>0);
         for (unsigned block=0;block<2;block++) {
             atomic_store(seen,0); set_policy(SCHED_FIFO,40);
             pid_t child=fork(); CHECK(child>=0);
@@ -259,6 +267,29 @@ static void remote_service_progress(void)
     }
     record("remote-service-forward-progress");
 }
+#ifdef BOAROS_SMP_DYNAMIC
+static int (*dso_get)(void);
+static void (*dso_set)(int);
+static void *(*dso_address)(void);
+static void *dso_thread(void *opaque)
+{
+    uintptr_t *address=opaque; pin(online&2 ? 1 : 0);
+    CHECK(dso_get()==700); dso_set(730); *address=(uintptr_t)dso_address();
+    CHECK(dso_get()==730); return 0;
+}
+static void dynamic_tls(void)
+{
+    void *module=dlopen("/lib/libboaros-tls.so",RTLD_NOW|RTLD_LOCAL); CHECK(module);
+    dso_get=(int (*)(void))dlsym(module,"boaros_tls_get");
+    dso_set=(void (*)(int))dlsym(module,"boaros_tls_set");
+    dso_address=(void *(*)(void))dlsym(module,"boaros_tls_address");
+    CHECK(dso_get && dso_set && dso_address && dso_get()==700); dso_set(710);
+    uintptr_t own=(uintptr_t)dso_address(), other=0; pthread_t thread;
+    CHECK(!pthread_create(&thread,0,dso_thread,&other) && !pthread_join(thread,0));
+    CHECK(other && own!=other && dso_get()==710 && !dlclose(module));
+    record("dynamic-musl-dlopen-tls");
+}
+#endif
 int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--exec-child")) return 23;
@@ -266,6 +297,11 @@ int main(int argc,char **argv)
     printf("USER-SMP BEGIN cpus=%u\n",online==3 ? 2 : 1); fflush(stdout);
     pin(0);
     process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress();
-    puts("USER-SMP END 8"); fflush(stdout); CHECK(!fsync(1) || errno==EINVAL);
+#ifdef BOAROS_SMP_DYNAMIC
+    dynamic_tls(); puts("USER-SMP END 9");
+#else
+    puts("USER-SMP END 8");
+#endif
+    fflush(stdout); CHECK(!fsync(1) || errno==EINVAL);
     sync(); (void)reboot(RB_POWER_OFF); return 42;
 }

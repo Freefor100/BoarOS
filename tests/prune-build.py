@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-user-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -19,7 +19,7 @@ def current_linux_keys():
     import harness
     return {harness.identity(ROOT / config)[0] for config in
             ('tests/diff-abi/linux.config', 'tests/program-inventory/linux.config',
-             'tests/network-linux.config', 'tests/tty/pty-linux.config')}
+             'tests/network-linux.config', 'tests/tty/pty-linux.config', 'tests/smp/linux-user.config')}
 
 
 def candidates():
@@ -57,6 +57,11 @@ def candidates():
         if directory.is_dir():
             result.extend(p for p in directory.iterdir()
                           if p.name not in {'concurrency-12', 'concurrency-14','process-12.o','process-14.o'})
+
+    user_smp = BUILD / 'riscv-user-smp'
+    if user_smp.is_dir():
+        result.extend(path for path in user_smp.iterdir()
+                      if path.name not in {'riscv','kernel-rv','user-smp-rv','user-smp-dynamic-rv'})
 
     riscv = BUILD / 'riscv'
     smp_runs = BUILD / 'riscv-smp' / 'runs'

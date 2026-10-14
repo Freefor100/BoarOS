@@ -13,7 +13,8 @@ class CleanupContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);build=root/'build'
             caches=('qemu-la/qemu-system-loongarch64','qemu-la-rtc/source/rtc.c',
-                'riscv-smp/riscv/kernel/main.o', 'riscv-smp-test/guard/kernel-rv',
+                'riscv-smp/riscv/kernel/main.o',
+                'riscv-user-smp/riscv/mm/mm.o','riscv-user-smp/kernel-rv','riscv-user-smp/user-smp-rv','riscv-user-smp/user-smp-dynamic-rv', 'riscv-smp-test/guard/kernel-rv',
                 'riscv-mm-smp-test/riscv/mm/mm.o', 'riscv-mm-smp-test/mm-fence-i/kernel-rv',
                 'riscv-mm-shared-smp-test/riscv/mm/mm.o', 'riscv-mm-shared-smp-test/rfence-error/kernel-rv',
                 'riscv-mm-file-smp-test/riscv/mm/mm.o', 'riscv-mm-file-smp-test/rfence-error/kernel-rv',
@@ -26,6 +27,8 @@ class CleanupContract(unittest.TestCase):
                 'loongarch/glibc/static-program','loongarch/diff-abi-cases')
             outputs=('loongarch/inventory-full/state.json','loongarch/program-inventory/state.json',
                 'riscv-smp/runs/2-512M.log',
+                'riscv-user-smp/runs/run-first/report.json','riscv-user-smp/abi/run-first/root.img',
+                'riscv-user-smp/runtime/run-first/glibc/fixture.img',
                 'riscv-mm-smp-test/runs/rfence-error/2-1G.log',
                 'riscv-mm-shared-smp-test/runs/2-512M.log',
                 'riscv-mm-file-smp-test/runs/2-512M.log',

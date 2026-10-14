@@ -95,3 +95,9 @@ RV PLIC的dispatching由CPU0派发器独占。原查询直接返回全局值，�
 固定本地依据为`references/linux/kernel/sched/core.c`、`arch/riscv/kernel/entry.S`、`mm/memory.c`和`mm/filemap.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；用户可观察affinity、trap保存及COW/来源边界按这些路径核对，BoarOS的CPU0交接由自己的执行owner协议实现。SMP reference采用独立配置与身份，不沿用单CPU Linux结果。
 
 实时用户资格不能由临时服务迁移隐式让出。固定Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `kernel/sched/rt.c` 在 `yield_task_rt()` 显式移到同级队尾，非阻塞syscall不做这种移交。同一个原生ELF把父子固定CPU1/FIFO40：Linux在父yield前不运行子，旧CPU0交接实现则提前运行子。修复在实际任务的来源CPU保存实时资格，并在CPU0独立索引内核服务；阻塞/片尾等真实资格结束点释放。只优先服务还不够：同级子任务完成首次内核准备后，恢复用户态必须重新服从来源资格，CPU0也适用。原生测试同时保护非阻塞、yield、阻塞、RR以及服务前进性；宿主模型另检查嵌套优先级保留及节点归还。
+
+普通用户远端执行使失败回滚也成为硬件并发边界。旧Sv39缺页先发布L1、后分配L0，第二次OOM会清父项并直接释放L1；另一hart已在途的页表访问不能由“最终映射失败”取消。现在整条缺失路径私有准备完才发布父项，失败仅释放私有候选；已发布非叶仍遵守全范围失效后退休。宿主用实际MM/Sv39与第二级OOM握手，让另一CPU在准备期间观察根，保护这一owner边界。组停止也必须在最终状态提交锁段核对实际执行owner，不能沿用解锁前的READY判断；真实claim握手反例和用户SIGSTOP/SIGCONT保护停止通知不会在已消费组信号后丢失。
+
+受控kernel FPU探针不能留下没有任务权威图像的Clean状态。`riscv_fpu_state_restore()`以Clean结束，生产恢复使用任务自有图像并处于切换保护；探针却恢复局部expected后才单独标Dirty，间隙timer可以运行同核伙伴。强制tick在该处复现了另一任务的完整寄存器图案；探针现以IRQ保护包住恢复与Dirty发布，`test-smp-fpu-setup-riscv`封存独立核并保护8个实际owner，所有32寄存器/FCSR比较继续执行。用户态FP指令的硬件Dirty更新与本测试手工发布不同。最初guard启动仅有`preempt-FD`阶段、没有实际寄存器值，不能仅凭后续通过唯一归因；其原核与失败现场保留，新增反例明确证明并修复这一初始化缺陷。
+
+FIFO的非阻塞窗口须先区分真实睡眠。动态musl首次fork返回/时钟库代码在BoarOS冷ELF缺页路径会等待CPU0 I/O；服务跟踪确认cause=instruction-page-fault并提交真实阻塞，释放实时资格合法。原生策略案例先预热fork返回、时钟与syscall代码，再校验无主动yield的getpid窗口；真正waitpid阻塞另测，不把cold fault解释成非阻塞调度错误。预热后的同ELF在旧核仍能检出FIFO资格缺陷，动态Musl及其原TLS DSO以独立同ELF profile对照，原static/pthread consumer的BoarOS集成不冒充Linux差分。

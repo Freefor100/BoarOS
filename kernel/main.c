@@ -734,6 +734,10 @@ static void storage_cleanup_worker(void *argument)
                 }
                 shutdown_for_root_boot_error(root_status);
             }
+#if BOAROS_USER_SMP
+            /* UART worker已排空/停止，避免延后用户stdout插入统计记录。 */
+            riscv_smp_report_user_execution();
+#endif
             struct kernel_stack_statistics stack_statistics;
             kernel_scheduler_stack_statistics(&stack_statistics);
             virt_uart_puts("BoarOS: task stacks released=");

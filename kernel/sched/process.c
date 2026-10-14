@@ -284,7 +284,9 @@ static void request_thread_termination_locked(struct kernel_task *task)
     if (task->state == KERNEL_THREAD_STATE_EXITED || task->state == KERNEL_THREAD_STATE_ZOMBIE ||
         task->state == KERNEL_THREAD_STATE_GROUP_DEAD || task->retirement) return;
     task->terminate_requested = 1;
+#if BOAROS_USER_SMP
     scheduler_user_request_locked(task);
+#endif
     if (task->vfork_waiting && task->vfork_wait_child) {
         task->vfork_wait_child->vfork_parent = 0;
         task->vfork_wait_child->vfork_child = 0;
