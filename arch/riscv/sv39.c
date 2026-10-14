@@ -868,12 +868,11 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
     return RISCV_SV39_STATUS_OK;
 }
 
-static enum riscv_sv39_status rollback_runtime_table(
+/* 只归还从未发布的候选；已发布非叶必须由上层失效/退休协议回收。 */
+static enum riscv_sv39_status discard_private_runtime_table(
     struct riscv_sv39_user_space *space,
-    uint64_t *parent_entry,
     uint64_t address)
 {
-    *parent_entry = 0U;
     (void)physical_page_release(space->allocator, address);
     if (space->table_pages <= 1U) {
         return RISCV_SV39_STATUS_STATE;
@@ -912,7 +911,6 @@ static enum riscv_sv39_status resolve_user_leaf_slot(
         if (status != RISCV_SV39_STATUS_OK) {
             return status;
         }
-        *root_entry = table_entry(level1_address);
         allocated_level1 = 1;
     } else {
         if (!valid_nonleaf_entry(*root_entry)) {
@@ -935,15 +933,14 @@ static enum riscv_sv39_status resolve_user_leaf_slot(
                                         &level0);
         if (status != RISCV_SV39_STATUS_OK) {
             if (allocated_level1 != 0 &&
-                rollback_runtime_table(space,
-                                       root_entry,
-                                       level1_address) !=
+                discard_private_runtime_table(space,
+                                              level1_address) !=
                     RISCV_SV39_STATUS_OK) {
                 return RISCV_SV39_STATUS_STATE;
             }
             return status;
         }
-        *level1_entry = table_entry(level0_address);
+        __atomic_store_n(level1_entry,table_entry(level0_address),__ATOMIC_RELEASE);
     } else {
         if (!valid_nonleaf_entry(*level1_entry)) {
             return RISCV_SV39_STATUS_CONFLICT;
@@ -962,6 +959,10 @@ static enum riscv_sv39_status resolve_user_leaf_slot(
     if (*result != 0U) {
         return RISCV_SV39_STATUS_CONFLICT;
     }
+    /* 缺失的整条路径准备完才发布root；二级OOM不会留下远端可见后
+     * 直接归还的L1。已有L1的路径只发布这次准备完整的L0。 */
+    if (allocated_level1)
+        __atomic_store_n(root_entry,table_entry(level1_address),__ATOMIC_RELEASE);
     *leaf = result;
     return RISCV_SV39_STATUS_OK;
 }

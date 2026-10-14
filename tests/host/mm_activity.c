@@ -28,9 +28,20 @@ static unsigned sparse, walk_calls;
 static unsigned expect_nonleaf_sync;
 static unsigned fail_copy;
 static uint64_t failed_page;
+static unsigned table_oom, table_allocations, oom_preparing, oom_observed;
+static uint64_t *oom_root_slot, observed_parent;
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *address)
-{ enum physical_page_status status=__real_physical_page_allocate(a,address); if (!status && fail_copy) failed_page=*address; return status; }
+{
+    if (table_oom && ++table_allocations==2) {
+        __atomic_store_n(&oom_preparing,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&oom_observed,__ATOMIC_ACQUIRE)) sched_yield();
+        return PHYSICAL_PAGE_STATUS_EMPTY;
+    }
+    enum physical_page_status status=__real_physical_page_allocate(a,address);
+    if (!status && fail_copy) failed_page=*address;
+    return status;
+}
 enum physical_page_status __real_physical_page_resolve(const struct physical_page_allocator *,uint64_t,void **);
 enum physical_page_status __wrap_physical_page_resolve(const struct physical_page_allocator *a,uint64_t address,void **pointer)
 {
@@ -100,6 +111,18 @@ static void *enter(void *unused)
     assert(!kernel_cpu_current()->active_mm_record);
     return 0;
 }
+#ifdef REMOTE_USER_CASE
+static void *observe_partial_fault(void *unused)
+{
+    (void)unused; mm_test_attach(1); kernel_cpu_current()->logical_id=1;
+    await(&oom_preparing);
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    observed_parent=__atomic_load_n(oom_root_slot,__ATOMIC_ACQUIRE);
+    assert(!kernel_mm_activate(0,kernel_context));
+    publish(&oom_observed);
+    return 0;
+}
+#endif
 int main(void)
 {
     mm_test_attach(0);
@@ -152,7 +175,22 @@ int main(void)
     copying=0; assert(cow_fences);
     assert(!kernel_copy_from_user(&child,&byte,address,1,&copied) && byte==19);
     assert(!kernel_mm_release(&child));
-    uint64_t far=UINT64_C(0x1000000000), placed;
+    uint64_t failed_va=UINT64_C(0x800000000), placed;
+    assert(!kernel_mm_mmap_anonymous(&mm,failed_va,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&placed));
+    uint64_t *user_root=(void *)(uintptr_t)((context&((UINT64_C(1)<<44)-1))<<12);
+    oom_root_slot=&user_root[(failed_va>>30)&511];
+    assert(!*oom_root_slot);
+    before_failure=physical_page_available(&allocator);
+    table_oom=1; pthread_t observer;
+    assert(!pthread_create(&observer,0,observe_partial_fault,0));
+    assert(kernel_mm_resolve_user_fault(&mm,failed_va,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NO_MEMORY);
+    assert(!pthread_join(observer,0)); table_oom=0;
+    /* 远端在二级准备失败前不能见到随后直接归还的非叶owner。 */
+    assert(!observed_parent && !*oom_root_slot && physical_page_available(&allocator)==before_failure);
+    assert(kernel_mm_lookup(&mm,failed_va,&original)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_munmap(&mm,failed_va,BOAROS_PAGE_SIZE));
+    uint64_t far=UINT64_C(0x1000000000);
     assert(!kernel_mm_mmap_anonymous(&mm,far,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED,&placed) && placed==far);
     expect_nonleaf_sync=1;

@@ -2,7 +2,7 @@
 
 本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
-普通用户MM可在私有构造期调用`kernel_mm_enable_remote_user_execution()`。它只开放远端根切换/活动CPU/失效后退休，内核VMA、来源、缺页和业务操作仍要求CPU0，不启用受控并行修改gate，也不排斥ELF或系统压力hook。两种能力的范围见[真实用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。普通COW保留旧PTE引用到RFENCE确认，候选访问失败不修改旧叶；非叶变更全范围同步，稀疏范围按实际owned叶/页表分支遍历。
+普通用户MM可在私有构造期调用`kernel_mm_enable_remote_user_execution()`。它只开放远端根切换/活动CPU/失效后退休，内核VMA、来源、缺页和业务操作仍要求CPU0，不启用受控并行修改gate，也不排斥ELF或系统压力hook。两种能力的范围见[真实用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。普通COW保留旧PTE引用到RFENCE确认，候选访问失败不修改旧叶；非叶变更全范围同步，稀疏范围按实际owned叶/页表分支遍历。普通Sv39缺页先私有准备缺失的整条页表路径，再发布非叶；第二级OOM仅归还未发布候选，不把远端可见表页直接释放。
 
 ## 范围与入口
 
