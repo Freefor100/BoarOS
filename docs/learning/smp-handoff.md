@@ -93,3 +93,5 @@ RV PLIC的dispatching由CPU0派发器独占。原查询直接返回全局值，�
 普通MM远端执行也不等于并行修改。短保护只协调活动根与退休，既有CPU0缺页/来源策略继续复用。普通COW原先只做本地确认；新增反例要求旧父PTE页引用在远端确认时仍在。新页访问失败必须完整回滚而不是fatal；新增非叶页表还必须全范围失效，不能仅同步目标叶。64GiB稀疏撤映射只遍历实际叶及分支，避免把能力扩展变成空页线性扫描。
 
 固定本地依据为`references/linux/kernel/sched/core.c`、`arch/riscv/kernel/entry.S`、`mm/memory.c`和`mm/filemap.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；用户可观察affinity、trap保存及COW/来源边界按这些路径核对，BoarOS的CPU0交接由自己的执行owner协议实现。SMP reference采用独立配置与身份，不沿用单CPU Linux结果。
+
+实时用户资格不能由临时服务迁移隐式让出。固定Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `kernel/sched/rt.c` 在 `yield_task_rt()` 显式移到同级队尾，非阻塞syscall不做这种移交。同一个原生ELF把父子固定CPU1/FIFO40：Linux在父yield前不运行子，旧CPU0交接实现则提前运行子。修复在实际任务的来源CPU保存实时资格，并在CPU0独立索引内核服务；阻塞/片尾等真实资格结束点释放。只优先服务还不够：同级子任务完成首次内核准备后，恢复用户态必须重新服从来源资格，CPU0也适用。原生测试同时保护非阻塞、yield、阻塞、RR以及服务前进性；宿主模型另检查嵌套优先级保留及节点归还。

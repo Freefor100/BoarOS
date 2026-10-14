@@ -125,6 +125,10 @@ void scheduler_task_unlink_locked(struct kernel_task *task)
      * 两个阶段间把真实owner漏出关机计数。 */
     if (scheduler.retired_pending == UINT64_MAX) __builtin_trap();
     scheduler.retired_pending++;
+#if BOAROS_USER_SMP
+    if (task->reservation_cpu || task->reservation_node.queued || task->service_node.queued)
+        __builtin_trap();
+#endif
     task->retirement = 1;
 }
 

@@ -1032,7 +1032,11 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
-        !cpu->switch_previous && !cpu->eligible.first && !cpu->active_mm_record;
+        !cpu->switch_previous && !cpu->eligible.first && !cpu->active_mm_record
+#if BOAROS_USER_SMP
+        && !cpu->user_reservations.first && !scheduler.user_services.first
+#endif
+        ;
 }
 enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask)
@@ -1413,6 +1417,11 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+#if BOAROS_USER_SMP
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      if (scheduler_user_yield_locked(kernel_cpu_current()->current))
+          return KERNEL_SCHEDULER_STATUS_OK; }
+#endif
     return scheduler_reschedule(0, 1, 1);
 }
 

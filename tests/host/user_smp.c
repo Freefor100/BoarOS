@@ -133,6 +133,47 @@ int main(void)
     kernel_scheduler_enter_user_service();
     assert(active==&cpus[0] && !kernel_scheduler_user_service_pending());
     assert(tasks[0].service_migrations==2 && tasks[0].cpu_mask==2);
+    /* 实际任务临时服务不能把来源CPU的FIFO运行资格让给同级任务。 */
+    assert(!kernel_sched_policy_set(&tasks[0].scheduling,KERNEL_SCHED_FIFO,40,0));
+    kernel_scheduler_leave_user_service();
+    assert(active==&cpus[1]);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      setup_task(1,2,40); tasks[1].arch.user_mode=1; }
+    kernel_scheduler_enter_user_service();
+    assert(active==&cpus[0]);
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain); assert(!ready_best_locked()); }
+    active=&cpus[0];
+    /* 更高实时用户可越过低优先级保留者；它也进入服务后，两份
+     * 逻辑资格同时存活，来源核不能运行同级/低级等待者。 */
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      setup_task(2,2,60); tasks[2].arch.user_mode=1;
+      assert(ready_best_locked()==&tasks[2]);
+      assert(scheduler_select_next_locked(active,active->current,1)==&tasks[2]);
+      kernel_wait_switch_finish_locked(&idles[1]); active->switch_previous=0;
+      scheduler_user_service_set_locked(&tasks[2],1);
+      assert(tasks[0].reservation_node.queued && tasks[2].reservation_node.queued);
+      assert(!ready_best_locked());
+      /* 模型手动完成CPU1->CPU0的机器尾部；生产finish结束旧栈owner。 */
+      tasks[2].state=KERNEL_THREAD_STATE_READY; tasks[2].wait.ready_pending=1;
+      assert(scheduler_select_next_locked(active,&tasks[2],1)==&idles[1]);
+      kernel_wait_switch_finish_locked(&tasks[2]); active->switch_previous=0; }
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      /* 即使CPU0另有更高优先级USER任务，服务索引先接纳真实调用栈。 */
+      setup_task(3,1,99); tasks[3].arch.user_mode=1;
+      assert(ready_best_locked()==&tasks[2]);
+      ready_remove_locked(&tasks[2]);
+      assert(scheduler_user_yield_locked(&tasks[2]));
+      assert(!tasks[2].reservation_node.queued && tasks[0].reservation_node.queued);
+      scheduler_user_reservation_release_locked(&tasks[0]); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(ready_best_locked()==&tasks[1]);
+      ready_remove_locked(&tasks[1]); ready_remove_locked(&tasks[3]);
+      assert(!cpus[0].user_reservations.first && !cpus[1].user_reservations.first &&
+             !scheduler.user_services.first && !scheduler.runqueue.first); }
     puts("user SMP service eligibility and old-stack execution owner passed");
     return 0;
 }

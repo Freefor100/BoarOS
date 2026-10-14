@@ -192,6 +192,9 @@ struct kernel_task *deadline_index_first(void)
  * the ready queue. */
 void stopped_append_locked(struct kernel_task *thread)
 {
+#if BOAROS_USER_SMP
+    scheduler_user_reservation_release_locked(thread);
+#endif
     thread->blocked_previous = scheduler.stopped_tail;
     thread->next = 0;
     if (scheduler.stopped_tail == 0) {
@@ -233,6 +236,9 @@ int kernel_wait_backend_signal(struct kernel_task *task)
 uint64_t kernel_wait_backend_time(void) { return arch_time_read(); }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
 {
+#if BOAROS_USER_SMP
+    scheduler_user_reservation_release_locked(task);
+#endif
     task->wait.ready_head = 0;
     task->wait_queue = task->default_wait_node.queue;
     task->wakeup_deadline = deadline;

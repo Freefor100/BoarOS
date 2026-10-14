@@ -10,6 +10,10 @@ CPU1运行显式创建的受控内核任务，可绑定匿名及私有arena tmpf
 
 `kernel_scheduler_enter_user_service()`迁移实际任务的内核栈和调用现场。资格在rank40提交，旧执行owner由`switch_finish`结束后，CPU0才可接纳。syscall/同步fault在业务分派前交接；CPU1本地timer/IPI只处理同步元数据，无pending时直接恢复用户态。CPU0信号/组退出发布原子pending位并通知目标CPU；消费之后到达的新通知保留，返回前再次检查。晚于检查的IPI由硬件中断接纳，不要求远端读取live frame。
 
+FIFO/RR用户任务进入CPU0服务时，在来源CPU保留逻辑实时资格；非阻塞syscall不是yield。来源核只允许该owner恢复或更高优先级用户抢占。真正阻塞、yield、RR片尾、降为OTHER、移除来源affinity或退出会结束资格；多个被抢占者可同时保留，按原优先级/FIFO组织。CPU0另有服务资格索引，避免本核高优先级用户计算饿死异核服务；服务完成后重新检查用户资格，不把首次准备完的子任务直接送到U-mode。两种节点均借用既有执行/runnable owner，回收前必须摘尽；不固定MM/files，也不引入worker。
+
+RV整数ABI尺寸探针：实时资格修复使USER_SMP任务由2816增至2896字节，仍由一张4KiB页容纳；每CPU记录由2048增至3664字节，服务索引另为1616字节。每次调度选择O(1)，入/摘维护两CPU及服务索引，现有优先级桶最坏检查仍最多99级，不扫描等待任务。默认及受控SMP构建没有这些新增字段。
+
 普通MM的`remote_user`能力与受控并行修改能力独立。ELF、系统后备和压力hook仍可用，但所有内核业务由CPU0执行。撤映射、降权、fork/COW、截断和缓存撤写先更新翻译、固定退休owner，再完成本地及远端确认；新父项/摘空表同步全范围。稀疏撤映射按owned leaf/页表分支遍历，不枚举空虚拟页。最终MM释放要求活动CPU、pin和退休批次归零。
 
 ```sh
@@ -19,7 +23,7 @@ make test-user-smp-riscv INIT_CONFIG=config/init.json
 make run-user-smp-riscv
 ```
 
-2026-10-14的同ELF原生验证使用`tests/smp/linux-user.config`，固定Linux commit不变但单独启用SMP并生成配置哈希/缓存。MTTCG两核及一核退化、512MiB/1GiB完成独立进程无yield计算、pthread/TLS/全部F/D与FCSR、嵌套信号、远端撤权限/文件EOF、pipe取消与非leader exec；runner核对完整内容流、真实U-mode hart采样、CPU1不分派syscall、PID1/堆/根盘退出和磁盘检查。host另保护通知消费后的新发布、旧栈owner、晚加入活动MM、COW失败回滚与64GiB稀疏撤映射。运行时/ABI及平台的扩大验收分别记录，不能用这一组代替完整矩阵。
+2026-10-14的同ELF原生验证使用`tests/smp/linux-user.config`，固定Linux commit不变但单独启用SMP并生成配置哈希/缓存。MTTCG两核及一核退化、512MiB/1GiB完成独立进程无yield计算、pthread/TLS/全部F/D与FCSR、嵌套信号、远端撤权限/文件EOF、pipe取消、非leader exec、CPU0/CPU1 FIFO服务/yield/阻塞与RR片尾，以及CPU0高优先级用户下的异核服务前进；runner核对完整内容流、真实U-mode hart采样、CPU1不分派syscall、PID1/堆/根盘退出和磁盘检查。host另保护通知消费后的新发布、旧栈owner、晚加入活动MM、COW失败回滚与64GiB稀疏撤映射。运行时/ABI及平台的扩大验收分别记录，不能用这一组代替完整矩阵。
 
 服务统计区分CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。观测常驻CPU/任务字段，不分配或增加worker；默认单核配置不含这些字段。该配置不表示ext4、设备、协议、命名空间或系统压力回调已在两核并发执行，LA仍为单核。
 
