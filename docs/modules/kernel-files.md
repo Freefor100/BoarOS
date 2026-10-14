@@ -474,6 +474,6 @@ capacity现在由16×目标页大小导出，匹配原有16槽/16页owner和固�
 BoarOS退出回到根页/堆/任务栈/BAR基线。入口为`make test-pipe-loongarch`，
 RV继续由files/userland的pipe、FIFO、poll、取消和引用测试保护。
 
-标量 read/write/pread/pwrite 在限长前检查原始数值范围，空范围允许 NULL 和用户地址上界，拒绝高于上界的地址；通用零长度 uaccess 不改变。
+普通文件的标量 read/write/pread/pwrite 在限长前检查原始数值范围，空范围允许 NULL 和用户地址上界，拒绝高于上界的地址；通用零长度 uaccess 不改变。
 数值拒绝发生在复制、偏移及文件时间修改之前。socket sendto/recvfrom 则沿 Linux import_ubuf 先限长再检查，实际 iovec 使用同一限长值。
 `make test-abi-boundary-riscv test-abi-boundary-loongarch TEST_MEMORIES="512M 1G"` 以同一 ELF 对照固定 Linux，检查溢出无接纳、空范围、共享 OFD 标志和消息拒绝后的队列内容。

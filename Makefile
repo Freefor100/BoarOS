@@ -2418,3 +2418,7 @@ test-files-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHR
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
 		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
 	done
+
+.PHONY: test-instruction-sync-host
+test-instruction-sync-host:
+	python3 -B tests/test-instruction-sync.py

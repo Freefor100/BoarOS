@@ -1,4 +1,5 @@
 #include <arch/riscv/mm.h>
+#include <arch/mmu.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/virt_uart.h>
@@ -633,10 +634,19 @@ static void run_file_operations(struct kernel_files *files,
         kernel_files_read(files,
                           mm,
                           1,
-                          UINT64_MAX,
+                          TEST_USER_BUFFER,
                           0U,
                           &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
+        fail_files(19U, 0, result);
+    }
+    /* Empty scalar ranges include the user limit, but not higher addresses. */
+    if (kernel_files_read(files, mm, 1, UINT64_MAX, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != -KERNEL_EFAULT) {
+        fail_files(19U, -KERNEL_EFAULT, result);
+    }
+    if (kernel_files_read(files, mm, 1, ARCH_MMU_USER_LIMIT, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0) {
         fail_files(19U, 0, result);
     }
 

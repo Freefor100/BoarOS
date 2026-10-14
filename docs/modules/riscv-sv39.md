@@ -108,11 +108,11 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 
 `riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire；MM 的 VMA 分类回调使共享匿名 leaf 保持原权限和物理身份，其他 leaf 转成 COW。任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父进程的私有 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把私有页面内容复制推迟到父或子真正写入时。
 
-RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再登记 source-backed VMA；完整文件页在首次 fault 时共享 page cache 并以 COW 发布，文件/BSS 边界页和纯 BSS 页按需私有分配、精确填充与清零。RW/NX 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
+RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再登记 source-backed VMA；完整文件页在首次 fault 时共享 page cache 并以 COW 发布，文件/BSS 边界页和纯 BSS 页按需私有分配、精确填充与清零。默认 NX、按主 ELF GNU_STACK 选择执行许可的 RW 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
 
 ## 验证
 
-`test-icache-riscv`检查Make传入的实际`BUILD_DIR`对象，不要求默认`build/riscv`目录存在。
+`test-icache-riscv` 检查 Make 传入的实际 BUILD_DIR 对象及入口的直接调用可达链，不要求固定私有函数或 fence 位于公开函数本体。它是指令存在门禁，不能替代真实可执行映射/缺页/COW/mprotect 的行为验收。`test-instruction-sync-host` 拒绝无关 fence、非调用引用和仅含环路的假通过。
 
 ```sh
 make test-sv39-riscv

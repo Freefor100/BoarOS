@@ -695,3 +695,5 @@ MM的实际清理owner等drain完成，使回调对MM存储的借用有根，不
 公共出口只给当前用户任务的自身 MM 记账，不能让 CPU0 服务复制或受控内核任务调用用户统计消费者。
 固定 Linux `references/linux/arch/riscv/mm/fault.c`、`arch/loongarch/mm/fault.c` 及 `mm/memory.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）按完成结果区分 major/minor；BoarOS 仍沿实际当前任务块读请求分类，等待别人的读请求不承诺精确 major 分类。
 差分区间先预热采样缓冲，检查受控触碰产生的计数下界及失败无增长，避免精确累计数依赖无关启动缺页。
+
+编译产物的同步检查应沿入口实际可达调用链查找指令，不要求内联在公开函数本体。只在其他函数找到 fence.i 也不能算通过；直接调用之外的地址引用不构成执行证据。该检查只证明指令存在，发布顺序和硬件行为仍由真实缺页、COW 与 mprotect 消费者验收。
