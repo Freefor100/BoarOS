@@ -15,8 +15,15 @@ def identity(path):
     resolved = Path(shutil.which(str(path)) or path).resolve(strict=True)
     return {"path": str(resolved), "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest()}
 
+def observe_threads(pid):
+    names=set()
+    for path in Path(f'/proc/{pid}/task').glob('*/comm'):
+        try:names.add(path.read_text().strip())
+        except (FileNotFoundError,ProcessLookupError):pass
+    return names
 
-def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contract="scheduler", disks=()):
+
+def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contract="scheduler", disks=(), require_fpu_setup=False):
     command = [qemu, "-machine", "virt", "-accel", "tcg,thread=multi",
                "-name", "boaros-smp,debug-threads=on", "-smp", str(cpus),
                "-m", memory, "-nographic", "-no-reboot", "-bios", firmware, "-kernel", str(kernel)]
@@ -33,11 +40,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
     selector.register(process.stdout, selectors.EVENT_READ)
     try:
         while process.poll() is None:
-            for path in Path(f"/proc/{process.pid}/task").glob("*/comm"):
-                try:
-                    threads.add(path.read_text().strip())
-                except FileNotFoundError:
-                    pass
+            threads.update(observe_threads(process.pid))
             for key, _ in selector.select(0.005):
                 data.extend(os.read(key.fd, 65536))
             if time.monotonic() - started >= 180:
@@ -63,7 +66,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
     output.with_suffix(".log").write_text(text)
     report = {"command": command, "disks_before":disk_identities, "memory": memory, "cpus": cpus,
               "profile": profile,
-              "contract": contract,
+              "contract": contract, "require_fpu_setup":require_fpu_setup,
               "vcpu_threads": sorted(t for t in threads if "/TCG" in t),
               "returncode": process.returncode, "timeout": timed_out,
               "elapsed_seconds": time.monotonic() - started,
@@ -144,6 +147,8 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
                       "SMP per-CPU FIFO/yield and RR/timer qualification passed" not in text or
                       "SMP sleeping create rechecks STOPPED and returns private owners" not in text):
         raise RuntimeError("missing independent SMP execution and migration evidence")
+    if require_fpu_setup and cpus==2 and "FPU setup interrupt boundary protected; 8 owners returned" not in text:
+        raise RuntimeError("missing forced FPU setup boundary/owner observation")
     print(f"RV SMP cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
 
 
@@ -175,7 +180,10 @@ def main():
     parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
     parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file", "mm-disk", "files", "file-io"), default="scheduler")
     parser.add_argument("--init",type=Path)
+    parser.add_argument("--require-fpu-setup",action="store_true")
     args = parser.parse_args()
+    if args.require_fpu_setup and (args.contract!="scheduler" or args.profile!="normal"):
+        parser.error("FPU setup boundary belongs to the normal scheduler contract")
     if args.contract in ("files","file-io") and args.profile!="normal":
         parser.error("FD/pipe composition uses the normal profile; RFENCE errors have the existing MM contracts")
     if args.contract in ("mm-disk","files","file-io"):
@@ -203,7 +211,8 @@ def main():
     for cpus in ((2, 1) if args.profile == "normal" else (2,)):
         for memory in ("512M", "1G"):
             boot(args.qemu, args.firmware, args.kernel, memory, cpus,
-                 args.output / f"{cpus}-{memory}", args.profile, args.contract)
+                 args.output / f"{cpus}-{memory}", args.profile, args.contract,
+                 require_fpu_setup=args.require_fpu_setup)
 
 
 if __name__ == "__main__":

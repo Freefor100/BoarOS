@@ -2339,6 +2339,11 @@ test-smp-riscv:
 		python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/$$profile/kernel-rv --profile $$profile --output build/riscv-smp/runs/$$profile; \
 	done
 
+.PHONY: test-smp-fpu-setup-riscv
+test-smp-fpu-setup-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 COST_DIAGNOSTICS=0 BUILD_DIR=build/riscv-smp-test/fpu-setup/riscv KERNEL_RV=build/riscv-smp-test/fpu-setup/kernel-rv CFLAGS_EXTRA=-DBOAROS_SMP_FPU_SETUP_TEST=1 all
+	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/fpu-setup/kernel-rv --output build/riscv-smp/runs/fpu-setup --require-fpu-setup
+
 .PHONY: test-smp-userland-riscv
 .PHONY: test-mm-smp-userland-riscv
 test-mm-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)

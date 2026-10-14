@@ -703,6 +703,28 @@ static void parallel_allocator(void)
     virt_uart_puts("BoarOS: SMP private arena buddy/ref/slab/resize and audit passed\n");
 }
 
+#ifdef BOAROS_SMP_FPU_SETUP_TEST
+static unsigned fpu_setup_attempts, fpu_setup_unmasked;
+#endif
+/* 受控kernel测试把局部图像装入硬件；Dirty发布后才属于当前任务。 */
+static void install_test_fpu(struct riscv_fpu_state *image)
+{
+    /* restore以Clean结束，但图像此时还不是task->fpu；禁止在Dirty
+     * 发布前抢占。正常用户FP指令由硬件原子地标Dirty，不存在此测试间隙。 */
+    KERNEL_IRQ_SCOPE(fpu_setup_irq);
+    riscv_fpu_state_restore(image);
+#ifdef BOAROS_SMP_FPU_SETUP_TEST
+    __atomic_fetch_add(&fpu_setup_attempts,1,__ATOMIC_RELAXED);
+    if (arch_interrupt_is_enabled()) {
+        __atomic_fetch_add(&fpu_setup_unmasked,1,__ATOMIC_RELAXED);
+        uintptr_t irq=arch_interrupt_save();
+        require(kernel_scheduler_on_tick(1)==KERNEL_SCHEDULER_STATUS_OK,"fpu-setup-forced-tick");
+        arch_interrupt_restore(irq);
+    }
+#endif
+    asm volatile("csrs sstatus, %0" :: "r"((uintptr_t)0x6000) : "memory");
+}
+
 static void compute(void *argument)
 {
     unsigned id = (uintptr_t)argument;
@@ -710,8 +732,7 @@ static void compute(void *argument)
     require(__atomic_exchange_n(&executions[id], 1, __ATOMIC_ACQ_REL) == 0, "execution-unique");
     struct riscv_fpu_state expected = {.fcsr = 0x61, .saved = 1}, actual;
     for (unsigned i = 0; i < 32; i++) expected.regs[i] = UINT64_C(0x3ff0010000000000) + id * 256 + i;
-    riscv_fpu_state_restore(&expected);
-    asm volatile("csrs sstatus, %0" :: "r"((uintptr_t)0x6000) : "memory");
+    install_test_fpu(&expected);
     __atomic_fetch_add(&entered, 1, __ATOMIC_RELEASE);
     while (__atomic_load_n(&entered, __ATOMIC_ACQUIRE) != 4) {}
     /* 没有主动yield：同CPU伙伴必须经过timer抢占才能进入并前进。 */
@@ -723,7 +744,15 @@ static void compute(void *argument)
     }
     riscv_fpu_state_save(&actual);
     require(actual.fcsr == expected.fcsr, "preempt-FCSR");
-    for (unsigned i = 0; i < 32; i++) require(actual.regs[i] == expected.regs[i], "preempt-FD");
+    for (unsigned i = 0; i < 32; i++) {
+        if (actual.regs[i]!=expected.regs[i]) {
+            virt_uart_puts("BoarOS: preempt FD task="); virt_uart_put_hex(id);
+            virt_uart_puts(" reg="); virt_uart_put_hex(i);
+            virt_uart_puts(" expected="); virt_uart_put_hex(expected.regs[i]);
+            virt_uart_puts(" actual="); virt_uart_put_hex(actual.regs[i]); virt_uart_putc('\n');
+        }
+        require(actual.regs[i] == expected.regs[i], "preempt-FD");
+    }
     require(__atomic_exchange_n(&executions[id], 0, __ATOMIC_ACQ_REL) == 1, "execution-release");
 }
 
@@ -744,8 +773,7 @@ static void migrate(void *unused)
     require(kernel_cpu_current()->logical_id == source, "migration-source");
     struct riscv_fpu_state expected = {.fcsr = 0x83, .saved = 1}, actual;
     for (unsigned i = 0; i < 32; i++) expected.regs[i] = UINT64_C(0x4000010000000000) + i;
-    riscv_fpu_state_restore(&expected);
-    asm volatile("csrs sstatus, %0" :: "r"((uintptr_t)0x6000) : "memory");
+    install_test_fpu(&expected);
     require(riscv_smp_gpr_wait(), "migration-integer-context-PC");
     require(kernel_cpu_current()->logical_id == (source ^ 1U) && arch_current_stack() == sp,
             "migration-destination-SP");
@@ -762,8 +790,7 @@ static void shared_compute(void *argument)
     uintptr_t sp = arch_current_stack();
     struct riscv_fpu_state expected = {.fcsr = 0x41, .saved = 1}, actual;
     for (unsigned i = 0; i < 32; i++) expected.regs[i] = UINT64_C(0x3ff0020000000000) + id * 256 + i;
-    riscv_fpu_state_restore(&expected);
-    asm volatile("csrs sstatus, %0" :: "r"((uintptr_t)0x6000) : "memory");
+    install_test_fpu(&expected);
     __atomic_fetch_add(&shared_entered, 1, __ATOMIC_RELEASE);
     uint64_t end = riscv_time_read() + 50000000;
     while (__atomic_load_n(&shared_entered, __ATOMIC_ACQUIRE) < 2) {
@@ -827,6 +854,10 @@ static void parallel_tasks(void)
                 "migration-owner-return");
     }
     virt_uart_puts("BoarOS: SMP timer preemption, unique execution and FD migration passed\n");
+#ifdef BOAROS_SMP_FPU_SETUP_TEST
+    require(fpu_setup_attempts==8 && !fpu_setup_unmasked,"fpu-setup-owner-publication");
+    virt_uart_puts("BoarOS: FPU setup interrupt boundary protected; 8 owners returned\n");
+#endif
 }
 
 static void creation_noop(void *unused) { (void)unused; }
