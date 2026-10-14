@@ -153,13 +153,26 @@ class ArchitectureCoverage(unittest.TestCase):
         commands=[argument for case in self.plan('riscv','user-smp') for argument in case['argv']]
         self.assertIn('test-user-smp-riscv',commands)
         self.assertIn('test-user-smp-runtime-riscv',commands)
+        self.assertIn('test-user-smp-composition-riscv',commands)
         host=[argument for case in self.plan('host','host') for argument in case['argv']]
         self.assertIn('test-user-smp-host',host)
+        self.assertIn('test-user-smp-composition-host',host)
         controlled=[argument for case in self.plan('riscv','smp') for argument in case['argv']]
         self.assertIn('test-smp-fpu-setup-riscv',controlled)
         result=subprocess.run([sys.executable,'-B',str(Path(__file__).with_name('run.py')),
             '--arch','loongarch','--suite','user-smp','--list'],capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
+
+    def test_original_user_smp_profiles_have_independent_scheduled_results(self):
+        path=Path(__file__).resolve().parents[2]/'.github/workflows/native-extended.yml'
+        job=yaml.safe_load(path.read_text())['jobs']['riscv-user-programs']
+        self.assertEqual(job['strategy']['matrix']['cpus'],[2,1])
+        self.assertEqual(job['strategy']['matrix']['memory'],['512M','1G'])
+        self.assertFalse(job['strategy']['fail-fast'])
+        commands='\n'.join(step.get('run','') for step in job['steps'])
+        self.assertIn('--execution-profile rv-user-smp',commands)
+        self.assertIn('--require-pass',commands)
+        self.assertIn('--firmware',commands)
 
     def test_native_template_retains_full_abi_observations_and_failed_disk(self):
         path = Path(__file__).resolve().parents[2] / '.github/workflows/native-contracts.yml'

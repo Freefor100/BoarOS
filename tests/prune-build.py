@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-user-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-user-smp', 'riscv-user-smp-composition', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -62,6 +62,11 @@ def candidates():
     if user_smp.is_dir():
         result.extend(path for path in user_smp.iterdir()
                       if path.name not in {'riscv','kernel-rv','user-smp-rv','user-smp-dynamic-rv'})
+
+    composition = BUILD / 'riscv-user-smp-composition'
+    if composition.is_dir():
+        result.extend(path for path in composition.iterdir()
+                      if path.is_dir() and path.name.startswith('runs'))
 
     riscv = BUILD / 'riscv'
     smp_runs = BUILD / 'riscv-smp' / 'runs'

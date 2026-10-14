@@ -37,6 +37,8 @@ runner开启QEMU `debug-threads=on`，在Ubuntu/QEMU8.2.2同样能记录实际vC
 
 RV的`user-smp`组独立执行实际用户调度与CPU0服务交接：原生进程/线程、上下文、信号、组停止、实时资格及MM退休，同ELF对照包含静态/动态musl、dlopen TLS、1400 ABI及glibc五形态；原static/pthread musl的BoarOS集成另保留原consumer内容和回收核对。两核及一核退化、双RAM均使用独立Linux SMP reference配置`tests/smp/linux-user.config`；environment producer单独封存其配置和工具哈希缓存。runner保存真实U-mode hart采样、完整内容/退出、归还及磁盘核对，不用marker代替案例。服务统计在UART worker排空停止后输出；默认每次运行创建独立目录，显式非空目录拒绝覆盖快照/旧报告；退出期间消失的proc线程忽略ESRCH，权限或其他读取错误仍失败。该配置保留实际调用任务并把内核业务迁CPU0，LA没有用户SMP占位。
 
+`native-extended.yml`另设`riscv-user-programs`四格定时矩阵，分别完整运行原229项，覆盖2/1 CPU和512MiB/1GiB；每格使用严格Linux SMP参考、冻结同一ELF与独立报告，参考失败和BoarOS失败均使job失败并保留逐项结果。composition门禁在`native-contracts.yml`的RV `user-smp`组内，用CPU0控制器做MM/等待/SQLite组合；Linux只运行共同用户行为，定向页账本、OOM和退休同步暂停仅为BoarOS测试专属owner证据，远端目标单独计数。两个入口都显式使用真实RV64 OpenSBI及QEMU身份；添加job和本地通过不等于托管CI已经运行。
+
 两个environment独立生产缓存，各consumer只依赖本架构producer。core的一组
 失败后runner继续收集后续独立组；同模板的platform准备与执行在native环境成功时
 继续，不被core失败跳过。runtime与core独立。`Main dual-architecture gate`以

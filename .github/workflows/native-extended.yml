@@ -10,6 +10,53 @@ concurrency:
   group: native-extended-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  riscv-user-programs:
+    name: User SMP original programs (${{ matrix.cpus }} CPU, ${{ matrix.memory }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [2, 1]
+        memory: [512M, 1G]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/native-environment
+        with:
+          arch: riscv
+          mode: prepare
+      - name: Select actual RV64 firmware
+        run: python3 -B tests/ci/firmware.py --github-env
+      - name: Prepare unchanged programs and user SMP kernel
+        run: |
+          python3 -B tests/program-inventory/run.py --arch riscv --build-only
+          make INIT_CONFIG=config/init.json kernel-rv-user-smp
+      - name: Run one independent strict profile
+        env:
+          TEST_CPUS: ${{ matrix.cpus }}
+          TEST_MEMORY: ${{ matrix.memory }}
+        run: |
+          python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp \
+            --cpus "$TEST_CPUS" --memory "$TEST_MEMORY" --reuse-builds --require-pass \
+            --firmware "$QEMU_RISCV_FIRMWARE" --output build/riscv-user-smp/programs-ci
+      - name: Preserve complete per-case observations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: user-smp-programs-${{ matrix.cpus }}cpu-${{ matrix.memory }}
+          path: |
+            build/riscv-user-smp/programs-ci/**/*.json
+            build/riscv-user-smp/programs-ci/**/*.log
+            build/riscv-smp/ci-executor.json
+          if-no-files-found: warn
+      - name: Preserve failed disks
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: user-smp-programs-disks-${{ matrix.cpus }}cpu-${{ matrix.memory }}
+          path: build/riscv-user-smp/programs-ci/**/*.img
+          retention-days: 7
+          if-no-files-found: ignore
   original-programs:
     name: Original programs and devices (${{ matrix.arch }})
     runs-on: ubuntu-24.04

@@ -26,29 +26,7 @@ jobs:
           arch: ${{ inputs.arch }}
       - name: Record and select the actual SMP firmware
         if: ${{ inputs.arch == 'riscv' && (inputs.suite == 'smp' || inputs.suite == 'user-smp') }}
-        run: |
-          python3 -B - <<'PY'
-          import hashlib, json, os, shutil, subprocess
-          from pathlib import Path
-          files = subprocess.check_output(['dpkg-query', '-L', 'opensbi'], text=True).splitlines()
-          # Ubuntu installs both XLEN variants; RV64 cannot boot the RV32 image.
-          candidates = [Path(p) for p in files
-                        if p.endswith('/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin') and Path(p).is_file()]
-          if len(candidates) != 1:
-              raise SystemExit(f'Expected one installed RV64 generic OpenSBI image, found {candidates}')
-          firmware = candidates[0].resolve(strict=True)
-          qemu = Path(shutil.which('qemu-system-riscv64')).resolve(strict=True)
-          def identity(path):
-              return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-          report = {'firmware': identity(firmware), 'qemu': identity(qemu),
-                    'qemu_version': subprocess.check_output([str(qemu), '--version'], text=True),
-                    'opensbi_package': subprocess.check_output(['dpkg-query', '-W', 'opensbi'], text=True)}
-          output = Path('build/riscv-smp/ci-executor.json')
-          output.parent.mkdir(parents=True, exist_ok=True)
-          output.write_text(json.dumps(report, indent=2) + '\n')
-          with Path(os.environ['GITHUB_ENV']).open('a') as environment:
-              environment.write(f'QEMU_RISCV_FIRMWARE={firmware}\n')
-          PY
+        run: python3 -B tests/ci/firmware.py --github-env
       - name: Run the declared native contracts
         env:
           TARGET_ARCH: ${{ inputs.arch }}
@@ -85,6 +63,8 @@ jobs:
             build/riscv-user-smp/**/*.json
             build/riscv-user-smp/**/*.normalized
             build/riscv-user-smp/**/*.diff
+            build/riscv-user-smp-composition/**/*.log
+            build/riscv-user-smp-composition/**/*.json
             build/${{ inputs.arch }}/**/*.log
             build/${{ inputs.arch }}/**/*.json
             build/${{ inputs.arch }}/**/*.normalized
@@ -130,6 +110,7 @@ jobs:
             build/${{ inputs.arch }}/**/*.img
             build/riscv*-smp-test/runs/**/*.img
             build/riscv-user-smp/**/*.img
+            build/riscv-user-smp-composition/**/*.img
             build/diff-abi/run/*.img
             build/sched-handoff-*/*.img
             build/exec-boundary-*/*.img

@@ -391,3 +391,18 @@ RV门禁通过，没有修改原BusyBox、TTY核心、超时或结果归一化�
 原程序身份沿上述终端验收；该事实是runner同步修复，不是Linux/BoarOS ABI差异。
 
 2026-10-14 USER_SMP主线的默认单核组合复核仍使用固定229项及原程序：BoarOS两侧双RAM全部完成，RV1GiB与LA双RAM同ELF对照全通过。RV512MiB原BusyBox脚本的`du`在Linux动态`/proc`遍历失败，整组标为reference-not-pass；BoarOS内容/退出/回收通过。该首轮未补记通过，也不替此前LA参考失败归因。新USER_SMP原生、1400 ABI和运行时使用另一个固定Linux SMP配置，其结果及CPU0业务边界见[两核模块](../modules/riscv-smp.md#真实用户态与cpu0业务交接)，不把默认229项推广成全部SMP应用已验收。
+
+## RV USER_SMP原程序四profile复核（2026-10-14）
+
+冻结USER_SMP内核`9fe57b5d6f806f944b455b16abc9b139643ce2539ff0e1dba29bb9a8315fde04`下重新执行固定229项原程序。512MiB/2 CPU、512MiB/1 CPU、1GiB/2 CPU、1GiB/1 CPU四个profile均为`complete`且各229项pass；两侧程序/loader/库及运行参数来自同一已封存输入，四组严格运行没有参考端失败、BoarOS失败、超时或未到达。使用Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`的SMP profile `tests/smp/linux-user.config`，源码配置SHA-256 `dac55880b20f0091d1cfd4d86ee619456a1cdcc7177e8611030f107bf36c9516`。前一冻结核的两项启动输出协议失败及强制交错修复见[交接记录](smp-handoff.md#用户态原程序与生命周期组合2026-10-14)；其失败未补记为通过。
+
+本地执行器为QEMU11.1.2（`/usr/bin/qemu-system-riscv64` SHA-256 `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d`），firmware SHA-256 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。逐ID结果和manifest在验收时核对，运行目录按`build/`策略清理；Git保留结论、输入身份和复建命令。这不是托管CI结果。复建命令：
+
+```sh
+python3 -B tests/program-inventory/run.py --arch riscv --execution-profile rv-user-smp \
+  --cpus 2 --cpus 1 --memory 512M --memory 1G \
+  --firmware build/data-path-baselines/sync-b3/firmware.bin \
+  --reuse-builds --require-pass --output build/user-smp-programs-run
+```
+
+默认单核program profile此前发生的Linux BusyBox `du`动态`/proc`参考失败仍属该profile；这里的SMP Linux配置与运行身份独立，因此该历史结果保留、不由此处改写。
