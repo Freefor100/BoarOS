@@ -20,6 +20,46 @@ def stream(status=0, timed_out=0, out='68690a', err=''):
 
 
 class ObservationTests(unittest.TestCase):
+    def test_smp_reference_preserves_original_program_facilities(self):
+        here=Path(__file__).parent
+        required={line for line in (here/'linux.config').read_text().splitlines()
+                  if line.startswith('CONFIG_') and line.endswith('=y')}
+        actual=set((here.parent/'smp/linux-user.config').read_text().splitlines())
+        self.assertFalse(required-actual, sorted(required-actual))
+    def test_execution_profile_does_not_change_default_architecture_facts(self):
+        original = suites.PROFILES['riscv'].boot('qemu', 'kernel', '512M')
+        configuration = suites.execution_configuration('rv-user-smp', 'riscv', 2, '/firmware')
+        command = suites.execution_command(original, configuration)
+        self.assertEqual(command[command.index('-smp') + 1], '2')
+        self.assertEqual(command[command.index('-bios') + 1], '/firmware')
+        self.assertIn('tcg,thread=multi', command)
+        self.assertNotIn('-icount', command)
+        self.assertEqual(original[original.index('-smp') + 1], '1')
+        self.assertEqual(suites.execution_command(original,
+            suites.execution_configuration('single', 'riscv', 1, 'default')), original)
+
+    def test_invalid_execution_profile_rejected_before_guest_preparation(self):
+        for profile, arch, cpus, firmware in (
+                ('rv-user-smp', 'loongarch', 2, '/firmware'),
+                ('single', 'riscv', 2, 'default'),
+                ('rv-user-smp', 'riscv', 3, '/firmware'),
+                ('rv-user-smp', 'riscv', 2, 'default'),
+                ('unknown', 'riscv', 1, 'default')):
+            with self.subTest(profile=profile, arch=arch, cpus=cpus), self.assertRaises(ValueError):
+                suites.execution_configuration(profile, arch, cpus, firmware)
+
+    def test_user_profile_requires_smp_reference_and_user_kernel(self):
+        with tempfile.TemporaryDirectory() as output:
+            folder = Path(output)
+            kernel = folder / 'kernel'; config = folder / '.config'
+            kernel.write_bytes(b'ordinary single CPU kernel')
+            config.write_text('CONFIG_SMP=n\n')
+            with self.assertRaisesRegex(ValueError, 'SMP reference'):
+                suites.validate_execution_inputs('rv-user-smp', kernel, config)
+            config.write_text('CONFIG_SMP=y\nCONFIG_NR_CPUS=2\n')
+            with self.assertRaisesRegex(ValueError, 'user SMP kernel'):
+                suites.validate_execution_inputs('rv-user-smp', kernel, config)
+
     def test_strict_result_uses_only_selected_cases(self):
         state = {'status': 'partial', 'results': {
             'selected': {'status': 'pass', 'completed': True},

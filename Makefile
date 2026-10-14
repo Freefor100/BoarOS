@@ -2316,6 +2316,10 @@ test-user-smp-riscv: $(USER_SMP_ELF) $(USER_SMP_DYNAMIC_ELF) $(PTHREAD_TLS_DSO_R
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_ELF) $(TEST_MEMORY_ARGS)
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
 .PHONY: test-user-smp-runtime-riscv
+.PHONY: test-user-smp-programs-riscv
+test-user-smp-programs-riscv: test-program-inventory-host
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --reuse-builds $(TEST_MEMORY_ARGS)
 test-user-smp-runtime-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO) $(DIFF_ABI_RV)
 	$(MAKE) kernel-rv-user-smp
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(DIFF_ABI_RV) --manifest tests/diff-abi/cases.txt $(TEST_MEMORY_ARGS)

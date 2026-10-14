@@ -11,6 +11,12 @@ qemu=importlib.util.module_from_spec(qemu_spec);qemu_spec.loader.exec_module(qem
 from unittest.mock import Mock,patch
 
 class UserReport(unittest.TestCase):
+    def test_execution_budget_is_bounded_and_explicit(self):
+        with patch.dict(qemu.os.environ, {'BOAROS_SMP_TIMEOUT':'25'}):
+            self.assertEqual(qemu.execution_timeout(),25)
+        for value in ('0','181','nan','inf'):
+            with patch.dict(qemu.os.environ, {'BOAROS_SMP_TIMEOUT':value}),self.assertRaises(ValueError):
+                qemu.execution_timeout()
     def valid(self,cpus=2,dynamic=False):
         cases=runner.CASES+((runner.DYNAMIC_CASE,) if dynamic else ())
         lines=[f'USER-SMP BEGIN cpus={cpus}',*[f'USER-SMP CASE {name} OK' for name in cases],f'USER-SMP END {len(cases)}',

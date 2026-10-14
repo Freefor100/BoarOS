@@ -1,5 +1,17 @@
 # 两核启动与执行交接
 
+## SMP 原程序参考环境
+
+原程序driver在执行案例前准备proc/sysfs、tmpfs、mqueue、devpts和loopback。
+2026-10-14首次用户SMP清单试跑的两项程序在BoarOS完成，但Linux未启用
+`POSIX_MQUEUE`和`UNIX98_PTYS`，准备返回ENODEV，报告为reference-not-pass。
+这发生在原程序执行环境，不能归为BoarOS装载或程序错误。
+固定`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
+的`init/Kconfig`与`drivers/tty/Kconfig`定义对应能力。
+`tests/smp/linux-user.config`现保留原单核清单所需设施并启用SMP；配置内容进入
+Linux缓存键，旧reference及原失败报告不会被覆盖。相同两ELF的新profile复核通过。
+host反例约束原程序参考设施不丢失；完整清单结果另记，不由试跑推定229项通过。
+
 ## 文件表与端点的身份交接
 
 FD编号只标识当前槽，不能覆盖在途I/O。固定Linux `references/linux/fs/file.c`与`fs/pipe.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）分别提供文件取得/替换与管道片段、等待及断端行为依据。BoarOS在FD raw内取得实际OFD引用，锁外复制/睡眠；close摘槽后，旧请求仍持原端点。目录路径也遵循同样交接：OFD pin归还前必须先取得独立path引用。宿主反例让另一关闭消除槽owner，并且root/cwd不额外持被观察目录path，保护相对dirfd和AT_EMPTY_PATH两条路径。

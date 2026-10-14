@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from arch_profiles import PROFILES
 
@@ -87,6 +88,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arch',choices=tuple(PROFILES),default='riscv')
     parser.add_argument('--memory',choices=('512M','1G'),action='append')
+    parser.add_argument('--execution-profile',choices=('single','rv-user-smp'),default='single')
+    parser.add_argument('--cpus',type=int,choices=(1,2),action='append')
+    parser.add_argument('--kernel',type=Path)
+    parser.add_argument('--firmware',default=os.environ.get('QEMU_RISCV_FIRMWARE','default'))
+    parser.add_argument('--qemu')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--suite', choices=('all', 'busybox', 'libc'), default='all')
     parser.add_argument('--case', action='append', dest='case_ids')
@@ -99,7 +105,20 @@ def main():
     parser.add_argument('--require-pass', action='store_true', help='also fail for program incompatibilities')
     args = parser.parse_args()
     profile=PROFILES[args.arch]
-    destination = (args.output or ROOT/('build/program-inventory-full' if args.arch=='riscv' else 'build/loongarch/program-inventory')).resolve()
+    cpus = args.cpus or ([2,1] if args.execution_profile=='rv-user-smp' else [1])
+    if len(cpus)!=len(set(cpus)):parser.error('duplicate CPU profile')
+    if args.execution_profile=='rv-user-smp' and (args.arch!='riscv' or args.firmware=='default'):
+        parser.error('RV user SMP requires --arch riscv and --firmware FILE')
+    if args.execution_profile=='single' and cpus!=[1]:parser.error('single profile requires --cpus 1')
+    default_output=('build/riscv-user-smp/programs' if args.execution_profile=='rv-user-smp' else
+                    'build/program-inventory-full' if args.arch=='riscv' else 'build/loongarch/program-inventory')
+    destination = (args.output or ROOT/default_output).resolve()
+    if args.execution_profile=='rv-user-smp':
+        if args.output and destination.exists() and any(destination.iterdir()):
+            parser.error('refusing nonempty output; preserve the previous frozen observations')
+        if not args.output:
+            destination.mkdir(parents=True,exist_ok=True)
+            destination=Path(tempfile.mkdtemp(prefix='run-',dir=destination))
     destination.mkdir(parents=True, exist_ok=True)
     # Local unpacked tools are optional; all executable identities are recorded.
     local_tools = ROOT / 'build/diff-abi/tools/usr/bin'
@@ -168,15 +187,19 @@ def main():
             environment_variables=os.environ.copy()
             if args.arch=='loongarch':environment_variables['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True,env=environment_variables)
-        if args.arch=='riscv':image, linux_identity = harness.linux_build(HERE / 'linux.config')
+        if args.arch=='riscv':image, linux_identity = harness.linux_build(
+            ROOT/'tests/smp/linux-user.config' if args.execution_profile=='rv-user-smp' else HERE/'linux.config')
         else:
             image=profile.linux_kernel();linux_identity=json.loads((image.parent/'boaros-identity.json').read_text())
             if linux_identity['revision']!=harness.source_info()[1] or linux_identity.get('image_sha256')!=sha(image):
                 raise RuntimeError('LA fixed Linux identity mismatch')
-        metadata.update(linux=linux_identity, driver_command=command,
-                        driver_sha256=sha(driver), boaros_sha256=sha(ROOT/profile.kernel))
+        kernel=args.kernel or ROOT/('build/riscv-user-smp/kernel-rv' if args.execution_profile=='rv-user-smp' else profile.kernel)
+        linux_configuration=image.parents[3]/'.config' if args.arch=='riscv' else None
+        suites.validate_execution_inputs(args.execution_profile,kernel,linux_configuration)
+        metadata.update(linux=linux_identity, driver_command=command,execution_profile=args.execution_profile,
+                        driver_sha256=sha(driver), boaros_sha256=sha(kernel))
         frozen={}
-        for name,source in [('linux',image),('boaros',ROOT/profile.kernel)]:
+        for name,source in [('linux',image),('boaros',kernel)]:
             snapshot=destination/(name+'-kernel')
             original=sha(source)
             if snapshot.exists():
@@ -185,12 +208,18 @@ def main():
             if sha(snapshot)!=original:raise RuntimeError('kernel changed during input snapshot')
             frozen[name]=snapshot
         results={}
-        for memory in args.memory or (['512M','1G'] if args.arch=='loongarch' else ['512M']):
-            result=suites.run_suite(manifest,destination/('runs' if args.arch=='riscv' and memory=='512M' else 'runs-'+memory),
-                driver,frozen['linux'],frozen['boaros'],case_ids=args.case_ids,default_timeout=args.timeout,
-                output_validator=validate_output,keep_pass_images=args.keep_pass_images,
-                arch=args.arch,memory=memory,qemu=profile.qemu)
-            results[memory]=result
+        for memory in args.memory or (['512M','1G'] if args.arch=='loongarch' or args.execution_profile=='rv-user-smp' else ['512M']):
+            for count in cpus:
+                label=f'{memory}-{count}cpu' if args.execution_profile=='rv-user-smp' else memory
+                folder=('runs-'+label if args.execution_profile=='rv-user-smp' else
+                        'runs' if args.arch=='riscv' and memory=='512M' else 'runs-'+memory)
+                result=suites.run_suite(manifest,destination/folder,
+                    driver,frozen['linux'],frozen['boaros'],case_ids=args.case_ids,default_timeout=args.timeout,
+                    output_validator=validate_output,keep_pass_images=args.keep_pass_images,
+                    arch=args.arch,memory=memory,qemu=args.qemu or profile.qemu,
+                    execution_profile=args.execution_profile,cpus=count,firmware=args.firmware,
+                    linux_configuration=linux_configuration)
+                results[label]=result
         metadata['status']='inventoried';metadata['execution']=results
         print(json.dumps({memory:{'status':state['status'],'counts':state['counts']} for memory,state in results.items()},indent=2))
         if args.require_pass and any(not suites.strict_result_passes(result,args.case_ids) for result in results.values()):return 1

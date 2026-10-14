@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the existing userland consumer unchanged in an explicit MTTCG profile."""
 import json
+import math
 import os
 from pathlib import Path
 import selectors
@@ -10,6 +11,13 @@ import time
 from riscv import identity,observe_threads
 
 
+def execution_timeout():
+    budget = float(os.environ.get('BOAROS_SMP_TIMEOUT', '180'))
+    if not math.isfinite(budget) or not 0 < budget <= 180:
+        raise ValueError('QEMU execution budget must be in (0,180] seconds')
+    return budget
+
+
 def main():
     args = sys.argv[1:]
     actual = os.environ["BOAROS_SMP_QEMU"]
@@ -17,6 +25,7 @@ def main():
     output = Path(os.environ["BOAROS_SMP_OUTPUT"])
     # 原consumer保留盘准备、输入、完整marker与owner判定；仅改变架构profile。
     cpus = int(os.environ.get("BOAROS_SMP_CPUS", "2"))
+    budget = execution_timeout()
     for flag, value in (("-smp", str(cpus)), ("-bios", firmware)):
         index = args.index(flag)
         args[index + 1] = value
@@ -48,7 +57,7 @@ def main():
             threads.update(observe_threads(process.pid))
             for key, _ in selector.select(0.005):
                 data.extend(os.read(key.fd, 65536))
-            if time.monotonic() - start >= 180:
+            if time.monotonic() - start >= budget:
                 timed_out = True
                 process.terminate()
                 try:
@@ -67,7 +76,7 @@ def main():
         process.stdout.close()
     text = data.decode(errors="replace")
     prefix.with_suffix(".log").write_text(text)
-    record.update(returncode=process.returncode, timeout=timed_out, elapsed_seconds=time.monotonic() - start,
+    record.update(returncode=process.returncode, timeout=timed_out, budget_seconds=budget, elapsed_seconds=time.monotonic() - start,
                   vcpu_threads=sorted(t for t in threads if "/TCG" in t))
     prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
     sys.stdout.buffer.write(data)

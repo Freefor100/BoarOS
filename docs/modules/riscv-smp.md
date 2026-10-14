@@ -69,6 +69,17 @@ RFENCE错误走fatal并保留owner。单页接口仍是批量接口的包装。
 
 ## 验证入口与证据边界
 
+原程序清单可显式选择`rv-user-smp`执行profile：
+`make test-user-smp-programs-riscv QEMU_RISCV_FIRMWARE=/absolute/firmware.bin`，
+或`tests/program-inventory/run.py --execution-profile rv-user-smp --firmware FILE`。
+默认覆盖2/1 CPU和512MiB/1GiB，仍使用原229个ID、ELF、运行时和输出契约；
+`--cpus`、`--memory`可选择独立profile，`--kernel`指定冻结核。默认单核入口不变。
+同ELF对照使用`tests/smp/linux-user.config`的固定Linux SMP，保留原程序需要的
+mqueue、PTY和其他参考环境设施；不以单核reference或仅有计数的结果代替验收。
+显式固件、输入与实际MTTCG线程随逐案例报告保存；原案例预算保持，QEMU执行最多180秒，
+控制进程另留5秒终止/排空时间。短案例不要求CPU1用户采样非零，专项程序独立证明并行。
+参考准备失败、输出失败、超时和BoarOS回收状态分开；参考失败不能算共同通过。
+
 ```sh
 make test-smp-host test-mm-pin-host test-mm-concurrency-host
 make test-smp-fpu-setup-riscv
