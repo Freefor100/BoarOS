@@ -549,7 +549,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     /* 这里只验证数值范围；payload缺页必须留在状态检查和接纳预算之后。 */
     uint64_t range_size = request->arguments[2];
-    if (op == 206 && range_size > KERNEL_FILES_MAX_RW_COUNT) range_size = KERNEL_FILES_MAX_RW_COUNT;
+    if ((op == 206 || op == 207) && range_size > KERNEL_FILES_MAX_RW_COUNT) range_size = KERNEL_FILES_MAX_RW_COUNT;
     if ((op == 206 || op == 207) && kernel_user_range_check(
             request->arguments[1], (size_t)range_size) !=
             KERNEL_UACCESS_STATUS_OK) {
@@ -602,18 +602,18 @@ enum kernel_syscall_status syscall_handle_socket_operation(
             destination = &address;
         }
         if (kernel_socket_is_datagram(socket)) {
-            const struct kernel_uaccess_iovec iov = {request->arguments[1], request->arguments[2]};
+            const struct kernel_uaccess_iovec iov = {request->arguments[1], range_size};
             if (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
             result = kernel_socket_write_datagram(&file, mm, &iov, 1, iov.length, flags, destination);
         } else if (kernel_files_socket_io(files, mm, &file, request->arguments[1],
-                    request->arguments[2], flags, 1, &result) != KERNEL_FILES_STATUS_OK)
+                    range_size, flags, 1, &result) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         break;
     }
     case 207: { /* recvfrom / recv */
         uint32_t flags = (uint32_t)request->arguments[3];
         if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC)) { result = -KERNEL_EOPNOTSUPP; break; }
-        const struct kernel_uaccess_iovec iov = {request->arguments[1],request->arguments[2]};
+        const struct kernel_uaccess_iovec iov = {request->arguments[1],range_size};
         uint32_t message_size = 0;
         if (kernel_files_socket_iov_io(files,mm,&file,&iov,1,iov.length,
                 flags | KERNEL_SOCKET_IO_MESSAGE,0,&peer_address,&message_size,&result) != KERNEL_FILES_STATUS_OK)

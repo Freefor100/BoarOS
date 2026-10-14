@@ -34,7 +34,7 @@ lookup 与 OFD acquire 在同一临界区完成；跨解锁消费者持实际 OF
 close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已 pin 请求的身份。
 扩容先在锁外分配并清零候选，锁内复查、最多复制 8 KiB 后发布，旧数组及竞争失败候选在锁外释放。
 open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
-共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；FD_CLOEXEC 仍属于各张表。
+共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW；未支持的 DIRECT/NOATIME 仍返回 EINVAL。FD_CLOEXEC 仍属于各张表。
 `kernel_files_enable_concurrency()`只在 CPU0、独占未发布表上接纳同 heap/allocator 匿名 pipe、tmpfs及受控ext4普通OFD。
 pipe启用前核对槽引用覆盖全部OFD引用、不同OFD覆盖全部端点，且没有域外登记或在途借用；普通fork别名、重开OFD或观察者使其返回STATE。
 普通OFD在FD raw外核对真实inode、实例预算及受控缓存；调用者必须另持CPU0控制引用，直到任务、请求及MM来源结束。
@@ -473,3 +473,7 @@ capacity现在由16×目标页大小导出，匹配原有16槽/16页owner和固�
 每页内容及关闭验证；同一LA ELF在Linux/BoarOS512MiB/1GiB均通过，
 BoarOS退出回到根页/堆/任务栈/BAR基线。入口为`make test-pipe-loongarch`，
 RV继续由files/userland的pipe、FIFO、poll、取消和引用测试保护。
+
+标量 read/write/pread/pwrite 在限长前检查原始数值范围，空范围允许 NULL 和用户地址上界，拒绝高于上界的地址；通用零长度 uaccess 不改变。
+数值拒绝发生在复制、偏移及文件时间修改之前。socket sendto/recvfrom 则沿 Linux import_ubuf 先限长再检查，实际 iovec 使用同一限长值。
+`make test-abi-boundary-riscv test-abi-boundary-loongarch TEST_MEMORIES="512M 1G"` 以同一 ELF 对照固定 Linux，检查溢出无接纳、空范围、共享 OFD 标志和消息拒绝后的队列内容。

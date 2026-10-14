@@ -29,6 +29,14 @@
 
 #define KERNEL_FILES_WRITE_STAGING 64U
 
+/* Scalar access_ok includes empty ranges; uaccess itself intentionally does not.
+ * The user limit is a legal empty range, but an address above it is not. */
+static int scalar_empty_range_fault(uint64_t address, uint64_t count)
+{
+    return count == 0U && address != 0U &&
+        kernel_user_range_check(address - 1U, 1U) != KERNEL_UACCESS_STATUS_OK;
+}
+
 /* 调用现场持OFD pin及MM/files owner；callback结束之前iov与结果地址不退栈。
  * 队列只借用这些owner，不重查fd或再复制数据。 */
 struct regular_call {
@@ -539,6 +547,11 @@ static enum kernel_files_status read_pinned(
             return KERNEL_FILES_STATUS_OK;
         }
     }
+    if (iov_count == 1U && scalar_empty_range_fault(iov[0].base, count)) {
+        KERNEL_FILES_NOTE(files, read_failures, 1);
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (count == 0U) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
@@ -856,9 +869,7 @@ static enum kernel_files_status pread_pinned(
      * but rejects higher addresses; generic uaccess deliberately skips zeros. */
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
             KERNEL_UACCESS_STATUS_OK ||
-        (count == 0U && user_buffer != 0U &&
-         kernel_user_range_check(user_buffer - 1U, 1U) !=
-             KERNEL_UACCESS_STATUS_OK)) {
+        scalar_empty_range_fault(user_buffer, count)) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
@@ -1718,12 +1729,10 @@ static void account_write(struct kernel_files *files, int64_t result)
 
 static int memory_device_empty_range_fault(
     const struct kernel_open_file_description *description,
-    uint64_t user_buffer, uint64_t count)
+    uint64_t address, uint64_t count)
 {
     return description->device && description->device->empty_range_fault &&
-           count == 0U && user_buffer != 0U &&
-           kernel_user_range_check(user_buffer - 1U, 1U) !=
-               KERNEL_UACCESS_STATUS_OK;
+        scalar_empty_range_fault(address, count);
 }
 
 enum kernel_files_status kernel_files_write(
@@ -1759,17 +1768,17 @@ enum kernel_files_status kernel_files_write(
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
-    if (count > KERNEL_FILES_MAX_RW_COUNT) {
-        count = KERNEL_FILES_MAX_RW_COUNT;
-    }
+    /* Validate the original range before clipping; rejection cannot accept data. */
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
             KERNEL_UACCESS_STATUS_OK ||
-        memory_device_empty_range_fault(description, user_buffer, count)) {
+        scalar_empty_range_fault(user_buffer, count)) {
         *linux_result = -KERNEL_EFAULT;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
+    if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
+    iov.length = count;
     if (description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description, 0, mm, &iov, 1U,
@@ -1822,15 +1831,16 @@ enum kernel_files_status kernel_files_pwrite(
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
-    if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
             KERNEL_UACCESS_STATUS_OK ||
-        memory_device_empty_range_fault(description, user_buffer, count)) {
+        scalar_empty_range_fault(user_buffer, count)) {
         *linux_result = -KERNEL_EFAULT;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
+    if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
+    iov.length = count;
     status = write_request(files, mm, description, &iov, 1U, count,
                            1, (uint64_t)offset, linux_result, 0U);
     if (status == KERNEL_FILES_STATUS_OK) account_write(files, *linux_result);

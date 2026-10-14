@@ -26,6 +26,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
   `mode.c` 比较 ctime 是否变化：镜像旧时间来自宿主，而固定 Linux 客体时钟可从 epoch 起步，不能把数值递增当作 chmod 契约。
 - `socket.c`：72 条 raw syscall 记录使用真实 loopback ioctl 握手，对照 IPv4 UDP 的 bind/getsockname、接收超时、sendto/recvfrom 数据和来源，以及 TCP 的 CLOEXEC/NONBLOCK、listen、非阻塞 connect、ppoll 就绪和 accept；还覆盖两进程握手、普通与向量 I/O、零长度 datagram、用户复制 fault、负地址长度、`F_SETFL`、混合 fd 的 ppoll/epoll 协议定时器，以及非法类型标志、协议、地址族和坏 fd/用户指针的错误顺序。端口由内核分配；只检查身份和语义，不比较随机端口。固定 Linux 参考启用 `CONFIG_NET`/`CONFIG_INET`。整合后 502 条记录双侧一致，其中 socket 72 条；原 libc-test 静态/动态 socket entry 另由真实程序套件验证。
 - `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
+- `boundaries.c`：标量原始范围/零长度、F_SETFL 保留不可变标志与 dup 可见性、socket 限长和拒绝后的消息身份；聚焦入口为 `test-abi-boundary-riscv/loongarch`，也纳入完整案例清单。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
   MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。`CONFIG_RISCV_ISA_FALLBACK=y` 允许固定 Linux 在缺少 `riscv,isa-extensions` 的旧 QEMU 设备树上读取 `riscv,isa`；较新 QEMU 仍优先使用扩展列表。程序清单的 Linux profile 保持同一设置，保证参考侧能使用其实际提供的浮点指令。

@@ -370,3 +370,12 @@ BoarOS 原先可读宿主预制的 null/zero/console inode，但没有 mknodat �
 派发；此阶段只增加创建入口，通用设备后端、块节点和命名管道仍有独立依赖。
 
 `make test-vfs-riscv test-files-riscv test-lwext4-recovery-host test-sqlite-rollback-riscv test-sqlite-wal-riscv test-sqlite-recovery-riscv` 已通过，覆盖 ext4 既有断电/恢复、SQLite DELETE/WAL 多进程及 EXTRA/FULL 错误恢复。
+
+## 标量文件与 socket 的长度导入
+
+固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
+`fs/read_write.c::vfs_read/vfs_write` 先 access_ok 原始 count，再裁剪 MAX_RW_COUNT；
+`lib/iov_iter.c::import_ubuf` 为 socket 先裁剪再检查。统一成同一种顺序会改变错误优先级，甚至让溢出写入接纳一页并修改文件。
+零长度 access_ok 仍检查地址上界，这与不访问任何字节的通用 copy helper 是两个契约。
+`fs/fcntl.c::setfl` 只更新可变状态，F_GETFL 中的同步/目录标志不是非法输入；忽略不可变位不表示已支持 DIRECT 等新模式。
+双架构边界差分保护返回值、文件尺寸/偏移/时间及拒绝后消息的身份，不能只检查 errno。

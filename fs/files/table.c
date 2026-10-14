@@ -1115,7 +1115,9 @@ enum kernel_files_status kernel_files_fcntl(
     }
     case KERNEL_FILES_F_GETFL: *result=kernel_open_file_flags(source); break;
     case KERNEL_FILES_F_SETFL:
-        if (argument & ~(LINUX_O_ACCMODE | LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_LARGEFILE))
+        /* Immutable/open-only bits are ignored, not rejected. Direct I/O and
+         * no-atime remain unsupported mutable modes, as at open. */
+        if (argument & (00040000U | 01000000U))
             *result=-KERNEL_EINVAL;
         else { kernel_open_file_set_status_flags(source, (uint32_t)argument); *result=0; }
         break;

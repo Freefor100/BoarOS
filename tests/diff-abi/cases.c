@@ -204,7 +204,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_SCHED_HANDOFF_ONLY
+#ifdef ABI_BOUNDARY_ONLY
+    abi_boundary_cases();
+#elif defined(ABI_SCHED_HANDOFF_ONLY)
     abi_sched_handoff_cases();
 #elif defined(ABI_SYNC_ONLY)
     abi_sync_cases();
@@ -249,6 +251,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_sched_stat_cases();
     abi_shm_cases();
     abi_environment_cases();
+    abi_boundary_cases();
 #endif
 #endif
     text("ABI END "); number(records); flush();
