@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c
+DIFF_ABI_SOURCES := tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -71,3 +71,32 @@ test-abi-boundary-riscv: $(KERNEL_RV) build/diff-abi/boundary-rv
 	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/boundary-rv --case-manifest tests/diff-abi/boundary-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/abi-boundary-rv
 test-abi-boundary-loongarch: kernel-la build/loongarch/boundary-la prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/boundary-la --case-manifest tests/diff-abi/boundary-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/abi-boundary-la
+
+build/diff-abi/exec-boundary-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_EXEC_BOUNDARY_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/exec-boundary-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_EXEC_BOUNDARY_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+build/diff-abi/stack-rv-rwx: STACK_FLAGS := 7
+build/diff-abi/stack-rv-rw: STACK_FLAGS := 6
+build/diff-abi/stack-rv-absent: STACK_LD := tests/riscv/user_elf.ld
+build/diff-abi/stack-rv-rwx build/diff-abi/stack-rv-rw: STACK_LD := tests/diff-abi/stack.ld
+build/diff-abi/stack-rv-rwx build/diff-abi/stack-rv-rw build/diff-abi/stack-rv-absent: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/stack.ld tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_STACK_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,$(STACK_LD) -Wl,--defsym=STACK_FLAGS=$(or $(STACK_FLAGS),0) -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/stack-la-rwx: STACK_FLAGS := 7
+build/loongarch/stack-la-rw: STACK_FLAGS := 6
+build/loongarch/stack-la-absent: STACK_LD := tests/common/user.ld
+build/loongarch/stack-la-rwx build/loongarch/stack-la-rw: STACK_LD := tests/diff-abi/stack.ld
+build/loongarch/stack-la-rwx build/loongarch/stack-la-rw build/loongarch/stack-la-absent: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/stack.ld tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_STACK_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,$(STACK_LD) -Wl,--defsym=STACK_FLAGS=$(or $(STACK_FLAGS),0) -o $@ $(DIFF_ABI_SOURCES)
+.PHONY: test-elf-boundary-riscv test-elf-boundary-loongarch
+test-elf-boundary-riscv: $(KERNEL_RV) build/diff-abi/exec-boundary-rv build/diff-abi/stack-rv-rwx build/diff-abi/stack-rv-rw build/diff-abi/stack-rv-absent
+	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/exec-boundary-rv --case-manifest tests/diff-abi/exec-boundary-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/exec-boundary-rv
+	@for mode in rwx rw absent; do python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/stack-rv-$$mode --case-manifest tests/diff-abi/stack-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/stack-elf-rv-$$mode || exit $$?; done
+test-elf-boundary-loongarch: kernel-la build/loongarch/exec-boundary-la build/loongarch/stack-la-rwx build/loongarch/stack-la-rw build/loongarch/stack-la-absent prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/exec-boundary-la --case-manifest tests/diff-abi/exec-boundary-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/exec-boundary-la
+	@for mode in rwx rw absent; do python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/stack-la-$$mode --case-manifest tests/diff-abi/stack-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/stack-elf-la-$$mode || exit $$?; done

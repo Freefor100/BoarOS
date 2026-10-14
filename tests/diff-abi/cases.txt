@@ -1,3 +1,6 @@
+boundary.exec-stack-limit
+boundary.exec-failure-preserves
+
 path.open
 path.getfl
 path.getfd

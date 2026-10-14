@@ -53,7 +53,7 @@ run 边界同时包含每个装载段的首个完整页、最后一个完整文�
 - PIE `ET_DYN`，带 `PT_INTERP`；
 - 无解释器的 `ET_DYN`。
 
-主程序和解释器各由 exec 事务持有一个 source；解释器不能递归含 `PT_INTERP`。`PT_DYNAMIC`、`PT_TLS`、GNU RELRO/STACK 等信息保留在 source 中，供动态链接器读取；内核本身当前不执行重定位、加载额外 DSO 或分配 TLS。主文件格式/架构错误返回 `ENOEXEC`；解释器缺失保留路径错误，解释器短header返回 `EIO`，完整header的格式或架构错误返回 `ELIBBAD`。
+主程序和解释器各由 exec 事务持有一个 source；解释器不能递归含 `PT_INTERP`。`PT_DYNAMIC`、`PT_TLS`、GNU RELRO 等信息保留在 source 中，供动态链接器读取；主 ELF 最后一个 `PT_GNU_STACK` 的 PF_X 决定整个栈 VMA 及初始页的执行许可，解释器不覆盖，缺标记或非执行标记保持 NX；内核本身当前不执行重定位、加载额外 DSO 或分配 TLS。主文件格式/架构错误返回 `ENOEXEC`；解释器缺失保留路径错误，解释器短header返回 `EIO`，完整header的格式或架构错误返回 `ELIBBAD`。
 
 每个 source 的 `PT_LOAD` run 映射成 `ELF_PRIVATE` VMA，VMA 的 `backing_offset` 是 source-relative 起点，故障策略为 `ELF`。单个同时要求写与执行的装载段按 RWE 映射；共享文件页写入时仍先 COW，重叠装载段仍不得共享同一虚拟字节或形成跨段的写执行页。完整文件页共享 page cache，写入时 COW；复合页和 BSS 私有化。VMA 与 MM 各保留 source 引用：重复映射不会累积历史引用，fork 的子 MM 取得独立引用，最后一个相关 VMA 消失后释放。每次新建可执行页后先做架构地址转换失效并执行取指同步，覆盖先读后取指的路径。
 
@@ -63,7 +63,7 @@ run 边界同时包含每个装载段的首个完整页、最后一个完整文�
 
 DTB `/chosen/rng-seed` 至少 32 字节时，`kernel/random.c` 混入该材料并以 ChaCha20 产生独立布局值和 16 字节 `AT_RANDOM`；这只是兼容早期 exec 的不安全降级，DTB 材料不构成可信熵、不使 RNG ready。`kernel_random_available()` 仅表示已有材料；`kernel_random_ready()` 才表示累计取得至少 32 字节可信 VirtIO RNG 输入。既无 DTB 材料也无设备输入时仍启动，沿用确定性旧布局并省略 `AT_RANDOM`。可信源就绪后的输出使用同一状态并保留 ready，设备后续失败不撤回初始化状态。RISC-V 布局独立随机化 PIE/解释器 bias、mmap top-down base、8 MiB 栈 reserve 顶端、brk 起点和 vDSO 页，并逐项检查对齐、Sv39 上界和 VMA 冲突；无合法空洞返回 `ENOMEM`。
 
-栈 VMA 保留 8 MiB，底部 guard 页永不映射；exec 使用线程组当前 `RLIMIT_STACK` 软限制约束初始栈和提交页，按 4 KiB 页粒度计算可提交范围，但不永久缩小 VMA，因此后续调高限额仍能扩展栈。初次只提交覆盖序列化参数和最多 64 KiB headroom 的 RW/NX 页，其余页由匿名 demand-zero fault 提交；参数无法放进软限制时返回 `E2BIG` 并保持旧映像。入口栈按 psABI 16 字节对齐，依次包含 `argc`、`argv[]`、`envp[]`、auxv 和字符串。当前 auxv 提供真实 `AT_PAGESZ`、`AT_PHDR/AT_PHENT/AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_HWCAP=IMAFDC`、`AT_CLKTCK`、固定 root UID/GID、`AT_SECURE=0`、可用时的 `AT_RANDOM`、`AT_EXECFN` 和 `AT_NULL`。
+栈 VMA 保留 8 MiB，底部 guard 页永不映射；exec 使用线程组当前 `RLIMIT_STACK` 软限制约束初始栈和提交页，按 4 KiB 页粒度计算可提交范围，但不永久缩小 VMA，因此后续调高限额仍能扩展栈。初次只提交覆盖序列化参数和最多 64 KiB headroom 的 RW 页（执行许可随 GNU_STACK），其余页由匿名 demand-zero fault 提交；有效字符串连同指针表、auxv、execfn、随机字节和对齐无法放进 128 KiB 镜像或软限制时返回 `E2BIG` 并保持旧映像。入口栈按 psABI 16 字节对齐，依次包含 `argc`、`argv[]`、`envp[]`、auxv 和字符串。当前 auxv 提供真实 `AT_PAGESZ`、`AT_PHDR/AT_PHENT/AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_HWCAP=IMAFDC`、`AT_CLKTCK`、固定 root UID/GID、`AT_SECURE=0`、可用时的 `AT_RANDOM`、`AT_EXECFN` 和 `AT_NULL`。
 
 映像建立完成后，MM 记录 source-backed VMA、每 MM 的 mmap ceiling、vDSO 地址和从最高 `PT_LOAD` 内存末端得到的 brk 起点。scheduler 在提交点允许入口页尚未驻留，只要求它属于可执行 VMA；第一次取指由专用 ELF fault backing 完成。
 
@@ -72,6 +72,7 @@ DTB `/chosen/rng-seed` 至少 32 字节时，`kernel/random.c` 混入该材料�
 source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创建期 source/OFD，MM 持有 VMA 所需 source 引用，提交成功后事务释放临时 owner。任何失败都先保留原 MM；新 MM 的合法页表/堆释放完成即结束，只有 source/OFD 的真实 VFS/I/O 清理错误进入持久 owner，不能返回“已清理”而丢失资源。
 
 ```sh
+make test-elf-boundary-riscv test-elf-boundary-loongarch TEST_MEMORIES="512M 1G"
 make test-elf64-riscv
 make test-elf-rwx-riscv
 make test-elf-tail-riscv

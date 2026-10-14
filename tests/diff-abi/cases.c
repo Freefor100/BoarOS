@@ -204,13 +204,20 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_BOUNDARY_ONLY
+#ifdef ABI_STACK_ONLY
+    abi_stack_boundary_cases();
+#elif defined(ABI_EXEC_BOUNDARY_ONLY)
+    abi_exec_boundary_cases();
+#elif defined(ABI_BOUNDARY_ONLY)
     abi_boundary_cases();
 #elif defined(ABI_SCHED_HANDOFF_ONLY)
     abi_sched_handoff_cases();
 #elif defined(ABI_SYNC_ONLY)
     abi_sync_cases();
 #else
+#ifndef ABI_PATH_ONLY
+    abi_exec_boundary_cases();
+#endif
     abi_path_only_cases();
     abi_path_truncate_cases();
 #ifndef ABI_PATH_ONLY

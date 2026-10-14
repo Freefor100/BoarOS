@@ -101,6 +101,14 @@ jobs:
             build/sched-handoff-*/*.json
             build/sched-handoff-*/*.normalized
             build/sched-handoff-*/*.diff
+            build/exec-boundary-*/*.log
+            build/exec-boundary-*/*.json
+            build/exec-boundary-*/*.normalized
+            build/exec-boundary-*/*.diff
+            build/stack-elf-*/*.log
+            build/stack-elf-*/*.json
+            build/stack-elf-*/*.normalized
+            build/stack-elf-*/*.diff
             build/elf-tail-riscv/**/suite.json
             build/elf-tail-riscv/**/result.json
             build/elf-tail-riscv/**/*.log
@@ -119,6 +127,8 @@ jobs:
             build/riscv*-smp-test/runs/**/*.img
             build/diff-abi/run/*.img
             build/sched-handoff-*/*.img
+            build/exec-boundary-*/*.img
+            build/stack-elf-*/*.img
             build/io-sleep-run.*/root.img
             build/multi-disk-io.*/*.img
             build/elf-tail-riscv/**/*.img

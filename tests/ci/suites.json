@@ -37,7 +37,7 @@
       {"name":"storage-concurrency","targets":["test-io-sleep-riscv"]},
       {"name":"multi-disk-isolation","targets":["test-multi-disk-io-riscv"]},
       {"name":"user-runtime","targets":["test-userland-riscv"]},
-      {"name":"abi","targets":["test-diff-abi-riscv"]},
+      {"name":"abi","targets":["test-diff-abi-riscv","test-elf-boundary-riscv"]},
       {"name":"elf-tail","targets":["test-elf-tail-riscv"]},
       {"name":"stack-report","targets":["test-stack-usage"]}
     ],
@@ -48,7 +48,7 @@
       {"name":"cpu-state","targets":["test-sync-loongarch","test-wait-loongarch","test-scheduler-handoff-loongarch","test-sched-lifecycle-loongarch","test-fpu-loongarch","test-simd-loongarch"]},
       {"name":"dynamic-exec","targets":["test-dynamic-loongarch","test-exec-errors-loongarch"]},
       {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch","test-root-checksum-loongarch","test-root-io-loongarch"]},
-      {"name":"abi","targets":["test-diff-abi-loongarch"]},
+      {"name":"abi","targets":["test-diff-abi-loongarch","test-elf-boundary-loongarch"]},
       {"name":"stack-report","targets":["test-stack-usage-la"]}
     ]
   },

@@ -46,6 +46,8 @@ void abi_require_at(int condition, const char *file, unsigned line);
 #define abi_require(condition) abi_require_at((condition), __FILE__, __LINE__)
 void abi_exit(long code) __attribute__((noreturn));
 void abi_boundary_cases(void);
+void abi_exec_boundary_cases(void);
+void abi_stack_boundary_cases(void);
 void abi_mknod_cases(void);
 void abi_proc_cases(void);
 void abi_tmpfs_cases(void);

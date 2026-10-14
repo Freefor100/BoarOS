@@ -164,6 +164,12 @@ class ArchitectureCoverage(unittest.TestCase):
                 self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in ordinary), actual)
             actual = f'build/sched-handoff-{arch}/boaros-1G.img'
             self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in failed), actual)
+        for directory in ('exec-boundary-rv', 'exec-boundary-la', 'stack-elf-rv-rwx', 'stack-elf-la-rw', 'stack-elf-la-absent'):
+            for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
+                actual = f'build/{directory}/{name}'
+                self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in ordinary), actual)
+            actual = f'build/{directory}/boaros-1G.img'
+            self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in failed), actual)
 
     def test_shared_runtime_consumers_include_glibc_and_both_sqlite_modes(self):
         for arch in ('riscv', 'loongarch'):
