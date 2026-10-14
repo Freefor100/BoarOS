@@ -26,7 +26,7 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 | 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
 2026-10-13 本地组合核对：RV/LA在512MiB、1GiB下的BoarOS各完成 **229 项原程序**；RV及LA 1GiB的同ELF联合对照全部通过。LA 512MiB原清单有一项固定Linux `du` 遍历动态`/proc`失败，BoarOS该项成功，独立单项对照通过；首轮仍记参考失败，详见[程序基线](docs/learning/user-program-inventory.md)。
-两侧各 **1397 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
+两侧各 **1400 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
 具体输入与适用范围见[程序基线](docs/learning/user-program-inventory.md)和
 [调度组合核对](docs/learning/threads-and-futex.md#调度域身份发布与退休存储)。
 这些结果限定于上述平台和案例；LA客体原生开发、更多断电/组合矩阵、实板与普通用户/一般文件及外部后备多核仍需独立验收。

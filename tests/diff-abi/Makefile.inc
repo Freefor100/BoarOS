@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c
+DIFF_ABI_SOURCES := tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -112,3 +112,15 @@ test-fault-count-riscv: $(KERNEL_RV) build/diff-abi/fault-count-rv
 	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/fault-count-rv --case-manifest tests/diff-abi/fault-count-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/fault-count-rv
 test-fault-count-loongarch: kernel-la build/loongarch/fault-count-la prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/fault-count-la --case-manifest tests/diff-abi/fault-count-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/fault-count-la
+
+build/diff-abi/sigreturn-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) -march=rv64gc -mabi=lp64d -DABI_SIGRETURN_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/sigreturn-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_SIGRETURN_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+.PHONY: test-sigreturn-boundary-riscv test-sigreturn-boundary-loongarch
+test-sigreturn-boundary-riscv: $(KERNEL_RV) build/diff-abi/sigreturn-rv
+	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/sigreturn-rv --case-manifest tests/diff-abi/sigreturn-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/sigreturn-boundary-rv
+test-sigreturn-boundary-loongarch: kernel-la build/loongarch/sigreturn-la prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/sigreturn-la --case-manifest tests/diff-abi/sigreturn-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/sigreturn-boundary-la

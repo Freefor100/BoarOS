@@ -156,3 +156,6 @@ QEMU 可以验证语义和结构成本，但不能替代 VisionFive 2 上的 cyc
 当前实现接口、不变量与测试入口见[内核调度与进程生命周期模块](../modules/kernel-scheduler.md)、[内核 MM 模块](../modules/kernel-mm.md)和[进程文件资源模块](../modules/kernel-files.md)。
 
 同步用户故障与 syscall 用户复制失败是两条契约。前者保留故障 PC，经线程故障记录与统一 signal frame 交付，handler 可修复页后重试或修改 ucontext；后者保持 EFAULT，不发送 SEGV。固定本地 `references/linux/kernel/signal.c::force_sig_info_to_task`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）将被阻塞/忽略的致命同步信号恢复默认并解除阻塞，避免反复执行同一 fault 指令。用户测试中由 handler 异步读取的控制变量须 volatile，否则编译器可将修复模式写入移到故障指令之后，错误地把内核正常重试判成未恢复。`make test-userland-riscv test-diff-abi-riscv` 提供 musl 恢复/组退出与固定 Linux siginfo 对照。
+
+信号交付的栈对齐与 sigreturn 的用户输入检查是不同契约。固定 `references/linux/arch/riscv/kernel/signal.c::rt_sigreturn`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）检查范围和恢复字段，不因 SP 偏移8字节拒绝帧。
+RV/LA 差分移动真实内核交付帧再执行 syscall139，检查继续点、mask 与 RV FPU/FCSR；不可读帧仍终止，不放宽不支持扩展或特权寄存器来源。

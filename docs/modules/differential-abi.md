@@ -1,4 +1,4 @@
-# RISC-V Linux differential ABI
+# Linux 双架构 ABI 对照
 
 `make test-diff-abi-riscv` 将同一个无 libc raw-syscall ELF `/init` 分别交给
 Linux 与 BoarOS 生产内核。两次 QEMU system 均为 `virt`、一个 hart、512 MiB，
@@ -7,6 +7,11 @@ Linux 与 BoarOS 生产内核。两次 QEMU system 均为 `virt`、一个 hart�
 版本由 `references/sources.tsv` 的唯一 Linux 项提供；没有写死 reference 输出。
 Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于被忽略的
 `build/diff-abi/`，不复制 Linux 源码进入 BoarOS。
+
+当前完整清单为两侧各 **1400 条**，同 ELF 的 Linux/BoarOS 对照在 512 MiB、1 GiB 通过。
+其中 `exec_boundaries.c`、`fault_count.c`、`sigreturn.c` 和 `boundaries.c` 保护参数容量失败原子性、tmpfs 成功/失败缺页记账、真实偏移恢复帧及 I/O 输入顺序。
+`test-elf-boundary-riscv/loongarch` 另用显式 GNU_STACK RWE、RW 和无标记的三个 ELF 检查初始/扩展栈执行，不计入1400条。
+历史小清单结果保持其当时身份，不替代当前验证。
 
 ## 入口与契约
 

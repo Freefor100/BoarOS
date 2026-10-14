@@ -1,3 +1,7 @@
+boundary.sigreturn-aligned
+boundary.sigreturn-offset8
+boundary.sigreturn-unreadable
+
 boundary.exec-stack-limit
 boundary.exec-failure-preserves
 boundary.tmpfs-shared-minflt
