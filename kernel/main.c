@@ -53,6 +53,11 @@ void riscv_smp_test_root_finish(void);
 #endif
 #endif
 static struct riscv_root_boot root_boot;
+#if BOAROS_USER_SMP_COMPOSITION
+void riscv_user_composition_start(struct riscv_root_boot *,struct physical_page_allocator *);
+void riscv_user_composition_finish(void);
+void riscv_user_composition_report(void);
+#endif
 static struct dtb_irq_info boot_irq;
 static struct dtb_boot_info boot_info;
 static struct boot_memory_layout boot_layout;
@@ -696,6 +701,9 @@ static void storage_cleanup_worker(void *argument)
         int users_pending = init_reaped && kernel_scheduler_stop_users();
         arch_interrupt_restore(interrupt_status);
         if (init_reaped && !users_pending) {
+#if BOAROS_USER_SMP_COMPOSITION
+            riscv_user_composition_finish();
+#endif
 #if BOAROS_MAX_CPUS > 1
 #if BOAROS_SMP_TEST
             riscv_smp_test_root_finish();
@@ -736,6 +744,9 @@ static void storage_cleanup_worker(void *argument)
             }
 #if BOAROS_USER_SMP
             /* UART worker已排空/停止，避免延后用户stdout插入统计记录。 */
+#if BOAROS_USER_SMP_COMPOSITION
+            riscv_user_composition_report();
+#endif
             riscv_smp_report_user_execution();
 #endif
             struct kernel_stack_statistics stack_statistics;
@@ -1004,6 +1015,10 @@ static void kernel_main_high(void)
     riscv_smp_start(&boot_cpus, (UINT64_C(8) << 60) |
                     (transition_page_table.root_address >> 12),
                     riscv_sv39_current_satp(), boot_info.timebase_frequency);
+#if BOAROS_USER_SMP_COMPOSITION
+    if (!root_started) __builtin_trap();
+    riscv_user_composition_start(&root_boot,&page_allocator);
+#endif
 #if BOAROS_SMP_TEST
 #if BOAROS_MM_DISK_TEST
     if (!root_started || root_boot.device_count<2) __builtin_trap();
@@ -1012,12 +1027,7 @@ static void kernel_main_high(void)
     riscv_smp_test_start(&page_allocator, root_started);
 #endif
 #endif
-    timer_status = riscv_timer_start(boot_info.timebase_frequency,
-                                     KERNEL_TICKS_PER_SECOND);
-    if (timer_status != RISCV_TIMER_STATUS_OK) {
-        shutdown_for_timer_error(timer_status);
-    }
-
+    /* timer_start开启IRQ后用户任务和UART worker即可运行，先完成启动记录。 */
     virt_uart_puts("BoarOS: timer frequency=");
     virt_uart_put_hex((unsigned long)boot_info.timebase_frequency);
     virt_uart_puts(" tick-hz=");
@@ -1026,6 +1036,12 @@ static void kernel_main_high(void)
     virt_uart_put_hex((unsigned long)(boot_info.timebase_frequency /
                                       KERNEL_TICKS_PER_SECOND));
     virt_uart_putc('\n');
+
+    timer_status = riscv_timer_start(boot_info.timebase_frequency,
+                                     KERNEL_TICKS_PER_SECOND);
+    if (timer_status != RISCV_TIMER_STATUS_OK) {
+        shutdown_for_timer_error(timer_status);
+    }
 
     for (;;) {
         uintptr_t irq = arch_interrupt_save();

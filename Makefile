@@ -23,6 +23,16 @@ TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 COST_DIAGNOSTICS ?= 0
 SMP ?= 0
 USER_SMP ?= 0
+USER_SMP_BUILD ?= build/riscv-user-smp
+USER_SMP_COMPOSITION ?= 0
+ifneq ($(filter $(USER_SMP_COMPOSITION),0 1),$(USER_SMP_COMPOSITION))
+$(error USER_SMP_COMPOSITION must be 0 or 1)
+endif
+ifeq ($(USER_SMP_COMPOSITION),1)
+ifneq ($(SMP)$(USER_SMP),11)
+$(error USER_SMP_COMPOSITION requires SMP=1 USER_SMP=1)
+endif
+endif
 ifneq ($(filter $(USER_SMP),0 1),$(USER_SMP))
 $(error USER_SMP must be 0 or 1)
 endif
@@ -167,8 +177,8 @@ BUILD_DIR := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
 KERNEL_RV := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
 endif
 ifeq ($(USER_SMP),1)
-BUILD_DIR := build/riscv-user-smp/riscv
-KERNEL_RV := build/riscv-user-smp/kernel-rv
+BUILD_DIR := $(USER_SMP_BUILD)/riscv
+KERNEL_RV := $(USER_SMP_BUILD)/kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -223,6 +233,7 @@ CPPFLAGS := -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAG
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
 CPPFLAGS += -DBOAROS_MAX_CPUS=$(CPU_CAPACITY)
 CPPFLAGS += -DBOAROS_USER_SMP=$(USER_SMP)
+CPPFLAGS += -DBOAROS_USER_SMP_COMPOSITION=$(USER_SMP_COMPOSITION)
 CPPFLAGS += -DBOAROS_SMP_TEST=$(SMP_TEST) -DBOAROS_MM_DISK_TEST=$(MM_DISK_SMP_TEST)
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
@@ -413,6 +424,10 @@ endif
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+ifeq ($(USER_SMP_COMPOSITION),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
+LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_get_page,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output
+endif
 ifeq ($(SMP_TEST),1)
 ifeq ($(MM_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/mm_smp.o $(BUILD_DIR)/tests/riscv/mm_smp_probe.o
@@ -2317,6 +2332,15 @@ test-user-smp-riscv: $(USER_SMP_ELF) $(USER_SMP_DYNAMIC_ELF) $(PTHREAD_TLS_DSO_R
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
 .PHONY: test-user-smp-runtime-riscv
 .PHONY: test-user-smp-programs-riscv
+.PHONY: test-user-smp-composition-host test-user-smp-composition-riscv
+COMPOSITION_ELF := build/riscv-user-smp-composition/composition-rv
+$(COMPOSITION_ELF): tests/userland/user_smp_composition.c tests/smp/composition_protocol.h $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp_composition.c
+test-user-smp-composition-host:
+	python3 -B tests/smp/test_composition.py
+test-user-smp-composition-riscv: $(COMPOSITION_ELF) $(SQLITE_ROLLBACK_RV) $(SQLITE_WAL_RV) $(SQLITE_CLI_INIT_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(MUSL_LDSO) test-user-smp-composition-host
+	python3 -B tests/smp/composition.py --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --program $(COMPOSITION_ELF) $(TEST_MEMORY_ARGS)
 test-user-smp-programs-riscv: test-program-inventory-host
 	$(MAKE) kernel-rv-user-smp
 	python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --reuse-builds $(TEST_MEMORY_ARGS)

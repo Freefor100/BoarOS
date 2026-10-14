@@ -113,3 +113,35 @@ RV PLIC的dispatching由CPU0派发器独占。原查询直接返回全局值，�
 受控kernel FPU探针不能留下没有任务权威图像的Clean状态。`riscv_fpu_state_restore()`以Clean结束，生产恢复使用任务自有图像并处于切换保护；探针却恢复局部expected后才单独标Dirty，间隙timer可以运行同核伙伴。强制tick在该处复现了另一任务的完整寄存器图案；探针现以IRQ保护包住恢复与Dirty发布，`test-smp-fpu-setup-riscv`封存独立核并保护8个实际owner，所有32寄存器/FCSR比较继续执行。用户态FP指令的硬件Dirty更新与本测试手工发布不同。最初guard启动仅有`preempt-FD`阶段、没有实际寄存器值，不能仅凭后续通过唯一归因；其原核与失败现场保留，新增反例明确证明并修复这一初始化缺陷。
 
 FIFO的非阻塞窗口须先区分真实睡眠。动态musl首次fork返回/时钟库代码在BoarOS冷ELF缺页路径会等待CPU0 I/O；服务跟踪确认cause=instruction-page-fault并提交真实阻塞，释放实时资格合法。原生策略案例先预热fork返回、时钟与syscall代码，再校验无主动yield的getpid窗口；真正waitpid阻塞另测，不把cold fault解释成非阻塞调度错误。预热后的同ELF在旧核仍能检出FIFO资格缺陷，动态Musl及其原TLS DSO以独立同ELF profile对照，原static/pthread consumer的BoarOS集成不冒充Linux差分。
+
+## 用户态原程序与生命周期组合（2026-10-14）
+
+用户SMP原程序在独立Linux SMP profile下重跑原229项，四个profile（512MiB/1GiB × 2/1 CPU）各229项全部通过。固定输入是Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，配置文件`tests/smp/linux-user.config` SHA-256 `dac55880b20f0091d1cfd4d86ee619456a1cdcc7177e8611030f107bf36c9516`；本地冻结USER_SMP内核SHA-256 `9fe57b5d6f806f944b455b16abc9b139643ce2539ff0e1dba29bb9a8315fde04`。四个profile逐项报告都标为complete；严格入口为：
+
+```sh
+python3 -B tests/program-inventory/run.py --arch riscv --execution-profile rv-user-smp \
+  --cpus 2 --cpus 1 --memory 512M --memory 1G \
+  --firmware build/data-path-baselines/sync-b3/firmware.bin \
+  --reuse-builds --require-pass --output build/user-smp-programs-run
+```
+
+同一USER_SMP核的静态与动态musl原生用例各在Linux/BoarOS、1/2 CPU、512MiB/1GiB通过；1400条ABI manifest、原static/pthread/TLS consumer和glibc 2.44五种形态在同一矩阵通过。默认单核program inventory先前的RV 512MiB `du`/动态`/proc`参考失败仍留在其原记录中；独立Linux SMP配置的229 pass不回写为单核参考结果。
+
+有限组合用同一静态ELF（SHA-256 `260aac9ad6941ac3b2be05e07b379c326e49491b51eaff4bdc2db885b0cb1232`）完成60次本地QEMU11.1.2启动，四个CPU/RAM profile各15次：共享MM/文件映射及回收、匿名/文件首缺页竞争、1/8/32 pipe/futex等待与退出、SQLite DELETE/WAL及各自独立重启。Linux和未施加压力的BoarOS运行共同功能；另20次BoarOS受控构建持有真实分配页账本并检查退出归还。四次MM压力运行均记录页数`held==released`、一次真实页缓存回收、一次目标OOM、一次退休同步暂停和123个PREPARED等待登记，最终ledger/control均为0。远端目标计数核对为：双CPU两配置`remote-retirement=1`，单CPU两配置为0；不能把单CPU本地SFENCE暂停称为RFENCE。60项均退出0、无超时；独立e2fsck与SQLite读回通过。pressure/OOM/退休暂停只用于BoarOS内核test build，Linux只承担同ELF可观察行为对照。
+
+首缺页组合捕获了两个用户SMP MM边界。匿名情形下，两个线程对未驻留的`MAP_SHARED|MAP_ANONYMOUS`页同时写，测试等到第二个resolver已提交可写PTE后再恢复第一个硬件fault；旧路径看到权限满足却返回`ADDRESS_SPACE`并触发S-mode fatal。文件情形下，第一个`MAP_SHARED`文件读fault取得页引用后在inode读保护内yield，第二个reader提交同一PTE后，第一个的页后检查设`retry=1`，再次进入resolver时`resumed=1`。旧实现对这次present-PTE又发RFENCE。把测试候选暂时恢复旧条件，红灯为`arrivals=2, retries=1, resumed=1, resolved=2, syncs=2`；修复后只保留发布者的页同步，重试者重新进入用户态时的MM激活负责本地刷新。非远端MM的原`resumed`本地刷新保留，VMA/PTE权限不足仍走原拒绝/COW路径。固定Linux `references/linux/mm/memory.c`的`fix_spurious_fault()`用于核对并发语义；最终2/1 CPU和512MiB/1GiB四配置都分别验证匿名及文件竞争`syncs=1`，全60次应用组合通过。两个内核resolver仍按CPU0服务协议串行，不能据此声称页表由两个CPU并行修改。
+
+原冻结核`4025198ea029fd90341579958b674c1d11789ec958b8bbc8047e27512dc9020a`的四格矩阵完成914项pass、2项protocol-error。失败是512MiB/1CPU的`libc.dynamic.printf_fmt_g_round`和1GiB/2CPU的`libc.static.string_memset`；两例程序wait状态均为0且根退出完成，但`riscv_timer_start()`开启IRQ后才打印的timer横幅插进了`SUITE ENV`行。原输出保留失败身份，不能因退出0补记通过。强制交错在横幅写出前缀后让UART实际接纳用户输出，复现`timer frequency=COMPOSITION CASE…`，内容及owner仍完整但启动记录校验失败。当前先完成横幅再开启timer IRQ，同一反例通过；parser没有放宽损坏记录的规则。
+
+同一12案例ELF及60次组合在Ubuntu24.04容器、QEMU8.2.2最终同步修正和启动修正下重新全部通过，文件`resumed`重试及实际远端目标计数均与1/2 CPU profile相符。该环境与本地QEMU分列：完整工具容器镜像`sha256:e1c808712f62cb15e4e203c8facf9a8c1767ed601b0cd2349f4a778c562d89d0`；QEMU二进制SHA-256 `49b77f94862a9ae0e6e31d031a31cce9a668d647b5e827d706bf1e9951e96710`，报告版本`8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)`；kernel compiler为`riscv64-unknown-elf-gcc 13.2.0-11ubuntu1+12`，SHA-256 `8c7a8599f3e56e6abe23d4d54025f77ad03efd4113394eac16f1d6060b626974`；测试firmware仍为QEMU参考OpenSBI字节，SHA-256 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。容器profile Linux config hash为`925564bf8d751433ea3d7c18e848bb99a8588470f1af0d150b53c48d409eb428`，由不同host compiler产生的Linux产物身份单独记录，不能混进本地11.1.2同一次报告。只含交叉工具链的基底镜像`sha256:a5527d29952a18e962815ab3eea8a46448bbaee8d2a83da20d150c384f33a698`缺少`flex`，该次准备失败未启动QEMU；完整镜像的flex/bison/bc身份与封存Linux cache匹配。报告与运行镜像核对后按既有清理规则删除，保留可复用构建、容器和reference缓存；这些不是托管CI结果。
+
+使用已保留的完整工具镜像，可在仓库根目录复建同一容器组合：
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:$PWD" -w "$PWD" \
+  sha256:e1c808712f62cb15e4e203c8facf9a8c1767ed601b0cd2349f4a778c562d89d0 \
+  python3 -B tests/smp/composition.py --qemu /usr/bin/qemu-system-riscv64 \
+  --firmware build/data-path-baselines/sync-b3/firmware.bin \
+  --build-root build/riscv-user-smp-composition/ubuntu2404 \
+  --output build/user-smp-composition-container-run
+```

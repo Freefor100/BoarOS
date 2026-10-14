@@ -48,14 +48,14 @@ def validate_execution(text,cpus,boaros,require_parallel=False):
         if cpus==2 and int(samples[1][4],16):
             raise RuntimeError('CPU1 dispatched legacy kernel business')
 
-def boot_user(qemu,firmware,kernel,disk,memory,cpus,folder,linux=False):
+def boot_user(qemu,firmware,kernel,disk,memory,cpus,folder,linux=False,direct_init='/init'):
     command=harness.PROFILES['riscv'].boot(qemu,kernel,memory)
     command+=['-net','none','-global','virtio-mmio.force-legacy=false',
         '-object','rng-random,id=entropy,filename=/dev/urandom',
         '-device','virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.5',
         '-drive',f'file={disk},if=none,format=raw,cache=writeback,id=root',
         '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
-    if linux:command+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
+    if linux:command+=['-append',f'root=/dev/vda rw rootwait console=ttyS0 init={direct_init} loglevel=0 panic=-1']
     env=dict(os.environ,BOAROS_USER_SMP='1',BOAROS_SMP_QEMU=qemu,
         BOAROS_SMP_CPUS=str(cpus),BOAROS_SMP_FIRMWARE=firmware,BOAROS_SMP_OUTPUT=str(folder))
     launch=[sys.executable,str(Path(__file__).with_name('qemu.py')),*command[1:]]

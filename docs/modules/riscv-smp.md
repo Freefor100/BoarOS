@@ -23,10 +23,34 @@ make kernel-rv-user-smp
 make test-user-smp-host
 make test-user-smp-riscv INIT_CONFIG=config/init.json
 make test-user-smp-runtime-riscv INIT_CONFIG=config/init.json
+make test-user-smp-programs-riscv
+make test-user-smp-composition-host test-user-smp-composition-riscv
 make run-user-smp-riscv
 ```
 
 2026-10-14的同ELF原生验证使用`tests/smp/linux-user.config`，固定Linux commit不变但单独启用SMP并生成配置哈希/缓存。MTTCG两核及一核退化、512MiB/1GiB完成独立进程无yield计算、pthread/TLS/全部F/D与FCSR、嵌套信号、远端撤权限/文件EOF、pipe取消、非leader exec、组停止/继续、CPU0/CPU1 FIFO服务/yield/阻塞与RR片尾，以及CPU0高优先级用户下的异核服务前进；runner核对完整内容流、真实U-mode hart采样、CPU1不分派syscall、PID1/堆/根盘退出和磁盘检查。host另保护通知消费后的新发布、旧栈owner、晚加入活动MM、COW失败回滚与64GiB稀疏撤映射。静态/动态musl原生公共案例（动态形态另含dlopen TLS）、glibc五形态及1400条原ABI完成SMP Linux同ELF对照，覆盖2/1CPU和双RAM；原static/pthread musl集成consumer在BoarOS同矩阵复核；这部分不称Linux差分。原单CPU策略用例显式固定CPU0，离线affinity位按真实拓扑选取。Ubuntu24.04/QEMU8.2.2本地容器完成原生同矩阵，实际固件/工具身份由runner保存；这不是托管CI运行结果。默认RV/LA core/runtime/platform和原受控SMP组另行回归。
+
+### 用户态原程序与压力组合
+
+`tests/program-inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。`native-extended.yml`配置相同四格的独立定时job，托管job尚未运行不能由本地结果代替。
+
+`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进60次Linux/BoarOS启动：2/1 CPU、512MiB/1GiB各15次。MM ELF现在有12个有序功能案例，包括匿名和文件共享页的并发首fault；Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。20次受控启动均在自然退出时核对held/released、账本、控制页和页缓存回收；4个MM配置各确认一次定向OOM、一次退休同步暂停和123个等待登记。新增`remote-retirement`计数核对实际远端目标：2 CPU配置为1、1 CPU退化配置为0；因此只有两项双CPU结果证明远端RFENCE暂停，单CPU结果只证明本地同步期间owner保持。用户页fault、内容、PID1退出、磁盘状态和SQLite独立重启另有逐项检查。测试控制器、linker wrap及测试宏只存在于私有构建，不进入默认/正式USER_SMP内核。
+
+同一共享匿名页的双线程首缺页被加入确定性交错：双CPU时两个真实用户任务固定到不同逻辑CPU写同一未驻留页，首个resolver让出CPU0服务资格，直到第二个resolver已提交可写PTE后再继续；单CPU退化时两个任务同绑CPU0。旧路径此时返回`ADDRESS_SPACE`并fatal；固定Linux `mm/memory.c`的`fix_spurious_fault()`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）也将并发页表更新后的fault作为spurious fault处理。现在对`remote_translation` MM在VMA权限仍允许且当前PTE已满足请求时成功返回，不重复发送页级RFENCE：PTE提交者完成其同步，迟到fault返回用户态前的MM激活完成本地刷新；VMA拒绝或PTE权限不足仍走原拒绝/COW流程，普通单核MM原错误检测保持。测试要求两次真实fault、一次stale retry、两次成功及一次页级同步。该行为见[MM硬件缺页解析](kernel-mm.md#硬件用户缺页解析)。
+
+文件fault另覆盖`resumed=1`重试：第一个读fault取得缓存页引用后停在PTE提交前，第二个CPU上的reader映射同一`MAP_SHARED`页并完成同步；第一个继续时看到已有PTE，真实进入一次内部retry，再次解析同一权限。旧实现对该权限已满足的`resumed` PTE仍发第二次远端同步。测试红灯观测`arrivals=2, retries=1, resumed=1, resolved=2, syncs=2`；当前远端MM保留publisher的一次同步，非远端MM的既有resumed刷新不变，绿灯要求`syncs=1`。握手在inode共享读保护下让第二reader继续，持页引用和调用栈覆盖第一次准备；测试同时核对返回数据和自然退出owner。
+
+CPU0最后一条启动记录在`riscv_timer_start()`开启IRQ前完成，避免逐字console输出被已运行用户的TTY数据打断。私有测试在IRQ已开时暂停timer横幅，直到UART实际接纳用户队列数据，旧顺序会破坏横幅完整性；当前顺序不进入该暂停，完整启动记录先于用户案例。runner仍严格拒绝损坏的用户协议行，不从程序退出0推导输出通过。
+
+2026-10-14本地QEMU11.1.2下最终12案例ELF完成60次组合；同一ELF和固件在Ubuntu24.04/QEMU8.2.2容器也完成60次。四个CPU/RAM profile的匿名、文件竞争都要求分别两次fault、一次stale/retry及一次页级同步；受控MM退出owner闭合。QEMU8.2.2最终矩阵的2 CPU配置`remote-retirement=1`、1 CPU配置为0。两套环境分别记录QEMU、kernel compiler、Linux config、firmware、kernel及ELF身份，不能混成一次对照或据此声称性能提升。容器使用独立`--build-root`，防止不同交叉编译器共用对象缓存。
+
+```sh
+python3 -B tests/program-inventory/run.py --arch riscv --execution-profile rv-user-smp \
+  --cpus 2 --cpus 1 --memory 512M --memory 1G --firmware /absolute/fw_dynamic.bin \
+  --reuse-builds --require-pass --output build/user-smp-programs-run
+make test-user-smp-composition-host
+make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin
+```
 
 普通RV MM record由584增至600字节，仍属于1024字节slab；没有增加每次用户复制的业务引用层或并行修改gate。
 

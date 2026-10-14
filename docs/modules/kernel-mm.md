@@ -178,6 +178,8 @@ MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在�
 
 scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 只在 `kernel_mm_lookup()` 报未驻留后尝试解析；合法页成功提交后重查 PTE，VMA 外或权限不符仍按用户 fault 处理。
 
+已启用远端翻译的 MM 中，fault 可能在CPU0服务队列中等待时由另一用户任务先完成同一地址的映射或权限升级，也可能在文件取页后发现该地址已提交PTE而走内部retry。若VMA仍允许这次访问，且当前PTE已具备所需权限，resolver按spurious fault成功返回；原映射提交者负责完成页级SFENCE/RFENCE，后续切回该用户MM也会在本地刷新，迟到或resumed resolver不重复发起远端同步。它不能把已提交的有效映射误报为`ADDRESS_SPACE`。未经过本次resolver自身的睡眠/重试、且未启用远端翻译的MM仍把同一状态视为内核状态错误；非远端`resumed`路径保留原有本地刷新。固定Linux `references/linux/mm/memory.c` 的 `fix_spurious_fault()`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）用于核对该并发语义；匿名及文件同页双线程强制交错见[RV两核模块](riscv-smp.md#用户态原程序与压力组合)。
+
 ## fork 与 COW
 
 `kernel_mm_fork()` 先克隆所有会分配的 VMA、共享匿名对象引用和文件来源 metadata，最后才调用 Sv39 两阶段 fork。子页表先取得每个 active/`PROT_NONE` 4 KiB 页的物理引用；共享匿名页保持原权限，其他页以 COW 形态建立。全部构造成功后再把父进程私有可写叶子去掉 W 并标记 COW，随后刷新父地址空间 TLB。metadata 或子页表构造失败时父 PTE 不变；父提交阶段不再分配。无效或已撤销的页不进入子地址空间，内核高半区仍只借用稳定映射。

@@ -19,6 +19,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if BOAROS_USER_SMP_COMPOSITION
+void riscv_user_composition_fault_retry(uint64_t address, int resumed);
+#endif
+
 #define KERNEL_MM_RECORD_MAGIC UINT64_C(0x424f41524d4d5243)
 
 /* 创建仍在CPU0；原子预约也覆盖其抢占交错，零永久表示代次耗尽。 */
@@ -3717,8 +3721,15 @@ static enum kernel_mm_status resolve_user_fault_once(
     if (backend_status == ARCH_MMU_STATUS_OK) {
         uint32_t requested = access == KERNEL_MM_READ ? ARCH_MMU_READ :
                              access == KERNEL_MM_WRITE ? ARCH_MMU_WRITE : ARCH_MMU_EXECUTE;
-        if (resumed && (mapping.permissions & requested)) {
-            flush_user_page(record, virtual_address & ~BOAROS_PAGE_MASK, vma.permissions);
+        /* CPU0服务或文件取页等待期间，其他任务可能已提交该页。
+         * 远端MM由提交者同步，返回前激活再做本地刷新，迟到fault不重复RFENCE；
+         * 非远端resumed路径保留既有本地刷新。 */
+        int remote = remote_translation(record);
+        if ((resumed || remote) && (mapping.permissions & requested)) {
+            if (resumed && !remote) {
+                flush_user_page(record,
+                    virtual_address & ~BOAROS_PAGE_MASK, vma.permissions);
+            }
             return KERNEL_MM_STATUS_OK;
         }
 
@@ -3944,6 +3955,9 @@ static enum kernel_mm_status mm_resolve_user_fault_impl(
             return result;
         }
         resumed = 1;
+#if BOAROS_USER_SMP_COMPOSITION
+        riscv_user_composition_fault_retry(address, resumed);
+#endif
     }
 }
 
