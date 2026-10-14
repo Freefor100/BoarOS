@@ -44,6 +44,11 @@ struct kernel_cpu {
     struct { uint64_t period, next_deadline; int armed; } timer;
     struct kernel_sched_runqueue eligible;
     uint64_t ipi_sent, ipi_received, rfence_requests;
+#if BOAROS_USER_SMP
+    uint64_t user_traps, user_returns, user_local_interrupts;
+    uint64_t service_dispatches, service_migrations, service_queue_ticks;
+    uint64_t service_samples, service_elapsed_ticks, service_running_ns;
+#endif
 #endif
 };
 #if BOAROS_MAX_CPUS > 1

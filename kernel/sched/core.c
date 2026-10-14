@@ -208,6 +208,18 @@ static enum kernel_scheduler_status validate_thread(
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     } else {
+#if BOAROS_USER_SMP
+        /* 远端只核对已发布的存储及稳定根；业务资源/组状态由CPU0校验。
+         * execution owner阻止exec/退出在此任务仍运行时替换其MM/栈。 */
+        if (kernel_cpu_current()->logical_id) {
+            if (thread->arch.user_mode != 1 || thread->mm.state != KERNEL_MM_LIVE ||
+                thread->completion.kind != KERNEL_THREAD_KIND_USER ||
+                thread->mm.allocator != scheduler.allocator) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            canary = (const uint64_t *)(thread->stack_low - sizeof(*canary));
+            return *canary == KERNEL_STACK_CANARY ? KERNEL_SCHEDULER_STATUS_OK :
+                KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
+        }
+#endif
         resources_absent =
             thread->files.state == KERNEL_FILES_EMPTY &&
             thread->fs.state == KERNEL_FS_CONTEXT_EMPTY;
@@ -1196,6 +1208,18 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     thread->arch.user_sp = 0U;
     thread->arch.user_mode = 1U;
+#if BOAROS_USER_SMP
+    thread->user_service = 1;
+    /* PID1在secondary ONLINE前构造；默认集合在首次服务入口固定。 */
+    thread->cpu_mask = 0;
+#endif
+    /* 仅新profile开放远端用户执行；失败不发布任务，caller仍拥有原MM。 */
+#if BOAROS_USER_SMP
+    if (kernel_mm_enable_remote_user_execution(mm) != KERNEL_MM_STATUS_OK) {
+        status = release_task_storage(thread,KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
+        goto restore_interrupts;
+    }
+#endif
     arch_thread_set_mm(&thread->arch, user_context);
     thread->magic = KERNEL_THREAD_MAGIC;
     thread->next = 0;

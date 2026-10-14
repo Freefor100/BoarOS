@@ -22,6 +22,15 @@ TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 
 COST_DIAGNOSTICS ?= 0
 SMP ?= 0
+USER_SMP ?= 0
+ifneq ($(filter $(USER_SMP),0 1),$(USER_SMP))
+$(error USER_SMP must be 0 or 1)
+endif
+ifeq ($(USER_SMP),1)
+ifneq ($(SMP),1)
+$(error USER_SMP requires SMP=1)
+endif
+endif
 SMP_TEST ?= 0
 MM_SMP_TEST ?= 0
 MM_SHARED_SMP_TEST ?= 0
@@ -157,6 +166,10 @@ ifeq ($(FILE_IO_SMP_TEST),1)
 BUILD_DIR := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
 KERNEL_RV := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
 endif
+ifeq ($(USER_SMP),1)
+BUILD_DIR := build/riscv-user-smp/riscv
+KERNEL_RV := build/riscv-user-smp/kernel-rv
+endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
 TRAP_RETURN_SIE_TEST_KERNEL_RV := \
@@ -209,6 +222,7 @@ ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
 CPPFLAGS += -DBOAROS_MAX_CPUS=$(CPU_CAPACITY)
+CPPFLAGS += -DBOAROS_USER_SMP=$(USER_SMP)
 CPPFLAGS += -DBOAROS_SMP_TEST=$(SMP_TEST) -DBOAROS_MM_DISK_TEST=$(MM_DISK_SMP_TEST)
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
@@ -2274,6 +2288,27 @@ test-sched-concurrency-host:
 test-riscv: test-scheduler-handoff-riscv
 
 .PHONY: kernel-rv-smp run-smp-riscv test-smp-host test-smp-riscv
+.PHONY: kernel-rv-user-smp run-user-smp-riscv test-user-smp-host
+kernel-rv-user-smp:
+	$(MAKE) SMP=1 USER_SMP=1 COST_DIAGNOSTICS=0 all
+run-user-smp-riscv: kernel-rv-user-smp
+	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp/kernel-rv
+test-user-smp-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/user-smp
+	build/host/user-smp
+	python3 -B tests/smp/test_user.py
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_next_owned,--wrap=physical_page_allocate,--wrap=physical_page_resolve -o build/host/mm/remote-user
+	timeout 30s build/host/mm/remote-user
+
+.PHONY: test-user-smp-riscv
+USER_SMP_ELF := build/riscv-user-smp/user-smp-rv
+$(USER_SMP_ELF): tests/userland/user_smp.c tests/userland/user_smp_probe.S build/riscv/musl-root/.shared-built
+	@mkdir -p $(dir $@)
+	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
+test-user-smp-riscv: $(USER_SMP_ELF)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_ELF) $(TEST_MEMORY_ARGS)
 .PHONY: test-mm-smp-riscv
 test-mm-smp-riscv:
 	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 COST_DIAGNOSTICS=0 all

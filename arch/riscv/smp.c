@@ -227,9 +227,30 @@ void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
     virt_uart_putc('\n');
 }
 
+static void report_user_execution(void)
+{
+#if BOAROS_USER_SMP
+    for (unsigned i=0; i<cpu_count; i++) {
+        virt_uart_puts("BoarOS: USER SMP hart="); virt_uart_put_hex(cpus[i]->hardware_id);
+        virt_uart_puts(" traps="); virt_uart_put_hex(cpus[i]->user_traps);
+        virt_uart_puts(" returns="); virt_uart_put_hex(cpus[i]->user_returns);
+        virt_uart_puts(" local-irqs="); virt_uart_put_hex(cpus[i]->user_local_interrupts);
+        virt_uart_puts(" syscalls="); virt_uart_put_hex(cpus[i]->service_dispatches);
+        virt_uart_putc('\n');
+    }
+    virt_uart_puts("BoarOS: USER SMP service migrations="); virt_uart_put_hex(cpus[0]->service_migrations);
+    virt_uart_puts(" queue-ticks="); virt_uart_put_hex(cpus[0]->service_queue_ticks);
+    virt_uart_puts(" samples="); virt_uart_put_hex(cpus[0]->service_samples);
+    virt_uart_puts(" elapsed-ticks="); virt_uart_put_hex(cpus[0]->service_elapsed_ticks);
+    virt_uart_puts(" running-ns="); virt_uart_put_hex(cpus[0]->service_running_ns);
+    virt_uart_putc('\n');
+#endif
+}
+
 void riscv_smp_stop(void)
 {
-    if (cpu_count < 2 || __atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_STOPPED) return;
+    if (cpu_count < 2) { report_user_execution(); return; }
+    if (__atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_STOPPED) return;
     if (kernel_cpu_current()->logical_id) __builtin_trap();
     kernel_preempt_disable();
     if (!kernel_scheduler_core_quiescent(cpus[1])) riscv_smp_fail("stop-live-owner", -1);
@@ -242,6 +263,7 @@ void riscv_smp_stop(void)
     if (__atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) != KERNEL_CPU_QUIESCING)
         riscv_smp_fail("stop-kernel-state", cpus[1]->state);
     __atomic_store_n(&cpus[1]->state, KERNEL_CPU_STOPPED, __ATOMIC_RELEASE);
+    report_user_execution();
     kernel_preempt_enable();
 }
 

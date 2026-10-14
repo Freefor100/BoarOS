@@ -1,8 +1,27 @@
-# RV 受控两核调度
+# RV 两核执行与服务边界
 
 默认构建和LA仍为单CPU。`kernel-rv-smp`独立配置最多两个逻辑CPU，CPU0是固件选择的boot hart，
 CPU1运行显式创建的受控内核任务，可绑定匿名及私有arena tmpfs/受控ext4文件映射MM，也可绑定同域共享FD表执行匿名pipe I/O。CPU0保留文件构造、读写/截断、MM/fork发布和最后后端释放；控制者保留独立OFD、挂载和缓存owner，命名空间运行期间不修改。用户任务、现有worker、实际磁盘I/O、未开放外部后备和系统压力回收仍只在普通CPU0服务上下文执行。
-受控任务已验证 fork 后跨 MM 的共享匿名/真实tmpfs/磁盘缓存页与私有COW；普通用户线程跨核执行及其共享 MM ABI 仍未开放。
+受控任务已验证fork后跨MM的共享匿名/真实tmpfs/磁盘缓存页与私有COW；普通用户使用下面的独立USER_SMP配置，原受控配置仍把用户固定在CPU0。
+
+## 真实用户态与CPU0业务交接
+
+`SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
+
+`kernel_scheduler_enter_user_service()`迁移实际任务的内核栈和调用现场。资格在rank40提交，旧执行owner由`switch_finish`结束后，CPU0才可接纳。syscall/同步fault在业务分派前交接；CPU1本地timer/IPI只处理同步元数据，无pending时直接恢复用户态。CPU0信号/组退出发布原子pending位并通知目标CPU；消费之后到达的新通知保留，返回前再次检查。晚于检查的IPI由硬件中断接纳，不要求远端读取live frame。
+
+普通MM的`remote_user`能力与受控并行修改能力独立。ELF、系统后备和压力hook仍可用，但所有内核业务由CPU0执行。撤映射、降权、fork/COW、截断和缓存撤写先更新翻译、固定退休owner，再完成本地及远端确认；新父项/摘空表同步全范围。稀疏撤映射按owned leaf/页表分支遍历，不枚举空虚拟页。最终MM释放要求活动CPU、pin和退休批次归零。
+
+```sh
+make kernel-rv-user-smp
+make test-user-smp-host
+make test-user-smp-riscv INIT_CONFIG=config/init.json
+make run-user-smp-riscv
+```
+
+2026-10-14的同ELF原生验证使用`tests/smp/linux-user.config`，固定Linux commit不变但单独启用SMP并生成配置哈希/缓存。MTTCG两核及一核退化、512MiB/1GiB完成独立进程无yield计算、pthread/TLS/全部F/D与FCSR、嵌套信号、远端撤权限/文件EOF、pipe取消与非leader exec；runner核对完整内容流、真实U-mode hart采样、CPU1不分派syscall、PID1/堆/根盘退出和磁盘检查。host另保护通知消费后的新发布、旧栈owner、晚加入活动MM、COW失败回滚与64GiB稀疏撤映射。运行时/ABI及平台的扩大验收分别记录，不能用这一组代替完整矩阵。
+
+服务统计区分CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。观测常驻CPU/任务字段，不分配或增加worker；默认单核配置不含这些字段。该配置不表示ext4、设备、协议、命名空间或系统压力回调已在两核并发执行，LA仍为单核。
 
 ## 启动与本地状态
 

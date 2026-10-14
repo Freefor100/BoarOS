@@ -290,6 +290,12 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user);
 uint64_t kernel_scheduler_idle_ticks(void);
 /* IRQ return may leave idle without waiting for a timer tick. */
 void kernel_scheduler_prepare_idle_return(void);
+/* 实际调用任务迁到CPU0；只允许无业务锁/pin的用户陷入或恢复边界。
+ * 同一内核栈保留调用现场，switch_finish后才可在另一CPU继续执行。 */
+void kernel_scheduler_enter_user_service(void);
+void kernel_scheduler_leave_user_service(void);
+int kernel_scheduler_user_service_pending(void);
+int kernel_scheduler_user_service_active(void);
 
 /* Resolves a hardware fault in the running user task's active MM. */
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(

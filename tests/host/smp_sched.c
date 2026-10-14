@@ -4,7 +4,7 @@
 #include <stdio.h>
 
 struct kernel_scheduler scheduler;
-struct kernel_raw_lock kernel_wait_domain;
+struct kernel_raw_lock kernel_wait_domain __attribute__((weak));
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu *active;
 static struct kernel_cpu cpus[2];
@@ -145,4 +145,5 @@ int main(void)
     assert(tasks[0].wait.on_cpu && tasks[1].wait.on_cpu && tasks[0].cpu != tasks[1].cpu);
     pthread_barrier_destroy(&gate);
     puts("SMP eligibility FIFO, global membership and concurrent execution claim passed");
+    return 0;
 }

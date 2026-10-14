@@ -13,6 +13,9 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
  * 共享匿名对象须属于同heap/allocator且无budget；tmpfs/SysV业务仍不开放。
  * CPU1仅接受任务已绑定的同一记录；这不是普通用户态SMP开关。 */
 enum kernel_mm_status kernel_mm_enable_concurrency(struct kernel_mm *);
+/* 私有构造期开放远端用户执行，保留普通CPU0业务及后备/压力契约。
+ * 不启用并行内核修改gate；已有远端能力可重复核对而不改变owner。 */
+enum kernel_mm_status kernel_mm_enable_remote_user_execution(struct kernel_mm *);
 struct kernel_mm_statistics {
     uint64_t resident_probes, protect_visits;
     uint64_t protect_address_flushes, protect_global_flushes;

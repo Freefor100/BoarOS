@@ -46,15 +46,13 @@ enum kernel_syscall_status syscall_handle_sched(
         uint64_t mask=0;
         if (length>sizeof(mask)) length=sizeof(mask);
         result=length ? sched_copy(caller,request->arguments[2],&mask,length,0) : 0;
-        if (!result) result=pid<0 ? -KERNEL_ESRCH : kernel_task_sched_get(caller,pid,&state);
-        if (!result && !(mask&1U)) result=-KERNEL_EINVAL;
-        /* 唯一在线 CPU 为 0：接受掩码与在线集合相交后确实运行在 CPU0。 */
+        if (!result) result=kernel_task_affinity_set(caller,pid,mask);
     } else if (nr==123) {
         unsigned length=(unsigned)request->arguments[1];
         uint64_t mask=1;
         if (length<sizeof(mask) || length%sizeof(mask)) result=-KERNEL_EINVAL;
         else {
-            result=pid<0 ? -KERNEL_ESRCH : kernel_task_sched_get(caller,pid,&state);
+            result=kernel_task_affinity_get(caller,pid,&mask);
             if (!result) result=sched_copy(caller,request->arguments[2],&mask,sizeof(mask),1);
             if (!result) result=sizeof(mask);
         }

@@ -16,7 +16,8 @@ def main():
     firmware = os.environ.get("BOAROS_SMP_FIRMWARE", "default")
     output = Path(os.environ["BOAROS_SMP_OUTPUT"])
     # 原consumer保留盘准备、输入、完整marker与owner判定；仅改变架构profile。
-    for flag, value in (("-smp", "2"), ("-bios", firmware)):
+    cpus = int(os.environ.get("BOAROS_SMP_CPUS", "2"))
+    for flag, value in (("-smp", str(cpus)), ("-bios", firmware)):
         index = args.index(flag)
         args[index + 1] = value
     args += ["-accel", "tcg,thread=multi", "-name", "boaros-smp,debug-threads=on"]
@@ -75,8 +76,11 @@ def main():
     prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
-    if timed_out or process.returncode or len(record["vcpu_threads"]) != 2 or "SMP failure" in text or "SMP fatal" in text:
+    if timed_out or process.returncode or len(record["vcpu_threads"]) != cpus or "SMP failure" in text or "SMP fatal" in text:
         return 1
+    if os.environ.get("BOAROS_USER_SMP") == "1":
+        # 原consumer仍负责完整行为/PID1回收；本层保存实际MTTCG执行身份。
+        return 0
     if "SMP root overlap counter=" not in text or "controller/arena/wait owners returned" not in text:
         return 1
     if os.environ.get("BOAROS_SMP_FILES")=="1":

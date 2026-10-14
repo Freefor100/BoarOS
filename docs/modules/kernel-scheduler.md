@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录RV/LA单CPU的OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
+本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV用户两核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -8,7 +8,7 @@
 |---|---|
 | `kernel/sched/core.c` | 创建、切换、tick 入口、资源借用校验 |
 | `kernel/sched/policy.c`、`runqueue.c` | 纯策略/预算状态机、分级 ready 队列 |
-| `kernel/sched/scheduling.c`、`kernel/syscall/sched.c` | 实际运行时间记账、抢占、安全返回边界、策略与 CPU0 affinity ABI |
+| `kernel/sched/scheduling.c`、`kernel/syscall/sched.c` | 实际运行时间记账、抢占、安全返回边界、策略与请求affinity；独立用户SMP的CPU0服务交接 |
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
 | `kernel/pid.c`、`kernel/sched/identity.c` | 私有编号保留、身份发布/角色引用，以及锁外身份存储释放 |
 | `kernel/sched/lifetime.c` | 任务存储借用、退休后继、join/reaper 资格与锁外页归还 |

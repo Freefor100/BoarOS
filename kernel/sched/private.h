@@ -125,6 +125,12 @@ struct kernel_task {
     uint32_t cpu_mask, controlled;
     uint64_t bound_mm_context;
 #endif
+#if BOAROS_USER_SMP
+    /* 调度域保护phase；pending仅传递CPU0业务通知，不包含业务状态。 */
+    uint32_t user_service, user_service_pending;
+    uint64_t service_entries, service_migrations;
+    uint64_t service_started_ticks, service_running_ns;
+#endif
     unsigned accounted;
     struct kernel_thread_join *join;
     struct kernel_task *parent;
@@ -271,6 +277,9 @@ struct kernel_scheduler {
 };
 
 extern struct kernel_scheduler scheduler;
+/* 已持调度域；变更资格不修改用户请求affinity，也不结束执行owner。 */
+void scheduler_user_service_set_locked(struct kernel_task *, int);
+void scheduler_user_request_locked(struct kernel_task *);
 static inline enum kernel_scheduler_status scheduler_failure(void)
 { return __atomic_load_n(&scheduler.fatal_status, __ATOMIC_RELAXED); }
 

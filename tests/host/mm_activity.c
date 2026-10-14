@@ -10,6 +10,9 @@
 #include <stdlib.h>
 
 void mm_test_attach(unsigned);
+#ifdef REMOTE_USER_CASE
+extern enum kernel_mm_status kernel_mm_enable_remote_user_execution(struct kernel_mm *);
+#endif
 extern _Thread_local uint64_t mm_test_context;
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator allocator;
@@ -18,6 +21,26 @@ static struct kernel_mm mm;
 static uint64_t context, kernel_context;
 static unsigned sampled, entered, allow_send, pause_exit, exiting, allow_exit;
 static _Thread_local unsigned flushes, instruction_sync;
+#ifdef REMOTE_USER_CASE
+static unsigned copying, cow_fences;
+static uint64_t cow_old;
+static unsigned sparse, walk_calls;
+static unsigned expect_nonleaf_sync;
+static unsigned fail_copy;
+static uint64_t failed_page;
+enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *address)
+{ enum physical_page_status status=__real_physical_page_allocate(a,address); if (!status && fail_copy) failed_page=*address; return status; }
+enum physical_page_status __real_physical_page_resolve(const struct physical_page_allocator *,uint64_t,void **);
+enum physical_page_status __wrap_physical_page_resolve(const struct physical_page_allocator *a,uint64_t address,void **pointer)
+{
+    if (fail_copy && address==failed_page) { fail_copy=0; return PHYSICAL_PAGE_STATUS_INVALID; }
+    return __real_physical_page_resolve(a,address,pointer);
+}
+enum riscv_sv39_status __real_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *,uint64_t *,uint64_t *);
+enum riscv_sv39_status __wrap_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *space,uint64_t *cursor,uint64_t *address)
+{ if (sparse) walk_calls++; return __real_riscv_sv39_user_next_owned(space,cursor,address); }
+#endif
 static void await(unsigned *flag)
 { while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) sched_yield(); }
 static void publish(unsigned *flag)
@@ -45,6 +68,15 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
 {
     (void)address; (void)size; (void)instructions;
     assert(!kernel_cpu_current()->raw_locks && targets == 0);
+#ifdef REMOTE_USER_CASE
+    if (expect_nonleaf_sync) { assert(address==0 && size==UINT64_MAX); expect_nonleaf_sync=0; }
+    if (copying) {
+        uint32_t references;
+        assert(!physical_page_reference_count(&allocator, cow_old, &references));
+        assert(references >= 2); /* child与尚未确认失效的旧父PTE owner均存在。 */
+        cow_fences++;
+    }
+#endif
     /* 修改者已采样空集合；CPU1随后首次进入，不能靠本次远端通知。 */
     publish(&sampled); await(&allow_send);
 }
@@ -89,7 +121,11 @@ int main(void)
     assert(!kernel_mm_mmap_anonymous(&mm, 0x40000, BOAROS_PAGE_SIZE,
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address));
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
+#ifdef REMOTE_USER_CASE
+    assert(!kernel_mm_enable_remote_user_execution(&mm));
+#else
     assert(!kernel_mm_enable_concurrency(&mm));
+#endif
     pthread_t modifier, visitor;
     assert(!pthread_create(&visitor, 0, enter, 0) && !pthread_create(&modifier, 0, modify, 0));
     await(&entered);
@@ -100,6 +136,31 @@ int main(void)
     kernel_mm_get_concurrency_state(&mm, &state); assert(state.active_cpus == 2);
     publish(&allow_exit); assert(!pthread_join(visitor, 0));
     kernel_mm_get_concurrency_state(&mm, &state); assert(!state.active_cpus && !state.pending_retirement);
+#ifdef REMOTE_USER_CASE
+    assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
+    struct kernel_mm child = {0};
+    assert(!kernel_mm_fork(&child, &mm));
+    struct kernel_mm_mapping original;
+    assert(!kernel_mm_lookup(&mm,address,&original)); cow_old=original.physical_address;
+    uint64_t before_failure=physical_page_available(&allocator);
+    fail_copy=1;
+    assert(kernel_mm_resolve_user_fault(&mm,address,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_STATE);
+    assert(!fail_copy && physical_page_available(&allocator)==before_failure);
+    assert(!kernel_mm_lookup(&mm,address,&original) && original.physical_address==cow_old && !(original.permissions&KERNEL_MM_WRITE));
+    copying=1; byte=27;
+    assert(!kernel_copy_to_user(&mm,address,&byte,1,&copied) && copied==1);
+    copying=0; assert(cow_fences);
+    assert(!kernel_copy_from_user(&child,&byte,address,1,&copied) && byte==19);
+    assert(!kernel_mm_release(&child));
+    uint64_t far=UINT64_C(0x1000000000), placed;
+    assert(!kernel_mm_mmap_anonymous(&mm,far,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED,&placed) && placed==far);
+    expect_nonleaf_sync=1;
+    assert(!kernel_copy_to_user(&mm,far,&byte,1,&copied) && !expect_nonleaf_sync);
+    sparse=1;
+    assert(!kernel_mm_munmap(&mm,address,far+BOAROS_PAGE_SIZE-address));
+    sparse=0; assert(walk_calls<=4); /* 64GiB空洞不按虚拟页枚举。 */
+#endif
     mm_test_context = 0; assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
     puts("MM sampled-target late entry, same-root local invalidation and leave-before-retirement verified");

@@ -135,6 +135,15 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     kernel_cost_irq_disabled(kernel_cost_trap_timestamp);
 #endif
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
+#if BOAROS_USER_SMP
+    if (from_user) {
+        kernel_cpu_current()->user_traps++;
+        if (frame->scause & RISCV_SCAUSE_INTERRUPT)
+            kernel_cpu_current()->user_local_interrupts++;
+    }
+    if (from_user && !(frame->scause & RISCV_SCAUSE_INTERRUPT))
+        kernel_scheduler_enter_user_service();
+#endif
 #if BOAROS_MAX_CPUS > 1
     if (frame->scause == (RISCV_SCAUSE_INTERRUPT | 1U)) {
         riscv_smp_handle_ipi();
@@ -234,6 +243,10 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     }
 
     if (from_user && frame->scause == RISCV_SCAUSE_USER_ECALL) {
+#if BOAROS_USER_SMP
+        if (kernel_cpu_current()->logical_id) __builtin_trap();
+        kernel_cpu_current()->service_dispatches++;
+#endif
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .arguments = {
@@ -355,10 +368,18 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
 void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
-    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U)
-        kernel_task_prepare_user_return();
-    else kernel_scheduler_prepare_idle_return();
-    riscv_signal_prepare_user_return(frame);
+    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
+        do {
+            kernel_task_prepare_user_return();
+            if (kernel_scheduler_user_service_active()) {
+                riscv_signal_prepare_user_return(frame);
+                kernel_scheduler_leave_user_service();
+            }
+        } while (kernel_scheduler_user_service_pending());
+#if BOAROS_USER_SMP
+        kernel_cpu_current()->user_returns++;
+#endif
+    } else kernel_scheduler_prepare_idle_return();
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
 #endif

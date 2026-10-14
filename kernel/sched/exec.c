@@ -103,6 +103,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
+#if BOAROS_USER_SMP
+    if (kernel_mm_enable_remote_user_execution(&transaction->image.mm) != KERNEL_MM_STATUS_OK)
+        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+#endif
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     thread->fork_no_exec = 0U;

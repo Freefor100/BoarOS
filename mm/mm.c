@@ -113,9 +113,10 @@ struct kernel_mm_record {
     uint32_t access_pins, write_pins;
     struct kernel_mutex operations;
     struct kernel_wait_queue pins_changed;
-    uint32_t access_closed, concurrent;
+    uint32_t access_closed, concurrent, remote_user;
     uint32_t active_cpus, pending_retirement;
     uint64_t tlb_generation;
+    uint64_t synchronized_table_pages;
     uint64_t pin_acquisitions, prepared_pages, fault_retries;
     uint64_t retirement_batches, retired_pages, pin_waits;
     enum kernel_mm_record_stage stage;
@@ -145,6 +146,10 @@ struct kernel_mm_record {
     struct kernel_mm_elf_source *elf_sources;
     struct kernel_open_file_description *executable_file;
 };
+
+/* 远端用户执行仅扩展翻译/退休域，不能绕过CPU0业务限制或启用gate。 */
+static int remote_translation(const struct kernel_mm_record *record)
+{ return record->concurrent || record->remote_user; }
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *,
@@ -607,9 +612,9 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
         if (!(mapping.permissions&ARCH_MMU_WRITE)) return 0;
         if (arch_mmu_user_protect_owned_page(&record->space,address,
                 backend_permissions_from_mm(permissions))) __builtin_trap();
-        if (record->concurrent) targets=note_tlb_change_locked(record,&batch);
+        if (remote_translation(record)) targets=note_tlb_change_locked(record,&batch);
     }
-    if (record->concurrent) finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,0);
+    if (remote_translation(record)) finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,0);
     return 0;
 }
 
@@ -655,7 +660,7 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
         if (offset >= size) {
             /* All resident file offsets are page aligned; this includes the
              * exact-boundary case without overflowing a round-up operation. */
-            if (record->concurrent) {
+            if (remote_translation(record)) {
                 struct kernel_mm_retirement batch={0};
                 uint32_t targets;
                 {
@@ -1169,6 +1174,7 @@ static enum kernel_mm_status mm_fork_impl(
     destination_record->stage = KERNEL_MM_RECORD_LIVE;
     destination_record->vma_heap = source_record->vma_heap;
     destination_record->concurrent = source_record->concurrent;
+    destination_record->remote_user = source_record->remote_user;
     destination_record->cache_files = source_record->cache_files;
 
     /*
@@ -1279,14 +1285,14 @@ static enum kernel_mm_status mm_fork_impl(
         finish_handle(destination,KERNEL_MM_EMPTY);
         return status;
     }
-    backend_status = source_record->concurrent ? arch_mmu_user_space_fork_prepare(
+    backend_status = remote_translation(source_record) ? arch_mmu_user_space_fork_prepare(
         &destination_record->space,
         &source_record->space,
         source_record->vmas != 0 ? shared_anon_leaf : 0,
         source_record->vmas) : arch_mmu_user_space_fork(
             &destination_record->space, &source_record->space,
             source_record->vmas != 0 ? shared_anon_leaf : 0, source_record->vmas);
-    if (backend_status == ARCH_MMU_STATUS_OK && source_record->concurrent) {
+    if (backend_status == ARCH_MMU_STATUS_OK && remote_translation(source_record)) {
         uint64_t cursor = 0, address;
         /* child尚未发布，遍历私有树不持MM raw；每次只提交一个父叶。 */
         while ((backend_status = arch_mmu_user_next_owned(&destination_record->space,
@@ -1436,7 +1442,19 @@ static void finish_tlb_change(struct kernel_mm_record *record,
     struct kernel_mm_retirement *batch, uint32_t targets, uint64_t address,
     uint64_t size, int instructions)
 {
+    if (record->remote_user) {
+        KERNEL_RAW_SCOPE(guard,&record->metadata);
+        /* 普通fault沿用CPU0 mapper；新父项或摘空表必须同步walk cache。
+         * 每次非叶变更都会经过确认点，不能用后续相同表数量掩盖中间变化。 */
+        if (record->synchronized_table_pages != record->space.table_pages) {
+            address=0; size=UINT64_MAX;
+        }
+    }
     arch_mmu_sync_user(targets, address, size, instructions);
+    if (record->remote_user) {
+        KERNEL_RAW_SCOPE(guard,&record->metadata);
+        record->synchronized_table_pages=record->space.table_pages;
+    }
     for (unsigned i = 0; i < batch->count; i++)
         if (physical_page_release(record->space.allocator, batch->pages[i]) !=
             PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
@@ -2223,7 +2241,7 @@ static enum kernel_mm_status unmap_space_range(
     if (start < ARCH_MMU_PAGE_SIZE) {
         start = ARCH_MMU_PAGE_SIZE;
     }
-    if (record->concurrent) {
+    if (remote_translation(record)) {
         uint64_t cursor = start;
         while (cursor < end) {
             struct kernel_mm_retirement batch = {0};
@@ -2234,10 +2252,14 @@ static enum kernel_mm_status unmap_space_range(
                 unsigned visited = 0;
                 while (cursor < end && visited++ < 16 &&
                     batch.count <= KERNEL_MM_RETIRE_CAPACITY - 3) {
-                    status = arch_mmu_user_detach_page(&record->space, cursor, &batch);
+                    uint64_t address;
+                    status = arch_mmu_user_next_owned(&record->space, &cursor, &address);
+                    if (status == ARCH_MMU_STATUS_NOT_MAPPED) { cursor = end; break; }
+                    if (status != ARCH_MMU_STATUS_OK) __builtin_trap();
+                    if (address >= end) { cursor = end; break; }
+                    status = arch_mmu_user_detach_page(&record->space, address, &batch);
                     if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED)
                         __builtin_trap(); /* 已提交退休不能丢弃owner。 */
-                    cursor += BOAROS_PAGE_SIZE;
                 }
                 targets = batch.count ? note_tlb_change_locked(record, &batch) : record->active_cpus;
             }
@@ -3017,17 +3039,18 @@ static enum kernel_mm_status mm_mprotect_impl(
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
-    if (record->concurrent) {
+    if (remote_translation(record)) {
         backend_status = ARCH_MMU_STATUS_OK;
         uint32_t targets;
-        for (uint64_t cursor = address; cursor < end; cursor += BOAROS_PAGE_SIZE) {
+        uint64_t cursor = address, leaf;
+        while (arch_mmu_user_next_owned(&record->space, &cursor, &leaf) == ARCH_MMU_STATUS_OK && leaf < end) {
             uint32_t leaf_permissions=normalized;
             if (record->cache_files) {
-                struct mm_file_resident *resident=find_file_resident(record,cursor);
+                struct mm_file_resident *resident=find_file_resident(record,leaf);
                 if (resident && kernel_page_cache_alias_active(&resident->alias)) leaf_permissions &= ~KERNEL_MM_WRITE;
             }
             KERNEL_RAW_SCOPE(guard, &record->metadata);
-            backend_status = arch_mmu_user_protect_owned_page(&record->space, cursor,
+            backend_status = arch_mmu_user_protect_owned_page(&record->space, leaf,
                 backend_permissions_from_mm(leaf_permissions));
             if (backend_status != ARCH_MMU_STATUS_OK) __builtin_trap();
         }
@@ -3224,12 +3247,78 @@ static uint32_t backend_permissions_from_mm(uint32_t permissions)
     return result;
 }
 
-static void flush_user_page(uint64_t virtual_address, uint32_t permissions)
+static void flush_user_page(struct kernel_mm_record *record,
+    uint64_t virtual_address, uint32_t permissions)
 {
+    if (remote_translation(record)) {
+        struct kernel_mm_retirement batch = {0};
+        uint32_t targets;
+        { KERNEL_RAW_SCOPE(guard, &record->metadata);
+          targets = note_tlb_change_locked(record, &batch); }
+        finish_tlb_change(record, &batch, targets, virtual_address, BOAROS_PAGE_SIZE,
+            (permissions & KERNEL_MM_EXECUTE) != 0);
+        return;
+    }
     arch_mmu_flush_address(virtual_address);
     if ((permissions & KERNEL_MM_EXECUTE) != 0U) {
         arch_mmu_sync_instructions();
     }
+}
+
+static enum arch_mmu_status resolve_record_cow(struct kernel_mm_record *record,
+    uint64_t address, uint32_t permissions)
+{
+    if (!remote_translation(record))
+        return arch_mmu_user_resolve_cow(&record->space, address, permissions);
+    struct kernel_mm_retirement batch = {0};
+    struct physical_page_allocator *allocator = record->space.allocator;
+    uint64_t cookie, old, replacement = KERNEL_MM_NO_PAGE;
+    uint32_t targets = 0, references;
+    void *source = 0, *destination;
+    enum arch_mmu_status status;
+    {
+        KERNEL_RAW_SCOPE(guard, &record->metadata);
+        status = arch_mmu_user_cow_snapshot(&record->space,address,&cookie,&old);
+        if (status) return status;
+        if (physical_page_reference_count(allocator,old,&references)) __builtin_trap();
+        if (references == 1) {
+            status = arch_mmu_user_cow_commit(&record->space,address,cookie,
+                KERNEL_MM_NO_PAGE,permissions,&batch);
+            if (status) return status;
+            targets = note_tlb_change_locked(record,&batch);
+        } else {
+            /* 快照实际引用覆盖锁外复制；旧PTE引用另外留在退休批次。 */
+            if (physical_page_acquire(allocator,old)) __builtin_trap();
+            if (physical_page_resolve(allocator,old,&source)) {
+                physical_page_release(allocator,old);
+                return ARCH_MMU_STATUS_STATE;
+            }
+        }
+    }
+    if (source) {
+        enum physical_page_status allocated = physical_page_allocate(allocator,&replacement);
+        if (allocated != PHYSICAL_PAGE_STATUS_OK) {
+            physical_page_release(allocator,old);
+            return allocated == PHYSICAL_PAGE_STATUS_EMPTY ? ARCH_MMU_STATUS_NO_MEMORY : ARCH_MMU_STATUS_STATE;
+        }
+        if (physical_page_resolve(allocator,replacement,&destination)) {
+            physical_page_release(allocator,replacement);
+            physical_page_release(allocator,old);
+            return ARCH_MMU_STATUS_STATE;
+        }
+        unsigned char *out = destination, *in = source;
+        for (size_t i=0; i<BOAROS_PAGE_SIZE; i++) out[i]=in[i];
+        {
+            KERNEL_RAW_SCOPE(guard,&record->metadata);
+            status=arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,permissions,&batch);
+            if (!status) targets=note_tlb_change_locked(record,&batch);
+        }
+        if (status) physical_page_release(allocator,replacement);
+    }
+    if (!status) finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,
+        (permissions & ARCH_MMU_EXECUTE) != 0);
+    if (source) physical_page_release(allocator,old);
+    return status;
 }
 
 static enum kernel_mm_status map_file_page_status(
@@ -3262,16 +3351,18 @@ static enum kernel_mm_status discard_file_page(
 
 /* Undo a leaf that was already published before a later COW step failed. */
 static enum kernel_mm_status discard_mapped_page(
-    struct arch_mmu_user_space *space,
+    struct kernel_mm_record *record,
     uint64_t page_address,
     enum kernel_mm_status result)
 {
     enum arch_mmu_status status;
 
-    status = arch_mmu_user_unmap_owned_range(
-        space,
-        page_address,
-        page_address + BOAROS_PAGE_SIZE);
+    if (remote_translation(record)) {
+        return unmap_space_range(record,page_address,page_address+BOAROS_PAGE_SIZE) ==
+            KERNEL_MM_STATUS_OK ? result : KERNEL_MM_STATUS_STATE;
+    }
+    status = arch_mmu_user_unmap_owned_range(&record->space,
+        page_address, page_address + BOAROS_PAGE_SIZE);
     if (status != ARCH_MMU_STATUS_OK) {
         return KERNEL_MM_STATUS_STATE;
     }
@@ -3356,7 +3447,7 @@ static enum kernel_mm_status map_shared_file_page(
         physical_address, &resident->alias, resident, page_address,
         rearm_shared_file_alias);
     if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK)
-        return discard_mapped_page(&record->space, page_address,
+        return discard_mapped_page(record, page_address,
                                    KERNEL_MM_STATUS_STATE);
     if (access == KERNEL_MM_WRITE) {
         kernel_page_cache_alias_mark_dirty(&resident->alias);
@@ -3412,8 +3503,8 @@ static enum kernel_mm_status map_private_file_page(
                                      cached_address,
                                      map_file_page_status(backend_status));
         }
-        backend_status = arch_mmu_user_resolve_cow(
-            &record->space,
+        backend_status = resolve_record_cow(
+            record,
             page_address,
             backend_permissions_from_mm(vma->permissions));
         if (backend_status == ARCH_MMU_STATUS_OK) {
@@ -3422,7 +3513,7 @@ static enum kernel_mm_status map_private_file_page(
         } else {
             /* No provenance is published for a failed fault. Do not leave
              * the temporary cache PTE behind after private allocation fails. */
-            return discard_mapped_page(&record->space, page_address,
+            return discard_mapped_page(record, page_address,
                                          map_file_page_status(backend_status));
         }
         return map_file_page_status(backend_status);
@@ -3528,8 +3619,8 @@ static enum kernel_mm_status map_elf_source_page(
         }
         if (backend_status == ARCH_MMU_STATUS_OK &&
             access == KERNEL_MM_WRITE) {
-            backend_status = arch_mmu_user_resolve_cow(
-                &record->space,
+            backend_status = resolve_record_cow(
+                record,
                 page_address,
                 backend_permissions_from_mm(vma->permissions));
         }
@@ -3537,7 +3628,7 @@ static enum kernel_mm_status map_elf_source_page(
             enum kernel_mm_status failure = map_file_page_status(backend_status);
 
             if (mapped != 0) {
-                return discard_mapped_page(&record->space,
+                return discard_mapped_page(record,
                                            page_address,
                                            failure);
             }
@@ -3558,7 +3649,7 @@ static enum kernel_mm_status map_elf_source_page(
         }
     }
     status = KERNEL_MM_STATUS_OK;
-    flush_user_page(page_address, vma->permissions);
+    flush_user_page(record, page_address, vma->permissions);
     return status;
 }
 
@@ -3627,7 +3718,7 @@ static enum kernel_mm_status resolve_user_fault_once(
         uint32_t requested = access == KERNEL_MM_READ ? ARCH_MMU_READ :
                              access == KERNEL_MM_WRITE ? ARCH_MMU_WRITE : ARCH_MMU_EXECUTE;
         if (resumed && (mapping.permissions & requested)) {
-            flush_user_page(virtual_address & ~BOAROS_PAGE_MASK, vma.permissions);
+            flush_user_page(record, virtual_address & ~BOAROS_PAGE_MASK, vma.permissions);
             return KERNEL_MM_STATUS_OK;
         }
 
@@ -3647,14 +3738,15 @@ static enum kernel_mm_status resolve_user_fault_once(
                     &record->space, page->address,
                     backend_permissions_from_mm(vma.permissions));
                 if (backend_status != ARCH_MMU_STATUS_OK) __builtin_trap();
+                flush_user_page(record,page->address,vma.permissions);
                 return KERNEL_MM_STATUS_OK;
             }
             status = require_active_space(record);
             if (status != KERNEL_MM_STATUS_OK) {
                 return status;
             }
-            backend_status = arch_mmu_user_resolve_cow(
-                &record->space,
+            backend_status = resolve_record_cow(
+                record,
                 virtual_address & ~BOAROS_PAGE_MASK,
                 backend_permissions_from_mm(vma.permissions));
             if (backend_status == ARCH_MMU_STATUS_OK) {
@@ -3779,7 +3871,7 @@ static enum kernel_mm_status resolve_user_fault_once(
         }
         if (status == KERNEL_MM_STATUS_OK &&
             translation_synchronized == 0) {
-            flush_user_page(page_address, vma.permissions);
+            flush_user_page(record, page_address, vma.permissions);
         }
         return status;
     }
@@ -3819,7 +3911,7 @@ static enum kernel_mm_status resolve_user_fault_once(
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_ADDRESS_SPACE;
         }
-        flush_user_page(page_address, vma.permissions);
+        flush_user_page(record, page_address, vma.permissions);
         return KERNEL_MM_STATUS_OK;
     }
     if (vma.kind != KERNEL_VMA_KIND_ANONYMOUS ||
@@ -3831,7 +3923,7 @@ static enum kernel_mm_status resolve_user_fault_once(
         page_address,
         backend_permissions_from_mm(vma.permissions));
     if (backend_status == ARCH_MMU_STATUS_OK) {
-        flush_user_page(page_address, vma.permissions);
+        flush_user_page(record, page_address, vma.permissions);
         return KERNEL_MM_STATUS_OK;
     }
     if (backend_status == ARCH_MMU_STATUS_NO_MEMORY) {
@@ -3928,7 +4020,7 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         if (next->state != KERNEL_MM_LIVE) status = KERNEL_MM_STATUS_STATE;
         else status = resolve_record_storage(next, &record);
         if (status != KERNEL_MM_STATUS_OK) goto out;
-        if (logical && !record->concurrent) __builtin_trap();
+        if (logical && !remote_translation(record)) __builtin_trap();
         KERNEL_RAW_SCOPE(guard, &record->metadata);
         uint64_t context;
         if (arch_mmu_user_space_context(&record->space, &context) != ARCH_MMU_STATUS_OK) {
@@ -3937,7 +4029,7 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         if (record != previous && (record->active_cpus & (1U << logical))) __builtin_trap();
         record->active_cpus |= 1U << logical;
         if (arch_mmu_switch_context(context) != ARCH_MMU_STATUS_OK) __builtin_trap();
-        if (record->concurrent) { arch_mmu_flush_all(); arch_mmu_sync_instructions(); }
+        if (remote_translation(record)) { arch_mmu_flush_all(); arch_mmu_sync_instructions(); }
         cpu->active_mm_record = record;
         cpu->active_mm_generation = record->tlb_generation;
     } else {
@@ -4743,5 +4835,23 @@ enum kernel_mm_status kernel_mm_enable_concurrency(struct kernel_mm *mm)
         if (!kernel_open_file_memory_backed(source->file)) record->cache_files=1;
     /* 尚未发布且独占；以后才能创建另一MM句柄/绑定受控任务。 */
     __atomic_store_n(&record->concurrent, 1, __ATOMIC_RELEASE);
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_enable_remote_user_execution(struct kernel_mm *mm)
+{
+    kernel_assert_service_context();
+    struct kernel_mm_record *record;
+    if (!mm) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status) return status;
+    KERNEL_RAW_SCOPE(guard, &record->metadata);
+    if (mm->state != KERNEL_MM_LIVE || record->stage != KERNEL_MM_RECORD_LIVE ||
+        record->concurrent) return KERNEL_MM_STATUS_STATE;
+    if (record->remote_user) return KERNEL_MM_STATUS_OK;
+    if (__atomic_load_n(&record->references, __ATOMIC_ACQUIRE) != 1 ||
+        record->active_cpus || record->pending_retirement) return KERNEL_MM_STATUS_STATE;
+    record->remote_user = 1;
+    record->synchronized_table_pages=record->space.table_pages;
     return KERNEL_MM_STATUS_OK;
 }

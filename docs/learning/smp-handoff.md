@@ -83,3 +83,13 @@ OFD同步错误观察使用rank10 offset保护后，所有并发msync都必须�
 固定依据为本地`references/linux/fs/file.c`、`fs/read_write.c`及`mm/filemap.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；分别核对共享位置、接纳字节和同OFD错误观察。执行适配保持单次操作语义，内部队列与owner由BoarOS维护。
 
 RV PLIC的dispatching由CPU0派发器独占。原查询直接返回全局值，会把CPU0正在处理设备IRQ误报为CPU1的本地IRQ，后者即使没有锁、pin或抢占禁用，也被请求入口拒绝。真实两核原静态程序组合捕获了CPU1读到active并返回STATE的反例；查询现在先核对调用核，CPU1不读取该CPU0独占标记。这个修复只对应当前设备IRQ归CPU0的平台边界，不声明PLIC已支持多核设备派发。
+
+## 实际调用任务与用户执行资格
+
+普通用户的CPU0交接迁移调用者本身，不能让worker替代它处理信号、身份、restart、exec或线程退出。trap frame与C调用现场都留在该任务栈；旧CPU完成保存并结束执行owner后，CPU0继续同一调用。临时内核资格与请求affinity分开，才能让CPU1-only用户线程在CPU0调用syscall，同时仍向用户报告CPU1。
+
+纯timer/IPI不是进入业务层的理由。远端只读取原子待服务位和调度元数据；完整信号/组状态仍由CPU0读取。先消费通知再处理，恢复过程不能清掉之后到达的新通知。host握手在消费后再次发布，验证恢复用户资格仍保留新位；实际信号、取消和非leader exec则由同ELF原生对照验证。
+
+普通MM远端执行也不等于并行修改。短保护只协调活动根与退休，既有CPU0缺页/来源策略继续复用。普通COW原先只做本地确认；新增反例要求旧父PTE页引用在远端确认时仍在。新页访问失败必须完整回滚而不是fatal；新增非叶页表还必须全范围失效，不能仅同步目标叶。64GiB稀疏撤映射只遍历实际叶及分支，避免把能力扩展变成空页线性扫描。
+
+固定本地依据为`references/linux/kernel/sched/core.c`、`arch/riscv/kernel/entry.S`、`mm/memory.c`和`mm/filemap.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；用户可观察affinity、trap保存及COW/来源边界按这些路径核对，BoarOS的CPU0交接由自己的执行owner协议实现。SMP reference采用独立配置与身份，不沿用单CPU Linux结果。

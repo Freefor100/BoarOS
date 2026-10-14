@@ -5,6 +5,9 @@
 #include <kernel/rlimit.h>
 
 struct kernel_task;
+/* 返回请求affinity；临时CPU0内核服务资格不改变这个值。 */
+int kernel_task_affinity_get(struct kernel_task *, int32_t, uint64_t *);
+int kernel_task_affinity_set(struct kernel_task *, int32_t, uint64_t);
 struct kernel_mm;
 struct kernel_files;
 struct kernel_fs_context;

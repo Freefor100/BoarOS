@@ -284,6 +284,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
     if (task->state == KERNEL_THREAD_STATE_EXITED || task->state == KERNEL_THREAD_STATE_ZOMBIE ||
         task->state == KERNEL_THREAD_STATE_GROUP_DEAD || task->retirement) return;
     task->terminate_requested = 1;
+    scheduler_user_request_locked(task);
     if (task->vfork_waiting && task->vfork_wait_child) {
         task->vfork_wait_child->vfork_parent = 0;
         task->vfork_wait_child->vfork_child = 0;
@@ -819,6 +820,10 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     child->magic = KERNEL_THREAD_MAGIC;
     child->arch.user_mode = 1U;
+#if BOAROS_USER_SMP
+    child->cpu_mask = parent->cpu_mask;
+    child->user_service = 1;
+#endif
     child->state = KERNEL_THREAD_STATE_EXITED;
     child->completion.kind = KERNEL_THREAD_KIND_USER;
     child->completion.reason = KERNEL_THREAD_EXIT_USER_FAULT;
@@ -2374,6 +2379,10 @@ void kernel_task_prepare_user_return(void)
         __builtin_trap();
     struct kernel_task *task = kernel_cpu_current()->current;
     if (task == 0 || task->arch.user_mode != 1U) return;
+#if BOAROS_USER_SMP
+    if (!kernel_scheduler_user_service_active() && !kernel_scheduler_user_service_pending()) return;
+    kernel_scheduler_enter_user_service();
+#endif
     uint64_t address = task->set_tid_address;
     task->set_tid_address = 0U;
     if (address) {
