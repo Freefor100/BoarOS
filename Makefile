@@ -1936,6 +1936,7 @@ test-environment-riscv: $(KERNEL_RV)
 
 .PHONY: test-platform-profile-host
 test-platform-profile-host:
+	python3 -B tests/host/qemu_cache.py
 	python3 -B tests/host/platform_memory.py
 
 .PHONY: test-rtc-host

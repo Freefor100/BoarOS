@@ -35,6 +35,7 @@ make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权
 `build/linux-la`、`build/loongarch`；身份变化时拒绝混用。`make prune-build`
 保留工具、对象、ELF 和身份，删除运行日志及 initramfs。`QEMU_LOONGARCH64` 和
 `LA_CROSS_COMPILE` 可覆盖工具位置，版本变化需要重新验收。
+RTC模拟器缓存命中时核对源码、补丁、subproject、编译器、配置、二进制内容/权限/链接及user-network能力，全部匹配后直接复用。宿主库版本更新导致旧`build.ninja`中的绝对路径不存在，不应让完整身份的可执行产物重新链接；实际加载失败仍明确返回错误。缓存反例入口为`make test-platform-profile-host`，内容、权限或来源变化仍拒绝混用。
 
 内核物理装载地址为2MiB，高地址为缓存DMW的`0x9000000000200000`。
 开启分页前临时建立低地址DMW，跳到高地址后立即撤销；用户模式不可使用
