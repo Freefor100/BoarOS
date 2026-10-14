@@ -25,7 +25,7 @@ class CleanupContract(unittest.TestCase):
                 'qemu-la-rtc/build/build.ninja','linux-la-platform/vmlinux',
                 'loongarch/program-libc/source/entry.c','loongarch/dynamic-dp-v2/root/lib/libc.so',
                 'loongarch/glibc/static-program','loongarch/diff-abi-cases')
-            outputs=('loongarch/inventory-full/state.json','loongarch/program-inventory/state.json',
+            outputs=('loongarch/program-inventory-user-smp-review/state.json','loongarch/inventory-full/state.json','loongarch/program-inventory/state.json',
                 'riscv-smp/runs/2-512M.log',
                 'riscv-user-smp/runs/run-first/report.json','riscv-user-smp/abi/run-first/root.img',
                 'riscv-user-smp/runtime/run-first/glibc/fixture.img',

@@ -98,7 +98,7 @@ def candidates():
         result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check','dynamic','dynamic-dp','exec-error-inputs'}
                       or path.name.startswith(('root-run.','root-io-run.','userland-run.','exec-fail-run.','stack-guard-run.','rng-run.','network-run.','net-failure-run.','uart-failure-run.','tty-run.','pty-run.','environment-run.','rtc-model.','rtc-alarm.','sqlite-wal-run.','sqlite-run.')))
         result.extend(path for path in la.iterdir() if path.is_dir() and
-                      (path.name=='program-inventory' or path.name.startswith(('inventory-','diff-abi-','review-boundary-'))))
+                      (path.name=='program-inventory' or path.name.startswith(('program-inventory-','inventory-','diff-abi-','review-boundary-'))))
         la_libc=la/'program-libc'
         if la_libc.is_dir():
             result.extend(path for path in la_libc.iterdir() if path.name=='upstream.tar' or path.suffix=='.log')
