@@ -327,3 +327,6 @@ CPU0范围同步每批固定最多16份OFD与范围，释放gate后执行，以�
 缓存写回/截断的交接见[VFS](vfs-ext4.md#后台写回与水位回收)，真实两核及独立重启
 见[RV SMP](riscv-smp.md)。`make test-mm-disk-concurrency-host`链接真实Sv39、VFS/OFD、
 lwext4及镜像读写；宿主模型不证明硬件TLB或用户线程跨核ABI。
+
+用户 fault 统计由 `kernel_mm_resolve_user_fault()` 的共用完成出口负责，后备实现只返回解析结果；成功一次计一次，失败/内部重试不计，服务任务处理其他 MM 不计到服务者。
+`make test-fault-count-riscv test-fault-count-loongarch TEST_MEMORIES="512M 1G"` 使用真实 tmpfs 映射和 proc stat 对照共享首次读取、私有 COW 的计数增长及失败不增长，不比较两系统偶然的累计数值。

@@ -204,7 +204,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_STACK_ONLY
+#ifdef ABI_FAULT_COUNT_ONLY
+    abi_fault_count_cases();
+#elif defined(ABI_STACK_ONLY)
     abi_stack_boundary_cases();
 #elif defined(ABI_EXEC_BOUNDARY_ONLY)
     abi_exec_boundary_cases();
@@ -217,6 +219,7 @@ void abi_main(const unsigned long *initial_stack)
 #else
 #ifndef ABI_PATH_ONLY
     abi_exec_boundary_cases();
+    abi_fault_count_cases();
 #endif
     abi_path_only_cases();
     abi_path_truncate_cases();

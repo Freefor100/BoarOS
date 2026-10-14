@@ -3844,20 +3844,11 @@ static enum kernel_mm_status mm_resolve_user_fault_impl(
     struct kernel_mm *mm, uint64_t address, uint32_t access)
 {
     KERNEL_NO_RECLAIM_IO;
-    struct kernel_task *task = kernel_task_current();
-    const struct kernel_mm *task_mm = 0;
-    if (!mm || !task || kernel_task_mm_borrow(task, &task_mm) !=
-                     KERNEL_TASK_STATUS_OK ||
-        task_mm->record_page_address != mm->record_page_address) task = 0;
-    uint64_t block_reads = task ? kernel_proc_task_block_reads(task) : 0U;
     int resumed = 0;
     for (;;) {
         int retry = 0;
         enum kernel_mm_status result = resolve_user_fault_once(mm, address, access, &retry, resumed);
         if (!retry) {
-            if (result == KERNEL_MM_STATUS_OK && task)
-                kernel_proc_task_note_fault(task,
-                    kernel_proc_task_block_reads(task) != block_reads);
             return result;
         }
         resumed = 1;
@@ -4684,7 +4675,7 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
     if (cookie) physical_page_release(allocator, old);
     return status;
 }
-enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
+static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     uint64_t address, uint32_t access)
 {
     for (;;) {
@@ -4701,6 +4692,25 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
         { KERNEL_RAW_SCOPE(guard, &operation.record->metadata); operation.record->fault_retries++; }
         /* loser归还全部私有候选，下一轮重取VMA/PTE，不把旧许可带过睡眠。 */
     }
+}
+
+/* One successful resolution contributes one fault, whichever backing path won.
+ * Only the caller's own user MM is charged; retries and failures contribute none. */
+enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
+    uint64_t address, uint32_t access)
+{
+    struct kernel_task *task = kernel_task_current();
+    const struct kernel_mm *task_mm = 0;
+    if (!mm || !task || !kernel_task_has_user_context(task) ||
+        kernel_task_mm_borrow(task, &task_mm) !=
+                     KERNEL_TASK_STATUS_OK ||
+        task_mm->record_page_address != mm->record_page_address) task = 0;
+    uint64_t block_reads = task ? kernel_proc_task_block_reads(task) : 0U;
+    enum kernel_mm_status status = resolve_user_fault(mm, address, access);
+    if (status == KERNEL_MM_STATUS_OK && task)
+        kernel_proc_task_note_fault(task,
+            kernel_proc_task_block_reads(task) != block_reads);
+    return status;
 }
 
 enum kernel_mm_status kernel_mm_enable_concurrency(struct kernel_mm *mm)

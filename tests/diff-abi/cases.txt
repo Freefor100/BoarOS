@@ -1,5 +1,8 @@
 boundary.exec-stack-limit
 boundary.exec-failure-preserves
+boundary.tmpfs-shared-minflt
+boundary.tmpfs-private-cow-minflt
+boundary.tmpfs-failed-fault-count
 
 path.open
 path.getfl

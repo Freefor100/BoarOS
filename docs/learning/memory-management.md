@@ -690,3 +690,8 @@ MM的实际清理owner等drain完成，使回调对MM存储的借用有根，不
 `st_blocks` 的 512 字节单位与架构页大小独立，16 KiB 页不能继续按每页 8 块计费。
 
 普通单CPU MM 没有 operation gate，不能用“最终 inode 读锁之前已查 VMA”替代恢复后校验。真实读锁 park 的握手反例在其间将文件 VMA 固定替换成匿名 VMA，旧实现把文件 0x77 装入新匿名区；当前在取得读保护及最后可睡眠准备之后重查，匿名区重新按 demand-zero 解析。反例使用来源准备边界而非第几次锁调用，最后仍检查来源、页/堆 owner。
+
+缺页策略增加新后备分支时，统计也必须覆盖同一个公共完成边界。原记账藏在旧 resolver，使 tmpfs 的新文件缺页/COW 返回成功却不增长 minflt。
+公共出口只给当前用户任务的自身 MM 记账，不能让 CPU0 服务复制或受控内核任务调用用户统计消费者。
+固定 Linux `references/linux/arch/riscv/mm/fault.c`、`arch/loongarch/mm/fault.c` 及 `mm/memory.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）按完成结果区分 major/minor；BoarOS 仍沿实际当前任务块读请求分类，等待别人的读请求不承诺精确 major 分类。
+差分区间先预热采样缓冲，检查受控触碰产生的计数下界及失败无增长，避免精确累计数依赖无关启动缺页。
