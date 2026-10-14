@@ -2295,8 +2295,8 @@ kernel-rv-user-smp:
 run-user-smp-riscv: kernel-rv-user-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp/kernel-rv
 test-user-smp-host:
-	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/user-smp
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_next_owned,--wrap=physical_page_allocate,--wrap=physical_page_resolve -o build/host/mm/remote-user

@@ -165,6 +165,35 @@ static void nonleader_exec(void)
     int status; CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==23);
     record("nonleader-exec-remote-exit");
 }
+struct stop_case { atomic_uint ready,finished,progress; };
+static void *stop_thread(void *opaque)
+{
+    struct stop_case *state=opaque; pin(online&2 ? 1 : 0);
+    atomic_store_explicit(&state->ready,1,memory_order_release);
+    while (!atomic_load_explicit(&state->finished,memory_order_acquire))
+        atomic_fetch_add_explicit(&state->progress,1,memory_order_relaxed);
+    return 0;
+}
+static void group_stop_continue(void)
+{
+    struct stop_case *state=mmap(0,4096,PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_ANONYMOUS,-1,0); CHECK(state!=MAP_FAILED);
+    pid_t child=fork(); CHECK(child>=0);
+    if (!child) {
+        pthread_t thread; CHECK(!pthread_create(&thread,0,stop_thread,state));
+        wait_flag(&state->finished,1); CHECK(!pthread_join(thread,0)); _exit(0);
+    }
+    wait_flag(&state->ready,1); CHECK(!kill(child,SIGSTOP));
+    int status; CHECK(waitpid(child,&status,WUNTRACED)==child && WIFSTOPPED(status) && WSTOPSIG(status)==SIGSTOP);
+    unsigned before=atomic_load_explicit(&state->progress,memory_order_relaxed);
+    for (unsigned i=0;i<16;i++) CHECK(syscall(SYS_getpid)>0);
+    CHECK(atomic_load_explicit(&state->progress,memory_order_relaxed)==before);
+    CHECK(!kill(child,SIGCONT));
+    while (atomic_load_explicit(&state->progress,memory_order_relaxed)==before) {}
+    atomic_store_explicit(&state->finished,1,memory_order_release);
+    CHECK(waitpid(child,&status,0)==child && status==0);
+    CHECK(!munmap(state,4096)); record("group-stop-continue-remote-owner");
+}
 static uint64_t monotonic_ns(void)
 {
     struct timespec now; CHECK(!clock_gettime(CLOCK_MONOTONIC,&now));
@@ -236,7 +265,7 @@ int main(int argc,char **argv)
     CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3));
     printf("USER-SMP BEGIN cpus=%u\n",online==3 ? 2 : 1); fflush(stdout);
     pin(0);
-    process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); realtime_qualification(); remote_service_progress();
-    puts("USER-SMP END 7"); fflush(stdout); CHECK(!fsync(1) || errno==EINVAL);
+    process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress();
+    puts("USER-SMP END 8"); fflush(stdout); CHECK(!fsync(1) || errno==EINVAL);
     sync(); (void)reboot(RB_POWER_OFF); return 42;
 }

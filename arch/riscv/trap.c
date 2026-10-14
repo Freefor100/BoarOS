@@ -316,7 +316,11 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         }
         if (result.action == KERNEL_SYSCALL_ACTION_YIELD) {
             enum kernel_scheduler_status scheduler_status =
+#if BOAROS_USER_SMP
+                kernel_scheduler_user_yield_current();
+#else
                 kernel_scheduler_yield_current();
+#endif
 
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
                 riscv_scheduler_fatal(frame, scheduler_status);
@@ -368,6 +372,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
 void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
+#if BOAROS_USER_SMP
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
         do {
             kernel_task_prepare_user_return();
@@ -376,10 +381,13 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
                 kernel_scheduler_leave_user_service();
             }
         } while (kernel_scheduler_user_service_pending());
-#if BOAROS_USER_SMP
         kernel_cpu_current()->user_returns++;
-#endif
     } else kernel_scheduler_prepare_idle_return();
+#else
+    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_task_prepare_user_return();
+    else kernel_scheduler_prepare_idle_return();
+    riscv_signal_prepare_user_return(frame);
+#endif
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
 #endif

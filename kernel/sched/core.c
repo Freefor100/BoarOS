@@ -1417,11 +1417,6 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-#if BOAROS_USER_SMP
-    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-      if (scheduler_user_yield_locked(kernel_cpu_current()->current))
-          return KERNEL_SCHEDULER_STATUS_OK; }
-#endif
     return scheduler_reschedule(0, 1, 1);
 }
 

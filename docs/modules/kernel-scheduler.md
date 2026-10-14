@@ -22,6 +22,8 @@
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
 | `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
 
+USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0服务；用户`sched_yield`经`kernel_scheduler_user_yield_current()`延后到用户资格恢复，通用`kernel_scheduler_yield_current()`仍实际执行内核调度，等待游标/回调借用归还不使用用户yield标志。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
 等待登记、阻塞提交、期限索引、运行记账、策略更新、队列校验和runnable发布使用统一rank40短锁；heap10→physical20、

@@ -36,6 +36,50 @@ enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,st
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
+/* 本模型省略存储/canary校验，实际切换仍由生产调度决策及机器seam交接。 */
+enum kernel_scheduler_status kernel_scheduler_yield_current(void)
+{ return scheduler_reschedule(0,1,0); }
+static unsigned borrow_quiescing, borrow_ended, quiesce_calls;
+void __real_kernel_wait_backend_quiesce(void);
+void __wrap_kernel_wait_backend_quiesce(void)
+{
+    assert(active==&cpus[0] && active->current->user_service);
+    quiesce_calls++;
+    __atomic_store_n(&borrow_quiescing,1,__ATOMIC_RELEASE);
+    __real_kernel_wait_backend_quiesce();
+    while (!__atomic_load_n(&borrow_ended,__ATOMIC_ACQUIRE)) {}
+}
+static void *end_service_borrow(void *unused)
+{
+    (void)unused; active=&cpus[1]; sync_test_irq=1;
+    while (!__atomic_load_n(&borrow_quiescing,__ATOMIC_ACQUIRE)) {}
+    kernel_wait_task_unpin(&tasks[0]);
+    __atomic_store_n(&borrow_ended,1,__ATOMIC_RELEASE);
+    return 0;
+}
+static unsigned stop_armed, stop_guard_left, stop_claimed;
+void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
+{
+    int pause=stop_armed && guard->lock==&kernel_wait_domain;
+    if (pause) stop_armed=0;
+    __real_kernel_raw_lock_release(guard);
+    if (pause) {
+        __atomic_store_n(&stop_guard_left,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&stop_claimed,__ATOMIC_ACQUIRE)) {}
+    }
+}
+extern void user_stop_case(struct kernel_task *);
+static void *claim_during_stop(void *unused)
+{
+    (void)unused; active=&cpus[1]; sync_test_irq=1;
+    while (!__atomic_load_n(&stop_guard_left,__ATOMIC_ACQUIRE)) {}
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(scheduler_select_next_locked(active,active->current,1)==&tasks[3]);
+      kernel_wait_switch_finish_locked(&idles[1]); active->switch_previous=0; }
+    __atomic_store_n(&stop_claimed,1,__ATOMIC_RELEASE);
+    return 0;
+}
 static void *late_service_notice(void *unused)
 {
     (void)unused; active=&publishers[0]; sync_test_irq=1;
@@ -174,6 +218,27 @@ int main(void)
       ready_remove_locked(&tasks[1]); ready_remove_locked(&tasks[3]);
       assert(!cpus[0].user_reservations.first && !cpus[1].user_reservations.first &&
              !scheduler.user_services.first && !scheduler.runqueue.first); }
+    active=&cpus[0];
+    scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
+    struct kernel_wait_token borrowed_token;
+    assert(!kernel_wait_prepare(0,0,0,&borrowed_token));
+    kernel_wait_task_pin(&tasks[0]);
+    pthread_t borrower; assert(!pthread_create(&borrower,0,end_service_borrow,0));
+    assert(!kernel_wait_finish(&borrowed_token));
+    assert(!pthread_join(borrower,0) && quiesce_calls==1 && !tasks[0].wait.borrows);
+    assert(!borrowed_token.task && tasks[0].wait.phase==KERNEL_WAIT_FINISHED);
+    assert(!tasks[0].user_yielded);
+    assert(!kernel_scheduler_user_yield_current() && tasks[0].user_yielded);
+    tasks[0].user_yielded=0;
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      setup_task(3,2,60); tasks[3].arch.user_mode=1; tasks[3].magic=KERNEL_THREAD_MAGIC; }
+    pthread_t stopper; assert(!pthread_create(&stopper,0,claim_during_stop,0));
+    stop_armed=1; user_stop_case(&tasks[3]);
+    assert(!pthread_join(stopper,0) && stop_claimed);
+    assert(tasks[3].state==KERNEL_THREAD_STATE_RUNNING && tasks[3].wait.on_cpu);
+    assert(tasks[3].signal_pending==(UINT64_C(1)<<18) && tasks[3].user_service_pending);
+    assert(!tasks[3].ready_node.queued);
     puts("user SMP service eligibility and old-stack execution owner passed");
     return 0;
 }

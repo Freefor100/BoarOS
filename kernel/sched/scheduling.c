@@ -94,6 +94,20 @@ int scheduler_user_yield_locked(struct kernel_task *task)
     return 0;
 }
 
+#if BOAROS_USER_SMP
+enum kernel_scheduler_status kernel_scheduler_user_yield_current(void)
+{
+    kernel_assert_can_block();
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    struct kernel_task *task=cpu->current;
+    if (cpu->logical_id || !task || !task->wait.on_cpu ||
+        task->state!=KERNEL_THREAD_STATE_RUNNING || !scheduler_user_yield_locked(task))
+        __builtin_trap();
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+#endif
+
 void scheduler_user_service_set_locked(struct kernel_task *task, int service)
 {
 #if BOAROS_USER_SMP

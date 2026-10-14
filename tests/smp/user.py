@@ -15,7 +15,7 @@ import harness
 from riscv import identity
 CASES=('process-affinity-overlap','pthread-tls-registers-nested-signal',
        'shared-mm-remote-permission-and-truncate','pthread-cancel-pipe-owner',
-       'nonleader-exec-remote-exit','realtime-service-qualification',
+       'nonleader-exec-remote-exit','group-stop-continue-remote-owner','realtime-service-qualification',
        'remote-service-forward-progress')
 
 def results(text, cpus):

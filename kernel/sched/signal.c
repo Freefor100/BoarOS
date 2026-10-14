@@ -894,8 +894,10 @@ static enum kernel_signal_status signal_send_one(
     senders[sig - 1U] = (uint32_t)sender_tid;
     if (process_directed) leader->group_signal_code[sig - 1U] = code;
     else target->signal_code[sig - 1U] = code;
+#if BOAROS_USER_SMP
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       scheduler_user_request_locked(wake_target); }
+#endif
     if (wake_target != 0 && signal_wants_signal(wake_target, sig) &&
         kernel_scheduler_wake_signal(wake_target) !=
             KERNEL_SCHEDULER_STATUS_OK) {
@@ -1043,33 +1045,27 @@ static void signal_terminate(uint32_t sig, int core_dump)
 static void signal_stop_member(struct kernel_task *task, uint32_t sig)
 {
     uint64_t bit = signal_mask(sig);
-
-#if BOAROS_USER_SMP
+    int blocked;
     {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (task != kernel_cpu_current()->current && task->wait.on_cpu &&
-            signal_dispatchable_locked(task)) {
-            /* 运行者必须在自己的恢复边界停车，不能改远端live frame或释放栈。 */
-            task->signal_pending |= bit;
-            scheduler_user_request_locked(task);
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (!signal_dispatchable_locked(task) || task->state==KERNEL_THREAD_STATE_STOPPED)
             return;
-        }
+        task->signal_pending |= bit;
+        blocked=task->state==KERNEL_THREAD_STATE_BLOCKED;
     }
-#endif
-
-    if (!signal_dispatchable(task) ||
-        task->state == KERNEL_THREAD_STATE_STOPPED) {
+    if (blocked && kernel_scheduler_wake_signal(task)!=KERNEL_SCHEDULER_STATUS_OK)
+        return;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if (!signal_dispatchable_locked(task) || task->state==KERNEL_THREAD_STATE_STOPPED)
+        return;
+#if BOAROS_USER_SMP
+    if (task!=kernel_cpu_current()->current && task->wait.on_cpu) {
+        /* 最终提交点复查执行owner：READY可在锁外被CPU1接纳，
+         * 停止请求必须交给该运行者，不能丢掉已消费的组信号。 */
+        scheduler_user_request_locked(task);
         return;
     }
-    if (task->state == KERNEL_THREAD_STATE_BLOCKED) {
-        task->signal_pending |= bit;
-        if (kernel_scheduler_wake_signal(task) !=
-                KERNEL_SCHEDULER_STATUS_OK ||
-            task->state == KERNEL_THREAD_STATE_BLOCKED) {
-            return;
-        }
-    }
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+#endif
     if (task->state == KERNEL_THREAD_STATE_READY) {
         if (task->ready_node.queued) ready_remove_locked(task);
     } else if (task->state != KERNEL_THREAD_STATE_RUNNING ||

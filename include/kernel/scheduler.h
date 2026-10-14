@@ -279,6 +279,10 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *);
 void kernel_thread_join(struct kernel_thread_join *join);
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);
+#if BOAROS_USER_SMP
+/* 仅用户sched_yield服务延后到恢复用户资格；内核等待借用仍实际让出执行。 */
+enum kernel_scheduler_status kernel_scheduler_user_yield_current(void);
+#endif
 
 /*
  * Timer-interrupt path: credits `elapsed_ticks` to the interrupted task
