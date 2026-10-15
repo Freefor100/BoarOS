@@ -1,6 +1,127 @@
 import unittest
 from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_scheduler, validate_resume_selection
 
+class CostConsumerThroughputTest(unittest.TestCase):
+    @staticmethod
+    def method_output(method='readers', children=None, parent='20480.00',
+                      summed='69632.00', minimum='8192.00', maximum='32768.00',
+                      average='17408.00', min_xfer='256.00'):
+        raw=(f'Children see throughput for 4 {method} = {summed} kB/sec\n'
+             f'Parent sees throughput for 4 {method} = {parent} kB/sec\n'
+             f'Min throughput per process = {minimum} kB/sec\n'
+             f'Max throughput per process = {maximum} kB/sec\n'
+             f'Avg throughput per process = {average} kB/sec\n'
+             f'Min xfer = {min_xfer} kB\n')
+        for child, actual, rate in children or ():
+            raw += f'Child[{child}] xfer count = {actual} kB, Throughput = {rate} kB/sec\n'
+        return raw
+
+    def test_stonewall_counts_only_the_reported_child_transfers(self):
+        from cost_consumer import parse_throughput_methods
+        raw=self.method_output(children=((0,'1024.00','32768.00'),(1,'512.00','16384.00'),
+                                         (2,'768.00','12288.00'),(3,'256.00','8192.00')))
+        result=parse_throughput_methods(raw)[0]
+        self.assertEqual(result['method'],'readers')
+        self.assertEqual(result['counted_kib'],2560)
+        self.assertEqual(result['parent_kib_s'],20480)
+        self.assertEqual(result['children_sum_kib_s'],69632)
+        self.assertEqual(result['parent_interval_seconds'],0.125)
+        self.assertEqual([c['interval_seconds'] for c in result['children']],
+                         [0.03125,0.03125,0.0625,0.03125])
+
+    def test_complete_four_files_and_multiple_methods_keep_separate_intervals(self):
+        from cost_consumer import parse_throughput_methods
+        full=self.method_output(method='re-readers',parent='65536.00',summed='122880.00',
+            minimum='8192.00',maximum='65536.00',average='30720.00',min_xfer='1024.00',
+            children=((0,'1024.00','16384.00'),(1,'1024.00','32768.00'),
+                      (2,'1024.00','8192.00'),(3,'1024.00','65536.00')))
+        methods=parse_throughput_methods(self.method_output()+full)
+        self.assertEqual([m['method'] for m in methods],['readers','re-readers'])
+        result=methods[1]
+        self.assertEqual(result['counted_kib'],4096)
+        self.assertEqual(result['parent_interval_seconds'],0.0625)
+        self.assertEqual([c['interval_seconds'] for c in result['children']],
+                         [0.0625,0.03125,0.125,0.015625])
+
+    def test_missing_or_partial_child_details_leave_total_and_parent_interval_unknown(self):
+        from cost_consumer import parse_throughput_methods
+        for children in (None,((0,'1024.00','32768.00'),)):
+            result=parse_throughput_methods(self.method_output(children=children))[0]
+            self.assertEqual(result['child_count'],4)
+            self.assertEqual(result['min_kib_s'],8192)
+            self.assertEqual(result['max_kib_s'],32768)
+            self.assertEqual(result['avg_kib_s'],17408)
+            self.assertEqual(result['min_xfer_kib'],256)
+            self.assertIsNone(result['counted_kib'])
+            self.assertIsNone(result['parent_interval_seconds'])
+            self.assertEqual(result['children'],None if children is None else [
+                dict(child=0,actual_kib=1024.0,rate_kib_s=32768.0,interval_seconds=0.03125)])
+        partial=parse_throughput_methods('Children see throughput for 4 readers = 40.00 kB/sec\n')[0]
+        self.assertIsNone(partial['parent_kib_s'])
+        self.assertIsNone(partial['min_xfer_kib'])
+        self.assertEqual(parse_throughput_methods('iozone test complete.\n'),[])
+
+    def test_independently_rounded_header_and_child_rates_are_accepted(self):
+        from cost_consumer import parse_throughput_methods
+        raw=self.method_output(parent='100.00',summed='133.34',minimum='33.34',
+            maximum='33.34',average='33.34',min_xfer='256.00',
+            children=tuple((i,'256.00','33.34') for i in range(4)))
+        result=parse_throughput_methods(raw)[0]
+        self.assertEqual(result['counted_kib'],1024)
+        self.assertEqual(result['parent_interval_seconds'],10.24)
+        with self.assertRaises(ValueError):parse_throughput_methods(raw.replace('133.34','133.30'))
+
+    def test_zero_progress_remains_a_reported_stonewall_result(self):
+        from cost_consumer import parse_throughput_methods
+        raw=self.method_output(parent='0.00',summed='0.00',minimum='0.00',maximum='0.00',
+            average='0.00',min_xfer='0.00',children=tuple((i,'0.00','0.00') for i in range(4)))
+        result=parse_throughput_methods(raw)[0]
+        self.assertEqual(result['counted_kib'],0)
+        self.assertIsNone(result['parent_interval_seconds'])
+        self.assertEqual([c['interval_seconds'] for c in result['children']],[None]*4)
+        # The original minimum uses zero as its sentinel. Preserve its output;
+        # do not reject a zero child because the printed minimum is nonzero.
+        raw=self.method_output(parent='10000.00',summed='57344.00',minimum='8192.00',maximum='32768.00',
+            average='14336.00',min_xfer='256.00',
+            children=((0,'0.00','0.00'),(1,'1024.00','32768.00'),(2,'256.00','8192.00'),(3,'512.00','16384.00')))
+        result=parse_throughput_methods(raw)[0]
+        self.assertIsNone(result['children'][0]['interval_seconds'])
+        self.assertEqual(result['min_xfer_kib'],256)
+        self.assertEqual(result['children'][1]['interval_seconds'],0.03125)
+        self.assertEqual(result['counted_kib'],1792)
+        self.assertEqual(result['parent_interval_seconds'],0.1792)
+
+    def test_nonfinite_negative_duplicate_and_inconsistent_results_are_rejected(self):
+        from cost_consumer import parse_throughput_methods
+        raw=self.method_output(children=((0,'1024.00','32768.00'),(1,'512.00','16384.00'),
+                                         (2,'768.00','12288.00'),(3,'256.00','8192.00')))
+        for field in ('parent','summed','minimum','maximum','average','min_xfer'):
+            for value in ('-1','nan','inf'):
+                with self.subTest(field=field,value=value),self.assertRaises(ValueError):
+                    parse_throughput_methods(self.method_output(**{field:value}))
+        for bad in (raw.replace('xfer count = 1024.00','xfer count = nan'),
+                    raw.replace('Throughput = 32768.00','Throughput = -1'),
+                    raw.replace('Child[3]','Child[0]'),raw.replace('Child[3]','Child[4]'),
+                    raw.replace('Parent sees throughput for 4','Parent sees throughput for 3'),
+                    raw+raw):
+            with self.subTest(raw=bad),self.assertRaises(ValueError):parse_throughput_methods(bad)
+
+    def test_commands_preserve_metrics_and_new_fields_are_optional_in_old_records(self):
+        from cost_consumer import commands,validate_record
+        from copy import deepcopy
+        name='consumer-musl-1'
+        raw=self.method_output()+'iozone test complete.\n'
+        output=f'COST COMMAND BEGIN {name}\n{raw}COST RESULT {name} 123\nCOST COMMAND RESULT {name} 0 0\n'
+        command=commands(output,expected_names={name})[0]
+        self.assertEqual(command['throughput_methods'][0]['parent_kib_s'],20480)
+        self.assertIsNone(command['throughput_methods'][0]['counted_kib'])
+        row=CostReportTest().consumer_record()
+        for c in row['commands']:c.pop('throughput_methods',None)
+        validate_record(row,True)
+        new=deepcopy(row)
+        new['commands'][1]['throughput_methods']=[]
+        with self.assertRaises(ValueError):validate_record(new,True)
+
 class CostFixtureTest(unittest.TestCase):
     def test_resume_cannot_omit_or_add_frozen_mode(self):
         from cost_fixture import validate_resume_fixture
@@ -200,6 +321,7 @@ class CostReportTest(unittest.TestCase):
                                    ('still running',0,0)]:
             broken=deepcopy(row);c=broken['commands'][0]
             c.update(raw_output=raw,timeout=timeout,wait_status=status,**classify(raw,timeout,status))
+            c.pop('throughput_methods',None)  # Historical records have no parsed metrics.
             validate_record(broken,False)
             with self.assertRaises(ValueError):validate_record(broken,True)
         for field,value in [('timeout',1),('wait_status',32512),('raw_output','FATAL: kernel too old'),
@@ -237,6 +359,7 @@ class CostReportTest(unittest.TestCase):
                         valid.replace('10','0'),valid.replace('10','nan'),valid.replace('10','inf')):
                 broken=deepcopy(row);c=broken['commands'][index]
                 c.update(raw_output=raw,reported_sections=[],**classify(raw,0,0))
+                c.pop('throughput_methods',None)
                 validate_record(broken,False)
                 with self.assertRaises(ValueError):validate_record(broken,True)
         wrong=deepcopy(row);c=wrong['commands'][1]

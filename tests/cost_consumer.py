@@ -42,6 +42,83 @@ def classify(raw, timeout, status):
     return dict(completion_marker=marker,process_completed=process_completed,
                 requested_tests_available=available,outcome=outcome,reason=reason)
 
+def parse_throughput_methods(raw):
+    """Keep original kB (KiB) results and estimate intervals from rounded -C rows.
+
+    Children is the sum of independently timed child rates. Only complete child
+    transfer counts supply the numerator for the separately timed Parent rate.
+    Missing/zero progress cannot establish an interval and remains unknown.
+    """
+    methods=[]
+    current=None
+    seen=set()
+
+    def number(value):
+        result=float(value)
+        if not math.isfinite(result) or result<0:
+            raise ValueError('invalid original throughput value')
+        return result
+
+    def finish():
+        if current is None:return
+        children=current['children']
+        count=current['child_count']
+        if children is not None and len(children)==count:
+            # Each printed rate and their independently printed sum round to
+            # two decimals; summing the displayed children is not exact proof.
+            summed=sum(c['rate_kib_s'] for c in children)
+            if abs(summed-current['children_sum_kib_s'])>0.005*(count+1)+1e-9:
+                raise ValueError('child throughput sum differs from original header')
+            current['counted_kib']=sum(c['actual_kib'] for c in children)
+            parent=current['parent_kib_s']
+            if current['counted_kib']>0 and parent is not None and parent>0:
+                current['parent_interval_seconds']=current['counted_kib']/parent
+        methods.append(current)
+
+    for line in raw.splitlines():
+        line=line.strip()
+        header=re.fullmatch(r'(Children see|Parent sees) throughput for\s+(\d+)\s+(.+?)\s*=\s*(\S+)\s+kB/sec',line)
+        if header:
+            who,count,method,value=header.groups()
+            count=int(count);method=method.strip()
+            if count<1:raise ValueError('invalid original child count')
+            value=number(value)
+            if who=='Children see':
+                finish()
+                if method in seen:raise ValueError('duplicate original throughput method')
+                seen.add(method)
+                current=dict(method=method,child_count=count,children_sum_kib_s=value,
+                    parent_kib_s=None,min_kib_s=None,max_kib_s=None,avg_kib_s=None,
+                    min_xfer_kib=None,children=None,counted_kib=None,parent_interval_seconds=None)
+            else:
+                if current is None or current['method']!=method or current['child_count']!=count:
+                    raise ValueError('unpaired original Parent throughput')
+                if current['parent_kib_s'] is not None:raise ValueError('duplicate original Parent throughput')
+                current['parent_kib_s']=value
+            continue
+        summary=re.fullmatch(r'(Min|Max|Avg) throughput per (?:process|thread)\s*=\s*(\S+)\s+kB/sec',line)
+        xfer=re.fullmatch(r'Min xfer\s*=\s*(\S+)\s+kB',line)
+        if summary or xfer:
+            if current is None:raise ValueError('unpaired original throughput summary')
+            key=summary[1].lower()+'_kib_s' if summary else 'min_xfer_kib'
+            if current[key] is not None:raise ValueError('duplicate original throughput summary')
+            current[key]=number(summary[2] if summary else xfer[1])
+            continue
+        child=re.match(r'Child\[(\d+)\] xfer count\s*=\s*(\S+)\s+kB,\s*Throughput\s*=\s*(\S+)\s+kB/sec(?:$|,)',line)
+        if child:
+            if current is None:raise ValueError('unpaired original child throughput')
+            index=int(child[1]);actual=number(child[2]);rate=number(child[3])
+            if current['children'] is None:current['children']=[]
+            children=current['children']
+            if index>=current['child_count'] or any(c['child']==index for c in children):
+                raise ValueError('duplicate/invalid original child index')
+            children.append(dict(child=index,actual_kib=actual,rate_kib_s=rate,
+                interval_seconds=actual/rate if actual>0 and rate>0 else None))
+            continue
+        if line.startswith('Child['):raise ValueError('invalid original child throughput row')
+    finish()
+    return methods
+
 def commands(output, expected_budget_ms=180000, expected_names=None):
     policies=re.findall(r'^COST CONSUMER BUDGET ([^\n]+)$',output,re.M)
     if len(policies)>1:raise ValueError('duplicate consumer budget')
@@ -62,7 +139,9 @@ def commands(output, expected_budget_ms=180000, expected_names=None):
             timing=re.findall(r'^COST COMMAND TIMING '+name+r' (\d+) (\d+)$',output,re.M)
             if len(timing)>1:raise ValueError('duplicate command timing '+name)
             split_timing=dict(zip(('program_ns','drain_ns'),map(int,timing[0]))) if timing else {}
-            result.append(dict(command_timeout_ms=budget,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**split_timing,**classify(raw,timeout,status)))
+            result.append(dict(command_timeout_ms=budget,reported_sections=sections,
+                throughput_methods=parse_throughput_methods(raw),name=name,elf_sha256=ELFS[libc],argv=argv,
+                cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**split_timing,**classify(raw,timeout,status)))
     return result
 
 def validate_method_results(raw, index):
@@ -114,6 +193,8 @@ def validate_record(row, require_completion=False):
             raise ValueError('original argv/ELF/cwd/budget changed')
         actual=classify(c['raw_output'],c['timeout'],c['wait_status'])
         if c['timeout'] not in (0,1) or any(c.get(k)!=v for k,v in actual.items()):raise ValueError('incorrect completion classification')
+        if 'throughput_methods' in c and c['throughput_methods']!=parse_throughput_methods(c['raw_output']):
+            raise ValueError('parsed original throughput differs from raw output')
         if require_completion:
             # The fixed Linux reference independently rejects only (11,12).
             if not actual['process_completed'] or (index!='7' and actual['outcome']!='completed'):
