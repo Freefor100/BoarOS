@@ -507,6 +507,126 @@ static void expanded_index_case(struct kernel_page_cache *cache,struct kernel_vf
     puts("PASS expanded cache index: 64 distinct cold pages, complete contents, allocation/I/O/request-free hits");
 }
 
+static void wait_writeback_round(struct kernel_page_cache *cache, uint64_t before)
+{
+    struct timespec start, now; assert(!clock_gettime(CLOCK_MONOTONIC,&start));
+    for (;;) {
+        struct kernel_page_cache_concurrency_state state;
+        kernel_page_cache_get_concurrency_state(cache,&state);
+        if (state.writeback_rounds>before) return;
+        assert(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);
+        sched_yield();
+    }
+}
+static void dirty_index_case(struct kernel_page_cache *cache, struct kernel_vfs_mount *mount,
+    struct kernel_vfs_file *file, unsigned actors)
+{
+    unsigned char data[BOAROS_PAGE_SIZE]; memset(data,0x4b,sizeof(data)); size_t done;
+    for (unsigned i=0;i<256;i++)
+        assert(!kernel_vfs_pwrite(file,(uint64_t)i*BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    uint64_t observed=kernel_vfs_error_sequence(file);
+    assert(!kernel_vfs_sync(file,0,&observed));
+    const unsigned sparse[]={211,1,99}; unsigned char value=0x69;
+    for (unsigned i=0;i<3;i++)
+        assert(!kernel_vfs_pwrite(file,(uint64_t)sparse[i]*BOAROS_PAGE_SIZE+17,&value,1,&done) && done==1);
+    assert(!kernel_page_cache_start_worker(cache));
+    struct kernel_page_cache_concurrency_state state;
+    struct kernel_page_cache_statistics before, after;
+    kernel_page_cache_get_concurrency_state(cache,&state);
+    assert(state.index_live>=256 && state.index_capacity>=512);
+    kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache)); wait_writeback_round(cache,state.writeback_rounds);
+    kernel_page_cache_get_statistics(cache,&after);
+    printf("sparse dirty worker: clean-index=%zu dirty-visits=%llu written=%llu\n",state.index_capacity,
+        (unsigned long long)(after.worker_scanned-before.worker_scanned),
+        (unsigned long long)(after.worker_written-before.worker_written));
+    assert(after.worker_scanned-before.worker_scanned==3 && after.worker_written-before.worker_written==3);
+    assert(kernel_vfs_error_sequence(file)==observed);
+    for (unsigned i=0;i<3;i++) {
+        unsigned char actual;
+        assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),(uint64_t)sparse[i]*BOAROS_PAGE_SIZE+17,&actual,1,&done) && done==1 && actual==value);
+    }
+    const unsigned reverse[]={1,0};
+    for (unsigned i=0;i<2;i++)
+        assert(!kernel_vfs_pwrite(file,(uint64_t)reverse[i]*BOAROS_PAGE_SIZE+31,&value,1,&done) && done==1);
+    kernel_page_cache_get_concurrency_state(cache,&state); kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache)); wait_writeback_round(cache,state.writeback_rounds);
+    kernel_page_cache_get_statistics(cache,&after);
+    assert(after.worker_written-before.worker_written==2 && after.worker_scanned-before.worker_scanned==2 &&
+        kernel_vfs_error_sequence(file)==observed && !kernel_vfs_sync(file,0,&observed));
+    for (unsigned i=0;i<2;i++) {
+        unsigned char actual;
+        assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),(uint64_t)reverse[i]*BOAROS_PAGE_SIZE+31,&actual,1,&done) && done==1 && actual==value);
+    }
+    puts("PASS dirty order: randomized sparse offsets and descending adjacent pages, real readback, no writeback error");
+    for (unsigned i=0;i<3;i++)
+        assert(!kernel_vfs_pwrite(file,(uint64_t)sparse[2-i]*BOAROS_PAGE_SIZE+19,&value,1,&done) && done==1);
+    write_error=1;
+    kernel_page_cache_get_concurrency_state(cache,&state); kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache)); wait_writeback_round(cache,state.writeback_rounds);
+    kernel_page_cache_get_statistics(cache,&after);
+    assert(after.worker_scanned-before.worker_scanned==3 && after.worker_failed-before.worker_failed==3);
+    kernel_page_cache_get_concurrency_state(cache,&state);
+    assert(!kernel_page_cache_request_writeback(cache)); wait_writeback_round(cache,state.writeback_rounds);
+    kernel_page_cache_get_statistics(cache,&after);
+    assert(after.worker_scanned-before.worker_scanned==6 && after.worker_written-before.worker_written==3);
+    /* The round cursor points to the other inode while this first inode's
+     * device write is held. Removing it must update the persistent cursor. */
+    struct kernel_vfs_file other={0}; char name[40];
+    snprintf(name,sizeof(name),"/dirty-cursor-%u",actors);
+    assert(!kernel_vfs_create(mount,name,0600,&other));
+    assert(!kernel_vfs_pwrite(file,99*BOAROS_PAGE_SIZE+23,&value,1,&done) && done==1);
+    assert(!kernel_vfs_pwrite(&other,0,&value,1,&done) && done==1);
+    pause_write=1; write_entered=resume_write=0;
+    kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache));
+    while (!__atomic_load_n(&write_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_vfs_ftruncate(&other,0) && !kernel_vfs_close(&other));
+    struct kernel_vfs_file added={0};
+    snprintf(name,sizeof(name),"/dirty-new-%u",actors);
+    assert(!kernel_vfs_create(mount,name,0600,&added));
+    assert(!kernel_vfs_pwrite(&added,0,&value,1,&done) && done==1);
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+    struct timespec start,now; assert(!clock_gettime(CLOCK_MONOTONIC,&start));
+    for (;;) {
+        kernel_page_cache_get_statistics(cache,&after);
+        if (after.worker_written>=before.worker_written+2) break;
+        assert(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5); sched_yield();
+    }
+    kernel_page_cache_stop_worker(cache);
+    assert(after.worker_scanned-before.worker_scanned==2 && !kernel_vfs_node_dirty_pages(kernel_vfs_file_node(file))->count);
+    unsigned char actual;
+    assert(!kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&added))->count);
+    assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(&added),0,&actual,1,&done) && done==1 && actual==value);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&added)) && !kernel_vfs_close(&added));
+    puts("PASS dirty worker round: error retry, new dirty publication during held I/O, cursor inode truncate/close");
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
+    kernel_page_cache_get_concurrency_state(cache,&state); size_t capacity=state.index_capacity;
+    size_t baseline_live=state.index_live;
+    assert(baseline_live<64);
+    assert(!kernel_vfs_ftruncate(file,(uint64_t)2304*BOAROS_PAGE_SIZE));
+    for (unsigned wave=0;wave<32;wave++) {
+        for (unsigned i=0;i<64;i++) {
+            uint64_t address; size_t valid;
+            assert(!kernel_page_cache_get(cache,file,256+wave*64+i,&address,&valid) && valid==BOAROS_PAGE_SIZE);
+            assert(!physical_page_release(cache->allocator,address));
+        }
+        assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
+        kernel_page_cache_get_concurrency_state(cache,&state);
+        if (state.index_capacity!=capacity) fprintf(stderr,"tombstone churn grew wave=%u old=%zu new=%zu live=%zu tombstones=%zu\n",
+            wave,capacity,state.index_capacity,state.index_live,state.index_tombstones);
+        assert(state.index_live==baseline_live && state.index_capacity==capacity);
+    }
+    printf("PASS tombstone churn: 2048 distinct pages, live<=64, stable index capacity=%zu\n",capacity);
+    assert(!kernel_vfs_ftruncate(file,64*BOAROS_PAGE_SIZE));
+    for (unsigned i=0;i<64;i++) {
+        memset(data,0x30+i,sizeof(data));
+        assert(!kernel_vfs_pwrite(file,(uint64_t)i*BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    }
+    observed=kernel_vfs_error_sequence(file);
+    assert(!kernel_vfs_sync(file,0,&observed) && !kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
+}
+
 struct demand_read {
     unsigned cpu, done;
     uint64_t first;
@@ -1023,6 +1143,7 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
         alias_snapshot(cache, &file, pages,32,force_retry);
     }
     expanded_index_case(cache,&file,pages);
+    dirty_index_case(cache,&mount,&file,actors);
     demand_cases(cache, &file, actors);
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_unmount(&mount));

@@ -273,7 +273,14 @@ static void background_case(struct kernel_vfs_file *file)
     check(kernel_vfs_sync(file, 1, &observed) == 0 && kernel_vfs_ftruncate(file, 0) == 0, 60);
     /* Publish all dirty pages before starting the threshold worker. */
     unsigned pages = (unsigned)(physical_page_total(&allocator) / 10 + 8);
-    write_pages(file, pages);
+    unsigned clean_pages = pages * 3;
+    write_pages(file, clean_pages);
+    check(kernel_vfs_sync(file,1,&observed)==0, 67);
+    for (unsigned i=0;i<pages;i++) {
+        unsigned page=(pages-1-i)*3; size_t written;
+        memset(bytes,(int)(page%251+1),sizeof(bytes));
+        check(kernel_vfs_pwrite(file,(uint64_t)page*4096,bytes,sizeof(bytes),&written)==0 && written==sizeof(bytes),68);
+    }
     struct kernel_page_cache_statistics before;
     kernel_page_cache_get_statistics(&cache, &before);
     /* Reserve independent pages; no contiguous snapshot allocation is needed. */
@@ -293,11 +300,13 @@ static void background_case(struct kernel_vfs_file *file)
     kernel_page_cache_stop_worker(&cache);
     probe = 0;
     number("writeback background maximum bytes: ", maximum);
+    number("writeback sparse dirty visits: ", stats.worker_scanned-before.worker_scanned);
+    check(stats.worker_scanned-before.worker_scanned<=pages,69);
     check(stats.worker_written >= before.worker_written + pages / 3 && stats.worker_failed == before.worker_failed &&
           maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096, 64);
     check(kernel_vfs_sync(file, 1, &observed) == 0 &&
           kernel_page_cache_invalidate_node(&cache, kernel_vfs_file_node(file)) == KERNEL_PAGE_CACHE_STATUS_OK, 65);
-    read_pages(file, pages);
+    read_pages(file, clean_pages);
 }
 static void exercise(void *argument)
 {

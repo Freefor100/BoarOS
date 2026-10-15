@@ -101,6 +101,7 @@ struct kernel_page_cache_concurrency_state {
     uint32_t pending, running;
     size_t entry_bytes, record_bytes, request_bytes;
     size_t execution_request_bytes;
+    size_t index_capacity, index_live, index_tombstones;
     uint64_t executions_queued, executions_completed;
     uint64_t queue_ns, execute_ns, max_queue_ns, max_execute_ns;
 };

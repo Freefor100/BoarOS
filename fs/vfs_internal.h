@@ -12,7 +12,8 @@ struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file
 struct kernel_page_cache;
 struct kernel_page_cache_entry;
 struct kernel_page_cache_dirty {
-    struct kernel_page_cache_entry *head;
+    struct kernel_page_cache_entry *head, **tail;
+    struct kernel_page_cache_dirty *queue_next, *queue_previous;
     size_t count;
 };
 struct kernel_vfs_file;
