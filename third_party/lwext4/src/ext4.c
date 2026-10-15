@@ -90,6 +90,7 @@ struct ext4_mountpoint {
 
 	/* Optional adapter-owned realtime source; cleared on mount reuse. */
 	ext4_clock_read clock;
+	struct ext4_time_observer time_observer;
 	struct ext4_journal_runtime journal_runtime;
 
 	/**@brief   Ext4 filesystem internals.*/
@@ -365,11 +366,25 @@ static void ext4_time_store(struct ext4_inode_ref *ref, size_t base_offset,
     ref->dirty = true;
 }
 
+static void ext4_publish_times(struct ext4_mountpoint *mp,
+                              struct ext4_inode_ref *ref, unsigned fields)
+{
+    static const size_t base[3] = {offsetof(struct ext4_inode, access_time),
+        offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, change_inode_time)};
+    static const size_t extra[3] = {offsetof(struct ext4_inode, atime_extra),
+        offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
+    if (!mp->time_observer.store) return;
+    for (unsigned i = 0; i < 3; i++) if (fields & (1U << i))
+        mp->time_observer.store(mp->time_observer.context, ref->index, i,
+                               ext4_time_load(ref, base[i], extra[i]));
+}
+
 static void ext4_touch_inode(struct ext4_mountpoint *mp,
                              struct ext4_inode_ref *ref, unsigned int fields)
 {
     struct ext4_timestamp now;
     if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return;
+    if (ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_NOATIME)) fields &= ~EXT4_TIME_ATIME;
     if (fields & EXT4_TIME_RELATIME) {
         struct ext4_timestamp atime = ext4_time_load(ref,
             offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
@@ -391,6 +406,7 @@ static void ext4_touch_inode(struct ext4_mountpoint *mp,
     if (fields & EXT4_TIME_CTIME)
         ext4_time_store(ref, offsetof(struct ext4_inode, change_inode_time),
                         offsetof(struct ext4_inode, ctime_extra), now);
+    ext4_publish_times(mp, ref, fields);
 }
 
 static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
@@ -889,7 +905,7 @@ static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
 }
 
 __unused
-static int __ext4_trans_start(struct ext4_mountpoint *mp)
+static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	if (!journal) return EOK;
@@ -905,12 +921,13 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 			if (ext4_group_due(mp, false)) {
 				uint64_t target = journal->running->sequence;
 				r = ext4_group_freeze(mp, false);
-				if (r == EAGAIN) r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_SEALED);
+				if (r == EAGAIN && wait) r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_SEALED);
 				if (r != EOK) return r;
 				if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
 			}
 			bool reuse = ext4_space_waits_checkpoint(mp);
 			if (!reuse && jbd_journal_operation_room(journal, 0, 0, NULL, 0)) break;
+			if (!wait) return EAGAIN;
 			uint64_t target = reuse ? journal->accepted_sequence : jbd_journal_reclaim_target(journal);
 			if (!target || target <= journal->checkpoint_sequence) return ENOMEM;
 			r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
@@ -1122,13 +1139,14 @@ int ext4_recover(const char *mount_point __unused)
 	return r;
 }
 
-static int ext4_trans_start(struct ext4_mountpoint *mp __unused)
+static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait __unused)
 {
 	if (!mp) return ENOENT;
 	if (mp->fs.super_replay_required) return EUCLEAN;
 	if (mp->fs.read_only) return EROFS;
 #if CONFIG_JOURNALING_ENABLE
-	if (mp->fs.jbd_journal) return __ext4_trans_start(mp);
+	if (!wait && mp->transaction_depth) return EAGAIN;
+	if (mp->fs.jbd_journal) return __ext4_trans_start(mp, wait);
 #endif
 	if (mp->transaction_depth == UINT32_MAX) return EOVERFLOW;
 	if (mp->transaction_depth++ == 0)
@@ -1136,17 +1154,23 @@ static int ext4_trans_start(struct ext4_mountpoint *mp __unused)
 	return EOK;
 }
 
+static int ext4_trans_start(struct ext4_mountpoint *mp)
+{ return ext4_trans_start_mode(mp, true); }
+
 static int ext4_trans_finish(struct ext4_mountpoint *mp __unused, int result)
 {
+    if (!mp->transaction_depth) return result ? result : EINVAL;
 #if CONFIG_JOURNALING_ENABLE
-	if (mp->fs.jbd_journal) return __ext4_trans_finish(mp, result);
+    if (mp->fs.jbd_journal) result = __ext4_trans_finish(mp, result);
+    else
 #endif
-	if (!mp->transaction_depth) return result ? result : EINVAL;
-	if (--mp->transaction_depth == 0) {
-		int cleanup = ext4_bcache_scope_end(&mp->bc, &mp->transaction_scope);
-		if (result == EOK) result = cleanup;
-	}
-	return result;
+    if (--mp->transaction_depth == 0) {
+        int cleanup = ext4_bcache_scope_end(&mp->bc, &mp->transaction_scope);
+        if (result == EOK) result = cleanup;
+    }
+    if (!mp->transaction_depth && mp->time_observer.finish)
+        mp->time_observer.finish(mp->time_observer.context, result == EOK);
+    return result;
 }
 
 static bool ext4_file_rolled_back(ext4_file *file, int result)
@@ -1266,6 +1290,21 @@ int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock)
     return EOK;
 }
 
+bool ext4_file_read_clock(const ext4_file *file, struct ext4_timestamp *now)
+{
+    return file && file->mp && file->mp->mounted && file->mp->clock &&
+        file->mp->clock(now);
+}
+
+int ext4_mount_setup_time_observer(const char *mount_point,
+                                  const struct ext4_time_observer *observer)
+{
+    struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+    if (!mp) return ENOENT;
+    mp->time_observer = observer ? *observer : (struct ext4_time_observer){0};
+    return EOK;
+}
+
 int ext4_file_relatime_needed(ext4_file *file, bool *needed)
 {
     if (!file || !file->mp || !file->mp->mounted || !needed) return EINVAL;
@@ -1285,8 +1324,9 @@ int ext4_file_relatime_needed(ext4_file *file, bool *needed)
             offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
         struct ext4_timestamp ctime = ext4_time_load(&ref,
             offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
-        *needed = !(ext4_time_compare(mtime, atime) < 0 &&
-            ext4_time_compare(ctime, atime) < 0 && now.seconds - atime.seconds < 86400);
+        *needed = !ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_NOATIME) &&
+            !(ext4_time_compare(mtime, atime) < 0 &&
+              ext4_time_compare(ctime, atime) < 0 && now.seconds - atime.seconds < 86400);
         result = ext4_fs_put_inode_ref(&ref);
     }
     EXT4_MP_UNLOCK(mp);
@@ -1325,8 +1365,8 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     return result;
 }
 
-int ext4_file_set_times(ext4_file *file, unsigned fields,
-                       const struct ext4_timestamp times[3])
+static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
+                       const struct ext4_timestamp supplied[3], bool publish, bool wait)
 {
     static const size_t base[3] = {
         offsetof(struct ext4_inode, access_time),
@@ -1341,8 +1381,15 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     struct ext4_mountpoint *mp = file->mp;
     struct ext4_inode_ref ref;
+    struct ext4_timestamp current[3];
+    const struct ext4_timestamp *times = supplied;
     int r = EOK;
     EXT4_MP_LOCK(mp);
+    if (!publish) {
+        times = current;
+        fields = mp->time_observer.snapshot
+            ? mp->time_observer.snapshot(file->time_owner, current) : 0;
+    }
     if (fields & ~(EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME) ||
         (fields && !times)) { r = EINVAL; goto Unlock; }
     for (unsigned i = 0; i < 3; i++) {
@@ -1353,15 +1400,20 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
     }
     if (!fields) goto Unlock;
     if (mp->fs.read_only) { r = EROFS; goto Unlock; }
-    r = ext4_trans_start(mp);
+    r = ext4_trans_start_mode(mp, wait);
     if (r != EOK) goto Unlock;
     r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    if (!publish && mp->time_observer.snapshot)
+        fields = mp->time_observer.snapshot(file->time_owner, current);
     if (r == EOK) {
         for (unsigned i = 0; i < 3; i++)
             if (fields & (1U << i)) ext4_time_store(&ref, base[i], extra[i], times[i]);
+        if (publish) ext4_publish_times(mp, &ref, fields);
         r = ext4_fs_put_inode_ref(&ref);
     }
     r = ext4_trans_finish(mp, r);
+    if (!publish && !mp->transaction_depth && mp->time_observer.written)
+        mp->time_observer.written(file->time_owner, fields, times, r);
     ext4_file_completed(file, r);
 Unlock:
     if (r != EOK && mp->fs.curr_trans && !mp->fs.curr_trans->error)
@@ -1369,6 +1421,13 @@ Unlock:
     EXT4_MP_UNLOCK(mp);
     return r;
 }
+
+int ext4_file_set_times(ext4_file *file, unsigned fields,
+                       const struct ext4_timestamp times[3])
+{ return ext4_file_set_times_common(file, fields, times, true, true); }
+
+int ext4_file_writeback_times(ext4_file *file, bool wait)
+{ return ext4_file_set_times_common(file, 0, NULL, false, wait); }
 
 static int ext4_file_set_mode_common(ext4_file *file, uint32_t mode, bool initial)
 {
@@ -1879,6 +1938,7 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 		f->sync_tid = mp->fs.jbd_journal ? mp->fs.jbd_journal->committed_id : 0;
 		f->sync_sequence = mp->fs.jbd_journal ? mp->fs.jbd_journal->accepted_sequence : 0;
 		f->data_sequence = f->sync_sequence;
+		f->time_owner = NULL;
 
 		if (f->flags & O_APPEND)
 			f->fpos = f->fsize;
@@ -2748,6 +2808,7 @@ int ext4_fclose(ext4_file *file)
 	file->sync_tid = 0;
 	file->sync_sequence = 0;
 	file->data_sequence = 0;
+	file->time_owner = NULL;
 
 	return EOK;
 }
@@ -3491,10 +3552,24 @@ Retry:
     int direct_result = ext4_direct_write_flush(&ref, file, direct);
     if (!r) r = direct_result;
     ext4_free(direct);
+    struct ext4_timestamp times[3];
+    unsigned fields = !r && file->mp->time_observer.snapshot
+        ? file->mp->time_observer.snapshot(file->time_owner, times) : 0;
+    if (!r && fields) {
+        if (fields & EXT4_TIME_ATIME) ext4_time_store(&ref,
+            offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra), times[0]);
+        if (fields & EXT4_TIME_MTIME) ext4_time_store(&ref,
+            offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra), times[1]);
+        if (fields & EXT4_TIME_CTIME) ext4_time_store(&ref,
+            offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra), times[2]);
+    }
 	file->fsize = ext4_inode_get_size(&fs->sb, ref.inode);
 	int cleanup = ext4_fs_put_inode_ref(&ref);
 	if (!r) r = cleanup;
 	r = ext4_trans_finish(file->mp, r);
+	if (!file->mp->transaction_depth && file->mp->time_observer.written) {
+		file->mp->time_observer.written(file->time_owner, fields, times, r);
+	}
 Completed:
 	if (ext4_file_rolled_back(file, r)) {
 		file->fsize = saved_size; file->fpos = saved_pos;
@@ -4795,6 +4870,7 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
         file->sync_tid = mp->fs.jbd_journal ? mp->fs.jbd_journal->committed_id : 0;
         file->sync_sequence = mp->fs.jbd_journal ? mp->fs.jbd_journal->accepted_sequence : 0;
         file->data_sequence = file->sync_sequence;
+        file->time_owner = NULL;
         file->fsize = ext4_inode_get_size(&mp->fs.sb, ref.inode);
         file->fmax = ext4_inode_max_size(&mp->fs, ref.inode);
         result = ext4_fs_put_inode_ref(&ref);

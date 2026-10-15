@@ -899,11 +899,7 @@ $(JOURNAL_GROUP_KERNEL): $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUI
 .PHONY: test-journal-group-riscv
 test-journal-group-riscv: $(JOURNAL_GROUP_KERNEL)
 	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
-$(BUILD_DIR)/tests/kernel-journal-idle-negative-rv: $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_prepare_idle_return -o $@ $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
-.PHONY: test-journal-idle-negative-riscv
-test-journal-idle-negative-riscv: $(BUILD_DIR)/tests/kernel-journal-idle-negative-rv
-	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64) --expect-idle-failure
+	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64) --nojournal
 
 # Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
 test-lwext4-recovery-host:

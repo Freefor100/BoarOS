@@ -3476,8 +3476,14 @@ static void finish_sticky_metadata_test(const struct dtb_memory_range *mmio,
         fail_files(422U, 0, written);
     unsigned int before_failure = time_write_calls;
     int result = kernel_vfs_file_modified(&file, 0U, 0);
+    if (result != 0 || time_write_failures != 1U ||
+        time_write_calls != before_failure || kernel_vfs_file_size(&file) != 0U)
+        fail_files(423U, 0, result);
+    /* Ordinary I/O has published RAM time only. Encoding it through fsync
+     * reaches the actual device error, which the journal must retain. */
+    result = kernel_vfs_sync(&file, 0, &observed_error);
     if (result != -KERNEL_EIO || time_write_failures != 0U ||
-        time_write_calls <= before_failure || kernel_vfs_file_size(&file) != 0U)
+        time_write_calls <= before_failure)
         fail_files(423U, -KERNEL_EIO, result);
     /* Remove the device fault: subsequent errors must come from the journal's
      * retained failure, not from repeated fault injection. */
@@ -3983,7 +3989,8 @@ static void run_partial_write_test(const void *dtb)
             KERNEL_MM_STATUS_OK)
         fail_files(432U, KERNEL_MM_STATUS_NO_MEMORY, shared_fault);
 
-    /* Successful metadata submission still updates the observed timestamp. */
+    /* The mounted clock drives immediate runtime visibility; disk encoding
+     * waits until sync or unmount even when no user bytes were written. */
     if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
         ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, timestamp_test_clock) != EOK ||

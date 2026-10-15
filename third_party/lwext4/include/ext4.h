@@ -122,6 +122,7 @@ typedef struct ext4_file {
 	uint32_t sync_tid;
 	uint64_t sync_sequence;
 	uint64_t data_sequence;
+	void *time_owner; /* Adapter-owned live inode; valid for this handle lifetime. */
 } ext4_file;
 
 /* BoarOS adapter: optional realtime source and live-inode timestamp updates.
@@ -132,11 +133,27 @@ struct ext4_timestamp {
     uint32_t nanoseconds;
 };
 typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
+/* Adapter-owned live inode times. Stores are tentative until the outer
+ * transaction completes. Callbacks run under the mount write lock. */
+struct ext4_time_observer {
+    void *context;
+    void (*store)(void *context, uint32_t inode, unsigned field,
+                  struct ext4_timestamp value);
+    void (*finish)(void *context, bool accepted);
+    unsigned (*snapshot)(void *owner, struct ext4_timestamp times[3]);
+    void (*written)(void *owner, unsigned fields,
+                    const struct ext4_timestamp times[3], int result);
+};
+int ext4_mount_setup_time_observer(const char *mount_point,
+                                  const struct ext4_time_observer *observer);
+
 #define EXT4_TIME_ATIME 1U
 #define EXT4_TIME_MTIME 2U
 #define EXT4_TIME_CTIME 4U
 #define EXT4_TIME_RELATIME 8U
 int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock);
+/* Read the mount clock without inode lookup or a metadata transaction. */
+bool ext4_file_read_clock(const ext4_file *file, struct ext4_timestamp *now);
 int ext4_file_touch(ext4_file *file, unsigned int fields);
 /* Pure relatime query under a shared mount gate. A true result grants no
  * mutation right: reacquire exclusive ownership and recheck before updating. */
@@ -146,6 +163,9 @@ int ext4_file_relatime_needed(ext4_file *file, bool *needed);
  * bits are valid. A zero mask performs no I/O and permits times == NULL. */
 int ext4_file_set_times(ext4_file *file, unsigned fields,
                        const struct ext4_timestamp times[3]);
+/* Encode an already-published runtime snapshot without publishing it again.
+ * A background caller uses wait=false; EAGAIN leaves all fields dirty. */
+int ext4_file_writeback_times(ext4_file *file, bool wait);
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
