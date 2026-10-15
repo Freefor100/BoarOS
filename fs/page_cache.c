@@ -2914,7 +2914,7 @@ enum kernel_page_cache_status kernel_page_cache_invalidate_node(
                 remove_entry(cache,entry); entry=next;
             }
         }
-        kernel_lock_release(&node_guard);
+        kernel_lock_scope_release(&node_guard);
         int complete=drain_entries(cache,&released);
         { CACHE_SCOPE(guard,cache); cache->record->statistics.pages_reclaimed+=released; }
         return complete?KERNEL_PAGE_CACHE_STATUS_OK:KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
