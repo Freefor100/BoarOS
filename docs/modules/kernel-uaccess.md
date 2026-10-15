@@ -45,7 +45,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 当前uaccess只对已经激活的MM提交新页，驻留页的pin也可用于启动期I/O上下文。
 每个基页片段在MM rank15 raw内完成权限检查和取得页引用，复制及原子用户操作在锁外执行，
-随后由同一任务/I/O owner归还。字符串发现NUL也先归还pin；失败保持精确前缀。
+token 记录本次取得的实际 MM 记录和 owner 链位置；归还不重新解析 MM 元数据，也不扫描其他活动 token，支持任意顺序结束借用。随后由同一任务/I/O owner归还。字符串发现NUL也先归还pin；失败保持精确前缀。
 调用者的LIVE MM句柄覆盖token的寿命；token不可复制或跨任务归还，重复登记/归还fatal。
 页引用要求已finalized的allocator，不把bootstrap单owner页伪装为可共享引用。
 
