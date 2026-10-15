@@ -75,6 +75,7 @@ struct jbd_buf {
 	struct jbd_block_rec *block_rec;
 	TAILQ_ENTRY(jbd_buf) buf_node;
 	TAILQ_ENTRY(jbd_buf) dirty_buf_node;
+	TAILQ_ENTRY(jbd_buf) checkpoint_node;
 };
 
 struct jbd_source;
@@ -95,6 +96,7 @@ struct jbd_revoke_rec {
 struct jbd_block_rec {
 	ext4_fsblk_t lba;
 	struct jbd_trans *trans;
+	struct jbd_buf *checkpoint;
 	RB_ENTRY(jbd_block_rec) block_rec_node;
 	LIST_ENTRY(jbd_block_rec) tbrec_node;
 	TAILQ_HEAD(jbd_buf_dirty, jbd_buf) dirty_buf_queue;
@@ -144,6 +146,7 @@ struct jbd_journal {
 	struct jbd_trans *failed_trans;
 	struct jbd_trans *running, *committing;
 	struct jbd_trans *checkpointing, *checkpoint_last;
+	TAILQ_HEAD(jbd_checkpoint_bufs, jbd_buf) checkpoint_bufs;
 	TAILQ_HEAD(jbd_sealed_queue, jbd_trans) sealed_queue;
 	unsigned sealed_count, checkpoint_count, log_reserved;
 	bool checkpoint_requested;

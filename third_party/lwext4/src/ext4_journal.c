@@ -3260,6 +3260,30 @@ bool jbd_journal_select(struct jbd_journal *journal)
 			journal->checkpoint_last = TAILQ_NEXT(journal->checkpoint_last, trans_node);
 			count++;
 		}
+		/* Selection holds the modification lock. Publish one immutable home
+		 * version per LBA from this durable prefix, never from a later group.
+		 * A revoke discards the older incarnation; later metadata may replace it. */
+		TAILQ_INIT(&journal->checkpoint_bufs);
+		for (;;) {
+			struct jbd_buf *jb;
+			TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
+				struct jbd_block_rec *rec = jb->block_rec;
+				if (rec->checkpoint)
+					TAILQ_REMOVE(&journal->checkpoint_bufs, rec->checkpoint, checkpoint_node);
+				rec->checkpoint = jb;
+				TAILQ_INSERT_TAIL(&journal->checkpoint_bufs, jb, checkpoint_node);
+			}
+			struct jbd_revoke_rec *revoke;
+			RB_FOREACH(revoke, jbd_revoke_tree, &trans->revoke_root) {
+				struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, revoke->lba);
+				if (rec && rec->checkpoint) {
+					TAILQ_REMOVE(&journal->checkpoint_bufs, rec->checkpoint, checkpoint_node);
+					rec->checkpoint = NULL;
+				}
+			}
+			if (trans == journal->checkpoint_last) break;
+			trans = TAILQ_NEXT(trans, trans_node);
+		}
 		journal->checkpoint_requested = false;
 		return true;
 	}
@@ -3281,15 +3305,12 @@ int jbd_journal_checkpoint(struct jbd_journal *journal)
 	{
 	COST_PHASE_SCOPE(home_phase, 3);
 	struct jbd_io_batch batch = {0};
-	for (;;) {
-		struct jbd_buf *jb;
-		TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
-			r = jbd_batch_add(bdev, &batch, jb->after->data, jb->block.lb_id);
-			if (r != EOK) return r;
-		}
-		if (trans == journal->checkpoint_last) break;
-		trans = TAILQ_NEXT(trans, trans_node);
+	struct jbd_buf *jb;
+	TAILQ_FOREACH(jb, &journal->checkpoint_bufs, checkpoint_node) {
+		r = jbd_batch_add(bdev, &batch, jb->after->data, jb->block.lb_id);
+		if (r != EOK) return r;
 	}
+	trans = journal->checkpoint_last;
 	r = jbd_batch_flush(bdev, &batch);
 	if (r != EOK) return r;
 	r = ext4_blockdev_flush(bdev);
@@ -3306,6 +3327,10 @@ static void jbd_group_release(struct jbd_journal *journal, struct jbd_trans *tra
 	while ((jb = TAILQ_FIRST(&trans->buf_queue))) {
 		struct ext4_buf *buf = jb->block.buf;
 		struct ext4_block block = jb->block;
+		if (jb->block_rec->checkpoint == jb) {
+			TAILQ_REMOVE(&journal->checkpoint_bufs, jb, checkpoint_node);
+			jb->block_rec->checkpoint = NULL;
+		}
 		if (!buf->journal_pending) __builtin_trap();
 		jbd_unpin_version(journal, buf);
 		if (!buf->journal_pending && !memcmp(buf->data, jb->after->data, journal->block_size)) ext4_bcache_clear_dirty(buf);

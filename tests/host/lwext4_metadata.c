@@ -25,6 +25,8 @@ static const unsigned char *borrow_watch;
 static uint64_t borrow_watch_lba;
 static unsigned borrow_watch_size, borrow_watch_calls;
 static bool borrow_watch_escape;
+static ext4_fsblk_t checkpoint_homes[3];
+static unsigned checkpoint_home_writes[3], checkpoint_watch_block;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"%d: %s (alloc=%u fail=%u)\n",__LINE__,#x,allocations,fail_allocation); exit(1); } } while (0)
 void *ext4_user_malloc(size_t n) { if(payload_threshold && n>=payload_threshold)payload_allocations++; if(++allocations==fail_allocation)return NULL;void *p=malloc(n);if(p)live_allocations++;return p; }
 void *ext4_user_calloc(size_t n,size_t s) { if(payload_threshold && n*s>=payload_threshold)payload_allocations++; if(++allocations==fail_allocation)return NULL;void *p=calloc(n,s);if(p)live_allocations++;return p; }
@@ -36,6 +38,10 @@ static int dev_read(struct ext4_blockdev *b,void *p,uint64_t n,uint32_t c)
 static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t n,uint32_t c)
 {
     (void)b;
+    if (checkpoint_watch_block) for (unsigned i=0;i<3;i++) {
+        uint64_t sector=checkpoint_homes[i]*checkpoint_watch_block/512;
+        if (n<=sector && sector<n+c) checkpoint_home_writes[i]++;
+    }
     if (borrow_watch && n >= borrow_watch_lba && n < borrow_watch_lba + borrow_watch_size / 512) {
         unsigned offset = (unsigned)(n - borrow_watch_lba) * 512;
         if (borrow_watch_escape && !offset) {
@@ -376,6 +382,9 @@ static void group_log_payload(struct ext4_fs *fs)
     CHECK(ext4_fs_get_inode_ref(fs, file.inode, &inode) == EOK);
     for (unsigned i = 0; i < 128; i++) CHECK(ext4_fs_get_inode_dblk_idx(&inode, i, &homes[i], false) == EOK && homes[i]);
     CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
+    payload_threshold=fs->bdev->lg_bsize;
+    unsigned image_allocations=payload_allocations, cached_images=0;
+    for (struct jbd_image *image=journal->image_cache;image;image=image->next) cached_images++;
     struct jbd_trans *operation = jbd_journal_new_trans(journal);
     CHECK(operation);
     for (unsigned i = 0; i < 128; i++) {
@@ -385,7 +394,14 @@ static void group_log_payload(struct ext4_fs *fs)
         block.data[9] = (unsigned char)i;
         CHECK(jbd_trans_set_block_dirty(operation, &block) == EOK && ext4_block_set(fs->bdev, &block) == EOK);
     }
-    CHECK(journal->memory_used - journal->memory_cached <= 128 * (3 * fs->bdev->lg_bsize + 1024) + 65536);
+    unsigned remaining_images=0;
+    for (struct jbd_image *image=journal->image_cache;image;image=image->next) remaining_images++;
+    /* Count actual block images, including reused cache owners: cached home,
+     * undo and frozen version per metadata block, plus a few log controls.
+     * A separate log payload image for every version violates this bound. */
+    CHECK(payload_allocations-image_allocations+cached_images-remaining_images<=3*128+8);
+    CHECK(journal->memory_peak<=journal->memory_limit);
+    payload_threshold=0;
     CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
     unsigned before_allocations = allocations;
     fail_allocation = allocations + 1;
@@ -400,6 +416,88 @@ static void group_log_payload(struct ext4_fs *fs)
     }
     CHECK(ext4_fclose(&file) == EOK && ext4_journal_group_drain("/") == EOK);
     puts("group log payload: shared log/home version, isolated escape, packed control RAM and no freeze allocation");
+}
+static void group_checkpoint_collapse(struct ext4_fs *fs, unsigned fault)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file file; size_t count;
+    CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    unsigned block_size=fs->bdev->lg_bsize;
+    unsigned char *bytes=malloc(3*block_size); CHECK(bytes);
+    memset(bytes,0x5a,3*block_size);
+    CHECK(ext4_fpwrite(&file,0,bytes,3*block_size,&count)==EOK && count==3*block_size);
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    struct ext4_inode_ref inode;
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
+    for (unsigned i=0;i<3;i++)
+        CHECK(ext4_fs_get_inode_dblk_idx(&inode,i,&checkpoint_homes[i],false)==EOK && checkpoint_homes[i]);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    /* Three durable groups: old A/B, revoke A/B, then a new A incarnation
+     * and C. The selected prefix must write exactly new A and C. */
+    for (unsigned group=0;group<3;group++) {
+        struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
+        if (group==1) {
+            CHECK(jbd_trans_revoke_block(operation,checkpoint_homes[0])==EOK);
+            CHECK(jbd_trans_revoke_block(operation,checkpoint_homes[1])==EOK);
+        } else for (unsigned i=0;i<2;i++) {
+            unsigned home=group==0?i:2*i;
+            struct ext4_block block=EXT4_BLOCK_ZERO();
+            CHECK(ext4_block_get(fs->bdev,&block,checkpoint_homes[home])==EOK);
+            CHECK(jbd_trans_get_write_access(operation,&block)==EOK);
+            memset(block.data,group==0?0x61:0x73,block_size);
+            CHECK(jbd_trans_set_block_dirty(operation,&block)==EOK && ext4_block_set(fs->bdev,&block)==EOK);
+        }
+        CHECK(jbd_journal_accept(journal,operation,0)==EOK && jbd_journal_freeze(journal)==EOK);
+        CHECK(jbd_journal_select(journal) && journal->committing==operation);
+        CHECK(jbd_journal_submit(journal)==EOK && jbd_journal_retire(journal,EOK)==EOK);
+    }
+    CHECK(journal->checkpoint_count==3 && jbd_journal_select(journal) && journal->checkpointing);
+    /* An accepted later version is visible to live readers while the older
+     * durable prefix owns home DMA. It must not enter this checkpoint. */
+    struct jbd_trans *future=jbd_journal_new_trans(journal); CHECK(future);
+    struct ext4_block future_block=EXT4_BLOCK_ZERO();
+    CHECK(ext4_block_get(fs->bdev,&future_block,checkpoint_homes[0])==EOK);
+    CHECK(jbd_trans_get_write_access(future,&future_block)==EOK);
+    memset(future_block.data,0x88,block_size);
+    CHECK(jbd_trans_set_block_dirty(future,&future_block)==EOK && ext4_block_set(fs->bdev,&future_block)==EOK);
+    CHECK(jbd_journal_accept(journal,future,0)==EOK);
+    size_t owned=journal->memory_used;
+    checkpoint_watch_block=block_size;
+    memset(checkpoint_home_writes,0,sizeof(checkpoint_home_writes));
+    if (fault==1) disk.fail_write=disk.writes+1;
+    if (fault==2) disk.fail_flush=disk.flushes+1;
+    if (fault==3) disk.fail_write=disk.writes+3;
+    if (fault==4) disk.fail_flush=disk.flushes+2;
+    int result=jbd_journal_checkpoint(journal);
+    checkpoint_watch_block=0;
+    CHECK(result==(fault?EIO:EOK));
+    if (!fault) CHECK(checkpoint_home_writes[0]==1 && !checkpoint_home_writes[1] && checkpoint_home_writes[2]==1);
+    CHECK(jbd_journal_retire(journal,result)==result);
+    if (fault) {
+        CHECK(journal->error==EIO && journal->checkpoint_count==3 && journal->memory_used==owned);
+    } else {
+        CHECK(!journal->checkpoint_count && !journal->checkpointing);
+        CHECK(ext4_blocks_get_direct(fs->bdev,bytes,checkpoint_homes[0],1)==EOK);
+        for (unsigned i=0;i<block_size;i++) CHECK(bytes[i]==0x73);
+        CHECK(ext4_blocks_get_direct(fs->bdev,bytes,checkpoint_homes[1],1)==EOK);
+        for (unsigned i=0;i<block_size;i++) CHECK(bytes[i]==0x5a);
+        CHECK(ext4_blocks_get_direct(fs->bdev,bytes,checkpoint_homes[2],1)==EOK);
+        for (unsigned i=0;i<block_size;i++) CHECK(bytes[i]==0x73);
+    }
+    free(bytes);
+    CHECK(fault_block_crash(&disk)==0);
+    printf("checkpoint collapse block=%u fault=%u: latest incarnation, revoke suppression, durable owners\n",block_size,fault);
+}
+static void group_checkpoint_recovery(struct ext4_fs *fs)
+{
+    ext4_file file; size_t count; unsigned size=fs->bdev->lg_bsize;
+    unsigned char *bytes=malloc(3*size); CHECK(bytes);
+    CHECK(ext4_fopen(&file,"/file","r")==EOK);
+    CHECK(ext4_fread(&file,bytes,3*size,&count)==EOK && count==3*size);
+    for (unsigned i=0;i<3*size;i++) CHECK(bytes[i]==(i/size==1?0x5a:0x73));
+    CHECK(ext4_fclose(&file)==EOK); free(bytes);
 }
 static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
 {
@@ -1416,6 +1514,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
     else if(!strcmp(argv[2],"group-log-payload"))group_log_payload(dev.fs);
+    else if(!strcmp(argv[2],"group-checkpoint-collapse")) {group_checkpoint_collapse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);return 0;}
+    else if(!strcmp(argv[2],"group-checkpoint-recovery"))group_checkpoint_recovery(dev.fs);
     else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
     else if(!strcmp(argv[2],"group-namespace-unlink"))group_namespace(dev.fs,true);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);

@@ -17,6 +17,13 @@ for block in 1024 4096; do
     mkfs.ext4 -q -F -b "$block" -I 256 "$work/disk.img"
     "$work/probe" "$work/disk.img" seed
     cp "$work/disk.img" "$work/base.img"
+    for fault in 0 1 2 3 4; do
+        cp "$work/base.img" "$work/checkpoint.img"
+        "$work/probe" "$work/checkpoint.img" group-checkpoint-collapse "$fault"
+        "$work/probe" "$work/checkpoint.img" group-checkpoint-recovery
+        "$work/probe" "$work/checkpoint.img" group-checkpoint-recovery
+        e2fsck -fn "$work/checkpoint.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
     for operation in truncate unlink; do
         cp "$work/base.img" "$work/namespace.img"
         "$work/probe" "$work/namespace.img" "group-namespace-$operation"
