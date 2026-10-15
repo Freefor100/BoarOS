@@ -16,12 +16,13 @@ struct kernel_socket_write_request;
 struct kernel_epoll_wait_request;
 
 struct physical_page_allocator;
-/* One scratch page owned by a live I/O invocation, including forced exit. */
+/* 当前I/O持有scratch或取得的源页引用；forced exit沿同一登记归还。 */
 struct kernel_task_io_buffer {
     struct kernel_task *task;
     struct physical_page_allocator *allocator;
     uint64_t physical_address;
     void *data;
+    uint8_t retained_scratch;
 };
 
 enum kernel_task_status {
@@ -52,6 +53,9 @@ enum kernel_task_status kernel_task_socket_read_clear(
 
 enum kernel_task_status kernel_task_io_buffer_acquire(
     struct kernel_task_io_buffer *buffer, struct physical_page_allocator *allocator);
+/* 接管调用者已有的物理页引用，不额外hold；成功后由release或任务退出归还。 */
+void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
+    struct physical_page_allocator *allocator, uint64_t physical_address);
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer);
 
 void kernel_task_prepare_user_return(void);

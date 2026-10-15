@@ -1018,18 +1018,21 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (count) kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file);
     if (count == 0U || start >= kernel_open_file_size(input)) return 0;
-    struct kernel_task_io_buffer scratch = {0};
-    if (kernel_task_io_buffer_acquire(&scratch, mm->allocator) != KERNEL_TASK_STATUS_OK)
+    int datagram=kernel_socket_is_datagram(kernel_open_file_socket(output));
+    int direct=output->kind==KERNEL_OPEN_FILE_KIND_PIPE ||
+        (output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram);
+    struct kernel_task_io_buffer source_buffer = {0};
+    if (!direct && !datagram && kernel_task_io_buffer_acquire(&source_buffer, mm->allocator) != KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
     size_t capacity = BOAROS_PAGE_SIZE;
-    void *staging = scratch.data, *datagram_staging = 0;
-    if (kernel_socket_is_datagram(kernel_open_file_socket(output))) {
+    void *staging = source_buffer.data, *datagram_staging = 0;
+    if (datagram) {
         /* Linux splice_to_socket batches at most sixteen target pages. */
         size_t batch=(size_t)BOAROS_PAGE_SIZE*16U;
         capacity=count>batch ? batch : (size_t)count;
         enum kernel_heap_status allocated = kernel_heap_allocate(files->heap, capacity, &datagram_staging);
         if (allocated != KERNEL_HEAP_STATUS_OK) {
-            kernel_task_io_buffer_release(&scratch);
+            if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
             if (allocated != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
             return -KERNEL_ENOMEM;
         }
@@ -1045,16 +1048,56 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     while (total < count) {
         size_t wanted = count - total > capacity
             ? capacity : (size_t)(count - total), available = 0;
-        /* pread 交还 inode 数据锁后才写目标，允许同 inode 复制而不锁升级。 */
-        error = kernel_open_file_pread(input, start + total, staging, wanted, &available);
-        if (available > wanted) __builtin_trap();
-        if (available == 0U) break;
+        if (direct) {
+            uint64_t position=start+total,physical;
+            size_t offset=position&BOAROS_PAGE_MASK,valid;
+            kernel_open_file_read_begin(input,position);
+            int memory=kernel_open_file_memory_backed(input);
+            enum kernel_page_cache_status loaded=memory
+                ?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid)
+                :kernel_open_file_get_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid);
+            if (loaded==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND && memory) {
+                uint64_t size=kernel_open_file_size(input);
+                if (position>=size) break;
+                available=BOAROS_PAGE_SIZE-offset;
+                if (available>wanted) available=wanted;
+                if (available>size-position) available=(size_t)(size-position);
+                /* 稀疏内存文件的洞只生成当前零片段，不为读取建立持久文件页。 */
+                if (kernel_task_io_buffer_acquire(&source_buffer,mm->allocator)) {
+                    error=-KERNEL_ENOMEM;break;
+                }
+                staging=source_buffer.data;
+                memset(staging,0,available);
+            } else if (loaded==KERNEL_PAGE_CACHE_STATUS_OK) {
+                /* 页引用跨目标等待保活；TCP仍COPY进ACK前自有的协议版本。 */
+                kernel_task_io_buffer_take_page(&source_buffer,files->heap->page_allocator,physical);
+                if (offset<valid) {
+                    available=valid-offset;
+                    if (available>wanted) available=wanted;
+                }
+                staging=(unsigned char *)source_buffer.data+offset;
+            } else {
+                if (loaded!=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE)
+                    error=loaded==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
+                break;
+            }
+            kernel_open_file_read_progress(input,position,available);
+        } else {
+            /* 文件目标保留分离的读写版本，允许同inode及重叠区间复制。 */
+            error=kernel_open_file_pread(input,start+total,staging,wanted,&available);
+            if (available>wanted) __builtin_trap();
+        }
+        if (!available) {
+            if (direct && source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
+            break;
+        }
         if (total == 0U && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
             int modified = kernel_vfs_file_modified(&output->file, out_start, 0);
             if (modified != 0) { error = modified; break; }
         }
         int64_t sent = sendfile_output(output_owner, staging, available,
                                        out_start + total, deadline);
+        if (direct) kernel_task_io_buffer_release(&source_buffer);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
         if (sent > 0 && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
@@ -1068,7 +1111,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     }
     if (datagram_staging != 0 && kernel_heap_release(files->heap, datagram_staging) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
-    kernel_task_io_buffer_release(&scratch);
+    if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
     if (total != 0U && error == -KERNEL_ERESTARTSYS)
         kernel_signal_clear_syscall_restart(kernel_task_current());
     if (total != 0U) {

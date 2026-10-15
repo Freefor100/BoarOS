@@ -149,9 +149,15 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 RV64 syscall 71 用内核有界复制支持 regular/tmpfs 输入，输出可为 regular、pipe、
 stream 或 datagram socket。输入、输出各有 OFD pin，正常或信号取消均沿保存的
-syscall 栈展开。stream/file/pipe 使用请求暂存页；datagram来源按固定Linux的最多16个目标页为一批（RV64KiB、LA256KiB），
-再接发送者整包request owner/内存等待。每批是一条datagram，页大小不改变
-用户指定长度或UDP最大payload；不以普通POLLOUT预留整包。此接口尚未采用文件页到设备的零拷贝。
+syscall 栈展开。stream socket 与 pipe 直接从取得引用的来源页复制到目标，
+不经过请求中转页；同一 task I/O 登记在正常返回、信号取消和退出回收时归还
+来源页引用。借用固定后备页寿命，不将来源变成不可修改的快照；TCP 在提交时
+仍 COPY 到协议自己持有至 ACK 的版本。tmpfs 稀疏洞只生成当前零片段，不为
+读取建立文件页。regular 输出保留独立请求页，支持同 inode 及重叠区间复制。
+datagram 来源单独申请最多16个目标页的一批整包缓冲（RV64KiB、LA256KiB），
+不再同时取得未使用的 scratch，再接发送者整包 request owner/内存等待。
+每批是一条 datagram，页大小不改变用户指定长度或 UDP 最大 payload；
+不以普通 POLLOUT 预留整包。
 
 NULL offset 推进共享输入位置；显式 offset 只更新用户给定位置。两个 regular
 OFD 的位置锁按 rank/key 排序，同一 OFD 或 dup alias 只取一个锁、只推进一次。
@@ -299,9 +305,9 @@ fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原ino
 
 普通文件写入直接填入最终页，用户页、iovec 与目标页边界决定每个复制片段；普通单 hart 路径用一个完整片段覆盖冷页时无需先读旧数据。来源缺页在 inode 数据锁和目标写借用之外处理，随后固定来源并提交目标；同物理页的重叠片段使用 `memmove`，旧 EOF 后的空隙在来源复制后清零。tmpfs 与磁盘页缓存共用这一来源协议，tmpfs 后端只提交尺寸和时间元数据。
 
-TCP 写入仍按需分配一个 4 KiB 请求页，通过当前任务登记覆盖等待与退出；pipe 保持自己的 ring 协议，console 保持小块暂存。有效用户复制前缀只按目标已接受字节推进 offset，O_APPEND、定位写与同步错误观察规则不变。AF_UNIX DGRAM 使用有界整包缓冲，任务登记临时发送 owner；socket 请求 owner 见网络模块。
+TCP 写入按接纳容量跨 iovec 填充一个原生页大小的请求缓冲（RV64 为4KiB，LA为16KiB），通过当前任务登记覆盖等待与退出，并保留短提交后的未消费尾部。末批、窗口满或阻塞前输出协议队列；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议仍 COPY 并自行持有 ACK 前的版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
 
-`kernel_files_statistics.write_chunks` 记录普通文件/TCP 的实际用户复制片段，`read_chunks` 包括 socket 的暂存复制。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入的内容、部分失败和页解析；当前为 256 个片段、256 次用户页解析、1 MiB 用户复制、0 字节页缓存额外复制。页解析使用已有 COST 指标，普通构建不再更新独立的全局原子计数。这些数值描述复制量与工作次数，不代表吞吐倍数。
+`kernel_files_statistics.write_chunks` 记录普通文件的实际用户复制片段及 TCP/UNIX STREAM 的接纳批次，`read_chunks` 的 socket 项记录实际 packet 读取，不代表中转复制。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入的内容、部分失败和页解析；当前为 256 个片段、256 次用户页解析、1 MiB 用户复制、0 字节页缓存额外复制。页解析使用已有 COST 指标，普通构建不再更新独立的全局原子计数。这些数值描述复制量与工作次数，不代表吞吐倍数。
 
 ## 验证与限制
 
