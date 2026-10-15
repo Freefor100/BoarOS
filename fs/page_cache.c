@@ -2071,7 +2071,14 @@ static int prepare_writeback(struct kernel_page_cache *cache,
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    if (result) { writeback_unprepare(cache,entry,prepared); return result; }
+    if (result) {
+        if (kernel_io_context_current()->background_reclaim) {
+            CACHE_SCOPE(guard,cache);
+            cache->record->deferred_snapshots++;
+        }
+        writeback_unprepare(cache,entry,prepared);
+        return result;
+    }
     return 0;
 }
 
