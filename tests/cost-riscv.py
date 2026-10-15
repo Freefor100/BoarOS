@@ -274,6 +274,8 @@ def main():
                 if current is not None or (not snapshots and not args.off): raise ValueError('missing snapshot/end')
                 if args.off and snapshots: raise ValueError('diagnostic nodes present in off build')
                 if case=='write':
+                    if not args.linux:
+                        run([sys.executable, str(ROOT/'tests/check-stack-report.py'), str(folder/'boot.log')])
                     required={f'file-{cache}-{n}' for cache in ('cold','hot') for n in (0,1,3,63,64,65,4096)}
                     required.update(f'{kind}-1m-{alignment}' for kind in ('file','tcp') for alignment in ('aligned','misaligned'))
                     required.update(f'file-sync-{method}-every-{interval}' for method in range(3) for interval in (1,16,128))

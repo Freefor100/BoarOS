@@ -1122,13 +1122,25 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     *bytes_read = 0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
     if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
+    struct kernel_page_cache_read_page single, *pages = &single;
+    size_t capacity = 1;
+    int result = 0;
     while (*bytes_read < size && offset < node->size) {
         size_t start = offset & BOAROS_PAGE_MASK;
         size_t window = BOAROS_PAGE_SIZE * KERNEL_PAGE_CACHE_READ_BATCH_MAX - start;
         if (window > size - *bytes_read) window = size - *bytes_read;
         if (window > node->size - offset) window = node->size - offset;
         size_t count = (start + window + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
-        struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+        if (count > capacity) {
+            struct kernel_page_cache_read_page *larger;
+            if (kernel_heap_allocate(node->instance->heap, count * sizeof(*pages), (void **)&larger)) {
+                result = -KERNEL_ENOMEM;
+                break;
+            }
+            if (pages != &single && kernel_heap_release(node->instance->heap, pages)) __builtin_trap();
+            pages = larger;
+            capacity = count;
+        }
         if (kernel_page_cache_get_batch(cache, file, offset >> BOAROS_PAGE_SHIFT, pages, count) ==
             KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
         int error = 0;
@@ -1148,9 +1160,10 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
         }
         for (size_t i = 0; i < count; i++) if (!pages[i].status)
             if (physical_page_release(cache->allocator, pages[i].physical_address)) __builtin_trap();
-        if (error) return error;
+        if (error) { result = error; break; }
     }
-    return 0;
+    if (pages != &single && kernel_heap_release(node->instance->heap, pages)) __builtin_trap();
+    return result;
 }
 
 static void apply_truncated_size(struct kernel_vfs_node *node,

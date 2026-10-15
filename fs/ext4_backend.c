@@ -557,14 +557,21 @@ static int block_write_batch(struct ext4_blockdev *device,
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_span physical[KERNEL_BLOCK_BATCH_MAX];
+    struct kernel_block_span single = {0}, *physical = &single;
+    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
+            count * sizeof(*physical), (void **)&physical)) return ENOMEM;
     for (unsigned i = 0; i < count; i++) {
         if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) return EINVAL;
+            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
+            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
+            return EINVAL;
+        }
         physical[i] = (struct kernel_block_span){spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
             spans[i].data, (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE};
     }
-    switch (kernel_block_write_batch(adapter->block, physical, count)) {
+    enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
+    if (count > 1 && kernel_heap_release(adapter->instance.heap, physical)) __builtin_trap();
+    switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
     case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
@@ -578,10 +585,18 @@ static int block_read_batch(struct ext4_blockdev *device,
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_read_span physical[KERNEL_BLOCK_BATCH_MAX];
+    struct kernel_block_read_span single = {0}, *physical = &single;
+    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
+            count * sizeof(*physical), (void **)&physical)) {
+        for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
+        return ENOMEM;
+    }
     for (unsigned i = 0; i < count; i++) {
         if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) return EINVAL;
+            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
+            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
+            return EINVAL;
+        }
         physical[i] = (struct kernel_block_read_span){.offset = spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
             .buffer = spans[i].data, .size = (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE,
             .status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
@@ -598,6 +613,7 @@ static int block_read_batch(struct ext4_blockdev *device,
         }
         if (!result) result = spans[i].error;
     }
+    if (count > 1 && kernel_heap_release(adapter->instance.heap, physical)) __builtin_trap();
     return result;
 }
 

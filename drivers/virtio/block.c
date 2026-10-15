@@ -1109,11 +1109,6 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
 static enum kernel_block_status transfer_batch(struct virtio_block_device *device,
     const struct kernel_block_span *writes, struct kernel_block_read_span *reads, size_t count)
 {
-    if (count == 1) {
-        struct batch_transfer part;
-        struct block_segment segments[KERNEL_BLOCK_BATCH_MAX];
-        return transfer_batch_parts(device, writes, reads, count, &part, segments);
-    }
     uintptr_t irq = arch_interrupt_save();
     unsigned slot = REQUEST_SLOTS;
     while (device_live(device)) {
