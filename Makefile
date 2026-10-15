@@ -2065,6 +2065,14 @@ test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
+.PHONY: test-poll-host
+test-poll-host:
+	@mkdir -p build/host
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections -idirafter include \
+		-fsanitize=address,undefined tests/host/poll_snapshot.c -o build/host/poll-snapshot
+	build/host/poll-snapshot
+
 .PHONY: test-epoll-host test-epoll-riscv
 test-epoll-host:
 	@mkdir -p build/host
