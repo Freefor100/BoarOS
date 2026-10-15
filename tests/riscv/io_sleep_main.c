@@ -204,16 +204,6 @@ static void sync_source_probe(void *argument)
 }
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied)
 {
-    if (send_copy_testing && mm == &sync_mm) {
-        if (address == OP_USER && kernel_cpu_current()->current == send_copy_task && !send_copy_paused) {
-            send_copy_paused = 1;
-            enum kernel_wait_wake_reason reason;
-            check(kernel_scheduler_block_current(&send_copy_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 310);
-        }
-        int previous = sync_edit; sync_edit = 1;
-        enum kernel_uaccess_status result = __real_kernel_copy_from_user(mm, buffer, address, size, copied);
-        sync_edit = previous; return result;
-    }
     if (pipe_copy_testing && mm == &sync_mm) {
         if (address == OP_USER + 4096 && !pipe_copy_entered) {
             pipe_copy_entered = 1;
@@ -240,6 +230,13 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm 
 {
     if (!operation_testing || mm!=&sync_mm)
         return __real_kernel_uaccess_pin_user_page(mm,address,access,pin);
+    if (send_copy_testing && address == OP_USER &&
+        kernel_cpu_current()->current == send_copy_task && !send_copy_paused) {
+        /* TCP已预留容量，但尚未pin来源；暂停期间munmap仍须能排空并完成。 */
+        send_copy_paused = 1;
+        enum kernel_wait_wake_reason reason;
+        check(kernel_scheduler_block_current(&send_copy_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 310);
+    }
     if (address == operation_second && kernel_cpu_current()->current == operation_writer_task && !operation_paused) {
         operation_paused = 1;
         enum kernel_wait_wake_reason reason;
