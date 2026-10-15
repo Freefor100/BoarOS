@@ -230,6 +230,13 @@ static void pipe_geometry_case(struct kernel_heap *heap)
     assert(!kernel_pipe_writev(pipe,&domain_mm,&broken,1,32,1,&result) && result.bytes==-KERNEL_EFAULT && !result.broken);
     assert(!(kernel_pipe_poll(pipe,1,0,0)&KERNEL_POLLIN));
     assert(!kernel_mm_mprotect(&domain_mm,PIPE_SOURCE+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    struct kernel_uaccess_iovec valid={PIPE_SOURCE,1},target_byte={PIPE_TARGET,1};
+    assert(!kernel_pipe_writev(pipe,&domain_mm,&valid,1,1,1,&result) && result.bytes==1);
+    assert(!kernel_mm_mprotect(&domain_mm,PIPE_SOURCE+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,0));
+    assert(!kernel_pipe_writev(pipe,&domain_mm,&broken,1,32,1,&result) && result.bytes==-KERNEL_EFAULT);
+    int64_t old_byte;
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target_byte,1,1,0,&old_byte) && old_byte==1);
+    assert(!kernel_mm_mprotect(&domain_mm,PIPE_SOURCE+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
     assert(!kernel_files_release(&files));
     pipe_bind(0,0); pipe=pipe_table(heap); mm_test_bind_files(&files);
     struct pipe_actor actor={.write=1,.fd=1,.address=PIPE_SOURCE,.count=BOAROS_PAGE_SIZE+16};
@@ -279,6 +286,88 @@ static void pipe_tmpfs_buffer_case(struct kernel_heap *heap)
     puts("PASS cross-CPU pipe copy faults real tmpfs source/destination and returns exact contents");
 }
 
+extern unsigned mm_test_parked(unsigned id);
+static unsigned overlap_read_done;
+static void *overlap_reader(void *argument)
+{
+    struct pipe_actor *actor=argument;pipe_bind(2,&views[2]);
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file=kernel_files_hold_fd(&views[2],0,&pin);
+    assert(file);
+    uint64_t count=actor->count?actor->count:BOAROS_PAGE_SIZE;
+    struct kernel_uaccess_iovec target={PIPE_TARGET,count};
+    assert(!kernel_pipe_readv(file->pipe,&domain_mm,&target,1,count,0,&actor->bytes));
+    kernel_files_pin_guard_release(&pin);
+    assert(!kernel_files_release(&views[2]));
+    mm_test_bind_files(0);mm_test_bind(0);
+    __atomic_store_n(&overlap_read_done,1,__ATOMIC_RELEASE);
+    return 0;
+}
+static void pipe_page_ownership_case(struct kernel_heap *heap)
+{
+    pipe_bind(0,0);
+    struct kernel_heap_statistics before_heap,after_heap;
+    kernel_heap_get_statistics(heap,&before_heap);
+    uint64_t before=physical_page_available(heap->page_allocator);
+    struct kernel_pipe *empty=0;assert(!kernel_pipe_create(heap,&empty));
+    kernel_heap_get_statistics(heap,&after_heap);
+    assert(before-physical_page_available(heap->page_allocator)==after_heap.current_pages-before_heap.current_pages);
+    assert(!kernel_pipe_destroy_unowned(empty));
+    struct kernel_pipe *pipe=pipe_table(heap);mm_test_bind_files(&files);
+    size_t copied;unsigned char marker=0;
+    assert(!kernel_copy_to_user(&domain_mm,PIPE_TARGET,&marker,1,&copied) && copied==1);
+    before=physical_page_available(heap->page_allocator);
+    struct kernel_pipe_result write;
+    assert(!kernel_pipe_write_buffer(pipe,"x",1,1,&write) && write.bytes==1);
+    assert(physical_page_available(heap->page_allocator)==before-1);
+    struct kernel_uaccess_iovec target={PIPE_TARGET,1};int64_t bytes;
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&bytes) && bytes==1);
+    assert(physical_page_available(heap->page_allocator)==before);
+    assert(!kernel_files_release(&files));
+    puts("PASS pipe lazy slot pages: empty creation, one-byte allocation and drain returns backing");
+}
+static void pipe_copy_overlap_case(struct kernel_heap *heap)
+{
+    pipe_bind(0,0);struct kernel_pipe *pipe=pipe_table(heap);mm_test_bind_files(&files);
+    struct kernel_pipe_result fill;
+    assert(!kernel_pipe_write_buffer(pipe,pipe_payload,BOAROS_PAGE_SIZE,1,&fill) && fill.bytes==BOAROS_PAGE_SIZE);
+    struct pipe_actor writer={.write=1,.fd=1,.address=PIPE_SOURCE,.count=1},reader={0};
+    pause_copy=1;pause_park=0;pthread_t producer,consumer;start_actor(&writer,&producer);
+    while (!__atomic_load_n(&copy_ready,__ATOMIC_ACQUIRE)) sched_yield();
+    views[2]=(struct kernel_files){0};assert(!kernel_files_acquire(&views[2],&files));
+    overlap_read_done=0;unsigned parked=mm_test_parked(2);
+    assert(!pthread_create(&consumer,0,overlap_reader,&reader));
+    while (!__atomic_load_n(&overlap_read_done,__ATOMIC_ACQUIRE) && mm_test_parked(2)==parked) sched_yield();
+    assert(__atomic_load_n(&overlap_read_done,__ATOMIC_ACQUIRE) && reader.bytes==BOAROS_PAGE_SIZE);
+    __atomic_store_n(&resume_copy,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(producer,0) && !pthread_join(consumer,0) && writer.bytes==1);
+    struct kernel_uaccess_iovec target={PIPE_TARGET,1};int64_t bytes;
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&bytes) && bytes==1);
+    assert(!kernel_files_release(&files));
+    puts("PASS pipe independent head/tail copy: reader completes while tail writer is paused before publication");
+}
+
+static void pipe_merge_copy_case(struct kernel_heap *heap)
+{
+    pipe_bind(0,0);struct kernel_pipe *pipe=pipe_table(heap);mm_test_bind_files(&files);
+    struct kernel_uaccess_iovec source={PIPE_SOURCE,32};struct kernel_pipe_result fill;
+    assert(!kernel_pipe_writev(pipe,&domain_mm,&source,1,32,1,&fill) && fill.bytes==32);
+    struct pipe_actor writer={.write=1,.fd=1,.address=PIPE_SOURCE,.count=1},reader={.count=32};
+    pause_copy=1;pause_park=0;pthread_t producer,consumer;start_actor(&writer,&producer);
+    while (!__atomic_load_n(&copy_ready,__ATOMIC_ACQUIRE)) sched_yield();
+    views[2]=(struct kernel_files){0};assert(!kernel_files_acquire(&views[2],&files));
+    overlap_read_done=0;unsigned parked=mm_test_parked(2);
+    assert(!pthread_create(&consumer,0,overlap_reader,&reader));
+    while (!__atomic_load_n(&overlap_read_done,__ATOMIC_ACQUIRE) && mm_test_parked(2)==parked) sched_yield();
+    assert(!__atomic_load_n(&overlap_read_done,__ATOMIC_ACQUIRE) && mm_test_parked(2)>parked);
+    __atomic_store_n(&resume_copy,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(producer,0) && !pthread_join(consumer,0) && writer.bytes==1 && reader.bytes==32);
+    struct kernel_uaccess_iovec target={PIPE_TARGET,1};int64_t bytes;
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&bytes) && bytes==1);
+    assert(!kernel_files_release(&files));
+    puts("PASS pipe same-page merge: reader waits actual writer qualification before consuming/freeing tail");
+}
+
 static void pipe_cases(struct kernel_heap *heap)
 {
     uint64_t address;
@@ -287,6 +376,7 @@ static void pipe_cases(struct kernel_heap *heap)
     assert(!kernel_mm_mmap_anonymous(&domain_mm,PIPE_TARGET,17*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     memset(pipe_payload,0x71,sizeof(pipe_payload)); size_t done;
     assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_CAPACITY+1,&done) && done==KERNEL_PIPE_CAPACITY+1);
+    pipe_page_ownership_case(heap);pipe_copy_overlap_case(heap);pipe_merge_copy_case(heap);
     pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);
     pipe_packet_case(heap,2); pipe_packet_case(heap,4);
     mm_test_bind_files(0); mm_test_bind(0); mm_test_context=0;

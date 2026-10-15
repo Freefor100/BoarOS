@@ -8,13 +8,7 @@
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
-- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续16个目标页的数据区（RV64KiB、LA256KiB）、16 个固定页片段的有效范围、读写端引用和等待队列。
-  复制 mutex rank15 保持片段及接纳顺序，metadata raw rank30 保护 ring、端点、代次和 readiness。
-  用户复制/缺页在 raw 外执行；空读/满写在保护内登记，释放 metadata 和复制资格后 park。
-  通知在 raw 外同步执行，关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格；没有新增 worker。
-  核心结果分别返回接纳前缀和断端事实；SIGPIPE/重启只由真实用户调用层处理，内核调用者可取得 EPIPE。
-  `can_merge` 使用16-bit位图，受控标志复用对齐空隙，pipe保持504字节/512字节slab。
-  受控pipe不接未同步epoll，也不移入普通表；普通单CPU pipe/FIFO的poll/信号语义保持。
+- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有16个片段槽、按需分配的单页后备、端点引用和等待队列。metadata raw 保护 ring、端点、代次与 readiness；用户复制、缺页和通知在 raw 外执行。关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格。核心分别返回接纳前缀和断端事实，SIGPIPE/重启由真实用户调用层处理。受控 pipe 不接未同步 epoll，也不移入普通表；复制资格与页归还规则见下文 [pipe2](#pipe2-与-fifo-endpoint)。
 - socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
 - `kernel_fs_context` 持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
@@ -113,17 +107,19 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 ## `pipe2` 与 FIFO endpoint
 
-`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽；它们共享一个 order-4、16个目标页的连续 ring buffer（RV64KiB、LA256KiB），但读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
+`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享16个片段槽；各槽在写入时按需取得一张独立目标页，不要求连续物理区间。空 pipe 只分配对象元数据，最大数据容量仍为16个目标页（RV64KiB、LA256KiB）。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
 读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
 
-每个已发布的 pipe 片段对应数据区中的一页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。16 个槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
+每个已发布的 pipe 片段拥有一张独立页，完全消费后立即归还。尚未发布的写入页也先归槽所有，复制 fault 时撤销并释放，最后端点销毁会回收全部剩余槽页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。16 个槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
 
-用户复制可能因文件映射缺页而睡眠，关中断不能单独保护复制期间的片段。共享 pipe 持有 rank 15 的可睡眠复制锁，从选择片段到复制和发布／消费完成都保留资格；等待数据或空间前释放，唤醒后重新取得并检查状态。锁顺序为 OFD offset（10）→ pipe 复制（15）→ 缺页所需 inode／backend（20／40），请求的 OFD pin 保证锁等待和复制期间 pipe 仍有 owner。`make test-io-sleep-riscv` 在真实调度中暂扣一次用户复制，核对两个写者的完整内容和最终回收；管道的容量、原子写及 fault 前缀规则不变。
+用户复制可能因文件映射缺页而睡眠，关中断不能单独保护复制期间的片段。读者、写者各有 rank15 可睡眠复制锁，同向请求保留顺序；不同头、尾页可以同时复制。writer 避开正在复制的读槽，不把新字节并入该页；已取得尾页合并资格的 writer 则先完成复制、发布或 fault 撤销，reader 才能消费或释放这张页。reader 仅在这种同页冲突时按 read→write 的 key 顺序等待 writer，writer 不反向取得 read。当前槽标记只覆盖复制，成功和 fault 都先撤标记再释放资格；空读/满写的 interruptible wait 在标记建立前登记并释放复制锁。用户复制缺页的等待返回 C 调用，信号由返回路径处理，不会遗弃仍有资格的槽标记。
+
+锁顺序为 OFD offset（10）→ pipe 复制（15）→ 缺页所需 inode/backend（20/40），OFD pin 覆盖全部等待与复制。`make test-pipe-concurrency-host` 在4KiB、16KiB目标页下以握手暂扣尾写入，检查独立头读取仍能完成，以及同页合并时 reader 必须等待 writer；同时核对空对象、单页按需分配、消费归还、合并 fault 与最终所有权。`make test-io-sleep-riscv` 保留真实调度下的复制睡眠和多写者内容检查。
 
 匿名pipe的mode与创建时间由共享pipe对象持有，fchmod更新权限和ctime并保留FIFO类型；fstat与proc跟随查询报告稳定inode身份及同一元数据，两端、dup/fork和proc重开一致。数据读写不改变匿名pipe时间。`make test-fifo-riscv`的同ELF反例在旧内核以ENOTSUP失败，在固定Linux和修复后通过；raw ABI另保护改权及坏输出指针。
 
-pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名pipe不进入ext4页缓存；命名FIFO另持真实VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
+pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名pipe不进入ext4页缓存；命名FIFO另持真实VFS node。两个 endpoint 的最后一个 OFD 关闭后，剩余槽页、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
 
 ## `read/readv`、offset 与部分复制
 

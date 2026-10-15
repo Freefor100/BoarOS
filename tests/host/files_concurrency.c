@@ -398,7 +398,7 @@ int main(void)
     kernel_heap_get_statistics(&heap,&final);
     assert(!final.live_allocations);
     assert(!final.current_pages && physical_page_available(&pages)==baseline);
-    assert(sizeof(struct kernel_files_record)<=256 && sizeof(struct kernel_pipe)<=512);
+    assert(sizeof(struct kernel_files_record)<=256);
     assert(maximum_copy && maximum_copy<=8192 && metadata_acquisitions);
     printf("FD record=%zu pipe=%zu max raw copy=%u acquisitions=%u\n",
         sizeof(struct kernel_files_record),sizeof(struct kernel_pipe),maximum_copy,metadata_acquisitions);
