@@ -248,6 +248,18 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 				 ext4_lblk_t iblock, ext4_fsblk_t *fblock,
 				 bool support_unwritten);
 
+/* A range ends at a hole/extent boundary (or an indirect pointer leaf).
+ * Unwritten ranges retain their physical address; readers return zeroes. */
+struct ext4_inode_block_range {
+    ext4_fsblk_t block;
+    uint32_t count;
+    bool unwritten;
+    bool allocated;
+};
+int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *inode_ref,
+    ext4_lblk_t iblock, uint32_t max_blocks, bool create,
+    struct ext4_inode_block_range *range);
+
 /**@brief Initialize a part of unwritten range of the inode.
  * @param inode_ref I-node to proceed on.
  * @param iblock    Logical index of block
@@ -256,18 +268,6 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
  */
 int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 				  ext4_lblk_t iblock, ext4_fsblk_t *fblock);
-
-/**@brief Get or allocate one exact logical data block.
- * @param inode_ref I-node to proceed on.
- * @param iblock    Logical index of block.
- * @param fblock    Output physical block address.
- * @param allocated Set when a new physical data block was allocated.
- * @return Error code
- */
-int ext4_fs_get_or_alloc_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
-					ext4_lblk_t iblock,
-					ext4_fsblk_t *fblock,
-					bool *allocated);
 
 /**@brief Release one exact logical data block after failed initialization.
  * @param inode_ref I-node to proceed on.

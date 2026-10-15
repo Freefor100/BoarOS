@@ -101,6 +101,10 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 			    ext4_fsblk_t goal,
 			    ext4_fsblk_t *baddr);
 
+/* Allocate a contiguous prefix, bounded by a bitmap group or unavailable block. */
+int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
+    ext4_fsblk_t goal, uint32_t max_blocks, ext4_fsblk_t *baddr, uint32_t *count);
+
 /**@brief   Try allocate selected block.
  * @param   inode_ref inode reference
  * @param   baddr block address to allocate

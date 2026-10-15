@@ -3280,6 +3280,9 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
             spans[i].completed = limits[i];
         }
     }
+    struct ext4_inode_block_range range = {0};
+    ext4_lblk_t range_start = 0;
+    uint64_t range_offset = UINT64_MAX;
     while (!inline_link) {
         memset(mapping_errors, 0, count * sizeof(*mapping_errors));
         unsigned parts = 0, pending = 0;
@@ -3290,9 +3293,29 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                 unsigned skip = offset % block_size;
                 size_t length = block_size - skip;
                 if (length > limits[i] - planned) length = limits[i] - planned;
-                ext4_fsblk_t physical;
-                int r = ext4_fs_get_inode_dblk_idx(&ref, (ext4_lblk_t)(offset / block_size), &physical, true);
-                if (r) { mapping_errors[i] = r; break; }
+                ext4_lblk_t logical = offset / block_size;
+                if (offset != range_offset) range.count = 0;
+                if (!range.count || logical - range_start >= range.count) {
+                    uint64_t end = spans[i].offset + limits[i];
+                    /* Output buffers do not bound an inode mapping run. Only
+                     * adjacent requested file bytes may extend this window. */
+                    for (unsigned j = i + 1; j < count && !(end % block_size); j++) {
+                        if (!limits[j]) continue;
+                        if (spans[j].error || spans[j].offset != end) break;
+                        end += limits[j];
+                    }
+                    uint64_t needed = (end - 1) / block_size - logical + 1;
+                    uint32_t maximum = needed > UINT32_MAX ? UINT32_MAX : needed;
+                    int r = ext4_fs_get_inode_dblk_range(&ref, logical, maximum, false, &range);
+                    if (r) { mapping_errors[i] = r; break; }
+                    range_start = logical;
+                }
+                ext4_fsblk_t physical = range.unwritten || !range.block ? 0 :
+                    range.block + (logical - range_start);
+                if (!physical) {
+                    uint64_t bytes = (uint64_t)(range.count - (logical - range_start)) * block_size - skip;
+                    length = bytes < limits[i] - planned ? bytes : limits[i] - planned;
+                }
                 void *out = (uint8_t *)spans[i].buffer + planned;
                 unsigned sector = fs->bdev->bdif->ph_bsize;
                 uint64_t block = (fs->bdev->part_offset + physical * block_size + skip) / sector;
@@ -3311,6 +3334,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     memset(out, 0, length);
                     fragments[parts - 1].length += length;
                     planned += length;
+                    range_offset = offset + length;
                     continue;
                 }
                 if (parts == capacity) {
@@ -3320,6 +3344,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     reads[pending - 1].count += length / sector;
                     fragments[parts - 1].length += length;
                     planned += length;
+                    range_offset = offset + length;
                     continue;
                 }
                 unsigned part = parts++;
@@ -3339,6 +3364,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     }
                 }
                 planned += length;
+                range_offset = offset + length;
             }
         }
         ext4_blockdev_read_batch(fs->bdev, reads, pending);
@@ -3479,6 +3505,8 @@ Retry:
         direct = ext4_calloc(1, sizeof(*direct));
         if (!direct) r = ENOMEM;
     }
+    struct ext4_inode_block_range range = {0};
+    ext4_lblk_t range_next = 0;
 	for (unsigned i = 0; i < count && !r; i++) {
 		struct ext4_file_write_span *span = &spans[i];
 		if (!span->size) continue;
@@ -3502,14 +3530,35 @@ Retry:
         }
         size_t consumed = 0;
 		while (consumed < span->size && !r) {
+            if (direct && (direct->bytes == 131072 || direct->count == EXT4_BLOCK_BATCH_MAX)) {
+                r = ext4_direct_write_flush(&ref, file, direct);
+                if (r) break;
+            }
 			uint32_t offset = file->fpos % block_size;
 			size_t length = block_size - offset;
 			if (length > span->size - consumed) length = span->size - consumed;
 			ext4_fsblk_t physical;
 			bool allocated;
 			ext4_lblk_t logical_block = file->fpos / block_size;
-			r = ext4_fs_get_or_alloc_inode_dblk_idx(&ref, logical_block, &physical, &allocated);
-			if (r) break;
+            ext4_assert(!range.count || range_next == logical_block);
+			if (!range.count) {
+                uint64_t end = span->offset + span->size;
+                /* Stop at gaps and partial block boundaries. In particular a
+                 * later span revisiting this block must see initialized data. */
+                for (unsigned j = i + 1; j < count && !(end % block_size); j++) {
+                    if (!spans[j].size) continue;
+                    if (spans[j].offset != end) break;
+                    end += spans[j].size;
+                }
+                uint64_t needed = (end - 1) / block_size - logical_block + 1;
+                uint32_t maximum = (131072 - (direct ? direct->bytes : 0)) / block_size;
+                if (needed < maximum) maximum = needed;
+                r = ext4_fs_get_inode_dblk_range(&ref, logical_block, maximum, true, &range);
+                if (r) break;
+                range_next = logical_block;
+            }
+            physical = range.block;
+            allocated = range.allocated;
             const uint8_t *input = (const uint8_t *)span->buffer + consumed;
             uint32_t data_offset = offset, data_length = length;
             if (span->source_buffer) {
@@ -3546,14 +3595,9 @@ Retry:
                 if (!r) r = ext4_trans_write_data(fs->bdev, physical, data_offset,
                     input, data_length, allocated, &span->source);
             }
-			if (r) {
-				if (allocated) {
-					int cleanup = ext4_fs_release_inode_dblk_idx(&ref, logical_block, physical);
-					if (cleanup) r = cleanup;
-				}
-				break;
-			}
+			if (r) break;
             consumed += length;
+            range.block++; range.count--; range_next++;
 			if (!queued) span->written += length;
 			file->fpos += length;
 			if (!queued && file->fpos > ext4_inode_get_size(&fs->sb, ref.inode)) {
@@ -3561,6 +3605,16 @@ Retry:
 			}
 		}
 	}
+    if (r && range.allocated) {
+        /* Mapped ahead blocks can belong to later input spans. Keep one batch
+         * cursor so any failure releases their entire unconsumed suffix. */
+        while (range.count) {
+            range.count--;
+            int cleanup = ext4_fs_release_inode_dblk_idx(&ref,
+                range_next + range.count, range.block + range.count);
+            if (cleanup) r = cleanup;
+        }
+    }
     int direct_result = ext4_direct_write_flush(&ref, file, direct);
     if (!r) r = direct_result;
     ext4_free(direct);

@@ -7,6 +7,7 @@
 #include <ext4_super.h>
 #include <ext4_block_group.h>
 #include <ext4_bitmap.h>
+#include <ext4_balloc.h>
 #include <ext4_journal.h>
 #include <ext4_trans.h>
 #include <ext4_crc32.h>
@@ -15,6 +16,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TEST_RANGE_WORK_COUNTERS
+static uint32_t watched_bitmap_bytes, bitmap_crc_calls;
+static unsigned range_queries;
+int __real_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,bool,struct ext4_inode_block_range *);
+int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t logical,uint32_t count,bool create,struct ext4_inode_block_range *range)
+{
+    range_queries++;
+    return __real_ext4_fs_get_inode_dblk_range(ref,logical,count,create,range);
+}
+uint32_t __real_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes);
+uint32_t __wrap_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes)
+{
+    if (bytes == watched_bitmap_bytes) bitmap_crc_calls++;
+    return __real_ext4_crc32c(crc,data,bytes);
+}
+#endif
 static struct fault_block disk;
 static unsigned allocations, fail_allocation, reads, fail_read, live_allocations;
 static size_t payload_threshold;
@@ -1493,6 +1510,286 @@ static void corrupt_stats(struct ext4_fs *fs,const char *kind)
     if(memcmp(&stats,&before,sizeof(stats)) || disk.writes!=writes || fs->bdev->fs!=fs) fprintf(stderr,"corrupt %s bytes=%d writes=%llu/%llu owner=%d\n",kind,memcmp(&stats,&before,sizeof(stats)),(unsigned long long)disk.writes,(unsigned long long)writes,fs->bdev->fs==fs);
     CHECK(!memcmp(&stats,&before,sizeof(stats)) && disk.writes==writes && fs->bdev->fs==fs);
 }
+static void public_batch_ranges(struct ext4_blockdev *dev)
+{
+    (void)dev; /* Some host runners build this fixture without work counters. */
+    ext4_file file;CHECK(ext4_fopen(&file,"/public-range","w+")==EOK);
+    struct owned_file_page pages[32];struct ext4_file_write_span writes[32];
+    struct ext4_file_read_span reads_out[32];unsigned char *outputs[32];
+    for(unsigned i=0;i<32;i++) {
+        owned_page_init(&pages[i],4096,0x40+i);
+        writes[i]=(struct ext4_file_write_span){.offset=i*4096,.buffer=pages[i].bytes,.size=4096,
+            .source={&pages[i],owned_page_retain,owned_page_release,4096},
+            .source_buffer=pages[i].bytes,.source_size=4096};
+        outputs[i]=malloc(4096);CHECK(outputs[i]);
+        reads_out[i]=(struct ext4_file_read_span){i*4096,outputs[i],4096,0,0};
+    }
+    CHECK(ext4_transaction_begin("/")==EOK);
+#ifdef TEST_RANGE_WORK_COUNTERS
+    watched_bitmap_bytes=ext4_get32(&dev->fs->sb,blocks_per_group)/8;
+    bitmap_crc_calls=0;range_queries=0;
+#endif
+    CHECK(ext4_fpwrite_batch(&file,writes,32)==EOK);
+#ifdef TEST_RANGE_WORK_COUNTERS
+    printf("public 32-page write: queries=%u bitmapCRC=%u\n",range_queries,bitmap_crc_calls);
+    CHECK(range_queries==1 && bitmap_crc_calls==2);
+    watched_bitmap_bytes=0;range_queries=0;
+#endif
+    CHECK(ext4_fpread_batch(&file,reads_out,32)==EOK);
+#ifdef TEST_RANGE_WORK_COUNTERS
+    CHECK(range_queries==1);
+#endif
+    for(unsigned i=0;i<32;i++) {
+        CHECK(writes[i].written==4096 && !reads_out[i].error && reads_out[i].completed==4096);
+        for(unsigned j=0;j<4096;j++)CHECK(outputs[i][j]==0x40+i);
+        free(outputs[i]);
+    }
+    CHECK(ext4_transaction_end("/")==EOK);
+    for(unsigned i=0;i<32;i++) {
+        CHECK(pages[i].references==1);
+        outputs[i]=malloc(4096);CHECK(outputs[i]);
+        reads_out[i]=(struct ext4_file_read_span){i*4096,outputs[i],4096,0,0};
+    }
+    /* A journal retains its inode reference until unmount; raw cache cleanup
+     * would invalidate that owner. Cold-read through a complete remount. */
+    CHECK(ext4_fclose(&file)==EOK && ext4_umount("/")==EOK);
+    CHECK(ext4_mount("metadata","/",false)==EOK && ext4_journal_start("/")==EOK);
+    CHECK(ext4_fopen(&file,"/public-range","r+")==EOK);
+#ifdef TEST_RANGE_WORK_COUNTERS
+    range_queries=0;
+#endif
+    CHECK(ext4_fpread_batch(&file,reads_out,32)==EOK);
+#ifdef TEST_RANGE_WORK_COUNTERS
+    CHECK(range_queries==1);
+#endif
+    for(unsigned i=0;i<32;i++) {
+        CHECK(!reads_out[i].error && reads_out[i].completed==4096);
+        for(unsigned j=0;j<4096;j++)CHECK(outputs[i][j]==0x40+i);
+        free(outputs[i]);owned_page_release(&pages[i]);
+    }
+    CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/public-range")==EOK);
+    puts("public 32-page batch: discrete buffers, one write/read range and two bitmap CRC calls");
+}
+static void public_batch_boundaries(struct ext4_blockdev *dev)
+{
+    ext4_file file;CHECK(ext4_fopen(&file,"/batch-boundaries","w+")==EOK);
+    unsigned char first[13],second[19],last[17];memset(first,0x31,sizeof(first));
+    memset(second,0x52,sizeof(second));memset(last,0x73,sizeof(last));
+    struct ext4_file_write_span spans[3]={
+        {.offset=0,.buffer=first,.size=sizeof(first)},
+        {.offset=sizeof(first),.buffer=second,.size=sizeof(second)},
+        {.offset=2*dev->lg_bsize,.buffer=last,.size=sizeof(last)}};
+    CHECK(ext4_fpwrite_batch(&file,spans,3)==EOK);
+    struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,1,1,false,&range)==EOK && !range.block);
+    CHECK(ext4_inode_get_blocks_count(&dev->fs->sb,ref.inode)==2*dev->lg_bsize/512);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    size_t size=2*dev->lg_bsize+sizeof(last),done;unsigned char *out=malloc(size);CHECK(out);
+    CHECK(ext4_fpread(&file,0,out,size,&done)==EOK && done==size);
+    for(size_t i=0;i<size;i++)CHECK(out[i]==(i<13?0x31:i<32?0x52:i<2*dev->lg_bsize?0:0x73));
+    free(out);CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/batch-boundaries")==EOK);
+    puts("public batch boundaries: same-block partials preserve bytes; gaps remain unallocated holes");
+}
+static void direct_range_error(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    ext4_file file;CHECK(ext4_fopen(&file,"/direct-range-error","w+")==EOK);
+    uint64_t free_before=ext4_sb_get_free_blocks_cnt(&fs->sb);
+    struct ext4_file_write_span spans[32];
+    for(unsigned i=0;i<32;i++) {
+        owned_page_init(&direct_pages[i],8192,0x30+i);
+        spans[i]=(struct ext4_file_write_span){.offset=i*4096,.buffer=direct_pages[i].bytes,.size=4096,
+            .source={&direct_pages[i],owned_page_retain,owned_page_release,8192},
+            .source_buffer=direct_pages[i].bytes,.source_size=8192};
+    }
+    /* A copied sixth page flushes five queued borrowed pages while this one
+     * allocation window still owns the remaining 27 pages in later spans. */
+    spans[5].source=(struct ext4_data_source){0};spans[5].source_buffer=NULL;spans[5].source_size=0;
+    direct_batches=0;direct_fail_batch=1;fs->bdev->bdif->bwrite_batch=direct_write_batch;
+    CHECK(ext4_fpwrite_batch(&file,spans,32)==EIO && direct_batches==1 && !file.fsize);
+    fs->bdev->bdif->bwrite_batch=NULL;
+    struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(fs,file.inode,&ref)==EOK);
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,131072/fs->bdev->lg_bsize,false,&range)==EOK && !range.block && range.count==131072/fs->bdev->lg_bsize);
+    CHECK(!ext4_inode_get_blocks_count(&fs->sb,ref.inode));
+    CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb)==free_before);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    for(unsigned i=0;i<32;i++) {CHECK(!spans[i].written && direct_pages[i].references==1);owned_page_release(&direct_pages[i]);}
+    CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/direct-range-error")==EOK);
+    puts("nonjournal cross-span failure: five queued pages and 27 mapped-ahead pages all released");
+}
+static void extent_range(struct ext4_blockdev *dev)
+{
+    ext4_file f; CHECK(ext4_fopen(&f,"/range","w+")==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    struct ext4_inode_ref ref;
+    CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+    ext4_fsblk_t physical; uint32_t count;
+#ifdef TEST_RANGE_WORK_COUNTERS
+    watched_bitmap_bytes=ext4_get32(&dev->fs->sb,blocks_per_group)/8;
+    bitmap_crc_calls=0;
+#endif
+    CHECK(ext4_extent_get_blocks(&ref,4,32,&physical,true,&count)==EOK);
+    CHECK(physical && count==32);
+#ifdef TEST_RANGE_WORK_COUNTERS
+    CHECK(bitmap_crc_calls==2); /* One verification and one update of the bitmap. */
+    watched_bitmap_bytes=0;
+#endif
+    ext4_fsblk_t first=physical;
+    struct ext4_inode_block_range range;
+    unsigned before=allocations;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,7,64,false,&range)==EOK);
+    CHECK(range.block==first+3 && range.count==29 && !range.unwritten && !range.allocated);
+    unsigned path_allocations=allocations-before;
+    before=allocations;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,7,1,false,&range)==EOK && range.count==1);
+    CHECK(allocations-before==path_allocations); /* Range length does not repeat path allocation. */
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,64,false,&range)==EOK && !range.block && range.count==4);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,36,64,false,&range)==EOK && !range.block && range.count==64);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,0,false,&range)==EINVAL);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,EXT_MAX_BLOCKS,1,false,&range)==EFBIG);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,EXT_MAX_BLOCKS-1,2,false,&range)==EOK && !range.block && range.count==1);
+    /* Encode an on-disk unwritten extent, rather than treating holes as its
+     * proxy: physical storage remains owned while reads must return zero. */
+    uint16_t *disk_len=(uint16_t *)((unsigned char *)ref.inode->blocks+16);
+    CHECK(to_le16(*disk_len)==32); *disk_len=to_le16(0x8000+32); ref.dirty=true;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,7,64,false,&range)==EOK &&
+        range.unwritten && range.block==first+3 && range.count==29 && !range.allocated);
+    CHECK(ext4_extent_get_blocks(&ref,7,64,&physical,false,&count)==EOK && !physical && count==29);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,11,5,true,&range)==EOK &&
+        range.block==first+7 && range.count==5 && !range.unwritten && !range.allocated);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,4,64,false,&range)==EOK && range.unwritten && range.count==7);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,16,64,false,&range)==EOK && range.unwritten && range.count==20);
+    ext4_inode_set_size(ref.inode,36*dev->lg_bsize);ref.dirty=true;
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+    unsigned char *zeroes=malloc(36*dev->lg_bsize);CHECK(zeroes);size_t done;
+    memset(zeroes,0xa5,36*dev->lg_bsize);
+    before=allocations;
+    CHECK(ext4_fpread(&f,0,zeroes,36*dev->lg_bsize,&done)==EOK && done==36*dev->lg_bsize);
+    unsigned read_allocations=allocations-before;
+    CHECK(read_allocations<=6);
+    for(size_t i=0;i<done;i++) { CHECK(!zeroes[i]); }
+    free(zeroes);
+    CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/range")==EOK);
+    printf("extent range: 32-block allocation, bitmap CRC=2, path allocations=%u, 36-block read allocations=%u, holes/unwritten/conversion boundaries\n",path_allocations,read_allocations);
+}
+static void legacy_range(struct ext4_blockdev *dev)
+{
+    ext4_file f;CHECK(ext4_fopen(&f,"/legacy-range","w+")==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+    ext4_inode_clear_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS);
+    memset(ref.inode->blocks,0,sizeof(ref.inode->blocks));ref.dirty=true;
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,8,32,true,&range)==EOK && range.allocated && range.count==4);
+    ext4_fsblk_t direct=range.block;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,12,32,true,&range)==EOK && range.allocated && range.count==32);
+    ext4_fsblk_t indirect=range.block;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,8,32,false,&range)==EOK && range.block==direct && range.count==4);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,12,64,false,&range)==EOK && range.block==indirect && range.count==32);
+    ext4_lblk_t boundary=12+dev->lg_bsize/4;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,boundary-2,8,false,&range)==EOK && !range.block && range.count==2);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,boundary-2,8,true,&range)==EOK && range.count==2);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,boundary,6,true,&range)==EOK && range.count==6);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,boundary+3,32,false,&range)==EOK && range.block && range.count==3);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,boundary+6,32,false,&range)==EOK && !range.block && range.count==32);
+    ext4_inode_set_size(ref.inode,(uint64_t)(boundary+6)*dev->lg_bsize);ref.dirty=true;
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+    CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/legacy-range")==EOK);
+    puts("legacy ranges: direct/single/double-indirect leaves and holes");
+}
+static void range_abort(struct ext4_blockdev *dev)
+{
+    ext4_file f;CHECK(ext4_fopen(&f,"/range-abort","w+")==EOK);
+    uint64_t free_before=ext4_sb_get_free_blocks_cnt(&dev->fs->sb);
+    unsigned failures=0;
+    for(unsigned point=0;point<=24;point++) {
+        CHECK(ext4_transaction_begin("/")==EOK);
+        struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+        struct ext4_inode_block_range range;
+        if(point)fail_allocation=allocations+point;
+        int r=ext4_fs_get_inode_dblk_range(&ref,0,32,true,&range);
+        fail_allocation=0;
+        CHECK(r==EOK || r==ENOMEM);
+        if(r==EOK) {
+            CHECK(range.allocated && range.count==32);
+            CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before-32);
+        } else failures++;
+        int put=ext4_fs_put_inode_ref(&ref);CHECK(put==EOK || put==ENOMEM);
+        CHECK(ext4_transaction_abort("/",r?r:ECANCELED)==(r?r:ECANCELED));
+        CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before);
+        CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+        CHECK(!ext4_inode_get_blocks_count(&dev->fs->sb,ref.inode));
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,0,32,false,&range)==EOK && !range.block && range.count==32);
+        CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    }
+    CHECK(failures);
+    int close_result=ext4_fclose(&f),remove_result=ext4_fremove("/range-abort");
+    if(close_result || remove_result)fprintf(stderr,"range abort close=%d remove=%d\n",close_result,remove_result);
+    CHECK(close_result==EOK && remove_result==EOK);
+    printf("range abort: extent, 32 bitmap bits, inode and free counts restored; %u OOM points\n",failures);
+}
+static void unwritten_range_abort(struct ext4_blockdev *dev)
+{
+    ext4_file f;CHECK(ext4_fopen(&f,"/unwritten-abort","w+")==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,32,true,&range)==EOK && range.count==32);
+    uint16_t *disk_len=(uint16_t *)((unsigned char *)ref.inode->blocks+16);
+    *disk_len=to_le16(0x8000+32);ref.dirty=true;
+    for(unsigned i=0;i<3;i++)CHECK(ext4_fs_get_inode_dblk_range(&ref,64+2*i,1,true,&range)==EOK);
+    ext4_inode_set_size(ref.inode,69*dev->lg_bsize);ref.dirty=true;
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+    uint64_t free_before=ext4_sb_get_free_blocks_cnt(&dev->fs->sb);
+    unsigned failures=0;
+    for(unsigned point=0;point<=32;point++) {
+        CHECK(ext4_transaction_begin("/")==EOK && ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+        if(point)fail_allocation=allocations+point;
+        int r=ext4_fs_get_inode_dblk_range(&ref,7,5,true,&range);
+        bool injected=point && allocations>=fail_allocation;
+        fail_allocation=0;
+        CHECK(r==EOK || r==ENOMEM);
+        if(injected) {CHECK(r==ENOMEM);failures++;}
+        else CHECK(r==EOK && range.count==5 && !range.unwritten);
+        int put=ext4_fs_put_inode_ref(&ref);CHECK(put==EOK || put==ENOMEM);
+        CHECK(ext4_transaction_abort("/",r?r:ECANCELED)==(r?r:ECANCELED));
+        CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before);
+        CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,0,64,false,&range)==EOK && range.unwritten && range.count==32);
+        CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    }
+    CHECK(failures);
+    CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/unwritten-abort")==EOK);
+    printf("unwritten abort: split tree and bitmap restored; %u OOM points\n",failures);
+}
+static void fragmented_range(struct ext4_blockdev *dev)
+{
+    ext4_file f;CHECK(ext4_fopen(&f,"/range-fragments","w+")==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,32,true,&range)==EOK && range.count==32);
+    ext4_fsblk_t first=range.block;
+    for(unsigned i=32;i>4;i--)CHECK(ext4_fs_release_inode_dblk_idx(&ref,i-1,first+i-1)==EOK);
+    for(unsigned i=3;i;i--)CHECK(ext4_fs_release_inode_dblk_idx(&ref,i-1,first+i-1)==EOK);
+    ext4_inode_set_size(ref.inode,4*dev->lg_bsize);ref.dirty=true;
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK && ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+    uint64_t free_before=ext4_sb_get_free_blocks_cnt(&dev->fs->sb);
+    ext4_fsblk_t block;uint32_t count;
+    int result=ext4_balloc_alloc_blocks(&ref,first,8,&block,&count);
+    if(result || block!=first || count!=3)fprintf(stderr,"fragment result=%d first=%llu block=%llu count=%u grouped=%d\n",result,(unsigned long long)first,(unsigned long long)block,count,dev->fs->jbd_journal->grouped);
+    CHECK(result==EOK && block==first && count==3);
+    CHECK(ext4_balloc_free_blocks(&ref,block,count)==EOK);
+    CHECK(ext4_balloc_alloc_blocks(&ref,first+3,5,&block,&count)==EOK && block==first+4 && count==5);
+    CHECK(ext4_balloc_free_blocks(&ref,block,count)==EOK);
+    CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+    CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/range-fragments")==EOK);
+    puts("fragmented allocator: bounded prefix, occupied goal, one owner per run");
+}
 static void extent_read_failure(struct ext4_blockdev *dev, bool io, unsigned point)
 {
     ext4_file f;unsigned char byte=0x5a;size_t written;
@@ -1539,6 +1836,7 @@ int main(int argc,char **argv)
     }
     if(!strcmp(argv[2],"extent-read-oom") || !strcmp(argv[2],"extent-read-error"))
         extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
+    else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
@@ -1555,6 +1853,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-pipeline") || !strcmp(argv[2],"group-commit-crash")) {group_pipeline(dev.fs,!strcmp(argv[2],"group-commit-crash"));if(!strcmp(argv[2],"group-commit-crash"))return 0;}
     else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
     else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);
+    else if(!strcmp(argv[2],"direct-range-error"))direct_range_error(dev.fs);
     else if(!strcmp(argv[2],"direct-data-batch") || !strcmp(argv[2],"direct-data-error"))
         direct_data_batch(dev.fs,!strcmp(argv[2],"direct-data-error"));
     else if(!strcmp(argv[2],"group-partial-owner") || !strcmp(argv[2],"group-partial-error")) {
