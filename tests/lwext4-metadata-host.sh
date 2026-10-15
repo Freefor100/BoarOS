@@ -10,7 +10,7 @@ check_fs() {
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
     -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
-    -DTEST_RANGE_WORK_COUNTERS=1 -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range \
+    -DTEST_RANGE_WORK_COUNTERS=1 -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
