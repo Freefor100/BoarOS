@@ -106,6 +106,7 @@ struct kernel_page_cache_record {
     struct cache_version *snapshots[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
     size_t snapshot_count;
     struct writeback_workspace *writeback_workspace;
+    union foreground_workspace *foreground_workspace;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     struct readahead_job readahead_jobs[8];
     struct kernel_thread_join readahead_worker;
@@ -169,6 +170,54 @@ static void cache_guard_begin(struct kernel_page_cache *cache, struct cache_guar
 #define CACHE_SCOPE(name, cache) \
     struct cache_guard name __attribute__((cleanup(cache_unlock))) = {0}; \
     cache_guard_begin((cache), &name)
+
+struct read_workspace {
+    struct kernel_page_cache_entry *loads[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+    struct kernel_vfs_read_span spans[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+    struct kernel_page_cache_read_page *outputs[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+};
+struct prepared_writeback {
+    struct cache_version *version;
+    uint64_t generation;
+    uint32_t begin,end;
+    uint8_t closed,span_index;
+};
+struct writeback_storage {
+    struct prepared_writeback prepared[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+    struct file_write_span spans[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+    struct kernel_page_cache_entry *selected[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+};
+union foreground_workspace {
+    struct read_workspace read;
+    struct writeback_storage writeback;
+};
+_Static_assert(sizeof(union foreground_workspace) <= BOAROS_PAGE_SIZE,
+    "foreground descriptors must fit one physical page");
+
+/* cache保留一个空闲控制区；借出后由调用现场独占。竞争者取得独立区，
+ * 不在inode I/O资格或loading页借用下等待另一批归还。 */
+static union foreground_workspace *foreground_workspace_take(struct kernel_page_cache *cache)
+{
+    union foreground_workspace *workspace;
+    {
+        CACHE_SCOPE(guard,cache);
+        workspace=cache->record->foreground_workspace;
+        cache->record->foreground_workspace=NULL;
+    }
+    if (!workspace && kernel_heap_allocate(cache->heap,sizeof(*workspace),(void **)&workspace)) return NULL;
+    return workspace;
+}
+static void foreground_workspace_put(struct kernel_page_cache *cache,union foreground_workspace *workspace)
+{
+    {
+        CACHE_SCOPE(guard,cache);
+        if (!cache->record->foreground_workspace) {
+            cache->record->foreground_workspace=workspace;
+            return;
+        }
+    }
+    if (kernel_heap_release(cache->heap,workspace)) __builtin_trap();
+}
 static int remote_cache_client(void)
 {
 #if BOAROS_MAX_CPUS > 1
@@ -1624,15 +1673,12 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     struct kernel_page_cache_entry **entries)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    struct read_workspace {
-        struct kernel_page_cache_entry *loads[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
-        struct kernel_vfs_read_span spans[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
-        struct kernel_page_cache_read_page *outputs[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
-    } *workspace=NULL;
+    union foreground_workspace *lease=count>1?foreground_workspace_take(cache):NULL;
+    struct read_workspace *workspace=lease?&lease->read:NULL;
     struct kernel_page_cache_entry *single_load;
     struct kernel_vfs_read_span single_span;
     struct kernel_page_cache_read_page *single_output;
-    if (count>1 && kernel_heap_allocate(cache->heap,sizeof(*workspace),(void **)&workspace)) {
+    if (count>1 && !workspace) {
         for (size_t i=0;i<count;i++) {
             if (entries[i]) pages[i].status=finish_read_page(cache,entries[i],
                 &pages[i].physical_address,&pages[i].valid_bytes);
@@ -1684,10 +1730,10 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     }
     /* 先完成本批自有页，再等其他loading；反向重叠的需求不会彼此等待未提交页。 */
     (void)load_read_pages(cache, node, loads, spans, loading, outputs);
+    if (lease) foreground_workspace_put(cache,lease);
     for (size_t i = 0; i < count; i++) if (entries[i])
         pages[i].status = finish_read_page(cache, entries[i],
             &pages[i].physical_address, &pages[i].valid_bytes);
-    if (workspace && kernel_heap_release(cache->heap,workspace)) __builtin_trap();
 }
 
 struct cache_read_batch_request {
@@ -1935,12 +1981,6 @@ static int complete_writeback(struct kernel_page_cache *cache,
     }
     return result;
 }
-struct prepared_writeback {
-    struct cache_version *version;
-    uint64_t generation;
-    uint32_t begin,end;
-    uint8_t closed,span_index;
-};
 _Static_assert(BOAROS_PAGE_SIZE <= UINT32_MAX && BOAROS_PAGE_CACHE_WRITEBACK_PAGES <= UINT8_MAX,
     "writeback page offsets and span indices must fit their stored representation");
 _Static_assert(BOAROS_PAGE_CACHE_WRITEBACK_PAGES * (sizeof(struct prepared_writeback) +
@@ -2176,8 +2216,11 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
             single=entry;entry_borrow(single);COST_ADD(WRITEBACK_VISITS,1);
         }
     }
-    struct writeback_workspace work={0};
-    if (multiple && writeback_workspace_init(cache,&work)) return -KERNEL_ENOMEM;
+    union foreground_workspace *lease=multiple?foreground_workspace_take(cache):NULL;
+    if (multiple && !lease) return -KERNEL_ENOMEM;
+    struct writeback_workspace work=multiple?(struct writeback_workspace){
+        .prepared=lease->writeback.prepared,.spans=lease->writeback.spans,
+        .selected=lease->writeback.selected}:(struct writeback_workspace){0};
     int result=0;
     for (;;) {
         struct kernel_page_cache_entry **selected=multiple?work.selected:&single;
@@ -2199,7 +2242,7 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
         {CACHE_SCOPE(guard,cache);for(size_t i=0;i<count;i++)entry_return(selected[i]);}
         if (result || !multiple || cursor>last) break;
     }
-    if (multiple) writeback_workspace_release(cache,&work);
+    if (lease) foreground_workspace_put(cache,lease);
     return result;
 }
 
@@ -2950,6 +2993,8 @@ enum kernel_page_cache_status kernel_page_cache_destroy(
                                 cache->record->buckets);
         cache->record->buckets = 0;
     }
+    if (cache->record->foreground_workspace &&
+        kernel_heap_release(cache->heap,cache->record->foreground_workspace)) __builtin_trap();
     (void)kernel_heap_release(cache->heap, cache->record);
     cache->heap = 0;
     cache->allocator = 0;

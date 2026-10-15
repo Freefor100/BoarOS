@@ -45,6 +45,7 @@ static struct kernel_page_cache *current_cache;
 static struct kernel_vfs_file *current_file;
 struct read_operation_counts {
     uint64_t metadata_locks, inode_locks, physical_acquires, physical_releases;
+    uint64_t descriptor_allocations;
 #ifndef CACHE_MM_CASES
     uint64_t cache_allocations;
 #endif
@@ -89,9 +90,16 @@ struct writeback_operation_counts {
     const struct file_write_span *spans;
 };
 static _Thread_local struct writeback_operation_counts *write_counts;
+static _Thread_local unsigned fail_workspace_allocation;
+static _Thread_local size_t *demand_heap_allocations;
 enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t bytes,void **out)
 {
+    if (current_cache && heap==current_cache->heap) {
+        if (read_counts && bytes>256) read_counts->descriptor_allocations++;
+        if (demand_heap_allocations) (*demand_heap_allocations)++;
+        if (fail_workspace_allocation && !--fail_workspace_allocation) return KERNEL_HEAP_STATUS_EMPTY;
+    }
     if(write_counts && current_cache && heap==current_cache->heap) {
         write_counts->allocations++;
         if(bytes>256)write_counts->large_allocations++;
@@ -567,7 +575,7 @@ static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs
     assert(!kernel_vfs_sync(file,0,&observed));write_counts=NULL;
     printf("foreground windows: pages=%u allocations=%zu descriptors=%zu largest=%zu batches=%zu maxpages=%zu\n",
         COUNT,counts.allocations,counts.large_allocations,counts.largest,counts.batches,counts.maximum_pages);
-    assert(counts.large_allocations==1 && counts.allocations==COUNT+1);
+    assert(!counts.large_allocations && counts.allocations==COUNT);
     assert(counts.maximum_pages<=131072/BOAROS_PAGE_SIZE && counts.largest<=BOAROS_PAGE_SIZE);
     assert(counts.maximum_borrows<=2*(131072/BOAROS_PAGE_SIZE));
     for(unsigned i=0;i<COUNT;i++) {
@@ -579,7 +587,7 @@ static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs
     counts=(struct writeback_operation_counts){0};write_counts=&counts;
     assert(!kernel_vfs_sync(file,0,&observed));write_counts=NULL;
     assert(counts.allocations==1 && !counts.large_allocations && counts.batches==1 && counts.maximum_pages==1);
-    puts("PASS foreground writeback: one bounded descriptor allocation across windows, scalar page uses no descriptors");
+    puts("PASS foreground writeback: reused bounded descriptors across sync calls/windows, scalar page uses no descriptors");
 }
 static unsigned window_truncate_started,window_truncate_done;
 static void *truncate_writeback_window(void *file)
@@ -746,6 +754,8 @@ static void dirty_index_case(struct kernel_page_cache *cache, struct kernel_vfs_
 
 struct demand_read {
     unsigned cpu, done;
+    unsigned fail_workspace;
+    size_t heap_allocations;
     uint64_t first;
     size_t count;
     enum kernel_page_cache_status status;
@@ -755,10 +765,14 @@ static void *read_demand_batch(void *arg)
 {
     struct demand_read *read = arg;
     mm_test_attach(read->cpu);
+    fail_workspace_allocation=read->fail_workspace;
+    demand_heap_allocations=&read->heap_allocations;
     /* 结果必须由本次调用完整填写，错误页不能沿用旧地址或字节数。 */
     memset(read->pages, 0xa5, sizeof(read->pages));
     read->status = kernel_page_cache_get_batch(current_cache, current_file,
         read->first, read->pages, read->count);
+    assert(!fail_workspace_allocation);
+    demand_heap_allocations=NULL;
     __atomic_store_n(&read->done, 1, __ATOMIC_RELEASE);
     return 0;
 }
@@ -866,13 +880,14 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
             assert(source_batches == !warm && source_reads == (warm ? 0 : count));
             assert(read.counts.physical_acquires == (warm || !remote ? count : 0) &&
                 read.counts.physical_releases == count);
+            assert(!read.counts.descriptor_allocations);
 #ifndef CACHE_MM_CASES
             assert(read.counts.cache_allocations == (remote || warm ? 0 : count));
 #endif
             /* expanded_index已建立足够桶容量；这里检查实际保护次数，
              * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
             assert(read.counts.inode_locks == (remote ? count : 1));
-            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 2 * count + 2));
+            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 2 * count + 2 + (count>1?2:0)));
             else if (warm) assert(read.counts.metadata_locks == count);
             printf("read operation counts: page=%u cpu=%s cache=%s pages=%u metadata=%llu inode=%llu acquire=%llu release=%llu cache_probes=unavailable(COST=0) scope=caller\n",
                 (unsigned)BOAROS_PAGE_SIZE, remote ? "remote" : "native", warm ? "hot" : "cold", count,
@@ -963,6 +978,7 @@ static void demand_overlap(struct kernel_page_cache *cache, struct kernel_vfs_fi
     assert(!pthread_join(producer, 0) && !pthread_join(other, 0));
     assert(!first.status && !overlap.status && source_reads == 6 && source_batches == 2 &&
         source_batch_sizes[0] == 3 && source_batch_sizes[1] == 3);
+    assert(overlap.heap_allocations==1);
     for (unsigned i = 0; i < 4; i++) demand_contents(&first.pages[i], 0x30 + i, BOAROS_PAGE_SIZE);
     for (unsigned i = 0; i < 6; i++) demand_contents(&overlap.pages[i], 0x32 + i, BOAROS_PAGE_SIZE);
     assert(first.pages[1].physical_address == hot[0] && overlap.pages[4].physical_address == hot[1] &&
@@ -974,6 +990,44 @@ static void demand_overlap(struct kernel_page_cache *cache, struct kernel_vfs_fi
     demand_release(&overlap);
     demand_idle(cache);
     puts("PASS overlapping demand batches: hot/loading/own misses, publish before wait, one load per cold page");
+}
+static void demand_workspace_oom(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
+    struct kernel_heap_statistics before,after;
+    kernel_heap_get_statistics(cache->heap,&before);
+    uint64_t hot;size_t valid;
+    assert(!kernel_page_cache_get(cache,file,4,&hot,&valid) && valid==BOAROS_PAGE_SIZE);
+    reset_demand_source();pause_read=1;
+    struct demand_read first={.cpu=1,.count=2};
+    pthread_t producer;
+    assert(!pthread_create(&producer,NULL,read_demand_batch,&first));
+    wait_progress(&read_entered,1);
+    /* 首批仍在后端持有控制区；并发批次分配失败只影响自己的冷页，
+     * 已取得的热页引用保留，不能等首批归还而阻塞独立I/O。 */
+    struct demand_read failed={.cpu=0,.first=4,.count=3,.fail_workspace=1};
+    read_demand_batch(&failed);
+    assert(failed.status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY && failed.heap_allocations==1 &&
+        source_reads==2 && source_batches==1 && !__atomic_load_n(&first.done,__ATOMIC_ACQUIRE));
+    demand_contents(&failed.pages[0],0x34,BOAROS_PAGE_SIZE);
+    for(unsigned i=1;i<3;i++) assert(failed.pages[i].status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY &&
+        !failed.pages[i].physical_address && !failed.pages[i].valid_bytes);
+    struct demand_read retry={.cpu=0,.first=4,.count=3};
+    read_demand_batch(&retry);
+    assert(!retry.status && retry.heap_allocations==1 && source_reads==4 && source_batches==2 &&
+        !__atomic_load_n(&first.done,__ATOMIC_ACQUIRE) &&
+        retry.pages[0].physical_address==failed.pages[0].physical_address);
+    for(unsigned i=0;i<3;i++) demand_contents(&retry.pages[i],0x34+i,BOAROS_PAGE_SIZE);
+    __atomic_store_n(&resume_read,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(producer,NULL) && !first.status);
+    for(unsigned i=0;i<2;i++) demand_contents(&first.pages[i],0x30+i,BOAROS_PAGE_SIZE);
+    demand_release(&retry);demand_release(&failed);demand_release(&first);
+    assert(!physical_page_release(cache->allocator,hot));
+    demand_idle(cache);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
+    kernel_heap_get_statistics(cache->heap,&after);
+    assert(after.live_allocations==before.live_allocations);
+    puts("PASS workspace contention: allocation failure preserves hot refs, independent retry finishes before paused owner, surplus descriptor freed");
 }
 static void demand_errors(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
@@ -1162,6 +1216,7 @@ static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file
     demand_cold_warm(cache, file);
     demand_short_read(cache, file);
     demand_overlap(cache, file);
+    demand_workspace_oom(cache,file);
     demand_errors(cache, file);
 #ifndef CACHE_MM_CASES
     demand_oom(cache, file);
