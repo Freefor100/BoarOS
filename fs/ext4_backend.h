@@ -29,6 +29,7 @@ struct lwext4_mount_adapter {
     struct lwext4_orphan *orphans;
     struct lwext4_node *dirty_times, **dirty_times_tail, *staged_times;
     uint64_t times_deadline;
+    size_t dirty_times_count;
 
     uint8_t block_claimed;
     uint8_t registered;

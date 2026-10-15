@@ -21,7 +21,8 @@ struct kernel_vfs_instance {
     struct kernel_heap *heap;
     struct kernel_page_cache *page_cache;
     size_t writeback_block_size; /* Zero means no block alignment requirement. */
-    struct kernel_vfs_node *nodes;
+    struct kernel_vfs_node *nodes, *node_index;
+    size_t node_count;
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
     uint32_t external_files;
@@ -33,7 +34,9 @@ struct kernel_vfs_instance {
 
 struct kernel_vfs_node {
     struct kernel_pipe *fifo_pipe;
-    struct kernel_vfs_node *next;
+    struct kernel_vfs_node *next, **previous;
+    struct kernel_vfs_node *index_left, *index_right;
+    uint8_t index_height;
     struct kernel_page_cache_entry *cache_pages;
     struct kernel_page_cache_dirty dirty_cache_pages;
     struct kernel_memory_object *memory;

@@ -1980,6 +1980,97 @@ Finish:
     return result;
 }
 
+/* The identity index borrows registered nodes. Its embedded links require no
+ * allocation; the list remains the bounded full-instance enumeration order. */
+static unsigned node_height(const struct kernel_vfs_node *node)
+{ return node ? node->index_height : 0; }
+static void node_height_update(struct kernel_vfs_node *node)
+{
+    unsigned left = node_height(node->index_left), right = node_height(node->index_right);
+    node->index_height = 1 + (left > right ? left : right);
+}
+static struct kernel_vfs_node *node_rotate_left(struct kernel_vfs_node *node)
+{
+    struct kernel_vfs_node *right = node->index_right;
+    node->index_right = right->index_left; right->index_left = node;
+    node_height_update(node); node_height_update(right); return right;
+}
+static struct kernel_vfs_node *node_rotate_right(struct kernel_vfs_node *node)
+{
+    struct kernel_vfs_node *left = node->index_left;
+    node->index_left = left->index_right; left->index_right = node;
+    node_height_update(node); node_height_update(left); return left;
+}
+static struct kernel_vfs_node *node_balance(struct kernel_vfs_node *node)
+{
+    node_height_update(node);
+    int balance = (int)node_height(node->index_left) - (int)node_height(node->index_right);
+    if (balance > 1) {
+        if (node_height(node->index_left->index_left) < node_height(node->index_left->index_right))
+            node->index_left = node_rotate_left(node->index_left);
+        return node_rotate_right(node);
+    }
+    if (balance < -1) {
+        if (node_height(node->index_right->index_right) < node_height(node->index_right->index_left))
+            node->index_right = node_rotate_right(node->index_right);
+        return node_rotate_left(node);
+    }
+    return node;
+}
+static struct kernel_vfs_node *node_index_insert(struct kernel_vfs_node *root,
+                                                 struct kernel_vfs_node *node)
+{
+    if (!root) { node->index_height = 1; return node; }
+    if (node->inode < root->inode) root->index_left = node_index_insert(root->index_left, node);
+    else if (node->inode > root->inode) root->index_right = node_index_insert(root->index_right, node);
+    else {
+        if (!root->retired && !root->closed) __builtin_trap();
+        /* Disk inode reuse replaces only the index entry. The retired node
+         * keeps its actual file/cache owners and enumeration link. */
+        node->index_left = root->index_left; node->index_right = root->index_right;
+        root->index_left = root->index_right = 0; root->index_height = 0;
+        return node_balance(node);
+    }
+    return node_balance(root);
+}
+static struct kernel_vfs_node *node_index_pop_min(struct kernel_vfs_node *root,
+                                                  struct kernel_vfs_node **minimum)
+{
+    if (!root->index_left) { *minimum = root; return root->index_right; }
+    root->index_left = node_index_pop_min(root->index_left, minimum);
+    return node_balance(root);
+}
+static struct kernel_vfs_node *node_index_remove(struct kernel_vfs_node *root,
+                                                 struct kernel_vfs_node *node)
+{
+    if (!root) return 0;
+    if (node->inode < root->inode) root->index_left = node_index_remove(root->index_left, node);
+    else if (node->inode > root->inode) root->index_right = node_index_remove(root->index_right, node);
+    else {
+        if (root != node) return root; /* A newer incarnation owns this key. */
+        struct kernel_vfs_node *replacement;
+        if (!root->index_left) replacement = root->index_right;
+        else if (!root->index_right) replacement = root->index_left;
+        else {
+            struct kernel_vfs_node *right = node_index_pop_min(root->index_right, &replacement);
+            replacement->index_left = root->index_left; replacement->index_right = right;
+            replacement = node_balance(replacement);
+        }
+        node->index_left = node->index_right = 0; node->index_height = 0;
+        return replacement;
+    }
+    return node_balance(root);
+}
+struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *instance, uint64_t inode)
+{
+    struct kernel_vfs_node *node = instance->node_index;
+    while (node) {
+        if (inode == node->inode) return node->retired || node->closed ? 0 : node;
+        node = inode < node->inode ? node->index_left : node->index_right;
+    }
+    return 0;
+}
+
 struct kernel_vfs_node *kernel_vfs_file_node(
     const struct kernel_vfs_file *file)
 {
@@ -2015,40 +2106,43 @@ static void release_node_pin(struct kernel_vfs_node **owner)
 int kernel_vfs_node_release(struct kernel_vfs_node **owner)
 {
     struct kernel_vfs_node *node;
-    struct kernel_vfs_node **link;
     int result;
 
     if (owner == 0 || *owner == 0) {
         return -KERNEL_EINVAL;
     }
     node = *owner;
-    uint32_t references=__atomic_load_n(&node->references,__ATOMIC_ACQUIRE);
-    while (references>1U) {
-        if (__atomic_compare_exchange_n(&node->references,&references,references-1,1,
-            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) { *owner=0; return 0; }
-    }
-    if (__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == 1U) {
+    for (;;) {
+        uint32_t references = __atomic_load_n(&node->references, __ATOMIC_ACQUIRE);
+        if (references > 1U) {
+            if (__atomic_compare_exchange_n(&node->references, &references, references - 1, 1,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { *owner = 0; return 0; }
+            continue;
+        }
+        if (references != 1U) __builtin_trap();
+        uintptr_t irq = arch_interrupt_save();
+        if (!__atomic_compare_exchange_n(&node->references, &references, 0, 0,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { arch_interrupt_restore(irq); continue; }
         if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
             node->dirty_cache_pages.tree.rbh_root || node->dirty_cache_pages.count ||
-            node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous) __builtin_trap();
-        if (!kernel_record_lock_state_empty(&node->record_locks))
+            node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous ||
+            !kernel_record_lock_state_empty(&node->record_locks)) __builtin_trap();
+        if (!node->previous || *node->previous != node || !node->instance->node_count)
             __builtin_trap();
-        __atomic_store_n(&node->references,0,__ATOMIC_RELEASE);
-        link = &node->instance->nodes;
-        while (*link != 0 && *link != node) {
-            link = &(*link)->next;
-        }
-        if (*link != node) {
-            return -KERNEL_EIO;
-        }
-        *link = node->next;
-        node->next = 0;
+        node->instance->node_index = node_index_remove(node->instance->node_index, node);
+        *node->previous = node->next;
+        if (node->next) node->next->previous = node->previous;
+        node->previous = 0; node->next = 0;
+        node->instance->node_count--;
         if (node->unlinked && !node->retired) {
             node->next = node->instance->cleanup_nodes;
             node->instance->cleanup_nodes = node;
             *owner = 0;
+            arch_interrupt_restore(irq);
             return 0;
         }
+        arch_interrupt_restore(irq);
+        break;
     }
     /* 干净页回收期间也可能释放最后引用；close_node 不得等待存储 I/O。 */
     if (!node->closed) {
@@ -2137,8 +2231,7 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
     snapshot->heap = instance->heap;
     for (;;) {
         uintptr_t irq = arch_interrupt_save();
-        size_t capacity = 0;
-        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) capacity++;
+        size_t capacity = instance->node_count;
         arch_interrupt_restore(irq);
         if (!capacity) return 0;
         if (capacity > SIZE_MAX / sizeof(*snapshot->nodes)) return -KERNEL_ENOMEM;
@@ -2149,9 +2242,7 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
             return -KERNEL_ENOMEM;
         }
         irq = arch_interrupt_save();
-        size_t count = 0;
-        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) count++;
-        if (count > capacity) {
+        if (instance->node_count > capacity) {
             arch_interrupt_restore(irq);
             if (kernel_heap_release(instance->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
             snapshot->nodes = 0;
@@ -2467,13 +2558,14 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
     if (!path) {
         int error = instance->ops->error ? instance->ops->error(instance) : 0;
         if (error) return error;
-        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
-            if (node->inode != inode_number || node->retired || node->closed) continue;
-            if (__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == UINT32_MAX) return -KERNEL_EOVERFLOW;
-            struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) = 0;
-            int pinned = kernel_vfs_node_acquire(node);
-            if (pinned) return pinned;
-            pin = node;
+        uintptr_t irq = arch_interrupt_save();
+        struct kernel_vfs_node *node = kernel_vfs_node_find(instance, inode_number);
+        int pinned = node ? (__atomic_load_n(&node->references, __ATOMIC_ACQUIRE) == UINT32_MAX
+            ? -KERNEL_EOVERFLOW : kernel_vfs_node_acquire(node)) : 0;
+        arch_interrupt_restore(irq);
+        if (pinned) return pinned;
+        if (node) {
+            struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) = node;
             /* 等待锁之前独立持有节点，回收者可在锁交接后归还最后缓存引用。 */
             KERNEL_LOCK_SCOPE(node_guard);
             kernel_vfs_node_lock(node, &node_guard, 1);
@@ -2663,11 +2755,12 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     struct kernel_vfs_instance *instance = mount->private_data;
     struct kernel_vfs_node *existing;
     node->instance = instance;
-    for (existing = instance->nodes; existing; existing = existing->next)
-        if (existing->inode == node->inode && !existing->retired && !existing->closed) break;
+    uintptr_t irq = arch_interrupt_save();
+    existing = kernel_vfs_node_find(instance, node->inode);
+    int pin_error = existing ? (existing->references == UINT32_MAX ? -KERNEL_EOVERFLOW :
+                               kernel_vfs_node_acquire(existing)) : 0;
+    arch_interrupt_restore(irq);
     if (existing) {
-        int pin_error = existing->references == UINT32_MAX ? -KERNEL_EOVERFLOW :
-                        kernel_vfs_node_acquire(existing);
         struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) =
             pin_error ? 0 : existing;
         if (pin_error) {
@@ -2697,8 +2790,14 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
         kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
         kernel_file_mapping_init(node);
         kernel_record_lock_state_init(&node->record_locks);
+        irq = arch_interrupt_save();
         node->next = instance->nodes;
+        node->previous = &instance->nodes;
+        if (node->next) node->next->previous = &node->next;
         instance->nodes = node;
+        instance->node_index = node_index_insert(instance->node_index, node);
+        instance->node_count++;
+        arch_interrupt_restore(irq);
     }
     file->private_data = node;
     file->mount = mount;

@@ -44,6 +44,12 @@ void kernel_vfs_node_lock(struct kernel_vfs_node *n, struct kernel_lock_guard *g
 { (void)w; kernel_rwlock_write(&n->io_lock, g); }
 struct kernel_vfs_node *kernel_vfs_file_node(const struct kernel_vfs_file *f)
 { return f && f->state == VFS_FILE_STATE_LIVE ? f->private_data : 0; }
+struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *instance, uint64_t inode)
+{
+    for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next)
+        if (node->inode == inode && !node->retired && !node->closed) return node;
+    return 0;
+}
 int kernel_vfs_path_acquire(struct kernel_vfs_path *p)
 { p->references++; return 0; }
 int kernel_pty_mount_start(struct kernel_vfs_mount *m)

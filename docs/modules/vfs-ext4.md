@@ -65,7 +65,7 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 
 挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。普通文件的共享 inode 节点持有 atime/mtime/ctime 与脏字段位，首次打开从实际 inode 解码，硬链接和多个描述符共用该对象。`kernel_vfs_file_accessed()` 直接按这组运行时值判断 relatime，`kernel_vfs_file_modified()` 在非零写请求复制前更新 mtime/ctime；两条普通 I/O 路径都不读取磁盘 inode 或创建时间事务，首字节 EFAULT 仍保留此前的时间更新。只读挂载与 inode 的 NOATIME 标志禁止访问时间更新；O_NOATIME open 选项仍明确返回 ENOTSUP。已知 mount 错误在写侧当场传播，读侧时间错误不改变数据结果。
 
-脏时间字段随数据写回的同一事务编码；无脏数据页时由现有挂载后台线程在首次变脏约 100ms 后、显式同步或卸载编码。该线程在所有可写 ext4 上启动；没有 journal 时只处理脏时间，有 journal 时同时推进组提交。脏字段持有节点引用，最后描述符关闭不会丢失时间。worker 使用非阻塞事务准入，空间不足时先推进 journal，避免等待自身。namespace、truncate、chmod/chown 和显式 utimens 仍在原 metadata 事务修改时间；挂载回调暂存规范化值，外层事务成功后才发布到共享节点。每个字段的版本检查保留操作等待期间发生的更新，abort 丢弃暂存值，写回仅清除仍等于已编码快照的脏字段。短暂的内存发布依赖现有 CPU0 service 执行域与 IRQ 排斥，不构成通用 SMP inode 锁。操作时机、编码及错误语义的依据见[时间戳学习记录](../learning/file-timestamps.md)。
+脏时间字段随数据写回的同一事务编码；无脏数据页时由现有挂载后台线程在首次变脏约 100ms 后、显式同步或卸载编码。该线程在所有可写 ext4 上启动；没有 journal 时只处理脏时间，有 journal 时同时推进组提交。脏字段持有节点引用，最后描述符关闭不会丢失时间。脏时间队列的节点数在入队和摘链时维护，每轮直接用该计数限定处理量，不先遍历队列计数。worker 使用非阻塞事务准入，空间不足时先推进 journal，避免等待自身。namespace、truncate、chmod/chown 和显式 utimens 仍在原 metadata 事务修改时间；挂载回调暂存规范化值，外层事务成功后才发布到共享节点。每个字段的版本检查保留操作等待期间发生的更新，abort 丢弃暂存值，写回仅清除仍等于已编码快照的脏字段。短暂的内存发布依赖现有 CPU0 service 执行域与 IRQ 排斥，不构成通用 SMP inode 锁。操作时机、编码及错误语义的依据见[时间戳学习记录](../learning/file-timestamps.md)。
 
 共享查询的 GDT/inode checksum 校验不临时清零 cache 字段。`ext4_crc32c_zeroed()`
 以一个或两个本地零字段计算同一 CRC，不复制整个 inode、不分配或等待；真正的修改路径
@@ -105,7 +105,7 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 
 ## 文件节点与页缓存
 
-VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
+VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。实例按 inode 建立 AVL 索引，链接嵌在 node 内，查找与增删为 O(log N)，无需另分配索引对象。注册链保留全实例枚举顺序，末引用通过反向链接直接摘链；索引和注册链只借用节点，不增加引用。查询在短 IRQ 保护内完成，需跨等待的调用者在离开保护前取得自己的节点引用。磁盘 inode 复用只替换索引中的退休或已关闭节点，旧节点继续由其实际文件和缓存 owner 持有。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
 
 活 node 还嵌入记录锁区间树与等待队列，因此独立 open 必须在同一 inode 上冲突；unlink 后仍打开的旧 inode 保持原锁身份，同名重建使用新 inode 和新锁状态。末节点释放要求树与等待队列都为空；锁 owner、close/退出释放与阻塞 pin 契约见[文件资源模块](kernel-files.md)。该状态属于单 hart 临界区，不代表已经具备跨核并发锁。
 
@@ -125,7 +125,8 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 ## 挂载范围与全局同步
 
-`kernel_vfs_sync_mount()`先取得根路径owner，再在短发布保护区捕获并引用全部活节点；
+`kernel_vfs_sync_mount()`先取得根路径owner，按注册时增减的节点计数准备快照容量，
+再在短发布保护区遍历一次并引用全部活节点；容量不足时先重新准备，不能漏掉新增节点。
 节点在取得inode锁和睡眠前已被钉住，调用结束统一归还。逐个交接普通文件页缓存后，
 后端捕获挂载durable目标一次；并发新修改不不断推进该目标。journal保留ordered-data、
 日志与commit的既有屏障，syncfs不要求checkpoint全部完成；无journal则写回全部块缓存
