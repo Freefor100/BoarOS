@@ -10,7 +10,9 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
 static struct kernel_heap test_heap;
 static struct kernel_io_context test_context;
-static unsigned heap_allocations;
+static unsigned heap_allocations,protocol_services,allow_ofd_release;
+void kernel_cost_add(enum kernel_cost_metric metric,uint64_t value)
+{ if (metric==COST_NETWORK_SERVICE_CALLS) protocol_services+=(unsigned)value; }
 static size_t user_remaining = SIZE_MAX;
 static struct kernel_socket *close_during_copy;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
@@ -57,7 +59,7 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
 struct kernel_socket *kernel_open_file_socket(struct kernel_open_file_description *f)
 { return (struct kernel_socket *)(uintptr_t)f; }
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **f)
-{ (void)f; abort(); }
+{ CHECK(allow_ofd_release && f && *f);--allow_ofd_release;*f=0;return KERNEL_OPEN_FILE_STATUS_OK; }
 enum kernel_task_status kernel_task_socket_write_register(struct kernel_task *t, struct kernel_socket_write_request *r)
 { (void)t; (void)r; abort(); }
 enum kernel_task_status kernel_task_socket_write_clear(struct kernel_task *t, struct kernel_socket_write_request *r)
@@ -98,7 +100,7 @@ static err_t physical_output(struct netif *interface, struct pbuf *packet, const
 static err_t physical_init(struct netif *interface)
 { interface->name[0] = 't'; interface->name[1] = 'e'; interface->mtu = 1500; interface->output = physical_output; return ERR_OK; }
 
-static void copy_capacity(unsigned eligible)
+static void copy_capacity(unsigned eligible, unsigned gather)
 {
     uintptr_t irq = kernel_socket_protocol_enter();
     kernel_socket_network_initialize();
@@ -119,7 +121,43 @@ static void copy_capacity(unsigned eligible)
     socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
     TCP_REG_ACTIVE(socket->tcp); tcp_bind_netif(socket->tcp, &network.interface);
     dma_eligible = eligible; nic_full = 1; copy_attempts = copied_packets = segment_attempts = 0;
-    CHECK(kernel_socket_write_buffer(socket, "owner", 5, 0) == 5);
+    kernel_socket_protocol_leave(irq);protocol_services=0;
+    if (gather) {
+        struct kernel_open_file_description *owner=(void *)socket;
+        struct kernel_socket_write_request request={0};
+        kernel_socket_stream_begin(&request,&owner);
+        unsigned prefix=gather==2?2:5;
+        CHECK(kernel_socket_stream_reserve(&request,prefix,0)==(int)prefix);
+        CHECK(kernel_socket_stream_commit(&request,"owner",prefix,KERNEL_SOCKET_IO_MORE)==(int)prefix);
+        CHECK(!copy_attempts && !segment_attempts && !protocol_services);
+        if (gather==2) {
+            CHECK(kernel_socket_stream_reserve(&request,3,0)==3);
+            CHECK(kernel_socket_stream_commit(&request,"ner",3,0)==3);
+            CHECK(copy_attempts==1 && protocol_services==1);
+        }
+        if (gather==4) {
+            CHECK(kernel_socket_stream_reserve(&request,3,0)==3);
+            socket->pending_error=-KERNEL_ECONNRESET;
+            CHECK(kernel_socket_stream_commit(&request,"ner",3,0)==-KERNEL_ECONNRESET);
+            CHECK(socket->pending_error==-KERNEL_ECONNRESET && !socket->tx_reserved);
+        }
+        if (gather==3) {
+            allow_ofd_release=1;kernel_socket_abort_write(&request);
+            CHECK(!owner && !allow_ofd_release && !request.pin);
+        } else {
+            kernel_socket_stream_finish(&request);
+            CHECK(owner==(void *)socket && protocol_services==1);
+            if (gather==4) {
+                CHECK(socket->pending_error==-KERNEL_ECONNRESET);
+                CHECK(kernel_socket_write_buffer(socket,"next",4,KERNEL_SOCKET_MSG_NOSIGNAL)==-KERNEL_ECONNRESET);
+                CHECK(!socket->pending_error && protocol_services==1);
+            }
+        }
+    } else {
+        CHECK(kernel_socket_write_buffer(socket, "owner", 5, 0) == 5);
+        CHECK(protocol_services==1);
+    }
+    irq=kernel_socket_protocol_enter();
     CHECK(socket->tcp->unsent && copy_attempts == 1 && segment_attempts == eligible && !copied_packets);
     kernel_socket_protocol_leave(irq);
     uint64_t generation = pool_generation, before_time = clock_ns;
@@ -135,7 +173,8 @@ static void copy_capacity(unsigned eligible)
     netif_remove(&network.interface);
     kernel_socket_protocol_leave(irq);
     CHECK(!heap_live);
-    printf("PASS copy fallback %s: NIC capacity alone retries real TCP output\n", eligible ? "no indirect" : "SG unsuitable");
+    if (gather) printf("PASS TCP batch %u: bounded output/service calls, retained prefix and NIC-only retry\n",gather);
+    else printf("PASS copy fallback %s: NIC capacity alone retries real TCP output\n", eligible ? "no indirect" : "SG unsuitable");
 }
 
 static void udp_final_payload(void)
@@ -446,8 +485,12 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "udp-payload")) udp_final_payload();
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
-    else if (!strcmp(argv[1], "copy-indirect")) copy_capacity(1);
-    else if (!strcmp(argv[1], "copy-ineligible")) copy_capacity(0);
+    else if (!strcmp(argv[1], "tcp-batch")) copy_capacity(0,1);
+    else if (!strcmp(argv[1], "tcp-batch-last")) copy_capacity(0,2);
+    else if (!strcmp(argv[1], "tcp-batch-abort")) copy_capacity(0,3);
+    else if (!strcmp(argv[1], "tcp-batch-error")) copy_capacity(0,4);
+    else if (!strcmp(argv[1], "copy-indirect")) copy_capacity(1,0);
+    else if (!strcmp(argv[1], "copy-ineligible")) copy_capacity(0,0);
     else if (!strcmp(argv[1], "timewait-capacity")) timewait_owner(0);
     else if (!strcmp(argv[1], "timewait-timer")) timewait_owner(1);
     else if (!strcmp(argv[1], "controls")) { timewait_owner(2); raw_owner_control(); }

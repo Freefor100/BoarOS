@@ -128,6 +128,7 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
 #define KERNEL_SOCKET_MSG_NOSIGNAL 0x4000U
 #define KERNEL_SOCKET_MSG_TRUNC 0x20U
 #define KERNEL_SOCKET_IO_MESSAGE 0x80000000U
+#define KERNEL_SOCKET_IO_MORE 0x40000000U
 int kernel_socket_shutdown(struct kernel_socket *socket, int how);
 
 enum kernel_socket_option {

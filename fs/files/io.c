@@ -1338,12 +1338,9 @@ static enum kernel_files_status tcp_write_request(
     }
     kernel_socket_stream_begin(&request, &description);
     do {
-        uint64_t address = 0;
         size_t chunk = staged - consumed;
         if (!chunk && count) {
-            size_t limit = count - total < BOAROS_PAGE_SIZE ? (size_t)(count - total) : BOAROS_PAGE_SIZE;
-            chunk = kernel_uaccess_iov_span(&cursor, limit, &address);
-            if (!chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
+            chunk=count-total<BOAROS_PAGE_SIZE?(size_t)(count-total):BOAROS_PAGE_SIZE;
         }
         int result = kernel_socket_stream_reserve(&request, (uint32_t)chunk, flags);
         size_t copied_now = 0;
@@ -1370,7 +1367,8 @@ static enum kernel_files_status tcp_write_request(
                 staged = copied_now; consumed = 0; chunk = copied_now;
             }
             result = kernel_socket_stream_commit(&request,
-                (const unsigned char *)buffer.data + consumed, (uint32_t)chunk, flags);
+                (const unsigned char *)buffer.data + consumed, (uint32_t)chunk,
+                flags|((!fault && total+chunk<count)?KERNEL_SOCKET_IO_MORE:0));
         }
         if (result == -KERNEL_EAGAIN) {
             if (!total) COST_ADD(STREAM_COPY_BLOCKED_BYTES, copied_now);

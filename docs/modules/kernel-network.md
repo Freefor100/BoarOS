@@ -36,7 +36,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 普通 socket read/readv 使用“预留队首片段→按偏移复制→提交/取消”。用户容量决定 UDP 的截断长度，请求直接从持有的 packet/pbuf 片段复制到用户 iovec，游标只向前遍历 pbuf 链，最终只消费一次，不使用接收中转页。零长度 datagram 也必须完成 reservation；TCP EOF 没有 reservation。TCP 在用户容量内继续读取已排队片段，取得进展后不等待新数据。每段完整复制后才消费；当前段 fault 保留整段，返回先前已提交的字节数，没有先前进展则 EFAULT。UDP fault 丢弃当前 datagram。read reservation 独占队首，第二个 read/recvfrom 不得越过它。
 
-TCP 写请求的 scratch 页由任务持有并在多次调用间复用（首次使用时分配），调用期间登记在当前任务；分配失败返回 ENOMEM。正常返回解除登记，物理页保留至任务最终存储释放；强制退出先取消实际请求／释放其 OFD pin，再解除登记，之后才释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。TCP 普通 write/writev 使用请求页，按用户页和协议剩余空间提交；不再每 64 字节调用 tcp_write。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数；用户页解析尝试由诊断构建的 `COST_USER_RESOLUTIONS` 记录，普通构建不为此维护全局原子计数。计数没有新增用户 ABI。
+TCP 写请求的 scratch 页由任务持有并在多次调用间复用（首次使用时分配），调用期间登记在当前任务；分配失败返回 ENOMEM。正常返回解除登记，物理页保留至任务最终存储释放；强制退出先取消实际请求／释放其 OFD pin，再解除登记，之后才释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。TCP 普通 write/writev 在已取得的协议容量内跨用户页和 iovec 填充请求页，批量交给 tcp_write(COPY)。请求末批、容量阻塞点和退出时集中推动 tcp_output；每次接纳批次只在一个边界执行有界协议服务。已接纳前缀后的异步错误留给下一次调用观察。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数；用户页解析尝试由诊断构建的 `COST_USER_RESOLUTIONS` 记录，普通构建不为此维护全局原子计数。计数没有新增用户 ABI。
 
 INET UDP 发送请求直接持有最终 PBUF_RAM，用户 iovec 填入该载荷后交给协议发送，不再分配临时 socket_packet 和第二份数据区。用户复制在协议临界区外执行；复制失败、正常完成或强制退出都由同一请求释放尚未转交的 pbuf。
 

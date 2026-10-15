@@ -1330,6 +1330,11 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
         __builtin_trap();
 }
 
+enum { SOCKET_WRITE_ACCEPTED=1U, SOCKET_WRITE_DEFERRED=2U };
+static void tcp_flush_output(struct kernel_socket *socket);
+static int tcp_write_buffer_locked(struct kernel_socket *socket,
+    const void *buffer, uint32_t size, uint32_t flags);
+
 static void free_write_packet(struct kernel_socket_write_request *request)
 {
     if (request->protocol_payload) {
@@ -1346,6 +1351,9 @@ static void clear_write_request(struct kernel_socket_write_request *request)
 {
     free_write_packet(request);
     kernel_socket_stream_cancel(request);
+    uintptr_t irq=kernel_socket_protocol_enter();
+    if (request->progressed & SOCKET_WRITE_DEFERRED) tcp_flush_output(request->socket);
+    kernel_socket_protocol_leave(irq);
     if (request->task && kernel_task_socket_write_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
         __builtin_trap();
 }
@@ -1603,6 +1611,19 @@ static uint32_t tcp_admission_capacity(const struct kernel_socket *socket)
     if (available > budget) available = budget;
     return available > socket->tx_reserved ? available - socket->tx_reserved : 0;
 }
+static void tcp_flush_output(struct kernel_socket *socket)
+{
+    if (!socket->tcp || !socket->tcp->unsent) return;
+    nic_blocked = 0;
+    err_t output = tcp_output(socket->tcp);
+    if (output == ERR_MEM) {
+        if (nic_blocked) {
+            work_remove(&nic_wait, socket);
+            work_add(&nic_wait, socket, nic_generation);
+        } else socket_pool_wait(socket);
+    }
+}
+
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner)
 {
@@ -1622,7 +1643,11 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     uint32_t available = error ? 0 : tcp_admission_capacity(request->socket);
     if (!error && size) {
         if (size > available) size = available;
-        if (!size) { error = -KERNEL_EAGAIN; COST_ADD(STREAM_ADMIT_BLOCKED, 1); }
+        if (!size) {
+            tcp_flush_output(request->socket);
+            request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
+            error = -KERNEL_EAGAIN; COST_ADD(STREAM_ADMIT_BLOCKED, 1);
+        }
         else { request->reserved = size; request->socket->tx_reserved += size; }
     }
     kernel_socket_protocol_leave(irq);
@@ -1642,11 +1667,16 @@ void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
 void kernel_socket_stream_finish(struct kernel_socket_write_request *request)
 {
     kernel_socket_stream_cancel(request);
+    int deferred=(request->progressed & SOCKET_WRITE_DEFERRED)!=0;
+    uintptr_t irq=kernel_socket_protocol_enter();
+    if (deferred) tcp_flush_output(request->socket);
+    kernel_socket_protocol_leave(irq);
     if (request->task && kernel_task_socket_write_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
         __builtin_trap();
     if (*request->pin_owner || !request->pin) __builtin_trap();
     *request->pin_owner = request->pin;
     request->pin = 0; request->socket = 0;
+    if (deferred) service_inline();
 }
 int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
     const void *buffer, uint32_t size, uint32_t flags)
@@ -1657,20 +1687,25 @@ int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
     stream_release_reservation(request, 0);
     /* 已交付前缀优先：保留后来错误供下一次调用观察，也不为短成功发送SIGPIPE。 */
     int result = tcp_write_state(request->socket, flags, !request->progressed);
-    if (!result) result = kernel_socket_write_buffer(request->socket, buffer, size, flags);
-    if (result > 0) request->progressed = 1;
+    if (!result) result = tcp_write_buffer_locked(request->socket, buffer, size, flags);
+    if (result > 0) {
+        request->progressed = SOCKET_WRITE_ACCEPTED |
+            (((flags & KERNEL_SOCKET_IO_MORE) && tcp_admission_capacity(request->socket))
+                ? SOCKET_WRITE_DEFERRED : 0U);
+    } else if (result == -KERNEL_EAGAIN) {
+        tcp_flush_output(request->socket);
+        request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
+    }
     if (result == -KERNEL_EAGAIN) COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
     if (tcp_admission_capacity(request->socket)) wake_socket(request->socket);
     kernel_socket_protocol_leave(irq);
-    if (result > 0) service_inline();
+    if (result > 0 && !(request->progressed & SOCKET_WRITE_DEFERRED)) service_inline();
     return result;
 }
 
 int kernel_socket_write_buffer(struct kernel_socket *socket,
                                const void *buffer, uint32_t size, uint32_t flags)
 {
-    uint32_t length;
-    err_t error;
     uintptr_t old_status;
 
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
@@ -1727,36 +1762,40 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
     }
 
     old_status = kernel_socket_protocol_enter();
-    if (socket->type == SOCKET_DGRAM) {
-        kernel_socket_protocol_leave(old_status); return -KERNEL_EDESTADDRREQ;
-    }
-    int state = tcp_write_state(socket, flags, 1);
-    if (state || !size) { kernel_socket_protocol_leave(old_status); return state; }
+    int state=socket->type==SOCKET_DGRAM?-KERNEL_EDESTADDRREQ:tcp_write_state(socket,flags,1);
+    int result=state || !size?state:tcp_write_buffer_locked(socket,buffer,size,flags);
+    kernel_socket_protocol_leave(old_status);
+    if (result>0) service_inline();
+    return result;
+}
+
+static int tcp_write_buffer_locked(struct kernel_socket *socket,
+    const void *buffer, uint32_t size, uint32_t flags)
+{
+    uint32_t length;
+    err_t error;
     length = tcp_admission_capacity(socket);
     if (length > size) length = size;
     if (length > UINT16_MAX) length = UINT16_MAX;
-    if (!length) { kernel_socket_protocol_leave(old_status); return -KERNEL_EAGAIN; }
+    if (!length) return -KERNEL_EAGAIN;
     socket_statistics.tcp_write_calls++;
-    error = tcp_write(socket->tcp, buffer, (u16_t)length, TCP_WRITE_FLAG_COPY);
+    error = tcp_write(socket->tcp, buffer, (u16_t)length, TCP_WRITE_FLAG_COPY |
+        ((flags & KERNEL_SOCKET_IO_MORE) ? TCP_WRITE_FLAG_MORE : 0));
     if (error == ERR_OK) {
         socket_statistics.tcp_written_bytes += length;
         write_retry_disarm(socket);
         /* tcp_write owns the copied bytes even if immediate output defers. */
-        nic_blocked = 0;
-        err_t output = tcp_output(socket->tcp);
-        if (output == ERR_MEM) {
-            if (nic_blocked) { work_remove(&nic_wait, socket); work_add(&nic_wait, socket, nic_generation); }
-            else socket_pool_wait(socket);
-        }
+        /* 单次gather请求先填接纳窗口；末批、窗口满或finish退出时再发送。 */
+        if (!(flags & KERNEL_SOCKET_IO_MORE) || !tcp_admission_capacity(socket))
+            tcp_flush_output(socket);
         socket_schedule(socket, SOCKET_WORK_REAP);
     } else if (error == ERR_MEM) {
         /* The global segment/pbuf pool can be full even while sndbuf remains.
          * Hide POLLOUT until an ACK or a bounded protocol-timer retry. */
         write_retry_arm(socket);
         socket_pool_wait(socket);
+        tcp_flush_output(socket);
     }
-    kernel_socket_protocol_leave(old_status);
-    if (error == ERR_OK) service_inline();
     return error == ERR_OK ? (int)length
                            : error == ERR_MEM ? -KERNEL_EAGAIN
                                               : lwip_error(error);
