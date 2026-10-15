@@ -430,7 +430,6 @@ static enum kernel_files_status read_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        struct kernel_task_io_buffer buffer = {0};
         struct kernel_socket_read_request read_request = {0};
         int received = 0;
         enum kernel_files_status result = KERNEL_FILES_STATUS_OK;
@@ -447,12 +446,6 @@ static enum kernel_files_status read_pinned(
         int discard = kernel_socket_discard_receive(kernel_open_file_socket(description),socket_flags);
         if (count == 0U && !message) {
             *linux_result = 0;
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (count != 0U && !discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
-                KERNEL_TASK_STATUS_OK) {
-            *linux_result = -KERNEL_ENOMEM;
-            KERNEL_FILES_NOTE(files, read_failures, 1);
             return KERNEL_FILES_STATUS_OK;
         }
         while (total < count || (message && total == 0)) {
@@ -472,29 +465,13 @@ static enum kernel_files_status read_pinned(
             if (received < 0 || read_request.socket == 0) break;
             int datagram = read_request.datagram;
             if (datagram) kernel_socket_read_info(&read_request, peer, message_size);
-            uint32_t done = discard ? (uint32_t)received : 0;
-            int fault = 0;
-            while (done < (uint32_t)received) {
-                size_t chunk = (uint32_t)received - done, copied = 0;
-                if (chunk > BOAROS_PAGE_SIZE) chunk = BOAROS_PAGE_SIZE;
-                kernel_socket_copy_read(&read_request, done, buffer.data, chunk);
-                enum kernel_uaccess_status access = kernel_copy_to_user_iov(
-                    mm, &cursor, buffer.data, chunk, &copied);
-                KERNEL_FILES_NOTE(files, read_chunks, 1);
-                if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
-                    fault = 1;
-                    if (access != KERNEL_UACCESS_STATUS_FAULT)
-                        result = KERNEL_FILES_STATUS_STATE;
-                    break;
-                }
-                done += (uint32_t)chunk;
-            }
+            int fault = !discard && kernel_socket_read_user(&read_request, mm, &cursor);
+            KERNEL_FILES_NOTE(files, read_chunks, 1);
             kernel_socket_finish_read(&read_request, fault);
             if (fault) { received = -KERNEL_EFAULT; break; }
             total += (uint32_t)received;
             if (datagram) break;
         }
-        if (buffer.allocator) kernel_task_io_buffer_release(&buffer);
         *linux_result = total != 0U ? (int64_t)total : received;
         if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
         else KERNEL_FILES_NOTE(files, bytes_read, total);

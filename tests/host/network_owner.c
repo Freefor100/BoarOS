@@ -10,6 +10,8 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
 static struct kernel_heap test_heap;
 static struct kernel_io_context test_context;
+static unsigned heap_allocations;
+static size_t user_remaining = SIZE_MAX;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
@@ -19,7 +21,7 @@ struct kernel_task *kernel_task_current(void) { return NULL; }
 enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task, uint32_t signal, kernel_pid_t sender)
 { (void)task; (void)signal; (void)sender; abort(); }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
-{ CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); ++heap_live; return KERNEL_HEAP_STATUS_OK; }
+{ CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
 enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap, void *allocation)
@@ -49,6 +51,41 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     captured_size = size;
     ++copied_packets;
     return 0;
+}
+
+struct kernel_socket *kernel_open_file_socket(struct kernel_open_file_description *f)
+{ return (struct kernel_socket *)(uintptr_t)f; }
+enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **f)
+{ (void)f; abort(); }
+enum kernel_task_status kernel_task_socket_write_register(struct kernel_task *t, struct kernel_socket_write_request *r)
+{ (void)t; (void)r; abort(); }
+enum kernel_task_status kernel_task_socket_write_clear(struct kernel_task *t, struct kernel_socket_write_request *r)
+{ (void)t; (void)r; abort(); }
+enum kernel_task_status kernel_task_socket_read_register(struct kernel_task *t, struct kernel_socket_read_request *r)
+{ (void)t; (void)r; abort(); }
+enum kernel_task_status kernel_task_socket_read_clear(struct kernel_task *t, struct kernel_socket_read_request *r)
+{ (void)t; (void)r; abort(); }
+void kernel_signal_note_syscall_restart(struct kernel_task *t) { (void)t; abort(); }
+enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
+{ (void)q;(void)d;(void)i;(void)t;abort(); }
+enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
+{ (void)t;(void)r;abort(); }
+enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
+{ (void)t;abort(); }
+enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,uint64_t in,size_t n,size_t *copied)
+{
+    (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
+    memcpy(out,(void *)(uintptr_t)in,*copied);
+    if(user_remaining!=SIZE_MAX)user_remaining-=*copied;
+    return *copied==n?KERNEL_UACCESS_STATUS_OK:KERNEL_UACCESS_STATUS_FAULT;
+}
+
+enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m,uint64_t out,const void *in,size_t n,size_t *copied)
+{
+    (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
+    memcpy((void *)(uintptr_t)out,in,*copied);
+    if(user_remaining!=SIZE_MAX)user_remaining-=*copied;
+    return *copied==n?KERNEL_UACCESS_STATUS_OK:KERNEL_UACCESS_STATUS_FAULT;
 }
 
 static err_t physical_output(struct netif *interface, struct pbuf *packet, const ip4_addr_t *destination)
@@ -94,6 +131,66 @@ static void copy_capacity(unsigned eligible)
     kernel_socket_protocol_leave(irq);
     CHECK(!heap_live);
     printf("PASS copy fallback %s: NIC capacity alone retries real TCP output\n", eligible ? "no indirect" : "SG unsuitable");
+}
+
+static void udp_final_payload(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *socket=0;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&socket));
+    struct kernel_open_file_description *owner=(void *)socket;
+    char first[]="alpha",second[]="beta";
+    struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,5},{(uintptr_t)second,4}};
+    struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=23001,.bytes={127,0,0,1}};
+    unsigned before=heap_allocations;
+    CHECK(kernel_socket_write_datagram(&owner,(void *)socket,iov,2,9,0,&address)==9);
+    CHECK(owner==(void *)socket && heap_allocations==before);
+    uint32_t memory=lwip_stats.mem.used;
+    user_remaining=6;
+    CHECK(kernel_socket_write_datagram(&owner,(void *)socket,iov,2,9,0,&address)==-KERNEL_EFAULT);
+    CHECK(owner==(void *)socket && lwip_stats.mem.used==memory && !socket->tx_reserved);
+    user_remaining=SIZE_MAX;
+    kernel_socket_destroy(socket);
+    puts("PASS UDP final payload: no transient kernel heap objects, gather usercopy and fault rollback");
+}
+
+static void receive_payload(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *sender=0,*receiver=0;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&sender,&receiver));
+    CHECK(kernel_socket_write_buffer(sender,"alphabeta",9,0)==9);
+    struct kernel_open_file_description *owner=(void *)receiver;
+    struct kernel_socket_read_request request={0};
+    char first[2]={0},second[7]={0};
+    struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,2},{(uintptr_t)second,7}};
+    struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
+    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0)==9);
+    user_remaining=6;
+    CHECK(kernel_socket_read_user(&request,(void *)receiver,&cursor)==-KERNEL_EFAULT);
+    kernel_socket_finish_read(&request,1);
+    CHECK(receiver->rx_bytes==9 && owner==(void *)receiver);
+    cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};user_remaining=SIZE_MAX;
+    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0)==9);
+    CHECK(!kernel_socket_read_user(&request,(void *)receiver,&cursor));
+    kernel_socket_finish_read(&request,0);
+    CHECK(!memcmp(first,"al",2) && !memcmp(second,"phabeta",7) && !receiver->rx_bytes);
+    kernel_socket_destroy(sender);kernel_socket_destroy(receiver);receiver=0;
+
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&receiver));
+    struct pbuf *head=pbuf_alloc(PBUF_RAW,3,PBUF_RAM),*tail=pbuf_alloc(PBUF_RAW,6,PBUF_RAM);
+    CHECK(head && tail && pbuf_take(head,"abc",3)==ERR_OK && pbuf_take(tail,"defghi",6)==ERR_OK);
+    pbuf_cat(head,tail);
+    ip_addr_t peer;IP_ADDR4(&peer,127,0,0,1);
+    uintptr_t irq=kernel_socket_protocol_enter();udp_received(receiver,receiver->udp,head,&peer,23001);kernel_socket_protocol_leave(irq);
+    owner=(void *)receiver;cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};
+    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0)==9);
+    user_remaining=6;
+    CHECK(kernel_socket_read_user(&request,(void *)receiver,&cursor)==-KERNEL_EFAULT);
+    kernel_socket_finish_read(&request,1);user_remaining=SIZE_MAX;
+    CHECK(!receiver->rx_bytes && !receiver->packets_head);
+    kernel_socket_destroy(receiver);
+    puts("PASS direct receive: multi-iovec, chained pbuf, STREAM fault replay and UDP fault discard");
 }
 
 static void connected_pair(struct kernel_socket **listener, struct kernel_socket **client, struct kernel_socket **server)
@@ -313,7 +410,9 @@ static void loopback_work(void)
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "loopback-work")) loopback_work();
+    if (!strcmp(argv[1], "receive-payload")) receive_payload();
+    else if (!strcmp(argv[1], "udp-payload")) udp_final_payload();
+    else if (!strcmp(argv[1], "loopback-work")) loopback_work();
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
     else if (!strcmp(argv[1], "copy-indirect")) copy_capacity(1);
     else if (!strcmp(argv[1], "copy-ineligible")) copy_capacity(0);

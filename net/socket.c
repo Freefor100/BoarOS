@@ -1212,6 +1212,40 @@ void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
     }
 }
 
+int kernel_socket_read_user(const struct kernel_socket_read_request *request,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor)
+{
+    const struct socket_packet *packet = request->packet;
+    if (!request->socket || request->socket->read_request != request || !packet)
+        __builtin_trap();
+    const struct pbuf *part = packet->payload;
+    uint32_t offset = packet->consumed, remaining = request->bytes;
+    /* reservation保活完整payload；只前移当前段，不反复扫描已消费的pbuf前缀。 */
+    while (remaining) {
+        const void *source;
+        size_t length = remaining, copied = 0;
+        if (part) {
+            while (offset >= part->len) {
+                offset -= part->len;
+                part = part->next;
+                if (!part) __builtin_trap();
+            }
+            if (length > (size_t)(part->len - offset)) length = part->len - offset;
+            source = (const unsigned char *)part->payload + offset;
+        } else {
+            if (!packet->data || packet->payload) __builtin_trap();
+            source = (const unsigned char *)packet->data + offset;
+        }
+        enum kernel_uaccess_status status = kernel_copy_to_user_iov(mm, cursor,
+            source, length, &copied);
+        if (status == KERNEL_UACCESS_STATUS_FAULT) return -KERNEL_EFAULT;
+        if (status || copied != length) __builtin_trap();
+        remaining -= (uint32_t)length;
+        offset += (uint32_t)length;
+    }
+    return 0;
+}
+
 void kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault)
 {
@@ -1308,6 +1342,10 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
 
 static void free_write_packet(struct kernel_socket_write_request *request)
 {
+    if (request->protocol_payload) {
+        socket_pbuf_free(request->protocol_payload);
+        request->protocol_payload = 0;
+    }
     struct socket_packet *packet = request->packet;
     if (!packet) return;
     if (packet->data && kernel_heap_release(request->socket->heap, packet->data) != KERNEL_HEAP_STATUS_OK)
@@ -1408,7 +1446,18 @@ static int socket_write_datagram_source(struct kernel_open_file_description **pi
     }
     result=-KERNEL_ENOMEM;
     struct socket_packet *packet = 0;
-    {
+    void *data = 0;
+    ip_addr_t remote;
+    if (request.socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
+        int imported = destination ? address_import(request.socket, destination, &remote, 0) : 0;
+        if (imported) { result = imported; goto out; }
+        uintptr_t saved = kernel_socket_protocol_enter();
+        struct pbuf *payload = pbuf_alloc(PBUF_TRANSPORT, (u16_t)count, PBUF_RAM);
+        request.protocol_payload = payload;
+        kernel_socket_protocol_leave(saved);
+        if (!payload) goto out;
+        data = payload->payload;
+    } else {
         KERNEL_NO_RECLAIM_IO;
         enum kernel_heap_status status = kernel_heap_allocate_zeroed(request.socket->heap,
             1, sizeof(*packet), (void **)&packet);
@@ -1425,28 +1474,25 @@ static int socket_write_datagram_source(struct kernel_open_file_description **pi
                 goto out;
             }
         }
+        data = packet->data;
     }
     if (kernel_buffer) {
-        if (count) __builtin_memcpy(packet->data, kernel_buffer, (size_t)count);
+        if (count) __builtin_memcpy(data, kernel_buffer, (size_t)count);
     } else {
         struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
         size_t copied = 0;
         enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
-            packet->data, (size_t)count, &copied);
+            data, (size_t)count, &copied);
         if (access == KERNEL_UACCESS_STATUS_FAULT) { result = -KERNEL_EFAULT; goto out; }
         if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
     }
     if (request.socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
-        ip_addr_t remote;
-        int imported = destination ? address_import(request.socket, destination, &remote, 0) : 0;
-        if (imported != 0) { result = imported; goto out; }
         uintptr_t saved = kernel_socket_protocol_enter();
-        struct pbuf *payload = pbuf_alloc(PBUF_TRANSPORT, (u16_t)count, PBUF_RAM);
-        if (payload == 0) { kernel_socket_protocol_leave(saved); result = -KERNEL_ENOMEM; goto out; }
-        if (count) __builtin_memcpy(payload->payload, packet->data, (size_t)count);
+        struct pbuf *payload = request.protocol_payload;
         err_t error = destination ? udp_sendto(request.socket->udp, payload, &remote, destination->port)
                                  : udp_send(request.socket->udp, payload);
         socket_pbuf_free(payload);
+        request.protocol_payload = 0;
         kernel_socket_protocol_leave(saved);
         if (error == ERR_OK) service_inline();
         result = error == ERR_OK ? (int)count : lwip_error(error);

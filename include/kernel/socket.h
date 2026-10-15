@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 struct kernel_uaccess_iovec;
+struct kernel_uaccess_iov_cursor;
 struct kernel_socket_address;
 struct kernel_heap;
 struct kernel_mm;
@@ -28,6 +29,7 @@ struct kernel_socket_read_request {
 struct kernel_socket_write_request {
     uint32_t reserved;
     uint8_t progressed;
+    void *protocol_payload;
     struct kernel_socket *socket;
     struct kernel_task *task;
     void *packet;
@@ -112,6 +114,8 @@ void kernel_socket_read_info(const struct kernel_socket_read_request *request,
                              struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
                              uint32_t offset, void *buffer, uint32_t length);
+int kernel_socket_read_user(const struct kernel_socket_read_request *request,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor);
 void kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
