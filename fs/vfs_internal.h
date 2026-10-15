@@ -44,8 +44,9 @@ struct kernel_vfs_read_span {
     size_t size, completed;
     int error;
 };
-/* Caller owns node/read gate and every destination until return. Successful
- * spans may stop at EOF; errors preserve each contiguous byte prefix. */
+/* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX
+ * nonoverlapping, valid kernel destinations until return. Successful spans
+ * may stop at EOF; errors preserve each contiguous byte prefix. */
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
     struct kernel_vfs_read_span *spans, size_t count);
 

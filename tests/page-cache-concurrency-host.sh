@@ -17,7 +17,8 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         mm/heap.c mm/memory_object.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
         fs/record_lock.c fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c ${CACHE_HOST_SOURCES:-} \
-        -Wl,--gc-sections,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_vfs_node_writeback,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page ${CACHE_HOST_LDFLAGS:-} \
+        -Wl,--gc-sections,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_vfs_node_writeback,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page \
+        -Wl,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_write,--wrap=physical_page_acquire,--wrap=physical_page_release ${CACHE_HOST_LDFLAGS:-} \
         -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
     mkfs.ext4 -q -F -b 4096 "$build_dir/image-$shift.img"

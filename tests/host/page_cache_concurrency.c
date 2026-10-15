@@ -41,6 +41,43 @@ static enum kernel_page_cache_status expected_status;
 static unsigned watch_stop, stop_entered, stop_done;
 static struct kernel_page_cache *current_cache;
 static struct kernel_vfs_file *current_file;
+struct read_operation_counts {
+    uint64_t metadata_locks, inode_locks, physical_acquires, physical_releases;
+};
+static struct kernel_rwlock *cache_metadata_lock;
+static _Thread_local unsigned observe_cache_metadata;
+static _Thread_local struct read_operation_counts *read_counts;
+static _Thread_local struct kernel_rwlock *read_inode_lock;
+static _Thread_local struct physical_page_allocator *read_allocator;
+void __real_kernel_rwlock_read(struct kernel_rwlock *, struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    if (read_counts && lock == read_inode_lock) read_counts->inode_locks++;
+    __real_kernel_rwlock_read(lock, guard);
+}
+void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    /* mutex_lock是inline；记录它实际调用的write，指针来自真实cache状态读取。 */
+    if (observe_cache_metadata) {
+        assert(!cache_metadata_lock || cache_metadata_lock == lock);
+        cache_metadata_lock = lock;
+    }
+    if (read_counts && lock == cache_metadata_lock) read_counts->metadata_locks++;
+    __real_kernel_rwlock_write(lock, guard);
+}
+enum physical_page_status __real_physical_page_acquire(struct physical_page_allocator *, uint64_t);
+enum physical_page_status __wrap_physical_page_acquire(struct physical_page_allocator *pages, uint64_t address)
+{
+    if (read_counts && pages == read_allocator) read_counts->physical_acquires++;
+    return __real_physical_page_acquire(pages, address);
+}
+enum physical_page_status __real_physical_page_release(struct physical_page_allocator *, uint64_t);
+enum physical_page_status __wrap_physical_page_release(struct physical_page_allocator *pages, uint64_t address)
+{
+    if (read_counts && pages == read_allocator) read_counts->physical_releases++;
+    return __real_physical_page_release(pages, address);
+}
 static unsigned execute_calls;
 static void execute_on_cpu0(void *argument)
 {
@@ -453,6 +490,74 @@ static void demand_release(struct demand_read *read)
         } else assert(!read->pages[i].physical_address && !read->pages[i].valid_bytes);
     }
 }
+struct counted_demand {
+    size_t count;
+    struct read_operation_counts counts;
+};
+static void count_demand_read(struct counted_demand *read)
+{
+    struct demand_read result = {.count = read->count};
+    read_inode_lock = &kernel_vfs_file_node(current_file)->io_lock;
+    read_allocator = current_cache->allocator;
+    read_counts = &read->counts;
+    result.status = kernel_page_cache_get_batch(current_cache, current_file, 16,
+        result.pages, result.count);
+    assert(!result.status);
+    for (size_t i = 0; i < result.count; i++)
+        demand_contents(&result.pages[i], 0x40 + i, BOAROS_PAGE_SIZE);
+    demand_release(&result);
+    read_counts = 0;
+}
+static void *count_remote_demand(void *argument)
+{
+    mm_test_attach(1);
+    count_demand_read(argument);
+    return 0;
+}
+static void demand_operation_cases(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
+{
+    struct kernel_page_cache_concurrency_state state;
+    observe_cache_metadata = 1;
+    kernel_page_cache_get_concurrency_state(cache, &state);
+    observe_cache_metadata = 0;
+    assert(cache_metadata_lock);
+    for (unsigned remote = 0; remote < 2; remote++) for (unsigned warm = 0; warm < 2; warm++)
+        for (unsigned count = 1; count <= 8; count *= 8) {
+            assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
+            if (warm) {
+                struct demand_read prepared = {.count = count};
+                assert(!kernel_page_cache_get_batch(cache, file, 16, prepared.pages, prepared.count));
+                demand_release(&prepared);
+            }
+            reset_demand_source();
+            struct counted_demand read = {.count = count};
+            if (remote) {
+                unsigned parked = mm_test_parked(1);
+                pause_read = !warm;
+                pthread_t client;
+                assert(!pthread_create(&client, 0, count_remote_demand, &read));
+                if (!warm) {
+                    wait_progress(&read_entered, 1);
+                    while (mm_test_parked(1) == parked) sched_yield();
+                    __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
+                }
+                assert(!pthread_join(client, 0));
+            } else count_demand_read(&read);
+            assert(source_batches == !warm && source_reads == (warm ? 0 : count));
+            assert(read.counts.physical_acquires == (warm || !remote ? count : 0) &&
+                read.counts.physical_releases == count);
+            /* expanded_index已建立足够桶容量；这里检查实际保护次数，
+             * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
+            assert(read.counts.inode_locks == (remote ? count : 1));
+            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 2 * count + 2));
+            else if (warm) assert(read.counts.metadata_locks == count);
+            printf("read operation counts: page=%u cpu=%s cache=%s pages=%u metadata=%llu inode=%llu acquire=%llu release=%llu cache_probes=unavailable(COST=0) scope=caller\n",
+                (unsigned)BOAROS_PAGE_SIZE, remote ? "remote" : "native", warm ? "hot" : "cold", count,
+                (unsigned long long)read.counts.metadata_locks, (unsigned long long)read.counts.inode_locks,
+                (unsigned long long)read.counts.physical_acquires, (unsigned long long)read.counts.physical_releases);
+            demand_idle(cache);
+        }
+}
 static void demand_cold_warm(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
     assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
@@ -702,9 +807,10 @@ static void demand_truncate(struct kernel_page_cache *cache, struct kernel_vfs_f
     demand_idle(cache);
     puts("PASS truncate waits for demand loading: short EOF, retired owners, zero tail and no stale pages after growth");
 }
-static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
+static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file *file, unsigned actors)
 {
     assert(!kernel_page_cache_start_worker(cache));
+    if (actors == 2) demand_operation_cases(cache, file);
     demand_cold_warm(cache, file);
     demand_overlap(cache, file);
     demand_errors(cache, file);
@@ -803,7 +909,7 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
         alias_snapshot(cache, &file, pages,32,force_retry);
     }
     expanded_index_case(cache,&file,pages);
-    demand_cases(cache, &file);
+    demand_cases(cache, &file, actors);
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_unmount(&mount));
     assert(!close(image_fd));
