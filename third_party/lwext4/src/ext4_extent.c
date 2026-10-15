@@ -1795,6 +1795,7 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 		      ext4_ext_get_actual_len(path[depth].extent) - 1)) {
 
 		struct ext4_extent *ex = path[depth].extent, newex;
+        uint16_t original_count = ex->block_count;
 		int unwritten = ext4_ext_is_unwritten(ex);
 		ext4_lblk_t ee_block = to_le32(ex->first_block);
 		int32_t len = ext4_ext_get_actual_len(ex);
@@ -1805,7 +1806,11 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 		if (unwritten)
 			ext4_ext_mark_unwritten(ex);
 
-		ext4_ext_dirty(inode_ref, path + depth);
+        ret = ext4_ext_dirty(inode_ref, path + depth);
+        if (ret != EOK) {
+            ex->block_count = original_count;
+            goto out;
+        }
 
 		newex.first_block = to_le32(to + 1);
 		newex.block_count = to_le16(ee_block + len - 1 - to);
@@ -1814,6 +1819,23 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 			ext4_ext_mark_unwritten(&newex);
 
 		ret = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
+        if (ret != EOK) {
+            /* Tree growth can move the shortened left extent to another leaf.
+             * Restore its encoded length, including unwritten state, before
+             * returning the insertion error; bitmap ownership is unchanged. */
+            int restore = ext4_find_extent(inode_ref, ee_block, &path, 0);
+            if (restore == EOK) {
+                depth = ext_depth(inode_ref->inode);
+                ex = path[depth].extent;
+                if (!ex || to_le32(ex->first_block) != ee_block) restore = EIO;
+                else {
+                    ex->block_count = original_count;
+                    restore = ext4_ext_dirty(inode_ref, path + depth);
+                }
+            }
+            if (restore) ret = restore;
+            goto out;
+        }
         /* Splitting preserves both neighbors; the removed middle still owns
          * bitmap bits until it is explicitly freed after successful insertion. */
         if (ret == EOK)

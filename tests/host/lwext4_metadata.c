@@ -34,6 +34,8 @@ uint32_t __wrap_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes)
 #endif
 static struct fault_block disk;
 static unsigned allocations, fail_allocation, reads, fail_read, live_allocations;
+static size_t denied_block_buffer_size;
+static unsigned denied_block_buffers;
 static size_t payload_threshold;
 static unsigned payload_allocations;
 static uint64_t forbidden_lba = UINT64_MAX, forbidden_writes;
@@ -45,7 +47,13 @@ static bool borrow_watch_escape;
 static ext4_fsblk_t checkpoint_homes[3];
 static unsigned checkpoint_home_writes[3], checkpoint_watch_block;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"%d: %s (alloc=%u fail=%u)\n",__LINE__,#x,allocations,fail_allocation); exit(1); } } while (0)
-void *ext4_user_malloc(size_t n) { if(payload_threshold && n>=payload_threshold)payload_allocations++; if(++allocations==fail_allocation)return NULL;void *p=malloc(n);if(p)live_allocations++;return p; }
+void *ext4_user_malloc(size_t n)
+{
+    if(payload_threshold && n>=payload_threshold)payload_allocations++;
+    if(++allocations==fail_allocation)return NULL;
+    if(denied_block_buffer_size && n==denied_block_buffer_size) {denied_block_buffers++;return NULL;}
+    void *p=malloc(n);if(p)live_allocations++;return p;
+}
 void *ext4_user_calloc(size_t n,size_t s) { if(payload_threshold && n*s>=payload_threshold)payload_allocations++; if(++allocations==fail_allocation)return NULL;void *p=calloc(n,s);if(p)live_allocations++;return p; }
 void *ext4_user_realloc(void *p,size_t n) { if(++allocations==fail_allocation)return NULL;void *next=realloc(p,n);if(next&&!p)live_allocations++;return next; }
 void ext4_user_free(void *p) { if(p){CHECK(live_allocations);live_allocations--;}free(p); }
@@ -717,6 +725,20 @@ static int direct_write_batch(struct ext4_blockdev *bdev,const struct ext4_block
         if (r) return r;
     }
     return EOK;
+}
+static struct ext4_inode *direct_cleanup_leaf;
+static int direct_full_leaf_write_batch(struct ext4_blockdev *bdev,const struct ext4_block_span *spans,unsigned count)
+{
+    int r=direct_write_batch(bdev,spans,count);
+    if(r) {
+        uint16_t header[6];memcpy(header,direct_cleanup_leaf->blocks,sizeof(header));
+        CHECK(to_le16(header[0])==0xf30a && to_le16(header[1])==4 &&
+            to_le16(header[2])==4 && !header[3]);
+        /* Cleanup may allocate extent search paths, but removing the failed
+         * tail must not need a new block buffer for an extent-tree split. */
+        denied_block_buffer_size=bdev->lg_bsize;
+    }
+    return r;
 }
 static void direct_data_batch(struct ext4_fs *fs,bool fail)
 {
@@ -1729,6 +1751,101 @@ static void direct_range_error(struct ext4_fs *fs)
     CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/direct-range-error")==EOK);
     puts("nonjournal cross-span failure: five queued pages and 27 mapped-ahead pages all released");
 }
+static void direct_range_full_leaf_error(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    ext4_file file;CHECK(ext4_fopen(&file,"/direct-full-leaf-error","w+")==EOK);
+    unsigned block=fs->bdev->lg_bsize;
+    unsigned char *old=malloc(block);CHECK(old);
+    for(unsigned i=0;i<3;i++) {
+        size_t written;memset(old,0x91+i,block);
+        CHECK(ext4_fpwrite(&file,(uint64_t)i*2*block,old,block,&written)==EOK && written==block);
+    }
+    struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(fs,file.inode,&ref)==EOK);
+    ext4_fsblk_t previous[3];
+    for(unsigned i=0;i<3;i++)CHECK(ext4_fs_get_inode_dblk_idx(&ref,i*2,&previous[i],true)==EOK && previous[i]);
+    uint64_t free_before=ext4_sb_get_free_blocks_cnt(&fs->sb);
+    uint64_t blocks_before=ext4_inode_get_blocks_count(&fs->sb,ref.inode);
+    struct file_write_span spans[32];
+    uint64_t start=1024*(uint64_t)block;
+    for(unsigned i=0;i<32;i++) {
+        owned_page_init(&direct_pages[i],8192,0x30+i);
+        spans[i]=(struct file_write_span){.offset=start+i*4096,.buffer=direct_pages[i].bytes,.size=4096,
+            .source={&direct_pages[i],owned_page_retain,owned_page_release,8192},
+            .source_buffer=direct_pages[i].bytes,.source_size=8192};
+    }
+    /* Three sparse old extents plus the mapped-ahead run fill the inode leaf.
+     * The sixth copied page fails the first batch before consuming the run. */
+    spans[5].source=(struct file_data_source){0};spans[5].source_buffer=NULL;spans[5].source_size=0;
+    direct_batches=0;direct_fail_batch=1;direct_cleanup_leaf=ref.inode;denied_block_buffers=0;
+    fs->bdev->bdif->bwrite_batch=direct_full_leaf_write_batch;
+    int r=ext4_fpwrite_batch(&file,spans,32);
+    denied_block_buffer_size=0;direct_cleanup_leaf=NULL;fs->bdev->bdif->bwrite_batch=NULL;
+    printf("full-leaf failed batch: result=%d denied-new-buffers=%u\n",r,denied_block_buffers);
+    CHECK(r==EIO && direct_batches==1 && !denied_block_buffers && file.fsize==5*(uint64_t)block);
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,start/block,131072/block,false,&range)==EOK &&
+        !range.block && range.count==131072/block);
+    for(unsigned i=0;i<3;i++) {
+        ext4_fsblk_t physical;CHECK(ext4_fs_get_inode_dblk_idx(&ref,i*2,&physical,true)==EOK && physical==previous[i]);
+        size_t read;CHECK(ext4_fpread(&file,(uint64_t)i*2*block,old,block,&read)==EOK && read==block);
+        for(unsigned j=0;j<block;j++)CHECK(old[j]==0x91+i);
+    }
+    CHECK(ext4_inode_get_blocks_count(&fs->sb,ref.inode)==blocks_before);
+    CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb)==free_before);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    free(old);
+    for(unsigned i=0;i<32;i++) {CHECK(!spans[i].written && direct_pages[i].references==1);owned_page_release(&direct_pages[i]);}
+    CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/direct-full-leaf-error")==EOK);
+    puts("nonjournal full-leaf failure: reverse tail cleanup preserves old sparse extents without growing the tree");
+}
+static void extent_middle_oom(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    unsigned block=fs->bdev->lg_bsize;
+    unsigned char *bytes=malloc(block),*bitmap_before=malloc(block);CHECK(bytes && bitmap_before);
+    memset(bytes,0x75,block);
+    for(unsigned unwritten=0;unwritten<2;unwritten++) {
+        ext4_file file;CHECK(ext4_fopen(&file,"/extent-middle-oom","w+")==EOK);
+        for(unsigned i=0;i<3;i++) {
+            size_t written;CHECK(ext4_fpwrite(&file,(uint64_t)i*2*block,bytes,block,&written)==EOK && written==block);
+        }
+        struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(fs,file.inode,&ref)==EOK);
+        struct ext4_inode_block_range range;
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,1024,32,true,&range)==EOK && range.block && range.count==32);
+        ext4_fsblk_t physical=range.block;
+        uint16_t header[6];memcpy(header,ref.inode->blocks,sizeof(header));
+        CHECK(to_le16(header[0])==0xf30a && to_le16(header[1])==4 && to_le16(header[2])==4 && !header[3]);
+        if(unwritten) {
+            uint16_t encoded=to_le16(0x8000+32);
+            memcpy((unsigned char *)ref.inode->blocks+12+3*12+4,&encoded,sizeof(encoded));ref.dirty=true;
+        }
+        unsigned char leaf_before[sizeof(ref.inode->blocks)];memcpy(leaf_before,ref.inode->blocks,sizeof(leaf_before));
+        uint64_t blocks_before=ext4_inode_get_blocks_count(&fs->sb,ref.inode);
+        uint64_t free_before=ext4_sb_get_free_blocks_cnt(&fs->sb);
+        struct ext4_block_group_ref bg;struct ext4_block bitmap=EXT4_BLOCK_ZERO();
+        CHECK(ext4_fs_get_block_group_ref(fs,ext4_balloc_get_bgid_of_block(&fs->sb,physical),&bg)==EOK);
+        CHECK(ext4_block_get(fs->bdev,&bitmap,ext4_bg_get_block_bitmap(bg.block_group,&fs->sb))==EOK);
+        memcpy(bitmap_before,bitmap.data,block);
+        denied_block_buffers=0;denied_block_buffer_size=block;
+        int r=ext4_extent_remove_space(&ref,1028,1028);
+        denied_block_buffer_size=0;
+        printf("full-leaf middle OOM: unwritten=%u result=%d denied-new-buffers=%u\n",unwritten,r,denied_block_buffers);
+        CHECK(r==ENOMEM && denied_block_buffers==1);
+        CHECK(!memcmp(leaf_before,ref.inode->blocks,sizeof(leaf_before)));
+        CHECK(!memcmp(bitmap_before,bitmap.data,block));
+        CHECK(ext4_inode_get_blocks_count(&fs->sb,ref.inode)==blocks_before &&
+            ext4_sb_get_free_blocks_cnt(&fs->sb)==free_before && file.fsize==5*(uint64_t)block);
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,1024,32,false,&range)==EOK &&
+            range.block==physical && range.count==32 && range.unwritten==!!unwritten);
+        CHECK(ext4_block_set(fs->bdev,&bitmap)==EOK && ext4_fs_put_block_group_ref(&bg)==EOK);
+        CHECK(ext4_extent_remove_space(&ref,1024,1055)==EOK);
+        CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+        CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/extent-middle-oom")==EOK);
+    }
+    free(bytes);free(bitmap_before);
+    puts("middle extent removal OOM: initialized/unwritten leaf, mappings and bitmap preserved");
+}
 static void extent_range(struct ext4_blockdev *dev)
 {
     ext4_file f; CHECK(ext4_fopen(&f,"/range","w+")==EOK);
@@ -1965,6 +2082,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
     else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);
     else if(!strcmp(argv[2],"direct-range-error"))direct_range_error(dev.fs);
+    else if(!strcmp(argv[2],"direct-full-leaf-error"))direct_range_full_leaf_error(dev.fs);
+    else if(!strcmp(argv[2],"extent-middle-oom"))extent_middle_oom(dev.fs);
     else if(!strcmp(argv[2],"direct-data-batch") || !strcmp(argv[2],"direct-data-error"))
         direct_data_batch(dev.fs,!strcmp(argv[2],"direct-data-error"));
     else if(!strcmp(argv[2],"group-partial-owner") || !strcmp(argv[2],"group-partial-error")) {

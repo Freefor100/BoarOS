@@ -3387,11 +3387,27 @@ struct ext4_direct_write_batch {
     unsigned count;
     size_t bytes;
 };
+/* Drop the highest mapped blocks before any queued prefix. Releasing a middle
+ * block can split an extent and require metadata allocation during error repair. */
+static int ext4_write_discard_range(struct ext4_inode_ref *ref,
+    struct ext4_inode_block_range *range, ext4_lblk_t next, int result)
+{
+    if (!range->allocated) return result;
+    while (range->count) {
+        range->count--;
+        int cleanup = ext4_fs_release_inode_dblk_idx(ref,
+            next + range->count, range->block + range->count);
+        if (!result) result = cleanup;
+    }
+    return result;
+}
 static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
-    struct ext4_direct_write_batch *batch)
+    struct ext4_direct_write_batch *batch, struct ext4_inode_block_range *range,
+    ext4_lblk_t range_next)
 {
     if (!batch || !batch->count) return EOK;
     int r = ext4_trans_write_data_batch(ref->fs->bdev, batch->blocks, batch->count);
+    if (r) r = ext4_write_discard_range(ref, range, range_next, r);
     unsigned block_size = ref->fs->bdev->lg_bsize;
     for (unsigned step = 0; step < batch->count; step++) {
         unsigned i = r ? batch->count - 1 - step : step;
@@ -3402,12 +3418,12 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
                 ext4_inode_set_size(ref->inode, end); ref->dirty = true;
             }
         } else if (batch->logical[i].allocated) {
-            /* Remove from the end so failed append cleanup does not split
-             * extents and allocate new metadata while releasing old mappings. */
+            /* The mapped-ahead suffix is gone; now remove queued blocks from
+             * the end while preserving the device error as the operation error. */
             for (uint32_t j = batch->blocks[i].count; j > 0; j--) {
                 int cleanup = ext4_fs_release_inode_dblk_idx(ref,
                     batch->logical[i].offset / block_size + j - 1, batch->blocks[i].block + j - 1);
-                if (cleanup) r = cleanup;
+                if (!r) r = cleanup;
             }
         }
     }
@@ -3508,13 +3524,13 @@ Retry:
             block_size <= span->source_size - (source_offset - block_offset);
         /* The supplied block already includes the zero gap after old EOF. */
         if (!covers_eof && span->offset > old_size && old_size % block_size) {
-            r = ext4_direct_write_flush(&ref, file, direct);
+            r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
             if (!r) r = ext4_zero_allocated_eof_tail(&ref, old_size, span->offset);
         }
         size_t consumed = 0;
 		while (consumed < span->size && !r) {
             if (direct && (direct->bytes == 131072 || direct->count == EXT4_BLOCK_BATCH_MAX)) {
-                r = ext4_direct_write_flush(&ref, file, direct);
+                r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
                 if (r) break;
             }
 			uint32_t offset = file->fpos % block_size;
@@ -3561,7 +3577,7 @@ Retry:
                 bool overlap = n && physical >= direct->blocks[n-1].block &&
                     physical - direct->blocks[n-1].block < direct->blocks[n-1].count;
                 if ((!merge && n == EXT4_BLOCK_BATCH_MAX) || overlap || direct->bytes + block_size > 131072) {
-                    r = ext4_direct_write_flush(&ref, file, direct); n = 0; merge = false;
+                    r = ext4_direct_write_flush(&ref, file, direct, &range, range_next); n = 0; merge = false;
                 }
                 if (!r && merge) {
                     direct->blocks[n-1].count++;
@@ -3574,7 +3590,7 @@ Retry:
                 }
                 if (!r) direct->bytes += block_size;
             } else {
-                r = ext4_direct_write_flush(&ref, file, direct);
+                r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
                 if (!r) r = ext4_trans_write_data(fs->bdev, physical, data_offset,
                     input, data_length, allocated, &span->source);
             }
@@ -3588,17 +3604,8 @@ Retry:
 			}
 		}
 	}
-    if (r && range.allocated) {
-        /* Mapped ahead blocks can belong to later input spans. Keep one batch
-         * cursor so any failure releases their entire unconsumed suffix. */
-        while (range.count) {
-            range.count--;
-            int cleanup = ext4_fs_release_inode_dblk_idx(&ref,
-                range_next + range.count, range.block + range.count);
-            if (cleanup) r = cleanup;
-        }
-    }
-    int direct_result = ext4_direct_write_flush(&ref, file, direct);
+    if (r) r = ext4_write_discard_range(&ref, &range, range_next, r);
+    int direct_result = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
     if (!r) r = direct_result;
     ext4_free(direct);
     struct ext4_timestamp times[3];

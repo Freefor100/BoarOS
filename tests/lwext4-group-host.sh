@@ -74,7 +74,7 @@ for block in 1024 4096; do
     cp "$work/base.img" "$work/owner.img"
     "$work/probe" "$work/owner.img" group-data-batch
     e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
-    for mode in direct-data-batch direct-data-error direct-range-error; do
+    for mode in direct-data-batch direct-data-error direct-range-error direct-full-leaf-error extent-middle-oom; do
         truncate -s 32M "$work/direct.img"
         mkfs.ext4 -q -F -b "$block" -I 256 -O '^has_journal' "$work/direct.img"
         "$work/probe" "$work/direct.img" seed
