@@ -1,6 +1,47 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef uintptr_t memory_word __attribute__((__may_alias__));
+
+/* 只用于普通RAM；同余对齐后才访问整字，首尾不借读相邻对象。 */
+static inline __attribute__((always_inline)) void *copy_forward(
+    void *destination, const void *source, size_t size)
+{
+    unsigned char *output = destination;
+    const unsigned char *input = source;
+    if (size == 0U) return destination;
+    const size_t width = sizeof(memory_word);
+    if ((((uintptr_t)output ^ (uintptr_t)input) & (width - 1U)) == 0U) {
+        while (size != 0U && ((uintptr_t)output & (width - 1U)) != 0U) {
+            *output++ = *input++;
+            size--;
+        }
+        if (size == 0U) return destination;
+        memory_word *words_out = (memory_word *)(void *)output;
+        const memory_word *words_in = (const memory_word *)(const void *)input;
+        while (size >= 4U * width) {
+            words_out[0] = words_in[0];
+            words_out[1] = words_in[1];
+            words_out[2] = words_in[2];
+            words_out[3] = words_in[3];
+            words_out += 4;
+            words_in += 4;
+            size -= 4U * width;
+        }
+        while (size >= width) {
+            *words_out++ = *words_in++;
+            size -= width;
+        }
+        output = (unsigned char *)words_out;
+        input = (const unsigned char *)words_in;
+    }
+    while (size != 0U) {
+        *output++ = *input++;
+        size--;
+    }
+    return destination;
+}
+
 int memcmp(const void *left, const void *right, size_t size)
 {
     const unsigned char *left_bytes = left;
@@ -18,15 +59,7 @@ int memcmp(const void *left, const void *right, size_t size)
 
 void *memcpy(void *destination, const void *source, size_t size)
 {
-    unsigned char *output = destination;
-    const unsigned char *input = source;
-    size_t index;
-
-    for (index = 0U; index < size; index++) {
-        output[index] = input[index];
-    }
-
-    return destination;
+    return copy_forward(destination, source, size);
 }
 
 void *memmove(void *destination, const void *source, size_t size)
@@ -34,16 +67,42 @@ void *memmove(void *destination, const void *source, size_t size)
     unsigned char *output = destination;
     const unsigned char *input = source;
 
-    if ((uintptr_t)output < (uintptr_t)input) {
-        size_t index;
-
-        for (index = 0U; index < size; index++) {
-            output[index] = input[index];
+    if (size == 0U || output == input) return destination;
+    if ((uintptr_t)output < (uintptr_t)input ||
+        (uintptr_t)output - (uintptr_t)input >= size) {
+        return copy_forward(output, input, size);
+    } else {
+        const size_t width = sizeof(memory_word);
+        output += size;
+        input += size;
+        if ((((uintptr_t)output ^ (uintptr_t)input) & (width - 1U)) == 0U) {
+            while (size != 0U && ((uintptr_t)output & (width - 1U)) != 0U) {
+                *--output = *--input;
+                size--;
+            }
+            if (size == 0U) return destination;
+            memory_word *words_out = (memory_word *)(void *)output;
+            const memory_word *words_in = (const memory_word *)(const void *)input;
+            /* 从高地址逐字提交，距离小于展开块时也不覆盖待读源字。 */
+            while (size >= 4U * width) {
+                words_out[-1] = words_in[-1];
+                words_out[-2] = words_in[-2];
+                words_out[-3] = words_in[-3];
+                words_out[-4] = words_in[-4];
+                words_out -= 4;
+                words_in -= 4;
+                size -= 4U * width;
+            }
+            while (size >= width) {
+                *--words_out = *--words_in;
+                size -= width;
+            }
+            output = (unsigned char *)words_out;
+            input = (const unsigned char *)words_in;
         }
-    } else if ((uintptr_t)output > (uintptr_t)input) {
         while (size != 0U) {
+            *--output = *--input;
             size--;
-            output[size] = input[size];
         }
     }
 
@@ -53,10 +112,31 @@ void *memmove(void *destination, const void *source, size_t size)
 void *memset(void *destination, int value, size_t size)
 {
     unsigned char *bytes = destination;
-    size_t index;
-
-    for (index = 0U; index < size; index++) {
-        bytes[index] = (unsigned char)value;
+    const size_t width = sizeof(memory_word);
+    const unsigned char byte = (unsigned char)value;
+    while (size != 0U && ((uintptr_t)bytes & (width - 1U)) != 0U) {
+        *bytes++ = byte;
+        size--;
+    }
+    if (size == 0U) return destination;
+    memory_word pattern = (UINTPTR_MAX / UINT8_MAX) * byte;
+    memory_word *words = (memory_word *)(void *)bytes;
+    while (size >= 4U * width) {
+        words[0] = pattern;
+        words[1] = pattern;
+        words[2] = pattern;
+        words[3] = pattern;
+        words += 4;
+        size -= 4U * width;
+    }
+    while (size >= width) {
+        *words++ = pattern;
+        size -= width;
+    }
+    bytes = (unsigned char *)words;
+    while (size != 0U) {
+        *bytes++ = byte;
+        size--;
     }
 
     return destination;

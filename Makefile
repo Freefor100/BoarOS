@@ -871,6 +871,10 @@ test-lwext4-checksum-host:
 	build/host/lwext4-checksum
 	python3 -B tests/lwext4-checksum-read-host.py
 
+.PHONY: test-string-host
+test-string-host:
+	sh tests/string-host.sh
+
 .PHONY: test-lwext4-cache-host
 .PHONY: test-lwext4-deep-truncate-host
 test-lwext4-deep-truncate-host:

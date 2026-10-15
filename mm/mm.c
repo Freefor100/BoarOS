@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #if BOAROS_USER_SMP_COMPOSITION
 void riscv_user_composition_fault_retry(uint64_t address, int resumed);
@@ -189,12 +190,7 @@ static void finish_handle(struct kernel_mm *mm, enum kernel_mm_state state)
 
 static void clear_page(void *pointer)
 {
-    volatile unsigned char *bytes = pointer;
-    size_t index;
-
-    for (index = 0U; index < BOAROS_PAGE_SIZE; index++) {
-        bytes[index] = 0U;
-    }
+    memset(pointer, 0, BOAROS_PAGE_SIZE);
 }
 
 static enum kernel_mm_status resolve_record_storage(
@@ -686,8 +682,8 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
             if (physical_page_resolve(record->space.allocator,
                     page->physical_address, (void **)&bytes) !=
                     PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-            for (size_t i = (size_t)(size & BOAROS_PAGE_MASK);
-                 i < BOAROS_PAGE_SIZE; i++) bytes[i] = 0U;
+            size_t tail = (size_t)(size & BOAROS_PAGE_MASK);
+            memset(bytes + tail, 0, BOAROS_PAGE_SIZE - tail);
             cleared = 1;
         }
         link = &page->next;
@@ -3310,8 +3306,7 @@ static enum arch_mmu_status resolve_record_cow(struct kernel_mm_record *record,
             physical_page_release(allocator,old);
             return ARCH_MMU_STATUS_STATE;
         }
-        unsigned char *out = destination, *in = source;
-        for (size_t i=0; i<BOAROS_PAGE_SIZE; i++) out[i]=in[i];
+        memcpy(destination, source, BOAROS_PAGE_SIZE);
         {
             KERNEL_RAW_SCOPE(guard,&record->metadata);
             status=arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,permissions,&batch);
@@ -4539,7 +4534,7 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
         if (status == KERNEL_MM_STATUS_OK) {
             void *bytes = old_bytes;
             if (!cookie && physical_page_resolve(allocator,source.address,&bytes)) __builtin_trap();
-            for (size_t i=0; i<BOAROS_PAGE_SIZE; i++) ((unsigned char *)copy)[i]=((unsigned char *)bytes)[i];
+            memcpy(copy, bytes, BOAROS_PAGE_SIZE);
             count++;
         }
     }
@@ -4721,8 +4716,7 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
         if (status == KERNEL_MM_STATUS_OK) {
             prepared_count++;
             if (cookie) {
-                unsigned char *destination = new_pointer, *source = old_pointer;
-                for (size_t i = 0; i < BOAROS_PAGE_SIZE; i++) destination[i] = source[i];
+                memcpy(new_pointer, old_pointer, BOAROS_PAGE_SIZE);
             } else clear_page(new_pointer);
         }
     }

@@ -45,8 +45,11 @@ make test-page-riscv
 
 默认关闭的 COST 构建另在实际 calloc 清零与 resize 搬迁处记录字节、次数、单次最大值
 和经过 ticks，不在公共内存函数采样。字节是原实际范围，失败准备不制造成功样本；
-ticks 可以包含中断与切换，不能当作独占 CPU 时间。公共字节实现仍是生产路径；
-宽字候选的微实验改善没有带来原 Lua 工程收益，见[有限归因](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
+ticks 可以包含中断与切换，不能当作独占 CPU 时间。清零和搬迁使用 `lib/string.c`
+的公共 RAM 原语：对齐区域按机器字复制或填充，首尾精确处理，重叠搬迁使用 `memmove`。
+MM 的清页与 COW 也复用这些原语，不在各模块保留逐字节副本。
+`make test-string-host` 用全部对齐组合、双向重叠和守卫页检查边界；
+历史宽字微实验没有带来当时的 Lua 工程收益，见[有限归因](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
 
 堆 allocate/resize 与 MM 元数据变更使用任务 `allocation_depth` 限制回收：可回收干净且无外部引用的页，不允许在分配器内部发起脏页 I/O。物理分配器递归检测使用任务 `reclaim_depth`，一个任务睡眠不把其他任务误判为自身递归。脏页回收只在外层无锁处执行；不足返回真实 EMPTY/ENOMEM，不构造重试锁链。
 

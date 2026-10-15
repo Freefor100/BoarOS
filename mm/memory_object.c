@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define SHARED_ANON_INITIAL_BUCKETS 16U
 
@@ -235,8 +236,7 @@ static enum kernel_memory_object_status get_page(
     if (physical_page_resolve(object->allocator, page->physical_address,
                               &bytes) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
-    for (size_t i = 0U; i < BOAROS_PAGE_SIZE; i++)
-        ((unsigned char *)bytes)[i] = 0U;
+    memset(bytes, 0, BOAROS_PAGE_SIZE);
     if (physical_page_acquire(object->allocator, page->physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     /* 先完成私有的object/PTE页引用准备，再CAS竞争跨对象预算；失败归还两份。 */
@@ -375,7 +375,7 @@ void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t
                 if (physical_page_resolve(object->allocator, page->physical_address, &bytes) !=
                     PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
                 /* 缩短后保留的末页不允许在再次增长时暴露旧内容。 */
-                for (size_t j = tail; j < BOAROS_PAGE_SIZE; j++) ((unsigned char *)bytes)[j] = 0;
+                memset((unsigned char *)bytes + tail, 0, BOAROS_PAGE_SIZE - tail);
             }
             link = &page->next;
         }
