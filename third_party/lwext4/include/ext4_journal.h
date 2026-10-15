@@ -43,6 +43,7 @@ extern "C" {
 
 #include <ext4_config.h>
 #include <ext4_types.h>
+#include <ext4_blockdev.h>
 #include <misc/queue.h>
 #include <misc/tree.h>
 
@@ -76,12 +77,13 @@ struct jbd_buf {
 	TAILQ_ENTRY(jbd_buf) dirty_buf_node;
 };
 
+struct jbd_source;
 /* File payload belongs to the transaction but is never a log record. */
 struct jbd_data {
 	struct ext4_block block;
-	struct jbd_image *before;
-	struct jbd_image *after;
-	bool modified, was_dirty;
+	struct jbd_image *image;
+	struct jbd_source *source;
+	RB_ENTRY(jbd_data) index_node;
 	TAILQ_ENTRY(jbd_data) node;
 };
 
@@ -116,7 +118,8 @@ struct jbd_trans {
 	int error;
 	uint64_t sequence;
 	uint64_t first_dirty_ns;
-	unsigned reserved_logs;
+	unsigned reserved_logs, reserved_log_images;
+	unsigned ordered_count, revoke_count;
 	bool frozen;
 	struct jbd_image *checkpoint_image;
 	ext4_fsblk_t checkpoint_lba;
@@ -125,6 +128,7 @@ struct jbd_trans {
 
 	TAILQ_HEAD(jbd_trans_buf, jbd_buf) buf_queue;
 	TAILQ_HEAD(jbd_trans_data, jbd_data) data_queue;
+	RB_HEAD(jbd_data_tree, jbd_data) data_root;
 	TAILQ_HEAD(jbd_trans_log, jbd_log_block) log_queue;
 	struct jbd_trans_log log_reserve;
 	LIST_HEAD(jbd_quarantine_list, jbd_quarantine) quarantine;
@@ -146,6 +150,7 @@ struct jbd_journal {
 	bool grouped;
 	size_t memory_used, memory_peak, memory_limit;
 	size_t memory_cached;
+	RB_HEAD(jbd_source_tree, jbd_source) sources;
 	struct jbd_image *image_cache;
 	void *allocation_cache[6];
 	bool cache_disabled;
@@ -187,10 +192,11 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 /* Reserve the journal owner and rollback image before changing a buffer. */
 int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
-int jbd_trans_get_data_access(struct jbd_trans *trans,
-			      struct ext4_block *block);
-int jbd_trans_set_data_dirty(struct jbd_trans *trans,
-			     struct ext4_block *block);
+int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
+	uint32_t offset, const void *data, uint32_t length, bool initialize,
+	const struct ext4_data_source *source);
+/* The mount lock stabilizes this borrowed version. NULL means read home. */
+const void *jbd_journal_read_data(struct ext4_fs *fs, ext4_fsblk_t block);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
 			   ext4_fsblk_t lba);
 int jbd_trans_try_revoke_block(struct jbd_trans *trans,
@@ -224,7 +230,8 @@ int jbd_journal_retire(struct jbd_journal *journal, int error);
  * owners outside it. Commit and checkpoint completion are distinct. */
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
-bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads);
+bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads,
+	const struct ext4_data_source *const *sources, unsigned count);
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);

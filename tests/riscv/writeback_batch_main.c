@@ -17,9 +17,6 @@
 #include "../../fs/vfs_internal.h"
 #include <string.h>
 
-#ifndef BOAROS_PAGE_CACHE_WRITEBACK_PAGES
-#define BOAROS_PAGE_CACHE_WRITEBACK_PAGES 1
-#endif
 static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator allocator;
 static struct kernel_heap heap;
@@ -60,29 +57,35 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
     if (reject_page) { injected++; return PHYSICAL_PAGE_STATUS_EMPTY; }
     return __real_physical_page_allocate(a, out);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *written)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
 {
+    size_t size=0;
+    for (size_t i=0;i<count;i++) size+=spans[i].size;
+    uint64_t offset=count?spans[0].offset:0;
     if (probe) {
-        if (calls < 16) { offsets[calls] = (unsigned)offset; lengths[calls] = (unsigned)size; }
-        calls++; submitted += size;
-        if (maximum < size) maximum = (unsigned)size;
+        if (calls < 16) { offsets[calls]=(unsigned)offset; lengths[calls]=(unsigned)size; }
+        calls++; submitted+=size;
+        if (maximum<size) maximum=(unsigned)size;
     }
     if (fail_write) {
-        *written = fail_write == 1 ? 0 : size - 1;
-        return fail_write == 1 ? -KERNEL_EIO : 0;
+        for (size_t i=0;i<count;i++) spans[i].written=fail_write==1?0:spans[i].size;
+        if (count && fail_write==2) spans[count-1].written--;
+        return fail_write==1?-KERNEL_EIO:0;
     }
     if (hold_snapshot) {
-        hold_snapshot = 0; snapshot_waiting = 1;
+        hold_snapshot=0; snapshot_waiting=1;
         while (!snapshot_changed) {
             enum kernel_wait_wake_reason reason;
-            check(kernel_scheduler_block_current(&snapshot_ready, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 70);
+            check(kernel_scheduler_block_current(&snapshot_ready,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,70);
         }
-        const unsigned char *data = buffer;
-        for (size_t i = 0; i < size; i++)
-            check(data[i] == (unsigned char)((offset + i) / 4096 + 1), 71);
+        for (size_t i=0;i<count;i++) {
+            const unsigned char *data=spans[i].buffer;
+            for (size_t j=0;j<spans[i].size;j++)
+                check(data[j]==(unsigned char)((spans[i].offset+j)/4096+1),71);
+        }
     }
-    return __real_kernel_vfs_node_writeback(node, offset, buffer, size, written);
+    return __real_kernel_vfs_node_writeback(node,spans,count);
 }
 static void reset_probe(void)
 { calls = maximum = 0; submitted = 0; probe = 1; }
@@ -124,7 +127,29 @@ static void range_cases(struct kernel_vfs_file *file)
     reset_probe();
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 34);
     probe = 0;
-    check(calls == 3 && maximum == 1 && submitted == 3, 35);
+    check(calls == (3 + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES && submitted == 3, 35);
+    /* Logical gaps do not prevent one backend transaction. The block driver
+     * decides which resulting disk ranges can share an SG request. */
+    memset(bytes,0x8e,sizeof(bytes));
+    const unsigned sparse[] = {0,4,8};
+    for (unsigned i=0;i<3;i++)
+        check(kernel_vfs_pwrite(file,sparse[i]*4096,bytes,sizeof(bytes),&written)==0 && written==sizeof(bytes),360);
+    reset_probe();
+    check(kernel_page_cache_writeback(&cache,kernel_vfs_file_node(file))==0,361);
+    probe=0;
+    check(calls==(3+BOAROS_PAGE_CACHE_WRITEBACK_PAGES-1)/BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
+          submitted==3*4096,362);
+    check(kernel_vfs_sync(file,1,&observed)==0 &&
+          kernel_page_cache_invalidate_node(&cache,kernel_vfs_file_node(file))==KERNEL_PAGE_CACHE_STATUS_OK,363);
+    for (unsigned page=0;page<9;page++) {
+        size_t read;
+        check(kernel_vfs_pread(file,page*4096,actual,sizeof(actual),&read)==0 && read==sizeof(actual),364);
+        for (unsigned i=0;i<4096;i++) {
+            unsigned char expected=page==0 || page==4 || page==8 ? 0x8e :
+                page<3 && i==17 ? value : page+1;
+            check(actual[i]==expected,365);
+        }
+    }
     write_pages(file, 9);
     reset_probe();
     check(kernel_page_cache_writeback_range(&cache, kernel_vfs_file_node(file), 0, 2 * 4096 + 37) == 0, 36);
@@ -163,8 +188,9 @@ static void allocation_cases(struct kernel_vfs_file *file)
     reset_probe();
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 50);
     probe = reject_order = 0;
-    check(calls == 8 && maximum == 4096 && submitted == 8 * 4096, 51);
-    if (BOAROS_PAGE_CACHE_WRITEBACK_PAGES > 1) check(injected != 0, 52);
+    check(calls == (8 + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
+          maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096 && submitted == 8 * 4096, 51);
+    check(injected == 0, 52);
     write_pages(file, 1);
     reject_page = 1;
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == -KERNEL_ENOMEM, 53);
@@ -239,7 +265,7 @@ static void error_cases(struct kernel_vfs_file *file)
         check(submitted == 8 * 4096, 93);
     }
 }
-static void background_case(struct kernel_vfs_file *file, int degraded)
+static void background_case(struct kernel_vfs_file *file)
 {
     uint64_t observed = 0;
     check(kernel_vfs_sync(file, 1, &observed) == 0 && kernel_vfs_ftruncate(file, 0) == 0, 60);
@@ -248,13 +274,12 @@ static void background_case(struct kernel_vfs_file *file, int degraded)
     write_pages(file, pages);
     struct kernel_page_cache_statistics before;
     kernel_page_cache_get_statistics(&cache, &before);
-    /* 只拒绝预留降级的候选分配，随后创建 worker 的内核栈仍正常分配。 */
-    reject_order = degraded ? (unsigned)__builtin_ctz(BOAROS_PAGE_CACHE_WRITEBACK_PAGES) : 0;
+    /* Reserve independent pages; no contiguous snapshot allocation is needed. */
     injected = 0;
     reset_probe();
     check(kernel_page_cache_start_worker(&cache) == 0, 61);
     reject_order = 0;
-    if (degraded && BOAROS_PAGE_CACHE_WRITEBACK_PAGES > 1) check(injected != 0, 66);
+    check(injected == 0, 66);
     uint64_t deadline;
     check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns() + UINT64_C(5000000000), &deadline) == KERNEL_TIME_STATUS_OK, 62);
     struct kernel_page_cache_statistics stats = {0};
@@ -265,9 +290,9 @@ static void background_case(struct kernel_vfs_file *file, int degraded)
     }
     kernel_page_cache_stop_worker(&cache);
     probe = 0;
-    number(degraded ? "writeback degraded background maximum bytes: " : "writeback background maximum bytes: ", maximum);
+    number("writeback background maximum bytes: ", maximum);
     check(stats.worker_written >= before.worker_written + pages / 3 && stats.worker_failed == before.worker_failed &&
-          maximum == (degraded ? 1 : BOAROS_PAGE_CACHE_WRITEBACK_PAGES) * 4096, 64);
+          maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096, 64);
     check(kernel_vfs_sync(file, 1, &observed) == 0 &&
           kernel_page_cache_invalidate_node(&cache, kernel_vfs_file_node(file)) == KERNEL_PAGE_CACHE_STATUS_OK, 65);
     read_pages(file, pages);
@@ -283,8 +308,7 @@ static void exercise(void *argument)
     allocation_cases(&file);
     redirty_case(&file);
     error_cases(&file);
-    background_case(&file, 0);
-    background_case(&file, 1);
+    background_case(&file);
     check(kernel_vfs_close(&file) == 0 && kernel_vfs_unmount(&mount) == 0, 12);
     check(kernel_page_cache_destroy(&cache) == KERNEL_PAGE_CACHE_STATUS_OK &&
           riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK, 13);

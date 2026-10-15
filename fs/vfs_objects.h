@@ -166,10 +166,9 @@ struct kernel_vfs_backend {
         size_t *bytes_read);
     int (*pread_batch)(struct kernel_vfs_node *node,
         struct kernel_vfs_read_span *spans, size_t count);
-    int (*memory_write)(struct kernel_vfs_node *node, uint64_t offset,
-        const void *buffer, size_t size, size_t *written);
-    int (*writeback)(struct kernel_vfs_node *node, uint64_t offset,
-        const void *buffer, size_t size, size_t *written);
+    void (*memory_written)(struct kernel_vfs_node *node, uint64_t end);
+    int (*writeback)(struct kernel_vfs_node *node,
+        struct kernel_vfs_writeback_span *spans, size_t count);
 };
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,

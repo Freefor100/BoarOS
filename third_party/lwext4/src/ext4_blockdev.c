@@ -305,6 +305,23 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 	return EOK;
 }
 
+int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
+	struct ext4_block_read_span *spans, unsigned count)
+{
+	if (!bdev || !bdev->bdif || !bdev->bdif->ph_refctr || count > EXT4_BLOCK_BATCH_MAX ||
+	    (count && !spans)) return EINVAL;
+	if (count && bdev->bdif->bread_batch) {
+		ext4_bdif_lock(bdev);
+		bdev->bdif->bread_batch(bdev, spans, count);
+		bdev->bdif->bread_ctr += count;
+		ext4_bdif_unlock(bdev);
+	} else for (unsigned i = 0; i < count; i++)
+		spans[i].error = ext4_bdif_bread(bdev, spans[i].data, spans[i].block, spans[i].count);
+	int first = EOK;
+	for (unsigned i = 0; i < count; i++) if (!first) first = spans[i].error;
+	return first;
+}
+
 int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	const uint64_t *lbas, int *errors, unsigned count)
 {
@@ -337,13 +354,7 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 			ratio, EIO};
 	}
 	/* 先完成自己发布的加载，再等待别人的 loading，重叠批次不会互等未发布页。 */
-	if (pending && bdev->bdif->bread_batch) {
-		ext4_bdif_lock(bdev);
-		bdev->bdif->bread_batch(bdev, reads, pending);
-		bdev->bdif->bread_ctr += pending;
-		ext4_bdif_unlock(bdev);
-	} else for (unsigned i = 0; i < pending; i++)
-		reads[i].error = ext4_bdif_bread(bdev, reads[i].data, reads[i].block, reads[i].count);
+	ext4_blockdev_read_batch(bdev, reads, pending);
 	for (unsigned i = 0; i < pending; i++) {
 		struct ext4_buf *buf = blocks[owners[i]].buf;
 		buf->load_error = reads[i].error;

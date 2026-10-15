@@ -21,6 +21,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/vfs.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/write_source.h"
 #include "../../fs/files/private.h"
 #include "../../kernel/sched/private.h"
 #include <string.h>
@@ -93,9 +94,11 @@ int __wrap_kernel_open_file_sync_range(struct kernel_open_file_description *ofd,
 enum kernel_open_file_status __real_kernel_open_file_release(struct kernel_open_file_description **);
 enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner);
 static unsigned loading_probe, loads, done, write_probe, background_fail;
+static size_t background_failed_pages;
 static uint64_t pressure_pages[1024], failed_offset;
 static struct kernel_wait_queue held_write;
 static unsigned stop_probe, stop_entered, stop_called, stop_done;
+static size_t stop_pages;
 static struct kernel_page_cache instance_peer;
 static struct kernel_vfs_node *instance_nodes[2];
 static struct kernel_wait_queue instance_held[2];
@@ -215,15 +218,27 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, vo
     }
     if (!operation_testing || mm != &sync_mm)
         return __real_kernel_copy_from_user(mm, buffer, address, size, copied);
-    if (address == operation_second && kernel_task_current() == operation_writer_task && !operation_paused) {
+    /* 向量导入仍走通用usercopy，文件payload直接从页pin写入最终页。 */
+    int previous=sync_edit; sync_edit=1;
+    enum kernel_uaccess_status result=__real_kernel_copy_from_user(mm,buffer,address,size,copied);
+    sync_edit=previous;
+    return result;
+}
+enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *mm,uint64_t address,
+    uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    if (!operation_testing || mm!=&sync_mm)
+        return __real_kernel_uaccess_pin_user_page(mm,address,access,pin);
+    if (address == operation_second && kernel_cpu_current()->current == operation_writer_task && !operation_paused) {
         operation_paused = 1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&operation_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 240);
     }
     /* 使用真实 MM/uaccess；只模型化未激活 MM 的 satp，调度和 VFS 等待仍用真实 hart。 */
-    sync_edit = 1;
-    enum kernel_uaccess_status result = __real_kernel_copy_from_user(mm, buffer, address, size, copied);
-    sync_edit = 0;
+    int previous=sync_edit; sync_edit=1;
+    enum kernel_uaccess_status result=__real_kernel_uaccess_pin_user_page(mm,address,access,pin);
+    sync_edit=previous;
     return result;
 }
 static void operation_writer(void *argument)
@@ -607,9 +622,11 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
     }
     return __real_kernel_vfs_node_pread(node, offset, buffer, size, count);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *written)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
 {
+    uint64_t offset=count?spans[0].offset:0;
+    const void *buffer=count?spans[0].buffer:NULL;
     if (instance_hold && kernel_io_context_current()->background_reclaim) {
         for (unsigned i = 0; i < 2; i++) if (node == instance_nodes[i] && !instance_entered[i]) {
             instance_entered[i] = 1;
@@ -619,14 +636,16 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offs
     }
     if (stop_probe && kernel_io_context_current()->background_reclaim) {
         stop_probe = 0;
+        stop_pages = count;
         stop_entered = 1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&held_write, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 116);
     }
     if (background_fail && kernel_io_context_current()->background_reclaim) {
         background_fail = 0;
+        background_failed_pages=count;
         failed_offset = offset;
-        *written = 0;
+        for (size_t i=0;i<count;i++) spans[i].written=0;
         return -5;
     }
     if (write_probe) {
@@ -636,7 +655,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offs
         check(*(const unsigned char *)buffer == first, 21);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_writeback(node, offset, buffer, size, written);
+    return __real_kernel_vfs_node_writeback(node,spans,count);
 }
 static void write_worker(void *argument)
 {
@@ -976,11 +995,12 @@ static void instance_yield(void)
 static void instance_write(struct kernel_page_cache *c, struct kernel_vfs_file *f,
                            unsigned pages)
 {
-    KERNEL_LOCK_SCOPE(guard);
-    kernel_vfs_node_lock(kernel_vfs_file_node(f), &guard, 1);
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(f,&operation);
     for (unsigned i = 0; i < pages; i++) {
         size_t written;
-        check(kernel_page_cache_write(c, f, (uint64_t)i * 4096, payload, sizeof(payload),
+        struct kernel_vfs_write_source source={.data=payload};
+        check(kernel_page_cache_write_source(c, f, (uint64_t)i * 4096, &source, sizeof(payload),
                                       &written) == 0 && written == sizeof(payload), 182);
     }
 }
@@ -1168,7 +1188,8 @@ static void background_writeback_probe(void *unused)
     check(memory.dirty <= physical_page_total(&allocator) / 20 * 4096, 94);
     struct kernel_page_cache_statistics worker_stats = {0};
     kernel_page_cache_get_statistics(&cache, &worker_stats);
-    check(!background_fail && worker_stats.worker_failed == 1 && worker_stats.worker_written > 0, 100);
+    check(!background_fail && background_failed_pages &&
+          worker_stats.worker_failed == background_failed_pages && worker_stats.worker_written > 0, 100);
     check(worker_stats.worker_batches > 1 &&
           worker_stats.worker_scanned <= worker_stats.worker_batches * 64, 125);
     struct riscv_virtio_mmio_block_statistics query_before, query_after;
@@ -1207,7 +1228,7 @@ static void background_writeback_probe(void *unused)
     check(physical_page_release(&allocator, pinned) == PHYSICAL_PAGE_STATUS_OK, 107);
     while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 108);
     kernel_page_cache_stop_worker(&cache);
-    /* 暂扣在途写回，stop 必须等待它完成且不能继续提交本批其他页。 */
+    /* 暂扣已提交批次，stop 必须等待它完成且不能再提交下一批。 */
     for (unsigned i = 0; i < pages; i++) {
         size_t n;
         memset(payload, (int)(i % 251 + 1), sizeof(payload));
@@ -1226,7 +1247,8 @@ static void background_writeback_probe(void *unused)
     check(kernel_wait_queue_wake_all(&held_write) == KERNEL_SCHEDULER_STATUS_OK, 123);
     kernel_thread_join(&stopper);
     kernel_page_cache_get_statistics(&cache, &worker_stats);
-    check(stop_done && worker_stats.worker_written == writes_before_stop + 1, 124);
+    check(stop_done && stop_pages &&
+          worker_stats.worker_written == writes_before_stop + stop_pages, 124);
     (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     size_t count;
     check(kernel_vfs_pread(&target, (uint64_t)(pages - 1) * 4096, payload, sizeof(payload), &count) == 0 &&

@@ -44,6 +44,8 @@
 #include <ext4_fs.h>
 #include <ext4_journal.h>
 #include <ext4_trans.h>
+#include <string.h>
+#include <stdlib.h>
 
 static int trans_error(struct ext4_blockdev *bdev, int r)
 {
@@ -120,51 +122,61 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 	return trans_error(bdev, r);
 }
 
-int ext4_trans_data_get(struct ext4_blockdev *bdev, struct ext4_block *b,
-			uint64_t lba)
-{
-	int r = ext4_block_get(bdev, b, lba);
-	if (r != EOK)
-		return trans_error(bdev, r);
-#if CONFIG_JOURNALING_ENABLE
-	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans) {
-		r = jbd_trans_get_data_access(bdev->fs->curr_trans, b);
-		if (r != EOK) {
-			bdev->cache_write_back++;
-			ext4_block_set(bdev, b);
-			bdev->cache_write_back--;
-		}
-	}
-#endif
-	return trans_error(bdev, r);
-}
-
-int ext4_trans_data_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
-			       uint64_t lba)
+int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
+	uint32_t offset, const void *data, uint32_t length, bool initialize,
+	const struct ext4_data_source *source)
 {
 #if CONFIG_JOURNALING_ENABLE
 	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans)
-		return ext4_trans_data_get(bdev, b, lba);
+		return trans_error(bdev, jbd_trans_write_data(bdev->fs->curr_trans,
+			lba, offset, data, length, initialize, source));
 #endif
-	return trans_error(bdev, ext4_block_get_noread(bdev, b, lba));
-}
-
-int ext4_trans_set_data_dirty(struct ext4_buf *buf)
-{
-#if CONFIG_JOURNALING_ENABLE
-	struct ext4_fs *fs = buf->bc->bdev->fs;
-	if (fs && fs->jbd_journal && fs->jbd_journal->error)
-		return trans_error(buf->bc->bdev, fs->jbd_journal->error);
-	if (fs && fs->jbd_journal && fs->curr_trans) {
-		struct ext4_block block = {
-			.lb_id = buf->lba, .data = buf->data, .buf = buf
-		};
-		return trans_error(buf->bc->bdev,
-			jbd_trans_set_data_dirty(fs->curr_trans, &block));
+	/* Standalone non-journal users may explicitly request deferred bcache
+	 * writes. The VFS supplies stable sources and writes directly instead. */
+	if (source && source->retain) {
+		struct ext4_block cached = EXT4_BLOCK_ZERO();
+		struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, lba);
+		void *assembled = NULL;
+		const void *payload = data;
+		int r = EOK;
+		if (offset || length != bdev->lg_bsize) {
+			assembled = ext4_malloc(bdev->lg_bsize);
+			if (!assembled) r = ENOMEM;
+			else if (initialize) memset(assembled, 0, bdev->lg_bsize);
+			else if (old && ext4_bcache_test_flag(old, BC_UPTODATE)) memcpy(assembled, cached.data, bdev->lg_bsize);
+			else r = ext4_blocks_get_direct(bdev, assembled, lba, 1);
+			if (!r) {
+				if (data) memcpy((uint8_t *)assembled + offset, data, length);
+				else memset((uint8_t *)assembled + offset, 0, length);
+			}
+			payload = assembled;
+		}
+		if (!r) r = ext4_blocks_set_direct(bdev, payload, lba, 1);
+		if (!r && old) {
+			/* An explicitly held standalone bcache reference sees the new
+			 * contents too; no stale dirty version may overwrite direct DMA. */
+			memcpy(cached.data, payload, bdev->lg_bsize);
+			ext4_bcache_set_flag(old, BC_UPTODATE);
+			ext4_bcache_clear_dirty(old);
+		}
+		ext4_free(assembled);
+		if (old) {
+			bdev->cache_write_back++;
+			int cleanup = ext4_block_set(bdev, &cached);
+			bdev->cache_write_back--;
+			if (!r) r = cleanup;
+		}
+		return r;
 	}
-#endif
-	ext4_bcache_set_dirty(buf);
-	return EOK;
+	struct ext4_block block = EXT4_BLOCK_ZERO();
+	int r = initialize || (!offset && length == bdev->lg_bsize)
+		? ext4_block_get_noread(bdev, &block, lba) : ext4_block_get(bdev, &block, lba);
+	if (r) return r;
+	if (initialize) memset(block.data, 0, bdev->lg_bsize);
+	if (data) memcpy(block.data + offset, data, length);
+	else memset(block.data + offset, 0, length);
+	ext4_bcache_set_dirty(block.buf);
+	return ext4_block_set(bdev, &block);
 }
 
 int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev __unused,

@@ -1,6 +1,7 @@
 #include "vfs_objects.h"
 #include "vfs_internal.h"
 #include "record_lock.h"
+#include "write_source.h"
 #include <arch/context.h>
 
 #include <kernel/block.h>
@@ -1158,22 +1159,59 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
         kernel_page_cache_truncate(node->instance->page_cache, node, size);
 }
 
-int kernel_vfs_pwrite(struct kernel_vfs_file *file,
-                      uint64_t offset,
-                      const void *buffer,
-                      size_t size,
-                      size_t *bytes_written)
+static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
+    struct kernel_vfs_write_source *source,size_t size,size_t *written)
+{
+    struct physical_page_allocator *allocator=node->instance->heap->page_allocator;
+    *written=0;
+    while (*written<size) {
+        size_t start=offset&BOAROS_PAGE_MASK;
+        size_t count=BOAROS_PAGE_SIZE-start;
+        if (count>size-*written) count=size-*written;
+        count=kernel_vfs_write_source_span(source,count);
+        if (!count) { source->access=KERNEL_UACCESS_STATUS_STATE; return 0; }
+        KERNEL_LOCK_SCOPE(io);
+        kernel_vfs_node_lock(node,&io,1);
+        uint64_t address,index=offset>>BOAROS_PAGE_SHIFT; int created;
+        enum kernel_memory_object_status status=kernel_memory_object_prepare_page(
+            node->memory,index,&address,&created);
+        if (status==KERNEL_MEMORY_OBJECT_NO_SPACE) return -KERNEL_ENOSPC;
+        if (status==KERNEL_MEMORY_OBJECT_NO_MEMORY) return -KERNEL_ENOMEM;
+        if (status) __builtin_trap();
+        kernel_lock_release(&io);
+        struct kernel_mm_user_pin pin={0};
+        if (!kernel_vfs_write_source_pin(source,&pin)) {
+            kernel_memory_object_finish_page(node->memory,index,address,0);
+            return 0;
+        }
+        kernel_vfs_node_lock(node,&io,1);
+        void *page;
+        if (physical_page_resolve(allocator,address,&page)) __builtin_trap();
+        kernel_vfs_write_source_copy(source,(unsigned char *)page+start,count);
+        node->instance->ops->memory_written(node,offset+count);
+        kernel_lock_release(&io);
+        if (pin.registration) kernel_mm_unpin_user_page(&pin);
+        kernel_memory_object_finish_page(node->memory,index,address,1);
+        if (physical_page_release(allocator,address)) __builtin_trap();
+        kernel_vfs_write_source_advance(source,count);
+        offset+=count; *written+=count;
+    }
+    return 0;
+}
+
+static int vfs_write_source(struct kernel_vfs_file *file,uint64_t offset,
+    struct kernel_vfs_write_source *source,size_t size,size_t *bytes_written)
 {
     struct kernel_vfs_node *node;
     size_t written = 0U;
     int result;
 
     if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
-        file->private_data == 0 || (buffer == 0 && size != 0U) ||
-        bytes_written == 0) {
+        file->private_data == 0 || bytes_written == 0) {
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    *bytes_written=0;
     KERNEL_LOCK_SCOPE(operation_guard);
     kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
@@ -1194,20 +1232,51 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     if (size > node->max_size - offset)
         size = (size_t)(node->max_size - offset);
-    int controlled=node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache);
-    if (controlled) kernel_lock_release(&node_guard);
+    kernel_lock_release(&node_guard);
     result = node->memory
-        ? node->instance->ops->memory_write(node, offset, buffer, size, &written)
-        : kernel_page_cache_write(node->instance->page_cache, file, offset, buffer, size, &written);
+        ? memory_write_source(node,offset,source,size,&written)
+        : kernel_page_cache_write_source(node->instance->page_cache,file,offset,source,size,&written);
     file->size = node->size;
     *bytes_written = written;
     if (written > size) {
         return -KERNEL_EIO;
     }
-    if (result != 0 && written == 0U) {
-        return result;
+    return result;
+}
+
+int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
+    const void *buffer,size_t size,size_t *bytes_written)
+{
+    if ((!buffer && size) || !bytes_written) return -KERNEL_EINVAL;
+    struct kernel_vfs_write_source source={.data=buffer};
+    size_t written=0;
+    int error=vfs_write_source(file,offset,&source,size,&written);
+    *bytes_written=written;
+    return written?0:error;
+}
+
+int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov,size_t iov_count,size_t count,
+    uint64_t offset,int append,struct kernel_vfs_user_write_result *result)
+{
+    if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data ||
+        !mm || !iov || !result) return -KERNEL_EINVAL;
+    *result=(struct kernel_vfs_user_write_result){.end_offset=offset};
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(file,&operation);
+    if (append) {
+        KERNEL_LOCK_SCOPE(io);
+        struct kernel_vfs_node *node=file->private_data;
+        kernel_vfs_node_lock(node,&io,0);
+        offset=node->size;
+        result->end_offset=offset;
     }
-    return 0;
+    struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0}};
+    int error=vfs_write_source(file,offset,&source,count,&result->written);
+    result->end_offset=offset+result->written;
+    result->access=source.access;
+    result->chunks=source.chunks;
+    return error;
 }
 
 int kernel_vfs_append(struct kernel_vfs_file *file,
@@ -1245,8 +1314,7 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
         *bytes_written = 0U;
         return 0;
     }
-    if (node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache))
-        kernel_lock_release(&node_guard);
+    kernel_lock_release(&node_guard);
     result = kernel_vfs_pwrite(file, offset, buffer, size, &written);
     if (written_offset != 0) {
         *written_offset = offset + (uint64_t)written;
@@ -2559,12 +2627,12 @@ int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
     return instance->ops->snapshot(file->private_data, heap, buffer, length);
 }
 
-int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written)
+int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count)
 {
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;
-    return instance->ops->writeback(node, offset, buffer, size, written);
+    return instance->ops->writeback(node, spans, count);
 }
 
 /* 后端已准备好私有 handle；同一实例的活 inode 只发布一个通用节点。 */

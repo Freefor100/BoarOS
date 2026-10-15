@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #ifndef BOAROS_PAGE_CACHE_WRITEBACK_PAGES
-#define BOAROS_PAGE_CACHE_WRITEBACK_PAGES 1
+#define BOAROS_PAGE_CACHE_WRITEBACK_PAGES 8
 #endif
 #if BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 1 && BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 2 && \
     BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 4 && BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 8
@@ -168,14 +168,6 @@ void kernel_page_cache_write_end(struct kernel_page_cache_write_borrow *);
 enum kernel_page_cache_status kernel_page_cache_wait_writable(
     struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t index, uint64_t physical);
 
-/* Caller supplies stable kernel bytes and owns the file-operation lock.
- * 普通CPU0缓存的full-page miss不读旧内容；受控实例自行取得每页inode保护，
- * 当前先读入冷页，再通过写许可复制。Partial pages preserve their old contents.
- * Dirty pages remain owned until writeback or explicit discard; return zero
- * or a negative errno while retaining partial progress. */
-int kernel_page_cache_write(struct kernel_page_cache *cache,
-                             struct kernel_vfs_file *file, uint64_t offset,
-                             const void *buffer, size_t size, size_t *written);
 int kernel_page_cache_writeback(struct kernel_page_cache *cache,
                                  struct kernel_vfs_node *node);
 int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,

@@ -4,6 +4,7 @@
 #include <kernel/block.h>
 #include <kernel/heap.h>
 #include <kernel/read_source.h>
+#include <kernel/uaccess.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -256,6 +257,19 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
                       size_t size,
                       uint64_t *written_offset,
                       size_t *bytes_written);
+
+struct kernel_uaccess_iovec;
+struct kernel_vfs_user_write_result {
+    uint64_t end_offset;
+    size_t written, chunks;
+    enum kernel_uaccess_status access;
+};
+/* 调用者持file/MM/iovec owner，iovec已导入并完成区间校验；
+ * 保持整个请求写操作门，直接填入最终页。
+ * 用户fault保留已提交前缀，内部uaccess错误单独报告，不转换为磁盘I/O错误。 */
+int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
+    const struct kernel_uaccess_iovec *,size_t iov_count,size_t count,
+    uint64_t offset,int append,struct kernel_vfs_user_write_result *);
 
 int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
                          uint64_t size);

@@ -202,10 +202,7 @@ enum kernel_open_file_status __real_kernel_open_file_release(
     struct kernel_open_file_description **owner);
 uint64_t __real_riscv_sv39_current_satp(void);
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __real_ext4_fpwrite(ext4_file *file, uint64_t offset,
-                       const void *buffer,
-                       size_t size,
-                       size_t *bytes_written);
+int __real_ext4_fpwrite_batch(ext4_file *, struct ext4_file_write_span *, unsigned);
 int __real_ext4_ftruncate(ext4_file *file, uint64_t size);
 #endif
 
@@ -225,38 +222,26 @@ enum kernel_open_file_status __wrap_kernel_open_file_release(
 }
 
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __wrap_ext4_fpwrite(ext4_file *file, uint64_t offset,
-                       const void *buffer,
-                       size_t size,
-                       size_t *bytes_written)
+int __wrap_ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsigned count)
 {
-    size_t committed = 0U;
     int result;
-
     if (!inject_partial_write_error) {
-        result = __real_ext4_fpwrite(file, offset, buffer, size, bytes_written);
-        if (writeback_redirty_mm != 0 && result == EOK &&
-            bytes_written != 0 && *bytes_written == size) {
-            struct kernel_mm *mm = writeback_redirty_mm;
-            unsigned char value = 'O';
-            writeback_redirty_mm = 0;
-            writeback_redirty_seen++;
-            writeback_redirty_status = kernel_copy_to_user(
-                mm, writeback_redirty_address, &value, 1U,
-                &writeback_redirty_copied);
+        result=__real_ext4_fpwrite_batch(file,spans,count);
+        if (writeback_redirty_mm && !result) {
+            struct kernel_mm *mm=writeback_redirty_mm;
+            unsigned char value='O';
+            writeback_redirty_mm=0; writeback_redirty_seen++;
+            writeback_redirty_status=kernel_copy_to_user(mm,writeback_redirty_address,&value,1U,&writeback_redirty_copied);
         }
         return result;
     }
-    inject_partial_write_error = 0;
-    if (size < 5U) {
-        return __real_ext4_fpwrite(file, offset, buffer, size, bytes_written);
-    }
-
-    result = __real_ext4_fpwrite(file, offset, buffer, 5U, &committed);
-    if (bytes_written != 0) {
-        *bytes_written = committed;
-    }
-    return result == EOK && committed == 5U ? EIO : result;
+    inject_partial_write_error=0;
+    if (!count || spans[0].size<5U) return __real_ext4_fpwrite_batch(file,spans,count);
+    struct ext4_file_write_span prefix=spans[0]; prefix.size=5;
+    result=__real_ext4_fpwrite_batch(file,&prefix,1);
+    for (unsigned i=0;i<count;i++) spans[i].written=0;
+    spans[0].written=prefix.written;
+    return !result && prefix.written==5U ? EIO : result;
 }
 
 int __wrap_ext4_ftruncate(ext4_file *file, uint64_t size)

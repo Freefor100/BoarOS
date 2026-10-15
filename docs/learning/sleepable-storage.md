@@ -8,7 +8,7 @@
 - `references/linux/drivers/block/virtio_blk.c`、`fs/read_write.c`、`fs/file.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：FLUSH 缺失时的 write-through、定位/共享 offset 接口参考。
 - `references/riscv/riscv-privileged-20260120.pdf`，版本 20260120，SHA-256 `d0f818af6fa519d39e68f822aa795bff9f38032a2f352afdf43e91c0d480e408`：supervisor external interrupt 与本地地址空间契约。来源固定于 `references/sources.tsv`。
 
-本文前半记录 2026-09-28 单 hart 可睡眠 I/O 阶段；后台写回和多磁盘随后已交付，当前契约见 [VFS/ext4](../modules/vfs-ext4.md)。范围仍限 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、同实例并发写事务和事务合并尚未实现。
+本文前半记录 2026-09-28 单 hart 可睡眠 I/O 阶段；后台写回和多磁盘随后已交付，当前契约见 [VFS/ext4](../modules/vfs-ext4.md)。范围仍限 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、同实例并发私有写事务尚未实现；组提交与当前文件版本、SG、写回结构见上述模块。
 
 ## 所有权与失败路径
 
@@ -16,7 +16,7 @@
 
 VirtIO 使用最多 32 描述符、8 个在途槽。准备不发布 DMA；提交后槽的任务 owner、header/status、bounce 与描述符一直保留至确认完成。IRQ 只收割/ack/唤醒；队列满则等待。flush 阻止新提交、排空此前请求，再完成设备或软件屏障。timeout 先禁止提交并 reset，确认停止 DMA 后一次性完成失败请求；设备保持失败态。当前请求期限为30秒；超时不是应用执行预算。QEMU的FLUSH会同步宿主后备文件，包括启动前宿主复制留下的脏页，不能用一秒期限或预同步镜像冒充可靠性。统计的 max_inflight 计已发布且未确认完成的请求，不计仅预留槽。
 
-缓存同页 miss 合并为一个 loader，不同页并发；写回固定页快照和 dirty generation。writeback 选页数组在首次睡眠前逐项 pin，之后只释放原集合。inode 写锁排除 truncate/失效/orphan 最后 close 与 loading/writeback。用户复制在存储锁外；文件/ELF 缺页先 pin source 和 VMA generation，I/O 返回后验证版本与同地址 PTE，再发布。另一任务先完成同页缺页可满足本次请求。
+缓存同页 miss 合并为一个 loader，不同页并发；写回固定页快照和 dirty generation。writeback 选页数组在首次睡眠前逐项 pin，之后只释放原集合。inode 写锁排除 truncate/失效/orphan 最后 close 与 loading/writeback。用户来源的缺页解析和 pin 在 inode 数据锁及目标写借用之外，取得实际来源后直接填入最终文件页；文件/ELF 缺页先 pin source 和 VMA generation，I/O 返回后验证版本与同地址 PTE，再发布。另一任务先完成同页缺页可满足本次请求。
 
 lwext4 纯读使用局部游标 `ext4_fpread`；同块缓存 loading 合并，不同块可同时等待。事务记录任务 owner，只有同 owner 可嵌套；orphan、journal 生命周期、恢复和卸载也持独占 gate。持锁、堆与 MM 元数据分配只回收干净页；正常干净回收立即释放最后 node（`ext4_fclose` 仅清理内存）；只有未完成 orphan/真实失败保留 mount owner。脏回收在外层无锁处执行，真实耗尽返回 ENOMEM。
 
@@ -217,7 +217,7 @@ runnable时不会进入idle，设备IRQ得不到处理。GDB确认setup阻塞在
 
 2026-10-13共享FD/pipe组合的host总门禁另有一次`test-page-cache-concurrency-host`的30秒超时，最后可证实阶段为2线程真实冷读通过，尚未完成4线程阶段。该目标不链接FD/pipe实现；独立窄复核及原host总门禁完整复核随后通过，首轮原因仍未确认，原失败日志保留。这个结果不关闭此前16KiB宿主MM超时，也不以干净重跑补记原失败通过。 普通文件交接验证又出现16KiB缓存目标开始后的超时，以及4KiB磁盘MM目标在2线程冷读通过后的超时；均未取得失败时线程栈。独立GDB运行和最终两目标通过只增加成功证据，未完成这两次归因。
 
-尺寸以默认RA0/WB1、COST OFF的实际产物核对：entry216字节（256字节slab），
+本节记录当时RA0/WB1、COST OFF的产物尺寸：entry216字节（256字节slab），
 record728字节（原受控版本672字节，均为1024字节slab；最初普通版本480字节），
 alias64、resident128（仍128字节slab）、pin88、MM记录584（仍一页）、执行请求96字节、冷读参数48字节栈现场。
 inode440及ext4包装的512字节slab保持。SMP任务2784字节，仍一页metadata；CPU1968字节。
@@ -228,4 +228,4 @@ inode440及ext4包装的512字节slab保持。SMP任务2784字节，仍一页met
 固定语义依据为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
 `mm/filemap.c`的fault/page_mkwrite、`mm/rmap.c`的写权限回收、`mm/truncate.c`的
 截断与驻留页关系。BoarOS使用自己的gate/代次/entry借用协议；固定源码提供行为依据，
-不把Linux锁实现直接套成BoarOS所有权。实际后端为仓库固定lwext4，默认存储RA0/WB1保持。
+不把Linux锁实现直接套成BoarOS所有权。实际后端为仓库固定lwext4；本节测试使用当时的RA0/WB1配置，当前参数与版本交接见[VFS/ext4](../modules/vfs-ext4.md#当前成本边界)。

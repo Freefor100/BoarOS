@@ -250,7 +250,7 @@ def main():
                             f'foreground.{kind}_requested.value':int(requested),
                             f'foreground.{kind}_accepted.value':int(accepted)}
                         if kind in ('file','dgram'): expectations[name][f'foreground.{kind}_copy.value']=int(accepted)
-                        if kind=='file': expectations[name]['foreground.file_staging.value']=4096*int(calls) if int(requested) else 0
+                        if kind=='file': expectations[name]['foreground.file_staging.value']=0
                     elif line.startswith('COST RESULT '):
                         _,_,name,ns=line.split()
                         if name in timings: raise ValueError('duplicate timing')
@@ -279,6 +279,7 @@ def main():
                     required.update(f'file-sync-{method}-every-{interval}' for method in range(3) for interval in (1,16,128))
                     required.update(('dgram-64k','dgram-oversize','file-osync','file-odsync','file-random','file-extend-accept','file-extend-sync','file-fault-prefix','file-fault-first'))
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('missing/extra workload window')
+                    if not args.off and set(closing)!=required: raise ValueError('missing/extra write closing window')
                 if case=='locking':
                     validate_locking(timings,snapshots,not args.off)
                 if not args.off:

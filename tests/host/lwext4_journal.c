@@ -179,6 +179,10 @@ int main(int argc, char **argv)
         unsigned char data[1024];
         CHECK(ext4_blocks_get_direct(&dev, data, home, 1) == EOK);
         CHECK(data[0] == (unsigned char)atoi(argv[3]));
+        if (atoi(argv[3]) == 192) {
+            CHECK(!memcmp(data, "\xc0\x3b\x39\x98", 4));
+            for (unsigned i = 4; i < sizeof(data); i++) CHECK(data[i] == 'N');
+        }
         if (!strcmp(argv[2], "recover-metadata")) {
             CHECK(ext4_fs_get_inode_ref(dev.fs, file.inode, &inode) == EOK);
             CHECK((ext4_inode_get_mode(&dev.fs->sb, inode.inode) & 0777) == 0600);
@@ -259,6 +263,8 @@ int main(int argc, char **argv)
     struct ext4_block block;
     CHECK(ext4_block_get(&dev, &block, home) == EOK);
     memset(block.data, !strcmp(argv[2], "checksum3-two") && iteration ? 'S' : 'N', dev.lg_bsize);
+    bool escaped = strstr(argv[2], "escape") != NULL;
+    if (escaped) memcpy(block.data, "\xc0\x3b\x39\x98", 4);
     CHECK(jbd_trans_set_block_dirty(tx, &block) == EOK);
     CHECK(ext4_block_set(&dev, &block) == EOK);
     if (strstr(argv[2], "wide")) {
@@ -282,6 +288,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2], "error") && argc > 3) disk.fail_flush = disk.flushes + (uint64_t)atoi(argv[3]);
     if (!strcmp(argv[2], "write-error")) disk.fail_write = disk.writes + (uint64_t)atoi(argv[3]);
+    bool escape_error = escaped && argc > 3;
+    if (escape_error) disk.fail_write = disk.writes + (uint64_t)atoi(argv[3]);
     if (!strncmp(argv[2], "checksum3-revoke", 16))
         CHECK(jbd_trans_revoke_block(tx, home + 1) == EOK);
     uint32_t allocation_start = journal.last;
@@ -293,7 +301,7 @@ int main(int argc, char **argv)
         struct jbd_trans *retry = jbd_journal_new_trans(&journal);
         CHECK(retry != NULL);
         CHECK(jbd_journal_commit_trans(&journal, retry) == EOK);
-    } else if (!strcmp(argv[2], "error") || !strcmp(argv[2], "write-error")) {
+    } else if (!strcmp(argv[2], "error") || !strcmp(argv[2], "write-error") || escape_error) {
         CHECK(rc == EIO);
     } else {
         CHECK(rc == EOK);

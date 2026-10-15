@@ -424,25 +424,14 @@ static int pread_inode(struct kernel_vfs_node *n,uint64_t offset,void *buffer,si
     }
     return 0;
 }
-static int write_inode(struct kernel_vfs_node *n,uint64_t offset,const void *buffer,size_t size,size_t *written)
+static void memory_written(struct kernel_vfs_node *n,uint64_t end)
 {
-    struct tmp_mount *m=tm(n->instance); struct tmp_inode *i=ti(n); *written=0;
-    while(*written<size) {
-        uint64_t address; int created; size_t start=offset & BOAROS_PAGE_MASK;
-        size_t count=BOAROS_PAGE_SIZE-start; if(count>size-*written) count=size-*written;
-        enum kernel_memory_object_status r=kernel_memory_object_get_page(i->memory,offset>>BOAROS_PAGE_SHIFT,&address,&created);
-        if(r!=KERNEL_MEMORY_OBJECT_OK) return r==KERNEL_MEMORY_OBJECT_NO_SPACE ? -KERNEL_ENOSPC : -KERNEL_ENOMEM;
-        void *p; if(physical_page_resolve(m->instance.heap->page_allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-        memcpy((char *)p+start,(const char *)buffer+*written,count);
-        (void)physical_page_release(m->instance.heap->page_allocator,address);
-        *written+=count; offset+=count;
-        if(offset>i->size) i->size=offset;
-        n->size=i->size;
-        struct kernel_vfs_timespec time=now();
-        KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
-        i->ctime=i->mtime=time;
-    }
-    return 0;
+    struct tmp_inode *i=ti(n);
+    if(end>i->size) i->size=end;
+    n->size=i->size;
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->ctime=i->mtime=time;
 }
 static int set_times(struct kernel_vfs_file *f,const struct kernel_vfs_timespec t[2])
 {
@@ -551,7 +540,7 @@ static void initialize_ops(void)
     o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_regular; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
-    o->pread=pread_inode; o->memory_write=write_inode; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
+    o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->writeback_allowed=no_writeback;
     o->sync_metadata=sync_metadata; o->flush=error; o->unmount=unmount;
 }

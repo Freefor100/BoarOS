@@ -1,6 +1,7 @@
 /* 宿主只提供线程执行、时钟与未开放消费者；缓存/VFS/后端均链接生产代码。 */
 #include <kernel/scheduler.h>
 #include <kernel/cpu.h>
+#include "../../../mm/uaccess_internal.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -77,6 +78,14 @@ uint64_t kernel_task_current_stack_limit(void) { return 0; }
 #endif
 static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort(); }
 #define EXCLUDED(name) void name(void) { excluded(); }
+#if !defined(FILE_IO_CASES) && !defined(CACHE_MM_CASES)
+/* 此缓存fixture仅接纳内核来源；MM/uaccess组合由CACHE_MM_CASES链接真实实现。 */
+enum kernel_uaccess_status kernel_uaccess_pin_user_page(struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{ (void)mm; (void)address; (void)access; (void)pin; excluded(); return KERNEL_UACCESS_STATUS_STATE; }
+void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{ (void)pin; excluded(); }
+#endif
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)

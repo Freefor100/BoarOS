@@ -51,7 +51,7 @@ EXCLUDED(kernel_page_cache_retry_alias)
 EXCLUDED(kernel_page_cache_is_controlled)
 EXCLUDED(kernel_ext4_check_mapping_domain)
 
-EXCLUDED(kernel_page_cache_write)
+EXCLUDED(kernel_page_cache_write_source)
 
 EXCLUDED(kernel_page_cache_resize_prepare)
 EXCLUDED(kernel_page_cache_resize_finish)

@@ -216,7 +216,7 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 自然退出要求arena回到4079页、页/表/堆/任务栈/等待/请求/别名及挂载owner归还，
 根盘PID1与设备收口另核对；两盘e2fsck必须成功。OFF日志分列setup/业务/清理tick，
 缓存请求、peak pages、后台写入/延期和MM准备/退休计数；它们随交错变化，不是并行收益。
-默认RA0/WB1保持，SMP+COST继续拒绝；实际QEMU/OpenSBI身份由runner保存。
+存储配置见[VFS/ext4](vfs-ext4.md#当前成本边界)，SMP+COST继续拒绝；实际QEMU/OpenSBI身份由runner保存。
 接口、结构成本和竞态背景见[MM](kernel-mm.md#受控-ext4-文件映射)、
 [VFS](vfs-ext4.md#后台写回与水位回收)及[存储学习说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。
 

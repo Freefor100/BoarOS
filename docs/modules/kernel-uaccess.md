@@ -52,18 +52,20 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 pin防止已许可片段使用的页被撤映射后重新发放，不固定内容、权限或映射身份。
 普通逐页复制先归还当前片段再取下一个；显式自持同一MM pin的内部调用若gate忙或新许可关闭，返回`CONFLICT`，不得保留pin等待排空它的操作。冲突不发布新token，旧owner继续负责归还。
 CPU1只接受已绑定受控匿名、私有arena tmpfs或受控ext4映射记录的任务。磁盘冷页通过CPU0 worker取得，可写pin同时持有entry写入借用；快照关闭该页并撤W/确认RFENCE后，须等待这些借用归还。其他页继续复制。fault成功到pin之间若再次遇临时撤W，重新解析并复查VMA/EOF；真实撤权仍FAULT，冲突不忙等。mprotect返回前排空旧片段，fork排空旧写片段；撤映射/COW的旧owner等TLB确认后释放。一般文件/FD业务、未开放外部后备和普通用户跨核执行仍未开放，详见[MM并发边界](kernel-mm.md#匿名-mm-的并发与回收)。
-驻留页每个基页进行一次三级软件页表查询、物理页解析及acquire/release，增加一个固定大小栈token；随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
+驻留页每个基页进行一次三级软件页表查询、物理页解析及acquire/release，增加一个固定大小栈token；随后通过公共RAM `memcpy` 复制当前已pin片段。公共原语在源和目标同余对齐时使用 alias-safe 机器字与四字展开，首尾和不同对齐保留字节访问，严格限制在片段内；`memmove` 按实际重叠方向复制，清页/COW及heap清零/扩容复用相同RAM原语。它们不用于MMIO。首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。普通文件写使用同一 pin 解析器，从用户片段直接复制到最终页缓存或 tmpfs 页，详见[文件资源模块](kernel-files.md#请求暂存与成本)。文件读仍按持有的缓存页片段复制到用户。当前的页固定协议承担权限、COW、撤映射和真实引用寿命；硬件 SUM 加异常表需要另外实现这些保证，不能只替换复制指令。开发板吞吐、TLB miss 与 cache 开销尚未测量。
 
 COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
 及经过 ticks；解析失败、权限检查和字符串扫描不归入该复制样本。采样不改变已复制
-前缀。Lua 定点结果只归因这段复制，不能用它排除解析、缺页或全部内存成本；
-[工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)保留了字节实现与未上线宽字候选的比较。
+前缀。用户页解析次数只通过已有 `COST_USER_RESOLUTIONS` 记录，普通构建不维护每页全局原子计数。
+Lua 定点结果只归因当时的页内字节复制，不能用它排除解析、缺页或全部内存成本；
+[工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)保留历史字节实现与宽字候选的比较，不能作为当前实现的应用吞吐结果。
 
 QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异已由启动内存和页表建立隔离。LoongArch 已用同一策略和自己的 16 KiB/三级页表、用户范围验证真实 ELF 与跨页用户复制；见[首阶段范围](loongarch-boot.md)。
 
 ## 验证与限制
 
 ```sh
+make test-string-host
 make test-mm-pin-host test-mm-concurrency-host
 make test-mm-smp-riscv
 make test-uaccess-riscv

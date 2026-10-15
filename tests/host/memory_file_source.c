@@ -1,5 +1,6 @@
 #include "../../fs/open_file_internal.h"
 #include "../../fs/vfs_objects.h"
+#include "../../mm/uaccess_internal.h"
 #include <kernel/tmpfs.h>
 #include <kernel/memory_object.h>
 #include <kernel/file_mapping.h>
@@ -11,6 +12,12 @@
 #include <stdio.h>
 
 void mm_test_attach(unsigned);
+/* 此fixture只使用稳定内核来源，不替代实际MM/uaccess组合的用户复制。 */
+enum kernel_uaccess_status kernel_uaccess_pin_user_page(struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{ (void)mm; (void)address; (void)access; (void)pin; __builtin_trap(); }
+void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{ (void)pin; __builtin_trap(); }
 static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;

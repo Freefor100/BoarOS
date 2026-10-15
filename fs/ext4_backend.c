@@ -157,8 +157,8 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
                           void *buffer,
                           size_t size,
                           size_t *bytes_read);
-static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written);
+static int ext4_backend_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count);
 
 static struct kernel_vfs_backend ext4_backend;
 int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
@@ -1577,15 +1577,25 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     return lwext4_error(result);
 }
 
-static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written)
+static int ext4_backend_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count)
 {
-    COST_ADD(BACKEND_REQUESTED, size);
-    *written = 0;
-    int result = ext4_fpwrite(lwext4_node_file(node), offset, buffer, size, written);
-    if (result == EOK && *written != size) result = EIO;
-    if (result != EOK) kernel_vfs_record_writeback_error(node, lwext4_error(result));
-    COST_ADD(BACKEND_ACCEPTED, *written);
+    if (count > KERNEL_VFS_WRITEBACK_MAX) __builtin_trap();
+    struct ext4_file_write_span batch[KERNEL_VFS_WRITEBACK_MAX];
+    for (size_t i = 0; i < count; i++) {
+        COST_ADD(BACKEND_REQUESTED, spans[i].size);
+        batch[i] = (struct ext4_file_write_span){
+            .offset=spans[i].offset, .buffer=spans[i].buffer, .size=spans[i].size,
+            .source={.context=spans[i].owner, .retain=spans[i].retain,
+                .release=spans[i].release, .bytes=spans[i].source_bytes}};
+    }
+    int result = ext4_fpwrite_batch(lwext4_node_file(node), batch, count);
+    for (size_t i = 0; i < count; i++) {
+        spans[i].written = batch[i].written;
+        if (!result && spans[i].written != spans[i].size) result = EIO;
+        COST_ADD(BACKEND_ACCEPTED, spans[i].written);
+    }
+    if (result) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     return lwext4_error(result);
 }
 

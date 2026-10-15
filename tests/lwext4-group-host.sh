@@ -23,6 +23,9 @@ for block in 1024 4096; do
         e2fsck -fn "$work/namespace.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
     done
     cp "$work/base.img" "$work/bounds.img"
+    "$work/probe" "$work/bounds.img" group-log-payload
+    e2fsck -fn "$work/bounds.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    cp "$work/base.img" "$work/bounds.img"
     "$work/probe" "$work/bounds.img" group-bounds
     e2fsck -fn "$work/bounds.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
     cp "$work/base.img" "$work/pipeline.img"
@@ -37,6 +40,24 @@ for block in 1024 4096; do
     e2fsck -fn "$work/pipeline.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
     "$work/probe" "$work/disk.img" group
     e2fsck -fn "$work/disk.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    cp "$work/base.img" "$work/owner.img"
+    "$work/probe" "$work/owner.img" group-data-owner
+    e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    cp "$work/base.img" "$work/owner.img"
+    "$work/probe" "$work/owner.img" group-data-batch
+    e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    for mode in group-source-budget group-source-error; do
+        cp "$work/base.img" "$work/owner.img"
+        "$work/probe" "$work/owner.img" "$mode"
+        "$work/probe" "$work/owner.img" group-recovery
+        e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
+    for fault in write flush; do
+        cp "$work/base.img" "$work/owner.img"
+        "$work/probe" "$work/owner.img" "group-data-$fault-error"
+        "$work/probe" "$work/owner.img" group-recovery
+        e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
     if [ "$block" = 4096 ]; then
         cp "$work/base.img" "$work/space.img"
         "$work/probe" "$work/space.img" group-space

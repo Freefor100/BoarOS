@@ -44,7 +44,19 @@ extern "C" {
 #include <ext4_bcache.h>
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+/* Immutable RAM supplied by a caller. Context identifies one stable owner;
+ * callbacks and its entire retained allocation size stay fixed while borrowed.
+ * A journal retains/charges that owner once across all blocks and transactions.
+ * Empty sources have no callbacks and bytes=0. */
+struct ext4_data_source {
+	void *context;
+	void (*retain)(void *context);
+	void (*release)(void *context);
+	size_t bytes;
+};
 
 #define EXT4_BLOCK_BATCH_MAX 8U
 #define EXT4_CACHED_READ_BATCH 1
@@ -250,6 +262,10 @@ int ext4_block_set(struct ext4_blockdev *bdev, struct ext4_block *b);
  * @param   buf output buffer
  * @param   lba logical block address
  * @return  standard error code*/
+/* Physical-sector reads into caller destinations, without allocating cache blocks. */
+int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
+	struct ext4_block_read_span *spans, unsigned count);
+
 int ext4_blocks_get_direct(struct ext4_blockdev *bdev, void *buf, uint64_t lba,
 			   uint32_t cnt);
 

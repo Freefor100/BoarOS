@@ -142,8 +142,8 @@ static int rearm_alias(void *owner, uint64_t address)
     __atomic_fetch_add(&rearms,1,__ATOMIC_RELEASE);
     return 0;
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,uint64_t,const void *,size_t,size_t *);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,uint64_t offset,const void *data,size_t size,size_t *written)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct kernel_vfs_writeback_span *,size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct kernel_vfs_writeback_span *spans,size_t count)
 {
     if (__atomic_exchange_n(&pause_write,0,__ATOMIC_ACQ_REL)) {
         __atomic_store_n(&write_entered,1,__ATOMIC_RELEASE);
@@ -151,15 +151,17 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,uint64_t offse
     }
     unsigned fault=__atomic_exchange_n(&write_error,0,__ATOMIC_ACQ_REL);
     if (fault) {
-        *written=0;
-        if (fault==2 && size>1) {
-            int result=__real_kernel_vfs_node_writeback(node,offset,data,size/2,written);
-            assert(!result && *written==size/2);
+        for (size_t i=0;i<count;i++) spans[i].written=0;
+        if (fault==2 && count && spans[0].size>1) {
+            struct kernel_vfs_writeback_span prefix=spans[0]; prefix.size/=2;
+            int result=__real_kernel_vfs_node_writeback(node,&prefix,1);
+            assert(!result && prefix.written==prefix.size);
+            spans[0].written=prefix.written;
         }
         kernel_vfs_record_writeback_error(node,-KERNEL_EIO);
         return fault==2?0:-KERNEL_EIO;
     }
-    return __real_kernel_vfs_node_writeback(node,offset,data,size,written);
+    return __real_kernel_vfs_node_writeback(node,spans,count);
 }
 static void *sync_file(void *arg)
 {

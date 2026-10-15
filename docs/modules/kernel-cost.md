@@ -10,6 +10,11 @@
 在途深度及控制抑制状态（当前标量 48 字节，加内嵌 backend guard 的 16 字节，共 64 字节），原任务元数据页容量断言继续生效。
 热路径不分配、不打印、不睡眠；原始 CSR SIE save/restore 保护聚合，不走被观测的锁。
 
+普通构建也不再为诊断单独读取设备服务时间、在途积分和发布阶段时钟；VirtIO 只保留
+完成请求、字节、队列占用等运行统计，以及真实期限所需的时钟。详细时长由同一
+`BOAROS_COST_DIAGNOSTICS` 开关启用。用户页解析复用 COST 计数，删除了每个解析
+片段都更新的独立全局原子计数；关闭诊断后不保留这项探针。
+
 仅观测版本提供 `/proc/boaros_cost_control`（完整 `begin\n`、`end\n`）及只读
 `/proc/boaros_cost`。开始在用户返回时激活，结束在用户返回时完成；控制 fd 的完整
 read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数。重复开始 EBUSY，
@@ -17,7 +22,7 @@ read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数�
 控制组退出中止窗口并标 incomplete。完整用户复制先于控制发布，坏指针 EFAULT。
 控制节点使用同 OFD offset 串行机制，但完整命令不受当前 offset 限制。
 
-consumer 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
+consumer 和 write 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
 结束时先记录 `COST RESULT` 的时间边界；`end` 返回 EBUSY 时在用户态有界等待重试，
 最多十秒，并另报 `COST CLOSING name ns retries`。关闭等待属于快照覆盖区间，
 不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。其他受控
@@ -76,7 +81,8 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 不能把 heap 字节、物理页及 staging 引用容量相加当驻留峰值。
 缓存计 bucket probes、实际复制、范围写回候选访问、实际脏区间快照与逻辑后端接受量。旧两轮全页链与整页快照的历史值保持原解释，当前算法访问较小的候选集合。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
-使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
+使用提交身份，旧请求不能污染新窗口。fixture 未登记设备属于 other；设备详细计时只在
+观测构建产生，用户页解析由 `COST_USER_RESOLUTIONS` 统一记录。
 封口事务的提交路径按 ordered data、journal、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。

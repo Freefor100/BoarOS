@@ -1046,7 +1046,7 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=physical_page_allocate_order \
 		-Wl,--wrap=riscv_sv39_current_satp \
-		-Wl,--wrap=ext4_fpwrite \
+		-Wl,--wrap=ext4_fpwrite_batch \
 		-Wl,--wrap=ext4_ftruncate \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-partial-write-rv.map \
 		-o $@ $(FILES_PARTIAL_WRITE_TEST_OBJECTS)
@@ -1799,7 +1799,7 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
-		-Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback \
+		-Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback \
 		-Wl,--wrap=kernel_wait_queue_wake_all \
 		-Wl,--wrap=netif_poll_all -Wl,--wrap=sys_check_timeouts -Wl,--wrap=sys_now \
 		-Wl,--wrap=netif_poll_budget -Wl,--wrap=sys_check_timeouts_budget \
@@ -1811,7 +1811,7 @@ test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
 IO_SLEEP_OBJECTS := $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/io_sleep_main.o
 -include $(BUILD_DIR)/tests/riscv/io_sleep_main.d
 $(BUILD_DIR)/tests/kernel-io-sleep-rv: $(IO_SLEEP_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback -Wl,--wrap=kernel_open_file_sync_range -Wl,--wrap=kernel_open_file_release -Wl,--wrap=riscv_sv39_current_satp -Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_copy_to_user -Wl,--wrap=kernel_task_current -Wl,--wrap=kernel_vfs_node_lock -Wl,--wrap=kernel_open_file_get_page -o $@ $(IO_SLEEP_OBJECTS)
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback -Wl,--wrap=kernel_open_file_sync_range -Wl,--wrap=kernel_open_file_release -Wl,--wrap=riscv_sv39_current_satp -Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_copy_to_user -Wl,--wrap=kernel_task_current -Wl,--wrap=kernel_vfs_node_lock -Wl,--wrap=kernel_open_file_get_page -Wl,--wrap=kernel_uaccess_pin_user_page -o $@ $(IO_SLEEP_OBJECTS)
 .PHONY: test-io-sleep-riscv
 test-io-sleep-riscv: $(BUILD_DIR)/tests/kernel-io-sleep-rv build/host/nbd-fault
 	python3 tests/io-sleep-riscv.py --kernel $< --qemu $(QEMU_RISCV64)

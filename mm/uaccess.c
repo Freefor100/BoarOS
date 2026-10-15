@@ -5,13 +5,11 @@
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/uaccess.h>
+#include "uaccess_internal.h"
 
 #include <stddef.h>
 #include <stdint.h>
-
-static uint64_t page_resolutions;
-uint64_t kernel_uaccess_page_resolutions(void)
-{ return __atomic_load_n(&page_resolutions, __ATOMIC_RELAXED); }
+#include <string.h>
 
 enum kernel_uaccess_status kernel_user_range_check(
     uint64_t user_address,
@@ -29,11 +27,10 @@ enum kernel_uaccess_status kernel_user_range_check(
 }
 
 /* 每个基页片段持有实际物理owner；fault可能睡眠，成功后重新pin。 */
-static enum kernel_uaccess_status resolve_user_page(
+enum kernel_uaccess_status kernel_uaccess_pin_user_page(
     struct kernel_mm *mm, uint64_t address, uint32_t access,
     struct kernel_mm_user_pin *pin)
 {
-    __atomic_fetch_add(&page_resolutions, 1, __ATOMIC_RELAXED);
     COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
     enum kernel_mm_status status = kernel_mm_pin_user_page(mm, address, access, pin);
     while (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
@@ -80,13 +77,12 @@ enum kernel_uaccess_status kernel_copy_to_user(
         uint64_t current = user_destination + (uint64_t)copied;
         size_t offset = (size_t)(current & BOAROS_PAGE_MASK);
         size_t chunk = (size_t)BOAROS_PAGE_SIZE - offset;
-        size_t index;
         enum kernel_uaccess_status status;
 
         if (chunk > size - copied) {
             chunk = size - copied;
         }
-        status = resolve_user_page(mm,
+        status = kernel_uaccess_pin_user_page(mm,
                                    current,
                                    KERNEL_MM_WRITE,
                                    &pin);
@@ -99,9 +95,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
         uint64_t memory_start = kernel_cost_clock();
 #endif
         page = pin.page;
-        for (index = 0U; index < chunk; index++) {
-            page[offset + index] = source[copied + index];
-        }
+        memcpy(page + offset, source + copied, chunk);
 #if BOAROS_COST_DIAGNOSTICS
         uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
@@ -146,13 +140,12 @@ enum kernel_uaccess_status kernel_copy_from_user(
         uint64_t current = user_source + (uint64_t)copied;
         size_t offset = (size_t)(current & BOAROS_PAGE_MASK);
         size_t chunk = (size_t)BOAROS_PAGE_SIZE - offset;
-        size_t index;
         enum kernel_uaccess_status status;
 
         if (chunk > size - copied) {
             chunk = size - copied;
         }
-        status = resolve_user_page(mm,
+        status = kernel_uaccess_pin_user_page(mm,
                                    current,
                                    KERNEL_MM_READ,
                                    &pin);
@@ -165,9 +158,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
         uint64_t memory_start = kernel_cost_clock();
 #endif
         page = pin.page;
-        for (index = 0U; index < chunk; index++) {
-            destination[copied + index] = page[offset + index];
-        }
+        memcpy(destination + copied, page + offset, chunk);
 #if BOAROS_COST_DIAGNOSTICS
         uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
@@ -197,7 +188,7 @@ enum kernel_uaccess_status kernel_user_cmpxchg_u32(
         kernel_user_range_check(user_address, sizeof(uint32_t)) !=
             KERNEL_UACCESS_STATUS_OK)
         return KERNEL_UACCESS_STATUS_FAULT;
-    status = resolve_user_page(mm, user_address, KERNEL_MM_WRITE, &pin);
+    status = kernel_uaccess_pin_user_page(mm, user_address, KERNEL_MM_WRITE, &pin);
     if (status != KERNEL_UACCESS_STATUS_OK) return status;
     page = pin.page;
     (void)__atomic_compare_exchange_n(
@@ -247,7 +238,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         if ((uint64_t)chunk > ARCH_MMU_USER_LIMIT - current) {
             chunk = (size_t)(ARCH_MMU_USER_LIMIT - current);
         }
-        status = resolve_user_page(mm,
+        status = kernel_uaccess_pin_user_page(mm,
                                    current,
                                    KERNEL_MM_READ,
                                    &pin);

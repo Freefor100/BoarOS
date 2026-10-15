@@ -140,7 +140,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 `write` 与 `writev` 支持 console、pipe 以及具备写权限（`O_WRONLY/O_RDWR`）的常规文件：
 - 生产 console 经 [TTY](kernel-tty.md) 接受有界 TX、OPOST 和真实输入；不自动建立 ctty。未发布 serial transport 的裸 console fixture 经 kernel_console_putc/原输入暂存。用户 fault、短计数和阻塞 pin 保持所属请求的真实 owner。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
-- regular 文件的 `kernel_vfs_pwrite/append()` 将已复制字节接收到共享 inode 页缓存；部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
+- regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
 - `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的位置。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
 - `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
@@ -297,9 +297,11 @@ fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原ino
 
 ## 请求暂存与成本
 
-普通文件与 TCP 写入按需分配一个 4 KiB 请求页，通过当前任务登记覆盖等待与退出；pipe 保持自己的 ring 协议，console 保持小块暂存。缓冲分配失败返回 ENOMEM；有效用户复制前缀仍只按后端已接受字节推进 offset，O_APPEND、定位写与同步错误观察规则不变。AF_UNIX DGRAM 使用有界整包缓冲而非页分块提交，任务登记临时发送 owner；socket 请求 owner 见网络模块。
+普通文件写入直接填入最终页，用户页、iovec 与目标页边界决定每个复制片段；普通单 hart 路径用一个完整片段覆盖冷页时无需先读旧数据。来源缺页在 inode 数据锁和目标写借用之外处理，随后固定来源并提交目标；同物理页的重叠片段使用 `memmove`，旧 EOF 后的空隙在来源复制后清零。tmpfs 与磁盘页缓存共用这一来源协议，tmpfs 后端只提交尺寸和时间元数据。
 
-`kernel_files_statistics.write_chunks` 记录普通文件/TCP 的用户复制分块，`read_chunks` 包括 socket 的暂存复制；页解析与 TCP 协议提交有独立计数。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入不超过 512 分块和 512 次用户页解析，并检查内容与暂存页 OOM。当前值均为 256；它是结构成本，不是吞吐倍数。
+TCP 写入仍按需分配一个 4 KiB 请求页，通过当前任务登记覆盖等待与退出；pipe 保持自己的 ring 协议，console 保持小块暂存。有效用户复制前缀只按目标已接受字节推进 offset，O_APPEND、定位写与同步错误观察规则不变。AF_UNIX DGRAM 使用有界整包缓冲，任务登记临时发送 owner；socket 请求 owner 见网络模块。
+
+`kernel_files_statistics.write_chunks` 记录普通文件/TCP 的实际用户复制片段，`read_chunks` 包括 socket 的暂存复制。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入的内容、部分失败和页解析；当前为 256 个片段、256 次用户页解析、1 MiB 用户复制、0 字节页缓存额外复制。页解析使用已有 COST 指标，普通构建不再更新独立的全局原子计数。这些数值描述复制量与工作次数，不代表吞吐倍数。
 
 ## 验证与限制
 
@@ -348,7 +350,7 @@ make test-riscv
 
 共享 OFD 的普通读写、seek 和目录游标受 offset mutex 保护；定位 I/O 不取得 offset 锁。调用在可能等待前 pin OFD，元数据与目录操作同样适用；路径起点获得独立 path 引用，不借用可能被 close/chdir 替换的对象。open 先预留 fd，再执行可睡眠解析/创建；失败取消预留，fork 不复制未安装槽，dup3 对正在预留的目标返回 EBUSY。dup 替换在安装新 OFD 前不执行会睡眠的最后释放。延后清理链先摘下本轮集合，再执行可能等待的关闭并重新挂入仍有真实 owner 的失败项，避免并发 drain 覆盖新项。
 
-文件写先完成请求缓冲的用户复制，再进入 inode/后端锁；读持引用取得数据，解除存储锁后复制到用户。与用户缺页重入、共享 offset、close 后 fd 复用相关的门禁为 files、partial-write、真实 userland 和差分测试。
+普通文件写在 inode 数据锁和目标页写借用之外解析、固定来源用户页，再取得目标资格并直接复制；来源可以是同一 inode 的尚未驻留映射，不会持目标锁重入文件缺页。读持引用取得数据，解除存储锁后复制到用户。files、partial-write、file-io-concurrency 与真实 userland 测试检查缺页重入、共享 offset、close 后 fd 复用及部分复制。
 
 ## 节点创建
 
@@ -367,9 +369,9 @@ AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记�
 共享；同 OFD 的 dup/fork 共享规则不变。tmpfs read/readv/pread 用无分配空洞读路径，
 只有 mmap 缺页或实际写入才消耗后备页配额。
 
-普通文件整次 write/writev/pwrite 在有界 staging 循环外取得 inode 操作门闩（rank 15），直到同步写收尾返回才释放；非定位写先取得共享 OFD offset 锁（rank 10）。truncate 与直接 VFS pwrite/append 走同一门闩，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在块间复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-userland-riscv` 补实际同 inode 未驻留映射缓冲和多页向量追加。
+普通文件整次 write/writev/pwrite 在用户 iovec 与页面片段循环外取得 inode 写操作锁（rank 15），直到同步写收尾返回才释放；非定位写先取得共享 OFD offset 锁（rank 10）。truncate 与直接 VFS pwrite/append 走同一写操作锁，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-file-io-concurrency-host` 检查同 inode 未驻留映射来源、双向重叠和旧 EOF 尾部来源，`make test-userland-riscv` 补真实系统调用。
 
-成本诊断版本记录真实请求/接受和 staging/usercopy，保持短写及同步尾部错误的原行为；接口与单位见[成本观测](kernel-cost.md)。
+成本诊断版本记录真实请求、接受量、用户复制及仍有实际使用者的暂存容量；普通文件写入的暂存量为零。短写及同步尾部错误沿原语义处理；接口与单位见[成本观测](kernel-cost.md)。
 
 ## 仅读RTC与OFD设备资格
 

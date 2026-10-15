@@ -46,7 +46,7 @@ int main(int argc,char **argv)
     for(unsigned i=0;i<8;i++)spans[i]=(struct ext4_file_read_span){i*4096,out[i],4096,0,0};
     clear(&dev);CHECK(read_batch(&file,spans,8)==EOK);
     printf("file batch blocksize=%u width=%u batches=%u\n",dev.lg_bsize,width,batches);
-    CHECK(width== (dev.lg_bsize>4096 ? 32768/dev.lg_bsize:8));
+    CHECK(width==8);
     for(unsigned i=0;i<8;i++){CHECK(!spans[i].error && spans[i].completed==4096);for(unsigned j=0;j<4096;j++)CHECK(out[i][j]==expected(i*4096+j));}
     /* Mixed holes, EOF and unaligned fragments preserve independent results. */
     const uint64_t offsets[8]={32761,32768,40000,49150,65530,65536+123,4093,131072};

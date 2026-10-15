@@ -24,6 +24,38 @@ void mm_test_unavailable(void) { fputs("excluded business path reached\n", stder
 static void *page_access(uint64_t address) { return (void *)(uintptr_t)address; }
 static int page_address(const void *pointer, uint64_t *address)
 { *address = (uintptr_t)pointer; return 1; }
+static void copy_fragments(struct kernel_mm *mm, uint64_t address)
+{
+    unsigned char source[BOAROS_PAGE_SIZE + 64] __attribute__((aligned(16)));
+    unsigned char destination[BOAROS_PAGE_SIZE + 64] __attribute__((aligned(16)));
+    for (size_t i = 0; i < sizeof(source); i++) source[i] = (unsigned char)(i * 29 + i / 251);
+    for (size_t from = 0; from < 16; from++) for (size_t to = 0; to < 16; to++) {
+        size_t size = BOAROS_PAGE_SIZE - to, copied;
+        assert(kernel_copy_to_user(mm, address + to, source + from, size, &copied) == 0 && copied == size);
+        memset(destination, 0x95, sizeof(destination));
+        size_t start = 15 - from;
+        assert(kernel_copy_from_user(mm, destination + start, address + to, size, &copied) == 0 && copied == size);
+        assert(!memcmp(destination + start, source + from, size));
+        for (size_t i = 0; i < start; i++) assert(destination[i] == 0x95);
+        for (size_t i = start + size; i < sizeof(destination); i++) assert(destination[i] == 0x95);
+    }
+    const size_t prefixes[] = {0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65,
+        BOAROS_PAGE_SIZE - 1, BOAROS_PAGE_SIZE};
+    for (unsigned p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
+        for (size_t offset = 0; offset < 16; offset++) {
+            size_t prefix = prefixes[p], copied;
+            uint64_t start = address + BOAROS_PAGE_SIZE - prefix;
+            assert(kernel_copy_to_user(mm, start, source + offset, prefix + 37, &copied) ==
+                KERNEL_UACCESS_STATUS_FAULT && copied == prefix);
+            memset(destination, 0x95, sizeof(destination));
+            assert(kernel_copy_from_user(mm, destination + offset, start, prefix + 37, &copied) ==
+                KERNEL_UACCESS_STATUS_FAULT && copied == prefix);
+            assert(!memcmp(destination + offset, source + offset, prefix));
+            for (size_t i = 0; i < offset; i++) assert(destination[i] == 0x95);
+            for (size_t i = offset + prefix; i < sizeof(destination); i++) assert(destination[i] == 0x95);
+        }
+    }
+}
 static void fatal_pins(struct kernel_mm *mm, uint64_t address)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
@@ -77,6 +109,7 @@ int main(void)
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address) == 0);
     /* 构造resident页，准备完成后测试lookup到复制结束的物理owner。 */
     assert(kernel_mm_resolve_user_fault(&mm, address, KERNEL_MM_WRITE) == 0);
+    copy_fragments(&mm, address);
     unsigned char source[4] = {1, 2, 3, 4}, destination[4] = {0}; size_t copied;
     assert(kernel_copy_to_user(&mm, address + BOAROS_PAGE_SIZE - 2,
         source, sizeof(source), &copied) == KERNEL_UACCESS_STATUS_FAULT && copied == 2);

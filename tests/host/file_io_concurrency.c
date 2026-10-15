@@ -8,6 +8,7 @@
 #include <kernel/block.h>
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
+#include <kernel/file_mapping.h>
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
 #include "../../fs/vfs_internal.h"
@@ -186,6 +187,26 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
 }
 static void bind(unsigned id)
 { mm_test_attach(id); mm_test_bind(&mm); mm_test_bind_files(&files); mm_test_context=context; }
+static void mapped_source_write(void)
+{
+    int64_t result; size_t copied;
+    unsigned char bytes[68];
+    assert(kernel_open_file_size(control)==68);
+    /* 首次读取尚未驻留的同文件映射；fault期间目标没有inode锁或写借用。 */
+    assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping,8,4,&result) && result==8);
+    assert(!kernel_copy_from_user(&mm,bytes,shared_mapping,12,&copied) && copied==12 &&
+        !memcmp(bytes,"origoriginal",12));
+    assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping+4,8,0,&result) && result==8);
+    assert(!kernel_copy_from_user(&mm,bytes,shared_mapping,8,&copied) && copied==8 &&
+        !memcmp(bytes,"original",8));
+    /* 来源位于旧EOF尾部：先复制，再清新洞，不能把来源先归零。 */
+    assert(!kernel_copy_to_user(&mm,shared_mapping+96,"fromtail",8,&copied) && copied==8);
+    assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping+96,8,128,&result) && result==8 &&
+        kernel_open_file_size(control)==136);
+    assert(!kernel_copy_from_user(&mm,bytes,shared_mapping+68,sizeof(bytes),&copied) && copied==sizeof(bytes));
+    if (control->io_domain==2) for (size_t i=0;i<60;i++) assert(!bytes[i]);
+    assert(!memcmp(bytes+60,"fromtail",8));
+}
 static void *read_and_write(void *unused)
 {
     (void)unused; bind(1);
@@ -221,6 +242,7 @@ static void *read_and_write(void *unused)
     assert(!kernel_files_pwrite(&files,&mm,0,0x100000+BOAROS_PAGE_SIZE-4,8,64,&result) && result==4);
     assert(!kernel_mm_mprotect(&mm,0x100000+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
     assert(!kernel_copy_from_user(&mm,&sentinel,0x100000+BOAROS_PAGE_SIZE,1,&copied) && copied==1 && sentinel==0xa5);
+    mapped_source_write();
     assert(kernel_files_syncfs(&files,0,&result)==KERNEL_FILES_STATUS_STATE);
     assert(kernel_files_statx(&files,&fs,&mm,0,0,KERNEL_FILES_AT_EMPTY_PATH,0x7ff,0x100100,&result)==
         KERNEL_FILES_STATUS_STATE);
@@ -246,12 +268,6 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     uint64_t observed=0;
     assert(!kernel_vfs_sync(&control->file,0,&observed));
     shared_mapping=0;
-    if (!cache) {
-        struct kernel_open_file_description *source=control;
-        assert(!kernel_open_file_acquire(source));
-        assert(!kernel_mm_mmap_file_private(&mm,&source,0x400000,BOAROS_PAGE_SIZE,0,
-            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED_NOREPLACE,&shared_mapping) && !source);
-    }
     if (cache) {
         uint64_t address;
         assert(!kernel_mm_munmap(&mm,0x100000,2*BOAROS_PAGE_SIZE));
@@ -263,6 +279,11 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
         assert(!kernel_page_cache_invalidate_node(cache,kernel_open_file_node(control)));
         assert(!kernel_page_cache_start_worker(cache));
     }
+    struct kernel_open_file_description *source=control;
+    assert(!kernel_open_file_acquire(source));
+    assert(!kernel_file_mapping_prepare(kernel_open_file_node(control)));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x400000,BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED_NOREPLACE,&shared_mapping) && !source);
     assert(!kernel_files_create(&files,heap));
     struct kernel_open_file_description *slot=control;
     assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot));
@@ -281,11 +302,11 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     if (cache) {
         struct kernel_page_cache_concurrency_state state;
         kernel_page_cache_get_concurrency_state(cache,&state);
-        assert(state.executions_queued==10 && state.executions_completed==10 && !state.pending && !state.running);
+        assert(state.executions_queued>=10 && state.executions_completed==state.executions_queued && !state.pending && !state.running);
     }
     char bytes[8];
     assert(!kernel_open_file_pread(control,32,bytes,8,&done) && done==8 && !memcmp(bytes,"original",8));
-    assert(!kernel_open_file_pread(control,64,bytes,8,&done) && done==4 && !memcmp(bytes,"orig",4));
+    assert(!kernel_open_file_pread(control,64,bytes,4,&done) && done==4 && !memcmp(bytes,"orig",4));
     assert(!kernel_open_file_release(&control));
     if (cache) kernel_page_cache_stop_worker(cache);
     puts(cache?"PASS cross-CPU ext4 file I/O, shared offset, positioned prefix and CPU0 final owner":

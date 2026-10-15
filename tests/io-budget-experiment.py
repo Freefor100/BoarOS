@@ -48,7 +48,7 @@ def profile(name):
     read, write = map(int, match.groups())
     return dict(name=name, readahead_pages=read, writeback_pages=write,
                 page_bytes=4096, readahead_pages_bytes=read * 4096,
-                writeback_pages_bytes=write * 4096, production_default=read == 0 and write == 1,
+                writeback_pages_bytes=write * 4096, production_default=read == 0 and write == 8,
                 scope='Compile-parameter arithmetic, not measured allocation or a guaranteed device batch size')
 
 
