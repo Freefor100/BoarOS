@@ -13,7 +13,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 PAGES = 16
 LENGTH = 20 * 4096 + 123
-PHASES = ('read', 'pread', 'hot', 'readv', 'unaligned', 'mixed', 'eof', 'at-eof',
+PHASES = ('single-read', 'single-pread', 'single-hot',
+          'read', 'pread', 'hot', 'readv', 'unaligned', 'mixed', 'eof', 'at-eof',
           'efault-prefix', 'efault-first', 'eio-prefix', 'eio-first', 'eio-gap', 'retry', 'held-owner', 'hole')
 
 
@@ -72,15 +73,18 @@ def verify_requests(phase, requests, maps, block_size):
         if actual - allowed or sum(actual.values()) > 8 * 4096 // 512:
             raise RuntimeError(f'{phase}: I/O continued past the first failing user-copy window: {requests}')
         return
-    pages = (range(17) if phase == 'unaligned' else
+    pages = ((2,) if phase == 'single-read' else (3,) if phase == 'single-pread' else
+             range(17) if phase == 'unaligned' else
              [i for i in range(PAGES) if i not in (1, 4, 7, 10, 13)] if phase == 'mixed' else
-             (19, 20) if phase == 'eof' else () if phase in ('hot', 'at-eof') else
+             (19, 20) if phase == 'eof' else () if phase in ('single-hot', 'hot', 'at-eof') else
              (0, 1, 2, 3, 5, 6, 7) if phase == 'eio-gap' else
              range(8) if phase == 'eio-first' else range(PAGES))
     expected = sectors(maps['hole' if phase == 'hole' else 'data'], block_size, pages)
     if actual != expected:
         raise RuntimeError(f'{phase}: data READ coverage differs: {requests}; missing={expected - actual}, extra={actual - expected}')
     sizes = [request['size'] for request in requests]
+    if phase in ('single-read', 'single-pread') and sizes != [4096]:
+        raise RuntimeError(f'{phase}: a single-page demand did not issue one 4KiB READ: {requests}')
     if phase in ('read', 'pread', 'readv', 'retry', 'eio-prefix', 'held-owner') and sizes != [32768, 32768]:
         raise RuntimeError(f'{phase}: ordinary 64KiB read did not form two 32KiB SG requests: {requests}')
     if phase == 'eio-first' and sizes != [32768]:

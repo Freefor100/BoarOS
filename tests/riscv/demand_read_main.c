@@ -228,6 +228,16 @@ static void exercise(void *unused)
           KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK && address == USER, 52);
     check(kernel_vfs_start_journal_worker(&mount) == 0 && kernel_page_cache_start_worker(&cache) == 0, 53);
     open_file("/data"); cold();
+    seek(2U * 4096U); begin("single-read");
+    check(read(BUFFER, 4096) == 4096, 81);
+    position(3U * 4096U); verify(BUFFER, 2U * 4096U, 4096, 0); end("single-read");
+    cold(); seek(37); begin("single-pread");
+    check(pread(BUFFER, 4096, 3U * 4096U) == 4096, 82);
+    position(37); verify(BUFFER, 3U * 4096U, 4096, 0); end("single-pread");
+    seek(3U * 4096U); begin("single-hot");
+    check(read(BUFFER, 4096) == 4096, 83);
+    position(4U * 4096U); verify(BUFFER, 3U * 4096U, 4096, 0); end("single-hot");
+    cold(); seek(0);
     begin("read");
     check(read(BUFFER, REQUEST) == REQUEST, 60); position(REQUEST); verify(BUFFER, 0, REQUEST, 0);
     end("read");

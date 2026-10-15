@@ -44,6 +44,9 @@ static struct kernel_page_cache *current_cache;
 static struct kernel_vfs_file *current_file;
 struct read_operation_counts {
     uint64_t metadata_locks, inode_locks, physical_acquires, physical_releases;
+#ifndef CACHE_MM_CASES
+    uint64_t cache_allocations;
+#endif
 };
 static struct kernel_rwlock *cache_metadata_lock;
 static _Thread_local unsigned observe_cache_metadata;
@@ -199,6 +202,12 @@ enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t count,
     size_t size, void **out)
 {
+    if (read_counts && current_cache && heap == current_cache->heap) {
+        /* inode资格已经阻止分配等待回收I/O，不再套一次相同用途的计数。 */
+        assert(kernel_lock_held(&kernel_vfs_file_node(current_file)->io_lock, 0));
+        assert(!kernel_io_context_current()->allocation_depth);
+        read_counts->cache_allocations++;
+    }
     if (fail_cache_entry && current_cache && heap == current_cache->heap && !--fail_cache_entry)
         return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate_zeroed(heap, count, size, out);
@@ -449,6 +458,8 @@ static void *read_demand_batch(void *arg)
 {
     struct demand_read *read = arg;
     mm_test_attach(read->cpu);
+    /* 结果必须由本次调用完整填写，错误页不能沿用旧地址或字节数。 */
+    memset(read->pages, 0xa5, sizeof(read->pages));
     read->status = kernel_page_cache_get_batch(current_cache, current_file,
         read->first, read->pages, read->count);
     __atomic_store_n(&read->done, 1, __ATOMIC_RELEASE);
@@ -505,6 +516,7 @@ struct counted_demand {
 static void count_demand_read(struct counted_demand *read)
 {
     struct demand_read result = {.count = read->count};
+    memset(result.pages, 0xa5, sizeof(result.pages));
     read_inode_lock = &kernel_vfs_file_node(current_file)->io_lock;
     read_allocator = current_cache->allocator;
     read_counts = &read->counts;
@@ -554,6 +566,9 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
             assert(source_batches == !warm && source_reads == (warm ? 0 : count));
             assert(read.counts.physical_acquires == (warm || !remote ? count : 0) &&
                 read.counts.physical_releases == count);
+#ifndef CACHE_MM_CASES
+            assert(read.counts.cache_allocations == (remote || warm ? 0 : count));
+#endif
             /* expanded_index已建立足够桶容量；这里检查实际保护次数，
              * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
             assert(read.counts.inode_locks == (remote ? count : 1));

@@ -1566,7 +1566,10 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
             n = spans[i].size;
             if (n > node->size - spans[i].offset) n = node->size - spans[i].offset;
         }
-        batch[i] = (struct ext4_file_read_span){spans[i].offset, spans[i].buffer, n, 0, EIO};
+        /* 活跃node持有打开的file；lwext4在检查区段前初始化全部结果字段。 */
+        batch[i].offset = spans[i].offset;
+        batch[i].buffer = spans[i].buffer;
+        batch[i].size = n;
     }
     int result = ext4_fpread_batch(lwext4_node_file(node), batch, count);
     for (size_t i = 0; i < count; i++) {
