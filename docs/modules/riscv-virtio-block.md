@@ -41,6 +41,8 @@ VirtIO 批量读支持 direct DMA 与逐扇区 bounce；一个 span 出错不会
 失败 span 只承诺其 completed 前缀。调用返回前必须排空所有已发布 DMA，或确认 reset。
 读取消同样不能提前归还目标内存；成功完成的部分不会因别的请求超时而改写为失败。
 
+批量驱动的成员进度与临时 SG 段表由本次调用独占的工作槽维护。每槽 2048 字节，设备初始化按实际请求槽数保留工作区并紧凑放入普通架构页；八槽设备在 RV 上额外保留四个 4 KiB 页，在 16 KiB 页架构上保留一页。这些元数据不保存数据内容，也不参与 DMA。工作槽耗尽时借用既有 available 等待队列等待归还，不重新分配页，保证脏页回收在空闲页耗尽时仍能提交批量 I/O。调用消费全部完成或确认 reset 后才归还工作槽，销毁时统一释放保留页；初始化中途分配失败也先 reset 再回收已有页。单项调用使用小型栈工作区，不借用池，不增加分配，避免把 32 项数组压入每层文件/块调用栈。
+
 VirtIO 将发布、通知、等待和收割分开。同一 batch 将磁盘连续、扇区对齐且能直接 DMA 的多个 span 组成一个 SG 请求，各 span 保留独立的数据描述符，无需搬到连续内存；32 个独立 4 KiB 页可组成一个 128 KiB 请求，其完整链为 header、32 个数据描述符、status，共 34 项。设备 QueueNumMax 较小时向下选择队列容量并拆成多条请求；协商 SIZE_MAX/SEG_MAX 时读取对应上限，将每个数据描述符按整扇区截断，并限制每条链的数据段数。一个 span 可由多段描述符承载，其 completed 只在所属请求完成后推进。仍受空闲描述符和 32 位总字节数限制；请求槽维持八个，队列扩大不增加请求槽或 bounce。磁盘不连续的 span 在同一轮发布多个请求，然后只通知队列一次。请求可以乱序完成，并在其他调用释放槽或描述符后继续补发；不要求先凑齐整批资源。一个 SG 请求的成员共用设备完成状态，读失败时各成员保留此前已确认的 completed 前缀。每个请求保留独立的 I/O context、期限、状态、DMA buffer 和成本身份。batch 只占一个逻辑调用 owner，`active` 统计逻辑调用数，共用队列的 `inflight` 是已经发布的请求数的唯一计数；释放某个槽不会提前释放整批 owner。不同字节区间仍可能落在同一物理扇区，因此本批内涉及同扇区的 span 按输入顺序串行推进读改写，其他 span 可并发；不会因两个独立 bounce 快照覆盖相邻字节。
 
 `kernel_block_flush()` 表示设备持久化边界。块设备显式声明 UNKNOWN、WRITETHROUGH 或 WRITEBACK；未知能力且没有 flush 回调返回 UNSUPPORTED，只有声明 write-through 的设备可以省略 flush。VirtIO 协商 `VIRTIO_BLK_F_FLUSH`（bit 9），发送独立的 type 4 请求，只有 header/status 两个描述符，不带数据。未协商 CONFIG_WCE，因此 FLUSH 存在表示 writeback，缺失表示 write-through；驱动不修改缓存模式。该规则依据固定 Linux `references/linux/drivers/block/virtio_blk.c` 的 `virtblk_get_cache_mode()`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）。设备错误和超时保持所属状态，flush 请求单独计数。

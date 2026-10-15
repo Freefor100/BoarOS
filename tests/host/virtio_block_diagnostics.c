@@ -6,7 +6,9 @@
 #include "virtio_mmio_block_native.c"
 
 static uint32_t registers[128];
-static void *queue_allocation;
+static void *queue_allocation, *workspace_allocation[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+static unsigned release_batch_slot;
+static unsigned fail_workspace;
 static size_t allocation_size;
 static unsigned allocations;
 static unsigned releases;
@@ -248,7 +250,10 @@ enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_q
     (void)queue; (void)deadline; (void)interruptible;
     park_calls++;
     if (wait_irq_device) {
-        block_irq(wait_irq_device);
+        if (release_batch_slot) {
+            wait_irq_device->batch_claimed &= ~(1U << (release_batch_slot - 1));
+            release_batch_slot = 0;
+        } else block_irq(wait_irq_device);
         *reason = KERNEL_WAIT_WOKEN;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
@@ -258,6 +263,16 @@ enum physical_page_status physical_page_allocate_order(struct physical_page_allo
                                                        uint32_t order, uint64_t *physical)
 {
     (void)allocator;
+    if (!order) {
+        unsigned i;
+        for (i = 0; i < VIRTIO_BLOCK_BATCH_POOL_PAGES; i++) if (!workspace_allocation[i]) break;
+        assert(i < VIRTIO_BLOCK_BATCH_POOL_PAGES);
+        if (fail_workspace && i >= fail_workspace - 1) return PHYSICAL_PAGE_STATUS_EMPTY;
+        workspace_allocation[i] = calloc(1, 4096);
+        assert(workspace_allocation[i]);
+        *physical = UINT64_C(0x83000000) + i * 4096; allocations++;
+        return PHYSICAL_PAGE_STATUS_OK;
+    }
     assert(queue_allocation == NULL);
     allocation_size = 4096U << order;
     queue_allocation = calloc(1, allocation_size);
@@ -270,6 +285,11 @@ enum physical_page_status physical_page_resolve(const struct physical_page_alloc
                                                 uint64_t physical, void **pointer)
 {
     (void)allocator;
+    if (physical >= UINT64_C(0x83000000)) {
+        unsigned i = (physical - UINT64_C(0x83000000)) / 4096;
+        assert(i < VIRTIO_BLOCK_BATCH_POOL_PAGES && workspace_allocation[i]);
+        *pointer = workspace_allocation[i]; return PHYSICAL_PAGE_STATUS_OK;
+    }
     assert(physical == UINT64_C(0x81000000));
     *pointer = queue_allocation;
     return PHYSICAL_PAGE_STATUS_OK;
@@ -278,6 +298,12 @@ enum physical_page_status physical_page_release_order(struct physical_page_alloc
                                                       uint64_t physical, uint32_t order)
 {
     (void)allocator;
+    if (physical >= UINT64_C(0x83000000)) {
+        unsigned i = (physical - UINT64_C(0x83000000)) / 4096;
+        assert(!order && i < VIRTIO_BLOCK_BATCH_POOL_PAGES && workspace_allocation[i]);
+        free(workspace_allocation[i]); workspace_allocation[i] = NULL; releases++;
+        return PHYSICAL_PAGE_STATUS_OK;
+    }
     assert(registers[0x70 / 4] == 0);
     assert(physical == UINT64_C(0x81000000));
     assert(allocation_size == (4096U << order));
@@ -759,6 +785,54 @@ static void bad_segment_limits_case(unsigned version)
     printf("PASS invalid segment limits transport=%u: reject before allocating DMA\n", version);
 }
 
+static void workspace_pool_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device = {0};
+    struct physical_page_allocator allocator = {0};
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0x74726976; registers[1] = version; registers[2] = 2;
+    registers[0x10 / 4] = 1; registers[0x34 / 4] = 64; registers[0x100 / 4] = 128;
+    fault = SG_BATCH; batch_popped = batch_pushed = 0; clock_value = 0;
+    notifications = first_notify_heads = sg_max_segments = park_calls = 0; sg_fail_sector = UINT32_MAX;
+    assert(initialize_model(&device, registers, sizeof(registers), &allocator,
+        dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    struct kernel_block_read_span reads[2]; struct kernel_block_span writes[2];
+    for (unsigned i = 0; i < 2; i++) {
+        reads[i] = (struct kernel_block_read_span){i * 4096, batch_output[i], 4096, 0, 0};
+        writes[i] = (struct kernel_block_span){i * 4096, batch_output[i], 4096};
+    }
+    unsigned before = allocations;
+    fail_workspace = 1;
+    assert(kernel_block_read_batch(&device.block, reads, 2) == KERNEL_BLOCK_STATUS_OK);
+    for (unsigned i = 0; i < 2; i++) assert(reads[i].completed == 4096 && reads[i].status == KERNEL_BLOCK_STATUS_OK);
+    assert(kernel_block_write_batch(&device.block, writes, 2) == KERNEL_BLOCK_STATUS_OK);
+    assert(!device.active && !device.queue.inflight && !device.batch_claimed && allocations == before);
+    for (unsigned i = 0; i < VIRTIO_BLOCK_BATCH_POOL_PAGES; i++) memset(device.batch_memory[i], 0xa7, 4096);
+    device.batch_claimed = 255;
+    device.irq_source = 1; wait_irq_device = &device; release_batch_slot = 8;
+    assert(kernel_block_read_batch(&device.block, reads, 2) == KERNEL_BLOCK_STATUS_OK);
+    assert(park_calls == 1 && !release_batch_slot && device.batch_claimed == 127);
+    for (unsigned i = 0; i < 7 * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES; i++)
+        assert(((unsigned char *)device.batch_memory[i / 4096])[i % 4096] == 0xa7);
+    device.batch_claimed = 0; device.irq_source = 0; wait_irq_device = NULL;
+    assert(kernel_block_read_batch(&device.block, reads, 1) == KERNEL_BLOCK_STATUS_OK && reads[0].completed == 4096);
+    assert(allocations == before && !caller.allocation_depth);
+    fail_workspace = 0;
+    assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
+    printf("PASS reserved batch workspace transport=%u: allocation denied, full pool waits, other owners intact, one span allocates nothing\n", version);
+    for (unsigned failure = 1; failure <= 3; failure += 2) {
+        device = (struct riscv_virtio_mmio_block){0};
+        memset(registers, 0, sizeof(registers));
+        registers[0] = 0x74726976; registers[1] = version; registers[2] = 2;
+        registers[0x10 / 4] = 1; registers[0x34 / 4] = 64; registers[0x100 / 4] = 128;
+        fail_workspace = failure;
+        assert(initialize_model(&device, registers, sizeof(registers), &allocator,
+            dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_NO_MEMORY);
+        assert(!device.state && allocations == releases && !queue_allocation);
+    }
+    fail_workspace = 0;
+}
+
 static void scalar_dma_before_irq_case(unsigned version)
 {
     struct riscv_virtio_mmio_block device = {0};
@@ -827,6 +901,7 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "sg-128k")) {
         for (unsigned version = 1; version <= 2; version++) for (int writing = 0; writing <= 1; writing++) {
             bad_segment_limits_case(version);
+            workspace_pool_case(version);
             sg_128k_case(version, 64, writing, 0, 0);
             sg_128k_case(version, 32, writing, 0, 0);
             sg_128k_case(version, 64, writing, 1024, 3);
@@ -876,6 +951,7 @@ int main(int argc, char **argv)
     }
     for (unsigned version = 1; version <= 2; ++version) {
         bad_segment_limits_case(version);
+        workspace_pool_case(version);
         for (int writing = 0; writing <= 1; writing++) {
             sg_128k_case(version, 64, writing, 0, 0);
             sg_128k_case(version, 32, writing, 0, 0);

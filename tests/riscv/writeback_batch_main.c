@@ -25,8 +25,9 @@ static struct kernel_vfs_mount mount;
 static struct riscv_virtio_mmio_block device;
 static unsigned completed, probe, calls, maximum, reject_order, reject_page, injected, fail_write;
 static unsigned hold_snapshot, snapshot_waiting, snapshot_changed, alias_rearms;
-static uint64_t alias_pages[8];
-static struct kernel_page_cache_alias aliases[8];
+#define TEST_PAGES (BOAROS_PAGE_CACHE_WRITEBACK_PAGES > 8 ? BOAROS_PAGE_CACHE_WRITEBACK_PAGES : 8)
+static uint64_t alias_pages[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+static struct kernel_page_cache_alias aliases[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
 static struct kernel_wait_queue snapshot_ready;
 static size_t submitted;
 static unsigned offsets[16], lengths[16];
@@ -108,17 +109,18 @@ static void read_pages(struct kernel_vfs_file *file, unsigned count)
 static void range_cases(struct kernel_vfs_file *file)
 {
     uint64_t observed = 0;
-    write_pages(file, 9);
+    unsigned full_pages = TEST_PAGES + 1;
+    write_pages(file, full_pages);
     reset_probe();
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 30);
     probe = 0;
     number("writeback range calls: ", calls);
-    /* Nine fully dirty pages need the configured bounded number of handoffs. */
-    check(calls == (9 + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
-          maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096 && submitted == 9 * 4096, 31);
+    /* Include one page beyond the largest tested window and verify its tail. */
+    check(calls == (full_pages + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
+          maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096 && submitted == full_pages * 4096, 31);
     check(kernel_vfs_sync(file, 1, &observed) == 0 &&
           kernel_page_cache_invalidate_node(&cache, kernel_vfs_file_node(file)) == KERNEL_PAGE_CACHE_STATUS_OK, 32);
-    read_pages(file, 9);
+    read_pages(file, full_pages);
     /* Adjacent pages with disjoint dirty bytes must keep the clean gap. */
     size_t written;
     unsigned char value = 0x74;
@@ -183,13 +185,13 @@ static void range_cases(struct kernel_vfs_file *file)
 }
 static void allocation_cases(struct kernel_vfs_file *file)
 {
-    write_pages(file, 8);
+    write_pages(file, TEST_PAGES);
     reject_order = UINT32_MAX; injected = 0;
     reset_probe();
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 50);
     probe = reject_order = 0;
-    check(calls == (8 + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
-          maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096 && submitted == 8 * 4096, 51);
+    check(calls == (TEST_PAGES + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
+          maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096 && submitted == TEST_PAGES * 4096, 51);
     check(injected == 0, 52);
     write_pages(file, 1);
     reject_page = 1;
@@ -216,7 +218,7 @@ static void redirty_worker(void *unused)
 }
 static void redirty_case(struct kernel_vfs_file *file)
 {
-    write_pages(file, 8);
+    write_pages(file, TEST_PAGES);
     for (unsigned i = 0; i < BOAROS_PAGE_CACHE_WRITEBACK_PAGES; i++) {
         size_t valid;
         check(kernel_page_cache_get(&cache, file, i, &alias_pages[i], &valid) == KERNEL_PAGE_CACHE_STATUS_OK &&
@@ -241,7 +243,7 @@ static void redirty_case(struct kernel_vfs_file *file)
     uint64_t observed = 0;
     check(kernel_vfs_sync(file, 1, &observed) == 0 &&
           kernel_page_cache_invalidate_node(&cache, kernel_vfs_file_node(file)) == KERNEL_PAGE_CACHE_STATUS_OK, 81);
-    for (unsigned i = 0; i < 8; i++) {
+    for (unsigned i = 0; i < TEST_PAGES; i++) {
         size_t read;
         check(kernel_vfs_pread(file, i * 4096, actual, sizeof(actual), &read) == 0 && read == sizeof(actual), 82);
         memset(bytes, i < BOAROS_PAGE_CACHE_WRITEBACK_PAGES ? (int)(0xa0 + i) : (int)(i + 1), sizeof(bytes));
@@ -251,18 +253,18 @@ static void redirty_case(struct kernel_vfs_file *file)
 static void error_cases(struct kernel_vfs_file *file)
 {
     for (unsigned kind = 1; kind <= 2; kind++) {
-        write_pages(file, 8);
+        write_pages(file, TEST_PAGES);
         fail_write = kind;
         reset_probe();
         check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == -KERNEL_EIO, 90);
         probe = fail_write = 0;
         struct kernel_memory_statistics memory;
         kernel_memory_snapshot(&allocator, &memory);
-        check(!memory.writeback && memory.dirty == 8 * 4096, 91);
+        check(!memory.writeback && memory.dirty == TEST_PAGES * 4096, 91);
         reset_probe();
         check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 92);
         probe = 0;
-        check(submitted == 8 * 4096, 93);
+        check(submitted == TEST_PAGES * 4096, 93);
     }
 }
 static void background_case(struct kernel_vfs_file *file)

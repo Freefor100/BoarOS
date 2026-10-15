@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_VIRTIO_BLOCK_H
 
 #include <kernel/block.h>
+#include <kernel/page.h>
 #include <kernel/cost.h>
 #include <kernel/virtio_split_queue.h>
 #include <kernel/physical_page.h>
@@ -38,6 +39,11 @@ struct virtio_block_statistics {
     uint64_t inflight_ticks, busy_ticks, total_ticks, queue_wait_ticks, service_ticks;
 };
 
+#define VIRTIO_BLOCK_REQUEST_SLOTS 8U
+#define VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES 2048U
+#define VIRTIO_BLOCK_BATCH_POOL_PAGES \
+    ((VIRTIO_BLOCK_REQUEST_SLOTS * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES + BOAROS_PAGE_SIZE - 1U) / BOAROS_PAGE_SIZE)
+
 struct virtio_block_device {
     struct kernel_block_device block;
     struct physical_page_allocator *page_allocator;
@@ -47,6 +53,9 @@ struct virtio_block_device {
     uint64_t queue_physical_address;
     uint64_t timeout_ticks;
     uint16_t queue_size;
+    uint64_t batch_physical[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+    void *batch_memory[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+    unsigned batch_claimed;
     struct virtio_split_queue queue;
     uint32_t transport_version;
     uint32_t queue_allocation_order;
