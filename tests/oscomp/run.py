@@ -31,6 +31,14 @@ def output(args, cwd=ROOT):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 
 
+def copy_disk_image(source, destination):
+    # Guest flushes must not pay for first allocating holes or breaking shared
+    # host extents. Finish a written copy before starting either guest clock.
+    subprocess.run(['cp', '--reflink=never', '--sparse=never', str(source), str(destination)], check=True)
+    with Path(destination).open('rb') as stream:
+        os.fsync(stream.fileno())
+
+
 def validate(verify_assets=False, architectures=('riscv', 'loongarch')):
     identity = json.loads((HERE / 'inputs.json').read_text())
     if output(['git', 'remote', 'get-url', 'origin'], REF) != identity['autotest_url']:
@@ -323,12 +331,13 @@ def main():
             facts = identity['architectures'][arch]
             kernel = target / facts['kernel']; shutil.copyfile(ROOT / facts['kernel'], kernel)
             disk = target / 'root.img'
-            subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(REF / facts['image']), str(disk)], check=True)
+            copy_disk_image(REF / facts['image'], disk)
             qemu = args.qemu_riscv if arch == 'riscv' else args.qemu_loongarch
             executable = Path(shutil.which(qemu) or qemu).resolve(strict=True)
             base = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
             command = boot_command(arch, str(executable), kernel, disk, config, args.rng)
             entry = {'kernel_sha256': sha(kernel), 'fixture_sha256': sha(disk), 'boot_count': 1,
+                'backing_preparation': 'written-and-synced',
                 'init_config_path': str(configs[arch]), 'init_config_sha256': sha(ROOT / configs[arch]),
                 'case_sha256': sha(base / 'case'),
                 'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],

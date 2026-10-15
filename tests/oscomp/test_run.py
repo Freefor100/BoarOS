@@ -1,6 +1,8 @@
 """Report failures and combined scores from the real fixed upstream judge."""
 import importlib.util
+import errno
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -12,6 +14,50 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('compatibility_runner', HERE / 'run.py')
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+
+
+class DiskImageCopyTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, 'SEEK_HOLE'), 'SEEK_HOLE is unavailable')
+    def test_sparse_image_is_fully_written_before_guest_boot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'release.img'
+            destination = Path(temporary) / 'root.img'
+            size = 2 * 1024 * 1024
+            tail = b'original release tail'
+            with source.open('wb') as stream:
+                stream.write(b'original release header')
+                stream.seek(size - len(tail))
+                stream.write(tail)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.assertLess(source.stat().st_blocks * 512, size)
+            with source.open('rb') as stream:
+                try:
+                    source_hole = os.lseek(stream.fileno(), 0, os.SEEK_HOLE)
+                except OSError as error:
+                    if error.errno in (errno.EINVAL, errno.ENOTSUP):
+                        self.skipTest('temporary filesystem cannot report holes')
+                    raise
+            if source_hole == size:
+                self.skipTest('temporary filesystem does not distinguish real sparse holes')
+
+            runner.copy_disk_image(source, destination)
+
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(destination.stat().st_size, size)
+            self.assertGreaterEqual(destination.stat().st_blocks * 512, size)
+            with destination.open('rb') as stream:
+                self.assertEqual(os.lseek(stream.fileno(), 0, os.SEEK_HOLE), size)
+
+    def test_image_sync_failure_is_returned_to_the_caller(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'release.img'
+            destination = Path(temporary) / 'root.img'
+            source.write_bytes(b'original image bytes')
+            with patch.object(runner.os, 'fsync', side_effect=OSError(errno.EIO, 'sync failed')):
+                with self.assertRaises(OSError) as caught:
+                    runner.copy_disk_image(source, destination)
+            self.assertEqual(caught.exception.errno, errno.EIO)
 
 
 class ReportTests(unittest.TestCase):
