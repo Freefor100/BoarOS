@@ -122,6 +122,26 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 	return trans_error(bdev, r);
 }
 
+int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
+    const struct ext4_block_span *spans, unsigned count)
+{
+    int r = ext4_blocks_set_batch(bdev, spans, count);
+    if (r) return r;
+    for (unsigned i = 0; i < count; i++) for (uint32_t j = 0; j < spans[i].count; j++) {
+        struct ext4_block cached = EXT4_BLOCK_ZERO();
+        struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].block + j);
+        if (!old) continue;
+        memcpy(cached.data, (const uint8_t *)spans[i].data + (size_t)j * bdev->lg_bsize, bdev->lg_bsize);
+        ext4_bcache_set_flag(old, BC_UPTODATE);
+        ext4_bcache_clear_dirty(old);
+        bdev->cache_write_back++;
+        int cleanup = ext4_block_set(bdev, &cached);
+        bdev->cache_write_back--;
+        if (!r) r = cleanup;
+    }
+    return r;
+}
+
 int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
 	const struct ext4_data_source *source)
@@ -134,6 +154,10 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	/* Standalone non-journal users may explicitly request deferred bcache
 	 * writes. The VFS supplies stable sources and writes directly instead. */
 	if (source && source->retain) {
+        if (!offset && length == bdev->lg_bsize && data) {
+            struct ext4_block_span span = {data, lba, 1};
+            return ext4_trans_write_data_batch(bdev, &span, 1);
+        }
 		struct ext4_block cached = EXT4_BLOCK_ZERO();
 		struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, lba);
 		void *assembled = NULL;

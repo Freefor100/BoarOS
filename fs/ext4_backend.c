@@ -841,6 +841,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     }
 
     adapter->superblock = superblock;
+    adapter->instance.writeback_block_size = ext4_sb_get_block_size(superblock);
     mount->id = kernel_vfs_allocate_mount_id();
     mount->state = VFS_MOUNT_STATE_LIVE;
     return 0;
@@ -1544,14 +1545,18 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     if ((uint64_t)requested > node->size - offset) {
         requested = (size_t)(node->size - offset);
     }
-    result = ext4_fpread(lwext4_node_file(node), offset, buffer, requested, &result_count);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    if (result_count > requested) {
-        return -KERNEL_EIO;
-    }
-    *bytes_read = result_count;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    adapter->locks.read_lock(adapter->locks.context);
+    uint64_t stored=ext4_fsize(lwext4_node_file(node));
+    if (stored>node->size) stored=node->size;
+    size_t prefix=offset>=stored?0:stored-offset<requested?(size_t)(stored-offset):requested;
+    result = ext4_fpread(lwext4_node_file(node), offset, buffer, prefix, &result_count);
+    adapter->locks.unlock(adapter->locks.context);
+    if (result != EOK) return lwext4_error(result);
+    if (result_count != prefix) return -KERNEL_EIO;
+    /* Cache-only growth has known zero holes beyond the accepted inode EOF. */
+    memset((unsigned char *)buffer+prefix,0,requested-prefix);
+    *bytes_read = requested;
     return 0;
 }
 
@@ -1559,12 +1564,20 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     struct kernel_vfs_read_span *spans, size_t count)
 {
     if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
-    struct ext4_file_read_span batch[KERNEL_VFS_READ_BATCH_MAX];
+    struct ext4_file_read_span local, *batch=&local;
+    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
+        for (size_t i=0;i<count;i++) { spans[i].completed=0; spans[i].error=-KERNEL_ENOMEM; }
+        return -KERNEL_ENOMEM;
+    }
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    adapter->locks.read_lock(adapter->locks.context);
+    uint64_t stored=ext4_fsize(lwext4_node_file(node));
+    if (stored>node->size) stored=node->size;
     for (size_t i = 0; i < count; i++) {
         size_t n = 0;
-        if (spans[i].offset < node->size) {
+        if (spans[i].offset < stored) {
             n = spans[i].size;
-            if (n > node->size - spans[i].offset) n = node->size - spans[i].offset;
+            if (n > stored - spans[i].offset) n = stored - spans[i].offset;
         }
         /* 活跃node持有打开的file；lwext4在检查区段前初始化全部结果字段。 */
         batch[i].offset = spans[i].offset;
@@ -1572,11 +1585,21 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
         batch[i].size = n;
     }
     int result = ext4_fpread_batch(lwext4_node_file(node), batch, count);
+    adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++) {
         spans[i].error = lwext4_error(batch[i].error);
         spans[i].completed = batch[i].completed;
         if (spans[i].completed > batch[i].size) __builtin_trap();
+        if (!spans[i].error && spans[i].completed != batch[i].size) spans[i].error=-KERNEL_EIO;
+        if (!spans[i].error) {
+            size_t logical=spans[i].offset>=node->size?0:node->size-spans[i].offset<spans[i].size?
+                (size_t)(node->size-spans[i].offset):spans[i].size;
+            if (logical<spans[i].completed) __builtin_trap();
+            memset((unsigned char *)spans[i].buffer+spans[i].completed,0,logical-spans[i].completed);
+            spans[i].completed=logical;
+        }
     }
+    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
     return lwext4_error(result);
 }
 
@@ -1584,11 +1607,16 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct kernel_vfs_writeback_span *spans, size_t count)
 {
     if (count > KERNEL_VFS_WRITEBACK_MAX) __builtin_trap();
-    struct ext4_file_write_span batch[KERNEL_VFS_WRITEBACK_MAX];
+    struct ext4_file_write_span local, *batch=&local;
+    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
+        for (size_t i=0;i<count;i++) spans[i].written=0;
+        return -KERNEL_ENOMEM;
+    }
     for (size_t i = 0; i < count; i++) {
         COST_ADD(BACKEND_REQUESTED, spans[i].size);
         batch[i] = (struct ext4_file_write_span){
             .offset=spans[i].offset, .buffer=spans[i].buffer, .size=spans[i].size,
+            .source_buffer=spans[i].source_buffer, .source_size=spans[i].source_size,
             .source={.context=spans[i].owner, .retain=spans[i].retain,
                 .release=spans[i].release, .bytes=spans[i].source_bytes}};
     }
@@ -1598,6 +1626,7 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
         if (!result && spans[i].written != spans[i].size) result = EIO;
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
+    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
     if (result) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     return lwext4_error(result);
 }

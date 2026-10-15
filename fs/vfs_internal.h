@@ -37,7 +37,7 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
-#define KERNEL_VFS_READ_BATCH_MAX 8U
+#define KERNEL_VFS_READ_BATCH_MAX 32U
 struct kernel_vfs_read_span {
     uint64_t offset;
     void *buffer;
@@ -70,7 +70,7 @@ struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node);
 int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node);
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
-#define KERNEL_VFS_WRITEBACK_MAX 8U
+#define KERNEL_VFS_WRITEBACK_MAX 32U
 struct kernel_vfs_writeback_span {
     uint64_t offset;
     const void *buffer;
@@ -79,10 +79,14 @@ struct kernel_vfs_writeback_span {
     void (*retain)(void *owner);
     void (*release)(void *owner);
     size_t source_bytes;
+    const void *source_buffer;
+    size_t source_size;
 };
 /* Stable sources remain caller-owned. The backend may retain them through
  * ordered commit; source_bytes includes the entire retained allocation, not
- * just this dirty range. Shared source ownership is charged once. */
+ * just this dirty range. source_buffer/source_size describe initialized stable
+ * bytes surrounding buffer; logical offset/size still define completion and EOF.
+ * Shared source ownership is charged once. */
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
     struct kernel_vfs_writeback_span *spans, size_t count);
 

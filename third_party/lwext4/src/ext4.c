@@ -812,10 +812,9 @@ static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 {
 	struct jbd_trans *running = mp->fs.jbd_journal->running;
 	if (!running) return false;
-	unsigned blocks = running->data_cnt + running->ordered_count;
 	uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
 	return force || (mp->fs.jbd_journal->seal_target >= running->sequence) ||
-		(uint64_t)blocks * mp->fs.jbd_journal->block_size >= 256 * 1024 ||
+		(uint64_t)running->reserved_logs * mp->fs.jbd_journal->block_size >= 256 * 1024 ||
 		(now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000);
 }
 
@@ -825,9 +824,8 @@ static int ext4_group_freeze(struct ext4_mountpoint *mp, bool force)
 #if BOAROS_COST_DIAGNOSTICS
     struct jbd_journal *journal = mp->fs.jbd_journal;
     struct jbd_trans *running = journal->running;
-    unsigned blocks = running->data_cnt + running->ordered_count;
     uint64_t now = mp->journal_runtime.now_ns(mp->journal_runtime.context);
-    bool bytes = (uint64_t)blocks * journal->block_size >= 256 * 1024;
+    bool bytes = (uint64_t)running->reserved_logs * journal->block_size >= 256 * 1024;
     bool age = now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000;
     bool target = journal->seal_target >= running->sequence;
 #endif
@@ -912,7 +910,7 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 				if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
 			}
 			bool reuse = ext4_space_waits_checkpoint(mp);
-			if (!reuse && jbd_journal_operation_room(journal, 0, NULL, 0)) break;
+			if (!reuse && jbd_journal_operation_room(journal, 0, 0, NULL, 0)) break;
 			uint64_t target = reuse ? journal->accepted_sequence : jbd_journal_reclaim_target(journal);
 			if (!target || target <= journal->checkpoint_sequence) return ENOMEM;
 			r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
@@ -3153,6 +3151,15 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
     return result;
 }
 
+struct ext4_read_fragment { unsigned span; size_t length; int error; };
+struct ext4_read_workspace {
+    size_t limits[EXT4_BLOCK_BATCH_MAX];
+    struct ext4_read_fragment fragments[EXT4_BLOCK_BATCH_MAX];
+    struct ext4_block_read_span reads[EXT4_BLOCK_BATCH_MAX];
+    unsigned owners[EXT4_BLOCK_BATCH_MAX];
+    int mapping_errors[EXT4_BLOCK_BATCH_MAX];
+};
+
 /* The mount read lock stabilizes inode mappings and current cache versions. */
 int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, unsigned count)
 {
@@ -3174,6 +3181,21 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     }
     for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
     if (!count) return EOK;
+    struct ext4_read_workspace *work = count > 1 ? ext4_malloc(sizeof(*work)) : NULL;
+    if (count > 1 && !work) {
+        for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
+        return ENOMEM;
+    }
+    size_t scalar_limit;
+    struct ext4_read_fragment scalar_fragment;
+    struct ext4_block_read_span scalar_read;
+    unsigned scalar_owner;
+    int scalar_mapping_error;
+    size_t *limits = work ? work->limits : &scalar_limit;
+    struct ext4_read_fragment *fragments = work ? work->fragments : &scalar_fragment;
+    struct ext4_block_read_span *reads = work ? work->reads : &scalar_read;
+    unsigned *owners = work ? work->owners : &scalar_owner;
+    int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
     const struct ext4_lock *locks = file->mp->os_locks;
     if (locks && locks->read_lock) locks->read_lock(locks->context);
     else EXT4_MP_LOCK(file->mp);
@@ -3186,7 +3208,6 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     uint64_t size = ext4_inode_get_size(&fs->sb, ref.inode);
     if (size > file->fmax) { result = EFBIG; goto Put; }
     unsigned block_size = ext4_sb_get_block_size(&fs->sb);
-    size_t limits[EXT4_BLOCK_BATCH_MAX];
     bool inline_link = ext4_inode_is_type(&fs->sb, ref.inode, EXT4_INODE_MODE_SOFTLINK) &&
         size < sizeof(ref.inode->blocks) && !ext4_inode_get_blocks_count(&fs->sb, ref.inode);
     for (unsigned i = 0; i < count; i++) {
@@ -3198,12 +3219,9 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
         }
     }
     while (!inline_link) {
-        struct read_fragment { unsigned span; size_t length; int error; } fragments[EXT4_BLOCK_BATCH_MAX];
-        struct ext4_block_read_span reads[EXT4_BLOCK_BATCH_MAX];
-        unsigned owners[EXT4_BLOCK_BATCH_MAX];
-        int mapping_errors[EXT4_BLOCK_BATCH_MAX] = {0};
+        memset(mapping_errors, 0, count * sizeof(*mapping_errors));
         unsigned parts = 0, pending = 0;
-        for (unsigned i = 0; i < count && parts < EXT4_BLOCK_BATCH_MAX; i++) {
+        for (unsigned i = 0; i < count && parts < count; i++) {
             size_t planned = spans[i].completed;
             while (!spans[i].error && planned < limits[i]) {
                 uint64_t offset = spans[i].offset + planned;
@@ -3222,8 +3240,8 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     reads[pending - 1].block + reads[pending - 1].count == block &&
                     (uint8_t *)reads[pending - 1].data + (size_t)reads[pending - 1].count * sector == out &&
                     length / sector <= UINT32_MAX - reads[pending - 1].count;
-                if (parts == EXT4_BLOCK_BATCH_MAX) {
-                    /* 八项限制针对真实输出区间；同页连续小FS块仍可扩展最后一项。
+                if (parts == count) {
+                    /* 片段限制针对真实输出区间；同页连续小FS块仍可扩展最后一项。
                      * 空输出只查询当前版本，不能把未接纳片段提前复制进调用者。 */
                     if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
                     reads[pending - 1].count += length / sector;
@@ -3232,7 +3250,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     continue;
                 }
                 unsigned part = parts++;
-                fragments[part] = (struct read_fragment){i, length, EOK};
+                fragments[part] = (struct ext4_read_fragment){i, length, EOK};
                 if (!physical) memset(out, 0, length);
                 else if (!ext4_copy_pending_data(fs->bdev, physical, skip, out, length)) {
                     if (!aligned)
@@ -3253,7 +3271,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
         ext4_blockdev_read_batch(fs->bdev, reads, pending);
         for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].error;
         for (unsigned j = 0; j < parts; j++) {
-            struct read_fragment *part = &fragments[j];
+            struct ext4_read_fragment *part = &fragments[j];
             struct ext4_file_read_span *span = &spans[part->span];
             if (!span->error) {
                 if (part->error) span->error = part->error;
@@ -3270,7 +3288,50 @@ Failed:
     result = EOK;
     for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
     EXT4_MP_UNLOCK(file->mp);
+    ext4_free(work);
     return result;
+}
+
+/* Non-journal writes borrow caller versions until synchronous DMA completes;
+ * mapping ahead does not yet publish logical completion or inode size. */
+struct ext4_direct_write_batch {
+    struct ext4_block_span blocks[EXT4_BLOCK_BATCH_MAX];
+    struct {
+        struct ext4_file_write_span *span;
+        uint64_t offset;
+        size_t length;
+        bool allocated;
+    } logical[EXT4_BLOCK_BATCH_MAX];
+    unsigned count;
+    size_t bytes;
+};
+static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
+    struct ext4_direct_write_batch *batch)
+{
+    if (!batch || !batch->count) return EOK;
+    int r = ext4_trans_write_data_batch(ref->fs->bdev, batch->blocks, batch->count);
+    unsigned block_size = ref->fs->bdev->lg_bsize;
+    for (unsigned step = 0; step < batch->count; step++) {
+        unsigned i = r ? batch->count - 1 - step : step;
+        if (!r) {
+            batch->logical[i].span->written += batch->logical[i].length;
+            uint64_t end = batch->logical[i].offset + batch->logical[i].length;
+            if (end > ext4_inode_get_size(&ref->fs->sb, ref->inode)) {
+                ext4_inode_set_size(ref->inode, end); ref->dirty = true;
+            }
+        } else if (batch->logical[i].allocated) {
+            /* Remove from the end so failed append cleanup does not split
+             * extents and allocate new metadata while releasing old mappings. */
+            for (uint32_t j = batch->blocks[i].count; j > 0; j--) {
+                int cleanup = ext4_fs_release_inode_dblk_idx(ref,
+                    batch->logical[i].offset / block_size + j - 1, batch->blocks[i].block + j - 1);
+                if (cleanup) r = cleanup;
+            }
+        }
+    }
+    if (r) file->fpos = batch->logical[0].offset;
+    batch->count = 0; batch->bytes = 0;
+    return r;
 }
 
 static int ext4_write_spans(ext4_file *file, struct ext4_file_write_span *spans, unsigned count)
@@ -3280,7 +3341,7 @@ static int ext4_write_spans(ext4_file *file, struct ext4_file_write_span *spans,
 	if (file->mp->fs.read_only) return EROFS;
 	if (file->flags & O_RDONLY) return EPERM;
 	uint64_t write_end = 0;
-	size_t blocks = 0;
+	size_t blocks = 0, data_images = 0;
 	const struct ext4_data_source *sources[EXT4_BLOCK_BATCH_MAX];
 	unsigned source_count = 0;
 	unsigned block_size = ext4_sb_get_block_size(&file->mp->fs.sb);
@@ -3291,21 +3352,41 @@ static int ext4_write_spans(ext4_file *file, struct ext4_file_write_span *spans,
 		if (span->offset > file->fmax || span->size > file->fmax - span->offset) return EFBIG;
 		if (i && span->offset < spans[i-1].offset + spans[i-1].size) return EINVAL;
 		if (!span->size) continue;
-		size_t skip = span->offset % block_size;
-		if (skip) skip = block_size - skip;
-		if (span->source.retain && skip < span->size && span->size - skip >= block_size)
-			sources[source_count++] = &span->source;
-		write_end = span->offset + span->size;
-		size_t n = (span->size - 1 + span->offset % block_size) / block_size + 1;
-		if (n > SIZE_MAX - blocks) return ENOMEM;
-		blocks += n;
+        size_t leading = span->offset % block_size;
+        size_t n = (span->size - 1 + leading) / block_size + 1;
+        if (n > SIZE_MAX - blocks) return ENOMEM;
+        blocks += n;
+        size_t borrowed = 0;
+        if (span->source_buffer || span->source_size) {
+            uintptr_t base = (uintptr_t)span->source_buffer, input = (uintptr_t)span->buffer;
+            if (!base || !span->source.retain || input < base ||
+                input - base > span->source_size || span->size > span->source_size - (input - base) ||
+                span->source_size > span->source.bytes || base > UINTPTR_MAX - span->source_size ||
+                input - base > span->offset) return EINVAL;
+            size_t delta = input - base;
+            size_t first = delta >= leading ? delta - leading : block_size - (leading - delta);
+            size_t end = delta + span->size;
+            if (first < end && first <= span->source_size && block_size <= span->source_size - first) {
+                size_t covered = (span->source_size - first) / block_size;
+                size_t touched = (end - first - 1) / block_size + 1;
+                borrowed = covered < touched ? covered : touched;
+            }
+        } else if (span->source.retain) {
+            size_t skip = leading ? block_size - leading : 0;
+            if (skip < span->size) borrowed = (span->size - skip) / block_size;
+        }
+        if (borrowed) sources[source_count++] = &span->source;
+        data_images += n - borrowed;
+        write_end = span->offset + span->size;
 	}
 	if (!blocks) return EOK;
-	int r = ext4_prepare_growth(file, write_end);
 	struct jbd_journal *journal = file->mp->fs.jbd_journal;
-	if (!r && journal && journal->grouped && !file->mp->transaction_depth) {
-		if (blocks > SIZE_MAX - 24) r = ENOMEM;
-		while (!r && !jbd_journal_operation_room(journal, blocks + 24, sources, source_count)) {
+	bool outer = !file->mp->transaction_depth;
+	int r;
+Retry:
+	r = ext4_prepare_growth(file, write_end);
+	if (!r && journal && journal->grouped && outer) {
+		while (!r && !jbd_journal_operation_room(journal, blocks, data_images, sources, source_count)) {
 			uint64_t target = jbd_journal_reclaim_target(journal);
 			if (!target || target <= journal->checkpoint_sequence) { r = ENOMEM; break; }
 			r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
@@ -3313,48 +3394,122 @@ static int ext4_write_spans(ext4_file *file, struct ext4_file_write_span *spans,
 	}
 	if (!r) r = ext4_trans_start(file->mp);
 	if (r) return r;
+	uint64_t budget_failures = journal ? journal->budget_failures : 0;
 	struct ext4_fs *fs = &file->mp->fs;
 	struct ext4_inode_ref ref;
+	uint64_t saved_size = file->fsize, saved_pos = file->fpos;
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
-	if (r) return ext4_trans_finish(file->mp, r);
-	uint64_t saved_size = ext4_inode_get_size(&fs->sb, ref.inode), saved_pos = file->fpos;
+	if (r) { r = ext4_trans_finish(file->mp, r); goto Completed; }
+	saved_size = ext4_inode_get_size(&fs->sb, ref.inode);
+    struct ext4_direct_write_batch *direct = NULL;
+    if (!journal && blocks > 1 && source_count) {
+        direct = ext4_calloc(1, sizeof(*direct));
+        if (!direct) r = ENOMEM;
+    }
 	for (unsigned i = 0; i < count && !r; i++) {
 		struct ext4_file_write_span *span = &spans[i];
 		if (!span->size) continue;
 		file->fpos = span->offset;
-		r = ext4_zero_allocated_eof_tail(&ref, ext4_inode_get_size(&fs->sb, ref.inode),
-			span->offset);
-		while (span->written < span->size && !r) {
+        uint64_t old_size = ext4_inode_get_size(&fs->sb, ref.inode);
+        if (direct && direct->count) {
+            unsigned last = direct->count - 1;
+            uint64_t pending_end = direct->logical[last].offset + direct->logical[last].length;
+            if (old_size < pending_end) old_size = pending_end;
+        }
+        size_t source_offset = span->source_buffer ?
+            (uintptr_t)span->buffer - (uintptr_t)span->source_buffer : 0;
+        size_t block_offset = span->offset % block_size;
+        bool covers_eof = span->source_buffer && old_size / block_size == span->offset / block_size &&
+            source_offset >= block_offset && source_offset - block_offset <= span->source_size &&
+            block_size <= span->source_size - (source_offset - block_offset);
+        /* The supplied block already includes the zero gap after old EOF. */
+        if (!covers_eof && span->offset > old_size && old_size % block_size) {
+            r = ext4_direct_write_flush(&ref, file, direct);
+            if (!r) r = ext4_zero_allocated_eof_tail(&ref, old_size, span->offset);
+        }
+        size_t consumed = 0;
+		while (consumed < span->size && !r) {
 			uint32_t offset = file->fpos % block_size;
 			size_t length = block_size - offset;
-			if (length > span->size - span->written) length = span->size - span->written;
+			if (length > span->size - consumed) length = span->size - consumed;
 			ext4_fsblk_t physical;
 			bool allocated;
-			r = ext4_fs_get_or_alloc_inode_dblk_idx(&ref, file->fpos / block_size, &physical, &allocated);
+			ext4_lblk_t logical_block = file->fpos / block_size;
+			r = ext4_fs_get_or_alloc_inode_dblk_idx(&ref, logical_block, &physical, &allocated);
 			if (r) break;
-			r = ext4_trans_write_data(fs->bdev, physical, offset,
-				(const uint8_t *)span->buffer + span->written, length, allocated, &span->source);
+            const uint8_t *input = (const uint8_t *)span->buffer + consumed;
+            uint32_t data_offset = offset, data_length = length;
+            if (span->source_buffer) {
+                size_t position = (uintptr_t)input - (uintptr_t)span->source_buffer;
+                if (position >= offset && position - offset <= span->source_size &&
+                    block_size <= span->source_size - (position - offset)) {
+                    input -= offset; data_offset = 0; data_length = block_size;
+                }
+            }
+            bool queued = direct && !data_offset && data_length == block_size && span->source.retain;
+            if (queued) {
+                unsigned n = direct->count;
+                bool merge = n && direct->logical[n-1].span == span &&
+                    direct->logical[n-1].allocated == allocated &&
+                    direct->blocks[n-1].block + direct->blocks[n-1].count == physical &&
+                    (const uint8_t *)direct->blocks[n-1].data + (size_t)direct->blocks[n-1].count * block_size == input;
+                bool overlap = n && physical >= direct->blocks[n-1].block &&
+                    physical - direct->blocks[n-1].block < direct->blocks[n-1].count;
+                if ((!merge && n == EXT4_BLOCK_BATCH_MAX) || overlap || direct->bytes + block_size > 131072) {
+                    r = ext4_direct_write_flush(&ref, file, direct); n = 0; merge = false;
+                }
+                if (!r && merge) {
+                    direct->blocks[n-1].count++;
+                    direct->logical[n-1].length += length;
+                } else if (!r) {
+                    direct->blocks[n] = (struct ext4_block_span){input, physical, 1};
+                    direct->logical[n].span = span; direct->logical[n].offset = file->fpos;
+                    direct->logical[n].length = length; direct->logical[n].allocated = allocated;
+                    direct->count++;
+                }
+                if (!r) direct->bytes += block_size;
+            } else {
+                r = ext4_direct_write_flush(&ref, file, direct);
+                if (!r) r = ext4_trans_write_data(fs->bdev, physical, data_offset,
+                    input, data_length, allocated, &span->source);
+            }
 			if (r) {
 				if (allocated) {
-					int cleanup = ext4_fs_release_inode_dblk_idx(&ref, file->fpos / block_size, physical);
+					int cleanup = ext4_fs_release_inode_dblk_idx(&ref, logical_block, physical);
 					if (cleanup) r = cleanup;
 				}
 				break;
 			}
-			span->written += length;
+            consumed += length;
+			if (!queued) span->written += length;
 			file->fpos += length;
-			if (file->fpos > ext4_inode_get_size(&fs->sb, ref.inode)) {
+			if (!queued && file->fpos > ext4_inode_get_size(&fs->sb, ref.inode)) {
 				ext4_inode_set_size(ref.inode, file->fpos); ref.dirty = true;
 			}
 		}
 	}
+    int direct_result = ext4_direct_write_flush(&ref, file, direct);
+    if (!r) r = direct_result;
+    ext4_free(direct);
 	file->fsize = ext4_inode_get_size(&fs->sb, ref.inode);
 	int cleanup = ext4_fs_put_inode_ref(&ref);
 	if (!r) r = cleanup;
 	r = ext4_trans_finish(file->mp, r);
+Completed:
 	if (ext4_file_rolled_back(file, r)) {
 		file->fsize = saved_size; file->fpos = saved_pos;
 		for (unsigned i = 0; i < count; i++) spans[i].written = 0;
+		/* Mapping growth may need more metadata than the admission minimum.
+		 * Retry only a real budget denial, after private rollback has ended;
+		 * allocator failures and an enclosing atomic operation still return. */
+		if (r == ENOMEM && outer && journal && journal->grouped &&
+		    budget_failures != journal->budget_failures) {
+			uint64_t target = jbd_journal_reclaim_target(journal);
+			if (target > journal->checkpoint_sequence) {
+				r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
+				if (!r) goto Retry;
+			}
+		}
 	}
 	ext4_file_completed(file, r);
 	if (!r) file->data_sequence = file->sync_sequence;
@@ -3378,8 +3533,9 @@ int ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsi
 	EXT4_MP_LOCK(file->mp);
 	ext4_file local = *file;
 	int r = ext4_write_spans(&local, spans, count);
+    file->fsize = local.fsize;
 	if (!r) {
-		file->fsize = local.fsize; file->sync_tid = local.sync_tid;
+		file->sync_tid = local.sync_tid;
 		if (file->sync_sequence < local.sync_sequence) file->sync_sequence = local.sync_sequence;
 		if (file->data_sequence < local.data_sequence) file->data_sequence = local.data_sequence;
 	}

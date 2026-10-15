@@ -150,6 +150,7 @@ struct jbd_journal {
 	bool grouped;
 	size_t memory_used, memory_peak, memory_limit;
 	size_t memory_cached;
+	uint64_t budget_failures;
 	RB_HEAD(jbd_source_tree, jbd_source) sources;
 	struct jbd_image *image_cache;
 	void *allocation_cache[6];
@@ -230,7 +231,7 @@ int jbd_journal_retire(struct jbd_journal *journal, int error);
  * owners outside it. Commit and checkpoint completion are distinct. */
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
-bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads,
+bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
 	const struct ext4_data_source *const *sources, unsigned count);
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,

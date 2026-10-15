@@ -149,7 +149,6 @@ static uint64_t test_satp;
 static int inject_partial_write_error;
 static int inject_truncate_error;
 static kernel_block_write_fn time_original_write;
-static kernel_block_flush_fn sync_original_flush;
 static unsigned int sync_flush_failures;
 static struct kernel_open_file_description *sendfile_flush_output;
 static uint64_t sendfile_flush_threshold;
@@ -162,18 +161,23 @@ static enum kernel_uaccess_status writeback_redirty_status;
 static size_t writeback_redirty_copied;
 static unsigned int writeback_redirty_seen;
 
-static enum kernel_block_status sync_test_flush(void *context)
+int __real_ext4_file_sync_metadata_mode(ext4_file *, bool);
+int __wrap_ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
 {
+    int result = __real_ext4_file_sync_metadata_mode(file, data_only);
+    if (result) return result;
+    /* A retryable sync result is distinct from a failed journal barrier:
+     * the latter poisons the mount and is tested by the final fixture. */
     if (sendfile_flush_output != 0 &&
         kernel_open_file_size(sendfile_flush_output) >= sendfile_flush_threshold) {
         sendfile_flush_output = 0;
-        return KERNEL_BLOCK_STATUS_IO;
+        return EIO;
     }
     if (sync_flush_failures != 0U) {
         sync_flush_failures--;
-        return KERNEL_BLOCK_STATUS_IO;
+        return EIO;
     }
-    return sync_original_flush(context);
+    return EOK;
 }
 
 static bool timestamp_test_clock(struct ext4_timestamp *now)
@@ -3770,8 +3774,6 @@ static void run_partial_write_test(const void *dtb)
     inject_partial_write_error = 0;
 
     /* Synchronous write errors leave the accepted bytes and offset visible. */
-    sync_original_flush = device.block.flush;
-    device.block.flush = sync_test_flush;
     const uint64_t sync_flags[] = {KERNEL_FILES_O_DSYNC, KERNEL_FILES_O_SYNC};
     for (size_t n = 0; n < 2; n++) {
         if (!write_user_bytes(&mm, TEST_USER_PATH, "/sync-file", 11U) ||
@@ -3844,10 +3846,9 @@ static void run_partial_write_test(const void *dtb)
     if (kernel_files_ftruncate(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK || result != 0 ||
         kernel_files_lseek(&files, 0, 28, 0, &result) != KERNEL_FILES_STATUS_OK || result != 28)
         fail_files(455U, 28, result);
-    device.block.flush = sync_original_flush;
 
     /* msync keeps the inode's writeback error owner while the mapping pins
-     * its OFD. A second sync observes successful retry after a failed flush. */
+     * its OFD. A second sync observes a successful retry after the reported sync error. */
     struct kernel_open_file_description *mapping_pin = 0;
     uint64_t shared_address = 0;
     unsigned char mapped_value = 'M';
@@ -3866,7 +3867,6 @@ static void run_partial_write_test(const void *dtb)
                                      KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
         !write_user_bytes(&mm, shared_address, &mapped_value, 1U))
         fail_files(429U, 0, result);
-    device.block.flush = sync_test_flush;
     sync_flush_failures = 1U;
     if (kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) !=
             -KERNEL_EIO || sync_flush_failures != 0U ||
@@ -3960,7 +3960,6 @@ static void run_partial_write_test(const void *dtb)
     if (!read_user_bytes(&mm, TEST_USER_BUFFER, &persisted_value, 1U) ||
         persisted_value != 'O')
         fail_files(440U, 'O', persisted_value);
-    device.block.flush = sync_original_flush;
 
     if (kernel_files_pin(&files, 0, &mapping_pin, &result) !=
             KERNEL_FILES_STATUS_OK || result != 0 ||

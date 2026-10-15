@@ -20,6 +20,7 @@ struct kernel_vfs_instance {
     struct kernel_mutex namespace_lock;
     struct kernel_heap *heap;
     struct kernel_page_cache *page_cache;
+    size_t writeback_block_size; /* Zero means no block alignment requirement. */
     struct kernel_vfs_node *nodes;
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */

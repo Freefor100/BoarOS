@@ -11,8 +11,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-PAGES = 16
-LENGTH = 20 * 4096 + 123
+PAGES = 64
+LENGTH = 68 * 4096 + 123
 PHASES = ('single-read', 'single-pread', 'single-hot',
           'read', 'pread', 'hot', 'readv', 'unaligned', 'mixed', 'eof', 'at-eof',
           'efault-prefix', 'efault-first', 'eio-prefix', 'eio-first', 'eio-gap', 'retry', 'held-owner', 'hole')
@@ -64,34 +64,34 @@ def verify_requests(phase, requests, maps, block_size):
     actual = Counter()
     for request in requests:
         offset, size = request['offset'], request['size']
-        if offset % 512 or size % 512 or not 0 < size <= 8 * 4096:
+        if offset % 512 or size % 512 or not 0 < size <= 32 * 4096:
             raise RuntimeError(f'{phase}: invalid bounded READ {request}')
         actual.update(range(offset // 512, (offset + size) // 512))
     if phase in ('efault-prefix', 'efault-first'):
         # User access may fail after the first demand window has been loaded.
         allowed = sectors(maps['data'], block_size, range(PAGES))
-        if actual - allowed or sum(actual.values()) > 8 * 4096 // 512:
+        if actual - allowed or sum(actual.values()) > 32 * 4096 // 512:
             raise RuntimeError(f'{phase}: I/O continued past the first failing user-copy window: {requests}')
         return
     pages = ((2,) if phase == 'single-read' else (3,) if phase == 'single-pread' else
-             range(17) if phase == 'unaligned' else
+             range(65) if phase == 'unaligned' else
              [i for i in range(PAGES) if i not in (1, 4, 7, 10, 13)] if phase == 'mixed' else
-             (19, 20) if phase == 'eof' else () if phase in ('single-hot', 'hot', 'at-eof') else
-             (0, 1, 2, 3, 5, 6, 7) if phase == 'eio-gap' else
-             range(8) if phase == 'eio-first' else range(PAGES))
+             (67, 68) if phase == 'eof' else () if phase in ('single-hot', 'hot', 'at-eof') else
+             [i for i in range(32) if i != 4] if phase == 'eio-gap' else
+             range(32) if phase == 'eio-first' else range(PAGES))
     expected = sectors(maps['hole' if phase == 'hole' else 'data'], block_size, pages)
     if actual != expected:
         raise RuntimeError(f'{phase}: data READ coverage differs: {requests}; missing={expected - actual}, extra={actual - expected}')
     sizes = [request['size'] for request in requests]
     if phase in ('single-read', 'single-pread') and sizes != [4096]:
         raise RuntimeError(f'{phase}: a single-page demand did not issue one 4KiB READ: {requests}')
-    if phase in ('read', 'pread', 'readv', 'retry', 'eio-prefix', 'held-owner') and sizes != [32768, 32768]:
-        raise RuntimeError(f'{phase}: ordinary 64KiB read did not form two 32KiB SG requests: {requests}')
-    if phase == 'eio-first' and sizes != [32768]:
+    if phase in ('read', 'pread', 'readv', 'retry', 'eio-prefix', 'held-owner') and sizes != [131072, 131072]:
+        raise RuntimeError(f'{phase}: ordinary 256KiB read did not form two 128KiB SG requests: {requests}')
+    if phase == 'eio-first' and sizes != [131072]:
         raise RuntimeError(f'{phase}: I/O continued after its first failed batch: {requests}')
-    if phase == 'eio-gap' and sizes != [16384, 12288]:
+    if phase == 'eio-gap' and sizes != [16384, 110592]:
         raise RuntimeError(f'{phase}: a cached page did not divide the failed demand window: {requests}')
-    if phase == 'unaligned' and sizes != [32768, 32768, 4096]:
+    if phase == 'unaligned' and sizes != [131072, 131072, 4096]:
         raise RuntimeError(f'{phase}: unexpected page window: {requests}')
 
 

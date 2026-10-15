@@ -26,12 +26,12 @@
 #define BOAROS_PAGE_CACHE_READAHEAD_PAGES 0
 #endif
 _Static_assert(BOAROS_PAGE_CACHE_READAHEAD_PAGES == 0, "demand reads require RA0");
-_Static_assert(KERNEL_PAGE_CACHE_READ_BATCH_MAX == 8, "exercise the existing eight-page bound");
+_Static_assert(KERNEL_PAGE_CACHE_READ_BATCH_MAX == 32, "exercise the 128 KiB demand window");
 #define USER UINT64_C(0x21000000)
-#define USER_SIZE UINT64_C(0x20000)
+#define USER_SIZE UINT64_C(0x80000)
 #define BUFFER (USER + UINT64_C(0x4000))
-#define LENGTH (20U * 4096U + 123U)
-#define REQUEST (16U * 4096U)
+#define LENGTH (68U * 4096U + 123U)
+#define REQUEST (64U * 4096U)
 
 static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator allocator;
@@ -48,7 +48,7 @@ static unsigned model_user, completed;
 static unsigned char scratch[4096];
 static struct kernel_task *reader_task;
 static unsigned reader_done, observe_dma;
-static uint64_t dma_pages[8];
+static uint64_t dma_pages[32];
 static size_t dma_count;
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 
@@ -101,7 +101,7 @@ int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_v
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
 {
     if (observe_dma && !dma_count) {
-        check(count == 8, 12);
+        check(count == 32, 12);
         for (size_t i = 0; i < count; i++) {
             check(spans[i].size == 4096 && !((uintptr_t)spans[i].buffer & 4095), 13);
             dma_pages[i] = (uintptr_t)spans[i].buffer;
@@ -197,7 +197,7 @@ static void held_dma(void)
     struct kernel_thread_join reader = {0};
     check(kernel_thread_create_joinable(held_reader, 0, &reader) == KERNEL_SCHEDULER_STATUS_OK, 41);
     while (!reader_task || reader_task->state != KERNEL_THREAD_STATE_BLOCKED) yield();
-    check(dma_count == 8 && device.queue.inflight == 1 && device.active == 1 && !reader_done, 42);
+    check(dma_count == 32 && device.queue.inflight == 1 && device.active == 1 && !reader_done, 42);
     close_file();
     check(kernel_page_cache_reclaim(&cache, 1024) == 0, 43);
     for (size_t i = 0; i < dma_count; i++) {
@@ -249,7 +249,7 @@ static void exercise(void *unused)
     check(read(BUFFER, REQUEST) == REQUEST, 62); position(REQUEST); verify(BUFFER, 0, REQUEST, 0);
     end("hot");
 
-    struct kernel_uaccess_iovec vectors[3] = {{BUFFER + 3, 32755}, {USER, 0}, {USER + 0x10000 + 5, 32781}};
+    struct kernel_uaccess_iovec vectors[3] = {{BUFFER + 3, 131059}, {USER, 0}, {USER + 0x30000 + 5, 131085}};
     copy_in(USER, vectors, sizeof(vectors)); seek(0); cold(); begin("readv");
     int64_t result;
     check(kernel_files_readv(&files, &mm, 0, USER, 3, &result) == KERNEL_FILES_STATUS_OK && result == REQUEST, 63);
@@ -267,7 +267,7 @@ static void exercise(void *unused)
     seek(0); begin("mixed");
     check(read(BUFFER, REQUEST) == REQUEST, 66); position(REQUEST); verify(BUFFER, 0, REQUEST, 0); end("mixed");
 
-    cold(); seek(20U * 4096U - 17); begin("eof");
+    cold(); seek(68U * 4096U - 17); begin("eof");
     check(read(BUFFER, 8192) == 140, 67); position(LENGTH); verify(BUFFER, LENGTH - 140, 140, 0); end("eof");
     begin("at-eof"); check(read(BUFFER, REQUEST) == 0 && read(USER + USER_SIZE, 0) == 0, 68);
     position(LENGTH); end("at-eof");
@@ -278,10 +278,10 @@ static void exercise(void *unused)
     cold(); seek(0); begin("efault-first");
     check(read(USER + USER_SIZE, REQUEST) == -KERNEL_EFAULT, 70); position(0); end("efault-first");
 
-    cold(); seek(0); memset(scratch, 0xcd, sizeof(scratch)); copy_in(BUFFER + 32768, scratch, sizeof(scratch));
-    begin("eio-prefix"); check(read(BUFFER, REQUEST) == 32768, 71); position(32768); verify(BUFFER, 0, 32768, 0);
+    cold(); seek(0); memset(scratch, 0xcd, sizeof(scratch)); copy_in(BUFFER + 131072, scratch, sizeof(scratch));
+    begin("eio-prefix"); check(read(BUFFER, REQUEST) == 131072, 71); position(131072); verify(BUFFER, 0, 131072, 0);
     size_t copied;
-    check(kernel_copy_from_user(&mm, scratch, BUFFER + 32768, sizeof(scratch), &copied) == KERNEL_UACCESS_STATUS_OK && copied == sizeof(scratch), 72);
+    check(kernel_copy_from_user(&mm, scratch, BUFFER + 131072, sizeof(scratch), &copied) == KERNEL_UACCESS_STATUS_OK && copied == sizeof(scratch), 72);
     for (size_t i = 0; i < sizeof(scratch); i++) check(scratch[i] == 0xcd, 73);
     end("eio-prefix");
     cold(); seek(0); begin("eio-first"); check(read(BUFFER, REQUEST) == -KERNEL_EIO, 74); position(0); end("eio-first");

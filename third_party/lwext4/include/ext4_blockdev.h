@@ -198,7 +198,7 @@ int ext4_block_init(struct ext4_blockdev *bdev);
 
 /** Device persistence barrier; ENOTSUP if the backend has no contract. */
 int ext4_blockdev_flush(struct ext4_blockdev *bdev);
-/* Logical block spans, at most eight non-overlapping ranges. */
+/* Logical block spans, at most EXT4_BLOCK_BATCH_MAX non-overlapping ranges. */
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	const struct ext4_block_span *spans, unsigned count);
 

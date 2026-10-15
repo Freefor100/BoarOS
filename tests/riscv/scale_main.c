@@ -173,7 +173,7 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t visits, snapshot;
     check(kernel_cost_end(6, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
-          visits <= 2 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 264);
+          visits <= 2 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 4096, 264);
     number("cache small-range visits: ", visits); number("cache one-byte snapshot: ", snapshot);
 #endif
     unsigned indices[] = {200, 3, 100};

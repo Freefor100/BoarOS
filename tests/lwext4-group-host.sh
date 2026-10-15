@@ -28,6 +28,18 @@ for block in 1024 4096; do
     cp "$work/base.img" "$work/bounds.img"
     "$work/probe" "$work/bounds.img" group-bounds
     e2fsck -fn "$work/bounds.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    cp "$work/base.img" "$work/bounds.img"
+    "$work/probe" "$work/bounds.img" group-borrow-admission
+    e2fsck -fn "$work/bounds.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    for fault in 0 1 2; do
+        for persist in 0 1 2; do
+            cp "$work/base.img" "$work/barrier.img"
+            "$work/probe" "$work/barrier.img" group-barrier "$fault" "$persist"
+            "$work/probe" "$work/barrier.img" group-barrier-recovery
+            "$work/probe" "$work/barrier.img" group-barrier-recovery
+            e2fsck -fn "$work/barrier.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+        done
+    done
     cp "$work/base.img" "$work/pipeline.img"
     "$work/probe" "$work/pipeline.img" group-ring
     e2fsck -fn "$work/pipeline.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
@@ -46,7 +58,14 @@ for block in 1024 4096; do
     cp "$work/base.img" "$work/owner.img"
     "$work/probe" "$work/owner.img" group-data-batch
     e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
-    for mode in group-source-budget group-source-error; do
+    for mode in direct-data-batch direct-data-error; do
+        truncate -s 32M "$work/direct.img"
+        mkfs.ext4 -q -F -b "$block" -I 256 -O '^has_journal' "$work/direct.img"
+        "$work/probe" "$work/direct.img" seed
+        "$work/probe" "$work/direct.img" "$mode"
+        e2fsck -fn "$work/direct.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
+    for mode in group-partial-owner group-partial-error group-source-budget group-source-error; do
         cp "$work/base.img" "$work/owner.img"
         "$work/probe" "$work/owner.img" "$mode"
         "$work/probe" "$work/owner.img" group-recovery

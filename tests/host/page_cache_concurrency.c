@@ -265,6 +265,15 @@ static int rearm_alias(void *owner, uint64_t address)
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct kernel_vfs_writeback_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct kernel_vfs_writeback_span *spans,size_t count)
 {
+    for (size_t i=0;i<count;i++) {
+        size_t block=node->instance->writeback_block_size;
+        uintptr_t base=(uintptr_t)spans[i].source_buffer, input=(uintptr_t)spans[i].buffer;
+        assert(base && input>=base && spans[i].size<=spans[i].source_size-(input-base));
+        if (block<=BOAROS_PAGE_SIZE) {
+            assert(spans[i].source_size%block==0 && input-base==spans[i].offset%block);
+            assert(spans[i].source_size==((spans[i].size+input-base+block-1)/block)*block);
+        }
+    }
     if (__atomic_exchange_n(&pause_write,0,__ATOMIC_ACQ_REL)) {
         __atomic_store_n(&write_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_write,__ATOMIC_ACQUIRE)) sched_yield();
@@ -299,6 +308,57 @@ static void *drain_alias(void *arg)
     __atomic_store_n(&drain_done,1,__ATOMIC_RELEASE);
     return 0;
 }
+static void sparse_cache_growth(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,
+    unsigned actors)
+{
+    char name[48]; snprintf(name,sizeof(name),"/sparse-growth-%u",actors);
+    struct kernel_vfs_file file={0}; assert(!kernel_vfs_create(mount,name,0600,&file));
+    uint64_t end=2*BOAROS_PAGE_SIZE+3; size_t count;
+    assert(!kernel_vfs_pwrite(&file,end,"end",3,&count) && count==3);
+    unsigned char bytes[80]; memset(bytes,0xcc,sizeof(bytes));
+    assert(!kernel_vfs_pread(&file,end-45,bytes,sizeof(bytes),&count) && count==48);
+    for (unsigned i=0;i<45;i++) assert(!bytes[i]);
+    assert(!memcmp(bytes+45,"end",3));
+    uint64_t address; size_t valid;
+    assert(!kernel_page_cache_get(cache,&file,0,&address,&valid) && valid==BOAROS_PAGE_SIZE);
+    for (size_t i=0;i<valid;i++) assert(!((unsigned char *)access_page(address))[i]);
+    assert(!physical_page_release(cache->allocator,address));
+    uint64_t observed=kernel_vfs_error_sequence(&file);
+    assert(!kernel_vfs_sync(&file,0,&observed));
+    assert(!kernel_vfs_close(&file));
+    puts("PASS sparse cache growth: uncached zero gap below logical EOF before backend size acceptance");
+}
+
+static void partial_snapshot(struct kernel_page_cache *cache,struct kernel_vfs_file *file,
+    struct physical_page_allocator *pages)
+{
+    uint64_t observed=kernel_vfs_error_sequence(file);
+    assert(!kernel_vfs_sync(file,0,&observed));
+    unsigned char before=0xa3; size_t count;
+    assert(!kernel_vfs_pwrite(file,17,&before,1,&count) && count==1);
+    uint64_t address; size_t valid;
+    assert(!kernel_page_cache_get(cache,file,0,&address,&valid));
+    struct kernel_page_cache_alias alias={0};
+    assert(!kernel_page_cache_alias_attach(cache,file,0,address,&alias,
+        kernel_vfs_file_node(file),0x80000,rearm_alias));
+    write_entered=resume_write=sync_done=0; pause_write=1;
+    pthread_t sync; assert(!pthread_create(&sync,0,sync_file,file));
+    while (!__atomic_load_n(&write_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    struct kernel_page_cache_write_borrow writer={0};
+    assert(!kernel_page_cache_alias_write_begin(&alias,&writer));
+    ((unsigned char *)access_page(address))[17]=0xb4;
+    kernel_page_cache_alias_mark_dirty(&alias); kernel_page_cache_write_end(&writer);
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(sync,0));
+    unsigned char actual;
+    assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),17,&actual,1,&count) && count==1 && actual==before);
+    assert(!kernel_vfs_sync(file,0,&observed));
+    assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),17,&actual,1,&count) && count==1 && actual==0xb4);
+    kernel_page_cache_alias_detach(&alias); kernel_page_cache_alias_drain(&alias);
+    assert(!physical_page_release(pages,address));
+    puts("PASS one-byte stable block: concurrent alias mutation preserves old borrowed bytes and next dirty generation");
+}
+
 static void alias_snapshot(struct kernel_page_cache *cache, struct kernel_vfs_file *file,
     struct physical_page_allocator *pages,unsigned count,int force_retry)
 {
@@ -498,7 +558,10 @@ static void demand_contents(const struct kernel_page_cache_read_page *page,
 {
     assert(!page->status && page->physical_address && page->valid_bytes == valid);
     const unsigned char *data = access_page(page->physical_address);
-    for (size_t i = 0; i < valid; i++) assert(data[i] == byte);
+    for (size_t i = 0; i < valid; i++) {
+        if (data[i]!=byte) fprintf(stderr,"demand content offset=%zu actual=%u expected=%u valid=%zu\n",i,data[i],byte,valid);
+        assert(data[i] == byte);
+    }
 }
 static void demand_release(struct demand_read *read)
 {
@@ -952,6 +1015,8 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     disk_mm_case(cache, heap, pages, &mount, name);
     kernel_page_cache_stop_worker(cache);
 #endif
+    sparse_cache_growth(cache,&mount,actors);
+    partial_snapshot(cache,&file,pages);
     for (unsigned force_retry=0;force_retry<2;force_retry++) {
         alias_snapshot(cache, &file, pages,1,force_retry);
         alias_snapshot(cache, &file, pages,8,force_retry);

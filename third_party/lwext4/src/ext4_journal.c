@@ -84,10 +84,12 @@ static void jbd_trim_cache(struct jbd_journal *journal, size_t target);
 static bool jbd_budget_room(struct jbd_journal *journal, size_t bytes)
 {
     if (!journal->memory_limit) return true;
-    if (bytes > journal->memory_limit) return false;
+    if (bytes > journal->memory_limit) { journal->budget_failures++; return false; }
     if (journal->memory_used > journal->memory_limit - bytes)
         jbd_trim_cache(journal, 0);
-    return journal->memory_used <= journal->memory_limit - bytes;
+    if (journal->memory_used <= journal->memory_limit - bytes) return true;
+    journal->budget_failures++;
+    return false;
 }
 static void jbd_note_peak(struct jbd_journal *journal)
 {
@@ -2313,7 +2315,7 @@ static void jbd_trans_release_data(struct jbd_trans *trans, bool abort __unused)
 	}
 }
 
-static int jbd_trans_flush_ordered(struct jbd_trans *trans)
+static int jbd_trans_write_ordered(struct jbd_trans *trans)
 {
 	struct ext4_blockdev *bdev = trans->journal->jbd_fs->bdev;
 	struct jbd_data *data;
@@ -2322,8 +2324,7 @@ static int jbd_trans_flush_ordered(struct jbd_trans *trans)
 		int r = jbd_batch_add(bdev, &batch, data->block.data, data->block.lb_id);
 		if (r) return r;
 	}
-	int r = jbd_batch_flush(bdev, &batch);
-	return r || !trans->ordered_count ? r : ext4_blockdev_flush(bdev);
+	return jbd_batch_flush(bdev, &batch);
 }
 
 /**@brief  Add block to a transaction and mark it dirty.
@@ -2979,7 +2980,9 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		/* Since there are no entries in both buffer list
 		 * and revoke entry list, we do not consider trans as
 		 * complete transaction and just return EOK.*/
-		rc = jbd_trans_flush_ordered(trans);
+		rc = jbd_trans_write_ordered(trans);
+		if (!rc && trans->ordered_count)
+			rc = ext4_blockdev_flush(journal->jbd_fs->bdev);
 		jbd_journal_free_trans(journal, trans, rc != EOK);
 		return rc;
 	}
@@ -2987,7 +2990,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 	rc = jbd_trans_prepare_commit_block(trans);
 	if (rc != EOK)
 		goto Finish;
-	rc = jbd_trans_flush_ordered(trans);
+	rc = jbd_trans_write_ordered(trans);
 	if (rc != EOK) {
 		journal->last = old_last;
 		jbd_journal_free_trans(journal, trans, true);
@@ -3232,20 +3235,11 @@ int jbd_journal_submit(struct jbd_journal *journal)
 	COST_SCOPE(submit_cost, JOURNAL_SUBMIT_TICKS);
 	struct jbd_trans *trans = journal->committing;
 	if (!trans) return EOK;
-	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
-	struct jbd_data *data;
 	int r = EOK;
 	bool submitted = false;
 	{
 	COST_PHASE_SCOPE(ordered_phase, 1);
-	struct jbd_io_batch batch = {0};
-	TAILQ_FOREACH(data, &trans->data_queue, node) {
-		r = jbd_batch_add(bdev, &batch, data->block.data, data->block.lb_id);
-		if (r != EOK) return r;
-	}
-	r = jbd_batch_flush(bdev, &batch);
-	if (r != EOK) return r;
-	if (!TAILQ_EMPTY(&trans->data_queue)) r = ext4_blockdev_flush(bdev);
+	r = jbd_trans_write_ordered(trans);
 	}
 	if (r == EOK) { COST_PHASE_SCOPE(log_phase, 2); r = jbd_write_prepared(trans, &submitted); }
 	return r;
@@ -3374,18 +3368,22 @@ uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal)
 	return trans ? trans->sequence : 0;
 }
 
-bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads,
+bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
 	const struct ext4_data_source *const *sources, unsigned count)
 {
-	/* 最小私有操作预留 undo、metadata 版本和 descriptor；payload
-	 * 只占日志块与节点。新组另需 checkpoint/commit 的可写镜像。 */
+	/* Private metadata needs undo/version/control space; borrowed file data
+	 * needs records and one charge per distinct owner, never a block image.
+	 * Allocators enforce the same hard budget for additional mapping changes. */
 	size_t images = journal->running ? 3 : 5;
-	if (images < payloads) images = payloads;
+	if (data_images > SIZE_MAX - images) return false;
+	images += data_images;
 	size_t per_image = jbd_image_charge(journal) + 256;
 	size_t fixed = jbd_allocation_charge(sizeof(struct jbd_trans)) + 4 * 256;
 	if (images > (SIZE_MAX - fixed) / per_image) return false;
-	size_t minimum = images * per_image +
-		fixed;
+	size_t minimum = images * per_image + fixed;
+	size_t record = jbd_allocation_charge(sizeof(struct jbd_data));
+	if (payloads > (SIZE_MAX - minimum) / record) return false;
+	minimum += payloads * record;
 	for (unsigned i = 0; i < count; i++) {
 		struct jbd_source key = { .owner.context = sources[i]->context };
 		if (RB_FIND(jbd_source_tree, &journal->sources, &key)) continue;

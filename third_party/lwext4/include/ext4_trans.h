@@ -72,6 +72,11 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 		   struct ext4_block *b,
 		   uint64_t lba);
 
+struct ext4_block_span;
+/* Synchronous non-journal stable blocks; explicit bcache borrows remain coherent. */
+int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
+    const struct ext4_block_span *spans, unsigned count);
+
 struct ext4_data_source;
 /* A private replacement version makes abort discard-only. Full blocks can
  * retain an immutable caller source; partial updates assemble one new block. */

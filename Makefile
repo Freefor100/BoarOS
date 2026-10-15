@@ -1047,6 +1047,7 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=physical_page_allocate_order \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=ext4_fpwrite_batch \
+		-Wl,--wrap=ext4_file_sync_metadata_mode \
 		-Wl,--wrap=ext4_ftruncate \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-partial-write-rv.map \
 		-o $@ $(FILES_PARTIAL_WRITE_TEST_OBJECTS)
