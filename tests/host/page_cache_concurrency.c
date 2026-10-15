@@ -370,10 +370,14 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)));
     source_reads = read_entered = resume_read = 0; pause_read = 1;
     source_error = -KERNEL_EIO; expected_status = KERNEL_PAGE_CACHE_STATUS_IO;
-    for (unsigned i = 1; i <= actors; i++) assert(!pthread_create(&threads[i - 1], 0, get_cold_page, (void *)(uintptr_t)i));
+    assert(!pthread_create(&threads[0], 0, get_cold_page, (void *)(uintptr_t)1));
     while (!__atomic_load_n(&read_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    /* 先发布被暂停的loading，再让其余actor借用同一次失败I/O；
+     * 提前入队的请求尚无entry，不能用entry_borrows等待它们。 */
+    for (unsigned i = 2; i <= actors; i++) assert(!pthread_create(&threads[i - 1], 0, get_cold_page, (void *)(uintptr_t)i));
     do { kernel_page_cache_get_concurrency_state(cache, &state); sched_yield(); }
     while (state.entry_borrows != actors);
+    assert(state.running == 1 && !state.pending);
     __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
     for (unsigned i = 1; i <= actors; i++) assert(!pthread_join(threads[i - 1], 0));
     source_error = 0; expected_status = KERNEL_PAGE_CACHE_STATUS_OK;
