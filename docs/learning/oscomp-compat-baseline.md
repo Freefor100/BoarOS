@@ -570,17 +570,52 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 
 ## 当前主线集成的验证范围
 
-兼容分支集成main `16951f0bfafd196452ccce705dc9d2d3f7ffc91a`，保留双架构
-默认构建、兼容uname、原盘loader、监督/显式shell及LA调度DSO。共同README和
-路线图采用主线当前能力与限制，历史提交及正式成绩保留原身份。
+当前兼容分支通过 `ff9ceea` 集成 main `458893b`，保留双架构默认构建、兼容 uname、
+原盘 loader、监督/显式 shell 及 LA 调度 DSO。I/O 通路的设计、固定工作量与最终 fsync
+比较见 [VFS/ext4 模块](../modules/vfs-ext4.md)。
 
-合并树的61项OSComp host及20项CI host通过；raw/等待/可睡眠锁及4/16KiB、
+本次 iozone 在 RV、LA 分别独占运行，复用之前 `3189b00` 的原盘、程序和参数：
+单 CPU、1 GiB，RV QEMU 11.1.2/MMIO，LA QEMU 11.1.0/PCI，关闭成本诊断。
+两侧各一次完整启动，glibc/musl 原脚本均结束，退出状态、内核错误及根盘资源回收检查通过。
+原 judge 分数如下，不与早先完整比赛的联合成绩合并：
+
+| 内核 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| `3189b00` | 33.393410 | 33.230391 | 35.663898 | 35.291900 |
+| `ff9ceea` | 35.228576 | 34.679442 | 36.486410 | 36.409846 |
+
+原程序仍对最后的 11/12 方法打印 `Selected test not available on the version`；
+该输出和原判分均保留。RV 普通版同一 iozone 启动的最少剩余任务栈由 656 字节提高到
+2984 字节，仍使用原来的 8 KiB 栈；诊断版另用 36 个完整写入负载检查，最少剩余 2088 字节。
+
+单项结果也保留：RV musl 四进程 Parent read 从 34258.19 降到 21884.29 kB/s，
+而各进程最少传输量由 699 KiB 变成 569 KiB，该模式在首个完成后停止其余进程。
+随后复用现有 readers 程序，以同一 ELF、1 KiB 请求、每进程固定读取 8 MiB，
+等四个进程都完成；交替版本顺序，各三次独立启动，96 条进程内容/长度记录全部通过。
+使用 main 修改前后的相同配置内核，下面为四进程合计 32 MiB 的中位速率（MiB/s）：
+
+| 读取关系 | 修改前 | 修改后 |
+|---|---:|---:|
+| 同文件冷读 | 30.15 | 30.35 |
+| 同文件热读 | 63.94 | 70.87 |
+| 独立文件冷读 | 22.68 | 22.85 |
+| 独立文件热读 | 65.15 | 70.84 |
+
+固定字节数对照没有复现上述幅度的并发读下降；原 iozone 单项仍按实测值记录。
+本机结果目录为 `build/io-impl-20261015/{iozone-rv,iozone-la,readers}`。
+
+```sh
+python3 -B tests/oscomp/run.py --arch riscv --groups iozone --diagnostic-timeout 600
+python3 -B tests/oscomp/run.py --arch loongarch --groups iozone --diagnostic-timeout 600
+```
+
+此前集成 main `16951f0` 时，61项OSComp host及20项CI host通过；raw/等待/可睡眠锁及4/16KiB、
 2/4线程allocator并发门禁通过。相同raw supervisor在固定Linux与BoarOS、
 RV/LA各512MiB/1GiB的八次启动通过，含native退出、组隔离、超时KILL/reap；
 通用fixture的双架构两种RAM等待切换通过。原盘环境诊断两侧各一次1GiB启动
 均正常退出，PID1/页/堆/任务栈/根盘及设备owner核对通过。
 
-| 本次原judge聚焦组 | RV glibc | RV musl | LA glibc | LA musl |
+| 此前 environment 原judge组 | RV glibc | RV musl | LA glibc | LA musl |
 |---|---:|---:|---:|---:|
 | basic | 86 | 90 | 90 | 90 |
 | BusyBox | 54 | 54 | 54 | 54 |
