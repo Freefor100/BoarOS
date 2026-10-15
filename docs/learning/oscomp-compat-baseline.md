@@ -570,11 +570,11 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 
 ## 当前主线集成的验证范围
 
-当前兼容分支通过 `ff9ceea` 集成 main `458893b`，保留双架构默认构建、兼容 uname、
+当前兼容分支通过 `dfaa65d` 集成 main `1807501`，保留双架构默认构建、兼容 uname、
 原盘 loader、监督/显式 shell 及 LA 调度 DSO。I/O 通路的设计、固定工作量与最终 fsync
 比较见 [VFS/ext4 模块](../modules/vfs-ext4.md)。
 
-本次 iozone 在 RV、LA 分别独占运行，复用之前 `3189b00` 的原盘、程序和参数：
+此前 `ff9ceea` 的 iozone 在 RV、LA 分别独占运行，复用 `3189b00` 的原盘、程序和参数：
 单 CPU、1 GiB，RV QEMU 11.1.2/MMIO，LA QEMU 11.1.0/PCI，关闭成本诊断。
 两侧各一次完整启动，glibc/musl 原脚本均结束，退出状态、内核错误及根盘资源回收检查通过。
 原 judge 分数如下，不与早先完整比赛的联合成绩合并：
@@ -588,21 +588,34 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 该输出和原判分均保留。RV 普通版同一 iozone 启动的最少剩余任务栈由 656 字节提高到
 2984 字节，仍使用原来的 8 KiB 栈；诊断版另用 36 个完整写入负载检查，最少剩余 2088 字节。
 
-单项结果也保留：RV musl 四进程 Parent read 从 34258.19 降到 21884.29 kB/s，
-而各进程最少传输量由 699 KiB 变成 569 KiB，该模式在首个完成后停止其余进程。
-随后复用现有 readers 程序，以同一 ELF、1 KiB 请求、每进程固定读取 8 MiB，
-等四个进程都完成；交替版本顺序，各三次独立启动，96 条进程内容/长度记录全部通过。
-使用 main 修改前后的相同配置内核，下面为四进程合计 32 MiB 的中位速率（MiB/s）：
+此前单次 RV musl 四进程 Parent read 从 34258.19 降到 21884.29 KiB/s，
+该结果仍保留。后续调查直接使用原脚本作六次交替启动，又用原 iozone ELF 的
+`-C` / `-C -x` 比较提前停止与完整读取；没有以固定字节数 readers 程序替代归因。
+Parent 的分子是实际计入量，分母还包括读循环后的四次 fsync、关闭与回收，
+不是 Children 独立速率之和的另一种显示。多轮结果与逐阶段分析见
+[VFS/ext4 的原 iozone 对照](../modules/vfs-ext4.md#当前成本边界)。
 
-| 读取关系 | 修改前 | 修改后 |
-|---|---:|---:|
-| 同文件冷读 | 30.15 | 30.35 |
-| 同文件热读 | 63.94 | 70.87 |
-| 独立文件冷读 | 22.68 | 22.85 |
-| 独立文件热读 | 65.15 | 70.84 |
+低 Parent 的可重复部分定位到宿主稀疏 raw backing 的首次分配：日志推进到原有
+hole 后，两次 guest commit flush 对应的 host fdatasync 变慢。原盘 journal 在
+宿主仅前 558 个 4 KiB 块已有 backing；新旧版本在不同轮次跨过这一地址，
+故同名 reader 单项可能承担不同的宿主分配成本。写实镜像的原程序对照消除了该增长。
+`fd40a8b` 因此修改本地 runner：复制原盘时写实独立副本，启动 guest 前 fsync；
+每份 4 GiB 工作镜像实际占用约 4 GiB，准备时间不计入 guest 运行。
+镜像字节、原脚本、程序和 judge 保持相同；内核的追加写、SG 和需求读取合批实现未变。
 
-固定字节数对照没有复现上述幅度的并发读下降；原 iozone 单项仍按实测值记录。
-本机结果目录为 `build/io-impl-20261015/{iozone-rv,iozone-la,readers}`。
+在 `dfaa65d` 的干净工作树上，使用该准备方式重新完整运行一次 RV 原 iozone 组，
+关闭成本诊断且不加载归因库。glibc/musl 脚本均正常结束，设备错误和超时为零，
+根盘页、堆及任务栈检查通过；本次只重测 RV，LA 保留上表的历史结果。
+
+| 写实镜像上的原组 | 原 judge 分数 | 四进程 Parent read，KiB/s | Children，KiB/s |
+|---|---:|---:|---:|
+| RV glibc | 35.261479 | 36068.49 | 123461.80 |
+| RV musl | 34.766263 | 37392.91 | 122023.42 |
+
+这些是镜像准备修正后的独立运行结果，不把宿主分配成本的变化写成新的内核加速。
+`test-cost-report.py` 43 项通过；`make test-oscomp-host` 63 项通过，含真实稀疏源复制、
+完整初始化与准备期 fsync 错误传播两项回归，旧复制方式在这两项均失败。
+保留目录为 `build/iozone-parent-20261015/{original,focused,wait-runs,materialized-runs,merged-initialized}`。
 
 ```sh
 python3 -B tests/oscomp/run.py --arch riscv --groups iozone --diagnostic-timeout 600
