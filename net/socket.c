@@ -37,12 +37,12 @@
 struct socket_packet {
     struct socket_packet *next;
     struct pbuf *payload;
-    void *data;
     uint32_t length;
     struct kernel_socket_address address;
     uint32_t consumed;
     struct kernel_socket *unix_sender;
     uint32_t send_charge;
+    unsigned char data[];
 };
 
 struct socket_pending {
@@ -787,10 +787,6 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         if (packet->payload != 0) {
             socket_pbuf_free(packet->payload);
         }
-        if (packet->data != 0) {
-            if (kernel_heap_release(socket->heap, packet->data) != KERNEL_HEAP_STATUS_OK)
-                __builtin_trap();
-        }
         unix_uncharge(packet);
         if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK)
             __builtin_trap();
@@ -1205,10 +1201,8 @@ void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
         if (pbuf_copy_partial(packet->payload, buffer, (u16_t)length,
                               packet->consumed + offset) != length)
             __builtin_trap();
-    } else if (packet->data != 0) {
-        __builtin_memcpy(buffer, (const char *)packet->data + packet->consumed + offset, length);
     } else {
-        __builtin_trap();
+        __builtin_memcpy(buffer, (const char *)packet->data + packet->consumed + offset, length);
     }
 }
 
@@ -1233,7 +1227,7 @@ int kernel_socket_read_user(const struct kernel_socket_read_request *request,
             if (length > (size_t)(part->len - offset)) length = part->len - offset;
             source = (const unsigned char *)part->payload + offset;
         } else {
-            if (!packet->data || packet->payload) __builtin_trap();
+            if (packet->payload) __builtin_trap();
             source = (const unsigned char *)packet->data + offset;
         }
         enum kernel_uaccess_status status = kernel_copy_to_user_iov(mm, cursor,
@@ -1282,10 +1276,6 @@ void kernel_socket_finish_read(struct kernel_socket_read_request *request,
         socket->packets_head = packet->next;
         if (socket->packets_head == 0) socket->packets_tail = 0;
         if (packet->payload != 0) socket_pbuf_free(packet->payload);
-        if (packet->data != 0) {
-            if (kernel_heap_release(socket->heap, packet->data) != KERNEL_HEAP_STATUS_OK)
-                __builtin_trap();
-        }
         unix_uncharge(packet);
         if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK)
             __builtin_trap();
@@ -1348,8 +1338,6 @@ static void free_write_packet(struct kernel_socket_write_request *request)
     }
     struct socket_packet *packet = request->packet;
     if (!packet) return;
-    if (packet->data && kernel_heap_release(request->socket->heap, packet->data) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
     if (kernel_heap_release(request->socket->heap, packet) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     request->packet = 0;
     receive_capacity();
@@ -1414,22 +1402,35 @@ static int unix_reserve_packet(struct kernel_socket_write_request *request,uint3
     }
     arch_interrupt_restore(saved);return result;
 }
-static int socket_write_datagram_source(struct kernel_open_file_description **pin_owner,
-    struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
-    size_t iov_count, uint64_t count, uint32_t flags,
-    const struct kernel_socket_address *destination, const void *kernel_buffer)
+static int socket_write_packet_source(struct kernel_open_file_description **pin_owner,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t count, uint32_t flags,
+    const struct kernel_socket_address *destination, const void *kernel_buffer,
+    int *user_fault)
 {
+    if (user_fault) *user_fault=0;
     struct kernel_socket *socket = kernel_open_file_socket(*pin_owner);
-    /* sendfile 的 UDP actor 在协议长度检查前解析缺失的 connected peer。 */
-    if (kernel_buffer && socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination &&
-        !socket->connected && count <= UINT16_MAX) return -KERNEL_EDESTADDRREQ;
-    if (count > (socket->domain == KERNEL_SOCKET_DOMAIN_INET ? UDP_MAX_PAYLOAD : socket->tx_limit-32U) ||
-        count > socket->tx_limit) return -KERNEL_EMSGSIZE;
-    if (socket->write_closed) {
-        return -KERNEL_EPIPE;
+    if (socket->type == SOCKET_STREAM) {
+        if (socket->domain != KERNEL_SOCKET_DOMAIN_UNIX) __builtin_trap();
+        uintptr_t saved=kernel_socket_protocol_enter();
+        int failure=(!socket->peer || socket->write_closed || socket->peer->read_closed)
+            ?unix_peer_failure(socket):0;
+        kernel_socket_protocol_leave(saved);
+        if (failure) return failure;
+        if (!count) return 0;
+        uint32_t limit=socket->tx_limit/2U-64U;
+        if (limit>32768U) limit=32768U;
+        if (count>limit) count=limit;
+    } else {
+        /* sendfile 的 UDP actor 在协议长度检查前解析缺失的 connected peer。 */
+        if (kernel_buffer && socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination &&
+            !socket->connected && count <= UINT16_MAX) return -KERNEL_EDESTADDRREQ;
+        if (count > (socket->domain == KERNEL_SOCKET_DOMAIN_INET ? UDP_MAX_PAYLOAD : socket->tx_limit-32U) ||
+            count > socket->tx_limit) return -KERNEL_EMSGSIZE;
+        if (socket->write_closed) return -KERNEL_EPIPE;
+        if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)
+            return -KERNEL_EDESTADDRREQ;
     }
-    if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)
-        return -KERNEL_EDESTADDRREQ;
     struct kernel_socket_write_request request = {
         .socket = kernel_open_file_socket(*pin_owner), .task = kernel_task_current(),
         .pin = *pin_owner, .pin_owner = pin_owner,
@@ -1460,31 +1461,28 @@ static int socket_write_datagram_source(struct kernel_open_file_description **pi
     } else {
         KERNEL_NO_RECLAIM_IO;
         enum kernel_heap_status status = kernel_heap_allocate_zeroed(request.socket->heap,
-            1, sizeof(*packet), (void **)&packet);
+            1, sizeof(*packet)+(size_t)count, (void **)&packet);
         if (status != KERNEL_HEAP_STATUS_OK) {
             if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
             goto out;
         }
         request.packet = packet;
         packet->length = (uint32_t)count;
-        if (count) {
-            status = kernel_heap_allocate(request.socket->heap, (size_t)count, &packet->data);
-            if (status != KERNEL_HEAP_STATUS_OK) {
-                if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
-                goto out;
-            }
-        }
         data = packet->data;
     }
     if (kernel_buffer) {
         if (count) __builtin_memcpy(data, kernel_buffer, (size_t)count);
     } else {
-        struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
         size_t copied = 0;
-        enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
+        enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, cursor,
             data, (size_t)count, &copied);
-        if (access == KERNEL_UACCESS_STATUS_FAULT) { result = -KERNEL_EFAULT; goto out; }
-        if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
+        if (access == KERNEL_UACCESS_STATUS_FAULT) {
+            if (user_fault) *user_fault=1;
+            if (request.socket->type != SOCKET_STREAM || !copied) {
+                result = -KERNEL_EFAULT; goto out;
+            }
+            count=copied; packet->length=(uint32_t)copied;
+        } else if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
     }
     if (request.socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
         uintptr_t saved = kernel_socket_protocol_enter();
@@ -1525,15 +1523,23 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
     size_t iov_count, uint64_t count, uint32_t flags,
     const struct kernel_socket_address *destination)
 {
-    return socket_write_datagram_source(pin_owner, mm, iov, iov_count, count,
-                                        flags, destination, 0);
+    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
+    return socket_write_packet_source(pin_owner, mm, &cursor, count,
+                                        flags, destination, 0, 0);
 }
 
 int kernel_socket_write_datagram_buffer(struct kernel_open_file_description **pin_owner,
     const void *buffer, uint64_t count, uint32_t flags)
 {
     if (!buffer) return -KERNEL_EINVAL;
-    return socket_write_datagram_source(pin_owner, 0, 0, 0, count, flags, 0, buffer);
+    return socket_write_packet_source(pin_owner, 0, 0, count, flags, 0, buffer, 0);
+}
+
+int kernel_socket_write_unix(struct kernel_open_file_description **pin_owner,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t count, uint32_t flags, int *user_fault)
+{
+    return socket_write_packet_source(pin_owner,mm,cursor,count,flags,0,0,user_fault);
 }
 
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags)
@@ -1696,23 +1702,13 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
             if(to_write>chunk)to_write=chunk;
         }
         struct socket_packet *packet = 0;
-        void *data_buf = 0;
         enum kernel_heap_status heap_status;
-        if(to_write) {
-            heap_status=kernel_heap_allocate(peer->heap,to_write,(void **)&data_buf);
-            if(heap_status!=KERNEL_HEAP_STATUS_OK) {
-                if(heap_status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
-                kernel_socket_protocol_leave(old_status);return -KERNEL_ENOMEM;
-            }
-        }
-        heap_status=kernel_heap_allocate_zeroed(peer->heap,1U,sizeof(*packet),(void **)&packet);
+        heap_status=kernel_heap_allocate_zeroed(peer->heap,1U,sizeof(*packet)+to_write,(void **)&packet);
         if(heap_status!=KERNEL_HEAP_STATUS_OK) {
             if(heap_status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
-            if(data_buf && kernel_heap_release(peer->heap,data_buf)!=KERNEL_HEAP_STATUS_OK)__builtin_trap();
             kernel_socket_protocol_leave(old_status);return -KERNEL_ENOMEM;
         }
-        if(to_write)__builtin_memcpy(data_buf,buffer,to_write);
-        packet->data = data_buf;
+        if(to_write)__builtin_memcpy(packet->data,buffer,to_write);
         packet->length = to_write;
         packet->consumed = 0U;
 

@@ -42,6 +42,9 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
     size_t iov_count, uint64_t count, uint32_t flags,
     const struct kernel_socket_address *destination);
+int kernel_socket_write_unix(struct kernel_open_file_description **pin_owner,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t count, uint32_t flags, int *user_fault);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
 int kernel_socket_is_tcp(const struct kernel_socket *socket);
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,

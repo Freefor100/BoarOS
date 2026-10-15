@@ -12,6 +12,7 @@ static struct kernel_heap test_heap;
 static struct kernel_io_context test_context;
 static unsigned heap_allocations;
 static size_t user_remaining = SIZE_MAX;
+static struct kernel_socket *close_during_copy;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
@@ -76,6 +77,10 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,u
 {
     (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
     memcpy(out,(void *)(uintptr_t)in,*copied);
+    if (close_during_copy) {
+        struct kernel_socket *peer=close_during_copy;close_during_copy=0;
+        kernel_socket_destroy(peer);
+    }
     if(user_remaining!=SIZE_MAX)user_remaining-=*copied;
     return *copied==n?KERNEL_UACCESS_STATUS_OK:KERNEL_UACCESS_STATUS_FAULT;
 }
@@ -152,6 +157,32 @@ static void udp_final_payload(void)
     user_remaining=SIZE_MAX;
     kernel_socket_destroy(socket);
     puts("PASS UDP final payload: no transient kernel heap objects, gather usercopy and fault rollback");
+}
+
+static void unix_final_payload(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *sender=0,*receiver=0;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&sender,&receiver));
+    struct kernel_open_file_description *owner=(void *)sender;
+    char first[]="alpha",second[]="beta";
+    struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,5},{(uintptr_t)second,4}};
+    struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
+    unsigned before=heap_allocations;
+    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==9);
+    CHECK(owner==(void *)sender && heap_allocations==before+1 && receiver->rx_bytes==9);
+    CHECK(!memcmp(receiver->packets_head->data,"alphabeta",9) && !sender->tx_reserved);
+    uint64_t charged=sender->unix_memory;
+    cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};user_remaining=6;
+    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==6);
+    CHECK(receiver->packets_tail->length==6 && !memcmp(receiver->packets_tail->data,"alphab",6));
+    CHECK(sender->unix_memory>charged && !sender->tx_reserved);user_remaining=SIZE_MAX;
+    cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};close_during_copy=receiver;
+    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==-KERNEL_EPIPE);
+    CHECK(!close_during_copy && owner==(void *)sender && heap_live==1 &&
+        !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets && sender->pending_error==-KERNEL_ECONNRESET);
+    kernel_socket_destroy(sender);
+    puts("PASS UNIX final queue payload: one allocation, gather fill, fault prefix and peer-close reservation rollback");
 }
 
 static void receive_payload(void)
@@ -410,7 +441,8 @@ static void loopback_work(void)
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "receive-payload")) receive_payload();
+    if (!strcmp(argv[1], "unix-payload")) unix_final_payload();
+    else if (!strcmp(argv[1], "receive-payload")) receive_payload();
     else if (!strcmp(argv[1], "udp-payload")) udp_final_payload();
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();

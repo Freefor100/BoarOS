@@ -1203,8 +1203,7 @@ static enum kernel_files_status buffered_write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, unsigned char *staging, size_t capacity,
-    uint32_t socket_flags)
+    int64_t *linux_result, unsigned char *staging, size_t capacity)
 {
     uint64_t total = 0U;
 
@@ -1235,73 +1234,7 @@ static enum kernel_files_status buffered_write_request(
         }
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        struct kernel_socket *socket = kernel_open_file_socket(description);
-        uint64_t timeout = kernel_socket_send_timeout(socket), target = 0;
-        if (timeout) {
-            uint64_t now = kernel_time_monotonic_ns();
-            target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
-        }
-        for (size_t index = 0U; index < iov_count && total < count; index++) {
-            uint64_t offset = 0U;
-            while (offset < iov[index].length && total < count) {
-                size_t chunk = iov[index].length - offset;
-                size_t copied = 0U;
-                int sent;
-                enum kernel_uaccess_status access;
-                if (chunk > capacity) chunk = capacity;
-                size_t page_left = BOAROS_PAGE_SIZE -
-                    ((iov[index].base + offset) & BOAROS_PAGE_MASK);
-                if (chunk > page_left) chunk = page_left;
-                if (chunk > count - total) chunk = (size_t)(count - total);
-                KERNEL_FILES_NOTE(files, write_chunks, 1);
-                access = kernel_copy_from_user(mm, staging,
-                    iov[index].base + offset, chunk, &copied);
-                if (access == KERNEL_UACCESS_STATUS_FAULT && copied == 0U) {
-                    *linux_result = total != 0U ? (int64_t)total
-                                                 : -KERNEL_EFAULT;
-                    return KERNEL_FILES_STATUS_OK;
-                }
-                if (access != KERNEL_UACCESS_STATUS_OK &&
-                    access != KERNEL_UACCESS_STATUS_FAULT)
-                    return KERNEL_FILES_STATUS_STATE;
-                size_t consumed = 0U;
-                /* 等待和短发送只推进暂存游标，不能重新解析尚未发送的用户字节。 */
-                while (consumed < copied) {
-                    sent = kernel_socket_write_buffer(socket, (const unsigned char *)staging + consumed,
-                                                        (uint32_t)(copied - consumed), socket_flags);
-                    if (sent == -KERNEL_EAGAIN) {
-                        uint64_t now = target ? kernel_time_monotonic_ns() : 0;
-                        int waited = target && now >= target ? -KERNEL_EAGAIN :
-                            socket_wait_ready(description, KERNEL_POLLOUT,
-                                              target ? target-now : 0, socket_flags);
-                        if (waited == 0) continue;
-                        if (total && waited == -KERNEL_ERESTARTSYS)
-                            kernel_signal_clear_syscall_restart(kernel_task_current());
-                        sent = waited;
-                    }
-                    if (sent < 0) {
-                        *linux_result = total != 0U ? (int64_t)total : sent;
-                        return KERNEL_FILES_STATUS_OK;
-                    }
-                    if (sent == 0 || (size_t)sent > copied - consumed)
-                        return KERNEL_FILES_STATUS_STATE;
-                    consumed += (size_t)sent;
-                    total += (uint64_t)sent;
-                    offset += (uint64_t)sent;
-                    /* fault或非阻塞仍返回本次已接受前缀。 */
-                    if (access == KERNEL_UACCESS_STATUS_FAULT || (consumed < copied &&
-                        ((kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK) ||
-                         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
-                        *linux_result = (int64_t)total;
-                        return KERNEL_FILES_STATUS_OK;
-                    }
-                }
-            }
-        }
-        *linux_result = (int64_t)total;
-        return KERNEL_FILES_STATUS_OK;
-    }
+
     if (!description->device) return KERNEL_FILES_STATUS_STATE;
     for (size_t index = 0U; index < iov_count && total < count; index++) {
         uint64_t offset = 0U;
@@ -1342,6 +1275,45 @@ static enum kernel_files_status buffered_write_request(
         }
     }
     *linux_result = (int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+static enum kernel_files_status unix_write_request(struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
+    uint32_t flags, int64_t *linux_result)
+{
+    struct kernel_open_file_description *borrowed=description;
+    struct kernel_socket *socket=kernel_open_file_socket(description);
+    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
+    uint64_t total=0,target=0,timeout=kernel_socket_send_timeout(socket);
+    if (timeout) {
+        uint64_t now=kernel_time_monotonic_ns();
+        target=UINT64_MAX-now<timeout?UINT64_MAX:now+timeout;
+    }
+    do {
+        int fault=0;
+        int result=kernel_socket_write_unix(&description,mm,&cursor,count-total,
+            flags|KERNEL_SOCKET_MSG_DONTWAIT,&fault);
+        if (result==-KERNEL_EAGAIN) {
+            uint64_t now=target?kernel_time_monotonic_ns():0;
+            result=target && now>=target?-KERNEL_EAGAIN:socket_wait_ready(borrowed,
+                KERNEL_POLLOUT,target?target-now:0,flags);
+            if (!result) continue;
+            if (total && result==-KERNEL_ERESTARTSYS)
+                kernel_signal_clear_syscall_restart(kernel_task_current());
+        }
+        if (result<0) {
+            if (!total && result==-KERNEL_EPIPE && !(flags&KERNEL_SOCKET_MSG_NOSIGNAL))
+                (void)kernel_signal_send_task(kernel_task_current(),13U,0);
+            *linux_result=total?(int64_t)total:result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        total+=(uint64_t)result;
+        if (result>0) KERNEL_FILES_NOTE(files,write_chunks,1);
+        if (!result || fault) break;
+    } while (total<count);
+    *linux_result=(int64_t)total;
     return KERNEL_FILES_STATUS_OK;
 }
 
@@ -1453,6 +1425,11 @@ static enum kernel_files_status write_request(
         if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
         return status;
     }
+    if (kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_SOCKET) {
+        enum kernel_files_status status=unix_write_request(files,mm,description,iov,iov_count,count,socket_flags,linux_result);
+        if (status==KERNEL_FILES_STATUS_OK) COST_IO_ADD(2,*linux_result>0?(uint64_t)*linux_result:0);
+        return status;
+    }
     KERNEL_LOCK_SCOPE(offset_guard);
     if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
          kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
@@ -1467,23 +1444,11 @@ static enum kernel_files_status write_request(
         status=regular_write_request(files,mm,description,iov,iov_count,count,
             positioned,requested_offset,linux_result);
     } else {
-        struct kernel_task_io_buffer buffer = {0};
         unsigned char small[KERNEL_FILES_WRITE_STAGING];
         unsigned char *staging = small;
         size_t capacity = sizeof(small);
-        if (count != 0U && kind==KERNEL_OPEN_FILE_KIND_SOCKET) {
-            if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
-                    KERNEL_TASK_STATUS_OK) {
-                *linux_result = -KERNEL_ENOMEM;
-                return KERNEL_FILES_STATUS_OK;
-            }
-            staging = buffer.data;
-            capacity = BOAROS_PAGE_SIZE;
-            COST_IO_ADD(5, BOAROS_PAGE_SIZE);
-        }
         status=buffered_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result,staging,capacity,socket_flags);
-        if (buffer.allocator != 0) kernel_task_io_buffer_release(&buffer);
+            positioned,requested_offset,linux_result,staging,capacity);
     }
     if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
     if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&

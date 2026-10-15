@@ -75,6 +75,8 @@ raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所�
 可观察身份；仍持有packet的发送者只保留不可再发送的计费owner，最后引用释放
 实际堆对象，不建立无owner的清理重试。
 
+UNIX stream 普通写先预留发送者容量，在协议临界区外把用户 iovec 直接填入最终队列载荷，再检查对端状态并发布。packet 头和内联载荷只分配一次；复制 fault 只发布成功前缀，首字节 fault 不发布。对端在复制期间关闭时归还预留与未发布 packet，保留真实 EPIPE/ECONNRESET。接收直接从该载荷复制到用户，因此普通 stream 不再经过读写中转页。
+
 AF_UNIX按发送者内存限制等待，SO_RCVBUF仍可设置/查询但不能给对端发送者提供
 credit。SO_SNDBUF按Linux倍增、下限与4MiB设置上限；固定双侧默认212992。
 新packet可在当前内存低于sndbuf时分配一次，计费包含实际请求的payload及本地
