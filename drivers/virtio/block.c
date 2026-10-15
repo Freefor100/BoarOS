@@ -32,6 +32,7 @@
 #define VIRTIO_BLOCK_REQUEST_FLUSH 4U
 #define VIRTIO_BLOCK_STATUS_OK 0U
 #define VIRTIO_BLOCK_STATUS_IO_ERROR 1U
+#define VIRTIO_BLOCK_TRANSFER_BYTES (128U * 1024U)
 #define VIRTIO_BLOCK_STATUS_UNSUPPORTED 2U
 #define VIRTIO_BLOCK_SECTOR_SIZE 512U
 
@@ -87,7 +88,7 @@ struct batch_transfer {
     unsigned char *buffer;
     size_t remaining, copied;
     uint32_t members;
-    int modify_ready;
+    uint8_t modify_ready, next_ready;
 };
 
 struct block_batch_workspace {
@@ -329,10 +330,13 @@ static void fail_device(struct virtio_block_device *device, enum kernel_block_st
             kernel_cost_sample_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 7), kernel_cost_clock() - r->cost_start);
             device->statistics.service_ticks += time_now() - r->publish_time;
 #endif
-            if (r->completion->head) device->statistics.wakes++;
-            wake(r->completion);
+            if (r->completion != &device->available) {
+                if (r->completion->head) device->statistics.wakes++;
+                wake(r->completion);
+            }
         }
     }
+    if (device->available.head) device->statistics.wakes++;
     wake(&device->available);
 }
 
@@ -396,10 +400,11 @@ static void diagnose_queue_fault(struct virtio_block_device *device,
     }
 }
 
-static void collect_used(struct virtio_block_device *device)
+static void harvest_used(struct virtio_block_device *device, uint32_t pending)
 {
-    uint32_t pending=device->transport.ops.ack_interrupt(device->transport.context);
-    if (pending) arch_io_barrier();
+#if BOAROS_COST_DIAGNOSTICS
+    uint32_t batch_woken = 0;
+#endif
     uint16_t used_index = device->queue.used->index;
     uint16_t observed_count = (uint16_t)(used_index - device->queue.last_used);
     int completed = observed_count != 0;
@@ -447,13 +452,38 @@ static void collect_used(struct virtio_block_device *device)
         device->statistics.service_ticks += time_now() - r->publish_time;
 #endif
         if (r->result != KERNEL_BLOCK_STATUS_OK) device->statistics.io_errors++;
-        if (r->completion->head) device->statistics.wakes++;
-        wake(r->completion);
+        if (r->completion != &device->available) {
+            if (r->completion->head) device->statistics.wakes++;
+            wake(r->completion);
+        }
 #if BOAROS_COST_DIAGNOSTICS
-        if (r->cost_woken) kernel_cost_add_tag(r->cost_tag, COST_IO_COMPLETE_TO_READY, kernel_cost_clock() - r->cost_completed);
+        if (r->cost_woken) {
+            if (r->completion == &device->available) batch_woken |= UINT32_C(1) << (offset / REQUEST_STRIDE);
+            else kernel_cost_add_tag(r->cost_tag, COST_IO_COMPLETE_TO_READY, kernel_cost_clock() - r->cost_completed);
+        }
 #endif
     }
-    if (completed) wake(&device->available);
+    if (completed) {
+        if (device->available.head) device->statistics.wakes++;
+        wake(&device->available);
+#if BOAROS_COST_DIAGNOSTICS
+        for (unsigned i = 0; i < slot_count(device); i++) if (batch_woken & (UINT32_C(1) << i)) {
+            struct block_request *r = request_at(device, i);
+            kernel_cost_add_tag(r->cost_tag, COST_IO_COMPLETE_TO_READY, kernel_cost_clock() - r->cost_completed);
+        }
+#endif
+    }
+}
+static uint32_t acknowledge_interrupt(struct virtio_block_device *device)
+{
+    uint32_t pending = device->transport.ops.ack_interrupt(device->transport.context);
+    if (pending) arch_io_barrier();
+    return pending;
+}
+static void collect_used(struct virtio_block_device *device)
+{
+    if (device->queue.used->index == device->queue.last_used) return;
+    harvest_used(device, acknowledge_interrupt(device));
 }
 static int completion_wait_needed(struct virtio_block_device *device, const struct block_request *request)
 {
@@ -489,8 +519,8 @@ static void block_irq(void *owner)
 {
     struct virtio_block_device *device = owner;
     device->statistics.interrupts++;
-    if (device_live(device)) collect_used(device);
-    else (void)device->transport.ops.ack_interrupt(device->transport.context);
+    uint32_t pending = acknowledge_interrupt(device);
+    if (device_live(device)) harvest_used(device, pending);
 }
 int virtio_block_enable_irq(struct virtio_block_device *device, uint32_t source)
 {
@@ -565,23 +595,43 @@ static struct block_request *reserve_request(struct virtio_block_device *device)
     if (!device_live(device)) r = 0;
     arch_interrupt_restore(irq); return r;
 }
-static void release_request(struct virtio_block_device *device, struct block_request *r)
+static void release_request_owner(struct virtio_block_device *device, struct block_request *r)
 {
-    uintptr_t irq = arch_interrupt_save();
     if (r->state != 1 || r->owner != kernel_io_context_current() || !device->active || r->done.head)
         __builtin_trap();
     r->state = 0; r->owner = 0; r->completion = 0;
+}
+static void release_request(struct virtio_block_device *device, struct block_request *r)
+{
+    uintptr_t irq = arch_interrupt_save();
+    release_request_owner(device, r);
     wake(&device->available);
     arch_interrupt_restore(irq);
 }
 
-
+static uint64_t free_descriptor_mask(const struct virtio_block_device *device)
+{
+    uint64_t mask = device->queue.size == 64 ? UINT64_MAX :
+        (UINT64_C(1) << device->queue.size) - 1;
+    return mask & ~device->queue.claimed;
+}
 static unsigned free_descriptors(const struct virtio_block_device *device)
 {
-    unsigned count = 0;
-    for (unsigned i = 0; i < device->queue.size; i++)
-        count += !(device->queue.claimed & (UINT64_C(1) << i));
-    return count;
+    uint64_t bits = free_descriptor_mask(device);
+    bits -= (bits >> 1) & UINT64_C(0x5555555555555555);
+    bits = (bits & UINT64_C(0x3333333333333333)) + ((bits >> 2) & UINT64_C(0x3333333333333333));
+    bits = (bits + (bits >> 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+    return (unsigned)((bits * UINT64_C(0x0101010101010101)) >> 56);
+}
+static unsigned first_descriptor(uint64_t bits)
+{
+    unsigned first = 0;
+    if (!(bits & UINT32_MAX)) { first += 32; bits >>= 32; }
+    if (!(bits & UINT16_MAX)) { first += 16; bits >>= 16; }
+    if (!(bits & UINT8_MAX)) { first += 8; bits >>= 8; }
+    if (!(bits & 15U)) { first += 4; bits >>= 4; }
+    if (!(bits & 3U)) { first += 2; bits >>= 2; }
+    return first + !(bits & 1U);
 }
 
 /* IRQ exclusion covers descriptor selection through enqueue. Request slots own
@@ -594,8 +644,11 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     if (r->state != 1 || r->owner != kernel_io_context_current() || count + 2 > device->queue.size) __builtin_trap();
     uint16_t indices[VIRTIO_SPLIT_MAX_SIZE];
     unsigned found = 0;
-    for (unsigned i = 0; i < device->queue.size && found < count + 2; i++)
-        if (!(device->queue.claimed & (UINT64_C(1) << i))) indices[found++] = i;
+    uint64_t free = free_descriptor_mask(device);
+    while (free && found < count + 2) {
+        indices[found++] = first_descriptor(free);
+        free &= free - 1;
+    }
     if (found != count + 2) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
     uint32_t data_length = 0;
     for (unsigned i = 0; i < count; i++) {
@@ -930,15 +983,15 @@ static int earlier_sector_pending(const struct kernel_block_span *spans,
 
 static enum kernel_block_status publish_batch_part(struct virtio_block_device *device,
     struct batch_transfer *parts, size_t count, size_t index,
-    const struct kernel_block_span *writes, int writing, struct block_segment *segments)
+    const struct kernel_block_span *writes, int writing, int phase, unsigned free,
+    struct block_segment *segments)
 {
     struct batch_transfer *part = &parts[index];
     struct block_request *r = part->request;
-    unsigned free = free_descriptors(device);
     if (free < 3) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
     unsigned segments_count = 0;
     uint32_t members = 0, total = 0;
-    const uint32_t maximum = UINT32_MAX & ~(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+    const uint32_t maximum = VIRTIO_BLOCK_TRANSFER_BYTES;
     size_t next = index;
     uint64_t offset = part->offset;
     if (!part->modify_ready) {
@@ -957,6 +1010,11 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
             members |= UINT32_C(1) << next;
             total += length; offset += length;
             if (candidate->copied < candidate->remaining) continue;
+            if (phase) {
+                next = candidate->next_ready;
+                if (next == count || parts[next].offset != offset) break;
+                continue;
+            }
             for (next = 0; next < count; next++) {
                 if (!parts[next].remaining || parts[next].copied || parts[next].request ||
                     parts[next].offset != offset) continue;
@@ -984,6 +1042,14 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
         segments, segments_count, bounce);
 }
 
+static void phase_ready_insert(struct batch_transfer *parts, uint8_t *head, unsigned index)
+{
+    while (*head != KERNEL_BLOCK_BATCH_MAX && parts[*head].offset < parts[index].offset)
+        head = &parts[*head].next_ready;
+    parts[index].next_ready = *head;
+    *head = (uint8_t)index;
+}
+
 static enum kernel_block_status transfer_batch_parts(struct virtio_block_device *device,
     const struct kernel_block_span *writes, struct kernel_block_read_span *reads, size_t count,
     struct batch_transfer *parts, struct block_segment *segments,
@@ -996,6 +1062,9 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
         return KERNEL_BLOCK_STATUS_IO;
     }
     struct kernel_io_context *owner = kernel_io_context_current();
+    struct kernel_block_span phase_span = {0};
+    uint8_t ready_head = KERNEL_BLOCK_BATCH_MAX;
+    uint32_t ready_mask = 0;
     bytes_zero(parts, count * sizeof(*parts));
     for (size_t i = 0; !next && i < count; i++) {
         parts[i].offset = writes ? writes[i].offset : reads[i].offset;
@@ -1007,6 +1076,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
         uintptr_t irq = arch_interrupt_save();
         if (owner != kernel_io_context_current()) __builtin_trap();
         if (device_live(device)) collect_used(device);
+        unsigned released = 0;
         /* 一个SG请求的成员共用设备状态；消费一次完成后再推进各span。
          * 写错误停止后续发布，已经借给设备的其他链仍须排空。 */
         for (size_t i = 0; i < count; i++) {
@@ -1019,8 +1089,10 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
                 part->modify_ready = 1;
                 continue;
             }
-            for (size_t j = 0; j < count; j++) {
-                if (!(part->members & (UINT32_C(1) << j))) continue;
+            uint32_t members = part->members;
+            while (members) {
+                unsigned j = first_descriptor(members);
+                members &= members - 1;
                 struct batch_transfer *member = &parts[j];
                 if (status == KERNEL_BLOCK_STATUS_OK) {
                     if (reads && r->bounce_used)
@@ -1037,27 +1109,39 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
                 member->copied = 0;
             }
             part->members = 0; part->modify_ready = 0;
-            release_request(device, r); part->request = NULL;
+            release_request_owner(device, r); part->request = NULL;
+            released++;
         }
+        if (released) wake(&device->available);
+        released = 0;
         if (writing && !device_live(device) && result == KERNEL_BLOCK_STATUS_OK) result = KERNEL_BLOCK_STATUS_IO;
         /* Refill each free owner slot immediately. A slow DMA in another
          * slot never prevents admission beyond the previous 32-span window. */
         if (next && result == KERNEL_BLOCK_STATUS_OK) {
             for (size_t i = 0; i < count; i++) {
                 if (parts[i].remaining || parts[i].copied || parts[i].request) continue;
-                struct kernel_block_span span;
-                while (next(&cursor, &span)) {
-                    if (!span.size) continue;
-                    parts[i].offset = span.offset;
-                    parts[i].buffer = (unsigned char *)span.buffer;
-                    parts[i].remaining = span.size;
-                    break;
-                }
+                while (!phase_span.size && next(&cursor, &phase_span)) {}
+                if (!phase_span.size) break;
+                size_t length = phase_span.size < VIRTIO_BLOCK_TRANSFER_BYTES ?
+                    phase_span.size : VIRTIO_BLOCK_TRANSFER_BYTES;
+                parts[i].offset = phase_span.offset;
+                parts[i].buffer = (unsigned char *)phase_span.buffer;
+                parts[i].remaining = length;
+                phase_span.offset += length;
+                phase_span.buffer = (const unsigned char *)phase_span.buffer + length;
+                phase_span.size -= length;
             }
+            for (unsigned i = 0; i < count; i++)
+                if (parts[i].remaining && !parts[i].copied && !parts[i].request &&
+                    !(ready_mask & (UINT32_C(1) << i))) {
+                    phase_ready_insert(parts, &ready_head, i);
+                    ready_mask |= UINT32_C(1) << i;
+                }
         }
         unsigned published = 0;
-        for (size_t i = 0; i < count; i++) {
+        for (size_t i = next ? ready_head : 0; i < count; i = next ? ready_head : i + 1) {
             struct batch_transfer *part = &parts[i];
+            if (next && result != KERNEL_BLOCK_STATUS_OK) break;
             if ((writing && result != KERNEL_BLOCK_STATUS_OK) || !part->remaining ||
                 (part->copied && !part->modify_ready)) continue;
             if (writes && earlier_sector_pending(writes, parts, i)) continue;
@@ -1065,25 +1149,38 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
                 if (reads) { reads[i].status = KERNEL_BLOCK_STATUS_IO; part->remaining = 0; }
                 continue;
             }
+            unsigned free = free_descriptors(device);
+            if (free < 3) { if (next) break; else continue; }
             if (!part->request) {
-                if (free_descriptors(device) < 3) continue;
                 part->request = try_reserve_request(device);
-                if (!part->request) continue;
+                if (!part->request) { if (next) break; else continue; }
                 part->request->completion = &device->available;
             }
             if (part->request->state == 1) {
-                enum kernel_block_status status = publish_batch_part(device, parts, count, i, writes, writing, segments);
-                if (status == KERNEL_BLOCK_STATUS_OK) published++;
+                enum kernel_block_status status = publish_batch_part(device, parts, count, i, writes, writing,
+                    next != NULL, free, segments);
+                if (status == KERNEL_BLOCK_STATUS_OK) {
+                    published++;
+                    if (next) {
+                        uint32_t members = part->members;
+                        while (ready_head < count && (members & (UINT32_C(1) << ready_head)))
+                            ready_head = parts[ready_head].next_ready;
+                        ready_mask &= ~members;
+                    }
+                }
                 else if (status != KERNEL_BLOCK_STATUS_NOT_SUBMITTED) __builtin_trap();
+                else if (next) break;
             }
         }
         if (published && virtio_split_notify(&device->queue, &device->transport, 0) != VIRTIO_OK) __builtin_trap();
         if (writing && result != KERNEL_BLOCK_STATUS_OK) {
             for (size_t i = 0; i < count; i++) {
                 if (parts[i].request && parts[i].request->state == 1) {
-                    release_request(device, parts[i].request); parts[i].request = NULL;
+                    release_request_owner(device, parts[i].request); parts[i].request = NULL;
+                    released++;
                 }
             }
+            if (released) wake(&device->available);
         }
         /* 通知可以同步触发设备完成；先收割并消费它，不能为已完成DMA登记睡眠。 */
         if (device_live(device) && device->queue.used->index != device->queue.last_used) {

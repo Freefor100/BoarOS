@@ -30,10 +30,14 @@ static unsigned char batch_output[96][8192];
 static unsigned char sg_disk[1048576];
 static unsigned notifications, first_notify_heads, sg_max_segments, park_calls;
 static unsigned sg_fail_sector;
+static unsigned sg_max_bytes, ack_calls;
+static uint32_t (*underlying_ack)(void *);
 static unsigned phase_hold, phase_held_head, phase_crossed_window;
 static unsigned char *phase_held_status;
 static void (*underlying_write)(void *, enum virtio_register, uint32_t);
 static void sg_device_step(void);
+static uint32_t observed_ack(void *context)
+{ ack_calls++; return underlying_ack(context); }
 
 static void observed_write(void *context, enum virtio_register reg, uint32_t value)
 {
@@ -114,6 +118,7 @@ static void sg_device_step(void)
         }
         assert(d[at].flags == 2 && d[at].length == 1);
         if (segments > sg_max_segments) sg_max_segments = segments;
+        if (bytes>sg_max_bytes) sg_max_bytes=bytes;
         if (phase_hold && !sector) {
             phase_held_head=head;
             phase_held_status=physical_pointer(d[at].address,1);
@@ -389,6 +394,8 @@ static enum riscv_virtio_mmio_block_status initialize_model(
     if (result == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
         underlying_write = device->transport.ops.write;
         device->transport.ops.write = observed_write;
+        underlying_ack = device->transport.ops.ack_interrupt;
+        device->transport.ops.ack_interrupt = observed_ack;
     }
     return result;
 }
@@ -821,6 +828,36 @@ static void write_phase_case(unsigned version, int failing)
     printf("PASS journal phase transport=%u error=%d: 80 spans, later window enters while first DMA held, error drains owners\n",version,failing);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
+static void large_phase_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=sg_max_bytes=park_calls=0;
+    sg_fail_sector=UINT32_MAX; diagnostic_length=0;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    device.irq_source=1; wait_irq_device=&device;
+    unsigned char *bytes=(void *)batch_output;
+    for (unsigned i=0;i<512*1024;i++) bytes[i]=(unsigned char)(i*13+i/512);
+    struct phase_entry entry={{0,bytes,512*1024},NULL};
+    assert(kernel_block_write_phase(&device.block,phase_next,&entry)==KERNEL_BLOCK_STATUS_OK);
+    assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==4);
+    assert(device.statistics.max_inflight==4 && !memcmp(bytes,sg_disk,512*1024));
+    struct kernel_block_span public_span={0,bytes,512*1024};
+    assert(kernel_block_write_batch(&device.block,&public_span,1)==KERNEL_BLOCK_STATUS_OK);
+    assert(device.statistics.requests==8 && sg_max_bytes==128*1024);
+    unsigned before=ack_calls;
+    for (unsigned i=0;i<32;i++) collect_used(&device);
+    assert(ack_calls==before);
+    block_irq(&device);
+    assert(ack_calls==before+1); /* A real IRQ is acknowledged even with no used entry. */
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    device.irq_source=0; wait_irq_device=NULL;
+    printf("PASS large journal phase transport=%u: one 512KiB owner, four concurrent 128KiB requests, quiet poll and IRQ ack\n",version);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
 static void bad_segment_limits_case(unsigned version)
 {
     for (unsigned kind = 0; kind < 2; kind++) {
@@ -952,6 +989,9 @@ static void fragmented_descriptors_case(unsigned version)
 
 int main(int argc, char **argv)
 {
+    if (argc==2 && !strcmp(argv[1],"large-phase")) {
+        large_phase_case(1); large_phase_case(2); return 0;
+    }
     if (argc==2 && !strcmp(argv[1],"write-phase")) {
         for (unsigned version=1;version<=2;version++) for (int failing=0;failing<=1;failing++) write_phase_case(version,failing);
         return 0;
@@ -1008,6 +1048,7 @@ int main(int argc, char **argv)
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
+        large_phase_case(version);
         write_phase_case(version,0);
         write_phase_case(version,1);
         bad_segment_limits_case(version);
