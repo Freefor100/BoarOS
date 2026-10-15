@@ -2029,7 +2029,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
     }
     if (__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == 1U) {
         if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
-            node->dirty_cache_pages.head || node->dirty_cache_pages.tail || node->dirty_cache_pages.count ||
+            node->dirty_cache_pages.tree.rbh_root || node->dirty_cache_pages.count ||
             node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous) __builtin_trap();
         if (!kernel_record_lock_state_empty(&node->record_locks))
             __builtin_trap();

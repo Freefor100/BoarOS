@@ -1238,7 +1238,7 @@ $(BUILD_DIR)/%.o: %.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o: \
+$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o $(BUILD_DIR)/fs/page_cache.o: \
 	CPPFLAGS += $(LWEXT4_CPPFLAGS)
 
 $(BUILD_DIR)/third_party/lwip/src/core/%.o \

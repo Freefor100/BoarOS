@@ -82,6 +82,22 @@ enum physical_page_status __wrap_physical_page_release(struct physical_page_allo
     if (read_counts && pages == read_allocator) read_counts->physical_releases++;
     return __real_physical_page_release(pages, address);
 }
+struct writeback_operation_counts {
+    size_t allocations, large_allocations, largest, batches, maximum_pages;
+    uint64_t maximum_borrows;
+    const struct kernel_vfs_writeback_span *spans;
+};
+static _Thread_local struct writeback_operation_counts *write_counts;
+enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t bytes,void **out)
+{
+    if(write_counts && current_cache && heap==current_cache->heap) {
+        write_counts->allocations++;
+        if(bytes>256)write_counts->large_allocations++;
+        if(bytes>write_counts->largest)write_counts->largest=bytes;
+    }
+    return __real_kernel_heap_allocate(heap,bytes,out);
+}
 static unsigned execute_calls;
 static void execute_on_cpu0(void *argument)
 {
@@ -265,6 +281,15 @@ static int rearm_alias(void *owner, uint64_t address)
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct kernel_vfs_writeback_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct kernel_vfs_writeback_span *spans,size_t count)
 {
+    if(write_counts) {
+        write_counts->batches++;
+        if(count>write_counts->maximum_pages)write_counts->maximum_pages=count;
+        if(!write_counts->spans)write_counts->spans=spans;
+        else assert(write_counts->spans==spans);
+        struct kernel_page_cache_concurrency_state state;
+        kernel_page_cache_get_concurrency_state(current_cache,&state);
+        if(state.entry_borrows>write_counts->maximum_borrows)write_counts->maximum_borrows=state.entry_borrows;
+    }
     for (size_t i=0;i<count;i++) {
         size_t block=node->instance->writeback_block_size;
         uintptr_t base=(uintptr_t)spans[i].source_buffer, input=(uintptr_t)spans[i].buffer;
@@ -517,6 +542,87 @@ static void wait_writeback_round(struct kernel_page_cache *cache, uint64_t befor
         assert(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);
         sched_yield();
     }
+}
+static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    current_cache=cache;
+    enum { COUNT=128 };
+    unsigned char data[BOAROS_PAGE_SIZE];memset(data,0x58,sizeof(data));size_t done;
+    uint64_t observed=kernel_vfs_error_sequence(file);
+    assert(!kernel_vfs_sync(file,0,&observed));
+    for(unsigned i=0;i<COUNT;i++)
+        assert(!kernel_vfs_pwrite(file,(uint64_t)(COUNT-1-i)*BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    struct writeback_operation_counts counts={0};write_counts=&counts;
+    assert(!kernel_vfs_sync(file,0,&observed));write_counts=NULL;
+    printf("foreground windows: pages=%u allocations=%zu descriptors=%zu largest=%zu batches=%zu maxpages=%zu\n",
+        COUNT,counts.allocations,counts.large_allocations,counts.largest,counts.batches,counts.maximum_pages);
+    assert(counts.large_allocations==1 && counts.allocations==COUNT+1);
+    assert(counts.maximum_pages<=131072/BOAROS_PAGE_SIZE && counts.largest<=16384);
+    assert(counts.maximum_borrows<=2*(131072/BOAROS_PAGE_SIZE));
+    for(unsigned i=0;i<COUNT;i++) {
+        unsigned char actual;
+        assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && actual==0x58);
+    }
+    unsigned char one=0x76;
+    assert(!kernel_vfs_pwrite(file,17,&one,1,&done) && done==1);
+    counts=(struct writeback_operation_counts){0};write_counts=&counts;
+    assert(!kernel_vfs_sync(file,0,&observed));write_counts=NULL;
+    assert(counts.allocations==1 && !counts.large_allocations && counts.batches==1 && counts.maximum_pages==1);
+    puts("PASS foreground writeback: one bounded descriptor allocation across windows, scalar page uses no descriptors");
+}
+static unsigned window_truncate_started,window_truncate_done;
+static void *truncate_writeback_window(void *file)
+{
+    mm_test_attach(0);
+    __atomic_store_n(&window_truncate_started,1,__ATOMIC_RELEASE);
+    assert(!kernel_vfs_ftruncate(file,BOAROS_PAGE_SIZE+37));
+    __atomic_store_n(&window_truncate_done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void foreground_window_truncate(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    enum { COUNT=64 };
+    unsigned char data[BOAROS_PAGE_SIZE];memset(data,0x82,sizeof(data));size_t done;
+    for(unsigned i=0;i<COUNT;i++)assert(!kernel_vfs_pwrite(file,(uint64_t)i*BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    uint64_t addresses[2];size_t valid;struct kernel_page_cache_alias aliases[2]={0};
+    for(unsigned i=0;i<2;i++) {
+        assert(!kernel_page_cache_get(cache,file,i?COUNT-1:0,&addresses[i],&valid));
+        assert(!kernel_page_cache_alias_attach(cache,file,i?COUNT-1:0,addresses[i],&aliases[i],
+            kernel_vfs_file_node(file),0x500000+i*BOAROS_PAGE_SIZE,rearm_alias));
+    }
+    write_entered=resume_write=sync_done=0;pause_write=1;
+    pthread_t sync,truncator;assert(!pthread_create(&sync,NULL,sync_file,file));
+    while(!__atomic_load_n(&write_entered,__ATOMIC_ACQUIRE))sched_yield();
+    struct kernel_page_cache_concurrency_state state;kernel_page_cache_get_concurrency_state(cache,&state);
+    assert(state.entry_borrows<=2*(131072/BOAROS_PAGE_SIZE));
+    for(unsigned i=0;i<2;i++) {
+        struct kernel_page_cache_write_borrow writer={0};
+        assert(!kernel_page_cache_alias_write_begin(&aliases[i],&writer));
+        ((unsigned char *)access_page(addresses[i]))[0]=0x94;
+        kernel_page_cache_alias_mark_dirty(&aliases[i]);kernel_page_cache_write_end(&writer);
+    }
+    /* This synthetic alias is not an MM mapping that truncate can detach.
+     * End that alias borrow, retaining only its explicit physical-page owner. */
+    kernel_page_cache_alias_detach(&aliases[1]);kernel_page_cache_alias_drain(&aliases[1]);
+    window_truncate_started=window_truncate_done=0;unsigned parked=mm_test_parked(0);
+    assert(!pthread_create(&truncator,NULL,truncate_writeback_window,file));
+    while(!__atomic_load_n(&window_truncate_started,__ATOMIC_ACQUIRE) || mm_test_parked(0)==parked)sched_yield();
+    assert(!__atomic_load_n(&window_truncate_done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(sync,NULL) && !pthread_join(truncator,NULL));
+    assert(kernel_vfs_node_size(kernel_vfs_file_node(file))==BOAROS_PAGE_SIZE+37);
+    for(unsigned i=0;i<2;i++) {
+        if(kernel_page_cache_alias_active(&aliases[i])) {
+            kernel_page_cache_alias_detach(&aliases[i]);kernel_page_cache_alias_drain(&aliases[i]);
+        }
+        assert(!physical_page_release(cache->allocator,addresses[i]));
+    }
+    uint64_t observed=kernel_vfs_error_sequence(file);assert(!kernel_vfs_sync(file,0,&observed));
+    unsigned char actual;assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),0,&actual,1,&done) && done==1 && actual==0x94);
+    assert(!kernel_vfs_ftruncate(file,(uint64_t)COUNT*BOAROS_PAGE_SIZE));
+    assert(!kernel_vfs_pread(file,(uint64_t)(COUNT-1)*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && !actual);
+    kernel_page_cache_get_concurrency_state(cache,&state);assert(!state.entry_borrows);
+    puts("PASS foreground window truncate: held old completion, new dirty generation, unselected tail retirement and zero regrowth");
 }
 static void dirty_index_case(struct kernel_page_cache *cache, struct kernel_vfs_mount *mount,
     struct kernel_vfs_file *file, unsigned actors)
@@ -1143,6 +1249,8 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
         alias_snapshot(cache, &file, pages,32,force_retry);
     }
     expanded_index_case(cache,&file,pages);
+    foreground_windows(cache,&file);
+    foreground_window_truncate(cache,&file);
     dirty_index_case(cache,&mount,&file,actors);
     demand_cases(cache, &file, actors);
     assert(!kernel_vfs_close(&file));
