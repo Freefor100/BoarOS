@@ -208,7 +208,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
-	const struct ext4_data_source *source);
+	const struct file_data_source *source);
 /* The mount lock stabilizes this borrowed version. NULL means read home. */
 const void *jbd_journal_read_data(struct ext4_fs *fs, ext4_fsblk_t block);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
@@ -245,7 +245,7 @@ int jbd_journal_retire(struct jbd_journal *journal, int error);
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
 bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
-	const struct ext4_data_source *const *sources, unsigned count);
+	const struct file_data_source *const *sources, unsigned count);
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);

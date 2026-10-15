@@ -41,8 +41,8 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
     if (cache_io_probe) cache_reads++;
     return __real_kernel_vfs_node_pread(node, offset, buffer, size, done);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
     if (cache_io_probe && count) {
         if (cache_writes && spans[0].offset<=cache_last_offset) __builtin_trap();

@@ -77,12 +77,12 @@ struct ext4_block_span;
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     const struct ext4_block_span *spans, unsigned count);
 
-struct ext4_data_source;
+struct file_data_source;
 /* A private replacement version makes abort discard-only. Full blocks can
  * retain an immutable caller source; partial updates assemble one new block. */
 int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
-	const struct ext4_data_source *source);
+	const struct file_data_source *source);
 
 /**@brief  Try to add block to be revoked to the current transaction.
  * @param  bdev block device descriptor

@@ -47,16 +47,7 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
-/* Immutable RAM supplied by a caller. Context identifies one stable owner;
- * callbacks and its entire retained allocation size stay fixed while borrowed.
- * A journal retains/charges that owner once across all blocks and transactions.
- * Empty sources have no callbacks and bytes=0. */
-struct ext4_data_source {
-	void *context;
-	void (*retain)(void *context);
-	void (*release)(void *context);
-	size_t bytes;
-};
+#include <common/file_io.h>
 
 #define EXT4_BLOCK_BATCH_MAX 32U
 #define EXT4_CACHED_READ_BATCH 1

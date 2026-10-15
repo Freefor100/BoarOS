@@ -2161,7 +2161,7 @@ const void *jbd_journal_read_data(struct ext4_fs *fs, ext4_fsblk_t lba)
 }
 
 struct jbd_source {
-	struct ext4_data_source owner;
+	struct file_data_source owner;
 	size_t blocks;
 	RB_ENTRY(jbd_source) node;
 };
@@ -2173,7 +2173,7 @@ static int jbd_source_cmp(struct jbd_source *a, struct jbd_source *b)
 RB_GENERATE_INTERNAL(jbd_source_tree, jbd_source, node, jbd_source_cmp, static inline)
 
 static int jbd_source_borrow(struct jbd_journal *journal,
-	const struct ext4_data_source *owner, struct jbd_source **out)
+	const struct file_data_source *owner, struct jbd_source **out)
 {
 	struct jbd_source key = { .owner.context = owner->context };
 	struct jbd_source *source = RB_FIND(jbd_source_tree, &journal->sources, &key);
@@ -2224,7 +2224,7 @@ static void jbd_data_free(struct jbd_journal *journal, struct jbd_data *data)
 
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 	uint32_t offset, const void *input, uint32_t length, bool initialize,
-	const struct ext4_data_source *source)
+	const struct file_data_source *source)
 {
 	struct jbd_journal *journal = trans->journal;
 	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
@@ -3403,7 +3403,7 @@ uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal)
 }
 
 bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
-	const struct ext4_data_source *const *sources, unsigned count)
+	const struct file_data_source *const *sources, unsigned count)
 {
 	/* Private metadata needs undo/version/control space; borrowed file data
 	 * needs records and one charge per distinct owner, never a block image.

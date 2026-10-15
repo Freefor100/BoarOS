@@ -1,4 +1,5 @@
 #include <kernel/page_cache.h>
+#include <ext4.h>
 #include <kernel/heap.h>
 #include <kernel/cpu.h>
 #include <kernel/sync.h>
@@ -85,7 +86,7 @@ enum physical_page_status __wrap_physical_page_release(struct physical_page_allo
 struct writeback_operation_counts {
     size_t allocations, large_allocations, largest, batches, maximum_pages;
     uint64_t maximum_borrows;
-    const struct kernel_vfs_writeback_span *spans;
+    const struct file_write_span *spans;
 };
 static _Thread_local struct writeback_operation_counts *write_counts;
 enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
@@ -97,6 +98,16 @@ enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,siz
         if(bytes>write_counts->largest)write_counts->largest=bytes;
     }
     return __real_kernel_heap_allocate(heap,bytes,out);
+}
+int __real_ext4_fpwrite_batch(ext4_file *,struct file_write_span *,unsigned);
+int __wrap_ext4_fpwrite_batch(ext4_file *file,struct file_write_span *spans,unsigned count)
+{
+    if(write_counts) {
+        if((const void *)spans!=(const void *)write_counts->spans)
+            fprintf(stderr,"writeback descriptors copied: VFS=%p ext4=%p\n",(const void *)write_counts->spans,(void *)spans);
+        assert((const void *)spans==(const void *)write_counts->spans);
+    }
+    return __real_ext4_fpwrite_batch(file,spans,count);
 }
 static unsigned execute_calls;
 static void execute_on_cpu0(void *argument)
@@ -278,8 +289,8 @@ static int rearm_alias(void *owner, uint64_t address)
     __atomic_fetch_add(&rearms,1,__ATOMIC_RELEASE);
     return 0;
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct kernel_vfs_writeback_span *,size_t);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct kernel_vfs_writeback_span *spans,size_t count)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
 {
     if(write_counts) {
         write_counts->batches++;
@@ -307,7 +318,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct kernel_
     if (fault) {
         for (size_t i=0;i<count;i++) spans[i].written=0;
         if (fault==2 && count && spans[0].size>1) {
-            struct kernel_vfs_writeback_span prefix=spans[0]; prefix.size/=2;
+            struct file_write_span prefix=spans[0]; prefix.size/=2;
             int result=__real_kernel_vfs_node_writeback(node,&prefix,1);
             assert(!result && prefix.written==prefix.size);
             spans[0].written=prefix.written;

@@ -174,14 +174,6 @@ int ext4_file_set_mode_initial(ext4_file *file, uint32_t mode);
 /* Live inode owner update, set-ID/capability removal and ctime share one
  * operation transaction. UINT32_MAX preserves the corresponding ID. */
 int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid);
-struct ext4_file_write_span {
-	uint64_t offset;
-	const void *buffer;
-	size_t size, written;
-	struct ext4_data_source source;
-	const void *source_buffer;
-	size_t source_size;
-};
 /* One operation for up to EXT4_BLOCK_BATCH_MAX ordered, disjoint file ranges. Sources are
  * borrowed on entry; a retained owner is released after its last full block's
  * ordered commit or abort. Failed mounts retain accepted versions for readers.
@@ -189,7 +181,7 @@ struct ext4_file_write_span {
  * buffer. They contain current bytes, including zeros beyond logical EOF; only
  * offset/size advance file size and completion. An ordinary buffer (empty source)
  * is copied into a private version. */
-int ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsigned count);
+int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
 int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 

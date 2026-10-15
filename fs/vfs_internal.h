@@ -1,6 +1,8 @@
 #ifndef BOAROS_FS_VFS_INTERNAL_H
 #define BOAROS_FS_VFS_INTERNAL_H
 
+#include <common/file_io.h>
+
 #include <kernel/cost.h>
 #include <stddef.h>
 #include <kernel/sync.h>
@@ -75,24 +77,13 @@ struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_no
 int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node);
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
 #define KERNEL_VFS_WRITEBACK_MAX 32U
-struct kernel_vfs_writeback_span {
-    uint64_t offset;
-    const void *buffer;
-    size_t size, written;
-    void *owner;
-    void (*retain)(void *owner);
-    void (*release)(void *owner);
-    size_t source_bytes;
-    const void *source_buffer;
-    size_t source_size;
-};
 /* Stable sources remain caller-owned. The backend may retain them through
- * ordered commit; source_bytes includes the entire retained allocation, not
+ * ordered commit; source.bytes includes the entire retained allocation, not
  * just this dirty range. source_buffer/source_size describe initialized stable
  * bytes surrounding buffer; logical offset/size still define completion and EOF.
  * Shared source ownership is charged once. */
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
-    struct kernel_vfs_writeback_span *spans, size_t count);
+    struct file_write_span *spans, size_t count);
 
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node);
 const struct kernel_vfs_mount *kernel_vfs_node_mount(

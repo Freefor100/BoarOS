@@ -2638,7 +2638,7 @@ int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
 }
 
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
-    struct kernel_vfs_writeback_span *spans, size_t count)
+    struct file_write_span *spans, size_t count)
 {
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;

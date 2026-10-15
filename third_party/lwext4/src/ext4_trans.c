@@ -144,7 +144,7 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
 
 int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
-	const struct ext4_data_source *source)
+	const struct file_data_source *source)
 {
 #if CONFIG_JOURNALING_ENABLE
 	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans)

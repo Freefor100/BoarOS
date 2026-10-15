@@ -1941,12 +1941,12 @@ struct prepared_writeback {
     int closed;
     size_t begin,end;
     uint64_t generation;
-    struct kernel_vfs_writeback_span *span;
+    struct file_write_span *span;
 };
 
 struct writeback_workspace {
     struct prepared_writeback *prepared;
-    struct kernel_vfs_writeback_span *spans;
+    struct file_write_span *spans;
     struct kernel_page_cache_entry **selected;
 };
 static int writeback_workspace_init(struct kernel_page_cache *cache,struct writeback_workspace *work)
@@ -2035,7 +2035,7 @@ static int prepare_writeback(struct kernel_page_cache *cache,
 }
 
 static void capture_writeback(struct kernel_page_cache *cache,
-    struct prepared_writeback *prepared,uint64_t limit,struct kernel_vfs_writeback_span *span)
+    struct prepared_writeback *prepared,uint64_t limit,struct file_write_span *span)
 {
     struct kernel_page_cache_entry *entry=prepared->entry;
     int controlled=cache->record->controlled;
@@ -2073,10 +2073,10 @@ static void capture_writeback(struct kernel_page_cache *cache,
             memcpy(stable,(unsigned char *)page+first,copy_end-first);
             memset((unsigned char *)stable+copy_end-first,0,last-copy_end);
             prepared->span=span;
-            *span=(struct kernel_vfs_writeback_span){
+            *span=(struct file_write_span){
                 .offset=start+prepared->begin,.buffer=snapshot,.size=size,
-                .owner=prepared->version,.retain=version_retain,.release=version_release,
-                .source_bytes=BOAROS_PAGE_SIZE+owner_bytes,
+                .source={.context=prepared->version,.retain=version_retain,.release=version_release,
+                    .bytes=BOAROS_PAGE_SIZE+owner_bytes},
                 .source_buffer=stable,.source_size=last-first};
         }
         if (prepared->closed) {
@@ -2100,7 +2100,7 @@ static int writeback_run(struct kernel_page_cache *cache,
         count=cache->record->snapshot_count;
     int background=kernel_io_context_current()->background_reclaim && cache->record->started;
     struct prepared_writeback single_prepared;
-    struct kernel_vfs_writeback_span single_span;
+    struct file_write_span single_span;
     struct writeback_workspace local={.prepared=&single_prepared,.spans=&single_span};
     if (background) workspace=cache->record->writeback_workspace;
     if (!workspace) {
@@ -2110,7 +2110,7 @@ static int writeback_run(struct kernel_page_cache *cache,
     memset(workspace->prepared,0,count*sizeof(*workspace->prepared));
     memset(workspace->spans,0,count*sizeof(*workspace->spans));
     struct prepared_writeback *prepared=workspace->prepared;
-    struct kernel_vfs_writeback_span *spans=workspace->spans;
+    struct file_write_span *spans=workspace->spans;
     size_t ready=0,done=0;
     int result=0;
     for (;done<count;done++) {

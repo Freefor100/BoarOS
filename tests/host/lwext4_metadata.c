@@ -727,10 +727,10 @@ static void direct_data_batch(struct ext4_fs *fs,bool fail)
     CHECK(ext4_fs_get_inode_dblk_idx(&inode,0,&physical,true)==EOK && physical);
     CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
     struct ext4_block held=EXT4_BLOCK_ZERO(); CHECK(ext4_block_get(fs->bdev,&held,physical)==EOK);
-    struct ext4_file_write_span spans[32];
+    struct file_write_span spans[32];
     for (unsigned i=0;i<32;i++) {
         owned_page_init(&direct_pages[i],8192,0x60+i);
-        spans[i]=(struct ext4_file_write_span){.offset=i*8192,.buffer=direct_pages[i].bytes,.size=8192,
+        spans[i]=(struct file_write_span){.offset=i*8192,.buffer=direct_pages[i].bytes,.size=8192,
             .source={&direct_pages[i],owned_page_retain,owned_page_release,8192},
             .source_buffer=direct_pages[i].bytes,.source_size=8192};
     }
@@ -776,7 +776,7 @@ static void group_partial_owner(struct ext4_fs *fs, bool failed)
     CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
     struct owned_file_page old, replacement, tail;
     owned_page_init(&old,block,0x5a); memset(old.bytes+17,0xa7,13);
-    struct ext4_file_write_span span={.offset=17,.buffer=old.bytes+17,.size=13,
+    struct file_write_span span={.offset=17,.buffer=old.bytes+17,.size=13,
         .source={&old,owned_page_retain,owned_page_release,block},
         .source_buffer=old.bytes,.source_size=block};
     unsigned before_reads=reads;
@@ -795,7 +795,7 @@ static void group_partial_owner(struct ext4_fs *fs, bool failed)
      * logical byte grows the file. Bytes after it must never become visible. */
     size_t end=8*block+18;
     owned_page_init(&tail,block,0); tail.bytes[17]=0xdc;
-    span=(struct ext4_file_write_span){.offset=end-1,.buffer=tail.bytes+17,.size=1,
+    span=(struct file_write_span){.offset=end-1,.buffer=tail.bytes+17,.size=1,
         .source={&tail,owned_page_retain,owned_page_release,block},
         .source_buffer=tail.bytes,.source_size=block};
     CHECK(ext4_fpwrite_batch(&file,&span,1)==EOK && span.written==1 && file.fsize==end);
@@ -827,10 +827,10 @@ static void group_data_owner(struct ext4_fs *fs)
     ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
     const size_t block=fs->bdev->lg_bsize;
     struct owned_file_page pages[8];
-    struct ext4_file_write_span spans[8];
+    struct file_write_span spans[8];
     for (unsigned i=0;i<8;i++) {
         owned_page_init(&pages[i],block,0x20+i);
-        spans[i]=(struct ext4_file_write_span){.offset=i*block,.buffer=pages[i].bytes,.size=block,
+        spans[i]=(struct file_write_span){.offset=i*block,.buffer=pages[i].bytes,.size=block,
             .source={&pages[i],owned_page_retain,owned_page_release,block}};
     }
     uint64_t writes=disk.writes,flushes=disk.flushes;
@@ -849,7 +849,7 @@ static void group_data_owner(struct ext4_fs *fs)
     /* Replace one running version. Its old bytes no longer have a borrower. */
     struct owned_file_page replacement;
     owned_page_init(&replacement,block,0x91);
-    struct ext4_file_write_span replace={.offset=0,.buffer=replacement.bytes,.size=block,
+    struct file_write_span replace={.offset=0,.buffer=replacement.bytes,.size=block,
         .source={&replacement,owned_page_retain,owned_page_release,block}};
     CHECK(ext4_fpwrite_batch(&file,&replace,1)==EOK && replace.written==block);
     owned_page_release(&replacement);
@@ -858,7 +858,7 @@ static void group_data_owner(struct ext4_fs *fs)
      * earlier accepted version, without writing or undoing that earlier page. */
     struct owned_file_page aborted;
     owned_page_init(&aborted,block,0xee);
-    replace=(struct ext4_file_write_span){.offset=block,.buffer=aborted.bytes,.size=block,
+    replace=(struct file_write_span){.offset=block,.buffer=aborted.bytes,.size=block,
         .source={&aborted,owned_page_retain,owned_page_release,block}};
     CHECK(ext4_transaction_begin("/")==EOK && ext4_fpwrite_batch(&file,&replace,1)==EOK);
     CHECK(aborted.references==2 && ext4_transaction_abort("/",ECANCELED)==ECANCELED && aborted.references==1);
@@ -946,12 +946,12 @@ static void group_data_batch(struct ext4_fs *fs)
         CHECK(selected==8);
         CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
         struct owned_file_page pages[8];
-        struct ext4_file_write_span spans[8];
+        struct file_write_span spans[8];
         for (unsigned i=0;i<8;i++) {
             /* Padding makes separate pages observably noncontiguous in RAM. */
             owned_page_init(&pages[i],page+512,0x30+i);
             batch_payloads[i]=pages[i].bytes;
-            spans[i]=(struct ext4_file_write_span){.offset=offsets[i],.buffer=pages[i].bytes,.size=page,
+            spans[i]=(struct file_write_span){.offset=offsets[i],.buffer=pages[i].bytes,.size=page,
                 .source={&pages[i],owned_page_retain,owned_page_release,page+512}};
         }
         CHECK(ext4_fpwrite_batch(&file,spans,8)==EOK);
@@ -990,7 +990,7 @@ static void group_borrow_admission(struct ext4_fs *fs)
     CHECK(ext4_fwrite(&file,initial,bytes,&count)==EOK && count==bytes);
     CHECK(ext4_journal_group_drain("/")==EOK);
     struct owned_file_page page; owned_page_init(&page,bytes,0x73);
-    struct ext4_file_write_span span={.buffer=page.bytes,.size=bytes,
+    struct file_write_span span={.buffer=page.bytes,.size=bytes,
         .source={&page,owned_page_retain,owned_page_release,bytes}};
     struct jbd_journal *journal=fs->jbd_journal;
     size_t limit=journal->memory_limit;
@@ -1023,7 +1023,7 @@ static void group_source_budget(struct ext4_fs *fs, bool failed)
     struct owned_file_page page, rejected;
     owned_page_init(&page,bytes,0x63); owned_page_init(&rejected,bytes,0xee);
     for (unsigned i=0;i<blocks;i++) memset(page.bytes+i*block,0x60+i,block);
-    struct ext4_data_source source={&page,owned_page_retain,owned_page_release,bytes};
+    struct file_data_source source={&page,owned_page_retain,owned_page_release,bytes};
     struct jbd_journal *journal=fs->jbd_journal;
     struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
     size_t original_limit=journal->memory_limit, baseline=journal->memory_used-journal->memory_cached;
@@ -1036,14 +1036,14 @@ static void group_source_budget(struct ext4_fs *fs, bool failed)
         if (!i) CHECK(journal->memory_used>=baseline+bytes);
         else CHECK(journal->memory_used-previous<block);
     }
-    struct ext4_data_source invalid={&rejected,owned_page_retain,owned_page_release,bytes};
+    struct file_data_source invalid={&rejected,owned_page_retain,owned_page_release,bytes};
     CHECK(jbd_trans_write_data(operation,homes[0],0,rejected.bytes,block,false,&invalid)==ENOMEM);
     CHECK(rejected.references==1 && !rejected.retains && jbd_journal_read_data(fs,homes[0])==page.bytes);
     invalid=source; invalid.bytes++;
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&invalid)==EINVAL);
     invalid=source; invalid.release=owned_page_retain;
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&invalid)==EINVAL);
-    invalid=(struct ext4_data_source){.bytes=1};
+    invalid=(struct file_data_source){.bytes=1};
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&invalid)==EINVAL);
     CHECK(page.references==2 && page.retains==1 && !page.releases);
     fs->curr_trans=NULL; journal->memory_limit=original_limit;
@@ -1093,7 +1093,7 @@ static void group_data_error(struct ext4_fs *fs, bool fail_flush)
     const unsigned offsets[4]={0,1,2,1};
     struct jbd_journal *journal=fs->jbd_journal;
     for (unsigned i=0;i<4;i++) {
-        struct ext4_file_write_span span={.offset=offsets[i]*block,
+        struct file_write_span span={.offset=offsets[i]*block,
             .buffer=pages[i].bytes,.size=block,
             .source={&pages[i],owned_page_retain,owned_page_release,block}};
         CHECK(ext4_fpwrite_batch(&file,&span,1)==EOK && span.written==block);
@@ -1124,7 +1124,7 @@ static void group_data_error(struct ext4_fs *fs, bool fail_flush)
     for (unsigned i=0;i<17;i++) CHECK(readback[i]==0x43);
     for (unsigned i=0;i<19;i++) CHECK(readback[32+i]==0x42);
     CHECK(ext4_journal_group_drain("/")==EIO);
-    struct ext4_file_write_span rejected={.buffer=readback,.size=1};
+    struct file_write_span rejected={.buffer=readback,.size=1};
     CHECK(ext4_fpwrite_batch(&file,&rejected,1)==EIO && !rejected.written);
     for (unsigned i=0;i<4;i++) CHECK(pages[i].references==1 && pages[i].bytes);
     CHECK(disk.writes==writes && disk.flushes==flushes);
@@ -1624,11 +1624,11 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
 {
     (void)dev; /* Some host runners build this fixture without work counters. */
     ext4_file file;CHECK(ext4_fopen(&file,"/public-range","w+")==EOK);
-    struct owned_file_page pages[32];struct ext4_file_write_span writes[32];
+    struct owned_file_page pages[32];struct file_write_span writes[32];
     struct ext4_file_read_span reads_out[32];unsigned char *outputs[32];
     for(unsigned i=0;i<32;i++) {
         owned_page_init(&pages[i],4096,0x40+i);
-        writes[i]=(struct ext4_file_write_span){.offset=i*4096,.buffer=pages[i].bytes,.size=4096,
+        writes[i]=(struct file_write_span){.offset=i*4096,.buffer=pages[i].bytes,.size=4096,
             .source={&pages[i],owned_page_retain,owned_page_release,4096},
             .source_buffer=pages[i].bytes,.source_size=4096};
         outputs[i]=malloc(4096);CHECK(outputs[i]);
@@ -1685,7 +1685,7 @@ static void public_batch_boundaries(struct ext4_blockdev *dev)
     ext4_file file;CHECK(ext4_fopen(&file,"/batch-boundaries","w+")==EOK);
     unsigned char first[13],second[19],last[17];memset(first,0x31,sizeof(first));
     memset(second,0x52,sizeof(second));memset(last,0x73,sizeof(last));
-    struct ext4_file_write_span spans[3]={
+    struct file_write_span spans[3]={
         {.offset=0,.buffer=first,.size=sizeof(first)},
         {.offset=sizeof(first),.buffer=second,.size=sizeof(second)},
         {.offset=2*dev->lg_bsize,.buffer=last,.size=sizeof(last)}};
@@ -1706,16 +1706,16 @@ static void direct_range_error(struct ext4_fs *fs)
     CHECK(!fs->jbd_journal);
     ext4_file file;CHECK(ext4_fopen(&file,"/direct-range-error","w+")==EOK);
     uint64_t free_before=ext4_sb_get_free_blocks_cnt(&fs->sb);
-    struct ext4_file_write_span spans[32];
+    struct file_write_span spans[32];
     for(unsigned i=0;i<32;i++) {
         owned_page_init(&direct_pages[i],8192,0x30+i);
-        spans[i]=(struct ext4_file_write_span){.offset=i*4096,.buffer=direct_pages[i].bytes,.size=4096,
+        spans[i]=(struct file_write_span){.offset=i*4096,.buffer=direct_pages[i].bytes,.size=4096,
             .source={&direct_pages[i],owned_page_retain,owned_page_release,8192},
             .source_buffer=direct_pages[i].bytes,.source_size=8192};
     }
     /* A copied sixth page flushes five queued borrowed pages while this one
      * allocation window still owns the remaining 27 pages in later spans. */
-    spans[5].source=(struct ext4_data_source){0};spans[5].source_buffer=NULL;spans[5].source_size=0;
+    spans[5].source=(struct file_data_source){0};spans[5].source_buffer=NULL;spans[5].source_size=0;
     direct_batches=0;direct_fail_batch=1;fs->bdev->bdif->bwrite_batch=direct_write_batch;
     CHECK(ext4_fpwrite_batch(&file,spans,32)==EIO && direct_batches==1 && !file.fsize);
     fs->bdev->bdif->bwrite_batch=NULL;

@@ -3379,7 +3379,7 @@ Failed:
 struct ext4_direct_write_batch {
     struct ext4_block_span blocks[EXT4_BLOCK_BATCH_MAX];
     struct {
-        struct ext4_file_write_span *span;
+        struct file_write_span *span;
         uint64_t offset;
         size_t length;
         bool allocated;
@@ -3416,7 +3416,7 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
     return r;
 }
 
-static int ext4_write_spans(ext4_file *file, struct ext4_file_write_span *spans, unsigned count)
+static int ext4_write_spans(ext4_file *file, struct file_write_span *spans, unsigned count)
 {
 	if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
 	for (unsigned i = 0; i < count; i++) spans[i].written = 0;
@@ -3424,11 +3424,11 @@ static int ext4_write_spans(ext4_file *file, struct ext4_file_write_span *spans,
 	if (file->flags & O_RDONLY) return EPERM;
 	uint64_t write_end = 0;
 	size_t blocks = 0, data_images = 0;
-	const struct ext4_data_source *sources[EXT4_BLOCK_BATCH_MAX];
+	const struct file_data_source *sources[EXT4_BLOCK_BATCH_MAX];
 	unsigned source_count = 0;
 	unsigned block_size = ext4_sb_get_block_size(&file->mp->fs.sb);
 	for (unsigned i = 0; i < count; i++) {
-		struct ext4_file_write_span *span = &spans[i];
+		struct file_write_span *span = &spans[i];
 		if ((!span->buffer && span->size) || !!span->source.retain != !!span->source.release ||
 		    !!span->source.retain != !!span->source.bytes) return EINVAL;
 		if (span->offset > file->fmax || span->size > file->fmax - span->offset) return EFBIG;
@@ -3491,7 +3491,7 @@ Retry:
     struct ext4_inode_block_range range = {0};
     ext4_lblk_t range_next = 0;
 	for (unsigned i = 0; i < count && !r; i++) {
-		struct ext4_file_write_span *span = &spans[i];
+		struct file_write_span *span = &spans[i];
 		if (!span->size) continue;
 		file->fpos = span->offset;
         uint64_t old_size = ext4_inode_get_size(&fs->sb, ref.inode);
@@ -3644,14 +3644,14 @@ int ext4_fwrite(ext4_file *file, const void *buffer, size_t size, size_t *writte
 {
 	if (!file || !file->mp) return EINVAL;
 	EXT4_MP_LOCK(file->mp);
-	struct ext4_file_write_span span = {.offset=file->fpos, .buffer=buffer, .size=size};
+	struct file_write_span span = {.offset=file->fpos, .buffer=buffer, .size=size};
 	int r = ext4_write_spans(file, &span, 1);
 	if (written) *written = span.written;
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
 
-int ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsigned count)
+int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
 {
 	if (!file || !file->mp) return EINVAL;
 	EXT4_MP_LOCK(file->mp);
@@ -3669,7 +3669,7 @@ int ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsi
 
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written)
 {
-	struct ext4_file_write_span span = {.offset=offset, .buffer=buffer, .size=size};
+	struct file_write_span span = {.offset=offset, .buffer=buffer, .size=size};
 	int r = ext4_fpwrite_batch(file, &span, 1);
 	if (written) *written = span.written;
 	return r;

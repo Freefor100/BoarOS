@@ -158,7 +158,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
                           size_t size,
                           size_t *bytes_read);
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
-    struct kernel_vfs_writeback_span *spans, size_t count);
+    struct file_write_span *spans, size_t count);
 
 static struct kernel_vfs_backend ext4_backend;
 int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
@@ -1912,29 +1912,17 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
 }
 
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
-    struct kernel_vfs_writeback_span *spans, size_t count)
+    struct file_write_span *spans, size_t count)
 {
+    _Static_assert(KERNEL_VFS_WRITEBACK_MAX <= EXT4_BLOCK_BATCH_MAX,
+        "VFS writeback batches must fit ext4");
     if (count > KERNEL_VFS_WRITEBACK_MAX) __builtin_trap();
-    struct ext4_file_write_span local, *batch=&local;
-    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
-        for (size_t i=0;i<count;i++) spans[i].written=0;
-        return -KERNEL_ENOMEM;
-    }
+    for (size_t i = 0; i < count; i++) COST_ADD(BACKEND_REQUESTED, spans[i].size);
+    int result = ext4_fpwrite_batch(lwext4_node_file(node), spans, count);
     for (size_t i = 0; i < count; i++) {
-        COST_ADD(BACKEND_REQUESTED, spans[i].size);
-        batch[i] = (struct ext4_file_write_span){
-            .offset=spans[i].offset, .buffer=spans[i].buffer, .size=spans[i].size,
-            .source_buffer=spans[i].source_buffer, .source_size=spans[i].source_size,
-            .source={.context=spans[i].owner, .retain=spans[i].retain,
-                .release=spans[i].release, .bytes=spans[i].source_bytes}};
-    }
-    int result = ext4_fpwrite_batch(lwext4_node_file(node), batch, count);
-    for (size_t i = 0; i < count; i++) {
-        spans[i].written = batch[i].written;
         if (!result && spans[i].written != spans[i].size) result = EIO;
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
-    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
     if (result) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     return lwext4_error(result);
 }
