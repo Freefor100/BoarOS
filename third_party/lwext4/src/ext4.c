@@ -2904,12 +2904,15 @@ static bool ext4_copy_pending_data(struct ext4_blockdev *bdev, ext4_fsblk_t bloc
 	uint32_t offset, void *out, size_t length)
 {
 	const void *pending = jbd_journal_read_data(bdev->fs, block);
-	if (pending) { memcpy(out, (const uint8_t *)pending + offset, length); return true; }
+    if (pending) {
+        if (out) memcpy(out, (const uint8_t *)pending + offset, length);
+        return true;
+    }
 	struct ext4_block cached = EXT4_BLOCK_ZERO();
 	struct ext4_buf *buf = ext4_bcache_find_get(bdev->bc, &cached, block);
 	if (!buf) return false;
 	bool current = ext4_bcache_test_flag(buf, BC_DIRTY) || buf->journal_pending;
-	if (current) memcpy(out, cached.data + offset, length);
+    if (current && out) memcpy(out, cached.data + offset, length);
 	/* Lookup is only a borrow: it must not flush unrelated data in a read. */
 	bdev->cache_write_back++;
 	if (ext4_block_set(bdev, &cached)) __builtin_trap();
@@ -3202,7 +3205,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
         unsigned parts = 0, pending = 0;
         for (unsigned i = 0; i < count && parts < EXT4_BLOCK_BATCH_MAX; i++) {
             size_t planned = spans[i].completed;
-            while (!spans[i].error && planned < limits[i] && parts < EXT4_BLOCK_BATCH_MAX) {
+            while (!spans[i].error && planned < limits[i]) {
                 uint64_t offset = spans[i].offset + planned;
                 unsigned skip = offset % block_size;
                 size_t length = block_size - skip;
@@ -3210,19 +3213,38 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                 ext4_fsblk_t physical;
                 int r = ext4_fs_get_inode_dblk_idx(&ref, (ext4_lblk_t)(offset / block_size), &physical, true);
                 if (r) { mapping_errors[i] = r; break; }
+                void *out = (uint8_t *)spans[i].buffer + planned;
+                unsigned sector = fs->bdev->bdif->ph_bsize;
+                uint64_t block = (fs->bdev->part_offset + physical * block_size + skip) / sector;
+                bool aligned = physical && !(skip % sector) && !(length % sector);
+                bool extend = parts && pending && aligned &&
+                    fragments[parts - 1].span == i && owners[pending - 1] == parts - 1 &&
+                    reads[pending - 1].block + reads[pending - 1].count == block &&
+                    (uint8_t *)reads[pending - 1].data + (size_t)reads[pending - 1].count * sector == out &&
+                    length / sector <= UINT32_MAX - reads[pending - 1].count;
+                if (parts == EXT4_BLOCK_BATCH_MAX) {
+                    /* 八项限制针对真实输出区间；同页连续小FS块仍可扩展最后一项。
+                     * 空输出只查询当前版本，不能把未接纳片段提前复制进调用者。 */
+                    if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
+                    reads[pending - 1].count += length / sector;
+                    fragments[parts - 1].length += length;
+                    planned += length;
+                    continue;
+                }
                 unsigned part = parts++;
                 fragments[part] = (struct read_fragment){i, length, EOK};
-                void *out = (uint8_t *)spans[i].buffer + planned;
                 if (!physical) memset(out, 0, length);
                 else if (!ext4_copy_pending_data(fs->bdev, physical, skip, out, length)) {
-                    unsigned sector = fs->bdev->bdif->ph_bsize;
-                    if (skip % sector || length % sector)
+                    if (!aligned)
                         fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
+                    else if (extend) {
+                        parts--;
+                        reads[pending - 1].count += length / sector;
+                        fragments[parts - 1].length += length;
+                    }
                     else {
                         owners[pending] = part;
-                        reads[pending++] = (struct ext4_block_read_span){out,
-                            (fs->bdev->part_offset + physical * block_size + skip) / sector,
-                            length / sector, EIO};
+                        reads[pending++] = (struct ext4_block_read_span){out, block, length / sector, EIO};
                     }
                 }
                 planned += length;

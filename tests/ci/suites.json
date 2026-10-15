@@ -42,6 +42,7 @@
       {"name":"architecture","targets":["test-riscv"]},
       {"name":"scale","targets":["test-scale-riscv"]},
       {"name":"storage-concurrency","targets":["test-io-sleep-riscv"]},
+      {"name":"demand-read","targets":["test-demand-read-riscv"]},
       {"name":"multi-disk-isolation","targets":["test-multi-disk-io-riscv"]},
       {"name":"user-runtime","targets":["test-userland-riscv"]},
       {"name":"abi","targets":["test-diff-abi-riscv","test-elf-boundary-riscv"]},

@@ -239,6 +239,9 @@ static void disk_mm_case(struct kernel_page_cache *cache,struct kernel_heap *hea
         if (revoke) assert(!kernel_mm_mprotect(&parent,0x40000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
     }
     puts("PASS fault-to-pin: snapshot revoke retries; actual VMA revoke faults");
+    /* 前一组权限准备可能把页0标脏；本组只检查截掉页1时旧pin的退休，
+     * 先同步保留页，避免完整fsync合法地将两页绑定成同一批次。 */
+    assert(!kernel_mm_msync(&parent,0x40000,BOAROS_PAGE_SIZE,4));
     disk_views[1]=&parent; assert(!kernel_mm_context(&parent,&disk_roots[1]));
     disk_target=0x40000+BOAROS_PAGE_SIZE; disk_pin_ready=disk_pin_resume=0;
     pthread_t writer,sync;

@@ -72,6 +72,16 @@ enum kernel_page_cache_status __wrap_kernel_open_file_get_page(struct kernel_ope
     sync_edit = edit;
     return result;
 }
+enum kernel_page_cache_status __real_kernel_page_cache_get_batch(struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t, struct kernel_page_cache_read_page *, size_t);
+enum kernel_page_cache_status __wrap_kernel_page_cache_get_batch(struct kernel_page_cache *owner, const struct kernel_vfs_file *source,
+    uint64_t first, struct kernel_page_cache_read_page *pages, size_t count)
+{
+    int edit = sync_edit;
+    if (operation_testing) sync_edit = 0;
+    enum kernel_page_cache_status result = __real_kernel_page_cache_get_batch(owner, source, first, pages, count);
+    sync_edit = edit;
+    return result;
+}
 enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied);
 
@@ -611,8 +621,8 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int physical(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static int dma(const void *p, uint64_t n, uint64_t *out) { (void)n; *out = (uintptr_t)p; return 1; }
-int __real_kernel_vfs_node_pread(struct kernel_vfs_node *, uint64_t, void *, size_t, size_t *);
-int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, void *buffer, size_t size, size_t *count)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
 {
     if (loading_probe) {
         loads++;
@@ -620,7 +630,7 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 10);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_pread(node, offset, buffer, size, count);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count);
 }
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
@@ -687,8 +697,11 @@ static void reader(void *arg)
 {
     uintptr_t irq = riscv_interrupt_save();
     unsigned index = (uintptr_t)arg;
-    size_t valid;
-    check(kernel_page_cache_get(&cache, &file, 0, &observed[index], &valid) == KERNEL_PAGE_CACHE_STATUS_OK, 11);
+    struct kernel_page_cache_read_page page;
+    check(kernel_page_cache_get_batch(&cache, &file, 0, &page, 1) == KERNEL_PAGE_CACHE_STATUS_OK &&
+        page.status == KERNEL_PAGE_CACHE_STATUS_OK, 11);
+    size_t valid = page.valid_bytes;
+    observed[index] = page.physical_address;
     check(valid == sizeof(payload) && !memcmp(access_page(observed[index]), payload, valid), 12);
     check(physical_page_release(&allocator, observed[index]) == PHYSICAL_PAGE_STATUS_OK, 13);
     done++;

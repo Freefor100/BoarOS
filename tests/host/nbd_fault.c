@@ -199,6 +199,7 @@ static int gate_control(int fd, struct response_gate *gate,
     gate->input[gate->used] = 0;
     gate->used = 0;
     int drain = !strcmp(gate->input, "drain");
+    int read_error = 0;
     uint64_t id = 0;
     char tail;
     if (!strcmp(gate->input, "cut")) {
@@ -213,12 +214,20 @@ static int gate_control(int fd, struct response_gate *gate,
     }
     if (!strcmp(gate->input, "arm")) arm_faults(disk, options, event, armed);
     else if (!strcmp(gate->input, "hold")) gate->hold = 1;
-    else if (drain || sscanf(gate->input, "release %" SCNu64 "%c", &id, &tail) == 1) {
+    else if (drain || sscanf(gate->input, "release %" SCNu64 "%c", &id, &tail) == 1 ||
+             (read_error = sscanf(gate->input, "read-error %" SCNu64 "%c", &id, &tail) == 1)) {
         int found = drain;
         struct pending_reply **link = &gate->head;
         while (*link) {
             struct pending_reply *reply = *link;
             if (drain || reply->id == id) {
+                /* Only a successful nonempty READ has a data payload. Fail
+                 * that named reply without executing another device command. */
+                if (read_error) {
+                    if (reply->size <= 16) return -1;
+                    put32(reply->bytes + 4, EIO);
+                    reply->size = 16;
+                }
                 if (transfer(fd, reply->bytes, reply->size, 1)) return -1;
                 *link = reply->next;
                 fprintf(stderr, "released=%" PRIu64 "\n", reply->id);

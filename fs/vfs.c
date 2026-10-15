@@ -1123,23 +1123,32 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
     if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
     while (*bytes_read < size && offset < node->size) {
-        uint64_t address;
-        size_t valid, start = (size_t)(offset & (BOAROS_PAGE_SIZE - 1U));
-        void *page;
-        enum kernel_page_cache_status status = kernel_page_cache_get(
-              cache, file, offset >> BOAROS_PAGE_SHIFT, &address, &valid);
-        if (status != KERNEL_PAGE_CACHE_STATUS_OK)
-            return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
-                       ? -KERNEL_ENOMEM : -KERNEL_EIO;
-        if (physical_page_resolve(cache->allocator, address, &page) !=
-                PHYSICAL_PAGE_STATUS_OK || valid <= start) __builtin_trap();
-        size_t count = valid - start;
-        if (count > size - *bytes_read) count = size - *bytes_read;
-        memcpy((unsigned char *)buffer + *bytes_read,
-                (unsigned char *)page + start, count);
-        (void)physical_page_release(cache->allocator, address);
-        *bytes_read += count;
-        offset += count;
+        size_t start = offset & BOAROS_PAGE_MASK;
+        size_t window = BOAROS_PAGE_SIZE * KERNEL_PAGE_CACHE_READ_BATCH_MAX - start;
+        if (window > size - *bytes_read) window = size - *bytes_read;
+        if (window > node->size - offset) window = node->size - offset;
+        size_t count = (start + window + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+        struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+        if (kernel_page_cache_get_batch(cache, file, offset >> BOAROS_PAGE_SHIFT, pages, count) ==
+            KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
+        int error = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (pages[i].status) {
+                error = pages[i].status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+                break;
+            }
+            void *page;
+            size_t valid = pages[i].valid_bytes;
+            if (physical_page_resolve(cache->allocator, pages[i].physical_address, &page) || valid <= start)
+                __builtin_trap();
+            size_t copied = valid - start;
+            if (copied > size - *bytes_read) copied = size - *bytes_read;
+            memcpy((unsigned char *)buffer + *bytes_read, (unsigned char *)page + start, copied);
+            *bytes_read += copied; offset += copied; start = 0;
+        }
+        for (size_t i = 0; i < count; i++) if (!pages[i].status)
+            if (physical_page_release(cache->allocator, pages[i].physical_address)) __builtin_trap();
+        if (error) return error;
     }
     return 0;
 }

@@ -123,6 +123,19 @@ enum kernel_page_cache_status kernel_page_cache_get(
     uint64_t *physical_address,
     size_t *valid_bytes);
 
+#define KERNEL_PAGE_CACHE_READ_BATCH_MAX 8U
+struct kernel_page_cache_read_page {
+    uint64_t physical_address;
+    size_t valid_bytes;
+    enum kernel_page_cache_status status;
+};
+/* 只装入本次请求覆盖的连续页。每项独立返回；只有OK项拥有物理页引用，
+ * 调用者须归还全部成功项，包括首个错误之后的项。返回值是首个非OK状态。
+ * 自有加载先一起完成、发布，再等待他人的loading，避免重叠批次互等。 */
+enum kernel_page_cache_status kernel_page_cache_get_batch(
+    struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first,
+    struct kernel_page_cache_read_page *pages, size_t count);
+
 /* A successful lookup also returns an owned physical-page reference. */
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache,

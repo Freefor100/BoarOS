@@ -73,6 +73,8 @@ jobs:
             build/stack-usage/**/*.su
             build/stack-usage/*.log
             build/io-sleep-run.*/*.log
+            build/demand-read/build.log
+            build/demand-read/run-*/*.log
             build/multi-disk-io.*/*.log
             build/multi-disk-io.*/*-timeout.json
             build/multi-disk-io.*/*-exit.json
@@ -116,6 +118,7 @@ jobs:
             build/exec-boundary-*/*.img
             build/stack-elf-*/*.img
             build/io-sleep-run.*/root.img
+            build/demand-read/run-*/root.img
             build/multi-disk-io.*/*.img
             build/elf-tail-riscv/**/*.img
             build/network/contract-*/**/*.img

@@ -60,11 +60,13 @@ static void yield(void)
 }
 #if BOAROS_TEST_READAHEAD_HELD
 static unsigned prefetch_entered, demand_finished, owner_checked;
-static struct kernel_task *producer_task, *demand_task, *stopping_task;
+static struct kernel_task *producer_task, *demand_task, *stopping_task, *exercise_task;
 static struct kernel_thread_join demand_join, observer_join;
 int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
 {
+    if (kernel_task_current() == exercise_task)
+        return __real_kernel_vfs_node_pread_batch(node, spans, count);
     producer_task = kernel_task_current(); prefetch_entered = 1;
     check(count == BOAROS_PAGE_CACHE_READAHEAD_PAGES, 51);
     int result=__real_kernel_vfs_node_pread_batch(node,spans,count);
@@ -111,6 +113,9 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kern
 static void exercise(void *unused)
 {
     (void)unused;uintptr_t irq=riscv_interrupt_save();
+#if BOAROS_TEST_READAHEAD_HELD
+    exercise_task = kernel_task_current();
+#endif
     struct kernel_open_file_description *file=NULL;int error;
     check(kernel_vfs_start_journal_worker(&mount)==0,15);
     check(kernel_open_file_create(&heap,&mount,"/data",&file,&error)==KERNEL_OPEN_FILE_STATUS_OK && !error,10);

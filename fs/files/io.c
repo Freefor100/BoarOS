@@ -333,6 +333,68 @@ enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
     return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
 }
 
+/* 缓存批次只覆盖剩余需求；复制前已经结束存储锁，整个批次的成功页都有独立引用。 */
+static enum kernel_files_status disk_read(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    struct kernel_uaccess_iov_cursor *cursor, uint64_t request,
+    uint64_t position, int advance, int64_t *linux_result)
+{
+    uint64_t total = 0;
+    int error = 0, done = 0;
+    enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
+    while (total < request && !done) {
+        kernel_open_file_read_begin(description, position);
+        size_t start = position & BOAROS_PAGE_MASK;
+        size_t count = (start + request - total + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+        if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
+        struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+        enum kernel_page_cache_status loaded = kernel_page_cache_get_batch(
+            kernel_open_file_page_cache(description), &description->file,
+            position >> BOAROS_PAGE_SHIFT, pages, count);
+        if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT)
+            return KERNEL_FILES_STATUS_STATE;
+        for (size_t i = 0; i < count; i++) {
+            struct kernel_page_cache_read_page *part = &pages[i];
+            KERNEL_FILES_NOTE(files, read_chunks, 1);
+            if (part->status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE ||
+                (!part->status && start >= part->valid_bytes)) { done = 1; break; }
+            if (part->status) {
+                error = part->status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+                done = 1; break;
+            }
+            void *page;
+            if (physical_page_resolve(files->heap->page_allocator, part->physical_address, &page)) {
+                status = KERNEL_FILES_STATUS_STATE; done = 1; break;
+            }
+            size_t chunk = part->valid_bytes - start, copied = 0;
+            if (chunk > request - total) chunk = request - total;
+            enum kernel_uaccess_status access = kernel_copy_to_user_iov(mm, cursor,
+                (unsigned char *)page + start, chunk, &copied);
+            if (copied > chunk || (advance && kernel_open_file_advance(description, copied))) {
+                status = KERNEL_FILES_STATUS_STATE; done = 1; break;
+            }
+            kernel_open_file_read_progress(description, position, copied);
+            total += copied; position += copied;
+            if (access == KERNEL_UACCESS_STATUS_FAULT) {
+                error = -KERNEL_EFAULT; done = 1; break;
+            }
+            if (access || copied != chunk) {
+                status = KERNEL_FILES_STATUS_STATE; done = 1; break;
+            }
+            if (part->valid_bytes < BOAROS_PAGE_SIZE) { done = 1; break; }
+            start = 0;
+        }
+        /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
+        for (size_t i = 0; i < count; i++) if (!pages[i].status)
+            if (physical_page_release(files->heap->page_allocator, pages[i].physical_address)) __builtin_trap();
+    }
+    if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
+    KERNEL_FILES_NOTE(files, bytes_read, total);
+    *linux_result = total ? (int64_t)total : error;
+    return status;
+}
+
 static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -573,88 +635,8 @@ static enum kernel_files_status read_pinned(
     if (kernel_open_file_memory_backed(description))
         return memory_read(files, mm, description, &cursor, request,
                            kernel_open_file_offset(description), 1, linux_result);
-    while (total < request) {
-        uint64_t file_offset = kernel_open_file_offset(description);
-        kernel_open_file_read_begin(description, file_offset);
-        uint64_t page_index = file_offset >> BOAROS_PAGE_SHIFT;
-        size_t page_offset = (size_t)(file_offset & BOAROS_PAGE_MASK);
-        size_t valid_bytes;
-        size_t chunk;
-        size_t copied = 0U;
-        uint64_t physical_address;
-        void *page;
-        enum kernel_page_cache_status cache_status;
-        enum kernel_uaccess_status access_status;
-
-        cache_status = kernel_open_file_get_page(description,
-                                                 page_index,
-                                                 &physical_address,
-                                                 &valid_bytes);
-        KERNEL_FILES_NOTE(files, read_chunks, 1);
-        if (cache_status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) {
-            break;
-        }
-        if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
-            int result = cache_status ==
-                                     KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
-                                 ? -KERNEL_ENOMEM
-                                 : -KERNEL_EIO;
-
-            KERNEL_FILES_NOTE(files, read_failures, 1);
-            *linux_result = total != 0U ? (int64_t)total : result;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (page_offset >= valid_bytes) {
-            (void)physical_page_release(files->heap->page_allocator,
-                                      physical_address);
-            break;
-        }
-        chunk = valid_bytes - page_offset;
-        if ((uint64_t)chunk > request - total) {
-            chunk = (size_t)(request - total);
-        }
-        if (physical_page_resolve(files->heap->page_allocator,
-                                  physical_address,
-                                  &page) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            (void)physical_page_release(files->heap->page_allocator,
-                                        physical_address);
-            return KERNEL_FILES_STATUS_STATE;
-        }
-        access_status = kernel_copy_to_user_iov(mm, &cursor,
-                                                (unsigned char *)page +
-                                                    page_offset,
-                                                chunk, &copied);
-        if (kernel_open_file_advance(description, copied) !=
-                KERNEL_OPEN_FILE_STATUS_OK ||
-            physical_page_release(files->heap->page_allocator,
-                                  physical_address) !=
-                PHYSICAL_PAGE_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
-        kernel_open_file_read_progress(description, file_offset, copied);
-        total += copied;
-        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-            KERNEL_FILES_NOTE(files, read_failures, 1);
-            *linux_result = total != 0U ? (int64_t)total
-                                        : -KERNEL_EFAULT;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (access_status != KERNEL_UACCESS_STATUS_OK ||
-            copied != chunk) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
-        if (page_offset + chunk == valid_bytes &&
-            valid_bytes < BOAROS_PAGE_SIZE) {
-            break;
-        }
-    }
-
-    KERNEL_FILES_NOTE(files, bytes_read, total);
-    *linux_result = (int64_t)total;
-    return KERNEL_FILES_STATUS_OK;
+    return disk_read(files, mm, description, &cursor, request,
+                     kernel_open_file_offset(description), 1, linux_result);
 }
 
 static void read_cpu0(void *argument)
@@ -831,7 +813,6 @@ static enum kernel_files_status pread_pinned(
     }
     uint64_t position;
     uint64_t request;
-    uint64_t total = 0U;
     uint64_t file_size;
 
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
@@ -914,78 +895,9 @@ static enum kernel_files_status pread_pinned(
         struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
         return memory_read(files, mm, description, &cursor, request, position, 0, linux_result);
     }
-    while (total < request) {
-        kernel_open_file_read_begin(description, position);
-        uint64_t page_index = position >> BOAROS_PAGE_SHIFT;
-        size_t page_offset = (size_t)(position & BOAROS_PAGE_MASK);
-        size_t valid_bytes;
-        size_t chunk;
-        size_t copied = 0U;
-        uint64_t physical_address;
-        void *page;
-        enum kernel_page_cache_status cache_status;
-        enum kernel_uaccess_status access_status;
-
-        cache_status = kernel_open_file_get_page(description,
-                                                  page_index,
-                                                  &physical_address,
-                                                  &valid_bytes);
-        KERNEL_FILES_NOTE(files, read_chunks, 1);
-        if (cache_status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) {
-            break;
-        }
-        if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
-            int result = cache_status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
-                             ? -KERNEL_ENOMEM
-                             : -KERNEL_EIO;
-
-            KERNEL_FILES_NOTE(files, read_failures, 1);
-            *linux_result = total != 0U ? (int64_t)total : result;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (page_offset >= valid_bytes) {
-            (void)physical_page_release(files->heap->page_allocator,
-                                      physical_address);
-            break;
-        }
-        chunk = valid_bytes - page_offset;
-        if ((uint64_t)chunk > request - total) {
-            chunk = (size_t)(request - total);
-        }
-        if (physical_page_resolve(files->heap->page_allocator,
-                                  physical_address,
-                                  &page) != PHYSICAL_PAGE_STATUS_OK) {
-            (void)physical_page_release(files->heap->page_allocator,
-                                        physical_address);
-            return KERNEL_FILES_STATUS_STATE;
-        }
-        access_status = kernel_copy_to_user(mm,
-                                            user_buffer + total,
-                                            (unsigned char *)page + page_offset,
-                                            chunk,
-                                            &copied);
-        (void)physical_page_release(files->heap->page_allocator,
-                                  physical_address);
-        total += copied;
-        kernel_open_file_read_progress(description, position, copied);
-        position += copied;
-        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-            KERNEL_FILES_NOTE(files, read_failures, 1);
-            *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
-        if (page_offset + chunk == valid_bytes && valid_bytes < BOAROS_PAGE_SIZE) {
-            break;
-        }
-    }
-    KERNEL_FILES_NOTE(files, bytes_read, total);
-    *linux_result = (int64_t)total;
-    return KERNEL_FILES_STATUS_OK;
+    const struct kernel_uaccess_iovec iov = {user_buffer, request};
+    struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
+    return disk_read(files, mm, description, &cursor, request, position, 0, linux_result);
 }
 
 static void pread_cpu0(void *argument)
