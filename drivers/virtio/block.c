@@ -407,7 +407,7 @@ static void harvest_used(struct virtio_block_device *device, uint32_t pending)
 #endif
     uint16_t used_index = device->queue.used->index;
     uint16_t observed_count = (uint16_t)(used_index - device->queue.last_used);
-    int completed = observed_count != 0;
+    int completed = 0;
     if (observed_count > slot_count(device)) {
         diagnose_queue_fault(device, "used-overflow", used_index, observed_count, pending, NULL);
         fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
@@ -442,6 +442,7 @@ static void harvest_used(struct virtio_block_device *device, uint32_t pending)
             fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
         }
         r->state = 3;
+        completed = 1;
 #if BOAROS_COST_DIAGNOSTICS
         r->cost_completed = kernel_cost_clock();
         r->cost_woken = r->completion->head != NULL;

@@ -32,6 +32,20 @@ static unsigned notifications, first_notify_heads, sg_max_segments, park_calls;
 static unsigned sg_fail_sector;
 static unsigned sg_max_bytes, ack_calls;
 static uint32_t (*underlying_ack)(void *);
+static void (*before_take)(void);
+static struct kernel_wait_queue *late_wait_queue;
+static struct kernel_wait_node late_waiter;
+static unsigned late_wakes;
+enum virtio_status __real_virtio_split_take(struct virtio_split_queue *, struct virtio_completion *);
+enum virtio_status __wrap_virtio_split_take(struct virtio_split_queue *queue, struct virtio_completion *completion)
+{
+    if (before_take) {
+        void (*hook)(void)=before_take;
+        before_take=NULL;
+        hook();
+    }
+    return __real_virtio_split_take(queue,completion);
+}
 static unsigned phase_hold, phase_held_head, phase_crossed_window;
 static unsigned char *phase_held_status;
 static void (*underlying_write)(void *, enum virtio_register, uint32_t);
@@ -261,7 +275,13 @@ void kernel_proc_task_note_block_read(void) {}
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 { memset(queue, 0, sizeof(*queue)); }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
-{ assert(queue->head == NULL); return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    if (queue==late_wait_queue) {
+        assert(queue->head==&late_waiter && queue->tail==&late_waiter && late_waiter.queue==queue);
+        queue->head=queue->tail=NULL; late_waiter.queue=NULL; late_wakes++;
+    } else assert(queue->head == NULL);
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *queue,
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 {
@@ -858,6 +878,44 @@ static void large_phase_case(unsigned version)
     printf("PASS large journal phase transport=%u: one 512KiB owner, four concurrent 128KiB requests, quiet poll and IRQ ack\n",version);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
+static void late_harvest_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=MANUAL_COMPLETION; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=0; sg_fail_sector=UINT32_MAX;
+    diagnostic_length=0; late_wakes=0;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(begin_call(&device,0));
+    struct block_request *requests[8];
+    for (unsigned i=0;i<8;i++) {
+        requests[i]=reserve_request(&device); assert(requests[i]);
+        requests[i]->completion=&device.available;
+        assert(publish_request(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
+            UINT64_C(0x82000000)+i*512,512,0)==KERNEL_BLOCK_STATUS_OK);
+    }
+    late_waiter=(struct kernel_wait_node){.queue=&device.available};
+    late_wait_queue=&device.available;
+    device.available.head=device.available.tail=&late_waiter;
+    assert(device.queue.used->index==device.queue.last_used);
+    /* This hook runs only on entry to the real queue take, after harvest's
+     * initial used-index snapshot. Eight completions become visible then. */
+    before_take=sg_device_step;
+    block_irq(&device);
+    assert(!before_take && late_wakes==1 && !late_waiter.queue && !device.available.head);
+    assert(!device.queue.inflight && device.statistics.wakes==1);
+    late_wait_queue=NULL;
+    for (unsigned i=0;i<8;i++) {
+        assert(wait_request(&device,requests[i])==KERNEL_BLOCK_STATUS_OK);
+        release_request(&device,requests[i]);
+    }
+    end_call(&device,0);
+    assert(!device.active && !device.queue.claimed);
+    printf("PASS late used harvest transport=%u: eight completions after empty snapshot wake the registered batch waiter once\n",version);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
 static void bad_segment_limits_case(unsigned version)
 {
     for (unsigned kind = 0; kind < 2; kind++) {
@@ -989,6 +1047,9 @@ static void fragmented_descriptors_case(unsigned version)
 
 int main(int argc, char **argv)
 {
+    if (argc==2 && !strcmp(argv[1],"late-harvest")) {
+        late_harvest_case(1); late_harvest_case(2); return 0;
+    }
     if (argc==2 && !strcmp(argv[1],"large-phase")) {
         large_phase_case(1); large_phase_case(2); return 0;
     }
@@ -1048,6 +1109,7 @@ int main(int argc, char **argv)
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
+        late_harvest_case(version);
         large_phase_case(version);
         write_phase_case(version,0);
         write_phase_case(version,1);
