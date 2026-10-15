@@ -63,8 +63,10 @@ int kernel_files_is_live(const struct kernel_files *files)
             !bound || bound->record!=files->record) __builtin_trap();
     }
 #endif
-    KERNEL_FILES_SCOPE(guard, files);
-    struct kernel_files_record *record=files->record;
+    return 1;
+}
+static void validate_record_locked(const struct kernel_files_record *record)
+{
     uint32_t capacity=record->statistics.capacity;
     if (!record->references || record->retired || !record->slots ||
         capacity<KERNEL_FILES_INITIAL_CAPACITY || capacity>KERNEL_FILES_MAX_CAPACITY ||
@@ -72,11 +74,11 @@ int kernel_files_is_live(const struct kernel_files *files)
         record->statistics.current_open_fds>capacity ||
         record->statistics.close_on_exec_fds>record->statistics.current_open_fds)
         __builtin_trap();
-    return 1;
 }
 static struct kernel_open_file_description *lookup_locked(
     const struct kernel_files *files, int64_t fd)
 {
+    validate_record_locked(files->record);
     return fd >= 0 && (uint64_t)fd < files->record->statistics.capacity
         ? files->record->slots[fd].description : 0;
 }
@@ -677,9 +679,9 @@ int kernel_files_fd_matches(struct kernel_files *files, int64_t fd,
 void kernel_files_note(struct kernel_files *files, size_t offset, uint64_t value)
 {
     if (offset > offsetof(struct kernel_files_statistics, write_chunks) || offset % sizeof(uint64_t)) __builtin_trap();
-    KERNEL_FILES_SCOPE(guard, files);
     uint64_t *counter=(uint64_t *)((char *)&files->record->statistics+offset);
-    *counter += value;
+    /* 调用计数不改变槽或OFD所有权，不为每个计数重新取得FD表锁。 */
+    __atomic_fetch_add(counter, value, __ATOMIC_RELAXED);
 }
 
 enum kernel_files_status kernel_files_pin_data(
@@ -1134,10 +1136,10 @@ enum kernel_files_status kernel_files_close(
     struct kernel_open_file_description *description;
     {
         KERNEL_FILES_SCOPE(guard, files);
-        files->record->statistics.close_calls++;
+        KERNEL_FILES_NOTE(files, close_calls, 1);
         description = lookup_locked(files, fd);
         if (!description) {
-            files->record->statistics.close_failures++;
+            KERNEL_FILES_NOTE(files, close_failures, 1);
             *linux_result = -KERNEL_EBADF;
             return KERNEL_FILES_STATUS_OK;
         }
@@ -1189,7 +1191,15 @@ void kernel_files_get_statistics(
         return;
     }
     KERNEL_FILES_SCOPE(guard, files);
-    *statistics = files->record->statistics;
+    const struct kernel_files_statistics *source=&files->record->statistics;
+    const uint64_t *counters=(const void *)source;
+    uint64_t *output=(void *)statistics;
+    for (size_t i=0;i<offsetof(struct kernel_files_statistics,current_open_fds)/sizeof(*counters);i++)
+        output[i]=__atomic_load_n(&counters[i],__ATOMIC_RELAXED);
+    statistics->current_open_fds=source->current_open_fds;
+    statistics->peak_open_fds=source->peak_open_fds;
+    statistics->close_on_exec_fds=source->close_on_exec_fds;
+    statistics->capacity=source->capacity;
 }
 
 enum kernel_files_status kernel_files_release(struct kernel_files *files)

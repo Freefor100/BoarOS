@@ -29,7 +29,7 @@
 OFD 引用采用非零/溢出检查的原子取得与归还，只有最后归还者进入后端清理；
 引用计数为零的 detached cleanup owner 仍可处理原有真实清理错误，不能重新 acquire。
 原子引用只保护存储寿命，不使 offset、设备或文件业务自动获得跨核同步。
-每张 FD record 的 rank30 raw 锁保护槽、预留编号、descriptor flags、record 引用及统计。
+每张 FD record 的 rank30 raw 锁保护槽、预留编号、descriptor flags、record 引用和槽位数量。句柄存活及执行域检查不另取表锁，record 的可变不变量在锁内查槽时检查。调用、字节和分块计数使用 relaxed 原子更新，读取统计时分别取样；它们不参与 FD 所有权决策。
 lookup 与 OFD acquire 在同一临界区完成；跨解锁消费者持实际 OFD pin，已移除裸 description 查询入口。
 close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已 pin 请求的身份。
 扩容先在锁外分配并清零候选，锁内复查、最多复制 8 KiB 后发布，旧数组及竞争失败候选在锁外释放。

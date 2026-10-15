@@ -314,6 +314,12 @@ static void *close_thread(void *p)
     assert(!kernel_files_close(&files, 0, &result) && !result);
     return 0;
 }
+static void *count_statistics(void *unused)
+{
+    (void)unused; mm_test_attach(0);
+    for (unsigned i=0;i<10000;i++) KERNEL_FILES_NOTE(&files,read_calls,1);
+    return 0;
+}
 #ifdef PIPE_CONCURRENCY_CASES
 #include "pipe_cases.h"
 #endif
@@ -337,6 +343,16 @@ int main(void)
     assert(!kernel_open_file_create_pipe(&heap, pipe, KERNEL_PIPE_ENDPOINT_WRITE, 0, &write));
     assert(!kernel_files_install_new_owned_at(&files, 0, 0, &read));
     assert(!kernel_files_install_new_owned_at(&files, 1, 0, &write));
+    unsigned locks_before=metadata_acquisitions;
+    assert(kernel_files_is_live(&files));
+    KERNEL_FILES_NOTE(&files,read_calls,7);
+    assert(metadata_acquisitions==locks_before);
+    pthread_t counters[4];
+    for (unsigned i=0;i<4;i++) assert(!pthread_create(&counters[i],0,count_statistics,0));
+    for (unsigned i=0;i<4;i++) assert(!pthread_join(counters[i],0));
+    struct kernel_files_statistics counts;
+    kernel_files_get_statistics(&files,&counts);
+    assert(counts.read_calls==40007);
     watch_pin=1;
     pthread_t pin, close;
     assert(!pthread_create(&pin, 0, pin_thread, 0));
