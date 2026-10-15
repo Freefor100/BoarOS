@@ -1450,11 +1450,13 @@ static enum kernel_page_cache_status get_page(
         kernel_vfs_node_written(node, offset + BOAROS_PAGE_SIZE);
         *overwritten = 1;
     }
+    size_t valid = entry_valid_bytes(entry);
+    if (!overwrite && bytes_read > BOAROS_PAGE_SIZE) __builtin_trap();
+    if (!overwrite && !read_error && bytes_read < valid) read_error = -KERNEL_EIO;
     enum kernel_page_cache_status result = read_error == -KERNEL_ENOMEM ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY :
         read_error ? KERNEL_PAGE_CACHE_STATUS_IO : KERNEL_PAGE_CACHE_STATUS_OK;
     uint64_t physical = entry->physical_address;
     if (!result && physical_page_acquire(cache->allocator, physical)) __builtin_trap();
-    size_t valid = !result ? entry_valid_bytes(entry) : 0;
     int clean = 0;
     {
         CACHE_SCOPE(complete, cache);

@@ -32,6 +32,7 @@ static int page_address(const void *p, uint64_t *out)
 static int image_fd;
 static unsigned source_reads, pause_read, read_entered, resume_read;
 static int source_error;
+static unsigned source_short;
 static unsigned capture_reads, source_batches, source_batch_completed;
 static unsigned source_pages[64], source_batch_sizes[8];
 static unsigned source_fault_index;
@@ -144,7 +145,9 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t off, voi
     source_read_begin(off);
     source_read_pause();
     if (source_error) { *done = 0; return source_error; }
-    return __real_kernel_vfs_node_pread(node, off, out, size, done);
+    int result = __real_kernel_vfs_node_pread(node, off, out, size, done);
+    if (!result && source_short && *done) --*done;
+    return result;
 }
 int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
@@ -175,7 +178,11 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
         }
     }
     int result = used ? __real_kernel_vfs_node_pread_batch(node, kept, used) : 0;
-    for (size_t i = 0; i < used; i++) spans[destinations[i]] = kept[i];
+    for (size_t i = 0; i < used; i++) {
+        spans[destinations[i]] = kept[i];
+        if (source_short && !spans[destinations[i]].error && spans[destinations[i]].completed)
+            --spans[destinations[i]].completed;
+    }
     __atomic_fetch_add(&source_batch_completed, 1, __ATOMIC_RELEASE);
     return result ? result : injected;
 }
@@ -463,6 +470,7 @@ static void reset_demand_source(void)
     source_reads = source_batches = source_batch_completed = 0;
     read_entered = resume_read = pause_read = 0;
     source_error = source_fault_error = 0;
+    source_short = 0;
     memset(source_pages, 0, sizeof(source_pages));
     memset(source_batch_sizes, 0, sizeof(source_batch_sizes));
     capture_reads = 1;
@@ -586,6 +594,31 @@ static void demand_cold_warm(struct kernel_page_cache *cache, struct kernel_vfs_
     demand_release(&cold);
     demand_idle(cache);
     puts("PASS demand batch: eight cold pages in one backend call; owned refs and request/allocation-free warm hits");
+}
+static void demand_short_read(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
+{
+    assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
+    uint64_t available = physical_page_available(cache->allocator);
+    reset_demand_source();
+    source_short = 1;
+    uint64_t address; size_t valid;
+    assert(kernel_page_cache_get(cache, file, 0, &address, &valid) == KERNEL_PAGE_CACHE_STATUS_IO);
+    demand_idle(cache);
+    assert(physical_page_available(cache->allocator) == available);
+    struct demand_read failed = {.cpu = 0, .count = 1};
+    read_demand_batch(&failed);
+    assert(failed.status == KERNEL_PAGE_CACHE_STATUS_IO &&
+        !failed.pages[0].physical_address && !failed.pages[0].valid_bytes);
+    demand_idle(cache);
+    assert(physical_page_available(cache->allocator) == available);
+    reset_demand_source();
+    struct demand_read retry = {.cpu = 0, .count = 1};
+    read_demand_batch(&retry);
+    assert(!retry.status && source_reads == 1);
+    demand_contents(&retry.pages[0], 0x30, BOAROS_PAGE_SIZE);
+    demand_release(&retry);
+    demand_idle(cache);
+    puts("PASS short backend read: scalar and one-page batch reject incomplete success; failed entries release and retry");
 }
 static void demand_overlap(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
@@ -812,6 +845,7 @@ static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file
     assert(!kernel_page_cache_start_worker(cache));
     if (actors == 2) demand_operation_cases(cache, file);
     demand_cold_warm(cache, file);
+    demand_short_read(cache, file);
     demand_overlap(cache, file);
     demand_errors(cache, file);
 #ifndef CACHE_MM_CASES
