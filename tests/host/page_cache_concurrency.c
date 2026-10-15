@@ -6,6 +6,7 @@
 #include <kernel/block.h>
 #include <kernel/vfs.h>
 #include <kernel/page.h>
+#include <kernel/file_mapping.h>
 #include <kernel/errno.h>
 #include "../../fs/vfs_objects.h"
 #include <assert.h>
@@ -55,10 +56,17 @@ static _Thread_local unsigned observe_cache_metadata;
 static _Thread_local struct read_operation_counts *read_counts;
 static _Thread_local struct kernel_rwlock *read_inode_lock;
 static _Thread_local struct physical_page_allocator *read_allocator;
+static _Thread_local struct kernel_rwlock *attempt_inode_lock;
+static _Thread_local unsigned *inode_read_attempts;
+static _Thread_local unsigned *inode_read_resume;
 void __real_kernel_rwlock_read(struct kernel_rwlock *, struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
     if (read_counts && lock == read_inode_lock) read_counts->inode_locks++;
+    if (inode_read_attempts && lock==attempt_inode_lock) {
+        __atomic_fetch_add(inode_read_attempts,1,__ATOMIC_RELEASE);
+        while(inode_read_resume && !__atomic_load_n(inode_read_resume,__ATOMIC_ACQUIRE))sched_yield();
+    }
     __real_kernel_rwlock_read(lock, guard);
 }
 void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
@@ -754,6 +762,7 @@ static void dirty_index_case(struct kernel_page_cache *cache, struct kernel_vfs_
 
 struct demand_read {
     unsigned cpu, done;
+    unsigned watch_inode, inode_attempts, pause_inode, resume_inode, scalar;
     unsigned fail_workspace;
     size_t heap_allocations;
     uint64_t first;
@@ -765,14 +774,25 @@ static void *read_demand_batch(void *arg)
 {
     struct demand_read *read = arg;
     mm_test_attach(read->cpu);
+    if (read->watch_inode) {
+        attempt_inode_lock=&kernel_vfs_file_node(current_file)->io_lock;
+        inode_read_attempts=&read->inode_attempts;
+        inode_read_resume=read->pause_inode?&read->resume_inode:NULL;
+    }
     fail_workspace_allocation=read->fail_workspace;
     demand_heap_allocations=&read->heap_allocations;
     /* 结果必须由本次调用完整填写，错误页不能沿用旧地址或字节数。 */
     memset(read->pages, 0xa5, sizeof(read->pages));
-    read->status = kernel_page_cache_get_batch(current_cache, current_file,
+    if(read->scalar) {
+        assert(read->count==1);
+        read->pages[0]=(struct kernel_page_cache_read_page){0};
+        read->status=read->pages[0].status=kernel_page_cache_lookup(current_cache,current_file,
+            read->first,&read->pages[0].physical_address,&read->pages[0].valid_bytes);
+    } else read->status = kernel_page_cache_get_batch(current_cache, current_file,
         read->first, read->pages, read->count);
     assert(!fail_workspace_allocation);
     demand_heap_allocations=NULL;
+    attempt_inode_lock=NULL;inode_read_attempts=NULL;inode_read_resume=NULL;
     __atomic_store_n(&read->done, 1, __ATOMIC_RELEASE);
     return 0;
 }
@@ -886,9 +906,9 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
 #endif
             /* expanded_index已建立足够桶容量；这里检查实际保护次数，
              * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
-            assert(read.counts.inode_locks == (remote ? count : 1));
-            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 2 * count + 2 + (count>1?2:0)));
-            else if (warm) assert(read.counts.metadata_locks == count);
+            assert(read.counts.inode_locks == (!remote && !warm));
+            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 2 * count + 3 + (count>1?2:0)));
+            else if (warm) assert(read.counts.metadata_locks == 1);
             printf("read operation counts: page=%u cpu=%s cache=%s pages=%u metadata=%llu inode=%llu acquire=%llu release=%llu cache_probes=unavailable(COST=0) scope=caller\n",
                 (unsigned)BOAROS_PAGE_SIZE, remote ? "remote" : "native", warm ? "hot" : "cold", count,
                 (unsigned long long)read.counts.metadata_locks, (unsigned long long)read.counts.inode_locks,
@@ -924,6 +944,103 @@ static void demand_cold_warm(struct kernel_page_cache *cache, struct kernel_vfs_
     demand_release(&cold);
     demand_idle(cache);
     puts("PASS demand batch: eight cold pages in one backend call; owned refs and request/allocation-free warm hits");
+}
+static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_file *original,unsigned actors)
+{
+    struct kernel_vfs_file file={0};
+    char name[32];snprintf(name,sizeof(name),"/hot-resize-%u",actors);
+    assert(!kernel_vfs_create(original->mount,name,0600,&file));
+    current_cache=cache;current_file=&file;
+    capture_reads=0;
+    unsigned char data[BOAROS_PAGE_SIZE];size_t done;
+    for(unsigned i=0;i<4;i++) {
+        memset(data,0x70+i,sizeof(data));
+        assert(!kernel_vfs_pwrite(&file,(uint64_t)i*BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    }
+    uint64_t observed=kernel_vfs_error_sequence(&file);
+    assert(!kernel_vfs_sync(&file,0,&observed));
+    struct demand_read held={.count=4,.watch_inode=1};read_demand_batch(&held);
+    assert(!held.status && !held.inode_attempts);
+    struct demand_read scalar_hot={.cpu=1,.count=1,.watch_inode=1,.scalar=1};pthread_t scalar_reader;
+    assert(!pthread_create(&scalar_reader,NULL,read_demand_batch,&scalar_hot) && !pthread_join(scalar_reader,NULL));
+    assert(!scalar_hot.status && !scalar_hot.inode_attempts);
+    demand_contents(&scalar_hot.pages[0],0x70,BOAROS_PAGE_SIZE);demand_release(&scalar_hot);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    assert(!kernel_vfs_ftruncate(&file,3*BOAROS_PAGE_SIZE+37));
+    for(unsigned closed=0;closed<2;closed++) for(unsigned scalar=0;scalar<2;scalar++) {
+        struct kernel_lock_guard operation={0},inode={0};
+        struct kernel_page_cache_resize resize={0};
+        if(closed) {
+            kernel_vfs_file_write_lock(&file,&operation);
+            assert(!kernel_page_cache_resize_prepare(cache,node,node->size,node->size+1,&resize) && resize.entry);
+        }
+        kernel_vfs_node_lock(node,&inode,1);
+        if(!closed) kernel_file_mapping_close(node);
+        unsigned parked=mm_test_parked(0);
+        struct demand_read waiting={.first=scalar?3:0,.count=scalar?1:4,.watch_inode=1,.scalar=scalar};pthread_t reader;
+        assert(!pthread_create(&reader,NULL,read_demand_batch,&waiting));
+        wait_progress(&waiting.inode_attempts,1);
+        while(mm_test_parked(0)==parked)sched_yield();
+        assert(!__atomic_load_n(&waiting.done,__ATOMIC_ACQUIRE));
+        uint32_t references;
+        assert(!physical_page_reference_count(cache->allocator,held.pages[0].physical_address,&references) && references==2);
+        if(closed) kernel_page_cache_resize_finish(&resize,node->size);
+        else kernel_file_mapping_open(node);
+        kernel_lock_release(&inode);
+        if(operation.lock) kernel_lock_release(&operation);
+        assert(!pthread_join(reader,NULL) && !waiting.status);
+        for(unsigned i=0;i<waiting.count;i++) {
+            unsigned index=(unsigned)waiting.first+i;
+            demand_contents(&waiting.pages[i],0x70+index,index==3?37:BOAROS_PAGE_SIZE);
+        }
+        demand_release(&waiting);
+    }
+    assert(!kernel_page_cache_invalidate_node(cache,node));
+    struct demand_read prefix={.count=1};read_demand_batch(&prefix);assert(!prefix.status);
+    struct demand_read mixed={.count=2,.watch_inode=1,.pause_inode=1};pthread_t mixed_reader;
+    assert(!pthread_create(&mixed_reader,NULL,read_demand_batch,&mixed));
+    wait_progress(&mixed.inode_attempts,1);
+    uint32_t references;
+    assert(!physical_page_reference_count(cache->allocator,prefix.pages[0].physical_address,&references) && references==3);
+    /* miss尚未取得inode资格；旧hot前缀已拥有页，截断/再增长只影响慢路重查。 */
+    assert(!kernel_vfs_ftruncate(&file,0) && !kernel_vfs_ftruncate(&file,4*BOAROS_PAGE_SIZE));
+    __atomic_store_n(&mixed.resume_inode,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(mixed_reader,NULL) && !mixed.status);
+    demand_contents(&mixed.pages[0],0x70,BOAROS_PAGE_SIZE);
+    demand_contents(&mixed.pages[1],0,BOAROS_PAGE_SIZE);
+    assert(mixed.pages[0].physical_address==prefix.pages[0].physical_address &&
+        mixed.pages[1].physical_address!=held.pages[1].physical_address);
+    demand_release(&mixed);demand_release(&prefix);
+    for(unsigned i=0;i<4;i++) {
+        memset(data,0x70+i,sizeof(data));
+        assert(!kernel_vfs_pwrite(&file,(uint64_t)i*BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    }
+    observed=kernel_vfs_error_sequence(&file);assert(!kernel_vfs_sync(&file,0,&observed));
+    /* 已返回页只持数据页寿命；截断可以退休整页，重新增长不能复活其身份。 */
+    assert(!kernel_vfs_ftruncate(&file,BOAROS_PAGE_SIZE+37));
+    assert(!physical_page_reference_count(cache->allocator,held.pages[2].physical_address,&references) && references==1);
+    demand_contents(&held.pages[2],0x72,BOAROS_PAGE_SIZE);
+    struct demand_read eof={.count=4};read_demand_batch(&eof);
+    assert(eof.status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE);
+    demand_contents(&eof.pages[0],0x70,BOAROS_PAGE_SIZE);
+    demand_contents(&eof.pages[1],0x71,37);
+    assert(eof.pages[2].status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE && eof.pages[3].status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE);
+    assert(!kernel_vfs_ftruncate(&file,4*BOAROS_PAGE_SIZE));
+    struct demand_read grown={.count=4};read_demand_batch(&grown);assert(!grown.status);
+    demand_contents(&grown.pages[0],0x70,BOAROS_PAGE_SIZE);
+    const unsigned char *tail=access_page(grown.pages[1].physical_address);
+    for(size_t i=0;i<BOAROS_PAGE_SIZE;i++)assert(tail[i]==(i<37?0x71:0));
+    for(unsigned i=2;i<4;i++) {
+        demand_contents(&grown.pages[i],0,BOAROS_PAGE_SIZE);
+        assert(grown.pages[i].physical_address!=held.pages[i].physical_address);
+    }
+    demand_contents(&held.pages[2],0x72,BOAROS_PAGE_SIZE);
+    demand_release(&grown);demand_release(&eof);demand_release(&held);
+    demand_idle(cache);
+    assert(!kernel_page_cache_invalidate_node(cache,node));
+    assert(!kernel_vfs_unlink(file.mount,name) && !kernel_vfs_close(&file));
+    current_file=original;
+    puts("PASS hot read resize: batch/scalar closing/CLOSED waits, mixed hit/miss truncate-regrowth, old pins and new EOF identities");
 }
 static void demand_short_read(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
@@ -1212,6 +1329,7 @@ static void demand_truncate(struct kernel_page_cache *cache, struct kernel_vfs_f
 static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file *file, unsigned actors)
 {
     assert(!kernel_page_cache_start_worker(cache));
+    demand_hot_resize(cache,file,actors);
     if (actors == 2) demand_operation_cases(cache, file);
     demand_cold_warm(cache, file);
     demand_short_read(cache, file);

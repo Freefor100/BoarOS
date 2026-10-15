@@ -1222,6 +1222,20 @@ static enum kernel_page_cache_status finish_read_page(
     return status;
 }
 
+/* 取页资格只覆盖取页；physical ref不冻结内容，MM仍须核对自己的来源epoch。
+ * resize关闭在cache保护内建立；整inode截断另外由既有mapping关闭代次表达。 */
+static int read_cache_open(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
+{
+    uint64_t epoch;
+    return !cache->record->controlled || !kernel_file_mapping_epoch(node,&epoch);
+}
+static int read_entry_ready(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry)
+{
+    return !entry->loading && !entry->load_error && !entry->retired &&
+        (!cache->record->controlled ||
+         !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED));
+}
+
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t index, uint64_t *address, size_t *valid)
@@ -1230,7 +1244,21 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     if (!node) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     KERNEL_LOCK_SCOPE(inode);
-    if (cache->record->controlled) kernel_vfs_node_lock(node, &inode, 0);
+    if (cache->record->controlled) {
+        if (!kernel_lock_held(&node->io_lock,0)) {
+            CACHE_SCOPE(guard,cache);
+            if (read_cache_open(cache,node)) {
+                struct kernel_page_cache_entry *entry;
+                enum kernel_page_cache_status status=lookup_entry(cache,file,index,&entry);
+                if (status) return status;
+                if (read_entry_ready(cache,entry)) {
+                    take_read_page(cache,entry,address,valid,entry_valid_bytes(entry));
+                    return KERNEL_PAGE_CACHE_STATUS_OK;
+                }
+            }
+        }
+        kernel_vfs_node_lock(node,&inode,0);
+    }
     struct kernel_page_cache_entry *entry;
     {
         CACHE_SCOPE(guard, cache);
@@ -1743,6 +1771,51 @@ struct cache_read_batch_request {
     struct kernel_page_cache_read_page *pages;
     size_t count;
 };
+
+static int read_cached_batch(struct cache_read_batch_request *request,int remote)
+{
+    struct kernel_page_cache *cache=request->cache;
+    struct kernel_vfs_node *node=kernel_vfs_file_node(request->file);
+    int pending=0,retry=0;
+    {
+        CACHE_SCOPE(guard,cache);
+        retry=!read_cache_open(cache,node);
+        uint64_t size=retry?0:kernel_vfs_node_size(node);
+        for (size_t i=0;i<request->count && !retry;i++) {
+            struct kernel_page_cache_read_page *page=&request->pages[i];
+            uint64_t offset=(request->first+i)<<BOAROS_PAGE_SHIFT;
+            if (offset>=size) { page->status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE; continue; }
+            struct kernel_page_cache_entry *entry;
+            enum kernel_page_cache_status status=lookup_entry(cache,request->file,request->first+i,&entry);
+            if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) {
+                pending=1;
+                if (!remote) break;
+                continue;
+            }
+            if (status) __builtin_trap();
+            if (!read_entry_ready(cache,entry)) {
+                if (cache->record->controlled &&
+                    (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) { retry=1; break; }
+                pending=1;
+                if (!remote) break;
+                continue;
+            }
+            size_t valid=size-offset<BOAROS_PAGE_SIZE?size-offset:BOAROS_PAGE_SIZE;
+            take_read_page(cache,entry,&page->physical_address,&page->valid_bytes,valid);
+            page->status=KERNEL_PAGE_CACHE_STATUS_OK;
+        }
+    }
+    if (retry) {
+        /* 跨resize资格不能保留本次暂取结果；先归还页，才允许慢路等待inode。
+         * 普通miss保留成功项，未完成项在取得inode后重新检查，避免重复pin。 */
+        for (size_t i=0;i<request->count;i++) {
+            struct kernel_page_cache_read_page *page=&request->pages[i];
+            if (!page->status && physical_page_release(cache->allocator,page->physical_address)) __builtin_trap();
+            page->status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+        }
+    }
+    return pending || retry;
+}
 static void read_batch_on_cpu0(void *argument)
 {
     struct cache_read_batch_request *request = argument;
@@ -1793,20 +1866,18 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
             count - 1 > (UINT64_MAX >> BOAROS_PAGE_SHIFT) - first)))
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     for (size_t i = 0; i < count; i++) pages[i].status = KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+    if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
     struct cache_read_batch_request request = {cache, file, first, pages, count};
-    if (cache->record->controlled && remote_cache_client()) {
-        size_t missing = 0;
-        for (size_t i = 0; i < count; i++) {
-            pages[i].status = kernel_page_cache_lookup(cache, file, first + i,
-                &pages[i].physical_address, &pages[i].valid_bytes);
-            missing += pages[i].status == KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
-        }
-        if (missing) {
+    int remote=cache->record->controlled && remote_cache_client();
+    /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
+     * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
+    if (read_cached_batch(&request,remote)) {
+        if (remote) {
             enum kernel_page_cache_status status = run_request(cache, read_batch_on_cpu0, &request, 0);
             if (status) for (size_t i = 0; i < count; i++)
                 if (pages[i].status == KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) pages[i].status = status;
-        }
-    } else read_batch_on_cpu0(&request);
+        } else read_batch_on_cpu0(&request);
+    }
     enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_OK;
     for (size_t i = 0; i < count; i++) if (pages[i].status) {
         pages[i].physical_address = 0;
