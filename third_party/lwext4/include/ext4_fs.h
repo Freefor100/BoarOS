@@ -248,7 +248,8 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 				 ext4_lblk_t iblock, ext4_fsblk_t *fblock,
 				 bool support_unwritten);
 
-/* A range ends at a hole/extent boundary (or an indirect pointer leaf).
+/* Allocations end at a hole/extent boundary or an indirect pointer leaf;
+ * a read-only lookup can cover an entire missing indirect subtree.
  * Unwritten ranges retain their physical address; readers return zeroes. */
 struct ext4_inode_block_range {
     ext4_fsblk_t block;

@@ -42,18 +42,18 @@ DEFAULT_CASES = ('ext4:append:cache:1:1M:4K,ext4:overwrite:fsync:1:1M:64K,'
 
 
 def profile(name):
-    match = re.fullmatch(r'ra(0|1|2|4|8)-wb(1|2|4|8)', name)
+    match = re.fullmatch(r'ra(0|1|2|4|8)-wb(1|2|4|8|16|32)', name)
     if not match:
         raise ValueError('invalid bounded profile ' + name)
     read, write = map(int, match.groups())
     return dict(name=name, readahead_pages=read, writeback_pages=write,
                 page_bytes=4096, readahead_pages_bytes=read * 4096,
-                writeback_pages_bytes=write * 4096, production_default=read == 0 and write == 8,
+                writeback_pages_bytes=write * 4096, production_default=read == 0 and write == 32,
                 scope='Compile-parameter arithmetic, not measured allocation or a guaranteed device batch size')
 
 
 def profiles(value):
-    names = [f'ra{r}-wb{w}' for r, w in itertools.product((0, 1, 2, 4, 8), (1, 2, 4, 8))] if value == 'all' else value.split(',')
+    names = [f'ra{r}-wb{w}' for r, w in itertools.product((0, 1, 2, 4, 8), (1, 2, 4, 8, 16, 32))] if value == 'all' else value.split(',')
     if len(names) != len(set(names)):
         raise ValueError('duplicate profile')
     return [profile(name) for name in names]
@@ -229,7 +229,10 @@ def extract(disk, work):
 
 
 def boot(work, kernel, image, case, name, repetition, args, program_sha):
-    work.mkdir(); disk = work / 'disk.img'; shutil.copyfile(image, disk)
+    work.mkdir(); disk = work / 'disk.img'
+    subprocess.run(['cp', '--reflink=never', '--sparse=never', str(image), str(disk)], check=True)
+    with disk.open('rb') as backing:
+        os.fsync(backing.fileno())
     command = [args.qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel), '-m', args.ram,
                '-smp', '1', '-nographic', '-no-reboot', '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
                '-drive', f'file={disk},if=none,format=raw,id=root,cache=writeback',
@@ -237,7 +240,8 @@ def boot(work, kernel, image, case, name, repetition, args, program_sha):
     if name == 'linux':
         command += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
     row = dict(case=case, variant=name, repetition=repetition, kernel_sha256=digest(kernel), program_sha256=program_sha,
-               fixture_sha256=digest(image), observation_enabled=args.observe, smoke=args.smoke, command=command)
+               fixture_sha256=digest(image), observation_enabled=args.observe, smoke=args.smoke,
+               backing_preparation='written-and-synced', command=command)
     try:
         harness.run_logged(command, work / 'console.log', args.timeout + 20)
         raw = (work / 'console.log').read_text(errors='replace')

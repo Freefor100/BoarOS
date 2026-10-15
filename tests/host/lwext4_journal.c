@@ -25,6 +25,64 @@ static int write_device(struct ext4_blockdev *b, const void *p, uint64_t n, uint
 static int flush_device(struct ext4_blockdev *b)
 { (void)b; return kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 
+static void group_revoke_reservation(struct ext4_blockdev *dev,
+    struct jbd_journal *journal, ext4_fsblk_t home, unsigned fault)
+{
+    unsigned capacity = to_be32(journal->jbd_fs->sb.maxlen) - journal->first;
+    unsigned revokes = capacity + 64;
+    CHECK(revokes < dev->lg_bcnt / 2);
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    dev->fs->jbd_journal = journal;
+    uint64_t writes = disk.writes;
+    struct jbd_trans *operation = jbd_journal_new_trans(journal);
+    CHECK(operation != NULL);
+    /* Revoke entries occupy packed control blocks. Their count may exceed
+     * journal capacity without requiring one log block for every entry. */
+    for (unsigned i = 0; i < revokes; i++)
+        CHECK(jbd_trans_revoke_block(operation, dev->lg_bcnt - 1 - i) == EOK);
+    jbd_journal_free_trans(journal, operation, true);
+    CHECK(journal->log_reserved == 0 && disk.writes == writes);
+    jbd_journal_group_fini(journal);
+    CHECK(journal->memory_used == 0);
+
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    /* Keep the first half running while a second private operation needs
+     * the next packed revoke block and reuses the same metadata version. */
+    for (unsigned half = 0; half < 2; half++) {
+        operation = jbd_journal_new_trans(journal);
+        CHECK(operation != NULL);
+        struct ext4_block block;
+        CHECK(ext4_block_get(dev, &block, home) == EOK);
+        CHECK(jbd_trans_get_write_access(operation, &block) == EOK);
+        memset(block.data, 'N', dev->lg_bsize);
+        CHECK(jbd_trans_set_block_dirty(operation, &block) == EOK);
+        CHECK(ext4_block_set(dev, &block) == EOK);
+        for (unsigned i = half * revokes / 2; i < (half + 1) * revokes / 2; i++)
+            CHECK(jbd_trans_revoke_block(operation, dev->lg_bcnt - 1 - i) == EOK);
+        CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
+    }
+    CHECK(disk.writes == writes);
+    CHECK(jbd_journal_freeze(journal) == EOK && jbd_journal_select(journal));
+    bool fail = fault == 1 || fault == 2;
+    if (fail) disk.fail_flush = disk.flushes + fault;
+    int result = jbd_journal_submit(journal);
+    CHECK(result == (fail ? EIO : EOK));
+    CHECK(jbd_journal_retire(journal, result) == result);
+    if (fail) {
+        CHECK(journal->failed_trans == journal->committing);
+        CHECK(journal->error == EIO);
+    } else if (fault == 3) {
+        CHECK(jbd_journal_select(journal));
+        CHECK(jbd_journal_checkpoint(journal) == EOK);
+        CHECK(jbd_journal_retire(journal, EOK) == EOK);
+        jbd_journal_group_fini(journal);
+        CHECK(journal->memory_used == 0);
+    } /* fault=0 crashes with the committed packed records still in the log. */
+    CHECK(fault_block_crash(&disk) == 0);
+    printf("group revoke reservation: block=%u entries=%u abort/merge/retire fault=%u\n",
+        dev->lg_bsize, revokes, fault);
+}
+
 /* Corrupt actual on-disk records independently of the writer/replay code. */
 static void mutate_log(struct ext4_blockdev *dev, struct jbd_fs *jfs,
                        const char *kind)
@@ -176,13 +234,15 @@ int main(int argc, char **argv)
         CHECK(!dev.fs->super_replay_required);
         if (!strcmp(argv[2], "recover-crash")) CHECK(fault_block_crash(&disk) == 0);
         CHECK(jbd_put_fs(&jfs) == EOK);
-        unsigned char data[1024];
+        unsigned char *data = malloc(dev.lg_bsize);
+        CHECK(data != NULL);
         CHECK(ext4_blocks_get_direct(&dev, data, home, 1) == EOK);
         CHECK(data[0] == (unsigned char)atoi(argv[3]));
         if (atoi(argv[3]) == 192) {
             CHECK(!memcmp(data, "\xc0\x3b\x39\x98", 4));
-            for (unsigned i = 4; i < sizeof(data); i++) CHECK(data[i] == 'N');
+            for (unsigned i = 4; i < dev.lg_bsize; i++) CHECK(data[i] == 'N');
         }
+        free(data);
         if (!strcmp(argv[2], "recover-metadata")) {
             CHECK(ext4_fs_get_inode_ref(dev.fs, file.inode, &inode) == EOK);
             CHECK((ext4_inode_get_mode(&dev.fs->sb, inode.inode) & 0777) == 0600);
@@ -212,6 +272,10 @@ int main(int argc, char **argv)
     }
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
+    if (!strcmp(argv[2], "group-reserve")) {
+        group_revoke_reservation(&dev, &journal, home, argc > 3 ? atoi(argv[3]) : 0);
+        return 0;
+    }
     if (!strcmp(argv[2], "abort-fresh")) {
         /* Aborting a first modification must restore the live cache as well
          * as leave disk unchanged. No prior committed log can supply it. */

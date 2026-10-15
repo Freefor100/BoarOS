@@ -18,7 +18,14 @@
 
 #ifdef TEST_RANGE_WORK_COUNTERS
 static uint32_t watched_bitmap_bytes, bitmap_crc_calls;
-static unsigned range_queries;
+static unsigned range_queries, watched_indirect_gets;
+static ext4_fsblk_t watched_indirect_leaf;
+int __real_ext4_trans_block_get(struct ext4_blockdev *, struct ext4_block *, uint64_t);
+int __wrap_ext4_trans_block_get(struct ext4_blockdev *dev, struct ext4_block *block, uint64_t address)
+{
+    if (watched_indirect_leaf && address == watched_indirect_leaf) watched_indirect_gets++;
+    return __real_ext4_trans_block_get(dev, block, address);
+}
 int __real_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,bool,struct ext4_inode_block_range *);
 int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t logical,uint32_t count,bool create,struct ext4_inode_block_range *range)
 {
@@ -1926,6 +1933,99 @@ static void legacy_range(struct ext4_blockdev *dev)
     CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/legacy-range")==EOK);
     puts("legacy ranges: direct/single/double-indirect leaves and holes");
 }
+/* A contiguous legacy allocation must visit its pointer leaf once, regardless
+ * of its length. Reintroducing a block-at-a-time setter repeats this work. */
+static void legacy_leaf_batch(struct ext4_blockdev *dev)
+{
+    uint32_t per_leaf=dev->lg_bsize/4;
+    ext4_lblk_t starts[]={12,12+per_leaf,12+per_leaf+(uint64_t)per_leaf*per_leaf};
+    for(unsigned depth=1;depth<=3;depth++) {
+        ext4_file file;CHECK(ext4_fopen(&file,"/legacy-leaf-batch","w+")==EOK);
+        CHECK(ext4_transaction_begin("/")==EOK);
+        struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+        ext4_inode_clear_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS);
+        memset(ref.inode->blocks,0,sizeof(ref.inode->blocks));ref.dirty=true;
+        struct ext4_inode_block_range range;
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,starts[depth-1],1,true,&range)==EOK && range.count==1);
+        ext4_fsblk_t first=range.block;
+        ext4_fsblk_t leaf=ext4_inode_get_indirect_block(ref.inode,depth-1);
+        for(unsigned level=depth;level>1;level--) {
+            struct ext4_block parent;
+            CHECK(ext4_trans_block_get(dev,&parent,leaf)==EOK);
+            leaf=to_le32(((uint32_t *)parent.data)[0]);
+            CHECK(ext4_block_set(dev,&parent)==EOK);
+        }
+#ifdef TEST_RANGE_WORK_COUNTERS
+        watched_indirect_leaf=leaf;watched_indirect_gets=0;
+#endif
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,starts[depth-1]+1,32,true,&range)==EOK &&
+            range.allocated && range.block && range.count==32);
+        ext4_fsblk_t second=range.block;
+#ifdef TEST_RANGE_WORK_COUNTERS
+        watched_indirect_leaf=0;
+        printf("legacy depth=%u 32-pointer allocation: leaf gets=%u\n",depth,watched_indirect_gets);
+        CHECK(watched_indirect_gets==1);
+#endif
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,starts[depth-1],1,false,&range)==EOK &&
+            range.block==first && range.count==1);
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,starts[depth-1]+1,64,false,&range)==EOK &&
+            range.block==second && range.count==32);
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,starts[depth-1]+33,1,false,&range)==EOK && !range.block);
+        CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+        CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+        CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/legacy-leaf-batch")==EOK);
+    }
+}
+static void legacy_chain_abort(struct ext4_blockdev *dev)
+{
+    uint32_t per_leaf=dev->lg_bsize/4;
+    ext4_lblk_t starts[]={12,12+per_leaf,12+per_leaf+(uint64_t)per_leaf*per_leaf};
+    for(unsigned depth=1;depth<=3;depth++) for(unsigned existing=0;existing<2;existing++) {
+        if(existing && depth==1)continue;
+        ext4_file file;CHECK(ext4_fopen(&file,"/legacy-chain-abort","w+")==EOK);
+        CHECK(ext4_transaction_begin("/")==EOK);
+        struct ext4_inode_ref ref;CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+        ext4_inode_clear_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS);
+        memset(ref.inode->blocks,0,sizeof(ref.inode->blocks));ref.dirty=true;
+        struct ext4_inode_block_range range;
+        if(existing) {
+            CHECK(ext4_fs_get_inode_dblk_range(&ref,starts[depth-1],1,true,&range)==EOK && range.count==1);
+            ext4_inode_set_size(ref.inode,(uint64_t)(starts[depth-1]+1)*dev->lg_bsize);
+        }
+        CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+        uint64_t free_before=ext4_sb_get_free_blocks_cnt(&dev->fs->sb);
+        uint32_t inode_before[15];uint64_t blocks_before;
+        CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+        memcpy(inode_before,ref.inode->blocks,sizeof(inode_before));
+        blocks_before=ext4_inode_get_blocks_count(&dev->fs->sb,ref.inode);
+        CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+        ext4_lblk_t target=starts[depth-1]+(existing?per_leaf:0)+per_leaf-2;
+        unsigned attempts=0,failures=0;
+        for(unsigned point=0;point<=attempts;point++) {
+            CHECK(ext4_transaction_begin("/")==EOK);
+            CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+            unsigned before=allocations;
+            if(point)fail_allocation=allocations+point;
+            int r=ext4_fs_get_inode_dblk_range(&ref,target,8,true,&range);
+            if(!point)attempts=allocations-before;
+            fail_allocation=0;
+            CHECK(r==EOK || r==ENOMEM);
+            if(r==EOK)CHECK(range.allocated && range.block && range.count==2);
+            else {failures++;CHECK(!range.block && !range.count);}
+            CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+            CHECK(ext4_transaction_abort("/",r?r:ECANCELED)==(r?r:ECANCELED));
+            CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before);
+            CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+            CHECK(!memcmp(inode_before,ref.inode->blocks,sizeof(inode_before)));
+            CHECK(ext4_inode_get_blocks_count(&dev->fs->sb,ref.inode)==blocks_before);
+            CHECK(ext4_fs_get_inode_dblk_range(&ref,target,8,false,&range)==EOK && !range.block);
+            CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+        }
+        CHECK(failures);
+        CHECK(ext4_fclose(&file)==EOK && ext4_fremove("/legacy-chain-abort")==EOK);
+        printf("legacy depth=%u existing=%u: %u OOM points restore chain, bitmap and inode counts\n",depth,existing,failures);
+    }
+}
 static void range_abort(struct ext4_blockdev *dev)
 {
     ext4_file f;CHECK(ext4_fopen(&f,"/range-abort","w+")==EOK);
@@ -2063,7 +2163,7 @@ int main(int argc,char **argv)
     }
     if(!strcmp(argv[2],"extent-read-oom") || !strcmp(argv[2],"extent-read-error"))
         extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
-    else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
+    else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);legacy_leaf_batch(&dev);legacy_chain_abort(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);

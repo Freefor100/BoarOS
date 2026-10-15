@@ -124,7 +124,7 @@ struct jbd_trans {
 	int error;
 	uint64_t sequence;
 	uint64_t first_dirty_ns;
-	unsigned reserved_logs, reserved_log_images;
+	unsigned reserved_logs, reserved_log_images, reserved_payloads;
 	unsigned ordered_count, revoke_count;
 	bool frozen;
 	struct jbd_image *checkpoint_image;

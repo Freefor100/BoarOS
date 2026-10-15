@@ -122,6 +122,60 @@ static void run_backend_inode_identity_regression(struct kernel_heap *heap)
         fail_vfs(123U, 0, instance.external_files);
 }
 
+static void run_inode_index_regression(struct kernel_heap *heap)
+{
+    enum { COUNT = 257 };
+    static struct kernel_vfs_file files[COUNT];
+    static struct kernel_vfs_backend callbacks;
+    struct kernel_vfs_instance instance = {.heap = heap, .ops = &callbacks};
+    struct kernel_vfs_mount mount = {.private_data = &instance, .state = VFS_MOUNT_STATE_LIVE};
+    volatile struct kernel_vfs_backend *active = &callbacks;
+    active->close_node = synthetic_node_close;
+    for (unsigned i = 0; i < COUNT; i++) {
+        struct kernel_vfs_node *node = 0;
+        if (kernel_heap_allocate_zeroed(heap, 1, sizeof(*node), (void **)&node))
+            fail_vfs(135U, 0, -KERNEL_ENOMEM);
+        node->inode = UINT64_C(0x100000001) * i + 1;
+        node->mode = KERNEL_VFS_S_IFREG;
+        if (kernel_vfs_publish_node(&mount, node, &files[i], 0)) fail_vfs(136U, 0, -1);
+    }
+    for (unsigned i = 0; i < COUNT; i++) {
+        unsigned j = (i * 73U) % COUNT;
+        struct kernel_vfs_node *node = files[j].private_data;
+        if (kernel_vfs_node_find(&instance, node->inode) != node) fail_vfs(137U, j, -1);
+    }
+    /* A retired owner may outlive reuse of its on-disk inode number. Closing
+     * that old owner must leave the replacement's identity in the index. */
+    struct kernel_vfs_node *old = files[128].private_data, *replacement = 0;
+    old->retired = 1;
+    if (kernel_vfs_node_find(&instance, old->inode)) fail_vfs(138U, 0, -1);
+    if (kernel_heap_allocate_zeroed(heap, 1, sizeof(*replacement), (void **)&replacement))
+        fail_vfs(139U, 0, -KERNEL_ENOMEM);
+    replacement->inode = old->inode;
+    replacement->mode = old->mode;
+    struct kernel_vfs_file fresh = {0};
+    if (kernel_vfs_publish_node(&mount, replacement, &fresh, 0) ||
+        kernel_vfs_close(&files[128]) ||
+        kernel_vfs_node_find(&instance, replacement->inode) != replacement)
+        fail_vfs(140U, 0, -1);
+    files[128] = fresh;
+    for (unsigned i = 0; i < COUNT; i++) {
+        unsigned j = (i * 73U) % COUNT;
+        uint64_t inode = kernel_vfs_file_inode(&files[j]);
+        if (kernel_vfs_close(&files[j]) || kernel_vfs_node_find(&instance, inode))
+            fail_vfs(141U, 0, -1);
+        /* Removing one identity must preserve every other live lookup,
+         * including subtrees moved while replacing an internal entry. */
+        for (unsigned live = 0; live < COUNT; live++) {
+            struct kernel_vfs_node *node = files[live].private_data;
+            if (node && kernel_vfs_node_find(&instance, node->inode) != node)
+                fail_vfs(143U, live, -1);
+        }
+    }
+    if (instance.nodes || instance.node_index || instance.node_count || instance.external_files)
+        fail_vfs(142U, 0, -1);
+}
+
 static int synthetic_root(struct kernel_vfs_instance *instance,
                           uint64_t *inode, uint32_t *mode)
 {
@@ -1007,6 +1061,7 @@ static void run_vfs_test(const void *dtb)
     }
 #ifndef VFS_EXPECT_RECOVERY
     run_backend_inode_identity_regression(&heap);
+    run_inode_index_regression(&heap);
     run_live_inode_reuse(&heap);
     run_cache_only_reopen(&heap);
 #endif

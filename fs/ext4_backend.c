@@ -140,6 +140,18 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
 static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
                          const char *path,
                          uint32_t mode);
+/* The namespace lock holds names, not cache-only registry ancestors. Pin the
+ * indexed target before reclaim can rotate the tree or retire its last owner. */
+static struct kernel_vfs_node *pin_linked_node(struct lwext4_mount_adapter *adapter, uint32_t inode)
+{
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_vfs_node *node = kernel_vfs_node_find(&adapter->instance, inode);
+    if (node && node->unlinked) node = 0;
+    if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
+    arch_interrupt_restore(irq);
+    return node;
+}
+
 static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
                           const char *path);
 static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
@@ -243,6 +255,8 @@ static void time_unlink_dirty(struct lwext4_node *node)
     else adapter->dirty_times_tail = node->dirty_previous;
     node->dirty_previous = 0;
     node->dirty_next = 0;
+    if (!adapter->dirty_times_count) __builtin_trap();
+    adapter->dirty_times_count--;
     if (!adapter->dirty_times) adapter->times_deadline = 0;
 }
 
@@ -253,6 +267,7 @@ static void time_append_dirty(struct lwext4_node *node)
     node->dirty_previous = adapter->dirty_times_tail;
     *adapter->dirty_times_tail = node;
     adapter->dirty_times_tail = &node->dirty_next;
+    adapter->dirty_times_count++;
 }
 
 static void time_drop_dirty(struct lwext4_node *node)
@@ -295,9 +310,8 @@ static void time_stage(void *context, uint32_t inode, unsigned field,
 {
     struct lwext4_mount_adapter *adapter = context;
     uintptr_t irq = arch_interrupt_save();
-    for (struct kernel_vfs_node *base = adapter->instance.nodes; base; base = base->next) {
-        if (base->inode != inode || base->retired ||
-            (base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) continue;
+    struct kernel_vfs_node *base = kernel_vfs_node_find(&adapter->instance, inode);
+    if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         struct lwext4_node *node = (struct lwext4_node *)base;
         if (!node->staged_fields) {
             if (kernel_vfs_node_acquire(base)) __builtin_trap();
@@ -307,7 +321,6 @@ static void time_stage(void *context, uint32_t inode, unsigned field,
         node->staged[field] = value;
         node->staged_version[field] = node->time_version[field];
         node->staged_fields |= 1U << field;
-        break;
     }
     arch_interrupt_restore(irq);
 }
@@ -373,8 +386,7 @@ static int writeback_times(struct kernel_vfs_node *node, bool wait)
 static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait)
 {
     uintptr_t irq = arch_interrupt_save();
-    size_t count = 0;
-    for (struct lwext4_node *node = adapter->dirty_times; node; node = node->dirty_next) count++;
+    size_t count = adapter->dirty_times_count;
     arch_interrupt_restore(irq);
     int result = EOK;
     while (count--) {
@@ -1634,11 +1646,7 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
 
-    for (node = adapter->instance.nodes; node != 0; node = node->next) {
-        if (node->inode == inode && !node->unlinked) {
-            break;
-        }
-    }
+    node = pin_linked_node(adapter, inode);
 
     if (node != 0) {
         if (is_orphan) {
@@ -1646,6 +1654,7 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
             ext4_backend_release_unlinked(node);
         }
         release_orphan(adapter, orphan);
+        if (kernel_vfs_node_release(&node)) __builtin_trap();
         return 0;
     } else if (is_orphan) {
         orphan->inode = inode;
@@ -1695,12 +1704,12 @@ static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
         release_orphan(adapter, orphan);
         return lwext4_error(result);
     }
-    for (node = adapter->instance.nodes; node != 0; node = node->next)
-        if (node->inode == inode && !node->unlinked) break;
+    node = pin_linked_node(adapter, inode);
     if (node != 0) {
         node->unlinked = 1U;
         ext4_backend_release_unlinked(node);
         release_orphan(adapter, orphan);
+        if (kernel_vfs_node_release(&node)) __builtin_trap();
         return 0;
     }
     orphan->inode = inode;

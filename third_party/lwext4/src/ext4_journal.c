@@ -891,7 +891,7 @@ static int jbd_reserve_log_images(struct jbd_trans *trans, unsigned images)
 
 static void jbd_trim_reserved_logs(struct jbd_trans *trans, unsigned credits, unsigned images)
 {
-	if (trans->reserved_logs < credits || trans->reserved_log_images < images) __builtin_trap();
+	if (credits < images || trans->reserved_logs < credits || trans->reserved_log_images < images) __builtin_trap();
 	while (trans->reserved_logs > credits)
 		jbd_log_free(jbd_log_unreserve(trans, trans->reserved_log_images > images));
 	while (trans->reserved_log_images > images) {
@@ -902,12 +902,28 @@ static void jbd_trim_reserved_logs(struct jbd_trans *trans, unsigned credits, un
 		TAILQ_INSERT_TAIL(&trans->log_reserve, log, node);
 		trans->reserved_log_images--;
 	}
+	trans->reserved_payloads = credits - images;
 }
 
-static int jbd_reserve_logs(struct jbd_trans *trans, unsigned count, unsigned revokes)
+static int jbd_reserve_logs(struct jbd_trans *trans, unsigned payloads, unsigned revokes)
 {
 	if (!trans->journal->grouped) return EOK;
 	struct jbd_journal *journal = trans->journal;
+	struct jbd_trans *running = journal->running;
+	/* 私有操作只补合并后的 control 增量；已有 running control 继续由
+	 * running 持有，失败回滚只归还私有预留，不会动到已接受的日志。 */
+	unsigned images = jbd_log_images_needed(journal,
+		payloads + (running ? running->data_cnt : 0),
+		revokes + (running ? running->revoke_count : 0), true);
+	if (running) {
+		if (images < running->reserved_log_images) __builtin_trap();
+		images -= running->reserved_log_images;
+	}
+	/* An access or revoke removed later in the operation can leave a spare
+	 * image. Keep it until accept, without mistaking it for a payload credit. */
+	unsigned retained_images = images > trans->reserved_log_images ? images : trans->reserved_log_images;
+	unsigned needed = payloads + retained_images;
+	unsigned count = needed > trans->reserved_logs ? needed - trans->reserved_logs : 0;
 	unsigned available = jbd_log_free_blocks(journal);
 	if (journal->log_reserved > available || count > available - journal->log_reserved)
 		return ENOSPC;
@@ -917,12 +933,9 @@ static int jbd_reserve_logs(struct jbd_trans *trans, unsigned count, unsigned re
 		jbd_log_reserve_insert(trans, log);
 		journal->log_reserved++;
 	}
-	/* 撤销的 revoke 可能仍保留磁盘 credit；私有操作按上界预留，
-	 * accept 再按最终的 payload/revoke 数精确归还多余 RAM。 */
-	bool commit = !journal->running;
-	unsigned payloads = (trans->reserved_logs - commit) / 2;
-	return jbd_reserve_log_images(trans,
-		jbd_log_images_needed(journal, payloads, revokes, commit));
+	int r = jbd_reserve_log_images(trans, images);
+	if (r == EOK) trans->reserved_payloads = payloads;
+	return r;
 }
 
 static int jbd_prepare_block_get(struct jbd_trans *trans,
@@ -982,6 +995,7 @@ static void jbd_release_prepared(struct jbd_trans *trans)
 	}
 	trans->reserved_logs = 0;
 	trans->reserved_log_images = 0;
+	trans->reserved_payloads = 0;
 }
 
 /* Nodes belong to the already charged stable version/control owners. The
@@ -2423,7 +2437,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 	if (new_version) {
 		jb->after = jbd_version(trans->journal, block->buf);
 
-		r = jb->after ? jbd_reserve_logs(trans, 2, trans->revoke_count) : ENOMEM;
+		r = jb->after ? jbd_reserve_logs(trans, trans->reserved_payloads + 1, trans->revoke_count) : ENOMEM;
 		if (r != EOK) {
 			/* The access already owns its beforeimage: the caller's abort
 			 * can now undo this incomplete reservation without I/O. */
@@ -2482,7 +2496,7 @@ int jbd_trans_revoke_block(struct jbd_trans *trans,
 		return ENOMEM;
 
 	rec->lba = lba;
-	int r = jbd_reserve_logs(trans, 1, trans->revoke_count + 1);
+	int r = jbd_reserve_logs(trans, trans->reserved_payloads, trans->revoke_count + 1);
 	if (r != EOK) { jbd_free(rec); return r; }
 	RB_INSERT(jbd_revoke_tree, &trans->revoke_root, rec);
 	trans->revoke_count++;
@@ -3089,7 +3103,7 @@ jbd_journal_new_trans(struct jbd_journal *journal)
 	TAILQ_INIT(&trans->log_reserve);
 	if (journal->grouped && !journal->running) {
 		trans->checkpoint_image = jbd_image_alloc(journal);
-		if (!trans->checkpoint_image || jbd_reserve_logs(trans, 1, 0) != EOK) {
+		if (!trans->checkpoint_image || jbd_reserve_logs(trans, 0, 0) != EOK) {
 			jbd_journal_free_trans(journal, trans, true);
 			return NULL;
 		}
@@ -3123,8 +3137,8 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 	}
 	struct jbd_trans *running = journal->running;
 	if (!running && journal->accepted_sequence == UINT64_MAX) return EOVERFLOW;
-	/* One conservative descriptor per metadata block covers every checksum
-	 * format. No accepted group can exhaust the circular log at sealing. */
+	/* Private reservations cover the actual serialized payload/control count.
+	 * No accepted group can exhaust the circular log at sealing. */
 	unsigned credits = operation->reserved_logs + (running ? running->reserved_logs : 0);
 	uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
 	if (credits >= maxlen - journal->first) return ENOSPC;
@@ -3194,8 +3208,8 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 		}
 		jbd_image_free(operation->checkpoint_image); jbd_free(operation);
 	}
-	jbd_trim_reserved_logs(running, 2 * running->data_cnt + running->revoke_count + 1,
-		jbd_log_images_needed(journal, running->data_cnt, running->revoke_count, true));
+	unsigned images = jbd_log_images_needed(journal, running->data_cnt, running->revoke_count, true);
+	jbd_trim_reserved_logs(running, running->data_cnt + images, images);
 	COST_ADD(JOURNAL_ACCEPTED, 1);
 	return EOK;
 }
@@ -3429,8 +3443,13 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, si
 		    sources[i]->bytes + control > SIZE_MAX - minimum) return false;
 		minimum += sources[i]->bytes + control;
 	}
+	struct jbd_trans *running = journal->running;
+	unsigned logs = 1 + jbd_log_images_needed(journal,
+		(running ? running->data_cnt : 0) + 1,
+		running ? running->revoke_count : 0, true);
+	if (running) logs -= running->reserved_log_images;
 	return jbd_budget_room(journal, minimum) &&
-		jbd_log_free_blocks(journal) >= journal->log_reserved + (journal->running ? 2 : 3);
+		jbd_log_free_blocks(journal) >= journal->log_reserved + logs;
 }
 
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,

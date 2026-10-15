@@ -290,8 +290,12 @@ static void unlink_inode(struct tmp_mount *m, struct tmp_inode *i)
     if ((i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->links = 0;
     else { if (i->links > 1) { if (!m->inode_count) __builtin_trap(); m->inode_count--; } i->links--; }
     i->ctime = now();
-    if (!i->links) for (struct kernel_vfs_node *n = m->instance.nodes; n; n = n->next)
-        if (n->inode == i->number) { n->unlinked = 1; }
+    if (!i->links) {
+        uintptr_t irq = arch_interrupt_save();
+        struct kernel_vfs_node *node = kernel_vfs_node_find(&m->instance, i->number);
+        if (node) node->unlinked = 1;
+        arch_interrupt_restore(irq);
+    }
     collect_inode(m, i);
 }
 static int remove_path(struct kernel_vfs_mount *mount, const char *path, int directory)

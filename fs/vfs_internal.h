@@ -23,6 +23,7 @@ struct kernel_page_cache_dirty {
 };
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
+struct kernel_vfs_instance;
 struct kernel_vfs_node;
 #if BOAROS_COST_DIAGNOSTICS
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
@@ -40,6 +41,9 @@ uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file);
 struct kernel_record_lock_state *kernel_vfs_node_record_locks(
     struct kernel_vfs_node *node);
 
+/* Borrow with IRQs disabled; pin before restoring IRQs unless a live owner
+ * already covers the target. Namespace locking alone does not exclude reclaim. */
+struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t inode);
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
