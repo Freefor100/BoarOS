@@ -36,7 +36,7 @@ block包装层记录core owner是否已消费，根清理也纳入尚未构造co
 
 ## descriptor 与业务 owner
 
-当前split queue最多32项；descriptor、available/used idx及used元素按协议自然
+当前split queue最多64项，以64位mask记录descriptor所有权；descriptor、available/used idx及used元素按协议自然
 对齐，idx以单次半字读写。调用方用单CPU IRQ排他串行化发布、收割和reset；这不
 提供SMP锁。队列内存由设备核心分配，框架只借用，不分配或释放物理页。
 
@@ -58,7 +58,7 @@ ring索引；另一个设备的reset确认不能代用。业务buffer继续属�
 ## block 接入与边界
 
 block保留八个请求槽、预留/发布/完成/调用方消费状态、batch/RMW/flush、I/O
-context、等待、30秒期限和统计。legacy/modern ring布局和请求buffer布局保持，
+context、等待、30秒期限和统计。legacy/modern ring遵循同一协议布局，modern请求区避开64项ring，
 配置capacity经transport读取。请求槽不决定 descriptor head，连续磁盘 span 通过多个数据描述符组成 SG；同一轮多个请求只 notify 一次。读完成最多所有数据描述符总长度+status，写/flush完成只允许
 status长度；非法长度在reset前诊断为`used-length`，零长度仍为`used-element`。
 块路径仍限定固定QEMU同步reset：若不能确认，不能返回借用的调用方DMA，保留

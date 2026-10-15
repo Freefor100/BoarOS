@@ -58,7 +58,7 @@ struct ext4_data_source {
 	size_t bytes;
 };
 
-#define EXT4_BLOCK_BATCH_MAX 8U
+#define EXT4_BLOCK_BATCH_MAX 32U
 #define EXT4_CACHED_READ_BATCH 1
 struct ext4_block_read_span {
 	void *data;

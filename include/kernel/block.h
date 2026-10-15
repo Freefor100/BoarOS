@@ -38,7 +38,7 @@ typedef enum kernel_block_status (*kernel_block_write_fn)(
     const void *buffer,
     size_t size);
 
-#define KERNEL_BLOCK_BATCH_MAX 8U
+#define KERNEL_BLOCK_BATCH_MAX 32U
 
 struct kernel_block_span {
     uint64_t offset;
@@ -107,7 +107,7 @@ enum kernel_block_status kernel_block_write_at(
     const void *buffer,
     size_t size);
 
-/* Synchronous, non-transactional batch of at most eight disjoint byte ranges.
+/* Synchronous, non-transactional batch of at most 32 disjoint byte ranges.
  * Preflight every span before I/O. Empty spans permit a null buffer but their
  * offset must be in capacity; count zero needs no spans. A missing callback
  * falls back in input order and stops on the first failed write. All buffers

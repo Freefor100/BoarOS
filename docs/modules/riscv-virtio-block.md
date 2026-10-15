@@ -29,11 +29,11 @@ RV `arch/riscv/virtio_mmio_block.c` 负责PLIC绑定，MMIO身份/版本和寄�
 
 ## 请求和 DMA
 
-通用 `kernel_block_device` 暴露容量、逻辑块大小和精确字节范围的同步读写接口（`kernel_block_read_at`/`kernel_block_write_at`），统一检查空参数、越界和整数溢出。两种 transport 共用最多 32 个描述符的 split queue，最多八个在途请求槽；按设备 QueueNumMax 向下取可用容量，至少一个槽。请求槽只持有 header/status/bounce，head 与数据描述符从队列空闲项选择，不再与槽号固定对应。普通请求使用 header、一个或多个数据描述符、status，FLUSH 只用两个描述符。modern 分配连续两个架构页（RV为8KiB，LA为32KiB）；当前RV legacy分配四个4KiB页（16KiB），used ring按协议4KiB对齐。每槽独立持有 header/status、512 字节 bounce、任务 owner、完成状态与等待队列；同步调用拥有槽位直到完成确认，不能在 DMA 期间复用。
+通用 `kernel_block_device` 暴露容量、逻辑块大小和精确字节范围的同步读写接口（`kernel_block_read_at`/`kernel_block_write_at`），统一检查空参数、越界和整数溢出。两种 transport 共用最多 64 个描述符的 split queue，最多八个在途请求槽；按设备 QueueNumMax 向下取可用容量，至少一个槽。请求槽只持有 header/status/bounce，head 与数据描述符从队列空闲项选择，不再与槽号固定对应。普通请求使用 header、一个或多个数据描述符、status；modern 的请求区从 2048 字节开始，避开扩大后的 descriptor/available/used 区域，编译断言检查它们不重叠。FLUSH 只用两个描述符。modern 分配连续两个架构页（RV为8KiB，LA为32KiB）；当前RV legacy分配四个4KiB页（16KiB），used ring按协议4KiB对齐。每槽独立持有 header/status、512 字节 bounce、任务 owner、完成状态与等待队列；同步调用拥有槽位直到完成确认，不能在 DMA 期间复用。
 
-`kernel_block_write_batch(device, spans, count)` 接受最多八个 `kernel_block_span { offset, buffer, size }`。设备与逻辑块大小必须有效，至少具有单写或批量写回调；只读设备返回 UNSUPPORTED。通用层在任何写入前检查所有 span 的容量、指针范围和非空字节区间重叠；非空 span 之间重叠返回 INVALID。有效可写设备上的 `count == 0` 可以传空 spans，成功且不调用驱动；空 span 可以传空 buffer，但 offset 仍须不超过容量，全部为空也不调用驱动。可选 `device.write_batch` 一次接收原 span 数组，可能含空项；没有回调时跳过空项、按输入顺序调用单写，遇到首个错误即停止。它保留实际失败状态，不承诺整批原子性或自动 flush；已完成的写不会回滚，调用方须保持所有非空 buffer 有效直到函数返回。
+`kernel_block_write_batch(device, spans, count)` 接受最多 32 个 `kernel_block_span { offset, buffer, size }`。设备与逻辑块大小必须有效，至少具有单写或批量写回调；只读设备返回 UNSUPPORTED。通用层在任何写入前检查所有 span 的容量、指针范围和非空字节区间重叠；非空 span 之间重叠返回 INVALID。有效可写设备上的 `count == 0` 可以传空 spans，成功且不调用驱动；空 span 可以传空 buffer，但 offset 仍须不超过容量，全部为空也不调用驱动。可选 `device.write_batch` 一次接收原 span 数组，可能含空项；没有回调时跳过空项、按输入顺序调用单写，遇到首个错误即停止。它保留实际失败状态，不承诺整批原子性或自动 flush；已完成的写不会回滚，调用方须保持所有非空 buffer 有效直到函数返回。
 
-`kernel_block_read_batch(device, spans, count)` 同样最多八项，在发布前检查全部参数。
+`kernel_block_read_batch(device, spans, count)` 同样最多 32 项，在发布前检查全部参数。
 读 span 提供可写 buffer、已完成字节前缀和独立状态；磁盘范围可以重叠，但目标内存
 必须彼此及与描述符数组分离。预检失败不发布任何请求，未执行项保留 NOT_SUBMITTED。
 没有批量回调时按顺序执行全部标量读，保存每项结果；返回输入顺序中首个错误。
@@ -41,7 +41,7 @@ VirtIO 批量读支持 direct DMA 与逐扇区 bounce；一个 span 出错不会
 失败 span 只承诺其 completed 前缀。调用返回前必须排空所有已发布 DMA，或确认 reset。
 读取消同样不能提前归还目标内存；成功完成的部分不会因别的请求超时而改写为失败。
 
-VirtIO 将发布、通知、等待和收割分开。同一 batch 将磁盘连续、扇区对齐且能直接 DMA 的多个 span 组成一个 SG 请求，各 span 保留独立的数据描述符，无需搬到连续内存；受空闲描述符和 32 位总字节数限制时继续拆分。磁盘不连续的 span 在同一轮发布多个请求，然后只通知队列一次。请求可以乱序完成，并在其他调用释放槽或描述符后继续补发；不要求先凑齐整批资源。一个 SG 请求的成员共用设备完成状态，读失败时各成员保留此前已确认的 completed 前缀。每个请求保留独立的 I/O context、期限、状态、DMA buffer 和成本身份。batch 只占一个逻辑调用 owner，`active` 统计逻辑调用数，共用队列的 `inflight` 是已经发布的请求数的唯一计数；释放某个槽不会提前释放整批 owner。不同字节区间仍可能落在同一物理扇区，因此本批内涉及同扇区的 span 按输入顺序串行推进读改写，其他 span 可并发；不会因两个独立 bounce 快照覆盖相邻字节。
+VirtIO 将发布、通知、等待和收割分开。同一 batch 将磁盘连续、扇区对齐且能直接 DMA 的多个 span 组成一个 SG 请求，各 span 保留独立的数据描述符，无需搬到连续内存；32 个独立 4 KiB 页可组成一个 128 KiB 请求，其完整链为 header、32 个数据描述符、status，共 34 项。设备 QueueNumMax 较小时向下选择队列容量并拆成多条请求；协商 SIZE_MAX/SEG_MAX 时读取对应上限，将每个数据描述符按整扇区截断，并限制每条链的数据段数。一个 span 可由多段描述符承载，其 completed 只在所属请求完成后推进。仍受空闲描述符和 32 位总字节数限制；请求槽维持八个，队列扩大不增加请求槽或 bounce。磁盘不连续的 span 在同一轮发布多个请求，然后只通知队列一次。请求可以乱序完成，并在其他调用释放槽或描述符后继续补发；不要求先凑齐整批资源。一个 SG 请求的成员共用设备完成状态，读失败时各成员保留此前已确认的 completed 前缀。每个请求保留独立的 I/O context、期限、状态、DMA buffer 和成本身份。batch 只占一个逻辑调用 owner，`active` 统计逻辑调用数，共用队列的 `inflight` 是已经发布的请求数的唯一计数；释放某个槽不会提前释放整批 owner。不同字节区间仍可能落在同一物理扇区，因此本批内涉及同扇区的 span 按输入顺序串行推进读改写，其他 span 可并发；不会因两个独立 bounce 快照覆盖相邻字节。
 
 `kernel_block_flush()` 表示设备持久化边界。块设备显式声明 UNKNOWN、WRITETHROUGH 或 WRITEBACK；未知能力且没有 flush 回调返回 UNSUPPORTED，只有声明 write-through 的设备可以省略 flush。VirtIO 协商 `VIRTIO_BLK_F_FLUSH`（bit 9），发送独立的 type 4 请求，只有 header/status 两个描述符，不带数据。未协商 CONFIG_WCE，因此 FLUSH 存在表示 writeback，缺失表示 write-through；驱动不修改缓存模式。该规则依据固定 Linux `references/linux/drivers/block/virtio_blk.c` 的 `virtblk_get_cache_mode()`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）。设备错误和超时保持所属状态，flush 请求单独计数。
 
@@ -80,7 +80,7 @@ python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv
 
 测试使用真实 QEMU raw disk，分别以默认 legacy 和显式 modern 配置覆盖 feature/status negotiation、批量 direct DMA、非对齐 bounce、容量边界、超时/错误统计和队列页回收。默认无块设备的生产内核仍可进入 timer idle；挂入两种 transport 的根盘时由根启动测试继续消费本模块。
 
-块测试将两个 transport 分别与 writeback/writethrough 组合，检查协商结果、flush 完成与独立统计，并覆盖单批八个 direct DMA、非对齐相邻字节/跨扇区的 RMW 回读及只读拒绝。host 测试检查未知能力拒绝和错误传播，以及 batch 的整批预检、零项、重叠、八项边界、顺序回退和可选回调；`tests/host/block_registry.c` 检查稳定设备号查找、重复登记拒绝、跨设备独立 claim、同设备重复 claim 拒绝及 claim 释放后注销；`tests/host/block_fault.c` 提供以文件为稳定镜像、以内存为易失缓存的 512 字节原子写模型，可选择持久化任意事件、丢弃未同步写、注入 write/flush 失败。模型自测不是文件系统恢复验收。
+块测试将两个 transport 分别与 writeback/writethrough 组合，检查协商结果、flush 完成与独立统计，并覆盖单批八个 direct DMA、32 个物理不连续 4 KiB 页组成的 128 KiB SG 读写（每方向恰好一条请求、页间 canary 与资源归还）、非对齐相邻字节/跨扇区的 RMW 回读及只读拒绝。host 测试检查未知能力拒绝和错误传播，以及 batch 的整批预检、零项、重叠、32 项边界、顺序回退和可选回调；`tests/host/block_registry.c` 检查稳定设备号查找、重复登记拒绝、跨设备独立 claim、同设备重复 claim 拒绝及 claim 释放后注销；`tests/host/block_fault.c` 提供以文件为稳定镜像、以内存为易失缓存的 512 字节原子写模型，可选择持久化任意事件、丢弃未同步写、注入 write/flush 失败。模型自测不是文件系统恢复验收。
 
 `virtio_block_diagnostics.py` 仅在临时副本中将 RISC-V fence/time 指令替换为宿主 fence/受控时钟，编译实际驱动其余代码。legacy/modern 的 literal split-ring 反例检查上述四种错误分类、reset 前字段、非法指针值不被追踪、真实返回状态、一次发布及最终队列回收；正常完成与普通设备错误检查无诊断输出。它不验证真实 DMA 顺序、中断时序或 QEMU 完成行为。
 
@@ -113,7 +113,7 @@ QEMU，避免直接 kill 截断健康盘的响应。诱导断线后的原始日�
 批量读的旧驱动顺序回退在生产函数宿主模型中只能发布一个请求，新增“暂扣至八项”
 测试超时；新驱动同时发布八项。两种 transport 的反序完成、单项错误、错误时另项
 仍在途、超时 reset、非对齐、多片段和 505 字节成功前缀由同一实际驱动模型验证，
-这些是受控设备边界证据。新增 SG 模型检查 4/8/32 项队列、八段内容及边界、空闲描述符有洞时仍保留其他链、一次通知多个请求，以及 scalar/batch 的 DMA 先于 IRQ 零 park；设备在通知时发布 used，不靠驱动时钟推进完成。真实 `test-io-sleep-riscv` 四组合额外要求
+这些是受控设备边界证据。新增 SG 模型检查 4/8/32/64 项队列、八段及 32 段内容与边界；32 个 4 KiB 页之间保留 4 KiB 空隙和 canary，检查一个 128 KiB 请求、一次通知、无 bounce，以及受 SIZE_MAX=1024、SEG_MAX=3 限制时的拆分、空闲描述符有洞时仍保留其他链、一次通知多个请求，以及 scalar/batch 的 DMA 先于 IRQ 零 park；设备在通知时发布 used，不靠驱动时钟推进完成。真实 `test-io-sleep-riscv` 四组合额外要求
 单次调用先产生八个 NBD READ，释放七个后取消/唤醒仍不得返回，最后一个回复后才
 检查完整数据、独立状态和 owner 回收。文件批量读的八个连续页则必须形成一个 32 KiB SG 请求，暂扣该响应期间取消不能使批量读提前返回。
 

@@ -31,13 +31,13 @@ enum virtio_status virtio_split_enqueue(struct virtio_split_queue *q,struct virt
     if(q->fault.reason || !t->started || t->quiescent ||
         (q->transport && q->transport!=t))return VIRTIO_STATE;
     if(q->inflight==q->size)return VIRTIO_FULL;
-    uint32_t mask=0;uint16_t index=head;
+    uint64_t mask=0;uint16_t index=head;
     for(;;) {
-        if(index>=q->size || (mask&(UINT32_C(1)<<index)))return VIRTIO_STATE;
+        if(index>=q->size || (mask&(UINT64_C(1)<<index)))return VIRTIO_STATE;
         struct virtio_descriptor d=q->descriptors[index];
         if(d.address>UINT64_MAX-d.length)return VIRTIO_STATE;
         if(d.flags&~(VIRTIO_DESC_NEXT|VIRTIO_DESC_WRITE|VIRTIO_DESC_INDIRECT))return VIRTIO_STATE;
-        mask|=UINT32_C(1)<<index;
+        mask|=UINT64_C(1)<<index;
         if(d.flags&VIRTIO_DESC_INDIRECT) {
             if(!(t->features&(UINT64_C(1)<<28)))return VIRTIO_UNSUPPORTED;
             if(index!=head || d.flags!=VIRTIO_DESC_INDIRECT || (d.address&15) || !d.length || (d.length&15))return VIRTIO_STATE;

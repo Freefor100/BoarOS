@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TEST_POOL_PAGES 32U
+#define TEST_POOL_PAGES 128U
 
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
@@ -138,6 +138,42 @@ static void test_write_batch(struct riscv_virtio_mmio_block *rw,
         buffer[1024] != 'f' || buffer[1025] != 'g' || buffer[1026])
         fail_block(66, KERNEL_BLOCK_STATUS_OK, result);
     virt_uart_puts("BoarOS: block batch direct, SG and adjacent RMW passed\n");
+}
+
+static void test_128k_sg(struct riscv_virtio_mmio_block *device)
+{
+    uint64_t addresses[32];
+    unsigned char *pages[32];
+    struct kernel_block_span writes[32];
+    struct kernel_block_read_span reads[32];
+    uint64_t baseline = physical_page_available(device->page_allocator);
+    for (unsigned i = 0; i < 32; i++) {
+        if (physical_page_allocate_order(device->page_allocator, 1, &addresses[i]) != PHYSICAL_PAGE_STATUS_OK ||
+            physical_page_resolve(device->page_allocator, addresses[i], (void **)&pages[i]) != PHYSICAL_PAGE_STATUS_OK)
+            fail_block(80, 0, i);
+        for (unsigned j = 0; j < 8192; j++) pages[i][j] = j < 4096 ? (unsigned char)(i + j * 17) : 0xa5;
+        writes[i] = (struct kernel_block_span){262144 + i * 4096, pages[i], 4096};
+        reads[i] = (struct kernel_block_read_span){262144 + i * 4096, pages[i], 4096, 0, 0};
+    }
+    uint64_t requests = device->statistics.requests, bounce = device->statistics.bounce_requests;
+    if (kernel_block_write_batch(&device->block, writes, 32) != KERNEL_BLOCK_STATUS_OK ||
+        device->statistics.requests != requests + 1) fail_block(81, requests + 1, device->statistics.requests);
+    for (unsigned i = 0; i < 32; i++) for (unsigned j = 0; j < 4096; j++) pages[i][j] = 0;
+    requests = device->statistics.requests;
+    if (kernel_block_read_batch(&device->block, reads, 32) != KERNEL_BLOCK_STATUS_OK ||
+        device->statistics.requests != requests + 1) fail_block(82, requests + 1, device->statistics.requests);
+    for (unsigned i = 0; i < 32; i++) {
+        if (reads[i].completed != 4096 || reads[i].status != KERNEL_BLOCK_STATUS_OK) fail_block(83, 4096, reads[i].completed);
+        for (unsigned j = 0; j < 8192; j++) {
+            unsigned char expected = j < 4096 ? (unsigned char)(i + j * 17) : 0xa5;
+            if (pages[i][j] != expected) fail_block(84, expected, pages[i][j]);
+        }
+        if (physical_page_release_order(device->page_allocator, addresses[i], 1) != PHYSICAL_PAGE_STATUS_OK) fail_block(85, 0, i);
+    }
+    if (physical_page_available(device->page_allocator) != baseline ||
+        device->statistics.bounce_requests != bounce || device->queue.inflight || device->queue.claimed || device->active)
+        fail_block(86, baseline, physical_page_available(device->page_allocator));
+    virt_uart_puts("BoarOS: block 128KiB discrete SG read/write passed\n");
 }
 
 static void test_rejects_invalid_or_non_block_mmio(void)
@@ -458,6 +494,7 @@ static void test_real_virtio_block(const void *dtb)
     }
 
     test_write_batch(rw_dev, ro_dev, buffer);
+    test_128k_sg(rw_dev);
 
     block_status = kernel_block_flush(&rw_dev->block);
     if (block_status != KERNEL_BLOCK_STATUS_OK ||

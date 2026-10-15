@@ -2,7 +2,7 @@
 #define BOAROS_KERNEL_VIRTIO_SPLIT_QUEUE_H
 #include <kernel/virtio_transport.h>
 #include <stddef.h>
-#define VIRTIO_SPLIT_MAX_SIZE 32U
+#define VIRTIO_SPLIT_MAX_SIZE 64U
 #define VIRTIO_DESC_NEXT 1U
 #define VIRTIO_DESC_WRITE 2U
 #define VIRTIO_DESC_INDIRECT 4U
@@ -31,8 +31,8 @@ struct virtio_split_queue {
     volatile struct virtio_available_ring *available;
     volatile struct virtio_used_ring *used;
     uint16_t size,last_used,next_available,inflight;
-    uint32_t claimed;
-    struct { void *token; uint32_t mask,min_length,max_length; } owners[VIRTIO_SPLIT_MAX_SIZE];
+    uint64_t claimed;
+    struct { void *token; uint64_t mask; uint32_t min_length,max_length; } owners[VIRTIO_SPLIT_MAX_SIZE];
     struct virtio_queue_fault fault;
 };
 /* Caller serializes publish/take/reset against IRQ. Ring and business buffers are borrowed.

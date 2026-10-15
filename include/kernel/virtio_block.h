@@ -52,6 +52,7 @@ struct virtio_block_device {
     uint32_t queue_allocation_order;
     uint32_t state;
     uint32_t read_only;
+    uint32_t max_segment_size, max_segments;
     uint32_t irq_source, active, barrier_waiters, barrier;
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t statistics_start, statistics_last;

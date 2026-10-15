@@ -22,6 +22,8 @@
 #define VIRTIO_FEATURE_VERSION_1_HIGH_MASK \
     (UINT32_C(1) << VIRTIO_FEATURE_VERSION_1_LOW_BIT)
 
+#define VIRTIO_BLOCK_FEATURE_SIZE_MAX (UINT32_C(1) << 1)
+#define VIRTIO_BLOCK_FEATURE_SEG_MAX (UINT32_C(1) << 2)
 #define VIRTIO_BLOCK_FEATURE_RO (UINT32_C(1) << 5)
 #define VIRTIO_BLOCK_FEATURE_FLUSH (UINT32_C(1) << 9)
 
@@ -35,12 +37,12 @@
 
 #define VIRTQ_DESC_NEXT UINT16_C(1)
 #define VIRTQ_DESC_WRITE UINT16_C(2)
-#define VIRTIO_QUEUE_SIZE 32U
+#define VIRTIO_QUEUE_SIZE 64U
 #define REQUEST_SLOTS 8U
 #define REQUEST_STRIDE 768U
 
 #define VIRTIO_QUEUE_DESC_OFFSET 0U
-#define VIRTIO_REQUEST_HEADER_OFFSET 1024U
+#define VIRTIO_REQUEST_HEADER_OFFSET 2048U
 #define VIRTIO_LEGACY_QUEUE_USED_OFFSET BOAROS_PAGE_SIZE
 #define VIRTIO_LEGACY_REQUEST_HEADER_OFFSET (2U * BOAROS_PAGE_SIZE)
 #define VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER 2U
@@ -79,6 +81,8 @@ struct block_request {
 #endif
 };
 _Static_assert(sizeof(struct block_request) <= REQUEST_STRIDE, "request slot overflow");
+_Static_assert((((16U * VIRTIO_QUEUE_SIZE + 6U + 2U * VIRTIO_QUEUE_SIZE + 15U) & ~15U) +
+    6U + 8U * VIRTIO_QUEUE_SIZE) <= VIRTIO_REQUEST_HEADER_OFFSET, "modern ring overlaps requests");
 _Static_assert(VIRTIO_REQUEST_HEADER_OFFSET + REQUEST_SLOTS * REQUEST_STRIDE <= 8192, "modern queue overflow");
 _Static_assert(VIRTIO_LEGACY_REQUEST_HEADER_OFFSET + REQUEST_SLOTS * REQUEST_STRIDE <= (4U * BOAROS_PAGE_SIZE), "legacy queue overflow");
 
@@ -201,7 +205,8 @@ static enum virtio_block_status negotiate_features(
 {
     uint64_t features;
     enum virtio_status status = virtio_transport_begin(&device->transport,
-        VIRTIO_BLOCK_FEATURE_RO | VIRTIO_BLOCK_FEATURE_FLUSH, 0, &features);
+        VIRTIO_BLOCK_FEATURE_RO | VIRTIO_BLOCK_FEATURE_FLUSH |
+        VIRTIO_BLOCK_FEATURE_SIZE_MAX | VIRTIO_BLOCK_FEATURE_SEG_MAX, 0, &features);
     if (status != VIRTIO_OK) return status == VIRTIO_UNSUPPORTED ?
         VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED : VIRTIO_BLOCK_DRIVER_STATUS_DEVICE;
     device->read_only = (features & VIRTIO_BLOCK_FEATURE_RO) != 0;
@@ -209,6 +214,27 @@ static enum virtio_block_status negotiate_features(
     device->block.cache_mode = (features & VIRTIO_BLOCK_FEATURE_FLUSH) ?
         KERNEL_BLOCK_CACHE_WRITEBACK : KERNEL_BLOCK_CACHE_WRITETHROUGH;
     return VIRTIO_BLOCK_DRIVER_STATUS_OK;
+}
+
+static int read_segment_limits(struct virtio_block_device *device)
+{
+    for (unsigned attempt = 0; attempt < 8; attempt++) {
+        uint32_t generation = legacy_transport(device) ? 0 : reg_read(device, VIRTIO_REG_CONFIG_GENERATION);
+        uint32_t size = UINT32_MAX, count = KERNEL_BLOCK_BATCH_MAX;
+        if ((device->transport.features & VIRTIO_BLOCK_FEATURE_SIZE_MAX) &&
+            virtio_transport_config_read(&device->transport, 8, 4, &size) != VIRTIO_OK) return 0;
+        if ((device->transport.features & VIRTIO_BLOCK_FEATURE_SEG_MAX) &&
+            virtio_transport_config_read(&device->transport, 12, 4, &count) != VIRTIO_OK) return 0;
+        if (!legacy_transport(device) && generation != reg_read(device, VIRTIO_REG_CONFIG_GENERATION)) continue;
+        /* direct 与 bounce 都传完整扇区；不足一扇区的上限无法承载 RMW。 */
+        size &= ~(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+        if (!size || !count) return 0;
+        device->max_segment_size = size;
+        device->max_segments = count < KERNEL_BLOCK_BATCH_MAX ? count : KERNEL_BLOCK_BATCH_MAX;
+        if (device->max_segments > device->queue_size - 2U) device->max_segments = device->queue_size - 2U;
+        return 1;
+    }
+    return 0;
 }
 
 static uint64_t read_capacity(struct virtio_block_device *device)
@@ -362,7 +388,7 @@ static void collect_used(struct virtio_block_device *device)
             struct virtio_used_element item = {fault->head, fault->length};
             const char *reason = fault->reason == VIRTIO_QUEUE_OVERFLOW ? "used-overflow" :
                 fault->head >= device->queue.size || !fault->length ||
-                (fault->reason == VIRTIO_QUEUE_BAD_HEAD && (device->queue.claimed & (UINT32_C(1) << fault->head))) ?
+                (fault->reason == VIRTIO_QUEUE_BAD_HEAD && (device->queue.claimed & (UINT64_C(1) << fault->head))) ?
                 "used-element" : fault->reason == VIRTIO_QUEUE_BAD_LENGTH ? "used-length" : "slot-state";
             diagnose_queue_fault(device, reason, used_index, observed_count, pending,
                 fault->reason == VIRTIO_QUEUE_OVERFLOW ? NULL : &item);
@@ -525,7 +551,7 @@ static unsigned free_descriptors(const struct virtio_block_device *device)
 {
     unsigned count = 0;
     for (unsigned i = 0; i < device->queue.size; i++)
-        count += !(device->queue.claimed & (UINT32_C(1) << i));
+        count += !(device->queue.claimed & (UINT64_C(1) << i));
     return count;
 }
 
@@ -540,7 +566,7 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     uint16_t indices[VIRTIO_SPLIT_MAX_SIZE];
     unsigned found = 0;
     for (unsigned i = 0; i < device->queue.size && found < count + 2; i++)
-        if (!(device->queue.claimed & (UINT32_C(1) << i))) indices[found++] = i;
+        if (!(device->queue.claimed & (UINT64_C(1) << i))) indices[found++] = i;
     if (found != count + 2) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
     uint32_t data_length = 0;
     for (unsigned i = 0; i < count; i++) {
@@ -689,9 +715,7 @@ static enum kernel_block_status transfer_read(struct virtio_block_device *device
 
         if (sector_offset == 0U && size >= VIRTIO_BLOCK_SECTOR_SIZE) {
             size_t direct_size = size;
-            const size_t maximum_direct_size =
-                (size_t)UINT32_MAX &
-                ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+            const size_t maximum_direct_size = device->max_segment_size;
 
             if (direct_size > maximum_direct_size) {
                 direct_size = maximum_direct_size;
@@ -771,9 +795,7 @@ static enum kernel_block_status transfer_write(struct virtio_block_device *devic
 
         if (sector_offset == 0U && size >= VIRTIO_BLOCK_SECTOR_SIZE) {
             size_t direct_size = size;
-            const size_t maximum_direct_size =
-                (size_t)UINT32_MAX &
-                ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+            const size_t maximum_direct_size = device->max_segment_size;
 
             if (direct_size > maximum_direct_size) {
                 direct_size = maximum_direct_size;
@@ -900,18 +922,21 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
     size_t next = index;
     uint64_t offset = part->offset;
     if (!part->modify_ready) {
-        while (segments_count < KERNEL_BLOCK_BATCH_MAX && segments_count + 2 < free) {
+        while (segments_count < device->max_segments && segments_count + 2 < free) {
             struct batch_transfer *candidate = &parts[next];
-            if (candidate->offset % VIRTIO_BLOCK_SECTOR_SIZE || candidate->remaining < VIRTIO_BLOCK_SECTOR_SIZE) break;
-            size_t length = candidate->remaining;
+            if ((candidate->offset + candidate->copied) % VIRTIO_BLOCK_SECTOR_SIZE ||
+                candidate->remaining - candidate->copied < VIRTIO_BLOCK_SECTOR_SIZE) break;
+            size_t length = candidate->remaining - candidate->copied;
+            if (length > device->max_segment_size) length = device->max_segment_size;
             if (length > maximum - total) length = maximum - total;
             length &= ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
             uint64_t address;
-            if (!length || !device->dma_address(candidate->buffer, length, &address)) break;
+            if (!length || !device->dma_address(candidate->buffer + candidate->copied, length, &address)) break;
             segments[segments_count++] = (struct block_segment){address, (uint32_t)length};
-            candidate->copied = length;
+            candidate->copied += length;
             members |= UINT32_C(1) << next;
             total += length; offset += length;
+            if (candidate->copied < candidate->remaining) continue;
             for (next = 0; next < count; next++) {
                 if (!parts[next].remaining || parts[next].copied || parts[next].request ||
                     parts[next].offset != offset) continue;
@@ -1107,6 +1132,8 @@ enum virtio_block_status virtio_block_init(
     }
     result.queue_size = VIRTIO_QUEUE_SIZE;
     while (result.queue_size > queue_max) result.queue_size /= 2;
+    if (!read_segment_limits(&result))
+        return init_failure(&result, VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED, 1, 0);
 
     page_status = physical_page_allocate_order(page_allocator,
                                                 result.queue_allocation_order,
