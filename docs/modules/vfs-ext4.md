@@ -263,7 +263,11 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 短写/EIO 脏页保留、读回及 e2fsck。`make test-lwext4-group-host` 另外检查外部稳定页
 在接纳、替换、abort 和 commit 时的实际引用归还，以及冷读没有第二份文件数据缓存。
 元数据日志的普通 payload 与 checkpoint 共享同一 after 版本，只有 descriptor、revoke、
-commit 分配日志镜像；磁盘空间预留与实际控制镜像内存分别计量。escape 格式仅复制
+commit 分配日志镜像。日志空间按 payload 块数、按 tag 容量装箱的 descriptor 块数、
+按 32/64 位记录容量装箱的 revoke 块数和一个 commit 块预留，控制镜像与 payload credit 分别计数。
+私有操作预留自己的新增 payload，并只补合并后控制块数量的增量；running 继续持有已有预留。
+只读访问或撤销 revoke 留下的多余控制镜像暂留到 accept，合并去重后按最终记录数裁剪；
+abort 只归还私有预留，不动已接纳组。磁盘空间与实际控制镜像内存分别计量。escape 格式仅复制
 需改 magic 的第一个物理扇区，余下数据借用原版本，不临时修改共享输入。
 这些检查说明内容、生命周期和请求形态；应用吞吐与延迟需要在对应负载上测量。
 

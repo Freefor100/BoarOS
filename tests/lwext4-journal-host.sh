@@ -14,6 +14,20 @@ truncate -s 32M "$work/base.img"
 mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"
 debugfs -w -R "write $work/data /probe" "$work/base.img" >/dev/null 2>&1
+for block in 1024 4096; do
+    truncate -s 32M "$work/group-base.img"
+    mkfs.ext4 -q -F -b "$block" "$work/group-base.img"
+    debugfs -w -R "write $work/data /probe" "$work/group-base.img" >/dev/null 2>&1
+    for fault in 0 1 2 3; do
+        cp "$work/group-base.img" "$work/group.img"
+        timeout 30 "$work/probe" "$work/group.img" group-reserve "$fault"
+        expected=78
+        case "$fault" in 1|2) expected=79;; esac
+        timeout 30 "$work/probe" "$work/group.img" recover-crash "$expected"
+        e2fsck -fn "$work/group.img" >/dev/null
+    done
+done
+printf '%s\n' 'PASS: packed revoke credit, private abort, running merge and barrier recovery'
 cp "$work/base.img" "$work/commit.img"
 cp "$work/base.img" "$work/abort-fresh.img"
 timeout 30 "$work/probe" "$work/abort-fresh.img" abort-fresh
