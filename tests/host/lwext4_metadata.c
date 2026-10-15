@@ -543,6 +543,116 @@ static void group_checkpoint_recovery(struct ext4_fs *fs)
     for (unsigned i=0;i<3*size;i++) CHECK(bytes[i]==(i/size==1?0x5a:0x73));
     CHECK(ext4_fclose(&file)==EOK); free(bytes);
 }
+static void group_quarantine(struct ext4_fs *fs, bool failed)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct ext4_inode_ref inode; ext4_fsblk_t home;
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&inode,0,&home,false)==EOK && home);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    CHECK(jbd_trans_quarantine(fs,home,1,false)==EOK);
+    CHECK(jbd_journal_quarantined(fs,home,false,NULL));
+    CHECK(jbd_trans_quarantine(fs,home,1,false)==EUCLEAN);
+    CHECK(jbd_trans_quarantine(fs,UINT64_MAX,2,false)==EINVAL);
+    for (unsigned i=0;i<64;i++) CHECK(jbd_trans_quarantine(fs,1000+4*i,2,false)==EOK);
+    CHECK(jbd_trans_quarantine(fs,1001,4,false)==EUCLEAN);
+    CHECK(jbd_trans_quarantine(fs,1000,2,true)==EOK);
+    CHECK(journal->quarantined_blocks==129 && journal->quarantined_inodes==2);
+    /* Independent interval oracle includes holes and exact end boundaries;
+     * inode and block namespaces may use the same numeric addresses. */
+    for (ext4_fsblk_t address=990;address<1270;address++) {
+        bool covered=false; ext4_fsblk_t boundary=UINT64_MAX;
+        for (unsigned i=0;i<65;i++) {
+            ext4_fsblk_t first=i==64?home:1000+4*i;
+            unsigned count=i==64?1:2;
+            if (address>=first && address-first<count) {covered=true;boundary=first+count;break;}
+            if (first>address && first<boundary) boundary=first;
+        }
+        ext4_fsblk_t next;
+        CHECK(jbd_journal_quarantined(fs,address,false,&next)==covered && next==boundary);
+        CHECK(jbd_journal_quarantined(fs,address,true,&next)==(address>=1000 && address<1002));
+        CHECK(next==(address<1000?1000:address<1002?1002:UINT64_MAX));
+    }
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    CHECK(!journal->quarantined_blocks && !journal->quarantined_inodes);
+    CHECK(!jbd_journal_quarantined(fs,home,false,NULL));
+
+    CHECK(ext4_transaction_begin("/")==EOK);
+    size_t original_limit=journal->memory_limit;
+    journal->memory_limit=journal->memory_used;
+    unsigned reserved=0;
+    for (;;) {
+        CHECK(reserved<4096);
+        int result=jbd_trans_quarantine(fs,2000+2*reserved,1,false);
+        if (result==ENOMEM) break;
+        CHECK(result==EOK);
+        reserved++;
+    }
+    CHECK(reserved && journal->quarantined_blocks==reserved);
+    CHECK(!jbd_journal_quarantined(fs,2000+2*reserved,false,NULL));
+    CHECK(journal->memory_used<=journal->memory_limit);
+    journal->memory_limit=original_limit;
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED && !journal->quarantined_blocks);
+
+    /* Run the real bitmap allocator against separated reserved free ranges.
+     * Abort owns every metadata change, so these temporary allocations never
+     * become unreferenced blocks in the persisted filesystem. */
+    struct ext4_block_group_ref bg; struct ext4_block bitmap=EXT4_BLOCK_ZERO();
+    CHECK(ext4_fs_get_block_group_ref(fs,0,&bg)==EOK);
+    CHECK(ext4_block_get(fs->bdev,&bitmap,ext4_bg_get_block_bitmap(bg.block_group,&fs->sb))==EOK);
+    uint32_t bit=0,end=ext4_blocks_in_group_cnt(&fs->sb,0);
+    while (bit+16<end) {
+        unsigned length=0;
+        while (length<16 && ext4_bmap_is_bit_clr(bitmap.data,bit+length)) length++;
+        if (length==16) break;
+        bit+=length+1;
+    }
+    CHECK(bit+16<end);
+    ext4_fsblk_t first=ext4_fs_bg_idx_to_addr(&fs->sb,bit,0), allocated; uint32_t count;
+    CHECK(ext4_block_set(fs->bdev,&bitmap)==EOK && ext4_fs_put_block_group_ref(&bg)==EOK);
+    uint64_t free_blocks=ext4_sb_get_free_blocks_cnt(&fs->sb);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    CHECK(jbd_trans_quarantine(fs,first+2,4,false)==EOK && jbd_trans_quarantine(fs,first+8,4,false)==EOK);
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
+    CHECK(ext4_balloc_alloc_blocks(&inode,first+2,8,&allocated,&count)==EOK && allocated==first+6 && count==2);
+    CHECK(ext4_balloc_alloc_blocks(&inode,first,8,&allocated,&count)==EOK && allocated==first && count==2);
+    CHECK(ext4_balloc_alloc_blocks(&inode,first+8,4,&allocated,&count)==EOK && allocated==first+12 && count==4);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb)==free_blocks && !journal->quarantined_blocks);
+
+    struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
+    CHECK(ext4_transaction_begin("/")==EOK && ext4_file_set_times(&file,7,times)==EOK);
+    CHECK(jbd_trans_quarantine(fs,home,1,false)==EOK && ext4_transaction_end("/")==EOK);
+    times[0].nanoseconds++;
+    CHECK(ext4_transaction_begin("/")==EOK && ext4_file_set_times(&file,7,times)==EOK);
+    CHECK(jbd_trans_quarantine(fs,home+1,1,false)==EOK && ext4_transaction_end("/")==EOK);
+    CHECK(journal->quarantined_blocks==2 && jbd_journal_freeze(journal)==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK && jbd_trans_quarantine(fs,home+2,1,false)==EOK);
+    CHECK(journal->quarantined_blocks==3 && ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    CHECK(journal->quarantined_blocks==2);
+    CHECK(jbd_journal_quarantined(fs,home,false,NULL) && jbd_journal_select(journal) && journal->committing);
+    CHECK(jbd_journal_submit(journal)==EOK && jbd_journal_retire(journal,EOK)==EOK);
+    CHECK(journal->quarantined_blocks==2 && jbd_journal_select(journal) && journal->checkpointing);
+    CHECK(jbd_journal_checkpoint(journal)==EOK && jbd_journal_quarantined(fs,home,false,NULL));
+    CHECK(jbd_journal_retire(journal,EOK)==EOK && !journal->quarantined_blocks);
+    CHECK(!jbd_journal_quarantined(fs,home,false,NULL));
+    if (failed) {
+        times[0].seconds=4444;
+        CHECK(ext4_transaction_begin("/")==EOK && ext4_file_set_times(&file,7,times)==EOK);
+        CHECK(jbd_trans_quarantine(fs,home,1,false)==EOK && ext4_transaction_end("/")==EOK);
+        CHECK(jbd_journal_freeze(journal)==EOK && jbd_journal_select(journal) && journal->committing);
+        disk.fail_write=disk.writes+1;
+        CHECK(jbd_journal_submit(journal)==EIO && jbd_journal_retire(journal,EIO)==EIO);
+        CHECK(journal->quarantined_blocks==1 && jbd_journal_quarantined(fs,home,false,NULL));
+        CHECK(fault_block_crash(&disk)==0);
+    } else CHECK(ext4_fclose(&file)==EOK);
+    printf("quarantine index block=%u error=%d: interval holes, double-free, exact counts, bitmap skip, abort and durable owner lifetime\n",fs->bdev->lg_bsize,failed);
+}
 static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -1205,7 +1315,7 @@ static void group_namespace(struct ext4_fs *fs, bool unlink_files)
             if(i&1) {size_t count;CHECK(ext4_fwrite(&f,data,sizeof(data),&count)==EOK && count==sizeof(data));}
             CHECK(ext4_fclose(&f)==EOK && ext4_fremove(name)==EOK);
             CHECK(ext4_fopen(&f,name,"r")==ENOENT);
-            CHECK(jbd_journal_quarantined(fs,retired[i],true));
+            CHECK(jbd_journal_quarantined(fs,retired[i],true,NULL));
         }
         /* An open unlinked inode retains its content until its last owner. */
         CHECK(ext4_fopen2(&f,"/namespace-live",O_CREAT|O_RDWR)==EOK);
@@ -1216,7 +1326,7 @@ static void group_namespace(struct ext4_fs *fs, bool unlink_files)
         CHECK(ext4_fpwrite(&f,0,data,sizeof(data),&count)==EOK && count==sizeof(data));
         CHECK(ext4_fpread(&f,0,actual,sizeof(actual),&count)==EOK && count==sizeof(actual) && !memcmp(data,actual,sizeof(data)));
         CHECK(ext4_fclose(&f)==EOK && ext4_orphan_free("/",inode)==EOK);
-        CHECK(jbd_journal_quarantined(fs,inode,true));
+        CHECK(jbd_journal_quarantined(fs,inode,true,NULL));
     }
     CHECK(namespace_waits==waits && disk.writes==writes && disk.flushes==flushes);
     namespace_hold=false;
@@ -1843,6 +1953,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-log-payload"))group_log_payload(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-collapse")) {group_checkpoint_collapse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);return 0;}
     else if(!strcmp(argv[2],"group-checkpoint-recovery"))group_checkpoint_recovery(dev.fs);
+    else if(!strcmp(argv[2],"group-quarantine") || !strcmp(argv[2],"group-quarantine-error")) {bool failed=!strcmp(argv[2],"group-quarantine-error");group_quarantine(dev.fs,failed);if(failed)return 0;}
     else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
     else if(!strcmp(argv[2],"group-namespace-unlink"))group_namespace(dev.fs,true);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);

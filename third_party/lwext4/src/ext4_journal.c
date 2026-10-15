@@ -338,6 +338,11 @@ RB_GENERATE_INTERNAL(jbd_block, jbd_block_rec, block_rec_node,
 RB_GENERATE_INTERNAL(jbd_revoke_tree, jbd_revoke_rec, revoke_node,
 		     jbd_revoke_rec_cmp, static inline)
 
+static int jbd_quarantine_cmp(struct jbd_quarantine *a, struct jbd_quarantine *b)
+{ return a->first < b->first ? -1 : a->first > b->first; }
+RB_GENERATE_INTERNAL(jbd_quarantine_tree, jbd_quarantine, index_node,
+		     jbd_quarantine_cmp, static inline)
+
 #define jbd_alloc_revoke_entry() ext4_calloc(1, sizeof(struct revoke_entry))
 #define jbd_free_revoke_entry(addr) ext4_free(addr)
 
@@ -2574,7 +2579,14 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 	}
 
 	struct jbd_quarantine *q;
-	while ((q = LIST_FIRST(&trans->quarantine))) { LIST_REMOVE(q, node); jbd_free(q); }
+	while ((q = LIST_FIRST(&trans->quarantine))) {
+		LIST_REMOVE(q, node);
+		RB_REMOVE(jbd_quarantine_tree, &journal->quarantine_index[q->inode], q);
+		uint64_t *count = q->inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;
+		if (*count < q->count) __builtin_trap();
+		*count -= q->count;
+		jbd_free(q);
+	}
 	jbd_image_free(trans->checkpoint_image);
 	jbd_free(trans);
 }
@@ -3422,39 +3434,48 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, si
 }
 
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
-	uint32_t count, bool inode)
+    uint32_t count, bool inode)
 {
-	if (!fs->jbd_journal || !fs->jbd_journal->grouped || !count) return EOK;
-	if (!fs->curr_trans) return EINVAL;
-	struct jbd_quarantine *q = jbd_alloc(fs->jbd_journal, sizeof(*q));
-	if (!q) return ENOMEM;
-	q->first = first; q->count = count; q->inode = inode;
-	LIST_INSERT_HEAD(&fs->curr_trans->quarantine, q, node);
-	return EOK;
+    struct jbd_journal *journal = fs->jbd_journal;
+    if (!journal || !journal->grouped || !count) return EOK;
+    if (!fs->curr_trans || count > UINT64_MAX - first) return EINVAL;
+    struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
+    struct jbd_quarantine key = {.first = first};
+    struct jbd_quarantine *after = RB_NFIND(jbd_quarantine_tree, index, &key);
+    struct jbd_quarantine *before = after ? RB_PREV(jbd_quarantine_tree, index, after) :
+        RB_MAX(jbd_quarantine_tree, index);
+    /* Reuse is excluded while an interval is indexed. A second free that
+     * intersects it is therefore an actual double-free, not another owner. */
+    if ((after && after->first - first < count) ||
+        (before && first - before->first < before->count)) return EUCLEAN;
+    struct jbd_quarantine *q = jbd_alloc(journal, sizeof(*q));
+    if (!q) return ENOMEM;
+    q->first = first; q->count = count; q->inode = inode;
+    if (RB_INSERT(jbd_quarantine_tree, index, q)) __builtin_trap();
+    LIST_INSERT_HEAD(&fs->curr_trans->quarantine, q, node);
+    uint64_t *total = inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;
+    if (*total > UINT64_MAX - count) __builtin_trap();
+    *total += count;
+    return EOK;
 }
 
-static bool jbd_trans_quarantined(struct jbd_trans *trans, ext4_fsblk_t address, bool inode)
+bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address,
+    bool inode, ext4_fsblk_t *next)
 {
-	if (!trans) return false;
-	struct jbd_quarantine *q;
-	LIST_FOREACH(q, &trans->quarantine, node)
-		if (q->inode == inode && address >= q->first && address - q->first < q->count) return true;
-	return false;
-}
-
-bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address, bool inode)
-{
-	struct jbd_journal *journal = fs->jbd_journal;
-	if (!journal || !journal->grouped) return false;
-	if (jbd_trans_quarantined(fs->curr_trans, address, inode) ||
-	    jbd_trans_quarantined(journal->running, address, inode) ||
-	    jbd_trans_quarantined(journal->committing, address, inode)) return true;
-	struct jbd_trans *trans;
-	TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node)
-		if (jbd_trans_quarantined(trans, address, inode)) return true;
-	TAILQ_FOREACH(trans, &journal->cp_queue, trans_node)
-		if (jbd_trans_quarantined(trans, address, inode)) return true;
-	return false;
+    if (next) *next = UINT64_MAX;
+    struct jbd_journal *journal = fs->jbd_journal;
+    if (!journal || !journal->grouped) return false;
+    struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
+    struct jbd_quarantine key = {.first = address};
+    struct jbd_quarantine *after = RB_NFIND(jbd_quarantine_tree, index, &key);
+    struct jbd_quarantine *cover = after && after->first == address ? after :
+        after ? RB_PREV(jbd_quarantine_tree, index, after) : RB_MAX(jbd_quarantine_tree, index);
+    if (cover && address - cover->first < cover->count) {
+        if (next) *next = cover->first + cover->count;
+        return true;
+    }
+    if (next && after) *next = after->first;
+    return false;
 }
 
 int jbd_journal_group_init(struct jbd_journal *journal, size_t limit)
@@ -3479,7 +3500,9 @@ void jbd_journal_group_fini(struct jbd_journal *journal)
 {
 	if (journal->running || journal->committing || journal->checkpointing ||
 	    !TAILQ_EMPTY(&journal->sealed_queue) || !TAILQ_EMPTY(&journal->cp_queue) ||
-	    !RB_EMPTY(&journal->sources) || journal->log_reserved || journal->error) __builtin_trap();
+	    !RB_EMPTY(&journal->sources) || journal->log_reserved || journal->error ||
+        !RB_EMPTY(&journal->quarantine_index[0]) || !RB_EMPTY(&journal->quarantine_index[1]) ||
+        journal->quarantined_blocks || journal->quarantined_inodes) __builtin_trap();
 	journal->grouped = false;
 	jbd_free(journal->log_map); journal->log_map = NULL;
 	jbd_trim_cache(journal, 0);

@@ -17,6 +17,15 @@ for block in 1024 4096; do
     mkfs.ext4 -q -F -b "$block" -I 256 "$work/disk.img"
     "$work/probe" "$work/disk.img" seed
     cp "$work/disk.img" "$work/base.img"
+    for mode in group-quarantine group-quarantine-error; do
+        cp "$work/base.img" "$work/quarantine.img"
+        "$work/probe" "$work/quarantine.img" "$mode"
+        if [ "$mode" = group-quarantine-error ]; then
+            "$work/probe" "$work/quarantine.img" group-recovery
+            "$work/probe" "$work/quarantine.img" group-recovery
+        fi
+        e2fsck -fn "$work/quarantine.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
     for fault in 0 1 2 3 4; do
         cp "$work/base.img" "$work/checkpoint.img"
         "$work/probe" "$work/checkpoint.img" group-checkpoint-collapse "$fault"

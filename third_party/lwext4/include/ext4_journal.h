@@ -109,6 +109,7 @@ struct jbd_quarantine {
 	ext4_fsblk_t first;
 	uint32_t count;
 	bool inode;
+	RB_ENTRY(jbd_quarantine) index_node;
 	LIST_ENTRY(jbd_quarantine) node;
 };
 
@@ -156,6 +157,10 @@ struct jbd_journal {
 	unsigned sealed_count, checkpoint_count, log_reserved;
 	bool checkpoint_requested;
 	bool grouped;
+	/* Transaction lists own each range through abort or checkpoint. These
+	 * block/inode indexes borrow the same nodes across accept and sealing. */
+	RB_HEAD(jbd_quarantine_tree, jbd_quarantine) quarantine_index[2];
+	uint64_t quarantined_blocks, quarantined_inodes;
 	size_t memory_used, memory_peak, memory_limit;
 	size_t memory_cached;
 	uint64_t budget_failures;
@@ -244,7 +249,11 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, si
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);
-bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address, bool inode);
+/* Return whether address is reserved for an older incarnation. When next is
+ * supplied, report the end of that interval, or the next reserved start when
+ * address is free (UINT64_MAX if none). The modification lock stabilizes it. */
+bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address,
+	bool inode, ext4_fsblk_t *next);
 
 #ifdef __cplusplus
 }

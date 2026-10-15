@@ -880,28 +880,11 @@ static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext
 }
 
 __unused
-static void ext4_group_free_counts(struct jbd_trans *trans, uint64_t *blocks, uint64_t *inodes)
-{
-	if (!trans) return;
-	struct jbd_quarantine *range;
-	LIST_FOREACH(range, &trans->quarantine, node) {
-		if (range->inode) *inodes += range->count;
-		else *blocks += range->count;
-	}
-}
-
-__unused
 static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
-	uint64_t blocks = 0, inodes = 0;
-	ext4_group_free_counts(journal->running, &blocks, &inodes);
-	ext4_group_free_counts(journal->committing, &blocks, &inodes);
-	struct jbd_trans *trans;
-	TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node) ext4_group_free_counts(trans, &blocks, &inodes);
-	TAILQ_FOREACH(trans, &journal->cp_queue, trans_node) ext4_group_free_counts(trans, &blocks, &inodes);
-	return (blocks && ext4_sb_get_free_blocks_cnt(&mp->fs.sb) <= blocks + 32) ||
-		(inodes && ext4_get32(&mp->fs.sb, free_inodes_count) <= inodes + 1);
+	return (journal->quarantined_blocks && ext4_sb_get_free_blocks_cnt(&mp->fs.sb) <= journal->quarantined_blocks + 32) ||
+		(journal->quarantined_inodes && ext4_get32(&mp->fs.sb, free_inodes_count) <= journal->quarantined_inodes + 1);
 }
 
 __unused

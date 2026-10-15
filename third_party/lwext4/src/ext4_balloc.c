@@ -395,25 +395,28 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
         uint32_t end = ext4_blocks_in_group_cnt(sb, group);
         uint32_t start = step ? 0 : ext4_fs_addr_to_idx_bg(sb, goal);
         uint32_t index = start, found = end;
+        ext4_fsblk_t next_quarantine = UINT64_MAX;
         /* Search the goal suffix, then the same group's prefix, without
          * borrowing or checksumming its bitmap a second time. */
         for (unsigned pass = 0; pass < (start ? 2U : 1U); pass++) {
             uint32_t limit = pass ? start : end;
             index = pass ? 0 : start;
             while (ext4_bmap_bit_find_clr(bitmap.data, index, limit, &index) == EOK) {
-                if (!jbd_journal_quarantined(fs, ext4_fs_bg_idx_to_addr(sb, index, group), false)) {
+                ext4_fsblk_t address = ext4_fs_bg_idx_to_addr(sb, index, group);
+                if (!jbd_journal_quarantined(fs, address, false, &next_quarantine)) {
                     found = index; break;
                 }
-                index++;
+                uint64_t skip = next_quarantine - address;
+                index = skip >= limit - index ? limit : index + (uint32_t)skip;
             }
             if (found != end) break;
         }
         uint32_t length = 0;
         if (found != end) {
-            while (length < max_blocks && length < end - found &&
-                ext4_bmap_is_bit_clr(bitmap.data, found + length) &&
-                !jbd_journal_quarantined(fs, ext4_fs_bg_idx_to_addr(sb, found + length, group), false))
-                length++;
+            ext4_fsblk_t address = ext4_fs_bg_idx_to_addr(sb, found, group);
+            uint64_t reusable = next_quarantine - address;
+            while (length < max_blocks && length < end - found && length < reusable &&
+                ext4_bmap_is_bit_clr(bitmap.data, found + length)) length++;
             for (uint32_t i = 0; i < length; i++) ext4_bmap_bit_set(bitmap.data, found + i);
             ext4_balloc_set_bitmap_csum(sb, bg.block_group, bitmap.data);
             ext4_trans_set_block_dirty(bitmap.buf);
@@ -489,7 +492,7 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 
 	/* Check if block is free */
 	*free = ext4_bmap_is_bit_clr(b.data, index_in_group) &&
-	    !jbd_journal_quarantined(inode_ref->fs, baddr, false);
+	    !jbd_journal_quarantined(inode_ref->fs, baddr, false, NULL);
 
 	/* Allocate block if possible */
 	if (*free) {
