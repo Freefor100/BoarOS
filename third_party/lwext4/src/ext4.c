@@ -3248,15 +3248,16 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
         return ENOMEM;
     }
     size_t scalar_limit;
-    struct ext4_read_fragment scalar_fragment;
-    struct ext4_block_read_span scalar_read;
-    unsigned scalar_owner;
+    struct ext4_read_fragment scalar_fragments[8];
+    struct ext4_block_read_span scalar_reads[8];
+    unsigned scalar_owners[8];
     int scalar_mapping_error;
     size_t *limits = work ? work->limits : &scalar_limit;
-    struct ext4_read_fragment *fragments = work ? work->fragments : &scalar_fragment;
-    struct ext4_block_read_span *reads = work ? work->reads : &scalar_read;
-    unsigned *owners = work ? work->owners : &scalar_owner;
+    struct ext4_read_fragment *fragments = work ? work->fragments : scalar_fragments;
+    struct ext4_block_read_span *reads = work ? work->reads : scalar_reads;
+    unsigned *owners = work ? work->owners : scalar_owners;
     int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
+    unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : 8;
     const struct ext4_lock *locks = file->mp->os_locks;
     if (locks && locks->read_lock) locks->read_lock(locks->context);
     else EXT4_MP_LOCK(file->mp);
@@ -3282,7 +3283,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     while (!inline_link) {
         memset(mapping_errors, 0, count * sizeof(*mapping_errors));
         unsigned parts = 0, pending = 0;
-        for (unsigned i = 0; i < count && parts < count; i++) {
+        for (unsigned i = 0; i < count && parts < capacity; i++) {
             size_t planned = spans[i].completed;
             while (!spans[i].error && planned < limits[i]) {
                 uint64_t offset = spans[i].offset + planned;
@@ -3301,9 +3302,20 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     reads[pending - 1].block + reads[pending - 1].count == block &&
                     (uint8_t *)reads[pending - 1].data + (size_t)reads[pending - 1].count * sector == out &&
                     length / sector <= UINT32_MAX - reads[pending - 1].count;
-                if (parts == count) {
-                    /* 片段限制针对真实输出区间；同页连续小FS块仍可扩展最后一项。
-                     * 空输出只查询当前版本，不能把未接纳片段提前复制进调用者。 */
+                /* A sparse run has one immediate completion fragment, even
+                 * when it spans many filesystem blocks. Keep its neighboring
+                 * disk fragments in the same submission wave. */
+                if (!physical && parts && fragments[parts - 1].span == i &&
+                    !fragments[parts - 1].error &&
+                    (!pending || owners[pending - 1] != parts - 1)) {
+                    memset(out, 0, length);
+                    fragments[parts - 1].length += length;
+                    planned += length;
+                    continue;
+                }
+                if (parts == capacity) {
+                    /* 片段已满时仍可扩展最后一个设备区间。空输出只查询当前
+                     * 版本，不能把未接纳片段提前复制进调用者。 */
                     if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
                     reads[pending - 1].count += length / sector;
                     fragments[parts - 1].length += length;
