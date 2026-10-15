@@ -189,7 +189,7 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
           cache_write_spans==3 && cache_write_bytes==3 && !cache_reads, 268);
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_end(7, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
-          visits <= 6 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 3, 269);
+          visits <= 6 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 3 * 4096, 269);
     number("cache sparse-dirty visits: ", visits);
 #endif
     for (unsigned i = 64; i < 80; i++)
@@ -202,8 +202,8 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     cache_io_probe = 0; check(cache_writes == 1, 278);
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_end(8, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
-          visits == 1 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 279);
-    number("cache selected hash visits among 16 dirty: ", visits);
+          visits == 1 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 4096, 279);
+    number("cache selected dirty candidates among 16 dirty: ", visits);
 #endif
     cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 280);
@@ -227,7 +227,8 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 32 * 4096, 40 * 4096) == 0, 285);
     cache_io_probe = 0;
-    check(!cache_reads && cache_writes == 8 / BOAROS_PAGE_CACHE_WRITEBACK_PAGES, 286);
+    check(!cache_reads && cache_write_spans == 8 && cache_write_bytes == 8 * sizeof(bytes) &&
+          cache_writes == (8 + BOAROS_PAGE_CACHE_WRITEBACK_PAGES - 1) / BOAROS_PAGE_CACHE_WRITEBACK_PAGES, 286);
     number("cache contiguous writeback calls: ", cache_writes);
     check(kernel_vfs_sync(&file, 1, &observed) == 0 &&
           kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 287);
@@ -393,7 +394,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
           kernel_files_close(files, listener_fd, &result) == KERNEL_FILES_STATUS_OK && result == 0, 34);
 }
 
-static void udp_buffer_oom(struct kernel_files *files, struct kernel_mm *mm)
+static void udp_read_without_buffer(struct kernel_files *files, struct kernel_mm *mm)
 {
     int64_t fd, result;
     struct kernel_open_file_description *pin = 0;
@@ -405,9 +406,11 @@ static void udp_buffer_oom(struct kernel_files *files, struct kernel_mm *mm)
           (address.bytes[0] = 127, address.bytes[3] = 1, kernel_socket_sendto(socket, mm, BUFFER, 8192, &address)) == 8192, 37);
     fail_page = 1;
     check(kernel_files_read(files, mm, fd, BUFFER, 8192, &result) == KERNEL_FILES_STATUS_OK &&
-          result == -KERNEL_ENOMEM && fail_page == 0, 38);
-    /* Failure must leave the complete datagram owned by the socket queue. */
-    check(kernel_socket_recvfrom(socket, mm, BUFFER, 8192, &address) == 8192, 39);
+          result == 8192 && fail_page == 1, 38);
+    /* Final packet storage is copied directly; no read scratch allocation. */
+    fail_page = 0;
+    check(kernel_files_read(files, mm, fd, BUFFER, 8192, &result) == KERNEL_FILES_STATUS_OK &&
+          result == -KERNEL_EAGAIN, 39);
     for (unsigned page = 0; page < 2; page++) {
         size_t copied;
         check(kernel_copy_from_user(mm, payload, BUFFER + page * 4096, sizeof(payload), &copied) ==
@@ -503,10 +506,20 @@ static void unix_datagram_budget(struct kernel_files *files, struct kernel_mm *m
         check(kernel_files_write(files, mm, pair[0], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 186);
         check(kernel_files_read(files, mm, pair[1], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == 1, 187);
     }
-    for (unsigned ordinal = 1; ordinal <= 2; ordinal++) {
+    /* Enumerate actual allocation failures until the request succeeds without
+     * reaching the injected point; payload and control may share one owner. */
+    for (unsigned ordinal = 1; ; ordinal++) {
+        check(ordinal < 32, 192);
         fail_packet = ordinal;
-        check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_ENOMEM, 192);
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK, 192);
+        unsigned pending = fail_packet;
         fail_packet = 0;
+        if (result == 8) {
+            check(pending && kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK &&
+                  result == 8, 194);
+            break;
+        }
+        check(result == -KERNEL_ENOMEM && !pending, 192);
         check(kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 193);
         check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == 8 &&
             kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == 8, 194);
@@ -946,7 +959,7 @@ void kernel_main(unsigned long hart, const void *dtb)
 #endif
     cache_range_cost(&mount, &cache);
     tcp_cost(&files, &mm);
-    udp_buffer_oom(&files, &mm);
+    udp_read_without_buffer(&files, &mm);
     socketpair_scale(&files, &mm);
     unix_datagram_budget(&files, &mm);
     struct riscv_mm_statistics small = mapped_cost(&files, &mm, fd, 16 * MIB);

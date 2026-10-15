@@ -2168,7 +2168,9 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
         if (last>tail->page_index) last=tail->page_index;
         struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
         multiple=next && next->page_index<=last;
-        if (!multiple) {single=entry;entry_borrow(single);}
+        if (!multiple) {
+            single=entry;entry_borrow(single);COST_ADD(WRITEBACK_VISITS,1);
+        }
     }
     struct writeback_workspace work={0};
     if (multiple && writeback_workspace_init(cache,&work)) return -KERNEL_ENOMEM;
