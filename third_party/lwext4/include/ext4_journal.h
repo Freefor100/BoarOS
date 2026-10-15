@@ -69,6 +69,8 @@ struct jbd_buf {
 	bool was_dirty;
 	struct jbd_image *before;
 	struct jbd_image *after;
+	void *escaped_prefix;
+	struct ext4_block_write home_io;
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
@@ -84,6 +86,7 @@ struct jbd_data {
 	struct ext4_block block;
 	struct jbd_image *image;
 	struct jbd_source *source;
+	struct ext4_block_write io;
 	RB_ENTRY(jbd_data) index_node;
 	TAILQ_ENTRY(jbd_data) node;
 };
@@ -125,6 +128,7 @@ struct jbd_trans {
 	bool frozen;
 	struct jbd_image *checkpoint_image;
 	ext4_fsblk_t checkpoint_lba;
+	struct ext4_block_write *io_head;
 
 	struct jbd_journal *journal;
 
@@ -147,6 +151,7 @@ struct jbd_journal {
 	struct jbd_trans *running, *committing;
 	struct jbd_trans *checkpointing, *checkpoint_last;
 	TAILQ_HEAD(jbd_checkpoint_bufs, jbd_buf) checkpoint_bufs;
+	struct ext4_block_write *checkpoint_io;
 	TAILQ_HEAD(jbd_sealed_queue, jbd_trans) sealed_queue;
 	unsigned sealed_count, checkpoint_count, log_reserved;
 	bool checkpoint_requested;

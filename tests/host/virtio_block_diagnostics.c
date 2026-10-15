@@ -26,10 +26,12 @@ static int injected, final_statistics;
 static unsigned batch_mode, batch_popped, batch_pushed;
 static int batch_is_write;
 static struct virtio_block_device *wait_irq_device;
-static unsigned char batch_output[32][8192];
-static unsigned char sg_disk[262144];
+static unsigned char batch_output[96][8192];
+static unsigned char sg_disk[1048576];
 static unsigned notifications, first_notify_heads, sg_max_segments, park_calls;
 static unsigned sg_fail_sector;
+static unsigned phase_hold, phase_held_head, phase_crossed_window;
+static unsigned char *phase_held_status;
 static void (*underlying_write)(void *, enum virtio_register, uint32_t);
 static void sg_device_step(void);
 
@@ -89,6 +91,7 @@ static void sg_device_step(void)
         uint32_t type; uint64_t sector;
         memcpy(&type, header, 4); memcpy(&sector, header + 8, 8);
         assert(type == 0 || type == 1 || type == 4);
+        if (phase_hold && sector>=64) phase_crossed_window=1;
         uint64_t offset = sector * 512;
         unsigned bytes = 0;
         int error = sector == sg_fail_sector;
@@ -111,8 +114,18 @@ static void sg_device_step(void)
         }
         assert(d[at].flags == 2 && d[at].length == 1);
         if (segments > sg_max_segments) sg_max_segments = segments;
+        if (phase_hold && !sector) {
+            phase_held_head=head;
+            phase_held_status=physical_pointer(d[at].address,1);
+            continue;
+        }
         *(unsigned char *)physical_pointer(d[at].address, 1) = error ? 1 : 0;
         done[batch_pushed++ % size] = (struct wire_completion){head, error || type != 0 ? 1 : bytes + 1};
+    }
+    if (phase_hold && phase_crossed_window && phase_held_status) {
+        *phase_held_status=0;
+        done[batch_pushed++ % size]=(struct wire_completion){phase_held_head,1};
+        phase_held_status=NULL;
     }
     used[1] = (uint16_t)batch_pushed;
     registers[0x60 / 4] = 1;
@@ -767,6 +780,47 @@ static void sg_128k_case(unsigned version, unsigned queue_size, int writing,
     assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
 }
 
+struct phase_entry { struct kernel_block_span span; struct phase_entry *next; };
+static int phase_next(const void **cursor, struct kernel_block_span *span)
+{
+    const struct phase_entry *entry=*cursor;
+    if (!entry) return 0;
+    *span=entry->span; *cursor=entry->next; return 1;
+}
+static void write_phase_case(unsigned version, int failing)
+{
+    struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=park_calls=0;
+    sg_fail_sector=failing?64:UINT32_MAX; diagnostic_length=0;
+    phase_hold=1; phase_crossed_window=0; phase_held_status=NULL;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    device.irq_source=1; wait_irq_device=&device;
+    struct phase_entry entries[80];
+    memset(sg_disk,0,sizeof(sg_disk));
+    for (unsigned i=0;i<80;i++) {
+        memset(batch_output[i],(unsigned char)(i+3),512);
+        entries[i]=(struct phase_entry){{i*1024,batch_output[i],512},i==79?NULL:&entries[i+1]};
+    }
+    /* A malformed final range must prevent publication of the valid prefix. */
+    entries[79].span.offset=sizeof(sg_disk);
+    assert(kernel_block_write_phase(&device.block,phase_next,entries)==KERNEL_BLOCK_STATUS_OUT_OF_RANGE && !device.statistics.requests);
+    entries[79].span.offset=79*1024;
+    enum kernel_block_status result=kernel_block_write_phase(&device.block,phase_next,entries);
+    assert(result==(failing?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK));
+    assert(phase_crossed_window && !phase_held_status);
+    assert(first_notify_heads==8 && device.statistics.max_inflight==8);
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    if (!failing) for (unsigned i=0;i<80;i++) for (unsigned j=0;j<512;j++)
+        assert(sg_disk[i*1024+j]==(unsigned char)(i+3));
+    else assert(device.statistics.requests<80);
+    phase_hold=0; device.irq_source=0; wait_irq_device=NULL;
+    printf("PASS journal phase transport=%u error=%d: 80 spans, later window enters while first DMA held, error drains owners\n",version,failing);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
 static void bad_segment_limits_case(unsigned version)
 {
     for (unsigned kind = 0; kind < 2; kind++) {
@@ -898,6 +952,10 @@ static void fragmented_descriptors_case(unsigned version)
 
 int main(int argc, char **argv)
 {
+    if (argc==2 && !strcmp(argv[1],"write-phase")) {
+        for (unsigned version=1;version<=2;version++) for (int failing=0;failing<=1;failing++) write_phase_case(version,failing);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "sg-128k")) {
         for (unsigned version = 1; version <= 2; version++) for (int writing = 0; writing <= 1; writing++) {
             bad_segment_limits_case(version);
@@ -950,6 +1008,8 @@ int main(int argc, char **argv)
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
+        write_phase_case(version,0);
+        write_phase_case(version,1);
         bad_segment_limits_case(version);
         workspace_pool_case(version);
         for (int writing = 0; writing <= 1; writing++) {

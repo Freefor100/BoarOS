@@ -454,6 +454,39 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	return r;
 }
 
+int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
+	const struct ext4_block_write *first)
+{
+	if (!bdev || !bdev->bdif || !bdev->bdif->ph_bsize) return EINVAL;
+	uint32_t sector = bdev->bdif->ph_bsize;
+	for (const struct ext4_block_write *io = first; io; io = io->next) {
+		if (!io->data || !io->size || io->offset % sector || io->size % sector ||
+		    io->offset < bdev->part_offset || io->offset - bdev->part_offset > bdev->part_size ||
+		    io->size > bdev->part_size - (io->offset - bdev->part_offset) ||
+		    io->size - 1 > UINTPTR_MAX - (uintptr_t)io->data) return EINVAL;
+	}
+	if (!first) return EOK;
+	ext4_bdif_lock(bdev);
+	int r = EOK;
+	if (bdev->bdif->bwrite_phase) r = bdev->bdif->bwrite_phase(bdev, first);
+	else for (const struct ext4_block_write *io = first; io; io = io->next) {
+		/* Legacy devices have no in-flight phase producer. */
+		const uint8_t *data = io->data;
+		uint64_t block = io->offset / sector;
+		size_t left = io->size / sector;
+		while (left) {
+			uint32_t count = left > UINT32_MAX ? UINT32_MAX : (uint32_t)left;
+			r = bdev->bdif->bwrite(bdev, data, block, count);
+			if (r != EOK) break;
+			block += count; data += (size_t)count * sector; left -= count;
+		}
+		if (r != EOK) break;
+	}
+	for (const struct ext4_block_write *io = first; io; io = io->next) bdev->bdif->bwrite_ctr++;
+	ext4_bdif_unlock(bdev);
+	return r;
+}
+
 int ext4_block_writebytes(struct ext4_blockdev *bdev, uint64_t off,
 			  const void *buf, uint32_t len)
 {

@@ -83,7 +83,7 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
 使用提交身份，旧请求不能污染新窗口。fixture 未登记设备属于 other；设备详细计时只在
 观测构建产生，用户页解析由 `COST_USER_RESOLUTIONS` 统一记录。
-封口事务的提交路径按 ordered data、journal、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
+提交路径按纯数据阶段、提交前正文、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因。`device*_precommit_body` 包含同一阶段的 ordered data 与日志正文，不声称区分二者；commit 记录计入总写入。历史 `device*_journal_write` 由旧记录格式读取，不出现在当前诊断输出；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
 

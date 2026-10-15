@@ -170,6 +170,7 @@ int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
         !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
     return 0;
 }
+
 int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap,const struct physical_page_allocator *allocator)
 {
@@ -576,6 +577,27 @@ static int block_write_batch(struct ext4_blockdev *device,
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
     case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
     case KERNEL_BLOCK_STATUS_INVALID: return EINVAL;
+    default: return EIO;
+    }
+}
+
+static int block_phase_next(const void **cursor, struct kernel_block_span *span)
+{
+    const struct ext4_block_write *io = *cursor;
+    if (!io) return 0;
+    *span = (struct kernel_block_span){io->offset, io->data, io->size};
+    *cursor = io->next;
+    return 1;
+}
+
+static int block_write_phase(struct ext4_blockdev *device,
+                            const struct ext4_block_write *first)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    switch (kernel_block_write_phase(adapter->block, block_phase_next, first)) {
+    case KERNEL_BLOCK_STATUS_OK: return EOK;
+    case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
     default: return EIO;
     }
 }
@@ -1022,6 +1044,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->interface.bread_batch = block_read_batch;
     adapter->interface.bwrite = block_write;
     adapter->interface.bwrite_batch = block_write_batch;
+    adapter->interface.bwrite_phase = block_write_phase;
     adapter->interface.close = block_close;
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;

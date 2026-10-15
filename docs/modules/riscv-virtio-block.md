@@ -33,6 +33,8 @@ RV `arch/riscv/virtio_mmio_block.c` 负责PLIC绑定，MMIO身份/版本和寄�
 
 `kernel_block_write_batch(device, spans, count)` 接受最多 32 个 `kernel_block_span { offset, buffer, size }`。设备与逻辑块大小必须有效，至少具有单写或批量写回调；只读设备返回 UNSUPPORTED。通用层在任何写入前检查所有 span 的容量、指针范围和非空字节区间重叠；非空 span 之间重叠返回 INVALID。有效可写设备上的 `count == 0` 可以传空 spans，成功且不调用驱动；空 span 可以传空 buffer，但 offset 仍须不超过容量，全部为空也不调用驱动。可选 `device.write_batch` 一次接收原 span 数组，可能含空项；没有回调时跳过空项、按输入顺序调用单写，遇到首个错误即停止。它保留实际失败状态，不承诺整批原子性或自动 flush；已完成的写不会回滚，调用方须保持所有非空 buffer 有效直到函数返回。
 
+journal 内部的 `kernel_block_write_phase()` 接收可重新遍历的稳定范围游标，先检查整阶段的容量、对齐和 RAM 边界，再持续填充预留工作区。任何完成成员都可立即接纳后续范围，不等待原 32 项窗口全部排空；错误后停止新发布并等待已有 DMA 结束。范围不重叠由 journal 的块所有权保证，公共批量接口的检查保持原语义。
+
 `kernel_block_read_batch(device, spans, count)` 同样最多 32 项，在发布前检查全部参数。
 读 span 提供可写 buffer、已完成字节前缀和独立状态；磁盘范围可以重叠，但目标内存
 必须彼此及与描述符数组分离。预检失败不发布任何请求，未执行项保留 NOT_SUBMITTED。

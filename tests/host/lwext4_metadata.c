@@ -369,6 +369,33 @@ static void group_log_payload(struct ext4_fs *fs)
         CHECK(jbd_journal_retire(journal, EOK) == EOK && allocations == before_allocations);
         fail_allocation = 0;
     }
+    /* A magic-prefixed home needs a private wire sector. Exercise every
+     * allocation failure while acquiring it, including after buffer ownership
+     * was installed but before the caller has changed a byte. */
+    struct ext4_block escaped_home=EXT4_BLOCK_ZERO();
+    CHECK(ext4_block_get(fs->bdev,&escaped_home,home)==EOK);
+    bool installed_failure=false;
+    journal->cache_disabled=true;
+    for (unsigned point=1;;point++) {
+        CHECK(point<32);
+        struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
+        unsigned begin=allocations;
+        fail_allocation=begin+point;
+        int result=jbd_trans_get_write_access(operation,&escaped_home);
+        unsigned attempted=allocations-begin;
+        fail_allocation=0;
+        CHECK(result==EOK || result==ENOMEM);
+        struct jbd_buf *access=escaped_home.buf->end_write_arg;
+        if (result==ENOMEM && access && access->trans==operation && !access->escaped_prefix) {
+            CHECK(access->before);
+            installed_failure=true;
+        }
+        jbd_journal_free_trans(journal,operation,true);
+        CHECK(!journal->error && !memcmp(escaped_home.data,"\xc0\x3b\x39\x98",4));
+        if (result==EOK && point>attempted) break;
+    }
+    journal->cache_disabled=false;
+    CHECK(installed_failure && ext4_block_set(fs->bdev,&escaped_home)==EOK);
     /* Cross descriptor boundaries without reserving a whole control image
      * per payload. The private operation still owns every undo and version. */
     unsigned char bytes[4096]; size_t written;
@@ -739,19 +766,21 @@ static const void *batch_payloads[8];
 static uint64_t batch_payload_blocks[8];
 static size_t batch_payload_bytes;
 static unsigned payload_batches, payload_spans;
-static int data_batch_write(struct ext4_blockdev *bdev, const struct ext4_block_span *spans, unsigned count)
+static int data_phase_write(struct ext4_blockdev *bdev, const struct ext4_block_write *first)
 {
-    unsigned payloads=0;
-    for (unsigned i=0;i<count;i++) for (unsigned j=0;j<8;j++) {
-        uintptr_t pointer=(uintptr_t)spans[i].data, first=(uintptr_t)batch_payloads[j];
-        if (pointer<first || pointer-first>=batch_payload_bytes) continue;
-        CHECK(pointer==first && spans[i].block==batch_payload_blocks[j] &&
-            spans[i].count==batch_payload_bytes/512);
-        payloads++;
+    unsigned payloads=0, nodes=0;
+    for (const struct ext4_block_write *io=first;io;io=io->next) {
+        nodes++;
+        for (unsigned j=0;j<8;j++) {
+            uintptr_t pointer=(uintptr_t)io->data, start=(uintptr_t)batch_payloads[j];
+            if (pointer<start || pointer-start>=batch_payload_bytes) continue;
+            CHECK(pointer==start && io->offset==batch_payload_blocks[j]*512 && io->size==batch_payload_bytes);
+            payloads++;
+        }
     }
-    if (payloads) { CHECK(payloads==8 && count==8); payload_batches++; payload_spans+=payloads; }
-    for (unsigned i=0;i<count;i++) {
-        int r=dev_write(bdev,spans[i].data,spans[i].block,spans[i].count);
+    if (payloads) { CHECK(payloads==8 && nodes>=8); payload_batches++; payload_spans+=payloads; }
+    for (const struct ext4_block_write *io=first;io;io=io->next) {
+        int r=dev_write(bdev,io->data,io->offset/512,io->size/512);
         if (r) return r;
     }
     return EOK;
@@ -804,11 +833,11 @@ static void group_data_batch(struct ext4_fs *fs)
             owned_page_release(&pages[i]);
         }
         batch_payload_bytes=page; payload_batches=payload_spans=0;
-        fs->bdev->bdif->bwrite_batch=data_batch_write;
+        fs->bdev->bdif->bwrite_phase=data_phase_write;
         struct jbd_journal *journal=fs->jbd_journal;
         CHECK(jbd_journal_freeze(journal)==EOK && jbd_journal_select(journal));
         CHECK(jbd_journal_submit(journal)==EOK && jbd_journal_retire(journal,EOK)==EOK);
-        fs->bdev->bdif->bwrite_batch=NULL;
+        fs->bdev->bdif->bwrite_phase=NULL;
         CHECK(payload_batches==1 && payload_spans==8);
         for (unsigned i=0;i<8;i++) CHECK(!pages[i].references && !pages[i].bytes);
         CHECK(ext4_journal_group_drain("/")==EOK);
@@ -871,7 +900,7 @@ static void group_source_budget(struct ext4_fs *fs, bool failed)
     struct jbd_journal *journal=fs->jbd_journal;
     struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
     size_t original_limit=journal->memory_limit, baseline=journal->memory_used-journal->memory_cached;
-    journal->memory_limit=baseline+bytes+4096;
+    journal->memory_limit=baseline+bytes+blocks*(2*sizeof(struct jbd_data)+2*sizeof(void *))+512;
     fs->curr_trans=operation;
     for (unsigned i=0;i<blocks;i++) {
         size_t previous=journal->memory_used;

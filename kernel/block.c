@@ -129,6 +129,35 @@ enum kernel_block_status kernel_block_write_batch(
 static int memory_overlaps(uintptr_t a, size_t an, uintptr_t b, size_t bn)
 { return an && bn && (a < b ? b - a < an : a - b < bn); }
 
+enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
+    kernel_block_phase_next_fn next, const void *first)
+{
+    kernel_assert_service_context();
+    if (!device || !device->logical_block_size || !next) return KERNEL_BLOCK_STATUS_INVALID;
+    if (!device->write && !device->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    const void *cursor = first;
+    struct kernel_block_span span;
+    unsigned nonempty = 0;
+    while (next(&cursor, &span)) {
+        if (span.offset > device->capacity_bytes || span.size > device->capacity_bytes - span.offset)
+            return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
+        if (!span.size) continue;
+        if (!span.buffer || span.size - 1 > UINTPTR_MAX - (uintptr_t)span.buffer ||
+            span.offset % device->logical_block_size || span.size % device->logical_block_size)
+            return KERNEL_BLOCK_STATUS_INVALID;
+        nonempty = 1;
+    }
+    if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
+    if (device->write_phase) return device->write_phase(device->context, next, first);
+    cursor = first;
+    while (next(&cursor, &span)) {
+        if (!span.size) continue;
+        enum kernel_block_status result = device->write(device->context, span.offset, span.buffer, span.size);
+        if (result != KERNEL_BLOCK_STATUS_OK) return result;
+    }
+    return KERNEL_BLOCK_STATUS_OK;
+}
+
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
     struct kernel_block_read_span *spans, size_t count)
 {

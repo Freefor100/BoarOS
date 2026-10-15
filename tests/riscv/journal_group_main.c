@@ -292,7 +292,7 @@ void kernel_main(unsigned long hart,const void *dtb)
     uint64_t groups, data_writes, resumes;
     check(kernel_cost_end(1,0)==0 &&
         kernel_cost_read(1,COST_JOURNAL_GROUPS,&groups)==0 && (journaled ? groups>0 : groups==0) &&
-        kernel_cost_read(1,COST_DEVICE_OTHER_DATA_WRITE,&data_writes)==0 && (!journaled || data_writes>0) &&
+        kernel_cost_read(1,COST_DEVICE_OTHER_PRECOMMIT_BODY,&data_writes)==0 && (!journaled || data_writes>0) &&
         kernel_cost_read(1,COST_IO_COMPLETE_TO_RESUME,&resumes)==0 && (!journaled || resumes>0),41);
 #endif
     virt_uart_puts("BoarOS: journal group tests passed\n");sbi_shutdown();

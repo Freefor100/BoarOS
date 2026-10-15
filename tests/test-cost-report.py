@@ -84,6 +84,18 @@ class CostSeedTest(unittest.TestCase):
             with self.assertRaises(ValueError): validate_resume_seed(record, requested)
 
 class CostReportTest(unittest.TestCase):
+    def test_precommit_body_names_are_current_and_history_keeps_its_registry(self):
+        from cost_report import supported_schemas
+        current=schema()
+        names={name for name,_,_ in current}
+        for device in ('device0','device1','device_other'):
+            self.assertIn(device+'_precommit_body',names)
+            self.assertNotIn(device+'_journal_write',names)
+        historical=[registry for registry in supported_schemas()
+                    if len(registry)==len(current) and any(name=='device0_journal_write' for name,_,_ in registry)]
+        self.assertEqual(len(historical),1)
+        self.assertNotEqual(historical[0],current)
+
     def test_scheduler_requires_completed_windows_and_peer_content(self):
         work = {'scheduler-yield': (8192, 8192), 'scheduler-wake': (8192, 8192 * ord('p')),
                 'scheduler-create': (1024, 1024)}
