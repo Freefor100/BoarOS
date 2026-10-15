@@ -16,8 +16,8 @@ io = importlib.util.module_from_spec(spec); spec.loader.exec_module(io)
 class Profiles(unittest.TestCase):
     def test_matrix_and_defaults(self):
         rows = io.profiles('all')
-        self.assertEqual(len(rows), 20)
-        self.assertEqual([r['name'] for r in rows if r['production_default']], ['ra0-wb1'])
+        self.assertEqual(len(rows), 30)
+        self.assertEqual([r['name'] for r in rows if r['production_default']], ['ra0-wb32'])
         for bad in ('ra16-wb1', 'ra1-wb0', 'ra3-wb3'):
             with self.assertRaises(ValueError): io.profile(bad)
 
