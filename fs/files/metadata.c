@@ -20,9 +20,10 @@ static int metadata_path(struct kernel_files *files,
 {
     struct kernel_vfs_path *start = 0;
     if (!name[0] && (flags & KERNEL_FILES_AT_EMPTY_PATH)) {
+        KERNEL_FILES_PIN_SCOPE(selected_fd);
         if (dirfd == KERNEL_FS_AT_FDCWD) start = kernel_fs_context_cwd(fs);
         else {
-            struct kernel_open_file_description *file = kernel_files_lookup_description(files, dirfd);
+            struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
             if (!file) return -KERNEL_EBADF;
             start = file->file.path;
             if (!start) return -KERNEL_ENOTSUP;
@@ -70,6 +71,7 @@ enum kernel_files_status kernel_files_truncate(
     struct kernel_mm *mm, uint64_t user_path, int64_t length,
     int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (length < 0) {
@@ -91,6 +93,7 @@ enum kernel_files_status kernel_files_utimensat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint64_t user_times, uint32_t flags, int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_vfs_timespec times[2];
     struct kernel_vfs_path *path = 0;
@@ -139,6 +142,7 @@ enum kernel_files_status kernel_files_fchmod(
     struct kernel_files *files, int64_t fd, uint32_t mode,
     int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -157,6 +161,7 @@ enum kernel_files_status kernel_files_fchmodat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint32_t mode, int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     struct kernel_vfs_path *path = 0;
     int result;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
@@ -174,6 +179,7 @@ enum kernel_files_status kernel_files_fchown(
     struct kernel_files *files, int64_t fd, uint32_t uid, uint32_t gid,
     int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -191,6 +197,7 @@ enum kernel_files_status kernel_files_fchownat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint32_t uid, uint32_t gid, uint32_t flags, int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) || !mm || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (flags & ~(KERNEL_FILES_AT_SYMLINK_NOFOLLOW | KERNEL_FILES_AT_EMPTY_PATH)) {
@@ -219,7 +226,8 @@ enum kernel_files_status kernel_files_fchownat(
         if ((!name || !name[0]) && (flags & KERNEL_FILES_AT_EMPTY_PATH) &&
             dirfd != KERNEL_FS_AT_FDCWD) {
             /* 空路径按选定 OFD 修改，也覆盖没有路径的共享 pipe 和已 unlink inode。 */
-            struct kernel_open_file_description *file = kernel_files_lookup_description(files, dirfd);
+            KERNEL_FILES_PIN_SCOPE(selected_fd);
+            struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
             if (file && file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
                 struct kernel_vfs_path *held = file->file.path;
                 result = kernel_vfs_path_acquire(held);
@@ -278,6 +286,7 @@ enum kernel_files_status kernel_files_statfs(
     struct kernel_mm *mm, uint64_t user_path, uint64_t user_buffer,
     int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     struct kernel_vfs_path *path = 0;
     int result;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
@@ -295,6 +304,7 @@ enum kernel_files_status kernel_files_fstatfs(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, int64_t *linux_result)
 {
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !mm || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;

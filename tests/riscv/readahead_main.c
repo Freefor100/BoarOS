@@ -60,11 +60,13 @@ static void yield(void)
 }
 #if BOAROS_TEST_READAHEAD_HELD
 static unsigned prefetch_entered, demand_finished, owner_checked;
-static struct kernel_task *producer_task, *demand_task, *stopping_task;
+static struct kernel_task *producer_task, *demand_task, *stopping_task, *exercise_task;
 static struct kernel_thread_join demand_join, observer_join;
 int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
 {
+    if (kernel_task_current() == exercise_task)
+        return __real_kernel_vfs_node_pread_batch(node, spans, count);
     producer_task = kernel_task_current(); prefetch_entered = 1;
     check(count == BOAROS_PAGE_CACHE_READAHEAD_PAGES, 51);
     int result=__real_kernel_vfs_node_pread_batch(node,spans,count);
@@ -92,7 +94,7 @@ static void held_observer(void *unused)
     virt_uart_puts("readahead: pending\n");
     while(!virt_uart_rx_ready())yield();
     check(virt_uart_getc()=='q',55);
-    while(device.inflight!=1 || producer_task->state!=KERNEL_THREAD_STATE_BLOCKED) {
+    while(device.queue.inflight!=1 || producer_task->state!=KERNEL_THREAD_STATE_BLOCKED) {
         check(!demand_finished,56);yield();
     }
     check(!demand_finished && producer_task->state==KERNEL_THREAD_STATE_BLOCKED &&
@@ -111,6 +113,9 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kern
 static void exercise(void *unused)
 {
     (void)unused;uintptr_t irq=riscv_interrupt_save();
+#if BOAROS_TEST_READAHEAD_HELD
+    exercise_task = kernel_task_current();
+#endif
     struct kernel_open_file_description *file=NULL;int error;
     check(kernel_vfs_start_journal_worker(&mount)==0,15);
     check(kernel_open_file_create(&heap,&mount,"/data",&file,&error)==KERNEL_OPEN_FILE_STATUS_OK && !error,10);
@@ -129,7 +134,7 @@ static void exercise(void *unused)
     stopping_task=kernel_task_current();
     kernel_page_cache_stop_worker(&cache);
     kernel_thread_join(&demand_join);kernel_thread_join(&observer_join);
-    check(owner_checked && demand_finished && !device.inflight && !device.active,58);
+    check(owner_checked && demand_finished && !device.queue.inflight && !device.active,58);
     check(kernel_page_cache_start_worker(&cache)==0,59);
 #endif
     uint64_t deadline=riscv_time_read()+timebase*2;

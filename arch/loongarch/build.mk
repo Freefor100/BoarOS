@@ -8,6 +8,7 @@ LA_CROSS_COMPILE ?= $(shell \
 	fi)
 QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
 LA_BUILD := build/loongarch
+KERNEL_LA ?= kernel-la
 LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS ?= -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
 LA_CPPFLAGS := -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
@@ -26,8 +27,12 @@ $(LA_BUILD)/%.o: %.c arch/loongarch/build.mk
 $(LA_BUILD)/%.o: %.S arch/loongarch/build.mk
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -MMD -MP -c $< -o $@
-kernel-la: $(LA_OBJECTS) arch/loongarch/linker.ld
+$(KERNEL_LA): $(LA_OBJECTS) arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch -Wl,-Map,$(LA_BUILD)/kernel.map -o $@ $(LA_OBJECTS) -lgcc
+ifneq ($(KERNEL_LA),kernel-la)
+.PHONY: kernel-la
+kernel-la: $(KERNEL_LA)
+endif
 .PHONY: run-loongarch test-loongarch test-loongarch-boot prepare-la-tools prepare-la-linux test-stack-usage-la
 prepare-la-tools:
 	python3 -B tests/loongarch/qemu_rtc.py
@@ -147,8 +152,8 @@ $(LA_BUILD)/root-fault: tests/loongarch/root_fault.c prepare-la-userland
 test-root-loongarch: $(LA_BUILD)/root-fault $(LA_BUILD)/kernel-root-oom-1 $(LA_BUILD)/kernel-root-oom-2 $(LA_BUILD)/kernel-root-oom-3
 
 .PHONY: test-root-io-loongarch
-test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault prepare-la-tools
-	python3 -B tests/loongarch/root_io.py --qemu $(QEMU_LOONGARCH64)
+test-root-io-loongarch: $(KERNEL_LA) $(LA_BUILD)/root-probe build/host/nbd-fault prepare-la-tools
+	python3 -B tests/loongarch/root_io.py --qemu $(QEMU_LOONGARCH64) --kernel $(KERNEL_LA) --build-dir $(LA_BUILD)
 
 .PHONY: test-la-userland-host
 .PHONY: test-rng-loongarch
@@ -359,3 +364,13 @@ $(LA_BUILD)/wait-native: $(LA_OBJECTS) $(LA_BUILD)/wait-native.o arch/loongarch/
 .PHONY: test-wait-loongarch
 test-wait-loongarch: $(LA_BUILD)/wait-native prepare-la-tools
 	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
+
+$(LA_BUILD)/sched-lifecycle-native.o: tests/wait/native.c Makefile
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
+$(LA_BUILD)/sched-lifecycle-native: $(LA_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch -o $@ $(LA_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o -lgcc
+.PHONY: test-sched-lifecycle-loongarch
+test-sched-lifecycle-loongarch: $(LA_BUILD)/sched-lifecycle-native prepare-la-tools
+	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD) --case sched-lifecycle
+-include $(LA_BUILD)/sched-lifecycle-native.d

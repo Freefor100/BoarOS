@@ -21,6 +21,114 @@ endif
 TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 
 COST_DIAGNOSTICS ?= 0
+SMP ?= 0
+USER_SMP ?= 0
+USER_SMP_BUILD ?= build/riscv-user-smp
+USER_SMP_COMPOSITION ?= 0
+ifneq ($(filter $(USER_SMP_COMPOSITION),0 1),$(USER_SMP_COMPOSITION))
+$(error USER_SMP_COMPOSITION must be 0 or 1)
+endif
+ifeq ($(USER_SMP_COMPOSITION),1)
+ifneq ($(SMP)$(USER_SMP),11)
+$(error USER_SMP_COMPOSITION requires SMP=1 USER_SMP=1)
+endif
+endif
+ifneq ($(filter $(USER_SMP),0 1),$(USER_SMP))
+$(error USER_SMP must be 0 or 1)
+endif
+ifeq ($(USER_SMP),1)
+ifneq ($(SMP),1)
+$(error USER_SMP requires SMP=1)
+endif
+endif
+SMP_TEST ?= 0
+MM_SMP_TEST ?= 0
+MM_SHARED_SMP_TEST ?= 0
+MM_FILE_SMP_TEST ?= 0
+MM_DISK_SMP_TEST ?= 0
+FILES_SMP_TEST ?= 0
+FILES_SMP_BUILD ?= build/riscv-files-smp-test
+FILE_IO_SMP_TEST ?= 0
+FILE_IO_SMP_BUILD ?= build/riscv-file-io-smp-test
+SMP_TEST_PROFILE ?= normal
+ifneq ($(filter $(SMP_TEST_PROFILE),normal missing-rfence denied-start guard denied-stop rfence-error mm-fence-i),$(SMP_TEST_PROFILE))
+$(error invalid SMP_TEST_PROFILE)
+endif
+SMP_TEST_SUFFIX := $(if $(filter normal,$(SMP_TEST_PROFILE)),,$(SMP_TEST_PROFILE)/)
+SMP_NEGATIVE := $(if $(filter missing-rfence,$(SMP_TEST_PROFILE)),1,$(if $(filter denied-start,$(SMP_TEST_PROFILE)),2,$(if $(filter guard,$(SMP_TEST_PROFILE)),3,$(if $(filter denied-stop,$(SMP_TEST_PROFILE)),4,$(if $(filter rfence-error,$(SMP_TEST_PROFILE)),5,$(if $(filter mm-fence-i,$(SMP_TEST_PROFILE)),6,0))))))
+ifneq ($(filter $(SMP_TEST),0 1),$(SMP_TEST))
+$(error SMP_TEST must be 0 or 1)
+endif
+ifeq ($(SMP_TEST_PROFILE),mm-fence-i)
+ifneq ($(MM_SMP_TEST),1)
+$(error mm-fence-i requires MM_SMP_TEST=1)
+endif
+endif
+ifneq ($(filter $(SMP),0 1),$(SMP))
+$(error SMP must be 0 or 1)
+endif
+ifeq ($(SMP_TEST),1)
+ifeq ($(SMP),0)
+$(error SMP_TEST requires SMP=1)
+endif
+endif
+ifneq ($(filter $(MM_SMP_TEST),0 1),$(MM_SMP_TEST))
+$(error MM_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(MM_SMP_TEST),1)
+ifneq ($(SMP)$(SMP_TEST),11)
+$(error MM_SMP_TEST requires SMP=1 SMP_TEST=1)
+endif
+ifneq ($(filter $(SMP_TEST_PROFILE),normal rfence-error mm-fence-i),$(SMP_TEST_PROFILE))
+$(error MM_SMP_TEST profile must be normal, rfence-error or mm-fence-i)
+endif
+endif
+ifneq ($(filter $(MM_SHARED_SMP_TEST),0 1),$(MM_SHARED_SMP_TEST))
+$(error MM_SHARED_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(MM_SHARED_SMP_TEST),1)
+ifneq ($(MM_SMP_TEST),1)
+$(error MM_SHARED_SMP_TEST requires MM_SMP_TEST=1)
+endif
+ifneq ($(filter $(SMP_TEST_PROFILE),normal rfence-error),$(SMP_TEST_PROFILE))
+$(error MM_SHARED_SMP_TEST profile must be normal or rfence-error)
+endif
+endif
+ifneq ($(filter $(MM_FILE_SMP_TEST),0 1),$(MM_FILE_SMP_TEST))
+$(error MM_FILE_SMP_TEST must be 0 or 1)
+endif
+ifneq ($(filter $(MM_DISK_SMP_TEST),0 1),$(MM_DISK_SMP_TEST))
+$(error MM_DISK_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(MM_DISK_SMP_TEST),1)
+ifneq ($(MM_FILE_SMP_TEST),1)
+$(error MM_DISK_SMP_TEST requires MM_FILE_SMP_TEST=1)
+endif
+endif
+ifeq ($(MM_FILE_SMP_TEST),1)
+ifneq ($(MM_SHARED_SMP_TEST),1)
+$(error MM_FILE_SMP_TEST requires MM_SHARED_SMP_TEST=1)
+endif
+endif
+ifneq ($(filter $(FILES_SMP_TEST),0 1),$(FILES_SMP_TEST))
+$(error FILES_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(FILES_SMP_TEST),1)
+ifneq ($(MM_DISK_SMP_TEST),1)
+$(error FILES_SMP_TEST requires the controlled disk MM fixture)
+endif
+endif
+ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
+$(error SMP plus COST is unsupported)
+endif
+ifneq ($(filter $(FILE_IO_SMP_TEST),0 1),$(FILE_IO_SMP_TEST))
+$(error FILE_IO_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(FILE_IO_SMP_TEST),1)
+ifneq ($(FILES_SMP_TEST),1)
+$(error FILE_IO_SMP_TEST requires the controlled FD fixture)
+endif
+endif
 ifneq ($(filter $(COST_DIAGNOSTICS),0 1),$(COST_DIAGNOSTICS))
 $(error COST_DIAGNOSTICS must be 0 or 1)
 endif
@@ -30,6 +138,47 @@ KERNEL_RV := build/cost/kernel-rv
 else
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
+endif
+ifeq ($(SMP),1)
+BUILD_DIR := build/riscv-smp/riscv
+KERNEL_RV := build/riscv-smp/kernel-rv
+CPU_CAPACITY := 2
+else
+CPU_CAPACITY := 1
+endif
+ifeq ($(SMP_TEST),1)
+BUILD_DIR := build/riscv-smp-test/riscv
+KERNEL_RV := build/riscv-smp-test/kernel-rv
+BUILD_DIR := build/riscv-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(MM_SMP_TEST),1)
+BUILD_DIR := build/riscv-mm-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-mm-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(MM_SHARED_SMP_TEST),1)
+BUILD_DIR := build/riscv-mm-shared-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-mm-shared-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(MM_FILE_SMP_TEST),1)
+BUILD_DIR := build/riscv-mm-file-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-mm-file-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(MM_DISK_SMP_TEST),1)
+BUILD_DIR := build/riscv-mm-disk-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-mm-disk-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(FILES_SMP_TEST),1)
+BUILD_DIR := $(FILES_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := $(FILES_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(FILE_IO_SMP_TEST),1)
+BUILD_DIR := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := $(FILE_IO_SMP_BUILD)/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(USER_SMP),1)
+BUILD_DIR := $(USER_SMP_BUILD)/riscv
+KERNEL_RV := $(USER_SMP_BUILD)/kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -82,6 +231,10 @@ USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
+CPPFLAGS += -DBOAROS_MAX_CPUS=$(CPU_CAPACITY)
+CPPFLAGS += -DBOAROS_USER_SMP=$(USER_SMP)
+CPPFLAGS += -DBOAROS_USER_SMP_COMPOSITION=$(USER_SMP_COMPOSITION)
+CPPFLAGS += -DBOAROS_SMP_TEST=$(SMP_TEST) -DBOAROS_MM_DISK_TEST=$(MM_DISK_SMP_TEST)
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
@@ -147,6 +300,7 @@ LWIP_SOURCES := \
 C_SOURCES := \
 	kernel/cpu.c \
 	kernel/raw_lock.c \
+	arch/riscv/smp.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -197,6 +351,7 @@ C_SOURCES := \
 	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
+	fs/file_mapping.c \
 	fs/procfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
@@ -217,7 +372,7 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c \
+	kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -256,6 +411,7 @@ C_SOURCES := \
 	$(LWIP_SOURCES)
 ASM_SOURCES := \
 	arch/riscv/boot.S \
+	arch/riscv/secondary.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S \
@@ -268,6 +424,33 @@ endif
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+ifeq ($(USER_SMP_COMPOSITION),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
+LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_get_page,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output
+endif
+ifeq ($(SMP_TEST),1)
+ifeq ($(MM_SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/mm_smp.o $(BUILD_DIR)/tests/riscv/mm_smp_probe.o
+LDFLAGS += -Wl,--wrap=riscv_trap_dispatch,--wrap=sbi_remote_sfence,--wrap=sbi_remote_fence_i,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_memory_object_prepare_page,--wrap=kernel_open_file_prepare_mapping_page
+else
+OBJECTS += $(BUILD_DIR)/tests/riscv/smp_cases.o
+OBJECTS += $(BUILD_DIR)/tests/riscv/smp_registers.o
+LDFLAGS += -Wl,--wrap=riscv_context_switch,--wrap=sbi_remote_sfence
+LDFLAGS += -Wl,--wrap=sbi_probe_extension,--wrap=sbi_hart_start,--wrap=sbi_hart_status
+LDFLAGS += -Wl,--wrap=physical_page_allocate
+$(BUILD_DIR)/tests/riscv/smp_cases.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE)
+endif
+ifeq ($(FILES_SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/files_smp.o
+LDFLAGS += -Wl,--wrap=kernel_wait_park
+endif
+ifeq ($(FILE_IO_SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/file_io_smp.o
+LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt
+endif
+$(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
+$(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
+endif
 TEST_RUNTIME_C_SOURCES := \
 	kernel/cpu.c \
 	kernel/raw_lock.c \
@@ -320,6 +503,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
+	fs/file_mapping.c \
 	fs/procfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
@@ -337,7 +521,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c \
+	kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -738,6 +922,10 @@ test-lwext4-checksum-host:
 	build/host/lwext4-checksum
 	python3 -B tests/lwext4-checksum-read-host.py
 
+.PHONY: test-string-host
+test-string-host:
+	sh tests/string-host.sh
+
 .PHONY: test-lwext4-cache-host
 .PHONY: test-lwext4-deep-truncate-host
 test-lwext4-deep-truncate-host:
@@ -762,11 +950,7 @@ $(JOURNAL_GROUP_KERNEL): $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUI
 .PHONY: test-journal-group-riscv
 test-journal-group-riscv: $(JOURNAL_GROUP_KERNEL)
 	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
-$(BUILD_DIR)/tests/kernel-journal-idle-negative-rv: $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_prepare_idle_return -o $@ $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
-.PHONY: test-journal-idle-negative-riscv
-test-journal-idle-negative-riscv: $(BUILD_DIR)/tests/kernel-journal-idle-negative-rv
-	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64) --expect-idle-failure
+	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64) --nojournal
 
 # Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
 test-lwext4-recovery-host:
@@ -909,7 +1093,8 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=physical_page_allocate_order \
 		-Wl,--wrap=riscv_sv39_current_satp \
-		-Wl,--wrap=ext4_fpwrite \
+		-Wl,--wrap=ext4_fpwrite_batch \
+		-Wl,--wrap=ext4_file_sync_metadata_mode \
 		-Wl,--wrap=ext4_ftruncate \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-partial-write-rv.map \
 		-o $@ $(FILES_PARTIAL_WRITE_TEST_OBJECTS)
@@ -1422,7 +1607,9 @@ test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
 		./tests/uaccess-oom-riscv.sh
 
 test-icache-riscv: $(KERNEL_RV)
-	OBJDUMP_RV=$(OBJDUMP) ./tests/icache-riscv.sh
+	OBJDUMP_RV=$(OBJDUMP) MM_OBJECT_RV=$(abspath $(BUILD_DIR)/mm/mm.o) \
+		ELF_IMAGE_OBJECT_RV=$(abspath $(BUILD_DIR)/kernel/elf_image.o) \
+		SV39_OBJECT_RV=$(abspath $(BUILD_DIR)/arch/riscv/sv39.o) ./tests/icache-riscv.sh
 
 test-demand-page-riscv: test-root-init-riscv \
 		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
@@ -1660,7 +1847,7 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
-		-Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback \
+		-Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback \
 		-Wl,--wrap=kernel_wait_queue_wake_all \
 		-Wl,--wrap=netif_poll_all -Wl,--wrap=sys_check_timeouts -Wl,--wrap=sys_now \
 		-Wl,--wrap=netif_poll_budget -Wl,--wrap=sys_check_timeouts_budget \
@@ -1672,7 +1859,7 @@ test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
 IO_SLEEP_OBJECTS := $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/io_sleep_main.o
 -include $(BUILD_DIR)/tests/riscv/io_sleep_main.d
 $(BUILD_DIR)/tests/kernel-io-sleep-rv: $(IO_SLEEP_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback -Wl,--wrap=kernel_open_file_sync_range -Wl,--wrap=kernel_open_file_release -Wl,--wrap=riscv_sv39_current_satp -Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_copy_to_user -Wl,--wrap=kernel_task_current -Wl,--wrap=kernel_vfs_node_lock -Wl,--wrap=kernel_open_file_get_page -o $@ $(IO_SLEEP_OBJECTS)
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_vfs_node_pread_batch -Wl,--wrap=kernel_vfs_node_writeback -Wl,--wrap=kernel_open_file_sync_range -Wl,--wrap=kernel_open_file_release -Wl,--wrap=riscv_sv39_current_satp -Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_copy_to_user -Wl,--wrap=kernel_task_current -Wl,--wrap=kernel_vfs_node_lock -Wl,--wrap=kernel_open_file_get_page -Wl,--wrap=kernel_page_cache_get_batch -Wl,--wrap=kernel_uaccess_pin_user_page -o $@ $(IO_SLEEP_OBJECTS)
 .PHONY: test-io-sleep-riscv
 test-io-sleep-riscv: $(BUILD_DIR)/tests/kernel-io-sleep-rv build/host/nbd-fault
 	python3 tests/io-sleep-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
@@ -1702,6 +1889,13 @@ test-pid-object-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
 	build/host/pid-object-test
+	@set -e; for shift in 12 14; do \
+	cc -std=c11 -O2 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift \
+		-DBOAROS_COST_DIAGNOSTICS=0 -Itests/host/random -idirafter include \
+		tests/host/pid_allocation.c kernel/pid.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c \
+		-o build/host/pid-allocation-$$shift; \
+		build/host/pid-allocation-$$shift; \
+	done
 
 test-random-host:
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/host/random_vectors.py
@@ -1748,14 +1942,31 @@ test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/sched-bandwidth-riscv.sh
 
 # Cost variants never reuse objects compiled with a different observation flag.
-.PHONY: force-cost-config test-cost-riscv test-cost-host
+.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv test-cost-diagnostic-host test-cost-diagnostic-plugin-host
 force-cost-config:
 $(BUILD_DIR)/generated/cost-config.h: force-cost-config
 	@mkdir -p $(dir $@)
 	@printf '#define BOAROS_COST_DIAGNOSTICS %s\n' '$(COST_DIAGNOSTICS)' > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
 COST_CASE ?= all
-test-cost-host:
+test-cost-match-host:
+	python3 -B tests/test-cost-match-report.py
+	python3 -B tests/test-cost-policy.py
+	python3 -B tests/test-cost-policy-guard.py
+	python3 -B tests/test-cost-measurement.py
+	python3 -B tests/test-cost-match.py
+test-cost-diagnostic-host:
+	python3 -B tests/test-cost-diagnostic.py
+# The optional observer requires QEMU API headers and GLib development files;
+# ordinary host COST/CI gates keep their existing dependency footprint.
+test-cost-diagnostic-plugin-host:
+	@mkdir -p build/cost/diagnostic
+	cc -std=c11 -O2 -ffunction-sections -fdata-sections -Wl,--gc-sections -Wall -Wextra -Werror $$(pkg-config --cflags glib-2.0) tests/cost/diagnostic_plugin_test.c $$(pkg-config --libs glib-2.0) -o build/cost/diagnostic/collector-test
+	build/cost/diagnostic/collector-test
+COST_MATCH_OUTPUT ?= build/cost-match-riscv
+test-cost-match-riscv: test-cost-match-host
+	python3 -B tests/cost-match-riscv.py --output $(COST_MATCH_OUTPUT)
+test-cost-host: test-cost-match-host test-cost-diagnostic-host
 	@mkdir -p build/cost/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
 	build/cost/host/core-test
@@ -1792,6 +2003,7 @@ test-environment-riscv: $(KERNEL_RV)
 
 .PHONY: test-platform-profile-host
 test-platform-profile-host:
+	python3 -B tests/host/qemu_cache.py
 	python3 -B tests/host/platform_memory.py
 
 .PHONY: test-rtc-host
@@ -1862,7 +2074,7 @@ test-tty-host:
 	build/host/tty/endpoints
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
 	build/host/tty/flags
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c -o build/host/tty/group
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c -o build/host/tty/group
 	build/host/tty/group
 
 TTY_PROBE_RV := $(BUILD_DIR)/tests/user/tty-probe-rv
@@ -1929,6 +2141,10 @@ test-writeback-batch-riscv:
 test-readahead-riscv:
 	python3 -B tests/readahead-riscv.py
 
+.PHONY: test-demand-read-riscv
+test-demand-read-riscv:
+	python3 -B tests/demand-read-riscv.py --qemu $(QEMU_RISCV64)
+
 include arch/loongarch/build.mk
 
 .PHONY: test-ci-host
@@ -1993,6 +2209,106 @@ test-sync-host:
 	build/host/sync
 	python3 -B tests/sync/test_native.py
 
+.PHONY: test-mm-pin-host test-memory-object-concurrency-host test-mm-shared-concurrency-host test-file-mapping-concurrency-host
+test-file-mapping-concurrency-host:
+	@mkdir -p build/host/mm
+	@set -e; for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/file_mapping_concurrency.c tests/host/mm/context.c fs/file_mapping.c fs/vfs.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c \
+		-Wl,--gc-sections -o build/host/mm/file-mapping-$$shift; \
+		timeout 30s build/host/mm/file-mapping-$$shift || exit $$?; \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/memory_file_source.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
+		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/file_mapping.c fs/record_lock.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c \
+		-Wl,--gc-sections,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-source-$$shift; \
+		timeout 30s build/host/mm/file-source-$$shift; \
+	done
+test-memory-object-concurrency-host:
+	@mkdir -p build/host/mm
+	@set -e; for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/memory_object_concurrency.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c \
+		-Wl,--gc-sections,--wrap=physical_page_acquire,--wrap=physical_page_allocate,--wrap=physical_page_resolve,--wrap=kernel_heap_allocate_zeroed \
+		-o build/host/mm/object-$$shift; \
+		timeout 30s build/host/mm/object-$$shift; \
+	done
+
+test-mm-pin-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_pin.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections -o build/host/mm/pin
+	build/host/mm/pin
+
+.PHONY: test-mm-concurrency-host
+test-mm-concurrency-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_concurrency.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=physical_page_allocate -o build/host/mm/concurrency
+	timeout 30s build/host/mm/concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections -o build/host/mm/activity
+	timeout 30s build/host/mm/activity
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_zero.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c arch/riscv/sv39.c -Wl,--gc-sections -o build/host/mm/zero
+	timeout 30s build/host/mm/zero
+
+test-mm-shared-concurrency-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_shared.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=kernel_memory_object_prepare_page -o build/host/mm/shared
+	timeout 30s build/host/mm/shared
+
+.PHONY: test-mm-file-concurrency-host
+.PHONY: test-page-cache-concurrency-host
+test-page-cache-concurrency-host:
+	sh tests/page-cache-concurrency-host.sh
+
+test-mm-file-concurrency-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_file.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
+		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/file_mapping.c fs/record_lock.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
+	timeout 30s build/host/mm/file-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_file_single_wait.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
+		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/file_mapping.c fs/record_lock.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_rwlock_read -o build/host/mm/file-single-wait
+	timeout 30s build/host/mm/file-single-wait
+
 .PHONY: test-allocator-concurrency-host
 test-allocator-concurrency-host:
 	@mkdir -p build/host
@@ -2003,9 +2319,9 @@ test-allocator-concurrency-host:
 		build/host/allocator-concurrency-$$shift || exit; \
 	done
 
-$(BUILD_DIR)/sync-%.o: tests/sync/native.c
+$(BUILD_DIR)/sync-%.o: tests/sync/native.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SYNC_CASE=$* -c $< -o $@
 $(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_main -o $@ $(OBJECTS) $(BUILD_DIR)/sync-$*.o
 .PHONY: test-sync-riscv
@@ -2019,14 +2335,25 @@ test-wait-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/runqueue.c -Wl,--wrap=kernel_raw_lock_release -o build/host/wait
 	build/host/wait
 
-$(BUILD_DIR)/wait-native.o: tests/wait/native.c
+$(BUILD_DIR)/wait-native.o: tests/wait/native.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
 .PHONY: test-wait-riscv
 test-wait-riscv: $(BUILD_DIR)/wait-native
 	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+
+$(BUILD_DIR)/sched-lifecycle-native.o: tests/wait/native.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
+$(BUILD_DIR)/sched-lifecycle-native: $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o
+.PHONY: test-sched-lifecycle-riscv
+test-sched-lifecycle-riscv: $(BUILD_DIR)/sched-lifecycle-native
+	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR) --case sched-lifecycle
+-include $(BUILD_DIR)/sched-lifecycle-native.d
+test-riscv: test-sched-lifecycle-riscv
 
 .PHONY: test-sleep-lock-host
 test-sleep-lock-host:
@@ -2036,10 +2363,232 @@ test-sleep-lock-host:
 
 test-riscv: test-wait-riscv
 
+$(BUILD_DIR)/sync-%.d: ;
+-include $(BUILD_DIR)/wait-native.d $(wildcard $(BUILD_DIR)/sync-*.d)
+
+.PHONY: test-files-concurrency-host
+.PHONY: test-file-io-concurrency-host
+test-file-io-concurrency-host:
+	sh tests/file-io-concurrency-host.sh
+
+test-files-concurrency-host:
+	sh tests/files-concurrency-host.sh
+
+.PHONY: test-pipe-concurrency-host
+test-pipe-concurrency-host:
+	sh tests/pipe-concurrency-host.sh
+
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/scheduler-handoff
-	build/host/scheduler-handoff
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
+		build/host/scheduler-handoff-$$shift; \
+	done
+
+.PHONY: test-sched-concurrency-host
+test-sched-concurrency-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire -o build/host/sched-concurrency
+	build/host/sched-concurrency
 
 test-riscv: test-scheduler-handoff-riscv
+
+.PHONY: kernel-rv-smp run-smp-riscv test-smp-host test-smp-riscv
+.PHONY: kernel-rv-user-smp run-user-smp-riscv test-user-smp-host
+kernel-rv-user-smp:
+	$(MAKE) SMP=1 USER_SMP=1 COST_DIAGNOSTICS=0 all
+run-user-smp-riscv: kernel-rv-user-smp
+	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp/kernel-rv
+test-user-smp-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
+	build/host/user-smp
+	python3 -B tests/smp/test_user.py
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_next_owned,--wrap=physical_page_allocate,--wrap=physical_page_resolve -o build/host/mm/remote-user
+	timeout 30s build/host/mm/remote-user
+
+.PHONY: test-user-smp-riscv
+USER_SMP_ELF := build/riscv-user-smp/user-smp-rv
+$(USER_SMP_ELF): tests/userland/user_smp.c tests/userland/user_smp_probe.S build/riscv/musl-root/.shared-built
+	@mkdir -p $(dir $@)
+	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
+USER_SMP_DYNAMIC_ELF := build/riscv-user-smp/user-smp-dynamic-rv
+$(USER_SMP_DYNAMIC_ELF): tests/userland/user_smp.c tests/userland/user_smp_probe.S $(MUSL_LDSO)
+	@mkdir -p $(dir $@)
+	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -DBOAROS_SMP_DYNAMIC=1 -Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 -fPIC -pie -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
+test-user-smp-riscv: $(USER_SMP_ELF) $(USER_SMP_DYNAMIC_ELF) $(PTHREAD_TLS_DSO_RV)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_ELF) $(TEST_MEMORY_ARGS)
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
+.PHONY: test-user-smp-runtime-riscv
+.PHONY: test-user-smp-programs-riscv
+.PHONY: test-user-smp-composition-host test-user-smp-composition-riscv
+COMPOSITION_ELF := build/riscv-user-smp-composition/composition-rv
+$(COMPOSITION_ELF): tests/userland/user_smp_composition.c tests/smp/composition_protocol.h $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp_composition.c
+test-user-smp-composition-host:
+	python3 -B tests/smp/test_composition.py
+test-user-smp-composition-riscv: $(COMPOSITION_ELF) $(SQLITE_ROLLBACK_RV) $(SQLITE_WAL_RV) $(SQLITE_CLI_INIT_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(MUSL_LDSO) test-user-smp-composition-host
+	python3 -B tests/smp/composition.py --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --program $(COMPOSITION_ELF) $(TEST_MEMORY_ARGS)
+test-user-smp-programs-riscv: test-program-inventory-host
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --reuse-builds $(TEST_MEMORY_ARGS)
+test-user-smp-runtime-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO) $(DIFF_ABI_RV)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(DIFF_ABI_RV) --manifest tests/diff-abi/cases.txt $(TEST_MEMORY_ARGS)
+	python3 -B tests/smp/runtime.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(REAL_USERLAND_RV) --pthread-program $(PTHREAD_USERLAND_RV) --tls $(PTHREAD_TLS_DSO_RV) --loader $(MUSL_LDSO) $(TEST_MEMORY_ARGS)
+.PHONY: test-mm-smp-riscv
+test-mm-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm --qemu $(QEMU_RISCV64) \
+		--firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-smp-test/kernel-rv \
+		--output build/riscv-mm-smp-test/runs
+	@set -e; for profile in rfence-error mm-fence-i; do \
+		$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 SMP_TEST_PROFILE=$$profile COST_DIAGNOSTICS=0 all; \
+		python3 -B tests/smp/riscv.py --contract mm --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-smp-test/$$profile/kernel-rv --profile $$profile --output build/riscv-mm-smp-test/runs/$$profile; \
+	done
+QEMU_RISCV_FIRMWARE ?= default
+kernel-rv-smp:
+	$(MAKE) SMP=1 SMP_TEST=0 COST_DIAGNOSTICS=0 all
+run-smp-riscv: kernel-rv-smp
+	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp/kernel-rv
+test-smp-host:
+	python3 -B tests/host/smp_dtb_test.py
+	python3 -B tests/smp/mm_contract_test.py
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/sync -idirafter include tests/host/smp_sched.c kernel/cpu.c kernel/raw_lock.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/smp-sched
+	build/host/smp-sched
+test-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/kernel-rv
+	@set -e; for profile in missing-rfence denied-start guard denied-stop rfence-error; do \
+		$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=$$profile COST_DIAGNOSTICS=0 all; \
+		python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/$$profile/kernel-rv --profile $$profile --output build/riscv-smp/runs/$$profile; \
+	done
+
+.PHONY: test-smp-fpu-setup-riscv
+test-smp-fpu-setup-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 COST_DIAGNOSTICS=0 BUILD_DIR=build/riscv-smp-test/fpu-setup/riscv KERNEL_RV=build/riscv-smp-test/fpu-setup/kernel-rv CFLAGS_EXTRA=-DBOAROS_SMP_FPU_SETUP_TEST=1 all
+	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/fpu-setup/kernel-rv --output build/riscv-smp/runs/fpu-setup --require-fpu-setup
+
+.PHONY: test-smp-userland-riscv
+.PHONY: test-mm-smp-userland-riscv
+test-mm-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-smp-test/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+test-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-smp/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-mm-shared-smp-riscv test-mm-shared-smp-userland-riscv
+test-mm-shared-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm-shared --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-shared-smp-test/kernel-rv --output build/riscv-mm-shared-smp-test/runs
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 SMP_TEST_PROFILE=rfence-error COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm-shared --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-shared-smp-test/rfence-error/kernel-rv --profile rfence-error --output build/riscv-mm-shared-smp-test/runs/rfence-error
+
+test-mm-shared-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-shared-smp-test/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-shared-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+
+.PHONY: test-mm-file-smp-riscv test-mm-file-smp-userland-riscv
+test-mm-file-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm-file --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-file-smp-test/kernel-rv --output build/riscv-mm-file-smp-test/runs
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 SMP_TEST_PROFILE=rfence-error COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm-file --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-file-smp-test/rfence-error/kernel-rv --profile rfence-error --output build/riscv-mm-file-smp-test/runs/rfence-error
+
+test-mm-file-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-file-smp-test/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-file-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-mm-disk-concurrency-host test-mm-disk-smp-riscv test-mm-disk-smp-userland-riscv
+test-mm-disk-concurrency-host:
+	sh tests/mm-disk-concurrency-host.sh
+
+test-mm-disk-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,-e,_start tests/riscv/mm_disk_init.S -o build/riscv-mm-disk-smp-test/init
+	python3 -B tests/smp/riscv.py --contract mm-disk --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-disk-smp-test/kernel-rv --init build/riscv-mm-disk-smp-test/init --output build/riscv-mm-disk-smp-test/runs
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 SMP_TEST_PROFILE=rfence-error COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm-disk --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-disk-smp-test/rfence-error/kernel-rv --init build/riscv-mm-disk-smp-test/init --profile rfence-error --output build/riscv-mm-disk-smp-test/runs/rfence-error
+
+test-mm-disk-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-disk-smp-test/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-disk-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-file-io-smp-riscv test-file-io-smp-userland-riscv
+test-file-io-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 FILE_IO_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,-e,_start tests/riscv/mm_disk_init.S -o $(FILE_IO_SMP_BUILD)/init
+	python3 -B tests/smp/riscv.py --contract file-io --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(FILE_IO_SMP_BUILD)/kernel-rv --init $(FILE_IO_SMP_BUILD)/init --output $(FILE_IO_SMP_BUILD)/runs
+
+test-file-io-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 FILE_IO_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_FILE_IO=1 BOAROS_SMP_FILES=1 BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(abspath $(FILE_IO_SMP_BUILD))/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(abspath $(FILE_IO_SMP_BUILD))/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-files-smp-riscv test-files-smp-userland-riscv
+test-files-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,-e,_start tests/riscv/mm_disk_init.S -o $(FILES_SMP_BUILD)/init
+	python3 -B tests/smp/riscv.py --contract files --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(FILES_SMP_BUILD)/kernel-rv --init $(FILES_SMP_BUILD)/init --output $(FILES_SMP_BUILD)/runs
+
+test-files-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 FILES_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_FILES=1 BOAROS_SMP_DISK=1 BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(abspath $(FILES_SMP_BUILD))/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(abspath $(FILES_SMP_BUILD))/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
+
+.PHONY: test-instruction-sync-host
+test-instruction-sync-host:
+	python3 -B tests/test-instruction-sync.py

@@ -49,7 +49,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     thread = kernel_cpu_current()->current;
     old_tid = thread->tid;
     transaction = thread->exec_transaction;
-    if (thread == &scheduler.idle || thread->arch.user_mode != 1U ||
+    if (thread == kernel_cpu_current()->idle || thread->arch.user_mode != 1U ||
         transaction == 0 ||
         transaction->state != KERNEL_EXEC_TRANSACTION_PREPARED ||
         transaction->retired_mm.state != KERNEL_MM_EMPTY ||
@@ -103,6 +103,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
+#if BOAROS_USER_SMP
+    if (kernel_mm_enable_remote_user_execution(&transaction->image.mm) != KERNEL_MM_STATUS_OK)
+        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+#endif
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     thread->fork_no_exec = 0U;
@@ -111,7 +115,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
      * a non-leader exec adopted the group leader's identity. */
     kernel_futex_release_robust(thread, old_tid);
     kernel_futex_release_mm(thread);
-    if (arch_mmu_switch_context(new_context) != ARCH_MMU_STATUS_OK) {
+    if (kernel_mm_activate(&transaction->image.mm, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     transaction->retired_mm = thread->mm;

@@ -126,6 +126,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
                command == KERNEL_FILES_F_OFD_SETLKW;
     if (!kernel_files_is_live(files) || !mm || !task || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     status = kernel_files_pin_data(files, fd, &file, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || !file) return status;
     access = kernel_copy_from_user(mm, &flock, user_flock,
@@ -153,7 +154,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
         *linux_result = -KERNEL_EBADF;
         goto out;
     }
-    if (!query && flock.type == 1 && (file->open_flags & 3U) == 0U) {
+    if (!query && flock.type == 1 && (kernel_open_file_flags(file) & 3U) == 0U) {
         *linux_result = -KERNEL_EBADF;
         goto out;
     }
@@ -204,7 +205,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
                 result = -KERNEL_ERESTARTSYS;
                 break;
             }
-            if (!kind && kernel_files_lookup_description(files, fd) != file) {
+            if (!kind && !kernel_files_fd_matches(files, fd, file)) {
                 result = -KERNEL_EBADF;
                 break;
             }

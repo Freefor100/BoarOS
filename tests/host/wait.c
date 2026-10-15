@@ -20,6 +20,7 @@ struct kernel_task {
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu cpu;
 static _Thread_local struct kernel_task task;
+static _Thread_local struct kernel_task *selected_task;
 static struct kernel_sched_runqueue runnable;
 static pthread_barrier_t committed, notified;
 static struct kernel_wait_token shared_token;
@@ -30,9 +31,19 @@ static pthread_barrier_t close_entered, close_released;
 static _Thread_local unsigned pause_close;
 static _Thread_local struct kernel_wait_queue *finish_queues;
 static _Thread_local unsigned finish_remaining;
+static _Thread_local int segment_parking;
+static pthread_barrier_t segment_committed, segment_woken;
+static struct kernel_task *segment_tasks;
+static unsigned segment_count, segment_notified;
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
+    if (segment_tasks && guard->lock == &kernel_wait_domain) {
+        unsigned count = 0;
+        for (unsigned i = 0; i < segment_count; i++) count += segment_tasks[i].wait.phase == KERNEL_WAIT_NOTIFIED;
+        assert(count >= segment_notified && count - segment_notified <= 16);
+        segment_notified = count;
+    }
     int pause = pause_close && guard->lock == &kernel_wait_domain && closing.closed;
     if (pause) pause_close = 0;
     if (finish_queues && guard->lock == &kernel_wait_domain) {
@@ -63,18 +74,35 @@ static void barrier(pthread_barrier_t *b)
 { int result = pthread_barrier_wait(b); assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD); }
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *t) { return &t->wait; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *t) { return &t->node; }
-struct kernel_task *kernel_wait_current_task(void) { return &task; }
+struct kernel_task *kernel_wait_current_task(void) { return selected_task ? selected_task : &task; }
 int kernel_wait_backend_initialized(void) { return 1; }
 int kernel_wait_backend_signal(struct kernel_task *t) { (void)t; return 0; }
 uint64_t kernel_wait_backend_time(void) { return 1; }
 void kernel_wait_backend_commit(struct kernel_task *t, uint64_t deadline, int interruptible)
 { (void)deadline; (void)interruptible; assert(!t->blocked); t->blocked = 1; }
 void kernel_wait_backend_notify(struct kernel_task *t, uint32_t reason)
-{ (void)reason; assert(t->blocked == 1); t->blocked = 0; t->completions++; }
+{
+    (void)reason;
+    assert(t->blocked == 1);
+    t->blocked = 0;
+    t->completions++;
+    /* COMMITTED通知与生产backend一样摘除默认登记，next也随之清空。 */
+    kernel_wait_node_remove_locked(&t->node);
+}
 void kernel_wait_backend_ready(struct kernel_task *t)
 { assert(!t->ready_node.queued && !t->wait.on_cpu); kernel_sched_enqueue(&runnable, &t->ready_node, t, 0, 0); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
 {
+    if (segment_parking) {
+        { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); kernel_wait_switch_finish_locked(t); }
+        barrier(&segment_committed);
+        barrier(&segment_woken);
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        assert(t->wait.phase == KERNEL_WAIT_NOTIFIED && t->completions == 1 && t->ready_node.queued);
+        kernel_sched_dequeue(&runnable, &t->ready_node);
+        t->wait.on_cpu = 1;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
     assert(switching && !sync_test_irq && !cpu.raw_locks && !cpu.preempt_depth);
     if (wake_after_switch) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -314,6 +342,129 @@ static void owner_failures(void)
         assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL);
     }
 }
+struct segment_job { struct kernel_wait_queue *queue; unsigned cpu_id; };
+static void *segment_worker(void *argument)
+{
+    struct segment_job *job = argument;
+    struct kernel_wait_queue *queue = job->queue;
+    initialize(job->cpu_id);
+    segment_parking = 1;
+    struct kernel_wait_token token;
+    assert(kernel_wait_prepare(queue, 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+    enum kernel_wait_wake_reason reason;
+    assert(kernel_wait_park(&token, &reason) == KERNEL_SCHEDULER_STATUS_OK && reason == KERNEL_WAIT_WOKEN);
+    assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(!task.node.references && !task.wait.borrows);
+    segment_parking = 0;
+    return 0;
+}
+static void committed_segments(void)
+{
+    for (unsigned count = 2; count <= 4; count *= 2) {
+        struct kernel_wait_queue queue;
+        pthread_t workers[4];
+        struct segment_job jobs[4];
+        kernel_wait_queue_init(&queue);
+        assert(!pthread_barrier_init(&segment_committed, 0, count + 1));
+        assert(!pthread_barrier_init(&segment_woken, 0, count + 1));
+        for (unsigned i = 0; i < count; i++) {
+            jobs[i] = (struct segment_job){&queue, 100 + i};
+            assert(!pthread_create(&workers[i], 0, segment_worker, &jobs[i]));
+        }
+        barrier(&segment_committed);
+        assert(queue.registrations == count);
+        assert(kernel_wait_queue_wake_all(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+        /* 真实backend在notify时摘默认节点；不能在通知后读取被清空的next。 */
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            assert(!queue.registrations && runnable.first && runnable.last);
+        }
+        barrier(&segment_woken);
+        for (unsigned i = 0; i < count; i++) assert(!pthread_join(workers[i], 0));
+        assert(!runnable.first && !runnable.last && !queue.borrows);
+        assert(kernel_wait_queue_close(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+        assert(kernel_wait_queue_destroy(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+        assert(!pthread_barrier_destroy(&segment_committed) && !pthread_barrier_destroy(&segment_woken));
+    }
+}
+
+struct mixed_context {
+    struct kernel_task *actors;
+    struct kernel_wait_queue *queue;
+    struct kernel_wait_node *extra;
+    unsigned before, after, calls, extra_calls;
+};
+static void mixed_callback(struct kernel_wait_node *node, uint32_t reason)
+{
+    struct mixed_context *context = node->context;
+    assert(reason == KERNEL_WAIT_WOKEN && cpu.preempt_depth && !cpu.raw_locks);
+    for (unsigned i = 0; i < context->before; i++) assert(context->actors[i].wait.phase == KERNEL_WAIT_NOTIFIED);
+    for (unsigned i = context->before; i < context->after; i++) assert(context->actors[i].wait.phase == KERNEL_WAIT_PREPARED);
+    /* 回调新增的登记不能越过本次游标sequence；下一次通知才可执行。 */
+    kernel_wait_queue_add(context->queue, context->extra);
+    context->calls++;
+}
+static void appended_callback(struct kernel_wait_node *node, uint32_t reason)
+{
+    struct mixed_context *context = node->context;
+    assert(reason == KERNEL_WAIT_WOKEN && cpu.preempt_depth && !cpu.raw_locks);
+    context->extra_calls++;
+}
+static void task_segments(void)
+{
+    const unsigned counts[] = {2, 8, 16, 17, 33, 64};
+    for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
+        for (unsigned mixed = 0; mixed < 2; mixed++) {
+            unsigned count = counts[c];
+            struct kernel_task actors[65] = {0};
+            struct kernel_wait_token tokens[65] = {0};
+            struct kernel_wait_queue queue;
+            struct kernel_wait_node callback_node, extra_node;
+            struct mixed_context context = {actors, &queue, &extra_node, count / 2, count, 0, 0};
+            kernel_wait_queue_init(&queue);
+            kernel_wait_node_init_callback(&callback_node, mixed_callback, &context);
+            kernel_wait_node_init_callback(&extra_node, appended_callback, &context);
+            for (unsigned i = 0; i < count; i++) {
+                kernel_wait_record_init(&actors[i].wait);
+                actors[i].wait.on_cpu = 1;
+                kernel_wait_node_init(&actors[i].node, &actors[i]);
+                if (mixed && i == count / 2) kernel_wait_queue_add(&queue, &callback_node);
+                selected_task = &actors[i];
+                assert(kernel_wait_prepare(&queue, 0, 0, &tokens[i]) == KERNEL_SCHEDULER_STATUS_OK);
+            }
+            selected_task = 0;
+            segment_tasks = actors;
+            segment_count = count;
+            segment_notified = 0;
+            if (!mixed) {
+                assert(kernel_wait_queue_wake_one(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+                assert(actors[0].wait.phase == KERNEL_WAIT_NOTIFIED);
+                for (unsigned i = 1; i < count; i++) assert(actors[i].wait.phase == KERNEL_WAIT_PREPARED);
+            }
+            assert(kernel_wait_queue_wake_all(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+            segment_tasks = 0;
+            assert(context.calls == mixed);
+            if (mixed) {
+                assert(!context.extra_calls);
+                kernel_wait_queue_remove(&callback_node);
+                assert(kernel_wait_queue_wake_all(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+                assert(context.extra_calls == 1);
+                kernel_wait_queue_remove(&extra_node);
+            }
+            for (unsigned i = 0; i < count; i++) {
+                selected_task = &actors[i];
+                assert(actors[i].wait.phase == KERNEL_WAIT_NOTIFIED);
+                assert(kernel_wait_finish(&tokens[i]) == KERNEL_SCHEDULER_STATUS_OK);
+                assert(!actors[i].wait.borrows && !actors[i].node.references);
+            }
+            selected_task = 0;
+            assert(!queue.registrations && !queue.borrows);
+            assert(kernel_wait_queue_close(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+            assert(kernel_wait_queue_destroy(&queue) == KERNEL_SCHEDULER_STATUS_OK);
+        }
+    }
+}
+
 int main(void)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
@@ -332,5 +483,7 @@ int main(void)
     arbitration(4);
     callback_lifetime();
     close_lifetime();
+    committed_segments();
+    task_segments();
     puts("wait: early wake, 2/4-thread first-winner arbitration, stale tokens, multi-queue, borrowed retired cursors and callback lifetime passed");
 }

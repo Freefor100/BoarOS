@@ -43,15 +43,6 @@ void kernel_cost_syscall(uint64_t number, int64_t fd)
         task->cost.suppress = kernel_files_cost_descriptor(&task->files, fd);
     if (task->cost.suppress) kernel_cost_irq_suppress();
 }
-static int belongs(struct kernel_task *task, uint64_t owner)
-{
-    while (task) {
-        if (process_identity_generation(task) == owner) return 1;
-        struct kernel_task *leader = task->group_leader;
-        task = leader ? leader->parent : task->parent;
-    }
-    return 0;
-}
 int kernel_cost_control(const char *command, size_t size)
 {
     struct kernel_task *task = kernel_cpu_current()->current;
@@ -59,11 +50,23 @@ int kernel_cost_control(const char *command, size_t size)
     uint64_t owner = process_identity_generation(task);
     if (size == 6 && !memcmp(command, "begin\n", 6)) {
         int result = kernel_cost_begin(owner, kernel_cost_timebase(), 0, 1);
-        if (!result) for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next) {
-            if (belongs(t, owner)) kernel_cost_join(&t->cost);
-            else kernel_cost_rebase(&t->cost);
-            if (t->state == KERNEL_THREAD_STATE_BLOCKED) t->cost.blocked_start = kernel_cost_clock();
-            if (t->state == KERNEL_THREAD_STATE_READY) kernel_cost_ready(&t->cost);
+        if (!result) {
+            struct scheduler_task_cursor cursor;
+            scheduler_task_cursor_begin(&cursor);
+            while (cursor.task) {
+                int belongs = scheduler_task_descends_from(cursor.task, 0, owner);
+                {
+                    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+                    struct kernel_task *t = cursor.task;
+                    if (t->accounted) {
+                        if (belongs) kernel_cost_join(&t->cost);
+                        else kernel_cost_rebase(&t->cost);
+                        if (t->state == KERNEL_THREAD_STATE_BLOCKED) t->cost.blocked_start = kernel_cost_clock();
+                        if (t->state == KERNEL_THREAD_STATE_READY) kernel_cost_ready(&t->cost);
+                    }
+                }
+                scheduler_task_cursor_next(&cursor);
+            }
         }
         return result;
     }

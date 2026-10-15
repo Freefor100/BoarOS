@@ -8,7 +8,7 @@ struct batch_disk {
     unsigned writes, reads, batches;
     unsigned fail_at;
     enum kernel_block_status result;
-    uint64_t order[8];
+    uint64_t order[32];
 };
 
 static enum kernel_block_status write_bytes(void *context, uint64_t offset,
@@ -42,7 +42,7 @@ static void test_write_batch(void)
         .capacity_bytes = sizeof(disk.bytes), .logical_block_size = 512,
     };
     const char values[] = "abcdefgh";
-    struct kernel_block_span spans[9] = {
+    struct kernel_block_span spans[33] = {
         {16, values, 3}, {0, values + 3, 2}, {32, values + 5, 3},
     };
     assert(kernel_block_write_batch(0, spans, 3) == KERNEL_BLOCK_STATUS_INVALID);
@@ -50,7 +50,7 @@ static void test_write_batch(void)
     assert(kernel_block_write_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_INVALID);
     device.logical_block_size = 512;
     assert(kernel_block_write_batch(&device, 0, 1) == KERNEL_BLOCK_STATUS_INVALID);
-    assert(kernel_block_write_batch(&device, spans, 9) == KERNEL_BLOCK_STATUS_INVALID);
+    assert(kernel_block_write_batch(&device, spans, 33) == KERNEL_BLOCK_STATUS_INVALID);
     assert(kernel_block_write_batch(&device, 0, 0) == KERNEL_BLOCK_STATUS_OK);
     spans[3] = (struct kernel_block_span){64, 0, 0};
     assert(kernel_block_write_batch(&device, spans + 3, 1) == KERNEL_BLOCK_STATUS_OK);
@@ -110,6 +110,9 @@ static void test_write_batch(void)
     device.write = 0;
     assert(kernel_block_write_batch(&device, spans, 8) == KERNEL_BLOCK_STATUS_OK);
     for (size_t i = 0; i < 8; i++) assert(disk.bytes[i * 8] == (unsigned char)values[i]);
+    for (size_t i = 0; i < 32; i++) spans[i] = (struct kernel_block_span){i * 2, values + i % 8, 1};
+    assert(kernel_block_write_batch(&device, spans, 32) == KERNEL_BLOCK_STATUS_OK);
+    for (size_t i = 0; i < 32; i++) assert(disk.bytes[i * 2] == (unsigned char)values[i % 8]);
     device.write = 0; device.write_batch = 0;
     assert(kernel_block_write_batch(&device, spans, 1) == KERNEL_BLOCK_STATUS_UNSUPPORTED);
 }
@@ -134,7 +137,7 @@ static void test_read_batch(void)
         {.offset = 16, .buffer = output + 16, .size = 8}};
     assert(kernel_block_read_batch(&device, 0, 0) == KERNEL_BLOCK_STATUS_OK);
     assert(kernel_block_read_batch(&device, 0, 1) == KERNEL_BLOCK_STATUS_INVALID);
-    assert(kernel_block_read_batch(&device, spans, 9) == KERNEL_BLOCK_STATUS_INVALID);
+    assert(kernel_block_read_batch(&device, spans, 33) == KERNEL_BLOCK_STATUS_INVALID);
     spans[2].offset = 60;
     assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_OUT_OF_RANGE && !disk.reads);
     spans[2].offset = 16; spans[2].buffer = output + 7;

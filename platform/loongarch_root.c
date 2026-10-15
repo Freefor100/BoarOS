@@ -189,7 +189,8 @@ static void cleanup_worker(void *unused)
             irq=arch_interrupt_save();kernel_scheduler_wait_cleanup(arch_time_read()+la_timer_frequency()/100);arch_interrupt_restore(irq);
             continue;
         }
-        if(status!=KERNEL_SCHEDULER_STATUS_EMPTY && status!=KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) la_virt_fatal("root reaper");
+        if(status!=KERNEL_SCHEDULER_STATUS_EMPTY && status!=KERNEL_SCHEDULER_STATUS_BUSY &&
+           status!=KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) la_virt_fatal("root reaper");
         irq=arch_interrupt_save();kernel_scheduler_wait_cleanup(status==KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP ?
             arch_time_read()+la_timer_frequency()/100 : 0);arch_interrupt_restore(irq);
     }

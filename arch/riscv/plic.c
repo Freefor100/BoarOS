@@ -1,9 +1,18 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/plic.h>
+#include <kernel/cpu.h>
 #include <stddef.h>
 #define PLIC_MAX_SOURCES 1023U
 static int dispatching;
-int riscv_plic_in_interrupt(void) { return dispatching; }
+int riscv_plic_in_interrupt(void)
+{
+#if BOAROS_MAX_CPUS > 1
+    /* 本平台仅CPU0派发设备IRQ；另一核不能借这个本核状态拒绝可睡眠操作。
+     * 短路也避免CPU1读取CPU0独占、非原子的dispatching。 */
+    if (kernel_cpu_current()->logical_id) return 0;
+#endif
+    return dispatching;
+}
 static struct {
     volatile unsigned char *base;
     uint64_t size, enable, claim;

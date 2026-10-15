@@ -1238,3 +1238,106 @@ enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,
     if (status == DTB_STATUS_OK) *info = result;
     return status;
 }
+
+enum dtb_status dtb_read_cpu_info(const void *dtb, uint64_t boot_hart,
+                                struct dtb_cpu_info *info)
+{
+    struct dtb_boot_info validated;
+    if (!info) return DTB_STATUS_INVALID;
+    enum dtb_status status = dtb_read_boot_info(dtb, &validated);
+    if (status != DTB_STATUS_OK) return status;
+
+    struct cpu_node {
+        uint32_t address_cells, seen;
+        const unsigned char *reg;
+        uint32_t reg_length;
+        unsigned enabled, cpus, cpu, cpu_named;
+    } stack[DTB_DISCOVERY_MAX_DEPTH];
+    struct dtb_cpu_info result = {0};
+    const unsigned char *blob = dtb;
+    const unsigned char *structure = blob + read_be32(blob + FDT_HEADER_STRUCT_OFFSET);
+    const unsigned char *strings = blob + read_be32(blob + FDT_HEADER_STRINGS_OFFSET);
+    uint32_t pos = 0, depth = 0, cpus_seen = 0;
+    /* 结构及字符串边界已由boot读取器验证；这里只发布完整CPU快照。 */
+    for (;;) {
+        uint32_t token = read_be32(structure + pos);
+        pos += 4;
+        if (token == FDT_BEGIN_NODE) {
+            uint32_t len = 0;
+            while (structure[pos + len]) len++;
+            if (depth == DTB_DISCOVERY_MAX_DEPTH) return DTB_STATUS_UNSUPPORTED;
+            struct cpu_node *node = &stack[depth];
+            *node = (struct cpu_node){.address_cells = 2,
+                .enabled = depth ? stack[depth - 1].enabled : 1};
+            node->cpus = depth == 1 && bytes_equal_string(structure + pos, len, "cpus");
+            node->cpu_named = depth == 2 && stack[1].cpus && len >= 4 &&
+                structure[pos] == 'c' && structure[pos + 1] == 'p' &&
+                structure[pos + 2] == 'u' && structure[pos + 3] == '@';
+            if (node->cpus && cpus_seen++) return DTB_STATUS_INVALID;
+            pos = (pos + len + 4) & ~3U;
+            depth++;
+        } else if (token == FDT_PROP) {
+            uint32_t len = read_be32(structure + pos);
+            const unsigned char *name = strings + read_be32(structure + pos + 4);
+            const unsigned char *value = structure + pos + 8;
+            uint32_t nl = 0;
+            while (name[nl]) nl++;
+            pos += 8 + ((len + 3) & ~3U);
+            struct cpu_node *node = &stack[depth - 1];
+            unsigned bit = 0;
+            if (bytes_equal_string(name, nl, "#address-cells")) {
+                bit = 1;
+                if (len != 4) return DTB_STATUS_INVALID;
+                node->address_cells = read_be32(value);
+            } else if (bytes_equal_string(name, nl, "status")) {
+                int available;
+                bit = 2;
+                if (!status_is_available(value, len, &available)) return DTB_STATUS_INVALID;
+                node->enabled = available && (depth == 1 || stack[depth - 2].enabled);
+            } else if (depth == 3 && stack[1].cpus &&
+                       bytes_equal_string(name, nl, "device_type")) {
+                bit = 4;
+                if (len != 4 || !bytes_equal_string(value, 3, "cpu"))
+                    return DTB_STATUS_INVALID;
+                node->cpu = 1;
+            } else if (bytes_equal_string(name, nl, "reg")) {
+                bit = 8;
+                node->reg = value;
+                node->reg_length = len;
+            }
+            if (bit && (node->seen & bit)) return DTB_STATUS_INVALID;
+            node->seen |= bit;
+        } else if (token == FDT_END_NODE) {
+            struct cpu_node *node = &stack[depth - 1];
+            if (depth == 3 && stack[1].cpus && node->enabled &&
+                (node->cpu || node->cpu_named)) {
+                uint32_t ac = stack[1].address_cells;
+                if (!node->cpu || !node->reg || !ac || ac > 2 ||
+                    node->reg_length != ac * 4) return DTB_STATUS_INVALID;
+                uint64_t hart = read_cells(node->reg, ac);
+                for (uint32_t i = 0; i < result.count; i++)
+                    if (result.hart_ids[i] == hart) return DTB_STATUS_INVALID;
+                if (result.count == DTB_MAX_CPUS) return DTB_STATUS_UNSUPPORTED;
+                result.hart_ids[result.count++] = hart;
+            }
+            depth--;
+        } else if (token == FDT_END) break;
+    }
+    uint32_t boot = result.count;
+    for (uint32_t i = 0; i < result.count; i++)
+        if (result.hart_ids[i] == boot_hart) boot = i;
+    if (boot == result.count) return DTB_STATUS_NOT_FOUND;
+    result.hart_ids[boot] = result.hart_ids[0];
+    result.hart_ids[0] = boot_hart;
+    for (uint32_t i = 2; i < result.count; i++) {
+        uint64_t hart = result.hart_ids[i];
+        uint32_t j = i;
+        while (j > 1 && result.hart_ids[j - 1] > hart) {
+            result.hart_ids[j] = result.hart_ids[j - 1];
+            j--;
+        }
+        result.hart_ids[j] = hart;
+    }
+    *info = result;
+    return DTB_STATUS_OK;
+}

@@ -11,6 +11,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+static void lookup_end(struct kernel_task **task)
+{ if (*task) kernel_task_lookup_put(*task); }
+
 #define LINUX_CLONE_SIGNAL_MASK UINT64_C(0xff)
 #define LINUX_SIGCHLD UINT64_C(17)
 #define LINUX_CLONE_VM UINT64_C(0x100)
@@ -53,6 +56,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     target = pid == 0 ? caller :
              pid > 0 && pid <= INT32_MAX
                  ? kernel_signal_find_by_tid((kernel_pid_t)pid) : 0;
+    struct kernel_task *lookup __attribute__((cleanup(lookup_end))) = pid > 0 ? target : 0;
     if (target == 0) {
         decoded->value = -KERNEL_ESRCH;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -66,8 +70,12 @@ enum kernel_syscall_status syscall_handle_prlimit64(
         decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (kernel_task_get_rlimit(target, resource, &before) !=
-        KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    enum kernel_task_status task_status = kernel_task_get_rlimit(target, resource, &before);
+    if (task_status == KERNEL_TASK_STATUS_STATE) {
+        decoded->value = -KERNEL_ESRCH;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if (new_address != 0U) {
         uint64_t capacity = resource == KERNEL_RLIMIT_NOFILE
                                 ? KERNEL_RLIMIT_NOFILE_CAP
@@ -82,8 +90,12 @@ enum kernel_syscall_status syscall_handle_prlimit64(
             decoded->value = -KERNEL_EPERM;
             return KERNEL_SYSCALL_STATUS_OK;
         }
-        if (kernel_task_set_rlimit(target, resource, &replacement) !=
-            KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        task_status = kernel_task_set_rlimit(target, resource, &replacement);
+        if (task_status == KERNEL_TASK_STATUS_STATE) {
+            decoded->value = -KERNEL_ESRCH;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (task_status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     if (old_address != 0U) {
         copied = 0U;
@@ -147,6 +159,7 @@ enum kernel_syscall_status syscall_handle_get_robust_list(
     enum kernel_uaccess_status access;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    struct kernel_task *lookup __attribute__((cleanup(lookup_end))) = pid > 0 ? target : 0;
     if (target == 0) {
         decoded->value = -KERNEL_ESRCH;
         return KERNEL_SYSCALL_STATUS_OK;

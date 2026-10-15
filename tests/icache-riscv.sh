@@ -12,13 +12,7 @@ has_fence_i()
 {
     object=$1
     symbol=$2
-    "$objdump" -d "$object" |
-        awk -v symbol="$symbol" '
-            $0 ~ "<" symbol ">:" { in_symbol = 1; next }
-            in_symbol && /^Disassembly of section / { exit }
-            in_symbol && /fence\.i/ { found = 1 }
-            END { exit found ? 0 : 1 }
-        '
+    python3 -B "$project_root/tests/instruction-sync.py" "$objdump" "$object" "$symbol"
 }
 
 for object in "$mm_object" "$elf_object" "$sv39_object"; do

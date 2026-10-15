@@ -46,7 +46,7 @@ int main(int argc,char **argv)
     for(unsigned i=0;i<8;i++)spans[i]=(struct ext4_file_read_span){i*4096,out[i],4096,0,0};
     clear(&dev);CHECK(read_batch(&file,spans,8)==EOK);
     printf("file batch blocksize=%u width=%u batches=%u\n",dev.lg_bsize,width,batches);
-    CHECK(width== (dev.lg_bsize>4096 ? 32768/dev.lg_bsize:8));
+    CHECK(width==8);
     for(unsigned i=0;i<8;i++){CHECK(!spans[i].error && spans[i].completed==4096);for(unsigned j=0;j<4096;j++)CHECK(out[i][j]==expected(i*4096+j));}
     /* Mixed holes, EOF and unaligned fragments preserve independent results. */
     const uint64_t offsets[8]={32761,32768,40000,49150,65530,65536+123,4093,131072};
@@ -59,11 +59,28 @@ int main(int argc,char **argv)
         for(unsigned j=0;j<n;j++)CHECK(out[i][j]==expected(offsets[i]+j));
         for(unsigned j=n;j<4096;j++)CHECK(out[i][j]==0xcd);
     }
+    /* One output buffer still batches the disk fragments on both sides of a
+     * sparse range; output count does not limit device request width. */
+    clear(&dev);memset(out,0xcd,sizeof(out));
+    spans[0]=(struct ext4_file_read_span){7*4096,out,6*4096,0,0};
+    CHECK(read_batch(&file,spans,1)==EOK);
+    CHECK(!spans[0].error && spans[0].completed==6*4096);
+    printf("scalar sparse read blocksize=%u width=%u batches=%u\n",dev.lg_bsize,width,batches);
+    CHECK(width==2 && batches==1);
+    for(unsigned i=0;i<6*4096;i++)CHECK(((unsigned char *)out)[i]==expected(7*4096+i));
     /* One physical failure leaves other spans valid, including a successful prefix. */
-    clear(&dev);struct ext4_inode_ref ref;ext4_fsblk_t home;
+    clear(&dev);struct ext4_inode_ref ref;ext4_fsblk_t home,tail;
     CHECK(ext4_fs_get_inode_ref(dev.fs,file.inode,&ref)==EOK);
     CHECK(ext4_fs_get_inode_dblk_idx(&ref,1,&home,true)==EOK && home);
-    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);fail_sector=home*(dev.lg_bsize/512);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,12*4096/dev.lg_bsize,&tail,true)==EOK && tail);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    fail_sector=tail*(dev.lg_bsize/512);
+    spans[0]=(struct ext4_file_read_span){7*4096,out,6*4096,0,0};
+    CHECK(read_batch(&file,spans,1)==EIO && spans[0].error==EIO && spans[0].completed==5*4096);
+    CHECK(width==2 && batches==1);
+    for(unsigned i=0;i<5*4096;i++)CHECK(((unsigned char *)out)[i]==expected(7*4096+i));
+    fail_sector=UINT64_MAX;CHECK(read_batch(&file,spans,1)==EOK && spans[0].completed==6*4096);
+    clear(&dev);fail_sector=home*(dev.lg_bsize/512);
     spans[0]=(struct ext4_file_read_span){dev.lg_bsize-17,out[0],4096,0,0};
     spans[1]=(struct ext4_file_read_span){16384,out[1],4096,0,0};
     CHECK(read_batch(&file,spans,2)==EIO);

@@ -10,6 +10,12 @@ struct kernel_tty *kernel_task_controlling_tty(const struct kernel_task *task);
 int kernel_task_tty_set(struct kernel_task *task, struct kernel_tty *tty);
 void kernel_task_tty_clear(struct kernel_task *task);
 void kernel_task_tty_clear_session(struct kernel_tty *tty, struct kernel_pid *session);
+/* Returns an identity owner under the scheduler domain, not a bare role link. */
+void kernel_task_identity_put(struct kernel_pid *);
+static inline void kernel_task_identity_end(struct kernel_pid **identity)
+{ if (*identity) kernel_task_identity_put(*identity); }
+int kernel_task_tty_identity_matches(const struct kernel_task *, enum kernel_pid_role,
+                                     const struct kernel_pid *);
 struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *task,
                                             enum kernel_pid_role role);
 int kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number,

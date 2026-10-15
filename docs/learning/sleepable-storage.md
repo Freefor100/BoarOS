@@ -8,7 +8,7 @@
 - `references/linux/drivers/block/virtio_blk.c`、`fs/read_write.c`、`fs/file.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：FLUSH 缺失时的 write-through、定位/共享 offset 接口参考。
 - `references/riscv/riscv-privileged-20260120.pdf`，版本 20260120，SHA-256 `d0f818af6fa519d39e68f822aa795bff9f38032a2f352afdf43e91c0d480e408`：supervisor external interrupt 与本地地址空间契约。来源固定于 `references/sources.tsv`。
 
-本文前半记录 2026-09-28 单 hart 可睡眠 I/O 阶段；后台写回和多磁盘随后已交付，当前契约见 [VFS/ext4](../modules/vfs-ext4.md)。范围仍限 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、同实例并发写事务和事务合并尚未实现。
+本文前半记录 2026-09-28 单 hart 可睡眠 I/O 阶段；后台写回和多磁盘随后已交付，当前契约见 [VFS/ext4](../modules/vfs-ext4.md)。范围仍限 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、同实例并发私有写事务尚未实现；组提交与当前文件版本、SG、写回结构见上述模块。
 
 ## 所有权与失败路径
 
@@ -16,7 +16,7 @@
 
 VirtIO 使用最多 32 描述符、8 个在途槽。准备不发布 DMA；提交后槽的任务 owner、header/status、bounce 与描述符一直保留至确认完成。IRQ 只收割/ack/唤醒；队列满则等待。flush 阻止新提交、排空此前请求，再完成设备或软件屏障。timeout 先禁止提交并 reset，确认停止 DMA 后一次性完成失败请求；设备保持失败态。当前请求期限为30秒；超时不是应用执行预算。QEMU的FLUSH会同步宿主后备文件，包括启动前宿主复制留下的脏页，不能用一秒期限或预同步镜像冒充可靠性。统计的 max_inflight 计已发布且未确认完成的请求，不计仅预留槽。
 
-缓存同页 miss 合并为一个 loader，不同页并发；写回固定页快照和 dirty generation。writeback 选页数组在首次睡眠前逐项 pin，之后只释放原集合。inode 写锁排除 truncate/失效/orphan 最后 close 与 loading/writeback。用户复制在存储锁外；文件/ELF 缺页先 pin source 和 VMA generation，I/O 返回后验证版本与同地址 PTE，再发布。另一任务先完成同页缺页可满足本次请求。
+缓存同页 miss 合并为一个 loader，不同页并发；写回固定页快照和 dirty generation。writeback 选页数组在首次睡眠前逐项 pin，之后只释放原集合。inode 写锁排除 truncate/失效/orphan 最后 close 与 loading/writeback。用户来源的缺页解析和 pin 在 inode 数据锁及目标写借用之外，取得实际来源后直接填入最终文件页；文件/ELF 缺页先 pin source 和 VMA generation，I/O 返回后验证版本与同地址 PTE，再发布。另一任务先完成同页缺页可满足本次请求。
 
 lwext4 纯读使用局部游标 `ext4_fpread`；同块缓存 loading 合并，不同块可同时等待。事务记录任务 owner，只有同 owner 可嵌套；orphan、journal 生命周期、恢复和卸载也持独占 gate。持锁、堆与 MM 元数据分配只回收干净页；正常干净回收立即释放最后 node（`ext4_fclose` 仅清理内存）；只有未完成 orphan/真实失败保留 mount owner。脏回收在外层无锁处执行，真实耗尽返回 ENOMEM。
 
@@ -78,7 +78,7 @@ PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁
 
 `tests/multi-disk-io-riscv.py --rt-load` 是独立的无故障组合模式，不替代原暂扣 B、错误隔离与断电恢复矩阵。用户程序逐轮创建 FIFO、RR 的持续可运行子任务，明确设置默认 950000/1000000 微秒全局预算；子任务在循环中不 yield、不 sleep，普通父任务的计算和双盘 I/O 因而依赖普通类获得预算余量。
 
-每轮 host 在放行父任务前让两台 NBD 进入 hold。检测到每台盘的真实 READ 后立即 drain，不用固定主机 sleep 消耗设备超时；读回内容由 guest 验证。只有普通父任务确认两盘同步写入/读回、host 同时观察两盘成功 WRITE/FLUSH 后，才允许父任务停止 RT 子任务。随后验证 wait 回收、动态盘卸载、根退出的堆/页/任务栈基线；QEMU 退出后独立 dump 两盘检查字节，并运行 `e2fsck -fn`。这证明组合进展和资源回收，不把 QEMU 墙钟作为实时延迟保证，也不宣称两盘请求必定同时在途。
+每轮 host 在放行父任务前让两台 NBD 进入 hold。检测到每台盘的真实 READ 后立即 drain，不用固定主机 sleep 消耗设备超时；读回内容由 guest 验证。drain提交至其ACK之间，全部暂扣响应由该操作释放，不能再逐项release；两盘ACK均从各自FIFO管道读到后，才能结束当前轮并重置下一轮归属。2026-10-13定时CI的EIO由重复release使严格NBD后端断链引起，真实NBD排列及跨轮ACK反例已保护此边界。只有普通父任务确认两盘同步写入/读回、host 同时观察两盘成功 WRITE/FLUSH 后，才允许父任务停止 RT 子任务。随后验证 wait 回收、动态盘卸载、根退出的堆/页/任务栈基线；QEMU 退出后独立 dump 两盘检查字节，并运行 `e2fsck -fn`。这证明组合进展和资源回收，不把 QEMU 墙钟作为实时延迟保证，也不宣称两盘请求必定同时在途。
 
 固定 musl 1.2.5 的 `src/sched/sched_setscheduler.c` 包装器直接返回 ENOSYS；出处为 `references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。该验收程序明确使用 `syscall(SYS_sched_setscheduler, ...)` 进入内核，避免将 libc 包装器存根误判为内核调度失败。NBD 的普通 event 日志只记录 WRITE/FLUSH，READ 的实际请求由既有 hold/drain 协议证明。
 
@@ -177,3 +177,55 @@ python3 -B tests/host/virtio_block_diagnostics.py pre-park
 make test-virtio-block-host test-wait-host test-io-sleep-riscv
 make test-block-loongarch test-root-io-loongarch test-pci-reset-owner-loongarch INIT_CONFIG=config/init.json
 ```
+
+## 受控磁盘映射的I/O与页写入交接
+
+`kernel_page_cache_init_controlled()` 使用无压力hook的独立 arena。缓存加载资格仍由
+CPU0取得；远端排队的请求不先建立loading项，否则CPU0文件写入可能持inode锁等
+loading，而请求执行者正等同一inode锁。CPU0先取得inode保护，再查缓存并发布
+loading；远端命中在索引保护内借用entry，锁外取得物理引用后归还存储借用。
+请求节点驻留调用者等待现场，完成前不能退栈。停止取消未执行请求，并等待真实
+在途读取返回，不能用取消通知代替后端完成。
+
+本地 `make test-page-cache-concurrency-host` 使用真实VFS/lwext4、镜像块I/O与生产
+park，在4/16 KiB、2/4线程下核对同页唯一加载、64页索引扩容、失败合并、命中
+不分配/读盘/排队、请求停止与1/8/32别名借用。`test-mm-disk-concurrency-host`
+再链接真实Sv39/OFD/MM，覆盖来源过期、COW/OOM/fixed替换、实际尺寸失败与最后owner。
+宿主文件/MM模型与客户机MTTCG、RFENCE及独立重启证据分列，后者见[两核模块](../modules/riscv-smp.md)。
+
+写入许可不是整MM的copy开关。每个缓存entry用一个原子字表达关闭和在途写入数，
+可写pin还持entry借用。快照先关闭目标页、锁外回调撤W并确认RFENCE，再排空旧pin、
+复制原脏范围，随即开放写入；inode读保护覆盖后端提交，generation保护旧完成不清新脏。
+后台worker不能等待一个可能正排队冷读的MM gate或pin：遇忙时保留脏页并延期，
+实际gate释放或pin归还通知后再推进，复用现有worker而不增加轮询/线程。
+前台快照也是一个进展owner：强制后台轮次可能在其I/O期间跳过该页，之后必须由
+成功完成者为仍脏的新代次重新发布work。独立审查用真实ext4复现了缺失通知，
+永久1/8/32别名反例通过已完成后台轮次的值快照确认请求已消费，再核对后端读回和资源归还。
+
+两个强制交错说明许可与寿命必须分别处理：fault成功到pin之间快照可再次撤W，
+uaccess须重查而不能把合法临时撤权误报FAULT；真正VMA降权/EOF仍结束复制。
+截断成功后整页可退出索引，但已在排空旧pin的快照仍持有entry；其完成只归还owner，
+不再把旧内容提交到重新增长的文件。后端actual/changed明确后重新取得inode写保护，
+把尾零、缓存退休与尺寸发布连在同一保护内，防止新冷加载越过收敛过程。
+对应反例验证复制前缀、页/堆归还、真实镜像读回，未删除错误状态或损坏校验。
+
+客户机fixture曾在cleanup线程的IRQ-off忙yield中等待尚未完成的setup I/O；只剩自身
+runnable时不会进入idle，设备IRQ得不到处理。GDB确认setup阻塞在真实块请求，而
+收口线程持续运行。交接期间启用IRQ、返回恢复原状态，立即退出的PID1覆盖这一边界；
+未放宽五秒握手或180秒启动预算。一次早期16KiB宿主超时缺少完整现场，原因仍未确认，
+后续通过不替它完成归因。
+
+2026-10-13共享FD/pipe组合的host总门禁另有一次`test-page-cache-concurrency-host`的30秒超时，最后可证实阶段为2线程真实冷读通过，尚未完成4线程阶段。该目标不链接FD/pipe实现；独立窄复核及原host总门禁完整复核随后通过，首轮原因仍未确认，原失败日志保留。这个结果不关闭此前16KiB宿主MM超时，也不以干净重跑补记原失败通过。 普通文件交接验证又出现16KiB缓存目标开始后的超时，以及4KiB磁盘MM目标在2线程冷读通过后的超时；均未取得失败时线程栈。独立GDB运行和最终两目标通过只增加成功证据，未完成这两次归因。
+
+本节记录当时RA0/WB1、COST OFF的产物尺寸：entry216字节（256字节slab），
+record728字节（原受控版本672字节，均为1024字节slab；最初普通版本480字节），
+alias64、resident128（仍128字节slab）、pin88、MM记录584（仍一页）、执行请求96字节、冷读参数48字节栈现场。
+inode440及ext4包装的512字节slab保持。SMP任务2784字节，仍一页metadata；CPU1968字节。
+受控文件的冷写当前先读入再复制，普通CPU0缓存保留整页覆盖不读旧数据的路径。
+这是实际成本边界；没有每页mutex、每请求堆对象或新worker，不据结构/正确性计数宣称加速。
+常规OFF启动记录构造、业务、收尾tick与独立worker工作量，不作短窗口性能比较。
+
+固定语义依据为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
+`mm/filemap.c`的fault/page_mkwrite、`mm/rmap.c`的写权限回收、`mm/truncate.c`的
+截断与驻留页关系。BoarOS使用自己的gate/代次/entry借用协议；固定源码提供行为依据，
+不把Linux锁实现直接套成BoarOS所有权。实际后端为仓库固定lwext4；本节测试使用当时的RA0/WB1配置，当前参数与版本交接见[VFS/ext4](../modules/vfs-ext4.md#当前成本边界)。

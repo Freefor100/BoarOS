@@ -26,6 +26,43 @@ DEFAULT_ENV = {'PATH': '/bin:/usr/bin:/', 'LC_ALL': 'C',
                'LD_LIBRARY_PATH': '/lib:/', 'TMPDIR': '/tmp', 'TERM': 'linux'}
 
 
+def execution_configuration(name, arch, cpus, firmware):
+    if name not in ('single', 'rv-user-smp') or cpus not in (1, 2):
+        raise ValueError('unknown execution profile or CPU count')
+    if name == 'single' and cpus != 1:
+        raise ValueError('single execution profile requires one CPU')
+    if name == 'rv-user-smp' and (arch != 'riscv' or firmware == 'default'):
+        raise ValueError('RV user SMP requires RISC-V and an explicit firmware file')
+    return {'name': name, 'cpus': cpus, 'firmware': str(firmware)}
+
+
+def execution_command(command, configuration):
+    result = list(command)
+    if configuration['name'] == 'rv-user-smp':
+        result[result.index('-smp') + 1] = str(configuration['cpus'])
+        result[result.index('-bios') + 1] = configuration['firmware']
+        result += ['-accel', 'tcg,thread=multi', '-name', 'boaros-smp,debug-threads=on']
+    elif '-bios' in result:
+        result[result.index('-bios') + 1] = configuration['firmware']
+    return result
+
+
+def validate_execution_inputs(name, kernel, linux_configuration):
+    if name == 'single':
+        return
+    if linux_configuration is None:
+        raise ValueError('SMP reference configuration required')
+    config = Path(linux_configuration).read_text().splitlines()
+    if 'CONFIG_SMP=y' not in config or 'CONFIG_NR_CPUS=2' not in config:
+        raise ValueError('SMP reference configuration mismatch')
+    data = Path(kernel).read_bytes()
+    # 构建前筛掉普通核；实际拓扑/业务域/回收还须由每次启动记录验证。
+    if (data[:6] != b'\x7fELF\x02\x01' or len(data) < 20 or
+            int.from_bytes(data[18:20], 'little') != 243 or
+            b'BoarOS: USER SMP hart=' not in data):
+        raise ValueError('expected a RISC-V user SMP kernel')
+
+
 def reference_environment_ready(observation):
     mounts = {'proc', 'sysfs', 'shm', 'mqueue', 'devpts'}
     for name in mounts | {'shm-dir', 'mqueue-dir', 'pts-dir', 'lo'}:
@@ -184,11 +221,11 @@ def guest_path(tree, value):
     return destination
 
 
-def logged(argv, log, timeout=300):
+def logged(argv, log, timeout=300, env=None):
     with Path(log).open('wb') as output:
         try:
             result = subprocess.run(list(map(str, argv)), stdin=subprocess.DEVNULL,
-                                    stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
+                                    stdout=output, stderr=subprocess.STDOUT, timeout=timeout, env=env)
             return result.returncode
         except subprocess.TimeoutExpired:
             return 'timeout'
@@ -338,7 +375,8 @@ def prune_pass_images(directory, result, *, dry_run=False):
 def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
               case_ids=None, resume=True, default_timeout=10, boot_timeout=15,
               qemu='qemu-system-riscv64', output_validator=None,
-              keep_pass_images=True, platform_config='fixture',arch='riscv',memory=None):
+              keep_pass_images=True, platform_config='fixture',arch='riscv',memory=None,
+              execution_profile='single',cpus=1,firmware='default',linux_configuration=None):
     """Run all selected cases serially; persist each result before continuing.
 
     A driver or guest failure affects its case only. No result is called pass
@@ -347,6 +385,8 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
     same invocation to resume, or set case_ids to select independent cases.
     """
     profile=PROFILES[arch]
+    execution = execution_configuration(execution_profile, arch, cpus, firmware)
+    validate_execution_inputs(execution_profile, boaros_kernel, linux_configuration)
     memory=memory or ('1G' if platform_config=='official' else '512M')
     if platform_config not in ('fixture','official'):raise ValueError('unknown platform configuration')
     manifest = json.loads(Path(manifest).read_text()) if not isinstance(manifest, dict) else manifest
@@ -366,7 +406,13 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                 'runner_sha256': digest(__file__),
                 'kernels': {name: {'path': str(path), 'sha256': digest(path)} for name, path in kernels.items()},
                 'default_timeout': default_timeout, 'boot_timeout': boot_timeout,
-                'arch':arch,'qemu': str(qemu), 'memory': memory, 'smp': 1}
+                'arch':arch,'qemu': str(qemu), 'memory': memory, 'smp': cpus,
+                'execution': execution}
+    if firmware != 'default':
+        identity['firmware_sha256'] = digest(firmware)
+    if execution_profile == 'rv-user-smp':
+        identity['linux_configuration_sha256'] = digest(linux_configuration)
+        identity['execution_runner_sha256'] = digest(ROOT/'tests/smp/qemu.py')
     identity['tools'] = {}
     for tool, flag in ((qemu, '--version'), ('mkfs.ext4', '-V'), ('debugfs', '-V')):
         executable = shutil.which(str(tool))
@@ -455,9 +501,23 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                     argv+=['-device',('virtio-net-pci,netdev=net,addr=5,disable-legacy=on' if arch=='loongarch' else 'virtio-net-device,netdev=net'),'-netdev','user,id=net','-rtc','base=utc']
                 if name == 'linux':
                     argv += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
+                argv = execution_command(argv, execution)
                 log = directory / (name + '.log')
+                launch_log = log
                 begun = time.monotonic()
-                code = logged(argv, log, timeout + boot_timeout)
+                launch = argv
+                environment = None
+                if execution_profile == 'rv-user-smp':
+                    launch = [sys.executable, str(ROOT/'tests/smp/qemu.py'), *argv[1:]]
+                    # qemu wrapper唯一加入MTTCG选项；避免重复-accel。
+                    at = launch.index('-accel'); del launch[at:at+4]
+                    environment = dict(os.environ, BOAROS_USER_SMP='1', BOAROS_SMP_QEMU=str(qemu),
+                        BOAROS_SMP_CPUS=str(cpus), BOAROS_SMP_FIRMWARE=str(firmware),
+                        BOAROS_SMP_OUTPUT=str(directory), BOAROS_SMP_TIMEOUT=str(min(180,timeout+boot_timeout)))
+                    launch_log = directory/(name+'-launcher.log')
+                code = logged(launch, launch_log, min(180, timeout + boot_timeout) + (5 if environment else 0), environment)
+                if not log.exists():
+                    shutil.copyfile(launch_log,log)
                 raw = log.read_text(errors='replace').replace('\r\n', '\n')
                 observed = parse_observation(raw, case_id)
                 observed['guest_status'] = 'complete'
@@ -469,6 +529,18 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                     observed['guest_status'] = 'guest-incomplete'
                 elif name == 'linux' and not reference_environment_ready(observed):
                     observed['guest_status'] = 'reference-environment-error'
+                if execution_profile == 'rv-user-smp':
+                    execution_record = directory/(name+'.json')
+                    if execution_record.exists():
+                        observed['execution'] = json.loads(execution_record.read_text())
+                        if observed['execution']['timeout']:observed['guest_status']='timeout'
+                    if name == 'boaros' and code == 0:
+                        sys.path.insert(0, str(ROOT/'tests/smp'))
+                        from user import validate_execution
+                        try:
+                            validate_execution(raw, cpus, True)
+                        except RuntimeError as error:
+                            observed.update(guest_status='guest-incomplete', execution_error=str(error))
                 for channel in ('stdout', 'stderr'):
                     (directory / (name + '.' + channel)).write_bytes(bytes.fromhex(observed[channel + '_hex']))
                 if case.get('output_contract'):

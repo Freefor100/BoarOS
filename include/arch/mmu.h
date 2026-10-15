@@ -1,9 +1,12 @@
 #ifndef BOAROS_ARCH_MMU_H
 #define BOAROS_ARCH_MMU_H
+#include <kernel/page.h>
 #if defined(BOAROS_ARCH_LOONGARCH)
 #include <arch/loongarch/mmu.h>
 #else
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/mmu_context.h>
+#include <arch/riscv/smp.h>
 #define ARCH_MMU_STATE_ACTIVE RISCV_SV39_STATE_ACTIVE
 #define arch_mmu_page_table riscv_sv39_page_table
 #define arch_mmu_user_space_init riscv_sv39_user_space_init
@@ -12,6 +15,8 @@
 #define arch_mmu_kernel_window_active riscv_sv39_kernel_window_active
 #define arch_mmu_kernel_window_map riscv_sv39_kernel_window_map
 #define arch_mmu_kernel_window_unmap riscv_sv39_kernel_window_unmap
+#define arch_mmu_kernel_window_map_pages riscv_sv39_kernel_window_map_pages
+#define arch_mmu_kernel_window_unmap_pages riscv_sv39_kernel_window_unmap_pages
 #define arch_mmu_current_context riscv_sv39_current_satp
 #define arch_mmu_mapping riscv_sv39_mapping
 #define arch_mmu_status riscv_sv39_status
@@ -29,6 +34,14 @@
 #define arch_mmu_user_space_fork riscv_sv39_user_space_fork
 #define arch_mmu_user_space_move riscv_sv39_user_space_move
 #define arch_mmu_user_unmap_owned_range riscv_sv39_user_unmap_owned_range
+#define arch_mmu_user_detach_page riscv_sv39_user_detach_page
+#define arch_mmu_user_leaf_missing riscv_sv39_user_leaf_missing
+#define arch_mmu_user_map_prepared_page riscv_sv39_user_map_prepared_page
+#define arch_mmu_user_cow_snapshot riscv_sv39_user_cow_snapshot
+#define arch_mmu_user_cow_commit riscv_sv39_user_cow_commit
+#define arch_mmu_user_next_owned riscv_sv39_user_next_owned
+#define arch_mmu_user_mark_cow_page riscv_sv39_user_mark_cow_page
+#define arch_mmu_user_space_fork_prepare riscv_sv39_user_space_fork_prepare
 #define ARCH_MMU_EXECUTE RISCV_SV39_EXECUTE
 #define ARCH_MMU_PAGE_SIZE RISCV_SV39_PAGE_SIZE_4K
 #define ARCH_MMU_READ RISCV_SV39_READ
@@ -44,8 +57,21 @@
 #define ARCH_MMU_USER_SPACE_LIVE RISCV_SV39_USER_SPACE_LIVE
 #define ARCH_MMU_WRITE RISCV_SV39_WRITE
 static inline void arch_mmu_sync_instructions(void)
-{ __asm__ volatile("fence.i" ::: "memory"); }
+{ riscv_mmu_sync_instructions(); }
 static inline void arch_mmu_flush_address(uint64_t address)
-{ __asm__ volatile("sfence.vma %0, zero" :: "r"(address) : "memory"); }
+{ riscv_mmu_flush_address(address); }
+static inline void arch_mmu_flush_all(void) { riscv_mmu_flush_all(); }
+static inline void arch_mmu_sync_user(uint32_t targets, uint64_t address,
+    uint64_t size, int instructions)
+{
+#if BOAROS_MAX_CPUS > 1
+    riscv_smp_sync_user(targets, address, size, instructions);
+#else
+    if (targets & ~UINT32_C(1)) __builtin_trap();
+    if (size == BOAROS_PAGE_SIZE) riscv_mmu_flush_address(address);
+    else riscv_mmu_flush_all();
+    if (instructions) riscv_mmu_sync_instructions();
+#endif
+}
 #endif
 #endif

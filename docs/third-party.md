@@ -20,14 +20,15 @@
 - 固定版本：`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`
 - 导入路径：`third_party/lwext4/`
 - GDT/inode 与 orphan 的 CRC 计算通过只读归一化原语跳过 checksum 字段，不再
-  临时改写输入；`make test-lwext4-checksum-host` 保护并发读者、只读输入与格式边界。
+  临时改写输入；CRC32C 使用 4 KiB 只读 slicing-by-4 表，保留种子、分段更新和校验语义。
+  `make test-lwext4-checksum-host` 保护并发读者、只读输入、CRC 参考与格式边界。
   固定来源和反例见[时间戳背景](learning/file-timestamps.md#共享读取中的-checksum-计算2026-10-08)。
 - 导入内容：`include/`、`src/`、`LICENSE`、`README.md`、`CHANGELOG`
 - 许可证：`src/ext4_extent.c` 和 `src/ext4_xattr.c` 为 GPL-2.0-or-later，其余导入源码为 BSD-3-Clause；上游说明组合后的库受 GPLv2 约束。
 - 用途：在 BoarOS 自有 VFS 与块设备接口之后提供 ext2/3/4 磁盘格式实现。
-- 本地修改：初始导入提交不修改上游源码；后续补全现代 superblock 中 `s_checksum_seed` 等字段的磁盘布局，识别 `metadata_csum_seed`，并让 bitmap、group descriptor、inode、directory、extent 与 xattr 的 metadata checksum 使用规范选择的种子；目录适配另加 `ext4_dir_entry_next_status()` 和原始记录推进入口，以区分 EOF、inode-zero 尾记录与块/格式错误。文件适配允许在按 inode extent/legacy mapping 计算的 maxbytes 内 seek 到 EOF 之后、精确分配逻辑块、对 hole 合成零，并以 sparse 方式执行写入和向上截断；legacy maxbytes 取间接指针树、`ext4_lblk_t`/哨兵及 inode 块计数容量的交集，不让大块文件系统的 64-bit offset 缩窄回绕到低逻辑块。新块初始化失败撤销 exact mapping，unwritten conversion 与 caller data 共享缓存路径。时间戳适配新增 mount 可选 realtime callback 和 live-inode touch，支持受 inode_size/extra_isize 约束的 signed epoch/纳秒编码、relatime、创建与父目录修改；即时 block-cache flush 传播 errno，失败缓冲由 mount 保留 dirty owner；文件写入/截断按操作固定并提交修改缓冲集合，防止分配中途 I/O 失败失去块 owner，也避免排空无关历史脏数据。保留 JBD2 journal 与 superblock 自身原有的独立校验算法。所有权适配新增live-inode chown，修正UID/GID的low/high 16位编码；内部xattr路径修正缺失inline属性区、删除finder、共享EA块复制的校验和/扇区计数、inode删除时的引用归还及失败释放，用于在同一事务删除capability。内核构建profile启用journal/replay与该内部xattr路径，并关闭mkfs、debug/assert；用户xattr/ACL接口及文件capability执行仍未接入；BoarOS 的 heap、块设备、VFS 和负 errno 适配位于 `kernel/` 与 `fs/`，不暴露 lwext4 类型。
+- 本地修改：初始导入提交不修改上游源码；后续补全现代 superblock 中 `s_checksum_seed` 等字段的磁盘布局，识别 `metadata_csum_seed`，并让 bitmap、group descriptor、inode、directory、extent 与 xattr 的 metadata checksum 使用规范选择的种子；目录适配另加 `ext4_dir_entry_next_status()` 和原始记录推进入口，以区分 EOF、inode-zero 尾记录与块/格式错误。文件适配允许在按 inode extent/legacy mapping 计算的 maxbytes 内 seek 到 EOF 之后、精确分配逻辑块、对 hole 合成零，并以 sparse 方式执行写入和向上截断；legacy maxbytes 取间接指针树、`ext4_lblk_t`/哨兵及 inode 块计数容量的交集，不让大块文件系统的 64-bit offset 缩窄回绕到低逻辑块。新块初始化失败撤销 exact mapping，unwritten conversion 与调用者数据在同一私有操作中提交。时间戳适配新增 mount 可选 realtime callback 和 live-inode touch，支持受 inode_size/extra_isize 约束的 signed epoch/纳秒编码、relatime、创建与父目录修改；即时 block-cache flush 传播 errno，失败缓冲由 mount 保留 dirty owner；文件写入/截断按操作固定并提交修改缓冲集合，防止分配中途 I/O 失败失去块 owner，也避免排空无关历史脏数据。保留 JBD2 journal 与 superblock 自身原有的独立校验算法。所有权适配新增live-inode chown，修正UID/GID的low/high 16位编码；内部xattr路径修正缺失inline属性区、删除finder、共享EA块复制的校验和/扇区计数、inode删除时的引用归还及失败释放，用于在同一事务删除capability。内核构建profile启用journal/replay与该内部xattr路径，并关闭mkfs、debug/assert；用户xattr/ACL接口及文件capability执行仍未接入；BoarOS 的 heap、块设备、VFS 和负 errno 适配位于 `kernel/` 与 `fs/`，不暴露 lwext4 类型。
 
-- 日志与恢复修改：加入设备 flush 回调、ordered data、修改前缓冲引用与 before-image、嵌套事务错误传播、checksum v2/v3/revoke 校验、checkpoint 后持久回收日志空间和 sticky journal 错误。superblock 更新进入日志，受限启动允许由合法 redo 修复扇区撕裂的 superblock。新增 `ext4_orphan.c` 支持 orphan_file/传统链，`ext4_truncate.c` 按实际 extent/间接块映射分批回收；公开修改入口接入持久 orphan 生命周期。块组读取不再隐式初始化位图，分配器才初始化；bitmap/inode/directory/extent 校验失败明确返回错误，索引目录不会静默降级后改写损坏元数据。extent 树读取失败按 get 的成功状态归还引用，不用预先填写的块号判断 owner，避免 OOM 后释放 NULL buffer。恢复测试与承诺范围见 [VFS 模块](modules/vfs-ext4.md)。
+- 日志与恢复修改：加入设备 flush 回调、ordered data、元数据修改前的缓冲引用与 before-image、文件数据私有替换版本、嵌套事务错误传播、checksum v2/v3/revoke 校验、checkpoint 后持久回收日志空间和 sticky journal 错误。superblock 更新进入日志，受限启动允许由合法 redo 修复扇区撕裂的 superblock。新增 `ext4_orphan.c` 支持 orphan_file/传统链，`ext4_truncate.c` 按实际 extent/间接块映射分批回收；公开修改入口接入持久 orphan 生命周期。块组读取不再隐式初始化位图，分配器才初始化；bitmap/inode/directory/extent 校验失败明确返回错误，索引目录不会静默降级后改写损坏元数据。extent 树读取失败按 get 的成功状态归还引用，不用预先填写的块号判断 owner，避免 OOM 后释放 NULL buffer。恢复测试与承诺范围见 [VFS 模块](modules/vfs-ext4.md)。
 
 BoarOS 采用 GPL-2.0-only；仓库根目录 `LICENSE` 保存完整许可证文本，第三方文件保留各自的上游版权与许可声明。
 
@@ -45,7 +46,7 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 
 - 单 hart 可睡眠扩展：mount 读写锁、任务 transaction owner、纯定位 `ext4_fpread`、同块 loading 等待、RELATIME 无副作用读预检；orphan/journal/恢复/卸载统一独占。生产 owner 检查不依赖可关闭的 debug assert。写事务仍单 owner 且保持日志格式与提交顺序，未升级上游版本；验证见 `test-io-sleep-riscv` 与 `test-lwext4-recovery-host`。
 - 多实例扩展：锁回调显式携带 context，BoarOS 适配按实例登记名称、块设备、锁和错误 owner；公共堆绑定按引用计数维护。新增固定源 inode 的硬链接事务入口，同步目录项、链接数和时间戳；最后链接才进入 orphan 生命周期。验证为 `test-lwext4-instances-host` 与扩展的 `test-lwext4-rename-host`，上游 commit 不变。
-- 异步日志扩展：操作级私有 undo/资源预留、mount running group、不可变 metadata/data/log 版本及独立 worker；有预算的日志映射、未提交 home writeback 禁止、释放块/inode quarantine、full/data 同步目标与版本 checkpoint。保持现有磁盘格式和 ordered/log/commit 屏障，未启用 ASYNC_COMMIT 特性，也未升级上游。旧“即时提交”描述仅适用于未启用组引擎的路径；生产 journal mount 使用组提交。实际 1/4KiB 引擎、RV64 IRQ/lifecycle、完整恢复及原消费者验收见 [VFS模块](modules/vfs-ext4.md) 和 [机制分析](learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+- 异步日志扩展：操作级私有 undo/资源预留、mount running group、不可变元数据版本、借用 VFS 稳定页的 ordered data、与 checkpoint 共用 after 版本的日志 payload 及独立 worker；有预算的日志映射、未提交 home writeback 禁止、释放块/inode quarantine、full/data 同步目标与版本 checkpoint。保持现有磁盘格式和 ordered/log/commit 屏障，未启用 ASYNC_COMMIT 特性，也未升级上游。旧“即时提交”描述仅适用于未启用组引擎的路径；生产 journal mount 使用组提交。实际 1/4KiB 引擎、RV64 IRQ/lifecycle、完整恢复及原消费者验收见 [VFS模块](modules/vfs-ext4.md) 和 [机制分析](learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 ## BLAKE2s
 
@@ -55,10 +56,11 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 - 验证：`make test-random-host` 比较已知向量、分块边界与旧输出预测下一密钥的回归；确定性向量不证明熵源质量。
 
 - lwext4 批量只读扩展：`ext4_fpread_batch` 在 mount read lock 下按真实 inode 映射处理
-  洞、EOF 与块内片段；`ext4_block_get_batch` 先固定当前 bcache 版本，仅对缺失块调用
-  可选 `bread_batch`，重复块共用 loading。本批新读先完成，再等待其他 loading，避免
-  重叠批次互等未发布缓冲。每项保留独立错误和成功字节前缀，失败读不进入 journal
-  写回错误状态；设备侧最多八项并保留 DMA owner 至返回。未升级上游，来源仍为
+  洞、EOF 与块内片段；普通文件数据先查当前事务版本，其余物理区间经
+  `ext4_blockdev_read_batch` 直接读入调用者的目标，不建立第二份普通数据缓存。
+  元数据的 `ext4_block_get_batch` 保留共享 loading，并先完成本批新读再等待其他
+  loading，避免重叠批次互等。每项保留独立错误和成功字节前缀；设备侧最多八项
+  并保留 DMA owner 至返回。未升级上游，来源仍为
   `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
   验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
 

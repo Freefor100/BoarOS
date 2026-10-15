@@ -66,8 +66,9 @@ lwext4 基线为仓库内 `third_party/lwext4/`，上游固定 commit
 
 VFS 在 mount 上绑定可选 realtime 回调，未初始化 kernel clock 时返回“不可用”，保持 fixture 的
 原时间。正常系统使用 `kernel_time_realtime_ns()`；回调结构保留 signed seconds 和 nanoseconds。
-内部 `ext4_file_touch()` 通过 `ext4_file.inode` 取得 inode，不重新解析路径，因此 unlink 后的
-仍打开文件继续更新自身时间。
+普通文件首次打开时从实际 inode 初始化共享节点的时间字段。后续普通 I/O 使用该节点的
+运行时值；别名和 unlink 后仍打开的文件保持同一 inode owner。脏字段的保存、事务接受与
+更新交错由 [VFS 时间状态](../modules/vfs-ext4.md) 描述。
 
 文件层在完成 fd/模式/用户范围检查之后、非零 I/O 请求开始时更新：read/pread 走 relatime，
 普通文件 write/writev 在 usercopy 前更新 mtime/ctime。零长度和访问模式拒绝不更新；
@@ -114,15 +115,19 @@ refcount、新块checksum、inode占有扇区数和释放都必须一致。操�
 
 ## I/O 失败与持久化
 
-`ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；早期即时路径修复了上游 `ext4_bcache_free()` 忽略 flush errno 的问题，失败缓冲保留在 mount dirty list。2026-10-01 生产 journal mount 改为操作私有 undo 与挂载点组提交：touch 完成操作接受后即可返回，时间从当前内存立即可见；零更新、无时钟和只读访问不新增时间操作。资源/日志预留在接受前完成，提交只使用独立冻结版本，未提交 home buffer 禁止隐式写回；truncate 与普通写不能在块尚无 owner 时发布成功。未启用组引擎的宿主/无 journal 路径继续保持各自明确契约。
+普通 read/write 在共享 inode 上发布运行时时间并登记脏字段，不为每次访问开启 metadata
+事务。数据写回取得实际事务资格后才捕获当前时间，因此准入等待期间的 namespace 修改
+不会被旧快照覆盖。显式设置和 namespace 操作仍使用各自事务；准备失败或 abort 不发布
+暂存时间，成功后按字段版本保留期间发生的较新更新。
 
-写侧 touch 的准备错误或已知 mount 错误在数据提交之前返回；接受后后台 I/O 错误由 journal/mount 保留，并在同步调用中观察。读侧 atime 错误按 Linux 规则不改变 read 返回值。
-关键 journal/metadata write 或 flush 失败由 mount 保留错误及缓冲 owner，停止后续修改和成功同步承诺；不能清除错误后用卸载重试宣称恢复。只有提交前且尚未改变持久状态的准备失败才安全回滚。重启按 journal/replay 和持久 orphan 恢复，创建/链接/rename 已纳入事务断电验证，见 [VFS 模块](../modules/vfs-ext4.md)。
+已知 mount 错误在写侧数据复制前返回；时间编码、日志提交或 flush 的后续错误由
+node/journal/mount 保留，并在同步调用中观察。读侧 atime 错误按 Linux 规则不改变 read
+返回值。关键 I/O 失败不能通过清除错误或重复卸载冒充成功；只有尚未改变持久状态的准备
+失败才安全回滚。重启按 journal/replay 和持久 orphan 恢复，见 [VFS 模块](../modules/vfs-ext4.md)。
 
-时间更新加入已有 running group 消除了逐次时间事务提交，但没有改变非零首字节 EFAULT、
-stat即时可见或relatime条件。同步 full/data 分别捕获序号，纯时间修改不推进 data 目标；
-已在同组中的时间 metadata 可顺带持久化。原消费者的收益、同步成本和恢复证据见
-[异步日志验收](cost-baseline.md#异步日志与组提交验收2026-10-01)。
+完整 fsync 先编码脏时间，再捕获 durable 目标。fdatasync 保留只同步数据所需依赖的语义，
+纯时间修改不单独推进 data 目标；与数据同事务编码的时间随数据持久化。性能收益必须由
+实际工作量的测量判断，历史组提交结果见[异步日志验收](cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 ## 显式设置与检查顺序
 
@@ -133,11 +138,18 @@ musl 的 `futimens` 调用 utimensat(fd,NULL,times,0)。其 `statfs/fstatfs` 包
 ## 验证
 
 ```sh
+make test-journal-group-riscv
 make test-files-partial-write-riscv
 make test-lwext4-host test-lwext4-metadata-host
 make test-userland-riscv
 make test-diff-abi-riscv
 ```
+
+真实 VFS/journal worker 测试检查反复普通时间更新不增加操作事务、描述符共享可见性、
+显式事务 abort、较新 atime 与事务发布交错、OMIT、无脏数据页的 fsync、最后关闭后后台
+保存，以及卸载重挂后的时间值。无 journal 镜像另检查仅 atime 变脏后最后关闭文件，后台线程
+写入实际 inode-table 块并释放最后节点引用，不依赖显式同步或卸载。IRQ 唤醒交错由持有真实设备响应的 I/O sleep 测试检查，
+不以 QEMU 请求必须进入睡眠作为 journal 测试的前提。
 
 聚焦测试区分用户缓存写入进度与后续同步错误；journal 元数据错误不会被有效 fd 的历史 close 清理覆盖。host 显式时间故障测试验证准备 OOM 保持旧值、实际 write/flush 错误保留 sticky mount、重复重启恢复，并确认只改时间不主动写回无关 inode 数据。
 

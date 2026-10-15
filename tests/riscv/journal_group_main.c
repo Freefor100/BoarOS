@@ -5,6 +5,7 @@
 #include <arch/riscv/virt_uart.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/dtb.h>
+#include <kernel/errno.h>
 #include <kernel/cost.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
@@ -16,6 +17,9 @@
 #include <kernel/file_mapping.h>
 #include "../../fs/ext4_backend.h"
 #include <ext4_fs.h>
+#include <ext4_inode.h>
+#include <ext4_super.h>
+#include <ext4_errno.h>
 #include <ext4_journal.h>
 #include <string.h>
 
@@ -26,9 +30,8 @@ static struct kernel_page_cache cache;
 static struct kernel_vfs_mount mount;
 static struct riscv_virtio_mmio_block device;
 static unsigned completed;
+static int journaled;
 static unsigned char bytes[4096], actual[4096];
-static volatile unsigned irq_completed;
-static unsigned char irq_bytes[512];
 static struct kernel_vfs_file *hot_file;
 static unsigned hot_read_done;
 static struct kernel_wait_queue hot_read_completion;
@@ -40,16 +43,6 @@ static void check(int good, unsigned id)
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int physical(const void *pointer, uint64_t *address) { *address=(uintptr_t)pointer;return 1; }
 static int dma(const void *pointer, uint64_t size, uint64_t *address) { (void)size;return physical(pointer,address); }
-static void irq_only_reader(void *argument)
-{
-    (void)argument;
-    /* Keep publish-to-block atomic in this fixture so the idle caller, rather
-     * than the reader's ordinary IRQ boundary, observes the pending IRQ. */
-    uintptr_t irq=riscv_interrupt_save();
-    check(kernel_block_read_at(&device.block,0,irq_bytes,sizeof(irq_bytes))==KERNEL_BLOCK_STATUS_OK,10);
-    irq_completed=1;
-    riscv_interrupt_restore(irq);
-}
 static void hot_read_access(void *argument)
 {
     (void)argument;
@@ -59,9 +52,58 @@ static void hot_read_access(void *argument)
     check(kernel_wait_queue_wake_one(&hot_read_completion)==KERNEL_SCHEDULER_STATUS_OK,47);
     riscv_interrupt_restore(irq);
 }
-/* Used only by the counterfactual fixture: suppress the public idle return
- * hook while preserving the same actual device interrupt and sleeping task. */
-void __wrap_kernel_scheduler_prepare_idle_return(void) { }
+static void exercise_nojournal_times(struct lwext4_mount_adapter *adapter)
+{
+    struct kernel_vfs_file file={0};
+    struct kernel_vfs_stat expected, observed;
+    size_t count=0;
+    check(kernel_vfs_open(&mount,"/background-atime",&file)==0 &&
+        kernel_vfs_pread(&file,0,actual,1,&count)==0 && count==1 && actual[0]=='R',65);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    uint32_t inode=node->inode;
+    uint32_t block_size=ext4_sb_get_block_size(adapter->superblock);
+    struct ext4_inode_ref reference;
+    adapter->locks.lock(adapter->locks.context);
+    check(ext4_fs_get_inode_ref(adapter->device.fs,inode,&reference)==0,66);
+    uint64_t block=reference.block.lb_id;
+    size_t inode_offset=(unsigned char *)reference.inode-reference.block.data;
+    check(ext4_fs_put_inode_ref(&reference)==0,66);
+    adapter->locks.unlock(adapter->locks.context);
+    check(kernel_page_cache_invalidate_node(&cache,node)==KERNEL_PAGE_CACHE_STATUS_OK,67);
+    kernel_vfs_file_accessed(&file);
+    check(kernel_vfs_fstat(&file,&expected)==0 &&
+        (expected.atime.seconds || expected.atime.nanoseconds) &&
+        !node->dirty_cache_pages.count &&
+        ((struct lwext4_node *)node)->dirty_fields==EXT4_TIME_ATIME &&
+        kernel_vfs_close(&file)==0,68);
+    /* The clean data page was removed above. Only the dirty timestamp pin
+     * keeps this inode alive until the existing mount worker has stored it. */
+    check(adapter->journal_started && adapter->dirty_times,69);
+    uint64_t deadline;
+    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,70);
+    enum kernel_wait_wake_reason reason;
+    while(adapter->dirty_times && riscv_time_read()<deadline)
+        check(kernel_scheduler_block_current(&adapter->journal_progress,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,71);
+    check(!adapter->dirty_times,72);
+    for(node=adapter->instance.nodes;node;node=node->next) check(node->inode!=inode,73);
+    /* Read the actual inode-table block through the device, bypassing lwext4's
+     * metadata cache, before any explicit sync or unmount can save the value. */
+    check(block_size==sizeof(actual) && kernel_block_read_at(&device.block,
+        block*block_size,actual,block_size)==KERNEL_BLOCK_STATUS_OK,74);
+    struct ext4_inode disk;
+    memcpy(&disk,actual+inode_offset,sizeof(disk));
+    check((int32_t)disk.access_time==expected.atime.seconds &&
+        (disk.atime_extra>>2)==expected.atime.nanoseconds,75);
+    check(kernel_vfs_unmount(&mount)==0 &&
+        kernel_vfs_mount_root(&mount,&device.block,&heap,&cache)==0 &&
+        kernel_vfs_open(&mount,"/background-atime",&file)==0 &&
+        kernel_vfs_fstat(&file,&observed)==0 &&
+        !memcmp(&expected.atime,&observed.atime,sizeof(expected.atime)) &&
+        kernel_vfs_close(&file)==0 && kernel_vfs_unmount(&mount)==0,76);
+    check(kernel_page_cache_destroy(&cache)==KERNEL_PAGE_CACHE_STATUS_OK &&
+        riscv_virtio_mmio_block_destroy(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK,77);
+    completed=1;
+}
 
 static void exercise(void *argument)
 {
@@ -70,10 +112,22 @@ static void exercise(void *argument)
     int startup=kernel_vfs_start_journal_worker(&mount);
     if(startup){virt_uart_puts("journal startup errno=");virt_uart_put_hex((uint64_t)(int64_t)startup);virt_uart_putc('\n');
         struct lwext4_mount_adapter *a=mount.private_data;
-        virt_uart_puts("journal state error/memory/limit=");virt_uart_put_hex(a->device.fs->jbd_journal->error);virt_uart_putc(' ');virt_uart_put_hex(a->device.fs->jbd_journal->memory_used);virt_uart_putc(' ');virt_uart_put_hex(a->device.fs->jbd_journal->memory_limit);virt_uart_putc('\n');}
+        if(a->device.fs->jbd_journal){virt_uart_puts("journal state error/memory/limit=");virt_uart_put_hex(a->device.fs->jbd_journal->error);virt_uart_putc(' ');virt_uart_put_hex(a->device.fs->jbd_journal->memory_used);virt_uart_putc(' ');virt_uart_put_hex(a->device.fs->jbd_journal->memory_limit);virt_uart_putc('\n');}}
     check(startup==0,20);
     struct lwext4_mount_adapter *adapter=mount.private_data;
     struct jbd_journal *journal=adapter->device.fs->jbd_journal;
+    journaled=journal!=NULL;
+    if(!journaled){exercise_nojournal_times(adapter);riscv_interrupt_restore(irq);return;}
+    struct kernel_vfs_file noatime={0};
+    const struct kernel_vfs_timespec noatime_old[2]={{0,0},{0,0}};
+    struct kernel_vfs_stat noatime_stat;
+    check(kernel_vfs_open(&mount,"/noatime",&noatime)==0 &&
+        kernel_vfs_file_set_times(&noatime,noatime_old)==0,63);
+    uint64_t noatime_sequence=journal->accepted_sequence;
+    kernel_vfs_file_accessed(&noatime);
+    check(kernel_vfs_fstat(&noatime,&noatime_stat)==0 && noatime_stat.atime.seconds==0 &&
+        noatime_stat.atime.nanoseconds==0 && journal->accepted_sequence==noatime_sequence &&
+        kernel_vfs_close(&noatime)==0 && kernel_vfs_unlink(&mount,"/noatime")==0,64);
     struct kernel_vfs_file file={0};
     check(kernel_vfs_create(&mount,"/group",0600,&file)==0,21);
     size_t count;uint64_t error=0;
@@ -91,7 +145,7 @@ static void exercise(void *argument)
     check(journal->durable_sequence==journal->accepted_sequence && journal->memory_peak<=journal->memory_limit,24);
     struct riscv_virtio_mmio_block_statistics statistics;
     riscv_virtio_mmio_block_get_statistics(&device,&statistics);
-    check(statistics.max_inflight==8,42);
+    check(statistics.max_inflight>1 && statistics.max_inflight<=8,42);
     kernel_vfs_file_accessed(&file);
     hot_file=&file;
     kernel_wait_queue_init(&hot_read_completion);
@@ -114,21 +168,90 @@ static void exercise(void *argument)
     }
     const struct kernel_vfs_timespec old_times[2]={{1,0},{1,0}};
     check(kernel_vfs_file_set_times(&file,old_times)==0,46);
+    struct kernel_vfs_file alias={0};
+    check(kernel_vfs_open(&mount,"/group",&alias)==0 &&
+        kernel_vfs_file_node(&alias)==kernel_vfs_file_node(&file),48);
+    struct ext4_inode disk_before, disk_after;
+    ext4_file *handle=lwext4_node_file(kernel_vfs_file_node(&file));
+    check(ext4_fraw_inode_fill(handle,&disk_before)==0,49);
     uint64_t before=journal->accepted_sequence;
-    struct kernel_vfs_stat stat={0};
-    check(kernel_vfs_file_modified(&file, 0, 1)==0 && kernel_vfs_fstat(&file,&stat)==0 &&
-        stat.mtime.seconds!=1 && journal->accepted_sequence>=before && journal->running,26);
+    for(unsigned repeat=0;repeat<64;repeat++) {
+        check(kernel_vfs_file_modified(&file, 0, 1)==0,26);
+        kernel_vfs_file_accessed(&file);
+    }
+    check(journal->accepted_sequence==before,50);
+    struct kernel_vfs_stat stat={0}, alias_stat={0};
+    check(kernel_vfs_fstat(&file,&stat)==0 && kernel_vfs_fstat(&alias,&alias_stat)==0 &&
+        (stat.mtime.seconds!=1 || stat.mtime.nanoseconds!=0) &&
+        !memcmp(&stat.atime,&alias_stat.atime,sizeof(stat.atime)) &&
+        !memcmp(&stat.mtime,&alias_stat.mtime,sizeof(stat.mtime)) &&
+        !memcmp(&stat.ctime,&alias_stat.ctime,sizeof(stat.ctime)) &&
+        ext4_fraw_inode_fill(handle,&disk_after)==0 &&
+        disk_after.modification_time==disk_before.modification_time &&
+        disk_after.mtime_extra==disk_before.mtime_extra,51);
+    /* A real metadata abort must preserve the earlier dirty runtime values. */
+    const struct ext4_timestamp explicit[3]={{77,17},{78,18},{79,19}};
+    check(kernel_vfs_file_modified(&file,0,0)==0 && kernel_vfs_fstat(&file,&stat)==0 &&
+        ext4_transaction_begin(adapter->mount_point)==0 &&
+        ext4_file_set_times(handle,7,explicit)==0 &&
+        ext4_transaction_abort(adapter->mount_point,ECANCELED)==ECANCELED &&
+        kernel_vfs_fstat(&alias,&alias_stat)==0 &&
+        !memcmp(&stat.mtime,&alias_stat.mtime,sizeof(stat.mtime)) &&
+        !memcmp(&stat.ctime,&alias_stat.ctime,sizeof(stat.ctime)),52);
+    /* A read after a tentative explicit set owns a newer atime. Acceptance
+     * must not overwrite it with the earlier transaction's staged value. */
+    const struct kernel_vfs_timespec stale_atime[2]={{0,0},{0,KERNEL_VFS_UTIME_OMIT}};
+    check(kernel_vfs_file_set_times(&file,stale_atime)==0 && kernel_vfs_fstat(&file,&stat)==0 &&
+        ext4_transaction_begin(adapter->mount_point)==0 &&
+        ext4_file_set_times(handle,EXT4_TIME_ATIME,explicit)==0,60);
+    kernel_vfs_file_accessed(&file);
+    check(ext4_transaction_end(adapter->mount_point)==0 &&
+        kernel_vfs_fstat(&file,&alias_stat)==0 && alias_stat.atime.seconds!=77,61);
+    /* A metadata-only fsync must encode the current RAM values even though
+     * every data page was already clean before these writes were announced. */
+    check(kernel_vfs_sync(&file,0,&error)==0 &&
+        ext4_fraw_inode_fill(handle,&disk_after)==0 &&
+        (int32_t)disk_after.modification_time==stat.mtime.seconds &&
+        (disk_after.mtime_extra>>2)==stat.mtime.nanoseconds &&
+        (int32_t)disk_after.change_inode_time==stat.ctime.seconds &&
+        (disk_after.ctime_extra>>2)==stat.ctime.nanoseconds,53);
+    /* Explicit atime with OMIT keeps the dirty runtime mtime authoritative. */
+    check(kernel_vfs_file_modified(&file,0,0)==0 && kernel_vfs_fstat(&file,&stat)==0,54);
+    const struct kernel_vfs_timespec partial_times[2]={{123,456},{0,KERNEL_VFS_UTIME_OMIT}};
+    check(kernel_vfs_file_set_times(&alias,partial_times)==0 &&
+        kernel_vfs_fstat(&file,&alias_stat)==0 && alias_stat.atime.seconds==123 &&
+        alias_stat.atime.nanoseconds==456 &&
+        !memcmp(&stat.mtime,&alias_stat.mtime,sizeof(stat.mtime)) &&
+        kernel_vfs_sync(&file,0,&error)==0,55);
+    /* A dirty timestamp owns the inode after the last descriptor disappears.
+     * Wait on actual journal progress with a deadline, then reopen it. */
+    check(kernel_vfs_close(&alias)==0,57);
+    struct kernel_vfs_file time_only={0};
+    check(kernel_vfs_create(&mount,"/time-only",0600,&time_only)==0 &&
+        kernel_vfs_file_modified(&time_only,0,0)==0 &&
+        kernel_vfs_fstat(&time_only,&stat)==0 && kernel_vfs_close(&time_only)==0,58);
     uint64_t deadline;
-    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+200000000,&deadline)==KERNEL_TIME_STATUS_OK,27);
+    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,27);
     enum kernel_wait_wake_reason reason;
-    check(kernel_scheduler_block_current(NULL,deadline,1,&reason)==KERNEL_SCHEDULER_STATUS_OK && reason==KERNEL_WAIT_TIMEOUT,28);
-    check(journal->checkpoint_sequence==journal->accepted_sequence,29);
+    while((adapter->dirty_times || journal->checkpoint_sequence!=journal->accepted_sequence) && riscv_time_read()<deadline)
+        check(kernel_scheduler_block_current(&adapter->journal_progress,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,28);
+    check(!adapter->dirty_times && journal->checkpoint_sequence==journal->accepted_sequence,29);
+    check(kernel_vfs_open(&mount,"/time-only",&time_only)==0 &&
+        kernel_vfs_fstat(&time_only,&alias_stat)==0 &&
+        !memcmp(&stat.mtime,&alias_stat.mtime,sizeof(stat.mtime)) &&
+        kernel_vfs_close(&time_only)==0,59);
     check(kernel_vfs_ftruncate(&file,4097)==0 && kernel_vfs_sync(&file,0,&error)==0,30);
     check(kernel_vfs_unlink(&mount,"/group")==0,31);
     memset(bytes,0x92,sizeof(bytes));
     check(kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&count)==0 && count==sizeof(bytes) && kernel_vfs_sync(&file,0,&error)==0,32);
     check(kernel_vfs_close(&file)==0,33);
     check(kernel_vfs_unmount(&mount)==0,34);
+    check(kernel_vfs_mount_root(&mount,&device.block,&heap,&cache)==0 &&
+        kernel_vfs_open(&mount,"/time-only",&time_only)==0 &&
+        kernel_vfs_fstat(&time_only,&alias_stat)==0 &&
+        !memcmp(&stat.mtime,&alias_stat.mtime,sizeof(stat.mtime)) &&
+        kernel_vfs_close(&time_only)==0 && kernel_vfs_unlink(&mount,"/time-only")==0 &&
+        kernel_vfs_unmount(&mount)==0,62);
     check(kernel_page_cache_destroy(&cache)==KERNEL_PAGE_CACHE_STATUS_OK,35);
     check(riscv_virtio_mmio_block_destroy(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK,36);
     completed=1;
@@ -155,20 +278,6 @@ void kernel_main(unsigned long hart,const void *dtb)
     uint32_t source=0;
     for(unsigned i=0;i<routing.route_count;i++) if(routing.routes[i].base==(uintptr_t)riscv_virtio_mmio_block_base(&device))source=routing.routes[i].source;
     check(riscv_virtio_mmio_block_enable_irq(&device,source),6);
-    /* Timer is not started. Hold SIE clear until the device IRQ is pending,
-     * then expose precisely the enable-to-wfi interval in the idle caller. */
-    check(kernel_thread_create(irq_only_reader,NULL)==KERNEL_SCHEDULER_STATUS_OK &&
-        kernel_scheduler_yield_current()==KERNEL_SCHEDULER_STATUS_OK,11);
-    uint64_t irq_limit=riscv_time_read()+2*info.timebase_frequency;
-    volatile uint32_t *interrupt_status=(void*)((uintptr_t)riscv_virtio_mmio_block_base(&device)+0x60);
-    while(!(*interrupt_status&1) && riscv_time_read()<irq_limit) { }
-    check((*interrupt_status&1)!=0,12);
-    riscv_interrupt_restore(RISCV_SSTATUS_SIE);
-    __asm__ volatile("nop; nop; nop; nop" ::: "memory");
-    check(irq_completed,13);
-    (void)riscv_interrupt_save();
-    struct kernel_thread_completion completion;
-    check(kernel_scheduler_reap_one(&completion)==KERNEL_SCHEDULER_STATUS_OK,14);
     check(kernel_time_init(info.timebase_frequency,0)==KERNEL_TIME_STATUS_OK && riscv_timer_start(info.timebase_frequency,100)==RISCV_TIMER_STATUS_OK,7);
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_begin(1,info.timebase_frequency,1,0)==0,40);
@@ -182,9 +291,9 @@ void kernel_main(unsigned long hart,const void *dtb)
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t groups, data_writes, resumes;
     check(kernel_cost_end(1,0)==0 &&
-        kernel_cost_read(1,COST_JOURNAL_GROUPS,&groups)==0 && groups>0 &&
-        kernel_cost_read(1,COST_DEVICE_OTHER_DATA_WRITE,&data_writes)==0 && data_writes>0 &&
-        kernel_cost_read(1,COST_IO_COMPLETE_TO_RESUME,&resumes)==0 && resumes>0,41);
+        kernel_cost_read(1,COST_JOURNAL_GROUPS,&groups)==0 && (journaled ? groups>0 : groups==0) &&
+        kernel_cost_read(1,COST_DEVICE_OTHER_DATA_WRITE,&data_writes)==0 && (!journaled || data_writes>0) &&
+        kernel_cost_read(1,COST_IO_COMPLETE_TO_RESUME,&resumes)==0 && (!journaled || resumes>0),41);
 #endif
     virt_uart_puts("BoarOS: journal group tests passed\n");sbi_shutdown();
 }

@@ -4,6 +4,10 @@
 
 ## 范围与入口
 
+`dtb_read_cpu_info()`提供最多两个CPU的独立身份快照，boot hart为逻辑0；
+非零/稀疏ID、disabled、重复/损坏和失败不修改输出由`make test-smp-host`保护，
+完整启动与容量边界见[RV两核模块](riscv-smp.md)。
+
 | 文件 | 当前职责 |
 |---|---|
 | `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小、RISC-V timebase、`/chosen/rng-seed`、静态保留区和 VirtIO MMIO 范围 |

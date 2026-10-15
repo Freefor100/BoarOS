@@ -12,7 +12,8 @@ struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file
 struct kernel_page_cache;
 struct kernel_page_cache_entry;
 struct kernel_page_cache_dirty {
-    struct kernel_page_cache_entry *head;
+    struct kernel_page_cache_entry *head, **tail;
+    struct kernel_page_cache_dirty *queue_next, *queue_previous;
     size_t count;
 };
 struct kernel_vfs_file;
@@ -22,6 +23,10 @@ struct kernel_vfs_node;
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
 #endif
 struct kernel_heap;
+struct physical_page_allocator;
+/* 实际ext4 inode及其已开放cache的固定绑定；借用已有来源owner，不扫描注册表。 */
+int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *,
+    const struct kernel_heap *, const struct physical_page_allocator *);
 struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(
@@ -33,15 +38,16 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
-#define KERNEL_VFS_READ_BATCH_MAX 8U
+#define KERNEL_VFS_READ_BATCH_MAX 32U
 struct kernel_vfs_read_span {
     uint64_t offset;
     void *buffer;
     size_t size, completed;
     int error;
 };
-/* Caller owns node/read gate and every destination until return. Successful
- * spans may stop at EOF; errors preserve each contiguous byte prefix. */
+/* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX
+ * nonoverlapping, valid kernel destinations until return. Successful spans
+ * may stop at EOF; errors preserve each contiguous byte prefix. */
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
     struct kernel_vfs_read_span *spans, size_t count);
 
@@ -54,6 +60,8 @@ int kernel_vfs_file_is_control(const struct kernel_vfs_file *file);
 int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
     uint64_t offset, char *buffer, size_t size, size_t *count);
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
+int kernel_ext4_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,
+    const struct physical_page_allocator *);
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
                              struct kernel_heap *heap,
                              char **buffer, size_t *length);
@@ -63,8 +71,25 @@ struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node);
 int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node);
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
-int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written);
+#define KERNEL_VFS_WRITEBACK_MAX 32U
+struct kernel_vfs_writeback_span {
+    uint64_t offset;
+    const void *buffer;
+    size_t size, written;
+    void *owner;
+    void (*retain)(void *owner);
+    void (*release)(void *owner);
+    size_t source_bytes;
+    const void *source_buffer;
+    size_t source_size;
+};
+/* Stable sources remain caller-owned. The backend may retain them through
+ * ordered commit; source_bytes includes the entire retained allocation, not
+ * just this dirty range. source_buffer/source_size describe initialized stable
+ * bytes surrounding buffer; logical offset/size still define completion and EOF.
+ * Shared source ownership is charged once. */
+int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count);
 
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node);
 const struct kernel_vfs_mount *kernel_vfs_node_mount(

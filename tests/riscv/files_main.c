@@ -1,4 +1,5 @@
 #include <arch/riscv/mm.h>
+#include <arch/mmu.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/virt_uart.h>
@@ -148,7 +149,6 @@ static uint64_t test_satp;
 static int inject_partial_write_error;
 static int inject_truncate_error;
 static kernel_block_write_fn time_original_write;
-static kernel_block_flush_fn sync_original_flush;
 static unsigned int sync_flush_failures;
 static struct kernel_open_file_description *sendfile_flush_output;
 static uint64_t sendfile_flush_threshold;
@@ -161,18 +161,23 @@ static enum kernel_uaccess_status writeback_redirty_status;
 static size_t writeback_redirty_copied;
 static unsigned int writeback_redirty_seen;
 
-static enum kernel_block_status sync_test_flush(void *context)
+int __real_ext4_file_sync_metadata_mode(ext4_file *, bool);
+int __wrap_ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
 {
+    int result = __real_ext4_file_sync_metadata_mode(file, data_only);
+    if (result) return result;
+    /* A retryable sync result is distinct from a failed journal barrier:
+     * the latter poisons the mount and is tested by the final fixture. */
     if (sendfile_flush_output != 0 &&
         kernel_open_file_size(sendfile_flush_output) >= sendfile_flush_threshold) {
         sendfile_flush_output = 0;
-        return KERNEL_BLOCK_STATUS_IO;
+        return EIO;
     }
     if (sync_flush_failures != 0U) {
         sync_flush_failures--;
-        return KERNEL_BLOCK_STATUS_IO;
+        return EIO;
     }
-    return sync_original_flush(context);
+    return EOK;
 }
 
 static bool timestamp_test_clock(struct ext4_timestamp *now)
@@ -201,10 +206,7 @@ enum kernel_open_file_status __real_kernel_open_file_release(
     struct kernel_open_file_description **owner);
 uint64_t __real_riscv_sv39_current_satp(void);
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __real_ext4_fpwrite(ext4_file *file, uint64_t offset,
-                       const void *buffer,
-                       size_t size,
-                       size_t *bytes_written);
+int __real_ext4_fpwrite_batch(ext4_file *, struct ext4_file_write_span *, unsigned);
 int __real_ext4_ftruncate(ext4_file *file, uint64_t size);
 #endif
 
@@ -224,38 +226,26 @@ enum kernel_open_file_status __wrap_kernel_open_file_release(
 }
 
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __wrap_ext4_fpwrite(ext4_file *file, uint64_t offset,
-                       const void *buffer,
-                       size_t size,
-                       size_t *bytes_written)
+int __wrap_ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsigned count)
 {
-    size_t committed = 0U;
     int result;
-
     if (!inject_partial_write_error) {
-        result = __real_ext4_fpwrite(file, offset, buffer, size, bytes_written);
-        if (writeback_redirty_mm != 0 && result == EOK &&
-            bytes_written != 0 && *bytes_written == size) {
-            struct kernel_mm *mm = writeback_redirty_mm;
-            unsigned char value = 'O';
-            writeback_redirty_mm = 0;
-            writeback_redirty_seen++;
-            writeback_redirty_status = kernel_copy_to_user(
-                mm, writeback_redirty_address, &value, 1U,
-                &writeback_redirty_copied);
+        result=__real_ext4_fpwrite_batch(file,spans,count);
+        if (writeback_redirty_mm && !result) {
+            struct kernel_mm *mm=writeback_redirty_mm;
+            unsigned char value='O';
+            writeback_redirty_mm=0; writeback_redirty_seen++;
+            writeback_redirty_status=kernel_copy_to_user(mm,writeback_redirty_address,&value,1U,&writeback_redirty_copied);
         }
         return result;
     }
-    inject_partial_write_error = 0;
-    if (size < 5U) {
-        return __real_ext4_fpwrite(file, offset, buffer, size, bytes_written);
-    }
-
-    result = __real_ext4_fpwrite(file, offset, buffer, 5U, &committed);
-    if (bytes_written != 0) {
-        *bytes_written = committed;
-    }
-    return result == EOK && committed == 5U ? EIO : result;
+    inject_partial_write_error=0;
+    if (!count || spans[0].size<5U) return __real_ext4_fpwrite_batch(file,spans,count);
+    struct ext4_file_write_span prefix=spans[0]; prefix.size=5;
+    result=__real_ext4_fpwrite_batch(file,&prefix,1);
+    for (unsigned i=0;i<count;i++) spans[i].written=0;
+    spans[0].written=prefix.written;
+    return !result && prefix.written==5U ? EIO : result;
 }
 
 int __wrap_ext4_ftruncate(ext4_file *file, uint64_t size)
@@ -303,6 +293,13 @@ static int dma_physical_address(const void *pointer,
     }
     *physical_address = (uint64_t)value;
     return 1;
+}
+
+static __attribute__((unused)) uint64_t test_fd_offset(struct kernel_files *files,int64_t fd)
+{
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+    return file ? kernel_open_file_offset(file) : UINT64_MAX;
 }
 
 static void fail_files(unsigned long case_id,
@@ -626,10 +623,19 @@ static void run_file_operations(struct kernel_files *files,
         kernel_files_read(files,
                           mm,
                           1,
-                          UINT64_MAX,
+                          TEST_USER_BUFFER,
                           0U,
                           &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
+        fail_files(19U, 0, result);
+    }
+    /* Empty scalar ranges include the user limit, but not higher addresses. */
+    if (kernel_files_read(files, mm, 1, UINT64_MAX, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != -KERNEL_EFAULT) {
+        fail_files(19U, -KERNEL_EFAULT, result);
+    }
+    if (kernel_files_read(files, mm, 1, ARCH_MMU_USER_LIMIT, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0) {
         fail_files(19U, 0, result);
     }
 
@@ -2962,7 +2968,8 @@ static void run_epoll_operations(struct kernel_files *files,
     /* A full table reports EMFILE transactionally.  In particular, fd 0 and
      * all counters remain owned by the pre-existing description. */
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 208U);
-    first_description = kernel_files_lookup_description(files, 0);
+    KERNEL_FILES_PIN_SCOPE(first_pin);
+    first_description = kernel_files_hold_fd(files,0,&first_pin);
     for (index = 1U; index < KERNEL_FILES_MAX_CAPACITY; index++) {
         if (kernel_files_dup(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
             result != (int64_t)index) {
@@ -2976,7 +2983,7 @@ static void run_epoll_operations(struct kernel_files *files,
         fail_files(210U, -KERNEL_EMFILE, result);
     }
     kernel_files_get_statistics(files, &after);
-    if (kernel_files_lookup_description(files, 0) != first_description ||
+    if (!kernel_files_fd_matches(files,0,first_description) ||
         after.current_open_fds != before.current_open_fds ||
         after.peak_open_fds != before.peak_open_fds ||
         after.close_on_exec_fds != before.close_on_exec_fds ||
@@ -3360,8 +3367,8 @@ static void check_usercopy_write(struct kernel_files *files,
 {
     const uint64_t boundary = TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE;
     struct kernel_uaccess_iovec vectors[3];
-    struct kernel_open_file_description *description =
-        kernel_files_lookup_description(files, 0);
+    KERNEL_FILES_PIN_SCOPE(selected);
+    struct kernel_open_file_description *description = kernel_files_hold_fd(files,0,&selected);
     struct kernel_vfs_stat stat;
     struct kernel_files_statistics before, after;
     unsigned char payload[80], expected[90], observed[90];
@@ -3469,8 +3476,14 @@ static void finish_sticky_metadata_test(const struct dtb_memory_range *mmio,
         fail_files(422U, 0, written);
     unsigned int before_failure = time_write_calls;
     int result = kernel_vfs_file_modified(&file, 0U, 0);
+    if (result != 0 || time_write_failures != 1U ||
+        time_write_calls != before_failure || kernel_vfs_file_size(&file) != 0U)
+        fail_files(423U, 0, result);
+    /* Ordinary I/O has published RAM time only. Encoding it through fsync
+     * reaches the actual device error, which the journal must retain. */
+    result = kernel_vfs_sync(&file, 0, &observed_error);
     if (result != -KERNEL_EIO || time_write_failures != 0U ||
-        time_write_calls <= before_failure || kernel_vfs_file_size(&file) != 0U)
+        time_write_calls <= before_failure)
         fail_files(423U, -KERNEL_EIO, result);
     /* Remove the device fault: subsequent errors must come from the journal's
      * retained failure, not from repeated fault injection. */
@@ -3616,7 +3629,8 @@ static void run_partial_write_test(const void *dtb)
         result != (int64_t)(sizeof(initial) - 1U)) {
         fail_files(301U, sizeof(initial) - 1U, result);
     }
-    description = kernel_files_lookup_description(&files, 0);
+    KERNEL_FILES_PIN_SCOPE(source_pin);
+    description = kernel_files_hold_fd(&files,0,&source_pin);
     if (description == 0 ||
         kernel_open_file_lookup_page(description, 0U, &cached_page,
                                      &valid_bytes) !=
@@ -3766,8 +3780,6 @@ static void run_partial_write_test(const void *dtb)
     inject_partial_write_error = 0;
 
     /* Synchronous write errors leave the accepted bytes and offset visible. */
-    sync_original_flush = device.block.flush;
-    device.block.flush = sync_test_flush;
     const uint64_t sync_flags[] = {KERNEL_FILES_O_DSYNC, KERNEL_FILES_O_SYNC};
     for (size_t n = 0; n < 2; n++) {
         if (!write_user_bytes(&mm, TEST_USER_PATH, "/sync-file", 11U) ||
@@ -3780,7 +3792,7 @@ static void run_partial_write_test(const void *dtb)
         if (kernel_files_write(&files, &mm, 1, TEST_USER_BUFFER, 4U, &result) !=
                 KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
             sync_flush_failures != 0U ||
-            kernel_open_file_offset(kernel_files_lookup_description(&files, 1)) != 4U ||
+            test_fd_offset(&files,1) != 4U ||
             kernel_files_pread(&files, &mm, 1, TEST_USER_BUFFER, 4U, 0,
                                &result) != KERNEL_FILES_STATUS_OK || result != 4 ||
             !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 4U) ||
@@ -3809,7 +3821,8 @@ static void run_partial_write_test(const void *dtb)
                     fail_files(451U, 0, result);
                 int64_t offset = 0, observed_offset = -1;
                 if (!write_user_bytes(&mm, TEST_USER_PATH + 64U, &offset, sizeof(offset))) fail_files(452U, 0, -1);
-                struct kernel_open_file_description *target = kernel_files_lookup_description(&files, 1);
+                KERNEL_FILES_PIN_SCOPE(target_pin);
+                struct kernel_open_file_description *target = kernel_files_hold_fd(&files,1,&target_pin);
                 sendfile_flush_output = target;
                 sendfile_flush_threshold = failed_batch * BOAROS_PAGE_SIZE;
                 int64_t expected = failed_batch == 1 ? -KERNEL_EIO : (int64_t)BOAROS_PAGE_SIZE;
@@ -3826,6 +3839,7 @@ static void run_partial_write_test(const void *dtb)
                     observed_offset != (explicit_offset ? (int64_t)progress : 0))
                     fail_files(458U, explicit_offset ? (int64_t)progress : 0, observed_offset);
                 size_t copied_data = 0;
+                kernel_files_pin_guard_release(&target_pin);
                 if (kernel_open_file_pread(target, (failed_batch - 1U) * BOAROS_PAGE_SIZE, observed,
                         sizeof(observed), &copied_data) != 0 || copied_data != sizeof(observed) ||
                     memcmp(observed, sendfile_data, sizeof(observed)) != 0 ||
@@ -3838,10 +3852,9 @@ static void run_partial_write_test(const void *dtb)
     if (kernel_files_ftruncate(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK || result != 0 ||
         kernel_files_lseek(&files, 0, 28, 0, &result) != KERNEL_FILES_STATUS_OK || result != 28)
         fail_files(455U, 28, result);
-    device.block.flush = sync_original_flush;
 
     /* msync keeps the inode's writeback error owner while the mapping pins
-     * its OFD. A second sync observes successful retry after a failed flush. */
+     * its OFD. A second sync observes a successful retry after the reported sync error. */
     struct kernel_open_file_description *mapping_pin = 0;
     uint64_t shared_address = 0;
     unsigned char mapped_value = 'M';
@@ -3860,7 +3873,6 @@ static void run_partial_write_test(const void *dtb)
                                      KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
         !write_user_bytes(&mm, shared_address, &mapped_value, 1U))
         fail_files(429U, 0, result);
-    device.block.flush = sync_test_flush;
     sync_flush_failures = 1U;
     if (kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) !=
             -KERNEL_EIO || sync_flush_failures != 0U ||
@@ -3954,7 +3966,6 @@ static void run_partial_write_test(const void *dtb)
     if (!read_user_bytes(&mm, TEST_USER_BUFFER, &persisted_value, 1U) ||
         persisted_value != 'O')
         fail_files(440U, 'O', persisted_value);
-    device.block.flush = sync_original_flush;
 
     if (kernel_files_pin(&files, 0, &mapping_pin, &result) !=
             KERNEL_FILES_STATUS_OK || result != 0 ||
@@ -3978,7 +3989,8 @@ static void run_partial_write_test(const void *dtb)
             KERNEL_MM_STATUS_OK)
         fail_files(432U, KERNEL_MM_STATUS_NO_MEMORY, shared_fault);
 
-    /* Successful metadata submission still updates the observed timestamp. */
+    /* The mounted clock drives immediate runtime visibility; disk encoding
+     * waits until sync or unmount even when no user bytes were written. */
     if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
         ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, timestamp_test_clock) != EOK ||
@@ -3991,6 +4003,7 @@ static void run_partial_write_test(const void *dtb)
     }
     if (ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, 0) != EOK) fail_files(404U, 0, -1);
 
+    kernel_files_pin_guard_release(&source_pin);
     use_test_satp = 0;
     if (kernel_files_close(&files, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||

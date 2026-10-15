@@ -1,4 +1,5 @@
 #include <arch/riscv/virt_uart.h>
+#include <arch/riscv/smp.h>
 #include <arch/riscv/uart_tty.h>
 #include <arch/riscv/context.h>
 #include <kernel/console.h>
@@ -42,6 +43,9 @@ static void uart_raw_putc(char character)
 
 void virt_uart_putc(char character)
 {
+#if BOAROS_MAX_CPUS > 1
+    if (!riscv_smp_output_allowed()) for (;;) asm volatile("wfi" ::: "memory");
+#endif
     if (emergency) { uart_raw_putc(character); return; }
     if (kernel_log_putc(6, character)) kernel_console_putc(character);
 }

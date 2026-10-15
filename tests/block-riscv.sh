@@ -72,6 +72,11 @@ run_case()
         echo "$mode VirtIO block test kernel did not report success" >&2
         exit 1
     fi
+    if [ "$(grep -cxF 'BoarOS: block 128KiB discrete SG read/write passed' "$output" || true)" -ne 1 ]; then
+        show_output
+        echo "$mode VirtIO block test did not verify the 128KiB discrete SG payload" >&2
+        exit 1
+    fi
     if grep -qF 'BoarOS: block test failed' "$output"; then
         show_output
         echo "$mode VirtIO block test kernel reported a failed case" >&2

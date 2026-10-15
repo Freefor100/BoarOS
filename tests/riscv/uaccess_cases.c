@@ -43,6 +43,8 @@ static int setup_mm(struct physical_page_allocator *allocator,
         physical_page_allocator_bind_access(allocator,
                                             test_page_access) !=
             PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_finalize(allocator) !=
+            PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(kernel_table, allocator) !=
             RISCV_SV39_STATUS_OK) {
         return 0;

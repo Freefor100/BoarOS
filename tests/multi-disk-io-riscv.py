@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import time
 
+from nbd_control import release_rt_response, rt_round_complete
+
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--kernel', default=str(ROOT / 'kernel-rv'))
@@ -251,7 +253,7 @@ def run_rt(transport, cache):
             selector.register(stream, selectors.EVENT_READ, label)
         pending = {key: bytearray() for key in logs}
         active = None; progressed = False; observed = set(); completed = set()
-        hold_acks = set()
+        hold_acks = set(); draining = set()
         deadline = time.monotonic() + 120
         # 回收记录也属于验收输入，进程退出不能代替管道 EOF。
         while selector.get_map() and time.monotonic() < deadline:
@@ -265,7 +267,7 @@ def run_rt(transport, cache):
                     line = line.rstrip(b'\r')
                     if label == 'guest' and line.startswith(b'multi-disk-rt: load ready policy='):
                         active = int(line.rsplit(b'=', 1)[1]);progressed = False;observed = set()
-                        hold_acks = set()
+                        hold_acks = set(); draining = set()
                         for server in servers: server.stdin.write(b'hold\n')
                     elif label in ('a', 'b') and line == b'control=hold' and active is not None:
                         hold_acks.add(label)
@@ -273,10 +275,11 @@ def run_rt(transport, cache):
                     elif label in ('a', 'b') and line.startswith(b'held=') and active is not None:
                         server = servers[0 if label == 'a' else 1]
                         if b'command=0 ' in line:
-                            observed.add((label, 'READ'));server.stdin.write(b'drain\n')
-                        else:
-                            identity = int(line.split()[0].split(b'=')[1])
-                            server.stdin.write(f'release {identity}\n'.encode())
+                            observed.add((label, 'READ'))
+                        if release_rt_response(server.stdin, line, label in draining):
+                            draining.add(label)
+                    elif label in ('a', 'b') and line == b'control=drain':
+                        draining.discard(label)
                     elif label in ('a', 'b') and line.startswith(b'event='):
                         assert b'result=0 ' in line, line
                         if active is not None:
@@ -284,7 +287,7 @@ def run_rt(transport, cache):
                             observed.add((label, event))
                     elif label == 'guest' and line.startswith(b'multi-disk-rt: I/O progressed policy='):
                         assert active == int(line.rsplit(b'=', 1)[1]);progressed = True
-                    if progressed and all((disk, event) in observed for disk in ('a', 'b') for event in ('READ', 'WRITE', 'FLUSH')):
+                    if rt_round_complete(progressed, observed, draining):
                         completed.add(active);active = None;progressed = False;send_token(guest, tokens, label, line)
         check_progress_timeout(guest, work, 'rt', logs, tokens,
             {'active_policy': active, 'completed_policies': sorted(completed),

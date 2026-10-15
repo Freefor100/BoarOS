@@ -6,6 +6,7 @@ struct host_task { struct kernel_task task; unsigned *dispatch; unsigned id; };
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
+#include <string.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -203,11 +204,47 @@ static void fatal_cases(void)
         assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL);
     }
 }
+static unsigned try_mode, try_entered, try_leave;
+static void *try_owner(void *unused)
+{
+    (void)unused;
+    initialize(1);
+    struct kernel_lock_guard guard = {0};
+    if (try_mode) kernel_rwlock_write(&lock, &guard);
+    else kernel_rwlock_read(&lock, &guard);
+    __atomic_store_n(&try_entered, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&try_leave, __ATOMIC_ACQUIRE)) sched_yield();
+    kernel_lock_release(&guard);
+    return 0;
+}
+static void try_write_busy(void)
+{
+    for (unsigned irq = 0; irq < 2; irq++) for (try_mode = 0; try_mode < 2; try_mode++) {
+        kernel_rwlock_init(&lock, 10, 1);
+        try_entered = try_leave = 0;
+        pthread_t owner;
+        assert(!pthread_create(&owner, 0, try_owner, 0));
+        while (!__atomic_load_n(&try_entered, __ATOMIC_ACQUIRE)) sched_yield();
+        sync_test_irq = irq;
+        struct kernel_lock_guard guard = {0}, saved = guard;
+        assert(!kernel_rwlock_try_write(&lock, &guard));
+        assert(!memcmp(&guard, &saved, sizeof(guard)) && !current.io_context.locks);
+        assert(sync_test_irq == irq && !cpu.raw_locks && !cpu.preempt_depth);
+        assert(!lock.waiters.registrations && !lock.pending_head && !lock.handoff_owner);
+        __atomic_store_n(&try_leave, 1, __ATOMIC_RELEASE);
+        assert(!pthread_join(owner, 0));
+        assert(kernel_rwlock_try_write(&lock, &guard));
+        assert(lock.writer == &current.io_context && !lock.readers);
+        kernel_lock_release(&guard);
+        assert(sync_test_irq == irq && !current.io_context.locks);
+    }
+}
 int main(void)
 {
     initialize(0);
     kernel_wait_domain_init();
     fatal_cases();
+    try_write_busy();
     for (unsigned irq = 0; irq < 2; irq++) {
         sync_test_irq = irq;
         struct kernel_lock_guard guard = {0};

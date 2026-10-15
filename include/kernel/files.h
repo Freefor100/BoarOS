@@ -126,6 +126,13 @@ struct kernel_files {
 enum kernel_files_status kernel_files_create(
     struct kernel_files *files,
     struct kernel_heap *heap);
+/* CPU0在独占、未发布record上启用；全部OFD/端点引用及观察者必须在本域。
+ * 接纳同域匿名pipe或同域tmpfs/受控磁盘普通OFD。普通OFD调用者必须
+ * 另持CPU0控制引用至任务、请求和MM结束；未准备的普通OFD不能随后安装。
+ * 控制者和任务
+ * 分别持有handle，record共享。末handle退休后锁外清理OFD及数组。 */
+enum kernel_files_status kernel_files_enable_concurrency(struct kernel_files *, const struct kernel_mm *);
+enum kernel_files_status kernel_files_check_concurrent_domain(const struct kernel_files *, const struct kernel_mm *);
 
 /* Share the complete descriptor table and its cleanup ownership. */
 enum kernel_files_status kernel_files_acquire(
@@ -143,10 +150,6 @@ enum kernel_files_status kernel_files_move(
 
 int kernel_files_is_live(const struct kernel_files *files);
 
-/* Borrowed descriptor inspection; caller serializes the table and pins any
- * object it retains before releasing that protection. */
-struct kernel_open_file_description *kernel_files_fd_borrow(
-    const struct kernel_files *files, int64_t fd);
 int kernel_files_next_open_fd(const struct kernel_files *files, int after,
                               int *fd);
 

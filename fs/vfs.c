@@ -1,6 +1,7 @@
 #include "vfs_objects.h"
 #include "vfs_internal.h"
 #include "record_lock.h"
+#include "write_source.h"
 #include <arch/context.h>
 
 #include <kernel/block.h>
@@ -1000,7 +1001,7 @@ int kernel_vfs_create_at(struct kernel_vfs_path *start,
         struct kernel_vfs_node *node = file->private_data;
         struct kernel_vfs_instance *adapter = file->mount->private_data;
         child->file = *file;
-        node->references++;
+        __atomic_fetch_add(&node->references,1,__ATOMIC_RELAXED);
         node->open_files++;
         adapter->external_files++;
         file->path = child;
@@ -1122,23 +1123,32 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
     if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
     while (*bytes_read < size && offset < node->size) {
-        uint64_t address;
-        size_t valid, start = (size_t)(offset & (BOAROS_PAGE_SIZE - 1U));
-        void *page;
-        enum kernel_page_cache_status status = kernel_page_cache_get(
-              cache, file, offset >> BOAROS_PAGE_SHIFT, &address, &valid);
-        if (status != KERNEL_PAGE_CACHE_STATUS_OK)
-            return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
-                       ? -KERNEL_ENOMEM : -KERNEL_EIO;
-        if (physical_page_resolve(cache->allocator, address, &page) !=
-                PHYSICAL_PAGE_STATUS_OK || valid <= start) __builtin_trap();
-        size_t count = valid - start;
-        if (count > size - *bytes_read) count = size - *bytes_read;
-        memcpy((unsigned char *)buffer + *bytes_read,
-                (unsigned char *)page + start, count);
-        (void)physical_page_release(cache->allocator, address);
-        *bytes_read += count;
-        offset += count;
+        size_t start = offset & BOAROS_PAGE_MASK;
+        size_t window = BOAROS_PAGE_SIZE * KERNEL_PAGE_CACHE_READ_BATCH_MAX - start;
+        if (window > size - *bytes_read) window = size - *bytes_read;
+        if (window > node->size - offset) window = node->size - offset;
+        size_t count = (start + window + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+        struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+        if (kernel_page_cache_get_batch(cache, file, offset >> BOAROS_PAGE_SHIFT, pages, count) ==
+            KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
+        int error = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (pages[i].status) {
+                error = pages[i].status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+                break;
+            }
+            void *page;
+            size_t valid = pages[i].valid_bytes;
+            if (physical_page_resolve(cache->allocator, pages[i].physical_address, &page) || valid <= start)
+                __builtin_trap();
+            size_t copied = valid - start;
+            if (copied > size - *bytes_read) copied = size - *bytes_read;
+            memcpy((unsigned char *)buffer + *bytes_read, (unsigned char *)page + start, copied);
+            *bytes_read += copied; offset += copied; start = 0;
+        }
+        for (size_t i = 0; i < count; i++) if (!pages[i].status)
+            if (physical_page_release(cache->allocator, pages[i].physical_address)) __builtin_trap();
+        if (error) return error;
     }
     return 0;
 }
@@ -1151,32 +1161,66 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
         kernel_page_cache_extend(node->instance->page_cache, node, old_size, size);
     node->size = size;
     file->size = node->size;
-    if (node->size < old_size) {
-        for (struct kernel_file_mapping *mapping = node->mappings;
-             mapping != 0; mapping = mapping->next) {
-            mapping->truncate(mapping->owner, node, node->size);
-        }
+    if (node->size < old_size && !node->memory) {
+        kernel_file_mapping_notify(node, node->size);
     }
     if (size < old_size && node->instance->page_cache)
         kernel_page_cache_truncate(node->instance->page_cache, node, size);
 }
 
-int kernel_vfs_pwrite(struct kernel_vfs_file *file,
-                      uint64_t offset,
-                      const void *buffer,
-                      size_t size,
-                      size_t *bytes_written)
+static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
+    struct kernel_vfs_write_source *source,size_t size,size_t *written)
+{
+    struct physical_page_allocator *allocator=node->instance->heap->page_allocator;
+    *written=0;
+    while (*written<size) {
+        size_t start=offset&BOAROS_PAGE_MASK;
+        size_t count=BOAROS_PAGE_SIZE-start;
+        if (count>size-*written) count=size-*written;
+        count=kernel_vfs_write_source_span(source,count);
+        if (!count) { source->access=KERNEL_UACCESS_STATUS_STATE; return 0; }
+        KERNEL_LOCK_SCOPE(io);
+        kernel_vfs_node_lock(node,&io,1);
+        uint64_t address,index=offset>>BOAROS_PAGE_SHIFT; int created;
+        enum kernel_memory_object_status status=kernel_memory_object_prepare_page(
+            node->memory,index,&address,&created);
+        if (status==KERNEL_MEMORY_OBJECT_NO_SPACE) return -KERNEL_ENOSPC;
+        if (status==KERNEL_MEMORY_OBJECT_NO_MEMORY) return -KERNEL_ENOMEM;
+        if (status) __builtin_trap();
+        kernel_lock_release(&io);
+        struct kernel_mm_user_pin pin={0};
+        if (!kernel_vfs_write_source_pin(source,&pin)) {
+            kernel_memory_object_finish_page(node->memory,index,address,0);
+            return 0;
+        }
+        kernel_vfs_node_lock(node,&io,1);
+        void *page;
+        if (physical_page_resolve(allocator,address,&page)) __builtin_trap();
+        kernel_vfs_write_source_copy(source,(unsigned char *)page+start,count);
+        node->instance->ops->memory_written(node,offset+count);
+        kernel_lock_release(&io);
+        if (pin.registration) kernel_mm_unpin_user_page(&pin);
+        kernel_memory_object_finish_page(node->memory,index,address,1);
+        if (physical_page_release(allocator,address)) __builtin_trap();
+        kernel_vfs_write_source_advance(source,count);
+        offset+=count; *written+=count;
+    }
+    return 0;
+}
+
+static int vfs_write_source(struct kernel_vfs_file *file,uint64_t offset,
+    struct kernel_vfs_write_source *source,size_t size,size_t *bytes_written)
 {
     struct kernel_vfs_node *node;
     size_t written = 0U;
     int result;
 
     if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
-        file->private_data == 0 || (buffer == 0 && size != 0U) ||
-        bytes_written == 0) {
+        file->private_data == 0 || bytes_written == 0) {
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    *bytes_written=0;
     KERNEL_LOCK_SCOPE(operation_guard);
     kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
@@ -1197,18 +1241,51 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     if (size > node->max_size - offset)
         size = (size_t)(node->max_size - offset);
+    kernel_lock_release(&node_guard);
     result = node->memory
-        ? node->instance->ops->memory_write(node, offset, buffer, size, &written)
-        : kernel_page_cache_write(node->instance->page_cache, file, offset, buffer, size, &written);
+        ? memory_write_source(node,offset,source,size,&written)
+        : kernel_page_cache_write_source(node->instance->page_cache,file,offset,source,size,&written);
     file->size = node->size;
     *bytes_written = written;
     if (written > size) {
         return -KERNEL_EIO;
     }
-    if (result != 0 && written == 0U) {
-        return result;
+    return result;
+}
+
+int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
+    const void *buffer,size_t size,size_t *bytes_written)
+{
+    if ((!buffer && size) || !bytes_written) return -KERNEL_EINVAL;
+    struct kernel_vfs_write_source source={.data=buffer};
+    size_t written=0;
+    int error=vfs_write_source(file,offset,&source,size,&written);
+    *bytes_written=written;
+    return written?0:error;
+}
+
+int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov,size_t iov_count,size_t count,
+    uint64_t offset,int append,struct kernel_vfs_user_write_result *result)
+{
+    if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data ||
+        !mm || !iov || !result) return -KERNEL_EINVAL;
+    *result=(struct kernel_vfs_user_write_result){.end_offset=offset};
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(file,&operation);
+    if (append) {
+        KERNEL_LOCK_SCOPE(io);
+        struct kernel_vfs_node *node=file->private_data;
+        kernel_vfs_node_lock(node,&io,0);
+        offset=node->size;
+        result->end_offset=offset;
     }
-    return 0;
+    struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0}};
+    int error=vfs_write_source(file,offset,&source,count,&result->written);
+    result->end_offset=offset+result->written;
+    result->access=source.access;
+    result->chunks=source.chunks;
+    return error;
 }
 
 int kernel_vfs_append(struct kernel_vfs_file *file,
@@ -1246,6 +1323,7 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
         *bytes_written = 0U;
         return 0;
     }
+    kernel_lock_release(&node_guard);
     result = kernel_vfs_pwrite(file, offset, buffer, size, &written);
     if (written_offset != 0) {
         *written_offset = offset + (uint64_t)written;
@@ -1297,7 +1375,77 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
-    if (node->memory) apply_truncated_size(node, file, size);
+    if (node->memory) {
+        /* 关闭旧候选的发布，释放inode锁后才逐MM撤销。登记/OFD覆盖回调
+         * 寿命；缺页最终校验取得IO读锁，因此关闭与提交有唯一先后关系。 */
+        uint64_t old_size = node->size;
+        /* 首次状态发布同样取得 I/O 读保护。没有状态时保持写保护直到
+         * 后备提交，禁止在旧尺寸和新登记之间形成未关闭的窗口。 */
+        if (!__atomic_load_n(&node->mapping_state, __ATOMIC_ACQUIRE)) {
+            uint64_t actual;
+            int changed;
+            result = node->instance->ops->truncate(node, size, &actual, &changed);
+            if (changed) apply_truncated_size(node, file, actual);
+            return result;
+        }
+        kernel_file_mapping_close(node);
+        kernel_lock_release(&node_guard);
+        if (size < old_size) kernel_file_mapping_notify(node, size);
+        kernel_vfs_node_lock(node, &node_guard, 1);
+        uint64_t actual;
+        int changed;
+        result = node->instance->ops->truncate(node, size, &actual, &changed);
+        if (changed) apply_truncated_size(node, file, actual);
+        kernel_file_mapping_open(node);
+        return result;
+    }
+    if (node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache)) {
+        kernel_assert_service_context();
+        struct kernel_page_cache *cache = node->instance->page_cache;
+        uint64_t old_size = node->size;
+        result = kernel_file_mapping_prepare(node);
+        if (result) return result;
+        /* 写操作门保留，inode保护必须在MM回调、pin排空和磁盘等待前释放。 */
+        kernel_lock_release(&node_guard);
+        result = kernel_page_cache_writeback_before(cache, node, size);
+        if (result) return result;
+        kernel_vfs_node_lock(node, &node_guard, 1);
+        kernel_file_mapping_close(node);
+        kernel_lock_release(&node_guard);
+        struct kernel_page_cache_resize resize = {0};
+        result = kernel_page_cache_resize_prepare(cache,node,old_size,size,&resize);
+        if (result) {
+            kernel_vfs_node_lock(node,&node_guard,1);
+            kernel_file_mapping_open(node);
+            return result;
+        }
+        if (size < old_size) kernel_file_mapping_notify(node,size);
+        uint64_t actual;
+        int changed;
+        kernel_vfs_node_lock(node,&node_guard,1);
+        result = node->instance->ops->truncate(node,size,&actual,&changed);
+        kernel_lock_release(&node_guard);
+        if (!changed) {
+            /* 撤映射可以重建；脏页与尾部内容不能在无变化失败时被提前丢弃。 */
+            kernel_vfs_node_lock(node,&node_guard,1);
+            kernel_page_cache_resize_finish(&resize,old_size);
+        } else {
+            if (actual != size) {
+                kernel_page_cache_resize_finish(&resize,old_size);
+                if (actual < size) kernel_file_mapping_notify(node,actual);
+                if (kernel_page_cache_resize_prepare(cache,node,old_size,actual,&resize))
+                    __builtin_trap();
+            }
+            /* 关闭代次只拒绝MM提交，不能替代缓存lookup的inode保护。
+             * 结果收敛重新取写保护，阻止冷加载越过整页退休与size发布。 */
+            kernel_vfs_node_lock(node,&node_guard,1);
+            kernel_page_cache_resize_finish(&resize,actual);
+            if (actual < old_size) kernel_page_cache_truncate(cache,node,actual);
+        }
+        if (changed) { __atomic_store_n(&node->size,actual,__ATOMIC_RELEASE); file->size=actual; }
+        kernel_file_mapping_open(node);
+        return result;
+    }
     result = node->memory ? 0 : kernel_page_cache_writeback_before(node->instance->page_cache, node, size);
     if (result != 0) return result;
     uint64_t actual;
@@ -1837,38 +1985,18 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node)
 {
-    if (node == 0 || node->references == 0U || node->closed ||
-        node->references == UINT32_MAX) {
-        return -KERNEL_EINVAL;
+    if (!node || node->closed) return -KERNEL_EINVAL;
+    uint32_t references=__atomic_load_n(&node->references,__ATOMIC_ACQUIRE);
+    for (;;) {
+        if (!references || references==UINT32_MAX) return -KERNEL_EINVAL;
+        if (__atomic_compare_exchange_n(&node->references,&references,references+1,1,
+            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
     }
-    node->references++;
-    return 0;
 }
 
 static void release_node_pin(struct kernel_vfs_node **owner)
 {
     if (*owner && kernel_vfs_node_release(owner)) __builtin_trap();
-}
-
-void kernel_file_mapping_register(struct kernel_file_mapping *mapping)
-{
-    if (mapping == 0 || mapping->node == 0 || mapping->owner == 0 ||
-        mapping->truncate == 0 || mapping->previous != 0) {
-        __builtin_trap();
-    }
-    mapping->next = mapping->node->mappings;
-    mapping->previous = &mapping->node->mappings;
-    if (mapping->next != 0) mapping->next->previous = &mapping->next;
-    mapping->node->mappings = mapping;
-}
-
-void kernel_file_mapping_unregister(struct kernel_file_mapping *mapping)
-{
-    if (mapping->previous == 0) return;
-    *mapping->previous = mapping->next;
-    if (mapping->next != 0) mapping->next->previous = mapping->previous;
-    mapping->next = 0;
-    mapping->previous = 0;
 }
 
 int kernel_vfs_node_release(struct kernel_vfs_node **owner)
@@ -1881,17 +2009,18 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         return -KERNEL_EINVAL;
     }
     node = *owner;
-    if (node->references > 1U) {
-        node->references--;
-        *owner = 0;
-        return 0;
+    uint32_t references=__atomic_load_n(&node->references,__ATOMIC_ACQUIRE);
+    while (references>1U) {
+        if (__atomic_compare_exchange_n(&node->references,&references,references-1,1,
+            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) { *owner=0; return 0; }
     }
-    if (node->references == 1U) {
-        if (node->mappings != 0 || node->fifo_pipe || node->cache_pages ||
-            node->dirty_cache_pages.head || node->dirty_cache_pages.count) __builtin_trap();
+    if (__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == 1U) {
+        if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
+            node->dirty_cache_pages.head || node->dirty_cache_pages.tail || node->dirty_cache_pages.count ||
+            node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous) __builtin_trap();
         if (!kernel_record_lock_state_empty(&node->record_locks))
             __builtin_trap();
-        node->references = 0U;
+        __atomic_store_n(&node->references,0,__ATOMIC_RELEASE);
         link = &node->instance->nodes;
         while (*link != 0 && *link != node) {
             link = &(*link)->next;
@@ -1919,6 +2048,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         }
         node->closed = 1U;
     }
+    kernel_file_mapping_destroy(node);
     (void)kernel_heap_release(node->instance->heap, node);
     *owner = 0;
     return 0;
@@ -1926,8 +2056,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
 
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
 {
-    return node != 0 && node->references != 0U && !node->closed
-               ? node->size : 0U;
+    return node != 0 && __atomic_load_n(&node->references,__ATOMIC_ACQUIRE) != 0U && !node->closed
+               ? __atomic_load_n(&node->size,__ATOMIC_ACQUIRE) : 0U;
 }
 
 struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
@@ -1941,7 +2071,7 @@ struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_no
 
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end)
 {
-    if (end > node->size) node->size = end;
+    if (end > node->size) __atomic_store_n(&node->size,end,__ATOMIC_RELEASE);
 }
 
 int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node)
@@ -2042,7 +2172,8 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
         if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG || !instance->page_cache)
             continue;
         KERNEL_LOCK_SCOPE(node_guard);
-        kernel_vfs_node_lock(node, &node_guard, 0);
+        if (!kernel_page_cache_is_controlled(instance->page_cache))
+            kernel_vfs_node_lock(node, &node_guard, 0);
         int error = kernel_page_cache_writeback(instance->page_cache, node);
         if (error && error != -KERNEL_ENOMEM && error != -KERNEL_EBUSY)
             kernel_vfs_record_writeback_error(node, error);
@@ -2174,11 +2305,15 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
     kernel_vfs_node_lock(node, &node_guard, 0);
     result = 0;
     if (node->instance->read_only) goto observe;
+    int controlled = node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache);
+    if (controlled) kernel_assert_service_context();
+    if (controlled && node_guard.lock) kernel_lock_release(&node_guard);
     result = !node->instance->page_cache ? 0 : start == 0U && end == UINT64_MAX
         ? kernel_page_cache_writeback(node->instance->page_cache, node)
         : kernel_page_cache_writeback_range(node->instance->page_cache,
                                             node, start, end);
     if (result == 0) {
+        if (controlled) kernel_vfs_node_lock(node, &node_guard, 0);
         result = node->instance->ops->sync_metadata(node, data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR);
         if (result != 0) kernel_vfs_record_writeback_error(node, result);
     }
@@ -2242,7 +2377,7 @@ void kernel_vfs_file_write_lock(struct kernel_vfs_file *file, struct kernel_lock
 
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write)
 {
-    if (!node || !node->references) __builtin_trap();
+    if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE)) __builtin_trap();
     if (kernel_lock_held(&node->io_lock, write)) return;
     if (write) kernel_rwlock_write(&node->io_lock, guard);
     else kernel_rwlock_read(&node->io_lock, guard);
@@ -2321,7 +2456,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
         if (error) return error;
         for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
             if (node->inode != inode_number || node->retired || node->closed) continue;
-            if (node->references == UINT32_MAX) return -KERNEL_EOVERFLOW;
+            if (__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == UINT32_MAX) return -KERNEL_EOVERFLOW;
             struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) = 0;
             int pinned = kernel_vfs_node_acquire(node);
             if (pinned) return pinned;
@@ -2441,25 +2576,12 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
     struct kernel_vfs_read_span *spans, size_t count)
 {
-    if (!node || !node->mount || !node->mount->private_data ||
-        count > KERNEL_VFS_READ_BATCH_MAX || (count && !spans)) return -KERNEL_EINVAL;
-    for (size_t i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = -KERNEL_EINVAL; }
-    for (size_t i = 0; i < count; i++) {
-        uintptr_t a = (uintptr_t)spans[i].buffer, b = (uintptr_t)spans;
-        size_t n = spans[i].size;
-        if (spans[i].offset > INT64_MAX || n > UINT64_MAX - spans[i].offset ||
-            (n && (!a || n - 1 > UINTPTR_MAX - a ||
-            (a < b ? b - a < n : a - b < count * sizeof(*spans))))) return spans[i].error = -KERNEL_EINVAL;
-        for (size_t j = 0; j < i; j++) {
-            b = (uintptr_t)spans[j].buffer;
-            if (n && spans[j].size && (a < b ? b - a < n : a - b < spans[j].size)) return spans[i].error = -KERNEL_EINVAL;
-        }
-    }
-    for (size_t i = 0; i < count; i++) spans[i].error = 0;
+    /* 私有调用者已固定独立的缓存页；后端边界负责自己的参数校验和结果初始化。 */
     struct kernel_vfs_instance *instance = node->mount->private_data;
     if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count);
     int result = 0;
     for (size_t i = 0; i < count; i++) {
+        spans[i].completed = 0;
         spans[i].error = instance->ops->pread(node, spans[i].offset, spans[i].buffer, spans[i].size, &spans[i].completed);
         if (!result) result = spans[i].error;
     }
@@ -2502,12 +2624,12 @@ int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
     return instance->ops->snapshot(file->private_data, heap, buffer, length);
 }
 
-int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written)
+int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count)
 {
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;
-    return instance->ops->writeback(node, offset, buffer, size, written);
+    return instance->ops->writeback(node, spans, count);
 }
 
 /* 后端已准备好私有 handle；同一实例的活 inode 只发布一个通用节点。 */
@@ -2556,10 +2678,11 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
             return error ? error : -KERNEL_EOVERFLOW;
         }
         node->mount = mount;
-        node->references = 1;
+        __atomic_store_n(&node->references,1,__ATOMIC_RELEASE);
         node->open_files = 1;
         kernel_mutex_init(&node->write_operation, 15, (uintptr_t)node);
         kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
+        kernel_file_mapping_init(node);
         kernel_record_lock_state_init(&node->record_locks);
         node->next = instance->nodes;
         instance->nodes = node;

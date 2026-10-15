@@ -202,7 +202,9 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
     uint32_t fcsr;
     size_t copied;
 
-    if (frame == 0 || (frame->sp & 15U) != 0U ||
+    /* Delivery is ABI-aligned; Linux sigreturn accepts a readable relocated
+     * frame without imposing that alignment on user input. */
+    if (frame == 0 ||
         frame->sp > UINT64_MAX - RISCV_SIGNAL_FRAME_SIZE ||
         kernel_task_mm_borrow_mutable(task, &mm) != KERNEL_TASK_STATUS_OK) {
         riscv_signal_bad_frame();

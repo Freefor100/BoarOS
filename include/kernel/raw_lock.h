@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 enum kernel_raw_rank {
-    KERNEL_RAW_RANK_HEAP = 10, KERNEL_RAW_RANK_PAGE = 20,
+    KERNEL_RAW_RANK_HEAP = 10, KERNEL_RAW_RANK_MM = 15,
+    KERNEL_RAW_RANK_PAGE = 20,
     KERNEL_RAW_RANK_OBJECT = 30, KERNEL_RAW_RANK_SCHEDULER = 40
 };
 /* 初始化/移动仅允许未发布实例；原子字是权威互斥，CPU链负责owner与锁序。 */
@@ -27,6 +28,7 @@ void kernel_raw_lock_release(struct kernel_raw_guard *);
 static inline void kernel_raw_scope_release(struct kernel_raw_guard *guard)
 { if (guard->lock) kernel_raw_lock_release(guard); }
 #define KERNEL_RAW_SCOPE(name, object) \
-    struct kernel_raw_guard name __attribute__((cleanup(kernel_raw_scope_release))) = {0}; \
+    struct kernel_raw_guard name __attribute__((cleanup(kernel_raw_scope_release))); \
+    name.lock = 0; \
     kernel_raw_lock_acquire((object), &name)
 #endif

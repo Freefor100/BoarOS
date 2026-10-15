@@ -1,4 +1,5 @@
 #include <kernel/block.h>
+#include <kernel/cpu.h>
 #include <kernel/errno.h>
 #ifdef __riscv
 #include <arch/context.h>
@@ -24,6 +25,7 @@ static void registry_unlock(uintptr_t state)
 
 enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
 {
+    kernel_assert_service_context();
     if (device == 0 || device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_INVALID;
     }
@@ -40,6 +42,7 @@ enum kernel_block_status kernel_block_read_at(
     void *buffer,
     size_t size)
 {
+    kernel_assert_service_context();
     if (device == 0 || device->read == 0 ||
         device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_INVALID;
@@ -64,6 +67,7 @@ enum kernel_block_status kernel_block_write_at(
     const void *buffer,
     size_t size)
 {
+    kernel_assert_service_context();
     if (device == 0 || device->write == 0 ||
         device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_UNSUPPORTED;
@@ -87,6 +91,7 @@ enum kernel_block_status kernel_block_write_batch(
     const struct kernel_block_span *spans,
     size_t count)
 {
+    kernel_assert_service_context();
     if (!device || !device->logical_block_size)
         return KERNEL_BLOCK_STATUS_INVALID;
     if (!device->write && !device->write_batch)
@@ -127,6 +132,7 @@ static int memory_overlaps(uintptr_t a, size_t an, uintptr_t b, size_t bn)
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
     struct kernel_block_read_span *spans, size_t count)
 {
+    kernel_assert_service_context();
     if (!device || !device->logical_block_size || count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
         return KERNEL_BLOCK_STATUS_INVALID;
     if (!device->read && !device->read_batch) return KERNEL_BLOCK_STATUS_UNSUPPORTED;

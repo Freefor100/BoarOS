@@ -25,13 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <kernel/cost.h>
-
-struct riscv_switch_context {
-    uint64_t ra;
-    uint64_t sp;
-    uint64_t tp;
-    uint64_t s[12];
-} __attribute__((aligned(16)));
+#include <arch/switch_context.h>
 
 enum riscv_context_status {
     RISCV_CONTEXT_STATUS_OK = 0,

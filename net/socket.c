@@ -169,6 +169,7 @@ static struct kernel_io_context *protocol_owner;
 
 uintptr_t kernel_socket_protocol_enter(void)
 {
+    kernel_assert_service_context();
     uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (protocol_depth && protocol_owner != owner) __builtin_trap();

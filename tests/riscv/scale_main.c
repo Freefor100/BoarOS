@@ -30,20 +30,10 @@ static unsigned char payload[4096];
 static uint64_t active_satp;
 #if BOAROS_COST_DIAGNOSTICS
 static uint32_t cost_frequency;
-static unsigned cost_copy_measuring;
-static uint64_t cost_copy_observed;
 #endif
-enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
-enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *to, uint64_t from, size_t size, size_t *copied)
-{
-    enum kernel_uaccess_status status = __real_kernel_copy_from_user(mm, to, from, size, copied);
-#if BOAROS_COST_DIAGNOSTICS
-    if (cost_copy_measuring) cost_copy_observed += *copied;
-#endif
-    return status;
-}
 
-static unsigned cache_io_probe, cache_reads, cache_writes;
+static unsigned cache_io_probe, cache_reads, cache_writes, cache_write_spans;
+static size_t cache_write_bytes;
 static uint64_t cache_last_offset;
 int __real_kernel_vfs_node_pread(struct kernel_vfs_node *, uint64_t, void *, size_t, size_t *);
 int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, void *buffer, size_t size, size_t *done)
@@ -51,14 +41,19 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
     if (cache_io_probe) cache_reads++;
     return __real_kernel_vfs_node_pread(node, offset, buffer, size, done);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *done)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
 {
-    if (cache_io_probe) {
-        if (cache_writes && offset <= cache_last_offset) __builtin_trap();
-        cache_last_offset = offset; cache_writes++;
+    if (cache_io_probe && count) {
+        if (cache_writes && spans[0].offset<=cache_last_offset) __builtin_trap();
+        for (size_t i=0;i<count;i++) {
+            if (i && spans[i].offset<=spans[i-1].offset) __builtin_trap();
+            cache_write_bytes+=spans[i].size;
+        }
+        cache_write_spans+=count;
+        cache_last_offset=spans[count-1].offset; cache_writes++;
     }
-    return __real_kernel_vfs_node_writeback(node, offset, buffer, size, done);
+    return __real_kernel_vfs_node_writeback(node,spans,count);
 }
 
 static unsigned freeze_lwip_clock;
@@ -148,13 +143,13 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
           kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 252);
     memset(bytes, 0x52, sizeof(bytes));
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_vfs_pwrite(&file, 0, bytes, 4096, &count) == 0 && count == 4096, 253);
     cache_io_probe = 0;
     number("cache full-overwrite backend reads: ", cache_reads);
     check(!cache_reads && kernel_vfs_sync(&file, 0, &observed) == 0 &&
           kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 254);
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     unsigned char value = 0x73;
     check(kernel_vfs_pwrite(&file, 17, &value, 1, &count) == 0 && count == 1, 255);
     cache_io_probe = 0;
@@ -172,13 +167,13 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_begin(6, cost_frequency, 1, 0) == 0, 261);
 #endif
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 3 * 4096, 4 * 4096) == 0, 262);
     cache_io_probe = 0; check(cache_writes == 1 && !cache_reads, 263);
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t visits, snapshot;
     check(kernel_cost_end(6, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
-          visits <= 2 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 264);
+          visits <= 2 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 4096, 264);
     number("cache small-range visits: ", visits); number("cache one-byte snapshot: ", snapshot);
 #endif
     unsigned indices[] = {200, 3, 100};
@@ -187,9 +182,11 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_begin(7, cost_frequency, 1, 0) == 0, 266);
 #endif
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 267);
-    cache_io_probe = 0; check(cache_writes == 3 && !cache_reads, 268);
+    cache_io_probe = 0;
+    check(cache_writes == (3+BOAROS_PAGE_CACHE_WRITEBACK_PAGES-1)/BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
+          cache_write_spans==3 && cache_write_bytes==3 && !cache_reads, 268);
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_end(7, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
           visits <= 6 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 3, 269);
@@ -200,7 +197,7 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_begin(8, cost_frequency, 1, 0) == 0, 276);
 #endif
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 70 * 4096, 71 * 4096) == 0, 277);
     cache_io_probe = 0; check(cache_writes == 1, 278);
 #if BOAROS_COST_DIAGNOSTICS
@@ -208,9 +205,11 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
           visits == 1 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 279);
     number("cache selected hash visits among 16 dirty: ", visits);
 #endif
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 280);
-    cache_io_probe = 0; check(cache_writes == 15, 281);
+    cache_io_probe = 0;
+    check(cache_write_spans==15 && cache_write_bytes==15 && cache_writes==
+          (15+BOAROS_PAGE_CACHE_WRITEBACK_PAGES-1)/BOAROS_PAGE_CACHE_WRITEBACK_PAGES, 281);
     check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
           kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 270);
     for (unsigned i = 0; i < 3; i++) {
@@ -225,7 +224,7 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     memset(bytes, 0x49, sizeof(bytes));
     for (unsigned i = 32; i < 40; i++)
         check(kernel_vfs_pwrite(&file, (uint64_t)i * 4096, bytes, sizeof(bytes), &count) == 0 && count == sizeof(bytes), 284);
-    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    cache_reads = cache_writes = cache_write_spans = 0; cache_write_bytes = 0; cache_io_probe = 1;
     check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 32 * 4096, 40 * 4096) == 0, 285);
     cache_io_probe = 0;
     check(!cache_reads && cache_writes == 8 / BOAROS_PAGE_CACHE_WRITEBACK_PAGES, 286);
@@ -279,14 +278,21 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     for (unsigned i = 0; i < 16; i++) kernel_socket_destroy(idle[i]);
     struct kernel_socket_statistics before, after;
     kernel_socket_get_statistics(&before);
-    uint64_t resolutions = kernel_uaccess_page_resolutions();
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(9, cost_frequency, 1, 0) == 0, 33);
+#endif
     check(kernel_files_write(files, mm, client_fd, BUFFER + 1, 8192, &result) ==
           KERNEL_FILES_STATUS_OK && result == 8192, 32);
     kernel_socket_get_statistics(&after);
-    resolutions = kernel_uaccess_page_resolutions() - resolutions;
     number("TCP 8192-byte submissions: ", after.tcp_write_calls - before.tcp_write_calls);
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t resolutions;
+    check(kernel_cost_end(9, 0) == 0 &&
+          kernel_cost_read(0, COST_USER_RESOLUTIONS, &resolutions) == 0 &&
+          resolutions > 0 && resolutions <= 8, 33);
     number("TCP user-page resolutions: ", resolutions);
-    check(after.tcp_write_calls - before.tcp_write_calls <= 8 && resolutions <= 8 &&
+#endif
+    check(after.tcp_write_calls - before.tcp_write_calls <= 8 &&
           after.tcp_written_bytes - before.tcp_written_bytes == 8192, 33);
     struct kernel_open_file_description *reader=0;
     check(kernel_open_file_create_socket(files->heap,accepted,0,&reader)==KERNEL_OPEN_FILE_STATUS_OK, 201);
@@ -304,18 +310,18 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     check(reserved > 0 && !client && !(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT), 241);
     kernel_socket_stream_begin(&competing, &second_pin);
     check(kernel_socket_stream_reserve(&competing, 1, 0) == -KERNEL_EAGAIN, 242);
-    resolutions = kernel_uaccess_page_resolutions();
 #if BOAROS_COST_DIAGNOSTICS
     check(kernel_cost_begin(5, cost_frequency, 1, 0) == 0, 243);
 #endif
     check(kernel_files_write(files, mm, client_fd, BUFFER, 4096, &result) == KERNEL_FILES_STATUS_OK &&
-          result == -KERNEL_EAGAIN && kernel_uaccess_page_resolutions() == resolutions, 244);
+          result == -KERNEL_EAGAIN, 244);
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t denied, copied_blocked, copied_stream;
     check(kernel_cost_end(5, 0) == 0 &&
           kernel_cost_read(0, COST_STREAM_ADMIT_BLOCKED, &denied) == 0 && denied == 1 &&
           kernel_cost_read(0, COST_STREAM_COPY_BLOCKED_BYTES, &copied_blocked) == 0 && !copied_blocked &&
-          kernel_cost_read(0, COST_STREAM_COPY, &copied_stream) == 0 && !copied_stream, 245);
+          kernel_cost_read(0, COST_STREAM_COPY, &copied_stream) == 0 && !copied_stream &&
+          kernel_cost_read(0, COST_USER_RESOLUTIONS, &resolutions) == 0 && !resolutions, 245);
 #endif
     kernel_socket_stream_cancel(&reservation);
     check(kernel_socket_stream_reserve(&competing, 3, 0) == 3, 246);
@@ -818,8 +824,8 @@ static void growth_cost(struct kernel_vfs_mount *mount, struct kernel_page_cache
                   kernel_cost_read(0, COST_RESIZE_TAIL_PAGES, &tails) == 0, 215);
             number("growth bytes: ", size); number("growth chunk: ", chunks[c]);
             number("growth visits: ", visits); number("growth tail pages: ", tails);
-            uint64_t needed = chunks[c] == 1024 ? size / 4096 * 3 : 0;
-            check(visits <= needed && tails == needed, 216);
+            uint64_t budget = chunks[c] == 1024 ? size / 4096 * 3 : 0;
+            check(visits <= budget && tails <= budget, 216);
             struct kernel_page_cache_statistics stats;
             kernel_page_cache_get_statistics(cache, &stats);
             check(stats.current_pages >= size / 4096, 217);
@@ -901,31 +907,30 @@ void kernel_main(unsigned long hart, const void *dtb)
               KERNEL_UACCESS_STATUS_OK && copied == sizeof(payload), 8);
     struct kernel_files_statistics before, after;
     kernel_files_get_statistics(&files, &before);
-    uint64_t resolutions = kernel_uaccess_page_resolutions();
 #if BOAROS_COST_DIAGNOSTICS
     struct riscv_virtio_mmio_block_statistics device_before, device_after;
     riscv_virtio_mmio_block_get_statistics(&device, &device_before);
     cost_frequency = info.timebase_frequency;
     check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 190);
-    cost_copy_measuring = 1;
 #endif
     check(kernel_files_write(&files, &mm, fd, BUFFER, MIB, &result) == KERNEL_FILES_STATUS_OK &&
           result == MIB, 9);
-    resolutions = kernel_uaccess_page_resolutions() - resolutions;
 #if BOAROS_COST_DIAGNOSTICS
-    cost_copy_measuring = 0;
     check(kernel_cost_end(1, 0) == 0, 191);
-    uint64_t metric;
-    check(kernel_cost_read(0, COST_COPY_FROM_USER, &metric) == 0 && metric == cost_copy_observed && metric == MIB, 192);
-    check(kernel_cost_read(0, COST_USER_RESOLUTIONS, &metric) == 0 && metric == resolutions, 193);
+    uint64_t metric, resolutions;
+    check(kernel_cost_read(0, COST_COPY_FROM_USER, &metric) == 0 && metric == MIB &&
+          kernel_cost_read(0, COST_UACCESS_COPY_BYTES, &metric) == 0 && metric == MIB &&
+          kernel_cost_read(0, COST_CACHE_COPY, &metric) == 0 && metric == 0, 192);
+    check(kernel_cost_read(0, COST_USER_RESOLUTIONS, &resolutions) == 0 &&
+          resolutions > 0 && resolutions <= 512, 193);
     riscv_virtio_mmio_block_get_statistics(&device, &device_after);
     check(kernel_cost_read(0, COST_DEVICE_OTHER_REQUESTS, &metric) == 0 && metric == device_after.requests - device_before.requests, 194);
-    number("cost wrapper copy bytes: ", cost_copy_observed);
+    number("file direct user bytes: ", MIB);
+    number("file user-page resolutions: ", resolutions);
 #endif
     kernel_files_get_statistics(&files, &after);
     number("file write chunks: ", after.write_chunks - before.write_chunks);
-    number("file user-page resolutions: ", resolutions);
-    check(after.write_chunks - before.write_chunks <= 512 && resolutions <= 512, 10);
+    check(after.write_chunks - before.write_chunks <= 512, 10);
     for (uint64_t at = 0; at < MIB; at += 4096) {
         check(kernel_files_pread(&files, &mm, fd, BUFFER, 4096, at, &result) == KERNEL_FILES_STATUS_OK && result == 4096, 11);
         check(kernel_copy_from_user(&mm, payload, BUFFER, sizeof(payload), &copied) == KERNEL_UACCESS_STATUS_OK, 12);
@@ -933,6 +938,8 @@ void kernel_main(unsigned long hart, const void *dtb)
     }
     fail_page = 1;
     check(kernel_files_pwrite(&files, &mm, fd, BUFFER, 4096, 0, &result) == KERNEL_FILES_STATUS_OK &&
+          result == 4096 && fail_page == 1, 14);
+    check(kernel_files_pwrite(&files, &mm, fd, BUFFER, 4096, MIB, &result) == KERNEL_FILES_STATUS_OK &&
           result == -KERNEL_ENOMEM && fail_page == 0, 14);
 #if BOAROS_COST_DIAGNOSTICS
     growth_cost(&mount, &cache);

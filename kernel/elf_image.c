@@ -48,6 +48,7 @@ struct kernel_elf_layout {
     size_t environment_count;
     const struct kernel_exec_string *environment;
     const struct kernel_exec_string *executable;
+    uint32_t stack_permissions;
     int has_interpreter;
     int has_random;
     uint8_t random_data[16];
@@ -350,6 +351,24 @@ static int choose_interpreter_bias(const struct kernel_elf64_source *source,
     return 1;
 }
 
+/* Linux takes the main ELF's last GNU_STACK record; the interpreter does not
+ * override it. Absent/non-executable records keep the architecture's NX default. */
+static uint32_t source_stack_permissions(const struct kernel_elf64_source *source)
+{
+    uint32_t permissions = KERNEL_MM_READ | KERNEL_MM_WRITE;
+    uint16_t count = kernel_elf64_source_program_header_count(source);
+    for (uint16_t index = 0U; index < count; index++) {
+        const struct kernel_elf64_program_header *header =
+            kernel_elf64_source_program_header(source, index);
+        if (header->type == KERNEL_ELF64_PROGRAM_GNU_STACK) {
+            permissions = KERNEL_MM_READ | KERNEL_MM_WRITE;
+            if (header->flags & KERNEL_ELF64_FLAG_EXECUTE)
+                permissions |= KERNEL_MM_EXECUTE;
+        }
+    }
+    return permissions;
+}
+
 static enum kernel_elf_image_status prepare_stack_layout(
     const struct kernel_exec_image_request *request,
     const struct kernel_elf_layout *base,
@@ -380,48 +399,51 @@ static enum kernel_elf_image_status prepare_stack_layout(
         layout->executable = &empty;
     }
     for (index = 0U; index < layout->argument_count; index++) {
-        if (layout->arguments[index].bytes == 0 ||
-            layout->arguments[index].length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
+        if (layout->arguments[index].bytes == 0)
+            return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        if (layout->arguments[index].length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
             string_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT -
                                layout->arguments[index].length - 1U) {
-            return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+            return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
         }
         string_bytes += (uint64_t)layout->arguments[index].length + 1U;
     }
     for (index = 0U; index < layout->environment_count; index++) {
-        if (layout->environment[index].bytes == 0 ||
-            layout->environment[index].length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
+        if (layout->environment[index].bytes == 0)
+            return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        if (layout->environment[index].length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
             string_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT -
                                layout->environment[index].length - 1U) {
-            return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+            return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
         }
         string_bytes += (uint64_t)layout->environment[index].length + 1U;
     }
     if (layout->executable->length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
         string_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT -
                            layout->executable->length - 1U) {
-        return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     string_bytes += (uint64_t)layout->executable->length + 1U;
     if (random_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT - string_bytes) {
-        return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     total_bytes = string_bytes + random_bytes;
     if (layout->argument_count > KERNEL_ELF_STACK_IMAGE_LIMIT / 8U ||
         layout->environment_count > KERNEL_ELF_STACK_IMAGE_LIMIT / 8U) {
-        return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     table_words = 1U + (uint64_t)layout->argument_count + 1U +
                   (uint64_t)layout->environment_count + 1U +
                   2U * (16U + (random_bytes != 0U ? 1U : 0U));
     if (table_words > UINT64_MAX / sizeof(uint64_t)) {
-        return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     table_bytes = table_words * sizeof(uint64_t);
-    if (table_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT - total_bytes ||
-        layout->stack_top < total_bytes + table_bytes) {
-        return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+    if (table_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT - total_bytes) {
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
+    if (layout->stack_top < total_bytes + table_bytes)
+        return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     layout->string_address = layout->stack_top - total_bytes;
     layout->stack_pointer =
         (layout->string_address - table_bytes) & ~UINT64_C(15);
@@ -429,7 +451,7 @@ static enum kernel_elf_image_status prepare_stack_layout(
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     if (layout->stack_top - layout->stack_pointer >
         KERNEL_ELF_STACK_IMAGE_LIMIT) {
-        return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     layout->committed_stack_base =
         align_down_page(layout->stack_pointer - KERNEL_ELF_STACK_HEADROOM);
@@ -469,7 +491,8 @@ static enum kernel_elf_image_status map_stack_pages(
         status = arch_mmu_user_map_zeroed_page(
             space,
             address,
-            ARCH_MMU_READ | ARCH_MMU_WRITE);
+            ARCH_MMU_READ | ARCH_MMU_WRITE |
+                ((layout->stack_permissions & KERNEL_MM_EXECUTE) ? ARCH_MMU_EXECUTE : 0U));
         if (status != ARCH_MMU_STATUS_OK) {
             return status == ARCH_MMU_STATUS_NO_MEMORY
                        ? KERNEL_ELF_IMAGE_STATUS_NO_MEMORY
@@ -969,6 +992,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
     if (base.vdso > base.brk_start && base.vdso < base.brk_limit) {
         base.brk_limit = base.vdso;
     }
+    base.stack_permissions = source_stack_permissions(request->executable_source);
     status = prepare_stack_layout(request, &base, &layout);
     if (status != KERNEL_ELF_IMAGE_STATUS_OK) {
         return status;
@@ -1024,7 +1048,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
             &image->mm,
             layout.stack_base,
             layout.stack_top,
-            KERNEL_MM_READ | KERNEL_MM_WRITE,
+            layout.stack_permissions,
             KERNEL_VMA_ROLE_STACK,
             KERNEL_VMA_FAULT_DEMAND_ZERO);
     }

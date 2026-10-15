@@ -5,6 +5,9 @@
 #include <kernel/rlimit.h>
 
 struct kernel_task;
+/* 返回请求affinity；临时CPU0内核服务资格不改变这个值。 */
+int kernel_task_affinity_get(struct kernel_task *, int32_t, uint64_t *);
+int kernel_task_affinity_set(struct kernel_task *, int32_t, uint64_t);
 struct kernel_mm;
 struct kernel_files;
 struct kernel_fs_context;
@@ -30,6 +33,10 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
+/* 当前执行owner覆盖读取；内核任务没有用户信号/重启上下文。 */
+int kernel_task_has_user_context(const struct kernel_task *);
+/* Releases only a lookup storage borrow, not MM/files or a running owner. */
+void kernel_task_lookup_put(struct kernel_task *task);
 enum kernel_task_status kernel_task_epoll_register(
     struct kernel_task *task, struct kernel_epoll_wait_request *request);
 enum kernel_task_status kernel_task_epoll_clear(

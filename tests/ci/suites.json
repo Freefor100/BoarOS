@@ -3,13 +3,38 @@
     "host": [
       {"name":"references","targets":["test-references"]},
       {"name":"ci-contracts","targets":["test-ci-host"]},
-      {"name":"allocator","targets":["test-sync-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host"]},
+      {"name":"allocator","targets":["test-string-host","test-sync-host","test-smp-host","test-user-smp-host","test-user-smp-composition-host","test-mm-pin-host","test-mm-concurrency-host","test-memory-object-concurrency-host","test-mm-shared-concurrency-host","test-file-mapping-concurrency-host","test-mm-file-concurrency-host","test-page-cache-concurrency-host","test-mm-disk-concurrency-host","test-files-concurrency-host","test-pipe-concurrency-host","test-file-io-concurrency-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-sched-concurrency-host","test-pid-object-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host","test-cost-match-host"]},
       {"name":"virtio","targets":["test-virtio-framework-host","test-virtio-block-host","test-virtio-rng-host","test-virtio-net-host","test-pci-host"]},
       {"name":"terminal","targets":["test-tty-host","test-pty-host","test-uart-host"]},
       {"name":"random-clock","targets":["test-random-host","test-rtc-host","test-rtc-loongarch-host"]},
       {"name":"events-network","targets":["test-epoll-host","test-lwip-host","test-lwip-reassembly-host","test-ethernet-worker-host"]},
       {"name":"file-cache","targets":["test-lwext4-host","test-lwext4-checksum-host","test-lwext4-cache-host","test-lwext4-batch-read-host","test-lwext4-group-host","test-lwext4-metadata-host","test-lwext4-deep-truncate-host"]},
-      {"name":"runner-profiles","targets":["test-diff-abi-host","test-program-inventory-host","test-program-environment-host","test-glibc-profile-host","test-platform-profile-host"]}
+      {"name":"runner-profiles","targets":["test-diff-abi-host","test-instruction-sync-host","test-program-inventory-host","test-program-environment-host","test-glibc-profile-host","test-platform-profile-host"]}
+    ]
+  },
+  "smp": {
+    "riscv": [
+      {"name":"two-core-lifecycle","targets":["test-smp-riscv","test-smp-fpu-setup-riscv"]},
+      {"name":"pinned-user-composition","targets":["test-smp-userland-riscv"]},
+      {"name":"private-anonymous-mm","targets":["test-mm-smp-riscv"]},
+      {"name":"private-mm-user-composition","targets":["test-mm-smp-userland-riscv"]},
+      {"name":"shared-anonymous-mm","targets":["test-mm-shared-smp-riscv"]},
+      {"name":"shared-mm-user-composition","targets":["test-mm-shared-smp-userland-riscv"]},
+      {"name":"tmpfs-file-mm","targets":["test-mm-file-smp-riscv"]},
+      {"name":"tmpfs-mm-user-composition","targets":["test-mm-file-smp-userland-riscv"]},
+      {"name":"disk-file-mm","targets":["test-mm-disk-smp-riscv"]},
+      {"name":"disk-mm-user-composition","targets":["test-mm-disk-smp-userland-riscv"]},
+      {"name":"shared-fd-pipe","targets":["test-files-smp-riscv"]},
+      {"name":"shared-fd-user-composition","targets":["test-files-smp-userland-riscv"]},
+      {"name":"ordinary-file-io","targets":["test-file-io-smp-riscv"]},
+      {"name":"ordinary-file-user-composition","targets":["test-file-io-smp-userland-riscv"]}
+    ]
+  },
+  "user-smp": {
+    "riscv": [
+      {"name":"real-user-execution","targets":["test-user-smp-riscv"]},
+      {"name":"user-abi-and-runtime","targets":["test-user-smp-runtime-riscv"],"timeout":3600},
+      {"name":"user-pressure-composition","targets":["test-user-smp-composition-riscv"],"timeout":3600}
     ]
   },
   "core": {
@@ -17,9 +42,10 @@
       {"name":"architecture","targets":["test-riscv"]},
       {"name":"scale","targets":["test-scale-riscv"]},
       {"name":"storage-concurrency","targets":["test-io-sleep-riscv"]},
+      {"name":"demand-read","targets":["test-demand-read-riscv"]},
       {"name":"multi-disk-isolation","targets":["test-multi-disk-io-riscv"]},
       {"name":"user-runtime","targets":["test-userland-riscv"]},
-      {"name":"abi","targets":["test-diff-abi-riscv"]},
+      {"name":"abi","targets":["test-diff-abi-riscv","test-elf-boundary-riscv"]},
       {"name":"elf-tail","targets":["test-elf-tail-riscv"]},
       {"name":"stack-report","targets":["test-stack-usage"]}
     ],
@@ -27,10 +53,10 @@
       {"name":"architecture","targets":["test-loongarch"]},
       {"name":"stack-permissions","targets":["test-stack-guard-loongarch","test-permissions-loongarch"]},
       {"name":"signals-threads","targets":["test-signal-loongarch","test-pthread-loongarch","test-pthread-oom-loongarch"]},
-      {"name":"cpu-state","targets":["test-sync-loongarch","test-wait-loongarch","test-scheduler-handoff-loongarch","test-fpu-loongarch","test-simd-loongarch"]},
+      {"name":"cpu-state","targets":["test-sync-loongarch","test-wait-loongarch","test-scheduler-handoff-loongarch","test-sched-lifecycle-loongarch","test-fpu-loongarch","test-simd-loongarch"]},
       {"name":"dynamic-exec","targets":["test-dynamic-loongarch","test-exec-errors-loongarch"]},
       {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch","test-root-checksum-loongarch","test-root-io-loongarch"]},
-      {"name":"abi","targets":["test-diff-abi-loongarch"]},
+      {"name":"abi","targets":["test-diff-abi-loongarch","test-elf-boundary-loongarch"]},
       {"name":"stack-report","targets":["test-stack-usage-la"]}
     ]
   },

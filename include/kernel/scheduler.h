@@ -6,10 +6,12 @@
 #include <kernel/pid.h>
 
 #include <stdint.h>
+#include <kernel/cpu_config.h>
 
 struct kernel_files;
 struct kernel_fs_context;
 struct kernel_task;
+struct kernel_cpu;
 
 enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_OK = 0,
@@ -94,6 +96,8 @@ void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks);
 
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
+/* CPU0处理远端新增期限时，只重装本地硬件事件。 */
+void kernel_scheduler_deadline_changed(void);
 
 /* Commits the image prepared by the current user task's exec transaction. */
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void);
@@ -256,9 +260,29 @@ struct kernel_thread_join {
 };
 enum kernel_scheduler_status kernel_thread_create_joinable(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join);
+#if BOAROS_MAX_CPUS > 1
+/* CPU0创建并持有join；仅显式受控任务可改变mask，且必须已阻塞/off_cpu。 */
+enum kernel_scheduler_status kernel_thread_create_joinable_mask(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask);
+/* CPU0创建，成功转移已开放匿名/tmpfs/受控磁盘映射域的MM引用；失败保留原句柄。
+ * 受控任务只使用绑定记录；MM与任务栈最终由CPU0可信栈回收。 */
+enum kernel_scheduler_status kernel_thread_create_joinable_mm(
+    void (*entry)(void *), void *, struct kernel_thread_join *, uint32_t, struct kernel_mm *);
+/* CPU0私有准备MM/files各一份引用；成功移入任务，失败完整归还。
+ * caller保留原句柄，任务只使用已校验的同域匿名pipe表。 */
+enum kernel_scheduler_status kernel_thread_create_joinable_files(
+    void (*entry)(void *), void *, struct kernel_thread_join *, uint32_t,
+    const struct kernel_mm *, const struct kernel_files *);
+enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *, uint32_t);
+int kernel_scheduler_core_quiescent(struct kernel_cpu *);
+#endif
 void kernel_thread_join(struct kernel_thread_join *join);
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);
+#if BOAROS_USER_SMP
+/* 仅用户sched_yield服务延后到恢复用户资格；内核等待借用仍实际让出执行。 */
+enum kernel_scheduler_status kernel_scheduler_user_yield_current(void);
+#endif
 
 /*
  * Timer-interrupt path: credits `elapsed_ticks` to the interrupted task
@@ -270,6 +294,12 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user);
 uint64_t kernel_scheduler_idle_ticks(void);
 /* IRQ return may leave idle without waiting for a timer tick. */
 void kernel_scheduler_prepare_idle_return(void);
+/* 实际调用任务迁到CPU0；只允许无业务锁/pin的用户陷入或恢复边界。
+ * 同一内核栈保留调用现场，switch_finish后才可在另一CPU继续执行。 */
+void kernel_scheduler_enter_user_service(void);
+void kernel_scheduler_leave_user_service(void);
+int kernel_scheduler_user_service_pending(void);
+int kernel_scheduler_user_service_active(void);
 
 /* Resolves a hardware fault in the running user task's active MM. */
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
@@ -279,7 +309,9 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion);
 
-/* O(1) cleanup work predicate; call with interrupts disabled. */
+/* O(1) immediately executable cleanup predicate, with interrupts disabled.
+ * Outstanding lookup/event/execution owners are pending, not runnable work;
+ * the worker parks until their release notification. reap_one may return BUSY. */
 int kernel_scheduler_reap_pending(void);
 
 /* PID 1 shutdown, with interrupts disabled: terminate remaining user groups

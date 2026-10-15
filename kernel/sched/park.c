@@ -280,10 +280,9 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
         kernel_wait_backend_ready(task);
     }
 }
-static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
+int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
     int direct_notification)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || queue->borrows == UINT32_MAX)
         __builtin_trap();
     queue_shape(queue);
@@ -303,6 +302,12 @@ static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_curs
     *cursor = (struct kernel_wait_cursor){queue, queue->head, queue->sequence};
     if (cursor->node) borrow(cursor->node);
     return 1;
+}
+static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
+                        int direct_notification)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return kernel_wait_cursor_prepare_locked(queue, cursor, direct_notification);
 }
 void kernel_wait_cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
 { (void)cursor_begin(queue, cursor, 0); }
@@ -362,21 +367,15 @@ enum kernel_scheduler_status kernel_wait_node_move(struct kernel_wait_node *node
         kernel_wait_backend_quiesce();
     }
 }
-static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int all)
+void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor, int all)
 {
-    if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
-        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    struct kernel_wait_cursor cursor;
-    if (!cursor_begin(queue, &cursor, 1)) return KERNEL_SCHEDULER_STATUS_OK;
-    while (cursor.node) {
-        struct kernel_wait_node *node = cursor.node;
+    while (cursor->node) {
+        struct kernel_wait_node *node = cursor->node;
         kernel_wait_callback_fn callback = 0;
         int notified = 0;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (node->queue == queue) {
+            if (node->queue == cursor->queue) {
                 callback = node->callback;
                 if (!callback && node->task && node->generation) {
                     struct kernel_wait_token token = {node->task, node->generation};
@@ -391,9 +390,18 @@ static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int al
             notified = 1;
         }
         if (notified && !all) break;
-        kernel_wait_cursor_advance(&cursor);
+        kernel_wait_cursor_advance(cursor);
     }
-    kernel_wait_cursor_end(&cursor);
+    kernel_wait_cursor_end(cursor);
+}
+static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int all)
+{
+    if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
+        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    struct kernel_wait_cursor cursor;
+    if (cursor_begin(queue, &cursor, 1)) kernel_wait_cursor_wake(&cursor, all);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 enum kernel_scheduler_status kernel_wait_queue_wake_one(struct kernel_wait_queue *queue) { return wake(queue, 0); }

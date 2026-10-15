@@ -31,22 +31,34 @@ void kernel_task_tty_clear(struct kernel_task *task)
 }
 void kernel_task_tty_clear_session(struct kernel_tty *tty, struct kernel_pid *session)
 {
-    if (!session)
-        return;
-    for (struct kernel_pid_member *m = session->members[KERNEL_PID_SID]; m; m = m->next) {
-        struct kernel_task *task = m->task;
-        if (kernel_task_controlling_tty(task) == tty)
-            kernel_task_tty_clear(task);
+    if (!session) return;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        struct kernel_task *task = cursor.task;
+        if (kernel_task_tty_identity_matches(task, KERNEL_PID_SID, session) &&
+            kernel_task_controlling_tty(task) == tty) kernel_task_tty_clear(task);
+        scheduler_task_cursor_next(&cursor);
     }
 }
 struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *task,
                                             enum kernel_pid_role role)
 {
-    return process_identity(task, role);
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid *id = process_identity(task, role);
+    if (id) kernel_pid_get(id);
+    return id;
+}
+int kernel_task_tty_identity_matches(const struct kernel_task *task, enum kernel_pid_role role,
+                                     const struct kernel_pid *identity)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return process_identity(task, role) == identity;
 }
 int kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number,
                                struct kernel_pid **out)
 {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_pid *group = kernel_pid_find(&scheduler.identities, number);
     *out = 0;
     if (!group)
@@ -58,6 +70,7 @@ int kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number,
     if (!member || process_identity(member->task, KERNEL_PID_SID) !=
                        process_identity(task, KERNEL_PID_SID))
         return -KERNEL_EPERM;
+    kernel_pid_get(group);
     *out = group;
     return 0;
 }
@@ -82,23 +95,32 @@ int kernel_task_tty_group_orphaned(const struct kernel_task *task)
 }
 void kernel_task_tty_signal_group(struct kernel_pid *group, unsigned signal)
 {
-    if (!group)
-        return;
-    for (struct kernel_pid_member *m = group->members[KERNEL_PID_PGID]; m; m = m->next)
-        (void)signal_send_kernel_group(m->task, signal);
+    if (!group) return;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        struct kernel_task *task = cursor.task;
+        if (task->identities[KERNEL_PID_TGID].identity &&
+            kernel_task_tty_identity_matches(task, KERNEL_PID_PGID, group))
+            (void)signal_send_kernel_group(task, signal);
+        scheduler_task_cursor_next(&cursor);
+    }
 }
 void kernel_task_tty_signal_session(struct kernel_tty *tty, struct kernel_pid *session)
 {
-    if (!session)
-        return;
-    for (struct kernel_pid_member *m = session->members[KERNEL_PID_SID]; m; m = m->next) {
-        struct kernel_task *task = m->task;
-        if (kernel_task_tty_session_leader(task)) {
-            (void)signal_send_kernel_group(task, 1);
-            (void)signal_send_kernel_group(task, 18);
+    if (!session) return;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        struct kernel_task *task = cursor.task;
+        if (kernel_task_tty_identity_matches(task, KERNEL_PID_SID, session)) {
+            if (kernel_task_tty_session_leader(task)) {
+                (void)signal_send_kernel_group(task, 1);
+                (void)signal_send_kernel_group(task, 18);
+            }
+            if (kernel_task_controlling_tty(task) == tty) kernel_task_tty_clear(task);
         }
-        if (kernel_task_controlling_tty(task) == tty)
-            kernel_task_tty_clear(task);
+        scheduler_task_cursor_next(&cursor);
     }
 }
 void kernel_task_tty_request_set(struct kernel_task *task, struct kernel_tty_request *request)

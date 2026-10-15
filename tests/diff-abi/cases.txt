@@ -1,3 +1,13 @@
+boundary.sigreturn-aligned
+boundary.sigreturn-offset8
+boundary.sigreturn-unreadable
+
+boundary.exec-stack-limit
+boundary.exec-failure-preserves
+boundary.tmpfs-shared-minflt
+boundary.tmpfs-private-cow-minflt
+boundary.tmpfs-failed-fault-count
+
 path.open
 path.getfl
 path.getfd
@@ -104,6 +114,7 @@ shared-file.protect-close-sync
 shared-file.fork
 shared-file.fork-sync
 shared-file.private-isolation
+shared-file.snapshot-copy-next-generation
 shared-file.unlinked-sync
 shared-file.truncate-sigbus
 shared-file.grow-tail
@@ -142,6 +153,10 @@ mode.umask-shared-fs
 pipe.mode-shared
 pipe.mode-type-preserved
 pipe.stat-fault
+pipe.flags-dup-cloexec
+pipe.flags-ofd-shared
+pipe.flags-fork-shared
+pipe.flags-dup2-descriptor
 fifo.create
 fifo.create-existing
 fifo.nonblock-writer
@@ -1099,6 +1114,7 @@ proc.exe-deleted-open
 proc.exe-deleted-magic
 proc.readonly-unmount
 tmpfs.mount
+tmpfs.allocated-block-units
 tmpfs.quota
 tmpfs.busy
 tmpfs.unmount
@@ -1373,3 +1389,25 @@ rtc.fault
 rtc.unknown
 rtc.dup_exclusive
 rtc.reopen
+
+# Scalar I/O import and shared OFD flag boundaries.
+boundary.write-overflow
+boundary.pwrite-overflow
+boundary.read-zero-high
+boundary.write-zero-high
+boundary.pread-zero-high
+boundary.pwrite-zero-high
+boundary.scalar-zero-null
+boundary.setfl-sync
+boundary.setfl-sync-clear
+boundary.setfl-dsync
+boundary.setfl-dsync-clear
+boundary.setfl-directory
+boundary.setfl-directory-clear
+boundary.setfl-nofollow
+boundary.setfl-nofollow-clear
+boundary.recvfrom-huge-badfd
+boundary.sendto-huge-badfd
+boundary.recvfrom-huge-message
+boundary.recvfrom-huge-high
+boundary.recvfrom-after-rejection

@@ -1264,12 +1264,15 @@ enum physical_page_status physical_page_allocate_order(
         /* 分发与 callback 取得自身 owner 之间不得被卸载。干净回收不睡眠；
          * pressure_wait 在显式睡眠前自行 pin 组，不持有 buddy 修改状态。 */
         KERNEL_IRQ_SCOPE(irq);
-        if (allocator_initialized(allocator) && allocator->pressure_notify)
+        if (allocator_initialized(allocator) && allocator->pressure_notify) {
+            kernel_assert_service_context();
             allocator->pressure_notify(allocator->pressure_context);
+        }
         if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
             allocator_initialized(allocator) &&
             physical_page_allocator_is_finalized(allocator) &&
             allocator->reclaimer != 0) {
+            kernel_assert_service_context();
             uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
             if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
             if (depth != &allocator->reclaiming) *depth = 1U;
@@ -1565,7 +1568,7 @@ void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
     out->total = physical_page_total(allocator) * BOAROS_PAGE_SIZE;
     out->free = physical_page_available(allocator) * BOAROS_PAGE_SIZE;
     out->available = out->free;
-    out->shared = allocator->shared_anon_pages * BOAROS_PAGE_SIZE;
+    out->shared = __atomic_load_n(&allocator->shared_anon_pages, __ATOMIC_ACQUIRE) * BOAROS_PAGE_SIZE;
     out->cached = out->shared;
     if (allocator->buffer_bytes)
         out->buffers = allocator->buffer_bytes(allocator->buffer_context);

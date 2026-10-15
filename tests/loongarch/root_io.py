@@ -12,9 +12,9 @@ from root import disk
 ROOT=Path(__file__).resolve().parents[2]
 
 def main(args):
-    directory=Path(tempfile.mkdtemp(prefix='root-io-run.',dir=ROOT/'build/loongarch'))
+    directory=Path(tempfile.mkdtemp(prefix='root-io-run.',dir=args.build_dir))
     for memory in ('512M','1G'):
-        image=disk(directory,ROOT/'build/loongarch/root-probe',ROOT/'build/loongarch/busybox-source/busybox/busybox')
+        image=disk(directory,args.build_dir/'root-probe',ROOT/'build/loongarch/busybox-source/busybox/busybox')
         socket=directory/'nbd.sock';socket.unlink(missing_ok=True)
         server=subprocess.Popen([ROOT/'build/host/nbd-fault',image,socket,'--arm-on-signal','--fail-write=1'],stderr=subprocess.PIPE)
         guest=None
@@ -23,7 +23,7 @@ def main(args):
             while not socket.exists():
                 if server.poll() is not None or time.monotonic()>deadline: raise RuntimeError('NBD startup failed')
                 time.sleep(.01)
-            command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel','kernel-la',
+            command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel',args.kernel,
                      '-drive',f'file=nbd+unix:///?socket={socket},if=none,format=raw,id=root',
                      '-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on',
                      '-net','none','-nographic','-no-reboot']
@@ -53,4 +53,5 @@ def main(args):
             if guest: guest.stdout.close()
             server.stderr.close();socket.unlink(missing_ok=True)
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--qemu',default='build/qemu-la-rtc/qemu-system-loongarch64');parser.add_argument('--timeout',type=int,default=60);main(parser.parse_args())
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--qemu',default='build/qemu-la-rtc/qemu-system-loongarch64');parser.add_argument('--timeout',type=int,default=60)
+    parser.add_argument('--kernel',default='kernel-la');parser.add_argument('--build-dir',type=Path,default=ROOT/'build/loongarch');main(parser.parse_args())

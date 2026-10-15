@@ -347,7 +347,8 @@ static int job_control(struct tty_instance *i, struct kernel_task *caller, unsig
     struct kernel_tty *tty = i->tty;
     if ((console_io && i->console) || kernel_task_controlling_tty(caller) != tty)
         return 0;
-    struct kernel_pid *group = kernel_task_tty_identity(caller, KERNEL_PID_PGID);
+    struct kernel_pid *group __attribute__((cleanup(kernel_task_identity_end))) =
+        kernel_task_tty_identity(caller, KERNEL_PID_PGID);
     if (!tty->foreground || group == tty->foreground)
         return 0;
     if (kernel_task_tty_signal_ignored(caller, sig))
@@ -775,11 +776,11 @@ void kernel_tty_transport_ready(struct kernel_tty *tty)
 static void drop_session(struct kernel_tty *tty)
 {
     if (tty->session) {
-        kernel_pid_put(tty->session);
+        kernel_task_identity_put(tty->session);
         tty->session = 0;
     }
     if (tty->foreground) {
-        kernel_pid_put(tty->foreground);
+        kernel_task_identity_put(tty->foreground);
         tty->foreground = 0;
     }
 }
@@ -830,10 +831,11 @@ static int acquire_ctty(struct kernel_tty *tty, struct kernel_task *caller, int 
     }
     struct kernel_pid *sid = kernel_task_tty_identity(caller, KERNEL_PID_SID),
                       *pgid = kernel_task_tty_identity(caller, KERNEL_PID_PGID);
-    if (!sid || !pgid)
+    if (!sid || !pgid) {
+        if (sid) kernel_task_identity_put(sid);
+        if (pgid) kernel_task_identity_put(pgid);
         return -KERNEL_EPERM;
-    kernel_pid_get(sid);
-    kernel_pid_get(pgid);
+    }
     tty->session = sid;
     tty->foreground = pgid;
     return kernel_task_tty_set(caller, tty);
@@ -1585,7 +1587,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         if (error)
             break;
         if (kernel_task_controlling_tty(caller) != control ||
-            control->session != kernel_task_tty_identity(caller, KERNEL_PID_SID)) {
+            !kernel_task_tty_identity_matches(caller, KERNEL_PID_SID, control->session)) {
             error = -KERNEL_ENOTTY;
             break;
         }
@@ -1601,9 +1603,8 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         struct kernel_pid *group = 0;
         error = kernel_task_tty_find_group(caller, number, &group);
         if (!error) {
-            kernel_pid_get(group);
             if (control->foreground)
-                kernel_pid_put(control->foreground);
+                kernel_task_identity_put(control->foreground);
             control->foreground = group;
             changed(tty);
         }

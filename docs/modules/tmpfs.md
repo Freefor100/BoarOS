@@ -17,6 +17,12 @@
 映射缺页按需实例化。文件缺页接口返回本次是否新建；失败先释放临时 pin，
 仅撤销地址仍匹配且没有其他引用的新页；已有页不回滚。inode 锁 rank 30，
 对象锁 rank 35；对象分配禁止递归进入可睡眠脏页回收。
+对象引用采用原子非零/溢出检查，末次引用唯一负责销毁；每次对象操作必须由实际owner覆盖。
+跨对象预算及allocator共享页计数在后备页发布时原子收费，失败准备归还自己的页/metadata，
+PTE、fork及pin不重复收费。驻留数/statfs使用值读取，不承诺跨对象全局原子快照。
+对象索引仍使用原mutex；预算绑定/上限在私有构造期确定。此基础同步不开放tmpfs业务跨核。
+受控来源验证同时核对实际 tmpfs 普通 inode、对象、heap/allocator 和所属挂载的预算身份；
+共享匿名对象的域验证仍要求无 budget。该检查借用已有 OFD owner，不额外增加对象引用。
 
 截断先撤销越界的所有 MM 映射（含私有 COW），再释放对象的越界页并清零
 末页尾部。私有 COW 仍属于 MM；文件尾页清零不改写独立私有副本。
@@ -57,6 +63,8 @@ SysV 共享内存已由共用内存后备对象实现。挂载扩展的剩余工
 
 ```sh
 make test-vma-riscv test-files-riscv
+make test-memory-object-concurrency-host
+make test-file-mapping-concurrency-host
 make test-diff-abi-riscv
 make test-userland-riscv
 make test-root-multi-block-riscv
@@ -74,8 +82,10 @@ make test-busybox-tmpfs-riscv
 直接发布可写 PTE，之后的 store 不保证另一次时间通知；这与固定 Linux 的
 `mm/memory.c: fault_dirty_shared_page`、`mm/vma.c: vma_wants_writenotify`
 及 shmem 无 page_mkwrite 回调相符，不能为测试强制所有 tmpfs 首写陷入。
-时间更新在成功发布后以单 hart IRQ 临界区完成，不升级 fault 持有的 inode 读锁。
+时间更新在成功发布后使用已有 inode metadata raw 保护，不升级 fault 持有的 inode 读锁。stat 和 CPU0 显式时间修改使用同一保护。
 
 命名FIFO使用真实tmpfs inode与目录项，但不创建稀疏文件数据对象；打开才取得活动pipe。
 inode配额和只读创建检查与普通节点一致，传输不计入文件数据容量。打开/关闭及弱关联
 契约见[文件模块](kernel-files.md#命名-fifo)，同ELF验证入口为`make test-fifo-riscv`。
+
+`st_blocks` 以 512 字节为单位，驻留页数乘 `PAGE_SIZE / 512`；RV 4 KiB 和 LA 16 KiB 的页大小不改变该 ABI 单位。`tests/diff-abi/tmpfs.c` 的 `tmpfs.allocated-block-units` 使用同一目标 ELF 与固定 Linux 对照。时间字段更新和 stat 的读取使用已有 inode metadata 保护，不升级缺页的 I/O 读锁；这不开放命名空间跨核修改。

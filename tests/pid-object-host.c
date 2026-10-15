@@ -1,10 +1,54 @@
 #include <kernel/pid.h>
 #include <assert.h>
 #include <stdio.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void encoding_boundaries(void)
+{
+    /* Protect the agreed allocation class, rather than member offsets. */
+    assert(sizeof(struct kernel_pid) <= 64);
+    const uint64_t generations[] = {1, UINT64_C(1) << 31, UINT64_C(1) << 33,
+                                    UINT64_MAX >> 30};
+    for (unsigned i = 0; i < sizeof(generations)/sizeof(generations[0]); i++) {
+        uint64_t bitmap[1];
+        struct kernel_pid_allocator numbers = {0};
+        struct kernel_pid_registry registry = {.numbers = &numbers, .next_generation = generations[i]};
+        struct kernel_pid id = {0};
+        assert(kernel_pid_allocator_init(&numbers, bitmap, 1) == KERNEL_PID_STATUS_OK);
+        assert(kernel_pid_reserve(&registry, &id) == KERNEL_PID_STATUS_OK);
+        assert(id.generation == generations[i] && !id.published);
+        assert(kernel_pid_publish_reserved(&id) == KERNEL_PID_STATUS_OK);
+        assert(id.generation == generations[i] && id.published == 1);
+        /* The full reference range remains independent of the state word. */
+        id.references = UINT32_MAX - 1;
+        kernel_pid_get(&id);
+        assert(id.references == UINT32_MAX && id.generation == generations[i] && id.published == 1);
+        for (unsigned bad = 0; bad < 2; bad++) {
+            pid_t child = fork(); assert(child >= 0);
+            if (!child) {
+                if (bad) { id.references = 1; id.published = 3; }
+                kernel_pid_get(&id);
+                _exit(1);
+            }
+            int status; assert(waitpid(child, &status, 0) == child);
+            assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL);
+        }
+        id.references = 1;
+        kernel_pid_put(&id);
+        assert(id.generation == generations[i] && id.published == 2 && !numbers.allocated);
+        assert(kernel_pid_take_retired(&registry) == &id);
+        assert(id.generation == generations[i] && !id.published && !id.references);
+    }
+}
 
 /* Releasing a task must not recycle numbers owned by another role or a pin. */
 int main(void)
 {
+    struct rlimit limit = {0}; assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+    encoding_boundaries();
     uint64_t bitmap[1];
     struct kernel_pid_allocator numbers = {0};
     struct kernel_pid_registry registry = {.numbers = &numbers, .next_generation = 1};
@@ -45,5 +89,22 @@ int main(void)
     struct kernel_pid overflow = {0};
     assert(kernel_pid_publish(&registry, &overflow) == KERNEL_PID_STATUS_EXHAUSTED);
     assert(numbers.allocated == 0 && !overflow.registry);
+    registry.next_generation = 100;
+    struct kernel_pid reserved = {0};
+    assert(kernel_pid_reserve(&registry, &reserved) == KERNEL_PID_STATUS_OK);
+    assert(numbers.allocated == 1 && !kernel_pid_find(&registry, reserved.number));
+    kernel_pid_attach(&tid, &reserved, KERNEL_PID_TID, &leader);
+    assert(kernel_pid_publish_reserved(&reserved) == KERNEL_PID_STATUS_OK);
+    assert(kernel_pid_find(&registry, reserved.number) == &reserved);
+    assert(kernel_pid_publish_reserved(&reserved) == KERNEL_PID_STATUS_STATE);
+    kernel_pid_detach(&tid);
+    kernel_pid_put(&reserved);
+    assert(kernel_pid_reserve(&registry, &reserved) == KERNEL_PID_STATUS_STATE);
+    assert(kernel_pid_take_retired(&registry) == &reserved);
+    struct kernel_pid aborted = {0};
+    assert(kernel_pid_reserve(&registry, &aborted) == KERNEL_PID_STATUS_OK);
+    kernel_pid_put(&aborted);
+    assert(!numbers.allocated && !kernel_pid_find(&registry, aborted.number));
+    assert(kernel_pid_take_retired(&registry) == &aborted);
     puts("pid object lifetime PASS");
 }

@@ -21,6 +21,8 @@
 #include <kernel/scheduler.h>
 #include <kernel/vfs.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/write_source.h"
+#include "../../fs/files/private.h"
 #include "../../kernel/sched/private.h"
 #include <string.h>
 
@@ -70,6 +72,16 @@ enum kernel_page_cache_status __wrap_kernel_open_file_get_page(struct kernel_ope
     sync_edit = edit;
     return result;
 }
+enum kernel_page_cache_status __real_kernel_page_cache_get_batch(struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t, struct kernel_page_cache_read_page *, size_t);
+enum kernel_page_cache_status __wrap_kernel_page_cache_get_batch(struct kernel_page_cache *owner, const struct kernel_vfs_file *source,
+    uint64_t first, struct kernel_page_cache_read_page *pages, size_t count)
+{
+    int edit = sync_edit;
+    if (operation_testing) sync_edit = 0;
+    enum kernel_page_cache_status result = __real_kernel_page_cache_get_batch(owner, source, first, pages, count);
+    sync_edit = edit;
+    return result;
+}
 enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied);
 
@@ -92,9 +104,11 @@ int __wrap_kernel_open_file_sync_range(struct kernel_open_file_description *ofd,
 enum kernel_open_file_status __real_kernel_open_file_release(struct kernel_open_file_description **);
 enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner);
 static unsigned loading_probe, loads, done, write_probe, background_fail;
+static size_t background_failed_pages;
 static uint64_t pressure_pages[1024], failed_offset;
 static struct kernel_wait_queue held_write;
 static unsigned stop_probe, stop_entered, stop_called, stop_done;
+static size_t stop_pages;
 static struct kernel_page_cache instance_peer;
 static struct kernel_vfs_node *instance_nodes[2];
 static struct kernel_wait_queue instance_held[2];
@@ -103,7 +117,7 @@ static unsigned instance_stop_called, instance_stop_done;
 static uint64_t instance_peer_pin;
 static uint64_t observed[2], inserted_page;
 static struct kernel_page_cache_alias alias;
-static void rearm(void *owner, uint64_t address) { (void)owner; (void)address; }
+static int rearm(void *owner, uint64_t address) { (void)owner; (void)address; return 0; }
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {
@@ -214,15 +228,27 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, vo
     }
     if (!operation_testing || mm != &sync_mm)
         return __real_kernel_copy_from_user(mm, buffer, address, size, copied);
-    if (address == operation_second && kernel_task_current() == operation_writer_task && !operation_paused) {
+    /* 向量导入仍走通用usercopy，文件payload直接从页pin写入最终页。 */
+    int previous=sync_edit; sync_edit=1;
+    enum kernel_uaccess_status result=__real_kernel_copy_from_user(mm,buffer,address,size,copied);
+    sync_edit=previous;
+    return result;
+}
+enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *mm,uint64_t address,
+    uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    if (!operation_testing || mm!=&sync_mm)
+        return __real_kernel_uaccess_pin_user_page(mm,address,access,pin);
+    if (address == operation_second && kernel_cpu_current()->current == operation_writer_task && !operation_paused) {
         operation_paused = 1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&operation_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 240);
     }
     /* 使用真实 MM/uaccess；只模型化未激活 MM 的 satp，调度和 VFS 等待仍用真实 hart。 */
-    sync_edit = 1;
-    enum kernel_uaccess_status result = __real_kernel_copy_from_user(mm, buffer, address, size, copied);
-    sync_edit = 0;
+    int previous=sync_edit; sync_edit=1;
+    enum kernel_uaccess_status result=__real_kernel_uaccess_pin_user_page(mm,address,access,pin);
+    sync_edit=previous;
     return result;
 }
 static void operation_writer(void *argument)
@@ -463,7 +489,8 @@ static void receive_reservation_probe(void *argument)
             kernel_copy_to_user(&sync_mm,OP_USER+512,"xyz",3,&copied)==KERNEL_UACCESS_STATUS_OK,276);
         sync_edit=0;
         check(kernel_files_write(&operation_files,&sync_mm,receive_pair[0],OP_USER+512,3,&result)==KERNEL_FILES_STATUS_OK && result==3,277);
-        struct kernel_socket *socket=kernel_open_file_socket(kernel_files_fd_borrow(&operation_files,receive_pair[1]));
+        KERNEL_FILES_PIN_SCOPE(socket_pin);
+        struct kernel_socket *socket=kernel_open_file_socket(kernel_files_hold_fd(&operation_files,receive_pair[1],&socket_pin));
         kernel_socket_set_receive_timeout(socket,receive_mode==1 ? 100000000 : 0);
         struct kernel_thread_join holder={0},waiter={0};
         check(kernel_thread_create_joinable(receive_owner,0,&holder)==KERNEL_SCHEDULER_STATUS_OK,278);
@@ -488,6 +515,7 @@ static void receive_reservation_probe(void *argument)
         kernel_thread_join(&holder); kernel_thread_join(&waiter);
         sync_edit=1; char bytes[3];
         check(kernel_copy_from_user(&sync_mm,bytes,OP_USER+256,3,&copied)==KERNEL_UACCESS_STATUS_OK && (receive_mode==3 ? bytes[0]==0 && bytes[1]==0 && bytes[2]==0 : !memcmp(bytes,"xyz",3)),287);
+        kernel_files_pin_guard_release(&socket_pin);
         sync_edit=receive_testing=operation_testing=0; sync_satp=0;
         check(kernel_files_release(&operation_files)==KERNEL_FILES_STATUS_OK && kernel_mm_release(&sync_mm)==KERNEL_MM_STATUS_OK &&
             physical_page_release(&allocator,table.root_address)==PHYSICAL_PAGE_STATUS_OK,288);
@@ -581,19 +609,20 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
     virt_uart_puts(" sleeps="); virt_uart_put_hex(stats->sleeps);
     virt_uart_puts(" wakes="); virt_uart_put_hex(stats->wakes);
     virt_uart_puts(" queue-waits="); virt_uart_put_hex(stats->queue_waits);
-    virt_uart_puts(" runtime-polls="); virt_uart_put_hex(stats->runtime_polls);
+#if BOAROS_COST_DIAGNOSTICS
     virt_uart_puts(" inflight-ticks="); virt_uart_put_hex(stats->inflight_ticks);
     virt_uart_puts(" busy-ticks="); virt_uart_put_hex(stats->busy_ticks);
     virt_uart_puts(" total-ticks="); virt_uart_put_hex(stats->total_ticks);
     virt_uart_puts(" wait-ticks="); virt_uart_put_hex(stats->queue_wait_ticks);
     virt_uart_puts(" service-ticks="); virt_uart_put_hex(stats->service_ticks);
+#endif
     virt_uart_putc('\n');
 }
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int physical(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static int dma(const void *p, uint64_t n, uint64_t *out) { (void)n; *out = (uintptr_t)p; return 1; }
-int __real_kernel_vfs_node_pread(struct kernel_vfs_node *, uint64_t, void *, size_t, size_t *);
-int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, void *buffer, size_t size, size_t *count)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
 {
     if (loading_probe) {
         loads++;
@@ -601,11 +630,13 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 10);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_pread(node, offset, buffer, size, count);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *written)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
 {
+    uint64_t offset=count?spans[0].offset:0;
+    const void *buffer=count?spans[0].buffer:NULL;
     if (instance_hold && kernel_io_context_current()->background_reclaim) {
         for (unsigned i = 0; i < 2; i++) if (node == instance_nodes[i] && !instance_entered[i]) {
             instance_entered[i] = 1;
@@ -615,14 +646,16 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offs
     }
     if (stop_probe && kernel_io_context_current()->background_reclaim) {
         stop_probe = 0;
+        stop_pages = count;
         stop_entered = 1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&held_write, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 116);
     }
     if (background_fail && kernel_io_context_current()->background_reclaim) {
         background_fail = 0;
+        background_failed_pages=count;
         failed_offset = offset;
-        *written = 0;
+        for (size_t i=0;i<count;i++) spans[i].written=0;
         return -5;
     }
     if (write_probe) {
@@ -632,7 +665,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offs
         check(*(const unsigned char *)buffer == first, 21);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_writeback(node, offset, buffer, size, written);
+    return __real_kernel_vfs_node_writeback(node,spans,count);
 }
 static void write_worker(void *argument)
 {
@@ -664,8 +697,11 @@ static void reader(void *arg)
 {
     uintptr_t irq = riscv_interrupt_save();
     unsigned index = (uintptr_t)arg;
-    size_t valid;
-    check(kernel_page_cache_get(&cache, &file, 0, &observed[index], &valid) == KERNEL_PAGE_CACHE_STATUS_OK, 11);
+    struct kernel_page_cache_read_page page;
+    check(kernel_page_cache_get_batch(&cache, &file, 0, &page, 1) == KERNEL_PAGE_CACHE_STATUS_OK &&
+        page.status == KERNEL_PAGE_CACHE_STATUS_OK, 11);
+    size_t valid = page.valid_bytes;
+    observed[index] = page.physical_address;
     check(valid == sizeof(payload) && !memcmp(access_page(observed[index]), payload, valid), 12);
     check(physical_page_release(&allocator, observed[index]) == PHYSICAL_PAGE_STATUS_OK, 13);
     done++;
@@ -842,7 +878,7 @@ static void test_batch(unsigned mode)
     unsigned requests = mode == 2 ? 16 : batch_fillers + 16;
     requests += device.block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK;
     check(batch_done == batch_fillers + 4 && device.statistics.requests - before == requests &&
-          !device.active && !device.inflight && !device.barrier, 282);
+          !device.active && !device.queue.inflight && !device.barrier, 282);
     struct riscv_virtio_mmio_block_statistics stats;
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     print_counters(mode == 0 ? "batch" : mode == 1 ? "batch-partial" : "batch-error", &stats);
@@ -894,7 +930,7 @@ static void batch_reader_owner_probe(void *unused)
     check(kernel_scheduler_wake_signal(read_batch_task) == KERNEL_SCHEDULER_STATUS_OK &&
         read_batch_task->state == KERNEL_THREAD_STATE_BLOCKED && !read_batch_finished, 344);
     virt_uart_puts("I/O handshake: read-batch-pending\n");
-    while (device.inflight != 1 || read_batch_task->state != KERNEL_THREAD_STATE_BLOCKED) {
+    while (device.queue.inflight != 1 || read_batch_task->state != KERNEL_THREAD_STATE_BLOCKED) {
         check(!read_batch_finished && kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 345);
         riscv_interrupt_restore(RISCV_SSTATUS_SIE); (void)riscv_interrupt_save();
     }
@@ -921,9 +957,11 @@ static void test_read_batch(unsigned filesystem)
         riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
     }
     (void)riscv_interrupt_save();
-    check(read_batch_finished && device.statistics.requests - before == 8 && !device.inflight && !device.active, 350);
+    check(read_batch_finished && device.statistics.requests - before == (filesystem ? 1U : 8U) &&
+        !device.queue.inflight && !device.active, 350);
     if (filesystem) check(kernel_vfs_close(&read_batch_file) == 0, 355);
-    virt_uart_puts("I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner\n");
+    virt_uart_puts(filesystem ? "I/O file SG read passed: eight pages, held DMA and cancellation owner\n" :
+        "I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner\n");
 }
 
 static void timeout_worker(void *argument)
@@ -970,11 +1008,12 @@ static void instance_yield(void)
 static void instance_write(struct kernel_page_cache *c, struct kernel_vfs_file *f,
                            unsigned pages)
 {
-    KERNEL_LOCK_SCOPE(guard);
-    kernel_vfs_node_lock(kernel_vfs_file_node(f), &guard, 1);
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(f,&operation);
     for (unsigned i = 0; i < pages; i++) {
         size_t written;
-        check(kernel_page_cache_write(c, f, (uint64_t)i * 4096, payload, sizeof(payload),
+        struct kernel_vfs_write_source source={.data=payload};
+        check(kernel_page_cache_write_source(c, f, (uint64_t)i * 4096, &source, sizeof(payload),
                                       &written) == 0 && written == sizeof(payload), 182);
     }
 }
@@ -1162,7 +1201,8 @@ static void background_writeback_probe(void *unused)
     check(memory.dirty <= physical_page_total(&allocator) / 20 * 4096, 94);
     struct kernel_page_cache_statistics worker_stats = {0};
     kernel_page_cache_get_statistics(&cache, &worker_stats);
-    check(!background_fail && worker_stats.worker_failed == 1 && worker_stats.worker_written > 0, 100);
+    check(!background_fail && background_failed_pages &&
+          worker_stats.worker_failed == background_failed_pages && worker_stats.worker_written > 0, 100);
     check(worker_stats.worker_batches > 1 &&
           worker_stats.worker_scanned <= worker_stats.worker_batches * 64, 125);
     struct riscv_virtio_mmio_block_statistics query_before, query_after;
@@ -1201,7 +1241,7 @@ static void background_writeback_probe(void *unused)
     check(physical_page_release(&allocator, pinned) == PHYSICAL_PAGE_STATUS_OK, 107);
     while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 108);
     kernel_page_cache_stop_worker(&cache);
-    /* 暂扣在途写回，stop 必须等待它完成且不能继续提交本批其他页。 */
+    /* 暂扣已提交批次，stop 必须等待它完成且不能再提交下一批。 */
     for (unsigned i = 0; i < pages; i++) {
         size_t n;
         memset(payload, (int)(i % 251 + 1), sizeof(payload));
@@ -1220,7 +1260,8 @@ static void background_writeback_probe(void *unused)
     check(kernel_wait_queue_wake_all(&held_write) == KERNEL_SCHEDULER_STATUS_OK, 123);
     kernel_thread_join(&stopper);
     kernel_page_cache_get_statistics(&cache, &worker_stats);
-    check(stop_done && worker_stats.worker_written == writes_before_stop + 1, 124);
+    check(stop_done && stop_pages &&
+          worker_stats.worker_written == writes_before_stop + stop_pages, 124);
     (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     size_t count;
     check(kernel_vfs_pread(&target, (uint64_t)(pages - 1) * 4096, payload, sizeof(payload), &count) == 0 &&
@@ -1395,8 +1436,10 @@ void kernel_main(unsigned long hart, const void *dtb)
     (void)riscv_interrupt_save();
     struct riscv_virtio_mmio_block_statistics stats;
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
-    check(cold_done == 2 && progress_done && stats.max_inflight >= 2 && stats.sleeps >= 2 && !stats.runtime_polls, 46);
+    check(cold_done == 2 && progress_done && stats.max_inflight >= 2 && stats.sleeps >= 2, 46);
+#if BOAROS_COST_DIAGNOSTICS
     struct riscv_virtio_mmio_block_statistics queue_before = stats;
+#endif
     virt_uart_puts("I/O handshake: queue\n");
     while (!virt_uart_rx_ready()) { }
     check(virt_uart_getc() == 'g', 53);
@@ -1415,6 +1458,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     /* 队列场景持握 8 个请求：时间加权在途深度必须显著高于 1，
      * 等待与设备服务时间必须真实累计，忙时不超过总span。 */
     print_counters("queue", &stats);
+#if BOAROS_COST_DIAGNOSTICS
     uint64_t queue_busy = stats.busy_ticks - queue_before.busy_ticks;
     uint64_t queue_weighted = stats.inflight_ticks - queue_before.inflight_ticks;
     uint64_t queue_waited = stats.queue_wait_ticks - queue_before.queue_wait_ticks;
@@ -1428,6 +1472,7 @@ void kernel_main(unsigned long hart, const void *dtb)
           queue_weighted <= stats.max_inflight * queue_busy && queue_waited > 0 &&
           stats.service_ticks > queue_before.service_ticks &&
           stats.total_ticks >= stats.busy_ticks, 270);
+#endif
     for (unsigned mode = 0; mode < 3; mode++) test_batch(mode);
     test_read_batch(0);
     test_read_batch(1);
@@ -1498,7 +1543,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     (void)riscv_interrupt_save();
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     print_counters("timeout", &stats);
-    check(timed_out == 5 && stats.timeouts == 1 && !stats.runtime_polls &&
+    check(timed_out == 5 && stats.timeouts == 1 &&
           riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           physical_page_available(&allocator) == baseline, 67);
 #if BOAROS_COST_DIAGNOSTICS

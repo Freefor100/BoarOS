@@ -179,9 +179,9 @@ resolve在锁内验证owner，解锁后调用映射器，合法调用者自身�
 4/16 KiB的2/4宿主线程检查独立owner、内容、共享引用、resize和耗尽，结束后完整审计并回到页/堆基线；
 旧IRQ-only实现的两线程负对照触发free-list-insert fatal。压力回调与缓存注销继续保持单CPU契约。
 
-当前uaccess最终得到direct-map指针后没有新增覆盖复制的页引用；尚未复现单核UAF，
-但共享MM跨核执行需要把映射查询与取得pin放在同一保护下。页引用解决存活，不等于
-权限或COW永远不变。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，
+uaccess现按基页片段取得实际物理pin，权限检查与acquire位于同一MM rank15 raw范围；
+宿主反例证明旧lookup只有PTE引用，新pin在撤映射后阻止物理复用，归还后恢复allocator基线。
+该证据保护存活与精确复制前缀，不替代完整映射修改、权限或COW的跨核协议。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，
 `references/linux/arch/riscv/mm/tlbflush.c` 的本地与远端失效路径提供固定依据。
 
 RV COST记录IRQ-off、按rank的对象锁持有与wake-to-run；LA尚未接完整同类时间挂钩。
@@ -630,3 +630,70 @@ RV功能核的PT_LOAD映射/内容与匹配新OFF核一致；ELF文件SHA差异�
 可复用缓存和未关闭现场保留。
 
 </details>
+
+## 匿名并发的许可与失效完成
+
+共享匿名/tmpfs/SysV共用的memory_object页索引已有rank35任务锁，但多个对象并不共用这把锁。
+确定性交错让两个对象完成页准备后竞争一页预算，原IRQ-only记账使二者都成功；
+改为CAS收费，失败者归还两份私有页引用和metadata。对象引用与共享页统计也改为原子访问，
+现有索引mutex和扩容流程保留。4/16KiB、2/4 actor模型验证同页仅一次发布、配额、末次引用、
+构造/扩容/页OOM和归还；预热get/find没有新分配。这里只是后备对象证据，业务并发须另验。
+
+自持pin再次进入gate存在真实等待环：另一操作已经持gate排空它，pin owner又排队等gate。宿主以实际park登记和真实生产MM复现阻塞后，采用非阻塞取得；忙时返回`CONFLICT`，保留旧pin/映射，先归还再重试。关闭许可后的再次pin、缺页私有准备后的重取gate也遵守此规则，后者必须清候选和旧COW临时引用。try-write保留FIFO/pending/handoff和上下文检查，不登记等待者；2/4 actor与MTTCG双RAM验证错误返回、后续进展及最终owner。该规则不改变普通无自持pin调用的等待语义。
+
+物理 pin 与权限许可是两件事。PTE、权限和 acquire 必须在同一保护下完成；复制在锁外，只保留已获许可的页内片段。撤映射可摘 PTE 而让旧 pin 完成，降权则先关闭新登记并排空旧片段，fork 只排空写 pin。它们不能靠原子 refcount 单独完成，也不能把复制全部包进 MM raw。
+
+候选准备不能长期持有 raw 或 gate。并发 fault 用 VMA generation/PTE cookie 重新验证准备前事实；COW 复制期间暂持旧页引用，提交后旧映射引用归退休批次。父 fork 的失败资源准备与权限提交分开：子树未完成不改父页，父失效确认后才发布 child。第二张表 OOM、stale candidate 和竞争 loser 都归还实际 owner，不以已分配等同于已接纳。
+
+active bit 的含义是“旧翻译仍可能被该CPU使用”，不是 scheduler 的任务归属。目标集合采样后的新进入者须先登记、切根并失效；退出者本地失效完成后才清位，同SATP并发域也不能省略。固定本地 Linux `references/linux/arch/riscv/mm/context.c`、`tlbflush.c`、`cacheflush.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，用于核对发布与本地/远端区别。OpenSBI `references/opensbi/lib/sbi/sbi_ecall_rfence.c`、`sbi_tlb.c`，v1.8.1 `74434f255873d74e56cc50aa762d1caf24c099f8`，确认 RFENCE/FENCE.I 完成。非叶清除要求全范围，固定特权规范身份见[启动交接](smp-handoff.md)。
+
+CPU0预留16MiB arena拥有独立 allocator/heap/root template；只有kernel高半区子树由系统owner借用，allocator equality未放宽。用这一隔离域验证同MM多owner和fork/COW，不把系统压力或文件业务并发偷偷带入。绑MM任务退出必须在通用可信栈释放入口归还MM；只在某个task-storage包装里清理，会遗漏实际join路径，本轮真实资源基线曾发现这一遗漏，修复后全路径归零。
+
+验证命令与硬件/模型范围见[MM](../modules/kernel-mm.md#匿名-mm-的并发与回收)和[两核验证](../modules/riscv-smp.md#匿名-mm-验证)。宿主替换CSR/通知的活动集合握手不作为真实RFENCE证据；原SMP栈的错误profile也不能代替新MM链路。新链路独立注入RFENCE/FENCE.I错误，保留批次/live owner后fatal，回收未验证。正确性启动的OFF整段时间及固定容量计数不支持性能收益结论，默认单CPU与LA结果分列。
+
+实际 U-mode 微探针还暴露了测试上下文自身的中断假设：一次 scause=supervisor timer 到达正在执行的小段 U 指令，控制任务并不是普通用户 task，因而进入 fatal。固定特权规范20260120第3.1.6.1节规定，高特权中断不受低特权执行时的全局 SIE 位屏蔽；微探针改为暂时清 sie 源、返回S态后原样恢复。正常调度/用户 timer 行为没有修改。该探针只验证取指/访问权限，抢占证据仍来自生产调度及原用户程序，不能用屏蔽源的探针声称覆盖 U-mode 抢占。
+
+候选页和COW替换使用 `KERNEL_MM_NO_PAGE=UINT64_MAX`，不是0。RV合法物理页可以位于0；将0作“未准备/已消费/原地恢复”会拒绝合法表、漏归还候选，或把新页误作原地恢复。`test-mm-concurrency-host`的独立零地址模型导入bootstrap零页owner，验证零地址表、COW来源、末引用恢复、新替换与最终审计；它用access映射到宿主pool，不把启动期物理直访builder当成可迁移的宿主runtime walker。LA目录的0仍表达缺表，保留其原后端范围约束。
+
+共享匿名扩展复用同一fault准备/重查/提交，而不是另建一套策略。VMA/registry在gate内覆盖
+取得真实对象引用；暂停期间即使最后VMA被删除，对象及prepare返回的页owner仍存活。恢复时
+核对代次/backing/偏移/权限；失败结束准备登记并归还页引用，最后放对象引用。
+同页对象mutex只发布一次，两个MM各取得自己的PTE引用。并发fork的父提交必须按VMA分类：
+旧实现无条件mark_cow把共享父叶降为COW，直接权限反例失败；现在共享/protected共享跳过，
+私有叶仍COW。握手共享写证明可见性，单侧mprotect不撤另一MM许可，不替应用解决数据竞争。
+
+共享页回滚不能用当前物理引用数推断接纳历史：两个MM先后准备同页，另一MM写入再撤PTE，
+creator因无关VMA代次变化重试，旧实现删掉对象页并丢失内容。反向交错中，creator先失败而
+另一个准备引用尚存，旧实现又会遗留未接纳的收费页。握手反例分别检查写入内容和驻留/计费。
+并发准备现在在同一rank35 mutex内登记计数，finish成功记录不可撤销的接纳，失败归还自身引用；
+最后失败者才清未接纳页。直接get/find与继承的既有对象内容仍按实际消费者保存。页槽24→32字节，
+两者均使用32字节slab，不增加锁、对象引用或驻留页；准备完成多一次对象锁/点查询，不扫描全MM。
+
+组合fixture曾在fixed替换释放旧空表后继续用旧表地址核对引用，引发allocator fatal；
+改为在替换完成后重新捕获当前数据/表owner。双RAM静态/pthread重跑通过，生产回收契约未修改。
+
+## tmpfs 映射的关闭与登记借用
+
+文件登记不能仅在链表锁外保存裸next。摘队后仍在执行的回调需要其MM和来源存活；
+游标的退休后继借用覆盖继续遍历，注销等待该借用结束才释放记录，迭代归还限制raw段长。
+MM的实际清理owner等drain完成，使回调对MM存储的借用有根，不需要登记永久持MM引用形成自环。
+截断持inode IO30调用可能取得MM gate25的回调会倒置锁序；旧代次关闭后释放IO30，
+同步逐MM撤销，再取得IO30修改后备，将提交校验和回收连接起来。固定依据为
+`references/linux/mm/shmem.c:shmem_setattr`及`mm/truncate.c:truncate_pagecache`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；Linux两次撤销封住COW竞态，
+这里的代次关闭要求旧准备在重查时退出，不能把第一次撤销当成停止所有旧提交。
+非调度的原文件fixture暴露了通知NOT_INITIALIZED：空等待队列保留未初始化状态，
+有注册或借用则必须完成真实通知，不伪造scheduler就绪。
+
+映射登记状态若内嵌，会让原 504 字节 ext4 包装超过 512 字节 slab。当前采用 inode 独占、首次映射准备的 88 字节状态，普通节点保持原尺寸；状态指针只取得一次发布快照，在已有 owner 下使用，不为每次字段访问重复 acquire。首次发布与无状态截断共享 inode I/O 保护，避免“查到没有登记后释放锁，首次映射进入旧尺寸”的窗口。关闭后仍有登记借用时，不得在 MM gate 下 drain，否则截断回调等待 gate、注销者等待回调形成环。
+
+`st_blocks` 的 512 字节单位与架构页大小独立，16 KiB 页不能继续按每页 8 块计费。
+
+普通单CPU MM 没有 operation gate，不能用“最终 inode 读锁之前已查 VMA”替代恢复后校验。真实读锁 park 的握手反例在其间将文件 VMA 固定替换成匿名 VMA，旧实现把文件 0x77 装入新匿名区；当前在取得读保护及最后可睡眠准备之后重查，匿名区重新按 demand-zero 解析。反例使用来源准备边界而非第几次锁调用，最后仍检查来源、页/堆 owner。
+
+缺页策略增加新后备分支时，统计也必须覆盖同一个公共完成边界。原记账藏在旧 resolver，使 tmpfs 的新文件缺页/COW 返回成功却不增长 minflt。
+公共出口只给当前用户任务的自身 MM 记账，不能让 CPU0 服务复制或受控内核任务调用用户统计消费者。
+固定 Linux `references/linux/arch/riscv/mm/fault.c`、`arch/loongarch/mm/fault.c` 及 `mm/memory.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）按完成结果区分 major/minor；BoarOS 仍沿实际当前任务块读请求分类，等待别人的读请求不承诺精确 major 分类。
+差分区间先预热采样缓冲，检查受控触碰产生的计数下界及失败无增长，避免精确累计数依赖无关启动缺页。
+
+编译产物的同步检查应沿入口实际可达调用链查找指令，不要求内联在公开函数本体。只在其他函数找到 fence.i 也不能算通过；直接调用之外的地址引用不构成执行证据。该检查只证明指令存在，发布顺序和硬件行为仍由真实缺页、COW 与 mprotect 消费者验收。

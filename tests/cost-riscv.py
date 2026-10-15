@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Serial, independent-boot cost measurements; unimplemented cases fail explicitly."""
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -13,9 +12,12 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_resume_selection
+from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_scheduler, validate_resume_selection
+from cost_seed import replica_seed, seed_arguments, validate_resume_seed
+from cost_fixture import FrozenFixture, validate_resume_fixture
+from cost_measurement import acquire_measurement_lock
 ROOT=Path(__file__).resolve().parents[1]
-CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator')
+CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator','scheduler')
 IMPLEMENTED=set(CASES)
 def digest(path):
     with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -23,9 +25,12 @@ def run(command, **kwargs): return subprocess.run(command,check=True,**kwargs)
 def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--resume-from',type=Path,help='revalidate completed boot logs and continue remaining replicas without rerunning them')
+    parser.add_argument('--measurement-lock-fd',type=int,help='reuse the matched campaign parent-owned global measurement lock')
     parser.add_argument('--case',choices=(*CASES,'all'),default='all')
     parser.add_argument('--kernel',type=Path,default=ROOT/'build/cost/kernel-rv')
     parser.add_argument('--qemu',default='qemu-system-riscv64')
+    parser.add_argument('--qemu-seed',type=lambda value:int(value,0),
+                        help='fixture guest PRNG seed; replica i uses seed+i, pair it across kernels and ON/OFF')
     parser.add_argument('--root-drain-fixture',action='store_true',help='require private root unmount timing; not a user syscall')
     parser.add_argument('--kernel-identity',type=Path,help='sealed build identity when the kernel was built from a different source tree')
     parser.add_argument('--trace-read-lbas',action='store_true',help='QEMU read trace, whole boot including initialization and snapshot reads')
@@ -33,6 +38,7 @@ def main():
     parser.add_argument('--bios',type=Path,default=Path('/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin'))
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture',help='official hardware: fixed RAM/hart, default VirtIO, net/RTC, no RNG')
     parser.add_argument('--output',type=Path)
+    parser.add_argument('--fixture-cache',type=Path,help='freeze and reuse preboot images for allocator/latency/locking/scheduler')
     parser.add_argument('--metadata-core-only',action='store_true',help='accept only fixed metadata/lmbench measurements from a frozen coordinator; retain failed extra consumer attempts explicitly')
     parser.add_argument('--two-disks',action='store_true')
     parser.add_argument('--off',action='store_true',help='run identical ELF with diagnostics disabled')
@@ -47,13 +53,20 @@ def main():
     parser.add_argument('--consumer-sync-only',action='store_true',help='controlled synchronous reference, no original iozone commands')
     parser.add_argument('--coordinator-elf',type=Path,help='reuse a frozen workload ELF for matched ON/OFF comparisons')
     args=parser.parse_args()
+    try: replica_seed(args.qemu_seed,args.replicas-1)
+    except ValueError as error: parser.error(str(error))
+    if args.qemu_seed is not None and args.platform_config=='official':
+        parser.error('paired QEMU seed applies only to fixture measurements')
+    if args.fixture_cache and (args.case not in ('allocator','latency','locking','scheduler') or
+            args.two_disks or args.linux or args.platform_config!='fixture'):
+        parser.error('frozen fixture requires one supported single-disk BoarOS fixture case')
     names=[f'consumer-{libc}-{i}' for libc in ('musl','glibc') for i in range(8)]
     selected=names if args.consumer_commands=='all' else [f'consumer-{v.replace(":","-")}' for v in args.consumer_commands.split(',')]
     if args.consumer_sync_only:args.consumer_sync=True;selected=[]
     if (not selected and not args.consumer_sync_only) or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
     if args.consumer_sync and args.case!='consumer':parser.error('synchronous probes require --case consumer')
     if args.consumer_readers and args.case!='consumer':parser.error('appended readers require --case consumer')
-    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata','allocator','latency','locking') or args.consumer_sync):parser.error('frozen coordinator requires a supported case without new probes')
+    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata','allocator','latency','locking','scheduler') or args.consumer_sync):parser.error('frozen coordinator requires a supported case without new probes')
     if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
     if args.case in ('metadata','all') and args.consumer_timeout_ms!=180000:parser.error('metadata coordinator uses a fixed 180000 ms consumer budget')
@@ -66,9 +79,9 @@ def main():
         sys.path.insert(0,str(ROOT/'tests/diff-abi')); import harness
         args.kernel,linux_identity=harness.fixed_linux_image(None); args.off=True
     (ROOT/'build/cost').mkdir(parents=True,exist_ok=True)
-    measurement_lock=(ROOT/'build/cost/measurement.lock').open('w')
-    try: fcntl.flock(measurement_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    try: measurement_lock=acquire_measurement_lock(ROOT/'build/cost/measurement.lock',args.measurement_lock_fd)
     except BlockingIOError: parser.error('another cost measurement is active; serial runs required')
+    except (OSError,ValueError) as error: parser.error('invalid inherited measurement lock: '+str(error))
     cases=CASES if args.case=='all' else (args.case,)
     missing=set(cases)-IMPLEMENTED
     if missing: parser.error('not implemented: '+','.join(sorted(missing)))
@@ -114,7 +127,9 @@ def main():
                     elf=work/(libc+'-lmbench_all')
                     run(['debugfs','-R',f'dump /{libc}/lmbench_all {elf}',str(original)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                     identity['lmbench_elf_sha256'][libc]=digest(elf)
+            fixture=FrozenFixture(args.fixture_cache,case,digest(program)) if args.fixture_cache else None
             for replica in range(args.replicas):
+                qemu_seed=replica_seed(args.qemu_seed,replica)
                 folder=work/f'{case}-{replica}'; folder.mkdir(exist_ok=bool(args.resume_from))
                 reusing = args.resume_from and (folder/'boot.log').is_file() and (folder/'input.json').is_file()
                 if reusing:
@@ -126,47 +141,60 @@ def main():
                                       'trace_read_lbas':args.trace_read_lbas}.items():
                         if record[key]!=value:raise ValueError('resume input differs: '+key)
                     validate_resume_selection(case,record,selected)
+                    validate_resume_seed(record,qemu_seed)
+                    if fixture:
+                        if fixture.load() is None:raise ValueError('resume frozen fixture missing')
+                    validate_resume_fixture(record,fixture.sha256 if fixture else None)
                     if case=='consumer' and record.get('consumer_fixed_readers',False)!=args.consumer_readers:raise ValueError('resume reader selection differs')
                     record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(payload.encode()).hexdigest()
                     returncode=0
                 else:
                     disk=folder/'root.img'
-                    if case in ('consumer','metadata'): run(['cp','--sparse=always','--reflink=auto',str(original),str(disk)])
+                    cached=fixture.load() if fixture else None
+                    if cached:
+                        run(['cp','--sparse=always','--reflink=auto',str(cached),str(disk)])
+                        disk.chmod(0o600)
+                        if digest(disk)!=fixture.sha256:raise ValueError('frozen fixture copy differs')
                     else:
-                        with disk.open('wb') as stream: stream.truncate(256*1024*1024)
-                        run(['mkfs.ext4','-q','-F','-b','4096',str(disk)])
-                    commands=folder/'fixture.commands'
-                    contents=f'write {program} /init\nset_inode_field /init mode 0100755\n'
-                    if case=='consumer':
-                        nonce=folder/'replica-id';nonce.write_text(str(replica)+'\n');contents+=f'write {nonce} /cost-replica\n'
-                        policy=folder/'consumer-budget';policy.write_text(str(args.consumer_timeout_ms)+'\n')
-                        contents+=f'write {policy} /cost-consumer-budget\n'
-                        selection=folder/'consumer-selection';selection.write_text(str(sum(1<<names.index(n) for n in selected))+'\n')
-                        contents+=f'write {selection} /cost-consumer-selection\n'
-                        if args.consumer_readers:
-                            flag=folder/'readers-probe';flag.write_text('fixed work readers\n');contents+=f'write {flag} /cost-consumer-readers\n'
-                        if args.consumer_sync:
-                            flag=folder/'sync-probe';flag.write_text('controlled hot 4KiB sync\n');contents+=f'write {flag} /cost-consumer-sync\n'
-                    if args.linux:
-                        flag=folder/'linux-flag'; flag.write_text('fixed Linux reference\n'); contents+=f'write {flag} /cost-linux\n'
-                    if case=='write':
-                        seed=folder/'cold-data'; seed.write_bytes(bytes([0x5a])*1048576)
-                        contents+=''.join(f'write {seed} /cold-{n}\n' for n in (0,1,3,63,64,65,4096))
-                    if case in ('readers','consumer'):
-                        seed=folder/'reader-data';seed.write_bytes(bytes([0x5a])*8388608)
-                        contents+=''.join(f'write {seed} /reader-{relation}-{i}\n' for relation in (0,1) for i in range(1 if relation==0 else 4))
-                    if case=='mprotect':
-                        seed=folder/'resident-data'; seed.write_bytes(bytes([0x5a])*67108864)
-                        contents+=f'write {seed} /resident-data\n'
-                    if case=='locking':
-                        seed=folder/'lock-data'; seed.write_bytes(bytes([0x5a])*1048576)
-                        contents+=''.join(f'write {seed} /lock-{name}\n' for name in ('a','b','input'))
-                    if args.two_disks:
-                        flag=folder/'dual-flag'; flag.write_text('two disks\n'); contents+=f'write {flag} /cost-dual\n'
-                    commands.write_text(contents)
-                    run(['debugfs','-w','-f',str(commands),str(disk)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        if case in ('consumer','metadata'): run(['cp','--sparse=always','--reflink=auto',str(original),str(disk)])
+                        else:
+                            with disk.open('wb') as stream: stream.truncate(256*1024*1024)
+                            run(['mkfs.ext4','-q','-F','-b','4096',str(disk)])
+                        commands=folder/'fixture.commands'
+                        contents=f'write {program} /init\nset_inode_field /init mode 0100755\n'
+                        if case=='consumer':
+                            nonce=folder/'replica-id';nonce.write_text(str(replica)+'\n');contents+=f'write {nonce} /cost-replica\n'
+                            policy=folder/'consumer-budget';policy.write_text(str(args.consumer_timeout_ms)+'\n')
+                            contents+=f'write {policy} /cost-consumer-budget\n'
+                            selection=folder/'consumer-selection';selection.write_text(str(sum(1<<names.index(n) for n in selected))+'\n')
+                            contents+=f'write {selection} /cost-consumer-selection\n'
+                            if args.consumer_readers:
+                                flag=folder/'readers-probe';flag.write_text('fixed work readers\n');contents+=f'write {flag} /cost-consumer-readers\n'
+                            if args.consumer_sync:
+                                flag=folder/'sync-probe';flag.write_text('controlled hot 4KiB sync\n');contents+=f'write {flag} /cost-consumer-sync\n'
+                        if args.linux:
+                            flag=folder/'linux-flag'; flag.write_text('fixed Linux reference\n'); contents+=f'write {flag} /cost-linux\n'
+                        if case=='write':
+                            seed=folder/'cold-data'; seed.write_bytes(bytes([0x5a])*1048576)
+                            contents+=''.join(f'write {seed} /cold-{n}\n' for n in (0,1,3,63,64,65,4096))
+                        if case in ('readers','consumer'):
+                            seed=folder/'reader-data';seed.write_bytes(bytes([0x5a])*8388608)
+                            contents+=''.join(f'write {seed} /reader-{relation}-{i}\n' for relation in (0,1) for i in range(1 if relation==0 else 4))
+                        if case=='mprotect':
+                            seed=folder/'resident-data'; seed.write_bytes(bytes([0x5a])*67108864)
+                            contents+=f'write {seed} /resident-data\n'
+                        if case=='locking':
+                            seed=folder/'lock-data'; seed.write_bytes(bytes([0x5a])*1048576)
+                            contents+=''.join(f'write {seed} /lock-{name}\n' for name in ('a','b','input'))
+                        if args.two_disks:
+                            flag=folder/'dual-flag'; flag.write_text('two disks\n'); contents+=f'write {flag} /cost-dual\n'
+                        commands.write_text(contents)
+                        run(['debugfs','-w','-f',str(commands),str(disk)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        if fixture:fixture.publish(disk)
                     with disk.open('rb') as prepared:os.fdatasync(prepared.fileno())
                     record={**identity,'case':case,'replica':replica,'elf_sha256':digest(program),'fixture_sha256':digest(disk),'timebase_hz':10000000}
+                    if fixture:record.update(fixture_mode='frozen',fixture_input_sha256=fixture.sha256)
+                    if qemu_seed is not None:record['qemu_seed']=qemu_seed
                     if case=='metadata':
                         record['consumer_command_names']=['consumer-musl-1','consumer-glibc-1']
                         record['scope']='metadata fixed work and two selected original iozone commands'
@@ -176,6 +204,7 @@ def main():
                         '-drive',f'file={disk},if=none,format=raw,id=root,cache={args.cache}',
                         '-global','virtio-mmio.force-legacy='+('true' if args.transport=='legacy' else 'false'),
                         '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+                    invocation+=seed_arguments(qemu_seed)
                     if args.platform_config=='official':
                         invocation[invocation.index('-m')+1]='1G'
                         global_index=invocation.index('-global');del invocation[global_index:global_index+2]
@@ -221,7 +250,7 @@ def main():
                             f'foreground.{kind}_requested.value':int(requested),
                             f'foreground.{kind}_accepted.value':int(accepted)}
                         if kind in ('file','dgram'): expectations[name][f'foreground.{kind}_copy.value']=int(accepted)
-                        if kind=='file': expectations[name]['foreground.file_staging.value']=4096*int(calls) if int(requested) else 0
+                        if kind=='file': expectations[name]['foreground.file_staging.value']=0
                     elif line.startswith('COST RESULT '):
                         _,_,name,ns=line.split()
                         if name in timings: raise ValueError('duplicate timing')
@@ -250,6 +279,7 @@ def main():
                     required.update(f'file-sync-{method}-every-{interval}' for method in range(3) for interval in (1,16,128))
                     required.update(('dgram-64k','dgram-oversize','file-osync','file-odsync','file-random','file-extend-accept','file-extend-sync','file-fault-prefix','file-fault-first'))
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('missing/extra workload window')
+                    if not args.off and set(closing)!=required: raise ValueError('missing/extra write closing window')
                 if case=='locking':
                     validate_locking(timings,snapshots,not args.off)
                 if not args.off:
@@ -299,6 +329,8 @@ def main():
                     required={f'latency-copy-{n}' for n in (4096,65536,1048576)}|{f'latency-protect-{n}' for n in (4096,1048576)}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('latency coverage')
                     if not args.off and any(s['values']['foreground.irq_off_ticks.samples']==0 or s['values']['foreground.wake_to_run.samples']==0 for s in snapshots): raise ValueError('IRQ or independent wake not measured')
+                if case=='scheduler':
+                    record['scheduler']=validate_scheduler(timings,snapshots,output,not args.off)
                 if case=='allocator':
                     record['allocator']=validate_allocator(timings,snapshots,output,not args.off)
                 if case=='deadline':

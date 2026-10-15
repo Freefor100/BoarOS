@@ -126,6 +126,54 @@ class ArchitectureCoverage(unittest.TestCase):
         commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
         self.assertIn('test-references', commands)
 
+    def test_smp_has_its_own_rv_gate_and_shared_host_contract(self):
+        commands = [arg for case in self.plan('riscv', 'smp') for arg in case['argv']]
+        self.assertIn('test-smp-riscv', commands)
+        self.assertIn('test-smp-userland-riscv', commands)
+        self.assertIn('test-mm-smp-riscv', commands)
+        self.assertIn('test-mm-smp-userland-riscv', commands)
+        self.assertIn('test-mm-shared-smp-riscv', commands)
+        self.assertIn('test-mm-shared-smp-userland-riscv', commands)
+        commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
+        self.assertIn('test-smp-host', commands)
+        self.assertIn('test-mm-pin-host', commands)
+        self.assertIn('test-mm-concurrency-host', commands)
+        self.assertIn('test-memory-object-concurrency-host', commands)
+        self.assertIn('test-mm-shared-concurrency-host', commands)
+        result = subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('run.py')),
+            '--arch', 'loongarch', '--suite', 'smp', '--list'], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_host_runs_matched_measurement_contracts_without_privileged_campaign(self):
+        commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
+        self.assertIn('test-cost-match-host', commands)
+        self.assertNotIn('test-cost-match-riscv', commands)
+
+    def test_user_smp_has_an_independent_result_suite(self):
+        commands=[argument for case in self.plan('riscv','user-smp') for argument in case['argv']]
+        self.assertIn('test-user-smp-riscv',commands)
+        self.assertIn('test-user-smp-runtime-riscv',commands)
+        self.assertIn('test-user-smp-composition-riscv',commands)
+        host=[argument for case in self.plan('host','host') for argument in case['argv']]
+        self.assertIn('test-user-smp-host',host)
+        self.assertIn('test-user-smp-composition-host',host)
+        controlled=[argument for case in self.plan('riscv','smp') for argument in case['argv']]
+        self.assertIn('test-smp-fpu-setup-riscv',controlled)
+        result=subprocess.run([sys.executable,'-B',str(Path(__file__).with_name('run.py')),
+            '--arch','loongarch','--suite','user-smp','--list'],capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0)
+
+    def test_original_user_smp_profiles_have_independent_scheduled_results(self):
+        path=Path(__file__).resolve().parents[2]/'.github/workflows/native-extended.yml'
+        job=yaml.safe_load(path.read_text())['jobs']['riscv-user-programs']
+        self.assertEqual(job['strategy']['matrix']['cpus'],[2,1])
+        self.assertEqual(job['strategy']['matrix']['memory'],['512M','1G'])
+        self.assertFalse(job['strategy']['fail-fast'])
+        commands='\n'.join(step.get('run','') for step in job['steps'])
+        self.assertIn('--execution-profile rv-user-smp',commands)
+        self.assertIn('--require-pass',commands)
+        self.assertIn('--firmware',commands)
+
     def test_native_template_retains_full_abi_observations_and_failed_disk(self):
         path = Path(__file__).resolve().parents[2] / '.github/workflows/native-contracts.yml'
         steps = yaml.safe_load(path.read_text())['jobs']['contracts']['steps']
@@ -135,6 +183,18 @@ class ArchitectureCoverage(unittest.TestCase):
         for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
             self.assertTrue(any(fnmatch.fnmatchcase('build/diff-abi/run/' + name, pattern) for pattern in ordinary), name)
         self.assertTrue(any(fnmatch.fnmatchcase('build/diff-abi/run/boaros-1G.img', pattern) for pattern in failed))
+        for arch in ('rv', 'la'):
+            for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
+                actual = f'build/sched-handoff-{arch}/{name}'
+                self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in ordinary), actual)
+            actual = f'build/sched-handoff-{arch}/boaros-1G.img'
+            self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in failed), actual)
+        for directory in ('exec-boundary-rv', 'exec-boundary-la', 'stack-elf-rv-rwx', 'stack-elf-la-rw', 'stack-elf-la-absent'):
+            for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
+                actual = f'build/{directory}/{name}'
+                self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in ordinary), actual)
+            actual = f'build/{directory}/boaros-1G.img'
+            self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in failed), actual)
 
     def test_shared_runtime_consumers_include_glibc_and_both_sqlite_modes(self):
         for arch in ('riscv', 'loongarch'):

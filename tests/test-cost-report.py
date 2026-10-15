@@ -1,7 +1,113 @@
 import unittest
-from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_resume_selection
+from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_scheduler, validate_resume_selection
+
+class CostFixtureTest(unittest.TestCase):
+    def test_resume_cannot_omit_or_add_frozen_mode(self):
+        from cost_fixture import validate_resume_fixture
+        validate_resume_fixture({},None)
+        validate_resume_fixture({'fixture_mode':'frozen','fixture_sha256':'f','fixture_input_sha256':'f'},'f')
+        for record,requested in (({'fixture_mode':'frozen','fixture_sha256':'f','fixture_input_sha256':'f'},None),
+                ({},'f'),({'fixture_mode':'frozen','fixture_sha256':'f','fixture_input_sha256':'other'},'f')):
+            with self.assertRaises(ValueError):validate_resume_fixture(record,requested)
+
+    def test_frozen_replicas_require_equal_bytes_and_distinct_writable_paths(self):
+        rows=[dict(case='locking',cost_diagnostics=0,transport='modern',cache='writeback',
+                   replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',
+                   source_sha256='s',fixture_sha256='f',fixture_input_sha256='f',fixture_mode='frozen',
+                   argv=['qemu','-drive',f'file=/boot/{i}/root.img,if=none,format=raw,id=root,cache=writeback'],
+                   snapshots=[],timings_ns={'small':1}) for i in range(3)]
+        validate_replicas(rows)
+        from copy import deepcopy
+        for field,value in (('fixture_mode','fresh'),('fixture_input_sha256','changed'),
+                            ('argv',rows[0]['argv']),('fixture_sha256','changed')):
+            bad=deepcopy(rows);bad[1][field]=value
+            with self.assertRaises(ValueError):validate_replicas(bad)
+
+    def test_frozen_preboot_bytes_are_reused_and_sealed(self):
+        from cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); source=root/'root.img'; source.write_bytes(b'preboot')
+            cache=FrozenFixture(root/'cache','locking','elf')
+            self.assertIsNone(cache.load())
+            cache.publish(source)
+            source.write_bytes(b'after boot')
+            self.assertEqual(cache.load().read_bytes(),b'preboot')
+            with self.assertRaises(ValueError):cache.publish(source)
+
+    def test_changed_elf_and_damaged_cache_are_not_repaired_silently(self):
+        from cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); source=root/'root.img'; source.write_bytes(b'preboot')
+            cache=FrozenFixture(root/'cache','allocator','elf');cache.publish(source)
+            with self.assertRaises(ValueError):FrozenFixture(root/'cache','allocator','other-elf').load()
+            image=cache.load(); image.chmod(0o600); image.write_bytes(b'damaged')
+            with self.assertRaises(ValueError):cache.load()
+
+    def test_partial_publication_is_rejected(self):
+        from cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);(root/'cache/latency').mkdir(parents=True)
+            with self.assertRaises(ValueError):FrozenFixture(root/'cache','latency','elf').load()
+
+class CostSeedTest(unittest.TestCase):
+    def test_replica_inputs_pair_across_kernel_and_observation_modes(self):
+        from cost_seed import replica_seed, seed_arguments
+        expected = [123, 124, 125]
+        for _ in ('baseline-off', 'candidate-off', 'return-off', 'baseline-on', 'candidate-on', 'return-on'):
+            self.assertEqual([replica_seed(123, i) for i in range(3)], expected)
+        self.assertEqual(seed_arguments(123), ['-seed', '123'])
+        self.assertEqual(seed_arguments(None), [])
+
+    def test_seed_range_and_span_are_checked_before_launch(self):
+        from cost_seed import replica_seed
+        maximum = (1 << 64) - 1
+        self.assertEqual(replica_seed(maximum, 0), maximum)
+        self.assertIsNone(replica_seed(None, 0))
+        for seed, replica in ((maximum, 1), (-1, 0), (True, 0), (1, -1), (1, True)):
+            with self.assertRaises(ValueError): replica_seed(seed, replica)
+
+    def test_resume_checks_seed_and_actual_argument(self):
+        from cost_seed import validate_resume_seed
+        validate_resume_seed({'argv': ['qemu']}, None)
+        validate_resume_seed({'qemu_seed': 123, 'argv': ['qemu', '-seed', '123']}, 123)
+        for record, requested in (({'argv': ['qemu']}, 123),
+                ({'qemu_seed': 124, 'argv': ['qemu', '-seed', '124']}, 123),
+                ({'qemu_seed': 123, 'argv': ['qemu', '-seed', '124']}, 123),
+                ({'qemu_seed': 123, 'argv': ['qemu', '-seed']}, 123),
+                ({'qemu_seed': 123, 'argv': ['qemu', '-seed', '123', '-seed', '123']}, 123)):
+            with self.assertRaises(ValueError): validate_resume_seed(record, requested)
 
 class CostReportTest(unittest.TestCase):
+    def test_scheduler_requires_completed_windows_and_peer_content(self):
+        work = {'scheduler-yield': (8192, 8192), 'scheduler-wake': (8192, 8192 * ord('p')),
+                'scheduler-create': (1024, 1024)}
+        timings = {name: 100 for name in work}
+        output = ''.join(f'COST SCHED WORK {name} {n} {v}\n' for name, (n, v) in work.items())
+        validate_scheduler(timings, [], output, False)
+        for bad in (0, -1):
+            with self.assertRaisesRegex(ValueError, 'time'):
+                validate_scheduler({name: bad for name in work}, [], output, False)
+        for bad in ('', output + output.splitlines()[0] + '\n', output.replace('917504', '0')):
+            with self.assertRaisesRegex(ValueError, 'work|progress'):
+                validate_scheduler(timings, [], bad, False)
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            validate_scheduler(timings, [], output, True)
+        snapshots = [{'name': name, 'values': {
+            'foreground.irq_off_ticks.samples': 1,
+            'foreground.raw_wait_ticks.samples': 1,
+            'foreground.raw_hold_ticks.samples': 1}} for name in work]
+        validate_scheduler(timings, snapshots, output, True)
+        for metric in snapshots[0]['values']:
+            bad = [{**s, 'values': {**s['values'], metric: 0}} for s in snapshots]
+            with self.assertRaisesRegex(ValueError, 'not measured'):
+                validate_scheduler(timings, bad, output, True)
+
     def test_resume_selection_only_applies_to_consumer_manifests(self):
         for case in ('allocator','latency','locking'):
             validate_resume_selection(case, {}, ['consumer-musl-0'])

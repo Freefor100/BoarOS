@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录RV/LA单CPU的OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
+本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV用户两核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -8,9 +8,10 @@
 |---|---|
 | `kernel/sched/core.c` | 创建、切换、tick 入口、资源借用校验 |
 | `kernel/sched/policy.c`、`runqueue.c` | 纯策略/预算状态机、分级 ready 队列 |
-| `kernel/sched/scheduling.c`、`kernel/syscall/sched.c` | 实际运行时间记账、抢占、安全返回边界、策略与 CPU0 affinity ABI |
+| `kernel/sched/scheduling.c`、`kernel/syscall/sched.c` | 实际运行时间记账、抢占、安全返回边界、策略与请求affinity；独立用户SMP的CPU0服务交接 |
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
-| `kernel/pid.c` | 统一身份对象、编号/代次、引用与 TID/TGID/PGID/SID 角色成员 |
+| `kernel/pid.c`、`kernel/sched/identity.c` | 私有编号保留、身份发布/角色引用，以及锁外身份存储释放 |
+| `kernel/sched/lifetime.c` | 任务存储借用、退休后继、join/reaper 资格与锁外页归还 |
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
@@ -21,11 +22,14 @@
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
 | `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
 
+USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0服务；用户`sched_yield`经`kernel_scheduler_user_yield_current()`延后到用户资格恢复，通用`kernel_scheduler_yield_current()`仍实际执行内核调度，等待游标/回调借用归还不使用用户yield标志。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
-等待登记、阻塞提交、期限索引和runnable发布使用统一rank40短锁；heap10→physical20、
+等待登记、阻塞提交、期限索引、运行记账、策略更新、队列校验和runnable发布使用统一rank40短锁；heap10→physical20、
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
-业务条件、进程组及缓存/网络数据仍按单CPU纪律保护；等待原语互斥不表示整个内核支持SMP。
+任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
+受控任务可绑定匿名及私有arena tmpfs映射 MM，信号内容、文件/SysV/设备业务及其统计仍限定单CPU；调度元数据互斥不表示整个内核支持SMP。
 
 `kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
@@ -48,6 +52,7 @@ queue_destroy在注册或操作/游标/回调借用未归零时返回BUSY，调�
 
 聚焦入口：`make test-wait-host test-wait-riscv test-wait-loongarch`。host直接链接park.c、
 真实raw/runqueue，在2/4线程握手下检查提前wake、单次仲裁、旧代次、多队列与退休游标；
+COMMITTED任务的模拟backend与生产一样在通知中摘除默认节点，另验证任务/回调混合队列的FIFO和新增登记的sequence边界。
 双侧512MiB/1GiB检查真实首次/退出切换、timeout及任务页回到基线。此处是原语与单CPU证据，
 不替代共享MM、业务对象或多核客体的并发验收。
 
@@ -56,6 +61,7 @@ queue_destroy在注册或操作/游标/回调借用未归零时返回BUSY，调�
 finish每段最多摘16个登记，未借用的小批登记可在同一保护下结束；存在借用才等待归还。
 
 可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw再park。
+`kernel_rwlock_try_write()`及mutex包装只尝试取得，不登记等待者；已有读/写owner、pending或handoff均返回忙，guard和IRQ状态保持。它保留相同rank/key、owner与上下文检查，不能用于越过FIFO或在raw内取得任务锁。
 未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束及pending摘除。
 FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
 已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。
@@ -70,7 +76,15 @@ IRQ恢复及非法owner/上下文。真实I/O等待继续用`make test-io-sleep-
 
 ## 策略、就绪队列与 RT 预算
 
+独立[RV受控两核配置](riscv-smp.md)在同一调度域内维护每CPU资格索引，只有显式mask的joinable内核任务参与跨CPU选择。
+用户及业务worker默认CPU0；全局runnable成员与on_cpu仍是唯一owner，资格节点只借用成员。
+任务构造、栈窗口和实际回收限CPU0，停止时受控存储owner归零后才确认HSM STOPPED。
+
 OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
+
+挑选、摘队列与取得on_cpu执行owner在同一个短锁发布点完成，普通切换与退出复用该入口；锁外才切换架构状态，旧owner仍由新栈交接释放。未使用的拆分pop入口已删除。
+yield及预算tick在同一决策raw内校验队列，不再校验后解锁重取；普通tick的load遍历
+仍在锁外，遍历前检查和决策时重查分别保留。无效队列不消费待调度请求。
 
 ready 节点独立于 blocked/cleanup 链。全局优先级排序双链保留遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
 
@@ -79,6 +93,8 @@ FIFO yield和RR到期只轮转同级候选；未节流且没有同级竞争者�
 `test-scheduler-handoff-host`直接链接生产决策、队列/策略/raw，覆盖低/同/高优先级、节流和idle；
 `test-scheduler-handoff-riscv/test-scheduler-handoff-loongarch`在512MiB/1GiB以同ELF对照固定Linux，
 高优先级yield/跨RR片时低任务计数保持0，随后高任务阻塞才允许低任务前进并正常回收。
+该用例在放行前准备计时输出，阻塞后通过pipe确认真实子任务进展；不以5ms睡眠
+推断调度完成。另运行子任务延迟20ms的同契约反例，原160ms RR窗口和退出核对保持。
 
 退出在发布 completion、清 TID 并唤醒等待者后，若已注册 cleanup worker，按同一
 ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 或 join owner 在可信栈
@@ -87,11 +103,17 @@ ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 
 `test-scheduler-cases-riscv` 在未启动 timer 时验证退出、join 和清理的连续进展，
 以及除启动 owner 所持 cleanup worker 外的页回到基线。
 
-全局预算默认 period=1,000,000us、runtime=950,000us，仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在 IRQ 临界区先结算旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
+全局预算配置默认 period=1,000,000us、runtime=950,000us，消费量和结算起点按CPU保存；仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在调度短锁内先结算各CPU在旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
 
-硬件 timer 取普通 tick、RT 配额耗尽/补充和 RR 片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
+硬件 timer 的最后编程期限由当前CPU持有，取普通 tick、该CPU的RT配额耗尽/补充和当前任务RR片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
 
-sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、SMP、cgroup 配额或 deadline scheduler。
+IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡眠服务前结束；
+缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
+后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
+
+sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、用户任务跨核执行、cgroup 配额或 deadline scheduler；独立 RV 两核仅接纳受控内核任务。
+
+`make test-sched-concurrency-host`直接执行生产策略/选择/等待交接，在2/4线程握手中验证唯一执行owner、旧栈交接及IRQ恢复；保护CPU独立记账和公开策略入口的同域修改。该证据不替代客户机多核。
 
 确定性 host 测试 `tests/host/sched_{policy,runqueue,syscall}_test.c` 覆盖预算、排队、ABI 和随机队列模型。`tests/diff-abi/sched_policy.c` 的 23 条同 ELF Linux 对照覆盖参数及真实 FIFO/yield/更高优先级抢占/RR轮转；`sched_stat.c` 另有5条策略stat和STOPPED/zombie wchan对照。`tests/sched-bandwidth-riscv.sh` 使用真实 FIFO 忙循环验证耗尽、OTHER 进展、周期恢复、同值写不补预算和 -1 切换保留消费；500us/250us 场景先等待新 coarse tick，再检查8ms以内被抢占并报告实际超出量。RR 在高优先级任务运行60ms后仍只剩约40ms，能检出错误重装100ms的实现。两个先阻塞后赋RR策略的子进程由同一pipe write唤醒，在100ms quota/300ms period下验证同时到期仍把CPU交给同级peer；旧队首重排已由该测试复现失败。该测试直接调用 SYS_sched_setscheduler，固定 musl 的同名包装函数是 ENOSYS 存根。测试用 guest monotonic 计时，不由 QEMU 墙钟速度推断调度正确性。
 
@@ -101,7 +123,44 @@ TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的�
 
 编号仅在全部角色成员和临时引用都释放后归还 bitmap。对象仍有引用不表示 TID 对应线程仍可收信号；线程 lookup、组 lookup 和 proc 可见性分别检查其角色及生命周期。组长先退出保留身份容器，直到最后线程退出或非组长 exec 原子接管四类成员。zombie 在 wait/reap 前保留进程身份；旧 proc 节点用同一对象的代次防止编号复用后命中新进程。
 
-对象存储来自调度器私有 slab heap；准备分配可以睡眠，但必须先于身份发布，发布、角色迁移和摘除区间禁止分配或 yield。单 hart 的 SIE=0 本身不代表禁止睡眠：既有 syscall/回收路径可调度，不能因此把跨分配的裸身份指针当作受保护引用。最后引用先摘编号索引、登记待释放对象，再在身份变更结束后归还存储。该机制不宣称 SMP 安全。固定依据为 `references/linux/kernel/pid.c` 的角色成员和 exec 转移，以及 `references/linux/kernel/sys.c`、`kernel/exit.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现按已选契约额外让临时引用保留编号。
+对象存储来自调度器私有slab heap。准备分配可以睡眠；reserve仅占用数字/代次，不进入查找桶。
+TID与私有TGID先构造，父进程的PGID/SID在准备期间持实际引用，自己的身份由既有角色owner覆盖。
+最终发布在同一调度域中挂接角色、进入任务索引及runnable；失败归还私有保留项，不发布半成品。
+最后PID引用只摘编号索引并登记退休，heap释放在锁外执行。
+PID记录为64字节，状态与代次共用一字；合法代次仍为proc身份的34位范围，引用保持32位。
+状态0/1/2为私有/已发布/退休，3为损坏。所有状态修改仍在调度域；真实PID引用覆盖已发布代次读取，
+任务存储借用不能替代PID引用或锁内快照。`test-pid-object-host`覆盖编码边界、非法引用/状态，
+以及4/16KiB下32/128个实际PID的单页slab预算和最终页/堆归还。
+
+`scheduler_task_lookup`在发现任务的同一保护下取得存储借用，归还使用`scheduler_task_put`；
+locked变体仅供已持调度域的短操作使用。借用不固定MM、文件表、权限、角色或代次。
+退休先摘身份和任务索引，资源由可信栈清理；最后等待/执行/查找使用结束后才归还元数据页。
+组退出沿本组的借用游标通知成员，不扫描全局任务表；单成员的退出标记和状态发布
+在同一raw内完成，仅实际跨解锁通知时增加借用。`test-sched-concurrency-host`
+用1/2/4成员及64个无关任务保护工作量、退出标记和全部借用归还。
+长枚举借用当前节点，退休节点保留有owner的后继；每段至多16项，后继引用迭代归还。
+父子与组校验跨段保留存储，代次变化时重查；proc调度/身份值受域保护，MM/TTY内容仍按单CPU业务契约读取。
+
+join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
+wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
+退出队头仍有事件/等待/执行owner时，reaper返回BUSY；cleanup等待真实归还通知，不将待归还借用当作可立即回收的工作。
+PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cleanup；空索引不能代替页基线。
+退休元数据的最后借用在普通可信调用栈上归还页；禁止抢占的回调范围只通知已有cleanup owner，raw持有者不得触发释放。
+摘索引时pending即覆盖清理owner，retire只改变可释放资格；摘队列再将页owner交给collector，
+实际锁外归还完成后，才在调度域内减少pending。
+最后一次完成保留关机进展标记，cleanup登记前后都复查，避免通知先到而永久睡眠；
+标记只要求重新检查，下一次stop_users扫描前清除，不表示live user已结束，也不绕过retry deadline。
+2/4线程门禁握手覆盖页服务未完成及通知在检查、登记、park各窗口到达，检查注册与借用归零。
+父通知的空队列或直接token通知在域内结束，实际跨解锁的
+游标才固定父任务容器。发送信号给当前已固定的leader复用既有owner；不同leader
+仍在同一保护下取得存储借用，GROUP_DEAD容器和真实成员遍历的寿命不变。
+退出通知cleanup后再选择next；join在新栈完成点通知，避免既提前释放旧栈又丢失无timer进展。
+`make test-sched-concurrency-host`涵盖2/4线程的选择、策略竞争、查找/退休与join/reaper争用；
+`make test-sched-lifecycle-riscv test-sched-lifecycle-loongarch`在512MiB/1GiB验证真实换栈、
+借用延后归还及trusted-stack资源基线。宿主模型不替代客户机多核。
+固定依据仍为`references/linux/kernel/pid.c`、`kernel/fork.c`、`kernel/exit.c`和`fs/exec.c`，
+commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引用对数字的owner。
+
 
 每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_NOFILE`/`RLIMIT_STACK`。两项限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
@@ -175,9 +234,13 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 ## 同步、成本与验证边界
 
-单 hart 的 SIE 临界区串行化组关系、fd/MM 引用和 futex 登记。共享 MM 使用同一页表与本地 SFENCE.VMA；这不是 SMP 协议。多 hart 前仍须补锁、页引用原子操作和远端 TLB shootdown。
+短调度域保护组/身份元数据；fd/MM等业务引用及futex条件仍依赖单CPU的IRQ纪律。共享 MM 使用同一页表与本地 SFENCE.VMA；多CPU前仍须补共享对象同步、lookup到pin的交接和远端TLB完成后回收。
 
 RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
+
+页/栈初始化只写已独占、对齐的私有存储，完整初始化后才发布。可信栈回收时用整字
+跳过全为填充值的前缀，再逐字节定位首处差异；不跨canary或高边界，余量统计仍精确
+到字节。host在4/16KiB下遍历全部前缀边界并检查坏canary拒绝回收，真实guard另测。
 
 LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有永久boot页，任务叶
 仅借用原连续物理栈，PLV0/RW/NX且下方16KiB未映射。异常入口在写frame前
@@ -189,7 +252,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。LoongArch 已验证整数 context、timer 抢占、信号、musl TLS/pthread、动态 musl/DSO TLS、标量 FPU 与 LSX/LASX；更广程序与多核仍需独立验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无普通用户任务跨核及文件/共享后备 MM 的 SMP 闭环、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。受控 RV 两核边界见[两核模块](riscv-smp.md)。LoongArch 已验证整数 context、timer 抢占、信号、musl TLS/pthread、动态 musl/DSO TLS、标量 FPU 与 LSX/LASX；更广程序与多核仍需独立验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
@@ -207,7 +270,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 ## 系统统计与可等待内核任务
 
-调度器独立登记所有已发布任务，直到最后 metadata 回收才注销；构造失败不发布。`kernel_scheduler_system_statistics()` 返回真实任务数（含尚未回收的 zombie，16 位饱和）和 16 位小数的负载。每 501 个 100 Hz tick 按固定 Linux 的 1884/2014/2037（11 位小数）更新 1/5/15 分钟指数平均。READY/RUNNING 与不可中断 BLOCKED 计入活动量；空闲 worker/cleanup 的工作队列等待标为 interruptible，不凭空形成空闲负载，实际存储与压力等待仍计入。
+调度器独立登记所有已发布任务，逻辑退休时摘表；构造失败不发布。退休后仅因存储借用保留的页不再代表可见任务，未被wait/reap的zombie仍在表中。`kernel_scheduler_system_statistics()` 返回真实任务数（含尚未回收的 zombie，16 位饱和）和 16 位小数的负载。每 501 个 100 Hz tick 按固定 Linux 的 1884/2014/2037（11 位小数）更新 1/5/15 分钟指数平均。READY/RUNNING 与不可中断 BLOCKED 计入活动量；空闲 worker/cleanup 的工作队列等待标为 interruptible，不凭空形成空闲负载，实际存储与压力等待仍计入。
 
 `kernel_thread_create_joinable()` 的调用者持有 join handle；被等待线程退出不向普通 completion 队列发布业务完成。`kernel_thread_join()` 等在途调用展开到 EXITED 后，从可信调用栈摘取并释放目标栈/metadata；清理任务也可安全等待，不依赖它自己稍后执行 reap。通用 reap 同样清空并唤醒 handle。页缓存 stop 先禁止新压力提交，唤醒并 join worker，再释放专用快照页。
 
@@ -244,7 +307,7 @@ pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号�
 | 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | raw_lock.h的32位acquire/release原子字、CPU guard链与rank/key序 |
 | 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | 内部raw30→调度raw40；业务数据仍由guard或原单CPU纪律负责 |
 
-内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current与need_resched由CPU记录持有。
+内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current、need_resched、idle归属/恢复状态、退出丢弃上下文、运行结算及timer期限由CPU记录持有；RR剩余片跟随任务。
 启动任务与idle显式绑定，RV采用固件hart ID并在高地址重定位后重绑，LA读取CPUID CSR。
 bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度不迁入CPU。raw guard必须按LIFO由同CPU释放，
 递归、逆序、错误owner和计数损坏fatal；block/yield/退出及可睡眠锁获取拒绝禁止抢占上下文。
@@ -253,7 +316,7 @@ bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度�
 RV scheduler cases分别验证idle和两个同级OTHER任务的延期请求，恢复后peer必须进展并归还全部owner。
 `test-sync-riscv/test-sync-loongarch`在512M/1G运行真实原子/IRQ正例，以及raw内block/yield/退出/睡眠锁的fatal。
 runner从Make接收实际构建目录，COST入口不能借用普通产物；host保护目录覆盖和缺失输入不回退。
-这些结果不证明调度策略/任务索引、共享MM或设备业务已经具备SMP安全性。
+这些原语门禁不替代调度/索引组合以及共享MM/设备业务的客户机多核验收。
 
 `kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
 资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确
@@ -282,3 +345,5 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 固定依据为本地references/linux/Documentation/locking/locktypes.rst，commit
 f4cdf7ca9a1fdcca413157df19753f388a5a224e；lwIP raw串行边界见references/lwip/doc/doxygen/main_page.h（pitfalls/multithreading），
 commit77dcd25a72509eb83f72b033d219b1d40cd8eb95。实现依赖只在[路线图](../goals.md#p6b-锁等待与中断规则)维护。
+
+受控匿名及tmpfs映射 MM 的创建/切换与最终释放见[两核模块](riscv-smp.md#私有匿名-mm-验证)。实际地址空间切换在 rank40 外执行 `kernel_mm_activate()`；热路径静态门禁允许这项登记/本地失效入口，但继续拒绝 MM 分配、引用修改、pin/fault、文件和 exec 生命周期操作进入 switch 路径。

@@ -54,19 +54,28 @@ RISC-V direct map 使用固定公式 `VA = 0xffffffc000000000 + PA`，窗口大�
 
 `riscv_sv39_activate` 使用 ASID 0，把根页物理页号与 MODE=8 写入 `satp`，在写入前后各执行一次全局 `SFENCE.VMA`，并读回 `satp` 验证硬件接受该模式。切换前保存旧 `satp`；若读回不一致，则经过同样的 fence 恢复旧值，再把页表标为 `FAILED`。
 
-激活期间，旧地址空间和候选地址空间都必须保持当前代码、栈、trap 入口以及页表对象本身可访问，页表对象还必须可写。当前启动路径先从 Bare 切到过渡页表；激活函数从低地址返回后，汇编路径把 `ra`、`sp`、`gp`、`stvec` 和控制流切换到高半区。随后 C 代码从高地址激活最终页表，第二次切换前后所需对象都由高半区内核映射覆盖，因此最终页表不再需要低 RAM。当前只支持单 hart 的启动切换；若错误页表让当前执行地址在写入 `satp` 后立即不可达，CPU 会先产生同步异常，软件无法依赖后续读回路径恢复。
+激活期间，旧地址空间和候选地址空间都必须保持当前代码、栈、trap 入口以及页表对象本身可访问，页表对象还必须可写。当前启动路径先从 Bare 切到过渡页表；激活函数从低地址返回后，汇编路径把 `ra`、`sp`、`gp`、`stvec` 和控制流切换到高半区。随后 C 代码从高地址激活最终页表，第二次切换前后所需对象都由高半区内核映射覆盖，因此最终页表不再需要低 RAM。每个 hart 独立切根，secondary 的过渡栈与高地址交接见[两核模块](riscv-smp.md)；若错误页表让当前执行地址在写入 `satp` 后立即不可达，CPU 会先产生同步异常，软件无法依赖后续读回路径恢复。
 
 ## 内核栈窗口
 
+运行期两页接口`riscv_sv39_kernel_window_map_pages/unmap_pages`全部预检后提交。
+缺表私有准备并在可能睡眠后重查；空表在本地/远端失效确认后归还，详见[RV两核模块](riscv-smp.md)。
+
 `riscv_sv39_kernel_window_reserve()` 在表处于 BUILDING 时为一个未使用的根槽建立空子树：只分配 level-1 空表并写入根项，不建立任何叶。这样任何之后创建的用户空间按值复制根项时都继承同一子树指针，而运行期只修改共享的下级表。
 
-`riscv_sv39_kernel_window_map()/unmap()` 只接受窗口内 4 KiB 对齐地址：map 惰性分配 level-0 表并写入 R/W 叶，unmap 清叶并在该表变空时释放它、清 level-1 项；两者按地址 `SFENCE.VMA`，释放整表时用全局 fence。窗口不保存分配器指针——reserve 在重定位前运行，指针必须由调用方在运行期传入，否则 medany 取址会留下物理别名。窗口只覆盖一个根槽；未映射页在窗口内按 fault 处理，不存在回退映射。
+`riscv_sv39_kernel_window_map()/unmap()` 是批量接口的单页包装，只接受窗口内 4 KiB 对齐地址。
+map 惰性准备 level-0 表并写入 R/W、NX 叶；发布非叶父项时执行全局 SFENCE/RFENCE，已有父表下的叶更新可按地址失效。
+unmap 清叶并摘除空表，再完成全局失效；两核配置等待在线远端 SBI RFENCE 确认后才释放表和页 owner。
+固件错误保留 owner 并 fatal。窗口不保存 allocator 指针；reserve 在重定位前运行，运行期由调用方传入高地址 allocator。
+窗口只覆盖一个根槽；未映射页产生 fault，不存在回退映射。
 
 ## 运行期用户地址空间
 
 `riscv_sv39_user_space_init()` 分配一张新根表，清空低半区根项，并复制已经 ACTIVE 的最终内核页表根项 256..511。用户对象只拥有低半区树；借用的高半区表和叶子始终由内核页表拥有，销毁时不会遍历或释放。
 
 `riscv_sv39_user_map_owned_page()` 只接受 `[0x1000, 2^38)` 内按 4 KiB 对齐的低地址、已分配物理页和合法 R/W/X 权限。成功建立带 U/A（可写时还带 D）的 Level 0 叶子并接管物理页；失败仍由调用者持有该页。`riscv_sv39_user_map_zeroed_page()` 则在地址空间内部完成叶表路径准备、叶子分配、清零、映射和所有权登记，调用者不会接触处于“已经分配但尚无所有者”状态的叶子。中间表分配采用局部事务：若创建第二张中间表失败，会撤销本次新建且仍为空的上级表，不破坏更早的映射。
+
+新匿名页在构造方独占期间用整数块完成全页清零，之后才发布有效PTE；不访问本页之外，也不改变中间表或解析失败的回收顺序。成本边界见[匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
 
 `riscv_sv39_user_map_cow_page()` 接管调用者的一份 order-0 物理页引用，建立去掉 W 且以 RSW bit 8 标记的 present COW 叶子。`riscv_sv39_user_resolve_cow()` 只接受这种软件标记的页：引用数为 1 时原地恢复最终权限，否则分配并复制新页、替换当前 PTE 后释放旧引用。真正只读而未带 COW 标记的叶子不会被写 fault 放宽。空间统计分别记录当前 COW 页、复制次数和原地恢复次数，供正确性及后续成本测量使用。
 
@@ -89,7 +98,7 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0`
 推断。
 
-`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前没有 ASID 分配或 SMP 远端 shootdown。
+`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前用户 MM 没有 ASID 分配或跨核 shootdown；受控两核的共享内核栈另有 RFENCE 确认。
 
 `riscv_sv39_user_unmap_owned_range()` 只处理对齐的 4 KiB 用户范围。调用方先证明目标就是本 hart 当前活动 MM；walker 预检覆盖范围中已有的页表分支、表项形态、物理页可访问性和 active/protected 计数，输入或状态错误在写 PTE 前返回。提交时先把 active 和 protected owner 暂时改为 `V=0` 的软件 PTE，再执行一次本地全局 `SFENCE.VMA`，随后立即释放物理页并清零 PTE。函数返回时不保留临时 invalid PTE、页计数或回收接口；释放不变量错误直接 fatal。
 
@@ -99,9 +108,11 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 
 `riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire；MM 的 VMA 分类回调使共享匿名 leaf 保持原权限和物理身份，其他 leaf 转成 COW。任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父进程的私有 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把私有页面内容复制推迟到父或子真正写入时。
 
-RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再登记 source-backed VMA；完整文件页在首次 fault 时共享 page cache 并以 COW 发布，文件/BSS 边界页和纯 BSS 页按需私有分配、精确填充与清零。RW/NX 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
+RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再登记 source-backed VMA；完整文件页在首次 fault 时共享 page cache 并以 COW 发布，文件/BSS 边界页和纯 BSS 页按需私有分配、精确填充与清零。默认 NX、按主 ELF GNU_STACK 选择执行许可的 RW 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
 
 ## 验证
+
+`test-icache-riscv` 检查 Make 传入的实际 BUILD_DIR 对象及入口的直接调用可达链，不要求固定私有函数或 fence 位于公开函数本体。它是指令存在门禁，不能替代真实可执行映射/缺页/COW/mprotect 的行为验收。`test-instruction-sync-host` 拒绝无关 fence、非调用引用和仅含环路的假通过。
 
 ```sh
 make test-sv39-riscv
@@ -118,4 +129,4 @@ make test-riscv
 
 聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页/COW 映射、fork 父提交失败原子性、复制与末引用原地恢复、owned-range 参数失败不变、实际撤销/释放、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。VMA/mmap 用例覆盖 protected COW 保持、fixed replace 和 unmap 的 PTE—fence—release 顺序；真实 U-mode mmap 还覆盖匿名和 ext4 文件私有映射、EOF/SIGBUS。非法释放由 allocator fatal-path 测试覆盖。
 
-当前未实现 1 GiB 叶子、共享文件映射、ASID 分配和 SMP TLB shootdown。按需提交用于匿名栈、`brk` heap、私有/共享匿名 mmap 和普通文件的 private mapping，用户映射固定为 4 KiB；运行期改权/撤销/COW 在单 hart 的不可调度区执行，截断撤销支持非当前 MM，尚无跨 hart 同步协议。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。
+当前未实现 1 GiB 叶子和 ASID 分配；受控私有/共享匿名 MM 已通过 gate、短 metadata 锁、active mask 与 SBI RFENCE 闭合跨核提交和失效。普通用户、共享文件和外部后备业务仍限 CPU0；文件截断撤销支持非当前 MM，但尚无文件业务跨 hart 协议。按需提交用于匿名栈、`brk` heap、私有/共享匿名 mmap 和普通文件映射，用户页固定为 4 KiB。prepared-map、COW snapshot/commit 和 detach 的无分配提交边界见[MM 模块](kernel-mm.md#匿名-mm-的并发与回收)。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

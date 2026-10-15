@@ -65,11 +65,13 @@ cp "$work/base.img" "$work/no-flush.img"
 timeout 30 "$work/probe" "$work/no-flush.img" no-flush
 printf '%s\n' 'PASS: journal write/tail errors, bounded journal wrap, missing barrier rejection'
 
-for action in oversize checksum2 checksum3 wide checksum2-wide checksum3-wide; do
+for action in oversize checksum2 checksum3 wide checksum2-wide checksum3-wide \
+              commit-escape checksum2-escape checksum3-escape; do
     cp "$work/base.img" "$work/feature.img"
     timeout 30 "$work/probe" "$work/feature.img" "$action"
     expected=78
     [ "$action" != oversize ] || expected=79
+    case "$action" in *-escape) expected=192;; esac
     timeout 30 "$work/probe" "$work/feature.img" recover-crash "$expected"
     e2fsck -fn "$work/feature.img" >/dev/null
 done
@@ -79,14 +81,22 @@ timeout 30 "$work/probe" "$work/metadata.img" metadata
 timeout 30 "$work/probe" "$work/metadata.img" recover-metadata 78
 e2fsck -fn "$work/metadata.img" >/dev/null
 for feature in commit checksum2 checksum3 checksum3-revoke checksum3-revoke64 \
-               wide checksum2-wide checksum3-wide; do
+               wide checksum2-wide checksum3-wide commit-escape checksum2-escape checksum3-escape; do
     cp "$work/base.img" "$work/independent.img"
     timeout 30 "$work/probe" "$work/independent.img" "$feature"
     e2fsck -fy "$work/independent.img" > "$work/fsck.log" 2>&1 || {
         status=$?
         [ "$status" -le 1 ] || { cat "$work/fsck.log"; exit "$status"; }
     }
-    timeout 30 "$work/probe" "$work/independent.img" recover 78
+    expected=78
+    case "$feature" in *-escape) expected=192;; esac
+    timeout 30 "$work/probe" "$work/independent.img" recover "$expected"
+done
+for point in 1 2 3 4; do
+    cp "$work/base.img" "$work/escape-error.img"
+    timeout 30 "$work/probe" "$work/escape-error.img" checksum3-escape "$point"
+    timeout 30 "$work/probe" "$work/escape-error.img" recover-crash 79
+    e2fsck -fn "$work/escape-error.img" >/dev/null
 done
 
 cp "$work/base.img" "$work/unsupported.img"

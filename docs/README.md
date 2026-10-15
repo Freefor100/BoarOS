@@ -19,7 +19,7 @@
 
 | 子系统 | 模块 |
 |---|---|
-| 启动 / 平台 | [启动](modules/riscv-boot.md)、[DTB](modules/dtb-memory.md)、[根启动](modules/riscv-root-boot.md) |
+| 启动 / 平台 | [启动](modules/riscv-boot.md)、[DTB](modules/dtb-memory.md)、[根启动](modules/riscv-root-boot.md)、[RV受控两核](modules/riscv-smp.md) |
 | Trap / 执行 | [Trap](modules/riscv-trap.md)、[浮点](modules/riscv-fpu.md)、[syscall](modules/kernel-syscall.md)、[内核日志](modules/kernel-log.md) |
 | 内存 | [物理页](modules/physical-pages.md)、[堆](modules/kernel-heap.md)、[Sv39](modules/riscv-sv39.md)、[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[uaccess](modules/kernel-uaccess.md) |
 | 用户映像 | [ELF](modules/user-elf.md)、[exec](modules/kernel-exec.md) |
@@ -42,7 +42,7 @@ learning 面向读者解释机制、结果和适用条件。正文使用可识�
 |---|---|
 | 架构基础 | [启动](learning/riscv-boot.md)、[Trap](learning/riscv-traps.md)、[用户态](learning/riscv-user-mode.md)、[时间](learning/riscv-time.md) |
 | 内存 / ELF | [内存管理](learning/memory-management.md)、[ELF 装载](learning/elf-loading.md) |
-| 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md)、[可信随机源](learning/random-source.md)、[会话/调度消费者](learning/session-consumers.md) |
+| 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md)、[两核交接与失效](learning/smp-handoff.md)、[可信随机源](learning/random-source.md)、[会话/调度消费者](learning/session-consumers.md) |
 | 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md)、[记录锁与恢复](learning/record-lock-sqlite-recovery.md)、[可睡眠存储](learning/sleepable-storage.md)、[多挂载验收](learning/memory-backed-mounts.md)、[proc 控制](learning/proc-controls.md)、[网络 owner](learning/network-ownership.md) |
 | 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[双架构评测证据](learning/oscomp-compat-baseline.md)、[客体内编译探针](learning/offline-toolchain-probe.md)、[单核规模](learning/single-hart-scale.md) |
 | CI 复现 | [固定原工具环境、缓存身份与干净 runner](learning/ci-native-environment.md) |

@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/cpu.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/timer.h>
 
@@ -13,11 +14,14 @@
 struct riscv_timer_state {
     uint64_t period;
     uint64_t next_deadline;
-    uint64_t scheduler_deadline;
     int armed;
 };
 
+#if BOAROS_MAX_CPUS > 1
+#define timer_state (kernel_cpu_current()->timer)
+#else
 static struct riscv_timer_state timer_state;
+#endif
 
 uint64_t riscv_time_read(void)
 {
@@ -121,16 +125,24 @@ static uint64_t earlier_deadline(uint64_t periodic, uint64_t event)
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 {
     if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
-    if (sbi_set_timer(earlier_deadline(timer_state.next_deadline, deadline)) != 0L)
-        return RISCV_TIMER_STATUS_SBI_SET_FAILED;
-    timer_state.scheduler_deadline = deadline;
-    return RISCV_TIMER_STATUS_OK;
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    enum riscv_timer_status status = RISCV_TIMER_STATUS_OK;
+    /* 周期IRQ自行推进并重装硬件；相同的已确认事件不再次进入固件。
+     * 失败不发布候选，IRQ保护比较到提交之间不被tick改写。 */
+    if (cpu->timer_deadline != deadline) {
+        if (sbi_set_timer(earlier_deadline(timer_state.next_deadline, deadline)) != 0L)
+            status = RISCV_TIMER_STATUS_SBI_SET_FAILED;
+        else cpu->timer_deadline = deadline;
+    }
+    arch_interrupt_restore(irq);
+    return status;
 }
 
 enum riscv_timer_status riscv_timer_handle_interrupt(uint64_t *elapsed_ticks)
 {
     uint64_t candidate_deadline, candidate_elapsed;
-    uint64_t event = timer_state.scheduler_deadline;
+    uint64_t event = kernel_cpu_current()->timer_deadline;
     if (!elapsed_ticks) return RISCV_TIMER_STATUS_INVALID_ARGUMENT;
     if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
     uint64_t now = riscv_time_read();
@@ -142,7 +154,7 @@ enum riscv_timer_status riscv_timer_handle_interrupt(uint64_t *elapsed_ticks)
     if (sbi_set_timer(earlier_deadline(candidate_deadline, event)) != 0L)
         return RISCV_TIMER_STATUS_SBI_SET_FAILED;
     timer_state.next_deadline = candidate_deadline;
-    timer_state.scheduler_deadline = event;
+    kernel_cpu_current()->timer_deadline = event;
     *elapsed_ticks = candidate_elapsed;
     return RISCV_TIMER_STATUS_OK;
 }

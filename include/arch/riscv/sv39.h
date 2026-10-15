@@ -2,6 +2,8 @@
 #define BOAROS_ARCH_RISCV_SV39_H
 
 #include <kernel/physical_page.h>
+#include <kernel/mm_retire.h>
+#include <kernel/mm_prepare.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -102,6 +104,11 @@ enum riscv_sv39_status riscv_sv39_kernel_window_reserve(
     uint64_t virtual_address,
     uint64_t size);
 int riscv_sv39_kernel_window_active(void);
+/* 仅CPU0修改；候选表私有准备，全部叶子及远程失效完成后才返回。 */
+enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
+    struct physical_page_allocator *, uint64_t va, uint64_t pa, unsigned pages);
+enum riscv_sv39_status riscv_sv39_kernel_window_unmap_pages(
+    struct physical_page_allocator *, uint64_t va, unsigned pages);
 enum riscv_sv39_status riscv_sv39_kernel_window_map(
     struct physical_page_allocator *allocator,
     uint64_t virtual_address,
@@ -160,6 +167,28 @@ enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
     struct riscv_sv39_user_space *space,
     uint64_t start,
     uint64_t end);
+/* MM短保护内只摘PTE/交接owner，无分配、flush、物理释放。 */
+enum riscv_sv39_status riscv_sv39_user_detach_page(
+    struct riscv_sv39_user_space *, uint64_t address,
+    struct kernel_mm_retirement *);
+enum riscv_sv39_status riscv_sv39_user_leaf_missing(
+    struct riscv_sv39_user_space *, uint64_t, unsigned *);
+enum riscv_sv39_status riscv_sv39_user_map_prepared_page(
+    struct riscv_sv39_user_space *, uint64_t, uint64_t, uint32_t,
+    struct kernel_mm_leaf_preparation *);
+enum riscv_sv39_status riscv_sv39_user_cow_snapshot(
+    struct riscv_sv39_user_space *, uint64_t, uint64_t *, uint64_t *);
+/* replacement==KERNEL_MM_NO_PAGE只请求末引用原地恢复；0是合法新页。 */
+enum riscv_sv39_status riscv_sv39_user_cow_commit(
+    struct riscv_sv39_user_space *, uint64_t, uint64_t, uint64_t, uint32_t,
+    struct kernel_mm_retirement *);
+enum riscv_sv39_status riscv_sv39_user_next_owned(
+    struct riscv_sv39_user_space *, uint64_t *, uint64_t *);
+enum riscv_sv39_status riscv_sv39_user_mark_cow_page(
+    struct riscv_sv39_user_space *, uint64_t);
+enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
+    struct riscv_sv39_user_space *, struct riscv_sv39_user_space *,
+    int (*)(void *, uint64_t), void *);
 
 /*
  * Changes access for owned leaves in [start, end).  permissions == 0 keeps

@@ -11,6 +11,7 @@
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/page_cache.h>
+#include <kernel/file_mapping.h>
 #include <kernel/memory_object.h>
 #include <kernel/tmpfs.h>
 #include <kernel/socket.h>
@@ -557,6 +558,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file)
 {
+    if (file && file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe &&
+        __atomic_load_n(&file->pipe->concurrent,__ATOMIC_ACQUIRE)) return 0;
     if (file == 0) {
         return 0;
     }
@@ -575,12 +578,14 @@ int kernel_open_file_supports_epoll(
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file)
 {
-    if (file == 0 || file->heap == 0 || file->references == 0U ||
-        file->references == UINT32_MAX || file->vfs_closed) {
-        return KERNEL_OPEN_FILE_STATUS_STATE;
+    if (file == 0 || file->heap == 0) return KERNEL_OPEN_FILE_STATUS_STATE;
+    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_RELAXED);
+    for (;;) {
+        if (!references || references == UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
+        /* 已有owner覆盖存活，不能从裸指针复活清理中的OFD。 */
+        if (__atomic_compare_exchange_n(&file->references, &references, references + 1,
+                1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    file->references++;
-    return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
 enum kernel_open_file_status kernel_open_file_release(
@@ -594,18 +599,29 @@ enum kernel_open_file_status kernel_open_file_release(
     }
     file = *owner;
     /* A detached last reference is kept at zero until cleanup drains it. */
-    if (file->heap == 0 || file->references == UINT32_MAX) {
+    if (file->heap == 0) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    if (file->references > 1U) {
-        file->references--;
+    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (references == UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
+        if (!references) break; /* 原清理owner重试，未取得新引用。 */
+        if (__atomic_compare_exchange_n(&file->references, &references, references - 1,
+                1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+    }
+    if (references > 1U) {
         *owner = 0;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    if (file->references == 1U) {
+    /* 匿名pipe没有后端、命名空间或观察者清理；最后endpoint可在受控CPU归还。
+     * 其余对象的真实清理继续由CPU0服务域执行。 */
+    if (!(file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe &&
+          !file->file.private_data && !file->pipe->fifo_node &&
+          !file->ep_items && !file->device_opened && !file->record_locks &&
+          !file->generated_ready)) kernel_assert_service_context();
+    if (references == 1U) {
         reset_read_prediction(file);
         release_record_locks(file);
-        file->references = 0U;
     }
     if (file->device_opened) {
         file->device_opened = 0;
@@ -676,13 +692,17 @@ enum kernel_open_file_status kernel_open_file_detach(
     if (!open_file_live(file)) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    /* A pipe endpoint's last live owner closes it immediately. */
-    if ((file->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
-         file->kind == KERNEL_OPEN_FILE_KIND_SOCKET) &&
-        file->references == 1U) {
-        return kernel_open_file_release(owner);
+    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (!references || references == UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
+        /* A pipe endpoint's last live owner closes it immediately. */
+        if (references == 1 && (file->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+                               file->kind == KERNEL_OPEN_FILE_KIND_SOCKET))
+            return kernel_open_file_release(owner);
+        if (__atomic_compare_exchange_n(&file->references, &references, references - 1,
+                1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
     }
-    if (file->references == 1U) {
+    if (references == 1U) {
         reset_read_prediction(file);
         release_record_locks(file);
         if (file->device_opened) {
@@ -691,8 +711,7 @@ enum kernel_open_file_status kernel_open_file_detach(
             file->device_instance = 0;
         }
     }
-    file->references--;
-    if (file->references != 0U) {
+    if (references > 1U) {
         *owner = 0;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -701,7 +720,7 @@ enum kernel_open_file_status kernel_open_file_detach(
 
 static int open_file_live(const struct kernel_open_file_description *file)
 {
-    return file != 0 && file->heap != 0 && file->references != 0U &&
+    return file != 0 && file->heap != 0 && __atomic_load_n(&file->references, __ATOMIC_ACQUIRE) != 0U &&
            !file->vfs_closed;
 }
 
@@ -752,8 +771,10 @@ uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file)) return 0U;
-    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data) {
+        KERNEL_RAW_SCOPE(guard,&file->pipe->metadata_lock);
         return file->pipe->mode;
+    }
     if (file->kind == KERNEL_OPEN_FILE_KIND_PATH)
         return kernel_vfs_path_mode(file->file.path);
     return file->file.mode;
@@ -764,7 +785,15 @@ uint32_t kernel_open_file_flags(
 {
     /* 创建/终端取得/fd标志不是OFD状态；F_GETFL结果可直接用于F_SETFL。 */
     const uint32_t open_only = 0100U | 0200U | 0400U | 01000U | 02000000U;
-    return open_file_live(file) ? file->open_flags & ~open_only : 0U;
+    return open_file_live(file) ? __atomic_load_n(&file->open_flags, __ATOMIC_RELAXED) & ~open_only : 0U;
+}
+void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
+{
+    if (!open_file_live(file)) __builtin_trap();
+    const uint32_t mask=00002000U | 00004000U;
+    uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&file->open_flags, &old,
+        (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
 int kernel_open_file_readable(
@@ -775,7 +804,7 @@ int kernel_open_file_readable(
     if (!open_file_live(file)) {
         return 0;
     }
-    access_mode = file->open_flags & 3U;
+    access_mode = kernel_open_file_flags(file) & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
@@ -801,8 +830,8 @@ int kernel_open_file_writable(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file) || file->kind == KERNEL_OPEN_FILE_KIND_PATH) return 0;
-    return (file->open_flags & 3U) == 1U ||
-           (file->open_flags & 3U) == 2U;
+    return (kernel_open_file_flags(file) & 3U) == 1U ||
+           (kernel_open_file_flags(file) & 3U) == 2U;
 }
 
 uint64_t kernel_open_file_offset(
@@ -836,6 +865,111 @@ enum kernel_open_file_status kernel_open_file_advance(
 
 int kernel_open_file_memory_backed(struct kernel_open_file_description *file)
 { return open_file_live(file) && kernel_vfs_file_memory(&file->file) != 0; }
+const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *file)
+{ return open_file_live(file) ? &file->file : 0; }
+struct kernel_page_cache *kernel_open_file_page_cache(const struct kernel_open_file_description *file)
+{ return open_file_live(file) ? kernel_vfs_file_page_cache(&file->file) : 0; }
+
+int kernel_open_file_prepare_memory_page(struct kernel_open_file_description *file,
+    uint64_t index, struct kernel_open_file_page_preparation *prepared)
+{
+    if (!prepared || prepared->pending || !kernel_open_file_memory_backed(file))
+        return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node = kernel_open_file_node(file);
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_node_lock(node, &guard, 0);
+    int error = kernel_file_mapping_prepare(node);
+    if (error) return error;
+    uint64_t epoch;
+    if (kernel_file_mapping_epoch(node, &epoch)) return -KERNEL_EBUSY;
+    uint64_t size = kernel_open_file_size(file);
+    if (index > UINT64_MAX / BOAROS_PAGE_SIZE || index * BOAROS_PAGE_SIZE >= size)
+        return -KERNEL_EFAULT;
+    uint64_t address;
+    int created;
+    enum kernel_memory_object_status status = kernel_memory_object_prepare_page(
+        kernel_vfs_file_memory(&file->file), index, &address, &created);
+    if (status != KERNEL_MEMORY_OBJECT_OK)
+        return status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM :
+               status == KERNEL_MEMORY_OBJECT_NO_SPACE ? -KERNEL_ENOSPC : -KERNEL_EIO;
+    *prepared = (struct kernel_open_file_page_preparation){
+        .address=address, .index=index, .epoch=epoch, .size=size, .pending=1, .created=created};
+    return 0;
+}
+
+void kernel_open_file_finish_memory_page(struct kernel_open_file_description *file,
+    struct kernel_open_file_page_preparation *prepared, int accepted)
+{
+    if (!prepared || !prepared->pending || !kernel_open_file_memory_backed(file))
+        __builtin_trap();
+    kernel_memory_object_finish_page(kernel_vfs_file_memory(&file->file),
+        prepared->index, prepared->address, accepted);
+    prepared->pending = 0;
+}
+
+enum kernel_open_file_status kernel_open_file_check_mapping_domain(
+    const struct kernel_open_file_description *file,const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR)
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    int error=kernel_open_file_memory_backed((struct kernel_open_file_description *)file) ?
+        kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_mapping_domain(node,heap,allocator);
+    return error ? KERNEL_OPEN_FILE_STATUS_STATE : KERNEL_OPEN_FILE_STATUS_OK;
+}
+enum kernel_open_file_status kernel_open_file_check_io_domain(
+    const struct kernel_open_file_description *file,const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    if (!open_file_live(file) || file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR || file->heap!=heap ||
+        file->ep_items || file->record_locks || file->device_opened || file->generated_ready)
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    int error=kernel_open_file_memory_backed((struct kernel_open_file_description *)file) ?
+        kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_io_domain(node,heap,allocator);
+    return error?KERNEL_OPEN_FILE_STATUS_STATE:KERNEL_OPEN_FILE_STATUS_OK;
+}
+int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index,struct kernel_open_file_page_preparation *prepared)
+{
+    if (kernel_open_file_memory_backed(file)) return kernel_open_file_prepare_memory_page(file,index,prepared);
+    if (!prepared || prepared->pending || !open_file_live(file)) return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
+    if (!node || !kernel_page_cache_is_controlled(cache)) return -KERNEL_EINVAL;
+    uint64_t epoch,size;
+    {
+        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
+        int error=kernel_file_mapping_prepare(node);
+        if (error) return error;
+        if (kernel_file_mapping_epoch(node,&epoch)) return -KERNEL_EBUSY;
+        size=kernel_open_file_size(file);
+        if (index>UINT64_MAX/BOAROS_PAGE_SIZE || index*BOAROS_PAGE_SIZE>=size) return -KERNEL_EFAULT;
+    }
+    /* 不能携带inode读资格等CPU0再取得读资格：排队writer会形成等待环。 */
+    uint64_t address; size_t valid;
+    enum kernel_page_cache_status status=kernel_page_cache_get(cache,&file->file,index,&address,&valid);
+    if (status) return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
+        status==KERNEL_PAGE_CACHE_STATUS_STATE ? -KERNEL_EBUSY : -KERNEL_EIO;
+    {
+        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
+        uint64_t latest;
+        if (kernel_file_mapping_epoch(node,&latest) || latest!=epoch || index*BOAROS_PAGE_SIZE>=kernel_open_file_size(file)) {
+            physical_page_release(cache->allocator,address); return -KERNEL_EBUSY;
+        }
+    }
+    *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.epoch=epoch,.size=size,.pending=1};
+    return 0;
+}
+void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *file,
+    struct kernel_open_file_page_preparation *prepared,int accepted)
+{
+    if (kernel_open_file_memory_backed(file)) { kernel_open_file_finish_memory_page(file,prepared,accepted); return; }
+    if (!prepared || !prepared->pending || !open_file_live(file)) __builtin_trap();
+    if (!accepted && physical_page_release(kernel_vfs_file_page_cache(&file->file)->allocator,prepared->address)) __builtin_trap();
+    prepared->pending=0;
+}
 
 static enum kernel_page_cache_status memory_page(struct kernel_open_file_description *file,
     uint64_t index, uint64_t *address, size_t *valid, int create, int *created)
@@ -928,7 +1062,7 @@ enum kernel_page_cache_status kernel_open_file_alias_attach(
     struct kernel_open_file_description *file, uint64_t page_index,
     uint64_t physical_address, struct kernel_page_cache_alias *alias,
     void *owner, uint64_t virtual_address,
-    void (*rearm)(void *owner, uint64_t virtual_address))
+    int (*rearm)(void *owner, uint64_t virtual_address))
 {
     if (!open_file_live(file) || file->file.mount == 0 ||
         file->file.mount->private_data == 0)
@@ -952,10 +1086,28 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
     return result;
 }
 
+struct sync_range_call {
+    struct kernel_open_file_description *file;
+    uint64_t start,end;
+    int result;
+};
+static void sync_range_cpu0(void *argument)
+{
+    struct sync_range_call *call=argument;
+    call->result=kernel_open_file_sync_range(call->file,call->start,call->end);
+}
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,
     uint64_t start, uint64_t end)
 {
     if (!open_file_live(file)) return -KERNEL_EBADF;
+    if (kernel_open_file_io_requires_cpu0(file)) {
+        struct sync_range_call call={file,start,end,-KERNEL_EIO};
+        if (kernel_page_cache_run_cpu0(kernel_open_file_page_cache(file),sync_range_cpu0,&call))
+            return -KERNEL_EIO;
+        return call.result;
+    }
+    KERNEL_LOCK_SCOPE(offset);
+    if (!kernel_lock_held(&file->offset_lock.lock,1)) kernel_mutex_lock(&file->offset_lock,&offset);
     return kernel_vfs_sync_range(&file->file, start, end,
                                  &file->observed_writeback_error);
 }
@@ -976,7 +1128,7 @@ uint32_t kernel_open_file_poll(
     if (!open_file_live(file)) {
         return KERNEL_POLLNVAL;
     }
-    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, file->open_flags, requested_events, out_queue) : 0U;
+    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, file->pipe_observed_writers, out_queue);

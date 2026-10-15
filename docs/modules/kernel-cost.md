@@ -10,6 +10,11 @@
 在途深度及控制抑制状态（当前标量 48 字节，加内嵌 backend guard 的 16 字节，共 64 字节），原任务元数据页容量断言继续生效。
 热路径不分配、不打印、不睡眠；原始 CSR SIE save/restore 保护聚合，不走被观测的锁。
 
+普通构建也不再为诊断单独读取设备服务时间、在途积分和发布阶段时钟；VirtIO 只保留
+完成请求、字节、队列占用等运行统计，以及真实期限所需的时钟。详细时长由同一
+`BOAROS_COST_DIAGNOSTICS` 开关启用。用户页解析复用 COST 计数，删除了每个解析
+片段都更新的独立全局原子计数；关闭诊断后不保留这项探针。
+
 仅观测版本提供 `/proc/boaros_cost_control`（完整 `begin\n`、`end\n`）及只读
 `/proc/boaros_cost`。开始在用户返回时激活，结束在用户返回时完成；控制 fd 的完整
 read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数。重复开始 EBUSY，
@@ -17,7 +22,7 @@ read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数�
 控制组退出中止窗口并标 incomplete。完整用户复制先于控制发布，坏指针 EFAULT。
 控制节点使用同 OFD offset 串行机制，但完整命令不受当前 offset 限制。
 
-consumer 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
+consumer 和 write 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
 结束时先记录 `COST RESULT` 的时间边界；`end` 返回 EBUSY 时在用户态有界等待重试，
 最多十秒，并另报 `COST CLOSING name ns retries`。关闭等待属于快照覆盖区间，
 不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。其他受控
@@ -48,10 +53,27 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator，
+目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator/scheduler，
 `all` 不跳过缺项；consumer 不将未完成命令标为完成。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
-直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
+直方图不一致、incomplete 和 overflow。scheduler固定8192次yield、8192次带内容核对的管道往返，以及1024次创建/wait/让出执行；
+三个业务窗口共wait完成1026个child；预热child在计时外。元数据资源归还另由生命周期门禁和整次启动基线核对。
+各窗口时间必须为正；ON还要求真实IRQ和raw取得/持有样本。冻结ELF通过`--coordinator-elf`复用。
+当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
+
+fixture匹配测量可显式传`--qemu-seed`（uint64且整个副本跨度不得溢出），副本i使用
+base+i，并在基线/候选/返回及ON/OFF间配对。默认不设置，official配置拒绝该选项。
+它固定QEMU的客体PRNG，包括生成DTB及reset时更新的`rng-seed`，不把不可信启动材料
+改成可信熵或伪造random ready，也不保证host crypto/外部RNG确定性。实际参数、种子
+和DTB哈希进入启动前seal；resume同时核对身份和argv，不能混入未设置种子的旧启动。
+固定依据为`references/qemu` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`的
+`qemu-options.hx`、`hw/riscv/virt.c`和`hw/riscv/boot.c`；固定timebase仍不代表固定速度。
+
+`--fixture-cache PATH`只用于上述allocator/latency/locking/scheduler单盘BoarOS fixture。
+首次在客体启动前封存完整镜像及case/ELF/长度/SHA身份，以整目录发布，随后各次启动
+复制为独立可写盘。缓存损坏或半发布明确失败，不重新生成后冒充命中。三个副本的初始
+内容相同，但实际root drive路径必须不同；fresh历史记录仍使用原校验规则。冻结模式及
+内容身份进入seal，resume不能通过漏传或新增cache选项改变前置状态。默认和official不变。
 
 C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实际 usercopy、页解析、
 staging 累计请求容量、heap 请求字节和成功物理页。短写以实际接受前缀为准；同步尾部失败
@@ -59,7 +81,8 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 不能把 heap 字节、物理页及 staging 引用容量相加当驻留峰值。
 缓存计 bucket probes、实际复制、范围写回候选访问、实际脏区间快照与逻辑后端接受量。旧两轮全页链与整页快照的历史值保持原解释，当前算法访问较小的候选集合。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
-使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
+使用提交身份，旧请求不能污染新窗口。fixture 未登记设备属于 other；设备详细计时只在
+观测构建产生，用户页解析由 `COST_USER_RESOLUTIONS` 统一记录。
 封口事务的提交路径按 ordered data、journal、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
@@ -179,9 +202,9 @@ uaccess_copy_bytes/ticks。它们只包围实际 calloc 清零、resize 搬迁�
 采样前捕获 epoch/前后台身份，睡眠或切换后仍按该来源记账；不把经过时间称为独占
 CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工作量。
 
-聚合存储为 **65,436 字节**、每任务仍为64字节，距离64KiB上限仅余100字节；编译与
+该次加入后的聚合存储为 **65,436 字节**、每任务仍为64字节，距离64KiB上限仅余100字节；编译与
 快照均检查预算，后续新增指标必须重新核对容量。追加前的
-完整203项 schema 继续可读，当前209项必须齐全，版本1不变。关闭观测时没有新状态
+完整203项 schema 继续可读，当时的209项必须齐全，版本1不变。关闭观测时没有新状态
 或指令。独立消费者 fixture 核对真实范围、失败边界、样本和时钟，而不是只测试
 公共内存函数。Lua 的一次定点窗口及候选未上线结论见
 [工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
@@ -229,3 +252,90 @@ raw_wait_ticks记录轮询/原子获取区间（无争用获取也有样本）�
 存栈上tag与时间，不固定新owner；释放raw后集中提交。元数据计时从取得锁后开始，
 排除锁获取与压力/I/O。heap→page嵌套区间可能重叠，不能把raw_hold与meta时间相加当独占CPU时间。
 完整旧226项registry缺少这两项时标为不可用；任意缺字段或部分新增schema仍拒绝。
+
+## 短窗口匹配与宿主策略租约
+
+`make test-cost-match-host` 验证配对统计、全轮测量锁、CPU策略恢复和完整日志门禁，
+也是 `test-cost-host` 的依赖。`tests/cost-match-riscv.py` 使用固定的
+`build/data-path-baselines/sync-b3/` 输入；开始前校验原B3基线、当前OFF核的源码差异与
+加载段、工具、原ELF及只读预启动盘。没有缓存时明确失败，不重新准备盘后冒充相同输入。
+
+协议 `b3-short-v1` 每个case固定12个三启动配对块，三个既有seed各使用四次。
+校准为同一当前核的三次启动，比较为原基线/当前核/同一原基线。完整块重采样10000次，
+每次重新计算三相中位数及首尾基线均值；不得独立重采样列或平均块百分比。
+校准95%双侧区间须在±1%内，首尾漂移须在±2%内；比较单侧95%上界不超过3%才通过，
+下界超过3%为稳定超标，其余未决。区间是有限样本筛查，不能排除系统性偏差或证明普遍等价。
+所有原窗口都保留，各自校准未决时不记置信通过。新增95%门槛只用于两个目标；
+非目标继续保护原点估计3%及漂移2%门槛，不扩大验收范围。部分case结果不能声明B3整体完成。
+
+driver与普通用户恢复监护进程持有同一全局 `measurement.lock`，控制进程死亡或超时后，
+监护仍保留真实锁描述符直到负责恢复的helper退出；单次runner通过已验证的
+继承描述符复用锁。单次记录仍是 `replicas=1, acceptance=false`；完整验收属于外层manifest，
+不改变原三副本接口。完整schedule在第一次启动前封存，校准失败的case不进入比较，
+不追加样本、筛掉慢副本或重用缺少真实终态的旧日志。
+
+CPU策略helper只操作CPU2/3的governor、频率上下限及governor改变的EPP，请求performance/
+2500000kHz；包含其他CPU的共享policy先拒绝。测量与文件写入仍由普通用户执行，helper
+不接受工作命令。正常结束、配置失败、SIGINT/SIGTERM和控制管道EOF都进入恢复，逐项
+核对原值；cpufreq上下限提交后异步生效，每项只写一次，最多等1秒确认读回再写下一项，
+不把请求被接纳当作恢复完成。恢复失败仍发送原值、实际值及具体错误；恢复未验证即失败。
+策略读回、频率观察、同胞活动与节流计数各自记录，
+缺失标不可用；固定请求频率不证明实际频率恒定。
+
+runner封存完整input/result/boot.log及实际退出状态；离线校验重新解析所有工作量、
+locking的168条native wait status和唯一完整PID1终态，核对复制的kernel/firmware/ELF/DTB。
+root成功行只在冻结源码的 `root_boot_finish` 完成worker/挂载/设备销毁、heap及page基线检查后
+输出；这是既有root门禁执行证据，不是独立打印了所有等待和设备owner的零计数。
+输出目录必须新建或为空；当前协议不resume或拼接旧启动。
+
+```sh
+make test-cost-match-host
+# 只验证真实策略取得/恢复，不启动客户机；末条 restored 的 errors 须为空。
+printf '{"command":"restore"}\n' | sudo /usr/bin/python3 -I tests/cost_policy.py --lease
+# 在允许sudo取得root的普通宿主终端预先认证，仅helper取得权限。
+sudo -v
+make test-cost-match-riscv COST_MATCH_OUTPUT=build/cost-match-new
+python3 -B tests/cost-match-riscv.py --verify build/cost-match-new
+```
+
+权限不足在任何正式启动前记录 `environment_blocked`，不回退到powersave测量。
+本机普通终端的当前清页核及隔离FS-Off候选各完成72次同核校准，两个目标均未通过精度门槛，
+各自比较阶段全部跳过，候选没有成本验收通过资格；
+更早执行器的权限阻塞单列保留。当前成本状态及历史结果见
+[共享调度域匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
+
+### 只读执行器归因
+
+`tests/cost-diagnostic-riscv.py` 提供单独的 instrumented profile，复用单次启动、固定盘和完整
+工作量/退出检查。准备时封存原 ELF、候选核加载段、执行器、插件、符号 PC 和运行源码；
+wrapper 另记录实际含插件的 QEMU argv，与单次 runner 记录的 wrapper 身份分开核对。
+尝试槽位和 exec 收据均独占创建；失败、超时或中断不补跑，不 resume。此 profile 的
+`acceptance` 和 `performance_verified` 始终为 false，不进入正式匹配成绩。
+
+观测边界为原 ELF 的 `clock_gettime` 入口，和客体取时点有偏差；同时记录 wall、vCPU线程
+CPU时间及自愿/非自愿切换次数。wall−CPU包含WFI、I/O及宿主调度，切换次数不能换算成
+离核时长。两个时钟并非同时取样：每次CPU/切换计数取样都有MONOTONIC前后包络，
+报告wall−CPU的有符号差及包络误差区间，不把包络内的负差值判成无效。
+TB长度×执行次数只是工作量代理：异常可能提前离开TB。FS取首次执行的样本，
+仅为翻译键的一部分；hardware-address值仅在同次启动内作不透明身份比较。全局code-cache
+flush与客体TLB失效分开。所选函数入口事件不代表完成，符号体内TB代理不包含其callee；
+共享helper的业务owner没有独立证据时保持未知。热回调不输出或分配，固定容量溢出使诊断无效。
+
+```sh
+make test-cost-diagnostic-host
+# 本地观察器额外依赖 QEMU plugin API 头文件和 GLib 开发文件。
+make test-cost-diagnostic-plugin-host
+python3 -B tests/cost-diagnostic-riscv.py --prepare build/residual-diagnostic-new
+sudo -v
+python3 -B tests/cost-diagnostic-riscv.py --run build/residual-diagnostic-new
+python3 -B tests/cost-diagnostic-riscv.py --verify build/residual-diagnostic-new
+```
+
+固定资料：`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`kernel/sys.c`定义RUSAGE_THREAD；`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`
+的`target/riscv/cpu.h`与`tcg/tcg-cpu.c`定义FS翻译键。实际插件编译头、QEMU二进制及工具SHA
+由manifest另行封存，参考源码版本不替代执行器身份。
+固定FS-Off核的12次诊断已通过108个原窗口及完整自然退出核对，策略恢复无错误。
+已确认后台journal阶段与等待变化，剩余定量边界见[当前成本结论](../learning/cost-baseline.md#共享调度域的匹配时间)；
+该结果没有性能通过资格，不替代正式校准。
+短窗口归因已停止，保留方法与证据供实际需求复用，不再作为RV两核规划的前置门槛。

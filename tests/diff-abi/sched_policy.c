@@ -30,10 +30,13 @@ void abi_sched_policy_cases(void)
     abi_record("sched.param-null",SC2(121,0,0),-1,-1,0,0,0);
     abi_record("sched.param-fault",SC2(121,0,1),-1,-1,0,0,0);
     abi_record("sched.pid-negative",SC1(120,-1),-1,-1,0,0,0);
+    unsigned long original_mask=0;
+    abi_require(SC3(123,0,sizeof(original_mask),&original_mask)==sizeof(original_mask));
     unsigned long mask=1;
     abi_record("sched.affinity-cpu0",SC3(122,0,8,&mask),-1,-1,0,0,0);
     abi_record("sched.affinity-short",SC3(123,0,1,&mask),-1,-1,0,0,0);
-    mask=2;abi_record("sched.affinity-offline",SC3(122,0,8,&mask),-1,-1,0,0,0);
+    mask=1;while (mask & original_mask) mask <<= 1;
+    abi_record("sched.affinity-offline",SC3(122,0,8,&mask),-1,-1,0,0,0);
     mask=0;result=SC3(123,0,8,&mask);
     abi_record("sched.affinity-get",result,-1,-1,0,&mask,sizeof(mask));
     struct sched_time interval;
@@ -86,4 +89,5 @@ void abi_sched_policy_cases(void)
     abi_record("sched.rr-equal-priority-rotation",rr_rotated,-1,-1,0,0,0);
     policy(0,0,0);
     abi_require(SC2(215,address,ABI_PAGE_SIZE)==0);
+    abi_require(SC3(122,0,sizeof(original_mask),&original_mask)==0);
 }

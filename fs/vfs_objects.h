@@ -20,6 +20,7 @@ struct kernel_vfs_instance {
     struct kernel_mutex namespace_lock;
     struct kernel_heap *heap;
     struct kernel_page_cache *page_cache;
+    size_t writeback_block_size; /* Zero means no block alignment requirement. */
     struct kernel_vfs_node *nodes;
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
@@ -36,7 +37,7 @@ struct kernel_vfs_node {
     struct kernel_page_cache_entry *cache_pages;
     struct kernel_page_cache_dirty dirty_cache_pages;
     struct kernel_memory_object *memory;
-    struct kernel_file_mapping *mappings;
+    struct kernel_file_mapping_state *mapping_state;
     struct kernel_record_lock_state record_locks;
     struct kernel_vfs_instance *instance;
     struct kernel_vfs_mount *mount;
@@ -166,10 +167,9 @@ struct kernel_vfs_backend {
         size_t *bytes_read);
     int (*pread_batch)(struct kernel_vfs_node *node,
         struct kernel_vfs_read_span *spans, size_t count);
-    int (*memory_write)(struct kernel_vfs_node *node, uint64_t offset,
-        const void *buffer, size_t size, size_t *written);
-    int (*writeback)(struct kernel_vfs_node *node, uint64_t offset,
-        const void *buffer, size_t size, size_t *written);
+    void (*memory_written)(struct kernel_vfs_node *node, uint64_t end);
+    int (*writeback)(struct kernel_vfs_node *node,
+        struct kernel_vfs_writeback_span *spans, size_t count);
 };
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,

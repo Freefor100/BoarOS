@@ -141,7 +141,19 @@ def validate_replicas(records):
         if len(rows)!=3 or {r['replica'] for r in rows}!={0,1,2}: raise ValueError('three distinct boot replicas required')
         for field in ('kernel_sha256','elf_sha256','source_sha256'):
             if len({r[field] for r in rows})!=1: raise ValueError('changed immutable input: '+field)
-        if len({r['fixture_sha256'] for r in rows})!=3: raise ValueError('independent fixtures required')
+        modes={r.get('fixture_mode','fresh') for r in rows}
+        if modes=={'frozen'}:
+            from cost_fixture import validate_resume_fixture, writable_root_path
+            if key[0] not in ('allocator','latency','locking','scheduler') or key[4] or key[5]!='boaros':
+                raise ValueError('unsupported frozen fixture configuration')
+            sha=rows[0]['fixture_sha256']
+            for row in rows:validate_resume_fixture(row,sha)
+            if len({writable_root_path(row) for row in rows})!=3:
+                raise ValueError('independent writable fixtures required')
+        elif modes!={'fresh'}:
+            raise ValueError('mixed or invalid fixture mode')
+        elif len({r['fixture_sha256'] for r in rows})!=3:
+            raise ValueError('independent fixtures required')
         if any(r['replicas']!=3 or not r['acceptance'] for r in rows): raise ValueError('pilot is not acceptance')
         if len({tuple(sorted(r['timings_ns'])) for r in rows})!=1: raise ValueError('missing workload phase')
         for row in rows:
@@ -163,7 +175,7 @@ def validate_replicas(records):
                 if row['case']=='deadline':validate_deadline(snapshot['name'],parsed)
                 if parsed['epoch']<=previous_epoch:raise ValueError('reused/stale boot epoch')
                 previous_epoch=parsed['epoch']
-            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure','allocator'):
+            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure','allocator','scheduler'):
                 expected_epochs=[1,2,3,5] if row['case']=='contract' else list(range(1,len(row['snapshots'])+1))
                 if [s['values']['epoch'] for s in row['snapshots']]!=expected_epochs:raise ValueError('boot epoch sequence')
             if row['cost_diagnostics'] and row['timings_ns'] and seen!=set(row['timings_ns']): raise ValueError('window coverage')
@@ -190,3 +202,21 @@ def validate_resume_selection(case, record, selected):
     expected = ['consumer-musl-1', 'consumer-glibc-1'] if case == 'metadata' else selected
     if record.get('consumer_command_names') != expected:
         raise ValueError('resume command selection differs')
+
+def validate_scheduler(timings, snapshots, output, diagnostics):
+    expected = {'scheduler-yield': (8192, 8192),
+                'scheduler-wake': (8192, 8192 * ord('p')),
+                'scheduler-create': (1024, 1024)}
+    if set(timings) != set(expected) or (diagnostics and {s['name'] for s in snapshots} != set(expected)):
+        raise ValueError('scheduler window coverage')
+    if any(value <= 0 for value in timings.values()):
+        raise ValueError('scheduler nonpositive work time')
+    work = re.findall(r'^COST SCHED WORK (\S+) (\d+) (\d+)$', output, re.M)
+    if len(work) != len(expected) or {n: (int(c), int(v)) for n, c, v in work} != expected:
+        raise ValueError('scheduler fixed work or peer progress')
+    if diagnostics:
+        for snapshot in snapshots:
+            for metric in ('irq_off_ticks', 'raw_wait_ticks', 'raw_hold_ticks'):
+                if snapshot['values'][f'foreground.{metric}.samples'] <= 0:
+                    raise ValueError(f'scheduler {metric} not measured')
+    return {'operations': expected, 'waited_children': 1026}

@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-user-smp', 'riscv-user-smp-composition', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -19,7 +19,7 @@ def current_linux_keys():
     import harness
     return {harness.identity(ROOT / config)[0] for config in
             ('tests/diff-abi/linux.config', 'tests/program-inventory/linux.config',
-             'tests/network-linux.config', 'tests/tty/pty-linux.config')}
+             'tests/network-linux.config', 'tests/tty/pty-linux.config', 'tests/smp/linux-user.config')}
 
 
 def candidates():
@@ -43,7 +43,35 @@ def candidates():
             if kernels.is_dir():
                 result.extend(path for path in kernels.glob('*/build.log'))
 
+    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test'):
+        directory = BUILD / family
+        if directory.is_dir():
+            result.extend(p for p in directory.iterdir() if p.is_dir() and p.name.startswith('runs'))
+            if family in ('riscv-files-smp-test','riscv-file-io-smp-test'):
+                # 自定义CI构建保留编译缓存，嵌套运行镜像仍按同一规则清理。
+                result.extend(p for p in directory.glob('*/runs') if p.is_dir())
+
+    # 保留可复用宿主consumer，镜像/日志/临时诊断源码及内核均是运行现场。
+    for family in ('cache', 'mm-disk','file-io'):
+        directory = BUILD / 'host' / family
+        if directory.is_dir():
+            result.extend(p for p in directory.iterdir()
+                          if p.name not in {'concurrency-12', 'concurrency-14','process-12.o','process-14.o'})
+
+    user_smp = BUILD / 'riscv-user-smp'
+    if user_smp.is_dir():
+        result.extend(path for path in user_smp.iterdir()
+                      if path.name not in {'riscv','kernel-rv','user-smp-rv','user-smp-dynamic-rv'})
+
+    composition = BUILD / 'riscv-user-smp-composition'
+    if composition.is_dir():
+        result.extend(path for path in composition.iterdir()
+                      if path.is_dir() and path.name.startswith('runs'))
+
     riscv = BUILD / 'riscv'
+    smp_runs = BUILD / 'riscv-smp' / 'runs'
+    if smp_runs.is_dir():
+        result.append(smp_runs)
     if riscv.is_dir():
         result.extend(path for path in riscv.iterdir()
                       if path.name in {'artifacts', 'musl-src', 'truncate-probe'}
@@ -75,7 +103,7 @@ def candidates():
         result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check','dynamic','dynamic-dp','exec-error-inputs'}
                       or path.name.startswith(('root-run.','root-io-run.','userland-run.','exec-fail-run.','stack-guard-run.','rng-run.','network-run.','net-failure-run.','uart-failure-run.','tty-run.','pty-run.','environment-run.','rtc-model.','rtc-alarm.','sqlite-wal-run.','sqlite-run.')))
         result.extend(path for path in la.iterdir() if path.is_dir() and
-                      (path.name=='program-inventory' or path.name.startswith(('inventory-','diff-abi-','review-boundary-'))))
+                      (path.name=='program-inventory' or path.name.startswith(('program-inventory-','inventory-','diff-abi-','review-boundary-'))))
         la_libc=la/'program-libc'
         if la_libc.is_dir():
             result.extend(path for path in la_libc.iterdir() if path.name=='upstream.tar' or path.suffix=='.log')

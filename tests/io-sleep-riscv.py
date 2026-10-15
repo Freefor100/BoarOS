@@ -101,6 +101,8 @@ try:
     released = False
     read_held = []
     read_pending = read_released = False
+    read_target = 8
+    read_owner_held = False
     read_verified = 0
     phase = "cold"
     queued = []
@@ -142,16 +144,16 @@ try:
                     phase = 'read-batch'
                     read_held = []
                     read_pending = read_released = False
+                    read_target = 1 if line == b'I/O handshake: file-read-batch' else 8
+                    read_owner_held = False
                     batch_deadline = time.monotonic() + 15
                     server.stdin.write(b'hold\n')
                 elif label == 'guest' and line == b'I/O handshake: read-batch-pending':
                     assert phase == 'read-batch'
                     read_pending = True
                 elif label == 'guest' and line == b'I/O handshake: read-batch-held':
-                    assert read_released and len(read_held) == 8
-                    server.stdin.write(f'release {read_held[0]}\ndrain\n'.encode())
-                    read_verified += 1
-                    batch_deadline = None
+                    assert phase == 'read-batch'
+                    read_owner_held = True
                 elif label == 'guest' and line == b'I/O handshake: timeout':
                     phase = 'timeout'
                     batch_deadline = None
@@ -199,8 +201,11 @@ try:
                     elif phase == 'read-batch':
                         command = int(line.split()[1].split(b'=')[1])
                         assert command == 0
+                        if read_target == 1:
+                            fields = dict(item.split(b'=') for item in bytes(line).split())
+                            assert int(fields[b'size'], 0) == 8 * 4096
                         read_held.append(identity)
-                        assert len(read_held) <= 8
+                        assert len(read_held) <= read_target
                     elif phase.startswith('batch'):
                         command = int(line.split()[1].split(b'=')[1])
                         expected_writes = 10 if phase == 'batch-partial' else 8
@@ -245,11 +250,16 @@ try:
                 if len(held) >= 2 and progress and not released:
                     server.stdin.write(f'release {held[1]}\ndrain\n'.encode())
                     released = True
-                if phase == 'read-batch' and len(read_held) == 8 and read_pending and not read_released:
-                    # 七个反序完成后仍暂扣一个，guest确认其请求owner尚未归还。
+                if phase == 'read-batch' and len(read_held) == read_target and read_pending and not read_released:
+                    # 稀疏请求反序完成前缀；连续文件页由一条SG链持有到最后回复。
                     for held_id in reversed(read_held[1:]):
                         server.stdin.write(f'release {held_id}\n'.encode())
                     read_released = True
+                if phase == 'read-batch' and read_released and read_owner_held:
+                    server.stdin.write(f'release {read_held[0]}\ndrain\n'.encode())
+                    read_owner_held = False
+                    read_verified += 1
+                    batch_deadline = None
                 if phase in ('batch', 'batch-partial') and batch_pending:
                     if phase == 'batch-partial' and args.write_through:
                         # Without NBD FUA, WRITE replies still require backend
@@ -279,6 +289,7 @@ try:
                b'I/O pipe copy sleep passed: two writers, complete content and cleanup' in logs['guest'] and
                b'I/O TCP copy sleep passed: reservation, close/reuse, shutdown and fault rollback' in logs['guest'] and
                b'I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner' in logs['guest'] and
+               b'I/O file SG read passed: eight pages, held DMA and cancellation owner' in logs['guest'] and
                b'I/O sleep failed:' not in logs['guest'])
     if success and args.cost_output:
         snapshots=[]; current=None; body=[]

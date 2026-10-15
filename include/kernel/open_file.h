@@ -13,11 +13,20 @@ struct kernel_vfs_node;
 struct kernel_vfs_stat;
 struct kernel_socket;
 
+/* acquire needs an existing owner; atomic references cannot revive raw pointers.
+ * A controlled CPU1 memory-file fault only drops nonlast refs: CPU0 retains a
+ * controller ref until MM registrations and all preparation borrows drain.
+ * The sole last releaser performs backend cleanup. A zero-ref detached cleanup
+ * owner is retained on real cleanup errors and may retry; it is not a live ref. */
+
 /* Borrowed identity, valid while the regular-file OFD is owned. */
 struct kernel_vfs_node *kernel_open_file_node(
     const struct kernel_open_file_description *description);
 struct kernel_vfs_path *kernel_open_file_path(
     const struct kernel_open_file_description *description);
+/* 同一OFD owner下借用真实文件/cache，不增加引用或允许后端跨核。 */
+const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *);
+struct kernel_page_cache *kernel_open_file_page_cache(const struct kernel_open_file_description *);
 
 enum kernel_open_file_status {
     KERNEL_OPEN_FILE_STATUS_OK = 0,
@@ -127,6 +136,28 @@ int kernel_open_file_pipe_finish(struct kernel_heap *heap,
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file);
 
+/* caller's actual OFD owner covers the claim through exactly one finish.
+ * prepare returns outside inode protection; pin is not a content snapshot.
+ * EBUSY means epoch closed, EFAULT means EOF, ENOSPC/ENOMEM retain no claim.
+ * accepted retains the page ref for caller/PTE; rejected consumes it. A copied
+ * source is accepted too, then caller returns its extra physical reference. */
+struct kernel_open_file_page_preparation {
+    uint64_t address, index, epoch, size;
+    uint32_t pending, created;
+};
+int kernel_open_file_prepare_memory_page(struct kernel_open_file_description *,
+    uint64_t index, struct kernel_open_file_page_preparation *);
+void kernel_open_file_finish_memory_page(struct kernel_open_file_description *,
+    struct kernel_open_file_page_preparation *, int accepted);
+/* 同一准备/接纳契约；disk合法读页已被cache接纳，失败只归还额外页引用。 */
+int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,
+    uint64_t index, struct kernel_open_file_page_preparation *);
+void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *,
+    struct kernel_open_file_page_preparation *, int accepted);
+enum kernel_open_file_status kernel_open_file_check_mapping_domain(
+    const struct kernel_open_file_description *,const struct kernel_heap *,
+    const struct physical_page_allocator *);
+
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file);
 
@@ -140,6 +171,8 @@ uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file);
 uint32_t kernel_open_file_flags(
     const struct kernel_open_file_description *file);
+/* 已有OFD owner覆盖寿命；status共享于dup/fork别名，访问方向不改变。 */
+void kernel_open_file_set_status_flags(struct kernel_open_file_description *, uint32_t);
 /* Access mode is OFD state and therefore survives descriptor duplication. */
 int kernel_open_file_readable(
     const struct kernel_open_file_description *file);
@@ -195,7 +228,7 @@ enum kernel_page_cache_status kernel_open_file_alias_attach(
     struct kernel_open_file_description *file, uint64_t page_index,
     uint64_t physical_address, struct kernel_page_cache_alias *alias,
     void *owner, uint64_t virtual_address,
-    void (*rearm)(void *owner, uint64_t virtual_address));
+    int (*rearm)(void *owner, uint64_t virtual_address));
 
 int kernel_open_file_pread(struct kernel_open_file_description *file,
                            uint64_t offset,

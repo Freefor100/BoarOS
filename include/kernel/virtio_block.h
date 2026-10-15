@@ -2,6 +2,8 @@
 #define BOAROS_KERNEL_VIRTIO_BLOCK_H
 
 #include <kernel/block.h>
+#include <kernel/page.h>
+#include <kernel/cost.h>
 #include <kernel/virtio_split_queue.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
@@ -32,10 +34,15 @@ struct virtio_block_statistics {
     uint64_t timeouts;
     uint64_t io_errors;
     uint64_t flush_requests;
-    uint64_t interrupts, sleeps, wakes, queue_waits, runtime_polls, max_inflight;
-    /* 时间加权在途深度（Σ深度·tick）、忙时、总span、等待与设备服务时间。 */
+    uint64_t interrupts, sleeps, wakes, queue_waits, max_inflight;
+    /* BOAROS_COST_DIAGNOSTICS下累计时间；普通构建保持零。 */
     uint64_t inflight_ticks, busy_ticks, total_ticks, queue_wait_ticks, service_ticks;
 };
+
+#define VIRTIO_BLOCK_REQUEST_SLOTS 8U
+#define VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES 2048U
+#define VIRTIO_BLOCK_BATCH_POOL_PAGES \
+    ((VIRTIO_BLOCK_REQUEST_SLOTS * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES + BOAROS_PAGE_SIZE - 1U) / BOAROS_PAGE_SIZE)
 
 struct virtio_block_device {
     struct kernel_block_device block;
@@ -46,13 +53,19 @@ struct virtio_block_device {
     uint64_t queue_physical_address;
     uint64_t timeout_ticks;
     uint16_t queue_size;
+    uint64_t batch_physical[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+    void *batch_memory[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+    unsigned batch_claimed;
     struct virtio_split_queue queue;
     uint32_t transport_version;
     uint32_t queue_allocation_order;
     uint32_t state;
     uint32_t read_only;
-    uint32_t irq_source, active, inflight, barrier_waiters, barrier;
+    uint32_t max_segment_size, max_segments;
+    uint32_t irq_source, active, barrier_waiters, barrier;
+#if BOAROS_COST_DIAGNOSTICS
     uint64_t statistics_start, statistics_last;
+#endif
     struct kernel_wait_queue available;
     struct virtio_block_statistics statistics;
 };

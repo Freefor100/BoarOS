@@ -13,11 +13,20 @@ long abi_call(long nr, long a, long b, long c, long d, long e, long f)
     return test_syscall6(nr,a,b,c,d,e,f);
 }
 void abi_exit(long code) { SC1(93, code); for (;;) {} }
-void abi_require(int condition)
+void abi_require_at(int condition, const char *file, unsigned source_line)
 {
     if (!condition) {
-        static const char error[] = "ABI ERROR setup\n";
-        SC3(64, 1, error, sizeof(error) - 1);
+        char error[160];
+        usize n = 0;
+        const char *prefix = "ABI ERROR setup ";
+        while (*prefix) error[n++] = *prefix++;
+        while (*file && n < 120) error[n++] = *file++;
+        error[n++] = ':';
+        char digits[12]; unsigned used_digits = 0;
+        do { digits[used_digits++] = '0' + source_line % 10; source_line /= 10; } while (source_line);
+        while (used_digits) error[n++] = digits[--used_digits];
+        error[n++] = '\n';
+        SC3(64, 1, error, n);
         abi_exit(99);
     }
 }
@@ -195,11 +204,26 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_SCHED_HANDOFF_ONLY
+#ifdef ABI_SIGRETURN_ONLY
+    abi_sigreturn_cases();
+#elif defined(ABI_FAULT_COUNT_ONLY)
+    abi_fault_count_cases();
+#elif defined(ABI_STACK_ONLY)
+    abi_stack_boundary_cases();
+#elif defined(ABI_EXEC_BOUNDARY_ONLY)
+    abi_exec_boundary_cases();
+#elif defined(ABI_BOUNDARY_ONLY)
+    abi_boundary_cases();
+#elif defined(ABI_SCHED_HANDOFF_ONLY)
     abi_sched_handoff_cases();
 #elif defined(ABI_SYNC_ONLY)
     abi_sync_cases();
 #else
+#ifndef ABI_PATH_ONLY
+    abi_sigreturn_cases();
+    abi_exec_boundary_cases();
+    abi_fault_count_cases();
+#endif
     abi_path_only_cases();
     abi_path_truncate_cases();
 #ifndef ABI_PATH_ONLY
@@ -240,6 +264,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_sched_stat_cases();
     abi_shm_cases();
     abi_environment_cases();
+    abi_boundary_cases();
 #endif
 #endif
     text("ABI END "); number(records); flush();

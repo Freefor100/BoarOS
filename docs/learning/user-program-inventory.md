@@ -4,13 +4,16 @@
 
 `build/` 是未纳入 Git 的可重建产物目录，不是永久证据库。本页所列旧 `build/` 路径是当时的运行位置，2026-09-25 已清理，不能直接打开；可复用的结论、固定输入、身份和复现命令记录在 Git 中。运行器在执行期间会保存 JSON、日志和镜像，核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录，只留下可跨轮复用的编译缓存。
 
-## 双架构最近完整结果（2026-10-07）
+## 双架构最近完整结果（2026-10-13）
 
 当前固定输入清单为 **229个相同ID**：BusyBox10项（原9项加已有环境内容案例），
-libc-test107静态、110动态及两项原包装器。RV完整229项全部通过；LA在512MiB、
-1GiB各完整229项全部通过，包括原BusyBox包装器55子项及静态/动态libc包装器。
-每ID均有同一ELF的Linux/BoarOS真实wait/输出判定与正常root资源退出，未修改原程序。
+libc-test107静态、110动态及两项原包装器。BoarOS在RV/LA的512MiB、1GiB下各229项通过，包括原BusyBox包装器55子项及静态/动态libc包装器。联合对照存在Linux原BusyBox遍历动态`/proc`的参考端竞态：本次RV两种RAM及LA512MiB均229 pass，LA1GiB为228 pass、1 reference-not-pass；此前一次LA512MiB同类参考失败也保留。
+该参考失败是原BusyBox包装器的`du: ./proc/85: No such file or directory`，Linux shell仍退出0，但原内部断言失败；BoarOS同次55子项全部成功。独立同ELF单项复核两边均通过，原完整运行不改成229 pass，也不拼接复核结果。固定BusyBox的`libbb/recursive_action.c`遇stat失败返回失败，Linux动态proc目录不保证遍历期间存活；实际PID85身份未由此次输出固定。
+每ID均保留Linux/BoarOS真实wait、输出与正常root资源退出判定，未修改原程序。
 过去228/227的记录仍属历史，不由本次通过推断当时失败的具体修复归因。
+本次原程序核RV SHA`f63d308c247ec22df6c8ff79896860203d363647cae1b7f80534726302798acc`、
+LA SHA`a18648c3c595f5152010bea35a9fc8d43afe433065099f4e87b8023bd387b1c0`；
+独立成本核、glibc消费者及托管CI结果不能混作这份清单身份。
 
 LA Linux/QEMU及16KiB/LP64D输入见[平台模块](../modules/loongarch-boot.md)，musl
 仍固定1.2.5；glibc五形态是另一组矩阵，LA原2.42与RV原2.44的版本差异保留。
@@ -22,6 +25,12 @@ LA最初未启用完整LS7A参考模型时，stat的时间关系和两项包装�
 复现使用 `--arch loongarch --reuse-builds --require-pass`；编译缓存按架构独立，
 同一个输出目录只接受相同身份。全部原程序通过的范围是这个共同清单，不是正式
 比赛分数、所有RV程序或完整客体开发环境。
+
+```sh
+python3 -B tests/program-inventory/run.py --arch riscv --reuse-builds --memory 512M --memory 1G --require-pass --output build/program-check-rv
+python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --memory 512M --memory 1G --require-pass --output build/program-check-la
+python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --memory 512M --case busybox.official --require-pass --output build/program-check-la-busybox
+```
 
 ## 固定输入与复现
 
@@ -47,17 +56,16 @@ make test-program-inventory-host test-diff-abi-host
 python3 tests/program-inventory/run.py --reuse-builds --require-pass --output build/program-check
 ```
 
-双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
+双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。 原 BusyBox 清单末尾的 find 遍历根目录，也会进入 Linux 动态 `/proc`；一次参考启动的 ps 显示 PID85 为 ext4lazyinit，随后 find 报 `./proc/85: No such file or directory` 并使原断言失败。2026-10-13普通文件组合的LA1GiB全量复核再次观察到该命令失败：ps列出PID86为ext4lazyinit，find随后报`./proc/86: No such file or directory`；BoarOS同项55条原断言、退出及回收通过。两次记录分别保留。该记录属于参考端进程退出与目录遍历的竞态，不能靠后一次通过覆盖；BoarOS同脚本成功也不把该次联合结果改成通过。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
 
 ## 当前基线与口径
 
-最近的完整228项历史清单来自进程/随机/调度阶段，227 pass和原BusyBox53/55的身份
-仍在下方历史记录。本轮没有重跑228项；只运行原BusyBox包装器和环境内容工作流。
-原脚本两侧55/55子项成功、wait=0，dmesg保存真实启动消息，hwclock输出真实UTC。
-新增内容脚本检查-r/-c/-n的作用、清空后无消息，以及df根盘总量/使用量/可用量与
-同一客体statfs一致，Linux/BoarOS均退出0。BoarOS根来源为`/dev/block/252:0`，
-节点由公共镜像生成器建立。环境探针另验证console不会回灌日志、RTC与realtime
-一致、OFD独占/dup/fork/CLOEXEC和坏指针；新增27条使固定LinuxABI扩为1118。
+当前完整结果见本页开头；旧228/227及原BusyBox53/55保留为历史身份。
+原包装器的55条内部断言、wait status和真实环境行为都必须成立。内容脚本检查
+-r/-c/-n、清空后无消息，以及df容量与同一客体statfs一致；dmesg读取真实启动消息，
+hwclock输出真实UTC。BoarOS根来源`/dev/block/252:0`由公共镜像生成器建立。
+环境探针另保护console不回灌、RTC/realtime、OFD独占/dup/fork/CLOEXEC和坏指针；
+最初27条加入后的1118是历史ABI规模，当前1372条由独立ABI门禁验证。
 
 原包装器含日期、日志、PID与容量等动态内容，整份stdout跨系统不要求字节相同。
 清单显式选择contract比较：所有55条原断言、顺序、命令与wait status仍必须成立，
@@ -67,8 +75,8 @@ UART半行插在SUITE/ABI标记之前，重新核对同一原日志完整记录�
 
 重建：`make test-environment-riscv test-log-host test-rtc-host`；
 `python3 -B tests/program-inventory/run.py --suite busybox --case busybox.official --case busybox.environment --reuse-builds --require-pass --output build/environment-check`。
-输入依旧为本页固定BusyBox源码/原包装器和Linux commit；实际QEMU11.1.1、512MiB、
-单hart。环境补全的结果与分类记录在本页；逐条输出、输入身份及ABI重核记录
+输入依旧为本页固定BusyBox源码/原包装器和Linux commit；当前RV QEMU11.1.2、单CPU，LA执行器见平台模块；两种RAM显式传入。
+环境补全的结果与分类记录在本页；逐条输出、输入身份及ABI重核记录
 由上述执行器在运行目录生成，大型运行记录不纳入Git。
 
 | 分类 | 证据与判断边界 |
@@ -81,7 +89,7 @@ UART半行插在SUITE/ABI标记之前，重新核对同一原日志完整记录�
 | 程序错误/契约失败 | 非零、signal或原内部断言失败，先核对固定Linux及程序调用条件 |
 | 性能回退 | 同身份工作量及正确完成后的分布变化；Max提高不能抵消Parent/慢任务变化 |
 
-程序清单、ABI差分、原镜像诊断与正式评分仍是不同口径；本轮不产生正式评分。
+程序清单、ABI差分、原镜像诊断与正式评分是不同口径；本页结果不产生正式评分。
 后续主线只在[路线](../goals.md)维护，本页不积累开发任务。
 
 ## 历史阶段记录
@@ -381,3 +389,20 @@ make test-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage \
 仍要求行规程echo与cat真实回送分别出现。Linux/BoarOS的LA512MiB/1GiB和
 RV门禁通过，没有修改原BusyBox、TTY核心、超时或结果归一化。固定资料与
 原程序身份沿上述终端验收；该事实是runner同步修复，不是Linux/BoarOS ABI差异。
+
+2026-10-14 USER_SMP主线的默认单核组合复核仍使用固定229项及原程序：BoarOS两侧双RAM全部完成，RV1GiB与LA双RAM同ELF对照全通过。RV512MiB原BusyBox脚本的`du`在Linux动态`/proc`遍历失败，整组标为reference-not-pass；BoarOS内容/退出/回收通过。该首轮未补记通过，也不替此前LA参考失败归因。新USER_SMP原生、1400 ABI和运行时使用另一个固定Linux SMP配置，其结果及CPU0业务边界见[两核模块](../modules/riscv-smp.md#真实用户态与cpu0业务交接)，不把默认229项推广成全部SMP应用已验收。
+
+## RV USER_SMP原程序四profile复核（2026-10-14）
+
+冻结USER_SMP内核`9fe57b5d6f806f944b455b16abc9b139643ce2539ff0e1dba29bb9a8315fde04`下重新执行固定229项原程序。512MiB/2 CPU、512MiB/1 CPU、1GiB/2 CPU、1GiB/1 CPU四个profile均为`complete`且各229项pass；两侧程序/loader/库及运行参数来自同一已封存输入，四组严格运行没有参考端失败、BoarOS失败、超时或未到达。使用Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`的SMP profile `tests/smp/linux-user.config`，源码配置SHA-256 `dac55880b20f0091d1cfd4d86ee619456a1cdcc7177e8611030f107bf36c9516`。前一冻结核的两项启动输出协议失败及强制交错修复见[交接记录](smp-handoff.md#用户态原程序与生命周期组合2026-10-14)；其失败未补记为通过。
+
+本地执行器为QEMU11.1.2（`/usr/bin/qemu-system-riscv64` SHA-256 `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d`），firmware SHA-256 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。逐ID结果和manifest在验收时核对，运行目录按`build/`策略清理；Git保留结论、输入身份和复建命令。这不是托管CI结果。复建命令：
+
+```sh
+python3 -B tests/program-inventory/run.py --arch riscv --execution-profile rv-user-smp \
+  --cpus 2 --cpus 1 --memory 512M --memory 1G \
+  --firmware build/data-path-baselines/sync-b3/firmware.bin \
+  --reuse-builds --require-pass --output build/user-smp-programs-run
+```
+
+默认单核program profile此前发生的Linux BusyBox `du`动态`/proc`参考失败仍属该profile；这里的SMP Linux配置与运行身份独立，因此该历史结果保留、不由此处改写。

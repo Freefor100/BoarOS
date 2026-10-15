@@ -1,3 +1,4 @@
+#define COST_END_WAIT_ASYNC 1
 #include "common.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -5,6 +6,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
+#include <termios.h>
 static unsigned char *payload;
 static void verify(int fd, unsigned size, unsigned char value)
 {
@@ -74,8 +76,12 @@ int main(void)
     int pair[2]; CHECK(socketpair(AF_UNIX,SOCK_DGRAM,0,pair)==0);
     cost_begin(); CHECK(write(pair[0],payload,65536)==65536); CHECK(read(pair[1],payload,65536)==65536);
     cost_end("dgram-64k","dgram",1,65536,65536);
-    cost_begin(); CHECK(write(pair[0],payload,65537)==-1 && errno==EMSGSIZE);
-    cost_end("dgram-oversize","dgram",1,65537,0); close(pair[0]); close(pair[1]);
+    int sendbuf; socklen_t sendbuf_length=sizeof(sendbuf);
+    CHECK(getsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&sendbuf,&sendbuf_length)==0 &&
+        sendbuf_length==sizeof(sendbuf) && sendbuf>0 && sendbuf<1048576);
+    size_t oversize=(size_t)sendbuf+1;
+    cost_begin(); CHECK(write(pair[0],payload,oversize)==-1 && errno==EMSGSIZE);
+    cost_end("dgram-oversize","dgram",1,oversize,0); close(pair[0]); close(pair[1]);
     for(int mode=0;mode<3;mode++) {
         if(mode) { close(fd); fd=open("/write-data",O_RDWR|(mode==1?O_SYNC:O_DSYNC)); CHECK(fd>=0); }
         if(mode) {
@@ -108,5 +114,6 @@ int main(void)
     cost_begin(); CHECK(pwrite(fd,fault,8192,0)==4096); cost_end("file-fault-prefix","file",1,8192,4096);
     cost_begin(); CHECK(pwrite(fd,(void *)1,4096,0)==-1 && errno==EFAULT); cost_end("file-fault-first","file",1,4096,0);
     CHECK(munmap(fault,4096)==0); verify(fd,1048576,0x5a); close(fd); free(payload);
-    puts("COST PASS write"); return 0;
+    puts("COST PASS write"); CHECK(fflush(stdout)==0);
+    CHECK(tcdrain(STDOUT_FILENO)==0); return 0;
 }

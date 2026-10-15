@@ -41,6 +41,20 @@ int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount)
 }
 static struct tmp_mount *tm(struct kernel_vfs_instance *i) { return i->backend_data; }
 static struct tmp_inode *ti(struct kernel_vfs_node *n) { return n->backend_data; }
+int kernel_tmpfs_check_domain(const struct kernel_vfs_node *node,
+    const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
+{
+    if (!node || !node->instance || node->instance->ops != &tmp_ops ||
+        node->instance->heap != heap || !heap || heap->page_allocator != allocator ||
+        !node->backend_data || (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG)
+        return -KERNEL_EINVAL;
+    struct tmp_mount *mount = tm(node->instance);
+    struct tmp_inode *inode = node->backend_data;
+    if (inode->memory != node->memory || inode->number != node->inode ||
+        kernel_memory_object_check_budget_domain(inode->memory, heap, allocator, &mount->pages))
+        return -KERNEL_EINVAL;
+    return 0;
+}
 static struct kernel_vfs_timespec now(void)
 {
     uint64_t ns = kernel_time_realtime_ns();
@@ -354,16 +368,18 @@ static int rename_inode(struct kernel_vfs_instance *instance, uint64_t old_paren
 static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s)
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,
-        .size=i->size,.blksize=BOAROS_PAGE_SIZE,.blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*8 : 0,
+        .size=i->size,.blksize=BOAROS_PAGE_SIZE,
+        .blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*(BOAROS_PAGE_SIZE/512) : 0,
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
 }
 static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
 {
     struct tmp_mount *m=tm(mount->private_data);
     *s=(struct kernel_vfs_statfs){.type=0x01021994,.block_size=BOAROS_PAGE_SIZE,.blocks=m->pages.limit,
-        .free_blocks=m->pages.limit ? m->pages.limit-m->pages.used : 0,
-        .available_blocks=m->pages.limit ? m->pages.limit-m->pages.used : 0,
+        .free_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
+        .available_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
         .fsid=mount->id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
 }
@@ -385,7 +401,9 @@ static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint6
 static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actual,int *changed)
 {
     struct tmp_inode *i=ti(n); kernel_memory_object_truncate(i->memory,size);
-    i->size=size; i->ctime=i->mtime=now(); *actual=size; *changed=1; return 0;
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->size=size; i->ctime=i->mtime=time; *actual=size; *changed=1; return 0;
 }
 static int pread_inode(struct kernel_vfs_node *n,uint64_t offset,void *buffer,size_t size,size_t *read)
 {
@@ -406,22 +424,14 @@ static int pread_inode(struct kernel_vfs_node *n,uint64_t offset,void *buffer,si
     }
     return 0;
 }
-static int write_inode(struct kernel_vfs_node *n,uint64_t offset,const void *buffer,size_t size,size_t *written)
+static void memory_written(struct kernel_vfs_node *n,uint64_t end)
 {
-    struct tmp_mount *m=tm(n->instance); struct tmp_inode *i=ti(n); *written=0;
-    while(*written<size) {
-        uint64_t address; int created; size_t start=offset & BOAROS_PAGE_MASK;
-        size_t count=BOAROS_PAGE_SIZE-start; if(count>size-*written) count=size-*written;
-        enum kernel_memory_object_status r=kernel_memory_object_get_page(i->memory,offset>>BOAROS_PAGE_SHIFT,&address,&created);
-        if(r!=KERNEL_MEMORY_OBJECT_OK) return r==KERNEL_MEMORY_OBJECT_NO_SPACE ? -KERNEL_ENOSPC : -KERNEL_ENOMEM;
-        void *p; if(physical_page_resolve(m->instance.heap->page_allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-        memcpy((char *)p+start,(const char *)buffer+*written,count);
-        (void)physical_page_release(m->instance.heap->page_allocator,address);
-        *written+=count; offset+=count;
-        if(offset>i->size) i->size=offset;
-        n->size=i->size; i->ctime=i->mtime=now();
-    }
-    return 0;
+    struct tmp_inode *i=ti(n);
+    if(end>i->size) i->size=end;
+    n->size=i->size;
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->ctime=i->mtime=time;
 }
 static int set_times(struct kernel_vfs_file *f,const struct kernel_vfs_timespec t[2])
 {
@@ -434,6 +444,7 @@ static int set_times(struct kernel_vfs_file *f,const struct kernel_vfs_timespec 
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
     struct tmp_inode *i = ti(n); struct kernel_vfs_timespec time = now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     if (!t || t[0].nanoseconds != KERNEL_VFS_UTIME_OMIT)
         i->atime = !t || t[0].nanoseconds == KERNEL_VFS_UTIME_NOW ? time : t[0];
     if (!t || t[1].nanoseconds != KERNEL_VFS_UTIME_OMIT)
@@ -449,7 +460,10 @@ static int set_mode(struct kernel_vfs_file *f,uint32_t mode)
     if (n->instance->read_only) return -KERNEL_EROFS;
     struct tmp_inode *i = ti(n);
     i->mode = (i->mode & KERNEL_VFS_S_IFMT) | (mode & 07777);
-    n->mode = f->mode = i->mode; i->ctime = now();
+    n->mode = f->mode = i->mode;
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->ctime = time;
     return 0;
 }
 static int set_owner(struct kernel_vfs_file *f, uint32_t uid, uint32_t gid)
@@ -463,7 +477,9 @@ static int set_owner(struct kernel_vfs_file *f, uint32_t uid, uint32_t gid)
     if (gid != UINT32_MAX) i->gid = gid;
     i->mode = kernel_vfs_chown_mode(i->mode);
     n->mode = f->mode = i->mode;
-    i->ctime = now();
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->ctime = time;
     return 0;
 }
 static int time_not_after(struct kernel_vfs_timespec a, struct kernel_vfs_timespec b)
@@ -473,17 +489,27 @@ static int time_not_after(struct kernel_vfs_timespec a, struct kernel_vfs_timesp
 static void accessed(struct kernel_vfs_file *f)
 {
     struct tmp_inode *i=ti(f->private_data); struct kernel_vfs_timespec t=now();
+    struct kernel_vfs_node *n=f->private_data;
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     if (time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
         (t.seconds >= i->atime.seconds && (uint64_t)t.seconds - (uint64_t)i->atime.seconds >= 86400))
         i->atime=t;
 }
 static int modified(struct kernel_vfs_file *f,uint64_t offset,int append)
-{ (void)offset; (void)append; struct tmp_inode *i=ti(f->private_data); i->mtime=i->ctime=now(); return 0; }
+{
+    (void)offset; (void)append;
+    struct kernel_vfs_node *n=f->private_data;
+    struct tmp_inode *i=ti(n);
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->mtime=i->ctime=time;
+    return 0;
+}
 void kernel_tmpfs_memory_modified(struct kernel_vfs_file *file)
 {
     if (!file || !kernel_tmpfs_is_mount(file->mount) || !file->private_data)
         __builtin_trap();
-    /* 调用者在单核上屏蔽中断；不分配、不睡眠，不升级缺页持有的 inode 读锁。 */
+    /* 短metadata与stat/CPU0时间修改互斥，不升级缺页持有的inode读锁。 */
     (void)modified(file, 0, 0);
 }
 static int no_writeback(struct kernel_vfs_instance *i) { (void)i; return 0; }
@@ -502,7 +528,7 @@ static int unmount(struct kernel_vfs_mount *mount)
         remove_entry(m, m->entries);
     }
     while(m->inodes) { m->inodes->links=0; collect_inode(m,m->inodes); }
-    if(m->pages.used || m->inode_count) __builtin_trap();
+    if(__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) || m->inode_count) __builtin_trap();
     struct kernel_heap *heap=m->instance.heap;
     if(kernel_heap_release(heap,m)!=KERNEL_HEAP_STATUS_OK) __builtin_trap();
     return 0;
@@ -514,7 +540,7 @@ static void initialize_ops(void)
     o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_regular; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
-    o->pread=pread_inode; o->memory_write=write_inode; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
+    o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->writeback_allowed=no_writeback;
     o->sync_metadata=sync_metadata; o->flush=error; o->unmount=unmount;
 }

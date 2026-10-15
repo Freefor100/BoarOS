@@ -10,10 +10,61 @@
 #include <signal.h>
 #include <unistd.h>
 
+/* Reflected Castagnoli bit recurrence, independent of the production tables. */
+static uint32_t bitwise_crc32c(uint32_t crc, const void *buffer, uint32_t size)
+{
+    const unsigned char *bytes = buffer;
+    for (uint32_t i = 0; i < size; i++) {
+        crc ^= bytes[i];
+        for (unsigned bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (0x82f63b78U & (0U - (crc & 1U)));
+    }
+    return crc;
+}
+
+static void raw_crc32c(void)
+{
+    unsigned char bytes[16400];
+    const uint32_t seeds[] = {0, UINT32_MAX, 0x1234abcd};
+    const uint32_t lengths[] = {511, 512, 513, 1023, 1024, 1025,
+        4095, 4096, 4097, 8191, 8192, 8193, 16383, 16384};
+    for (unsigned i = 0; i < sizeof(bytes); i++) bytes[i] = (unsigned char)(i * 17 + i / 251);
+    assert((ext4_crc32c(UINT32_MAX, "123456789", 9) ^ UINT32_MAX) == 0xe3069283);
+    assert((ext4_crc32(UINT32_MAX, "123456789", 9) ^ UINT32_MAX) == 0xcbf43926);
+    for (unsigned seed = 0; seed < 3; seed++) for (unsigned offset = 0; offset < 16; offset++) {
+        for (uint32_t size = 0; size <= 257; size++)
+            assert(ext4_crc32c(seeds[seed], bytes + offset, size) ==
+                bitwise_crc32c(seeds[seed], bytes + offset, size));
+        for (unsigned size = 0; size < sizeof(lengths) / sizeof(lengths[0]); size++)
+            assert(ext4_crc32c(seeds[seed], bytes + offset, lengths[size]) ==
+                bitwise_crc32c(seeds[seed], bytes + offset, lengths[size]));
+        for (uint32_t split = 0; split <= 257; split++)
+            assert(ext4_crc32c(ext4_crc32c(seeds[seed], bytes + offset, split),
+                bytes + offset + split, 257 - split) ==
+                bitwise_crc32c(seeds[seed], bytes + offset, 257));
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    assert(page_size > 0);
+    size_t page = (size_t)page_size;
+    unsigned char *area = mmap(NULL, 3 * page, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(area != MAP_FAILED && !mprotect(area + page, page, PROT_READ | PROT_WRITE));
+    for (size_t i = 0; i < page; i++) area[page + i] = (unsigned char)(i * 43);
+    assert(!mprotect(area + page, page, PROT_READ));
+    for (uint32_t size = 0; size <= page; size++) {
+        assert(ext4_crc32c(UINT32_MAX, area + page, size) ==
+            bitwise_crc32c(UINT32_MAX, area + page, size));
+        assert(ext4_crc32c(UINT32_MAX, area + 2 * page - size, size) ==
+            bitwise_crc32c(UINT32_MAX, area + 2 * page - size, size));
+    }
+    assert(!munmap(area, 3 * page));
+}
+
 int main(void)
 {
     const struct rlimit no_core = {0, 0};
     assert(!setrlimit(RLIMIT_CORE, &no_core));
+    raw_crc32c();
     unsigned char original[16384], oracle[16384];
     unsigned char *data = mmap(NULL, sizeof(original), PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -36,7 +87,7 @@ int main(void)
                 memset(oracle + first, 0, 2);
                 if (second < size) memset(oracle + second, 0, 2);
                 uint32_t actual = ext4_crc32c_zeroed(seeds[seed], data, size, first, second);
-                assert(actual == ext4_crc32c(seeds[seed], oracle, size));
+                assert(actual == bitwise_crc32c(seeds[seed], oracle, size));
                 assert(!memcmp(data, original, sizeof(original)));
                 cases++;
             }
@@ -48,7 +99,7 @@ int main(void)
         memset(oracle + first, 0, 2);
         if (second < size) memset(oracle + second, 0, 2);
         assert(ext4_crc32c_zeroed(UINT32_MAX, data, size, first, second) ==
-            ext4_crc32c(UINT32_MAX, oracle, size));
+            bitwise_crc32c(UINT32_MAX, oracle, size));
         cases++;
     }
     const uint32_t invalid[][3] = {{0,0,0},{1,0,1},{32,UINT32_MAX,32},{32,31,32},
@@ -60,6 +111,6 @@ int main(void)
         assert(WIFSIGNALED(status) && (WTERMSIG(status) == SIGILL || WTERMSIG(status) == SIGTRAP));
     }
     assert(!munmap(data, sizeof(original)));
-    printf("PASS: %u normalized CRC cases on read-only input, nonadjacent inode fields and 7 fatal layout boundaries\n", cases);
+    printf("PASS: CRC32C bitwise oracle, alignments, splits, guard pages; %u normalized cases on read-only input and 7 fatal layout boundaries\n", cases);
     return 0;
 }

@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--pages', nargs='+', type=int, choices=(1, 2, 4, 8), default=(1, 2, 4, 8))
+parser.add_argument('--pages', nargs='+', type=int, choices=(1, 2, 4, 8, 16, 32), default=(1, 2, 4, 8, 16, 32))
 parser.add_argument('--block-size', nargs='+', type=int, choices=(1024, 4096), default=(1024, 4096))
 parser.add_argument('--qemu', default='qemu-system-riscv64')
 parser.add_argument('--transport', choices=('legacy', 'modern'), default='modern')

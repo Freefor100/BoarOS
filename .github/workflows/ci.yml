@@ -122,6 +122,22 @@ jobs:
       arch: riscv
       suite: runtime
 
+  riscv-smp:
+    name: RISC-V controlled two-core correctness
+    needs: riscv-environment
+    uses: ./.github/workflows/native-contracts.yml
+    with:
+      arch: riscv
+      suite: smp
+
+  riscv-user-smp:
+    name: RISC-V real user two-core correctness
+    needs: riscv-environment
+    uses: ./.github/workflows/native-contracts.yml
+    with:
+      arch: riscv
+      suite: user-smp
+
   loongarch-runtime:
     name: LoongArch glibc 2.42 and SQLite
     needs: loongarch-environment
@@ -161,7 +177,7 @@ jobs:
   required:
     name: Main dual-architecture gate
     if: always()
-    needs: [host-contracts, riscv-environment, loongarch-environment, riscv-core, loongarch-core, riscv-runtime, loongarch-runtime, riscv-development]
+    needs: [host-contracts, riscv-environment, loongarch-environment, riscv-core, loongarch-core, riscv-runtime, loongarch-runtime, riscv-smp, riscv-user-smp, riscv-development]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -170,4 +186,4 @@ jobs:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: |
           python3 -B tests/ci/run.py --check-jobs host-contracts riscv-environment \
-            loongarch-environment riscv-core loongarch-core riscv-runtime loongarch-runtime riscv-development
+            loongarch-environment riscv-core loongarch-core riscv-runtime loongarch-runtime riscv-smp riscv-user-smp riscv-development

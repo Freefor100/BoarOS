@@ -1,6 +1,8 @@
 #ifndef BOAROS_ARCH_LOONGARCH_MMU_H
 #define BOAROS_ARCH_LOONGARCH_MMU_H
 #include <kernel/physical_page.h>
+#include <kernel/mm_retire.h>
+#include <kernel/mm_prepare.h>
 #include <kernel/page.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -61,6 +63,28 @@ struct arch_mmu_mapping {
     uint64_t physical_address;
     uint32_t permissions;
 };
+enum arch_mmu_status arch_mmu_user_detach_page(
+    struct arch_mmu_user_space *, uint64_t, struct kernel_mm_retirement *);
+void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
+    int instructions);
+void arch_mmu_flush_all(void);
+enum arch_mmu_status arch_mmu_user_leaf_missing(
+    struct arch_mmu_user_space *, uint64_t, unsigned *);
+enum arch_mmu_status arch_mmu_user_map_prepared_page(
+    struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t,
+    struct kernel_mm_leaf_preparation *);
+enum arch_mmu_status arch_mmu_user_cow_snapshot(
+    struct arch_mmu_user_space *, uint64_t, uint64_t *, uint64_t *);
+/* replacement==KERNEL_MM_NO_PAGE requests last-reference in-place recovery. */
+enum arch_mmu_status arch_mmu_user_cow_commit(
+    struct arch_mmu_user_space *, uint64_t, uint64_t, uint64_t, uint32_t,
+    struct kernel_mm_retirement *);
+enum arch_mmu_status arch_mmu_user_next_owned(
+    struct arch_mmu_user_space *, uint64_t *, uint64_t *);
+enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *, uint64_t);
+enum arch_mmu_status arch_mmu_user_space_fork_prepare(
+    struct arch_mmu_user_space *, struct arch_mmu_user_space *,
+    int (*)(void *, uint64_t), void *);
 
 /* The user-space object and kernel table must use the same allocator. */
 enum arch_mmu_status arch_mmu_user_space_init(

@@ -6,9 +6,6 @@
 
 struct kernel_mm;
 
-/* Single-hart diagnostic count of user-page resolution attempts. */
-uint64_t kernel_uaccess_page_resolutions(void);
-
 enum kernel_uaccess_status {
     KERNEL_UACCESS_STATUS_OK = 0,
     KERNEL_UACCESS_STATUS_INVALID_ARGUMENT,
@@ -21,11 +18,11 @@ enum kernel_uaccess_status kernel_user_range_check(
     uint64_t user_address,
     size_t size);
 
-/* 调用者持有MM owner；当前解析到页内复制依赖单CPU调用纪律，未取得覆盖复制的
- * 额外物理页pin。fault可睡眠，恢复后重查PTE/权限；失败报告精确已复制前缀。
- * SMP前必须在同一MM保护下lookup并取得pin，睡眠后重查VMA/PTE/COW；pin只保证
- * 存活，权限许可点及撤权与在途复制关系须另定义。unmap/truncate/降权与活动CPU
- * TLB完成确认后回收必须连起来实现，不能只给resolve返回的指针加引用。 */
+/* 调用者持有MM owner；每个基页片段经权限检查取得实际pin后复制，
+ * fault及最后pin之间的映射/临时写许可变化须重查，失败报告精确已复制前缀。
+ * pin只保证物理存活；受控磁盘页写借用覆盖复制到归还，快照须排空该页写者。
+ * 默认业务仍限CPU0；受控域以MM gate/raw、活动集合和确认失效后回收保护并发。
+ * 不能以pin代替内容同步，或把此接口解释为普通用户/所有文件业务的SMP支持。 */
 enum kernel_uaccess_status kernel_copy_to_user(
     struct kernel_mm *mm,
     uint64_t user_destination,

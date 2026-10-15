@@ -14,7 +14,7 @@ static uint32_t read_reg(void *opaque, enum virtio_register reg)
     switch(reg) {
     case VIRTIO_REG_STATUS:return m->status;
     case VIRTIO_REG_DEVICE_FEATURES:return m->offered[m->features_select];
-    case VIRTIO_REG_QUEUE_NUM_MAX:return 32;
+    case VIRTIO_REG_QUEUE_NUM_MAX:return 64;
     case VIRTIO_REG_QUEUE_READY:return 0;
     default:return 0;
     }
@@ -72,6 +72,14 @@ int main(void)
         assert(done.head==(unsigned)i && done.token==&owners[i] && done.length==16);
     }
     assert(!q.inflight && virtio_split_take(&q,&done)==VIRTIO_EMPTY);
+    unsigned notified=m.notified;
+    assert(virtio_split_enqueue(&q,&t,0,&owners[0],0,16)==VIRTIO_OK);
+    assert(virtio_split_enqueue(&q,&t,1,&owners[1],0,16)==VIRTIO_OK);
+    assert(m.notified==notified && q.inflight==2);
+    assert(virtio_split_notify(&q,&t,0)==VIRTIO_OK && m.notified==notified+1);
+    complete(&q,1,16);complete(&q,0,16);
+    assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.token==&owners[1]);
+    assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.token==&owners[0]);
     for(unsigned i=0;i<65544;i++) {
         assert(virtio_split_publish(&q,&t,0,0,&owners[0],1,16)==VIRTIO_OK);
         complete(&q,0,16);assert(virtio_split_take(&q,&done)==VIRTIO_OK);
@@ -126,5 +134,26 @@ int main(void)
     assert(virtio_transport_begin(&t,0x21,0,&features)==VIRTIO_OK && features==0x21);
     assert(virtio_transport_queue(&t,0,32,0x100000,512,4096,4096)==VIRTIO_OK);
     assert(virtio_split_initialize(&q,memory,sizeof(memory),32,2,1024)==VIRTIO_INVALID);
+    assert(virtio_transport_reset(&t)==VIRTIO_OK && virtio_split_reset(&q,&t)==VIRTIO_OK);
+    assert(virtio_split_initialize(&q,memory,sizeof(memory),64,1024,4096)==VIRTIO_OK);
+    assert(virtio_transport_begin(&t,0,0,0)==VIRTIO_OK);
+    assert(virtio_transport_queue(&t,0,64,0x100000,1024,4096,4096)==VIRTIO_OK);
+    assert(virtio_transport_start(&t)==VIRTIO_OK);
+    int large_owners[64]={0};
+    for(unsigned i=0;i<64;i++) {
+        q.descriptors[i]=(struct virtio_descriptor){0x200000+16*i,16,VIRTIO_DESC_WRITE,0};
+        assert(virtio_split_enqueue(&q,&t,i,&large_owners[i],1,16)==VIRTIO_OK);
+    }
+    assert(q.claimed==UINT64_MAX && q.inflight==64);
+    assert(virtio_split_notify(&q,&t,0)==VIRTIO_OK);
+    for(int i=63;i>=0;i--)complete(&q,(unsigned)i,16);
+    for(int i=63;i>=0;i--) {
+        assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.head==(unsigned)i && done.token==&large_owners[i]);
+    }
+    assert(!q.claimed && !q.inflight);
+    assert(virtio_split_enqueue(&q,&t,63,&large_owners[63],1,16)==VIRTIO_OK);
+    assert(q.claimed==(UINT64_C(1)<<63));
+    assert(virtio_transport_reset(&t)==VIRTIO_OK && virtio_split_reset(&q,&t)==VIRTIO_OK);
+    assert(!q.claimed && !q.inflight && !q.owners[63].token);
     puts("VirtIO feature/reset/descriptor ownership, chain, reverse completion, wrap and malformed device tests passed");
 }

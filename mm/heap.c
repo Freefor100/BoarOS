@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define KERNEL_HEAP_INITIALIZED UINT32_C(0x48454150)
 #define KERNEL_SLAB_MAGIC UINT64_C(0x424f4152534c4142)
@@ -59,29 +60,6 @@ static enum kernel_heap_status page_status_to_heap(
     case PHYSICAL_PAGE_STATUS_INVALID:
     default:
         return KERNEL_HEAP_STATUS_INVALID;
-    }
-}
-
-static void bytes_zero(void *pointer, size_t size)
-{
-    unsigned char *bytes = pointer;
-    size_t index;
-
-    for (index = 0U; index < size; index++) {
-        bytes[index] = 0U;
-    }
-}
-
-static void bytes_copy(void *destination,
-                       const void *source,
-                       size_t size)
-{
-    unsigned char *output = destination;
-    const unsigned char *input = source;
-    size_t index;
-
-    for (index = 0U; index < size; index++) {
-        output[index] = input[index];
     }
 }
 
@@ -588,7 +566,7 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
         struct kernel_cost_tag memory_tag = kernel_cost_capture();
         uint64_t memory_start = kernel_cost_clock();
 #endif
-        bytes_zero(result, total);
+        memset(result, 0, total);
 #if BOAROS_COST_DIAGNOSTICS
         uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
         kernel_cost_add_tag(memory_tag, COST_HEAP_ZERO_TICKS, memory_elapsed);
@@ -811,7 +789,7 @@ enum kernel_heap_status kernel_heap_resize(
         struct kernel_cost_tag memory_tag = kernel_cost_capture();
         uint64_t memory_start = kernel_cost_clock();
 #endif
-        bytes_copy(result, old_pointer, capacity);
+        memcpy(result, old_pointer, capacity);
 #if BOAROS_COST_DIAGNOSTICS
         uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
         kernel_cost_add_tag(memory_tag, COST_HEAP_COPY_TICKS, memory_elapsed);

@@ -7,8 +7,8 @@
 #ifndef __ASSEMBLER__
 #include <stddef.h>
 #include <stdint.h>
+#include <arch/loongarch/context.h>
 struct arch_thread_state { uintptr_t kernel_sp, user_sp; uint64_t user_mode, page_root, signal_error_code; } __attribute__((aligned(16)));
-struct arch_switch_context { uint64_t ra, sp, tp, fp, s[9]; } __attribute__((aligned(16)));
 /* width 为当前硬件宽度；live_width 保留已初始化的上半部，即使 sigreturn 撤销 used。 */
 struct arch_fpu_state { uint64_t regs[32][4], fcc; uint32_t fcsr, width; uint64_t saved; uint32_t live_width; } __attribute__((aligned(32)));
 _Static_assert(sizeof(struct arch_fpu_state)==1056 && offsetof(struct arch_fpu_state,fcc)==1024 &&

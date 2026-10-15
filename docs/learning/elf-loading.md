@@ -125,3 +125,11 @@ ELF权限及exec/root聚焦通过。冻结的LA ELF SHA-256为
 `c609adb22c06ad374e0d3ef85e49a37c70550e5ab4549835bf8f94ed6bfd1b59`，
 在原失败fixture上用修正内核执行，512MiB/1GiB均完成退出和根owner基线。
 这项是共用装载纠错，不表示原评测全量或容器验收已经完成。
+
+## 栈权限与容量错误
+
+固定 `references/linux/fs/binfmt_elf.c::load_elf_binary`、`fs/exec.c::setup_arg_pages/bprm_stack_limits`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
+GNU_STACK 是内核初始栈策略，静态程序同样需要；主程序最后一个记录决定 PF_X，解释器不覆盖。
+初始 PTE 与 demand-zero VMA 必须一致。自定义 PHDRS 可能让 -z execstack 不生成记录，测试应显式声明 PT_GNU_STACK，并核对实际 ELF。
+参数字符串总量不是最终栈用量，指针、auxv、execfn、随机字节及对齐都占空间；合法输入超限属于 E2BIG，而非内部参数 EINVAL。
+边界对照同时检查失败后旧 PID、CLOEXEC descriptor、偏移和内容；栈执行另覆盖初始页、缺页扩展、显式 RW 和缺标记的 NX 控制。

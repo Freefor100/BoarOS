@@ -131,12 +131,12 @@ struct kernel_pid *kernel_pid_find(struct kernel_pid_registry *registry,
     return 0;
 }
 
-enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
+enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
                                           struct kernel_pid *prepared)
 {
-    if (!registry || !prepared || prepared->registry || !registry->next_generation)
+    if (!registry || !prepared || prepared->registry || prepared->published || !registry->next_generation)
         return KERNEL_PID_STATUS_STATE;
-    if (registry->next_generation > (UINT64_MAX >> 30U))
+    if (registry->next_generation > KERNEL_PID_GENERATION_MAX)
         return KERNEL_PID_STATUS_EXHAUSTED;
     kernel_pid_t number;
     enum kernel_pid_status status = kernel_pid_allocate(registry->numbers, &number);
@@ -145,30 +145,52 @@ enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
     prepared->generation = registry->next_generation++;
     prepared->references = 1;
     prepared->registry = registry;
-    unsigned bucket = (uint32_t)number % KERNEL_PID_BUCKETS;
+    return KERNEL_PID_STATUS_OK;
+}
+
+enum kernel_pid_status kernel_pid_publish_reserved(struct kernel_pid *prepared)
+{
+    if (!prepared || !prepared->registry || !prepared->references ||
+        prepared->published) return KERNEL_PID_STATUS_STATE;
+    struct kernel_pid_registry *registry = prepared->registry;
+    unsigned bucket = (uint32_t)prepared->number % KERNEL_PID_BUCKETS;
+    if (kernel_pid_find(registry, prepared->number) || prepared->hash_next)
+        __builtin_trap();
     prepared->hash_next = registry->buckets[bucket];
+    prepared->published = 1;
     registry->buckets[bucket] = prepared;
     return KERNEL_PID_STATUS_OK;
 }
 
+enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
+                                          struct kernel_pid *prepared)
+{
+    enum kernel_pid_status status = kernel_pid_reserve(registry, prepared);
+    if (status != KERNEL_PID_STATUS_OK) return status;
+    return kernel_pid_publish_reserved(prepared);
+}
+
 void kernel_pid_get(struct kernel_pid *identity)
 {
-    if (!identity || !identity->registry || !identity->references ||
+    if (!identity || !identity->registry || identity->published > 1 || !identity->references ||
         identity->references == UINT32_MAX) __builtin_trap();
     identity->references++;
 }
 
 void kernel_pid_put(struct kernel_pid *identity)
 {
-    if (!identity || !identity->registry || !identity->references) __builtin_trap();
+    if (!identity || !identity->registry || identity->published > 1 || !identity->references) __builtin_trap();
     if (--identity->references) return;
     for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
         if (identity->members[role]) __builtin_trap();
     struct kernel_pid_registry *registry = identity->registry;
-    struct kernel_pid **link = &registry->buckets[(uint32_t)identity->number % KERNEL_PID_BUCKETS];
-    while (*link && *link != identity) link = &(*link)->hash_next;
-    if (!*link) __builtin_trap();
-    *link = identity->hash_next;
+    if (identity->published) {
+        struct kernel_pid **link = &registry->buckets[(uint32_t)identity->number % KERNEL_PID_BUCKETS];
+        while (*link && *link != identity) link = &(*link)->hash_next;
+        if (!*link) __builtin_trap();
+        *link = identity->hash_next;
+    } else if (identity->hash_next) __builtin_trap();
+    identity->published = 2; /* Retired storage is still owned by the registry. */
     if (kernel_pid_release(registry->numbers, identity->number) != KERNEL_PID_STATUS_OK)
         __builtin_trap();
     identity->registry = 0;
@@ -226,6 +248,8 @@ struct kernel_pid *kernel_pid_take_retired(struct kernel_pid_registry *registry)
     if (retired) {
         registry->retired = retired->hash_next;
         retired->hash_next = 0;
+        if (retired->published != 2) __builtin_trap();
+        retired->published = 0;
     }
     return retired;
 }

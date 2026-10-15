@@ -60,7 +60,7 @@ def plot(io, network, target, table=None):
     fig, axes = plt.subplots(1, 3, figsize=(12, 4.3))
     profiles = [
         ("baseline", "5687377 baseline", "#777777"),
-        ("ra0-wb1", "Current default (RA0 / WB1)", "#0072b2"),
+        ("ra0-wb1", "Historical default (RA0 / WB1)", "#0072b2"),
         ("ra0-wb8", "RA0 / WB8", "#009e73"),
         ("ra8-wb8", "RA8 / WB8", "#cc79a7"),
     ]

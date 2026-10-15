@@ -21,6 +21,11 @@ void abi_tmpfs_cases(void)
     char byte = 1;
     abi_require(SC4(67, fd, &byte, 1, (3 * ABI_PAGE_SIZE)) == 1 && byte == 0);
     abi_require(SC4(68, fd, "A", 1, 0) == 1 && SC4(68, fd, "B", 1, ABI_PAGE_SIZE) == 1);
+    struct abi_stat allocated;
+    abi_require(SC2(80, fd, &allocated) == 0);
+    long units[] = {allocated.blocks == 2 * (ABI_PAGE_SIZE / 512),
+                    allocated.blksize == ABI_PAGE_SIZE, allocated.size == 4 * ABI_PAGE_SIZE};
+    abi_record("tmpfs.allocated-block-units", 0, -1, -1, 0, units, sizeof(units));
     abi_record("tmpfs.quota", SC4(68, fd, "C", 1, (2 * ABI_PAGE_SIZE)), -1, -1, 0, 0, 0);
     long mapping = SC6(222, 0, ABI_PAGE_SIZE, 3, 1, fd, 0);
     abi_require(mapping > 0);

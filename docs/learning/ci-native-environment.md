@@ -60,6 +60,14 @@ exec/setup errno；host 编译开启 Fortify，另有一次中断后的真实错
 `environment.py`。保留脚本目录优先级后，29 项 inventory host 测试在本机和
 Ubuntu 均通过；严格原程序执行仍单独判定，入口修复不等于程序通过。
 
+Ubuntu24.04的GCC13.3默认定义`_FORTIFY_SOURCE=3`。FD宿主成本探针虽有
+`-fno-builtin-memcpy`和linker `--wrap=memcpy`，glibc强化声明仍显式调用
+`__builtin___memcpy_chk`，优化后成为`rep movsq`，绕过symbol wrap。
+真实扩容和owner测试通过时，复制计数仍为0；这不能当作消除复制的证据。
+现在仅table被测对象使用非强化声明，其余fixture保留Fortify；同一Ubuntu环境
+在4/16KiB、2/4线程实测最大复制8192字节，原非零/上界断言保持。
+重建入口为`make test-files-concurrency-host test-pipe-concurrency-host`。
+
 首次 LA 冷环境准备超过 45 分钟；它包含 QEMU、两个 Linux 配置与整数 GCC/musl
 的源码构建。main 新 push 不再取消正在构建的环境，最新 pending 执行随后使用
 精确缓存；PR 继续取消旧执行。并发依据为

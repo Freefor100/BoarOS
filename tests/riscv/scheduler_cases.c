@@ -1023,7 +1023,7 @@ static unsigned long run_deadline_cases(
                               kernel_scheduler_on_tick(1U));
 
     /* timer 重装必须包含最早的阻塞期限。 */
-    if (scheduler.armed_deadline != deadline_case_ticks[0]) failures++;
+    if (kernel_cpu_current()->armed_deadline != deadline_case_ticks[0]) failures++;
 
     /* 到期扫描只处理已到期者；未到期成员保持阻塞。 */
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
@@ -1052,7 +1052,7 @@ static unsigned long run_deadline_cases(
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
     /* 成员全部销毁后，硬件事件不再携带阻塞期限。 */
-    if (scheduler.armed_deadline != 0U) failures++;
+    if (kernel_cpu_current()->armed_deadline != 0U) failures++;
     return failures + (physical_page_available(allocator) != available);
 }
 

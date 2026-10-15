@@ -2,6 +2,9 @@
 #include <arch/timer.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
+#if BOAROS_MAX_CPUS > 1
+#include <arch/riscv/smp.h>
+#endif
 
 #include "private.h"
 
@@ -106,7 +109,8 @@ static int deadline_before(const struct kernel_task *a,
                            const struct kernel_task *b)
 {
     return a->wakeup_deadline < b->wakeup_deadline ||
-           (a->wakeup_deadline == b->wakeup_deadline && a->tid < b->tid);
+           (a->wakeup_deadline == b->wakeup_deadline &&
+            (a->tid < b->tid || (a->tid == b->tid && (uintptr_t)a < (uintptr_t)b)));
 }
 
 static struct kernel_task *deadline_insert_node(struct kernel_task *root,
@@ -186,8 +190,12 @@ struct kernel_task *deadline_index_first(void)
 /* STOPPED tasks park on their own list so the blocked-list invariant
  * (state == BLOCKED) stays intact; SIGCONT/SIGKILL move them back to
  * the ready queue. */
-void stopped_append(struct kernel_task *thread)
+void stopped_append_locked(struct kernel_task *thread)
 {
+#if BOAROS_USER_SMP
+    scheduler_user_reservation_release_locked(thread);
+#endif
+    thread->blocked_previous = scheduler.stopped_tail;
     thread->next = 0;
     if (scheduler.stopped_tail == 0) {
         scheduler.stopped_head = thread;
@@ -197,28 +205,23 @@ void stopped_append(struct kernel_task *thread)
     scheduler.stopped_tail = thread;
 }
 
-void stopped_unlink(struct kernel_task *thread)
+void stopped_unlink_locked(struct kernel_task *thread)
 {
-    struct kernel_task *previous = 0;
-    struct kernel_task *current = scheduler.stopped_head;
-
-    while (current != 0 && current != thread) {
-        previous = current;
-        current = current->next;
-    }
-    if (current != thread) {
-        return;
-    }
-    if (previous == 0) {
+    struct kernel_task *previous = thread->blocked_previous;
+    if (previous) previous->next = thread->next;
+    else {
+        if (scheduler.stopped_head != thread) __builtin_trap();
         scheduler.stopped_head = thread->next;
-    } else {
-        previous->next = thread->next;
     }
-    if (scheduler.stopped_tail == thread) {
-        scheduler.stopped_tail = previous;
-    }
-    thread->next = 0;
+    if (thread->next) thread->next->blocked_previous = previous;
+    else scheduler.stopped_tail = previous;
+    thread->next = thread->blocked_previous = 0;
 }
+void stopped_append(struct kernel_task *thread)
+{ KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); stopped_append_locked(thread); }
+void stopped_unlink(struct kernel_task *thread)
+{ KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); stopped_unlink_locked(thread); }
+
 
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task) { return &task->wait; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { return &task->default_wait_node; }
@@ -233,11 +236,20 @@ int kernel_wait_backend_signal(struct kernel_task *task)
 uint64_t kernel_wait_backend_time(void) { return arch_time_read(); }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
 {
+#if BOAROS_USER_SMP
+    scheduler_user_reservation_release_locked(task);
+#endif
     task->wait.ready_head = 0;
     task->wait_queue = task->default_wait_node.queue;
     task->wakeup_deadline = deadline;
     task->wait_interruptible = interruptible;
-    if (deadline) deadline_index_insert(task);
+    if (deadline) {
+        deadline_index_insert(task);
+#if BOAROS_MAX_CPUS > 1
+        if (kernel_cpu_current()->logical_id)
+            kernel_cpu_notify(riscv_smp_cpu(0), RISCV_IPI_DEADLINE);
+#endif
+    }
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_block(&task->cost);
 #endif

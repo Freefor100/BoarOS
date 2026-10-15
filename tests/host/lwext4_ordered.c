@@ -131,14 +131,24 @@ int main(int argc, char **argv)
         CHECK(jbd_journal_commit_trans(&journal,old) == EOK);
     }
     uint64_t writes=disk.writes;
+    unsigned char replacement[1024];
+    CHECK(dev.lg_bsize == sizeof(replacement));
+    memset(replacement, 'D', sizeof(replacement));
     for (unsigned attempt=0; attempt<2; attempt++) {
         struct jbd_trans *tx=jbd_journal_new_trans(&journal);
         CHECK(tx != NULL);
         dev.fs->curr_trans=tx;
         struct ext4_block block;
-        CHECK(ext4_trans_data_get_noread(&dev,&block,home) == EOK);
-        memset(block.data,'D',dev.lg_bsize);
-        if (!access_only) CHECK(ext4_trans_set_data_dirty(block.buf) == EOK);
+        CHECK(ext4_block_get(&dev,&block,home) == EOK);
+        unsigned char old_first = block.data[0];
+        if (!access_only) {
+            CHECK(ext4_trans_write_data(&dev,home,0,replacement,sizeof(replacement),false,NULL) == EOK);
+            const unsigned char *pending = jbd_journal_read_data(dev.fs,home);
+            CHECK(pending && pending[0] == 'D' && block.data[0] == old_first);
+        }
+        unsigned char actual; size_t read;
+        CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 &&
+            actual == (access_only ? old_first : 'D'));
         if (!data_only && !access_only) {
         CHECK(ext4_fs_get_inode_ref(dev.fs,file.inode,&inode) == EOK);
         ext4_inode_set_mode(&dev.fs->sb,inode.inode,0100600);
@@ -149,7 +159,9 @@ int main(int argc, char **argv)
         dev.fs->curr_trans=NULL;
         if (!strcmp(argv[2],"abort")) {
             jbd_journal_free_trans(&journal,tx,true);
-            CHECK(block.data[0] == 'O');
+            CHECK(!jbd_journal_read_data(dev.fs,home) && block.data[0] == old_first);
+            CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 && actual == 'O');
+            CHECK(ext4_block_set(&dev,&block) == EOK);
             CHECK(disk.writes == writes);
             return 0;
         }
@@ -166,6 +178,9 @@ int main(int argc, char **argv)
         if (critical) {
             CHECK(r == EIO && journal.error == EIO);
             CHECK(journal.failed_trans == tx);
+            const unsigned char *pending=jbd_journal_read_data(dev.fs,home);
+            CHECK(pending && pending[0]=='D' && tx->ordered_count==1);
+            CHECK(ext4_fpread(&file,0,&actual,1,&read)==EOK && read==1 && actual=='D');
             for (unsigned retry=0; retry<2; retry++)
                 CHECK(jbd_journal_commit_trans(&journal,tx) == EIO);
             CHECK(journal.failed_trans == tx);
@@ -177,7 +192,9 @@ int main(int argc, char **argv)
             CHECK(r == EIO);
             CHECK(journal.error == 0 && journal.failed_trans == NULL);
             CHECK(journal.last == last && journal.committed_id == tid);
-            CHECK(block.data[0] == 'O');
+            CHECK(!jbd_journal_read_data(dev.fs,home) && block.data[0] == old_first);
+            CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 &&
+                actual == disk.visible[data_offset]);
             CHECK(log_writes == 0);
             CHECK(ext4_block_set(&dev,&block) == EOK);
             disk.fail_write=disk.fail_flush=0;
@@ -188,10 +205,12 @@ int main(int argc, char **argv)
         CHECK(log_writes == ((data_only || access_only) ? 0 : 2));
         if (data_only || access_only) CHECK(journal.committed_id == tid);
         if (access_only) {
-            CHECK(block.data[0] == 'O');
+            CHECK(!jbd_journal_read_data(dev.fs,home) && block.data[0] == old_first);
             CHECK(disk.writes == writes);
+            CHECK(ext4_block_set(&dev,&block) == EOK);
             return 0;
         }
+        CHECK(block.data[0] == old_first);
         CHECK(ext4_block_set(&dev,&block) == EOK);
         unsigned char stable;
         CHECK(pread(disk.fd,&stable,1,(off_t)((home+1)*dev.lg_bsize)) == 1);

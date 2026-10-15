@@ -4,6 +4,7 @@
 #include <arch/riscv/root_boot.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/smp.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/timer.h>
 #include <arch/riscv/virt_rtc.h>
@@ -40,7 +41,23 @@ static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
 static struct physical_page_allocator transition_page_allocator;
 static struct riscv_sv39_page_table transition_page_table;
+#if BOAROS_MAX_CPUS > 1
+static struct dtb_cpu_info boot_cpus;
+#if BOAROS_SMP_TEST
+void riscv_smp_test_start(struct physical_page_allocator *, int);
+#if BOAROS_MM_DISK_TEST
+void riscv_smp_test_disk_config(struct kernel_heap *,struct kernel_block_device *);
+#endif
+void riscv_smp_test_poll(void);
+void riscv_smp_test_root_finish(void);
+#endif
+#endif
 static struct riscv_root_boot root_boot;
+#if BOAROS_USER_SMP_COMPOSITION
+void riscv_user_composition_start(struct riscv_root_boot *,struct physical_page_allocator *);
+void riscv_user_composition_finish(void);
+void riscv_user_composition_report(void);
+#endif
 static struct dtb_irq_info boot_irq;
 static struct dtb_boot_info boot_info;
 static struct boot_memory_layout boot_layout;
@@ -684,6 +701,15 @@ static void storage_cleanup_worker(void *argument)
         int users_pending = init_reaped && kernel_scheduler_stop_users();
         arch_interrupt_restore(interrupt_status);
         if (init_reaped && !users_pending) {
+#if BOAROS_USER_SMP_COMPOSITION
+            riscv_user_composition_finish();
+#endif
+#if BOAROS_MAX_CPUS > 1
+#if BOAROS_SMP_TEST
+            riscv_smp_test_root_finish();
+#endif
+            riscv_smp_stop();
+#endif
             struct kernel_heap_statistics heap_statistics;
             uint64_t available_pages;
 
@@ -716,6 +742,13 @@ static void storage_cleanup_worker(void *argument)
                 }
                 shutdown_for_root_boot_error(root_status);
             }
+#if BOAROS_USER_SMP
+            /* UART worker已排空/停止，避免延后用户stdout插入统计记录。 */
+#if BOAROS_USER_SMP_COMPOSITION
+            riscv_user_composition_report();
+#endif
+            riscv_smp_report_user_execution();
+#endif
             struct kernel_stack_statistics stack_statistics;
             kernel_scheduler_stack_statistics(&stack_statistics);
             virt_uart_puts("BoarOS: task stacks released=");
@@ -736,6 +769,7 @@ static void storage_cleanup_worker(void *argument)
             sbi_shutdown();
         }
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
+            scheduler_status != KERNEL_SCHEDULER_STATUS_BUSY &&
             scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
             shutdown_for_scheduler_error(scheduler_status);
         }
@@ -762,6 +796,10 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (dtb_read_irq_info(dtb, hart_id, &boot_irq) != DTB_STATUS_OK)
         shutdown_for_dtb_error(DTB_STATUS_UNSUPPORTED);
     boot_hart_id = hart_id;
+#if BOAROS_MAX_CPUS > 1
+    dtb_status = dtb_read_cpu_info(dtb, hart_id, &boot_cpus);
+    if (dtb_status != DTB_STATUS_OK) riscv_smp_fail("CPU-discovery", dtb_status);
+#endif
     boot_dtb_address = (uintptr_t)dtb;
     /* 重定位前 __kernel_start 即物理加载地址，绑定镜像 VA->PA 偏移。 */
     riscv_image_bind_load_offset(RISCV_KERNEL_VIRTUAL_BASE -
@@ -973,12 +1011,23 @@ static void kernel_main_high(void)
         __asm__ volatile("csrs sstatus, %0" ::"r"(fs_clean) : "memory");
     }
 
-    timer_status = riscv_timer_start(boot_info.timebase_frequency,
-                                     KERNEL_TICKS_PER_SECOND);
-    if (timer_status != RISCV_TIMER_STATUS_OK) {
-        shutdown_for_timer_error(timer_status);
-    }
-
+#if BOAROS_MAX_CPUS > 1
+    riscv_smp_start(&boot_cpus, (UINT64_C(8) << 60) |
+                    (transition_page_table.root_address >> 12),
+                    riscv_sv39_current_satp(), boot_info.timebase_frequency);
+#if BOAROS_USER_SMP_COMPOSITION
+    if (!root_started) __builtin_trap();
+    riscv_user_composition_start(&root_boot,&page_allocator);
+#endif
+#if BOAROS_SMP_TEST
+#if BOAROS_MM_DISK_TEST
+    if (!root_started || root_boot.device_count<2) __builtin_trap();
+    riscv_smp_test_disk_config(&root_boot.heap,&riscv_root_boot_device(&root_boot,1)->block);
+#endif
+    riscv_smp_test_start(&page_allocator, root_started);
+#endif
+#endif
+    /* timer_start开启IRQ后用户任务和UART worker即可运行，先完成启动记录。 */
     virt_uart_puts("BoarOS: timer frequency=");
     virt_uart_put_hex((unsigned long)boot_info.timebase_frequency);
     virt_uart_puts(" tick-hz=");
@@ -988,16 +1037,29 @@ static void kernel_main_high(void)
                                       KERNEL_TICKS_PER_SECOND));
     virt_uart_putc('\n');
 
+    timer_status = riscv_timer_start(boot_info.timebase_frequency,
+                                     KERNEL_TICKS_PER_SECOND);
+    if (timer_status != RISCV_TIMER_STATUS_OK) {
+        shutdown_for_timer_error(timer_status);
+    }
+
     for (;;) {
         uintptr_t irq = arch_interrupt_save();
         if (!root_started) {
             struct kernel_thread_completion completion;
             while (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) { }
+#if BOAROS_SMP_TEST
+            riscv_smp_test_poll();
+#endif
         }
         scheduler_status = kernel_scheduler_yield_current();
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
         arch_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+#if BOAROS_MAX_CPUS > 1
+        riscv_smp_idle();
+#else
         asm volatile("wfi");
+#endif
     }
 
 }

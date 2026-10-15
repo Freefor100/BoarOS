@@ -109,11 +109,35 @@ struct kernel_task {
     uintptr_t stack_high;
     struct kernel_task *next;
     struct kernel_task *all_next;
+    struct kernel_task *all_previous;
+    struct kernel_task *retired_next;
+    struct kernel_task *exit_previous;
+    uint32_t exit_queued, reaping;
+    /* Domain-protected storage borrows; they do not pin MM/files/business state.
+     * Retirement 1 stops discovery, 2 finishes resources, 3 owns disposal. */
+    uint32_t storage_borrows, retirement;
+    struct kernel_pid *prepared_group, *prepared_session;
     struct kernel_sched_policy scheduling;
     struct kernel_sched_node ready_node;
+#if BOAROS_MAX_CPUS > 1
+    struct kernel_sched_node eligible_nodes[BOAROS_MAX_CPUS];
+    /* controlled=1为私有准备，2持已发布存储owner，直到最终页归还。 */
+    uint32_t cpu_mask, controlled;
+    uint64_t bound_mm_context;
+#endif
+#if BOAROS_USER_SMP
+    /* 调度域保护phase；pending仅传递CPU0业务通知，不包含业务状态。 */
+    uint32_t user_service, user_service_pending;
+    struct kernel_sched_node service_node, reservation_node;
+    struct kernel_cpu *reservation_cpu;
+    uint32_t user_yielded;
+    uint64_t service_entries, service_migrations;
+    uint64_t service_started_ticks, service_running_ns;
+#endif
     unsigned accounted;
     struct kernel_thread_join *join;
     struct kernel_task *parent;
+    uint64_t children_epoch, group_epoch;
     struct kernel_task *first_child;
     struct kernel_task *last_child;
     struct kernel_task *previous_sibling;
@@ -220,36 +244,96 @@ struct kernel_task {
 
 struct kernel_scheduler {
     uint32_t initialized;
-    uint32_t idle_context_saved;
+    uint32_t shutdown_waiting;
+    /* Last disposal may notify before cleanup registers: retain progress until
+     * its next stop_users scan, without mistaking it for user quiescence. */
+    uint32_t shutdown_progress;
     uint64_t kernel_context;
-    uint64_t idle_ticks;
+    struct kernel_cpu *cpus;
     struct kernel_task *all_tasks;
+    struct kernel_task *retired_tasks;
+    uint64_t retired_pending, task_count;
+#if BOAROS_MAX_CPUS > 1
+    uint32_t controlled_owners;
+#endif
     uint64_t loads[3], load_ticks;
     struct kernel_pid_registry identities;
     struct kernel_heap identity_heap;
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
-    struct kernel_task idle;
+    struct kernel_task boot_idle;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
     struct kernel_sched_runqueue runqueue;
-    struct kernel_rt_bandwidth rt_bandwidth;
+#if BOAROS_USER_SMP
+    struct kernel_sched_runqueue user_services;
+#endif
+    struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
     struct kernel_task *blocked_tail;
     struct kernel_task *deadline_root;
-    uint64_t armed_deadline; /* Last deadline handed to the hardware timer. */
     struct kernel_task *stopped_head;
     struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
     enum kernel_scheduler_status fatal_status;
-    struct arch_switch_context discard_context;
     struct kernel_stack_statistics stack_statistics;
 };
 
 extern struct kernel_scheduler scheduler;
+/* 已持调度域；变更资格不修改用户请求affinity，也不结束执行owner。 */
+void scheduler_user_service_set_locked(struct kernel_task *, int);
+void scheduler_user_request_locked(struct kernel_task *);
+/* 同一调度域内结束逻辑实时资格；不结束任务执行或存储owner。 */
+void scheduler_user_reservation_release_locked(struct kernel_task *);
+int scheduler_user_yield_locked(struct kernel_task *);
+static inline enum kernel_scheduler_status scheduler_failure(void)
+{ return __atomic_load_n(&scheduler.fatal_status, __ATOMIC_RELAXED); }
+
+/* Locked variants require kernel_wait_domain; a lookup borrow is obtained
+ * under the same domain as discovery and lasts through task_put(). */
+struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t, enum kernel_pid_role, uint64_t);
+struct kernel_task *scheduler_task_lookup(kernel_pid_t, enum kernel_pid_role, uint64_t);
+void scheduler_task_get_locked(struct kernel_task *);
+void scheduler_task_put(struct kernel_task *);
+static inline void scheduler_task_borrow_end(struct kernel_task **task)
+{ if (*task) scheduler_task_put(*task); }
+#define SCHEDULER_TASK_BORROW(name, expression) \
+    struct kernel_task *name __attribute__((cleanup(scheduler_task_borrow_end))) = (expression)
+void scheduler_task_publish_locked(struct kernel_task *);
+void scheduler_task_unlink_locked(struct kernel_task *);
+void scheduler_task_retire(struct kernel_task *);
+/* 已持调度域；资源清理已结束，跨解锁使用仍须存储borrow。 */
+void scheduler_task_retire_locked(struct kernel_task *);
+void scheduler_task_collect(void);
+void scheduler_task_claim_release_locked(struct kernel_task *);
+/* wait4 owns task storage through this call; release can expose an unconsumed
+ * event or exited task, and notifies existing queue owners outside the domain. */
+void scheduler_task_wait_claim_release(struct kernel_task *);
+int scheduler_cleanup_ready_locked(void);
+void exited_append_locked(struct kernel_task *);
+void exited_remove_locked(struct kernel_task *);
+enum kernel_scheduler_status scheduler_task_claim_exit_locked(struct kernel_task *);
+enum kernel_scheduler_status scheduler_join_claim_locked(struct kernel_thread_join *, struct kernel_task **);
+void scheduler_task_disposal_notify(void);
+struct scheduler_group_cursor {
+    struct kernel_task *leader, *task;
+    uint64_t epoch;
+    uint32_t member_owned, steps;
+};
+void scheduler_group_cursor_begin(struct kernel_task *, struct scheduler_group_cursor *);
+void scheduler_group_cursor_next(struct scheduler_group_cursor *);
+void scheduler_group_cursor_end(struct scheduler_group_cursor *);
+struct scheduler_task_cursor { struct kernel_task *task; };
+int scheduler_task_descends_from(struct kernel_task *, const struct kernel_task *, uint64_t);
+void scheduler_task_cursor_begin(struct scheduler_task_cursor *);
+void scheduler_task_cursor_next(struct scheduler_task_cursor *);
+void scheduler_task_cursor_end(struct scheduler_task_cursor *);
+void process_identity_commit_locked(struct kernel_task *);
+void process_identity_sync_locked(struct kernel_task *);
+void process_identity_release_locked(struct kernel_task *);
 
 void kernel_proc_task_update_comm(struct kernel_task *task);
 
@@ -271,6 +355,7 @@ void process_group_request_exit(struct kernel_task *task,
                                 uint64_t status, uint64_t detail);
 enum kernel_scheduler_status process_group_exec_current(void);
 
+/* 调用者独占从allocator取得的页对齐存储，完整清零后才发布对象。 */
 void clear_page(void *pointer);
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
 enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
@@ -279,15 +364,22 @@ enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
 struct kernel_task *ready_first(void);
 struct kernel_task *ready_next(const struct kernel_task *task);
-struct kernel_task *ready_best(void);
 void ready_remove(struct kernel_task *task);
 void ready_enqueue(struct kernel_task *task, int head);
 void scheduler_account_runtime(void);
+void scheduler_account_runtime_locked(void);
+struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
+    struct kernel_task *previous, int ready_allowed);
+enum kernel_scheduler_status scheduler_switch_claimed(
+    struct kernel_task *previous, struct kernel_task *next);
+void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
+                              uint64_t now_ns);
 void scheduler_rearm_timer(void);
-enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
+/* IRQ关闭；CPU/current借用只覆盖决策，架构切换后不得继续使用缓存值。 */
+enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues);
 void ready_append(struct kernel_task *thread);
+int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
 void scheduler_forget_task(struct kernel_task *thread);
-struct kernel_task *ready_pop(void);
 void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
 void deadline_index_insert(struct kernel_task *task);
@@ -299,13 +391,19 @@ void process_complete_vfork(struct kernel_task *thread);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);
 enum kernel_scheduler_status validate_queues(void);
+/* Caller holds the scheduler domain; checks and selection observe one state. */
+enum kernel_scheduler_status validate_queues_locked(void);
 enum kernel_scheduler_status release_after_create_failure(
     uint64_t physical_address,
     enum kernel_scheduler_status original_status);
 enum kernel_scheduler_status validate_current(void);
+/* CPU obtained at this IRQ-off entry; never retain it across switch/sleep. */
+enum kernel_scheduler_status validate_current_on_cpu(struct kernel_cpu *cpu);
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task);
 void wake_waiting_parent(struct kernel_task *child);
+void stopped_append_locked(struct kernel_task *);
+void stopped_unlink_locked(struct kernel_task *);
 void stopped_append(struct kernel_task *thread);
 void stopped_unlink(struct kernel_task *thread);
 enum kernel_signal_status kernel_signal_release_table(

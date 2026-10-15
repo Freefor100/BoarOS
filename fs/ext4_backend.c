@@ -157,10 +157,26 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
                           void *buffer,
                           size_t size,
                           size_t *bytes_read);
-static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written);
+static int ext4_backend_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count);
 
 static struct kernel_vfs_backend ext4_backend;
+int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
+    const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
+{
+    if (!node || !node->instance || !node->mount ||
+        node->closed || node->retired || (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        node->instance->ops != &ext4_backend || node->mount->private_data != node->instance ||
+        !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
+    return 0;
+}
+int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
+    const struct kernel_heap *heap,const struct physical_page_allocator *allocator)
+{
+    if (kernel_ext4_check_io_domain(node,heap,allocator) ||
+        !__atomic_load_n(&node->mapping_state,__ATOMIC_ACQUIRE)) return -KERNEL_EINVAL;
+    return 0;
+}
 static void initialize_backend(void);
 static int mount_error(const struct lwext4_mount_adapter *adapter)
 {
@@ -196,6 +212,217 @@ static bool vfs_realtime(struct ext4_timestamp *now)
     now->seconds = (int64_t)(nanoseconds / UINT64_C(1000000000));
     now->nanoseconds = (uint32_t)(nanoseconds % UINT64_C(1000000000));
     return true;
+}
+
+/* Timestamp state is owned by the shared regular-file node. Service-context
+ * IRQ exclusion protects short publications; no backend lock or I/O is needed
+ * by ordinary read/write. Dirty and tentative lists each own one node pin. */
+static int time_compare(struct ext4_timestamp a, struct ext4_timestamp b)
+{
+    if (a.seconds != b.seconds) return a.seconds < b.seconds ? -1 : 1;
+    return (a.nanoseconds > b.nanoseconds) - (a.nanoseconds < b.nanoseconds);
+}
+
+static struct ext4_timestamp normalize_time(struct lwext4_node *node,
+                                            unsigned field, struct ext4_timestamp time)
+{
+    int extended = node->extra_times & (1U << field);
+    int64_t maximum = extended ? INT64_C(15032385535) : INT32_MAX;
+    if (time.seconds <= INT32_MIN) { time.seconds = INT32_MIN; time.nanoseconds = 0; }
+    if (time.seconds >= maximum) { time.seconds = maximum; time.nanoseconds = 0; }
+    if (!extended) time.nanoseconds = 0;
+    return time;
+}
+
+static void time_unlink_dirty(struct lwext4_node *node)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
+    *node->dirty_previous = node->dirty_next;
+    if (node->dirty_next) node->dirty_next->dirty_previous = node->dirty_previous;
+    else adapter->dirty_times_tail = node->dirty_previous;
+    node->dirty_previous = 0;
+    node->dirty_next = 0;
+    if (!adapter->dirty_times) adapter->times_deadline = 0;
+}
+
+static void time_append_dirty(struct lwext4_node *node)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
+    if (!adapter->dirty_times_tail) adapter->dirty_times_tail = &adapter->dirty_times;
+    node->dirty_previous = adapter->dirty_times_tail;
+    *adapter->dirty_times_tail = node;
+    adapter->dirty_times_tail = &node->dirty_next;
+}
+
+static void time_drop_dirty(struct lwext4_node *node)
+{
+    if (node->dirty_fields || !node->dirty_previous) return;
+    time_unlink_dirty(node);
+    struct kernel_vfs_node *pin = &node->node;
+    if (kernel_vfs_node_release(&pin)) __builtin_trap();
+}
+
+static void time_dirty(struct lwext4_node *node, unsigned fields,
+                        struct ext4_timestamp now)
+{
+    kernel_assert_service_context();
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
+    uintptr_t irq = arch_interrupt_save();
+    for (unsigned i = 0; i < 3; i++) if (fields & (1U << i)) {
+        struct ext4_timestamp value = normalize_time(node, i, now);
+        if (!time_compare(node->times[i], value)) continue;
+        node->times[i] = value;
+        if (!++node->time_version[i]) __builtin_trap();
+        node->dirty_fields |= 1U << i;
+    }
+    if (node->dirty_fields && !node->dirty_previous) {
+        if (kernel_vfs_node_acquire(&node->node)) __builtin_trap();
+        time_append_dirty(node);
+        if (!adapter->times_deadline) {
+            adapter->times_deadline = kernel_time_monotonic_ns() + UINT64_C(100000000);
+            if (adapter->journal_started) {
+                adapter->journal_requested = 1;
+                (void)kernel_wait_queue_wake_all(&adapter->journal_work);
+            }
+        }
+    }
+    arch_interrupt_restore(irq);
+}
+
+static void time_stage(void *context, uint32_t inode, unsigned field,
+                       struct ext4_timestamp value)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    uintptr_t irq = arch_interrupt_save();
+    for (struct kernel_vfs_node *base = adapter->instance.nodes; base; base = base->next) {
+        if (base->inode != inode || base->retired ||
+            (base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) continue;
+        struct lwext4_node *node = (struct lwext4_node *)base;
+        if (!node->staged_fields) {
+            if (kernel_vfs_node_acquire(base)) __builtin_trap();
+            node->staged_next = adapter->staged_times;
+            adapter->staged_times = node;
+        }
+        node->staged[field] = value;
+        node->staged_version[field] = node->time_version[field];
+        node->staged_fields |= 1U << field;
+        break;
+    }
+    arch_interrupt_restore(irq);
+}
+
+static void time_finish(void *context, bool accepted)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    uintptr_t irq = arch_interrupt_save();
+    while (adapter->staged_times) {
+        struct lwext4_node *node = adapter->staged_times;
+        adapter->staged_times = node->staged_next;
+        for (unsigned i = 0; i < 3; i++) {
+            if (!accepted || !(node->staged_fields & (1U << i)) ||
+                node->staged_version[i] != node->time_version[i]) continue;
+            node->times[i] = node->staged[i];
+            if (!++node->time_version[i]) __builtin_trap();
+            node->dirty_fields &= ~(1U << i);
+        }
+        node->staged_fields = 0;
+        node->staged_next = 0;
+        time_drop_dirty(node);
+        struct kernel_vfs_node *pin = &node->node;
+        if (kernel_vfs_node_release(&pin)) __builtin_trap();
+    }
+    arch_interrupt_restore(irq);
+}
+
+static unsigned ext4_backend_pending_times(struct kernel_vfs_node *base,
+                                            struct ext4_timestamp times[3])
+{
+    kernel_assert_service_context();
+    struct lwext4_node *node = (struct lwext4_node *)base;
+    uintptr_t irq = arch_interrupt_save();
+    memcpy(times, node->times, sizeof(node->times));
+    unsigned fields = node->dirty_fields;
+    arch_interrupt_restore(irq);
+    return fields;
+}
+
+static void ext4_backend_finish_times(struct kernel_vfs_node *base, unsigned fields,
+                                      const struct ext4_timestamp times[3], int result)
+{
+    if (result) return;
+    struct lwext4_node *node = (struct lwext4_node *)base;
+    uintptr_t irq = arch_interrupt_save();
+    for (unsigned i = 0; i < 3; i++)
+        if ((fields & (1U << i)) && !time_compare(node->times[i], times[i]))
+            node->dirty_fields &= ~(1U << i);
+    time_drop_dirty(node);
+    arch_interrupt_restore(irq);
+}
+
+static unsigned time_snapshot(void *owner, struct ext4_timestamp times[3])
+{ return owner ? ext4_backend_pending_times(owner, times) : 0; }
+
+static void time_written(void *owner, unsigned fields,
+                          const struct ext4_timestamp times[3], int result)
+{ if (owner) ext4_backend_finish_times(owner, fields, times, result); }
+
+static int writeback_times(struct kernel_vfs_node *node, bool wait)
+{ return ext4_file_writeback_times(lwext4_node_file(node), wait); }
+
+static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait)
+{
+    uintptr_t irq = arch_interrupt_save();
+    size_t count = 0;
+    for (struct lwext4_node *node = adapter->dirty_times; node; node = node->dirty_next) count++;
+    arch_interrupt_restore(irq);
+    int result = EOK;
+    while (count--) {
+        irq = arch_interrupt_save();
+        struct kernel_vfs_node *node = adapter->dirty_times ? &adapter->dirty_times->node : 0;
+        if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
+        arch_interrupt_restore(irq);
+        if (!node) break;
+        result = writeback_times(node, wait);
+        irq = arch_interrupt_save();
+        struct lwext4_node *current = (struct lwext4_node *)node;
+        /* Newer RAM updates keep their pin, but may not hide the other inodes
+         * that belonged to this bounded flush pass. New entries join the tail. */
+        if (!result && current->dirty_previous && adapter->dirty_times == current) {
+            time_unlink_dirty(current);
+            time_append_dirty(current);
+        }
+        arch_interrupt_restore(irq);
+        if (result && result != EAGAIN) kernel_vfs_record_writeback_error(node, lwext4_error(result));
+        if (kernel_vfs_node_release(&node)) __builtin_trap();
+        if (result) break;
+    }
+    irq = arch_interrupt_save();
+    adapter->times_deadline = adapter->dirty_times
+        ? kernel_time_monotonic_ns() + UINT64_C(100000000) : 0;
+    arch_interrupt_restore(irq);
+    return result;
+}
+
+static int load_times(struct kernel_vfs_node *base, struct lwext4_mount_adapter *adapter)
+{
+    if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) return EOK;
+    struct ext4_inode inode;
+    int result = ext4_fraw_inode_fill(lwext4_node_file(base), &inode);
+    if (result) return result;
+    struct lwext4_node *node = (struct lwext4_node *)base;
+    lwext4_node_file(base)->time_owner = base;
+    node->noatime = ext4_inode_has_flag(&inode, EXT4_INODE_FLAG_NOATIME);
+    size_t offsets[3] = {offsetof(struct ext4_inode, atime_extra),
+        offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
+    uint32_t seconds[3] = {inode.access_time, inode.modification_time, inode.change_inode_time};
+    uint32_t extra[3] = {inode.atime_extra, inode.mtime_extra, inode.ctime_extra};
+    for (unsigned i = 0; i < 3; i++) {
+        int extended = inode_extra_field_present(adapter->superblock, &inode, offsets[i], sizeof(uint32_t));
+        if (extended) node->extra_times |= 1U << i;
+        struct kernel_vfs_timespec value = decode_inode_time(seconds[i], extra[i], extended);
+        node->times[i] = (struct ext4_timestamp){value.seconds, value.nanoseconds};
+    }
+    return EOK;
 }
 
 static int lwext4_error(int error)
@@ -493,6 +720,8 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
                        ? -KERNEL_EBUSY : -KERNEL_EIO;
         }
     }
+    result = writeback_mount_times(adapter, true);
+    if (result != EOK) return lwext4_error(result);
     orphan_link = &adapter->orphans;
     while (*orphan_link != 0) {
         struct lwext4_orphan *orphan = *orphan_link;
@@ -542,8 +771,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         root->closed = 1U;
     }
     if (adapter->journal_started) {
-        result = ext4_journal_group_drain(adapter->mount_point);
-        if (result != EOK) return lwext4_error(result);
+        if (adapter->device.fs->jbd_journal) {
+            result = ext4_journal_group_drain(adapter->mount_point);
+            if (result != EOK) return lwext4_error(result);
+        }
         uintptr_t irq = arch_interrupt_save();
         adapter->journal_stopping = 1;
         (void)kernel_wait_queue_wake_all(&adapter->journal_work);
@@ -645,15 +876,24 @@ static void journal_worker(void *context)
         int stopping = adapter->journal_stopping;
         arch_interrupt_restore(irq);
         if (stopping) break;
-        int result = ext4_journal_group_service(adapter->mount_point, force);
+        int metadata = EOK;
+        if (adapter->times_deadline && kernel_time_monotonic_ns() >= adapter->times_deadline)
+            metadata = writeback_mount_times(adapter, false);
+        int result = EOK;
+        struct ext4_journal_progress progress = {0};
+        if (adapter->device.fs->jbd_journal) {
+            result = ext4_journal_group_service(adapter->mount_point, force || metadata == EAGAIN);
+            if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+        }
         irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
         arch_interrupt_restore(irq);
-        struct ext4_journal_progress progress;
-        if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
         uint64_t deadline = 0;
-        if (!result && (progress.ready || (progress.deadline_ns &&
-            kernel_time_deadline_from_monotonic(progress.deadline_ns, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
+        uint64_t due = progress.deadline_ns;
+        if (!result && adapter->times_deadline && (!due || adapter->times_deadline < due))
+            due = adapter->times_deadline;
+        if (!result && (progress.ready || (due &&
+            kernel_time_deadline_from_monotonic(due, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
         irq = arch_interrupt_save();
         if (!adapter->journal_requested && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
@@ -670,19 +910,23 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct lwext4_mount_adapter *adapter = mount->private_data;
     if (adapter->instance.backend_data != adapter || !adapter->mounted) return -KERNEL_EINVAL;
-    if (!adapter->device.fs->jbd_journal || adapter->instance.read_only) return 0;
+    if (adapter->instance.read_only) return 0;
     if (adapter->journal_started) return -KERNEL_EBUSY;
     kernel_wait_queue_init(&adapter->journal_work);
     kernel_wait_queue_init(&adapter->journal_progress);
-    uint64_t budget = physical_page_total(adapter->instance.page_cache->allocator) * BOAROS_PAGE_SIZE / 32;
-    if (budget > 4 * 1024 * 1024) budget = 4 * 1024 * 1024;
-    struct ext4_journal_runtime runtime = {adapter, journal_now, journal_request, journal_wait};
-    int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
-    if (result != EOK) return lwext4_error(result);
+    /* The same mount worker also owns timestamp-only writeback on writable
+     * filesystems without JBD; dirty inode pins need a consumer there too. */
+    if (adapter->device.fs->jbd_journal) {
+        uint64_t budget = physical_page_total(adapter->instance.page_cache->allocator) * BOAROS_PAGE_SIZE / 32;
+        if (budget > 4 * 1024 * 1024) budget = 4 * 1024 * 1024;
+        struct ext4_journal_runtime runtime = {adapter, journal_now, journal_request, journal_wait};
+        int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
+        if (result != EOK) return lwext4_error(result);
+    }
     enum kernel_scheduler_status status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         /* No operation could join while startup held this execution path. */
-        jbd_journal_group_fini(adapter->device.fs->jbd_journal);
+        if (adapter->device.fs->jbd_journal) jbd_journal_group_fini(adapter->device.fs->jbd_journal);
         return status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
     adapter->journal_started = 1;
@@ -797,6 +1041,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     heap->page_allocator->buffer_context = heap;
     result = ext4_mount_setup_locks(adapter->mount_point, &adapter->locks);
     if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
+    struct ext4_time_observer observer = {adapter, time_stage, time_finish, time_snapshot, time_written};
+    result = ext4_mount_setup_time_observer(adapter->mount_point, &observer);
+    if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
     result = ext4_mount_setup_clock(adapter->mount_point, vfs_realtime);
     if (result != EOK) {
         (void)cleanup_mount(mount);
@@ -825,6 +1072,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     }
 
     adapter->superblock = superblock;
+    adapter->instance.writeback_block_size = ext4_sb_get_block_size(superblock);
     mount->id = kernel_vfs_allocate_mount_id();
     mount->state = VFS_MOUNT_STATE_LIVE;
     return 0;
@@ -1014,7 +1262,7 @@ static int ext4_backend_set_times(struct kernel_vfs_file *file,
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
     struct ext4_timestamp now, values[3];
-    if (!vfs_realtime(&now)) return -KERNEL_EIO;
+    if (!ext4_file_read_clock(lwext4_node_file(node), &now)) return -KERNEL_EIO;
     unsigned fields = EXT4_TIME_CTIME;
     values[2] = now;
     for (unsigned i = 0; i < 2; i++) {
@@ -1136,6 +1384,15 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     node->max_size = lwext4_node_file(node)->fmax;
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode = mode;
+    result = load_times(node, adapter);
+    if (result) {
+        if (ext4_fclose(lwext4_node_file(node)) != EOK) {
+            node->instance = &adapter->instance;
+            node->next = adapter->instance.cleanup_nodes;
+            adapter->instance.cleanup_nodes = node;
+        } else (void)kernel_heap_release(adapter->instance.heap, node);
+        return lwext4_error(result);
+    }
     return kernel_vfs_publish_node(mount, node, file, 0);
 }
 
@@ -1195,22 +1452,37 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->max_size = lwext4_node_file(node)->fmax;
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode = (mode & 07777U) | KERNEL_VFS_S_IFREG;
+    result = load_times(node, adapter);
+    if (result) {
+        if (ext4_fclose(lwext4_node_file(node)) != EOK) {
+            node->instance = &adapter->instance;
+            node->next = adapter->instance.cleanup_nodes;
+            adapter->instance.cleanup_nodes = node;
+        } else (void)kernel_heap_release(adapter->instance.heap, node);
+        return lwext4_error(result);
+    }
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
 
 static void ext4_backend_accessed(struct kernel_vfs_file *file)
 {
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return;
-    struct kernel_vfs_node *node = file->private_data;
-    KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 0);
-    bool needed;
-    if (ext4_file_relatime_needed(lwext4_node_file(node), &needed) != EOK || !needed) return;
-    /* 共享查询后先释放资格；独占更新重查当前 inode，避免升级死锁。 */
-    kernel_lock_release(&node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 1);
-    /* Linux touch_atime does not change a read result on metadata failure. */
-    (void)ext4_file_touch(lwext4_node_file(node), EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
+    struct kernel_vfs_node *base = file->private_data;
+    if (base->instance->read_only || mount_error(lwext4_instance(base->instance))) return;
+    if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
+        (void)ext4_file_touch(lwext4_node_file(base), EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
+        return;
+    }
+    struct lwext4_node *node = (struct lwext4_node *)base;
+    if (node->noatime) return;
+    struct ext4_timestamp now;
+    if (!ext4_file_read_clock(lwext4_node_file(base), &now)) return;
+    uintptr_t irq = arch_interrupt_save();
+    if (time_compare(node->times[1], node->times[0]) >= 0 ||
+        time_compare(node->times[2], node->times[0]) >= 0 ||
+        now.seconds - node->times[0].seconds >= 86400)
+        time_dirty(node, EXT4_TIME_ATIME, now);
+    arch_interrupt_restore(irq);
 }
 
 static int ext4_backend_modified(struct kernel_vfs_file *file,
@@ -1227,8 +1499,12 @@ static int ext4_backend_modified(struct kernel_vfs_file *file,
     /* Linux generic/ext4 write checks reject the maximum position before
      * file_modified, even when the user buffer would fault. */
     if (offset >= node->max_size) return -KERNEL_EFBIG;
-    return lwext4_error(ext4_file_touch(lwext4_node_file(node),
-                                       EXT4_TIME_MTIME | EXT4_TIME_CTIME));
+    int result = mount_error(lwext4_instance(node->instance));
+    if (result) return lwext4_error(result);
+    struct ext4_timestamp now;
+    if (ext4_file_read_clock(lwext4_node_file(node), &now)) time_dirty((struct lwext4_node *)node,
+                                      EXT4_TIME_MTIME | EXT4_TIME_CTIME, now);
+    return 0;
 }
 
 static int ext4_backend_stat(const struct kernel_vfs_file *file,
@@ -1250,8 +1526,14 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
     if (result != EOK) return lwext4_error(result);
     fill_stat(file->mount, lwext4_instance(node->instance)->superblock,
               node->inode, &inode, stat);
-    if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG)
+    if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         stat->size = node->size;
+        struct ext4_timestamp times[3];
+        (void)ext4_backend_pending_times((struct kernel_vfs_node *)node, times);
+        stat->atime = (struct kernel_vfs_timespec){times[0].seconds, times[0].nanoseconds};
+        stat->mtime = (struct kernel_vfs_timespec){times[1].seconds, times[1].nanoseconds};
+        stat->ctime = (struct kernel_vfs_timespec){times[2].seconds, times[2].nanoseconds};
+    }
     return 0;
 }
 
@@ -1400,7 +1682,7 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
     int result;
 
     if (node == 0) return;
-    node->references++;
+    __atomic_fetch_add(&node->references,1,__ATOMIC_RELAXED);
     struct kernel_lock_guard guard = {0};
     kernel_vfs_node_lock(node, &guard, 1);
     if (!node->unlinked || node->retired) {
@@ -1418,6 +1700,10 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
     result = ext4_orphan_free(lwext4_instance(node->instance)->mount_point, node->inode);
     if (result == EOK) {
         node->retired = 1U;
+        uintptr_t irq = arch_interrupt_save();
+        ((struct lwext4_node *)node)->dirty_fields = 0;
+        time_drop_dirty((struct lwext4_node *)node);
+        arch_interrupt_restore(irq);
     }
 
 out:
@@ -1513,7 +1799,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     size_t result_count;
     int result;
 
-    if (node == 0 || node->references == 0U || node->closed ||
+    if (node == 0 || __atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == 0U || node->closed ||
         bytes_read == 0 || (buffer == 0 && size != 0U)) {
         return -KERNEL_EINVAL;
     }
@@ -1528,48 +1814,89 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     if ((uint64_t)requested > node->size - offset) {
         requested = (size_t)(node->size - offset);
     }
-    result = ext4_fpread(lwext4_node_file(node), offset, buffer, requested, &result_count);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    if (result_count > requested) {
-        return -KERNEL_EIO;
-    }
-    *bytes_read = result_count;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    adapter->locks.read_lock(adapter->locks.context);
+    uint64_t stored=ext4_fsize(lwext4_node_file(node));
+    if (stored>node->size) stored=node->size;
+    size_t prefix=offset>=stored?0:stored-offset<requested?(size_t)(stored-offset):requested;
+    result = ext4_fpread(lwext4_node_file(node), offset, buffer, prefix, &result_count);
+    adapter->locks.unlock(adapter->locks.context);
+    if (result != EOK) return lwext4_error(result);
+    if (result_count != prefix) return -KERNEL_EIO;
+    /* Cache-only growth has known zero holes beyond the accepted inode EOF. */
+    memset((unsigned char *)buffer+prefix,0,requested-prefix);
+    *bytes_read = requested;
     return 0;
 }
 
 static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     struct kernel_vfs_read_span *spans, size_t count)
 {
-    if (!node || !node->references || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
-    struct ext4_file_read_span batch[KERNEL_VFS_READ_BATCH_MAX];
+    if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
+    struct ext4_file_read_span local, *batch=&local;
+    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
+        for (size_t i=0;i<count;i++) { spans[i].completed=0; spans[i].error=-KERNEL_ENOMEM; }
+        return -KERNEL_ENOMEM;
+    }
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    adapter->locks.read_lock(adapter->locks.context);
+    uint64_t stored=ext4_fsize(lwext4_node_file(node));
+    if (stored>node->size) stored=node->size;
     for (size_t i = 0; i < count; i++) {
         size_t n = 0;
-        if (spans[i].offset < node->size) {
+        if (spans[i].offset < stored) {
             n = spans[i].size;
-            if (n > node->size - spans[i].offset) n = node->size - spans[i].offset;
+            if (n > stored - spans[i].offset) n = stored - spans[i].offset;
         }
-        batch[i] = (struct ext4_file_read_span){spans[i].offset, spans[i].buffer, n, 0, EIO};
+        /* 活跃node持有打开的file；lwext4在检查区段前初始化全部结果字段。 */
+        batch[i].offset = spans[i].offset;
+        batch[i].buffer = spans[i].buffer;
+        batch[i].size = n;
     }
     int result = ext4_fpread_batch(lwext4_node_file(node), batch, count);
+    adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++) {
         spans[i].error = lwext4_error(batch[i].error);
         spans[i].completed = batch[i].completed;
         if (spans[i].completed > batch[i].size) __builtin_trap();
+        if (!spans[i].error && spans[i].completed != batch[i].size) spans[i].error=-KERNEL_EIO;
+        if (!spans[i].error) {
+            size_t logical=spans[i].offset>=node->size?0:node->size-spans[i].offset<spans[i].size?
+                (size_t)(node->size-spans[i].offset):spans[i].size;
+            if (logical<spans[i].completed) __builtin_trap();
+            memset((unsigned char *)spans[i].buffer+spans[i].completed,0,logical-spans[i].completed);
+            spans[i].completed=logical;
+        }
     }
+    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
     return lwext4_error(result);
 }
 
-static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
-                              const void *buffer, size_t size, size_t *written)
+static int ext4_backend_writeback(struct kernel_vfs_node *node,
+    struct kernel_vfs_writeback_span *spans, size_t count)
 {
-    COST_ADD(BACKEND_REQUESTED, size);
-    *written = 0;
-    int result = ext4_fpwrite(lwext4_node_file(node), offset, buffer, size, written);
-    if (result == EOK && *written != size) result = EIO;
-    if (result != EOK) kernel_vfs_record_writeback_error(node, lwext4_error(result));
-    COST_ADD(BACKEND_ACCEPTED, *written);
+    if (count > KERNEL_VFS_WRITEBACK_MAX) __builtin_trap();
+    struct ext4_file_write_span local, *batch=&local;
+    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
+        for (size_t i=0;i<count;i++) spans[i].written=0;
+        return -KERNEL_ENOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+        COST_ADD(BACKEND_REQUESTED, spans[i].size);
+        batch[i] = (struct ext4_file_write_span){
+            .offset=spans[i].offset, .buffer=spans[i].buffer, .size=spans[i].size,
+            .source_buffer=spans[i].source_buffer, .source_size=spans[i].source_size,
+            .source={.context=spans[i].owner, .retain=spans[i].retain,
+                .release=spans[i].release, .bytes=spans[i].source_bytes}};
+    }
+    int result = ext4_fpwrite_batch(lwext4_node_file(node), batch, count);
+    for (size_t i = 0; i < count; i++) {
+        spans[i].written = batch[i].written;
+        if (!result && spans[i].written != spans[i].size) result = EIO;
+        COST_ADD(BACKEND_ACCEPTED, spans[i].written);
+    }
+    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
+    if (result) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     return lwext4_error(result);
 }
 
@@ -1606,7 +1933,8 @@ static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 static int ext4_backend_sync_metadata(struct kernel_vfs_node *node, int data_only)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
-    int result = ext4_file_sync_metadata_mode(lwext4_node_file(node), data_only != 0);
+    int result = writeback_times(node, true);
+    if (result == EOK) result = ext4_file_sync_metadata_mode(lwext4_node_file(node), data_only != 0);
     if (result == EOK && !adapter->device.fs->jbd_journal) result = block_flush(&adapter->device);
     return lwext4_error(result);
 }
@@ -1620,7 +1948,8 @@ static int ext4_backend_sync_filesystem(struct kernel_vfs_instance *instance,
                                         struct kernel_vfs_node *root)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
-    int result = ext4_file_sync_metadata_mode(lwext4_node_file(root), false);
+    int result = writeback_mount_times(adapter, true);
+    if (result == EOK) result = ext4_file_sync_metadata_mode(lwext4_node_file(root), false);
     if (result == EOK && !adapter->device.fs->jbd_journal) {
         result = ext4_cache_flush(adapter->mount_point);
         if (result == EOK) result = block_flush(&adapter->device);
