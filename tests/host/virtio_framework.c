@@ -72,6 +72,14 @@ int main(void)
         assert(done.head==(unsigned)i && done.token==&owners[i] && done.length==16);
     }
     assert(!q.inflight && virtio_split_take(&q,&done)==VIRTIO_EMPTY);
+    unsigned notified=m.notified;
+    assert(virtio_split_enqueue(&q,&t,0,&owners[0],0,16)==VIRTIO_OK);
+    assert(virtio_split_enqueue(&q,&t,1,&owners[1],0,16)==VIRTIO_OK);
+    assert(m.notified==notified && q.inflight==2);
+    assert(virtio_split_notify(&q,&t,0)==VIRTIO_OK && m.notified==notified+1);
+    complete(&q,1,16);complete(&q,0,16);
+    assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.token==&owners[1]);
+    assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.token==&owners[0]);
     for(unsigned i=0;i<65544;i++) {
         assert(virtio_split_publish(&q,&t,0,0,&owners[0],1,16)==VIRTIO_OK);
         complete(&q,0,16);assert(virtio_split_take(&q,&done)==VIRTIO_OK);

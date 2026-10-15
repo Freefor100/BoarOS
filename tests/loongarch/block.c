@@ -7,7 +7,7 @@
 #include <kernel/tick.h>
 #include <string.h>
 static struct virtio_pci_block devices[2];
-static unsigned char data[8][512] __attribute__((aligned(16)));
+static unsigned char data[8][528] __attribute__((aligned(16)));
 static volatile unsigned io_done,cpu_progress,io_masked;
 static uint64_t masked_irqs[2];
 void la_fault_injection_set(int);
@@ -22,7 +22,9 @@ static void io_worker(void *argument)
     masked_irqs[1]=devices[1].device.statistics.interrupts;io_masked=1;
     struct kernel_block_read_span spans[8];
     for(unsigned i=0;i<8;i++) spans[i]=(struct kernel_block_read_span){16384+i*512,data[i],512,0,KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
-    if(kernel_block_read_batch(&devices[0].device.block,spans,8)!=KERNEL_BLOCK_STATUS_OK) la_virt_fatal("PCI batch read");
+    uint64_t submitted=devices[0].device.statistics.requests;
+    if(kernel_block_read_batch(&devices[0].device.block,spans,8)!=KERNEL_BLOCK_STATUS_OK ||
+        devices[0].device.statistics.requests!=submitted+1) la_virt_fatal("PCI SG batch read");
     for(unsigned i=0;i<8;i++) for(unsigned j=0;j<512;j++)
         if(data[i][j]!=(i*512+j)%251) la_virt_fatal("PCI batch contents");
     uint64_t until=arch_time_read()+la_timer_frequency()/20;
@@ -99,7 +101,7 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
         if(reaped<2) arch_cpu_wait();
     }
     if(physical_page_available(allocator)!=prepared || !devices[0].device.statistics.interrupts ||
-        devices[0].device.statistics.runtime_polls || devices[0].device.statistics.max_inflight!=8)
+        devices[0].device.statistics.max_inflight!=1)
         la_virt_fatal("PCI IRQ and task owner");
     for(unsigned i=2;i;i--) {
         if(kernel_block_unregister(&devices[i-1].device.block) ||

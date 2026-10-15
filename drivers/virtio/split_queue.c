@@ -24,8 +24,8 @@ enum virtio_status virtio_split_initialize(struct virtio_split_queue *q,void *me
     memset((void *)q->used,0,6U+8U*size);
     return VIRTIO_OK;
 }
-enum virtio_status virtio_split_publish(struct virtio_split_queue *q,struct virtio_transport *t,
-    uint16_t queue,uint16_t head,void *token,uint32_t min_length,uint32_t max_length)
+enum virtio_status virtio_split_enqueue(struct virtio_split_queue *q,struct virtio_transport *t,
+    uint16_t head,void *token,uint32_t min_length,uint32_t max_length)
 {
     if(!q || !q->size || !t || !t->ops.write || !token || head>=q->size || min_length>max_length)return VIRTIO_INVALID;
     if(q->fault.reason || !t->started || t->quiescent ||
@@ -53,8 +53,20 @@ enum virtio_status virtio_split_publish(struct virtio_split_queue *q,struct virt
     q->available->ring[q->next_available%q->size]=head;
     /* 先发布owner与完整链，最后一次半字写推进设备可见idx。 */
     arch_dma_barrier();q->available->index=++q->next_available;
+    return VIRTIO_OK;
+}
+enum virtio_status virtio_split_notify(struct virtio_split_queue *q,struct virtio_transport *t,uint16_t queue)
+{
+    if(!q || !q->size || !t || !t->ops.write)return VIRTIO_INVALID;
+    if(q->fault.reason || q->transport!=t || !t->started || t->quiescent)return VIRTIO_STATE;
     arch_dma_barrier();t->ops.write(t->context,VIRTIO_REG_QUEUE_NOTIFY,queue);
     return VIRTIO_OK;
+}
+enum virtio_status virtio_split_publish(struct virtio_split_queue *q,struct virtio_transport *t,
+    uint16_t queue,uint16_t head,void *token,uint32_t min_length,uint32_t max_length)
+{
+    enum virtio_status status=virtio_split_enqueue(q,t,head,token,min_length,max_length);
+    return status==VIRTIO_OK ? virtio_split_notify(q,t,queue) : status;
 }
 static enum virtio_status fault(struct virtio_split_queue *q,enum virtio_queue_fault_reason reason,
     uint16_t observed,uint16_t count,uint32_t head,uint32_t length)

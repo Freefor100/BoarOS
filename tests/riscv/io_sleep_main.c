@@ -584,12 +584,13 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
     virt_uart_puts(" sleeps="); virt_uart_put_hex(stats->sleeps);
     virt_uart_puts(" wakes="); virt_uart_put_hex(stats->wakes);
     virt_uart_puts(" queue-waits="); virt_uart_put_hex(stats->queue_waits);
-    virt_uart_puts(" runtime-polls="); virt_uart_put_hex(stats->runtime_polls);
+#if BOAROS_COST_DIAGNOSTICS
     virt_uart_puts(" inflight-ticks="); virt_uart_put_hex(stats->inflight_ticks);
     virt_uart_puts(" busy-ticks="); virt_uart_put_hex(stats->busy_ticks);
     virt_uart_puts(" total-ticks="); virt_uart_put_hex(stats->total_ticks);
     virt_uart_puts(" wait-ticks="); virt_uart_put_hex(stats->queue_wait_ticks);
     virt_uart_puts(" service-ticks="); virt_uart_put_hex(stats->service_ticks);
+#endif
     virt_uart_putc('\n');
 }
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
@@ -845,7 +846,7 @@ static void test_batch(unsigned mode)
     unsigned requests = mode == 2 ? 16 : batch_fillers + 16;
     requests += device.block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK;
     check(batch_done == batch_fillers + 4 && device.statistics.requests - before == requests &&
-          !device.active && !device.inflight && !device.barrier, 282);
+          !device.active && !device.queue.inflight && !device.barrier, 282);
     struct riscv_virtio_mmio_block_statistics stats;
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     print_counters(mode == 0 ? "batch" : mode == 1 ? "batch-partial" : "batch-error", &stats);
@@ -897,7 +898,7 @@ static void batch_reader_owner_probe(void *unused)
     check(kernel_scheduler_wake_signal(read_batch_task) == KERNEL_SCHEDULER_STATUS_OK &&
         read_batch_task->state == KERNEL_THREAD_STATE_BLOCKED && !read_batch_finished, 344);
     virt_uart_puts("I/O handshake: read-batch-pending\n");
-    while (device.inflight != 1 || read_batch_task->state != KERNEL_THREAD_STATE_BLOCKED) {
+    while (device.queue.inflight != 1 || read_batch_task->state != KERNEL_THREAD_STATE_BLOCKED) {
         check(!read_batch_finished && kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 345);
         riscv_interrupt_restore(RISCV_SSTATUS_SIE); (void)riscv_interrupt_save();
     }
@@ -924,9 +925,11 @@ static void test_read_batch(unsigned filesystem)
         riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
     }
     (void)riscv_interrupt_save();
-    check(read_batch_finished && device.statistics.requests - before == 8 && !device.inflight && !device.active, 350);
+    check(read_batch_finished && device.statistics.requests - before == (filesystem ? 1U : 8U) &&
+        !device.queue.inflight && !device.active, 350);
     if (filesystem) check(kernel_vfs_close(&read_batch_file) == 0, 355);
-    virt_uart_puts("I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner\n");
+    virt_uart_puts(filesystem ? "I/O file SG read passed: eight pages, held DMA and cancellation owner\n" :
+        "I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner\n");
 }
 
 static void timeout_worker(void *argument)
@@ -1398,8 +1401,10 @@ void kernel_main(unsigned long hart, const void *dtb)
     (void)riscv_interrupt_save();
     struct riscv_virtio_mmio_block_statistics stats;
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
-    check(cold_done == 2 && progress_done && stats.max_inflight >= 2 && stats.sleeps >= 2 && !stats.runtime_polls, 46);
+    check(cold_done == 2 && progress_done && stats.max_inflight >= 2 && stats.sleeps >= 2, 46);
+#if BOAROS_COST_DIAGNOSTICS
     struct riscv_virtio_mmio_block_statistics queue_before = stats;
+#endif
     virt_uart_puts("I/O handshake: queue\n");
     while (!virt_uart_rx_ready()) { }
     check(virt_uart_getc() == 'g', 53);
@@ -1418,6 +1423,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     /* 队列场景持握 8 个请求：时间加权在途深度必须显著高于 1，
      * 等待与设备服务时间必须真实累计，忙时不超过总span。 */
     print_counters("queue", &stats);
+#if BOAROS_COST_DIAGNOSTICS
     uint64_t queue_busy = stats.busy_ticks - queue_before.busy_ticks;
     uint64_t queue_weighted = stats.inflight_ticks - queue_before.inflight_ticks;
     uint64_t queue_waited = stats.queue_wait_ticks - queue_before.queue_wait_ticks;
@@ -1431,6 +1437,7 @@ void kernel_main(unsigned long hart, const void *dtb)
           queue_weighted <= stats.max_inflight * queue_busy && queue_waited > 0 &&
           stats.service_ticks > queue_before.service_ticks &&
           stats.total_ticks >= stats.busy_ticks, 270);
+#endif
     for (unsigned mode = 0; mode < 3; mode++) test_batch(mode);
     test_read_batch(0);
     test_read_batch(1);
@@ -1501,7 +1508,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     (void)riscv_interrupt_save();
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     print_counters("timeout", &stats);
-    check(timed_out == 5 && stats.timeouts == 1 && !stats.runtime_polls &&
+    check(timed_out == 5 && stats.timeouts == 1 &&
           riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           physical_page_available(&allocator) == baseline, 67);
 #if BOAROS_COST_DIAGNOSTICS

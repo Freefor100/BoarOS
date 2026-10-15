@@ -20,7 +20,7 @@ root = Path(__file__).resolve().parents[1]
 if args.held and (0 in args.pages or args.block_size != [4096]): parser.error('--held requires --pages >0 --block-size 4096')
 
 def held_run(command, disk, work, pages):
-    """Release no READ until the entire window exists, then keep one DMA held."""
+    """Keep the contiguous window's SG request held until all owners wait."""
     subprocess.run(['make', 'build/host/nbd-fault'], cwd=root, check=True, stdout=subprocess.DEVNULL)
     address = work / 'nbd.sock'
     server = subprocess.Popen([str(root/'build/host/nbd-fault'), str(disk), str(address), '--control-stdin'],
@@ -60,13 +60,13 @@ def held_run(command, disk, work, pages):
                         fields=dict(item.split(b'=') for item in line.split())
                         if int(fields[b'command'],0)!=0: raise RuntimeError('unexpected held command '+line.decode())
                         held.append(int(fields[b'held'],0))
-                        if len(held)>pages: raise RuntimeError('prefetch exceeded window')
+                        if len(held)>1 or int(fields[b'size'],0)!=pages*4096:
+                            raise RuntimeError('prefetch did not submit the contiguous window as one SG request')
                     elif label=='guest' and line==b'readahead: pending': consumer=True
                     elif label=='guest' and line==b'readahead: held-owner':
-                        if not released or len(held)!=pages: raise RuntimeError('missing held prefix')
+                        if not released or len(held)!=1: raise RuntimeError('missing held SG request')
                         server.stdin.write(f'release {held[0]}\ndrain\n'.encode());verified=True
-                    if len(held)==pages and consumer and not released:
-                        for identity in reversed(held[1:]): server.stdin.write(f'release {identity}\n'.encode())
+                    if len(held)==1 and consumer and not released:
                         released=True;guest.stdin.write(b'q')
         if not guest_eof or not verified: raise RuntimeError(f'held read deadline: reads={len(held)} consumer={consumer} owner={verified}')
         return subprocess.CompletedProcess(command,guest.wait(timeout=5),logs['guest'].decode(errors='replace'),'')

@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_VIRTIO_BLOCK_H
 
 #include <kernel/block.h>
+#include <kernel/cost.h>
 #include <kernel/virtio_split_queue.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
@@ -32,8 +33,8 @@ struct virtio_block_statistics {
     uint64_t timeouts;
     uint64_t io_errors;
     uint64_t flush_requests;
-    uint64_t interrupts, sleeps, wakes, queue_waits, runtime_polls, max_inflight;
-    /* 时间加权在途深度（Σ深度·tick）、忙时、总span、等待与设备服务时间。 */
+    uint64_t interrupts, sleeps, wakes, queue_waits, max_inflight;
+    /* BOAROS_COST_DIAGNOSTICS下累计时间；普通构建保持零。 */
     uint64_t inflight_ticks, busy_ticks, total_ticks, queue_wait_ticks, service_ticks;
 };
 
@@ -51,8 +52,10 @@ struct virtio_block_device {
     uint32_t queue_allocation_order;
     uint32_t state;
     uint32_t read_only;
-    uint32_t irq_source, active, inflight, barrier_waiters, barrier;
+    uint32_t irq_source, active, barrier_waiters, barrier;
+#if BOAROS_COST_DIAGNOSTICS
     uint64_t statistics_start, statistics_last;
+#endif
     struct kernel_wait_queue available;
     struct virtio_block_statistics statistics;
 };

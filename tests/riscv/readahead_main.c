@@ -92,7 +92,7 @@ static void held_observer(void *unused)
     virt_uart_puts("readahead: pending\n");
     while(!virt_uart_rx_ready())yield();
     check(virt_uart_getc()=='q',55);
-    while(device.inflight!=1 || producer_task->state!=KERNEL_THREAD_STATE_BLOCKED) {
+    while(device.queue.inflight!=1 || producer_task->state!=KERNEL_THREAD_STATE_BLOCKED) {
         check(!demand_finished,56);yield();
     }
     check(!demand_finished && producer_task->state==KERNEL_THREAD_STATE_BLOCKED &&
@@ -129,7 +129,7 @@ static void exercise(void *unused)
     stopping_task=kernel_task_current();
     kernel_page_cache_stop_worker(&cache);
     kernel_thread_join(&demand_join);kernel_thread_join(&observer_join);
-    check(owner_checked && demand_finished && !device.inflight && !device.active,58);
+    check(owner_checked && demand_finished && !device.queue.inflight && !device.active,58);
     check(kernel_page_cache_start_worker(&cache)==0,59);
 #endif
     uint64_t deadline=riscv_time_read()+timebase*2;

@@ -42,6 +42,11 @@ enum virtio_status virtio_split_initialize(struct virtio_split_queue *,void *,si
     uint16_t,uint32_t,uint32_t);
 enum virtio_status virtio_split_publish(struct virtio_split_queue *,struct virtio_transport *,
     uint16_t,uint16_t,void *,uint32_t,uint32_t);
+/* Enqueue publishes one complete chain. Notify once after the caller's wave;
+ * completion can already arrive between these operations. */
+enum virtio_status virtio_split_enqueue(struct virtio_split_queue *,struct virtio_transport *,
+    uint16_t,void *,uint32_t,uint32_t);
+enum virtio_status virtio_split_notify(struct virtio_split_queue *,struct virtio_transport *,uint16_t);
 enum virtio_status virtio_split_take(struct virtio_split_queue *,struct virtio_completion *);
 enum virtio_status virtio_split_reset(struct virtio_split_queue *,const struct virtio_transport *);
 #endif

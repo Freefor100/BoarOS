@@ -40,10 +40,10 @@ block包装层记录core owner是否已消费，根清理也纳入尚未构造co
 对齐，idx以单次半字读写。调用方用单CPU IRQ排他串行化发布、收割和reset；这不
 提供SMP锁。队列内存由设备核心分配，框架只借用，不分配或释放物理页。
 
-调用方只能构造空闲descriptor。`publish`检查NEXT链范围/循环、flags、DMA地址
+调用方只能构造空闲descriptor。`enqueue`检查NEXT链范围/循环、flags、DMA地址
 溢出、链间descriptor冲突及indirect协商/表地址长度边界；在推进available idx之前登记
 head/token/链mask和完成长度边界。token是业务owner的不透明身份，不被框架解引用。
-发布后设备对象、transport和队列地址必须保持稳定。
+发布后设备对象、transport和队列地址必须保持稳定。`notify` 在一轮 enqueue 后执行 DMA 屏障并通知队列；block 使用它合并通知，其他设备沿用一次 enqueue 后立即通知的 `publish`。设备可在 enqueue 后、notify 前完成，调用方不能把通知点当成 DMA 所有权的起点。
 
 `take`先读used idx并执行DMA屏障，检查ring容量、已发布head与长度边界。每次
 合法完成返回token并归还descriptor资格；它不释放业务buffer、RX loan、pbuf或
@@ -59,7 +59,7 @@ ring索引；另一个设备的reset确认不能代用。业务buffer继续属�
 
 block保留八个请求槽、预留/发布/完成/调用方消费状态、batch/RMW/flush、I/O
 context、等待、30秒期限和统计。legacy/modern ring布局和请求buffer布局保持，
-配置capacity经transport读取。读完成最多数据长度+status，写/flush完成只允许
+配置capacity经transport读取。请求槽不决定 descriptor head，连续磁盘 span 通过多个数据描述符组成 SG；同一轮多个请求只 notify 一次。读完成最多所有数据描述符总长度+status，写/flush完成只允许
 status长度；非法长度在reset前诊断为`used-length`，零长度仍为`used-element`。
 块路径仍限定固定QEMU同步reset：若不能确认，不能返回借用的调用方DMA，保留
 原fatal契约；随机/网络的持久业务owner另有显式错误与重试策略，不能由框架统一吞掉。
@@ -84,7 +84,7 @@ host验证feature/reset失败、三个adapter的访问宽度/notify/BAR、token�
 真实块门禁包含legacy/modern MMIO与modern PCI、readonly/batch/flush、LA共享INTx
 及两种RAM的页/堆/任务栈/BAR回收；真实可睡眠I/O门禁覆盖两种传输×两种缓存
 模式、暂扣响应时计算进展、八槽部分补发、错误排空、取消和超时reset。
-RV块IRQ smoke核对两个请求的内容、IRQ完成及无运行期轮询；若IRQ在调用方检查前
+RV块IRQ smoke核对两个请求的内容与IRQ完成；若IRQ在调用方检查前
 已完成，合法路径可以不睡眠。`test-io-sleep-riscv`另由host暂扣两个响应，确认
 真实任务已BLOCKED后才释放，并核对计算进展及至少两次睡眠，不能由smoke替代。
 真实PCI上的确认失败注入另验证初始化半成品、core消费后的BAR重试及根启动
