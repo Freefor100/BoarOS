@@ -206,7 +206,7 @@ enum kernel_open_file_status __real_kernel_open_file_release(
     struct kernel_open_file_description **owner);
 uint64_t __real_riscv_sv39_current_satp(void);
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __real_ext4_fpwrite_batch(ext4_file *, struct ext4_file_write_span *, unsigned);
+int __real_ext4_fpwrite_batch(ext4_file *, struct file_write_span *, unsigned);
 int __real_ext4_ftruncate(ext4_file *file, uint64_t size);
 #endif
 
@@ -226,7 +226,7 @@ enum kernel_open_file_status __wrap_kernel_open_file_release(
 }
 
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __wrap_ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *spans, unsigned count)
+int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
 {
     int result;
     if (!inject_partial_write_error) {
@@ -241,7 +241,7 @@ int __wrap_ext4_fpwrite_batch(ext4_file *file, struct ext4_file_write_span *span
     }
     inject_partial_write_error=0;
     if (!count || spans[0].size<5U) return __real_ext4_fpwrite_batch(file,spans,count);
-    struct ext4_file_write_span prefix=spans[0]; prefix.size=5;
+    struct file_write_span prefix=spans[0]; prefix.size=5;
     result=__real_ext4_fpwrite_batch(file,&prefix,1);
     for (unsigned i=0;i<count;i++) spans[i].written=0;
     spans[0].written=prefix.written;

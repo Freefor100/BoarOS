@@ -20,8 +20,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#define KERNEL_PIPE_ORDER 4U
-#define KERNEL_PIPE_NO_BUFFER UINT64_MAX
 #define PIPE_META(name, pipe) KERNEL_RAW_SCOPE(name, &(pipe)->metadata_lock)
 
 static uint64_t next_pipe_proc_identity = 1U;
@@ -68,6 +66,13 @@ int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid)
     return 0;
 }
 
+static void pipe_release_page(struct kernel_pipe *pipe,void *page)
+{
+    uint64_t physical;
+    if (!page || !pipe->heap->physical_address(page,&physical) ||
+        physical_page_release(pipe->allocator,physical)) __builtin_trap();
+}
+
 static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
 {
     if (pipe->read_queue.initialized) {
@@ -84,13 +89,7 @@ static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
         if (pipe->fifo_node->fifo_pipe != pipe) __builtin_trap();
         pipe->fifo_node->fifo_pipe = 0;
     }
-    if (pipe->buffer_physical != KERNEL_PIPE_NO_BUFFER) {
-        (void)physical_page_release_order(pipe->allocator,
-                                        pipe->buffer_physical,
-                                        KERNEL_PIPE_ORDER);
-        pipe->buffer_physical = KERNEL_PIPE_NO_BUFFER;
-        pipe->buffer = 0;
-    }
+    for (unsigned i=0;i<16;i++) if (pipe->pages[i]) pipe_release_page(pipe,pipe->pages[i]);
     (void)kernel_heap_release(pipe->heap, pipe);
     return KERNEL_PIPE_STATUS_OK;
 }
@@ -100,10 +99,7 @@ enum kernel_pipe_status kernel_pipe_create(
     struct kernel_pipe **owner)
 {
     struct kernel_pipe *pipe;
-    uint64_t physical_address;
-    void *buffer;
     enum kernel_heap_status heap_status;
-    enum physical_page_status page_status;
 
     if (heap == 0 || owner == 0 || *owner != 0) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
@@ -122,31 +118,13 @@ enum kernel_pipe_status kernel_pipe_create(
     pipe->allocator = heap->page_allocator;
     pipe->mode = KERNEL_VFS_S_IFIFO | 0600U;
     pipe->atime = pipe->mtime = pipe->ctime = pipe_now();
-    pipe->buffer_physical = KERNEL_PIPE_NO_BUFFER;
-    page_status = physical_page_allocate_order(heap->page_allocator,
-                                               KERNEL_PIPE_ORDER,
-                                               &physical_address);
-    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        (void)pipe_destroy(pipe);
-        return page_status == PHYSICAL_PAGE_STATUS_EMPTY
-                   ? KERNEL_PIPE_STATUS_NO_MEMORY
-                   : KERNEL_PIPE_STATUS_STATE;
-    }
-    page_status = physical_page_resolve(heap->page_allocator,
-                                        physical_address,
-                                        &buffer);
-    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        pipe->buffer_physical = physical_address;
-        (void)pipe_destroy(pipe);
-        return KERNEL_PIPE_STATUS_STATE;
-    }
-    memset(buffer, 0, KERNEL_PIPE_CAPACITY);
-    pipe->buffer_physical = physical_address;
-    pipe->buffer = buffer;
+    pipe->read_slot=pipe->merge_slot=16;
     kernel_wait_queue_init(&pipe->read_queue);
     kernel_wait_queue_init(&pipe->write_queue);
     kernel_wait_queue_init(&pipe->both_queue);
-    kernel_mutex_init(&pipe->copy_lock, 15U, (uintptr_t)pipe);
+    /* read在前，只有同页合并时才按key顺序短暂等待write；writer不反向取read。 */
+    kernel_mutex_init(&pipe->read_lock,15U,(uintptr_t)&pipe->read_lock);
+    kernel_mutex_init(&pipe->write_lock,15U,(uintptr_t)&pipe->write_lock);
     uint64_t identity=__atomic_load_n(&next_pipe_proc_identity,__ATOMIC_RELAXED);
     for (;;) {
         if (!identity || identity==UINT64_MAX) __builtin_trap();
@@ -186,7 +164,7 @@ int kernel_pipe_enable_concurrency(struct kernel_pipe *pipe,uint32_t owners,
 }
 enum kernel_pipe_status kernel_pipe_acquire_endpoint(struct kernel_pipe *pipe,uint32_t endpoint)
 {
-    if (!pipe || !pipe->heap || !pipe->buffer || endpoint<1 || endpoint>3)
+    if (!pipe || !pipe->heap || !pipe->allocator || endpoint<1 || endpoint>3)
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     uintptr_t irq=arch_interrupt_save();
     {
@@ -323,19 +301,22 @@ static uint16_t next_slot(uint16_t slot)
                       (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
 }
 
-static void pipe_consume(struct kernel_pipe *pipe, uint64_t count)
+static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count)
 {
     uint16_t slot = pipe->head;
-
+    void *page=0;
+    if (pipe->merge_slot==slot) __builtin_trap();
     pipe->page_offset[slot] += (uint16_t)count;
     pipe->page_length[slot] -= (uint16_t)count;
     pipe->bytes -= count;
     if (pipe->page_length[slot] == 0U) {
+        page=pipe->pages[slot];pipe->pages[slot]=0;
         pipe->page_offset[slot] = 0U;
         pipe->can_merge &= (uint16_t)~(1U << slot);
         pipe->head = next_slot(slot);
         pipe->slots--;
     }
+    return page;
 }
 
 static uint16_t pipe_tail_space(const struct kernel_pipe *pipe)
@@ -346,7 +327,7 @@ static uint16_t pipe_tail_space(const struct kernel_pipe *pipe)
     last = (uint16_t)((pipe->tail +
                        KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE - 1U) %
                       (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
-    if (!(pipe->can_merge & (1U << last))) return 0U;
+    if (pipe->read_slot==last || !(pipe->can_merge & (1U << last))) return 0U;
     return (uint16_t)(BOAROS_PAGE_SIZE - pipe->page_offset[last] -
                       pipe->page_length[last]);
 }
@@ -364,7 +345,7 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
     const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,
     uint32_t flags,int64_t *result)
 {
-    if (!pipe || !mm || !result || !pipe->heap || !pipe->buffer)
+    if (!pipe || !mm || !result || !pipe->heap || !pipe->allocator)
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     if ((flags & 3)==1) { *result=-KERNEL_EBADF; return KERNEL_PIPE_STATUS_OK; }
     for (size_t i=0;i<iov_count;i++) if (kernel_user_range_check(iov[i].base,(size_t)iov[i].length)) {
@@ -372,7 +353,7 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
     }
     if (!count) { *result=0; return KERNEL_PIPE_STATUS_OK; }
     uintptr_t irq=arch_interrupt_save();
-    KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->copy_lock,&copy);
+    KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->read_lock,&copy);
     uint64_t requested;
     for (;;) {
         struct kernel_wait_token token={0};
@@ -396,27 +377,37 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
         status=pipe_park(&copy,&token,&reason);
         if (status) { arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
         if (reason==KERNEL_WAIT_SIGNALLED) { *result=-KERNEL_ERESTARTSYS; arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_OK; }
-        kernel_mutex_lock(&pipe->copy_lock,&copy);
+        kernel_mutex_lock(&pipe->read_lock,&copy);
     }
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     uint64_t committed=0; int fault=0;
     while (committed<requested) {
         uint16_t slot,offset; size_t chunk;
-        {
+        for (;;) {
             PIPE_META(guard,pipe);
+            if (pipe->merge_slot==pipe->head) {
+                kernel_raw_scope_release(&guard);
+                KERNEL_LOCK_SCOPE(writer);kernel_mutex_lock(&pipe->write_lock,&writer);
+                continue;
+            }
             slot=pipe->head; offset=pipe->page_offset[slot];
             if (!pipe->slots || !pipe->page_length[slot]) __builtin_trap();
             uint64_t length=requested-committed;
             chunk=length<pipe->page_length[slot] ? (size_t)length : pipe->page_length[slot];
+            pipe->read_slot=slot;
+            break;
         }
         size_t done=0;
         enum kernel_uaccess_status access=kernel_copy_to_user_iov(mm,&cursor,
-            pipe->buffer+(size_t)slot*BOAROS_PAGE_SIZE+offset,chunk,&done);
+            pipe->pages[slot]+offset,chunk,&done);
         if (access || done!=chunk) {
+            { PIPE_META(guard,pipe); pipe->read_slot=16; }
             if (access!=KERNEL_UACCESS_STATUS_FAULT) { kernel_lock_scope_release(&copy); arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
             fault=1; break;
         }
-        { PIPE_META(guard,pipe); pipe_consume(pipe,chunk); }
+        void *page;
+        { PIPE_META(guard,pipe);pipe->read_slot=16;page=pipe_consume(pipe,chunk); }
+        if (page) pipe_release_page(pipe,page);
         committed+=chunk;
     }
     if (committed) pipe_notify(pipe,0,1);
@@ -428,13 +419,13 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
     const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,uint32_t flags,
     struct kernel_pipe_result *result,const unsigned char *buffer)
 {
-    if (!pipe || (!mm && !buffer) || !result || !pipe->heap || !pipe->buffer)
+    if (!pipe || (!mm && !buffer) || !result || !pipe->heap || !pipe->allocator)
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     *result=(struct kernel_pipe_result){0};
     if (!(flags & 3)) { result->bytes=-KERNEL_EBADF; return KERNEL_PIPE_STATUS_OK; }
     if (!count) return KERNEL_PIPE_STATUS_OK;
     uintptr_t irq=arch_interrupt_save();
-    KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->copy_lock,&copy);
+    KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->write_lock,&copy);
     /* sendfile/splice来源始终占新片段，不能并入user write的尾片段。 */
     uint64_t total=0; uint16_t remainder=buffer ? 0 : (uint16_t)(count & BOAROS_PAGE_MASK);
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
@@ -466,6 +457,7 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                 offset=merging ? (uint16_t)(pipe->page_offset[slot]+pipe->page_length[slot]) : 0;
                 uint64_t rest=count-total;
                 chunk=merging ? remainder : rest<BOAROS_PAGE_SIZE ? (size_t)rest : BOAROS_PAGE_SIZE;
+                if (merging) pipe->merge_slot=slot;
             }
         }
         if (status) { kernel_lock_scope_release(&copy); arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
@@ -477,13 +469,33 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                 result->bytes=total ? (int64_t)total : -KERNEL_ERESTARTSYS;
                 arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_OK;
             }
-            kernel_mutex_lock(&pipe->copy_lock,&copy); continue;
+            kernel_mutex_lock(&pipe->write_lock,&copy); continue;
         }
-        unsigned char *destination=pipe->buffer+(size_t)slot*BOAROS_PAGE_SIZE+offset;
+        if (!pipe->pages[slot]) {
+            uint64_t physical;void *page;
+            enum physical_page_status allocated=physical_page_allocate(pipe->allocator,&physical);
+            if (allocated==PHYSICAL_PAGE_STATUS_EMPTY) {
+                result->bytes=total?(int64_t)total:-KERNEL_ENOMEM;
+                kernel_lock_scope_release(&copy);arch_interrupt_restore(irq);
+                return KERNEL_PIPE_STATUS_OK;
+            }
+            if (allocated || physical_page_resolve(pipe->allocator,physical,&page)) __builtin_trap();
+            /* 槽先拥有尚未发布的页；用户fault或最后端点释放都能找到它。 */
+            { PIPE_META(guard,pipe);pipe->pages[slot]=page; }
+        }
+        unsigned char *destination=pipe->pages[slot]+offset;
         size_t done=0; enum kernel_uaccess_status access=KERNEL_UACCESS_STATUS_OK;
         if (buffer) { memcpy(destination,buffer+total,chunk); done=chunk; }
         else access=kernel_copy_from_user_iov(mm,&cursor,destination,chunk,&done);
         if (access || done!=chunk) {
+            void *page=0;
+            { PIPE_META(guard,pipe);
+              pipe->merge_slot=16;
+              if (!merging) {
+                  page=pipe->pages[slot];pipe->pages[slot]=0;
+              }
+            }
+            if (page) pipe_release_page(pipe,page);
             kernel_lock_scope_release(&copy); arch_interrupt_restore(irq);
             if (access!=KERNEL_UACCESS_STATUS_FAULT) return KERNEL_PIPE_STATUS_STATE;
             result->bytes=total ? (int64_t)total : -KERNEL_EFAULT;
@@ -498,6 +510,7 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                 pipe->tail=next_slot(slot); pipe->slots++;
             }
             pipe->page_length[slot]+=(uint16_t)chunk; pipe->bytes+=chunk;
+            pipe->merge_slot=16;
         }
         total+=chunk;
         pipe_notify(pipe,1,0);

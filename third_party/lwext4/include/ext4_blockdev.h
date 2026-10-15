@@ -47,16 +47,7 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
-/* Immutable RAM supplied by a caller. Context identifies one stable owner;
- * callbacks and its entire retained allocation size stay fixed while borrowed.
- * A journal retains/charges that owner once across all blocks and transactions.
- * Empty sources have no callbacks and bytes=0. */
-struct ext4_data_source {
-	void *context;
-	void (*retain)(void *context);
-	void (*release)(void *context);
-	size_t bytes;
-};
+#include <common/file_io.h>
 
 #define EXT4_BLOCK_BATCH_MAX 32U
 #define EXT4_CACHED_READ_BATCH 1
@@ -70,6 +61,15 @@ struct ext4_block_span {
 	const void *data;
 	uint64_t block;
 	uint32_t count;
+};
+
+/* Physical byte ranges embedded in stable journal owners. The journal builds
+ * a disjoint phase before dropping its modification lock. */
+struct ext4_block_write {
+	uint64_t offset;
+	const void *data;
+	size_t size;
+	struct ext4_block_write *next;
 };
 
 struct ext4_blockdev_iface {
@@ -98,6 +98,8 @@ struct ext4_blockdev_iface {
 	/* Physical spans; borrows every payload until all published I/O stops. */
 	int (*bwrite_batch)(struct ext4_blockdev *bdev,
 		const struct ext4_block_span *spans, unsigned count);
+	int (*bwrite_phase)(struct ext4_blockdev *bdev,
+		const struct ext4_block_write *first);
 
 	/**@brief   Close device function.
 	 * @param   bdev block device.*/
@@ -198,6 +200,8 @@ int ext4_block_init(struct ext4_blockdev *bdev);
 
 /** Device persistence barrier; ENOTSUP if the backend has no contract. */
 int ext4_blockdev_flush(struct ext4_blockdev *bdev);
+int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
+	const struct ext4_block_write *first);
 /* Logical block spans, at most EXT4_BLOCK_BATCH_MAX non-overlapping ranges. */
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	const struct ext4_block_span *spans, unsigned count);

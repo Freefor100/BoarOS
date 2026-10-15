@@ -159,17 +159,18 @@ X(TIMER_TICKS, timer_ticks, ticks, 1)
 X(IRQ_OFF_TICKS, irq_off_ticks, ticks, 1)
 X(WAKE_TO_RUN, wake_to_run, ticks, 1)
 
-/* Ordered journal submit phases; all other device bytes remain unknown. */
+/* Journal I/O phases. Precommit body combines ordered data and log body;
+ * commit bytes remain in total device writes, outside the body counter. */
 X(DEVICE0_DATA_WRITE, device0_data_write, bytes, 0)
-X(DEVICE0_JOURNAL_WRITE, device0_journal_write, bytes, 0)
+X(DEVICE0_PRECOMMIT_BODY, device0_precommit_body, bytes, 0)
 X(DEVICE0_CHECKPOINT_WRITE, device0_checkpoint_write, bytes, 0)
 X(DEVICE0_JOURNAL_SB_WRITE, device0_journal_sb_write, bytes, 0)
 X(DEVICE1_DATA_WRITE, device1_data_write, bytes, 0)
-X(DEVICE1_JOURNAL_WRITE, device1_journal_write, bytes, 0)
+X(DEVICE1_PRECOMMIT_BODY, device1_precommit_body, bytes, 0)
 X(DEVICE1_CHECKPOINT_WRITE, device1_checkpoint_write, bytes, 0)
 X(DEVICE1_JOURNAL_SB_WRITE, device1_journal_sb_write, bytes, 0)
 X(DEVICE_OTHER_DATA_WRITE, device_other_data_write, bytes, 0)
-X(DEVICE_OTHER_JOURNAL_WRITE, device_other_journal_write, bytes, 0)
+X(DEVICE_OTHER_PRECOMMIT_BODY, device_other_precommit_body, bytes, 0)
 X(DEVICE_OTHER_CHECKPOINT_WRITE, device_other_checkpoint_write, bytes, 0)
 X(DEVICE_OTHER_JOURNAL_SB_WRITE, device_other_journal_sb_write, bytes, 0)
 X(JOURNAL_ACCEPTED, journal_accepted, operations, 0)

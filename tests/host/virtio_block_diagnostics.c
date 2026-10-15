@@ -26,12 +26,32 @@ static int injected, final_statistics;
 static unsigned batch_mode, batch_popped, batch_pushed;
 static int batch_is_write;
 static struct virtio_block_device *wait_irq_device;
-static unsigned char batch_output[32][8192];
-static unsigned char sg_disk[262144];
+static unsigned char batch_output[96][8192];
+static unsigned char sg_disk[1048576];
 static unsigned notifications, first_notify_heads, sg_max_segments, park_calls;
 static unsigned sg_fail_sector;
+static unsigned sg_max_bytes, ack_calls;
+static uint32_t (*underlying_ack)(void *);
+static void (*before_take)(void);
+static struct kernel_wait_queue *late_wait_queue;
+static struct kernel_wait_node late_waiter;
+static unsigned late_wakes;
+enum virtio_status __real_virtio_split_take(struct virtio_split_queue *, struct virtio_completion *);
+enum virtio_status __wrap_virtio_split_take(struct virtio_split_queue *queue, struct virtio_completion *completion)
+{
+    if (before_take) {
+        void (*hook)(void)=before_take;
+        before_take=NULL;
+        hook();
+    }
+    return __real_virtio_split_take(queue,completion);
+}
+static unsigned phase_hold, phase_held_head, phase_crossed_window;
+static unsigned char *phase_held_status;
 static void (*underlying_write)(void *, enum virtio_register, uint32_t);
 static void sg_device_step(void);
+static uint32_t observed_ack(void *context)
+{ ack_calls++; return underlying_ack(context); }
 
 static void observed_write(void *context, enum virtio_register reg, uint32_t value)
 {
@@ -89,6 +109,7 @@ static void sg_device_step(void)
         uint32_t type; uint64_t sector;
         memcpy(&type, header, 4); memcpy(&sector, header + 8, 8);
         assert(type == 0 || type == 1 || type == 4);
+        if (phase_hold && sector>=64) phase_crossed_window=1;
         uint64_t offset = sector * 512;
         unsigned bytes = 0;
         int error = sector == sg_fail_sector;
@@ -111,8 +132,19 @@ static void sg_device_step(void)
         }
         assert(d[at].flags == 2 && d[at].length == 1);
         if (segments > sg_max_segments) sg_max_segments = segments;
+        if (bytes>sg_max_bytes) sg_max_bytes=bytes;
+        if (phase_hold && !sector) {
+            phase_held_head=head;
+            phase_held_status=physical_pointer(d[at].address,1);
+            continue;
+        }
         *(unsigned char *)physical_pointer(d[at].address, 1) = error ? 1 : 0;
         done[batch_pushed++ % size] = (struct wire_completion){head, error || type != 0 ? 1 : bytes + 1};
+    }
+    if (phase_hold && phase_crossed_window && phase_held_status) {
+        *phase_held_status=0;
+        done[batch_pushed++ % size]=(struct wire_completion){phase_held_head,1};
+        phase_held_status=NULL;
     }
     used[1] = (uint16_t)batch_pushed;
     registers[0x60 / 4] = 1;
@@ -243,7 +275,13 @@ void kernel_proc_task_note_block_read(void) {}
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 { memset(queue, 0, sizeof(*queue)); }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
-{ assert(queue->head == NULL); return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    if (queue==late_wait_queue) {
+        assert(queue->head==&late_waiter && queue->tail==&late_waiter && late_waiter.queue==queue);
+        queue->head=queue->tail=NULL; late_waiter.queue=NULL; late_wakes++;
+    } else assert(queue->head == NULL);
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *queue,
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 {
@@ -376,6 +414,8 @@ static enum riscv_virtio_mmio_block_status initialize_model(
     if (result == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
         underlying_write = device->transport.ops.write;
         device->transport.ops.write = observed_write;
+        underlying_ack = device->transport.ops.ack_interrupt;
+        device->transport.ops.ack_interrupt = observed_ack;
     }
     return result;
 }
@@ -767,6 +807,115 @@ static void sg_128k_case(unsigned version, unsigned queue_size, int writing,
     assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
 }
 
+struct phase_entry { struct kernel_block_span span; struct phase_entry *next; };
+static int phase_next(const void **cursor, struct kernel_block_span *span)
+{
+    const struct phase_entry *entry=*cursor;
+    if (!entry) return 0;
+    *span=entry->span; *cursor=entry->next; return 1;
+}
+static void write_phase_case(unsigned version, int failing)
+{
+    struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=park_calls=0;
+    sg_fail_sector=failing?64:UINT32_MAX; diagnostic_length=0;
+    phase_hold=1; phase_crossed_window=0; phase_held_status=NULL;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    device.irq_source=1; wait_irq_device=&device;
+    struct phase_entry entries[80];
+    memset(sg_disk,0,sizeof(sg_disk));
+    for (unsigned i=0;i<80;i++) {
+        memset(batch_output[i],(unsigned char)(i+3),512);
+        entries[i]=(struct phase_entry){{i*1024,batch_output[i],512},i==79?NULL:&entries[i+1]};
+    }
+    /* A malformed final range must prevent publication of the valid prefix. */
+    entries[79].span.offset=sizeof(sg_disk);
+    assert(kernel_block_write_phase(&device.block,phase_next,entries)==KERNEL_BLOCK_STATUS_OUT_OF_RANGE && !device.statistics.requests);
+    entries[79].span.offset=79*1024;
+    enum kernel_block_status result=kernel_block_write_phase(&device.block,phase_next,entries);
+    assert(result==(failing?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK));
+    assert(phase_crossed_window && !phase_held_status);
+    assert(first_notify_heads==8 && device.statistics.max_inflight==8);
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    if (!failing) for (unsigned i=0;i<80;i++) for (unsigned j=0;j<512;j++)
+        assert(sg_disk[i*1024+j]==(unsigned char)(i+3));
+    else assert(device.statistics.requests<80);
+    phase_hold=0; device.irq_source=0; wait_irq_device=NULL;
+    printf("PASS journal phase transport=%u error=%d: 80 spans, later window enters while first DMA held, error drains owners\n",version,failing);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
+static void large_phase_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=sg_max_bytes=park_calls=0;
+    sg_fail_sector=UINT32_MAX; diagnostic_length=0;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    device.irq_source=1; wait_irq_device=&device;
+    unsigned char *bytes=(void *)batch_output;
+    for (unsigned i=0;i<512*1024;i++) bytes[i]=(unsigned char)(i*13+i/512);
+    struct phase_entry entry={{0,bytes,512*1024},NULL};
+    assert(kernel_block_write_phase(&device.block,phase_next,&entry)==KERNEL_BLOCK_STATUS_OK);
+    assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==4);
+    assert(device.statistics.max_inflight==4 && !memcmp(bytes,sg_disk,512*1024));
+    struct kernel_block_span public_span={0,bytes,512*1024};
+    assert(kernel_block_write_batch(&device.block,&public_span,1)==KERNEL_BLOCK_STATUS_OK);
+    assert(device.statistics.requests==8 && sg_max_bytes==128*1024);
+    unsigned before=ack_calls;
+    for (unsigned i=0;i<32;i++) collect_used(&device);
+    assert(ack_calls==before);
+    block_irq(&device);
+    assert(ack_calls==before+1); /* A real IRQ is acknowledged even with no used entry. */
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    device.irq_source=0; wait_irq_device=NULL;
+    printf("PASS large journal phase transport=%u: one 512KiB owner, four concurrent 128KiB requests, quiet poll and IRQ ack\n",version);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
+static void late_harvest_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=MANUAL_COMPLETION; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=0; sg_fail_sector=UINT32_MAX;
+    diagnostic_length=0; late_wakes=0;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(begin_call(&device,0));
+    struct block_request *requests[8];
+    for (unsigned i=0;i<8;i++) {
+        requests[i]=reserve_request(&device); assert(requests[i]);
+        requests[i]->completion=&device.available;
+        assert(publish_request(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
+            UINT64_C(0x82000000)+i*512,512,0)==KERNEL_BLOCK_STATUS_OK);
+    }
+    late_waiter=(struct kernel_wait_node){.queue=&device.available};
+    late_wait_queue=&device.available;
+    device.available.head=device.available.tail=&late_waiter;
+    assert(device.queue.used->index==device.queue.last_used);
+    /* This hook runs only on entry to the real queue take, after harvest's
+     * initial used-index snapshot. Eight completions become visible then. */
+    before_take=sg_device_step;
+    block_irq(&device);
+    assert(!before_take && late_wakes==1 && !late_waiter.queue && !device.available.head);
+    assert(!device.queue.inflight && device.statistics.wakes==1);
+    late_wait_queue=NULL;
+    for (unsigned i=0;i<8;i++) {
+        assert(wait_request(&device,requests[i])==KERNEL_BLOCK_STATUS_OK);
+        release_request(&device,requests[i]);
+    }
+    end_call(&device,0);
+    assert(!device.active && !device.queue.claimed);
+    printf("PASS late used harvest transport=%u: eight completions after empty snapshot wake the registered batch waiter once\n",version);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
 static void bad_segment_limits_case(unsigned version)
 {
     for (unsigned kind = 0; kind < 2; kind++) {
@@ -898,6 +1047,16 @@ static void fragmented_descriptors_case(unsigned version)
 
 int main(int argc, char **argv)
 {
+    if (argc==2 && !strcmp(argv[1],"late-harvest")) {
+        late_harvest_case(1); late_harvest_case(2); return 0;
+    }
+    if (argc==2 && !strcmp(argv[1],"large-phase")) {
+        large_phase_case(1); large_phase_case(2); return 0;
+    }
+    if (argc==2 && !strcmp(argv[1],"write-phase")) {
+        for (unsigned version=1;version<=2;version++) for (int failing=0;failing<=1;failing++) write_phase_case(version,failing);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "sg-128k")) {
         for (unsigned version = 1; version <= 2; version++) for (int writing = 0; writing <= 1; writing++) {
             bad_segment_limits_case(version);
@@ -950,6 +1109,10 @@ int main(int argc, char **argv)
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
+        late_harvest_case(version);
+        large_phase_case(version);
+        write_phase_case(version,0);
+        write_phase_case(version,1);
         bad_segment_limits_case(version);
         workspace_pool_case(version);
         for (int writing = 0; writing <= 1; writing++) {

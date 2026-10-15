@@ -1,5 +1,6 @@
 #include "vfs_objects.h"
 #include "write_source.h"
+#include <misc/tree.h>
 
 #include <kernel/cost.h>
 #include <kernel/heap.h>
@@ -32,12 +33,11 @@ struct kernel_page_cache_entry {
     struct kernel_page_cache_entry *lru_previous;
     struct kernel_page_cache_entry *lru_next;
     struct kernel_page_cache_entry *cleanup_next;
-    struct kernel_page_cache_entry *dirty_next;
-    struct kernel_page_cache_entry **dirty_previous;
+    RB_ENTRY(kernel_page_cache_entry) dirty_link;
+    uint8_t dirty_indexed;
     struct kernel_page_cache_entry *node_next;
     struct kernel_page_cache_entry **node_previous;
     struct kernel_page_cache *cache;
-    uint64_t worker_epoch;
     struct kernel_vfs_node *node;
     uint64_t page_index;
     uint64_t physical_address;
@@ -96,11 +96,11 @@ struct kernel_page_cache_record {
     unsigned int writeback_active;
     uint64_t dirty_pages;
     struct kernel_page_cache_dirty *dirty_head, *dirty_tail, *dirty_cursor;
-    uint64_t dirty_remaining;
+    uint64_t dirty_remaining, dirty_scan_index;
     struct kernel_thread_join worker;
     struct kernel_wait_queue work, progress;
     uint64_t low, high, dirty_high, dirty_low;
-    uint64_t epoch, completed;
+    uint64_t completed;
     uint64_t requested;
     int started, stopping;
     struct cache_version *snapshots[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
@@ -115,6 +115,17 @@ struct kernel_page_cache_record {
 #endif
 
 };
+
+static int dirty_compare(struct kernel_page_cache_entry *a,struct kernel_page_cache_entry *b)
+{
+    return a->page_index<b->page_index?-1:a->page_index>b->page_index;
+}
+RB_GENERATE_INTERNAL(kernel_page_cache_dirty_tree,kernel_page_cache_entry,dirty_link,dirty_compare,static inline)
+static struct kernel_page_cache_entry *dirty_at_or_after(struct kernel_vfs_node *node,uint64_t index)
+{
+    struct kernel_page_cache_entry key={.page_index=index};
+    return RB_NFIND(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,&key);
+}
 
 /* caller的等待现场持有节点及file借用，DONE之前不得退栈；worker只借用。
  * 请求发布不等于缓存页loading发布，后者须在CPU0取得inode保护后完成。 */
@@ -493,89 +504,78 @@ static int drain_entries(struct kernel_page_cache *cache,
     return !failed;
 }
 
-/* 脏页本身持有 node；队列只借用它，不额外延长 inode 或页面生命期。 */
+/* The inode queue borrows its dirty entries. One offset tree replaces the
+ * dirty chain, so foreground and background select the same ordered windows. */
 static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size_t end)
 {
-    if (begin >= end || end > BOAROS_PAGE_SIZE) __builtin_trap();
-    struct kernel_page_cache_record *r = entry->cache->record;
+    if (begin>=end || end>BOAROS_PAGE_SIZE) __builtin_trap();
+    struct kernel_page_cache_record *r=entry->cache->record;
     if (!entry->dirty_end) {
-        struct kernel_page_cache_dirty *dirty = kernel_vfs_node_dirty_pages(entry->node);
-        if (entry->dirty_previous) __builtin_trap();
+        struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(entry->node);
+        if (entry->dirty_indexed) __builtin_trap();
         if (!dirty->count) {
-            if (dirty->head || dirty->tail || dirty->queue_next || dirty->queue_previous) __builtin_trap();
-            dirty->tail = &dirty->head;
-            dirty->queue_previous = r->dirty_tail;
-            if (r->dirty_tail) r->dirty_tail->queue_next = dirty; else r->dirty_head = dirty;
-            r->dirty_tail = dirty;
+            if (!RB_EMPTY(&dirty->tree) || dirty->queue_next || dirty->queue_previous) __builtin_trap();
+            dirty->queue_previous=r->dirty_tail;
+            if (r->dirty_tail) r->dirty_tail->queue_next=dirty; else r->dirty_head=dirty;
+            r->dirty_tail=dirty;
         }
-        entry->dirty_next = NULL; entry->dirty_previous = dirty->tail;
-        *dirty->tail = entry; dirty->tail = &entry->dirty_next; dirty->count++;
-        r->dirty_pages++;
-        entry->dirty_begin = begin;
-    } else if (begin < entry->dirty_begin) entry->dirty_begin = begin;
-    if (end > entry->dirty_end) entry->dirty_end = end;
+        if (RB_INSERT(kernel_page_cache_dirty_tree,&dirty->tree,entry)) __builtin_trap();
+        entry->dirty_indexed=1;dirty->count++;r->dirty_pages++;
+        entry->dirty_begin=begin;
+    } else if (begin<entry->dirty_begin) entry->dirty_begin=begin;
+    if (end>entry->dirty_end) entry->dirty_end=end;
     entry->generation++;
     if (r->controlled && r->started && !r->stopping && r->force_writeback) {
-        r->requested = 1; cache_wake(&r->work);
+        r->requested=1;cache_wake(&r->work);
     }
 }
 static void dirty_clear(struct kernel_page_cache_entry *entry)
 {
-    if (!entry->dirty_previous) {
+    if (!entry->dirty_indexed) {
         if (entry->dirty_end) __builtin_trap();
         return;
     }
-    struct kernel_page_cache_record *r = entry->cache->record;
-    struct kernel_page_cache_dirty *dirty = kernel_vfs_node_dirty_pages(entry->node);
+    struct kernel_page_cache_record *r=entry->cache->record;
+    struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(entry->node);
     if (!dirty->count || !r->dirty_pages) __builtin_trap();
-    *entry->dirty_previous = entry->dirty_next;
-    if (entry->dirty_next) entry->dirty_next->dirty_previous = entry->dirty_previous;
-    else dirty->tail = entry->dirty_previous;
-    entry->dirty_next = NULL; entry->dirty_previous = NULL;
-    dirty->count--; r->dirty_pages--;
+    if (RB_REMOVE(kernel_page_cache_dirty_tree,&dirty->tree,entry)!=entry) __builtin_trap();
+    entry->dirty_indexed=0;dirty->count--;r->dirty_pages--;
     if (!dirty->count) {
-        /* cursor 只保存在 record；最后一项移除后不能跨 I/O 留下已释放的 inode。 */
-        if (r->dirty_cursor == dirty) r->dirty_cursor = dirty->queue_next;
-        if (dirty->queue_previous) dirty->queue_previous->queue_next = dirty->queue_next;
-        else r->dirty_head = dirty->queue_next;
-        if (dirty->queue_next) dirty->queue_next->queue_previous = dirty->queue_previous;
-        else r->dirty_tail = dirty->queue_previous;
-        dirty->tail = NULL; dirty->queue_next = dirty->queue_previous = NULL;
+        if (!RB_EMPTY(&dirty->tree)) __builtin_trap();
+        if (r->dirty_cursor==dirty) {r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;}
+        if (dirty->queue_previous) dirty->queue_previous->queue_next=dirty->queue_next;
+        else r->dirty_head=dirty->queue_next;
+        if (dirty->queue_next) dirty->queue_next->queue_previous=dirty->queue_previous;
+        else r->dirty_tail=dirty->queue_previous;
+        dirty->queue_next=dirty->queue_previous=NULL;
     }
-    entry->dirty_begin = entry->dirty_end = 0;
-}
-
-/* 已访问项移至尾部，使每轮只看未访问前缀；失败项也只尝试一次。 */
-static void dirty_rotate(struct kernel_page_cache_dirty *dirty, struct kernel_page_cache_entry *entry)
-{
-    if (!entry->dirty_next) return;
-    *entry->dirty_previous = entry->dirty_next;
-    entry->dirty_next->dirty_previous = entry->dirty_previous;
-    entry->dirty_next = NULL; entry->dirty_previous = dirty->tail;
-    *dirty->tail = entry; dirty->tail = &entry->dirty_next;
+    entry->dirty_begin=entry->dirty_end=0;
 }
 static void dirty_round_begin(struct kernel_page_cache_record *r)
 {
     if (r->dirty_cursor && r->dirty_remaining) return;
-    if (!++r->epoch) __builtin_trap();
-    r->dirty_cursor = r->dirty_head; r->dirty_remaining = r->dirty_pages;
+    r->dirty_cursor=r->dirty_head;r->dirty_remaining=r->dirty_pages;r->dirty_scan_index=0;
 }
-static size_t dirty_batch(struct kernel_page_cache_record *r,
-    struct kernel_page_cache_entry **batch)
+static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_cache_entry **batch)
 {
-    size_t count = 0;
-    unsigned scanned = 0;
-    while (r->dirty_cursor && r->dirty_remaining && scanned < 64 &&
-        count < BOAROS_PAGE_CACHE_WRITEBACK_PAGES && count < r->snapshot_count) {
-        struct kernel_page_cache_dirty *dirty = r->dirty_cursor;
-        struct kernel_page_cache_entry *entry = dirty->head;
-        if (!entry || !dirty->count) __builtin_trap();
-        if (entry->worker_epoch == r->epoch) { r->dirty_cursor = dirty->queue_next; continue; }
-        if (count && entry->node != batch[0]->node) break;
-        dirty_rotate(dirty, entry); entry->worker_epoch = r->epoch;
-        r->dirty_remaining--; scanned++; r->statistics.worker_scanned++;
-        if (entry->loading || entry->writeback || (!r->controlled && entry->users)) continue;
-        batch[count++] = entry; entry_borrow(entry);
+    size_t count=0;unsigned scanned=0;
+    size_t capacity=r->snapshot_count<BOAROS_PAGE_CACHE_WRITEBACK_PAGES?r->snapshot_count:BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    while (r->dirty_cursor && r->dirty_remaining && scanned<64 && count<capacity) {
+        struct kernel_page_cache_dirty *dirty=r->dirty_cursor;
+        if (!dirty->count || RB_EMPTY(&dirty->tree)) __builtin_trap();
+        struct kernel_page_cache_entry key={.page_index=r->dirty_scan_index};
+        struct kernel_page_cache_entry *entry=RB_NFIND(kernel_page_cache_dirty_tree,&dirty->tree,&key);
+        if (!entry) {r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;continue;}
+        if (count && entry->node!=batch[0]->node) break;
+        while (entry && r->dirty_remaining && scanned<64 && count<capacity) {
+            r->dirty_scan_index=entry->page_index+1;
+            r->dirty_remaining--;scanned++;r->statistics.worker_scanned++;
+            if (!entry->loading && !entry->writeback && (r->controlled || !entry->users)) {
+                batch[count++]=entry;entry_borrow(entry);
+            }
+            entry=RB_NEXT(kernel_page_cache_dirty_tree,&dirty->tree,entry);
+        }
+        if (!entry) {r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;}
     }
     return count;
 }
@@ -1936,48 +1936,48 @@ static int complete_writeback(struct kernel_page_cache *cache,
     return result;
 }
 struct prepared_writeback {
-    struct kernel_page_cache_entry *entry;
     struct cache_version *version;
-    int closed;
-    size_t begin,end;
     uint64_t generation;
-    struct kernel_vfs_writeback_span *span;
+    uint32_t begin,end;
+    uint8_t closed,span_index;
 };
+_Static_assert(BOAROS_PAGE_SIZE <= UINT32_MAX && BOAROS_PAGE_CACHE_WRITEBACK_PAGES <= UINT8_MAX,
+    "writeback page offsets and span indices must fit their stored representation");
+_Static_assert(BOAROS_PAGE_CACHE_WRITEBACK_PAGES * (sizeof(struct prepared_writeback) +
+    sizeof(struct file_write_span) + sizeof(struct kernel_page_cache_entry *)) <= BOAROS_PAGE_SIZE,
+    "a complete writeback workspace must fit one physical page");
 
 struct writeback_workspace {
     struct prepared_writeback *prepared;
-    struct kernel_vfs_writeback_span *spans;
+    struct file_write_span *spans;
+    struct kernel_page_cache_entry **selected;
 };
 static int writeback_workspace_init(struct kernel_page_cache *cache,struct writeback_workspace *work)
 {
-    if (kernel_heap_allocate(cache->heap,BOAROS_PAGE_CACHE_WRITEBACK_PAGES*sizeof(*work->prepared),
-        (void **)&work->prepared)) return -KERNEL_ENOMEM;
-    if (kernel_heap_allocate(cache->heap,BOAROS_PAGE_CACHE_WRITEBACK_PAGES*sizeof(*work->spans),
-        (void **)&work->spans)) {
-        if (kernel_heap_release(cache->heap,work->prepared)) __builtin_trap();
-        work->prepared=NULL; return -KERNEL_ENOMEM;
-    }
+    size_t count=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    size_t bytes=count*(sizeof(*work->prepared)+sizeof(*work->spans)+sizeof(*work->selected));
+    if (kernel_heap_allocate(cache->heap,bytes,(void **)&work->prepared)) return -KERNEL_ENOMEM;
+    work->spans=(void *)(work->prepared+count);
+    work->selected=(void *)(work->spans+count);
     return 0;
 }
 static void writeback_workspace_release(struct kernel_page_cache *cache,struct writeback_workspace *work)
 {
-    if (kernel_heap_release(cache->heap,work->spans) ||
-        kernel_heap_release(cache->heap,work->prepared)) __builtin_trap();
+    if (kernel_heap_release(cache->heap,work->prepared)) __builtin_trap();
 }
 
 static void writeback_unprepare(struct kernel_page_cache *cache,
-    struct prepared_writeback *prepared,int error)
+    struct kernel_page_cache_entry *entry,struct prepared_writeback *prepared)
 {
     if (prepared->version) version_release(prepared->version);
+    prepared->version=NULL;
     { CACHE_SCOPE(guard,cache);
-      struct kernel_page_cache_entry *entry=prepared->entry;
       if (prepared->closed) {
           uint64_t previous=__atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
           if (!(previous&CACHE_WRITES_CLOSED)) __builtin_trap();
       }
       entry->writeback=0; cache->record->writeback_active--;
       entry_return(entry); cache_wake(&entry->ready); }
-    (void)error;
 }
 
 static int prepare_writeback(struct kernel_page_cache *cache,
@@ -2003,9 +2003,8 @@ static int prepare_writeback(struct kernel_page_cache *cache,
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    prepared->entry=entry;
     prepared->version=version_take(cache,slot);
-    if (!prepared->version) { writeback_unprepare(cache,prepared,-KERNEL_ENOMEM); return -KERNEL_ENOMEM; }
+    if (!prepared->version) { writeback_unprepare(cache,entry,prepared); return -KERNEL_ENOMEM; }
     int result=0;
     if (controlled) {
         CACHE_SCOPE(guard,cache);
@@ -2032,14 +2031,15 @@ static int prepare_writeback(struct kernel_page_cache *cache,
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    if (result) { writeback_unprepare(cache,prepared,result); return result; }
+    if (result) { writeback_unprepare(cache,entry,prepared); return result; }
     return 0;
 }
 
-static void capture_writeback(struct kernel_page_cache *cache,
-    struct prepared_writeback *prepared,uint64_t limit,struct kernel_vfs_writeback_span *span)
+static int capture_writeback(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry *entry,struct prepared_writeback *prepared,
+    uint64_t limit,struct file_write_span *span)
 {
-    struct kernel_page_cache_entry *entry=prepared->entry;
+    int captured=0;
     int controlled=cache->record->controlled;
     void *page;
     if (physical_page_resolve(cache->allocator,entry->physical_address,&page)) __builtin_trap();
@@ -2074,11 +2074,11 @@ static void capture_writeback(struct kernel_page_cache *cache,
             COST_ADD(SNAPSHOT_COPY,copy_end-first); COST_ADD(WRITEBACK_REQUESTED,size);
             memcpy(stable,(unsigned char *)page+first,copy_end-first);
             memset((unsigned char *)stable+copy_end-first,0,last-copy_end);
-            prepared->span=span;
-            *span=(struct kernel_vfs_writeback_span){
+            captured=1;
+            *span=(struct file_write_span){
                 .offset=start+prepared->begin,.buffer=snapshot,.size=size,
-                .owner=prepared->version,.retain=version_retain,.release=version_release,
-                .source_bytes=BOAROS_PAGE_SIZE+owner_bytes,
+                .source={.context=prepared->version,.retain=version_retain,.release=version_release,
+                    .bytes=BOAROS_PAGE_SIZE+owner_bytes},
                 .source_buffer=stable,.source_size=last-first};
         }
         if (prepared->closed) {
@@ -2089,27 +2089,31 @@ static void capture_writeback(struct kernel_page_cache *cache,
         entry->retry_blocked=0;
         prepared->closed=0;
     }
+    return captured;
 }
 
 /* Candidates are already pinned. Each selected page supplies a separate stable
  * version, so the batch never requires physically contiguous snapshot storage. */
 static int writeback_run(struct kernel_page_cache *cache,
-    struct kernel_page_cache_entry **entries,size_t count,uint64_t limit,size_t *used)
+    struct kernel_page_cache_entry **entries,size_t count,uint64_t limit,size_t *used,
+    struct writeback_workspace *workspace)
 {
     if (!count || count>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) __builtin_trap();
     if (kernel_io_context_current()->background_reclaim && cache->record->started && count>cache->record->snapshot_count)
         count=cache->record->snapshot_count;
     int background=kernel_io_context_current()->background_reclaim && cache->record->started;
     struct prepared_writeback single_prepared;
-    struct kernel_vfs_writeback_span single_span;
+    struct file_write_span single_span;
     struct writeback_workspace local={.prepared=&single_prepared,.spans=&single_span};
-    struct writeback_workspace *workspace=background?cache->record->writeback_workspace:&local;
-    if (!background && count>1 && writeback_workspace_init(cache,workspace)) { *used=1; return -KERNEL_ENOMEM; }
-    if (!workspace) __builtin_trap();
+    if (background) workspace=cache->record->writeback_workspace;
+    if (!workspace) {
+        if (count!=1) __builtin_trap();
+        workspace=&local;
+    }
     memset(workspace->prepared,0,count*sizeof(*workspace->prepared));
     memset(workspace->spans,0,count*sizeof(*workspace->spans));
     struct prepared_writeback *prepared=workspace->prepared;
-    struct kernel_vfs_writeback_span *spans=workspace->spans;
+    struct file_write_span *spans=workspace->spans;
     size_t ready=0,done=0;
     int result=0;
     for (;done<count;done++) {
@@ -2119,9 +2123,9 @@ static int writeback_run(struct kernel_page_cache *cache,
     KERNEL_LOCK_SCOPE(io);
     if (done) kernel_vfs_node_lock(entries[0]->node,&io,0);
     for (size_t i=0;i<done;i++) {
-        if (!prepared[i].entry) continue;
-        capture_writeback(cache,&prepared[i],limit,&spans[ready]);
-        if (prepared[i].span) ready++;
+        if (!prepared[i].version) continue;
+        if (capture_writeback(cache,entries[i],&prepared[i],limit,&spans[ready]))
+            prepared[i].span_index=++ready;
     }
     /* A later allocation failure still permits the already captured pages.
      * No failed device write is retried as a smaller batch. */
@@ -2130,15 +2134,15 @@ static int writeback_run(struct kernel_page_cache *cache,
     if (submitted) result=submitted;
     for (size_t i=done;i>0;i--) {
         struct prepared_writeback *p=&prepared[i-1];
-        if (!p->entry) continue;
-        int r=complete_writeback(cache,p->entry,p->begin,p->end,p->generation,
-            p->span ? submitted : 0,p->span ? p->span->written : 0);
+        if (!p->version) continue;
+        struct file_write_span *span=p->span_index?&spans[p->span_index-1]:NULL;
+        int r=complete_writeback(cache,entries[i-1],p->begin,p->end,p->generation,
+            span ? submitted : 0,span ? span->written : 0);
         if (r && !result) result=r;
         version_release(p->version);
-        { CACHE_SCOPE(guard,cache); entry_return(p->entry); }
+        { CACHE_SCOPE(guard,cache); entry_return(entries[i-1]); }
     }
     *used=done?done:1;
-    if (!background && count>1) writeback_workspace_release(cache,workspace);
     return result;
 }
 
@@ -2146,127 +2150,56 @@ static int writeback_entry(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry *entry,uint64_t limit)
 {
     size_t used;
-    return writeback_run(cache,&entry,1,limit,&used);
-}
-
-static int page_offset_compare(const void *left, const void *right)
-{
-    const struct kernel_page_cache_entry *a = *(struct kernel_page_cache_entry *const *)left;
-    const struct kernel_page_cache_entry *b = *(struct kernel_page_cache_entry *const *)right;
-    return a->page_index < b->page_index ? -1 : a->page_index > b->page_index;
-}
-
-static int controlled_writeback_range(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node,uint64_t start,uint64_t end)
-{
-    struct kernel_page_cache_entry **selected=0;
-    size_t capacity=0,count=0;
-    uint64_t first=start>>BOAROS_PAGE_SHIFT,last=(end-1)>>BOAROS_PAGE_SHIFT,pages=last-first+1;
-    for (;;) {
-        size_t needed;
-        { CACHE_SCOPE(guard,cache); needed=kernel_vfs_node_dirty_pages(node)->count;
-          if (pages<needed) needed=(size_t)pages; }
-        if (!needed) {
-            if (selected) kernel_heap_release(cache->heap,selected);
-            return 0;
-        }
-        if (needed>SIZE_MAX/sizeof(*selected)) return -KERNEL_ENOMEM;
-        if (capacity<needed) {
-            if (selected) kernel_heap_release(cache->heap,selected);
-            if (kernel_heap_allocate(cache->heap,needed*sizeof(*selected),(void **)&selected)) return -KERNEL_ENOMEM;
-            capacity=needed;
-        }
-        CACHE_SCOPE(guard,cache);
-        struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(node);
-        needed=pages<dirty->count?(size_t)pages:dirty->count;
-        if (needed>capacity) continue;
-        if (pages<=dirty->count) {
-            for (uint64_t index=first;index<=last;index++) {
-                int found; size_t bucket=find_bucket(cache->record,node,index,&found);
-                COST_ADD(WRITEBACK_VISITS,1);
-                if (found && cache->record->buckets[bucket]->dirty_end) selected[count++]=cache->record->buckets[bucket];
-            }
-        } else {
-            for (struct kernel_page_cache_entry *e=dirty->head;e;e=e->dirty_next) {
-                COST_ADD(WRITEBACK_VISITS,1);
-                if (e->page_index>=first && e->page_index<=last) selected[count++]=e;
-            }
-        }
-        if (count>capacity) __builtin_trap();
-        for (size_t i=0;i<count;i++) entry_borrow(selected[i]);
-        break;
-    }
-    qsort(selected,count,sizeof(*selected),page_offset_compare);
-    int result=0;
-    for (size_t i=0;i<count && !result;) {
-        size_t batch=count-i,used;
-        if (batch>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) batch=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
-        result=writeback_run(cache,&selected[i],batch,end,&used); i+=used;
-    }
-    { CACHE_SCOPE(guard,cache); for (size_t i=0;i<count;i++) entry_return(selected[i]); }
-    kernel_heap_release(cache->heap,selected);
-    return result;
+    return writeback_run(cache,&entry,1,limit,&used,NULL);
 }
 
 int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+    struct kernel_vfs_node *node,uint64_t start,uint64_t end)
 {
-    if (!cache_live(cache) || !node || start >= end) return -KERNEL_EINVAL;
+    if (!cache_live(cache) || !node || start>=end) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(node_guard);
     if (cache->record->controlled) {
         if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
-        return controlled_writeback_range(cache,node,start,end);
-    }
-    KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 0);
-    struct kernel_page_cache_entry **selected = 0;
-    size_t count = 0;
-    uint64_t first = start >> BOAROS_PAGE_SHIFT, last = (end - 1) >> BOAROS_PAGE_SHIFT;
-    uint64_t pages = last - first + 1;
-    /* 分配与捕获之间不能睡眠或被共享映射写者插入新脏页；失败返回真实ENOMEM。 */
-    uintptr_t irq = arch_interrupt_save();
+    } else kernel_vfs_node_lock(node,&node_guard,0);
+    uint64_t cursor=start>>BOAROS_PAGE_SHIFT,last=(end-1)>>BOAROS_PAGE_SHIFT;
+    struct kernel_page_cache_entry *single=NULL;
+    int multiple=0;
     {
-        KERNEL_NO_RECLAIM_IO;
-        struct kernel_page_cache_dirty *dirty = kernel_vfs_node_dirty_pages(node);
-        size_t capacity = pages < dirty->count ? (size_t)pages : dirty->count;
-        if (!capacity) { arch_interrupt_restore(irq); return 0; }
-        if (capacity > SIZE_MAX / sizeof(*selected)) { arch_interrupt_restore(irq); return -KERNEL_ENOMEM; }
-        enum kernel_heap_status allocated = kernel_heap_allocate(cache->heap,
-            capacity * sizeof(*selected), (void **)&selected);
-        if (allocated != KERNEL_HEAP_STATUS_OK) {
-            if (allocated != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
-            arch_interrupt_restore(irq); return -KERNEL_ENOMEM;
+        CACHE_SCOPE(guard,cache);
+        struct kernel_page_cache_entry *entry=dirty_at_or_after(node,cursor);
+        if (!entry || entry->page_index>last) return 0;
+        struct kernel_page_cache_entry *tail=RB_MAX(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree);
+        if (last>tail->page_index) last=tail->page_index;
+        struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
+        multiple=next && next->page_index<=last;
+        if (!multiple) {
+            single=entry;entry_borrow(single);COST_ADD(WRITEBACK_VISITS,1);
         }
-        if (pages <= dirty->count) {
-            for (uint64_t index = first; index <= last; index++) {
-                int found;
-                size_t bucket = find_bucket(cache->record, node, index, &found);
-                COST_ADD(WRITEBACK_VISITS, 1);
-                if (found && cache->record->buckets[bucket]->dirty_end)
-                    selected[count++] = cache->record->buckets[bucket];
-            }
-        } else {
-            for (struct kernel_page_cache_entry *entry = dirty->head; entry; entry = entry->dirty_next) {
-                COST_ADD(WRITEBACK_VISITS, 1);
-                if (entry->page_index >= first && entry->page_index <= last) selected[count++] = entry;
-            }
-        }
-        if (count > capacity) __builtin_trap();
-        for (size_t i = 0; i < count; i++)
-            if (physical_page_acquire(cache->allocator, selected[i]->physical_address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     }
-    arch_interrupt_restore(irq);
-    /* 在首次I/O等待前固定选中集合；排序不再沿可被别的读者扩展的inode链。 */
-    qsort(selected, count, sizeof(*selected), page_offset_compare);
-    int result = 0;
-    for (size_t i = 0; i < count && !result; ) {
-        size_t batch = count-i, used;
-        if (batch>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) batch=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
-        result = writeback_run(cache, &selected[i], batch, end, &used);
-        i += used;
+    struct writeback_workspace work={0};
+    if (multiple && writeback_workspace_init(cache,&work)) return -KERNEL_ENOMEM;
+    int result=0;
+    for (;;) {
+        struct kernel_page_cache_entry **selected=multiple?work.selected:&single;
+        size_t count=0,used;
+        if (multiple) {
+            CACHE_SCOPE(guard,cache);
+            struct kernel_page_cache_entry *entry=dirty_at_or_after(node,cursor);
+            while (entry && entry->page_index<=last && count<BOAROS_PAGE_CACHE_WRITEBACK_PAGES) {
+                selected[count++]=entry;entry_borrow(entry);
+                COST_ADD(WRITEBACK_VISITS,1);
+                entry=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
+            }
+        } else count=1;
+        if (!count) break;
+        /* Store only the key across I/O; a concurrent truncate may retire all
+         * other pages. This window alone borrows entry storage until return. */
+        cursor=selected[count-1]->page_index+1;
+        result=writeback_run(cache,selected,count,end,&used,multiple?&work:NULL);
+        {CACHE_SCOPE(guard,cache);for(size_t i=0;i<count;i++)entry_return(selected[i]);}
+        if (result || !multiple || cursor>last) break;
     }
-    for (size_t i = 0; i < count; i++)
-        if (physical_page_release(cache->allocator, selected[i]->physical_address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    (void)kernel_heap_release(cache->heap, selected);
+    if (multiple) writeback_workspace_release(cache,&work);
     return result;
 }
 
@@ -2608,9 +2541,8 @@ static void controlled_background(struct kernel_page_cache *cache)
             if (!count && (!r->dirty_cursor || !r->dirty_remaining)) break;
         }
         if (count) {
-            qsort(batch,count,sizeof(*batch),page_offset_compare);
             size_t used;
-            int result=writeback_run(cache,batch,count,UINT64_MAX,&used);
+            int result=writeback_run(cache,batch,count,UINT64_MAX,&used,r->writeback_workspace);
             if (result && result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM)
                 kernel_vfs_record_writeback_error(batch[0]->node,result);
             {
@@ -2739,10 +2671,9 @@ static void page_cache_worker(void *argument)
             struct kernel_page_cache_entry *batch[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
             size_t count = dirty_batch(r,batch), used=0;
             if (count) {
-                qsort(batch,count,sizeof(*batch),page_offset_compare);
-                KERNEL_LOCK_SCOPE(guard);
+                    KERNEL_LOCK_SCOPE(guard);
                 if (kernel_vfs_node_try_read(batch[0]->node,&guard)) {
-                    int result=writeback_run(cache,batch,count,UINT64_MAX,&used);
+                    int result=writeback_run(cache,batch,count,UINT64_MAX,&used,r->writeback_workspace);
                     int removed=0;
                     for (size_t i=0;i<count;i++) {
                         struct kernel_page_cache_entry *entry=batch[i]; entry_return(entry);

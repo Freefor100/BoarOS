@@ -632,8 +632,8 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kern
     }
     return __real_kernel_vfs_node_pread_batch(node, spans, count);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
     uint64_t offset=count?spans[0].offset:0;
     const void *buffer=count?spans[0].buffer:NULL;

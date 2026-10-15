@@ -300,8 +300,13 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 			inodes_in_bg = ext4_inodes_in_group_cnt(sb, bgid);
 			rc = ext4_bmap_bit_find_clr(b.data, 0, inodes_in_bg,
 						    &idx_in_bg);
-			while (rc == EOK && jbd_journal_quarantined(fs, (uint64_t)bgid * ext4_get32(sb, inodes_per_group) + idx_in_bg + 1, true))
-				rc = ext4_bmap_bit_find_clr(b.data, idx_in_bg + 1, inodes_in_bg, &idx_in_bg);
+			while (rc == EOK) {
+			    ext4_fsblk_t address = (uint64_t)bgid * ext4_get32(sb, inodes_per_group) + idx_in_bg + 1, next;
+			    if (!jbd_journal_quarantined(fs, address, true, &next)) break;
+			    uint64_t skip = next - address;
+			    uint32_t start = skip >= inodes_in_bg - idx_in_bg ? inodes_in_bg : idx_in_bg + (uint32_t)skip;
+			    rc = ext4_bmap_bit_find_clr(b.data, start, inodes_in_bg, &idx_in_bg);
+			}
 			/* Block group has not any free i-node */
 			if (rc == ENOSPC) {
 				rc = ext4_block_set(fs->bdev, &b);

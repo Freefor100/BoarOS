@@ -11,6 +11,7 @@ struct kernel_open_file_description;
 struct kernel_vfs_path;
 struct kernel_elf64_source;
 struct kernel_io_context;
+struct kernel_mm_record;
 struct kernel_heap;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
@@ -80,9 +81,11 @@ struct kernel_mm_mapping {
  * 无争用munmap仍允许自持pin；需要排空自身pin的mprotect/fork仍是非法上下文。 */
 struct kernel_mm_user_pin {
     const struct kernel_mm *mm;
+    struct kernel_mm_record *record;
     struct kernel_io_context *owner;
     struct kernel_mm_user_pin *registration;
     struct kernel_mm_user_pin *owner_next;
+    struct kernel_mm_user_pin **owner_previous;
     void *page;
     uint64_t physical_address;
     uint32_t access;

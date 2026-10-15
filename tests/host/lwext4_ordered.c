@@ -38,7 +38,10 @@ static int write_device(struct ext4_blockdev *d, const void *p, uint64_t n, uint
              to_be32(hdr->blocktype) == JBD_COMMIT_BLOCK)) {
             unsigned char stable;
             CHECK(pread(disk.fd,&stable,1,(off_t)data_offset) == 1);
-            CHECK(stable == 'D'); /* Data is stable before any metadata log. */
+            if (to_be32(hdr->blocktype) == JBD_COMMIT_BLOCK) {
+                CHECK(stable == 'D');
+                CHECK(!disk.count); /* All data and log body survived the precommit flush. */
+            }
             log_writes++;
         }
         const unsigned char *s = p;
@@ -99,7 +102,7 @@ int main(int argc, char **argv)
         CHECK(fault_block_crash(&disk) == 0);
         unsigned char bytes[1024];
         CHECK(ext4_blocks_get_direct(&dev,bytes,home,1) == EOK);
-        CHECK(bytes[0] == 'D');
+        CHECK(bytes[0] == (!strcmp(argv[2],"recover-old-data") ? 'O' : 'D'));
         CHECK(ext4_fs_get_inode_ref(dev.fs,file.inode,&inode) == EOK);
         CHECK((ext4_inode_get_mode(&dev.fs->sb,inode.inode)&0777) ==
               (!strcmp(argv[2],"recover") ? 0600 : 0644));
@@ -118,7 +121,7 @@ int main(int argc, char **argv)
     bool data_only=!strcmp(argv[2],"data-only");
     bool access_only=!strcmp(argv[2],"access-only");
     bool reuse=!strcmp(argv[2],"reuse");
-    bool critical=!strncmp(argv[2],"log-",4);
+    bool critical=!strncmp(argv[2],"log-",4) || !strcmp(argv[2],"write-error") || !strcmp(argv[2],"flush-error");
     if (reuse) {
         struct jbd_trans *old=jbd_journal_new_trans(&journal);
         struct ext4_block oldblock;
@@ -171,12 +174,12 @@ int main(int argc, char **argv)
         if (fail && !strcmp(argv[2],"write-error")) disk.fail_write=disk.writes+1;
         if (fail && !strcmp(argv[2],"flush-error")) disk.fail_flush=disk.flushes+1;
         if (!strcmp(argv[2],"log-write-error")) disk.fail_write=disk.writes+2;
-        if (!strcmp(argv[2],"log-flush-error")) disk.fail_flush=disk.flushes+2;
-        if (!strcmp(argv[2],"log-commit-flush-error")) disk.fail_flush=disk.flushes+3;
-        uint32_t last=journal.last, tid=journal.committed_id;
+
+        if (!strcmp(argv[2],"log-commit-flush-error")) disk.fail_flush=disk.flushes+2;
+        uint32_t start=journal.start, tid=journal.committed_id;
         int r=jbd_journal_commit_trans(&journal,tx);
         if (critical) {
-            CHECK(r == EIO && journal.error == EIO);
+            CHECK(r == EIO && journal.error == EIO && journal.start == start && journal.committed_id == tid);
             CHECK(journal.failed_trans == tx);
             const unsigned char *pending=jbd_journal_read_data(dev.fs,home);
             CHECK(pending && pending[0]=='D' && tx->ordered_count==1);
@@ -187,19 +190,6 @@ int main(int argc, char **argv)
             CHECK(jbd_journal_new_trans(&journal) == NULL);
             CHECK(fault_block_crash(&disk) == 0);
             return 0;
-        }
-        if (fail) {
-            CHECK(r == EIO);
-            CHECK(journal.error == 0 && journal.failed_trans == NULL);
-            CHECK(journal.last == last && journal.committed_id == tid);
-            CHECK(!jbd_journal_read_data(dev.fs,home) && block.data[0] == old_first);
-            CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 &&
-                actual == disk.visible[data_offset]);
-            CHECK(log_writes == 0);
-            CHECK(ext4_block_set(&dev,&block) == EOK);
-            disk.fail_write=disk.fail_flush=0;
-            writes=disk.writes;
-            continue;
         }
         CHECK(r == EOK);
         CHECK(log_writes == ((data_only || access_only) ? 0 : 2));

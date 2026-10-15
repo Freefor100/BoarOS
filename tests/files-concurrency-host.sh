@@ -12,7 +12,7 @@ for shift in ${FILES_HOST_SHIFTS:-12 14}; do
         -U_FORTIFY_SOURCE -Itests/host/mm -Itests/host/sync -idirafter include \
         -c fs/files/table.c -o "$build_dir/table-$shift.o"
     ${HOST_CC:-cc} -std=gnu11 -O2 -g -Wall -Wextra -Werror -pthread -fno-builtin-memcpy \
-        -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 -DFILES_PIPE_CASES ${FILES_HOST_FLAGS:-} \
+        -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 -DFILES_PIPE_CASES -DCACHE_MM_CASES ${FILES_HOST_FLAGS:-} \
         -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
         -include tests/host/lwext4_memory.h -Wno-unused-but-set-variable -Wno-stringop-truncation \
         -Ithird_party/lwext4/include -Itests/host/mm -Itests/host/sync -idirafter include \

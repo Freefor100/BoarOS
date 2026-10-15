@@ -158,7 +158,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
                           size_t size,
                           size_t *bytes_read);
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
-    struct kernel_vfs_writeback_span *spans, size_t count);
+    struct file_write_span *spans, size_t count);
 
 static struct kernel_vfs_backend ext4_backend;
 int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
@@ -170,6 +170,7 @@ int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
         !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
     return 0;
 }
+
 int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap,const struct physical_page_allocator *allocator)
 {
@@ -557,18 +558,46 @@ static int block_write_batch(struct ext4_blockdev *device,
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_span physical[KERNEL_BLOCK_BATCH_MAX];
+    struct kernel_block_span single = {0}, *physical = &single;
+    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
+            count * sizeof(*physical), (void **)&physical)) return ENOMEM;
     for (unsigned i = 0; i < count; i++) {
         if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) return EINVAL;
+            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
+            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
+            return EINVAL;
+        }
         physical[i] = (struct kernel_block_span){spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
             spans[i].data, (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE};
     }
-    switch (kernel_block_write_batch(adapter->block, physical, count)) {
+    enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
+    if (count > 1 && kernel_heap_release(adapter->instance.heap, physical)) __builtin_trap();
+    switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
     case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
     case KERNEL_BLOCK_STATUS_INVALID: return EINVAL;
+    default: return EIO;
+    }
+}
+
+static int block_phase_next(const void **cursor, struct kernel_block_span *span)
+{
+    const struct ext4_block_write *io = *cursor;
+    if (!io) return 0;
+    *span = (struct kernel_block_span){io->offset, io->data, io->size};
+    *cursor = io->next;
+    return 1;
+}
+
+static int block_write_phase(struct ext4_blockdev *device,
+                            const struct ext4_block_write *first)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    switch (kernel_block_write_phase(adapter->block, block_phase_next, first)) {
+    case KERNEL_BLOCK_STATUS_OK: return EOK;
+    case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
     default: return EIO;
     }
 }
@@ -578,10 +607,18 @@ static int block_read_batch(struct ext4_blockdev *device,
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_read_span physical[KERNEL_BLOCK_BATCH_MAX];
+    struct kernel_block_read_span single = {0}, *physical = &single;
+    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
+            count * sizeof(*physical), (void **)&physical)) {
+        for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
+        return ENOMEM;
+    }
     for (unsigned i = 0; i < count; i++) {
         if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) return EINVAL;
+            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
+            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
+            return EINVAL;
+        }
         physical[i] = (struct kernel_block_read_span){.offset = spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
             .buffer = spans[i].data, .size = (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE,
             .status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
@@ -598,6 +635,7 @@ static int block_read_batch(struct ext4_blockdev *device,
         }
         if (!result) result = spans[i].error;
     }
+    if (count > 1 && kernel_heap_release(adapter->instance.heap, physical)) __builtin_trap();
     return result;
 }
 
@@ -1006,6 +1044,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->interface.bread_batch = block_read_batch;
     adapter->interface.bwrite = block_write;
     adapter->interface.bwrite_batch = block_write_batch;
+    adapter->interface.bwrite_phase = block_write_phase;
     adapter->interface.close = block_close;
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
@@ -1873,29 +1912,17 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
 }
 
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
-    struct kernel_vfs_writeback_span *spans, size_t count)
+    struct file_write_span *spans, size_t count)
 {
+    _Static_assert(KERNEL_VFS_WRITEBACK_MAX <= EXT4_BLOCK_BATCH_MAX,
+        "VFS writeback batches must fit ext4");
     if (count > KERNEL_VFS_WRITEBACK_MAX) __builtin_trap();
-    struct ext4_file_write_span local, *batch=&local;
-    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
-        for (size_t i=0;i<count;i++) spans[i].written=0;
-        return -KERNEL_ENOMEM;
-    }
+    for (size_t i = 0; i < count; i++) COST_ADD(BACKEND_REQUESTED, spans[i].size);
+    int result = ext4_fpwrite_batch(lwext4_node_file(node), spans, count);
     for (size_t i = 0; i < count; i++) {
-        COST_ADD(BACKEND_REQUESTED, spans[i].size);
-        batch[i] = (struct ext4_file_write_span){
-            .offset=spans[i].offset, .buffer=spans[i].buffer, .size=spans[i].size,
-            .source_buffer=spans[i].source_buffer, .source_size=spans[i].source_size,
-            .source={.context=spans[i].owner, .retain=spans[i].retain,
-                .release=spans[i].release, .bytes=spans[i].source_bytes}};
-    }
-    int result = ext4_fpwrite_batch(lwext4_node_file(node), batch, count);
-    for (size_t i = 0; i < count; i++) {
-        spans[i].written = batch[i].written;
         if (!result && spans[i].written != spans[i].size) result = EIO;
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
-    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
     if (result) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     return lwext4_error(result);
 }

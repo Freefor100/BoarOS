@@ -1781,26 +1781,40 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
             task->io_scratch_data = data;
         }
     }
-    *buffer = (struct kernel_task_io_buffer){task, allocator, physical, data};
+    *buffer = (struct kernel_task_io_buffer){.task=task, .allocator=allocator,
+        .physical_address=physical, .data=data, .retained_scratch=1};
     if (task != 0) task->io_buffer = buffer;
     return KERNEL_TASK_STATUS_OK;
+}
+
+void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
+    struct physical_page_allocator *allocator, uint64_t physical_address)
+{
+    struct kernel_task *task = kernel_task_current();
+    if (!buffer || buffer->allocator || !allocator || (task && task->io_buffer))
+        __builtin_trap();
+    void *data;
+    if (physical_page_resolve(allocator, physical_address, &data)) __builtin_trap();
+    *buffer = (struct kernel_task_io_buffer){.task=task, .allocator=allocator,
+        .physical_address=physical_address, .data=data};
+    if (task) task->io_buffer=buffer;
 }
 
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer)
 {
     if (buffer == 0 || buffer->allocator == 0) __builtin_trap();
-    if (buffer->task != 0) {
-        if (buffer->task->io_buffer != buffer ||
-            buffer->task->io_scratch_data == 0 ||
-            buffer->task->io_scratch_physical_address !=
-                buffer->physical_address) __builtin_trap();
+    if (buffer->task) {
+        if (buffer->task->io_buffer != buffer) __builtin_trap();
+        if (buffer->retained_scratch &&
+            (!buffer->task->io_scratch_data ||
+             buffer->task->io_scratch_physical_address != buffer->physical_address))
+            __builtin_trap();
         buffer->task->io_buffer = 0;
-        /* The retained scratch page stays with the task until teardown. */
-    } else if (physical_page_release(buffer->allocator,
-                                     buffer->physical_address) !=
-               PHYSICAL_PAGE_STATUS_OK) {
-        __builtin_trap();
     }
+    /* 常驻scratch继续归任务；其余引用在完成、信号或forced exit时立即归还。 */
+    if ((!buffer->task || !buffer->retained_scratch) &&
+        physical_page_release(buffer->allocator, buffer->physical_address))
+        __builtin_trap();
     *buffer = (struct kernel_task_io_buffer){0};
 }
 

@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 struct kernel_uaccess_iovec;
+struct kernel_uaccess_iov_cursor;
 struct kernel_socket_address;
 struct kernel_heap;
 struct kernel_mm;
@@ -28,6 +29,7 @@ struct kernel_socket_read_request {
 struct kernel_socket_write_request {
     uint32_t reserved;
     uint8_t progressed;
+    void *protocol_payload;
     struct kernel_socket *socket;
     struct kernel_task *task;
     void *packet;
@@ -40,6 +42,9 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
     size_t iov_count, uint64_t count, uint32_t flags,
     const struct kernel_socket_address *destination);
+int kernel_socket_write_unix(struct kernel_open_file_description **pin_owner,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t count, uint32_t flags, int *user_fault);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
 int kernel_socket_is_tcp(const struct kernel_socket *socket);
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
@@ -112,6 +117,8 @@ void kernel_socket_read_info(const struct kernel_socket_read_request *request,
                              struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
                              uint32_t offset, void *buffer, uint32_t length);
+int kernel_socket_read_user(const struct kernel_socket_read_request *request,
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor);
 void kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
@@ -121,6 +128,7 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
 #define KERNEL_SOCKET_MSG_NOSIGNAL 0x4000U
 #define KERNEL_SOCKET_MSG_TRUNC 0x20U
 #define KERNEL_SOCKET_IO_MESSAGE 0x80000000U
+#define KERNEL_SOCKET_IO_MORE 0x40000000U
 int kernel_socket_shutdown(struct kernel_socket *socket, int how);
 
 enum kernel_socket_option {

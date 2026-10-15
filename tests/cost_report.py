@@ -25,7 +25,13 @@ def supported_schemas():
     admission_previous=current[:next(i for i,x in enumerate(current) if x[0]=='stream_admit_blocked')]
     allocator_previous=current[:next(i for i,x in enumerate(current) if x[0]=='page_meta_checked')]
     raw_previous=current[:next(i for i,x in enumerate(current) if x[0]=='raw_wait_ticks')]
-    return current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous
+    registries=(current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
+    # Frozen historical snapshots retain their original metric names and
+    # values. They are separate registries, never aliases in current output.
+    historical=tuple([(name.replace('_precommit_body','_journal_write'),unit,hist)
+                      for name,unit,hist in registry] for registry in registries
+                     if any(name.endswith('_precommit_body') for name,_,_ in registry))
+    return registries+historical
 
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics

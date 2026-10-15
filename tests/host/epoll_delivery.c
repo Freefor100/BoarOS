@@ -117,6 +117,13 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m,uint64_t out,
     }
     if(action==6) kernel_wait_queue_wake_all(&target_wait[0]);
     if(action==7) { control(KERNEL_EPOLL_CTL_DEL,0,0);control(KERNEL_EPOLL_CTL_ADD,KERNEL_EPOLLONESHOT,77); }
+    if(action==9) {
+        /* 本次只请求一个事件，关闭尚未选中的fd必须立即归还其注册对象。 */
+        size_t before=allocations;
+        struct kernel_open_file_description *f=fds[2];fds[2]=NULL;
+        kernel_open_file_release(&f);
+        CHECK(allocations+1==before && targets[1].references==0);
+    }
     *copied=n<copy_remaining?n:copy_remaining;memcpy((void *)(uintptr_t)out,in,*copied);
     if(copy_remaining!=SIZE_MAX)copy_remaining-=*copied;
     return *copied==n?KERNEL_UACCESS_STATUS_OK:KERNEL_UACCESS_STATUS_FAULT;
@@ -179,12 +186,23 @@ int main(int argc, char **argv)
     setup(KERNEL_EPOLLET);copy_action=8;
     CHECK(wait_events(out,16)==1 && out[0].data==42 && targets[0].references==0);
     CHECK(wait_events(out,16)==1 && out[0].data==88);teardown();
+    setup(KERNEL_EPOLLET);
+    int64_t unrelated;
+    CHECK(kernel_files_epoll_ctl(&files,0,KERNEL_EPOLL_CTL_ADD,2,KERNEL_POLLIN|KERNEL_EPOLLET,43,&unrelated)==KERNEL_FILES_STATUS_OK && !unrelated);
+    copy_action=9;
+    CHECK(wait_events(out,1)==1 && out[0].data==42);
+    CHECK(wait_events(out,1)==0);teardown();
+    setup(KERNEL_EPOLLET);
+    CHECK(kernel_files_epoll_ctl(&files,0,KERNEL_EPOLL_CTL_ADD,2,KERNEL_POLLIN|KERNEL_EPOLLET,43,&unrelated)==KERNEL_FILES_STATUS_OK && !unrelated);
+    readable[0]=0;
+    CHECK(wait_events(out,1)==1 && out[0].data==43);
+    CHECK(wait_events(out,1)==0);teardown();
     setup(KERNEL_EPOLLET);copy_action=3;
     int64_t added;
     CHECK(kernel_files_epoll_ctl(&files,0,KERNEL_EPOLL_CTL_ADD,2,KERNEL_POLLIN|KERNEL_EPOLLET,43,&added)==KERNEL_FILES_STATUS_OK && !added);
     if(!setjmp(cancelled)) { wait_events(out,16); CHECK(0); }
     CHECK(!registered && epfile.references==1 && targets[0].references==1);
     CHECK(wait_events(out,16)==2);teardown();
-    puts("PASS actual epoll: fault replay, reentrant notification, MOD, DEL, close pins and cancelled scan");
+    puts("PASS actual epoll: fault replay, reentrant notification, MOD, DEL, close pins, bounded candidate ownership and cancelled scan");
     return 0;
 }

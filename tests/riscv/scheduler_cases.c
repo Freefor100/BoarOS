@@ -960,6 +960,18 @@ static void io_buffer_worker(void *argument)
         io_buffer_failures++;
 }
 
+static void borrowed_io_page_worker(void *argument)
+{
+    (void)argument;
+    uint64_t physical;
+    if (physical_page_allocate(test_page_allocator, &physical)) __builtin_trap();
+    struct kernel_task_io_buffer borrowed = {0};
+    kernel_task_io_buffer_take_page(&borrowed, test_page_allocator, physical);
+    /* 不返回到调用者，保留仍存活的登记；reap先归还borrow，再释放这个栈。 */
+    (void)riscv_interrupt_save();
+    kernel_thread_exit();
+}
+
 static unsigned long run_io_buffer_cases(
     struct physical_page_allocator *allocator)
 {
@@ -980,7 +992,11 @@ static unsigned long run_io_buffer_cases(
     for (unsigned slot = 0U; slot < 2U; slot++)
         failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                                   kernel_scheduler_reap_one(&completion));
-    /* 任务销毁后常驻页必须归还分配器。 */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+        kernel_thread_create(borrowed_io_page_worker, 0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_scheduler_on_tick(1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_scheduler_reap_one(&completion));
+    /* 任务销毁后常驻scratch和借用页都必须归还分配器。 */
     if (physical_page_available(allocator) != available) failures++;
     return failures + io_buffer_failures;
 }

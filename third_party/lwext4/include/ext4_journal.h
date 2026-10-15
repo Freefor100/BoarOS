@@ -69,12 +69,15 @@ struct jbd_buf {
 	bool was_dirty;
 	struct jbd_image *before;
 	struct jbd_image *after;
+	void *escaped_prefix;
+	struct ext4_block_write home_io;
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
 	struct jbd_block_rec *block_rec;
 	TAILQ_ENTRY(jbd_buf) buf_node;
 	TAILQ_ENTRY(jbd_buf) dirty_buf_node;
+	TAILQ_ENTRY(jbd_buf) checkpoint_node;
 };
 
 struct jbd_source;
@@ -83,6 +86,7 @@ struct jbd_data {
 	struct ext4_block block;
 	struct jbd_image *image;
 	struct jbd_source *source;
+	struct ext4_block_write io;
 	RB_ENTRY(jbd_data) index_node;
 	TAILQ_ENTRY(jbd_data) node;
 };
@@ -95,6 +99,7 @@ struct jbd_revoke_rec {
 struct jbd_block_rec {
 	ext4_fsblk_t lba;
 	struct jbd_trans *trans;
+	struct jbd_buf *checkpoint;
 	RB_ENTRY(jbd_block_rec) block_rec_node;
 	LIST_ENTRY(jbd_block_rec) tbrec_node;
 	TAILQ_HEAD(jbd_buf_dirty, jbd_buf) dirty_buf_queue;
@@ -104,6 +109,7 @@ struct jbd_quarantine {
 	ext4_fsblk_t first;
 	uint32_t count;
 	bool inode;
+	RB_ENTRY(jbd_quarantine) index_node;
 	LIST_ENTRY(jbd_quarantine) node;
 };
 
@@ -123,6 +129,7 @@ struct jbd_trans {
 	bool frozen;
 	struct jbd_image *checkpoint_image;
 	ext4_fsblk_t checkpoint_lba;
+	struct ext4_block_write *io_head;
 
 	struct jbd_journal *journal;
 
@@ -144,10 +151,16 @@ struct jbd_journal {
 	struct jbd_trans *failed_trans;
 	struct jbd_trans *running, *committing;
 	struct jbd_trans *checkpointing, *checkpoint_last;
+	TAILQ_HEAD(jbd_checkpoint_bufs, jbd_buf) checkpoint_bufs;
+	struct ext4_block_write *checkpoint_io;
 	TAILQ_HEAD(jbd_sealed_queue, jbd_trans) sealed_queue;
 	unsigned sealed_count, checkpoint_count, log_reserved;
 	bool checkpoint_requested;
 	bool grouped;
+	/* Transaction lists own each range through abort or checkpoint. These
+	 * block/inode indexes borrow the same nodes across accept and sealing. */
+	RB_HEAD(jbd_quarantine_tree, jbd_quarantine) quarantine_index[2];
+	uint64_t quarantined_blocks, quarantined_inodes;
 	size_t memory_used, memory_peak, memory_limit;
 	size_t memory_cached;
 	uint64_t budget_failures;
@@ -195,7 +208,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
-	const struct ext4_data_source *source);
+	const struct file_data_source *source);
 /* The mount lock stabilizes this borrowed version. NULL means read home. */
 const void *jbd_journal_read_data(struct ext4_fs *fs, ext4_fsblk_t block);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
@@ -232,11 +245,15 @@ int jbd_journal_retire(struct jbd_journal *journal, int error);
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
 bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
-	const struct ext4_data_source *const *sources, unsigned count);
+	const struct file_data_source *const *sources, unsigned count);
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);
-bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address, bool inode);
+/* Return whether address is reserved for an older incarnation. When next is
+ * supplied, report the end of that interval, or the next reserved start when
+ * address is free (UINT64_MAX if none). The modification lock stabilizes it. */
+bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address,
+	bool inode, ext4_fsblk_t *next);
 
 #ifdef __cplusplus
 }

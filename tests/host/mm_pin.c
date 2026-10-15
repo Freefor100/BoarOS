@@ -21,7 +21,13 @@ void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_fence(uint64_t address, int instructions)
 { (void)address; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
-static void *page_access(uint64_t address) { return (void *)(uintptr_t)address; }
+static uint64_t watched_record;
+static unsigned record_resolutions;
+static void *page_access(uint64_t address)
+{
+    if (address == watched_record) record_resolutions++;
+    return (void *)(uintptr_t)address;
+}
 static int page_address(const void *pointer, uint64_t *address)
 { *address = (uintptr_t)pointer; return 1; }
 static void copy_fragments(struct kernel_mm *mm, uint64_t address)
@@ -138,6 +144,13 @@ int main(void)
     assert(physical_page_reference_count(&allocator,
         mapping.physical_address, &references) == 0);
     assert(references == 2);
+    struct kernel_mm_user_pin extra[3] = {0};
+    for (unsigned i=0;i<3;i++)
+        assert(!kernel_mm_pin_user_page(&mm,address,KERNEL_MM_READ,&extra[i]));
+    kernel_mm_unpin_user_page(&extra[1]);
+    kernel_mm_unpin_user_page(&extra[0]);
+    kernel_mm_unpin_user_page(&extra[2]);
+    assert(kernel_io_context_current()->user_pins == &pin);
     memset(pin.page, 0x37, BOAROS_PAGE_SIZE);
     assert(kernel_mm_munmap(&mm, address, BOAROS_PAGE_SIZE) == 0);
     assert(physical_page_reference_count(&allocator,
@@ -149,7 +162,11 @@ int main(void)
     }
     for (size_t i = 0; i < BOAROS_PAGE_SIZE; i++)
         assert(((unsigned char *)pin.page)[i] == 0x37);
+    watched_record = mm.record_page_address;
+    record_resolutions = 0;
     kernel_mm_unpin_user_page(&pin);
+    assert(record_resolutions == 0);
+    watched_record = 0;
     for (unsigned i = 0; i < count; i++)
         assert(physical_page_release(&allocator, allocated[i]) == 0);
     mm_test_context = 0;

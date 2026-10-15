@@ -3,7 +3,7 @@
 
 typedef uintptr_t memory_word __attribute__((__may_alias__));
 
-/* 只用于普通RAM；同余对齐后才访问整字，首尾不借读相邻对象。 */
+/* 只用于普通RAM；整字读写保持对齐，首尾不借读相邻对象。 */
 static inline __attribute__((always_inline)) void *copy_forward(
     void *destination, const void *source, size_t size)
 {
@@ -11,12 +11,12 @@ static inline __attribute__((always_inline)) void *copy_forward(
     const unsigned char *input = source;
     if (size == 0U) return destination;
     const size_t width = sizeof(memory_word);
-    if ((((uintptr_t)output ^ (uintptr_t)input) & (width - 1U)) == 0U) {
-        while (size != 0U && ((uintptr_t)output & (width - 1U)) != 0U) {
-            *output++ = *input++;
-            size--;
-        }
-        if (size == 0U) return destination;
+    while (size != 0U && ((uintptr_t)output & (width - 1U)) != 0U) {
+        *output++ = *input++;
+        size--;
+    }
+    if (size == 0U) return destination;
+    if (((uintptr_t)input & (width - 1U)) == 0U) {
         memory_word *words_out = (memory_word *)(void *)output;
         const memory_word *words_in = (const memory_word *)(const void *)input;
         while (size >= 4U * width) {
@@ -34,6 +34,22 @@ static inline __attribute__((always_inline)) void *copy_forward(
         }
         output = (unsigned char *)words_out;
         input = (const unsigned char *)words_in;
+    } else if (size >= 2U * width) {
+        size_t shift = (uintptr_t)input & (width - 1U);
+        size_t prefix = width - shift;
+        memory_word low = 0;
+        /* RV/LA均为小端。只读区间内的对齐源字，合成对齐目标字；
+         * 首尾不用向对象外取字，memmove前向重叠也保留已预读的边界。 */
+        for (size_t i=0;i<prefix;i++) low |= (memory_word)input[i] << (8U*i);
+        const memory_word *words_in=(const void *)(input+prefix);
+        memory_word *words_out=(void *)output;
+        while (size >= width+prefix) {
+            memory_word high=*words_in++;
+            *words_out++=low | (high << (8U*prefix));
+            low=high >> (8U*shift);
+            input+=width; size-=width;
+        }
+        output=(void *)words_out;
     }
     while (size != 0U) {
         *output++ = *input++;
@@ -75,12 +91,12 @@ void *memmove(void *destination, const void *source, size_t size)
         const size_t width = sizeof(memory_word);
         output += size;
         input += size;
-        if ((((uintptr_t)output ^ (uintptr_t)input) & (width - 1U)) == 0U) {
-            while (size != 0U && ((uintptr_t)output & (width - 1U)) != 0U) {
-                *--output = *--input;
-                size--;
-            }
-            if (size == 0U) return destination;
+        while (size != 0U && ((uintptr_t)output & (width - 1U)) != 0U) {
+            *--output = *--input;
+            size--;
+        }
+        if (size == 0U) return destination;
+        if (((uintptr_t)input & (width - 1U)) == 0U) {
             memory_word *words_out = (memory_word *)(void *)output;
             const memory_word *words_in = (const memory_word *)(const void *)input;
             /* 从高地址逐字提交，距离小于展开块时也不覆盖待读源字。 */
@@ -99,6 +115,20 @@ void *memmove(void *destination, const void *source, size_t size)
             }
             output = (unsigned char *)words_out;
             input = (const unsigned char *)words_in;
+        } else if (size >= 2U * width) {
+            size_t suffix=(uintptr_t)input & (width-1U);
+            memory_word high=0;
+            for (size_t i=0;i<suffix;i++)
+                high |= (memory_word)(input-suffix)[i] << (8U*(width-suffix+i));
+            const memory_word *words_in=(const void *)(input-suffix);
+            memory_word *words_out=(void *)output;
+            while (size >= width+suffix) {
+                memory_word low=*--words_in;
+                *--words_out=high | (low >> (8U*suffix));
+                high=low << (8U*(width-suffix));
+                input-=width; size-=width;
+            }
+            output=(void *)words_out;
         }
         while (size != 0U) {
             *--output = *--input;

@@ -14,17 +14,20 @@ mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"
 debugfs -w -R "write $work/data /probe" "$work/base.img" >/dev/null 2>&1
 for action in commit abort write-error flush-error data-only access-only reuse \
-              log-write-error log-flush-error log-commit-flush-error; do
+              log-write-error log-commit-flush-error; do
     cp "$work/base.img" "$work/test.img"
     timeout 30 "$work/probe" "$work/test.img" "$action"
     if [ "$action" != abort ] && [ "$action" != access-only ]; then
         recover=recover
-        case "$action" in data-only|log-*) recover=recover-oldmeta ;; esac
+        case "$action" in
+            data-only|log-commit-flush-error) recover=recover-oldmeta ;;
+            write-error|flush-error|log-write-error) recover=recover-old-data ;;
+        esac
         timeout 30 "$work/probe" "$work/test.img" "$recover"
         e2fsck -fn "$work/test.img" >/dev/null
     fi
 done
-printf '%s\n' 'PASS: ordered data precedes metadata log, stays outside log, scoped writes, rollback/retry/replay'
+printf '%s\n' 'PASS: data and log body precede durable commit, payload stays outside log, scoped writes, sticky I/O owners and replay'
 
 # Every start/stop write and barrier, including primary-superblock checkpoints.
 for blocksize in 1024 4096; do

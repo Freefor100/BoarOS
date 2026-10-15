@@ -490,23 +490,14 @@ static void ext4_idx_store_pblock(struct ext4_extent_index *ix, ext4_fsblk_t pb)
 	ix->leaf_hi = to_le16((uint16_t)((pb >> 32)) & 0xffff);
 }
 
-static int ext4_allocate_single_block(struct ext4_inode_ref *inode_ref,
-				      ext4_fsblk_t goal, ext4_fsblk_t *blockp)
-{
-	return ext4_balloc_alloc_block(inode_ref, goal, blockp);
-}
-
 static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
-					 ext4_fsblk_t goal,
-					 uint32_t flags __unused,
-					 uint32_t *count, int *errp)
+    ext4_fsblk_t goal, uint32_t flags __unused, uint32_t *count, int *errp)
 {
-	ext4_fsblk_t block = 0;
-
-	*errp = ext4_allocate_single_block(inode_ref, goal, &block);
-	if (count)
-		*count = 1;
-	return block;
+    ext4_fsblk_t block = 0;
+    uint32_t allocated = 0;
+    *errp = ext4_balloc_alloc_blocks(inode_ref, goal, count ? *count : 1, &block, &allocated);
+    if (count) *count = allocated;
+    return block;
 }
 
 static int ext4_ext_free_blocks(struct ext4_inode_ref *inode_ref,
@@ -1804,16 +1795,22 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 		      ext4_ext_get_actual_len(path[depth].extent) - 1)) {
 
 		struct ext4_extent *ex = path[depth].extent, newex;
+        uint16_t original_count = ex->block_count;
 		int unwritten = ext4_ext_is_unwritten(ex);
 		ext4_lblk_t ee_block = to_le32(ex->first_block);
 		int32_t len = ext4_ext_get_actual_len(ex);
 		ext4_fsblk_t newblock = to + 1 - ee_block + ext4_ext_pblock(ex);
+        ext4_fsblk_t removed = from - ee_block + ext4_ext_pblock(ex);
 
 		ex->block_count = to_le16(from - ee_block);
 		if (unwritten)
 			ext4_ext_mark_unwritten(ex);
 
-		ext4_ext_dirty(inode_ref, path + depth);
+        ret = ext4_ext_dirty(inode_ref, path + depth);
+        if (ret != EOK) {
+            ex->block_count = original_count;
+            goto out;
+        }
 
 		newex.first_block = to_le32(to + 1);
 		newex.block_count = to_le16(ee_block + len - 1 - to);
@@ -1822,6 +1819,27 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 			ext4_ext_mark_unwritten(&newex);
 
 		ret = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
+        if (ret != EOK) {
+            /* Tree growth can move the shortened left extent to another leaf.
+             * Restore its encoded length, including unwritten state, before
+             * returning the insertion error; bitmap ownership is unchanged. */
+            int restore = ext4_find_extent(inode_ref, ee_block, &path, 0);
+            if (restore == EOK) {
+                depth = ext_depth(inode_ref->inode);
+                ex = path[depth].extent;
+                if (!ex || to_le32(ex->first_block) != ee_block) restore = EIO;
+                else {
+                    ex->block_count = original_count;
+                    restore = ext4_ext_dirty(inode_ref, path + depth);
+                }
+            }
+            if (restore) ret = restore;
+            goto out;
+        }
+        /* Splitting preserves both neighbors; the removed middle still owns
+         * bitmap bits until it is explicitly freed after successful insertion. */
+        if (ret == EOK)
+            ret = ext4_ext_free_blocks(inode_ref, removed, to - from + 1, 0);
 		goto out;
 	}
 
@@ -1926,8 +1944,10 @@ static int ext4_ext_split_extent_at(struct ext4_inode_ref *inode_ref,
 	int32_t ee_len;
 	int32_t depth = ext_depth(inode_ref->inode);
 	int err = EOK;
+    uint16_t original_count;
 
 	ex = (*ppath)[depth].extent;
+    original_count = ex->block_count;
 	ee_block = to_le32(ex->first_block);
 	ee_len = ext4_ext_get_actual_len(ex);
 	newblock = split - ee_block + ext4_ext_pblock(ex);
@@ -1968,9 +1988,19 @@ static int ext4_ext_split_extent_at(struct ext4_inode_ref *inode_ref,
 out:
 	return err;
 restore_extent_len:
-	ex->block_count = to_le16(ee_len);
-	err = ext4_ext_dirty(inode_ref, *ppath + depth);
-	return err;
+    /* Failed insertion can grow the tree and release the old leaf. Re-select
+     * its current owner before restoring the extent, including unwritten state. */
+    int restore_error = ext4_find_extent(inode_ref, ee_block, ppath, 0);
+    if (restore_error == EOK) {
+        depth = ext_depth(inode_ref->inode);
+        ex = (*ppath)[depth].extent;
+        if (!ex || to_le32(ex->first_block) != ee_block) return EIO;
+        ex->block_count = original_count;
+        restore_error = ext4_ext_dirty(inode_ref, *ppath + depth);
+    }
+    /* A successful local repair still returns the insertion failure so the
+     * journal caller aborts every metadata change in the enclosing operation. */
+    return restore_error ? restore_error : err;
 }
 
 static int ext4_ext_convert_to_initialized(struct ext4_inode_ref *inode_ref,
@@ -1996,6 +2026,10 @@ static int ext4_ext_convert_to_initialized(struct ext4_inode_ref *inode_ref,
 		err = ext4_ext_split_extent_at(inode_ref, ppath, split + blocks,
 					       EXT4_EXT_MARK_UNWRIT1 |
 						   EXT4_EXT_MARK_UNWRIT2);
+        /* Insertion leaves the path on the newly inserted right extent.
+         * Re-select the left extent before splitting the initialized middle. */
+        if (err == EOK)
+            err = ext4_find_extent(inode_ref, split, ppath, 0);
 		if (err == EOK) {
 			err = ext4_ext_split_extent_at(inode_ref, ppath, split,
 						       EXT4_EXT_MARK_UNWRIT1);
@@ -2083,9 +2117,8 @@ __unused static void print_path(struct ext4_extent_path *path)
 	}
 }
 
-int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
-			   uint32_t max_blocks, ext4_fsblk_t *result,
-			   bool create, uint32_t *blocks_count)
+int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, bool create, struct ext4_inode_block_range *range)
 {
 	struct ext4_extent_path *path = NULL;
 	struct ext4_extent newex, *ex;
@@ -2096,11 +2129,12 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	ext4_lblk_t next;
 	ext4_fsblk_t newblock;
 
-	if (result)
-		*result = 0;
-
-	if (blocks_count)
-		*blocks_count = 0;
+	if (!range || !max_blocks) return EINVAL;
+    *range = (struct ext4_inode_block_range){0};
+    if (iblock >= EXT_MAX_BLOCKS) return EFBIG;
+    if (max_blocks > EXT_MAX_BLOCKS - iblock) {
+        max_blocks = EXT_MAX_BLOCKS - iblock;
+    }
 
 	/* find extent for this block */
 	err = ext4_find_extent(inode_ref, iblock, &path, 0);
@@ -2132,7 +2166,8 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 			}
 
 			if (!create) {
-				newblock = 0;
+                range->unwritten = true;
+                newblock = iblock - ee_block + ee_start;
 				goto out;
 			}
 
@@ -2161,15 +2196,22 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	 * we couldn't try to create block if create flag is zero
 	 */
 	if (!create) {
-		goto out2;
-	}
+        next = ex && iblock < to_le32(ex->first_block) ?
+            to_le32(ex->first_block) : ext4_ext_next_allocated_block(path);
+        allocated = next > iblock ? next - iblock : max_blocks;
+        if (next == EXT_MAX_BLOCKS) allocated = max_blocks;
+        newblock = 0;
+        goto out;
+    }
 
 	/* find next allocated block so that we know how many
 	 * blocks we can allocate without ovelapping next extent */
-	next = ext4_ext_next_allocated_block(path);
+	next = ex && iblock < to_le32(ex->first_block) ?
+        to_le32(ex->first_block) : ext4_ext_next_allocated_block(path);
 	allocated = next - iblock;
 	if (allocated > max_blocks)
 		allocated = max_blocks;
+    if (allocated > EXT4_EXT_MAX_LEN_WRITTEN) allocated = EXT4_EXT_MAX_LEN_WRITTEN;
 
 	/* allocate new block */
 	goal = ext4_ext_find_goal(inode_ref, path, iblock);
@@ -2184,23 +2226,22 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	err = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
 	if (err != EOK) {
 		/* free data blocks we just allocated */
-		ext4_ext_free_blocks(inode_ref, ext4_ext_pblock(&newex),
-				     to_le16(newex.block_count), 0);
+		int cleanup = ext4_ext_free_blocks(inode_ref, ext4_ext_pblock(&newex),
+                     to_le16(newex.block_count), 0);
+        if (cleanup) err = cleanup;
 		goto out2;
 	}
 
 	/* previous routine could use block we allocated */
 	newblock = ext4_ext_pblock(&newex);
+    range->allocated = true;
 
 out:
 	if (allocated > max_blocks)
 		allocated = max_blocks;
 
-	if (result)
-		*result = newblock;
-
-	if (blocks_count)
-		*blocks_count = allocated;
+	range->block = newblock;
+    range->count = allocated;
 
 out2:
 	if (path) {
@@ -2209,5 +2250,14 @@ out2:
 	}
 
 	return err;
+}
+int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, ext4_fsblk_t *result, bool create, uint32_t *blocks_count)
+{
+    struct ext4_inode_block_range range = {0};
+    int r = ext4_extent_get_range(inode_ref, iblock, max_blocks, create, &range);
+    if (result) *result = range.unwritten ? 0 : range.block;
+    if (blocks_count) *blocks_count = range.count;
+    return r;
 }
 #endif

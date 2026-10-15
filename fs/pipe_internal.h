@@ -23,8 +23,7 @@ struct kernel_pipe {
     uint32_t uid, gid;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct physical_page_allocator *allocator;
-    uint64_t buffer_physical;
-    unsigned char *buffer;
+    unsigned char *pages[16];
     uint16_t head;
     uint16_t tail;
     uint16_t slots;
@@ -41,7 +40,8 @@ struct kernel_pipe {
     struct kernel_wait_queue read_queue;
     struct kernel_wait_queue write_queue;
     struct kernel_wait_queue both_queue;
-    struct kernel_mutex copy_lock;
+    uint16_t read_slot, merge_slot;
+    struct kernel_mutex read_lock, write_lock;
     struct kernel_raw_lock metadata_lock;
 };
 
@@ -58,7 +58,7 @@ enum kernel_pipe_status {
     KERNEL_PIPE_STATUS_NO_MEMORY,
     KERNEL_PIPE_STATUS_STATE,
 };
-/* 复制mutex固定片段，metadata raw保护发布；核心不处理用户信号。
+/* 读写资格分别固定片段；同页尾部合并另由metadata标记协调。核心不处理用户信号。
  * bytes保留已接纳前缀，broken独立报告断端，包括部分接纳后的断端。 */
 struct kernel_pipe_result { int64_t bytes; unsigned broken; };
 
@@ -89,7 +89,7 @@ enum kernel_pipe_status kernel_pipe_acquire_endpoint(
     struct kernel_pipe *pipe,
     uint32_t endpoint);
 
-/* The final endpoint also releases the contiguous order-4 backing block. */
+/* 最后端点归还全部已分配槽页，包括未发布的写入页。 */
 enum kernel_pipe_status kernel_pipe_release_endpoint(
     struct kernel_pipe *pipe,
     uint32_t endpoint);

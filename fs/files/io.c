@@ -3,6 +3,7 @@
 #include "../pipe_internal.h"
 #include "../char_device_internal.h"
 #include "../uaccess_iov_internal.h"
+#include "../../mm/uaccess_internal.h"
 #include "../vfs_internal.h"
 
 #include <kernel/cost.h>
@@ -430,7 +431,6 @@ static enum kernel_files_status read_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        struct kernel_task_io_buffer buffer = {0};
         struct kernel_socket_read_request read_request = {0};
         int received = 0;
         enum kernel_files_status result = KERNEL_FILES_STATUS_OK;
@@ -447,12 +447,6 @@ static enum kernel_files_status read_pinned(
         int discard = kernel_socket_discard_receive(kernel_open_file_socket(description),socket_flags);
         if (count == 0U && !message) {
             *linux_result = 0;
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (count != 0U && !discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
-                KERNEL_TASK_STATUS_OK) {
-            *linux_result = -KERNEL_ENOMEM;
-            KERNEL_FILES_NOTE(files, read_failures, 1);
             return KERNEL_FILES_STATUS_OK;
         }
         while (total < count || (message && total == 0)) {
@@ -472,29 +466,13 @@ static enum kernel_files_status read_pinned(
             if (received < 0 || read_request.socket == 0) break;
             int datagram = read_request.datagram;
             if (datagram) kernel_socket_read_info(&read_request, peer, message_size);
-            uint32_t done = discard ? (uint32_t)received : 0;
-            int fault = 0;
-            while (done < (uint32_t)received) {
-                size_t chunk = (uint32_t)received - done, copied = 0;
-                if (chunk > BOAROS_PAGE_SIZE) chunk = BOAROS_PAGE_SIZE;
-                kernel_socket_copy_read(&read_request, done, buffer.data, chunk);
-                enum kernel_uaccess_status access = kernel_copy_to_user_iov(
-                    mm, &cursor, buffer.data, chunk, &copied);
-                KERNEL_FILES_NOTE(files, read_chunks, 1);
-                if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
-                    fault = 1;
-                    if (access != KERNEL_UACCESS_STATUS_FAULT)
-                        result = KERNEL_FILES_STATUS_STATE;
-                    break;
-                }
-                done += (uint32_t)chunk;
-            }
+            int fault = !discard && kernel_socket_read_user(&read_request, mm, &cursor);
+            KERNEL_FILES_NOTE(files, read_chunks, 1);
             kernel_socket_finish_read(&read_request, fault);
             if (fault) { received = -KERNEL_EFAULT; break; }
             total += (uint32_t)received;
             if (datagram) break;
         }
-        if (buffer.allocator) kernel_task_io_buffer_release(&buffer);
         *linux_result = total != 0U ? (int64_t)total : received;
         if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
         else KERNEL_FILES_NOTE(files, bytes_read, total);
@@ -1041,18 +1019,21 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (count) kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file);
     if (count == 0U || start >= kernel_open_file_size(input)) return 0;
-    struct kernel_task_io_buffer scratch = {0};
-    if (kernel_task_io_buffer_acquire(&scratch, mm->allocator) != KERNEL_TASK_STATUS_OK)
+    int datagram=kernel_socket_is_datagram(kernel_open_file_socket(output));
+    int direct=output->kind==KERNEL_OPEN_FILE_KIND_PIPE ||
+        (output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram);
+    struct kernel_task_io_buffer source_buffer = {0};
+    if (!direct && !datagram && kernel_task_io_buffer_acquire(&source_buffer, mm->allocator) != KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
     size_t capacity = BOAROS_PAGE_SIZE;
-    void *staging = scratch.data, *datagram_staging = 0;
-    if (kernel_socket_is_datagram(kernel_open_file_socket(output))) {
+    void *staging = source_buffer.data, *datagram_staging = 0;
+    if (datagram) {
         /* Linux splice_to_socket batches at most sixteen target pages. */
         size_t batch=(size_t)BOAROS_PAGE_SIZE*16U;
         capacity=count>batch ? batch : (size_t)count;
         enum kernel_heap_status allocated = kernel_heap_allocate(files->heap, capacity, &datagram_staging);
         if (allocated != KERNEL_HEAP_STATUS_OK) {
-            kernel_task_io_buffer_release(&scratch);
+            if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
             if (allocated != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
             return -KERNEL_ENOMEM;
         }
@@ -1068,16 +1049,56 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     while (total < count) {
         size_t wanted = count - total > capacity
             ? capacity : (size_t)(count - total), available = 0;
-        /* pread 交还 inode 数据锁后才写目标，允许同 inode 复制而不锁升级。 */
-        error = kernel_open_file_pread(input, start + total, staging, wanted, &available);
-        if (available > wanted) __builtin_trap();
-        if (available == 0U) break;
+        if (direct) {
+            uint64_t position=start+total,physical;
+            size_t offset=position&BOAROS_PAGE_MASK,valid;
+            kernel_open_file_read_begin(input,position);
+            int memory=kernel_open_file_memory_backed(input);
+            enum kernel_page_cache_status loaded=memory
+                ?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid)
+                :kernel_open_file_get_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid);
+            if (loaded==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND && memory) {
+                uint64_t size=kernel_open_file_size(input);
+                if (position>=size) break;
+                available=BOAROS_PAGE_SIZE-offset;
+                if (available>wanted) available=wanted;
+                if (available>size-position) available=(size_t)(size-position);
+                /* 稀疏内存文件的洞只生成当前零片段，不为读取建立持久文件页。 */
+                if (kernel_task_io_buffer_acquire(&source_buffer,mm->allocator)) {
+                    error=-KERNEL_ENOMEM;break;
+                }
+                staging=source_buffer.data;
+                memset(staging,0,available);
+            } else if (loaded==KERNEL_PAGE_CACHE_STATUS_OK) {
+                /* 页引用跨目标等待保活；TCP仍COPY进ACK前自有的协议版本。 */
+                kernel_task_io_buffer_take_page(&source_buffer,files->heap->page_allocator,physical);
+                if (offset<valid) {
+                    available=valid-offset;
+                    if (available>wanted) available=wanted;
+                }
+                staging=(unsigned char *)source_buffer.data+offset;
+            } else {
+                if (loaded!=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE)
+                    error=loaded==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
+                break;
+            }
+            kernel_open_file_read_progress(input,position,available);
+        } else {
+            /* 文件目标保留分离的读写版本，允许同inode及重叠区间复制。 */
+            error=kernel_open_file_pread(input,start+total,staging,wanted,&available);
+            if (available>wanted) __builtin_trap();
+        }
+        if (!available) {
+            if (direct && source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
+            break;
+        }
         if (total == 0U && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
             int modified = kernel_vfs_file_modified(&output->file, out_start, 0);
             if (modified != 0) { error = modified; break; }
         }
         int64_t sent = sendfile_output(output_owner, staging, available,
                                        out_start + total, deadline);
+        if (direct) kernel_task_io_buffer_release(&source_buffer);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
         if (sent > 0 && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
@@ -1091,7 +1112,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     }
     if (datagram_staging != 0 && kernel_heap_release(files->heap, datagram_staging) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
-    kernel_task_io_buffer_release(&scratch);
+    if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
     if (total != 0U && error == -KERNEL_ERESTARTSYS)
         kernel_signal_clear_syscall_restart(kernel_task_current());
     if (total != 0U) {
@@ -1226,8 +1247,7 @@ static enum kernel_files_status buffered_write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, unsigned char *staging, size_t capacity,
-    uint32_t socket_flags)
+    int64_t *linux_result, unsigned char *staging, size_t capacity)
 {
     uint64_t total = 0U;
 
@@ -1258,73 +1278,7 @@ static enum kernel_files_status buffered_write_request(
         }
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        struct kernel_socket *socket = kernel_open_file_socket(description);
-        uint64_t timeout = kernel_socket_send_timeout(socket), target = 0;
-        if (timeout) {
-            uint64_t now = kernel_time_monotonic_ns();
-            target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
-        }
-        for (size_t index = 0U; index < iov_count && total < count; index++) {
-            uint64_t offset = 0U;
-            while (offset < iov[index].length && total < count) {
-                size_t chunk = iov[index].length - offset;
-                size_t copied = 0U;
-                int sent;
-                enum kernel_uaccess_status access;
-                if (chunk > capacity) chunk = capacity;
-                size_t page_left = BOAROS_PAGE_SIZE -
-                    ((iov[index].base + offset) & BOAROS_PAGE_MASK);
-                if (chunk > page_left) chunk = page_left;
-                if (chunk > count - total) chunk = (size_t)(count - total);
-                KERNEL_FILES_NOTE(files, write_chunks, 1);
-                access = kernel_copy_from_user(mm, staging,
-                    iov[index].base + offset, chunk, &copied);
-                if (access == KERNEL_UACCESS_STATUS_FAULT && copied == 0U) {
-                    *linux_result = total != 0U ? (int64_t)total
-                                                 : -KERNEL_EFAULT;
-                    return KERNEL_FILES_STATUS_OK;
-                }
-                if (access != KERNEL_UACCESS_STATUS_OK &&
-                    access != KERNEL_UACCESS_STATUS_FAULT)
-                    return KERNEL_FILES_STATUS_STATE;
-                size_t consumed = 0U;
-                /* 等待和短发送只推进暂存游标，不能重新解析尚未发送的用户字节。 */
-                while (consumed < copied) {
-                    sent = kernel_socket_write_buffer(socket, (const unsigned char *)staging + consumed,
-                                                        (uint32_t)(copied - consumed), socket_flags);
-                    if (sent == -KERNEL_EAGAIN) {
-                        uint64_t now = target ? kernel_time_monotonic_ns() : 0;
-                        int waited = target && now >= target ? -KERNEL_EAGAIN :
-                            socket_wait_ready(description, KERNEL_POLLOUT,
-                                              target ? target-now : 0, socket_flags);
-                        if (waited == 0) continue;
-                        if (total && waited == -KERNEL_ERESTARTSYS)
-                            kernel_signal_clear_syscall_restart(kernel_task_current());
-                        sent = waited;
-                    }
-                    if (sent < 0) {
-                        *linux_result = total != 0U ? (int64_t)total : sent;
-                        return KERNEL_FILES_STATUS_OK;
-                    }
-                    if (sent == 0 || (size_t)sent > copied - consumed)
-                        return KERNEL_FILES_STATUS_STATE;
-                    consumed += (size_t)sent;
-                    total += (uint64_t)sent;
-                    offset += (uint64_t)sent;
-                    /* fault或非阻塞仍返回本次已接受前缀。 */
-                    if (access == KERNEL_UACCESS_STATUS_FAULT || (consumed < copied &&
-                        ((kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK) ||
-                         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
-                        *linux_result = (int64_t)total;
-                        return KERNEL_FILES_STATUS_OK;
-                    }
-                }
-            }
-        }
-        *linux_result = (int64_t)total;
-        return KERNEL_FILES_STATUS_OK;
-    }
+
     if (!description->device) return KERNEL_FILES_STATUS_STATE;
     for (size_t index = 0U; index < iov_count && total < count; index++) {
         uint64_t offset = 0U;
@@ -1368,6 +1322,45 @@ static enum kernel_files_status buffered_write_request(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status unix_write_request(struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
+    uint32_t flags, int64_t *linux_result)
+{
+    struct kernel_open_file_description *borrowed=description;
+    struct kernel_socket *socket=kernel_open_file_socket(description);
+    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
+    uint64_t total=0,target=0,timeout=kernel_socket_send_timeout(socket);
+    if (timeout) {
+        uint64_t now=kernel_time_monotonic_ns();
+        target=UINT64_MAX-now<timeout?UINT64_MAX:now+timeout;
+    }
+    do {
+        int fault=0;
+        int result=kernel_socket_write_unix(&description,mm,&cursor,count-total,
+            flags|KERNEL_SOCKET_MSG_DONTWAIT,&fault);
+        if (result==-KERNEL_EAGAIN) {
+            uint64_t now=target?kernel_time_monotonic_ns():0;
+            result=target && now>=target?-KERNEL_EAGAIN:socket_wait_ready(borrowed,
+                KERNEL_POLLOUT,target?target-now:0,flags);
+            if (!result) continue;
+            if (total && result==-KERNEL_ERESTARTSYS)
+                kernel_signal_clear_syscall_restart(kernel_task_current());
+        }
+        if (result<0) {
+            if (!total && result==-KERNEL_EPIPE && !(flags&KERNEL_SOCKET_MSG_NOSIGNAL))
+                (void)kernel_signal_send_task(kernel_task_current(),13U,0);
+            *linux_result=total?(int64_t)total:result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        total+=(uint64_t)result;
+        if (result>0) KERNEL_FILES_NOTE(files,write_chunks,1);
+        if (!result || fault) break;
+    } while (total<count);
+    *linux_result=(int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status tcp_write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1383,60 +1376,86 @@ static enum kernel_files_status tcp_write_request(
     uint64_t total = 0, target = 0, timeout = kernel_socket_send_timeout(socket);
     size_t staged = 0, consumed = 0;
     int fault = 0;
+    const int direct = iov_count == 1;
     if (timeout) {
         uint64_t now = kernel_time_monotonic_ns();
         target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
     }
     kernel_socket_stream_begin(&request, &description);
     do {
-        uint64_t address = 0;
         size_t chunk = staged - consumed;
         if (!chunk && count) {
-            size_t limit = count - total < BOAROS_PAGE_SIZE ? (size_t)(count - total) : BOAROS_PAGE_SIZE;
-            chunk = kernel_uaccess_iov_span(&cursor, limit, &address);
-            if (!chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
+            chunk=count-total<BOAROS_PAGE_SIZE?(size_t)(count-total):BOAROS_PAGE_SIZE;
         }
+        uint64_t address = 0;
+        if (direct && count) chunk = kernel_uaccess_iov_span(&cursor, chunk, &address);
         int result = kernel_socket_stream_reserve(&request, (uint32_t)chunk, flags);
         size_t copied_now = 0;
         if (result >= 0) {
             if (!count) { *linux_result = 0; break; }
             if (!result || (size_t)result > chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
             chunk = (size_t)result;
-            if (staged == consumed) {
-                if (!buffer.allocator) {
-                    if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
-                        *linux_result = total ? (int64_t)total : -KERNEL_ENOMEM; break;
+            if (direct) {
+                struct kernel_mm_user_pin pin = {0};
+                enum kernel_uaccess_status access = kernel_uaccess_pin_user_page(mm,
+                    address, KERNEL_MM_READ, &pin);
+                if (access != KERNEL_UACCESS_STATUS_OK) {
+                    if (access == KERNEL_UACCESS_STATUS_FAULT)
+                        *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
+                    else status = KERNEL_FILES_STATUS_STATE;
+                    break;
+                }
+                /* COPY在协议接纳时持有ACK前版本。未接纳的用户页不跨等待保留，
+                 * 让munmap/mprotect可以排空pin，重试重新读取尚未接纳的输入。 */
+                result = kernel_socket_stream_commit(&request,
+                    (const unsigned char *)pin.page + (address & BOAROS_PAGE_MASK),
+                    (uint32_t)chunk, flags | ((total + chunk < count) ? KERNEL_SOCKET_IO_MORE : 0));
+                kernel_mm_unpin_user_page(&pin);
+            } else {
+                if (staged == consumed) {
+                    if (!buffer.allocator) {
+                        if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
+                            *linux_result = total ? (int64_t)total : -KERNEL_ENOMEM; break;
+                        }
+                        COST_IO_ADD(5, BOAROS_PAGE_SIZE);
                     }
-                    COST_IO_ADD(5, BOAROS_PAGE_SIZE);
+                    KERNEL_FILES_NOTE(files, write_chunks, 1);
+                    enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
+                        buffer.data, chunk, &copied_now);
+                    if ((access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT) ||
+                        copied_now > chunk || (access == KERNEL_UACCESS_STATUS_OK && copied_now != chunk)) {
+                        status = KERNEL_FILES_STATUS_STATE; break;
+                    }
+                    fault = access == KERNEL_UACCESS_STATUS_FAULT;
+                    if (!copied_now) { *linux_result = total ? (int64_t)total : -KERNEL_EFAULT; break; }
+                    staged = copied_now; consumed = 0; chunk = copied_now;
                 }
-                KERNEL_FILES_NOTE(files, write_chunks, 1);
-                enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
-                    buffer.data, chunk, &copied_now);
-                if ((access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT) ||
-                    copied_now > chunk || (access == KERNEL_UACCESS_STATUS_OK && copied_now != chunk)) {
-                    status = KERNEL_FILES_STATUS_STATE; break;
-                }
-                fault = access == KERNEL_UACCESS_STATUS_FAULT;
-                if (!copied_now) { *linux_result = total ? (int64_t)total : -KERNEL_EFAULT; break; }
-                staged = copied_now; consumed = 0; chunk = copied_now;
+                result = kernel_socket_stream_commit(&request,
+                    (const unsigned char *)buffer.data + consumed, (uint32_t)chunk,
+                    flags|((!fault && total+chunk<count)?KERNEL_SOCKET_IO_MORE:0));
             }
-            result = kernel_socket_stream_commit(&request,
-                (const unsigned char *)buffer.data + consumed, (uint32_t)chunk, flags);
         }
         if (result == -KERNEL_EAGAIN) {
             if (!total) COST_ADD(STREAM_COPY_BLOCKED_BYTES, copied_now);
             uint64_t now = target ? kernel_time_monotonic_ns() : 0;
             result = target && now >= target ? -KERNEL_EAGAIN : socket_wait_ready(borrowed,
                 KERNEL_POLLOUT, target ? target - now : 0, flags);
-            if (!result) continue; /* 暂存尾部留在当前请求，下次只重取接纳预算。 */
+            if (!result) continue; /* gather保留暂存尾部；单iov重新pin未接纳的来源。 */
             if (total && result == -KERNEL_ERESTARTSYS)
                 kernel_signal_clear_syscall_restart(kernel_task_current());
         }
         if (result < 0) { *linux_result = total ? (int64_t)total : result; break; }
-        if (!result || (size_t)result > staged - consumed) { status = KERNEL_FILES_STATUS_STATE; break; }
-        consumed += (size_t)result; total += (uint64_t)result;
+        if (!result || (size_t)result > (direct ? chunk : staged - consumed)) {
+            status = KERNEL_FILES_STATUS_STATE; break;
+        }
+        if (direct) {
+            cursor.offset += (size_t)result;
+            KERNEL_FILES_NOTE(files, write_chunks, 1);
+            COST_ADD(COPY_FROM_USER, result); COST_IO_ADD(3, result);
+        } else consumed += (size_t)result;
+        total += (uint64_t)result;
         *linux_result = (int64_t)total;
-        if (fault || (consumed < staged && ((kernel_open_file_flags(borrowed) & KERNEL_FILES_O_NONBLOCK) ||
+        if (fault || ((direct ? (size_t)result < chunk : consumed < staged) && ((kernel_open_file_flags(borrowed) & KERNEL_FILES_O_NONBLOCK) ||
             (flags & KERNEL_SOCKET_MSG_DONTWAIT)))) break;
     } while (total < count);
     kernel_socket_stream_finish(&request);
@@ -1476,6 +1495,11 @@ static enum kernel_files_status write_request(
         if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
         return status;
     }
+    if (kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_SOCKET) {
+        enum kernel_files_status status=unix_write_request(files,mm,description,iov,iov_count,count,socket_flags,linux_result);
+        if (status==KERNEL_FILES_STATUS_OK) COST_IO_ADD(2,*linux_result>0?(uint64_t)*linux_result:0);
+        return status;
+    }
     KERNEL_LOCK_SCOPE(offset_guard);
     if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
          kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
@@ -1490,23 +1514,11 @@ static enum kernel_files_status write_request(
         status=regular_write_request(files,mm,description,iov,iov_count,count,
             positioned,requested_offset,linux_result);
     } else {
-        struct kernel_task_io_buffer buffer = {0};
         unsigned char small[KERNEL_FILES_WRITE_STAGING];
         unsigned char *staging = small;
         size_t capacity = sizeof(small);
-        if (count != 0U && kind==KERNEL_OPEN_FILE_KIND_SOCKET) {
-            if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
-                    KERNEL_TASK_STATUS_OK) {
-                *linux_result = -KERNEL_ENOMEM;
-                return KERNEL_FILES_STATUS_OK;
-            }
-            staging = buffer.data;
-            capacity = BOAROS_PAGE_SIZE;
-            COST_IO_ADD(5, BOAROS_PAGE_SIZE);
-        }
         status=buffered_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result,staging,capacity,socket_flags);
-        if (buffer.allocator != 0) kernel_task_io_buffer_release(&buffer);
+            positioned,requested_offset,linux_result,staging,capacity);
     }
     if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
     if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&

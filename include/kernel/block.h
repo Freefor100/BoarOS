@@ -60,12 +60,20 @@ typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
 typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
     void *context, const struct kernel_block_span *spans, size_t count);
 
+/* Restartable immutable producer for one journal I/O phase. The owner has
+ * already established disjoint disk ranges. Each span is sector aligned. */
+typedef int (*kernel_block_phase_next_fn)(const void **cursor,
+    struct kernel_block_span *span);
+typedef enum kernel_block_status (*kernel_block_write_phase_fn)(void *context,
+    kernel_block_phase_next_fn next, const void *first);
+
 struct kernel_block_device {
     void *context;
     kernel_block_read_fn read;
     kernel_block_write_fn write;
     kernel_block_write_batch_fn write_batch;
     kernel_block_read_batch_fn read_batch;
+    kernel_block_write_phase_fn write_phase;
     uint64_t capacity_bytes;
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
@@ -116,6 +124,14 @@ enum kernel_block_status kernel_block_write_batch(
     struct kernel_block_device *device,
     const struct kernel_block_span *spans,
     size_t count);
+
+/* Internal journal phase: preflight the entire restartable producer before
+ * publishing I/O. Payloads and producer nodes remain stable until return,
+ * including on errors. Unlike write_batch, disjointness is established by the
+ * journal's block ownership/indexes; this interface validates alignment,
+ * capacity and RAM bounds. A missing callback writes in producer order. */
+enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
+    kernel_block_phase_next_fn next, const void *first);
 
 /* Preflight all spans before I/O. Disk ranges may overlap, but mutable outputs
  * must be disjoint from each other and these descriptors. Every span reports

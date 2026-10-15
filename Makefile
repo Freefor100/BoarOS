@@ -1289,7 +1289,7 @@ $(BUILD_DIR)/%.o: %.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o: \
+$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o $(BUILD_DIR)/fs/page_cache.o: \
 	CPPFLAGS += $(LWEXT4_CPPFLAGS)
 
 $(BUILD_DIR)/third_party/lwip/src/core/%.o \
@@ -2115,6 +2115,14 @@ test-pty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+
+.PHONY: test-poll-host
+test-poll-host:
+	@mkdir -p build/host
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections -idirafter include \
+		-fsanitize=address,undefined tests/host/poll_snapshot.c -o build/host/poll-snapshot
+	build/host/poll-snapshot
 
 .PHONY: test-epoll-host test-epoll-riscv
 test-epoll-host:

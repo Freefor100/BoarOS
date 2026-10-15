@@ -183,6 +183,27 @@ static void poll_restore_sigmask(
     }
 }
 
+/* 保留本次观察到的完整结果，返回前不再查询一次可能已变化的设备状态。 */
+static int poll_snapshot(struct kernel_pollfd *pfds,
+    struct kernel_open_file_description **pinned, uint32_t nfds)
+{
+    int ready = 0;
+    for (uint32_t i = 0; i < nfds; i++) {
+        uint32_t events = 0;
+        if (pfds[i].fd >= 0) {
+            if (!pinned[i]) events = KERNEL_POLLNVAL;
+            else {
+                struct kernel_wait_queue *queue = 0;
+                events = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue)
+                    & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
+            }
+        }
+        pfds[i].revents = (int16_t)events;
+        ready += events != 0U;
+    }
+    return ready;
+}
+
 static int core_poll_run(
     struct kernel_files *files,
     struct kernel_task *task,
@@ -204,7 +225,7 @@ static int core_poll_run(
 
     if (nfds > KERNEL_POLL_STACK_CAPACITY) {
         size_t alloc_size =
-            nfds * (sizeof(*pinned) + sizeof(*nodes));
+            nfds * (sizeof(*pinned) + (immediate ? 0U : sizeof(*nodes)));
         enum kernel_heap_status h_status =
             kernel_heap_allocate(files->heap, alloc_size, &heap_block);
         if (h_status != KERNEL_HEAP_STATUS_OK) {
@@ -218,7 +239,7 @@ static int core_poll_run(
 
     for (uint32_t i = 0; i < nfds; i++) {
         pinned[i] = 0;
-        kernel_wait_node_init(&nodes[i], task);
+        if (!immediate) kernel_wait_node_init(&nodes[i], task);
     }
 
     /* First pass: pin descriptors and check for initial readiness */
@@ -270,25 +291,13 @@ static int core_poll_run(
                     break;
                 }
             }
-            for (uint32_t i = 0; i < nfds && !error; i++) {
-                if (!pinned[i]) continue;
-                struct kernel_wait_queue *queue = 0;
-                uint32_t active = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
-                if (active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL))
-                    ready_count++;
-            }
+            if (!error) ready_count = poll_snapshot(pfds, pinned, nfds);
             if (!ready_count && !error && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
                 error = -KERNEL_EIO;
             if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
             if (error || ready_count) break;
             if (reason == KERNEL_WAIT_SIGNALLED) { error = -KERNEL_EINTR; break; }
-            for (uint32_t i = 0; i < nfds; i++) {
-                if (!pinned[i]) continue;
-                struct kernel_wait_queue *queue = 0;
-                uint32_t active = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
-                if (active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL))
-                    ready_count++;
-            }
+            ready_count = poll_snapshot(pfds, pinned, nfds);
             if (reason == KERNEL_WAIT_TIMEOUT) break;
         }
 
@@ -298,32 +307,6 @@ static int core_poll_run(
 
     int interrupted = (error == -KERNEL_EINTR);
     poll_restore_sigmask(task, saved_mask, mask_modified, interrupted);
-
-    if (error == 0) {
-        /* Compute final revents and count */
-        ready_count = 0;
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (pfds[i].fd < 0) {
-                pfds[i].revents = 0;
-                continue;
-            }
-            if (pinned[i] == 0) {
-                pfds[i].revents = (int16_t)KERNEL_POLLNVAL;
-                ready_count++;
-                continue;
-            }
-            struct kernel_wait_queue *wq = 0;
-            uint32_t active = kernel_open_file_poll(
-                pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
-            uint32_t rev =
-                active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR |
-                          KERNEL_POLLHUP | KERNEL_POLLNVAL);
-            pfds[i].revents = (int16_t)rev;
-            if (rev != 0U) {
-                ready_count++;
-            }
-        }
-    }
 
     /* Release all pinned OFDs */
     for (uint32_t i = 0; i < nfds; i++) {

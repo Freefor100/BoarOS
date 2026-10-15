@@ -4,6 +4,7 @@
 #include <kernel/mm_backend.h>
 #include <kernel/page_cache.h>
 #include <kernel/tmpfs.h>
+#include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/block.h>
 #include <kernel/cpu.h>
@@ -318,6 +319,62 @@ static void initialize(struct physical_page_allocator *pages,struct kernel_heap 
     assert(!physical_page_allocator_init(pages,&layout) && !physical_page_allocator_bind_access(pages,access_page) &&
         !physical_page_allocator_finalize(pages) && !kernel_heap_init(heap,pages,page_address));
 }
+static void sendfile_pipe_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};
+    struct kernel_open_file_description *source=0;
+    int error;int64_t result;size_t done;
+    unsigned char data[BOAROS_PAGE_SIZE+43],actual[BOAROS_PAGE_SIZE+17];
+    for (size_t i=0;i<sizeof(data);i++) data[i]=(unsigned char)(i*17U+3U);
+    assert(!kernel_open_file_create_mode(heap,mount,"/sendfile-source",0600,&source,&error) && !error);
+    source->open_flags=2;assert(!kernel_vfs_file_acquire_write(&source->file));
+    assert(!kernel_vfs_pwrite(&source->file,0,data,sizeof(data),&done) && done==sizeof(data));
+    struct kernel_open_file_description *source_file=source;
+    assert(!kernel_files_create(&local,heap) && !kernel_files_install_new_owned_at(&local,0,0,&source));
+    assert(!kernel_files_pipe2(&local,&mm,0x200000,KERNEL_FILES_O_NONBLOCK,&result) && !result);
+    int pair[2];assert(!kernel_copy_from_user(&mm,pair,0x200000,sizeof(pair),&done) && done==sizeof(pair));
+    int64_t offset=13;assert(!kernel_copy_to_user(&mm,0x200080,&offset,sizeof(offset),&done));
+    assert(!kernel_files_sendfile(&local,&mm,pair[1],0,0x200080,sizeof(actual),&result) && result==sizeof(actual));
+    assert(!kernel_copy_from_user(&mm,&offset,0x200080,sizeof(offset),&done) && offset==13+(int64_t)sizeof(actual));
+    assert(!kernel_files_read(&local,&mm,pair[0],0x200000,sizeof(actual),&result) && result==sizeof(actual));
+    assert(!kernel_copy_from_user(&mm,actual,0x200000,sizeof(actual),&done) && done==sizeof(actual) &&
+        !memcmp(actual,data+13,sizeof(actual)));
+    assert(!kernel_vfs_ftruncate(&source_file->file,4U*BOAROS_PAGE_SIZE));
+    uint64_t physical;size_t valid;
+    int memory=kernel_open_file_memory_backed(source_file);
+    if (memory) assert(kernel_open_file_lookup_page(source_file,2,&physical,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    offset=2U*BOAROS_PAGE_SIZE+7U;
+    assert(!kernel_copy_to_user(&mm,0x200080,&offset,sizeof(offset),&done));
+    assert(!kernel_files_sendfile(&local,&mm,pair[1],0,0x200080,17,&result) && result==17);
+    assert(!kernel_files_read(&local,&mm,pair[0],0x200000,17,&result) && result==17);
+    assert(!kernel_copy_from_user(&mm,actual,0x200000,17,&done) && done==17);
+    for (size_t i=0;i<17;i++) assert(!actual[i]);
+    if (memory) assert(kernel_open_file_lookup_page(source_file,2,&physical,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    assert(!kernel_files_release(&local));
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    puts("PASS sendfile source-page borrow: unaligned cross-page pipe content, sparse zero bytes and explicit offset");
+}
+
+static void borrowed_page_case(struct physical_page_allocator *pages)
+{
+    struct kernel_task_io_buffer scratch={0},borrowed={0};
+    assert(!kernel_task_io_buffer_acquire(&scratch,pages));
+    uint64_t retained=scratch.physical_address;
+    kernel_task_io_buffer_release(&scratch);
+    uint64_t before=physical_page_available(pages),physical;
+    assert(!physical_page_allocate(pages,&physical));
+    kernel_task_io_buffer_take_page(&borrowed,pages,physical);
+    assert(borrowed.physical_address==physical && !borrowed.retained_scratch);
+    kernel_task_io_buffer_release(&borrowed);
+    assert(physical_page_available(pages)==before);
+    assert(!kernel_task_io_buffer_acquire(&scratch,pages) && scratch.physical_address==retained);
+    kernel_task_io_buffer_release(&scratch);
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+}
+
+#ifdef TCP_IO_CASES
+#include "tcp_usercopy_cases.h"
+#endif
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -325,6 +382,7 @@ int main(int argc,char **argv)
     struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
+    borrowed_page_case(&pages);
     struct arch_mmu_page_table kernel={0}; struct arch_mmu_user_space user={0};
     assert(!riscv_sv39_page_table_init(&kernel,&pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
     assert(!arch_mmu_user_space_init(&user,&pages,&kernel) && !kernel_mm_create(&mm,&user) &&
@@ -336,8 +394,11 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+#ifdef TCP_IO_CASES
+    tcp_usercopy_case(&heap);
+#endif
     struct kernel_vfs_mount *memory=0;
-    assert(!kernel_tmpfs_create(&heap,0,"",&memory)); file_case(&heap,memory,0);
+    assert(!kernel_tmpfs_create(&heap,0,"",&memory)); sendfile_pipe_case(&heap,memory); file_case(&heap,memory,0);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,memory,0,actors,append);
     assert(!kernel_vfs_unmount(memory));
@@ -346,6 +407,7 @@ int main(int argc,char **argv)
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=flush_image,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)

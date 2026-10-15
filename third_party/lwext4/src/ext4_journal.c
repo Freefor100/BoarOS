@@ -338,6 +338,11 @@ RB_GENERATE_INTERNAL(jbd_block, jbd_block_rec, block_rec_node,
 RB_GENERATE_INTERNAL(jbd_revoke_tree, jbd_revoke_rec, revoke_node,
 		     jbd_revoke_rec_cmp, static inline)
 
+static int jbd_quarantine_cmp(struct jbd_quarantine *a, struct jbd_quarantine *b)
+{ return a->first < b->first ? -1 : a->first > b->first; }
+RB_GENERATE_INTERNAL(jbd_quarantine_tree, jbd_quarantine, index_node,
+		     jbd_quarantine_cmp, static inline)
+
 #define jbd_alloc_revoke_entry() ext4_calloc(1, sizeof(struct revoke_entry))
 #define jbd_free_revoke_entry(addr) ext4_free(addr)
 
@@ -805,6 +810,9 @@ static int jbd_block_set(struct jbd_fs *jbd_fs,
  * ordered data. Otherwise a later ENOMEM could roll back inode size while
  * leaving already-written data outside the aborted size change visible. */
 struct jbd_log_block {
+	struct ext4_block_write io;
+	struct ext4_block_write *escaped_rest;
+	const void *escaped_prefix;
 	struct ext4_block block;
 	struct jbd_image *image;
 	TAILQ_ENTRY(jbd_log_block) node;
@@ -976,99 +984,78 @@ static void jbd_release_prepared(struct jbd_trans *trans)
 	trans->reserved_log_images = 0;
 }
 
-struct jbd_io_batch {
-	struct ext4_block_span spans[EXT4_BLOCK_BATCH_MAX];
-	unsigned count;
-};
-static int jbd_batch_flush(struct ext4_blockdev *bdev, struct jbd_io_batch *batch)
+/* Nodes belong to the already charged stable version/control owners. The
+ * phase adds neither an array allocation nor another payload version. */
+struct jbd_io_phase { struct ext4_block_write *first, *last; };
+static void jbd_phase_add(struct jbd_journal *journal, struct jbd_io_phase *phase,
+    struct ext4_block_write *io, const void *data, ext4_fsblk_t block,
+    uint32_t within, size_t size)
 {
-	int r = ext4_blocks_set_batch(bdev, batch->spans, batch->count);
-	batch->count = 0;
-	return r;
+    struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
+    *io = (struct ext4_block_write){block * journal->block_size + within + bdev->part_offset,
+        data, size, NULL};
+    struct ext4_block_write *last = phase->last;
+    if (last && last->offset <= UINT64_MAX - last->size &&
+        last->offset + last->size == io->offset &&
+        last->size <= UINTPTR_MAX - (uintptr_t)last->data &&
+        (uintptr_t)last->data + last->size == (uintptr_t)io->data &&
+        io->size <= SIZE_MAX - last->size) {
+        last->size += io->size;
+        return;
+    }
+    if (last) last->next = io;
+    else phase->first = io;
+    phase->last = io;
 }
-static int jbd_batch_add(struct ext4_blockdev *bdev, struct jbd_io_batch *batch,
-	const void *data, ext4_fsblk_t block)
+static void jbd_ordered_phase(struct jbd_trans *trans, struct jbd_io_phase *phase)
 {
-	bool conflict = false;
-	for (unsigned i = 0; i < batch->count; i++)
-		if (block >= batch->spans[i].block &&
-		    block - batch->spans[i].block < batch->spans[i].count) conflict = true;
-	/* 同 LBA 的旧版本必须完成后才能发布下一版，不能乱序覆盖 home。 */
-	if (conflict) {
-		int r = jbd_batch_flush(bdev, batch);
-		if (r != EOK) return r;
-	}
-	if (batch->count) {
-		struct ext4_block_span *last = &batch->spans[batch->count - 1];
-		uint32_t ratio = bdev->lg_bsize / bdev->bdif->ph_bsize;
-		/* FS block owners stay separate; adjacent bytes of a stable page
-		 * share one I/O span, including when all eight span slots are used. */
-		if (last->count < UINT32_MAX / ratio &&
-		    last->count < SIZE_MAX / bdev->lg_bsize &&
-		    last->count < (UINTPTR_MAX - (uintptr_t)last->data) / bdev->lg_bsize &&
-		    last->block <= UINT64_MAX - last->count &&
-		    last->block + last->count == block &&
-		    (uintptr_t)last->data + (size_t)last->count * bdev->lg_bsize == (uintptr_t)data) {
-			last->count++;
-			return EOK;
-		}
-	}
-	if (batch->count == EXT4_BLOCK_BATCH_MAX) {
-		int r = jbd_batch_flush(bdev, batch);
-		if (r != EOK) return r;
-	}
-	batch->spans[batch->count++] = (struct ext4_block_span){data, block, 1};
-	return EOK;
+    struct jbd_data *data;
+    TAILQ_FOREACH(data, &trans->data_queue, node)
+        jbd_phase_add(trans->journal, phase, &data->io, data->block.data,
+            data->block.lb_id, 0, trans->journal->block_size);
 }
-
+static void jbd_prepare_phase(struct jbd_trans *trans)
+{
+    struct jbd_journal *journal = trans->journal;
+    struct jbd_io_phase phase = {0};
+    jbd_ordered_phase(trans, &phase);
+    struct jbd_log_block *log;
+    TAILQ_FOREACH(log, &trans->log_queue, node) {
+        if (!TAILQ_NEXT(log, node)) break;
+        if (log->escaped_prefix) {
+            uint32_t prefix = journal->jbd_fs->bdev->bdif->ph_bsize;
+            if (prefix < sizeof(uint32_t)) prefix = sizeof(uint32_t);
+            memcpy((void *)log->escaped_prefix, log->block.data, prefix);
+            ((struct jbd_bhdr *)log->escaped_prefix)->magic = 0;
+            jbd_phase_add(journal, &phase, &log->io, log->escaped_prefix,
+                log->block.lb_id, 0, prefix);
+            if (prefix < journal->block_size)
+                jbd_phase_add(journal, &phase, log->escaped_rest, log->block.data + prefix,
+                    log->block.lb_id, prefix, journal->block_size - prefix);
+        } else jbd_phase_add(journal, &phase, &log->io, log->block.data,
+            log->block.lb_id, 0, journal->block_size);
+    }
+    trans->io_head = phase.first;
+}
 static int jbd_write_prepared(struct jbd_trans *trans, bool *submitted)
 {
-	struct jbd_fs *fs = trans->journal->jbd_fs;
-	struct ext4_blockdev *bdev = fs->bdev;
-	struct jbd_io_batch batch = {0};
-	struct jbd_log_block *log;
-	void *escape_scratch = NULL;
-	int r = EINVAL;
-	/* Control images are private to this submission. Payloads borrow the
-	 * version already owned by the transaction through checkpoint. */
-	TAILQ_FOREACH(log, &trans->log_queue, node) {
-		if (!TAILQ_NEXT(log, node)) {
-			/* The commit follows every data write and its durability barrier. */
-			r = jbd_batch_flush(bdev, &batch);
-			if (r != EOK) break;
-			r = ext4_blockdev_flush(bdev);
-			if (r != EOK) break;
-			*submitted = true;
-			r = ext4_blocks_set_direct(bdev, log->block.data, log->block.lb_id, 1);
-			if (r == EOK) r = ext4_blockdev_flush(bdev);
-			break;
-		}
-		struct jbd_bhdr *header = (void *)log->block.data;
-		if (log->image && jbd_get32(header, blocktype) == JBD_DESCRIPTOR_BLOCK)
-			escape_scratch = log->block.data;
-		if (!log->image && header->magic == to_be32(JBD_MAGIC_NUMBER)) {
-			if (!escape_scratch) __builtin_trap();
-			/* 先完成 descriptor 的 DMA，才复用其独占 image 暂存首扇区。
-			 * 后续扇区直接借原版本，checkpoint 始终看到未转义的首字。 */
-			r = jbd_batch_flush(bdev, &batch);
-			if (r != EOK) break;
-			uint32_t prefix = bdev->bdif->ph_bsize;
-			if (prefix < sizeof(uint32_t)) prefix = sizeof(uint32_t);
-			memcpy(escape_scratch, log->block.data, prefix);
-			((struct jbd_bhdr *)escape_scratch)->magic = 0;
-			uint64_t offset = log->block.lb_id * bdev->lg_bsize;
-			r = ext4_block_writebytes(bdev, offset, escape_scratch, prefix);
-			if (r != EOK) break;
-			if (prefix < bdev->lg_bsize)
-				r = ext4_block_writebytes(bdev, offset + prefix,
-					log->block.data + prefix, bdev->lg_bsize - prefix);
-		} else r = jbd_batch_add(bdev, &batch, log->block.data, log->block.lb_id);
-		if (r != EOK) break;
-	}
-	/* Only grouped submission runs outside the modification lock. Its
-	 * control allocations are returned by retire under that lock. */
-	if (!trans->frozen) jbd_release_prepared(trans);
-	return r;
+    struct ext4_blockdev *bdev = trans->journal->jbd_fs->bdev;
+    if (!trans->frozen) jbd_prepare_phase(trans);
+    int r;
+    {
+        COST_PHASE_SCOPE(precommit_body, 2);
+        r = ext4_blocks_set_phase(bdev, trans->io_head);
+        if (r == EOK) r = ext4_blockdev_flush(bdev);
+    }
+    if (r == EOK) {
+        struct jbd_log_block *commit = TAILQ_LAST(&trans->log_queue, jbd_trans_log);
+        if (!commit) __builtin_trap();
+        *submitted = true;
+        r = ext4_blocks_set_direct(bdev, commit->block.data, commit->block.lb_id, 1);
+        if (r == EOK) r = ext4_blockdev_flush(bdev);
+    }
+    if (!trans->frozen) jbd_release_prepared(trans);
+    return r;
 }
 
 /**@brief  helper functions to calculate
@@ -2174,7 +2161,7 @@ const void *jbd_journal_read_data(struct ext4_fs *fs, ext4_fsblk_t lba)
 }
 
 struct jbd_source {
-	struct ext4_data_source owner;
+	struct file_data_source owner;
 	size_t blocks;
 	RB_ENTRY(jbd_source) node;
 };
@@ -2186,7 +2173,7 @@ static int jbd_source_cmp(struct jbd_source *a, struct jbd_source *b)
 RB_GENERATE_INTERNAL(jbd_source_tree, jbd_source, node, jbd_source_cmp, static inline)
 
 static int jbd_source_borrow(struct jbd_journal *journal,
-	const struct ext4_data_source *owner, struct jbd_source **out)
+	const struct file_data_source *owner, struct jbd_source **out)
 {
 	struct jbd_source key = { .owner.context = owner->context };
 	struct jbd_source *source = RB_FIND(jbd_source_tree, &journal->sources, &key);
@@ -2237,7 +2224,7 @@ static void jbd_data_free(struct jbd_journal *journal, struct jbd_data *data)
 
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 	uint32_t offset, const void *input, uint32_t length, bool initialize,
-	const struct ext4_data_source *source)
+	const struct file_data_source *source)
 {
 	struct jbd_journal *journal = trans->journal;
 	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
@@ -2317,14 +2304,10 @@ static void jbd_trans_release_data(struct jbd_trans *trans, bool abort __unused)
 
 static int jbd_trans_write_ordered(struct jbd_trans *trans)
 {
-	struct ext4_blockdev *bdev = trans->journal->jbd_fs->bdev;
-	struct jbd_data *data;
-	struct jbd_io_batch batch = {0};
-	TAILQ_FOREACH(data, &trans->data_queue, node) {
-		int r = jbd_batch_add(bdev, &batch, data->block.data, data->block.lb_id);
-		if (r) return r;
-	}
-	return jbd_batch_flush(bdev, &batch);
+    COST_PHASE_SCOPE(data_only, 1);
+    struct jbd_io_phase phase = {0};
+    jbd_ordered_phase(trans, &phase);
+    return ext4_blocks_set_phase(trans->journal->jbd_fs->bdev, phase.first);
 }
 
 /**@brief  Add block to a transaction and mark it dirty.
@@ -2349,7 +2332,7 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 		if (jbd_buf && jbd_buf->trans == trans) {
 			jbd_buf->modified = true;
 			ext4_bcache_set_dirty(block->buf);
-			return EOK;
+			goto Escape;
 		}
 	}
 	jbd_buf = jbd_alloc(trans->journal, sizeof(struct jbd_buf));
@@ -2358,6 +2341,7 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 
 	if ((block_rec = jbd_trans_insert_block_rec(trans,
 					block->lb_id)) == NULL) {
+		jbd_free(jbd_buf->escaped_prefix);
 		jbd_free(jbd_buf);
 		return ENOMEM;
 	}
@@ -2392,6 +2376,13 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 		jbd_free(rec);
 	}
 
+Escape:
+    if (((struct jbd_bhdr *)block->data)->magic == to_be32(JBD_MAGIC_NUMBER) && !jbd_buf->escaped_prefix) {
+        uint32_t prefix = trans->journal->jbd_fs->bdev->bdif->ph_bsize;
+        if (prefix < sizeof(uint32_t)) prefix = sizeof(uint32_t);
+        jbd_buf->escaped_prefix = jbd_alloc(trans->journal, prefix);
+        if (!jbd_buf->escaped_prefix) return trans->error = ENOMEM;
+    }
 	return EOK;
 }
 
@@ -2417,7 +2408,15 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 	bool dirty = ext4_bcache_test_flag(block->buf, BC_DIRTY);
 	int r = jbd_trans_set_block_dirty(trans, block);
 	if (r != EOK) {
-		jbd_image_free(before);
+		jb = block->buf->end_write == jbd_trans_end_write ? block->buf->end_write_arg : NULL;
+		if (jb && jb->trans == trans) {
+			/* Escaped-sector reservation can fail after access ownership was
+			 * installed. Abort still needs the original bytes, even before the
+			 * caller performed its first mutation. */
+			jb->before = before;
+			jb->was_dirty = dirty;
+			jb->modified = false;
+		} else jbd_image_free(before);
 		return r;
 	}
 	jb = block->buf->end_write_arg;
@@ -2566,6 +2565,7 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 			jbd_image_free(jbd_buf->after);
 		}
 		jbd_image_free(jbd_buf->before);
+		jbd_free(jbd_buf->escaped_prefix);
 		jbd_free(jbd_buf);
 	}
 	RB_FOREACH_SAFE(rec, jbd_revoke_tree, &trans->revoke_root,
@@ -2579,7 +2579,14 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 	}
 
 	struct jbd_quarantine *q;
-	while ((q = LIST_FIRST(&trans->quarantine))) { LIST_REMOVE(q, node); jbd_free(q); }
+	while ((q = LIST_FIRST(&trans->quarantine))) {
+		LIST_REMOVE(q, node);
+		RB_REMOVE(jbd_quarantine_tree, &journal->quarantine_index[q->inode], q);
+		uint64_t *count = q->inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;
+		if (*count < q->count) __builtin_trap();
+		*count -= q->count;
+		jbd_free(q);
+	}
 	jbd_image_free(trans->checkpoint_image);
 	jbd_free(trans);
 }
@@ -2652,6 +2659,7 @@ static void jbd_trans_prune(struct jbd_journal *journal, struct jbd_trans *trans
 			jbd_image_free(jbd_buf->after);
 		}
 		jbd_image_free(jbd_buf->before);
+		jbd_free(jbd_buf->escaped_prefix);
 		jbd_free(jbd_buf);
 	}
 }
@@ -2763,6 +2771,12 @@ again:
 			break;
 		}
 
+        if (is_escape) {
+            if (!jbd_buf->escaped_prefix) __builtin_trap();
+            struct jbd_log_block *log = TAILQ_LAST(&trans->log_queue, jbd_trans_log);
+            log->escaped_prefix = jbd_buf->escaped_prefix;
+            log->escaped_rest = &jbd_buf->home_io;
+        }
 		rc = jbd_prepare_block_set(trans, &data_block);
 		if (rc != EOK) {
 			desc_iblock = 0;
@@ -2935,6 +2949,7 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 	}
 
 	jbd_image_free(jbd_buf->before);
+	jbd_free(jbd_buf->escaped_prefix);
 	jbd_free(jbd_buf);
 
 	trans->written_cnt++;
@@ -2983,20 +2998,14 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		rc = jbd_trans_write_ordered(trans);
 		if (!rc && trans->ordered_count)
 			rc = ext4_blockdev_flush(journal->jbd_fs->bdev);
-		jbd_journal_free_trans(journal, trans, rc != EOK);
+		if (rc != EOK) goto Finish;
+		jbd_journal_free_trans(journal, trans, false);
 		return rc;
 	}
 
 	rc = jbd_trans_prepare_commit_block(trans);
 	if (rc != EOK)
 		goto Finish;
-	rc = jbd_trans_write_ordered(trans);
-	if (rc != EOK) {
-		journal->last = old_last;
-		jbd_journal_free_trans(journal, trans, true);
-		return rc;
-	}
-
 	rc = jbd_write_prepared(trans, &commit_submitted);
 	if (rc != EOK)
 		goto Finish;
@@ -3145,7 +3154,11 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 				journal->jbd_fs->bdev->cache_write_back++;
 				ext4_block_set(journal->jbd_fs->bdev, &jb->block);
 				journal->jbd_fs->bdev->cache_write_back--;
-				jbd_image_free(jb->before); jbd_image_free(jb->after); jbd_free(jb);
+	                if (jb->escaped_prefix) {
+                    jbd_free(old->escaped_prefix); old->escaped_prefix = jb->escaped_prefix;
+                    jb->escaped_prefix = NULL;
+                }
+			jbd_image_free(jb->before); jbd_image_free(jb->after); jbd_free(jb);
 			} else {
 				jb->trans = running;
 				TAILQ_INSERT_TAIL(&running->buf_queue, jb, buf_node);
@@ -3220,6 +3233,7 @@ int jbd_journal_freeze(struct jbd_journal *journal)
 	jbd_sb_csum_set(&sb);
 	memset(trans->checkpoint_image->data, 0, journal->block_size);
 	memcpy(trans->checkpoint_image->data, &sb, sizeof(sb));
+	jbd_prepare_phase(trans);
 	journal->running = NULL;
 	TAILQ_INSERT_TAIL(&journal->sealed_queue, trans, trans_node);
 	journal->sealed_count++;
@@ -3235,14 +3249,8 @@ int jbd_journal_submit(struct jbd_journal *journal)
 	COST_SCOPE(submit_cost, JOURNAL_SUBMIT_TICKS);
 	struct jbd_trans *trans = journal->committing;
 	if (!trans) return EOK;
-	int r = EOK;
 	bool submitted = false;
-	{
-	COST_PHASE_SCOPE(ordered_phase, 1);
-	r = jbd_trans_write_ordered(trans);
-	}
-	if (r == EOK) { COST_PHASE_SCOPE(log_phase, 2); r = jbd_write_prepared(trans, &submitted); }
-	return r;
+	return jbd_write_prepared(trans, &submitted);
 }
 
 bool jbd_journal_select(struct jbd_journal *journal)
@@ -3260,6 +3268,36 @@ bool jbd_journal_select(struct jbd_journal *journal)
 			journal->checkpoint_last = TAILQ_NEXT(journal->checkpoint_last, trans_node);
 			count++;
 		}
+		/* Selection holds the modification lock. Publish one immutable home
+		 * version per LBA from this durable prefix, never from a later group.
+		 * A revoke discards the older incarnation; later metadata may replace it. */
+		TAILQ_INIT(&journal->checkpoint_bufs);
+		for (;;) {
+			struct jbd_buf *jb;
+			TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
+				struct jbd_block_rec *rec = jb->block_rec;
+				if (rec->checkpoint)
+					TAILQ_REMOVE(&journal->checkpoint_bufs, rec->checkpoint, checkpoint_node);
+				rec->checkpoint = jb;
+				TAILQ_INSERT_TAIL(&journal->checkpoint_bufs, jb, checkpoint_node);
+			}
+			struct jbd_revoke_rec *revoke;
+			RB_FOREACH(revoke, jbd_revoke_tree, &trans->revoke_root) {
+				struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, revoke->lba);
+				if (rec && rec->checkpoint) {
+					TAILQ_REMOVE(&journal->checkpoint_bufs, rec->checkpoint, checkpoint_node);
+					rec->checkpoint = NULL;
+				}
+			}
+			if (trans == journal->checkpoint_last) break;
+			trans = TAILQ_NEXT(trans, trans_node);
+		}
+        struct jbd_io_phase phase = {0};
+        struct jbd_buf *jb;
+        TAILQ_FOREACH(jb, &journal->checkpoint_bufs, checkpoint_node)
+            jbd_phase_add(journal, &phase, &jb->home_io, jb->after->data,
+                jb->block.lb_id, 0, journal->block_size);
+        journal->checkpoint_io = phase.first;
 		journal->checkpoint_requested = false;
 		return true;
 	}
@@ -3280,20 +3318,11 @@ int jbd_journal_checkpoint(struct jbd_journal *journal)
 	int r = EOK;
 	{
 	COST_PHASE_SCOPE(home_phase, 3);
-	struct jbd_io_batch batch = {0};
-	for (;;) {
-		struct jbd_buf *jb;
-		TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
-			r = jbd_batch_add(bdev, &batch, jb->after->data, jb->block.lb_id);
-			if (r != EOK) return r;
-		}
-		if (trans == journal->checkpoint_last) break;
-		trans = TAILQ_NEXT(trans, trans_node);
-	}
-	r = jbd_batch_flush(bdev, &batch);
+	r = ext4_blocks_set_phase(bdev, journal->checkpoint_io);
 	if (r != EOK) return r;
 	r = ext4_blockdev_flush(bdev);
 	}
+	trans = journal->checkpoint_last;
 	COST_PHASE_SCOPE(checkpoint_phase, 4);
 	if (r == EOK) r = ext4_blocks_set_direct(bdev, trans->checkpoint_image->data, trans->checkpoint_lba, 1);
 	return r != EOK ? r : ext4_blockdev_flush(bdev);
@@ -3306,6 +3335,10 @@ static void jbd_group_release(struct jbd_journal *journal, struct jbd_trans *tra
 	while ((jb = TAILQ_FIRST(&trans->buf_queue))) {
 		struct ext4_buf *buf = jb->block.buf;
 		struct ext4_block block = jb->block;
+		if (jb->block_rec->checkpoint == jb) {
+			TAILQ_REMOVE(&journal->checkpoint_bufs, jb, checkpoint_node);
+			jb->block_rec->checkpoint = NULL;
+		}
 		if (!buf->journal_pending) __builtin_trap();
 		jbd_unpin_version(journal, buf);
 		if (!buf->journal_pending && !memcmp(buf->data, jb->after->data, journal->block_size)) ext4_bcache_clear_dirty(buf);
@@ -3355,6 +3388,7 @@ int jbd_journal_retire(struct jbd_journal *journal, int error)
 		jbd_group_release(journal, trans);
 		if (done) break;
 	}
+	journal->checkpoint_io = NULL;
 	journal->checkpointing = journal->checkpoint_last = NULL;
 	return EOK;
 }
@@ -3369,7 +3403,7 @@ uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal)
 }
 
 bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
-	const struct ext4_data_source *const *sources, unsigned count)
+	const struct file_data_source *const *sources, unsigned count)
 {
 	/* Private metadata needs undo/version/control space; borrowed file data
 	 * needs records and one charge per distinct owner, never a block image.
@@ -3400,39 +3434,48 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, si
 }
 
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
-	uint32_t count, bool inode)
+    uint32_t count, bool inode)
 {
-	if (!fs->jbd_journal || !fs->jbd_journal->grouped || !count) return EOK;
-	if (!fs->curr_trans) return EINVAL;
-	struct jbd_quarantine *q = jbd_alloc(fs->jbd_journal, sizeof(*q));
-	if (!q) return ENOMEM;
-	q->first = first; q->count = count; q->inode = inode;
-	LIST_INSERT_HEAD(&fs->curr_trans->quarantine, q, node);
-	return EOK;
+    struct jbd_journal *journal = fs->jbd_journal;
+    if (!journal || !journal->grouped || !count) return EOK;
+    if (!fs->curr_trans || count > UINT64_MAX - first) return EINVAL;
+    struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
+    struct jbd_quarantine key = {.first = first};
+    struct jbd_quarantine *after = RB_NFIND(jbd_quarantine_tree, index, &key);
+    struct jbd_quarantine *before = after ? RB_PREV(jbd_quarantine_tree, index, after) :
+        RB_MAX(jbd_quarantine_tree, index);
+    /* Reuse is excluded while an interval is indexed. A second free that
+     * intersects it is therefore an actual double-free, not another owner. */
+    if ((after && after->first - first < count) ||
+        (before && first - before->first < before->count)) return EUCLEAN;
+    struct jbd_quarantine *q = jbd_alloc(journal, sizeof(*q));
+    if (!q) return ENOMEM;
+    q->first = first; q->count = count; q->inode = inode;
+    if (RB_INSERT(jbd_quarantine_tree, index, q)) __builtin_trap();
+    LIST_INSERT_HEAD(&fs->curr_trans->quarantine, q, node);
+    uint64_t *total = inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;
+    if (*total > UINT64_MAX - count) __builtin_trap();
+    *total += count;
+    return EOK;
 }
 
-static bool jbd_trans_quarantined(struct jbd_trans *trans, ext4_fsblk_t address, bool inode)
+bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address,
+    bool inode, ext4_fsblk_t *next)
 {
-	if (!trans) return false;
-	struct jbd_quarantine *q;
-	LIST_FOREACH(q, &trans->quarantine, node)
-		if (q->inode == inode && address >= q->first && address - q->first < q->count) return true;
-	return false;
-}
-
-bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address, bool inode)
-{
-	struct jbd_journal *journal = fs->jbd_journal;
-	if (!journal || !journal->grouped) return false;
-	if (jbd_trans_quarantined(fs->curr_trans, address, inode) ||
-	    jbd_trans_quarantined(journal->running, address, inode) ||
-	    jbd_trans_quarantined(journal->committing, address, inode)) return true;
-	struct jbd_trans *trans;
-	TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node)
-		if (jbd_trans_quarantined(trans, address, inode)) return true;
-	TAILQ_FOREACH(trans, &journal->cp_queue, trans_node)
-		if (jbd_trans_quarantined(trans, address, inode)) return true;
-	return false;
+    if (next) *next = UINT64_MAX;
+    struct jbd_journal *journal = fs->jbd_journal;
+    if (!journal || !journal->grouped) return false;
+    struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
+    struct jbd_quarantine key = {.first = address};
+    struct jbd_quarantine *after = RB_NFIND(jbd_quarantine_tree, index, &key);
+    struct jbd_quarantine *cover = after && after->first == address ? after :
+        after ? RB_PREV(jbd_quarantine_tree, index, after) : RB_MAX(jbd_quarantine_tree, index);
+    if (cover && address - cover->first < cover->count) {
+        if (next) *next = cover->first + cover->count;
+        return true;
+    }
+    if (next && after) *next = after->first;
+    return false;
 }
 
 int jbd_journal_group_init(struct jbd_journal *journal, size_t limit)
@@ -3457,7 +3500,9 @@ void jbd_journal_group_fini(struct jbd_journal *journal)
 {
 	if (journal->running || journal->committing || journal->checkpointing ||
 	    !TAILQ_EMPTY(&journal->sealed_queue) || !TAILQ_EMPTY(&journal->cp_queue) ||
-	    !RB_EMPTY(&journal->sources) || journal->log_reserved || journal->error) __builtin_trap();
+	    !RB_EMPTY(&journal->sources) || journal->log_reserved || journal->error ||
+        !RB_EMPTY(&journal->quarantine_index[0]) || !RB_EMPTY(&journal->quarantine_index[1]) ||
+        journal->quarantined_blocks || journal->quarantined_inodes) __builtin_trap();
 	journal->grouped = false;
 	jbd_free(journal->log_map); journal->log_map = NULL;
 	jbd_trim_cache(journal, 0);

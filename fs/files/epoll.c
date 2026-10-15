@@ -57,7 +57,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
     if (epoll && item->linked && !item->oneshot_disarmed) {
         item->notification_generation++;
         /* poll和用户复制都可能重入；通知链不借用扫描者的ready_next。 */
-        if (epoll->scan_owner) epoll_pending_add(epoll, item);
+        if (epoll->scan_owner && !item->on_ready_list) epoll_pending_add(epoll, item);
         else epoll_ready_add(epoll, item);
         kernel_wait_queue_wake_all(&epoll->wait_queue);
     }
@@ -719,17 +719,25 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
         return 0;
     }
     epoll->scan_owner = request;
-    request->head = epoll->ready_head;
-    epoll->ready_head = epoll->ready_tail = 0;
-    for (struct kernel_epoll_item *item = request->head; item; item = item->ready_next) {
-        if (item->references == UINT32_MAX || item->in_scan) __builtin_trap();
-        item->references++;
-        item->in_scan = 1;
-        item->on_ready_list = 0;
-    }
     arch_interrupt_restore(irq);
     int64_t delivered = 0;
-    while (request->head && (size_t)delivered < maximum) {
+    while ((size_t)delivered < maximum) {
+        irq = arch_interrupt_save();
+        /* 只借用当前候选；未扫描后缀仍由ready队列持有，DEL可立即释放。 */
+        request->head = epoll->ready_head;
+        if (!request->head) {
+            arch_interrupt_restore(irq);
+            break;
+        }
+        epoll->ready_head = request->head->ready_next;
+        if (!epoll->ready_head) epoll->ready_tail = 0;
+        request->head->ready_next = 0;
+        if (request->head->references == UINT32_MAX || request->head->in_scan)
+            __builtin_trap();
+        request->head->references++;
+        request->head->in_scan = 1;
+        request->head->on_ready_list = 0;
+        arch_interrupt_restore(irq);
         struct kernel_epoll_item *item = request->head;
         uint64_t control = item->control_generation;
         uint64_t notification = item->notification_generation;

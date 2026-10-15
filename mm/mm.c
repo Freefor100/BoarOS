@@ -1626,7 +1626,9 @@ retry:
     record->pin_acquisitions++;
     if (access & KERNEL_MM_WRITE) record->write_pins++;
     struct kernel_io_context *owner = kernel_io_context_current();
-    pin->mm=mm; pin->owner=owner; pin->registration=pin; pin->owner_next=owner->user_pins;
+    pin->mm=mm; pin->record=record; pin->owner=owner; pin->registration=pin;
+    pin->owner_next=owner->user_pins; pin->owner_previous=&owner->user_pins;
+    if (pin->owner_next) pin->owner_next->owner_previous=&pin->owner_next;
     pin->page=pointer; pin->physical_address=physical; pin->access=access;
     owner->user_pins = pin;
     return KERNEL_MM_STATUS_OK;
@@ -1634,17 +1636,16 @@ retry:
 
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 {
-    struct kernel_mm_record *record;
     if (!pin || pin->registration != pin ||
         pin->owner != kernel_io_context_current() || !pin->mm ||
-        pin->mm->state != KERNEL_MM_LIVE ||
-        resolve_record(pin->mm, &record) != KERNEL_MM_STATUS_OK)
+        pin->mm->state != KERNEL_MM_LIVE || !pin->record ||
+        !pin->owner_previous || *pin->owner_previous != pin)
         __builtin_trap();
+    /* 页借用已由存活MM持有；归还同一记录，不重新解析整个地址空间。 */
+    struct kernel_mm_record *record=pin->record;
     KERNEL_RAW_SCOPE(guard, &record->metadata);
-    struct kernel_mm_user_pin **registration = &pin->owner->user_pins;
-    while (*registration && *registration != pin) registration = &(*registration)->owner_next;
-    if (*registration != pin) __builtin_trap();
-    *registration = pin->owner_next;
+    *pin->owner_previous = pin->owner_next;
+    if (pin->owner_next) pin->owner_next->owner_previous=pin->owner_previous;
     if (!record->access_pins ||
         ((pin->access & KERNEL_MM_WRITE) && !record->write_pins)) __builtin_trap();
     record->access_pins--;

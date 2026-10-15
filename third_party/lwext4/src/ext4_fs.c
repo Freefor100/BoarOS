@@ -1466,118 +1466,25 @@ int ext4_fs_indirect_find_goal(struct ext4_inode_ref *inode_ref,
 }
 
 static int ext4_fs_get_inode_dblk_idx_internal(struct ext4_inode_ref *inode_ref,
-				       ext4_lblk_t iblock, ext4_fsblk_t *fblock,
-				       bool extent_create,
-				       bool support_unwritten __unused)
+    ext4_lblk_t iblock, ext4_fsblk_t *fblock, bool extent_create,
+    bool support_unwritten __unused)
 {
-	COST_PHASE_SCOPE(read_source, 6);
-	struct ext4_fs *fs = inode_ref->fs;
-
-	/* For empty file is situation simple */
-	if (ext4_inode_get_size(&fs->sb, inode_ref->inode) == 0) {
-		*fblock = 0;
-		return EOK;
-	}
-
-	ext4_fsblk_t current_block;
-
-	(void)extent_create;
+    if (!ext4_inode_get_size(&inode_ref->fs->sb, inode_ref->inode)) {
+        *fblock = 0;
+        return EOK;
+    }
+    bool create = false;
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
-	/* Handle i-node using extents */
-	if ((ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS)) &&
-	    (ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS))) {
-
-		ext4_fsblk_t current_fsblk;
-		int rc = ext4_extent_get_blocks(inode_ref, iblock, 1,
-				&current_fsblk, extent_create, NULL);
-		if (rc != EOK)
-			return rc;
-
-		current_block = current_fsblk;
-		*fblock = current_block;
-
-		ext4_assert(*fblock || support_unwritten);
-		return EOK;
-	}
+    create = extent_create &&
+        ext4_sb_feature_incom(&inode_ref->fs->sb, EXT4_FINCOM_EXTENTS) &&
+        ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS);
+#else
+    (void)extent_create;
 #endif
-
-	struct ext4_inode *inode = inode_ref->inode;
-
-	/* Direct block are read directly from array in i-node structure */
-	if (iblock < EXT4_INODE_DIRECT_BLOCK_COUNT) {
-		current_block =
-		    ext4_inode_get_direct_block(inode, (uint32_t)iblock);
-		*fblock = current_block;
-		return EOK;
-	}
-
-	/* Determine indirection level of the target block */
-	unsigned int l = 0;
-	unsigned int i;
-	for (i = 1; i < 4; i++) {
-		if (iblock < fs->inode_block_limits[i]) {
-			l = i;
-			break;
-		}
-	}
-
-	if (l == 0)
-		return EIO;
-
-	/* Compute offsets for the topmost level */
-	uint32_t blk_off_in_lvl = (uint32_t)(iblock - fs->inode_block_limits[l - 1]);
-	current_block = ext4_inode_get_indirect_block(inode, l - 1);
-	uint32_t off_in_blk = (uint32_t)(blk_off_in_lvl / fs->inode_blocks_per_level[l - 1]);
-
-	/* Sparse file */
-	if (current_block == 0) {
-		*fblock = 0;
-		return EOK;
-	}
-
-	struct ext4_block block;
-
-	/*
-	 * Navigate through other levels, until we find the block number
-	 * or find null reference meaning we are dealing with sparse file
-	 */
-	while (l > 0) {
-		/* Load indirect block */
-		int rc = ext4_trans_block_get(fs->bdev, &block, current_block);
-		if (rc != EOK)
-			return rc;
-
-		/* Read block address from indirect block */
-		current_block =
-		    to_le32(((uint32_t *)block.data)[off_in_blk]);
-
-		/* Put back indirect block untouched */
-		rc = ext4_block_set(fs->bdev, &block);
-		if (rc != EOK)
-			return rc;
-
-		/* Check for sparse file */
-		if (current_block == 0) {
-			*fblock = 0;
-			return EOK;
-		}
-
-		/* Jump to the next level */
-		l--;
-
-		/* Termination condition - we have address of data block loaded
-		 */
-		if (l == 0)
-			break;
-
-		/* Visit the next level */
-		blk_off_in_lvl %= fs->inode_blocks_per_level[l];
-		off_in_blk = (uint32_t)(blk_off_in_lvl / fs->inode_blocks_per_level[l - 1]);
-	}
-
-	*fblock = current_block;
-
-	return EOK;
+    struct ext4_inode_block_range range;
+    int r = ext4_fs_get_inode_dblk_range(inode_ref, iblock, 1, create, &range);
+    *fblock = range.unwritten ? 0 : range.block;
+    return r;
 }
 
 
@@ -1761,60 +1668,93 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 	return EOK;
 }
 
-int ext4_fs_get_or_alloc_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
-					ext4_lblk_t iblock,
-					ext4_fsblk_t *fblock,
-					bool *allocated)
+static int ext4_fs_indirect_range(struct ext4_inode_ref *ref,
+    ext4_lblk_t iblock, uint32_t max_blocks, struct ext4_inode_block_range *range)
 {
-	struct ext4_fs *fs = inode_ref->fs;
-	int rc;
+    struct ext4_fs *fs = ref->fs;
+    struct ext4_block leaf = {0};
+    uint32_t *entries;
+    uint32_t offset, available;
+    if (iblock < EXT4_INODE_DIRECT_BLOCK_COUNT) {
+        entries = ref->inode->blocks;
+        offset = iblock;
+        available = EXT4_INODE_DIRECT_BLOCK_COUNT - offset;
+    } else {
+        unsigned level;
+        for (level = 1; level < 4 && iblock >= fs->inode_block_limits[level]; level++);
+        if (level == 4) return EIO;
+        uint64_t relative = iblock - fs->inode_block_limits[level - 1];
+        ext4_fsblk_t block = ext4_inode_get_indirect_block(ref->inode, level - 1);
+        while (level) {
+            uint64_t coverage = fs->inode_blocks_per_level[level - 1];
+            if (!block) {
+                /* A missing parent covers its whole remaining subtree. */
+                uint64_t remaining = fs->inode_blocks_per_level[level] - relative;
+                range->count = remaining < max_blocks ? remaining : max_blocks;
+                return EOK;
+            }
+            int r = ext4_trans_block_get(fs->bdev, &leaf, block);
+            if (r) return r;
+            offset = relative / coverage;
+            entries = (uint32_t *)leaf.data;
+            if (level == 1) break;
+            block = to_le32(entries[offset]);
+            r = ext4_block_set(fs->bdev, &leaf);
+            if (r) return r;
+            relative %= coverage;
+            level--;
+        }
+        available = fs->bdev->lg_bsize / sizeof(uint32_t) - offset;
+    }
+    range->block = to_le32(entries[offset]);
+    range->count = 1;
+    if (available > max_blocks) available = max_blocks;
+    while (range->count < available) {
+        ext4_fsblk_t next = to_le32(entries[offset + range->count]);
+        if (range->block ? next != range->block + range->count : next != 0) break;
+        range->count++;
+    }
+    return leaf.buf ? ext4_block_set(fs->bdev, &leaf) : EOK;
+}
 
-	if (!fblock || !allocated)
-		return EINVAL;
-
-	*allocated = false;
-	*fblock = 0;
-
+int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,
+    ext4_lblk_t iblock, uint32_t max_blocks, bool create,
+    struct ext4_inode_block_range *range)
+{
+    COST_PHASE_SCOPE(read_source, 6);
+    if (!range || !max_blocks) return EINVAL;
+    *range = (struct ext4_inode_block_range){0};
+    struct ext4_fs *fs = ref->fs;
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
-	if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
-	    ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
-		uint32_t existing_count = 0;
-
-		rc = ext4_extent_get_blocks(inode_ref, iblock, 1, fblock,
-					    false, &existing_count);
-		if (rc != EOK || *fblock)
-			return rc;
-
-		rc = ext4_extent_get_blocks(inode_ref, iblock, 1, fblock,
-					    true, NULL);
-		if (rc == EOK)
-			*allocated = existing_count == 0;
-		return rc;
-	}
+    if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+        ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_EXTENTS))
+        return ext4_extent_get_range(ref, iblock, max_blocks, create, range);
 #endif
-
-	rc = ext4_fs_get_inode_dblk_idx(inode_ref, iblock, fblock, true);
-	if (rc != EOK || *fblock)
-		return rc;
-
-	ext4_fsblk_t goal;
-	rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
-	if (rc != EOK)
-		return rc;
-
-	rc = ext4_balloc_alloc_block(inode_ref, goal, fblock);
-	if (rc != EOK)
-		return rc;
-
-	rc = ext4_fs_set_inode_data_block_index(inode_ref, iblock, *fblock);
-	if (rc != EOK) {
-		int free_rc = ext4_balloc_free_block(inode_ref, *fblock);
-		*fblock = 0;
-		return free_rc != EOK ? free_rc : rc;
-	}
-
-	*allocated = true;
-	return EOK;
+    int r = ext4_fs_indirect_range(ref, iblock, max_blocks, range);
+    if (r || !create || range->block) return r;
+    ext4_fsblk_t goal;
+    r = ext4_fs_indirect_find_goal(ref, &goal);
+    if (r) return r;
+    r = ext4_balloc_alloc_blocks(ref, goal, range->count, &range->block, &range->count);
+    if (r) return r;
+    uint32_t installed = 0;
+    for (; installed < range->count; installed++) {
+        r = ext4_fs_set_inode_data_block_index(ref, iblock + installed, range->block + installed);
+        if (r) break;
+    }
+    if (r) {
+        int cleanup = ext4_balloc_free_blocks(ref, range->block + installed, range->count - installed);
+        if (cleanup) r = cleanup;
+        while (installed) {
+            installed--;
+            cleanup = ext4_fs_release_inode_dblk_idx(ref, iblock + installed, range->block + installed);
+            if (cleanup) r = cleanup;
+        }
+        *range = (struct ext4_inode_block_range){0};
+        return r;
+    }
+    range->allocated = true;
+    return EOK;
 }
 
 int ext4_fs_release_inode_dblk_idx(struct ext4_inode_ref *inode_ref,

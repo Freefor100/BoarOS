@@ -58,8 +58,8 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
     if (reject_page) { injected++; return PHYSICAL_PAGE_STATUS_EMPTY; }
     return __real_physical_page_allocate(a, out);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct kernel_vfs_writeback_span *, size_t);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct kernel_vfs_writeback_span *spans, size_t count)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
     size_t size=0;
     for (size_t i=0;i<count;i++) size+=spans[i].size;

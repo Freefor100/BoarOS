@@ -61,6 +61,7 @@ uint16_t wire_used_read(volatile struct virtio_used_ring *ring) { return ring->i
         *shlex.split(os.environ.get("CFLAGS", "")),
         "-Itests/host/random", "-idirafter", "include", "-I", str(work),
         "tests/host/virtio_block_diagnostics.c", "kernel/block.c",
-        "drivers/virtio/transport.c", "drivers/virtio/split_queue.c", "-o", str(exe),
+        "drivers/virtio/transport.c", "drivers/virtio/split_queue.c",
+        "-Wl,--wrap=virtio_split_take", "-o", str(exe),
     ], cwd=root, check=True)
     subprocess.run([str(exe), *os.sys.argv[1:]], check=True)
