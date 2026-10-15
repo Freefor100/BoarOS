@@ -301,7 +301,7 @@ fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原ino
 
 普通文件写入直接填入最终页，用户页、iovec 与目标页边界决定每个复制片段；普通单 hart 路径用一个完整片段覆盖冷页时无需先读旧数据。来源缺页在 inode 数据锁和目标写借用之外处理，随后固定来源并提交目标；同物理页的重叠片段使用 `memmove`，旧 EOF 后的空隙在来源复制后清零。tmpfs 与磁盘页缓存共用这一来源协议，tmpfs 后端只提交尺寸和时间元数据。
 
-TCP 写入按接纳容量跨 iovec 填充一个原生页大小的请求缓冲（RV64 为4KiB，LA为16KiB），通过当前任务登记覆盖等待与退出，并保留短提交后的未消费尾部。末批、窗口满或阻塞前输出协议队列；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议仍 COPY 并自行持有 ACK 前的版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
+TCP 单 iovec 写入先取得接纳容量，再在协议保护外 pin 当前用户页，直接把页内片段交给 `tcp_write(COPY)`，提交返回即 unpin；未接纳字节在等待后重新解析，不保留旧来源快照。多 iovec 写入按接纳容量填充一个原生页大小的 gather 请求缓冲（RV64 为4KiB，LA为16KiB），通过当前任务登记覆盖等待与退出，并保留短提交后的未消费尾部。末批、窗口满或阻塞前输出协议队列；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议仍 COPY 并自行持有 ACK 前的版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
 
 `kernel_files_statistics.write_chunks` 记录普通文件的实际用户复制片段及 TCP/UNIX STREAM 的接纳批次，`read_chunks` 的 socket 项记录实际 packet 读取，不代表中转复制。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入的内容、部分失败和页解析；当前为 256 个片段、256 次用户页解析、1 MiB 用户复制、0 字节页缓存额外复制。页解析使用已有 COST 指标，普通构建不再更新独立的全局原子计数。这些数值描述复制量与工作次数，不代表吞吐倍数。
 
@@ -438,8 +438,9 @@ OFD持有独立挂载错误游标，新打开从当前序号开始，dup/fork共
 
 
 INET TCP 的流写接纳先于 payload usercopy：请求把 OFD pin 和 byte reservation 登记到当前任务，
-页内 iovec span 受接纳量限制，缺页睡眠期间 pin 保证 close/fd 复用不改变目标。
-完整请求正常展开或强制退出归还预留；同一次阻塞发送保留暂存后缀。
+页内 iovec span 受接纳量限制，缺页睡眠期间 OFD pin 保证 close/fd 复用不改变目标。
+完整请求正常展开或强制退出归还预留；单 iovec 的用户页 pin 在提交后立即归还，
+不跨协议容量等待，多 iovec 则保留 gather 暂存后缀。
 数值地址范围检查仍在状态与容量判断之前，实际读页在之后；文件、UNIX 和数据报路径保持各自契约。
 接口与同 ELF 验证见[网络模块](kernel-network.md#tcp-发送接纳与复制2026-10-05)。
 

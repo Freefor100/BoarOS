@@ -4,8 +4,16 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${FILE_IO_HOST_BUILD:-build/host/file-io}
 mkdir -p "$build_dir"
+network_sources=
+if [ "${FILE_IO_HOST_TCP:-0}" = 1 ]; then
+    network_sources=$(python3 -c 'import re; s=open("Makefile").read().split("LWIP_SOURCES :=",1)[1].split("\n\n",1)[0]; print(" ".join(re.findall(r"(?:third_party/lwip|net/lwip_port)/[\w/]+\.c",s)))')
+    FILE_IO_HOST_FLAGS="${FILE_IO_HOST_FLAGS:-} -DTCP_IO_CASES -include sys/types.h -include limits.h"
+fi
 set --
 for symbol in $(sed -n 's/^EXCLUDED(\([^)]*\)).*/\1/p' tests/host/file_io_excluded.c); do
+    if [ "${FILE_IO_HOST_TCP:-0}" = 1 ]; then
+        case "$symbol" in kernel_socket_*|kernel_time_deadline_from_monotonic) continue;; esac
+    fi
     set -- "$@" "-Wl,--wrap=$symbol"
 done
 for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
@@ -29,7 +37,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         fs/files/table.c fs/files/io.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c fs/open_file.c \
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \
         fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c kernel/block.c net/socket.c \
-        third_party/lwext4/src/*.c ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
+        third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
         ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=kernel_vfs_file_accessed \
         -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"

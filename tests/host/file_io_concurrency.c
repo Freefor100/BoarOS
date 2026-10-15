@@ -372,6 +372,9 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
 }
 
+#ifdef TCP_IO_CASES
+#include "tcp_usercopy_cases.h"
+#endif
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -391,6 +394,9 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+#ifdef TCP_IO_CASES
+    tcp_usercopy_case(&heap);
+#endif
     struct kernel_vfs_mount *memory=0;
     assert(!kernel_tmpfs_create(&heap,0,"",&memory)); sendfile_pipe_case(&heap,memory); file_case(&heap,memory,0);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
