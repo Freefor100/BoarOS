@@ -568,7 +568,7 @@ static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs
     printf("foreground windows: pages=%u allocations=%zu descriptors=%zu largest=%zu batches=%zu maxpages=%zu\n",
         COUNT,counts.allocations,counts.large_allocations,counts.largest,counts.batches,counts.maximum_pages);
     assert(counts.large_allocations==1 && counts.allocations==COUNT+1);
-    assert(counts.maximum_pages<=131072/BOAROS_PAGE_SIZE && counts.largest<=16384);
+    assert(counts.maximum_pages<=131072/BOAROS_PAGE_SIZE && counts.largest<=BOAROS_PAGE_SIZE);
     assert(counts.maximum_borrows<=2*(131072/BOAROS_PAGE_SIZE));
     for(unsigned i=0;i<COUNT;i++) {
         unsigned char actual;

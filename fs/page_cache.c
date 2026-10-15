@@ -1936,13 +1936,16 @@ static int complete_writeback(struct kernel_page_cache *cache,
     return result;
 }
 struct prepared_writeback {
-    struct kernel_page_cache_entry *entry;
     struct cache_version *version;
-    int closed;
-    size_t begin,end;
     uint64_t generation;
-    struct file_write_span *span;
+    uint32_t begin,end;
+    uint8_t closed,span_index;
 };
+_Static_assert(BOAROS_PAGE_SIZE <= UINT32_MAX && BOAROS_PAGE_CACHE_WRITEBACK_PAGES <= UINT8_MAX,
+    "writeback page offsets and span indices must fit their stored representation");
+_Static_assert(BOAROS_PAGE_CACHE_WRITEBACK_PAGES * (sizeof(struct prepared_writeback) +
+    sizeof(struct file_write_span) + sizeof(struct kernel_page_cache_entry *)) <= BOAROS_PAGE_SIZE,
+    "a complete writeback workspace must fit one physical page");
 
 struct writeback_workspace {
     struct prepared_writeback *prepared;
@@ -1964,18 +1967,17 @@ static void writeback_workspace_release(struct kernel_page_cache *cache,struct w
 }
 
 static void writeback_unprepare(struct kernel_page_cache *cache,
-    struct prepared_writeback *prepared,int error)
+    struct kernel_page_cache_entry *entry,struct prepared_writeback *prepared)
 {
     if (prepared->version) version_release(prepared->version);
+    prepared->version=NULL;
     { CACHE_SCOPE(guard,cache);
-      struct kernel_page_cache_entry *entry=prepared->entry;
       if (prepared->closed) {
           uint64_t previous=__atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
           if (!(previous&CACHE_WRITES_CLOSED)) __builtin_trap();
       }
       entry->writeback=0; cache->record->writeback_active--;
       entry_return(entry); cache_wake(&entry->ready); }
-    (void)error;
 }
 
 static int prepare_writeback(struct kernel_page_cache *cache,
@@ -2001,9 +2003,8 @@ static int prepare_writeback(struct kernel_page_cache *cache,
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    prepared->entry=entry;
     prepared->version=version_take(cache,slot);
-    if (!prepared->version) { writeback_unprepare(cache,prepared,-KERNEL_ENOMEM); return -KERNEL_ENOMEM; }
+    if (!prepared->version) { writeback_unprepare(cache,entry,prepared); return -KERNEL_ENOMEM; }
     int result=0;
     if (controlled) {
         CACHE_SCOPE(guard,cache);
@@ -2030,14 +2031,15 @@ static int prepare_writeback(struct kernel_page_cache *cache,
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    if (result) { writeback_unprepare(cache,prepared,result); return result; }
+    if (result) { writeback_unprepare(cache,entry,prepared); return result; }
     return 0;
 }
 
-static void capture_writeback(struct kernel_page_cache *cache,
-    struct prepared_writeback *prepared,uint64_t limit,struct file_write_span *span)
+static int capture_writeback(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry *entry,struct prepared_writeback *prepared,
+    uint64_t limit,struct file_write_span *span)
 {
-    struct kernel_page_cache_entry *entry=prepared->entry;
+    int captured=0;
     int controlled=cache->record->controlled;
     void *page;
     if (physical_page_resolve(cache->allocator,entry->physical_address,&page)) __builtin_trap();
@@ -2072,7 +2074,7 @@ static void capture_writeback(struct kernel_page_cache *cache,
             COST_ADD(SNAPSHOT_COPY,copy_end-first); COST_ADD(WRITEBACK_REQUESTED,size);
             memcpy(stable,(unsigned char *)page+first,copy_end-first);
             memset((unsigned char *)stable+copy_end-first,0,last-copy_end);
-            prepared->span=span;
+            captured=1;
             *span=(struct file_write_span){
                 .offset=start+prepared->begin,.buffer=snapshot,.size=size,
                 .source={.context=prepared->version,.retain=version_retain,.release=version_release,
@@ -2087,6 +2089,7 @@ static void capture_writeback(struct kernel_page_cache *cache,
         entry->retry_blocked=0;
         prepared->closed=0;
     }
+    return captured;
 }
 
 /* Candidates are already pinned. Each selected page supplies a separate stable
@@ -2120,9 +2123,9 @@ static int writeback_run(struct kernel_page_cache *cache,
     KERNEL_LOCK_SCOPE(io);
     if (done) kernel_vfs_node_lock(entries[0]->node,&io,0);
     for (size_t i=0;i<done;i++) {
-        if (!prepared[i].entry) continue;
-        capture_writeback(cache,&prepared[i],limit,&spans[ready]);
-        if (prepared[i].span) ready++;
+        if (!prepared[i].version) continue;
+        if (capture_writeback(cache,entries[i],&prepared[i],limit,&spans[ready]))
+            prepared[i].span_index=++ready;
     }
     /* A later allocation failure still permits the already captured pages.
      * No failed device write is retried as a smaller batch. */
@@ -2131,12 +2134,13 @@ static int writeback_run(struct kernel_page_cache *cache,
     if (submitted) result=submitted;
     for (size_t i=done;i>0;i--) {
         struct prepared_writeback *p=&prepared[i-1];
-        if (!p->entry) continue;
-        int r=complete_writeback(cache,p->entry,p->begin,p->end,p->generation,
-            p->span ? submitted : 0,p->span ? p->span->written : 0);
+        if (!p->version) continue;
+        struct file_write_span *span=p->span_index?&spans[p->span_index-1]:NULL;
+        int r=complete_writeback(cache,entries[i-1],p->begin,p->end,p->generation,
+            span ? submitted : 0,span ? span->written : 0);
         if (r && !result) result=r;
         version_release(p->version);
-        { CACHE_SCOPE(guard,cache); entry_return(p->entry); }
+        { CACHE_SCOPE(guard,cache); entry_return(entries[i-1]); }
     }
     *used=done?done:1;
     return result;
