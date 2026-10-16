@@ -40,7 +40,7 @@ SQLite 3.53.4 官方 amalgamation 保存于 `sqlite/sqlite-amalgamation-3530400.
 
 Alpine v3.22 `main/riscv64` 的 GCC 14.2.0-r6、binutils、musl 开发文件和
 GNU make4.4.1-r3及其余12个运行依赖APK 保存于 `alpine/v3.22/main/riscv64/`。`sources.tsv`
-逐包固定官方 URL、SHA-256 与 2026-09-27 访问日期；包内 `.PKGINFO`
+逐包固定官方 URL、SHA-256 与核对日期；包内 `.PKGINFO`
 的版本、架构和许可表达式由
 `tests/workloads/toolchain/prepare_alpine.py` 核对。`make
 prepare-offline-c-toolchain` 将原包原样解到忽略的

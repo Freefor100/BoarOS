@@ -33,7 +33,7 @@ PACKAGES = {
     "mpfr4-4.2.1_p1-r0.apk": ("mpfr4", "4.2.1_p1-r0", "LGPL-3.0-or-later"),
     "musl-1.2.5-r12.apk": ("musl", "1.2.5-r12", "MIT"),
     "musl-dev-1.2.5-r12.apk": ("musl-dev", "1.2.5-r12", "MIT"),
-    "zlib-1.3.2-r0.apk": ("zlib", "1.3.2-r0", "Zlib"),
+    "zlib-1.3.2-r1.apk": ("zlib", "1.3.2-r1", "Zlib"),
     "zstd-libs-1.5.7-r0.apk": ("zstd-libs", "1.5.7-r0", "BSD-3-Clause OR GPL-2.0-or-later"),
 }
 
