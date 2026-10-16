@@ -51,12 +51,6 @@ extern "C" {
 
 #define EXT4_BLOCK_BATCH_MAX 32U
 #define EXT4_CACHED_READ_BATCH 1
-struct ext4_block_read_span {
-	void *data;
-	uint64_t block;
-	uint32_t count;
-	int error;
-};
 struct ext4_block_span {
 	const void *data;
 	uint64_t block;
@@ -85,9 +79,10 @@ struct ext4_blockdev_iface {
 	int (*bread)(struct ext4_blockdev *bdev, void *buf, uint64_t blk_id,
 		     uint32_t blk_cnt);
 
-	/* Mutable physical spans; every published read is finished on return. */
+	/* Mutable physical byte ranges; status is an ext4 errno and every
+	 * published read is finished on return, with its byte count completed. */
 	int (*bread_batch)(struct ext4_blockdev *bdev,
-		struct ext4_block_read_span *spans, unsigned count);
+		struct block_read_span *spans, unsigned count);
 
 	/**@brief   Block write function.
 	 * @param   buf input buffer
@@ -268,7 +263,7 @@ int ext4_block_set(struct ext4_blockdev *bdev, struct ext4_block *b);
  * @return  standard error code*/
 /* Physical-sector reads into caller destinations, without allocating cache blocks. */
 int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
-	struct ext4_block_read_span *spans, unsigned count);
+	struct block_read_span *spans, unsigned count);
 
 int ext4_blocks_get_direct(struct ext4_blockdev *bdev, void *buf, uint64_t lba,
 			   uint32_t cnt);

@@ -2679,11 +2679,11 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
 }
 
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct kernel_vfs_read_span *spans, size_t count)
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
     /* 私有调用者已固定独立的缓存页；后端边界负责自己的参数校验和结果初始化。 */
     struct kernel_vfs_instance *instance = node->mount->private_data;
-    if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count);
+    if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count, workspace);
     int result = 0;
     for (size_t i = 0; i < count; i++) {
         spans[i].completed = 0;

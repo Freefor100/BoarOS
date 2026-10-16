@@ -505,16 +505,12 @@ int ext4_ftruncate(ext4_file *file, uint64_t size);
 int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt);
 /* Positioned data read; mount read lock excludes every writer. */
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt);
-#define EXT4_FILE_READ_BATCH 1
-struct ext4_file_read_span {
-    uint64_t offset;
-    void *buffer;
-    size_t size, completed;
-    int error;
-};
-/* At most eight disjoint outputs; every span reports a contiguous prefix.
- * Reads consult cache versions, including dirty and journal-pending data. */
-int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, unsigned count);
+/* At most FILE_READ_BATCH_MAX disjoint outputs; every span reports a contiguous prefix.
+ * Reads consult cache versions, including dirty and journal-pending data.
+ * Multi-output callers lend a workspace until return; scalar callers may pass
+ * NULL. size_limit caps visible EOF without changing the caller's span sizes. */
+int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
+    struct file_read_workspace *workspace, uint64_t size_limit);
 
 
 /**@brief   Write data to file.

@@ -2979,9 +2979,8 @@ static int ext4_read_pending_data(struct ext4_blockdev *bdev,
 				if (!scratch) return ENOMEM;
 				target = scratch; skip = 0; bytes = bdev->lg_bsize;
 			}
-			struct ext4_block_read_span read = {target,
-				(bdev->part_offset + first * bdev->lg_bsize + skip) / sector,
-				bytes / sector, EIO};
+			struct block_read_span read = {bdev->part_offset + first * bdev->lg_bsize + skip,
+				target, bytes, 0, EIO};
 			int r = ext4_blockdev_read_batch(bdev, &read, 1);
 			if (!r && scratch) memcpy(out, (uint8_t *)scratch + offset, chunk);
 			ext4_free(scratch);
@@ -3189,26 +3188,21 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt)
 {
     if (!rcnt) return EINVAL;
-    struct ext4_file_read_span span = {offset, buf, size, 0, EOK};
-    int result = ext4_fpread_batch(file, &span, 1);
+    struct file_read_span span = {offset, buf, size, 0, EOK};
+    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX);
     *rcnt = span.completed;
     return result;
 }
 
-struct ext4_read_fragment { unsigned span; size_t length; int error; };
-struct ext4_read_workspace {
-    size_t limits[EXT4_BLOCK_BATCH_MAX];
-    struct ext4_read_fragment fragments[EXT4_BLOCK_BATCH_MAX];
-    struct ext4_block_read_span reads[EXT4_BLOCK_BATCH_MAX];
-    unsigned owners[EXT4_BLOCK_BATCH_MAX];
-    int mapping_errors[EXT4_BLOCK_BATCH_MAX];
-};
-
 /* The mount read lock stabilizes inode mappings and current cache versions. */
-int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, unsigned count)
+int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
+    struct file_read_workspace *work, uint64_t size_limit)
 {
     if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
+    uintptr_t descriptors = (uintptr_t)spans, workspace = (uintptr_t)work;
+    if (work && count && (descriptors < workspace ? workspace - descriptors < count * sizeof(*spans) :
+        descriptors - workspace < sizeof(*work))) return EINVAL;
     for (unsigned i = 0; i < count; i++) {
         uintptr_t a = (uintptr_t)spans[i].buffer;
         size_t size = spans[i].size;
@@ -3216,6 +3210,8 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
             return spans[i].error = EINVAL;
         uintptr_t b = (uintptr_t)spans;
         if (size && (a < b ? b - a < size : a - b < count * sizeof(*spans)))
+            return spans[i].error = EINVAL;
+        if (work && size && (a < workspace ? workspace - a < size : a - workspace < sizeof(*work)))
             return spans[i].error = EINVAL;
         for (unsigned j = 0; j < i; j++) {
             b = (uintptr_t)spans[j].buffer;
@@ -3225,19 +3221,18 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     }
     for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
     if (!count) return EOK;
-    struct ext4_read_workspace *work = count > 1 ? ext4_malloc(sizeof(*work)) : NULL;
     if (count > 1 && !work) {
         for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
         return ENOMEM;
     }
     size_t scalar_limit;
-    struct ext4_read_fragment scalar_fragments[8];
-    struct ext4_block_read_span scalar_reads[8];
+    struct file_read_fragment scalar_fragments[8];
+    struct block_read_span scalar_reads[8];
     unsigned scalar_owners[8];
     int scalar_mapping_error;
     size_t *limits = work ? work->limits : &scalar_limit;
-    struct ext4_read_fragment *fragments = work ? work->fragments : scalar_fragments;
-    struct ext4_block_read_span *reads = work ? work->reads : scalar_reads;
+    struct file_read_fragment *fragments = work ? work->fragments : scalar_fragments;
+    struct block_read_span *reads = work ? work->reads : scalar_reads;
     unsigned *owners = work ? work->owners : scalar_owners;
     int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
     unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : 8;
@@ -3252,6 +3247,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     if (result) goto Failed;
     uint64_t size = ext4_inode_get_size(&fs->sb, ref.inode);
     if (size > file->fmax) { result = EFBIG; goto Put; }
+    if (size > size_limit) size = size_limit;
     unsigned block_size = ext4_sb_get_block_size(&fs->sb);
     bool inline_link = ext4_inode_is_type(&fs->sb, ref.inode, EXT4_INODE_MODE_SOFTLINK) &&
         size < sizeof(ref.inode->blocks) && !ext4_inode_get_blocks_count(&fs->sb, ref.inode);
@@ -3301,13 +3297,13 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                 }
                 void *out = (uint8_t *)spans[i].buffer + planned;
                 unsigned sector = fs->bdev->bdif->ph_bsize;
-                uint64_t block = (fs->bdev->part_offset + physical * block_size + skip) / sector;
+                uint64_t block = fs->bdev->part_offset + physical * block_size + skip;
                 bool aligned = physical && !(skip % sector) && !(length % sector);
                 bool extend = parts && pending && aligned &&
                     fragments[parts - 1].span == i && owners[pending - 1] == parts - 1 &&
-                    reads[pending - 1].block + reads[pending - 1].count == block &&
-                    (uint8_t *)reads[pending - 1].data + (size_t)reads[pending - 1].count * sector == out &&
-                    length / sector <= UINT32_MAX - reads[pending - 1].count;
+                    reads[pending - 1].offset + reads[pending - 1].size == block &&
+                    (uint8_t *)reads[pending - 1].buffer + reads[pending - 1].size == out &&
+                    length <= (uint64_t)UINT32_MAX * sector - reads[pending - 1].size;
                 /* A sparse run has one immediate completion fragment, even
                  * when it spans many filesystem blocks. Keep its neighboring
                  * disk fragments in the same submission wave. */
@@ -3324,26 +3320,26 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     /* 片段已满时仍可扩展最后一个设备区间。空输出只查询当前
                      * 版本，不能把未接纳片段提前复制进调用者。 */
                     if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
-                    reads[pending - 1].count += length / sector;
+                    reads[pending - 1].size += length;
                     fragments[parts - 1].length += length;
                     planned += length;
                     range_offset = offset + length;
                     continue;
                 }
                 unsigned part = parts++;
-                fragments[part] = (struct ext4_read_fragment){i, length, EOK};
+                fragments[part] = (struct file_read_fragment){i, length, EOK};
                 if (!physical) memset(out, 0, length);
                 else if (!ext4_copy_pending_data(fs->bdev, physical, skip, out, length)) {
                     if (!aligned)
                         fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
                     else if (extend) {
                         parts--;
-                        reads[pending - 1].count += length / sector;
+                        reads[pending - 1].size += length;
                         fragments[parts - 1].length += length;
                     }
                     else {
                         owners[pending] = part;
-                        reads[pending++] = (struct ext4_block_read_span){out, block, length / sector, EIO};
+                        reads[pending++] = (struct block_read_span){block, out, length, 0, EIO};
                     }
                 }
                 planned += length;
@@ -3351,10 +3347,10 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
             }
         }
         ext4_blockdev_read_batch(fs->bdev, reads, pending);
-        for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].error;
+        for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].status;
         for (unsigned j = 0; j < parts; j++) {
-            struct ext4_read_fragment *part = &fragments[j];
-            struct ext4_file_read_span *span = &spans[part->span];
+            struct file_read_fragment *part = &fragments[j];
+            struct file_read_span *span = &spans[part->span];
             if (!span->error) {
                 if (part->error) span->error = part->error;
                 else span->completed += part->length;
@@ -3370,7 +3366,6 @@ Failed:
     result = EOK;
     for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
     EXT4_MP_UNLOCK(file->mp);
-    ext4_free(work);
     return result;
 }
 

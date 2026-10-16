@@ -633,8 +633,8 @@ static void read_batch_case(unsigned version, unsigned mode)
     assert(initialize_model(&device, registers, sizeof(registers), &allocator,
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     memset(batch_output, 0xa5, sizeof(batch_output));
-    struct kernel_block_read_span spans[8];
-    for (unsigned i = 0; i < 8; i++) spans[i] = (struct kernel_block_read_span){
+    struct block_read_span spans[8];
+    for (unsigned i = 0; i < 8; i++) spans[i] = (struct block_read_span){
         .offset = (uint64_t)i * 4096 + (mode >= 4 ? 7 : 0), .buffer = batch_output[i],
         .size = mode == 4 ? 496 : mode >= 5 ? 1200 : 512};
     enum kernel_block_status result = kernel_block_read_batch(&device.block, spans, 8);
@@ -670,12 +670,12 @@ static void completed_before_park_case(unsigned version, int writing)
     assert(initialize_model(&device, registers, sizeof(registers), &allocator,
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     device.irq_source = 1; wait_irq_device = &device;
-    struct kernel_block_read_span reads[8];
+    struct block_read_span reads[8];
     struct kernel_block_span writes[8];
     for (unsigned i = 0; i < 8; i++) {
         for (unsigned j = 0; j < 512; j++)
             batch_output[i][j] = writing ? (unsigned char)((i * 4096 + j) * 7 + 3) : 0xa5;
-        reads[i] = (struct kernel_block_read_span){i * 4096, batch_output[i], 512, 0, 0};
+        reads[i] = (struct block_read_span){i * 4096, batch_output[i], 512, 0, 0};
         writes[i] = (struct kernel_block_span){i * 4096, batch_output[i], 512};
     }
     enum kernel_block_status result = writing ? kernel_block_write_batch(&device.block, writes, 8) :
@@ -708,13 +708,13 @@ static void sg_batch_case(unsigned version, unsigned queue_size, int writing, in
     assert(initialize_model(&device, registers, sizeof(registers), &allocator,
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     device.irq_source = 1; wait_irq_device = &device;
-    struct kernel_block_read_span reads[8]; struct kernel_block_span writes[8];
+    struct block_read_span reads[8]; struct kernel_block_span writes[8];
     for (unsigned j = 0; j < sizeof(sg_disk); j++) sg_disk[j] = (unsigned char)(j * 7 + j / 512 + 3);
     for (unsigned i = 0; i < 8; i++) {
         unsigned offset = i * (sparse ? 4096 : 512);
         memset(batch_output[i], 0xa5, 4096);
         if (writing) for (unsigned j = 0; j < 512; j++) batch_output[i][j] = (unsigned char)(i + j * 13);
-        reads[i] = (struct kernel_block_read_span){offset, batch_output[i], 512, 0, 0};
+        reads[i] = (struct block_read_span){offset, batch_output[i], 512, 0, 0};
         writes[i] = (struct kernel_block_span){offset, batch_output[i], 512};
     }
     enum kernel_block_status result = writing ? kernel_block_write_batch(&device.block, writes, 8) :
@@ -765,12 +765,12 @@ static void sg_128k_case(unsigned version, unsigned queue_size, int writing,
     assert(initialize_model(&device, registers, sizeof(registers), &allocator,
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     device.irq_source = 1; wait_irq_device = &device;
-    struct kernel_block_read_span reads[32]; struct kernel_block_span writes[32];
+    struct block_read_span reads[32]; struct kernel_block_span writes[32];
     for (unsigned j = 0; j < sizeof(sg_disk); j++) sg_disk[j] = (unsigned char)(j * 7 + j / 512 + 3);
     for (unsigned i = 0; i < 32; i++) {
         memset(batch_output[i], 0xa5, sizeof(batch_output[i]));
         if (writing) for (unsigned j = 0; j < 4096; j++) batch_output[i][j] = (unsigned char)(i + j * 13);
-        reads[i] = (struct kernel_block_read_span){i * 4096, batch_output[i], 4096, 0, 0};
+        reads[i] = (struct block_read_span){i * 4096, batch_output[i], 4096, 0, 0};
         writes[i] = (struct kernel_block_span){i * 4096, batch_output[i], 4096};
     }
     enum kernel_block_status result = writing ? kernel_block_write_batch(&device.block, writes, 32) :
@@ -945,9 +945,9 @@ static void workspace_pool_case(unsigned version)
     notifications = first_notify_heads = sg_max_segments = park_calls = 0; sg_fail_sector = UINT32_MAX;
     assert(initialize_model(&device, registers, sizeof(registers), &allocator,
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
-    struct kernel_block_read_span reads[2]; struct kernel_block_span writes[2];
+    struct block_read_span reads[2]; struct kernel_block_span writes[2];
     for (unsigned i = 0; i < 2; i++) {
-        reads[i] = (struct kernel_block_read_span){i * 4096, batch_output[i], 4096, 0, 0};
+        reads[i] = (struct block_read_span){i * 4096, batch_output[i], 4096, 0, 0};
         writes[i] = (struct kernel_block_span){i * 4096, batch_output[i], 4096};
     }
     unsigned before = allocations;
@@ -1030,8 +1030,8 @@ static void fragmented_descriptors_case(unsigned version)
     fault = SG_BATCH; batch_popped = 2; batch_pushed = 1;
     notifications = first_notify_heads = sg_max_segments = park_calls = 0; sg_fail_sector = UINT32_MAX;
     device.irq_source = 1; wait_irq_device = &device;
-    struct kernel_block_read_span reads[8];
-    for (unsigned i = 0; i < 8; i++) reads[i] = (struct kernel_block_read_span){i * 512, batch_output[i], 512, 0, 0};
+    struct block_read_span reads[8];
+    for (unsigned i = 0; i < 8; i++) reads[i] = (struct block_read_span){i * 512, batch_output[i], 512, 0, 0};
     assert(kernel_block_read_batch(&device.block, reads, 8) == KERNEL_BLOCK_STATUS_OK);
     assert(notifications == 1 && sg_max_segments == 8 && device.queue.inflight == 1);
     at = held_head;

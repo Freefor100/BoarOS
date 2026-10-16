@@ -1654,14 +1654,15 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
     (void)dev; /* Some host runners build this fixture without work counters. */
     ext4_file file;CHECK(ext4_fopen(&file,"/public-range","w+")==EOK);
     struct owned_file_page pages[32];struct file_write_span writes[32];
-    struct ext4_file_read_span reads_out[32];unsigned char *outputs[32];
+    struct file_read_span reads_out[32];unsigned char *outputs[32];
+    struct file_read_workspace read_work;
     for(unsigned i=0;i<32;i++) {
         owned_page_init(&pages[i],4096,0x40+i);
         writes[i]=(struct file_write_span){.offset=i*4096,.buffer=pages[i].bytes,.size=4096,
             .source={&pages[i],owned_page_retain,owned_page_release,4096},
             .source_buffer=pages[i].bytes,.source_size=4096};
         outputs[i]=malloc(4096);CHECK(outputs[i]);
-        reads_out[i]=(struct ext4_file_read_span){i*4096,outputs[i],4096,0,0};
+        reads_out[i]=(struct file_read_span){i*4096,outputs[i],4096,0,0};
     }
     CHECK(ext4_transaction_begin("/")==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
@@ -1674,7 +1675,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
     CHECK(range_queries==1 && bitmap_crc_calls==2);
     watched_bitmap_bytes=0;range_queries=0;
 #endif
-    CHECK(ext4_fpread_batch(&file,reads_out,32)==EOK);
+    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX)==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
     CHECK(range_queries==1);
 #endif
@@ -1687,7 +1688,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
     for(unsigned i=0;i<32;i++) {
         CHECK(pages[i].references==1);
         outputs[i]=malloc(4096);CHECK(outputs[i]);
-        reads_out[i]=(struct ext4_file_read_span){i*4096,outputs[i],4096,0,0};
+        reads_out[i]=(struct file_read_span){i*4096,outputs[i],4096,0,0};
     }
     /* A journal retains its inode reference until unmount; raw cache cleanup
      * would invalidate that owner. Cold-read through a complete remount. */
@@ -1697,7 +1698,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
 #ifdef TEST_RANGE_WORK_COUNTERS
     range_queries=0;
 #endif
-    CHECK(ext4_fpread_batch(&file,reads_out,32)==EOK);
+    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX)==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
     CHECK(range_queries==1);
 #endif

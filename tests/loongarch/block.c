@@ -20,8 +20,8 @@ static void io_worker(void *argument)
     __asm__ volatile("csrxchg %0, %1, 4":"+r"(disabled):"r"(mask):"memory");
     masked_irqs[0]=devices[0].device.statistics.interrupts;
     masked_irqs[1]=devices[1].device.statistics.interrupts;io_masked=1;
-    struct kernel_block_read_span spans[8];
-    for(unsigned i=0;i<8;i++) spans[i]=(struct kernel_block_read_span){16384+i*512,data[i],512,0,KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
+    struct block_read_span spans[8];
+    for(unsigned i=0;i<8;i++) spans[i]=(struct block_read_span){16384+i*512,data[i],512,0,KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
     uint64_t submitted=devices[0].device.statistics.requests;
     if(kernel_block_read_batch(&devices[0].device.block,spans,8)!=KERNEL_BLOCK_STATUS_OK ||
         devices[0].device.statistics.requests!=submitted+1) la_virt_fatal("PCI SG batch read");

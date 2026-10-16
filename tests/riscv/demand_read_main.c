@@ -97,8 +97,8 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *owner,
     enum kernel_uaccess_status status = __real_kernel_copy_from_user(owner, destination, address, size, copied);
     model_user = previous; return status;
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
     if (observe_dma && !dma_count) {
         check(count == 32, 12);
@@ -108,7 +108,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kern
         }
         dma_count = count;
     }
-    return __real_kernel_vfs_node_pread_batch(node, spans, count);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
 }
 
 static unsigned char pattern(uint64_t offset)

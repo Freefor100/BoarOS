@@ -128,13 +128,14 @@ static int cache_batch(struct ext4_blockdev *d, struct ext4_block *b, const uint
 static unsigned batch_width, batch_calls;
 static int batch_failure;
 #ifdef EXT4_CACHED_READ_BATCH
-static int dev_read_batch(struct ext4_blockdev *dev, struct ext4_block_read_span *s, unsigned n)
+static int dev_read_batch(struct ext4_blockdev *dev, struct block_read_span *s, unsigned n)
 {
     batch_calls++;if(n>batch_width)batch_width=n;
     int first=EOK;
     for(unsigned i=n;i>0;i--){unsigned j=i-1;
-        s[j].error = batch_failure && j==2 ? EIO : dev_read(dev,s[j].data,s[j].block,s[j].count);
-        if(s[j].error)first=s[j].error;
+        s[j].status = batch_failure && j==2 ? EIO : dev_read(dev,s[j].buffer,s[j].offset/512,s[j].size/512);
+        if(!s[j].status)s[j].completed=s[j].size;
+        if(s[j].status)first=s[j].status;
     }
     return first;
 }
@@ -201,4 +202,17 @@ static void batch_contracts(void)
     }
     puts("cached read batches: dirty version, overlapping loads, duplicate blocks, per-block error and fallback balanced");
 }
-int main(void) { cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();return 0; }
+static void invalid_physical_batch(void)
+{
+    struct ext4_bcache cache; struct ext4_blockdev dev; struct ext4_blockdev_iface iface;
+    unsigned char data[1024];
+    init(&cache,&dev,&iface,2);
+    struct block_read_span spans[2] = {
+        {.offset=1,.size=512,.buffer=data,.completed=512},
+        {.offset=512,.size=512,.buffer=data+512,.completed=512},
+    };
+    CHECK(ext4_blockdev_read_batch(&dev,spans,2)==EINVAL && !reads);
+    for (unsigned i=0;i<2;i++) CHECK(spans[i].status==EINVAL && !spans[i].completed);
+    finish(&cache);
+}
+int main(void) { cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }

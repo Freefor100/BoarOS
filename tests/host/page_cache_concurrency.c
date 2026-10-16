@@ -195,19 +195,27 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t off, voi
     if (!result && source_short && *done) --*done;
     return result;
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct kernel_vfs_read_span *spans, size_t count)
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
     assert(count && count <= KERNEL_VFS_READ_BATCH_MAX);
-    for (size_t i = 0; i < count; i++) source_read_begin(spans[i].offset);
+    for (size_t i = 0; i < count; i++) {
+        source_read_begin(spans[i].offset);
+#ifndef CACHE_MM_CASES
+        if (read_counts) {
+            const unsigned char *bytes=spans[i].buffer;
+            assert(bytes[0]==0xd7 && bytes[BOAROS_PAGE_SIZE-1]==0xd7);
+        }
+#endif
+    }
     unsigned batch = __atomic_fetch_add(&source_batches, 1, __ATOMIC_RELAXED);
     if (capture_reads) {
         assert(batch < sizeof(source_batch_sizes) / sizeof(source_batch_sizes[0]));
         source_batch_sizes[batch] = (unsigned)count;
     }
     source_read_pause();
-    struct kernel_vfs_read_span kept[KERNEL_VFS_READ_BATCH_MAX];
+    struct file_read_span kept[KERNEL_VFS_READ_BATCH_MAX];
     size_t destinations[KERNEL_VFS_READ_BATCH_MAX], used = 0;
     int injected = source_error;
     for (size_t i = 0; i < count; i++) {
@@ -223,7 +231,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
             kept[used++] = spans[i];
         }
     }
-    int result = used ? __real_kernel_vfs_node_pread_batch(node, kept, used) : 0;
+    int result = used ? __real_kernel_vfs_node_pread_batch(node, kept, used, workspace) : 0;
     for (size_t i = 0; i < used; i++) {
         spans[destinations[i]] = kept[i];
         if (source_short && !spans[destinations[i]].error && spans[destinations[i]].completed)
@@ -239,7 +247,11 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
 {
     if (fail_cache_page && current_cache && pages == current_cache->allocator && !--fail_cache_page)
         return PHYSICAL_PAGE_STATUS_EMPTY;
-    return __real_physical_page_allocate(pages, out);
+    enum physical_page_status status=__real_physical_page_allocate(pages,out);
+    /* 读取生产者应直接填充未初始化页，不能先清整页再用I/O覆盖。 */
+    if (!status && read_counts && current_cache && pages==current_cache->allocator)
+        memset(access_page(*out),0xd7,BOAROS_PAGE_SIZE);
+    return status;
 }
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *, size_t, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t count,
@@ -907,7 +919,7 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
             /* expanded_index已建立足够桶容量；这里检查实际保护次数，
              * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
             assert(read.counts.inode_locks == (!remote && !warm));
-            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 2 * count + 3 + (count>1?2:0)));
+            if (!remote) assert(read.counts.metadata_locks == (warm ? 1 : 4 + (count>1?2:0)));
             else if (warm) assert(read.counts.metadata_locks == 1);
             printf("read operation counts: page=%u cpu=%s cache=%s pages=%u metadata=%llu inode=%llu acquire=%llu release=%llu cache_probes=unavailable(COST=0) scope=caller\n",
                 (unsigned)BOAROS_PAGE_SIZE, remote ? "remote" : "native", warm ? "hot" : "cold", count,
@@ -1024,6 +1036,8 @@ static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_
     assert(eof.status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE);
     demand_contents(&eof.pages[0],0x70,BOAROS_PAGE_SIZE);
     demand_contents(&eof.pages[1],0x71,37);
+    const unsigned char *eof_tail=access_page(eof.pages[1].physical_address);
+    for(size_t i=37;i<BOAROS_PAGE_SIZE;i++) assert(!eof_tail[i]);
     assert(eof.pages[2].status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE && eof.pages[3].status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE);
     assert(!kernel_vfs_ftruncate(&file,4*BOAROS_PAGE_SIZE));
     struct demand_read grown={.count=4};read_demand_batch(&grown);assert(!grown.status);

@@ -615,39 +615,23 @@ static int block_write_phase(struct ext4_blockdev *device,
 }
 
 static int block_read_batch(struct ext4_blockdev *device,
-                            struct ext4_block_read_span *spans, unsigned count)
+                            struct block_read_span *spans, unsigned count)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_read_span single = {0}, *physical = &single;
-    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
-            count * sizeof(*physical), (void **)&physical)) {
-        for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
-        return ENOMEM;
-    }
-    for (unsigned i = 0; i < count; i++) {
-        if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
-            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
-            return EINVAL;
-        }
-        physical[i] = (struct kernel_block_read_span){.offset = spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
-            .buffer = spans[i].data, .size = (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE,
-            .status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
-    }
-    kernel_block_read_batch(adapter->block, physical, count);
+    for (unsigned i = 0; i < count; i++) spans[i].status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+    kernel_block_read_batch(adapter->block, spans, count);
     int result = EOK;
     for (unsigned i = 0; i < count; i++) {
-        switch (physical[i].status) {
-        case KERNEL_BLOCK_STATUS_OK: spans[i].error = EOK; break;
-        case KERNEL_BLOCK_STATUS_NO_MEMORY: spans[i].error = ENOMEM; break;
-        case KERNEL_BLOCK_STATUS_INVALID: spans[i].error = EINVAL; break;
-        case KERNEL_BLOCK_STATUS_UNSUPPORTED: spans[i].error = ENOTSUP; break;
-        default: spans[i].error = EIO; break;
+        switch (spans[i].status) {
+        case KERNEL_BLOCK_STATUS_OK: spans[i].status = spans[i].completed == spans[i].size ? EOK : EIO; break;
+        case KERNEL_BLOCK_STATUS_NO_MEMORY: spans[i].status = ENOMEM; break;
+        case KERNEL_BLOCK_STATUS_INVALID: spans[i].status = EINVAL; break;
+        case KERNEL_BLOCK_STATUS_UNSUPPORTED: spans[i].status = ENOTSUP; break;
+        default: spans[i].status = EIO; break;
         }
-        if (!result) result = spans[i].error;
+        if (!result) result = spans[i].status;
     }
-    if (count > 1 && kernel_heap_release(adapter->instance.heap, physical)) __builtin_trap();
     return result;
 }
 
@@ -1878,36 +1862,21 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
 }
 
 static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
-    struct kernel_vfs_read_span *spans, size_t count)
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
     if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
-    struct ext4_file_read_span local, *batch=&local;
-    if (count>1 && kernel_heap_allocate(node->instance->heap,count*sizeof(*batch),(void **)&batch)) {
-        for (size_t i=0;i<count;i++) { spans[i].completed=0; spans[i].error=-KERNEL_ENOMEM; }
-        return -KERNEL_ENOMEM;
-    }
     struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
     adapter->locks.read_lock(adapter->locks.context);
     uint64_t stored=ext4_fsize(lwext4_node_file(node));
     if (stored>node->size) stored=node->size;
-    for (size_t i = 0; i < count; i++) {
-        size_t n = 0;
-        if (spans[i].offset < stored) {
-            n = spans[i].size;
-            if (n > stored - spans[i].offset) n = stored - spans[i].offset;
-        }
-        /* 活跃node持有打开的file；lwext4在检查区段前初始化全部结果字段。 */
-        batch[i].offset = spans[i].offset;
-        batch[i].buffer = spans[i].buffer;
-        batch[i].size = n;
-    }
-    int result = ext4_fpread_batch(lwext4_node_file(node), batch, count);
+    int result = ext4_fpread_batch(lwext4_node_file(node), spans, count, workspace, stored);
     adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++) {
-        spans[i].error = lwext4_error(batch[i].error);
-        spans[i].completed = batch[i].completed;
-        if (spans[i].completed > batch[i].size) __builtin_trap();
-        if (!spans[i].error && spans[i].completed != batch[i].size) spans[i].error=-KERNEL_EIO;
+        spans[i].error = lwext4_error(spans[i].error);
+        size_t requested = spans[i].offset >= stored ? 0 : stored - spans[i].offset < spans[i].size ?
+            (size_t)(stored - spans[i].offset) : spans[i].size;
+        if (spans[i].completed > requested) __builtin_trap();
+        if (!spans[i].error && spans[i].completed != requested) spans[i].error=-KERNEL_EIO;
         if (!spans[i].error) {
             size_t logical=spans[i].offset>=node->size?0:node->size-spans[i].offset<spans[i].size?
                 (size_t)(node->size-spans[i].offset):spans[i].size;
@@ -1916,7 +1885,6 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
             spans[i].completed=logical;
         }
     }
-    if (count>1 && kernel_heap_release(node->instance->heap,batch)) __builtin_trap();
     return lwext4_error(result);
 }
 

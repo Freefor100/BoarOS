@@ -64,6 +64,11 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
   `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
   验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
 
+- 普通文件批读直接借用调用者的 `file_read_workspace`，VFS/lwext4 共用文件区段，
+  lwext4/块层共用字节区段；删除每次请求的规划分配和两层转换数组。可见 EOF 独立
+  限制，不改变请求长度；短设备完成转为 EIO，各区段保留准确完成量。1/4/8 KiB、
+  extent/传统映射的零分配、并发工作区、别名、OOM 与错误测试见批读宿主入口。
+
 - 深层 extent 截断纠错：删除叶节点后上移时，用既有 `ext4_ext_drop_refs` 释放内部
   索引引用，先重算脏块 checksum，再归还引用。原路径直接 `ext4_block_set` 清掉块号，
   后续查找会返回 EUCLEAN；1/4 KiB 的真实深层树、跨进程重启与最终截零由
