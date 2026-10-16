@@ -1068,6 +1068,21 @@ static void cache_instances_probe(void)
           kernel_page_cache_writeback(&instance_peer, kernel_vfs_file_node(&files[1])) == 0, 189);
     kernel_memory_snapshot(&allocator, &memory);
     check(memory.cached == 4 * 4096 && !memory.dirty, 190);
+    uint64_t pins[2][2];
+    size_t valid;
+    check(memory.reclaimable>=memory.cached && !(memory.reclaimable%4096), 191);
+    uint64_t idle=(memory.reclaimable-memory.cached)/4096;
+    for(unsigned i=0;i<2;i++)for(unsigned j=0;j<2;j++)
+        check(kernel_page_cache_get(i?&instance_peer:&cache,&files[i],j,&pins[i][j],&valid)==
+            KERNEL_PAGE_CACHE_STATUS_OK && valid==4096, 191);
+    /* 先固定四个真实cache页，单独归还已结束的稳定版本；之后的两次
+     * group reclaim才必须各自移除一个实例中的真实cache页。 */
+    uint64_t returned=kernel_page_cache_reclaim(&cache,UINT64_MAX)+
+        kernel_page_cache_reclaim(&instance_peer,UINT64_MAX);
+    kernel_memory_snapshot(&allocator,&memory);
+    check(returned==idle && !memory.reclaimable && memory.cached==4*4096, 191);
+    for(unsigned i=0;i<2;i++)for(unsigned j=0;j<2;j++)
+        check(physical_page_release(&allocator,pins[i][j])==PHYSICAL_PAGE_STATUS_OK, 191);
     check(allocator.reclaimer(allocator.reclaimer_context, 1) == 1 &&
           allocator.reclaimer(allocator.reclaimer_context, 1) == 1, 191);
     kernel_page_cache_get_statistics(&cache, &a);
@@ -1158,7 +1173,11 @@ static void background_writeback_probe(void *unused)
     check(startup_held && startup_held < 1024 && !physical_page_available(&allocator), 111);
     check(kernel_page_cache_start_worker(&cache) == -12 && !physical_page_available(&allocator), 112);
     check(physical_page_release(&allocator, pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 113);
-    check(kernel_page_cache_start_worker(&cache) == -12 && physical_page_available(&allocator) == 1, 114);
+    check(kernel_page_cache_start_worker(&cache) == -12, 114);
+    /* 启动失败允许把已构造版本归还idle；清理后仍须精确归还仅有的一页，
+     * 不能残留worker、版本借用或不可回收的启动资源。 */
+    (void)kernel_page_cache_reclaim(&cache,UINT64_MAX);
+    check(physical_page_available(&allocator) == 1, 114);
     while (startup_held) check(physical_page_release(&allocator,
                 pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 115);
     check(kernel_page_cache_start_worker(&cache) == 0, 91);

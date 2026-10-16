@@ -87,9 +87,23 @@ enum physical_page_status __wrap_physical_page_acquire(struct physical_page_allo
     return __real_physical_page_acquire(pages, address);
 }
 enum physical_page_status __real_physical_page_release(struct physical_page_allocator *, uint64_t);
+static const uint64_t *tracked_version_pages;
+static size_t tracked_version_count;
+static _Thread_local size_t *version_releases;
+static struct physical_page_allocator *destroy_allocator;
+static uint64_t destroy_idle_page;
+static unsigned pause_version_free,version_free_entered,resume_version_free;
 enum physical_page_status __wrap_physical_page_release(struct physical_page_allocator *pages, uint64_t address)
 {
     if (read_counts && pages == read_allocator) read_counts->physical_releases++;
+    if(pages==destroy_allocator && address==destroy_idle_page &&
+        __atomic_exchange_n(&pause_version_free,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&version_free_entered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&resume_version_free,__ATOMIC_ACQUIRE))sched_yield();
+    }
+    if (version_releases && current_cache && pages==current_cache->allocator)
+        for(size_t i=0;i<tracked_version_count;i++)if(address==tracked_version_pages[i])(*version_releases)++;
     return __real_physical_page_release(pages, address);
 }
 struct writeback_operation_counts {
@@ -100,10 +114,32 @@ struct writeback_operation_counts {
 static _Thread_local struct writeback_operation_counts *write_counts;
 static _Thread_local unsigned fail_workspace_allocation;
 static _Thread_local size_t *demand_heap_allocations;
+struct retained_version {
+    struct file_data_source source;
+    const unsigned char *data;
+};
+static _Thread_local struct retained_version *retain_version;
+static struct retained_version late_version;
+static struct retained_version after_destroy_version;
+static struct retained_version *retain_background_version;
+static unsigned reject_background_allocations,rejected_background_allocations;
+static unsigned version_cycle_active,version_cycle_submissions;
+static unsigned cycle_fg_entered,cycle_fg_resume,cycle_alloc_entered,cycle_alloc_resume,cycle_pause_allocation;
 enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t bytes,void **out)
 {
     if (current_cache && heap==current_cache->heap) {
+        unsigned reject=__atomic_load_n(&reject_background_allocations,__ATOMIC_ACQUIRE);
+        if (reject && (reject>1 || kernel_io_context_current()->background_reclaim)) {
+            __atomic_fetch_add(&rejected_background_allocations,1,__ATOMIC_RELEASE);
+            if(kernel_io_context_current()->background_reclaim &&
+                __atomic_exchange_n(&cycle_pause_allocation,0,__ATOMIC_ACQ_REL)) {
+                assert(!kernel_cpu_current()->raw_locks);
+                __atomic_store_n(&cycle_alloc_entered,1,__ATOMIC_RELEASE);
+                while(!__atomic_load_n(&cycle_alloc_resume,__ATOMIC_ACQUIRE))sched_yield();
+            }
+            return KERNEL_HEAP_STATUS_EMPTY;
+        }
         if (read_counts && bytes>256) read_counts->descriptor_allocations++;
         if (demand_heap_allocations) (*demand_heap_allocations)++;
         if (fail_workspace_allocation && !--fail_workspace_allocation) return KERNEL_HEAP_STATUS_EMPTY;
@@ -317,9 +353,27 @@ static int rearm_alias(void *owner, uint64_t address)
     __atomic_fetch_add(&rearms,1,__ATOMIC_RELEASE);
     return 0;
 }
+static int cycle_rearm_foreground(void *owner,uint64_t address)
+{
+    (void)owner;(void)address;
+    __atomic_store_n(&cycle_fg_entered,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&cycle_fg_resume,__ATOMIC_ACQUIRE))sched_yield();
+    return 0;
+}
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
 {
+    if(__atomic_load_n(&version_cycle_active,__ATOMIC_ACQUIRE))
+        __atomic_fetch_add(&version_cycle_submissions,1,__ATOMIC_RELEASE);
+    struct retained_version *retained=retain_version;
+    if (!retained && kernel_io_context_current()->background_reclaim)
+        retained=__atomic_load_n(&retain_background_version,__ATOMIC_ACQUIRE);
+    if (retained) {
+        assert(count==1 && !retained->source.context);
+        spans[0].source.retain(spans[0].source.context);
+        retained->source=spans[0].source;
+        retained->data=spans[0].buffer;
+    }
     if(write_counts) {
         write_counts->batches++;
         if(count>write_counts->maximum_pages)write_counts->maximum_pages=count;
@@ -595,7 +649,7 @@ static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs
     assert(!kernel_vfs_sync(file,0,&observed));write_counts=NULL;
     printf("foreground windows: pages=%u allocations=%zu descriptors=%zu largest=%zu batches=%zu maxpages=%zu\n",
         COUNT,counts.allocations,counts.large_allocations,counts.largest,counts.batches,counts.maximum_pages);
-    assert(!counts.large_allocations && counts.allocations==COUNT);
+    assert(!counts.large_allocations && !counts.allocations);
     assert(counts.maximum_pages<=131072/BOAROS_PAGE_SIZE && counts.largest<=BOAROS_PAGE_SIZE);
     assert(counts.maximum_borrows<=2*(131072/BOAROS_PAGE_SIZE));
     for(unsigned i=0;i<COUNT;i++) {
@@ -606,8 +660,247 @@ static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs
     assert(!kernel_vfs_pwrite(file,17,&one,1,&done) && done==1);
     counts=(struct writeback_operation_counts){0};write_counts=&counts;
     assert(!kernel_vfs_sync(file,0,&observed));write_counts=NULL;
-    assert(counts.allocations==1 && !counts.large_allocations && counts.batches==1 && counts.maximum_pages==1);
+    assert(!counts.allocations && !counts.large_allocations && counts.batches==1 && counts.maximum_pages==1);
     puts("PASS foreground writeback: reused bounded descriptors across sync calls/windows, scalar page uses no descriptors");
+}
+static void version_reuse_case(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    current_cache=cache;
+    struct retained_version first={0},second={0},third={0};
+    struct retained_version *versions[3]={&first,&second,&third};
+    size_t done;
+    uint64_t observed=kernel_vfs_error_sequence(file);
+    for(unsigned i=0;i<3;i++) {
+        unsigned char byte=0x91+i;
+        assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+        if(i==2) {
+            second.source.release(second.source.context);
+            assert(*first.data==0x91);
+        }
+        struct writeback_operation_counts counts={0};write_counts=&counts;
+        retain_version=versions[i];
+        assert(!kernel_vfs_sync(file,0,&observed));
+        retain_version=NULL;write_counts=NULL;
+        assert(*versions[i]->data==byte && *first.data==0x91);
+        if(i==1)assert(first.source.context!=second.source.context && first.data!=second.data);
+        if(i==2) {
+            printf("stable version reuse: allocations=%zu old=%p reused=%p\n",counts.allocations,
+                first.source.context,third.source.context);
+            assert(!counts.allocations && third.source.context==second.source.context && third.data==second.data);
+        }
+    }
+    first.source.release(first.source.context);third.source.release(third.source.context);
+    puts("PASS stable versions: retained old bytes, distinct active owner, idle object and page reused without allocation");
+}
+static void retain_generation(struct kernel_vfs_file *file,unsigned char byte,struct retained_version *version)
+{
+    size_t done;uint64_t observed=kernel_vfs_error_sequence(file);
+    retain_version=version;
+    __atomic_store_n(&retain_background_version,version,__ATOMIC_RELEASE);
+    assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+    assert(!kernel_vfs_sync(file,0,&observed));retain_version=NULL;
+    __atomic_store_n(&retain_background_version,NULL,__ATOMIC_RELEASE);
+    assert(version->source.context && *version->data==byte);
+}
+static void version_capacity_case(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    enum { CAPACITY=262144U/BOAROS_PAGE_SIZE, COUNT=CAPACITY+3 };
+    struct retained_version versions[COUNT];memset(versions,0,sizeof(versions));
+    uint64_t addresses[COUNT];
+    for(unsigned i=0;i<COUNT;i++) {
+        retain_generation(file,0x20+i,&versions[i]);
+        addresses[i]=(uintptr_t)versions[i].data&~BOAROS_PAGE_MASK;
+        for(unsigned j=0;j<i;j++)assert(addresses[i]!=addresses[j] && *versions[j].data==0x20+j);
+    }
+    uint64_t pinned;size_t valid;
+    assert(!kernel_page_cache_get(cache,file,0,&pinned,&valid));
+    size_t released=0;version_releases=&released;
+    tracked_version_pages=addresses;tracked_version_count=COUNT;
+    for(unsigned i=0;i<COUNT;i++)versions[i].source.release(versions[i].source.context);
+    assert(released==COUNT-CAPACITY);
+    assert(!kernel_page_cache_start_worker(cache));
+    unsigned excess=CAPACITY-BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    assert(kernel_page_cache_reclaim(cache,excess)==excess && released==COUNT-BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
+    rejected_background_allocations=0;__atomic_store_n(&reject_background_allocations,1,__ATOMIC_RELEASE);
+    unsigned char byte=0xd1;size_t done;
+    assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+    struct kernel_page_cache_concurrency_state before;
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache));wait_writeback_round(cache,before.writeback_rounds);
+    assert(!__atomic_load_n(&rejected_background_allocations,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&reject_background_allocations,0,__ATOMIC_RELEASE);
+    kernel_page_cache_stop_worker(cache);
+    assert(kernel_page_cache_reclaim(cache,BOAROS_PAGE_CACHE_WRITEBACK_PAGES)==BOAROS_PAGE_CACHE_WRITEBACK_PAGES && released==COUNT);
+    version_releases=NULL;tracked_version_pages=NULL;tracked_version_count=0;
+    assert(!physical_page_release(cache->allocator,pinned));
+    printf("PASS version pool capacity: idle=%u pages <=256KiB, pressure frees surplus before cache pages, %u-page reserve writes with allocations rejected\n",
+        CAPACITY,(unsigned)BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
+}
+static void version_oom_case(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    enum { COUNT=BOAROS_PAGE_CACHE_WRITEBACK_PAGES };
+    struct retained_version versions[COUNT],replacement={0};memset(versions,0,sizeof(versions));
+    unsigned parked=mm_test_parked(0);
+    assert(!kernel_page_cache_start_worker(cache));
+    while(mm_test_parked(0)==parked)sched_yield();
+    for(unsigned i=0;i<COUNT;i++)retain_generation(file,0x40+i,&versions[i]);
+    rejected_background_allocations=0;__atomic_store_n(&reject_background_allocations,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&retain_background_version,&replacement,__ATOMIC_RELEASE);
+    unsigned char byte=0xe2;size_t done;
+    assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+    struct kernel_page_cache_concurrency_state before;
+    kernel_page_cache_get_concurrency_state(cache,&before);parked=mm_test_parked(0);
+    assert(!kernel_page_cache_request_writeback(cache));
+    while(!__atomic_load_n(&rejected_background_allocations,__ATOMIC_ACQUIRE) || mm_test_parked(0)==parked)sched_yield();
+    for(unsigned i=0;i<COUNT;i++)assert(*versions[i].data==0x40+i);
+    void *returned=versions[0].source.context;
+    versions[0].source.release(returned);versions[0].source.context=NULL;
+    wait_writeback_round(cache,before.writeback_rounds);
+    assert(replacement.source.context==returned && *replacement.data==byte);
+    __atomic_store_n(&retain_background_version,NULL,__ATOMIC_RELEASE);
+    byte=0xe3;assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+    rejected_background_allocations=0;parked=mm_test_parked(0);
+    assert(!kernel_page_cache_request_writeback(cache));
+    while(!__atomic_load_n(&rejected_background_allocations,__ATOMIC_ACQUIRE) || mm_test_parked(0)==parked)sched_yield();
+    kernel_page_cache_stop_worker(cache);
+    __atomic_store_n(&reject_background_allocations,0,__ATOMIC_RELEASE);
+    replacement.source.release(replacement.source.context);
+    for(unsigned i=1;i<COUNT;i++)versions[i].source.release(versions[i].source.context);
+    uint64_t observed=kernel_vfs_error_sequence(file);assert(!kernel_vfs_sync(file,0,&observed));
+    puts("PASS version OOM: retained owners block reuse, actual last release resumes background, stop cancels an allocation-starved wait");
+}
+static void version_prefix_cycle(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    enum { COUNT=BOAROS_PAGE_CACHE_WRITEBACK_PAGES };
+    if(COUNT<2)return;
+    (void)kernel_page_cache_reclaim(cache,UINT64_MAX);
+    unsigned char byte=0x6a;size_t done,valid;
+    for(unsigned i=1;i<=COUNT;i++)assert(!kernel_vfs_pwrite(file,(uint64_t)i*BOAROS_PAGE_SIZE+17,&byte,1,&done) && done==1);
+    uint64_t address,foreground_address;
+    assert(!kernel_page_cache_get(cache,file,COUNT-1,&address,&valid));
+    assert(!kernel_page_cache_get(cache,file,0,&foreground_address,&valid));
+    struct kernel_page_cache_alias alias={0};
+    struct kernel_page_cache_alias foreground_alias={0};
+    assert(!kernel_page_cache_alias_attach(cache,file,COUNT-1,address,&alias,kernel_vfs_file_node(file),0x99000,rearm_alias));
+    assert(!kernel_page_cache_alias_attach(cache,file,0,foreground_address,&foreground_alias,kernel_vfs_file_node(file),0x9a000,cycle_rearm_foreground));
+    alias_entered=resume_alias=0;pause_alias=1;
+    cycle_fg_entered=cycle_fg_resume=cycle_alloc_entered=cycle_alloc_resume=0;cycle_pause_allocation=1;
+    rejected_background_allocations=version_cycle_submissions=0;
+    __atomic_store_n(&version_cycle_active,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&reject_background_allocations,1,__ATOMIC_RELEASE);
+    assert(!kernel_page_cache_start_worker(cache));
+    struct kernel_page_cache_concurrency_state before;
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache));
+    while(!__atomic_load_n(&alias_entered,__ATOMIC_ACQUIRE))sched_yield();
+    /* Background owns COUNT-1 entries and versions. A new lower page lets
+     * foreground take the last idle version before waiting on that prefix. */
+    byte=0x5e;assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+    sync_done=0;
+    pthread_t foreground;assert(!pthread_create(&foreground,NULL,sync_file,file));
+    while(!__atomic_load_n(&cycle_fg_entered,__ATOMIC_ACQUIRE))sched_yield();
+    __atomic_store_n(&resume_alias,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&cycle_alloc_entered,__ATOMIC_ACQUIRE))sched_yield();
+    unsigned parked=mm_test_parked(0);
+    __atomic_store_n(&cycle_fg_resume,1,__ATOMIC_RELEASE);
+    while(mm_test_parked(0)==parked)sched_yield();
+    __atomic_store_n(&cycle_alloc_resume,1,__ATOMIC_RELEASE);
+    puts("version prefix handshake: foreground owns last version and waits on background; background allocation returned OOM");
+    while(!__atomic_load_n(&version_cycle_submissions,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_join(foreground,NULL));wait_writeback_round(cache,before.writeback_rounds);
+    __atomic_store_n(&reject_background_allocations,0,__ATOMIC_RELEASE);
+    __atomic_store_n(&version_cycle_active,0,__ATOMIC_RELEASE);
+    kernel_page_cache_stop_worker(cache);
+    kernel_page_cache_alias_detach(&alias);kernel_page_cache_alias_drain(&alias);
+    kernel_page_cache_alias_detach(&foreground_alias);kernel_page_cache_alias_drain(&foreground_alias);
+    assert(!physical_page_release(cache->allocator,address));
+    assert(!physical_page_release(cache->allocator,foreground_address));
+    for(unsigned i=0;i<=COUNT;i++) {
+        unsigned char actual;
+        assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),(uint64_t)i*BOAROS_PAGE_SIZE+17,&actual,1,&done) && done==1 && actual==(i?0x6a:0x5e));
+    }
+    puts("PASS version OOM interleave: submitted prepared background prefix before waiting on foreground's last version");
+}
+static int cycle_sync_result;
+static void *cycle_sync_file(void *argument)
+{
+    mm_test_attach(0);uint64_t observed=kernel_vfs_error_sequence(argument);
+    cycle_sync_result=kernel_vfs_sync(argument,0,&observed);return NULL;
+}
+static void version_empty_cycle(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    enum { COUNT=BOAROS_PAGE_CACHE_WRITEBACK_PAGES };
+    if(COUNT<2)return;
+    (void)kernel_page_cache_reclaim(cache,UINT64_MAX);
+    unsigned parked=mm_test_parked(0);assert(!kernel_page_cache_start_worker(cache));
+    while(mm_test_parked(0)==parked)sched_yield();
+    struct retained_version held[COUNT-1];memset(held,0,sizeof(held));
+    for(unsigned i=0;i<COUNT-1;i++)retain_generation(file,0x20+i,&held[i]);
+    unsigned char byte=0xa1;size_t done,valid;uint64_t address;
+    assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
+    byte=0xa2;assert(!kernel_vfs_pwrite(file,BOAROS_PAGE_SIZE+17,&byte,1,&done) && done==1);
+    assert(!kernel_page_cache_get(cache,file,0,&address,&valid));
+    struct kernel_page_cache_alias alias={0};
+    assert(!kernel_page_cache_alias_attach(cache,file,0,address,&alias,kernel_vfs_file_node(file),0x9b000,cycle_rearm_foreground));
+    cycle_fg_entered=cycle_fg_resume=cycle_alloc_entered=cycle_alloc_resume=0;cycle_pause_allocation=1;
+    pthread_t foreground;assert(!pthread_create(&foreground,NULL,cycle_sync_file,file));
+    while(!__atomic_load_n(&cycle_fg_entered,__ATOMIC_ACQUIRE))sched_yield();
+    version_cycle_submissions=rejected_background_allocations=0;
+    __atomic_store_n(&version_cycle_active,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&reject_background_allocations,2,__ATOMIC_RELEASE);
+    struct kernel_page_cache_concurrency_state before;kernel_page_cache_get_concurrency_state(cache,&before);
+    assert(!kernel_page_cache_request_writeback(cache));
+    while(!__atomic_load_n(&cycle_alloc_entered,__ATOMIC_ACQUIRE))sched_yield();
+    parked=mm_test_parked(0);__atomic_store_n(&cycle_alloc_resume,1,__ATOMIC_RELEASE);
+    while(mm_test_parked(0)==parked)sched_yield();
+    __atomic_store_n(&cycle_fg_resume,1,__ATOMIC_RELEASE);
+    puts("version empty-prefix handshake: foreground owns last version; background reached OOM before foreground continues");
+    while(!__atomic_load_n(&version_cycle_submissions,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_join(foreground,NULL) && (!cycle_sync_result || cycle_sync_result==-KERNEL_ENOMEM));
+    wait_writeback_round(cache,before.writeback_rounds);
+    __atomic_store_n(&reject_background_allocations,0,__ATOMIC_RELEASE);
+    __atomic_store_n(&version_cycle_active,0,__ATOMIC_RELEASE);
+    kernel_page_cache_stop_worker(cache);
+    for(unsigned i=0;i<COUNT-1;i++)held[i].source.release(held[i].source.context);
+    uint64_t observed=kernel_vfs_error_sequence(file);assert(!kernel_vfs_sync(file,0,&observed));
+    kernel_page_cache_alias_detach(&alias);kernel_page_cache_alias_drain(&alias);
+    assert(!physical_page_release(cache->allocator,address));
+    for(unsigned i=0;i<2;i++) {
+        unsigned char actual;
+        assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),(uint64_t)i*BOAROS_PAGE_SIZE+17,&actual,1,&done) && done==1 && actual==0xa1+i);
+    }
+    puts("PASS version OOM empty-prefix interleave: background releases entry qualification before waiting; foreground prefix submits and both finish");
+}
+static void retain_after_cache_close(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
+{
+    struct retained_version idle={0};
+    retain_generation(file,0xf1,&late_version);
+    retain_generation(file,0xf3,&after_destroy_version);
+    retain_generation(file,0xf2,&idle);
+    destroy_allocator=cache->allocator;
+    destroy_idle_page=(uintptr_t)idle.data&~BOAROS_PAGE_MASK;
+    idle.source.release(idle.source.context);
+}
+static void *destroy_with_borrowed_version(void *argument)
+{
+    mm_test_attach(0);assert(!kernel_page_cache_destroy(argument));return NULL;
+}
+static void destroy_version_case(struct kernel_page_cache *cache)
+{
+    if(!late_version.source.context) {assert(!kernel_page_cache_destroy(cache));return;}
+    pause_version_free=1;version_free_entered=resume_version_free=0;
+    pthread_t destroyer;assert(!pthread_create(&destroyer,NULL,destroy_with_borrowed_version,cache));
+    while(!__atomic_load_n(&version_free_entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(*late_version.data==0xf1);
+    /* Closing detached idle versions and dropped the pool lock before their
+     * physical release. A real last borrower can return concurrently here. */
+    late_version.source.release(late_version.source.context);late_version=(struct retained_version){0};
+    __atomic_store_n(&resume_version_free,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(destroyer,NULL));destroy_allocator=NULL;
+    assert(!cache->record && !cache->heap && *after_destroy_version.data==0xf3);
+    after_destroy_version.source.release(after_destroy_version.source.context);
+    after_destroy_version=(struct retained_version){0};
+    puts("PASS version pool destroy: closed idle drain overlaps last retained release, no cache pointer borrowed by late owner");
 }
 static unsigned window_truncate_started,window_truncate_done;
 static void *truncate_writeback_window(void *file)
@@ -710,11 +1003,13 @@ static void dirty_index_case(struct kernel_page_cache *cache, struct kernel_vfs_
     kernel_page_cache_get_concurrency_state(cache,&state); kernel_page_cache_get_statistics(cache,&before);
     assert(!kernel_page_cache_request_writeback(cache)); wait_writeback_round(cache,state.writeback_rounds);
     kernel_page_cache_get_statistics(cache,&after);
-    assert(after.worker_scanned-before.worker_scanned==3 && after.worker_failed-before.worker_failed==3);
+    unsigned failed_pages=BOAROS_PAGE_CACHE_WRITEBACK_PAGES<3?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:3;
+    assert(after.worker_scanned-before.worker_scanned==3 && after.worker_failed-before.worker_failed==failed_pages &&
+        after.worker_written-before.worker_written==3-failed_pages);
     kernel_page_cache_get_concurrency_state(cache,&state);
     assert(!kernel_page_cache_request_writeback(cache)); wait_writeback_round(cache,state.writeback_rounds);
     kernel_page_cache_get_statistics(cache,&after);
-    assert(after.worker_scanned-before.worker_scanned==6 && after.worker_written-before.worker_written==3);
+    assert(after.worker_scanned-before.worker_scanned==3+failed_pages && after.worker_written-before.worker_written==3);
     /* The round cursor points to the other inode while this first inode's
      * device write is held. Removing it must update the persistent cursor. */
     struct kernel_vfs_file other={0}; char name[40];
@@ -890,6 +1185,15 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
     for (unsigned remote = 0; remote < 2; remote++) for (unsigned warm = 0; warm < 2; warm++)
         for (unsigned count = 1; count <= 8; count *= 8) {
             assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
+            kernel_page_cache_get_concurrency_state(cache,&state);
+            if(state.index_capacity-state.index_capacity/4-state.index_live-state.index_tombstones<count) {
+                /* Churn can leave a large table needing a tombstone rebuild.
+                 * Prepare that maintenance before counting the read itself. */
+                struct demand_read prepared={.count=count};
+                assert(!kernel_page_cache_get_batch(cache,file,16,prepared.pages,prepared.count));
+                demand_release(&prepared);
+                assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
+            }
             if (warm) {
                 struct demand_read prepared = {.count = count};
                 assert(!kernel_page_cache_get_batch(cache, file, 16, prepared.pages, prepared.count));
@@ -914,6 +1218,9 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
                 read.counts.physical_releases == count);
             assert(!read.counts.descriptor_allocations);
 #ifndef CACHE_MM_CASES
+            if(read.counts.cache_allocations!=(remote || warm ? 0 : count))fprintf(stderr,
+                "cache allocation mismatch: remote=%u warm=%u count=%u actual=%llu\n",remote,warm,count,
+                (unsigned long long)read.counts.cache_allocations);
             assert(read.counts.cache_allocations == (remote || warm ? 0 : count));
 #endif
             /* expanded_index已建立足够桶容量；这里检查实际保护次数，
@@ -1447,10 +1754,13 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
         alias_snapshot(cache, &file, pages,32,force_retry);
     }
     expanded_index_case(cache,&file,pages);
+    version_reuse_case(cache,&file);
     foreground_windows(cache,&file);
+    if(actors==2) {version_capacity_case(cache,&file);version_oom_case(cache,&file);version_prefix_cycle(cache,&file);version_empty_cycle(cache,&file);}
     foreground_window_truncate(cache,&file);
     dirty_index_case(cache,&mount,&file,actors);
     demand_cases(cache, &file, actors);
+    if(actors==4)retain_after_cache_close(cache,&file);
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_unmount(&mount));
     assert(!close(image_fd));
@@ -1491,7 +1801,7 @@ int main(int argc, char **argv)
         cold_case(&cache, &heap, &pages, argv[1], 4);
     }
     execution_case(&cache);
-    assert(!kernel_page_cache_destroy(&cache));
+    destroy_version_case(&cache);
     assert(!physical_page_allocator_audit(&pages));
     assert(physical_page_available(&pages) == baseline);
     struct kernel_heap_statistics backend_stats;

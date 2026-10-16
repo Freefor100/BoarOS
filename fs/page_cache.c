@@ -103,8 +103,8 @@ struct kernel_page_cache_record {
     uint64_t completed;
     uint64_t requested;
     int started, stopping;
-    struct cache_version *snapshots[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
-    size_t snapshot_count;
+    struct version_pool *versions;
+    size_t writeback_capacity;
     struct writeback_workspace *writeback_workspace;
     union foreground_workspace *foreground_workspace;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
@@ -238,34 +238,68 @@ static void cache_wake(struct kernel_wait_queue *queue)
         !queue->registrations && !queue->borrows)) __builtin_trap();
 }
 
-/* One stable file-data version. The cache or writeback caller owns the first
- * reference; ordered transactions retain the same page instead of copying it. */
-struct cache_version {
+/* A pool outlives the cache while a journal/DMA borrower still owns a
+ * version. Idle entries have no borrowers; their page and object move together. */
+#define CACHE_VERSION_IDLE_MAX (262144U / BOAROS_PAGE_SIZE)
+struct version_pool {
+    struct kernel_raw_lock lock;
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
-    uint64_t physical;
-    unsigned references;
+    struct cache_version *idle;
+    size_t idle_count, reserve;
+    unsigned references, closed, stopping;
     struct kernel_wait_queue ready;
 };
-static struct cache_version *version_new(struct kernel_page_cache *cache)
+struct cache_version {
+    struct version_pool *pool;
+    struct cache_version *next;
+    uint64_t physical;
+    unsigned references;
+};
+static void version_pool_put(struct version_pool *pool)
+{
+    unsigned old=__atomic_fetch_sub(&pool->references,1,__ATOMIC_ACQ_REL);
+    if (!old) __builtin_trap();
+    if (old!=1) return;
+    if (!pool->closed || pool->idle || kernel_wait_queue_destroy(&pool->ready) ||
+        kernel_heap_release(pool->heap,pool)) __builtin_trap();
+}
+static struct version_pool *version_pool_new(struct kernel_heap *heap,
+    struct physical_page_allocator *allocator)
+{
+    struct version_pool *pool;
+    if (kernel_heap_allocate(heap,sizeof(*pool),(void **)&pool)) return NULL;
+    *pool=(struct version_pool){.heap=heap,.allocator=allocator,.references=1};
+    kernel_raw_lock_init(&pool->lock,KERNEL_RAW_RANK_OBJECT);
+    kernel_wait_queue_init(&pool->ready);
+    return pool;
+}
+static struct cache_version *version_new(struct version_pool *pool)
 {
     struct cache_version *version;
-    enum kernel_heap_status heap_status=kernel_heap_allocate(cache->heap,sizeof(*version),(void **)&version);
+    enum kernel_heap_status heap_status=kernel_heap_allocate(pool->heap,sizeof(*version),(void **)&version);
     if (heap_status) {
         if (heap_status!=KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
         return NULL;
     }
     uint64_t address;
-    enum physical_page_status status=physical_page_allocate(cache->allocator,&address);
+    enum physical_page_status status=physical_page_allocate(pool->allocator,&address);
     if (status) {
         if (status!=PHYSICAL_PAGE_STATUS_EMPTY) __builtin_trap();
-        if (kernel_heap_release(cache->heap,version)) __builtin_trap();
+        if (kernel_heap_release(pool->heap,version)) __builtin_trap();
         return NULL;
     }
-    *version=(struct cache_version){.heap=cache->heap,.allocator=cache->allocator,
-        .physical=address,.references=1};
-    kernel_wait_queue_init(&version->ready);
+    unsigned old=__atomic_fetch_add(&pool->references,1,__ATOMIC_ACQ_REL);
+    if (!old || old==UINT32_MAX) __builtin_trap();
+    *version=(struct cache_version){.pool=pool,.physical=address,.references=1};
     return version;
+}
+static void version_dispose(struct cache_version *version)
+{
+    struct version_pool *pool=version->pool;
+    if (physical_page_release(pool->allocator,version->physical) ||
+        kernel_heap_release(pool->heap,version)) __builtin_trap();
+    version_pool_put(pool);
 }
 static void version_retain(void *owner)
 {
@@ -278,41 +312,113 @@ static void version_release(void *owner)
     struct cache_version *version=owner;
     unsigned old=__atomic_fetch_sub(&version->references,1,__ATOMIC_ACQ_REL);
     if (!old) __builtin_trap();
-    if (old==2) cache_wake(&version->ready);
     if (old!=1) return;
-    if (physical_page_release(version->allocator,version->physical) ||
-        kernel_heap_release(version->heap,version)) __builtin_trap();
-}
-static struct cache_version *version_take(struct kernel_page_cache *cache,size_t slot)
-{
-    struct kernel_page_cache_record *record=cache->record;
-    if (!kernel_io_context_current()->background_reclaim || !record->started)
-        return version_new(cache);
-    if (slot>=record->snapshot_count) __builtin_trap();
-    struct cache_version *version=record->snapshots[slot];
-    unsigned available=1;
-    if (__atomic_compare_exchange_n(&version->references,&available,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
-        return version;
-    /* A busy reserve must not cap a running group at one writeback batch.
-     * Ordinary free RAM supplies the next version; wait only at real pressure. */
-    struct cache_version *fresh=version_new(cache);
-    if (fresh) return fresh;
-    KERNEL_IRQ_SCOPE(irq);
-    for (;;) {
-        unsigned expected=1;
-        if (__atomic_compare_exchange_n(&version->references,&expected,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
-            return version;
-        /* The reserved page is still an immutable ordered-data source. Wait
-         * for its actual last borrower; starting the next write cannot reuse it. */
-        enum kernel_wait_wake_reason reason;
-        if (KERNEL_WAIT_RECHECK(&version->ready,0,0,&reason,
-            (__atomic_load_n(&version->references,__ATOMIC_ACQUIRE)!=1))) __builtin_trap();
+    struct version_pool *pool=version->pool;
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        if (!pool->closed && pool->idle_count<CACHE_VERSION_IDLE_MAX) {
+            version->next=pool->idle; pool->idle=version; pool->idle_count++;
+            cache_wake(&pool->ready);
+            return;
+        }
     }
+    version_dispose(version);
+}
+/* Detach only idle owners under the raw lock. Physical/heap releases can take
+ * lower-ranked allocator locks and therefore always happen after unlocking. */
+static uint64_t version_pool_reclaim(struct version_pool *pool,uint64_t target)
+{
+    struct cache_version *retired=NULL;
+    uint64_t count=0;
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        while (pool->idle && pool->idle_count>pool->reserve && count<target) {
+            struct cache_version *version=pool->idle;
+            pool->idle=version->next; pool->idle_count--;
+            version->next=retired; retired=version; count++;
+        }
+    }
+    while (retired) {
+        struct cache_version *version=retired;retired=version->next;
+        version_dispose(version);
+    }
+    return count;
+}
+static void version_pool_close(struct version_pool *pool)
+{
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        if (pool->closed) __builtin_trap();
+        pool->closed=1;pool->reserve=0;
+    }
+    enum kernel_scheduler_status status=kernel_wait_queue_close(&pool->ready);
+    if (status && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED) __builtin_trap();
+    (void)version_pool_reclaim(pool,UINT64_MAX);
+    version_pool_put(pool);
+}
+static struct cache_version *version_take(struct kernel_page_cache *cache)
+{
+    struct version_pool *pool=cache->record->versions;
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        if (pool->closed) __builtin_trap();
+        struct cache_version *version=pool->idle;
+        if (version) {
+            pool->idle=version->next;pool->idle_count--;
+            version->next=NULL;
+            if (__atomic_exchange_n(&version->references,1,__ATOMIC_ACQ_REL)) __builtin_trap();
+            return version;
+        }
+    }
+    return version_new(pool);
+}
+/* No entry writeback qualification or prepared versions may be held here:
+ * a foreground borrower may need those entries before returning its version. */
+static int version_wait(struct kernel_page_cache *cache)
+{
+    struct version_pool *pool=cache->record->versions;
+    struct kernel_wait_token token={0};
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        if (pool->stopping) return 0;
+        if (pool->idle) return 1;
+        if (kernel_wait_prepare(&pool->ready,0,0,&token)) __builtin_trap();
+    }
+    enum kernel_wait_wake_reason reason;
+    if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
+    return 1;
+}
+static size_t version_pool_reserve(struct version_pool *pool)
+{
+    size_t count;
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        pool->stopping=0;
+        pool->reserve=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+        count=pool->idle_count;
+    }
+    while (count<BOAROS_PAGE_CACHE_WRITEBACK_PAGES) {
+        struct cache_version *version=version_new(pool);
+        if (!version) break;
+        version_release(version);count++;
+    }
+    if (count>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) count=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    {KERNEL_RAW_SCOPE(guard,&pool->lock);pool->reserve=count;}
+    return count;
+}
+static void version_pool_unreserve(struct version_pool *pool)
+{
+    KERNEL_RAW_SCOPE(guard,&pool->lock);pool->reserve=0;
+}
+static void version_pool_stop(struct version_pool *pool)
+{
+    KERNEL_RAW_SCOPE(guard,&pool->lock);
+    pool->stopping=1;cache_wake(&pool->ready);
 }
 static void *version_data(struct cache_version *version)
 {
     void *data;
-    if (physical_page_resolve(version->allocator,version->physical,&data)) __builtin_trap();
+    if (physical_page_resolve(version->pool->allocator,version->physical,&data)) __builtin_trap();
     return data;
 }
 
@@ -611,7 +717,7 @@ static void dirty_round_begin(struct kernel_page_cache_record *r)
 static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_cache_entry **batch)
 {
     size_t count=0;unsigned scanned=0;
-    size_t capacity=r->snapshot_count<BOAROS_PAGE_CACHE_WRITEBACK_PAGES?r->snapshot_count:BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    size_t capacity=r->writeback_capacity<BOAROS_PAGE_CACHE_WRITEBACK_PAGES?r->writeback_capacity:BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
     while (r->dirty_cursor && r->dirty_remaining && scanned<64 && count<capacity) {
         struct kernel_page_cache_dirty *dirty=r->dirty_cursor;
         if (!dirty->count || RB_EMPTY(&dirty->tree)) __builtin_trap();
@@ -671,6 +777,11 @@ static void cache_memory_snapshot(void *context, struct kernel_memory_statistics
     struct kernel_page_cache *cache = context;
     if (!cache_live(cache)) return;
     uint64_t reclaimable = 0;
+    {
+        struct version_pool *pool=cache->record->versions;
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        if (pool->idle_count>pool->reserve) reclaimable+=(pool->idle_count-pool->reserve)*BOAROS_PAGE_SIZE;
+    }
     for (struct kernel_page_cache_entry *e = cache->record->lru_head; e; e = e->lru_next) {
         out->cached += BOAROS_PAGE_SIZE;
         if (e->dirty_end) out->dirty += BOAROS_PAGE_SIZE;
@@ -704,7 +815,7 @@ static uint64_t reclaim_callback(void *context, uint64_t target_pages)
 {
     struct kernel_page_cache *cache = context;
     struct kernel_page_cache_entry *entry = cache->record->lru_tail;
-    uint64_t released = 0;
+    uint64_t released = version_pool_reclaim(cache->record->versions,target_pages);
     while (entry && released < target_pages) {
         struct kernel_page_cache_entry *previous = entry->lru_previous;
         uint32_t references;
@@ -827,6 +938,12 @@ static enum kernel_page_cache_status cache_init(
                    ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
                    : KERNEL_PAGE_CACHE_STATUS_STATE;
     }
+    record->versions=version_pool_new(heap,allocator);
+    if (!record->versions) {
+        (void)kernel_heap_release(heap,record->buckets);
+        (void)kernel_heap_release(heap,record);
+        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+    }
     record->capacity = PAGE_CACHE_INITIAL_CAPACITY;
     record->controlled = controlled;
     kernel_mutex_init(&record->metadata, 45, (uintptr_t)record);
@@ -862,6 +979,7 @@ static enum kernel_page_cache_status cache_init(
     group->head = record;
     return KERNEL_PAGE_CACHE_STATUS_OK;
 failed:
+    version_pool_close(record->versions);
     (void)kernel_heap_release(heap, record->buckets);
     (void)kernel_heap_release(heap, record);
     *cache = (struct kernel_page_cache){0};
@@ -2143,12 +2261,13 @@ static void writeback_unprepare(struct kernel_page_cache *cache,
 }
 
 static int prepare_writeback(struct kernel_page_cache *cache,
-    struct kernel_page_cache_entry *entry,uint64_t limit,size_t slot,
+    struct kernel_page_cache_entry *entry,uint64_t limit,int wait_version,
     struct prepared_writeback *prepared)
 {
     int controlled=cache->record->controlled;
     if (controlled) for (struct kernel_page_cache_write_borrow *b=kernel_io_context_current()->cache_writes;b;b=b->next)
         if (b->entry==entry) return -KERNEL_EBUSY;
+Retry:
     for (;;) {
         struct kernel_wait_token token={0};
         {
@@ -2165,8 +2284,13 @@ static int prepare_writeback(struct kernel_page_cache *cache,
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    prepared->version=version_take(cache,slot);
-    if (!prepared->version) { writeback_unprepare(cache,entry,prepared); return -KERNEL_ENOMEM; }
+    prepared->version=version_take(cache);
+    if (!prepared->version) {
+        writeback_unprepare(cache,entry,prepared);
+        if (wait_version && kernel_io_context_current()->background_reclaim && cache->record->started &&
+            version_wait(cache)) goto Retry;
+        return -KERNEL_ENOMEM;
+    }
     int result=0;
     if (controlled) {
         CACHE_SCOPE(guard,cache);
@@ -2268,8 +2392,8 @@ static int writeback_run(struct kernel_page_cache *cache,
     struct writeback_workspace *workspace)
 {
     if (!count || count>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) __builtin_trap();
-    if (kernel_io_context_current()->background_reclaim && cache->record->started && count>cache->record->snapshot_count)
-        count=cache->record->snapshot_count;
+    if (kernel_io_context_current()->background_reclaim && cache->record->started && count>cache->record->writeback_capacity)
+        count=cache->record->writeback_capacity;
     int background=kernel_io_context_current()->background_reclaim && cache->record->started;
     struct prepared_writeback single_prepared;
     struct file_write_span single_span;
@@ -2279,40 +2403,48 @@ static int writeback_run(struct kernel_page_cache *cache,
         if (count!=1) __builtin_trap();
         workspace=&local;
     }
-    memset(workspace->prepared,0,count*sizeof(*workspace->prepared));
-    memset(workspace->spans,0,count*sizeof(*workspace->spans));
     struct prepared_writeback *prepared=workspace->prepared;
     struct file_write_span *spans=workspace->spans;
-    size_t ready=0,done=0;
-    int result=0;
-    for (;done<count;done++) {
-        int r=prepare_writeback(cache,entries[done],limit,done,&prepared[done]);
-        if (r) { result=r; break; }
+    for (size_t first=0;first<count;) {
+        memset(prepared,0,(count-first)*sizeof(*prepared));
+        memset(spans,0,(count-first)*sizeof(*spans));
+        size_t ready=0,done=0;
+        int result=0;
+        for (;done<count-first;done++) {
+            int r=prepare_writeback(cache,entries[first+done],limit,!done,&prepared[done]);
+            if (r) { result=r; break; }
+        }
+        int prepare_error=result;
+        KERNEL_LOCK_SCOPE(io);
+        if (done) kernel_vfs_node_lock(entries[first]->node,&io,0);
+        for (size_t i=0;i<done;i++) {
+            if (!prepared[i].version) continue;
+            if (capture_writeback(cache,entries[first+i],&prepared[i],limit,&spans[ready]))
+                prepared[i].span_index=++ready;
+        }
+        int submitted=ready ? kernel_vfs_node_writeback(entries[first]->node,spans,ready) : 0;
+        for (size_t i=0;i<ready;i++) if (!submitted && spans[i].written!=spans[i].size) submitted=-KERNEL_EIO;
+        if (submitted) result=submitted;
+        for (size_t i=done;i>0;i--) {
+            struct prepared_writeback *p=&prepared[i-1];
+            if (!p->version) continue;
+            struct file_write_span *span=p->span_index?&spans[p->span_index-1]:NULL;
+            int r=complete_writeback(cache,entries[first+i-1],p->begin,p->end,p->generation,
+                span ? submitted : 0,span ? span->written : 0);
+            if (r && !result) result=r;
+            version_release(p->version);
+            { CACHE_SCOPE(guard,cache); entry_return(entries[first+i-1]); }
+        }
+        /* Publish a prepared prefix before waiting for another stable owner.
+         * This ends its entry qualifications, allowing a foreground writer
+         * that borrowed the last version to finish and return that version. */
+        if (prepare_error==-KERNEL_ENOMEM && done && !submitted && result==prepare_error) {
+            first+=done;continue;
+        }
+        *used=first+(done?done:1);
+        return result;
     }
-    KERNEL_LOCK_SCOPE(io);
-    if (done) kernel_vfs_node_lock(entries[0]->node,&io,0);
-    for (size_t i=0;i<done;i++) {
-        if (!prepared[i].version) continue;
-        if (capture_writeback(cache,entries[i],&prepared[i],limit,&spans[ready]))
-            prepared[i].span_index=++ready;
-    }
-    /* A later allocation failure still permits the already captured pages.
-     * No failed device write is retried as a smaller batch. */
-    int submitted=ready ? kernel_vfs_node_writeback(entries[0]->node,spans,ready) : 0;
-    for (size_t i=0;i<ready;i++) if (!submitted && spans[i].written!=spans[i].size) submitted=-KERNEL_EIO;
-    if (submitted) result=submitted;
-    for (size_t i=done;i>0;i--) {
-        struct prepared_writeback *p=&prepared[i-1];
-        if (!p->version) continue;
-        struct file_write_span *span=p->span_index?&spans[p->span_index-1]:NULL;
-        int r=complete_writeback(cache,entries[i-1],p->begin,p->end,p->generation,
-            span ? submitted : 0,span ? span->written : 0);
-        if (r && !result) result=r;
-        version_release(p->version);
-        { CACHE_SCOPE(guard,cache); entry_return(entries[i-1]); }
-    }
-    *used=done?done:1;
-    return result;
+    __builtin_unreachable();
 }
 
 static int writeback_entry(struct kernel_page_cache *cache,
@@ -2555,9 +2687,15 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
     uint64_t scanned = 0U;
     uint64_t scan_limit;
 
-    if (!cache_live(cache) || target_pages == 0U ||
-        cache->record->writeback_active != 0U) {
+    if (!cache_live(cache) || target_pages == 0U) {
         return 0U;
+    }
+    released=version_pool_reclaim(cache->record->versions,target_pages);
+    reclaimed=released;
+    if (cache->record->writeback_active) {
+        CACHE_SCOPE(guard,cache);
+        cache->record->statistics.pages_reclaimed+=released;
+        return released;
     }
     if (cache->record->controlled) {
         kernel_assert_service_context();
@@ -2819,6 +2957,8 @@ static void page_cache_worker(void *argument)
         int pressure = physical_page_available(cache->allocator) <= r->low;
         uint64_t released = 0;
         if (pressure) {
+            uint64_t available=physical_page_available(cache->allocator);
+            if (available<r->high) released=version_pool_reclaim(r->versions,r->high-available);
             size_t limit = r->capacity;
             for (size_t cursor = 0; cursor < limit && !r->stopping;) {
                 for (unsigned scanned = 0; cursor < limit && scanned < 64 && !r->stopping; scanned++) {
@@ -2896,12 +3036,9 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
         if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
         r->writeback_workspace=NULL; return -KERNEL_ENOMEM;
     }
-    for (size_t i=0;i<BOAROS_PAGE_CACHE_WRITEBACK_PAGES;i++) {
-        struct cache_version *version=version_new(cache);
-        if (!version) break;
-        r->snapshots[r->snapshot_count++]=version;
-    }
-    if (!r->snapshot_count) {
+    r->writeback_capacity=version_pool_reserve(r->versions);
+    if (!r->writeback_capacity) {
+        version_pool_unreserve(r->versions);
         writeback_workspace_release(cache,r->writeback_workspace);
         if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
         r->writeback_workspace=NULL; return -KERNEL_ENOMEM;
@@ -2916,7 +3053,7 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     kernel_wait_queue_init(&r->progress);
     enum kernel_scheduler_status result = kernel_thread_create_joinable(page_cache_worker, cache, &r->worker);
     if (result != KERNEL_SCHEDULER_STATUS_OK) {
-        while (r->snapshot_count) version_release(r->snapshots[--r->snapshot_count]);
+        version_pool_unreserve(r->versions);r->writeback_capacity=0;
         writeback_workspace_release(cache,r->writeback_workspace);
         if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
         r->writeback_workspace=NULL;
@@ -2942,6 +3079,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     struct kernel_page_cache_record *r = cache->record;
     uintptr_t irq = arch_interrupt_save();
     { CACHE_SCOPE(stop, cache); r->stopping = 1; r->dirty_cursor=NULL; r->dirty_remaining=0; }
+    version_pool_stop(r->versions);
     if (r->controlled) {
         for (;;) {
             CACHE_SCOPE(cancel,cache);
@@ -2969,7 +3107,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     (void)kernel_wait_queue_wake_all(&r->work);
     (void)kernel_wait_queue_wake_all(&r->progress);
     kernel_thread_join(&r->worker);
-    while (r->snapshot_count) version_release(r->snapshots[--r->snapshot_count]);
+    version_pool_unreserve(r->versions);r->writeback_capacity=0;
     writeback_workspace_release(cache,r->writeback_workspace);
     if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
     r->writeback_workspace=NULL;
@@ -3124,6 +3262,7 @@ enum kernel_page_cache_status kernel_page_cache_destroy(
     }
     if (cache->record->foreground_workspace &&
         kernel_heap_release(cache->heap,cache->record->foreground_workspace)) __builtin_trap();
+    version_pool_close(cache->record->versions);
     (void)kernel_heap_release(cache->heap, cache->record);
     cache->heap = 0;
     cache->allocator = 0;
