@@ -1884,8 +1884,11 @@ test-sched-policy-host:
 	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude \
 		tests/host/sched_runqueue_test.c kernel/sched/runqueue.c -o build/host/sched-runqueue
 	build/host/sched-runqueue
-	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/host/random -Iinclude \
-		tests/host/sched_syscall_test.c kernel/syscall/sched.c kernel/sched/policy.c -o build/host/sched-syscall
+	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -Iinclude \
+		-Wl,--gc-sections -Wl,--wrap=kernel_task_sched_get -Wl,--wrap=kernel_task_sched_set \
+		tests/host/sched_syscall_test.c kernel/syscall/sched.c kernel/sched/policy.c \
+		kernel/sched/scheduling.c kernel/cpu.c kernel/raw_lock.c -o build/host/sched-syscall
 	build/host/sched-syscall
 
 .PHONY: test-multi-disk-rt-riscv
