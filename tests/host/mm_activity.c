@@ -56,9 +56,9 @@ enum physical_page_status __wrap_physical_page_map_owned(const struct physical_p
     if (fail_copy && address==failed_page) { fail_copy=0; return PHYSICAL_PAGE_STATUS_INVALID; }
     return __real_physical_page_map_owned(a,address,pointer);
 }
-enum riscv_sv39_status __real_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *,uint64_t *,uint64_t *);
-enum riscv_sv39_status __wrap_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *space,uint64_t *cursor,uint64_t *address)
-{ if (sparse) walk_calls++; return __real_riscv_sv39_user_next_owned(space,cursor,address); }
+enum riscv_sv39_status __real_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *,uint64_t *,uint64_t,uint64_t *);
+enum riscv_sv39_status __wrap_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *space,uint64_t *cursor,uint64_t end,uint64_t *address)
+{ if (sparse) walk_calls++; return __real_riscv_sv39_user_next_owned(space,cursor,end,address); }
 #endif
 static void await(unsigned *flag)
 { while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) sched_yield(); }

@@ -782,7 +782,7 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     check(kernel_cost_end(2, 0) == 0, 197);
     uint64_t observed;
     riscv_kernel_mm_get_statistics(mm, &protect_after);
-    check(kernel_cost_read(0, COST_MPROTECT_RESIDENT_VISITS, &observed) == 0 && observed == pages * 2, 198);
+    check(kernel_cost_read(0, COST_MPROTECT_RESIDENT_VISITS, &observed) == 0 && observed == 2, 198);
     check(kernel_cost_read(0, COST_MPROTECT_PTE_VISITS, &observed) == 0 && observed == protect_after.protect_visits - protect_before.protect_visits, 199);
     check(kernel_cost_read(0, COST_MPROTECT_ADDRESS_TLB, &observed) == 0 && observed == protect_after.protect_address_flushes - protect_before.protect_address_flushes, 200);
 #endif

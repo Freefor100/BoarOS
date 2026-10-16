@@ -92,6 +92,7 @@ struct mm_file_mapping {
 struct mm_file_resident {
     struct kernel_mm_record *record;
     struct mm_file_resident *next;
+    struct mm_file_resident **previous;
     struct mm_file_resident *clone_source;
     struct mm_file_resident *hash_next;
     uint64_t address;
@@ -455,6 +456,8 @@ static void publish_file_resident(struct kernel_mm_record *record,
     record->resident_buckets[index] = page;
     record->resident_count++;
     page->next = record->file_residents;
+    page->previous = &record->file_residents;
+    if (page->next) page->next->previous = &page->next;
     record->file_residents = page;
 }
 
@@ -535,21 +538,17 @@ static void unindex_file_resident(struct kernel_mm_record *record,
     }
     *link = page->hash_next;
     record->resident_count--;
+    *page->previous = page->next;
+    if (page->next) page->next->previous = page->previous;
+    page->previous = 0;
 }
 
-static void forget_file_residents(struct kernel_mm_record *record,
-                                  uint64_t start, uint64_t end)
+static void forget_file_residents(struct kernel_mm_record *record)
 {
-    struct mm_file_resident **link = &record->file_residents;
-    while (*link != 0) {
-        struct mm_file_resident *page = *link;
-        if (page->address >= start && page->address < end) {
-            *link = page->next;
-            unindex_file_resident(record, page);
-            retire_file_resident(record,page);
-        } else {
-            link = &page->next;
-        }
+    while (record->file_residents) {
+        struct mm_file_resident *page = record->file_residents;
+        unindex_file_resident(record, page);
+        retire_file_resident(record, page);
     }
 }
 
@@ -646,7 +645,6 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
                 finish_tlb_change(record,&batch,targets,0,UINT64_MAX,0);
             } else if (arch_mmu_user_unmap_owned_range(&record->space,
                     page->address, page->address + BOAROS_PAGE_SIZE)) __builtin_trap();
-            *link = page->next;
             unindex_file_resident(record, page);
             retire_file_resident(record,page);
             continue;
@@ -1301,7 +1299,7 @@ static enum kernel_mm_status mm_fork_impl(
         uint64_t cursor = 0, address;
         /* child尚未发布，遍历私有树不持MM raw；每次只提交一个父叶。 */
         while ((backend_status = arch_mmu_user_next_owned(&destination_record->space,
-            &cursor, &address)) == ARCH_MMU_STATUS_OK) {
+            &cursor, ARCH_MMU_USER_LIMIT, &address)) == ARCH_MMU_STATUS_OK) {
             /* 按VMA语义分类，不能把合法shared/protected页当作私有COW。 */
             if (shared_anon_leaf(source_record->vmas, address)) continue;
             KERNEL_RAW_SCOPE(guard, &source_record->metadata);
@@ -2322,21 +2320,33 @@ static enum kernel_mm_status unmap_space_range(
             struct kernel_mm_retirement batch = {0};
             uint64_t first = cursor;
             uint32_t targets;
+            struct mm_file_resident *removed = 0;
             {
                 KERNEL_RAW_SCOPE(guard, &record->metadata);
                 unsigned visited = 0;
                 while (cursor < end && visited++ < 16 &&
                     batch.count <= KERNEL_MM_RETIRE_CAPACITY - 3) {
                     uint64_t address;
-                    status = arch_mmu_user_next_owned(&record->space, &cursor, &address);
+                    status = arch_mmu_user_next_owned(&record->space, &cursor, end, &address);
                     if (status == ARCH_MMU_STATUS_NOT_MAPPED) { cursor = end; break; }
                     if (status != ARCH_MMU_STATUS_OK) __builtin_trap();
                     if (address >= end) { cursor = end; break; }
+                    struct mm_file_resident *page = find_file_resident(record, address);
+                    if (page) {
+                        unindex_file_resident(record, page);
+                        page->next = removed;
+                        removed = page;
+                    }
                     status = arch_mmu_user_detach_page(&record->space, address, &batch);
                     if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED)
                         __builtin_trap(); /* 已提交退休不能丢弃owner。 */
                 }
                 targets = batch.count ? note_tlb_change_locked(record, &batch) : record->active_cpus;
+            }
+            while (removed) {
+                struct mm_file_resident *page = removed;
+                removed = page->next;
+                retire_file_resident(record, page);
             }
             if (batch.count) {
                 /* raw外固件确认；非叶覆盖walk cache，错误保留批次owner并fatal。 */
@@ -2344,14 +2354,22 @@ static enum kernel_mm_status unmap_space_range(
                     batch.nonleaf ? UINT64_MAX : cursor - first, 0);
             }
         }
-        forget_file_residents(record,start,end);
         return KERNEL_MM_STATUS_OK;
     }
+    uint64_t cursor = start, address;
+    while ((status = arch_mmu_user_next_owned(&record->space, &cursor, end,
+                                             &address)) == ARCH_MMU_STATUS_OK) {
+        struct mm_file_resident *page = find_file_resident(record, address);
+        if (page) {
+            unindex_file_resident(record, page);
+            retire_file_resident(record, page);
+        }
+    }
+    if (status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
     status = arch_mmu_user_unmap_owned_range(&record->space,
                                                start,
                                                end);
     if (status == ARCH_MMU_STATUS_OK) {
-        forget_file_residents(record, start, end);
         return KERNEL_MM_STATUS_OK;
     }
     return status == ARCH_MMU_STATUS_STATE
@@ -3119,47 +3137,32 @@ static enum kernel_mm_status mm_mprotect_impl(
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
+    uint64_t cursor = address, leaf;
+    while ((backend_status = arch_mmu_user_next_owned(&record->space, &cursor,
+                   end, &leaf)) == ARCH_MMU_STATUS_OK) {
+        uint32_t leaf_permissions = normalized;
+        struct mm_file_resident *resident = find_file_resident(record, leaf);
+        if (resident) {
+            COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
+            if (kernel_page_cache_alias_active(&resident->alias))
+                leaf_permissions &= ~KERNEL_MM_WRITE;
+        }
+        KERNEL_RAW_SCOPE(guard, &record->metadata);
+        if (arch_mmu_user_protect_owned_page(&record->space, leaf,
+                backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
+    }
+    if (backend_status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
     if (remote_translation(record)) {
-        backend_status = ARCH_MMU_STATUS_OK;
         uint32_t targets;
-        uint64_t cursor = address, leaf;
-        while (arch_mmu_user_next_owned(&record->space, &cursor, &leaf) == ARCH_MMU_STATUS_OK && leaf < end) {
-            uint32_t leaf_permissions=normalized;
-            if (record->cache_files) {
-                struct mm_file_resident *resident=find_file_resident(record,leaf);
-                if (resident && kernel_page_cache_alias_active(&resident->alias)) leaf_permissions &= ~KERNEL_MM_WRITE;
-            }
-            KERNEL_RAW_SCOPE(guard, &record->metadata);
-            backend_status = arch_mmu_user_protect_owned_page(&record->space, leaf,
-                backend_permissions_from_mm(leaf_permissions));
-            if (backend_status != ARCH_MMU_STATUS_OK) __builtin_trap();
-        }
-        {
-            KERNEL_RAW_SCOPE(guard, &record->metadata);
-            if (record->tlb_generation == UINT64_MAX) __builtin_trap();
-            record->tlb_generation++;
-            targets = record->active_cpus;
-        }
+        { KERNEL_RAW_SCOPE(guard, &record->metadata);
+          if (record->tlb_generation == UINT64_MAX) __builtin_trap();
+          record->tlb_generation++;
+          targets = record->active_cpus; }
         arch_mmu_sync_user(targets, address, end - address,
             (normalized & KERNEL_MM_EXECUTE) != 0);
-    } else {
-        backend_status = arch_mmu_user_protect_owned_range(
-            &record->space, address, end, backend_permissions_from_mm(normalized));
-    }
-    if (backend_status != ARCH_MMU_STATUS_OK) {
-        return backend_status == ARCH_MMU_STATUS_STATE
-                   ? KERNEL_MM_STATUS_STATE
-                   : KERNEL_MM_STATUS_ADDRESS_SPACE;
     }
     if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
         KERNEL_VMA_STATUS_OK) return KERNEL_MM_STATUS_STATE;
-    for (struct mm_file_resident *page = record->file_residents;
-         page != 0; page = page->next) {
-        COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
-        if (page->address >= address && page->address < end &&
-            kernel_page_cache_alias_active(&page->alias))
-            rearm_shared_file_alias(page, page->address);
-    }
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -4209,7 +4212,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 
     if (record->stage == KERNEL_MM_RECORD_VMAS_CLEANUP) {
         drain_file_registrations(record, 0);
-        forget_file_residents(record, 0, UINT64_MAX);
+        forget_file_residents(record);
         struct mm_file_resident *retired=record->retired_file_residents;
         record->retired_file_residents=0;
         drain_retired_residents(record,retired);

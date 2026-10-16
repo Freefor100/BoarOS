@@ -1488,27 +1488,27 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit(struct riscv_sv39_user_space *
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *s,
-    uint64_t *cursor, uint64_t *address)
+    uint64_t *cursor, uint64_t end, uint64_t *address)
 {
     if (!s || !cursor || !address || s->state != RISCV_SV39_USER_SPACE_LIVE ||
-        *cursor > RISCV_SV39_USER_LIMIT || (*cursor & BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
-    if (*cursor == RISCV_SV39_USER_LIMIT) return RISCV_SV39_STATUS_NOT_MAPPED;
+        *cursor > end || end > RISCV_SV39_USER_LIMIT || ((*cursor | end) & BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
+    if (*cursor == end) return RISCV_SV39_STATUS_NOT_MAPPED;
     uint64_t *root, *middle, *leaves;
     enum riscv_sv39_status status = resolve_runtime_table(s->allocator, s->root_address, &root);
     if (status != RISCV_SV39_STATUS_OK) return status;
     unsigned first_r = *cursor >> 30, first_m = (*cursor >> 21) & RISCV_SV39_INDEX_MASK;
     unsigned first_l = (*cursor >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
-    for (unsigned r = first_r; r < 256; r++) {
+    for (unsigned r = first_r; r < 256 && ((uint64_t)r << 30) < end; r++) {
         if (!root[r]) continue;
         if (!valid_nonleaf_entry(root[r])) return RISCV_SV39_STATUS_STATE;
         status = resolve_runtime_table(s->allocator, entry_address(root[r]), &middle);
         if (status != RISCV_SV39_STATUS_OK) return status;
-        for (unsigned m = r == first_r ? first_m : 0; m < 512; m++) {
+        for (unsigned m = r == first_r ? first_m : 0; m < 512 && (((uint64_t)r << 30) | ((uint64_t)m << 21)) < end; m++) {
             if (!middle[m]) continue;
             if (!valid_nonleaf_entry(middle[m])) return RISCV_SV39_STATUS_STATE;
             status = resolve_runtime_table(s->allocator, entry_address(middle[m]), &leaves);
             if (status != RISCV_SV39_STATUS_OK) return status;
-            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < 512; l++) {
+            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < 512 && (((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << 12)) < end; l++) {
                 if (!leaves[l]) continue;
                 if (!valid_user_leaf_entry(leaves[l]) && !valid_protected_entry(leaves[l])) return RISCV_SV39_STATUS_STATE;
                 *address = ((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT);
@@ -1517,7 +1517,7 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
             }
         }
     }
-    *cursor = RISCV_SV39_USER_LIMIT;
+    *cursor = end;
     return RISCV_SV39_STATUS_NOT_MAPPED;
 }
 enum riscv_sv39_status riscv_sv39_user_mark_cow_page(struct riscv_sv39_user_space *s, uint64_t address)
