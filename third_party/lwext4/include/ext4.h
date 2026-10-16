@@ -93,7 +93,7 @@ int ext4_journal_group_drain(const char *mount_point);
 struct ext4_journal_progress {
 	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
 	size_t memory_used, memory_peak;
-	bool ready, commit_ready, checkpoint_ready;
+	bool ready, commit_ready, checkpoint_ready, checkpoint_pending;
 	int error;
 };
 int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress);

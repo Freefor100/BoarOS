@@ -865,7 +865,8 @@ static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	if (journal->seal_target < target) journal->seal_target = target;
-	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) journal->checkpoint_requested = true;
+	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT && journal->checkpoint_target < target)
+		journal->checkpoint_target = target;
 	if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
 	if (mp->journal_runtime.wait) return mp->journal_runtime.wait(mp->journal_runtime.context, target, kind);
 	for (;;) {
@@ -1045,6 +1046,11 @@ static int ext4_journal_group_run(const char *mount_point, bool force,
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	int r = !journal || !journal->grouped ? EINVAL : journal->error;
 	if (r == EOK && mp->transaction_depth) r = EBUSY;
+	/* An explicit checkpoint call requests the durable prefix that exists
+	 * now. The target survives a bounded selection until every batch retires. */
+	if (r == EOK && stage == JBD_JOURNAL_CHECKPOINT &&
+	    journal->checkpoint_target < journal->durable_sequence)
+		journal->checkpoint_target = journal->durable_sequence;
 	if (r == EOK && stage != JBD_JOURNAL_CHECKPOINT && ext4_group_due(mp, force)) {
 		r = ext4_group_freeze(mp, force);
 		if (r == EAGAIN) r = EOK; /* 已有提交 owner，先让队首进展。 */
@@ -1100,7 +1106,7 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 		struct jbd_trans *running = journal->running;
 		bool commit_ready = !journal->committing &&
 			(!TAILQ_EMPTY(&journal->sealed_queue) || ext4_group_due(mp, false));
-		bool checkpoint_ready = !journal->checkpointing && !TAILQ_EMPTY(&journal->cp_queue);
+		bool checkpoint_ready = jbd_journal_checkpoint_ready(journal);
 		*progress = (struct ext4_journal_progress){
 			.accepted = journal->accepted_sequence, .sealed = journal->sealed_sequence,
 			.durable = journal->durable_sequence, .checkpoint = journal->checkpoint_sequence,
@@ -1108,6 +1114,7 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 			.memory_used = journal->memory_used, .memory_peak = journal->memory_peak,
 			.ready = commit_ready || checkpoint_ready,
 			.commit_ready = commit_ready, .checkpoint_ready = checkpoint_ready,
+			.checkpoint_pending = !TAILQ_EMPTY(&journal->cp_queue),
 			.error = journal->error};
 	}
 	EXT4_MP_UNLOCK(mp);

@@ -892,10 +892,16 @@ test-lwext4-group-host:
 	sh tests/lwext4-group-host.sh
 
 JOURNAL_GROUP_KERNEL := $(BUILD_DIR)/tests/kernel-journal-group-rv
+JOURNAL_GROUP_RUNTIME_OBJECTS := $(filter-out $(BUILD_DIR)/fs/ext4_backend.o,$(TEST_RUNTIME_OBJECTS)) $(BUILD_DIR)/tests/riscv/journal_group_backend.o
 $(BUILD_DIR)/tests/riscv/journal_group_main.o: CPPFLAGS += -Ifs/lwext4_config -Ithird_party/lwext4/include -DCONFIG_USE_DEFAULT_CFG=0
+$(BUILD_DIR)/tests/riscv/journal_group_backend.o: CPPFLAGS += -Ifs/lwext4_config -Ithird_party/lwext4/include -DCONFIG_USE_DEFAULT_CFG=0 -Dkernel_time_monotonic_ns=journal_group_time_monotonic_ns
+$(BUILD_DIR)/tests/riscv/journal_group_backend.o: fs/ext4_backend.c $(BUILD_DIR)/generated/cost-config.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 -include $(BUILD_DIR)/tests/riscv/journal_group_main.d
-$(JOURNAL_GROUP_KERNEL): $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -o $@ $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
+-include $(BUILD_DIR)/tests/riscv/journal_group_backend.d
+$(JOURNAL_GROUP_KERNEL): $(JOURNAL_GROUP_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_wait_prepare -o $@ $(JOURNAL_GROUP_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
 .PHONY: test-journal-group-riscv
 test-journal-group-riscv: $(JOURNAL_GROUP_KERNEL)
 	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64)

@@ -3274,17 +3274,21 @@ int jbd_journal_submit(struct jbd_journal *journal)
 	return jbd_write_prepared(trans, &submitted);
 }
 
+bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
+{
+	return !journal->error && !journal->checkpointing && !TAILQ_EMPTY(&journal->cp_queue) &&
+		(journal->checkpoint_target > journal->checkpoint_sequence || journal->checkpoint_count >= 4 ||
+		 journal->memory_used - journal->memory_cached > journal->memory_limit / 2);
+}
+
 enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
 	enum jbd_journal_stage stage)
 {
 	if (journal->error) return JBD_JOURNAL_IDLE;
 	struct jbd_trans *trans = TAILQ_FIRST(&journal->cp_queue);
-	/* 每个 checkpoint 批次结束后重新选择；容量压力不能被提交流饿死。 */
-	bool reclaim = trans && (journal->checkpoint_requested || journal->checkpoint_count >= 4 ||
-		journal->memory_used - journal->memory_cached > journal->memory_limit / 2 ||
-		TAILQ_EMPTY(&journal->sealed_queue));
-	if (!journal->checkpointing && trans && stage != JBD_JOURNAL_COMMIT &&
-	    (stage == JBD_JOURNAL_CHECKPOINT || reclaim)) {
+	/* Reclaim pressure is shared with progress reporting. An empty sealed
+	 * queue says nothing about a commit currently doing device I/O. */
+	if (stage != JBD_JOURNAL_COMMIT && jbd_journal_checkpoint_ready(journal)) {
 		journal->checkpointing = journal->checkpoint_last = trans;
 		unsigned count = 1;
 		while (count < 8 && TAILQ_NEXT(journal->checkpoint_last, trans_node)) {
@@ -3321,7 +3325,6 @@ enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
             jbd_phase_add(journal, &phase, &jb->home_io, jb->after->data,
                 jb->block.lb_id, 0, journal->block_size);
         journal->checkpoint_io = phase.first;
-		journal->checkpoint_requested = false;
 		return JBD_JOURNAL_CHECKPOINT;
 	}
 	if (journal->committing || stage == JBD_JOURNAL_CHECKPOINT) return JBD_JOURNAL_IDLE;
@@ -3338,6 +3341,9 @@ bool jbd_journal_select(struct jbd_journal *journal)
 	/* Sequential low-level callers have no completion token. Keep them from
 	 * borrowing an owner already held by either runtime consumer. */
 	if (journal->committing || journal->checkpointing) return false;
+	if (TAILQ_EMPTY(&journal->sealed_queue) && !journal->running &&
+	    journal->checkpoint_target < journal->durable_sequence)
+		journal->checkpoint_target = journal->durable_sequence;
 	return jbd_journal_select_stage(journal, JBD_JOURNAL_IDLE) != JBD_JOURNAL_IDLE;
 }
 

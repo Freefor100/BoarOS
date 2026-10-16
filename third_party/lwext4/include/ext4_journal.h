@@ -158,7 +158,7 @@ struct jbd_journal {
 	struct ext4_block_write *checkpoint_io;
 	TAILQ_HEAD(jbd_sealed_queue, jbd_trans) sealed_queue;
 	unsigned sealed_count, checkpoint_count, log_reserved;
-	bool checkpoint_requested;
+	uint64_t checkpoint_target;
 	bool grouped;
 	/* Transaction lists own each range through abort or checkpoint. These
 	 * block/inode indexes borrow the same nodes across accept and sealing. */
@@ -254,6 +254,7 @@ int jbd_journal_retire_stage(struct jbd_journal *journal,
  * selects either stage for a caller that drives both synchronously. */
 enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
 	enum jbd_journal_stage stage);
+bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal);
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_retire(struct jbd_journal *journal, int error);
 int jbd_journal_checkpoint(struct jbd_journal *journal);

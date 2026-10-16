@@ -1001,6 +1001,7 @@ static void journal_worker(void *context)
 static void journal_checkpoint_worker(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
+    uint64_t pending_deadline = 0;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
         uintptr_t irq = arch_interrupt_save();
@@ -1010,9 +1011,17 @@ static void journal_checkpoint_worker(void *context)
         if (stopping) break;
         struct jbd_journal *journal = adapter->device.fs->jbd_journal;
         uint64_t before = journal->checkpoint_sequence;
-        int result = ext4_journal_group_checkpoint(adapter->mount_point);
         struct ext4_journal_progress progress;
         if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+        if (!progress.checkpoint_pending) pending_deadline = 0;
+        else if (!pending_deadline) pending_deadline = kernel_time_monotonic_ns() + 100000000;
+        int result = progress.error;
+        if (!result && (progress.checkpoint_ready || (pending_deadline &&
+            kernel_time_monotonic_ns() >= pending_deadline))) {
+            result = ext4_journal_group_checkpoint(adapter->mount_point);
+            if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+            if (!progress.checkpoint_pending) pending_deadline = 0;
+        }
         irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
         if (progress.checkpoint != before) {
@@ -1022,10 +1031,16 @@ static void journal_checkpoint_worker(void *context)
         }
         arch_interrupt_restore(irq);
         if (!result && progress.checkpoint_ready) continue;
+        uint64_t deadline = 0;
+        /* Later durable groups share the first pending group's window. They
+         * cannot postpone home durability indefinitely by waking this worker. */
+        if (!result && pending_deadline &&
+            kernel_time_deadline_from_monotonic(pending_deadline, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED)
+            continue;
         irq = arch_interrupt_save();
         if (!adapter->checkpoint_requested && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
-            if (KERNEL_WAIT_RECHECK(&adapter->checkpoint_work, 0, 0, &reason,
+            if (KERNEL_WAIT_RECHECK(&adapter->checkpoint_work, deadline, 0, &reason,
                 (!adapter->checkpoint_requested && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
         arch_interrupt_restore(irq);

@@ -157,13 +157,15 @@ commit 线程处理封口与日志提交，checkpoint 线程处理已持久前�
 软封口条件是首次脏化后 100 ms，或运行组预留的元数据日志空间达到 256 KiB；普通文件数据块数不参与这个阈值。同步目标、显式请求和资源回收也会推动封口。文件版本按实际保留的内存控制：每个外部来源只取得一份引用并计一次完整分配，块借用只增加控制记录；未提供稳定覆盖的部分块才计入私有数据镜像。每个元数据 home buffer 在第一个版本 pin 时计费，最后一个版本释放时撤销计费。空闲镜像和控制记录池最多保留 min(256 KiB, 预算/4)，不足时先释放空闲资源；固定日志映射也计入挂载点预算，运行时上限为 min(4 MiB, RAM/32)。
 
 运行组之外最多两组封口 FIFO 和一组提交中；commit 屏障后发布 durable，metadata 版本、日志空间与 quarantine 保留到 checkpoint 完成。commit 与 checkpoint 各自维护实际在途 owner，checkpoint 的设备等待不阻止后续提交或 fsync 完成。
-checkpoint 每次选择最多八组已持久的连续前缀，结束后重新选择，释放的预算通知 commit 线程继续。选择阶段复用现有物理块索引，只为本次已提交前缀的同一 home 地址保留最后一个版本；revoke 去掉旧的块用途，后续元数据可以发布新版本，不借用尚未选中的事务。home 数据和 checkpoint 尾部持久化后，才释放所选前缀的全部版本与 quarantine。
+checkpoint 积累到四组、活动内存超过预算一半，或实际空间等待和排空请求指定了目标序号时立即推进；低压力的小批次最多等待首个待回写组出现后的 100 ms，后来提交的组不延长这个期限。单纯没有待提交的 sealed 组不能作为回写条件，commit 此时仍可能在等待设备。每次选择最多八组已持久的连续前缀，目标序号保留到各批都已回收，释放的预算通知 commit 线程继续。选择阶段复用现有物理块索引，只为本次已提交前缀的同一 home 地址保留最后一个版本；revoke 去掉旧的块用途，后续元数据可以发布新版本，不借用尚未选中的事务。home 数据和 checkpoint 尾部持久化后，才释放所选前缀的全部版本与 quarantine。
 任一线程遇到持久化错误都保留第一个错误；另一线程即使随后完成 I/O，也保留其版本和恢复 owner，不再发布进度或回收空间。等待区分 sealed、durable 和 checkpoint：封口 FIFO 满才等 sealed，实际内存、日志空间或复用不足才等 checkpoint。写入接纳前分别估算数据记录、所需私有镜像和新增来源；映射增长若仍触及硬预算，先结束私有操作并完整回滚，再等待旧组回收后重做。普通分配失败不会因此重试，嵌套原子操作也不会中途提交或释放修改锁等待。
 
 同步返回保证提交记录及其先决数据已经持久化。历史存储流水线及 SQLite 恢复结果见[2026-10-01 验收记录](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
 
 `make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。新增交错检查把 checkpoint 停在实际 home write 内，后续真实 fsync 仍必须达到更晚的 durable 序号；
 双向注入另一路写入或 flush 失败，检查两个 owner 均保留，并逐边界断电、两次恢复及 fsck。
+checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home 版本，十组请求按 8+2 保留目标，
+实际来源内存越过阈值时优先回收旧前缀，以及后台首个期限不被后来的组延长。
 命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`sh tests/lwext4-reclaim-host.sh` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
 
 同一提交阶段使用稳定数据和日志控制 owner 内嵌的范围节点，组成 `ext4_blocks_set_phase()` 输入；不再每 32 个区间等待整批完成。块层先检查整个只读范围游标，再用预留的 32 项工作区持续补充空出的成员，直到整个阶段结束。磁盘相邻、内存分散的区间沿 SG 路径提交；没有 phase 设备接口时按范围顺序写入。journal 的物理块索引保证同一阶段范围不重叠，公共 write_batch 仍保留原有重叠检查和部分扇区语义。日志 magic 转义只为实际命中的载荷预留独立首扇区，余部借用原版本，避免复用 descriptor 缓冲而被迫等待它的 DMA。数据来源一直保留到实际设备使用结束，失败挂载还会保留读取当前文件内容所需的版本。
@@ -189,7 +191,7 @@ checkpoint 每次选择最多八组已持久的连续前缀，结束后重新选
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存、逐分量权限检查、周期 writeback 或 read-ahead。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存与逐分量权限检查；后台写回按阈值和压力触发，顺序预读有独立候选实现，默认关闭。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -426,7 +428,7 @@ guest 测试不变。每份 4 GiB 工作镜像因此实际占用约 4 GiB，空�
 | ext4 实例 | 纯定位读共享进入，写事务及维护操作独占；不同盘有独立锁与错误 owner |
 | 块队列 | 每设备最多八个在途槽；一次同步调用等待自己的请求，不能由八槽推断单次写回会填满队列；flush 排空此前请求并挡住后继 |
 
-每盘后台 worker 使用专用快照页，按阈值和压力触发；不是周期刷盘，也不代替
+每盘后台 worker 从稳定版本池取得快照，按阈值和压力触发；不是周期刷盘，也不代替
 fsync 的持久化与错误观察。全局内存快照 O(总缓存项数)、压力通知 O(实例数)。
 等待期间 CPU、无关缓存及另一磁盘均有进展。后续工作见[路线](../goals.md)。
 

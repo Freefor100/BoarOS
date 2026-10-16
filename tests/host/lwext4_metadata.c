@@ -355,7 +355,7 @@ static void group_test(struct ext4_fs *fs)
     CHECK(ext4_journal_group_service("/",true)==EOK);
     CHECK(!write_interleave && fs->jbd_journal->running);
     /* Explicitly advance home I/O; service now completes one worker phase. */
-    CHECK(ext4_journal_group_service("/",false)==EOK);
+    CHECK(ext4_journal_group_checkpoint("/")==EOK);
     CHECK(!memcmp(disk.visible+data_block*fs->bdev->lg_bsize,bytes,sizeof(bytes)));
     struct ext4_inode *stable=(void*)(disk.visible+inode_position);
     CHECK(to_le32(stable->access_time)==9999);
@@ -572,6 +572,86 @@ static void group_checkpoint_recovery(struct ext4_fs *fs)
     for (unsigned i=0;i<3*size;i++) CHECK(bytes[i]==(i/size==1?0x5a:0x73));
     CHECK(ext4_fclose(&file)==EOK); free(bytes);
 }
+static void group_checkpoint_batching(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    struct ext4_journal_progress progress;
+    uint64_t checkpoint=journal->checkpoint_sequence;
+    struct ext4_timestamp times[3]={{9123,11},{9456,22},{9789,33}};
+    for (unsigned group=1;group<=4;group++) {
+        times[0].nanoseconds=group;
+        CHECK(ext4_file_set_times(&file,7,times)==EOK);
+        CHECK(ext4_journal_group_commit("/",true)==EOK);
+        CHECK(journal->checkpoint_count==group && journal->checkpoint_sequence==checkpoint);
+        CHECK(ext4_journal_group_progress("/",&progress)==EOK);
+        CHECK(progress.checkpoint_pending && !progress.commit_ready && progress.durable==progress.accepted);
+        if (group<4) {
+            CHECK(!progress.checkpoint_ready && !progress.ready);
+            uint64_t writes=disk.writes,flushes=disk.flushes;
+            CHECK(ext4_journal_group_service("/",false)==EOK);
+            CHECK(disk.writes==writes && disk.flushes==flushes && journal->checkpoint_count==group);
+        } else CHECK(progress.checkpoint_ready && progress.ready);
+    }
+    unsigned block_size=fs->bdev->lg_bsize;
+    unsigned char *expected=malloc(block_size),*actual=malloc(block_size); CHECK(expected && actual);
+    struct ext4_inode_ref inode; CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
+    checkpoint_homes[0]=checkpoint_homes[1]=checkpoint_homes[2]=inode.block.lb_id;
+    memcpy(expected,inode.block.data,block_size);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    checkpoint_watch_block=block_size;
+    memset(checkpoint_home_writes,0,sizeof(checkpoint_home_writes));
+    uint64_t flushes=disk.flushes;
+    CHECK(ext4_journal_group_service("/",false)==EOK);
+    checkpoint_watch_block=0;
+    CHECK(disk.flushes==flushes+2 && checkpoint_home_writes[0]==1);
+    CHECK(journal->checkpoint_sequence==progress.durable && !journal->checkpoint_count);
+    CHECK(ext4_blocks_get_direct(fs->bdev,actual,checkpoint_homes[0],1)==EOK);
+    CHECK(!memcmp(actual,expected,block_size));
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
+        !progress.checkpoint_pending && !progress.checkpoint_ready && !progress.ready);
+    free(actual); free(expected); CHECK(ext4_fclose(&file)==EOK);
+    puts("checkpoint batching: 1/2/3 durable groups wait without I/O; fourth group merges one home version with two flushes");
+}
+
+static void group_checkpoint_target(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    struct ext4_timestamp times[3]={{10123,11},{10456,22},{10789,33}};
+    for (unsigned group=0;group<10;group++) {
+        times[0].nanoseconds=group;
+        CHECK(ext4_file_set_times(&file,7,times)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    }
+    CHECK(journal->checkpoint_count==10);
+    uint64_t target=journal->durable_sequence,flushes=disk.flushes;
+    CHECK(ext4_journal_group_checkpoint("/")==EOK && disk.flushes==flushes+2);
+    CHECK(journal->checkpoint_count==2 && journal->checkpoint_sequence==target-2);
+    struct ext4_journal_progress progress;
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
+        progress.checkpoint_pending && progress.checkpoint_ready);
+    flushes=disk.flushes;
+    CHECK(ext4_journal_group_service("/",false)==EOK && disk.flushes==flushes+2);
+    CHECK(!journal->checkpoint_count && journal->checkpoint_sequence==target);
+
+    /* Reaching this request must not turn every later commit into an
+     * immediate checkpoint. A new single group has its own wait boundary. */
+    times[0].nanoseconds=10;
+    CHECK(ext4_file_set_times(&file,7,times)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
+        progress.checkpoint_pending && !progress.checkpoint_ready && !progress.ready);
+    uint64_t writes=disk.writes; flushes=disk.flushes;
+    CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes && disk.flushes==flushes);
+    CHECK(journal->checkpoint_count==1 && journal->checkpoint_sequence==target);
+    CHECK(ext4_journal_group_checkpoint("/")==EOK && disk.flushes==flushes+2);
+    CHECK(!journal->checkpoint_count && journal->checkpoint_sequence==journal->durable_sequence);
+    CHECK(ext4_fclose(&file)==EOK);
+    puts("checkpoint target: ten-group explicit request drains eight plus two, retires its target, later single group waits until explicitly requested");
+}
 static void group_quarantine(struct ext4_fs *fs, bool failed)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -720,6 +800,68 @@ static void owned_page_init(struct owned_file_page *page,size_t size,unsigned ch
 {
     *page=(struct owned_file_page){.references=1,.bytes=malloc(size)};
     CHECK(page->bytes); memset(page->bytes,value,size);
+}
+static void group_checkpoint_pressure(struct ext4_fs *fs)
+{
+    enum { PAGES=17, PAGE_BYTES=16384 };
+    const size_t bytes=PAGES*PAGE_BYTES,block=fs->bdev->lg_bsize;
+    ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    unsigned char *readback=malloc(bytes); CHECK(readback); memset(readback,0x5a,bytes);
+    size_t count;
+    CHECK(ext4_fpwrite(&file,0,readback,bytes,&count)==EOK && count==bytes);
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,512*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    ext4_fsblk_t homes[PAGES*PAGE_BYTES/1024];
+    struct ext4_inode_ref inode; CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
+    for (unsigned i=0;i<bytes/block;i++)
+        CHECK(ext4_fs_get_inode_dblk_idx(&inode,i,&homes[i],false)==EOK && homes[i]);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    struct ext4_timestamp times[3]={{11123,11},{11456,22},{11789,33}};
+    CHECK(ext4_file_set_times(&file,7,times)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    struct ext4_journal_progress progress;
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
+        progress.checkpoint_pending && !progress.checkpoint_ready && journal->checkpoint_count==1);
+    uint64_t target=progress.durable;
+    struct owned_file_page pages[PAGES];
+    for (unsigned page=0;page<PAGES;page++) {
+        owned_page_init(&pages[page],PAGE_BYTES,(unsigned char)(0x60+page));
+        struct file_data_source source={&pages[page],owned_page_retain,owned_page_release,PAGE_BYTES};
+        struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
+        for (unsigned i=0;i<PAGE_BYTES/block;i++)
+            CHECK(jbd_trans_write_data(operation,homes[page*PAGE_BYTES/block+i],0,
+                pages[page].bytes+i*block,block,false,&source)==EOK);
+        CHECK(jbd_journal_accept(journal,operation,0)==EOK);
+        CHECK(pages[page].references==2 && pages[page].retains==1);
+        owned_page_release(&pages[page]);
+    }
+    CHECK(jbd_journal_freeze(journal)==EOK && journal->sealed_count==1);
+    times[0].nanoseconds++;
+    CHECK(ext4_file_set_times(&file,7,times)==EOK && journal->running);
+    CHECK(journal->memory_used-journal->memory_cached>journal->memory_limit/2);
+    CHECK(journal->memory_used<=journal->memory_limit);
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
+        progress.commit_ready && progress.checkpoint_ready && progress.checkpoint_pending);
+    struct jbd_trans *committing=TAILQ_FIRST(&journal->sealed_queue);
+    CHECK(jbd_journal_select_stage(journal,JBD_JOURNAL_COMMIT)==JBD_JOURNAL_COMMIT &&
+        journal->committing==committing && journal->running);
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
+        !progress.commit_ready && progress.checkpoint_ready && progress.checkpoint_pending);
+    uint64_t flushes=disk.flushes;
+    CHECK(ext4_journal_group_service("/",false)==EOK && disk.flushes==flushes+2);
+    CHECK(journal->checkpoint_sequence==target && !journal->checkpoint_count &&
+        journal->committing==committing && journal->running);
+    for (unsigned page=0;page<PAGES;page++) CHECK(pages[page].references==1 && pages[page].releases==1);
+    CHECK(jbd_journal_submit(journal)==EOK &&
+        jbd_journal_retire_stage(journal,JBD_JOURNAL_COMMIT,EOK)==EOK);
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    for (unsigned page=0;page<PAGES;page++)
+        CHECK(!pages[page].references && !pages[page].bytes && pages[page].releases==2);
+    CHECK(ext4_fpread(&file,0,readback,bytes,&count)==EOK && count==bytes);
+    for (size_t i=0;i<bytes;i++) CHECK(readback[i]==0x60+i/PAGE_BYTES);
+    CHECK(journal->memory_peak<=journal->memory_limit);
+    free(readback); CHECK(ext4_fclose(&file)==EOK);
+    puts("checkpoint pressure: actual retained sources cross half budget; one pending group checkpoints beside committing/running owners, exact source release and readback");
 }
 static struct owned_file_page direct_pages[32];
 static unsigned direct_batches, direct_fail_batch;
@@ -1494,7 +1636,7 @@ static void group_independent_progress(struct ext4_fs *fs,unsigned fault)
         return;
     }
     write_interleave=independent_fsync_while_home_held;
-    int result=ext4_journal_group_service("/",true);
+    int result=ext4_journal_group_checkpoint("/");
     CHECK(independent_handshakes==1 && !write_interleave);
     bool failed=(fault>=1 && fault<=4) || fault>=10;
     CHECK(result==(failed?EIO:EOK));
@@ -2313,6 +2455,9 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-independent-recovery"))group_independent_recovery(dev.fs,argc>3 && atoi(argv[3])>=10 && atoi(argv[3])<=13);
     else if(!strcmp(argv[2],"group-checkpoint-collapse")) {group_checkpoint_collapse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);return 0;}
     else if(!strcmp(argv[2],"group-checkpoint-recovery"))group_checkpoint_recovery(dev.fs);
+    else if(!strcmp(argv[2],"group-checkpoint-batching"))group_checkpoint_batching(dev.fs);
+    else if(!strcmp(argv[2],"group-checkpoint-target"))group_checkpoint_target(dev.fs);
+    else if(!strcmp(argv[2],"group-checkpoint-pressure"))group_checkpoint_pressure(dev.fs);
     else if(!strcmp(argv[2],"group-quarantine") || !strcmp(argv[2],"group-quarantine-error")) {bool failed=!strcmp(argv[2],"group-quarantine-error");group_quarantine(dev.fs,failed);if(failed)return 0;}
     else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
     else if(!strcmp(argv[2],"group-namespace-unlink"))group_namespace(dev.fs,true);

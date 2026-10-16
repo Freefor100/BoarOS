@@ -12,6 +12,7 @@
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
+#include <kernel/task.h>
 #include <kernel/time.h>
 #include <kernel/vfs.h>
 #include <kernel/file_mapping.h>
@@ -36,8 +37,34 @@ static struct kernel_vfs_file *hot_file;
 static unsigned hot_read_done;
 static struct kernel_wait_queue hot_read_completion;
 static struct kernel_wait_queue checkpoint_held_wait, checkpoint_release_wait;
+static struct kernel_wait_queue checkpoint_window_wait;
 static unsigned checkpoint_hold_armed, checkpoint_held, checkpoint_release;
 static int (*checkpoint_write_phase)(struct ext4_blockdev *, const struct ext4_block_write *);
+static struct lwext4_mount_adapter *checkpoint_clock_adapter;
+static uint64_t checkpoint_clock, checkpoint_waited_durable;
+uint64_t journal_group_time_monotonic_ns(void)
+{
+    if (checkpoint_clock_adapter && kernel_task_current()==checkpoint_clock_adapter->checkpoint_worker.task)
+        return checkpoint_clock;
+    return kernel_time_monotonic_ns();
+}
+enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,
+    uint64_t,int,struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
+    uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+{
+    enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if(status==KERNEL_SCHEDULER_STATUS_OK && checkpoint_clock_adapter && deadline &&
+        queue==&checkpoint_clock_adapter->checkpoint_work &&
+        kernel_task_current()==checkpoint_clock_adapter->checkpoint_worker.task) {
+        struct jbd_journal *journal=checkpoint_clock_adapter->device.fs->jbd_journal;
+        if(journal->durable_sequence>journal->checkpoint_sequence) {
+            checkpoint_waited_durable=journal->durable_sequence;
+            (void)kernel_wait_queue_wake_all(&checkpoint_window_wait);
+        }
+    }
+    return status;
+}
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {
@@ -70,6 +97,16 @@ static int hold_checkpoint_phase(struct ext4_blockdev *bdev,const struct ext4_bl
     }
     return checkpoint_write_phase(bdev,first);
 }
+static void wait_checkpoint_window(uint64_t durable)
+{
+    uint64_t deadline;
+    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,90);
+    while(checkpoint_waited_durable<durable && !checkpoint_held && riscv_time_read()<deadline) {
+        enum kernel_wait_wake_reason reason;
+        check(kernel_scheduler_block_current(&checkpoint_window_wait,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,91);
+    }
+    check(checkpoint_waited_durable>=durable && !checkpoint_held,92);
+}
 static void exercise_independent_checkpoint(struct lwext4_mount_adapter *adapter,ext4_file *file)
 {
     check(ext4_journal_group_drain(adapter->mount_point)==0,80);
@@ -77,12 +114,30 @@ static void exercise_independent_checkpoint(struct lwext4_mount_adapter *adapter
     uint64_t checkpoint=journal->checkpoint_sequence;
     kernel_wait_queue_init(&checkpoint_held_wait);
     kernel_wait_queue_init(&checkpoint_release_wait);
+    kernel_wait_queue_init(&checkpoint_window_wait);
     checkpoint_write_phase=adapter->interface.bwrite_phase;
     checkpoint_hold_armed=1;
     adapter->interface.bwrite_phase=hold_checkpoint_phase;
+    /* Only this worker sees the controlled clock. Its registered timed wait
+     * proves each new durable group was considered before time is advanced. */
+    uint64_t first_pending=kernel_time_monotonic_ns()+60000000000ULL;
+    checkpoint_clock=first_pending;
+    checkpoint_clock_adapter=adapter;
     const struct ext4_timestamp older[3]={{411,11},{422,22},{433,33}};
+    const struct ext4_timestamp middle[3]={{461,11},{472,22},{483,33}};
     const struct ext4_timestamp newer[3]={{511,11},{522,22},{533,33}};
     check(ext4_file_set_times(file,7,older)==0 && ext4_file_sync_metadata(file)==0,81);
+    wait_checkpoint_window(journal->durable_sequence);
+    check(journal->checkpoint_count==1 && journal->checkpoint_sequence==checkpoint,93);
+    checkpoint_clock=first_pending+50000000;
+    check(ext4_file_set_times(file,7,middle)==0 && ext4_file_sync_metadata(file)==0,94);
+    wait_checkpoint_window(journal->durable_sequence);
+    check(journal->checkpoint_count==2 && journal->checkpoint_sequence==checkpoint,95);
+    checkpoint_clock=first_pending+100000000;
+    uintptr_t irq=riscv_interrupt_save();
+    adapter->checkpoint_requested=1;
+    check(kernel_wait_queue_wake_all(&adapter->checkpoint_work)==KERNEL_SCHEDULER_STATUS_OK,96);
+    riscv_interrupt_restore(irq);
     uint64_t deadline;
     check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,82);
     while(!checkpoint_held && riscv_time_read()<deadline) {
@@ -90,21 +145,24 @@ static void exercise_independent_checkpoint(struct lwext4_mount_adapter *adapter
         check(kernel_scheduler_block_current(&checkpoint_held_wait,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,83);
     }
     check(checkpoint_held && journal->checkpointing && journal->checkpoint_sequence==checkpoint,84);
+    check(TAILQ_NEXT(journal->checkpointing,trans_node)==journal->checkpoint_last,97);
     struct jbd_trans *held=journal->checkpointing;
     uint64_t durable=journal->durable_sequence;
     check(ext4_file_set_times(file,7,newer)==0 && ext4_file_sync_metadata(file)==0,85);
     check(journal->checkpointing==held && journal->checkpoint_sequence==checkpoint &&
         journal->durable_sequence>durable && journal->durable_sequence==journal->accepted_sequence,86);
-    uintptr_t irq=riscv_interrupt_save();
+    irq=riscv_interrupt_save();
     checkpoint_release=1;
     check(kernel_wait_queue_wake_all(&checkpoint_release_wait)==KERNEL_SCHEDULER_STATUS_OK,87);
     riscv_interrupt_restore(irq);
     check(ext4_journal_group_drain(adapter->mount_point)==0 && !journal->checkpointing &&
         journal->checkpoint_sequence==journal->durable_sequence,88);
+    checkpoint_clock_adapter=NULL;
     adapter->interface.bwrite_phase=checkpoint_write_phase;
     struct ext4_inode inode;
     check(ext4_fraw_inode_fill(file,&inode)==0 && inode.modification_time==522 && inode.mtime_extra==(22U<<2),89);
     virt_uart_puts("BoarOS: held checkpoint allowed later durable fsync\n");
+    virt_uart_puts("BoarOS: checkpoint window merged groups at first pending deadline\n");
 }
 static void exercise_nojournal_times(struct lwext4_mount_adapter *adapter)
 {

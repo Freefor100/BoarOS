@@ -17,6 +17,11 @@ for block in 1024 4096; do
     mkfs.ext4 -q -F -b "$block" -I 256 "$work/disk.img"
     "$work/probe" "$work/disk.img" seed
     cp "$work/disk.img" "$work/base.img"
+    for mode in group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure; do
+        cp "$work/base.img" "$work/checkpoint.img"
+        "$work/probe" "$work/checkpoint.img" "$mode"
+        e2fsck -fn "$work/checkpoint.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
     for fault in $(seq 0 17); do
         cp "$work/base.img" "$work/independent.img"
         "$work/probe" "$work/independent.img" group-independent "$fault"
