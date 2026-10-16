@@ -10,6 +10,7 @@
 #include <kernel/mm_backend.h>
 #include <kernel/open_file.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/tty.h>
 #include <kernel/wait_internal.h>
 #include "../../mm/uaccess_internal.h"
@@ -152,6 +153,13 @@ static void finish_read(void)
 static void pressure(void)
 {
     check(!ledger_count);
+    struct kernel_vfs_file source={0};
+    uint64_t page;size_t valid;
+    struct kernel_page_cache_statistics before,after;
+    check(!kernel_vfs_open(&root->mount,"/observer",&source));
+    check(!kernel_page_cache_get(&root->page_cache,&source,0,&page,&valid) && valid);
+    kernel_page_cache_get_statistics(&root->page_cache,&before);
+    check(physical_page_release(allocator,page)==PHYSICAL_PAGE_STATUS_OK);
     uint64_t low=physical_page_total(allocator)/50;
     while (!stopping && physical_page_available(allocator)>low) {
         uint64_t free=physical_page_available(allocator), address;
@@ -163,8 +171,18 @@ static void pressure(void)
         held+=UINT64_C(1)<<order;
         if (!(ledger_count&31U)) relinquish();
     }
-    /* 实际系统缓存回收；控制页属于tmpfs，不借用被驱逐的缓存entry。 */
-    reclaimed+=kernel_page_cache_reclaim(&root->page_cache,128);
+    /* observer页不映射到用户空间；计入加压分配触发的后台回收，
+     * 不要求最后一次同步调用抢在worker之前回收同一张页。 */
+    (void)kernel_page_cache_reclaim(&root->page_cache,128);
+    uint64_t deadline=kernel_time_monotonic_ns()+UINT64_C(10000000000);
+    for (;;) {
+        kernel_page_cache_get_statistics(&root->page_cache,&after);
+        if (after.pages_reclaimed>before.pages_reclaimed) break;
+        /* worker按轮发布回收计数，摘除候选后可能尚未结束该轮。 */
+        check(kernel_time_monotonic_ns()<deadline);relinquish();
+    }
+    reclaimed+=after.pages_reclaimed-before.pages_reclaimed;
+    check(!kernel_vfs_close(&source));
 }
 static void close_observer(struct kernel_vfs_file *file, uint64_t page,
                           int page_reference)

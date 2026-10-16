@@ -31,6 +31,12 @@ class CompositionReports(unittest.TestCase):
             with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_controlled(bad)
         single=good.replace('remote-retirement=0x1','remote-retirement=0x0')
         module.validate_controlled(single,cpus=1)
+        sqlite=(single.replace('oom=0x1','oom=0x0').replace('retirement=0x1','retirement=0x0')
+                .replace('waits=0x7b','waits=0x0'))
+        for cpus in (1,2):
+            module.validate_controlled(sqlite,sqlite=True,cpus=cpus)
+            with self.assertRaises(RuntimeError):
+                module.validate_controlled(sqlite.replace('reclaimed=0x2','reclaimed=0x0'),sqlite=True,cpus=cpus)
     def test_functional_stream_is_complete_and_exact(self):
         module=self.checker()
         lines='\n'.join(f'COMPOSITION CASE {case} OK' for case in module.CASES)+f'\nCOMPOSITION END {len(module.CASES)}\n'

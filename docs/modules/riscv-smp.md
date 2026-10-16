@@ -34,7 +34,7 @@ make run-user-smp-riscv
 
 `tests/program-inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。`native-extended.yml`配置相同四格的独立定时job，托管job尚未运行不能由本地结果代替。
 
-`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF有19个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。普通读控制器在真实ecall的复制及迁移点按hart记录字节，先等竞争seek或fork实际park再释放写pin；两hart要求本地复制、CPU0续读和唯一offset借用均发生，一hart仍核对内容与实际pin等待。用户页fault、PID1退出、磁盘状态和SQLite独立重启另有逐项检查。测试控制器、linker wrap及测试宏只存在于私有构建，不进入默认/正式USER_SMP内核。
+`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF有19个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。加压前准备未映射的干净observer文件页，回收统计覆盖账本分配和显式回收，并等待后台轮次发布实际回收数；不要求同步调用抢在后台worker之前回收候选。普通读控制器在真实ecall的复制及迁移点按hart记录字节，先等竞争seek或fork实际park再释放写pin；两hart要求本地复制、CPU0续读和唯一offset借用均发生，一hart仍核对内容与实际pin等待。用户页fault、PID1退出、磁盘状态和SQLite独立重启另有逐项检查。测试控制器、linker wrap及测试宏只存在于私有构建，不进入默认/正式USER_SMP内核。
 
 普通读的聚焦原生验证以512MiB、2/1 hart运行同一19案例ELF的Linux参考，以及BoarOS功能/受控profile。双hart九次受观测操作共复制130字节，其中hart1为84、CPU0为46，确认五次实际任务服务迁移及一次持offset续读；竞争seek必须看到整次读取后的16，fork必须等真实写pin归还后才发布child。无观察钩子的正式USER_SMP内核另运行七项普通读场景及RA2顺序预读/取消，检查内容、自然退出、堆owner和fsck；它验证正式路径功能，不替代受控复制位置与等待交错证据。
 
