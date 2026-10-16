@@ -10,6 +10,7 @@
 #include <kernel/files.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
+#include <kernel/mm_backend.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
@@ -18,6 +19,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include "../../fs/files/private.h"
+#include "../../mm/uaccess_internal.h"
 #include "../../fs/vfs_internal.h"
 #include "../../kernel/sched/private.h"
 #include <string.h>
@@ -87,6 +89,17 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *owner, u
 {
     unsigned previous = model_user; model_user = 1;
     enum kernel_uaccess_status status = __real_kernel_copy_to_user(owner, address, source, size, copied);
+    model_user = previous; return status;
+}
+enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
+    struct kernel_uaccess_write_cursor *, uint64_t, const void *, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *owner,
+    struct kernel_uaccess_write_cursor *cursor, uint64_t address,
+    const void *source, size_t size, size_t *copied)
+{
+    unsigned previous = model_user; model_user = 1;
+    enum kernel_uaccess_status status = __real_kernel_uaccess_write_cursor_copy(
+        owner, cursor, address, source, size, copied);
     model_user = previous; return status;
 }
 enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
@@ -257,7 +270,14 @@ static void exercise(void *unused)
     verify(vectors[2].base, vectors[0].length, vectors[2].length, 0); end("readv");
 
     seek(37); cold(); begin("unaligned");
+    struct kernel_mm_concurrency_state pins_before, pins_after;
+    kernel_mm_get_concurrency_state(&mm, &pins_before);
     check(pread(BUFFER + 7, REQUEST, 13) == REQUEST, 64);
+    kernel_mm_get_concurrency_state(&mm, &pins_after);
+    /* 两个窗口边界结束pin；窗口内部跨缓存页不重pin同一用户页。
+     * 三批分别覆盖32、33、2个目标页，旧逐源页复制需129次。 */
+    check(pins_after.pin_acquisitions - pins_before.pin_acquisitions == 67 &&
+          !pins_after.pins && !pins_after.write_pins, 84);
     position(37); verify(BUFFER + 7, 13, REQUEST, 0); end("unaligned");
 
     cold();

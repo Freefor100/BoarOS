@@ -355,6 +355,7 @@ static enum kernel_files_status disk_read(
             position >> BOAROS_PAGE_SHIFT, pages, count);
         if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT)
             return KERNEL_FILES_STATUS_STATE;
+        struct kernel_uaccess_write_cursor user_copy={0};
         for (size_t i = 0; i < count; i++) {
             struct kernel_page_cache_read_page *part = &pages[i];
             KERNEL_FILES_NOTE(files, read_chunks, 1);
@@ -370,7 +371,7 @@ static enum kernel_files_status disk_read(
             }
             size_t chunk = part->valid_bytes - start, copied = 0;
             if (chunk > request - total) chunk = request - total;
-            enum kernel_uaccess_status access = kernel_copy_to_user_iov(mm, cursor,
+            enum kernel_uaccess_status access = kernel_copy_to_user_iov_cursor(mm, cursor,&user_copy,
                 (unsigned char *)page + start, chunk, &copied);
             if (copied > chunk || (advance && kernel_open_file_advance(description, copied))) {
                 status = KERNEL_FILES_STATUS_STATE; done = 1; break;
@@ -387,6 +388,7 @@ static enum kernel_files_status disk_read(
             start = 0;
         }
         /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
+        kernel_uaccess_write_cursor_finish(&user_copy);
         for (size_t i = 0; i < count; i++) if (!pages[i].status)
             if (physical_page_release(files->heap->page_allocator, pages[i].physical_address)) __builtin_trap();
     }

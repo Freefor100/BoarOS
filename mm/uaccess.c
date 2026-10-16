@@ -47,8 +47,14 @@ enum kernel_uaccess_status kernel_uaccess_pin_user_page(
     return KERNEL_UACCESS_STATUS_STATE;
 }
 
-enum kernel_uaccess_status kernel_copy_to_user(
+void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *cursor)
+{
+    if (cursor->pin.registration) kernel_mm_unpin_user_page(&cursor->pin);
+}
+
+enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
     struct kernel_mm *mm,
+    struct kernel_uaccess_write_cursor *cursor,
     uint64_t user_destination,
     const void *kernel_source,
     size_t size,
@@ -57,7 +63,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
     const unsigned char *source = kernel_source;
     size_t copied = 0U;
 
-    if (mm == 0 || bytes_copied == 0 ||
+    if (mm == 0 || cursor == 0 || bytes_copied == 0 ||
         (size != 0U && kernel_source == 0)) {
         return KERNEL_UACCESS_STATUS_INVALID_ARGUMENT;
     }
@@ -67,12 +73,12 @@ enum kernel_uaccess_status kernel_copy_to_user(
     }
     if (kernel_user_range_check(user_destination, size) !=
         KERNEL_UACCESS_STATUS_OK) {
+        kernel_uaccess_write_cursor_finish(cursor);
         *bytes_copied = 0U;
         return KERNEL_UACCESS_STATUS_FAULT;
     }
 
     while (copied < size) {
-        struct kernel_mm_user_pin pin = {0};
         unsigned char *page;
         uint64_t current = user_destination + (uint64_t)copied;
         size_t offset = (size_t)(current & BOAROS_PAGE_MASK);
@@ -82,32 +88,46 @@ enum kernel_uaccess_status kernel_copy_to_user(
         if (chunk > size - copied) {
             chunk = size - copied;
         }
-        status = kernel_uaccess_pin_user_page(mm,
-                                   current,
-                                   KERNEL_MM_WRITE,
-                                   &pin);
-        if (status != KERNEL_UACCESS_STATUS_OK) {
-            *bytes_copied = copied;
-            return status;
+        uint64_t virtual_page = current & ~BOAROS_PAGE_MASK;
+        if (!cursor->pin.registration || cursor->pin.mm != mm ||
+            cursor->virtual_page != virtual_page) {
+            kernel_uaccess_write_cursor_finish(cursor);
+            status = kernel_uaccess_pin_user_page(mm, current,
+                                                 KERNEL_MM_WRITE, &cursor->pin);
+            if (status != KERNEL_UACCESS_STATUS_OK) {
+                *bytes_copied = copied;
+                return status;
+            }
+            cursor->virtual_page = virtual_page;
         }
 #if BOAROS_COST_DIAGNOSTICS
         struct kernel_cost_tag memory_tag = kernel_cost_capture();
         uint64_t memory_start = kernel_cost_clock();
 #endif
-        page = pin.page;
+        page = cursor->pin.page;
         memcpy(page + offset, source + copied, chunk);
 #if BOAROS_COST_DIAGNOSTICS
         uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_BYTES, chunk);
 #endif
-        kernel_mm_unpin_user_page(&pin);
         COST_ADD(COPY_TO_USER, chunk);
         copied += chunk;
     }
 
     *bytes_copied = copied;
     return KERNEL_UACCESS_STATUS_OK;
+}
+
+enum kernel_uaccess_status kernel_copy_to_user(
+    struct kernel_mm *mm, uint64_t user_destination, const void *kernel_source,
+    size_t size, size_t *bytes_copied)
+{
+    struct kernel_uaccess_write_cursor cursor = {0};
+    enum kernel_uaccess_status status = kernel_uaccess_write_cursor_copy(
+        mm, &cursor, user_destination, kernel_source, size, bytes_copied);
+    kernel_uaccess_write_cursor_finish(&cursor);
+    return status;
 }
 
 enum kernel_uaccess_status kernel_copy_from_user(
