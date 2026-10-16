@@ -281,7 +281,9 @@ OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 `kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/未开放外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算；受控ext4来源须核对真实inode/挂载及独立缓存的heap/allocator绑定，登记状态由CPU0在发布前准备。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。本受控配置的普通用户任务仍限 CPU0；真实用户多核另用`USER_SMP`，LA仍为单CPU。CPU0负责文件构造、命名空间/截断和最终释放；CPU1执行已绑定映射及获准FD操作，控制者保留独立 OFD/挂载/缓存 owner，命名空间运行期间不修改。内部MM开关不独自开放系统压力或FD业务，普通文件IO另按[文件表域](kernel-files.md)验证并发布。
 
-每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。普通文件读在每批已经取得的缓存页内保留当前用户页 pin，跨源页或 iovec 片段不重复解析同一目标页；换目标页时先归还再处理缺页，整批结束或出错时归还，下一次存储等待不携带用户 pin。该游标只延长现有片段借用，不缓存映射身份，撤映射、撤权限和共享页写回仍遵守原来的 pin 排空规则。
+每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
+
+一次性 `kernel_copy_to_user()` 逐目标页 pin、复制并归还，不维护跨片段的虚页身份。普通文件读在本批已取得的缓存页内保留当前用户页 pin，跨来源页或 iovec 片段不重复解析同一目标页；单页请求也共用这一批次路径。两种借用期限共用复制实现。换目标页时先归还再处理缺页，整批结束或出错时归还，下一次存储等待不携带用户 pin。该游标只延长现有片段借用，不缓存映射身份，撤映射、撤权限和共享页写回仍遵守原来的 pin 排空规则。`USER_SMP` 本地读取使用能报告 `RETRY` 的驻留游标，不在本地处理缺页。
 
 `USER_SMP`的`kernel_mm_try_pin_user_page()`只接受当前真实用户任务绑定的普通`remote_user` MM。它尝试既有operation gate，在operation内核对VMA来源，raw内核对pin许可和当前PTE，再取得实际物理页引用；gate忙、许可关闭、缺页、COW或共享磁盘写目标均要求转到CPU0，不能在本地分配或升级权限。uaccess的resident游标用`RETRY`和真实copied前缀交回文件层，归还pin后由同一任务继续原请求。fork和降权持同一gate关闭新写许可，等旧写pin归还后才发布COW或新权限；pin结束只需raw，不等待gate，因此排空者不会阻止归还。
 

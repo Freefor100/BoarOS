@@ -620,6 +620,86 @@ static unsigned long run_reused_write_pin(void)
     return 0;
 }
 
+static unsigned long run_write_pin_geometry(void)
+{
+    static unsigned char source[BOAROS_PAGE_SIZE + 13U];
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table = {0};
+    struct kernel_mm mm = {0};
+    struct kernel_uaccess_write_cursor pages = {0};
+    struct kernel_mm_concurrency_state before, after;
+    uint64_t baseline;
+    size_t copied;
+
+    if (!setup_mm(&allocator, &kernel_table, &mm, &baseline)) return 1U;
+    for (size_t i = 0U; i < sizeof(source); i++)
+        source[i] = (unsigned char)(i * 29U + i / BOAROS_PAGE_SIZE + 3U);
+    const uint64_t destinations[] = {TEST_USER_BASE, TEST_USER_BASE + 0x618U};
+    for (size_t test = 0U; test < 2U; test++) {
+        kernel_mm_get_concurrency_state(&mm, &before);
+        if (kernel_copy_to_user(&mm, destinations[test], source,
+                                BOAROS_PAGE_SIZE, &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != BOAROS_PAGE_SIZE)
+            return 2U;
+        kernel_mm_get_concurrency_state(&mm, &after);
+        if (after.pin_acquisitions - before.pin_acquisitions != test + 1U ||
+            after.pins || after.write_pins) return 3U;
+        for (size_t i = 0U; i < BOAROS_PAGE_SIZE; i++) {
+            unsigned char actual;
+            if (!read_user_byte(&mm, destinations[test] + i, &actual) ||
+                actual != source[i]) return 4U;
+        }
+    }
+
+    /* source页边界与iov边界不同；同一目标页只能登记一次实际写pin。 */
+    const struct kernel_uaccess_iovec vectors[] = {
+        {TEST_USER_BASE + 7U, 19U}, {TEST_USER_BASE, 0U},
+        {TEST_USER_BASE + 26U, BOAROS_PAGE_SIZE - 26U},
+        {TEST_USER_BASE + BOAROS_PAGE_SIZE, 20U},
+    };
+    struct kernel_uaccess_iov_cursor cursor = {.iov = vectors, .count = 4U};
+    kernel_mm_get_concurrency_state(&mm, &before);
+    if (kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, source,
+                                      BOAROS_PAGE_SIZE, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != BOAROS_PAGE_SIZE ||
+        kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages,
+                                      source + BOAROS_PAGE_SIZE, 13U,
+                                      &copied) != KERNEL_UACCESS_STATUS_OK ||
+        copied != 13U) return 5U;
+    kernel_mm_get_concurrency_state(&mm, &after);
+    if (after.pin_acquisitions - before.pin_acquisitions != 2U ||
+        after.pins != 1U || after.write_pins != 1U) return 6U;
+    for (size_t i = 0U; i < sizeof(source); i++) {
+        unsigned char actual;
+        if (!read_user_byte(&mm, TEST_USER_BASE + 7U + i, &actual) ||
+            actual != source[i]) return 7U;
+    }
+    kernel_uaccess_write_cursor_finish(&pages);
+
+    const struct kernel_uaccess_iovec fault_vectors[] = {
+        {TEST_USER_BASE + 2U * BOAROS_PAGE_SIZE - 5U, 2U},
+        {TEST_USER_BASE + 2U * BOAROS_PAGE_SIZE - 3U, 6U},
+    };
+    cursor = (struct kernel_uaccess_iov_cursor){.iov = fault_vectors, .count = 2U};
+    kernel_mm_get_concurrency_state(&mm, &before);
+    if (kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, source, 8U,
+                                      &copied) != KERNEL_UACCESS_STATUS_FAULT ||
+        copied != 5U || cursor.index != 1U || cursor.offset != 3U)
+        return 8U;
+    kernel_mm_get_concurrency_state(&mm, &after);
+    if (after.pin_acquisitions - before.pin_acquisitions != 1U ||
+        after.pins || after.write_pins) return 9U;
+    for (size_t i = 0U; i < copied; i++) {
+        unsigned char actual;
+        if (!read_user_byte(&mm, fault_vectors[0].base + i, &actual) ||
+            actual != source[i]) return 10U;
+    }
+    kernel_uaccess_write_cursor_finish(&pages);
+    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
+        physical_page_available(&allocator) != baseline) return 11U;
+    return 0U;
+}
+
 unsigned long run_all_uaccess_cases(void)
 {
     unsigned long result = run_cross_page_copy();
@@ -658,5 +738,7 @@ unsigned long run_all_uaccess_cases(void)
     result = run_copy_string_from_user();
     if (result != 0U) return UINT64_C(0x900) + result;
     result = run_reused_write_pin();
-    return result == 0U ? 0U : UINT64_C(0xa00) + result;
+    if (result != 0U) return UINT64_C(0xa00) + result;
+    result = run_write_pin_geometry();
+    return result == 0U ? 0U : UINT64_C(0xb00) + result;
 }
