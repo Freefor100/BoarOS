@@ -239,10 +239,20 @@ int jbd_journal_group_init(struct jbd_journal *journal, size_t limit);
 void jbd_journal_group_fini(struct jbd_journal *journal);
 int jbd_journal_freeze(struct jbd_journal *journal);
 int jbd_journal_submit(struct jbd_journal *journal);
-int jbd_journal_retire(struct jbd_journal *journal, int error);
-/* Select a worker phase under the modification lock, then submit immutable
- * owners outside it. Commit and checkpoint completion are distinct. */
+enum jbd_journal_stage {
+	JBD_JOURNAL_IDLE,
+	JBD_JOURNAL_COMMIT,
+	JBD_JOURNAL_CHECKPOINT,
+};
+int jbd_journal_retire_stage(struct jbd_journal *journal,
+	enum jbd_journal_stage stage, int error);
+/* The two consumers select and retire their own immutable owners under the
+ * modification lock. Their device I/O may overlap outside that lock. IDLE
+ * selects either stage for a caller that drives both synchronously. */
+enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
+	enum jbd_journal_stage stage);
 bool jbd_journal_select(struct jbd_journal *journal);
+int jbd_journal_retire(struct jbd_journal *journal, int error);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
 bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
 	const struct file_data_source *const *sources, unsigned count);

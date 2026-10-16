@@ -149,15 +149,22 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改。元数据修改前保留原内容，供 abort 恢复仍被引用的元数据缓冲；普通文件数据在私有新版本上修改，abort 只丢弃新版本，不再备份或改写旧数据缓存。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 
-`ext4_journal_group_enable/service/drain` 由可写 journal mount 的 joinable 线程驱动；宿主 fixture 显式推进同一引擎。私有操作保留元数据撤销内容，成功后合入挂载点运行组并释放本次撤销内容。接纳只处理新增或替换的记录，不重新扫描累计集合。文件数据从接纳时起就借用稳定来源；封口只复制元数据到已预留的不可变版本。提交准备使用预留日志资源和挂载期固定映射，设备提交和 checkpoint 不再读取可变 bcache。`journal_pending` 阻止元数据提前回写；释放的块和 inode 到 checkpoint 完成后才能重新分配。释放区间仍由所属事务链持有，块与 inode 各有一个引用同一节点的区间索引，查询直接给出覆盖区间末端或下一个区间起点，分配器可整段跳过。可回收块数、inode 数随区间增删维护，不再反复扫描所有待提交事务；接纳只移动事务链，abort 或持久化 checkpoint 尾推进后才撤销索引。重复或交叠释放返回 EUCLEAN。
+`ext4_journal_group_enable/commit/checkpoint/drain` 由可写 journal mount 的两个 joinable 线程驱动：
+commit 线程处理封口与日志提交，checkpoint 线程处理已持久前缀的 home 写入和日志回收。
+二者只在选择与退休 owner 时持 mount 锁，设备 I/O 可独立等待；
+宿主 fixture 的 `service` 接口仍可同步推进同一引擎。私有操作保留元数据撤销内容，成功后合入挂载点运行组并释放本次撤销内容。接纳只处理新增或替换的记录，不重新扫描累计集合。文件数据从接纳时起就借用稳定来源；封口只复制元数据到已预留的不可变版本。提交准备使用预留日志资源和挂载期固定映射，设备提交和 checkpoint 不再读取可变 bcache。`journal_pending` 阻止元数据提前回写；释放的块和 inode 到 checkpoint 完成后才能重新分配。释放区间仍由所属事务链持有，块与 inode 各有一个引用同一节点的区间索引，查询直接给出覆盖区间末端或下一个区间起点，分配器可整段跳过。可回收块数、inode 数随区间增删维护，不再反复扫描所有待提交事务；接纳只移动事务链，abort 或持久化 checkpoint 尾推进后才撤销索引。重复或交叠释放返回 EUCLEAN。
 
 软封口条件是首次脏化后 100 ms，或运行组预留的元数据日志空间达到 256 KiB；普通文件数据块数不参与这个阈值。同步目标、显式请求和资源回收也会推动封口。文件版本按实际保留的内存控制：每个外部来源只取得一份引用并计一次完整分配，块借用只增加控制记录；未提供稳定覆盖的部分块才计入私有数据镜像。每个元数据 home buffer 在第一个版本 pin 时计费，最后一个版本释放时撤销计费。空闲镜像和控制记录池最多保留 min(256 KiB, 预算/4)，不足时先释放空闲资源；固定日志映射也计入挂载点预算，运行时上限为 min(4 MiB, RAM/32)。
 
-运行组之外最多两组封口 FIFO 和一组提交中；commit 屏障后发布 durable，metadata 版本、日志空间与 quarantine 保留到 checkpoint 完成。worker 优先提交，空队列、回收压力或累计四组 checkpoint 时执行最多八组连续 checkpoint。选择阶段复用现有物理块索引，只为本次已提交前缀的同一 home 地址保留最后一个版本；revoke 去掉旧的块用途，后续元数据可以发布新版本，不借用尚未选中的事务。home 数据和 checkpoint 尾部持久化后，才释放所选前缀的全部版本与 quarantine。等待区分 sealed、durable 和 checkpoint：封口 FIFO 满才等 sealed，实际内存、日志空间或复用不足才等 checkpoint。写入接纳前分别估算数据记录、所需私有镜像和新增来源；映射增长若仍触及硬预算，先结束私有操作并完整回滚，再等待旧组回收后重做。普通分配失败不会因此重试，嵌套原子操作也不会中途提交或释放修改锁等待。
+运行组之外最多两组封口 FIFO 和一组提交中；commit 屏障后发布 durable，metadata 版本、日志空间与 quarantine 保留到 checkpoint 完成。commit 与 checkpoint 各自维护实际在途 owner，checkpoint 的设备等待不阻止后续提交或 fsync 完成。
+checkpoint 每次选择最多八组已持久的连续前缀，结束后重新选择，释放的预算通知 commit 线程继续。选择阶段复用现有物理块索引，只为本次已提交前缀的同一 home 地址保留最后一个版本；revoke 去掉旧的块用途，后续元数据可以发布新版本，不借用尚未选中的事务。home 数据和 checkpoint 尾部持久化后，才释放所选前缀的全部版本与 quarantine。
+任一线程遇到持久化错误都保留第一个错误；另一线程即使随后完成 I/O，也保留其版本和恢复 owner，不再发布进度或回收空间。等待区分 sealed、durable 和 checkpoint：封口 FIFO 满才等 sealed，实际内存、日志空间或复用不足才等 checkpoint。写入接纳前分别估算数据记录、所需私有镜像和新增来源；映射增长若仍触及硬预算，先结束私有操作并完整回滚，再等待旧组回收后重做。普通分配失败不会因此重试，嵌套原子操作也不会中途提交或释放修改锁等待。
 
 同步返回保证提交记录及其先决数据已经持久化。历史存储流水线及 SQLite 恢复结果见[2026-10-01 验收记录](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
 
-`make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`sh tests/lwext4-reclaim-host.sh` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
+`make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。新增交错检查把 checkpoint 停在实际 home write 内，后续真实 fsync 仍必须达到更晚的 durable 序号；
+双向注入另一路写入或 flush 失败，检查两个 owner 均保留，并逐边界断电、两次恢复及 fsck。
+命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`sh tests/lwext4-reclaim-host.sh` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
 
 同一提交阶段使用稳定数据和日志控制 owner 内嵌的范围节点，组成 `ext4_blocks_set_phase()` 输入；不再每 32 个区间等待整批完成。块层先检查整个只读范围游标，再用预留的 32 项工作区持续补充空出的成员，直到整个阶段结束。磁盘相邻、内存分散的区间沿 SG 路径提交；没有 phase 设备接口时按范围顺序写入。journal 的物理块索引保证同一阶段范围不重叠，公共 write_batch 仍保留原有重叠检查和部分扇区语义。日志 magic 转义只为实际命中的载荷预留独立首扇区，余部借用原版本，避免复用 descriptor 缓冲而被迫等待它的 DMA。数据来源一直保留到实际设备使用结束，失败挂载还会保留读取当前文件内容所需的版本。
 

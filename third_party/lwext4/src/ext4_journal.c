@@ -3267,15 +3267,17 @@ int jbd_journal_submit(struct jbd_journal *journal)
 	return jbd_write_prepared(trans, &submitted);
 }
 
-bool jbd_journal_select(struct jbd_journal *journal)
+enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
+	enum jbd_journal_stage stage)
 {
-	if (journal->committing || journal->checkpointing || journal->error) return false;
+	if (journal->error) return JBD_JOURNAL_IDLE;
 	struct jbd_trans *trans = TAILQ_FIRST(&journal->cp_queue);
 	/* 每个 checkpoint 批次结束后重新选择；容量压力不能被提交流饿死。 */
 	bool reclaim = trans && (journal->checkpoint_requested || journal->checkpoint_count >= 4 ||
 		journal->memory_used - journal->memory_cached > journal->memory_limit / 2 ||
 		TAILQ_EMPTY(&journal->sealed_queue));
-	if (reclaim) {
+	if (!journal->checkpointing && trans && stage != JBD_JOURNAL_COMMIT &&
+	    (stage == JBD_JOURNAL_CHECKPOINT || reclaim)) {
 		journal->checkpointing = journal->checkpoint_last = trans;
 		unsigned count = 1;
 		while (count < 8 && TAILQ_NEXT(journal->checkpoint_last, trans_node)) {
@@ -3313,14 +3315,23 @@ bool jbd_journal_select(struct jbd_journal *journal)
                 jb->block.lb_id, 0, journal->block_size);
         journal->checkpoint_io = phase.first;
 		journal->checkpoint_requested = false;
-		return true;
+		return JBD_JOURNAL_CHECKPOINT;
 	}
+	if (journal->committing || stage == JBD_JOURNAL_CHECKPOINT) return JBD_JOURNAL_IDLE;
 	trans = TAILQ_FIRST(&journal->sealed_queue);
-	if (!trans) return false;
+	if (!trans) return JBD_JOURNAL_IDLE;
 	TAILQ_REMOVE(&journal->sealed_queue, trans, trans_node);
 	journal->sealed_count--;
 	journal->committing = trans;
-	return true;
+	return JBD_JOURNAL_COMMIT;
+}
+
+bool jbd_journal_select(struct jbd_journal *journal)
+{
+	/* Sequential low-level callers have no completion token. Keep them from
+	 * borrowing an owner already held by either runtime consumer. */
+	if (journal->committing || journal->checkpointing) return false;
+	return jbd_journal_select_stage(journal, JBD_JOURNAL_IDLE) != JBD_JOURNAL_IDLE;
 }
 
 int jbd_journal_checkpoint(struct jbd_journal *journal)
@@ -3365,17 +3376,24 @@ static void jbd_group_release(struct jbd_journal *journal, struct jbd_trans *tra
 	jbd_journal_free_trans(journal, trans, false);
 }
 
-int jbd_journal_retire(struct jbd_journal *journal, int error)
+int jbd_journal_retire_stage(struct jbd_journal *journal,
+	enum jbd_journal_stage stage, int error)
 {
-	struct jbd_trans *trans = journal->committing ? journal->committing : journal->checkpointing;
+	struct jbd_trans *trans = stage == JBD_JOURNAL_COMMIT ? journal->committing : journal->checkpointing;
 	if (!trans) return error;
 	if (error) {
-		journal->error = error; journal->failed_trans = trans;
+		if (!journal->error) {
+			journal->error = error;
+			journal->failed_trans = trans;
+		}
 		/* DMA has stopped, but live readers still own the accepted file
 		 * contents. The failed mount keeps these versions and later groups. */
-		return error;
+		return journal->error;
 	}
-	if (journal->committing) {
+	/* A failure in the other consumer leaves this completed owner's recovery
+	 * and live-read references intact as well. No lane can recycle the log. */
+	if (journal->error) return journal->error;
+	if (stage == JBD_JOURNAL_COMMIT) {
 		/* commit 屏障成功即形成恢复依据；home owner 继续归 checkpoint 队列。 */
 		journal->committed_id = trans->trans_id;
 		journal->durable_sequence = trans->sequence;
@@ -3405,6 +3423,13 @@ int jbd_journal_retire(struct jbd_journal *journal, int error)
 	journal->checkpoint_io = NULL;
 	journal->checkpointing = journal->checkpoint_last = NULL;
 	return EOK;
+}
+
+int jbd_journal_retire(struct jbd_journal *journal, int error)
+{
+	if (journal->committing && journal->checkpointing) __builtin_trap();
+	return jbd_journal_retire_stage(journal, journal->committing ?
+		JBD_JOURNAL_COMMIT : JBD_JOURNAL_CHECKPOINT, error);
 }
 
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal)

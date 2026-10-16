@@ -41,6 +41,11 @@ with tempfile.TemporaryDirectory(prefix='journal-group.',dir=root/'build') as te
     output=result.stdout.decode(errors='replace')
     if result.returncode or 'BoarOS: journal group tests passed' not in output:
         print(output[-12000:]);raise SystemExit('journal group runtime failed')
+    overlap='BoarOS: held checkpoint allowed later durable fsync'
+    if not args.nojournal:
+        if overlap not in output:
+            print(output[-12000:]);raise SystemExit('checkpoint/commit interleaving did not run')
+        print(overlap)
     check=subprocess.run(['e2fsck','-fn',str(image)],capture_output=True,text=True)
     if check.returncode:print(check.stdout+check.stderr);raise SystemExit('journal group filesystem damaged')
     print(f'PASS: {"nojournal timestamps" if args.nojournal else "journal group"} runtime {args.transport}/{args.cache}')

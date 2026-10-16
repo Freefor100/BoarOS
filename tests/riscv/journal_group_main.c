@@ -35,6 +35,9 @@ static unsigned char bytes[4096], actual[4096];
 static struct kernel_vfs_file *hot_file;
 static unsigned hot_read_done;
 static struct kernel_wait_queue hot_read_completion;
+static struct kernel_wait_queue checkpoint_held_wait, checkpoint_release_wait;
+static unsigned checkpoint_hold_armed, checkpoint_held, checkpoint_release;
+static int (*checkpoint_write_phase)(struct ext4_blockdev *, const struct ext4_block_write *);
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {
@@ -51,6 +54,57 @@ static void hot_read_access(void *argument)
     hot_read_done=1;
     check(kernel_wait_queue_wake_one(&hot_read_completion)==KERNEL_SCHEDULER_STATUS_OK,47);
     riscv_interrupt_restore(irq);
+}
+static int hold_checkpoint_phase(struct ext4_blockdev *bdev,const struct ext4_block_write *first)
+{
+    struct jbd_journal *journal=bdev->fs->jbd_journal;
+    if(checkpoint_hold_armed && journal->checkpointing && first==journal->checkpoint_io) {
+        uintptr_t irq=riscv_interrupt_save();
+        checkpoint_hold_armed=0; checkpoint_held=1;
+        check(kernel_wait_queue_wake_all(&checkpoint_held_wait)==KERNEL_SCHEDULER_STATUS_OK,78);
+        while(!checkpoint_release) {
+            enum kernel_wait_wake_reason reason;
+            check(kernel_scheduler_block_current(&checkpoint_release_wait,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,79);
+        }
+        riscv_interrupt_restore(irq);
+    }
+    return checkpoint_write_phase(bdev,first);
+}
+static void exercise_independent_checkpoint(struct lwext4_mount_adapter *adapter,ext4_file *file)
+{
+    check(ext4_journal_group_drain(adapter->mount_point)==0,80);
+    struct jbd_journal *journal=adapter->device.fs->jbd_journal;
+    uint64_t checkpoint=journal->checkpoint_sequence;
+    kernel_wait_queue_init(&checkpoint_held_wait);
+    kernel_wait_queue_init(&checkpoint_release_wait);
+    checkpoint_write_phase=adapter->interface.bwrite_phase;
+    checkpoint_hold_armed=1;
+    adapter->interface.bwrite_phase=hold_checkpoint_phase;
+    const struct ext4_timestamp older[3]={{411,11},{422,22},{433,33}};
+    const struct ext4_timestamp newer[3]={{511,11},{522,22},{533,33}};
+    check(ext4_file_set_times(file,7,older)==0 && ext4_file_sync_metadata(file)==0,81);
+    uint64_t deadline;
+    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,82);
+    while(!checkpoint_held && riscv_time_read()<deadline) {
+        enum kernel_wait_wake_reason reason;
+        check(kernel_scheduler_block_current(&checkpoint_held_wait,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,83);
+    }
+    check(checkpoint_held && journal->checkpointing && journal->checkpoint_sequence==checkpoint,84);
+    struct jbd_trans *held=journal->checkpointing;
+    uint64_t durable=journal->durable_sequence;
+    check(ext4_file_set_times(file,7,newer)==0 && ext4_file_sync_metadata(file)==0,85);
+    check(journal->checkpointing==held && journal->checkpoint_sequence==checkpoint &&
+        journal->durable_sequence>durable && journal->durable_sequence==journal->accepted_sequence,86);
+    uintptr_t irq=riscv_interrupt_save();
+    checkpoint_release=1;
+    check(kernel_wait_queue_wake_all(&checkpoint_release_wait)==KERNEL_SCHEDULER_STATUS_OK,87);
+    riscv_interrupt_restore(irq);
+    check(ext4_journal_group_drain(adapter->mount_point)==0 && !journal->checkpointing &&
+        journal->checkpoint_sequence==journal->durable_sequence,88);
+    adapter->interface.bwrite_phase=checkpoint_write_phase;
+    struct ext4_inode inode;
+    check(ext4_fraw_inode_fill(file,&inode)==0 && inode.modification_time==522 && inode.mtime_extra==(22U<<2),89);
+    virt_uart_puts("BoarOS: held checkpoint allowed later durable fsync\n");
 }
 static void exercise_nojournal_times(struct lwext4_mount_adapter *adapter)
 {
@@ -173,6 +227,7 @@ static void exercise(void *argument)
         kernel_vfs_file_node(&alias)==kernel_vfs_file_node(&file),48);
     struct ext4_inode disk_before, disk_after;
     ext4_file *handle=lwext4_node_file(kernel_vfs_file_node(&file));
+    exercise_independent_checkpoint(adapter,handle);
     check(ext4_fraw_inode_fill(handle,&disk_before)==0,49);
     uint64_t before=journal->accepted_sequence;
     for(unsigned repeat=0;repeat<64;repeat++) {

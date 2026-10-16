@@ -1036,27 +1036,43 @@ int ext4_journal_group_enable(const char *mount_point,
 	return r;
 }
 
-int ext4_journal_group_service(const char *mount_point, bool force)
+static int ext4_journal_group_run(const char *mount_point, bool force,
+	enum jbd_journal_stage stage)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENOENT;
 	EXT4_MP_LOCK(mp);
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	int r = !journal || !journal->grouped ? EINVAL : journal->error;
-	if (r == EOK && (mp->transaction_depth || journal->committing || journal->checkpointing)) r = EBUSY;
-	if (r == EOK && ext4_group_due(mp, force)) {
+	if (r == EOK && mp->transaction_depth) r = EBUSY;
+	if (r == EOK && stage != JBD_JOURNAL_CHECKPOINT && ext4_group_due(mp, force)) {
 		r = ext4_group_freeze(mp, force);
 		if (r == EAGAIN) r = EOK; /* 已有提交 owner，先让队首进展。 */
 	}
-	bool selected = r == EOK && jbd_journal_select(journal);
-	bool checkpoint = selected && journal->checkpointing;
+	enum jbd_journal_stage selected = r == EOK ?
+		jbd_journal_select_stage(journal, stage) : JBD_JOURNAL_IDLE;
 	EXT4_MP_UNLOCK(mp);
 	if (r != EOK || !selected) return r;
-	r = checkpoint ? jbd_journal_checkpoint(journal) : jbd_journal_submit(journal);
+	r = selected == JBD_JOURNAL_CHECKPOINT ? jbd_journal_checkpoint(journal) : jbd_journal_submit(journal);
 	EXT4_MP_LOCK(mp);
-	r = jbd_journal_retire(journal, r);
+	r = jbd_journal_retire_stage(journal, selected, r);
 	EXT4_MP_UNLOCK(mp);
 	return r;
+}
+
+int ext4_journal_group_service(const char *mount_point, bool force)
+{
+	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_IDLE);
+}
+
+int ext4_journal_group_commit(const char *mount_point, bool force)
+{
+	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_COMMIT);
+}
+
+int ext4_journal_group_checkpoint(const char *mount_point)
+{
+	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT);
 }
 
 int ext4_journal_group_drain(const char *mount_point)
@@ -1082,12 +1098,16 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 	int r = !journal || !journal->grouped ? ENOTSUP : EOK;
 	if (r == EOK) {
 		struct jbd_trans *running = journal->running;
+		bool commit_ready = !journal->committing &&
+			(!TAILQ_EMPTY(&journal->sealed_queue) || ext4_group_due(mp, false));
+		bool checkpoint_ready = !journal->checkpointing && !TAILQ_EMPTY(&journal->cp_queue);
 		*progress = (struct ext4_journal_progress){
 			.accepted = journal->accepted_sequence, .sealed = journal->sealed_sequence,
 			.durable = journal->durable_sequence, .checkpoint = journal->checkpoint_sequence,
 			.deadline_ns = running ? running->first_dirty_ns + 100000000 : 0,
 			.memory_used = journal->memory_used, .memory_peak = journal->memory_peak,
-			.ready = !TAILQ_EMPTY(&journal->sealed_queue) || !TAILQ_EMPTY(&journal->cp_queue) || ext4_group_due(mp, false),
+			.ready = commit_ready || checkpoint_ready,
+			.commit_ready = commit_ready, .checkpoint_ready = checkpoint_ready,
 			.error = journal->error};
 	}
 	EXT4_MP_UNLOCK(mp);

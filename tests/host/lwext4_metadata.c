@@ -53,7 +53,14 @@ static unsigned borrow_watch_size, borrow_watch_calls;
 static bool borrow_watch_escape;
 static ext4_fsblk_t checkpoint_homes[3];
 static unsigned checkpoint_home_writes[3], checkpoint_watch_block;
+static unsigned independent_cut, independent_event;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"%d: %s (alloc=%u fail=%u)\n",__LINE__,#x,allocations,fail_allocation); exit(1); } } while (0)
+static void independent_boundary(void)
+{
+    if (!independent_cut || ++independent_event != independent_cut) return;
+    CHECK(fault_block_crash(&disk)==0);
+    exit(0);
+}
 void *ext4_user_malloc(size_t n)
 {
     if(payload_threshold && n>=payload_threshold)payload_allocations++;
@@ -85,10 +92,17 @@ static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t n,uint32_t c
     }
     if(write_interleave){void (*hook)(void)=write_interleave;write_interleave=NULL;hook();}
     if (n <= forbidden_lba && forbidden_lba < n+c) forbidden_writes++;
-    return kernel_block_write_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO;
+    int result=kernel_block_write_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO;
+    independent_boundary();
+    return result;
 }
 static int dev_flush(struct ext4_blockdev *b)
-{ (void)b; return kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
+{
+    (void)b;
+    int result=kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO;
+    independent_boundary();
+    return result;
+}
 static uint32_t cost_tick;
 extern int ext4_journal_group_enable(const char *, const struct ext4_journal_runtime *, size_t) __attribute__((weak));
 extern int ext4_journal_group_service(const char *, bool) __attribute__((weak));
@@ -1147,9 +1161,10 @@ static void group_data_error(struct ext4_fs *fs, bool fail_flush)
     CHECK(reads>before_reads); /* The unchanged cold block still reaches disk. */
     CHECK(ext4_fseek(&file,0,SEEK_SET)==EOK && ext4_fread(&file,readback,block,&count)==EOK && count==block);
     for (size_t j=0;j<block;j++) CHECK(readback[j]==0x40);
-    struct ext4_file_read_span spans[2]={
+    struct file_read_span spans[2]={
         {block+13,readback,17,0,EIO},{2*block+29,readback+32,19,0,EIO}};
-    CHECK(ext4_fpread_batch(&file,spans,2)==EOK && spans[0].completed==17 && spans[1].completed==19);
+    struct file_read_workspace read_work;
+    CHECK(ext4_fpread_batch(&file,spans,2,&read_work,UINT64_MAX)==EOK && spans[0].completed==17 && spans[1].completed==19);
     for (unsigned i=0;i<17;i++) CHECK(readback[i]==0x43);
     for (unsigned i=0;i<19;i++) CHECK(readback[32+i]==0x42);
     CHECK(ext4_journal_group_drain("/")==EIO);
@@ -1386,6 +1401,131 @@ static void seed(void)
     CHECK(ext4_fopen(&f,"/file","w+")==EOK);CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&n)==EOK && n==sizeof(bytes));CHECK(ext4_fclose(&f)==EOK);
     CHECK(ext4_fopen(&f,"/other","w+")==EOK);CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&n)==EOK && n==sizeof(bytes));CHECK(ext4_fclose(&f)==EOK);
 }
+static struct ext4_fs *independent_fs;
+static ext4_file *independent_file;
+static struct jbd_trans *independent_checkpoint;
+static unsigned independent_fault, independent_handshakes;
+static size_t independent_owned;
+static const struct ext4_timestamp independent_times[3]={{8123,11},{8456,22},{8789,33}};
+static void independent_checkpoint_error_while_commit_held(void)
+{
+    struct jbd_journal *journal=independent_fs->jbd_journal;
+    CHECK(journal->checkpointing==independent_checkpoint && journal->committing);
+    unsigned point=independent_fault-14;
+    if (!(point&1)) disk.fail_write=disk.writes+1+point/2;
+    else disk.fail_flush=disk.flushes+1+point/2;
+    CHECK(jbd_journal_checkpoint(journal)==EIO);
+    CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_CHECKPOINT,EIO)==EIO);
+    CHECK(journal->failed_trans==independent_checkpoint && journal->committing);
+    independent_owned=journal->memory_used;
+    independent_handshakes++;
+}
+static void independent_fsync_while_home_held(void)
+{
+    struct jbd_journal *journal=independent_fs->jbd_journal;
+    CHECK(journal->checkpointing==independent_checkpoint && !journal->committing);
+    uint64_t checkpoint=journal->checkpoint_sequence, durable=journal->durable_sequence;
+    CHECK(ext4_file_set_times(independent_file,7,independent_times)==EOK);
+    if (independent_fault>=10) {
+        unsigned point=independent_fault-10;
+        if (!(point&1)) disk.fail_write=disk.writes+1+point/2;
+        else disk.fail_flush=disk.flushes+1+point/2;
+    }
+    /* The older home write is still on the caller's device stack. A complete
+     * fsync must seal, write and durably commit this new target before return. */
+    int result=ext4_file_sync_metadata(independent_file);
+    if (result!=(independent_fault>=10?EIO:EOK))
+        fprintf(stderr,"held checkpoint: later fsync returned %d; durable=%llu checkpoint=%llu target=%llu\n",
+            result,(unsigned long long)journal->durable_sequence,
+            (unsigned long long)journal->checkpoint_sequence,(unsigned long long)journal->accepted_sequence);
+    CHECK(result==(independent_fault>=10?EIO:EOK));
+    CHECK(journal->checkpointing==independent_checkpoint && journal->checkpoint_sequence==checkpoint);
+    if (independent_fault>=10) {
+        CHECK(journal->error==EIO && journal->committing && journal->durable_sequence==durable);
+        CHECK(journal->failed_trans==journal->committing && journal->checkpoint_count==1);
+    } else {
+        CHECK(!journal->committing && journal->durable_sequence>durable);
+        CHECK(journal->durable_sequence==journal->accepted_sequence && journal->checkpoint_count==2);
+    }
+    independent_handshakes++;
+    independent_owned=journal->memory_used;
+    if (independent_fault==5) {
+        CHECK(fault_block_crash(&disk)==0);
+        exit(0);
+    }
+    if (independent_fault>=6 && independent_fault<=9)
+        independent_cut=independent_fault-5;
+    if (independent_fault==1) disk.fail_write=disk.writes+1;
+    if (independent_fault==2) disk.fail_flush=disk.flushes+1;
+    if (independent_fault==3) disk.fail_write=disk.writes+2;
+    if (independent_fault==4) disk.fail_flush=disk.flushes+2;
+}
+
+static void group_independent_progress(struct ext4_fs *fs,unsigned fault)
+{
+    CHECK(fault<=17);
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct ext4_timestamp old[3]={{7123,11},{7456,22},{7789,33}};
+    CHECK(ext4_file_set_times(&file,7,old)==EOK && ext4_file_sync_metadata(&file)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    independent_checkpoint=TAILQ_FIRST(&journal->cp_queue);
+    CHECK(independent_checkpoint && journal->checkpoint_count==1);
+    CHECK(TAILQ_FIRST(&independent_checkpoint->buf_queue) &&
+        !TAILQ_NEXT(TAILQ_FIRST(&independent_checkpoint->buf_queue),buf_node));
+    uint64_t before=journal->checkpoint_sequence;
+    independent_fs=fs; independent_file=&file; independent_fault=fault;
+    if (fault>=14) {
+        /* Reverse the completion order: checkpoint fails while the later
+         * commit is in its first device write, then that commit completes all
+         * its real I/O. Sticky failure must keep both actual owners. */
+        CHECK(jbd_journal_select(journal) && journal->checkpointing==independent_checkpoint);
+        uint64_t durable=journal->durable_sequence;
+        CHECK(ext4_file_set_times(&file,7,independent_times)==EOK);
+        write_interleave=independent_checkpoint_error_while_commit_held;
+        CHECK(ext4_file_sync_metadata(&file)==EIO && independent_handshakes==1);
+        CHECK(journal->checkpointing==independent_checkpoint && journal->committing &&
+            journal->failed_trans==independent_checkpoint && journal->checkpoint_count==1);
+        CHECK(journal->durable_sequence==durable && journal->checkpoint_sequence==before &&
+            journal->memory_used==independent_owned);
+        CHECK(ext4_umount("/")==EIO && fs->bdev->fs==fs && fault_block_crash(&disk)==0);
+        printf("independent reverse error block=%u fault=%u: checkpoint failed, completed commit owner retained\n",fs->bdev->lg_bsize,fault);
+        return;
+    }
+    write_interleave=independent_fsync_while_home_held;
+    int result=ext4_journal_group_service("/",true);
+    CHECK(independent_handshakes==1 && !write_interleave);
+    bool failed=(fault>=1 && fault<=4) || fault>=10;
+    CHECK(result==(failed?EIO:EOK));
+    if (failed) {
+        CHECK(journal->error==EIO && journal->checkpointing==independent_checkpoint);
+        CHECK(journal->checkpoint_sequence==before && journal->memory_used==independent_owned);
+        CHECK(journal->failed_trans==(fault>=10?journal->committing:independent_checkpoint));
+        CHECK(ext4_file_sync_metadata(&file)==EIO && ext4_umount("/")==EIO && fs->bdev->fs==fs);
+    } else {
+        CHECK(journal->checkpoint_sequence>before && !journal->checkpointing);
+        CHECK(journal->checkpoint_count==1 && journal->durable_sequence>journal->checkpoint_sequence);
+    }
+    CHECK(fault_block_crash(&disk)==0);
+    printf("independent progress block=%u fault=%u: held home, later fsync, retained stage owners\n",fs->bdev->lg_bsize,fault);
+}
+
+static void group_independent_recovery(struct ext4_fs *fs, bool failed_commit)
+{
+    ext4_file file; struct ext4_inode inode;
+    CHECK(ext4_fopen(&file,"/file","r")==EOK && ext4_fraw_inode_fill(&file,&inode)==EOK);
+    bool extended=ext4_get16(&fs->sb,inode_size)>128;
+    bool latest=get_time(&inode,0,extended).seconds==independent_times[0].seconds;
+    CHECK(latest || failed_commit);
+    for(unsigned i=0;i<3;i++) {
+        struct ext4_timestamp expected=independent_times[i];
+        if (!latest) expected.seconds-=1000;
+        expect_time(&file,i,expected,extended);
+    }
+    CHECK(ext4_fclose(&file)==EOK);
+}
+
 static void times_test(struct ext4_fs *fs, bool readonly)
 {
     bool extended=ext4_get16(&fs->sb,inode_size)>128;
@@ -2169,6 +2309,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
     else if(!strcmp(argv[2],"group-log-payload"))group_log_payload(dev.fs);
+    else if(!strcmp(argv[2],"group-independent")) {group_independent_progress(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);return 0;}
+    else if(!strcmp(argv[2],"group-independent-recovery"))group_independent_recovery(dev.fs,argc>3 && atoi(argv[3])>=10 && atoi(argv[3])<=13);
     else if(!strcmp(argv[2],"group-checkpoint-collapse")) {group_checkpoint_collapse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);return 0;}
     else if(!strcmp(argv[2],"group-checkpoint-recovery"))group_checkpoint_recovery(dev.fs);
     else if(!strcmp(argv[2],"group-quarantine") || !strcmp(argv[2],"group-quarantine-error")) {bool failed=!strcmp(argv[2],"group-quarantine-error");group_quarantine(dev.fs,failed);if(failed)return 0;}

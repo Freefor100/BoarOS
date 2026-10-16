@@ -812,8 +812,13 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         uintptr_t irq = arch_interrupt_save();
         adapter->journal_stopping = 1;
         (void)kernel_wait_queue_wake_all(&adapter->journal_work);
+        (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
         arch_interrupt_restore(irq);
         kernel_thread_join(&adapter->journal_worker);
+        if (adapter->checkpoint_started) {
+            kernel_thread_join(&adapter->checkpoint_worker);
+            adapter->checkpoint_started = 0;
+        }
         adapter->journal_started = 0;
     }
     if (adapter->mounted) {
@@ -849,7 +854,9 @@ static void journal_request(void *context)
     struct lwext4_mount_adapter *adapter = context;
     uintptr_t irq = arch_interrupt_save();
     adapter->journal_requested = 1;
+    adapter->checkpoint_requested = 1;
     (void)kernel_wait_queue_wake_all(&adapter->journal_work);
+    (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
     arch_interrupt_restore(irq);
 }
 
@@ -885,7 +892,7 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
             kind == EXT4_JOURNAL_WAIT_DURABLE ? progress.durable : progress.checkpoint;
         if (reached >= sequence) break;
         uintptr_t irq = arch_interrupt_save();
-        /* Only the worker advances completion, and it cannot run between the
+        /* Only the workers advance completion, and neither runs between the
          * disabled-IRQ predicate and queue insertion on this single hart. */
         struct jbd_journal *journal = adapter->device.fs->jbd_journal;
         if (!journal->error && journal_reached(journal, kind) < sequence) {
@@ -916,8 +923,15 @@ static void journal_worker(void *context)
         int result = EOK;
         struct ext4_journal_progress progress = {0};
         if (adapter->device.fs->jbd_journal) {
-            result = ext4_journal_group_service(adapter->mount_point, force || metadata == EAGAIN);
+            uint64_t before = adapter->device.fs->jbd_journal->durable_sequence;
+            result = ext4_journal_group_commit(adapter->mount_point, force || metadata == EAGAIN);
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+            if (progress.durable != before) {
+                irq = arch_interrupt_save();
+                adapter->checkpoint_requested = 1;
+                (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
+                arch_interrupt_restore(irq);
+            }
         }
         irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
@@ -926,13 +940,48 @@ static void journal_worker(void *context)
         uint64_t due = progress.deadline_ns;
         if (!result && adapter->times_deadline && (!due || adapter->times_deadline < due))
             due = adapter->times_deadline;
-        if (!result && (progress.ready || (due &&
+        if (!result && (progress.commit_ready || (due &&
             kernel_time_deadline_from_monotonic(due, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
         irq = arch_interrupt_save();
         if (!adapter->journal_requested && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
             if (KERNEL_WAIT_RECHECK(&adapter->journal_work, deadline, 0, &reason,
                 (!adapter->journal_requested && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        }
+        arch_interrupt_restore(irq);
+    }
+    kernel_io_context_current()->background_reclaim = 0;
+}
+
+static void journal_checkpoint_worker(void *context)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    kernel_io_context_current()->background_reclaim = 1;
+    for (;;) {
+        uintptr_t irq = arch_interrupt_save();
+        adapter->checkpoint_requested = 0;
+        int stopping = adapter->journal_stopping;
+        arch_interrupt_restore(irq);
+        if (stopping) break;
+        struct jbd_journal *journal = adapter->device.fs->jbd_journal;
+        uint64_t before = journal->checkpoint_sequence;
+        int result = ext4_journal_group_checkpoint(adapter->mount_point);
+        struct ext4_journal_progress progress;
+        if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+        irq = arch_interrupt_save();
+        (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
+        if (progress.checkpoint != before) {
+            /* Reclaim returns log/RAM credits to a commit waiting for space. */
+            adapter->journal_requested = 1;
+            (void)kernel_wait_queue_wake_all(&adapter->journal_work);
+        }
+        arch_interrupt_restore(irq);
+        if (!result && progress.checkpoint_ready) continue;
+        irq = arch_interrupt_save();
+        if (!adapter->checkpoint_requested && !adapter->journal_stopping) {
+            enum kernel_wait_wake_reason reason;
+            if (KERNEL_WAIT_RECHECK(&adapter->checkpoint_work, 0, 0, &reason,
+                (!adapter->checkpoint_requested && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
         arch_interrupt_restore(irq);
     }
@@ -947,6 +996,7 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
     if (adapter->instance.read_only) return 0;
     if (adapter->journal_started) return -KERNEL_EBUSY;
     kernel_wait_queue_init(&adapter->journal_work);
+    kernel_wait_queue_init(&adapter->checkpoint_work);
     kernel_wait_queue_init(&adapter->journal_progress);
     /* The same mount worker also owns timestamp-only writeback on writable
      * filesystems without JBD; dirty inode pins need a consumer there too. */
@@ -957,8 +1007,22 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
         int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
         if (result != EOK) return lwext4_error(result);
     }
-    enum kernel_scheduler_status status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
+    enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
+    if (adapter->device.fs->jbd_journal) {
+        status = kernel_thread_create_joinable(journal_checkpoint_worker, adapter, &adapter->checkpoint_worker);
+        if (status == KERNEL_SCHEDULER_STATUS_OK) adapter->checkpoint_started = 1;
+    }
+    if (status == KERNEL_SCHEDULER_STATUS_OK)
+        status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        if (adapter->checkpoint_started) {
+            uintptr_t irq = arch_interrupt_save();
+            adapter->journal_stopping = 1;
+            (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
+            arch_interrupt_restore(irq);
+            kernel_thread_join(&adapter->checkpoint_worker);
+            adapter->checkpoint_started = adapter->journal_stopping = 0;
+        }
         /* No operation could join while startup held this execution path. */
         if (adapter->device.fs->jbd_journal) jbd_journal_group_fini(adapter->device.fs->jbd_journal);
         return status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;

@@ -83,14 +83,17 @@ struct ext4_journal_runtime {
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);
-/* One caller owns service. Freezing and retirement use the mount lock; slow
- * device I/O uses only immutable transaction-owned images outside that lock. */
+/* A runtime supplies one consumer for each stage. Freezing and retirement use
+ * the mount lock; each consumer owns its immutable images during device I/O.
+ * service() drives either stage synchronously when no runtime is supplied. */
 int ext4_journal_group_service(const char *mount_point, bool force);
+int ext4_journal_group_commit(const char *mount_point, bool force);
+int ext4_journal_group_checkpoint(const char *mount_point);
 int ext4_journal_group_drain(const char *mount_point);
 struct ext4_journal_progress {
 	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
 	size_t memory_used, memory_peak;
-	bool ready;
+	bool ready, commit_ready, checkpoint_ready;
 	int error;
 };
 int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress);
