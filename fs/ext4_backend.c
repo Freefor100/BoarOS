@@ -9,6 +9,7 @@
 #include <kernel/file_mapping.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
+#include <kernel/irq.h>
 #include <kernel/page_cache.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -228,9 +229,13 @@ static bool vfs_realtime(struct ext4_timestamp *now)
     return true;
 }
 
-/* Timestamp updates may run on the reader's hart. One mount raw lock protects
- * the shared node values and dirty/staged lists; list pins are released only
- * after dropping that lock, since their final release may close/free a node. */
+/* SMP readers share the mount lock; a single-hart build only needs IRQ
+ * exclusion for these nonblocking updates. Final node releases stay outside. */
+#if BOAROS_MAX_CPUS > 1
+#define TIMESTAMP_SCOPE(name, adapter) KERNEL_RAW_SCOPE(name, &(adapter)->timestamp_lock)
+#else
+#define TIMESTAMP_SCOPE(name, adapter) KERNEL_IRQ_SCOPE(name); (void)(adapter)
+#endif
 static int time_compare(struct ext4_timestamp a, struct ext4_timestamp b)
 {
     if (a.seconds != b.seconds) return a.seconds < b.seconds ? -1 : 1;
@@ -318,7 +323,7 @@ static void time_dirty(struct lwext4_node *node, unsigned fields,
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
     int notify;
     {
-        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        TIMESTAMP_SCOPE(times, adapter);
         notify = time_dirty_locked(node, fields, now);
     }
     time_notify(adapter, notify);
@@ -326,7 +331,7 @@ static void time_dirty(struct lwext4_node *node, unsigned fields,
 
 static uint64_t time_deadline(struct lwext4_mount_adapter *adapter)
 {
-    KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+    TIMESTAMP_SCOPE(times, adapter);
     return adapter->times_deadline;
 }
 
@@ -334,7 +339,7 @@ static void time_stage(void *context, uint32_t inode, unsigned field,
                        struct ext4_timestamp value)
 {
     struct lwext4_mount_adapter *adapter = context;
-    KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+    TIMESTAMP_SCOPE(times, adapter);
     struct kernel_vfs_node *base = kernel_vfs_node_find(&adapter->instance, inode);
     if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         struct lwext4_node *node = (struct lwext4_node *)base;
@@ -355,7 +360,7 @@ static void time_finish(void *context, bool accepted)
     for (;;) {
         struct kernel_vfs_node *dirty_pin, *staged_pin;
         {
-            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            TIMESTAMP_SCOPE(times, adapter);
             struct lwext4_node *node = adapter->staged_times;
             if (!node) break;
             adapter->staged_times = node->staged_next;
@@ -381,7 +386,7 @@ static unsigned ext4_backend_pending_times(struct kernel_vfs_node *base,
 {
     struct lwext4_node *node = (struct lwext4_node *)base;
     struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
-    KERNEL_RAW_SCOPE(guard, &adapter->timestamp_lock);
+    TIMESTAMP_SCOPE(guard, adapter);
     memcpy(times, node->times, sizeof(node->times));
     return node->dirty_fields;
 }
@@ -394,7 +399,7 @@ static void ext4_backend_finish_times(struct kernel_vfs_node *base, unsigned fie
     struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
     struct kernel_vfs_node *dirty_pin;
     {
-        KERNEL_RAW_SCOPE(guard, &adapter->timestamp_lock);
+        TIMESTAMP_SCOPE(guard, adapter);
         for (unsigned i = 0; i < 3; i++)
             if ((fields & (1U << i)) && !time_compare(node->times[i], times[i]))
                 node->dirty_fields &= ~(1U << i);
@@ -417,21 +422,21 @@ static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait
 {
     size_t count;
     {
-        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        TIMESTAMP_SCOPE(times, adapter);
         count = adapter->dirty_times_count;
     }
     int result = EOK;
     while (count--) {
         struct kernel_vfs_node *node;
         {
-            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            TIMESTAMP_SCOPE(times, adapter);
             node = adapter->dirty_times ? &adapter->dirty_times->node : NULL;
             if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
         }
         if (!node) break;
         result = writeback_times(node, wait);
         {
-            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            TIMESTAMP_SCOPE(times, adapter);
             struct lwext4_node *current = (struct lwext4_node *)node;
             /* Newer RAM updates keep their pin without hiding other inodes
              * from this bounded flush pass. New entries join the tail. */
@@ -445,7 +450,7 @@ static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait
         if (result) break;
     }
     {
-        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        TIMESTAMP_SCOPE(times, adapter);
         adapter->times_deadline = adapter->dirty_times
             ? kernel_time_monotonic_ns() + UINT64_C(100000000) : 0;
     }
@@ -1114,7 +1119,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     }
     adapter_names(adapter);
     boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock);
+#if BOAROS_MAX_CPUS > 1
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
+#endif
     adapter->next_adapter = adapters;
     adapters = adapter;
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
@@ -1620,7 +1627,7 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
     int notify = 0;
     {
-        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        TIMESTAMP_SCOPE(times, adapter);
         if (time_compare(node->times[1], node->times[0]) >= 0 ||
             time_compare(node->times[2], node->times[0]) >= 0 ||
             now.seconds - node->times[0].seconds >= 86400)
@@ -1844,7 +1851,7 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
         struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
         struct kernel_vfs_node *dirty_pin;
         {
-            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            TIMESTAMP_SCOPE(times, adapter);
             ((struct lwext4_node *)node)->dirty_fields = 0;
             dirty_pin = time_drop_dirty((struct lwext4_node *)node);
         }

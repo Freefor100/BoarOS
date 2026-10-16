@@ -14,7 +14,9 @@ struct lwext4_mount_adapter {
     struct kernel_vfs_instance instance;
     struct kernel_block_device *block;
     struct kernel_rwlock backend_lock;
+#if BOAROS_MAX_CPUS > 1
     struct kernel_raw_lock timestamp_lock;
+#endif
     struct ext4_lock locks;
     struct kernel_thread_join journal_worker, checkpoint_worker;
     struct kernel_wait_queue journal_work, checkpoint_work, journal_progress;

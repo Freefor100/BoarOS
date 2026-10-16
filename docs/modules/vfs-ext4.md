@@ -518,7 +518,7 @@ metadata 位于独立 heap/allocator，不注册系统压力 hook；普通缓存
 并按当前 EOF 确定有效长度；已完成的热页在同一保护内取得物理引用，无需先取得 inode 读资格或排队。
 不满足资格时转入既有 inode 读保护路径；loading 页仍由 entry 借用跨等待持有。
 MM 取得来源页前后仍核对映射 epoch，最终提交 PTE 前重新取得 inode 资格，复查来源 epoch、VMA 身份和 EOF。
-CPU0受控MM任务同样把冷读交给普通CPU0 worker，不能借逻辑CPU号绕过业务域。普通read/readv/pread在调用hart消费热页并复制用户数据，不再整次排队；共享offset在调用者取得，写入、seek和同步也在排队前取得同一资格，CPU0回调只借用。运行时时间戳的共享值、dirty/staged链及deadline由一把挂载raw锁维护，实际编码与提交仍归CPU0；可选预读队列亦由缓存保护，取消后的节点由CPU0 worker锁外释放。
+CPU0受控MM任务同样把冷读交给普通CPU0 worker，不能借逻辑CPU号绕过业务域。普通read/readv/pread在调用hart消费热页并复制用户数据，不再整次排队；共享offset在调用者取得，写入、seek和同步也在排队前取得同一资格，CPU0回调只借用。SMP 运行时时间戳的共享值、dirty/staged链及deadline由一把挂载raw锁维护；单 hart 构建的这些短更新不阻塞，只需 IRQ 保护，不维护跨核锁。实际编码与提交仍归CPU0；可选预读队列亦由缓存保护，取消后的节点由CPU0 worker锁外释放。
 停止先拒绝新请求，已执行读取完成后才归还请求现场，未执行请求返回 STATE。
 `make test-page-cache-concurrency-host` 链接真实 VFS/lwext4 和镜像块读写，在4/16 KiB、
 2/4宿主线程下检查冷读合并、64页扩容/预热命中、读失败、停止交接、1/8/32别名、
