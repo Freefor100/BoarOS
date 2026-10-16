@@ -151,25 +151,57 @@ struct cache_guard {
     struct kernel_lock_guard lock;
     uintptr_t irq;
     int controlled, active;
+#if BOAROS_USER_SMP
+    int irq_saved;
+#endif
 };
+static int cache_shared_metadata(const struct kernel_page_cache *cache)
+{
+#if BOAROS_USER_SMP
+    (void)cache;
+    return 1;
+#else
+    return cache->record->controlled;
+#endif
+}
 static void cache_unlock(struct cache_guard *guard)
 {
     if (!guard->active) return;
     if (guard->controlled) kernel_lock_release(&guard->lock);
     else arch_interrupt_restore(guard->irq);
+#if BOAROS_USER_SMP
+    if (guard->irq_saved) arch_interrupt_restore(guard->irq);
+#endif
     guard->active = 0;
 }
 /* guard必须在最终存储地址初始化：锁owner链不能指向返回值临时对象。 */
-static void cache_guard_begin(struct kernel_page_cache *cache, struct cache_guard *guard)
+static void cache_metadata_guard_begin(struct kernel_page_cache *cache, struct cache_guard *guard)
 {
-    guard->controlled = cache->record->controlled;
+    guard->controlled = cache_shared_metadata(cache);
     guard->active = 1;
+#if BOAROS_USER_SMP
+    /* 普通CPU0游标仍依赖原IRQ排他；另用同一mutex排除远端resident查找。 */
+    if (!cache->record->controlled) {
+        guard->irq=arch_interrupt_save();
+        guard->irq_saved=1;
+    }
+#endif
     if (guard->controlled) kernel_mutex_lock(&cache->record->metadata, &guard->lock);
     else { kernel_assert_service_context(); guard->irq = arch_interrupt_save(); }
+}
+static void cache_guard_begin(struct kernel_page_cache *cache, struct cache_guard *guard)
+{
+#if BOAROS_USER_SMP
+    if (!cache->record->controlled) kernel_assert_service_context();
+#endif
+    cache_metadata_guard_begin(cache,guard);
 }
 #define CACHE_SCOPE(name, cache) \
     struct cache_guard name __attribute__((cleanup(cache_unlock))) = {0}; \
     cache_guard_begin((cache), &name)
+#define CACHE_METADATA_SCOPE(name, cache) \
+    struct cache_guard name __attribute__((cleanup(cache_unlock))) = {0}; \
+    cache_metadata_guard_begin((cache), &name)
 
 struct read_workspace {
     struct file_read_workspace backend;
@@ -741,6 +773,11 @@ static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_
 static void remove_entry(struct kernel_page_cache *cache,
                          struct kernel_page_cache_entry *entry)
 {
+#if BOAROS_USER_SMP
+    /* 普通CPU0回收者也与远端resident查找共用索引资格；已持有者只借用。 */
+    struct cache_guard guard __attribute__((cleanup(cache_unlock))) = {0};
+    if (!kernel_lock_held(&cache->record->metadata.lock,1)) cache_guard_begin(cache,&guard);
+#endif
     if (entry->aliases != 0 || entry->loading || (entry->users && !cache->record->controlled)) __builtin_trap();
     if (entry->retired) __builtin_trap();
     entry->retired=1;
@@ -1357,6 +1394,58 @@ static int read_entry_ready(struct kernel_page_cache *cache,struct kernel_page_c
          !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED));
 }
 
+enum kernel_page_cache_status kernel_page_cache_try_resident_batch(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
+    struct kernel_page_cache_read_page *pages,size_t count)
+{
+    if (!cache_live(cache) || count>KERNEL_PAGE_CACHE_READ_BATCH_MAX ||
+        (count && (!pages || first>UINT64_MAX>>BOAROS_PAGE_SHIFT ||
+            count-1>(UINT64_MAX>>BOAROS_PAGE_SHIFT)-first)))
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
+    if (!cache_shared_metadata(cache)) return KERNEL_PAGE_CACHE_STATUS_BUSY;
+    KERNEL_LOCK_SCOPE(guard);
+    if (!kernel_mutex_try_lock(&cache->record->metadata,&guard))
+        return KERNEL_PAGE_CACHE_STATUS_BUSY;
+    uint64_t epoch;
+    if (kernel_file_mapping_epoch(node,&epoch)) return KERNEL_PAGE_CACHE_STATUS_BUSY;
+    uint64_t size=kernel_vfs_node_size(node);
+    enum kernel_page_cache_status result=KERNEL_PAGE_CACHE_STATUS_OK;
+    size_t borrowed=0;
+    for (;borrowed<count;borrowed++) {
+        struct kernel_page_cache_read_page *page=&pages[borrowed];
+        uint64_t offset=(first+borrowed)<<BOAROS_PAGE_SHIFT;
+        if (offset>=size) {
+            *page=(struct kernel_page_cache_read_page){.status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE};
+            continue;
+        }
+        struct kernel_page_cache_entry *entry;
+        result=lookup_entry(cache,file,first+borrowed,&entry);
+        if (result) break;
+        if (!read_entry_ready(cache,entry) ||
+            (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
+            result=KERNEL_PAGE_CACHE_STATUS_BUSY;
+            break;
+        }
+        if (physical_page_acquire(cache->allocator,entry->physical_address)) __builtin_trap();
+        *page=(struct kernel_page_cache_read_page){.physical_address=entry->physical_address,
+            .valid_bytes=size-offset<BOAROS_PAGE_SIZE?(size_t)(size-offset):BOAROS_PAGE_SIZE,
+            .status=KERNEL_PAGE_CACHE_STATUS_OK};
+        /* 远端不改变CPU0的LRU游标；实际物理引用允许entry在复制期间退休。 */
+        cache->record->statistics.hits++;
+    }
+    if (result) {
+        /* 全热批次才交付借用。miss仍由原调用现场继续，不留下半批owner。 */
+        for (size_t i=0;i<borrowed;i++) if (!pages[i].status) {
+            if (physical_page_release(cache->allocator,pages[i].physical_address)) __builtin_trap();
+            pages[i]=(struct kernel_page_cache_read_page){.status=result};
+        }
+    }
+    return result;
+}
+
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t index, uint64_t *address, size_t *valid)
@@ -1520,7 +1609,7 @@ static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel
 void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie)
 {
     if (!cache_live(cache) || !cookie) return;
-    CACHE_SCOPE(cancel, cache);
+    CACHE_METADATA_SCOPE(cancel, cache);
     struct kernel_page_cache_record *r = cache->record;
     for (unsigned i = 0; i < 8; i++) {
         struct readahead_job *job = &r->readahead_jobs[i];
@@ -1533,7 +1622,7 @@ uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t first, uint64_t cookie)
 {
     if (!cache_live(cache) || !node || first > UINT64_MAX >> BOAROS_PAGE_SHIFT) return 0;
-    CACHE_SCOPE(publish, cache);
+    CACHE_METADATA_SCOPE(publish, cache);
     struct kernel_page_cache_record *r = cache->record;
     if (!r->readahead_started || r->stopping || physical_page_available(cache->allocator) <= r->low ||
         (first << BOAROS_PAGE_SHIFT) >= kernel_vfs_node_size(node)) {

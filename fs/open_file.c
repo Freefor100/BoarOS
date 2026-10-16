@@ -615,6 +615,23 @@ enum kernel_open_file_status kernel_open_file_acquire(
     }
 }
 
+#if BOAROS_USER_SMP
+int kernel_open_file_release_nonfinal(struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file = *owner;
+    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (!references || references == UINT32_MAX) __builtin_trap();
+        if (references == 1) return 0;
+        if (__atomic_compare_exchange_n(&file->references, &references, references - 1,
+            1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            *owner = NULL;
+            return 1;
+        }
+    }
+}
+#endif
+
 enum kernel_open_file_status kernel_open_file_release(
     struct kernel_open_file_description **owner)
 {

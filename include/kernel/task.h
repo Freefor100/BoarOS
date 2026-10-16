@@ -102,6 +102,11 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(
 enum kernel_task_status kernel_task_files_borrow(
     struct kernel_task *task,
     struct kernel_files **files);
+#if BOAROS_USER_SMP
+/* 当前执行owner固定handle；仅FD数据读借用，不读取fs业务状态或改rlimit。 */
+enum kernel_task_status kernel_task_read_resources_borrow(
+    struct kernel_task *, struct kernel_files **, struct kernel_mm **);
+#endif
 
 enum kernel_task_status kernel_task_fs_context_borrow(
     const struct kernel_task *task,

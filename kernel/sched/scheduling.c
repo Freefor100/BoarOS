@@ -160,12 +160,15 @@ int kernel_scheduler_user_service_active(void)
 #endif
 }
 
-void kernel_scheduler_enter_user_service(void)
-{
 #if BOAROS_USER_SMP
+static void enter_user_service(const struct kernel_lock_guard *borrowed)
+{
     kernel_assert_can_block();
     struct kernel_io_context *io = kernel_io_context_current();
-    if (io->locks || io->user_pins || io->backend_depth) __builtin_trap();
+    if (io->locks != borrowed || io->user_pins || io->cache_writes || io->backend_depth ||
+        kernel_cpu_current()->raw_locks || (borrowed &&
+        (borrowed->owner != io || borrowed->previous || !borrowed->write ||
+         !borrowed->lock || !kernel_lock_held(borrowed->lock, 1)))) __builtin_trap();
     uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = kernel_cpu_current()->current;
     if (!task || !task->arch.user_mode || !task->wait.on_cpu) __builtin_trap();
@@ -200,6 +203,18 @@ void kernel_scheduler_enter_user_service(void)
     /* 先消费通知，再处理业务；之后到达的通知留给下一返回检查。 */
     (void)__atomic_exchange_n(&task->user_service_pending, 0, __ATOMIC_ACQ_REL);
     arch_interrupt_restore(irq);
+}
+
+void kernel_scheduler_enter_user_service_borrowing(const struct kernel_lock_guard *borrowed)
+{
+    enter_user_service(borrowed);
+}
+#endif
+
+void kernel_scheduler_enter_user_service(void)
+{
+#if BOAROS_USER_SMP
+    enter_user_service(NULL);
 #endif
 }
 

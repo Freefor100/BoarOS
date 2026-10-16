@@ -430,6 +430,35 @@ enum kernel_syscall_status syscall_handle_pipe2(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+#if BOAROS_USER_SMP
+enum kernel_syscall_status kernel_syscall_try_local_read(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int *handled)
+{
+    *handled = 0;
+    enum kernel_files_read_kind kind;
+    switch (request->number) {
+    case 63U: kind = KERNEL_FILES_READ; break;
+    case 65U: kind = KERNEL_FILES_READV; break;
+    case 67U: kind = KERNEL_FILES_PREAD; break;
+    default: return KERNEL_SYSCALL_STATUS_OK;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (kind == KERNEL_FILES_PREAD && request->arguments[3] > INT64_MAX)
+        return KERNEL_SYSCALL_STATUS_OK;
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    enum kernel_task_status status = kernel_task_read_resources_borrow(caller, &files, &mm);
+    if (status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE)
+        return KERNEL_SYSCALL_STATUS_OK;
+    if (status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    return kernel_files_try_local_read(files, mm, kind, (int64_t)request->arguments[0],
+        request->arguments[1], request->arguments[2], (int64_t)request->arguments[3],
+        handled, &decoded->value) == KERNEL_FILES_STATUS_OK ? KERNEL_SYSCALL_STATUS_OK :
+        KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+}
+#endif
+
 enum kernel_syscall_status syscall_handle_read(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

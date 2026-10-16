@@ -426,7 +426,7 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
-LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_get_page,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output
+LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_get_page,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_try_pin_user_page,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_scheduler_enter_user_service_borrowing,--wrap=kernel_mm_fork
 endif
 ifeq ($(SMP_TEST),1)
 ifeq ($(MM_SMP_TEST),1)
@@ -2330,11 +2330,13 @@ run-user-smp-riscv: kernel-rv-user-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp/kernel-rv
 test-user-smp-host:
 	@mkdir -p build/host/mm
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_next_owned,--wrap=physical_page_allocate,--wrap=physical_page_resolve -o build/host/mm/remote-user
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_next_owned,--wrap=physical_page_allocate,--wrap=physical_page_resolve -o build/host/mm/remote-user
 	timeout 30s build/host/mm/remote-user
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c fs/tmpfs.c fs/open_file.c fs/file_mapping.c fs/record_lock.c kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release -o build/host/mm/remote-source-release
+	timeout 30s build/host/mm/remote-source-release
 
 .PHONY: test-user-smp-riscv
 USER_SMP_ELF := build/riscv-user-smp/user-smp-rv

@@ -94,6 +94,14 @@ struct kernel_mm_user_pin {
 enum kernel_mm_status kernel_mm_pin_user_page(
     const struct kernel_mm *, uint64_t address, uint32_t access,
     struct kernel_mm_user_pin *);
+#if BOAROS_USER_SMP
+/* 真实远端用户的resident-only复制；仅当前绑定remote_user MM可用。
+ * 不等待gate/许可，不fault或处理COW；需CPU0继续时返回CONFLICT且不接纳pin。
+ * 成功pin参加fork/mprotect撤权排空，复制后由同owner归还，无需重取gate。 */
+enum kernel_mm_status kernel_mm_try_pin_user_page(
+    const struct kernel_mm *, uint64_t address, uint32_t access,
+    struct kernel_mm_user_pin *);
+#endif
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 
 /* Success creates another independently owned reference to the same MM. */

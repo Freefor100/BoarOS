@@ -2389,6 +2389,23 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+#if BOAROS_USER_SMP
+enum kernel_task_status kernel_task_read_resources_borrow(
+    struct kernel_task *task, struct kernel_files **files, struct kernel_mm **mm)
+{
+    if (!files || !mm || !kernel_task_has_user_context(task))
+        return KERNEL_TASK_STATUS_STATE;
+    if (task->files.state == KERNEL_FILES_EMPTY)
+        return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    if (task->files.state != KERNEL_FILES_LIVE || !task->files.record ||
+        !task->files.heap || task->mm.state != KERNEL_MM_LIVE)
+        return KERNEL_TASK_STATUS_STATE;
+    *files = &task->files;
+    *mm = &task->mm;
+    return KERNEL_TASK_STATUS_OK;
+}
+#endif
+
 void kernel_task_prepare_user_return(void)
 {
     if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK)

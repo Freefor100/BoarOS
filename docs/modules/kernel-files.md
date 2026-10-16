@@ -37,6 +37,10 @@ pipe启用前核对槽引用覆盖全部OFD引用、不同OFD覆盖全部端点�
 这个私有启用检查最多 O(capacity²)，不在 FD raw 内扫描，不加入常见 lookup/close 路径。
 受控任务的MM/files引用在发布前准备，退出后在可信栈归还。命名FIFO、socket/epoll、路径/挂载、记录锁及sendfile业务不随普通OFD接纳开放。
 
+`USER_SMP`的普通用户`read/pread/readv`另有驻留尝试入口。它只借用当前任务自己的MM/files句柄，在原FD raw内查槽并取得真实OFD pin，不对普通表调用受控域启用接口。普通磁盘文件的缓存批次一次取得metadata保护，核对尺寸和缓存代次并固定全部成功页；目标用户页以resident-only pin复制，不在发起hart处理缺页或COW。小iovec也先尝试驻留导入，需缺页或较大控制缓冲时交回CPU0。
+
+缺缓存、用户页需fault或操作不支持时，原任务到CPU0执行原业务。若已经复制了前缀，归还全部缓存引用和用户pin后保留原游标继续；`read/readv`的同一个offset guard从开始到完成一直持有，迁移只借用这份唯一资格，不能让另一个reader或seek插入。`pread`保持独立位置。fd关闭或复用不改变已pin的文件；本地只归还非末次OFD引用，成为最后owner时由同一任务到CPU0完成后端释放。信号和返回准备沿原syscall协议处理。实际执行位置及受控文件任务的区别见[RV两核](riscv-smp.md#普通文件io的执行位置)。
+
 tmpfs读写、定位I/O及offset在调用核执行。受控ext4的read/readv/pread先在调用核取得热缓存页并复制用户数据，仅未完成的缓存项交现有CPU0 worker装入；写入、元数据及同步操作仍由该worker执行。
 请求持调用现场的OFD pin及MM/files owner，不按fd数字重新查找；参数、导入iov及结果地址在DONE和worker借用结束前不能退栈。
 使用共享offset的操作在提交前取得原有rank10 mutex，CPU0回调借用这次资格，结束后仍由调用者归还；不能先排入CPU0再等待该锁，否则会阻挡持锁读者的冷读请求。借锁入口只接受调用者唯一持有的指定write guard。其他对象保护、用户pin或缓存写入借用不允许跨提交，违反返回STATE且不发布请求。回调在cache mutex外、普通CPU0上下文执行，不绑定调用者MM。

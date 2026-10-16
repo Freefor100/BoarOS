@@ -78,5 +78,9 @@ enum kernel_open_file_status kernel_open_file_create_epoll(
  * a real cleanup failure leaves a retry owner, as for other final OFDs. */
 enum kernel_open_file_status kernel_open_file_detach(
     struct kernel_open_file_description **owner);
+#if BOAROS_USER_SMP
+/* 成功只归还非末引用；末owner留给同一调用者迁CPU0执行真实清理。 */
+int kernel_open_file_release_nonfinal(struct kernel_open_file_description **owner);
+#endif
 
 #endif
