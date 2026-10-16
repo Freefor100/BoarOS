@@ -3954,8 +3954,11 @@ static enum kernel_mm_status resolve_user_fault_once(
             publish_file_resident(record, resident);
             pin.created = 0;
         } else {
-            if (resident->alias.previous != 0)
+            if (resident->alias.previous != 0) {
                 kernel_page_cache_alias_detach(&resident->alias);
+                if (node_guard.lock) kernel_lock_release(&node_guard);
+                kernel_page_cache_alias_drain(&resident->alias);
+            }
             (void)kernel_heap_release(record->vma_heap, resident);
         }
         if (status == KERNEL_MM_STATUS_OK &&
@@ -4090,9 +4093,7 @@ enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *mm,
     if (status) return status;
     KERNEL_RAW_SCOPE(guard,&record->metadata);
     return mm->state==KERNEL_MM_LIVE && record->concurrent &&
-        record->vma_heap==heap && mm->allocator==heap->page_allocator &&
-        !mm->allocator->reclaimer && !mm->allocator->pressure_notify &&
-        !mm->allocator->pressure_wait
+        record->vma_heap==heap && mm->allocator==heap->page_allocator
         ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_STATE;
 }
 
@@ -4976,8 +4977,7 @@ enum kernel_mm_status kernel_mm_enable_concurrency(struct kernel_mm *mm)
     enum kernel_mm_status status = resolve_record(mm, &record);
     if (status != KERNEL_MM_STATUS_OK) return status;
     if (mm->state != KERNEL_MM_LIVE || __atomic_load_n(&record->references, __ATOMIC_ACQUIRE) != 1 || record->concurrent ||
-        !record->vmas || record->elf_sources || record->executable_file ||
-        mm->allocator->reclaimer || mm->allocator->pressure_notify)
+        !record->vmas || record->elf_sources || record->executable_file)
         return KERNEL_MM_STATUS_STATE;
     for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas); i++) {
         struct kernel_vma vma;

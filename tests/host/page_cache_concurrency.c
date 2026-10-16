@@ -1983,13 +1983,13 @@ int main(int argc, char **argv)
         !physical_page_allocator_finalize(&backend_pages) &&
         !kernel_heap_init(&backend_heap,&backend_pages,page_address));
     uint64_t backend_baseline=physical_page_available(&backend_pages);
-    assert(!kernel_page_cache_init_controlled(&cache, &heap, &pages));
+    assert(!kernel_page_cache_init(&cache, &heap, &pages));
     struct kernel_page_cache_concurrency_state sizes;
     kernel_page_cache_get_concurrency_state(&cache, &sizes);
     printf("cache sizes: entry=%zu record=%zu request=%zu\n", sizes.entry_bytes, sizes.record_bytes, sizes.request_bytes);
-    assert(!pages.reclaimer && !pages.pressure_notify && !pages.pressure_wait &&
-        !pages.cache_snapshot && !pages.cache_context);
-    assert(kernel_page_cache_init_controlled(&cache, &heap, &pages) ==
+    assert(pages.reclaim_hooks.reclaim && pages.reclaim_hooks.notify && pages.reclaim_hooks.wait &&
+        pages.reclaim_hooks.snapshot && pages.reclaim_hooks.context);
+    assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc == 2) {
         cold_case(&cache, &heap, &pages, argv[1], 2);
@@ -2004,6 +2004,6 @@ int main(int argc, char **argv)
     kernel_heap_get_statistics(&backend_heap,&backend_stats);
     assert(!backend_stats.live_allocations && !backend_stats.current_pages &&
         physical_page_available(&backend_pages)==backend_baseline && !physical_page_allocator_audit(&backend_pages));
-    puts("PASS controlled cache construction: no pressure hook, private publication, owner return");
+    puts("PASS ordinary cache construction: real pressure hooks, shared protection, owner return");
     return 0;
 }

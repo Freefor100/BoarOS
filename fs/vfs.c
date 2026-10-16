@@ -1170,8 +1170,6 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
                                  struct kernel_vfs_file *file, uint64_t size)
 {
     uint64_t old_size = node->size;
-    if (size > old_size && node->instance->page_cache)
-        kernel_page_cache_extend(node->instance->page_cache, node, old_size, size);
     node->size = size;
     file->size = node->size;
     if (node->size < old_size && !node->memory) {
@@ -1412,7 +1410,7 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
         kernel_file_mapping_open(node);
         return result;
     }
-    if (node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache)) {
+    if (node->instance->page_cache != NULL) {
         kernel_assert_service_context();
         struct kernel_page_cache *cache = node->instance->page_cache;
         uint64_t old_size = node->size;
@@ -2275,9 +2273,6 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
         struct kernel_vfs_node *node = snapshot.nodes[i];
         if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG || !instance->page_cache)
             continue;
-        KERNEL_LOCK_SCOPE(node_guard);
-        if (!kernel_page_cache_is_controlled(instance->page_cache))
-            kernel_vfs_node_lock(node, &node_guard, 0);
         int error = kernel_page_cache_writeback(instance->page_cache, node);
         if (error && error != -KERNEL_ENOMEM && error != -KERNEL_EBUSY)
             kernel_vfs_record_writeback_error(node, error);
@@ -2409,15 +2404,15 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
     kernel_vfs_node_lock(node, &node_guard, 0);
     result = 0;
     if (node->instance->read_only) goto observe;
-    int controlled = node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache);
-    if (controlled) kernel_assert_service_context();
-    if (controlled && node_guard.lock) kernel_lock_release(&node_guard);
+    int cached = node->instance->page_cache != NULL;
+    if (cached) kernel_assert_service_context();
+    if (cached && node_guard.lock) kernel_lock_release(&node_guard);
     result = !node->instance->page_cache ? 0 : start == 0U && end == UINT64_MAX
         ? kernel_page_cache_writeback(node->instance->page_cache, node)
         : kernel_page_cache_writeback_range(node->instance->page_cache,
                                             node, start, end);
     if (result == 0) {
-        if (controlled) kernel_vfs_node_lock(node, &node_guard, 0);
+        if (cached) kernel_vfs_node_lock(node, &node_guard, 0);
         result = node->instance->ops->sync_metadata(node, data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR);
         if (result != 0) kernel_vfs_record_writeback_error(node, result);
     }

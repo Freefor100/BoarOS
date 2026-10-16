@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/irq.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/mm.h>
 #include <kernel/open_file.h>
@@ -635,6 +636,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
     uint64_t offset=count?spans[0].offset:0;
     const void *buffer=count?spans[0].buffer:NULL;
     if (instance_hold && kernel_io_context_current()->background_reclaim) {
+        KERNEL_IRQ_SCOPE(block_irq);
         for (unsigned i = 0; i < 2; i++) if (node == instance_nodes[i] && !instance_entered[i]) {
             instance_entered[i] = 1;
             enum kernel_wait_wake_reason reason;
@@ -642,6 +644,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
         }
     }
     if (stop_probe && kernel_io_context_current()->background_reclaim) {
+        KERNEL_IRQ_SCOPE(block_irq);
         stop_probe = 0;
         stop_pages = count;
         stop_entered = 1;
@@ -1015,6 +1018,18 @@ static void instance_write(struct kernel_page_cache *c, struct kernel_vfs_file *
                                       &written) == 0 && written == sizeof(payload), 182);
     }
 }
+static void wait_cache_pressure(void)
+{
+    struct physical_page_reclaim_hooks hooks;
+    {
+        KERNEL_RAW_SCOPE(binding,&allocator.lock);
+        hooks=allocator.reclaim_hooks;
+        check(hooks.wait && hooks.retain && hooks.release,185);
+        hooks.retain(hooks.context);
+    }
+    hooks.wait(hooks.context);
+    hooks.release(hooks.context);
+}
 static void instance_waiter(void *unused)
 {
     (void)unused;
@@ -1027,7 +1042,7 @@ static void instance_waiter(void *unused)
         held++;
     }
     instance_waiting = 1;
-    allocator.pressure_wait(allocator.pressure_context);
+    wait_cache_pressure();
     instance_wait_done = 1;
     while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 184);
 }
@@ -1050,8 +1065,17 @@ static void cache_instances_probe(void)
     struct kernel_vfs_file files[2] = {{0}, {0}};
     struct kernel_page_cache_statistics a, b, a_after, b_after;
     struct kernel_memory_statistics memory;
+    /* 干净回收不再承担写盘；先完成现有脏页，再检查回收归还。 */
+    uint64_t observed=kernel_vfs_mount_error_sequence(&mount);
+    check(!kernel_vfs_sync_mount(&mount,&observed),212);
     (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     kernel_page_cache_get_statistics(&cache, &a);
+    if (a.current_pages) {
+        kernel_memory_snapshot(&allocator,&memory);
+        virt_uart_puts("cache clean reclaim remaining=");virt_uart_put_hex(a.current_pages);
+        virt_uart_puts(" dirty=");virt_uart_put_hex(memory.dirty);
+        virt_uart_puts(" writeback=");virt_uart_put_hex(memory.writeback);virt_uart_putc('\n');
+    }
     check(!a.current_pages, 186);
     check(kernel_page_cache_init(&instance_peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
           kernel_vfs_create(&mount, "/instance-root", 0600, &files[0]) == 0 &&
@@ -1083,8 +1107,8 @@ static void cache_instances_probe(void)
     check(returned==idle && !memory.reclaimable && memory.cached==4*4096, 191);
     for(unsigned i=0;i<2;i++)for(unsigned j=0;j<2;j++)
         check(physical_page_release(&allocator,pins[i][j])==PHYSICAL_PAGE_STATUS_OK, 191);
-    check(allocator.reclaimer(allocator.reclaimer_context, 1) == 1 &&
-          allocator.reclaimer(allocator.reclaimer_context, 1) == 1, 191);
+    check(allocator.reclaim_hooks.reclaim(allocator.reclaim_hooks.context, 1) == 1 &&
+          allocator.reclaim_hooks.reclaim(allocator.reclaim_hooks.context, 1) == 1, 191);
     kernel_page_cache_get_statistics(&cache, &a);
     kernel_page_cache_get_statistics(&instance_peer, &b);
     check(a.current_pages == 1 && b.current_pages == 1, 192);
@@ -1152,9 +1176,9 @@ static void cache_instances_probe(void)
         }
         kernel_thread_join(&waiter); kernel_thread_join(&stopper);
         instance_hold = 0;
-        check(instance_stop_done && allocator.pressure_wait && allocator.pressure_notify, 204);
+        check(instance_stop_done && allocator.reclaim_hooks.wait && allocator.reclaim_hooks.notify, 204);
         /* peer 注销后，真实 root worker 仍能收到压力请求并完成。 */
-        allocator.pressure_wait(allocator.pressure_context);
+        wait_cache_pressure();
         kernel_page_cache_stop_worker(&cache);
         (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     }
@@ -1184,14 +1208,14 @@ static void background_writeback_probe(void *unused)
     struct kernel_page_cache peer = {0};
     check(kernel_page_cache_init(&peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
           kernel_page_cache_start_worker(&peer) == 0, 163);
-    allocator.pressure_wait(allocator.pressure_context);
+    wait_cache_pressure();
     kernel_page_cache_stop_worker(&peer);
-    check(allocator.pressure_wait && allocator.pressure_notify, 164);
+    check(allocator.reclaim_hooks.wait && allocator.reclaim_hooks.notify, 164);
     check(kernel_page_cache_destroy(&peer) == KERNEL_PAGE_CACHE_STATUS_OK, 165);
-    check(allocator.pressure_wait && allocator.pressure_notify, 166);
+    check(allocator.reclaim_hooks.wait && allocator.reclaim_hooks.notify, 166);
 
     /* 没有候选的一轮必须返回并休眠，不能自行反复扫描。 */
-    allocator.pressure_wait(allocator.pressure_context);
+    wait_cache_pressure();
     struct kernel_page_cache_statistics empty_before, empty_after;
     kernel_page_cache_get_statistics(&cache, &empty_before);
     for (unsigned i = 0; i < 8; i++)
@@ -1390,6 +1414,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     uint32_t references;
     check(physical_page_reference_count(&allocator, inserted_page, &references) == PHYSICAL_PAGE_STATUS_OK && references == 1, 70);
     kernel_page_cache_alias_detach(&alias);
+    kernel_page_cache_alias_drain(&alias);
     check(kernel_vfs_sync(&file, 0, &sequence) == 0, 27);
     check(kernel_vfs_create(&mount, "/orphan", 0600, &orphan) == 0 &&
           kernel_vfs_pwrite(&orphan, 0, payload, sizeof(payload), &written) == 0 &&

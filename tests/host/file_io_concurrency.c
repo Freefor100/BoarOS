@@ -514,7 +514,7 @@ int main(int argc,char **argv)
         parallel_case(&heap,memory,0,actors,append);
     assert(!kernel_vfs_unmount(memory));
     image=open(argv[1],O_RDWR); assert(image>=0); struct stat info; assert(!fstat(image,&info));
-    struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init_controlled(&cache,&heap,&pages));
+    struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init(&cache,&heap,&pages));
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=flush_image,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));

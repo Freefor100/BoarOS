@@ -676,7 +676,7 @@ static void parallel_allocator(void)
             physical_page_allocator_bind_access(&arena, arena_access) == PHYSICAL_PAGE_STATUS_OK &&
             physical_page_allocator_finalize(&arena) == PHYSICAL_PAGE_STATUS_OK &&
             kernel_heap_init(&heap, &arena, arena_physical) == KERNEL_HEAP_STATUS_OK, "arena-initialize");
-    require(!arena.reclaimer && !arena.pressure_notify && !arena.pressure_wait, "arena-no-pressure");
+    require(!arena.reclaim_hooks.reclaim && !arena.reclaim_hooks.notify && !arena.reclaim_hooks.wait, "arena-no-pressure");
     uint64_t available = physical_page_available(&arena);
     require(physical_page_allocate(&arena, &shared_page) == PHYSICAL_PAGE_STATUS_OK, "arena-shared-owner");
     kernel_mutex_init(&model, 1, (uintptr_t)&model);

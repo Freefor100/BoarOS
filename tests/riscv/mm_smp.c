@@ -823,7 +823,7 @@ static void prepare_mm(void)
         kernel_heap_init(&heap, &arena, physical) == KERNEL_HEAP_STATUS_OK, "mm-private-arena");
     arena_baseline = physical_page_available(&arena);
 #if BOAROS_MM_DISK_TEST
-    require(!kernel_page_cache_init_controlled(&disk_cache,&heap,&arena) &&
+    require(!kernel_page_cache_init(&disk_cache,&heap,&arena) &&
         !kernel_vfs_mount_ext4(&disk_mount,disk_backend,disk_backend_heap,&disk_cache,0),"disk-private-cache-mount");
     file_mount=&disk_mount;
     int opened=kernel_open_file_create(&heap,file_mount,"/controlled",&file_controller,&error);

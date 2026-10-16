@@ -155,17 +155,18 @@ static unsigned heap_case(unsigned at, unsigned release, unsigned fresh)
     return count;
 }
 static unsigned pressure_notified, pressure_reclaimed, pressure_waited;
+static uintptr_t pressure_irq;
 static uint64_t pressure_page;
 static void pressure_notify(void *context)
 {
     assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
-    assert(context == &allocator && !allocator_test_irq_enabled);
+    assert(context == &allocator && allocator_test_irq_enabled == pressure_irq);
     pressure_notified++;
 }
 static uint64_t pressure_reclaim(void *context, uint64_t needed)
 {
     assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
-    assert(context == &allocator && needed == 1 && !allocator_test_irq_enabled);
+    assert(context == &allocator && needed == 1 && allocator_test_irq_enabled == pressure_irq);
     pressure_reclaimed++;
     uint64_t unused;
     /* 同任务递归必须返回真实 EMPTY，不能再次进入回收器。 */
@@ -175,7 +176,7 @@ static uint64_t pressure_reclaim(void *context, uint64_t needed)
 static void pressure_wait(void *context)
 {
     assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
-    assert(context == &allocator && !allocator_test_irq_enabled);
+    assert(context == &allocator && allocator_test_irq_enabled == pressure_irq);
     assert(contexts[0].reclaim_depth == 0);
     pressure_waited++;
     /* 模拟 callback 持有 group 引用后显式睡眠；其他任务可正常分配、
@@ -186,9 +187,6 @@ static void pressure_wait(void *context)
     assert(physical_page_allocate(&allocator, &temporary) == 0);
     assert(physical_page_release(&allocator, temporary) == 0);
     assert(physical_page_allocator_clear_reclaimer(&allocator) == 0);
-    allocator.pressure_notify = 0;
-    allocator.pressure_wait = 0;
-    allocator.pressure_context = 0;
     current_task = 0;
 }
 static uint32_t *reclaim_depth(void) { return &contexts[current_task].reclaim_depth; }
@@ -201,13 +199,12 @@ static void pressure_case(uintptr_t enabled)
         assert(physical_page_allocate(&allocator, &pages[count++]) == 0);
     }
     pressure_page = pages[--count];
-    assert(physical_page_allocator_set_reclaimer(&allocator, pressure_reclaim, &allocator) == 0);
-    allocator.reclaim_depth = reclaim_depth;
-    allocator.pressure_context = &allocator;
-    allocator.pressure_notify = pressure_notify;
-    allocator.pressure_wait = pressure_wait;
+    assert(physical_page_allocator_set_reclaimer(&allocator, &(struct physical_page_reclaim_hooks){
+        .reclaim=pressure_reclaim,.notify=pressure_notify,.wait=pressure_wait,
+        .depth=reclaim_depth,.context=&allocator}) == 0);
     pressure_notified = pressure_reclaimed = pressure_waited = 0;
     allocator_test_irq_enabled = enabled;
+    pressure_irq = enabled;
     uint64_t page;
     assert(physical_page_allocate(&allocator, &page) == 0);
     assert(allocator_test_irq_enabled == enabled);

@@ -353,13 +353,9 @@ enum physical_page_status physical_page_allocator_init(
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
 
-    result.pressure_notify = 0;
     kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_PAGE);
-    result.pressure_wait = 0;
-    result.pressure_context = 0;
+    result.reclaim_hooks = (struct physical_page_reclaim_hooks){0};
     result.shared_anon_pages = 0;
-    result.cache_snapshot = 0;
-    result.cache_context = 0;
     result.buffer_bytes = 0;
     result.buffer_context = 0;
     result.total_pages = 0U;
@@ -374,10 +370,7 @@ enum physical_page_status physical_page_allocator_init(
     result.initialized = 0U;
     result.finalized = 0U;
     result.reclaiming = 0U;
-    result.reclaim_depth = 0;
     result.access = 0;
-    result.reclaimer = 0;
-    result.reclaimer_context = 0;
     result.metadata = 0;
     result.roots = 0;
     result.tree = 0;
@@ -1250,6 +1243,22 @@ physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t or
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+/* 绑定在allocator短锁内固定；卸载只摘绑定，实际后备由本次借用持有。 */
+static struct physical_page_reclaim_hooks reclaim_hooks_acquire(
+    const struct physical_page_allocator *allocator)
+{
+    struct physical_page_reclaim_hooks hooks = {0};
+    if (!allocator_initialized(allocator)) return hooks;
+    KERNEL_RAW_SCOPE(guard, &((struct physical_page_allocator *)allocator)->lock);
+    hooks = allocator->reclaim_hooks;
+    if (hooks.retain) hooks.retain(hooks.context);
+    return hooks;
+}
+static void reclaim_hooks_release(struct physical_page_reclaim_hooks *hooks)
+{
+    if (hooks->release) hooks->release(hooks->context);
+}
+
 enum physical_page_status physical_page_allocate_order(
     struct physical_page_allocator *allocator,
     uint32_t order,
@@ -1260,35 +1269,27 @@ enum physical_page_status physical_page_allocate_order(
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address);
 
-    {
-        /* 分发与 callback 取得自身 owner 之间不得被卸载。干净回收不睡眠；
-         * pressure_wait 在显式睡眠前自行 pin 组，不持有 buddy 修改状态。 */
-        KERNEL_IRQ_SCOPE(irq);
-        if (allocator_initialized(allocator) && allocator->pressure_notify) {
-            kernel_assert_service_context();
-            allocator->pressure_notify(allocator->pressure_context);
+    struct physical_page_reclaim_hooks hooks = reclaim_hooks_acquire(allocator);
+    if (hooks.notify) hooks.notify(hooks.context);
+    if (status == PHYSICAL_PAGE_STATUS_EMPTY && hooks.reclaim) {
+        uint32_t *depth = hooks.depth ? hooks.depth() : &allocator->reclaiming;
+        int entered;
+        if (hooks.depth) { entered = !*depth; if (entered) *depth = 1; }
+        else {
+            uint32_t expected = 0;
+            entered = __atomic_compare_exchange_n(depth, &expected, 1, 0,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         }
-        if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
-            allocator_initialized(allocator) &&
-            physical_page_allocator_is_finalized(allocator) &&
-            allocator->reclaimer != 0) {
-            kernel_assert_service_context();
-            uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
-            if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
-            if (depth != &allocator->reclaiming) *depth = 1U;
-            if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
-            allocator->reclaiming++;
-            (void)allocator->reclaimer(allocator->reclaimer_context,
-                                       order_page_count(order));
-            allocator->reclaiming--;
-            if (depth != &allocator->reclaiming) *depth = 0U;
-            if (allocator->available_pages < order_page_count(order) && allocator->pressure_wait)
-                allocator->pressure_wait(allocator->pressure_context);
-            status = physical_page_allocate_order_once(allocator,
-                                                       order,
-                                                       address);
+        if (entered) {
+            (void)hooks.reclaim(hooks.context, order_page_count(order));
+            if (hooks.depth) *depth = 0;
+            else __atomic_store_n(depth, 0, __ATOMIC_RELEASE);
+            if (physical_page_available(allocator) < order_page_count(order) && hooks.wait)
+                hooks.wait(hooks.context);
+            status = physical_page_allocate_order_once(allocator, order, address);
         }
     }
+    reclaim_hooks_release(&hooks);
 
     if (status == PHYSICAL_PAGE_STATUS_OK) {
         COST_ADD(PAGE_ACCEPTED, order_page_count(order)); COST_IO_ADD(7, order_page_count(order));
@@ -1476,37 +1477,29 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
 
 enum physical_page_status physical_page_allocator_set_reclaimer(
     struct physical_page_allocator *allocator,
-    physical_page_reclaim_fn reclaimer,
-    void *context)
+    const struct physical_page_reclaim_hooks *hooks)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    if (!physical_page_allocator_is_finalized(allocator) ||
-        reclaimer == 0) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (allocator->reclaimer != 0 || allocator->reclaiming != 0U) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
-
-    allocator->reclaimer = reclaimer;
-    allocator->reclaimer_context = context;
+    if (!physical_page_allocator_is_finalized(allocator) || !hooks || !hooks->reclaim ||
+        (!!hooks->retain != !!hooks->release)) return PHYSICAL_PAGE_STATUS_INVALID;
+    KERNEL_RAW_SCOPE(guard, &allocator->lock);
+    if (allocator->reclaim_hooks.reclaim) return PHYSICAL_PAGE_STATUS_STATE;
+    if (hooks->retain) hooks->retain(hooks->context);
+    allocator->reclaim_hooks = *hooks;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
 enum physical_page_status physical_page_allocator_clear_reclaimer(
     struct physical_page_allocator *allocator)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    if (!physical_page_allocator_is_finalized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+    if (!physical_page_allocator_is_finalized(allocator)) return PHYSICAL_PAGE_STATUS_INVALID;
+    struct physical_page_reclaim_hooks hooks;
+    {
+        KERNEL_RAW_SCOPE(guard, &allocator->lock);
+        hooks = allocator->reclaim_hooks;
+        if (!hooks.reclaim) return PHYSICAL_PAGE_STATUS_STATE;
+        allocator->reclaim_hooks = (struct physical_page_reclaim_hooks){0};
     }
-    if (allocator->reclaimer == 0 || allocator->reclaiming != 0U) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
-
-    allocator->reclaimer = 0;
-    allocator->reclaim_depth = 0;
-    allocator->reclaimer_context = 0;
+    reclaim_hooks_release(&hooks);
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1594,6 +1587,7 @@ void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
     out->cached = out->shared;
     if (allocator->buffer_bytes)
         out->buffers = allocator->buffer_bytes(allocator->buffer_context);
-    if (allocator->cache_snapshot)
-        allocator->cache_snapshot(allocator->cache_context, out);
+    struct physical_page_reclaim_hooks hooks = reclaim_hooks_acquire(allocator);
+    if (hooks.snapshot) hooks.snapshot(hooks.context, out);
+    reclaim_hooks_release(&hooks);
 }

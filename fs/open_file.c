@@ -981,7 +981,7 @@ int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *f
     if (!prepared || prepared->pending || !open_file_live(file)) return -KERNEL_EINVAL;
     struct kernel_vfs_node *node=kernel_open_file_node(file);
     struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
-    if (!node || !kernel_page_cache_is_controlled(cache)) return -KERNEL_EINVAL;
+    if (!node || !cache) return -KERNEL_EINVAL;
     uint64_t epoch,size;
     {
         KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
