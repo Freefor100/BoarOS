@@ -37,5 +37,12 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *result);
+#if BOAROS_USER_SMP
+static inline int kernel_syscall_local_read_number(uint64_t number)
+{ return number == 63U || number == 65U || number == 67U; }
+enum kernel_syscall_status kernel_syscall_try_local_read(
+    struct kernel_task *, const struct kernel_syscall_request *,
+    struct kernel_syscall_result *, int *handled);
+#endif
 
 #endif

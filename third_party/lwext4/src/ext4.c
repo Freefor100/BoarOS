@@ -865,7 +865,8 @@ static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	if (journal->seal_target < target) journal->seal_target = target;
-	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) journal->checkpoint_requested = true;
+	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT && journal->checkpoint_target < target)
+		journal->checkpoint_target = target;
 	if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
 	if (mp->journal_runtime.wait) return mp->journal_runtime.wait(mp->journal_runtime.context, target, kind);
 	for (;;) {
@@ -1036,27 +1037,48 @@ int ext4_journal_group_enable(const char *mount_point,
 	return r;
 }
 
-int ext4_journal_group_service(const char *mount_point, bool force)
+static int ext4_journal_group_run(const char *mount_point, bool force,
+	enum jbd_journal_stage stage)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENOENT;
 	EXT4_MP_LOCK(mp);
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	int r = !journal || !journal->grouped ? EINVAL : journal->error;
-	if (r == EOK && (mp->transaction_depth || journal->committing || journal->checkpointing)) r = EBUSY;
-	if (r == EOK && ext4_group_due(mp, force)) {
+	if (r == EOK && mp->transaction_depth) r = EBUSY;
+	/* An explicit checkpoint call requests the durable prefix that exists
+	 * now. The target survives a bounded selection until every batch retires. */
+	if (r == EOK && stage == JBD_JOURNAL_CHECKPOINT &&
+	    journal->checkpoint_target < journal->durable_sequence)
+		journal->checkpoint_target = journal->durable_sequence;
+	if (r == EOK && stage != JBD_JOURNAL_CHECKPOINT && ext4_group_due(mp, force)) {
 		r = ext4_group_freeze(mp, force);
 		if (r == EAGAIN) r = EOK; /* 已有提交 owner，先让队首进展。 */
 	}
-	bool selected = r == EOK && jbd_journal_select(journal);
-	bool checkpoint = selected && journal->checkpointing;
+	enum jbd_journal_stage selected = r == EOK ?
+		jbd_journal_select_stage(journal, stage) : JBD_JOURNAL_IDLE;
 	EXT4_MP_UNLOCK(mp);
 	if (r != EOK || !selected) return r;
-	r = checkpoint ? jbd_journal_checkpoint(journal) : jbd_journal_submit(journal);
+	r = selected == JBD_JOURNAL_CHECKPOINT ? jbd_journal_checkpoint(journal) : jbd_journal_submit(journal);
 	EXT4_MP_LOCK(mp);
-	r = jbd_journal_retire(journal, r);
+	r = jbd_journal_retire_stage(journal, selected, r);
 	EXT4_MP_UNLOCK(mp);
 	return r;
+}
+
+int ext4_journal_group_service(const char *mount_point, bool force)
+{
+	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_IDLE);
+}
+
+int ext4_journal_group_commit(const char *mount_point, bool force)
+{
+	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_COMMIT);
+}
+
+int ext4_journal_group_checkpoint(const char *mount_point)
+{
+	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT);
 }
 
 int ext4_journal_group_drain(const char *mount_point)
@@ -1082,12 +1104,17 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 	int r = !journal || !journal->grouped ? ENOTSUP : EOK;
 	if (r == EOK) {
 		struct jbd_trans *running = journal->running;
+		bool commit_ready = !journal->committing &&
+			(!TAILQ_EMPTY(&journal->sealed_queue) || ext4_group_due(mp, false));
+		bool checkpoint_ready = jbd_journal_checkpoint_ready(journal);
 		*progress = (struct ext4_journal_progress){
 			.accepted = journal->accepted_sequence, .sealed = journal->sealed_sequence,
 			.durable = journal->durable_sequence, .checkpoint = journal->checkpoint_sequence,
 			.deadline_ns = running ? running->first_dirty_ns + 100000000 : 0,
 			.memory_used = journal->memory_used, .memory_peak = journal->memory_peak,
-			.ready = !TAILQ_EMPTY(&journal->sealed_queue) || !TAILQ_EMPTY(&journal->cp_queue) || ext4_group_due(mp, false),
+			.ready = commit_ready || checkpoint_ready,
+			.commit_ready = commit_ready, .checkpoint_ready = checkpoint_ready,
+			.checkpoint_pending = !TAILQ_EMPTY(&journal->cp_queue),
 			.error = journal->error};
 	}
 	EXT4_MP_UNLOCK(mp);
@@ -1577,9 +1604,6 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 	if (mp->transaction_depth) return EBUSY;
 	if (!release_inode) {
 		/* 新建、同尺寸截断和普通扩展没有待回收映射，不创建清理事务。 */
-		if (!ext4_get32(&mp->fs.sb, last_orphan) &&
-		    !ext4_sb_feature_ro_com(&mp->fs.sb, EXT4_FRO_COM_ORPHAN_PRESENT))
-			return EOK;
 		bool present;
 		r = ext4_orphan_contains(&mp->fs, index, &present);
 		if (r != EOK || !present) return r;
@@ -1634,9 +1658,6 @@ static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 	if (fs->jbd_journal->error) return fs->jbd_journal->error;
 	if (mp->transaction_error) return mp->transaction_error;
 	if (fs->curr_trans && fs->curr_trans->error) return fs->curr_trans->error;
-	if (!ext4_get32(&fs->sb, last_orphan) &&
-	    !ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_ORPHAN_PRESENT))
-		return EOK;
 	r = ext4_orphan_contains(fs, file->inode, &present);
 	if (r != EOK || !present) goto Finish;
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
@@ -2397,8 +2418,8 @@ Put:
 	if (source.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&source));
 	if (new.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&new));
 	if (old.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&old));
-	/* Complete checksums on all modified inodes before orphan_add scans
-	 * other records that may refer to those same inode-table blocks. */
+	/* Release the modified references before orphan enrollment so its initial
+	 * index load sees completed inode checksums in the shared table blocks. */
 	if (r == EOK && output.replaced_last_link) {
 		r = ext4_fs_get_inode_ref(fs, victim_ino, &victim);
 		if (r == EOK) {
@@ -2979,9 +3000,8 @@ static int ext4_read_pending_data(struct ext4_blockdev *bdev,
 				if (!scratch) return ENOMEM;
 				target = scratch; skip = 0; bytes = bdev->lg_bsize;
 			}
-			struct ext4_block_read_span read = {target,
-				(bdev->part_offset + first * bdev->lg_bsize + skip) / sector,
-				bytes / sector, EIO};
+			struct block_read_span read = {bdev->part_offset + first * bdev->lg_bsize + skip,
+				target, bytes, 0, EIO};
 			int r = ext4_blockdev_read_batch(bdev, &read, 1);
 			if (!r && scratch) memcpy(out, (uint8_t *)scratch + offset, chunk);
 			ext4_free(scratch);
@@ -3189,26 +3209,21 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt)
 {
     if (!rcnt) return EINVAL;
-    struct ext4_file_read_span span = {offset, buf, size, 0, EOK};
-    int result = ext4_fpread_batch(file, &span, 1);
+    struct file_read_span span = {offset, buf, size, 0, EOK};
+    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX);
     *rcnt = span.completed;
     return result;
 }
 
-struct ext4_read_fragment { unsigned span; size_t length; int error; };
-struct ext4_read_workspace {
-    size_t limits[EXT4_BLOCK_BATCH_MAX];
-    struct ext4_read_fragment fragments[EXT4_BLOCK_BATCH_MAX];
-    struct ext4_block_read_span reads[EXT4_BLOCK_BATCH_MAX];
-    unsigned owners[EXT4_BLOCK_BATCH_MAX];
-    int mapping_errors[EXT4_BLOCK_BATCH_MAX];
-};
-
 /* The mount read lock stabilizes inode mappings and current cache versions. */
-int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, unsigned count)
+int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
+    struct file_read_workspace *work, uint64_t size_limit)
 {
     if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
+    uintptr_t descriptors = (uintptr_t)spans, workspace = (uintptr_t)work;
+    if (work && count && (descriptors < workspace ? workspace - descriptors < count * sizeof(*spans) :
+        descriptors - workspace < sizeof(*work))) return EINVAL;
     for (unsigned i = 0; i < count; i++) {
         uintptr_t a = (uintptr_t)spans[i].buffer;
         size_t size = spans[i].size;
@@ -3216,6 +3231,8 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
             return spans[i].error = EINVAL;
         uintptr_t b = (uintptr_t)spans;
         if (size && (a < b ? b - a < size : a - b < count * sizeof(*spans)))
+            return spans[i].error = EINVAL;
+        if (work && size && (a < workspace ? workspace - a < size : a - workspace < sizeof(*work)))
             return spans[i].error = EINVAL;
         for (unsigned j = 0; j < i; j++) {
             b = (uintptr_t)spans[j].buffer;
@@ -3225,19 +3242,18 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     }
     for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
     if (!count) return EOK;
-    struct ext4_read_workspace *work = count > 1 ? ext4_malloc(sizeof(*work)) : NULL;
     if (count > 1 && !work) {
         for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
         return ENOMEM;
     }
     size_t scalar_limit;
-    struct ext4_read_fragment scalar_fragments[8];
-    struct ext4_block_read_span scalar_reads[8];
+    struct file_read_fragment scalar_fragments[8];
+    struct block_read_span scalar_reads[8];
     unsigned scalar_owners[8];
     int scalar_mapping_error;
     size_t *limits = work ? work->limits : &scalar_limit;
-    struct ext4_read_fragment *fragments = work ? work->fragments : scalar_fragments;
-    struct ext4_block_read_span *reads = work ? work->reads : scalar_reads;
+    struct file_read_fragment *fragments = work ? work->fragments : scalar_fragments;
+    struct block_read_span *reads = work ? work->reads : scalar_reads;
     unsigned *owners = work ? work->owners : scalar_owners;
     int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
     unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : 8;
@@ -3252,6 +3268,7 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
     if (result) goto Failed;
     uint64_t size = ext4_inode_get_size(&fs->sb, ref.inode);
     if (size > file->fmax) { result = EFBIG; goto Put; }
+    if (size > size_limit) size = size_limit;
     unsigned block_size = ext4_sb_get_block_size(&fs->sb);
     bool inline_link = ext4_inode_is_type(&fs->sb, ref.inode, EXT4_INODE_MODE_SOFTLINK) &&
         size < sizeof(ref.inode->blocks) && !ext4_inode_get_blocks_count(&fs->sb, ref.inode);
@@ -3301,13 +3318,13 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                 }
                 void *out = (uint8_t *)spans[i].buffer + planned;
                 unsigned sector = fs->bdev->bdif->ph_bsize;
-                uint64_t block = (fs->bdev->part_offset + physical * block_size + skip) / sector;
+                uint64_t block = fs->bdev->part_offset + physical * block_size + skip;
                 bool aligned = physical && !(skip % sector) && !(length % sector);
                 bool extend = parts && pending && aligned &&
                     fragments[parts - 1].span == i && owners[pending - 1] == parts - 1 &&
-                    reads[pending - 1].block + reads[pending - 1].count == block &&
-                    (uint8_t *)reads[pending - 1].data + (size_t)reads[pending - 1].count * sector == out &&
-                    length / sector <= UINT32_MAX - reads[pending - 1].count;
+                    reads[pending - 1].offset + reads[pending - 1].size == block &&
+                    (uint8_t *)reads[pending - 1].buffer + reads[pending - 1].size == out &&
+                    length <= (uint64_t)UINT32_MAX * sector - reads[pending - 1].size;
                 /* A sparse run has one immediate completion fragment, even
                  * when it spans many filesystem blocks. Keep its neighboring
                  * disk fragments in the same submission wave. */
@@ -3324,26 +3341,26 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
                     /* 片段已满时仍可扩展最后一个设备区间。空输出只查询当前
                      * 版本，不能把未接纳片段提前复制进调用者。 */
                     if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
-                    reads[pending - 1].count += length / sector;
+                    reads[pending - 1].size += length;
                     fragments[parts - 1].length += length;
                     planned += length;
                     range_offset = offset + length;
                     continue;
                 }
                 unsigned part = parts++;
-                fragments[part] = (struct ext4_read_fragment){i, length, EOK};
+                fragments[part] = (struct file_read_fragment){i, length, EOK};
                 if (!physical) memset(out, 0, length);
                 else if (!ext4_copy_pending_data(fs->bdev, physical, skip, out, length)) {
                     if (!aligned)
                         fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
                     else if (extend) {
                         parts--;
-                        reads[pending - 1].count += length / sector;
+                        reads[pending - 1].size += length;
                         fragments[parts - 1].length += length;
                     }
                     else {
                         owners[pending] = part;
-                        reads[pending++] = (struct ext4_block_read_span){out, block, length / sector, EIO};
+                        reads[pending++] = (struct block_read_span){block, out, length, 0, EIO};
                     }
                 }
                 planned += length;
@@ -3351,10 +3368,10 @@ int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, 
             }
         }
         ext4_blockdev_read_batch(fs->bdev, reads, pending);
-        for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].error;
+        for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].status;
         for (unsigned j = 0; j < parts; j++) {
-            struct ext4_read_fragment *part = &fragments[j];
-            struct ext4_file_read_span *span = &spans[part->span];
+            struct file_read_fragment *part = &fragments[j];
+            struct file_read_span *span = &spans[part->span];
             if (!span->error) {
                 if (part->error) span->error = part->error;
                 else span->completed += part->length;
@@ -3370,7 +3387,6 @@ Failed:
     result = EOK;
     for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
     EXT4_MP_UNLOCK(file->mp);
-    ext4_free(work);
     return result;
 }
 

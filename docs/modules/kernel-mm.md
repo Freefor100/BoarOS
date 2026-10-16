@@ -2,7 +2,7 @@
 
 本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
-普通用户MM可在私有构造期调用`kernel_mm_enable_remote_user_execution()`。它只开放远端根切换/活动CPU/失效后退休，内核VMA、来源、缺页和业务操作仍要求CPU0，不启用受控并行修改gate，也不排斥ELF或系统压力hook。两种能力的范围见[真实用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。普通COW保留旧PTE引用到RFENCE确认，候选访问失败不修改旧叶；非叶变更全范围同步，稀疏范围按实际owned叶/页表分支遍历。普通Sv39缺页先私有准备缺失的整条页表路径，再发布非叶；第二级OOM仅归还未发布候选，不把远端可见表页直接释放。
+普通用户MM可在私有构造期调用`kernel_mm_enable_remote_user_execution()`，开放远端根切换、活动CPU登记和失效后退休。在`USER_SMP`中，普通文件本地读取还可借用当前任务自己的驻留用户页；VMA修改、真实缺页及来源后端业务仍由CPU0执行，不把普通MM改成受控并发域，也不排斥ELF或系统压力hook。驻留pin与CPU0修改复用同一operation gate及pin排空协议。两种能力的范围见[真实用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。普通COW保留旧PTE引用到RFENCE确认，候选访问失败不修改旧叶；非叶变更全范围同步，稀疏范围按实际owned叶/页表分支遍历。普通Sv39缺页先私有准备缺失的整条页表路径，再发布非叶；第二级OOM仅归还未发布候选，不把远端可见表页直接释放。
 
 ## 范围与入口
 
@@ -279,9 +279,13 @@ OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 自持同一 MM pin 的调用者只尝试取得 operation gate；忙时返回 `CONFLICT`，原 pin、映射和未发布的输出保持。新 pin 许可已关闭也不等待；缺页准备后的重取 gate 使用同一规则，冲突归还候选及 COW 临时引用后返回，不在保留 pin 时自旋重试。调用者归还原 pin 后可重试，无争用的自持 pin 撤映射仍有效。零长度 mprotect 不进入 gate。
 
-`kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/未开放外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算；受控ext4来源须核对真实inode/挂载及独立缓存的heap/allocator绑定，登记状态由CPU0在发布前准备。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。普通用户任务仍限 CPU0；LA 仍为单CPU。CPU0负责文件构造、命名空间/截断和最终释放；CPU1执行已绑定映射及获准FD操作，控制者保留独立 OFD/挂载/缓存 owner，命名空间运行期间不修改。内部MM开关不独自开放系统压力或FD业务，普通文件IO另按[文件表域](kernel-files.md)验证并发布。
+`kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/未开放外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算；受控ext4来源须核对真实inode/挂载及独立缓存的heap/allocator绑定，登记状态由CPU0在发布前准备。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。本受控配置的普通用户任务仍限 CPU0；真实用户多核另用`USER_SMP`，LA仍为单CPU。CPU0负责文件构造、命名空间/截断和最终释放；CPU1执行已绑定映射及获准FD操作，控制者保留独立 OFD/挂载/缓存 owner，命名空间运行期间不修改。内部MM开关不独自开放系统压力或FD业务，普通文件IO另按[文件表域](kernel-files.md)验证并发布。
 
-每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
+每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。普通文件读在每批已经取得的缓存页内保留当前用户页 pin，跨源页或 iovec 片段不重复解析同一目标页；换目标页时先归还再处理缺页，整批结束或出错时归还，下一次存储等待不携带用户 pin。该游标只延长现有片段借用，不缓存映射身份，撤映射、撤权限和共享页写回仍遵守原来的 pin 排空规则。
+
+`USER_SMP`的`kernel_mm_try_pin_user_page()`只接受当前真实用户任务绑定的普通`remote_user` MM。它尝试既有operation gate，在operation内核对VMA来源，raw内核对pin许可和当前PTE，再取得实际物理页引用；gate忙、许可关闭、缺页、COW或共享磁盘写目标均要求转到CPU0，不能在本地分配或升级权限。uaccess的resident游标用`RETRY`和真实copied前缀交回文件层，归还pin后由同一任务继续原请求。fork和降权持同一gate关闭新写许可，等旧写pin归还后才发布COW或新权限；pin结束只需raw，不等待gate，因此排空者不会阻止归还。
+
+普通用户的缺页仍走原CPU0 mapper；进入ELF、普通磁盘或其他旧后备mapper前释放operation gate，保留实际来源引用和提交时的VMA/PTE重查。`msync`固定来源后也先结束gate再取得OFD同步资格。最后VMA消失时，先在gate内摘下既有来源和登记节点，放gate后排空登记回调，再释放实际OFD/ELF owner；真实关闭失败把同一来源节点交回MM继续清理，不能提前释放回调借用的inode。
 
 共享匿名fault在gate下取得实际对象引用，放保护后prepare页/准备缺表，恢复后重查VMA代次、backing、偏移和权限；prepare返回的额外页引用成功转给PTE，finish记录接纳；失败finish归还该引用并结束准备计数，只有最后失败者撤销未接纳的匹配页。另一MM撤PTE不清接纳历史，最后归还临时对象引用。并发fork按VMA分类，只把私有叶提交成COW，共享及受保护共享叶保持共享。单侧降权只作用于本MM，不保证另一MM的共享数据内容不变。
 

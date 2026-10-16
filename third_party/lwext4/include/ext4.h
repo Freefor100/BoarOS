@@ -83,14 +83,17 @@ struct ext4_journal_runtime {
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);
-/* One caller owns service. Freezing and retirement use the mount lock; slow
- * device I/O uses only immutable transaction-owned images outside that lock. */
+/* A runtime supplies one consumer for each stage. Freezing and retirement use
+ * the mount lock; each consumer owns its immutable images during device I/O.
+ * service() drives either stage synchronously when no runtime is supplied. */
 int ext4_journal_group_service(const char *mount_point, bool force);
+int ext4_journal_group_commit(const char *mount_point, bool force);
+int ext4_journal_group_checkpoint(const char *mount_point);
 int ext4_journal_group_drain(const char *mount_point);
 struct ext4_journal_progress {
 	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
 	size_t memory_used, memory_peak;
-	bool ready;
+	bool ready, commit_ready, checkpoint_ready, checkpoint_pending;
 	int error;
 };
 int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress);
@@ -505,16 +508,12 @@ int ext4_ftruncate(ext4_file *file, uint64_t size);
 int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt);
 /* Positioned data read; mount read lock excludes every writer. */
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt);
-#define EXT4_FILE_READ_BATCH 1
-struct ext4_file_read_span {
-    uint64_t offset;
-    void *buffer;
-    size_t size, completed;
-    int error;
-};
-/* At most eight disjoint outputs; every span reports a contiguous prefix.
- * Reads consult cache versions, including dirty and journal-pending data. */
-int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, unsigned count);
+/* At most FILE_READ_BATCH_MAX disjoint outputs; every span reports a contiguous prefix.
+ * Reads consult cache versions, including dirty and journal-pending data.
+ * Multi-output callers lend a workspace until return; scalar callers may pass
+ * NULL. size_limit caps visible EOF without changing the caller's span sizes. */
+int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
+    struct file_read_workspace *workspace, uint64_t size_limit);
 
 
 /**@brief   Write data to file.

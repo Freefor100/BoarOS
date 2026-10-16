@@ -42,6 +42,7 @@
 #include <ext4_debug.h>
 
 #include <ext4_fs.h>
+#include <ext4_orphan.h>
 #include <ext4_super.h>
 #include <ext4_journal.h>
 #include <ext4_blockdev.h>
@@ -1831,7 +1832,7 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	if (r == EOK)
 		r = ext4_blockdev_flush(jbd_fs->bdev);
 	if (r != EOK) {
-		journal->error = r;
+		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 		return r;
 	}
 	r = jbd_journal_update_super(journal, true);
@@ -1845,8 +1846,10 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 		int cleanup = jbd_write_sb(jbd_fs);
 		if (cleanup == EOK)
 			cleanup = ext4_blockdev_flush(jbd_fs->bdev);
-		if (cleanup != EOK)
-			r = journal->error = cleanup;
+		if (cleanup != EOK) {
+			r = cleanup;
+			__atomic_store_n(&journal->error,cleanup,__ATOMIC_RELEASE);
+		}
 		else
 			jbd_fs->bdev->journal = NULL;
 	}
@@ -1941,7 +1944,7 @@ int jbd_journal_purge_cp_trans(struct jbd_journal *journal,
 	}
 	return EOK;
 Error:
-	journal->error = r;
+	__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 	return r;
 }
 
@@ -1977,7 +1980,7 @@ int jbd_journal_stop(struct jbd_journal *journal)
 	if (r == EOK)
 		r = ext4_blockdev_flush(jbd_fs->bdev);
 	if (r != EOK)
-		journal->error = r;
+		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 	return r;
 }
 
@@ -2095,7 +2098,7 @@ jbd_trans_finish_callback(struct jbd_journal *journal,
 				if (r != EOK) {
 					/* The earlier committed transaction still owns its
 					 * log record even when rollback cannot read it. */
-					journal->error = r;
+					__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 					jbd_trans_change_ownership(block_rec, jbd_buf->trans);
 					if (block.lb_id)
 						ext4_block_set(fs->bdev, &block);
@@ -2601,6 +2604,7 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 		*count -= q->count;
 		jbd_free(q);
 	}
+	ext4_orphan_trans_finish(trans, abort);
 	jbd_image_free(trans->checkpoint_image);
 	jbd_free(trans);
 }
@@ -2942,7 +2946,7 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 	struct jbd_journal *journal = trans->journal;
 	if (res != EOK) {
 		trans->error = res;
-		journal->error = res;
+		__atomic_store_n(&journal->error,res,__ATOMIC_RELEASE);
 		return;
 	}
 
@@ -3023,6 +3027,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 	rc = jbd_write_prepared(trans, &commit_submitted);
 	if (rc != EOK)
 		goto Finish;
+	ext4_orphan_trans_finish(trans, false);
 	journal->committed_id = trans->trans_id;
 	journal->alloc_trans_id++;
 
@@ -3073,8 +3078,8 @@ Finish:
 	if (rc != EOK) {
 		/* Never recycle possibly committed log blocks after uncertain I/O.
 		 * The journal owns this pinned transaction until recovery/remount. */
-		journal->error = rc;
 		journal->failed_trans = trans;
+		__atomic_store_n(&journal->error,rc,__ATOMIC_RELEASE);
 	}
 	return rc;
 }
@@ -3142,6 +3147,7 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 	unsigned credits = operation->reserved_logs + (running ? running->reserved_logs : 0);
 	uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
 	if (credits >= maxlen - journal->first) return ENOSPC;
+	ext4_orphan_trans_finish(operation, false);
 	/* Only this newly accepted operation owns undo images. Older accepted
 	 * records already discarded theirs; never rescan the accumulated group. */
 	struct jbd_buf *accepted;
@@ -3236,7 +3242,8 @@ int jbd_journal_freeze(struct jbd_journal *journal)
 	if (r == EOK) r = jbd_trans_prepare_commit_block(trans);
 	if (r == EOK) trans->checkpoint_lba = journal->log_map[0];
 	if (r != EOK) {
-		journal->error = r; journal->failed_trans = trans;
+		journal->failed_trans = trans;
+		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 		return r;
 	}
 	struct jbd_sb sb = journal->jbd_fs->sb;
@@ -3267,15 +3274,21 @@ int jbd_journal_submit(struct jbd_journal *journal)
 	return jbd_write_prepared(trans, &submitted);
 }
 
-bool jbd_journal_select(struct jbd_journal *journal)
+bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
 {
-	if (journal->committing || journal->checkpointing || journal->error) return false;
+	return !journal->error && !journal->checkpointing && !TAILQ_EMPTY(&journal->cp_queue) &&
+		(journal->checkpoint_target > journal->checkpoint_sequence || journal->checkpoint_count >= 4 ||
+		 journal->memory_used - journal->memory_cached > journal->memory_limit / 2);
+}
+
+enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
+	enum jbd_journal_stage stage)
+{
+	if (journal->error) return JBD_JOURNAL_IDLE;
 	struct jbd_trans *trans = TAILQ_FIRST(&journal->cp_queue);
-	/* 每个 checkpoint 批次结束后重新选择；容量压力不能被提交流饿死。 */
-	bool reclaim = trans && (journal->checkpoint_requested || journal->checkpoint_count >= 4 ||
-		journal->memory_used - journal->memory_cached > journal->memory_limit / 2 ||
-		TAILQ_EMPTY(&journal->sealed_queue));
-	if (reclaim) {
+	/* Reclaim pressure is shared with progress reporting. An empty sealed
+	 * queue says nothing about a commit currently doing device I/O. */
+	if (stage != JBD_JOURNAL_COMMIT && jbd_journal_checkpoint_ready(journal)) {
 		journal->checkpointing = journal->checkpoint_last = trans;
 		unsigned count = 1;
 		while (count < 8 && TAILQ_NEXT(journal->checkpoint_last, trans_node)) {
@@ -3312,15 +3325,26 @@ bool jbd_journal_select(struct jbd_journal *journal)
             jbd_phase_add(journal, &phase, &jb->home_io, jb->after->data,
                 jb->block.lb_id, 0, journal->block_size);
         journal->checkpoint_io = phase.first;
-		journal->checkpoint_requested = false;
-		return true;
+		return JBD_JOURNAL_CHECKPOINT;
 	}
+	if (journal->committing || stage == JBD_JOURNAL_CHECKPOINT) return JBD_JOURNAL_IDLE;
 	trans = TAILQ_FIRST(&journal->sealed_queue);
-	if (!trans) return false;
+	if (!trans) return JBD_JOURNAL_IDLE;
 	TAILQ_REMOVE(&journal->sealed_queue, trans, trans_node);
 	journal->sealed_count--;
 	journal->committing = trans;
-	return true;
+	return JBD_JOURNAL_COMMIT;
+}
+
+bool jbd_journal_select(struct jbd_journal *journal)
+{
+	/* Sequential low-level callers have no completion token. Keep them from
+	 * borrowing an owner already held by either runtime consumer. */
+	if (journal->committing || journal->checkpointing) return false;
+	if (TAILQ_EMPTY(&journal->sealed_queue) && !journal->running &&
+	    journal->checkpoint_target < journal->durable_sequence)
+		journal->checkpoint_target = journal->durable_sequence;
+	return jbd_journal_select_stage(journal, JBD_JOURNAL_IDLE) != JBD_JOURNAL_IDLE;
 }
 
 int jbd_journal_checkpoint(struct jbd_journal *journal)
@@ -3365,17 +3389,24 @@ static void jbd_group_release(struct jbd_journal *journal, struct jbd_trans *tra
 	jbd_journal_free_trans(journal, trans, false);
 }
 
-int jbd_journal_retire(struct jbd_journal *journal, int error)
+int jbd_journal_retire_stage(struct jbd_journal *journal,
+	enum jbd_journal_stage stage, int error)
 {
-	struct jbd_trans *trans = journal->committing ? journal->committing : journal->checkpointing;
+	struct jbd_trans *trans = stage == JBD_JOURNAL_COMMIT ? journal->committing : journal->checkpointing;
 	if (!trans) return error;
 	if (error) {
-		journal->error = error; journal->failed_trans = trans;
+		if (!journal->error) {
+			journal->failed_trans = trans;
+			__atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
+		}
 		/* DMA has stopped, but live readers still own the accepted file
 		 * contents. The failed mount keeps these versions and later groups. */
-		return error;
+		return journal->error;
 	}
-	if (journal->committing) {
+	/* A failure in the other consumer leaves this completed owner's recovery
+	 * and live-read references intact as well. No lane can recycle the log. */
+	if (journal->error) return journal->error;
+	if (stage == JBD_JOURNAL_COMMIT) {
 		/* commit 屏障成功即形成恢复依据；home owner 继续归 checkpoint 队列。 */
 		journal->committed_id = trans->trans_id;
 		journal->durable_sequence = trans->sequence;
@@ -3405,6 +3436,13 @@ int jbd_journal_retire(struct jbd_journal *journal, int error)
 	journal->checkpoint_io = NULL;
 	journal->checkpointing = journal->checkpoint_last = NULL;
 	return EOK;
+}
+
+int jbd_journal_retire(struct jbd_journal *journal, int error)
+{
+	if (journal->committing && journal->checkpointing) __builtin_trap();
+	return jbd_journal_retire_stage(journal, journal->committing ?
+		JBD_JOURNAL_COMMIT : JBD_JOURNAL_CHECKPOINT, error);
 }
 
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal)

@@ -99,11 +99,11 @@ static void test_write_batch(struct riscv_virtio_mmio_block *rw,
     if (physical_page_allocate_order(rw->page_allocator, 1, &sg_address) != PHYSICAL_PAGE_STATUS_OK ||
         physical_page_resolve(rw->page_allocator, sg_address, (void **)&sg_buffers) != PHYSICAL_PAGE_STATUS_OK)
         fail_block(72, 0, 1);
-    struct kernel_block_read_span reads[8];
+    struct block_read_span reads[8];
     for (unsigned i = 0; i < 8; i++) {
         for (unsigned j = 0; j < sizeof(sg_buffers[i]); j++) sg_buffers[i][j] = (unsigned char)(i + j * 13);
         spans[i] = (struct kernel_block_span){16384 + i * 512, sg_buffers[i], 512};
-        reads[i] = (struct kernel_block_read_span){16384 + i * 512, sg_buffers[i], 512, 0, 0};
+        reads[i] = (struct block_read_span){16384 + i * 512, sg_buffers[i], 512, 0, 0};
     }
     uint64_t submitted = rw->statistics.requests;
     result = kernel_block_write_batch(&rw->block, spans, 8);
@@ -145,7 +145,7 @@ static void test_128k_sg(struct riscv_virtio_mmio_block *device)
     uint64_t addresses[32];
     unsigned char *pages[32];
     struct kernel_block_span writes[32];
-    struct kernel_block_read_span reads[32];
+    struct block_read_span reads[32];
     uint64_t baseline = physical_page_available(device->page_allocator);
     for (unsigned i = 0; i < 32; i++) {
         if (physical_page_allocate_order(device->page_allocator, 1, &addresses[i]) != PHYSICAL_PAGE_STATUS_OK ||
@@ -153,7 +153,7 @@ static void test_128k_sg(struct riscv_virtio_mmio_block *device)
             fail_block(80, 0, i);
         for (unsigned j = 0; j < 8192; j++) pages[i][j] = j < 4096 ? (unsigned char)(i + j * 17) : 0xa5;
         writes[i] = (struct kernel_block_span){262144 + i * 4096, pages[i], 4096};
-        reads[i] = (struct kernel_block_read_span){262144 + i * 4096, pages[i], 4096, 0, 0};
+        reads[i] = (struct block_read_span){262144 + i * 4096, pages[i], 4096, 0, 0};
     }
     uint64_t requests = device->statistics.requests, bounce = device->statistics.bounce_requests;
     if (kernel_block_write_batch(&device->block, writes, 32) != KERNEL_BLOCK_STATUS_OK ||

@@ -4,6 +4,7 @@
 #include <kernel/files.h>
 #include <kernel/uaccess.h>
 #include <kernel/page.h>
+#include "../mm/uaccess_internal.h"
 
 #include <stddef.h>
 
@@ -31,9 +32,10 @@ static inline size_t kernel_uaccess_iov_span(struct kernel_uaccess_iov_cursor *c
 
 /* The caller commits backend progress separately. A FAULT can carry a
  * successfully copied prefix, including one spanning prior iovecs. */
-static inline enum kernel_uaccess_status kernel_copy_to_user_iov(
+static inline enum kernel_uaccess_status kernel_copy_to_user_iov_impl(
     struct kernel_mm *mm,
     struct kernel_uaccess_iov_cursor *cursor,
+    struct kernel_uaccess_write_cursor *pages,
     const void *source,
     size_t length,
     size_t *copied)
@@ -58,10 +60,10 @@ static inline enum kernel_uaccess_status kernel_copy_to_user_iov(
             chunk = (size_t)(cursor->iov[cursor->index].length -
                              cursor->offset);
         }
-        status = kernel_copy_to_user(mm,
-                    cursor->iov[cursor->index].base + cursor->offset,
-                    (const unsigned char *)source + *copied,
-                    chunk, &part);
+        uint64_t address = cursor->iov[cursor->index].base + cursor->offset;
+        const void *data = (const unsigned char *)source + *copied;
+        status = pages ? kernel_uaccess_write_cursor_copy(mm, pages, address, data, chunk, &part)
+                       : kernel_copy_to_user(mm, address, data, chunk, &part);
         if (part > chunk) {
             return KERNEL_UACCESS_STATUS_STATE;
         }
@@ -73,6 +75,21 @@ static inline enum kernel_uaccess_status kernel_copy_to_user_iov(
         }
     }
     return KERNEL_UACCESS_STATUS_OK;
+}
+
+static inline enum kernel_uaccess_status kernel_copy_to_user_iov(
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    const void *source, size_t length, size_t *copied)
+{
+    return kernel_copy_to_user_iov_impl(mm, cursor, 0, source, length, copied);
+}
+
+static inline enum kernel_uaccess_status kernel_copy_to_user_iov_cursor(
+    struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    struct kernel_uaccess_write_cursor *pages, const void *source,
+    size_t length, size_t *copied)
+{
+    return kernel_copy_to_user_iov_impl(mm, cursor, pages, source, length, copied);
 }
 
 /* A pipe writer publishes a fragment only after this copies the complete

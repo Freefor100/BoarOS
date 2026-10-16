@@ -26,6 +26,7 @@ static struct riscv_virtio_mmio_block device;
 static unsigned completed, probe, calls, maximum, reject_order, reject_page, injected, fail_write;
 static unsigned hold_snapshot, snapshot_waiting, snapshot_changed, alias_rearms;
 #define TEST_PAGES (BOAROS_PAGE_CACHE_WRITEBACK_PAGES > 8 ? BOAROS_PAGE_CACHE_WRITEBACK_PAGES : 8)
+static uint64_t allocation_pins[TEST_PAGES];
 static uint64_t alias_pages[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
 static struct kernel_page_cache_alias aliases[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
 static struct kernel_wait_queue snapshot_ready;
@@ -194,9 +195,20 @@ static void allocation_cases(struct kernel_vfs_file *file)
           maximum == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096 && submitted == TEST_PAGES * 4096, 51);
     check(injected == 0, 52);
     write_pages(file, 1);
+    /* 空闲稳定页可直接复用；固定文件页后排空空闲池，才能注入真实的新页OOM。 */
+    for (unsigned i=0;i<TEST_PAGES;i++) {
+        size_t valid;
+        check(kernel_page_cache_get(&cache,file,i,&allocation_pins[i],&valid)==
+              KERNEL_PAGE_CACHE_STATUS_OK && valid==4096, 56);
+    }
+    (void)kernel_page_cache_reclaim(&cache,UINT64_MAX);
     reject_page = 1;
+    injected = 0;
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == -KERNEL_ENOMEM, 53);
+    check(injected, 57);
     reject_page = 0;
+    for (unsigned i=0;i<TEST_PAGES;i++)
+        check(physical_page_release(&allocator,allocation_pins[i])==PHYSICAL_PAGE_STATUS_OK, 58);
     reset_probe();
     check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 54);
     probe = 0;

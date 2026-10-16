@@ -618,8 +618,8 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int physical(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static int dma(const void *p, uint64_t n, uint64_t *out) { (void)n; *out = (uintptr_t)p; return 1; }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
     if (loading_probe) {
         loads++;
@@ -627,7 +627,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kern
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 10);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_pread_batch(node, spans, count);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
 }
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
@@ -890,17 +890,18 @@ static void batch_reader(void *unused)
     (void)unused;
     uintptr_t irq = riscv_interrupt_save();
     unsigned char sectors[8][512];
-    struct kernel_block_read_span spans[8];
+    struct block_read_span spans[8];
     read_batch_task = kernel_task_current();
-    for (unsigned i = 0; i < 8; i++) spans[i] = (struct kernel_block_read_span){
+    for (unsigned i = 0; i < 8; i++) spans[i] = (struct block_read_span){
         .offset = 120 * 1024 * 1024 + i * 4096, .buffer = sectors[i], .size = 512};
     if (read_batch_filesystem) {
-        struct kernel_vfs_read_span pages[8];
-        for (unsigned i = 0; i < 8; i++) pages[i] = (struct kernel_vfs_read_span){i * 4096,
+        struct file_read_span pages[8];
+        for (unsigned i = 0; i < 8; i++) pages[i] = (struct file_read_span){i * 4096,
             read_batch_pages[i], 4096, 0, 0};
         KERNEL_LOCK_SCOPE(guard);
         kernel_vfs_node_lock(kernel_vfs_file_node(&read_batch_file), &guard, 0);
-        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8) == 0, 351);
+        static struct file_read_workspace file_read_work;
+        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8, &file_read_work) == 0, 351);
         for (unsigned i = 0; i < 8; i++) {
             check(!pages[i].error && pages[i].completed == 4096, 352);
             for (unsigned j = 0; j < 4096; j++) check(read_batch_pages[i][j] == i + 1, 353);
@@ -1067,6 +1068,21 @@ static void cache_instances_probe(void)
           kernel_page_cache_writeback(&instance_peer, kernel_vfs_file_node(&files[1])) == 0, 189);
     kernel_memory_snapshot(&allocator, &memory);
     check(memory.cached == 4 * 4096 && !memory.dirty, 190);
+    uint64_t pins[2][2];
+    size_t valid;
+    check(memory.reclaimable>=memory.cached && !(memory.reclaimable%4096), 191);
+    uint64_t idle=(memory.reclaimable-memory.cached)/4096;
+    for(unsigned i=0;i<2;i++)for(unsigned j=0;j<2;j++)
+        check(kernel_page_cache_get(i?&instance_peer:&cache,&files[i],j,&pins[i][j],&valid)==
+            KERNEL_PAGE_CACHE_STATUS_OK && valid==4096, 191);
+    /* 先固定四个真实cache页，单独归还已结束的稳定版本；之后的两次
+     * group reclaim才必须各自移除一个实例中的真实cache页。 */
+    uint64_t returned=kernel_page_cache_reclaim(&cache,UINT64_MAX)+
+        kernel_page_cache_reclaim(&instance_peer,UINT64_MAX);
+    kernel_memory_snapshot(&allocator,&memory);
+    check(returned==idle && !memory.reclaimable && memory.cached==4*4096, 191);
+    for(unsigned i=0;i<2;i++)for(unsigned j=0;j<2;j++)
+        check(physical_page_release(&allocator,pins[i][j])==PHYSICAL_PAGE_STATUS_OK, 191);
     check(allocator.reclaimer(allocator.reclaimer_context, 1) == 1 &&
           allocator.reclaimer(allocator.reclaimer_context, 1) == 1, 191);
     kernel_page_cache_get_statistics(&cache, &a);
@@ -1157,7 +1173,11 @@ static void background_writeback_probe(void *unused)
     check(startup_held && startup_held < 1024 && !physical_page_available(&allocator), 111);
     check(kernel_page_cache_start_worker(&cache) == -12 && !physical_page_available(&allocator), 112);
     check(physical_page_release(&allocator, pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 113);
-    check(kernel_page_cache_start_worker(&cache) == -12 && physical_page_available(&allocator) == 1, 114);
+    check(kernel_page_cache_start_worker(&cache) == -12, 114);
+    /* 启动失败允许把已构造版本归还idle；清理后仍须精确归还仅有的一页，
+     * 不能残留worker、版本借用或不可回收的启动资源。 */
+    (void)kernel_page_cache_reclaim(&cache,UINT64_MAX);
+    check(physical_page_available(&allocator) == 1, 114);
     while (startup_held) check(physical_page_release(&allocator,
                 pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 115);
     check(kernel_page_cache_start_worker(&cache) == 0, 91);

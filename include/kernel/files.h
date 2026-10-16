@@ -9,6 +9,7 @@
     ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
 
 struct kernel_file_slot;
+struct kernel_files;
 struct kernel_files_record;
 struct kernel_fs_context;
 struct kernel_heap;
@@ -24,6 +25,18 @@ enum kernel_files_status {
     KERNEL_FILES_STATUS_CLEANUP_REQUIRED,
     KERNEL_FILES_STATUS_STATE,
 };
+#if BOAROS_USER_SMP
+enum kernel_files_read_kind {
+    KERNEL_FILES_READ,
+    KERNEL_FILES_PREAD,
+    KERNEL_FILES_READV,
+};
+/* 零进度不支持时handled=0；接纳后同一OFD pin覆盖本地段和CPU0续读。 */
+enum kernel_files_status kernel_files_try_local_read(
+    struct kernel_files *, struct kernel_mm *, enum kernel_files_read_kind,
+    int64_t fd, uint64_t buffer, uint64_t count, int64_t offset,
+    int *handled, int64_t *result);
+#endif
 
 enum kernel_files_state {
     KERNEL_FILES_EMPTY = 0,

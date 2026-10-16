@@ -14,6 +14,7 @@
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -39,7 +40,8 @@ static void command(unsigned action)
 {
     if (!controlled && !observed) return;
     if (!controlled && action!=COMPOSITION_STOP && action!=COMPOSITION_FAULT_RACE &&
-        action!=COMPOSITION_FILE_FAULT_RACE) return;
+        action!=COMPOSITION_FILE_FAULT_RACE && action!=COMPOSITION_READ_ARM &&
+        action!=COMPOSITION_READ_FINISH) return;
     composition_store(&control->command,action);
     composition_store(&control->request,++request);
     wait_value(&control->reply,request);
@@ -173,6 +175,149 @@ static void concurrent_file_first_fault(void)
     CHECK(!munmap((void *)page,4096) && !close(fd));
     record("concurrent-file-first-fault");
 }
+
+struct ordinary_read {
+    int fd, operation, signal_wait;
+    unsigned char *buffer;
+    size_t size;
+    off_t offset;
+    uint64_t tid,ready,go,done;
+    ssize_t result;
+};
+static volatile sig_atomic_t read_signal_seen;
+static void read_signal(int number) { CHECK(number==SIGUSR1);read_signal_seen=1; }
+static void *ordinary_reader(void *opaque)
+{
+    struct ordinary_read *test=opaque;pin(1);
+    test->tid=(uint64_t)syscall(SYS_gettid);
+    composition_store(&test->ready,1);wait_value(&test->go,1);
+    if (test->operation==1) test->result=pread(test->fd,test->buffer,test->size,test->offset);
+    else if (test->operation==2) {
+        struct iovec vector[2]={{test->buffer,5},{test->buffer+32,test->size-5}};
+        test->result=readv(test->fd,vector,2);
+    } else test->result=read(test->fd,test->buffer,test->size);
+    composition_store(&test->done,1);
+    if(test->signal_wait) { uint64_t end=now()+UINT64_C(10000000000);
+        while(!read_signal_seen) { CHECK(now()<end);sched_yield(); } }
+    return 0;
+}
+static void read_arm(struct ordinary_read *test,unsigned flags)
+{
+    composition_store(&control->read_tid,test->tid);
+    composition_store(&control->read_address,(uintptr_t)test->buffer);
+    composition_store(&control->read_size,test->operation==2 ? 64 : test->size);
+    composition_store(&control->read_hart,(online&2) ? 1 : 0);
+    composition_store(&control->read_flags,flags);
+    composition_store(&control->read_entered,0);composition_store(&control->read_release,0);
+    composition_store(&control->read_waiter_tid,0);composition_store(&control->read_waited,0);
+    command(COMPOSITION_READ_ARM);composition_store(&test->go,1);
+}
+static void read_run(struct ordinary_read *test,unsigned flags)
+{
+    pthread_t thread;CHECK(!pthread_create(&thread,0,ordinary_reader,test));
+    wait_value(&test->ready,1);read_arm(test,flags);
+    CHECK(!pthread_join(thread,0));command(COMPOSITION_READ_FINISH);
+}
+static void *ordinary_seeker(void *opaque)
+{
+    struct ordinary_read *test=opaque;pin(1);
+    test->tid=(uint64_t)syscall(SYS_gettid);composition_store(&test->ready,1);
+    wait_value(&test->go,1);test->result=lseek(test->fd,0,SEEK_CUR);return 0;
+}
+static void *ordinary_sequential_reader(void *opaque)
+{
+    struct ordinary_read *test=opaque;pin(1);
+    CHECK(read(test->fd,test->buffer,4096)==4096 &&
+        read(test->fd,test->buffer+4096,4096)==4096);
+    for(unsigned i=0;i<8192;i++)CHECK(test->buffer[i]==(unsigned char)(i*13+7));
+    /* 第二个整页的顺序进度可排第三页预读，seek只取消已有计划。 */
+    CHECK(!lseek(test->fd,0,SEEK_SET));
+    return 0;
+}
+static void ordinary_reads(void)
+{
+    int fd=open("/ordinary-read-source",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(fd>=0);
+    unsigned char source[4096];for(unsigned i=0;i<sizeof(source);i++)source[i]=(unsigned char)(i*13+7);
+    for(unsigned i=0;i<3;i++)CHECK(write(fd,source,sizeof(source))==sizeof(source));
+    CHECK(!fsync(fd));
+    unsigned char *buffer=mmap(0,3*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(buffer!=MAP_FAILED);memset(buffer,0,2*4096);
+    CHECK(!lseek(fd,0,SEEK_SET));
+    struct ordinary_read test={.fd=fd,.buffer=buffer,.size=16};
+    read_run(&test,COMPOSITION_READ_LOCAL);CHECK(test.result==16 && !memcmp(buffer,source,16));
+    test=(struct ordinary_read){.fd=fd,.operation=1,.buffer=buffer,.size=16,.offset=128};
+    read_run(&test,COMPOSITION_READ_LOCAL);CHECK(test.result==16 && !memcmp(buffer,source+128,16));
+    test=(struct ordinary_read){.fd=fd,.operation=2,.buffer=buffer,.size=16};
+    read_run(&test,COMPOSITION_READ_LOCAL);
+    CHECK(test.result==16 && !memcmp(buffer,source+16,5) && !memcmp(buffer+32,source+21,11));
+    CHECK(lseek(fd,0,SEEK_CUR)==32);record("ordinary-hot-read-pread-readv");
+
+    test=(struct ordinary_read){.fd=fd,.operation=1,.buffer=buffer,.size=16,.offset=64};
+    read_run(&test,COMPOSITION_READ_SERVICE|COMPOSITION_READ_COLD);
+    CHECK(test.result==16 && !memcmp(buffer,source+64,16));record("ordinary-cold-cache");
+    test=(struct ordinary_read){.fd=fd,.operation=1,.buffer=buffer+8192,.size=16,.offset=96};
+    read_run(&test,COMPOSITION_READ_SERVICE);
+    CHECK(test.result==16 && !memcmp(buffer+8192,source+96,16));record("ordinary-user-fault");
+    CHECK(!mprotect(buffer+4096,4096,PROT_NONE) && !lseek(fd,0,SEEK_SET));
+    test=(struct ordinary_read){.fd=fd,.buffer=buffer+4094,.size=4};
+    read_run(&test,COMPOSITION_READ_SERVICE|COMPOSITION_READ_PREFIX);
+    CHECK(test.result==2 && !memcmp(buffer+4094,source,2) && lseek(fd,0,SEEK_CUR)==2);
+    CHECK(!mprotect(buffer+4096,4096,PROT_READ|PROT_WRITE));record("ordinary-read-fault-prefix");
+
+    CHECK(!munmap(buffer+4096,4096) &&
+        mmap(buffer+4096,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0)==buffer+4096);
+    CHECK(!lseek(fd,0,SEEK_SET));
+    test=(struct ordinary_read){.fd=fd,.buffer=buffer+4094,.size=16};
+    struct ordinary_read seek={.fd=fd};pthread_t reader,seeker;
+    CHECK(!pthread_create(&reader,0,ordinary_reader,&test) &&
+        !pthread_create(&seeker,0,ordinary_seeker,&seek));
+    wait_value(&test.ready,1);wait_value(&seek.ready,1);
+    read_arm(&test,COMPOSITION_READ_SERVICE|COMPOSITION_READ_HOLD|COMPOSITION_READ_SEEK);
+    if(observed)wait_value(&control->read_entered,1);
+    else CHECK(!pthread_join(reader,0));
+    composition_store(&control->read_waiter_tid,seek.tid);composition_store(&seek.go,1);
+    if(observed)CHECK(!pthread_join(reader,0));
+    CHECK(!pthread_join(seeker,0));command(COMPOSITION_READ_FINISH);
+    CHECK(test.result==16 && seek.result==16 && !memcmp(buffer+4094,source,16));record("ordinary-read-seek");
+
+    CHECK(!lseek(fd,0,SEEK_SET));
+    struct sigaction action={.sa_handler=read_signal};sigemptyset(&action.sa_mask);CHECK(!sigaction(SIGUSR1,&action,0));
+    test=(struct ordinary_read){.fd=fd,.buffer=buffer,.size=16,.signal_wait=1};read_signal_seen=0;
+    CHECK(!pthread_create(&reader,0,ordinary_reader,&test));wait_value(&test.ready,1);
+    read_arm(&test,COMPOSITION_READ_LOCAL|COMPOSITION_READ_HOLD|COMPOSITION_READ_CLOSE);
+    if(observed)wait_value(&control->read_entered,1);
+    else wait_value(&test.done,1);
+    CHECK(!close(fd));int replacement=open("/ordinary-read-replacement",O_CREAT|O_RDWR|O_TRUNC,0600);
+    CHECK(replacement==fd && write(replacement,"replacement",11)==11);
+    CHECK(!pthread_kill(reader,SIGUSR1));
+    if(observed)composition_store(&control->read_release,1);
+    CHECK(!pthread_join(reader,0));
+    command(COMPOSITION_READ_FINISH);
+    CHECK(test.result==16 && !memcmp(buffer,source,16));
+    CHECK(read_signal_seen);
+    CHECK(pread(replacement,buffer,11,0)==11 && !memcmp(buffer,"replacement",11));
+    CHECK(!close(replacement) && !unlink("/ordinary-read-replacement"));record("ordinary-read-close-signal");
+
+    fd=open("/ordinary-read-source",O_RDONLY);CHECK(fd>=0);memset(buffer,0,16);
+    test=(struct ordinary_read){.fd=fd,.buffer=buffer,.size=16};
+    CHECK(!pthread_create(&reader,0,ordinary_reader,&test));wait_value(&test.ready,1);
+    read_arm(&test,COMPOSITION_READ_LOCAL|COMPOSITION_READ_HOLD|COMPOSITION_READ_FORK);
+    if(observed)wait_value(&control->read_entered,1);else CHECK(!pthread_join(reader,0));
+    composition_store(&control->read_waiter_tid,(uint64_t)syscall(SYS_gettid));
+    /* 绕过libc的atfork锁，直接clone检查内核排写pin的握手。 */
+    pid_t child=(pid_t)syscall(SYS_clone,SIGCHLD,0,0,0,0);
+    CHECK(child>=0);if(!child)_exit(!memcmp(buffer,source,16) ? 0 : 1);
+    int status;CHECK(waitpid(child,&status,0)==child && status==0);
+    if(observed)CHECK(!pthread_join(reader,0));
+    command(COMPOSITION_READ_FINISH);
+    CHECK(test.result==16 && !memcmp(buffer,source,16));
+    /* 先由CPU0处理COW和冷缓存，随后实际用户hart连续消费两张热页。
+     * 此时观察phase已结束，不把预读功能混入130字节的精确前缀记录。 */
+    CHECK(pread(fd,buffer,8192,0)==8192 && !lseek(fd,0,SEEK_SET));
+    CHECK(!pthread_create(&reader,0,ordinary_sequential_reader,&test) && !pthread_join(reader,0));
+    CHECK(!close(fd) && !unlink("/ordinary-read-source") && !munmap(buffer,3*4096));
+    record("ordinary-read-fork-pin");
+}
 static void mappings(void)
 {
     int file=open("/mapped-pressure",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(file>=0);
@@ -204,6 +349,18 @@ static void mappings(void)
     pid_t child=fork();CHECK(child>=0);if (!child) _exit(test.anonymous[0]==42 ? 0 : 1);
     int status;CHECK(waitpid(child,&status,0)==child && status==0);
     CHECK(!munmap(test.anonymous,4096) && !munmap(test.file,8192) && !close(file));
+    /* fd已关闭时，最后VMA仍拥有文件；撤映射和固定替换都要归还该owner。 */
+    file=open("/mapped-pressure",O_RDONLY);CHECK(file>=0);
+    unsigned char *retired=mmap(0,4096,PROT_READ,MAP_SHARED,file,0);CHECK(retired!=MAP_FAILED);
+    CHECK(retired[0]==31 && !close(file) && !munmap(retired,4096));
+    file=open("/mapped-pressure",O_RDONLY);CHECK(file>=0);
+    unsigned char value=0;CHECK(pread(file,&value,1,0)==1 && value==31);
+    retired=mmap(0,4096,PROT_READ,MAP_SHARED,file,0);CHECK(retired!=MAP_FAILED);
+    CHECK(retired[0]==31 && !close(file));
+    CHECK(mmap(retired,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==retired);
+    retired[0]=53;CHECK(retired[0]==53 && !munmap(retired,4096));
+    file=open("/mapped-pressure",O_RDONLY);CHECK(file>=0);
+    CHECK(pread(file,&value,1,0)==1 && value==31 && !close(file));
     CHECK(!unlink("/mapped-pressure"));record("mm-reclaim");
 }
 struct waiter { unsigned index;int fd,futex;uint64_t ready;unsigned char value; };
@@ -310,14 +467,18 @@ int main(void)
 {
     setup();
     if (!access("/sqlite-scene",F_OK)) sqlite();
+    else if (!access("/ordinary-read-scene",F_OK)) {
+        ordinary_reads();puts("COMPOSITION END 7");
+    }
     else {
         concurrent_first_fault();
         concurrent_file_first_fault();
+        ordinary_reads();
         mappings();
         for (unsigned count=1;count<=32;count=count==1 ? 8 : 32) {
             waiters(count,0);waiters(count,1);group_exit(count);if (count==32) break;
         }
-        puts("COMPOSITION END 12");
+        puts("COMPOSITION END 19");
     }
     command(COMPOSITION_STOP);
     CHECK(!munmap(control,4096) && !close(control_fd) && !unlink("/dev/shm/smp-control"));

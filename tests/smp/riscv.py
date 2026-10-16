@@ -98,6 +98,8 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
                 raise RuntimeError(f"missing native FD/pipe/root closure:\n{text[-5000:]}")
         if contract=="file-io" and "FILE IO native cold buffer/offset/prefix/sync/close owners passed" not in text:
             raise RuntimeError("missing ordinary file IO and owner closure")
+        if contract=="file-io" and f"FILE IO local hot copy hart=0x{1 if cpus==2 else 0:x}" not in text:
+            raise RuntimeError("missing actual caller-hart hot copy and CPU0 cold backend evidence")
         for disk in disks:
             subprocess.run(["e2fsck","-fn",str(disk)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
         print(f"RV {contract} cpus={cpus} RAM={memory} actual I/O and owner closure passed",flush=True)

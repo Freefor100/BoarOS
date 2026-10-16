@@ -2,6 +2,9 @@
 #include <arch/riscv/sv39.h>
 #include <kernel/boot_memory.h>
 #include <kernel/mm.h>
+#include <kernel/mm_backend.h>
+#include "../../mm/uaccess_internal.h"
+#include "../../fs/uaccess_iov_internal.h"
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/uaccess.h>
@@ -569,6 +572,54 @@ static unsigned long run_copy_string_from_user(void)
     return 0U;
 }
 
+static unsigned long run_reused_write_pin(void)
+{
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table = {0};
+    struct kernel_mm mm = {0};
+    struct kernel_uaccess_write_cursor pages = {0};
+    struct kernel_mm_concurrency_state before, after;
+    uint64_t baseline;
+    size_t copied;
+    unsigned char bytes[8] = {1,2,3,4,5,6,7,8};
+    const struct kernel_uaccess_iovec iov[] = {
+        {TEST_USER_BASE + 1, 2}, {TEST_USER_BASE + 3, 0},
+        {TEST_USER_BASE + 3, 3}, {TEST_USER_BASE + 100, 3},
+    };
+    struct kernel_uaccess_iov_cursor cursor = {.iov=iov, .count=4};
+    if (!setup_mm(&allocator, &kernel_table, &mm, &baseline)) return 1;
+    kernel_mm_get_concurrency_state(&mm, &before);
+    /* 跨source及iov片段仍只持当前一个用户页，不重复查询PTE和登记引用。 */
+    if (kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, bytes, 4, &copied) || copied != 4 ||
+        kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, bytes + 4, 4, &copied) || copied != 4)
+        return 2;
+    kernel_mm_get_concurrency_state(&mm, &after);
+    if (after.pin_acquisitions != before.pin_acquisitions + 1 ||
+        after.pins != 1 || after.write_pins != 1) return 3;
+    for (unsigned i=0;i<5;i++) {
+        unsigned char actual;
+        if (!read_user_byte(&mm, TEST_USER_BASE + 1 + i, &actual) || actual != bytes[i]) return 4;
+    }
+    for (unsigned i=0;i<3;i++) {
+        unsigned char actual;
+        if (!read_user_byte(&mm, TEST_USER_BASE + 100 + i, &actual) || actual != bytes[5+i]) return 5;
+    }
+    if (kernel_uaccess_write_cursor_copy(&mm, &pages,
+        TEST_USER_BASE + BOAROS_PAGE_SIZE - 2, bytes, 4, &copied) || copied != 4) return 6;
+    kernel_mm_get_concurrency_state(&mm, &after);
+    if (after.pin_acquisitions != before.pin_acquisitions + 2 || after.pins != 1) return 7;
+    /* 后一页缺失：返回准确前缀，进入fault前已结束上一页写借用。 */
+    if (kernel_uaccess_write_cursor_copy(&mm, &pages,
+        TEST_USER_BASE + 2 * BOAROS_PAGE_SIZE - 3, bytes, 8, &copied) !=
+        KERNEL_UACCESS_STATUS_FAULT || copied != 3 || pages.pin.registration) return 8;
+    kernel_mm_get_concurrency_state(&mm, &after);
+    if (after.pins || after.write_pins) return 9;
+    kernel_uaccess_write_cursor_finish(&pages);
+    kernel_uaccess_write_cursor_finish(&pages);
+    if (kernel_mm_release(&mm) || physical_page_available(&allocator) != baseline) return 10;
+    return 0;
+}
+
 unsigned long run_all_uaccess_cases(void)
 {
     unsigned long result = run_cross_page_copy();
@@ -605,5 +656,7 @@ unsigned long run_all_uaccess_cases(void)
         return UINT64_C(0x800) + result;
     }
     result = run_copy_string_from_user();
-    return result == 0U ? 0U : UINT64_C(0x900) + result;
+    if (result != 0U) return UINT64_C(0x900) + result;
+    result = run_reused_write_pin();
+    return result == 0U ? 0U : UINT64_C(0xa00) + result;
 }

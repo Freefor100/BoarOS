@@ -9,7 +9,8 @@ cc=${HOST_CC:-cc}
     -Wno-stringop-truncation -DCONFIG_USE_DEFAULT_CFG=1 ${ORPHAN_TEST_CFLAGS:-} \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_orphan.c" \
-    "$root/tests/host/block_fault.c" "$root/kernel/block.c" -o "$work/probe"
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" \
+    -Wl,--wrap=malloc -Wl,--wrap=calloc -o "$work/probe"
 printf 'persistent orphan fixture' > "$work/data"
 for features in '^orphan_file' orphan_file 'orphan_file,^metadata_csum_seed' 'orphan_file,^metadata_csum,^metadata_csum_seed'; do
     image="$work/$features.img"
@@ -20,13 +21,23 @@ for features in '^orphan_file' orphan_file 'orphan_file,^metadata_csum_seed' 'or
     done
     cp "$image" "$work/base-$features.img"
     timeout 30 "$work/probe" "$image" readonly
+    cp "$image" "$work/lookup.img"
+    timeout 30 "$work/probe" "$work/lookup.img" lookup
+    cp "$image" "$work/rollback.img"
+    timeout 30 "$work/probe" "$work/rollback.img" rollback
+    cp "$image" "$work/group.img"
+    timeout 30 "$work/probe" "$work/group.img" group-rollback
+    timeout 30 "$work/probe" "$work/group.img" drain
+    e2fsck -fn "$work/group.img" >/dev/null
+    cp "$image" "$work/mutation.img"
+    timeout 30 "$work/probe" "$work/mutation.img" mutation-reject
     timeout 30 "$work/probe" "$image" add
     cp "$image" "$work/pending-$features.img"
     timeout 30 "$work/probe" "$image" remove-one
     timeout 30 "$work/probe" "$image" remove-one
     timeout 30 "$work/probe" "$image" finish
     e2fsck -fn "$image" >/dev/null
-    printf 'PASS: %s add/remove, crash enumeration, repeated recovery\n' "$features"
+    printf 'PASS: %s add/remove, indexed lookup, rollback, mutation validation, crash enumeration\n' "$features"
 done
 
 for damage in file-magic file-checksum file-range file-free file-duplicate \
@@ -48,7 +59,7 @@ orphan_ino=$(dumpe2fs -h "$work/full.img" 2>/dev/null | sed -n 's/^Orphan file i
 debugfs -w -R "punch <$orphan_ino> 1 4294967295" "$work/full.img" >/dev/null 2>&1
 debugfs -w -R "set_inode_field <$orphan_ino> size 1024" "$work/full.img" >/dev/null 2>&1
 i=0
-while [ "$i" -le 254 ]; do
+while [ "$i" -le 257 ]; do
     printf 'write %s /fill-%s\n' "$work/data" "$i" >> "$work/fill.commands"
     i=$((i + 1))
 done

@@ -41,9 +41,33 @@ static uint64_t shared_mapping;
 static struct kernel_files views[4];
 static struct kernel_open_file_description *controls[4];
 static unsigned pause_access,access_entered,resume_access,stop_done;
+static unsigned pause_local_access,local_access_entered,resume_local_access;
 #define PACKETS 32U
 struct packet { uint32_t actor,sequence; unsigned char payload[24]; };
 static pthread_barrier_t launch;
+static unsigned read_seen[4][PACKETS];
+static void *parallel_reader(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    mm_test_attach(id+1);kernel_cpu_current()->logical_id=id&1;
+    mm_test_bind(&mm);mm_test_bind_files(&views[id]);mm_test_context=context;
+    int started=pthread_barrier_wait(&launch);
+    assert(!started || started==PTHREAD_BARRIER_SERIAL_THREAD);
+    uint64_t buffer=0x200000+id*BOAROS_PAGE_SIZE;
+    for(unsigned n=0;n<PACKETS;n++) {
+        int64_t result;size_t copied;
+        if(n&1) {
+            struct kernel_uaccess_iovec iov[2]={{buffer,13},{buffer+13,sizeof(struct packet)-13}};
+            assert(!kernel_copy_to_user(&mm,buffer+128,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+            assert(!kernel_files_readv(&views[id],&mm,0,buffer+128,2,&result));
+        } else assert(!kernel_files_read(&views[id],&mm,0,buffer,sizeof(struct packet),&result));
+        struct packet packet;
+        assert(result==sizeof(packet) && !kernel_copy_from_user(&mm,&packet,buffer,sizeof(packet),&copied) && copied==sizeof(packet));
+        assert(packet.actor<4 && packet.sequence<PACKETS && !__atomic_fetch_add(&read_seen[packet.actor][packet.sequence],1,__ATOMIC_RELAXED));
+        for(unsigned j=0;j<sizeof(packet.payload);j++)assert(packet.payload[j]==0x40+packet.actor);
+    }
+    assert(!kernel_files_release(&views[id]));mm_test_finish();return 0;
+}
 static void *parallel_writer(void *argument)
 {
     unsigned id=(unsigned)(uintptr_t)argument;
@@ -101,16 +125,40 @@ static void parallel_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
         for (unsigned j=0;j<sizeof(packets[i].payload);j++)
             assert(packets[i].payload[j]==0x40+packets[i].actor);
     }
+    if(!append) {
+        assert(!kernel_files_lseek(&files,0,0,0,&result) && !result);
+        struct kernel_page_cache_concurrency_state before={0},after={0};
+        if(cache)kernel_page_cache_get_concurrency_state(cache,&before);
+        memset(read_seen,0,sizeof(read_seen));
+        assert(!pthread_barrier_init(&launch,0,actors));
+        for(unsigned i=0;i<actors;i++) {
+            views[i]=(struct kernel_files){0};assert(!kernel_files_acquire(&views[i],&files));
+            assert(!pthread_create(&threads[i],0,parallel_reader,(void *)(uintptr_t)i));
+        }
+        for(unsigned i=0;i<actors;i++)assert(!pthread_join(threads[i],0));
+        assert(!pthread_barrier_destroy(&launch));mm_test_attach(0);mm_test_activate_task();
+        assert(controls[0]->offset==(uint64_t)total);
+        for(unsigned i=0;i<actors;i++)for(unsigned n=0;n<PACKETS;n++)assert(read_seen[i][n]==1);
+        if(cache) {
+            kernel_page_cache_get_concurrency_state(cache,&after);
+            assert(after.requests_queued==before.requests_queued);
+        }
+        puts("PASS shared OFD read/readv: unique complete packets, one total offset, hot hits stay off CPU0 queue");
+    }
     assert(!kernel_files_sync(&files,0,0,&result) && !result);
     assert(!kernel_files_release(&files));
     for (unsigned i=0;i<actors;i++) assert(!kernel_open_file_release(&controls[i]));
     if (cache) kernel_page_cache_stop_worker(cache);
     printf("PASS %u threads %s %s: unique whole packets, offsets, final owners\n",actors,
-        cache?"ext4 CPU0":"tmpfs local",append?"independent append OFDs":"shared OFD");
+        cache?"ext4":"tmpfs",append?"independent append OFDs":"shared OFD");
 }
 static enum kernel_block_status read_image(void *unused,uint64_t offset,void *data,size_t size)
 {
     (void)unused; assert(!kernel_cpu_current()->logical_id && !kernel_cpu_current()->raw_locks);
+    if (__atomic_exchange_n(&pause_access,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&access_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&resume_access,__ATOMIC_ACQUIRE)) sched_yield();
+    }
     return pread(image,data,size,offset)==(ssize_t)size?KERNEL_BLOCK_STATUS_OK:KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status write_image(void *unused,uint64_t offset,const void *data,size_t size)
@@ -123,22 +171,21 @@ static enum kernel_block_status flush_image(void *unused)
 void __real_kernel_vfs_file_accessed(struct kernel_vfs_file *);
 void __wrap_kernel_vfs_file_accessed(struct kernel_vfs_file *file)
 {
-    if (!kernel_vfs_file_memory(file)) assert(!kernel_cpu_current()->logical_id &&
-        "regular disk read touched backend metadata on CPU1");
-    if (__atomic_exchange_n(&pause_access,0,__ATOMIC_ACQ_REL)) {
-        __atomic_store_n(&access_entered,1,__ATOMIC_RELEASE);
-        while (!__atomic_load_n(&resume_access,__ATOMIC_ACQUIRE)) sched_yield();
+    if(__atomic_exchange_n(&pause_local_access,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&local_access_entered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&resume_local_access,__ATOMIC_ACQUIRE))sched_yield();
     }
     __real_kernel_vfs_file_accessed(file);
 }
-struct crossing { unsigned id; enum kernel_files_status status; int64_t result; char bytes[8]; };
+struct crossing { unsigned id,shared; enum kernel_files_status status; int64_t result; char bytes[8]; };
 static void *crossing_read(void *argument)
 {
     struct crossing *call=argument; mm_test_attach(call->id); mm_test_bind(&mm);
     mm_test_bind_files(&files); mm_test_context=context;
     uint64_t buffer=0x200000+call->id*BOAROS_PAGE_SIZE;
-    call->status=kernel_files_pread(&files,&mm,0,buffer,8,0,&call->result);
-    if (!call->status) {
+    call->status=call->shared ? kernel_files_read(&files,&mm,0,buffer,8,&call->result) :
+        kernel_files_pread(&files,&mm,0,buffer,8,0,&call->result);
+    if (!call->status && call->result>=0) {
         size_t copied;
         assert(call->result==8 && !kernel_copy_from_user(&mm,call->bytes,buffer,8,&copied) && copied==8);
     }
@@ -159,6 +206,9 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
         assert(!kernel_open_file_create_mode(heap,mount,i?"/new-identity":"/old-identity",0600,&controls[i],&error) && !error);
         controls[i]->open_flags=2; assert(!kernel_vfs_file_acquire_write(&controls[i]->file));
         assert(!kernel_vfs_pwrite(&controls[i]->file,0,i?"replaced":"original",8,&done) && done==8);
+        uint64_t observed=0;
+        assert(!kernel_vfs_sync(&controls[i]->file,0,&observed) &&
+            !kernel_page_cache_invalidate_node(cache,kernel_open_file_node(controls[i])));
         struct kernel_open_file_description *slot=controls[i];
         assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,i,0,&slot));
     }
@@ -174,7 +224,7 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     struct kernel_page_cache_concurrency_state state;
     do { kernel_page_cache_get_concurrency_state(cache,&state); sched_yield(); } while (state.pending!=1);
     assert(state.running==1 && !pthread_create(&stopper,0,stop_requests,cache));
-    assert(!pthread_join(pending,0) && queued.status==KERNEL_FILES_STATUS_STATE);
+    assert(!pthread_join(pending,0) && !queued.status && queued.result==-KERNEL_EIO);
     assert(!__atomic_load_n(&stop_done,__ATOMIC_ACQUIRE));
     assert(controls[0]->references==2); /* cancel不是正在执行请求的完成。 */
     __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);
@@ -185,6 +235,67 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     mm_test_attach(0); mm_test_activate_task(); assert(!kernel_files_release(&files));
     for (unsigned i=0;i<2;i++) assert(!kernel_open_file_release(&controls[i]));
     puts("PASS executing OFD survives close/reuse; queued cancellation drains before stop; actual prefix and final owners");
+}
+static void *crossing_seek(void *argument)
+{
+    struct crossing *call=argument;mm_test_attach(call->id);mm_test_bind(&mm);
+    mm_test_bind_files(&files);mm_test_context=context;
+    call->status=kernel_files_lseek(&files,0,0,1,&call->result);
+    mm_test_finish();return 0;
+}
+static void borrowed_execution(void *argument)
+{ (*(unsigned *)argument)++; }
+static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
+    struct kernel_page_cache *cache)
+{
+    int error;size_t written;uint64_t observed=0;
+    files=(struct kernel_files){0};assert(!kernel_files_create(&files,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,"/offset-handoff",0600,&control,&error) && !error);
+    control->open_flags=2;
+    assert(!kernel_vfs_file_acquire_write(&control->file) &&
+        !kernel_vfs_pwrite(&control->file,0,"offset!!",8,&written) && written==8 &&
+        !kernel_vfs_sync(&control->file,0,&observed) &&
+        !kernel_page_cache_invalidate_node(cache,kernel_open_file_node(control)));
+    struct kernel_open_file_description *slot=control;
+    assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot) &&
+        !kernel_page_cache_start_worker(cache) && !kernel_files_enable_concurrency(&files,&mm));
+    {
+        unsigned executed=0;
+        struct kernel_mm_user_pin pin={0};
+        assert(!kernel_mm_pin_user_page(&mm,0x200000,KERNEL_MM_READ,&pin));
+        KERNEL_LOCK_SCOPE(offset);
+        kernel_mutex_lock(&control->offset_lock,&offset);
+        assert(kernel_open_file_sync_range(control,0,UINT64_MAX)==-KERNEL_EIO);
+        assert(kernel_page_cache_run_cpu0_borrowing(cache,borrowed_execution,&executed,&offset)==KERNEL_PAGE_CACHE_STATUS_STATE && !executed);
+        kernel_mm_unpin_user_page(&pin);
+        struct kernel_lock_guard unregistered={.lock=&control->offset_lock.lock,.owner=kernel_io_context_current(),.write=1};
+        assert(kernel_page_cache_run_cpu0_borrowing(cache,borrowed_execution,&executed,&unregistered)==KERNEL_PAGE_CACHE_STATUS_STATE && !executed);
+        assert(!kernel_page_cache_run_cpu0_borrowing(cache,borrowed_execution,&executed,&offset) && executed==1 &&
+            kernel_io_context_current()->locks==&offset && kernel_lock_held(&control->offset_lock.lock,1));
+    }
+    local_access_entered=resume_local_access=0;__atomic_store_n(&pause_local_access,1,__ATOMIC_RELEASE);
+    struct crossing reader={.id=1,.shared=1},seeker={.id=2};pthread_t reading,seeking;
+    assert(!pthread_create(&reading,0,crossing_read,&reader));
+    while(!__atomic_load_n(&local_access_entered,__ATOMIC_ACQUIRE))sched_yield();
+    struct kernel_page_cache_concurrency_state before,after;
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    assert(!pthread_create(&seeking,0,crossing_seek,&seeker));
+    for(;;) {
+        unsigned waiting;
+        { KERNEL_RAW_SCOPE(guard,&control->offset_lock.lock.metadata);waiting=control->offset_lock.lock.writers_waiting; }
+        if(waiting)break;
+        sched_yield();
+    }
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    assert(after.executions_queued==before.executions_queued);
+    __atomic_store_n(&resume_local_access,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reading,0) && !pthread_join(seeking,0));
+    assert(!reader.status && reader.result==8 && !memcmp(reader.bytes,"offset!!",8) &&
+        !seeker.status && seeker.result==8 && control->offset==8);
+    mm_test_attach(0);mm_test_activate_task();
+    assert(!kernel_files_release(&files) && !kernel_open_file_release(&control));
+    kernel_page_cache_stop_worker(cache);
+    puts("PASS shared offset qualification precedes CPU0 queue: held read, waiting seek, cold miss and actual owners finish");
 }
 static void bind(unsigned id)
 { mm_test_attach(id); mm_test_bind(&mm); mm_test_bind_files(&files); mm_test_context=context; }
@@ -303,7 +414,7 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     if (cache) {
         struct kernel_page_cache_concurrency_state state;
         kernel_page_cache_get_concurrency_state(cache,&state);
-        assert(state.executions_queued>=10 && state.executions_completed==state.executions_queued && !state.pending && !state.running);
+        assert(state.executions_queued && state.executions_completed==state.executions_queued && !state.pending && !state.running);
     }
     char bytes[8];
     assert(!kernel_open_file_pread(control,32,bytes,8,&done) && done==8 && !memcmp(bytes,"original",8));
@@ -410,6 +521,7 @@ int main(int argc,char **argv)
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);
+    offset_handoff_case(&heap,&mount,&cache);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,&mount,&cache,actors,append);
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache)); assert(!close(image));

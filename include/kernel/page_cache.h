@@ -113,6 +113,12 @@ void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *,
  * 在普通CPU0任务、缓存保护外执行。关闭取消未执行者，执行者等实际结束。 */
 enum kernel_page_cache_status kernel_page_cache_run_cpu0(struct kernel_page_cache *,
     void (*execute)(void *),void *argument);
+struct kernel_lock_guard;
+/* OFD位置操作的caller持唯一指定互斥资格至callback完成；executor只借用，
+ * 不取得、转移或归还该锁。其他锁、user pin和cache写借用仍禁止排队。 */
+enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(
+    struct kernel_page_cache *,void (*execute)(void *),void *argument,
+    const struct kernel_lock_guard *borrowed);
 int kernel_page_cache_is_executor(const struct kernel_page_cache *);
 
 /* Returns an owned physical-page reference that the caller must release. */
@@ -143,6 +149,13 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     uint64_t page_index,
     uint64_t *physical_address,
     size_t *valid_bytes);
+
+/* 调用者持有file/cache owner；一次资格尝试整批现有完成页，不等待、分配或I/O。
+ * 成功逐项返回物理页借用或EOF，由调用者release；失败已归还本次全部借用，
+ * 没有可消费输出。不延长entry/node借用，也不改变CPU0回收者的LRU游标。 */
+enum kernel_page_cache_status kernel_page_cache_try_resident_batch(
+    struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first_page,
+    struct kernel_page_cache_read_page *pages, size_t count);
 
 enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,

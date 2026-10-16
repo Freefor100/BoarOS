@@ -131,7 +131,7 @@ static void test_read_batch(void)
     struct kernel_block_device device = {.context = &disk, .read = read_bytes,
         .logical_block_size = 512, .capacity_bytes = 64};
     unsigned char output[24]; memset(output, 0xa5, sizeof(output));
-    struct kernel_block_read_span spans[3] = {
+    struct block_read_span spans[3] = {
         {.offset = 16, .buffer = output, .size = 8},
         {.offset = 0, .buffer = output + 8, .size = 8},
         {.offset = 16, .buffer = output + 16, .size = 8}};
@@ -157,7 +157,7 @@ static void test_read_batch(void)
     assert(spans[0].completed == 8 && spans[0].status == KERNEL_BLOCK_STATUS_OK &&
         spans[1].completed == 0 && spans[1].status == KERNEL_BLOCK_STATUS_IO &&
         spans[2].completed == 8 && spans[2].status == KERNEL_BLOCK_STATUS_OK && output[8] == 0xa5);
-    spans[0] = (struct kernel_block_read_span){.offset = 64};
+    spans[0] = (struct block_read_span){.offset = 64};
     disk.reads = 0;
     assert(kernel_block_read_batch(&device, spans, 1) == KERNEL_BLOCK_STATUS_OK && !disk.reads &&
         spans[0].status == KERNEL_BLOCK_STATUS_OK && !spans[0].completed);

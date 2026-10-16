@@ -64,6 +64,10 @@ static inline int kernel_files_controlled(const struct kernel_files *files)
 #define KERNEL_FILES_SCOPE(name, files) \
     KERNEL_RAW_SCOPE(name, &(files)->record->metadata_lock)
 void kernel_files_note(struct kernel_files *, size_t offset, uint64_t value);
+#if BOAROS_USER_SMP
+enum kernel_files_status kernel_files_pin_local_regular(struct kernel_files *, int64_t,
+    struct kernel_open_file_description **, int *, int64_t *);
+#endif
 #define KERNEL_FILES_NOTE(files, field, value) \
     kernel_files_note((files), offsetof(struct kernel_files_statistics, field), (value))
 int kernel_files_fd_matches(struct kernel_files *, int64_t,

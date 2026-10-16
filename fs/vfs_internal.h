@@ -47,18 +47,13 @@ struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint6
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
-#define KERNEL_VFS_READ_BATCH_MAX 32U
-struct kernel_vfs_read_span {
-    uint64_t offset;
-    void *buffer;
-    size_t size, completed;
-    int error;
-};
+#define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX
 /* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX
  * nonoverlapping, valid kernel destinations until return. Successful spans
- * may stop at EOF; errors preserve each contiguous byte prefix. */
+ * may stop at EOF; errors preserve each contiguous byte prefix. Multi-output
+ * calls lend an independent request workspace through synchronous completion. */
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct kernel_vfs_read_span *spans, size_t count);
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace);
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           uint64_t offset,

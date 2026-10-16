@@ -17,38 +17,207 @@
 #include <string.h>
 
 struct orphan_tail { uint32_t magic, checksum; };
-struct orphan_seen { uint32_t *table; size_t capacity, count; };
-struct orphan_scan {
-    uint32_t first, target, previous, next, slot, free_slot, seed;
-    ext4_fsblk_t block, free_block;
-    bool found;
-    struct orphan_seen seen;
+#define ORPHAN_NO_BLOCK UINT32_MAX
+
+struct orphan_record {
+    uint32_t inode, previous, next, file_block, slot;
+    uint32_t list_previous, list_next;
+    uint8_t state;
+};
+struct orphan_file_block {
+    ext4_fsblk_t lba;
+    uint32_t free_count, free_previous, free_next;
+};
+struct ext4_orphan_index {
+    struct orphan_record *table;
+    size_t capacity, occupied, count, pending;
+    uint32_t head, chain_head, seed, file_blocks, slots, words, free_head;
+    struct orphan_file_block *blocks;
+    uint64_t *free_slots;
+};
+struct ext4_orphan_undo {
+    struct ext4_orphan_undo *next;
+    struct ext4_orphan_index *index;
+    struct orphan_record old;
+    uint32_t inode;
+    bool restore;
 };
 
-static int seen_insert(struct orphan_seen *seen, uint32_t inode)
+static struct orphan_record *index_find(struct ext4_orphan_index *index, uint32_t inode)
 {
-    if (seen->count >= seen->capacity / 2) {
-        size_t cap = seen->capacity ? seen->capacity * 2 : 32;
-        if (cap < seen->capacity || cap > SIZE_MAX / sizeof(uint32_t)) return ENOMEM;
-        uint32_t *table = ext4_calloc(cap, sizeof(*table));
-        if (!table) return ENOMEM;
-        for (size_t i = 0; i < seen->capacity; i++) if (seen->table[i]) {
-            size_t slot = (seen->table[i] * 2654435761U) & (cap - 1);
-            while (table[slot]) slot = (slot + 1) & (cap - 1);
-            table[slot] = seen->table[i];
-        }
-        ext4_free(seen->table);
-        seen->table = table;
-        seen->capacity = cap;
+    if (!index->capacity) return NULL;
+    size_t slot = (inode * 2654435761U) & (index->capacity - 1);
+    while (index->table[slot].state) {
+        if (index->table[slot].state == 1 && index->table[slot].inode == inode)
+            return &index->table[slot];
+        slot = (slot + 1) & (index->capacity - 1);
     }
-    size_t slot = (inode * 2654435761U) & (seen->capacity - 1);
-    while (seen->table[slot]) {
-        if (seen->table[slot] == inode) return EUCLEAN;
-        slot = (slot + 1) & (seen->capacity - 1);
+    return NULL;
+}
+
+static void index_store(struct ext4_orphan_index *index, struct orphan_record record)
+{
+    size_t slot = (record.inode * 2654435761U) & (index->capacity - 1);
+    while (index->table[slot].state == 1) slot = (slot + 1) & (index->capacity - 1);
+    if (!index->table[slot].state) index->occupied++;
+    record.state = 1;
+    index->table[slot] = record;
+    index->count++;
+}
+
+static int index_reserve(struct ext4_orphan_index *index)
+{
+    if (index->occupied + 1 < index->capacity / 2) return EOK;
+    size_t capacity = index->capacity ? index->capacity : 32;
+    if (index->count + 1 >= capacity / 2) {
+        if (capacity > SIZE_MAX / 2) return ENOMEM;
+        capacity *= 2;
     }
-    seen->table[slot] = inode;
-    seen->count++;
+    if (capacity > SIZE_MAX / sizeof(*index->table)) return ENOMEM;
+    struct orphan_record *table = ext4_calloc(capacity, sizeof(*table));
+    if (!table) return ENOMEM;
+    struct orphan_record *old = index->table;
+    size_t old_capacity = index->capacity;
+    index->table = table;
+    index->capacity = capacity;
+    index->occupied = index->count = 0;
+    for (size_t i = 0; i < old_capacity; i++)
+        if (old[i].state == 1) index_store(index, old[i]);
+    ext4_free(old);
     return EOK;
+}
+
+static int index_load_record(struct ext4_orphan_index *index, struct orphan_record record)
+{
+    if (index_find(index, record.inode)) return EUCLEAN;
+    int r = index_reserve(index);
+    if (r != EOK) return r;
+    record.list_next = index->head;
+    if (index->head) index_find(index, index->head)->list_previous = record.inode;
+    index->head = record.inode;
+    index_store(index, record);
+    return EOK;
+}
+
+static void index_free(struct ext4_orphan_index *index)
+{
+    if (!index) return;
+    ext4_free(index->free_slots);
+    ext4_free(index->blocks);
+    ext4_free(index->table);
+    ext4_free(index);
+}
+
+void ext4_orphan_index_fini(struct ext4_fs *fs)
+{
+    if (fs->orphan_index && fs->orphan_index->pending) __builtin_trap();
+    index_free(fs->orphan_index);
+    fs->orphan_index = NULL;
+}
+
+static void free_block_link(struct ext4_orphan_index *index, uint32_t block)
+{
+    struct orphan_file_block *entry = &index->blocks[block];
+    entry->free_previous = ORPHAN_NO_BLOCK;
+    entry->free_next = index->free_head;
+    if (index->free_head != ORPHAN_NO_BLOCK)
+        index->blocks[index->free_head].free_previous = block;
+    index->free_head = block;
+}
+
+static void free_slot_set(struct ext4_orphan_index *index, uint32_t block,
+                          uint32_t slot, bool free_slot)
+{
+    struct orphan_file_block *entry = &index->blocks[block];
+    uint64_t *word = &index->free_slots[(size_t)block * index->words + slot / 64];
+    uint64_t mask = UINT64_C(1) << (slot % 64);
+    if (((*word & mask) != 0) == free_slot) __builtin_trap();
+    if (free_slot) {
+        *word |= mask;
+        if (!entry->free_count++) free_block_link(index, block);
+    } else {
+        *word &= ~mask;
+        if (!entry->free_count) __builtin_trap();
+        if (!--entry->free_count) {
+            if (entry->free_previous != ORPHAN_NO_BLOCK)
+                index->blocks[entry->free_previous].free_next = entry->free_next;
+            else index->free_head = entry->free_next;
+            if (entry->free_next != ORPHAN_NO_BLOCK)
+                index->blocks[entry->free_next].free_previous = entry->free_previous;
+        }
+    }
+}
+
+/* Rollback uses the same location edits in reverse; hash capacity and the
+ * free-slot bitmap were reserved before touching journaled metadata. */
+static void index_insert(struct ext4_orphan_index *index, struct orphan_record record)
+{
+    if (record.list_previous)
+        index_find(index, record.list_previous)->list_next = record.inode;
+    else index->head = record.inode;
+    if (record.list_next)
+        index_find(index, record.list_next)->list_previous = record.inode;
+    if (record.file_block != ORPHAN_NO_BLOCK)
+        free_slot_set(index, record.file_block, record.slot, false);
+    else {
+        if (record.previous) index_find(index, record.previous)->next = record.inode;
+        else index->chain_head = record.inode;
+        if (record.next) index_find(index, record.next)->previous = record.inode;
+    }
+    index_store(index, record);
+}
+
+static void index_remove(struct ext4_orphan_index *index, uint32_t inode)
+{
+    struct orphan_record *record = index_find(index, inode);
+    if (!record) __builtin_trap();
+    if (record->list_previous)
+        index_find(index, record->list_previous)->list_next = record->list_next;
+    else index->head = record->list_next;
+    if (record->list_next)
+        index_find(index, record->list_next)->list_previous = record->list_previous;
+    if (record->file_block != ORPHAN_NO_BLOCK)
+        free_slot_set(index, record->file_block, record->slot, true);
+    else {
+        if (record->previous) index_find(index, record->previous)->next = record->next;
+        else index->chain_head = record->next;
+        if (record->next) index_find(index, record->next)->previous = record->previous;
+    }
+    record->state = 2;
+    index->count--;
+}
+
+void ext4_orphan_trans_finish(struct jbd_trans *trans, bool abort)
+{
+    struct ext4_orphan_undo *undo;
+    while ((undo = trans->orphan_undo)) {
+        trans->orphan_undo = undo->next;
+        if (abort) {
+            if (undo->restore) index_insert(undo->index, undo->old);
+            else index_remove(undo->index, undo->inode);
+        }
+        if (!undo->index->pending) __builtin_trap();
+        undo->index->pending--;
+        ext4_free(undo);
+    }
+}
+
+static struct ext4_orphan_undo *reserve_undo(struct ext4_fs *fs,
+                                           struct orphan_record *old, uint32_t inode)
+{
+    struct ext4_orphan_undo *undo = ext4_malloc(sizeof(*undo));
+    if (!undo) return NULL;
+    *undo = (struct ext4_orphan_undo){.index = fs->orphan_index,
+                                    .inode = inode, .restore = old != NULL};
+    if (old) undo->old = *old;
+    return undo;
+}
+
+static void record_undo(struct ext4_fs *fs, struct ext4_orphan_undo *undo)
+{
+    undo->next = fs->curr_trans->orphan_undo;
+    fs->curr_trans->orphan_undo = undo;
+    undo->index->pending++;
 }
 
 static uint32_t inode_seed(struct ext4_inode_ref *ref)
@@ -160,12 +329,11 @@ static int check_block(struct ext4_fs *fs, struct ext4_block *block, uint32_t se
     return EOK;
 }
 
-static int scan_file(struct ext4_fs *fs, struct orphan_scan *scan,
+static int scan_file(struct ext4_fs *fs, struct ext4_orphan_index *index,
                      struct ext4_inode_ref *caller)
 {
-    if (!ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT)) {
+    if (!ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT))
         return ext4_sb_feature_ro_com(&fs->sb, EXT4_ORPHAN_PRESENT_RO_COMPAT) ? EUCLEAN : EOK;
-    }
     struct ext4_inode_ref file;
     int r = load_inode(fs, ext4_get32(&fs->sb, orphan_file_inum), &file, true);
     if (r != EOK) return r;
@@ -174,26 +342,40 @@ static int scan_file(struct ext4_fs *fs, struct orphan_scan *scan,
     uint64_t blocks = length / size;
     if ((ext4_inode_get_mode(&fs->sb, file.inode) & EXT4_INODE_MODE_TYPE_MASK) !=
         EXT4_INODE_MODE_FILE || length % size ||
-        blocks > fs->bdev->lg_bcnt || blocks > UINT32_MAX) { r = EUCLEAN; goto Done; }
-    scan->seed = inode_seed(&file);
-    for (uint64_t i = 0; i < blocks; i++) {
+        blocks > fs->bdev->lg_bcnt || blocks >= ORPHAN_NO_BLOCK) { r = EUCLEAN; goto Done; }
+    index->seed = inode_seed(&file);
+    index->file_blocks = (uint32_t)blocks;
+    index->slots = (size - sizeof(struct orphan_tail)) / 4;
+    index->words = (index->slots + 63) / 64;
+    if (blocks > SIZE_MAX / sizeof(*index->blocks) ||
+        blocks > SIZE_MAX / sizeof(*index->free_slots) / index->words) { r = ENOMEM; goto Done; }
+    if (blocks) {
+        index->blocks = ext4_calloc((size_t)blocks, sizeof(*index->blocks));
+        index->free_slots = ext4_calloc((size_t)blocks * index->words, sizeof(*index->free_slots));
+        if (!index->blocks || !index->free_slots) { r = ENOMEM; goto Done; }
+    }
+    for (uint32_t i = 0; i < blocks; i++) {
         ext4_fsblk_t physical;
-        r = ext4_fs_get_inode_dblk_idx(&file, (ext4_lblk_t)i, &physical, false);
+        r = ext4_fs_get_inode_dblk_idx(&file, i, &physical, false);
         if (r == EINVAL) r = EUCLEAN;
         if (r != EOK) break;
         if (!physical || physical >= fs->bdev->lg_bcnt) { r = EUCLEAN; break; }
+        index->blocks[i].lba = physical;
+        index->blocks[i].free_previous = index->blocks[i].free_next = ORPHAN_NO_BLOCK;
         struct ext4_block block;
         r = ext4_block_get(fs->bdev, &block, physical);
         if (r != EOK) break;
-        r = check_block(fs, &block, scan->seed);
+        r = check_block(fs, &block, index->seed);
         uint32_t *entries = (void *)block.data;
-        for (uint32_t j = 0; r == EOK && j < (size - sizeof(struct orphan_tail)) / 4; j++) {
+        for (uint32_t j = 0; r == EOK && j < index->slots; j++) {
             uint32_t ino = to_le32(entries[j]);
             if (!ino) {
-                if (!scan->free_block) { scan->free_block = physical; scan->free_slot = j; }
+                index->free_slots[(size_t)i * index->words + j / 64] |= UINT64_C(1) << (j % 64);
+                index->blocks[i].free_count++;
                 continue;
             }
-            r = seen_insert(&scan->seen, ino);
+            struct orphan_record record = {.inode = ino, .file_block = i, .slot = j};
+            r = index_load_record(index, record);
             if (r != EOK) break;
             if (caller && ino == caller->index) r = check_allocated(fs, ino, false);
             else {
@@ -201,28 +383,30 @@ static int scan_file(struct ext4_fs *fs, struct orphan_scan *scan,
                 r = load_inode(fs, ino, &ref, false);
                 if (r == EOK) r = ext4_fs_put_inode_ref(&ref);
             }
-            if (r != EOK) break;
-            if (!scan->first) scan->first = ino;
-            if (ino == scan->target) {
-                scan->found = true; scan->block = physical; scan->slot = j;
-            }
         }
         int release = ext4_block_set(fs->bdev, &block);
         if (r == EOK) r = release;
         if (r != EOK) break;
     }
+    if (r == EOK) for (uint32_t i = index->file_blocks; i; i--)
+        if (index->blocks[i - 1].free_count) free_block_link(index, i - 1);
 Done:
     { int release = ext4_fs_put_inode_ref(&file); return r != EOK ? r : release; }
 }
 
-static int scan_all(struct ext4_fs *fs, struct orphan_scan *scan,
-                    struct ext4_inode_ref *caller)
+static int load_index(struct ext4_fs *fs, struct ext4_inode_ref *caller)
 {
+    struct ext4_orphan_index *index = ext4_calloc(1, sizeof(*index));
+    if (!index) return ENOMEM;
+    index->free_head = ORPHAN_NO_BLOCK;
     uint32_t ino = ext4_get32(&fs->sb, last_orphan), previous = 0;
+    index->chain_head = ino;
     int r = EOK;
-    scan->first = ino;
     while (ino) {
-        r = seen_insert(&scan->seen, ino); /* Detect every chain cycle too. */
+        struct orphan_record record = {.inode = ino, .previous = previous,
+                                       .file_block = ORPHAN_NO_BLOCK};
+        /* Insert before following next so duplicate records also detect cycles. */
+        r = index_load_record(index, record);
         if (r != EOK) break;
         uint32_t next;
         if (caller && ino == caller->index) {
@@ -237,16 +421,19 @@ static int scan_all(struct ext4_fs *fs, struct orphan_scan *scan,
             r = ext4_fs_put_inode_ref(&ref);
             if (r != EOK) break;
         }
-        if (ino == scan->target) {
-            scan->found = true; scan->previous = previous; scan->next = next;
-        }
+        index_find(index, ino)->next = next;
         previous = ino;
         ino = next;
     }
-    if (r == EOK) r = scan_file(fs, scan, caller);
-    ext4_free(scan->seen.table);
-    scan->seen.table = NULL;
-    return r;
+    if (r == EOK) r = scan_file(fs, index, caller);
+    if (r != EOK) { index_free(index); return r; }
+    fs->orphan_index = index;
+    return EOK;
+}
+
+static int ensure_index(struct ext4_fs *fs, struct ext4_inode_ref *caller)
+{
+    return fs->orphan_index ? EOK : load_index(fs, caller);
 }
 
 static int require_transaction(struct ext4_fs *fs)
@@ -258,43 +445,49 @@ static int require_transaction(struct ext4_fs *fs)
 
 int ext4_orphan_validate(struct ext4_fs *fs)
 {
-    struct orphan_scan scan = {0};
-    return scan_all(fs, &scan, NULL);
+    if (!fs) return EINVAL;
+    if (fs->jbd_journal && fs->jbd_journal->error) return fs->jbd_journal->error;
+    if (fs->orphan_index && fs->orphan_index->pending) return EBUSY;
+    ext4_orphan_index_fini(fs);
+    return load_index(fs, NULL);
 }
 
 int ext4_orphan_peek(struct ext4_fs *fs, uint32_t *inode)
 {
-    if (!inode) return EINVAL;
-    struct orphan_scan scan = {0};
-    int r = scan_all(fs, &scan, NULL);
-    if (r == EOK) *inode = scan.first;
+    if (!fs || !inode) return EINVAL;
+    int r = ensure_index(fs, NULL);
+    if (r == EOK) *inode = fs->orphan_index->chain_head ?
+        fs->orphan_index->chain_head : fs->orphan_index->head;
     return r;
 }
 
 int ext4_orphan_contains(struct ext4_fs *fs, uint32_t inode, bool *present)
 {
     if (!fs || !inode || !present) return EINVAL;
-    struct orphan_scan scan = { .target = inode };
-    int r = scan_all(fs, &scan, NULL);
-    if (r == EOK) *present = scan.found;
+    int r = ensure_index(fs, NULL);
+    if (r == EOK) *present = index_find(fs->orphan_index, inode) != NULL;
     return r;
 }
 
-static int update_slot(struct ext4_fs *fs, ext4_fsblk_t lba,
-                       uint32_t slot, uint32_t seed, uint32_t value)
+static int update_slot(struct ext4_fs *fs, struct orphan_record *record,
+                       uint32_t expected, uint32_t value, bool *changed)
 {
+    struct ext4_orphan_index *index = fs->orphan_index;
+    ext4_fsblk_t lba = index->blocks[record->file_block].lba;
     struct ext4_block block;
-    /* Reserve the slot's undo/version owner before changing orphan_file. */
+    /* Reserve undo/version ownership and validate the affected on-disk slot. */
     int r = ext4_trans_block_get(fs->bdev, &block, lba);
     if (r != EOK) return r;
-    r = check_block(fs, &block, seed);
+    r = check_block(fs, &block, index->seed);
+    if (r == EOK && to_le32(((uint32_t *)block.data)[record->slot]) != expected) r = EUCLEAN;
     if (r == EOK) r = ext4_trans_set_block_dirty(block.buf);
     if (r == EOK) {
-        ((uint32_t *)block.data)[slot] = to_le32(value);
+        ((uint32_t *)block.data)[record->slot] = to_le32(value);
         uint32_t size = fs->bdev->lg_bsize;
         struct orphan_tail *tail = (void *)(block.data + size - sizeof(*tail));
         if (ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_METADATA_CSUM))
-            tail->checksum = to_le32(block_checksum(seed, lba, block.data, size));
+            tail->checksum = to_le32(block_checksum(index->seed, lba, block.data, size));
+        *changed = true;
     }
     int release = ext4_block_set(fs->bdev, &block);
     return r != EOK ? r : release;
@@ -305,28 +498,50 @@ int ext4_orphan_add(struct ext4_inode_ref *inode)
     struct ext4_fs *fs = inode->fs;
     int r = require_transaction(fs);
     if (r != EOK) return r;
+    r = ensure_index(fs, inode);
+    if (r != EOK) return r;
+    struct ext4_orphan_index *index = fs->orphan_index;
     r = check_allocated(fs, inode->index, false);
     if (r != EOK) return r;
     if (!valid_orphan_type(fs, inode->inode)) return EINVAL;
-    struct orphan_scan scan = { .target = inode->index };
-    r = scan_all(fs, &scan, inode);
-    if (r != EOK || scan.found) return r;
-    if (scan.free_block) {
-        r = update_slot(fs, scan.free_block, scan.free_slot, scan.seed, inode->index);
-        if (r == EOK) ext4_set32(&fs->sb, features_read_only,
-            ext4_get32(&fs->sb, features_read_only) | EXT4_ORPHAN_PRESENT_RO_COMPAT);
-        return r;
-    }
-    /* Linux uses the traditional list when the preallocated orphan file fills. */
-    r = ext4_trans_set_block_dirty(inode->block.buf);
+    if (index_find(index, inode->index)) return EOK;
+    if (ext4_get32(&fs->sb, last_orphan) != index->chain_head) return EUCLEAN;
+    r = index_reserve(index);
     if (r != EOK) return r;
-    ext4_inode_set_del_time(inode->inode, ext4_get32(&fs->sb, last_orphan));
-    ext4_set32(&fs->sb, last_orphan, inode->index);
-    finish_inode(inode);
-    if (ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT))
-        ext4_set32(&fs->sb, features_read_only,
-            ext4_get32(&fs->sb, features_read_only) | EXT4_ORPHAN_PRESENT_RO_COMPAT);
-    return EOK;
+    struct ext4_orphan_undo *undo = reserve_undo(fs, NULL, inode->index);
+    if (!undo) return ENOMEM;
+    struct orphan_record record = {.inode = inode->index, .file_block = index->free_head,
+                                   .list_next = index->head};
+    bool changed = false;
+    if (record.file_block != ORPHAN_NO_BLOCK) {
+        uint64_t *bits = &index->free_slots[(size_t)record.file_block * index->words];
+        uint32_t word = 0;
+        while (word < index->words && !bits[word]) word++;
+        if (word == index->words) __builtin_trap();
+        uint32_t bit = 0;
+        while (!(bits[word] & (UINT64_C(1) << bit))) bit++;
+        record.slot = word * 64 + bit;
+        r = update_slot(fs, &record, 0, inode->index, &changed);
+    } else {
+        /* Linux falls back to the legacy chain once the orphan file is full. */
+        record.next = index->chain_head;
+        r = jbd_trans_get_write_access(fs->curr_trans, &inode->block);
+        if (r == EOK) r = ext4_trans_set_block_dirty(inode->block.buf);
+        if (r == EOK) {
+            ext4_inode_set_del_time(inode->inode, record.next);
+            ext4_set32(&fs->sb, last_orphan, inode->index);
+            finish_inode(inode);
+            changed = true;
+        }
+    }
+    if (changed) {
+        index_insert(index, record);
+        record_undo(fs, undo);
+        if (ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT))
+            ext4_set32(&fs->sb, features_read_only,
+                ext4_get32(&fs->sb, features_read_only) | EXT4_ORPHAN_PRESENT_RO_COMPAT);
+    } else ext4_free(undo);
+    return r;
 }
 
 int ext4_orphan_remove(struct ext4_inode_ref *inode)
@@ -334,41 +549,56 @@ int ext4_orphan_remove(struct ext4_inode_ref *inode)
     struct ext4_fs *fs = inode->fs;
     int r = require_transaction(fs);
     if (r != EOK) return r;
-    struct orphan_scan scan = { .target = inode->index };
-    r = scan_all(fs, &scan, inode);
+    r = ensure_index(fs, inode);
     if (r != EOK) return r;
-    if (!scan.found) goto Done;
-    if (scan.block) {
-        r = update_slot(fs, scan.block, scan.slot, scan.seed, 0);
-        goto Done;
+    struct ext4_orphan_index *index = fs->orphan_index;
+    struct orphan_record *found = index_find(index, inode->index);
+    if (!found) return index->count ? EOK : ext4_orphan_set_present(fs, false);
+    struct orphan_record record = *found;
+    r = check_allocated(fs, inode->index, false);
+    if (r != EOK) return r;
+    if (!valid_orphan_type(fs, inode->inode) ||
+        ext4_get32(&fs->sb, last_orphan) != index->chain_head) return EUCLEAN;
+    struct ext4_orphan_undo *undo = reserve_undo(fs, found, inode->index);
+    if (!undo) return ENOMEM;
+    bool changed = false;
+    if (record.file_block != ORPHAN_NO_BLOCK) {
+        r = update_slot(fs, &record, inode->index, 0, &changed);
+    } else {
+        struct ext4_inode_ref previous;
+        bool held = false;
+        if (ext4_inode_get_del_time(inode->inode) != record.next) { r = EUCLEAN; goto Finish; }
+        if (record.previous) {
+            r = load_inode(fs, record.previous, &previous, false);
+            if (r != EOK) goto Finish;
+            held = true;
+            if (ext4_inode_get_del_time(previous.inode) != inode->index) r = EUCLEAN;
+            if (r == EOK) r = ext4_trans_set_block_dirty(previous.block.buf);
+        }
+        if (r == EOK) r = jbd_trans_get_write_access(fs->curr_trans, &inode->block);
+        if (r == EOK) r = ext4_trans_set_block_dirty(inode->block.buf);
+        if (r == EOK) {
+            if (record.previous) {
+                ext4_inode_set_del_time(previous.inode, record.next);
+                finish_inode(&previous);
+            } else ext4_set32(&fs->sb, last_orphan, record.next);
+            ext4_inode_set_del_time(inode->inode, 0);
+            finish_inode(inode);
+            changed = true;
+        }
+        if (held) {
+            int release = ext4_fs_put_inode_ref(&previous);
+            if (r == EOK) r = release;
+        }
     }
-    struct ext4_inode_ref previous;
-    if (scan.previous) {
-        r = load_inode(fs, scan.previous, &previous, false);
-        if (r != EOK) return r;
-        r = ext4_trans_set_block_dirty(previous.block.buf);
-        if (r != EOK) { ext4_fs_put_inode_ref(&previous); return r; }
-    }
-    r = ext4_trans_set_block_dirty(inode->block.buf);
-    if (r == EOK) {
-        if (scan.previous) {
-            ext4_inode_set_del_time(previous.inode, scan.next);
-            finish_inode(&previous);
-        } else ext4_set32(&fs->sb, last_orphan, scan.next);
-        ext4_inode_set_del_time(inode->inode, 0);
-        finish_inode(inode);
-    }
-    if (scan.previous) {
-        int release = ext4_fs_put_inode_ref(&previous);
-        if (r == EOK) r = release;
-    }
-Done:
-    /* 已完整校验并去重的计数也证明删除后是否为空；在同一事务内
-     * 清标记，不为peek和set_present重复读取整个orphan文件。 */
-    if (r == EOK && scan.seen.count == (size_t)scan.found &&
-        ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT))
-        ext4_set32(&fs->sb, features_read_only,
-            ext4_get32(&fs->sb, features_read_only) & ~EXT4_ORPHAN_PRESENT_RO_COMPAT);
+Finish:
+    if (changed) {
+        index_remove(index, inode->index);
+        record_undo(fs, undo);
+        if (!index->count && ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT))
+            ext4_set32(&fs->sb, features_read_only,
+                ext4_get32(&fs->sb, features_read_only) & ~EXT4_ORPHAN_PRESENT_RO_COMPAT);
+    } else ext4_free(undo);
     return r;
 }
 

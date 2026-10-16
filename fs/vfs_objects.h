@@ -169,7 +169,7 @@ struct kernel_vfs_backend {
         size_t size,
         size_t *bytes_read);
     int (*pread_batch)(struct kernel_vfs_node *node,
-        struct kernel_vfs_read_span *spans, size_t count);
+        struct file_read_span *spans, size_t count, struct file_read_workspace *workspace);
     void (*memory_written)(struct kernel_vfs_node *node, uint64_t end);
     int (*writeback)(struct kernel_vfs_node *node,
         struct file_write_span *spans, size_t count);

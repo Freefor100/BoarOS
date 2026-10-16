@@ -684,6 +684,36 @@ void kernel_files_note(struct kernel_files *files, size_t offset, uint64_t value
     __atomic_fetch_add(counter, value, __ATOMIC_RELAXED);
 }
 
+#if BOAROS_USER_SMP
+enum kernel_files_status kernel_files_pin_local_regular(
+    struct kernel_files *files, int64_t fd, struct kernel_open_file_description **owner,
+    int *handled, int64_t *result)
+{
+    struct kernel_files *bound_files;
+    struct kernel_mm *bound_mm;
+    if (kernel_task_read_resources_borrow(kernel_task_current(), &bound_files, &bound_mm) !=
+        KERNEL_TASK_STATUS_OK || bound_files != files || !owner || *owner || !handled || !result)
+        return KERNEL_FILES_STATUS_STATE;
+    (void)bound_mm;
+    *handled = 0;
+    KERNEL_FILES_SCOPE(guard, files);
+    struct kernel_open_file_description *file = lookup_locked(files, fd);
+    if (!file) {
+        *handled = 1; *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    /* 普通表没有受控fixture的业务资格。这里只开放已有cache的普通数据读，
+     * 原槽owner覆盖refcount acquire，close/dup继续使用同一个FD raw锁。 */
+    if (files->record->concurrent || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR ||
+        file->device || kernel_open_file_memory_backed(file) || !kernel_open_file_page_cache(file))
+        return KERNEL_FILES_STATUS_OK;
+    if (kernel_open_file_acquire(file) != KERNEL_OPEN_FILE_STATUS_OK)
+        return KERNEL_FILES_STATUS_STATE;
+    *owner = file; *handled = 1; *result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+#endif
+
 enum kernel_files_status kernel_files_pin_data(
     struct kernel_files *files, int64_t fd,
     struct kernel_open_file_description **description, int64_t *result)

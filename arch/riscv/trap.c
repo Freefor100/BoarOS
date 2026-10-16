@@ -141,7 +141,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         if (frame->scause & RISCV_SCAUSE_INTERRUPT)
             kernel_cpu_current()->user_local_interrupts++;
     }
-    if (from_user && !(frame->scause & RISCV_SCAUSE_INTERRUPT))
+    if (from_user && !(frame->scause & RISCV_SCAUSE_INTERRUPT) &&
+        !(frame->scause == RISCV_SCAUSE_USER_ECALL && kernel_cpu_current()->logical_id &&
+          kernel_syscall_local_read_number(frame->a7)))
         kernel_scheduler_enter_user_service();
 #endif
 #if BOAROS_MAX_CPUS > 1
@@ -243,10 +245,6 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     }
 
     if (from_user && frame->scause == RISCV_SCAUSE_USER_ECALL) {
-#if BOAROS_USER_SMP
-        if (kernel_cpu_current()->logical_id) __builtin_trap();
-        kernel_cpu_current()->service_dispatches++;
-#endif
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .arguments = {
@@ -260,6 +258,15 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         };
         struct kernel_syscall_result result;
 
+#if BOAROS_USER_SMP
+        int handled = 0;
+        if (kernel_cpu_current()->logical_id && !kernel_scheduler_user_service_pending() &&
+            kernel_syscall_try_local_read(kernel_task_current(), &request, &result, &handled) !=
+                KERNEL_SYSCALL_STATUS_OK) riscv_trap_fatal(frame);
+        if (!handled && !kernel_scheduler_user_service_active()) kernel_scheduler_enter_user_service();
+        if (!kernel_cpu_current()->logical_id) kernel_cpu_current()->service_dispatches++;
+        if (!handled)
+#endif
         if (kernel_syscall_dispatch(kernel_task_current(),
                                     &request,
                                     &result) !=

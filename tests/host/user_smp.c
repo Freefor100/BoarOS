@@ -10,7 +10,7 @@ extern void scheduler_user_request_locked(struct kernel_task *);
 extern int kernel_scheduler_user_service_pending(void);
 struct kernel_task *process_find_identity(kernel_pid_t pid, enum kernel_pid_role role)
 { (void)role; for (unsigned i=0; i<4; i++) if (tasks[i].tid==pid) return &tasks[i]; return 0; }
-struct kernel_io_context *kernel_io_context_current(void) { return &active->current->io_context; }
+struct kernel_task *kernel_task_current(void) { return active->current; }
 uint32_t kernel_time_is_initialized(void) { return 0; }
 uint64_t riscv_time_read(void) { return 1; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *ticks)

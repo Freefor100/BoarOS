@@ -8,7 +8,7 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-unused-but-set-varia
     -Wno-stringop-truncation -DCONFIG_USE_DEFAULT_CFG=1 ${BATCH_TEST_CFLAGS:-} \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_batch_read.c" \
-    "$root/tests/host/block_fault.c" "$root/kernel/block.c" -o "$work/probe"
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" -pthread -Wl,--wrap=malloc -o "$work/probe"
 python3 - "$work/data" <<'PY'
 import sys
 with open(sys.argv[1], 'wb') as f:

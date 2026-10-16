@@ -1052,7 +1052,7 @@ static void phase_ready_insert(struct batch_transfer *parts, uint8_t *head, unsi
 }
 
 static enum kernel_block_status transfer_batch_parts(struct virtio_block_device *device,
-    const struct kernel_block_span *writes, struct kernel_block_read_span *reads, size_t count,
+    const struct kernel_block_span *writes, struct block_read_span *reads, size_t count,
     struct batch_transfer *parts, struct block_segment *segments,
     kernel_block_phase_next_fn next, const void *cursor)
 {
@@ -1222,7 +1222,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
 
 
 static enum kernel_block_status transfer_batch(struct virtio_block_device *device,
-    const struct kernel_block_span *writes, struct kernel_block_read_span *reads, size_t count,
+    const struct kernel_block_span *writes, struct block_read_span *reads, size_t count,
     kernel_block_phase_next_fn next, const void *cursor)
 {
     uintptr_t irq = arch_interrupt_save();
@@ -1260,7 +1260,7 @@ static enum kernel_block_status virtio_block_write_batch(void *context,
 { return transfer_batch(context, spans, NULL, count, NULL, NULL); }
 
 static enum kernel_block_status virtio_block_read_batch(void *context,
-    struct kernel_block_read_span *spans, size_t count)
+    struct block_read_span *spans, size_t count)
 { return transfer_batch(context, NULL, spans, count, NULL, NULL); }
 
 static enum kernel_block_status virtio_block_write_phase(void *context,

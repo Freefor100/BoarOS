@@ -159,7 +159,7 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
 }
 
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
-    struct kernel_block_read_span *spans, size_t count)
+    struct block_read_span *spans, size_t count)
 {
     kernel_assert_service_context();
     if (!device || !device->logical_block_size || count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
@@ -170,7 +170,7 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
     }
     int nonempty = 0;
     for (size_t i = 0; i < count; i++) {
-        struct kernel_block_read_span *span = &spans[i];
+        struct block_read_span *span = &spans[i];
         if (span->offset > device->capacity_bytes || span->size > device->capacity_bytes - span->offset)
             return span->status = KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
         if (!span->size) { span->status = KERNEL_BLOCK_STATUS_OK; continue; }

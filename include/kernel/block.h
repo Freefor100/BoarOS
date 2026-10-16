@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <common/block_io.h>
 
 enum kernel_block_status {
     KERNEL_BLOCK_STATUS_OK = 0,
@@ -46,16 +47,8 @@ struct kernel_block_span {
     size_t size;
 };
 
-struct kernel_block_read_span {
-    uint64_t offset;
-    void *buffer;
-    size_t size;
-    size_t completed;
-    enum kernel_block_status status;
-};
-
 typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
-    void *context, struct kernel_block_read_span *spans, size_t count);
+    void *context, struct block_read_span *spans, size_t count);
 
 typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
     void *context, const struct kernel_block_span *spans, size_t count);
@@ -140,6 +133,6 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
  * result. The return is the first failed span status. Published DMA remains
  * owned until every request finishes or device reset has been acknowledged. */
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
-    struct kernel_block_read_span *spans, size_t count);
+    struct block_read_span *spans, size_t count);
 
 #endif

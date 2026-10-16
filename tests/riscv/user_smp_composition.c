@@ -7,10 +7,12 @@
 #include <kernel/irq.h>
 #include <kernel/memory_object.h>
 #include <kernel/mm.h>
+#include <kernel/mm_backend.h>
 #include <kernel/open_file.h>
 #include <kernel/task.h>
 #include <kernel/tty.h>
 #include <kernel/wait_internal.h>
+#include "../../mm/uaccess_internal.h"
 #include <string.h>
 #include "../../fs/vfs_internal.h"
 #include "../smp/composition_protocol.h"
@@ -32,8 +34,23 @@ static unsigned fault_race_armed;
 static unsigned fault_race_file;
 static unsigned stopping;
 static unsigned boot_banner_waiting, boot_user_output;
+static uint64_t read_tid,read_address,read_size,read_flags,read_hart;
+static uint64_t read_copies[2],read_moves,read_phases,read_local_phases,read_service_phases;
+static uint64_t read_close_phases,read_seek_phases,read_fork_phases,read_total_copies[2],read_total_moves;
+static uint64_t read_offset_moves;
+static struct kernel_task *read_waiter;
+static uint64_t read_wait_generation;
+static struct kernel_mm *read_revoke_mm;
+static unsigned read_copy_active;
 
-static void check(int valid) { if (!valid) __builtin_trap(); }
+static void check_at(int valid,unsigned line)
+{
+    if (!valid) {
+        virt_uart_puts("BoarOS: COMPOSITION check line=");virt_uart_put_hex(line);
+        virt_uart_puts("\n");__builtin_trap();
+    }
+}
+#define check(valid) check_at((valid),__LINE__)
 static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
@@ -72,6 +89,65 @@ static void release_pages(void)
         released+=UINT64_C(1)<<p.order;
         if (!(ledger_count&127U)) relinquish();
     }
+}
+static int reading_task(void)
+{
+    kernel_pid_t tid=0;
+    return read_tid && !kernel_task_tid(kernel_task_current(),&tid) && tid>0 && (uint64_t)tid==read_tid;
+}
+static void release_read_waiter(void)
+{
+    if (!read_waiter || !control || composition_load(&control->read_release)) return;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_wait_record *wait=kernel_wait_record_of(read_waiter);
+    if (wait->generation==read_wait_generation && wait->phase==KERNEL_WAIT_COMMITTED && !wait->on_cpu) {
+        /* 资格等待已实际park；release让保留真实pin的读取者继续复制和归还。 */
+        composition_store(&control->read_waited,1);
+        composition_store(&control->read_release,1);
+        read_waiter=NULL;
+    }
+}
+static void arm_read(void)
+{
+    check(!read_tid);
+    read_tid=composition_load(&control->read_tid);read_address=composition_load(&control->read_address);
+    read_size=composition_load(&control->read_size);read_flags=composition_load(&control->read_flags);
+    read_hart=composition_load(&control->read_hart);
+    check(read_tid && read_address && read_size && read_hart<2);
+    read_copies[0]=read_copies[1]=read_moves=0;read_waiter=NULL;
+    if(read_flags&COMPOSITION_READ_COLD) {
+        struct kernel_vfs_file source={0};
+        check(!kernel_vfs_open(&root->mount,"/ordinary-read-source",&source));
+        check(!kernel_page_cache_invalidate_node(&root->page_cache,kernel_vfs_file_node(&source)));
+        check(!kernel_vfs_close(&source));
+    }
+}
+static void finish_read(void)
+{
+    check(read_tid && !read_waiter && !read_revoke_mm);
+    if(read_flags&COMPOSITION_READ_LOCAL) {
+        check(read_copies[read_hart] && !read_copies[read_hart^1]);
+        if(!(read_flags&COMPOSITION_READ_CLOSE))check(!read_moves);
+        read_local_phases++;
+    }
+    if(read_flags&COMPOSITION_READ_SERVICE) {
+        if(read_flags&COMPOSITION_READ_PREFIX)check(read_copies[0]+read_copies[1]==2);
+        else check(read_copies[0]);
+        if(read_hart)check(read_moves);
+        read_service_phases++;
+    }
+    if(read_flags&COMPOSITION_READ_CLOSE) {
+        if(read_hart)check(read_moves);
+        read_close_phases++;
+    }
+    if(read_flags&COMPOSITION_READ_SEEK) {
+        check(composition_load(&control->read_waited)==1);
+        if(read_hart)check(read_offset_moves==1);
+        read_seek_phases++;
+    }
+    if(read_flags&COMPOSITION_READ_FORK) { check(composition_load(&control->read_waited)==1);read_fork_phases++; }
+    read_total_copies[0]+=read_copies[0];read_total_copies[1]+=read_copies[1];read_total_moves+=read_moves;
+    read_phases++;read_tid=0;
 }
 static void pressure(void)
 {
@@ -133,12 +209,15 @@ static void run(void *unused)
     composition_store(&control->observer_ready,1);
     uint64_t completed=0;
     while (!stopping) {
+        release_read_waiter();
         uint64_t request=composition_load(&control->request);
         if (request==completed) { relinquish();continue; }
         check(request==completed+1);
         switch (composition_load(&control->command)) {
         case COMPOSITION_PRESSURE:pressure();break;
         case COMPOSITION_RELEASE:release_pages();break;
+        case COMPOSITION_READ_ARM:arm_read();break;
+        case COMPOSITION_READ_FINISH:finish_read();break;
         case COMPOSITION_OOM:check(!failed_tid);failed_tid=control->target_tid;break;
         case COMPOSITION_RFENCE:check(!watched_tid);watched_tid=control->target_tid;break;
         case COMPOSITION_FAULT_RACE:
@@ -185,10 +264,20 @@ void riscv_user_composition_finish(void)
 {
     stopping=1;kernel_thread_join(&controller);
     check(!control && !ledger && !ledger_count && held==released && !failed_tid && !watched_tid &&
-          !fault_race_armed);
+          !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm);
 }
 void riscv_user_composition_report(void)
 {
+    virt_uart_puts("BoarOS: COMPOSITION ordinary-read phases=");virt_uart_put_hex(read_phases);
+    virt_uart_puts(" local=");virt_uart_put_hex(read_local_phases);
+    virt_uart_puts(" service=");virt_uart_put_hex(read_service_phases);
+    virt_uart_puts(" copy0=");virt_uart_put_hex(read_total_copies[0]);
+    virt_uart_puts(" copy1=");virt_uart_put_hex(read_total_copies[1]);
+    virt_uart_puts(" migrations=");virt_uart_put_hex(read_total_moves);
+    virt_uart_puts(" borrowed=");virt_uart_put_hex(read_offset_moves);
+    virt_uart_puts(" close=");virt_uart_put_hex(read_close_phases);
+    virt_uart_puts(" seek=");virt_uart_put_hex(read_seek_phases);
+    virt_uart_puts(" fork=");virt_uart_put_hex(read_fork_phases);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION owners held=");virt_uart_put_hex(held);
     virt_uart_puts(" released=");virt_uart_put_hex(released);
     virt_uart_puts(" reclaimed=");virt_uart_put_hex(reclaimed);
@@ -291,6 +380,19 @@ enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_to
 enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,enum kernel_wait_wake_reason *reason)
 {
     if (control && token && token->task) {
+        kernel_pid_t reader_waiter=0;
+        if(read_tid && (read_flags&(COMPOSITION_READ_SEEK|COMPOSITION_READ_FORK)) &&
+           (!(read_flags&COMPOSITION_READ_FORK) || read_revoke_mm) &&
+           composition_load(&control->read_entered) &&
+           !composition_load(&control->read_release) &&
+           !kernel_task_tid(token->task,&reader_waiter) && reader_waiter>0 &&
+           (uint64_t)reader_waiter==composition_load(&control->read_waiter_tid)) {
+            if(read_flags&COMPOSITION_READ_FORK) {
+                struct kernel_mm_concurrency_state state;
+                kernel_mm_get_concurrency_state(read_revoke_mm,&state);check(state.write_pins);
+            }
+            read_waiter=token->task;read_wait_generation=token->generation;
+        }
         uint64_t current_epoch=composition_load(&control->epoch);kernel_pid_t tid=0;
         if (current_epoch && !kernel_task_tid(token->task,&tid)) {
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -305,6 +407,79 @@ enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_to
         }
     }
     return __real_kernel_wait_park(token,reason);
+}
+
+static void hold_read_pin(enum kernel_mm_status status,uint64_t address,uint32_t access,
+    struct kernel_mm_user_pin *pin)
+{
+    if(!status && access==KERNEL_MM_WRITE && reading_task() && read_copy_active &&
+       address>=read_address && address-read_address<read_size && (read_flags&COMPOSITION_READ_HOLD) &&
+       !composition_load(&control->read_entered)) {
+        check(pin->registration==pin);
+        composition_store(&control->read_entered,1);
+        while(!composition_load(&control->read_release))relinquish();
+    }
+}
+enum kernel_mm_status __real_kernel_mm_try_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_mm_status __wrap_kernel_mm_try_pin_user_page(const struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    enum kernel_mm_status status=__real_kernel_mm_try_pin_user_page(mm,address,access,pin);
+    hold_read_pin(status,address,access,pin);
+    return status;
+}
+enum kernel_mm_status __real_kernel_mm_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    enum kernel_mm_status status=__real_kernel_mm_pin_user_page(mm,address,access,pin);
+    hold_read_pin(status,address,access,pin);
+    return status;
+}
+enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
+    struct kernel_uaccess_write_cursor *cursor,uint64_t destination,const void *source,size_t size,size_t *copied)
+{
+    int watched=reading_task() && destination>=read_address && destination-read_address<read_size;
+    if(watched) { check(!read_copy_active);read_copy_active=1; }
+    enum kernel_uaccess_status result=__real_kernel_uaccess_write_cursor_copy(mm,cursor,destination,source,size,copied);
+    if(watched)read_copy_active=0;
+    if(watched && *copied) {
+        unsigned cpu=kernel_cpu_current()->logical_id;check(cpu<2);
+        read_copies[cpu]+=*copied;
+    }
+    return result;
+}
+void __real_kernel_scheduler_enter_user_service_borrowing(const struct kernel_lock_guard *);
+void __wrap_kernel_scheduler_enter_user_service_borrowing(const struct kernel_lock_guard *borrowed)
+{
+    struct kernel_task *task=kernel_task_current();int watched=reading_task();
+    if(watched) {
+        check(!kernel_io_context_current()->user_pins && !kernel_io_context_current()->cache_writes);
+        if(borrowed) {
+            check(borrowed->owner==kernel_io_context_current() && kernel_lock_held(borrowed->lock,1));
+            if(read_flags&COMPOSITION_READ_SEEK)read_offset_moves++;
+        }
+        read_moves++;
+    }
+    __real_kernel_scheduler_enter_user_service_borrowing(borrowed);
+    if(watched)check(kernel_task_current()==task && !kernel_cpu_current()->logical_id);
+}
+enum kernel_mm_status __real_kernel_mm_fork(struct kernel_mm *,struct kernel_mm *);
+enum kernel_mm_status __wrap_kernel_mm_fork(struct kernel_mm *destination,struct kernel_mm *source)
+{
+    kernel_pid_t tid=0;
+    int watched=read_tid && (read_flags&COMPOSITION_READ_FORK) &&
+        !kernel_task_tid(kernel_task_current(),&tid) && tid>0 &&
+        (uint64_t)tid==composition_load(&control->read_waiter_tid);
+    if(watched) { check(!read_revoke_mm);read_revoke_mm=source; }
+    enum kernel_mm_status result=__real_kernel_mm_fork(destination,source);
+    if(watched) {
+        struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(source,&state);
+        check(!result && !state.write_pins && composition_load(&control->read_waited)==1);
+        read_revoke_mm=NULL;
+    }
+    return result;
 }
 
 enum kernel_mm_status __real_kernel_mm_resolve_user_fault(struct kernel_mm *,uint64_t,uint32_t);

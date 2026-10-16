@@ -62,14 +62,14 @@ static void yield(void)
 static unsigned prefetch_entered, demand_finished, owner_checked;
 static struct kernel_task *producer_task, *demand_task, *stopping_task, *exercise_task;
 static struct kernel_thread_join demand_join, observer_join;
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
     if (kernel_task_current() == exercise_task)
-        return __real_kernel_vfs_node_pread_batch(node, spans, count);
+        return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
     producer_task = kernel_task_current(); prefetch_entered = 1;
     check(count == BOAROS_PAGE_CACHE_READAHEAD_PAGES, 51);
-    int result=__real_kernel_vfs_node_pread_batch(node,spans,count);
+    int result=__real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
     if(fail_prefetch && count){fail_prefetch=0;spans[0].error=-KERNEL_EIO;spans[0].completed=17;return -KERNEL_EIO;}
     return result;
 }
@@ -102,10 +102,10 @@ static void held_observer(void *unused)
     owner_checked=1;virt_uart_puts("readahead: held-owner\n");
 }
 #else
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct kernel_vfs_read_span *, size_t);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct kernel_vfs_read_span *spans, size_t count)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
 {
-    int result=__real_kernel_vfs_node_pread_batch(node,spans,count);
+    int result=__real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
     if(fail_prefetch && count){fail_prefetch=0;spans[0].error=-KERNEL_EIO;spans[0].completed=17;return -KERNEL_EIO;}
     return result;
 }

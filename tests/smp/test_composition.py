@@ -57,6 +57,20 @@ class CompositionReports(unittest.TestCase):
                     good.replace('file-fault-race-syncs=0x1','file-fault-race-syncs=0x2'),good+good):
             with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_file_fault_race(bad)
 
+    def test_ordinary_reads_require_real_hart_copies_continuation_and_wait_owners(self):
+        module=self.checker()
+        good=('COMPOSITION ordinary-read phases=0x9 local=0x5 service=0x4 '
+              'copy0=0x2e copy1=0x54 migrations=0x5 borrowed=0x1 close=0x1 seek=0x1 fork=0x1\n')
+        module.validate_ordinary_reads(good)
+        for bad in ('',good+good,good.replace('copy1=0x54','copy1=0x0'),
+                    good.replace('copy0=0x2e','copy0=0x2f'),good.replace('migrations=0x5','migrations=0x0'),
+                    good.replace('borrowed=0x1','borrowed=0x0'),good.replace('fork=0x1','fork=0x0')):
+            with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_ordinary_reads(bad)
+        single=good.replace('copy0=0x2e copy1=0x54 migrations=0x5 borrowed=0x1',
+                            'copy0=0x82 copy1=0x0 migrations=0x0 borrowed=0x0')
+        module.validate_ordinary_reads(single,cpus=1)
+        with self.assertRaises(RuntimeError):module.validate_ordinary_reads(good,cpus=1)
+
     def test_build_root_can_isolate_toolchain_specific_objects(self):
         module=self.checker()
         with tempfile.TemporaryDirectory() as directory:

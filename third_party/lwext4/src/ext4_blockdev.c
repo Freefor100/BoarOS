@@ -306,19 +306,37 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 }
 
 int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
-	struct ext4_block_read_span *spans, unsigned count)
+	struct block_read_span *spans, unsigned count)
 {
 	if (!bdev || !bdev->bdif || !bdev->bdif->ph_refctr || count > EXT4_BLOCK_BATCH_MAX ||
 	    (count && !spans)) return EINVAL;
+	uint32_t sector = bdev->bdif->ph_bsize;
+	if (!sector) return EINVAL;
+	for (unsigned i = 0; i < count; i++) {
+		spans[i].completed = 0;
+		spans[i].status = EIO;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		if (spans[i].offset % sector || spans[i].size % sector || spans[i].size / sector > UINT32_MAX) {
+			for (unsigned j = 0; j < count; j++) spans[j].status = EINVAL;
+			return EINVAL;
+		}
+	}
 	if (count && bdev->bdif->bread_batch) {
 		ext4_bdif_lock(bdev);
 		bdev->bdif->bread_batch(bdev, spans, count);
 		bdev->bdif->bread_ctr += count;
 		ext4_bdif_unlock(bdev);
-	} else for (unsigned i = 0; i < count; i++)
-		spans[i].error = ext4_bdif_bread(bdev, spans[i].data, spans[i].block, spans[i].count);
+	} else for (unsigned i = 0; i < count; i++) {
+		spans[i].status = ext4_bdif_bread(bdev, spans[i].buffer,
+			spans[i].offset / sector, spans[i].size / sector);
+		if (!spans[i].status) spans[i].completed = spans[i].size;
+	}
 	int first = EOK;
-	for (unsigned i = 0; i < count; i++) if (!first) first = spans[i].error;
+	for (unsigned i = 0; i < count; i++) {
+		if (!spans[i].status && spans[i].completed != spans[i].size) spans[i].status = EIO;
+		if (!first) first = spans[i].status;
+	}
 	return first;
 }
 
@@ -329,7 +347,6 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	    !bdev->lg_bsize || !bdev->bdif->ph_bsize ||
 	    bdev->lg_bsize % bdev->bdif->ph_bsize || count > EXT4_BLOCK_BATCH_MAX ||
 	    (count && (!blocks || !lbas || !errors))) return EINVAL;
-	uint32_t ratio = bdev->lg_bsize / bdev->bdif->ph_bsize;
 	for (unsigned i = 0; i < count; i++) {
 		blocks[i] = (struct ext4_block)EXT4_BLOCK_ZERO(); errors[i] = EOK;
 	}
@@ -340,7 +357,7 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 			return EINVAL;
 		}
 	}
-	struct ext4_block_read_span reads[EXT4_BLOCK_BATCH_MAX];
+	struct block_read_span reads[EXT4_BLOCK_BATCH_MAX];
 	unsigned owners[EXT4_BLOCK_BATCH_MAX], pending = 0;
 	for (unsigned i = 0; i < count; i++) {
 		errors[i] = ext4_block_get_noread(bdev, &blocks[i], lbas[i]);
@@ -349,15 +366,14 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 		if (buf->loading || buf->load_error || ext4_bcache_test_flag(buf, BC_UPTODATE)) continue;
 		buf->loading = true;
 		owners[pending] = i;
-		reads[pending++] = (struct ext4_block_read_span){blocks[i].data,
-			(lbas[i] * bdev->lg_bsize + bdev->part_offset) / bdev->bdif->ph_bsize,
-			ratio, EIO};
+		reads[pending++] = (struct block_read_span){lbas[i] * bdev->lg_bsize + bdev->part_offset,
+			blocks[i].data, bdev->lg_bsize, 0, EIO};
 	}
 	/* 先完成自己发布的加载，再等待别人的 loading，重叠批次不会互等未发布页。 */
 	ext4_blockdev_read_batch(bdev, reads, pending);
 	for (unsigned i = 0; i < pending; i++) {
 		struct ext4_buf *buf = blocks[owners[i]].buf;
-		buf->load_error = reads[i].error;
+		buf->load_error = reads[i].status;
 		if (!buf->load_error) ext4_bcache_set_flag(buf, BC_UPTODATE);
 		buf->loading = false;
 		if (bdev->bdif->wake_read) bdev->bdif->wake_read(buf);

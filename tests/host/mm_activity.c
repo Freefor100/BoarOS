@@ -8,6 +8,12 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if BOAROS_USER_SMP && defined(REMOTE_USER_CASE)
+#include "../../kernel/sched/private.h"
+#include "../../mm/uaccess_internal.h"
+void mm_test_bind(struct kernel_mm *);
+unsigned mm_test_parked(unsigned);
+#endif
 
 void mm_test_attach(unsigned);
 #ifdef REMOTE_USER_CASE
@@ -29,10 +35,12 @@ static unsigned expect_nonleaf_sync;
 static unsigned fail_copy;
 static uint64_t failed_page;
 static unsigned table_oom, table_allocations, oom_preparing, oom_observed;
+static unsigned allocation_calls;
 static uint64_t *oom_root_slot, observed_parent;
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *address)
 {
+    __atomic_fetch_add(&allocation_calls,1,__ATOMIC_RELAXED);
     if (table_oom && ++table_allocations==2) {
         __atomic_store_n(&oom_preparing,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&oom_observed,__ATOMIC_ACQUIRE)) sched_yield();
@@ -122,6 +130,106 @@ static void *observe_partial_fault(void *unused)
     publish(&oom_observed);
     return 0;
 }
+#if BOAROS_USER_SMP
+static unsigned resident_protect, resident_started, resident_done;
+static struct kernel_mm resident_child;
+static void *resident_mutate(void *unused)
+{
+    (void)unused; mm_test_attach(3); kernel_cpu_current()->logical_id=0;
+    mm_test_context=context; publish(&resident_started);
+    if (resident_protect)
+        assert(!kernel_mm_mprotect(&mm,0x40000,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+    else assert(!kernel_mm_fork(&resident_child,&mm));
+    assert(!kernel_io_context_current()->user_pins && !kernel_io_context_current()->locks);
+    publish(&resident_done); return NULL;
+}
+static void resident_enter(void)
+{
+    mm_test_attach(1); mm_test_context=context; mm_test_bind(&mm);
+    kernel_task_current()->arch.user_mode=1;
+}
+static void resident_leave(void)
+{
+    assert(!kernel_io_context_current()->user_pins && !kernel_io_context_current()->locks);
+    kernel_task_current()->arch.user_mode=0; mm_test_bind(NULL);
+    kernel_cpu_current()->logical_id=0;
+}
+static void resident_wait_drain(unsigned before)
+{
+    await(&resident_started);
+    /* 只有该actor3变更者在运行；其park必须等待这次真实pin归还。 */
+    while (mm_test_parked(3)==before && !__atomic_load_n(&resident_done,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(mm_test_parked(3)>before && !__atomic_load_n(&resident_done,__ATOMIC_ACQUIRE));
+}
+static void resident_pin_cases(uint64_t address)
+{
+    struct kernel_mm_user_pin pin={0}, rejected={0};
+    pthread_t mutator;
+    resident_enter();
+    unsigned calls=__atomic_load_n(&allocation_calls,__ATOMIC_RELAXED);
+    assert(!kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_WRITE,&pin));
+    assert(__atomic_load_n(&allocation_calls,__ATOMIC_RELAXED)==calls);
+    unsigned before=mm_test_parked(3), local_before=mm_test_parked(1);
+    resident_started=resident_done=resident_protect=0;
+    assert(!pthread_create(&mutator,NULL,resident_mutate,NULL));
+    resident_wait_drain(before);
+    assert(kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_READ,&rejected)==KERNEL_MM_STATUS_CONFLICT);
+    assert(!rejected.registration && mm_test_parked(1)==local_before);
+    ((unsigned char *)pin.page)[0]=0x66;
+    kernel_mm_unpin_user_page(&pin);
+    assert(!pthread_join(mutator,NULL)); resident_leave();
+    unsigned char byte=0; size_t copied;
+    assert(!kernel_copy_from_user(&resident_child,&byte,address,1,&copied) && copied==1 && byte==0x66);
+    resident_enter(); calls=__atomic_load_n(&allocation_calls,__ATOMIC_RELAXED);
+    assert(kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_WRITE,&rejected)==KERNEL_MM_STATUS_CONFLICT);
+    assert(!rejected.registration && __atomic_load_n(&allocation_calls,__ATOMIC_RELAXED)==calls);
+    struct kernel_uaccess_write_cursor cursor={.resident_only=1};
+    byte=0x77; copied=99;
+    assert(kernel_uaccess_write_cursor_copy(&mm,&cursor,address,&byte,1,&copied)==KERNEL_UACCESS_STATUS_RETRY);
+    assert(!copied && !cursor.pin.registration); kernel_uaccess_write_cursor_finish(&cursor);
+    assert(!kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_READ,&pin));
+    assert(((unsigned char *)pin.page)[0]==0x66); kernel_mm_unpin_user_page(&pin);
+    resident_leave(); byte=0x77;
+    assert(!kernel_copy_to_user(&mm,address,&byte,1,&copied) && copied==1);
+    assert(!kernel_copy_from_user(&resident_child,&byte,address,1,&copied) && byte==0x66);
+    assert(!kernel_mm_release(&resident_child));
+
+    resident_enter();
+    assert(!kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_WRITE,&pin));
+    before=mm_test_parked(3); local_before=mm_test_parked(1);
+    resident_started=resident_done=0; resident_protect=1;
+    assert(!pthread_create(&mutator,NULL,resident_mutate,NULL));
+    resident_wait_drain(before);
+    assert(kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_WRITE,&rejected)==KERNEL_MM_STATUS_CONFLICT);
+    assert(!rejected.registration && mm_test_parked(1)==local_before);
+    ((unsigned char *)pin.page)[1]=0x88; kernel_mm_unpin_user_page(&pin);
+    assert(!pthread_join(mutator,NULL));
+    assert(kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_WRITE,&rejected)==KERNEL_MM_STATUS_CONFLICT);
+    assert(!rejected.registration && !kernel_mm_try_pin_user_page(&mm,address,KERNEL_MM_READ,&pin));
+    assert(((unsigned char *)pin.page)[1]==0x88); kernel_mm_unpin_user_page(&pin);
+    resident_leave();
+    assert(!kernel_mm_mprotect(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    uint64_t placed;
+    assert(!kernel_mm_mmap_anonymous(&mm,address+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&placed));
+    resident_enter(); calls=__atomic_load_n(&allocation_calls,__ATOMIC_RELAXED);
+    const unsigned char source[]={0x95,0x96}; unsigned char imported[]={0,0};
+    cursor=(struct kernel_uaccess_write_cursor){.resident_only=1};
+    assert(kernel_uaccess_write_cursor_copy(&mm,&cursor,address+BOAROS_PAGE_SIZE-1,source,2,&copied)==KERNEL_UACCESS_STATUS_RETRY);
+    assert(copied==1 && !cursor.pin.registration); kernel_uaccess_write_cursor_finish(&cursor);
+    assert(kernel_copy_from_user_resident(&mm,imported,address+BOAROS_PAGE_SIZE-1,2,&copied)==KERNEL_UACCESS_STATUS_RETRY);
+    assert(copied==1 && imported[0]==0x95 && !imported[1]);
+    assert(!kernel_io_context_current()->user_pins && __atomic_load_n(&allocation_calls,__ATOMIC_RELAXED)==calls);
+    resident_leave();
+    assert(!kernel_copy_from_user(&mm,&byte,address+BOAROS_PAGE_SIZE-1,1,&copied) && byte==0x95);
+    assert(!kernel_mm_munmap(&mm,address+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE));
+    byte=19; assert(!kernel_copy_to_user(&mm,address,&byte,1,&copied));
+    struct kernel_mm_concurrency_state state;
+    kernel_mm_get_concurrency_state(&mm,&state);
+    assert(!state.pins && !state.write_pins && !state.pending_retirement);
+    puts("MM resident pin fork/mprotect drain, COW retry and exact copy/import prefix verified");
+}
+#endif
 #endif
 int main(void)
 {
@@ -161,6 +269,9 @@ int main(void)
     kernel_mm_get_concurrency_state(&mm, &state); assert(!state.active_cpus && !state.pending_retirement);
 #ifdef REMOTE_USER_CASE
     assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
+#if BOAROS_USER_SMP
+    resident_pin_cases(address);
+#endif
     struct kernel_mm child = {0};
     assert(!kernel_mm_fork(&child, &mm));
     struct kernel_mm_mapping original;
