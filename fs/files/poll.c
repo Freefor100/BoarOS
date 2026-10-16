@@ -333,6 +333,7 @@ enum kernel_files_status kernel_files_ppoll(
     size_t sigsetsize,
     int64_t *linux_result)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_pollfd stack_pfds[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
@@ -461,6 +462,7 @@ enum kernel_files_status kernel_files_pselect6(
     uint64_t user_sigdata,
     int64_t *linux_result)
 {
+    KERNEL_SERVICE_SCOPE(service);
     uint64_t stack_fds[6] = {0};
     uint64_t *in_rfds = &stack_fds[0];
     uint64_t *in_wfds = &stack_fds[1];

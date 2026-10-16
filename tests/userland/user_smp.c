@@ -5,6 +5,7 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -16,6 +17,9 @@
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
 #include <sys/reboot.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -75,7 +79,14 @@ static void process_overlap(void)
     }
     for (unsigned i=0;i<2;i++) { int status; CHECK(waitpid(children[i],&status,0)==children[i] && status==0); }
     CHECK(run->checksum[0]==run->checksum[1] && run->checksum[0]);
-    CHECK(!munmap(run,4096)); record("process-affinity-overlap");
+    CHECK(!munmap(run,4096));
+    pin(online&2 ? 1 : 0);
+    CHECK(syscall(SYS_sync)==0);
+    int interface=socket(AF_INET,SOCK_DGRAM,0);CHECK(interface>=0);
+    struct ifreq query={0};memcpy(query.ifr_name,"lo",3);
+    CHECK(!ioctl(interface,SIOCGIFMTU,&query) && query.ifr_mtu>0 && !close(interface));
+    CHECK(syscall(SYS_sched_setaffinity,0,sizeof(online),&online)==0);
+    record("process-affinity-overlap");
 }
 static atomic_uint receiver_started, receiver_done;
 static void *receiver(void *unused)
@@ -143,6 +154,43 @@ static void mapping_retirement(void)
 }
 static atomic_uint io_ready;
 static int io_pipe[2];
+static pthread_barrier_t close_pipe_gate;
+static int observed_pipes[2][2];
+static void *close_observed_pipe(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    pin(id && (online&2) ? 1 : 0);
+    int barrier=pthread_barrier_wait(&close_pipe_gate);
+    CHECK(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+    CHECK(!close(observed_pipes[id][1]));
+    return NULL;
+}
+static void epoll_peer_close(void)
+{
+    for (unsigned round=0;round<32;round++) {
+        int epoll=epoll_create1(0);CHECK(epoll>=0);
+        CHECK(!pthread_barrier_init(&close_pipe_gate,NULL,3));
+        pthread_t writers[2];
+        for (unsigned id=0;id<2;id++) {
+            CHECK(!pipe(observed_pipes[id]));
+            struct epoll_event event={.events=EPOLLIN,.data.u64=id+1};
+            CHECK(!epoll_ctl(epoll,EPOLL_CTL_ADD,observed_pipes[id][0],&event));
+            CHECK(!pthread_create(&writers[id],NULL,close_observed_pipe,(void *)(uintptr_t)id));
+        }
+        int barrier=pthread_barrier_wait(&close_pipe_gate);
+        CHECK(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+        for (unsigned id=0;id<2;id++) CHECK(!pthread_join(writers[id],NULL));
+        struct epoll_event ready[2];unsigned seen=0;
+        CHECK(epoll_wait(epoll,ready,2,1000)==2);
+        for (unsigned id=0;id<2;id++) {
+            CHECK(ready[id].data.u64>=1 && ready[id].data.u64<=2 && (ready[id].events&EPOLLHUP));
+            seen|=1U<<(ready[id].data.u64-1);
+        }
+        CHECK(seen==3);
+        for (unsigned id=0;id<2;id++) CHECK(!close(observed_pipes[id][0]));
+        CHECK(!close(epoll) && !pthread_barrier_destroy(&close_pipe_gate));
+    }
+}
 static void *cancel_reader(void *unused)
 {
     (void)unused; pin(online&2 ? 1 : 0);
@@ -154,7 +202,9 @@ static void cancellation(void)
     CHECK(!pipe(io_pipe)); pthread_t thread; CHECK(!pthread_create(&thread,0,cancel_reader,0));
     wait_flag(&io_ready,1); CHECK(!pthread_cancel(thread));
     void *result; CHECK(!pthread_join(thread,&result) && result==PTHREAD_CANCELED);
-    CHECK(!close(io_pipe[0]) && !close(io_pipe[1])); record("pthread-cancel-pipe-owner");
+    CHECK(!close(io_pipe[0]) && !close(io_pipe[1]));
+    epoll_peer_close();
+    record("pthread-cancel-pipe-owner");
 }
 static void *exec_thread(void *unused)
 {
@@ -260,7 +310,7 @@ static void remote_service_progress(void)
         pid_t service=fork(); CHECK(service>=0);
         if (!service) {
             pin(1); wait_flag(&shared->ready,1); set_policy(SCHED_FIFO,40);
-            for (unsigned i=0;i<16;i++) CHECK(syscall(SYS_getpid)>0);
+            for (unsigned i=0;i<16;i++) CHECK(syscall(SYS_setpgid,0,0)==0);
             atomic_store_explicit(&shared->finished,1,memory_order_release); _exit(0);
         }
         reap(service); reap(busy); CHECK(!munmap(shared,4096));

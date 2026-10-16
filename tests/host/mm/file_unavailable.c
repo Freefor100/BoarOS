@@ -18,7 +18,9 @@ uint64_t kernel_task_current_stack_limit(void) { return 0; }
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
-EXCLUDED(kernel_shm_attachment_release)
+struct kernel_shm_attachment;
+void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
+{ if (owner && *owner) mm_file_unavailable(); }
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
@@ -54,3 +56,6 @@ EXCLUDED(kernel_page_cache_write_source)
 
 EXCLUDED(kernel_page_cache_resize_prepare)
 EXCLUDED(kernel_page_cache_resize_finish)
+
+EXCLUDED(kernel_page_cache_needs_cpu0)
+EXCLUDED(kernel_page_cache_run_cpu0)

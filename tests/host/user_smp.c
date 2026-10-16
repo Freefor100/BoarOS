@@ -22,6 +22,8 @@ enum kernel_scheduler_status validate_queues_locked(void) { __builtin_trap(); }
 enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,struct kernel_task *next)
 {
     assert(next==active->idle && old->wait.on_cpu && !old->ready_node.queued);
+    /* 普通服务强制迁移也排在目标核已有工作之后，不能反复插队。 */
+    if (old->scheduling.policy==KERNEL_SCHED_OTHER) assert(!old->wait.ready_head);
     unsigned other=active->logical_id^1;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -106,6 +108,26 @@ int main(void)
         scheduler_cpu_initialize(active, &idles[i], 1);
     }
     active = &cpus[0];
+    {
+        struct kernel_task worker={.accounted=1,.cpu_mask=1,.state=KERNEL_THREAD_STATE_READY};
+        struct kernel_task services[2];
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        for (unsigned i=0;i<2;i++) {
+            services[i]=(struct kernel_task){.accounted=1,.cpu_mask=3,.arch.user_mode=1,
+                .user_service=1,.state=KERNEL_THREAD_STATE_READY};
+            ready_enqueue_locked(&services[i],0);
+        }
+        ready_enqueue_locked(&worker,0);
+        for (unsigned i=0;i<2;i++) {
+            assert(ready_best_locked()==&services[i]);
+            ready_remove_locked(&services[i]);
+            ready_enqueue_locked(&services[i],0);
+        }
+        assert(ready_best_locked()==&worker);
+        ready_remove_locked(&worker);
+        for (unsigned i=0;i<2;i++) ready_remove_locked(&services[i]);
+        puts("PASS ordinary CPU0 services share FIFO eligibility with the worker they may wait for");
+    }
     tasks[0] = (struct kernel_task){.accounted = 1, .cpu_mask = 2,
         .arch.user_mode = 1, .tid_owned=1, .tid=7, .state = KERNEL_THREAD_STATE_READY};
     {
@@ -166,7 +188,9 @@ int main(void)
         kernel_wait_switch_finish_locked(&idles[1]); active->switch_previous=0;
     }
     kernel_scheduler_enter_user_service();
-    assert(active==&cpus[0] && !kernel_scheduler_user_service_pending());
+    assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
+    kernel_scheduler_ack_user_service();
+    assert(!kernel_scheduler_user_service_pending());
     assert(!pthread_barrier_init(&gate,0,2)); pthread_t notifier;
     assert(!pthread_create(&notifier,0,late_service_notice,0));
     int barrier=pthread_barrier_wait(&gate);
@@ -175,7 +199,9 @@ int main(void)
     kernel_scheduler_leave_user_service();
     assert(active==&cpus[1] && kernel_scheduler_user_service_pending());
     kernel_scheduler_enter_user_service();
-    assert(active==&cpus[0] && !kernel_scheduler_user_service_pending());
+    assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
+    kernel_scheduler_ack_user_service();
+    assert(!kernel_scheduler_user_service_pending());
     assert(tasks[0].service_migrations==2 && tasks[0].cpu_mask==2);
     /* 实际任务临时服务不能把来源CPU的FIFO运行资格让给同级任务。 */
     assert(!kernel_sched_policy_set(&tasks[0].scheduling,KERNEL_SCHED_FIFO,40,0));
@@ -209,7 +235,7 @@ int main(void)
       setup_task(3,1,99); tasks[3].arch.user_mode=1;
       assert(ready_best_locked()==&tasks[2]);
       ready_remove_locked(&tasks[2]);
-      assert(scheduler_user_yield_locked(&tasks[2]));
+      scheduler_user_reservation_release_locked(&tasks[2]);
       assert(!tasks[2].reservation_node.queued && tasks[0].reservation_node.queued);
       scheduler_user_reservation_release_locked(&tasks[0]); }
     active=&cpus[1];
@@ -217,7 +243,7 @@ int main(void)
       assert(ready_best_locked()==&tasks[1]);
       ready_remove_locked(&tasks[1]); ready_remove_locked(&tasks[3]);
       assert(!cpus[0].user_reservations.first && !cpus[1].user_reservations.first &&
-             !scheduler.user_services.first && !scheduler.runqueue.first); }
+             !scheduler.rt_services.first && !scheduler.runqueue.first); }
     active=&cpus[0];
     scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
     struct kernel_wait_token borrowed_token;
@@ -227,9 +253,6 @@ int main(void)
     assert(!kernel_wait_finish(&borrowed_token));
     assert(!pthread_join(borrower,0) && quiesce_calls==1 && !tasks[0].wait.borrows);
     assert(!borrowed_token.task && tasks[0].wait.phase==KERNEL_WAIT_FINISHED);
-    assert(!tasks[0].user_yielded);
-    assert(!kernel_scheduler_user_yield_current() && tasks[0].user_yielded);
-    tasks[0].user_yielded=0;
     active=&cpus[0];
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
       setup_task(3,2,60); tasks[3].arch.user_mode=1; tasks[3].magic=KERNEL_THREAD_MAGIC; }

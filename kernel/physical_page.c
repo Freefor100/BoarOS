@@ -1193,13 +1193,18 @@ physical_page_allocator_finalize(struct physical_page_allocator *allocator)
 
 static enum physical_page_status
 physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t order,
-                                  uint64_t *address)
+                                  uint64_t *address,struct physical_page_reclaim_hooks *hooks)
 {
     PAGE_METADATA_SCOPE(work, a);
     if (!allocator_initialized(a) || !address || order > PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a))
         return PHYSICAL_PAGE_STATUS_STATE;
+    /* 本次分配已持元数据锁，在同一处取得回调借用，不再重新加锁取绑定。 */
+    if (hooks) {
+        *hooks=a->reclaim_hooks;
+        if (hooks->retain) hooks->retain(hooks->context);
+    }
     uint32_t found = order;
     while (found <= PHYSICAL_PAGE_MAX_ORDER)
     {
@@ -1266,10 +1271,9 @@ enum physical_page_status physical_page_allocate_order(
 {
     kernel_assert_can_block();
     COST_ADD(PAGE_CALLS, 1);
+    struct physical_page_reclaim_hooks hooks = {0};
     enum physical_page_status status =
-        physical_page_allocate_order_once(allocator, order, address);
-
-    struct physical_page_reclaim_hooks hooks = reclaim_hooks_acquire(allocator);
+        physical_page_allocate_order_once(allocator, order, address,&hooks);
     if (hooks.notify) hooks.notify(hooks.context);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY && hooks.reclaim) {
         uint32_t *depth = hooks.depth ? hooks.depth() : &allocator->reclaiming;
@@ -1286,7 +1290,7 @@ enum physical_page_status physical_page_allocate_order(
             else __atomic_store_n(depth, 0, __ATOMIC_RELEASE);
             if (physical_page_available(allocator) < order_page_count(order) && hooks.wait)
                 hooks.wait(hooks.context);
-            status = physical_page_allocate_order_once(allocator, order, address);
+            status = physical_page_allocate_order_once(allocator, order, address,NULL);
         }
     }
     reclaim_hooks_release(&hooks);

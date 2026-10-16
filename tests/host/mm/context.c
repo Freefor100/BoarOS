@@ -103,6 +103,24 @@ struct kernel_task *kernel_task_current(void)
     return 0;
 }
 #endif
+#if BOAROS_USER_SMP && !defined(FILE_IO_CASES)
+/* 这个MM模型只提供匿名/文件访问；真正需要迁移到CPU0的SysV业务另测。
+ * 未进入的范围没有归还动作，意外请求迁移则直接失败。 */
+void mm_test_unavailable(void);
+int kernel_scheduler_user_service_active(void)
+{
+    struct kernel_task *task=kernel_task_current();
+    return !cpu.logical_id && task && task->user_service;
+}
+void kernel_service_scope_begin(struct kernel_service_scope *scope)
+{
+    assert(!scope->entered);
+    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
+        mm_test_unavailable();
+}
+void kernel_service_scope_end(struct kernel_service_scope *scope)
+{ assert(!scope->entered); }
+#endif
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task) { return &task->wait; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { return &task->default_wait_node; }
 struct kernel_task *kernel_wait_current_task(void) { return &actor.task; }

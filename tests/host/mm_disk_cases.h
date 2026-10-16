@@ -6,6 +6,13 @@
 extern _Thread_local uint64_t mm_test_context;
 void mm_test_bind(struct kernel_mm *);
 #include <ext4.h>
+static _Thread_local unsigned *disk_raw_observe;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    if (disk_raw_observe) (*disk_raw_observe)++;
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 static _Thread_local unsigned disk_fail_page,disk_fail_heap;
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *pages,uint64_t *out)
@@ -142,10 +149,20 @@ static void disk_mm_case(struct kernel_page_cache *cache,struct kernel_heap *hea
         KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&shared);
     if (mapped) fprintf(stderr,"disk map status=%d mode=%o flags=%u context=%llu\n",mapped,controller->file.mode,controller->open_flags,(unsigned long long)mm_test_context);
     assert(!mapped);
-    assert(kernel_mm_enable_concurrency(&parent)==KERNEL_MM_STATUS_OK && "real ext4 cache domain must be admitted");
+    assert(kernel_mm_check_task_domain(&parent)==KERNEL_MM_STATUS_OK && "real ext4 cache domain must be admitted");
     assert(!kernel_mm_fork(&child,&parent));
     assert(!kernel_mm_context(&parent,&mm_test_context)); mm_test_bind(&parent);
     unsigned char byte=0x5a; size_t done;
+    uint64_t anonymous;
+    assert(!kernel_mm_mmap_anonymous(&parent,0x400000,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&anonymous));
+    assert(!kernel_mm_resolve_user_fault(&parent,anonymous,KERNEL_MM_WRITE));
+    unsigned locks=0;disk_raw_observe=&locks;
+    assert(!kernel_copy_to_user(&parent,anonymous,&byte,1,&done) && done==1);
+    disk_raw_observe=NULL;
+    printf("resident anonymous copy beside shared disk mapping: locks=%u\n",locks);
+    assert(locks==4);
+
     assert(!kernel_copy_to_user(&parent,shared,&byte,1,&done) && done==1);
     assert(!kernel_mm_context(&child,&mm_test_context)); mm_test_bind(&child);
     byte=0; assert(!kernel_copy_from_user(&child,&byte,shared,1,&done) && done==1 && byte==0x5a);

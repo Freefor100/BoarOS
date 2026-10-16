@@ -11,9 +11,9 @@ sys.path.insert(0,str(Path(__file__).parent))
 from user import ROOT,boot_user,harness,identity,validate_execution,create_run_directory
 
 CASES=('concurrent-first-fault','concurrent-file-first-fault',
-    'ordinary-hot-read-pread-readv','ordinary-cold-cache','ordinary-user-fault',
+    'ordinary-hot-read-pread-readv','ordinary-cold-cache','ordinary-cold-batch-local','ordinary-user-fault',
     'ordinary-read-fault-prefix','ordinary-read-seek','ordinary-read-close-signal',
-    'ordinary-read-fork-pin','mm-reclaim')+tuple(f'{name}-{count}' for count in (1,8,32)
+    'ordinary-read-fork-pin','ordinary-write-pwrite-writev-local','mm-reclaim')+tuple(f'{name}-{count}' for count in (1,8,32)
     for name in ('fd-pipe','futex','group-exit'))
 
 def validate_boot_output(text):
@@ -55,20 +55,19 @@ def validate_file_fault_race(text):
     if len(syncs)!=1 or int(syncs[0],16)!=1:
         raise RuntimeError('resumed remote file fault repeated the publisher synchronization')
 
-def validate_ordinary_reads(text,cpus=2):
-    rows=re.findall(r'COMPOSITION ordinary-read phases=(0x[0-9a-f]+) local=(0x[0-9a-f]+) '
-        r'service=(0x[0-9a-f]+) copy0=(0x[0-9a-f]+) copy1=(0x[0-9a-f]+) '
-        r'migrations=(0x[0-9a-f]+) borrowed=(0x[0-9a-f]+) close=(0x[0-9a-f]+) '
+def validate_ordinary_io(text,cpus=2):
+    rows=re.findall(r'COMPOSITION ordinary-io phases=(0x[0-9a-f]+) local=(0x[0-9a-f]+) '
+        r'copy0=(0x[0-9a-f]+) copy1=(0x[0-9a-f]+) '
+        r'batch=(0x[0-9a-f]+) local-faults=(0x[0-9a-f]+) writes=(0x[0-9a-f]+) '
+        r'write-pin0=(0x[0-9a-f]+) write-pin1=(0x[0-9a-f]+) close=(0x[0-9a-f]+) '
         r'seek=(0x[0-9a-f]+) fork=(0x[0-9a-f]+)',text)
-    if len(rows)!=1:raise RuntimeError('missing or duplicate ordinary read evidence')
-    phases,local,service,copy0,copy1,migrations,borrowed,close,seek,fork=map(lambda value:int(value,16),rows[0])
-    if (phases,local,service,close,seek,fork)!=(9,5,4,1,1,1) or copy0+copy1!=130:
-        raise RuntimeError('ordinary read syscall, exact copy prefix or owner/wait handshake missing')
-    if cpus>1:
-        if copy0<46 or copy1<80 or migrations<5 or borrowed!=1:
-            raise RuntimeError('local user copies, same-task CPU0 continuation or borrowed offset missing')
-    elif copy1 or migrations or borrowed:
-        raise RuntimeError('single-hart read reported a remote copy or migration')
+    if len(rows)!=1:raise RuntimeError('missing or duplicate ordinary I/O observations')
+    phases,local,copy0,copy1,batches,faults,writes,pin0,pin1,close,seek,fork=map(lambda value:int(value,16),rows[0])
+    if (phases,local,batches,writes,close,seek,fork)!=(10,10,1,3,1,1,1) or not faults:
+        raise RuntimeError('ordinary I/O, demand batch, local fault or owner/wait handshake missing')
+    expected=(0,65666,0,4) if cpus>1 else (65666,0,4,0)
+    if (copy0,copy1,pin0,pin1)!=expected:
+        raise RuntimeError('copy bytes or source pins did not stay on the issuing CPU')
 
 def validate_controlled(text,sqlite=False,cpus=2):
     rows=re.findall(r'COMPOSITION owners held=(0x[0-9a-f]+) released=(0x[0-9a-f]+) reclaimed=(0x[0-9a-f]+) '
@@ -170,7 +169,7 @@ def main():
                             if target!='linux' and scene=='mm':
                                 validate_fault_race(text)
                                 validate_file_fault_race(text)
-                                validate_ordinary_reads(text,cpus)
+                                validate_ordinary_io(text,cpus)
                             owners=validate_controlled(text,scene!='mm',cpus) if mode=='controlled' else None
                             if scene!='mm':
                                 wanted=('BoarOS: SQLite WAL multiprocess passed' if phase=='initial' else 'BoarOS: SQLite WAL reboot verified') if scene=='sqlite-wal' else (

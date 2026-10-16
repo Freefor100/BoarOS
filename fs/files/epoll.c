@@ -251,7 +251,7 @@ enum kernel_files_status kernel_files_epoll_create1(
     uint32_t flags,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_epoll *epoll = 0;
     struct kernel_open_file_description *ofd = 0;
     uint32_t fd = 0U;
@@ -448,7 +448,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
     uint64_t data,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_open_file_description *target_file = 0;
     struct kernel_epoll *epoll;
@@ -795,7 +795,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
     size_t sigsetsize,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_epoll *epoll;
     struct kernel_epoll_wait_request request = {0};

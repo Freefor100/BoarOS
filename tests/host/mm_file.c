@@ -299,7 +299,7 @@ int main(void)
         KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped) && !source && mapped==0x40000);
     /* 初次状态 OOM 必须在 VMA/登记发布之前失败，OFD 引用仍归调用者。 */
     /* 真实tmpfs来源已经受其实例预算约束；旧实现无条件拒绝文件域。 */
-    assert(kernel_mm_enable_concurrency(&parent)==KERNEL_MM_STATUS_OK);
+    assert(kernel_mm_check_task_domain(&parent)==KERNEL_MM_STATUS_OK);
     assert(!kernel_mm_fork(&child,&parent));
     for (unsigned id=1; id<=4; id++) {
         assert(!kernel_mm_acquire(&views[id],id==2 || id==4 ? &child : &parent));

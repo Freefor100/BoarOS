@@ -17,9 +17,12 @@ EXCLUDED(kernel_page_cache_alias_detach)
 #if !defined(BOAROS_MAX_CPUS) || BOAROS_MAX_CPUS == 1
 EXCLUDED(kernel_task_mm_borrow)
 #endif
+#if !BOAROS_USER_SMP
 EXCLUDED(kernel_proc_task_block_reads)
 EXCLUDED(kernel_proc_task_note_fault)
+#endif
 EXCLUDED(kernel_vfs_node_lock)
+EXCLUDED(kernel_vfs_node_try_read)
 EXCLUDED(kernel_open_file_size)
 EXCLUDED(kernel_open_file_memory_backed)
 EXCLUDED(kernel_open_file_get_page_for_fault)
@@ -42,7 +45,9 @@ EXCLUDED(kernel_file_mapping_stop)
 EXCLUDED(kernel_file_mapping_drain)
 EXCLUDED(kernel_tmpfs_check_domain)
 EXCLUDED(kernel_shm_attachment_acquire)
-EXCLUDED(kernel_shm_attachment_release)
+struct kernel_shm_attachment;
+void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
+{ if (owner && *owner) mm_test_unavailable(); }
 
 EXCLUDED(kernel_file_mapping_prepare)
 

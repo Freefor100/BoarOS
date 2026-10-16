@@ -22,7 +22,7 @@ class UserReport(unittest.TestCase):
         lines=[f'USER-SMP BEGIN cpus={cpus}',*[f'USER-SMP CASE {name} OK' for name in cases],f'USER-SMP END {len(cases)}',
             'BoarOS: PID 1 exited status=0x2a pages=0x20 heap-live=0x0; shutting down']
         for hart in range(cpus):
-            lines.append(f'BoarOS: USER SMP hart=0x{hart:x} traps=0x20 returns=0x20 local-irqs=0x2 syscalls=0x{15 if hart==0 else 0:x}')
+            lines.append(f'BoarOS: USER SMP hart=0x{hart:x} traps=0x20 returns=0x20 local-irqs=0x2 syscalls=0x{15 if hart==0 else 7:x}')
         return '\n'.join(lines)
     def test_exact_stream_and_real_harts(self):
         for cpus in (1,2):self.assertEqual(len(runner.validate(self.valid(cpus),cpus,True)),len(runner.CASES)+2)
@@ -47,8 +47,8 @@ class UserReport(unittest.TestCase):
             self.assertEqual(evidence.read_text(),'original owner evidence')
             explicit=Path(temp)/'explicit'
             self.assertEqual(runner.create_run_directory(explicit,base),explicit.resolve())
-    def test_cpu1_must_not_dispatch_syscall(self):
-        with self.assertRaises(RuntimeError):runner.validate(self.valid().replace('syscalls=0x0','syscalls=0x1'),2,True)
+    def test_cpu1_must_dispatch_local_syscalls(self):
+        with self.assertRaises(RuntimeError):runner.validate(self.valid().replace('syscalls=0x7','syscalls=0x0'),2,True)
     def test_exiting_proc_thread_is_not_a_runner_failure(self):
         good=Mock();good.read_text.return_value='CPU 1/TCG\n'
         vanished=Mock();vanished.read_text.side_effect=ProcessLookupError(3,'No such process')

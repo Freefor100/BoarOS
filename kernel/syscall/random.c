@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/errno.h>
 #include <kernel/random.h>
@@ -10,6 +11,7 @@ enum kernel_syscall_status syscall_handle_getrandom(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     uint64_t address = request->arguments[0];
     size_t size = request->arguments[1], total = 0;
     unsigned flags = (unsigned)request->arguments[2];

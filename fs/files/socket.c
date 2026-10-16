@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -43,7 +44,7 @@ enum kernel_files_status kernel_files_socket_create(
     struct kernel_files *files, int family, int type, uint32_t flags,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_socket *socket = 0;
     uint32_t fd;
     int find_result = 0;
@@ -73,7 +74,7 @@ enum kernel_files_status kernel_files_socket_accept(
     uint32_t flags, struct kernel_socket_address *peer_address,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_socket *accepted = 0;
     uint32_t fd;
     int find_result = 0;
@@ -113,7 +114,7 @@ enum kernel_files_status kernel_files_socketpair_create(
     uint64_t user_sv,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_socket *sock0 = 0;
     struct kernel_socket *sock1 = 0;
     struct kernel_open_file_description *ofd0 = 0;

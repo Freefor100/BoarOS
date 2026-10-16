@@ -11,18 +11,16 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 
 默认生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
 两侧共用 MM、调度、VFS、设备和用户程序策略，架构实现在构建期绑定。
-独立 RV 两核调度核心及受控私有/共享匿名、独立 tmpfs/磁盘文件 MM 的 pin/COW/TLB 回收闭环已验证。磁盘冷缺页通过CPU0 worker交接，写回按页排空写入借用；该受控配置的普通用户程序、实际磁盘I/O与现有业务仍在CPU0。
-同域共享FD表和匿名pipe已接入受控两核，验证查找/pin、dup/close、等待、迁移及最后端点回收；预先打开的同域tmpfs普通文件可就地I/O，ext4普通文件的整次操作交给既有CPU0 worker，已验证共享偏移、关闭身份及持久化。socket/epoll/FIFO、命名空间和一般设备业务跨核仍未开放。
+RV 两核调度支持受控内核任务和独立 `kernel-rv-user-smp` 的真实用户执行。普通与受控 MM、页缓存、FD/OFD 共用保护与引用规则；匿名缺页、驻留用户复制及普通文件缓存读写在发起 CPU 完成。冷读只把缺失批次交给既有 CPU0 worker，保留 128 KiB SG；回写、同步和后端最终释放仍由 CPU0 执行。命名空间、进程生命周期、设备和网络在实际业务入口串行，不再迁移整次通用 syscall。执行边界与验证见[RV 两核](docs/modules/riscv-smp.md#真实用户态与cpu0业务交接)。
 
-独立 `kernel-rv-user-smp` 配置开放真实用户态两核执行：syscall、同步fault和待服务通知迁移实际任务到CPU0，保留调用栈与身份；CPU1纯本地timer/IPI返回不进入业务服务。普通MM仅开放远端执行和失效后退休，内核业务仍在CPU0。当前同ELF Linux SMP对照已覆盖独立进程、pthread/TLS/寄存器、嵌套信号、撤权限/截断、取消、非leader exec、组停止/继续及实时服务资格，详见[用户两核边界](docs/modules/riscv-smp.md#真实用户态与cpu0业务交接)。默认单核和原受控配置保持。
-2026-10-14以固定Linux SMP同ELF复核229项原程序：2/1 CPU与512 MiB/1 GiB四个profile各229项通过；共享映射首缺页、pipe/futex等待及取消、组退出、低内存回收、SQLite DELETE/WAL与独立重启共60次组合启动通过。当前边界仍是CPU0执行内核业务，不代表任意内核路径都可并发。
+2026-10-14 的原程序记录包含 2/1 CPU、512 MiB/1 GiB 四个 USER_SMP profile，各 229 项通过；这是当时实现的结果。本轮普通对象并发、调用 CPU 执行位置及 SQLite 独立重启结果记录在对应[模块说明](docs/modules/riscv-smp.md#用户态原程序与压力组合)。
 
 | 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
-| 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX；独立 RV 受控两核配置 | 一般文件/设备及外部后备的并行内核业务尚未开放，RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[两核边界](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
+| 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX；独立 RV 受控两核配置 | 设备、网络及命名空间的并行内核业务尚未开放，RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[两核边界](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
-| 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；private/共享匿名/共享文件/SysV futex、robust-list、标准信号和同步 fault | 默认用户任务限CPU0，独立RV用户SMP的内核服务仍在CPU0；无 PI futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
-| 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename；受控RV共享FD/匿名pipe两核 | 一般文件/OFD与socket/epoll/FIFO业务仍限CPU0；无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
+| 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；private/共享匿名/共享文件/SysV futex、robust-list、标准信号和同步 fault | 默认用户任务限CPU0，独立 RV 用户 SMP 仅在需要串行的业务范围进入 CPU0；无 PI futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
+| 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename；受控RV共享FD/匿名pipe两核 | 普通文件数据访问可就地执行，socket/epoll/FIFO 业务仍在 CPU0；无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
 | 文件系统与挂载 | ext4、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount 与普通忙卸载、独立第二 ext4 盘 | 无 bind/remount/move/传播、扩展卸载 flags 或 mount namespace；[VFS](docs/modules/vfs-ext4.md)、[tmpfs](docs/modules/tmpfs.md) |
 | 存储 | 共用 VirtIO transport/split queue、批量/乱序 I/O、flush/reset、页缓存、后台写回/压力回收、ordered journal、durable commit/checkpoint、orphan/replay | RV legacy/modern MMIO；LA modern PCI及transitional设备的modern接口，纯legacy PCI未接；[框架](docs/modules/virtio-framework.md)、[存储](docs/modules/vfs-ext4.md) |
 | 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
@@ -81,16 +79,7 @@ make test-stack-usage test-stack-usage-la
 
 ## 开发方向与文档
 
-当前主线推进 **一般文件/页缓存/设备的并行内核业务及未开放后备域**，再按组合证据扩展RV核数和LA多核；
-具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
-CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；任务选择、身份发布及存储借用在统一短调度域保护，资源清理留在锁外；等待代次、借用游标、
-新栈交接与可睡眠锁内部资格已建立。受控磁盘映射保留CPU0 I/O及最终释放；系统压力回收、未开放外部后备及一般文件/其他业务对象仍需跨核保护。
-默认生产继续单CPU；新增[RV受控两核配置](docs/modules/riscv-smp.md)使用独立构建入口，
-2026-10-11在512MiB/1GiB完成MTTCG两核抢占、IPI/WFI交接、双向迁移、执行资格、
-RFENCE后栈回收、私有allocator及CPU0原静态/pthread组合；同一内核的一CPU退化也通过。
-用户任务及现有业务仍限CPU0，
-受控任务可绑定匿名和私有arena的tmpfs/ext4文件映射MM，完成片段pin、跨MM共享/私有COW、文件关闭代次与登记借用、活动集合及确认失效后回收。CPU0保留文件修改、磁盘I/O和最终释放；未开放后备与一般业务对象的并行内核操作仍需独立验收。普通用户两核使用独立USER_SMP配置，在真实调用任务上交接CPU0内核服务。
-共享FD表、匿名pipe、预开普通文件及真实用户跨核接入已存在；229项原程序四个USER_SMP profile及有限压力/生命周期组合已在本地验收，托管CI尚需实际运行确认；一般并行内核业务仍是后续方向，既有所有权边界继续适用。
+当前主线继续推进设备、网络和命名空间的并行内核业务，再按实际需要扩展 RV 核数与 LA 多核；具体未完成能力与依赖维护在[开发路线](docs/goals.md)。普通文件缓存、匿名缺页、用户 pin 与系统压力通知已经使用共同对象规则，不再保留 IRQ-only 缓存、MM/FD 并发启用开关和 resident-only read 支路。需要串行的 ext4 后端、设备及进程生命周期仍在实际 CPU0 操作边界执行，默认生产与 LA 继续单 CPU。
 共享调度域的[成本核对](docs/learning/cost-baseline.md#共享调度域的匹配时间)保留既有开销和短窗口未决结果；
 短窗口归因已停止，不再作为两核规划的前置门槛。既有3%测量协议保留，未决不记为通过。
 FS-Off候选仍在实验分支，未进入main；宿主同步测试与单核验收不代表整个内核已具备SMP安全性。

@@ -164,8 +164,8 @@ static void verify(void *unused)
     struct kernel_mm_user_pin pin={0};
     check(!kernel_mm_pin_user_page(mm,IO_ANON,KERNEL_MM_READ,&pin),"file-io-self-pin");
     kernel_page_cache_get_concurrency_state(cache,&before);
-    check(kernel_files_pread(files,mm,0,IO_ANON,0,0,&result)==KERNEL_FILES_STATUS_STATE,
-        "file-io-self-pin-no-publication");
+    check(!kernel_files_pread(files,mm,0,IO_ANON,0,0,&result) && !result,
+        "file-io-self-pin-empty-local");
     kernel_mm_unpin_user_page(&pin);
     kernel_page_cache_get_concurrency_state(cache,&after);
     check(before.executions_queued==after.executions_queued,"file-io-rejected-request-owner");
@@ -215,11 +215,10 @@ static void verify(void *unused)
         !kernel_files_lseek(files,1,0,1,&result) && !result,"file-io-local-tmpfs-positioned");
     check(!kernel_files_read(files,mm,1,IO_ANON+128,4,&result) && result==4 &&
         !kernel_files_lseek(files,1,0,1,&result) && result==4,"file-io-local-tmpfs-offset");
-    check(kernel_files_ftruncate(files,1,0,&result)==KERNEL_FILES_STATUS_STATE,
-        "file-io-tmpfs-truncate-controller-only");
-    check(kernel_files_syncfs(files,0,&result)==KERNEL_FILES_STATUS_STATE,"file-io-unopened-mount-business");
-    check(kernel_files_socketpair_create(files,mm,1,0,IO_ANON+128,&result)==KERNEL_FILES_STATUS_STATE &&
-        kernel_files_epoll_create1(files,0,&result)==KERNEL_FILES_STATUS_STATE,"file-io-unopened-business-before-publication");
+    check(!kernel_files_ftruncate(files,1,0,&result) && !result && !kernel_open_file_size(memory_control),
+        "file-io-tmpfs-truncate-common-path");
+    /* 命名空间/网络不由这个绑定文件任务执行；创建时检查实际消费者，
+     * 不再用FD表的资格标记模拟另一套业务语义。 */
 }
 void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigned count,
     struct kernel_open_file_description *source,struct kernel_page_cache *page_cache)
@@ -265,7 +264,7 @@ void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigne
         !kernel_vfs_pwrite(&memory_control->file,0,"MEM0",4,&written) && written==4,"file-io-tmpfs-seed");
     slot=memory_control;
     check(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&table,1,0,&slot) &&
-        !kernel_files_enable_concurrency(&table,space),"file-io-table-publication");
+        !kernel_files_check_task_domain(&table,space),"file-io-table-publication");
 }
 void riscv_file_io_overlap_start(void)
 {

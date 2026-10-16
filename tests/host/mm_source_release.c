@@ -114,7 +114,6 @@ int main(void)
     assert(!arch_mmu_user_space_init(&space,&pages,&kernel) && !kernel_mm_create(&mm,&space) &&
         !kernel_mm_vma_enable(&mm,&heap) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
     assert(!kernel_mm_context(&mm,&context)); mm_test_context=context;
-    assert(!kernel_mm_enable_remote_user_execution(&mm));
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));
 
     struct kernel_open_file_description *file=map_file("/unmap",0x40000);
@@ -147,7 +146,7 @@ int main(void)
     /* 真实登记仍被callback借用，等待者已提交unmap；不挡同MM无关resident pin。 */
     kernel_cpu_current()->logical_id=1; mm_test_bind(&mm); kernel_task_current()->arch.user_mode=1;
     struct kernel_mm_user_pin pin={0};
-    assert(!kernel_mm_try_pin_user_page(&mm,0x80000,KERNEL_MM_WRITE,&pin)); kernel_mm_unpin_user_page(&pin);
+    assert(!kernel_mm_pin_user_page(&mm,0x80000,KERNEL_MM_WRITE,&pin)); kernel_mm_unpin_user_page(&pin);
     kernel_task_current()->arch.user_mode=0; mm_test_bind(NULL); kernel_cpu_current()->logical_id=0;
     publish(&callback_resume);
     assert(!pthread_join(notifier,NULL) && !pthread_join(remover,NULL) && unmap_done);

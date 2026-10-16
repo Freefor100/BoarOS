@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -28,6 +29,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_rlimit64 before;
     struct kernel_rlimit64 replacement;
     struct kernel_mm *mm;
@@ -149,6 +151,7 @@ enum kernel_syscall_status syscall_handle_get_robust_list(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     int32_t pid = (int32_t)(uint32_t)request->arguments[0];
     struct kernel_task *target = pid == 0 ? caller :
                                  pid > 0 ? kernel_signal_find_by_tid(pid) : 0;
@@ -196,6 +199,10 @@ enum kernel_syscall_status syscall_handle_execve(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+#if BOAROS_USER_SMP
+    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
+        kernel_scheduler_enter_user_service();
+#endif
     int64_t linux_result;
 
     if (kernel_execve_prepare(caller,
@@ -267,6 +274,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
 enum kernel_syscall_status syscall_handle_setpgid(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = kernel_task_setpgid(caller, (int32_t)request->arguments[0],
                                         (int32_t)request->arguments[1]);
@@ -276,6 +284,7 @@ enum kernel_syscall_status syscall_handle_setpgid(struct kernel_task *caller,
 enum kernel_syscall_status syscall_handle_getpgid(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = kernel_task_getpgid(caller, (int32_t)request->arguments[0]);
     return KERNEL_SYSCALL_STATUS_OK;
@@ -284,6 +293,7 @@ enum kernel_syscall_status syscall_handle_getpgid(struct kernel_task *caller,
 enum kernel_syscall_status syscall_handle_getsid(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = kernel_task_getsid(caller, (int32_t)request->arguments[0]);
     return KERNEL_SYSCALL_STATUS_OK;
@@ -292,6 +302,7 @@ enum kernel_syscall_status syscall_handle_getsid(struct kernel_task *caller,
 enum kernel_syscall_status syscall_handle_setsid(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     (void)request;
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = kernel_task_setsid(caller);

@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/log.h>
 #include <kernel/errno.h>
@@ -19,6 +20,7 @@ enum kernel_syscall_status syscall_handle_syslog(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     int action = (int)request->arguments[0], length = (int)request->arguments[2];
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     /* All current tasks have the immutable root identity. The policy itself

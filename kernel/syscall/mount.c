@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -151,6 +152,7 @@ enum kernel_syscall_status syscall_handle_mount(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded, int unmount)
 {
+    KERNEL_SERVICE_SCOPE(service);
     const struct kernel_fs_context *fs;
     struct kernel_mm *mm;
     if (kernel_task_fs_context_borrow(caller, &fs) != KERNEL_TASK_STATUS_OK ||

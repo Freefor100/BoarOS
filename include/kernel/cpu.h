@@ -48,7 +48,7 @@ struct kernel_cpu {
     /* 借用任务执行/就绪owner，保留服务往返期间的实时用户资格。 */
     struct kernel_sched_runqueue user_reservations;
     uint64_t user_traps, user_returns, user_local_interrupts;
-    uint64_t service_dispatches, service_migrations, service_queue_ticks;
+    uint64_t syscall_dispatches, service_migrations, service_queue_ticks;
     uint64_t service_samples, service_elapsed_ticks, service_running_ns;
 #endif
 #endif

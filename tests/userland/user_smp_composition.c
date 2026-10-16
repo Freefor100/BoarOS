@@ -195,6 +195,11 @@ static void *ordinary_reader(void *opaque)
     else if (test->operation==2) {
         struct iovec vector[2]={{test->buffer,5},{test->buffer+32,test->size-5}};
         test->result=readv(test->fd,vector,2);
+    } else if(test->operation==3) test->result=write(test->fd,test->buffer,test->size);
+    else if(test->operation==4) test->result=pwrite(test->fd,test->buffer,test->size,test->offset);
+    else if(test->operation==5) {
+        struct iovec vector[2]={{test->buffer,5},{test->buffer+32,test->size-5}};
+        test->result=writev(test->fd,vector,2);
     } else test->result=read(test->fd,test->buffer,test->size);
     composition_store(&test->done,1);
     if(test->signal_wait) { uint64_t end=now()+UINT64_C(10000000000);
@@ -205,7 +210,7 @@ static void read_arm(struct ordinary_read *test,unsigned flags)
 {
     composition_store(&control->read_tid,test->tid);
     composition_store(&control->read_address,(uintptr_t)test->buffer);
-    composition_store(&control->read_size,test->operation==2 ? 64 : test->size);
+    composition_store(&control->read_size,(test->operation==2 || test->operation==5) ? 64 : test->size);
     composition_store(&control->read_hart,(online&2) ? 1 : 0);
     composition_store(&control->read_flags,flags);
     composition_store(&control->read_entered,0);composition_store(&control->read_release,0);
@@ -238,9 +243,9 @@ static void ordinary_reads(void)
 {
     int fd=open("/ordinary-read-source",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(fd>=0);
     unsigned char source[4096];for(unsigned i=0;i<sizeof(source);i++)source[i]=(unsigned char)(i*13+7);
-    for(unsigned i=0;i<3;i++)CHECK(write(fd,source,sizeof(source))==sizeof(source));
+    for(unsigned i=0;i<16;i++)CHECK(write(fd,source,sizeof(source))==sizeof(source));
     CHECK(!fsync(fd));
-    unsigned char *buffer=mmap(0,3*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    unsigned char *buffer=mmap(0,17*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     CHECK(buffer!=MAP_FAILED);memset(buffer,0,2*4096);
     CHECK(!lseek(fd,0,SEEK_SET));
     struct ordinary_read test={.fd=fd,.buffer=buffer,.size=16};
@@ -253,14 +258,21 @@ static void ordinary_reads(void)
     CHECK(lseek(fd,0,SEEK_CUR)==32);record("ordinary-hot-read-pread-readv");
 
     test=(struct ordinary_read){.fd=fd,.operation=1,.buffer=buffer,.size=16,.offset=64};
-    read_run(&test,COMPOSITION_READ_SERVICE|COMPOSITION_READ_COLD);
+    read_run(&test,COMPOSITION_READ_LOCAL|COMPOSITION_READ_COLD);
     CHECK(test.result==16 && !memcmp(buffer,source+64,16));record("ordinary-cold-cache");
+    test=(struct ordinary_read){.fd=fd,.operation=1,.buffer=buffer,.size=65536};
+    read_run(&test,COMPOSITION_READ_LOCAL|COMPOSITION_READ_COLD|COMPOSITION_READ_BATCH);
+    CHECK(test.result==65536);
+    for(unsigned i=0;i<16;i++)CHECK(!memcmp(buffer+i*4096,source,4096));
+    record("ordinary-cold-batch-local");
+    CHECK(!munmap(buffer+8192,4096) && mmap(buffer+8192,4096,PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0)==buffer+8192);
     test=(struct ordinary_read){.fd=fd,.operation=1,.buffer=buffer+8192,.size=16,.offset=96};
-    read_run(&test,COMPOSITION_READ_SERVICE);
+    read_run(&test,COMPOSITION_READ_LOCAL);
     CHECK(test.result==16 && !memcmp(buffer+8192,source+96,16));record("ordinary-user-fault");
     CHECK(!mprotect(buffer+4096,4096,PROT_NONE) && !lseek(fd,0,SEEK_SET));
     test=(struct ordinary_read){.fd=fd,.buffer=buffer+4094,.size=4};
-    read_run(&test,COMPOSITION_READ_SERVICE|COMPOSITION_READ_PREFIX);
+    read_run(&test,COMPOSITION_READ_LOCAL|COMPOSITION_READ_PREFIX);
     CHECK(test.result==2 && !memcmp(buffer+4094,source,2) && lseek(fd,0,SEEK_CUR)==2);
     CHECK(!mprotect(buffer+4096,4096,PROT_READ|PROT_WRITE));record("ordinary-read-fault-prefix");
 
@@ -272,7 +284,7 @@ static void ordinary_reads(void)
     CHECK(!pthread_create(&reader,0,ordinary_reader,&test) &&
         !pthread_create(&seeker,0,ordinary_seeker,&seek));
     wait_value(&test.ready,1);wait_value(&seek.ready,1);
-    read_arm(&test,COMPOSITION_READ_SERVICE|COMPOSITION_READ_HOLD|COMPOSITION_READ_SEEK);
+    read_arm(&test,COMPOSITION_READ_LOCAL|COMPOSITION_READ_HOLD|COMPOSITION_READ_SEEK);
     if(observed)wait_value(&control->read_entered,1);
     else CHECK(!pthread_join(reader,0));
     composition_store(&control->read_waiter_tid,seek.tid);composition_store(&seek.go,1);
@@ -311,12 +323,23 @@ static void ordinary_reads(void)
     if(observed)CHECK(!pthread_join(reader,0));
     command(COMPOSITION_READ_FINISH);
     CHECK(test.result==16 && !memcmp(buffer,source,16));
-    /* 先由CPU0处理COW和冷缓存，随后实际用户hart连续消费两张热页。
-     * 此时观察phase已结束，不把预读功能混入130字节的精确前缀记录。 */
+    /* 观察phase已结束；再次检查顺序读取，不把可选预读混入需求批次记录。 */
     CHECK(pread(fd,buffer,8192,0)==8192 && !lseek(fd,0,SEEK_SET));
     CHECK(!pthread_create(&reader,0,ordinary_sequential_reader,&test) && !pthread_join(reader,0));
-    CHECK(!close(fd) && !unlink("/ordinary-read-source") && !munmap(buffer,3*4096));
+    CHECK(!close(fd) && !unlink("/ordinary-read-source"));
     record("ordinary-read-fork-pin");
+    int output=open("/ordinary-write-target",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(output>=0);
+    memcpy(buffer,"local-data-write",16);memcpy(buffer+32,"vector-tail",11);
+    for(unsigned operation=3;operation<=5;operation++) {
+        test=(struct ordinary_read){.fd=output,.operation=(int)operation,.buffer=buffer,.size=16,.offset=32};
+        read_run(&test,COMPOSITION_WRITE_LOCAL);CHECK(test.result==16);
+    }
+    CHECK(lseek(output,0,SEEK_CUR)==32 && !fsync(output));
+    unsigned char actual[48],expected[48];
+    memcpy(expected,buffer,16);memcpy(expected+16,buffer,5);memcpy(expected+21,buffer+32,11);memcpy(expected+32,buffer,16);
+    CHECK(pread(output,actual,sizeof(actual),0)==sizeof(actual) && !memcmp(actual,expected,sizeof(actual)));
+    CHECK(!close(output) && !unlink("/ordinary-write-target"));record("ordinary-write-pwrite-writev-local");
+    CHECK(!munmap(buffer,17*4096));
 }
 static void mappings(void)
 {
@@ -468,7 +491,7 @@ int main(void)
     setup();
     if (!access("/sqlite-scene",F_OK)) sqlite();
     else if (!access("/ordinary-read-scene",F_OK)) {
-        ordinary_reads();puts("COMPOSITION END 7");
+        ordinary_reads();puts("COMPOSITION END 9");
     }
     else {
         concurrent_first_fault();
@@ -478,7 +501,7 @@ int main(void)
         for (unsigned count=1;count<=32;count=count==1 ? 8 : 32) {
             waiters(count,0);waiters(count,1);group_exit(count);if (count==32) break;
         }
-        puts("COMPOSITION END 19");
+        puts("COMPOSITION END 21");
     }
     command(COMPOSITION_STOP);
     CHECK(!munmap(control,4096) && !close(control_fd) && !unlink("/dev/shm/smp-control"));

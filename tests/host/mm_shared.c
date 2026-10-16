@@ -187,7 +187,7 @@ int main(void)
     assert(!kernel_mm_brk_initialize(&parent,0x10000,0x20000) && !kernel_mm_context(&parent,&roots[1])); mm_test_context=roots[1];
     map(&parent,SHARED,3*BOAROS_PAGE_SIZE,RW,1); map(&parent,PRIVATE,BOAROS_PAGE_SIZE,RW,0);
     write_byte(&parent,SHARED,11); write_byte(&parent,PRIVATE,31);
-    assert(!kernel_mm_enable_concurrency(&parent));
+    assert(!kernel_mm_check_task_domain(&parent));
     assert(!kernel_mm_fork(&child,&parent));
     struct kernel_mm_mapping a,b;
     assert(!kernel_mm_lookup(&parent,SHARED,&a) && !kernel_mm_lookup(&child,SHARED,&b));

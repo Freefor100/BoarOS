@@ -567,6 +567,13 @@ enum kernel_signal_status kernel_signal_update_blocked(
     } else {
         task->signal_blocked = mask;
     }
+#if BOAROS_USER_SMP
+    struct kernel_task *leader = signal_group_leader(task);
+    if ((task->signal_pending | (leader ? leader->group_pending : 0)) & ~task->signal_blocked) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_user_request_locked(task);
+    }
+#endif
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -1242,6 +1249,7 @@ void kernel_signal_restore_temporary_mask(
 void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
     int32_t code, uint64_t address)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (task != kernel_cpu_current()->current || !signal_dispatchable(task) ||
         !sig || sig > KERNEL_SIGNAL_COUNT || task->signal_fault.signal) __builtin_trap();
     const struct kernel_signal_action *entry = signal_action_of(task, sig);
@@ -1253,6 +1261,10 @@ void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
         task->signal_blocked &= ~mask;
     }
     task->signal_fault = (struct kernel_signal_fault){sig, code, address};
+#if BOAROS_USER_SMP
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    scheduler_user_request_locked(task);
+#endif
 }
 
 enum kernel_signal_select_result kernel_signal_select(

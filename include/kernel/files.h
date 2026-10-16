@@ -25,18 +25,6 @@ enum kernel_files_status {
     KERNEL_FILES_STATUS_CLEANUP_REQUIRED,
     KERNEL_FILES_STATUS_STATE,
 };
-#if BOAROS_USER_SMP
-enum kernel_files_read_kind {
-    KERNEL_FILES_READ,
-    KERNEL_FILES_PREAD,
-    KERNEL_FILES_READV,
-};
-/* 零进度不支持时handled=0；接纳后同一OFD pin覆盖本地段和CPU0续读。 */
-enum kernel_files_status kernel_files_try_local_read(
-    struct kernel_files *, struct kernel_mm *, enum kernel_files_read_kind,
-    int64_t fd, uint64_t buffer, uint64_t count, int64_t offset,
-    int *handled, int64_t *result);
-#endif
 
 enum kernel_files_state {
     KERNEL_FILES_EMPTY = 0,
@@ -139,13 +127,10 @@ struct kernel_files {
 enum kernel_files_status kernel_files_create(
     struct kernel_files *files,
     struct kernel_heap *heap);
-/* CPU0在独占、未发布record上启用；全部OFD/端点引用及观察者必须在本域。
- * 接纳同域匿名pipe或同域tmpfs/受控磁盘普通OFD。普通OFD调用者必须
- * 另持CPU0控制引用至任务、请求和MM结束；未准备的普通OFD不能随后安装。
- * 控制者和任务
- * 分别持有handle，record共享。末handle退休后锁外清理OFD及数组。 */
-enum kernel_files_status kernel_files_enable_concurrency(struct kernel_files *, const struct kernel_mm *);
-enum kernel_files_status kernel_files_check_concurrent_domain(const struct kernel_files *, const struct kernel_mm *);
+/* LIVE表owner在无用户pin/业务锁的返回边界推进已经退休的OFD。 */
+enum kernel_files_status kernel_files_drain_file_cleanup(struct kernel_files *);
+/* 受控内核任务在创建处检查实际后备、设备和观察者；不改变FD/OFD保护规则。 */
+enum kernel_files_status kernel_files_check_task_domain(const struct kernel_files *, const struct kernel_mm *);
 
 /* Share the complete descriptor table and its cleanup ownership. */
 enum kernel_files_status kernel_files_acquire(

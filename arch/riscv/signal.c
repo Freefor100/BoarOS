@@ -194,6 +194,7 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
 
 void riscv_signal_restore_current(struct riscv_trap_frame *frame)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_task *task = kernel_task_current();
     struct riscv_fpu_state *fpu = riscv_process_fpu_borrow_current();
     struct kernel_mm *mm;

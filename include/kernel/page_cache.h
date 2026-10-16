@@ -115,6 +115,7 @@ struct kernel_lock_guard;
 enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(
     struct kernel_page_cache *,void (*execute)(void *),void *argument,
     const struct kernel_lock_guard *borrowed);
+int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *);
 int kernel_page_cache_is_executor(const struct kernel_page_cache *);
 
 /* Returns an owned physical-page reference that the caller must release. */
@@ -139,19 +140,13 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache_read_page *pages, size_t count);
 
 /* A successful lookup also returns an owned physical-page reference. */
+/* 只借用当前已完成页；装入、resize或截断中的条目返回BUSY。 */
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,
     uint64_t page_index,
     uint64_t *physical_address,
     size_t *valid_bytes);
-
-/* 调用者持有file/cache owner；一次资格尝试整批现有完成页，不等待、分配或I/O。
- * 成功逐项返回物理页借用或EOF，由调用者release；失败已归还本次全部借用，
- * 没有可消费输出。不延长entry/node借用，也不改变CPU0回收者的LRU游标。 */
-enum kernel_page_cache_status kernel_page_cache_try_resident_batch(
-    struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first_page,
-    struct kernel_page_cache_read_page *pages, size_t count);
 
 enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,

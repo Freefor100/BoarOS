@@ -12,7 +12,6 @@ enum kernel_uaccess_status {
     KERNEL_UACCESS_STATUS_FAULT,
     KERNEL_UACCESS_STATUS_TOO_LONG,
     KERNEL_UACCESS_STATUS_STATE,
-    KERNEL_UACCESS_STATUS_RETRY,
 };
 
 enum kernel_uaccess_status kernel_user_range_check(

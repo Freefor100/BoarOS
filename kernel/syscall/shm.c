@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -11,6 +12,7 @@ enum kernel_syscall_status syscall_handle_shmget(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (caller == 0 || request == 0 || decoded == 0) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
@@ -30,6 +32,7 @@ enum kernel_syscall_status syscall_handle_shmat(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (caller == 0 || request == 0 || decoded == 0) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
@@ -49,6 +52,7 @@ enum kernel_syscall_status syscall_handle_shmdt(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (caller == 0 || request == 0 || decoded == 0) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
@@ -63,6 +67,7 @@ enum kernel_syscall_status syscall_handle_shmctl(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (caller == 0 || request == 0 || decoded == 0) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }

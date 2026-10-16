@@ -1508,7 +1508,7 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
             if (!valid_nonleaf_entry(middle[m])) return RISCV_SV39_STATUS_STATE;
             status = resolve_runtime_table(s->allocator, entry_address(middle[m]), &leaves);
             if (status != RISCV_SV39_STATUS_OK) return status;
-            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < 512 && (((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << 12)) < end; l++) {
+            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < 512 && (((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT)) < end; l++) {
                 if (!leaves[l]) continue;
                 if (!valid_user_leaf_entry(leaves[l]) && !valid_protected_entry(leaves[l])) return RISCV_SV39_STATUS_STATE;
                 *address = ((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT);

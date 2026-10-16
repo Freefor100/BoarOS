@@ -76,7 +76,7 @@ struct kernel_page_cache_record {
     struct kernel_mutex metadata;
     struct cache_request *reads_head, **reads_tail;
     struct kernel_io_context *executor_io;
-    uint32_t read_requests, reads_running;
+    uint32_t read_requests, reads_running, request_borrows;
     uint64_t requests_queued, requests_completed, entry_borrows;
     uint64_t deferred_snapshots;
     uint64_t executions_queued, executions_completed;
@@ -135,19 +135,14 @@ struct cache_request {
     struct cache_request *next;
     void (*execute)(void *);
     void *argument;
+    struct kernel_task *account_task;
     uint64_t queued_at;
     unsigned observed;
     enum kernel_page_cache_status status;
     unsigned done;
     struct kernel_wait_queue changed;
 };
-struct cache_read_request {
-    struct kernel_page_cache *cache;
-    const struct kernel_vfs_file *file;
-    uint64_t index, address;
-    size_t valid;
-    enum kernel_page_cache_status status;
-};
+
 #define CACHE_SCOPE(name, cache) \
     KERNEL_LOCK_SCOPE(name); \
     kernel_mutex_lock(&(cache)->record->metadata, &(name))
@@ -201,13 +196,30 @@ static void foreground_workspace_put(struct kernel_page_cache *cache,union foreg
     }
     if (kernel_heap_release(cache->heap,workspace)) __builtin_trap();
 }
+struct read_batch_load {
+    struct kernel_page_cache *cache;
+    const struct kernel_vfs_file *file;
+    uint64_t first;
+    struct kernel_page_cache_read_page *pages;
+    size_t count,candidates;
+    struct kernel_page_cache_entry **entries,**loads;
+    struct kernel_page_cache_read_page **outputs;
+    struct file_read_span *spans;
+    struct file_read_workspace *backend;
+    enum kernel_page_cache_status allocation;
+};
+
 static int remote_cache_client(void)
 {
 #if BOAROS_MAX_CPUS > 1
     if (kernel_cpu_current()->logical_id != 0) return 1;
     const struct kernel_mm *bound=0;
     struct kernel_task *task=kernel_task_current();
-    return task && kernel_task_mm_borrow(task,&bound)==KERNEL_TASK_STATUS_OK;
+    if (!task || kernel_task_mm_borrow(task,&bound)!=KERNEL_TASK_STATUS_OK) return 0;
+#if BOAROS_USER_SMP
+    if (kernel_task_has_user_context(task) && kernel_scheduler_user_service_active()) return 0;
+#endif
+    return 1;
 #else
     return 0;
 #endif
@@ -400,7 +412,7 @@ static void version_pool_stop(struct version_pool *pool)
 static void *version_data(struct cache_version *version)
 {
     void *data;
-    if (physical_page_resolve(version->pool->allocator,version->physical,&data)) __builtin_trap();
+    if (physical_page_map_owned(version->pool->allocator,version->physical,&data)) __builtin_trap();
     return data;
 }
 
@@ -986,7 +998,7 @@ void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *cache,
         .deferred_snapshots = r->deferred_snapshots,
         .writeback_rounds = r->completed,
         .running = r->reads_running, .entry_bytes = sizeof(struct kernel_page_cache_entry),
-        .record_bytes = sizeof(*r), .request_bytes = sizeof(struct cache_request)+sizeof(struct cache_read_request),
+        .record_bytes = sizeof(*r), .request_bytes = sizeof(struct cache_request)+sizeof(struct read_batch_load),
         .execution_request_bytes=sizeof(struct cache_request),
         .index_capacity=r->capacity,.index_live=r->occupied,.index_tombstones=r->tombstones,
         .executions_queued=r->executions_queued,.executions_completed=r->executions_completed,
@@ -1143,11 +1155,10 @@ void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias)
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
 }
-static int rearm_aliases(struct kernel_page_cache_entry *entry)
+/* 调用者在关闭写入的同一保护内取得首个alias借用。 */
+static int rearm_aliases(struct kernel_page_cache_entry *entry,struct kernel_page_cache_alias *alias)
 {
     struct kernel_page_cache *cache = entry->cache;
-    struct kernel_page_cache_alias *alias;
-    { CACHE_SCOPE(guard, cache); alias = entry->aliases; alias_borrow(alias); }
     while (alias) {
         int active;
         { CACHE_SCOPE(guard,cache); active = alias->previous != 0; }
@@ -1203,7 +1214,7 @@ enum kernel_page_cache_status kernel_page_cache_alias_write_begin(
     if (!alias || !kernel_page_cache_alias_active(alias) || !alias->entry || !borrow) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     return writer_begin(alias->entry,borrow) ? KERNEL_PAGE_CACHE_STATUS_OK : KERNEL_PAGE_CACHE_STATUS_BUSY;
 }
-void kernel_page_cache_write_end(struct kernel_page_cache_write_borrow *borrow)
+static void writer_end_locked(struct kernel_page_cache_write_borrow *borrow)
 {
     if (!borrow || borrow->registration != borrow || borrow->owner != kernel_io_context_current()) __builtin_trap();
     struct kernel_page_cache_entry *entry = borrow->entry;
@@ -1211,7 +1222,6 @@ void kernel_page_cache_write_end(struct kernel_page_cache_write_borrow *borrow)
     struct kernel_page_cache_write_borrow **link = &owner->cache_writes;
     while (*link && *link != borrow) link = &(*link)->next;
     if (*link != borrow) __builtin_trap();
-    CACHE_SCOPE(guard,entry->cache);
     uint64_t state = __atomic_fetch_sub(&entry->writes,1,__ATOMIC_RELEASE);
     if (state & ~CACHE_WRITES_MASK || !(uint32_t)state) __builtin_trap();
     *link = borrow->next; *borrow = (struct kernel_page_cache_write_borrow){0};
@@ -1225,6 +1235,12 @@ void kernel_page_cache_write_end(struct kernel_page_cache_write_borrow *borrow)
     if ((uint32_t)state==1 && entry->retired && entry->cache->record->started) {
         entry->cache->record->requested=1; cache_wake(&entry->cache->record->work);
     }
+}
+void kernel_page_cache_write_end(struct kernel_page_cache_write_borrow *borrow)
+{
+    if (!borrow || !borrow->entry) __builtin_trap();
+    CACHE_SCOPE(guard,borrow->entry->cache);
+    writer_end_locked(borrow);
 }
 enum kernel_page_cache_status kernel_page_cache_wait_writable(
     struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t index,uint64_t physical)
@@ -1283,7 +1299,7 @@ static enum kernel_page_cache_status finish_read_page(
         struct kernel_wait_token token = {0};
         {
             CACHE_SCOPE(guard, cache);
-            if (!entry->loading) {
+            if (!entry->loading && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
                 status = entry->load_error;
                 if (!status) take_read_page(cache, entry, address, valid, entry_valid_bytes(entry));
                 entry_return(entry);
@@ -1320,92 +1336,20 @@ static int read_entry_ready(struct kernel_page_cache_entry *entry)
         (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED));
 }
 
-enum kernel_page_cache_status kernel_page_cache_try_resident_batch(
-    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
-    struct kernel_page_cache_read_page *pages,size_t count)
-{
-    if (!cache_live(cache) || count>KERNEL_PAGE_CACHE_READ_BATCH_MAX ||
-        (count && (!pages || first>UINT64_MAX>>BOAROS_PAGE_SHIFT ||
-            count-1>(UINT64_MAX>>BOAROS_PAGE_SHIFT)-first)))
-        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
-    if (!node) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
-    KERNEL_LOCK_SCOPE(guard);
-    if (!kernel_mutex_try_lock(&cache->record->metadata,&guard))
-        return KERNEL_PAGE_CACHE_STATUS_BUSY;
-    uint64_t epoch;
-    if (kernel_file_mapping_epoch(node,&epoch)) return KERNEL_PAGE_CACHE_STATUS_BUSY;
-    uint64_t size=kernel_vfs_node_size(node);
-    enum kernel_page_cache_status result=KERNEL_PAGE_CACHE_STATUS_OK;
-    size_t borrowed=0;
-    for (;borrowed<count;borrowed++) {
-        struct kernel_page_cache_read_page *page=&pages[borrowed];
-        uint64_t offset=(first+borrowed)<<BOAROS_PAGE_SHIFT;
-        if (offset>=size) {
-            *page=(struct kernel_page_cache_read_page){.status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE};
-            continue;
-        }
-        struct kernel_page_cache_entry *entry;
-        result=lookup_entry(cache,file,first+borrowed,&entry);
-        if (result) break;
-        if (!read_entry_ready(entry) ||
-            (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
-            result=KERNEL_PAGE_CACHE_STATUS_BUSY;
-            break;
-        }
-        if (physical_page_acquire(cache->allocator,entry->physical_address)) __builtin_trap();
-        *page=(struct kernel_page_cache_read_page){.physical_address=entry->physical_address,
-            .valid_bytes=size-offset<BOAROS_PAGE_SIZE?(size_t)(size-offset):BOAROS_PAGE_SIZE,
-            .status=KERNEL_PAGE_CACHE_STATUS_OK};
-        /* 远端不改变CPU0的LRU游标；实际物理引用允许entry在复制期间退休。 */
-        cache->record->statistics.hits++;
-    }
-    if (result) {
-        /* 全热批次才交付借用。miss仍由原调用现场继续，不留下半批owner。 */
-        for (size_t i=0;i<borrowed;i++) if (!pages[i].status) {
-            if (physical_page_release(cache->allocator,pages[i].physical_address)) __builtin_trap();
-            pages[i]=(struct kernel_page_cache_read_page){.status=result};
-        }
-    }
-    return result;
-}
-
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t index, uint64_t *address, size_t *valid)
 {
-    if (!cache_live(cache) || !address || !valid) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    if (!node) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    KERNEL_LOCK_SCOPE(inode);
-    {
-        if (!kernel_lock_held(&node->io_lock,0)) {
-            CACHE_SCOPE(guard,cache);
-            if (read_cache_open(node)) {
-                struct kernel_page_cache_entry *entry;
-                enum kernel_page_cache_status status=lookup_entry(cache,file,index,&entry);
-                if (status) return status;
-                if (read_entry_ready(entry)) {
-                    take_read_page(cache,entry,address,valid,entry_valid_bytes(entry));
-                    return KERNEL_PAGE_CACHE_STATUS_OK;
-                }
-            }
-        }
-        kernel_vfs_node_lock(node,&inode,0);
-    }
+    if (!cache_live(cache) || !address || !valid || !kernel_vfs_file_node(file))
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    CACHE_SCOPE(guard,cache);
+    if (!read_cache_open(kernel_vfs_file_node(file))) return KERNEL_PAGE_CACHE_STATUS_BUSY;
     struct kernel_page_cache_entry *entry;
-    {
-        CACHE_SCOPE(guard, cache);
-        enum kernel_page_cache_status status = lookup_entry(cache, file, index, &entry);
-        if (status) return status;
-        if (!entry->loading && !entry->load_error) {
-            take_read_page(cache, entry, address, valid, entry_valid_bytes(entry));
-            return KERNEL_PAGE_CACHE_STATUS_OK;
-        }
-        entry_borrow(entry);
-    }
-    return finish_read_page(cache, entry, address, valid);
+    enum kernel_page_cache_status status=lookup_entry(cache,file,index,&entry);
+    if (status) return status;
+    if (!read_entry_ready(entry)) return entry->load_error ? entry->load_error : KERNEL_PAGE_CACHE_STATUS_BUSY;
+    take_read_page(cache,entry,address,valid,entry_valid_bytes(entry));
+    return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
 /* 未发布的候选持有自己的node/page；分配完成后才在cache保护内竞争发布。 */
@@ -1422,7 +1366,7 @@ static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *ca
     }
     entry->page_references_owned=1;
     void *page;
-    if (physical_page_resolve(cache->allocator,entry->physical_address,&page))
+    if (physical_page_map_owned(cache->allocator,entry->physical_address,&page))
         return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_STATE);
     if (clear) memset(page,0,BOAROS_PAGE_SIZE);
     if (kernel_vfs_node_acquire(node)) return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_STATE);
@@ -1443,36 +1387,6 @@ static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cac
     lru_insert_head(r,entry);r->statistics.insertions++;r->statistics.current_pages++;
     if (r->statistics.current_pages>r->statistics.peak_pages) r->statistics.peak_pages=r->statistics.current_pages;
 }
-/* Scalar writers retain their partial-page initialization. Read producers are
- * invisible while loading and initialize only their successful EOF tail. */
-static enum kernel_page_cache_status prepare_page(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node,uint64_t page_index,int clear,
-    struct kernel_page_cache_entry **output,void **bytes,int *created)
-{
-    if (!reserve_buckets(cache,1)) return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-    struct kernel_page_cache_entry *entry;void *page;
-    enum kernel_page_cache_status status=allocate_entry(cache,node,page_index,clear,&entry,&page);
-    if (status) return status;
-    for (;;) {
-        CACHE_SCOPE(publish,cache);
-        int found;size_t bucket=find_bucket(cache->record,node,page_index,&found);
-        if (found) {
-            *created=0;*output=cache->record->buckets[bucket];*bytes=NULL;
-            kernel_lock_scope_release(&publish);
-            (void)abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_OK);
-            return KERNEL_PAGE_CACHE_STATUS_OK;
-        }
-        if (cache->record->occupied+cache->record->tombstones+1>
-            cache->record->capacity-cache->record->capacity/4) {
-            kernel_lock_scope_release(&publish);
-            if (!reserve_buckets(cache,1)) return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_NO_MEMORY);
-            continue;
-        }
-        publish_entry(cache,entry,bucket);*output=entry;*bytes=page;*created=1;
-        return KERNEL_PAGE_CACHE_STATUS_OK;
-    }
-}
-
 /* 完成加载并归还生产者借用；需求读直接取得物理引用，预读只发布缓存内容。 */
 static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs_node *node,
     struct kernel_page_cache_entry **entries, struct file_read_span *spans, size_t count,
@@ -1694,87 +1608,32 @@ static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel
 { (void)cache; (void)node; }
 #endif
 
-static enum kernel_page_cache_status get_page(
-    struct kernel_page_cache *cache,
-    const struct kernel_vfs_file *file,
-    uint64_t page_index,
-    uint64_t *physical_address,
-    size_t *valid_bytes,
-    int for_write)
-{
-    struct kernel_page_cache_entry *entry = 0;
-    struct kernel_vfs_node *node;
-    void *page = 0;
-    uint64_t offset;
-    size_t bytes_read = 0U;
-    enum kernel_page_cache_status lookup_status;
-
-    lookup_status = kernel_page_cache_lookup(cache,
-                                             file,
-                                             page_index,
-                                             physical_address,
-                                             valid_bytes);
-    if (lookup_status == KERNEL_PAGE_CACHE_STATUS_OK) {
-        return lookup_status;
-    }
-    if (lookup_status != KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
-        !cache_live(cache)) {
-        return lookup_status;
-    }
-    node = kernel_vfs_file_node(file);
-    if (node == 0 || page_index > UINT64_MAX >> BOAROS_PAGE_SHIFT) {
-        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    }
-    offset = page_index << BOAROS_PAGE_SHIFT;
-    if (!for_write && offset >= kernel_vfs_node_size(node)) {
-        return KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
-    }
-    { CACHE_SCOPE(miss, cache); cache->record->statistics.misses++; }
-    int created = 0;
-    lookup_status = prepare_page(cache, node, page_index, for_write, &entry, &page, &created);
-    if (lookup_status != KERNEL_PAGE_CACHE_STATUS_OK) return lookup_status;
-    if (!created) return kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
-    int read_error = 0;
-    read_error = kernel_vfs_node_pread(node, offset, page, BOAROS_PAGE_SIZE, &bytes_read);
-    size_t valid = entry_valid_bytes(entry);
-    if (bytes_read > BOAROS_PAGE_SIZE) __builtin_trap();
-    if (!read_error && bytes_read < valid) read_error = -KERNEL_EIO;
-    if (!read_error && valid<BOAROS_PAGE_SIZE) memset((unsigned char *)page+valid,0,BOAROS_PAGE_SIZE-valid);
-    enum kernel_page_cache_status result = read_error == -KERNEL_ENOMEM ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY :
-        read_error ? KERNEL_PAGE_CACHE_STATUS_IO : KERNEL_PAGE_CACHE_STATUS_OK;
-    uint64_t physical = entry->physical_address;
-    if (!result && physical_page_acquire(cache->allocator, physical)) __builtin_trap();
-    int clean = 0;
-    {
-        CACHE_SCOPE(complete, cache);
-        entry->load_error = result; entry->loading = 0;
-        entry_return(entry);
-        cache_wake(&entry->ready);
-        if (result && !entry->users) { remove_entry(cache, entry); clean = 1; }
-    }
-    if (clean) { uint64_t released = 0; (void)drain_entries(cache, &released); }
-    if (result) return result;
-    *physical_address = physical; *valid_bytes = valid;
-    return KERNEL_PAGE_CACHE_STATUS_OK;
-}
-
 int kernel_page_cache_is_executor(const struct kernel_page_cache *cache)
 {
     if (!cache_live(cache)) return 0;
     struct kernel_io_context *executor=__atomic_load_n(&cache->record->executor_io,__ATOMIC_ACQUIRE);
     return executor && executor==kernel_io_context_current();
 }
+int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *cache)
+{
+    return cache_live(cache) && !kernel_page_cache_is_executor(cache) && remote_cache_client();
+}
+
 static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache,
     void (*execute)(void *),void *argument,unsigned observed)
 {
     struct cache_request request = {.execute=execute,.argument=argument,.observed=observed,
         .queued_at=observed?kernel_time_monotonic_ns():0};
+    struct kernel_task *task = kernel_task_current();
+    if (kernel_task_has_user_context(task)) request.account_task = task;
+    else request.account_task = kernel_io_context_current()->account_task;
     kernel_wait_queue_init(&request.changed);
     struct kernel_page_cache_record *r = cache->record;
     {
         CACHE_SCOPE(publish, cache);
         if (!r->started || r->stopping) return KERNEL_PAGE_CACHE_STATUS_STATE;
-        if (r->read_requests == UINT32_MAX) __builtin_trap();
+        if (r->read_requests == UINT32_MAX || r->request_borrows == UINT32_MAX) __builtin_trap();
+        r->request_borrows++;
         if (!r->reads_head) r->reads_tail = &r->reads_head;
         *r->reads_tail = &request; r->reads_tail = &request.next; r->read_requests++;
         r->requests_queued++;
@@ -1793,6 +1652,9 @@ static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache
     }
     if (kernel_wait_queue_close(&request.changed) ||
         kernel_wait_queue_destroy(&request.changed)) __builtin_trap();
+    { CACHE_SCOPE(guard, cache);
+      if (!r->request_borrows) __builtin_trap();
+      r->request_borrows--; }
     return request.status;
 }
 enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(struct kernel_page_cache *cache,
@@ -1816,39 +1678,92 @@ enum kernel_page_cache_status kernel_page_cache_run_cpu0(struct kernel_page_cach
 {
     return kernel_page_cache_run_cpu0_borrowing(cache,execute,argument,NULL);
 }
-static void read_on_cpu0(void *argument)
-{
-    struct cache_read_request *request=argument;
-    request->status=kernel_page_cache_get(request->cache,request->file,request->index,
-        &request->address,&request->valid);
-}
-static enum kernel_page_cache_status remote_read(struct kernel_page_cache *cache,
-    const struct kernel_vfs_file *file, uint64_t index, uint64_t *address, size_t *valid)
-{
-    struct cache_read_request request={.cache=cache,.file=file,.index=index};
-    enum kernel_page_cache_status status=run_request(cache,read_on_cpu0,&request,0);
-    if (status) return status;
-    if (!request.status) { *address=request.address; *valid=request.valid; }
-    return request.status;
-}
-
 enum kernel_page_cache_status kernel_page_cache_get(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes)
 {
-    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    if (!node || !cache_live(cache)) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    if (remote_cache_client()) {
-        enum kernel_page_cache_status found = kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
-        if (found != KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) return found;
-        return remote_read(cache, file, page_index, physical_address, valid_bytes);
-    }
-    KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 0);
-    return get_page(cache, file, page_index, physical_address, valid_bytes, 0);
+    if (!physical_address || !valid_bytes) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    struct kernel_page_cache_read_page page;
+    enum kernel_page_cache_status status=kernel_page_cache_get_batch(cache,file,page_index,&page,1);
+    if (!status) { *physical_address=page.physical_address; *valid_bytes=page.valid_bytes; }
+    return status;
 }
 
-/* 不内联装入器，避免热命中也预留整批装入工作区。 */
+
+
+/* 候选尚未发布；先取得inode读资格，再重查并发布本次装入。
+ * 等待队列中较早的截断不会被一个尚未执行的loading条目挡住。 */
+static void commit_read_batch(void *argument)
+{
+    struct read_batch_load *request=argument;
+    struct kernel_page_cache *cache=request->cache;
+    const struct kernel_vfs_file *file=request->file;
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    uint64_t first=request->first;
+    struct kernel_page_cache_read_page *pages=request->pages;
+    size_t count=request->count,candidates=request->candidates;
+    struct kernel_page_cache_entry **entries=request->entries,**loads=request->loads;
+    struct kernel_page_cache_read_page **outputs=request->outputs;
+    struct file_read_span *spans=request->spans;
+    enum kernel_page_cache_status allocation=request->allocation;
+    KERNEL_LOCK_SCOPE(inode);
+    for (;;) {
+        kernel_vfs_node_lock(node,&inode,0);
+        if (read_cache_open(node)) break;
+        if (inode.lock) kernel_lock_release(&inode);
+        kernel_file_mapping_wait(node);
+    }
+    struct kernel_page_cache_entry *discard=NULL;
+    size_t ready=0;
+    for (;;) {
+        CACHE_SCOPE(publish,cache);
+        struct kernel_page_cache_record *r=cache->record;
+        size_t room=r->capacity-r->capacity/4-r->occupied-r->tombstones;
+        if (candidates>room) {
+            kernel_lock_scope_release(&publish);
+            if (reserve_buckets(cache,candidates)) continue;
+            allocation=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+            for (size_t i=0;i<count;i++) if (loads[i]) {
+                loads[i]->cleanup_next=discard;discard=loads[i];loads[i]=NULL;
+            }
+            candidates=0;
+            continue;
+        }
+        for (size_t i=0;i<count;i++) {
+            if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
+            struct kernel_page_cache_entry *candidate=loads[i];
+            if (((first+i)<<BOAROS_PAGE_SHIFT)>=kernel_vfs_node_size(node)) {
+                if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
+                pages[i].status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
+                continue;
+            }
+            int found;size_t bucket=find_bucket(r,node,first+i,&found);
+            if (found) {
+                struct kernel_page_cache_entry *entry=r->buckets[bucket];
+                if (read_entry_ready(entry)) {
+                    take_read_page(cache,entry,&pages[i].physical_address,&pages[i].valid_bytes,entry_valid_bytes(entry));
+                    pages[i].status=KERNEL_PAGE_CACHE_STATUS_OK;
+                } else { entry_borrow(entry);entries[i]=entry; }
+                if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
+            } else if (candidate) {
+                publish_entry(cache,candidate,bucket);
+                loads[ready]=candidate;spans[ready]=spans[i];outputs[ready]=&pages[i];ready++;
+            } else {
+                if (!allocation) __builtin_trap();
+                pages[i].status=allocation;
+            }
+        }
+        break;
+    }
+    while (discard) {
+        struct kernel_page_cache_entry *entry=discard;discard=entry->cleanup_next;entry->cleanup_next=NULL;
+        (void)abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_OK);
+    }
+    /* 自有加载全部完成后才等待其他producer，反向重叠批次不互等。 */
+    (void)load_read_pages(cache,node,loads,spans,ready,outputs,request->backend);
+}
+
+/* 只有缺失批次进入此处；页、描述及容量由调用CPU准备，热命中不租工作区。 */
 static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache *cache,const struct kernel_vfs_file *file,
     uint64_t first,struct kernel_page_cache_read_page *pages,size_t count,
     struct kernel_page_cache_entry **entries,int need_capacity,struct read_workspace *workspace)
@@ -1876,49 +1791,25 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
         spans[i]=(struct file_read_span){(first+i)<<BOAROS_PAGE_SHIFT,data,BOAROS_PAGE_SIZE,0,0};
         candidates++;
     }
-    struct kernel_page_cache_entry *discard=NULL;
-    size_t ready=0;
-    for (;;) {
-        CACHE_SCOPE(publish,cache);
-        struct kernel_page_cache_record *r=cache->record;
-        size_t room=r->capacity-r->capacity/4-r->occupied-r->tombstones;
-        if (candidates>room) {
-            kernel_lock_scope_release(&publish);
-            if (reserve_buckets(cache,candidates)) continue;
-            allocation=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-            for (size_t i=0;i<count;i++) if (loads[i]) {
-                loads[i]->cleanup_next=discard;discard=loads[i];loads[i]=NULL;
+    if (candidates) {
+        struct read_batch_load request={cache,file,first,pages,count,candidates,entries,loads,outputs,spans,
+            workspace?&workspace->backend:NULL,allocation};
+        enum kernel_page_cache_status submitted=KERNEL_PAGE_CACHE_STATUS_OK;
+        if (remote_cache_client()) submitted=run_request(cache,commit_read_batch,&request,0);
+        else commit_read_batch(&request);
+        if (submitted) {
+            for (size_t i=0;i<count;i++) {
+                if (loads[i]) (void)abandon_entry(cache,loads[i],submitted);
+                if (pages[i].status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) pages[i].status=submitted;
             }
-            candidates=0;
-            continue;
+            CACHE_SCOPE(guard,cache);
+            for (size_t i=0;i<count;i++) if (entries[i]) { entry_return(entries[i]); entries[i]=NULL; }
         }
-        for (size_t i=0;i<count;i++) {
-            if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
-            struct kernel_page_cache_entry *candidate=loads[i];
-            int found;size_t bucket=find_bucket(r,node,first+i,&found);
-            if (found) {
-                struct kernel_page_cache_entry *entry=r->buckets[bucket];
-                if (!entry->loading && !entry->load_error) {
-                    take_read_page(cache,entry,&pages[i].physical_address,&pages[i].valid_bytes,entry_valid_bytes(entry));
-                    pages[i].status=KERNEL_PAGE_CACHE_STATUS_OK;
-                } else { entry_borrow(entry);entries[i]=entry; }
-                if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
-            } else if (candidate) {
-                publish_entry(cache,candidate,bucket);
-                loads[ready]=candidate;spans[ready]=spans[i];outputs[ready]=&pages[i];ready++;
-            } else {
-                if (!allocation) __builtin_trap();
-                pages[i].status=allocation;
-            }
-        }
-        break;
+    } else {
+        for (size_t i=0;i<count;i++)
+            if (pages[i].status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND && !entries[i]) pages[i].status=allocation;
     }
-    while (discard) {
-        struct kernel_page_cache_entry *entry=discard;discard=entry->cleanup_next;entry->cleanup_next=NULL;
-        (void)abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_OK);
-    }
-    /* 自有加载全部完成后才等待其他producer，反向重叠批次不互等。 */
-    (void)load_read_pages(cache,node,loads,spans,ready,outputs,workspace?&workspace->backend:NULL);
+    /* 自有加载已完成，等待其他producer只占用调用者，不堵塞CPU0执行者。 */
     for (size_t i=0;i<count;i++) if (entries[i])
         pages[i].status=finish_read_page(cache,entries[i],&pages[i].physical_address,&pages[i].valid_bytes);
 }
@@ -1931,11 +1822,11 @@ struct cache_read_batch_request {
     size_t count;
 };
 
-static int read_cached_batch(struct cache_read_batch_request *request,int remote)
+static int read_cached_batch(struct cache_read_batch_request *request)
 {
     struct kernel_page_cache *cache=request->cache;
     struct kernel_vfs_node *node=kernel_vfs_file_node(request->file);
-    int pending=0,retry=0;
+    int pending=0,retry=0,remote=-1;
     {
         CACHE_SCOPE(guard,cache);
         retry=!read_cache_open(node);
@@ -1948,6 +1839,7 @@ static int read_cached_batch(struct cache_read_batch_request *request,int remote
             enum kernel_page_cache_status status=lookup_entry(cache,request->file,request->first+i,&entry);
             if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) {
                 pending=1;
+                if (remote<0) remote=remote_cache_client();
                 if (!remote) break;
                 continue;
             }
@@ -1955,6 +1847,7 @@ static int read_cached_batch(struct cache_read_batch_request *request,int remote
             if (!read_entry_ready(entry)) {
                 if ((__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) { retry=1; break; }
                 pending=1;
+                if (remote<0) remote=remote_cache_client();
                 if (!remote) break;
                 continue;
             }
@@ -1974,13 +1867,11 @@ static int read_cached_batch(struct cache_read_batch_request *request,int remote
     }
     return pending || retry;
 }
-static void __attribute__((noinline)) read_batch_on_cpu0(void *argument)
+static void __attribute__((noinline)) prepare_read_batch(void *argument)
 {
     struct cache_read_batch_request *request = argument;
     struct kernel_page_cache *cache = request->cache;
     struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
-    KERNEL_LOCK_SCOPE(inode);
-    kernel_vfs_node_lock(node, &inode, 0);
     union foreground_workspace *lease=request->count>1?foreground_workspace_take(cache):NULL;
     if (request->count>1 && !lease) {
         for (size_t i=0;i<request->count;i++)
@@ -1992,11 +1883,16 @@ static void __attribute__((noinline)) read_batch_on_cpu0(void *argument)
      * 热命中在调用本函数前返回，不为慢路数组预留栈空间。 */
     struct kernel_page_cache_entry *single_entry;
     struct kernel_page_cache_entry **entries=lease?lease->read.entries:&single_entry;
-    uint64_t size = kernel_vfs_node_size(node);
     size_t missing=0;
     int pending = 0,need_capacity=0;
-    {
+    for (;;) {
         CACHE_SCOPE(lookup, cache);
+        if (!read_cache_open(node)) {
+            kernel_lock_release(&lookup);
+            kernel_file_mapping_wait(node);
+            continue;
+        }
+        uint64_t size=kernel_vfs_node_size(node);
         for (size_t i = 0; i < request->count; i++) {
             struct kernel_page_cache_read_page *page = &request->pages[i];
             entries[i] = NULL;
@@ -2009,7 +1905,7 @@ static void __attribute__((noinline)) read_batch_on_cpu0(void *argument)
             struct kernel_page_cache_entry *entry;
             enum kernel_page_cache_status status = lookup_entry(cache, request->file, request->first + i, &entry);
             if (!status) {
-                if (!entry->loading && !entry->load_error) {
+                if (read_entry_ready(entry)) {
                     size_t valid = size - offset < BOAROS_PAGE_SIZE ? size - offset : BOAROS_PAGE_SIZE;
                     take_read_page(cache, entry, &page->physical_address, &page->valid_bytes, valid);
                     page->status = KERNEL_PAGE_CACHE_STATUS_OK;
@@ -2025,6 +1921,7 @@ static void __attribute__((noinline)) read_batch_on_cpu0(void *argument)
         }
         struct kernel_page_cache_record *r=cache->record;
         need_capacity=missing>r->capacity-r->capacity/4-r->occupied-r->tombstones;
+        break;
     }
     if (pending) read_batch_local(cache,request->file,request->first,request->pages,request->count,entries,need_capacity,
         lease?&lease->read:NULL);
@@ -2042,16 +1939,9 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     for (size_t i = 0; i < count; i++) pages[i].status = KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
     if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
     struct cache_read_batch_request request = {cache, file, first, pages, count};
-    int remote=remote_cache_client();
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
-    if (read_cached_batch(&request,remote)) {
-        if (remote) {
-            enum kernel_page_cache_status status = run_request(cache, read_batch_on_cpu0, &request, 0);
-            if (status) for (size_t i = 0; i < count; i++)
-                if (pages[i].status == KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) pages[i].status = status;
-        } else read_batch_on_cpu0(&request);
-    }
+    if (read_cached_batch(&request)) prepare_read_batch(&request);
     enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_OK;
     for (size_t i = 0; i < count; i++) if (pages[i].status) {
         pages[i].physical_address = 0;
@@ -2062,6 +1952,47 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
 }
 
 static void resize_apply(struct kernel_page_cache_resize *,uint64_t);
+/* 已发布entry的借用覆盖其数据页，不再另加物理引用；完整冷覆盖只准备私有候选，
+ * 用户来源缺页结束后才发布，避免把未初始化数据交给读取者或等待自身加载。 */
+static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cache *cache,
+    struct kernel_vfs_file *file, uint64_t index, int whole,
+    struct kernel_page_cache_entry **entry, struct kernel_page_cache_entry **candidate,
+    uint64_t *address)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    int missing,need_capacity;
+    {
+        CACHE_SCOPE(guard,cache);
+        enum kernel_page_cache_status status=lookup_entry(cache,file,index,entry);
+        missing=status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+        struct kernel_page_cache_record *record=cache->record;
+        need_capacity=record->occupied+record->tombstones>=record->capacity-record->capacity/4;
+        if (!status && !(*entry)->loading && !(*entry)->load_error) {
+            entry_borrow(*entry);
+            *address=(*entry)->physical_address;
+            return KERNEL_PAGE_CACHE_STATUS_OK;
+        }
+        *entry=NULL;
+        if (status && !missing) return status;
+    }
+    if (missing && (whole || (index<<BOAROS_PAGE_SHIFT)>=kernel_vfs_node_size(node))) {
+        if (need_capacity && !reserve_buckets(cache,1)) return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+        void *bytes;
+        return allocate_entry(cache,node,index,!whole,candidate,&bytes);
+    }
+    size_t valid;
+    enum kernel_page_cache_status status=kernel_page_cache_get(cache,file,index,address,&valid);
+    if (status) return status;
+    {
+        CACHE_SCOPE(guard,cache);
+        status=lookup_entry(cache,file,index,entry);
+        if (!status && (*entry)->physical_address==*address) entry_borrow(*entry);
+        else { *entry=NULL; status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND; }
+    }
+    if (physical_page_release(cache->allocator,*address)) __builtin_trap();
+    return status;
+}
+
 static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_file *file,
     uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written)
 {
@@ -2074,71 +2005,104 @@ static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs
         count=kernel_vfs_write_source_span(source,count);
         if (!count) { source->access=KERNEL_UACCESS_STATUS_STATE; return 0; }
         KERNEL_LOCK_SCOPE(io);
-        kernel_vfs_node_lock(node,&io,1);
-        uint64_t old_size=node->size;
+        /* 外层文件写操作门固定逻辑尺寸，取得写入来源前不重复占用inode。 */
+        uint64_t old_size=kernel_vfs_node_size(node);
         struct kernel_page_cache_resize resize={0};
-        if (offset+count>old_size) {
-            kernel_lock_release(&io);
-            int error=kernel_page_cache_resize_prepare(cache,node,old_size,offset+count,&resize);
-            if (error) return error;
-            kernel_vfs_node_lock(node,&io,1);
-        }
-        uint64_t address; size_t valid;
-        enum kernel_page_cache_status status=get_page(cache,file,offset>>BOAROS_PAGE_SHIFT,
-            &address,&valid,1);
+        uint64_t address=0;
+        struct kernel_page_cache_entry *entry=NULL,*candidate=NULL;
+        enum kernel_page_cache_status status=prepare_write_entry(cache,file,offset>>BOAROS_PAGE_SHIFT,
+            !start && count==BOAROS_PAGE_SIZE,&entry,&candidate,&address);
         if (status) {
-            if (io.lock) kernel_lock_release(&io);
             kernel_page_cache_resize_finish(&resize,old_size);
+            if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) continue;
             return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
         }
-        struct kernel_page_cache_entry *entry;
         struct kernel_page_cache_write_borrow writer={0};
         struct kernel_mm_user_pin pin={0};
-        int admitted;
-        {
-            CACHE_SCOPE(guard,cache);
-            if (lookup_entry(cache,file,offset>>BOAROS_PAGE_SHIFT,&entry)) __builtin_trap();
-            entry_borrow(entry);
-        }
-        /* source fault可重入同一文件：先结束inode资格，且不持目标写借用。 */
-        kernel_lock_release(&io);
         if (!kernel_vfs_write_source_pin(source,&pin)) {
+            if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
             kernel_page_cache_resize_finish(&resize,old_size);
-            { CACHE_SCOPE(guard,cache); entry_return(entry); }
-            physical_page_release(cache->allocator,address);
+            if (entry) {
+                { CACHE_SCOPE(guard,cache); entry_return(entry); }
+            }
             return 0;
         }
+        if (offset+count>old_size) {
+            int error=kernel_page_cache_resize_prepare(cache,node,old_size,offset+count,&resize);
+            if (error==-KERNEL_EBUSY && source->mm) {
+                /* 有MM编辑正在排空本次读pin：先归还，再等待别名撤权。
+                 * 之后只重取现有pin；若映射已变，开放目标后再做真正缺页。 */
+                kernel_mm_unpin_user_page(&pin);
+                error=kernel_page_cache_resize_prepare(cache,node,old_size,offset+count,&resize);
+                if (!error) {
+                    uint64_t user=source->user.iov[source->user.index].base+source->user.offset;
+                    enum kernel_mm_status pinned=kernel_mm_pin_user_page(source->mm,user,KERNEL_MM_READ,&pin);
+                    if (pinned==KERNEL_MM_STATUS_OK) kernel_vfs_write_source_use_pin(source,&pin);
+                    else if (pinned!=KERNEL_MM_STATUS_NOT_MAPPED && pinned!=KERNEL_MM_STATUS_ACCESS)
+                        __builtin_trap();
+                }
+            }
+            if (error || (source->mm && !pin.registration)) {
+                if (pin.registration) kernel_mm_unpin_user_page(&pin);
+                kernel_page_cache_resize_finish(&resize,old_size);
+                if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
+                if (entry) {
+                    { CACHE_SCOPE(guard,cache); entry_return(entry); }
+                }
+                if (error) return error;
+                continue;
+            }
+        }
         kernel_vfs_node_lock(node,&io,1);
+        int admitted=0,loading=0;
         {
             CACHE_SCOPE(guard,cache);
-            admitted=resize.entry==entry || writer_begin(entry,&writer);
+            if (candidate) {
+                int found; size_t bucket=find_bucket(cache->record,node,offset>>BOAROS_PAGE_SHIFT,&found);
+                if (found) {
+                    struct kernel_page_cache_entry *current=cache->record->buckets[bucket];
+                    if (!current->loading && !current->load_error) entry=current;
+                } else if (cache->record->occupied+cache->record->tombstones+1 <=
+                    cache->record->capacity-cache->record->capacity/4) {
+                    entry=candidate; candidate=NULL;
+                    publish_entry(cache,entry,bucket); loading=1;
+                }
+                if (entry) {
+                    entry_borrow(entry); address=entry->physical_address;
+                }
+            }
+            if (entry) admitted=resize.entry==entry || writer_begin(entry,&writer);
         }
+        if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
         if (!admitted) {
+            if (loading) __builtin_trap(); /* 新候选尚无其他写入者。 */
             kernel_lock_release(&io);
             if (pin.registration) kernel_mm_unpin_user_page(&pin);
             kernel_page_cache_resize_finish(&resize,old_size);
-            (void)kernel_page_cache_wait_writable(cache,file,offset>>BOAROS_PAGE_SHIFT,address);
-            { CACHE_SCOPE(guard,cache); entry_return(entry); }
-            physical_page_release(cache->allocator,address);
+            if (entry) {
+                (void)kernel_page_cache_wait_writable(cache,file,offset>>BOAROS_PAGE_SHIFT,address);
+                { CACHE_SCOPE(guard,cache); entry_return(entry); }
+            }
             continue;
         }
         void *page;
-        if (physical_page_resolve(cache->allocator,address,&page)) __builtin_trap();
+        if (physical_page_map_owned(cache->allocator,address,&page)) __builtin_trap();
         kernel_vfs_write_source_copy(source,(unsigned char *)page+start,count);
-        /* 复制后只清洞；同页MAP_SHARED来源可位于旧EOF尾部，不能先清源字节。 */
         resize_apply(&resize,offset>old_size?offset:old_size);
-        { CACHE_SCOPE(guard,cache); dirty_mark(entry,start,start+count); }
+        {
+            CACHE_SCOPE(guard,cache);
+            dirty_mark(entry,start,start+count);
+            if (loading) { entry->loading=0; entry_return(entry); cache_wake(&entry->ready); }
+            if (writer.registration) writer_end_locked(&writer);
+            entry_return(entry);
+        }
         kernel_vfs_node_written(node,offset+count);
         file->size=node->size;
         kernel_lock_release(&io);
         if (pin.registration) kernel_mm_unpin_user_page(&pin);
-        if (writer.registration) kernel_page_cache_write_end(&writer);
         kernel_page_cache_resize_finish(&resize,old_size);
-        { CACHE_SCOPE(guard,cache); entry_return(entry); }
-        physical_page_release(cache->allocator,address);
         kernel_vfs_write_source_advance(source,count);
         offset+=count; *written+=count;
-        pressure_notify(cache);
     }
     return 0;
 }
@@ -2150,7 +2114,10 @@ int kernel_page_cache_write_source(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     /* 来源缺页可以重入同一inode，调用者不得跨此入口持有数据锁。 */
     if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
-    return write_cached_source(cache,file,offset,source,size,written);
+    int result=write_cached_source(cache,file,offset,source,size,written);
+    /* 按实际接纳的范围发布一次脏工作，部分成功后出错也必须通知。 */
+    if (*written) pressure_notify(cache);
+    return result;
 }
 
 static int complete_writeback(struct kernel_page_cache *cache,
@@ -2160,13 +2127,13 @@ static int complete_writeback(struct kernel_page_cache *cache,
     COST_ADD(WRITEBACK_ACCEPTED,written);
     if (written > end-begin) __builtin_trap();
     if (!result && written != end-begin) result=-KERNEL_EIO;
-    CACHE_SCOPE(guard,cache);
     if (!result && !entry->retired && generation == entry->generation) {
         if (end == entry->dirty_end) dirty_clear(entry);
         else entry->dirty_begin=end;
     }
     if (!entry->writeback || !cache->record->writeback_active) __builtin_trap();
     entry->writeback_error=result; entry->writeback=0; cache->record->writeback_active--;
+    entry_return(entry);
     cache_wake(&entry->ready);
     /* A force round can skip this foreground-owned entry and go to sleep.
      * Successful completion must republish work if a newer dirty generation
@@ -2247,7 +2214,8 @@ Retry:
             version_wait(cache)) goto Retry;
         return -KERNEL_ENOMEM;
     }
-    int result=0;
+    int result=0,writing=0;
+    struct kernel_page_cache_alias *aliases=NULL;
     {
         CACHE_SCOPE(guard,cache);
         if (kernel_io_context_current()->background_reclaim) {
@@ -2260,10 +2228,12 @@ Retry:
             uint64_t previous=__atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED,__ATOMIC_ACQ_REL);
             if (previous&CACHE_WRITES_CLOSED || previous&~CACHE_WRITES_MASK) __builtin_trap();
             prepared->closed=1;
+            writing=(uint32_t)previous!=0;
         }
+        if (!result) { aliases=entry->aliases; alias_borrow(aliases); }
     }
-    if (!result) result=rearm_aliases(entry);
-    while (!result) {
+    if (!result) result=rearm_aliases(entry,aliases);
+    while (!result && writing) {
         struct kernel_wait_token token={0};
         {
             CACHE_SCOPE(guard,cache);
@@ -2290,7 +2260,7 @@ static int capture_writeback(struct kernel_page_cache *cache,
 {
     int captured=0;
         void *page;
-    if (physical_page_resolve(cache->allocator,entry->physical_address,&page)) __builtin_trap();
+    if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
     {
         CACHE_SCOPE(guard,cache);
         prepared->begin=entry->dirty_begin; prepared->end=entry->dirty_end;
@@ -2378,16 +2348,20 @@ static int writeback_run(struct kernel_page_cache *cache,
         int submitted=ready ? kernel_vfs_node_writeback(entries[first]->node,spans,ready) : 0;
         for (size_t i=0;i<ready;i++) if (!submitted && spans[i].written!=spans[i].size) submitted=-KERNEL_EIO;
         if (submitted) result=submitted;
-        for (size_t i=done;i>0;i--) {
-            struct prepared_writeback *p=&prepared[i-1];
-            if (!p->version) continue;
-            struct file_write_span *span=p->span_index?&spans[p->span_index-1]:NULL;
-            int r=complete_writeback(cache,entries[first+i-1],p->begin,p->end,p->generation,
-                span ? submitted : 0,span ? span->written : 0);
-            if (r && !result) result=r;
-            version_release(p->version);
-            { CACHE_SCOPE(guard,cache); entry_return(entries[first+i-1]); }
+        {
+            CACHE_SCOPE(guard,cache);
+            for (size_t i=done;i>0;i--) {
+                struct prepared_writeback *p=&prepared[i-1];
+                if (!p->version) continue;
+                struct file_write_span *span=p->span_index?&spans[p->span_index-1]:NULL;
+                int r=complete_writeback(cache,entries[first+i-1],p->begin,p->end,p->generation,
+                    span ? submitted : 0,span ? span->written : 0);
+                if (r && !result) result=r;
+            }
         }
+        /* 完成状态和entry借用按批发布；稳定版本的实际归还仍在保护外。 */
+        for (size_t i=done;i>0;i--)
+            if (prepared[i-1].version) version_release(prepared[i-1].version);
         /* Publish a prepared prefix before waiting for another stable owner.
          * This ends its entry qualifications, allowing a foreground writer
          * that borrowed the last version to finish and return that version. */
@@ -2466,7 +2440,6 @@ int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kern
     uint64_t old_size,uint64_t target,struct kernel_page_cache_resize *token)
 {
     if (!token || token->entry || !cache_live(cache)) return -KERNEL_EINVAL;
-    kernel_assert_service_context();
     uint64_t boundary=old_size<target?old_size:target;
     if (old_size==target || !(boundary&BOAROS_PAGE_MASK)) return 0;
     if (kernel_lock_held(&node->io_lock,0) || kernel_cpu_current()->raw_locks) __builtin_trap();
@@ -2479,19 +2452,21 @@ int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kern
     }
     for (struct kernel_page_cache_write_borrow *b=kernel_io_context_current()->cache_writes;b;b=b->next)
         if (b->entry==entry) { CACHE_SCOPE(guard,cache); entry_return(entry); return -KERNEL_EBUSY; }
+    struct kernel_page_cache_alias *aliases=NULL;
     for (;;) {
         struct kernel_wait_token wait={0};
         {
             CACHE_SCOPE(guard,cache);
             if (!entry->writeback && !entry->loading && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
-                __atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED,__ATOMIC_ACQ_REL); break;
+                __atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED,__ATOMIC_ACQ_REL);
+                aliases=entry->aliases;alias_borrow(aliases);break;
             }
             if (kernel_wait_prepare(&entry->ready,0,0,&wait)) __builtin_trap();
         }
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&wait,&reason) || kernel_wait_finish(&wait)) __builtin_trap();
     }
-    int result=rearm_aliases(entry);
+    int result=rearm_aliases(entry,aliases);
     if (result) {
         CACHE_SCOPE(guard,cache);
         __atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
@@ -2518,7 +2493,7 @@ static void resize_apply(struct kernel_page_cache_resize *token,uint64_t actual)
     uint64_t boundary=token->old_size<actual?token->old_size:actual;
     if (actual!=token->old_size && entry->page_index==(boundary>>BOAROS_PAGE_SHIFT)) {
         void *page;
-        if (physical_page_resolve(cache->allocator,entry->physical_address,&page)) __builtin_trap();
+        if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
         size_t begin=boundary&BOAROS_PAGE_MASK;
         size_t end=actual<token->old_size?BOAROS_PAGE_SIZE:
             actual-boundary<BOAROS_PAGE_SIZE-begin?begin+(size_t)(actual-boundary):BOAROS_PAGE_SIZE;
@@ -2769,7 +2744,11 @@ static void page_cache_worker(void *argument)
         uint64_t started=request->observed?kernel_time_monotonic_ns():0;
         if (!stopping) {
             kernel_assert_service_context();
+            struct kernel_io_context *io = kernel_io_context_current();
+            if (io->account_task) __builtin_trap();
+            io->account_task = request->account_task;
             request->execute(request->argument);
+            io->account_task = NULL;
             result=KERNEL_PAGE_CACHE_STATUS_OK;
         }
         uint64_t finished=request->observed?kernel_time_monotonic_ns():0;
@@ -2980,6 +2959,7 @@ enum kernel_page_cache_status kernel_page_cache_destroy(struct kernel_page_cache
         if (flush_cache_mount(cache,NULL)) return KERNEL_PAGE_CACHE_STATUS_IO;
         {
             CACHE_SCOPE(guard,cache);
+            if (cache->record->request_borrows) return KERNEL_PAGE_CACHE_STATUS_STATE;
             for (struct kernel_page_cache_entry *entry=cache->record->lru_tail;entry;entry=entry->lru_previous) {
                 uint32_t references;
                 if (physical_page_reference_count(cache->allocator,entry->physical_address,&references)) __builtin_trap();

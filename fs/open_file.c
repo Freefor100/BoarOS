@@ -11,6 +11,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
+#include <kernel/task.h>
 #include <kernel/page_cache.h>
 #include <kernel/file_mapping.h>
 #include <kernel/memory_object.h>
@@ -585,8 +586,6 @@ enum kernel_open_file_kind kernel_open_file_kind(
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file)
 {
-    if (file && file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe &&
-        __atomic_load_n(&file->pipe->concurrent,__ATOMIC_ACQUIRE)) return 0;
     if (file == 0) {
         return 0;
     }
@@ -615,58 +614,41 @@ enum kernel_open_file_status kernel_open_file_acquire(
     }
 }
 
-#if BOAROS_USER_SMP
-int kernel_open_file_release_nonfinal(struct kernel_open_file_description **owner)
+int kernel_open_file_io_requires_cpu0(const struct kernel_open_file_description *file)
 {
-    struct kernel_open_file_description *file = *owner;
-    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
-    for (;;) {
-        if (!references || references == UINT32_MAX) __builtin_trap();
-        if (references == 1) return 0;
-        if (__atomic_compare_exchange_n(&file->references, &references, references - 1,
-            1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            *owner = NULL;
-            return 1;
-        }
-    }
+    struct kernel_page_cache *cache = file ? kernel_vfs_file_page_cache(&file->file) : NULL;
+    return cache && kernel_page_cache_needs_cpu0(cache);
 }
-#endif
 
-enum kernel_open_file_status kernel_open_file_release(
-    struct kernel_open_file_description **owner)
+struct close_call {
+    struct kernel_open_file_description **owner;
+    enum kernel_open_file_status status;
+};
+static void close_cpu0(void *argument)
 {
-    struct kernel_open_file_description *file;
-    enum kernel_pipe_status pipe_status;
+    struct close_call *call = argument;
+    call->status = kernel_open_file_release(call->owner);
+}
 
-    if (owner == 0 || *owner == 0) {
-        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
-    }
-    file = *owner;
-    /* A detached last reference is kept at zero until cleanup drains it. */
-    if (file->heap == 0) {
-        return KERNEL_OPEN_FILE_STATUS_STATE;
-    }
-    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
-    for (;;) {
-        if (references == UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
-        if (!references) break; /* 原清理owner重试，未取得新引用。 */
-        if (__atomic_compare_exchange_n(&file->references, &references, references - 1,
-                1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
-    }
-    if (references > 1U) {
-        *owner = 0;
-        return KERNEL_OPEN_FILE_STATUS_OK;
-    }
-    /* 匿名pipe没有后端、命名空间或观察者清理；最后endpoint可在受控CPU归还。
-     * 其余对象的真实清理继续由CPU0服务域执行。 */
-    if (!(file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe &&
-          !file->file.private_data && !file->pipe->fifo_node &&
-          !file->ep_items && !file->device_opened && !file->record_locks &&
-          !file->generated_ready)) kernel_assert_service_context();
-    if (references == 1U) {
-        reset_read_prediction(file);
-        release_record_locks(file);
-    }
+static int close_is_local(const struct kernel_open_file_description *file)
+{
+    if (file->vfs_closed) return 1;
+    /* 普通用户pipe的另一端可以登记epoll，最后关闭须在CPU0通知。
+     * 受控内核pipe消费者在创建时已排除协议观察者，端点结束必须
+     * 就地唤醒其普通等待者，不能把EOF推迟到等待双方退出后的清理。 */
+    return !kernel_task_has_user_context(kernel_task_current()) &&
+        file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe && !file->pipe->fifo_node &&
+        !file->file.private_data && !file->ep_items && !file->device_opened &&
+        !file->record_locks && !file->generated_ready;
+}
+static enum kernel_open_file_status finish_close(struct kernel_open_file_description **owner,
+    int first, int local)
+{
+    struct kernel_open_file_description *file=*owner;
+    enum kernel_pipe_status pipe_status;
+    KERNEL_SERVICE_SCOPE_IF(service, !local);
+    if (!local) kernel_assert_service_context();
+    if (first) { reset_read_prediction(file); release_record_locks(file); }
     if (file->device_opened) {
         file->device_opened = 0;
         if (file->device->release) file->device->release(file->device_instance);
@@ -724,42 +706,50 @@ enum kernel_open_file_status kernel_open_file_release(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
-enum kernel_open_file_status kernel_open_file_detach(
+enum kernel_open_file_status kernel_open_file_release(
     struct kernel_open_file_description **owner)
 {
-    struct kernel_open_file_description *file;
-
-    if (owner == 0 || *owner == 0) {
-        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
-    }
-    file = *owner;
-    if (!open_file_live(file)) {
-        return KERNEL_OPEN_FILE_STATUS_STATE;
-    }
-    uint32_t references = __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
+    if (!owner || !*owner) return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    struct kernel_open_file_description *file=*owner;
+    if (!file->heap) return KERNEL_OPEN_FILE_STATUS_STATE;
+    uint32_t references=__atomic_load_n(&file->references,__ATOMIC_ACQUIRE);
+    int local=0;
     for (;;) {
-        if (!references || references == UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
-        /* A pipe endpoint's last live owner closes it immediately. */
-        if (references == 1 && (file->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
-                               file->kind == KERNEL_OPEN_FILE_KIND_SOCKET))
-            return kernel_open_file_release(owner);
-        if (__atomic_compare_exchange_n(&file->references, &references, references - 1,
-                1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
-    }
-    if (references == 1U) {
-        reset_read_prediction(file);
-        release_record_locks(file);
-        if (file->device_opened) {
-            file->device_opened = 0;
-            if (file->device->release) file->device->release(file->device_instance);
-            file->device_instance = 0;
+        if (references==UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
+        if (references<=1) {
+            local=close_is_local(file);
+            struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
+            if (!local && cache && kernel_page_cache_needs_cpu0(cache)) {
+                struct close_call call={owner,KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED};
+                return kernel_page_cache_run_cpu0(cache,close_cpu0,&call) ?
+                    KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED : call.status;
+            }
+#if BOAROS_MAX_CPUS > 1
+            if (!local) {
+                struct kernel_task *task=kernel_task_current();
+                const struct kernel_mm *bound=NULL;
+                int user=kernel_task_has_user_context(task);
+                if ((!user && (kernel_cpu_current()->logical_id || (task && !kernel_task_mm_borrow(task,&bound))))
+#if !BOAROS_USER_SMP
+                    || kernel_cpu_current()->logical_id
+#endif
+                    ) return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+#if BOAROS_USER_SMP
+                if (user && !kernel_scheduler_user_service_active()) {
+                    struct kernel_io_context *io=kernel_io_context_current();
+                    if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks)
+                        return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+                }
+#endif
+            }
+#endif
         }
+        if (!references) break;
+        if (__atomic_compare_exchange_n(&file->references,&references,references-1,
+            1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
     }
-    if (references > 1U) {
-        *owner = 0;
-        return KERNEL_OPEN_FILE_STATUS_OK;
-    }
-    return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+    if (references>1) { *owner=NULL; return KERNEL_OPEN_FILE_STATUS_OK; }
+    return finish_close(owner,references==1,local);
 }
 
 static int open_file_live(const struct kernel_open_file_description *file)
@@ -995,7 +985,7 @@ int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *f
     uint64_t address; size_t valid;
     enum kernel_page_cache_status status=kernel_page_cache_get(cache,&file->file,index,&address,&valid);
     if (status) return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
-        status==KERNEL_PAGE_CACHE_STATUS_STATE ? -KERNEL_EBUSY : -KERNEL_EIO;
+        -KERNEL_EIO;
     {
         KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
         uint64_t latest;
@@ -1146,6 +1136,9 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
     uint64_t start, uint64_t end)
 {
     if (!open_file_live(file)) return -KERNEL_EBADF;
+    struct kernel_io_context *current = kernel_io_context_current();
+    if (current->user_pins || current->cache_writes || kernel_cpu_current()->raw_locks)
+        return -KERNEL_EIO;
     if (kernel_open_file_io_requires_cpu0(file)) {
         struct kernel_io_context *io=kernel_io_context_current();
         if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||

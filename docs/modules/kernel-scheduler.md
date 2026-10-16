@@ -22,7 +22,7 @@
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
 | `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
 
-USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0服务；用户`sched_yield`经`kernel_scheduler_user_yield_current()`延后到用户资格恢复，通用`kernel_scheduler_yield_current()`仍实际执行内核调度，等待游标/回调借用归还不使用用户yield标志。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务；普通服务与已有worker按OTHER队列轮转，迁移排到目标核队尾。用户`sched_yield`在发起CPU调用共同的`kernel_scheduler_yield_current()`，等待游标和回调借用归还也使用真实内核调度。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
@@ -198,7 +198,7 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务同时进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
 
-WAIT 先登记等待 token，再复查用户字与 expected，通知可先于 park 到达。private key 使用不复用的 MM 身份号与四字节对齐地址；共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。MM 在同一映射操作保护内解析身份并取得对象引用；需要缺页时先结束保护，缺页完成后重新解析当前映射。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；WAIT 另需读取用户字，未驻留页沿原缺页权限检查。坏页在 WAKE 中也返回 EFAULT。哈希碰撞需二次匹配，REQUEUE 将目标 key 的引用交给迁移的等待者、保留 FIFO，返回唤醒数与迁移数之和。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，REQUEUE 保留原掩码。值不匹配为 EAGAIN，非法地址为 EFAULT，取共享键时缺页分配耗尽为 ENOMEM，零掩码等非法参数为 EINVAL，超时为 ETIMEDOUT。
+WAIT 先固定用户字所在页，再登记等待 token，通过同一 pin 复查 expected，归还 pin 后才 park。驻留页也可能遇到远端 MM 编辑关闭新 pin 许可，因此缺页和 pin 等待必须发生在 token 登记前。登记后的比较不再调用可能睡眠的 uaccess；通知可先于 park 到达。private key 使用不复用的 MM 身份号与四字节对齐地址；共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。MM 在同一映射操作保护内解析身份并取得对象引用；需要缺页时先结束保护，缺页完成后重新解析当前映射。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；WAIT 另需读取用户字，未驻留页沿原缺页权限检查。坏页在 WAKE 中也返回 EFAULT。哈希碰撞需二次匹配，REQUEUE 将目标 key 的引用交给迁移的等待者、保留 FIFO，返回唤醒数与迁移数之和。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，REQUEUE 保留原掩码。值不匹配为 EAGAIN，非法地址为 EFAULT，取共享键时缺页分配耗尽为 ENOMEM，零掩码等非法参数为 EINVAL，超时为 ETIMEDOUT。
 
 WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或带 `FUTEX_CLOCK_REALTIME` 的绝对 realtime。当前没有 `clock_settime`/`settimeofday` 写入口，启动后的 realtime offset 不变，故可一次转换为 monotonic deadline；将来加入可调时钟时必须重新审查阻塞中的实时截止时刻。无超时等待的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时等待使用 tagged restart state 保存用户地址、expected、operation、掩码和首次调用的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 

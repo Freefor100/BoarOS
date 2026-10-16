@@ -24,6 +24,10 @@ static void finish_mm_move(struct kernel_mm *mm)
 
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
 {
+#if BOAROS_USER_SMP
+    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
+        kernel_scheduler_enter_user_service();
+#endif
     struct kernel_task *thread;
     struct kernel_exec_transaction *transaction;
     struct kernel_mm_mapping entry_mapping;
@@ -104,10 +108,6 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
-#if BOAROS_USER_SMP
-    if (kernel_mm_enable_remote_user_execution(&transaction->image.mm) != KERNEL_MM_STATUS_OK)
-        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
-#endif
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     thread->fork_no_exec = 0U;

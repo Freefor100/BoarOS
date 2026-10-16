@@ -894,7 +894,7 @@ static void prepare_mm(void)
             KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address),"file-controlled-private-map");
 #endif
     require(kernel_mm_activate(0, kernel_context) == KERNEL_MM_STATUS_OK &&
-        kernel_mm_enable_concurrency(&parent) == KERNEL_MM_STATUS_OK, "mm-private-publication");
+        kernel_mm_check_task_domain(&parent) == KERNEL_MM_STATUS_OK, "mm-private-publication");
     capture_old_pages();
 #if BOAROS_MM_DISK_TEST
     arch_interrupt_restore(construction_irq);

@@ -11,6 +11,7 @@ struct kernel_lock_guard;
 struct kernel_lock_waiter;
 struct kernel_mm_user_pin;
 struct kernel_page_cache_write_borrow;
+struct kernel_task;
 /* 任务级可睡眠对象锁；独立rank30 raw保护内部资格，登记时嵌套rank40调度锁。
  * rank/key、不可递归和guard owner随任务保留。释放内部raw后park，先授资格再wake；
  * 尚未运行的获得者也计入占用。读者批次保留handoff owner及原边界，每段最多16项，
@@ -40,6 +41,8 @@ struct kernel_io_context {
     struct kernel_lock_guard *locks;
     struct kernel_mm_user_pin *user_pins;
     struct kernel_page_cache_write_borrow *cache_writes;
+    /* 同步执行请求借用被阻塞的原调用者，磁盘读记账随实际I/O归属。 */
+    struct kernel_task *account_task;
     unsigned allocation_depth;
     uint32_t reclaim_depth;
     unsigned backend_depth;

@@ -2,6 +2,7 @@
 
 #include <kernel/errno.h>
 #include <kernel/heap.h>
+#include <kernel/irq.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -135,13 +136,13 @@ static void owner_insert(struct kernel_record_lock **head,
     lock->owner_next = *head;
     lock->owner_previous = head;
     if (*head) (*head)->owner_previous = &lock->owner_next;
-    *head = lock;
+    __atomic_store_n(head,lock,__ATOMIC_RELEASE);
 }
 
 static void owner_remove(struct kernel_record_lock *lock)
 {
     if (!lock->owner_previous) __builtin_trap();
-    *lock->owner_previous = lock->owner_next;
+    __atomic_store_n(lock->owner_previous,lock->owner_next,__ATOMIC_RELEASE);
     if (lock->owner_next)
         lock->owner_next->owner_previous = lock->owner_previous;
     lock->owner_next = 0;
@@ -336,6 +337,8 @@ void kernel_record_lock_release(struct kernel_record_lock_state *state,
                                 struct kernel_record_lock **owner_head,
                                 struct kernel_heap *heap)
 {
+    /* CPU0 worker可以开中断执行；摘除树/owner并通知的短操作自行排除抢占。 */
+    KERNEL_IRQ_SCOPE(irq);
     struct kernel_record_lock *lock = *owner_head;
     int changed = 0;
     while (lock) {

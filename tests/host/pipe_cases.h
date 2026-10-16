@@ -52,7 +52,7 @@ static struct kernel_pipe *pipe_table(struct kernel_heap *heap)
     assert(!kernel_open_file_create_pipe(heap,pipe,2,0,&b));
     assert(!kernel_files_install_new_owned_at(&files,0,0,&a));
     assert(!kernel_files_install_new_owned_at(&files,1,0,&b));
-    assert(!kernel_files_enable_concurrency(&files,&domain_mm));
+    assert(!kernel_files_check_task_domain(&files,&domain_mm));
     return pipe;
 }
 struct pipe_actor { unsigned write,fd; uint64_t address,count; int64_t bytes; unsigned broken; };

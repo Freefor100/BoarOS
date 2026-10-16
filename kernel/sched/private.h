@@ -118,7 +118,7 @@ struct kernel_task {
     uint32_t user_service, user_service_pending;
     struct kernel_sched_node service_node, reservation_node;
     struct kernel_cpu *reservation_cpu;
-    uint32_t user_yielded;
+    uint32_t user_slice_expired;
     uint64_t service_entries, service_migrations;
     uint64_t service_started_ticks, service_running_ns;
 #endif
@@ -255,7 +255,7 @@ struct kernel_scheduler {
     struct kernel_wait_queue cleanup_queue;
     struct kernel_sched_runqueue runqueue;
 #if BOAROS_USER_SMP
-    struct kernel_sched_runqueue user_services;
+    struct kernel_sched_runqueue rt_services;
 #endif
     struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;
@@ -276,7 +276,6 @@ void scheduler_user_service_set_locked(struct kernel_task *, int);
 void scheduler_user_request_locked(struct kernel_task *);
 /* 同一调度域内结束逻辑实时资格；不结束任务执行或存储owner。 */
 void scheduler_user_reservation_release_locked(struct kernel_task *);
-int scheduler_user_yield_locked(struct kernel_task *);
 static inline enum kernel_scheduler_status scheduler_failure(void)
 { return __atomic_load_n(&scheduler.fatal_status, __ATOMIC_RELAXED); }
 

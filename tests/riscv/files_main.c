@@ -94,13 +94,13 @@ char __wrap_virt_uart_getc(void)
 static struct kernel_mm *unmap_during_fault;
 static uint64_t unmap_fault_address;
 static int complete_peer_fault;
-enum kernel_page_cache_status __real_kernel_open_file_get_page(
-    struct kernel_open_file_description *, uint64_t, uint64_t *, size_t *);
-enum kernel_page_cache_status __wrap_kernel_open_file_get_page(
-    struct kernel_open_file_description *file, uint64_t index, uint64_t *address, size_t *valid)
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *, uint64_t,
+    struct kernel_open_file_page_preparation *);
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index, struct kernel_open_file_page_preparation *prepared)
 {
-    enum kernel_page_cache_status status = __real_kernel_open_file_get_page(file, index, address, valid);
-    if (unmap_during_fault && status == KERNEL_PAGE_CACHE_STATUS_OK) {
+    int status = __real_kernel_open_file_prepare_mapping_page(file, index, prepared);
+    if (unmap_during_fault && !status) {
         struct kernel_mm *mm = unmap_during_fault;
         unmap_during_fault = 0;
         enum kernel_mm_status changed = complete_peer_fault
@@ -1523,10 +1523,7 @@ static void run_close_cleanup_isolation(struct kernel_files *files)
     int64_t result = INT64_MIN;
 
     if (kernel_open_file_create_console(files->heap, &historical) !=
-            KERNEL_OPEN_FILE_STATUS_OK ||
-        kernel_open_file_detach(&historical) !=
-            KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED ||
-        historical == 0) {
+            KERNEL_OPEN_FILE_STATUS_OK || historical == 0) {
         fail_files(165U, KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED,
                    KERNEL_OPEN_FILE_STATUS_STATE);
     }

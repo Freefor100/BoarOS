@@ -366,6 +366,10 @@ void process_group_request_exit(struct kernel_task *task,
 void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
                             uint64_t status, uint64_t detail)
 {
+#if BOAROS_USER_SMP
+    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
+        kernel_scheduler_enter_user_service();
+#endif
     process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
     kernel_user_thread_exit(reason, status, detail);
 }
@@ -770,6 +774,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t child_tid,
     int64_t *linux_result)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_task *parent;
     struct kernel_task *child;
     uint64_t child_context;
@@ -1254,6 +1259,7 @@ static void wait_claim_end(struct kernel_task **task)
 enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
     uint64_t status_address, uint32_t options, uint64_t rusage_address, int64_t *linux_result)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (!linux_result || arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (options & ~LINUX_WAIT4_SUPPORTED_OPTIONS) { *linux_result = -KERNEL_EINVAL; return KERNEL_SCHEDULER_STATUS_OK; }
@@ -2058,6 +2064,10 @@ void kernel_user_thread_exit(
     uint64_t status,
     uint64_t detail)
 {
+#if BOAROS_USER_SMP
+    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
+        kernel_scheduler_enter_user_service();
+#endif
     struct kernel_thread_completion completion = {
         .kind = KERNEL_THREAD_KIND_USER,
         .reason = reason,
@@ -2193,9 +2203,10 @@ enum kernel_task_status kernel_task_set_rlimit(
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
         return KERNEL_TASK_STATUS_STATE;
-    if (resource == KERNEL_RLIMIT_NOFILE)
-        task->group_leader->nofile_limit = *limit;
-    else task->group_leader->stack_limit = *limit;
+    if (resource == KERNEL_RLIMIT_NOFILE) {
+        __atomic_store_n(&task->group_leader->nofile_limit.current, limit->current, __ATOMIC_RELAXED);
+        task->group_leader->nofile_limit.maximum = limit->maximum;
+    } else task->group_leader->stack_limit = *limit;
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2368,7 +2379,7 @@ enum kernel_task_status kernel_task_files_borrow(
     }
     *files = &task->files;
     task->files.nofile_limit =
-        (uint32_t)task->group_leader->nofile_limit.current;
+        (uint32_t)__atomic_load_n(&task->group_leader->nofile_limit.current, __ATOMIC_RELAXED);
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2389,32 +2400,18 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
-#if BOAROS_USER_SMP
-enum kernel_task_status kernel_task_read_resources_borrow(
-    struct kernel_task *task, struct kernel_files **files, struct kernel_mm **mm)
-{
-    if (!files || !mm || !kernel_task_has_user_context(task))
-        return KERNEL_TASK_STATUS_STATE;
-    if (task->files.state == KERNEL_FILES_EMPTY)
-        return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
-    if (task->files.state != KERNEL_FILES_LIVE || !task->files.record ||
-        !task->files.heap || task->mm.state != KERNEL_MM_LIVE)
-        return KERNEL_TASK_STATUS_STATE;
-    *files = &task->files;
-    *mm = &task->mm;
-    return KERNEL_TASK_STATUS_OK;
-}
-#endif
-
 void kernel_task_prepare_user_return(void)
 {
     if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
     struct kernel_task *task = kernel_cpu_current()->current;
     if (task == 0 || task->arch.user_mode != 1U) return;
+    if (task->files.state==KERNEL_FILES_LIVE) (void)kernel_files_drain_file_cleanup(&task->files);
+    kernel_mm_drain_sources(&task->mm);
 #if BOAROS_USER_SMP
     if (!kernel_scheduler_user_service_active() && !kernel_scheduler_user_service_pending()) return;
     kernel_scheduler_enter_user_service();
+    kernel_scheduler_ack_user_service();
 #endif
     uint64_t address = task->set_tid_address;
     task->set_tid_address = 0U;

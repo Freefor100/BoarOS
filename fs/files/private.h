@@ -46,28 +46,18 @@ struct kernel_file_slot {
 
 struct kernel_files_record {
     struct kernel_file_slot *slots;
-    struct kernel_open_file_description *cleanup_files;
+    _Atomic(struct kernel_open_file_description *) cleanup_files;
     struct kernel_record_lock *record_locks;
     struct kernel_files_statistics statistics;
     uint32_t references;
     uint32_t next_fd;
     struct kernel_raw_lock metadata_lock;
     uint8_t retired;
-    uint8_t concurrent;
 };
-/* handle由调用者持有；发布后concurrent只读，不在此借用中修改handle。 */
-static inline int kernel_files_controlled(const struct kernel_files *files)
-{
-    return files && files->state==KERNEL_FILES_LIVE && files->record &&
-        __atomic_load_n(&files->record->concurrent,__ATOMIC_ACQUIRE);
-}
 #define KERNEL_FILES_SCOPE(name, files) \
     KERNEL_RAW_SCOPE(name, &(files)->record->metadata_lock)
 void kernel_files_note(struct kernel_files *, size_t offset, uint64_t value);
-#if BOAROS_USER_SMP
-enum kernel_files_status kernel_files_pin_local_regular(struct kernel_files *, int64_t,
-    struct kernel_open_file_description **, int *, int64_t *);
-#endif
+
 #define KERNEL_FILES_NOTE(files, field, value) \
     kernel_files_note((files), offsetof(struct kernel_files_statistics, field), (value))
 int kernel_files_fd_matches(struct kernel_files *, int64_t,
