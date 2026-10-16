@@ -14,6 +14,8 @@ struct kernel_open_file_description {
     struct kernel_vfs_file file;
     struct kernel_open_file_description *cleanup_next;
     struct kernel_heap *heap;
+    /* read/readv与位置操作的调用者持有；CPU0请求只借用已有资格，
+     * 不能先进入executor后等待此锁，否则会阻挡持锁读者的cache miss。 */
     struct kernel_mutex offset_lock;
     uint64_t offset;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES

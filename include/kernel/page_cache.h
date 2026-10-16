@@ -113,6 +113,12 @@ void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *,
  * 在普通CPU0任务、缓存保护外执行。关闭取消未执行者，执行者等实际结束。 */
 enum kernel_page_cache_status kernel_page_cache_run_cpu0(struct kernel_page_cache *,
     void (*execute)(void *),void *argument);
+struct kernel_lock_guard;
+/* OFD位置操作的caller持唯一指定互斥资格至callback完成；executor只借用，
+ * 不取得、转移或归还该锁。其他锁、user pin和cache写借用仍禁止排队。 */
+enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(
+    struct kernel_page_cache *,void (*execute)(void *),void *argument,
+    const struct kernel_lock_guard *borrowed);
 int kernel_page_cache_is_executor(const struct kernel_page_cache *);
 
 /* Returns an owned physical-page reference that the caller must release. */

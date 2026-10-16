@@ -1832,7 +1832,7 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	if (r == EOK)
 		r = ext4_blockdev_flush(jbd_fs->bdev);
 	if (r != EOK) {
-		journal->error = r;
+		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 		return r;
 	}
 	r = jbd_journal_update_super(journal, true);
@@ -1846,8 +1846,10 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 		int cleanup = jbd_write_sb(jbd_fs);
 		if (cleanup == EOK)
 			cleanup = ext4_blockdev_flush(jbd_fs->bdev);
-		if (cleanup != EOK)
-			r = journal->error = cleanup;
+		if (cleanup != EOK) {
+			r = cleanup;
+			__atomic_store_n(&journal->error,cleanup,__ATOMIC_RELEASE);
+		}
 		else
 			jbd_fs->bdev->journal = NULL;
 	}
@@ -1942,7 +1944,7 @@ int jbd_journal_purge_cp_trans(struct jbd_journal *journal,
 	}
 	return EOK;
 Error:
-	journal->error = r;
+	__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 	return r;
 }
 
@@ -1978,7 +1980,7 @@ int jbd_journal_stop(struct jbd_journal *journal)
 	if (r == EOK)
 		r = ext4_blockdev_flush(jbd_fs->bdev);
 	if (r != EOK)
-		journal->error = r;
+		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 	return r;
 }
 
@@ -2096,7 +2098,7 @@ jbd_trans_finish_callback(struct jbd_journal *journal,
 				if (r != EOK) {
 					/* The earlier committed transaction still owns its
 					 * log record even when rollback cannot read it. */
-					journal->error = r;
+					__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 					jbd_trans_change_ownership(block_rec, jbd_buf->trans);
 					if (block.lb_id)
 						ext4_block_set(fs->bdev, &block);
@@ -2944,7 +2946,7 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 	struct jbd_journal *journal = trans->journal;
 	if (res != EOK) {
 		trans->error = res;
-		journal->error = res;
+		__atomic_store_n(&journal->error,res,__ATOMIC_RELEASE);
 		return;
 	}
 
@@ -3076,8 +3078,8 @@ Finish:
 	if (rc != EOK) {
 		/* Never recycle possibly committed log blocks after uncertain I/O.
 		 * The journal owns this pinned transaction until recovery/remount. */
-		journal->error = rc;
 		journal->failed_trans = trans;
+		__atomic_store_n(&journal->error,rc,__ATOMIC_RELEASE);
 	}
 	return rc;
 }
@@ -3240,7 +3242,8 @@ int jbd_journal_freeze(struct jbd_journal *journal)
 	if (r == EOK) r = jbd_trans_prepare_commit_block(trans);
 	if (r == EOK) trans->checkpoint_lba = journal->log_map[0];
 	if (r != EOK) {
-		journal->error = r; journal->failed_trans = trans;
+		journal->failed_trans = trans;
+		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
 		return r;
 	}
 	struct jbd_sb sb = journal->jbd_fs->sb;
@@ -3387,8 +3390,8 @@ int jbd_journal_retire_stage(struct jbd_journal *journal,
 	if (!trans) return error;
 	if (error) {
 		if (!journal->error) {
-			journal->error = error;
 			journal->failed_trans = trans;
+			__atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
 		}
 		/* DMA has stopped, but live readers still own the accepted file
 		 * contents. The failed mount keeps these versions and later groups. */

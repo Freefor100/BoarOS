@@ -37,15 +37,15 @@ pipe启用前核对槽引用覆盖全部OFD引用、不同OFD覆盖全部端点�
 这个私有启用检查最多 O(capacity²)，不在 FD raw 内扫描，不加入常见 lookup/close 路径。
 受控任务的MM/files引用在发布前准备，退出后在可信栈归还。命名FIFO、socket/epoll、路径/挂载、记录锁及sendfile业务不随普通OFD接纳开放。
 
-tmpfs读写、定位I/O及offset在调用核执行；ext4的整次read/write/readv/writev/pread/pwrite/lseek/fstat/fsync/ftruncate由现有CPU0 cache worker执行。
+tmpfs读写、定位I/O及offset在调用核执行。受控ext4的read/readv/pread先在调用核取得热缓存页并复制用户数据，仅未完成的缓存项交现有CPU0 worker装入；写入、元数据及同步操作仍由该worker执行。
 请求持调用现场的OFD pin及MM/files owner，不按fd数字重新查找；参数、导入iov及结果地址在DONE和worker借用结束前不能退栈。
-提交者不得持对象保护、用户pin或缓存写入借用，违反返回STATE且不发布请求。回调在cache mutex外、普通CPU0上下文执行，不绑定调用者MM。
+使用共享offset的操作在提交前取得原有rank10 mutex，CPU0回调借用这次资格，结束后仍由调用者归还；不能先排入CPU0再等待该锁，否则会阻挡持锁读者的冷读请求。借锁入口只接受调用者唯一持有的指定write guard。其他对象保护、用户pin或缓存写入借用不允许跨提交，违反返回STATE且不发布请求。回调在cache mutex外、普通CPU0上下文执行，不绑定调用者MM。
 用户复制按已有pin协议处理冷缺页；受控owned fault允许持gate的CPU0服务任务在kernel根上操作，其他活动地址空间检查保留。
 共享offset及错误观察沿已有rank10 mutex保护；定位同步写在写门前取得它，msync固定来源后先释放MM gate25再同步，tmpfs与磁盘均遵守此顺序。
 冷读及普通操作共用FIFO，16项后检查写回并让出；这不是时间上界。关闭取消未执行请求，执行者等待实际完成；最终后端释放仍在CPU0。
 `make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持pin拒绝及控制引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
-host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。OFD保持336字节/512字节slab、FD record160字节/256字节slab；cache entry216字节不变，record728字节仍为1024字节slab。
-宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；冷CPU0复制经fork私有页验证COW隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的cpu0执行交接)。
+host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
+宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；冷CPU0复制经fork私有页验证COW隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的执行位置)。
 `make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
 在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
 `make test-pipe-concurrency-host`另验证真实MM/uaccess的提前wake、fd复用后旧请求、EOF/部分EPIPE、

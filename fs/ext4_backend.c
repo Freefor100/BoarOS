@@ -193,9 +193,10 @@ int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
 static void initialize_backend(void);
 static int mount_error(const struct lwext4_mount_adapter *adapter)
 {
-    if (adapter->mount_error) return adapter->mount_error;
+    int error=__atomic_load_n(&adapter->mount_error,__ATOMIC_ACQUIRE);
+    if (error) return error;
     struct ext4_fs *fs = adapter->device.fs;
-    return fs && fs->jbd_journal ? fs->jbd_journal->error : EOK;
+    return fs && fs->jbd_journal ? __atomic_load_n(&fs->jbd_journal->error,__ATOMIC_ACQUIRE) : EOK;
 }
 
 static int prepare_journal_mount(struct lwext4_mount_adapter *adapter)
@@ -213,7 +214,7 @@ static int prepare_journal_mount(struct lwext4_mount_adapter *adapter)
     if (result == EOK)
         adapter->recovery_pending = 0U;
     else if (result != ENOMEM && result != ENOSPC)
-        adapter->mount_error = result;
+        __atomic_store_n(&adapter->mount_error,result,__ATOMIC_RELEASE);
     return result;
 }
 
@@ -227,9 +228,9 @@ static bool vfs_realtime(struct ext4_timestamp *now)
     return true;
 }
 
-/* Timestamp state is owned by the shared regular-file node. Service-context
- * IRQ exclusion protects short publications; no backend lock or I/O is needed
- * by ordinary read/write. Dirty and tentative lists each own one node pin. */
+/* Timestamp updates may run on the reader's hart. One mount raw lock protects
+ * the shared node values and dirty/staged lists; list pins are released only
+ * after dropping that lock, since their final release may close/free a node. */
 static int time_compare(struct ext4_timestamp a, struct ext4_timestamp b)
 {
     if (a.seconds != b.seconds) return a.seconds < b.seconds ? -1 : 1;
@@ -270,20 +271,20 @@ static void time_append_dirty(struct lwext4_node *node)
     adapter->dirty_times_count++;
 }
 
-static void time_drop_dirty(struct lwext4_node *node)
+static struct kernel_vfs_node *time_drop_dirty(struct lwext4_node *node)
 {
-    if (node->dirty_fields || !node->dirty_previous) return;
+    if (node->dirty_fields || !node->dirty_previous) return NULL;
     time_unlink_dirty(node);
-    struct kernel_vfs_node *pin = &node->node;
-    if (kernel_vfs_node_release(&pin)) __builtin_trap();
+    return &node->node;
 }
 
-static void time_dirty(struct lwext4_node *node, unsigned fields,
-                        struct ext4_timestamp now)
+/* Caller holds timestamp_lock. The acquired list pin is atomic; wakeups and
+ * final node releases stay outside this short cross-hart publication. */
+static int time_dirty_locked(struct lwext4_node *node, unsigned fields,
+                             struct ext4_timestamp now)
 {
-    kernel_assert_service_context();
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
-    uintptr_t irq = arch_interrupt_save();
+    int notify = 0;
     for (unsigned i = 0; i < 3; i++) if (fields & (1U << i)) {
         struct ext4_timestamp value = normalize_time(node, i, now);
         if (!time_compare(node->times[i], value)) continue;
@@ -296,20 +297,44 @@ static void time_dirty(struct lwext4_node *node, unsigned fields,
         time_append_dirty(node);
         if (!adapter->times_deadline) {
             adapter->times_deadline = kernel_time_monotonic_ns() + UINT64_C(100000000);
-            if (adapter->journal_started) {
-                adapter->journal_requested = 1;
-                (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-            }
+            notify = adapter->journal_started;
         }
     }
+    return notify;
+}
+
+static void time_notify(struct lwext4_mount_adapter *adapter, int notify)
+{
+    if (!notify) return;
+    uintptr_t irq = arch_interrupt_save();
+    __atomic_store_n(&adapter->journal_requested, 1, __ATOMIC_RELEASE);
+    (void)kernel_wait_queue_wake_all(&adapter->journal_work);
     arch_interrupt_restore(irq);
+}
+
+static void time_dirty(struct lwext4_node *node, unsigned fields,
+                        struct ext4_timestamp now)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
+    int notify;
+    {
+        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        notify = time_dirty_locked(node, fields, now);
+    }
+    time_notify(adapter, notify);
+}
+
+static uint64_t time_deadline(struct lwext4_mount_adapter *adapter)
+{
+    KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+    return adapter->times_deadline;
 }
 
 static void time_stage(void *context, uint32_t inode, unsigned field,
                        struct ext4_timestamp value)
 {
     struct lwext4_mount_adapter *adapter = context;
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
     struct kernel_vfs_node *base = kernel_vfs_node_find(&adapter->instance, inode);
     if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         struct lwext4_node *node = (struct lwext4_node *)base;
@@ -322,42 +347,43 @@ static void time_stage(void *context, uint32_t inode, unsigned field,
         node->staged_version[field] = node->time_version[field];
         node->staged_fields |= 1U << field;
     }
-    arch_interrupt_restore(irq);
 }
 
 static void time_finish(void *context, bool accepted)
 {
     struct lwext4_mount_adapter *adapter = context;
-    uintptr_t irq = arch_interrupt_save();
-    while (adapter->staged_times) {
-        struct lwext4_node *node = adapter->staged_times;
-        adapter->staged_times = node->staged_next;
-        for (unsigned i = 0; i < 3; i++) {
-            if (!accepted || !(node->staged_fields & (1U << i)) ||
-                node->staged_version[i] != node->time_version[i]) continue;
-            node->times[i] = node->staged[i];
-            if (!++node->time_version[i]) __builtin_trap();
-            node->dirty_fields &= ~(1U << i);
+    for (;;) {
+        struct kernel_vfs_node *dirty_pin, *staged_pin;
+        {
+            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            struct lwext4_node *node = adapter->staged_times;
+            if (!node) break;
+            adapter->staged_times = node->staged_next;
+            for (unsigned i = 0; i < 3; i++) {
+                if (!accepted || !(node->staged_fields & (1U << i)) ||
+                    node->staged_version[i] != node->time_version[i]) continue;
+                node->times[i] = node->staged[i];
+                if (!++node->time_version[i]) __builtin_trap();
+                node->dirty_fields &= ~(1U << i);
+            }
+            node->staged_fields = 0;
+            node->staged_next = 0;
+            dirty_pin = time_drop_dirty(node);
+            staged_pin = &node->node;
         }
-        node->staged_fields = 0;
-        node->staged_next = 0;
-        time_drop_dirty(node);
-        struct kernel_vfs_node *pin = &node->node;
-        if (kernel_vfs_node_release(&pin)) __builtin_trap();
+        if (dirty_pin && kernel_vfs_node_release(&dirty_pin)) __builtin_trap();
+        if (kernel_vfs_node_release(&staged_pin)) __builtin_trap();
     }
-    arch_interrupt_restore(irq);
 }
 
 static unsigned ext4_backend_pending_times(struct kernel_vfs_node *base,
                                             struct ext4_timestamp times[3])
 {
-    kernel_assert_service_context();
     struct lwext4_node *node = (struct lwext4_node *)base;
-    uintptr_t irq = arch_interrupt_save();
+    struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
+    KERNEL_RAW_SCOPE(guard, &adapter->timestamp_lock);
     memcpy(times, node->times, sizeof(node->times));
-    unsigned fields = node->dirty_fields;
-    arch_interrupt_restore(irq);
-    return fields;
+    return node->dirty_fields;
 }
 
 static void ext4_backend_finish_times(struct kernel_vfs_node *base, unsigned fields,
@@ -365,12 +391,16 @@ static void ext4_backend_finish_times(struct kernel_vfs_node *base, unsigned fie
 {
     if (result) return;
     struct lwext4_node *node = (struct lwext4_node *)base;
-    uintptr_t irq = arch_interrupt_save();
-    for (unsigned i = 0; i < 3; i++)
-        if ((fields & (1U << i)) && !time_compare(node->times[i], times[i]))
-            node->dirty_fields &= ~(1U << i);
-    time_drop_dirty(node);
-    arch_interrupt_restore(irq);
+    struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
+    struct kernel_vfs_node *dirty_pin;
+    {
+        KERNEL_RAW_SCOPE(guard, &adapter->timestamp_lock);
+        for (unsigned i = 0; i < 3; i++)
+            if ((fields & (1U << i)) && !time_compare(node->times[i], times[i]))
+                node->dirty_fields &= ~(1U << i);
+        dirty_pin = time_drop_dirty(node);
+    }
+    if (dirty_pin && kernel_vfs_node_release(&dirty_pin)) __builtin_trap();
 }
 
 static unsigned time_snapshot(void *owner, struct ext4_timestamp times[3])
@@ -385,37 +415,45 @@ static int writeback_times(struct kernel_vfs_node *node, bool wait)
 
 static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait)
 {
-    uintptr_t irq = arch_interrupt_save();
-    size_t count = adapter->dirty_times_count;
-    arch_interrupt_restore(irq);
+    size_t count;
+    {
+        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        count = adapter->dirty_times_count;
+    }
     int result = EOK;
     while (count--) {
-        irq = arch_interrupt_save();
-        struct kernel_vfs_node *node = adapter->dirty_times ? &adapter->dirty_times->node : 0;
-        if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
-        arch_interrupt_restore(irq);
+        struct kernel_vfs_node *node;
+        {
+            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            node = adapter->dirty_times ? &adapter->dirty_times->node : NULL;
+            if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
+        }
         if (!node) break;
         result = writeback_times(node, wait);
-        irq = arch_interrupt_save();
-        struct lwext4_node *current = (struct lwext4_node *)node;
-        /* Newer RAM updates keep their pin, but may not hide the other inodes
-         * that belonged to this bounded flush pass. New entries join the tail. */
-        if (!result && current->dirty_previous && adapter->dirty_times == current) {
-            time_unlink_dirty(current);
-            time_append_dirty(current);
+        {
+            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            struct lwext4_node *current = (struct lwext4_node *)node;
+            /* Newer RAM updates keep their pin without hiding other inodes
+             * from this bounded flush pass. New entries join the tail. */
+            if (!result && current->dirty_previous && adapter->dirty_times == current) {
+                time_unlink_dirty(current);
+                time_append_dirty(current);
+            }
         }
-        arch_interrupt_restore(irq);
         if (result && result != EAGAIN) kernel_vfs_record_writeback_error(node, lwext4_error(result));
         if (kernel_vfs_node_release(&node)) __builtin_trap();
         if (result) break;
     }
-    irq = arch_interrupt_save();
-    adapter->times_deadline = adapter->dirty_times
-        ? kernel_time_monotonic_ns() + UINT64_C(100000000) : 0;
-    arch_interrupt_restore(irq);
+    {
+        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        adapter->times_deadline = adapter->dirty_times
+            ? kernel_time_monotonic_ns() + UINT64_C(100000000) : 0;
+    }
     return result;
 }
 
+/* The node is still unpublished; its initial times and immutable format flags
+ * become visible together when kernel_vfs_publish_node exposes it. */
 static int load_times(struct kernel_vfs_node *base, struct lwext4_mount_adapter *adapter)
 {
     if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) return EOK;
@@ -853,7 +891,7 @@ static void journal_request(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
     uintptr_t irq = arch_interrupt_save();
-    adapter->journal_requested = 1;
+    __atomic_store_n(&adapter->journal_requested, 1, __ATOMIC_RELEASE);
     adapter->checkpoint_requested = 1;
     (void)kernel_wait_queue_wake_all(&adapter->journal_work);
     (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
@@ -913,12 +951,14 @@ static void journal_worker(void *context)
     for (;;) {
         uintptr_t irq = arch_interrupt_save();
         int force = adapter->journal_force;
-        adapter->journal_force = adapter->journal_requested = 0;
+        adapter->journal_force = 0;
+        (void)__atomic_exchange_n(&adapter->journal_requested, 0, __ATOMIC_ACQ_REL);
         int stopping = adapter->journal_stopping;
         arch_interrupt_restore(irq);
         if (stopping) break;
         int metadata = EOK;
-        if (adapter->times_deadline && kernel_time_monotonic_ns() >= adapter->times_deadline)
+        uint64_t times_due = time_deadline(adapter);
+        if (times_due && kernel_time_monotonic_ns() >= times_due)
             metadata = writeback_mount_times(adapter, false);
         int result = EOK;
         struct ext4_journal_progress progress = {0};
@@ -938,15 +978,15 @@ static void journal_worker(void *context)
         arch_interrupt_restore(irq);
         uint64_t deadline = 0;
         uint64_t due = progress.deadline_ns;
-        if (!result && adapter->times_deadline && (!due || adapter->times_deadline < due))
-            due = adapter->times_deadline;
+        times_due = time_deadline(adapter);
+        if (!result && times_due && (!due || times_due < due)) due = times_due;
         if (!result && (progress.commit_ready || (due &&
             kernel_time_deadline_from_monotonic(due, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
         irq = arch_interrupt_save();
-        if (!adapter->journal_requested && !adapter->journal_stopping) {
+        if (!__atomic_load_n(&adapter->journal_requested, __ATOMIC_ACQUIRE) && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
             if (KERNEL_WAIT_RECHECK(&adapter->journal_work, deadline, 0, &reason,
-                (!adapter->journal_requested && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+                (!__atomic_load_n(&adapter->journal_requested, __ATOMIC_ACQUIRE) && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
         arch_interrupt_restore(irq);
     }
@@ -972,7 +1012,7 @@ static void journal_checkpoint_worker(void *context)
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
         if (progress.checkpoint != before) {
             /* Reclaim returns log/RAM credits to a commit waiting for space. */
-            adapter->journal_requested = 1;
+            __atomic_store_n(&adapter->journal_requested, 1, __ATOMIC_RELEASE);
             (void)kernel_wait_queue_wake_all(&adapter->journal_work);
         }
         arch_interrupt_restore(irq);
@@ -1074,6 +1114,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     }
     adapter_names(adapter);
     boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock);
+    kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
     adapter->next_adapter = adapters;
     adapters = adapter;
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
@@ -1576,12 +1617,16 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     if (node->noatime) return;
     struct ext4_timestamp now;
     if (!ext4_file_read_clock(lwext4_node_file(base), &now)) return;
-    uintptr_t irq = arch_interrupt_save();
-    if (time_compare(node->times[1], node->times[0]) >= 0 ||
-        time_compare(node->times[2], node->times[0]) >= 0 ||
-        now.seconds - node->times[0].seconds >= 86400)
-        time_dirty(node, EXT4_TIME_ATIME, now);
-    arch_interrupt_restore(irq);
+    struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
+    int notify = 0;
+    {
+        KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+        if (time_compare(node->times[1], node->times[0]) >= 0 ||
+            time_compare(node->times[2], node->times[0]) >= 0 ||
+            now.seconds - node->times[0].seconds >= 86400)
+            notify = time_dirty_locked(node, EXT4_TIME_ATIME, now);
+    }
+    time_notify(adapter, notify);
 }
 
 static int ext4_backend_modified(struct kernel_vfs_file *file,
@@ -1796,10 +1841,14 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
     result = ext4_orphan_free(lwext4_instance(node->instance)->mount_point, node->inode);
     if (result == EOK) {
         node->retired = 1U;
-        uintptr_t irq = arch_interrupt_save();
-        ((struct lwext4_node *)node)->dirty_fields = 0;
-        time_drop_dirty((struct lwext4_node *)node);
-        arch_interrupt_restore(irq);
+        struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+        struct kernel_vfs_node *dirty_pin;
+        {
+            KERNEL_RAW_SCOPE(times, &adapter->timestamp_lock);
+            ((struct lwext4_node *)node)->dirty_fields = 0;
+            dirty_pin = time_drop_dirty((struct lwext4_node *)node);
+        }
+        if (dirty_pin && kernel_vfs_node_release(&dirty_pin)) __builtin_trap();
     }
 
 out:

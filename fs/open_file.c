@@ -6,6 +6,7 @@
 #include "files/epoll_internal.h"
 
 #include <arch/context.h>
+#include <arch/platform_io.h>
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -26,9 +27,13 @@ static int open_file_live(
 static void reset_read_prediction(struct kernel_open_file_description *file)
 {
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
-    if (file->readahead_cookie)
-        kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file), file->readahead_cookie);
-    file->readahead_cookie = 0; file->read_sequential = 0;
+    uint64_t cookie;
+    {
+        KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+        cookie=file->readahead_cookie;
+        file->readahead_cookie = 0; file->read_sequential = 0;
+    }
+    if (cookie) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cookie);
 #else
     (void)file;
 #endif
@@ -38,9 +43,15 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
 {
     if (!open_file_live(file)) return;
-    uintptr_t irq = arch_interrupt_save();
-    if (file->read_sequential && file->read_end != offset) reset_read_prediction(file);
-    arch_interrupt_restore(irq);
+    uint64_t cancel=0;
+    {
+        KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+        if (file->read_sequential && file->read_end != offset) {
+            cancel=file->readahead_cookie;
+            file->readahead_cookie=0;file->read_sequential=0;
+        }
+    }
+    if (cancel) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cancel);
 }
 void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     uint64_t offset, size_t count)
@@ -48,14 +59,30 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     if (!count || !open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_memory_backed(file) || kernel_vfs_file_generated(&file->file)) return;
     if (offset > UINT64_MAX - count) __builtin_trap();
-    uintptr_t irq = arch_interrupt_save();
-    int sequential = file->read_sequential && file->read_end == offset;
-    if (!sequential) reset_read_prediction(file);
-    file->read_end = offset + count; file->read_sequential = 1;
-    if (sequential && !(file->read_end & BOAROS_PAGE_MASK))
-        file->readahead_cookie = kernel_page_cache_readahead(kernel_vfs_file_page_cache(&file->file),
-            kernel_vfs_file_node(&file->file), file->read_end >> BOAROS_PAGE_SHIFT, file->readahead_cookie);
-    arch_interrupt_restore(irq);
+    uint64_t cancel=0,cookie=0,end=offset+count;
+    int queue;
+    {
+        KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+        int sequential=file->read_sequential && file->read_end==offset;
+        if (!sequential) { cancel=file->readahead_cookie;file->readahead_cookie=0; }
+        file->read_end=end;file->read_sequential=1;
+        queue=sequential && !(end&BOAROS_PAGE_MASK);
+        cookie=file->readahead_cookie;
+    }
+    struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
+    if (cancel) kernel_page_cache_cancel_readahead(cache,cancel);
+    if (queue) {
+        uint64_t published=kernel_page_cache_readahead(cache,kernel_vfs_file_node(&file->file),
+            end>>BOAROS_PAGE_SHIFT,cookie);
+        int keep;
+        {
+            KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+            keep=file->read_sequential && file->read_end==end && file->readahead_cookie==cookie;
+            if (keep) file->readahead_cookie=published;
+        }
+        /* 排队期间的seek或其他pread已改变预测；不能把旧计划重新挂回OFD。 */
+        if (!keep && published) kernel_page_cache_cancel_readahead(cache,published);
+    }
 }
 #endif
 
@@ -1094,15 +1121,22 @@ struct sync_range_call {
 static void sync_range_cpu0(void *argument)
 {
     struct sync_range_call *call=argument;
-    call->result=kernel_open_file_sync_range(call->file,call->start,call->end);
+    /* 调用者在排队前取得OFD位置资格，executor只借用，不能等待自己的队首。 */
+    call->result=kernel_vfs_sync_range(&call->file->file,call->start,call->end,
+        &call->file->observed_writeback_error);
 }
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,
     uint64_t start, uint64_t end)
 {
     if (!open_file_live(file)) return -KERNEL_EBADF;
     if (kernel_open_file_io_requires_cpu0(file)) {
+        struct kernel_io_context *io=kernel_io_context_current();
+        if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
+            !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return -KERNEL_EIO;
+        KERNEL_LOCK_SCOPE(offset);
+        kernel_mutex_lock(&file->offset_lock,&offset);
         struct sync_range_call call={file,start,end,-KERNEL_EIO};
-        if (kernel_page_cache_run_cpu0(kernel_open_file_page_cache(file),sync_range_cpu0,&call))
+        if (kernel_page_cache_run_cpu0_borrowing(kernel_open_file_page_cache(file),sync_range_cpu0,&call,&offset))
             return -KERNEL_EIO;
         return call.result;
     }

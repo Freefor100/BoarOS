@@ -236,9 +236,9 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 自然退出同时核对PID1状态、FD/OFD/端点/等待、MM/pin、页/堆/任务栈、私有挂载与根盘设备owner，并运行两盘fsck；不是只检查串口marker。RV产物FD record160字节、pipe504字节、task2784字节，前两者保持256/512字节slab；复用task已有files字段，未新增任务页。扩容锁内复制上限8192字节，pin/close不分配或全表扫描；没有新增数据中转缓冲或worker。OFF工作tick与收尾分别保留，不据此宣称性能提升。
 
-## 普通文件IO的CPU0执行交接
+## 普通文件IO的执行位置
 
-受控FD表可接纳同域、预先打开的tmpfs/ext4普通OFD。CPU0私有校验真实来源后发布稳定资格，控制引用覆盖任务、请求和MM来源；末次后端释放仍由CPU0完成。tmpfs读写及定位操作就地执行；ext4整次操作排入既有cache worker，由它取得offset/write保护并复制用户数据，不改变任务或MM绑定。fsync/fdatasync/ftruncate及共享错误观察保持相同执行规则；tmpfs截断仍由CPU0控制者完成。路径、statx、socket/epoll、记录锁和sendfile不随FD接纳开放，入口在发布或用户输出前返回STATE。
+受控FD表可接纳同域、预先打开的tmpfs/ext4普通OFD。CPU0私有校验真实来源后发布稳定资格，控制引用覆盖任务、请求和MM来源；末次后端释放仍由CPU0完成。tmpfs读写及定位操作就地执行；ext4 read/readv/pread在调用hart取得热缓存并复制用户数据，只有miss交CPU0装入；写入和元数据操作仍排入既有cache worker，不改变任务或MM绑定。共享offset由调用者在排队前取得原有锁，worker借用资格并在实际完成后交回，避免队首操作等待本地读者而挡住其miss。fsync/fdatasync/ftruncate及共享错误观察保持相同执行规则；tmpfs截断仍由CPU0控制者完成。路径、statx、socket/epoll、记录锁和sendfile不随FD接纳开放，入口在发布或用户输出前返回STATE。
 
 ```sh
 make test-file-io-concurrency-host
@@ -251,4 +251,6 @@ make test-file-io-smp-userland-riscv INIT_CONFIG=config/init.json \
 
 宿主4/16KiB、2/4线程核对共享offset及独立OFD整次追加的内容隔离；强制暂停实际执行者后close/dup复用、取消排队者并停止worker，原请求仍读原OFD，运行者完成前不得join。真实客户机同时验证磁盘映射作为缓冲区的冷缺页、精确短读写内容/哨兵、tmpfs本地I/O和最后控制引用结束后的arena基线。本受控配置的普通用户仍只在CPU0，USER_SMP另行验收。
 
-OFD336/FD160/pipe504字节保持512/256/512字节slab；cache entry216字节未变，record672→728字节仍为1024字节slab。执行请求96字节、冷读参数48字节、普通I/O调用现场112字节，均由等待栈及已有owner覆盖；受控task2784/CPU1968字节未变。常见FD pin/close无新分配或扫描，tmpfs无队列交接；每次ext4操作增加一次请求（命中也承担），自动同步及worker内冷缺页不再次排队。没有新数据缓冲或worker。OFF输出分别记录foreground、排队/服务、durability/close和原缓存后台/根退出收尾，不宣称性能提升。
+热读不创建执行请求，用户copy仍在调用hart；冷请求只排入缺失页，不把整个文件操作转交。运行时时间戳由挂载点raw锁保护共享值与dirty/staged链，锁外唤醒和归还节点；读取不为atime单独排队。可选预读的OFD预测用已有短锁，队列由缓存保护；取消只标记，CPU0预读worker在锁外归还节点。
+
+2026-10-16本地QEMU11.1.2分别以RA0、RA2完成2/1hart、512MiB/1GiB的新盘及独立重启。两hart日志要求实际用户copy发生在hart1，热读requests_queued不增加；冷缺页由CPU0加载且不增加整操作执行请求。共享read/readv、短fault与offset、close/reuse、同步和最终owner继续检查。RA2另通过1/4KiB和held DMA检查。默认普通用户syscall的执行策略仍见本文前述USER_SMP部分。

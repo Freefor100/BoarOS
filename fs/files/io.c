@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include <arch/context.h>
+#include <arch/platform_io.h>
 
 #define KERNEL_FILES_WRITE_STAGING 64U
 
@@ -44,10 +45,10 @@ struct regular_call {
     struct kernel_files *files;
     struct kernel_mm *mm;
     struct kernel_open_file_description *description;
-    struct kernel_open_file_description **description_owner;
+    const struct kernel_lock_guard *offset_borrow;
     const struct kernel_uaccess_iovec *iov;
     size_t iov_count;
-    uint64_t count, user_buffer, requested_offset, whence;
+    uint64_t count, requested_offset, whence;
     int64_t offset;
     int positioned;
     int64_t *result;
@@ -60,12 +61,26 @@ static int regular_remote(struct kernel_open_file_description *file)
 static enum kernel_files_status regular_dispatch(struct regular_call *call,void (*execute)(void *))
 {
     call->status=KERNEL_FILES_STATUS_STATE;
-    enum kernel_page_cache_status status=kernel_page_cache_run_cpu0(
-        kernel_open_file_page_cache(call->description),execute,call);
+    struct kernel_page_cache *cache=kernel_open_file_page_cache(call->description);
+    enum kernel_page_cache_status status=call->offset_borrow ?
+        kernel_page_cache_run_cpu0_borrowing(cache,execute,call,call->offset_borrow) :
+        kernel_page_cache_run_cpu0(cache,execute,call);
     return status?KERNEL_FILES_STATUS_STATE:call->status;
 }
-static void read_cpu0(void *);
-static void pread_cpu0(void *);
+static int regular_caller_ready(void)
+{
+    struct kernel_io_context *io=kernel_io_context_current();
+    return !io->locks && !io->user_pins && !io->cache_writes && !kernel_cpu_current()->raw_locks &&
+        kernel_scheduler_can_sleep() && !arch_external_interrupt_active();
+}
+static int regular_borrows_offset(struct kernel_open_file_description *description,
+    const struct kernel_lock_guard *borrowed)
+{
+    if (!borrowed) return 0;
+    if (borrowed->lock!=&description->offset_lock.lock || !borrowed->write ||
+        !borrowed->owner || borrowed->previous) __builtin_trap();
+    return 1;
+}
 static void write_cpu0(void *);
 static void seek_cpu0(void *);
 static void sync_cpu0(void *);
@@ -279,15 +294,20 @@ static enum kernel_files_status memory_read(
 }
 
 static enum kernel_files_status sync_pinned(struct kernel_open_file_description *description,
-    int datasync,int64_t *linux_result)
+    int datasync,int64_t *linux_result,const struct kernel_lock_guard *borrowed)
 {
     if (regular_remote(description)) {
-        struct regular_call call={.description=description,.positioned=datasync,.result=linux_result};
+        if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
+        KERNEL_LOCK_SCOPE(offset);
+        kernel_mutex_lock(&description->offset_lock,&offset);
+        struct regular_call call={.description=description,.positioned=datasync,.result=linux_result,
+            .offset_borrow=&offset};
         return regular_dispatch(&call,sync_cpu0);
     }
     enum kernel_open_file_kind kind=kernel_open_file_kind(description);
     KERNEL_LOCK_SCOPE(offset);
     if ((kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY) &&
+        !regular_borrows_offset(description,borrowed) &&
         !kernel_lock_held(&description->offset_lock.lock,1))
         kernel_mutex_lock(&description->offset_lock,&offset);
     *linux_result=kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ?
@@ -297,7 +317,7 @@ static enum kernel_files_status sync_pinned(struct kernel_open_file_description 
 static void sync_cpu0(void *argument)
 {
     struct regular_call *call=argument;
-    call->status=sync_pinned(call->description,call->positioned,call->result);
+    call->status=sync_pinned(call->description,call->positioned,call->result,call->offset_borrow);
 }
 enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     int64_t fd, int datasync, int64_t *linux_result)
@@ -308,7 +328,7 @@ enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) return status;
-    status=sync_pinned(description,datasync,linux_result);
+    status=sync_pinned(description,datasync,linux_result,NULL);
     return release_io_description(files,&description,status);
 }
 
@@ -409,11 +429,7 @@ static enum kernel_files_status read_pinned(
     int64_t *linux_result, uint32_t socket_flags,
     struct kernel_socket_address *peer, uint32_t *message_size)
 {
-    if (regular_remote(description)) {
-        struct regular_call call={.files=files,.mm=mm,.description=description,
-            .description_owner=description_owner,.iov=iov,.iov_count=iov_count,.count=count,.result=linux_result};
-        return regular_dispatch(&call,read_cpu0);
-    }
+    if (regular_remote(description) && !regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
     KERNEL_LOCK_SCOPE(offset_guard);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
@@ -619,12 +635,6 @@ static enum kernel_files_status read_pinned(
                      kernel_open_file_offset(description), 1, linux_result);
 }
 
-static void read_cpu0(void *argument)
-{
-    struct regular_call *call=argument;
-    call->status=read_pinned(call->files,call->mm,call->description,call->description_owner,
-        call->iov,call->iov_count,call->count,call->result,0,0,0);
-}
 enum kernel_files_status kernel_files_read(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -786,11 +796,7 @@ static enum kernel_files_status pread_pinned(
     int64_t offset,
     int64_t *linux_result)
 {
-    if (regular_remote(description)) {
-        struct regular_call call={.files=files,.mm=mm,.description=description,
-            .user_buffer=user_buffer,.count=count,.offset=offset,.result=linux_result};
-        return regular_dispatch(&call,pread_cpu0);
-    }
+    if (regular_remote(description) && !regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
     uint64_t position;
     uint64_t request;
     uint64_t file_size;
@@ -880,12 +886,6 @@ static enum kernel_files_status pread_pinned(
     return disk_read(files, mm, description, &cursor, request, position, 0, linux_result);
 }
 
-static void pread_cpu0(void *argument)
-{
-    struct regular_call *call=argument;
-    call->status=pread_pinned(call->files,call->mm,call->description,
-        call->user_buffer,call->count,call->offset,call->result);
-}
 enum kernel_files_status kernel_files_pread(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, uint64_t count, int64_t offset,
@@ -1470,12 +1470,17 @@ static enum kernel_files_status write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, uint32_t socket_flags)
+    int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed)
 {
     if (regular_remote(description)) {
+        if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
+        KERNEL_LOCK_SCOPE(offset);
+        if (!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC))
+            kernel_mutex_lock(&description->offset_lock,&offset);
         struct regular_call call={.files=files,.mm=mm,.description=description,
             .iov=iov,.iov_count=iov_count,.count=count,.positioned=positioned,
-            .requested_offset=requested_offset,.result=linux_result};
+            .requested_offset=requested_offset,.result=linux_result,
+            .offset_borrow=offset.lock?&offset:NULL};
         return regular_dispatch(&call,write_cpu0);
     }
     COST_SCOPE(write_cost, OPERATION_TICKS);
@@ -1505,8 +1510,10 @@ static enum kernel_files_status write_request(
     KERNEL_LOCK_SCOPE(offset_guard);
     if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
          kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
-        kernel_mutex_lock(&description->offset_lock, &offset_guard);
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) {
+        if (!regular_borrows_offset(description,borrowed))
+            kernel_mutex_lock(&description->offset_lock, &offset_guard);
+    }
     KERNEL_LOCK_SCOPE(operation_guard);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR)
         kernel_vfs_file_write_lock(&description->file, &operation_guard);
@@ -1541,7 +1548,7 @@ static void write_cpu0(void *argument)
 {
     struct regular_call *call=argument;
     call->status=write_request(call->files,call->mm,call->description,call->iov,call->iov_count,
-        call->count,call->positioned,call->requested_offset,call->result,0);
+        call->count,call->positioned,call->requested_offset,call->result,0,call->offset_borrow);
 }
 enum kernel_files_status kernel_files_socket_iov_io(
     struct kernel_files *files, struct kernel_mm *mm,
@@ -1556,7 +1563,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (writing) {
         KERNEL_FILES_NOTE(files, write_calls, 1);
-        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags);
+        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags,NULL);
         if (status == KERNEL_FILES_STATUS_OK) {
             if (*linux_result >= 0) KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
             else KERNEL_FILES_NOTE(files, write_failures, 1);
@@ -1641,7 +1648,7 @@ enum kernel_files_status kernel_files_write(
             kernel_task_current(), files, &description, 0, mm, &iov, 1U,
             count, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, &iov, 1U, count,
-                           0, 0U, linux_result, 0U);
+                           0, 0U, linux_result, 0U,NULL);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
@@ -1699,7 +1706,7 @@ enum kernel_files_status kernel_files_pwrite(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     iov.length = count;
     status = write_request(files, mm, description, &iov, 1U, count,
-                           1, (uint64_t)offset, linux_result, 0U);
+                           1, (uint64_t)offset, linux_result, 0U,NULL);
     if (status == KERNEL_FILES_STATUS_OK) account_write(files, *linux_result);
     return release_io_description(files, &description, status);
 }
@@ -1793,7 +1800,7 @@ enum kernel_files_status kernel_files_writev(
             iov == local ? 0 : (void **)&iov, mm, iov, iovcnt,
             total, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, iov, iovcnt, total,
-                           0, 0U, linux_result, 0U);
+                           0, 0U, linux_result, 0U,NULL);
 out:
     if (iov && iov != local &&
         kernel_files_release_allocation(files, iov) ==
@@ -1808,15 +1815,20 @@ out:
 
 static enum kernel_files_status lseek_pinned(
     struct kernel_open_file_description *description, int64_t offset,
-    uint64_t whence, int64_t *linux_result)
+    uint64_t whence, int64_t *linux_result,const struct kernel_lock_guard *borrowed)
 {
     if (regular_remote(description)) {
-        struct regular_call call={.description=description,.offset=offset,.whence=whence,.result=linux_result};
+        if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
+        KERNEL_LOCK_SCOPE(guard);
+        kernel_mutex_lock(&description->offset_lock,&guard);
+        struct regular_call call={.description=description,.offset=offset,.whence=whence,.result=linux_result,
+            .offset_borrow=&guard};
         return regular_dispatch(&call,seek_cpu0);
     }
     int64_t current, target;
     KERNEL_LOCK_SCOPE(offset_guard);
-    kernel_mutex_lock(&description->offset_lock, &offset_guard);
+    if (!regular_borrows_offset(description,borrowed))
+        kernel_mutex_lock(&description->offset_lock, &offset_guard);
     if ((description->device && !description->device->positioned) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
@@ -1891,7 +1903,7 @@ static enum kernel_files_status lseek_pinned(
 static void seek_cpu0(void *argument)
 {
     struct regular_call *call=argument;
-    call->status=lseek_pinned(call->description,call->offset,call->whence,call->result);
+    call->status=lseek_pinned(call->description,call->offset,call->whence,call->result,call->offset_borrow);
 }
 enum kernel_files_status kernel_files_lseek(
     struct kernel_files *files, int64_t fd, int64_t offset,
@@ -1906,7 +1918,7 @@ enum kernel_files_status kernel_files_lseek(
         *linux_result = -KERNEL_EINVAL;
         return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
     }
-    status = lseek_pinned(description, offset, whence, linux_result);
+    status = lseek_pinned(description, offset, whence, linux_result,NULL);
     return release_io_description(files, &description, status);
 }
 
