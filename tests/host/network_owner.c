@@ -15,6 +15,7 @@ void kernel_cost_add(enum kernel_cost_metric metric,uint64_t value)
 { if (metric==COST_NETWORK_SERVICE_CALLS) protocol_services+=(unsigned)value; }
 static size_t user_remaining = SIZE_MAX;
 static struct kernel_socket *close_during_copy;
+static struct kernel_socket *shutdown_during_copy;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
@@ -79,6 +80,10 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,u
 {
     (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
     memcpy(out,(void *)(uintptr_t)in,*copied);
+    if (shutdown_during_copy) {
+        struct kernel_socket *peer=shutdown_during_copy;shutdown_during_copy=0;
+        CHECK(!kernel_socket_shutdown(peer,1));
+    }
     if (close_during_copy) {
         struct kernel_socket *peer=close_during_copy;close_during_copy=0;
         kernel_socket_destroy(peer);
@@ -208,8 +213,10 @@ static void unix_final_payload(void)
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,5},{(uintptr_t)second,4}};
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
     unsigned before=heap_allocations;
+    shutdown_during_copy=receiver;
     CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==9);
-    CHECK(owner==(void *)sender && heap_allocations==before+1 && receiver->rx_bytes==9);
+    CHECK(!shutdown_during_copy && sender->peer_closed && !receiver->read_closed &&
+        owner==(void *)sender && heap_allocations==before+1 && receiver->rx_bytes==9);
     CHECK(!memcmp(receiver->packets_head->data,"alphabeta",9) && !sender->tx_reserved);
     uint64_t charged=sender->unix_memory;
     cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};user_remaining=6;
@@ -221,7 +228,7 @@ static void unix_final_payload(void)
     CHECK(!close_during_copy && owner==(void *)sender && heap_live==1 &&
         !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets && sender->pending_error==-KERNEL_ECONNRESET);
     kernel_socket_destroy(sender);
-    puts("PASS UNIX final queue payload: one allocation, gather fill, fault prefix and peer-close reservation rollback");
+    puts("PASS UNIX final queue payload: half-close before/during send, gather fill, fault prefix and peer-close reservation rollback");
 }
 
 static void receive_payload(void)

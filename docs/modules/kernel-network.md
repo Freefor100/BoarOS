@@ -146,7 +146,9 @@ recvmsg 不生成未请求的控制消息；非空 ancillary 发送明确不支�
 
 SHUT_RD 保留已排队内容，空队列返回 EOF；SHUT_WR 让已接受 TCP 内容先发送，
 FIN 在其后，读方向仍能接收反向响应。dup/fork 共享方向状态。UNIX 的对端关闭
-接收方向使发送 EPIPE/SIGPIPE，NOSIGNAL 只抑制该调用的信号。FIN、reset 和本地
+发送方向只产生接收 EOF，不阻止向它回复；预留容量前和复制完成后都按本地发送
+方向、对端接收方向及对端存活判断能否发送。对端关闭接收方向使发送 EPIPE/SIGPIPE，
+NOSIGNAL 只抑制该调用的信号。FIN、reset 和本地
 关闭分开决定 IN/OUT/HUP/RDHUP。SYN 拒绝是 ECONNREFUSED，建立后 reset 是
 ECONNRESET；SO_ERROR 或读/写消费 pending error，后续 EOF/EPIPE 由真实协议
 终止状态决定，不能永久重复历史错误。

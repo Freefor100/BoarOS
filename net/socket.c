@@ -1392,7 +1392,7 @@ static int unix_reserve_packet(struct kernel_socket_write_request *request,uint3
     int result=0;
     for(;;) {
         struct kernel_socket *sender=request->socket,*peer=sender->peer;
-        if(!peer || sender->peer_closed || sender->write_closed || peer->read_closed) {result=unix_peer_failure(sender);break;}
+        if(!peer || sender->write_closed || peer->read_closed) {result=unix_peer_failure(sender);break;}
         if(sender->unix_memory+sender->tx_reserved<sender->tx_limit) {
             request->reserved=unix_charge(count);
             if(sender->tx_reserved>UINT32_MAX-request->reserved)__builtin_trap();
@@ -1506,7 +1506,7 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
     }
     uintptr_t saved=arch_interrupt_save();
     struct kernel_socket *peer=request.socket->peer;
-    if(!peer || request.socket->peer_closed || request.socket->write_closed || peer->read_closed) {
+    if(!peer || request.socket->write_closed || peer->read_closed) {
         result=unix_peer_failure(request.socket);
     } else {
         uint32_t charge=request.reserved;
