@@ -122,16 +122,6 @@ enum physical_page_status __wrap_physical_page_allocate(
     return __real_physical_page_allocate(allocator, out);
 }
 
-static int fail_fifo_backing;
-enum physical_page_status __real_physical_page_allocate_order(
-    struct physical_page_allocator *, uint32_t, uint64_t *);
-enum physical_page_status __wrap_physical_page_allocate_order(
-    struct physical_page_allocator *allocator, uint32_t order, uint64_t *out)
-{
-    if (fail_fifo_backing) { fail_fifo_backing = 0; return PHYSICAL_PAGE_STATUS_EMPTY; }
-    return __real_physical_page_allocate_order(allocator, order, out);
-}
-
 static unsigned fail_metadata_allocation;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(
     struct kernel_heap *, size_t, size_t, void **);
@@ -2601,19 +2591,28 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
             &file, &result) != KERNEL_OPEN_FILE_STATUS_OK || result)
         fail_files(601U, 0, result);
     struct kernel_vfs_node *node = file->file.private_data;
-    for (unsigned failure = 0; failure < 2; failure++) {
-        struct kernel_pipe *pipe = 0;
-        uint8_t endpoint; uint64_t observed;
-        if (failure) fail_fifo_backing = 1;
-        else fail_metadata_allocation = 1;
-        result = kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed);
-        fail_metadata_allocation = 0; fail_fifo_backing = 0;
-        if (result != -KERNEL_ENOMEM || pipe || node->fifo_pipe)
-            fail_files(602U, -KERNEL_ENOMEM, result);
-        if (kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed) ||
-            kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe)
-            fail_files(603U, 0, -1);
-    }
+    struct kernel_pipe *pipe = 0;
+    uint8_t endpoint; uint64_t observed;
+    fail_metadata_allocation = 1;
+    result = kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed);
+    unsigned pending = fail_metadata_allocation; fail_metadata_allocation = 0;
+    if (result != -KERNEL_ENOMEM || pending || pipe || node->fifo_pipe)
+        fail_files(602U, -KERNEL_ENOMEM, result);
+    if (kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed))
+        fail_files(603U, 0, -1);
+    /* FIFO打开只分配元数据，数据页在第一次写入时按需取得。 */
+    uint64_t available = physical_page_available(heap->page_allocator);
+    struct kernel_pipe_result written = {0};
+    fail_physical_allocation = 1;
+    enum kernel_pipe_status status = kernel_pipe_write_buffer(pipe,"x",1,2U|KERNEL_PIPE_NONBLOCK,&written);
+    pending = fail_physical_allocation; fail_physical_allocation = 0;
+    if (status || written.bytes != -KERNEL_ENOMEM || pending || pipe->bytes || pipe->slots ||
+        node->fifo_pipe != pipe || physical_page_available(heap->page_allocator) != available)
+        fail_files(605U, -KERNEL_ENOMEM, written.bytes);
+    if (kernel_pipe_write_buffer(pipe,"x",1,2U|KERNEL_PIPE_NONBLOCK,&written) || written.bytes != 1 ||
+        kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe ||
+        physical_page_available(heap->page_allocator) != available)
+        fail_files(603U, 0, -1);
     if (kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK ||
         kernel_vfs_path_release(&root) || kernel_vfs_unmount(mount))
         fail_files(604U, 0, -1);
