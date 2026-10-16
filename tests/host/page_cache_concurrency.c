@@ -375,6 +375,7 @@ static int rearm_alias(void *owner, uint64_t address)
 static int cycle_rearm_foreground(void *owner,uint64_t address)
 {
     (void)owner;(void)address;
+    assert(!kernel_io_context_current()->background_reclaim);
     __atomic_store_n(&cycle_fg_entered,1,__ATOMIC_RELEASE);
     while(!__atomic_load_n(&cycle_fg_resume,__ATOMIC_ACQUIRE))sched_yield();
     return 0;
@@ -855,6 +856,12 @@ static void version_empty_cycle(struct kernel_page_cache *cache,struct kernel_vf
     while(mm_test_parked(0)==parked)sched_yield();
     struct retained_version held[COUNT-1];memset(held,0,sizeof(held));
     for(unsigned i=0;i<COUNT-1;i++)retain_generation(file,0x20+i,&held[i]);
+    /* 先结束继承的强制回写轮次；否则它能在alias装好前写净下面的目标页，
+     * 前台不再进入暂停回调，控制线程却会永久等那个从未发生的事件。 */
+    struct kernel_page_cache_concurrency_state drained;
+    kernel_page_cache_get_concurrency_state(cache,&drained);
+    assert(!kernel_page_cache_request_writeback(cache));
+    wait_writeback_round(cache,drained.writeback_rounds);
     unsigned char byte=0xa1;size_t done,valid;uint64_t address;
     assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
     byte=0xa2;assert(!kernel_vfs_pwrite(file,BOAROS_PAGE_SIZE+17,&byte,1,&done) && done==1);
