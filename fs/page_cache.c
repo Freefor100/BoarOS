@@ -205,6 +205,7 @@ static void cache_guard_begin(struct kernel_page_cache *cache, struct cache_guar
 
 struct read_workspace {
     struct file_read_workspace backend;
+    struct kernel_page_cache_entry *entries[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct kernel_page_cache_entry *loads[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct file_read_span spans[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct kernel_page_cache_read_page *outputs[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
@@ -1936,21 +1937,12 @@ enum kernel_page_cache_status kernel_page_cache_get(
 /* 不内联装入器，避免热命中也预留整批装入工作区。 */
 static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache *cache,const struct kernel_vfs_file *file,
     uint64_t first,struct kernel_page_cache_read_page *pages,size_t count,
-    struct kernel_page_cache_entry **entries,int need_capacity)
+    struct kernel_page_cache_entry **entries,int need_capacity,struct read_workspace *workspace)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
-    union foreground_workspace *lease=count>1?foreground_workspace_take(cache):NULL;
-    struct read_workspace *workspace=lease?&lease->read:NULL;
     struct kernel_page_cache_entry *single_load;
     struct file_read_span single_span;
     struct kernel_page_cache_read_page *single_output;
-    if (count>1 && !workspace) {
-        for (size_t i=0;i<count;i++) {
-            if (entries[i]) pages[i].status=finish_read_page(cache,entries[i],&pages[i].physical_address,&pages[i].valid_bytes);
-            else if (pages[i].status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) pages[i].status=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-        }
-        return;
-    }
     struct kernel_page_cache_entry **loads=workspace?workspace->loads:&single_load;
     struct file_read_span *spans=workspace?workspace->spans:&single_span;
     struct kernel_page_cache_read_page **outputs=workspace?workspace->outputs:&single_output;
@@ -2013,7 +2005,6 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     }
     /* 自有加载全部完成后才等待其他producer，反向重叠批次不互等。 */
     (void)load_read_pages(cache,node,loads,spans,ready,outputs,workspace?&workspace->backend:NULL);
-    if (lease) foreground_workspace_put(cache,lease);
     for (size_t i=0;i<count;i++) if (entries[i])
         pages[i].status=finish_read_page(cache,entries[i],&pages[i].physical_address,&pages[i].valid_bytes);
 }
@@ -2070,14 +2061,24 @@ static int read_cached_batch(struct cache_read_batch_request *request,int remote
     }
     return pending || retry;
 }
-static void read_batch_on_cpu0(void *argument)
+static void __attribute__((noinline)) read_batch_on_cpu0(void *argument)
 {
     struct cache_read_batch_request *request = argument;
     struct kernel_page_cache *cache = request->cache;
     struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
-    struct kernel_page_cache_entry *entries[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     KERNEL_LOCK_SCOPE(inode);
     kernel_vfs_node_lock(node, &inode, 0);
+    union foreground_workspace *lease=request->count>1?foreground_workspace_take(cache):NULL;
+    if (request->count>1 && !lease) {
+        for (size_t i=0;i<request->count;i++)
+            if (request->pages[i].status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND)
+                request->pages[i].status=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+        return;
+    }
+    /* 单页fault只保留一个entry；多页的借用表和装入器共用已有工作区。
+     * 热命中在调用本函数前返回，不为慢路数组预留栈空间。 */
+    struct kernel_page_cache_entry *single_entry;
+    struct kernel_page_cache_entry **entries=lease?lease->read.entries:&single_entry;
     uint64_t size = kernel_vfs_node_size(node);
     size_t missing=0;
     int pending = 0,need_capacity=0;
@@ -2112,7 +2113,9 @@ static void read_batch_on_cpu0(void *argument)
         struct kernel_page_cache_record *r=cache->record;
         need_capacity=missing>r->capacity-r->capacity/4-r->occupied-r->tombstones;
     }
-    if (pending) read_batch_local(cache,request->file,request->first,request->pages,request->count,entries,need_capacity);
+    if (pending) read_batch_local(cache,request->file,request->first,request->pages,request->count,entries,need_capacity,
+        lease?&lease->read:NULL);
+    if (lease) foreground_workspace_put(cache,lease);
 }
 
 enum kernel_page_cache_status kernel_page_cache_get_batch(
