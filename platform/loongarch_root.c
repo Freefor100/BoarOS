@@ -76,6 +76,26 @@ static int start_network(struct physical_page_allocator *allocator,struct pci_ho
 /* 文件、映像和 mount 仍是 I/O owner 时保留原字段，下一次只重试未完成项。 */
 static int release_root(void)
 {
+    if((root.files.state==KERNEL_FILES_LIVE || root.files.state==KERNEL_FILES_CLEANUP) &&
+       kernel_files_release(&root.files)!=KERNEL_FILES_STATUS_OK) return -KERNEL_EIO;
+    if((root.fs.state==KERNEL_FS_CONTEXT_LIVE || root.fs.state==KERNEL_FS_CONTEXT_CLEANUP) &&
+       kernel_fs_context_release(&root.fs)!=KERNEL_FS_CONTEXT_STATUS_OK) return -KERNEL_EIO;
+    if((root.image.mm.state==KERNEL_MM_LIVE || root.image.mm.state==KERNEL_MM_CLEANUP) &&
+       kernel_exec_image_cleanup(&root.heap,&root.image)!=KERNEL_EXEC_IMAGE_STATUS_OK) return -KERNEL_EIO;
+    if(root.interpreter_source && kernel_elf64_source_release(&root.interpreter_source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
+    if(root.interpreter_file && kernel_open_file_release(&root.interpreter_file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
+    if(root.source && kernel_elf64_source_release(&root.source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
+    if(root.file && kernel_open_file_release(&root.file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
+    if(root.uart) {
+        int stopped=ns16550_stop_report(&root.uart,&root.uart_statistics);
+        if(stopped)return stopped;
+        la_virt_puts("LA UART final irq=");la_virt_hex(root.uart_statistics.interrupts);
+        la_virt_puts(" rx=");la_virt_hex(root.uart_statistics.received);
+        la_virt_puts(" tx=");la_virt_hex(root.uart_statistics.transmitted);
+        la_virt_puts(" overruns=");la_virt_hex(root.uart_statistics.overruns);
+        la_virt_puts(" console-dropped=");la_virt_hex(root.uart_statistics.console_dropped);la_virt_puts("\n");
+    }
+    /* TTY已排空并停止，设备统计不会插进用户最后一次write。 */
     int had_network=root.network!=0;
     int network_error=kernel_network_stop(&root.network);
     if(network_error)return network_error;
@@ -98,25 +118,6 @@ static int release_root(void)
         la_virt_puts(" rng-errors=");la_virt_hex(root.rng.device.errors);
         la_virt_puts(" rng-timeouts=");la_virt_hex(root.rng.device.timeouts);
         la_virt_puts(" block-irqs=");la_virt_hex(block_irqs);la_virt_puts("\n");
-    }
-    if((root.files.state==KERNEL_FILES_LIVE || root.files.state==KERNEL_FILES_CLEANUP) &&
-       kernel_files_release(&root.files)!=KERNEL_FILES_STATUS_OK) return -KERNEL_EIO;
-    if((root.fs.state==KERNEL_FS_CONTEXT_LIVE || root.fs.state==KERNEL_FS_CONTEXT_CLEANUP) &&
-       kernel_fs_context_release(&root.fs)!=KERNEL_FS_CONTEXT_STATUS_OK) return -KERNEL_EIO;
-    if((root.image.mm.state==KERNEL_MM_LIVE || root.image.mm.state==KERNEL_MM_CLEANUP) &&
-       kernel_exec_image_cleanup(&root.heap,&root.image)!=KERNEL_EXEC_IMAGE_STATUS_OK) return -KERNEL_EIO;
-    if(root.interpreter_source && kernel_elf64_source_release(&root.interpreter_source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
-    if(root.interpreter_file && kernel_open_file_release(&root.interpreter_file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
-    if(root.source && kernel_elf64_source_release(&root.source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
-    if(root.file && kernel_open_file_release(&root.file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
-    if(root.uart) {
-        int stopped=ns16550_stop_report(&root.uart,&root.uart_statistics);
-        if(stopped)return stopped;
-        la_virt_puts("LA UART final irq=");la_virt_hex(root.uart_statistics.interrupts);
-        la_virt_puts(" rx=");la_virt_hex(root.uart_statistics.received);
-        la_virt_puts(" tx=");la_virt_hex(root.uart_statistics.transmitted);
-        la_virt_puts(" overruns=");la_virt_hex(root.uart_statistics.overruns);
-        la_virt_puts(" console-dropped=");la_virt_hex(root.uart_statistics.console_dropped);la_virt_puts("\n");
     }
     kernel_page_cache_stop_worker(&root.cache);
     int error=kernel_vfs_disk_cleanup_pending();

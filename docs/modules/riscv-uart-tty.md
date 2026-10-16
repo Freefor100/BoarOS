@@ -6,7 +6,7 @@
 
 root 的 heap 分配 port；port 保存 借用的 MMIO mapping、复制的 IRQ 回调和登记、joinable worker、1024 个字符/状态 RX 项和 1024 字节内核控制台队列。port 创建 TTY 后发布串口实例，标准 OFD 才能绑定它。`riscv_root_boot_start_with_irq` 是生产入口；原 `riscv_root_boot_start` 保留模块启动的早期 console。生产路径由 `kernel/main.c` 把固定早期 sink 与 DTB UART 的相交页合并后只映射一次，避免重复 PTE 冲突，然后初始化 PLIC，然后调用带 IRQ 的入口。
 
-worker 使用调度器架构标准栈（RV 8 KiB、LA 32 KiB）和任务存储。root baseline 在创建 port/worker 前采集，正常 finish 必须先回收用户任务及其 OFD/session 引用，再 drain、停止和 join UART worker、注销 IRQ、销毁 TTY、释放 port，最后检查 heap 与物理页。启动失败路径先释放准备期 OFD，再停止 UART；没有遗失的 port 指针。TTY 销毁仍被真实引用阻塞或硬件 drain 超时会保留 port，下一次 stop 可继续进展；合法 allocator 释放失败直接 fatal，不转换成清理重试。
+worker 使用调度器架构标准栈（RV 8 KiB、LA 32 KiB）和任务存储。root baseline 在创建 port/worker 前采集，正常 finish 必须先回收用户任务及其 OFD/session 引用，再 drain、停止和 join UART worker、注销 IRQ、销毁 TTY、释放 port。设备收尾统计在 UART 排空并停止后才打印，避免独立的 console 队列插进尚未发完的用户记录；最后检查 heap 与物理页。启动失败路径先释放准备期 OFD，再停止 UART；没有遗失的 port 指针。TTY 销毁仍被真实引用阻塞或硬件 drain 超时会保留 port，下一次 stop 可继续进展；合法 allocator 释放失败直接 fatal，不转换成清理重试。
 
 ## IRQ、worker 与线路
 
@@ -42,7 +42,7 @@ make test-uart-host
 make build/riscv/arch/riscv/uart_tty.o
 ```
 
-宿主 fixture 使用生产传输实现与真实 IIR/LSR/IER 行为模型，TTY 边界只模拟回调；保护 IRQ 预算、满环/恢复和索引回绕、LSR 错误位、控制台 overflow、部分发送、发送 credit IRQ、TEMT 期限、modem/configure、四类启动失败与 unregister，以及关闭超时 owner 保留/恢复。新增fixture链接实际 `fs/tty.c`，分别保护TEMT忙时IRQ/worker启动失败的rollback、第一空worker期限/真实drain唤醒和正常stop超时保留/恢复；准备状态的公开入口不可接受TX，模型同时检查IRQ临界区。ASAN/UBSAN 验证 owner 清理。DTB fixture 另验证地址/clock/route/layout 与失败保持输出。真实 U-mode 和整合回归由集成 owner 验证，宿主 fixture 或 object 编译不等于真实 TTY ABI 已通过。
+宿主 fixture 使用生产传输实现与真实 IIR/LSR/IER 行为模型，TTY 边界只模拟回调；保护 IRQ 预算、满环/恢复和索引回绕、LSR 错误位、控制台 overflow、部分发送、发送 credit IRQ、TEMT 期限、modem/configure、四类启动失败与 unregister，以及关闭超时 owner 保留/恢复。新增fixture链接实际 `fs/tty.c`，分别保护TEMT忙时IRQ/worker启动失败的rollback、第一空worker期限/真实drain唤醒和正常stop超时保留/恢复；准备状态的公开入口不可接受TX，模型同时检查IRQ临界区。ASAN/UBSAN 验证 owner 清理。DTB fixture 另验证地址/clock/route/layout 与失败保持输出。双核组合测试在 PID1 退出后向真实 TTY 留下超过单轮发送预算的尾部，直到 stop 才允许 worker 发送；检查完整尾部先于设备收尾统计，解析器继续拒绝损坏的用户记录。真实 U-mode 和整合回归由集成 owner 验证，宿主 fixture 或 object 编译不等于真实 TTY ABI 已通过。
 
 固定资料：`references/qemu/hw/riscv/virt.c` 与 `hw/char/serial.c`，QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`；`references/linux/drivers/tty/serial/8250/8250_port.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。本实现没有复制外部代码。本传输范围不包含 modem 输入查询、硬件流控、多串口、DMA 或实板验证；
 PTY 使用独立软件 transport，见[TTY 模块](kernel-tty.md)。

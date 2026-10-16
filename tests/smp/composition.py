@@ -31,6 +31,13 @@ def validate_functional(text,sqlite=False):
         raise RuntimeError('incomplete or failed composition stream')
     return list(expected)
 
+def validate_shutdown_output(text):
+    tail='COMPOSITION shutdown-tail '+'x'*358
+    rows=list(re.finditer(r'(?m)^'+re.escape(tail)+r'\r?$',text))
+    final=text.find(' root-heap-peak-pages=')
+    if len(rows)!=1 or final<rows[0].end():
+        raise RuntimeError('queued TTY tail overlapped shutdown diagnostics')
+
 def validate_fault_race(text):
     rows=re.findall(r'COMPOSITION fault-race arrivals=(0x[0-9a-f]+) stale=(0x[0-9a-f]+) resolved=(0x[0-9a-f]+)',text)
     if len(rows)!=1 or tuple(int(value,16) for value in rows[0])!=(2,1,2):
@@ -157,7 +164,9 @@ def main():
                             text,run,log=boot_user(args.qemu,args.firmware,kernel,disk,memory,cpus,phase_dir,target=='linux','/composition-supervisor')
                             validate_execution(text,cpus,target!='linux',require_parallel=True)
                             validate_functional(text,scene!='mm')
-                            if target!='linux':validate_boot_output(text)
+                            if target!='linux':
+                                validate_boot_output(text)
+                                validate_shutdown_output(text)
                             if target!='linux' and scene=='mm':
                                 validate_fault_race(text)
                                 validate_file_fault_race(text)

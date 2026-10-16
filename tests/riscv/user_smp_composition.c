@@ -16,6 +16,7 @@
 #include "../../mm/uaccess_internal.h"
 #include <string.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/char_device_internal.h"
 #include "../smp/composition_protocol.h"
 
 struct held_page { uint64_t address; uint32_t order; };
@@ -35,6 +36,7 @@ static unsigned fault_race_armed;
 static unsigned fault_race_file;
 static unsigned stopping;
 static unsigned boot_banner_waiting, boot_user_output;
+static unsigned shutdown_tail_held;
 static uint64_t read_tid,read_address,read_size,read_flags,read_hart;
 static uint64_t read_copies[2],read_moves,read_phases,read_local_phases,read_service_phases;
 static uint64_t read_close_phases,read_seek_phases,read_fork_phases,read_total_copies[2],read_total_moves;
@@ -56,9 +58,16 @@ static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
 {
+    if (shutdown_tail_held) return 0;
     size_t accepted=__real_kernel_tty_service_output(tty,budget);
     if (boot_banner_waiting && accepted) boot_user_output=1;
     return accepted;
+}
+int __real_ns16550_stop_report(struct ns16550_port **,struct ns16550_statistics *);
+int __wrap_ns16550_stop_report(struct ns16550_port **port,struct ns16550_statistics *statistics)
+{
+    shutdown_tail_held=0;
+    return __real_ns16550_stop_report(port,statistics);
 }
 void __real_virt_uart_puts(const char *);
 void __wrap_virt_uart_puts(const char *text)
@@ -283,6 +292,23 @@ void riscv_user_composition_finish(void)
     stopping=1;kernel_thread_join(&controller);
     check(!control && !ledger && !ledger_count && held==released && !failed_tid && !watched_tid &&
           !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm);
+    /* 留下超过worker单轮预算的真实TTY尾部，直到stop才允许发送。 */
+    uintptr_t irq=arch_interrupt_save();
+    const struct kernel_char_device *device=kernel_tty_device_lookup(0x440);
+    void *instance=0;
+    check(device && !device->open(&root->heap,kernel_task_current(),
+          KERNEL_FILES_O_NONBLOCK|0400U,0,&instance));
+    char tail[385];
+    const char prefix[]="COMPOSITION shutdown-tail ";
+    memcpy(tail,prefix,sizeof(prefix)-1);
+    memset(tail+sizeof(prefix)-1,'x',sizeof(tail)-sizeof(prefix));
+    tail[sizeof(tail)-1]='\n';
+    shutdown_tail_held=1;
+    size_t written=0;
+    check(!device->write(instance,kernel_task_current(),KERNEL_FILES_O_NONBLOCK,
+                        tail,sizeof(tail),&written) && written==sizeof(tail));
+    device->release(instance);
+    arch_interrupt_restore(irq);
 }
 void riscv_user_composition_report(void)
 {

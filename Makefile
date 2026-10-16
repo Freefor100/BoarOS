@@ -426,6 +426,7 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
+LDFLAGS += -Wl,--wrap=ns16550_stop_report
 LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_get_page,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_try_pin_user_page,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_scheduler_enter_user_service_borrowing,--wrap=kernel_mm_fork
 endif
 ifeq ($(SMP_TEST),1)

@@ -18,6 +18,15 @@ class CompositionReports(unittest.TestCase):
                      banner.replace(' tick-hz',user+' tick-hz')):
             with self.subTest(text=text),self.assertRaises(RuntimeError):
                 module.validate_boot_output(text)
+    def test_shutdown_drains_the_entire_user_tail_before_diagnostics(self):
+        module=self.checker()
+        tail='COMPOSITION shutdown-tail '+'x'*358+'\n'
+        final=' root-heap-peak-pages=131\n'
+        module.validate_shutdown_output(tail+final)
+        for text in (final,tail,tail+tail+final,final+tail,
+                     tail[:128]+final+tail[128:]):
+            with self.subTest(text=text),self.assertRaises(RuntimeError):
+                module.validate_shutdown_output(text)
     def test_controlled_owner_evidence_is_not_a_functional_marker(self):
         module=self.checker()
         good=('BoarOS: COMPOSITION owners held=0x100 released=0x100 reclaimed=0x2 '
