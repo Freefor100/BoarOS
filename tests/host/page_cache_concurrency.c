@@ -11,6 +11,7 @@
 #include "../../fs/vfs_objects.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -132,6 +133,18 @@ static unsigned reject_background_allocations,rejected_background_allocations;
 static unsigned version_cycle_active,version_cycle_submissions;
 static unsigned cycle_fg_entered,cycle_fg_resume,cycle_alloc_entered,cycle_alloc_resume,cycle_pause_allocation;
 static unsigned cycle_background_waiting;
+static _Thread_local int hold_ordinary_wait;
+static unsigned ordinary_wait_entered,ordinary_wait_resume;
+enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_token *,enum kernel_wait_wake_reason *);
+enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,
+    enum kernel_wait_wake_reason *reason)
+{
+    if (hold_ordinary_wait) {
+        __atomic_store_n(&ordinary_wait_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&ordinary_wait_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return __real_kernel_wait_park(token,reason);
+}
 enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
@@ -1892,6 +1905,58 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     printf("PASS %u-thread real ext4 cold read: CPU0 producer, one page/read, warm hit no allocation\n", actors);
 }
 
+static void *ordinary_writeback_waiter(void *argument)
+{
+    mm_test_attach(0);hold_ordinary_wait=1;
+    assert(!kernel_page_cache_writeback(current_cache,kernel_vfs_file_node(argument)));
+    hold_ordinary_wait=0;return NULL;
+}
+static void ordinary_reclaim_borrow(struct kernel_heap *heap,struct physical_page_allocator *pages,const char *path)
+{
+    struct kernel_page_cache cache={0};
+    assert(!kernel_page_cache_init(&cache,heap,pages));
+    current_cache=&cache;
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);
+    struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    assert(!kernel_vfs_create(&mount,"/ordinary-borrow",0600,&file));
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x69,sizeof(bytes));size_t done;
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    pause_write=1;write_entered=resume_write=0;
+    ordinary_wait_entered=ordinary_wait_resume=0;
+    assert(!kernel_page_cache_start_worker(&cache));
+    uint64_t *held=malloc(physical_page_total(pages)*sizeof(*held));assert(held);size_t count=0;
+    while (physical_page_available(pages)>physical_page_total(pages)/100)
+        assert(!physical_page_allocate(pages,&held[count++]));
+    wait_progress(&write_entered,1);
+    pthread_t waiter;assert(!pthread_create(&waiter,NULL,ordinary_writeback_waiter,&file));
+    wait_progress(&ordinary_wait_entered,1);
+    struct kernel_page_cache_concurrency_state before,after;
+    struct kernel_page_cache_statistics stats_before,stats_after;
+    kernel_page_cache_get_concurrency_state(&cache,&before);
+    kernel_page_cache_get_statistics(&cache,&stats_before);
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+    wait_writeback_round(&cache,before.writeback_rounds);
+    kernel_page_cache_get_concurrency_state(&cache,&after);
+    kernel_page_cache_get_statistics(&cache,&stats_after);
+    assert(stats_after.worker_written>stats_before.worker_written && after.entry_borrows &&
+        after.index_live==before.index_live && !kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count);
+    /* 等待者仍借用元数据；物理引用数恢复为1不代表可以退休缓存项。 */
+    __atomic_store_n(&ordinary_wait_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(waiter,NULL));
+    kernel_page_cache_stop_worker(&cache);
+    for(size_t i=0;i<count;i++)assert(!physical_page_release(pages,held[i]));
+    free(held);
+    unsigned char actual[BOAROS_PAGE_SIZE];
+    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS ordinary pressure writeback: parked foreground keeps entry alive after the last physical pin; contents and owners returned");
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
@@ -1927,6 +1992,7 @@ int main(int argc, char **argv)
     }
     execution_case(&cache);
     destroy_version_case(&cache);
+    if(argc==2)ordinary_reclaim_borrow(&heap,&pages,argv[1]);
     assert(!physical_page_allocator_audit(&pages));
     assert(physical_page_available(&pages) == baseline);
     struct kernel_heap_statistics backend_stats;

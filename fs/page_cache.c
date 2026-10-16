@@ -3051,14 +3051,18 @@ static void page_cache_worker(void *argument)
             size_t limit = r->capacity;
             for (size_t cursor = 0; cursor < limit && !r->stopping;) {
                 for (unsigned scanned = 0; cursor < limit && scanned < 64 && !r->stopping; scanned++) {
-                    if (cursor >= r->capacity) break;
-                    struct kernel_page_cache_entry *entry = r->buckets[cursor++];
-                    r->statistics.worker_scanned++;
-                    if (!entry || entry == PAGE_CACHE_TOMBSTONE || entry->loading || entry->users ||
-                        entry->writeback || entry->dirty_end || entry->aliases) continue;
-                    uint32_t references;
-                    if (physical_page_reference_count(cache->allocator,entry->physical_address,&references) || references != 1) continue;
-                    remove_entry(cache,entry); (void)drain_entries(cache,&released);
+                    {
+                        CACHE_SCOPE(metadata,cache);
+                        if (cursor >= r->capacity) break;
+                        struct kernel_page_cache_entry *entry = r->buckets[cursor++];
+                        r->statistics.worker_scanned++;
+                        if (!entry || entry == PAGE_CACHE_TOMBSTONE || entry->loading || entry->users ||
+                            entry->writeback || entry->dirty_end || entry->aliases) continue;
+                        uint32_t references;
+                        if (physical_page_reference_count(cache->allocator,entry->physical_address,&references) || references != 1) continue;
+                        remove_entry(cache,entry);
+                    }
+                    (void)drain_entries(cache,&released);
                     group_progress(r->group);
                 }
                 r->statistics.worker_batches++;
@@ -3066,29 +3070,36 @@ static void page_cache_worker(void *argument)
                 if (kernel_scheduler_yield_current()) __builtin_trap();
             }
         }
-        dirty_round_begin(r);
+        { CACHE_SCOPE(metadata,cache); dirty_round_begin(r); }
         while (!r->stopping && r->dirty_cursor && r->dirty_remaining &&
             (pressure ? physical_page_available(cache->allocator) < r->high : group_dirty(r->group) > r->dirty_low)) {
             struct kernel_page_cache_entry *batch[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
-            size_t count = dirty_batch(r,batch), used=0;
+            size_t count,used=0;
+            { CACHE_SCOPE(metadata,cache); count=dirty_batch(r,batch); }
             if (count) {
-                    KERNEL_LOCK_SCOPE(guard);
+                KERNEL_LOCK_SCOPE(guard);
                 if (kernel_vfs_node_try_read(batch[0]->node,&guard)) {
                     int result=writeback_run(cache,batch,count,UINT64_MAX,&used,r->writeback_workspace);
                     int removed=0;
-                    for (size_t i=0;i<count;i++) {
-                        struct kernel_page_cache_entry *entry=batch[i]; entry_return(entry);
-                        if (i>=used) continue;
-                        if (result) {
-                            r->statistics.worker_failed++;
-                            if (result!=-KERNEL_ENOMEM && result!=-KERNEL_EBUSY)
-                                kernel_vfs_record_writeback_error(entry->node,result);
-                        } else {
-                            r->statistics.worker_written++;
-                            uint32_t references;
-                            if (pressure && !entry->dirty_end && !entry->aliases &&
-                                !physical_page_reference_count(cache->allocator,entry->physical_address,&references) && references==1) {
-                                remove_entry(cache,entry); removed=1;
+                    {
+                        CACHE_SCOPE(metadata,cache);
+                        for (size_t i=0;i<count;i++) {
+                            struct kernel_page_cache_entry *entry=batch[i]; entry_return(entry);
+                            if (i>=used) continue;
+                            if (result) {
+                                r->statistics.worker_failed++;
+                                if (result!=-KERNEL_ENOMEM && result!=-KERNEL_EBUSY)
+                                    kernel_vfs_record_writeback_error(entry->node,result);
+                            } else {
+                                r->statistics.worker_written++;
+                                uint32_t references;
+                                /* I/O期间新等待者可借用entry而不pin物理页；归还本批
+                                 * 引用后仍须在索引保护内检查这些借用，才能退休。 */
+                                if (pressure && !entry->users && !entry->loading && !entry->writeback &&
+                                    !entry->dirty_end && !entry->aliases &&
+                                    !physical_page_reference_count(cache->allocator,entry->physical_address,&references) && references==1) {
+                                    remove_entry(cache,entry); removed=1;
+                                }
                             }
                         }
                     }
@@ -3096,7 +3107,10 @@ static void page_cache_worker(void *argument)
                         kernel_lock_release(&guard);
                         (void)drain_entries(cache,&released); group_progress(r->group);
                     }
-                } else for (size_t i=0;i<count;i++) entry_return(batch[i]);
+                } else {
+                    CACHE_SCOPE(metadata,cache);
+                    for (size_t i=0;i<count;i++) entry_return(batch[i]);
+                }
             }
             r->statistics.worker_batches++;
             if (kernel_scheduler_yield_current()) __builtin_trap();

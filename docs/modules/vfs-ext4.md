@@ -117,7 +117,7 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 缓存索引失效本身不撤销用户 PTE。向下截断另通过稳定 node–MM 登记通知相关地址空间，撤销越过新 EOF 的整页（含 private COW 与 PROT_NONE），并按驻留来源处理非对齐尾页；普通写直接修改共享缓存，不撤销 private COW 页面。VMA 保留，后续访问重新缺页并检查 live inode size。实现与单 hart 同步边界见本文末尾及[MM 模块](kernel-mm.md)。
 
-miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器的压力入口由多缓存共同 owner 注册，按实例轮转；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
+miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器的压力入口由多缓存共同 owner 注册，按实例轮转；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。物理引用数为 1 仍可能有等待回写的 entry 借用；后台完成 I/O 后，在缓存索引保护内归还本批借用，重新检查其他借用、loading、writeback、脏范围和映射，再决定退休。批量选择与干净页退休共用该保护，实际 I/O 和资源释放放在保护外。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join 页缓存 worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node；日志 worker 继续服务这些交接，排空到 checkpoint 后才停止并 join，之后允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
