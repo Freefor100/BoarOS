@@ -3,6 +3,7 @@
 #include <kernel/elf64_source.h>
 #include <kernel/errno.h>
 #include <kernel/file_mapping.h>
+#include <kernel/futex.h>
 #include <kernel/heap.h>
 #include <kernel/irq.h>
 #include <kernel/open_file.h>
@@ -4901,6 +4902,62 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
         if (status != KERNEL_MM_STATUS_CONFLICT || current_pins(mm)) return status;
         { KERNEL_RAW_SCOPE(guard, &operation.record->metadata); operation.record->fault_retries++; }
         /* loser归还全部私有候选，下一轮重取VMA/PTE，不把旧许可带过睡眠。 */
+    }
+}
+
+enum kernel_mm_status kernel_mm_acquire_futex_key(struct kernel_mm *mm,
+    uint64_t address, int shared, struct kernel_futex_key *key)
+{
+    if (!key || (address & 3U) || address >= ARCH_MMU_USER_LIMIT)
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    *key = (struct kernel_futex_key){0};
+    for (;;) {
+        MM_OPERATION(mm);
+        struct kernel_mm_record *record = operation.record;
+        if (!shared) {
+            key->identity = record->futex_id;
+            key->offset = address;
+            return KERNEL_MM_STATUS_OK;
+        }
+        struct kernel_vma vma;
+        if (!record->vmas || kernel_vma_set_lookup(record->vmas, address, &vma) !=
+                KERNEL_VMA_STATUS_OK)
+            return KERNEL_MM_STATUS_NOT_MAPPED;
+        struct kernel_mm_mapping mapping;
+        enum kernel_mm_status status;
+        { KERNEL_RAW_SCOPE(guard, &record->metadata);
+          status = lookup_record(record, address, &mapping); }
+        if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
+            /* 缺页可等待；回来后重新取得映射及其后备，不能沿用旧 VMA。 */
+            if (operation.guard.lock) mm_gate_release(record, &operation.guard);
+            status = kernel_mm_resolve_user_fault(mm, address, KERNEL_MM_READ);
+            if (status) return status;
+            continue;
+        }
+        if (status) return status;
+        /* Linux GUP 对已驻留的可访问叶取身份，不要求可读；WAIT 随后仍需
+         * 读取用户字。PROT_NONE 不能取得身份，冷页沿原缺页权限检查。 */
+        if (!(mapping.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
+            return KERNEL_MM_STATUS_ACCESS;
+        key->offset = vma.backing_offset + address - vma.start;
+        if (vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
+            struct kernel_vfs_node *node = kernel_open_file_node(vma.backing);
+            if (!node || kernel_vfs_node_acquire(node)) __builtin_trap();
+            key->kind = KERNEL_FUTEX_KEY_SHARED_FILE;
+            key->file_node = node;
+            key->identity = (uintptr_t)node;
+        } else if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
+                   vma.kind == KERNEL_VMA_KIND_SYSV_SHM) {
+            struct kernel_memory_object *object = vma.backing;
+            if (!object || kernel_memory_object_acquire(object)) __builtin_trap();
+            key->kind = KERNEL_FUTEX_KEY_SHARED_MEMORY;
+            key->shared_object = object;
+            key->identity = (uintptr_t)object;
+        } else {
+            key->identity = record->futex_id;
+            key->offset = address;
+        }
+        return KERNEL_MM_STATUS_OK;
     }
 }
 

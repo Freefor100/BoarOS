@@ -7,6 +7,7 @@
 #include <kernel/wait_internal.h>
 #include <arch/context.h>
 #include <kernel/files.h>
+#include <kernel/futex.h>
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
@@ -31,19 +32,6 @@
 
 struct kernel_exec_transaction;
 struct kernel_memory_object;
-
-enum kernel_futex_key_kind {
-    KERNEL_FUTEX_KEY_PRIVATE = 0,
-    KERNEL_FUTEX_KEY_SHARED_ANON,
-};
-
-/* A queued task owns shared_object until its wait call resumes. */
-struct kernel_futex_key {
-    uint64_t identity;
-    uint64_t offset;
-    struct kernel_memory_object *shared_object;
-    enum kernel_futex_key_kind kind;
-};
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,

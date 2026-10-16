@@ -13,6 +13,7 @@ struct kernel_elf64_source;
 struct kernel_io_context;
 struct kernel_mm_record;
 struct kernel_heap;
+struct kernel_futex_key;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
 #define KERNEL_MM_WRITE (UINT32_C(1) << 1U)
@@ -173,6 +174,10 @@ enum kernel_mm_status kernel_mm_vma_lookup(
 void kernel_mm_add_user(struct kernel_mm *mm);
 uint32_t kernel_mm_user_count(const struct kernel_mm *mm);
 uint32_t kernel_mm_remove_user(struct kernel_mm *mm);
+
+enum kernel_mm_status kernel_mm_acquire_futex_key(
+    struct kernel_mm *, uint64_t address, int shared,
+    struct kernel_futex_key *);
 
 /* Unique for the lifetime of the kernel, including after MM page reuse. */
 enum kernel_mm_status kernel_mm_futex_id(

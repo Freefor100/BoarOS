@@ -381,6 +381,15 @@ futex.shared-wake
 futex.shared-requeue
 futex.shared-bad-wake
 futex.shared-protected-wake
+futex.shared-exec-only-wake
+futex.file-alias
+futex.file-independent-open
+futex.file-hardlink-offset
+futex.file-killed
+futex.file-robust
+futex.file-owner-died
+futex.file-timeout
+futex.sysv-alias
 futex.bitset-zero-wait
 futex.bitset-zero-wake
 futex.bitset-mismatch

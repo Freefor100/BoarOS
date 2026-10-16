@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct kernel_vfs_node;
+
 #define KERNEL_VFS_S_IFMT UINT32_C(0170000)
 #define KERNEL_VFS_S_IFREG UINT32_C(0100000)
 #define KERNEL_VFS_S_IFDIR UINT32_C(0040000)
@@ -348,5 +350,9 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
 
 int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
                                 const struct kernel_vfs_file *right);
+
+/* 已持有 node 的调用者可取得独立引用，跨关闭或撤映射保持 inode 身份。 */
+int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
+int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
 #endif

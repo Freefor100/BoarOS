@@ -44,8 +44,6 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 /* Borrow with IRQs disabled; pin before restoring IRQs unless a live owner
  * already covers the target. Namespace locking alone does not exclude reclaim. */
 struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t inode);
-int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
-int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
 #define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX
 /* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX
