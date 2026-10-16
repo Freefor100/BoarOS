@@ -48,6 +48,7 @@ endif
 $(LA_BUILD)/kernel-block-la: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o -lgcc
 .PHONY: test-block-loongarch test-pci-host
+test-block-loongarch test-pci-reset-owner-loongarch: build/host/nbd-fault
 test-block-loongarch: $(LA_BUILD)/kernel-block-la prepare-la-tools
 	python3 -B tests/loongarch/block.py --qemu $(QEMU_LOONGARCH64)
 $(LA_BUILD)/kernel-pci-reset-owner: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o $(LA_BUILD)/tests/loongarch/pci_reset_owner.o arch/loongarch/linker.ld

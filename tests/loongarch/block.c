@@ -3,6 +3,7 @@
 #include <platform/loongarch_virt.h>
 #include <arch/task.h>
 #include <arch/timer.h>
+#include <arch/platform_io.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
 #include <string.h>
@@ -37,8 +38,17 @@ static void cpu_worker(void *argument)
     (void)argument;
     uint64_t mask_deadline=arch_time_read()+la_timer_frequency()*3;
     while(!io_masked) if((int64_t)(arch_time_read()-mask_deadline)>=0) la_virt_fatal("PCI mask owner progress");
-    uint64_t until=arch_time_read()+la_timer_frequency()/50;
-    while((int64_t)(arch_time_read()-until)<0) { }
+    while(!devices[0].device.statistics.sleeps) {
+        if(kernel_scheduler_yield_current()!=KERNEL_SCHEDULER_STATUS_OK ||
+           (int64_t)(arch_time_read()-mask_deadline)>=0) la_virt_fatal("PCI I/O did not park");
+    }
+    /* 已实际等待响应；释放DMA完成，同时继续屏蔽PCI并经历一次timer。 */
+    la_virt_puts("LA PCI IRQ release\n");
+    while(devices[0].device.queue.used->index==devices[0].device.queue.last_used)
+        if((int64_t)(arch_time_read()-mask_deadline)>=0) la_virt_fatal("PCI held response missing");
+    uint64_t tick=kernel_tick_count();
+    while(kernel_tick_count()==tick)
+        if((int64_t)(arch_time_read()-mask_deadline)>=0) la_virt_fatal("PCI masked timer progress");
     if(devices[0].device.statistics.interrupts!=masked_irqs[0] || devices[1].device.statistics.interrupts!=masked_irqs[1])
         la_virt_fatal("masked PCI interrupt dispatched on timer");
     uint64_t mask=4,enabled=4;
@@ -82,6 +92,11 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
     for(unsigned i=0;i<512;i++) buffer[i]=(i*13+7)%256;
     if(kernel_block_write_at(&devices[0].device.block,32768,buffer,512)!=KERNEL_BLOCK_STATUS_OK ||
         kernel_block_flush(&devices[0].device.block)!=KERNEL_BLOCK_STATUS_OK) la_virt_fatal("PCI write flush");
+    la_virt_puts("LA PCI IRQ hold\n");
+    uint64_t ready_deadline=arch_time_read()+la_timer_frequency()*5;
+    while(!arch_uart_rx_ready())
+        if((int64_t)(arch_time_read()-ready_deadline)>=0) la_virt_fatal("PCI response hold handshake");
+    if(arch_uart_getc()!='g') la_virt_fatal("PCI response hold acknowledgement");
     uint64_t prepared=physical_page_available(allocator);
     if(kernel_thread_create(io_worker,0)!=KERNEL_SCHEDULER_STATUS_OK ||
         kernel_thread_create(cpu_worker,0)!=KERNEL_SCHEDULER_STATUS_OK ||
@@ -100,9 +115,9 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
         if((int64_t)(arch_time_read()-deadline)>=0) la_virt_fatal("PCI task deadline");
         if(reaped<2) arch_cpu_wait();
     }
-    if(physical_page_available(allocator)!=prepared || !devices[0].device.statistics.interrupts ||
-        devices[0].device.statistics.max_inflight!=1)
-        la_virt_fatal("PCI IRQ and task owner");
+    if(physical_page_available(allocator)!=prepared) la_virt_fatal("PCI task page owner");
+    if(!devices[0].device.statistics.interrupts || !devices[0].device.statistics.sleeps ||
+        devices[0].device.statistics.max_inflight!=1) la_virt_fatal("PCI IRQ completion");
     for(unsigned i=2;i;i--) {
         if(kernel_block_unregister(&devices[i-1].device.block) ||
             virtio_pci_block_destroy(&devices[i-1])!=VIRTIO_BLOCK_DRIVER_STATUS_OK) la_virt_fatal("PCI device release");
