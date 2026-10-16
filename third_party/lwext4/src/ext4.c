@@ -1597,9 +1597,6 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 	if (mp->transaction_depth) return EBUSY;
 	if (!release_inode) {
 		/* 新建、同尺寸截断和普通扩展没有待回收映射，不创建清理事务。 */
-		if (!ext4_get32(&mp->fs.sb, last_orphan) &&
-		    !ext4_sb_feature_ro_com(&mp->fs.sb, EXT4_FRO_COM_ORPHAN_PRESENT))
-			return EOK;
 		bool present;
 		r = ext4_orphan_contains(&mp->fs, index, &present);
 		if (r != EOK || !present) return r;
@@ -1654,9 +1651,6 @@ static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 	if (fs->jbd_journal->error) return fs->jbd_journal->error;
 	if (mp->transaction_error) return mp->transaction_error;
 	if (fs->curr_trans && fs->curr_trans->error) return fs->curr_trans->error;
-	if (!ext4_get32(&fs->sb, last_orphan) &&
-	    !ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_ORPHAN_PRESENT))
-		return EOK;
 	r = ext4_orphan_contains(fs, file->inode, &present);
 	if (r != EOK || !present) goto Finish;
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
@@ -2417,8 +2411,8 @@ Put:
 	if (source.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&source));
 	if (new.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&new));
 	if (old.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&old));
-	/* Complete checksums on all modified inodes before orphan_add scans
-	 * other records that may refer to those same inode-table blocks. */
+	/* Release the modified references before orphan enrollment so its initial
+	 * index load sees completed inode checksums in the shared table blocks. */
 	if (r == EOK && output.replaced_last_link) {
 		r = ext4_fs_get_inode_ref(fs, victim_ino, &victim);
 		if (r == EOK) {

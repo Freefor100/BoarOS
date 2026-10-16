@@ -113,6 +113,8 @@ struct jbd_quarantine {
 	LIST_ENTRY(jbd_quarantine) node;
 };
 
+struct ext4_orphan_undo;
+
 struct jbd_trans {
 	uint32_t trans_id;
 
@@ -132,6 +134,7 @@ struct jbd_trans {
 	struct ext4_block_write *io_head;
 
 	struct jbd_journal *journal;
+	struct ext4_orphan_undo *orphan_undo;
 
 	TAILQ_HEAD(jbd_trans_buf, jbd_buf) buf_queue;
 	TAILQ_HEAD(jbd_trans_data, jbd_data) data_queue;

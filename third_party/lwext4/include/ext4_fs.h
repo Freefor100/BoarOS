@@ -53,6 +53,8 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 
+struct ext4_orphan_index;
+
 struct ext4_fs {
 	bool read_only;
 	bool super_replay_required;
@@ -69,6 +71,7 @@ struct ext4_fs {
 	struct jbd_fs *jbd_fs;
 	struct jbd_journal *jbd_journal;
 	struct jbd_trans *curr_trans;
+	struct ext4_orphan_index *orphan_index;
 };
 
 struct ext4_block_group_ref {

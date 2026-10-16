@@ -42,6 +42,7 @@
 #include <ext4_debug.h>
 
 #include <ext4_fs.h>
+#include <ext4_orphan.h>
 #include <ext4_super.h>
 #include <ext4_journal.h>
 #include <ext4_blockdev.h>
@@ -2601,6 +2602,7 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 		*count -= q->count;
 		jbd_free(q);
 	}
+	ext4_orphan_trans_finish(trans, abort);
 	jbd_image_free(trans->checkpoint_image);
 	jbd_free(trans);
 }
@@ -3023,6 +3025,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 	rc = jbd_write_prepared(trans, &commit_submitted);
 	if (rc != EOK)
 		goto Finish;
+	ext4_orphan_trans_finish(trans, false);
 	journal->committed_id = trans->trans_id;
 	journal->alloc_trans_id++;
 
@@ -3142,6 +3145,7 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 	unsigned credits = operation->reserved_logs + (running ? running->reserved_logs : 0);
 	uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
 	if (credits >= maxlen - journal->first) return ENOSPC;
+	ext4_orphan_trans_finish(operation, false);
 	/* Only this newly accepted operation owns undo images. Older accepted
 	 * records already discarded theirs; never rescan the accumulated group. */
 	struct jbd_buf *accepted;

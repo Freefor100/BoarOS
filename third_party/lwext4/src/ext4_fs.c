@@ -61,6 +61,7 @@
 #include <ext4_bitmap.h>
 #include <ext4_inode.h>
 #include <ext4_ialloc.h>
+#include <ext4_orphan.h>
 #include <ext4_extent.h>
 
 #include <string.h>
@@ -78,6 +79,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	fs->curr_trans = NULL;
 	fs->jbd_journal = NULL;
 	fs->jbd_fs = NULL;
+	fs->orphan_index = NULL;
 	fs->super_replay_required = false;
 	fs->journaled_session = false;
 
@@ -154,15 +156,17 @@ int ext4_fs_fini(struct ext4_fs *fs)
 	ext4_assert(fs);
 	if (fs->super_replay_required) return EUCLEAN;
 	/* Journal stop commits and checkpoints the final superblock itself. */
-	if (fs->journaled_session || fs->read_only) return EOK;
+	if (fs->journaled_session || fs->read_only) {
+		ext4_orphan_index_fini(fs);
+		return EOK;
+	}
 
 	/*Set superblock state*/
 	ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_VALID_FS);
 
-	if (!fs->read_only)
-		return ext4_sb_write(fs->bdev, &fs->sb);
-
-	return EOK;
+	int r = ext4_sb_write(fs->bdev, &fs->sb);
+	if (r == EOK) ext4_orphan_index_fini(fs);
+	return r;
 }
 
 static void ext4_fs_debug_features_inc(uint32_t features_incompatible)
