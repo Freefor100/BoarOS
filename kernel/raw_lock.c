@@ -13,6 +13,7 @@ void kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_gua
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!lock || !guard || guard->lock || lock->initialized != KERNEL_RAW_INITIALIZED ||
         cpu->preempt_depth == UINT32_MAX) __builtin_trap();
+#if BOAROS_LOCK_DEBUG
     for (struct kernel_raw_guard *held = cpu->raw_locks; held; held = held->previous)
         if (held->lock == lock) __builtin_trap();
     if (cpu->raw_locks) {
@@ -20,12 +21,14 @@ void kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_gua
         if (outer->rank > lock->rank ||
             (outer->rank == lock->rank && (uintptr_t)outer >= (uintptr_t)lock)) __builtin_trap();
     }
+#endif
     guard->interrupts = irq;
     guard->previous_depth = cpu->preempt_depth++;
 #if BOAROS_COST_DIAGNOSTICS
     guard->cost = kernel_cost_capture();
     uint64_t wait_start = guard->cost.epoch ? kernel_cost_clock() : 0;
 #endif
+#if BOAROS_MAX_CPUS > 1
     /* 争用时先轮询，避免每次重试都向共享cacheline发出写操作。 */
     uint32_t observed;
     do {
@@ -36,6 +39,11 @@ void kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_gua
         observed = __atomic_exchange_n(&lock->word, 1U, __ATOMIC_ACQUIRE);
         if (observed > 1U) __builtin_trap();
     } while (observed);
+#else
+    if (lock->word) __builtin_trap();
+    lock->word = 1;
+    __asm__ volatile("" ::: "memory");
+#endif
 #if BOAROS_COST_DIAGNOSTICS
     if (guard->cost.epoch) {
         guard->hold_start = kernel_cost_clock();
@@ -59,7 +67,12 @@ void kernel_raw_lock_release(struct kernel_raw_guard *guard)
 #endif
     cpu->raw_locks = guard->previous;
     cpu->preempt_depth = guard->previous_depth;
+#if BOAROS_MAX_CPUS > 1
     __atomic_store_n(&guard->lock->word, 0U, __ATOMIC_RELEASE);
+#else
+    __asm__ volatile("" ::: "memory");
+    guard->lock->word = 0;
+#endif
     guard->lock = 0;
 #if BOAROS_MAX_CPUS > 1
     if (!cpu->raw_locks) kernel_cpu_flush_notifications();

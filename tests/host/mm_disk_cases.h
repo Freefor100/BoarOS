@@ -64,7 +64,7 @@ int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_descrip
 }
 static void *disk_fault_actor(void *arg)
 {
-    unsigned id=(unsigned)(uintptr_t)arg; mm_test_attach(id);
+    unsigned id=(unsigned)(uintptr_t)arg; cache_test_attach(id);
     mm_test_bind(disk_views[id]); mm_test_context=disk_roots[id];
     unsigned char byte=0x80+id; size_t done;
     disk_results[id]=kernel_copy_to_user(disk_views[id],disk_target+id,&byte,1,&done);
@@ -82,7 +82,7 @@ static int disk_sync_result;
 static uint64_t disk_old_page;
 static void *disk_retiring_writer(void *unused)
 {
-    (void)unused; mm_test_attach(1); mm_test_bind(disk_views[1]); mm_test_context=disk_roots[1];
+    (void)unused; cache_test_attach(1); mm_test_bind(disk_views[1]); mm_test_context=disk_roots[1];
     struct kernel_mm_user_pin pin={0};
     assert(!kernel_mm_resolve_user_fault(disk_views[1],disk_target,KERNEL_MM_WRITE));
     assert(!kernel_mm_pin_user_page(disk_views[1],disk_target,KERNEL_MM_WRITE,&pin));
@@ -95,7 +95,7 @@ static void *disk_retiring_writer(void *unused)
 }
 static void *disk_retiring_sync(void *arg)
 {
-    mm_test_attach(0); uint64_t observed=0;
+    cache_test_attach(0); uint64_t observed=0;
     disk_sync_result=kernel_vfs_sync(arg,0,&observed);
     return 0;
 }

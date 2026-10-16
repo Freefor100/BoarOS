@@ -160,7 +160,7 @@ WAKE，重启成功场景保持用户字不变，直到WAKE明确返回选中一
 内核 tp 继续指向任务，任务关联 CPU 记录；它与用户 TLS 的保存完全独立。
 CPU 记录持有 current、待调度标志和短锁/抢占深度，I/O guard 与回收深度仍由任务持有。
 禁止抢占只保证本地执行上下文稳定；共享元数据还需要带 acquire/release 内存序的互斥。
-raw guard 保存原 IRQ 状态并登记到 CPU 持有链，禁止递归、逆序和持锁阻塞。
+raw guard 保存原 IRQ 状态并登记到 CPU 持有链，禁止持锁阻塞。UP 只需本地中断、抢占嵌套与编译器屏障；SMP 使用原子互斥。递归与锁等级扫描由默认关闭的 `LOCK_DEBUG` 控制，持有链和嵌套恢复不受该开关影响。
 timer 可以记账并留下待调度请求，解除禁止抢占不在任意调用栈直接切换。
 延期状态还须保留OTHER轮转原因：只有need_resched时，同级peer既不higher、OTHER也不expired，
 安全返回会清掉请求并继续当前任务。idle对照会被higher条件掩盖，因此另用两个普通OTHER

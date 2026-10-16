@@ -72,7 +72,8 @@ void mm_test_attach(unsigned id)
 {
     kernel_cpu_initialize(&cpu, id, &io);
 #if BOAROS_MAX_CPUS > 1
-    cpu.logical_id = id;
+    /* actor_id 区分等待者；CPU 归属由 activity、文件或缓存夹具显式设置。 */
+    cpu.logical_id = 0;
 #endif
     assert(!pthread_once(&domain_once, kernel_wait_domain_init));
     assert(id < 16); actor_id = id;
@@ -129,3 +130,14 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 void kernel_wait_backend_quiesce(void) { sched_yield(); }
+
+#if BOAROS_MAX_CPUS > 1
+/* 普通宿主 MM actor 只使用本地翻译；跨 CPU 确认由 activity 夹具接管。 */
+__attribute__((weak)) void riscv_smp_sync_user(uint32_t targets, uint64_t address,
+                                             uint64_t size, int instructions)
+{
+    assert(!(targets & ~1U));
+    mm_test_fence(size == BOAROS_PAGE_SIZE ? address : UINT64_MAX, 0);
+    if (instructions) mm_test_fence(0, 1);
+}
+#endif

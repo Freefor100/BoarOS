@@ -19,12 +19,17 @@
 #include <string.h>
 #include <sched.h>
 #include <time.h>
-#ifdef CACHE_MM_CASES
 void mm_test_attach(unsigned);
+static void cache_test_attach(unsigned actor_id)
+{
+    mm_test_attach(actor_id);
+    /* 多个调用者可来自同一远端 CPU；后台执行者固定在 CPU0。 */
+    kernel_cpu_current()->logical_id = actor_id != 0;
+}
+#ifdef CACHE_MM_CASES
 #include "mm_disk_cases.h"
 #endif
 
-void mm_test_attach(unsigned);
 static unsigned char backend_pool[16 * 1024 * 1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator backend_pages;
 static struct kernel_heap backend_heap;
@@ -203,7 +208,7 @@ static void execute_on_cpu0(void *argument)
 }
 static void *execute_client(void *unused)
 {
-    (void)unused; mm_test_attach(1);
+    (void)unused; cache_test_attach(1);
     assert(!kernel_page_cache_run_cpu0(current_cache,execute_on_cpu0,&execute_calls));
     return 0;
 }
@@ -339,7 +344,7 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
 static void *get_cold_page(void *arg)
 {
     unsigned id = (unsigned)(uintptr_t)arg;
-    mm_test_attach(id);
+    cache_test_attach(id);
     size_t valid;
     assert(kernel_page_cache_get(current_cache, current_file, 0, &received[id], &valid) == expected_status);
     if (expected_status) return 0;
@@ -356,14 +361,14 @@ void __wrap_kernel_thread_join(struct kernel_thread_join *join)
 }
 static void *stop_cache(void *arg)
 {
-    (void)arg; mm_test_attach(0);
+    (void)arg; cache_test_attach(0);
     kernel_page_cache_stop_worker(current_cache);
     __atomic_store_n(&stop_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 static void *get_cancelled_page(void *arg)
 {
-    (void)arg; mm_test_attach(2);
+    (void)arg; cache_test_attach(2);
     uint64_t address; size_t valid;
     assert(kernel_page_cache_get(current_cache, current_file, 1, &address, &valid) == KERNEL_PAGE_CACHE_STATUS_STATE);
     return 0;
@@ -445,14 +450,14 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_wr
 }
 static void *sync_file(void *arg)
 {
-    mm_test_attach(0); uint64_t error=kernel_vfs_error_sequence(arg);
+    cache_test_attach(0); uint64_t error=kernel_vfs_error_sequence(arg);
     assert(!kernel_vfs_sync(arg,0,&error));
     __atomic_store_n(&sync_done,1,__ATOMIC_RELEASE);
     return 0;
 }
 static void *drain_alias(void *arg)
 {
-    (void)arg; mm_test_attach(6);
+    (void)arg; cache_test_attach(6);
     kernel_page_cache_alias_detach(drain_target);
     __atomic_store_n(&drain_entered,1,__ATOMIC_RELEASE);
     kernel_page_cache_alias_drain(drain_target);
@@ -613,7 +618,7 @@ static void alias_snapshot(struct kernel_page_cache *cache, struct kernel_vfs_fi
 }
 static void *read_expanded_index(void *arg)
 {
-    unsigned id=(unsigned)(uintptr_t)arg; mm_test_attach(id);
+    unsigned id=(unsigned)(uintptr_t)arg; cache_test_attach(id);
     for (unsigned index=id-1;index<64;index+=4) {
         uint64_t address; size_t valid;
         assert(!kernel_page_cache_get(current_cache,current_file,index,&address,&valid) && valid==BOAROS_PAGE_SIZE);
@@ -857,7 +862,7 @@ static void version_prefix_cycle(struct kernel_page_cache *cache,struct kernel_v
 static int cycle_sync_result;
 static void *cycle_sync_file(void *argument)
 {
-    mm_test_attach(0);uint64_t observed=kernel_vfs_error_sequence(argument);
+    cache_test_attach(0);uint64_t observed=kernel_vfs_error_sequence(argument);
     cycle_sync_result=kernel_vfs_sync(argument,0,&observed);return NULL;
 }
 static void version_empty_cycle(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
@@ -924,7 +929,7 @@ static void retain_after_cache_close(struct kernel_page_cache *cache,struct kern
 }
 static void *destroy_with_borrowed_version(void *argument)
 {
-    mm_test_attach(0);assert(!kernel_page_cache_destroy(argument));return NULL;
+    cache_test_attach(0);assert(!kernel_page_cache_destroy(argument));return NULL;
 }
 static void destroy_version_case(struct kernel_page_cache *cache)
 {
@@ -946,7 +951,7 @@ static void destroy_version_case(struct kernel_page_cache *cache)
 static unsigned window_truncate_started,window_truncate_done;
 static void *truncate_writeback_window(void *file)
 {
-    mm_test_attach(0);
+    cache_test_attach(0);
     __atomic_store_n(&window_truncate_started,1,__ATOMIC_RELEASE);
     assert(!kernel_vfs_ftruncate(file,BOAROS_PAGE_SIZE+37));
     __atomic_store_n(&window_truncate_done,1,__ATOMIC_RELEASE);
@@ -1121,7 +1126,7 @@ struct demand_read {
 static void *read_demand_batch(void *arg)
 {
     struct demand_read *read = arg;
-    mm_test_attach(read->cpu);
+    cache_test_attach(read->cpu);
     if (read->watch_inode) {
         attempt_inode_lock=&kernel_vfs_file_node(current_file)->io_lock;
         inode_read_attempts=&read->inode_attempts;
@@ -1212,7 +1217,7 @@ static void count_demand_read(struct counted_demand *read)
 }
 static void *count_remote_demand(void *argument)
 {
-    mm_test_attach(1);
+    cache_test_attach(1);
     count_demand_read(argument);
     return 0;
 }
@@ -1224,7 +1229,7 @@ struct resident_demand {
 static void *try_resident_demand(void *argument)
 {
     struct resident_demand *call=argument;
-    mm_test_attach(1);
+    cache_test_attach(1);
     read_counts=&call->counts; read_allocator=current_cache->allocator;
     call->read.status=kernel_page_cache_try_resident_batch(current_cache,call->file,
         call->read.first,call->read.pages,call->read.count);
@@ -1718,7 +1723,7 @@ static void demand_cancel(struct kernel_page_cache *cache, struct kernel_vfs_fil
 static unsigned demand_truncate_started, demand_truncate_done;
 static void *truncate_demand_file(void *unused)
 {
-    (void)unused; mm_test_attach(0);
+    (void)unused; cache_test_attach(0);
     __atomic_store_n(&demand_truncate_started, 1, __ATOMIC_RELEASE);
     assert(!kernel_vfs_ftruncate(current_file, 2 * BOAROS_PAGE_SIZE + 37));
     __atomic_store_n(&demand_truncate_done, 1, __ATOMIC_RELEASE);
@@ -1907,7 +1912,7 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
 
 static void *ordinary_writeback_waiter(void *argument)
 {
-    mm_test_attach(0);hold_ordinary_wait=1;
+    cache_test_attach(0);hold_ordinary_wait=1;
     assert(!kernel_page_cache_writeback(current_cache,kernel_vfs_file_node(argument)));
     hold_ordinary_wait=0;return NULL;
 }
@@ -1960,7 +1965,7 @@ static void ordinary_reclaim_borrow(struct kernel_heap *heap,struct physical_pag
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
-    mm_test_attach(0);
+    cache_test_attach(0);
     struct physical_page_allocator pages = {0};
     struct kernel_heap heap = {0};
     struct kernel_page_cache cache = {0};
