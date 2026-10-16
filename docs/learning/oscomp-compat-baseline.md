@@ -570,9 +570,10 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 
 ## 当前主线集成的验证范围
 
-当前兼容分支通过 `dfaa65d` 集成 main `1807501`，保留双架构默认构建、兼容 uname、
-原盘 loader、监督/显式 shell 及 LA 调度 DSO。I/O 通路的设计、固定工作量与最终 fsync
-比较见 [VFS/ext4 模块](../modules/vfs-ext4.md)。
+当前通用 I/O 实现来自 main `4ea3a3e`，通过 `a135053` 集成到兼容分支；
+`8820b44` 更新接电后的固定工作量比较。双架构默认构建、兼容 uname、原盘 loader、
+监督/显式 shell 及 LA 调度 DSO 继续使用。I/O 通路设计、固定工作量及最终 fsync 比较见
+[VFS/ext4 模块](../modules/vfs-ext4.md)。
 
 此前 `ff9ceea` 的 iozone 在 RV、LA 分别独占运行，复用 `3189b00` 的原盘、程序和参数：
 单 CPU、1 GiB，RV QEMU 11.1.2/MMIO，LA QEMU 11.1.0/PCI，关闭成本诊断。
@@ -603,19 +604,43 @@ hole 后，两次 guest commit flush 对应的 host fdatasync 变慢。原盘 jo
 每份 4 GiB 工作镜像实际占用约 4 GiB，准备时间不计入 guest 运行。
 镜像字节、原脚本、程序和 judge 保持相同；内核的追加写、SG 和需求读取合批实现未变。
 
-在 `dfaa65d` 的干净工作树上，使用该准备方式重新完整运行一次 RV 原 iozone 组，
-关闭成本诊断且不加载归因库。glibc/musl 脚本均正常结束，设备错误和超时为零，
-根盘页、堆及任务栈检查通过；本次只重测 RV，LA 保留上表的历史结果。
+2026-10-16 在适配器已接通、platform_profile=performance 下重跑原组，沿用前次相同
+内核 ELF 和原盘。RV 旧内核为 `dfaa65d`，LA 旧内核为 `ff9ceea`（其后至 `3ea4d50`
+没有通用 I/O 生产代码变化），新内核为兼容集成 `a135053`；对应通用源码为 `1807501`→`4ea3a3e`。
+RV QEMU 11.1.2/MMIO、LA QEMU 11.1.0/PCI，均为 1 GiB、单 CPU、关闭成本诊断，
+每次使用完整写入并 fsync 的独立 4 GiB 工作镜像，准备时间不进入 guest 计时。
+原脚本、ELF、参数及 judge 均保持原样；RV 无 preload，LA musl 使用已有调度兼容 DSO，
+glibc 无 preload。每五秒及启动前后记录宿主供电和性能配置，所有样本均保持接电与 performance。
 
-| 写实镜像上的原组 | 原 judge 分数 | 四进程 Parent read，KiB/s | Children，KiB/s |
-|---|---:|---:|---:|
-| RV glibc | 35.261479 | 36068.49 | 123461.80 |
-| RV musl | 34.766263 | 37392.91 | 122023.42 |
+RV 每版三次，顺序为旧、新、新、旧、旧、新；LA 旧、新各一次。八次原脚本全部完成，
+退出、内核错误、根盘页/堆回收检查通过，设备错误与超时均为零。320 个原 judge 输入
+逐项对应 serial 中的 `Max throughput per process`，每组 20 项，未改判分。
+RV 最少剩余任务栈为 2984 字节，仍使用 8 KiB 栈。下表 RV 为三次中位数，LA 为单次结果：
 
-这些是镜像准备修正后的独立运行结果，不把宿主分配成本的变化写成新的内核加速。
-`test-cost-report.py` 43 项通过；`make test-oscomp-host` 63 项通过，含真实稀疏源复制、
-完整初始化与准备期 fsync 错误传播两项回归，旧复制方式在这两项均失败。
-保留目录为 `build/iozone-parent-20261015/{original,focused,wait-runs,materialized-runs,merged-initialized}`。
+| 架构 / libc | 每版次数 | 原 judge，旧→新 | Parent read，旧→新，KiB/s | Children，旧→新，KiB/s |
+|---|---:|---:|---:|---:|
+| RV glibc | 3 | 35.056709→35.389270 | 39374.75→39636.38 | 132671.47→147429.09 |
+| RV musl | 3 | 34.963618→35.067373 | 46821.17→45933.70 | 131784.01→150277.94 |
+| LA glibc | 1 | 36.866050→37.029134 | 44385.94→39451.57 | 146290.40→156532.06 |
+| LA musl | 1 | 36.685516→36.907537 | 42954.55→43164.37 | 150549.66→164037.79 |
+
+RV musl Parent 的旧版三次为 45582.37、46821.17、47154.56 KiB/s，
+新版为 50240.71、45933.70、41244.21 KiB/s。中位数低约 1.9%，最后一对仍出现
+约 12.5% 的下降；该低值发生时供电记录正常。同时 Children 中位数高约 14.0%，
+原 judge 中位数高约 0.3%。这些量的分母与取值方式不同，不能把 Parent 的变化直接
+当成纯读取循环的加减速；本次原组没有另外采集逐阶段耗时，不将低值归到某个具体阶段。
+LA glibc 单次 Parent 低约 11.1%，原 judge 略高；LA 结果按单次对照保留。
+
+此前 `d66f0e4` 对照曾观察到 RV musl Parent 中位数 44862.53→39237.08 KiB/s。
+那一轮及随后中断的一轮没有供电记录，原始文件继续保留，不并入本次接电统计，
+也不以离电解释全部差异。当前固定工作量另比较默认调度与 CPU0/2 性能核集合，
+其中 4 KiB 冷读差值由约 6.7% 缩至约 1.1%，追加写结果也随宿主条件变化，详见模块文档。
+
+`test-cost-report.py` 43 项和 `make test-oscomp-host` 63 项在本轮合并前已通过；
+本次复用相同 runner 与内核，不重复这些未改动的检查。原始输入、逐轮 serial、原 judge、
+运行结果及连续供电记录保存在 `build/io-space-time-20261016-ac/original`。
+此前定位稀疏 backing 的记录保留在 `build/iozone-parent-20261015/{original,focused,wait-runs,materialized-runs,merged-initialized}`，
+前一轮优化比较保留在 `build/io-space-time-20261015/{original,original-final,compare-final,compare-final-repeat}`。
 
 ```sh
 python3 -B tests/oscomp/run.py --arch riscv --groups iozone --diagnostic-timeout 600
