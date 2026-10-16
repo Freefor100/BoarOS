@@ -251,6 +251,8 @@ static void test_irq_reads(const void *dtb, struct physical_page_allocator *allo
          (uintptr_t)__boot_stack_top) != KERNEL_SCHEDULER_STATUS_OK ||
         !riscv_virtio_mmio_block_enable_irq(device, source)) fail_block(44, 0, 1);
     irq_device = device; irq_buffers = buffer;
+    struct riscv_virtio_mmio_block_statistics before;
+    riscv_virtio_mmio_block_get_statistics(device, &before);
     for (uintptr_t i = 0; i < 2; i++)
         if (kernel_thread_create(irq_read_worker, (void *)i) != KERNEL_SCHEDULER_STATUS_OK)
             fail_block(45, 0, 1);
@@ -269,9 +271,11 @@ static void test_irq_reads(const void *dtb, struct physical_page_allocator *allo
     virt_uart_puts(" interrupts="); virt_uart_put_hex(stats.interrupts);
     virt_uart_puts(" sleeps="); virt_uart_put_hex(stats.sleeps);
     virt_uart_putc('\n');
-    /* IRQ可在提交返回后、wait_request复查前完成；正确字节和真实IRQ
-     * 不要求已完成请求再park。强制延迟/NBD的睡眠交接由io_sleep另验。 */
-    if (irq_done != 2 || !stats.interrupts)
+    /* used可在等待前完成并被收割、确认，无须再经过PLIC或park。
+     * 这里检查IRQ启用后的真实请求与内容；延迟完成/睡眠交接由io_sleep另验。 */
+    if (irq_done != 2 || stats.requests - before.requests != 2 ||
+        stats.sectors_read - before.sectors_read != 2 ||
+        stats.io_errors != before.io_errors || stats.timeouts != before.timeouts)
         fail_block(47, 2, irq_done);
 }
 
