@@ -61,7 +61,8 @@ enum kernel_mm_cleanup_stage {
  * MM引用只保证记录存活，lookup快照不能代替访问片段的实际页引用。 */
 struct kernel_mm {
     struct physical_page_allocator *allocator;
-    uint64_t record_page_address;
+    struct kernel_mm_record *record;
+    uint64_t record_page_address; /* 只用于归还记录页。 */
     enum kernel_mm_state state;
     enum kernel_mm_cleanup_stage cleanup_stage;
 };

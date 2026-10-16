@@ -16,6 +16,7 @@
 static void finish_mm_move(struct kernel_mm *mm)
 {
     mm->allocator = 0;
+    mm->record = 0;
     mm->record_page_address = 0U;
     mm->state = KERNEL_MM_MOVED;
     mm->cleanup_stage = KERNEL_MM_CLEANUP_NONE;

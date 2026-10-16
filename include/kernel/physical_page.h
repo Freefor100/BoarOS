@@ -137,6 +137,12 @@ enum physical_page_status physical_page_allocation_order(
     uint32_t *order);
 
 /* The caller must own an allocated page; this validates only address history. */
+/* 内部持有者访问：调用者须已持有覆盖此次使用的页、页表或 pin 引用。
+ * 不查询 buddy 所有权，也不取得分配器锁。 */
+enum physical_page_status physical_page_map_owned(
+    const struct physical_page_allocator *, uint64_t physical_address,
+    void **pointer);
+
 enum physical_page_status physical_page_resolve(
     const struct physical_page_allocator *allocator,
     uint64_t physical_address,

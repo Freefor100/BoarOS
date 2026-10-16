@@ -390,7 +390,7 @@ static enum riscv_sv39_status resolve_runtime_table(
     if (entries == 0) {
         return RISCV_SV39_STATUS_INVALID;
     }
-    status = physical_page_resolve(allocator, address, &pointer);
+    status = physical_page_map_owned(allocator, address, &pointer);
     if (status == PHYSICAL_PAGE_STATUS_STATE) {
         return RISCV_SV39_STATUS_STATE;
     }
@@ -992,7 +992,7 @@ enum riscv_sv39_status riscv_sv39_user_map_owned_page(
         !valid_user_permissions(permissions)) {
         return RISCV_SV39_STATUS_INVALID;
     }
-    if (physical_page_resolve(space->allocator,
+    if (physical_page_map_owned(space->allocator,
                               physical_address,
                               &owned_page) != PHYSICAL_PAGE_STATUS_OK) {
         return RISCV_SV39_STATUS_INVALID;
@@ -1033,7 +1033,7 @@ enum riscv_sv39_status riscv_sv39_user_map_cow_page(
         space->cow_pages == UINT32_MAX) {
         return RISCV_SV39_STATUS_INVALID;
     }
-    if (physical_page_resolve(space->allocator,
+    if (physical_page_map_owned(space->allocator,
                               physical_address,
                               &owned_page) != PHYSICAL_PAGE_STATUS_OK) {
         return RISCV_SV39_STATUS_INVALID;
@@ -1275,7 +1275,7 @@ enum riscv_sv39_status riscv_sv39_user_detach_page(
         (protected && !space->protected_pages) || (cow && !space->cow_pages) ||
         space->table_pages < 3) return RISCV_SV39_STATUS_STATE;
     void *owned;
-    if (physical_page_resolve(space->allocator, entry_address(old), &owned) !=
+    if (physical_page_map_owned(space->allocator, entry_address(old), &owned) !=
         PHYSICAL_PAGE_STATUS_OK) return RISCV_SV39_STATUS_STATE;
     /* 三个槽在发布前已保留；之后不发生可恢复失败或descriptor分配。 */
     __atomic_store_n(&leaves[l], 0, __ATOMIC_RELEASE);
@@ -1430,7 +1430,7 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_
     if (status != RISCV_SV39_STATUS_OK) return status;
     if (leaves[l]) return RISCV_SV39_STATUS_CONFLICT;
     void *owner;
-    if (physical_page_resolve(s->allocator, physical, &owner) != PHYSICAL_PAGE_STATUS_OK)
+    if (physical_page_map_owned(s->allocator, physical, &owner) != PHYSICAL_PAGE_STATUS_OK)
         return RISCV_SV39_STATUS_STATE;
     /* 候选树先填好再发布父链接；全部可能失败的解析已结束。 */
     __atomic_store_n(&leaves[l], user_leaf_entry(physical, permissions), __ATOMIC_RELEASE);
@@ -1476,7 +1476,7 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit(struct riscv_sv39_user_space *
         return RISCV_SV39_STATUS_STATE;
     if (replacement == KERNEL_MM_NO_PAGE && references != 1) return RISCV_SV39_STATUS_CONFLICT;
     void *pointer;
-    if (replacement != KERNEL_MM_NO_PAGE && physical_page_resolve(s->allocator, replacement, &pointer) != PHYSICAL_PAGE_STATUS_OK)
+    if (replacement != KERNEL_MM_NO_PAGE && physical_page_map_owned(s->allocator, replacement, &pointer) != PHYSICAL_PAGE_STATUS_OK)
         return RISCV_SV39_STATUS_STATE;
     uint64_t *leaf;
     status = resolve_existing_user_leaf(s, address, &leaf, 0);
@@ -1639,7 +1639,7 @@ static enum riscv_sv39_status validate_owned_range(
                 } else {
                     return RISCV_SV39_STATUS_STATE;
                 }
-                if (physical_page_resolve(
+                if (physical_page_map_owned(
                         space->allocator,
                         entry_address(level0[level0_index]),
                         &owned_page) != PHYSICAL_PAGE_STATUS_OK) {
@@ -1895,7 +1895,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_page(
     int present = valid_user_leaf_entry(old);
     if (!present && !valid_protected_entry(old)) return RISCV_SV39_STATUS_STATE;
     void *owned_page;
-    if (physical_page_resolve(space->allocator, entry_address(old), &owned_page) !=
+    if (physical_page_map_owned(space->allocator, entry_address(old), &owned_page) !=
             PHYSICAL_PAGE_STATUS_OK) return RISCV_SV39_STATUS_STATE;
     int cow = present ? present_cow_entry(old) : protected_cow_entry(old);
     if ((present && space->leaf_pages == 0) ||
@@ -2124,7 +2124,7 @@ enum riscv_sv39_status riscv_sv39_user_space_populate(
             RISCV_SV39_STATUS_OK) {
             return RISCV_SV39_STATUS_NOT_MAPPED;
         }
-        if (physical_page_resolve(
+        if (physical_page_map_owned(
                 space->allocator,
                 mapping.physical_address & ~BOAROS_PAGE_MASK,
                 &pointer) != PHYSICAL_PAGE_STATUS_OK) {

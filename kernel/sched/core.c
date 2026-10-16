@@ -289,18 +289,18 @@ static enum kernel_scheduler_status validate_thread(
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (thread->mm.state == KERNEL_MM_LIVE) {
-            if (thread->mm.allocator != scheduler.allocator) {
+            if (!thread->mm.record || thread->mm.allocator != scheduler.allocator) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
         } else if (thread->mm.state ==
                    KERNEL_MM_CLEANUP) {
-            if (thread->mm.allocator != scheduler.allocator ||
+            if (!thread->mm.record || thread->mm.allocator != scheduler.allocator ||
                 (thread->mm.record_page_address &
                  BOAROS_PAGE_MASK) != 0U) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
         } else if (thread->mm.allocator != 0 ||
-                   thread->mm.record_page_address != 0U) {
+                   thread->mm.record_page_address != 0U || thread->mm.record != 0) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }

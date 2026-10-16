@@ -50,11 +50,11 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
     if (!status && fail_copy) failed_page=*address;
     return status;
 }
-enum physical_page_status __real_physical_page_resolve(const struct physical_page_allocator *,uint64_t,void **);
-enum physical_page_status __wrap_physical_page_resolve(const struct physical_page_allocator *a,uint64_t address,void **pointer)
+enum physical_page_status __real_physical_page_map_owned(const struct physical_page_allocator *,uint64_t,void **);
+enum physical_page_status __wrap_physical_page_map_owned(const struct physical_page_allocator *a,uint64_t address,void **pointer)
 {
     if (fail_copy && address==failed_page) { fail_copy=0; return PHYSICAL_PAGE_STATUS_INVALID; }
-    return __real_physical_page_resolve(a,address,pointer);
+    return __real_physical_page_map_owned(a,address,pointer);
 }
 enum riscv_sv39_status __real_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *,uint64_t *,uint64_t *);
 enum riscv_sv39_status __wrap_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *space,uint64_t *cursor,uint64_t *address)

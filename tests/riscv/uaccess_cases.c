@@ -12,6 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+extern uint64_t kernel_test_pin_acquisitions;
+
 #define TEST_PAGE_COUNT 16U
 #define TEST_USER_BASE UINT64_C(0x10000)
 #define TEST_READ_ONLY_ADDRESS UINT64_C(0x20000)
@@ -578,7 +580,8 @@ static unsigned long run_reused_write_pin(void)
     struct riscv_sv39_page_table kernel_table = {0};
     struct kernel_mm mm = {0};
     struct kernel_uaccess_write_cursor pages = {0};
-    struct kernel_mm_concurrency_state before, after;
+    struct kernel_mm_concurrency_state after;
+    uint64_t pin_before;
     uint64_t baseline;
     size_t copied;
     unsigned char bytes[8] = {1,2,3,4,5,6,7,8};
@@ -588,13 +591,13 @@ static unsigned long run_reused_write_pin(void)
     };
     struct kernel_uaccess_iov_cursor cursor = {.iov=iov, .count=4};
     if (!setup_mm(&allocator, &kernel_table, &mm, &baseline)) return 1;
-    kernel_mm_get_concurrency_state(&mm, &before);
+    pin_before = kernel_test_pin_acquisitions;
     /* 跨source及iov片段仍只持当前一个用户页，不重复查询PTE和登记引用。 */
     if (kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, bytes, 4, &copied) || copied != 4 ||
         kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, bytes + 4, 4, &copied) || copied != 4)
         return 2;
     kernel_mm_get_concurrency_state(&mm, &after);
-    if (after.pin_acquisitions != before.pin_acquisitions + 1 ||
+    if (kernel_test_pin_acquisitions != pin_before + 1 ||
         after.pins != 1 || after.write_pins != 1) return 3;
     for (unsigned i=0;i<5;i++) {
         unsigned char actual;
@@ -607,7 +610,7 @@ static unsigned long run_reused_write_pin(void)
     if (kernel_uaccess_write_cursor_copy(&mm, &pages,
         TEST_USER_BASE + BOAROS_PAGE_SIZE - 2, bytes, 4, &copied) || copied != 4) return 6;
     kernel_mm_get_concurrency_state(&mm, &after);
-    if (after.pin_acquisitions != before.pin_acquisitions + 2 || after.pins != 1) return 7;
+    if (kernel_test_pin_acquisitions != pin_before + 2 || after.pins != 1) return 7;
     /* 后一页缺失：返回准确前缀，进入fault前已结束上一页写借用。 */
     if (kernel_uaccess_write_cursor_copy(&mm, &pages,
         TEST_USER_BASE + 2 * BOAROS_PAGE_SIZE - 3, bytes, 8, &copied) !=
@@ -627,7 +630,8 @@ static unsigned long run_write_pin_geometry(void)
     struct riscv_sv39_page_table kernel_table = {0};
     struct kernel_mm mm = {0};
     struct kernel_uaccess_write_cursor pages = {0};
-    struct kernel_mm_concurrency_state before, after;
+    struct kernel_mm_concurrency_state after;
+    uint64_t pin_before;
     uint64_t baseline;
     size_t copied;
 
@@ -636,13 +640,13 @@ static unsigned long run_write_pin_geometry(void)
         source[i] = (unsigned char)(i * 29U + i / BOAROS_PAGE_SIZE + 3U);
     const uint64_t destinations[] = {TEST_USER_BASE, TEST_USER_BASE + 0x618U};
     for (size_t test = 0U; test < 2U; test++) {
-        kernel_mm_get_concurrency_state(&mm, &before);
+        pin_before = kernel_test_pin_acquisitions;
         if (kernel_copy_to_user(&mm, destinations[test], source,
                                 BOAROS_PAGE_SIZE, &copied) !=
                 KERNEL_UACCESS_STATUS_OK || copied != BOAROS_PAGE_SIZE)
             return 2U;
         kernel_mm_get_concurrency_state(&mm, &after);
-        if (after.pin_acquisitions - before.pin_acquisitions != test + 1U ||
+        if (kernel_test_pin_acquisitions - pin_before != test + 1U ||
             after.pins || after.write_pins) return 3U;
         for (size_t i = 0U; i < BOAROS_PAGE_SIZE; i++) {
             unsigned char actual;
@@ -658,7 +662,7 @@ static unsigned long run_write_pin_geometry(void)
         {TEST_USER_BASE + BOAROS_PAGE_SIZE, 20U},
     };
     struct kernel_uaccess_iov_cursor cursor = {.iov = vectors, .count = 4U};
-    kernel_mm_get_concurrency_state(&mm, &before);
+    pin_before = kernel_test_pin_acquisitions;
     if (kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, source,
                                       BOAROS_PAGE_SIZE, &copied) !=
             KERNEL_UACCESS_STATUS_OK || copied != BOAROS_PAGE_SIZE ||
@@ -667,7 +671,7 @@ static unsigned long run_write_pin_geometry(void)
                                       &copied) != KERNEL_UACCESS_STATUS_OK ||
         copied != 13U) return 5U;
     kernel_mm_get_concurrency_state(&mm, &after);
-    if (after.pin_acquisitions - before.pin_acquisitions != 2U ||
+    if (kernel_test_pin_acquisitions - pin_before != 2U ||
         after.pins != 1U || after.write_pins != 1U) return 6U;
     for (size_t i = 0U; i < sizeof(source); i++) {
         unsigned char actual;
@@ -681,13 +685,13 @@ static unsigned long run_write_pin_geometry(void)
         {TEST_USER_BASE + 2U * BOAROS_PAGE_SIZE - 3U, 6U},
     };
     cursor = (struct kernel_uaccess_iov_cursor){.iov = fault_vectors, .count = 2U};
-    kernel_mm_get_concurrency_state(&mm, &before);
+    pin_before = kernel_test_pin_acquisitions;
     if (kernel_copy_to_user_iov_cursor(&mm, &cursor, &pages, source, 8U,
                                       &copied) != KERNEL_UACCESS_STATUS_FAULT ||
         copied != 5U || cursor.index != 1U || cursor.offset != 3U)
         return 8U;
     kernel_mm_get_concurrency_state(&mm, &after);
-    if (after.pin_acquisitions - before.pin_acquisitions != 1U ||
+    if (kernel_test_pin_acquisitions - pin_before != 1U ||
         after.pins || after.write_pins) return 9U;
     for (size_t i = 0U; i < copied; i++) {
         unsigned char actual;

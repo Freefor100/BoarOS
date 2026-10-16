@@ -57,7 +57,7 @@ metadata 地址，非法地址或 bootstrap 失败不读取 metadata，也不追
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_release()` 只在末引用消失时把页归还 buddy；
-`physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。高阶块仍是单 owner，
+`physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。普通零阶页按 PFN 定位元数据，在分配器锁内检查活块头并增减引用；非末引用释放不查询 buddy 祖先，末次释放才进入完整树验证和合并。分配、释放与合并同步维护块头状态和引用数，旧尾记录不能获得活页资格。高阶块仍是单 owner，
 不能通过单页 acquire 拆分引用，避免让连续分配的 tail 生命周期失去统一边界。引用达到
 `UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
@@ -69,6 +69,8 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap
 模式只能按发放历史检查；finalized 模式要求页首位于 allocated 权威块，允许连续块内的尾页页首，明确
 拒绝 free 和 internal 页。两种模式都只在访问回调返回非空指针后写输出。
+
+内部 `physical_page_map_owned()` 供已经持有分配页、页表或用户 pin 的调用者使用，直接调用绑定的映射函数，不再重复取得元数据锁或确认所有权。调用者必须覆盖整个访问期间的页寿命；分配、归还和首次接纳身份仍由各自边界负责。
 
 `physical_page_total()` 保留所有对齐可用页的原始总数；
 `physical_page_available()` 在 finalized 后排除 bootstrap owner 与 metadata；
@@ -88,11 +90,11 @@ free/split/allocated/internal为权威状态，inactive节点不拥有页，编�
 分裂先准备子状态再发布split，合并先摘链/退休子节点再发布free。无跨range合并；
 旧尾载荷不参与owner判断，不能用一段旧尾的状态替代树验证。
 
-只读的resolve、allocation_order和reference_count在页首载荷给出候选块头时，
+受检查的resolve和allocation_order在页首载荷给出候选块头时，
 验证该几何位置的活动ALLOCATED树节点和块头字段；正常块头查询为O(log R)，
 连续块内部页或过期hint回退到完整祖先查找。合并先退休子节点，所以旧尾载荷不能
 误认新owner。该快路径经人确认：祖先关系损坏的发现时点可推迟到修改或完整审计；
-块头/候选节点检查仍保留。分配、释放和增引用始终验证完整相关祖先链。
+块头/候选节点检查仍保留。分配与最终释放验证完整相关祖先链；零阶引用操作按上述活块头规则处理。
 
 热路径检查相关权威路径、块头引用与free-list双向连接，不扫描空闲块尾记录，也不
 重写最终合并块的全部页。小请求的检查受树/根目录深度约束，重写受split/coalesce

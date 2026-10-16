@@ -118,7 +118,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 ## 句柄、引用与状态
 
-`struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。RISC-V 后端用 `record_page_address` 指向一张物理记录页；记录页保存引用计数、清理阶段和唯一的 `riscv_sv39_user_space`。多个 LIVE 句柄可以指向同一记录页：
+`struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。句柄直接持有内核记录指针，`record_page_address` 只用于归还记录页。记录保存引用计数、清理阶段和架构页表；创建、fork 的成功与清理分支、acquire、move 和最终 release 共同维护指针与所有权。正常访问不再从物理句柄重新解析记录，也不重复审计整份 VMA/来源/清理状态。多个 LIVE 句柄可以指向同一记录：
 
 - `acquire` 增加引用计数并发布一个新的独立 owner；vfork 与线程 clone 用它共享地址空间，任一线程释放自己的引用不撤销其他 owner。共享 MM 的 VMA/PTE 变更对同组立即可见；当前单 hart 关闭 SIE 串行化，并执行本地 TLB 失效，不等同于 SMP 同步；
 - `fork` 创建独立地址空间，克隆 VMA/文件来源并让父子暂时共享用户物理页，逻辑 MM 和后续写入仍独立；
@@ -203,7 +203,7 @@ LIVE(last ref)
 
 `CLEANUP_VMAS`、`CLEANUP_FILE_SOURCES` 和 `CLEANUP_ELF_SOURCES` 只表示仍由 MM 持有的文件/OFD/source owner 需要完成真实 VFS/I/O 清理；页表树、VMA metadata、记录页和物理页的合法释放完成即推进流程，不产生 allocator retry。所有 CLEANUP 句柄都只能 move 或由所属上层继续处理，不能 acquire、lookup 或生成 `satp`。非末引用释放不触碰 VMA、文件来源或页表树。
 
-页表页在 production 中只经 finalized physical-page allocator 和固定 direct map 解析。合法且仍归 MM owner 所有的页表页没有异步缺页、I/O 或其他能让失败条件稍后消失的 producer；解析失败只可能表示页所有权、allocator metadata 或 direct-map 不变量已经破坏。因此 Sv39 teardown 直接触发 fatal trap，不保留 `CLEANUP_SPACE`，也不允许下一次 `release` 把部分释放的树伪装成恢复成功。VFS/OFD 的真实外部 I/O owner 仍使用各自 cleanup 状态。
+MM、页表及用户 pin 已持有实际物理页生命周期时，通过 `physical_page_map_owned()` 直接调用绑定的映射函数，不再取得分配器锁、查询 buddy 所有权树。页表页没有异步缺页、I/O 或其他能让映射失败条件稍后消失的 producer；映射失败表示内部不变量损坏。因此 Sv39 teardown 直接触发 fatal trap，不保留 `CLEANUP_SPACE`，也不允许下一次 `release` 把部分释放的树伪装成恢复成功。VFS/OFD 的真实外部 I/O owner 仍使用各自 cleanup 状态。
 
 用户退出路径先切到内核根页表，再在仍有效的任务内核栈上调用 `kernel_mm_release()`；只有真实 VFS/OFD cleanup 仍有 owner 时才交给后续回收上下文处理。因此不会销毁硬件当前仍在使用的用户根。MM 完成后才允许任务成为 zombie，zombie 只保留身份、亲缘、wait status 和任务页。
 
@@ -255,7 +255,7 @@ FENCE.I。当前单 hart syscall 不可调度区保证登记和通知稳定，�
 物理分配失败；`test-userland-riscv` 与 `test-diff-abi-riscv` 验证真实驻留/COW、
 PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长。
 
-`riscv_kernel_mm_get_statistics` 提供驻留查找探测、改权页表访问及地址/全局失效计数。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限和写回 rearm 使用单页 PTE 操作；引用与脏代次协议保持不变。
+`riscv_kernel_mm_get_statistics` 提供诊断快照。驻留探测、准备页、pin 获取/等待、退休批次和 fault 重试等纯统计只在 `COST_DIAGNOSTICS=1` 更新；pin 数、页引用、活动 CPU 与 TLB 代次始终参与正确性。测试用链接包装观察实际 pin、锁与解析调用。驻留匿名页的 1、64、4096 字节双向复制均由每次 9 次锁获取、5 次受检查地址解析降为 4 次锁获取、0 次受检查解析；这四次仍保护 MM pin 与物理页引用。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限和写回 rearm 使用单页 PTE 操作；引用与脏代次协议保持不变。
 
 调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
 

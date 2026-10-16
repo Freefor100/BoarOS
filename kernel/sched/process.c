@@ -543,7 +543,7 @@ void process_complete_vfork(struct kernel_task *thread)
     }
     /* MM remains a single-CPU business handle this round. Storage pinning
      * covers the parent record, not shared-MM permission or release ordering. */
-    if (thread->mm.state == KERNEL_MM_LIVE && thread->mm.record_page_address == parent->mm.record_page_address)
+    if (thread->mm.state == KERNEL_MM_LIVE && thread->mm.record == parent->mm.record)
         return;
     int notify = 0;
     {

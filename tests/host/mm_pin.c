@@ -30,6 +30,31 @@ static void *page_access(uint64_t address)
 }
 static int page_address(const void *pointer, uint64_t *address)
 { *address = (uintptr_t)pointer; return 1; }
+static unsigned raw_acquisitions, checked_resolutions;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{ raw_acquisitions++; __real_kernel_raw_lock_acquire(lock, guard); }
+enum physical_page_status __real_physical_page_resolve(const struct physical_page_allocator *, uint64_t, void **);
+enum physical_page_status __wrap_physical_page_resolve(const struct physical_page_allocator *a, uint64_t address, void **out)
+{ checked_resolutions++; return __real_physical_page_resolve(a, address, out); }
+static void resident_copy_cost(struct kernel_mm *mm, uint64_t address)
+{
+    unsigned char data[4096] = {0};
+    const size_t sizes[] = {1, 64, 4096};
+    for (unsigned write = 0; write < 2; write++) {
+        for (unsigned i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++) {
+            size_t copied;
+            raw_acquisitions = checked_resolutions = 0;
+            enum kernel_uaccess_status result = write ?
+                kernel_copy_to_user(mm, address, data, sizes[i], &copied) :
+                kernel_copy_from_user(mm, data, address, sizes[i], &copied);
+            unsigned locks = raw_acquisitions;
+            printf("resident %s %zu bytes: locks=%u checked_resolutions=%u\n",
+                   write ? "write" : "read", sizes[i], locks, checked_resolutions);
+            assert(!result && copied == sizes[i] && locks == 4 && !checked_resolutions);
+        }
+    }
+}
 static void copy_fragments(struct kernel_mm *mm, uint64_t address)
 {
     unsigned char source[BOAROS_PAGE_SIZE + 64] __attribute__((aligned(16)));
@@ -135,6 +160,7 @@ int main(void)
     assert(kernel_mm_pin_user_page(&mm, address, KERNEL_MM_WRITE, &rejected) == KERNEL_MM_STATUS_ACCESS);
     assert(!rejected.registration && !rejected.page);
     assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
+    resident_copy_cost(&mm, address);
     fatal_pins(&mm, address);
     struct kernel_mm_mapping mapping;
     assert(kernel_mm_lookup(&mm, address, &mapping) == 0);

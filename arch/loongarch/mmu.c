@@ -50,7 +50,7 @@ int arch_mmu_kernel_window_active(void) { return kernel_window.root_address!=0; 
 static uint64_t *table(struct arch_mmu_user_space *s, uint64_t address)
 {
     void *p;
-    if (!address || (address&BOAROS_PAGE_MASK) || physical_page_resolve(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
+    if (!address || (address&BOAROS_PAGE_MASK) || physical_page_map_owned(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
         la_virt_fatal("page table owner");
     return p;
 }
@@ -109,7 +109,7 @@ enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *
     uint64_t *slot;void *bytes;
     enum arch_mmu_status status=kernel_slot(a,v,&slot);
     if(status!=ARCH_MMU_STATUS_OK)return status;
-    if((p&BOAROS_PAGE_MASK) || p>PTE_ADDRESS || physical_page_resolve(a,p,&bytes)!=PHYSICAL_PAGE_STATUS_OK)return ARCH_MMU_STATUS_INVALID;
+    if((p&BOAROS_PAGE_MASK) || p>PTE_ADDRESS || physical_page_map_owned(a,p,&bytes)!=PHYSICAL_PAGE_STATUS_OK)return ARCH_MMU_STATUS_INVALID;
     if(*slot)return ARCH_MMU_STATUS_CONFLICT;
     *slot=p|PTE_PRESENT|PTE_VALID|PTE_DIRTY|PTE_WRITE|PTE_NX|0x10;
     __asm__ volatile("dbar 0":::"memory");arch_mmu_flush_address(v);return ARCH_MMU_STATUS_OK;

@@ -1333,6 +1333,18 @@ enum physical_page_status physical_page_release_order(struct physical_page_alloc
         physical_page_release_fatal(a,address,order,"not-finalized",address);
     }
     struct buddy_owner owner;
+    if (!order && page_lookup_work(a, address, 0, &page, &work)) {
+        struct physical_page_metadata *metadata = &a->metadata[page];
+        if (metadata->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
+            !metadata->order && metadata->reference_count > 1) {
+            struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
+            if (!head_valid(a, &head, &work))
+                physical_page_release_fatal(a,address,order,"allocated-block",address);
+            metadata->reference_count--;
+            page_written(&work);
+            return PHYSICAL_PAGE_STATUS_OK;
+        }
+    }
     int found = owner_at_address(a,address,&page,&owner,&work,0);
     if (!found) physical_page_release_fatal(a,address,order,"address-range",address);
     if (found < 0) physical_page_release_fatal(a,address,order,"tree-owner",address);
@@ -1436,12 +1448,12 @@ enum physical_page_status physical_page_acquire(struct physical_page_allocator *
 {
     PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
-    struct buddy_owner owner;
-    if (!physical_page_allocator_is_finalized(a) || (address & BOAROS_PAGE_MASK) ||
-        owner_at_address(a,address,&page,&owner,&work,0) != 1 || owner.first != page || owner.order ||
-        owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work) ||
-        a->metadata[page].reference_count == UINT32_MAX)
-        __builtin_trap();
+    if (!physical_page_allocator_is_finalized(a) ||
+        !page_lookup_work(a, address, 0, &page, &work)) __builtin_trap();
+    struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
+    if (!head_valid(a, &head, &work) ||
+        a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+        a->metadata[page].reference_count == UINT32_MAX) __builtin_trap();
     a->metadata[page].reference_count++;
     page_written(&work);
     return PHYSICAL_PAGE_STATUS_OK;
@@ -1453,11 +1465,11 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
 {
     PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
-    struct buddy_owner owner;
     if (!physical_page_allocator_is_finalized(a) || !references ||
-        owner_at_address(a,address,&page,&owner,&work,1) != 1 || owner.first != page ||
-        owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work))
-        __builtin_trap();
+        !page_lookup_work(a, address, 0, &page, &work)) __builtin_trap();
+    struct buddy_owner head = {.first=page, .order=a->metadata[page].order, .state=BUDDY_ALLOCATED};
+    if (a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+        !head_valid(a, &head, &work)) __builtin_trap();
     *references = a->metadata[page].reference_count;
     return PHYSICAL_PAGE_STATUS_OK;
 }
@@ -1495,6 +1507,16 @@ enum physical_page_status physical_page_allocator_clear_reclaimer(
     allocator->reclaimer = 0;
     allocator->reclaim_depth = 0;
     allocator->reclaimer_context = 0;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
+enum physical_page_status physical_page_map_owned(
+    const struct physical_page_allocator *allocator, uint64_t address,
+    void **pointer)
+{
+    void *mapped = allocator->access(address);
+    if (!mapped) return PHYSICAL_PAGE_STATUS_INVALID;
+    *pointer = mapped;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 

@@ -20,12 +20,16 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#if BOAROS_COST_DIAGNOSTICS
+#define MM_DIAGNOSTIC(statement) statement
+#else
+#define MM_DIAGNOSTIC(statement) ((void)0)
+#endif
 
 #if BOAROS_USER_SMP_COMPOSITION
 void riscv_user_composition_fault_retry(uint64_t address, int resumed);
 #endif
 
-#define KERNEL_MM_RECORD_MAGIC UINT64_C(0x424f41524d4d5243)
 
 /* 创建仍在CPU0；原子预约也覆盖其抢占交错，零永久表示代次耗尽。 */
 static uint64_t next_futex_mm_id = 1U;
@@ -111,7 +115,6 @@ static void unpin_elf_fault_source(struct kernel_mm_elf_source **source)
 }
 
 struct kernel_mm_record {
-    uint64_t magic;
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
@@ -180,13 +183,13 @@ _Static_assert(sizeof(struct kernel_mm_record) <= BOAROS_PAGE_SIZE,
 static int empty_handle(const struct kernel_mm *mm)
 {
     return mm->state == KERNEL_MM_EMPTY && mm->allocator == 0 &&
-           mm->record_page_address == 0U &&
+           mm->record == 0 && mm->record_page_address == 0U &&
            mm->cleanup_stage == KERNEL_MM_CLEANUP_NONE;
 }
 
 static int owner_handle(const struct kernel_mm *mm)
 {
-    return mm->allocator != 0 &&
+    return mm->record != 0 && mm->allocator != 0 &&
            (mm->record_page_address & BOAROS_PAGE_MASK) == 0U &&
            (mm->state == KERNEL_MM_LIVE ||
             mm->state == KERNEL_MM_CLEANUP);
@@ -195,6 +198,7 @@ static int owner_handle(const struct kernel_mm *mm)
 static void finish_handle(struct kernel_mm *mm, enum kernel_mm_state state)
 {
     mm->allocator = 0;
+    mm->record = 0;
     mm->record_page_address = 0U;
     mm->state = state;
     mm->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
@@ -209,51 +213,8 @@ static enum kernel_mm_status resolve_record_storage(
     const struct kernel_mm *mm,
     struct kernel_mm_record **record)
 {
-    void *pointer;
-    int empty_space_cleanup;
-
-    if (!owner_handle(mm) ||
-        physical_page_resolve(mm->allocator,
-                              mm->record_page_address,
-                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
-        return owner_handle(mm) ? KERNEL_MM_STATUS_PAGE_ACCESS
-                                : KERNEL_MM_STATUS_STATE;
-    }
-    *record = pointer;
-    empty_space_cleanup =
-        ((*record)->stage == KERNEL_MM_RECORD_VMAS_CLEANUP ||
-         (*record)->stage ==
-             KERNEL_MM_RECORD_FILE_SOURCES_CLEANUP ||
-         (*record)->stage ==
-             KERNEL_MM_RECORD_ELF_SOURCES_CLEANUP) &&
-        (*record)->space.state == ARCH_MMU_USER_SPACE_EMPTY;
-    if ((*record)->magic != KERNEL_MM_RECORD_MAGIC ||
-        (*record)->futex_id == 0U ||
-        __atomic_load_n(&(*record)->references, __ATOMIC_ACQUIRE) == 0U ||
-        (*record)->stage > KERNEL_MM_RECORD_ONLY_CLEANUP ||
-        (*record)->brk_initialized > 1U ||
-        ((*record)->vmas != 0 && (*record)->vma_heap == 0) ||
-        ((*record)->file_sources != 0 && (*record)->vma_heap == 0) ||
-        ((*record)->elf_sources != 0 && (*record)->vma_heap == 0) ||
-        ((*record)->stage == KERNEL_MM_RECORD_LIVE &&
-         ((*record)->file_sources != 0 || (*record)->elf_sources != 0) &&
-         (*record)->vmas == 0) ||
-        ((*record)->brk_initialized != 0U &&
-         (((*record)->stage == KERNEL_MM_RECORD_LIVE &&
-           (*record)->vmas == 0) ||
-          ((*record)->start_brk & BOAROS_PAGE_MASK) != 0U ||
-          ((*record)->brk_limit & BOAROS_PAGE_MASK) != 0U ||
-          (*record)->start_brk > __atomic_load_n(&(*record)->current_brk, __ATOMIC_ACQUIRE) ||
-          __atomic_load_n(&(*record)->current_brk, __ATOMIC_ACQUIRE) > (*record)->brk_limit)) ||
-        ((*record)->brk_initialized != 0U &&
-         ((*record)->mmap_base < ARCH_MMU_PAGE_SIZE ||
-          (*record)->mmap_base > ARCH_MMU_USER_LIMIT ||
-          (*record)->vdso_address >= ARCH_MMU_USER_LIMIT)) ||
-        (!empty_space_cleanup &&
-         ((*record)->space.allocator != mm->allocator ||
-          (*record)->space.state != ARCH_MMU_USER_SPACE_LIVE))) {
-        return KERNEL_MM_STATUS_STATE;
-    }
+    if (!owner_handle(mm)) return KERNEL_MM_STATUS_STATE;
+    *record = mm->record;
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -266,7 +227,7 @@ static enum kernel_mm_status resolve_record(const struct kernel_mm *mm,
     const struct kernel_mm *bound = 0;
     struct kernel_task *task = kernel_task_current();
     if ((*record)->concurrent && task && kernel_task_mm_borrow(task, &bound) == KERNEL_TASK_STATUS_OK &&
-        bound->allocator == mm->allocator && bound->record_page_address == mm->record_page_address)
+        bound->allocator == mm->allocator && bound->record == mm->record)
         return KERNEL_MM_STATUS_OK;
 #endif
     kernel_assert_service_context();
@@ -322,7 +283,7 @@ enum kernel_mm_status kernel_mm_create(
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return KERNEL_MM_STATUS_STATE;
     }
-    if (physical_page_resolve(allocator,
+    if (physical_page_map_owned(allocator,
                               record_page_address,
                               &pointer) != PHYSICAL_PAGE_STATUS_OK) {
         return abandon_unresolved_record(mm,
@@ -333,7 +294,6 @@ enum kernel_mm_status kernel_mm_create(
 
     clear_page(pointer);
     record = pointer;
-    record->magic = KERNEL_MM_RECORD_MAGIC;
     record->futex_id = reserve_mm_identity();
     if (!record->futex_id) return abandon_unresolved_record(mm, allocator,
         record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
@@ -351,6 +311,7 @@ enum kernel_mm_status kernel_mm_create(
             KERNEL_MM_STATUS_ADDRESS_SPACE);
     }
     mm->allocator = allocator;
+    mm->record = record;
     mm->record_page_address = record_page_address;
     mm->state = KERNEL_MM_LIVE;
     mm->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
@@ -637,7 +598,9 @@ static struct mm_file_resident *find_file_resident(
     size_t index = resident_bucket(address, record->resident_capacity);
     for (struct mm_file_resident *page = record->resident_buckets[index];
          page != 0; page = page->hash_next) {
+#if BOAROS_COST_DIAGNOSTICS
         record->resident_probes++;
+#endif
         if (page->address == address) return page;
     }
     return 0;
@@ -691,7 +654,7 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
         if (kernel_open_file_memory_backed(vma.backing) && offset == last_page && !page->private &&
             vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE) {
             unsigned char *bytes;
-            if (physical_page_resolve(record->space.allocator,
+            if (physical_page_map_owned(record->space.allocator,
                     page->physical_address, (void **)&bytes) !=
                     PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
             size_t tail = (size_t)(size & BOAROS_PAGE_MASK);
@@ -1192,7 +1155,7 @@ static enum kernel_mm_status mm_fork_impl(
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return KERNEL_MM_STATUS_STATE;
     }
-    if (physical_page_resolve(source->allocator,
+    if (physical_page_map_owned(source->allocator,
                               record_page_address,
                               &pointer) != PHYSICAL_PAGE_STATUS_OK) {
         return abandon_unresolved_record(destination,
@@ -1202,7 +1165,6 @@ static enum kernel_mm_status mm_fork_impl(
     }
     clear_page(pointer);
     destination_record = pointer;
-    destination_record->magic = KERNEL_MM_RECORD_MAGIC;
     destination_record->futex_id = reserve_mm_identity();
     if (!destination_record->futex_id) return abandon_unresolved_record(destination,
         source->allocator, record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
@@ -1230,6 +1192,7 @@ static enum kernel_mm_status mm_fork_impl(
                 destination_record->stage =
                     KERNEL_MM_RECORD_VMAS_CLEANUP;
                 destination->allocator = source->allocator;
+                destination->record = destination_record;
                 destination->record_page_address = record_page_address;
                 destination->state = KERNEL_MM_CLEANUP;
                 destination->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
@@ -1250,6 +1213,7 @@ static enum kernel_mm_status mm_fork_impl(
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage = KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator = source->allocator;
+        destination->record = destination_record;
         destination->record_page_address = record_page_address;
         destination->state = KERNEL_MM_CLEANUP;
         destination->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
@@ -1303,6 +1267,7 @@ static enum kernel_mm_status mm_fork_impl(
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage = KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator = source->allocator;
+        destination->record = destination_record;
         destination->record_page_address = record_page_address;
         destination->state = KERNEL_MM_CLEANUP;
         destination->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
@@ -1317,6 +1282,7 @@ static enum kernel_mm_status mm_fork_impl(
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage=KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator=source->allocator;
+        destination->record=destination_record;
         destination->record_page_address=record_page_address;
         destination->state=KERNEL_MM_CLEANUP;
         destination->cleanup_stage=KERNEL_MM_CLEANUP_VMAS;
@@ -1384,6 +1350,7 @@ static enum kernel_mm_status mm_fork_impl(
         for (struct mm_file_mapping *entry=destination_record->file_mappings; entry; entry=entry->next)
             if (kernel_file_mapping_register(&entry->registration)) __builtin_trap();
         destination->allocator = source->allocator;
+        destination->record = destination_record;
         destination->record_page_address = record_page_address;
         destination->state = KERNEL_MM_LIVE;
         destination->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
@@ -1394,6 +1361,7 @@ static enum kernel_mm_status mm_fork_impl(
     failure = fork_status_from_backend(backend_status);
     destination_record->stage = KERNEL_MM_RECORD_VMAS_CLEANUP;
     destination->allocator = source->allocator;
+    destination->record = destination_record;
     destination->record_page_address = record_page_address;
     destination->state = KERNEL_MM_CLEANUP;
     destination->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
@@ -1472,8 +1440,10 @@ static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
     record->tlb_generation++;
     if (batch->count) {
         record->pending_retirement++;
+#if BOAROS_COST_DIAGNOSTICS
         record->retirement_batches++;
         record->retired_pages += batch->count;
+#endif
     }
     return record->active_cpus;
 }
@@ -1546,7 +1516,7 @@ static int current_pins(const struct kernel_mm *mm)
     for (const struct kernel_mm_user_pin *pin = kernel_io_context_current()->user_pins;
          pin; pin = pin->owner_next)
         if (pin->mm->allocator == mm->allocator &&
-            pin->mm->record_page_address == mm->record_page_address) return 1;
+            pin->mm->record == mm->record) return 1;
     return 0;
 }
 static enum kernel_mm_status mm_operation_lock(struct mm_operation *operation)
@@ -1584,7 +1554,9 @@ static void wait_pin_condition(struct kernel_mm_record *record, int drain)
             int blocked = drain ? (record->access_closed == 2 ? record->write_pins :
                 record->access_pins) != 0 : record->access_closed != 0;
             if (!blocked) return;
+#if BOAROS_COST_DIAGNOSTICS
             record->pin_waits++;
+#endif
             if (kernel_wait_prepare(&record->pins_changed, 0, 0, &token) !=
                 KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
@@ -1600,7 +1572,7 @@ static void close_pins(struct mm_operation *operation, int writers_only)
     for (struct kernel_mm_user_pin *pin = kernel_io_context_current()->user_pins;
          pin; pin = pin->owner_next)
         if (pin->mm->allocator == operation->mm->allocator &&
-            pin->mm->record_page_address == operation->mm->record_page_address &&
+            pin->mm->record == operation->mm->record &&
             (!writers_only || (pin->access & KERNEL_MM_WRITE)))
             __builtin_trap();
     {
@@ -1638,7 +1610,7 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
         (access | KERNEL_MM_USER)) return KERNEL_MM_STATUS_ACCESS;
     uint64_t physical = mapping.physical_address & ~BOAROS_PAGE_MASK;
     /* permission许可和取得实际页引用不能被撤映射插入。 */
-    if (physical_page_resolve(mm->allocator, physical, &pointer) !=
+    if (physical_page_map_owned(mm->allocator, physical, &pointer) !=
         PHYSICAL_PAGE_STATUS_OK) return KERNEL_MM_STATUS_PAGE_ACCESS;
     if (record->access_pins == UINT32_MAX || record->write_pins == UINT32_MAX)
         __builtin_trap();
@@ -1653,7 +1625,9 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
     if (physical_page_acquire(mm->allocator, physical) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
     record->access_pins++;
+#if BOAROS_COST_DIAGNOSTICS
     record->pin_acquisitions++;
+#endif
     if (access & KERNEL_MM_WRITE) record->write_pins++;
     struct kernel_io_context *owner = kernel_io_context_current();
     pin->mm=mm; pin->record=record; pin->owner=owner; pin->registration=pin;
@@ -1705,7 +1679,7 @@ enum kernel_mm_status kernel_mm_try_pin_user_page(const struct kernel_mm *mm,
     const struct kernel_mm *bound=NULL;
     if (mm->state!=KERNEL_MM_LIVE || !task || !kernel_task_has_user_context(task) ||
         kernel_task_mm_borrow(task,&bound)!=KERNEL_TASK_STATUS_OK ||
-        bound->allocator!=mm->allocator || bound->record_page_address!=mm->record_page_address)
+        bound->allocator!=mm->allocator || bound->record!=mm->record)
         return KERNEL_MM_STATUS_STATE;
     struct kernel_mm_record *record;
     enum kernel_mm_status status=resolve_record_storage(mm,&record);
@@ -3395,7 +3369,7 @@ static enum arch_mmu_status resolve_record_cow(struct kernel_mm_record *record,
         } else {
             /* 快照实际引用覆盖锁外复制；旧PTE引用另外留在退休批次。 */
             if (physical_page_acquire(allocator,old)) __builtin_trap();
-            if (physical_page_resolve(allocator,old,&source)) {
+            if (physical_page_map_owned(allocator,old,&source)) {
                 physical_page_release(allocator,old);
                 return ARCH_MMU_STATUS_STATE;
             }
@@ -3407,7 +3381,7 @@ static enum arch_mmu_status resolve_record_cow(struct kernel_mm_record *record,
             physical_page_release(allocator,old);
             return allocated == PHYSICAL_PAGE_STATUS_EMPTY ? ARCH_MMU_STATUS_NO_MEMORY : ARCH_MMU_STATUS_STATE;
         }
-        if (physical_page_resolve(allocator,replacement,&destination)) {
+        if (physical_page_map_owned(allocator,replacement,&destination)) {
             physical_page_release(allocator,replacement);
             physical_page_release(allocator,old);
             return ARCH_MMU_STATUS_STATE;
@@ -3630,7 +3604,7 @@ static enum kernel_mm_status map_private_file_page(
                    ? KERNEL_MM_STATUS_NO_MEMORY
                    : KERNEL_MM_STATUS_STATE;
     }
-    if (physical_page_resolve(record->space.allocator,
+    if (physical_page_map_owned(record->space.allocator,
                               private_address,
                               &private_page) !=
         PHYSICAL_PAGE_STATUS_OK) {
@@ -4493,7 +4467,7 @@ static enum kernel_mm_status allocate_private_page(struct physical_page_allocato
     enum physical_page_status status = physical_page_allocate(allocator, address);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY) return KERNEL_MM_STATUS_NO_MEMORY;
     if (status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    if (physical_page_resolve(allocator, *address, pointer) != PHYSICAL_PAGE_STATUS_OK) {
+    if (physical_page_map_owned(allocator, *address, pointer) != PHYSICAL_PAGE_STATUS_OK) {
         physical_page_release(allocator, *address); *address = KERNEL_MM_NO_PAGE;
         return KERNEL_MM_STATUS_PAGE_ACCESS;
     }
@@ -4563,7 +4537,10 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
     struct kernel_mm_retirement batch = {0};
     struct mm_file_resident *resident = 0;
     void *old_bytes = 0, *copy = 0;
-    unsigned missing = 0, count = 0;
+    unsigned missing = 0;
+#if BOAROS_COST_DIAGNOSTICS
+    unsigned count = 0;
+#endif
     uint32_t targets = 0;
     int shared = vma.kind == KERNEL_VMA_KIND_FILE_SHARED;
     int disk = !kernel_open_file_memory_backed(file);
@@ -4616,7 +4593,7 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
                 old = KERNEL_MM_NO_PAGE;
                 goto finish;
             }
-            if (physical_page_acquire(allocator,old) || physical_page_resolve(allocator,old,&old_bytes))
+            if (physical_page_acquire(allocator,old) || physical_page_map_owned(allocator,old,&old_bytes))
                 __builtin_trap();
         } else if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
             if (arch_mmu_user_leaf_missing(&record->space,address,&missing)) __builtin_trap();
@@ -4631,7 +4608,7 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
         status = !error ? KERNEL_MM_STATUS_OK : error == -KERNEL_EBUSY ? KERNEL_MM_STATUS_CONFLICT :
             error == -KERNEL_ENOMEM ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
         if (status == KERNEL_MM_STATUS_OK) {
-            count += source.created;
+            MM_DIAGNOSTIC(count += source.created);
             replacement = source.address;
         }
     }
@@ -4639,9 +4616,9 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
         status = allocate_private_page(allocator,&replacement,&copy);
         if (status == KERNEL_MM_STATUS_OK) {
             void *bytes = old_bytes;
-            if (!cookie && physical_page_resolve(allocator,source.address,&bytes)) __builtin_trap();
+            if (!cookie && physical_page_map_owned(allocator,source.address,&bytes)) __builtin_trap();
             memcpy(copy, bytes, BOAROS_PAGE_SIZE);
-            count++;
+            MM_DIAGNOSTIC(count++);
         }
     }
     if (status == KERNEL_MM_STATUS_OK && !cookie) {
@@ -4652,11 +4629,13 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
     for (unsigned i=0; i<2 && status==KERNEL_MM_STATUS_OK; i++) if (missing & (1U << i)) {
         void *table;
         status = allocate_private_page(allocator,&prepared.tables[i],&table);
-        if (status == KERNEL_MM_STATUS_OK) { clear_page(table); count++; }
+        if (status == KERNEL_MM_STATUS_OK) { clear_page(table); MM_DIAGNOSTIC(count++); }
     }
     enum kernel_mm_status gate_status = mm_operation_lock(operation);
     if (gate_status != KERNEL_MM_STATUS_OK) status = gate_status;
+#if BOAROS_COST_DIAGNOSTICS
     { KERNEL_RAW_SCOPE(guard,&record->metadata); record->prepared_pages += count; }
+#endif
     if (status == KERNEL_MM_STATUS_OK) {
         kernel_vfs_node_lock(node,&inode,0);
         uint64_t latest;
@@ -4760,7 +4739,9 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
     uint64_t shared_preparation = KERNEL_MM_NO_PAGE;
     void *old_pointer = 0, *new_pointer;
     unsigned missing = 0;
+#if BOAROS_COST_DIAGNOSTICS
     unsigned prepared_count = 0;
+#endif
     uint32_t targets;
     struct kernel_mm_retirement batch = {0};
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
@@ -4793,7 +4774,7 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
             }
             /* COW旧页为只读快照；实际引用覆盖解锁后的复制和竞争者提交。 */
             if (physical_page_acquire(allocator, old) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-            if (physical_page_resolve(allocator, old, &old_pointer) != PHYSICAL_PAGE_STATUS_OK) {
+            if (physical_page_map_owned(allocator, old, &old_pointer) != PHYSICAL_PAGE_STATUS_OK) {
                 physical_page_release(allocator, old);
                 return KERNEL_MM_STATUS_PAGE_ACCESS;
             }
@@ -4814,13 +4795,13 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
         status = result == KERNEL_MEMORY_OBJECT_OK ? KERNEL_MM_STATUS_OK :
             result == KERNEL_MEMORY_OBJECT_NO_MEMORY ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_STATE;
         if (status == KERNEL_MM_STATUS_OK) {
-            prepared_count += created != 0;
+            MM_DIAGNOSTIC(prepared_count += created != 0);
             shared_preparation = replacement;
         }
     } else {
         status = allocate_private_page(allocator, &replacement, &new_pointer);
         if (status == KERNEL_MM_STATUS_OK) {
-            prepared_count++;
+            MM_DIAGNOSTIC(prepared_count++);
             if (cookie) {
                 memcpy(new_pointer, old_pointer, BOAROS_PAGE_SIZE);
             } else clear_page(new_pointer);
@@ -4829,11 +4810,13 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
     for (unsigned i = 0; i < 2 && status == KERNEL_MM_STATUS_OK; i++) if (missing & (1U << i)) {
         void *pointer;
         status = allocate_private_page(allocator, &prepared.tables[i], &pointer);
-        if (status == KERNEL_MM_STATUS_OK) { clear_page(pointer); prepared_count++; }
+        if (status == KERNEL_MM_STATUS_OK) { clear_page(pointer); MM_DIAGNOSTIC(prepared_count++); }
     }
     enum kernel_mm_status gate_status = mm_operation_lock(operation);
     if (gate_status != KERNEL_MM_STATUS_OK) status = gate_status;
+#if BOAROS_COST_DIAGNOSTICS
     { KERNEL_RAW_SCOPE(guard, &record->metadata); record->prepared_pages += prepared_count; }
+#endif
     if (status == KERNEL_MM_STATUS_OK) {
         struct kernel_mm_mapping current;
         KERNEL_RAW_SCOPE(guard, &record->metadata);
@@ -4900,7 +4883,9 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
         enum kernel_mm_status status = memory_file ? mapped_file_fault(&operation,address,access) :
             anonymous_fault(&operation, address, access);
         if (status != KERNEL_MM_STATUS_CONFLICT || current_pins(mm)) return status;
+#if BOAROS_COST_DIAGNOSTICS
         { KERNEL_RAW_SCOPE(guard, &operation.record->metadata); operation.record->fault_retries++; }
+#endif
         /* loser归还全部私有候选，下一轮重取VMA/PTE，不把旧许可带过睡眠。 */
     }
 }
@@ -4971,7 +4956,7 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
     if (!mm || !task || !kernel_task_has_user_context(task) ||
         kernel_task_mm_borrow(task, &task_mm) !=
                      KERNEL_TASK_STATUS_OK ||
-        task_mm->record_page_address != mm->record_page_address) task = 0;
+        task_mm->record != mm->record) task = 0;
     uint64_t block_reads = task ? kernel_proc_task_block_reads(task) : 0U;
     enum kernel_mm_status status = resolve_user_fault(mm, address, access);
     if (status == KERNEL_MM_STATUS_OK && task)
