@@ -2006,6 +2006,15 @@ static void run_directory_operations(struct kernel_files *files,
     /* The root directory opens read-only and lists its entries. */
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U, 0, 110U);
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 1, 110U);
+    for (uint64_t capacity = 0; capacity <= 1; capacity++) {
+        if (kernel_files_getdents(files, mm, 0, dir_buffer, capacity,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != -KERNEL_EINVAL)
+            fail_files(129U, -KERNEL_EINVAL, result);
+        if (kernel_files_lseek(files, 0, 0, KERNEL_FILES_SEEK_CUR,
+                               &result) != KERNEL_FILES_STATUS_OK || result != 0)
+            fail_files(129U, 0, result);
+    }
     /* getdents64 exposes the real dot entries; the VFS must not silently
      * turn a directory stream into an inode-name-only index. */
     if (kernel_files_getdents(files,

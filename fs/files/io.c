@@ -2155,10 +2155,6 @@ enum kernel_files_status kernel_files_getdents(
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (count == 0U) {
-        *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
-    }
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
@@ -2167,7 +2163,7 @@ enum kernel_files_status kernel_files_getdents(
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
     /* The descriptor offset is the backend cookie for the next record. */
     position = kernel_open_file_offset(description);
-    while (total < request) {
+    do {
         size_t name_length;
         size_t record_length;
         size_t copied = 0U;
@@ -2246,7 +2242,7 @@ enum kernel_files_status kernel_files_getdents(
             KERNEL_OPEN_FILE_STATUS_OK) {
             return KERNEL_FILES_STATUS_STATE;
         }
-    }
+    } while (total < request);
     KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;

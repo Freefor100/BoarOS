@@ -8,6 +8,11 @@ boundary.tmpfs-shared-minflt
 boundary.tmpfs-private-cow-minflt
 boundary.tmpfs-failed-fault-count
 
+getdents.zero-before-eof
+getdents.small-before-eof
+getdents.capacity-cookie
+getdents.zero-at-eof
+getdents.zero-after-rewind
 path.open
 path.getfl
 path.getfd

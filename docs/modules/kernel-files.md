@@ -238,7 +238,7 @@ console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续
 
 `faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份仅需对普通文件执行请求保留“至少一个执行位”约束，对只读挂载的普通文件或目录写请求返回 `EROFS`；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
-`kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；缓冲区连第一条记录都放不下返回 `-EINVAL`，用户 fault 在已完整发出的记录上返回前缀计数。
+`kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；即使容量为零也先判断是否存在下一条记录：存在但放不下返回 `-EINVAL`，EOF 返回零。容量不足不消费该项 cookie；用户 fault 在已完整发出的记录上返回前缀计数。
 
 ## 关闭与退出回收
 
