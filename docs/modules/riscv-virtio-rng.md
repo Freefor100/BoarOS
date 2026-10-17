@@ -38,6 +38,7 @@ IRQ owner，允许显式重试。运行期间同样保留owner，60秒后先重�
 任务最终释放仍负责归还缓存页。入口和退出恢复调用者原有 IRQ 状态。
 显式擦除复用普通 RAM 的宽字 `memset`，随后以指针输入和编译器 memory clobber
 阻止死存储删除，与固定 Linux 的 `memzero_explicit` 一致，不再另写逐字节擦除循环。
+RV 的 ChaCha block 函数代码按 2 KiB 对齐，当前函数小于这一范围，输出循环不会因其他函数尺寸变化而让一条压缩指令旁的 32 位 store 横跨代码页；这避免 QEMU 拆分热点翻译块，不改变算法或输出缓冲区的对齐要求。
 吞吐与定时响应对照见[数据路径实验](../learning/data-path-budget-experiments.md#大-getrandom)。
 
 ## 固定依据与验证

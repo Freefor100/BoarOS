@@ -1316,7 +1316,14 @@ enum kernel_signal_select_result kernel_signal_select(
     struct kernel_signal_delivery *delivery)
 {
     for (;;) {
-        struct kernel_task *leader;
+        /* 无事件只观察可交付的pending位，不消费载荷；不借用等待者的
+         * wait_mask规则。真正取走事件仍在下面同一调度保护内完成。 */
+        struct kernel_task *leader = signal_group_leader(task);
+        uint64_t observed = task->signal_pending | (leader ? leader->group_pending : 0);
+        if (!task->signal_fault.signal && !task->terminate_requested &&
+            !task->signal_restore_mask && !(observed & ~task->signal_blocked))
+            return KERNEL_SIGNAL_SELECT_NONE;
+
         struct kernel_signal_fault fault;
         struct kernel_signal_wait_info info = {0};
         uint64_t pending;

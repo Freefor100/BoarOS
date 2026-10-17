@@ -65,6 +65,11 @@ static void quarter_round(uint32_t *a,
     *b = rotate_left(*b, 7U);
 }
 
+/* RV压缩指令可让32位store跨代码页；让热点block主体留在同一页内，
+ * 避免QEMU反复拆分输出循环。当前主体小于2 KiB。 */
+#if defined(__riscv)
+__attribute__((aligned(2048)))
+#endif
 void kernel_random_chacha20_block(
     const uint8_t key[32],
     const uint8_t nonce[12],

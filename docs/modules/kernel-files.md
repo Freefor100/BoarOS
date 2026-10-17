@@ -31,7 +31,7 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW；未支持的 DIRECT/NOATIME 仍返回 EINVAL。FD_CLOEXEC 仍属于各张表。
 普通与受控 FD 表共同使用这些保护和引用规则，不再封存 OFD、pipe 或表的并发资格。`kernel_files_check_task_domain()` 在受控任务创建时检查当前实际消费者和资源绑定；它不改变对象状态，也不要求额外保留 CPU0 控制引用来规避末次释放。
 
-普通 `read/pread/readv` 与 `write/pwrite/writev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。热读不创建执行请求；冷读在调用 CPU 准备未发布候选，把实际缺失批次交给既有 CPU0 worker。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
+普通 `read/pread/readv` 与 `write/pwrite/writev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选，把实际缺失批次交给既有 CPU0 worker。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
 
 共享 offset 的 rank10 mutex 覆盖整次调用；seek、同步和需要后端的操作在提交前取得资格，worker 借用它而不重新等待。ftruncate 同样在排队前取得文件写操作门。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
 

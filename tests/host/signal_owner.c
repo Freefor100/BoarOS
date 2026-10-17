@@ -1,6 +1,32 @@
 /* The static production selector is linked in this translation unit; the
  * scheduler domain, group cursor and storage borrow remain real implementations. */
-#include "../../kernel/sched/signal.c"
+/* Stop/fatal scheduling belongs to the native signal cases. This model must
+ * fail if its pending-selection cases enter one of those transitions. */
+#define process_group_request_exit signal_owner_unexpected_group_exit
+#define kernel_user_thread_exit signal_owner_unexpected_exit
+#define process_group_is_orphaned signal_owner_unexpected_orphan
+#define kernel_scheduler_wake_signal signal_owner_unexpected_wake
+#define scheduler_switch_current_away signal_owner_unexpected_switch
+#define stopped_append_locked signal_owner_unexpected_stop
+#ifndef SIGNAL_SOURCE
+#define SIGNAL_SOURCE "../../kernel/sched/signal.c"
+#endif
+#include SIGNAL_SOURCE
+#undef process_group_request_exit
+#undef kernel_user_thread_exit
+#undef process_group_is_orphaned
+#undef kernel_scheduler_wake_signal
+#undef scheduler_switch_current_away
+#undef stopped_append_locked
+#include <stdlib.h>
+void signal_owner_unexpected_group_exit(struct kernel_task *task,enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
+{ (void)task;(void)reason;(void)status;(void)detail;abort(); }
+void signal_owner_unexpected_exit(enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
+{ (void)reason;(void)status;(void)detail;abort(); }
+int signal_owner_unexpected_orphan(const struct kernel_task *task) { (void)task;abort(); }
+enum kernel_scheduler_status signal_owner_unexpected_wake(struct kernel_task *task) { (void)task;abort(); }
+enum kernel_scheduler_status signal_owner_unexpected_switch(struct kernel_task *task) { (void)task;abort(); }
+void signal_owner_unexpected_stop(struct kernel_task *task) { (void)task;abort(); }
 #include <assert.h>
 #include <stdio.h>
 void signal_owner_cases(unsigned *lock_calls)
@@ -25,9 +51,25 @@ void signal_owner_cases(unsigned *lock_calls)
     table.actions[16].handler=KERNEL_SIGNAL_DFL;
     struct kernel_task *previous=kernel_cpu_current()->current;
     kernel_cpu_current()->current=&leader;
-    leader.signal_wait_mask=leader.group_pending=signal_mask(17);
+    struct kernel_signal_delivery delivery;
+    *lock_calls=0;
+    assert(kernel_signal_select(&leader,&delivery)==KERNEL_SIGNAL_SELECT_NONE);
+    assert(*lock_calls==0);
+    table.actions[16].handler=0x1000;
+    leader.signal_blocked=0;leader.group_pending=signal_mask(17);
+    leader.group_sender[16]=41;leader.group_signal_code[16]=1;
+    leader.group_child_info=(struct kernel_signal_child_info){.uid=22,.status=37};
+    *lock_calls=0;
+    assert(kernel_signal_select(&leader,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
+    assert(*lock_calls==1 && !leader.group_pending);
+    assert(delivery.signal==17 && delivery.sender==41 && delivery.code==1 && delivery.uid==22 && delivery.status==37);
+    table.actions[16].handler=KERNEL_SIGNAL_DFL;
+    leader.signal_blocked=leader.signal_wait_mask=leader.group_pending=signal_mask(17);
     leader.group_sender[16]=42;leader.group_signal_code[16]=5;
     leader.group_child_info=(struct kernel_signal_child_info){.uid=23,.status=19};
+    *lock_calls=0;
+    assert(kernel_signal_select(&leader,&delivery)==KERNEL_SIGNAL_SELECT_NONE);
+    assert(*lock_calls==0 && leader.group_pending==signal_mask(17));
     struct kernel_signal_wait_info info;
     assert(!kernel_signal_wait_take(&leader,&info));
     assert(info.signal==17 && info.sender==42 && info.code==5 && info.uid==23 && info.status==19);
