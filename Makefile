@@ -2117,6 +2117,10 @@ test-demand-read-riscv:
 
 include arch/loongarch/build.mk
 
+.PHONY: test-elf-layout-host
+test-elf-layout-host:
+	sh tests/elf-layout-host.sh
+
 .PHONY: test-ci-host
 test-ci-host:
 	python3 -B -m unittest discover -s tests/ci -p 'test_*.py'

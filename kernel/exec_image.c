@@ -44,7 +44,7 @@ enum kernel_exec_image_status kernel_exec_image_prepare(
     int64_t error;
 
     if (request == 0 || heap == 0 || image == 0 || linux_result == 0 ||
-        image->mm.state != KERNEL_MM_EMPTY || image->arch_private != 0 ||
+        image->mm.state != KERNEL_MM_EMPTY ||
         exec_allocator == 0 || exec_kernel_table == 0 ||
         heap->page_allocator != exec_allocator) {
         return KERNEL_EXEC_IMAGE_STATUS_STATE;
@@ -75,7 +75,6 @@ enum kernel_exec_image_status kernel_exec_image_cleanup(
     enum kernel_mm_status status;
 
     if (heap == 0 || image == 0 ||
-        image->arch_private != 0 ||
         (image->mm.state != KERNEL_MM_EMPTY &&
          image->mm.state != KERNEL_MM_LIVE &&
          image->mm.state != KERNEL_MM_CLEANUP &&

@@ -38,7 +38,7 @@ static int mm_owner_absent(const struct kernel_mm *mm)
 
 static int image_cleanup_complete(const struct kernel_exec_image *image)
 {
-    return mm_owner_absent(&image->mm) && image->arch_private == 0;
+    return mm_owner_absent(&image->mm);
 }
 
 static int transaction_resources_empty(

@@ -31,7 +31,6 @@ struct kernel_exec_image_request {
 
 struct kernel_exec_image {
     struct kernel_mm mm;
-    void *arch_private;
     uintptr_t entry;
     uintptr_t stack_pointer;
     uintptr_t thread_pointer;
