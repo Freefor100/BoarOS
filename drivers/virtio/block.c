@@ -437,9 +437,14 @@ static void harvest_used(struct virtio_block_device *device, uint32_t pending)
             diagnose_queue_fault(device, "slot-state", used_index, observed_count, pending, &item);
             fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
         }
-        r->result = r->status == VIRTIO_BLOCK_STATUS_OK ? KERNEL_BLOCK_STATUS_OK :
+        /* modern IN 的 status 在全部数据之后；短完成并不覆盖它。合法
+         * used 已结束此请求 DMA，按请求失败归还，不因此复位其他 owner。 */
+        int short_read = !legacy_transport(device) && r->header.type == VIRTIO_BLOCK_REQUEST_IN &&
+            completion.length != r->data_length + 1;
+        r->result = short_read ? KERNEL_BLOCK_STATUS_IO :
+            r->status == VIRTIO_BLOCK_STATUS_OK ? KERNEL_BLOCK_STATUS_OK :
             r->status == VIRTIO_BLOCK_STATUS_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED : KERNEL_BLOCK_STATUS_IO;
-        if (r->status > VIRTIO_BLOCK_STATUS_UNSUPPORTED) {
+        if (!short_read && r->status > VIRTIO_BLOCK_STATUS_UNSUPPORTED) {
             diagnose_queue_fault(device, "device-status", used_index, observed_count, pending, &item);
             fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
         }
@@ -694,7 +699,8 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
         d[indices[i + 1]] = (struct virtio_descriptor){segments[i].address, segments[i].length,
             VIRTQ_DESC_NEXT | (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0), indices[i + 2]};
     d[indices[count + 1]] = (struct virtio_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
-    if (virtio_split_enqueue(&device->queue, &device->transport, indices[0], r, 1,
+    if (virtio_split_enqueue(&device->queue, &device->transport, indices[0], r,
+        !legacy_transport(device) && type == VIRTIO_BLOCK_REQUEST_IN ? 0 : 1,
         1U + (type == VIRTIO_BLOCK_REQUEST_IN ? data_length : 0)) != VIRTIO_OK) __builtin_trap();
     if (device->queue.inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->queue.inflight;
     if (type == VIRTIO_BLOCK_REQUEST_IN) kernel_proc_task_note_block_read();

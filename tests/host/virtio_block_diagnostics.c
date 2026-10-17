@@ -31,6 +31,8 @@ static unsigned char sg_disk[1048576];
 static unsigned notifications, first_notify_heads, sg_max_segments, park_calls;
 static unsigned sg_fail_sector;
 static unsigned sg_max_bytes, ack_calls;
+static uint32_t sg_used_length = UINT32_MAX;
+static unsigned char sg_read_status;
 static uint32_t (*underlying_ack)(void *);
 static void (*before_take)(void);
 static struct kernel_wait_queue *late_wait_queue;
@@ -113,6 +115,13 @@ static void sg_device_step(void)
         uint64_t offset = sector * 512;
         unsigned bytes = 0;
         int error = sector == sg_fail_sector;
+        uint32_t reported = type == 0 ? sg_used_length : UINT32_MAX;
+        unsigned writable = 0;
+        if (reported != UINT32_MAX)
+            for (unsigned part = head;; part = d[part].next) {
+                if (d[part].flags & 2) writable += d[part].length;
+                if (!(d[part].flags & 1)) break;
+            }
         while (d[at].flags & 1) {
             at = d[at].next;
             assert(at < size);
@@ -123,7 +132,7 @@ static void sg_device_step(void)
             if (registers[0x10c / 4]) assert(segments < registers[0x10c / 4]);
             assert(offset + d[at].length <= sizeof(sg_disk));
             unsigned char *buffer = physical_pointer(d[at].address, d[at].length);
-            if (!error) {
+            if (!error && (reported == UINT32_MAX || reported >= writable)) {
                 if (type == 0) memcpy(buffer, sg_disk + offset, d[at].length);
                 else memcpy(sg_disk + offset, buffer, d[at].length);
             }
@@ -138,8 +147,11 @@ static void sg_device_step(void)
             phase_held_status=physical_pointer(d[at].address,1);
             continue;
         }
-        *(unsigned char *)physical_pointer(d[at].address, 1) = error ? 1 : 0;
-        done[batch_pushed++ % size] = (struct wire_completion){head, error || type != 0 ? 1 : bytes + 1};
+        *(unsigned char *)physical_pointer(d[at].address, 1) =
+            reported != UINT32_MAX ? sg_read_status : error ? 1 : 0;
+        done[batch_pushed++ % size] = (struct wire_completion){head,
+            reported != UINT32_MAX ? reported : error || type != 0 ? 1 : bytes + 1};
+        if (reported != UINT32_MAX) sg_used_length = UINT32_MAX;
     }
     if (phase_hold && phase_crossed_window && phase_held_status) {
         *phase_held_status=0;
@@ -492,7 +504,7 @@ static void run_case(unsigned version, enum fault_kind kind)
         kind == NO_COMPLETION ? KERNEL_BLOCK_STATUS_TIMEOUT : KERNEL_BLOCK_STATUS_IO));
     assert(device.active == 0 && device.queue.inflight == 0);
     assert(request_at(&device, 0)->state == 0 && request_at(&device, 0)->owner == NULL);
-    if (kind <= DEVICE_UNSUPPORTED) {
+    if (kind <= DEVICE_UNSUPPORTED || (version == 2 && kind == ZERO_LENGTH)) {
         assert(diagnostic[0] == 0);
         assert(device_live(&device));
     } else {
@@ -1136,8 +1148,65 @@ static void fragmented_descriptors_case(unsigned version)
     printf("PASS block fragmented descriptor ownership transport=%u: SG skips a live chain\n", version);
 }
 
+static void short_read_case(unsigned version, unsigned mode, unsigned length_kind)
+{
+    struct riscv_virtio_mmio_block device = {0};
+    struct physical_page_allocator allocator = {0};
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0x74726976; registers[1] = version; registers[2] = 2;
+    registers[0x10 / 4] = 1; registers[0x34 / 4] = 64;
+    registers[0x100 / 4] = sizeof(sg_disk) / 512;
+    fault = SG_BATCH; batch_popped = batch_pushed = 0; clock_value = 0;
+    notifications = 0; diagnostic_length = 0; diagnostic[0] = 0;
+    sg_fail_sector = UINT32_MAX;
+    memset(batch_output, 0xa5, sizeof(batch_output));
+    for (unsigned i = 0; i < sizeof(sg_disk); i++) sg_disk[i] = (unsigned char)(i * 7 + i / 512 + 3);
+    assert(initialize_model(&device, registers, sizeof(registers), &allocator,
+        dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    unsigned bytes = mode == 2 ? 1024 : 512;
+    unsigned lengths[] = {0, 1, bytes, bytes + 1, bytes + 2};
+    unsigned length = lengths[length_kind];
+    sg_used_length = length;
+    /* A short modern completion does not cover this status byte. It cannot
+     * turn an ordinary failed request into a terminal invalid-status fault. */
+    sg_read_status = version == 2 && length_kind != 1 && length < bytes + 1 ? 7 : 0;
+    struct block_read_span spans[2] = {{0, batch_output[0], 512, 0, 0},
+        {512, batch_output[1], 512, 0, 0}};
+    enum kernel_block_status status = mode == 2
+        ? kernel_block_read_batch(&device.block, spans, 2, NULL)
+        : device.block.read(device.block.context, mode == 1 ? 1 : 0,
+            batch_output[0], mode == 1 ? 511 : 512);
+    int malformed = length > bytes + 1 || (!length && version == 1);
+    int short_modern = version == 2 && length < bytes + 1;
+    if (status != (malformed || short_modern ? KERNEL_BLOCK_STATUS_IO : KERNEL_BLOCK_STATUS_OK))
+        fprintf(stderr, "read completion transport=%u mode=%u used=%u status=%u buffer[0]=%u\n",
+            version, mode, length, status, batch_output[0][0]);
+    assert(status == (malformed || short_modern ? KERNEL_BLOCK_STATUS_IO : KERNEL_BLOCK_STATUS_OK));
+    if (short_modern) {
+        for (unsigned i = 0; i < 512; i++) assert(batch_output[0][i] == 0xa5);
+        if (mode == 2) assert(!spans[0].completed && !spans[1].completed);
+        assert(!diagnostic_length && device_live(&device));
+    }
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed);
+    if (!malformed) {
+        /* A short request frees its own owner; the device still accepts an
+         * unrelated valid read and its real payload. */
+        assert(device.block.read(device.block.context, 0, batch_output[0], 512) == KERNEL_BLOCK_STATUS_OK);
+        assert(!memcmp(batch_output[0], sg_disk, 512));
+    } else assert(!device_live(&device) && diagnostic_length);
+    assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
+    printf("PASS read completion transport=%u mode=%u bytes=%u used=%u\n", version, mode, bytes, length);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "short-read")) {
+        short_read_case(2, 0, 1);
+        for (unsigned version = 1; version <= 2; version++)
+            for (unsigned mode = 0; mode < 3; mode++)
+                for (unsigned length = 0; length < 5; length++) short_read_case(version, mode, length);
+        return 0;
+    }
     if (argc==2 && !strcmp(argv[1],"notifications")) {
         notification_conditions_case(1); notification_conditions_case(2); return 0;
     }
@@ -1203,6 +1272,8 @@ int main(int argc, char **argv)
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
+        for (unsigned mode = 0; mode < 3; mode++)
+            for (unsigned length = 0; length < 5; length++) short_read_case(version, mode, length);
         late_harvest_case(version); notification_conditions_case(version);
         large_phase_case(version);
         write_phase_case(version,0);
