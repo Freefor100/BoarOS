@@ -32,14 +32,15 @@ static void wake(struct virtio_net_device *d)
 { if (kernel_wait_queue_wake_all(&d->progress) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap(); }
 static unsigned free_head(uint32_t mask)
 { for (unsigned i = 0; i < 32; i++) if (!(mask & (UINT32_C(1) << i))) return i; return 32; }
-static void publish(struct virtio_net_device *d, unsigned q, unsigned id, unsigned b)
+static void enqueue(struct virtio_net_device *d, unsigned q, unsigned id, unsigned b)
 {
     void *token = q ? (void *)&d->tx_state[b] : (void *)&d->rx_state[b];
-    if (virtio_split_publish(&d->split[q], &d->transport, q, id, token,
+    if (virtio_split_enqueue(&d->split[q], &d->transport, id, token,
         q ? 0 : header(d), q ? 2048 : 2048 - padding(d)) != VIRTIO_OK) __builtin_trap();
 }
 static void refill_rx(struct virtio_net_device *d)
 {
+    unsigned submitted = 0;
     while (!d->failed && !d->stopping && d->configured && d->rx_count && d->rx_posted != UINT32_MAX) {
         unsigned id = free_head(d->rx_posted);
         unsigned b = d->rx_free[d->rx_head++ % 64];
@@ -49,8 +50,9 @@ static void refill_rx(struct virtio_net_device *d)
         struct virtio_descriptor *desc = queue(d, 0);
         desc[id] = (struct virtio_descriptor){ d->rx_phys + b * 2048 + padding(d), 2048 - padding(d), 2, 0 };
         d->rx_posted |= UINT32_C(1) << id;
-        publish(d, 0, id, b);
+        enqueue(d, 0, id, b); submitted++;
     }
+    if (submitted && virtio_split_notify(&d->split[0], &d->transport, 0) != VIRTIO_OK) __builtin_trap();
 }
 #if BOAROS_COST_DIAGNOSTICS
 static void latency_sample(struct virtio_net_device *d, uint64_t elapsed,
@@ -77,6 +79,7 @@ static void note_tx_free(struct virtio_net_device *d, unsigned b, uint64_t now)
 #endif
 static void flush_tx(struct virtio_net_device *d)
 {
+    unsigned submitted = 0;
     while (!d->failed && !d->stopping && d->configured && d->tx_count && d->tx_posted != UINT32_MAX) {
         unsigned id = free_head(d->tx_posted);
         unsigned b = d->tx_pending[d->tx_head++ % 64];
@@ -103,8 +106,9 @@ static void flush_tx(struct virtio_net_device *d)
         }
 #endif
         d->tx_posted |= UINT32_C(1) << id;
-        publish(d, 1, id, b);
+        enqueue(d, 1, id, b); submitted++;
     }
+    if (submitted && virtio_split_notify(&d->split[1], &d->transport, 1) != VIRTIO_OK) __builtin_trap();
 }
 static void diagnostic_text(const char *p) { while (*p) kernel_console_putc(*p++); }
 static void diagnostic_hex(uint64_t v)
@@ -247,9 +251,11 @@ static void interrupt(void *owner)
 static int reset(struct virtio_net_device *d)
 {
     if (virtio_transport_reset(&d->transport) != VIRTIO_OK) return -KERNEL_EIO;
+    uintptr_t irq = arch_interrupt_save();
     d->configured = 0;
     for (unsigned q = 0; q < 2; q++) if (d->split[q].size &&
         virtio_split_reset(&d->split[q], &d->transport) != VIRTIO_OK) __builtin_trap();
+    arch_interrupt_restore(irq);
     return 0;
 }
 static int allocate(struct virtio_net_device *d, unsigned order, uint64_t *phys, void **data)
@@ -433,41 +439,35 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     void (*release)(void *owner), int abandon)
 {
     if (!d || !release) return 0;
+    void *owners[VIRTIO_NET_BUFFERS];
     unsigned released = 0;
     uintptr_t saved = arch_interrupt_save();
-    if (abandon) {
-        if (!d->transport.quiescent || d->transport.started) __builtin_trap();
-        /* reset/stop 已确认 DMA 停止，归还所有仍持有的 owner。 */
-        for (unsigned b = 0; b < VIRTIO_NET_BUFFERS; b++) {
+    if (abandon && (!d->transport.quiescent || d->transport.started)) __builtin_trap();
+    unsigned next = 0;
+    while (abandon ? next < VIRTIO_NET_BUFFERS : d->tx_done_count != 0) {
+        unsigned b;
+        if (abandon) {
+            b = next++;
             if (!d->tx_owner[b]) continue;
-            release(d->tx_owner[b]);
-            d->tx_owner[b] = 0;
-            d->tx_state[b] = TX_FREE;
-            d->tx_capacity_generation++;
-#if BOAROS_COST_DIAGNOSTICS
-            note_tx_free(d, b, arch_time_read());
-#endif
-            released++;
-        }
-        d->tx_head = 0; d->tx_count = 0; d->tx_done_head = 0; d->tx_done_count = 0;
-    } else {
-        while (d->tx_done_count) {
-            unsigned b = d->tx_done[d->tx_done_head++ % VIRTIO_NET_BUFFERS];
+        } else {
+            b = d->tx_done[d->tx_done_head++ % VIRTIO_NET_BUFFERS];
             d->tx_done_count--;
             if (d->tx_state[b] != TX_DONE || !d->tx_owner[b]) __builtin_trap();
-            release(d->tx_owner[b]);
-            d->tx_owner[b] = 0;
-            d->tx_state[b] = TX_FREE;
-            d->tx_capacity_generation++;
-#if BOAROS_COST_DIAGNOSTICS
-            note_tx_free(d, b, arch_time_read());
-#endif
-            released++;
         }
+        /* 先归还槽位与capacity，再在IRQ外释放已摘下的独立owner。 */
+        owners[released++] = d->tx_owner[b];
+        d->tx_owner[b] = 0; d->tx_state[b] = TX_FREE;
+        d->tx_capacity_generation++;
+#if BOAROS_COST_DIAGNOSTICS
+        note_tx_free(d, b, arch_time_read());
+#endif
     }
+    if (abandon) d->tx_head = d->tx_count = d->tx_done_head = d->tx_done_count = 0;
     arch_interrupt_restore(saved);
+    for (unsigned i = 0; i < released; i++) release(owners[i]);
     return released;
 }
+
 int virtio_net_send(struct virtio_net_device *d, const void *data, uint32_t size)
 {
     if (!data) return -KERNEL_EINVAL;
@@ -477,7 +477,9 @@ int virtio_net_quiesce(struct virtio_net_device *d)
 {
     if (!d || !d->transport.context) return 0;
     uintptr_t saved = arch_interrupt_save(); d->stopping = 1;
+    arch_interrupt_restore(saved);
     if (reset(d)) { arch_interrupt_restore(saved); return -KERNEL_EIO; }
+    (void)arch_interrupt_save();
     if (d->irq_registered) {
         d->transport.ops.unregister_irq(d->transport.context, d->irq_source, d);
         d->irq_registered = 0;
@@ -487,13 +489,14 @@ int virtio_net_quiesce(struct virtio_net_device *d)
 int virtio_net_stop(struct virtio_net_device *d)
 {
     if (!d || !d->transport.context) return 0;
+    if (virtio_net_quiesce(d)) return -KERNEL_EIO;
     uintptr_t saved = arch_interrupt_save();
-    if (virtio_net_quiesce(d)) { arch_interrupt_restore(saved); return -KERNEL_EIO; }
     /* DMA停止不能撤销协议的loan、CPU lease和外部TX owner。 */
     if (d->loaned) { arch_interrupt_restore(saved); return -KERNEL_EBUSY; }
     for (unsigned i = 0; i < 64; i++) if (d->rx_state[i] == RX_CPU || d->tx_owner[i]) {
         arch_interrupt_restore(saved); return -KERNEL_EBUSY;
     }
+    arch_interrupt_restore(saved);
     if (d->queue_phys && physical_page_release_order(d->allocator, d->queue_phys, d->queue_order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     if (d->rx_phys && physical_page_release_order(d->allocator, d->rx_phys, d->buffer_order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     if (d->tx_phys && physical_page_release_order(d->allocator, d->tx_phys, d->buffer_order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();

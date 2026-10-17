@@ -4,13 +4,13 @@
 
 #include <arch/context.h>
 #include <kernel/errno.h>
+#include <kernel/cpu.h>
 #include <kernel/epoll.h>
 #include <kernel/task.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
-#include <kernel/socket.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/files.h>
@@ -24,6 +24,7 @@ static void epoll_ready_add(struct kernel_epoll *epoll, struct kernel_epoll_item
 {
     if (!item->linked || item->oneshot_disarmed || item->on_ready_list) return;
     item->ready_next = 0;
+    item->ready_prev = epoll->ready_tail;
     if (epoll->ready_tail) epoll->ready_tail->ready_next = item;
     else epoll->ready_head = item;
     epoll->ready_tail = item;
@@ -34,6 +35,7 @@ static void epoll_pending_add(struct kernel_epoll *epoll, struct kernel_epoll_it
 {
     if (!item->linked || item->oneshot_disarmed || item->on_pending_list) return;
     item->pending_next = 0;
+    item->pending_prev = epoll->pending_tail;
     if (epoll->pending_tail) epoll->pending_tail->pending_next = item;
     else epoll->pending_head = item;
     epoll->pending_tail = item;
@@ -42,9 +44,11 @@ static void epoll_pending_add(struct kernel_epoll *epoll, struct kernel_epoll_it
 
 static void epoll_item_put(struct kernel_epoll_item *item)
 {
+    uintptr_t irq = arch_interrupt_save();
     if (!item->references) __builtin_trap();
-    if (!--item->references && kernel_heap_release(item->heap, item) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    int release = !--item->references;
+    arch_interrupt_restore(irq);
+    if (release && kernel_heap_release(item->heap, item) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
 }
 
 static void epoll_notify(struct kernel_epoll *epoll)
@@ -72,35 +76,118 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
     arch_interrupt_restore(irq);
 }
 
-static void epoll_remove_from_ready_list(
-    struct kernel_epoll *epoll,
-    struct kernel_epoll_item *item)
+static void epoll_remove_from_ready_list(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
 {
-    struct kernel_epoll_item *curr;
-    struct kernel_epoll_item *prev;
+    if (!item->on_ready_list) return;
+    if (item->ready_prev) item->ready_prev->ready_next = item->ready_next;
+    else epoll->ready_head = item->ready_next;
+    if (item->ready_next) item->ready_next->ready_prev = item->ready_prev;
+    else epoll->ready_tail = item->ready_prev;
+    item->ready_next = item->ready_prev = 0;
+    item->on_ready_list = 0;
+}
+static void epoll_remove_from_pending_list(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
+{
+    if (!item->on_pending_list) return;
+    if (item->pending_prev) item->pending_prev->pending_next = item->pending_next;
+    else epoll->pending_head = item->pending_next;
+    if (item->pending_next) item->pending_next->pending_prev = item->pending_prev;
+    else epoll->pending_tail = item->pending_prev;
+    item->pending_next = item->pending_prev = 0;
+    item->on_pending_list = 0;
+}
 
-    if (epoll == 0 || item == 0 || !item->on_ready_list) {
-        return;
+static unsigned epoll_index_height(struct kernel_epoll_item *item)
+{ return item ? item->index_height : 0; }
+static void epoll_index_update(struct kernel_epoll_item *item)
+{
+    unsigned left = epoll_index_height(item->index_left), right = epoll_index_height(item->index_right);
+    item->index_height = 1 + (left > right ? left : right);
+}
+static struct kernel_epoll_item *epoll_index_rotate(struct kernel_epoll *epoll,
+    struct kernel_epoll_item *item, int left)
+{
+    struct kernel_epoll_item *pivot = left ? item->index_right : item->index_left;
+    struct kernel_epoll_item *parent = item->index_parent;
+    if (!parent) epoll->items_root = pivot;
+    else if (parent->index_left == item) parent->index_left = pivot;
+    else parent->index_right = pivot;
+    pivot->index_parent = parent;
+    if (left) {
+        item->index_right = pivot->index_left;
+        if (item->index_right) item->index_right->index_parent = item;
+        pivot->index_left = item;
+    } else {
+        item->index_left = pivot->index_right;
+        if (item->index_left) item->index_left->index_parent = item;
+        pivot->index_right = item;
     }
-    curr = epoll->ready_head;
-    prev = 0;
-    while (curr != 0) {
-        if (curr == item) {
-            if (prev != 0) {
-                prev->ready_next = curr->ready_next;
-            } else {
-                epoll->ready_head = curr->ready_next;
-            }
-            if (epoll->ready_tail == curr) {
-                epoll->ready_tail = prev;
-            }
-            curr->ready_next = 0;
-            curr->on_ready_list = 0U;
-            break;
+    item->index_parent = pivot;
+    epoll_index_update(item); epoll_index_update(pivot);
+    return pivot;
+}
+static void epoll_index_balance(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
+{
+    while (item) {
+        epoll_index_update(item);
+        int balance = (int)epoll_index_height(item->index_left) - (int)epoll_index_height(item->index_right);
+        if (balance > 1) {
+            if (epoll_index_height(item->index_left->index_right) > epoll_index_height(item->index_left->index_left))
+                epoll_index_rotate(epoll, item->index_left, 1);
+            item = epoll_index_rotate(epoll, item, 0);
+        } else if (balance < -1) {
+            if (epoll_index_height(item->index_right->index_left) > epoll_index_height(item->index_right->index_right))
+                epoll_index_rotate(epoll, item->index_right, 0);
+            item = epoll_index_rotate(epoll, item, 1);
         }
-        prev = curr;
-        curr = curr->ready_next;
+        item = item->index_parent;
     }
+}
+static int epoll_index_compare(int fd, struct kernel_open_file_description *file,
+    const struct kernel_epoll_item *item)
+{
+    if (fd != item->target_fd) return fd < item->target_fd ? -1 : 1;
+    return (uintptr_t)file < (uintptr_t)item->target_file ? -1 : (file != item->target_file);
+}
+static void epoll_index_insert(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
+{
+    struct kernel_epoll_item **link = &epoll->items_root, *parent = 0;
+    while (*link) {
+        parent = *link;
+        int order = epoll_index_compare(item->target_fd, item->target_file, parent);
+        if (!order) __builtin_trap();
+        link = order < 0 ? &parent->index_left : &parent->index_right;
+    }
+    *link = item; item->index_parent = parent; item->index_height = 1;
+    epoll_index_balance(epoll, parent);
+}
+static void epoll_index_remove(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
+{
+    /* 旋转对象本身而非复制key，扫描者和反向注册继续指向同一item。 */
+    while (item->index_left || item->index_right)
+        epoll_index_rotate(epoll, item, epoll_index_height(item->index_right) > epoll_index_height(item->index_left));
+    struct kernel_epoll_item *parent = item->index_parent;
+    if (!parent) epoll->items_root = 0;
+    else if (parent->index_left == item) parent->index_left = 0;
+    else parent->index_right = 0;
+    item->index_parent = 0;
+    epoll_index_balance(epoll, parent);
+}
+static struct kernel_epoll_item *epoll_index_first(struct kernel_epoll *epoll)
+{
+    struct kernel_epoll_item *item = epoll->items_root;
+    while (item && item->index_left) item = item->index_left;
+    return item;
+}
+static struct kernel_epoll_item *epoll_index_next(struct kernel_epoll_item *item)
+{
+    if (item->index_right) {
+        item = item->index_right;
+        while (item->index_left) item = item->index_left;
+        return item;
+    }
+    while (item->index_parent && item == item->index_parent->index_right) item = item->index_parent;
+    return item->index_parent;
 }
 
 int kernel_epoll_create(
@@ -122,7 +209,7 @@ int kernel_epoll_create(
     }
     epoll->heap = heap;
     kernel_wait_queue_init(&epoll->wait_queue);
-    epoll->items_head = 0;
+    epoll->items_root = 0;
     epoll->ready_head = 0;
     epoll->ready_tail = 0;
     epoll->item_count = 0U;
@@ -133,10 +220,9 @@ int kernel_epoll_create(
 static enum kernel_files_status epoll_item_unlink_and_destroy(
     struct kernel_epoll_item *item)
 {
-    if (item == 0 || !item->linked) {
-        return KERNEL_FILES_STATUS_OK;
-    }
+    if (!item) return KERNEL_FILES_STATUS_OK;
     uintptr_t irq = arch_interrupt_save();
+    if (!item->linked) { arch_interrupt_restore(irq); return KERNEL_FILES_STATUS_OK; }
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
 
@@ -146,25 +232,8 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
 
     if (epoll != 0) {
         epoll_remove_from_ready_list(epoll, item);
-        if (item->on_pending_list) {
-            struct kernel_epoll_item **link = &epoll->pending_head, *previous = 0;
-            while (*link && *link != item) { previous = *link; link = &(*link)->pending_next; }
-            if (!*link) __builtin_trap();
-            *link = item->pending_next;
-            if (epoll->pending_tail == item) epoll->pending_tail = previous;
-            item->pending_next = 0;
-            item->on_pending_list = 0;
-        }
-        if (item->items_prev != 0) {
-            item->items_prev->items_next = item->items_next;
-        } else if (epoll->items_head == item) {
-            epoll->items_head = item->items_next;
-        }
-        if (item->items_next != 0) {
-            item->items_next->items_prev = item->items_prev;
-        }
-        item->items_prev = 0;
-        item->items_next = 0;
+        epoll_remove_from_pending_list(epoll, item);
+        epoll_index_remove(epoll, item);
         if (epoll->item_count > 0U) {
             epoll->item_count--;
         }
@@ -186,8 +255,8 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
 
     item->linked = 0;
     item->epoll = 0;
-    epoll_item_put(item);
     arch_interrupt_restore(irq);
+    epoll_item_put(item);
     return KERNEL_FILES_STATUS_OK;
 }
 
@@ -197,14 +266,18 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
         return KERNEL_FILES_STATUS_OK;
     }
     if (epoll->scan_owner) __builtin_trap();
-    while (epoll->items_head != 0) {
-        struct kernel_epoll_item *item = epoll->items_head;
+    while (epoll->items_root != 0) {
+        struct kernel_epoll_item *item = epoll->items_root;
         (void)epoll_item_unlink_and_destroy(item);
     }
-    epoll->items_head = 0;
+    epoll->items_root = 0;
     epoll->ready_head = 0;
     epoll->ready_tail = 0;
     epoll->item_count = 0U;
+    enum kernel_scheduler_status status = kernel_wait_queue_close(&epoll->wait_queue);
+    if (status != KERNEL_SCHEDULER_STATUS_OK && status != KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
+        __builtin_trap();
+    if (kernel_wait_queue_destroy(&epoll->wait_queue) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 
     (void)kernel_heap_release(epoll->heap, epoll);
     return KERNEL_FILES_STATUS_OK;
@@ -222,37 +295,6 @@ void kernel_epoll_notify_file_release(
     file->ep_items = 0;
 }
 
-uint32_t kernel_epoll_poll(
-    struct kernel_epoll *epoll,
-    uint32_t requested_events,
-    struct kernel_wait_queue **out_queue)
-{
-    struct kernel_epoll_item *item;
-    uint32_t revents = 0U;
-
-    if (out_queue != 0) {
-        *out_queue = 0;
-    }
-    if (epoll == 0) {
-        return KERNEL_POLLNVAL;
-    }
-    if (out_queue != 0) {
-        *out_queue = &epoll->wait_queue;
-    }
-    item = epoll->ready_head;
-    while (item != 0) {
-        if (!item->oneshot_disarmed && item->target_file != 0) {
-            uint32_t target_revents =
-                kernel_open_file_poll(item->target_file, item->events, 0);
-            if ((target_revents & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U) {
-                revents |= (KERNEL_POLLIN | KERNEL_POLLRDNORM);
-                break;
-            }
-        }
-        item = item->ready_next;
-    }
-    return revents & requested_events;
-}
 
 enum kernel_files_status kernel_files_epoll_create1(
     struct kernel_files *files,
@@ -315,12 +357,11 @@ static struct kernel_epoll_item *epoll_find_item(
     int fd,
     struct kernel_open_file_description *target_file)
 {
-    struct kernel_epoll_item *item = epoll->items_head;
-    while (item != 0) {
-        if (item->target_fd == fd && item->target_file == target_file) {
-            return item;
-        }
-        item = item->items_next;
+    struct kernel_epoll_item *item = epoll->items_root;
+    while (item) {
+        int order = epoll_index_compare(fd, target_file, item);
+        if (!order) return item;
+        item = order < 0 ? item->index_left : item->index_right;
     }
     return 0;
 }
@@ -339,7 +380,7 @@ static int epoll_check_downward(
     int top = 0;
     int max_depth = 0;
 
-    stack[0].item = target_epoll->items_head;
+    stack[0].item = epoll_index_first(target_epoll);
     stack[0].depth = 0;
 
     while (top >= 0) {
@@ -348,7 +389,7 @@ static int epoll_check_downward(
             top--;
             continue;
         }
-        stack[top].item = item->items_next;
+        stack[top].item = epoll_index_next(item);
 
         if (item->target_file != 0 &&
             kernel_open_file_kind(item->target_file) == KERNEL_OPEN_FILE_KIND_EPOLL &&
@@ -366,7 +407,7 @@ static int epoll_check_downward(
             }
             if (top + 1 < 8) {
                 top++;
-                stack[top].item = child_ep->items_head;
+                stack[top].item = epoll_index_first(child_ep);
                 stack[top].depth = d;
             }
         }
@@ -498,100 +539,99 @@ enum kernel_files_status kernel_files_epoll_ctl(
     epoll = epoll_file->epoll;
 
     switch (op) {
-    case KERNEL_EPOLL_CTL_ADD:
+    case KERNEL_EPOLL_CTL_ADD: {
         if (!kernel_open_file_supports_epoll(target_file)) {
             *linux_result = -KERNEL_EPERM;
             break;
         }
-        if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL) {
-            int loop_err = epoll_check_nesting(epoll, target_file->epoll);
-            if (loop_err != 0) {
-                *linux_result = loop_err;
-                break;
-            }
-        }
-        if (epoll_find_item(epoll, (int)fd, target_file) != 0) {
-            *linux_result = -KERNEL_EEXIST;
-            break;
-        }
-        heap_status = kernel_heap_allocate_zeroed(epoll->heap,
-                                                  1U,
-                                                  sizeof(*item),
-                                                  (void **)&item);
+        /* 分配允许换任务；候选尚未发布，图与重复key必须在它之后检查。 */
+        heap_status = kernel_heap_allocate_zeroed(epoll->heap, 1U, sizeof(*item), (void **)&item);
         if (heap_status != KERNEL_HEAP_STATUS_OK) {
             *linux_result = -KERNEL_ENOMEM;
             break;
         }
         item->heap = epoll->heap;
         item->references = 1;
-        item->linked = 1;
         item->target_fd = (int)fd;
         item->target_file = target_file;
         item->epoll = epoll;
         item->events = events;
         item->data = data;
-        item->oneshot_disarmed = 0U;
-        item->on_ready_list = 0U;
-
-        /* Link into epoll items list */
-        item->items_prev = 0;
-        item->items_next = epoll->items_head;
-        if (epoll->items_head != 0) {
-            epoll->items_head->items_prev = item;
+        kernel_wait_node_init_callback(&item->wait_node, kernel_epoll_wait_callback, item);
+        kernel_preempt_disable();
+        int error = 0;
+        if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
+            error = epoll_check_nesting(epoll, target_file->epoll);
+        if (!error && epoll_find_item(epoll, (int)fd, target_file)) error = -KERNEL_EEXIST;
+        if (error) {
+            kernel_preempt_enable();
+            epoll_item_put(item);
+            *linux_result = error;
+            break;
         }
-        epoll->items_head = item;
+        uintptr_t irq = arch_interrupt_save();
+        item->linked = 1;
+        epoll_index_insert(epoll, item);
         epoll->item_count++;
-
-        /* Link into target_file ep_items list */
-        item->target_prev = 0;
         item->target_next = target_file->ep_items;
-        if (target_file->ep_items != 0) {
-            target_file->ep_items->target_prev = item;
-        }
+        if (item->target_next) item->target_next->target_prev = item;
         target_file->ep_items = item;
-
-        /* Register wait node on target wait queue */
-        kernel_wait_node_init_callback(&item->wait_node,
-                                       kernel_epoll_wait_callback,
-                                       item);
+        item->references++; /* query可睡眠，DEL只撤销登记引用。 */
+        arch_interrupt_restore(irq);
+        kernel_preempt_enable();
         target_queue = 0;
         current_revents = kernel_open_file_poll(target_file, events, &target_queue);
-        if (target_queue != 0) {
-            kernel_wait_queue_add(target_queue, &item->wait_node);
-        }
-
-        if ((current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U)
+        if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
+            target_queue = &target_file->epoll->wait_queue;
+        irq = arch_interrupt_save();
+        if (item->linked && target_queue) kernel_wait_queue_add(target_queue, &item->wait_node);
+        uint64_t control = item->control_generation;
+        uint32_t interest = item->events;
+        arch_interrupt_restore(irq);
+        /* 订阅前的通知可能已经结束；绑定后重新查询实际状态。 */
+        if (item->linked) current_revents = kernel_open_file_poll(target_file, interest, 0);
+        irq = arch_interrupt_save();
+        if (item->linked && control == item->control_generation &&
+            (current_revents & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP)))
             kernel_epoll_wait_callback(&item->wait_node, 0);
+        arch_interrupt_restore(irq);
+        epoll_item_put(item);
         *linux_result = 0;
         break;
-
-    case KERNEL_EPOLL_CTL_MOD:
+    }
+    case KERNEL_EPOLL_CTL_MOD: {
+        uintptr_t irq = arch_interrupt_save();
         item = epoll_find_item(epoll, (int)fd, target_file);
-        if (item == 0) {
+        if (!item) {
+            arch_interrupt_restore(irq);
             *linux_result = -KERNEL_ENOENT;
             break;
         }
-        item->control_generation++;
+        item->references++;
+        uint64_t control = ++item->control_generation;
         item->events = events;
         item->data = data;
-        item->oneshot_disarmed = 0U;
-
+        item->oneshot_disarmed = 0;
+        arch_interrupt_restore(irq);
         current_revents = kernel_open_file_poll(target_file, events, 0);
-        if ((current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U)
+        irq = arch_interrupt_save();
+        if (item->linked && control == item->control_generation &&
+            (current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)))
             kernel_epoll_wait_callback(&item->wait_node, 0);
+        arch_interrupt_restore(irq);
+        epoll_item_put(item);
         *linux_result = 0;
         break;
-
-    case KERNEL_EPOLL_CTL_DEL:
+    }
+    case KERNEL_EPOLL_CTL_DEL: {
+        uintptr_t irq = arch_interrupt_save();
         item = epoll_find_item(epoll, (int)fd, target_file);
-        if (item == 0) {
-            *linux_result = -KERNEL_ENOENT;
-            break;
-        }
-        epoll_item_unlink_and_destroy(item);
-        *linux_result = 0;
+        if (item) item->references++;
+        arch_interrupt_restore(irq);
+        if (item) { epoll_item_unlink_and_destroy(item); epoll_item_put(item); }
+        *linux_result = item ? 0 : -KERNEL_ENOENT;
         break;
-
+    }
     default:
         *linux_result = -KERNEL_EINVAL;
         break;
@@ -679,113 +719,255 @@ static int epoll_setup_sigmask(
 static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
 {
     struct kernel_epoll *epoll = request->epoll;
-    uintptr_t irq = arch_interrupt_save();
     if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
         __builtin_trap();
+    if (request->observing) {
+        struct kernel_epoll_item *item = request->head;
+        request->head = 0;
+        if (item) epoll_item_put(item);
+        return;
+    }
+    uintptr_t irq = arch_interrupt_save();
     if (epoll->scan_owner == request) {
         /* 尚未交付的项目仍由扫描引用保活；DEL只撤销注册引用。 */
         while (request->head) {
             struct kernel_epoll_item *item = request->head;
             request->head = item->ready_next;
-            item->ready_next = 0;
+            item->ready_next = item->ready_prev = 0;
             item->in_scan = 0;
             epoll_ready_add(epoll, item);
+            arch_interrupt_restore(irq);
             epoll_item_put(item);
+            irq = arch_interrupt_save();
         }
         while (epoll->pending_head) {
             struct kernel_epoll_item *item = epoll->pending_head;
-            epoll->pending_head = item->pending_next;
-            item->pending_next = 0;
-            item->on_pending_list = 0;
+            epoll_remove_from_pending_list(epoll, item);
             epoll_ready_add(epoll, item);
         }
-        epoll->pending_tail = 0;
         epoll->scan_owner = 0;
-        epoll_notify(epoll);
+        if (epoll->ready_head) epoll_notify(epoll);
     }
     arch_interrupt_restore(irq);
 }
 
+static void epoll_request_finish(struct kernel_epoll_wait_request *request)
+{
+    epoll_scan_finish(request);
+    if (request->task) {
+        if (kernel_task_epoll_clear(request->task, request, request->previous) != KERNEL_TASK_STATUS_OK) __builtin_trap();
+        request->task = 0;
+        request->previous = 0;
+    }
+    if (request->file && kernel_open_file_release(&request->file) != KERNEL_OPEN_FILE_STATUS_OK)
+        __builtin_trap();
+}
+
 void kernel_epoll_abort_wait(struct kernel_epoll_wait_request *request)
 {
-    if (!request || !request->task) return;
-    epoll_scan_finish(request);
-    if (kernel_task_epoll_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
-        __builtin_trap();
-    request->task = 0;
-    if (kernel_open_file_release(&request->file) != KERNEL_OPEN_FILE_STATUS_OK)
-        __builtin_trap();
+    while (request) {
+        struct kernel_epoll_wait_request *previous = request->previous;
+        epoll_request_finish(request);
+        request = previous;
+    }
+}
+
+struct epoll_candidate {
+    uint64_t control, notification;
+    uint32_t interest;
+    struct linux_epoll_event event;
+};
+
+static int epoll_scan_begin(struct kernel_epoll_wait_request *request)
+{
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_epoll *epoll = request->epoll;
+    int begin = !epoll->scan_owner && epoll->ready_head;
+    if (begin) epoll->scan_owner = request;
+    arch_interrupt_restore(irq);
+    return begin;
+}
+
+/* poll和wait共用候选刷新；只跨可能睡眠的目标query持有item/OFD借用。 */
+static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, struct epoll_candidate *candidate)
+{
+    struct kernel_epoll *epoll = request->epoll;
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_epoll_item *item = request->observing ? request->head : epoll->ready_head;
+    if (!item) {
+        arch_interrupt_restore(irq);
+        return 0;
+    }
+    if (!request->observing) {
+        epoll_remove_from_ready_list(epoll, item);
+        if (item->references == UINT32_MAX || item->in_scan) __builtin_trap();
+        item->references++;
+        item->in_scan = 1;
+        request->head = item;
+    }
+    *candidate = (struct epoll_candidate){.control = item->control_generation,
+        .notification = item->notification_generation, .interest = item->events,
+        .event.data = item->data};
+    if (item->linked && !item->oneshot_disarmed && item->target_file) {
+        request->target = item->target_file;
+        if (kernel_open_file_acquire(request->target) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+    }
+    arch_interrupt_restore(irq);
+    if (request->target)
+        candidate->event.events = kernel_open_file_poll(request->target, candidate->interest, 0) &
+            (candidate->interest | KERNEL_POLLERR | KERNEL_POLLHUP);
+    irq = arch_interrupt_save();
+    if (!item->linked || item->oneshot_disarmed || candidate->control != item->control_generation)
+        candidate->event.events = 0;
+    arch_interrupt_restore(irq);
+    return 1;
+}
+
+static int epoll_candidate_finish(struct kernel_epoll_wait_request *request,
+    const struct epoll_candidate *candidate, int delivered, int preserve)
+{
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_epoll_item *item = request->head;
+    struct kernel_epoll *epoll = request->epoll;
+    int pruned = 0;
+    if (request->observing) {
+        if (!candidate->event.events && item->linked && !item->in_scan &&
+            candidate->control == item->control_generation &&
+            candidate->notification == item->notification_generation) {
+            epoll_remove_from_ready_list(epoll, item);
+            epoll_remove_from_pending_list(epoll, item);
+            pruned = 1;
+        }
+    } else {
+        if (item->linked && candidate->control == item->control_generation) {
+            if (delivered && (candidate->interest & KERNEL_EPOLLONESHOT)) item->oneshot_disarmed = 1;
+            else if (preserve || (delivered && !(candidate->interest & KERNEL_EPOLLET)))
+                epoll_pending_add(epoll, item);
+        }
+        if (item->linked && (candidate->control != item->control_generation ||
+                            candidate->notification != item->notification_generation))
+            epoll_pending_add(epoll, item);
+    }
+    arch_interrupt_restore(irq);
+    /* 最后OFD关闭可能执行后端操作，不能在IRQ或协议scope内执行。 */
+    if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+    irq = arch_interrupt_save();
+    request->head = 0;
+    if (!request->observing) item->in_scan = 0;
+    arch_interrupt_restore(irq);
+    epoll_item_put(item);
+    return pruned;
+}
+
+int kernel_epoll_wait_pending(struct kernel_open_file_description *file, struct kernel_wait_queue **out_queue)
+{
+    struct kernel_epoll *epoll = file->epoll;
+    uintptr_t irq = arch_interrupt_save();
+    if (out_queue) *out_queue = &epoll->wait_queue;
+    int pending = !epoll->scan_owner && epoll->ready_head;
+    arch_interrupt_restore(irq);
+    return pending;
+}
+
+/* 纯查询不占交付游标。常见空结果直接摘ready头；并发交付或代次变化时，
+ * 本次按key向前借用候选，不跨目标query保留AVL节点或另一调用者的扫描指针。 */
+struct epoll_observe_cursor {
+    int indexed, started, fd, skip_fd, skip;
+    uintptr_t file, skip_file;
+};
+static void epoll_observe_indexed(struct epoll_observe_cursor *cursor)
+{
+    if (cursor->indexed) return;
+    cursor->skip = cursor->started;
+    cursor->skip_fd = cursor->fd;
+    cursor->skip_file = cursor->file;
+    cursor->indexed = 1;
+    cursor->started = 0;
+}
+static int epoll_observe_next(struct kernel_epoll_wait_request *request,
+    struct epoll_observe_cursor *cursor)
+{
+    struct kernel_epoll *epoll = request->epoll;
+    for (;;) {
+        uintptr_t irq = arch_interrupt_save();
+        if (epoll->scan_owner || epoll->pending_head) epoll_observe_indexed(cursor);
+        struct kernel_epoll_item *item = epoll->ready_head;
+        if (cursor->indexed) {
+            item = epoll->items_root;
+            struct kernel_epoll_item *next = 0;
+            while (item) {
+                if (!cursor->started || epoll_index_compare(cursor->fd,
+                    (struct kernel_open_file_description *)cursor->file, item) < 0) {
+                    next = item; item = item->index_left;
+                } else item = item->index_right;
+            }
+            item = next;
+        }
+        if (!item) { arch_interrupt_restore(irq); return 0; }
+        cursor->fd = item->target_fd; cursor->file = (uintptr_t)item->target_file; cursor->started = 1;
+        int candidate = !(cursor->skip && cursor->fd == cursor->skip_fd && cursor->file == cursor->skip_file) &&
+            item->linked && !item->oneshot_disarmed &&
+            (item->on_ready_list || item->on_pending_list || item->in_scan);
+        if (candidate) {
+            if (item->references == UINT32_MAX) __builtin_trap();
+            item->references++;
+            request->head = item;
+        }
+        arch_interrupt_restore(irq);
+        if (candidate) return 1;
+        /* 非候选不借用指针，也不在一次IRQ段里遍历全部登记。 */
+        epoll_observe_indexed(cursor);
+    }
+}
+
+uint32_t kernel_epoll_poll(struct kernel_epoll *epoll, uint32_t requested_events,
+    struct kernel_wait_queue **out_queue)
+{
+    if (out_queue) *out_queue = epoll ? &epoll->wait_queue : 0;
+    if (!epoll) return KERNEL_POLLNVAL;
+    struct kernel_epoll_wait_request request = {.epoll = epoll, .task = kernel_task_current(), .observing = 1};
+    if (request.task) {
+        request.file = epoll->file;
+        if (request.file && kernel_open_file_acquire(request.file) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+        if (kernel_task_epoll_register(request.task, &request, &request.previous) != KERNEL_TASK_STATUS_OK) __builtin_trap();
+    }
+    struct epoll_candidate candidate;
+    uint32_t revents = 0;
+    struct epoll_observe_cursor cursor = {0};
+    while (epoll_observe_next(&request, &cursor)) {
+        if (!epoll_candidate_refresh(&request, &candidate)) __builtin_trap();
+        int ready = candidate.event.events != 0;
+        int pruned = epoll_candidate_finish(&request, &candidate, 0, ready);
+        if (ready) { revents = KERNEL_POLLIN | KERNEL_POLLRDNORM; break; }
+        if (!pruned) epoll_observe_indexed(&cursor);
+    }
+    epoll_request_finish(&request);
+    return revents & requested_events;
 }
 
 static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
     struct kernel_mm *mm, uint64_t user_events, size_t maximum)
 {
-    struct kernel_epoll *epoll = request->epoll;
-    uintptr_t irq = arch_interrupt_save();
-    if (epoll->scan_owner || !epoll->ready_head) {
-        arch_interrupt_restore(irq);
-        return 0;
-    }
-    epoll->scan_owner = request;
-    arch_interrupt_restore(irq);
+    if (!epoll_scan_begin(request)) return 0;
     int64_t delivered = 0;
-    while ((size_t)delivered < maximum) {
-        irq = arch_interrupt_save();
-        /* 只借用当前候选；未扫描后缀仍由ready队列持有，DEL可立即释放。 */
-        request->head = epoll->ready_head;
-        if (!request->head) {
-            arch_interrupt_restore(irq);
-            break;
-        }
-        epoll->ready_head = request->head->ready_next;
-        if (!epoll->ready_head) epoll->ready_tail = 0;
-        request->head->ready_next = 0;
-        if (request->head->references == UINT32_MAX || request->head->in_scan)
-            __builtin_trap();
-        request->head->references++;
-        request->head->in_scan = 1;
-        request->head->on_ready_list = 0;
-        arch_interrupt_restore(irq);
-        struct kernel_epoll_item *item = request->head;
-        uint64_t control = item->control_generation;
-        uint64_t notification = item->notification_generation;
-        uint32_t interest = item->events;
-        struct linux_epoll_event event = {.data = item->data};
-        if (item->linked && !item->oneshot_disarmed && item->target_file) {
-            request->target = item->target_file;
-            if (kernel_open_file_acquire(request->target) != KERNEL_OPEN_FILE_STATUS_OK)
-                __builtin_trap();
-            event.events = kernel_open_file_poll(request->target, interest, 0) &
-                (interest | KERNEL_POLLERR | KERNEL_POLLHUP);
-            if (item->linked && event.events && control == item->control_generation) {
-                size_t copied = 0;
-                enum kernel_uaccess_status status = kernel_copy_to_user(mm,
-                    user_events + (uint64_t)delivered * sizeof(event), &event, sizeof(event), &copied);
-                if (status != KERNEL_UACCESS_STATUS_OK || copied != sizeof(event)) {
-                    if (status != KERNEL_UACCESS_STATUS_OK && status != KERNEL_UACCESS_STATUS_FAULT)
-                        __builtin_trap();
-                    if (!delivered) delivered = -KERNEL_EFAULT;
-                    break;
-                }
-                delivered++;
-                /* 完整event复制是提交点；睡眠期间的MOD不能被旧ONESHOT覆盖。 */
-                if (item->linked && control == item->control_generation) {
-                    if (interest & KERNEL_EPOLLONESHOT) item->oneshot_disarmed = 1;
-                    else if (!(interest & KERNEL_EPOLLET)) epoll_pending_add(epoll, item);
-                }
+    struct epoll_candidate candidate;
+    while ((size_t)delivered < maximum && epoll_candidate_refresh(request, &candidate)) {
+        int copied_event = 0;
+        if (candidate.event.events) {
+            size_t copied = 0;
+            enum kernel_uaccess_status status = kernel_copy_to_user(mm,
+                user_events + (uint64_t)delivered * sizeof(candidate.event),
+                &candidate.event, sizeof(candidate.event), &copied);
+            if (status != KERNEL_UACCESS_STATUS_OK || copied != sizeof(candidate.event)) {
+                if (status != KERNEL_UACCESS_STATUS_OK && status != KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
+                if (!delivered) delivered = -KERNEL_EFAULT;
+                break;
             }
-            if (kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
-                __builtin_trap();
+            delivered++;
+            copied_event = 1;
         }
-        irq = arch_interrupt_save();
-        if (item->linked && (control != item->control_generation ||
-                            notification != item->notification_generation))
-            epoll_pending_add(epoll, item);
-        request->head = item->ready_next;
-        item->ready_next = 0;
-        item->in_scan = 0;
-        epoll_item_put(item);
-        arch_interrupt_restore(irq);
+        /* 只有完整用户复制提交ET/ONESHOT；旧控制代次不能覆盖MOD。 */
+        epoll_candidate_finish(request, &candidate, copied_event, 0);
     }
     epoll_scan_finish(request);
     return delivered;
@@ -848,11 +1030,11 @@ enum kernel_files_status kernel_files_epoll_pwait(
     }
 
     request = (struct kernel_epoll_wait_request){.task = task, .epoll = epoll, .file = epoll_file};
-    if (kernel_task_epoll_register(task, &request) != KERNEL_TASK_STATUS_OK) __builtin_trap();
+    if (kernel_task_epoll_register(task, &request, &request.previous) != KERNEL_TASK_STATUS_OK) __builtin_trap();
 
     sig_error = epoll_setup_sigmask(mm, task, user_sigmask, sigsetsize, &saved_mask, &mask_modified);
     if (sig_error != 0) {
-        kernel_epoll_abort_wait(&request);
+        epoll_request_finish(&request);
         *linux_result = sig_error;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -903,6 +1085,6 @@ enum kernel_files_status kernel_files_epoll_pwait(
         int interrupted = (*linux_result == -KERNEL_EINTR);
         kernel_signal_restore_temporary_mask(task, saved_mask, interrupted);
     }
-    kernel_epoll_abort_wait(&request);
+    epoll_request_finish(&request);
     return KERNEL_FILES_STATUS_OK;
 }

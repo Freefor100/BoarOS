@@ -16,6 +16,8 @@ PLIC route 决定设备与 IRQ，不按槽位或测试配置硬编码。无设�
 
 ## 发布、完成与借用
 
+RX refill 与 TX flush 逐项调用共用 split enqueue 发布描述符，每个非空批次末尾只 notify 一次；队列中途填满也通知已提交部分，空批次不通知。descriptor、available 索引和 notify 的 DMA 屏障仍由共用 split queue 维护。
+
 RX 描述符资格与缓冲内容的 owner 分开。设备完成后描述符可再次使用，原缓冲
 先变成 worker 的 CPU lease，再移交给 custom pbuf。最多同时借出 32 个缓冲；
 最后一个 pbuf 引用归还前，设备不能覆盖原内容。custom 回调只归还槽、唤醒
@@ -23,7 +25,7 @@ worker，不分配、不睡眠。达到借用上限则复制到有界 PBUF_POOL�
 DMA 槽。UDP 接纳同时检查 DMA 借用、协议堆和备用池占用，保留至少 16 个
 备用 pbuf 给 TCP/控制流；不足计丢弃，不承诺不限速 UDP 无丢包。
 
-TX 在协商 indirect（bit28）后按包发布槽内 indirect 表：首项为设备头（驱动缓冲），其余为最多两段 pbuf（PBUF_RAM/POOL 且地址落在内核镜像映射内），驱动 `pbuf_ref` 持有到完成；IRQ 只把完成槽标为待归还，worker 在非 IRQ 上下文释放引用。设备失败/超时不提前归还：失败不等于 DMA 停止，设备仍可能读取已投递的描述符与 payload，在途 owner 保留到 stop 复位确认后才 abandon，与 RX 借用同一策略；已完成 owner 仍由 worker 归还。未协商 indirect、段数超限、volatile 或地址不可换算时回退为复制路径；`tx-sg`/`tx-copy` 统计两条路径的包数。最多 64 个排队，32 个可发布。
+TX 在协商 indirect（bit28）后按包发布槽内 indirect 表：首项为设备头（驱动缓冲），其余为最多两段 pbuf（PBUF_RAM/POOL 且地址落在内核镜像映射内），驱动 `pbuf_ref` 持有到完成；IRQ 只把完成槽标为待归还，worker 在短 IRQ 临界区摘下完成 owner、清槽并更新容量代次，然后在 IRQ 外释放引用。设备失败/超时不提前归还：失败不等于 DMA 停止，设备仍可能读取已投递的描述符与 payload，在途 owner 保留到 stop 复位确认后才 abandon，与 RX 借用同一策略；已完成 owner 仍由 worker 归还。未协商 indirect、段数超限、volatile 或地址不可换算时回退为复制路径；`tx-sg`/`tx-copy` 统计两条路径的包数。最多 64 个排队，32 个可发布。
 `linkoutput` 不睡眠，容量不足返回 ERR_MEM。TCP 已接受的内容仍归协议，完成
 唤醒 worker 后先释放已完成 owner 和槽，再重试 unsent 数据，无需用户再次进入 syscall。零拷贝 TX 持引用期间 TCP 段保持 busy，完成后才可重传。
 
@@ -34,20 +36,18 @@ IRQ、service 与直接 send 入口都检查，不能因无 TX 或配置 IRQ 丢
 新发布：除设备/队列现场外打印槽级快照（loaned/ready/pending/done、队列索引与
 每个非空闲 RX/TX 槽的状态、长度、age、owner），只读驱动自有数组，不追描述符
 地址、不分配。只有已发布 TX 使用五秒设备完成期限，正常 RX 空闲不是设备故障。
-worker 在首次收割后、RX与协议回调前释放完成owner；最后一次service及release后
-比较容量代次并复核RX ready。SG release返回归还数，容量代次还覆盖复制TX在IRQ/service
+worker 在首次收割后、RX 与协议回调前释放完成 owner；link/RX 有界批次、协议服务及等待登记共用一个外层协议资格。末次收割产生的 TX_DONE 使当前批次保持可运行，下轮开头在协议资格外归还；睡眠判断同时检查当前工作链、容量代次、TX_DONE 与 RX ready，不沿用旧 runnable 快照。SG release返回归还数，容量代次还覆盖复制TX在IRQ/service
 中的直接归还。有新容量或RX才继续服务，单纯窗口关闭的unsent不会形成自旋。
 worker 在任务上下文推进 Ethernet/ARP、协议定时器和重试，每批 RX 最多八帧，另独立限制 loopback 八包、socket 八个工作单元、一个 timer 回调；批次
 之间开放中断并让出运行机会。失败 NIC 不再收发，但共享的 loopback 和协议期限
 仍继续推进；不能在错误分支永久睡眠并停止 TIME_WAIT/重组回收。
-raw API 沿既有单 hart 临界区串行化，IRQ 不重入堆。无 NIC 时 `kernel_network_start`
+raw API 由调用者栈 scope 持有任务 mutex，同 owner 回调可嵌套，协议执行开放 IRQ；具体规则见 [网络协议执行资格](kernel-network.md)。无 NIC 时 `kernel_network_start`
 不创建收发 worker，但保留同一 `kernel_network` owner 与 timer-only worker：循环
 使用相同有界服务，先排空可立即执行的软件工作，再按 min(下一 socket 期限, now+5×frequency) 阻塞，期限/IRQ 只唤醒
 它，最后的 OFD 定时回收不再依赖用户再次进入 syscall，`kernel_network_stop`
 同样禁止新工作、join 后释放。
 
-停止先禁止新工作、唤醒并 join worker，清理接口的重组/ARP，移除 netif，然后
-通过 `virtio_net_quiesce` reset 并确认 DMA 已停，随后才允许 TX abandon。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
+停止先短暂关闭 IRQ 发布停止并唤醒，随后在协议 mutex 和 IRQ 临界区外 join worker、通过 `virtio_net_quiesce` reset 并确认 DMA 已停。再取得协议资格清理重组/ARP、移除 netif，释放资格后归还剩余 TX owner。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
 包括已脱离 socket 登记的 FIN_WAIT，释放其乱序 RX 引用；TIME_WAIT 转入前已 purge，
 此处不依赖已 join worker 的后续 timer。reset 未确认保留 DMA；reset 已确认但协议或接收请求
 仍持 pbuf，也保留整个设备 owner，返回 EBUSY。最后引用归还后才可释放队列页、

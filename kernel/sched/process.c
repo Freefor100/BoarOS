@@ -1845,20 +1845,23 @@ void kernel_task_release_io_scratch(struct kernel_task *task)
 }
 
 enum kernel_task_status kernel_task_epoll_register(
-    struct kernel_task *task, struct kernel_epoll_wait_request *request)
+    struct kernel_task *task, struct kernel_epoll_wait_request *request,
+    struct kernel_epoll_wait_request **previous)
 {
-    if (!task || task != kernel_task_current() || !request || task->epoll_wait_request)
+    if (!task || task != kernel_task_current() || !request || !previous)
         return KERNEL_TASK_STATUS_STATE;
+    *previous = task->epoll_wait_request;
     task->epoll_wait_request = request;
     return KERNEL_TASK_STATUS_OK;
 }
 
 enum kernel_task_status kernel_task_epoll_clear(
-    struct kernel_task *task, struct kernel_epoll_wait_request *request)
+    struct kernel_task *task, struct kernel_epoll_wait_request *request,
+    struct kernel_epoll_wait_request *previous)
 {
     if (!task || !request || task->epoll_wait_request != request)
         return KERNEL_TASK_STATUS_STATE;
-    task->epoll_wait_request = 0;
+    task->epoll_wait_request = previous;
     return KERNEL_TASK_STATUS_OK;
 }
 

@@ -120,7 +120,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 `struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。句柄直接持有内核记录指针，`record_page_address` 只用于归还记录页。记录保存引用计数、清理阶段和架构页表；创建、fork 的成功与清理分支、acquire、move 和最终 release 共同维护指针与所有权。正常访问不再从物理句柄重新解析记录，也不重复审计整份 VMA/来源/清理状态。多个 LIVE 句柄可以指向同一记录：
 
-- `acquire` 增加引用计数并发布一个新的独立 owner；vfork 与线程 clone 用它共享地址空间，任一线程释放自己的引用不撤销其他 owner。共享 MM 的 VMA/PTE 变更对同组立即可见；当前单 hart 关闭 SIE 串行化，并执行本地 TLB 失效，不等同于 SMP 同步；
+- `acquire` 增加引用计数并发布一个新的独立 owner；vfork 与线程 clone 用它共享地址空间，任一线程释放自己的引用不撤销其他 owner。共享 MM 的 VMA/PTE 使用同一 operation gate 与 metadata raw；发布变更后同步活动 CPU 的翻译，确认完成才回收旧页，具体见下文并发协议；
 - `fork` 创建独立地址空间，克隆 VMA/文件来源并让父子暂时共享用户物理页，逻辑 MM 和后续写入仍独立；
 - `move` 转移一个 owner，不改变引用计数；
 - `release` 消耗一个 owner，非末引用只减计数，末引用才销毁页表树和记录页；
@@ -172,11 +172,11 @@ MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在�
 
 ## 硬件用户缺页解析
 
-`kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端先检查用户范围、VMA、逻辑权限和现有 PTE；VMA 外地址、`PROT_NONE`/权限冲突和仅驻留策略 VMA 的空洞返回 `NOT_MAPPED`。`ELF_PRIVATE/ELF` VMA 再按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing；只有确认需要提交 anonymous/file/ELF 页或解析 present COW 后，才要求目标 MM 是本 hart 当前 `satp`，从而既不为非法软件访问分配，也能让 uaccess 对合法未驻留页复用同一解析器。
+`kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。
 
-匿名成功路径按 4 KiB 对齐故障地址，分配并清零一页，以 VMA 的完整 R/W/X 权限建立 U-mode PTE。文件路径则按上述缓存/私有策略取得页面。两者成功后都执行针对该虚拟页、ASID 0 的本地 `SFENCE.VMA`；VMA 带执行权限时还执行本 hart 的 `FENCE.I`，保证新填充的指令字节对后续取指可见。该规则覆盖匿名清零、文件填充和先读后执行的 file-private fault；COW 复制和恢复执行权限的页表路径也各自同步指令缓存。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED` 在 Trap 边界终止为 `SIGSEGV(11)`，文件整页越过 EOF 的 `BUS_FAULT` 终止为 `SIGBUS(7)`；uaccess 把二者都转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`；合法 owner 的页释放完成即返回，非法页表或分配器状态直接 fatal。PTE 已存在却仍产生允许权限的页故障或非活动 MM 都是内核状态错误。
+匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化登记翻译与指令代次：已有表内的单页发布按页同步，非叶结构变化使用全范围同步；可执行内容填充、COW 和执行权限发布还同步取指。RISC-V 对应 `SFENCE.VMA`、必要的远端 RFENCE 与 `FENCE.I`，不能由后端每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。
 
-scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 只在 `kernel_mm_lookup()` 报未驻留后尝试解析；合法页成功提交后重查 PTE，VMA 外或权限不符仍按用户 fault 处理。
+scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 在 pin 遇到未驻留或需要写故障处理的页面时解析；成功后重新 pin，VMA 外或权限不符仍按用户访问错误处理。
 
 并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，resolver 直接成功；实际提交者负责 SFENCE/RFENCE，迟到或 resumed resolver 不重复同步。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。固定资料 [`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对该语义；真实匿名及文件同页竞争见[RV 两核](riscv-smp.md#用户态原程序与压力组合)。
 
@@ -242,11 +242,11 @@ VMA/PTE 修改前预留关联；失败不消耗调用者 OFD。末个 VMA 消失
 不能留下无来源记录的 PTE。fork 后私有页面即使再次带 COW 标志，仍保持私有来源。
 munmap/fixed replace 清除对应驻留记录，mprotect/PROT_NONE 保留来源。
 
-VFS 向下截断按实际 live size（包括部分生效后报错）同步通知相关 MM。扫描每个
-驻留记录并查询当前 VMA 与文件偏移，撤销整页起点不小于新 EOF 的 PTE，保留 VMA；
-非对齐尾页只清零文件来源页的后缀，保留 private 页内容。当前与非当前 MM 使用
-相同的 PTE 失效、全局本 hart SFENCE.VMA、物理引用释放顺序；尾页代码修改执行
-FENCE.I。当前单 hart syscall 不可调度区保证登记和通知稳定，不代表 SMP 协议。
+VFS 向下截断按实际 live size（包括部分生效后报错）同步通知相关 MM。保留 VMA，
+撤销文件内页起点不小于新 EOF 的 PTE；非对齐尾页只清零文件来源页的后缀，保留
+private 页内容。范围摘除复用下面的有界遍历，剩余 resident 链只检查保留尾页。
+登记与来源借用维持跨等待寿命；PTE 变更在 MM raw 内发布，锁外确认本地及远端
+翻译失效后才归还旧页，尾页可执行内容改变时另推进指令同步。
 
 关联只扫描相关 MM；每个 MM 以动态虚拟页地址哈希查询驻留记录，保留链表负责遍历。哈希碰撞比较完整地址，装载因子不超过 1，按二倍扩容；分配成功后无分配地重建并替换桶，失败保留旧索引。fork 提前准备全部桶，unmap/fixed replace/截断同步摘除索引与链表；最后 MM 释放桶。查找为平均常数成本。munmap/fixed replace 与截断使用有界区间摘除：每次 raw 最多检查 16 个页表项，实际数据/空表 owner 交给同一个 16 项退休批次。每个涉及的叶表只扫描一次；范围外的叶只用于判断表是否仍被使用，缺失子树直接跳过。一个 middle 范围结束后有界检查空表，跨同步仅保存 VA、下标和占用标记，不保存 PTE 指针。后端在清 PTE 前把 VA/物理身份交给 MM，由 MM 解绑 resident 的哈希和活动链；alias 清理和实际页引用释放均在 raw 外完成。mprotect 仍以有结束地址的遍历访问驻留叶，包括 PROT_NONE。mprotect 对仍共享缓存的叶保留写保护，不再先开放写权限后全表 rearm。完整链表用于销毁与 fork；截断先按 VMA 形成 EOF 外的连续区间并复用同一有界摘除；剩余驻留链只处理保留尾页。元数据随驻留规模增长；不在 tick 热路径扫描。
 `test-files-riscv` 扫描准备阶段分配失败与 fork 回滚，并注入缓存命中后的 COW

@@ -267,40 +267,43 @@ static int wait_ready(struct kernel_task *caller,
             return -KERNEL_EAGAIN;
         if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
     }
-    saved = arch_interrupt_save();
-    while ((kernel_socket_poll(socket, 0) & event) == 0U) {
-        enum kernel_wait_wake_reason reason;
-        uint64_t sleep_deadline = deadline;
+    for (;;) {
+        struct kernel_socket_protocol_scope protocol;
+        saved = arch_interrupt_save();
+        kernel_socket_protocol_enter(&protocol);
+        if ((kernel_socket_poll(socket, 0) & event) != 0U) {
+            kernel_socket_protocol_leave(&protocol);
+            arch_interrupt_restore(saved);
+            return 0;
+        }
         if ((kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U ||
-            (flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U) {
+            (flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U ||
+            (target_ns && kernel_time_monotonic_ns() >= target_ns)) {
+            kernel_socket_protocol_leave(&protocol);
             arch_interrupt_restore(saved);
             return -KERNEL_EAGAIN;
         }
-        if (KERNEL_WAIT_RECHECK(
-                kernel_socket_wait_queue(socket), sleep_deadline, 1,
-                &reason,
-                ((kernel_socket_poll(socket, 0) & event) == 0U)) !=
-            KERNEL_SCHEDULER_STATUS_OK) {
-            arch_interrupt_restore(saved);
-            return -KERNEL_EIO;
+        (void)arch_interrupt_save();
+        struct kernel_wait_token token;
+        enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+        enum kernel_scheduler_status status = kernel_wait_prepare(
+            kernel_socket_wait_queue(socket), deadline, 1, &token);
+        int ready = status == KERNEL_SCHEDULER_STATUS_OK &&
+                    (kernel_socket_poll(socket, 0) & event) != 0U;
+        kernel_socket_protocol_leave(&protocol);
+        if (status == KERNEL_SCHEDULER_STATUS_OK) {
+            if (!ready) status = kernel_wait_park(&token, &reason);
+            if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
-        if (reason == KERNEL_WAIT_TIMEOUT) {
-            if (target_ns != 0U &&
-                kernel_time_monotonic_ns() >= target_ns) {
-                arch_interrupt_restore(saved);
-                return -KERNEL_EAGAIN;
-            }
-            continue;
-        }
+        arch_interrupt_restore(saved);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return -KERNEL_EIO;
+        if (ready) return 0;
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            arch_interrupt_restore(saved);
             if (timeout_ns != 0U) return -KERNEL_EINTR;
             kernel_signal_note_syscall_restart(caller);
             return -KERNEL_ERESTARTSYS;
         }
     }
-    arch_interrupt_restore(saved);
-    return 0;
 }
 
 enum kernel_syscall_status syscall_handle_socket(

@@ -19,8 +19,9 @@ static struct kernel_wait_queue ready_queue;
 
 void kernel_random_erase(void *buffer, size_t size)
 {
-    volatile uint8_t *p = buffer;
-    while (size--) *p++ = 0;
+    /* 同Linux memzero_explicit：复用宽字清零，指针和memory clobber防止擦除被删。 */
+    memset(buffer, 0, size);
+    __asm__ volatile("" : : "r"(buffer) : "memory");
 }
 
 

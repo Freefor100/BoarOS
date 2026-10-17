@@ -5,6 +5,15 @@
 #include <string.h>
 #include <stdio.h>
 int main(void) {
+    unsigned char erased[160];
+    for (unsigned offset=0;offset<8;offset++) {
+        for (unsigned size=0;size<=129;size++) {
+            memset(erased,0xa5,sizeof(erased));
+            kernel_random_erase(erased+offset,size);
+            for (unsigned i=0;i<sizeof(erased);i++)
+                assert(erased[i]==(i>=offset && i<offset+size ? 0 : 0xa5));
+        }
+    }
     unsigned char seed[32], first[64], next[64], predicted[64];
     unsigned char nonce[12];
     unsigned char zero_key[32]={0}, zero_nonce[12]={0}, initial[64], second[64];

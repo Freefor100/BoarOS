@@ -240,7 +240,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 ## 同步、成本与验证边界
 
-短调度域保护组/身份元数据；fd/MM等业务引用及futex条件仍依赖单CPU的IRQ纪律。共享 MM 使用同一页表与本地 SFENCE.VMA；多CPU前仍须补共享对象同步、lookup到pin的交接和远端TLB完成后回收。
+短调度域保护组与身份元数据。FD 槽和 OFD 引用使用共同的 raw/原子引用规则；MM 的修改、pin 和远端 TLB 确认由其 operation gate、metadata raw 与退休批次负责。futex 身份解析取得实际后备引用，等待队列沿本模块的代次协议处理；这些业务对象不依赖整次系统调用关闭中断。尚未并行化的命名空间、设备和协议后端仍在各自 CPU0 业务边界执行，具体见[文件资源](kernel-files.md)、[MM](kernel-mm.md)及[网络模块](kernel-network.md)。
 
 RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
@@ -334,10 +334,10 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 释放后再park；不能把当前整个IRQ-off acquire机械包进raw spinlock。
 
 登记、通知、阻塞和切换完成由本模块的短调度域保护；条件及task/callback/context的
-业务owner仍由调用者保持。完整SMP须把条件保护、MM页存活、对象最后释放与这套交接连接，
-不能只移植等待原语就撤掉业务IRQ纪律。当前销毁入口与借用规则见本文开头。
+业务owner仍由调用者保持。对象 mutex、raw 与实际引用分别覆盖条件、发布和存储寿命，
+等待原语不能代替这些业务保护。当前销毁入口与借用规则见本文开头。
 
-已核对的IRQ-off显式切换与owner边界如下；这是调用盘点，不是跨核安全证明：
+主要等待入口的保护与 owner 如下：
 
 | 调用位置 | 切换/工作 | 睡眠期间的owner |
 |---|---|---|
@@ -346,7 +346,7 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 | kernel/physical_page.c allocate_order | EMPTY后回收/pressure_wait | 不持buddy半成品；回调固定cache group，深度在任务context |
 | fs/page_cache.c lookup/get/readahead/writeback/pressure | loading、后台work、代次进展等待 | entry users、cache/runtime或group pin，停止先join |
 | drivers/virtio/block.c | 等descriptor/span/request完成与reset | request token及业务buffer；DMA停止未确认不释放 |
-| net/ethernet.c worker；net/socket.c协议入口 | IRQ关闭下NIC/串行lwIP批次，末尾重查后yield/block | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
+| net/ethernet.c worker；net/socket.c协议入口 | 协议mutex内开放IRQ执行；短IRQ区登记/复查，归还协议资格后park/finish | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
 | mm/mm.c文件fault | 源I/O可显式睡眠，恢复后重查 | 来源操作pin、VMA代次和候选页，失败准确回收 |
 
 等待交接须覆盖wake发生于检查前、登记后、释放保护后/park前；timeout和cancel

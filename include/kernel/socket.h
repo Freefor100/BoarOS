@@ -1,6 +1,8 @@
 #ifndef BOAROS_KERNEL_SOCKET_H
 #define BOAROS_KERNEL_SOCKET_H
 
+#include <kernel/sync.h>
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -20,7 +22,7 @@ struct kernel_socket_read_request {
     struct kernel_socket *socket;
     struct kernel_task *task;
     void *packet;
-    uint32_t bytes;
+    uint32_t bytes, completed_bytes;
     int datagram;
     struct kernel_open_file_description *pin;
     struct kernel_open_file_description **pin_owner;
@@ -110,9 +112,9 @@ void kernel_socket_read_info(const struct kernel_socket_read_request *request,
                              struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
                              uint32_t offset, void *buffer, uint32_t length);
-int kernel_socket_read_user(const struct kernel_socket_read_request *request,
+int kernel_socket_read_user(struct kernel_socket_read_request *request,
     struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor);
-void kernel_socket_finish_read(struct kernel_socket_read_request *request,
+uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
 int kernel_socket_write_buffer(struct kernel_socket *socket,
@@ -163,8 +165,17 @@ struct kernel_socket_service_result {
     unsigned sockets, packets, timers, runnable;
     uint64_t next_deadline;
 };
-uintptr_t kernel_socket_protocol_enter(void);
-void kernel_socket_protocol_leave(uintptr_t interrupts);
+/* Caller stack owns the outer mutex guard; callbacks may nest for the same task. */
+struct kernel_socket_protocol_scope {
+    uintptr_t interrupts;
+    struct kernel_lock_guard guard;
+    unsigned outer;
+};
+void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope);
+void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope);
+/* 外层scope的raw调用已返回；供worker将服务与等待登记置于同一owner内。 */
+struct kernel_socket_service_result kernel_socket_service_owned(const struct kernel_socket_protocol_scope *scope,
+    struct kernel_socket_service_budget budget);
 struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget);
 int kernel_socket_work_pending(void);
 void kernel_socket_network_capacity(void);

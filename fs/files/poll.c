@@ -1,4 +1,5 @@
 #include "private.h"
+#include <kernel/epoll.h>
 
 #include <arch/context.h>
 #include <kernel/errno.h>
@@ -183,9 +184,13 @@ static void poll_restore_sigmask(
     }
 }
 
-/* 保留本次观察到的完整结果，返回前不再查询一次可能已变化的设备状态。 */
+enum poll_query { POLL_QUERY_ALL, POLL_QUERY_WAIT, POLL_QUERY_EPOLL };
+
+/* token存活时epoll只提供候选提示，真实刷新可能释放最后一个后端owner。
+ * 其他FD已观察到的事件保留，不能因随后刷新epoll而覆盖整份结果。 */
 static int poll_snapshot(struct kernel_pollfd *pfds,
-    struct kernel_open_file_description **pinned, uint32_t nfds)
+    struct kernel_open_file_description **pinned, uint32_t nfds,
+    enum poll_query query, int *epoll_pending)
 {
     int ready = 0;
     for (uint32_t i = 0; i < nfds; i++) {
@@ -193,9 +198,16 @@ static int poll_snapshot(struct kernel_pollfd *pfds,
         if (pfds[i].fd >= 0) {
             if (!pinned[i]) events = KERNEL_POLLNVAL;
             else {
-                struct kernel_wait_queue *queue = 0;
-                events = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue)
-                    & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
+                int epoll = kernel_open_file_kind(pinned[i]) == KERNEL_OPEN_FILE_KIND_EPOLL;
+                if (query == POLL_QUERY_WAIT && epoll) {
+                    if ((pfds[i].events & (KERNEL_POLLIN | KERNEL_POLLRDNORM)) && kernel_epoll_wait_pending(pinned[i], 0))
+                        *epoll_pending = 1;
+                } else if (query == POLL_QUERY_EPOLL && !epoll) events = (uint16_t)pfds[i].revents;
+                else {
+                    struct kernel_wait_queue *queue = 0;
+                    events = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue)
+                        & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
+                }
             }
         }
         pfds[i].revents = (int16_t)events;
@@ -242,67 +254,62 @@ static int core_poll_run(
         if (!immediate) kernel_wait_node_init(&nodes[i], task);
     }
 
-    /* First pass: pin descriptors and check for initial readiness */
+    /* 先固定整份 FD 快照，再决定是否需要协议所有权。纯文件和管道
+     * 不取得网络 mutex；epoll 的成员可变，因此始终进入协议 scope。 */
+    int need_protocol = 0;
     for (uint32_t i = 0; i < nfds; i++) {
-        pfds[i].revents = 0;
-        if (pfds[i].fd < 0) {
-            continue;
-        }
+        if (pfds[i].fd < 0) continue;
         int64_t pin_result = 0;
-        enum kernel_files_status pin_status =
-            kernel_files_pin(files, pfds[i].fd, &pinned[i], &pin_result);
-        if (pin_status != KERNEL_FILES_STATUS_OK || pin_result != 0 ||
-            pinned[i] == 0) {
+        if (kernel_files_pin(files, pfds[i].fd, &pinned[i], &pin_result) !=
+                KERNEL_FILES_STATUS_OK || pin_result || !pinned[i]) {
             pinned[i] = 0;
-            pfds[i].revents = (int16_t)KERNEL_POLLNVAL;
-            ready_count++;
             continue;
         }
-        struct kernel_wait_queue *wq = 0;
-        uint32_t active = kernel_open_file_poll(
-            pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
-        uint32_t rev =
-            active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR |
-                      KERNEL_POLLHUP | KERNEL_POLLNVAL);
-        if (rev != 0U) {
-            pfds[i].revents = (int16_t)rev;
-            ready_count++;
-        }
+        enum kernel_open_file_kind kind = kernel_open_file_kind(pinned[i]);
+        need_protocol |= kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
+                         kind == KERNEL_OPEN_FILE_KIND_EPOLL;
     }
+    struct kernel_socket_protocol_scope protocol;
+    ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_ALL, 0);
 
-    /* If events already ready, or immediate zero timeout, skip sleeping */
-    if (ready_count == 0 && !immediate) {
+    while (!ready_count && !error && !immediate) {
+        /* 取得可能等待的协议锁时还没有 token；登记之后只嵌套借用
+         * 同一 owner，释放协议锁之后才 park，finish 后才重新取锁。 */
         uintptr_t saved_intr = arch_interrupt_save();
-
-        while (ready_count == 0 && error == 0) {
-            struct kernel_wait_token token;
-            enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
-            if (kernel_wait_prepare(0, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK) {
+        if (need_protocol) kernel_socket_protocol_enter(&protocol);
+        (void)arch_interrupt_save();
+        struct kernel_wait_token token;
+        enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+        if (kernel_wait_prepare(0, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK) {
+            error = -KERNEL_EIO;
+            if (need_protocol) kernel_socket_protocol_leave(&protocol);
+            arch_interrupt_restore(saved_intr);
+            break;
+        }
+        for (uint32_t i = 0; i < nfds; i++) {
+            if (!pinned[i]) continue;
+            struct kernel_wait_queue *queue = 0;
+            if (kernel_open_file_kind(pinned[i]) == KERNEL_OPEN_FILE_KIND_EPOLL)
+                (void)kernel_epoll_wait_pending(pinned[i], &queue);
+            else (void)kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
+            if (queue && kernel_wait_node_bind(queue, &nodes[i], &token) != KERNEL_SCHEDULER_STATUS_OK) {
                 error = -KERNEL_EIO;
                 break;
             }
-            /* 同一token登记多个条件，登记后复查，park前wake保留通知。 */
-            for (uint32_t i = 0; i < nfds; i++) {
-                if (!pinned[i]) continue;
-                struct kernel_wait_queue *queue = 0;
-                (void)kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
-                if (queue && kernel_wait_node_bind(queue, &nodes[i], &token) != KERNEL_SCHEDULER_STATUS_OK) {
-                    error = -KERNEL_EIO;
-                    break;
-                }
-            }
-            if (!error) ready_count = poll_snapshot(pfds, pinned, nfds);
-            if (!ready_count && !error && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
-                error = -KERNEL_EIO;
-            if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            if (error || ready_count) break;
-            if (reason == KERNEL_WAIT_SIGNALLED) { error = -KERNEL_EINTR; break; }
-            ready_count = poll_snapshot(pfds, pinned, nfds);
-            if (reason == KERNEL_WAIT_TIMEOUT) break;
         }
-
+        int epoll_pending = 0;
+        if (!error) ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_WAIT, &epoll_pending);
+        if (need_protocol) kernel_socket_protocol_leave(&protocol);
+        if (!ready_count && !epoll_pending && !error && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            error = -KERNEL_EIO;
+        if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         arch_interrupt_restore(saved_intr);
-
+        if (!error && epoll_pending)
+            ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_EPOLL, 0);
+        if (error || ready_count) break;
+        if (reason == KERNEL_WAIT_SIGNALLED) { error = -KERNEL_EINTR; break; }
+        if (!epoll_pending) ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_ALL, 0);
+        if (reason == KERNEL_WAIT_TIMEOUT) break;
     }
 
     int interrupted = (error == -KERNEL_EINTR);

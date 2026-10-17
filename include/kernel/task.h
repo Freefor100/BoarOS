@@ -39,9 +39,11 @@ int kernel_task_has_user_context(const struct kernel_task *);
 /* Releases only a lookup storage borrow, not MM/files or a running owner. */
 void kernel_task_lookup_put(struct kernel_task *task);
 enum kernel_task_status kernel_task_epoll_register(
-    struct kernel_task *task, struct kernel_epoll_wait_request *request);
+    struct kernel_task *task, struct kernel_epoll_wait_request *request,
+    struct kernel_epoll_wait_request **previous);
 enum kernel_task_status kernel_task_epoll_clear(
-    struct kernel_task *task, struct kernel_epoll_wait_request *request);
+    struct kernel_task *task, struct kernel_epoll_wait_request *request,
+    struct kernel_epoll_wait_request *previous);
 enum kernel_task_status kernel_task_socket_write_register(
     struct kernel_task *task, struct kernel_socket_write_request *request);
 enum kernel_task_status kernel_task_socket_write_clear(

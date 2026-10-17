@@ -340,9 +340,9 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     kernel_socket_stream_finish(&reservation);
     check(client && kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT, 248);
     virt_uart_puts("TCP admission: competing reservations, cancel and zero-copy EAGAIN passed\n");
-    uintptr_t core = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope core; kernel_socket_protocol_enter(&core);
     check(kernel_socket_write_buffer(client_socket, "batch", 5, 0) == 5, 223);
-    kernel_socket_protocol_leave(core);
+    kernel_socket_protocol_leave(&core);
     check(!(kernel_socket_poll(accepted, 0) & KERNEL_POLLIN), 224);
     struct kernel_socket_service_result service = kernel_socket_service_pending(
         (struct kernel_socket_service_budget){0, 0, 0});
@@ -360,7 +360,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     kernel_socket_finish_read(&budget_read, 0);
     static void *held_segments[MEMP_NUM_TCP_SEG];
     unsigned held = 0;
-    core = kernel_socket_protocol_enter();
+    kernel_socket_protocol_enter(&core);
     while (held < MEMP_NUM_TCP_SEG && (held_segments[held] = memp_malloc(MEMP_TCP_SEG))) held++;
     check(held > 1 && !memp_malloc(MEMP_TCP_SEG), 229);
     frozen_lwip_ms = __real_sys_now(); freeze_lwip_clock = 1;
@@ -368,15 +368,15 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     check(kernel_socket_write_buffer(client_socket, payload, 2 * TCP_MSS, 0) == -KERNEL_EAGAIN &&
           !(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT), 230);
     memp_free(MEMP_TCP_SEG, held_segments[--held]);
-    kernel_socket_protocol_leave(core);
+    kernel_socket_protocol_leave(&core);
     /* 不推进任何timer；归还事件必须直接恢复真正的池等待者。 */
     service = kernel_socket_service_pending((struct kernel_socket_service_budget){8, 0, 0});
     check(!service.timers && !service.packets, 231);
     check(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT, 232);
     freeze_lwip_clock = 0;
-    core = kernel_socket_protocol_enter();
+    kernel_socket_protocol_enter(&core);
     while (held) memp_free(MEMP_TCP_SEG, held_segments[--held]);
-    kernel_socket_protocol_leave(core);
+    kernel_socket_protocol_leave(&core);
     check(kernel_socket_write_buffer(client_socket, "pool", 4, 0) == 4, 233);
     budget_read = (struct kernel_socket_read_request){0};
     check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 4, 0) == 4, 234);
@@ -384,13 +384,14 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     check(!memcmp(budget_bytes, "pool", 4), 235);
     kernel_socket_finish_read(&budget_read, 0);
     virt_uart_puts("protocol budget and capacity progress passed\n");
-    /* 强制协议保留一次未接纳的 pbuf；IRQ 重试不能重入被中断的堆分配。 */
+    /* 强制协议保留一次未接纳的pbuf；IRQ只通知，服务owner再推进重试。 */
     fail_packet=1;
     check(kernel_socket_write_buffer(client_socket,"retry",5,0)==5 && fail_packet==0,203);
     uint64_t deadline=kernel_time_monotonic_ns()+UINT64_C(300000000);
     timer_probe=1;
     do{kernel_socket_expire_timers();}while(kernel_time_monotonic_ns()<deadline);
     timer_probe=0;check(timer_heap_calls==0,204);
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8, 8, 1});
     struct kernel_socket_read_request request={0};
     check(kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0)==5,205);
     char retry[5];kernel_socket_copy_read(&request,0,retry,5);check(!memcmp(retry,"retry",5),206);
@@ -979,8 +980,8 @@ void kernel_main(unsigned long hart, const void *dtb)
     check(small.protect_visits <= 6 * (16 * MIB / 4096) &&
           large.protect_visits <= 6 * (64 * MIB / 4096) &&
           small.protect_global_flushes == 0 && large.protect_global_flushes == 0 &&
-          small.protect_address_flushes == 16 * MIB / 4096 &&
-          large.protect_address_flushes == 64 * MIB / 4096, 26);
+          small.protect_address_flushes == 0 &&
+          large.protect_address_flushes == 0, 26);
     check(kernel_files_close(&files, fd, &result) == KERNEL_FILES_STATUS_OK && result == 0 &&
           kernel_files_release(&files) == KERNEL_FILES_STATUS_OK &&
           kernel_mm_release(&mm) == KERNEL_MM_STATUS_OK &&

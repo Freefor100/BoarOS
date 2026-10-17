@@ -52,11 +52,27 @@ static pthread_barrier_t launch;
 #define FUTEX_ADDRESS UINT64_C(0x600000)
 static _Thread_local unsigned futex_role;
 static unsigned futex_registered,futex_edit_ready,futex_word_read;
+#ifdef TCP_IO_CASES
+static void tcp_wait_preparing(struct kernel_wait_queue *);
+static void tcp_wait_prepared(struct kernel_wait_queue *,uint64_t);
+static void tcp_wait_parking(const struct kernel_wait_token *);
+static void tcp_wait_finishing(const struct kernel_wait_token *);
+static void tcp_wait_finished(void);
+static void tcp_wait_locking(struct kernel_rwlock *);
+static int tcp_batch_unpinning(struct kernel_mm_user_pin *);
+static void tcp_batch_unpinned(struct kernel_mm_user_pin *);
+#endif
 enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
+#ifdef TCP_IO_CASES
+    tcp_wait_preparing(queue);
+#endif
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+#ifdef TCP_IO_CASES
+    if (!status) tcp_wait_prepared(queue,deadline);
+#endif
     if (!status && futex_role==1 && kernel_task_current()->futex_bitset) {
         assert(!kernel_cpu_current()->raw_locks);
         __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
@@ -67,6 +83,29 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     }
     return status;
 }
+#ifdef TCP_IO_CASES
+enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_token *,enum kernel_wait_wake_reason *);
+enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,
+    enum kernel_wait_wake_reason *reason)
+{
+    tcp_wait_parking(token);
+    return __real_kernel_wait_park(token,reason);
+}
+enum kernel_scheduler_status __real_kernel_wait_finish(struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_finish(struct kernel_wait_token *token)
+{
+    tcp_wait_finishing(token);
+    enum kernel_scheduler_status status=__real_kernel_wait_finish(token);
+    if (!status) tcp_wait_finished();
+    return status;
+}
+void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
+{
+    tcp_wait_locking(lock);
+    __real_kernel_rwlock_write(lock,guard);
+}
+#endif
 void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
 void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 {
@@ -80,7 +119,13 @@ void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,
 void __real_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 {
+#ifdef TCP_IO_CASES
+    int batch=tcp_batch_unpinning(pin);
+#endif
     __real_kernel_mm_unpin_user_page(pin);
+#ifdef TCP_IO_CASES
+    if(batch) tcp_batch_unpinned(pin);
+#endif
     if (futex_role==1 && __atomic_load_n(&futex_registered,__ATOMIC_ACQUIRE))
         __atomic_store_n(&futex_word_read,1,__ATOMIC_RELEASE);
 }
@@ -697,6 +742,13 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     futex_pin_case();
 #ifdef TCP_IO_CASES
+    unix_receive_deadline_case(&heap);
+    unix_receive_error_prefix_case(&heap);
+    tcp_nonblock_timeout_case(&heap,0);
+    tcp_nonblock_timeout_case(&heap,1);
+    tcp_wait_owner_case(&heap,0);
+    tcp_wait_owner_case(&heap,1);
+    tcp_read_batch_case(&heap);
     tcp_usercopy_case(&heap);
 #endif
     struct kernel_vfs_mount *memory=0;

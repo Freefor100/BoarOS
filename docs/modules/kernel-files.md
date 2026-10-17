@@ -201,21 +201,23 @@ USER_SMP 中，`nfds=0` 且不替换临时信号掩码的调用在发起 CPU 执
 
 ## epoll 事件通知子系统
 
-`kernel_files_epoll_create1()`、`kernel_files_epoll_ctl()` 与 `kernel_files_epoll_pwait()` 实现了 Linux 现代事件驱动 I/O 子系统：
-- **epoll OFD 与长效事件绑定**：`epoll_create1` 创建 `KERNEL_OPEN_FILE_KIND_EPOLL` 类型的 open file description。不同于 `poll/select` 每次调用时的全量队列挂载，`epoll_ctl(EPOLL_CTL_ADD)` 将监听项（`struct kernel_epoll_item`）常驻注册在目标 OFD 的等待队列上，实现控制面与数据面解耦。
-- **fd 安装事务**：`epoll_create1` 与普通创建路径共用 fd 安装原语；成功同步更新 open/CLOEXEC 统计与最低空闲提示，表满返回 `-EMFILE` 并释放尚未安装的 epoll/OFD owner，不覆盖已有槽。
-- **`(target_fd, description)` 键化与目标校验**：epoll 监听项以 `(target_fd, description)` 元组为唯一主键索引。`epoll_ctl(ADD)` 严格检验目标描述符能力：仅支持 pipe、console 和 epoll 等具备真实等待队列通知的对象，常规文件和目录明确拒绝并返回 `-EPERM`。同一进程中由 `dup` 派生的多个指向同一 OFD 的不同 fd 允许独立注册。
-- **嵌套与环路防御（Iterative DFS）**：epoll 描述符自身可作为 target 被其他 epoll 实例监控。自监控（`epfd == target_fd` 或 `epoll_file == target_file`）返回 `-EINVAL`；嵌套图的环路检测与深度限制采用固定大小栈在栈内执行迭代 DFS，发现成环或嵌套深度超过 `EP_MAX_NESTS = 4` 时返回 `-ELOOP`，杜绝无界递归保护 1.8 KiB 内核栈。
-- **Push 模型就绪列表（Ready List）与回调**：当目标 OFD 状态变化并执行 `kernel_wait_queue_wake_all()` 时，安装在 `kernel_wait_node` 上的 `kernel_epoll_wait_callback()` 自动将所属 `epitem` 追加至 epoll 实例的就绪列表（`ready_head/tail`），并级联唤醒阻塞在 `epoll_pwait` 上的进程。
-- **水平触发（LT）、边缘触发（ET）与单次触发（ONESHOT）**：
-  - 水平触发（LT，默认）：`epoll_wait` 在返回就绪事件后，若底层数据仍可读写（`kernel_open_file_poll` 仍报告匹配事件），将该 item 重新排入就绪队尾，确保未读完的数据持续通知；
-  - 边缘触发（ET，`EPOLLET`）：事件一旦交付用户态，立即从就绪列表移出；仅当目标底层产生新的写入/唤醒边缘时才会重新入列；
-  - 单次触发（`EPOLLONESHOT`）：事件交付后将 item 标记为 disarmed，直至用户显式通过 `EPOLL_CTL_MOD` 重新激活。
-- **OFD 双向解绑与所有权**：目标 OFD 中维护指向所有监视它的 `epitem` 双向链表（`file->ep_items`）。当目标 OFD 的底层释放时，自动触发 `kernel_epoll_notify_file_release()` 从所属 epoll 实例中解绑。销毁 epoll 实例时，逻辑解绑只执行一次，item 和 epoll 私有堆对象随后按正常 owner 顺序释放；物理页或堆释放若违反分配器不变量直接 fatal。若关联的 VFS/OFD 清理报告真实 I/O 错误，owner 留在文件表供后续回收，fd 槽已经摘除且再次 close 返回 `-EBADF`。
-- **休眠与撤销**：`epoll_pwait`准备token后复查就绪列表，再park/finish；提前通知由token保留。回调在调度raw外同步执行并拒绝阻塞，队列借用覆盖callback/context寿命。DEL/最后close先停止item通知、同步撤销wait node，最后归还item引用；业务列表和OFD引用仍限定单CPU。
-- **逐事件交付与扫描 owner**：每实例只有一个交付扫描，ready 批次与扫描期间的 pending 通知使用独立链。完整 16 字节 event 成功复制后才消费 ET 或解除 ONESHOT；fault 保留失败项和未处理项，返回完整交付前缀或首项 `EFAULT`。LT 回队去重，MOD 的控制代次使旧交付不能覆盖重装。
-- **睡眠与退出**：扫描引用保活 item，当前目标 OFD 单独 pin；DEL/close 先逻辑解绑，最后扫描引用释放才回收。任务登记整个等待请求，强制退出先归还扫描、pending 项和 OFD，再回收旧栈。一次只使用一个栈上 event，任意合法 maxevents 不再需要按数量分配事件数组。
-- **验证边界**：`make test-epoll-host` 直接编译生产实现，覆盖回调重入、复制期间 MOD/DEL/close/fd复用、第二等待者及取消；`make test-epoll-riscv` 用同一 ELF 对照固定 Linux，覆盖 LT/ET/ONESHOT 的首项、event内部和完整前缀 fault。依据与局限见[事件交付](../learning/epoll-delivery.md)。
+`kernel_files_epoll_create1()`、`kernel_files_epoll_ctl()` 与 `kernel_files_epoll_pwait()`
+负责 fd 安装、目标引用和用户 ABI。创建复用普通 fd 安装原语；表满返回 `EMFILE`，
+归还尚未安装的 epoll/OFD，不覆盖已有槽。
+
+登记身份是 `(fd, OFD)`，因此指向同一 OFD 的不同 dup fd 可以分别登记。关闭其中一个
+fd 不会使仍由其他引用保活的登记失效；目标 OFD 最终释放时才解绑关联。支持具有真实
+等待通知的 pipe、console、socket 和 epoll；普通文件、目录返回 `EPERM`。自监控返回
+`EINVAL`，成环或嵌套超过四层返回 `ELOOP`。
+
+登记使用私有 AVL，ready/pending 是可直接摘除的双链。ADD 候选先分配，最终图检查、
+重复检查与发布之间禁止 CPU0 任务切换；链接只占短 IRQ 范围。纯查询借用候选并刷新，
+不占用交付扫描、不消费 ET 或解除 ONESHOT。完整 16 字节 event 成功复制后才提交；
+复制故障保留失败项，返回完整前缀或首项 `EFAULT`。目标查询、用户复制及最终释放均
+在 prepared token 与协议资格之外。
+
+对象和等待关系见[子系统说明](../learning/epoll-subsystem.md)，交付、通知代次、
+并发取消及测试见[事件交付](../learning/epoll-delivery.md)。
 
 ## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
 

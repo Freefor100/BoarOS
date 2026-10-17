@@ -1680,7 +1680,7 @@ build/host/lwip-port: tests/host/lwip_port_test.c \
 .PHONY: test-lwip-host
 test-lwip-host: build/host/lwip-port
 	$<
-	python3 -B tests/host/network_owner.py --case loopback-work
+	python3 -B tests/host/network_owner.py --case all
 
 HOST_CPU_SOURCES := kernel/cpu.c kernel/raw_lock.c tests/host/cpu_context.c
 
