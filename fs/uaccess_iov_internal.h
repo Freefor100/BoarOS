@@ -4,6 +4,7 @@
 #include <kernel/files.h>
 #include <kernel/uaccess.h>
 #include <kernel/page.h>
+#include <kernel/errno.h>
 #include "../mm/uaccess_internal.h"
 
 #include <stddef.h>
@@ -14,6 +15,34 @@ struct kernel_uaccess_iov_cursor {
     size_t index;
     uint64_t offset;
 };
+
+/* The caller owns storage for the already bounded descriptor count. Linux
+ * caps a sole vector before access_ok; multiple vectors check original ranges
+ * and cap the aggregate without rejecting a sum larger than ssize_t. */
+static inline int kernel_uaccess_iov_import(struct kernel_mm *mm,
+    uint64_t user_iov,struct kernel_uaccess_iovec *iov,size_t count,uint64_t *total)
+{
+    *total=0;
+    if (!count) return 0;
+    size_t copied=0;
+    enum kernel_uaccess_status status=kernel_copy_from_user(mm,iov,user_iov,
+        count*sizeof(*iov),&copied);
+    if (status==KERNEL_UACCESS_STATUS_FAULT) return -KERNEL_EFAULT;
+    if (status || copied!=count*sizeof(*iov)) __builtin_trap();
+    for (size_t i=0;i<count;i++)
+        if (iov[i].length>INT64_MAX) return -KERNEL_EINVAL;
+    for (size_t i=0;i<count;i++) {
+        if (count==1 && iov[i].length>KERNEL_FILES_MAX_RW_COUNT)
+            iov[i].length=KERNEL_FILES_MAX_RW_COUNT;
+        if (kernel_user_range_check(iov[i].base,iov[i].length) ||
+            (!iov[i].length && iov[i].base && kernel_user_range_check(iov[i].base-1,1)))
+            return -KERNEL_EFAULT;
+        if (iov[i].length>KERNEL_FILES_MAX_RW_COUNT-*total)
+            iov[i].length=KERNEL_FILES_MAX_RW_COUNT-*total;
+        *total+=iov[i].length;
+    }
+    return 0;
+}
 
 /* 描述下一段但不解析用户页；复制和后端进展分别由调用者提交。 */
 static inline size_t kernel_uaccess_iov_span(struct kernel_uaccess_iov_cursor *cursor,

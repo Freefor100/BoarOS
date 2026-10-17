@@ -14,6 +14,7 @@
 #include <kernel/sync.h>
 #include <kernel/time.h>
 #include <kernel/vfs.h>
+#include <ext4.h>
 #include "../../fs/vfs_internal.h"
 #include <string.h>
 
@@ -60,6 +61,16 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
     return __real_physical_page_allocate(a, out);
 }
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
+int __real_ext4_fpwrite_batch(ext4_file *, struct file_write_span *, unsigned);
+int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+{
+    if (fail_write) {
+        for (unsigned i=0;i<count;i++) spans[i].written=fail_write==1?0:spans[i].size;
+        if (count && fail_write==2) spans[count-1].written--;
+        return fail_write==1?KERNEL_EIO:0;
+    }
+    return __real_ext4_fpwrite_batch(file,spans,count);
+}
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
     size_t size=0;
@@ -69,11 +80,6 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
         if (calls < 16) { offsets[calls]=(unsigned)offset; lengths[calls]=(unsigned)size; }
         calls++; submitted+=size;
         if (maximum<size) maximum=(unsigned)size;
-    }
-    if (fail_write) {
-        for (size_t i=0;i<count;i++) spans[i].written=fail_write==1?0:spans[i].size;
-        if (count && fail_write==2) spans[count-1].written--;
-        return fail_write==1?-KERNEL_EIO:0;
     }
     if (hold_snapshot) {
         hold_snapshot=0; snapshot_waiting=1;
@@ -267,10 +273,12 @@ static void error_cases(struct kernel_vfs_file *file)
 {
     for (unsigned kind = 1; kind <= 2; kind++) {
         write_pages(file, TEST_PAGES);
+        uint64_t before=kernel_vfs_error_sequence(file), observed=before;
         fail_write = kind;
         reset_probe();
         check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == -KERNEL_EIO, 90);
         probe = fail_write = 0;
+        check(kernel_vfs_error_sequence(file)==before+1,94);
         struct kernel_memory_statistics memory;
         kernel_memory_snapshot(&allocator, &memory);
         check(!memory.writeback && memory.dirty == TEST_PAGES * 4096, 91);
@@ -278,11 +286,14 @@ static void error_cases(struct kernel_vfs_file *file)
         check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(file)) == 0, 92);
         probe = 0;
         check(submitted == TEST_PAGES * 4096, 93);
+        check(kernel_vfs_error_sequence(file)==before+1 &&
+              kernel_vfs_sync(file,1,&observed)==-KERNEL_EIO,95);
+        check(kernel_vfs_sync(file,1,&observed)==0,96);
     }
 }
 static void background_case(struct kernel_vfs_file *file)
 {
-    uint64_t observed = 0;
+    uint64_t observed = kernel_vfs_error_sequence(file);
     check(kernel_vfs_sync(file, 1, &observed) == 0 && kernel_vfs_ftruncate(file, 0) == 0, 60);
     /* Publish all dirty pages before starting the threshold worker. */
     unsigned pages = (unsigned)(physical_page_total(&allocator) / 10 + 8);

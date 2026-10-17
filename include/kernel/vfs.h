@@ -337,8 +337,9 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);
 /*
  * Report the first entry at or after the opaque byte `position` of an open
  * directory.  `next_position` receives the cookie to use for the following
- * entry.  Return 1 with fields filled, 0 at end of directory, or a negative
- * errno.  The position is a backend cookie, not an entry ordinal.
+ * entry, and remains valid at EOF (unchanged unless the backend advances it).
+ * Return 1 with fields filled, 0 at end of directory, or a negative errno.
+ * The position is a backend cookie, not an entry ordinal.
  */
 int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
                          uint64_t position,

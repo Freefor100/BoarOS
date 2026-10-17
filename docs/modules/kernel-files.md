@@ -66,7 +66,7 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 ## 传统与 OFD 记录锁
 
-`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；每个锁节点同时挂在 owner 的侵入式索引上。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
+`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
 
 错误检查先 pin fd，再导入 `flock`，最后检查对象是否支持记录锁。坏 fd 返回
 `EBADF`；有效 TTY 或 pipe fd 的坏指针返回 `EFAULT`，不被对象类型错误遮蔽。
@@ -122,7 +122,7 @@ pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名p
 
 open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样已经进入缓存但未交付用户的数据不会被错误计入文件位置。
 
-`kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；每项长度与地址按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验，单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。已发布 serial TTY 的 console/ttyS0/tty 完整 readv 由 [TTY 行规程](kernel-tty.md) 保持一次请求、64B continuation 与消费前缀；未建立 transport 的裸 UART fixture 仍只做一次输入暂存。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
+`kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；readv、writev 和 socket 消息共用 `fs/uaccess_iov_internal.h` 的导入规则，按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验每项有符号长度和地址。单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度；空区间允许地址等于用户上界，零项向量不访问描述符指针。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。已发布 serial TTY 的 console/ttyS0/tty 完整 readv 由 [TTY 行规程](kernel-tty.md) 保持一次请求、64B continuation 与消费前缀；未建立 transport 的裸 UART fixture 仍只做一次输入暂存。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
 
 磁盘文件的 `read/readv/pread` 共用需求读取核心，先批量取得本次请求覆盖的缓存页，再逐页复制到用户。每个用户复制 chunk 最多覆盖当前基页剩余部分，用户方向仍按基页查询和固定映射。批量装入、SG 大小、错误与页引用规则见 [VFS 批量读](vfs-ext4.md#缓存版本内的批量读)；缓存到用户保留一次复制。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。没有直接用户页 I/O 或用户态异步 I/O 接口。
 
@@ -134,7 +134,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
 - `kernel_files_sync()` pin 选定 OFD，分批交接目标 inode 数据，由 CPU0 prepare 捕获一次元数据 durable 目标，再由原调用者等待 journal 完成。栈上等待请求借用这份实际 OFD/file，关闭并复用 fd 不改变同步对象；CPU0 执行者不陪调用者等待。CPU0 的完成事件一次性记录元数据错误、消费 OFD 错误游标并发布原请求结果，调用者取走结果直接返回；数据交接失败不重复递增错误序号。独立 open 各持观察位置，dup/fork 共用，同一历史错误只被该 OFD 观察一次。独立同步不以文件位置锁覆盖设备等待；普通文件和目录支持 fsync/fdatasync，pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。分批、完成与停止边界见[VFS](vfs-ext4.md#文件节点与页缓存)。
 - `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
-- `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
+- `writev` 沿用上述共用向量导入规则，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
 ## `sendfile` 与来源片段
 

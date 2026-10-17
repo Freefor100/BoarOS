@@ -2215,7 +2215,7 @@ static int complete_writeback(struct kernel_page_cache *cache,
 {
     COST_ADD(WRITEBACK_ACCEPTED,written);
     if (written > end-begin) __builtin_trap();
-    if (!result && written != end-begin) result=-KERNEL_EIO;
+    if (!result && written != end-begin) __builtin_trap();
     if (!result && !entry->retired && generation == entry->generation) {
         if (end == entry->dirty_end) dirty_clear(entry);
         else entry->dirty_begin=end;
@@ -2435,7 +2435,6 @@ static int writeback_run(struct kernel_page_cache *cache,
                 prepared[i].span_index=++ready;
         }
         int submitted=ready ? kernel_vfs_node_writeback(entries[first]->node,spans,ready) : 0;
-        for (size_t i=0;i<ready;i++) if (!submitted && spans[i].written!=spans[i].size) submitted=-KERNEL_EIO;
         if (submitted) result=submitted;
         /* 后端已结束实际访问；完成发布只依赖entry借用和缓存保护。 */
         if (io.lock) kernel_lock_release(&io);
@@ -2810,8 +2809,6 @@ static void cache_background(struct kernel_page_cache *cache)
         if (count) {
             size_t used;
             int result=writeback_run(cache,batch,count,UINT64_MAX,&used,r->writeback_workspace);
-            if (result && result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM)
-                kernel_vfs_record_writeback_error(batch[0]->node,result);
             {
                 CACHE_SCOPE(guard,cache);
                 if (!result) r->statistics.worker_written+=used;

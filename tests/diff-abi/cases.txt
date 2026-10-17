@@ -528,6 +528,11 @@ readv.write-only-order
 readv.bad-fd-order
 readv.directory
 readv.directory-zero
+readv.single-large-length
+writev.single-large-length
+writev.multi-original-range
+readv.length-before-range
+writev.length-before-range
 readv.pipe-prefix-0
 readv.pipe-retry-0
 readv.pipe-prefix-1

@@ -19,12 +19,8 @@ static unsigned polls, binds, parks, finishes, refs, live, initialized, allocs;
 static size_t allocated_bytes;
 static int readable, at_bind, at_park, signalled, stale_hint;
 static unsigned hints;
-static unsigned service_entries, service_exits, protocol_entries, protocol_depth;
+static unsigned service_entries, service_exits;
 static enum kernel_open_file_kind target_kind;
-void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *s)
-{ CHECK(!live && !protocol_depth); *s=(struct kernel_socket_protocol_scope){0}; protocol_depth=1;protocol_entries++; }
-void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *s)
-{ (void)s;CHECK(protocol_depth==1);protocol_depth=0; }
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
 { CHECK(f==&target);return target_kind; }
 static uint64_t now_ns = 1000, wait_deadline;
@@ -39,17 +35,17 @@ enum kernel_files_status kernel_files_pin(struct kernel_files *f,int64_t fd,
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **out)
 { CHECK(*out==&target && refs);refs--;*out=NULL;return KERNEL_OPEN_FILE_STATUS_OK; }
 uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t requested,struct kernel_wait_queue **out)
-{ CHECK(f==&target);CHECK(target_kind!=KERNEL_OPEN_FILE_KIND_EPOLL || (!protocol_depth && !live));CHECK(!live || target_kind!=KERNEL_OPEN_FILE_KIND_SOCKET || protocol_depth);polls++;*out=&queue;return readable?(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM)):0; }
+{ CHECK(f==&target);CHECK(target_kind!=KERNEL_OPEN_FILE_KIND_EPOLL || !live);polls++;*out=&queue;return readable?(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM)):0; }
 int kernel_epoll_wait_pending(struct kernel_open_file_description *f,struct kernel_wait_queue **out)
-{ CHECK(f==&target && target_kind==KERNEL_OPEN_FILE_KIND_EPOLL && live && protocol_depth);if(out)*out=&queue;hints++;if(!out && stale_hint){stale_hint--;return 1;}return readable; }
+{ CHECK(f==&target && target_kind==KERNEL_OPEN_FILE_KIND_EPOLL && live);if(out)*out=&queue;hints++;if(!out && stale_hint){stale_hint--;return 1;}return readable; }
 void kernel_wait_node_init(struct kernel_wait_node *n,struct kernel_task *t)
 { initialized++;*n=(struct kernel_wait_node){.task=t}; }
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
-{ (void)q;(void)i;CHECK(protocol_depth == (target_kind==KERNEL_OPEN_FILE_KIND_SOCKET || target_kind==KERNEL_OPEN_FILE_KIND_EPOLL));wait_deadline=d;*t=(struct kernel_wait_token){0};live++;return KERNEL_SCHEDULER_STATUS_OK; }
+{ (void)q;(void)i;CHECK(!live);wait_deadline=d;*t=(struct kernel_wait_token){0};live++;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *q,struct kernel_wait_node *n,const struct kernel_wait_token *t)
 { (void)n;(void)t;CHECK(q==&queue && live==1);binds++;if(at_bind)readable=1;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
-{ (void)t;CHECK(!protocol_depth);parks++;if(at_park)readable=1;*r=signalled?KERNEL_WAIT_SIGNALLED:(at_park?KERNEL_WAIT_WOKEN:KERNEL_WAIT_TIMEOUT);if(*r==KERNEL_WAIT_TIMEOUT && wait_deadline>now_ns)now_ns=wait_deadline;return KERNEL_SCHEDULER_STATUS_OK; }
+{ (void)t;CHECK(live==1);parks++;if(at_park)readable=1;*r=signalled?KERNEL_WAIT_SIGNALLED:(at_park?KERNEL_WAIT_WOKEN:KERNEL_WAIT_TIMEOUT);if(*r==KERNEL_WAIT_TIMEOUT && wait_deadline>now_ns)now_ns=wait_deadline;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
 { (void)t;CHECK(live==1);live--;finishes++;return KERNEL_SCHEDULER_STATUS_OK; }
 void kernel_signal_restore_temporary_mask(struct kernel_task *t,uint64_t m,int i)
@@ -72,7 +68,7 @@ void kernel_heap_release(struct kernel_heap *h,void *p)
 static int run(struct kernel_pollfd *p,unsigned n,int immediate)
 { struct kernel_files f={0};int ret=core_poll_run(&f,NULL,p,n,123,immediate,0,0);CHECK(!refs&&!live&&!allocs);return ret; }
 static void reset(void)
-{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=protocol_entries=protocol_depth=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;now_ns=1000; }
+{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;now_ns=1000; }
 static void empty_waits(void)
 {
     struct kernel_files files={0};struct kernel_mm mm={0};struct kernel_task task={0};
@@ -126,20 +122,19 @@ int main(void)
     CHECK(run(p,1,0)==-KERNEL_EINTR && finishes==1);
     reset();p[0]=(struct kernel_pollfd){-1,KERNEL_POLLIN,123};p[1]=(struct kernel_pollfd){8,KERNEL_POLLIN,123};
     CHECK(run(p,2,0)==1 && p[0].revents==0 && p[1].revents==KERNEL_POLLNVAL && !polls&&!parks);
-    CHECK(!protocol_entries);
     for (unsigned i=0;i<2;i++) {
         reset();target_kind=i?KERNEL_OPEN_FILE_KIND_EPOLL:KERNEL_OPEN_FILE_KIND_SOCKET;
         p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};at_park=1;
-        CHECK(run(p,1,0)==1 && protocol_entries==1 && !protocol_depth && finishes==1);
+        CHECK(run(p,1,0)==1 && finishes==1);
         reset();target_kind=i?KERNEL_OPEN_FILE_KIND_EPOLL:KERNEL_OPEN_FILE_KIND_SOCKET;
         p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};at_bind=1;
-        CHECK(run(p,1,0)==1 && protocol_entries==1 && !protocol_depth && finishes==1 && !parks);
+        CHECK(run(p,1,0)==1 && finishes==1 && !parks);
     }
     CHECK(hints==2 && polls==2);
     reset();target_kind=KERNEL_OPEN_FILE_KIND_EPOLL;stale_hint=1;
     p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};
     CHECK(run(p,1,0)==0 && !p[0].revents && parks==1 && finishes==2 && polls==3);
-    CHECK(hints==4 && protocol_entries==2 && !protocol_depth);
+    CHECK(hints==4);
     reset();target_kind=KERNEL_OPEN_FILE_KIND_EPOLL;at_bind=1;
     p[0]=(struct kernel_pollfd){7,KERNEL_POLLRDNORM,0};
     CHECK(run(p,1,0)==1 && p[0].revents==KERNEL_POLLRDNORM && !parks && finishes==1);

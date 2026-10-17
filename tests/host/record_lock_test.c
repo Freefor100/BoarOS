@@ -8,18 +8,20 @@
 
 static size_t live_nodes;
 static int fail_alloc;
+static int allocations_left = -1;
 _Thread_local uintptr_t sync_test_irq = 1;
 
 enum kernel_heap_status kernel_heap_allocate_zeroed(
     struct kernel_heap *heap, size_t count, size_t size, void **pointer)
 {
     (void)heap;
-    if (fail_alloc) {
+    if (fail_alloc || allocations_left == 0) {
         *pointer = 0;
         return KERNEL_HEAP_STATUS_EMPTY;
     }
     *pointer = calloc(count, size);
     if (!*pointer) return KERNEL_HEAP_STATUS_EMPTY;
+    if (allocations_left > 0) allocations_left--;
     live_nodes++;
     return KERNEL_HEAP_STATUS_OK;
 }
@@ -128,6 +130,177 @@ static void verify_model(struct kernel_record_lock_state *state,
     }
 }
 
+static void expect_interval(struct kernel_record_lock_state *state,
+                            const void *observer, int64_t position,
+                            int16_t type, int64_t start, int64_t end)
+{
+    struct kernel_record_lock_conflict found;
+    assert(kernel_record_lock_get(state, observer, 0, position, position,
+                                   1, &found) == 0);
+    assert(found.type == type);
+    if (type != 2) assert(found.start == start && found.end == end);
+}
+
+static void test_edit_boundaries(struct kernel_heap *heap)
+{
+    struct kernel_record_lock_state state;
+    struct kernel_record_lock *head = 0;
+    int owner, observer;
+    kernel_record_lock_state_init(&state);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   0, INT64_MAX, 0, heap) == 0);
+
+    /* Failure after reserving the replacement must also return its node. */
+    allocations_left = 1;
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   10, 20, 1, heap) == -KERNEL_ENOLCK);
+    assert(live_nodes == 1);
+    expect_interval(&state, &observer, 15, 0, 0, INT64_MAX);
+    allocations_left = -1;
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   10, 20, 1, heap) == 0);
+    expect_interval(&state, &observer, 0, 0, 0, 9);
+    expect_interval(&state, &observer, 15, 1, 10, 20);
+    expect_interval(&state, &observer, INT64_MAX, 0, 21, INT64_MAX);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   0, 0, 2, heap) == 0);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   INT64_MAX, INT64_MAX, 2, heap) == 0);
+    expect_interval(&state, &observer, 0, 2, 0, 0);
+    expect_interval(&state, &observer, INT64_MAX, 2, 0, 0);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   10, 20, 0, heap) == 0);
+    expect_interval(&state, &observer, 15, 0, 1, INT64_MAX - 1);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   0, 0, 0, heap) == 0);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   INT64_MAX, INT64_MAX, 0, heap) == 0);
+    expect_interval(&state, &observer, 15, 0, 0, INT64_MAX);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   1, INT64_MAX - 1, 2, heap) == 0);
+    expect_interval(&state, &observer, 0, 0, 0, 0);
+    expect_interval(&state, &observer, INT64_MAX, 0, INT64_MAX, INT64_MAX);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 7,
+                                   1, INT64_MAX - 1, 0, heap) == 0);
+    expect_interval(&state, &observer, 15, 0, 0, INT64_MAX);
+    size_t count = 0;
+    verify_tree(state.root, 0, 0, &count);
+    assert(count == 1 && live_nodes == 1);
+    kernel_record_lock_release(&state, &head, heap);
+    assert(!head && !live_nodes && kernel_record_lock_state_empty(&state));
+}
+
+static void test_unrelated_inodes(struct kernel_heap *heap)
+{
+    enum { INODES = 1024 };
+    struct kernel_record_lock_state state, unrelated[INODES];
+    struct kernel_record_lock *head = 0;
+    int owner, observer;
+    kernel_record_lock_state_init(&state);
+    for (int index = 0; index < INODES; ++index) {
+        kernel_record_lock_state_init(&unrelated[index]);
+        assert(kernel_record_lock_set(&unrelated[index], &head, &owner,
+                                       0, 3, 0, 0, 0, heap) == 0);
+    }
+    record_lock_edit_visits = 0;
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 3,
+                                   10, 19, 0, heap) == 0);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 3,
+                                   30, 39, 0, heap) == 0);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 3,
+                                   20, 29, 0, heap) == 0);
+    assert(record_lock_edit_visits < 64);
+    expect_interval(&state, &observer, 25, 0, 10, 39);
+    assert(kernel_record_lock_set(&state, &head, &owner, 0, 3,
+                                   20, 29, 1, heap) == 0);
+    expect_interval(&state, &observer, 10, 0, 10, 19);
+    expect_interval(&state, &observer, 25, 1, 20, 29);
+    expect_interval(&state, &observer, 39, 0, 30, 39);
+    kernel_record_lock_release(&state, &head, heap);
+    assert(kernel_record_lock_state_empty(&state) && live_nodes == INODES);
+    for (int index = 0; index < INODES; ++index) {
+        size_t count = 0;
+        verify_tree(unrelated[index].root, 0, 0, &count);
+        assert(count == 1);
+        expect_interval(&unrelated[index], &observer, 0, 0, 0, 0);
+        kernel_record_lock_release(&unrelated[index], &head, heap);
+        assert(kernel_record_lock_state_empty(&unrelated[index]));
+    }
+    assert(!head && !live_nodes);
+}
+
+static void test_owner_kinds(struct kernel_heap *heap)
+{
+    struct kernel_record_lock_state state;
+    struct kernel_record_lock *heads[2] = {0};
+    int owner;
+    kernel_record_lock_state_init(&state);
+    for (int kind = 0; kind < 2; ++kind)
+        assert(kernel_record_lock_set(&state, &heads[kind], &owner, kind,
+                                       11, 10, 20, 0, heap) == 0);
+    assert(kernel_record_lock_set(&state, &heads[0], &owner, 0, 11,
+                                   10, 20, 1, heap) == -KERNEL_EAGAIN);
+    assert(kernel_record_lock_set(&state, &heads[0], &owner, 0, 11,
+                                   0, INT64_MAX, 2, heap) == 0);
+    assert(!heads[0] && heads[1] && live_nodes == 1);
+    struct kernel_record_lock_conflict found;
+    kernel_record_lock_get(&state, &owner, 0, 15, 15, 1, &found);
+    assert(found.type == 0 && found.kind == 1 && found.pid == -1);
+    kernel_record_lock_get(&state, &owner, 1, 15, 15, 1, &found);
+    assert(found.type == 2);
+    kernel_record_lock_release(&state, &heads[1], heap);
+    assert(!heads[1] && !live_nodes && kernel_record_lock_state_empty(&state));
+}
+
+static void test_bulk_edits(struct kernel_heap *heap)
+{
+    enum { INTERVALS = 1024, LAST = (INTERVALS - 1) * 4 };
+    struct kernel_record_lock_state state;
+    struct kernel_record_lock *heads[2] = {0};
+    int owners[2];
+    kernel_record_lock_state_init(&state);
+    for (int index = 0; index < INTERVALS; ++index) {
+        assert(kernel_record_lock_set(&state, &heads[0], &owners[0], 0, 3,
+                                       index * 4, index * 4, 0, heap) == 0);
+        assert(kernel_record_lock_set(&state, &heads[1], &owners[1], 0, 4,
+                                       index * 4 + 2, index * 4 + 2,
+                                       0, heap) == 0);
+    }
+    /* Remove a broad range while preserving interleaved other-owner locks. */
+    assert(kernel_record_lock_set(&state, &heads[0], &owners[0], 0, 3,
+                                   1, LAST - 1, 2, heap) == 0);
+    size_t count = 0;
+    verify_tree(state.root, 0, 0, &count);
+    assert(count == INTERVALS + 2 && live_nodes == count);
+    expect_interval(&state, &owners[1], 0, 0, 0, 0);
+    expect_interval(&state, &owners[1], 512, 2, 0, 0);
+    expect_interval(&state, &owners[1], LAST, 0, LAST, LAST);
+    assert(kernel_record_lock_set(&state, &heads[0], &owners[0], 0, 3,
+                                   1, LAST - 1, 0, heap) == 0);
+    count = 0;
+    verify_tree(state.root, 0, 0, &count);
+    assert(count == INTERVALS + 1 && live_nodes == count);
+    expect_interval(&state, &owners[1], 512, 0, 0, LAST);
+    assert(kernel_record_lock_set(&state, &heads[0], &owners[0], 0, 3,
+                                   1000, 2000, 2, heap) == 0);
+    count = 0;
+    verify_tree(state.root, 0, 0, &count);
+    assert(count == INTERVALS + 2 && live_nodes == count);
+    expect_interval(&state, &owners[1], 999, 0, 0, 999);
+    expect_interval(&state, &owners[1], 1500, 2, 0, 0);
+    expect_interval(&state, &owners[1], 2001, 0, 2001, LAST);
+    kernel_record_lock_release(&state, &heads[0], heap);
+    assert(!heads[0] && live_nodes == INTERVALS);
+    count = 0;
+    verify_tree(state.root, 0, 0, &count);
+    assert(count == INTERVALS);
+    for (int index = 0; index < INTERVALS; ++index)
+        expect_interval(&state, &owners[0], index * 4 + 2, 0,
+                         index * 4 + 2, index * 4 + 2);
+    kernel_record_lock_release(&state, &heads[1], heap);
+    assert(!heads[1] && !live_nodes && kernel_record_lock_state_empty(&state));
+}
+
 int main(void)
 {
     struct kernel_record_lock_state state;
@@ -185,12 +358,20 @@ int main(void)
     assert(kernel_record_lock_state_empty(&state) && !live_nodes);
     fail_alloc = 0;
 
+    test_edit_boundaries(&heap);
+    test_unrelated_inodes(&heap);
+    test_owner_kinds(&heap);
+    test_bulk_edits(&heap);
+
     /* Sparse keys must use the augmented maximum to avoid a full scan. */
     enum { SPARSE = 4096, OVERLAP = 512 };
+    record_lock_edit_visits = 0;
     for (int index = 0; index < SPARSE; ++index)
         assert(kernel_record_lock_set(&state, &heads[0], &owners[0], 0, 0,
             index * 3, index * 3, 0, &heap) == 0);
     assert(live_nodes == SPARSE);
+    size_t sparse_edit_visits = record_lock_edit_visits;
+    assert(sparse_edit_visits < SPARSE * 64);
     record_lock_conflict_visits = 0;
     kernel_record_lock_get(&state, &owners[1], 0,
                            INT64_MAX, INT64_MAX, 1, &result);
@@ -198,11 +379,18 @@ int main(void)
     record_lock_conflict_visits = 0;
     kernel_record_lock_get(&state, &owners[1], 0, 3072, 3072, 1, &result);
     assert(result.type == 0 && record_lock_conflict_visits < 32);
+    record_lock_edit_visits = 0;
+    assert(kernel_record_lock_set(&state, &heads[0], &owners[0], 0, 0,
+                                   3072, 3072, 1, &heap) == 0);
+    assert(record_lock_edit_visits < 80);
+    expect_interval(&state, &owners[1], 3072, 1, 3072, 3072);
     record_lock_remove_visits = 0;
     kernel_record_lock_release(&state, &heads[0], &heap);
     assert(!live_nodes && record_lock_remove_visits < SPARSE * 40);
-    printf("record lock sparse: %d nodes, %zu bytes, %zu remove visits\n",
+    printf("record lock sparse: %d nodes, %zu bytes, %zu edit visits, "
+           "%zu remove visits\n",
            SPARSE, SPARSE * sizeof(struct kernel_record_lock),
+           sparse_edit_visits,
            record_lock_remove_visits);
 
     struct kernel_record_lock *overlap_heads[OVERLAP] = {0};

@@ -1,4 +1,5 @@
 #include "private.h"
+#include "../../fs/uaccess_iov_internal.h"
 
 #include <kernel/errno.h>
 #include <kernel/files.h>
@@ -485,14 +486,8 @@ static enum kernel_files_status socket_message(
         if (allocation != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     }
     uint64_t count = 0;
-    if (header.iov_count != 0 &&
-        (kernel_copy_from_user(mm, iov, header.iov, (size_t)header.iov_count * sizeof(*iov), &copied) !=
-         KERNEL_UACCESS_STATUS_OK || copied != header.iov_count * sizeof(*iov))) goto out;
-    for (size_t i = 0; i < header.iov_count; i++) {
-        if (iov[i].length > INT64_MAX - count) { *result = -KERNEL_EINVAL; goto out; }
-        if (kernel_user_range_check(iov[i].base, (size_t)iov[i].length) != KERNEL_UACCESS_STATUS_OK) { *result = -KERNEL_EFAULT; goto out; }
-        count += iov[i].length;
-    }
+    *result=kernel_uaccess_iov_import(mm,header.iov,iov,header.iov_count,&count);
+    if (*result) goto out;
     struct kernel_socket *socket = kernel_open_file_socket(*file);
     struct kernel_socket_address address = {0};
     const struct kernel_socket_address *destination = 0;

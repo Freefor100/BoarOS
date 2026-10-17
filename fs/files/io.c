@@ -137,7 +137,6 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
             }
             timed = 1;
         }
-        (void)arch_interrupt_save();
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
         enum kernel_scheduler_status status = kernel_wait_prepare(
@@ -657,9 +656,7 @@ enum kernel_files_status kernel_files_readv(
     struct kernel_uaccess_iovec *iov = local;
     struct kernel_open_file_description *description = 0;
     uint64_t total = 0U;
-    size_t copied = 0U;
     enum kernel_files_status status;
-    enum kernel_uaccess_status access;
     int dispatched = 0;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
@@ -705,41 +702,8 @@ enum kernel_files_status kernel_files_readv(
             goto out;
         }
     }
-    if (iovcnt != 0U) {
-        access = kernel_copy_from_user(mm, iov, user_iov,
-                                       iovcnt * sizeof(*iov), &copied);
-        if (access != KERNEL_UACCESS_STATUS_OK ||
-            copied != iovcnt * sizeof(*iov)) {
-            *linux_result = -KERNEL_EFAULT;
-            status = access == KERNEL_UACCESS_STATUS_FAULT
-                         ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
-            goto out;
-        }
-    }
-    for (size_t index = 0U; index < iovcnt; index++) {
-        if (iov[index].length > (uint64_t)INT64_MAX) {
-            *linux_result = -KERNEL_EINVAL;
-            status = KERNEL_FILES_STATUS_OK;
-            goto out;
-        }
-        /* Linux imports a sole iovec through import_ubuf (cap first),
-         * whereas a multi-entry vector checks each original range first. */
-        if (iovcnt == 1U && iov[index].length > KERNEL_FILES_MAX_RW_COUNT) {
-            iov[index].length = KERNEL_FILES_MAX_RW_COUNT;
-        }
-        if (kernel_user_range_check(iov[index].base,
-                                    (size_t)(iov[index].length == 0U
-                                                 ? 1U : iov[index].length)) !=
-            KERNEL_UACCESS_STATUS_OK) {
-            *linux_result = -KERNEL_EFAULT;
-            status = KERNEL_FILES_STATUS_OK;
-            goto out;
-        }
-        if (iov[index].length > KERNEL_FILES_MAX_RW_COUNT - total) {
-            iov[index].length = KERNEL_FILES_MAX_RW_COUNT - total;
-        }
-        total += iov[index].length;
-    }
+    *linux_result=kernel_uaccess_iov_import(mm,user_iov,iov,iovcnt,&total);
+    if (*linux_result) goto out;
     if (total == 0U) {
         *linux_result = 0;
         status = KERNEL_FILES_STATUS_OK;
@@ -1610,14 +1574,6 @@ static void account_write(struct kernel_files *files, int64_t result)
     }
 }
 
-static int memory_device_empty_range_fault(
-    const struct kernel_open_file_description *description,
-    uint64_t address, uint64_t count)
-{
-    return description->device && description->device->empty_range_fault &&
-        scalar_empty_range_fault(address, count);
-}
-
 enum kernel_files_status kernel_files_write(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, uint64_t count, int64_t *linux_result)
@@ -1738,9 +1694,7 @@ enum kernel_files_status kernel_files_writev(
     struct kernel_uaccess_iovec *iov = local;
     struct kernel_open_file_description *description = 0;
     uint64_t total = 0U;
-    size_t copied = 0U;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
-    enum kernel_uaccess_status access;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1786,34 +1740,8 @@ enum kernel_files_status kernel_files_writev(
             goto out;
         }
     }
-    /* Import descriptors once before any output or blocking. This is also
-     * what makes aggregate PIPE_BUF checks independent of iovec layout. */
-    access = kernel_copy_from_user(mm, iov, user_iov, iovcnt * sizeof(*iov),
-                                    &copied);
-    if (access != KERNEL_UACCESS_STATUS_OK || copied != iovcnt * sizeof(*iov)) {
-        *linux_result = -KERNEL_EFAULT;
-        if (access != KERNEL_UACCESS_STATUS_FAULT) {
-            status = KERNEL_FILES_STATUS_STATE;
-        }
-        goto out;
-    }
-    for (size_t index = 0U; index < iovcnt; index++) {
-        if (iov[index].length > (uint64_t)INT64_MAX - total) {
-            *linux_result = -KERNEL_EINVAL;
-            goto out;
-        }
-        if (kernel_user_range_check(iov[index].base, iov[index].length) !=
-                KERNEL_UACCESS_STATUS_OK ||
-            memory_device_empty_range_fault(description, iov[index].base,
-                                            iov[index].length)) {
-            *linux_result = -KERNEL_EFAULT;
-            goto out;
-        }
-        total += iov[index].length;
-    }
-    if (total > KERNEL_FILES_MAX_RW_COUNT) {
-        total = KERNEL_FILES_MAX_RW_COUNT;
-    }
+    *linux_result=kernel_uaccess_iov_import(mm,user_iov,iov,iovcnt,&total);
+    if (*linux_result) goto out;
     if (description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description,

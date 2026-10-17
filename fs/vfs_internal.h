@@ -108,17 +108,16 @@ void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
  * completion. CPU0 links only outstanding durable targets; each waiter
  * protects its result and registration handshake. */
 struct kernel_vfs_sync_request {
-    struct kernel_vfs_sync_request *next;
+    struct kernel_vfs_sync_request *index_left, *index_right;
     struct kernel_vfs_file *file;
     struct kernel_raw_lock metadata;
     struct kernel_wait_queue changed;
     uint64_t target;
     uint64_t *observed_error;
     int result;
-    uint8_t done;
+    uint8_t done, index_height;
 };
 void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *, int result);
-int kernel_vfs_sync_wait(struct kernel_vfs_sync_request *);
 int kernel_vfs_sync_borrowing(struct kernel_vfs_file *, int data_only,
     uint64_t *observed_error, const struct kernel_lock_guard *borrowed);
 

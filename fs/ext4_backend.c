@@ -926,25 +926,91 @@ static uint64_t journal_reached(const struct jbd_journal *journal, enum ext4_jou
         kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
 }
 
+static unsigned sync_target_height(const struct kernel_vfs_sync_request *request)
+{
+    return request ? request->index_height : 0;
+}
+
+static void sync_target_update(struct kernel_vfs_sync_request *request)
+{
+    unsigned left=sync_target_height(request->index_left);
+    unsigned right=sync_target_height(request->index_right);
+    request->index_height=1+(left>right?left:right);
+}
+
+static struct kernel_vfs_sync_request *sync_target_rotate(
+    struct kernel_vfs_sync_request *root,int left)
+{
+    struct kernel_vfs_sync_request *pivot;
+    if (left) {
+        pivot=root->index_right;
+        root->index_right=pivot->index_left;
+        pivot->index_left=root;
+    } else {
+        pivot=root->index_left;
+        root->index_left=pivot->index_right;
+        pivot->index_right=root;
+    }
+    sync_target_update(root);
+    sync_target_update(pivot);
+    return pivot;
+}
+
+static struct kernel_vfs_sync_request *sync_target_balance(struct kernel_vfs_sync_request *root)
+{
+    sync_target_update(root);
+    int balance=(int)sync_target_height(root->index_left)-(int)sync_target_height(root->index_right);
+    if (balance>1) {
+        if (sync_target_height(root->index_left->index_right)>sync_target_height(root->index_left->index_left))
+            root->index_left=sync_target_rotate(root->index_left,1);
+        return sync_target_rotate(root,0);
+    }
+    if (balance < -1) {
+        if (sync_target_height(root->index_right->index_left)>sync_target_height(root->index_right->index_right))
+            root->index_right=sync_target_rotate(root->index_right,0);
+        return sync_target_rotate(root,1);
+    }
+    return root;
+}
+
+static struct kernel_vfs_sync_request *sync_target_insert(struct kernel_vfs_sync_request *root,
+    struct kernel_vfs_sync_request *request)
+{
+    if (!root) { request->index_height=1; return request; }
+    if (root==request) __builtin_trap();
+    if (request->target<root->target ||
+        (request->target==root->target && (uintptr_t)request<(uintptr_t)root))
+        root->index_left=sync_target_insert(root->index_left,request);
+    else root->index_right=sync_target_insert(root->index_right,request);
+    return sync_target_balance(root);
+}
+
+static struct kernel_vfs_sync_request *sync_target_take_first(struct kernel_vfs_sync_request *root)
+{
+    if (!root->index_left) return root->index_right;
+    root->index_left=sync_target_take_first(root->index_left);
+    return sync_target_balance(root);
+}
+
 static void complete_sync_waiters(struct lwext4_mount_adapter *adapter)
 {
-    uintptr_t irq = arch_interrupt_save();
-    struct jbd_journal *journal = adapter->device.fs->jbd_journal;
-    int error = mount_error(adapter);
-    struct kernel_vfs_sync_request **link = &adapter->sync_waiters;
-    while (*link) {
-        struct kernel_vfs_sync_request *request = *link;
-        if (!error && journal->durable_sequence < request->target) {
-            link = &request->next;
-            continue;
+    for (;;) {
+        uintptr_t irq=arch_interrupt_save();
+        struct kernel_vfs_sync_request *request=adapter->sync_waiters;
+        while (request && request->index_left) request=request->index_left;
+        int error=mount_error(adapter);
+        if (!request || (!error && adapter->device.fs->jbd_journal->durable_sequence<request->target)) {
+            arch_interrupt_restore(irq);
+            return;
         }
-        *link = request->next;
-        request->next = NULL;
-        /* The caller may retire this stack object after complete returns its
-         * raw protection; do not access request after that point. */
-        kernel_vfs_sync_complete(request, lwext4_error(error));
+        adapter->sync_waiters=sync_target_take_first(adapter->sync_waiters);
+        request->index_left=request->index_right=NULL;
+        request->index_height=0;
+        arch_interrupt_restore(irq);
+        /* The caller owns the removed request until this single completion;
+         * notification can retire its stack, so do not access it afterwards. */
+        kernel_vfs_sync_complete(request,lwext4_error(error));
     }
-    arch_interrupt_restore(irq);
 }
 
 static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
@@ -1061,7 +1127,7 @@ static void journal_checkpoint_worker(void *context)
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
             if (!progress.checkpoint_pending) pending_deadline = 0;
         }
-        complete_sync_waiters(adapter);
+        if (mount_error(adapter)) complete_sync_waiters(adapter);
         irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
         if (progress.checkpoint != before) {
@@ -2094,10 +2160,8 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     for (size_t i = 0; i < count; i++) COST_ADD(BACKEND_REQUESTED, spans[i].size);
     int result = ext4_fpwrite_batch(lwext4_node_file(node), spans, count);
     for (size_t i = 0; i < count; i++) {
-        if (!result && spans[i].written != spans[i].size) result = EIO;
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
-    if (result) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     return lwext4_error(result);
 }
 
@@ -2145,12 +2209,13 @@ static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_onl
         return;
     }
     uintptr_t irq = arch_interrupt_save();
-    request->next = adapter->sync_waiters;
-    adapter->sync_waiters = request;
-    /* Capture/request can have yielded before registration. Recheck the real
-     * journal after linking, so a completion in that interval is not lost. */
-    complete_sync_waiters(adapter);
+    result=mount_error(adapter);
+    /* Capture may have yielded. CPU0 cannot advance durable between this
+     * recheck and insertion; already reached targets need no pending index. */
+    int reached=result || adapter->device.fs->jbd_journal->durable_sequence>=request->target;
+    if (!reached) adapter->sync_waiters=sync_target_insert(adapter->sync_waiters,request);
     arch_interrupt_restore(irq);
+    if (reached) kernel_vfs_sync_complete(request,lwext4_error(result));
 }
 static int ext4_backend_flush(struct kernel_vfs_instance *instance)
 {
@@ -2163,11 +2228,14 @@ static int ext4_backend_sync_filesystem(struct kernel_vfs_instance *instance,
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
     int result = writeback_mount_times(adapter, true);
-    if (result == EOK) result = ext4_file_sync_metadata_mode(lwext4_node_file(root), false);
+    /* Timestamp failures have already been published on the affected inode. */
+    if (result != EOK) return lwext4_error(result);
+    result = ext4_file_sync_metadata_mode(lwext4_node_file(root), false);
     if (result == EOK && !adapter->device.fs->jbd_journal) {
         result = ext4_cache_flush(adapter->mount_point);
         if (result == EOK) result = block_flush(&adapter->device);
     }
+    if (result != EOK) kernel_vfs_record_writeback_error(root, lwext4_error(result));
     return lwext4_error(result);
 }
 static int ext4_backend_symlink(struct kernel_vfs_instance *instance, const char *target, const char *path)

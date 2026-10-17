@@ -804,6 +804,65 @@ static void sendfile_pipe_case(struct kernel_heap *heap,struct kernel_vfs_mount 
     puts("PASS sendfile source-page borrow: unaligned cross-page pipe content, sparse zero bytes and explicit offset");
 }
 
+static void vector_boundaries(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};
+    struct kernel_open_file_description *file=NULL;
+    int error; int64_t result; size_t copied,written;
+    assert(!kernel_files_create(&local,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,"/vector-boundaries",0600,&file,&error) && !error);
+    file->open_flags=2;
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    assert(!kernel_vfs_pwrite(&file->file,0,"x",1,&written) && written==1);
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&file));
+    const struct {
+        uint64_t base,length,count;
+        int64_t read_result,write_result;
+    } cases[]={
+        {ARCH_MMU_USER_LIMIT,0,1,0,0},
+        {ARCH_MMU_USER_LIMIT+1,0,1,-KERNEL_EFAULT,-KERNEL_EFAULT},
+        {UINT64_MAX,0,0,0,0},
+        {0x100000,INT64_MAX,1,1,2*BOAROS_PAGE_SIZE},
+        {0x100000,UINT64_MAX,1,-KERNEL_EINVAL,-KERNEL_EINVAL},
+        {0x100000,INT64_MAX,2,-KERNEL_EFAULT,-KERNEL_EFAULT},
+    };
+    for (unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        struct kernel_uaccess_iovec iov[2]={{cases[i].base,cases[i].length},{0x100000,1}};
+        assert(!kernel_copy_to_user(&mm,0x200080,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+        uint64_t user_iov=cases[i].count?0x200080:UINT64_MAX;
+        assert(!kernel_files_lseek(&local,0,0,0,&result) && !result);
+        assert(!kernel_files_readv(&local,&mm,0,user_iov,cases[i].count,&result) && result==cases[i].read_result);
+        assert(!kernel_files_lseek(&local,0,0,0,&result) && !result);
+        assert(!kernel_files_writev(&local,&mm,0,user_iov,cases[i].count,&result) && result==cases[i].write_result);
+        /* Keep the next case's EOF independent of an earlier accepted prefix. */
+        assert(!kernel_files_ftruncate(&local,0,1,&result) && !result);
+    }
+    assert(!kernel_files_release(&local));
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    puts("PASS vector boundaries: empty ranges, signed lengths, single-vector cap before range and multi-vector original-range checks");
+}
+
+static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    assert(!kernel_vfs_mkdir(mount,"/empty-directory",0700));
+    struct kernel_open_file_description *directory=NULL;
+    int error; int64_t result;
+    assert(!kernel_open_file_create(heap,mount,"/empty-directory",&directory,&error) && !error);
+    directory->kind=KERNEL_OPEN_FILE_KIND_DIRECTORY;
+    struct kernel_open_file_description *borrowed=directory;
+    struct kernel_files local={0};
+    assert(!kernel_files_create(&local,heap) && !kernel_files_install_new_owned_at(&local,0,0,&directory));
+    uint64_t next=UINT64_MAX,ino;uint8_t type;char name[256];
+    assert(!kernel_vfs_dir_entry(&borrowed->file,2,&next,&ino,&type,name,sizeof(name)) && next==2);
+    assert(!kernel_files_lseek(&local,0,2,0,&result) && result==2);
+    for (unsigned i=0;i<3;i++) {
+        assert(!kernel_files_getdents(&local,&mm,0,0x200000,4096,&result) && !result);
+        assert(!kernel_files_lseek(&local,0,0,1,&result) && result==2);
+    }
+    assert(!kernel_files_release(&local));
+    puts("PASS directory EOF: valid unchanged VFS cookie and repeated getdents preserve the shared offset");
+}
+
 static void borrowed_page_case(struct physical_page_allocator *pages)
 {
     struct kernel_task_io_buffer scratch={0},borrowed={0};
@@ -856,6 +915,8 @@ int main(int argc,char **argv)
 #endif
     struct kernel_vfs_mount *memory=0;
     assert(!kernel_tmpfs_create(&heap,0,"",&memory)); sendfile_pipe_case(&heap,memory); file_case(&heap,memory,0);
+    directory_eof(&heap,memory);
+    vector_boundaries(&heap,memory);
     close_lock_case(&heap,memory);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,memory,0,actors,append);
