@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -17,10 +18,13 @@
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/reboot.h>
+#include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -100,6 +104,33 @@ static void *receiver(void *unused)
     atomic_store_explicit(&receiver_done,1,memory_order_release);
     return (void *)(uintptr_t)73;
 }
+static void empty_wait_signal(int use_select)
+{
+    int ready[2];CHECK(!pipe(ready));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){
+        CHECK(!close(ready[0]));pin(online&2 ? 1 : 0);tls_value=73;
+        atomic_store(&signal_seen,0);atomic_store(&nested_seen,0);
+        struct timespec timeout={10,0};
+        CHECK(write(ready[1],"r",1)==1);
+        int result=use_select ? pselect(0,NULL,NULL,NULL,&timeout,NULL) : ppoll(NULL,0,&timeout,NULL);
+        CHECK(result==-1 && errno==EINTR && atomic_load(&signal_seen)==1 && atomic_load(&nested_seen)==1);
+        _exit(0);
+    }
+    CHECK(!close(ready[1]));char byte;CHECK(read(ready[0],&byte,1)==1 && !close(ready[0]));
+    struct timespec start,now;CHECK(!clock_gettime(CLOCK_MONOTONIC,&start));
+    /* ready 只说明即将调用；实际 S 状态确认等待已登记，再从另一 CPU 发信号。 */
+    for(;;){
+        char path[64],text[512];snprintf(path,sizeof(path),"/proc/%ld/stat",(long)child);
+        int fd=open(path,O_RDONLY);CHECK(fd>=0);ssize_t n=read(fd,text,sizeof(text)-1);
+        CHECK(n>0 && !close(fd));text[n]=0;char *end=strrchr(text,')');CHECK(end);
+        if(end[2]=='S')break;
+        CHECK(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);
+        CHECK(!sched_yield());
+    }
+    CHECK(!kill(child,SIGUSR1));int status;
+    CHECK(waitpid(child,&status,0)==child && status==0);
+}
 static void thread_signal(void)
 {
     struct sigaction action={.sa_sigaction=signal_handler,.sa_flags=SA_SIGINFO|SA_NODEFER};
@@ -110,6 +141,7 @@ static void thread_signal(void)
     CHECK(!pthread_kill(thread,SIGUSR1));
     void *result; CHECK(!pthread_join(thread,&result) && result==(void *)(uintptr_t)73);
     CHECK(atomic_load_explicit(&receiver_done,memory_order_acquire));
+    empty_wait_signal(0);empty_wait_signal(1);
     record("pthread-tls-registers-nested-signal");
 }
 struct mapping_case { unsigned char *page; atomic_uint ready, command, result; int file; };
@@ -343,6 +375,8 @@ static void dynamic_tls(void)
 int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--exec-child")) return 23;
+    CHECK(!mkdir("/proc",0555) || errno==EEXIST);
+    CHECK(!mount("proc","/proc","proc",0,NULL) || errno==EBUSY);
     CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3));
     printf("USER-SMP BEGIN cpus=%u\n",online==3 ? 2 : 1); fflush(stdout);
     pin(0);

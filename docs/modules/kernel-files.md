@@ -188,6 +188,11 @@ make test-files-partial-write-riscv
 ## I/O 多路复用与 `poll/select`
 
 `kernel_files_ppoll()` 与 `kernel_files_pselect6()` 提供 Linux I/O 多路就绪通知：
+
+USER_SMP 中，`nfds=0` 且不替换临时信号掩码的调用在发起 CPU 执行，沿同一等待 token
+处理超时、信号和清理。带 FD 或临时信号掩码的调用仍进入 CPU0 业务范围；
+`pselect6` 先解包掩码参数，空掩码指针不会仅因存在 argpack 而触发迁移。
+
 - **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠，并直接交付该次扫描的结果，不在返回前重复查询。零超时调用只准备 OFD 引用数组，不分配或初始化等待节点。
 - **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均绑定同一个task/代次token），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。登记后的复查和唤醒后的扫描直接填写 revents；登记、复查、park 的顺序仍保证事件不会丢失。
 - **OFD 钉住引用（Pinned References）生命周期**：进入阻塞前，poll 引擎通过 `kernel_files_pin()` 对所有被监听的有效 OFD 各获取一份独立引用。这确保了在多线程共享文件表环境中，即使另一线程在睡眠期间 `close()` 并复用相应 fd，正在被 poll 的 OFD 及其内部等待队列依然受保护，不会发生 Use-After-Free；唤醒与清理时统一通过 `kernel_open_file_release()` 释放。

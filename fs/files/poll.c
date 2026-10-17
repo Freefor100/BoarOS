@@ -333,7 +333,8 @@ enum kernel_files_status kernel_files_ppoll(
     size_t sigsetsize,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
+    /* nfds 为零且不替换信号掩码时，只操作调用者自己的超时与等待 token。 */
+    KERNEL_SERVICE_SCOPE_IF(service, nfds || user_sigmask);
     struct kernel_pollfd stack_pfds[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
@@ -462,7 +463,6 @@ enum kernel_files_status kernel_files_pselect6(
     uint64_t user_sigdata,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     uint64_t stack_fds[6] = {0};
     uint64_t *in_rfds = &stack_fds[0];
     uint64_t *in_wfds = &stack_fds[1];
@@ -516,6 +516,8 @@ enum kernel_files_status kernel_files_pselect6(
         sigsetsize = (size_t)argpack.sigsetsize;
     }
 
+    /* libc 可以传入指向空掩码的 argpack，按解包后的实际指针决定。 */
+    KERNEL_SERVICE_SCOPE_IF(service, nfds > 0 || user_sigmask);
     err = poll_compute_deadline(mm,
                                 user_timeout,
                                 &deadline,

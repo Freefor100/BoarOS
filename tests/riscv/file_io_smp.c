@@ -30,6 +30,7 @@ static struct kernel_page_cache *cache;
 static struct kernel_thread_join peer;
 static unsigned cpus,stop,progress,user_overlap;
 static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads;
+static unsigned watch_timeout,timeout_copies;
 enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
     struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
@@ -84,6 +85,11 @@ enum kernel_page_cache_status __wrap_kernel_page_cache_run_cpu0(struct kernel_pa
 enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *,void *,uint64_t,size_t,size_t *);
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *m,void *d,uint64_t a,size_t n,size_t *copied)
 {
+    if(watch_timeout && a==IO_ANON+512) {
+        if(kernel_cpu_current()->logical_id!=copy_cpu)
+            riscv_smp_fail("empty-poll-copy-left-caller-hart",-1);
+        timeout_copies++;
+    }
     enum kernel_uaccess_status s=__real_kernel_copy_from_user(m,d,a,n,copied);
     if (s && a==IO_BUFFER) {
         virt_uart_puts("BoarOS: FILE IO source copy status="); virt_uart_put_hex(s);
@@ -146,6 +152,21 @@ static void verify(void *unused)
     check(local_copies[copy_cpu] && before.requests_queued==after.requests_queued,"file-io-hot-no-cpu0-request");
     char zero=0;
     check(!kernel_copy_to_user(mm,IO_ANON,&zero,1,&copied) && copied==1,"file-io-cold-destination-ready");
+    int64_t timeout[2]={0,1000};
+    check(!kernel_copy_to_user(mm,IO_ANON+512,&timeout,sizeof(timeout),&copied) &&
+        copied==sizeof(timeout),"empty-poll-timeout-ready");
+    watch_timeout=1;
+    check(!kernel_files_ppoll(files,mm,kernel_task_current(),0,0,IO_ANON+512,0,0,&result) &&
+        !result,"empty-ppoll-local-timeout");
+    check(!kernel_copy_to_user(mm,IO_ANON+512,&timeout,sizeof(timeout),&copied) &&
+        copied==sizeof(timeout),"empty-pselect-timeout-ready");
+    check(!kernel_files_pselect6(files,mm,kernel_task_current(),0,0,0,0,IO_ANON+512,0,&result) &&
+        !result,"empty-pselect-local-timeout");
+    watch_timeout=0;
+    check(timeout_copies==2 && kernel_cpu_current()->logical_id==copy_cpu,
+        "empty-poll-kept-caller-hart");
+    virt_uart_puts("BoarOS: FILE IO empty poll timeout copy hart=");virt_uart_put_hex(copy_cpu);
+    virt_uart_puts(" copies=");virt_uart_put_hex(timeout_copies);virt_uart_putc('\n');
     kernel_page_cache_get_concurrency_state(cache,&before);
     unsigned loads=cold_loads;
     watch_copy=1;

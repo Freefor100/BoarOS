@@ -2081,6 +2081,7 @@ test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 test-poll-host:
 	@mkdir -p build/host
 	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 \
+		-DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 \
 		-ffunction-sections -fdata-sections -Wl,--gc-sections -idirafter include \
 		-fsanitize=address,undefined tests/host/poll_snapshot.c -o build/host/poll-snapshot
 	build/host/poll-snapshot
