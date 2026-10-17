@@ -25,5 +25,10 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         mkfs.ext4 -q -F -b "$block" "$build_dir/image-$shift-$block.img"
         timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift-$block.img"
         e2fsck -fn "$build_dir/image-$shift-$block.img" > "$build_dir/fsck-$shift-$block.log" 2>&1
+        truncate -s 32M "$build_dir/error-$shift-$block.img"
+        mkfs.ext4 -q -F -b "$block" "$build_dir/error-$shift-$block.img"
+        timeout 15s "$build_dir/concurrency-$shift" "$build_dir/error-$shift-$block.img" durable-error
+        timeout 15s "$build_dir/concurrency-$shift" "$build_dir/error-$shift-$block.img" durable-recover
+        e2fsck -fn "$build_dir/error-$shift-$block.img" > "$build_dir/fsck-error-recovered-$shift-$block.log" 2>&1
     done
 done

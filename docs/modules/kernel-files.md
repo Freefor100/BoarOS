@@ -132,7 +132,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - 生产 console 经 [TTY](kernel-tty.md) 接受有界 TX、OPOST 和真实输入；不自动建立 ctty。未发布 serial transport 的裸 console fixture 经 kernel_console_putc/原输入暂存。用户 fault、短计数和阻塞 pin 保持所属请求的真实 owner。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
-- `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的游标。共同同步路径在后端 I/O 完成后，用与错误发布相同的短 IRQ 保护一次性比较错误序列、决定返回值并推进游标；同一历史错误只被该 OFD 观察一次，不以文件位置锁覆盖设备等待。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
+- `kernel_files_sync()` pin 选定 OFD，分批交接目标 inode 数据，由 CPU0 prepare 捕获一次元数据 durable 目标，再由原调用者等待 journal 完成。栈上等待请求借用这份实际 OFD/file，关闭并复用 fd 不改变同步对象；CPU0 执行者不陪调用者等待。CPU0 的完成事件一次性记录元数据错误、消费 OFD 错误游标并发布原请求结果，调用者取走结果直接返回；数据交接失败不重复递增错误序号。独立 open 各持观察位置，dup/fork 共用，同一历史错误只被该 OFD 观察一次。独立同步不以文件位置锁覆盖设备等待；普通文件和目录支持 fsync/fdatasync，pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。分批、完成与停止边界见[VFS](vfs-ext4.md#文件节点与页缓存)。
 - `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
@@ -373,7 +373,7 @@ AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记�
 共享；同 OFD 的 dup/fork 共享规则不变。tmpfs read/readv/pread 用无分配空洞读路径，
 只有 mmap 缺页或实际写入才消耗后备页配额。
 
-普通文件整次 write/writev/pwrite 在用户 iovec 与页面片段循环外取得 inode 写操作锁（rank 15），直到同步写收尾返回才释放；非定位写先取得共享 OFD offset 锁（rank 10）。truncate 与直接 VFS pwrite/append 走同一写操作锁，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-file-io-concurrency-host` 检查同 inode 未驻留映射来源、双向重叠和旧 EOF 尾部来源，`make test-userland-riscv` 补真实系统调用。
+普通文件整次 write/writev/pwrite 在用户 iovec 与页面片段循环外取得 inode 写操作锁（rank 15），数据接纳结束后先释放，再执行同步写收尾；非定位写先取得共享 OFD offset 锁（rank 10），位置资格覆盖整次调用。truncate 与直接 VFS pwrite/append 走同一写操作锁，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-file-io-concurrency-host` 检查同 inode 未驻留映射来源、双向重叠和旧 EOF 尾部来源，`make test-userland-riscv` 补真实系统调用。
 
 成本诊断版本记录真实请求、接受量、用户复制及仍有实际使用者的暂存容量；普通文件写入的暂存量为零。短写及同步尾部错误沿原语义处理；接口与单位见[成本观测](kernel-cost.md)。
 

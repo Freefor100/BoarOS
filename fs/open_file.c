@@ -1118,17 +1118,6 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
     return result;
 }
 
-struct sync_range_call {
-    struct kernel_open_file_description *file;
-    uint64_t start,end;
-    int result;
-};
-static void sync_range_cpu0(void *argument)
-{
-    struct sync_range_call *call=argument;
-    call->result=kernel_vfs_sync_range(&call->file->file,call->start,call->end,
-        &call->file->observed_writeback_error);
-}
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,
     uint64_t start, uint64_t end)
 {
@@ -1136,15 +1125,8 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
     struct kernel_io_context *current = kernel_io_context_current();
     if (current->user_pins || current->cache_writes || kernel_cpu_current()->raw_locks)
         return -KERNEL_EIO;
-    if (kernel_open_file_io_requires_cpu0(file)) {
-        struct kernel_io_context *io=kernel_io_context_current();
-        if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
-            !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return -KERNEL_EIO;
-        struct sync_range_call call={file,start,end,-KERNEL_EIO};
-        if (kernel_page_cache_run_cpu0(kernel_open_file_page_cache(file),sync_range_cpu0,&call))
-            return -KERNEL_EIO;
-        return call.result;
-    }
+    if (kernel_open_file_io_requires_cpu0(file) && (current->locks ||
+        !kernel_scheduler_can_sleep() || arch_external_interrupt_active())) return -KERNEL_EIO;
     return kernel_vfs_sync_range(&file->file, start, end,
                                  &file->observed_writeback_error);
 }

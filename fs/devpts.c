@@ -475,8 +475,6 @@ static int set_times(struct kernel_vfs_file *file, const struct kernel_vfs_times
     return 0;
 }
 static void accessed(struct kernel_vfs_file *file) { (void)file; }
-static int sync_metadata(struct kernel_vfs_node *node, int data_only)
-{ (void)node; (void)data_only; return 0; }
 static int prepare_unmount(struct kernel_vfs_mount *mount)
 {
     struct devpts_mount *m = devpts(mount);
@@ -510,7 +508,7 @@ static void initialize_backend(void)
     ops->stat = stat_inode; ops->statfs = statfs; ops->dir_entry = dir_entry;
     ops->set_mode = set_mode; ops->set_owner = set_owner; ops->set_times = set_times;
     ops->accessed = accessed; ops->writeback_allowed = no_error;
-    ops->sync_metadata = sync_metadata; ops->flush = no_error;
+    ops->flush = no_error;
     ops->prepare_unmount = prepare_unmount; ops->unmount = unmount;
 }
 int kernel_devpts_create(struct kernel_heap *heap, uint64_t flags,

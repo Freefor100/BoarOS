@@ -147,6 +147,7 @@ struct cache_request {
     struct cache_request *next;
     void (*execute)(void *);
     void *argument;
+    const int *finished;
     struct kernel_task *account_task;
     uint64_t queued_at;
     unsigned observed;
@@ -635,22 +636,37 @@ static enum kernel_page_cache_status abandon_entry(
     return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
 }
 
+static void take_cleanup_entries(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry **entries)
+{
+    CACHE_SCOPE(guard,cache);
+    *entries=cache->record->cleanup_entries;
+    cache->record->cleanup_entries=NULL;
+}
+
+static int drain_cleanup_entries(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry **entries, size_t limit, uint64_t *pages_released)
+{
+    int failed=0;
+    while (*entries && limit--) {
+        struct kernel_page_cache_entry *entry=*entries;
+        *entries=entry->cleanup_next;
+        if (!cleanup_entry(cache,entry,pages_released)) {
+            CACHE_SCOPE(guard,cache);
+            entry->cleanup_next=cache->record->cleanup_entries;
+            cache->record->cleanup_entries=entry;
+            failed=1;
+        }
+    }
+    return !failed;
+}
+
 static int drain_entries(struct kernel_page_cache *cache,
                          uint64_t *pages_released)
 {
-    {
-        struct kernel_page_cache_entry *entries;
-        { CACHE_SCOPE(guard,cache); entries=cache->record->cleanup_entries; cache->record->cleanup_entries=0; }
-        int failed=0;
-        while (entries) {
-            struct kernel_page_cache_entry *entry=entries; entries=entry->cleanup_next;
-            if (!cleanup_entry(cache,entry,pages_released)) {
-                CACHE_SCOPE(guard,cache);
-                entry->cleanup_next=cache->record->cleanup_entries; cache->record->cleanup_entries=entry; failed=1;
-            }
-        }
-        return !failed;
-    }
+    struct kernel_page_cache_entry *entries;
+    take_cleanup_entries(cache,&entries);
+    return drain_cleanup_entries(cache,&entries,SIZE_MAX,pages_released);
 }
 
 /* The inode queue borrows its dirty entries. One offset tree replaces the
@@ -1684,9 +1700,9 @@ int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *cache)
 }
 
 static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache,
-    void (*execute)(void *),void *argument,unsigned observed)
+    void (*execute)(void *),void *argument,unsigned observed,const int *finished)
 {
-    struct cache_request request = {.execute=execute,.argument=argument,.observed=observed,
+    struct cache_request request = {.execute=execute,.argument=argument,.finished=finished,.observed=observed,
         .queued_at=observed?kernel_time_monotonic_ns():0};
     struct kernel_task *task = kernel_task_current();
     if (kernel_task_has_user_context(task)) request.account_task = task;
@@ -1721,8 +1737,9 @@ static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache
       r->request_borrows--; }
     return request.status;
 }
-enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(struct kernel_page_cache *cache,
-    void (*execute)(void *),void *argument,const struct kernel_lock_guard *borrowed)
+static enum kernel_page_cache_status run_cpu0_until(struct kernel_page_cache *cache,
+    void (*execute)(void *),void *argument,const struct kernel_lock_guard *borrowed,
+    const int *finished)
 {
     if (!cache_live(cache) || !execute)
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
@@ -1732,10 +1749,18 @@ enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(struct kernel
         io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
         !kernel_scheduler_can_sleep() || arch_external_interrupt_active()))
         return KERNEL_PAGE_CACHE_STATUS_STATE;
-    if (kernel_page_cache_is_executor(cache)) { execute(argument); return KERNEL_PAGE_CACHE_STATUS_OK; }
+    if (kernel_page_cache_is_executor(cache)) {
+        do { execute(argument); } while (finished && !*finished);
+        return KERNEL_PAGE_CACHE_STATUS_OK;
+    }
     if ((!borrowed && io->locks) || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
         !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return KERNEL_PAGE_CACHE_STATUS_STATE;
-    return run_request(cache,execute,argument,1);
+    return run_request(cache,execute,argument,1,finished);
+}
+enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(struct kernel_page_cache *cache,
+    void (*execute)(void *),void *argument,const struct kernel_lock_guard *borrowed)
+{
+    return run_cpu0_until(cache,execute,argument,borrowed,NULL);
 }
 enum kernel_page_cache_status kernel_page_cache_run_cpu0(struct kernel_page_cache *cache,
     void (*execute)(void *),void *argument)
@@ -1859,7 +1884,7 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
         struct read_batch_load request={cache,file,first,pages,count,candidates,entries,loads,outputs,spans,
             workspace?&workspace->backend:NULL,allocation};
         enum kernel_page_cache_status submitted=KERNEL_PAGE_CACHE_STATUS_OK;
-        if (remote_cache_client()) submitted=run_request(cache,commit_read_batch,&request,0);
+        if (remote_cache_client()) submitted=run_request(cache,commit_read_batch,&request,0,NULL);
         else commit_read_batch(&request);
         if (submitted) {
             for (size_t i=0;i<count;i++) {
@@ -2412,6 +2437,8 @@ static int writeback_run(struct kernel_page_cache *cache,
         int submitted=ready ? kernel_vfs_node_writeback(entries[first]->node,spans,ready) : 0;
         for (size_t i=0;i<ready;i++) if (!submitted && spans[i].written!=spans[i].size) submitted=-KERNEL_EIO;
         if (submitted) result=submitted;
+        /* 后端已结束实际访问；完成发布只依赖entry借用和缓存保护。 */
+        if (io.lock) kernel_lock_release(&io);
         {
             CACHE_SCOPE(guard,cache);
             for (size_t i=done;i>0;i--) {
@@ -2440,14 +2467,49 @@ static int writeback_run(struct kernel_page_cache *cache,
 
 
 
-int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node,uint64_t start,uint64_t end)
+struct foreground_writeback {
+    struct kernel_page_cache *cache;
+    struct kernel_vfs_node *node;
+    uint64_t cursor,last,end;
+    struct kernel_page_cache_entry **selected;
+    struct writeback_workspace *workspace;
+    size_t capacity;
+    int result,done;
+};
+
+static void writeback_window(void *argument)
+{
+    struct foreground_writeback *request=argument;
+    struct kernel_page_cache *cache=request->cache;
+    size_t count=0,used;
+    {
+        CACHE_SCOPE(guard,cache);
+        struct kernel_page_cache_entry *entry=dirty_at_or_after(request->node,request->cursor);
+        while (entry && entry->page_index<=request->last && count<request->capacity) {
+            request->selected[count++]=entry;
+            entry_borrow(entry); COST_ADD(WRITEBACK_VISITS,1);
+            entry=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(request->node)->tree,entry);
+        }
+    }
+    if (!count) { request->done=1; return; }
+    /* 窗口只借用本批条目；下一次提交前重查索引，截断可退休其余页。 */
+    request->cursor=request->selected[count-1]->page_index+1;
+    request->result=writeback_run(cache,request->selected,count,request->end,&used,request->workspace);
+    {
+        CACHE_SCOPE(guard,cache);
+        for (size_t i=0;i<count;i++) entry_return(request->selected[i]);
+    }
+    request->done=request->result || request->cursor>request->last;
+}
+
+static void cache_yield(void);
+
+int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t start,uint64_t end,
+    const struct kernel_lock_guard *borrowed)
 {
     if (!cache_live(cache) || !node || start>=end) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(node_guard);
-    {
-        if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
-    }
+    if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
     uint64_t cursor=start>>BOAROS_PAGE_SHIFT,last=(end-1)>>BOAROS_PAGE_SHIFT;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
@@ -2459,39 +2521,39 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
         if (last>tail->page_index) last=tail->page_index;
         struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
         multiple=next && next->page_index<=last;
-        if (!multiple) {
-            single=entry;entry_borrow(single);COST_ADD(WRITEBACK_VISITS,1);
-        }
     }
     union foreground_workspace *lease=multiple?foreground_workspace_take(cache):NULL;
     if (multiple && !lease) return -KERNEL_ENOMEM;
     struct writeback_workspace work=multiple?(struct writeback_workspace){
         .prepared=lease->writeback.prepared,.spans=lease->writeback.spans,
         .selected=lease->writeback.selected}:(struct writeback_workspace){0};
-    int result=0;
-    for (;;) {
-        struct kernel_page_cache_entry **selected=multiple?work.selected:&single;
-        size_t count=0,used;
-        if (multiple) {
-            CACHE_SCOPE(guard,cache);
-            struct kernel_page_cache_entry *entry=dirty_at_or_after(node,cursor);
-            while (entry && entry->page_index<=last && count<BOAROS_PAGE_CACHE_WRITEBACK_PAGES) {
-                selected[count++]=entry;entry_borrow(entry);
-                COST_ADD(WRITEBACK_VISITS,1);
-                entry=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
+    struct foreground_writeback request={.cache=cache,.node=node,.cursor=cursor,.last=last,
+        .end=end,.selected=multiple?work.selected:&single,.workspace=multiple?&work:NULL,
+        .capacity=multiple?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1};
+    int dispatch=kernel_page_cache_needs_cpu0(cache);
+    if (dispatch) {
+        if (run_cpu0_until(cache,writeback_window,&request,borrowed,&request.done))
+            request.result=-KERNEL_EIO;
+    } else {
+        while (!request.done) {
+            writeback_window(&request);
+            if (!request.done && kernel_scheduler_can_sleep()) {
+                /* 此调用者不占执行队列；批末允许IRQ抢占，不逐窗强制轮转。
+                 * restore只负责重新开启，须先save关回IRQ再恢复原状态。 */
+                uintptr_t irq=arch_interrupt_save();
+                arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
+                (void)arch_interrupt_save();
+                arch_interrupt_restore(irq);
             }
-        } else count=1;
-        if (!count) break;
-        /* Store only the key across I/O; a concurrent truncate may retire all
-         * other pages. This window alone borrows entry storage until return. */
-        cursor=selected[count-1]->page_index+1;
-        result=writeback_run(cache,selected,count,end,&used,multiple?&work:NULL);
-        {CACHE_SCOPE(guard,cache);for(size_t i=0;i<count;i++)entry_return(selected[i]);}
-        if (result || !multiple || cursor>last) break;
+        }
     }
     if (lease) foreground_workspace_put(cache,lease);
-    return result;
+    return request.result;
 }
+
+int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t start,uint64_t end)
+{ return kernel_page_cache_writeback_range_borrowing(cache,node,start,end,NULL); }
 
 int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t end)
@@ -2782,6 +2844,7 @@ static void page_cache_worker(void *argument)
     struct kernel_page_cache_record *r = cache->record;
     __atomic_store_n(&r->executor_io,kernel_io_context_current(),__ATOMIC_RELEASE);
     unsigned reads=0;
+    struct kernel_page_cache_entry *cleanup_entries=NULL;
     for (;;) {
         struct cache_request *request = 0;
         struct kernel_wait_token token = {0};
@@ -2795,13 +2858,17 @@ static void page_cache_worker(void *argument)
                 request = r->reads_head; r->reads_head = request->next;
                 if (!r->reads_head) r->reads_tail = &r->reads_head;
                 r->reads_running++; reads++;
-            } else if (r->stopping) break;
+            } else if (cleanup_entries) cleanup=2;
+            else if (r->stopping) break;
             else if (kernel_wait_prepare(&r->work, 0, 0, &token)) __builtin_trap();
         }
         if (!request) {
             if (cleanup) {
-                uint64_t released=0; (void)drain_entries(cache,&released);
-                if (!stopping) cache_background(cache);
+                if (!cleanup_entries) take_cleanup_entries(cache,&cleanup_entries);
+                uint64_t released=0;
+                (void)drain_cleanup_entries(cache,&cleanup_entries,16,&released);
+                if (cleanup==1 && !stopping) cache_background(cache);
+                cache_yield();
                 continue;
             }
             enum kernel_wait_wake_reason reason;
@@ -2823,17 +2890,33 @@ static void page_cache_worker(void *argument)
         {
             CACHE_SCOPE(complete, cache);
             if (!r->read_requests || !r->reads_running || request->done) __builtin_trap();
-            r->read_requests--; r->reads_running--; r->requests_completed++;
+            r->reads_running--;
             if (request->observed) {
                 uint64_t queued=started-request->queued_at,elapsed=finished-started;
-                r->executions_completed++; r->queue_ns+=queued; r->execute_ns+=elapsed;
+                r->queue_ns+=queued; r->execute_ns+=elapsed;
                 if (queued>r->max_queue_ns) r->max_queue_ns=queued;
                 if (elapsed>r->max_execute_ns) r->max_execute_ns=elapsed;
             }
-            request->status = result; request->done = 1;
-            cache_wake(&request->changed);
+            if (!stopping && !r->stopping && request->finished && !*request->finished) {
+                /* 同一请求只推进一个窗口；续批排到现有队尾，不唤醒caller重提。 */
+                request->next=NULL;
+                request->queued_at=finished;
+                if (!r->reads_head) r->reads_tail=&r->reads_head;
+                *r->reads_tail=request; r->reads_tail=&request->next;
+            } else {
+                if (r->stopping && request->finished && !*request->finished)
+                    result=KERNEL_PAGE_CACHE_STATUS_STATE;
+                r->read_requests--; r->requests_completed++;
+                if (request->observed) r->executions_completed++;
+                request->status = result; request->done = 1;
+                cache_wake(&request->changed);
+            }
         }
-        uint64_t released = 0; (void)drain_entries(cache, &released);
+        /* 剩余退休owner随worker存活；每次最多释放16项，再接下一条前景请求。
+         * 尚有借用的失败项归还缓存，等实际归还事件，不在本轮反复重试。 */
+        if (!cleanup_entries) take_cleanup_entries(cache,&cleanup_entries);
+        uint64_t released=0;
+        (void)drain_cleanup_entries(cache,&cleanup_entries,16,&released);
         cache_yield();
     }
     group_complete(r,0);

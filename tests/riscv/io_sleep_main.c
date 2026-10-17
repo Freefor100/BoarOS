@@ -26,6 +26,7 @@
 #include "../../fs/write_source.h"
 #include "../../fs/files/private.h"
 #include "../../kernel/sched/private.h"
+#include "../../mm/uaccess_internal.h"
 #include <string.h>
 
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(4096)));
@@ -373,18 +374,20 @@ static unsigned receive_paused, receive_done, receive_mode;
 static int32_t receive_pair[2];
 static struct kernel_task *receive_holder, *receive_waiter;
 static struct kernel_wait_queue receive_held, receive_completed;
-enum kernel_uaccess_status __real_kernel_copy_to_user(struct kernel_mm *, uint64_t, const void *, size_t, size_t *);
-enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm, uint64_t address, const void *buffer, size_t size, size_t *copied)
+enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
+    struct kernel_uaccess_write_cursor *, uint64_t, const void *, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
+    struct kernel_uaccess_write_cursor *cursor, uint64_t address, const void *buffer,
+    size_t size, size_t *copied)
 {
     if(!receive_testing || mm!=&sync_mm)
-        return __real_kernel_copy_to_user(mm,address,buffer,size,copied);
+        return __real_kernel_uaccess_write_cursor_copy(mm,cursor,address,buffer,size,copied);
     if(kernel_cpu_current()->current==receive_holder && address==OP_USER+256 && !receive_paused) {
         receive_paused=1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&receive_held,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,270);
     }
-    enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,buffer,size,copied);
-    return result;
+    return __real_kernel_uaccess_write_cursor_copy(mm,cursor,address,buffer,size,copied);
 }
 static void receive_owner(void *argument)
 {

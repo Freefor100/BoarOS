@@ -307,10 +307,13 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     check(kernel_open_file_create_socket(files->heap,accepted,0,&reader)==KERNEL_OPEN_FILE_STATUS_OK, 201);
     uint32_t consumed=0;
     while(consumed<8192){
+        /* 此启动夹具没有网络worker；读取不再隐式执行协议，显式推进实际待办。 */
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,4,2});
         struct kernel_socket_read_request request={0};
         int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0);
         check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
     }
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,4,2});
     struct kernel_socket_write_request reservation = {0}, competing = {0};
     struct kernel_open_file_description *second_pin = client;
     check(kernel_open_file_acquire(second_pin) == KERNEL_OPEN_FILE_STATUS_OK, 240);

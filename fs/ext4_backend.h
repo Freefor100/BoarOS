@@ -20,6 +20,7 @@ struct lwext4_mount_adapter {
     struct ext4_lock locks;
     struct kernel_thread_join journal_worker, checkpoint_worker;
     struct kernel_wait_queue journal_work, checkpoint_work, journal_progress;
+    struct kernel_vfs_sync_request *sync_waiters;
     uint8_t journal_started, checkpoint_started;
     uint8_t journal_requested, checkpoint_requested, journal_force, journal_stopping;
     char device_name[24];

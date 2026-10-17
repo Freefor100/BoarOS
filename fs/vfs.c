@@ -2394,55 +2394,113 @@ uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
     return node != 0 ? node->writeback_error_sequence : 0;
 }
 
-static int vfs_sync_range_mode(struct kernel_vfs_file *file,
-    uint64_t start, uint64_t end, uint64_t *observed_error, int data_only)
+static void vfs_sync_observe_complete(struct kernel_vfs_sync_request *request, int result)
 {
-    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
+    /* 完成事件已在CPU0；共享OFD游标在通知caller前一并消费，不再为此交接一次。 */
+    uintptr_t irq = arch_interrupt_save();
+    if (*request->observed_error != node->writeback_error_sequence) {
+        if (!result) result = node->writeback_error;
+        *request->observed_error = node->writeback_error_sequence;
+    }
+    {
+        KERNEL_RAW_SCOPE(guard, &request->metadata);
+        if (request->done || request->next) __builtin_trap();
+        request->result = result;
+        request->done = 1;
+        if (request->changed.initialized)
+            (void)kernel_wait_queue_wake_all(&request->changed);
+        /* request can retire once this raw lock is released. */
+    }
+    arch_interrupt_restore(irq);
+}
+
+void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *request, int result)
+{
+    if (result) kernel_vfs_record_writeback_error(kernel_vfs_file_node(request->file), result);
+    vfs_sync_observe_complete(request, result);
+}
+
+int kernel_vfs_sync_wait(struct kernel_vfs_sync_request *request)
+{
     int result;
-    if (node == 0 || observed_error == 0) return -KERNEL_EBADF;
-    if (start >= end) return -KERNEL_EINVAL;
-    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG &&
-        (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
-        return -KERNEL_EINVAL;
+    for (;;) {
+        struct kernel_wait_token token = {0};
+        {
+            KERNEL_RAW_SCOPE(guard, &request->metadata);
+            if (request->done) { result = request->result; break; }
+            if (!request->changed.initialized) kernel_wait_queue_init(&request->changed);
+            if (kernel_wait_prepare(&request->changed, 0, 0, &token)) __builtin_trap();
+        }
+        enum kernel_wait_wake_reason reason;
+        if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
+    }
+    if (request->changed.initialized && (kernel_wait_queue_close(&request->changed) ||
+        kernel_wait_queue_destroy(&request->changed))) __builtin_trap();
+    return result;
+}
+
+struct vfs_sync_call {
+    struct kernel_vfs_sync_request *request;
+    int result, data_only;
+};
+
+static void vfs_sync_prepare(void *argument)
+{
+    struct vfs_sync_call *call = argument;
+    struct kernel_vfs_sync_request *request = call->request;
+    struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
+    if (call->result || node->instance->read_only) {
+        /* 数据交接失败已由写回路径记录；这里只观察，不能再递增序号。 */
+        vfs_sync_observe_complete(request, call->result);
+        return;
+    }
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 0);
-    result = 0;
-    if (node->instance->read_only) goto observe;
-    int cached = node->instance->page_cache != NULL;
-    if (cached) kernel_assert_service_context();
-    if (cached && node_guard.lock) kernel_lock_release(&node_guard);
-    result = !node->instance->page_cache ? 0 : start == 0U && end == UINT64_MAX
-        ? kernel_page_cache_writeback(node->instance->page_cache, node)
-        : kernel_page_cache_writeback_range(node->instance->page_cache,
-                                            node, start, end);
-    if (result == 0) {
-        if (cached) kernel_vfs_node_lock(node, &node_guard, 0);
-        result = node->instance->ops->sync_metadata(node, data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR);
-        if (result != 0) kernel_vfs_record_writeback_error(node, result);
-    }
-observe:
-    /* 后端在CPU0发布错误；比较与推进共享OFD游标不能在两次同步间被抢占。
-     * 此处不等待，也不借用与文件位置无关的offset锁。 */
-    {
-        uintptr_t irq = arch_interrupt_save();
-        if (*observed_error != node->writeback_error_sequence) {
-            if (result == 0) result = node->writeback_error;
-            *observed_error = node->writeback_error_sequence;
-        }
-        arch_interrupt_restore(irq);
-    }
-    return result;
+    if (node->instance->ops->sync_prepare)
+        node->instance->ops->sync_prepare(node, call->data_only, request);
+    else
+        kernel_vfs_sync_complete(request, 0);
+}
+
+static int vfs_sync_range_mode(struct kernel_vfs_file *file,
+    uint64_t start, uint64_t end, uint64_t *observed_error, int data_only,
+    const struct kernel_lock_guard *borrowed)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!node || !observed_error) return -KERNEL_EBADF;
+    if (start >= end) return -KERNEL_EINVAL;
+    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG &&
+        (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_EINVAL;
+    struct kernel_page_cache *cache = node->instance->page_cache;
+    struct kernel_vfs_sync_request request = {.file = file, .observed_error = observed_error};
+    struct vfs_sync_call call = {.request = &request,
+        .data_only = data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR};
+    if (!node->instance->read_only)
+        call.result = cache ? kernel_page_cache_writeback_range_borrowing(
+            cache, node, start, end, borrowed) : 0;
+    kernel_raw_lock_init(&request.metadata, KERNEL_RAW_RANK_OBJECT);
+    if (cache && kernel_page_cache_needs_cpu0(cache)) {
+        enum kernel_page_cache_status status = kernel_page_cache_run_cpu0_borrowing(
+            cache, vfs_sync_prepare, &call, borrowed);
+        if (status) return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    } else vfs_sync_prepare(&call);
+    return kernel_vfs_sync_wait(&request);
 }
 
 int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
                     uint64_t *observed_error)
 {
-    return vfs_sync_range_mode(file, 0U, UINT64_MAX, observed_error, datasync);
+    return kernel_vfs_sync_borrowing(file, datasync, observed_error, NULL);
 }
+
+int kernel_vfs_sync_borrowing(struct kernel_vfs_file *file, int datasync,
+    uint64_t *observed_error, const struct kernel_lock_guard *borrowed)
+{ return vfs_sync_range_mode(file, 0U, UINT64_MAX, observed_error, datasync, borrowed); }
 
 int kernel_vfs_sync_range(struct kernel_vfs_file *file, uint64_t start,
     uint64_t end, uint64_t *observed_error)
-{ return vfs_sync_range_mode(file, start, end, observed_error, 0); }
+{ return vfs_sync_range_mode(file, start, end, observed_error, 0, NULL); }
 
 const struct kernel_vfs_mount *kernel_vfs_node_mount(
     const struct kernel_vfs_node *node)

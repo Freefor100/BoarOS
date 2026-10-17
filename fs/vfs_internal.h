@@ -104,4 +104,22 @@ void kernel_vfs_file_write_lock(struct kernel_vfs_file *file,
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
 
+/* The caller owns file/OFD and lends its observed_error cursor through
+ * completion. CPU0 links only outstanding durable targets; each waiter
+ * protects its result and registration handshake. */
+struct kernel_vfs_sync_request {
+    struct kernel_vfs_sync_request *next;
+    struct kernel_vfs_file *file;
+    struct kernel_raw_lock metadata;
+    struct kernel_wait_queue changed;
+    uint64_t target;
+    uint64_t *observed_error;
+    int result;
+    uint8_t done;
+};
+void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *, int result);
+int kernel_vfs_sync_wait(struct kernel_vfs_sync_request *);
+int kernel_vfs_sync_borrowing(struct kernel_vfs_file *, int data_only,
+    uint64_t *observed_error, const struct kernel_lock_guard *borrowed);
+
 #endif

@@ -46,7 +46,6 @@ struct regular_call {
     const struct kernel_lock_guard *offset_borrow, *operation_borrow;
     uint64_t length, whence;
     int64_t offset;
-    int data_only;
     int64_t *result;
     enum kernel_files_status status;
 };
@@ -73,7 +72,6 @@ static int regular_borrows_offset(struct kernel_open_file_description *descripti
     return 1;
 }
 static void seek_cpu0(void *);
-static void sync_cpu0(void *);
 static void truncate_cpu0(void *);
 
 /* 核心只报告接纳/断端；仅真实用户调用有SIGPIPE及syscall restart上下文。 */
@@ -279,21 +277,13 @@ static enum kernel_files_status memory_read(
 static enum kernel_files_status sync_pinned(struct kernel_open_file_description *description,
     int datasync,int64_t *linux_result,const struct kernel_lock_guard *borrowed)
 {
-    if (kernel_open_file_io_requires_cpu0(description)) {
-        if (!borrowed && !regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
-        struct regular_call call={.description=description,.data_only=datasync,.result=linux_result,
-            .offset_borrow=borrowed};
-        return regular_dispatch(&call,sync_cpu0);
-    }
+    if (kernel_open_file_io_requires_cpu0(description) && !borrowed && !regular_caller_ready())
+        return KERNEL_FILES_STATUS_STATE;
     enum kernel_open_file_kind kind=kernel_open_file_kind(description);
     *linux_result=kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ?
-        kernel_vfs_sync(&description->file,datasync,&description->observed_writeback_error):-KERNEL_EINVAL;
+        kernel_vfs_sync_borrowing(&description->file,datasync,
+            &description->observed_writeback_error,borrowed):-KERNEL_EINVAL;
     return KERNEL_FILES_STATUS_OK;
-}
-static void sync_cpu0(void *argument)
-{
-    struct regular_call *call=argument;
-    call->status=sync_pinned(call->description,call->data_only,call->result,call->offset_borrow);
 }
 enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     int64_t fd, int datasync, int64_t *linux_result)

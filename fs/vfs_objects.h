@@ -113,7 +113,11 @@ struct kernel_vfs_backend {
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
-    int (*sync_metadata)(struct kernel_vfs_node *node, int data_only);
+    /* Returns after capturing/registering a fixed target. The backend completes
+     * request once durable or failed, without borrowing a CPU0 executor stack.
+     * NULL denotes a memory-only backend without persistent metadata. */
+    void (*sync_prepare)(struct kernel_vfs_node *node, int data_only,
+                         struct kernel_vfs_sync_request *request);
     /* NULL denotes a memory-only backend without persistent writeback. */
     int (*sync_filesystem)(struct kernel_vfs_instance *instance,
                            struct kernel_vfs_node *root);

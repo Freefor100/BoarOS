@@ -77,6 +77,7 @@ static void adapter_names(struct lwext4_mount_adapter *adapter)
 
 static int mount_error(const struct lwext4_mount_adapter *adapter);
 static int prepare_journal_mount(struct lwext4_mount_adapter *adapter);
+static void complete_sync_waiters(struct lwext4_mount_adapter *adapter);
 static bool vfs_realtime(struct ext4_timestamp *now);
 static int lwext4_error(int error);
 static int block_open(struct ext4_blockdev *device);
@@ -786,6 +787,9 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     if (adapter->unmount_prepared) return 0;
     if (adapter->instance.external_files != (root ? 1U : 0U))
         return -KERNEL_EBUSY;
+    /* Each outstanding sync still borrows its file and mount. Leave the
+     * completion workers alive until those callers have consumed the result. */
+    if (adapter->sync_waiters) return -KERNEL_EBUSY;
     adapter->instance.quiescing = 1U;
     /* 停止并等待本实例 worker；后续失败仍保持静止，不能重新发布可写挂载。 */
     if (adapter->instance.page_cache)
@@ -922,6 +926,27 @@ static uint64_t journal_reached(const struct jbd_journal *journal, enum ext4_jou
         kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
 }
 
+static void complete_sync_waiters(struct lwext4_mount_adapter *adapter)
+{
+    uintptr_t irq = arch_interrupt_save();
+    struct jbd_journal *journal = adapter->device.fs->jbd_journal;
+    int error = mount_error(adapter);
+    struct kernel_vfs_sync_request **link = &adapter->sync_waiters;
+    while (*link) {
+        struct kernel_vfs_sync_request *request = *link;
+        if (!error && journal->durable_sequence < request->target) {
+            link = &request->next;
+            continue;
+        }
+        *link = request->next;
+        request->next = NULL;
+        /* The caller may retire this stack object after complete returns its
+         * raw protection; do not access request after that point. */
+        kernel_vfs_sync_complete(request, lwext4_error(error));
+    }
+    arch_interrupt_restore(irq);
+}
+
 static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
 {
 #if BOAROS_COST_DIAGNOSTICS
@@ -991,6 +1016,7 @@ static void journal_worker(void *context)
                 arch_interrupt_restore(irq);
             }
         }
+        complete_sync_waiters(adapter);
         irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
         arch_interrupt_restore(irq);
@@ -1035,6 +1061,7 @@ static void journal_checkpoint_worker(void *context)
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
             if (!progress.checkpoint_pending) pending_deadline = 0;
         }
+        complete_sync_waiters(adapter);
         irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
         if (progress.checkpoint != before) {
@@ -2104,13 +2131,26 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 { return lwext4_error(ext4_fclose(lwext4_node_file(node))); }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
-static int ext4_backend_sync_metadata(struct kernel_vfs_node *node, int data_only)
+static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_only,
+    struct kernel_vfs_sync_request *request)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
     int result = writeback_times(node, true);
-    if (result == EOK) result = ext4_file_sync_metadata_mode(lwext4_node_file(node), data_only != 0);
+    if (result == EOK)
+        result = ext4_file_sync_metadata_prepare(lwext4_node_file(node), data_only != 0,
+                                                 &request->target);
     if (result == EOK && !adapter->device.fs->jbd_journal) result = block_flush(&adapter->device);
-    return lwext4_error(result);
+    if (result != EOK || !request->target) {
+        kernel_vfs_sync_complete(request, lwext4_error(result));
+        return;
+    }
+    uintptr_t irq = arch_interrupt_save();
+    request->next = adapter->sync_waiters;
+    adapter->sync_waiters = request;
+    /* Capture/request can have yielded before registration. Recheck the real
+     * journal after linking, so a completion in that interval is not lost. */
+    complete_sync_waiters(adapter);
+    arch_interrupt_restore(irq);
 }
 static int ext4_backend_flush(struct kernel_vfs_instance *instance)
 {
@@ -2196,7 +2236,7 @@ static void initialize_backend(void)
     ops->truncate = ext4_backend_truncate;
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;
-    ops->sync_metadata = ext4_backend_sync_metadata;
+    ops->sync_prepare = ext4_backend_sync_prepare;
     ops->sync_filesystem = ext4_backend_sync_filesystem;
     ops->flush = ext4_backend_flush;
     ops->symlink = ext4_backend_symlink;

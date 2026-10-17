@@ -8,11 +8,14 @@ r"""Matched data-path I/O experiments; smoke timings are never performance evide
       --cases ext4:append:fsync:1:16M:64K,ext4:cold-read:cache:4:4M:4K --repeat 3
 
 Cases: backend:operation:completion:files:bytes_per_file:request_bytes.
-Backends ext4/tmpfs; operations append/overwrite/cold-read/hot-read/read;
+Backends ext4/tmpfs; operations append/overwrite/cold-read/hot-read/read/mixed-read;
 completion cache/fsync/fdatasync; files 1/4; sizes 1/4/16/64M; requests 1/4/64K.
 Cold-read is ext4 only, from an unread preloaded image. tmpfs read is resident
 memory, never a claim of cold disk. A single task rotates requests among files;
 completion spread is not a concurrent scheduler fairness or starvation bound.
+mixed-read is ext4/fsync/four files: one prepared dirty writer, two independent
+cold readers and one open/close task. Per-operation intervals show actual overlap
+with final fsync; preparation is excluded and does not measure append throughput.
 """
 import argparse
 from array import array
@@ -106,21 +109,23 @@ def parse_case(name):
     if len(parts) != 6:
         raise ValueError('case needs backend:operation:completion:files:size:request')
     backend, operation, completion, files, size, request = parts
-    if backend not in ('ext4', 'tmpfs') or operation not in ('append', 'overwrite', 'cold-read', 'hot-read', 'read') or completion not in ('cache', 'fsync', 'fdatasync'):
+    if backend not in ('ext4', 'tmpfs') or operation not in ('append', 'overwrite', 'cold-read', 'hot-read', 'read', 'mixed-read') or completion not in ('cache', 'fsync', 'fdatasync'):
         raise ValueError('unsupported case ' + name)
     if files not in ('1', '4') or size not in ('1M', '4M', '16M', '64M') or request not in ('1K', '4K', '64K'):
         raise ValueError('outside bounded file/request matrix ' + name)
     if backend == 'tmpfs' and operation == 'cold-read':
         raise ValueError('tmpfs cannot provide a cold-disk read')
-    if operation not in ('append', 'overwrite') and completion != 'cache':
+    if operation == 'mixed-read' and (backend != 'ext4' or completion != 'fsync' or files != '4'):
+        raise ValueError('mixed-read requires ext4, fsync and four independent files')
+    if operation not in ('append', 'overwrite', 'mixed-read') and completion != 'cache':
         raise ValueError('read cases do not pretend a redundant fsync measures write durability')
     if backend == 'ext4' and operation == 'read':
         raise ValueError('ext4 read must explicitly choose cold-read or hot-read')
     return dict(name=name, backend=backend, operation=operation, completion=completion,
                 files=int(files), bytes=int(size[:-1]) * 1048576, request=int(request[:-1]) * 1024,
-                schedule='one task, one request per file per round',
-                cache_scope='first guest data read of preloaded image' if operation == 'cold-read' else 'one complete verified preread' if operation == 'hot-read' else 'resident tmpfs setup' if backend == 'tmpfs' else 'no target-data preread',
-                persistence_scope='memory only' if backend == 'tmpfs' else 'explicit per-file sync syscall' if completion != 'cache' else 'cache completion; no durability claim for timed window')
+                schedule='four processes, writer dirtied before release, final fsync and two cold readers plus last-FD closes' if operation == 'mixed-read' else 'one task, one request per file per round',
+                cache_scope='first guest data read of preloaded image' if operation in ('cold-read', 'mixed-read') else 'one complete verified preread' if operation == 'hot-read' else 'resident tmpfs setup' if backend == 'tmpfs' else 'no target-data preread',
+                persistence_scope='prepared dirty writer final fsync, separate reader/close intervals; not append throughput' if operation == 'mixed-read' else 'memory only' if backend == 'tmpfs' else 'explicit per-file sync syscall' if completion != 'cache' else 'cache completion; no durability claim for timed window')
 
 
 def pattern(identifier, offset, count, epoch=0):
@@ -136,7 +141,7 @@ def seed(directory, case):
     directory.mkdir(parents=True, exist_ok=True)
     for identifier in range(case['files']):
         with (directory / f'file-{identifier}').open('wb') as stream:
-            if case['operation'] != 'append':
+            if case['operation'] != 'append' and not (case['operation'] == 'mixed-read' and identifier == 0):
                 for offset in range(0, case['bytes'], 65536):
                     stream.write(pattern(identifier, offset, min(65536, case['bytes'] - offset)))
 
@@ -172,6 +177,8 @@ def records(text, name):
 def validate(text, case):
     if not text.endswith('IO PASS all\n'):
         raise RuntimeError('incomplete durable guest results')
+    if case['operation'] == 'mixed-read':
+        return validate_mixed(text, case)
     windows, rows, sizes = records(text, 'WINDOW'), records(text, 'FILE'), records(text, 'SIZE')
     if len(windows) != 1 or len(rows) != case['files'] or {r.get('id') for r in rows} != set(range(case['files'])):
         raise RuntimeError('missing, duplicate or wrong file/window identity')
@@ -212,6 +219,76 @@ def validate(text, case):
     return dict(window=window, files=rows, sizes=sizes, metrics=metrics)
 
 
+def latency_metrics(samples):
+    ordered = sorted(samples)
+    return dict(samples=len(ordered), p50_ns=ordered[(len(ordered) - 1) // 2] if ordered else None,
+                p99_ns=ordered[max(0, (len(ordered) * 99 + 99) // 100 - 1)] if ordered else None,
+                maximum_ns=ordered[-1] if ordered else None)
+
+
+def validate_mixed(text, case):
+    windows = records(text, 'MIXED_WINDOW')
+    rows, samples = records(text, 'MIXED_FILE'), records(text, 'MIXED_SAMPLE')
+    if len(windows) != 1 or len(rows) != 4 or {r.get('id') for r in rows} != set(range(4)):
+        raise RuntimeError('mixed workload missing or duplicated window/file')
+    window = windows[0]
+    if window.get('complete') != 1 or window.get('bytes') != case['bytes'] * 2 or window['start_ns'] >= window['end_ns']:
+        raise RuntimeError('mixed read window/byte count invalid')
+    by_id = {r['id']: r for r in rows}
+    writer = by_id[0]
+    if not writer['data_start_ns'] < writer['data_end_ns'] <= window['start_ns']:
+        raise RuntimeError('dirty preparation must precede the mixed window')
+    if not writer['start_ns'] <= writer['sync_start_ns'] < writer['sync_end_ns'] <= writer['end_ns']:
+        raise RuntimeError('mixed final fsync interval invalid')
+    expected_reads = (case['bytes'] + case['request'] - 1) // case['request']
+    for identifier, row in by_id.items():
+        expected = 0 if identifier == 0 else 256 if identifier == 3 else expected_reads
+        own = [s for s in samples if s.get('id') == identifier]
+        if row.get('complete') != 1 or row.get('bytes') != (0 if identifier == 3 else case['bytes']):
+            raise RuntimeError('mixed file incomplete or wrong byte count')
+        if row.get('samples') != expected or len(own) != expected or [s.get('sequence') for s in own] != list(range(expected)):
+            raise RuntimeError('mixed operation samples missing, duplicated or out of order')
+        if row.get('calls', 0) < (256 if identifier == 3 else expected_reads):
+            raise RuntimeError('mixed operation calls do not cover requested work')
+        if not window['start_ns'] <= row['start_ns'] < row['end_ns'] <= window['end_ns']:
+            raise RuntimeError('mixed task outside the reported window')
+        previous = row['start_ns']
+        for sample in own:
+            if not previous <= sample['start_ns'] < sample['end_ns'] <= row['end_ns']:
+                raise RuntimeError('mixed sample interval invalid')
+            opening = sample.get('open_start_ns', 0)
+            if (identifier != 3 or sample['sequence'] == 0) and opening:
+                raise RuntimeError('unexpected mixed open interval')
+            if identifier == 3 and sample['sequence'] and not previous <= opening <= sample['start_ns']:
+                raise RuntimeError('mixed open interval invalid')
+            previous = sample['end_ns']
+        if identifier and (row['data_start_ns'] or row['data_end_ns'] or row['sync_start_ns'] or row['sync_end_ns']):
+            raise RuntimeError('reader/closer unexpectedly reports writer work')
+    if len(samples) != expected_reads * 2 + 256:
+        raise RuntimeError('mixed sample has an unknown identity')
+    metrics = dict(bytes=window['bytes'], elapsed_ns=window['end_ns'] - window['start_ns'],
+                   sync_ns=writer['sync_end_ns'] - writer['sync_start_ns'],
+                   prepared_write_bytes=case['bytes'])
+    latencies = {}
+    for name, identifiers in (('read', (1, 2)), ('close', (3,))):
+        own = [s for s in samples if s['id'] in identifiers]
+        overlapping = [s for s in own if s['start_ns'] < writer['sync_end_ns'] and s['end_ns'] > writer['sync_start_ns']]
+        latencies[name] = dict(all=latency_metrics([s['end_ns'] - s['start_ns'] for s in own]),
+                               overlapping_fsync=latency_metrics([s['end_ns'] - s['start_ns'] for s in overlapping]),
+                               completed_during_fsync=sum(writer['sync_start_ns'] < s['end_ns'] <= writer['sync_end_ns'] for s in own))
+        for scope in ('all', 'overlapping_fsync'):
+            for key, value in latencies[name][scope].items():
+                # An fsync can finish before this task runs. Keep absent overlap
+                # percentiles absent, rather than reporting a zero-latency sample.
+                if value is not None and (scope == 'all' or key == 'samples'):
+                    metrics[f'{name}_{scope}_{key}'] = value
+        metrics[f'{name}_completed_during_fsync'] = latencies[name]['completed_during_fsync']
+    openings = [s['start_ns'] - s['open_start_ns'] for s in samples if s['open_start_ns']]
+    latencies['open'] = latency_metrics(openings)
+    metrics.update({f'open_{key}': value for key, value in latencies['open'].items()})
+    return dict(window=window, files=rows, samples=samples, latencies=latencies, metrics=metrics)
+
+
 def extract(disk, work):
     readout = work / 'readout.img'; shutil.copyfile(disk, readout)
     command = ['e2fsck', '-p', '-E', 'journal_only', str(readout)]
@@ -234,7 +311,7 @@ def boot(work, kernel, image, case, name, repetition, args, program_sha):
     with disk.open('rb') as backing:
         os.fsync(backing.fileno())
     command = [args.qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel), '-m', args.ram,
-               '-smp', '1', '-nographic', '-no-reboot', '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
+               '-smp', str(getattr(args, 'cpus', 1)), '-nographic', '-no-reboot', '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
                '-drive', f'file={disk},if=none,format=raw,id=root,cache=writeback',
                '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
     if name == 'linux':
@@ -311,7 +388,7 @@ def summarize(work, identity, rows):
          failures=[dict(variant=r['variant'], case=r['case']['name'], error=r['error']) for r in rows if r['status'] != 'passed'],
          comparison_groups=[dict(variant=g['variant'], case=g['case']) for g in summary if g['status'] == 'measured'],
          comparison_policy='Only status=measured groups may support comparisons/recommendations; other metrics are diagnostic subsets.',
-         limits='Setup, final readback and cleanup sync are outside workload time. Pattern generation/read checking and five write-size checks are inside. Fresh guest cache does not mean cold host storage. Serial round robin does not establish concurrent fairness. tmpfs has no persistent-medium guarantee.'))
+         limits='Setup, final readback and cleanup sync are outside workload time. Ordinary cases include pattern generation/read checking and five write-size checks. Mixed cases prepare the dirty writer before the window and record actual fsync overlap separately; absent overlap has no latency percentile. Fresh guest cache does not mean cold host storage. Serial round robin does not establish concurrent fairness. tmpfs has no persistent-medium guarantee.'))
 
 
 def run(args):
@@ -363,7 +440,7 @@ def run_locked(args):
         cases=cases, repeat=args.repeat, observe=args.observe, smoke=args.smoke, linux_identity=linux_identity,
         evidence_kind='functional-smoke-not-performance' if args.smoke else 'diagnostic' if args.observe else 'performance',
         qemu_version=output([args.qemu, '--version']), qemu_sha256=digest(args.qemu), compiler=output([str(compiler), '--version']),
-        ram=args.ram, transport=args.transport, disk_cache='writeback', timeout_seconds=args.timeout, baseline_commit=helpers.BASELINE_COMMIT,
+        ram=args.ram, cpus=args.cpus, transport=args.transport, disk_cache='writeback', timeout_seconds=args.timeout, baseline_commit=helpers.BASELINE_COMMIT,
         cache_policy='Fresh kernel boot and matched image copy per case/variant/repetition; no drop_caches or host cache eviction')
     save(work / 'identity.json', identity); rows = []
     for index, case in enumerate(cases):
@@ -391,6 +468,7 @@ def main():
         p.add_argument('--cases', default=DEFAULT_CASES); p.add_argument('--repeat', type=int, default=1 if command == 'smoke' else 3)
         p.add_argument('--observe', action='store_true'); p.add_argument('--output', type=Path)
         p.add_argument('--ram', default='512M'); p.add_argument('--transport', choices=('legacy', 'modern'), default='modern')
+        p.add_argument('--cpus', type=int, choices=(1, 2), default=1, help='guest CPUs; two requires a USER_SMP kernel')
         p.add_argument('--timeout', type=int, default=240, help='explicit guest budget in seconds, 1..3600; excludes no failed runs')
     args = parser.parse_args()
     if args.command == 'profiles': print(json.dumps(profiles('all'), indent=2))

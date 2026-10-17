@@ -522,27 +522,29 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
     puts("PASS shared offset qualification precedes CPU0 queue: held read, waiting seek, cold miss and actual owners finish");
     puts("PASS truncate obtains write-operation qualification before queueing; blocked truncate cannot stop an active writer's cold read");
 }
-/* 独立同步等待后端时不占文件位置；两个请求仍共享一个错误游标。 */
+/* 独立同步不占文件位置或整次执行者；两个请求仍共享一个错误游标。 */
 static unsigned sync_pause,sync_entered,sync_resume,sync_progress;
-static void pause_sync_backend(struct kernel_vfs_file *file)
+static void pause_sync_call(struct kernel_vfs_file *file)
 {
     if (control && kernel_vfs_file_node(file)==kernel_open_file_node(control) &&
         __atomic_exchange_n(&sync_pause,0,__ATOMIC_ACQ_REL)) {
-        assert(!kernel_cpu_current()->logical_id && !kernel_cpu_current()->raw_locks);
+        assert(kernel_cpu_current()->logical_id==1 && !kernel_cpu_current()->raw_locks &&
+            !kernel_io_context_current()->locks);
         __atomic_store_n(&sync_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&sync_resume,__ATOMIC_ACQUIRE)) sched_yield();
     }
 }
-int __real_kernel_vfs_sync(struct kernel_vfs_file *,int,uint64_t *);
-int __wrap_kernel_vfs_sync(struct kernel_vfs_file *file,int data_only,uint64_t *observed)
+int __real_kernel_vfs_sync_borrowing(struct kernel_vfs_file *,int,uint64_t *,const struct kernel_lock_guard *);
+int __wrap_kernel_vfs_sync_borrowing(struct kernel_vfs_file *file,int data_only,uint64_t *observed,
+    const struct kernel_lock_guard *borrowed)
 {
-    pause_sync_backend(file);
-    return __real_kernel_vfs_sync(file,data_only,observed);
+    pause_sync_call(file);
+    return __real_kernel_vfs_sync_borrowing(file,data_only,observed,borrowed);
 }
 int __real_kernel_vfs_sync_range(struct kernel_vfs_file *,uint64_t,uint64_t,uint64_t *);
 int __wrap_kernel_vfs_sync_range(struct kernel_vfs_file *file,uint64_t start,uint64_t end,uint64_t *observed)
 {
-    pause_sync_backend(file);
+    pause_sync_call(file);
     return __real_kernel_vfs_sync_range(file,start,end,observed);
 }
 static void *crossing_sync(void *argument)
@@ -607,12 +609,12 @@ static void sync_offset_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
     assert(!pthread_join(reader,NULL) && control->offset==8);
     struct kernel_page_cache_concurrency_state before,after;
     kernel_page_cache_get_concurrency_state(cache,&before);
-    assert(before.running==1 && !before.pending && !pthread_create(&queued,NULL,crossing_sync,&second));
-    do { kernel_page_cache_get_concurrency_state(cache,&after);sched_yield(); } while (!after.pending);
-    assert(after.running==1 && after.pending==1 && after.executions_queued==before.executions_queued+1);
+    assert(!before.running && !before.pending && !pthread_create(&queued,NULL,crossing_sync,&second));
+    assert(!pthread_join(queued,NULL));
+    assert(!second.status && second.result==-KERNEL_EIO && control->observed_writeback_error==sequence);
     __atomic_store_n(&sync_resume,1,__ATOMIC_RELEASE);
-    assert(!pthread_join(syncing,NULL) && !pthread_join(queued,NULL));
-    assert(!first.status && !second.status && first.result==-KERNEL_EIO && !second.result &&
+    assert(!pthread_join(syncing,NULL));
+    assert(!first.status && !first.result &&
         control->observed_writeback_error==sequence && control->offset==8);
     mm_test_attach(0);mm_test_activate_task();
     assert(!kernel_files_sync(&files,0,0,&result) && !result);
