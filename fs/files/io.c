@@ -779,11 +779,7 @@ enum kernel_files_status kernel_files_readv(
                          total, linux_result, 0U, 0, 0);
     dispatched = 1;
 out:
-    if (iov && iov != local &&
-        kernel_files_release_allocation(files, iov) ==
-            KERNEL_FILES_STATUS_STATE) {
-        status = KERNEL_FILES_STATUS_STATE;
-    }
+    if (iov && iov != local) kernel_files_release_allocation(files, iov);
     if (!dispatched && status == KERNEL_FILES_STATUS_OK &&
         *linux_result < 0) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
@@ -1120,8 +1116,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         total += (uint64_t)sent;
         if ((size_t)sent < available || error != 0) break;
     }
-    if (datagram_staging != 0 && kernel_heap_release(files->heap, datagram_staging) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    if (datagram_staging) kernel_heap_release(files->heap, datagram_staging);
     if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
     if (total != 0U && error == -KERNEL_ERESTARTSYS)
         kernel_signal_clear_syscall_restart(kernel_task_current());
@@ -1208,7 +1203,7 @@ static enum kernel_files_status control_write(
         buffer, (size_t)count, &copied);
     /* 先完整收集 writev；第二段 fault 不得发布首段配置或偏移。 */
     if (access != KERNEL_UACCESS_STATUS_OK || copied != count) {
-        if (kernel_heap_release(files->heap, buffer) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(files->heap, buffer);
         if (access != KERNEL_UACCESS_STATUS_FAULT) return KERNEL_FILES_STATUS_STATE;
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
@@ -1216,7 +1211,7 @@ static enum kernel_files_status control_write(
     if (!result) result = kernel_vfs_file_control(&description->file, 1,
         positioned ? requested_offset : kernel_open_file_offset(description),
         buffer, (size_t)count, &accepted);
-    if (kernel_heap_release(files->heap, buffer) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(files->heap, buffer);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
     if (!positioned && kernel_open_file_advance(description, accepted) != KERNEL_OPEN_FILE_STATUS_OK)
         return KERNEL_FILES_STATUS_STATE;
@@ -1801,11 +1796,7 @@ enum kernel_files_status kernel_files_writev(
     } else status = write_request(files, mm, description, iov, iovcnt, total,
                            0, 0U, linux_result, 0U,NULL);
 out:
-    if (iov && iov != local &&
-        kernel_files_release_allocation(files, iov) ==
-            KERNEL_FILES_STATUS_STATE) {
-        status = KERNEL_FILES_STATUS_STATE;
-    }
+    if (iov && iov != local) kernel_files_release_allocation(files, iov);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }

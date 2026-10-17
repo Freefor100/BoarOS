@@ -206,7 +206,7 @@ static void foreground_workspace_put(struct kernel_page_cache *cache,union foreg
             return;
         }
     }
-    if (kernel_heap_release(cache->heap,workspace)) __builtin_trap();
+    kernel_heap_release(cache->heap,workspace);
 }
 struct read_batch_load {
     struct kernel_page_cache *cache;
@@ -267,8 +267,9 @@ static void version_pool_put(struct version_pool *pool)
     unsigned old=__atomic_fetch_sub(&pool->references,1,__ATOMIC_ACQ_REL);
     if (!old) __builtin_trap();
     if (old!=1) return;
-    if (!pool->closed || pool->idle || kernel_wait_queue_destroy(&pool->ready) ||
-        kernel_heap_release(pool->heap,pool)) __builtin_trap();
+    if (!pool->closed || pool->idle || kernel_wait_queue_destroy(&pool->ready))
+        __builtin_trap();
+    kernel_heap_release(pool->heap,pool);
 }
 static struct version_pool *version_pool_new(struct kernel_heap *heap,
     struct physical_page_allocator *allocator)
@@ -292,7 +293,7 @@ static struct cache_version *version_new(struct version_pool *pool)
     enum physical_page_status status=physical_page_allocate(pool->allocator,&address);
     if (status) {
         if (status!=PHYSICAL_PAGE_STATUS_EMPTY) __builtin_trap();
-        if (kernel_heap_release(pool->heap,version)) __builtin_trap();
+        kernel_heap_release(pool->heap,version);
         return NULL;
     }
     unsigned old=__atomic_fetch_add(&pool->references,1,__ATOMIC_ACQ_REL);
@@ -303,8 +304,8 @@ static struct cache_version *version_new(struct version_pool *pool)
 static void version_dispose(struct cache_version *version)
 {
     struct version_pool *pool=version->pool;
-    if (physical_page_release(pool->allocator,version->physical) ||
-        kernel_heap_release(pool->heap,version)) __builtin_trap();
+    if (physical_page_release(pool->allocator,version->physical)) __builtin_trap();
+    kernel_heap_release(pool->heap,version);
     version_pool_put(pool);
 }
 static void version_retain(void *owner)
@@ -548,7 +549,7 @@ static int reserve_buckets(struct kernel_page_cache *cache,size_t count)
                 published=1;
             }
         }
-        if (kernel_heap_release(cache->heap,published?retired:buckets)) __builtin_trap();
+        kernel_heap_release(cache->heap,published?retired:buckets);
         if (published || satisfied) return 1;
     }
 }
@@ -614,7 +615,7 @@ static int cleanup_entry(struct kernel_page_cache *cache,
         kernel_vfs_node_release(&entry->node) != 0) {
         return 0;
     }
-    (void)kernel_heap_release(cache->heap, entry);
+    kernel_heap_release(cache->heap, entry);
     return 1;
 }
 
@@ -835,7 +836,7 @@ static void group_put(struct page_cache_group *g)
 {
     uint64_t previous=__atomic_fetch_sub(&g->refs,1,__ATOMIC_ACQ_REL);
     if (!previous) __builtin_trap();
-    if (previous==1 && kernel_heap_release(g->heap,g)) __builtin_trap();
+    if (previous==1) kernel_heap_release(g->heap,g);
 }
 static void group_retain(void *context)
 {
@@ -918,15 +919,15 @@ static enum kernel_page_cache_status cache_init(
         sizeof(*record->buckets),
         (void **)&record->buckets);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        (void)kernel_heap_release(heap, record);
+        kernel_heap_release(heap, record);
         return heap_status == KERNEL_HEAP_STATUS_EMPTY
                    ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
                    : KERNEL_PAGE_CACHE_STATUS_STATE;
     }
     record->versions=version_pool_new(heap,allocator);
     if (!record->versions) {
-        (void)kernel_heap_release(heap,record->buckets);
-        (void)kernel_heap_release(heap,record);
+        kernel_heap_release(heap,record->buckets);
+        kernel_heap_release(heap,record);
         return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
     }
     record->capacity = PAGE_CACHE_INITIAL_CAPACITY;
@@ -977,8 +978,8 @@ static enum kernel_page_cache_status cache_init(
     return KERNEL_PAGE_CACHE_STATUS_OK;
 failed:
     version_pool_close(record->versions);
-    (void)kernel_heap_release(heap, record->buckets);
-    (void)kernel_heap_release(heap, record);
+    kernel_heap_release(heap, record->buckets);
+    kernel_heap_release(heap, record);
     *cache = (struct kernel_page_cache){0};
     return heap_status == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
                                                   : KERNEL_PAGE_CACHE_STATUS_STATE;
@@ -1376,7 +1377,7 @@ static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *ca
     if (kernel_heap_allocate_zeroed(cache->heap,1,sizeof(*entry),(void **)&entry))
         return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
     if (physical_page_allocate(cache->allocator,&entry->physical_address)) {
-        if (kernel_heap_release(cache->heap,entry)) __builtin_trap();
+        kernel_heap_release(cache->heap,entry);
         return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
     }
     entry->page_references_owned=1;
@@ -2230,7 +2231,7 @@ static int writeback_workspace_init(struct kernel_page_cache *cache,struct write
 }
 static void writeback_workspace_release(struct kernel_page_cache *cache,struct writeback_workspace *work)
 {
-    if (kernel_heap_release(cache->heap,work->prepared)) __builtin_trap();
+    kernel_heap_release(cache->heap,work->prepared);
 }
 
 static void writeback_unprepare(struct kernel_page_cache *cache,
@@ -2848,14 +2849,14 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     if (kernel_heap_allocate(cache->heap,sizeof(*r->writeback_workspace),
         (void **)&r->writeback_workspace)) return -KERNEL_ENOMEM;
     if (writeback_workspace_init(cache,r->writeback_workspace)) {
-        if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
+        kernel_heap_release(cache->heap,r->writeback_workspace);
         r->writeback_workspace=NULL; return -KERNEL_ENOMEM;
     }
     r->writeback_capacity=version_pool_reserve(r->versions);
     if (!r->writeback_capacity) {
         version_pool_unreserve(r->versions);
         writeback_workspace_release(cache,r->writeback_workspace);
-        if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
+        kernel_heap_release(cache->heap,r->writeback_workspace);
         r->writeback_workspace=NULL; return -KERNEL_ENOMEM;
     }
     uint64_t total = physical_page_total(cache->allocator);
@@ -2868,7 +2869,7 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     if (result != KERNEL_SCHEDULER_STATUS_OK) {
         version_pool_unreserve(r->versions);r->writeback_capacity=0;
         writeback_workspace_release(cache,r->writeback_workspace);
-        if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
+        kernel_heap_release(cache->heap,r->writeback_workspace);
         r->writeback_workspace=NULL;
         return result == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EINVAL;
     }
@@ -2921,7 +2922,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     kernel_thread_join(&r->worker);
     version_pool_unreserve(r->versions);r->writeback_capacity=0;
     writeback_workspace_release(cache,r->writeback_workspace);
-    if (kernel_heap_release(cache->heap,r->writeback_workspace)) __builtin_trap();
+    kernel_heap_release(cache->heap,r->writeback_workspace);
     r->writeback_workspace=NULL;
     r->started = 0;
 }
@@ -3040,11 +3041,10 @@ enum kernel_page_cache_status kernel_page_cache_destroy(struct kernel_page_cache
     }
     uint64_t released=0;
     if (!drain_entries(cache,&released)) return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
-    if (cache->record->buckets && kernel_heap_release(cache->heap,cache->record->buckets)) __builtin_trap();
-    if (cache->record->foreground_workspace &&
-        kernel_heap_release(cache->heap,cache->record->foreground_workspace)) __builtin_trap();
+    if (cache->record->buckets) kernel_heap_release(cache->heap,cache->record->buckets);
+    if (cache->record->foreground_workspace) kernel_heap_release(cache->heap,cache->record->foreground_workspace);
     version_pool_close(cache->record->versions);
-    if (kernel_heap_release(cache->heap,cache->record)) __builtin_trap();
+    kernel_heap_release(cache->heap,cache->record);
     cache->heap=NULL;cache->allocator=NULL;cache->record=NULL;cache->state=KERNEL_PAGE_CACHE_RELEASED;
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }

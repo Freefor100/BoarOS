@@ -50,7 +50,7 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t
     (void)h; if(fail_heap) return KERNEL_HEAP_STATUS_EMPTY;
     *out=calloc(n,size); live_allocations++; return KERNEL_HEAP_STATUS_OK;
 }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *h,void *p) { (void)h; free(p);live_allocations--;return KERNEL_HEAP_STATUS_OK; }
+void kernel_heap_release(struct kernel_heap *h,void *p) { (void)h; free(p);live_allocations--; }
 void kernel_wait_queue_init(struct kernel_wait_queue *q) { *q=(struct kernel_wait_queue){.initialized=1}; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q) { (void)q;wakes++;return 0; }
 enum kernel_scheduler_status kernel_thread_create_joinable(void (*fn)(void *),void *arg,struct kernel_thread_join *join) {

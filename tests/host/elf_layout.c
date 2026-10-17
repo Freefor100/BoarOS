@@ -4,6 +4,12 @@
 #include <kernel/heap.h>
 #include <kernel/uaccess.h>
 #include <kernel/random.h>
+#include <kernel/exec.h>
+#include <kernel/errno.h>
+#include <kernel/open_file.h>
+#include <kernel/tmpfs.h>
+#include "../../kernel/exec_internal.h"
+#include "../../fs/open_file_internal.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +20,16 @@ static unsigned char pool[8*1024*1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
 static struct arch_mmu_page_table kernel;
+static unsigned close_failures;
+int __real_kernel_vfs_close(struct kernel_vfs_file *file);
+int __wrap_kernel_vfs_close(struct kernel_vfs_file *file)
+{
+    if (close_failures) {
+        close_failures--;
+        return -KERNEL_EIO;
+    }
+    return __real_kernel_vfs_close(file);
+}
 __asm__(".pushsection .rodata\n.global arch_elf_trampoline_start,arch_elf_trampoline_end\narch_elf_trampoline_start:\n.byte 0x73,0,0,0\narch_elf_trampoline_end:\n.popsection");
 int kernel_random_available(void) { return 0; }
 enum kernel_random_status kernel_random_fill(void *buffer,size_t size)
@@ -98,6 +114,51 @@ static void build_case(uint16_t main_type,uint64_t main_address,uint16_t interpr
     assert(physical_page_available(&pages)==before && !physical_page_allocator_audit(&pages));
     fprintf(stderr,"ELF actual build main=%u interp=%u overlap=%d: OK\n",main_type,interpreter_type,overlap);
 }
+
+static void cleanup_transaction(void)
+{
+    uint64_t before=physical_page_available(&pages);
+    struct kernel_vfs_mount *mount=NULL;
+    assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));
+    unsigned char bytes[256];
+    struct kernel_elf64_source *reader=source(bytes,2,0x40000000,0x31,0);
+    assert(!kernel_elf64_source_release(&reader));
+    struct kernel_open_file_description *file=NULL;
+    int error;
+    size_t written;
+    assert(!kernel_open_file_create_mode(&heap,mount,"/image",0700,&file,&error) && !error);
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&written) && written==sizeof(bytes));
+    struct kernel_exec_transaction transaction={.heap=&heap,.state=KERNEL_EXEC_TRANSACTION_PREPARING};
+    assert(!kernel_elf64_source_create(&heap,&file,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,
+        &transaction.executable_source) && !file);
+    assert(!kernel_open_file_create_mode(&heap,mount,"/other-owner",0700,
+        &transaction.interpreter_file,&error) && !error);
+    struct kernel_exec_string name={"/image",6};
+    struct kernel_exec_image_request request={.executable_source=transaction.executable_source,
+        .executable=name,.arguments=&name,.argument_count=1};
+    assert(!kernel_elf_image_build(&request,&heap,&pages,&kernel,&transaction.image));
+    assert(!kernel_heap_allocate(&heap,32,(void **)&transaction.original_path));
+    assert(!kernel_heap_allocate(&heap,64,(void **)&transaction.string_bytes));
+    assert(!kernel_heap_allocate(&heap,32,(void **)&transaction.arguments));
+    assert(!kernel_heap_allocate(&heap,32,(void **)&transaction.environment));
+
+    /* 真实VFS关闭错误仍保留source/OFD；纯堆清理不参与重试。 */
+    close_failures=2;
+    assert(kernel_exec_transaction_cleanup(&transaction)==KERNEL_EXEC_STATUS_CLEANUP_REQUIRED);
+    assert(!close_failures && transaction.executable_source && transaction.interpreter_file);
+    assert(transaction.image.mm.state==KERNEL_MM_RELEASED);
+    assert(!transaction.original_path && !transaction.string_bytes &&
+        !transaction.arguments && !transaction.environment);
+    assert(!kernel_exec_transaction_cleanup(&transaction));
+    assert(transaction.state==KERNEL_EXEC_TRANSACTION_EMPTY_CLEANUP &&
+        !transaction.executable_source && !transaction.interpreter_file);
+    assert(!kernel_exec_transaction_cleanup(&transaction));
+    assert(!kernel_vfs_unmount(mount));
+    struct kernel_heap_statistics stats;
+    kernel_heap_get_statistics(&heap,&stats);
+    assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==before);
+    puts("exec actual cleanup: image released, failed source/OFD retained, heap owners cleared and retry completed");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -111,6 +172,7 @@ int main(void)
     build_case(2,0x40000000,2,0x40000000,1);
     build_case(2,0x40000000,0,0,0);
     build_case(3,0x20000,3,0x10000,0);
+    cleanup_transaction();
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);
     puts("ELF actual source/build/fault: disjoint ET_EXEC, overlap rejection, PIE/vDSO holes and final owners passed");

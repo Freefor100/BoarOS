@@ -24,14 +24,13 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
     return KERNEL_HEAP_STATUS_OK;
 }
 
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap,
-                                            void *pointer)
+void kernel_heap_release(struct kernel_heap *heap,
+                         void *pointer)
 {
     (void)heap;
     assert(pointer && live_nodes);
     live_nodes--;
     free(pointer);
-    return KERNEL_HEAP_STATUS_OK;
 }
 
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)

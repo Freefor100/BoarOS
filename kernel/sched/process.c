@@ -1710,7 +1710,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
                        ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
                        : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
-        (void)kernel_heap_release(heap, transaction);
+        kernel_heap_release(heap, transaction);
         thread->exec_transaction = 0;
     }
     if (thread->files.state == KERNEL_FILES_LIVE ||

@@ -344,6 +344,6 @@ int kernel_network_stop(struct kernel_network **owner)
     struct kernel_heap_statistics heap_statistics;
     kernel_heap_get_statistics(n->heap, &heap_statistics);
     print_text(" root-heap-peak-pages="); print_u64(heap_statistics.peak_pages); print_text("\n");
-    if (kernel_heap_release(n->heap, n) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(n->heap, n);
     *owner = 0; arch_interrupt_restore(irq); return 0;
 }

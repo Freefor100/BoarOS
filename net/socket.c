@@ -350,7 +350,7 @@ static void unix_uncharge(struct socket_packet *packet)
     if(sender->destroying) {
         if(!sender->unix_packets) {
             if(sender->unix_memory || sender->tx_reserved)__builtin_trap();
-            if(kernel_heap_release(sender->heap,sender)!=KERNEL_HEAP_STATUS_OK)__builtin_trap();
+            kernel_heap_release(sender->heap,sender);
         }
     } else wake_socket(sender);
 }
@@ -460,8 +460,7 @@ static void purge_dead_pending(struct kernel_socket *listener)
             if (listener->pending_tail == entry)
                 listener->pending_tail = previous;
             kernel_socket_destroy(entry->child);
-            if (kernel_heap_release(listener->heap, entry) !=
-                KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            kernel_heap_release(listener->heap, entry);
         } else {
             previous = entry;
         }
@@ -620,8 +619,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     status = kernel_heap_allocate_zeroed(listener->heap, 1U, sizeof(*entry),
                                          (void **)&entry);
     if (status == KERNEL_HEAP_STATUS_EMPTY) {
-        if (kernel_heap_release(listener->heap, child) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(listener->heap, child);
         tcp_abort(pcb);
         return ERR_ABRT;
     }
@@ -705,8 +703,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
     kernel_socket_protocol_leave(&old_status);
     if ((type == SOCKET_DGRAM && socket->udp == 0) ||
         (type == SOCKET_STREAM && socket->tcp == 0)) {
-        if (kernel_heap_release(heap, socket) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(heap, socket);
         return -KERNEL_ENOMEM;
     }
     kernel_socket_protocol_enter(&old_status);
@@ -736,7 +733,7 @@ int kernel_socket_pair(struct kernel_heap *heap, int type,
 
     status = kernel_heap_allocate_zeroed(heap, 1U, sizeof(*sock_b), (void **)&sock_b);
     if (status != KERNEL_HEAP_STATUS_OK) {
-        if (kernel_heap_release(heap, sock_a) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(heap, sock_a);
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 
@@ -799,16 +796,14 @@ void kernel_socket_destroy(struct kernel_socket *socket)
             socket_pbuf_free(packet->payload);
         }
         unix_uncharge(packet);
-        if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(socket->heap, packet);
         receive_capacity();
     }
     while (socket->pending_head != 0) {
         struct socket_pending *entry = socket->pending_head;
         socket->pending_head = entry->next;
         kernel_socket_destroy(entry->child);
-        if (kernel_heap_release(socket->heap, entry) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(socket->heap, entry);
     }
     if (socket->udp != 0) udp_remove(socket->udp);
     if (socket->tcp != 0) {
@@ -830,7 +825,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
     struct kernel_heap *heap = socket->heap;
     kernel_socket_protocol_leave(&old_status);
     if (release_socket) {
-        if (kernel_heap_release(heap, socket) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(heap, socket);
     }
     receive_capacity();
 }
@@ -1017,8 +1012,7 @@ int kernel_socket_accept(struct kernel_socket *socket,
     tcp_backlog_accepted(entry->child->tcp);
     *owner = entry->child;
     kernel_socket_protocol_leave(&old_status);
-    if (kernel_heap_release(socket->heap, entry) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(socket->heap, entry);
     return 0;
 }
 
@@ -1215,7 +1209,7 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
             if (!socket->packets_head) socket->packets_tail = 0;
             if (packet->payload) socket_pbuf_free(packet->payload);
             unix_uncharge(packet);
-            if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            kernel_heap_release(socket->heap, packet);
             freed = 1;
         } else packet->consumed += take;
         remaining -= take;
@@ -1282,7 +1276,7 @@ static void free_write_packet(struct kernel_socket_write_request *request)
     }
     struct socket_packet *packet = request->packet;
     if (!packet) return;
-    if (kernel_heap_release(request->socket->heap, packet) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(request->socket->heap, packet);
     request->packet = 0;
     receive_capacity();
 }

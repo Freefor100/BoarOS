@@ -297,7 +297,7 @@ fail:
     p->setup_rollback = 1;
     if (p->worker.task) { wake(p); kernel_thread_join(&p->worker); }
     if (p->tty && kernel_tty_destroy(&p->tty)) __builtin_trap();
-    if (kernel_heap_release(heap, p) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(heap, p);
     arch_interrupt_restore(irq); return error;
 }
 int ns16550_console(char character)
@@ -332,7 +332,7 @@ int ns16550_stop_report(struct ns16550_port **owner,
     int error = kernel_tty_destroy(&p->tty);
     if (error) { arch_interrupt_restore(irq); return error; }
     if (statistics) *statistics = p->statistics;
-    if (kernel_heap_release(p->heap, p) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(p->heap, p);
     *owner = 0; arch_interrupt_restore(irq); return 0;
 }
 

@@ -92,7 +92,7 @@ enum kernel_files_status kernel_files_install_shared_acquired_at(
     uint32_t fd_flags,
     struct kernel_open_file_description **owner);
 
-enum kernel_files_status kernel_files_release_allocation(
+void kernel_files_release_allocation(
     struct kernel_files *files,
     void *pointer);
 

@@ -40,7 +40,7 @@ static uintptr_t adapter_serial;
 struct backend_path { struct kernel_heap *heap; char *value; };
 static void backend_path_release(struct backend_path *path)
 {
-    if (path->value) (void)kernel_heap_release(path->heap, path->value);
+    if (path->value) kernel_heap_release(path->heap, path->value);
 }
 static int backend_path_make(struct lwext4_mount_adapter *adapter,
                             const char *path, struct backend_path *out)
@@ -626,7 +626,7 @@ static int block_write_batch(struct ext4_blockdev *device,
             spans[i].data, (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE};
     }
     enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
-    if (count > 1 && kernel_heap_release(adapter->instance.heap, physical)) __builtin_trap();
+    if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
     switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
@@ -726,7 +726,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
         heap->page_allocator->buffer_context = 0;
     }
     if (adapter->physical_buffer != 0) {
-        (void)kernel_heap_release(heap, adapter->physical_buffer);
+        kernel_heap_release(heap, adapter->physical_buffer);
         adapter->physical_buffer = 0;
     }
     if (adapter->heap_bound) {
@@ -735,7 +735,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
     }
 
     if (adapter->block_claimed) kernel_block_release_claim(adapter->block, mount);
-    (void)kernel_heap_release(heap, adapter);
+    kernel_heap_release(heap, adapter);
     mount->private_data = 0;
     mount->source_name = 0;
     mount->id = 0U;
@@ -753,7 +753,7 @@ static void queue_orphan(struct lwext4_mount_adapter *adapter,
 static void release_orphan(struct lwext4_mount_adapter *adapter,
                            struct lwext4_orphan *orphan)
 {
-    (void)kernel_heap_release(adapter->instance.heap, orphan);
+    kernel_heap_release(adapter->instance.heap, orphan);
 }
 
 static int reserve_orphan(struct lwext4_mount_adapter *adapter,
@@ -824,7 +824,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
             }
             orphan->orphan_freed = 1U;
         }
-        (void)kernel_heap_release(adapter->instance.heap, orphan);
+        kernel_heap_release(adapter->instance.heap, orphan);
         *orphan_link = next;
     }
     cleanup_link = &adapter->instance.cleanup_nodes;
@@ -847,7 +847,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
             }
             node->closed = 1U;
         }
-        (void)kernel_heap_release(adapter->instance.heap, node);
+        kernel_heap_release(adapter->instance.heap, node);
         *cleanup_link = next;
     }
     if (adapter->orphans != 0 || adapter->instance.cleanup_nodes != 0 ||
@@ -1524,7 +1524,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
         result = ext4_fopen_inode(lwext4_node_file(node), adapter->mount_point,
                                   inode_number);
         if (result != EOK) {
-            (void)kernel_heap_release(adapter->instance.heap, node);
+            kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
         }
     } else if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) {
@@ -1532,13 +1532,13 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
          * leaves the same file handle shape without allocating an ext4_dir on stack. */
         result = ext4_dir_open_file(lwext4_node_file(node), path);
         if (result != EOK) {
-            (void)kernel_heap_release(adapter->instance.heap, node);
+            kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
         }
     } else if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFCHR) {
         result = ext4_chrdev_open_file(lwext4_node_file(node), path);
         if (result != EOK) {
-            (void)kernel_heap_release(adapter->instance.heap, node);
+            kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
         }
     } else {
@@ -1551,7 +1551,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
             result = ext4_fopen(lwext4_node_file(node), path, "r");
         }
         if (result != EOK) {
-            (void)kernel_heap_release(adapter->instance.heap, node);
+            kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
         }
     }
@@ -1565,7 +1565,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
             node->instance = &adapter->instance;
             node->next = adapter->instance.cleanup_nodes;
             adapter->instance.cleanup_nodes = node;
-        } else (void)kernel_heap_release(adapter->instance.heap, node);
+        } else kernel_heap_release(adapter->instance.heap, node);
         return lwext4_error(result);
     }
     return kernel_vfs_publish_node(mount, node, file, 0);
@@ -1618,7 +1618,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
             node->next = adapter->instance.cleanup_nodes;
             adapter->instance.cleanup_nodes = node;
         } else {
-            (void)kernel_heap_release(adapter->instance.heap, node);
+            kernel_heap_release(adapter->instance.heap, node);
         }
         return lwext4_error(result);
     }
@@ -1633,7 +1633,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
             node->instance = &adapter->instance;
             node->next = adapter->instance.cleanup_nodes;
             adapter->instance.cleanup_nodes = node;
-        } else (void)kernel_heap_release(adapter->instance.heap, node);
+        } else kernel_heap_release(adapter->instance.heap, node);
         return lwext4_error(result);
     }
     return kernel_vfs_publish_node(mount, node, file, 1);

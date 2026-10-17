@@ -204,8 +204,8 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue
 {(void)q;if(arch_interrupt_is_enabled()) abort();return KERNEL_SCHEDULER_STATUS_OK;}
 void kernel_heap_get_statistics(const struct kernel_heap *heap,struct kernel_heap_statistics *out)
 {(void)heap;*out=(struct kernel_heap_statistics){0};}
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap,void *allocation)
-{(void)heap;if(protocol_held || !arch_interrupt_is_enabled()) abort();free(allocation);freed++;return KERNEL_HEAP_STATUS_OK;}
+void kernel_heap_release(struct kernel_heap *heap,void *allocation)
+{(void)heap;if(protocol_held || !arch_interrupt_is_enabled()) abort();free(allocation);freed++;}
 static void stop_contract(void)
 {
     struct virtio_net_device d={.loaned=1};

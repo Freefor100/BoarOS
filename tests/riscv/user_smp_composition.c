@@ -280,7 +280,7 @@ static void run(void *unused)
         if (!stopping) composition_store(&control->reply,completed);
     }
     release_pages();
-    check(kernel_heap_release(&root->heap,ledger)==KERNEL_HEAP_STATUS_OK);ledger=0;
+    kernel_heap_release(&root->heap,ledger);ledger=0;
     check(!kernel_vfs_close(&file));
     struct composition_control *final_control=control;
     composition_store(&final_control->reply,completed);

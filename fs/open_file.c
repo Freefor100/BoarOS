@@ -137,7 +137,7 @@ static enum kernel_open_file_status create_open_file(
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
-        (void)kernel_heap_release(heap, file);
+        kernel_heap_release(heap, file);
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -195,7 +195,7 @@ enum kernel_open_file_status kernel_open_file_create_at(
     default: result = -KERNEL_EINVAL; break;
     }
     if (result) {
-        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(heap, file);
     } else {
         file->heap = heap;
         file->references = 1U;
@@ -261,7 +261,7 @@ enum kernel_open_file_status kernel_open_file_create_mode(
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
-        (void)kernel_heap_release(heap, file);
+        kernel_heap_release(heap, file);
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -305,7 +305,7 @@ enum kernel_open_file_status kernel_open_file_create_executable(
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
-        (void)kernel_heap_release(heap, file);
+        kernel_heap_release(heap, file);
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -346,7 +346,7 @@ enum kernel_open_file_status kernel_open_file_create_console(
     if (!file->device) __builtin_trap();
     file->open_flags = 2U;
     if (kernel_char_device_open(file, file->open_flags)) {
-        (void)kernel_heap_release(heap, file);
+        kernel_heap_release(heap, file);
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
     *owner = file;
@@ -384,7 +384,7 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
     file->vfs_closed = 1U;
     pipe_status = kernel_pipe_acquire_endpoint(pipe, endpoint);
     if (pipe_status != KERNEL_PIPE_STATUS_OK) {
-        (void)kernel_heap_release(heap, file);
+        kernel_heap_release(heap, file);
         return pipe_status == KERNEL_PIPE_STATUS_NO_MEMORY
                    ? KERNEL_OPEN_FILE_STATUS_NO_MEMORY
                    : KERNEL_OPEN_FILE_STATUS_STATE;
@@ -701,7 +701,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             file->vfs_closed = 1U;
         }
     }
-    (void)kernel_heap_release(file->heap, file);
+    kernel_heap_release(file->heap, file);
     *owner = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -793,9 +793,7 @@ int kernel_open_file_generate(struct kernel_open_file_description *file)
 void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
 {
     if (!file || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED) __builtin_trap();
-    if (file->generated_data &&
-        kernel_heap_release(file->heap, file->generated_data) !=
-            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (file->generated_data) kernel_heap_release(file->heap, file->generated_data);
     file->generated_data = 0;
     file->generated_length = 0U;
     file->generated_ready = 0U;

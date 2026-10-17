@@ -105,8 +105,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     }
 Finish:
     if (covered && kernel_vfs_path_release(&covered)) __builtin_trap();
-    if (kernel_heap_release(fs->heap, target) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(fs->heap, target);
     return result;
 }
 
@@ -142,8 +141,7 @@ static int unmount_filesystem(struct kernel_mm *mm,
     if (result) kernel_vfs_disk_defer_cleanup(mount);
 Finish:
     if (root && kernel_vfs_path_release(&root)) __builtin_trap();
-    if (kernel_heap_release(fs->heap, target) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(fs->heap, target);
     return result;
 }
 

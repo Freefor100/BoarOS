@@ -189,7 +189,7 @@ static enum kernel_block_status timestamp_test_write(
 }
 #endif
 
-enum kernel_heap_status __real_kernel_heap_release(
+void __real_kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer);
 enum kernel_open_file_status __real_kernel_open_file_release(

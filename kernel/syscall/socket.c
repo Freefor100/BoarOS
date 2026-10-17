@@ -534,7 +534,7 @@ static enum kernel_files_status socket_message(
             copied != sizeof(header.flags)) *result = -KERNEL_EFAULT;
     }
 out:
-    if (iov != local && kernel_heap_release(files->heap, iov) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (iov != local) kernel_heap_release(files->heap, iov);
     return status;
 }
 

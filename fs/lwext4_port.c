@@ -146,6 +146,6 @@ void *ext4_user_realloc(void *pointer, size_t size)
 void ext4_user_free(void *pointer)
 {
     if (lwext4_heap != 0) {
-        (void)kernel_heap_release(lwext4_heap, pointer);
+        kernel_heap_release(lwext4_heap, pointer);
     }
 }

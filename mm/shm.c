@@ -335,8 +335,7 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
         struct kernel_shm_segment *segment = attachment->segment;
         kernel_memory_object_release(&attachment->memory);
         segment->attachments--;
-        if (kernel_heap_release(attachment->heap, attachment) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(attachment->heap, attachment);
         if (!segment->nattch && !segment->attachments && segment->marked_for_deletion)
             kernel_shm_destroy_segment_locked(segment);
     }

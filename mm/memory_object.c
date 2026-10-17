@@ -95,8 +95,7 @@ static enum kernel_memory_object_status grow_buckets(
             page = next;
         }
     }
-    if (kernel_heap_release(object->heap, object->buckets) !=
-        KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(object->heap, object->buckets);
     object->buckets = buckets;
     object->bucket_count = capacity;
     return KERNEL_MEMORY_OBJECT_OK;
@@ -121,8 +120,7 @@ enum kernel_memory_object_status kernel_memory_object_create(
                                          sizeof(*result->buckets),
                                          (void **)&result->buckets);
     if (status != KERNEL_HEAP_STATUS_OK) {
-        if (kernel_heap_release(heap, result) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(heap, result);
         return status == KERNEL_HEAP_STATUS_EMPTY
                    ? KERNEL_MEMORY_OBJECT_NO_MEMORY
                    : KERNEL_MEMORY_OBJECT_STATE;
@@ -167,17 +165,14 @@ void kernel_memory_object_release(struct kernel_memory_object **object)
             if (page->preparations) __builtin_trap();
             if (physical_page_release(owner->allocator,
                                       page->physical_address) !=
-                PHYSICAL_PAGE_STATUS_OK ||
-                kernel_heap_release(owner->heap, page) !=
-                KERNEL_HEAP_STATUS_OK) __builtin_trap();
+                PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+            kernel_heap_release(owner->heap, page);
             unaccount_page(owner);
             page = next;
         }
     }
-    if (kernel_heap_release(owner->heap, owner->buckets) !=
-            KERNEL_HEAP_STATUS_OK ||
-        kernel_heap_release(owner->heap, owner) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(owner->heap, owner->buckets);
+    kernel_heap_release(owner->heap, owner);
 }
 
 static enum kernel_memory_object_status get_page(
@@ -227,8 +222,7 @@ static enum kernel_memory_object_status get_page(
     page_status = physical_page_allocate(object->allocator,
                                          &page->physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        if (kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(object->heap, page);
         return page_status == PHYSICAL_PAGE_STATUS_EMPTY
                    ? KERNEL_MEMORY_OBJECT_NO_MEMORY
                    : KERNEL_MEMORY_OBJECT_STATE;
@@ -296,8 +290,9 @@ void kernel_memory_object_finish_page(struct kernel_memory_object *object,
     *link = page->next;
     __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
     unaccount_page(object);
-    if (physical_page_release(object->allocator, address) != PHYSICAL_PAGE_STATUS_OK ||
-        kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (physical_page_release(object->allocator, address) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    kernel_heap_release(object->heap, page);
 }
 
 void kernel_memory_object_discard_new_page(
@@ -325,9 +320,9 @@ void kernel_memory_object_discard_new_page(
     __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
     unaccount_page(object);
     if (physical_page_release(object->allocator, physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK ||
-        kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK)
+            PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
+    kernel_heap_release(object->heap, page);
 }
 
 enum kernel_memory_object_status kernel_memory_object_find_page(
@@ -367,7 +362,7 @@ void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t
                 __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
                 unaccount_page(object);
                 (void)physical_page_release(object->allocator, page->physical_address);
-                if (kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+                kernel_heap_release(object->heap, page);
                 continue;
             }
             if (tail && page->index == last) {

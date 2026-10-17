@@ -201,7 +201,7 @@ enum kernel_exec_status kernel_task_exec_finish(
      * replaced MM remains when the transaction container is finally freed. */
     process_complete_vfork(task);
     heap = transaction->heap;
-    (void)kernel_heap_release(heap, transaction);
+    kernel_heap_release(heap, transaction);
     task->exec_transaction = 0;
     return KERNEL_EXEC_STATUS_OK;
 }

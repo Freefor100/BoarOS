@@ -66,7 +66,8 @@ enum kernel_heap_status kernel_heap_resize(
     size_t new_size,
     void **new_pointer);
 
-enum kernel_heap_status kernel_heap_release(
+/* Releasing a live allocation cannot fail; invalid ownership is fatal. */
+void kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer);
 

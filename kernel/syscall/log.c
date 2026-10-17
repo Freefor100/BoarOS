@@ -43,7 +43,7 @@ enum kernel_syscall_status syscall_handle_syslog(
         decoded->value = -KERNEL_ENOMEM; return KERNEL_SYSCALL_STATUS_OK;
     }
     decoded->value = kernel_log_action(action, length, 1, copy_log, &target, scratch);
-    if (kernel_heap_release(fs->heap, scratch) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(fs->heap, scratch);
     if (decoded->value == -KERNEL_EINTR) {
         kernel_signal_note_syscall_restart(caller); decoded->value = -KERNEL_ERESTARTSYS;
     }

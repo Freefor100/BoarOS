@@ -67,8 +67,8 @@ int kernel_files_fd_matches(struct kernel_files *f,int64_t fd,const struct kerne
 { (void)f;return fd==7 && file==&target; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t n,void **out)
 { (void)h;*out=malloc(n);CHECK(*out);allocs++;allocated_bytes=n;return KERNEL_HEAP_STATUS_OK; }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *h,void *p)
-{ (void)h;CHECK(allocs==1);allocs--;free(p);return KERNEL_HEAP_STATUS_OK; }
+void kernel_heap_release(struct kernel_heap *h,void *p)
+{ (void)h;CHECK(allocs==1);allocs--;free(p); }
 static int run(struct kernel_pollfd *p,unsigned n,int immediate)
 { struct kernel_files f={0};int ret=core_poll_run(&f,NULL,p,n,123,immediate,0,0);CHECK(!refs&&!live&&!allocs);return ret; }
 static void reset(void)

@@ -29,9 +29,8 @@ static void release_disk(struct kernel_vfs_mount *mount)
     if (!*link) __builtin_trap();
     *link = disk->next;
     arch_interrupt_restore(irq);
-    if (disk->source && kernel_heap_release(heap, disk->source) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
-    if (kernel_heap_release(heap, disk) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (disk->source) kernel_heap_release(heap, disk->source);
+    kernel_heap_release(heap, disk);
 }
 
 int kernel_vfs_disk_cleanup_pending(void)

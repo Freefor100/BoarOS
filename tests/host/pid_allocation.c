@@ -47,7 +47,7 @@ int main(void)
     struct kernel_pid *retired;
     unsigned released = 0;
     while ((retired = kernel_pid_take_retired(&registry))) {
-        assert(kernel_heap_release(&heap, retired) == KERNEL_HEAP_STATUS_OK);
+        kernel_heap_release(&heap, retired);
         released++;
     }
     kernel_heap_get_statistics(&heap, &stats);

@@ -593,8 +593,7 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
         memcpy(buffer, text, length);
         *count = length;
     }
-    if (kernel_heap_release(node->instance->heap, text) !=
-        KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(node->instance->heap, text);
 Finish:
     if (kernel_vfs_path_release(&path)) __builtin_trap();
     return result;
@@ -786,8 +785,7 @@ static void release_mount_entries(struct kernel_heap *heap,
             kernel_vfs_path_release(&(*owner)[i].mount_root))
             __builtin_trap();
     }
-    if (kernel_heap_release(heap, *owner) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(heap, *owner);
     *owner = 0;
 }
 
@@ -917,10 +915,8 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
     data = 0;
     result = 0;
 Finish:
-    if (path_text && kernel_heap_release(heap, path_text) !=
-                         KERNEL_HEAP_STATUS_OK) __builtin_trap();
-    if (data && kernel_heap_release(heap, data) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    if (path_text) kernel_heap_release(heap, path_text);
+    if (data) kernel_heap_release(heap, data);
     release_mount_entries(heap, &entries, captured);
     return result;
 }
@@ -1088,7 +1084,7 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
         uint64_t interrupts = arch_interrupt_save();
         int result = kernel_cost_format(data, capacity);
         arch_interrupt_restore(interrupts);
-        if (result < 0) { if (kernel_heap_release(heap, data) != KERNEL_HEAP_STATUS_OK) __builtin_trap(); return result; }
+        if (result < 0) { kernel_heap_release(heap, data); return result; }
         *buffer = data; *length = (size_t)result;
         return 0;
     }
@@ -1152,7 +1148,7 @@ static int proc_unmount(struct kernel_vfs_mount *mount)
         instance->external_files || instance->nodes || instance->paths)
         return -KERNEL_EBUSY;
     struct kernel_heap *heap = proc->heap;
-    if (kernel_heap_release(heap, proc) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(heap, proc);
     return 0;
 }
 

@@ -60,8 +60,8 @@ int kernel_files_is_live(const struct kernel_files *f) { return f == &files; }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t z,void **p)
 { (void)h; CHECK(!preempt_depth); if (allocation_interleave) { void (*run)(void)=allocation_interleave; allocation_interleave=NULL; run(); }
   *p=calloc(n,z); CHECK(*p); allocations++; return KERNEL_HEAP_STATUS_OK; }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *h,void *p)
-{ (void)h; CHECK(p && allocations && !scopes[actor] && network_host_irq); allocations--; free(p); return KERNEL_HEAP_STATUS_OK; }
+void kernel_heap_release(struct kernel_heap *h,void *p)
+{ (void)h; CHECK(p && allocations && !scopes[actor] && network_host_irq); allocations--; free(p); }
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
 { return f->kind; }
 int kernel_open_file_supports_epoll(const struct kernel_open_file_description *f)

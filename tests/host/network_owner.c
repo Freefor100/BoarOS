@@ -58,8 +58,8 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, si
 { CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap, void *allocation)
-{ CHECK(heap == &test_heap && allocation && heap_live); --heap_live; free(allocation); return KERNEL_HEAP_STATUS_OK; }
+void kernel_heap_release(struct kernel_heap *heap, void *allocation)
+{ CHECK(heap == &test_heap && allocation && heap_live); --heap_live; free(allocation); }
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 { *queue = (struct kernel_wait_queue){.initialized = 1}; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)

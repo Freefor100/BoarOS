@@ -22,13 +22,12 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap,
     live_allocations++;
     return KERNEL_HEAP_STATUS_OK;
 }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap, void *owner)
+void kernel_heap_release(struct kernel_heap *heap, void *owner)
 {
     (void)heap;
     assert(owner && live_allocations);
     live_allocations--;
     free(owner);
-    return KERNEL_HEAP_STATUS_OK;
 }
 uint64_t kernel_time_realtime_ns(void) { return ++clock_ns; }
 uint64_t kernel_vfs_allocate_mount_id(void)
@@ -82,7 +81,7 @@ static void close_file(struct kernel_vfs_file *f)
         i->ops->release_unlinked(n);
     }
     assert(!i->ops->close_node(n));
-    assert(kernel_heap_release(i->heap, n) == KERNEL_HEAP_STATUS_OK);
+    kernel_heap_release(i->heap, n);
     *f = (struct kernel_vfs_file){0};
 }
 static void open_id(struct kernel_vfs_mount *m, uint64_t ino,

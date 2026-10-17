@@ -301,7 +301,7 @@ static int retire_pair(struct pty_pair *pair)
     global_pairs--;
     (void)kernel_wait_queue_wake_all(&mount->work);
     arch_interrupt_restore(irq);
-    if (kernel_heap_release(mount->heap, pair) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(mount->heap, pair);
     return 1;
 }
 static void worker(void *argument)
@@ -369,7 +369,7 @@ int kernel_pty_mount_start(struct kernel_vfs_mount *mount)
     kernel_wait_queue_init(&owner->work);
     enum kernel_scheduler_status created = kernel_thread_create_joinable(worker, owner, &owner->worker);
     if (created != KERNEL_SCHEDULER_STATUS_OK) {
-        if (kernel_heap_release(owner->heap, owner) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(owner->heap, owner);
         return created == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EINVAL;
     }
     kernel_devpts_mount_set_private(mount, owner);
@@ -387,7 +387,7 @@ int kernel_pty_mount_stop(struct kernel_vfs_mount *mount)
     kernel_thread_join(&owner->worker);
     kernel_devpts_mount_set_private(mount, 0);
     arch_interrupt_restore(irq);
-    if (kernel_heap_release(owner->heap, owner) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(owner->heap, owner);
     return 0;
 }
 int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *heap,

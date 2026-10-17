@@ -54,15 +54,15 @@ int __wrap_kernel_vfs_close(struct kernel_vfs_file *file)
 void __real_kernel_file_mapping_drain(struct kernel_file_mapping *);
 void __wrap_kernel_file_mapping_drain(struct kernel_file_mapping *mapping)
 { outside_gate(); __real_kernel_file_mapping_drain(mapping); }
-enum kernel_heap_status __real_kernel_heap_release(struct kernel_heap *,void *);
-enum kernel_heap_status __wrap_kernel_heap_release(struct kernel_heap *h,void *pointer)
+void __real_kernel_heap_release(struct kernel_heap *,void *);
+void __wrap_kernel_heap_release(struct kernel_heap *h,void *pointer)
 {
     if (kernel_cpu_current()->hardware_id==5 &&
         __atomic_exchange_n(&callback_after_fence,0,__ATOMIC_ACQ_REL)) {
         /* 此resident已摘索引；callback尚未返回，registration仍被实际借用。 */
         publish(&callback_entered); await(&callback_resume);
     }
-    return __real_kernel_heap_release(h,pointer);
+    __real_kernel_heap_release(h,pointer);
 }
 void kernel_assert_service_context(void) { assert(!kernel_cpu_current()->logical_id); }
 void kernel_cpu_flush_notifications(void) {}

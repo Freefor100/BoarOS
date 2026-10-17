@@ -135,15 +135,11 @@ static enum kernel_elf64_source_status map_elf_status(
     }
 }
 
-static int release_pointer(struct kernel_elf64_source *source,
+static void release_pointer(struct kernel_elf64_source *source,
                            void **pointer)
 {
-    if (*pointer == 0) {
-        return 1;
-    }
-    (void)kernel_heap_release(source->heap, *pointer);
+    kernel_heap_release(source->heap, *pointer);
     *pointer = 0;
-    return 1;
 }
 
 static enum kernel_elf64_source_status discard_page(
@@ -173,25 +169,15 @@ static enum kernel_elf64_source_status source_cleanup(
             source->file = 0;
         }
     }
-    if (!release_pointer(source, (void **)&source->interpreter)) {
-        failed = 1;
-    }
-    if (!release_pointer(source, (void **)&source->boundaries)) {
-        failed = 1;
-    }
-    if (!release_pointer(source, (void **)&source->runs)) {
-        failed = 1;
-    }
-    if (!release_pointer(source, (void **)&source->program_headers)) {
-        failed = 1;
-    }
-    if (source->file != 0 || source->interpreter != 0 ||
-        source->boundaries != 0 ||
-        source->runs != 0 || source->program_headers != 0 || failed) {
+    release_pointer(source, (void **)&source->interpreter);
+    release_pointer(source, (void **)&source->boundaries);
+    release_pointer(source, (void **)&source->runs);
+    release_pointer(source, (void **)&source->program_headers);
+    if (failed) {
         return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
     }
     source->magic = 0U;
-    (void)kernel_heap_release(source->heap, source);
+    kernel_heap_release(source->heap, source);
     *owner = 0;
     return KERNEL_ELF64_SOURCE_STATUS_OK;
 }
@@ -523,14 +509,10 @@ static enum kernel_elf64_source_status build_runs(
         run_count++;
     }
     if (run_count == 0U) {
-        if (!release_pointer(source, (void **)&source->boundaries)) {
-            return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
-        }
+        release_pointer(source, (void **)&source->boundaries);
         return KERNEL_ELF64_SOURCE_STATUS_MALFORMED;
     }
-    if (!release_pointer(source, (void **)&source->boundaries)) {
-        return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
-    }
+    release_pointer(source, (void **)&source->boundaries);
     source->run_count = run_count;
     return KERNEL_ELF64_SOURCE_STATUS_OK;
 }

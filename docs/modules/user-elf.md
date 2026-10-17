@@ -31,7 +31,7 @@ enum kernel_elf64_status kernel_elf64_open_cached(
 
 ## 不可变 ELF source
 
-`kernel_elf64_source_create()` 接收一个已打开的 regular-file OFD 和当前架构 machine，成功后消费调用者的 OFD owner；失败仍由调用者持有。source 保存 header、program headers、唯一的绝对 `PT_INTERP` 路径和按虚拟页排序、无重叠的 FILE/ZERO/COMPOSITE runs。source 具备 `create/acquire/release` 引用协议；最后一个 release 按 file、解释器字符串、临时边界、run/table allocation 的顺序清理。真实 VFS/I/O 清理失败保持 source/OFD owner；物理页与堆的合法释放完成即返回，分配器不变量错误进入 fatal。
+`kernel_elf64_source_create()` 接收一个已打开的 regular-file OFD 和当前架构 machine，成功后消费调用者的 OFD owner；失败仍由调用者持有。source 保存 header、program headers、唯一的绝对 `PT_INTERP` 路径和按虚拟页排序、无重叠的 FILE/ZERO/COMPOSITE runs。source 具备 `create/acquire/release` 引用协议；最后一个 release 按 file、解释器字符串、临时边界、run/table allocation 的顺序清理。真实 VFS/I/O 清理失败保持 source/OFD owner；纯堆指针无条件释放并清空，不派生清理失败状态。物理页与堆的合法释放完成即返回，分配器不变量错误进入 fatal。
 
 `kernel_elf64_source_create_reader()` 复制 `read_source` 描述符，不消费 backing。调用者必须让字节与 context 不可变且存活到最后一个 source 引用释放；LA fixture 使用内核只读区中的独立 ELF。reader 的完整 FILE 页同样分配并精确复制，不能按零页处理；OFD 仍走 page cache。两种 source 共用解析、runs、VMA、回滚与引用规则。
 

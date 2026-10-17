@@ -48,7 +48,7 @@ static void epoll_item_put(struct kernel_epoll_item *item)
     if (!item->references) __builtin_trap();
     int release = !--item->references;
     arch_interrupt_restore(irq);
-    if (release && kernel_heap_release(item->heap, item) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (release) kernel_heap_release(item->heap, item);
 }
 
 static void epoll_notify(struct kernel_epoll *epoll)
@@ -279,7 +279,7 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
         __builtin_trap();
     if (kernel_wait_queue_destroy(&epoll->wait_queue) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 
-    (void)kernel_heap_release(epoll->heap, epoll);
+    kernel_heap_release(epoll->heap, epoll);
     return KERNEL_FILES_STATUS_OK;
 }
 

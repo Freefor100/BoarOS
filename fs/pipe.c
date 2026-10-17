@@ -90,7 +90,7 @@ static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
         pipe->fifo_node->fifo_pipe = 0;
     }
     for (unsigned i=0;i<16;i++) if (pipe->pages[i]) pipe_release_page(pipe,pipe->pages[i]);
-    (void)kernel_heap_release(pipe->heap, pipe);
+    kernel_heap_release(pipe->heap, pipe);
     return KERNEL_PIPE_STATUS_OK;
 }
 

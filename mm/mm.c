@@ -396,7 +396,7 @@ static enum kernel_mm_status reserve_file_residents(
     record->resident_buckets = buckets;
     record->resident_capacity = capacity;
     }
-    if (old) (void)kernel_heap_release(record->vma_heap, old);
+    if (old) kernel_heap_release(record->vma_heap, old);
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -694,7 +694,7 @@ static void drain_file_registrations(struct kernel_mm_record *record,
                 record->retired_file_mappings=entry;
             } else {
                 kernel_file_mapping_unregister(&entry->registration);
-                (void)kernel_heap_release(record->vma_heap, entry);
+                kernel_heap_release(record->vma_heap, entry);
             }
         }
     }
@@ -710,7 +710,7 @@ static int release_file_sources(struct kernel_mm_record *record,
         struct kernel_mm_file_source *source=sources; sources=source->next;
         if (source->file && kernel_open_file_release(&source->file)!=KERNEL_OPEN_FILE_STATUS_OK) {
             source->draining=1; source->next=failed; failed=source;
-        } else if (kernel_heap_release(record->vma_heap,source)) __builtin_trap();
+        } else kernel_heap_release(record->vma_heap,source);
     }
     if (!failed) return 0;
     KERNEL_LOCK_SCOPE(guard);
@@ -792,7 +792,7 @@ static int release_elf_sources(struct kernel_mm_record *record,
         struct kernel_mm_elf_source *source=sources; sources=source->next;
         if (source->source && kernel_elf64_source_release(&source->source)!=KERNEL_ELF64_SOURCE_STATUS_OK) {
             source->draining=1; source->next=failed; failed=source;
-        } else if (kernel_heap_release(record->vma_heap,source)) __builtin_trap();
+        } else kernel_heap_release(record->vma_heap,source);
     }
     if (!failed) return 0;
     KERNEL_LOCK_SCOPE(guard);
@@ -883,7 +883,7 @@ static enum kernel_mm_status clone_elf_sources(
         }
         if (kernel_elf64_source_acquire(source->source) !=
             KERNEL_ELF64_SOURCE_STATUS_OK) {
-            (void)kernel_heap_release(destination_record->vma_heap, copy);
+            kernel_heap_release(destination_record->vma_heap, copy);
             return KERNEL_MM_STATUS_STATE;
         }
         copy->source = source->source;
@@ -930,7 +930,7 @@ static enum kernel_mm_status clone_file_sources(
         }
         if (kernel_open_file_acquire(source->file) !=
             KERNEL_OPEN_FILE_STATUS_OK) {
-            (void)kernel_heap_release(destination_record->vma_heap,
+            kernel_heap_release(destination_record->vma_heap,
                                     copy);
             return KERNEL_MM_STATUS_STATE;
         }
@@ -960,8 +960,7 @@ static void drain_shared_anon(struct kernel_mm_record *record,
         }
         *link = entry->next;
         kernel_memory_object_release(&entry->object);
-        if (kernel_heap_release(record->vma_heap, entry) !=
-            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(record->vma_heap, entry);
     }
 }
 
@@ -984,7 +983,7 @@ static enum kernel_mm_status clone_shared_anon(
                        : KERNEL_MM_STATUS_STATE;
         if (kernel_memory_object_acquire(source->object) !=
             KERNEL_MEMORY_OBJECT_OK) {
-            (void)kernel_heap_release(destination_record->vma_heap, copy);
+            kernel_heap_release(destination_record->vma_heap, copy);
             return KERNEL_MM_STATUS_STATE;
         }
         copy->object = source->object;
@@ -1040,7 +1039,7 @@ static void fork_file_guards_end(struct fork_file_guards *owner)
     if (!owner->nodes) return;
     for (size_t i=owner->count; i--;) if (owner->guards[i].lock)
         kernel_lock_release(&owner->guards[i]);
-    if (kernel_heap_release(owner->heap,owner->nodes)) __builtin_trap();
+    kernel_heap_release(owner->heap,owner->nodes);
     *owner=(struct fork_file_guards){0};
 }
 static void sift_file_nodes(struct kernel_vfs_node **nodes,size_t root,size_t count)
@@ -1460,7 +1459,7 @@ static void mm_operation_end(struct mm_operation *operation)
             struct mm_file_mapping *entry=retired;
             retired=entry->next;
             kernel_file_mapping_drain(&entry->registration);
-            if (kernel_heap_release(record->vma_heap,entry)) __builtin_trap();
+            kernel_heap_release(record->vma_heap,entry);
         }
         /* Registration callbacks still borrow the node; their drain must end
          * before its final OFD/ELF owner can close the backend. */
@@ -1760,7 +1759,7 @@ enum kernel_mm_status kernel_mm_map_elf_source(
         }
         if (kernel_elf64_source_acquire(source) !=
             KERNEL_ELF64_SOURCE_STATUS_OK) {
-            (void)kernel_heap_release(record->vma_heap, source_owner);
+            kernel_heap_release(record->vma_heap, source_owner);
             return KERNEL_MM_STATUS_STATE;
         }
         source_owner->source = source;
@@ -2376,9 +2375,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     return KERNEL_MM_STATUS_OK;
 
 discard_shared:
-    if (shared_entry != 0 &&
-        kernel_heap_release(record->vma_heap, shared_entry) !=
-            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (shared_entry != 0) kernel_heap_release(record->vma_heap, shared_entry);
     if (shared_object != 0)
         kernel_memory_object_release(&shared_object);
     return status;
@@ -2389,7 +2386,7 @@ static void discard_prepared_file_source(
     struct kernel_mm_file_source *source)
 {
     if (source != 0) {
-        (void)kernel_heap_release(record->vma_heap, source);
+        kernel_heap_release(record->vma_heap, source);
     }
 }
 
@@ -2593,7 +2590,7 @@ static enum kernel_mm_status commit_file_mapping(
         if (status != KERNEL_MM_STATUS_OK) {
             discard_prepared_file_source(record, prepared);
             if (registration != 0)
-                (void)kernel_heap_release(record->vma_heap, registration);
+                kernel_heap_release(record->vma_heap, registration);
             return status;
         }
     } else {
@@ -2605,7 +2602,7 @@ static enum kernel_mm_status commit_file_mapping(
         if (vma_status != KERNEL_VMA_STATUS_OK) {
             discard_prepared_file_source(record, prepared);
             if (registration != 0)
-                (void)kernel_heap_release(record->vma_heap, registration);
+                kernel_heap_release(record->vma_heap, registration);
             return status_from_vma(vma_status);
         }
         status = unmap_space_range(record, plan.start, plan.end);
@@ -2614,7 +2611,7 @@ static enum kernel_mm_status commit_file_mapping(
                 KERNEL_VMA_STATUS_OK) {
             discard_prepared_file_source(record, prepared);
             if (registration != 0)
-                (void)kernel_heap_release(record->vma_heap, registration);
+                kernel_heap_release(record->vma_heap, registration);
             return status != KERNEL_MM_STATUS_OK
                        ? status
                        : KERNEL_MM_STATUS_STATE;
@@ -2823,7 +2820,7 @@ enum kernel_mm_status kernel_mm_shmat(
         } else {
             if (shared_entry != 0) {
                 kernel_memory_object_release(&shared_entry->object);
-                (void)kernel_heap_release(record->vma_heap, shared_entry);
+                kernel_heap_release(record->vma_heap, shared_entry);
             }
         }
         return status;
@@ -2838,7 +2835,7 @@ enum kernel_mm_status kernel_mm_shmat(
         status = status_from_vma(vma_status);
         if (shared_entry != 0) {
             kernel_memory_object_release(&shared_entry->object);
-            (void)kernel_heap_release(record->vma_heap, shared_entry);
+            kernel_heap_release(record->vma_heap, shared_entry);
         }
         return status;
     }
@@ -2846,7 +2843,7 @@ enum kernel_mm_status kernel_mm_shmat(
     if (status != KERNEL_MM_STATUS_OK) {
         if (shared_entry != 0) {
             kernel_memory_object_release(&shared_entry->object);
-            (void)kernel_heap_release(record->vma_heap, shared_entry);
+            kernel_heap_release(record->vma_heap, shared_entry);
         }
         return status;
     }
@@ -2854,7 +2851,7 @@ enum kernel_mm_status kernel_mm_shmat(
         KERNEL_VMA_STATUS_OK) {
         if (shared_entry != 0) {
             kernel_memory_object_release(&shared_entry->object);
-            (void)kernel_heap_release(record->vma_heap, shared_entry);
+            kernel_heap_release(record->vma_heap, shared_entry);
         }
         return KERNEL_MM_STATUS_STATE;
     }
@@ -3250,7 +3247,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         record->retired_file_residents=0;
         drain_retired_residents(record,retired);
         if (record->resident_buckets != 0)
-            (void)kernel_heap_release(record->vma_heap, record->resident_buckets);
+            kernel_heap_release(record->vma_heap, record->resident_buckets);
         record->resident_buckets = 0;
         record->resident_capacity = 0;
         if (record->vmas != 0) {

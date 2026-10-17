@@ -323,7 +323,7 @@ static int core_poll_run(
     }
 
     if (heap_block != 0) {
-        (void)kernel_heap_release(files->heap, heap_block);
+        kernel_heap_release(files->heap, heap_block);
     }
 
     return error != 0 ? error : ready_count;
@@ -405,7 +405,7 @@ enum kernel_files_status kernel_files_ppoll(
                                   &copied);
         if (ustatus == KERNEL_UACCESS_STATUS_FAULT) {
             if (heap_pfds != 0) {
-                (void)kernel_heap_release(files->heap, heap_pfds);
+                kernel_heap_release(files->heap, heap_pfds);
             }
             poll_restore_sigmask(task, saved_mask, mask_modified, 0);
             *linux_result = -KERNEL_EFAULT;
@@ -414,7 +414,7 @@ enum kernel_files_status kernel_files_ppoll(
         if (ustatus != KERNEL_UACCESS_STATUS_OK ||
             copied != nfds * sizeof(*pfds)) {
             if (heap_pfds != 0) {
-                (void)kernel_heap_release(files->heap, heap_pfds);
+                kernel_heap_release(files->heap, heap_pfds);
             }
             poll_restore_sigmask(task, saved_mask, mask_modified, 0);
             *linux_result = -KERNEL_EINVAL;
@@ -445,7 +445,7 @@ enum kernel_files_status kernel_files_ppoll(
     }
 
     if (heap_pfds != 0) {
-        (void)kernel_heap_release(files->heap, heap_pfds);
+        kernel_heap_release(files->heap, heap_pfds);
     }
 
     poll_write_remaining_timeout(mm,
@@ -735,10 +735,10 @@ cleanup:
         poll_restore_sigmask(task, saved_mask, mask_modified, 0);
     }
     if (heap_pfds != 0) {
-        (void)kernel_heap_release(files->heap, heap_pfds);
+        kernel_heap_release(files->heap, heap_pfds);
     }
     if (heap_bitsets != 0) {
-        (void)kernel_heap_release(files->heap, heap_bitsets);
+        kernel_heap_release(files->heap, heap_bitsets);
     }
 
     poll_write_remaining_timeout(mm,

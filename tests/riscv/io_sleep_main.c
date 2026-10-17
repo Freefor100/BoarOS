@@ -1271,7 +1271,7 @@ static void cost_finish(const char *name, unsigned epoch)
     virt_uart_puts("COST SNAPSHOT "); virt_uart_puts(name); virt_uart_putc(' ');
     virt_uart_putc((char)('0' + epoch)); virt_uart_putc('\n');
     virt_uart_puts(report); virt_uart_puts("COST END\n");
-    check(kernel_heap_release(&heap, report) == KERNEL_HEAP_STATUS_OK, 215);
+    kernel_heap_release(&heap, report);
 }
 #endif
 void kernel_main(unsigned long hart, const void *dtb)

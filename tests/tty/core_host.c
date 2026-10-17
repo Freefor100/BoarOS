@@ -43,7 +43,7 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h, size_
     live++;
     return 0;
 }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *h, void *p)
+void kernel_heap_release(struct kernel_heap *h, void *p)
 {
     (void)h;
     if (p) {
@@ -51,7 +51,6 @@ enum kernel_heap_status kernel_heap_release(struct kernel_heap *h, void *p)
         live--;
         free(p);
     }
-    return 0;
 }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h, size_t n, void **p)
 { return kernel_heap_allocate_zeroed(h, 1, n, p); }
