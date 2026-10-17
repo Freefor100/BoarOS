@@ -32,6 +32,7 @@ uint64_t arch_mmu_current_context(void)
 enum arch_mmu_status arch_mmu_switch_context(uint64_t root)
 {
     if (root & BOAROS_PAGE_MASK || root > PTE_ADDRESS) return ARCH_MMU_STATUS_INVALID;
+    if (root == arch_mmu_current_context()) return ARCH_MMU_STATUS_OK;
     __asm__ volatile("dbar 0\ncsrwr %0, 0x19" : "+r"(root) :: "memory");
     flush_all(); return ARCH_MMU_STATUS_OK;
 }

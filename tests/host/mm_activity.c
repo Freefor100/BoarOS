@@ -85,7 +85,9 @@ void mm_test_fence(uint64_t address, int instructions)
 void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int instructions)
 {
     (void)address; (void)size; (void)instructions;
-    assert(!kernel_cpu_current()->raw_locks && targets == 0);
+    assert(!kernel_cpu_current()->raw_locks);
+    assert(targets == (kernel_cpu_current()->active_mm_record ?
+        UINT32_C(1) << kernel_cpu_current()->logical_id : 0));
 #ifdef REMOTE_USER_CASE
     if (expect_nonleaf_sync) { assert(address==0 && size==UINT64_MAX); expect_nonleaf_sync=0; }
     if (copying) {
@@ -109,10 +111,10 @@ static void *enter(void *unused)
     (void)unused; mm_test_attach(1); kernel_cpu_current()->logical_id = 1;
     await(&sampled);
     assert(!kernel_mm_activate(&mm, kernel_context));
-    assert(flushes >= 2 && instruction_sync == 1);
+    assert(flushes == 1 && instruction_sync == 1);
     unsigned before = flushes;
     assert(!kernel_mm_activate(&mm, kernel_context));
-    assert(flushes == before + 1 && instruction_sync == 2); /* 同SATP也失效。 */
+    assert(flushes == before && instruction_sync == 1); /* 同MM、同代次保留有效翻译。 */
     publish(&entered); await(&pause_exit);
     assert(!kernel_mm_activate(0, kernel_context));
     assert(!kernel_cpu_current()->active_mm_record);
@@ -263,6 +265,24 @@ int main(void)
     publish(&pause_exit); await(&exiting);
     kernel_mm_get_concurrency_state(&mm, &state); assert(state.active_cpus == 2);
     publish(&allow_exit); assert(!pthread_join(visitor, 0));
+    unsigned before_flush = flushes, before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before_flush + 1 && instruction_sync == before_instructions + 1);
+    before_flush = flushes; before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before_flush && instruction_sync == before_instructions);
+    assert(!kernel_mm_mprotect(&mm, 0x40000, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    before_flush = flushes; before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before_flush + 1 && instruction_sync == before_instructions);
+    assert(!kernel_mm_mprotect(&mm, 0x40000, BOAROS_PAGE_SIZE, KERNEL_MM_READ|KERNEL_MM_EXECUTE));
+    before_flush = flushes; before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before_flush + 1 && instruction_sync == before_instructions + 1);
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before_flush + 1 && instruction_sync == before_instructions + 1);
+    assert(!kernel_mm_activate(0, kernel_context));
+    mm_test_context = context;
     kernel_mm_get_concurrency_state(&mm, &state); assert(!state.active_cpus && !state.pending_retirement);
 #ifdef REMOTE_USER_CASE
     assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
@@ -309,5 +329,5 @@ int main(void)
 #endif
     mm_test_context = 0; assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
-    puts("MM sampled-target late entry, same-root local invalidation and leave-before-retirement verified");
+    puts("MM late entry, same-root reuse, independent instruction publication and leave-before-retirement verified");
 }

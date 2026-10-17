@@ -315,7 +315,6 @@ uint64_t riscv_sv39_current_satp(void)
 
 static void write_satp(uint64_t value)
 {
-    riscv_mmu_flush_all();
     riscv_mmu_context_write(value);
     riscv_mmu_flush_all();
 }

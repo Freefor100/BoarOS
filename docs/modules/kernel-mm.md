@@ -287,7 +287,7 @@ OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 文件与 ELF 的来源节点持有实际 OFD/ELF owner；缺页准备期间借用该节点，最后 VMA 消失也不能提前关闭来源。映射登记在 gate 内停止和摘除，gate、inode 与 raw 外排空回调，再释放来源。最终关闭暂时需要 CPU0 或真实 I/O 清理时，同一退休节点继续持有 owner；用户返回准备在 offset、pin 等调用资格已经归还后排空它，不复活已退休来源，也不建立第二组引用。
 
-active CPU 位图与 TLB 代次在 MM raw 内维护。撤映射、降权、COW 和截断先发布翻译变更并固定退休 owner，raw 外完成本地 SFENCE 与同步 SBI RFENCE，确认后才归还数据和表页。新加入者在相同保护下登记、切根并完整本地失效；离开者在旧翻译停止后清活动位。固件失败保留实际资源并 fatal。
+active CPU 位图与 TLB 代次在 MM raw 内维护。撤映射、降权、COW 和截断先发布翻译变更并固定退休 owner，raw 外完成本地 SFENCE 与同步 SBI RFENCE，确认后才归还数据和表页。新加入者在相同保护下登记；换根由架构入口完成一次全量失效，同根仅在加入或翻译代次变化时补做失效。CPU 记录实际观察到的翻译代次，相同 MM、相同代次的再次激活不清空 TLB。可执行页的填充、COW、执行权限发布及文件尾清零另推进指令代次；首次进入和未观察到该代次的 CPU 执行指令同步，不把普通 PTE 修改一概当作代码变化。离开者在旧翻译停止后清活动位。固件失败保留实际资源并 fatal。
 
 `kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。共享文件映射遵守同一来源与 alias 协议。SysV 的 attachment 修改在实际业务边界进入 CPU0，匿名范围编辑不迁移。设备、网络和命名空间仍在各自串行边界执行。
 

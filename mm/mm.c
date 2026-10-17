@@ -102,7 +102,7 @@ struct kernel_mm_record {
     struct kernel_wait_queue pins_changed;
     uint32_t access_closed;
     uint32_t active_cpus, pending_retirement;
-    uint64_t tlb_generation;
+    uint64_t tlb_generation, instruction_generation;
     uint64_t pin_acquisitions, prepared_pages, fault_retries;
     uint64_t retirement_batches, retired_pages, pin_waits;
     enum kernel_mm_record_stage stage;
@@ -136,7 +136,7 @@ struct kernel_mm_record {
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *,
-    const struct kernel_mm_retirement *);
+    const struct kernel_mm_retirement *, int);
 static void finish_tlb_change(struct kernel_mm_record *,
     struct kernel_mm_retirement *, uint32_t, uint64_t, uint64_t, int);
 
@@ -541,7 +541,7 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
         if (!(mapping.permissions&ARCH_MMU_WRITE)) return 0;
         if (arch_mmu_user_protect_owned_page(&record->space,address,
                 backend_permissions_from_mm(permissions))) __builtin_trap();
-        targets=note_tlb_change_locked(record,&batch);
+        targets=note_tlb_change_locked(record, &batch, 0);
     }
     finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,0);
     return 0;
@@ -597,7 +597,7 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
                 {
                     KERNEL_RAW_SCOPE(guard,&record->metadata);
                     if (arch_mmu_user_detach_page(&record->space,page->address,&batch)) __builtin_trap();
-                    targets=note_tlb_change_locked(record,&batch);
+                    targets=note_tlb_change_locked(record, &batch, 0);
                 }
                 finish_tlb_change(record,&batch,targets,0,UINT64_MAX,0);
             }
@@ -618,7 +618,14 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
         }
         link = &page->next;
     }
-    if (cleared) arch_mmu_sync_instructions();
+    if (cleared) {
+        uint32_t targets;
+        { KERNEL_RAW_SCOPE(guard, &record->metadata);
+          if (record->instruction_generation == UINT64_MAX) __builtin_trap();
+          record->instruction_generation++;
+          targets = record->active_cpus; }
+        arch_mmu_sync_user(targets, 0, UINT64_MAX, 1);
+    }
     struct mm_file_resident *retired=record->retired_file_residents;
     record->retired_file_residents=0;
     if (operation.lock) mm_gate_release(record,&operation);
@@ -1263,7 +1270,7 @@ static enum kernel_mm_status mm_fork_impl(
         uint32_t targets;
         {
             KERNEL_RAW_SCOPE(guard, &source_record->metadata);
-            targets = note_tlb_change_locked(source_record, &batch);
+            targets = note_tlb_change_locked(source_record, &batch, 0);
         }
         finish_tlb_change(source_record, &batch, targets, 0, UINT64_MAX, 0);
         backend_status = ARCH_MMU_STATUS_OK;
@@ -1383,11 +1390,15 @@ struct mm_operation {
     struct kernel_lock_guard guard;
 };
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
-    const struct kernel_mm_retirement *batch)
+    const struct kernel_mm_retirement *batch, int instructions)
 {
     if (record->tlb_generation == UINT64_MAX ||
         (batch->count && record->pending_retirement == UINT32_MAX)) __builtin_trap();
     record->tlb_generation++;
+    if (instructions) {
+        if (record->instruction_generation == UINT64_MAX) __builtin_trap();
+        record->instruction_generation++;
+    }
     if (batch->count) {
         record->pending_retirement++;
 #if BOAROS_COST_DIAGNOSTICS
@@ -2192,7 +2203,7 @@ static enum kernel_mm_status unmap_space_range(
                     if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED)
                         __builtin_trap(); /* 已提交退休不能丢弃owner。 */
                 }
-                targets = batch.count ? note_tlb_change_locked(record, &batch) : record->active_cpus;
+                targets = batch.count ? note_tlb_change_locked(record, &batch, 0) : record->active_cpus;
             }
             while (removed) {
                 struct mm_file_resident *page = removed;
@@ -2968,6 +2979,10 @@ static enum kernel_mm_status mm_mprotect_impl(
         { KERNEL_RAW_SCOPE(guard, &record->metadata);
           if (record->tlb_generation == UINT64_MAX) __builtin_trap();
           record->tlb_generation++;
+          if (normalized & KERNEL_MM_EXECUTE) {
+              if (record->instruction_generation == UINT64_MAX) __builtin_trap();
+              record->instruction_generation++;
+          }
           targets = record->active_cpus; }
         arch_mmu_sync_user(targets, address, end - address,
             (normalized & KERNEL_MM_EXECUTE) != 0);
@@ -3146,16 +3161,23 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         }
         if (record != previous && (record->active_cpus & (1U << logical))) __builtin_trap();
         record->active_cpus |= 1U << logical;
+        int changed = arch_mmu_current_context() != context;
         if (arch_mmu_switch_context(context) != ARCH_MMU_STATUS_OK) __builtin_trap();
-        { arch_mmu_flush_all(); arch_mmu_sync_instructions(); }
+        /* 换根已由架构入口失效；同根仅补齐加入前或未观察到的PTE修改。 */
+        if (!changed && (record != previous || cpu->active_mm_generation != record->tlb_generation))
+            arch_mmu_flush_all();
+        if (record != previous || cpu->active_mm_instruction_generation != record->instruction_generation)
+            arch_mmu_sync_instructions();
         cpu->active_mm_record = record;
         cpu->active_mm_generation = record->tlb_generation;
+        cpu->active_mm_instruction_generation = record->instruction_generation;
     } else {
         if (arch_mmu_switch_context(kernel_context) != ARCH_MMU_STATUS_OK) {
             status = KERNEL_MM_STATUS_ADDRESS_SPACE; goto out;
         }
         cpu->active_mm_record = 0;
         cpu->active_mm_generation = 0;
+        cpu->active_mm_instruction_generation = 0;
     }
     if (previous && previous != record) {
         KERNEL_RAW_SCOPE(guard, &previous->metadata);
@@ -3588,7 +3610,7 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
         KERNEL_RAW_SCOPE(guard,&record->metadata);
         if (arch_mmu_user_protect_owned_page(&record->space,address,
             backend_permissions_from_mm(vma->permissions))) __builtin_trap();
-        targets=note_tlb_change_locked(record,&batch);
+        targets=note_tlb_change_locked(record, &batch, 0);
     }
     finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,0);
     kernel_page_cache_write_end(&permit);
@@ -3684,7 +3706,7 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
             if (refs == 1) {
                 if (arch_mmu_user_cow_commit(&record->space,address,cookie,KERNEL_MM_NO_PAGE,
                         backend_permissions_from_mm(vma.permissions),&batch)) __builtin_trap();
-                targets = note_tlb_change_locked(record,&batch);
+                targets = note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
                 kernel_raw_lock_release(&guard);
                 finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,
                     (vma.permissions & KERNEL_MM_EXECUTE) != 0);
@@ -3775,7 +3797,7 @@ static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
             page->address=address; page->physical_address=replacement;
             page->private=!shared && access==KERNEL_MM_WRITE;
             if (resident) { publish_file_resident(record,resident); resident=0; }
-            targets=note_tlb_change_locked(record,&batch);
+            targets=note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
         }
     }
     if (status == KERNEL_MM_STATUS_OK) {
@@ -3863,7 +3885,7 @@ static enum kernel_mm_status memory_fault(struct mm_operation *operation,
                 if (arch_mmu_user_cow_commit(&record->space, address, cookie, KERNEL_MM_NO_PAGE,
                     backend_permissions_from_mm(vma.permissions), &batch) != ARCH_MMU_STATUS_OK)
                     __builtin_trap();
-                targets = note_tlb_change_locked(record, &batch);
+                targets = note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
                 kernel_raw_lock_release(&guard);
                 finish_tlb_change(record, &batch, targets, address, BOAROS_PAGE_SIZE,
                     (vma.permissions & KERNEL_MM_EXECUTE) != 0);
@@ -3969,7 +3991,7 @@ static enum kernel_mm_status memory_fault(struct mm_operation *operation,
                 KERNEL_MM_STATUS_CONFLICT : KERNEL_MM_STATUS_ADDRESS_SPACE;
             if (status == KERNEL_MM_STATUS_OK) {
                 replacement = KERNEL_MM_NO_PAGE;
-                targets = note_tlb_change_locked(record, &batch);
+                targets = note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
             }
         }
     }

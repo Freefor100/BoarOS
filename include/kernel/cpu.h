@@ -30,6 +30,7 @@ struct kernel_cpu {
     /* 当前地址空间记录借用由执行task的MM owner覆盖，切换失效后才清旧bit。 */
     void *active_mm_record;
     uint64_t active_mm_generation;
+    uint64_t active_mm_instruction_generation;
     struct kernel_task *idle;
     struct kernel_cpu *scheduler_next;
     struct kernel_rt_bandwidth rt_bandwidth;
