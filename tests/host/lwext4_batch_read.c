@@ -115,6 +115,23 @@ int main(int argc,char **argv)
     printf("file batch blocksize=%u width=%u batches=%u\n",dev.lg_bsize,width,batches);
     CHECK(width==8);
     for(unsigned i=0;i<8;i++){CHECK(!spans[i].error && spans[i].completed==4096);for(unsigned j=0;j<4096;j++)CHECK(out[i][j]==expected(i*4096+j));}
+    const unsigned destinations[][8]={{0,1,2,3,4,5,6,7},{7,6,5,4,3,2,1,0},{0,7,3,5,1,6,2,4}};
+    for(unsigned order=0;order<3;order++){
+        for(unsigned i=0;i<8;i++)spans[i]=(struct file_read_span){i*4096,out[destinations[order][i]],4096,0,0};
+        CHECK(read_batch(&file,spans,8)==EOK);
+        for(unsigned i=0;i<8;i++){
+            CHECK(!spans[i].error && spans[i].completed==4096);
+            for(unsigned j=0;j<4096;j++)CHECK(((unsigned char *)spans[i].buffer)[j]==expected(i*4096+j));
+        }
+        void *saved=spans[7].buffer;
+        for(unsigned i=0;i<7;i++){
+            spans[7].buffer=(char *)spans[i].buffer+4095;
+            unsigned before=batches;
+            CHECK(read_batch(&file,spans,8)==EINVAL && batches==before && spans[7].error==EINVAL);
+        }
+        spans[7].buffer=saved;
+    }
+    for(unsigned i=0;i<8;i++)spans[i]=(struct file_read_span){i*4096,out[i],4096,0,0};
     /* 部分块使规划跨过工作区容量：前窗完整输出先交付，最后一窗直接返回。 */
     unsigned char (*many_bytes)[4096]=malloc(32*4096);CHECK(many_bytes);
     memset(many_bytes,0xcd,32*4096);
@@ -140,6 +157,10 @@ int main(int argc,char **argv)
     CHECK(ext4_fpread_batch(&file,spans,8,NULL,UINT64_MAX, NULL)==ENOMEM);
     for(unsigned i=0;i<8;i++)CHECK(spans[i].error==ENOMEM && !spans[i].completed);
     struct file_read_workspace aliased_workspace;
+    struct file_read_span endpoint[3]={{65536+123,(void *)(UINTPTR_MAX-7),8,0,0},
+        {65536+123,out[0],8,0,0},{65536+123,(void *)UINTPTR_MAX,1,0,0}};
+    CHECK(read_batch(&file,endpoint,2)==EOK && !endpoint[0].completed && !endpoint[1].completed);
+    CHECK(read_batch(&file,endpoint,3)==EINVAL && endpoint[2].error==EINVAL);
     struct file_read_span overlap={0,&aliased_workspace,sizeof(aliased_workspace),0,0};
     CHECK(ext4_fpread_batch(&file,&overlap,1,&aliased_workspace,UINT64_MAX, NULL)==EINVAL);
     union {struct file_read_workspace workspace;struct file_read_span spans[2];} aliased;
@@ -219,12 +240,20 @@ int main(int argc,char **argv)
     CHECK(width==2 && batches==1);
     for(unsigned i=0;i<5*4096;i++)CHECK(((unsigned char *)out)[i]==expected(7*4096+i));
     fail_sector=UINT64_MAX;CHECK(read_batch(&file,spans,1)==EOK && spans[0].completed==6*4096);
-    clear(&dev);fail_sector=home*(dev.lg_bsize/512);
     spans[0]=(struct file_read_span){dev.lg_bsize-17,out[0],4096,0,0};
     spans[1]=(struct file_read_span){16384,out[1],4096,0,0};
-    CHECK(read_batch(&file,spans,2)==EIO);
-    CHECK(spans[0].error==EIO && spans[0].completed==17);
-    CHECK(!spans[1].error && spans[1].completed==4096 && out[1][0]==5);
+    for(unsigned suppressed=0;suppressed<2;suppressed++){
+        clear(&dev);fail_sector=home*(dev.lg_bsize/512);
+        file_completion=&completion;file_completed=0;suppress_progress=suppressed;
+        CHECK(read_batch(&file,spans,2)==EIO);
+        CHECK(spans[0].error==EIO && spans[0].completed==17);
+        CHECK(!spans[1].error && spans[1].completed==4096 && out[1][0]==5);
+        /* With a block at least as large as the span, both fragments are
+         * partial synchronous reads: its error is publishable before DMA. */
+        unsigned immediate=spans[0].size<=dev.lg_bsize ? 1 : 0;
+        CHECK(file_completed==(suppressed?immediate:3));
+        file_completion=NULL;suppress_progress=0;
+    }
     fail_sector=UINT64_MAX;CHECK(read_batch(&file,spans,2)==EOK && spans[0].completed==4096);
     clear(&dev);spans[0]=(struct file_read_span){0,out[0],4096,0,0};
     spans[1]=(struct file_read_span){0,out[0]+1,17,0,0};

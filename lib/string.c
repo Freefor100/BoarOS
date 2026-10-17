@@ -3,7 +3,9 @@
 
 typedef uintptr_t memory_word __attribute__((__may_alias__));
 
-/* 只用于普通RAM；整字读写保持对齐，首尾不借读相邻对象。 */
+/* 普通 RAM 的前向逻辑在两个 ABI 入口内联，避免 memmove 再付一次调用和零长检查。
+ * RV/LA 的 memcpy/memmove 分别小于 1/2 KiB，入口对齐使循环不跨代码页；
+ * 填充位于入口之前，不参与复制。首尾不借读相邻对象。 */
 static inline __attribute__((always_inline)) void *copy_forward(
     void *destination, const void *source, size_t size)
 {
@@ -73,12 +75,12 @@ int memcmp(const void *left, const void *right, size_t size)
     return 0;
 }
 
-void *memcpy(void *destination, const void *source, size_t size)
+__attribute__((aligned(1024))) void *memcpy(void *destination, const void *source, size_t size)
 {
     return copy_forward(destination, source, size);
 }
 
-void *memmove(void *destination, const void *source, size_t size)
+__attribute__((aligned(2048))) void *memmove(void *destination, const void *source, size_t size)
 {
     unsigned char *output = destination;
     const unsigned char *input = source;

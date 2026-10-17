@@ -1406,11 +1406,10 @@ struct read_pages_progress {
     struct kernel_page_cache_entry **entries;
     uint32_t completed;
 };
-static enum kernel_page_cache_status read_page_result(struct kernel_page_cache_entry *entry,
-    const struct file_read_span *span)
+static inline enum kernel_page_cache_status read_page_result(const struct file_read_span *span,
+    size_t valid)
 {
     int error = span->error;
-    size_t valid = entry_valid_bytes(entry);
     if (span->completed > span->size) __builtin_trap();
     if (!error && span->completed < valid) error = -KERNEL_EIO;
     if (!error && valid < BOAROS_PAGE_SIZE)
@@ -1422,7 +1421,7 @@ static void complete_read_page(void *context, unsigned index, const struct file_
 {
     struct read_pages_progress *progress = context;
     struct kernel_page_cache_entry *entry = progress->entries[index];
-    enum kernel_page_cache_status status = read_page_result(entry, span);
+    enum kernel_page_cache_status status = read_page_result(span, entry_valid_bytes(entry));
     __atomic_store_n(&entry->load_status, (uint32_t)status | CACHE_LOAD_EARLY, __ATOMIC_RELEASE);
     progress->completed |= UINT32_C(1) << index;
     cache_wake(&entry->ready);
@@ -1445,6 +1444,7 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
         cache->record->statistics.misses += count;
         for (size_t i = 0; i < count; i++) {
             struct kernel_page_cache_entry *entry = entries[i];
+            size_t valid = entry_valid_bytes(entry);
             enum kernel_page_cache_status status;
             /* 同一调用栈已结束全部回调和DMA，不再取得提前发布者的可见性。 */
             if (progress.completed & (UINT32_C(1) << i))
@@ -1452,7 +1452,7 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
                     __atomic_load_n(&entry->load_status, __ATOMIC_RELAXED) & ~CACHE_LOAD_EARLY);
             else {
                 if (result && !identified) spans[i].error = result;
-                status = read_page_result(entry, &spans[i]);
+                status = read_page_result(&spans[i], valid);
             }
             __atomic_store_n(&entry->load_status, status, __ATOMIC_RELAXED);
             if (outputs) {
@@ -1460,7 +1460,7 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
                 if (!status) {
                     if (physical_page_acquire(cache->allocator, entry->physical_address)) __builtin_trap();
                     outputs[i]->physical_address = entry->physical_address;
-                    outputs[i]->valid_bytes = entry_valid_bytes(entry);
+                    outputs[i]->valid_bytes = valid;
                 }
             }
             failed += status != 0;

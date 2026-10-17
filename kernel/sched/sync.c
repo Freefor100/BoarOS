@@ -147,7 +147,8 @@ void kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *gu
 { (void)acquire(lock, guard, 0, 0); }
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 { (void)acquire(lock, guard, 1, 0); }
-void kernel_lock_release(struct kernel_lock_guard *guard)
+/* RV/LA 函数体不足 1 KiB；入口对齐避免频繁释放时跨代码页拆分短指令序列。 */
+__attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard *guard)
 {
     uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();

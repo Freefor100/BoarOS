@@ -124,6 +124,13 @@ static enum kernel_block_status read_bytes(void *context, uint64_t offset, void 
     if (disk->reads == disk->fail_at) return disk->result;
     memcpy(buffer, disk->bytes + offset, size); return KERNEL_BLOCK_STATUS_OK;
 }
+static enum kernel_block_status accept_read_ranges(void *context, struct block_read_span *spans,
+    size_t count, const struct block_read_completion *completion)
+{
+    (void)completion;struct batch_disk *disk=context;disk->batches++;
+    for(size_t i=0;i<count;i++){spans[i].status=KERNEL_BLOCK_STATUS_OK;spans[i].completed=spans[i].size;}
+    return KERNEL_BLOCK_STATUS_OK;
+}
 static void test_read_batch(void)
 {
     struct batch_disk disk = {0};
@@ -161,6 +168,35 @@ static void test_read_batch(void)
     disk.reads = 0;
     assert(kernel_block_read_batch(&device, spans, 1, NULL) == KERNEL_BLOCK_STATUS_OK && !disk.reads &&
         spans[0].status == KERNEL_BLOCK_STATUS_OK && !spans[0].completed);
+    unsigned char scatter[40];
+    const unsigned destinations[][4] = {{0,1,2,3},{3,2,1,0},{0,3,1,2},{3,0,2,1}};
+    struct block_read_span scattered[5];
+    disk.fail_at = 0;
+    for (unsigned order = 0; order < 4; order++) {
+        memset(scatter, 0xa5, sizeof(scatter)); disk.reads = 0;
+        for (unsigned i = 0; i < 4; i++)
+            scattered[i] = (struct block_read_span){.offset = i * 8,
+                .buffer = scatter + destinations[order][i] * 8, .size = 8};
+        scattered[4] = (struct block_read_span){.buffer = scatter};
+        assert(kernel_block_read_batch(&device, scattered, 5, NULL) == KERNEL_BLOCK_STATUS_OK && disk.reads == 4);
+        for (unsigned i = 0; i < 4; i++)
+            assert(scattered[i].completed == 8 && !memcmp(scattered[i].buffer, disk.bytes + i * 8, 8));
+        /* A target inside the envelope may occupy a gap or overlap an earlier
+         * target. Neither ascending nor descending order may hide overlap. */
+        for (unsigned i = 0; i < 4; i++) {
+            scattered[4] = (struct block_read_span){.buffer = (char *)scattered[i].buffer + 7, .size = 2};
+            disk.reads = 0;
+            assert(kernel_block_read_batch(&device, scattered, 5, NULL) == KERNEL_BLOCK_STATUS_INVALID && !disk.reads);
+        }
+    }
+    /* Preflight permits an inclusive end at UINTPTR_MAX; the backend only
+     * observes these ranges, so no host address is dereferenced here. */
+    device.read_batch=accept_read_ranges;disk.batches=0;
+    scattered[0]=(struct block_read_span){.buffer=(void *)(UINTPTR_MAX-7),.size=8};
+    scattered[1]=(struct block_read_span){.buffer=scatter,.size=8};
+    assert(kernel_block_read_batch(&device,scattered,2,NULL)==KERNEL_BLOCK_STATUS_OK && disk.batches==1);
+    scattered[2]=(struct block_read_span){.buffer=(void *)UINTPTR_MAX,.size=1};
+    assert(kernel_block_read_batch(&device,scattered,3,NULL)==KERNEL_BLOCK_STATUS_INVALID && disk.batches==1);
     puts("block read batch: complete preflight, disjoint destinations and per-span fallback status passed");
 }
 

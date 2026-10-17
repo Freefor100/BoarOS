@@ -3218,7 +3218,7 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
 /* The mount read lock stabilizes inode mappings and current cache versions. */
 /* One span can cover several mappings. Publish only its contiguous result
  * after every fragment already exposed to DMA has returned. */
-static void ext4_file_read_publish(struct file_read_workspace *progress, unsigned index, int notify)
+static void ext4_file_read_publish(struct file_read_workspace *progress, unsigned index)
 {
     if (progress->completion_emitted & (UINT32_C(1) << index)) return;
     struct file_read_span *span = &progress->completion_spans[index];
@@ -3232,7 +3232,7 @@ static void ext4_file_read_publish(struct file_read_workspace *progress, unsigne
         }
     }
     if (!span->error) span->error = progress->mapping_errors[index];
-    if (notify && (span->error || span->completed == progress->limits[index])) {
+    if (span->error || span->completed == progress->limits[index]) {
         progress->completion_emitted |= UINT32_C(1) << index;
         progress->completion->complete(progress->completion->context, index, span);
     }
@@ -3243,7 +3243,7 @@ static void ext4_file_read_completed(void *context, unsigned index, const struct
     unsigned part = progress->owners[index];
     progress->fragments[part].error = span->status;
     progress->completion_ready |= UINT32_C(1) << part;
-    ext4_file_read_publish(progress, progress->fragments[part].span, 1);
+    ext4_file_read_publish(progress, progress->fragments[part].span);
 }
 
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
@@ -3254,6 +3254,7 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
     uintptr_t descriptors = (uintptr_t)spans, workspace = (uintptr_t)work;
     if (work && count && (descriptors < workspace ? workspace - descriptors < count * sizeof(*spans) :
         descriptors - workspace < sizeof(*work))) return EINVAL;
+    uintptr_t first = UINTPTR_MAX, last = 0;
     for (unsigned i = 0; i < count; i++) {
         uintptr_t a = (uintptr_t)spans[i].buffer;
         size_t size = spans[i].size;
@@ -3264,11 +3265,19 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
             return spans[i].error = EINVAL;
         if (work && size && (a < workspace ? workspace - a < size : a - workspace < sizeof(*work)))
             return spans[i].error = EINVAL;
-        for (unsigned j = 0; j < i; j++) {
-            b = (uintptr_t)spans[j].buffer;
-            if (size && spans[j].size && (a < b ? b - a < size : a - b < spans[j].size))
-                return spans[i].error = EINVAL;
+        if (!size) continue;
+        uintptr_t end = a + size - 1;
+        /* Sorted SG targets lie outside the envelope. Check individual spans
+         * only when a target enters its gaps or overlaps an earlier target. */
+        if (a <= last && end >= first) {
+            for (unsigned j = 0; j < i; j++) {
+                b = (uintptr_t)spans[j].buffer;
+                if (spans[j].size && (a < b ? b - a < size : a - b < spans[j].size))
+                    return spans[i].error = EINVAL;
+            }
         }
+        if (a < first) first = a;
+        if (end > last) last = end;
     }
     for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
     if (!count) return EOK;
@@ -3411,16 +3420,19 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
             progress->completion_ready = parts == 32 ? UINT32_MAX : (UINT32_C(1) << parts) - 1;
             for (unsigned j = 0; j < pending; j++) progress->completion_ready &= ~(UINT32_C(1) << owners[j]);
             if (pending && progress->completion_ready)
-                for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i, 1);
+                for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i);
         }
         ext4_blockdev_read_batch(fs->bdev, reads, pending, progress ? &forward : NULL);
         for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].status;
-        if (progress) {
-            progress->completion_ready = parts == 32 ? UINT32_MAX : (UINT32_C(1) << parts) - 1;
-            for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i, 0);
-        }
-        for (unsigned j = 0; !progress && j < parts; j++) {
+        /* DMA is drained: fold remaining fragments once. Early callbacks have
+         * already consumed each span's prefix; do not replay its publisher. */
+        for (unsigned j = 0; j < parts; j++) {
             struct file_read_fragment *part = &fragments[j];
+            if (progress) {
+                unsigned *cursor = &progress->completion_cursor[part->span];
+                if (j < *cursor) continue;
+                *cursor = j + 1;
+            }
             struct file_read_span *span = &spans[part->span];
             if (!span->error) {
                 if (part->error) span->error = part->error;
@@ -3434,7 +3446,7 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
         }
         /* 本轮已排空但还要继续映射/读下一窗时，先交付已经完整的页。 */
         if (progress && more)
-            for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i, 1);
+            for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i);
         if (!more) break;
     }
 Put:
