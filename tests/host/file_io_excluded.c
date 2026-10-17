@@ -26,6 +26,9 @@ EXCLUDED(kernel_socket_send_timeout)
 #endif
 EXCLUDED(kernel_socket_stream_begin)
 EXCLUDED(kernel_socket_stream_commit)
+#ifndef TCP_IO_CASES
+EXCLUDED(kernel_socket_stream_commitv)
+#endif
 EXCLUDED(kernel_socket_stream_finish)
 #ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_stream_reserve)

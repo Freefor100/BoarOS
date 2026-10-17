@@ -28,7 +28,13 @@ struct kernel_socket_read_request {
     struct kernel_open_file_description **pin_owner;
 };
 
+struct kernel_socket_write_segment;
 struct kernel_socket_write_request {
+    struct kernel_socket_write_request *next;
+    const struct kernel_socket_write_segment *segments;
+    unsigned segment_count;
+    uint32_t flags;
+    int result;
     uint32_t reserved;
     uint8_t progressed;
     void *protocol_payload;
@@ -53,6 +59,9 @@ void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner);
 int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     uint32_t size, uint32_t flags);
+struct kernel_socket_write_segment { const void *data; uint32_t size; };
+int kernel_socket_stream_commitv(struct kernel_socket_write_request *request,
+    const struct kernel_socket_write_segment *segments, unsigned count, uint32_t flags);
 int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
     const void *buffer, uint32_t size, uint32_t flags);
 void kernel_socket_stream_cancel(struct kernel_socket_write_request *request);

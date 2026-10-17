@@ -56,10 +56,8 @@ struct kernel_files_record {
 };
 #define KERNEL_FILES_SCOPE(name, files) \
     KERNEL_RAW_SCOPE(name, &(files)->record->metadata_lock)
-void kernel_files_note(struct kernel_files *, size_t offset, uint64_t value);
-
 #define KERNEL_FILES_NOTE(files, field, value) \
-    kernel_files_note((files), offsetof(struct kernel_files_statistics, field), (value))
+    __atomic_fetch_add(&(files)->record->statistics.field, (uint64_t)(value), __ATOMIC_RELAXED)
 int kernel_files_fd_matches(struct kernel_files *, int64_t,
     const struct kernel_open_file_description *);
 

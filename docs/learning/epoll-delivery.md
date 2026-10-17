@@ -48,8 +48,9 @@ MOD 改变控制代次，旧 ONESHOT 不能解除新注册；新通知不被旧�
 wait 与嵌套纯查询请求沿 task 的单个 top 指针组成栈，正常返回逐个弹出；
 强制退出先归还所有扫描和 item/OFD 借用，再回收任务栈。
 
-目标查询使用目标本身的同步域；socket poll 自行取得可睡眠的协议 mutex，
-epoll 不持有跨嵌套图的通用协议 scope。ADD 在借用目标 OFD 时先查询稳定等待队列，
+目标查询使用目标本身的同步域；socket poll 在短 IRQ 保护内读取端点队列、状态和
+发送接纳额度，不访问 lwIP PCB 或取得协议 mutex。epoll 不持有跨嵌套图的通用
+协议 scope。ADD 在借用目标 OFD 时先查询稳定等待队列，
 绑定后再查询实际状态，覆盖订阅前已经结束的通知。
 pwait 订阅自己的任务队列后只复查 ready/scan 元数据，再 park/finish。
 poll 的 prepared token 阶段对 epoll 只使用非阻塞候选提示；它只决定是否先 finish
@@ -76,10 +77,11 @@ make test-files-riscv test-userland-riscv test-stack-usage
 边界，启用 ASan/UBSan。覆盖 fault 重试、通知重入、MOD、DEL、close pin、
 fd 复用、128 个打乱顺序的索引键、分配期间重复 ADD 和反向图插入、扫描中的第二等待者、
 复制期间通知、嵌套纯查询取消、纯查询/交付重叠、解绑后反向登记及无序候选的代次重试，检查分配与引用全部归还。
-fixture还检查目标查询处IRQ开启且可抢占，具体socket查询持有协议owner，
-用户复制和最终OFD/堆释放不持协议scope，prepared候选提示不调用目标query，
+fixture 还检查目标查询处 IRQ 开启且可抢占，并在目标查询边界注入可睡眠 owner；
+这是对锁外查询的边界模型，不是生产 socket poll 的保护方式。用户复制和最终
+OFD/堆释放不持协议 scope，prepared 候选提示不调用目标 query，
 park/finish保持IRQ关闭并在外层恢复原IRQ状态。
 原交付改动的真实 RV64 九组 LT/ET/ONESHOT × fault 位置在同一 ELF 的
 固定 Linux 与 BoarOS 两侧通过，并检查 ONESHOT MOD 重装；该次 QEMU 为 11.1.1。
-本轮索引、共享 DAG 刷新及可睡眠协议 scope 的直接验证是宿主边界模型，
+索引、共享 DAG 刷新及可睡眠目标查询的直接验证是宿主边界模型，
 未将历史客体验证或操作数变化描述为本轮客体并发、完整 ABI 或应用性能结果。

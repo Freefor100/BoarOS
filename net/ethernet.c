@@ -298,11 +298,14 @@ int kernel_network_stop(struct kernel_network **owner)
     if (!owner || !*owner) return 0;
     struct kernel_network *n = *owner;
     uintptr_t irq = arch_interrupt_save();
+    int first_stop = !n->stopping;
     n->stopping = 1;
     if (n->device) n->device->stopping = 1;
     (void)kernel_wait_queue_wake_all(progress(n));
     kernel_assert_can_block();
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
+    /* Close queued admission and finish pinned callers before joining the worker. */
+    if (first_stop) kernel_socket_network_hooks(0, 0, 0, 0);
     if (n->worker.task) kernel_thread_join(&n->worker);
     if (n->device && virtio_net_quiesce(n->device)) { arch_interrupt_restore(irq); return -KERNEL_EIO; }
     if (n->attached) {
@@ -317,7 +320,6 @@ int kernel_network_stop(struct kernel_network **owner)
         virtio_net_tx_release(n->device, release_owner, 1);
         if (n->device->loaned) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
     }
-    kernel_socket_network_hooks(0, 0, 0, 0);
     if (n->device) {
         print_text("BoarOS: network final rx="); print_u64(n->device->statistics.rx_packets);
         print_text(" tx="); print_u64(n->device->statistics.tx_packets);

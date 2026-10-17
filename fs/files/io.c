@@ -124,18 +124,17 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     if (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) return -KERNEL_EAGAIN;
     for (;;) {
         uintptr_t saved = arch_interrupt_save();
-        struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
         int ready = socket_operation_ready(socket, events), result = 0;
         if (ready) {
             if (events & KERNEL_POLLOUT) result = kernel_socket_unix_wait_error(socket);
-            kernel_socket_protocol_leave(&scope); arch_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return result;
         }
         /* 就绪优先；调用者持有绝对期限，重试与虚唤醒都不能续期。 */
         if (!timed) {
             enum kernel_time_status status = kernel_time_deadline_from_monotonic(target_ns, &deadline);
             if (status != KERNEL_TIME_STATUS_OK) {
-                kernel_socket_protocol_leave(&scope); arch_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return status == KERNEL_TIME_STATUS_DEADLINE_PASSED ? -KERNEL_EAGAIN : -KERNEL_EIO;
             }
             timed = 1;
@@ -149,8 +148,6 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
             ready = socket_operation_ready(socket, events);
             if (ready && (events & KERNEL_POLLOUT)) result = kernel_socket_unix_wait_error(socket);
         }
-        /* token登记后只借用同一owner；真实竞争发生在prepare之前。 */
-        kernel_socket_protocol_leave(&scope);
         if (status == KERNEL_SCHEDULER_STATUS_OK) {
             if (!ready) status = kernel_wait_park(&token, &reason);
             if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
@@ -1357,6 +1354,63 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
     return KERNEL_FILES_STATUS_OK;
 }
 
+/* The existing task scratch holds page references, not another payload copy. */
+struct tcp_user_batch {
+    struct kernel_mm_user_pin pins[4];
+    struct kernel_socket_write_segment segments[4];
+};
+_Static_assert(sizeof(struct tcp_user_batch) <= BOAROS_PAGE_SIZE, "TCP pin workspace");
+
+static int tcp_write_user_batch(struct kernel_mm *mm,
+    struct kernel_socket_write_request *request, struct kernel_task_io_buffer *workspace,
+    uint64_t address, uint32_t size, uint32_t flags, int *fault)
+{
+    if (!workspace->allocator && kernel_task_io_buffer_acquire(workspace, mm->allocator) != KERNEL_TASK_STATUS_OK)
+        return -KERNEL_ENOMEM;
+    struct tcp_user_batch *batch = workspace->data;
+    unsigned count = 0;
+    uint32_t prepared = 0;
+    int result = 0;
+    while (prepared < size) {
+        if (kernel_user_range_check(address + prepared, 1) != KERNEL_UACCESS_STATUS_OK) {
+            *fault = 1;
+            if (!prepared) result = -KERNEL_EFAULT;
+            break;
+        }
+        struct kernel_mm_user_pin *pin = &batch->pins[count];
+        *pin = (struct kernel_mm_user_pin){0};
+        enum kernel_uaccess_status access;
+        if (!count) access = kernel_uaccess_pin_user_page(mm, address, KERNEL_MM_READ, pin);
+        else {
+            /* A mapping editor may be draining our earlier pins. Never fault
+             * or wait for its gate with that debt: submit the resident prefix. */
+            COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
+            enum kernel_mm_status status = kernel_mm_pin_user_page(mm, address + prepared, KERNEL_MM_READ, pin);
+            if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS ||
+                status == KERNEL_MM_STATUS_CONFLICT || status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
+                status == KERNEL_MM_STATUS_BUS_FAULT || status == KERNEL_MM_STATUS_NO_MEMORY) break;
+            if (status != KERNEL_MM_STATUS_OK) __builtin_trap();
+            access = KERNEL_UACCESS_STATUS_OK;
+        }
+        if (access != KERNEL_UACCESS_STATUS_OK) {
+            if (access != KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
+            *fault = 1;
+            if (!prepared) result = -KERNEL_EFAULT;
+            break;
+        }
+        uint32_t offset = (uint32_t)((address + prepared) & BOAROS_PAGE_MASK);
+        uint32_t length = BOAROS_PAGE_SIZE - offset;
+        if (length > size - prepared) length = size - prepared;
+        batch->segments[count++] = (struct kernel_socket_write_segment){(const unsigned char *)pin->page + offset, length};
+        prepared += length;
+    }
+    /* All page preparation precedes protocol ownership. Only this bounded
+     * accepted batch pins user pages; EAGAIN returns them before socket wait. */
+    if (prepared) result = kernel_socket_stream_commitv(request, batch->segments, count, flags);
+    while (count) kernel_mm_unpin_user_page(&batch->pins[--count]);
+    return result;
+}
+
 static enum kernel_files_status tcp_write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1384,7 +1438,11 @@ static enum kernel_files_status tcp_write_request(
             chunk=count-total<BOAROS_PAGE_SIZE?(size_t)(count-total):BOAROS_PAGE_SIZE;
         }
         uint64_t address = 0;
-        if (direct && count) chunk = kernel_uaccess_iov_span(&cursor, chunk, &address);
+        if (direct && count) {
+            address = iov[0].base + cursor.offset;
+            size_t limit = 4 * BOAROS_PAGE_SIZE - (address & BOAROS_PAGE_MASK);
+            chunk = count - total < limit ? (size_t)(count - total) : limit;
+        }
         int result = kernel_socket_stream_reserve(&request, (uint32_t)chunk, flags);
         size_t copied_now = 0;
         if (result >= 0) {
@@ -1392,21 +1450,8 @@ static enum kernel_files_status tcp_write_request(
             if (!result || (size_t)result > chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
             chunk = (size_t)result;
             if (direct) {
-                struct kernel_mm_user_pin pin = {0};
-                enum kernel_uaccess_status access = kernel_uaccess_pin_user_page(mm,
-                    address, KERNEL_MM_READ, &pin);
-                if (access != KERNEL_UACCESS_STATUS_OK) {
-                    if (access == KERNEL_UACCESS_STATUS_FAULT)
-                        *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
-                    else status = KERNEL_FILES_STATUS_STATE;
-                    break;
-                }
-                /* COPY在协议接纳时持有ACK前版本。未接纳的用户页不跨等待保留，
-                 * 让munmap/mprotect可以排空pin，重试重新读取尚未接纳的输入。 */
-                result = kernel_socket_stream_commit(&request,
-                    (const unsigned char *)pin.page + (address & BOAROS_PAGE_MASK),
-                    (uint32_t)chunk, flags | ((total + chunk < count) ? KERNEL_SOCKET_IO_MORE : 0));
-                kernel_mm_unpin_user_page(&pin);
+                result = tcp_write_user_batch(mm, &request, &buffer, address, (uint32_t)chunk,
+                    flags | ((total + chunk < count) ? KERNEL_SOCKET_IO_MORE : 0), &fault);
             } else {
                 if (staged == consumed) {
                     if (!buffer.allocator) {

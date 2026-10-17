@@ -3,6 +3,7 @@
 #include <kernel/time.h>
 #include <kernel/random.h>
 #include <kernel/socket.h>
+#include <kernel/signal.h>
 #include "lwip/init.h"
 #include "lwip/mem.h"
 #include "lwip/tcp.h"
@@ -17,12 +18,29 @@ static _Thread_local unsigned tcp_wait_role,tcp_finishing_socket;
 static struct kernel_wait_queue *tcp_wait_queue;
 static uint64_t tcp_wait_generation;
 static unsigned tcp_wait_active,tcp_wait_registered,tcp_wait_contender_acquired;
-static unsigned tcp_wait_park_call,tcp_wait_finish_count,tcp_wait_relocked,tcp_wait_owned;
-static unsigned tcp_wait_contender_parked;
+static unsigned tcp_wait_park_call,tcp_wait_finish_count,tcp_wait_relocked;
+static unsigned tcp_wait_token_finished,tcp_wait_caller_done,tcp_wait_reserved_under_core,tcp_wait_publication_done;
+static unsigned tcp_wait_contender_parked,tcp_wait_caller_parked;
 static struct kernel_socket *tcp_wait_client;
 static void **tcp_wait_allocations;
 static size_t tcp_wait_allocation_count;
 static int tcp_wait_writing;
+static _Thread_local unsigned tcp_write_observing,tcp_write_editor;
+static unsigned tcp_write_mode,tcp_write_edit_started,tcp_write_edit_closed,tcp_write_edit_done;
+static unsigned tcp_write_worker_ready,tcp_write_queued_ready,tcp_write_worker_published,tcp_write_pins_returned;
+static unsigned tcp_write_notifications,tcp_write_signal_count;
+static unsigned tcp_write_park_baseline;
+static uint64_t tcp_write_source_page;
+static struct kernel_task *tcp_write_caller_task;
+static struct kernel_socket *tcp_write_client_socket;
+static struct kernel_socket_write_request *tcp_write_queued_request;
+static _Thread_local struct kernel_mm_user_pin *tcp_write_pins[4],*tcp_write_returning;
+static _Thread_local unsigned tcp_write_held,tcp_write_pin_count,tcp_write_unpin_count;
+static _Thread_local unsigned tcp_write_misses,tcp_write_denied,tcp_write_conflicts,tcp_write_commits;
+static _Thread_local uint32_t tcp_write_commit_bytes[4];
+static _Thread_local unsigned tcp_write_commit_segments[4];
+static void tcp_write_pin_observed(uint32_t,enum kernel_mm_status,struct kernel_mm_user_pin *);
+static int tcp_protocol_held(void);
 static _Thread_local unsigned unix_deadline_active;
 static _Thread_local uint64_t unix_deadline_now;
 static unsigned unix_deadline_prepared,unix_deadline_parked,unix_deadline_steal,unix_deadline_stolen;
@@ -71,7 +89,15 @@ int __wrap_kernel_socket_reserve_read(struct kernel_socket *socket,struct kernel
 }
 int __real_kernel_socket_stream_reserve(struct kernel_socket_write_request *,uint32_t,uint32_t);
 int __wrap_kernel_socket_stream_reserve(struct kernel_socket_write_request *request,uint32_t size,uint32_t flags)
-{ tcp_nonblock_attempt();return __real_kernel_socket_stream_reserve(request,size,flags); }
+{
+    tcp_nonblock_attempt();
+    int result=__real_kernel_socket_stream_reserve(request,size,flags);
+    if(tcp_wait_role==1 && tcp_wait_active && tcp_wait_finish_count && result>0) {
+        assert(!tcp_protocol_held() && __atomic_load_n(&tcp_wait_contender_acquired,__ATOMIC_ACQUIRE));
+        __atomic_store_n(&tcp_wait_reserved_under_core,1,__ATOMIC_RELEASE);
+    }
+    return result;
+}
 int __real_kernel_socket_write_unix(struct kernel_open_file_description **,struct kernel_mm *,struct kernel_uaccess_iov_cursor *,uint64_t,uint32_t,int *);
 int __wrap_kernel_socket_write_unix(struct kernel_open_file_description **owner,struct kernel_mm *space,
     struct kernel_uaccess_iov_cursor *cursor,uint64_t count,uint32_t flags,int *fault)
@@ -91,6 +117,16 @@ static void tcp_wait_preparing(struct kernel_wait_queue *queue)
 }
 static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
 {
+    if(tcp_write_editor) {
+        assert(!kernel_io_context_current()->user_pins && !deadline);
+        __atomic_store_n(&tcp_write_edit_closed,1,__ATOMIC_RELEASE);
+    }
+    if(tcp_write_observing && tcp_write_mode>=4 && tcp_write_queued_request &&
+        tcp_write_queued_request->segments && queue==kernel_socket_wait_queue(tcp_write_client_socket)) {
+        assert(!deadline && !kernel_task_current()->wait.interruptible && tcp_write_held==2 &&
+            !tcp_protocol_held() && tcp_write_queued_request->task==kernel_task_current());
+        __atomic_fetch_add(&tcp_write_queued_ready,1,__ATOMIC_RELEASE);
+    }
     if(unix_deadline_active && queue==unix_deadline_queue) {
         if(unix_deadline_prepared==2) {
             fprintf(stderr,"FAIL read SO_RCVTIMEO renewed after two real wake-and-steal interleavings: deadlines=%llu,%llu,%llu now=%llu\n",
@@ -103,12 +139,10 @@ static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
     if(tcp_wait_role!=1 || !tcp_wait_active || queue!=tcp_wait_queue) return;
     assert(!tcp_wait_registered && kernel_task_current()->wait.phase==KERNEL_WAIT_PREPARED);
     tcp_wait_generation=kernel_task_current()->wait.generation;
-    tcp_wait_owned=tcp_protocol_held();
+    assert(!tcp_protocol_held() && !kernel_cpu_current()->raw_locks);
     __atomic_store_n(&tcp_wait_registered,1,__ATOMIC_RELEASE);
-    /* 真正竞争同一protocol mutex；新路径仍持owner，所以对手必须登记并park。
-     * 旧路径没有owner，对手取得锁后，重查会在已有socket token时再登记mutex。 */
-    while(!__atomic_load_n(&tcp_wait_contender_acquired,__ATOMIC_ACQUIRE) &&
-        mm_test_parked(2)==tcp_wait_contender_parked) sched_yield();
+    /* socket登记不占core；对手在token存活时取得core并持有到端点工作完成。 */
+    while(!__atomic_load_n(&tcp_wait_contender_acquired,__ATOMIC_ACQUIRE)) sched_yield();
 }
 static void tcp_wait_parking(const struct kernel_wait_token *token)
 {
@@ -122,21 +156,30 @@ static void tcp_wait_parking(const struct kernel_wait_token *token)
 }
 static void tcp_wait_finishing(const struct kernel_wait_token *token)
 {
+    if(tcp_write_observing && tcp_write_mode>=4 && tcp_write_queued_ready>1) {
+        assert(tcp_write_held==2 && !tcp_protocol_held());
+        while(!__atomic_load_n(&tcp_write_worker_published,__ATOMIC_ACQUIRE)) sched_yield();
+    }
     tcp_finishing_socket=tcp_wait_role==1 && tcp_wait_active &&
         token->generation==tcp_wait_generation;
-    if(tcp_finishing_socket) assert(!tcp_protocol_held());
+    if(tcp_finishing_socket) {
+        assert(!tcp_protocol_held());
+        /* 模拟同CPU任务只在本轮协议发布结束后恢复；不让宿主pthread同时执行IRQ短区。 */
+        while(!__atomic_load_n(&tcp_wait_publication_done,__ATOMIC_ACQUIRE)) sched_yield();
+    }
 }
 static void tcp_wait_finished(void)
 {
     if(!tcp_finishing_socket) return;
     assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED && !tcp_protocol_held());
     tcp_wait_finish_count++;tcp_finishing_socket=0;
+    __atomic_store_n(&tcp_wait_token_finished,1,__ATOMIC_RELEASE);
 }
 static void tcp_wait_locking(struct kernel_rwlock *lock)
 {
-    if(tcp_wait_role!=1 || !tcp_wait_active || lock->rank!=25 || !tcp_wait_finish_count) return;
-    assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
-    tcp_wait_relocked++;
+    if(tcp_wait_role!=1 || !tcp_wait_active || lock->rank!=25) return;
+    if(tcp_wait_registered) assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    if(tcp_wait_finish_count) tcp_wait_relocked++;
 }
 static void *tcp_wait_caller(void *argument)
 {
@@ -148,6 +191,7 @@ static void *tcp_wait_caller(void *argument)
         kernel_files_read(handle,&mm,1,0x201000,8,&tcp_wait_bytes);
     assert(tcp_wait_writing?tcp_timeout_sends>0:tcp_timeout_receives>0);tcp_timeout_observe=0;
     assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    __atomic_store_n(&tcp_wait_caller_done,1,__ATOMIC_RELEASE);
     tcp_wait_role=0;mm_test_finish();return NULL;
 }
 static void *tcp_wait_contender(void *unused)
@@ -155,11 +199,20 @@ static void *tcp_wait_contender(void *unused)
     (void)unused;mm_test_attach(2);mm_test_activate_task();mm_test_context=context;tcp_wait_role=2;
     while(!__atomic_load_n(&tcp_wait_registered,__ATOMIC_ACQUIRE)) sched_yield();
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    assert(mm_test_parked(2)==tcp_wait_contender_parked);
     __atomic_store_n(&tcp_wait_contender_acquired,1,__ATOMIC_RELEASE);
-    while(!__atomic_load_n(&tcp_wait_park_call,__ATOMIC_ACQUIRE)) sched_yield();
+    while(!__atomic_load_n(&tcp_wait_park_call,__ATOMIC_ACQUIRE) ||
+        mm_test_parked(1)==tcp_wait_caller_parked) sched_yield();
     if(tcp_wait_writing) {
         for(size_t i=0;i<tcp_wait_allocation_count;i++) mem_free(tcp_wait_allocations[i]);
     } else assert(kernel_socket_write_buffer(tcp_wait_client,"wakeonce",8,0)==8);
+    /* 在同一个真实core owner内推进loopback或池容量，发出实际socket通知。 */
+    for(unsigned i=0;i<8;i++)
+        (void)kernel_socket_service_owned(&scope,(struct kernel_socket_service_budget){8,8,1});
+    __atomic_store_n(&tcp_wait_publication_done,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&tcp_wait_token_finished,__ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(tcp_wait_writing?&tcp_wait_reserved_under_core:&tcp_wait_caller_done,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(tcp_protocol_held() && arch_interrupt_is_enabled());
     kernel_socket_protocol_leave(&scope);
     (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     tcp_wait_role=0;mm_test_finish();return NULL;
@@ -193,15 +246,21 @@ static void tcp_wait_owner_case(struct kernel_heap *heap,int writing)
     tcp_wait_queue=kernel_socket_wait_queue(writing?client:server);tcp_wait_client=client;
     tcp_wait_allocations=held;tcp_wait_allocation_count=count;tcp_wait_writing=writing;
     tcp_wait_generation=0;tcp_wait_registered=tcp_wait_contender_acquired=tcp_wait_park_call=0;
-    tcp_wait_finish_count=tcp_wait_relocked=tcp_wait_owned=0;tcp_wait_active=1;
-    tcp_wait_contender_parked=mm_test_parked(2);
+    tcp_wait_finish_count=tcp_wait_relocked=0;
+    tcp_wait_token_finished=tcp_wait_caller_done=tcp_wait_reserved_under_core=tcp_wait_publication_done=0;tcp_wait_active=1;
+    tcp_wait_contender_parked=mm_test_parked(2);tcp_wait_caller_parked=mm_test_parked(1);
     pthread_t caller,contender;
     assert(!pthread_create(&contender,0,tcp_wait_contender,NULL));
     assert(!pthread_create(&caller,0,tcp_wait_caller,&handle));
     assert(!pthread_join(caller,0) && !pthread_join(contender,0));
     tcp_wait_active=0;
-    assert(!tcp_wait_status && tcp_wait_bytes==8 && tcp_wait_owned && tcp_wait_park_call);
-    assert(tcp_wait_finish_count==1 && tcp_wait_relocked && mm_test_parked(2)>tcp_wait_contender_parked);
+    assert(!tcp_wait_status && tcp_wait_bytes==8 && tcp_wait_park_call && tcp_wait_caller_done);
+    if(tcp_wait_finish_count!=1 || !tcp_wait_token_finished || mm_test_parked(1)<=tcp_wait_caller_parked)
+        fprintf(stderr,"TCP wait counters: writing=%d finishes=%u token=%u caller parks=%u/%u contender=%u/%u\n",writing,
+            tcp_wait_finish_count,tcp_wait_token_finished,mm_test_parked(1),tcp_wait_caller_parked,
+            mm_test_parked(2),tcp_wait_contender_parked);
+    assert(tcp_wait_finish_count==1 && tcp_wait_token_finished && mm_test_parked(1)>tcp_wait_caller_parked);
+    assert(writing?(tcp_wait_reserved_under_core && tcp_wait_relocked):!tcp_wait_relocked);
     int64_t result;
     if(writing) assert(!kernel_files_read(&handle,&mm,1,0x201000,8,&result) && result==8);
     char actual[8];assert(!kernel_copy_from_user(&mm,actual,0x201000,8,&copied) && copied==8);
@@ -214,7 +273,7 @@ static void tcp_wait_owner_case(struct kernel_heap *heap,int writing)
     assert(!kernel_files_release(&handle));kernel_socket_destroy(listener);
     assert(!tcp_active_pcbs && !tcp_tw_pcbs);
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
-    printf("PASS TCP %s wait: actual protocol mutex contender parks, socket token finishes before reacquire, bytes and owners returned\n",writing?"write":"read");
+    printf("PASS TCP %s wait: socket token without core lock, endpoint progresses under contending core owner, notification and final owners\n",writing?"write":"read");
 }
 
 static _Thread_local unsigned tcp_batch_active,tcp_batch_copying,tcp_batch_pins,tcp_batch_unpins,tcp_batch_finishes;
@@ -225,9 +284,21 @@ static struct kernel_socket *tcp_batch_client;
 static struct kernel_files *tcp_batch_files;
 static int64_t tcp_batch_other_result;
 static int tcp_batch_unpinning(struct kernel_mm_user_pin *pin)
-{ return tcp_batch_copying && pin==tcp_batch_pin; }
+{
+    if(tcp_write_observing && tcp_write_held && pin==tcp_write_pins[tcp_write_held-1]) {
+        assert(!tcp_write_returning && pin->registration==pin);
+        tcp_write_returning=pin;return 1;
+    }
+    return tcp_batch_copying && pin==tcp_batch_pin;
+}
 static void tcp_batch_unpinned(struct kernel_mm_user_pin *pin)
 {
+    if(tcp_write_returning) {
+        assert(pin==tcp_write_returning && !pin->registration && tcp_write_held);
+        tcp_write_pins[--tcp_write_held]=NULL;tcp_write_unpin_count++;tcp_write_returning=NULL;
+        if(!tcp_write_held) __atomic_store_n(&tcp_write_pins_returned,1,__ATOMIC_RELEASE);
+        return;
+    }
     assert(!pin->registration && !kernel_io_context_current()->user_pins);
     tcp_batch_unpins++;tcp_batch_pin=NULL;
 }
@@ -236,6 +307,7 @@ enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *spa
     uint32_t access,struct kernel_mm_user_pin *pin)
 {
     enum kernel_mm_status status=__real_kernel_mm_pin_user_page(space,address,access,pin);
+    if(tcp_write_observing) tcp_write_pin_observed(access,status,pin);
     if(tcp_batch_copying && status==KERNEL_MM_STATUS_OK) {
         assert(access==KERNEL_MM_WRITE && !tcp_protocol_held() && !tcp_batch_pin);
         assert(pin->registration==pin && pin->owner==kernel_io_context_current() && pin->owner->user_pins==pin);
@@ -264,7 +336,7 @@ uint32_t __real_kernel_socket_finish_read(struct kernel_socket_read_request *,in
 uint32_t __wrap_kernel_socket_finish_read(struct kernel_socket_read_request *request,int fault)
 {
     if(tcp_batch_active) {
-        /* 真正MM pin已归还，才允许finish进入protocol mutex与回收packet。 */
+        /* 真正MM pin已归还，端点finish才能交还借用并退休packet。 */
         assert(!tcp_batch_copying && !tcp_batch_pin && !kernel_io_context_current()->user_pins);
         assert(tcp_batch_pins==tcp_batch_unpins && !tcp_protocol_held());tcp_batch_finishes++;
     }
@@ -517,9 +589,12 @@ static void *tcp_user_writer(void *argument)
     struct kernel_files *handle=argument;
     mm_test_attach(1);mm_test_activate_task();kernel_cpu_current()->logical_id=0;mm_test_context=context;
     tcp_writer_status=kernel_files_write(handle,&mm,0,0x200000,8,&tcp_writer_bytes);
+    assert(!kernel_task_current()->io_buffer && kernel_task_current()->io_scratch_data &&
+        !kernel_io_context_current()->user_pins);
     tcp_writer_available=physical_page_available(mm.allocator);
     mm_test_finish();return 0;
 }
+static void tcp_write_batch_case(struct kernel_heap *heap);
 static void tcp_usercopy_case(struct kernel_heap *heap)
 {
     kernel_socket_network_initialize();
@@ -569,7 +644,7 @@ static void tcp_usercopy_case(struct kernel_heap *heap)
     assert(!memcmp(actual,"newvalue",8));
     assert(!kernel_files_read(&handle,&mm,1,0x201000,1,&result) && result==-KERNEL_EAGAIN);
     assert(!kernel_mm_mprotect(&mm,0x200000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
-    assert(tcp_writer_available==before && physical_page_available(mm.allocator)==before); /* 返回前也没有scratch。 */
+    assert(tcp_writer_available+1==before && physical_page_available(mm.allocator)==before);
     uint64_t tail=0x200000+4U*BOAROS_PAGE_SIZE-4U;
     assert(!kernel_copy_to_user(&mm,tail,"tail",4,&copied) && copied==4);
     assert(!kernel_files_write(&handle,&mm,0,tail,8,&result) && result==4);
@@ -585,5 +660,193 @@ static void tcp_usercopy_case(struct kernel_heap *heap)
     assert(!kernel_files_release(&handle));kernel_socket_destroy(listener);
     assert(!tcp_active_pcbs && !tcp_tw_pcbs);
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
-    puts("PASS TCP direct user pin: ERR_MEM wait releases pin, remapped bytes accepted once, fault prefix, no scratch and final owners returned");
+    puts("PASS TCP direct user pin: ERR_MEM wait releases pin, remapped bytes accepted once, fault prefix, one retained descriptor page and final owners returned");
+    tcp_write_batch_case(heap);
+}
+
+/* Observe real pins and the real protocol COPY; no payload or result is supplied by the fixture. */
+static void tcp_write_pin_observed(uint32_t access,enum kernel_mm_status status,struct kernel_mm_user_pin *pin)
+{
+    assert(access==KERNEL_MM_READ);
+    if(status!=KERNEL_MM_STATUS_OK) {
+        if(tcp_write_held) {
+            if(status==KERNEL_MM_STATUS_NOT_MAPPED) tcp_write_misses++;
+            else if(status==KERNEL_MM_STATUS_ACCESS) tcp_write_denied++;
+            else if(status==KERNEL_MM_STATUS_CONFLICT) tcp_write_conflicts++;
+            else assert(!"unexpected resident pin failure");
+        }
+        return;
+    }
+    assert(!tcp_protocol_held() && tcp_write_held<4 && pin->registration==pin &&
+        pin->owner==kernel_io_context_current());
+    tcp_write_pins[tcp_write_held++]=pin;tcp_write_pin_count++;
+    if(tcp_write_mode==3 && tcp_write_pin_count==1) {
+        __atomic_store_n(&tcp_write_edit_started,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&tcp_write_edit_closed,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+int __real_kernel_socket_stream_commitv(struct kernel_socket_write_request *,
+    const struct kernel_socket_write_segment *,unsigned,uint32_t);
+int __wrap_kernel_socket_stream_commitv(struct kernel_socket_write_request *request,
+    const struct kernel_socket_write_segment *segments,unsigned count,uint32_t flags)
+{
+    if(!tcp_write_observing) return __real_kernel_socket_stream_commitv(request,segments,count,flags);
+    assert(!tcp_protocol_held() && count==tcp_write_held && count && tcp_write_commits<4);
+    uint32_t bytes=0;
+    for(unsigned i=0;i<count;i++) {
+        const unsigned char *page=tcp_write_pins[i]->page,*data=segments[i].data;
+        assert(data>=page && data<page+BOAROS_PAGE_SIZE && segments[i].size &&
+            segments[i].size<=(uint32_t)(page+BOAROS_PAGE_SIZE-data));
+        bytes+=segments[i].size;
+    }
+    tcp_write_commit_bytes[tcp_write_commits]=bytes;
+    tcp_write_commit_segments[tcp_write_commits++]=count;
+    tcp_write_queued_request=request;
+    int result=__real_kernel_socket_stream_commitv(request,segments,count,flags);
+    assert(!request->segments && !request->next && request->pin && request->task==kernel_task_current());
+    /* COPY and result publication finish before the caller returns any physical pin. */
+    for(unsigned i=0;i<count;i++) assert(tcp_write_pins[i]->registration==tcp_write_pins[i]);
+    return result;
+}
+static void *tcp_write_revoke(void *unused)
+{
+    (void)unused;mm_test_attach(2);mm_test_activate_task();mm_test_bind(&mm);mm_test_context=context;
+    kernel_cpu_current()->logical_id=1;tcp_write_editor=1;
+    while(!__atomic_load_n(&tcp_write_edit_started,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_mm_mprotect(&mm,tcp_write_source_page+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,0));
+    tcp_write_editor=0;__atomic_store_n(&tcp_write_edit_done,1,__ATOMIC_RELEASE);
+    mm_test_finish();return NULL;
+}
+static void tcp_write_work_notification(void *unused)
+{ (void)unused;__atomic_fetch_add(&tcp_write_notifications,1,__ATOMIC_RELEASE); }
+/* SIGPIPE is observed at the signal boundary so this fixture can inspect its target.
+ * Every unrelated signal remains an unexpected consumer, rather than a success stub. */
+enum kernel_signal_status __wrap_kernel_signal_send_task(struct kernel_task *task,uint32_t signal,kernel_pid_t sender_tid)
+{
+    assert(tcp_write_mode==5 && signal==13 && !sender_tid && task==tcp_write_caller_task &&
+        task!=kernel_task_current() && tcp_write_queued_request &&
+        tcp_write_queued_request->task==task && tcp_write_queued_request->segments);
+    tcp_write_signal_count++;
+    return KERNEL_SIGNAL_STATUS_OK;
+}
+static void *tcp_write_protocol_worker(void *unused)
+{
+    (void)unused;mm_test_attach(2);mm_test_activate_task();mm_test_context=context;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    __atomic_store_n(&tcp_write_worker_ready,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&tcp_write_queued_ready,__ATOMIC_ACQUIRE) ||
+        mm_test_parked(0)==tcp_write_park_baseline) sched_yield();
+    struct kernel_socket_write_request *request=tcp_write_queued_request;
+    assert(request && request->segments && request->segment_count==2 && request->reserved==96 &&
+        request->task==tcp_write_caller_task && request->pin && request->pin->references==3);
+    assert(tcp_write_notifications && !kernel_io_context_current()->user_pins);
+    /* 同一socket的其他通知不代表COPY完成；唤醒后必须持原pin重新等待。 */
+    struct kernel_wait_token token;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      token=(struct kernel_wait_token){tcp_write_caller_task,tcp_write_caller_task->wait.generation}; }
+    assert(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));
+    while(__atomic_load_n(&tcp_write_queued_ready,__ATOMIC_ACQUIRE)<2 ||
+        mm_test_parked(0)<tcp_write_park_baseline+2) sched_yield();
+    assert(request->segments && request->pin->references==3 &&
+        !__atomic_load_n(&tcp_write_pins_returned,__ATOMIC_ACQUIRE));
+    if(tcp_write_mode==6) kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    else {
+        if(tcp_write_mode==5) assert(!kernel_socket_shutdown(tcp_write_client_socket,1));
+        for(unsigned i=0;i<8;i++)
+            (void)kernel_socket_service_owned(&scope,(struct kernel_socket_service_budget){8,8,1});
+    }
+    assert(!request->segments && !request->next && !request->reserved &&
+        request->result==(tcp_write_mode==5?-KERNEL_EPIPE:tcp_write_mode==6?-KERNEL_EIO:96));
+    __atomic_store_n(&tcp_write_worker_published,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&tcp_write_pins_returned,__ATOMIC_ACQUIRE)) sched_yield();
+    kernel_socket_protocol_leave(&scope);
+    mm_test_finish();return NULL;
+}
+static void tcp_write_batch_case(struct kernel_heap *heap)
+{
+    kernel_socket_network_hooks(NULL,tcp_write_work_notification,NULL,NULL);
+    for(unsigned mode=0;mode<7;mode++) {
+        struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+        struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=(uint16_t)(24050+mode),.bytes={127,0,0,1}};
+        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener) &&
+            !kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4) &&
+            !kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
+        int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
+        for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+        assert(!kernel_socket_accept(listener,&server) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+        struct kernel_files handle={0};struct kernel_open_file_description *out=NULL,*in=NULL,*owner=NULL;
+        assert(!kernel_files_create(&handle,heap) && !kernel_open_file_create_socket(heap,client,2,&out) &&
+            !kernel_open_file_create_socket(heap,server,2|KERNEL_FILES_O_NONBLOCK,&in) &&
+            !kernel_files_install_new_owned_at(&handle,0,0,&out) && !kernel_files_install_new_owned_at(&handle,1,0,&in));
+        int64_t result;assert(!kernel_files_pin(&handle,0,&owner,&result) && !result && owner->references==2);
+        tcp_write_source_page=0x800000;uint64_t mapped;
+        assert(!kernel_mm_mmap_anonymous(&mm,tcp_write_source_page,2U*BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&mapped));
+        uint64_t source=tcp_write_source_page+BOAROS_PAGE_SIZE-31;
+        unsigned char expected[96],actual[96]={0};
+        for(unsigned i=0;i<sizeof(expected);i++) expected[i]=(unsigned char)(17U*i+mode+1U);
+        size_t copied;
+        assert(!kernel_copy_to_user(&mm,source,expected,31,&copied) && copied==31);
+        if(mode==1) memset(expected+31,0,65);
+        else assert(!kernel_copy_to_user(&mm,source+31,expected+31,65,&copied) && copied==65);
+        if(mode==2) assert(!kernel_mm_mprotect(&mm,tcp_write_source_page+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,0));
+        assert(!kernel_copy_to_user(&mm,0x200080,actual,sizeof(actual),&copied) && copied==sizeof(actual));
+        tcp_write_mode=mode;tcp_write_held=tcp_write_pin_count=tcp_write_unpin_count=0;
+        tcp_write_misses=tcp_write_denied=tcp_write_conflicts=tcp_write_commits=0;
+        tcp_write_edit_started=tcp_write_edit_closed=tcp_write_edit_done=0;
+        tcp_write_worker_ready=tcp_write_queued_ready=tcp_write_worker_published=tcp_write_pins_returned=0;
+        tcp_write_notifications=tcp_write_signal_count=0;tcp_write_queued_request=NULL;
+        tcp_write_caller_task=kernel_task_current();tcp_write_client_socket=client;
+        struct kernel_socket_statistics before_write,after_write;
+        kernel_socket_get_statistics(&before_write);
+        pthread_t other;
+        if(mode==3) assert(!pthread_create(&other,NULL,tcp_write_revoke,NULL));
+        if(mode>=4) {
+            tcp_write_park_baseline=mm_test_parked(0);
+            assert(!pthread_create(&other,NULL,tcp_write_protocol_worker,NULL));
+            while(!__atomic_load_n(&tcp_write_worker_ready,__ATOMIC_ACQUIRE)) sched_yield();
+        }
+        tcp_write_observing=1;
+        assert(!kernel_files_write(&handle,&mm,0,source,sizeof(expected),&result));
+        tcp_write_observing=0;
+        if(mode>=3) assert(!pthread_join(other,NULL));
+        kernel_socket_get_statistics(&after_write);
+        uint32_t accepted=mode==2 || mode==3?31:96;
+        assert(result==(mode==5?-KERNEL_EPIPE:mode==6?-KERNEL_EIO:(int64_t)accepted) && !tcp_write_held &&
+            tcp_write_pin_count==tcp_write_unpin_count && !kernel_io_context_current()->user_pins &&
+            !kernel_task_current()->socket_write_request && !kernel_task_current()->io_buffer && owner->references==2);
+        if(mode==0 || mode>=4) assert(tcp_write_commits==1 && tcp_write_commit_segments[0]==2 && tcp_write_commit_bytes[0]==96);
+        if(mode==1) assert(tcp_write_misses==1 && tcp_write_commits==2 && tcp_write_commit_segments[0]==1 &&
+            tcp_write_commit_bytes[0]==31 && tcp_write_commit_bytes[1]==65);
+        if(mode==2) assert(tcp_write_denied+tcp_write_misses==1 && tcp_write_commits==1 && tcp_write_commit_bytes[0]==31);
+        if(mode==3) assert(tcp_write_conflicts==1 && tcp_write_edit_done && tcp_write_commits==1 && tcp_write_commit_bytes[0]==31);
+        if(mode==5) assert(tcp_write_signal_count==1);
+        if(mode==6) assert(!tcp_write_signal_count && after_write.tcp_written_bytes==before_write.tcp_written_bytes);
+        if(mode<5) {
+            assert(!kernel_files_read(&handle,&mm,1,0x200080,accepted,&result) && result==accepted);
+            assert(!kernel_copy_from_user(&mm,actual,0x200080,accepted,&copied) && copied==accepted && !memcmp(actual,expected,accepted));
+            assert(!kernel_files_read(&handle,&mm,1,0x200080,1,&result) && result==-KERNEL_EAGAIN);
+        }
+        uint64_t scratch=kernel_task_current()->io_scratch_physical_address;
+        assert(scratch && kernel_task_current()->io_scratch_data);
+        if(mode==0) {
+            assert(!kernel_files_write(&handle,&mm,0,source,sizeof(expected),&result) && result==sizeof(expected) &&
+                kernel_task_current()->io_scratch_physical_address==scratch && !kernel_task_current()->io_buffer);
+            assert(!kernel_files_read(&handle,&mm,1,0x200080,sizeof(expected),&result) && result==sizeof(expected));
+            assert(!kernel_copy_from_user(&mm,actual,0x200080,sizeof(actual),&copied) &&
+                copied==sizeof(actual) && !memcmp(actual,expected,sizeof(actual)));
+        }
+        struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);
+        assert(!state.pins && !state.write_pins && !state.pending_retirement);
+        struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+        for(struct tcp_pcb *pcb=tcp_active_pcbs,*next;pcb;pcb=next) {
+            next=pcb->next;if(pcb->callback_arg==client || pcb->callback_arg==server) tcp_abort(pcb);
+        }
+        kernel_socket_protocol_leave(&scope);
+        assert(!kernel_open_file_release(&owner) && !kernel_files_release(&handle));kernel_socket_destroy(listener);
+        assert(!tcp_active_pcbs && !tcp_tw_pcbs && !kernel_mm_munmap(&mm,tcp_write_source_page,2U*BOAROS_PAGE_SIZE));
+        static const char *const names[]={"resident cross-page commit", "nonresident second page", "unreadable second page", "mprotect closes pin admission", "busy core worker COPY", "busy core EPIPE and caller SIGPIPE", "stop cancels queued COPY before worker exit"};
+        printf("PASS TCP batched write %s: real content/prefix, bounded pins, request result before unpin and final owners\n",names[mode]);
+        mm_test_finish();mm_test_attach(0);mm_test_activate_task();mm_test_context=context;
+    }
 }

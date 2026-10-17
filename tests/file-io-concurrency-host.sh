@@ -8,7 +8,7 @@ network_sources=
 if [ "${FILE_IO_HOST_TCP:-1}" = 1 ]; then
     network_sources=$(python3 -c 'import re; s=open("Makefile").read().split("LWIP_SOURCES :=",1)[1].split("\n\n",1)[0]; print(" ".join(re.findall(r"(?:third_party/lwip|net/lwip_port)/[\w/]+\.c",s)))')
     FILE_IO_HOST_FLAGS="${FILE_IO_HOST_FLAGS:-} -DTCP_IO_CASES -include sys/types.h -include limits.h"
-    FILE_IO_HOST_LDFLAGS="${FILE_IO_HOST_LDFLAGS:-} -Wl,--wrap=kernel_wait_park,--wrap=kernel_wait_finish,--wrap=kernel_rwlock_write,--wrap=kernel_mm_pin_user_page,--wrap=kernel_socket_read_user,--wrap=kernel_socket_finish_read"
+    FILE_IO_HOST_LDFLAGS="${FILE_IO_HOST_LDFLAGS:-} -Wl,--wrap=kernel_wait_park,--wrap=kernel_wait_finish,--wrap=kernel_rwlock_write,--wrap=kernel_mm_pin_user_page,--wrap=kernel_socket_read_user,--wrap=kernel_socket_finish_read,--wrap=kernel_socket_stream_commitv"
     FILE_IO_HOST_LDFLAGS="$FILE_IO_HOST_LDFLAGS -Wl,--wrap=kernel_socket_receive_timeout,--wrap=kernel_socket_send_timeout,--wrap=kernel_socket_reserve_read,--wrap=kernel_socket_stream_reserve,--wrap=kernel_socket_write_unix,--wrap=kernel_time_monotonic_ns"
 fi
 set --

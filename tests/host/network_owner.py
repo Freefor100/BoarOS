@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
-cases = ('protocol-owner', 'protocol-transaction', 'receive-prefix', 'receive-chains', 'nodelay', 'nodelay-capacity', 'tcp-batch', 'tcp-batch-last', 'tcp-batch-abort', 'tcp-batch-error', 'unix-payload', 'receive-payload', 'udp-payload', 'copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls','unix-sender','loopback-work')
+cases = ('endpoint-owner', 'protocol-owner', 'protocol-transaction', 'receive-prefix', 'receive-chains', 'nodelay', 'nodelay-capacity', 'tcp-batch', 'tcp-batch-last', 'tcp-batch-abort', 'tcp-batch-error', 'unix-payload', 'receive-payload', 'udp-payload', 'copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls','unix-sender','loopback-work')
 parser.add_argument('--case', choices=(*cases, 'all'), default='all')
 parser.add_argument('--sanitize', action='store_true')
 args = parser.parse_args()

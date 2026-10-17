@@ -254,9 +254,7 @@ static int core_poll_run(
         if (!immediate) kernel_wait_node_init(&nodes[i], task);
     }
 
-    /* 先固定整份 FD 快照，再决定是否需要协议所有权。纯文件和管道
-     * 不取得网络 mutex；epoll 的成员可变，因此始终进入协议 scope。 */
-    int need_protocol = 0;
+    /* 固定整份FD快照；socket就绪只读端点状态，不进入lwIP。 */
     for (uint32_t i = 0; i < nfds; i++) {
         if (pfds[i].fd < 0) continue;
         int64_t pin_result = 0;
@@ -265,24 +263,17 @@ static int core_poll_run(
             pinned[i] = 0;
             continue;
         }
-        enum kernel_open_file_kind kind = kernel_open_file_kind(pinned[i]);
-        need_protocol |= kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
-                         kind == KERNEL_OPEN_FILE_KIND_EPOLL;
     }
-    struct kernel_socket_protocol_scope protocol;
     ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_ALL, 0);
 
     while (!ready_count && !error && !immediate) {
-        /* 取得可能等待的协议锁时还没有 token；登记之后只嵌套借用
-         * 同一 owner，释放协议锁之后才 park，finish 后才重新取锁。 */
+        /* 查询、绑定、复查共用短IRQ范围；不在已准备的token内等待其他锁。 */
         uintptr_t saved_intr = arch_interrupt_save();
-        if (need_protocol) kernel_socket_protocol_enter(&protocol);
         (void)arch_interrupt_save();
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
         if (kernel_wait_prepare(0, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK) {
             error = -KERNEL_EIO;
-            if (need_protocol) kernel_socket_protocol_leave(&protocol);
             arch_interrupt_restore(saved_intr);
             break;
         }
@@ -299,7 +290,6 @@ static int core_poll_run(
         }
         int epoll_pending = 0;
         if (!error) ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_WAIT, &epoll_pending);
-        if (need_protocol) kernel_socket_protocol_leave(&protocol);
         if (!ready_count && !epoll_pending && !error && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
             error = -KERNEL_EIO;
         if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
