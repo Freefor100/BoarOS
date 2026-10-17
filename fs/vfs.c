@@ -2421,9 +2421,15 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
         if (result != 0) kernel_vfs_record_writeback_error(node, result);
     }
 observe:
-    if (*observed_error != node->writeback_error_sequence) {
-        if (result == 0) result = node->writeback_error;
-        *observed_error = node->writeback_error_sequence;
+    /* 后端在CPU0发布错误；比较与推进共享OFD游标不能在两次同步间被抢占。
+     * 此处不等待，也不借用与文件位置无关的offset锁。 */
+    {
+        uintptr_t irq = arch_interrupt_save();
+        if (*observed_error != node->writeback_error_sequence) {
+            if (result == 0) result = node->writeback_error;
+            *observed_error = node->writeback_error_sequence;
+        }
+        arch_interrupt_restore(irq);
     }
     return result;
 }

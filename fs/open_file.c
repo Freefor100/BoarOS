@@ -1126,7 +1126,6 @@ struct sync_range_call {
 static void sync_range_cpu0(void *argument)
 {
     struct sync_range_call *call=argument;
-    /* 调用者在排队前取得OFD位置资格，executor只借用，不能等待自己的队首。 */
     call->result=kernel_vfs_sync_range(&call->file->file,call->start,call->end,
         &call->file->observed_writeback_error);
 }
@@ -1141,15 +1140,11 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
         struct kernel_io_context *io=kernel_io_context_current();
         if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
             !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return -KERNEL_EIO;
-        KERNEL_LOCK_SCOPE(offset);
-        kernel_mutex_lock(&file->offset_lock,&offset);
         struct sync_range_call call={file,start,end,-KERNEL_EIO};
-        if (kernel_page_cache_run_cpu0_borrowing(kernel_open_file_page_cache(file),sync_range_cpu0,&call,&offset))
+        if (kernel_page_cache_run_cpu0(kernel_open_file_page_cache(file),sync_range_cpu0,&call))
             return -KERNEL_EIO;
         return call.result;
     }
-    KERNEL_LOCK_SCOPE(offset);
-    if (!kernel_lock_held(&file->offset_lock.lock,1)) kernel_mutex_lock(&file->offset_lock,&offset);
     return kernel_vfs_sync_range(&file->file, start, end,
                                  &file->observed_writeback_error);
 }

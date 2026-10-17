@@ -283,21 +283,12 @@ static enum kernel_files_status sync_pinned(struct kernel_open_file_description 
     int datasync,int64_t *linux_result,const struct kernel_lock_guard *borrowed)
 {
     if (kernel_open_file_io_requires_cpu0(description)) {
-        KERNEL_LOCK_SCOPE(offset);
-        if (!borrowed) {
-            if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
-            kernel_mutex_lock(&description->offset_lock,&offset);
-        }
+        if (!borrowed && !regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
         struct regular_call call={.description=description,.data_only=datasync,.result=linux_result,
-            .offset_borrow=borrowed ? borrowed : &offset};
+            .offset_borrow=borrowed};
         return regular_dispatch(&call,sync_cpu0);
     }
     enum kernel_open_file_kind kind=kernel_open_file_kind(description);
-    KERNEL_LOCK_SCOPE(offset);
-    if ((kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY) &&
-        !regular_borrows_offset(description,borrowed) &&
-        !kernel_lock_held(&description->offset_lock.lock,1))
-        kernel_mutex_lock(&description->offset_lock,&offset);
     *linux_result=kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ?
         kernel_vfs_sync(&description->file,datasync,&description->observed_writeback_error):-KERNEL_EINVAL;
     return KERNEL_FILES_STATUS_OK;

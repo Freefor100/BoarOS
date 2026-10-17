@@ -522,6 +522,107 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
     puts("PASS shared offset qualification precedes CPU0 queue: held read, waiting seek, cold miss and actual owners finish");
     puts("PASS truncate obtains write-operation qualification before queueing; blocked truncate cannot stop an active writer's cold read");
 }
+/* 独立同步等待后端时不占文件位置；两个请求仍共享一个错误游标。 */
+static unsigned sync_pause,sync_entered,sync_resume,sync_progress;
+static void pause_sync_backend(struct kernel_vfs_file *file)
+{
+    if (control && kernel_vfs_file_node(file)==kernel_open_file_node(control) &&
+        __atomic_exchange_n(&sync_pause,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->logical_id && !kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&sync_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&sync_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+int __real_kernel_vfs_sync(struct kernel_vfs_file *,int,uint64_t *);
+int __wrap_kernel_vfs_sync(struct kernel_vfs_file *file,int data_only,uint64_t *observed)
+{
+    pause_sync_backend(file);
+    return __real_kernel_vfs_sync(file,data_only,observed);
+}
+int __real_kernel_vfs_sync_range(struct kernel_vfs_file *,uint64_t,uint64_t,uint64_t *);
+int __wrap_kernel_vfs_sync_range(struct kernel_vfs_file *file,uint64_t start,uint64_t end,uint64_t *observed)
+{
+    pause_sync_backend(file);
+    return __real_kernel_vfs_sync_range(file,start,end,observed);
+}
+static void *crossing_sync(void *argument)
+{
+    struct crossing *call=argument;mm_test_attach(call->id);mm_test_bind(&mm);
+    mm_test_bind_files(&files);mm_test_context=context;
+    kernel_cpu_current()->logical_id=1;
+    if (call->shared) call->result=kernel_open_file_sync_range(control,0,UINT64_MAX);
+    else call->status=kernel_files_sync(&files,0,0,&call->result);
+    mm_test_finish();return NULL;
+}
+static void *sync_position_progress(void *argument)
+{
+    struct crossing *call=argument;mm_test_attach(call->id);mm_test_bind(&mm);
+    mm_test_bind_files(&files);mm_test_context=context;
+    kernel_cpu_current()->logical_id=1;
+    uint64_t buffer=0x200000+call->id*BOAROS_PAGE_SIZE;size_t copied;
+    call->status=kernel_files_read(&files,&mm,0,buffer,8,&call->result);
+    assert(!call->status && call->result==8 &&
+        !kernel_copy_from_user(&mm,call->bytes,buffer,8,&copied) && copied==8 &&
+        !memcmp(call->bytes,"syncdata",8));
+    call->status=kernel_files_lseek(&files,0,0,1,&call->result);
+    assert(!call->status && call->result==8);
+    __atomic_store_n(&sync_progress,1,__ATOMIC_RELEASE);
+    mm_test_finish();return NULL;
+}
+static void sync_offset_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
+    struct kernel_page_cache *cache,int range_first)
+{
+    int error;size_t done;uint64_t observed=0;int64_t result;
+    files=(struct kernel_files){0};assert(!kernel_files_create(&files,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,range_first?"/range-position":"/sync-position",0600,&control,&error) && !error);
+    control->open_flags=2;
+    assert(!kernel_vfs_file_acquire_write(&control->file) &&
+        !kernel_vfs_pwrite(&control->file,0,"syncdata",8,&done) && done==8 &&
+        !kernel_vfs_sync(&control->file,0,&observed));
+    struct kernel_open_file_description *slot=control;
+    assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot));
+    /* 先装热页，后端同步不应阻止同OFD的读和SEEK_CUR。 */
+    assert(!kernel_open_file_pread(control,0,(char[8]){0},8,&done) && done==8 &&
+        !kernel_page_cache_start_worker(cache) && !kernel_files_check_task_domain(&files,&mm));
+    kernel_vfs_record_writeback_error(kernel_open_file_node(control),-KERNEL_EIO);
+    uint64_t sequence=kernel_vfs_error_sequence(&control->file);
+    assert(control->observed_writeback_error!=sequence);
+    sync_entered=sync_resume=sync_progress=0;__atomic_store_n(&sync_pause,1,__ATOMIC_RELEASE);
+    struct crossing first={.id=1,.shared=(unsigned)range_first},second={.id=2,.shared=(unsigned)!range_first},position={.id=3};
+    pthread_t syncing,queued,reader;
+    assert(!pthread_create(&syncing,NULL,crossing_sync,&first));
+    while (!__atomic_load_n(&sync_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!pthread_create(&reader,NULL,sync_position_progress,&position));
+    for (;;) {
+        unsigned waiting;
+        { KERNEL_RAW_SCOPE(guard,&control->offset_lock.lock.metadata);
+          waiting=control->offset_lock.lock.pending_head!=NULL; }
+        if (waiting) {
+            fputs("sync scope regression: hot read queued on sync-owned offset lock\n",stderr);
+            assert(!waiting);
+        }
+        if (__atomic_load_n(&sync_progress,__ATOMIC_ACQUIRE)) break;
+        sched_yield();
+    }
+    assert(!pthread_join(reader,NULL) && control->offset==8);
+    struct kernel_page_cache_concurrency_state before,after;
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    assert(before.running==1 && !before.pending && !pthread_create(&queued,NULL,crossing_sync,&second));
+    do { kernel_page_cache_get_concurrency_state(cache,&after);sched_yield(); } while (!after.pending);
+    assert(after.running==1 && after.pending==1 && after.executions_queued==before.executions_queued+1);
+    __atomic_store_n(&sync_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(syncing,NULL) && !pthread_join(queued,NULL));
+    assert(!first.status && !second.status && first.result==-KERNEL_EIO && !second.result &&
+        control->observed_writeback_error==sequence && control->offset==8);
+    mm_test_attach(0);mm_test_activate_task();
+    assert(!kernel_files_sync(&files,0,0,&result) && !result);
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    assert(!after.pending && !after.running && !after.entry_borrows &&
+        after.executions_queued==after.executions_completed && control->references==2);
+    assert(!kernel_files_release(&files) && !kernel_open_file_release(&control));
+    kernel_page_cache_stop_worker(cache);
+    printf("PASS %s waits outside OFD offset: hot read and seek progress, competing sync consumes one error, final owners\n",range_first?"range sync":"fsync");
+}
 static void bind(unsigned id)
 { mm_test_attach(id); mm_test_bind(&mm); mm_test_bind_files(&files); mm_test_context=context; }
 static void mapped_source_write(void)
@@ -767,6 +868,8 @@ int main(int argc,char **argv)
     file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);
     offset_handoff_case(&heap,&mount,&cache);
+    sync_offset_case(&heap,&mount,&cache,0);
+    sync_offset_case(&heap,&mount,&cache,1);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,&mount,&cache,actors,append);
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache)); assert(!close(image));

@@ -40,7 +40,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \
         fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c kernel/block.c net/socket.c \
         third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
-        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=kernel_vfs_file_accessed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user \
+        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=kernel_vfs_sync,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user \
         -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
     mkfs.ext4 -q -F -b 4096 "$build_dir/image-$shift.img"
