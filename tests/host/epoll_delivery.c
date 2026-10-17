@@ -248,7 +248,7 @@ static void competing_delete(void)
     irq_interleave=delete_at_irq_boundary;
     CHECK(!epoll_item_unlink_and_destroy(item));
     epoll_item_put(item);
-    CHECK(!epfile.epoll->item_count && allocations==1);
+    CHECK(!epfile.epoll->items_root && allocations==1);
     teardown();
     puts("PASS epoll competing DEL: registration owner consumed once across IRQ boundary");
 }

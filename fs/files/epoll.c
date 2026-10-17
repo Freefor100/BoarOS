@@ -212,7 +212,6 @@ int kernel_epoll_create(
     epoll->items_root = 0;
     epoll->ready_head = 0;
     epoll->ready_tail = 0;
-    epoll->item_count = 0U;
     *out_epoll = epoll;
     return 0;
 }
@@ -234,9 +233,6 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
         epoll_remove_from_ready_list(epoll, item);
         epoll_remove_from_pending_list(epoll, item);
         epoll_index_remove(epoll, item);
-        if (epoll->item_count > 0U) {
-            epoll->item_count--;
-        }
     }
 
     if (target_file != 0) {
@@ -273,7 +269,6 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
     epoll->items_root = 0;
     epoll->ready_head = 0;
     epoll->ready_tail = 0;
-    epoll->item_count = 0U;
     enum kernel_scheduler_status status = kernel_wait_queue_close(&epoll->wait_queue);
     if (status != KERNEL_SCHEDULER_STATUS_OK && status != KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
         __builtin_trap();
@@ -572,7 +567,6 @@ enum kernel_files_status kernel_files_epoll_ctl(
         uintptr_t irq = arch_interrupt_save();
         item->linked = 1;
         epoll_index_insert(epoll, item);
-        epoll->item_count++;
         item->target_next = target_file->ep_items;
         if (item->target_next) item->target_next->target_prev = item;
         target_file->ep_items = item;
@@ -722,18 +716,17 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
     if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
         __builtin_trap();
     if (request->observing) {
-        struct kernel_epoll_item *item = request->head;
-        request->head = 0;
+        struct kernel_epoll_item *item = request->current;
+        request->current = 0;
         if (item) epoll_item_put(item);
         return;
     }
     uintptr_t irq = arch_interrupt_save();
     if (epoll->scan_owner == request) {
         /* 尚未交付的项目仍由扫描引用保活；DEL只撤销注册引用。 */
-        while (request->head) {
-            struct kernel_epoll_item *item = request->head;
-            request->head = item->ready_next;
-            item->ready_next = item->ready_prev = 0;
+        if (request->current) {
+            struct kernel_epoll_item *item = request->current;
+            request->current = 0;
             item->in_scan = 0;
             epoll_ready_add(epoll, item);
             arch_interrupt_restore(irq);
@@ -793,7 +786,7 @@ static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, st
 {
     struct kernel_epoll *epoll = request->epoll;
     uintptr_t irq = arch_interrupt_save();
-    struct kernel_epoll_item *item = request->observing ? request->head : epoll->ready_head;
+    struct kernel_epoll_item *item = request->observing ? request->current : epoll->ready_head;
     if (!item) {
         arch_interrupt_restore(irq);
         return 0;
@@ -803,7 +796,7 @@ static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, st
         if (item->references == UINT32_MAX || item->in_scan) __builtin_trap();
         item->references++;
         item->in_scan = 1;
-        request->head = item;
+        request->current = item;
     }
     *candidate = (struct epoll_candidate){.control = item->control_generation,
         .notification = item->notification_generation, .interest = item->events,
@@ -827,7 +820,7 @@ static int epoll_candidate_finish(struct kernel_epoll_wait_request *request,
     const struct epoll_candidate *candidate, int delivered, int preserve)
 {
     uintptr_t irq = arch_interrupt_save();
-    struct kernel_epoll_item *item = request->head;
+    struct kernel_epoll_item *item = request->current;
     struct kernel_epoll *epoll = request->epoll;
     int pruned = 0;
     if (request->observing) {
@@ -852,7 +845,7 @@ static int epoll_candidate_finish(struct kernel_epoll_wait_request *request,
     /* 最后OFD关闭可能执行后端操作，不能在IRQ或协议scope内执行。 */
     if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
     irq = arch_interrupt_save();
-    request->head = 0;
+    request->current = 0;
     if (!request->observing) item->in_scan = 0;
     arch_interrupt_restore(irq);
     epoll_item_put(item);
@@ -911,7 +904,7 @@ static int epoll_observe_next(struct kernel_epoll_wait_request *request,
         if (candidate) {
             if (item->references == UINT32_MAX) __builtin_trap();
             item->references++;
-            request->head = item;
+            request->current = item;
         }
         arch_interrupt_restore(irq);
         if (candidate) return 1;
