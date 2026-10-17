@@ -40,6 +40,8 @@ struct kernel_cpu {
     struct kernel_io_context *bootstrap_io;
     unsigned need_resched;
     unsigned rotate_other;
+    uint64_t wait_notification_sequence;
+    unsigned wait_notification_depth;
 #if BOAROS_MAX_CPUS > 1
     uint32_t logical_id, state, events, outbound;
     struct { uint64_t period, next_deadline; int armed; } timer;

@@ -204,6 +204,9 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
             }
             if (done) { lock->handoff_owner = 0; break; }
             kernel_raw_lock_release(&metadata);
+            /* handoff_owner保留原队列边界；分段之间允许原本开启的中断响应。 */
+            arch_interrupt_restore(irq);
+            irq = arch_interrupt_save();
             kernel_raw_lock_acquire(&lock->metadata, &metadata);
             if (lock->handoff_owner != owner) __builtin_trap();
         }

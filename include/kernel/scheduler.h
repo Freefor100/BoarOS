@@ -192,6 +192,8 @@ void kernel_wait_node_init_callback(struct kernel_wait_node *node,
                                     kernel_wait_callback_fn callback,
                                     void *context);
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
+/* 同一轮嵌套唤醒共享序号；仅在通知回调内非零，用于合并对象的向上传播。 */
+uint64_t kernel_wait_notification_sequence(void);
 void kernel_wait_queue_add(struct kernel_wait_queue *queue,
                            struct kernel_wait_node *node);
 void kernel_wait_queue_remove(struct kernel_wait_node *node);

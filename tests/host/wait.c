@@ -465,6 +465,41 @@ static void task_segments(void)
     }
 }
 
+static struct kernel_wait_queue notification_queues[2];
+static uint64_t callback_sequence;
+static unsigned notification_calls;
+static void sequence_callback(struct kernel_wait_node *node, uint32_t reason)
+{
+    (void)reason;
+    uint64_t sequence = kernel_wait_notification_sequence();
+    assert(sequence && cpu.preempt_depth && !cpu.raw_locks);
+    if (!notification_calls++) callback_sequence = sequence;
+    else assert(sequence == callback_sequence);
+    if (node->context) assert(!kernel_wait_queue_wake_all(&notification_queues[1]));
+}
+static void notification_sequences(void)
+{
+    struct kernel_wait_node nodes[3];
+    for (unsigned i = 0; i < 2; i++) kernel_wait_queue_init(&notification_queues[i]);
+    for (unsigned i = 0; i < 3; i++) {
+        kernel_wait_node_init_callback(&nodes[i], sequence_callback, i ? NULL : &nodes[0]);
+        kernel_wait_queue_add(&notification_queues[i ? 1 : 0], &nodes[i]);
+    }
+    uint64_t previous = 0;
+    for (unsigned i = 0; i < 2; i++) {
+        notification_calls = 0;
+        assert(!kernel_wait_queue_wake_all(&notification_queues[0]));
+        assert(notification_calls == 3 && previous != callback_sequence);
+        assert(!kernel_wait_notification_sequence());
+        previous = callback_sequence;
+    }
+    for (unsigned i = 0; i < 3; i++) assert(!kernel_wait_node_remove_sync(&nodes[i]));
+    for (unsigned i = 0; i < 2; i++) {
+        assert(!notification_queues[i].borrows && !notification_queues[i].registrations);
+        assert(!kernel_wait_queue_close(&notification_queues[i]));
+        assert(!kernel_wait_queue_destroy(&notification_queues[i]));
+    }
+}
 int main(void)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
@@ -485,5 +520,6 @@ int main(void)
     close_lifetime();
     committed_segments();
     task_segments();
+    notification_sequences();
     puts("wait: early wake, 2/4-thread first-winner arbitration, stale tokens, multi-queue, borrowed retired cursors and callback lifetime passed");
 }
