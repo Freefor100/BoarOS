@@ -305,8 +305,16 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 	return EOK;
 }
 
+static void ext4_bread_completed(void *context, unsigned index, const struct block_read_span *span)
+{
+    const struct block_read_completion *completion = context;
+    struct block_read_span result = *span;
+    if (!result.status && result.completed != result.size) result.status = EIO;
+    completion->complete(completion->context, index, &result);
+}
+
 int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
-	struct block_read_span *spans, unsigned count)
+	struct block_read_span *spans, unsigned count, const struct block_read_completion *completion)
 {
 	if (!bdev || !bdev->bdif || !bdev->bdif->ph_refctr || count > EXT4_BLOCK_BATCH_MAX ||
 	    (count && !spans)) return EINVAL;
@@ -322,15 +330,17 @@ int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
 			return EINVAL;
 		}
 	}
+    const struct block_read_completion forward = {ext4_bread_completed, (void *)completion};
 	if (count && bdev->bdif->bread_batch) {
 		ext4_bdif_lock(bdev);
-		bdev->bdif->bread_batch(bdev, spans, count);
+		bdev->bdif->bread_batch(bdev, spans, count, completion ? &forward : NULL);
 		bdev->bdif->bread_ctr += count;
 		ext4_bdif_unlock(bdev);
 	} else for (unsigned i = 0; i < count; i++) {
 		spans[i].status = ext4_bdif_bread(bdev, spans[i].buffer,
 			spans[i].offset / sector, spans[i].size / sector);
 		if (!spans[i].status) spans[i].completed = spans[i].size;
+        if (completion && i + 1 < count) ext4_bread_completed((void *)completion, i, &spans[i]);
 	}
 	int first = EOK;
 	for (unsigned i = 0; i < count; i++) {
@@ -370,7 +380,7 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 			blocks[i].data, bdev->lg_bsize, 0, EIO};
 	}
 	/* 先完成自己发布的加载，再等待别人的 loading，重叠批次不会互等未发布页。 */
-	ext4_blockdev_read_batch(bdev, reads, pending);
+	ext4_blockdev_read_batch(bdev, reads, pending, NULL);
 	for (unsigned i = 0; i < pending; i++) {
 		struct ext4_buf *buf = blocks[owners[i]].buf;
 		buf->load_error = reads[i].status;

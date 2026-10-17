@@ -49,9 +49,12 @@ struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint6
 /* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX
  * nonoverlapping, valid kernel destinations until return. Successful spans
  * may stop at EOF; errors preserve each contiguous byte prefix. Multi-output
- * calls lend an independent request workspace through synchronous completion. */
+ * calls lend an independent request workspace through synchronous completion.
+ * An optional completion publishes a final span before batch drain, at most once;
+ * unreported results arrive on return. Its result pointer
+ * is borrowed only during the callback. No later payload writes follow it. */
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace);
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion);
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           uint64_t offset,

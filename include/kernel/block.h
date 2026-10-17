@@ -48,7 +48,8 @@ struct kernel_block_span {
 };
 
 typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
-    void *context, struct block_read_span *spans, size_t count);
+    void *context, struct block_read_span *spans, size_t count,
+    const struct block_read_completion *completion);
 
 typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
     void *context, const struct kernel_block_span *spans, size_t count);
@@ -133,6 +134,6 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
  * result. The return is the first failed span status. Published DMA remains
  * owned until every request finishes or device reset has been acknowledged. */
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
-    struct block_read_span *spans, size_t count);
+    struct block_read_span *spans, size_t count, const struct block_read_completion *completion);
 
 #endif

@@ -1306,7 +1306,7 @@ static void group_data_error(struct ext4_fs *fs, bool fail_flush)
     struct file_read_span spans[2]={
         {block+13,readback,17,0,EIO},{2*block+29,readback+32,19,0,EIO}};
     struct file_read_workspace read_work;
-    CHECK(ext4_fpread_batch(&file,spans,2,&read_work,UINT64_MAX)==EOK && spans[0].completed==17 && spans[1].completed==19);
+    CHECK(ext4_fpread_batch(&file,spans,2,&read_work,UINT64_MAX, NULL)==EOK && spans[0].completed==17 && spans[1].completed==19);
     for (unsigned i=0;i<17;i++) CHECK(readback[i]==0x43);
     for (unsigned i=0;i<19;i++) CHECK(readback[32+i]==0x42);
     CHECK(ext4_journal_group_drain("/")==EIO);
@@ -1957,7 +1957,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
     CHECK(range_queries==1 && bitmap_crc_calls==2);
     watched_bitmap_bytes=0;range_queries=0;
 #endif
-    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX)==EOK);
+    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX, NULL)==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
     CHECK(range_queries==1);
 #endif
@@ -1980,7 +1980,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
 #ifdef TEST_RANGE_WORK_COUNTERS
     range_queries=0;
 #endif
-    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX)==EOK);
+    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX, NULL)==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
     CHECK(range_queries==1);
 #endif

@@ -112,7 +112,7 @@ static void test_write_batch(struct riscv_virtio_mmio_block *rw,
     if (kernel_block_flush(&rw->block) != KERNEL_BLOCK_STATUS_OK) fail_block(68, 0, 1);
     for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 512; j++) sg_buffers[i][j] = 0;
     submitted = rw->statistics.requests;
-    result = kernel_block_read_batch(&rw->block, reads, 8);
+    result = kernel_block_read_batch(&rw->block, reads, 8, NULL);
     if (result != KERNEL_BLOCK_STATUS_OK || rw->statistics.requests != submitted + 1)
         fail_block(69, submitted + 1, rw->statistics.requests);
     for (unsigned i = 0; i < 8; i++) {
@@ -160,7 +160,7 @@ static void test_128k_sg(struct riscv_virtio_mmio_block *device)
         device->statistics.requests != requests + 1) fail_block(81, requests + 1, device->statistics.requests);
     for (unsigned i = 0; i < 32; i++) for (unsigned j = 0; j < 4096; j++) pages[i][j] = 0;
     requests = device->statistics.requests;
-    if (kernel_block_read_batch(&device->block, reads, 32) != KERNEL_BLOCK_STATUS_OK ||
+    if (kernel_block_read_batch(&device->block, reads, 32, NULL) != KERNEL_BLOCK_STATUS_OK ||
         device->statistics.requests != requests + 1) fail_block(82, requests + 1, device->statistics.requests);
     for (unsigned i = 0; i < 32; i++) {
         if (reads[i].completed != 4096 || reads[i].status != KERNEL_BLOCK_STATUS_OK) fail_block(83, 4096, reads[i].completed);

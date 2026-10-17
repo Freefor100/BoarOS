@@ -20,6 +20,23 @@ static unsigned read_held, release_read;
 static _Thread_local unsigned hold_current;
 static struct block_read_span *held_spans;
 static unsigned held_count;
+static const struct block_read_span *active_reads;
+static unsigned active_count;
+static uint32_t active_completed, file_completed;
+static const struct file_read_completion *file_completion;
+static int suppress_progress;
+static void observe_file_read(void *unused, unsigned index, const struct file_read_span *span)
+{
+    (void)unused;
+    CHECK(!(file_completed & (UINT32_C(1) << index)));
+    file_completed |= UINT32_C(1) << index;
+    for (unsigned i = 0; i < active_count; i++) {
+        uintptr_t a = (uintptr_t)span->buffer, b = (uintptr_t)active_reads[i].buffer;
+        if (a < b ? b - a < span->size : a - b < active_reads[i].size)
+            CHECK(active_completed & (UINT32_C(1) << i));
+    }
+    if (index == 7) CHECK(active_completed != (UINT32_C(1) << active_count) - 1);
+}
 void *__real_malloc(size_t);
 void *__wrap_malloc(size_t size)
 {
@@ -34,7 +51,7 @@ static int dev_read(struct ext4_blockdev *d,void *p,uint64_t b,uint32_t n)
 {(void)d;return kernel_block_read_at(&disk.device,b*512,p,(size_t)n*512)==0?EOK:EIO;}
 static int dev_write(struct ext4_blockdev *d,const void *p,uint64_t b,uint32_t n)
 {(void)d;(void)p;(void)b;(void)n;return EROFS;}
-static int dev_batch(struct ext4_blockdev *d,struct block_read_span *s,unsigned n)
+static int dev_batch(struct ext4_blockdev *d,struct block_read_span *s,unsigned n, const struct block_read_completion *completion)
 {
     batches++;if(n>width)width=n;int first=EOK;
     if(hold_current){
@@ -44,12 +61,14 @@ static int dev_batch(struct ext4_blockdev *d,struct block_read_span *s,unsigned 
         while(!release_read)CHECK(pthread_cond_wait(&hold_changed,&hold_lock)==0);
         CHECK(pthread_mutex_unlock(&hold_lock)==0);
     }
-    for(unsigned k=n;k>0;k--){unsigned i=k-1;s[i].status= s[i].offset/512<=fail_sector && fail_sector-s[i].offset/512<s[i].size/512 ? EIO : dev_read(d,s[i].buffer,s[i].offset/512,s[i].size/512);if(!s[i].status)s[i].completed=s[i].offset/512==short_sector?s[i].size-512:s[i].size;if(!first)first=s[i].status;}
+    if(file_completion){active_reads=s;active_count=n;active_completed=0;}
+    for(unsigned k=n;k>0;k--){unsigned i=k-1;s[i].status= s[i].offset/512<=fail_sector && fail_sector-s[i].offset/512<s[i].size/512 ? EIO : dev_read(d,s[i].buffer,s[i].offset/512,s[i].size/512);if(!s[i].status)s[i].completed=s[i].offset/512==short_sector?s[i].size-512:s[i].size;if(!first)first=s[i].status;if(file_completion)active_completed|=UINT32_C(1)<<i;if(completion && !suppress_progress)completion->complete(completion->context,i,&s[i]);}
+    if(file_completion){active_reads=NULL;active_count=0;}
     return first;
 }
 static struct file_read_workspace read_workspace;
 static int read_batch(const ext4_file *f,struct file_read_span *s,unsigned n)
-{return ext4_fpread_batch(f,s,n,n>1?&read_workspace:NULL,UINT64_MAX);}
+{return ext4_fpread_batch(f,s,n,n>1?&read_workspace:NULL,UINT64_MAX, file_completion);}
 struct held_read {
     const ext4_file *file;
     struct file_read_span spans[2];
@@ -60,11 +79,21 @@ struct held_read {
 static void *read_while_held(void *arg)
 {
     struct held_read *read=arg;hold_current=1;
-    read->result=ext4_fpread_batch(read->file,read->spans,2,&read->workspace,UINT64_MAX);
+    read->result=ext4_fpread_batch(read->file,read->spans,2,&read->workspace,UINT64_MAX, NULL);
     return NULL;
 }
 static unsigned char expected(size_t off){return off<8*4096 || off>=12*4096 ? 1+off/4096:0;}
 static void clear(struct ext4_blockdev *d){ext4_bcache_cleanup(d->bc);width=batches=0;}
+struct prefix_observation { unsigned char (*bytes)[4096]; uint32_t seen; uint64_t offset; };
+static void observe_prefix(void *context, unsigned index, const struct file_read_span *span)
+{
+    struct prefix_observation *observation = context;
+    CHECK(index < 31 && !(observation->seen & (UINT32_C(1) << index)));
+    CHECK(!span->error && span->completed == 4096);
+    if (!observation->seen) CHECK(observation->bytes[31][0] == 0xcd);
+    observation->seen |= UINT32_C(1) << index;
+    for (unsigned j = 0; j < 4096; j++) CHECK(((unsigned char *)span->buffer)[j] == expected(observation->offset+j));
+}
 int main(int argc,char **argv)
 {
     CHECK(argc==2 && fault_block_open(&disk,argv[1])==0);
@@ -76,10 +105,31 @@ int main(int argc,char **argv)
     ext4_file file;CHECK(ext4_fopen(&file,"/data","r")==EOK);
     unsigned char out[8][4096];struct file_read_span spans[8];
     for(unsigned i=0;i<8;i++)spans[i]=(struct file_read_span){i*4096,out[i],4096,0,0};
-    clear(&dev);CHECK(read_batch(&file,spans,8)==EOK);
+    const struct file_read_completion completion={observe_file_read,NULL};
+    file_completion=&completion;file_completed=0;
+    clear(&dev);CHECK(read_batch(&file,spans,8)==EOK && file_completed==255);
+    suppress_progress=1;file_completed=0;
+    CHECK(read_batch(&file,spans,8)==EOK && !file_completed);
+    suppress_progress=0;
+    file_completion=NULL;
     printf("file batch blocksize=%u width=%u batches=%u\n",dev.lg_bsize,width,batches);
     CHECK(width==8);
     for(unsigned i=0;i<8;i++){CHECK(!spans[i].error && spans[i].completed==4096);for(unsigned j=0;j<4096;j++)CHECK(out[i][j]==expected(i*4096+j));}
+    /* 部分块使规划跨过工作区容量：前窗完整输出先交付，最后一窗直接返回。 */
+    unsigned char (*many_bytes)[4096]=malloc(32*4096);CHECK(many_bytes);
+    memset(many_bytes,0xcd,32*4096);
+    struct file_read_span many[32];
+    struct prefix_observation observation={many_bytes,0,dev.lg_bsize-17};
+    const struct file_read_completion prefix_completion={observe_prefix,&observation};
+    for(unsigned i=0;i<32;i++)many[i]=(struct file_read_span){observation.offset,many_bytes[i],4096,0,0};
+    file_completion=&prefix_completion;suppress_progress=1;
+    CHECK(read_batch(&file,many,32)==EOK && observation.seen);
+    file_completion=NULL;suppress_progress=0;
+    for(unsigned i=0;i<32;i++){
+        CHECK(!many[i].error && many[i].completed==4096);
+        for(unsigned j=0;j<4096;j++)CHECK(many_bytes[i][j]==expected(observation.offset+j));
+    }
+    free(many_bytes);
     /* Metadata is already resident; request-control work must be reusable. */
     allocation_attempts=0;track_allocations=2;
     for(unsigned i=0;i<3;i++)CHECK(read_batch(&file,spans,8)==EOK);
@@ -87,18 +137,18 @@ int main(int argc,char **argv)
     track_allocations=0;
     printf("steady multi-page read allocation attempts=%u\n",allocation_attempts);
     CHECK(allocation_attempts==0);
-    CHECK(ext4_fpread_batch(&file,spans,8,NULL,UINT64_MAX)==ENOMEM);
+    CHECK(ext4_fpread_batch(&file,spans,8,NULL,UINT64_MAX, NULL)==ENOMEM);
     for(unsigned i=0;i<8;i++)CHECK(spans[i].error==ENOMEM && !spans[i].completed);
     struct file_read_workspace aliased_workspace;
     struct file_read_span overlap={0,&aliased_workspace,sizeof(aliased_workspace),0,0};
-    CHECK(ext4_fpread_batch(&file,&overlap,1,&aliased_workspace,UINT64_MAX)==EINVAL);
+    CHECK(ext4_fpread_batch(&file,&overlap,1,&aliased_workspace,UINT64_MAX, NULL)==EINVAL);
     union {struct file_read_workspace workspace;struct file_read_span spans[2];} aliased;
     aliased.spans[0]=(struct file_read_span){0,out[0],4096,0,0};
-    CHECK(ext4_fpread_batch(&file,aliased.spans,1,&aliased.workspace,UINT64_MAX)==EINVAL);
+    CHECK(ext4_fpread_batch(&file,aliased.spans,1,&aliased.workspace,UINT64_MAX, NULL)==EINVAL);
     memset(out,0xcd,sizeof(out));
     spans[0]=(struct file_read_span){4090,out[0],4096,0,0};
     spans[1]=(struct file_read_span){8192,out[1],4096,0,0};
-    CHECK(ext4_fpread_batch(&file,spans,2,&read_workspace,4096)==EOK);
+    CHECK(ext4_fpread_batch(&file,spans,2,&read_workspace,4096, NULL)==EOK);
     CHECK(spans[0].size==4096 && spans[0].completed==6 && spans[1].size==4096 && !spans[1].completed);
     for(unsigned i=0;i<4096;i++)CHECK(out[0][i]==(i<6?1:0xcd) && out[1][i]==0xcd);
     for(unsigned i=0;i<8;i++)spans[i]=(struct file_read_span){i*4096,out[i],4096,0,0};

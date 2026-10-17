@@ -9,6 +9,7 @@
 #include <kernel/heap.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
+#include <kernel/file_mapping.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 #include <kernel/sync.h>
@@ -58,19 +59,69 @@ static void yield(void)
     check(kernel_scheduler_yield_current()==KERNEL_SCHEDULER_STATUS_OK,22);
     riscv_interrupt_restore(RISCV_SSTATUS_SIE);(void)riscv_interrupt_save();
 }
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+struct truncate_observation { struct kernel_page_cache_statistics before; unsigned called; };
+static void truncate_notification(void *owner, struct kernel_vfs_node *node, uint64_t size)
+{
+    struct truncate_observation *observation = owner;
+    check(size == 52 * 4096 + 37, 90);
+    observation->called++;
+    KERNEL_LOCK_SCOPE(probe);
+    check(kernel_vfs_node_try_read(node, &probe), 99);
+    uint64_t epoch;
+    check(kernel_file_mapping_epoch(node, &epoch) == -KERNEL_EBUSY, 100);
+    kernel_lock_release(&probe);
+    kernel_page_cache_get_statistics(&cache, &observation->before);
+    check(kernel_page_cache_readahead(&cache, node, 52, 0) != 0, 94);
+    struct kernel_page_cache_statistics stats;
+    uint64_t deadline = riscv_time_read() + 2 * timebase;
+    do { yield(); kernel_page_cache_get_statistics(&cache, &stats); }
+    while (stats.readahead_cancelled == observation->before.readahead_cancelled &&
+        stats.readahead_loaded == observation->before.readahead_loaded && riscv_time_read() < deadline);
+    check(stats.readahead_cancelled != observation->before.readahead_cancelled ||
+        stats.readahead_loaded != observation->before.readahead_loaded, 91);
+}
+static void truncate_with_queued_read(struct kernel_open_file_description *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(&file->file);
+    check(!kernel_open_file_seek(file, 0), 92);
+    kernel_page_cache_stop_worker(&cache);
+    check(!kernel_page_cache_invalidate_node(&cache, node) && !kernel_page_cache_start_worker(&cache), 92);
+    struct truncate_observation observation = {0};
+    struct kernel_file_mapping mapping = {.node=node,.owner=&observation,.truncate=truncate_notification};
+    KERNEL_LOCK_SCOPE(inode);
+    kernel_vfs_node_lock(node, &inode, 1);
+    check(!kernel_file_mapping_prepare(node) && !kernel_file_mapping_register(&mapping), 93);
+    kernel_lock_release(&inode);
+    /* notify窗口实际运行worker；边界页在resize_prepare时尚不存在。 */
+    check(!kernel_vfs_ftruncate(&file->file, 52 * 4096 + 37) && observation.called == 1, 95);
+    kernel_file_mapping_unregister(&mapping);
+    uint64_t address; size_t valid;
+    check(!kernel_open_file_get_page(file, 52, &address, &valid) && valid == 37, 96);
+    const unsigned char *bytes = access_page(address);
+    for (unsigned i = 0; i < 4096; i++) check(bytes[i] == (i < 37 ? 53 : 0), 97);
+    check(!physical_page_release(&allocator, address), 98);
+    virt_uart_puts("readahead: closed truncate window, absent boundary page and zero tail passed\n");
+}
+#endif
 #if BOAROS_TEST_READAHEAD_HELD
 static unsigned prefetch_entered, demand_finished, owner_checked;
 static struct kernel_task *producer_task, *demand_task, *stopping_task, *exercise_task;
 static struct kernel_thread_join demand_join, observer_join;
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     if (kernel_task_current() == exercise_task)
-        return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
+        return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
     producer_task = kernel_task_current(); prefetch_entered = 1;
     check(count == BOAROS_PAGE_CACHE_READAHEAD_PAGES, 51);
-    int result=__real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
-    if(fail_prefetch && count){fail_prefetch=0;spans[0].error=-KERNEL_EIO;spans[0].completed=17;return -KERNEL_EIO;}
+    int inject = fail_prefetch && count;
+    int result=__real_kernel_vfs_node_pread_batch(node,spans,count,workspace, inject ? NULL : completion);
+    if(inject){
+        fail_prefetch=0;spans[0].error=-KERNEL_EIO;spans[0].completed=17;
+        if(completion)for(size_t i=0;i<count;i++)completion->complete(completion->context,i,&spans[i]);
+        return -KERNEL_EIO;
+    }
     return result;
 }
 static void held_demand(void *argument)
@@ -102,11 +153,16 @@ static void held_observer(void *unused)
     owner_checked=1;virt_uart_puts("readahead: held-owner\n");
 }
 #else
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
-    int result=__real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
-    if(fail_prefetch && count){fail_prefetch=0;spans[0].error=-KERNEL_EIO;spans[0].completed=17;return -KERNEL_EIO;}
+    int inject = fail_prefetch && count;
+    int result=__real_kernel_vfs_node_pread_batch(node,spans,count,workspace, inject ? NULL : completion);
+    if(inject){
+        fail_prefetch=0;spans[0].error=-KERNEL_EIO;spans[0].completed=17;
+        if(completion)for(size_t i=0;i<count;i++)completion->complete(completion->context,i,&spans[i]);
+        return -KERNEL_EIO;
+    }
     return result;
 }
 #endif
@@ -140,7 +196,7 @@ static void exercise(void *unused)
     uint64_t deadline=riscv_time_read()+timebase*2;
     struct kernel_page_cache_statistics stats;
     do {yield();kernel_page_cache_get_statistics(&cache,&stats);}
-    while(stats.current_pages<2+BOAROS_PAGE_CACHE_READAHEAD_PAGES && riscv_time_read()<deadline);
+    while(stats.readahead_loaded!=BOAROS_PAGE_CACHE_READAHEAD_PAGES && riscv_time_read()<deadline);
     number("readahead cached pages: ",stats.current_pages);
     check(stats.current_pages==2+BOAROS_PAGE_CACHE_READAHEAD_PAGES,30);
     for(unsigned i=0;i!=BOAROS_PAGE_CACHE_READAHEAD_PAGES;i++){
@@ -192,14 +248,20 @@ static void exercise(void *unused)
     read_page(file,2*BOAROS_PAGE_CACHE_READAHEAD_PAGES);
     read_page(file,2*BOAROS_PAGE_CACHE_READAHEAD_PAGES+1);
     kernel_page_cache_get_statistics(&cache,&before);
+    KERNEL_LOCK_SCOPE(pressure_inode);
+    kernel_vfs_node_lock(kernel_vfs_file_node(&file->file), &pressure_inode, 1);
     size_t held=0;
     while(physical_page_available(&allocator)>physical_page_total(&allocator)/50) {
         check(held<4096 && physical_page_allocate(&allocator,&held_pages[held])==PHYSICAL_PAGE_STATUS_OK,65);held++;
     }
-    for(unsigned i=0;i<5;i++)yield();
-    kernel_page_cache_get_statistics(&cache,&stats);
+    /* inode资格让预测保持未发布，实际低水位建立后才允许worker处理取消。 */
+    kernel_lock_release(&pressure_inode);
+    deadline=riscv_time_read()+timebase*2;
+    do {yield();kernel_page_cache_get_statistics(&cache,&stats);}
+    while(stats.readahead_cancelled==before.readahead_cancelled && riscv_time_read()<deadline);
     check(stats.readahead_batches==before.readahead_batches && stats.readahead_cancelled>before.readahead_cancelled,66);
     for(size_t i=0;i<held;i++)check(physical_page_release(&allocator,held_pages[i])==PHYSICAL_PAGE_STATUS_OK,67);
+    truncate_with_queued_read(file);
     /* Truncate cancels an unpublished prediction before exposing the new EOF. */
     for(unsigned i=0;i<2;i++) {check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,68);read_page(file,20+i);}
     check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,69);

@@ -38,7 +38,7 @@ static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out)
 { *out = (uintptr_t)p; return 1; }
 static int image_fd;
-static unsigned source_reads, pause_read, read_entered, resume_read;
+static unsigned source_reads, pause_read, pause_after_read, read_entered, resume_read;
 static int source_error;
 static unsigned source_short;
 static unsigned capture_reads, source_batches, source_batch_completed;
@@ -148,10 +148,15 @@ static unsigned cycle_fg_entered,cycle_fg_resume,cycle_alloc_entered,cycle_alloc
 static unsigned cycle_background_waiting;
 static _Thread_local int hold_ordinary_wait;
 static unsigned ordinary_wait_entered,ordinary_wait_resume;
+static _Thread_local unsigned delay_load_registration;
+static _Thread_local struct kernel_wait_token delayed_load_token;
+static unsigned load_registration_entered, load_registration_resume, observe_load_publication, load_published;
 enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_token *,enum kernel_wait_wake_reason *);
 enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,
     enum kernel_wait_wake_reason *reason)
 {
+    assert(!delayed_load_token.generation || token->generation != delayed_load_token.generation ||
+        token->task != delayed_load_token.task);
     if (hold_ordinary_wait) {
         __atomic_store_n(&ordinary_wait_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&ordinary_wait_resume,__ATOMIC_ACQUIRE)) sched_yield();
@@ -162,7 +167,14 @@ enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
+    int delaying = delay_load_registration == 1 && cache_metadata_lock && kernel_lock_held(cache_metadata_lock, 1);
+    if (delaying) {
+        delay_load_registration = 2;
+        __atomic_store_n(&load_registration_entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&load_registration_resume, __ATOMIC_ACQUIRE)) sched_yield();
+    }
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (delaying) { assert(!status); delayed_load_token = *token; }
     if (!status && kernel_io_context_current()->background_reclaim &&
         __atomic_load_n(&cycle_alloc_entered,__ATOMIC_ACQUIRE) &&
         __atomic_load_n(&cycle_alloc_resume,__ATOMIC_ACQUIRE) &&
@@ -304,9 +316,23 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t off, voi
     if (!result && source_short && *done) --*done;
     return result;
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
+struct source_read_progress {
+    struct file_read_span *spans;
+    const size_t *destinations;
+    const struct file_read_completion *completion;
+};
+static void source_read_completed(void *context, unsigned index, const struct file_read_span *span)
+{
+    struct source_read_progress *progress = context;
+    size_t destination = progress->destinations[index];
+    progress->spans[destination] = *span;
+    if (source_short && !span->error && span->completed) progress->spans[destination].completed--;
+    progress->completion->complete(progress->completion->context, destination, &progress->spans[destination]);
+    if (observe_load_publication && !destination) __atomic_store_n(&load_published, 1, __ATOMIC_RELEASE);
+}
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *, const struct file_read_completion *);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     assert(count && count <= KERNEL_VFS_READ_BATCH_MAX);
     for (size_t i = 0; i < count; i++) {
@@ -340,13 +366,19 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
             kept[used++] = spans[i];
         }
     }
-    int result = used ? __real_kernel_vfs_node_pread_batch(node, kept, used, workspace) : 0;
+    struct source_read_progress progress = {spans, destinations, completion};
+    const struct file_read_completion forward = {source_read_completed, &progress};
+    int result = used ? __real_kernel_vfs_node_pread_batch(node, kept, used, workspace, completion ? &forward : NULL) : 0;
     for (size_t i = 0; i < used; i++) {
         spans[destinations[i]] = kept[i];
         if (source_short && !spans[destinations[i]].error && spans[destinations[i]].completed)
             --spans[destinations[i]].completed;
     }
     __atomic_fetch_add(&source_batch_completed, 1, __ATOMIC_RELEASE);
+    if (__atomic_exchange_n(&pause_after_read, 0, __ATOMIC_ACQ_REL)) {
+        pause_read = 1;
+        source_read_pause();
+    }
     return result ? result : injected;
 }
 #ifndef CACHE_MM_CASES
@@ -1153,6 +1185,7 @@ struct demand_read {
     unsigned cpu, done;
     unsigned watch_inode, inode_attempts, pause_inode, resume_inode, scalar;
     unsigned fail_workspace;
+    unsigned delay_registration;
     size_t heap_allocations;
     uint64_t first;
     size_t count;
@@ -1163,6 +1196,7 @@ static void *read_demand_batch(void *arg)
 {
     struct demand_read *read = arg;
     cache_test_attach(read->cpu);
+    delay_load_registration = read->delay_registration;
     if (read->watch_inode) {
         attempt_inode_lock=&kernel_vfs_file_node(current_file)->io_lock;
         inode_read_attempts=&read->inode_attempts;
@@ -1181,6 +1215,8 @@ static void *read_demand_batch(void *arg)
         read->first, read->pages, read->count);
     assert(!fail_workspace_allocation);
     demand_heap_allocations=NULL;
+    delayed_load_token = (struct kernel_wait_token){0};
+    delay_load_registration = 0;
     attempt_inode_lock=NULL;inode_read_attempts=NULL;inode_read_resume=NULL;
     __atomic_store_n(&read->done, 1, __ATOMIC_RELEASE);
     return 0;
@@ -1510,6 +1546,51 @@ static void demand_short_read(struct kernel_page_cache *cache, struct kernel_vfs
     demand_idle(cache);
     puts("PASS short backend read: scalar and one-page batch reject incomplete success; failed entries release and retry");
 }
+static void demand_published_before_drain(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
+{
+    assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
+    reset_demand_source(); pause_after_read = 1;
+    struct demand_read batch = {.cpu = 1, .count = 4};
+    pthread_t producer;
+    assert(!pthread_create(&producer, NULL, read_demand_batch, &batch));
+    wait_progress(&read_entered, 1);
+    assert(!__atomic_load_n(&batch.done, __ATOMIC_ACQUIRE));
+    uint64_t page; size_t valid;
+    assert(!kernel_page_cache_lookup(cache, file, 0, &page, &valid));
+    assert(valid == BOAROS_PAGE_SIZE && *(unsigned char *)access_page(page) == 0x30);
+    assert(!physical_page_release(cache->allocator, page));
+    __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(producer, NULL) && !batch.status);
+    demand_release(&batch); demand_idle(cache);
+    puts("PASS completed page is visible while its batch owner is still draining");
+}
+
+static void demand_completion_before_registration(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
+{
+    assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
+    reset_demand_source(); pause_read = 1;
+    load_registration_entered = load_registration_resume = load_published = 0;
+    observe_load_publication = 1;
+    struct demand_read first = {.cpu=1,.count=4};
+    struct demand_read waiting = {.cpu=0,.count=1,.delay_registration=1};
+    pthread_t producer, reader;
+    assert(!pthread_create(&producer, NULL, read_demand_batch, &first));
+    wait_progress(&read_entered, 1);
+    assert(!pthread_create(&reader, NULL, read_demand_batch, &waiting));
+    wait_progress(&load_registration_entered, 1);
+    /* reader仍持cache保护，但尚未登记entry等待；producer在此窗口真正完成P0。 */
+    __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
+    wait_progress(&load_published, 1);
+    __atomic_store_n(&load_registration_resume, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(reader, NULL) && !pthread_join(producer, NULL));
+    assert(!first.status && !waiting.status);
+    assert(first.pages[0].physical_address == waiting.pages[0].physical_address);
+    demand_contents(&waiting.pages[0], 0x30, BOAROS_PAGE_SIZE);
+    observe_load_publication = 0;
+    demand_release(&waiting); demand_release(&first); demand_idle(cache);
+    puts("PASS load completion before registration: no cache-lock dependency, no lost wake or park, exact owner return");
+}
+
 static void demand_overlap(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
     assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
@@ -1776,6 +1857,8 @@ static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file
     if (actors == 2) { demand_operation_cases(cache, file); write_owner_counts(cache,file); }
     demand_cold_warm(cache, file);
     demand_short_read(cache, file);
+    demand_published_before_drain(cache, file);
+    demand_completion_before_registration(cache, file);
     demand_overlap(cache, file);
     demand_workspace_oom(cache,file);
     demand_errors(cache, file);

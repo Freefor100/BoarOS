@@ -24,7 +24,7 @@ static void io_worker(void *argument)
     struct block_read_span spans[8];
     for(unsigned i=0;i<8;i++) spans[i]=(struct block_read_span){16384+i*512,data[i],512,0,KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
     uint64_t submitted=devices[0].device.statistics.requests;
-    if(kernel_block_read_batch(&devices[0].device.block,spans,8)!=KERNEL_BLOCK_STATUS_OK ||
+    if(kernel_block_read_batch(&devices[0].device.block,spans,8, NULL)!=KERNEL_BLOCK_STATUS_OK ||
         devices[0].device.statistics.requests!=submitted+1) la_virt_fatal("PCI SG batch read");
     for(unsigned i=0;i<8;i++) for(unsigned j=0;j<512;j++)
         if(data[i][j]!=(i*512+j)%251) la_virt_fatal("PCI batch contents");

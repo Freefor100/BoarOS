@@ -3002,7 +3002,7 @@ static int ext4_read_pending_data(struct ext4_blockdev *bdev,
 			}
 			struct block_read_span read = {bdev->part_offset + first * bdev->lg_bsize + skip,
 				target, bytes, 0, EIO};
-			int r = ext4_blockdev_read_batch(bdev, &read, 1);
+			int r = ext4_blockdev_read_batch(bdev, &read, 1, NULL);
 			if (!r && scratch) memcpy(out, (uint8_t *)scratch + offset, chunk);
 			ext4_free(scratch);
 			if (r) return r;
@@ -3210,14 +3210,44 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
 {
     if (!rcnt) return EINVAL;
     struct file_read_span span = {offset, buf, size, 0, EOK};
-    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX);
+    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX, NULL);
     *rcnt = span.completed;
     return result;
 }
 
 /* The mount read lock stabilizes inode mappings and current cache versions. */
+/* One span can cover several mappings. Publish only its contiguous result
+ * after every fragment already exposed to DMA has returned. */
+static void ext4_file_read_publish(struct file_read_workspace *progress, unsigned index, int notify)
+{
+    if (progress->completion_emitted & (UINT32_C(1) << index)) return;
+    struct file_read_span *span = &progress->completion_spans[index];
+    unsigned *cursor = &progress->completion_cursor[index];
+    while (*cursor < progress->completion_parts && progress->fragments[*cursor].span == index) {
+        if (!(progress->completion_ready & (UINT32_C(1) << *cursor))) return;
+        struct file_read_fragment *fragment = &progress->fragments[(*cursor)++];
+        if (!span->error) {
+            if (fragment->error) span->error = fragment->error;
+            else span->completed += fragment->length;
+        }
+    }
+    if (!span->error) span->error = progress->mapping_errors[index];
+    if (notify && (span->error || span->completed == progress->limits[index])) {
+        progress->completion_emitted |= UINT32_C(1) << index;
+        progress->completion->complete(progress->completion->context, index, span);
+    }
+}
+static void ext4_file_read_completed(void *context, unsigned index, const struct block_read_span *span)
+{
+    struct file_read_workspace *progress = context;
+    unsigned part = progress->owners[index];
+    progress->fragments[part].error = span->status;
+    progress->completion_ready |= UINT32_C(1) << part;
+    ext4_file_read_publish(progress, progress->fragments[part].span, 1);
+}
+
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *work, uint64_t size_limit)
+    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion)
 {
     if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
@@ -3257,6 +3287,13 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
     unsigned *owners = work ? work->owners : scalar_owners;
     int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
     unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : 8;
+    struct file_read_workspace *progress = completion && count > 1 ? work : NULL;
+    if (progress) {
+        progress->completion_spans = spans;
+        progress->completion = completion;
+        progress->completion_emitted = 0;
+    }
+    const struct block_read_completion forward = {ext4_file_read_completed, progress};
     const struct ext4_lock *locks = file->mp->os_locks;
     if (locks && locks->read_lock) locks->read_lock(locks->context);
     else EXT4_MP_LOCK(file->mp);
@@ -3286,7 +3323,9 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
     while (!inline_link) {
         memset(mapping_errors, 0, count * sizeof(*mapping_errors));
         unsigned parts = 0, pending = 0;
+        if (progress) for (unsigned i = 0; i < count; i++) progress->completion_cursor[i] = capacity;
         for (unsigned i = 0; i < count && parts < capacity; i++) {
+            if (progress) progress->completion_cursor[i] = parts;
             size_t planned = spans[i].completed;
             while (!spans[i].error && planned < limits[i]) {
                 uint64_t offset = spans[i].offset + planned;
@@ -3367,9 +3406,20 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                 range_offset = offset + length;
             }
         }
-        ext4_blockdev_read_batch(fs->bdev, reads, pending);
+        if (progress) {
+            progress->completion_parts = parts;
+            progress->completion_ready = parts == 32 ? UINT32_MAX : (UINT32_C(1) << parts) - 1;
+            for (unsigned j = 0; j < pending; j++) progress->completion_ready &= ~(UINT32_C(1) << owners[j]);
+            if (pending && progress->completion_ready)
+                for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i, 1);
+        }
+        ext4_blockdev_read_batch(fs->bdev, reads, pending, progress ? &forward : NULL);
         for (unsigned j = 0; j < pending; j++) fragments[owners[j]].error = reads[j].status;
-        for (unsigned j = 0; j < parts; j++) {
+        if (progress) {
+            progress->completion_ready = parts == 32 ? UINT32_MAX : (UINT32_C(1) << parts) - 1;
+            for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i, 0);
+        }
+        for (unsigned j = 0; !progress && j < parts; j++) {
             struct file_read_fragment *part = &fragments[j];
             struct file_read_span *span = &spans[part->span];
             if (!span->error) {
@@ -3377,14 +3427,23 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                 else span->completed += part->length;
             }
         }
-        for (unsigned i = 0; i < count; i++) if (!spans[i].error) spans[i].error = mapping_errors[i];
-        if (!parts) break;
+        int more = 0;
+        for (unsigned i = 0; i < count; i++) {
+            if (!spans[i].error) spans[i].error = mapping_errors[i];
+            more |= !spans[i].error && spans[i].completed < limits[i];
+        }
+        /* 本轮已排空但还要继续映射/读下一窗时，先交付已经完整的页。 */
+        if (progress && more)
+            for (unsigned i = 0; i < count; i++) ext4_file_read_publish(progress, i, 1);
+        if (!more) break;
     }
 Put:
     { int r = ext4_fs_put_inode_ref(&ref); if (!result) result = r; }
 Failed:
-    for (unsigned i = 0; i < count; i++) if (result && !spans[i].error) spans[i].error = result;
-    result = EOK;
+    for (unsigned i = 0; i < count; i++) {
+        if (progress && (progress->completion_emitted & (UINT32_C(1) << i))) continue;
+        if (result && !spans[i].error) spans[i].error = result;
+    }
     for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
     EXT4_MP_UNLOCK(file->mp);
     return result;

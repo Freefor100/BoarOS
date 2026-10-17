@@ -556,8 +556,8 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int physical(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static int dma(const void *p, uint64_t n, uint64_t *out) { (void)n; *out = (uintptr_t)p; return 1; }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     if (loading_probe) {
         loads++;
@@ -565,7 +565,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 10);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
 }
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
@@ -841,7 +841,7 @@ static void batch_reader(void *unused)
         KERNEL_LOCK_SCOPE(guard);
         kernel_vfs_node_lock(kernel_vfs_file_node(&read_batch_file), &guard, 0);
         static struct file_read_workspace file_read_work;
-        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8, &file_read_work) == 0, 351);
+        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8, &file_read_work, NULL) == 0, 351);
         for (unsigned i = 0; i < 8; i++) {
             check(!pages[i].error && pages[i].completed == 4096, 352);
             for (unsigned j = 0; j < 4096; j++) check(read_batch_pages[i][j] == i + 1, 353);
@@ -850,7 +850,7 @@ static void batch_reader(void *unused)
         riscv_interrupt_restore(irq);
         return;
     }
-    check(kernel_block_read_batch(&device.block, spans, 8) == KERNEL_BLOCK_STATUS_OK, 340);
+    check(kernel_block_read_batch(&device.block, spans, 8, NULL) == KERNEL_BLOCK_STATUS_OK, 340);
     for (unsigned i = 0; i < 8; i++) {
         check(spans[i].status == KERNEL_BLOCK_STATUS_OK && spans[i].completed == 512, 341);
         for (unsigned j = 0; j < 512; j++) check(sectors[i][j] == i + 1, 342);

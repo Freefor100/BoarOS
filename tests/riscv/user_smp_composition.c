@@ -418,9 +418,9 @@ int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_descrip
     }
     return status;
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *);
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *, const struct file_read_completion *);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
-    struct file_read_workspace *workspace)
+    struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     kernel_pid_t tid=0;
     struct kernel_task *owner=kernel_io_context_current()->account_task;
@@ -429,7 +429,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_
         read_backend_calls++;
         for(size_t i=0;i<count;i++)read_backend_bytes+=spans[i].size;
     }
-    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
+    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace, completion);
 }
 void riscv_user_composition_fault_retry(uint64_t address,int resumed)
 {

@@ -159,7 +159,7 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
 }
 
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
-    struct block_read_span *spans, size_t count)
+    struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
 {
     kernel_assert_service_context();
     if (!device || !device->logical_block_size || count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
@@ -184,13 +184,15 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
         nonempty = 1;
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
-    if (device->read_batch) return device->read_batch(device->context, spans, count);
+    if (device->read_batch) return device->read_batch(device->context, spans, count, completion);
     enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
     for (size_t i = 0; i < count; i++) {
-        if (!spans[i].size) continue;
-        spans[i].status = device->read(device->context, spans[i].offset, spans[i].buffer, spans[i].size);
-        if (spans[i].status == KERNEL_BLOCK_STATUS_OK) spans[i].completed = spans[i].size;
-        else if (result == KERNEL_BLOCK_STATUS_OK) result = spans[i].status;
+        if (spans[i].size) {
+            spans[i].status = device->read(device->context, spans[i].offset, spans[i].buffer, spans[i].size);
+            if (spans[i].status == KERNEL_BLOCK_STATUS_OK) spans[i].completed = spans[i].size;
+            else if (result == KERNEL_BLOCK_STATUS_OK) result = spans[i].status;
+        }
+        if (completion && i + 1 < count) completion->complete(completion->context, i, &spans[i]);
     }
     return result;
 }

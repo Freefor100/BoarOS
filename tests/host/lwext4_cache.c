@@ -128,8 +128,9 @@ static int cache_batch(struct ext4_blockdev *d, struct ext4_block *b, const uint
 static unsigned batch_width, batch_calls;
 static int batch_failure;
 #ifdef EXT4_CACHED_READ_BATCH
-static int dev_read_batch(struct ext4_blockdev *dev, struct block_read_span *s, unsigned n)
+static int dev_read_batch(struct ext4_blockdev *dev, struct block_read_span *s, unsigned n, const struct block_read_completion *completion)
 {
+    (void)completion;
     batch_calls++;if(n>batch_width)batch_width=n;
     int first=EOK;
     for(unsigned i=n;i>0;i--){unsigned j=i-1;
@@ -211,7 +212,7 @@ static void invalid_physical_batch(void)
         {.offset=1,.size=512,.buffer=data,.completed=512},
         {.offset=512,.size=512,.buffer=data+512,.completed=512},
     };
-    CHECK(ext4_blockdev_read_batch(&dev,spans,2)==EINVAL && !reads);
+    CHECK(ext4_blockdev_read_batch(&dev,spans,2, NULL)==EINVAL && !reads);
     for (unsigned i=0;i<2;i++) CHECK(spans[i].status==EINVAL && !spans[i].completed);
     finish(&cache);
 }

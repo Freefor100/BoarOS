@@ -82,7 +82,8 @@ struct ext4_blockdev_iface {
 	/* Mutable physical byte ranges; status is an ext4 errno and every
 	 * published read is finished on return, with its byte count completed. */
 	int (*bread_batch)(struct ext4_blockdev *bdev,
-		struct block_read_span *spans, unsigned count);
+		struct block_read_span *spans, unsigned count,
+		const struct block_read_completion *completion);
 
 	/**@brief   Block write function.
 	 * @param   buf input buffer
@@ -263,7 +264,7 @@ int ext4_block_set(struct ext4_blockdev *bdev, struct ext4_block *b);
  * @return  standard error code*/
 /* Physical-sector reads into caller destinations, without allocating cache blocks. */
 int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
-	struct block_read_span *spans, unsigned count);
+	struct block_read_span *spans, unsigned count, const struct block_read_completion *completion);
 
 int ext4_blocks_get_direct(struct ext4_blockdev *bdev, void *buf, uint64_t lba,
 			   uint32_t cnt);

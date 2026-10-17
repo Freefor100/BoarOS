@@ -41,6 +41,14 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
     if (cache_io_probe) cache_reads++;
     return __real_kernel_vfs_node_pread(node, offset, buffer, size, done);
 }
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t,
+    struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans,
+    size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
+{
+    if (cache_io_probe) cache_reads += count;
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
+}
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
@@ -768,9 +776,9 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     if (bytes == 16 * MIB) {
         struct kernel_mm clone = {0};
         check(kernel_mm_fork(&clone, mm) == KERNEL_MM_STATUS_OK, 43);
-        riscv_kernel_mm_get_statistics(&clone, &after);
-        check(after.resident_probes == 0 && after.protect_visits == 0 &&
-              after.protect_address_flushes == 0 && after.protect_global_flushes == 0, 44);
+        struct kernel_mm_mapping parent, child;
+        check(!kernel_mm_lookup(mm, address, &parent) && !kernel_mm_lookup(&clone, address, &child) &&
+            parent.physical_address == child.physical_address && !(child.permissions & KERNEL_MM_WRITE), 44);
         check(kernel_mm_release(&clone) == KERNEL_MM_STATUS_OK, 45);
     }
 #if BOAROS_COST_DIAGNOSTICS

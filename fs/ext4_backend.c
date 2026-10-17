@@ -657,22 +657,35 @@ static int block_write_phase(struct ext4_blockdev *device,
     }
 }
 
+static void block_read_error(struct block_read_span *span)
+{
+    switch (span->status) {
+    case KERNEL_BLOCK_STATUS_OK: span->status = span->completed == span->size ? EOK : EIO; break;
+    case KERNEL_BLOCK_STATUS_NO_MEMORY: span->status = ENOMEM; break;
+    case KERNEL_BLOCK_STATUS_INVALID: span->status = EINVAL; break;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED: span->status = ENOTSUP; break;
+    default: span->status = EIO; break;
+    }
+}
+/* 错误转换只转发当前结果，禁止间接递归内联放大I/O栈。 */
+static void __attribute__((noinline)) block_read_completed(void *context, unsigned index, const struct block_read_span *span)
+{
+    const struct block_read_completion *completion = context;
+    struct block_read_span result = *span;
+    block_read_error(&result);
+    completion->complete(completion->context, index, &result);
+}
 static int block_read_batch(struct ext4_blockdev *device,
-                            struct block_read_span *spans, unsigned count)
+    struct block_read_span *spans, unsigned count, const struct block_read_completion *completion)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) spans[i].status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
-    kernel_block_read_batch(adapter->block, spans, count);
+    const struct block_read_completion forward = {block_read_completed, (void *)completion};
+    kernel_block_read_batch(adapter->block, spans, count, completion ? &forward : NULL);
     int result = EOK;
     for (unsigned i = 0; i < count; i++) {
-        switch (spans[i].status) {
-        case KERNEL_BLOCK_STATUS_OK: spans[i].status = spans[i].completed == spans[i].size ? EOK : EIO; break;
-        case KERNEL_BLOCK_STATUS_NO_MEMORY: spans[i].status = ENOMEM; break;
-        case KERNEL_BLOCK_STATUS_INVALID: spans[i].status = EINVAL; break;
-        case KERNEL_BLOCK_STATUS_UNSUPPORTED: spans[i].status = ENOTSUP; break;
-        default: spans[i].status = EIO; break;
-        }
+        block_read_error(&spans[i]);
         if (!result) result = spans[i].status;
     }
     return result;
@@ -1996,30 +2009,52 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     return 0;
 }
 
+struct ext4_file_read_progress {
+    struct kernel_vfs_node *node;
+    uint64_t stored;
+    const struct file_read_completion *completion;
+    uint32_t completed;
+};
+static void file_read_result(struct ext4_file_read_progress *progress, struct file_read_span *span, int fill)
+{
+    span->error = lwext4_error(span->error);
+    size_t requested = span->offset >= progress->stored ? 0 : progress->stored - span->offset < span->size ?
+        (size_t)(progress->stored - span->offset) : span->size;
+    if (span->completed > requested) __builtin_trap();
+    if (!span->error && span->completed != requested) span->error = -KERNEL_EIO;
+    if (!span->error) {
+        uint64_t size = progress->node->size;
+        size_t logical = span->offset >= size ? 0 : size - span->offset < span->size ?
+            (size_t)(size - span->offset) : span->size;
+        if (logical < span->completed) __builtin_trap();
+        if (fill) memset((unsigned char *)span->buffer + span->completed, 0, logical - span->completed);
+        span->completed = logical;
+    }
+}
+static void file_read_completed(void *context, unsigned index, const struct file_read_span *span)
+{
+    struct ext4_file_read_progress *progress = context;
+    struct file_read_span result = *span;
+    file_read_result(progress, &result, 1);
+    progress->completed |= UINT32_C(1) << index;
+    progress->completion->complete(progress->completion->context, index, &result);
+}
 static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
-    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace,
+    const struct file_read_completion *completion)
 {
     if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
-    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
     adapter->locks.read_lock(adapter->locks.context);
-    uint64_t stored=ext4_fsize(lwext4_node_file(node));
-    if (stored>node->size) stored=node->size;
-    int result = ext4_fpread_batch(lwext4_node_file(node), spans, count, workspace, stored);
+    uint64_t stored = ext4_fsize(lwext4_node_file(node));
+    if (stored > node->size) stored = node->size;
+    struct ext4_file_read_progress progress = {node, stored, completion, 0};
+    const struct file_read_completion forward = {file_read_completed, &progress};
+    int result = ext4_fpread_batch(lwext4_node_file(node), spans, count, workspace, stored,
+        completion ? &forward : NULL);
     adapter->locks.unlock(adapter->locks.context);
-    for (size_t i = 0; i < count; i++) {
-        spans[i].error = lwext4_error(spans[i].error);
-        size_t requested = spans[i].offset >= stored ? 0 : stored - spans[i].offset < spans[i].size ?
-            (size_t)(stored - spans[i].offset) : spans[i].size;
-        if (spans[i].completed > requested) __builtin_trap();
-        if (!spans[i].error && spans[i].completed != requested) spans[i].error=-KERNEL_EIO;
-        if (!spans[i].error) {
-            size_t logical=spans[i].offset>=node->size?0:node->size-spans[i].offset<spans[i].size?
-                (size_t)(node->size-spans[i].offset):spans[i].size;
-            if (logical<spans[i].completed) __builtin_trap();
-            memset((unsigned char *)spans[i].buffer+spans[i].completed,0,logical-spans[i].completed);
-            spans[i].completed=logical;
-        }
-    }
+    for (size_t i = 0; i < count; i++)
+        file_read_result(&progress, &spans[i], !(progress.completed & (UINT32_C(1) << i)));
     return lwext4_error(result);
 }
 

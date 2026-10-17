@@ -42,15 +42,15 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel
     }
     return __real_kernel_uaccess_write_cursor_copy(mm,cursor,address,source,size,copied);
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *);
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *, const struct file_read_completion *);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
-    struct file_read_workspace *workspace)
+    struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     if(cold_control && node==kernel_open_file_node(cold_control)) {
         if(kernel_cpu_current()->logical_id)riscv_smp_fail("file-io-cold-backend-left-cpu0",-1);
         cold_loads++;
     }
-    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
+    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace, completion);
 }
 uint64_t riscv_file_io_retained_shared_pages(void)
 {
