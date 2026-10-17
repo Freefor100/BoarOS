@@ -11,7 +11,7 @@ LA_BUILD := build/loongarch
 KERNEL_LA ?= kernel-la
 LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS ?= -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
-LA_CPPFLAGS := -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
+LA_CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
 LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
@@ -21,10 +21,10 @@ LA_C_SOURCES := $(filter-out arch/% kernel/main.c,$(C_SOURCES)) \
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S tests/loongarch/user_blob.S
 LA_OBJECTS = $(patsubst %.c,$(LA_BUILD)/%.o,$(LA_C_SOURCES)) $(patsubst %.S,$(LA_BUILD)/%.o,$(LA_ASM_SOURCES))
-$(LA_BUILD)/%.o: %.c arch/loongarch/build.mk
+$(LA_BUILD)/%.o: %.c arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
-$(LA_BUILD)/%.o: %.S arch/loongarch/build.mk
+$(LA_BUILD)/%.o: %.S arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -MMD -MP -c $< -o $@
 $(KERNEL_LA): $(LA_OBJECTS) arch/loongarch/linker.ld
@@ -55,6 +55,7 @@ endif
 $(LA_BUILD)/kernel-block-la: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o -lgcc
 .PHONY: test-block-loongarch test-pci-host
+test-block-loongarch test-pci-reset-owner-loongarch: build/host/nbd-fault
 test-block-loongarch: $(LA_BUILD)/kernel-block-la prepare-la-tools
 	python3 -B tests/loongarch/block.py --qemu $(QEMU_LOONGARCH64)
 $(LA_BUILD)/kernel-pci-reset-owner: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o $(LA_BUILD)/tests/loongarch/pci_reset_owner.o arch/loongarch/linker.ld
@@ -374,3 +375,8 @@ $(LA_BUILD)/sched-lifecycle-native: $(LA_OBJECTS) $(LA_BUILD)/sched-lifecycle-na
 test-sched-lifecycle-loongarch: $(LA_BUILD)/sched-lifecycle-native prepare-la-tools
 	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD) --case sched-lifecycle
 -include $(LA_BUILD)/sched-lifecycle-native.d
+
+$(LA_BUILD)/generated/lock-config.h: force-cost-config
+	@mkdir -p $(dir $@)
+	@printf '#define BOAROS_LOCK_DEBUG %s\n' '$(LOCK_DEBUG)' > $@.tmp
+	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@

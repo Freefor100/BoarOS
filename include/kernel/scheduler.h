@@ -192,6 +192,8 @@ void kernel_wait_node_init_callback(struct kernel_wait_node *node,
                                     kernel_wait_callback_fn callback,
                                     void *context);
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
+/* 同一轮嵌套唤醒共享序号；仅在通知回调内非零，用于合并对象的向上传播。 */
+uint64_t kernel_wait_notification_sequence(void);
 void kernel_wait_queue_add(struct kernel_wait_queue *queue,
                            struct kernel_wait_node *node);
 void kernel_wait_queue_remove(struct kernel_wait_node *node);
@@ -279,10 +281,6 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *);
 void kernel_thread_join(struct kernel_thread_join *join);
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);
-#if BOAROS_USER_SMP
-/* 仅用户sched_yield服务延后到恢复用户资格；内核等待借用仍实际让出执行。 */
-enum kernel_scheduler_status kernel_scheduler_user_yield_current(void);
-#endif
 
 /*
  * Timer-interrupt path: credits `elapsed_ticks` to the interrupted task
@@ -297,14 +295,23 @@ void kernel_scheduler_prepare_idle_return(void);
 /* 实际调用任务迁到CPU0；只允许无业务锁/pin的用户陷入或恢复边界。
  * 同一内核栈保留调用现场，switch_finish后才可在另一CPU继续执行。 */
 void kernel_scheduler_enter_user_service(void);
-#if BOAROS_USER_SMP
-struct kernel_lock_guard;
-/* 只借用调用者唯一的OFD位置写资格；迁移前已归还cache/user页。 */
-void kernel_scheduler_enter_user_service_borrowing(const struct kernel_lock_guard *);
-#endif
 void kernel_scheduler_leave_user_service(void);
 int kernel_scheduler_user_service_pending(void);
 int kernel_scheduler_user_service_active(void);
+/* 实际业务入口持有最外层服务范围；嵌套调用借用当前执行资格。 */
+struct kernel_service_scope { unsigned entered; };
+#if BOAROS_USER_SMP
+void kernel_service_scope_begin(struct kernel_service_scope *);
+void kernel_service_scope_end(struct kernel_service_scope *);
+void kernel_scheduler_ack_user_service(void);
+#else
+static inline void kernel_service_scope_begin(struct kernel_service_scope *scope) { (void)scope; }
+static inline void kernel_service_scope_end(struct kernel_service_scope *scope) { (void)scope; }
+#endif
+#define KERNEL_SERVICE_SCOPE_IF(name, condition) \
+    struct kernel_service_scope name __attribute__((cleanup(kernel_service_scope_end))) = {0}; \
+    if (condition) kernel_service_scope_begin(&(name))
+#define KERNEL_SERVICE_SCOPE(name) KERNEL_SERVICE_SCOPE_IF(name, 1)
 
 /* Resolves a hardware fault in the running user task's active MM. */
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(

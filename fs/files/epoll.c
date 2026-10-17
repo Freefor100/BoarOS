@@ -47,6 +47,14 @@ static void epoll_item_put(struct kernel_epoll_item *item)
         __builtin_trap();
 }
 
+static void epoll_notify(struct kernel_epoll *epoll)
+{
+    uint64_t sequence = kernel_wait_notification_sequence();
+    if (sequence && epoll->notification_sequence == sequence) return;
+    epoll->notification_sequence = sequence;
+    kernel_wait_queue_wake_all(&epoll->wait_queue);
+}
+
 static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason)
 {
     (void)reason;
@@ -59,7 +67,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
         /* poll和用户复制都可能重入；通知链不借用扫描者的ready_next。 */
         if (epoll->scan_owner && !item->on_ready_list) epoll_pending_add(epoll, item);
         else epoll_ready_add(epoll, item);
-        kernel_wait_queue_wake_all(&epoll->wait_queue);
+        epoll_notify(epoll);
     }
     arch_interrupt_restore(irq);
 }
@@ -251,7 +259,7 @@ enum kernel_files_status kernel_files_epoll_create1(
     uint32_t flags,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_epoll *epoll = 0;
     struct kernel_open_file_description *ofd = 0;
     uint32_t fd = 0U;
@@ -448,7 +456,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
     uint64_t data,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_open_file_description *target_file = 0;
     struct kernel_epoll *epoll;
@@ -693,7 +701,7 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
         }
         epoll->pending_tail = 0;
         epoll->scan_owner = 0;
-        kernel_wait_queue_wake_all(&epoll->wait_queue);
+        epoll_notify(epoll);
     }
     arch_interrupt_restore(irq);
 }
@@ -795,7 +803,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
     size_t sigsetsize,
     int64_t *linux_result)
 {
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_epoll *epoll;
     struct kernel_epoll_wait_request request = {0};

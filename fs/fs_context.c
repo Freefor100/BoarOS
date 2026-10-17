@@ -31,11 +31,7 @@ static void finish_context(struct kernel_fs_context *fs,
 
 int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
 {
-    return fs != 0 && fs->state == KERNEL_FS_CONTEXT_LIVE &&
-           fs->heap != 0 && fs->record != 0 &&
-           fs->record->references != 0U &&
-           kernel_vfs_path_mount(fs->record->root) != 0 &&
-           fs->record->cwd != 0;
+    return fs && fs->state==KERNEL_FS_CONTEXT_LIVE && fs->heap && fs->record;
 }
 
 static enum kernel_fs_context_status create_context(
@@ -134,7 +130,7 @@ enum kernel_fs_context_status kernel_fs_context_fork(
     }
     return create_context(destination, source->record->root,
                           source->record->cwd, 0,
-                          source->heap, source->record->umask);
+                          source->heap, __atomic_load_n(&source->record->umask,__ATOMIC_RELAXED));
 }
 
 enum kernel_fs_context_status kernel_fs_context_move(
@@ -166,15 +162,14 @@ struct kernel_vfs_path *kernel_fs_context_cwd(const struct kernel_fs_context *fs
 
 uint32_t kernel_fs_context_umask(const struct kernel_fs_context *fs)
 {
-    return kernel_fs_context_is_live(fs) ? fs->record->umask : 0U;
+    return kernel_fs_context_is_live(fs) ? __atomic_load_n(&fs->record->umask,__ATOMIC_RELAXED) : 0U;
 }
 
 int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
                                     uint32_t requested, uint32_t *previous)
 {
     if (!kernel_fs_context_is_live(fs) || previous == 0) return -KERNEL_EINVAL;
-    *previous = fs->record->umask;
-    fs->record->umask = requested & 0777U;
+    *previous = __atomic_exchange_n(&fs->record->umask,requested & 0777U,__ATOMIC_RELAXED);
     return 0;
 }
 

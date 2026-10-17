@@ -346,6 +346,16 @@ void kernel_wait_task_unpin(struct kernel_task *task)
     if (!record->borrows) __builtin_trap();
     record->borrows--;
 }
+uint64_t kernel_wait_notification_sequence(void)
+{
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!cpu->wait_notification_depth) return 0;
+    unsigned logical = 0;
+#if BOAROS_MAX_CPUS > 1
+    logical = cpu->logical_id;
+#endif
+    return (cpu->wait_notification_sequence << 8) | (logical + 1U);
+}
 enum kernel_scheduler_status kernel_wait_node_move(struct kernel_wait_node *node, struct kernel_wait_queue *queue)
 {
     if (!node || !node->task || !queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
@@ -369,6 +379,12 @@ enum kernel_scheduler_status kernel_wait_node_move(struct kernel_wait_node *node
 }
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor, int all)
 {
+    /* IRQ保护固定本CPU；父队列的所有回调与递归唤醒共用一次通知身份。 */
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!cpu->wait_notification_depth++) {
+        if (cpu->wait_notification_sequence == (UINT64_MAX >> 8)) __builtin_trap();
+        cpu->wait_notification_sequence++;
+    }
     while (cursor->node) {
         struct kernel_wait_node *node = cursor->node;
         kernel_wait_callback_fn callback = 0;
@@ -393,6 +409,7 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor, int all)
         kernel_wait_cursor_advance(cursor);
     }
     kernel_wait_cursor_end(cursor);
+    cpu->wait_notification_depth--;
 }
 static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int all)
 {

@@ -15,6 +15,7 @@ void kernel_cost_add(enum kernel_cost_metric metric,uint64_t value)
 { if (metric==COST_NETWORK_SERVICE_CALLS) protocol_services+=(unsigned)value; }
 static size_t user_remaining = SIZE_MAX;
 static struct kernel_socket *close_during_copy;
+static struct kernel_socket *shutdown_during_copy;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
@@ -79,6 +80,10 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,u
 {
     (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
     memcpy(out,(void *)(uintptr_t)in,*copied);
+    if (shutdown_during_copy) {
+        struct kernel_socket *peer=shutdown_during_copy;shutdown_during_copy=0;
+        CHECK(!kernel_socket_shutdown(peer,1));
+    }
     if (close_during_copy) {
         struct kernel_socket *peer=close_during_copy;close_during_copy=0;
         kernel_socket_destroy(peer);
@@ -99,6 +104,49 @@ static err_t physical_output(struct netif *interface, struct pbuf *packet, const
 { (void)destination; return link_output(interface, packet); }
 static err_t physical_init(struct netif *interface)
 { interface->name[0] = 't'; interface->name[1] = 'e'; interface->mtu = 1500; interface->output = physical_output; return ERR_OK; }
+
+static void nodelay_pending(unsigned blocked)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device = {0};
+    struct kernel_network network = {.device = &device};
+    ip4_addr_t local, mask, gateway;
+    IP4_ADDR(&local, 10, 77, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 0);
+    ip4_addr_set_zero(&gateway);
+    CHECK(netif_add(&network.interface, &local, &mask, &gateway, &network, physical_init, ip_input));
+    netif_set_up(&network.interface); netif_set_link_up(&network.interface);
+    struct kernel_socket *socket = NULL;
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &socket));
+    socket->connected = 1; socket->tcp->state = ESTABLISHED;
+    ip_addr_copy_from_ip4(socket->tcp->local_ip, local);
+    IP_ADDR4(&socket->tcp->remote_ip, 10, 77, 0, 1);
+    socket->tcp->local_port = 22000; socket->tcp->remote_port = 22001;
+    socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
+    TCP_REG_ACTIVE(socket->tcp); tcp_bind_netif(socket->tcp, &network.interface);
+    uint64_t frozen = clock_ns;
+    CHECK(kernel_socket_write_buffer(socket, "a", 1, 0) == 1);
+    CHECK(copied_packets == 1 && socket->tcp->unacked && !socket->tcp->unsent);
+    CHECK(kernel_socket_write_buffer(socket, "b", 1, 0) == 1);
+    CHECK(copied_packets == 1 && socket->tcp->unsent);
+    CHECK(!kernel_socket_set_option(socket, KERNEL_SOCKET_NODELAY, 0));
+    CHECK(copied_packets == 1 && socket->tcp->unsent);
+    nic_full = blocked;
+    CHECK(!kernel_socket_set_option(socket, KERNEL_SOCKET_NODELAY, 1));
+    if (blocked) {
+        CHECK(copied_packets == 1 && socket->tcp->unsent);
+        CHECK(socket->work_links[nic_wait.slot].queued);
+        nic_full = 0; kernel_socket_network_capacity();
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8, 0, 0});
+    }
+    CHECK(copied_packets == 2 && !socket->tcp->unsent && clock_ns == frozen);
+    CHECK(!kernel_socket_set_option(socket, KERNEL_SOCKET_NODELAY, 1));
+    CHECK(copied_packets == 2);
+    uintptr_t irq = kernel_socket_protocol_enter();
+    tcp_abort(socket->tcp); kernel_socket_destroy(socket);
+    netif_remove(&network.interface);
+    kernel_socket_protocol_leave(irq);
+    printf("PASS NODELAY pending output and %s without ACK or timer progress\n", blocked ? "NIC capacity retry" : "immediate transmission");
+}
 
 static void copy_capacity(unsigned eligible, unsigned gather)
 {
@@ -208,8 +256,10 @@ static void unix_final_payload(void)
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,5},{(uintptr_t)second,4}};
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
     unsigned before=heap_allocations;
+    shutdown_during_copy=receiver;
     CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==9);
-    CHECK(owner==(void *)sender && heap_allocations==before+1 && receiver->rx_bytes==9);
+    CHECK(!shutdown_during_copy && sender->peer_closed && !receiver->read_closed &&
+        owner==(void *)sender && heap_allocations==before+1 && receiver->rx_bytes==9);
     CHECK(!memcmp(receiver->packets_head->data,"alphabeta",9) && !sender->tx_reserved);
     uint64_t charged=sender->unix_memory;
     cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};user_remaining=6;
@@ -221,7 +271,7 @@ static void unix_final_payload(void)
     CHECK(!close_during_copy && owner==(void *)sender && heap_live==1 &&
         !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets && sender->pending_error==-KERNEL_ECONNRESET);
     kernel_socket_destroy(sender);
-    puts("PASS UNIX final queue payload: one allocation, gather fill, fault prefix and peer-close reservation rollback");
+    puts("PASS UNIX final queue payload: half-close before/during send, gather fill, fault prefix and peer-close reservation rollback");
 }
 
 static void receive_payload(void)
@@ -480,7 +530,9 @@ static void loopback_work(void)
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "unix-payload")) unix_final_payload();
+    if (!strcmp(argv[1], "nodelay")) nodelay_pending(0);
+    else if (!strcmp(argv[1], "nodelay-capacity")) nodelay_pending(1);
+    else if (!strcmp(argv[1], "unix-payload")) unix_final_payload();
     else if (!strcmp(argv[1], "receive-payload")) receive_payload();
     else if (!strcmp(argv[1], "udp-payload")) udp_final_payload();
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();

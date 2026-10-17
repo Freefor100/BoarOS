@@ -13,5 +13,11 @@ struct block_read_span {
     size_t size, completed;
     unsigned status;
 };
+/* 可在调用任务内提前发布单项最终结果，每项至多一次；未通知项在同步返回时交付。
+ * 回调后不再写该项payload；整批描述、context和缓冲区仍借用至返回。 */
+struct block_read_completion {
+    void (*complete)(void *context, unsigned index, const struct block_read_span *span);
+    void *context;
+};
 
 #endif

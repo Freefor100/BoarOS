@@ -1,4 +1,5 @@
 #include <arch/riscv/context.h>
+extern uint64_t kernel_test_pin_acquisitions;
 #include <arch/riscv/mm.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/sbi.h>
@@ -110,8 +111,8 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *owner,
     enum kernel_uaccess_status status = __real_kernel_copy_from_user(owner, destination, address, size, copied);
     model_user = previous; return status;
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     if (observe_dma && !dma_count) {
         check(count == 32, 12);
@@ -121,7 +122,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file
         }
         dma_count = count;
     }
-    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
 }
 
 static unsigned char pattern(uint64_t offset)
@@ -197,46 +198,46 @@ static int64_t pread(uint64_t address, uint64_t count, uint64_t offset)
     check(kernel_files_pread(&files, &mm, 0, address, count, offset, &result) == KERNEL_FILES_STATUS_OK, 31);
     return result;
 }
-static void pins_since(const struct kernel_mm_concurrency_state *before,
+static void pins_since(uint64_t before,
                        uint64_t expected, unsigned id)
 {
     struct kernel_mm_concurrency_state after;
     kernel_mm_get_concurrency_state(&mm, &after);
-    check(after.pin_acquisitions - before->pin_acquisitions == expected &&
+    check(kernel_test_pin_acquisitions - before == expected &&
           !after.pins && !after.write_pins, id);
 }
 static void hot_pin_geometry(void)
 {
     const size_t length = 16U * 4096U;
-    struct kernel_mm_concurrency_state before;
+    uint64_t before;
     int64_t result;
 
-    seek(0); kernel_mm_get_concurrency_state(&mm, &before);
+    seek(0); before = kernel_test_pin_acquisitions;
     check(read(BUFFER, length) == (int64_t)length, 85);
-    pins_since(&before, 16U, 86); position(length); verify(BUFFER, 0, length, 0);
-    seek(37); kernel_mm_get_concurrency_state(&mm, &before);
+    pins_since(before, 16U, 86); position(length); verify(BUFFER, 0, length, 0);
+    seek(37); before = kernel_test_pin_acquisitions;
     check(pread(BUFFER, length, 0) == (int64_t)length, 87);
-    pins_since(&before, 16U, 88); position(37); verify(BUFFER, 0, length, 0);
+    pins_since(before, 16U, 88); position(37); verify(BUFFER, 0, length, 0);
 
     const struct kernel_uaccess_iovec vectors[] = {
         {BUFFER, 13U}, {BUFFER + 13U, 4083U},
         {USER, 0U}, {BUFFER + 4096U, length - 4096U},
     };
     copy_in(USER, vectors, sizeof(vectors)); seek(0);
-    kernel_mm_get_concurrency_state(&mm, &before);
+    before = kernel_test_pin_acquisitions;
     check(kernel_files_readv(&files, &mm, 0, USER, 4, &result) ==
           KERNEL_FILES_STATUS_OK && result == (int64_t)length, 89);
     /* iov导入读pin一次，16个目标页各写pin一次；碎iov不增加数据pin。 */
-    pins_since(&before, 17U, 90); position(length); verify(BUFFER, 0, length, 0);
+    pins_since(before, 17U, 90); position(length); verify(BUFFER, 0, length, 0);
 
     const struct kernel_uaccess_iovec fault_vectors[] = {
         {USER + USER_SIZE - 4U, 4U}, {USER + USER_SIZE, 8U},
     };
     copy_in(USER, fault_vectors, sizeof(fault_vectors)); seek(0);
-    kernel_mm_get_concurrency_state(&mm, &before);
+    before = kernel_test_pin_acquisitions;
     check(kernel_files_readv(&files, &mm, 0, USER, 2, &result) ==
           KERNEL_FILES_STATUS_OK && result == 4, 91);
-    pins_since(&before, 2U, 92); position(4);
+    pins_since(before, 2U, 92); position(4);
     verify(fault_vectors[0].base, 0, 4U, 0);
 }
 static void held_reader(void *unused)
@@ -282,26 +283,27 @@ static void exercise(void *unused)
     check(kernel_mm_mmap_anonymous(&mm, USER, USER_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE,
           KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK && address == USER, 52);
     check(kernel_vfs_start_journal_worker(&mount) == 0 && kernel_page_cache_start_worker(&cache) == 0, 53);
-    struct kernel_mm_concurrency_state pins_before, pins_after;
+    uint64_t pins_before;
+    struct kernel_mm_concurrency_state pins_after;
     open_file("/data"); cold();
     seek(2U * 4096U); begin("single-read");
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(read(BUFFER, 4096) == 4096, 81);
-    pins_since(&pins_before, 1U, 93);
+    pins_since(pins_before, 1U, 93);
     position(3U * 4096U); verify(BUFFER, 2U * 4096U, 4096, 0); end("single-read");
     cold(); seek(37); begin("single-pread");
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(pread(BUFFER, 4096, 3U * 4096U) == 4096, 82);
-    pins_since(&pins_before, 1U, 94);
+    pins_since(pins_before, 1U, 94);
     position(37); verify(BUFFER, 3U * 4096U, 4096, 0); end("single-pread");
     seek(3U * 4096U); begin("single-hot");
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(read(BUFFER, 4096) == 4096, 83);
-    pins_since(&pins_before, 1U, 95);
+    pins_since(pins_before, 1U, 95);
     position(4U * 4096U); verify(BUFFER, 3U * 4096U, 4096, 0);
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(pread(BUFFER + 0x618U, 4096, 3U * 4096U) == 4096, 96);
-    pins_since(&pins_before, 2U, 97);
+    pins_since(pins_before, 2U, 97);
     position(4U * 4096U); verify(BUFFER + 0x618U, 3U * 4096U, 4096, 0);
     end("single-hot");
     cold(); seek(0);
@@ -325,12 +327,12 @@ static void exercise(void *unused)
     verify(vectors[2].base, vectors[0].length, vectors[2].length, 0); end("readv");
 
     seek(37); cold(); begin("unaligned");
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(pread(BUFFER + 7, REQUEST, 13) == REQUEST, 64);
     kernel_mm_get_concurrency_state(&mm, &pins_after);
     /* 两个窗口边界结束pin；窗口内部跨缓存页不重pin同一用户页。
      * 三批分别覆盖32、33、2个目标页，旧逐源页复制需129次。 */
-    check(pins_after.pin_acquisitions - pins_before.pin_acquisitions == 67 &&
+    check(kernel_test_pin_acquisitions - pins_before == 67 &&
           !pins_after.pins && !pins_after.write_pins, 84);
     position(37); verify(BUFFER + 7, 13, REQUEST, 0); end("unaligned");
 
@@ -347,14 +349,14 @@ static void exercise(void *unused)
     position(LENGTH); end("at-eof");
 
     cold(); seek(0); begin("efault-prefix");
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(read(USER + USER_SIZE - 4096 + 13, REQUEST) == 4083, 69);
-    pins_since(&pins_before, 1U, 98);
+    pins_since(pins_before, 1U, 98);
     position(4083); verify(USER + USER_SIZE - 4096 + 13, 0, 4083, 0); end("efault-prefix");
     cold(); seek(0); begin("efault-first");
-    kernel_mm_get_concurrency_state(&mm, &pins_before);
+    pins_before = kernel_test_pin_acquisitions;
     check(read(USER + USER_SIZE, REQUEST) == -KERNEL_EFAULT, 70);
-    pins_since(&pins_before, 0U, 99); position(0); end("efault-first");
+    pins_since(pins_before, 0U, 99); position(0); end("efault-first");
 
     cold(); seek(0); memset(scratch, 0xcd, sizeof(scratch)); copy_in(BUFFER + 131072, scratch, sizeof(scratch));
     begin("eio-prefix"); check(read(BUFFER, REQUEST) == 131072, 71); position(131072); verify(BUFFER, 0, 131072, 0);

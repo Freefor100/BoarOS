@@ -122,11 +122,11 @@ make test-block-loongarch
 ```
 
 512MiB/1GiB各验证两个共享INTx pin的真实PCI盘、启动轮询和运行期IRQ、
-八槽批量数据、CPU进展、只读与范围错误、写入/FLUSH后的宿主字节和完整
+八个内存片段合成一次SG读取、CPU进展、只读与范围错误、写入/FLUSH后的宿主字节和完整
 任务/队列/PCI claim回收。queue OOM在真实设备初始化中恢复BAR、command和
-页基线。宿主模型额外覆盖capability循环/截断/溢出、BAR资源不足回滚，以及
+页基线；销毁时的页归还检查包含队列和批量工作区，最终reset失败仅保留PCI资源，再次销毁不得重复释放这些页。宿主模型额外覆盖capability循环/截断/溢出、BAR资源不足回滚，以及
 不依赖handler遍历顺序的共享level迟到完成。掩蔽外设的pending状态不能在
-timer trap中被分发，真实QEMU先复现失败后修复。
+timer trap中被分发。测试通过已有NBD后端扣住SG读取的响应，确认I/O任务实际等待后才释放；PCI仍被屏蔽时观察used ring完成并跨过一次timer tick，之后打开PCI中断，检查真实IRQ、任务完成和资源归还。快速完成可以由驱动直接收割，不能用普通内存盘请求必有IRQ作为测试前提。
 
 固定依据：QEMU上述commit的 `hw/pci-host/gpex.c`、`hw/intc/loongarch_{pch_pic,extioi}.c`
 及 `include/standard-headers/linux/virtio_pci.h`；Linux上述commit的

@@ -564,6 +564,13 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     }
     root->finish_failure = RISCV_ROOT_FINISH_NONE;
     root->finish_error = 0;
+    /* 用户已经退出，但TTY仍可能有已接受的尾部；先排空，再输出收尾统计。 */
+    error = riscv_uart_tty_stop_report(&root->uart, &root->uart_statistics);
+    if (error) {
+        root->finish_failure = RISCV_ROOT_FINISH_UART;
+        root->finish_error = error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     int had_network = root->network != 0;
     error = stop_network(root);
     if (error) {
@@ -627,12 +634,6 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
 
-    error = riscv_uart_tty_stop_report(&root->uart, &root->uart_statistics);
-    if (error) {
-        root->finish_failure = RISCV_ROOT_FINISH_UART;
-        root->finish_error = error;
-        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
-    }
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||

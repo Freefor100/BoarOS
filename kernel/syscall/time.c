@@ -33,6 +33,7 @@ static uint64_t itimer_ns(int64_t seconds, int64_t usec)
 enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_mm *mm;
     struct linux_itimerval input={0}, output={0};
     uint64_t remaining=0, interval=0;
@@ -222,6 +223,7 @@ enum kernel_syscall_status syscall_handle_times(
     uint64_t tms_address,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     uint64_t user_ticks;
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;
@@ -271,6 +273,7 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
     struct kernel_task *caller,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     enum kernel_scheduler_status sleep_status;
     uint64_t deadline;
@@ -375,6 +378,7 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     uint64_t remaining_address,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_mm *mm;
     struct linux_timespec request_spec;
     enum kernel_task_status task_status;

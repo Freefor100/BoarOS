@@ -29,7 +29,7 @@ struct kernel_elf64_source {
     uint64_t *boundaries;
     struct kernel_elf64_source_run *runs;
     uint32_t run_count;
-    uint32_t references;
+    _Atomic uint32_t references;
     uint64_t page_size;
     enum source_state state;
 };
@@ -686,11 +686,13 @@ enum kernel_elf64_source_status kernel_elf64_source_create_interpreter(
 enum kernel_elf64_source_status kernel_elf64_source_acquire(
     struct kernel_elf64_source *source)
 {
-    if (!source_valid(source) || source->state != SOURCE_LIVE ||
-        source->references == 0U || source->references == UINT32_MAX) {
+    if (!source_valid(source) || source->state != SOURCE_LIVE)
         return KERNEL_ELF64_SOURCE_STATUS_STATE;
-    }
-    source->references++;
+    uint32_t references = __atomic_load_n(&source->references, __ATOMIC_RELAXED);
+    do {
+        if (!references || references == UINT32_MAX) return KERNEL_ELF64_SOURCE_STATUS_STATE;
+    } while (!__atomic_compare_exchange_n(&source->references, &references, references + 1,
+        0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
     return KERNEL_ELF64_SOURCE_STATUS_OK;
 }
 
@@ -704,15 +706,12 @@ enum kernel_elf64_source_status kernel_elf64_source_release(
     }
     source = *owner;
     if (source->state == SOURCE_LIVE) {
-        if (source->references == 0U) {
-            return KERNEL_ELF64_SOURCE_STATUS_STATE;
-        }
-        if (source->references > 1U) {
-            source->references--;
+        uint32_t references = __atomic_fetch_sub(&source->references, 1, __ATOMIC_ACQ_REL);
+        if (!references) __builtin_trap();
+        if (references > 1) {
             *owner = 0;
             return KERNEL_ELF64_SOURCE_STATUS_OK;
         }
-        source->references = 0U;
     }
     return source_cleanup(owner);
 }

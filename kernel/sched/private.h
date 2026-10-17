@@ -7,6 +7,7 @@
 #include <kernel/wait_internal.h>
 #include <arch/context.h>
 #include <kernel/files.h>
+#include <kernel/futex.h>
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
@@ -31,19 +32,6 @@
 
 struct kernel_exec_transaction;
 struct kernel_memory_object;
-
-enum kernel_futex_key_kind {
-    KERNEL_FUTEX_KEY_PRIVATE = 0,
-    KERNEL_FUTEX_KEY_SHARED_ANON,
-};
-
-/* A queued task owns shared_object until its wait call resumes. */
-struct kernel_futex_key {
-    uint64_t identity;
-    uint64_t offset;
-    struct kernel_memory_object *shared_object;
-    enum kernel_futex_key_kind kind;
-};
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,
@@ -130,7 +118,7 @@ struct kernel_task {
     uint32_t user_service, user_service_pending;
     struct kernel_sched_node service_node, reservation_node;
     struct kernel_cpu *reservation_cpu;
-    uint32_t user_yielded;
+    uint32_t user_slice_expired;
     uint64_t service_entries, service_migrations;
     uint64_t service_started_ticks, service_running_ns;
 #endif
@@ -267,7 +255,7 @@ struct kernel_scheduler {
     struct kernel_wait_queue cleanup_queue;
     struct kernel_sched_runqueue runqueue;
 #if BOAROS_USER_SMP
-    struct kernel_sched_runqueue user_services;
+    struct kernel_sched_runqueue rt_services;
 #endif
     struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;
@@ -288,7 +276,6 @@ void scheduler_user_service_set_locked(struct kernel_task *, int);
 void scheduler_user_request_locked(struct kernel_task *);
 /* 同一调度域内结束逻辑实时资格；不结束任务执行或存储owner。 */
 void scheduler_user_reservation_release_locked(struct kernel_task *);
-int scheduler_user_yield_locked(struct kernel_task *);
 static inline enum kernel_scheduler_status scheduler_failure(void)
 { return __atomic_load_n(&scheduler.fatal_status, __ATOMIC_RELAXED); }
 

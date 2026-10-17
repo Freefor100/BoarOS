@@ -570,10 +570,36 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 
 ## 当前主线集成的验证范围
 
-当前通用 I/O 实现保留 main `5155e6f` 的生产代码；热读调查与新增 pin/故障测试更新至
-`41711b6`，通过 `6892cce` 集成到兼容分支。双架构默认构建、兼容 uname、原盘 loader、
-监督/显式 shell 及 LA 调度 DSO 继续使用。I/O 通路设计、固定工作量及最终 fsync 比较见
-[VFS/ext4 模块](../modules/vfs-ext4.md)。
+当前通用实现集成 main `348e4a7`，包括普通对象共同保护、MM 访问与服务范围调整，
+以及批量读取、复制布局和无 FD 等待修复。双架构默认构建、兼容 uname、原盘 loader、
+监督/显式 shell 及 LA 调度 DSO 继续使用。LA 构建保留可覆盖的编译选项，接入 main 的
+统一锁调试配置。I/O 通路见 [VFS/ext4](../modules/vfs-ext4.md)；本轮 main 的五组普通内核
+吞吐与 USER_SMP 原程序比较见[数据路径实验](data-path-budget-experiments.md#通知完成与复制路径2026-10-17)。
+它们直接在 main 测量，不是下面兼容分支原脚本的结果。
+
+2026-10-17 将上述 main 集成后重新构建，在兼容分支分别独占启动 RV、LA 的原 iozone
+脚本。单 CPU、1 GiB，QEMU 固定宿主 P 核 CPU2/4/6，ADP0 在线、BAT0 为 Full；
+计时期间没有编译或其他客户机。RV QEMU 11.1.2/MMIO，LA QEMU 11.1.0/PCI，
+RV GCC 16.2.0、LA GCC 15.1.0，成本诊断和锁调试关闭。每份 4 GiB 运行盘先完整写入并 fsync，
+原脚本、ELF、参数和 judge 不变；RV 无 preload，LA musl 沿用既有调度 DSO。
+
+| 架构 / libc | 原 judge | Parent read，KiB/s | Children，KiB/s | Min xfer，KiB |
+|---|---:|---:|---:|---:|
+| RV glibc | 36.624976 | 29647.78 | 112426.59 | 0 |
+| RV musl | 36.562780 | 30354.32 | 111123.44 | 1024 |
+| LA glibc | 37.471447 | 35457.07 | 162213.20 | 0 |
+| LA musl | 37.308396 | 54876.50 | 222683.97 | 0 |
+
+四个原脚本各执行八条命令并结束，退出均为零；两个客户机的 PID1、堆与根盘资源检查
+通过，运行盘只读 e2fsck 通过，设备错误和超时均为零。80 个原 judge 输入逐项对应
+serial 的 `Max throughput per process`，不是把组完成当作所有能力通过。原程序最后
+一组对方法 11/12 打印 `Selected test not available on the version`，原输出与判分保留。
+三组 reader 的 Min xfer 为零，仍按提前停止的实际结果记录。RV 最少剩余任务栈为
+2192 字节，继续使用 8 KiB 栈。结果、内核与串口保存在
+`build/io-regression-20261017/compat-{rv,la}/`；运行镜像检查后删除。
+
+这两次是合并后镜像的实际复测，没有把 main 的单核 E 核吞吐、双核 USER_SMP 对照或
+下面历史成绩混为一次运行，也不据单次 Parent read 宣称架构之间的固定倍数。
 
 此前 `ff9ceea` 的 iozone 在 RV、LA 分别独占运行，复用 `3189b00` 的原盘、程序和参数：
 单 CPU、1 GiB，RV QEMU 11.1.2/MMIO，LA QEMU 11.1.0/PCI，关闭成本诊断。
@@ -638,7 +664,7 @@ glibc/musl 均结束，退出、内核错误及根盘资源归还检查通过，
 设备错误和超时为零。80 个 judge 输入逐项对应原 serial 最大速率。
 RV 最少剩余任务栈为 2856 字节，仍使用 8 KiB 栈；LA 没有同类任务栈余量行。
 
-| 最终镜像 | 原 judge | Parent read，KiB/s | Children，KiB/s |
+| 2026-10-16 交付镜像 | 原 judge | Parent read，KiB/s | Children，KiB/s |
 |---|---:|---:|---:|
 | RV glibc | 35.594703 | 39106.02 | 151057.99 |
 | RV musl | 34.939013 | 41153.99 | 136505.89 |

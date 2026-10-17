@@ -180,12 +180,7 @@ make test-block-loongarch test-root-io-loongarch test-pci-reset-owner-loongarch 
 
 ## 受控磁盘映射的I/O与页写入交接
 
-`kernel_page_cache_init_controlled()` 使用无压力hook的独立 arena。缓存加载资格仍由
-CPU0取得；远端排队的请求不先建立loading项，否则CPU0文件写入可能持inode锁等
-loading，而请求执行者正等同一inode锁。CPU0先取得inode保护，再查缓存并发布
-loading；远端命中在索引保护内借用entry，锁外取得物理引用后归还存储借用。
-请求节点驻留调用者等待现场，完成前不能退栈。停止取消未执行请求，并等待真实
-在途读取返回，不能用取消通知代替后端完成。
+普通和受控缓存统一使用 `kernel_page_cache_init()` 与 metadata mutex。受控测试可选择独立 arena；普通路径保留真实系统压力挂钩。冷读候选在调用 CPU 私有准备，既有 CPU0 worker 复查并发布实际装入，热访问无需请求。当前对象、借用和停止协议见 [VFS/ext4](../modules/vfs-ext4.md#后台写回与水位回收)。
 
 本地 `make test-page-cache-concurrency-host` 使用真实VFS/lwext4、镜像块I/O与生产
 park，在4/16 KiB、2/4线程下核对同页唯一加载、64页索引扩容、失败合并、命中

@@ -90,14 +90,17 @@ static struct kernel_task *find_resource_owner(kernel_pid_t pid,
 
 void kernel_proc_task_note_block_read(void)
 {
-    struct kernel_task *task = kernel_task_current();
-    if (task && task->arch.user_mode && task->block_reads != UINT64_MAX)
-        task->block_reads++;
+    struct kernel_task *task = kernel_io_context_current()->account_task;
+    if (!task) task = kernel_task_current();
+    if (!task || !task->arch.user_mode) return;
+    uint64_t value = __atomic_load_n(&task->block_reads, __ATOMIC_RELAXED);
+    while (value != UINT64_MAX && !__atomic_compare_exchange_n(&task->block_reads,
+        &value, value + 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
 uint64_t kernel_proc_task_block_reads(const struct kernel_task *task)
 {
-    return task ? task->block_reads : 0U;
+    return task ? __atomic_load_n(&task->block_reads, __ATOMIC_RELAXED) : 0U;
 }
 
 void kernel_proc_task_note_fault(struct kernel_task *task, int major)

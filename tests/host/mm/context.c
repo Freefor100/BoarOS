@@ -72,7 +72,8 @@ void mm_test_attach(unsigned id)
 {
     kernel_cpu_initialize(&cpu, id, &io);
 #if BOAROS_MAX_CPUS > 1
-    cpu.logical_id = id;
+    /* actor_id 区分等待者；CPU 归属由 activity、文件或缓存夹具显式设置。 */
+    cpu.logical_id = 0;
 #endif
     assert(!pthread_once(&domain_once, kernel_wait_domain_init));
     assert(id < 16); actor_id = id;
@@ -102,6 +103,24 @@ struct kernel_task *kernel_task_current(void)
     return 0;
 }
 #endif
+#if BOAROS_USER_SMP && !defined(FILE_IO_CASES)
+/* 这个MM模型只提供匿名/文件访问；真正需要迁移到CPU0的SysV业务另测。
+ * 未进入的范围没有归还动作，意外请求迁移则直接失败。 */
+void mm_test_unavailable(void);
+int kernel_scheduler_user_service_active(void)
+{
+    struct kernel_task *task=kernel_task_current();
+    return !cpu.logical_id && task && task->user_service;
+}
+void kernel_service_scope_begin(struct kernel_service_scope *scope)
+{
+    assert(!scope->entered);
+    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
+        mm_test_unavailable();
+}
+void kernel_service_scope_end(struct kernel_service_scope *scope)
+{ assert(!scope->entered); }
+#endif
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task) { return &task->wait; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { return &task->default_wait_node; }
 struct kernel_task *kernel_wait_current_task(void) { return &actor.task; }
@@ -129,3 +148,14 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 void kernel_wait_backend_quiesce(void) { sched_yield(); }
+
+#if BOAROS_MAX_CPUS > 1
+/* 普通宿主 MM actor 只使用本地翻译；跨 CPU 确认由 activity 夹具接管。 */
+__attribute__((weak)) void riscv_smp_sync_user(uint32_t targets, uint64_t address,
+                                             uint64_t size, int instructions)
+{
+    assert(!(targets & ~1U));
+    mm_test_fence(size == BOAROS_PAGE_SIZE ? address : UINT64_MAX, 0);
+    if (instructions) mm_test_fence(0, 1);
+}
+#endif

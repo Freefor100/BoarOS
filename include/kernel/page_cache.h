@@ -81,20 +81,16 @@ struct kernel_page_cache {
 };
 
 /* 一个 allocator 可注册多个独立缓存。统计/水位全局汇总，worker 与快照页各自拥有。
- * 单 hart 调用边界与原 VFS 一致；所有实例和等待者离开后才释放聚合 owner。 */
+ * 元数据统一由对象mutex保护；实例、等待者和回调归还引用后释放聚合owner。 */
 enum kernel_page_cache_status kernel_page_cache_init(
     struct kernel_page_cache *cache,
     struct kernel_heap *heap,
     struct physical_page_allocator *allocator);
 
-/* CPU0私有构造；独立allocator不得带系统压力hook。调用者持有cache至
+/* 检查实际heap/allocator与worker绑定。调用者持有cache至
  * 全部MM/请求/别名结束并stop/join，末次后端清理仍由CPU0完成。 */
-enum kernel_page_cache_status kernel_page_cache_init_controlled(
-    struct kernel_page_cache *cache, struct kernel_heap *heap,
-    struct physical_page_allocator *allocator);
 int kernel_page_cache_check_domain(const struct kernel_page_cache *cache,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator);
-int kernel_page_cache_is_controlled(const struct kernel_page_cache *);
 struct kernel_page_cache_concurrency_state {
     uint64_t requests_queued, requests_completed, entry_borrows;
     uint64_t deferred_snapshots, writeback_rounds;
@@ -119,6 +115,7 @@ struct kernel_lock_guard;
 enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(
     struct kernel_page_cache *,void (*execute)(void *),void *argument,
     const struct kernel_lock_guard *borrowed);
+int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *);
 int kernel_page_cache_is_executor(const struct kernel_page_cache *);
 
 /* Returns an owned physical-page reference that the caller must release. */
@@ -143,19 +140,13 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache_read_page *pages, size_t count);
 
 /* A successful lookup also returns an owned physical-page reference. */
+/* 只借用当前已完成页；装入、resize或截断中的条目返回BUSY。 */
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,
     uint64_t page_index,
     uint64_t *physical_address,
     size_t *valid_bytes);
-
-/* 调用者持有file/cache owner；一次资格尝试整批现有完成页，不等待、分配或I/O。
- * 成功逐项返回物理页借用或EOF，由调用者release；失败已归还本次全部借用，
- * 没有可消费输出。不延长entry/node借用，也不改变CPU0回收者的LRU游标。 */
-enum kernel_page_cache_status kernel_page_cache_try_resident_batch(
-    struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first_page,
-    struct kernel_page_cache_read_page *pages, size_t count);
 
 enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
@@ -177,7 +168,7 @@ void kernel_page_cache_resize_finish(struct kernel_page_cache_resize *,uint64_t 
 void kernel_page_cache_alias_clone(struct kernel_page_cache_alias *target,
     const struct kernel_page_cache_alias *source, void *owner);
 void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias);
-/* detach只停止发布，受控alias保持entry直到锁外drain；MM存储同样须存活。
+/* detach只停止发布，alias保持entry直到锁外drain；MM存储同样须存活。
  * drain不持MM gate、inode I/O或raw，不能由当前在途回调等待自己。 */
 void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias);
 void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias);
@@ -202,8 +193,6 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end);
 /* Caller owns the inode mutation lock. Growth only touches the cached old
  * EOF tail; shrink follows mapping invalidation and removes out-of-range pages. */
-void kernel_page_cache_extend(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t old_size, uint64_t new_size);
 void kernel_page_cache_truncate(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t new_size);
 

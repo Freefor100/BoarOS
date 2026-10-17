@@ -5,7 +5,9 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -16,7 +18,13 @@
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
 #include <sys/reboot.h>
+#include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -75,7 +83,14 @@ static void process_overlap(void)
     }
     for (unsigned i=0;i<2;i++) { int status; CHECK(waitpid(children[i],&status,0)==children[i] && status==0); }
     CHECK(run->checksum[0]==run->checksum[1] && run->checksum[0]);
-    CHECK(!munmap(run,4096)); record("process-affinity-overlap");
+    CHECK(!munmap(run,4096));
+    pin(online&2 ? 1 : 0);
+    CHECK(syscall(SYS_sync)==0);
+    int interface=socket(AF_INET,SOCK_DGRAM,0);CHECK(interface>=0);
+    struct ifreq query={0};memcpy(query.ifr_name,"lo",3);
+    CHECK(!ioctl(interface,SIOCGIFMTU,&query) && query.ifr_mtu>0 && !close(interface));
+    CHECK(syscall(SYS_sched_setaffinity,0,sizeof(online),&online)==0);
+    record("process-affinity-overlap");
 }
 static atomic_uint receiver_started, receiver_done;
 static void *receiver(void *unused)
@@ -89,6 +104,33 @@ static void *receiver(void *unused)
     atomic_store_explicit(&receiver_done,1,memory_order_release);
     return (void *)(uintptr_t)73;
 }
+static void empty_wait_signal(int use_select)
+{
+    int ready[2];CHECK(!pipe(ready));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){
+        CHECK(!close(ready[0]));pin(online&2 ? 1 : 0);tls_value=73;
+        atomic_store(&signal_seen,0);atomic_store(&nested_seen,0);
+        struct timespec timeout={10,0};
+        CHECK(write(ready[1],"r",1)==1);
+        int result=use_select ? pselect(0,NULL,NULL,NULL,&timeout,NULL) : ppoll(NULL,0,&timeout,NULL);
+        CHECK(result==-1 && errno==EINTR && atomic_load(&signal_seen)==1 && atomic_load(&nested_seen)==1);
+        _exit(0);
+    }
+    CHECK(!close(ready[1]));char byte;CHECK(read(ready[0],&byte,1)==1 && !close(ready[0]));
+    struct timespec start,now;CHECK(!clock_gettime(CLOCK_MONOTONIC,&start));
+    /* ready 只说明即将调用；实际 S 状态确认等待已登记，再从另一 CPU 发信号。 */
+    for(;;){
+        char path[64],text[512];snprintf(path,sizeof(path),"/proc/%ld/stat",(long)child);
+        int fd=open(path,O_RDONLY);CHECK(fd>=0);ssize_t n=read(fd,text,sizeof(text)-1);
+        CHECK(n>0 && !close(fd));text[n]=0;char *end=strrchr(text,')');CHECK(end);
+        if(end[2]=='S')break;
+        CHECK(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);
+        CHECK(!sched_yield());
+    }
+    CHECK(!kill(child,SIGUSR1));int status;
+    CHECK(waitpid(child,&status,0)==child && status==0);
+}
 static void thread_signal(void)
 {
     struct sigaction action={.sa_sigaction=signal_handler,.sa_flags=SA_SIGINFO|SA_NODEFER};
@@ -99,6 +141,7 @@ static void thread_signal(void)
     CHECK(!pthread_kill(thread,SIGUSR1));
     void *result; CHECK(!pthread_join(thread,&result) && result==(void *)(uintptr_t)73);
     CHECK(atomic_load_explicit(&receiver_done,memory_order_acquire));
+    empty_wait_signal(0);empty_wait_signal(1);
     record("pthread-tls-registers-nested-signal");
 }
 struct mapping_case { unsigned char *page; atomic_uint ready, command, result; int file; };
@@ -143,6 +186,43 @@ static void mapping_retirement(void)
 }
 static atomic_uint io_ready;
 static int io_pipe[2];
+static pthread_barrier_t close_pipe_gate;
+static int observed_pipes[2][2];
+static void *close_observed_pipe(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    pin(id && (online&2) ? 1 : 0);
+    int barrier=pthread_barrier_wait(&close_pipe_gate);
+    CHECK(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+    CHECK(!close(observed_pipes[id][1]));
+    return NULL;
+}
+static void epoll_peer_close(void)
+{
+    for (unsigned round=0;round<32;round++) {
+        int epoll=epoll_create1(0);CHECK(epoll>=0);
+        CHECK(!pthread_barrier_init(&close_pipe_gate,NULL,3));
+        pthread_t writers[2];
+        for (unsigned id=0;id<2;id++) {
+            CHECK(!pipe(observed_pipes[id]));
+            struct epoll_event event={.events=EPOLLIN,.data.u64=id+1};
+            CHECK(!epoll_ctl(epoll,EPOLL_CTL_ADD,observed_pipes[id][0],&event));
+            CHECK(!pthread_create(&writers[id],NULL,close_observed_pipe,(void *)(uintptr_t)id));
+        }
+        int barrier=pthread_barrier_wait(&close_pipe_gate);
+        CHECK(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+        for (unsigned id=0;id<2;id++) CHECK(!pthread_join(writers[id],NULL));
+        struct epoll_event ready[2];unsigned seen=0;
+        CHECK(epoll_wait(epoll,ready,2,1000)==2);
+        for (unsigned id=0;id<2;id++) {
+            CHECK(ready[id].data.u64>=1 && ready[id].data.u64<=2 && (ready[id].events&EPOLLHUP));
+            seen|=1U<<(ready[id].data.u64-1);
+        }
+        CHECK(seen==3);
+        for (unsigned id=0;id<2;id++) CHECK(!close(observed_pipes[id][0]));
+        CHECK(!close(epoll) && !pthread_barrier_destroy(&close_pipe_gate));
+    }
+}
 static void *cancel_reader(void *unused)
 {
     (void)unused; pin(online&2 ? 1 : 0);
@@ -154,7 +234,9 @@ static void cancellation(void)
     CHECK(!pipe(io_pipe)); pthread_t thread; CHECK(!pthread_create(&thread,0,cancel_reader,0));
     wait_flag(&io_ready,1); CHECK(!pthread_cancel(thread));
     void *result; CHECK(!pthread_join(thread,&result) && result==PTHREAD_CANCELED);
-    CHECK(!close(io_pipe[0]) && !close(io_pipe[1])); record("pthread-cancel-pipe-owner");
+    CHECK(!close(io_pipe[0]) && !close(io_pipe[1]));
+    epoll_peer_close();
+    record("pthread-cancel-pipe-owner");
 }
 static void *exec_thread(void *unused)
 {
@@ -260,7 +342,7 @@ static void remote_service_progress(void)
         pid_t service=fork(); CHECK(service>=0);
         if (!service) {
             pin(1); wait_flag(&shared->ready,1); set_policy(SCHED_FIFO,40);
-            for (unsigned i=0;i<16;i++) CHECK(syscall(SYS_getpid)>0);
+            for (unsigned i=0;i<16;i++) CHECK(syscall(SYS_setpgid,0,0)==0);
             atomic_store_explicit(&shared->finished,1,memory_order_release); _exit(0);
         }
         reap(service); reap(busy); CHECK(!munmap(shared,4096));
@@ -293,6 +375,8 @@ static void dynamic_tls(void)
 int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--exec-child")) return 23;
+    CHECK(!mkdir("/proc",0555) || errno==EEXIST);
+    CHECK(!mount("proc","/proc","proc",0,NULL) || errno==EBUSY);
     CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3));
     printf("USER-SMP BEGIN cpus=%u\n",online==3 ? 2 : 1); fflush(stdout);
     pin(0);

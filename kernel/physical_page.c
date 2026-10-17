@@ -353,13 +353,9 @@ enum physical_page_status physical_page_allocator_init(
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
 
-    result.pressure_notify = 0;
     kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_PAGE);
-    result.pressure_wait = 0;
-    result.pressure_context = 0;
+    result.reclaim_hooks = (struct physical_page_reclaim_hooks){0};
     result.shared_anon_pages = 0;
-    result.cache_snapshot = 0;
-    result.cache_context = 0;
     result.buffer_bytes = 0;
     result.buffer_context = 0;
     result.total_pages = 0U;
@@ -374,10 +370,7 @@ enum physical_page_status physical_page_allocator_init(
     result.initialized = 0U;
     result.finalized = 0U;
     result.reclaiming = 0U;
-    result.reclaim_depth = 0;
     result.access = 0;
-    result.reclaimer = 0;
-    result.reclaimer_context = 0;
     result.metadata = 0;
     result.roots = 0;
     result.tree = 0;
@@ -1200,13 +1193,18 @@ physical_page_allocator_finalize(struct physical_page_allocator *allocator)
 
 static enum physical_page_status
 physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t order,
-                                  uint64_t *address)
+                                  uint64_t *address,struct physical_page_reclaim_hooks *hooks)
 {
     PAGE_METADATA_SCOPE(work, a);
     if (!allocator_initialized(a) || !address || order > PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a))
         return PHYSICAL_PAGE_STATUS_STATE;
+    /* 本次分配已持元数据锁，在同一处取得回调借用，不再重新加锁取绑定。 */
+    if (hooks) {
+        *hooks=a->reclaim_hooks;
+        if (hooks->retain) hooks->retain(hooks->context);
+    }
     uint32_t found = order;
     while (found <= PHYSICAL_PAGE_MAX_ORDER)
     {
@@ -1250,6 +1248,22 @@ physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t or
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+/* 绑定在allocator短锁内固定；卸载只摘绑定，实际后备由本次借用持有。 */
+static struct physical_page_reclaim_hooks reclaim_hooks_acquire(
+    const struct physical_page_allocator *allocator)
+{
+    struct physical_page_reclaim_hooks hooks = {0};
+    if (!allocator_initialized(allocator)) return hooks;
+    KERNEL_RAW_SCOPE(guard, &((struct physical_page_allocator *)allocator)->lock);
+    hooks = allocator->reclaim_hooks;
+    if (hooks.retain) hooks.retain(hooks.context);
+    return hooks;
+}
+static void reclaim_hooks_release(struct physical_page_reclaim_hooks *hooks)
+{
+    if (hooks->release) hooks->release(hooks->context);
+}
+
 enum physical_page_status physical_page_allocate_order(
     struct physical_page_allocator *allocator,
     uint32_t order,
@@ -1257,38 +1271,29 @@ enum physical_page_status physical_page_allocate_order(
 {
     kernel_assert_can_block();
     COST_ADD(PAGE_CALLS, 1);
+    struct physical_page_reclaim_hooks hooks = {0};
     enum physical_page_status status =
-        physical_page_allocate_order_once(allocator, order, address);
-
-    {
-        /* 分发与 callback 取得自身 owner 之间不得被卸载。干净回收不睡眠；
-         * pressure_wait 在显式睡眠前自行 pin 组，不持有 buddy 修改状态。 */
-        KERNEL_IRQ_SCOPE(irq);
-        if (allocator_initialized(allocator) && allocator->pressure_notify) {
-            kernel_assert_service_context();
-            allocator->pressure_notify(allocator->pressure_context);
+        physical_page_allocate_order_once(allocator, order, address,&hooks);
+    if (hooks.notify) hooks.notify(hooks.context);
+    if (status == PHYSICAL_PAGE_STATUS_EMPTY && hooks.reclaim) {
+        uint32_t *depth = hooks.depth ? hooks.depth() : &allocator->reclaiming;
+        int entered;
+        if (hooks.depth) { entered = !*depth; if (entered) *depth = 1; }
+        else {
+            uint32_t expected = 0;
+            entered = __atomic_compare_exchange_n(depth, &expected, 1, 0,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         }
-        if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
-            allocator_initialized(allocator) &&
-            physical_page_allocator_is_finalized(allocator) &&
-            allocator->reclaimer != 0) {
-            kernel_assert_service_context();
-            uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
-            if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
-            if (depth != &allocator->reclaiming) *depth = 1U;
-            if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
-            allocator->reclaiming++;
-            (void)allocator->reclaimer(allocator->reclaimer_context,
-                                       order_page_count(order));
-            allocator->reclaiming--;
-            if (depth != &allocator->reclaiming) *depth = 0U;
-            if (allocator->available_pages < order_page_count(order) && allocator->pressure_wait)
-                allocator->pressure_wait(allocator->pressure_context);
-            status = physical_page_allocate_order_once(allocator,
-                                                       order,
-                                                       address);
+        if (entered) {
+            (void)hooks.reclaim(hooks.context, order_page_count(order));
+            if (hooks.depth) *depth = 0;
+            else __atomic_store_n(depth, 0, __ATOMIC_RELEASE);
+            if (physical_page_available(allocator) < order_page_count(order) && hooks.wait)
+                hooks.wait(hooks.context);
+            status = physical_page_allocate_order_once(allocator, order, address,NULL);
         }
     }
+    reclaim_hooks_release(&hooks);
 
     if (status == PHYSICAL_PAGE_STATUS_OK) {
         COST_ADD(PAGE_ACCEPTED, order_page_count(order)); COST_IO_ADD(7, order_page_count(order));
@@ -1333,6 +1338,18 @@ enum physical_page_status physical_page_release_order(struct physical_page_alloc
         physical_page_release_fatal(a,address,order,"not-finalized",address);
     }
     struct buddy_owner owner;
+    if (!order && page_lookup_work(a, address, 0, &page, &work)) {
+        struct physical_page_metadata *metadata = &a->metadata[page];
+        if (metadata->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
+            !metadata->order && metadata->reference_count > 1) {
+            struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
+            if (!head_valid(a, &head, &work))
+                physical_page_release_fatal(a,address,order,"allocated-block",address);
+            metadata->reference_count--;
+            page_written(&work);
+            return PHYSICAL_PAGE_STATUS_OK;
+        }
+    }
     int found = owner_at_address(a,address,&page,&owner,&work,0);
     if (!found) physical_page_release_fatal(a,address,order,"address-range",address);
     if (found < 0) physical_page_release_fatal(a,address,order,"tree-owner",address);
@@ -1436,12 +1453,12 @@ enum physical_page_status physical_page_acquire(struct physical_page_allocator *
 {
     PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
-    struct buddy_owner owner;
-    if (!physical_page_allocator_is_finalized(a) || (address & BOAROS_PAGE_MASK) ||
-        owner_at_address(a,address,&page,&owner,&work,0) != 1 || owner.first != page || owner.order ||
-        owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work) ||
-        a->metadata[page].reference_count == UINT32_MAX)
-        __builtin_trap();
+    if (!physical_page_allocator_is_finalized(a) ||
+        !page_lookup_work(a, address, 0, &page, &work)) __builtin_trap();
+    struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
+    if (!head_valid(a, &head, &work) ||
+        a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+        a->metadata[page].reference_count == UINT32_MAX) __builtin_trap();
     a->metadata[page].reference_count++;
     page_written(&work);
     return PHYSICAL_PAGE_STATUS_OK;
@@ -1453,48 +1470,50 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
 {
     PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
-    struct buddy_owner owner;
     if (!physical_page_allocator_is_finalized(a) || !references ||
-        owner_at_address(a,address,&page,&owner,&work,1) != 1 || owner.first != page ||
-        owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work))
-        __builtin_trap();
+        !page_lookup_work(a, address, 0, &page, &work)) __builtin_trap();
+    struct buddy_owner head = {.first=page, .order=a->metadata[page].order, .state=BUDDY_ALLOCATED};
+    if (a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+        !head_valid(a, &head, &work)) __builtin_trap();
     *references = a->metadata[page].reference_count;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
 enum physical_page_status physical_page_allocator_set_reclaimer(
     struct physical_page_allocator *allocator,
-    physical_page_reclaim_fn reclaimer,
-    void *context)
+    const struct physical_page_reclaim_hooks *hooks)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    if (!physical_page_allocator_is_finalized(allocator) ||
-        reclaimer == 0) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (allocator->reclaimer != 0 || allocator->reclaiming != 0U) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
-
-    allocator->reclaimer = reclaimer;
-    allocator->reclaimer_context = context;
+    if (!physical_page_allocator_is_finalized(allocator) || !hooks || !hooks->reclaim ||
+        (!!hooks->retain != !!hooks->release)) return PHYSICAL_PAGE_STATUS_INVALID;
+    KERNEL_RAW_SCOPE(guard, &allocator->lock);
+    if (allocator->reclaim_hooks.reclaim) return PHYSICAL_PAGE_STATUS_STATE;
+    if (hooks->retain) hooks->retain(hooks->context);
+    allocator->reclaim_hooks = *hooks;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
 enum physical_page_status physical_page_allocator_clear_reclaimer(
     struct physical_page_allocator *allocator)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    if (!physical_page_allocator_is_finalized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+    if (!physical_page_allocator_is_finalized(allocator)) return PHYSICAL_PAGE_STATUS_INVALID;
+    struct physical_page_reclaim_hooks hooks;
+    {
+        KERNEL_RAW_SCOPE(guard, &allocator->lock);
+        hooks = allocator->reclaim_hooks;
+        if (!hooks.reclaim) return PHYSICAL_PAGE_STATUS_STATE;
+        allocator->reclaim_hooks = (struct physical_page_reclaim_hooks){0};
     }
-    if (allocator->reclaimer == 0 || allocator->reclaiming != 0U) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
+    reclaim_hooks_release(&hooks);
+    return PHYSICAL_PAGE_STATUS_OK;
+}
 
-    allocator->reclaimer = 0;
-    allocator->reclaim_depth = 0;
-    allocator->reclaimer_context = 0;
+enum physical_page_status physical_page_map_owned(
+    const struct physical_page_allocator *allocator, uint64_t address,
+    void **pointer)
+{
+    void *mapped = allocator->access(address);
+    if (!mapped) return PHYSICAL_PAGE_STATUS_INVALID;
+    *pointer = mapped;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1572,6 +1591,7 @@ void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
     out->cached = out->shared;
     if (allocator->buffer_bytes)
         out->buffers = allocator->buffer_bytes(allocator->buffer_context);
-    if (allocator->cache_snapshot)
-        allocator->cache_snapshot(allocator->cache_context, out);
+    struct physical_page_reclaim_hooks hooks = reclaim_hooks_acquire(allocator);
+    if (hooks.snapshot) hooks.snapshot(hooks.context, out);
+    reclaim_hooks_release(&hooks);
 }

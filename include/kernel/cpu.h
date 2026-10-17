@@ -30,6 +30,7 @@ struct kernel_cpu {
     /* 当前地址空间记录借用由执行task的MM owner覆盖，切换失效后才清旧bit。 */
     void *active_mm_record;
     uint64_t active_mm_generation;
+    uint64_t active_mm_instruction_generation;
     struct kernel_task *idle;
     struct kernel_cpu *scheduler_next;
     struct kernel_rt_bandwidth rt_bandwidth;
@@ -39,6 +40,8 @@ struct kernel_cpu {
     struct kernel_io_context *bootstrap_io;
     unsigned need_resched;
     unsigned rotate_other;
+    uint64_t wait_notification_sequence;
+    unsigned wait_notification_depth;
 #if BOAROS_MAX_CPUS > 1
     uint32_t logical_id, state, events, outbound;
     struct { uint64_t period, next_deadline; int armed; } timer;
@@ -48,7 +51,7 @@ struct kernel_cpu {
     /* 借用任务执行/就绪owner，保留服务往返期间的实时用户资格。 */
     struct kernel_sched_runqueue user_reservations;
     uint64_t user_traps, user_returns, user_local_interrupts;
-    uint64_t service_dispatches, service_migrations, service_queue_ticks;
+    uint64_t syscall_dispatches, service_migrations, service_queue_ticks;
     uint64_t service_samples, service_elapsed_ticks, service_running_ns;
 #endif
 #endif

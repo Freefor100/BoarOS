@@ -57,7 +57,7 @@ metadata 地址，非法地址或 bootstrap 失败不读取 metadata，也不追
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_release()` 只在末引用消失时把页归还 buddy；
-`physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。高阶块仍是单 owner，
+`physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。普通零阶页按 PFN 定位元数据，在分配器锁内检查活块头并增减引用；非末引用释放不查询 buddy 祖先，末次释放才进入完整树验证和合并。分配、释放与合并同步维护块头状态和引用数，旧尾记录不能获得活页资格。高阶块仍是单 owner，
 不能通过单页 acquire 拆分引用，避免让连续分配的 tail 生命周期失去统一边界。引用达到
 `UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
@@ -69,6 +69,8 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap
 模式只能按发放历史检查；finalized 模式要求页首位于 allocated 权威块，允许连续块内的尾页页首，明确
 拒绝 free 和 internal 页。两种模式都只在访问回调返回非空指针后写输出。
+
+内部 `physical_page_map_owned()` 供已经持有分配页、页表或用户 pin 的调用者使用，直接调用绑定的映射函数，不再重复取得元数据锁或确认所有权。调用者必须覆盖整个访问期间的页寿命；分配、归还和首次接纳身份仍由各自边界负责。
 
 `physical_page_total()` 保留所有对齐可用页的原始总数；
 `physical_page_available()` 在 finalized 后排除 bootstrap owner 与 metadata；
@@ -88,11 +90,11 @@ free/split/allocated/internal为权威状态，inactive节点不拥有页，编�
 分裂先准备子状态再发布split，合并先摘链/退休子节点再发布free。无跨range合并；
 旧尾载荷不参与owner判断，不能用一段旧尾的状态替代树验证。
 
-只读的resolve、allocation_order和reference_count在页首载荷给出候选块头时，
+受检查的resolve和allocation_order在页首载荷给出候选块头时，
 验证该几何位置的活动ALLOCATED树节点和块头字段；正常块头查询为O(log R)，
 连续块内部页或过期hint回退到完整祖先查找。合并先退休子节点，所以旧尾载荷不能
 误认新owner。该快路径经人确认：祖先关系损坏的发现时点可推迟到修改或完整审计；
-块头/候选节点检查仍保留。分配、释放和增引用始终验证完整相关祖先链。
+块头/候选节点检查仍保留。分配与最终释放验证完整相关祖先链；零阶引用操作按上述活块头规则处理。
 
 热路径检查相关权威路径、块头引用与free-list双向连接，不扫描空闲块尾记录，也不
 重写最终合并块的全部页。小请求的检查受树/根目录深度约束，重写受split/coalesce
@@ -163,14 +165,14 @@ sink 来读取真实分配器输出，并检查合法共享单页及连续页释
 
 ## 内存快照与后台压力通知
 
-`kernel_memory_snapshot()` 输出字节单位的只读快照，由 procfs 与 sysinfo 共用。调用者在当前单 hart 的关中断边界内查询；不分配、不回收、不发起 I/O。总量/空闲量来自 buddy，共享匿名量由 `mm/memory_object.c` 在后备页发布和最终释放时维护，fork/别名/临时引用不重复计量。文件缓存按唯一 cache entry 计量，块缓冲按 ext4 bcache 已分配的 payload 计量，不把堆开销重复归入 Buffers。
+`kernel_memory_snapshot()` 输出字节单位的只读快照，由 procfs 与 sysinfo 共用。查询固定当前回收绑定的组引用，再分别取得可用的缓存保护；忙对象可保守漏计，不提供跨对象的瞬间一致快照。不分配、不回收、不发起 I/O。总量/空闲量来自 buddy，共享匿名量由 `mm/memory_object.c` 在后备页发布和最终释放时维护，fork/别名/临时引用不重复计量。文件缓存按唯一 cache entry 计量，块缓冲按 ext4 bcache 已分配的 payload 计量，不把堆开销重复归入 Buffers。
 
 文件页回收资格在查询时检查物理引用、映射别名、装载/写回/用户固定及最后写回错误。失败页重新修改后仍不计入可回收预算，直到写回成功；共享匿名页没有 swap，不能回收。`MemAvailable=max(free-low,0)+reclaimable-min(reclaimable/2,low)`，最终夹在 `[0,total]`；low 至少一页。它是估算，不承诺任意高阶连续分配成功。`pressure_notify` 只合并事件；`pressure_wait` 检查任务/锁/backend/递归上下文，分配器不拥有 inode/mount 的 I/O 错误。
 
 聚焦入口为 `test-page-riscv`、`test-vma-riscv`、`test-io-sleep-riscv`；包括共享后备页 fork 不重复计数、最终归零、缓存压力及 worker 启动分配失败回滚。
 
 多个磁盘缓存的统计累加各自驻留、脏页与写回页，MemAvailable 只扣一次全局
-低水位余量。通知与 dirty 阈值判断为 O(实例数)，完整快照为 O(总缓存项数)。
+低水位余量。通知为 O(实例数)，全组脏页数随实际脏项增减维护，完整快照为 O(总缓存项数)。
 安全 OOM 路径等待共同一轮的首次实际释放进展，或所有参与 worker 完成；不逐盘
 串行等待。worker 与等待者各自保持 owner 引用，注销和唤醒不依赖借用悬空指针。
 统一内存后备对象的 tmpfs 页与共享匿名页同计 Shmem，不进入磁盘回收候选。
@@ -182,12 +184,9 @@ worker 在 SIE 开启时也调用堆和物理页分配器。`kernel/irq.h` 的 s
 恢复本 hart 的 SIE；嵌套进入不会提前打开中断，所有正常/失败返回均恢复调用者状态。
 bootstrap 回收链也使用该边界，避免 idle 安全 IRQ 返回中执行另一 owner 后破坏链。
 
-每次buddy分配尝试释放raw锁后才进行压力回调分发。分发仍按单CPU契约另行关闭IRQ，使callback函数与
-context 的读取、非阻塞干净回收、以及等待回调取得自身 owner 之间不能被卸载插入。
-`pressure_wait` 在显式睡眠前增加既有缓存组引用，睡眠期间允许其他任务运行、释放页
-和卸载最后缓存；此时没有未完成的 buddy/heap 元数据修改。回收递归深度在进入等待前
-清零，返回后只重新尝试 buddy 分配，不再借用旧缓存 context。这不是跨 I/O 持有分配器锁。
-干净回收仍在 IRQ-off 的调用契约内扫描，后续若需可抢占扫描必须另行定义缓存游标与引用。
+每次 buddy 分配尝试释放 raw 锁后才分发压力回调。回收、通知、等待与快照组成一个绑定，在 allocator raw 内完整发布或摘除；分配在原有持锁范围内取得已有缓存组引用，不为读取绑定再次加锁。回调在锁外执行并恢复调用者的 IRQ 状态；远端 CPU 的正常分配也可发布通知。注销不等待另一个调用栈返回，最后一个实例、绑定和在途回调各自归还引用后才释放组。
+
+组的短锁保护成员和等待轮次；遍历资格保持成员存活。同步干净回收只尝试取得缓存 mutex，忙时跳过，不等锁、不写磁盘；释放数据页后由已有 worker 清理剩余节点。脏数据仍由原 worker 回写。等待前结束本次回收递归深度，等待期间由回调引用覆盖组寿命；返回后只重试 buddy 分配，不访问已经摘除的绑定。
 
 宿主抢占回归在生产函数入口/出口逐一模拟一次 timer 切换，IRQ-off 时推迟到恢复后；
 断言只检查公共分配/引用/释放结果、不同 owner 的内容互不覆盖、heap 统计和空闲页归还，

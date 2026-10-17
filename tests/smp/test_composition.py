@@ -18,6 +18,15 @@ class CompositionReports(unittest.TestCase):
                      banner.replace(' tick-hz',user+' tick-hz')):
             with self.subTest(text=text),self.assertRaises(RuntimeError):
                 module.validate_boot_output(text)
+    def test_shutdown_drains_the_entire_user_tail_before_diagnostics(self):
+        module=self.checker()
+        tail='COMPOSITION shutdown-tail '+'x'*358+'\n'
+        final=' root-heap-peak-pages=131\n'
+        module.validate_shutdown_output(tail+final)
+        for text in (final,tail,tail+tail+final,final+tail,
+                     tail[:128]+final+tail[128:]):
+            with self.subTest(text=text),self.assertRaises(RuntimeError):
+                module.validate_shutdown_output(text)
     def test_controlled_owner_evidence_is_not_a_functional_marker(self):
         module=self.checker()
         good=('BoarOS: COMPOSITION owners held=0x100 released=0x100 reclaimed=0x2 '
@@ -31,6 +40,12 @@ class CompositionReports(unittest.TestCase):
             with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_controlled(bad)
         single=good.replace('remote-retirement=0x1','remote-retirement=0x0')
         module.validate_controlled(single,cpus=1)
+        sqlite=(single.replace('oom=0x1','oom=0x0').replace('retirement=0x1','retirement=0x0')
+                .replace('waits=0x7b','waits=0x0'))
+        for cpus in (1,2):
+            module.validate_controlled(sqlite,sqlite=True,cpus=cpus)
+            with self.assertRaises(RuntimeError):
+                module.validate_controlled(sqlite.replace('reclaimed=0x2','reclaimed=0x0'),sqlite=True,cpus=cpus)
     def test_functional_stream_is_complete_and_exact(self):
         module=self.checker()
         lines='\n'.join(f'COMPOSITION CASE {case} OK' for case in module.CASES)+f'\nCOMPOSITION END {len(module.CASES)}\n'
@@ -57,19 +72,21 @@ class CompositionReports(unittest.TestCase):
                     good.replace('file-fault-race-syncs=0x1','file-fault-race-syncs=0x2'),good+good):
             with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_file_fault_race(bad)
 
-    def test_ordinary_reads_require_real_hart_copies_continuation_and_wait_owners(self):
+    def test_ordinary_io_requires_issuing_cpu_copies_pins_batch_and_wait_owners(self):
         module=self.checker()
-        good=('COMPOSITION ordinary-read phases=0x9 local=0x5 service=0x4 '
-              'copy0=0x2e copy1=0x54 migrations=0x5 borrowed=0x1 close=0x1 seek=0x1 fork=0x1\n')
-        module.validate_ordinary_reads(good)
-        for bad in ('',good+good,good.replace('copy1=0x54','copy1=0x0'),
-                    good.replace('copy0=0x2e','copy0=0x2f'),good.replace('migrations=0x5','migrations=0x0'),
-                    good.replace('borrowed=0x1','borrowed=0x0'),good.replace('fork=0x1','fork=0x0')):
-            with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_ordinary_reads(bad)
-        single=good.replace('copy0=0x2e copy1=0x54 migrations=0x5 borrowed=0x1',
-                            'copy0=0x82 copy1=0x0 migrations=0x0 borrowed=0x0')
-        module.validate_ordinary_reads(single,cpus=1)
-        with self.assertRaises(RuntimeError):module.validate_ordinary_reads(good,cpus=1)
+        good=('COMPOSITION ordinary-io phases=0xa local=0xa '
+              'copy0=0x0 copy1=0x10082 batch=0x1 local-faults=0x1 writes=0x3 '
+              'write-pin0=0x0 write-pin1=0x4 close=0x1 seek=0x1 fork=0x1\n')
+        module.validate_ordinary_io(good)
+        for bad in ('',good+good,good.replace('copy1=0x10082','copy1=0x10081'),
+                    good.replace('copy0=0x0','copy0=0x1'),good.replace('batch=0x1','batch=0x0'),
+                    good.replace('write-pin1=0x4','write-pin1=0x0'),good.replace('fork=0x1','fork=0x0'),
+                    good.replace('local-faults=0x1','local-faults=0x0')):
+            with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_ordinary_io(bad)
+        single=good.replace('copy0=0x0 copy1=0x10082','copy0=0x10082 copy1=0x0').replace(
+            'write-pin0=0x0 write-pin1=0x4','write-pin0=0x4 write-pin1=0x0')
+        module.validate_ordinary_io(single,cpus=1)
+        with self.assertRaises(RuntimeError):module.validate_ordinary_io(good,cpus=1)
 
     def test_build_root_can_isolate_toolchain_specific_objects(self):
         module=self.checker()

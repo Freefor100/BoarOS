@@ -10,11 +10,13 @@
 #include <kernel/mm_backend.h>
 #include <kernel/open_file.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/tty.h>
 #include <kernel/wait_internal.h>
 #include "../../mm/uaccess_internal.h"
 #include <string.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/char_device_internal.h"
 #include "../smp/composition_protocol.h"
 
 struct held_page { uint64_t address; uint32_t order; };
@@ -34,10 +36,11 @@ static unsigned fault_race_armed;
 static unsigned fault_race_file;
 static unsigned stopping;
 static unsigned boot_banner_waiting, boot_user_output;
+static unsigned shutdown_tail_held;
 static uint64_t read_tid,read_address,read_size,read_flags,read_hart;
-static uint64_t read_copies[2],read_moves,read_phases,read_local_phases,read_service_phases;
-static uint64_t read_close_phases,read_seek_phases,read_fork_phases,read_total_copies[2],read_total_moves;
-static uint64_t read_offset_moves;
+static uint64_t read_copies[2],read_phases,read_local_phases,write_phases,write_pins[2],write_total_pins[2];
+static uint64_t read_backend_calls,read_backend_bytes,read_batches,read_user_faults;
+static uint64_t read_close_phases,read_seek_phases,read_fork_phases,read_total_copies[2];
 static struct kernel_task *read_waiter;
 static uint64_t read_wait_generation;
 static struct kernel_mm *read_revoke_mm;
@@ -55,9 +58,16 @@ static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
 {
+    if (shutdown_tail_held) return 0;
     size_t accepted=__real_kernel_tty_service_output(tty,budget);
     if (boot_banner_waiting && accepted) boot_user_output=1;
     return accepted;
+}
+int __real_ns16550_stop_report(struct ns16550_port **,struct ns16550_statistics *);
+int __wrap_ns16550_stop_report(struct ns16550_port **port,struct ns16550_statistics *statistics)
+{
+    shutdown_tail_held=0;
+    return __real_ns16550_stop_report(port,statistics);
 }
 void __real_virt_uart_puts(const char *);
 void __wrap_virt_uart_puts(const char *text)
@@ -114,7 +124,8 @@ static void arm_read(void)
     read_size=composition_load(&control->read_size);read_flags=composition_load(&control->read_flags);
     read_hart=composition_load(&control->read_hart);
     check(read_tid && read_address && read_size && read_hart<2);
-    read_copies[0]=read_copies[1]=read_moves=0;read_waiter=NULL;
+    read_copies[0]=read_copies[1]=write_pins[0]=write_pins[1]=0;
+    read_backend_calls=read_backend_bytes=0;read_waiter=NULL;
     if(read_flags&COMPOSITION_READ_COLD) {
         struct kernel_vfs_file source={0};
         check(!kernel_vfs_open(&root->mount,"/ordinary-read-source",&source));
@@ -127,31 +138,39 @@ static void finish_read(void)
     check(read_tid && !read_waiter && !read_revoke_mm);
     if(read_flags&COMPOSITION_READ_LOCAL) {
         check(read_copies[read_hart] && !read_copies[read_hart^1]);
-        if(!(read_flags&COMPOSITION_READ_CLOSE))check(!read_moves);
         read_local_phases++;
     }
-    if(read_flags&COMPOSITION_READ_SERVICE) {
-        if(read_flags&COMPOSITION_READ_PREFIX)check(read_copies[0]+read_copies[1]==2);
-        else check(read_copies[0]);
-        if(read_hart)check(read_moves);
-        read_service_phases++;
+    if(read_flags&COMPOSITION_READ_BATCH) {
+        check(read_backend_calls==1 && read_backend_bytes==65536);
+        read_batches++;
+    }
+    if(read_flags&COMPOSITION_WRITE_LOCAL) {
+        check(write_pins[read_hart] && !write_pins[read_hart^1]);
+        write_phases++;
+        write_total_pins[0]+=write_pins[0];write_total_pins[1]+=write_pins[1];
     }
     if(read_flags&COMPOSITION_READ_CLOSE) {
-        if(read_hart)check(read_moves);
         read_close_phases++;
     }
     if(read_flags&COMPOSITION_READ_SEEK) {
         check(composition_load(&control->read_waited)==1);
-        if(read_hart)check(read_offset_moves==1);
         read_seek_phases++;
     }
     if(read_flags&COMPOSITION_READ_FORK) { check(composition_load(&control->read_waited)==1);read_fork_phases++; }
-    read_total_copies[0]+=read_copies[0];read_total_copies[1]+=read_copies[1];read_total_moves+=read_moves;
-    read_phases++;read_tid=0;
+    read_total_copies[0]+=read_copies[0];read_total_copies[1]+=read_copies[1];
+    if (!(read_flags&COMPOSITION_WRITE_LOCAL)) read_phases++;
+    read_tid=0;
 }
 static void pressure(void)
 {
     check(!ledger_count);
+    struct kernel_vfs_file source={0};
+    uint64_t page;size_t valid;
+    struct kernel_page_cache_statistics before,after;
+    check(!kernel_vfs_open(&root->mount,"/observer",&source));
+    check(!kernel_page_cache_get(&root->page_cache,&source,0,&page,&valid) && valid);
+    kernel_page_cache_get_statistics(&root->page_cache,&before);
+    check(physical_page_release(allocator,page)==PHYSICAL_PAGE_STATUS_OK);
     uint64_t low=physical_page_total(allocator)/50;
     while (!stopping && physical_page_available(allocator)>low) {
         uint64_t free=physical_page_available(allocator), address;
@@ -163,8 +182,18 @@ static void pressure(void)
         held+=UINT64_C(1)<<order;
         if (!(ledger_count&31U)) relinquish();
     }
-    /* 实际系统缓存回收；控制页属于tmpfs，不借用被驱逐的缓存entry。 */
-    reclaimed+=kernel_page_cache_reclaim(&root->page_cache,128);
+    /* observer页不映射到用户空间；计入加压分配触发的后台回收，
+     * 不要求最后一次同步调用抢在worker之前回收同一张页。 */
+    (void)kernel_page_cache_reclaim(&root->page_cache,128);
+    uint64_t deadline=kernel_time_monotonic_ns()+UINT64_C(10000000000);
+    for (;;) {
+        kernel_page_cache_get_statistics(&root->page_cache,&after);
+        if (after.pages_reclaimed>before.pages_reclaimed) break;
+        /* worker按轮发布回收计数，摘除候选后可能尚未结束该轮。 */
+        check(kernel_time_monotonic_ns()<deadline);relinquish();
+    }
+    reclaimed+=after.pages_reclaimed-before.pages_reclaimed;
+    check(!kernel_vfs_close(&source));
 }
 static void close_observer(struct kernel_vfs_file *file, uint64_t page,
                           int page_reference)
@@ -265,16 +294,35 @@ void riscv_user_composition_finish(void)
     stopping=1;kernel_thread_join(&controller);
     check(!control && !ledger && !ledger_count && held==released && !failed_tid && !watched_tid &&
           !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm);
+    /* 留下超过worker单轮预算的真实TTY尾部，直到stop才允许发送。 */
+    uintptr_t irq=arch_interrupt_save();
+    const struct kernel_char_device *device=kernel_tty_device_lookup(0x440);
+    void *instance=0;
+    check(device && !device->open(&root->heap,kernel_task_current(),
+          KERNEL_FILES_O_NONBLOCK|0400U,0,&instance));
+    char tail[385];
+    const char prefix[]="COMPOSITION shutdown-tail ";
+    memcpy(tail,prefix,sizeof(prefix)-1);
+    memset(tail+sizeof(prefix)-1,'x',sizeof(tail)-sizeof(prefix));
+    tail[sizeof(tail)-1]='\n';
+    shutdown_tail_held=1;
+    size_t written=0;
+    check(!device->write(instance,kernel_task_current(),KERNEL_FILES_O_NONBLOCK,
+                        tail,sizeof(tail),&written) && written==sizeof(tail));
+    device->release(instance);
+    arch_interrupt_restore(irq);
 }
 void riscv_user_composition_report(void)
 {
-    virt_uart_puts("BoarOS: COMPOSITION ordinary-read phases=");virt_uart_put_hex(read_phases);
+    virt_uart_puts("BoarOS: COMPOSITION ordinary-io phases=");virt_uart_put_hex(read_phases);
     virt_uart_puts(" local=");virt_uart_put_hex(read_local_phases);
-    virt_uart_puts(" service=");virt_uart_put_hex(read_service_phases);
     virt_uart_puts(" copy0=");virt_uart_put_hex(read_total_copies[0]);
     virt_uart_puts(" copy1=");virt_uart_put_hex(read_total_copies[1]);
-    virt_uart_puts(" migrations=");virt_uart_put_hex(read_total_moves);
-    virt_uart_puts(" borrowed=");virt_uart_put_hex(read_offset_moves);
+    virt_uart_puts(" batch=");virt_uart_put_hex(read_batches);
+    virt_uart_puts(" local-faults=");virt_uart_put_hex(read_user_faults);
+    virt_uart_puts(" writes=");virt_uart_put_hex(write_phases);
+    virt_uart_puts(" write-pin0=");virt_uart_put_hex(write_total_pins[0]);
+    virt_uart_puts(" write-pin1=");virt_uart_put_hex(write_total_pins[1]);
     virt_uart_puts(" close=");virt_uart_put_hex(read_close_phases);
     virt_uart_puts(" seek=");virt_uart_put_hex(read_seek_phases);
     virt_uart_puts(" fork=");virt_uart_put_hex(read_fork_phases);virt_uart_puts("\n");
@@ -328,8 +376,11 @@ enum kernel_mm_status __wrap_kernel_mm_munmap(struct kernel_mm *mm,uint64_t addr
 void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
 void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 {
+    kernel_pid_t publisher=0;
     if (__atomic_load_n(&fault_race_armed,__ATOMIC_ACQUIRE) &&
-        address==(fault_race_address&~BOAROS_PAGE_MASK) && size==BOAROS_PAGE_SIZE) {
+        ((address==(fault_race_address&~BOAROS_PAGE_MASK) && size==BOAROS_PAGE_SIZE) ||
+         (!address && size==UINT64_MAX)) && !kernel_task_tid(kernel_task_current(),&publisher) &&
+        ((uint64_t)publisher==fault_race_tasks[0] || (uint64_t)publisher==fault_race_tasks[1])) {
         if (fault_race_file) fault_file_syncs++;
         else fault_race_syncs++;
     }
@@ -350,16 +401,14 @@ void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,
     }
     __real_riscv_smp_sync_user(targets,address,size,instructions);
 }
-enum kernel_page_cache_status __real_kernel_open_file_get_page(
-    struct kernel_open_file_description *,uint64_t,uint64_t *,size_t *);
-enum kernel_page_cache_status __wrap_kernel_open_file_get_page(
-    struct kernel_open_file_description *file,uint64_t index,
-    uint64_t *address,size_t *valid)
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
+    struct kernel_open_file_page_preparation *);
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
+    struct kernel_open_file_page_preparation *prepared)
 {
-    enum kernel_page_cache_status status=
-        __real_kernel_open_file_get_page(file,index,address,valid);
+    int status=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
     kernel_pid_t tid=0;
-    if (status==KERNEL_PAGE_CACHE_STATUS_OK && index==0 &&
+    if (!status && index==0 &&
         __atomic_load_n(&fault_race_armed,__ATOMIC_ACQUIRE) && fault_race_file &&
         !kernel_task_tid(kernel_task_current(),&tid) && tid>0 &&
         (uint64_t)tid==fault_race_tasks[0]) {
@@ -368,6 +417,19 @@ enum kernel_page_cache_status __wrap_kernel_open_file_get_page(
         while (!__atomic_load_n(&fault_file_resolved,__ATOMIC_ACQUIRE)) relinquish();
     }
     return status;
+}
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
+    struct file_read_workspace *workspace, const struct file_read_completion *completion)
+{
+    kernel_pid_t tid=0;
+    struct kernel_task *owner=kernel_io_context_current()->account_task;
+    if(owner && read_tid && !kernel_task_tid(owner,&tid) && (uint64_t)tid==read_tid) {
+        check(!kernel_cpu_current()->logical_id);
+        read_backend_calls++;
+        for(size_t i=0;i<count;i++)read_backend_bytes+=spans[i].size;
+    }
+    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace, completion);
 }
 void riscv_user_composition_fault_retry(uint64_t address,int resumed)
 {
@@ -420,20 +482,16 @@ static void hold_read_pin(enum kernel_mm_status status,uint64_t address,uint32_t
         while(!composition_load(&control->read_release))relinquish();
     }
 }
-enum kernel_mm_status __real_kernel_mm_try_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
-enum kernel_mm_status __wrap_kernel_mm_try_pin_user_page(const struct kernel_mm *mm,
-    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
-{
-    enum kernel_mm_status status=__real_kernel_mm_try_pin_user_page(mm,address,access,pin);
-    hold_read_pin(status,address,access,pin);
-    return status;
-}
 enum kernel_mm_status __real_kernel_mm_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *mm,
     uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     enum kernel_mm_status status=__real_kernel_mm_pin_user_page(mm,address,access,pin);
     hold_read_pin(status,address,access,pin);
+    if(!status && access==KERNEL_MM_READ && reading_task() && (read_flags&COMPOSITION_WRITE_LOCAL) &&
+        address>=read_address && address-read_address<read_size) {
+        unsigned cpu=kernel_cpu_current()->logical_id;check(cpu==read_hart);write_pins[cpu]++;
+    }
     return status;
 }
 enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
@@ -449,21 +507,6 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel
         read_copies[cpu]+=*copied;
     }
     return result;
-}
-void __real_kernel_scheduler_enter_user_service_borrowing(const struct kernel_lock_guard *);
-void __wrap_kernel_scheduler_enter_user_service_borrowing(const struct kernel_lock_guard *borrowed)
-{
-    struct kernel_task *task=kernel_task_current();int watched=reading_task();
-    if(watched) {
-        check(!kernel_io_context_current()->user_pins && !kernel_io_context_current()->cache_writes);
-        if(borrowed) {
-            check(borrowed->owner==kernel_io_context_current() && kernel_lock_held(borrowed->lock,1));
-            if(read_flags&COMPOSITION_READ_SEEK)read_offset_moves++;
-        }
-        read_moves++;
-    }
-    __real_kernel_scheduler_enter_user_service_borrowing(borrowed);
-    if(watched)check(kernel_task_current()==task && !kernel_cpu_current()->logical_id);
 }
 enum kernel_mm_status __real_kernel_mm_fork(struct kernel_mm *,struct kernel_mm *);
 enum kernel_mm_status __wrap_kernel_mm_fork(struct kernel_mm *destination,struct kernel_mm *source)
@@ -495,7 +538,13 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
         participant=tid==(kernel_pid_t)fault_race_tasks[0] ||
                     tid==(kernel_pid_t)fault_race_tasks[1];
     }
-    if (!participant) return __real_kernel_mm_resolve_user_fault(mm,address,access);
+    if (!participant) {
+        int local_io=reading_task() && address>=read_address && address-read_address<read_size;
+        if(local_io)check(kernel_cpu_current()->logical_id==read_hart);
+        enum kernel_mm_status status=__real_kernel_mm_resolve_user_fault(mm,address,access);
+        if(local_io && !status) { check(kernel_cpu_current()->logical_id==read_hart);read_user_faults++; }
+        return status;
+    }
 
     if (fault_race_file) {
         __atomic_fetch_add(&fault_file_arrivals,1,__ATOMIC_ACQ_REL);
@@ -512,6 +561,8 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
             __atomic_fetch_add(&fault_race_stale,1,__ATOMIC_RELEASE);
         }
     }
+    int local_io=reading_task() && address>=read_address && address-read_address<read_size;
+    if(local_io)check(kernel_cpu_current()->logical_id==read_hart);
     enum kernel_mm_status status=__real_kernel_mm_resolve_user_fault(mm,address,access);
     check(status==KERNEL_MM_STATUS_OK);
     uint64_t resolved=fault_race_file
@@ -519,5 +570,6 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
         : __atomic_fetch_add(&fault_race_resolved,1,__ATOMIC_ACQ_REL)+1;
     check(resolved<=2);
     if (resolved==2) __atomic_store_n(&fault_race_armed,0,__ATOMIC_RELEASE);
+    if(local_io && !status) { check(kernel_cpu_current()->logical_id==read_hart);read_user_faults++; }
     return status;
 }

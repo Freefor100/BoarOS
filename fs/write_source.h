@@ -26,6 +26,13 @@ static inline size_t kernel_vfs_write_source_span(
     return kernel_uaccess_iov_span(&source->user, limit, &address);
 }
 
+static inline void kernel_vfs_write_source_use_pin(
+    struct kernel_vfs_write_source *source, const struct kernel_mm_user_pin *pin)
+{
+    uint64_t address=source->user.iov[source->user.index].base+source->user.offset;
+    source->data=(const unsigned char *)pin->page+(address&BOAROS_PAGE_MASK);
+}
+
 static inline int kernel_vfs_write_source_pin(
     struct kernel_vfs_write_source *source, struct kernel_mm_user_pin *pin)
 {
@@ -33,7 +40,7 @@ static inline int kernel_vfs_write_source_pin(
     uint64_t address = source->user.iov[source->user.index].base + source->user.offset;
     source->access = kernel_uaccess_pin_user_page(source->mm, address, KERNEL_MM_READ, pin);
     if (source->access) return 0;
-    source->data = (const unsigned char *)pin->page + (address & BOAROS_PAGE_MASK);
+    kernel_vfs_write_source_use_pin(source,pin);
     return 1;
 }
 

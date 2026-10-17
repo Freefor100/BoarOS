@@ -44,16 +44,17 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 /* Borrow with IRQs disabled; pin before restoring IRQs unless a live owner
  * already covers the target. Namespace locking alone does not exclude reclaim. */
 struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t inode);
-int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
-int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
 #define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX
 /* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX
  * nonoverlapping, valid kernel destinations until return. Successful spans
  * may stop at EOF; errors preserve each contiguous byte prefix. Multi-output
- * calls lend an independent request workspace through synchronous completion. */
+ * calls lend an independent request workspace through synchronous completion.
+ * An optional completion publishes a final span before batch drain, at most once;
+ * unreported results arrive on return. Its result pointer
+ * is borrowed only during the callback. No later payload writes follow it. */
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace);
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion);
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           uint64_t offset,
@@ -84,6 +85,7 @@ void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count);
 
+/* 调用者已有node owner；尺寸由inode修改者发布，不重复查询生命周期。 */
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node);
 const struct kernel_vfs_mount *kernel_vfs_node_mount(
     const struct kernel_vfs_node *node);
@@ -93,6 +95,9 @@ struct kernel_page_cache *kernel_vfs_file_page_cache(
 
 int kernel_vfs_node_try_read(struct kernel_vfs_node *node, struct kernel_lock_guard *guard);
 void kernel_vfs_namespace_lock(struct kernel_vfs_mount *mount, struct kernel_lock_guard *guard);
+/* 调用者已取得write_operation，CPU0执行者只借用，不能排队后再等同一门闩。 */
+int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *, uint64_t,
+    const struct kernel_lock_guard *);
 /* Whole syscall write/truncate gate; rank 15, before namespace/inode locks. */
 void kernel_vfs_file_write_lock(struct kernel_vfs_file *file,
     struct kernel_lock_guard *guard);

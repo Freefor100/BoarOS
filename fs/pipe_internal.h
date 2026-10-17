@@ -33,7 +33,6 @@ struct kernel_pipe {
     uint64_t bytes;
     struct kernel_vfs_node *fifo_node; /* 弱关联；每个owner另持节点引用。 */
     uint32_t owners;
-    uint8_t concurrent; /* 复用代次前的对齐空隙；受控pipe不接未同步epoll。 */
     uint64_t reader_generation, writer_generation;
     uint32_t readers;
     uint32_t writers;
@@ -69,8 +68,7 @@ enum kernel_pipe_status kernel_pipe_create(
     struct kernel_pipe **owner);
 /* 私有发布检查全部端点与队列owner；commit前所有pipe必须先检查通过。
  * 已sealed的pipe只能经已校验域继续安装，不产生域外观察者。 */
-int kernel_pipe_enable_concurrency(struct kernel_pipe *, uint32_t owners,
-    uint32_t readers, uint32_t writers, int commit);
+
 
 int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node,
     uint32_t flags, struct kernel_pipe **owner, uint8_t *endpoint,
@@ -85,6 +83,7 @@ int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid);
 enum kernel_pipe_status kernel_pipe_destroy_unowned(
     struct kernel_pipe *pipe);
 
+int kernel_pipe_check_task_domain(struct kernel_pipe *);
 enum kernel_pipe_status kernel_pipe_acquire_endpoint(
     struct kernel_pipe *pipe,
     uint32_t endpoint);

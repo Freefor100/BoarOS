@@ -1,11 +1,15 @@
+#include <kernel/scheduler.h>
 #include "private.h"
+#include "../../mm/uaccess_internal.h"
 
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/mm.h>
+#include <kernel/page.h>
 #include <kernel/memory_object.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
+#include <kernel/vfs.h>
 
 #define FUTEX_BUCKETS 256U
 #define FUTEX_PRIVATE 128U
@@ -22,8 +26,10 @@ static struct kernel_wait_queue buckets[FUTEX_BUCKETS];
 
 static void futex_key_release(struct kernel_futex_key *key)
 {
-    if (key->kind == KERNEL_FUTEX_KEY_SHARED_ANON)
+    if (key->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY)
         kernel_memory_object_release(&key->shared_object);
+    else if (key->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
+             kernel_vfs_node_release(&key->file_node)) __builtin_trap();
     *key = (struct kernel_futex_key){0};
 }
 
@@ -31,56 +37,16 @@ static int64_t futex_key_acquire(
     struct kernel_task *task, uint64_t address, uint32_t operation,
     struct kernel_futex_key *key, enum kernel_scheduler_status *status)
 {
-    struct kernel_vma vma;
-    enum kernel_mm_status mm_status;
-    enum kernel_uaccess_status access;
-    uint64_t mm_id;
-    uint32_t ignored;
-    size_t copied = 0U;
-
-    *key = (struct kernel_futex_key){0};
-    if ((operation & FUTEX_PRIVATE) == 0U) {
-        /* Linux resolves a non-private key through the user mapping, even
-         * for WAKE. This also rejects inaccessible or stale addresses. */
-        access = kernel_copy_from_user(&task->mm, &ignored, address,
-                                       sizeof(ignored), &copied);
-        if (access == KERNEL_UACCESS_STATUS_FAULT ||
-            (access == KERNEL_UACCESS_STATUS_OK && copied != sizeof(ignored)))
-            return -KERNEL_EFAULT;
-        if (access != KERNEL_UACCESS_STATUS_OK) {
-            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            return 0;
-        }
-        mm_status = kernel_mm_vma_lookup(&task->mm, address, &vma);
-        if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED)
-            return -KERNEL_EFAULT;
-        if (mm_status != KERNEL_MM_STATUS_OK) {
-            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            return 0;
-        }
-        if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED) {
-            struct kernel_memory_object *object = vma.backing;
-
-            if (object == 0 ||
-                kernel_memory_object_acquire(object) != KERNEL_MEMORY_OBJECT_OK) {
-                *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-                return 0;
-            }
-            key->identity = (uint64_t)(uintptr_t)object;
-            key->offset = vma.backing_offset + address - vma.start;
-            key->shared_object = object;
-            key->kind = KERNEL_FUTEX_KEY_SHARED_ANON;
-            return 0;
-        }
-    }
-    mm_status = kernel_mm_futex_id(&task->mm, &mm_id);
-    if (mm_status != KERNEL_MM_STATUS_OK) {
+    enum kernel_mm_status result = kernel_mm_acquire_futex_key(
+        &task->mm, address, (operation & FUTEX_PRIVATE) == 0, key);
+    if (result == KERNEL_MM_STATUS_NO_MEMORY) return -KERNEL_ENOMEM;
+    if (result == KERNEL_MM_STATUS_NOT_MAPPED ||
+        result == KERNEL_MM_STATUS_ACCESS ||
+        result == KERNEL_MM_STATUS_ADDRESS_SPACE ||
+        result == KERNEL_MM_STATUS_BUS_FAULT)
+        return -KERNEL_EFAULT;
+    if (result != KERNEL_MM_STATUS_OK)
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        return 0;
-    }
-    key->identity = mm_id;
-    key->offset = address;
-    key->kind = KERNEL_FUTEX_KEY_PRIVATE;
     return 0;
 }
 
@@ -110,9 +76,11 @@ static void futex_key_requeue(struct kernel_task *task,
 {
     struct kernel_futex_key old;
 
-    if (target->kind == KERNEL_FUTEX_KEY_SHARED_ANON &&
+    if (target->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY &&
         kernel_memory_object_acquire(target->shared_object) !=
             KERNEL_MEMORY_OBJECT_OK) __builtin_trap();
+    if (target->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
+        kernel_vfs_node_acquire(target->file_node)) __builtin_trap();
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       old = task->futex_key;
       task->futex_key = *target; }
@@ -172,7 +140,7 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     uint64_t deadline = 0U;
     int64_t result;
     int expired = 0;
-    size_t copied = 0U;
+    struct kernel_mm_user_pin pin = {0};
     enum kernel_wait_wake_reason reason;
     enum kernel_uaccess_status access;
 
@@ -189,19 +157,21 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     result = futex_key_acquire(task, address, operation, &key, status);
     if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0)
         return result;
-    access = kernel_copy_from_user(&task->mm, &actual, address,
-                                   sizeof(actual), &copied);
+    access = kernel_uaccess_pin_user_page(&task->mm,address,KERNEL_MM_READ,&pin);
     if (access != KERNEL_UACCESS_STATUS_OK &&
         access != KERNEL_UACCESS_STATUS_FAULT) {
         futex_key_release(&key);
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
-    if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(actual)) {
+    if (access != KERNEL_UACCESS_STATUS_OK) {
         futex_key_release(&key);
         return -KERNEL_EFAULT;
     }
+    const uint32_t *word=(const uint32_t *)((const unsigned char *)pin.page+(address&BOAROS_PAGE_MASK));
+    actual=__atomic_load_n(word,__ATOMIC_ACQUIRE);
     if (actual != value || expired) {
+        kernel_mm_unpin_user_page(&pin);
         futex_key_release(&key);
         return actual != value ? -KERNEL_EAGAIN : -KERNEL_ETIMEDOUT;
     }
@@ -211,20 +181,18 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     struct kernel_wait_token token;
     *status = kernel_wait_prepare(futex_bucket(&key), deadline, 1, &token);
     if (*status != KERNEL_SCHEDULER_STATUS_OK) {
+        kernel_mm_unpin_user_page(&pin);
         futex_key_release(&task->futex_key);
         task->futex_bitset = 0;
         return 0;
     }
-    /* 首次uaccess已处理缺页；当前单CPU的IRQ域内，登记后重读实际用户字。 */
-    copied = 0;
-    access = kernel_copy_from_user(&task->mm, &actual, address, sizeof(actual), &copied);
-    if (access == KERNEL_UACCESS_STATUS_OK && copied == sizeof(actual) && actual == value)
+    /* 登记后只访问已有pin；MM撤权可关闭新许可，不能在外层token内再次等待。
+     * 最后比较仍在登记之后，实际阻塞前归还pin，允许MM编辑继续排空。 */
+    actual=__atomic_load_n(word,__ATOMIC_ACQUIRE);
+    kernel_mm_unpin_user_page(&pin);
+    if (actual == value)
         *status = kernel_wait_park(&token, &reason);
-    else {
-        result = access == KERNEL_UACCESS_STATUS_FAULT || copied != sizeof(actual) ? -KERNEL_EFAULT : -KERNEL_EAGAIN;
-        if (access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT)
-            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
+    else result=-KERNEL_EAGAIN;
     if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     futex_key_release(&task->futex_key);
     task->futex_bitset = 0U;
@@ -248,6 +216,7 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                      uint32_t bitset,
                      enum kernel_scheduler_status *status)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_futex_key source, target;
     uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
     uint64_t deadline_ns = 0U;
@@ -346,6 +315,7 @@ int64_t kernel_futex_restart_timed(
     uint32_t value, uint64_t deadline_ns, uint32_t bitset,
     enum kernel_scheduler_status *status)
 {
+    KERNEL_SERVICE_SCOPE(service);
     uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 
     *status = KERNEL_SCHEDULER_STATUS_OK;

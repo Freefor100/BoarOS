@@ -83,13 +83,18 @@ static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort
 enum kernel_uaccess_status kernel_uaccess_pin_user_page(struct kernel_mm *mm,
     uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 { (void)mm; (void)address; (void)access; (void)pin; excluded(); return KERNEL_UACCESS_STATUS_STATE; }
+enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{ (void)mm; (void)address; (void)access; (void)pin; excluded(); return KERNEL_MM_STATUS_STATE; }
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 { (void)pin; excluded(); }
 #endif
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
-EXCLUDED(kernel_shm_attachment_release)
+struct kernel_shm_attachment;
+void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
+{ if (owner && *owner) excluded(); }
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)

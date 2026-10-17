@@ -38,15 +38,22 @@ int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_descrip
     if (!result && final_inject) source_prepared=1;
     return result;
 }
-void __real_kernel_rwlock_read(struct kernel_rwlock *, struct kernel_lock_guard *);
-void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+int __real_kernel_rwlock_try_read(struct kernel_rwlock *, struct kernel_lock_guard *);
+int __wrap_kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
     if (final_inject && source_prepared && lock == &kernel_open_file_node(controller)->io_lock) {
-        assert(!kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
+        assert(!kernel_cpu_current()->raw_locks);
         final_inject = 0;
         __atomic_store_n(&final_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&final_writer_claimed,__ATOMIC_ACQUIRE)) sched_yield();
     }
+    return __real_kernel_rwlock_try_read(lock, guard);
+}
+void __real_kernel_rwlock_read(struct kernel_rwlock *, struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    if (source_prepared && lock == &kernel_open_file_node(controller)->io_lock)
+        assert(!kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
     __real_kernel_rwlock_read(lock,guard);
 }
 static void *final_writer(void *unused)

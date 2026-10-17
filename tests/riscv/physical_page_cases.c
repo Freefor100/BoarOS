@@ -1006,7 +1006,8 @@ static void test_finalized_allocator_reclaims_once_and_guards_recursion(void)
     context.calls = 0U;
     context.nested_status = PHYSICAL_PAGE_STATUS_OK;
     if (physical_page_allocator_set_reclaimer(
-            &allocator, release_one_page_reclaimer, &context) !=
+            &allocator, &(struct physical_page_reclaim_hooks){
+                .reclaim=release_one_page_reclaimer,.context=&context}) !=
         PHYSICAL_PAGE_STATUS_OK) {
         fail_page(102U, PHYSICAL_PAGE_STATUS_OK,
                   PHYSICAL_PAGE_STATUS_INVALID);
@@ -1026,7 +1027,8 @@ static void test_finalized_allocator_reclaims_once_and_guards_recursion(void)
     context.calls = 0U;
     context.target_pages = 0U;
     if (physical_page_allocator_set_reclaimer(
-            &allocator, recursive_reclaimer, &context) !=
+            &allocator, &(struct physical_page_reclaim_hooks){
+                .reclaim=recursive_reclaimer,.context=&context}) !=
         PHYSICAL_PAGE_STATUS_OK) {
         fail_page(105U, PHYSICAL_PAGE_STATUS_OK,
                   PHYSICAL_PAGE_STATUS_INVALID);

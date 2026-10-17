@@ -13,11 +13,12 @@ _Thread_local uintptr_t sync_test_irq = 1;
 static _Thread_local struct kernel_cpu cpu;
 void *sync_test_cpu(void) { return &cpu; }
 static struct kernel_raw_lock lock, inner;
+static void initialize(unsigned id)
+{ kernel_cpu_initialize(&cpu, id, 0); sync_test_irq = 1; }
+#if BOAROS_MAX_CPUS > 1
 static unsigned long count;
 static pthread_barrier_t start;
 
-static void initialize(unsigned id)
-{ kernel_cpu_initialize(&cpu, id, 0); sync_test_irq = 1; }
 static void *worker(void *argument)
 {
     initialize((unsigned)(uintptr_t)argument);
@@ -31,6 +32,7 @@ static void *worker(void *argument)
     assert(sync_test_irq && !cpu.preempt_depth && !cpu.raw_locks);
     return 0;
 }
+#endif
 static void misuse(unsigned which)
 {
     struct kernel_raw_guard a = {0}, b = {0};
@@ -76,18 +78,26 @@ int main(void)
           assert(!sync_test_irq && cpu.preempt_depth == 1); }
         assert(sync_test_irq == enabled && !cpu.raw_locks && !cpu.preempt_depth);
     }
+    unsigned fatal_cases = 0;
     for (unsigned which = 0; which < 11; which++) {
+#if !BOAROS_LOCK_DEBUG
+        if (which == 6 || (which == 0 && BOAROS_MAX_CPUS > 1)) continue;
+#endif
+        fatal_cases++;
         pid_t child = fork(); assert(child >= 0);
         if (!child) misuse(which);
         int status; assert(waitpid(child, &status, 0) == child);
         assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL);
     }
     kernel_raw_lock_init(&lock, KERNEL_RAW_RANK_HEAP);
+#if BOAROS_MAX_CPUS > 1
     assert(pthread_barrier_init(&start, 0, 4) == 0);
     pthread_t threads[4];
     for (unsigned i = 0; i < 4; i++) assert(pthread_create(&threads[i], 0, worker, (void *)(uintptr_t)i) == 0);
     for (unsigned i = 0; i < 4; i++) assert(pthread_join(threads[i], 0) == 0);
     assert(count == 80000);
     assert(pthread_barrier_destroy(&start) == 0);
-    puts("CPU/raw synchronization: mutual exclusion, visibility, IRQ restoration and 11 fatal cases passed");
+#endif
+    printf("CPU/raw synchronization: cpus=%u debug=%u, IRQ/preemption restoration and %u fatal cases passed\n",
+           BOAROS_MAX_CPUS, BOAROS_LOCK_DEBUG, fatal_cases);
 }

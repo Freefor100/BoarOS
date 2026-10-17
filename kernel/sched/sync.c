@@ -147,7 +147,8 @@ void kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *gu
 { (void)acquire(lock, guard, 0, 0); }
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 { (void)acquire(lock, guard, 1, 0); }
-void kernel_lock_release(struct kernel_lock_guard *guard)
+/* RV/LA 函数体不足 1 KiB；入口对齐避免频繁释放时跨代码页拆分短指令序列。 */
+__attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard *guard)
 {
     uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
@@ -204,6 +205,9 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
             }
             if (done) { lock->handoff_owner = 0; break; }
             kernel_raw_lock_release(&metadata);
+            /* handoff_owner保留原队列边界；分段之间允许原本开启的中断响应。 */
+            arch_interrupt_restore(irq);
+            irq = arch_interrupt_save();
             kernel_raw_lock_acquire(&lock->metadata, &metadata);
             if (lock->handoff_owner != owner) __builtin_trap();
         }

@@ -283,7 +283,12 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
         while (physical_page_allocate(&allocator, &single) == 0) {
             if (!corrupt_allocated_ancestor(single)) continue;
             if (which == 18) physical_page_release(&allocator, single);
-            else if (which == 19) physical_page_acquire(&allocator, single);
+            else if (which == 19) {
+                /* PFN引用不遍历祖先；末次归还仍必须发现损坏的buddy身份。 */
+                assert(!physical_page_acquire(&allocator, single));
+                assert(!physical_page_release(&allocator, single));
+                physical_page_release(&allocator, single);
+            }
             else (void)physical_page_allocator_audit(&allocator);
             assert(0);
         }

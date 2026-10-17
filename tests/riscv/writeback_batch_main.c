@@ -250,6 +250,7 @@ static void redirty_case(struct kernel_vfs_file *file)
     check(calls == 1 && submitted == BOAROS_PAGE_CACHE_WRITEBACK_PAGES * 4096, 79);
     for (unsigned i = 0; i < BOAROS_PAGE_CACHE_WRITEBACK_PAGES; i++) {
         kernel_page_cache_alias_detach(&aliases[i]);
+        kernel_page_cache_alias_drain(&aliases[i]);
         check(physical_page_release(&allocator, alias_pages[i]) == PHYSICAL_PAGE_STATUS_OK, 80);
     }
     uint64_t observed = 0;

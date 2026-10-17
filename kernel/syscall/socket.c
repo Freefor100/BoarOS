@@ -308,6 +308,7 @@ enum kernel_syscall_status syscall_handle_socket(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     int family = (int32_t)request->arguments[0];
     int type = (int32_t)request->arguments[1];
     int protocol = (int32_t)request->arguments[2];
@@ -363,6 +364,7 @@ enum kernel_syscall_status syscall_handle_socketpair(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     int family = (int32_t)request->arguments[0];
     int type = (int32_t)request->arguments[1];
     int protocol = (int32_t)request->arguments[2];
@@ -425,6 +427,7 @@ enum kernel_syscall_status syscall_handle_bind(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_files *files;
     struct kernel_open_file_description *file = 0;
     struct kernel_mm *mm;
@@ -537,6 +540,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct kernel_files *files;
     struct kernel_open_file_description *file = 0;
     struct kernel_socket *socket;

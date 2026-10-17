@@ -15,7 +15,7 @@ static struct kernel_heap heap;
 static struct kernel_files files;
 static struct kernel_open_file_description epfile, targets[2];
 static struct kernel_wait_queue target_wait[2];
-static struct kernel_open_file_description *fds[3];
+static struct kernel_open_file_description *fds[131];
 static struct kernel_epoll_wait_request *requests[2];
 static unsigned actor, actors[2];
 #define registered requests[actor]
@@ -24,6 +24,10 @@ static struct kernel_mm *mm = (void *)&heap;
 static size_t allocations, copy_remaining = SIZE_MAX;
 static unsigned poll_notification, copy_action, poll_calls, readable[2];
 static jmp_buf cancelled;
+static unsigned notification_depth;
+static uint64_t notification_sequence, callbacks;
+uint64_t kernel_wait_notification_sequence(void)
+{ return notification_depth ? notification_sequence : 0; }
 
 int kernel_files_is_live(const struct kernel_files *f) { return f == &files; }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t z,void **p)
@@ -50,7 +54,7 @@ enum kernel_files_status kernel_files_pin_data(struct kernel_files *f,int64_t fd
     struct kernel_open_file_description **p,int64_t *result)
 {
     CHECK(f==&files); *p=NULL; *result=-KERNEL_EBADF;
-    if(fd>=0 && fd<3 && fds[fd]) { *p=fds[fd]; kernel_open_file_acquire(*p); *result=0; }
+    if(fd>=0 && fd<(int64_t)(sizeof(fds)/sizeof(fds[0])) && fds[fd]) { *p=fds[fd]; kernel_open_file_acquire(*p); *result=0; }
     return KERNEL_FILES_STATUS_OK;
 }
 void kernel_wait_queue_init(struct kernel_wait_queue *q) { *q=(struct kernel_wait_queue){.initialized=1}; }
@@ -64,9 +68,15 @@ void kernel_wait_queue_remove(struct kernel_wait_node *n)
 enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_node *node)
 { if (node->queue) kernel_wait_queue_remove(node); return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
-{ for(struct kernel_wait_node *n=q->head;n;n=n->next) if(n->callback)n->callback(n,0);return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    if (!notification_depth++) notification_sequence++;
+    for(struct kernel_wait_node *n=q->head;n;n=n->next) if(n->callback) { callbacks++; n->callback(n,0); }
+    notification_depth--;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t requested,struct kernel_wait_queue **q)
 {
+    if (f->kind == KERNEL_OPEN_FILE_KIND_EPOLL) return kernel_epoll_poll(f->epoll, requested, q);
     CHECK(f>=targets && f<targets+2); unsigned i=(unsigned)(f-targets);
     CHECK(++poll_calls < 32); /* 单项非阻塞扫描必须结束，不能在失去就绪后自旋。 */
     if(q)*q=&target_wait[i];
@@ -152,6 +162,43 @@ static void teardown(void)
 #ifdef EPOLL_BASELINE
 void kernel_epoll_abort_wait(struct kernel_epoll_wait_request *r) { (void)r; abort(); }
 #endif
+static void nested_notifications(void)
+{
+    const unsigned width = 32, layers = 4, count = width * layers;
+    struct kernel_open_file_description nested[128];
+    CHECK(!allocations);
+    files.heap = &heap; readable[0] = 0;
+    targets[0] = (struct kernel_open_file_description){.kind=KERNEL_OPEN_FILE_KIND_PIPE,.references=1};
+    kernel_wait_queue_init(&target_wait[0]); fds[count] = &targets[0];
+    unsigned registrations = 0;
+    for (unsigned i = 0; i < count; i++) {
+        nested[i] = (struct kernel_open_file_description){.kind=KERNEL_OPEN_FILE_KIND_EPOLL,.references=1};
+        CHECK(!kernel_epoll_create(&heap, &nested[i].epoll));
+        nested[i].epoll->file = &nested[i]; fds[i] = &nested[i];
+        for (unsigned j = 0; j < (i < width ? 1 : width); j++) {
+            unsigned target = i < width ? count : (i / width - 1) * width + j;
+            int64_t result;
+            poll_calls = 0;
+            CHECK(!kernel_files_epoll_ctl(&files,i,KERNEL_EPOLL_CTL_ADD,target,
+                KERNEL_EPOLLIN|KERNEL_EPOLLET,target,&result) && !result);
+            registrations++;
+        }
+    }
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        callbacks = 0;
+        kernel_wait_queue_wake_all(&target_wait[0]);
+        printf("epoll nested: %u objects, %u registrations, %llu callbacks\n", count, registrations,
+            (unsigned long long)callbacks);
+        CHECK(callbacks == registrations);
+        for (unsigned i = 0; i < count; i++)
+            CHECK(nested[i].references == 1 && nested[i].epoll->ready_head);
+    }
+    for (unsigned i = count + 1; i; i--) {
+        struct kernel_open_file_description *f = fds[i - 1]; fds[i - 1] = NULL;
+        CHECK(!kernel_open_file_release(&f));
+    }
+    CHECK(!allocations && !target_wait[0].head);
+}
 int main(int argc, char **argv)
 {
     (void)argv;
@@ -203,6 +250,7 @@ int main(int argc, char **argv)
     if(!setjmp(cancelled)) { wait_events(out,16); CHECK(0); }
     CHECK(!registered && epfile.references==1 && targets[0].references==1);
     CHECK(wait_events(out,16)==2);teardown();
-    puts("PASS actual epoll: fault replay, reentrant notification, MOD, DEL, close pins, bounded candidate ownership and cancelled scan");
+    nested_notifications();
+    puts("PASS actual epoll: fault replay, reentrant notification, MOD, DEL, close pins, cancelled scan and nested notification coalescing");
     return 0;
 }

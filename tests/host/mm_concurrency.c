@@ -98,7 +98,7 @@ static void *query(void *unused)
     assert(!kernel_mm_msync(&mm[3], address, BOAROS_PAGE_SIZE, 4));
     assert(kernel_mm_msync(&mm[3], address, 2 * BOAROS_PAGE_SIZE, 4) == -KERNEL_ENOMEM);
     assert(kernel_mm_msync(&mm[3], address + 1, 1, 4) == -KERNEL_EINVAL);
-    assert(kernel_mm_shmdt(&mm[3], address) == KERNEL_MM_STATUS_STATE);
+    assert(kernel_mm_shmdt(&mm[3], address) == KERNEL_MM_STATUS_INVALID_ARGUMENT);
     uint64_t unused_address;
     assert(!kernel_mm_mmap_anonymous(&mm[3], 0, BOAROS_PAGE_SIZE,
         KERNEL_MM_READ, KERNEL_MM_MAP_SHARED, &unused_address));
@@ -360,7 +360,7 @@ int main(void)
     unsigned char value = 37; size_t copied;
     assert(!kernel_copy_to_user(&mm[0], address, &value, 1, &copied) && copied == 1);
 #ifndef MM_TEST_BASELINE
-    assert(!kernel_mm_enable_concurrency(&mm[0]));
+    assert(!kernel_mm_check_task_domain(&mm[0]));
 #endif
     for (unsigned id = 1; id < 4; id++) assert(!kernel_mm_acquire(&mm[id], &mm[0]));
     for (unsigned actors = 2; actors <= 4; actors += 2) {

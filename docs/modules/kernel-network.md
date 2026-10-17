@@ -146,7 +146,9 @@ recvmsg 不生成未请求的控制消息；非空 ancillary 发送明确不支�
 
 SHUT_RD 保留已排队内容，空队列返回 EOF；SHUT_WR 让已接受 TCP 内容先发送，
 FIN 在其后，读方向仍能接收反向响应。dup/fork 共享方向状态。UNIX 的对端关闭
-接收方向使发送 EPIPE/SIGPIPE，NOSIGNAL 只抑制该调用的信号。FIN、reset 和本地
+发送方向只产生接收 EOF，不阻止向它回复；预留容量前和复制完成后都按本地发送
+方向、对端接收方向及对端存活判断能否发送。对端关闭接收方向使发送 EPIPE/SIGPIPE，
+NOSIGNAL 只抑制该调用的信号。FIN、reset 和本地
 关闭分开决定 IN/OUT/HUP/RDHUP。SYN 拒绝是 ECONNREFUSED，建立后 reset 是
 ECONNRESET；SO_ERROR 或读/写消费 pending error，后续 EOF/EPIPE 由真实协议
 终止状态决定，不能永久重复历史错误。
@@ -266,6 +268,8 @@ TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect �
 
 
 ## TCP 发送接纳与复制（2026-10-05）
+
+开启 `TCP_NODELAY` 时先禁用 Nagle，再立即尝试输出已有 unsent 数据。NIC 暂无容量时登记原有 NIC 容量等待，协议内存不足时使用原有 pool 等待；容量事件推动重试，不依赖收到 ACK 或推进定时器。关闭 NODELAY 只恢复 Nagle。用户数据报发送使用任务登记的请求和 iovec cursor，退出清理沿同一请求归还 OFD 和包引用。
 
 INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_write_request`，
 与数据报请求共用退出登记但不拥有数据报 packet。请求持有原 OFD pin，

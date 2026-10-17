@@ -1,22 +1,22 @@
 # RV 两核执行与服务边界
 
-默认构建和LA仍为单CPU。`kernel-rv-smp`独立配置最多两个逻辑CPU，CPU0是固件选择的boot hart，
-CPU1运行显式创建的受控内核任务，可绑定匿名及私有arena tmpfs/受控ext4文件映射MM，也可绑定同域共享FD表执行匿名pipe I/O。CPU0保留构造、截断、MM/fork发布和最后后端释放；同域tmpfs普通I/O就地执行，ext4实际I/O交给CPU0 worker；控制者保留独立OFD、挂载和缓存owner，命名空间运行期间不修改。本受控配置的用户任务、现有worker、实际磁盘I/O、未开放外部后备和系统压力回收仍在普通CPU0服务上下文执行。
-受控任务已验证fork后跨MM的共享匿名/真实tmpfs/磁盘缓存页与私有COW；普通用户使用下面的独立USER_SMP配置，原受控配置仍把用户固定在CPU0。
+默认构建和 LA 仍为单 CPU。`kernel-rv-smp` 提供两核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户两核执行。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，实际写回继续由既有 CPU0 worker 完成。两种配置中的文件后端、命名空间、设备和网络业务按下述边界串行。
 
 ## 真实用户态与CPU0业务交接
 
 `SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
 
-`kernel_scheduler_enter_user_service()`迁移实际任务的内核栈和调用现场。资格在rank40提交，旧执行owner由`switch_finish`结束后，CPU0才可接纳。同步fault及通用syscall业务在分派前交接；普通磁盘文件的`read/pread/readv`先尝试在发起hart完成驻留缓存到驻留用户页的复制，具体边界见[普通文件IO](#普通文件io的执行位置)。CPU1本地timer/IPI只处理同步元数据，无pending时直接恢复用户态。CPU0信号/组退出发布原子pending位并通知目标CPU；消费之后到达的新通知保留，返回前再次检查。晚于检查的IPI由硬件中断接纳，不要求远端读取live frame。
+通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，只有实际后端工作进入既有缓存 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。命名空间、进程生命周期、设备、网络及尚未并行化的业务在操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
-FIFO/RR用户任务进入CPU0服务时，在来源CPU保留逻辑实时资格；非阻塞syscall不是yield。来源核只允许该owner恢复或更高优先级用户抢占。真正阻塞、yield、RR片尾、降为OTHER、移除来源affinity或退出会结束资格；多个被抢占者可同时保留，按原优先级/FIFO组织。CPU0另有服务资格索引，避免本核高优先级用户计算饿死异核服务；服务完成后重新检查用户资格，不把首次准备完的子任务直接送到U-mode。两种节点均借用既有执行/runnable owner，回收前必须摘尽；不固定MM/files，也不引入worker。
+`kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。信号、组退出及停止发布原子 pending 并通知目标 CPU；返回准备才消费通知，业务范围的进入不能提前吞掉它。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
 
-RV整数ABI尺寸探针：实时资格修复使USER_SMP任务由2816增至2896字节，仍由一张4KiB页容纳；每CPU记录由2048增至3664字节，服务索引另为1616字节。每次调度选择O(1)，入/摘维护两CPU及服务索引，现有优先级桶最坏检查仍最多99级，不扫描等待任务。默认及受控SMP构建没有这些新增字段。
+FIFO/RR用户任务进入CPU0服务时，在来源CPU保留逻辑实时资格；非阻塞syscall不是yield。来源核只允许该owner恢复或更高优先级用户抢占。真正阻塞、yield、RR片尾、降为OTHER、移除来源affinity或退出会结束资格；多个被抢占者可同时保留，按原优先级/FIFO组织。CPU0 的特殊资格索引仅接纳实时服务，避免本核高优先级用户计算饿死异核实时服务；普通服务与缓存 worker 按 OTHER 队列轮转，不能因反复查询而饿死其正在等待的 I/O。服务完成后重新检查用户资格，不把首次准备完的子任务直接送到U-mode。两种节点均借用既有执行/runnable owner，回收前必须摘尽；不固定MM/files，也不引入worker。
 
-服务内wait finish另用真实在途借用及两线程握手核对归还；用户yield与通用内核yield分开，不把等待清理改成延迟的用户轮转。
+2026-10-14 的 RV 整数 ABI 尺寸探针中，实时资格修复使USER_SMP任务由2816增至2896字节，仍由一张4KiB页容纳；每CPU记录由2048增至3664字节，服务索引另为1616字节。每次调度选择O(1)，入/摘维护两CPU及服务索引，现有优先级桶最坏检查仍最多99级，不扫描等待任务。默认及受控SMP构建没有这些新增字段。
 
-普通MM的`remote_user`能力与受控并行修改能力独立。ELF、系统后备和压力hook仍可用，VMA修改、实际缺页和文件后端业务仍由CPU0执行；本地驻留复制复用既有operation gate和pin登记，使fork、降权与写pin排空遵守同一协议。撤映射、降权、fork/COW、截断和缓存撤写先更新翻译、固定退休owner，再完成本地及远端确认；新父项/摘空表同步全范围。稀疏撤映射按owned leaf/页表分支遍历，不枚举空虚拟页。最终MM释放要求活动CPU、pin和退休批次归零。
+服务内 wait finish 用真实在途借用及两线程握手核对归还；显式 yield 在调用 CPU 走统一调度入口。普通任务因服务或 affinity 迁移时排到目标核队尾，不能反复插到已就绪的后端、checkpoint 或缓存 worker 前面；实时抢占、节流和来源资格保留原有顺序。服务期间耗尽 RR 片的状态在恢复用户资格时消费，不把非阻塞业务当成 yield。
+
+所有 MM 共用 operation gate 与 MM raw 发布协议，不保留 `remote_user` 或并发模式字段。匿名、COW 和 ELF 缺页在发起 CPU 准备和提交；文件缺页借用真实来源，冷页的后端读取交 CPU0 worker，恢复后重查 VMA/PTE。撤映射、降权、fork、截断和缓存撤写均在失效确认后归还退休页。驻留匿名复制保持四次实际锁获取，文件来源不使无关匿名 pin 增加 gate。
 
 ```sh
 make kernel-rv-user-smp
@@ -28,19 +28,17 @@ make test-user-smp-composition-host test-user-smp-composition-riscv
 make run-user-smp-riscv
 ```
 
-2026-10-14的同ELF原生验证使用`tests/smp/linux-user.config`，固定Linux commit不变但单独启用SMP并生成配置哈希/缓存。MTTCG两核及一核退化、512MiB/1GiB完成独立进程无yield计算、pthread/TLS/全部F/D与FCSR、嵌套信号、远端撤权限/文件EOF、pipe取消、非leader exec、组停止/继续、CPU0/CPU1 FIFO服务/yield/阻塞与RR片尾，以及CPU0高优先级用户下的异核服务前进；runner核对完整内容流、真实U-mode hart采样、CPU1不进入通用syscall业务分派、PID1/堆/根盘退出和磁盘检查。host另保护通知消费后的新发布、旧栈owner、晚加入活动MM、COW失败回滚与64GiB稀疏撤映射。静态/动态musl原生公共案例（动态形态另含dlopen TLS）、glibc五形态及1400条原ABI完成SMP Linux同ELF对照，覆盖2/1CPU和双RAM；原static/pthread musl集成consumer在BoarOS同矩阵复核；这部分不称Linux差分。原单CPU策略用例显式固定CPU0，离线affinity位按真实拓扑选取。Ubuntu24.04/QEMU8.2.2本地容器完成原生同矩阵，实际固件/工具身份由runner保存；这不是托管CI运行结果。默认RV/LA core/runtime/platform和原受控SMP组另行回归。
+2026-10-14的同ELF原生验证使用`tests/smp/linux-user.config`，固定Linux commit不变但单独启用SMP并生成配置哈希/缓存。MTTCG两核及一核退化、512MiB/1GiB完成独立进程无yield计算、pthread/TLS/全部F/D与FCSR、嵌套信号、远端撤权限/文件EOF、pipe取消、非leader exec、组停止/继续、CPU0/CPU1 FIFO服务/yield/阻塞与RR片尾，以及CPU0高优先级用户下的异核服务前进；runner核对完整内容流、真实U-mode hart采样、当时 CPU0 的通用 syscall 分派、PID1/堆/根盘退出和磁盘检查。host另保护通知消费后的新发布、旧栈owner、晚加入活动MM、COW失败回滚与64GiB稀疏撤映射。静态/动态musl原生公共案例（动态形态另含dlopen TLS）、glibc五形态及1400条原ABI完成SMP Linux同ELF对照，覆盖2/1CPU和双RAM；原static/pthread musl集成consumer在BoarOS同矩阵复核；这部分不称Linux差分。原单CPU策略用例显式固定CPU0，离线affinity位按真实拓扑选取。Ubuntu24.04/QEMU8.2.2本地容器完成原生同矩阵，实际固件/工具身份由runner保存；这不是托管CI运行结果。默认RV/LA core/runtime/platform和原受控SMP组另行回归。
 
 ### 用户态原程序与压力组合
 
 `tests/program-inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。`native-extended.yml`配置相同四格的独立定时job，托管job尚未运行不能由本地结果代替。
 
-`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF有19个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。普通读控制器在真实ecall的复制及迁移点按hart记录字节，先等竞争seek或fork实际park再释放写pin；两hart要求本地复制、CPU0续读和唯一offset借用均发生，一hart仍核对内容与实际pin等待。用户页fault、PID1退出、磁盘状态和SQLite独立重启另有逐项检查。测试控制器、linker wrap及测试宏只存在于私有构建，不进入默认/正式USER_SMP内核。
+`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF 有 21 个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。加压前准备未映射的干净observer文件页，回收统计覆盖账本分配和显式回收，并等待后台轮次发布实际回收数；不要求同步调用抢在后台worker之前回收候选。普通 I/O 控制器在真实 ecall 的复制、来源 pin、匿名 fault 与后端批次处观察 CPU。十种读场景共复制 65,666 字节，双核全部留在发起 CPU1，单核全部在 CPU0；其中冷 64 KiB 请求仅产生一个后端批次，后端必须在 CPU0。三种普通写场景的四次来源 pin 同样留在发起 CPU。共享 offset、竞争 seek、close 复用、fork 排空写 pin、精确 EFAULT 前缀和最终 fsync 继续核对。无观察钩子的正式内核运行九项普通 I/O 场景，测试控制器与 link wrap 不进入发布构建。
 
-普通读的聚焦原生验证以512MiB、2/1 hart运行同一19案例ELF的Linux参考，以及BoarOS功能/受控profile。双hart九次受观测操作共复制130字节，其中hart1为84、CPU0为46，确认五次实际任务服务迁移及一次持offset续读；竞争seek必须看到整次读取后的16，fork必须等真实写pin归还后才发布child。无观察钩子的正式USER_SMP内核另运行七项普通读场景及RA2顺序预读/取消，检查内容、自然退出、堆owner和fsck；它验证正式路径功能，不替代受控复制位置与等待交错证据。
+同一共享匿名页的双线程首缺页被加入确定性交错：双CPU时两个真实用户任务固定到不同逻辑CPU写同一未驻留页，首个 resolver 在候选提交前等待另一实际任务，直到第二个resolver已提交可写PTE后再继续；单CPU退化时两个任务同绑CPU0。旧路径此时返回`ADDRESS_SPACE`并fatal；固定Linux `mm/memory.c`的`fix_spurious_fault()`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）也将并发页表更新后的fault作为spurious fault处理。现在在所有 MM 的VMA权限仍允许且当前PTE已满足请求时成功返回，不重复发送页级RFENCE：PTE提交者完成其同步，迟到fault返回用户态前的MM激活完成本地刷新；VMA拒绝或PTE权限不足仍走原拒绝/COW流程。测试要求两次真实fault、一次stale retry、两次成功及一次页级同步。该行为见[MM硬件缺页解析](kernel-mm.md#硬件用户缺页解析)。
 
-同一共享匿名页的双线程首缺页被加入确定性交错：双CPU时两个真实用户任务固定到不同逻辑CPU写同一未驻留页，首个resolver让出CPU0服务资格，直到第二个resolver已提交可写PTE后再继续；单CPU退化时两个任务同绑CPU0。旧路径此时返回`ADDRESS_SPACE`并fatal；固定Linux `mm/memory.c`的`fix_spurious_fault()`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）也将并发页表更新后的fault作为spurious fault处理。现在对`remote_translation` MM在VMA权限仍允许且当前PTE已满足请求时成功返回，不重复发送页级RFENCE：PTE提交者完成其同步，迟到fault返回用户态前的MM激活完成本地刷新；VMA拒绝或PTE权限不足仍走原拒绝/COW流程，普通单核MM原错误检测保持。测试要求两次真实fault、一次stale retry、两次成功及一次页级同步。该行为见[MM硬件缺页解析](kernel-mm.md#硬件用户缺页解析)。
-
-文件fault另覆盖`resumed=1`重试：第一个读fault取得缓存页引用后停在PTE提交前，第二个CPU上的reader映射同一`MAP_SHARED`页并完成同步；第一个继续时看到已有PTE，真实进入一次内部retry，再次解析同一权限。旧实现对该权限已满足的`resumed` PTE仍发第二次远端同步。测试红灯观测`arrivals=2, retries=1, resumed=1, resolved=2, syncs=2`；当前远端MM保留publisher的一次同步，非远端MM的既有resumed刷新不变，绿灯要求`syncs=1`。握手在inode共享读保护下让第二reader继续，持页引用和调用栈覆盖第一次准备；测试同时核对返回数据和自然退出owner。
+文件fault另覆盖`resumed=1`重试：第一个读fault取得缓存页引用后停在PTE提交前，第二个CPU上的reader映射同一`MAP_SHARED`页并完成同步；第一个继续时看到已有PTE，真实进入一次内部retry，再次解析同一权限。旧实现对该权限已满足的`resumed` PTE仍发第二次远端同步。测试红灯观测`arrivals=2, retries=1, resumed=1, resolved=2, syncs=2`；当前共同路径只保留 publisher 的一次同步，绿灯要求`syncs=1`。握手在inode共享读保护下让第二reader继续，持页引用和调用栈覆盖第一次准备；测试同时核对返回数据和自然退出owner。
 
 CPU0最后一条启动记录在`riscv_timer_start()`开启IRQ前完成，避免逐字console输出被已运行用户的TTY数据打断。私有测试在IRQ已开时暂停timer横幅，直到UART实际接纳用户队列数据，旧顺序会破坏横幅完整性；当前顺序不进入该暂停，完整启动记录先于用户案例。runner仍严格拒绝损坏的用户协议行，不从程序退出0推导输出通过。
 
@@ -54,9 +52,9 @@ make test-user-smp-composition-host
 make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin
 ```
 
-普通用户的驻留复制复用任务已持有的MM/files句柄、实际OFD引用与既有operation gate，不为每次复制建立第二组业务owner。来源退休节点保留原有OFD/ELF引用，放开MM gate并排空登记回调后才执行真实关闭。
+普通用户的驻留复制复用任务已持有的 MM/files 句柄、实际 OFD 引用与 MM raw pin 协议，不为每次复制建立第二组业务owner。来源退休节点保留原有OFD/ELF引用，放开MM gate并排空登记回调后才执行真实关闭。
 
-服务统计区分CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。观测常驻CPU/任务字段，不分配或增加worker；默认单核配置不含这些字段。该配置不表示ext4、设备、协议、命名空间或系统压力回调已在两核并发执行，LA仍为单核。
+服务统计区分CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。观测常驻CPU/任务字段，不分配或增加worker；默认单核配置不含这些字段。ext4、设备、协议和命名空间仍在各自 CPU0 边界执行；分配器通知和同步干净回收可就地执行。LA 仍为单核。
 
 ## 启动与本地状态
 
@@ -90,7 +88,7 @@ IPI软件事件使用release发布、exchange消费；接收先清SSIP。通知�
 全部预检后发布叶子，撤销后先摘空表，完成本地SFENCE与在线远端RFENCE，才释放表、栈及槽位。
 发布或摘除非叶父项使用全范围失效，不能只指定某个叶VA；已有父表中的叶修改可使用范围RFENCE。
 RFENCE错误走fatal并保留owner。单页接口仍是批量接口的包装。
-受控任务只能进入已绑定的MM和获准FD域（匿名pipe及下述预开普通OFD），不得进入一般命名来源、socket/epoll/FIFO、设备、协议或系统压力回调；并行allocator/MM、pipe与受控缓存使用CPU0预留、无压力hook的私有arena。
+受控任务只能进入已绑定的 MM 和获准 FD 消费者（匿名 pipe 及下述预开普通 OFD），不得进入一般命名来源、socket/epoll/FIFO、设备或协议。分配器与缓存不再要求私有 arena 或关闭压力挂钩；专项测试可以用独立 arena 制造耗尽，普通用户和压力挂钩测试使用实际系统分配器及已挂载缓存。
 `kernel_thread_create_joinable_mm()`在最终 ONLINE 复查后才转移 caller MM，失败不发布 join 或身份；缓存 root 不取得额外引用。当前任务借用覆盖执行，最后 MM 释放由 CPU0 可信栈的统一 join/reaper 路径完成。活动 MM 借用归零也是 CPU 停止条件。
 
 ## 验证入口与证据边界
@@ -183,7 +181,7 @@ hash链和扩容的既有最坏成本仍在。共享fork/写fault不复制数据
 
 ## 私有 tmpfs 映射域
 
-`test-mm-file-smp-riscv` 使用真实私有 tmpfs、控制者OFD和 arena 内的后备预算，在512MiB/1GiB的MTTCG两核与一核退化验证源准备后截断、EOF/重新增长、跨根共享、私有COW、受保护叶、pin迁移及RFENCE后回收。独立RFENCE错误核对来源/登记/数据/表owner保留后fatal，不记自然回收。`test-mm-file-smp-userland-riscv` 让CPU0原静态/pthread程序与CPU1受控任务同时运行；本受控组合把用户固定CPU0，真实用户两核使用USER_SMP；普通OFD接纳另见文件交接章节。接口和关闭协议见[MM](kernel-mm.md#受控-tmpfs-文件映射)。
+`test-mm-file-smp-riscv` 使用真实私有 tmpfs、控制者OFD和 arena 内的后备预算，在512MiB/1GiB的MTTCG两核与一核退化验证源准备后截断、EOF/重新增长、跨根共享、私有COW、受保护叶、pin迁移及RFENCE后回收。独立RFENCE错误核对来源/登记/数据/表owner保留后fatal，不记自然回收。`test-mm-file-smp-userland-riscv` 让CPU0原静态/pthread程序与CPU1受控任务同时运行；本受控组合把用户固定CPU0，真实用户两核使用USER_SMP；普通OFD接纳另见文件交接章节。接口和关闭协议见[MM](kernel-mm.md#tmpfs-文件映射)。
 
 ```sh
 make test-mm-file-smp-riscv
@@ -219,7 +217,7 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 根盘PID1与设备收口另核对；两盘e2fsck必须成功。OFF日志分列setup/业务/清理tick，
 缓存请求、peak pages、后台写入/延期和MM准备/退休计数；它们随交错变化，不是并行收益。
 存储配置见[VFS/ext4](vfs-ext4.md#当前成本边界)，SMP+COST继续拒绝；实际QEMU/OpenSBI身份由runner保存。
-接口、结构成本和竞态背景见[MM](kernel-mm.md#受控-ext4-文件映射)、
+接口、结构成本和竞态背景见[MM](kernel-mm.md#ext4-文件映射)、
 [VFS](vfs-ext4.md#后台写回与水位回收)及[存储学习说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。
 
 ## 共享 FD 表与匿名 pipe
@@ -240,15 +238,15 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 ## 普通文件IO的执行位置
 
-`USER_SMP`的真实用户`ecall`只为普通磁盘文件的`read/pread/readv`保留本地尝试。当前任务借用自己已持有的MM/files句柄，在原FD raw保护下取得实际OFD pin；关闭和编号复用不改变这次读取的文件身份。每批在同一缓存metadata保护下检查尺寸、代次和全部缓存项，成功取得独立物理页引用后才复制。用户目标页只尝试已有可写PTE，不分配、不处理COW、不发起缺页；共享磁盘映射目标沿CPU0原有路径处理。普通缓存的索引发布和摘除使用同一mutex，CPU0保留原IRQ排他；本地尝试不改LRU或entry借用链。
+普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，冷文件数据只把缺失批次交给既有 CPU0 worker，不迁移整个调用。
 
-缓存缺页、用户页需fault/COW或保护正在变更时，先归还整批缓存引用及用户pin，再把原任务的栈和未完成游标迁到CPU0。`read/readv`始终持有同一个OFD offset guard，CPU0只借用该资格，完成后由原调用现场归还；已复制前缀与后续范围之间不允许另一reader或seek插入。`pread`不修改共享位置。迁移入口只特许唯一的指定offset guard，其他锁、用户pin和缓存写借用仍禁止跨交接。最终短fault只推进真实复制前缀；正常缓存边界不产生额外短读。
+候选页、entry 和读取工作区在调用 CPU 准备，未初始化数据保持私有，worker 取得 inode 资格后复查并发布 loading，再复用 128 KiB SG 后端读取。完成后用户复制和错误前缀仍由原调用者处理。共享文件来源写入先完成 pin，再关闭目标写资格；完整冷覆盖不读取旧数据或预清整页。
 
-非末次OFD pin可在本地原子归还。若并发close使它成为最后一个引用，读取者保留这份实际owner并到CPU0完成原后端清理。信号、重启、组停止/退出和返回准备继续使用原服务协议，pending通知使本地尝试转入CPU0。上述普通对象同步仅在`USER_SMP`编译启用；默认单hart和原受控域的接纳条件保持各自规则。
+fsync、SEEK_DATA/HOLE 和最终缓存 OFD 释放复用同一执行队列。需要共享 offset 或文件写操作门的调用先取得资格，再交给执行者借用，不能让 worker 等待调用者的锁而挡住其冷读。已执行请求及调用者退出等待现场之前，缓存保留实际请求借用。末次关闭不能在当前 pin/锁下完成时，既有清理链保留原 owner，用户返回准备在资格归还后继续清理。
 
 ### 受控文件任务
 
-受控FD表可接纳同域、预先打开的tmpfs/ext4普通OFD。CPU0私有校验真实来源后发布稳定资格，控制引用覆盖任务、请求和MM来源；末次后端释放仍由CPU0完成。tmpfs读写及定位操作就地执行；ext4 read/readv/pread在调用hart取得热缓存并复制用户数据，只有miss交CPU0装入；写入和元数据操作仍排入既有cache worker，不改变任务或MM绑定。共享offset由调用者在排队前取得原有锁，worker借用资格并在实际完成后交回，避免队首操作等待本地读者而挡住其miss。fsync/fdatasync/ftruncate及共享错误观察保持相同执行规则；tmpfs截断仍由CPU0控制者完成。路径、statx、socket/epoll、记录锁和sendfile不随FD接纳开放，入口在发布或用户输出前返回STATE。
+受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。命名空间、FIFO、socket/epoll、记录锁及设备业务仍在实际入口进入 CPU0 范围。
 
 ```sh
 make test-file-io-concurrency-host
@@ -263,4 +261,4 @@ make test-file-io-smp-userland-riscv INIT_CONFIG=config/init.json \
 
 热读不创建执行请求，用户copy仍在调用hart；冷请求只排入缺失页，不把整个文件操作转交。运行时时间戳由挂载点raw锁保护共享值与dirty/staged链，锁外唤醒和归还节点；读取不为atime单独排队。可选预读的OFD预测用已有短锁，队列由缓存保护；取消只标记，CPU0预读worker在锁外归还节点。
 
-2026-10-16本地QEMU11.1.2分别以RA0、RA2完成受控文件任务的2/1hart、512MiB/1GiB新盘及独立重启。两hart日志要求实际用户copy发生在hart1，热读requests_queued不增加；冷缺页由CPU0加载且不增加整操作执行请求。共享read/readv、短fault与offset、close/reuse、同步和最终owner继续检查。RA2另通过1/4KiB和held DMA检查。该证据来自受控内核文件入口；真实用户`ecall`使用前述驻留尝试与实际任务迁移路径。
+2026-10-16本地QEMU11.1.2分别以RA0、RA2完成受控文件任务的2/1hart、512MiB/1GiB新盘及独立重启。两hart日志要求实际用户copy发生在hart1，热读requests_queued不增加；冷缺页由CPU0加载且不增加整操作执行请求。共享read/readv、短fault与offset、close/reuse、同步和最终owner继续检查。RA2另通过1/4KiB和held DMA检查。该证据来自受控内核文件入口；真实用户 `ecall` 使用前述完整共同路径。

@@ -8,6 +8,7 @@
 
 static size_t live_nodes;
 static int fail_alloc;
+_Thread_local uintptr_t sync_test_irq = 1;
 
 enum kernel_heap_status kernel_heap_allocate_zeroed(
     struct kernel_heap *heap, size_t count, size_t size, void **pointer)

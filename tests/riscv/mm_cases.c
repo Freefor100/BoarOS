@@ -403,14 +403,13 @@ static unsigned long run_no_memory(void)
     return 0U;
 }
 
-static unsigned long run_destroy_failures(void)
+static unsigned long run_owned_record_access(void)
 {
     struct physical_page_allocator allocator;
     struct riscv_sv39_page_table kernel_table = {0};
     struct riscv_sv39_user_space space = {0};
     struct kernel_mm mm = {0};
     uint64_t baseline;
-    uint64_t available;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space)) {
@@ -420,20 +419,12 @@ static unsigned long run_destroy_failures(void)
         KERNEL_MM_STATUS_OK) {
         return 2U;
     }
-    available = physical_page_available(&allocator);
     inaccessible_page = mm.record_page_address;
-    if (kernel_mm_release(&mm) !=
-            KERNEL_MM_STATUS_PAGE_ACCESS ||
-        mm.state != KERNEL_MM_LIVE ||
-        physical_page_available(&allocator) != available) {
-        return 3U;
-    }
-    inaccessible_page = UINT64_MAX;
+    /* 活 MM 已持有记录指针，release 不再重新经过物理地址解析。 */
     if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
         mm.state != KERNEL_MM_RELEASED ||
-        physical_page_available(&allocator) != baseline) {
-        return 4U;
-    }
+        physical_page_available(&allocator) != baseline) return 3U;
+    inaccessible_page = UINT64_MAX;
     return 0U;
 }
 
@@ -565,6 +556,6 @@ unsigned long run_all_mm_cases(void)
     if (result != 0U) {
         return UINT64_C(0x400) + result;
     }
-    result = run_destroy_failures();
+    result = run_owned_record_access();
     return result == 0U ? 0U : UINT64_C(0x500) + result;
 }

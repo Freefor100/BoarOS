@@ -133,7 +133,7 @@ static void construct_pair(void *unused)
 static void prepare_table(void)
 {
     table=(struct kernel_files){0}; check(!kernel_files_create(&table,pool),"files-table-create");
-    check(!kernel_files_enable_concurrency(&table,space),"files-domain-publish");
+    check(!kernel_files_check_task_domain(&table,space),"files-domain-publish");
     struct kernel_thread_join constructor={0};
     check(!kernel_thread_create_joinable_files(construct_pair,0,&constructor,1,space,&table),"files-pair-bound-builder");
     kernel_thread_join(&constructor);

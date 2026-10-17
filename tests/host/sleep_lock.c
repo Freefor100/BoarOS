@@ -13,6 +13,8 @@ struct host_task { struct kernel_task task; unsigned *dispatch; unsigned id; };
 #include <unistd.h>
 
 _Thread_local uintptr_t sync_test_irq = 1;
+_Thread_local unsigned sync_test_irq_restores;
+static _Thread_local unsigned segment_restores;
 static _Thread_local struct kernel_cpu cpu;
 static _Thread_local struct host_task host_current;
 #define current host_current.task
@@ -22,6 +24,7 @@ static unsigned order[64], count;
 static unsigned entered[64], leave[64], parked[64], granted[64];
 static pthread_barrier_t segment_entered, segment_released;
 static unsigned segment_enabled, finish_pause;
+static unsigned handoff_irq = 1;
 static pthread_barrier_t finish_entered, finish_released;
 void *sync_test_cpu(void) { return &cpu; }
 struct kernel_task *kernel_task_current(void) { return &current; }
@@ -57,6 +60,15 @@ void kernel_wait_backend_quiesce(void) { sched_yield(); }
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_raw_guard *guard)
 {
+    if (segment_enabled && raw == &lock.metadata && lock.handoff_owner &&
+        lock.readers == 16 && host_current.id == 2) {
+        assert((handoff_irq ? sync_test_irq_restores > segment_restores :
+            sync_test_irq_restores == segment_restores) && !cpu.raw_locks && !cpu.preempt_depth);
+        int result = pthread_barrier_wait(&segment_entered);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        result = pthread_barrier_wait(&segment_released);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
     if (raw == &lock.metadata && host_current.id == 1 && current.wait.phase == KERNEL_WAIT_FINISHED &&
         __atomic_load_n(&parked[0], __ATOMIC_ACQUIRE) == 1 &&
         __atomic_exchange_n(&finish_pause, 0, __ATOMIC_ACQ_REL)) {
@@ -70,15 +82,10 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_r
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
-    int pause = segment_enabled && guard->lock == &lock.metadata &&
-        lock.handoff_owner && lock.readers == 16 && host_current.id == 2;
+    if (segment_enabled && guard->lock == &lock.metadata &&
+        lock.handoff_owner && lock.readers == 16 && host_current.id == 2)
+        segment_restores = sync_test_irq_restores;
     __real_kernel_raw_lock_release(guard);
-    if (pause) {
-        int result = pthread_barrier_wait(&segment_entered);
-        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
-        result = pthread_barrier_wait(&segment_released);
-        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
-    }
 }
 static void *worker(void *argument)
 {
@@ -92,7 +99,9 @@ static void *worker(void *argument)
     { KERNEL_RAW_SCOPE(raw, &lock.metadata); order[count++] = id; }
     __atomic_store_n(&entered[id], 1, __ATOMIC_RELEASE);
     while (!__atomic_load_n(&leave[id], __ATOMIC_ACQUIRE)) sched_yield();
+    if (id == 1) sync_test_irq = handoff_irq;
     kernel_lock_release(&guard);
+    assert(sync_test_irq == (id == 1 ? handoff_irq : 1));
     assert(!current.io_context.locks && current.wait.phase == KERNEL_WAIT_FINISHED);
     return 0;
 }
@@ -255,5 +264,6 @@ int main(void)
     }
     sync_test_irq = 1;
     fifo(1); fifo(8); fifo(32);
+    handoff_irq = 0; fifo(32);
     puts("sleep lock: deterministic FIFO writer boundary, reserved grants and 1/8/32 waiters passed");
 }

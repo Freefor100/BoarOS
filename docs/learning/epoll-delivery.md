@@ -1,6 +1,6 @@
 # epoll 交付、扫描与对象寿命
 
-2026-10-05，基线 `5687377c58dc96adfa1f72f1636a319bbd25b419`。
+最初交付问题对应 `5687377c58dc96adfa1f72f1636a319bbd25b419`。
 固定依据是 `references/linux/fs/eventpoll.c`，Linux commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的扫描隔离及逐事件交付。
 
@@ -25,6 +25,8 @@ ready，LT 回队再次使用同一个 next，形成自环。直接编译旧生�
 整个等待请求登记在 task，强制退出先归还当前候选和所有 pin，再回收栈。
 没有跨用户复制持有 epoll 锁或把关中断误当成不可能调度。
 
+嵌套 epoll 的通知按一次源队列唤醒合并。等待游标在本 CPU 的 IRQ 保护内为整轮嵌套通知提供序号；每个 epoll 在这一轮只唤醒父队列一次。每条注册仍更新自己的通知代次和 ready/pending 状态，扫描期间到达的事件不被合并掉。下一次源通知取得新序号，即使对象仍有 ready 项也会传播。128 个 epoll、3104 条注册的四层重复路径，单轮回调从 1,082,400 次变为 3104 次；这描述操作数，不是应用加速倍数。
+
 可重建验证：
 
 ```sh
@@ -35,7 +37,7 @@ make test-files-riscv test-userland-riscv test-stack-usage
 
 宿主测试编译完整 `fs/files/epoll.c`，只替换用户复制、OFD、调度和等待
 边界，启用 ASan/UBSan。覆盖 fault 重试、通知重入、MOD、DEL、close pin、
-fd 复用、扫描中的第二等待者、复制期间通知和退出取消，检查资源回到基线。
+fd 复用、扫描中的第二等待者、复制期间通知和退出取消，检查分配与引用全部归还。
 真实 RV64 的九组 LT/ET/ONESHOT × fault 位置在同一 ELF 的两侧通过，
 并检查 ONESHOT MOD 重装；QEMU 为 11.1.1。并发控制操作和强制取消的
 确定性交错由宿主边界模型验证，未把它描述成客体并发压力结果。

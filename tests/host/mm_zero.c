@@ -8,8 +8,9 @@ void mm_test_attach(unsigned);
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator pages;
 static struct arch_mmu_page_table kernel;
+static unsigned access_calls;
 static void *access(uint64_t physical)
-{ return physical < sizeof(pool) ? pool + physical : 0; }
+{ access_calls++; return physical < sizeof(pool) ? pool + physical : 0; }
 void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_unavailable(void) { abort(); }
 void mm_test_fence(uint64_t address, int instructions)
@@ -61,6 +62,18 @@ int main(void)
     assert(prepared.tables[0] == KERNEL_MM_NO_PAGE && prepared.tables[1] == KERNEL_MM_NO_PAGE);
     struct arch_mmu_mapping mapping;
     assert(!arch_mmu_user_lookup(&parent, 0x40000, &mapping) && mapping.physical_address == data);
+    const uint64_t far = UINT64_C(0x1000000000);
+    assert(!arch_mmu_user_map_zeroed_page(&parent,far,ARCH_MMU_READ|ARCH_MMU_WRITE));
+    assert(!arch_mmu_user_protect_owned_page(&parent,far,0));
+    uint64_t cursor = 0x40000, found;
+    assert(!arch_mmu_user_next_owned(&parent,&cursor,0x41000,&found) && found==0x40000);
+    unsigned before = access_calls;
+    assert(arch_mmu_user_next_owned(&parent,&cursor,0x41000,&found)==ARCH_MMU_STATUS_NOT_MAPPED &&
+           access_calls==before);
+    cursor = 0x41000; before = access_calls;
+    assert(arch_mmu_user_next_owned(&parent,&cursor,far,&found)==ARCH_MMU_STATUS_NOT_MAPPED &&
+           cursor==far && access_calls-before<=3); /* 不进入 end 外的驻留子树。 */
+    assert(!arch_mmu_user_next_owned(&parent,&cursor,far+BOAROS_PAGE_SIZE,&found) && found==far);
     assert(!arch_mmu_user_space_destroy(&parent));
     assert(physical_page_available(&pages) == baseline);
 

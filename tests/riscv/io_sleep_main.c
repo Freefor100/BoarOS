@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/irq.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/mm.h>
 #include <kernel/open_file.h>
@@ -21,6 +22,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/vfs.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/open_file_internal.h"
 #include "../../fs/write_source.h"
 #include "../../fs/files/private.h"
 #include "../../kernel/sched/private.h"
@@ -37,7 +39,7 @@ static unsigned char payload[4096];
 static struct kernel_mm sync_mm;
 static struct riscv_sv39_page_table protocol_table;
 static uint64_t sync_satp, sync_address;
-static int sync_edit, operation_testing;
+static int operation_testing;
 static struct kernel_files operation_files;
 static struct kernel_task *operation_writer_task, *operation_contender_task;
 static struct kernel_wait_queue operation_held;
@@ -52,36 +54,6 @@ static struct kernel_task *send_copy_task;
 static struct kernel_wait_queue send_copy_held;
 static int64_t send_copy_fd;
 #define OP_USER UINT64_C(0x21000000)
-struct kernel_task *__real_kernel_task_current(void);
-struct kernel_task *__wrap_kernel_task_current(void)
-{ return operation_testing && sync_edit ? kernel_cpu_current()->current : __real_kernel_task_current(); }
-void __real_kernel_vfs_node_lock(struct kernel_vfs_node *, struct kernel_lock_guard *, int);
-void __wrap_kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write)
-{
-    int edit = sync_edit;
-    if (operation_testing) sync_edit = 0;
-    __real_kernel_vfs_node_lock(node, guard, write);
-    sync_edit = edit;
-}
-enum kernel_page_cache_status __real_kernel_open_file_get_page(struct kernel_open_file_description *, uint64_t, uint64_t *, size_t *);
-enum kernel_page_cache_status __wrap_kernel_open_file_get_page(struct kernel_open_file_description *ofd, uint64_t index, uint64_t *page, size_t *valid)
-{
-    int edit = sync_edit;
-    if (operation_testing) sync_edit = 0;
-    enum kernel_page_cache_status result = __real_kernel_open_file_get_page(ofd, index, page, valid);
-    sync_edit = edit;
-    return result;
-}
-enum kernel_page_cache_status __real_kernel_page_cache_get_batch(struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t, struct kernel_page_cache_read_page *, size_t);
-enum kernel_page_cache_status __wrap_kernel_page_cache_get_batch(struct kernel_page_cache *owner, const struct kernel_vfs_file *source,
-    uint64_t first, struct kernel_page_cache_read_page *pages, size_t count)
-{
-    int edit = sync_edit;
-    if (operation_testing) sync_edit = 0;
-    enum kernel_page_cache_status result = __real_kernel_page_cache_get_batch(owner, source, first, pages, count);
-    sync_edit = edit;
-    return result;
-}
 enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied);
 
@@ -90,9 +62,6 @@ static struct kernel_wait_queue sync_held;
 static struct kernel_task *sync_task;
 static unsigned sync_entered, sync_active, sync_finished, sync_released;
 static int sync_error, sync_close_error;
-uint64_t __real_riscv_sv39_current_satp(void);
-uint64_t __wrap_riscv_sv39_current_satp(void)
-{ return sync_edit ? sync_satp : __real_riscv_sv39_current_satp(); }
 int __real_kernel_open_file_sync_range(struct kernel_open_file_description *, uint64_t, uint64_t);
 int __wrap_kernel_open_file_sync_range(struct kernel_open_file_description *ofd, uint64_t start, uint64_t end)
 {
@@ -125,7 +94,7 @@ static void check(int good, unsigned id)
 }
 enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner)
 {
-    if (*owner == sync_source) {
+    if (*owner == sync_source && __atomic_load_n(&sync_source->references,__ATOMIC_ACQUIRE)<=1) {
         check(!sync_active, 220); /* 最后映射撤销不能释放仍在 msync 中使用的 OFD。 */
         if (sync_close_error) { sync_close_error = 0; return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED; }
         sync_released++;
@@ -186,9 +155,7 @@ static void sync_source_probe(void *argument)
         check(sync_active && !sync_finished, 229);
         /* 被取消的同步仍拥有等待中的 OFD，不能把不可中断 I/O 当成已结束。 */
         sync_task->terminate_requested = 1;
-        sync_edit = 1;
         check(kernel_mm_munmap(&sync_mm, sync_address, 4096) == KERNEL_MM_STATUS_OK && !sync_released, 230);
-        sync_edit = 0;
         kernel_wait_queue_wake_all(&sync_held);
         kernel_thread_join(&holder);
         kernel_thread_join(&synchronizer);
@@ -210,19 +177,9 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, vo
             /* 模型化合法的用户缺页调度，让另一写者进入；不改实际复制或发布结果。 */
             check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 290);
         }
-        int edit = sync_edit;
-        sync_edit = 1;
-        enum kernel_uaccess_status result = __real_kernel_copy_from_user(mm, buffer, address, size, copied);
-        sync_edit = edit;
-        return result;
     }
-    if (!operation_testing || mm != &sync_mm)
-        return __real_kernel_copy_from_user(mm, buffer, address, size, copied);
     /* 向量导入仍走通用usercopy，文件payload直接从页pin写入最终页。 */
-    int previous=sync_edit; sync_edit=1;
-    enum kernel_uaccess_status result=__real_kernel_copy_from_user(mm,buffer,address,size,copied);
-    sync_edit=previous;
-    return result;
+    return __real_kernel_copy_from_user(mm,buffer,address,size,copied);
 }
 enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *mm,uint64_t address,
@@ -242,11 +199,8 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm 
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&operation_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 240);
     }
-    /* 使用真实 MM/uaccess；只模型化未激活 MM 的 satp，调度和 VFS 等待仍用真实 hart。 */
-    int previous=sync_edit; sync_edit=1;
-    enum kernel_uaccess_status result=__real_kernel_uaccess_pin_user_page(mm,address,access,pin);
-    sync_edit=previous;
-    return result;
+    /* MM owner 覆盖后台空间寿命，不伪造当前硬件根；调度与等待使用真实 hart。 */
+    return __real_kernel_uaccess_pin_user_page(mm,address,access,pin);
 }
 static void operation_writer(void *argument)
 {
@@ -305,7 +259,6 @@ static void whole_write_probe(void *argument)
         check(kernel_mm_mmap_anonymous(&sync_mm, OP_USER, 24576, KERNEL_MM_READ | KERNEL_MM_WRITE,
             KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK, 245);
         size_t copied;
-        sync_edit = 1;
         check(kernel_copy_to_user(&sync_mm, OP_USER, "/write-operation", 17, &copied) == KERNEL_UACCESS_STATUS_OK, 246);
         memset(payload, 'A', sizeof(payload));
         check(kernel_copy_to_user(&sync_mm, OP_USER + 4096, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK &&
@@ -313,7 +266,6 @@ static void whole_write_probe(void *argument)
         memset(payload, 'B', sizeof(payload));
         check(kernel_copy_to_user(&sync_mm, OP_USER + 16384, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK &&
             kernel_copy_to_user(&sync_mm, OP_USER + 20480, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK, 248);
-        sync_edit = 0;
         int64_t result;
         uint64_t flags = 2 | 0100 | 01000 | (operation_mode == 0 ? KERNEL_FILES_O_APPEND : 0);
         check(kernel_files_openat(&operation_files, &fs, &sync_mm, -100, OP_USER,
@@ -333,9 +285,7 @@ static void whole_write_probe(void *argument)
             (void)kernel_page_cache_reclaim(&cache, 64);
         }
         struct kernel_uaccess_iovec iov[2] = {{OP_USER + 4096, 4096}, {operation_second, 4096}};
-        sync_edit = 1;
         check(kernel_copy_to_user(&sync_mm, OP_USER + 128, iov, sizeof(iov), &copied) == KERNEL_UACCESS_STATUS_OK, 252);
-        sync_edit = 0;
         struct kernel_thread_join writer = {0}, contender = {0};
         check(kernel_thread_create_joinable(operation_writer, 0, &writer) == KERNEL_SCHEDULER_STATUS_OK, 253);
         while (!operation_paused) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 254);
@@ -353,7 +303,7 @@ static void whole_write_probe(void *argument)
             unsigned char expected = operation_mode == 0 && offset < 12288 ? 'A' : 'B';
             for (unsigned i = 0; i < 4096; i++) check(payload[i] == expected, 260);
         }
-        operation_testing = 0; sync_edit = 0; sync_satp = 0;
+        operation_testing = 0; sync_satp = 0;
         check(kernel_files_release(&operation_files) == KERNEL_FILES_STATUS_OK &&
             kernel_mm_release(&sync_mm) == KERNEL_MM_STATUS_OK &&
             kernel_fs_context_release(&fs) == KERNEL_FS_CONTEXT_STATUS_OK &&
@@ -391,14 +341,12 @@ static void pipe_copy_probe(void *unused)
     uint64_t address;
     size_t copied;
     int64_t result;
-    sync_edit = 1;
     check(kernel_mm_mmap_anonymous(&sync_mm, OP_USER, 16384, KERNEL_MM_READ | KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK &&
         kernel_files_pipe2(&operation_files, &sync_mm, OP_USER, 0, &result) == KERNEL_FILES_STATUS_OK && result == 0 &&
         kernel_copy_from_user(&sync_mm, pipe_copy_pair, OP_USER, sizeof(pipe_copy_pair), &copied) == KERNEL_UACCESS_STATUS_OK &&
         kernel_copy_to_user(&sync_mm, OP_USER + 4096, "AAAAAAAAAAAAAAAAAAAAAAAAA", 25, &copied) == KERNEL_UACCESS_STATUS_OK &&
         kernel_copy_to_user(&sync_mm, OP_USER + 8192, "BBBBBBBBBBBBBBBBBBBBBBBBB", 25, &copied) == KERNEL_UACCESS_STATUS_OK, 294);
-    sync_edit = 0;
     pipe_copy_testing = 1;
     pipe_copy_entered = 0;
     struct kernel_thread_join first = {0}, second = {0};
@@ -406,7 +354,6 @@ static void pipe_copy_probe(void *unused)
         kernel_thread_create_joinable(pipe_copy_writer, (void *)1, &second) == KERNEL_SCHEDULER_STATUS_OK, 295);
     kernel_thread_join(&first);
     kernel_thread_join(&second);
-    sync_edit = 1;
     check(pipe_copy_entered && kernel_files_read(&operation_files, &sync_mm, pipe_copy_pair[0],
         OP_USER + 12288, 50, &result) == KERNEL_FILES_STATUS_OK && result == 50, 296);
     unsigned char received[50];
@@ -415,7 +362,6 @@ static void pipe_copy_probe(void *unused)
     for (unsigned i = 0; i < sizeof(received); i++) { a += received[i] == 'A'; b += received[i] == 'B'; }
     check(a == 25 && b == 25, 298);
     pipe_copy_testing = 0;
-    sync_edit = 0;
     sync_satp = 0;
     check(kernel_files_release(&operation_files) == KERNEL_FILES_STATUS_OK &&
         kernel_mm_release(&sync_mm) == KERNEL_MM_STATUS_OK &&
@@ -437,9 +383,7 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm, uint
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&receive_held,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,270);
     }
-    int previous=sync_edit; sync_edit=1;
     enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,buffer,size,copied);
-    sync_edit=previous;
     return result;
 }
 static void receive_owner(void *argument)
@@ -479,12 +423,10 @@ static void receive_reservation_probe(void *argument)
             kernel_mm_brk_initialize(&sync_mm,0x10000000,0x70000000)==KERNEL_MM_STATUS_OK &&
             riscv_kernel_mm_satp(&sync_mm,&sync_satp)==KERNEL_MM_STATUS_OK &&
             kernel_files_create(&operation_files,&heap)==KERNEL_FILES_STATUS_OK,275);
-        uint64_t address; size_t copied; int64_t result; sync_edit=1;
-        check(kernel_mm_mmap_anonymous(&sync_mm,OP_USER,4096,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address)==KERNEL_MM_STATUS_OK &&
+        uint64_t address; size_t copied; int64_t result; check(kernel_mm_mmap_anonymous(&sync_mm,OP_USER,4096,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address)==KERNEL_MM_STATUS_OK &&
             kernel_files_socketpair_create(&operation_files,&sync_mm,2,0,OP_USER,&result)==KERNEL_FILES_STATUS_OK && result==0 &&
             kernel_copy_from_user(&sync_mm,receive_pair,OP_USER,sizeof(receive_pair),&copied)==KERNEL_UACCESS_STATUS_OK &&
             kernel_copy_to_user(&sync_mm,OP_USER+512,"xyz",3,&copied)==KERNEL_UACCESS_STATUS_OK,276);
-        sync_edit=0;
         check(kernel_files_write(&operation_files,&sync_mm,receive_pair[0],OP_USER+512,3,&result)==KERNEL_FILES_STATUS_OK && result==3,277);
         KERNEL_FILES_PIN_SCOPE(socket_pin);
         struct kernel_socket *socket=kernel_open_file_socket(kernel_files_hold_fd(&operation_files,receive_pair[1],&socket_pin));
@@ -504,16 +446,14 @@ static void receive_reservation_probe(void *argument)
             check(kernel_scheduler_block_current(&receive_completed,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,285);
         }
         if(receive_mode==3) {
-            sync_edit=1;
             check(kernel_mm_mprotect(&sync_mm,OP_USER,4096,KERNEL_MM_READ)==KERNEL_MM_STATUS_OK,292);
-            sync_edit=0;
-        }
+            }
         check(kernel_wait_queue_wake_all(&receive_held)==KERNEL_SCHEDULER_STATUS_OK,286);
         kernel_thread_join(&holder); kernel_thread_join(&waiter);
-        sync_edit=1; char bytes[3];
+        char bytes[3];
         check(kernel_copy_from_user(&sync_mm,bytes,OP_USER+256,3,&copied)==KERNEL_UACCESS_STATUS_OK && (receive_mode==3 ? bytes[0]==0 && bytes[1]==0 && bytes[2]==0 : !memcmp(bytes,"xyz",3)),287);
         kernel_files_pin_guard_release(&socket_pin);
-        sync_edit=receive_testing=operation_testing=0; sync_satp=0;
+        receive_testing=operation_testing=0; sync_satp=0;
         check(kernel_files_release(&operation_files)==KERNEL_FILES_STATUS_OK && kernel_mm_release(&sync_mm)==KERNEL_MM_STATUS_OK &&
             physical_page_release(&allocator,table.root_address)==PHYSICAL_PAGE_STATUS_OK,288);
     }
@@ -547,11 +487,9 @@ static void stream_copy_probe(void)
             kernel_mm_brk_initialize(&sync_mm, 0x10000000, 0x70000000) == KERNEL_MM_STATUS_OK &&
             riscv_kernel_mm_satp(&sync_mm, &sync_satp) == KERNEL_MM_STATUS_OK && kernel_files_create(&operation_files, &heap) == KERNEL_FILES_STATUS_OK, 315);
         uint64_t address; size_t copied; int64_t result, listener_fd;
-        sync_edit = 1;
         check(kernel_mm_mmap_anonymous(&sync_mm, OP_USER, 4096, KERNEL_MM_READ | KERNEL_MM_WRITE,
             KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK &&
             kernel_copy_to_user(&sync_mm, OP_USER, "pin", 3, &copied) == KERNEL_UACCESS_STATUS_OK, 316);
-        sync_edit = 0;
         struct kernel_open_file_description *listener = 0, *client = 0, *reader = 0;
         struct kernel_socket *accepted = 0;
         check(kernel_files_socket_create(&operation_files, 2, 1, 0, &listener_fd) == KERNEL_FILES_STATUS_OK && listener_fd >= 0 &&
@@ -572,7 +510,7 @@ static void stream_copy_probe(void)
         int64_t replacement;
         check(kernel_files_socket_create(&operation_files, 2, 2, 0, &replacement) == KERNEL_FILES_STATUS_OK && replacement == send_copy_fd, 323);
         if (send_copy_mode == 1) check(kernel_socket_shutdown(socket, 1) == 0, 324);
-        if (send_copy_mode == 2) { sync_edit = 1; check(kernel_mm_munmap(&sync_mm, OP_USER, 4096) == KERNEL_MM_STATUS_OK, 325); sync_edit = 0; }
+        if (send_copy_mode == 2) { check(kernel_mm_munmap(&sync_mm, OP_USER, 4096) == KERNEL_MM_STATUS_OK, 325); }
         check(kernel_wait_queue_wake_all(&send_copy_held) == KERNEL_SCHEDULER_STATUS_OK, 326);
         kernel_thread_join(&writer);
         if (!send_copy_mode) {
@@ -618,8 +556,8 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int physical(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static int dma(const void *p, uint64_t n, uint64_t *out) { (void)n; *out = (uintptr_t)p; return 1; }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *);
-int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t, struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     if (loading_probe) {
         loads++;
@@ -627,7 +565,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 10);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace);
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
 }
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
@@ -635,6 +573,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
     uint64_t offset=count?spans[0].offset:0;
     const void *buffer=count?spans[0].buffer:NULL;
     if (instance_hold && kernel_io_context_current()->background_reclaim) {
+        KERNEL_IRQ_SCOPE(block_irq);
         for (unsigned i = 0; i < 2; i++) if (node == instance_nodes[i] && !instance_entered[i]) {
             instance_entered[i] = 1;
             enum kernel_wait_wake_reason reason;
@@ -642,6 +581,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
         }
     }
     if (stop_probe && kernel_io_context_current()->background_reclaim) {
+        KERNEL_IRQ_SCOPE(block_irq);
         stop_probe = 0;
         stop_pages = count;
         stop_entered = 1;
@@ -901,7 +841,7 @@ static void batch_reader(void *unused)
         KERNEL_LOCK_SCOPE(guard);
         kernel_vfs_node_lock(kernel_vfs_file_node(&read_batch_file), &guard, 0);
         static struct file_read_workspace file_read_work;
-        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8, &file_read_work) == 0, 351);
+        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8, &file_read_work, NULL) == 0, 351);
         for (unsigned i = 0; i < 8; i++) {
             check(!pages[i].error && pages[i].completed == 4096, 352);
             for (unsigned j = 0; j < 4096; j++) check(read_batch_pages[i][j] == i + 1, 353);
@@ -910,7 +850,7 @@ static void batch_reader(void *unused)
         riscv_interrupt_restore(irq);
         return;
     }
-    check(kernel_block_read_batch(&device.block, spans, 8) == KERNEL_BLOCK_STATUS_OK, 340);
+    check(kernel_block_read_batch(&device.block, spans, 8, NULL) == KERNEL_BLOCK_STATUS_OK, 340);
     for (unsigned i = 0; i < 8; i++) {
         check(spans[i].status == KERNEL_BLOCK_STATUS_OK && spans[i].completed == 512, 341);
         for (unsigned j = 0; j < 512; j++) check(sectors[i][j] == i + 1, 342);
@@ -1015,6 +955,18 @@ static void instance_write(struct kernel_page_cache *c, struct kernel_vfs_file *
                                       &written) == 0 && written == sizeof(payload), 182);
     }
 }
+static void wait_cache_pressure(void)
+{
+    struct physical_page_reclaim_hooks hooks;
+    {
+        KERNEL_RAW_SCOPE(binding,&allocator.lock);
+        hooks=allocator.reclaim_hooks;
+        check(hooks.wait && hooks.retain && hooks.release,185);
+        hooks.retain(hooks.context);
+    }
+    hooks.wait(hooks.context);
+    hooks.release(hooks.context);
+}
 static void instance_waiter(void *unused)
 {
     (void)unused;
@@ -1027,7 +979,7 @@ static void instance_waiter(void *unused)
         held++;
     }
     instance_waiting = 1;
-    allocator.pressure_wait(allocator.pressure_context);
+    wait_cache_pressure();
     instance_wait_done = 1;
     while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 184);
 }
@@ -1050,8 +1002,17 @@ static void cache_instances_probe(void)
     struct kernel_vfs_file files[2] = {{0}, {0}};
     struct kernel_page_cache_statistics a, b, a_after, b_after;
     struct kernel_memory_statistics memory;
+    /* 干净回收不再承担写盘；先完成现有脏页，再检查回收归还。 */
+    uint64_t observed=kernel_vfs_mount_error_sequence(&mount);
+    check(!kernel_vfs_sync_mount(&mount,&observed),212);
     (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     kernel_page_cache_get_statistics(&cache, &a);
+    if (a.current_pages) {
+        kernel_memory_snapshot(&allocator,&memory);
+        virt_uart_puts("cache clean reclaim remaining=");virt_uart_put_hex(a.current_pages);
+        virt_uart_puts(" dirty=");virt_uart_put_hex(memory.dirty);
+        virt_uart_puts(" writeback=");virt_uart_put_hex(memory.writeback);virt_uart_putc('\n');
+    }
     check(!a.current_pages, 186);
     check(kernel_page_cache_init(&instance_peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
           kernel_vfs_create(&mount, "/instance-root", 0600, &files[0]) == 0 &&
@@ -1083,8 +1044,8 @@ static void cache_instances_probe(void)
     check(returned==idle && !memory.reclaimable && memory.cached==4*4096, 191);
     for(unsigned i=0;i<2;i++)for(unsigned j=0;j<2;j++)
         check(physical_page_release(&allocator,pins[i][j])==PHYSICAL_PAGE_STATUS_OK, 191);
-    check(allocator.reclaimer(allocator.reclaimer_context, 1) == 1 &&
-          allocator.reclaimer(allocator.reclaimer_context, 1) == 1, 191);
+    check(allocator.reclaim_hooks.reclaim(allocator.reclaim_hooks.context, 1) == 1 &&
+          allocator.reclaim_hooks.reclaim(allocator.reclaim_hooks.context, 1) == 1, 191);
     kernel_page_cache_get_statistics(&cache, &a);
     kernel_page_cache_get_statistics(&instance_peer, &b);
     check(a.current_pages == 1 && b.current_pages == 1, 192);
@@ -1152,9 +1113,9 @@ static void cache_instances_probe(void)
         }
         kernel_thread_join(&waiter); kernel_thread_join(&stopper);
         instance_hold = 0;
-        check(instance_stop_done && allocator.pressure_wait && allocator.pressure_notify, 204);
+        check(instance_stop_done && allocator.reclaim_hooks.wait && allocator.reclaim_hooks.notify, 204);
         /* peer 注销后，真实 root worker 仍能收到压力请求并完成。 */
-        allocator.pressure_wait(allocator.pressure_context);
+        wait_cache_pressure();
         kernel_page_cache_stop_worker(&cache);
         (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     }
@@ -1184,14 +1145,14 @@ static void background_writeback_probe(void *unused)
     struct kernel_page_cache peer = {0};
     check(kernel_page_cache_init(&peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
           kernel_page_cache_start_worker(&peer) == 0, 163);
-    allocator.pressure_wait(allocator.pressure_context);
+    wait_cache_pressure();
     kernel_page_cache_stop_worker(&peer);
-    check(allocator.pressure_wait && allocator.pressure_notify, 164);
+    check(allocator.reclaim_hooks.wait && allocator.reclaim_hooks.notify, 164);
     check(kernel_page_cache_destroy(&peer) == KERNEL_PAGE_CACHE_STATUS_OK, 165);
-    check(allocator.pressure_wait && allocator.pressure_notify, 166);
+    check(allocator.reclaim_hooks.wait && allocator.reclaim_hooks.notify, 166);
 
     /* 没有候选的一轮必须返回并休眠，不能自行反复扫描。 */
-    allocator.pressure_wait(allocator.pressure_context);
+    wait_cache_pressure();
     struct kernel_page_cache_statistics empty_before, empty_after;
     kernel_page_cache_get_statistics(&cache, &empty_before);
     for (unsigned i = 0; i < 8; i++)
@@ -1390,6 +1351,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     uint32_t references;
     check(physical_page_reference_count(&allocator, inserted_page, &references) == PHYSICAL_PAGE_STATUS_OK && references == 1, 70);
     kernel_page_cache_alias_detach(&alias);
+    kernel_page_cache_alias_drain(&alias);
     check(kernel_vfs_sync(&file, 0, &sequence) == 0, 27);
     check(kernel_vfs_create(&mount, "/orphan", 0600, &orphan) == 0 &&
           kernel_vfs_pwrite(&orphan, 0, payload, sizeof(payload), &written) == 0 &&
@@ -1512,7 +1474,9 @@ void kernel_main(unsigned long hart, const void *dtb)
     check(kernel_thread_create(whole_write_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 262);
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
-        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 263);
+        enum kernel_scheduler_status status=kernel_scheduler_yield_current();
+        if (status) { virt_uart_puts("I/O write scheduling status=");virt_uart_put_hex(status);virt_uart_putc('\n'); }
+        check(status == KERNEL_SCHEDULER_STATUS_OK, 263);
         struct kernel_thread_completion completion;
         if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
         riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);

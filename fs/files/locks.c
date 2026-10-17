@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 #include "../open_file_internal.h"
 #include "../record_lock.h"
@@ -107,6 +108,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
     struct kernel_task *task, int64_t fd, uint64_t command,
     uint64_t user_flock, int64_t *linux_result)
 {
+    KERNEL_SERVICE_SCOPE(service);
     struct linux_flock flock;
     struct kernel_open_file_description *file = 0;
     struct kernel_vfs_node *node;
@@ -126,7 +128,6 @@ enum kernel_files_status kernel_files_fcntl_lock(
                command == KERNEL_FILES_F_OFD_SETLKW;
     if (!kernel_files_is_live(files) || !mm || !task || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    if (kernel_files_controlled(files)) return KERNEL_FILES_STATUS_STATE;
     status = kernel_files_pin_data(files, fd, &file, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || !file) return status;
     access = kernel_copy_from_user(mm, &flock, user_flock,
@@ -209,6 +210,12 @@ enum kernel_files_status kernel_files_fcntl_lock(
                 result = -KERNEL_EBADF;
                 break;
             }
+        }
+        /* close可在首次锁发布前摘槽；接纳后重查实际OFD身份，
+         * 关闭已经发生时撤销本inode的传统锁，不留下失去fd的owner。 */
+        if (!result && !kind && flock.type!=2 && !kernel_files_fd_matches(files,fd,file)) {
+            kernel_record_lock_release(state,owner_head,files->heap);
+            result=-KERNEL_EBADF;
         }
     }
     arch_interrupt_restore(irq);

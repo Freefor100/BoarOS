@@ -235,7 +235,7 @@ void riscv_smp_report_user_execution(void)
         virt_uart_puts(" traps="); virt_uart_put_hex(cpus[i]->user_traps);
         virt_uart_puts(" returns="); virt_uart_put_hex(cpus[i]->user_returns);
         virt_uart_puts(" local-irqs="); virt_uart_put_hex(cpus[i]->user_local_interrupts);
-        virt_uart_puts(" syscalls="); virt_uart_put_hex(cpus[i]->service_dispatches);
+        virt_uart_puts(" syscalls="); virt_uart_put_hex(cpus[i]->syscall_dispatches);
         virt_uart_putc('\n');
     }
     virt_uart_puts("BoarOS: USER SMP service migrations="); virt_uart_put_hex(cpus[0]->service_migrations);

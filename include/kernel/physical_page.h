@@ -19,6 +19,17 @@ enum physical_page_status {
 typedef void *(*physical_page_access_fn)(uint64_t physical_address);
 typedef uint64_t (*physical_page_reclaim_fn)(void *context,
                                              uint64_t target_pages);
+struct kernel_memory_statistics;
+struct physical_page_reclaim_hooks {
+    physical_page_reclaim_fn reclaim;
+    void (*notify)(void *);
+    void (*wait)(void *);
+    void (*snapshot)(void *, struct kernel_memory_statistics *);
+    uint32_t *(*depth)(void);
+    void (*retain)(void *);
+    void (*release)(void *);
+    void *context;
+};
 
 /* Byte capacities; references and mappings never multiply owned storage. */
 struct kernel_memory_statistics {
@@ -41,12 +52,8 @@ struct physical_page_range {
 
 struct physical_page_allocator {
     struct kernel_raw_lock lock;
-    void (*pressure_notify)(void *);
-    void (*pressure_wait)(void *);
-    void *pressure_context;
+    struct physical_page_reclaim_hooks reclaim_hooks;
     uint64_t shared_anon_pages;
-    void (*cache_snapshot)(void *, struct kernel_memory_statistics *);
-    void *cache_context;
     uint64_t (*buffer_bytes)(void *);
     void *buffer_context;
     uint64_t total_pages;
@@ -61,10 +68,7 @@ struct physical_page_allocator {
     uint32_t initialized;
     uint32_t finalized;
     uint32_t reclaiming; /* Active callbacks, including suspended tasks. */
-    uint32_t *(*reclaim_depth)(void);
     physical_page_access_fn access;
-    physical_page_reclaim_fn reclaimer;
-    void *reclaimer_context;
     struct physical_page_metadata *metadata;
     struct physical_page_root *roots;
     unsigned char *tree;
@@ -96,8 +100,7 @@ int physical_page_allocator_is_finalized(
 
 enum physical_page_status physical_page_allocator_set_reclaimer(
     struct physical_page_allocator *allocator,
-    physical_page_reclaim_fn reclaimer,
-    void *context);
+    const struct physical_page_reclaim_hooks *hooks);
 
 enum physical_page_status physical_page_allocator_clear_reclaimer(
     struct physical_page_allocator *allocator);
@@ -137,6 +140,12 @@ enum physical_page_status physical_page_allocation_order(
     uint32_t *order);
 
 /* The caller must own an allocated page; this validates only address history. */
+/* 内部持有者访问：调用者须已持有覆盖此次使用的页、页表或 pin 引用。
+ * 不查询 buddy 所有权，也不取得分配器锁。 */
+enum physical_page_status physical_page_map_owned(
+    const struct physical_page_allocator *, uint64_t physical_address,
+    void **pointer);
+
 enum physical_page_status physical_page_resolve(
     const struct physical_page_allocator *allocator,
     uint64_t physical_address,

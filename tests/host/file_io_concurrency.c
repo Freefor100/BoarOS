@@ -9,10 +9,14 @@
 #include <kernel/block.h>
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
+#include <kernel/futex.h>
 #include <kernel/file_mapping.h>
+#include <kernel/irq.h>
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
 #include "../../fs/vfs_internal.h"
+#include "../../fs/vfs_objects.h"
+#include "../../kernel/sched/private.h"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -45,6 +49,154 @@ static unsigned pause_local_access,local_access_entered,resume_local_access;
 #define PACKETS 32U
 struct packet { uint32_t actor,sequence; unsigned char payload[24]; };
 static pthread_barrier_t launch;
+#define FUTEX_ADDRESS UINT64_C(0x600000)
+static _Thread_local unsigned futex_role;
+static unsigned futex_registered,futex_edit_ready,futex_word_read;
+enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
+    uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+{
+    enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && futex_role==1 && kernel_task_current()->futex_bitset) {
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&futex_edit_ready,__ATOMIC_ACQUIRE)) sched_yield();
+    } else if (!status && futex_role==2) {
+        /* 实际MM编辑已关闭新pin，并准备等待旧片段归还。 */
+        __atomic_store_n(&futex_edit_ready,1,__ATOMIC_RELEASE);
+    }
+    return status;
+}
+void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
+void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
+{
+    __real_riscv_smp_sync_user(targets,address,size,instructions);
+    if (futex_role==2) {
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&futex_edit_ready,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&futex_word_read,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+void __real_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
+void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{
+    __real_kernel_mm_unpin_user_page(pin);
+    if (futex_role==1 && __atomic_load_n(&futex_registered,__ATOMIC_ACQUIRE))
+        __atomic_store_n(&futex_word_read,1,__ATOMIC_RELEASE);
+}
+static void *futex_waiter(void *unused)
+{
+    (void)unused;mm_test_attach(1);mm_test_bind(&mm);mm_test_context=context;
+    kernel_cpu_current()->logical_id=0;futex_role=1;
+    uintptr_t irq=arch_interrupt_save();enum kernel_scheduler_status status;
+    assert(!kernel_futex(kernel_task_current(),FUTEX_ADDRESS,128,1,0,0,0,&status) && !status);
+    arch_interrupt_restore(irq);
+    assert(!kernel_task_current()->futex_bitset && kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    mm_test_finish();return NULL;
+}
+static void *futex_editor(void *unused)
+{
+    (void)unused;mm_test_attach(2);mm_test_bind(&mm);mm_test_context=context;
+    kernel_cpu_current()->logical_id=1;futex_role=2;
+    while (!__atomic_load_n(&futex_registered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_mm_mprotect(&mm,FUTEX_ADDRESS,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+    futex_role=0;
+    uintptr_t irq=arch_interrupt_save();enum kernel_scheduler_status status;
+    assert(kernel_futex(kernel_task_current(),FUTEX_ADDRESS,129,1,0,0,0,&status)==1 && !status);
+    arch_interrupt_restore(irq);
+    mm_test_finish();return NULL;
+}
+static void futex_pin_case(void)
+{
+    uint64_t address;uint32_t word=1;size_t copied;
+    assert(!kernel_mm_mmap_anonymous(&mm,FUTEX_ADDRESS,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && address==FUTEX_ADDRESS);
+    assert(!kernel_copy_to_user(&mm,address,&word,sizeof(word),&copied) && copied==sizeof(word));
+    futex_registered=futex_edit_ready=futex_word_read=0;
+    pthread_t waiter,editor;
+    assert(!pthread_create(&editor,NULL,futex_editor,NULL) && !pthread_create(&waiter,NULL,futex_waiter,NULL));
+    assert(!pthread_join(waiter,NULL) && !pthread_join(editor,NULL));
+    assert(futex_registered && futex_word_read && futex_edit_ready);
+    assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE));
+    struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);
+    assert(!state.pins && !state.write_pins && !state.pending_retirement);
+    puts("PASS futex registration vs actual mprotect: pin survives final comparison, unpin precedes park, exact wake and final owners");
+}
+static unsigned lock_set_entered,lock_close_done;
+static _Thread_local int pause_lock_set;
+int __real_kernel_record_lock_set(struct kernel_record_lock_state *,struct kernel_record_lock **,
+    const void *,uint8_t,int32_t,int64_t,int64_t,int16_t,struct kernel_heap *);
+int __wrap_kernel_record_lock_set(struct kernel_record_lock_state *state,struct kernel_record_lock **head,
+    const void *owner,uint8_t kind,int32_t pid,int64_t first,int64_t last,int16_t type,struct kernel_heap *heap)
+{
+    if (pause_lock_set) {
+        pause_lock_set=0;
+        __atomic_store_n(&lock_set_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&lock_close_done,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return __real_kernel_record_lock_set(state,head,owner,kind,pid,first,last,type,heap);
+}
+static void *close_before_lock_publish(void *unused)
+{
+    (void)unused;mm_test_attach(1);mm_test_bind(&mm);mm_test_bind_files(&files);mm_test_context=context;
+    while (!__atomic_load_n(&lock_set_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    int64_t result;
+    assert(!kernel_files_close(&files,0,&result) && !result);
+    __atomic_store_n(&lock_close_done,1,__ATOMIC_RELEASE);
+    mm_test_finish();return NULL;
+}
+static void close_lock_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    mm_test_attach(0);mm_test_activate_task();mm_test_bind(&mm);mm_test_bind_files(&files);mm_test_context=context;
+    files=(struct kernel_files){0};assert(!kernel_files_create(&files,heap));
+    int error;
+    assert(!kernel_open_file_create_mode(heap,mount,"/close-before-first-lock",0600,&control,&error) && !error);
+    control->open_flags=2;
+    assert(!kernel_vfs_file_acquire_write(&control->file));
+    struct kernel_open_file_description *slot=control;
+    assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot));
+    struct { int16_t type,whence; int32_t pad; int64_t start,length; int32_t pid,reserved; } flock={.type=1,.length=1};
+    size_t copied;
+    assert(!kernel_copy_to_user(&mm,0x200000,&flock,sizeof(flock),&copied) && copied==sizeof(flock));
+    struct kernel_task *task=kernel_task_current();
+    task->arch.user_mode=1;task->tid=1;task->tid_owned=1;task->group_leader=task;task->group_members=1;
+    lock_set_entered=lock_close_done=0;pause_lock_set=1;
+    pthread_t closer;assert(!pthread_create(&closer,NULL,close_before_lock_publish,NULL));
+    int64_t result;
+    assert(!kernel_files_fcntl_lock(&files,&mm,task,0,KERNEL_FILES_F_SETLK,0x200000,&result) && result==-KERNEL_EBADF);
+    assert(!pthread_join(closer,NULL));
+    task->arch.user_mode=0;
+    assert(!files.record->record_locks && !kernel_vfs_node_record_locks(kernel_open_file_node(control))->root);
+    mm_test_bind(NULL);mm_test_bind_files(NULL);
+    assert(!kernel_files_release(&files) && !kernel_open_file_release(&control));
+    puts("PASS first POSIX lock races actual close before publication: EBADF, no inode lock or owner left");
+}
+static void worker_lock_close_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
+    struct kernel_page_cache *cache)
+{
+    struct kernel_open_file_description *locked=NULL,*observer=NULL;
+    int error;
+    assert(!kernel_open_file_create_mode(heap,mount,"/worker-lock-close",0600,&locked,&error) && !error);
+    assert(!kernel_open_file_create(heap,mount,"/worker-lock-close",&observer,&error) && !error);
+    struct kernel_record_lock_state *state=kernel_vfs_node_record_locks(kernel_open_file_node(observer));
+    {
+        KERNEL_IRQ_SCOPE(irq);
+        assert(!kernel_record_lock_set(state,&locked->record_locks,locked,1,1,0,7,1,heap));
+    }
+    assert(state->root && arch_interrupt_is_enabled());
+    assert(!kernel_page_cache_start_worker(cache));
+    mm_test_attach(0);mm_test_activate_task();mm_test_bind(&mm);mm_test_context=context;
+    kernel_cpu_current()->logical_id=1;
+    struct kernel_page_cache_concurrency_state before,after;
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    assert(!kernel_open_file_release(&locked) && !locked && arch_interrupt_is_enabled());
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    assert(after.executions_completed==before.executions_completed+1 && !state->root);
+    assert(!kernel_open_file_release(&observer) && !observer);
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    kernel_page_cache_stop_worker(cache);
+    puts("PASS final OFD lock release through actual CPU0 worker: short IRQ protection, caller IRQ restored, inode owners returned");
+}
 static unsigned read_seen[4][PACKETS];
 static void *parallel_reader(void *argument)
 {
@@ -100,7 +252,7 @@ static void parallel_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
         assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,i,0,&slot));
     }
     if (cache) assert(!kernel_page_cache_start_worker(cache));
-    assert(!kernel_files_enable_concurrency(&files,&mm));
+    assert(!kernel_files_check_task_domain(&files,&mm));
     assert(!pthread_barrier_init(&launch,0,actors)); pthread_t threads[4];
     for (unsigned i=0;i<actors;i++) {
         views[i]=(struct kernel_files){0}; assert(!kernel_files_acquire(&views[i],&files));
@@ -212,7 +364,7 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
         struct kernel_open_file_description *slot=controls[i];
         assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,i,0,&slot));
     }
-    assert(!kernel_page_cache_start_worker(cache) && !kernel_files_enable_concurrency(&files,&mm));
+    assert(!kernel_page_cache_start_worker(cache) && !kernel_files_check_task_domain(&files,&mm));
     access_entered=resume_access=stop_done=0; __atomic_store_n(&pause_access,1,__ATOMIC_RELEASE);
     struct crossing first={.id=1},queued={.id=2}; pthread_t active,pending,stopper;
     assert(!pthread_create(&active,0,crossing_read,&first));
@@ -245,6 +397,13 @@ static void *crossing_seek(void *argument)
 }
 static void borrowed_execution(void *argument)
 { (*(unsigned *)argument)++; }
+static void *crossing_truncate(void *argument)
+{
+    struct crossing *call=argument;mm_test_attach(call->id);mm_test_bind(&mm);
+    mm_test_bind_files(&files);mm_test_context=context;
+    call->status=kernel_files_ftruncate(&files,0,8,&call->result);
+    mm_test_finish();return NULL;
+}
 static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_page_cache *cache)
 {
@@ -258,7 +417,7 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
         !kernel_page_cache_invalidate_node(cache,kernel_open_file_node(control)));
     struct kernel_open_file_description *slot=control;
     assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot) &&
-        !kernel_page_cache_start_worker(cache) && !kernel_files_enable_concurrency(&files,&mm));
+        !kernel_page_cache_start_worker(cache) && !kernel_files_check_task_domain(&files,&mm));
     {
         unsigned executed=0;
         struct kernel_mm_user_pin pin={0};
@@ -293,9 +452,30 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
     assert(!reader.status && reader.result==8 && !memcmp(reader.bytes,"offset!!",8) &&
         !seeker.status && seeker.result==8 && control->offset==8);
     mm_test_attach(0);mm_test_activate_task();
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_open_file_node(control)));
+    struct kernel_lock_guard writing={0};
+    kernel_vfs_file_write_lock(&control->file,&writing);
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    struct crossing truncating={.id=2},cold={.id=1};pthread_t truncater;
+    assert(!pthread_create(&truncater,NULL,crossing_truncate,&truncating));
+    struct kernel_vfs_node *node=kernel_open_file_node(control);
+    for (;;) {
+        unsigned waiting;
+        { KERNEL_RAW_SCOPE(guard,&node->write_operation.lock.metadata);
+          waiting=node->write_operation.lock.writers_waiting; }
+        if (waiting) break;
+        sched_yield();
+    }
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    assert(after.executions_queued==before.executions_queued);
+    assert(!pthread_create(&reading,NULL,crossing_read,&cold) && !pthread_join(reading,NULL));
+    assert(!cold.status && cold.result==8 && !memcmp(cold.bytes,"offset!!",8));
+    kernel_lock_release(&writing);
+    assert(!pthread_join(truncater,NULL) && !truncating.status && !truncating.result);
     assert(!kernel_files_release(&files) && !kernel_open_file_release(&control));
     kernel_page_cache_stop_worker(cache);
     puts("PASS shared offset qualification precedes CPU0 queue: held read, waiting seek, cold miss and actual owners finish");
+    puts("PASS truncate obtains write-operation qualification before queueing; blocked truncate cannot stop an active writer's cold read");
 }
 static void bind(unsigned id)
 { mm_test_attach(id); mm_test_bind(&mm); mm_test_bind_files(&files); mm_test_context=context; }
@@ -304,10 +484,26 @@ static void mapped_source_write(void)
     int64_t result; size_t copied;
     unsigned char bytes[68];
     assert(kernel_open_file_size(control)==68);
+    /* 目标尾页已缓存，来源别名尚未缺页；不能先关闭目标写入再等自身装入。 */
+    assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping,8,128,&result) && result==8 &&
+        kernel_open_file_size(control)==136);
+    assert(!kernel_files_ftruncate(&files,0,68,&result) && !result && kernel_open_file_size(control)==68);
     /* 首次读取尚未驻留的同文件映射；fault期间目标没有inode锁或写借用。 */
     assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping,8,4,&result) && result==8);
-    assert(!kernel_copy_from_user(&mm,bytes,shared_mapping,12,&copied) && copied==12 &&
-        !memcmp(bytes,"origoriginal",12));
+    enum kernel_uaccess_status access=kernel_copy_from_user(&mm,bytes,shared_mapping,12,&copied);
+    if (access || copied!=12 || memcmp(bytes,"origoriginal",12)) {
+        fprintf(stderr,"shared source overlap: page=%u memory=%d access=%d copied=%zu bytes=",
+            (unsigned)BOAROS_PAGE_SIZE,kernel_open_file_memory_backed(control),access,copied);
+        for (unsigned i=0;i<12;i++) fprintf(stderr,"%02x",bytes[i]);
+        struct kernel_mm_mapping mapping;
+        assert(!kernel_mm_lookup(&mm,shared_mapping,&mapping));
+        uint64_t cached; size_t valid;
+        assert(!kernel_page_cache_lookup(kernel_open_file_page_cache(control),&control->file,0,&cached,&valid));
+        fprintf(stderr," mapped=%llx cached=%llx cache-bytes=",(unsigned long long)mapping.physical_address,(unsigned long long)cached);
+        for (unsigned i=0;i<12;i++) fprintf(stderr,"%02x",((unsigned char *)access_page(cached))[i]);
+        assert(!physical_page_release(control->heap->page_allocator,cached));
+        fputc('\n',stderr); assert(!"shared source overlap contents");
+    }
     assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping+4,8,0,&result) && result==8);
     assert(!kernel_copy_from_user(&mm,bytes,shared_mapping,8,&copied) && copied==8 &&
         !memcmp(bytes,"original",8));
@@ -316,7 +512,7 @@ static void mapped_source_write(void)
     assert(!kernel_files_pwrite(&files,&mm,0,shared_mapping+96,8,128,&result) && result==8 &&
         kernel_open_file_size(control)==136);
     assert(!kernel_copy_from_user(&mm,bytes,shared_mapping+68,sizeof(bytes),&copied) && copied==sizeof(bytes));
-    if (control->io_domain==2) for (size_t i=0;i<60;i++) assert(!bytes[i]);
+    if (!kernel_open_file_memory_backed(control)) for (size_t i=0;i<60;i++) assert(!bytes[i]);
     assert(!memcmp(bytes+60,"fromtail",8));
 }
 static void *read_and_write(void *unused)
@@ -331,17 +527,17 @@ static void *read_and_write(void *unused)
     assert(!kernel_files_pread(&files,&mm,0,0x100000+BOAROS_PAGE_SIZE,8,32,&result) && result==8);
     assert(!kernel_copy_from_user(&mm,bytes,0x100000+BOAROS_PAGE_SIZE,8,&copied) && copied==8 && !memcmp(bytes,"original",8));
     if (shared_mapping) assert(!kernel_mm_msync(&mm,shared_mapping,BOAROS_PAGE_SIZE,4));
-    if (control->io_domain==2) {
+    if (!kernel_open_file_memory_backed(control)) {
         assert(!kernel_files_sync(&files,0,0,&result) && !result);
         assert(!kernel_files_ftruncate(&files,0,48,&result) && !result);
         assert(!kernel_files_fstat(&files,&mm,0,0x100080,&result) && !result);
         struct kernel_linux_stat stat;
         assert(!kernel_copy_from_user(&mm,&stat,0x100080,sizeof(stat),&copied) && copied==sizeof(stat) && stat.st_size==48);
     }
-    if (control->io_domain==2) {
+    if (!kernel_open_file_memory_backed(control)) {
         struct kernel_mm_user_pin pin={0};
         assert(!kernel_mm_pin_user_page(&mm,0x100000,KERNEL_MM_READ,&pin));
-        assert(kernel_files_pread(&files,&mm,0,0x100000,0,0,&result)==KERNEL_FILES_STATUS_STATE);
+        assert(!kernel_files_pread(&files,&mm,0,0x100000,0,0,&result) && !result);
         kernel_mm_unpin_user_page(&pin);
         assert(!kernel_files_pread(&files,&mm,0,0x100000,0,0,&result) && !result);
     }
@@ -355,12 +551,6 @@ static void *read_and_write(void *unused)
     assert(!kernel_mm_mprotect(&mm,0x100000+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
     assert(!kernel_copy_from_user(&mm,&sentinel,0x100000+BOAROS_PAGE_SIZE,1,&copied) && copied==1 && sentinel==0xa5);
     mapped_source_write();
-    assert(kernel_files_syncfs(&files,0,&result)==KERNEL_FILES_STATUS_STATE);
-    assert(kernel_files_statx(&files,&fs,&mm,0,0,KERNEL_FILES_AT_EMPTY_PATH,0x7ff,0x100100,&result)==
-        KERNEL_FILES_STATUS_STATE);
-    assert(kernel_files_getcwd(&files,&fs,&mm,0x100100,64,&result)==KERNEL_FILES_STATUS_STATE);
-    assert(kernel_files_socketpair_create(&files,&mm,1,0,0x100100,&result)==KERNEL_FILES_STATUS_STATE);
-    assert(kernel_files_epoll_create1(&files,0,&result)==KERNEL_FILES_STATUS_STATE);
     assert(!kernel_files_dup(&files,0,&result) && result==1);
     assert(!kernel_files_close(&files,0,&result) && !result);
     assert(!kernel_files_close(&files,1,&result) && !result);
@@ -399,7 +589,7 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     assert(!kernel_files_create(&files,heap));
     struct kernel_open_file_description *slot=control;
     assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot));
-    assert(!kernel_files_enable_concurrency(&files,&mm));
+    assert(!kernel_files_check_task_domain(&files,&mm));
     pthread_t actor; assert(!pthread_create(&actor,0,read_and_write,0) && !pthread_join(actor,0));
     mm_test_attach(0); mm_test_activate_task();
     assert(!kernel_files_release(&files));
@@ -498,26 +688,29 @@ int main(int argc,char **argv)
     assert(!riscv_sv39_page_table_init(&kernel,&pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
     assert(!arch_mmu_user_space_init(&user,&pages,&kernel) && !kernel_mm_create(&mm,&user) &&
         !kernel_mm_vma_enable(&mm,&heap) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
-    assert(!kernel_mm_enable_concurrency(&mm) && !kernel_mm_context(&mm,&context));
+    assert(!kernel_mm_check_task_domain(&mm) && !kernel_mm_context(&mm,&context));
     mm_test_context=context; /* 当前地址空间API的宿主硬件上下文，不是任务绑定。 */
     uint64_t address;
     assert(!kernel_mm_mmap_anonymous(&mm,0x100000,2*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+    futex_pin_case();
 #ifdef TCP_IO_CASES
     tcp_usercopy_case(&heap);
 #endif
     struct kernel_vfs_mount *memory=0;
     assert(!kernel_tmpfs_create(&heap,0,"",&memory)); sendfile_pipe_case(&heap,memory); file_case(&heap,memory,0);
+    close_lock_case(&heap,memory);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,memory,0,actors,append);
     assert(!kernel_vfs_unmount(memory));
     image=open(argv[1],O_RDWR); assert(image>=0); struct stat info; assert(!fstat(image,&info));
-    struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init_controlled(&cache,&heap,&pages));
+    struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init(&cache,&heap,&pages));
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=flush_image,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);

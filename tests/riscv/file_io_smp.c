@@ -30,6 +30,7 @@ static struct kernel_page_cache *cache;
 static struct kernel_thread_join peer;
 static unsigned cpus,stop,progress,user_overlap;
 static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads;
+static unsigned watch_timeout,timeout_copies;
 enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
     struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
@@ -42,15 +43,15 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel
     }
     return __real_kernel_uaccess_write_cursor_copy(mm,cursor,address,source,size,copied);
 }
-int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *);
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *, const struct file_read_completion *);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
-    struct file_read_workspace *workspace)
+    struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     if(cold_control && node==kernel_open_file_node(cold_control)) {
         if(kernel_cpu_current()->logical_id)riscv_smp_fail("file-io-cold-backend-left-cpu0",-1);
         cold_loads++;
     }
-    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace);
+    return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace, completion);
 }
 uint64_t riscv_file_io_retained_shared_pages(void)
 {
@@ -84,6 +85,11 @@ enum kernel_page_cache_status __wrap_kernel_page_cache_run_cpu0(struct kernel_pa
 enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *,void *,uint64_t,size_t,size_t *);
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *m,void *d,uint64_t a,size_t n,size_t *copied)
 {
+    if(watch_timeout && a==IO_ANON+512) {
+        if(kernel_cpu_current()->logical_id!=copy_cpu)
+            riscv_smp_fail("empty-poll-copy-left-caller-hart",-1);
+        timeout_copies++;
+    }
     enum kernel_uaccess_status s=__real_kernel_copy_from_user(m,d,a,n,copied);
     if (s && a==IO_BUFFER) {
         virt_uart_puts("BoarOS: FILE IO source copy status="); virt_uart_put_hex(s);
@@ -146,6 +152,21 @@ static void verify(void *unused)
     check(local_copies[copy_cpu] && before.requests_queued==after.requests_queued,"file-io-hot-no-cpu0-request");
     char zero=0;
     check(!kernel_copy_to_user(mm,IO_ANON,&zero,1,&copied) && copied==1,"file-io-cold-destination-ready");
+    int64_t timeout[2]={0,1000};
+    check(!kernel_copy_to_user(mm,IO_ANON+512,&timeout,sizeof(timeout),&copied) &&
+        copied==sizeof(timeout),"empty-poll-timeout-ready");
+    watch_timeout=1;
+    check(!kernel_files_ppoll(files,mm,kernel_task_current(),0,0,IO_ANON+512,0,0,&result) &&
+        !result,"empty-ppoll-local-timeout");
+    check(!kernel_copy_to_user(mm,IO_ANON+512,&timeout,sizeof(timeout),&copied) &&
+        copied==sizeof(timeout),"empty-pselect-timeout-ready");
+    check(!kernel_files_pselect6(files,mm,kernel_task_current(),0,0,0,0,IO_ANON+512,0,&result) &&
+        !result,"empty-pselect-local-timeout");
+    watch_timeout=0;
+    check(timeout_copies==2 && kernel_cpu_current()->logical_id==copy_cpu,
+        "empty-poll-kept-caller-hart");
+    virt_uart_puts("BoarOS: FILE IO empty poll timeout copy hart=");virt_uart_put_hex(copy_cpu);
+    virt_uart_puts(" copies=");virt_uart_put_hex(timeout_copies);virt_uart_putc('\n');
     kernel_page_cache_get_concurrency_state(cache,&before);
     unsigned loads=cold_loads;
     watch_copy=1;
@@ -164,8 +185,8 @@ static void verify(void *unused)
     struct kernel_mm_user_pin pin={0};
     check(!kernel_mm_pin_user_page(mm,IO_ANON,KERNEL_MM_READ,&pin),"file-io-self-pin");
     kernel_page_cache_get_concurrency_state(cache,&before);
-    check(kernel_files_pread(files,mm,0,IO_ANON,0,0,&result)==KERNEL_FILES_STATUS_STATE,
-        "file-io-self-pin-no-publication");
+    check(!kernel_files_pread(files,mm,0,IO_ANON,0,0,&result) && !result,
+        "file-io-self-pin-empty-local");
     kernel_mm_unpin_user_page(&pin);
     kernel_page_cache_get_concurrency_state(cache,&after);
     check(before.executions_queued==after.executions_queued,"file-io-rejected-request-owner");
@@ -215,11 +236,10 @@ static void verify(void *unused)
         !kernel_files_lseek(files,1,0,1,&result) && !result,"file-io-local-tmpfs-positioned");
     check(!kernel_files_read(files,mm,1,IO_ANON+128,4,&result) && result==4 &&
         !kernel_files_lseek(files,1,0,1,&result) && result==4,"file-io-local-tmpfs-offset");
-    check(kernel_files_ftruncate(files,1,0,&result)==KERNEL_FILES_STATUS_STATE,
-        "file-io-tmpfs-truncate-controller-only");
-    check(kernel_files_syncfs(files,0,&result)==KERNEL_FILES_STATUS_STATE,"file-io-unopened-mount-business");
-    check(kernel_files_socketpair_create(files,mm,1,0,IO_ANON+128,&result)==KERNEL_FILES_STATUS_STATE &&
-        kernel_files_epoll_create1(files,0,&result)==KERNEL_FILES_STATUS_STATE,"file-io-unopened-business-before-publication");
+    check(!kernel_files_ftruncate(files,1,0,&result) && !result && !kernel_open_file_size(memory_control),
+        "file-io-tmpfs-truncate-common-path");
+    /* 命名空间/网络不由这个绑定文件任务执行；创建时检查实际消费者，
+     * 不再用FD表的资格标记模拟另一套业务语义。 */
 }
 void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigned count,
     struct kernel_open_file_description *source,struct kernel_page_cache *page_cache)
@@ -265,7 +285,7 @@ void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigne
         !kernel_vfs_pwrite(&memory_control->file,0,"MEM0",4,&written) && written==4,"file-io-tmpfs-seed");
     slot=memory_control;
     check(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&table,1,0,&slot) &&
-        !kernel_files_enable_concurrency(&table,space),"file-io-table-publication");
+        !kernel_files_check_task_domain(&table,space),"file-io-table-publication");
 }
 void riscv_file_io_overlap_start(void)
 {

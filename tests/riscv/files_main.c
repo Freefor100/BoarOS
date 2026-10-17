@@ -94,13 +94,13 @@ char __wrap_virt_uart_getc(void)
 static struct kernel_mm *unmap_during_fault;
 static uint64_t unmap_fault_address;
 static int complete_peer_fault;
-enum kernel_page_cache_status __real_kernel_open_file_get_page(
-    struct kernel_open_file_description *, uint64_t, uint64_t *, size_t *);
-enum kernel_page_cache_status __wrap_kernel_open_file_get_page(
-    struct kernel_open_file_description *file, uint64_t index, uint64_t *address, size_t *valid)
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *, uint64_t,
+    struct kernel_open_file_page_preparation *);
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index, struct kernel_open_file_page_preparation *prepared)
 {
-    enum kernel_page_cache_status status = __real_kernel_open_file_get_page(file, index, address, valid);
-    if (unmap_during_fault && status == KERNEL_PAGE_CACHE_STATUS_OK) {
+    int status = __real_kernel_open_file_prepare_mapping_page(file, index, prepared);
+    if (unmap_during_fault && !status) {
         struct kernel_mm *mm = unmap_during_fault;
         unmap_during_fault = 0;
         enum kernel_mm_status changed = complete_peer_fault
@@ -120,16 +120,6 @@ enum physical_page_status __wrap_physical_page_allocate(
     if (fail_physical_allocation && --fail_physical_allocation == 0)
         return PHYSICAL_PAGE_STATUS_EMPTY;
     return __real_physical_page_allocate(allocator, out);
-}
-
-static int fail_fifo_backing;
-enum physical_page_status __real_physical_page_allocate_order(
-    struct physical_page_allocator *, uint32_t, uint64_t *);
-enum physical_page_status __wrap_physical_page_allocate_order(
-    struct physical_page_allocator *allocator, uint32_t order, uint64_t *out)
-{
-    if (fail_fifo_backing) { fail_fifo_backing = 0; return PHYSICAL_PAGE_STATUS_EMPTY; }
-    return __real_physical_page_allocate_order(allocator, order, out);
 }
 
 static unsigned fail_metadata_allocation;
@@ -1533,10 +1523,7 @@ static void run_close_cleanup_isolation(struct kernel_files *files)
     int64_t result = INT64_MIN;
 
     if (kernel_open_file_create_console(files->heap, &historical) !=
-            KERNEL_OPEN_FILE_STATUS_OK ||
-        kernel_open_file_detach(&historical) !=
-            KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED ||
-        historical == 0) {
+            KERNEL_OPEN_FILE_STATUS_OK || historical == 0) {
         fail_files(165U, KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED,
                    KERNEL_OPEN_FILE_STATUS_STATE);
     }
@@ -2016,6 +2003,15 @@ static void run_directory_operations(struct kernel_files *files,
     /* The root directory opens read-only and lists its entries. */
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U, 0, 110U);
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 1, 110U);
+    for (uint64_t capacity = 0; capacity <= 1; capacity++) {
+        if (kernel_files_getdents(files, mm, 0, dir_buffer, capacity,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != -KERNEL_EINVAL)
+            fail_files(129U, -KERNEL_EINVAL, result);
+        if (kernel_files_lseek(files, 0, 0, KERNEL_FILES_SEEK_CUR,
+                               &result) != KERNEL_FILES_STATUS_OK || result != 0)
+            fail_files(129U, 0, result);
+    }
     /* getdents64 exposes the real dot entries; the VFS must not silently
      * turn a directory stream into an inode-name-only index. */
     if (kernel_files_getdents(files,
@@ -2601,19 +2597,28 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
             &file, &result) != KERNEL_OPEN_FILE_STATUS_OK || result)
         fail_files(601U, 0, result);
     struct kernel_vfs_node *node = file->file.private_data;
-    for (unsigned failure = 0; failure < 2; failure++) {
-        struct kernel_pipe *pipe = 0;
-        uint8_t endpoint; uint64_t observed;
-        if (failure) fail_fifo_backing = 1;
-        else fail_metadata_allocation = 1;
-        result = kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed);
-        fail_metadata_allocation = 0; fail_fifo_backing = 0;
-        if (result != -KERNEL_ENOMEM || pipe || node->fifo_pipe)
-            fail_files(602U, -KERNEL_ENOMEM, result);
-        if (kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed) ||
-            kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe)
-            fail_files(603U, 0, -1);
-    }
+    struct kernel_pipe *pipe = 0;
+    uint8_t endpoint; uint64_t observed;
+    fail_metadata_allocation = 1;
+    result = kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed);
+    unsigned pending = fail_metadata_allocation; fail_metadata_allocation = 0;
+    if (result != -KERNEL_ENOMEM || pending || pipe || node->fifo_pipe)
+        fail_files(602U, -KERNEL_ENOMEM, result);
+    if (kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed))
+        fail_files(603U, 0, -1);
+    /* FIFO打开只分配元数据，数据页在第一次写入时按需取得。 */
+    uint64_t available = physical_page_available(heap->page_allocator);
+    struct kernel_pipe_result written = {0};
+    fail_physical_allocation = 1;
+    enum kernel_pipe_status status = kernel_pipe_write_buffer(pipe,"x",1,2U|KERNEL_PIPE_NONBLOCK,&written);
+    pending = fail_physical_allocation; fail_physical_allocation = 0;
+    if (status || written.bytes != -KERNEL_ENOMEM || pending || pipe->bytes || pipe->slots ||
+        node->fifo_pipe != pipe || physical_page_available(heap->page_allocator) != available)
+        fail_files(605U, -KERNEL_ENOMEM, written.bytes);
+    if (kernel_pipe_write_buffer(pipe,"x",1,2U|KERNEL_PIPE_NONBLOCK,&written) || written.bytes != 1 ||
+        kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe ||
+        physical_page_available(heap->page_allocator) != available)
+        fail_files(603U, 0, -1);
     if (kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK ||
         kernel_vfs_path_release(&root) || kernel_vfs_unmount(mount))
         fail_files(604U, 0, -1);

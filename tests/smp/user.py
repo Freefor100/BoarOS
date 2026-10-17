@@ -45,8 +45,8 @@ def validate_execution(text,cpus,boaros,require_parallel=False):
             raise RuntimeError('a requested CPU never entered/returned actual U-mode')
         if require_parallel and cpus==2 and not int(samples[1][3],16):
             raise RuntimeError('CPU1 local IRQ return was not exercised')
-        if cpus==2 and int(samples[1][4],16):
-            raise RuntimeError('CPU1 dispatched legacy kernel business')
+        if require_parallel and any(not int(row[4],16) for row in selected):
+            raise RuntimeError('a requested CPU never dispatched a local syscall')
 
 def boot_user(qemu,firmware,kernel,disk,memory,cpus,folder,linux=False,direct_init='/init'):
     command=harness.PROFILES['riscv'].boot(qemu,kernel,memory)

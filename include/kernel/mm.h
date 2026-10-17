@@ -13,6 +13,7 @@ struct kernel_elf64_source;
 struct kernel_io_context;
 struct kernel_mm_record;
 struct kernel_heap;
+struct kernel_futex_key;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
 #define KERNEL_MM_WRITE (UINT32_C(1) << 1U)
@@ -55,12 +56,13 @@ enum kernel_mm_cleanup_stage {
 };
 
 /* 句柄拥有MM记录引用，lookup返回映射快照而不取得物理页pin。
- * 受控匿名、私有arena的tmpfs及CPU0 I/O交接的磁盘映射由gate/MM raw保护，
- * 活动CPU失效确认后才回收；实际文件业务和外部后备仍由CPU0控制。句柄不能被其他执行者并发move/release。
+ * 所有映射编辑共用gate，PTE/resident/pin由MM raw发布；驻留pin不取得gate。
+ * 活动CPU失效确认后才回收，实际后端I/O留在CPU0。句柄不能被其他执行者并发move/release。
  * MM引用只保证记录存活，lookup快照不能代替访问片段的实际页引用。 */
 struct kernel_mm {
     struct physical_page_allocator *allocator;
-    uint64_t record_page_address;
+    struct kernel_mm_record *record;
+    uint64_t record_page_address; /* 只用于归还记录页。 */
     enum kernel_mm_state state;
     enum kernel_mm_cleanup_stage cleanup_stage;
 };
@@ -94,14 +96,6 @@ struct kernel_mm_user_pin {
 enum kernel_mm_status kernel_mm_pin_user_page(
     const struct kernel_mm *, uint64_t address, uint32_t access,
     struct kernel_mm_user_pin *);
-#if BOAROS_USER_SMP
-/* 真实远端用户的resident-only复制；仅当前绑定remote_user MM可用。
- * 不等待gate/许可，不fault或处理COW；需CPU0继续时返回CONFLICT且不接纳pin。
- * 成功pin参加fork/mprotect撤权排空，复制后由同owner归还，无需重取gate。 */
-enum kernel_mm_status kernel_mm_try_pin_user_page(
-    const struct kernel_mm *, uint64_t address, uint32_t access,
-    struct kernel_mm_user_pin *);
-#endif
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 
 /* Success creates another independently owned reference to the same MM. */
@@ -173,6 +167,10 @@ enum kernel_mm_status kernel_mm_vma_lookup(
 void kernel_mm_add_user(struct kernel_mm *mm);
 uint32_t kernel_mm_user_count(const struct kernel_mm *mm);
 uint32_t kernel_mm_remove_user(struct kernel_mm *mm);
+
+enum kernel_mm_status kernel_mm_acquire_futex_key(
+    struct kernel_mm *, uint64_t address, int shared,
+    struct kernel_futex_key *);
 
 /* Unique for the lifetime of the kernel, including after MM page reuse. */
 enum kernel_mm_status kernel_mm_futex_id(

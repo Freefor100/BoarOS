@@ -41,7 +41,8 @@ file	alpine/v3.22/main/riscv64/mpc1-1.3.1-r1.apk	https://dl-cdn.alpinelinux.org/
 file	alpine/v3.22/main/riscv64/mpfr4-4.2.1_p1-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/mpfr4-4.2.1_p1-r0.apk	-	8a9098015e675d500b6024d5d51869ed3a96f4769a386a53afde3fafba39dc27
 file	alpine/v3.22/main/riscv64/musl-1.2.5-r12.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/musl-1.2.5-r12.apk	-	6814d9cbaad929d14181ef4fbd1d65c7749df43746269b9bdb75551ba32a79db
 file	alpine/v3.22/main/riscv64/musl-dev-1.2.5-r12.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/musl-dev-1.2.5-r12.apk	-	cd16b9d772e93fe5b8a2b87b5182b5be786be7b86be5bf63af65f3537762fd20
-file	alpine/v3.22/main/riscv64/zlib-1.3.2-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/zlib-1.3.2-r0.apk	-	9a2761a457312f4aa1312c94d3ca8789c2f1dd51d34d992e400851c8181a6887
+# zlib packaging revision refreshed from the official repository; checked 2026-10-16.
+file	alpine/v3.22/main/riscv64/zlib-1.3.2-r1.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/zlib-1.3.2-r1.apk	-	9dfa50a52957f9d04b90b70c9fdfb08e1adca326fc57a3552d6e41047434e02c
 file	alpine/v3.22/main/riscv64/zstd-libs-1.5.7-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/zstd-libs-1.5.7-r0.apk	-	28bb837f617870a996009130c938ad12075f942738cfcd1390251720c78f0b8d
 # GNU make 4.4.1-r3, GPL-3.0-or-later; official Alpine package, checked 2026-10-03.
 file	alpine/v3.22/main/riscv64/make-4.4.1-r3.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/make-4.4.1-r3.apk	-	e57d545d8427629cd7f611b3bda0088b4c67da8d1a6a4438c889f72b1c9e60b4

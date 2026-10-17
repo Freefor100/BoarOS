@@ -15,7 +15,14 @@ static inline void *arch_current_thread_get(void) { return sync_test_current_tas
 static inline void arch_cpu_wait(void) { __builtin_trap(); }
 static inline uintptr_t arch_interrupt_save(void)
 { uintptr_t old = sync_test_irq; sync_test_irq = 0; return old; }
-static inline void arch_interrupt_restore(uintptr_t old) { sync_test_irq = old; }
+static inline void arch_interrupt_restore(uintptr_t old)
+{
+    sync_test_irq = old;
+#ifdef BOAROS_TEST_IRQ_RESTORE
+    extern _Thread_local unsigned sync_test_irq_restores;
+    if (old) sync_test_irq_restores++;
+#endif
+}
 static inline int arch_interrupt_is_enabled(void) { return sync_test_irq != 0; }
 static inline void *arch_current_cpu_get(void) { return sync_test_cpu(); }
 #endif

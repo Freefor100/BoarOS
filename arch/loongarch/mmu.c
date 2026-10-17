@@ -32,6 +32,7 @@ uint64_t arch_mmu_current_context(void)
 enum arch_mmu_status arch_mmu_switch_context(uint64_t root)
 {
     if (root & BOAROS_PAGE_MASK || root > PTE_ADDRESS) return ARCH_MMU_STATUS_INVALID;
+    if (root == arch_mmu_current_context()) return ARCH_MMU_STATUS_OK;
     __asm__ volatile("dbar 0\ncsrwr %0, 0x19" : "+r"(root) :: "memory");
     flush_all(); return ARCH_MMU_STATUS_OK;
 }
@@ -50,7 +51,7 @@ int arch_mmu_kernel_window_active(void) { return kernel_window.root_address!=0; 
 static uint64_t *table(struct arch_mmu_user_space *s, uint64_t address)
 {
     void *p;
-    if (!address || (address&BOAROS_PAGE_MASK) || physical_page_resolve(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
+    if (!address || (address&BOAROS_PAGE_MASK) || physical_page_map_owned(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
         la_virt_fatal("page table owner");
     return p;
 }
@@ -109,7 +110,7 @@ enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *
     uint64_t *slot;void *bytes;
     enum arch_mmu_status status=kernel_slot(a,v,&slot);
     if(status!=ARCH_MMU_STATUS_OK)return status;
-    if((p&BOAROS_PAGE_MASK) || p>PTE_ADDRESS || physical_page_resolve(a,p,&bytes)!=PHYSICAL_PAGE_STATUS_OK)return ARCH_MMU_STATUS_INVALID;
+    if((p&BOAROS_PAGE_MASK) || p>PTE_ADDRESS || physical_page_map_owned(a,p,&bytes)!=PHYSICAL_PAGE_STATUS_OK)return ARCH_MMU_STATUS_INVALID;
     if(*slot)return ARCH_MMU_STATUS_CONFLICT;
     *slot=p|PTE_PRESENT|PTE_VALID|PTE_DIRTY|PTE_WRITE|PTE_NX|0x10;
     __asm__ volatile("dbar 0":::"memory");arch_mmu_flush_address(v);return ARCH_MMU_STATUS_OK;
@@ -232,21 +233,21 @@ enum arch_mmu_status arch_mmu_user_cow_commit(struct arch_mmu_user_space *s, uin
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
-    uint64_t *cursor, uint64_t *address)
+    uint64_t *cursor, uint64_t end, uint64_t *address)
 {
-    if (!live(s) || !cursor || !address || *cursor > ARCH_MMU_USER_LIMIT ||
-        (*cursor & BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
-    if (*cursor == ARCH_MMU_USER_LIMIT) return ARCH_MMU_STATUS_NOT_MAPPED;
+    if (!live(s) || !cursor || !address || *cursor > end || end > ARCH_MMU_USER_LIMIT ||
+        ((*cursor | end) & BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
+    if (*cursor == end) return ARCH_MMU_STATUS_NOT_MAPPED;
     unsigned first_r = *cursor >> 36, first_m = (*cursor >> 25) & (ENTRIES - 1);
     unsigned first_l = (*cursor >> 14) & (ENTRIES - 1);
     uint64_t *root = table(s, s->root_address);
-    for (unsigned r = first_r; r < ENTRIES; r++) {
+    for (unsigned r = first_r; r < ENTRIES && ((uint64_t)r << 36) < end; r++) {
         if (!root[r]) continue;
         uint64_t *middle = table(s, root[r]);
-        for (unsigned m = r == first_r ? first_m : 0; m < ENTRIES; m++) {
+        for (unsigned m = r == first_r ? first_m : 0; m < ENTRIES && (((uint64_t)r << 36) | ((uint64_t)m << 25)) < end; m++) {
             if (!middle[m]) continue;
             uint64_t *leaves = table(s, middle[m]);
-            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < ENTRIES; l++) {
+            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < ENTRIES && (((uint64_t)r << 36) | ((uint64_t)m << 25) | ((uint64_t)l << 14)) < end; l++) {
                 if (!leaves[l]) continue;
                 if (!(leaves[l] & PTE_PRESENT)) return ARCH_MMU_STATUS_STATE;
                 *address = ((uint64_t)r << 36) | ((uint64_t)m << 25) | ((uint64_t)l << 14);
@@ -255,7 +256,7 @@ enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
             }
         }
     }
-    *cursor = ARCH_MMU_USER_LIMIT; return ARCH_MMU_STATUS_NOT_MAPPED;
+    *cursor = end; return ARCH_MMU_STATUS_NOT_MAPPED;
 }
 enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *s, uint64_t v)
 {

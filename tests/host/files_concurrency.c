@@ -35,6 +35,45 @@ static struct kernel_mm domain_mm;
 static struct kernel_open_file_description *path_description;
 static struct kernel_vfs_path *watched_path;
 static unsigned path_acquired;
+static struct kernel_fs_context shared_umask;
+static pthread_barrier_t umask_round;
+static uint32_t previous_umask[2];
+static void *exchange_umask(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    mm_test_attach(id+1);kernel_cpu_current()->logical_id=id;
+    for (unsigned i=0;i<2000;i++) {
+        int barrier=pthread_barrier_wait(&umask_round);
+        assert(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+        assert(!kernel_fs_context_exchange_umask(&shared_umask,id?0200:0100,&previous_umask[id]));
+        barrier=pthread_barrier_wait(&umask_round);
+        assert(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+    }
+    return NULL;
+}
+static void umask_case(struct kernel_heap *heap)
+{
+    struct kernel_vfs_mount *mount=NULL;
+    assert(!kernel_tmpfs_create(heap,0,"",&mount) && !kernel_fs_context_create(&shared_umask,mount,heap));
+    assert(!pthread_barrier_init(&umask_round,NULL,3));
+    pthread_t threads[2];
+    for (unsigned id=0;id<2;id++) assert(!pthread_create(&threads[id],NULL,exchange_umask,(void *)(uintptr_t)id));
+    for (unsigned i=0;i<2000;i++) {
+        uint32_t unused;
+        assert(!kernel_fs_context_exchange_umask(&shared_umask,0022,&unused));
+        int barrier=pthread_barrier_wait(&umask_round);
+        assert(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+        barrier=pthread_barrier_wait(&umask_round);
+        assert(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
+        uint32_t final=kernel_fs_context_umask(&shared_umask);
+        assert((previous_umask[0]==0022 && previous_umask[1]==0100 && final==0200) ||
+            (previous_umask[1]==0022 && previous_umask[0]==0200 && final==0100));
+    }
+    for (unsigned id=0;id<2;id++) assert(!pthread_join(threads[id],NULL));
+    assert(!pthread_barrier_destroy(&umask_round) && !kernel_fs_context_release(&shared_umask) && !kernel_vfs_unmount(mount));
+    mm_test_attach(0);
+    puts("PASS shared fs-context umask: 2000 simultaneous exchanges return one valid order and final value");
+}
 int __real_kernel_vfs_path_acquire(struct kernel_vfs_path *);
 int __wrap_kernel_vfs_path_acquire(struct kernel_vfs_path *path)
 {
@@ -129,27 +168,24 @@ static void reject_external_pipe_owner(struct kernel_heap *heap)
     assert(!kernel_files_install_new_owned_at(&files,0,0,&a));
     assert(!kernel_files_install_new_owned_at(&files,1,0,&b));
     assert(!kernel_files_fork(&ordinary,&files));
-    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
-        !files.record->concurrent && !pipe->concurrent);
+    assert(!kernel_files_check_task_domain(&files,&domain_mm));
     assert(!kernel_files_release(&ordinary));
     struct kernel_open_file_pipe_pin pin={0};
     assert(!kernel_open_file_pipe_pin(files.record->slots[0].description,0,&pin));
     assert(!kernel_open_file_pipe_finish(heap,&pin,0,&external));
-    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
-        !files.record->concurrent && !pipe->concurrent);
+    assert(!kernel_files_check_task_domain(&files,&domain_mm));
     assert(!kernel_open_file_release(&external));
     struct kernel_wait_node observer={0};
     kernel_wait_node_init_callback(&observer,forbidden_pipe_callback,0);
     kernel_wait_queue_add(&pipe->read_queue,&observer);
-    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
-        !files.record->concurrent && !pipe->concurrent);
+    assert(kernel_files_check_task_domain(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE);
     assert(!kernel_wait_node_remove_sync(&observer));
     /* 本表内dup有多个槽owner，却只对应一个端点，仍可启用。 */
     int64_t result;
     assert(!kernel_files_dup(&files,0,&result) && result==2);
-    assert(!kernel_files_enable_concurrency(&files,&domain_mm));
+    assert(!kernel_files_check_task_domain(&files,&domain_mm));
     assert(!kernel_files_release(&files));
-    puts("PASS controlled pipe publication rejects ordinary aliases and independent OFDs");
+    puts("PASS common pipe owners: ordinary aliases and independent OFDs admitted; unsupported observers rejected");
 }
 /* 域接纳不能仍只识别pipe；控制引用保持后端末次释放在CPU0。 */
 static void regular_file_domain(struct kernel_heap *heap)
@@ -165,16 +201,15 @@ static void regular_file_domain(struct kernel_heap *heap)
     slot=control; assert(!kernel_open_file_acquire(slot));
     assert(!kernel_files_install_new_owned_at(&files,0,0,&slot));
     assert(!kernel_open_file_release(&control));
-    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
-        !files.record->concurrent);
+    assert(!kernel_files_check_task_domain(&files,&domain_mm));
     assert(!kernel_files_pin(&files,0,&control,&result) && !result);
-    assert(!kernel_files_enable_concurrency(&files,&domain_mm) &&
+    assert(!kernel_files_check_task_domain(&files,&domain_mm) &&
         "same-arena regular OFD with a CPU0 control owner was rejected");
     struct kernel_files ordinary={0};
     assert(!kernel_files_create(&ordinary,heap));
     slot=control; assert(!kernel_open_file_acquire(slot));
-    assert(kernel_files_install_shared_acquired_at(&ordinary,0,0,&slot)==KERNEL_FILES_STATUS_STATE && slot);
-    assert(!kernel_open_file_release(&slot) && !kernel_files_release(&ordinary));
+    assert(!kernel_files_install_shared_acquired_at(&ordinary,0,0,&slot) && !slot);
+    assert(!kernel_files_release(&ordinary));
     mm_test_attach(1); mm_test_bind(&domain_mm); mm_test_bind_files(&files);
     assert(!kernel_files_dup(&files,0,&result) && result==1);
     assert(!kernel_files_close(&files,0,&result) && !result);
@@ -243,7 +278,7 @@ static void concurrent_dup_case(struct kernel_heap *heap,unsigned actors)
     assert(!kernel_open_file_create_pipe(heap,pipe,KERNEL_PIPE_ENDPOINT_WRITE,0,&b));
     assert(!kernel_files_install_new_owned_at(&files,0,0,&a));
     assert(!kernel_files_install_new_owned_at(&files,1,0,&b));
-    assert(!kernel_files_enable_concurrency(&files,&domain_mm));
+    assert(!kernel_files_check_task_domain(&files,&domain_mm));
     group_ready=group_release=0;
     pthread_t threads[4];
     for (unsigned i=0;i<actors;i++) {
@@ -279,8 +314,8 @@ static void concurrent_dup_case(struct kernel_heap *heap,unsigned actors)
     pid_t child=fork(); assert(child>=0);
     if (!child) {
         files.record->references=0;
-        struct kernel_open_file_description *invalid=0;
-        kernel_files_pin(&files,0,&invalid,&result);
+        /* 引用不变量在实际引用变更处检查，不给每次查槽增加全记录审计。 */
+        kernel_files_release(&files);
         _exit(0);
     }
     int status; assert(waitpid(child,&status,0)==child);
@@ -334,6 +369,7 @@ int main(void)
         !physical_page_allocator_finalize(&pages) &&
         !kernel_heap_init(&heap, &pages, page_address));
     uint64_t baseline=physical_page_available(&pages);
+    umask_case(&heap);
     directory_pin_handoff(&heap,0);
     assert(!kernel_files_create(&files, &heap));
     struct kernel_pipe *pipe = 0;
@@ -379,7 +415,7 @@ int main(void)
     assert(!arch_mmu_user_space_init(&space,&pages,&kernel) &&
         !kernel_mm_create(&domain_mm,&space) && !kernel_mm_vma_enable(&domain_mm,&heap));
     assert(!kernel_mm_brk_initialize(&domain_mm,0x10000,0x20000));
-    assert(!kernel_mm_enable_concurrency(&domain_mm));
+    assert(!kernel_mm_check_task_domain(&domain_mm));
     directory_pin_handoff(&heap,1);
     reject_external_pipe_owner(&heap);
     regular_file_domain(&heap);

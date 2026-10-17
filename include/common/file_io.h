@@ -13,6 +13,11 @@ struct file_read_span {
     size_t size, completed;
     int error;
 };
+/* 与block completion相同，只通知提前完成项；同步返回涵盖全部结果。 */
+struct file_read_completion {
+    void (*complete)(void *context, unsigned index, const struct file_read_span *span);
+    void *context;
+};
 
 struct file_read_fragment { unsigned span; size_t length; int error; };
 /* The request owns this reusable planning storage. Each synchronous layer
@@ -24,6 +29,12 @@ struct file_read_workspace {
     struct block_read_span reads[FILE_READ_BATCH_MAX];
     unsigned owners[FILE_READ_BATCH_MAX];
     int mapping_errors[FILE_READ_BATCH_MAX];
+    unsigned completion_cursor[FILE_READ_BATCH_MAX];
+    /* Backend completion borrows this same request storage through DMA drain. */
+    struct file_read_span *completion_spans;
+    const struct file_read_completion *completion;
+    uint32_t completion_ready, completion_emitted;
+    unsigned completion_parts;
 };
 
 /* Immutable caller storage. Context, callbacks and the entire retained

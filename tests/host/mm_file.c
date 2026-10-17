@@ -1,4 +1,5 @@
 #include <kernel/mm_backend.h>
+#include <kernel/futex.h>
 #include <kernel/uaccess.h>
 #include <kernel/tmpfs.h>
 #include <kernel/open_file.h>
@@ -8,6 +9,7 @@
 #include "../../fs/open_file_internal.h"
 #include "../../fs/vfs_objects.h"
 #include <assert.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <sched.h>
@@ -223,6 +225,49 @@ static void stale_shrink(void)
     assert(read_byte(&child,target)==0);
     mm_test_context=roots[1];
 }
+static void futex_key_lifetime(void)
+{
+    struct kernel_open_file_description *file = 0;
+    int error;
+    assert(!kernel_open_file_create_mode(&heap,mount,"/futex-key",0600,&file,&error) && !error);
+    file->open_flags = 2;
+    assert(!kernel_vfs_ftruncate(&file->file,2*BOAROS_PAGE_SIZE));
+    struct kernel_vfs_node *node = kernel_open_file_node(file);
+    uint64_t addresses[2];
+    struct kernel_futex_key keys[2];
+    for (unsigned i=0; i<2; i++) {
+        struct kernel_open_file_description *source = file;
+        assert(!kernel_open_file_acquire(source));
+        assert(!kernel_mm_mmap_file_private(&parent,&source,0,BOAROS_PAGE_SIZE,
+            BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED,&addresses[i]));
+        assert(!kernel_mm_acquire_futex_key(&parent,addresses[i]+12,1,&keys[i]));
+        assert(keys[i].kind==KERNEL_FUTEX_KEY_SHARED_FILE && keys[i].file_node==node &&
+               keys[i].offset==BOAROS_PAGE_SIZE+12);
+    }
+    assert(keys[0].identity==keys[1].identity && addresses[0]!=addresses[1]);
+    assert(!kernel_vfs_unlink(mount,"/futex-key"));
+    for (unsigned i=0; i<2; i++) assert(!kernel_mm_munmap(&parent,addresses[i],BOAROS_PAGE_SIZE));
+    assert(!kernel_open_file_release(&file));
+    assert(node->references==2); /* 最后两个映射及 OFD 已结束，仅 key 持有 inode。 */
+    assert(!kernel_vfs_node_release(&keys[0].file_node) && node->references==1);
+    assert(!kernel_vfs_node_release(&keys[1].file_node));
+
+    /* 冷共享页取身份可能真实分配失败；不发布后备引用，之后仍可正常解除映射。 */
+    uint64_t cold;
+    assert(!kernel_mm_mmap_anonymous(&parent,0,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED,&cold));
+    size_t capacity=physical_page_total(&pages), count=0;
+    uint64_t *held=malloc(capacity*sizeof(*held));
+    assert(held);
+    while (count<capacity && !physical_page_allocate(&pages,&held[count])) count++;
+    struct kernel_futex_key failed={0};
+    assert(kernel_mm_acquire_futex_key(&parent,cold,1,&failed)==KERNEL_MM_STATUS_NO_MEMORY);
+    assert(!failed.identity && !failed.shared_object);
+    while (count) assert(!physical_page_release(&pages,held[--count]));
+    free(held);
+    assert(!kernel_mm_munmap(&parent,cold,BOAROS_PAGE_SIZE));
+}
+
 int main(void)
 {
     mm_test_attach(0);
@@ -254,7 +299,7 @@ int main(void)
         KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped) && !source && mapped==0x40000);
     /* 初次状态 OOM 必须在 VMA/登记发布之前失败，OFD 引用仍归调用者。 */
     /* 真实tmpfs来源已经受其实例预算约束；旧实现无条件拒绝文件域。 */
-    assert(kernel_mm_enable_concurrency(&parent)==KERNEL_MM_STATUS_OK);
+    assert(kernel_mm_check_task_domain(&parent)==KERNEL_MM_STATUS_OK);
     assert(!kernel_mm_fork(&child,&parent));
     for (unsigned id=1; id<=4; id++) {
         assert(!kernel_mm_acquire(&views[id],id==2 || id==4 ? &child : &parent));
@@ -265,6 +310,7 @@ int main(void)
     uint64_t child_root; assert(!kernel_mm_context(&child,&child_root)); mm_test_context=child_root;
     byte=0; assert(!kernel_copy_from_user(&child,&byte,mapped,1,&done) && done==1 && byte==0x73);
     mm_test_context=roots[1];
+    futex_key_lifetime();
     first_fault(2); first_fault(4); stale_shrink(); fault_failures(); unregister_callback(); private_case();
     mm_test_context=0;
     for (unsigned id=1; id<=4; id++) assert(!kernel_mm_release(&views[id]));

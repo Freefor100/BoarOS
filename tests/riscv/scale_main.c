@@ -41,6 +41,14 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
     if (cache_io_probe) cache_reads++;
     return __real_kernel_vfs_node_pread(node, offset, buffer, size, done);
 }
+int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *, struct file_read_span *, size_t,
+    struct file_read_workspace *, const struct file_read_completion *);
+int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file_read_span *spans,
+    size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
+{
+    if (cache_io_probe) cache_reads += count;
+    return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
+}
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
@@ -402,8 +410,10 @@ static void udp_read_without_buffer(struct kernel_files *files, struct kernel_mm
           kernel_files_pin(files, fd, &pin, &result) == KERNEL_FILES_STATUS_OK && result == 0, 36);
     struct kernel_socket *socket = kernel_open_file_socket(pin);
     struct kernel_socket_address address = {.family = KERNEL_SOCKET_AF_INET};
-    check(kernel_socket_bind(socket, &address) == 0 && kernel_socket_getname(socket, &address) == 0 &&
-          (address.bytes[0] = 127, address.bytes[3] = 1, kernel_socket_sendto(socket, mm, BUFFER, 8192, &address)) == 8192, 37);
+    check(kernel_socket_bind(socket, &address) == 0 && kernel_socket_getname(socket, &address) == 0, 37);
+    address.bytes[0] = 127; address.bytes[3] = 1;
+    struct kernel_uaccess_iovec iov = {BUFFER, 8192};
+    check(kernel_socket_write_datagram(&pin, mm, &iov, 1, 8192, 0, &address) == 8192, 37);
     fail_page = 1;
     check(kernel_files_read(files, mm, fd, BUFFER, 8192, &result) == KERNEL_FILES_STATUS_OK &&
           result == 8192 && fail_page == 1, 38);
@@ -768,9 +778,9 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     if (bytes == 16 * MIB) {
         struct kernel_mm clone = {0};
         check(kernel_mm_fork(&clone, mm) == KERNEL_MM_STATUS_OK, 43);
-        riscv_kernel_mm_get_statistics(&clone, &after);
-        check(after.resident_probes == 0 && after.protect_visits == 0 &&
-              after.protect_address_flushes == 0 && after.protect_global_flushes == 0, 44);
+        struct kernel_mm_mapping parent, child;
+        check(!kernel_mm_lookup(mm, address, &parent) && !kernel_mm_lookup(&clone, address, &child) &&
+            parent.physical_address == child.physical_address && !(child.permissions & KERNEL_MM_WRITE), 44);
         check(kernel_mm_release(&clone) == KERNEL_MM_STATUS_OK, 45);
     }
 #if BOAROS_COST_DIAGNOSTICS
@@ -782,7 +792,7 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     check(kernel_cost_end(2, 0) == 0, 197);
     uint64_t observed;
     riscv_kernel_mm_get_statistics(mm, &protect_after);
-    check(kernel_cost_read(0, COST_MPROTECT_RESIDENT_VISITS, &observed) == 0 && observed == pages * 2, 198);
+    check(kernel_cost_read(0, COST_MPROTECT_RESIDENT_VISITS, &observed) == 0 && observed == 2, 198);
     check(kernel_cost_read(0, COST_MPROTECT_PTE_VISITS, &observed) == 0 && observed == protect_after.protect_visits - protect_before.protect_visits, 199);
     check(kernel_cost_read(0, COST_MPROTECT_ADDRESS_TLB, &observed) == 0 && observed == protect_after.protect_address_flushes - protect_before.protect_address_flushes, 200);
 #endif

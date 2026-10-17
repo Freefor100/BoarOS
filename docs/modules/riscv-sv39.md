@@ -52,7 +52,7 @@ RISC-V direct map 使用固定公式 `VA = 0xffffffc000000000 + PA`，窗口大�
 
 过渡页表使用内核镜像内静态预留的 5 个 4 KiB 页，不消费正式物理页分配器。最终页表页来自启动内存布局的可用 RAM，所以会减少分配器的可用页计数，并在最终地址空间中落入 direct map。第二次 `satp` 切换完成后，启动代码立即把 UART 驱动从过渡低地址切到最终高半区别名，再绑定物理页的 direct-map 访问函数；此后的页内访问和设备诊断都不依赖过渡映射。QEMU UART 物理地址属于平台事实，不在通用 `sv39.c` 中；接入 VisionFive 2 时应由新的平台入口提供自己的 MMIO 映射。
 
-`riscv_sv39_activate` 使用 ASID 0，把根页物理页号与 MODE=8 写入 `satp`，在写入前后各执行一次全局 `SFENCE.VMA`，并读回 `satp` 验证硬件接受该模式。切换前保存旧 `satp`；若读回不一致，则经过同样的 fence 恢复旧值，再把页表标为 `FAILED`。
+`riscv_sv39_activate` 使用 ASID 0，把根页物理页号与 MODE=8 写入 `satp`，写入后执行一次全局 `SFENCE.VMA`，并读回 `satp` 验证硬件接受该模式。切换前保存旧 `satp`；若读回不一致，则经过同样的 fence 恢复旧值，再把页表标为 `FAILED`。
 
 激活期间，旧地址空间和候选地址空间都必须保持当前代码、栈、trap 入口以及页表对象本身可访问，页表对象还必须可写。当前启动路径先从 Bare 切到过渡页表；激活函数从低地址返回后，汇编路径把 `ra`、`sp`、`gp`、`stvec` 和控制流切换到高半区。随后 C 代码从高地址激活最终页表，第二次切换前后所需对象都由高半区内核映射覆盖，因此最终页表不再需要低 RAM。每个 hart 独立切根，secondary 的过渡栈与高地址交接见[两核模块](riscv-smp.md)；若错误页表让当前执行地址在写入 `satp` 后立即不可达，CPU 会先产生同步异常，软件无法依赖后续读回路径恢复。
 
@@ -98,7 +98,7 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0`
 推断。
 
-`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前用户 MM 没有 ASID 分配或跨核 shootdown；受控两核的共享内核栈另有 RFENCE 确认。
+`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，相同 `satp` 直接返回；换根写入后执行一次全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前用户 MM 没有 ASID 分配或跨核 shootdown；受控两核的共享内核栈另有 RFENCE 确认。
 
 `riscv_sv39_user_unmap_owned_range()` 只处理对齐的 4 KiB 用户范围。调用方先证明目标就是本 hart 当前活动 MM；walker 预检覆盖范围中已有的页表分支、表项形态、物理页可访问性和 active/protected 计数，输入或状态错误在写 PTE 前返回。提交时先把 active 和 protected owner 暂时改为 `V=0` 的软件 PTE，再执行一次本地全局 `SFENCE.VMA`，随后立即释放物理页并清零 PTE。函数返回时不保留临时 invalid PTE、页计数或回收接口；释放不变量错误直接 fatal。
 

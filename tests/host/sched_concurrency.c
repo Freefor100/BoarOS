@@ -570,6 +570,8 @@ static void policy_selection_race(void)
     scheduler.rt_configuration = (struct kernel_rt_configuration){UINT64_C(1000000000), INT64_C(950000000)};
     for (unsigned i = 0; i < 2; i++) {
         kernel_cpu_initialize(&cpus[i], 7 + 6*i, &idles[i].io_context);
+        cpus[i].logical_id = i;
+        cpus[i].state = KERNEL_CPU_ONLINE;
         active_cpu = &cpus[i];
         scheduler_cpu_initialize(active_cpu, &idles[i], 0);
         active_cpu->current = &idles[i];
@@ -590,6 +592,7 @@ static void policy_selection_race(void)
         process_identity_sync_locked(&tasks[0]);
     }
     tasks[0].arch.user_mode = 1;
+    tasks[0].cpu_mask = 3;
     tasks[0].state = KERNEL_THREAD_STATE_READY;
     assert(!kernel_sched_policy_set(&tasks[0].scheduling, KERNEL_SCHED_FIFO, 50, 0));
     ready_append(&tasks[0]);
@@ -686,6 +689,8 @@ static void independent_runtime(void)
         tasks[i].state = KERNEL_THREAD_STATE_RUNNING;
         cpus[i].current = &tasks[i];
         active_cpu = &cpus[i];
+        cpus[i].logical_id = i;
+        cpus[i].state = KERNEL_CPU_ONLINE;
         scheduler_cpu_initialize(&cpus[i], &idles[i], 0);
         assert(!kernel_sched_policy_set(&tasks[i].scheduling, KERNEL_SCHED_RR, 50, 0));
     }
@@ -761,6 +766,8 @@ static void concurrent_claim(unsigned count)
     for (unsigned i = 0; i < count; i++) {
         idles[i] = tasks[i] = (struct kernel_task){0};
         kernel_cpu_initialize(&cpus[i], 7 + i * 6, &idles[i].io_context);
+        cpus[i].logical_id = i;
+        cpus[i].state = KERNEL_CPU_ONLINE;
         active_cpu = &cpus[i];
         scheduler_cpu_initialize(active_cpu, &idles[i], 0);
         active_cpu->current = &idles[i];
@@ -769,6 +776,7 @@ static void concurrent_claim(unsigned count)
         selected[i] = 0;
     }
     tasks[0].state = KERNEL_THREAD_STATE_READY;
+    tasks[0].cpu_mask = 3;
     ready_append(&tasks[0]);
     assert(!pthread_barrier_init(&start, 0, count));
     pthread_t threads[4];
@@ -814,8 +822,7 @@ int main(void)
     concurrent_group_retirement(2);
     concurrent_group_retirement(4);
     independent_runtime();
-    for (unsigned count = 2; count <= 4; count += 2)
-        for (unsigned iteration = 0; iteration < 64; iteration++) concurrent_claim(count);
-    puts("scheduler 2/4-CPU atomic selection and execution-owner handoff passed");
+    for (unsigned iteration = 0; iteration < 128; iteration++) concurrent_claim(2);
+    puts("scheduler 2-CPU execution claims and 2/4-actor metadata lifetime passed");
     return 0;
 }

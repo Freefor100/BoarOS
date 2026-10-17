@@ -126,6 +126,56 @@ static void *worker(void *argument)
     assert(!cpu.raw_locks && !cpu.preempt_depth && sync_test_irq);
     return 0;
 }
+struct hook_owner { unsigned references; uint64_t value; };
+static pthread_barrier_t hook_entered, hook_continue;
+static unsigned hook_freed;
+static void hook_retain(void *context)
+{
+    struct hook_owner *owner=context;
+    assert(__atomic_fetch_add(&owner->references,1,__ATOMIC_RELAXED));
+}
+static void hook_release(void *context)
+{
+    struct hook_owner *owner=context;
+    unsigned references=__atomic_fetch_sub(&owner->references,1,__ATOMIC_ACQ_REL);
+    assert(references);
+    if (references==1) { free(owner);__atomic_store_n(&hook_freed,1,__ATOMIC_RELEASE); }
+}
+static uint64_t hook_reclaim(void *context,uint64_t count)
+{ (void)context;(void)count;assert(0);return 0; }
+static void hook_notify(void *context)
+{
+    struct hook_owner *owner=context;
+    assert(cpu.logical_id==1 && !cpu.raw_locks && !cpu.preempt_depth && sync_test_irq);
+    assert(owner->value==UINT64_C(0x713791ca));
+    pthread_barrier_wait(&hook_entered);
+    pthread_barrier_wait(&hook_continue);
+    assert(!__atomic_load_n(&hook_freed,__ATOMIC_ACQUIRE) && owner->value==UINT64_C(0x713791ca));
+}
+static void *hook_allocate(void *unused)
+{
+    (void)unused;kernel_cpu_initialize(&cpu,1,&io);cpu.logical_id=1;
+    uint64_t page;assert(!physical_page_allocate(&allocator,&page));
+    assert(!physical_page_release(&allocator,page));return NULL;
+}
+static void hook_lifetime(void)
+{
+    struct hook_owner *owner=malloc(sizeof(*owner));assert(owner);
+    *owner=(struct hook_owner){.references=1,.value=UINT64_C(0x713791ca)};
+    hook_freed=0;
+    assert(!pthread_barrier_init(&hook_entered,NULL,2) && !pthread_barrier_init(&hook_continue,NULL,2));
+    assert(!physical_page_allocator_set_reclaimer(&allocator,&(struct physical_page_reclaim_hooks){
+        .reclaim=hook_reclaim,.notify=hook_notify,.retain=hook_retain,.release=hook_release,.context=owner}));
+    pthread_t thread;assert(!pthread_create(&thread,NULL,hook_allocate,NULL));
+    pthread_barrier_wait(&hook_entered);
+    assert(!physical_page_allocator_clear_reclaimer(&allocator));
+    hook_release(owner);
+    assert(!__atomic_load_n(&hook_freed,__ATOMIC_ACQUIRE));
+    pthread_barrier_wait(&hook_continue);
+    assert(!pthread_join(thread,NULL) && __atomic_load_n(&hook_freed,__ATOMIC_ACQUIRE));
+    assert(!pthread_barrier_destroy(&hook_entered) && !pthread_barrier_destroy(&hook_continue));
+    puts("allocator remote notification survives concurrent hook detach; final context owner returned");
+}
 static void run(unsigned threads)
 {
     thread_count = threads;
@@ -147,6 +197,7 @@ static void run(unsigned threads)
     for (unsigned i = 0; i < threads; i++) assert(pthread_join(ids[i], 0) == 0);
     assert(pthread_barrier_destroy(&gate) == 0);
     assert(physical_page_release(&allocator, shared) == 0);
+    hook_lifetime();
     assert(physical_page_allocator_audit(&allocator) == 0);
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap, &stats);
     assert(!stats.live_allocations && !stats.current_pages);

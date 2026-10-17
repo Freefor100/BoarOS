@@ -513,7 +513,7 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
  * Multi-output callers lend a workspace until return; scalar callers may pass
  * NULL. size_limit caps visible EOF without changing the caller's span sizes. */
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *workspace, uint64_t size_limit);
+    struct file_read_workspace *workspace, uint64_t size_limit, const struct file_read_completion *completion);
 
 
 /**@brief   Write data to file.

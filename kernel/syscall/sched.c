@@ -1,3 +1,4 @@
+#include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/errno.h>
 #include <kernel/sched_policy.h>
@@ -35,6 +36,7 @@ enum kernel_syscall_status syscall_handle_sched(
                 (nr==125 ? 99 : 1) : -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    KERNEL_SERVICE_SCOPE(service);
     if (nr==118 || nr==119) {
         uint64_t address=request->arguments[nr==118 ? 1 : 2];
         int priority, policy=nr==118 ? 0 : (int)request->arguments[1];

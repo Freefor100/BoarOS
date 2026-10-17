@@ -146,22 +146,17 @@ static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
             __builtin_trap();
     }
 }
-int kernel_pipe_enable_concurrency(struct kernel_pipe *pipe,uint32_t owners,
-    uint32_t readers,uint32_t writers,int commit)
+int kernel_pipe_check_task_domain(struct kernel_pipe *pipe)
 {
-    PIPE_META(guard,pipe);
-    if (pipe->fifo_node || !pipe->owners) __builtin_trap();
-    if (pipe->concurrent) return 0;
-    if (pipe->owners!=owners || pipe->readers!=readers || pipe->writers!=writers)
-        return -KERNEL_EBUSY;
-    KERNEL_RAW_SCOPE(wait_guard,&kernel_wait_domain);
-    struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue};
-    for (unsigned i=0;i<3;i++)
-        if (queues[i]->registrations || queues[i]->borrows || queues[i]->closed)
-            return -KERNEL_EBUSY;
-    if (commit) __atomic_store_n(&pipe->concurrent,1,__ATOMIC_RELEASE);
+    PIPE_META(guard, pipe);
+    if (pipe->fifo_node || !pipe->owners) return -KERNEL_EBUSY;
+    KERNEL_RAW_SCOPE(wait_guard, &kernel_wait_domain);
+    struct kernel_wait_queue *queues[] = {&pipe->read_queue, &pipe->write_queue, &pipe->both_queue};
+    for (unsigned i = 0; i < 3; i++)
+        if (queues[i]->registrations || queues[i]->borrows || queues[i]->closed) return -KERNEL_EBUSY;
     return 0;
 }
+
 enum kernel_pipe_status kernel_pipe_acquire_endpoint(struct kernel_pipe *pipe,uint32_t endpoint)
 {
     if (!pipe || !pipe->heap || !pipe->allocator || endpoint<1 || endpoint>3)

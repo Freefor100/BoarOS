@@ -1,8 +1,35 @@
 #include "abi.h"
 
 static void record(const char *id, long ret) { abi_record(id,ret,-1,-1,0,0,0); }
+static void directory_capacity_cases(void)
+{
+    char data[280];
+    long fd = abi_open("/", 0200000);
+    abi_require(fd >= 0);
+    record("getdents.zero-before-eof", SC3(61, fd, -1, 0));
+    record("getdents.small-before-eof", SC3(61, fd, data, 1));
+    char first[256];
+    long count = SC3(61, fd, data, sizeof(data));
+    abi_require(count > 19);
+    unsigned used = 0;
+    do { first[used] = data[19 + used]; } while (first[used++]);
+    abi_require(SC3(62, fd, 0, 0) == 0);
+    count = SC3(61, fd, data, sizeof(data));
+    abi_require(count > 19);
+    long same = 1;
+    for (unsigned i = 0; i < used; i++) if (first[i] != data[19 + i]) same = 0;
+    record("getdents.capacity-cookie", same);
+    do { count = SC3(61, fd, data, sizeof(data)); abi_require(count >= 0); }
+    while (count);
+    record("getdents.zero-at-eof", SC3(61, fd, -1, 0));
+    abi_require(SC3(62, fd, 0, 0) == 0);
+    record("getdents.zero-after-rewind", SC3(61, fd, data, 0));
+    abi_require(SC1(57, fd) == 0);
+}
+
 void abi_path_only_cases(void)
 {
+    directory_capacity_cases();
     abi_require(SC3(34,-100,"/path-proc",0755)==0 && SC5(40,"proc","/path-proc","proc",0,0)==0);
     long fd=abi_open("/path-target",2|64|128); abi_require(fd>=0);
     abi_require(SC3(64,fd,"data",4)==4);

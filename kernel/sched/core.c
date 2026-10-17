@@ -289,18 +289,18 @@ static enum kernel_scheduler_status validate_thread(
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (thread->mm.state == KERNEL_MM_LIVE) {
-            if (thread->mm.allocator != scheduler.allocator) {
+            if (!thread->mm.record || thread->mm.allocator != scheduler.allocator) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
         } else if (thread->mm.state ==
                    KERNEL_MM_CLEANUP) {
-            if (thread->mm.allocator != scheduler.allocator ||
+            if (!thread->mm.record || thread->mm.allocator != scheduler.allocator ||
                 (thread->mm.record_page_address &
                  BOAROS_PAGE_MASK) != 0U) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
         } else if (thread->mm.allocator != 0 ||
-                   thread->mm.record_page_address != 0U) {
+                   thread->mm.record_page_address != 0U || thread->mm.record != 0) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
@@ -910,7 +910,8 @@ static enum kernel_scheduler_status create_kernel_thread(
     enum arch_context_status context_status;
     enum kernel_scheduler_status status;
     uint64_t bound_context = 0;
-    if (bound_mm && kernel_mm_concurrent_context(bound_mm, &bound_context) != KERNEL_MM_STATUS_OK)
+    if (bound_mm && (kernel_mm_check_task_domain(bound_mm) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_context(bound_mm, &bound_context) != KERNEL_MM_STATUS_OK))
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -1034,7 +1035,7 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
     return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
         !cpu->switch_previous && !cpu->eligible.first && !cpu->active_mm_record
 #if BOAROS_USER_SMP
-        && !cpu->user_reservations.first && !scheduler.user_services.first
+        && !cpu->user_reservations.first && !scheduler.rt_services.first
 #endif
         ;
 }
@@ -1067,7 +1068,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_files(
     kernel_assert_service_context();
     if (!join || !mm || !files || !mask || (mask & ~3U))
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    if (kernel_files_check_concurrent_domain(files,mm))
+    if (kernel_files_check_task_domain(files,mm))
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     struct kernel_mm mm_owner={0}; struct kernel_files files_owner={0};
     enum kernel_mm_status acquired=kernel_mm_acquire(&mm_owner,mm);
@@ -1216,13 +1217,6 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->user_service = 1;
     /* PID1在secondary ONLINE前构造；默认集合在首次服务入口固定。 */
     thread->cpu_mask = 0;
-#endif
-    /* 仅新profile开放远端用户执行；失败不发布任务，caller仍拥有原MM。 */
-#if BOAROS_USER_SMP
-    if (kernel_mm_enable_remote_user_execution(mm) != KERNEL_MM_STATUS_OK) {
-        status = release_task_storage(thread,KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
-        goto restore_interrupts;
-    }
 #endif
     arch_thread_set_mm(&thread->arch, user_context);
     thread->magic = KERNEL_THREAD_MAGIC;

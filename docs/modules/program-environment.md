@@ -82,7 +82,7 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 构建且有 `identity.json`
 的缓存 Image；不指定时 runner 按固定资料构建。`make prepare-offline-c-toolchain`
 单独重建编译器树。`references/sources.tsv` 对以下16个APK 固定逐项完整 URL
-和 SHA-256，访问日期为 2026-09-27；准备脚本逐项校验 archive 哈希、
+和 SHA-256，各包核对日期随清单维护；准备脚本逐项校验 archive 哈希、
 `.PKGINFO` 的名称/版本/架构/许可和缓存树内容，不修改上游包。
 
 runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜像，
@@ -108,7 +108,7 @@ runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜�
 | mpfr4 | 4.2.1_p1-r0 | LGPL-3.0-or-later |
 | musl | 1.2.5-r12 | MIT |
 | musl-dev | 1.2.5-r12 | MIT |
-| zlib | 1.3.2-r0 | Zlib |
+| zlib | 1.3.2-r1 | Zlib |
 | zstd-libs | 1.5.7-r0 | BSD-3-Clause OR GPL-2.0-or-later |
 
 小探针证明此固定C源码的五阶段；中等工程流程见下节。C++、Rust或持续本机自举仍需独立验证。

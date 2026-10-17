@@ -38,16 +38,18 @@ enum virtio_block_status __wrap_virtio_pci_block_destroy(struct virtio_pci_block
         struct pci_host *host=block->pci.function.host;
         struct physical_page_allocator *allocator=block->device.page_allocator;
         uint64_t pages=physical_page_available(allocator);
-        uint64_t queue_pages=UINT64_C(1)<<block->device.queue_allocation_order;
+        uint64_t core_pages=UINT64_C(1)<<block->device.queue_allocation_order;
+        for(unsigned i=0;i<VIRTIO_BLOCK_BATCH_POOL_PAGES;i++)
+            core_pages+=block->device.batch_physical[i]!=0;
         unsigned claims=pci_host_claimed(host);
         denied=&block->pci.transport;
         enum virtio_block_status status=__real_virtio_pci_block_destroy(block);
         if(denied || status!=VIRTIO_BLOCK_DRIVER_STATUS_DEVICE || block->core_owned ||
             !block->pci.function.host || block->device.queue_memory || pci_host_claimed(host)!=claims ||
-            physical_page_available(allocator)!=pages+queue_pages)la_virt_fatal("PCI final reset owner");
+            physical_page_available(allocator)!=pages+core_pages)la_virt_fatal("PCI final reset owner");
         status=__real_virtio_pci_block_destroy(block);
         if(status!=VIRTIO_BLOCK_DRIVER_STATUS_OK || block->pci.function.host ||
-            pci_host_claimed(host)>=claims || physical_page_available(allocator)!=pages+queue_pages)
+            pci_host_claimed(host)>=claims || physical_page_available(allocator)!=pages+core_pages)
             la_virt_fatal("PCI final reset retry");
         la_virt_puts("LA PCI final reset failure retries BAR without double queue free passed\n");
         return status;

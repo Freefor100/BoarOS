@@ -13,6 +13,7 @@
 #include <kernel/memory_object.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/scheduler.h>
 #include <kernel/vfs.h>
 
 #include <string.h>
@@ -1122,10 +1123,11 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     *bytes_read = 0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
     if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
+    if (node_guard.lock) kernel_lock_release(&node_guard);
     struct kernel_page_cache_read_page single, *pages = &single;
     size_t capacity = 1;
-    int result = 0;
-    while (*bytes_read < size && offset < node->size) {
+    int result = 0, done = 0;
+    while (*bytes_read < size && offset < node->size && !done) {
         size_t start = offset & BOAROS_PAGE_MASK;
         size_t window = BOAROS_PAGE_SIZE * KERNEL_PAGE_CACHE_READ_BATCH_MAX - start;
         if (window > size - *bytes_read) window = size - *bytes_read;
@@ -1145,13 +1147,15 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
             KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
         int error = 0;
         for (size_t i = 0; i < count; i++) {
+            if (pages[i].status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) { done=1; break; }
             if (pages[i].status) {
                 error = pages[i].status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
                 break;
             }
             void *page;
             size_t valid = pages[i].valid_bytes;
-            if (physical_page_resolve(cache->allocator, pages[i].physical_address, &page) || valid <= start)
+            if (valid <= start) { done=1; break; }
+            if (physical_page_map_owned(cache->allocator, pages[i].physical_address, &page))
                 __builtin_trap();
             size_t copied = valid - start;
             if (copied > size - *bytes_read) copied = size - *bytes_read;
@@ -1170,8 +1174,6 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
                                  struct kernel_vfs_file *file, uint64_t size)
 {
     uint64_t old_size = node->size;
-    if (size > old_size && node->instance->page_cache)
-        kernel_page_cache_extend(node->instance->page_cache, node, old_size, size);
     node->size = size;
     file->size = node->size;
     if (node->size < old_size && !node->memory) {
@@ -1360,8 +1362,8 @@ int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size)
     return kernel_vfs_ftruncate(&path->file, size);
 }
 
-int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
-                         uint64_t size)
+int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
+    uint64_t size, const struct kernel_lock_guard *borrowed)
 {
     struct kernel_vfs_node *node;
     int result;
@@ -1372,7 +1374,10 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
     }
     node = file->private_data;
     KERNEL_LOCK_SCOPE(operation_guard);
-    kernel_vfs_file_write_lock(file, &operation_guard);
+    if (borrowed) {
+        if (borrowed->lock != &node->write_operation.lock || !borrowed->write || !borrowed->owner)
+            __builtin_trap();
+    } else kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1412,7 +1417,7 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
         kernel_file_mapping_open(node);
         return result;
     }
-    if (node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache)) {
+    if (node->instance->page_cache != NULL) {
         kernel_assert_service_context();
         struct kernel_page_cache *cache = node->instance->page_cache;
         uint64_t old_size = node->size;
@@ -1501,6 +1506,9 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
     return 0;
 }
 
+int kernel_vfs_ftruncate(struct kernel_vfs_file *file, uint64_t size)
+{ return kernel_vfs_ftruncate_borrowing(file, size, NULL); }
+
 int kernel_vfs_close(struct kernel_vfs_file *file)
 {
     struct kernel_vfs_instance *adapter;
@@ -1576,7 +1584,7 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
         return 0U;
     }
     node = file->private_data;
-    return node->size;
+    return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
 int kernel_vfs_stat_at(struct kernel_vfs_path *start,
@@ -2163,8 +2171,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
 
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
 {
-    return node != 0 && __atomic_load_n(&node->references,__ATOMIC_ACQUIRE) != 0U && !node->closed
-               ? __atomic_load_n(&node->size,__ATOMIC_ACQUIRE) : 0U;
+    return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
 struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
@@ -2275,9 +2282,6 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
         struct kernel_vfs_node *node = snapshot.nodes[i];
         if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG || !instance->page_cache)
             continue;
-        KERNEL_LOCK_SCOPE(node_guard);
-        if (!kernel_page_cache_is_controlled(instance->page_cache))
-            kernel_vfs_node_lock(node, &node_guard, 0);
         int error = kernel_page_cache_writeback(instance->page_cache, node);
         if (error && error != -KERNEL_ENOMEM && error != -KERNEL_EBUSY)
             kernel_vfs_record_writeback_error(node, error);
@@ -2344,6 +2348,7 @@ static void sync_mounts_without_array(struct kernel_vfs_path *root)
 
 void kernel_vfs_sync_all(struct kernel_vfs_path *root)
 {
+    KERNEL_SERVICE_SCOPE(service);
     if (!root || !root->file.mount) return;
     struct kernel_vfs_mount *mount = root->file.mount;
     struct kernel_heap *heap = ((struct kernel_vfs_instance *)mount->private_data)->heap;
@@ -2409,15 +2414,15 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
     kernel_vfs_node_lock(node, &node_guard, 0);
     result = 0;
     if (node->instance->read_only) goto observe;
-    int controlled = node->instance->page_cache && kernel_page_cache_is_controlled(node->instance->page_cache);
-    if (controlled) kernel_assert_service_context();
-    if (controlled && node_guard.lock) kernel_lock_release(&node_guard);
+    int cached = node->instance->page_cache != NULL;
+    if (cached) kernel_assert_service_context();
+    if (cached && node_guard.lock) kernel_lock_release(&node_guard);
     result = !node->instance->page_cache ? 0 : start == 0U && end == UINT64_MAX
         ? kernel_page_cache_writeback(node->instance->page_cache, node)
         : kernel_page_cache_writeback_range(node->instance->page_cache,
                                             node, start, end);
     if (result == 0) {
-        if (controlled) kernel_vfs_node_lock(node, &node_guard, 0);
+        if (cached) kernel_vfs_node_lock(node, &node_guard, 0);
         result = node->instance->ops->sync_metadata(node, data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR);
         if (result != 0) kernel_vfs_record_writeback_error(node, result);
     }
@@ -2462,7 +2467,7 @@ uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file)
 struct kernel_page_cache *kernel_vfs_file_page_cache(
     const struct kernel_vfs_file *file)
 {
-    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    const struct kernel_vfs_node *node = file ? file->private_data : NULL;
 
     return node != 0 ? node->instance->page_cache : 0;
 }
@@ -2679,16 +2684,17 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
 }
 
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
-    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace)
+    struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     /* 私有调用者已固定独立的缓存页；后端边界负责自己的参数校验和结果初始化。 */
     struct kernel_vfs_instance *instance = node->mount->private_data;
-    if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count, workspace);
+    if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count, workspace, completion);
     int result = 0;
     for (size_t i = 0; i < count; i++) {
         spans[i].completed = 0;
         spans[i].error = instance->ops->pread(node, spans[i].offset, spans[i].buffer, spans[i].size, &spans[i].completed);
         if (!result) result = spans[i].error;
+        if (completion && i + 1 < count) completion->complete(completion->context, i, &spans[i]);
     }
     return result;
 }
