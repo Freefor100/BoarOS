@@ -203,6 +203,7 @@ struct kernel_task {
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
     int16_t group_signal_code[KERNEL_SIGNAL_COUNT];
+    struct kernel_signal_child_info group_child_info;
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
     struct kernel_futex_key futex_key;
@@ -216,6 +217,7 @@ struct kernel_task {
     uint64_t signal_table_address;
     uint32_t signal_sender[KERNEL_SIGNAL_COUNT];
     int16_t signal_code[KERNEL_SIGNAL_COUNT];
+    struct kernel_signal_child_info signal_child_info;
     uint32_t stop_notified;
     uint32_t continue_notified;
     struct kernel_thread_completion completion;

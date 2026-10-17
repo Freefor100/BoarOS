@@ -199,11 +199,7 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
 {
     KERNEL_SERVICE_SCOPE(service);
     struct { int64_t seconds, nanoseconds; } timeout;
-    struct {
-        int32_t signo, error, code, padding;
-        uint32_t pid, uid;
-        uint8_t reserved[104];
-    } user_info;
+    uint8_t user_info[128];
     struct kernel_signal_wait_info taken;
     struct kernel_mm *mm;
     uint64_t mask;
@@ -301,10 +297,7 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
     if (taken.signal == 0U) return KERNEL_SYSCALL_STATUS_OK;
     decoded->value = taken.signal;
     if (request->arguments[1] == 0U) return KERNEL_SYSCALL_STATUS_OK;
-    memset(&user_info, 0, sizeof(user_info));
-    user_info.signo = (int32_t)taken.signal;
-    user_info.code = taken.code;
-    user_info.pid = taken.sender;
+    kernel_signal_encode_info(user_info, &taken, 0, 0);
     copy_status = signal_copy_to_user(mm, request->arguments[1],
                                       &user_info, sizeof(user_info));
     if (copy_status != KERNEL_UACCESS_STATUS_OK)

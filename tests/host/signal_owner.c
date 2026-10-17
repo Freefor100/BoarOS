@@ -14,6 +14,35 @@ void signal_owner_cases(unsigned *lock_calls)
     leader.group_next = leader.group_previous = &member;
     member.group_next = member.group_previous = &leader;
     struct kernel_task *extra = 0;
+    struct kernel_signal_table table = {.magic=KERNEL_SIGNAL_TABLE_MAGIC,.references=1};
+    leader.signal_table_address=(uintptr_t)&table;
+    leader.signal_blocked = signal_mask(17);
+    assert(signal_wants_sigchld_stop(&leader));
+    table.actions[16].flags=LINUX_SA_NOCLDSTOP;
+    assert(!signal_wants_sigchld_stop(&leader));
+    table.actions[16].flags=0;table.actions[16].handler=KERNEL_SIGNAL_IGN;
+    assert(!signal_wants_sigchld_stop(&leader));
+    table.actions[16].handler=KERNEL_SIGNAL_DFL;
+    struct kernel_task *previous=kernel_cpu_current()->current;
+    kernel_cpu_current()->current=&leader;
+    leader.signal_wait_mask=leader.group_pending=signal_mask(17);
+    leader.group_sender[16]=42;leader.group_signal_code[16]=5;
+    leader.group_child_info=(struct kernel_signal_child_info){.uid=23,.status=19};
+    struct kernel_signal_wait_info info;
+    assert(!kernel_signal_wait_take(&leader,&info));
+    assert(info.signal==17 && info.sender==42 && info.code==5 && info.uid==23 && info.status==19);
+    assert(!leader.group_pending);
+    unsigned char encoded[128];kernel_signal_encode_info(encoded,&info,0,0);
+    int32_t value;memcpy(&value,encoded+24,4);assert(value==19);
+    memcpy(&value,encoded+20,4);assert(value==23);
+    memcpy(&value,encoded+8,4);assert(value==5);
+    info.code=0;kernel_signal_encode_info(encoded,&info,0,0);
+    memcpy(&value,encoded+24,4);assert(!value);
+    kernel_signal_encode_info(encoded,&info,1,UINT64_C(0x123456789));
+    uint64_t address;memcpy(&address,encoded+16,8);assert(address==UINT64_C(0x123456789));
+    assert(!kernel_signal_wait_take(&leader,&info) && !info.signal);
+    kernel_cpu_current()->current=previous;
+    puts("SIGCHLD: blocked default stop policy, protected pending payload and common ABI encoding passed");
     /* The caller's real target owner already covers a self-representing
      * leader; a distinct group container still needs a cross-unlock borrow. */
     assert(signal_send_leader(&leader, &extra) == &leader && !extra);

@@ -641,6 +641,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->child_minor_faults = leader->child_minor_faults;
         task->child_major_faults = leader->child_major_faults;
         task->group_pending = leader->group_pending;
+        task->group_child_info = leader->group_child_info;
         task->nofile_limit = leader->nofile_limit;
         task->stack_limit = leader->stack_limit;
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)

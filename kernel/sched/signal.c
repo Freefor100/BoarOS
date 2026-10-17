@@ -19,6 +19,26 @@
 #define SIGNAL_STOP 19U
 #define LINUX_WAIT_STOPPED 0x7fU
 
+void kernel_signal_encode_info(void *output,
+    const struct kernel_signal_wait_info *info, int fault, uint64_t fault_address)
+{
+    uint8_t *data = output;
+    memset(data, 0, 128);
+    memcpy(data, &info->signal, 4);
+    memcpy(data + 8, &info->code, 4);
+    if (fault) memcpy(data + 16, &fault_address, 8);
+    else {
+        memcpy(data + 16, &info->sender, 4);
+        memcpy(data + 20, &info->uid, 4);
+        if (info->signal == 17 && info->code > 0 && info->code <= 6)
+            memcpy(data + 24, &info->status, 4);
+    }
+}
+
+static enum kernel_signal_status signal_send_one(
+    struct kernel_task *, uint32_t, kernel_pid_t, int, int16_t,
+    const struct kernel_signal_child_info *);
+
 static struct kernel_task *real_timers;
 static void real_timer_remove(struct kernel_task *leader)
 {
@@ -370,10 +390,14 @@ static void signal_clear_pending_group(struct kernel_task *task,
     struct scheduler_group_cursor cursor;
     scheduler_group_cursor_begin(task, &cursor);
     struct kernel_task *leader = cursor.leader;
-    if (!leader) { task->signal_pending &= ~mask; return; }
-    leader->group_pending &= ~mask;
+    if (!leader) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        task->signal_pending &= ~mask;
+        return;
+    }
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); leader->group_pending &= ~mask; }
     while (cursor.task) {
-        cursor.task->signal_pending &= ~mask;
+        { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); cursor.task->signal_pending &= ~mask; }
         scheduler_group_cursor_next(&cursor);
     }
     scheduler_group_cursor_end(&cursor);
@@ -448,6 +472,7 @@ enum kernel_signal_status kernel_signal_fork(
     }
     child->signal_fault = (struct kernel_signal_fault){0};
     child->signal_pending = 0U;
+    child->signal_child_info = (struct kernel_signal_child_info){0};
     child->signal_blocked = parent->signal_blocked;
     child->signal_wait_mask = 0U;
     child->signal_table_address = 0U;
@@ -509,6 +534,7 @@ enum kernel_signal_status kernel_signal_share(
     child->signal_blocked = parent->signal_blocked;
     child->signal_fault = (struct kernel_signal_fault){0};
     child->signal_pending = 0U;
+    child->signal_child_info = (struct kernel_signal_child_info){0};
     child->signal_wait_mask = 0U;
     memset(child->signal_sender, 0, sizeof(child->signal_sender));
     memset(child->signal_code, 0, sizeof(child->signal_code));
@@ -612,25 +638,29 @@ enum kernel_signal_status kernel_signal_wait_take(
     if (task != kernel_cpu_current()->current || !signal_dispatchable(task) || info == 0)
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     memset(info, 0, sizeof(*info));
-    matching = task->signal_pending & task->signal_wait_mask;
-    leader = signal_group_leader(task);
-    if (matching == 0U && leader != 0) {
-        matching = leader->group_pending & task->signal_wait_mask;
-        shared = matching != 0U;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        matching = task->signal_pending & task->signal_wait_mask;
+        leader = signal_group_leader(task);
+        if (matching == 0U && leader != 0) {
+            matching = leader->group_pending & task->signal_wait_mask;
+            shared = matching != 0U;
+        }
+        if (matching == 0U) return KERNEL_SIGNAL_STATUS_OK;
+        sig = signal_first_set(matching);
+        struct kernel_task *owner = shared ? leader : task;
+        if (shared) leader->group_pending &= ~signal_mask(sig);
+        else task->signal_pending &= ~signal_mask(sig);
+        info->sender = shared ? owner->group_sender[sig - 1] : owner->signal_sender[sig - 1];
+        info->code = shared ? owner->group_signal_code[sig - 1] : owner->signal_code[sig - 1];
+        if (sig == 17) {
+            struct kernel_signal_child_info child = shared ? owner->group_child_info : owner->signal_child_info;
+            info->uid = child.uid;
+            info->status = child.status;
+        }
+        info->signal = sig;
     }
-    if (matching == 0U) return KERNEL_SIGNAL_STATUS_OK;
-    sig = signal_first_set(matching);
-    if (shared) {
-        leader->group_pending &= ~signal_mask(sig);
-        if (sig == 14U) real_timer_rearm(leader);
-        info->sender = leader->group_sender[sig - 1U];
-        info->code = leader->group_signal_code[sig - 1U];
-    } else {
-        task->signal_pending &= ~signal_mask(sig);
-        info->sender = task->signal_sender[sig - 1U];
-        info->code = task->signal_code[sig - 1U];
-    }
-    info->signal = sig;
+    if (shared && sig == 14U) real_timer_rearm(leader);
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -687,9 +717,17 @@ static int signal_wants_sigchld_stop(const struct kernel_task *parent)
         return 0;
     }
     entry = signal_action_of(parent, 17U);
-    return entry != 0 && entry->handler != KERNEL_SIGNAL_DFL &&
-           entry->handler != KERNEL_SIGNAL_IGN &&
-           (entry->flags & LINUX_SA_NOCLDSTOP) == 0U;
+    return entry == 0 || (entry->handler != KERNEL_SIGNAL_IGN &&
+                          (entry->flags & LINUX_SA_NOCLDSTOP) == 0U);
+}
+
+static void signal_send_child(struct kernel_task *parent, struct kernel_task *child,
+    int16_t code, int32_t status)
+{
+    SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(parent));
+    struct kernel_signal_child_info info = {.uid = 0, .status = status};
+    if (representative)
+        (void)signal_send_one(representative, 17, child->tid, 1, code, &info);
 }
 
 void kernel_signal_notify_child_exit(struct kernel_task *child)
@@ -705,7 +743,10 @@ void kernel_signal_notify_child_exit(struct kernel_task *child)
         if (parent) scheduler_task_get_locked(parent);
     }
     if (parent != 0 && kernel_signal_wants_sigchld(parent)) {
-        (void)kernel_signal_send(parent, 17U, child->tid);
+        uint32_t status = child->wait_status;
+        signal_send_child(parent, child,
+            (status & 0x7fU) ? ((status & 0x80U) ? 3 : 2) : 1,
+            (status & 0x7fU) ? (int32_t)(status & 0x7fU) : (int32_t)((status >> 8) & 0xffU));
     }
     wake_waiting_parent(child);
 }
@@ -724,9 +765,9 @@ void kernel_signal_notify_child_stop(struct kernel_task *child,
         if (parent) scheduler_task_get_locked(parent);
     }
     if (parent != 0 && signal_wants_sigchld_stop(parent)) {
-        (void)kernel_signal_send(parent, 17U, child->tid);
+        signal_send_child(parent, child, continued ? 6 : 5,
+            continued ? SIGNAL_CONTINUE : (child->wait_status >> 8) & 0xffU);
     }
-    (void)continued;
     wake_waiting_parent(child);
 }
 
@@ -761,10 +802,10 @@ static void signal_prepare_group(struct kernel_task *task, uint32_t sig)
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         continued = leader->group_stopped != 0;
     }
-    leader->group_pending &= ~clear;
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); leader->group_pending &= ~clear; }
     while (cursor.task) {
         struct kernel_task *member = cursor.task;
-        member->signal_pending &= ~clear;
+        { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); member->signal_pending &= ~clear; }
         if (sig == SIGNAL_CONTINUE) signal_resume_stopped(member);
         scheduler_group_cursor_next(&cursor);
     }
@@ -857,7 +898,8 @@ static struct kernel_task *signal_send_leader(struct kernel_task *target,
 
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid,
-    int process_directed, int16_t code)
+    int process_directed, int16_t code,
+    const struct kernel_signal_child_info *child_info)
 {
     struct kernel_task *leader;
     struct kernel_task *wake_target;
@@ -886,25 +928,27 @@ static enum kernel_signal_status signal_send_one(
         selected = signal_choose_group_member_get(target, sig);
         wake_target = selected;
     }
-    if (signal_ignored_unblocked(wake_target, sig)) {
-        return KERNEL_SIGNAL_STATUS_OK;
-    }
-    pending = process_directed ? &leader->group_pending
-                               : &target->signal_pending;
-    senders = process_directed ? leader->group_sender
-                               : target->signal_sender;
-    bit = signal_mask(sig);
-    if ((*pending & bit) != 0U) {
-        return KERNEL_SIGNAL_STATUS_OK;
-    }
-    *pending |= bit;
-    senders[sig - 1U] = (uint32_t)sender_tid;
-    if (process_directed) leader->group_signal_code[sig - 1U] = code;
-    else target->signal_code[sig - 1U] = code;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (signal_ignored_unblocked(wake_target, sig)) return KERNEL_SIGNAL_STATUS_OK;
+        pending = process_directed ? &leader->group_pending : &target->signal_pending;
+        senders = process_directed ? leader->group_sender : target->signal_sender;
+        bit = signal_mask(sig);
+        /* 位与载荷共同发布；标准信号合并时保留尚未消费的首个事件。 */
+        if ((*pending & bit) != 0U) return KERNEL_SIGNAL_STATUS_OK;
+        senders[sig - 1] = (uint32_t)sender_tid;
+        if (process_directed) leader->group_signal_code[sig - 1] = code;
+        else target->signal_code[sig - 1] = code;
+        if (sig == 17) {
+            struct kernel_signal_child_info info = child_info ? *child_info : (struct kernel_signal_child_info){0};
+            if (process_directed) leader->group_child_info = info;
+            else target->signal_child_info = info;
+        }
+        *pending |= bit;
 #if BOAROS_USER_SMP
-    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      scheduler_user_request_locked(wake_target); }
+        scheduler_user_request_locked(wake_target);
 #endif
+    }
     if (wake_target != 0 && signal_wants_signal(wake_target, sig) &&
         kernel_scheduler_wake_signal(wake_target) !=
             KERNEL_SCHEDULER_STATUS_OK) {
@@ -922,13 +966,13 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
     if (representative == 0) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
-    return signal_send_one(representative, sig, sender_tid, 1, 0);
+    return signal_send_one(representative, sig, sender_tid, 1, 0, 0);
 }
 
 enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, uint32_t sig)
 {
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(target));
-    return representative ? signal_send_one(representative, sig, 0, 1, 128)
+    return representative ? signal_send_one(representative, sig, 0, 1, 128, 0)
         : KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
 }
 
@@ -939,7 +983,7 @@ void kernel_signal_timer_expire(void)
         struct kernel_task *leader = real_timers;
         real_timer_remove(leader);
         SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
-        if (representative && signal_send_one(representative, 14U, 0, 1, 128) != KERNEL_SIGNAL_STATUS_OK)
+        if (representative && signal_send_one(representative, 14U, 0, 1, 128, 0) != KERNEL_SIGNAL_STATUS_OK)
             __builtin_trap();
     }
 }
@@ -947,7 +991,7 @@ void kernel_signal_timer_expire(void)
 enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid)
 {
-    return signal_send_one(target, sig, sender_tid, 0, -6);
+    return signal_send_one(target, sig, sender_tid, 0, -6, 0);
 }
 
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
@@ -972,7 +1016,7 @@ static uint32_t signal_target_group(struct kernel_task *leader, uint32_t sig,
     if (!deliver) return 1;
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
     if (!representative) return 1;
-    return signal_send_one(representative, sig, sender, 1, 0) == KERNEL_SIGNAL_STATUS_OK;
+    return signal_send_one(representative, sig, sender, 1, 0, 0) == KERNEL_SIGNAL_STATUS_OK;
 }
 
 static uint32_t signal_target_identities(struct kernel_task *caller, int64_t pid,
@@ -1272,24 +1316,43 @@ enum kernel_signal_select_result kernel_signal_select(
     struct kernel_signal_delivery *delivery)
 {
     for (;;) {
-        struct kernel_task *leader = signal_group_leader(task);
-        struct kernel_signal_fault fault = task->signal_fault;
-        uint64_t pending = fault.signal ? signal_mask(fault.signal) :
-            task->signal_pending & ~task->signal_blocked;
+        struct kernel_task *leader;
+        struct kernel_signal_fault fault;
+        struct kernel_signal_wait_info info = {0};
+        uint64_t pending;
         int shared = 0;
-        uint32_t sig;
+        uint32_t sig = 0;
         const struct kernel_signal_action *entry;
-
-        if (task->terminate_requested != 0U) {
-            delivery->exit_reason = (uint32_t)KERNEL_THREAD_EXIT_SYSCALL;
-            delivery->exit_status = 0U;
-            delivery->exit_detail = 0U;
-            return KERNEL_SIGNAL_SELECT_EXIT;
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            leader = signal_group_leader(task);
+            fault = task->signal_fault;
+            pending = fault.signal ? signal_mask(fault.signal) : task->signal_pending & ~task->signal_blocked;
+            if (task->terminate_requested) {
+                delivery->exit_reason = KERNEL_THREAD_EXIT_SYSCALL;
+                delivery->exit_status = delivery->exit_detail = 0;
+                return KERNEL_SIGNAL_SELECT_EXIT;
+            }
+            if (!pending && leader) {
+                pending = leader->group_pending & ~task->signal_blocked;
+                shared = pending != 0;
+            }
+            if (pending) {
+                sig = signal_first_set(pending);
+                if (fault.signal) task->signal_fault = (struct kernel_signal_fault){0};
+                else if (shared) leader->group_pending &= ~signal_mask(sig);
+                else task->signal_pending &= ~signal_mask(sig);
+                info.signal = sig;
+                info.sender = shared ? leader->group_sender[sig - 1] : task->signal_sender[sig - 1];
+                info.code = fault.signal ? fault.code : shared ? leader->group_signal_code[sig - 1] : task->signal_code[sig - 1];
+                if (!fault.signal && sig == 17) {
+                    struct kernel_signal_child_info child = shared ? leader->group_child_info : task->signal_child_info;
+                    info.uid = child.uid;
+                    info.status = child.status;
+                }
+            }
         }
-        if (pending == 0U && leader != 0) {
-            pending = leader->group_pending & ~task->signal_blocked;
-            shared = pending != 0U;
-        }
+        if (shared && sig == 14) real_timer_rearm(leader);
         if (pending == 0U) {
             if (task->signal_restore_mask != 0U) {
                 enum kernel_wait_wake_reason reason;
@@ -1303,24 +1366,14 @@ enum kernel_signal_select_result kernel_signal_select(
             }
             return KERNEL_SIGNAL_SELECT_NONE;
         }
-        sig = signal_first_set(pending);
-        if (fault.signal) {
-            task->signal_fault = (struct kernel_signal_fault){0};
-        } else if (shared) {
-            leader->group_pending &= ~signal_mask(sig);
-            if (sig == 14U) real_timer_rearm(leader);
-        } else {
-            task->signal_pending &= ~signal_mask(sig);
-        }
         entry = signal_action_of(task, sig);
         if (entry != 0 && entry->handler != KERNEL_SIGNAL_DFL &&
             entry->handler != KERNEL_SIGNAL_IGN) {
             delivery->signal = sig;
-            delivery->sender = shared
-                                   ? leader->group_sender[sig - 1U]
-                                   : task->signal_sender[sig - 1U];
-            delivery->code = fault.signal ? fault.code :
-                shared ? leader->group_signal_code[sig - 1U] : task->signal_code[sig - 1U];
+            delivery->sender = info.sender;
+            delivery->code = info.code;
+            delivery->uid = info.uid;
+            delivery->status = info.status;
             delivery->fault = fault.signal != 0;
             delivery->fault_address = fault.address;
             delivery->handler = entry->handler;
