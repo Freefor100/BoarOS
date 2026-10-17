@@ -202,7 +202,7 @@ int main(void)
     assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
     kernel_scheduler_ack_user_service();
     assert(!kernel_scheduler_user_service_pending());
-    assert(tasks[0].service_migrations==2 && tasks[0].cpu_mask==2);
+    assert(active==&cpus[0] && active->current==&tasks[0] && tasks[0].user_service && tasks[0].cpu_mask==2);
     /* 实际任务临时服务不能把来源CPU的FIFO运行资格让给同级任务。 */
     assert(!kernel_sched_policy_set(&tasks[0].scheduling,KERNEL_SCHED_FIFO,40,0));
     kernel_scheduler_leave_user_service();

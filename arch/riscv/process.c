@@ -18,8 +18,6 @@ enum kernel_scheduler_status riscv_process_prepare_clone(
     riscv_fpu_state_save(&parent->fpu);
     child->fpu = parent->fpu;
     *frame = *parent_frame;
-    frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-                     RISCV_SSTATUS_FS_CLEAN;
     frame->a0 = 0U;
     frame->sepc += 4U;
     frame->scause = 0U;

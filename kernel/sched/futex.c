@@ -116,7 +116,6 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
             futex_key_requeue(task, target);
             enum kernel_scheduler_status status = kernel_wait_node_move(node, futex_bucket(target));
             if (status == KERNEL_SCHEDULER_STATUS_OK) {
-                task->wait_queue = node->queue;
                 moved++;
             } else if (status != KERNEL_SCHEDULER_STATUS_EMPTY) __builtin_trap();
             kernel_wait_task_unpin(task);

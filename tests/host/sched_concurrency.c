@@ -393,7 +393,7 @@ static void group_exit_work(void)
         kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
         struct kernel_task *leader = &tasks[0];
         for (unsigned i = 0; i < members; i++) {
-            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY};
+            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY, .magic = KERNEL_THREAD_MAGIC, .user_ticks = i+1, .kernel_ticks = 2*(i+1)};
             tasks[i].group_leader = leader;
             tasks[i].group_next = &tasks[(i + 1) % members];
             tasks[i].group_previous = &tasks[(i + members - 1) % members];
@@ -408,6 +408,12 @@ static void group_exit_work(void)
                 scheduler_task_publish_locked(&unrelated[i]);
             }
         }
+        uint64_t user, kernel, child_user, child_kernel;
+        leader->child_user_ticks=7;leader->child_kernel_ticks=9;
+        group_lock_calls=0;
+        kernel_task_cpu_ticks(&tasks[members-1],&user,&kernel,&child_user,&child_kernel);
+        assert(user==members*(members+1)/2 && kernel==members*(members+1));
+        assert(child_user==7 && child_kernel==9 && group_lock_calls<=32*members);
         group_lock_calls = 0;
         process_group_request_exit(&tasks[members - 1], KERNEL_THREAD_EXIT_SYSCALL, 42, 0);
         assert(leader->group_exiting && leader->completion.status == 42);

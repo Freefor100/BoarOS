@@ -33,10 +33,6 @@ static __attribute__((noinline)) void register_waiter(struct kernel_rwlock *lock
     if (lock->pending_tail) lock->pending_tail->next = waiter;
     else lock->pending_head = waiter;
     lock->pending_tail = waiter;
-    if (waiter->write) {
-        if (lock->writers_waiting == UINT32_MAX) __builtin_trap();
-        lock->writers_waiting++;
-    }
 }
 /* waiter仅竞争时驻留慢路径栈；返回前结束token，且对象raw仍由调用者持有。 */
 static __attribute__((noinline)) uint64_t acquire_waiter(struct kernel_rwlock *lock,
@@ -184,8 +180,7 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
                 lock->pending_head = next->next;
                 if (!lock->pending_head) lock->pending_tail = 0;
                 if (next->write) {
-                    if (!lock->writers_waiting || lock->readers || lock->writer) __builtin_trap();
-                    lock->writers_waiting--;
+                    if (lock->readers || lock->writer) __builtin_trap();
                     lock->writer = next->owner;
                 } else {
                     if (lock->readers == UINT32_MAX) __builtin_trap();

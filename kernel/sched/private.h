@@ -119,8 +119,9 @@ struct kernel_task {
     struct kernel_sched_node service_node, reservation_node;
     struct kernel_cpu *reservation_cpu;
     uint32_t user_slice_expired;
-    uint64_t service_entries, service_migrations;
+#if BOAROS_COST_DIAGNOSTICS
     uint64_t service_started_ticks, service_running_ns;
+#endif
 #endif
     unsigned accounted;
     struct kernel_thread_join *join;
@@ -141,16 +142,12 @@ struct kernel_task {
     uint64_t clear_tid_address;
     uint64_t robust_list_head;
     struct kernel_wait_record wait;
-    struct kernel_wait_queue *wait_queue;
-    uint64_t wakeup_deadline;
     /* Intrusive ordered index over tasks with a deadline, keyed by
-     * (wakeup_deadline, tid); maintained with interrupts disabled. */
+     * (wait.deadline, tid); maintained with interrupts disabled. */
     struct kernel_task *deadline_left;
     struct kernel_task *deadline_right;
     int8_t deadline_height;
     uint8_t deadline_indexed;
-    uint32_t wake_reason;
-    uint32_t wait_interruptible;
     struct kernel_syscall_restart_state syscall_restart;
     struct kernel_socket_read_request *socket_read_request;
     struct kernel_socket_write_request *socket_write_request;
@@ -363,6 +360,8 @@ enum kernel_scheduler_status scheduler_switch_claimed(
     struct kernel_task *previous, struct kernel_task *next);
 void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
                               uint64_t now_ns);
+uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu);
+void scheduler_arm_timer(uint64_t deadline);
 void scheduler_rearm_timer(void);
 /* IRQ关闭；CPU/current借用只覆盖决策，架构切换后不得继续使用缓存值。 */
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues);

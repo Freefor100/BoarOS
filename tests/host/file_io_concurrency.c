@@ -441,7 +441,7 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
     assert(!pthread_create(&seeking,0,crossing_seek,&seeker));
     for(;;) {
         unsigned waiting;
-        { KERNEL_RAW_SCOPE(guard,&control->offset_lock.lock.metadata);waiting=control->offset_lock.lock.writers_waiting; }
+        { KERNEL_RAW_SCOPE(guard,&control->offset_lock.lock.metadata);waiting=control->offset_lock.lock.pending_head!=NULL; }
         if(waiting)break;
         sched_yield();
     }
@@ -462,7 +462,7 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
     for (;;) {
         unsigned waiting;
         { KERNEL_RAW_SCOPE(guard,&node->write_operation.lock.metadata);
-          waiting=node->write_operation.lock.writers_waiting; }
+          waiting=node->write_operation.lock.pending_head!=NULL; }
         if (waiting) break;
         sched_yield();
     }

@@ -240,6 +240,4 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
     fpu->fcsr = fcsr;
     fpu->saved = 1U;
     riscv_fpu_state_restore(fpu);
-    frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-                     RISCV_SSTATUS_FS_CLEAN;
 }
