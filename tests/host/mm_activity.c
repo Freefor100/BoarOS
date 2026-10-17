@@ -55,9 +55,15 @@ enum physical_page_status __wrap_physical_page_map_owned(const struct physical_p
     if (fail_copy && address==failed_page) { fail_copy=0; return PHYSICAL_PAGE_STATUS_INVALID; }
     return __real_physical_page_map_owned(a,address,pointer);
 }
-enum riscv_sv39_status __real_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *,uint64_t *,uint64_t,uint64_t *);
-enum riscv_sv39_status __wrap_riscv_sv39_user_next_owned(struct riscv_sv39_user_space *space,uint64_t *cursor,uint64_t end,uint64_t *address)
-{ if (sparse) walk_calls++; return __real_riscv_sv39_user_next_owned(space,cursor,end,address); }
+enum riscv_sv39_status __real_riscv_sv39_user_detach_range(struct riscv_sv39_user_space *,uint64_t,uint64_t,
+    struct kernel_mm_detach_cursor *,struct kernel_mm_retirement *,void (*)(void *,uint64_t,uint64_t),void *);
+enum riscv_sv39_status __wrap_riscv_sv39_user_detach_range(struct riscv_sv39_user_space *space,uint64_t start,uint64_t end,
+    struct kernel_mm_detach_cursor *cursor,struct kernel_mm_retirement *batch,
+    void (*before_detach)(void *,uint64_t,uint64_t),void *owner)
+{
+    if (sparse) walk_calls++;
+    return __real_riscv_sv39_user_detach_range(space,start,end,cursor,batch,before_detach,owner);
+}
 #endif
 static void await(unsigned *flag)
 { while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) sched_yield(); }
@@ -99,6 +105,8 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
 #endif
     /* 修改者已采样空集合；CPU1随后首次进入，不能靠本次远端通知。 */
     if (sample_activation) { publish(&sampled); await(&allow_send); }
+    mm_test_fence(size==BOAROS_PAGE_SIZE?address:UINT64_MAX,0);
+    if (instructions) mm_test_fence(0,1);
 }
 static void *modify(void *unused)
 {
@@ -271,11 +279,15 @@ int main(void)
     before_flush = flushes; before_instructions = instruction_sync;
     assert(!kernel_mm_activate(&mm, kernel_context));
     assert(flushes == before_flush && instruction_sync == before_instructions);
+    before_flush=flushes; before_instructions=instruction_sync;
     assert(!kernel_mm_mprotect(&mm, 0x40000, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    assert(flushes==before_flush+1 && instruction_sync==before_instructions);
     before_flush = flushes; before_instructions = instruction_sync;
     assert(!kernel_mm_activate(&mm, kernel_context));
     assert(flushes == before_flush + 1 && instruction_sync == before_instructions);
+    before_flush=flushes; before_instructions=instruction_sync;
     assert(!kernel_mm_mprotect(&mm, 0x40000, BOAROS_PAGE_SIZE, KERNEL_MM_READ|KERNEL_MM_EXECUTE));
+    assert(flushes==before_flush+1 && instruction_sync==before_instructions+1);
     before_flush = flushes; before_instructions = instruction_sync;
     assert(!kernel_mm_activate(&mm, kernel_context));
     assert(flushes == before_flush + 1 && instruction_sync == before_instructions + 1);
@@ -325,7 +337,8 @@ int main(void)
     assert(!kernel_copy_to_user(&mm,far,&byte,1,&copied) && !expect_nonleaf_sync);
     sparse=1;
     assert(!kernel_mm_munmap(&mm,address,far+BOAROS_PAGE_SIZE-address));
-    sparse=0; assert(walk_calls<=4); /* 64GiB空洞不按虚拟页枚举。 */
+    sparse=0; fprintf(stderr,"64GiB sparse detach batches=%u\n",walk_calls);
+    assert(walk_calls && walk_calls<=256); /* 64GiB空洞不按虚拟页枚举。 */
 #endif
     mm_test_context = 0; assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));

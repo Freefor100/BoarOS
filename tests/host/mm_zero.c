@@ -8,13 +8,13 @@ void mm_test_attach(unsigned);
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator pages;
 static struct arch_mmu_page_table kernel;
-static unsigned access_calls;
+static unsigned access_calls, fences;
 static void *access(uint64_t physical)
 { access_calls++; return physical < sizeof(pool) ? pool + physical : 0; }
 void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_unavailable(void) { abort(); }
 void mm_test_fence(uint64_t address, int instructions)
-{ (void)address; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+{ (void)address; (void)instructions; fences++; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 static uint64_t allocate(void)
 {
     uint64_t physical;
@@ -38,6 +38,51 @@ static void drain(struct kernel_mm_retirement *batch)
     for (unsigned i = 0; i < batch->count; i++)
         assert(!physical_page_release(&pages, batch->pages[i]));
     batch->count = 0;
+}
+static unsigned detached;
+static void before_detach(void *owner,uint64_t address,uint64_t physical)
+{
+    struct arch_mmu_user_space *space=owner;
+    uint32_t refs;
+    assert(!physical_page_reference_count(&pages,physical,&refs) && refs);
+    uint64_t cursor=address, found;
+    assert(!arch_mmu_user_next_owned(space,&cursor,address+BOAROS_PAGE_SIZE,&found) && found==address);
+    detached++;
+}
+static void detach(struct arch_mmu_user_space *space,uint64_t start,uint64_t end,unsigned expected)
+{
+    struct kernel_mm_detach_cursor cursor={0};
+    unsigned calls=0; detached=0;
+    enum arch_mmu_status status;
+    do {
+        struct kernel_mm_retirement batch={0};
+        status=arch_mmu_user_detach_range(space,start,end,&cursor,&batch,before_detach,space);
+        assert(status==ARCH_MMU_STATUS_OK || status==ARCH_MMU_STATUS_NOT_MAPPED);
+        assert(batch.count<=KERNEL_MM_RETIRE_CAPACITY);
+        if (batch.count) drain(&batch);
+        assert(++calls<128);
+    } while (status==ARCH_MMU_STATUS_OK);
+    assert(detached==expected);
+}
+static void range_detach(void)
+{
+    struct arch_mmu_user_space space={0}, child={0};
+    assert(!arch_mmu_user_space_init(&space,&pages,&kernel));
+    uint64_t start=UINT64_C(0x200000), end=start+600*BOAROS_PAGE_SIZE;
+    for (uint64_t address=start-BOAROS_PAGE_SIZE;address<=end;address+=BOAROS_PAGE_SIZE) {
+        assert(!arch_mmu_user_map_zeroed_page(&space,address,ARCH_MMU_READ|ARCH_MMU_WRITE));
+        if ((address/BOAROS_PAGE_SIZE)%3==0) {
+            unsigned before=fences;
+            assert(!arch_mmu_user_protect_owned_page(&space,address,0) && fences==before);
+        }
+    }
+    assert(!arch_mmu_user_space_fork_prepare(&child,&space,0,0));
+    /* COW、PROT_NONE及部分覆盖的边界表都走同一个有界摘除路径。 */
+    detach(&space,start,end,600);
+    assert(space.leaf_pages+space.protected_pages==2 && space.table_pages>1);
+    detach(&space,start-BOAROS_PAGE_SIZE,end+BOAROS_PAGE_SIZE,2);
+    assert(!space.leaf_pages && !space.protected_pages && !space.cow_pages && space.table_pages==1);
+    assert(!arch_mmu_user_space_destroy(&child) && !arch_mmu_user_space_destroy(&space));
 }
 int main(void)
 {
@@ -75,6 +120,9 @@ int main(void)
            cursor==far && access_calls-before<=3); /* 不进入 end 外的驻留子树。 */
     assert(!arch_mmu_user_next_owned(&parent,&cursor,far+BOAROS_PAGE_SIZE,&found) && found==far);
     assert(!arch_mmu_user_space_destroy(&parent));
+    assert(physical_page_available(&pages) == baseline);
+
+    range_detach();
     assert(physical_page_available(&pages) == baseline);
 
     take_zero();

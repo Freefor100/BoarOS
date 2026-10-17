@@ -173,6 +173,28 @@ static int create_mm(struct physical_page_allocator *allocator,
     return 1;
 }
 
+static int compact_vmas(struct kernel_heap *heap)
+{
+    struct kernel_vma_set *set=0;
+    if (kernel_vma_set_create(heap,&set)) return 0;
+    const uint64_t base=UINT64_C(0x4000000);
+    for (unsigned i=0;i<256;i++) {
+        struct kernel_vma vma={.start=base+i*BOAROS_PAGE_SIZE,.end=base+(i+1)*BOAROS_PAGE_SIZE,
+            .permissions=KERNEL_MM_READ|((i&1)?KERNEL_MM_WRITE:0),
+            .maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS,.kind=KERNEL_VMA_KIND_ANONYMOUS,
+            .role=KERNEL_VMA_ROLE_MMAP,.fault_policy=KERNEL_VMA_FAULT_DEMAND_ZERO};
+        if (kernel_vma_set_insert(set,&vma)) return 0;
+    }
+    if (kernel_vma_set_count(set)!=256) return 0;
+    struct kernel_vma_edit edit;
+    if (kernel_vma_set_prepare_protect(set,base,base+256*BOAROS_PAGE_SIZE,KERNEL_MM_READ,&edit) ||
+        kernel_vma_set_commit_edit(set,&edit) || kernel_vma_set_count(set)!=1) return 0;
+    struct kernel_vma merged;
+    if (kernel_vma_set_get_at(set,0,&merged) || merged.start!=base ||
+        merged.end!=base+256*BOAROS_PAGE_SIZE || merged.permissions!=KERNEL_MM_READ) return 0;
+    return !kernel_vma_set_destroy(&set);
+}
+
 unsigned long run_all_vma_cases(void)
 {
     struct physical_page_allocator allocator;
@@ -215,6 +237,7 @@ unsigned long run_all_vma_cases(void)
     enum physical_page_status page_status;
 
     if (!setup(&allocator, &kernel_table, &heap, &baseline) ||
+        !compact_vmas(&heap) ||
         !create_mm(&allocator, &kernel_table, &parent) ||
         kernel_mm_vma_enable(&parent, &foreign_heap) !=
             KERNEL_MM_STATUS_INVALID_ARGUMENT ||
@@ -332,10 +355,11 @@ unsigned long run_all_vma_cases(void)
     }
     use_test_satp = 1;
     test_satp = parent_satp ^ UINT64_C(1);
+    /* 非当前SATP同样检查VMA并接受已满足访问权限的页。 */
     if (kernel_mm_resolve_user_fault(&parent,
-                                     VMA_TEST_STACK_BASE,
-                                     KERNEL_MM_READ) !=
-            KERNEL_MM_STATUS_STATE) {
+                                     VMA_TEST_TEXT_BASE,
+                                     KERNEL_MM_EXECUTE) !=
+            KERNEL_MM_STATUS_OK) {
         use_test_satp = 0;
         return 4U;
     }
@@ -498,7 +522,7 @@ unsigned long run_all_vma_cases(void)
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_TEXT_BASE,
                                      KERNEL_MM_EXECUTE) !=
-            KERNEL_MM_STATUS_ADDRESS_SPACE ||
+            KERNEL_MM_STATUS_OK ||
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_POLICY_BASE,
                                      KERNEL_MM_READ) !=
@@ -510,7 +534,7 @@ unsigned long run_all_vma_cases(void)
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_ORPHAN_PTE_BASE,
                                      KERNEL_MM_READ) !=
-            KERNEL_MM_STATUS_ADDRESS_SPACE ||
+            KERNEL_MM_STATUS_NOT_MAPPED ||
         kernel_mm_resolve_user_fault(
             &parent,
             RISCV_SV39_USER_LIMIT,
@@ -850,7 +874,7 @@ unsigned long run_all_vma_cases(void)
     if (kernel_mm_resolve_user_fault(
             &cleanup_mm,
             VMA_TEST_POLICY_BASE + BOAROS_PAGE_SIZE,
-            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_ADDRESS_SPACE ||
+            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_PAGE_ACCESS ||
         fault_page_address == 0U) {
         force_fault_page_access_failure = 0;
         use_test_satp = 0;

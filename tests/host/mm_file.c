@@ -1,4 +1,5 @@
 #include <kernel/mm_backend.h>
+#include <kernel/memory_object.h>
 #include <kernel/futex.h>
 #include <kernel/uaccess.h>
 #include <kernel/tmpfs.h>
@@ -26,7 +27,7 @@ static struct kernel_vfs_mount *mount;
 static struct kernel_open_file_description *controller;
 static struct kernel_mm views[5];
 static uint64_t roots[5], target;
-static unsigned capture, entered[5], resume, fail_heap, fail_page;
+static unsigned capture, entered[5], resume, fail_heap, fail_page, capture_allocate;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
 {
@@ -37,7 +38,15 @@ enum physical_page_status __real_physical_page_allocate(struct physical_page_all
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
 {
     if (fail_page && !--fail_page) return PHYSICAL_PAGE_STATUS_EMPTY;
-    return __real_physical_page_allocate(a,out);
+    enum physical_page_status status=__real_physical_page_allocate(a,out);
+    unsigned id=kernel_cpu_current()->hardware_id;
+    if (!status && id==1 && !kernel_io_context_current()->locks &&
+        __atomic_exchange_n(&capture_allocate,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&entered[id],1,__ATOMIC_RELEASE);
+        while (!(__atomic_load_n(&resume,__ATOMIC_ACQUIRE)&(1U<<id))) sched_yield();
+    }
+    return status;
 }
 static enum kernel_uaccess_status results[5];
 static unsigned char read_byte(struct kernel_mm *,uint64_t);
@@ -123,7 +132,7 @@ static void private_case(void)
 static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p, uint64_t *out) { *out=(uintptr_t)p; return 1; }
 void mm_test_fence(uint64_t v, int instructions)
-{ (void)v; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+{ (void)v; (void)instructions; assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
     struct kernel_open_file_page_preparation *);
 int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
@@ -137,6 +146,18 @@ int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_descrip
         while (!(__atomic_load_n(&resume,__ATOMIC_ACQUIRE)&(1U<<id))) sched_yield();
     }
     return result;
+}
+enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(struct kernel_memory_object *,uint64_t,uint64_t *,int *);
+enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(struct kernel_memory_object *object,uint64_t index,uint64_t *physical,int *created)
+{
+    enum kernel_memory_object_status status=__real_kernel_memory_object_prepare_page(object,index,physical,created);
+    unsigned id=kernel_cpu_current()->hardware_id;
+    if (!status && id==1 && __atomic_exchange_n(&capture_allocate,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
+        __atomic_store_n(&entered[id],1,__ATOMIC_RELEASE);
+        while (!(__atomic_load_n(&resume,__ATOMIC_ACQUIRE)&(1U<<id))) sched_yield();
+    }
+    return status;
 }
 static void *fault(void *arg)
 {
@@ -225,6 +246,62 @@ static void stale_shrink(void)
     assert(read_byte(&child,target)==0);
     mm_test_context=roots[1];
 }
+/* 同一叶表的最后一个resident由truncate移除，VMA完全不变。
+ * 暂停点持有真实候选页引用，不能用人为删PTE代替文件回调。 */
+static void adjacent_table_removal(void)
+{
+    struct kernel_open_file_description *other=0;
+    int error;
+    assert(!kernel_open_file_create_mode(&heap,mount,"/adjacent-target",0600,&other,&error) && !error);
+    other->open_flags=2;
+    assert(!kernel_vfs_ftruncate(&other->file,BOAROS_PAGE_SIZE));
+    const uint64_t base=UINT64_C(0x80000000);
+    for (unsigned kind=0;kind<3;kind++) for (unsigned outcome=0;outcome<4;outcome++) {
+        assert(!kernel_vfs_ftruncate(&controller->file,BOAROS_PAGE_SIZE));
+        uint64_t mapped;
+        struct kernel_open_file_description *owner=controller;
+        assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(&parent,&owner,
+            base,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped));
+        target=base+BOAROS_PAGE_SIZE;
+        if (kind<2) assert(!kernel_mm_mmap_anonymous(&parent,target,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|(kind?KERNEL_MM_MAP_SHARED:0),&mapped));
+        else {
+            owner=other;
+            assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(&parent,&owner,
+                target,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,
+                KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped));
+        }
+        (void)read_byte(&parent,base);
+        struct kernel_vma before,after;
+        assert(!kernel_mm_vma_lookup(&parent,target,&before));
+        memset(entered,0,sizeof(entered)); resume=0;
+        capture=kind==2?2:0; capture_allocate=kind<2;
+        pthread_t worker;
+        assert(!pthread_create(&worker,0,fault,(void *)(uintptr_t)1)); ready(1);
+        assert(!kernel_vfs_ftruncate(&controller->file,0));
+        assert(!kernel_mm_vma_lookup(&parent,target,&after) && !memcmp(&before,&after,sizeof(before)));
+        struct kernel_mm_mapping mapping;
+        assert(kernel_mm_lookup(&parent,base,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+        if (outcome==1) fail_page=1;
+        if (outcome==2) {
+            unsigned char byte=0x44; size_t done;
+            assert(!kernel_copy_to_user(&parent,target,&byte,1,&done) && done==1);
+        }
+        if (outcome==3) assert(!kernel_mm_mmap_anonymous(&parent,target,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&mapped));
+        __atomic_store_n(&resume,2,__ATOMIC_RELEASE);
+        assert(!pthread_join(worker,0)); fail_page=0;
+        if (outcome==1) assert(results[1]==KERNEL_UACCESS_STATUS_FAULT &&
+            kernel_mm_lookup(&parent,target,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+        else assert(!results[1] && read_byte(&parent,target+1)==0x81);
+        assert(!kernel_mm_munmap(&parent,base,2*BOAROS_PAGE_SIZE));
+        assert(!physical_page_allocator_audit(&pages));
+        fprintf(stderr,"adjacent table removal kind=%u outcome=%u OK\n",kind,outcome);
+    }
+    assert(!kernel_open_file_release(&other) && !kernel_vfs_unlink(mount,"/adjacent-target"));
+    assert(!kernel_vfs_ftruncate(&controller->file,3*BOAROS_PAGE_SIZE));
+}
 static void futex_key_lifetime(void)
 {
     struct kernel_open_file_description *file = 0;
@@ -311,7 +388,7 @@ int main(void)
     byte=0; assert(!kernel_copy_from_user(&child,&byte,mapped,1,&done) && done==1 && byte==0x73);
     mm_test_context=roots[1];
     futex_key_lifetime();
-    first_fault(2); first_fault(4); stale_shrink(); fault_failures(); unregister_callback(); private_case();
+    first_fault(2); first_fault(4); adjacent_table_removal(); stale_shrink(); fault_failures(); unregister_callback(); private_case();
     mm_test_context=0;
     for (unsigned id=1; id<=4; id++) assert(!kernel_mm_release(&views[id]));
     assert(!kernel_mm_release(&child) && !kernel_mm_release(&parent));

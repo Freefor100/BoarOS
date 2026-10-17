@@ -168,9 +168,10 @@ enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
     uint64_t start,
     uint64_t end);
 /* MM短保护内只摘PTE/交接owner，无分配、flush、物理释放。 */
-enum riscv_sv39_status riscv_sv39_user_detach_page(
-    struct riscv_sv39_user_space *, uint64_t address,
-    struct kernel_mm_retirement *);
+enum riscv_sv39_status riscv_sv39_user_detach_range(
+    struct riscv_sv39_user_space *, uint64_t start, uint64_t end,
+    struct kernel_mm_detach_cursor *, struct kernel_mm_retirement *,
+    void (*before_detach)(void *, uint64_t, uint64_t), void *);
 enum riscv_sv39_status riscv_sv39_user_leaf_missing(
     struct riscv_sv39_user_space *, uint64_t, unsigned *);
 enum riscv_sv39_status riscv_sv39_user_map_prepared_page(
@@ -195,7 +196,7 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
  * each physical page owned behind an invalid software PTE (PROT_NONE).
  * Missing leaves are unchanged; present leaves retain content.
  */
-/* Same ownership/PROT_NONE contract, with a single page walk and local VA flush. */
+/* Pure PTE update: caller publishes TLB/instruction changes after leaving raw. */
 enum riscv_sv39_status riscv_sv39_user_protect_owned_page(
     struct riscv_sv39_user_space *space, uint64_t address, uint32_t permissions);
 
