@@ -410,8 +410,10 @@ static void udp_read_without_buffer(struct kernel_files *files, struct kernel_mm
           kernel_files_pin(files, fd, &pin, &result) == KERNEL_FILES_STATUS_OK && result == 0, 36);
     struct kernel_socket *socket = kernel_open_file_socket(pin);
     struct kernel_socket_address address = {.family = KERNEL_SOCKET_AF_INET};
-    check(kernel_socket_bind(socket, &address) == 0 && kernel_socket_getname(socket, &address) == 0 &&
-          (address.bytes[0] = 127, address.bytes[3] = 1, kernel_socket_sendto(socket, mm, BUFFER, 8192, &address)) == 8192, 37);
+    check(kernel_socket_bind(socket, &address) == 0 && kernel_socket_getname(socket, &address) == 0, 37);
+    address.bytes[0] = 127; address.bytes[3] = 1;
+    struct kernel_uaccess_iovec iov = {BUFFER, 8192};
+    check(kernel_socket_write_datagram(&pin, mm, &iov, 1, 8192, 0, &address) == 8192, 37);
     fail_page = 1;
     check(kernel_files_read(files, mm, fd, BUFFER, 8192, &result) == KERNEL_FILES_STATUS_OK &&
           result == 8192 && fail_page == 1, 38);

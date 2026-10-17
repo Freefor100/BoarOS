@@ -1009,94 +1009,6 @@ int kernel_socket_accept_check(const struct kernel_socket *socket)
     return socket->listening ? 0 : -KERNEL_EINVAL;
 }
 
-int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
-                         uint64_t user_data, uint64_t size,
-                         const struct kernel_socket_address *address)
-{
-    struct pbuf *payload;
-    ip_addr_t remote;
-    size_t copied = 0;
-    err_t error;
-    uintptr_t old_status;
-    if (socket->type != SOCKET_DGRAM) return -KERNEL_EOPNOTSUPP;
-    if (size > UDP_MAX_PAYLOAD) return -KERNEL_EMSGSIZE;
-    int result = address_import(socket, address, &remote, 0);
-    if (result != 0) return result;
-    old_status = kernel_socket_protocol_enter();
-    payload = pbuf_alloc(PBUF_TRANSPORT, (u16_t)size, PBUF_RAM);
-    kernel_socket_protocol_leave(old_status);
-    if (payload == 0) return -KERNEL_ENOMEM;
-    if (size != 0 &&
-        (kernel_copy_from_user(mm, payload->payload, user_data, (size_t)size,
-                               &copied) != KERNEL_UACCESS_STATUS_OK ||
-         copied != size)) {
-        socket_pbuf_free(payload);
-        return -KERNEL_EFAULT;
-    }
-    old_status = kernel_socket_protocol_enter();
-    error = udp_sendto(socket->udp, payload, &remote, address->port);
-    socket_pbuf_free(payload);
-    kernel_socket_protocol_leave(old_status);
-    if (error == ERR_OK) service_inline();
-    return error == ERR_OK ? (int)size : lwip_error(error);
-}
-
-int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
-                           uint64_t user_data, uint64_t size,
-                           struct kernel_socket_address *address)
-{
-    struct socket_packet *packet;
-    uint8_t chunk[256];
-    size_t wanted;
-    size_t done = 0;
-    int user_fault = 0;
-    uintptr_t old_status;
-    if (socket->type != SOCKET_DGRAM) return -KERNEL_EOPNOTSUPP;
-    service_inline();
-    old_status = kernel_socket_protocol_enter();
-    if (socket->read_request != 0) {
-        kernel_socket_protocol_leave(old_status);
-        return -KERNEL_EAGAIN;
-    }
-    packet = socket->packets_head;
-    if (packet == 0) {
-        kernel_socket_protocol_leave(old_status);
-        return socket->read_closed ? 0 : -KERNEL_EAGAIN;
-    }
-    socket->packets_head = packet->next;
-    if (socket->packets_head == 0) socket->packets_tail = 0;
-    kernel_socket_protocol_leave(old_status);
-    wanted = size < packet->payload->tot_len ? (size_t)size
-                                             : packet->payload->tot_len;
-    while (done < wanted) {
-        size_t length = wanted - done;
-        size_t copied = 0;
-        if (length > sizeof(chunk)) length = sizeof(chunk);
-        if (pbuf_copy_partial(packet->payload, chunk, (u16_t)length,
-                              (u16_t)done) != length) __builtin_trap();
-        enum kernel_uaccess_status access =
-            kernel_copy_to_user(mm, user_data + done, chunk, length,
-                                &copied);
-        if (access != KERNEL_UACCESS_STATUS_OK) {
-            if (access != KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
-            user_fault = 1;
-            break;
-        }
-        done += length;
-    }
-    *address = packet->address;
-    old_status = kernel_socket_protocol_enter();
-    uint32_t charge = packet->payload->tot_len ? packet->payload->tot_len : 1U;
-    if (socket->rx_bytes < charge) __builtin_trap();
-    socket->rx_bytes -= charge;
-    socket_pbuf_free(packet->payload);
-    kernel_socket_protocol_leave(old_status);
-    unix_uncharge(packet);
-    if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
-    return user_fault ? -KERNEL_EFAULT : (int)done;
-}
-
 /* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
 static int socket_receive_empty(const struct kernel_socket *socket, int nonblocking)
 {
@@ -1863,7 +1775,10 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         if (socket->domain != KERNEL_SOCKET_DOMAIN_INET || socket->type != SOCKET_STREAM) { result = -KERNEL_ENOPROTOOPT; break; }
         socket->nodelay = value != 0;
         if (socket->tcp != 0 && !socket->listening) {
-            if (value) tcp_nagle_disable(socket->tcp); else tcp_nagle_enable(socket->tcp);
+            if (value) {
+                tcp_nagle_disable(socket->tcp);
+                tcp_flush_output(socket);
+            } else tcp_nagle_enable(socket->tcp);
         }
         break;
     case KERNEL_SOCKET_V6ONLY:

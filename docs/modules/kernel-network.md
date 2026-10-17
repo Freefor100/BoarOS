@@ -269,6 +269,8 @@ TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect �
 
 ## TCP 发送接纳与复制（2026-10-05）
 
+开启 `TCP_NODELAY` 时先禁用 Nagle，再立即尝试输出已有 unsent 数据。NIC 暂无容量时登记原有 NIC 容量等待，协议内存不足时使用原有 pool 等待；容量事件推动重试，不依赖收到 ACK 或推进定时器。关闭 NODELAY 只恢复 Nagle。用户数据报发送使用任务登记的请求和 iovec cursor，退出清理沿同一请求归还 OFD 和包引用。
+
 INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_write_request`，
 与数据报请求共用退出登记但不拥有数据报 packet。请求持有原 OFD pin，
 `stream_reserve/commit/cancel` 只预留本 socket 的 TCP 接纳字节，按 sndbuf、socket 预算、
