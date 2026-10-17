@@ -57,8 +57,7 @@ static int path_to_backend_name(const struct kernel_vfs_path *path,
 
 static void release_path(struct kernel_heap *heap, char *work)
 {
-    if (kernel_heap_release(heap, work) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(heap, work);
 }
 
 uint64_t kernel_vfs_allocate_mount_id(void)
@@ -403,8 +402,7 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
                                                       : -KERNEL_EIO;
     result = kernel_vfs_path_acquire(parent);
     if (result != 0) {
-        if (kernel_heap_release(adapter->heap, child) !=
-            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(adapter->heap, child);
         return result;
     }
     child->heap = adapter->heap;
@@ -415,8 +413,7 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
         struct kernel_vfs_path *parent_owner = child->parent;
         if (kernel_vfs_path_release(&parent_owner) != 0)
             __builtin_trap();
-        if (kernel_heap_release(adapter->heap, child) !=
-            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(adapter->heap, child);
         return result;
     }
     child->name = child->initial_name;
@@ -585,7 +582,7 @@ static int resolve_object(struct kernel_vfs_path *start,
     current = 0;
 Finish:
     if (current != 0) (void)kernel_vfs_path_release(&current);
-    (void)kernel_heap_release(adapter->heap, work);
+    kernel_heap_release(adapter->heap, work);
     return result;
 }
 
@@ -633,8 +630,7 @@ int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
         result = vfs_open_inode_raw(mount, inode,
                                     mode, &path->file);
     if (result != 0) {
-        if (kernel_heap_release(heap, path) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(heap, path);
         return result;
     }
     path->heap = heap;
@@ -681,9 +677,8 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
         parent = path->parent;
         path->references = 0U;
         if (path->name != path->initial_name)
-            (void)kernel_heap_release(path->heap, path->name);
-        if (kernel_heap_release(path->heap, path) !=
-            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            kernel_heap_release(path->heap, path->name);
+        kernel_heap_release(path->heap, path);
         path = parent;
         *owner = path;
     }
@@ -1139,7 +1134,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                 result = -KERNEL_ENOMEM;
                 break;
             }
-            if (pages != &single && kernel_heap_release(node->instance->heap, pages)) __builtin_trap();
+            if (pages != &single) kernel_heap_release(node->instance->heap, pages);
             pages = larger;
             capacity = count;
         }
@@ -1166,7 +1161,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
             if (physical_page_release(cache->allocator, pages[i].physical_address)) __builtin_trap();
         if (error) { result = error; break; }
     }
-    if (pages != &single && kernel_heap_release(node->instance->heap, pages)) __builtin_trap();
+    if (pages != &single) kernel_heap_release(node->instance->heap, pages);
     return result;
 }
 
@@ -2164,7 +2159,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         node->closed = 1U;
     }
     kernel_file_mapping_destroy(node);
-    (void)kernel_heap_release(node->instance->heap, node);
+    kernel_heap_release(node->instance->heap, node);
     *owner = 0;
     return 0;
 }
@@ -2228,8 +2223,7 @@ static void release_sync_nodes(struct sync_nodes *snapshot)
     for (size_t i = 0; i < snapshot->count; i++)
         if (kernel_vfs_node_release(&snapshot->nodes[i])) __builtin_trap();
     arch_interrupt_restore(irq);
-    if (snapshot->nodes && kernel_heap_release(snapshot->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    if (snapshot->nodes) kernel_heap_release(snapshot->heap, snapshot->nodes);
 }
 
 static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
@@ -2251,7 +2245,7 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
         irq = arch_interrupt_save();
         if (instance->node_count > capacity) {
             arch_interrupt_restore(irq);
-            if (kernel_heap_release(instance->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            kernel_heap_release(instance->heap, snapshot->nodes);
             snapshot->nodes = 0;
             continue;
         }
@@ -2375,7 +2369,7 @@ void kernel_vfs_sync_all(struct kernel_vfs_path *root)
         for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) needed++;
         if (needed > capacity) {
             arch_interrupt_restore(irq);
-            if (kernel_heap_release(heap, paths) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            kernel_heap_release(heap, paths);
             paths = 0;
             continue;
         }
@@ -2391,7 +2385,7 @@ void kernel_vfs_sync_all(struct kernel_vfs_path *root)
     for (size_t i = 0; i < count; i++) (void)kernel_vfs_sync_mount(paths[i]->file.mount, 0);
     for (size_t i = 0; i < count; i++)
         if (kernel_vfs_path_release(&paths[i])) __builtin_trap();
-    if (kernel_heap_release(heap, paths) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(heap, paths);
 }
 
 uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
@@ -2427,9 +2421,15 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
         if (result != 0) kernel_vfs_record_writeback_error(node, result);
     }
 observe:
-    if (*observed_error != node->writeback_error_sequence) {
-        if (result == 0) result = node->writeback_error;
-        *observed_error = node->writeback_error_sequence;
+    /* 后端在CPU0发布错误；比较与推进共享OFD游标不能在两次同步间被抢占。
+     * 此处不等待，也不借用与文件位置无关的offset锁。 */
+    {
+        uintptr_t irq = arch_interrupt_save();
+        if (*observed_error != node->writeback_error_sequence) {
+            if (result == 0) result = node->writeback_error;
+            *observed_error = node->writeback_error_sequence;
+        }
+        arch_interrupt_restore(irq);
     }
     return result;
 }
@@ -2751,7 +2751,7 @@ static int discard_unpublished_node(struct kernel_vfs_node *node)
     if (result) {
         node->next = instance->cleanup_nodes;
         instance->cleanup_nodes = node;
-    } else (void)kernel_heap_release(instance->heap, node);
+    } else kernel_heap_release(instance->heap, node);
     return result;
 }
 

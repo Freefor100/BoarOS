@@ -107,7 +107,7 @@ static enum kernel_files_status create_files(
                                               sizeof(*slots),
                                               (void **)&slots);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        (void)kernel_heap_release(heap, record);
+        kernel_heap_release(heap, record);
         return heap_status == KERNEL_HEAP_STATUS_EMPTY
                    ? KERNEL_FILES_STATUS_NO_MEMORY
                    : KERNEL_FILES_STATUS_STATE;
@@ -178,7 +178,7 @@ enum kernel_files_status kernel_files_check_task_domain(
         if (!description_in_domain(files, owners[i])) status = KERNEL_FILES_STATUS_STATE;
         if (owners[i] && kernel_open_file_release(&owners[i])) __builtin_trap();
     }
-    if (kernel_heap_release(files->heap, owners)) __builtin_trap();
+    kernel_heap_release(files->heap, owners);
     return status;
 }
 
@@ -290,12 +290,11 @@ enum kernel_files_status kernel_files_move(
     return KERNEL_FILES_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_release_allocation(
+void kernel_files_release_allocation(
     struct kernel_files *files,
     void *pointer)
 {
-    (void)kernel_heap_release(files->heap, pointer);
-    return KERNEL_FILES_STATUS_OK;
+    kernel_heap_release(files->heap, pointer);
 }
 
 static enum kernel_files_status cleanup_description(
@@ -562,15 +561,6 @@ int kernel_files_fd_matches(struct kernel_files *files, int64_t fd,
     KERNEL_FILES_SCOPE(guard, files);
     return lookup_locked(files, fd)==description;
 }
-void kernel_files_note(struct kernel_files *files, size_t offset, uint64_t value)
-{
-    if (offset > offsetof(struct kernel_files_statistics, write_chunks) || offset % sizeof(uint64_t)) __builtin_trap();
-    uint64_t *counter=(uint64_t *)((char *)&files->record->statistics+offset);
-    /* 调用计数不改变槽或OFD所有权，不为每个计数重新取得FD表锁。 */
-    __atomic_fetch_add(counter, value, __ATOMIC_RELAXED);
-}
-
-
 enum kernel_files_status kernel_files_pin_data(
     struct kernel_files *files, int64_t fd,
     struct kernel_open_file_description **description, int64_t *result)

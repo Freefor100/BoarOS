@@ -4,15 +4,49 @@
 旧专项名称仅保留历史输入、提交和结果身份。构建/监督入口见
 [兼容模块](../modules/oscomp-compat.md)。
 
-## 2026-10-17 提交边界与 IRQ 保护改动集成
+## 2026-10-17 网络端点与协议保护改动集成
 
-本次将 main `849e29c` 单向合并，保留兼容分支的架构初始化配置、编译器探测和
+本轮从 main `1f7132d` 单向集成端点队列与 lwIP 保护分离、固定用户页的批量发送、
+停止时完成排队请求，以及堆释放、独立文件同步和失效状态清理。保留兼容分支的编译器
+探测、架构初始化配置和 LA 参数覆盖。主线五组网络、文件 I/O、原版 iozone 与具体
+机制见[数据路径实验](data-path-budget-experiments.md)。
+
+最终源码分别重新构建 RV、LA，顺序运行原版 glibc/musl 脚本，各八条，共 32 条命令
+均取得结束输出，四组脚本 status 为零。其中 28 条执行所选测试；其余四条
+`-t 4 -i 11 -i 12 -r 1k -s 1m` 报告“Selected test not available on the version”，
+实际只输出 initial writers/rewriters，不能记为所请求的 pwritev/preadv 测试通过。
+原二进制、脚本、参数、提前停止方式均未替换，没有增加 `-C` 或 `-x`。
+
+RV QEMU 11.1.2、LA RTC 版 11.1.0，单 CPU、1 GiB，宿主 CPU14/15；成本诊断和
+锁调试关闭，ADP0 在线、BAT0 Full，没有并行构建或其他测试 VM。两侧 QEMU/PID 1
+正常退出，堆对象归零，设备错误和超时为零；两张运行盘 `e2fsck -fn` 均返回零。
+结果保留于 `build/network-next-20261017/compat-{rv,la}-final-iozone/`。
+
+下表为这次完整原脚本的单轮值，单位 KiB/s，Min xfer 为 KiB。四进程取原
+`-t 4 -i 0 -i 1 -r 1k -s 1m`，与 main 的多轮小盘对照分开：
+
+| 架构 / libc | 单进程 write | read | reread | 四进程 Parent read | Children read | Min xfer |
+|---|---:|---:|---:|---:|---:|---:|
+| riscv / glibc | 25585 | 56262 | 54982 | 30396.88 | 75264.20 | 515 |
+| riscv / musl | 26603 | 55656 | 54283 | 30962.73 | 68227.42 | 516 |
+| loongarch / glibc | 34400 | 79015 | 78881 | 38578.83 | 120109.41 | 730 |
+| loongarch / musl | 35535 | 73182 | 73818 | 37068.53 | 114871.14 | 731 |
+
+RV 本轮 Children read 高于下方旧单轮记录，Parent 却较低，同时 Min xfer 从约
+987/994 降为 515/516 KiB，明显受原提前停止及收尾影响，不能将 Parent 单值直接
+当作普通读路径速度。主线同参数五组中，RV UP、USER_SMP 单/双核和 LA 的 Parent
+中位数均提高；冷热读、最终 fsync 和仍保留的负值按各自对照报告。下面保留旧轮结果。
+
+## 2026-10-17 提交边界与 IRQ 保护改动集成（main 849e29c）
+
+这一轮将 main `849e29c` 单向合并，保留兼容分支的架构初始化配置、编译器探测和
 可由环境覆盖的 LA 参数；普通 LA 与 contract 产物仍分开。合并后的 63 项宿主测试和
 编译／链接配置正反切换通过。main 的五组 I/O、真实 USER_SMP 和其他负载比较见
 [数据路径实验](data-path-budget-experiments.md)。
 
 合并后分别重新构建 RV、LA，顺序执行原版 iozone 的 glibc/musl 脚本，每组八条命令，
-共 32 条均取得完整完成输出；四组 script status 为零。两侧 PID 1 正常退出、资源归还，
+共 32 条均取得结束输出；其中四条同样报告所选向量测试不可用，只输出默认写测量，
+其余 28 条执行所选测试。四组 script status 为零。两侧 PID 1 正常退出、资源归还，
 `e2fsck -fn` 均返回零。RV QEMU 11.1.2、LA RTC 版 11.1.0，单 CPU、1 GiB，固定宿主 CPU14/15，诊断和锁调试关闭；
 检查时 ADP0 在线、BAT0 Full。这是本地原脚本复测，结果单独保存在
 `build/review-round-20261017/compat-{riscv,loongarch}-iozone/`，不与 main 的不同配置混成一组。

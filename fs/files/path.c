@@ -93,7 +93,7 @@ int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *c
             file->file.mode = kernel_vfs_path_mode(path);
         }
     } else error = kernel_vfs_path_open(path, &file->file);
-    if (error) { if (kernel_heap_release(files->heap, file) != KERNEL_HEAP_STATUS_OK) __builtin_trap(); return error; }
+    if (error) { kernel_heap_release(files->heap, file); return error; }
     if (flags & LINUX_O_DIRECTORY) error = -KERNEL_ENOTDIR;
     if (!error && !(flags & LINUX_O_PATH)) {
         struct kernel_vfs_stat stat;
@@ -115,15 +115,6 @@ int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *c
     if (kernel_files_install_new_owned_at(files, fd, fd_flags, &file) != KERNEL_FILES_STATUS_OK) __builtin_trap();
     reservation.files=0;
     return (int)fd;
-}
-
-static enum kernel_files_status finish_path(struct kernel_files *files,
-                                             char *path)
-{
-    return kernel_files_release_allocation(files, path) ==
-                   KERNEL_FILES_STATUS_OK
-               ? KERNEL_FILES_STATUS_OK
-               : KERNEL_FILES_STATUS_STATE;
 }
 
 /* Capture identity before namespace locking or a storage sleep. */
@@ -236,14 +227,12 @@ enum kernel_files_status kernel_files_openat(
                                                     &start, &mount,
                                                     &result);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, path);
+        kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result != 0) {
         KERNEL_FILES_NOTE(files, open_failures, 1);
-        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
+        kernel_files_release_allocation(files, path);
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -286,13 +275,7 @@ enum kernel_files_status kernel_files_openat(
             continue;
         break;
     }
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-        if (description != 0) {
-            kernel_files_queue_description(files, description);
-            (void)kernel_files_drain_file_cleanup(files);
-        }
-        return KERNEL_FILES_STATUS_STATE;
-    }
+    kernel_files_release_allocation(files, path);
     if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
         if (description != 0) {
             kernel_files_queue_description(files, description);
@@ -499,8 +482,8 @@ enum kernel_files_status kernel_files_symlinkat(
         result = access_status == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT :
                  access_status == KERNEL_UACCESS_STATUS_TOO_LONG ?
                      -KERNEL_ENAMETOOLONG : 0;
-        if (finish_path(files, storage) != KERNEL_FILES_STATUS_OK ||
-            result == 0) return KERNEL_FILES_STATUS_STATE;
+        kernel_files_release_allocation(files, storage);
+        if (result == 0) return KERNEL_FILES_STATUS_STATE;
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -509,15 +492,14 @@ enum kernel_files_status kernel_files_symlinkat(
                                                     KERNEL_FS_PATH_MAX,
                                                     &start, &mount, &result);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, storage);
+        kernel_files_release_allocation(files, storage);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result == 0) {
         result = target_length == 0U ? -KERNEL_ENOENT :
             kernel_vfs_symlink_at(start, kernel_fs_context_root(fs), storage, linkpath);
     }
-    if (finish_path(files, storage) != KERNEL_FILES_STATUS_OK)
-        return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, storage);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -574,7 +556,7 @@ enum kernel_files_status kernel_files_readlinkat(
         if (result) start = 0;
     } else result = kernel_files_path_start(files, fs, dirfd, storage, &start);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, storage);
+        kernel_files_release_allocation(files, storage);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result == 0) {
@@ -591,12 +573,11 @@ enum kernel_files_status kernel_files_readlinkat(
             result = -KERNEL_EFAULT;
         else if (access_status != KERNEL_UACCESS_STATUS_OK ||
                  copied != bytes_read) {
-            (void)finish_path(files, storage);
+            kernel_files_release_allocation(files, storage);
             return KERNEL_FILES_STATUS_STATE;
         }
     }
-    if (finish_path(files, storage) != KERNEL_FILES_STATUS_OK)
-        return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, storage);
     *linux_result = result == 0 ? (int64_t)bytes_read : result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -806,7 +787,7 @@ static enum kernel_files_status stat_at_to_user(
         enum kernel_uaccess_status access = kernel_copy_string_from_user(mm, path,
                                      user_path, KERNEL_FS_PATH_MAX, &length);
         if (access != KERNEL_UACCESS_STATUS_OK) {
-            (void)finish_path(files, path);
+            kernel_files_release_allocation(files, path);
             if (access != KERNEL_UACCESS_STATUS_FAULT && access != KERNEL_UACCESS_STATUS_TOO_LONG)
                 return KERNEL_FILES_STATUS_STATE;
             *linux_result = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT
@@ -830,7 +811,7 @@ static enum kernel_files_status stat_at_to_user(
                     path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &vfs_stat);
         if (!result) fill_linux_vfs_stat(&stat, &vfs_stat);
     }
-    if (path && finish_path(files, path) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    if (path) kernel_files_release_allocation(files, path);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
     int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result, extended);
     if (copied < 0) return KERNEL_FILES_STATUS_STATE;
@@ -888,8 +869,7 @@ enum kernel_files_status kernel_files_faccessat(
     enum kernel_uaccess_status access = kernel_copy_string_from_user(
         mm, path, user_path, KERNEL_FS_PATH_MAX, &length);
     if (access != KERNEL_UACCESS_STATUS_OK) {
-        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK)
-            return KERNEL_FILES_STATUS_STATE;
+        kernel_files_release_allocation(files, path);
         if (access != KERNEL_UACCESS_STATUS_FAULT &&
             access != KERNEL_UACCESS_STATUS_TOO_LONG)
             return KERNEL_FILES_STATUS_STATE;
@@ -910,8 +890,7 @@ enum kernel_files_status kernel_files_faccessat(
          (stat.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) &&
         kernel_vfs_mount_is_readonly(kernel_vfs_path_mount(start)))
         result = -KERNEL_EROFS;
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK)
-        return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -956,21 +935,17 @@ enum kernel_files_status kernel_files_mkdirat(
                                                     &start, &mount,
                                                     &result);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, path);
+        kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result != 0) {
-        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
+        kernel_files_release_allocation(files, path);
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
     result = kernel_vfs_mkdir_at(start, kernel_fs_context_root(fs), path,
                                  mode & ~kernel_fs_context_umask(fs));
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
+    kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -1016,21 +991,17 @@ enum kernel_files_status kernel_files_mknodat(
                                                     &start, &mount,
                                                     &result);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, path);
+        kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result != 0) {
-        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
+        kernel_files_release_allocation(files, path);
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
     result = kernel_vfs_mknod_at(start, kernel_fs_context_root(fs), path,
                                  mode & ~kernel_fs_context_umask(fs), device);
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
+    kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -1079,13 +1050,11 @@ enum kernel_files_status kernel_files_unlinkat(
                                                     &start, &mount,
                                                     &result);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, path);
+        kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result != 0) {
-        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
+        kernel_files_release_allocation(files, path);
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1094,9 +1063,7 @@ enum kernel_files_status kernel_files_unlinkat(
     } else {
         result = kernel_vfs_unlink_at(start, kernel_fs_context_root(fs), path, 0);
     }
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
+    kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -1123,14 +1090,14 @@ enum kernel_files_status kernel_files_chdir(
     enum kernel_fs_context_status status = copy_path_start(files, fs, mm,
         KERNEL_FS_AT_FDCWD, user_path, path, KERNEL_FS_PATH_MAX, &start, &mount, &result);
     if (status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, path);
+        kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (!result) result = kernel_vfs_path_resolve(start,
                             kernel_fs_context_root(fs), path, 1, &resolved);
     if (!result) result = kernel_fs_context_set_cwd(fs, resolved);
     if (resolved) (void)kernel_vfs_path_release(&resolved);
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -1178,11 +1145,11 @@ enum kernel_files_status kernel_files_getcwd(
                                                         path, length, &copied);
         if (access == KERNEL_UACCESS_STATUS_FAULT) result = -KERNEL_EFAULT;
         else if (access != KERNEL_UACCESS_STATUS_OK || copied != length) {
-            (void)finish_path(files, path);
+            kernel_files_release_allocation(files, path);
             return KERNEL_FILES_STATUS_STATE;
         }
     }
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, path);
     *linux_result = result ? result : (int64_t)length;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -1217,7 +1184,7 @@ enum kernel_files_status kernel_files_linkat(
     enum kernel_uaccess_status access = kernel_copy_string_from_user(mm, paths,
                                       old_user_path, KERNEL_FS_PATH_MAX, &length);
     if (access != KERNEL_UACCESS_STATUS_OK) {
-        (void)finish_path(files, paths);
+        kernel_files_release_allocation(files, paths);
         if (access != KERNEL_UACCESS_STATUS_FAULT && access != KERNEL_UACCESS_STATUS_TOO_LONG)
             return KERNEL_FILES_STATUS_STATE;
         *linux_result = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : -KERNEL_ENAMETOOLONG;
@@ -1248,13 +1215,13 @@ enum kernel_files_status kernel_files_linkat(
             new_dirfd, new_user_path, paths + KERNEL_FS_PATH_MAX,
             KERNEL_FS_PATH_MAX, &new_start, &mount, &result);
         if (status != KERNEL_FS_CONTEXT_STATUS_OK) {
-            (void)finish_path(files, paths);
+            kernel_files_release_allocation(files, paths);
             return KERNEL_FILES_STATUS_STATE;
         }
     }
     if (!result) result = kernel_vfs_link_at(source, new_start,
                             kernel_fs_context_root(fs), paths + KERNEL_FS_PATH_MAX);
-    if (finish_path(files, paths) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, paths);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -1288,12 +1255,12 @@ enum kernel_files_status kernel_files_renameat(
         status = copy_path_start(files, fs, mm, new_dirfd, new_user_path,
               paths + KERNEL_FS_PATH_MAX, KERNEL_FS_PATH_MAX, &new_start, &mount, &result);
     if (status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        (void)finish_path(files, paths);
+        kernel_files_release_allocation(files, paths);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (!result) result = kernel_vfs_rename_at(old_start, new_start,
                    kernel_fs_context_root(fs), paths, paths + KERNEL_FS_PATH_MAX, flags);
-    if (finish_path(files, paths) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, paths);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }

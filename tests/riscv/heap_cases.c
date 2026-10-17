@@ -135,12 +135,7 @@ static void test_small_classes_reuse_and_release_pages(void)
     }
 
     for (index = 0U; index < sizeof(sizes) / sizeof(sizes[0]); index++) {
-        enum kernel_heap_status status =
-            kernel_heap_release(&heap, objects[index]);
-
-        if (status != KERNEL_HEAP_STATUS_OK) {
-            fail_heap(30U + index, KERNEL_HEAP_STATUS_OK, status);
-        }
+        kernel_heap_release(&heap, objects[index]);
     }
 
     if (physical_page_available(&allocator) != available) {
@@ -184,10 +179,10 @@ static void test_exact_page_uses_one_buddy_page(void)
         fail_value(53U, 0U, order);
     }
 
-    heap_status = kernel_heap_release(&heap, pointer);
-    if (heap_status != KERNEL_HEAP_STATUS_OK ||
-        physical_page_available(&allocator) != before) {
-        fail_heap(54U, KERNEL_HEAP_STATUS_OK, heap_status);
+    kernel_heap_release(&heap, pointer);
+    if (physical_page_available(&allocator) != before) {
+        fail_value(54U, (unsigned long)before,
+                   (unsigned long)physical_page_available(&allocator));
     }
 }
 
@@ -239,10 +234,7 @@ static void test_zero_calloc_overflow_and_realloc(void)
                        large[index]);
         }
     }
-    status = kernel_heap_release(&heap, large);
-    if (status != KERNEL_HEAP_STATUS_OK) {
-        fail_heap(66U, KERNEL_HEAP_STATUS_OK, status);
-    }
+    kernel_heap_release(&heap, large);
 }
 
 static void test_rejects_double_free_and_preserves_failed_realloc(void)
@@ -276,14 +268,8 @@ static void test_rejects_double_free_and_preserves_failed_realloc(void)
     if (((unsigned char *)pointer)[0] != 0x7bU) {
         fail_value(73U, 0x7bU, ((unsigned char *)pointer)[0]);
     }
-    status = kernel_heap_release(&heap, pointer);
-    if (status != KERNEL_HEAP_STATUS_OK) {
-        fail_heap(74U, KERNEL_HEAP_STATUS_OK, status);
-    }
-    status = kernel_heap_release(&heap, 0);
-    if (status != KERNEL_HEAP_STATUS_OK) {
-        fail_heap(76U, KERNEL_HEAP_STATUS_OK, status);
-    }
+    kernel_heap_release(&heap, pointer);
+    kernel_heap_release(&heap, 0);
 }
 
 void run_kernel_heap_tests(void)

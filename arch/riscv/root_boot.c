@@ -191,7 +191,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
         cleanup_failed = 1;
     }
     if (root->cleanup_path != 0) {
-        (void)kernel_heap_release(&root->heap, root->cleanup_path);
+        kernel_heap_release(&root->heap, root->cleanup_path);
         root->cleanup_path = 0;
     }
     if (root->mount.private_data != 0) {
@@ -450,7 +450,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
         }
     }
     if (resolved_interpreter_path != 0) {
-        (void)kernel_heap_release(&root->heap, resolved_interpreter_path);
+        kernel_heap_release(&root->heap, resolved_interpreter_path);
     }
     resolved_interpreter_path = 0;
     request.executable_source = executable_source;
@@ -533,7 +533,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
 
 fail:
     if (resolved_interpreter_path != 0) {
-        (void)kernel_heap_release(&root->heap, resolved_interpreter_path);
+        kernel_heap_release(&root->heap, resolved_interpreter_path);
         resolved_interpreter_path = 0;
     }
     return cleanup_start_failure(root,

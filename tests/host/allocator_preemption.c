@@ -80,7 +80,7 @@ static void acquire_page(void)
 static void allocate_object(void)
 { assert(kernel_heap_allocate(&heap, 64, &other_object) == 0); }
 static void release_object(void)
-{ assert(kernel_heap_release(&heap, other_object) == 0); }
+{ kernel_heap_release(&heap, other_object); }
 static unsigned page_case(unsigned at)
 {
     setup();
@@ -145,9 +145,9 @@ static unsigned heap_case(unsigned at, unsigned release, unsigned fresh)
     memset(object, 0x42, 64);
     if (!release) memset(other_object, 0x53, 64);
     assert((!kept || *(unsigned char *)kept == 0x31) && *(unsigned char *)object == 0x42);
-    assert(kernel_heap_release(&heap, kept) == 0);
-    assert(kernel_heap_release(&heap, object) == 0);
-    if (!release) assert(kernel_heap_release(&heap, other_object) == 0);
+    kernel_heap_release(&heap, kept);
+    kernel_heap_release(&heap, object);
+    if (!release) kernel_heap_release(&heap, other_object);
     struct kernel_heap_statistics stats;
     kernel_heap_get_statistics(&heap, &stats);
     assert(stats.live_allocations == 0 && stats.current_pages == 0);
@@ -226,7 +226,7 @@ static void irq_restore_case(uintptr_t enabled)
     assert(object == (void *)(uintptr_t)1 && allocator_test_irq_enabled == enabled);
     assert(kernel_heap_allocate(&heap, 64, &object) == 0);
     assert(allocator_test_irq_enabled == enabled);
-    assert(kernel_heap_release(&heap, object) == 0);
+    kernel_heap_release(&heap, object);
     assert(allocator_test_irq_enabled == enabled);
     assert(physical_page_available(&allocator) == initial_free);
     allocator_test_irq_enabled = 1;

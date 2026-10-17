@@ -57,22 +57,19 @@ static enum kernel_fs_context_status create_context(
     if (root == 0) {
         int result = kernel_vfs_path_root(root_mount, heap, &root);
         if (result != 0) {
-            if (kernel_heap_release(heap, record) != KERNEL_HEAP_STATUS_OK)
-                __builtin_trap();
+            kernel_heap_release(heap, record);
             return result == -KERNEL_ENOMEM
                        ? KERNEL_FS_CONTEXT_STATUS_NO_MEMORY
                        : KERNEL_FS_CONTEXT_STATUS_STATE;
         }
     } else if (kernel_vfs_path_acquire(root) != 0) {
-        if (kernel_heap_release(heap, record) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(heap, record);
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
     if (cwd == 0) cwd = root;
     if (kernel_vfs_path_acquire(cwd) != 0) {
         (void)kernel_vfs_path_release(&root);
-        if (kernel_heap_release(heap, record) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
+        kernel_heap_release(heap, record);
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
     record->root = root;
@@ -293,8 +290,7 @@ enum kernel_fs_context_status kernel_fs_context_release(
         return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
     if (kernel_vfs_path_release(&fs->record->root) != 0)
         return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
-    if (kernel_heap_release(fs->heap, fs->record) !=
-        KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(fs->heap, fs->record);
     finish_context(fs, KERNEL_FS_CONTEXT_RELEASED);
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }

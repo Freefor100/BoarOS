@@ -635,7 +635,7 @@ static void arena_worker(void *argument)
         }
         for (size_t i = 0; i < bytes; i++) require(((uint8_t *)object)[i] == id + 0x35, "arena-slab-content");
         { KERNEL_LOCK_SCOPE(guard); kernel_mutex_lock(&model, &guard); track(object, bytes, id, 0); }
-        require(kernel_heap_release(&heap, object) == KERNEL_HEAP_STATUS_OK, "arena-slab-release");
+        kernel_heap_release(&heap, object);
     }
 }
 

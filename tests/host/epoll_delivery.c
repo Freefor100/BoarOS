@@ -60,8 +60,8 @@ int kernel_files_is_live(const struct kernel_files *f) { return f == &files; }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t z,void **p)
 { (void)h; CHECK(!preempt_depth); if (allocation_interleave) { void (*run)(void)=allocation_interleave; allocation_interleave=NULL; run(); }
   *p=calloc(n,z); CHECK(*p); allocations++; return KERNEL_HEAP_STATUS_OK; }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *h,void *p)
-{ (void)h; CHECK(p && allocations && !scopes[actor] && network_host_irq); allocations--; free(p); return KERNEL_HEAP_STATUS_OK; }
+void kernel_heap_release(struct kernel_heap *h,void *p)
+{ (void)h; CHECK(p && allocations && !scopes[actor] && network_host_irq); allocations--; free(p); }
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
 { return f->kind; }
 int kernel_open_file_supports_epoll(const struct kernel_open_file_description *f)
@@ -248,7 +248,7 @@ static void competing_delete(void)
     irq_interleave=delete_at_irq_boundary;
     CHECK(!epoll_item_unlink_and_destroy(item));
     epoll_item_put(item);
-    CHECK(!epfile.epoll->item_count && allocations==1);
+    CHECK(!epfile.epoll->items_root && allocations==1);
     teardown();
     puts("PASS epoll competing DEL: registration owner consumed once across IRQ boundary");
 }

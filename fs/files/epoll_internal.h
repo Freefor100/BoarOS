@@ -87,7 +87,6 @@ struct kernel_epoll {
     struct kernel_epoll_item *pending_head, *pending_tail;
     struct kernel_epoll_wait_request *scan_owner;
     uint64_t notification_sequence;
-    uint32_t item_count;
 };
 
 
@@ -95,7 +94,7 @@ struct kernel_epoll_wait_request {
     struct kernel_task *task;
     struct kernel_epoll *epoll;
     struct kernel_open_file_description *file, *target;
-    struct kernel_epoll_item *head;
+    struct kernel_epoll_item *current;
     struct kernel_epoll_wait_request *previous;
     uint8_t observing;
 };

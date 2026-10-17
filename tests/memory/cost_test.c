@@ -95,7 +95,7 @@ int main(void)
     assert(storage_field && sscanf(storage_field, "storage_bytes=%llu", &storage_bytes) == 1);
     assert(storage_bytes > 0 && storage_bytes <= 65536);
     assert(!strstr(snapshot,"heap_zero_ticks.bucket."));
-    assert(kernel_heap_release(&heap,fresh)==0);
+    kernel_heap_release(&heap,fresh);
     for(unsigned i=0;i<2;i++) assert(physical_page_release(&allocator,mapped[i])==0);
     puts("memory cost: successful heap bodies and resolved page chunks counted exactly");
 }

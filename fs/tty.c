@@ -252,7 +252,7 @@ static void finish_request(struct kernel_tty_request *request)
         tty->writer = 0; request->writing = 0; changed(tty);
     }
     if (request->write_scratch) {
-        if (kernel_heap_release(request->instance->heap, request->write_scratch) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        kernel_heap_release(request->instance->heap, request->write_scratch);
         request->write_scratch = 0;
     }
     if (request->registered) {
@@ -281,8 +281,7 @@ void kernel_tty_abort_request(struct kernel_tty_request *request)
     request->file = 0;
     request->vectors = 0;
     finish_request(request);
-    if (vectors && kernel_heap_release(files->heap, vectors) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    if (vectors) kernel_heap_release(files->heap, vectors);
     if (file) {
         enum kernel_open_file_status status = kernel_open_file_release(&file);
         if (status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && file)
@@ -854,7 +853,7 @@ static int open_instance(struct kernel_tty *tty, struct kernel_heap *heap, struc
     int open_error = tty->transport.open_check ? tty->transport.open_check(tty->transport_owner) : 0;
     if (tty->shutdown || open_error) {
         arch_interrupt_restore(irq);
-        (void)kernel_heap_release(heap, instance);
+        kernel_heap_release(heap, instance);
         return open_error ? open_error : -KERNEL_ENXIO;
     }
     if (!tty->opens) {
@@ -862,7 +861,7 @@ static int open_instance(struct kernel_tty *tty, struct kernel_heap *heap, struc
         int error = configure_settings(tty, &settings);
         if (error) {
             arch_interrupt_restore(irq);
-            (void)kernel_heap_release(heap, instance);
+            kernel_heap_release(heap, instance);
             return error;
         }
         tty->settings = settings.basic;
@@ -910,8 +909,7 @@ static void release_instance(void *opaque)
         tty->transport.last_close(tty->transport_owner, tty->settings.cflag);
     kernel_tty_put(tty);
     arch_interrupt_restore(irq);
-    if (kernel_heap_release(i->heap, i) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(i->heap, i);
 }
 int kernel_tty_create(struct kernel_heap *heap, const struct kernel_tty_transport *transport,
                       void *owner, struct kernel_tty **out)
@@ -940,7 +938,7 @@ int kernel_tty_create(struct kernel_heap *heap, const struct kernel_tty_transpor
     kernel_wait_queue_init(&tty->events);
     int error = transport->configure(owner, &tty->settings);
     if (error) {
-        (void)kernel_heap_release(heap, tty);
+        kernel_heap_release(heap, tty);
         return error;
     }
     tty->ispeed = tty->ospeed = decode_speed(tty->settings.cflag, 0);
@@ -963,8 +961,7 @@ int kernel_tty_destroy(struct kernel_tty **owner)
         serial_tty = 0;
     tty->references = 0;
     arch_interrupt_restore(irq);
-    if (kernel_heap_release(tty->heap, tty) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(tty->heap, tty);
     *owner = 0;
     return 0;
 }

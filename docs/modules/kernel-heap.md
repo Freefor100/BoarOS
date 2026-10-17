@@ -12,7 +12,7 @@
 
 ## 失败和统计
 
-- 零长度分配成功并返回空指针；释放空指针成功。
+- 零长度分配成功并返回空指针；`kernel_heap_release()` 返回 `void`，接受空指针，不产生可重试的释放错误。
 - calloc 在乘法溢出时返回 `OVERFLOW`，不修改输出。
 - resize 在原容量足够时原地成功；扩容先取得新对象并复制，失败保留旧对象和输出。
 - slab bitmap 区分有效释放、内部地址、非本堆页和 double free；底层物理页释放属于
@@ -20,14 +20,14 @@
   分配器不变量损坏时直接 fatal trap，不把释放失败转成重试状态。
 - 统计记录调用、失败、活对象、当前页与峰值页。它用于资源回收检查，不等同于按调用点或大小分布的性能 profiler。
 
-当前生产平台仍为单CPU。共享slab查找/取槽、bitmap、链表、
+共享slab查找/取槽、bitmap、链表、
 释放与统计使用每heap的raw锁，保存/恢复IRQ并禁止抢占，防止开中断内核线程被timer抢占后产生
 双 owner 或借用已回收 slab。缺 slab 时在区外分配并初始化私有页，再在区内发布和
 取槽；期间其他任务也创建同类 slab 仍保持独立 owner。大对象页申请、calloc 清零和
 resize 复制不放进 heap 元数据临界区，回收可重入堆。
 size-class 热路径仍是一次链首访问、slot 链更新和 bitmap 更新；新建/回收 slab 或大
 对象才进入buddy。锁序为heap→physical allocator；嵌套页查询/释放不回收、不等待，
-页申请和压力回调在heap锁外。没有per-CPU cache；页缓存、压力回收和完整快照仍限单CPU。
+页申请和压力回调在heap锁外。UP 保留中断和抢占嵌套，SMP 由同一 raw API 提供跨核互斥；没有 per-CPU cache。
 
 ## 验证
 
@@ -63,6 +63,6 @@ MM 的清页与 COW 也复用这些原语，不在各模块保留逐字节副本
 
 LA 16 KiB fixture 用300个独立17字节对象验证位图覆盖、内容隔离及页回收；`make test-loongarch` 运行。RV allocator抢占与fatal释放测试保护既有4 KiB契约。
 
-并发host门禁用真实buddy/heap及独立owner账簿，在4/16 KiB下运行2/4线程，覆盖引用、
+宿主并发测试用真实buddy/heap及独立owner账簿，在4/16 KiB下运行2/4线程，覆盖引用、
 各class、大对象、calloc、resize、耗尽和最终审计/资源基线。账簿不替代生产互斥；
 该宿主结果不证明客户机等待或共享MM的多核正确性。

@@ -51,7 +51,7 @@ static void discard(struct allocation *a, unsigned id)
     for (size_t i = 0; i < a->bytes; i++) assert(((unsigned char *)a->pointer)[i] == a->pattern);
     track(a, id, 0);
     if (a->page) assert(physical_page_release_order(&allocator, (uintptr_t)a->pointer, a->order) == 0);
-    else assert(kernel_heap_release(&heap, a->pointer) == 0);
+    else kernel_heap_release(&heap, a->pointer);
     *a = (struct allocation){0};
 }
 static unsigned random_next(unsigned *state)

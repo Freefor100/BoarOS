@@ -61,8 +61,7 @@ static enum kernel_files_status copy_metadata_path(
     else if (access == KERNEL_UACCESS_STATUS_TOO_LONG) *result = -KERNEL_ENAMETOOLONG;
     else if (access == KERNEL_UACCESS_STATUS_OK)
         *result = metadata_path(files, fs, dirfd, name, flags, path);
-    if (kernel_files_release_allocation(files, name) != KERNEL_FILES_STATUS_OK)
-        return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, name);
     return access == KERNEL_UACCESS_STATUS_OK || access == KERNEL_UACCESS_STATUS_FAULT ||
            access == KERNEL_UACCESS_STATUS_TOO_LONG ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
 }
@@ -246,8 +245,7 @@ enum kernel_files_status kernel_files_fchownat(
             if (path) (void)kernel_vfs_path_release(&path);
         }
     }
-    if (name && kernel_files_release_allocation(files, name) != KERNEL_FILES_STATUS_OK)
-        return KERNEL_FILES_STATUS_STATE;
+    kernel_files_release_allocation(files, name);
     *linux_result = result;
     return status;
 }

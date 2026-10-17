@@ -51,7 +51,7 @@ int kernel_devpts_entry_acquire(struct kernel_devpts_entry *e)
 void kernel_devpts_entry_release(struct kernel_devpts_entry **e)
 {
     assert((*e)->references);
-    if (!--(*e)->references) assert(kernel_heap_release(&heap, *e) == 0);
+    if (!--(*e)->references) kernel_heap_release(&heap, *e);
     *e = 0;
 }
 void kernel_devpts_unpublish(struct kernel_devpts_entry *e) { e->binding = 0; }
@@ -91,7 +91,7 @@ int kernel_vfs_path_release(struct kernel_vfs_path **p)
     if (!--(*p)->references) {
         struct kernel_devpts_entry *e = (*p)->file.private_data;
         kernel_devpts_entry_release(&e);
-        assert(kernel_heap_release(&heap, *p) == 0);
+        kernel_heap_release(&heap, *p);
     }
     *p = 0;
     return 0;

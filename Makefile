@@ -298,39 +298,20 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/ipv6/nd6.c \
 	net/lwip_port/port.c
 
-C_SOURCES := \
-	kernel/cpu.c \
-	kernel/raw_lock.c \
-	arch/riscv/smp.c \
-	arch/riscv/context.c \
-	arch/riscv/direct_map.c \
-	arch/riscv/elf_image.c \
+CPU_C_SOURCES := kernel/cpu.c kernel/raw_lock.c
+COMMON_C_SOURCES := \
+	$(CPU_C_SOURCES) \
 	kernel/elf_image.c \
-	arch/riscv/exec.c \
 	kernel/exec_image.c \
-	arch/riscv/process.c \
-	arch/riscv/mm.c \
 	mm/mm.c \
-	arch/riscv/root_boot.c \
-	arch/riscv/sbi.c \
-	arch/riscv/sv39.c \
-	arch/riscv/timer.c \
-	arch/riscv/trap.c \
 	mm/uaccess.c \
-	arch/riscv/virt_rtc.c \
-	arch/riscv/virt_uart.c \
-	arch/riscv/uart_tty.c \
 	drivers/serial/ns16550.c \
-	arch/riscv/virtio_mmio_block.c \
 	drivers/virtio/block.c \
 	drivers/virtio/transport.c \
 	drivers/virtio/split_queue.c \
 	drivers/virtio/mmio.c \
-	arch/riscv/virtio_mmio_rng.c \
 	drivers/virtio/rng.c \
 	drivers/virtio/net.c \
-	arch/riscv/virtio_mmio_net.c \
-	arch/riscv/plic.c \
 	fs/lwext4_port.c \
 	fs/files/table.c \
 	fs/files/locks.c \
@@ -363,7 +344,6 @@ C_SOURCES := \
 	kernel/elf64.c \
 	kernel/elf64_source.c \
 	kernel/exec.c \
-	kernel/main.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
 	kernel/read_source.c \
@@ -373,7 +353,9 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c \
+	kernel/sched/scheduling.c \
+	kernel/sched/lifetime.c \
+	kernel/sched/identity.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -395,7 +377,6 @@ C_SOURCES := \
 	kernel/syscall/random.c \
 	kernel/syscall/log.c \
 	kernel/syscall/sched.c \
-	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
 	kernel/cost.c \
@@ -410,6 +391,32 @@ C_SOURCES := \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)
+
+RV_C_SOURCES := \
+	arch/riscv/smp.c \
+	arch/riscv/context.c \
+	arch/riscv/direct_map.c \
+	arch/riscv/elf_image.c \
+	arch/riscv/exec.c \
+	arch/riscv/process.c \
+	arch/riscv/mm.c \
+	arch/riscv/root_boot.c \
+	arch/riscv/sbi.c \
+	arch/riscv/sv39.c \
+	arch/riscv/timer.c \
+	arch/riscv/trap.c \
+	arch/riscv/virt_rtc.c \
+	arch/riscv/virt_uart.c \
+	arch/riscv/uart_tty.c \
+	arch/riscv/virtio_mmio_block.c \
+	arch/riscv/virtio_mmio_rng.c \
+	arch/riscv/virtio_mmio_net.c \
+	arch/riscv/plic.c \
+	kernel/main.c \
+	arch/riscv/signal.c
+
+# CPU 与架构/MM 后端相邻；共用源只维护一次，不把它们移到整个通用内核之后。
+C_SOURCES := $(CPU_C_SOURCES) $(RV_C_SOURCES) $(filter-out $(CPU_C_SOURCES),$(COMMON_C_SOURCES))
 ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/secondary.S \
@@ -417,6 +424,11 @@ ASM_SOURCES := \
 	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S \
 	arch/riscv/signal_trampoline.S
+# 无根模块测试复用生产运行时，由各目标追加测试入口。
+TEST_RUNTIME_C_SOURCES := $(filter-out arch/riscv/smp.c arch/riscv/root_boot.c \
+    kernel/main.c kernel/boot_memory.c kernel/dtb.c net/ethernet.c,\
+    $(C_SOURCES))
+TEST_RUNTIME_ASM_SOURCES := $(filter-out arch/riscv/secondary.S,$(ASM_SOURCES))
 ifeq ($(ROOT_DRAIN_FIXTURE),1)
 C_SOURCES += tests/riscv/root_drain_fixture.c
 LDFLAGS += -Wl,--wrap=kernel_vfs_unmount
@@ -453,118 +465,6 @@ endif
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
 endif
-TEST_RUNTIME_C_SOURCES := \
-	kernel/cpu.c \
-	kernel/raw_lock.c \
-	arch/riscv/context.c \
-	arch/riscv/direct_map.c \
-	arch/riscv/elf_image.c \
-	kernel/elf_image.c \
-	arch/riscv/exec.c \
-	kernel/exec_image.c \
-	arch/riscv/process.c \
-	arch/riscv/mm.c \
-	mm/mm.c \
-	arch/riscv/sbi.c \
-	arch/riscv/sv39.c \
-	arch/riscv/timer.c \
-	arch/riscv/trap.c \
-	mm/uaccess.c \
-	arch/riscv/virt_rtc.c \
-	arch/riscv/virt_uart.c \
-	arch/riscv/uart_tty.c \
-	drivers/serial/ns16550.c \
-	arch/riscv/virtio_mmio_block.c \
-	drivers/virtio/block.c \
-	drivers/virtio/transport.c \
-	drivers/virtio/split_queue.c \
-	drivers/virtio/mmio.c \
-	arch/riscv/virtio_mmio_rng.c \
-	drivers/virtio/rng.c \
-	drivers/virtio/net.c \
-	arch/riscv/virtio_mmio_net.c \
-	arch/riscv/plic.c \
-	fs/files/table.c \
-	fs/files/locks.c \
-	fs/files/io.c \
-	fs/files/path.c \
-	fs/files/metadata.c \
-	fs/files/console.c \
-	fs/files/poll.c \
-	fs/files/epoll.c \
-	fs/files/socket.c \
-	fs/fs_context.c \
-	fs/char_device.c \
-	fs/tty.c \
-	fs/devpts.c \
-	fs/pty.c \
-	fs/rtc_device.c \
-	fs/lwext4_port.c \
-	fs/open_file.c \
-	fs/pipe.c \
-	fs/record_lock.c \
-	fs/page_cache.c \
-	fs/vfs.c \
-	fs/file_mapping.c \
-	fs/procfs.c \
-	fs/tmpfs.c \
-	fs/disk_mount.c \
-	fs/ext4_backend.c \
-	kernel/block.c \
-	kernel/elf64.c \
-	kernel/elf64_source.c \
-	kernel/exec.c \
-	kernel/pid.c \
-	kernel/physical_page.c \
-	kernel/read_source.c \
-	kernel/random.c \
-	kernel/log.c \
-	kernel/blake2s.c \
-	kernel/sched/core.c \
-	kernel/sched/policy.c \
-	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c \
-	kernel/sched/exec.c \
-	kernel/sched/process.c \
-	kernel/sched/proc.c \
-	kernel/sched/signal.c \
-	kernel/sched/tty.c \
-	kernel/sched/wait.c \
-	kernel/sched/park.c \
-	kernel/sched/sync.c \
-	kernel/sched/futex.c \
-	kernel/syscall/dispatch.c \
-	kernel/syscall/file.c \
-	kernel/syscall/mount.c \
-	kernel/syscall/memory.c \
-	kernel/syscall/process.c \
-	kernel/syscall/signal.c \
-	kernel/syscall/socket.c \
-	kernel/syscall/shm.c \
-	kernel/syscall/time.c \
-	kernel/syscall/random.c \
-	kernel/syscall/log.c \
-	kernel/syscall/sched.c \
-	arch/riscv/signal.c \
-	kernel/tick.c \
-	kernel/time.c \
-	kernel/cost.c \
-	kernel/sched/cost.c \
-	net/socket.c \
-	lib/qsort.c \
-	lib/string.c \
-	mm/vma.c \
-	mm/memory_object.c \
-	mm/shm.c \
-	mm/heap.c \
-	$(LWEXT4_SOURCES) \
-	$(LWIP_SOURCES)
-TEST_RUNTIME_ASM_SOURCES := \
-	arch/riscv/boot.S \
-	arch/riscv/context_switch.S \
-	arch/riscv/fpu.S \
-	arch/riscv/trap_entry.S \
-	arch/riscv/signal_trampoline.S
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_ASM_SOURCES))
@@ -2434,6 +2334,8 @@ test-sched-concurrency-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire -o build/host/sched-concurrency
 	build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
+	build/host/process-child-links
 
 test-riscv: test-scheduler-handoff-riscv
 

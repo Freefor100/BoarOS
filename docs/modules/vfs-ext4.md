@@ -513,7 +513,7 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 写回固定本次页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回在首次等待前固定并 pin 精确页集合，不能重新遍历变化中的链表配对释放。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
-每 inode 的写操作门闩覆盖整次 write/writev/pwrite、append、O_SYNC/O_DSYNC 收尾以及 truncate；独立 OFD 也不能在页/iovec 边界交错同次写。内层 pwrite/append 借用外层门闩，不递归加锁。用户复制期间只保留 OFD offset/操作门闩，不持 inode 数据锁；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。文件写仍先复制到有界请求页再进入存储，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
+每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 

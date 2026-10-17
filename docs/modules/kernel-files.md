@@ -33,14 +33,14 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 
 普通 `read/pread/readv` 与 `write/pwrite/writev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选，把实际缺失批次交给既有 CPU0 worker。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
 
-共享 offset 的 rank10 mutex 覆盖整次调用；seek、同步和需要后端的操作在提交前取得资格，worker 借用它而不重新等待。ftruncate 同样在排队前取得文件写操作门。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
+共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate 同样在排队前取得文件写操作门。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
 
 请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。最后缓存 OFD 的后端释放交给同一 worker，普通用户 pipe 的最后关闭在 CPU0 发布端点变化，因为另一端可以登记 epoll 回调。受控内核 pipe 的普通等待者已在任务创建时限定，不把端点 EOF 推迟到退出清理。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
 
 命名空间、目录、设备和网络操作在实际业务入口进入 CPU0 范围，嵌套调用只由最外层迁移和恢复。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
 
 `make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持 pin 拒绝及最终引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
-host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
+host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。独立 fsync 与范围同步分别停在实际 CPU0 执行入口后，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步排队后只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
 宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；调用 CPU 的冷缺页复制经 fork 私有页验证 COW 隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的执行位置)。
 `make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
 在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
@@ -132,7 +132,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - 生产 console 经 [TTY](kernel-tty.md) 接受有界 TX、OPOST 和真实输入；不自动建立 ctty。未发布 serial transport 的裸 console fixture 经 kernel_console_putc/原输入暂存。用户 fault、短计数和阻塞 pin 保持所属请求的真实 owner。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
-- `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的位置。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
+- `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的游标。共同同步路径在后端 I/O 完成后，用与错误发布相同的短 IRQ 保护一次性比较错误序列、决定返回值并推进游标；同一历史错误只被该 OFD 观察一次，不以文件位置锁覆盖设备等待。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
 - `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
 

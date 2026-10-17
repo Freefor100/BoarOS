@@ -604,7 +604,8 @@ static const struct physical_page_root *root_for_page(const struct physical_page
     return (uint64_t)page - r->first_page_index < order_page_count(r->order) ? r : 0;
 }
 
-static const struct physical_page_root *root_for_address(const struct physical_page_allocator *a,
+/* Keep the binary-search loop inside a code page: QEMU otherwise splits every iteration. */
+static __attribute__((aligned(256))) const struct physical_page_root *root_for_address(const struct physical_page_allocator *a,
                                                          uint64_t address, struct page_work *work)
 {
     uint32_t lo = 0, hi = a->root_count;

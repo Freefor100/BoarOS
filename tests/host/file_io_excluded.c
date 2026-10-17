@@ -26,6 +26,9 @@ EXCLUDED(kernel_socket_send_timeout)
 #endif
 EXCLUDED(kernel_socket_stream_begin)
 EXCLUDED(kernel_socket_stream_commit)
+#ifndef TCP_IO_CASES
+EXCLUDED(kernel_socket_stream_commitv)
+#endif
 EXCLUDED(kernel_socket_stream_finish)
 #ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_stream_reserve)
@@ -38,7 +41,9 @@ EXCLUDED(kernel_socket_write_unix)
 #endif
 EXCLUDED(kernel_socket_write_datagram)
 EXCLUDED(kernel_socket_write_datagram_buffer)
+#ifndef TCP_IO_CASES
 EXCLUDED(kernel_signal_send_task)
+#endif
 EXCLUDED(kernel_signal_note_syscall_restart)
 EXCLUDED(kernel_signal_clear_syscall_restart)
 EXCLUDED(kernel_signal_note_futex_timed_restart)

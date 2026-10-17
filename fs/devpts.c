@@ -38,8 +38,7 @@ static int allocate(struct devpts_mount *m, size_t size, void **owner)
 }
 static void dispose(struct devpts_mount *m, void *owner)
 {
-    if (kernel_heap_release(m->instance.heap, owner) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(m->instance.heap, owner);
 }
 
 static struct kernel_devpts_entry *entry_inode(struct devpts_mount *m, uint64_t ino)

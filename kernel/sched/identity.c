@@ -17,7 +17,7 @@ void process_identity_collect(void)
             id = kernel_pid_take_retired(&scheduler.identities);
         }
         if (!id) return;
-        (void)kernel_heap_release(&scheduler.identity_heap, id);
+        kernel_heap_release(&scheduler.identity_heap, id);
     }
 }
 
@@ -82,7 +82,7 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
         }
     }
     if (status != KERNEL_PID_STATUS_OK)
-        (void)kernel_heap_release(&scheduler.identity_heap, id);
+        kernel_heap_release(&scheduler.identity_heap, id);
     return status;
 }
 

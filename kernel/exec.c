@@ -36,35 +36,22 @@ static int mm_owner_absent(const struct kernel_mm *mm)
            mm->state == KERNEL_MM_RELEASED;
 }
 
-static int image_cleanup_complete(const struct kernel_exec_image *image)
-{
-    return mm_owner_absent(&image->mm);
-}
-
 static int transaction_resources_empty(
     const struct kernel_exec_transaction *transaction)
 {
-    return transaction->original_path == 0 &&
-           transaction->string_bytes == 0 &&
-           transaction->arguments == 0 &&
-           transaction->environment == 0 &&
-           transaction->executable_file == 0 &&
+    return transaction->executable_file == 0 &&
            transaction->interpreter_file == 0 &&
            transaction->executable_source == 0 &&
            transaction->interpreter_source == 0 &&
-           image_cleanup_complete(&transaction->image) &&
+           mm_owner_absent(&transaction->image.mm) &&
            mm_owner_absent(&transaction->retired_mm);
 }
 
-static int release_allocation(struct kernel_exec_transaction *transaction,
+static void release_allocation(struct kernel_exec_transaction *transaction,
                               void **pointer)
 {
-    if (*pointer == 0) {
-        return 1;
-    }
-    (void)kernel_heap_release(transaction->heap, *pointer);
+    kernel_heap_release(transaction->heap, *pointer);
     *pointer = 0;
-    return 1;
 }
 
 enum kernel_exec_status kernel_exec_transaction_cleanup(
@@ -112,22 +99,10 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
             failed = 1;
         }
     }
-    if (!release_allocation(transaction,
-                            (void **)&transaction->environment)) {
-        failed = 1;
-    }
-    if (!release_allocation(transaction,
-                            (void **)&transaction->arguments)) {
-        failed = 1;
-    }
-    if (!release_allocation(transaction,
-                            (void **)&transaction->string_bytes)) {
-        failed = 1;
-    }
-    if (!release_allocation(transaction,
-                            (void **)&transaction->original_path)) {
-        failed = 1;
-    }
+    release_allocation(transaction, (void **)&transaction->environment);
+    release_allocation(transaction, (void **)&transaction->arguments);
+    release_allocation(transaction, (void **)&transaction->string_bytes);
+    release_allocation(transaction, (void **)&transaction->original_path);
     if (!failed && transaction_resources_empty(transaction)) {
         transaction->state = KERNEL_EXEC_TRANSACTION_EMPTY_CLEANUP;
         return KERNEL_EXEC_STATUS_OK;
@@ -616,7 +591,7 @@ enum kernel_exec_status kernel_execve_prepare(
     transaction->state = KERNEL_EXEC_TRANSACTION_PREPARING;
     if (kernel_task_exec_attach(task, transaction) !=
         KERNEL_EXEC_STATUS_OK) {
-        (void)kernel_heap_release(files->heap, transaction);
+        kernel_heap_release(files->heap, transaction);
         return KERNEL_EXEC_STATUS_STATE;
     }
     heap_status = kernel_heap_allocate(transaction->heap,

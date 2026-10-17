@@ -554,6 +554,33 @@ static void test_reset_owner(unsigned version)
     printf("PASS: VirtIO-net v%u repeated reset refusal and borrowed frame retain the same DMA owner\n", version);
 }
 
+static void test_rx_cpu_lease(unsigned version)
+{
+    struct riscv_virtio_mmio_net d; start(version, &d);
+    receive("before-protocol-owner", 21);
+    struct riscv_net_frame held;
+    assert(riscv_virtio_mmio_net_receive(&d, &held) == 1);
+    assert(!d.loaned && !memcmp(held.data, "before-protocol-owner", 21));
+    /* receive 已摘下帧，但调用者尚未取得协议 owner 或转成 pbuf loan。 */
+    for (unsigned i = 0; i < 80; i++) {
+        receive("interrupt-progress", 18);
+        struct riscv_net_frame other;
+        assert(riscv_virtio_mmio_net_receive(&d, &other) == 1 && other.buffer != held.buffer);
+        riscv_virtio_mmio_net_release(&d, other.buffer);
+        assert(!riscv_virtio_mmio_net_service(&d));
+        assert(!memcmp(held.data, "before-protocol-owner", 21));
+    }
+    reject_reset_from = reset_calls + 1;
+    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && interrupt_fn);
+    assert(!memcmp(held.data, "before-protocol-owner", 21));
+    reject_reset_from = 0;
+    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && !interrupt_fn);
+    assert(!memcmp(held.data, "before-protocol-owner", 21));
+    riscv_virtio_mmio_net_release(&d, held.buffer);
+    stop(&d);
+    printf("PASS: VirtIO-net v%u CPU RX lease survives IRQ/ring progress and refused/acknowledged stop before lend\n", version);
+}
+
 static unsigned test_device_needs_reset(unsigned entry)
 {
     static const char *const names[] = {"config-IRQ", "service-without-IRQ", "send-without-IRQ"};
@@ -717,6 +744,67 @@ static void test_tx_segments_unsupported(unsigned version)
     printf("PASS: VirtIO-net v%u TX segments require the negotiated indirect feature\n", version);
 }
 
+struct tx_release_probe {
+    struct riscv_virtio_mmio_net *device;
+    struct riscv_net_tx_segment segment;
+    unsigned owner[3], returned[3], abandon;
+};
+static struct tx_release_probe *active_release_probe;
+
+static void reenter_tx_release(void *owner)
+{
+    struct tx_release_probe *probe = active_release_probe;
+    struct riscv_virtio_mmio_net *d = probe->device;
+    assert(arch_interrupt_is_enabled());
+    unsigned which;
+    for (which = 0; which < 3 && owner != &probe->owner[which]; which++) {}
+    assert(which < 3 && !probe->returned[which]++);
+    /* 回调开始前，整批旧 owner 已从设备状态摘除，而非仅摘当前这一项。 */
+    for (unsigned b = 0; b < VIRTIO_NET_BUFFERS; b++) {
+        assert(d->tx_owner[b] != &probe->owner[0] && d->tx_owner[b] != &probe->owner[1]);
+    }
+    if (!which) {
+        assert(d->tx_capacity_generation == 2);
+        assert(!riscv_virtio_mmio_net_tx_release(d, reenter_tx_release, probe->abandon));
+        if (!probe->abandon) {
+            assert(!riscv_virtio_mmio_net_send_segments(d, &probe->segment, 1, &probe->owner[2]));
+            complete(1, next_head(1), 0, 1);
+            assert(riscv_virtio_mmio_net_tx_release(d, reenter_tx_release, 0) == 1);
+        }
+    }
+}
+
+static void test_tx_release_reentry(unsigned version, unsigned abandon)
+{
+    struct riscv_virtio_mmio_net d; start(version, &d);
+    uint64_t phys;
+    unsigned char *data = model_extra_memory(&phys);
+    memset(data, 'r', 64);
+    struct tx_release_probe probe = {.device = &d, .segment = {phys, 64}, .abandon = abandon};
+    active_release_probe = &probe;
+    for (unsigned i = 0; i < 2; i++)
+        assert(!riscv_virtio_mmio_net_send_segments(&d, &probe.segment, 1, &probe.owner[i]));
+    if (abandon) {
+        reject_reset_from = reset_calls + 1;
+        for (unsigned i = 0; i < 2; i++) {
+            assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && interrupt_fn);
+            assert(!probe.returned[0] && !probe.returned[1] && !d.tx_capacity_generation);
+            assert(!memcmp(data, "rrrr", 4) && queues[1].pending_count == 2);
+        }
+        reject_reset_from = 0;
+        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && !interrupt_fn);
+    } else {
+        for (unsigned i = 0; i < 2; i++) complete(1, next_head(1), 0, 1);
+    }
+    assert(riscv_virtio_mmio_net_tx_release(&d, reenter_tx_release, abandon) == 2);
+    assert(probe.returned[0] == 1 && probe.returned[1] == 1 && probe.returned[2] == !abandon);
+    assert(d.tx_capacity_generation == (abandon ? 2U : 3U));
+    assert(!riscv_virtio_mmio_net_tx_release(&d, reenter_tx_release, abandon));
+    stop(&d); model_extra_free(phys); active_release_probe = NULL;
+    printf("PASS: VirtIO-net v%u %s TX callbacks run IRQ-on after whole-batch detach, permit reentry, and return each owner once\n",
+           version, abandon ? "reset-abandon" : "completed");
+}
+
 static void test_batch_notify(unsigned version)
 {
     struct riscv_virtio_mmio_net d; start(version,&d);
@@ -756,6 +844,8 @@ int main(void)
         if (version == 2) { test_negotiation_failure(version, 1); test_negotiation_failure(version, 2); }
         for (unsigned nth = 1; nth <= 3; nth++) { test_allocation_failure(version, nth, 0); test_allocation_failure(version, nth, 1); }
         test_plic_failure(version, 0); test_plic_failure(version, 1); test_reset_owner(version);
+        test_rx_cpu_lease(version);
+        test_tx_release_reentry(version, 0); test_tx_release_reentry(version, 1);
     }
     test_legacy_reserved_status();
     for (unsigned entry = 0; entry < 3; entry++) errors += test_device_needs_reset(entry);

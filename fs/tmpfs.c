@@ -61,7 +61,7 @@ static struct kernel_vfs_timespec now(void)
     return (struct kernel_vfs_timespec){ns / 1000000000, ns % 1000000000};
 }
 static void dispose(struct tmp_mount *m, void *p)
-{ if (p && kernel_heap_release(m->instance.heap, p) != KERNEL_HEAP_STATUS_OK) __builtin_trap(); }
+{ if (p) kernel_heap_release(m->instance.heap, p); }
 static int allocate(struct tmp_mount *m, size_t n, void **out)
 {
     enum kernel_heap_status r = kernel_heap_allocate_zeroed(m->instance.heap, 1, n, out);
@@ -534,7 +534,7 @@ static int unmount(struct kernel_vfs_mount *mount)
     while(m->inodes) { m->inodes->links=0; collect_inode(m,m->inodes); }
     if(__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) || m->inode_count) __builtin_trap();
     struct kernel_heap *heap=m->instance.heap;
-    if(kernel_heap_release(heap,m)!=KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    kernel_heap_release(heap,m);
     return 0;
 }
 static void initialize_ops(void)

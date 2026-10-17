@@ -223,8 +223,7 @@ static struct kernel_record_lock *allocate(struct kernel_heap *heap)
 
 static void release(struct kernel_heap *heap, struct kernel_record_lock *lock)
 {
-    if (kernel_heap_release(heap, lock) != KERNEL_HEAP_STATUS_OK)
-        __builtin_trap();
+    kernel_heap_release(heap, lock);
 }
 
 static int touching(const struct kernel_record_lock *lock,

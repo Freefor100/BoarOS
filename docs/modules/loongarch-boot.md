@@ -26,7 +26,7 @@ make test-pthread-oom-loongarch # 两处 clone 构造 OOM、真实 pthread EAGAI
 make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权对照
 ```
 
-契约 runner 使用 `kernel-contract-la`；普通根盘、网络和用户程序 runner 使用 `kernel-la`。两者共享通用对象，启动 main/root 与测试对象分开保存。编译配置记录编译器身份、全局宏和 flags，链接配置记录对象集合与 wrappers；同目录反向切换也会更新受影响产物，内容未变时保留缓存。`make test-build-config-host` 用实际 Make 规则检查这些切换与无变更构建。
+契约 runner 使用 `kernel-contract-la`；普通根盘、网络和用户程序 runner 使用 `kernel-la`。共用生产源在 `COMMON_C_SOURCES` 维护一次，RV 的链接顺序为 CPU/锁、架构后端、其余通用代码；LA 直接组合共用源与自身架构源，不从含 RV 测试配置的列表排除条目。普通与契约产物共享通用对象，启动 main/root 与测试对象分开保存。编译配置记录编译器身份、全局宏和 flags，链接配置记录对象集合与 wrappers；同目录反向切换也会更新受影响产物，内容未变时保留缓存。`make test-build-config-host` 用实际 Make 规则检查这些切换与无变更构建。
 
 `prepare-la-tools` 从固定 QEMU 加本地 RTC 补丁构建派生模拟器；`prepare-la-original-tools`
 保留无补丁对照构建。`prepare-la-linux` 从固定 Linux defconfig 建立

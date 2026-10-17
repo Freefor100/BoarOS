@@ -417,13 +417,13 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
         for (uint32_t i = 0; i < working->count; i++)
             if (working->entries[i].shm_attachment)
                 kernel_shm_attachment_close(working->entries[i].shm_attachment);
-        (void)kernel_heap_release(working->heap, working->entries);
+        kernel_heap_release(working->heap, working->entries);
         working->entries = 0;
         working->count = 0U;
         working->capacity = 0U;
         working->total_bytes = 0U;
     }
-    (void)kernel_heap_release(working->heap, working);
+    kernel_heap_release(working->heap, working);
     *set = 0;
     return KERNEL_VMA_STATUS_OK;
 }

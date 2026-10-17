@@ -20,6 +20,7 @@ static size_t user_remaining = SIZE_MAX;
 static struct kernel_socket *close_during_copy;
 static struct kernel_socket *shutdown_during_copy;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
+static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
 
@@ -42,6 +43,14 @@ void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g
     CHECK(!pthread_mutex_lock(&model_mutex)); CHECK(!lock->writer);
     lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context}; acquired++;
 }
+int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    CHECK(!guard->lock);
+    if (pthread_mutex_trylock(&model_mutex)) return 0;
+    CHECK(!lock->writer);
+    lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context}; acquired++;
+    return 1;
+}
 void kernel_lock_release(struct kernel_lock_guard *guard)
 {
     CHECK(guard->lock && guard->owner==&test_context && guard->lock->writer==&test_context);
@@ -58,8 +67,17 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, si
 { CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap, void *allocation)
-{ CHECK(heap == &test_heap && allocation && heap_live); --heap_live; free(allocation); return KERNEL_HEAP_STATUS_OK; }
+void kernel_heap_release(struct kernel_heap *heap, void *allocation)
+{
+    CHECK(heap == &test_heap && allocation && heap_live);
+    if (heap_release_once) {
+        void (*interleave)(void *)=heap_release_once;
+        heap_release_once=0;
+        interleave(allocation);
+    }
+    --heap_live;
+    free(allocation);
+}
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 { *queue = (struct kernel_wait_queue){.initialized = 1}; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
@@ -159,6 +177,7 @@ static void nodelay_pending(unsigned blocked)
     socket->tcp->local_port = 22000; socket->tcp->remote_port = 22001;
     socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
     TCP_REG_ACTIVE(socket->tcp); tcp_bind_netif(socket->tcp, &network.interface);
+    tcp_publish_capacity(socket);
     uint64_t frozen = clock_ns;
     CHECK(kernel_socket_write_buffer(socket, "a", 1, 0) == 1);
     CHECK(copied_packets == 1 && socket->tcp->unacked && !socket->tcp->unsent);
@@ -204,6 +223,7 @@ static void copy_capacity(unsigned eligible, unsigned gather)
     socket->tcp->local_port = 22000; socket->tcp->remote_port = 22001;
     socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
     TCP_REG_ACTIVE(socket->tcp); tcp_bind_netif(socket->tcp, &network.interface);
+    tcp_publish_capacity(socket);
     dma_eligible = eligible; nic_full = 1; copy_attempts = copied_packets = segment_attempts = 0;
     kernel_socket_protocol_leave(&irq);protocol_services=0;
     if (gather) {
@@ -423,6 +443,51 @@ static void raw_owner_control(void)
     puts("PASS unowned raw TIME_WAIT PCBs do not invoke a socket owner");
 }
 
+static struct {
+    struct kernel_socket *sender;
+    struct socket_packet *incoming;
+    struct kernel_socket_read_request *read;
+    unsigned live;
+} unix_destroy_race;
+
+static void finish_during_unix_destroy(void *allocation)
+{
+    CHECK(allocation==unix_destroy_race.incoming && arch_interrupt_is_enabled());
+    CHECK(unix_destroy_race.sender->destroying==1 && unix_destroy_race.sender->unix_packets==1);
+    CHECK(kernel_socket_finish_read(unix_destroy_race.read,0)==4);
+    /* The closer still uses sender after this callback. Returning its last
+     * packet must not transfer final release until that cleanup is complete. */
+    CHECK(unix_destroy_race.sender->destroying==1 && !unix_destroy_race.sender->unix_packets &&
+        !unix_destroy_race.sender->unix_memory && heap_live+1==unix_destroy_race.live);
+}
+
+static void unix_destroy_interleaving(void)
+{
+    unsigned before=heap_live;
+    struct kernel_socket *sender=0,*receiver=0;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&sender,&receiver));
+    CHECK(kernel_socket_write_buffer(sender,"sent",4,0)==4);
+    CHECK(kernel_socket_write_buffer(receiver,"back",4,0)==4);
+    struct kernel_open_file_description *owner=(void *)receiver;
+    struct kernel_socket_read_request read={0};
+    CHECK(kernel_socket_reserve_read(receiver,0,&read,&owner,4,0)==4 && !owner);
+    char bytes[4];
+    kernel_socket_copy_read(&read,0,bytes,sizeof(bytes));
+    CHECK(!memcmp(bytes,"sent",sizeof(bytes)) && heap_live==before+4);
+    unix_destroy_race.sender=sender;
+    unix_destroy_race.incoming=sender->packets_head;
+    unix_destroy_race.read=&read;
+    unix_destroy_race.live=heap_live;
+    heap_release_once=finish_during_unix_destroy;
+    kernel_socket_destroy(sender);
+    CHECK(!heap_release_once && !read.socket && owner==(void *)receiver && !receiver->rx_bytes);
+    CHECK(heap_live==before+1);
+    kernel_socket_destroy(receiver);
+    CHECK(heap_live==before);
+    memset(&unix_destroy_race,0,sizeof(unix_destroy_race));
+    puts("PASS UNIX destroy preemption: last sent packet returned during incoming cleanup, closer retains final release");
+}
+
 static void unix_sender_owner(void)
 {
     kernel_socket_network_initialize();
@@ -444,6 +509,7 @@ static void unix_sender_owner(void)
         }
         CHECK(!heap_live);
     }
+    unix_destroy_interleaving();
     puts("PASS UNIX queued sender survives endpoint close and returns accounting once in either close order");
 }
 
@@ -633,8 +699,9 @@ static void protocol_transaction(void)
     struct kernel_socket_read_request read={0};
     locks=acquired;services=protocol_services;
     CHECK(kernel_socket_reserve_read(server,NULL,&read,&reader,1,0)==1);
-    CHECK(acquired==locks+1 && protocol_services==services+1);
+    CHECK(acquired==locks && protocol_services==services);
     kernel_socket_finish_read(&read,0);
+    CHECK(acquired==locks && protocol_services==services);
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     locks=acquired;services=protocol_services;
     CHECK(kernel_socket_write_buffer(client,"y",1,0)==1);
@@ -668,9 +735,9 @@ static void receive_prefix(void)
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)a,2},{(uintptr_t)b,8}};
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
     CHECK(!kernel_socket_read_user(&request,(void *)receiver,&cursor));
-    CHECK(acquired==locks+1 && !memcmp(a,"ab",2) && !memcmp(b,"cdefghij",8));
+    CHECK(acquired==locks && !memcmp(a,"ab",2) && !memcmp(b,"cdefghij",8));
     kernel_socket_finish_read(&request,0);
-    CHECK(acquired==locks+2 && receiver->rx_bytes==2);
+    CHECK(acquired==locks && receiver->rx_bytes==2);
     CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0)==2);
     struct kernel_open_file_description *other=(void *)receiver;
     struct kernel_socket_read_request second={0};
@@ -733,11 +800,75 @@ static void receive_packet_chains(void)
     puts("PASS chained packet prefix: readv spans pbuf chains, fault commits preceding whole packet and replays fault packet");
 }
 
+static unsigned retired_payloads;
+static void retired_payload_free(struct pbuf *payload)
+{
+    CHECK(payload && protocol_owner == &test_context && protocol_depth && arch_interrupt_is_enabled());
+    retired_payloads++;
+}
+static void endpoint_ownership(void)
+{
+    kernel_socket_network_initialize();
+    /* A consumed custom pbuf still owns its DMA-like payload until the core
+     * worker, or final close, actually uses and returns it. */
+    for (unsigned final_close = 0; final_close < 2; final_close++) {
+        struct kernel_socket *socket = NULL;
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&socket));
+        struct pbuf_custom custom = {.custom_free_function=retired_payload_free};
+        unsigned char bytes[4] = {'l','o','a','n'}, out[4] = {0};
+        struct pbuf *payload = pbuf_alloced_custom(PBUF_RAW,4,PBUF_REF,&custom,bytes,4);
+        CHECK(payload);
+        ip_addr_t peer;IP_ADDR4(&peer,127,0,0,1);
+        struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+        udp_received(socket,socket->udp,payload,&peer,24001);
+        kernel_socket_protocol_leave(&scope);
+        unsigned locks=acquired, returned=retired_payloads;
+        struct kernel_open_file_description *pin=(void *)socket;
+        struct kernel_socket_read_request read={0};
+        CHECK(kernel_socket_receive_ready(socket) && (kernel_socket_poll(socket,NULL)&KERNEL_POLLIN));
+        CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,4,0)==4);
+        kernel_socket_copy_read(&read,0,out,4);
+        CHECK(kernel_socket_finish_read(&read,0)==4 && !memcmp(out,bytes,4));
+        CHECK(acquired==locks && retired_payloads==returned && socket->retired_head && !socket->packets_head);
+        if (!final_close) {
+            (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+            CHECK(!socket->retired_head && retired_payloads==returned+1);
+        }
+        kernel_socket_destroy(socket);
+        CHECK(retired_payloads==returned+1);
+    }
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    /* The accepted side sends first: no incoming payload or timer may be
+     * needed to create its transmit admission. Two writers share one ledger. */
+    struct kernel_open_file_description *a=(void *)server,*b=(void *)server;
+    struct kernel_socket_write_request first={0},second={0};
+    kernel_socket_stream_begin(&first,&a);kernel_socket_stream_begin(&second,&b);
+    unsigned locks=acquired;
+    uint32_t available=tcp_admission_capacity(server);
+    CHECK(available && kernel_socket_stream_reserve(&first,available,0)==(int)available);
+    CHECK(kernel_socket_stream_reserve(&second,1,0)==-KERNEL_EAGAIN);
+    CHECK(!(kernel_socket_poll(server,NULL)&KERNEL_POLLOUT));
+    kernel_socket_stream_cancel(&first);
+    CHECK(kernel_socket_stream_reserve(&second,1,0)==1 && acquired==locks);
+    CHECK(kernel_socket_stream_commit(&second,"g",1,0)==1 && acquired==locks+1);
+    kernel_socket_stream_finish(&first);kernel_socket_stream_finish(&second);
+    CHECK(server->tx_reserved==0 && kernel_socket_receive_ready(client));
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    if(client->tcp)tcp_abort(client->tcp);
+    if(server->tcp)tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
+    for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    puts("PASS endpoint ownership: no core lock for RX/poll/admission, accepted writer sends first, reservations cannot oversell, payload retired once by worker or close");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     if (!strcmp(argv[1], "protocol-owner")) { protocol_ownership(); return 0; }
-    if (!strcmp(argv[1], "receive-chains")) receive_packet_chains();
+    if (!strcmp(argv[1], "endpoint-owner")) endpoint_ownership();
+    else if (!strcmp(argv[1], "receive-chains")) receive_packet_chains();
     else if (!strcmp(argv[1], "receive-prefix")) receive_prefix();
     else if (!strcmp(argv[1], "protocol-transaction")) protocol_transaction();
     else if (!strcmp(argv[1], "nodelay")) nodelay_pending(0);

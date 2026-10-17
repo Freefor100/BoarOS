@@ -31,7 +31,7 @@ static uint64_t test_satp;
 static int force_fault_page_access_failure;
 static uint64_t fault_page_address;
 
-enum kernel_heap_status __real_kernel_heap_release(
+void __real_kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer);
 enum kernel_heap_status __real_kernel_heap_resize(

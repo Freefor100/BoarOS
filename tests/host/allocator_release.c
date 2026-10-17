@@ -276,6 +276,13 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
         physical_page_reference_count(&allocator, page + BOAROS_PAGE_SIZE, &references);
         break;
     }
+    case 22: kernel_heap_release(0, object); break;
+    case 23: {
+        struct kernel_heap other;
+        assert(!kernel_heap_init(&other, &allocator, page_address));
+        kernel_heap_release(&other, object);
+        break;
+    }
     case 18:
     case 19:
     case 20: {
@@ -364,6 +371,8 @@ static void check_release_diagnostic(unsigned int which, const char *diagnostic,
         {0, 0U, 0},
         {0, 0U, 0},
         {0, 0U, 0},
+        {0, 0U, 0},
+        {0, 0U, 0},
     };
     uint64_t address;
 
@@ -423,6 +432,9 @@ static void test_legal_release_is_silent(void)
 {
     uint64_t page;
     uint64_t available;
+    void *small;
+    void *large;
+    struct kernel_heap_statistics statistics;
 
     setup();
     available = physical_page_available(&allocator);
@@ -433,6 +445,15 @@ static void test_legal_release_is_silent(void)
     assert(physical_page_release(&allocator, page) == 0);
     assert(physical_page_allocate_order(&allocator, 1U, &page) == 0);
     assert(physical_page_release_order(&allocator, page, 1U) == 0);
+    assert(!kernel_heap_allocate(&heap, 32, &small));
+    assert(!kernel_heap_allocate(&heap, 3 * BOAROS_PAGE_SIZE, &large));
+    kernel_heap_release(&heap, small);
+    kernel_heap_release(&heap, large);
+    kernel_heap_release(&heap, 0);
+    assert(!kernel_heap_allocate(&heap, 32, &small));
+    assert(!kernel_heap_resize(&heap, small, 0, &small) && !small);
+    kernel_heap_get_statistics(&heap, &statistics);
+    assert(!statistics.live_allocations && !statistics.current_pages);
     assert(physical_page_available(&allocator) == available);
     assert(console_characters == 0U);
 }
@@ -465,7 +486,7 @@ int main(void)
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
     test_legal_release_is_silent();
     test_retired_payload_is_not_owner();
-    for (unsigned int i = 0; i < 22; i++) {
+    for (unsigned int i = 0; i < 24; i++) {
         int output[2];
         char diagnostic[2048];
         size_t length = 0U;

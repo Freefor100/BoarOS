@@ -657,7 +657,7 @@ static enum kernel_heap_status allocation_information(
     }
 }
 
-enum kernel_heap_status kernel_heap_release(
+void kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer)
 {
@@ -672,7 +672,7 @@ enum kernel_heap_status kernel_heap_release(
         __builtin_trap();
     }
     if (pointer == 0) {
-        return KERNEL_HEAP_STATUS_OK;
+        return;
     }
     KERNEL_RAW_SCOPE(guard, &heap->lock);
 
@@ -723,7 +723,6 @@ enum kernel_heap_status kernel_heap_release(
     }
 
     heap->statistics.live_allocations--;
-    return KERNEL_HEAP_STATUS_OK;
 }
 
 enum kernel_heap_status kernel_heap_resize(
@@ -749,11 +748,9 @@ enum kernel_heap_status kernel_heap_resize(
         return kernel_heap_allocate(heap, new_size, new_pointer);
     }
     if (new_size == 0U) {
-        status = kernel_heap_release(heap, old_pointer);
-        if (status == KERNEL_HEAP_STATUS_OK) {
-            *new_pointer = 0;
-        }
-        return status;
+        kernel_heap_release(heap, old_pointer);
+        *new_pointer = 0;
+        return KERNEL_HEAP_STATUS_OK;
     }
     if (!allocation_order_for_size(new_size, &order)) {
         return KERNEL_HEAP_STATUS_OVERFLOW;
@@ -796,11 +793,7 @@ enum kernel_heap_status kernel_heap_resize(
         kernel_cost_add_tag(memory_tag, COST_HEAP_COPY_BYTES, capacity);
 #endif
     }
-    status = kernel_heap_release(heap, old_pointer);
-    if (status != KERNEL_HEAP_STATUS_OK) {
-        (void)kernel_heap_release(heap, result);
-        return status;
-    }
+    kernel_heap_release(heap, old_pointer);
 
     *new_pointer = result;
     return KERNEL_HEAP_STATUS_OK;

@@ -399,68 +399,6 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
                                         access);
 }
 
-static enum kernel_scheduler_status validate_child_list(
-    const struct kernel_task *parent, const struct kernel_task *required_child)
-{
-    SCHEDULER_TASK_BORROW(owner, 0);
-    uint64_t epoch = 0;
-    uintptr_t previous = 0;
-    uint32_t count = 0;
-    int found = required_child == 0, restart = 1;
-    for (;;) {
-        struct kernel_task *next_owner = 0;
-        int done = 0;
-        enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (!parent) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            if (parent->children_epoch != epoch) restart = 1;
-            if (restart) {
-                if (!parent || parent->magic != KERNEL_THREAD_MAGIC || parent->arch.user_mode != 1 ||
-                    !parent->tid_owned || parent->tid <= 0 ||
-                    ((parent->first_child == 0) != (parent->last_child == 0)) ||
-                    (parent->first_child && parent->first_child->previous_sibling) ||
-                    (parent->last_child && parent->last_child->next_sibling))
-                    return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-                epoch = parent->children_epoch;
-                previous = count = 0;
-                found = required_child == 0;
-            }
-            struct kernel_task *child = restart || owner == 0 || parent->children_epoch != epoch
-                ? parent->first_child : owner;
-            /* A changed epoch restarts with the still-protected live head. */
-            if (restart) child = parent->first_child;
-            restart = 0;
-            for (unsigned n = 0; child && n < 16; n++) {
-                if (++count > KERNEL_PID_LIMIT || child == parent || child->magic != KERNEL_THREAD_MAGIC ||
-                    child->idle || child->arch.user_mode != 1 || !child->tid_owned || child->tid <= 0 ||
-                    child->parent != parent || (uintptr_t)child->previous_sibling != previous ||
-                    child->publish_completion || child->state < KERNEL_THREAD_STATE_READY ||
-                    child->state > KERNEL_THREAD_STATE_GROUP_DEAD) {
-                    status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-                    break;
-                }
-                if (child == required_child) found = 1;
-                previous = (uintptr_t)child;
-                child = child->next_sibling;
-            }
-            if (status == KERNEL_SCHEDULER_STATUS_OK) {
-                if (!child) {
-                    done = 1;
-                    if (previous != (uintptr_t)parent->last_child || !found)
-                        status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-                } else {
-                    scheduler_task_get_locked(child);
-                    next_owner = child;
-                }
-            }
-        }
-        if (owner) scheduler_task_put(owner);
-        owner = next_owner;
-        if (status != KERNEL_SCHEDULER_STATUS_OK || done) return status;
-    }
-}
-
 static enum kernel_scheduler_status validate_child_endpoints(
     const struct kernel_task *parent)
 {
@@ -482,6 +420,15 @@ static enum kernel_scheduler_status validate_child_endpoints(
 static void child_append_locked(struct kernel_task *parent,
                          struct kernel_task *child)
 {
+    /* 在实际改链处核对局部关系，退出与收养不再预扫整个父子树。 */
+    if (!parent || !child || parent == child || child->parent ||
+        child->previous_sibling || child->next_sibling ||
+        ((parent->first_child == 0) != (parent->last_child == 0)) ||
+        (parent->first_child &&
+         (parent->first_child->previous_sibling || parent->first_child->parent != parent)) ||
+        (parent->last_child &&
+         (parent->last_child->next_sibling || parent->last_child->parent != parent)))
+        __builtin_trap();
     if (++parent->children_epoch == 0) __builtin_trap();
     child->parent = parent;
     child->previous_sibling = parent->last_child;
@@ -497,6 +444,18 @@ static void child_append_locked(struct kernel_task *parent,
 static void child_remove_locked(struct kernel_task *parent,
                          struct kernel_task *child)
 {
+    if (!parent || !child || parent == child || child->parent != parent ||
+        !parent->first_child || !parent->last_child ||
+        child->previous_sibling == child || child->next_sibling == child ||
+        (child->previous_sibling ?
+            (child->previous_sibling->parent != parent ||
+             child->previous_sibling->next_sibling != child) :
+            parent->first_child != child) ||
+        (child->next_sibling ?
+            (child->next_sibling->parent != parent ||
+             child->next_sibling->previous_sibling != child) :
+            parent->last_child != child))
+        __builtin_trap();
     if (++parent->children_epoch == 0) __builtin_trap();
     if (child->previous_sibling == 0) {
         parent->first_child = child->next_sibling;
@@ -1597,10 +1556,6 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             }
         }
         if (thread->parent != 0) {
-#if BOAROS_LOCK_DEBUG
-            status = validate_child_list(thread->parent, thread);
-            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-#endif
             {
                 KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
                 struct kernel_task *parent = thread->parent;
@@ -1710,7 +1665,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
                        ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
                        : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
-        (void)kernel_heap_release(heap, transaction);
+        kernel_heap_release(heap, transaction);
         thread->exec_transaction = 0;
     }
     if (thread->files.state == KERNEL_FILES_LIVE ||
@@ -1917,7 +1872,7 @@ static uint32_t user_wait_status(
 
 static enum kernel_scheduler_status reparent_children(struct kernel_task *parent)
 {
-    enum kernel_scheduler_status status = validate_child_list(parent, 0);
+    enum kernel_scheduler_status status = validate_child_endpoints(parent);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1933,10 +1888,6 @@ static enum kernel_scheduler_status reparent_children(struct kernel_task *parent
             new_parent->state == KERNEL_THREAD_STATE_EXITED || new_parent->state == KERNEL_THREAD_STATE_ZOMBIE)
             new_parent = 0;
         if (new_parent) scheduler_task_get_locked(new_parent);
-    }
-    if (new_parent) {
-        status = validate_child_list(new_parent, 0);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     }
     struct kernel_pid *replacement __attribute__((cleanup(kernel_task_identity_end))) =
         new_parent ? child_reaper_identity_get(new_parent, 0) : 0;

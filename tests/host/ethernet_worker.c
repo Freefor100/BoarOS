@@ -199,13 +199,13 @@ void etharp_cleanup_netif(struct netif *n) {(void)n;if(!protocol_held) abort();}
 void netif_set_down(struct netif *n) {(void)n;if(!protocol_held) abort();}
 void netif_remove(struct netif *n) {(void)n;if(!protocol_held) abort();removed++;}
 void kernel_socket_network_hooks(void (*timer)(void *),void (*work)(void *),int (*capacity)(void *),void *context)
-{ if(timer || work || capacity || context) abort();hook_removed++; }
+{ if(timer || work || capacity || context || protocol_held || !arch_interrupt_is_enabled()) abort();hook_removed++; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
 {(void)q;if(arch_interrupt_is_enabled()) abort();return KERNEL_SCHEDULER_STATUS_OK;}
 void kernel_heap_get_statistics(const struct kernel_heap *heap,struct kernel_heap_statistics *out)
 {(void)heap;*out=(struct kernel_heap_statistics){0};}
-enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap,void *allocation)
-{(void)heap;if(protocol_held || !arch_interrupt_is_enabled()) abort();free(allocation);freed++;return KERNEL_HEAP_STATUS_OK;}
+void kernel_heap_release(struct kernel_heap *heap,void *allocation)
+{(void)heap;if(protocol_held || !arch_interrupt_is_enabled()) abort();free(allocation);freed++;}
 static void stop_contract(void)
 {
     struct virtio_net_device d={.loaned=1};
@@ -214,9 +214,9 @@ static void stop_contract(void)
     network_host_irq=RISCV_SSTATUS_SIE;worker_mode=0;
     unsigned old_abandon=abandon_calls;
     quiesce_error=1;
-    if(kernel_network_stop(&n)!=-KERNEL_EIO || !n || removed || abandon_calls!=old_abandon || freed) abort();
+    if(kernel_network_stop(&n)!=-KERNEL_EIO || !n || removed || abandon_calls!=old_abandon || freed || hook_removed!=1) abort();
     quiesce_error=0;
-    if(kernel_network_stop(&n)!=-KERNEL_EBUSY || !n || removed!=1 || abandon_calls!=old_abandon+1 || freed || hook_removed) abort();
+    if(kernel_network_stop(&n)!=-KERNEL_EBUSY || !n || removed!=1 || abandon_calls!=old_abandon+1 || freed || hook_removed!=1) abort();
     d.loaned=0;
     if(kernel_network_stop(&n) || n || freed!=1 || joined!=1 || hook_removed!=1 || removed!=1) abort();
     puts("PASS stop: join/reset outside protocol and IRQ, reset failure retains owner, RX loan EBUSY retains object until final return");
