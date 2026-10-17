@@ -26,7 +26,6 @@
 #include "../../fs/vfs_objects.h"
 #include "../../fs/vfs_internal.h"
 #ifdef FILES_PARTIAL_WRITE_TEST
-#include "../../fs/vfs_internal.h"
 #include "../../fs/ext4_backend.h"
 
 #include <ext4.h>
@@ -150,13 +149,32 @@ static uint64_t writeback_redirty_address;
 static enum kernel_uaccess_status writeback_redirty_status;
 static size_t writeback_redirty_copied;
 static unsigned int writeback_redirty_seen;
+static struct kernel_lock_guard *writeback_redirty_guard;
 
-int __real_ext4_file_sync_metadata_mode(ext4_file *, bool);
-int __wrap_ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
+void __real_kernel_lock_release(struct kernel_lock_guard *);
+void __wrap_kernel_lock_release(struct kernel_lock_guard *guard)
 {
-    int result = __real_ext4_file_sync_metadata_mode(file, data_only);
+    int redirty = guard == writeback_redirty_guard;
+    __real_kernel_lock_release(guard);
+    if (redirty) {
+        struct kernel_mm *mm = writeback_redirty_mm;
+        unsigned char value = 'O';
+        writeback_redirty_guard = 0;
+        writeback_redirty_mm = 0;
+        writeback_redirty_seen++;
+        /* 后端已归还inode资格，旧版本尚未发布完成；实际MM写缺页仍
+         * 按MM→inode顺序取得保护，不在后端读锁内伪造另一用户的访问。 */
+        writeback_redirty_status = kernel_copy_to_user(mm, writeback_redirty_address,
+            &value, 1U, &writeback_redirty_copied);
+    }
+}
+
+int __real_ext4_file_sync_metadata_prepare(ext4_file *, bool, uint64_t *);
+int __wrap_ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *target)
+{
+    int result = __real_ext4_file_sync_metadata_prepare(file, data_only, target);
     if (result) return result;
-    /* A retryable sync result is distinct from a failed journal barrier:
+    /* A retryable preparation result is distinct from a failed journal barrier:
      * the latter poisons the mount and is tested by the final fixture. */
     if (sendfile_flush_output != 0 &&
         kernel_open_file_size(sendfile_flush_output) >= sendfile_flush_threshold) {
@@ -222,10 +240,9 @@ int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, un
     if (!inject_partial_write_error) {
         result=__real_ext4_fpwrite_batch(file,spans,count);
         if (writeback_redirty_mm && !result) {
-            struct kernel_mm *mm=writeback_redirty_mm;
-            unsigned char value='O';
-            writeback_redirty_mm=0; writeback_redirty_seen++;
-            writeback_redirty_status=kernel_copy_to_user(mm,writeback_redirty_address,&value,1U,&writeback_redirty_copied);
+            if (writeback_redirty_guard) __builtin_trap();
+            writeback_redirty_guard = kernel_io_context_current()->locks;
+            if (!writeback_redirty_guard || writeback_redirty_guard->write) __builtin_trap();
         }
         return result;
     }
@@ -3903,14 +3920,15 @@ static void run_partial_write_test(const void *dtb)
                             &mapped_copied) != KERNEL_UACCESS_STATUS_OK ||
         mapped_copied != 1U)
         fail_files(433U, 0, -1);
-    /* The ext4 write callback runs after the old contents were copied to
-     * the device, but before page-cache writeback compares generations. */
+    /* Arm after backend acceptance, then write after its inode guard is
+     * released and before page-cache writeback compares generations. */
     writeback_redirty_mm = &mm;
     writeback_redirty_address = peer_address;
     writeback_redirty_copied = 0U;
     writeback_redirty_seen = 0U;
     if (kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0 ||
         writeback_redirty_mm != 0 || writeback_redirty_seen != 1U ||
+        writeback_redirty_guard != 0 ||
         writeback_redirty_status != KERNEL_UACCESS_STATUS_OK ||
         writeback_redirty_copied != 1U ||
         kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0)

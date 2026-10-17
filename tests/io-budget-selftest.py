@@ -27,6 +27,9 @@ class Profiles(unittest.TestCase):
         for size in ('1M', '4M', '16M', '64M'):
             for request in ('1K', '4K', '64K'):
                 io.parse_case(f'ext4:cold-read:cache:4:{size}:{request}')
+        for bad in ('tmpfs:mixed-read:fsync:4:1M:4K', 'ext4:mixed-read:cache:4:1M:4K',
+                    'ext4:mixed-read:fdatasync:4:1M:4K', 'ext4:mixed-read:fsync:1:1M:4K'):
+            with self.assertRaises(ValueError): io.parse_case(bad)
 
     def test_smoke_is_not_promoted_to_performance(self):
         case = io.parse_case('ext4:cold-read:cache:1:1M:4K')
@@ -92,6 +95,41 @@ class Workload(unittest.TestCase):
 
     def test_actual_content_corruption_is_rejected(self):
         self.exercise('ext4:cold-read:cache:1:1M:4K', corrupt=True)
+
+    def test_mixed_read_and_close_intervals(self):
+        case = io.parse_case('ext4:mixed-read:fsync:4:1M:4K')
+        with tempfile.TemporaryDirectory(dir=self.work) as directory:
+            work = Path(directory)
+            io.seed(work / 'data', case)
+            self.assertEqual((work / 'data/file-0').stat().st_size, 0)
+            config = work / 'config'
+            config.write_text('{backend} {operation} {completion} {files} {bytes} {request}\n'.format(**case))
+            result = subprocess.run([str(self.program), str(config), str(work / 'data')],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = Path(str(config) + '.results').read_text()
+            parsed = io.validate(text, case)
+            self.assertEqual(parsed['metrics']['bytes'], case['bytes'] * 2)
+            self.assertEqual(parsed['latencies']['read']['all']['samples'], 512)
+            self.assertEqual(parsed['latencies']['close']['all']['samples'], 256)
+            self.assertEqual(parsed['latencies']['open']['samples'], 255)
+            self.assertGreater(parsed['metrics']['sync_ns'], 0)
+            lines = text.splitlines(keepends=True)
+            removed = False
+            truncated = []
+            for line in lines:
+                if not removed and line.startswith('IO MIXED_SAMPLE '):
+                    removed = True
+                else:
+                    truncated.append(line)
+            with self.assertRaises(RuntimeError): io.validate(''.join(truncated), case)
+            with self.assertRaises(RuntimeError): io.validate(text.replace('complete=1', 'complete=0', 1), case)
+            altered = text.replace('id=1 sequence=0 ', 'id=9 sequence=0 ', 1)
+            with self.assertRaises(RuntimeError): io.validate(altered, case)
+
+    def test_mixed_latency_percentile_and_absent_overlap(self):
+        self.assertEqual(io.latency_metrics([]), dict(samples=0, p50_ns=None, p99_ns=None, maximum_ns=None))
+        self.assertEqual(io.latency_metrics(range(1, 101)), dict(samples=100, p50_ns=50, p99_ns=99, maximum_ns=100))
 
 
 if __name__ == '__main__': unittest.main()

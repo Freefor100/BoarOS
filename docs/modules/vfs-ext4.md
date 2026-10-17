@@ -121,7 +121,11 @@ miss 路径私有分配未清零页，通过 node 的无 offset 副作用批量 
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join 页缓存 worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node；日志 worker 继续服务这些交接，排空到 checkpoint 后才停止并 join，之后允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
-`kernel_vfs_sync()` 先交接目标 inode 脏页，再捕获 full/data 目标序号并等待提交完成；journal 路径已包含持久化屏障，不额外发无意义的设备 flush。无 journal 路径仍显式 flush。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；共享 inode 的后端 handle 记录完整和数据序号。full 同步为涵盖经其他 handle 的 namespace 修改，保守地捕获当前 mount 序号一次；data 同步等待数据/检索依赖序号，纯时间修改不推进它。同组时间字段可以顺带持久化；新修改不会无限延长已有等待目标。`O_SYNC/O_DSYNC` 分别对已接受的写入前缀执行 full/data 同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。
+`kernel_vfs_sync()` 先分批交接目标 inode 脏页，再由 CPU0 的 prepare 操作处理元数据并捕获一次 full/data durable 目标。随后归还缓存执行者，由原调用者等待自己的目标。journal worker 达到目标或发布挂载错误时，在 CPU0 记录元数据错误、消费共享 OFD 的错误游标，再在原请求的 raw 保护内发布 result/done 并通知调用者；调用者取走结果直接返回，不为错误观察再次排队。数据交接失败只观察既有错误记录，不重复递增写回错误序号；只读或内存后端即时完成，已经完成的请求无需建立等待队列。
+
+等待请求位于调用者栈上，借用实际 file，外层 OFD 或映射来源引用覆盖整个等待，挂载仍有同步请求时不能停止日志 worker。登记后重查真实 durable 序号，完成早于登记也不会丢通知。正常 journal 同步只交接一次 prepare，由原调用者等待完成，不以文件位置锁覆盖独立同步等待。
+
+journal 路径已包含持久化屏障，不额外发设备 flush；无 journal 路径仍显式 flush。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；共享 inode 的后端 handle 记录完整和数据序号。full 同步为涵盖经其他 handle 的 namespace 修改，捕获当前 mount 序号一次；data 同步等待数据/检索依赖序号，纯时间修改不推进它。同组时间字段可以顺带持久化；新修改不延长已捕获的目标。`O_SYNC/O_DSYNC` 分别对已接受的写入前缀执行 full/data 同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。commit 与 checkpoint 仍沿用既有独立推进、稳定版本和屏障顺序。
 
 ## 挂载范围与全局同步
 
@@ -438,7 +442,7 @@ guest 测试不变。每份 4 GiB 工作镜像因此实际占用约 4 GiB，空�
 规模准备采用稀疏零页，另独立验证第 0 页已存在且已同步的真实旧内容被完整覆盖。
 重建 `make test-scale-riscv test-cache-growth-riscv`；这是成本界验证，吞吐结果另行测量。
 
-`kernel_vfs_sync_range()` 依次交接数据、等待 full 同步序号；
+`kernel_vfs_sync_range()` 分批交接数据，捕获 full 同步序号后由调用者等待；
 `kernel_vfs_sync()` 按 datasync 选择 full/data，journal 提交线程负责屏障。
 元数据随修改提交，频繁小写与逐次同步的事务/flush 放大尚需单独计量。
 
@@ -511,7 +515,7 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 同页 miss 先发布 loading 项，等待者合并到该项；不同页可各自等待设备。失败保留所属 errno，ENOMEM 不映射成磁盘错误。缓存索引、LRU 与借用由同一 metadata mutex 保护，跨等待时持有实际 entry、版本或 alias 引用；块缓存的 loading 与 wait/wake 同样合并同块读取。实际后端操作仍在 CPU0 执行，调用者的数据复制不依赖关中断排他。
 
-写回固定本次页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回在首次等待前固定并 pin 精确页集合，不能重新遍历变化中的链表配对释放。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
+写回固定本批页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回只借用当前窗口的精确页集合，归还时使用同一集合；跨窗口只保留页号与范围，续批重查当前脏页索引，不长期借用链表后继。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
 每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
@@ -539,11 +543,21 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 回写关闭目标写入时同时固定 alias 游标；若关闭前没有实际写入者，回调后无需再取得缓存锁检查空等待条件。后端批次结束后，一次保护发布本批完成状态和 entry 借用归还，再在保护外释放稳定版本。每个版本仍按真实引用覆盖 journal 与 DMA 使用。
 远端冷读请求借用调用者的等待现场及文件 owner，由既有 CPU0 worker 执行；排队不
 发布 loading 页，worker 取得 inode 保护后重新查询并取得唯一加载资格。
+前景范围写回复用同一队列：一次调用只建立一个栈上 `cache_request`，每次最多推进
+128 KiB 窗口，尚未完成就把原请求接回队尾。调用者等待整个请求完成，不逐批醒来重新
+提交；工作区在开始前借用一次，跨窗口复用，结束后归还。冷读、最后关闭和其他 inode
+的同步准备因而可以排在续批前执行，窗口内继续复用既有 SG 与稳定数据版本。
+不占执行队列的直接调用者只在批末开放中断安全点，由正常定时器抢占，
+不逐窗口强制轮转；尚未启动调度器的启动调用继续同步推进。队列 worker 在请求或
+清理批次之间让出。
+worker 停止后不再执行未开始的续批，唤醒请求并返回错误；已经接纳的版本不回滚，
+尚未提交或失败的数据保留原脏状态和 owner。退休清理每轮最多释放 16 项后让出 CPU，
+未完成清理的链由 worker 持有到后续轮次；仍有借用的项归回缓存，等待实际归还事件。
 普通标量取页与批量取页都先在缓存索引保护内检查 inode 映射是否 closing、页是否 CLOSED，
 并按当前 EOF 确定有效长度；已完成的热页在同一保护内取得物理引用，无需先取得 inode 读资格或排队。
 不满足资格时转入既有 inode 读保护路径；loading 页仍由 entry 借用跨等待持有。
 MM 取得来源页前后仍核对映射 epoch，最终提交 PTE 前重新取得 inode 资格，复查来源 epoch、VMA 身份和 EOF。
-CPU0受控MM任务同样把冷读交给普通CPU0 worker，不能借逻辑CPU号绕过业务域。普通read/readv/pread在调用hart消费热页并复制用户数据，不再整次排队；共享offset在调用者取得，写入、seek和同步也在排队前取得同一资格，CPU0回调只借用。SMP 运行时时间戳的共享值、dirty/staged链及deadline由一把挂载raw锁维护；单 hart 构建的这些短更新不阻塞，只需 IRQ 保护，不维护跨核锁。实际编码与提交仍归CPU0；可选预读队列亦由缓存保护，取消后的节点由CPU0 worker锁外释放。预读复用普通候选分配和索引发布，取得 inode 读资格后先检查映射关闭状态；截断准备至 MM 通知期间取消预测，不能按旧 EOF 装入边界页。
+CPU0受控MM任务同样把冷读交给普通CPU0 worker，不能借逻辑CPU号绕过业务域。普通read/readv/pread在调用hart消费热页并复制用户数据，不再整次排队；共享offset在调用者取得，需要位置或写操作门的后端回调只借用已有资格。独立fsync不取得offset锁，分批交接与prepare之后由原调用者等待固定目标，完成事件同时处理错误观察。SMP 运行时时间戳的共享值、dirty/staged链及deadline由一把挂载raw锁维护；单 hart 构建的这些短更新不阻塞，只需 IRQ 保护，不维护跨核锁。实际编码与提交仍归CPU0；可选预读队列亦由缓存保护，取消后的节点由CPU0 worker锁外释放。预读复用普通候选分配和索引发布，取得 inode 读资格后先检查映射关闭状态；截断准备至 MM 通知期间取消预测，不能按旧 EOF 装入边界页。
 停止先拒绝新请求，已执行读取完成后才归还请求现场，未执行请求返回 STATE。
 `make test-page-cache-concurrency-host` 链接真实 VFS/lwext4 和镜像块读写，在4/16 KiB、
 2/4宿主线程下检查冷读合并、64页扩容/预热命中、读失败、停止交接、1/8/32别名、
@@ -565,7 +579,7 @@ I/O失败与停止不建立重试循环。宿主反例用已完成后台轮次�
 及changed明确后，在inode写保护下收敛尾零、缓存退休和尺寸发布。无变化失败不丢脏页；
 部分生效按真实尺寸处理。已退休整页的旧pin/快照借用继续固定存储，旧写回不再提交。
 purge/destroy由CPU0独占生命周期owner执行，stop/join不替代外部来源、MM或pin的结束。
-`msync` 固定来源及范围后先释放 MM gate；ext4 同步及 FD 后端操作交给既有 CPU0 worker。共享 offset 或文件写操作门在调用者取得，由执行者借用，不能在队首等待调用者的锁。接口与关闭身份见[文件模块](kernel-files.md)。
+`msync` 固定来源及范围后先释放 MM gate；ext4 数据和元数据交接由既有 CPU0 worker 推进，持久化目标由原调用者等待。需要共享 offset 或文件写操作门的操作在调用者取得资格，由执行者借用，不能在队首等待调用者的锁。接口与关闭身份见[文件模块](kernel-files.md)。
 
 ```sh
 make test-page-cache-concurrency-host test-mm-disk-concurrency-host

@@ -3917,12 +3917,13 @@ int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode)
 	return r;
 }
 
-int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
+int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *target)
 {
 	struct ext4_inode_ref ref;
 	int r, cleanup;
-	if (!file || !file->mp || !file->mp->mounted)
+	if (!file || !file->mp || !file->mp->mounted || !target)
 		return EINVAL;
+	*target = 0;
 	EXT4_MP_LOCK(file->mp);
 #if CONFIG_JOURNALING_ENABLE
 	if (file->mp->fs.jbd_journal) {
@@ -3932,9 +3933,12 @@ int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
          * Full sync captures the current mount dependency once; newer work
          * cannot advance its target while it sleeps. */
         if (!data_only && journal->grouped) file->sync_sequence = journal->accepted_sequence;
-        uint64_t target = data_only ? file->data_sequence : file->sync_sequence;
-		if (r == EOK && journal->grouped && journal->durable_sequence < target) {
-			r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_DURABLE);
+		uint64_t sequence = data_only ? file->data_sequence : file->sync_sequence;
+		if (r == EOK && journal->grouped && journal->durable_sequence < sequence) {
+			*target = sequence;
+			if (journal->seal_target < sequence) journal->seal_target = sequence;
+			if (file->mp->journal_runtime.request)
+				file->mp->journal_runtime.request(file->mp->journal_runtime.context);
 		} else if (r == EOK && !journal->grouped) r = jbd_journal_sync(journal, file->sync_tid);
 		EXT4_MP_UNLOCK(file->mp);
 		return r;
@@ -3947,6 +3951,20 @@ int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
 		if (r == EOK) r = cleanup;
 	}
 	EXT4_MP_UNLOCK(file->mp);
+	return r;
+}
+
+int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
+{
+	uint64_t target;
+	int r = ext4_file_sync_metadata_prepare(file, data_only, &target);
+#if CONFIG_JOURNALING_ENABLE
+	if (r == EOK && target) {
+		EXT4_MP_LOCK(file->mp);
+		r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_DURABLE);
+		EXT4_MP_UNLOCK(file->mp);
+	}
+#endif
 	return r;
 }
 

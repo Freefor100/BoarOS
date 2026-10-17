@@ -187,6 +187,9 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid);
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
 int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
+/* Flush non-grouped metadata synchronously, or capture and request one fixed
+ * grouped-journal durable target without waiting for it. Zero means complete. */
+int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *target);
 
 /*****************************DIRECTORY DESCRIPTOR***************************/
 

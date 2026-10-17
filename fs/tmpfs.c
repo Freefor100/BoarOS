@@ -517,7 +517,6 @@ void kernel_tmpfs_memory_modified(struct kernel_vfs_file *file)
     (void)modified(file, 0, 0);
 }
 static int no_writeback(struct kernel_vfs_instance *i) { (void)i; return 0; }
-static int sync_metadata(struct kernel_vfs_node *n, int data_only) { (void)n; (void)data_only; return 0; }
 static int unmount(struct kernel_vfs_mount *mount)
 {
     struct tmp_mount *m=tm(mount->private_data);
@@ -546,7 +545,7 @@ static void initialize_ops(void)
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->writeback_allowed=no_writeback;
-    o->sync_metadata=sync_metadata; o->flush=error; o->unmount=unmount;
+    o->flush=error; o->unmount=unmount;
 }
 static int number(const char *p,size_t n,unsigned base,uint64_t *value)
 {

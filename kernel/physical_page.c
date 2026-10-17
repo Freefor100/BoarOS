@@ -1508,6 +1508,11 @@ enum physical_page_status physical_page_allocator_clear_reclaimer(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+/* The 34-byte RV mapping entry must keep its successful return in one code
+ * page; crossing it adds a QEMU TB to every page-table and user-page access. */
+#if defined(__riscv)
+__attribute__((aligned(64)))
+#endif
 enum physical_page_status physical_page_map_owned(
     const struct physical_page_allocator *allocator, uint64_t address,
     void **pointer)
