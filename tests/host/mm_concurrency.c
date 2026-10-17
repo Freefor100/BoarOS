@@ -61,8 +61,8 @@ void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
 void mm_test_fence(uint64_t v, int instructions)
 {
-    (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (v == UINT64_MAX && kernel_cpu_current()->hardware_id == 1 &&
+    (void)v; assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!instructions && kernel_cpu_current()->hardware_id == 1 &&
         __atomic_load_n(&hold_fence, __ATOMIC_ACQUIRE)) {
         assert(!kernel_cpu_current()->raw_locks);
         __atomic_store_n(&fence_entered, 1, __ATOMIC_RELEASE);
@@ -129,7 +129,7 @@ static void retirement(void)
     assert(!__atomic_load_n(&done[1], __ATOMIC_ACQUIRE));
     struct kernel_mm_mapping mapping;
     assert(kernel_mm_lookup(&mm[0], address, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
-    /* 叶已摘，但PTE转移的data/两级空表owner尚未释放。 */
+    /* 第一批数据叶已摘，PTE转移的owner仍等待确认；空表由后续有界扫描回收。 */
     assert(physical_page_available(&allocator) == before);
     uint32_t references;
     assert(!physical_page_reference_count(&allocator, old.physical_address, &references));

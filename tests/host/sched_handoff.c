@@ -13,6 +13,7 @@ static struct kernel_task peer __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned char peer_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNEL_STACK_BYTES)));
 static unsigned char running_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNEL_STACK_BYTES)));
 static unsigned lock_calls, cpu_queries;
+static uint64_t timer_request;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
@@ -77,7 +78,7 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
 { (void)mm; (void)address; (void)access; __builtin_trap(); /* Rejected kernel caller cannot enter MM. */ }
 uint64_t riscv_time_read(void) { return 1; }
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
-{ (void)deadline; return RISCV_TIMER_STATUS_NOT_STARTED; }
+{ assert(!cpu.raw_locks);timer_request=deadline;return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
 { *ticks = ns; return KERNEL_TIME_STATUS_OK; }
 enum kernel_scheduler_status __wrap_scheduler_switch_claimed(struct kernel_task *previous, struct kernel_task *next)
@@ -214,8 +215,7 @@ int main(void)
     cpu.current = &scheduler.boot_idle;
     assert(scheduler_reschedule(0, 0, 1) == KERNEL_SCHEDULER_STATUS_OK);
     assert(switches == 1 && selected == &peer && cpu.idle_context_saved);
-    /* A no-switch yield validates and accounts under one shared-domain
-     * acquisition, followed by separate hardware-deadline preparation. */
+    /* 校验、记账、选择和期限计算共用一个调度域，硬件重装在锁外。 */
     setup(KERNEL_SCHED_FIFO, 50, 10);
     cpu_queries = 0;
     assert(validate_current() == KERNEL_SCHEDULER_STATUS_OK);
@@ -227,11 +227,23 @@ int main(void)
     assert(cpu_queries <= 1);
     lock_calls = cpu_queries = 0;
     assert(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
-    assert(lock_calls <= 2 && !switches);
-    /* CPU identity is stable through the IRQ-off decision and timer update.
-     * A generous work bound protects against repeated volatile TP lookups. */
+    assert(lock_calls == 1 && !switches);
     fprintf(stderr, "no-switch yield CPU queries=%u\n", cpu_queries);
     assert(cpu_queries <= 20);
+    lock_calls = cpu_queries = 0;
+    assert(kernel_scheduler_on_tick(1) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(lock_calls == 1 && !switches);
+    /* CPU identity is stable through the IRQ-off decision and timer update.
+     * A generous work bound protects against repeated volatile TP lookups. */
+    fprintf(stderr, "no-switch tick CPU queries=%u\n", cpu_queries);
+    assert(cpu_queries <= 20);
+    /* 检查送给实际timer边界的请求，不保留另一个生产deadline镜像供测试读。 */
+    setup(KERNEL_SCHED_OTHER,0,0);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      ready_remove_locked(&peer);peer.wait.deadline=73;deadline_index_insert(&peer); }
+    scheduler_rearm_timer();assert(timer_request==73);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);deadline_index_remove(&peer);peer.wait.deadline=0; }
+    scheduler_rearm_timer();assert(!timer_request);
     /* Reject a candidate that would otherwise preempt: neither deferred nor
      * ordinary validation failure may consume an existing request or owner. */
     for (unsigned deferred = 0; deferred < 2; deferred++) {

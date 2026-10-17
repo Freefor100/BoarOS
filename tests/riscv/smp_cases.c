@@ -10,6 +10,7 @@
 #include <kernel/tick.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/timer.h>
+#include <arch/riscv/trap.h>
 #include <kernel/heap.h>
 #include <kernel/irq.h>
 #include <kernel/wait_internal.h>
@@ -725,6 +726,23 @@ static void install_test_fpu(struct riscv_fpu_state *image)
     asm volatile("csrs sstatus, %0" :: "r"((uintptr_t)0x6000) : "memory");
 }
 
+static void check_live_fs_return(void)
+{
+    KERNEL_IRQ_SCOPE(fs_irq);
+    uintptr_t original;
+    __asm__ volatile("csrr %0, sstatus" : "=r"(original));
+    const uintptr_t states[]={0,RISCV_SSTATUS_FS_INITIAL,RISCV_SSTATUS_FS_CLEAN,RISCV_SSTATUS_FS_DIRTY};
+    for(unsigned i=0;i<4;i++) {
+        uintptr_t status=(original & ~RISCV_SSTATUS_FS_MASK) | states[i];
+        __asm__ volatile("csrw sstatus, %0" :: "r"(status) : "memory");
+        struct riscv_trap_frame frame={.sstatus=RISCV_SSTATUS_SPP|RISCV_SSTATUS_SPIE|states[3-i]};
+        riscv_trap_return_prepare(&frame);
+        require((frame.sstatus & RISCV_SSTATUS_FS_MASK)==states[i],"trap-return-live-FS");
+        require((frame.sstatus & ~RISCV_SSTATUS_FS_MASK)==(RISCV_SSTATUS_SPP|RISCV_SSTATUS_SPIE),"trap-return-FS-only");
+    }
+    __asm__ volatile("csrw sstatus, %0" :: "r"(original) : "memory");
+}
+
 static void compute(void *argument)
 {
     unsigned id = (uintptr_t)argument;
@@ -733,6 +751,7 @@ static void compute(void *argument)
     struct riscv_fpu_state expected = {.fcsr = 0x61, .saved = 1}, actual;
     for (unsigned i = 0; i < 32; i++) expected.regs[i] = UINT64_C(0x3ff0010000000000) + id * 256 + i;
     install_test_fpu(&expected);
+    check_live_fs_return();
     __atomic_fetch_add(&entered, 1, __ATOMIC_RELEASE);
     while (__atomic_load_n(&entered, __ATOMIC_ACQUIRE) != 4) {}
     /* 没有主动yield：同CPU伙伴必须经过timer抢占才能进入并前进。 */
@@ -823,6 +842,7 @@ static void parallel_tasks(void)
                 1U << (i / 2)) == KERNEL_SCHEDULER_STATUS_OK, "compute-create");
     for (unsigned i = 0; i < 4; i++) kernel_thread_join(&joins[i]);
     for (unsigned i = 0; i < 4; i++) require(counters[i] >= 20000 && !executions[i], "compute-progress");
+    virt_uart_puts("BoarOS: FPU trap return preserved live Off/Initial/Clean/Dirty on four owners\n");
     for (unsigned i = 0; i < 2; i++)
         require(kernel_thread_create_joinable_mask(shared_compute, (void *)(uintptr_t)i, &joins[i], 3) ==
                 KERNEL_SCHEDULER_STATUS_OK, "shared-eligibility-create");

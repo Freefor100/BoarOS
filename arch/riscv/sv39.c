@@ -1243,55 +1243,90 @@ static enum riscv_sv39_status resolve_existing_user_leaf(
                         : RISCV_SV39_STATUS_OK;
 }
 
-enum riscv_sv39_status riscv_sv39_user_detach_page(
-    struct riscv_sv39_user_space *space, uint64_t address,
-    struct kernel_mm_retirement *batch)
+enum riscv_sv39_status riscv_sv39_user_detach_range(
+    struct riscv_sv39_user_space *s, uint64_t start, uint64_t end,
+    struct kernel_mm_detach_cursor *cursor, struct kernel_mm_retirement *batch,
+    void (*before_detach)(void *,uint64_t,uint64_t), void *owner)
 {
-    if (!space || space->state != RISCV_SV39_USER_SPACE_LIVE || !batch ||
-        batch->count > KERNEL_MM_RETIRE_CAPACITY - 3 || (address & BOAROS_PAGE_MASK) ||
-        address < BOAROS_PAGE_SIZE || address >= RISCV_SV39_USER_LIMIT)
-        return RISCV_SV39_STATUS_INVALID;
-    uint64_t *root, *middle, *leaves;
-    unsigned r = (address >> 30) & RISCV_SV39_INDEX_MASK;
-    unsigned m = (address >> 21) & RISCV_SV39_INDEX_MASK;
-    unsigned l = (address >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
-    enum riscv_sv39_status status = resolve_runtime_table(space->allocator,
-        space->root_address, &root);
-    if (status != RISCV_SV39_STATUS_OK) return status;
-    if (!root[r]) return RISCV_SV39_STATUS_NOT_MAPPED;
-    if (!valid_nonleaf_entry(root[r])) return RISCV_SV39_STATUS_STATE;
-    status = resolve_runtime_table(space->allocator, entry_address(root[r]), &middle);
-    if (status != RISCV_SV39_STATUS_OK) return status;
-    if (!middle[m]) return RISCV_SV39_STATUS_NOT_MAPPED;
-    if (!valid_nonleaf_entry(middle[m])) return RISCV_SV39_STATUS_STATE;
-    status = resolve_runtime_table(space->allocator, entry_address(middle[m]), &leaves);
-    if (status != RISCV_SV39_STATUS_OK) return status;
-    uint64_t old = leaves[l];
-    if (!old) return RISCV_SV39_STATUS_NOT_MAPPED;
-    int present = valid_user_leaf_entry(old), protected = valid_protected_entry(old);
-    int cow = present_cow_entry(old) || protected_cow_entry(old);
-    if ((!present && !protected) || (present && !space->leaf_pages) ||
-        (protected && !space->protected_pages) || (cow && !space->cow_pages) ||
-        space->table_pages < 3) return RISCV_SV39_STATUS_STATE;
-    void *owned;
-    if (physical_page_map_owned(space->allocator, entry_address(old), &owned) !=
-        PHYSICAL_PAGE_STATUS_OK) return RISCV_SV39_STATUS_STATE;
-    /* 三个槽在发布前已保留；之后不发生可恢复失败或descriptor分配。 */
-    __atomic_store_n(&leaves[l], 0, __ATOMIC_RELEASE);
-    kernel_mm_retirement_add(batch, entry_address(old), 0);
-    if (present) space->leaf_pages--; else space->protected_pages--;
-    if (cow) space->cow_pages--;
-    unsigned index;
-    for (index = 0; index < 512; index++) if (leaves[index]) break;
-    if (index == 512) {
-        kernel_mm_retirement_add(batch, entry_address(middle[m]), 1);
-        __atomic_store_n(&middle[m], 0, __ATOMIC_RELEASE);
-        space->table_pages--;
-        for (index = 0; index < 512; index++) if (middle[index]) break;
-        if (index == 512) {
-            kernel_mm_retirement_add(batch, entry_address(root[r]), 1);
-            __atomic_store_n(&root[r], 0, __ATOMIC_RELEASE);
-            space->table_pages--;
+    if (!s || s->state != RISCV_SV39_USER_SPACE_LIVE || !cursor || !batch || start>end ||
+        end>RISCV_SV39_USER_LIMIT || ((start|end)&BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
+    const uint64_t leaf_span=UINT64_C(1)<<21, middle_span=UINT64_C(1)<<30;
+    if (cursor->phase==3 || start==end) return RISCV_SV39_STATUS_NOT_MAPPED;
+    if (!cursor->phase) { cursor->address=start & ~(leaf_span-1); cursor->phase=1; }
+    unsigned visits=0;
+    while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
+        uint64_t *root;
+        enum riscv_sv39_status status=resolve_runtime_table(s->allocator,s->root_address,&root);
+        if (status) return status;
+        if (cursor->phase==2) {
+            unsigned r=cursor->middle_address>>30;
+            if (!root[r]) return RISCV_SV39_STATUS_STATE;
+            if (!valid_nonleaf_entry(root[r])) return RISCV_SV39_STATUS_STATE;
+            uint64_t *middle;
+            status=resolve_runtime_table(s->allocator,entry_address(root[r]),&middle);
+            if (status) return status;
+            /* 摘叶表后只在本middle段结束时检查一次；扫描同样受16项预算约束。 */
+            visits++;
+            if (middle[cursor->scan++]) { cursor->phase=1; cursor->scan=0; continue; }
+            if (cursor->scan==512) {
+                kernel_mm_retirement_add(batch,entry_address(root[r]),1);
+                __atomic_store_n(&root[r],0,__ATOMIC_RELEASE);
+                s->table_pages--; cursor->phase=1; cursor->scan=0;
+            }
+            continue;
+        }
+        if (cursor->address>=end && !(cursor->address & (leaf_span-1))) { cursor->phase=3; return RISCV_SV39_STATUS_NOT_MAPPED; }
+        uint64_t address=cursor->address;
+        unsigned r=address>>30, m=(address>>21)&(512-1);
+        unsigned l=(address>>BOAROS_PAGE_SHIFT)&(512-1);
+        if (!root[r]) {
+            cursor->address=(address & ~(middle_span-1))+middle_span;
+            visits++; continue;
+        }
+        if (!valid_nonleaf_entry(root[r])) return RISCV_SV39_STATUS_STATE;
+        uint64_t *middle;
+        status=resolve_runtime_table(s->allocator,entry_address(root[r]),&middle);
+            if (status) return status;
+        if (!middle[m]) {
+            cursor->address=(address & ~(leaf_span-1))+leaf_span;
+            visits++;
+        } else {
+            if (!valid_nonleaf_entry(middle[m])) return RISCV_SV39_STATUS_STATE;
+            uint64_t *leaves;
+            status=resolve_runtime_table(s->allocator,entry_address(middle[m]),&leaves);
+            if (status) return status;
+            uint64_t old=leaves[l];
+            visits++;
+            if (old && address>=start && address<end) {
+                int present=valid_user_leaf_entry(old), protected=valid_protected_entry(old);
+                int cow=present_cow_entry(old)||protected_cow_entry(old);
+                if ((!present && !protected) || (present && !s->leaf_pages) ||
+                    (protected && !s->protected_pages) || (cow && !s->cow_pages) || s->table_pages<3)
+                    return RISCV_SV39_STATUS_STATE;
+                uint64_t physical=entry_address(old);
+                void *owned;
+                if (physical_page_map_owned(s->allocator,physical,&owned)!=PHYSICAL_PAGE_STATUS_OK)
+                    return RISCV_SV39_STATUS_STATE;
+                /* resident必须在身份仍属于这个PTE时解绑；释放仍由MM在raw外完成。 */
+                if (before_detach) before_detach(owner,address,physical);
+                __atomic_store_n(&leaves[l],0,__ATOMIC_RELEASE);
+                kernel_mm_retirement_add(batch,physical,0);
+                if (present) s->leaf_pages--; else s->protected_pages--;
+                if (cow) s->cow_pages--;
+            } else if (old) cursor->occupied=1;
+            cursor->address+=BOAROS_PAGE_SIZE;
+            /* 末尾范围外的叶也只检查一次，不能提前结束而误回收部分使用的表。 */
+            if (l+1<512) continue;
+            if (!cursor->occupied) {
+                kernel_mm_retirement_add(batch,entry_address(middle[m]),1);
+                __atomic_store_n(&middle[m],0,__ATOMIC_RELEASE);
+                s->table_pages--;
+            }
+            cursor->occupied=0;
+        }
+        if ((cursor->address>>30)!=r || cursor->address>=end) {
+            cursor->middle_address=(uint64_t)r<<30;
+            cursor->phase=2; cursor->scan=0;
         }
     }
     return RISCV_SV39_STATUS_OK;
@@ -1914,14 +1949,9 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_page(
         }
         replacement = cow ? user_cow_entry(entry_address(old), permissions)
                           : user_leaf_entry(entry_address(old), permissions);
-        if (permissions & RISCV_SV39_EXECUTE)
-            riscv_mmu_sync_instructions();
     }
     if (replacement != old) {
-        *leaf = replacement;
-        riscv_mmu_flush_address(address);
-        space->protect_address_flushes++;
-        COST_ADD(MPROTECT_ADDRESS_TLB, 1);
+        __atomic_store_n(leaf, replacement, __ATOMIC_RELEASE);
     }
     return RISCV_SV39_STATUS_OK;
 }
@@ -1932,8 +1962,16 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     uint64_t end,
     uint32_t permissions)
 {
-    if (start < end && end - start == BOAROS_PAGE_SIZE)
-        return riscv_sv39_user_protect_owned_page(space, start, permissions);
+    if (start < end && end - start == BOAROS_PAGE_SIZE) {
+        enum riscv_sv39_status status=riscv_sv39_user_protect_owned_page(space,start,permissions);
+        if (status == RISCV_SV39_STATUS_OK) {
+            riscv_mmu_flush_address(start);
+            space->protect_address_flushes++;
+            COST_ADD(MPROTECT_ADDRESS_TLB,1);
+            if (permissions & RISCV_SV39_EXECUTE) riscv_mmu_sync_instructions();
+        }
+        return status;
+    }
     uint64_t *root;
     uint64_t *level1;
     uint64_t *level0;

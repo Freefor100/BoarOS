@@ -32,8 +32,8 @@ static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1; }
 void mm_test_fence(uint64_t v,int instructions)
 {
-    (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if(v==UINT64_MAX && kernel_cpu_current()->hardware_id==1 && delayed) {
+    (void)v; assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if(!instructions && kernel_cpu_current()->hardware_id==1 && delayed) {
         __atomic_store_n(&fence_entered,1,__ATOMIC_RELEASE);
         while(!__atomic_load_n(&fence_resume,__ATOMIC_ACQUIRE)) sched_yield();
     }

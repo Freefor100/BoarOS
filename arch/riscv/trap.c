@@ -384,6 +384,11 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
 #endif
+    /* 切换、信号恢复和exec可改变实际FS；旧trap快照不能把Dirty写回已保存状态。 */
+    uint64_t live_status;
+    __asm__ volatile("csrr %0, sstatus" : "=r"(live_status));
+    frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
+                     (live_status & RISCV_SSTATUS_FS_MASK);
 }
 
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)

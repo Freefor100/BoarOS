@@ -292,7 +292,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         task->vfork_wait_child->vfork_child = 0;
         task->vfork_wait_child = 0;
         task->vfork_waiting = 0;
-        if (task->state == KERNEL_THREAD_STATE_BLOCKED && task->wait_queue == &task->vfork_done_queue) {
+        if (task->state == KERNEL_THREAD_STATE_BLOCKED && task->default_wait_node.queue == &task->vfork_done_queue) {
             struct kernel_wait_token token = {task, task->wait.generation};
             (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
         }
@@ -641,6 +641,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->child_minor_faults = leader->child_minor_faults;
         task->child_major_faults = leader->child_major_faults;
         task->group_pending = leader->group_pending;
+        task->group_child_info = leader->group_child_info;
         task->nofile_limit = leader->nofile_limit;
         task->stack_limit = leader->stack_limit;
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
@@ -1596,12 +1597,17 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             }
         }
         if (thread->parent != 0) {
+#if BOAROS_LOCK_DEBUG
             status = validate_child_list(thread->parent, thread);
-            if (status != KERNEL_SCHEDULER_STATUS_OK) {
-                return status;
-            }
+            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+#endif
             {
                 KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+                struct kernel_task *parent = thread->parent;
+                if (!parent || parent->magic != KERNEL_THREAD_MAGIC ||
+                    (thread->previous_sibling ? thread->previous_sibling->next_sibling != thread : parent->first_child != thread) ||
+                    (thread->next_sibling ? thread->next_sibling->previous_sibling != thread : parent->last_child != thread))
+                    return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
                 exited_remove_locked(thread);
                 thread->state = KERNEL_THREAD_STATE_ZOMBIE;
                 thread->publish_completion = 0;
@@ -1839,20 +1845,23 @@ void kernel_task_release_io_scratch(struct kernel_task *task)
 }
 
 enum kernel_task_status kernel_task_epoll_register(
-    struct kernel_task *task, struct kernel_epoll_wait_request *request)
+    struct kernel_task *task, struct kernel_epoll_wait_request *request,
+    struct kernel_epoll_wait_request **previous)
 {
-    if (!task || task != kernel_task_current() || !request || task->epoll_wait_request)
+    if (!task || task != kernel_task_current() || !request || !previous)
         return KERNEL_TASK_STATUS_STATE;
+    *previous = task->epoll_wait_request;
     task->epoll_wait_request = request;
     return KERNEL_TASK_STATUS_OK;
 }
 
 enum kernel_task_status kernel_task_epoll_clear(
-    struct kernel_task *task, struct kernel_epoll_wait_request *request)
+    struct kernel_task *task, struct kernel_epoll_wait_request *request,
+    struct kernel_epoll_wait_request *previous)
 {
     if (!task || !request || task->epoll_wait_request != request)
         return KERNEL_TASK_STATUS_STATE;
-    task->epoll_wait_request = 0;
+    task->epoll_wait_request = previous;
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2020,6 +2029,7 @@ static void kernel_thread_finish(
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_wait_cursor cleanup_cursor;
     int notify_cleanup;
+    uint64_t next_deadline;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         current->state = KERNEL_THREAD_STATE_EXITED;
@@ -2030,6 +2040,7 @@ static void kernel_thread_finish(
         scheduler_account_runtime_locked();
         next = scheduler_select_next_locked(cpu, current, scheduler.cleanup_task != 0);
         if (!next) __builtin_trap();
+        next_deadline = scheduler_deadline_locked(cpu);
     }
     if (notify_cleanup) kernel_wait_cursor_wake(&cleanup_cursor, 1);
     status = activate_thread_address_space(next);
@@ -2037,7 +2048,7 @@ static void kernel_thread_finish(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_switch(&current->cost, &next->cost);
 #endif
-    scheduler_rearm_timer();
+    scheduler_arm_timer(next_deadline);
     arch_fpu_switch(0, &next->fpu);
     arch_context_switch(&kernel_cpu_current()->discard_context, &next->context);
     kernel_scheduler_switch_finish();
@@ -2268,19 +2279,26 @@ void kernel_task_cpu_ticks(const struct kernel_task *task,
         scheduler_task_get_locked(leader);
     }
     *user_ticks = *kernel_ticks = 0;
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
+    struct scheduler_group_cursor cursor;
+    scheduler_group_cursor_begin(leader, &cursor);
+    uint64_t epoch = cursor.epoch;
     while (cursor.task) {
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            /* 组成员变化会使游标从leader重走，旧前缀不能重复累计。 */
+            if (epoch != cursor.epoch) {
+                *user_ticks = *kernel_ticks = 0;
+                epoch = cursor.epoch;
+            }
             struct kernel_task *member = cursor.task;
-            if (member->accounted && member->group_leader == leader) {
+            if (leader->group_epoch == cursor.epoch && member->accounted && member->group_leader == leader) {
                 *user_ticks += member->user_ticks;
                 *kernel_ticks += member->kernel_ticks;
             }
         }
-        scheduler_task_cursor_next(&cursor);
+        scheduler_group_cursor_next(&cursor);
     }
+    scheduler_group_cursor_end(&cursor);
     scheduler_task_put(leader);
 }
 

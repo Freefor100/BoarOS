@@ -113,12 +113,11 @@ static void riscv_signal_build_frame(
     }
     user_sp = (frame->sp - RISCV_SIGNAL_FRAME_SIZE) & ~UINT64_C(15);
     memset(&data, 0, sizeof(data));
-    memcpy(data.prefix, &delivery->signal, sizeof(delivery->signal));
-    memcpy(data.prefix + 8U, &delivery->code, sizeof(delivery->code));
-    if (delivery->fault)
-        memcpy(data.prefix + 16U, &delivery->fault_address, sizeof(delivery->fault_address));
-    else
-        memcpy(data.prefix + 16U, &delivery->sender, sizeof(delivery->sender));
+    struct kernel_signal_wait_info info = {
+        .signal = delivery->signal, .sender = delivery->sender,
+        .code = delivery->code, .uid = delivery->uid, .status = delivery->status,
+    };
+    kernel_signal_encode_info(data.prefix, &info, delivery->fault, delivery->fault_address);
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 24U,
            &disabled, sizeof(disabled));
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 40U,
@@ -241,6 +240,4 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
     fpu->fcsr = fcsr;
     fpu->saved = 1U;
     riscv_fpu_state_restore(fpu);
-    frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-                     RISCV_SSTATUS_FS_CLEAN;
 }

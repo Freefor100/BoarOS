@@ -18,7 +18,15 @@ struct kernel_signal_wait_info {
     uint32_t signal;
     uint32_t sender;
     int32_t code;
+    uint32_t uid;
+    int32_t status;
 };
+
+/* 标准 SIGCHLD 只需补充身份和事件状态，无需为每个信号保留用户 ABI。 */
+struct kernel_signal_child_info { uint32_t uid; int32_t status; };
+void kernel_signal_encode_info(void *output,
+    const struct kernel_signal_wait_info *info,
+    int fault, uint64_t fault_address);
 
 #define KERNEL_SIGNAL_COUNT 64U
 #define KERNEL_SIGNAL_DFL UINT64_C(0)
@@ -73,6 +81,8 @@ struct kernel_signal_delivery {
     uint32_t signal;
     uint32_t sender;
     int32_t code;
+    uint32_t uid;
+    int32_t status;
     uint32_t fault;
     uint64_t fault_address;
     uint64_t handler;

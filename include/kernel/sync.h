@@ -24,7 +24,6 @@ struct kernel_rwlock {
     struct kernel_lock_waiter *pending_head, *pending_tail;
     struct kernel_io_context *writer;
     uint32_t readers;
-    uint32_t writers_waiting;
     uint32_t rank;
     uintptr_t key;
 };

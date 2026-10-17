@@ -37,6 +37,8 @@ USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务�
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
 原因，旧代次与重复通知无效，任务页复用也不重用代次。多队列节点通过`kernel_wait_node_bind`共享token。
 代次耗尽返回INVALID_STATE且不发布新登记，重复等待和错误owner属于fatal。
+事件队列只由实际等待节点保存，期限、原因和可中断性只由wait record保存。通知先按原期限
+摘除AVL，再发布完成原因；finish收完节点及借用后才清空record，futex requeue直接迁移节点。
 
 任务的on_cpu与CPU切换前驱共同保护旧栈：阻塞提交后的提前wake只记录ready_pending，
 park自行保存IRQ并保持关闭跨过切换交接，返回时恢复原状态；
@@ -85,8 +87,10 @@ IRQ恢复及非法owner/上下文。真实I/O等待继续用`make test-io-sleep-
 OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
 
 挑选、摘队列与取得on_cpu执行owner在同一个短锁发布点完成，普通切换与退出复用该入口；锁外才切换架构状态，旧owner仍由新栈交接释放。未使用的拆分pop入口已删除。
-yield及预算tick在同一决策raw内校验队列，不再校验后解锁重取；普通tick的load遍历
-仍在锁外，遍历前检查和决策时重查分别保留。无效队列不消费待调度请求。
+yield、预算tick与普通tick在同一次决策raw内完成队列校验、运行记账、挑选和最早期限计算，
+释放raw后才调用timer backend；切换、阻塞和退出也按这个顺序提交硬件事件。
+普通tick只在CPU0推进load采样余量，不为未到采样期的事件额外取锁。
+到采样期才借任务分段遍历，遍历前检查和决策时重查分别保留。无效队列不消费待调度请求。
 
 ready 节点独立于 blocked/cleanup 链。全局优先级排序双链保留遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
 
@@ -141,7 +145,7 @@ locked变体仅供已持调度域的短操作使用。借用不固定MM、文件
 在同一raw内完成，仅实际跨解锁通知时增加借用。`test-sched-concurrency-host`
 用1/2/4成员及64个无关任务保护工作量、退出标记和全部借用归还。
 长枚举借用当前节点，退休节点保留有owner的后继；每段至多16项，后继引用迭代归还。
-父子与组校验跨段保留存储，代次变化时重查；proc调度/身份值受域保护，MM/TTY内容仍按单CPU业务契约读取。
+完整父子与组审计跨段保留存储，代次变化时重查；退出的普通路径只检查本项与相邻链及首尾owner，完整父子审计由LOCK_DEBUG开启。proc调度/身份值受域保护，MM/TTY内容仍按单CPU业务契约读取。
 
 join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
 wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
@@ -232,11 +236,11 @@ wait4 遍历组长父子树，默认允许等待同组其他线程的子进程�
 
 支持 pid 选择、WNOHANG/WUNTRACED/WCONTINUED/__WALL/__WCLONE。组 stop 完成状态与组长执行状态分离，因此 GROUP_DEAD 容器仍能报告存活成员的组 stop/continue。不可中断等待尚未完成的成员保留 stop pending，不提前宣称整组停止。
 
-zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 不让它再次可 wait。退出和 reparent 可能向退出队尾追加 orphan zombie，摘头必须使用更新后的链关系，不能丢失新增 owner。`times()` 累计所有仍在组环中的线程及已回卷成员；子进程时间保存在组长，不重复计数。
+zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 不让它再次可 wait。退出和 reparent 可能向退出队尾追加 orphan zombie，摘头必须使用更新后的链关系，不能丢失新增 owner。`times()` 只遍历目标组环，累计所有仍在环中的线程及已回卷成员，不扫描无关任务。组代次变化导致游标重走时先清除旧累计；子进程时间保存在组长，不重复计数。
 
 ## 同步、成本与验证边界
 
-短调度域保护组/身份元数据；fd/MM等业务引用及futex条件仍依赖单CPU的IRQ纪律。共享 MM 使用同一页表与本地 SFENCE.VMA；多CPU前仍须补共享对象同步、lookup到pin的交接和远端TLB完成后回收。
+短调度域保护组与身份元数据。FD 槽和 OFD 引用使用共同的 raw/原子引用规则；MM 的修改、pin 和远端 TLB 确认由其 operation gate、metadata raw 与退休批次负责。futex 身份解析取得实际后备引用，等待队列沿本模块的代次协议处理；这些业务对象不依赖整次系统调用关闭中断。尚未并行化的命名空间、设备和协议后端仍在各自 CPU0 业务边界执行，具体见[文件资源](kernel-files.md)、[MM](kernel-mm.md)及[网络模块](kernel-network.md)。
 
 RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
@@ -330,10 +334,10 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 释放后再park；不能把当前整个IRQ-off acquire机械包进raw spinlock。
 
 登记、通知、阻塞和切换完成由本模块的短调度域保护；条件及task/callback/context的
-业务owner仍由调用者保持。完整SMP须把条件保护、MM页存活、对象最后释放与这套交接连接，
-不能只移植等待原语就撤掉业务IRQ纪律。当前销毁入口与借用规则见本文开头。
+业务owner仍由调用者保持。对象 mutex、raw 与实际引用分别覆盖条件、发布和存储寿命，
+等待原语不能代替这些业务保护。当前销毁入口与借用规则见本文开头。
 
-已核对的IRQ-off显式切换与owner边界如下；这是调用盘点，不是跨核安全证明：
+主要等待入口的保护与 owner 如下：
 
 | 调用位置 | 切换/工作 | 睡眠期间的owner |
 |---|---|---|
@@ -342,7 +346,7 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 | kernel/physical_page.c allocate_order | EMPTY后回收/pressure_wait | 不持buddy半成品；回调固定cache group，深度在任务context |
 | fs/page_cache.c lookup/get/readahead/writeback/pressure | loading、后台work、代次进展等待 | entry users、cache/runtime或group pin，停止先join |
 | drivers/virtio/block.c | 等descriptor/span/request完成与reset | request token及业务buffer；DMA停止未确认不释放 |
-| net/ethernet.c worker；net/socket.c协议入口 | IRQ关闭下NIC/串行lwIP批次，末尾重查后yield/block | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
+| net/ethernet.c worker；net/socket.c协议入口 | 协议mutex内开放IRQ执行；短IRQ区登记/复查，归还协议资格后park/finish | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
 | mm/mm.c文件fault | 源I/O可显式睡眠，恢复后重查 | 来源操作pin、VMA代次和候选页，失败准确回收 |
 
 等待交接须覆盖wake发生于检查前、登记后、释放保护后/park前；timeout和cancel

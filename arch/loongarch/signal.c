@@ -76,10 +76,11 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     size_t bytes=top-sp;
     if(bytes>sizeof(data))la_virt_fatal("signal frame capacity");
     memset(data,0,bytes);memset(&prefix,0,sizeof(prefix));
-    memcpy(prefix.info,&delivery->signal,4);
-    memcpy(prefix.info+8,&delivery->code,4);
-    if(delivery->fault)memcpy(prefix.info+16,&delivery->fault_address,8);
-    else memcpy(prefix.info+16,&delivery->sender,4);
+    struct kernel_signal_wait_info signal_info = {
+        .signal = delivery->signal, .sender = delivery->sender,
+        .code = delivery->code, .uid = delivery->uid, .status = delivery->status,
+    };
+    kernel_signal_encode_info(prefix.info, &signal_info, delivery->fault, delivery->fault_address);
     prefix.context.stack_flags=2;
     prefix.context.sigmask[0]=delivery->restore_mask;
     prefix.context.mcontext.pc=frame->era;

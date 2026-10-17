@@ -46,7 +46,7 @@ uint64_t kernel_wait_backend_time(void) { return 1; }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
 { (void)deadline; (void)interruptible; task->state = KERNEL_THREAD_STATE_BLOCKED; __atomic_fetch_add(&parked[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
-{ task->wake_reason = reason; task->state = KERNEL_THREAD_STATE_READY; }
+{ task->wait.reason = reason; task->state = KERNEL_THREAD_STATE_READY; }
 void kernel_wait_backend_ready(struct kernel_task *task)
 { __atomic_store_n(&granted[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); __atomic_store_n(host_of(task)->dispatch, 1, __ATOMIC_RELEASE); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)

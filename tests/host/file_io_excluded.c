@@ -9,23 +9,33 @@ EXCLUDED(kernel_socket_create)
 EXCLUDED(kernel_socket_accept)
 EXCLUDED(kernel_epoll_create)
 EXCLUDED(kernel_socket_copy_read)
+#ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_read_user)
+#endif
 EXCLUDED(kernel_socket_discard_receive)
+#ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_finish_read)
+#endif
 EXCLUDED(kernel_socket_poll)
 EXCLUDED(kernel_socket_read_info)
 EXCLUDED(kernel_socket_receive_ready)
+#ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_receive_timeout)
 EXCLUDED(kernel_socket_reserve_read)
 EXCLUDED(kernel_socket_send_timeout)
+#endif
 EXCLUDED(kernel_socket_stream_begin)
 EXCLUDED(kernel_socket_stream_commit)
 EXCLUDED(kernel_socket_stream_finish)
+#ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_stream_reserve)
+#endif
 EXCLUDED(kernel_socket_unix_wait_error)
 EXCLUDED(kernel_socket_wait_queue)
 EXCLUDED(kernel_socket_write_buffer)
+#ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_write_unix)
+#endif
 EXCLUDED(kernel_socket_write_datagram)
 EXCLUDED(kernel_socket_write_datagram_buffer)
 EXCLUDED(kernel_signal_send_task)

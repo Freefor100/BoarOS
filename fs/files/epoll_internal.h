@@ -64,11 +64,11 @@ struct kernel_epoll_item {
     uint64_t data;
     struct kernel_wait_node wait_node;
 
-    struct kernel_epoll_item *items_next;
-    struct kernel_epoll_item *items_prev;
+    struct kernel_epoll_item *index_left, *index_right, *index_parent;
+    unsigned index_height;
 
-    struct kernel_epoll_item *ready_next;
-    struct kernel_epoll_item *pending_next;
+    struct kernel_epoll_item *ready_next, *ready_prev;
+    struct kernel_epoll_item *pending_next, *pending_prev;
 
     struct kernel_epoll_item *target_next;
     struct kernel_epoll_item *target_prev;
@@ -81,7 +81,7 @@ struct kernel_epoll {
     struct kernel_heap *heap;
     struct kernel_wait_queue wait_queue;
     struct kernel_open_file_description *file;
-    struct kernel_epoll_item *items_head;
+    struct kernel_epoll_item *items_root;
     struct kernel_epoll_item *ready_head;
     struct kernel_epoll_item *ready_tail;
     struct kernel_epoll_item *pending_head, *pending_tail;
@@ -90,11 +90,14 @@ struct kernel_epoll {
     uint32_t item_count;
 };
 
+
 struct kernel_epoll_wait_request {
     struct kernel_task *task;
     struct kernel_epoll *epoll;
     struct kernel_open_file_description *file, *target;
     struct kernel_epoll_item *head;
+    struct kernel_epoll_wait_request *previous;
+    uint8_t observing;
 };
 
 int kernel_epoll_create(struct kernel_heap *heap,

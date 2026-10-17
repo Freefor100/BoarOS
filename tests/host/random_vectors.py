@@ -31,4 +31,10 @@ with tempfile.TemporaryDirectory(prefix='boaros-random-') as temp:
                     'fs/char_device.c', '-ffunction-sections', '-fdata-sections',
                     '-Wl,--gc-sections', '-o', str(executable)], cwd=root, check=True)
     subprocess.run([str(executable)], check=True)
+    for shift in (12, 14):
+        subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
+                        f'-DBOAROS_PAGE_SHIFT={shift}', '-idirafter', 'include',
+                        '-fsanitize=address,undefined', 'tests/host/random_copy.c',
+                        '-o', str(executable)], cwd=root, check=True)
+        subprocess.run([str(executable)], check=True)
 print('BLAKE2s independent vectors passed')

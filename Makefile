@@ -970,7 +970,7 @@ test-lwext4-recovery-host:
 	sh tests/lwext4-recovery-host.sh
 	sh tests/lwext4-reclaim-host.sh
 
-$(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
+$(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
 		-o $@ $(OBJECTS)
 
@@ -1308,7 +1308,7 @@ $(BUILD_DIR)/net/ethernet.o \
 $(BUILD_DIR)/third_party/lwip/src/netif/ethernet.o: CPPFLAGS += $(LWIP_CPPFLAGS)
 
 $(BUILD_DIR)/third_party/lwext4/src/%.o: \
-		third_party/lwext4/src/%.c
+		third_party/lwext4/src/%.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
 		-Wno-unused-but-set-variable -Wno-stringop-truncation \
@@ -1731,7 +1731,7 @@ build/host/lwip-port: tests/host/lwip_port_test.c \
 .PHONY: test-lwip-host
 test-lwip-host: build/host/lwip-port
 	$<
-	python3 -B tests/host/network_owner.py --case loopback-work
+	python3 -B tests/host/network_owner.py --case all
 
 HOST_CPU_SOURCES := kernel/cpu.c kernel/raw_lock.c tests/host/cpu_context.c
 
@@ -1956,9 +1956,20 @@ test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 # Cost variants never reuse objects compiled with a different observation flag.
 .PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv test-cost-diagnostic-host test-cost-diagnostic-plugin-host
 force-cost-config:
-$(BUILD_DIR)/generated/cost-config.h: force-cost-config
+# Shared prerequisite content must not depend on whichever target reaches it first.
+build-quote = '$(subst ','"'"',$(1))'
+BUILD_CONFIG_CC := $(CC)
+BUILD_CONFIG_FLAGS := $(CPPFLAGS) $(CFLAGS) $(ASFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS)
+BUILD_CONFIG_LINK := $(LDFLAGS) $(OBJECTS)
+$(BUILD_DIR)/generated/cost-config.h: force-cost-config Makefile
 	@mkdir -p $(dir $@)
-	@printf '#define BOAROS_COST_DIAGNOSTICS %s\n#define BOAROS_LOCK_DEBUG %s\n' '$(COST_DIAGNOSTICS)' '$(LOCK_DEBUG)' > $@.tmp
+	@{ printf '#define BOAROS_COST_DIAGNOSTICS %s\n#define BOAROS_LOCK_DEBUG %s\n/* compile inputs\n' '$(COST_DIAGNOSTICS)' '$(LOCK_DEBUG)'; \
+	  printf '%s\n' $(call build-quote,$(BUILD_CONFIG_CC)) $(call build-quote,$(BUILD_CONFIG_FLAGS)); \
+	  $(BUILD_CONFIG_CC) --version; sha256sum Makefile; printf '*/\n'; } > $@.tmp
+	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
+$(BUILD_DIR)/generated/link-config: force-cost-config Makefile
+	@mkdir -p $(dir $@)
+	@printf '%s\n' $(call build-quote,$(BUILD_CONFIG_CC)) $(call build-quote,$(BUILD_CONFIG_LINK)) > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
 COST_CASE ?= all
 test-cost-match-host:
@@ -2168,8 +2179,14 @@ test-demand-read-riscv:
 
 include arch/loongarch/build.mk
 
+.PHONY: test-build-config-host test-elf-layout-host
+test-build-config-host:
+	python3 -B tests/host/build_config.py
+test-elf-layout-host:
+	sh tests/elf-layout-host.sh
+
 .PHONY: test-ci-host
-test-ci-host:
+test-ci-host: test-build-config-host
 	python3 -B -m unittest discover -s tests/ci -p 'test_*.py'
 
 .PHONY: test-virtio-block-host
@@ -2322,7 +2339,7 @@ test-mm-file-concurrency-host:
 		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/file_mapping.c fs/record_lock.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
-		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
+		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_memory_object_prepare_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
 	timeout 30s build/host/mm/file-concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
@@ -2431,7 +2448,7 @@ test-user-smp-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_next_owned,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_detach_range,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
 	timeout 30s build/host/mm/remote-user
 
 .PHONY: test-user-smp-riscv

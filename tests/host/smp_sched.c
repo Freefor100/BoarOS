@@ -116,7 +116,7 @@ int main(void)
     pthread_barrier_destroy(&gate);
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       for (unsigned i = 0; i < 4; i++) {
-          tasks[i].wakeup_deadline = 55;
+          tasks[i].wait.deadline = 55;
           tasks[i].tid = 0;
           deadline_index_insert(&tasks[i]);
       }

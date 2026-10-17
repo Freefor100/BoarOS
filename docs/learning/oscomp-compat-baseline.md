@@ -4,6 +4,33 @@
 旧专项名称仅保留历史输入、提交和结果身份。构建/监督入口见
 [兼容模块](../modules/oscomp-compat.md)。
 
+## 2026-10-17 提交边界与 IRQ 保护改动集成
+
+本次将 main `849e29c` 单向合并，保留兼容分支的架构初始化配置、编译器探测和
+可由环境覆盖的 LA 参数；普通 LA 与 contract 产物仍分开。合并后的 63 项宿主测试和
+编译／链接配置正反切换通过。main 的五组 I/O、真实 USER_SMP 和其他负载比较见
+[数据路径实验](data-path-budget-experiments.md)。
+
+合并后分别重新构建 RV、LA，顺序执行原版 iozone 的 glibc/musl 脚本，每组八条命令，
+共 32 条均取得完整完成输出；四组 script status 为零。两侧 PID 1 正常退出、资源归还，
+`e2fsck -fn` 均返回零。RV QEMU 11.1.2、LA RTC 版 11.1.0，单 CPU、1 GiB，固定宿主 CPU14/15，诊断和锁调试关闭；
+检查时 ADP0 在线、BAT0 Full。这是本地原脚本复测，结果单独保存在
+`build/review-round-20261017/compat-{riscv,loongarch}-iozone/`，不与 main 的不同配置混成一组。
+
+下表均为 KiB/s，Min xfer 为 KiB；四进程数据取原 `-t 4 -i 0 -i 1 -r 1k -s 1m`，
+其余原命令仍照常执行，没有增加 `-C` 或 `-x`：
+
+| 架构 / libc | 单进程 write | read | reread | 四进程 Parent read | Children read | Min xfer |
+|---|---:|---:|---:|---:|---:|---:|
+| riscv / glibc | 23357 | 51587 | 50836 | 32050.05 | 61177.38 | 987 |
+| riscv / musl | 25778 | 52344 | 51342 | 35491.75 | 61421.48 | 994 |
+| loongarch / glibc | 36614 | 71912 | 72869 | 37000.41 | 113523.93 | 714 |
+| loongarch / musl | 37060 | 69498 | 68602 | 38200.88 | 114167.65 | 708 |
+
+LA 此次 Min xfer 小于 RV，提前停止量不同；Parent 包含等待所有 reader 收尾的时间，
+不能用 Children 速率之和代替。每条原命令、parser/judge 输出、进程及设备结束信息保留在
+对应串口与 report 中。下面保留较早输入、失败及运行记录。
+
 固定 Harness 为 `references/oscomp-autotest` 的
 `d1bb3a3c4b27274e196a2648518525c1a304e339`；输入是
 `pre-20250615` 原 RV/LA 盘，身份由 `tests/oscomp/inputs.json` 固定。

@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory(prefix='boaros-ethernet-worker-') as name:
     work = Path(name)
     (work / 'net-config.h').write_text('#define BOAROS_NET_IPV4 0x0a4d0002U\n#define BOAROS_NET_NETMASK 0xffffff00U\n')
     exe = work / 'worker'
-    subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+    subprocess.run(['cc', '-std=c11', '-DBOAROS_HOST_IRQ_STATE', '-O2', '-Wall', '-Wextra', '-Werror',
                     '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
                     '-DBOAROS_PAGE_SHIFT=12', '-Itests/host/random', '-idirafter', 'include', '-idirafter', 'net/lwip_port/include',
                     '-Ithird_party/lwip/src/include', '-I' + str(work),

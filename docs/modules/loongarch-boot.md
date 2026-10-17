@@ -3,13 +3,12 @@
 当前验收范围为 QEMU virt、LA464、单核、LA64、16 KiB/三级页表，
 整数/FPU/LSX/LASX状态与本轮指定用户程序、平台矩阵；完整Harness/原生开发另行验收。
 入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
-`platform/loongarch_virt.c`。`kernel-la` 有现代 PCI block 时启动可配置根盘 PID 1，
-无盘时运行内嵌独立 ELF 契约；平台存储生命周期在 `platform/loongarch_root.c`。
+`platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
 默认 `all` 和 RV 测试入口保持原路径。
 
 ```sh
-make kernel-la                 # LP64S 整数内核和独立用户 ELF
-make run-loongarch             # QEMU 无 BIOS 直接 ELF 启动，串口可交互
+make kernel-la                 # 普通 LP64S 内核，需要 PCI 根盘
+make kernel-la-contract        # 独立启动/MMU/heap/内嵌用户 ELF 契约
 make test-root-loongarch        # PCI/ext4/LP64S musl/原 BusyBox 与 Linux 对照
 make test-root-io-loongarch     # 真正的块写错误与持久 owner
 make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反例
@@ -27,7 +26,7 @@ make test-pthread-oom-loongarch # 两处 clone 构造 OOM、真实 pthread EAGAI
 make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权对照
 ```
 
-`run-loongarch` 进入 console 探针后，依次在 poll/read ready 标记出现时输入 `g` 和 `r`（各回车），完成后关机。
+契约 runner 使用 `kernel-contract-la`；普通根盘、网络和用户程序 runner 使用 `kernel-la`。两者共享通用对象，启动 main/root 与测试对象分开保存。编译配置记录编译器身份、全局宏和 flags，链接配置记录对象集合与 wrappers；同目录反向切换也会更新受影响产物，内容未变时保留缓存。`make test-build-config-host` 用实际 Make 规则检查这些切换与无变更构建。
 
 `prepare-la-tools` 从固定 QEMU 加本地 RTC 补丁构建派生模拟器；`prepare-la-original-tools`
 保留无补丁对照构建。`prepare-la-linux` 从固定 Linux defconfig 建立

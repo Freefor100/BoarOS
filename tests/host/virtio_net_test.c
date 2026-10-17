@@ -3,6 +3,8 @@
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <assert.h>
+#include <arch/context.h>
+_Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +105,7 @@ static void model_extra_free(uint64_t phys)
 static void *released_owner[8]; static unsigned released_count;
 static void collect_owner(void *owner)
 {
+    assert(arch_interrupt_is_enabled());
     assert(released_count < 8); released_owner[released_count++] = owner;
 }
 static struct wire_descriptor raw_descriptor(uint64_t table, unsigned id)
@@ -714,8 +717,33 @@ static void test_tx_segments_unsupported(unsigned version)
     printf("PASS: VirtIO-net v%u TX segments require the negotiated indirect feature\n", version);
 }
 
+static void test_batch_notify(unsigned version)
+{
+    struct riscv_virtio_mmio_net d; start(version,&d);
+    assert(queues[0].notifications==1 && !queues[1].notifications);
+    unsigned rx_before=queues[0].notifications;
+    for(unsigned i=0;i<8;i++) {
+        unsigned id=prepare_rx("batch",5,0,0);
+        complete(0,id,(version==1?10:12)+5,0);
+    }
+    assert(!virtio_net_service(&d));
+    assert(queues[0].notifications==rx_before+1);
+    for(unsigned i=0;i<64;i++) assert(virtio_net_send(&d,"x",1)==1);
+    assert(d.tx_count==32 && queues[1].pending_count==32);
+    unsigned tx_before=queues[1].notifications;
+    for(unsigned i=0;i<8;i++) complete(1,next_head(1),0,0);
+    assert(!virtio_net_service(&d));
+    assert(d.tx_count==24 && queues[1].pending_count==32 && queues[1].notifications==tx_before+1);
+    rx_before=queues[0].notifications;tx_before=queues[1].notifications;
+    assert(!virtio_net_service(&d));
+    assert(queues[0].notifications==rx_before && queues[1].notifications==tx_before);
+    stop(&d);
+    printf("PASS: VirtIO-net v%u RX/TX batch notifies once, partial full batch publishes, empty batch silent\n",version);
+}
+
 int main(void)
 {
+    test_batch_notify(1); test_batch_notify(2);
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
     for (unsigned version = 1; version <= 2; version++) {
         test_loan_budget(version); test_tx_copy_budget(version); test_failure_slot_dump(version);

@@ -16,11 +16,13 @@
 
 ## FS 状态机与调度
 
-初次 ELF 入口和 exec 的 Frame 将 `sstatus.FS` 置为 Initial；fork 继承父进程实际 FP image，子 Frame 标记 Clean，首次调度加载该 image。只有汇编封装 `riscv_fpu_state_save/restore` 和 `riscv_fpu_switch` 使用 F/D 指令；内核 C 和普通汇编按 RV64IMAC 编译，不在 FP owner 之外触碰浮点单元。
+初次 ELF 入口和 exec 的 Frame 将 `sstatus.FS` 置为 Initial；fork 继承父进程实际 FP image，首次调度加载该 image。只有汇编封装 `riscv_fpu_state_save/restore` 和 `riscv_fpu_switch` 使用 F/D 指令；内核 C 和普通汇编按 RV64IMAC 编译，不在 FP owner 之外触碰浮点单元。
 
 context switch 在关闭 SIE 的临界区先观察 FS：前一个用户 task 为 Dirty 时保存 32 个寄存器和 fcsr、将 FS 收敛到 Clean，再按需加载下一个 task 的 saved image；恢复完成后保持 Clean，使下一次用户 FP 指令重新产生 Dirty。内核线程没有用户 FP owner，不保存也不恢复。task 退出时丢弃其 FP image，只加载下一个用户 task 的状态。
 
-这条 lazy 路径把 272 字节保存和 32 次 store/load 放在真正使用 FP 的 task 切换上，而不是每次整数 trap 都支付；当前单 hart 关闭 SIE 已足以串行化 owner。引入 SMP 时必须同时保护 task 状态、远端切换和调度迁移，不能仅把字段改成原子类型。
+返回汇编调用的最后准备点从live CSR合并FS到当前Trap Frame，其余sstatus位仍由Frame决定。trap内调度、信号恢复和exec可能改变live FS，不能把入口旧快照写回，也不能无条件标成Clean：没有保存过的Dirty状态仍须让下一次切换保存。用户返回与内核抢占返回共用这一步。
+
+这条lazy路径把272字节保存和32次store/load放在真正使用FP的task切换上，而不是每次整数trap都支付。两核配置由调度域与on_cpu交接保护task image，目标核在旧执行owner结束后才加载；没有跨hart延迟借用仍在另一核运行的FPU owner。
 
 ## exec、clone 与 signal 边界
 
@@ -30,12 +32,13 @@ fork/clone 先保存父进程当前硬件 FP 寄存器，再复制 32 个 D 寄�
 
 ## 当前边界与验证
 
-当前只实现 RISC-V F/D 64 位寄存器视图；未实现 V 扩展、向量上下文、用户态浮点异常信号或跨 hart lazy ownership。每个 task 固定承担 272 字节状态空间，板级性能和 FPU trap 计数尚未测量，不能把 QEMU 的正确性通过写成性能结论。
+当前只实现RISC-V F/D 64位寄存器视图；未实现V扩展、向量上下文、用户态浮点异常信号或跨hart lazy ownership。每个 task 固定承担 272 字节状态空间，板级性能和 FPU trap 计数尚未测量，不能把 QEMU 的正确性通过写成性能结论。
 
 ```sh
 make test-signal-riscv
 make test-userland-riscv
+make test-smp-fpu-setup-riscv
 make test-riscv
 ```
 
-真实用户程序让浮点寄存器装入不同模式，在 timer 抢占、handler/sigreturn、clone/exec 和退出回收后检查值；signal 测试覆盖 ucontext FP 区域与恢复边界。
+真实用户程序让浮点寄存器装入不同模式，在timer抢占、handler/sigreturn、clone/exec和退出回收后检查值；signal测试覆盖ucontext FP区域与恢复边界。SMP fixture在四个真实owner上检查返回准备保留live Off/Initial/Clean/Dirty，同时覆盖timer抢占、迁移和最终image归还。

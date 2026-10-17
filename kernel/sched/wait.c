@@ -8,13 +8,8 @@
 
 #include "private.h"
 
-/*
- * Every BLOCKED task sits on the global blocked list.  wait_queue names
- * the event channel and
- * wakeup_deadline (raw time-counter ticks, 0 = none) adds a timeout.
- * Event wakeups use each queue's FIFO membership; timeout expiry alone
- * scans the global blocked list. Both memberships are removed in O(1).
- */
+/* BLOCKED成员位于blocked链；等待节点保存事件队列，wait record保存期限。
+ * 事件按队列FIFO通知；期限AVL只访问到期成员，不扫描整条blocked链。 */
 
 void blocked_append(struct kernel_task *thread)
 {
@@ -108,8 +103,8 @@ static struct kernel_task *deadline_balance(struct kernel_task *root)
 static int deadline_before(const struct kernel_task *a,
                            const struct kernel_task *b)
 {
-    return a->wakeup_deadline < b->wakeup_deadline ||
-           (a->wakeup_deadline == b->wakeup_deadline &&
+    return a->wait.deadline < b->wait.deadline ||
+           (a->wait.deadline == b->wait.deadline &&
             (a->tid < b->tid || (a->tid == b->tid && (uintptr_t)a < (uintptr_t)b)));
 }
 
@@ -159,7 +154,7 @@ static struct kernel_task *deadline_remove_node(struct kernel_task *root,
 
 void deadline_index_insert(struct kernel_task *task)
 {
-    if (task == 0 || task->wakeup_deadline == 0U ||
+    if (task == 0 || task->wait.deadline == 0U ||
         task->deadline_indexed) __builtin_trap();
     task->deadline_left = 0;
     task->deadline_right = 0;
@@ -240,9 +235,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
     scheduler_user_reservation_release_locked(task);
 #endif
     task->wait.ready_head = 0;
-    task->wait_queue = task->default_wait_node.queue;
-    task->wakeup_deadline = deadline;
-    task->wait_interruptible = interruptible;
+    if (task->wait.deadline != deadline || task->wait.interruptible != (uint32_t)interruptible) __builtin_trap();
     if (deadline) {
         deadline_index_insert(task);
 #if BOAROS_MAX_CPUS > 1
@@ -260,16 +253,13 @@ void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 {
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_wake(&task->cost);
-    if (reason == KERNEL_WAIT_TIMEOUT && task->wakeup_deadline)
-        kernel_cost_timeout(&task->cost, task->wakeup_deadline);
+    if (reason == KERNEL_WAIT_TIMEOUT && task->wait.deadline)
+        kernel_cost_timeout(&task->cost, task->wait.deadline);
 #endif
     blocked_unlink(task);
     deadline_index_remove(task);
     kernel_wait_node_remove_locked(&task->default_wait_node);
-    task->wait_queue = 0;
-    task->wakeup_deadline = 0;
-    task->wait_interruptible = 0;
-    task->wake_reason = reason;
+    (void)reason; /* 通知者在摘除期限索引后发布record.reason/phase。 */
     task->state = KERNEL_THREAD_STATE_READY;
 }
 void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(task, task->wait.ready_head); }
@@ -299,7 +289,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             for (unsigned n = 0; n < 16; n++) {
                 struct kernel_task *task = deadline_index_first();
-                if (!task || (int64_t)(now - task->wakeup_deadline) < 0) { done = 1; break; }
+                if (!task || (int64_t)(now - task->wait.deadline) < 0) { done = 1; break; }
                 struct kernel_wait_token token = {task, task->wait.generation};
                 COST_ADD(DEADLINE_VISITS, 1);
                 if (!kernel_wait_notify_locked(&token, KERNEL_WAIT_TIMEOUT)) __builtin_trap();

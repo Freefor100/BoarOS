@@ -2,7 +2,7 @@
 
 固定参考为 `references/linux/` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：`drivers/char/random.c` 的 `crng_fast_key_erasure`、`getrandom`、`random_poll` 和 `lib/crypto/blake2s.c`。后者 SPDX 为 GPL-2.0 OR MIT，`kernel/blake2s.c` 保留来源与版权并在项目 GPL-2.0 路线下使用；不是隐藏依赖于 references 的构建输入。
 
-旧实现先向调用者复制完整 ChaCha20 块，再把该块前 32 字节作为下一次 key；因此知道一次输出即可预测后续输出。新实现每次请求在单 hart 短关中断区用全局 key 生成首块，仅将前 32 字节保存为新 key；调用者收到后 32 字节，再由独立局部旧 key / counter 生成余量。大块生成和用户复制都在临界区外，局部 key、块和密码原语工作数组显式擦除。此为单 hart IRQ 排他契约，不是 SMP 同步。
+旧实现先向调用者复制完整 ChaCha20 块，再把该块前 32 字节作为下一次 key；因此知道一次输出即可预测后续输出。新实现每次请求在单 hart 短关中断区用全局 key 生成首块，仅将前 32 字节保存为新 key；调用者收到后 32 字节，再由独立局部旧 key / counter 生成余量。大块生成和用户复制都在临界区外，局部 key、块和密码原语工作数组显式擦除。 `getrandom` 完成就绪、范围和 MM 检查后，在数据生成与用户复制阶段显式开放 IRQ；每 256 字节检查已交付前缀后的信号，错误仍返回真实前缀，结束恢复入口 IRQ 状态。随机池自身保留短临界区，不在 syscall 入口统一开放中断。此为单 hart IRQ 排他契约，不是 SMP 同步。
 
 BLAKE2s 每次混入最多 32 字节输入与旧 32 字节 key，故混种临界区只执行一次有界压缩；重新取全局 key 避免 IRQ 并发更新被过期快照覆盖。`kernel_random_mix(data,size,trusted)` 的 trusted 只能由成功完成的可信 VirtIO RNG 数据设置，累计 32 字节使 ready 单向置位并唤醒等待者。DTB seed、时钟、测试 seed 与用户写入都是不计熵材料。可信设备失败不清除已获得的 ready，也不能把未完成或错误 DMA 缓冲计作可信字节。
 

@@ -473,12 +473,15 @@ enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *p
     kernel_assert_can_block();
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_task *next;
+    uint64_t deadline;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler_account_runtime_locked();
         next = scheduler_select_next_locked(cpu, previous, 1);
+        deadline = scheduler_deadline_locked(cpu);
     }
     if (!next) return KERNEL_SCHEDULER_STATUS_OK;
+    scheduler_arm_timer(deadline);
     return scheduler_switch_claimed(previous, next);
 }
 
@@ -491,7 +494,6 @@ enum kernel_scheduler_status scheduler_switch_claimed(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_switch(&previous->cost, &next->cost);
 #endif
-    scheduler_rearm_timer();
     arch_fpu_switch(&previous->fpu, &next->fpu);
     /* 新栈完成handoff；raw已释放，IRQ仍关闭，旧任务尚不能再次运行/回收。 */
     arch_context_switch(&previous->context, &next->context);
@@ -872,7 +874,6 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.blocked_head = 0;
     scheduler.blocked_tail = 0;
     scheduler.deadline_root = 0;
-    kernel_cpu_current()->armed_deadline = 0;
     kernel_stack_slots_reset();
     scheduler.stopped_head = 0;
     scheduler.stopped_tail = 0;
@@ -1346,13 +1347,16 @@ void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks)
     for (unsigned i = 0; i < 3; i++) loads[i] = scheduler.loads[i] << 5;
 }
 
-static void scheduler_sample_load(uint64_t elapsed)
+static enum kernel_scheduler_status scheduler_sample_load(uint64_t elapsed)
 {
     const uint64_t period = 5 * KERNEL_TICKS_PER_SECOND + 1;
+    /* 只有CPU0的IRQ关闭tick推进这个采样余量，普通tick不另取调度域。 */
+    scheduler.load_ticks += elapsed;
+    if (scheduler.load_ticks < period) return KERNEL_SCHEDULER_STATUS_OK;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        scheduler.load_ticks += elapsed;
-        if (scheduler.load_ticks < period) return;
+        enum kernel_scheduler_status status = validate_queues_locked();
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     }
     uint64_t active = 0;
     struct scheduler_task_cursor cursor;
@@ -1363,7 +1367,7 @@ static void scheduler_sample_load(uint64_t elapsed)
             struct kernel_task *task = cursor.task;
             if (task->accounted && (task->state == KERNEL_THREAD_STATE_READY ||
                 task->state == KERNEL_THREAD_STATE_RUNNING ||
-                (task->state == KERNEL_THREAD_STATE_BLOCKED && !task->wait_interruptible))) active++;
+                (task->state == KERNEL_THREAD_STATE_BLOCKED && !task->wait.interruptible))) active++;
         }
         scheduler_task_cursor_next(&cursor);
     }
@@ -1378,6 +1382,7 @@ static void scheduler_sample_load(uint64_t elapsed)
                                   (active >= load ? 2047 : 0)) >> 11;
         }
     }
+    return KERNEL_SCHEDULER_STATUS_OK;
 }
 
 enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
@@ -1393,11 +1398,8 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
         && kernel_cpu_current()->logical_id == 0
 #endif
     ) {
-        /* Load sampling traverses with borrows outside a single raw section.
-         * Preserve its fail-before-sampling check; the decision revalidates. */
-        status = validate_queues();
+        status = scheduler_sample_load(elapsed_ticks);
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-        scheduler_sample_load(elapsed_ticks);
     }
     return scheduler_reschedule(elapsed_ticks != 0, 0, 1);
 }

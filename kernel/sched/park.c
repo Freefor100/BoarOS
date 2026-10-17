@@ -261,6 +261,9 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
                 node->token_next = 0;
             }
             if (!record->nodes && !record->borrows) {
+                record->deadline = 0;
+                record->interruptible = 0;
+                record->reason = KERNEL_WAIT_WOKEN;
                 record->phase = KERNEL_WAIT_FINISHED;
                 *token = (struct kernel_wait_token){0};
                 return KERNEL_SCHEDULER_STATUS_OK;

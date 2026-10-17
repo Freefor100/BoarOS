@@ -238,12 +238,14 @@ void riscv_smp_report_user_execution(void)
         virt_uart_puts(" syscalls="); virt_uart_put_hex(cpus[i]->syscall_dispatches);
         virt_uart_putc('\n');
     }
+#if BOAROS_COST_DIAGNOSTICS
     virt_uart_puts("BoarOS: USER SMP service migrations="); virt_uart_put_hex(cpus[0]->service_migrations);
     virt_uart_puts(" queue-ticks="); virt_uart_put_hex(cpus[0]->service_queue_ticks);
     virt_uart_puts(" samples="); virt_uart_put_hex(cpus[0]->service_samples);
     virt_uart_puts(" elapsed-ticks="); virt_uart_put_hex(cpus[0]->service_elapsed_ticks);
     virt_uart_puts(" running-ns="); virt_uart_put_hex(cpus[0]->service_running_ns);
     virt_uart_putc('\n');
+#endif
 #endif
 }
 

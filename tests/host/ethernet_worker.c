@@ -26,6 +26,7 @@ void kernel_socket_network_failed(uint32_t address) { (void)address; errors++; }
 struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
 {
     (void)budget;
+    if (!arch_interrupt_is_enabled()) abort();
     expired = riscv_time_read() >= 950;
     if (worker_mode) {
         protocol_attempts++;
@@ -33,9 +34,29 @@ struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_
     }
     return (struct kernel_socket_service_result){.runnable = worker_mode >= 5 && protocol_attempts == 1, .next_deadline = 1200};
 }
-uintptr_t kernel_socket_protocol_enter(void) { return 0; }
-void kernel_socket_protocol_leave(uintptr_t irq) { (void)irq; }
-int kernel_socket_work_pending(void) { return worker_mode >= 5 && protocol_attempts == 1; }
+_Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
+static unsigned protocol_held, wait_active, wait_inject, wait_parks, wait_finishes;
+static unsigned outer_acquisitions, owned_services;
+static int actual_work=-1;
+static struct virtio_net_device *wait_device;
+void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope)
+{ if (wait_active && !protocol_held) abort(); scope->outer=!protocol_held;
+  if(scope->outer) {scope->interrupts=arch_interrupt_save();outer_acquisitions++;arch_interrupt_restore(RISCV_SSTATUS_SIE);}
+  protocol_held++; }
+void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
+{ if (!protocol_held) abort();protocol_held--;
+  if(scope->outer) {if(protocol_held)abort();(void)arch_interrupt_save();arch_interrupt_restore(scope->interrupts);}
+  if(scope->outer && wait_active && wait_inject==2) wait_device->tx_capacity_generation++; }
+struct kernel_socket_service_result kernel_socket_service_owned(const struct kernel_socket_protocol_scope *scope,
+    struct kernel_socket_service_budget budget)
+{ if(!scope->outer || protocol_held!=1) abort();owned_services++;return kernel_socket_service_pending(budget); }
+static void wait_once(struct kernel_network *n,struct kernel_socket_service_result service,uint64_t generation)
+{
+    uintptr_t irq=arch_interrupt_save();
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    wait_progress(n,&scope,service,generation);arch_interrupt_restore(irq);
+}
+int kernel_socket_work_pending(void) { if(!protocol_held) abort(); return actual_work>=0?actual_work:(worker_mode >= 5 && protocol_attempts == 1); }
 void kernel_socket_network_capacity(void) {}
 void kernel_socket_network_blocked(void) {}
 uint64_t kernel_socket_next_timer_deadline(void) { return 1200; }
@@ -87,6 +108,7 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     void (*release)(void *), int abandon)
 {
     (void)release;
+    if (!arch_interrupt_is_enabled() || protocol_held) abort();
     unsigned released = d->tx_done_count;
     if (abandon) abandon_calls++;
     else {
@@ -137,13 +159,77 @@ static int receive_contract(void)
     return 0;
 }
 
+static void wait_contract(void)
+{
+    struct virtio_net_device d={.frequency=100};
+    struct kernel_network n={.device=&d,.frequency=100};
+    worker_mode=0;wait_device=&d;network_host_irq=RISCV_SSTATUS_SIE;
+    for(wait_inject=1;wait_inject<=2;wait_inject++) {
+        unsigned parks=wait_parks,finishes=wait_finishes;
+        wait_once(&n,(struct kernel_socket_service_result){.next_deadline=1200},d.tx_capacity_generation);
+        if(wait_active || protocol_held || !arch_interrupt_is_enabled() ||
+            wait_finishes!=finishes+1 || wait_parks!=parks+(wait_inject==2)) abort();
+    }
+    wait_inject=0;wait_device=NULL;
+    puts("PASS worker wait: prepare recheck sees IRQ capacity, release-to-park wake retained, no mutex until finish");
+}
+static void current_work_contract(void)
+{
+    struct kernel_network n={.frequency=100};
+    network_host_irq=RISCV_SSTATUS_SIE;actual_work=0;
+    volatile unsigned before_yields=yields,before_parks=wait_parks;
+    if(!setjmp(stopped)) wait_once(&n,(struct kernel_socket_service_result){.runnable=1,.next_deadline=1200},0);
+    if(yields!=before_yields || wait_parks!=before_parks+1) { fprintf(stderr,"FAIL stale runnable yields=%u parks=%u\n",yields-before_yields,wait_parks-before_parks); abort(); }
+    network_host_irq=RISCV_SSTATUS_SIE;actual_work=1;
+    before_yields=yields;before_parks=wait_parks;
+    wait_once(&n,(struct kernel_socket_service_result){.runnable=0,.next_deadline=1200},0);
+    if(yields!=before_yields+1 || wait_parks!=before_parks) abort();
+    actual_work=-1;
+    puts("PASS worker current work: another owner drained stale runnable or published fresh work before recheck");
+}
+static unsigned quiesce_error,joined,removed,freed,hook_removed;
+void kernel_assert_can_block(void) {}
+void kernel_console_putc(char c) {(void)c;}
+void kernel_thread_join(struct kernel_thread_join *join)
+{ if(protocol_held || !arch_interrupt_is_enabled()) abort();joined++;join->task=NULL; }
+int virtio_net_quiesce(struct virtio_net_device *d)
+{ if(protocol_held || !arch_interrupt_is_enabled() || !d->stopping || !joined) abort();return quiesce_error?-KERNEL_EIO:0; }
+void ip4_reass_cleanup_netif(struct netif *n) {(void)n;if(!protocol_held || !arch_interrupt_is_enabled()) abort();}
+void etharp_cleanup_netif(struct netif *n) {(void)n;if(!protocol_held) abort();}
+void netif_set_down(struct netif *n) {(void)n;if(!protocol_held) abort();}
+void netif_remove(struct netif *n) {(void)n;if(!protocol_held) abort();removed++;}
+void kernel_socket_network_hooks(void (*timer)(void *),void (*work)(void *),int (*capacity)(void *),void *context)
+{ if(timer || work || capacity || context) abort();hook_removed++; }
+enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
+{(void)q;if(arch_interrupt_is_enabled()) abort();return KERNEL_SCHEDULER_STATUS_OK;}
+void kernel_heap_get_statistics(const struct kernel_heap *heap,struct kernel_heap_statistics *out)
+{(void)heap;*out=(struct kernel_heap_statistics){0};}
+enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap,void *allocation)
+{(void)heap;if(protocol_held || !arch_interrupt_is_enabled()) abort();free(allocation);freed++;return KERNEL_HEAP_STATUS_OK;}
+static void stop_contract(void)
+{
+    struct virtio_net_device d={.loaned=1};
+    struct kernel_network *n=calloc(1,sizeof(*n));if(!n) abort();
+    n->device=&d;n->attached=1;n->worker.task=(void *)1;
+    network_host_irq=RISCV_SSTATUS_SIE;worker_mode=0;
+    unsigned old_abandon=abandon_calls;
+    quiesce_error=1;
+    if(kernel_network_stop(&n)!=-KERNEL_EIO || !n || removed || abandon_calls!=old_abandon || freed) abort();
+    quiesce_error=0;
+    if(kernel_network_stop(&n)!=-KERNEL_EBUSY || !n || removed!=1 || abandon_calls!=old_abandon+1 || freed || hook_removed) abort();
+    d.loaned=0;
+    if(kernel_network_stop(&n) || n || freed!=1 || joined!=1 || hook_removed!=1 || removed!=1) abort();
+    puts("PASS stop: join/reset outside protocol and IRQ, reset failure retains owner, RX loan EBUSY retains object until final return");
+}
+
 int main(void)
 {
     struct virtio_net_device device = {0};
     struct kernel_network owner = {.device = &device};
     owner.device->frequency = owner.frequency = 100;
     owner.interface.flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP;
-    if (!setjmp(stopped)) worker(&owner);
+    if (!setjmp(stopped)) { network_host_irq=RISCV_SSTATUS_SIE; worker(&owner); }
+    if (outer_acquisitions != owned_services) abort();
     if (!expired || errors != 1 || blocked_deadline != 1200) {
         printf("FAIL failed-NIC protocol-expired=%u errors=%u deadline=%llu\n",
                expired, errors, (unsigned long long)blocked_deadline);
@@ -161,7 +247,8 @@ int main(void)
         memset(&owner, 0, sizeof(owner)); memset(&device, 0, sizeof(device)); owner.device = &device; owner.device->frequency = owner.frequency = 100;
         owner.device->tx_done_count = worker_mode == 2 || worker_mode == 4 ? 0 : 64;
         held = 64; sent = service_calls = protocol_attempts = yields = 0;
-        if (!setjmp(stopped)) worker(&owner);
+        if (!setjmp(stopped)) { network_host_irq=RISCV_SSTATUS_SIE; worker(&owner); }
+        if (outer_acquisitions != owned_services) abort();
         if ((worker_mode != 3 && sent != 1) || (worker_mode == 3 && (sent || protocol_attempts != 1 || yields))) {
             printf("FAIL TX completion mode=%u attempts=%u sent=%u held=%u yields=%u\n",
                 worker_mode, protocol_attempts, sent, held, yields);
@@ -172,12 +259,37 @@ int main(void)
     }
     worker_mode = 6; protocol_attempts = yields = sent = held = 0;
     memset(&owner, 0, sizeof(owner)); memset(&device, 0, sizeof(device)); owner.device = &device; owner.device->frequency = owner.frequency = 100;
-    if (!setjmp(stopped)) timer_worker(&owner);
+    if (!setjmp(stopped)) { network_host_irq=RISCV_SSTATUS_SIE; timer_worker(&owner); }
     if (protocol_attempts != 2 || yields != 1 || blocked_deadline != 1200) return 1;
-    puts("PASS timer-only worker drains runnable software before sleeping");
+    if (outer_acquisitions != owned_services) abort();
+    puts("PASS timer-only worker drains runnable software with one outer owner through wait registration");
     worker_mode = 0;
+    wait_contract(); current_work_contract(); stop_contract();
     return receive_contract();
 }
 
-#include "wait_boundary.h"
-HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)
+static struct kernel_wait_queue *wait_queue;
+static uint64_t wait_deadline;
+static int wait_interruptible;
+enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
+{
+    if(!protocol_held || arch_interrupt_is_enabled() || wait_active) abort();
+    wait_active=1;wait_queue=q;wait_deadline=d;wait_interruptible=i;
+    *t=(struct kernel_wait_token){(void *)q,1};
+    if(wait_inject==1) wait_device->tx_capacity_generation++;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
+{
+    (void)t;if(protocol_held || arch_interrupt_is_enabled() || !wait_active) abort();
+    wait_parks++;
+    if(wait_inject==2) {*r=KERNEL_WAIT_WOKEN;return KERNEL_SCHEDULER_STATUS_OK;}
+    /* The legacy worker cases escape their parked task entirely. */
+    wait_active=0;
+    return kernel_scheduler_block_current(wait_queue,wait_deadline,wait_interruptible,r);
+}
+enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
+{
+    if(protocol_held || arch_interrupt_is_enabled() || !wait_active) abort();
+    wait_active=0;wait_finishes++;*t=(struct kernel_wait_token){0};return KERNEL_SCHEDULER_STATUS_OK;
+}

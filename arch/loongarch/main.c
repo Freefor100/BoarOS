@@ -10,9 +10,11 @@
 void la_trap_initialize(void);
 void la_boot_tasks(struct physical_page_allocator *);
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
+#if BOAROS_LA_CONTRACT
 void la_heap_contract(struct physical_page_allocator *);
 void la_mmu_contract(struct physical_page_allocator *);
 void la_stack_window_contract(struct physical_page_allocator *);
+#endif
 static struct physical_page_allocator allocator;
 extern unsigned char __kernel_start[], __kernel_end[];
 void la_kernel_main(uint64_t systab)
@@ -33,6 +35,7 @@ void la_kernel_main(uint64_t systab)
     status = physical_page_allocator_finalize(&allocator);
     la_virt_puts("allocator finalize="); la_virt_hex(status); la_virt_puts("\n");
     if (status != PHYSICAL_PAGE_STATUS_OK) la_virt_fatal("allocator finalize");
+#if BOAROS_LA_CONTRACT
     uint64_t before = physical_page_available(&allocator), page;
     if (physical_page_allocate(&allocator, &page) != PHYSICAL_PAGE_STATUS_OK) la_virt_fatal("allocate");
     uint64_t *data = la_virt_page_access(page);
@@ -42,10 +45,15 @@ void la_kernel_main(uint64_t systab)
         physical_page_available(&allocator) != before) la_virt_fatal("page recovery");
     la_virt_puts("LA boot contracts passed; available pages="); la_virt_hex(before); la_virt_puts("\n");
     la_heap_contract(&allocator);
+#endif
     la_mmu_initialize();
+#if BOAROS_LA_CONTRACT
     la_mmu_contract(&allocator);
+#endif
     if(la_mmu_kernel_window_initialize(&allocator)!=ARCH_MMU_STATUS_OK)la_virt_fatal("kernel stack page tables");
+#if BOAROS_LA_CONTRACT
     la_stack_window_contract(&allocator);
+#endif
     uint64_t realtime=0;
     int rtc=la_virt_rtc_initialize(&realtime);
     la_virt_puts(rtc ? "LA RTC unavailable; realtime uses boot-relative epoch\n" : "LA RTC UTC seconds resolution=1 boot-ns=");

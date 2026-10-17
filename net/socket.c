@@ -148,7 +148,6 @@ static int address_import(const struct kernel_socket *socket,
 
 static struct kernel_socket *inet_sockets;
 static uint8_t socket_initialized;
-static uint8_t socket_timer_irq;
 static uint8_t socket_timer_running;
 static uint8_t socket_device_failed;
 static void (*network_timer_wake)(void *);
@@ -167,36 +166,58 @@ static unsigned polling_snapshot;
 #endif
 static struct kernel_io_context *protocol_owner;
 
-uintptr_t kernel_socket_protocol_enter(void)
+static struct kernel_mutex protocol_mutex;
+static unsigned protocol_mutex_initialized;
+
+void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope)
 {
     kernel_assert_service_context();
-    uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
-    if (protocol_depth && protocol_owner != owner) __builtin_trap();
-    if (!protocol_depth) {
-        protocol_owner = owner;
-        if (owner->allocation_depth == UINT32_MAX) __builtin_trap();
-        owner->allocation_depth++;
+    if (protocol_owner == owner) {
+        if (!protocol_depth || protocol_depth == UINT32_MAX) __builtin_trap();
+        /* 外层mutex随任务保活；抢占者不能改变深度，嵌套借用保留当前IRQ状态。 */
+        scope->outer = 0;
+        protocol_depth++;
+        return;
     }
-    if (protocol_depth == UINT32_MAX) __builtin_trap();
-    protocol_depth++;
-    return irq;
+    *scope = (struct kernel_socket_protocol_scope){.interrupts = arch_interrupt_save()};
+    if (!protocol_mutex_initialized) {
+        kernel_mutex_init(&protocol_mutex, 25, (uintptr_t)&protocol_mutex);
+        protocol_mutex_initialized = 1;
+    }
+    /* 竞争者的 guard 留在自己的调用栈；mutex 可调度等待其他协议 owner。 */
+    kernel_mutex_lock(&protocol_mutex, &scope->guard);
+    if (protocol_depth || protocol_owner) __builtin_trap();
+    scope->outer = 1;
+    protocol_owner = owner;
+    if (owner->allocation_depth == UINT32_MAX) __builtin_trap();
+    owner->allocation_depth++;
+    protocol_depth = 1;
+    /* 协议内部允许定时器抢占；任何 raw 临界区都不能越过这个入口。 */
+    kernel_assert_can_block();
+    arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
 }
-void kernel_socket_protocol_leave(uintptr_t irq)
+void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
 {
-    if (!protocol_depth || protocol_owner != kernel_io_context_current()) __builtin_trap();
-    if (!--protocol_depth) {
-        if (!protocol_owner->allocation_depth) __builtin_trap();
-        protocol_owner->allocation_depth--;
-        protocol_owner = 0;
+    if (!scope->outer) {
+        if (protocol_depth <= 1 || protocol_owner != kernel_io_context_current()) __builtin_trap();
+        protocol_depth--;
+        return;
     }
-    arch_interrupt_restore(irq);
+    (void)arch_interrupt_save();
+    if (protocol_depth != 1 || protocol_owner != kernel_io_context_current() ||
+        !protocol_owner->allocation_depth) __builtin_trap();
+    protocol_depth = 0;
+    protocol_owner->allocation_depth--;
+    protocol_owner = 0;
+    kernel_lock_release(&scope->guard);
+    arch_interrupt_restore(scope->interrupts);
 }
 static void socket_pbuf_free(struct pbuf *payload)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     pbuf_free(payload);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 static void work_remove(struct socket_work_queue *queue, struct kernel_socket *socket)
 {
@@ -232,10 +253,10 @@ static void socket_pool_wait(struct kernel_socket *socket)
 }
 static void receive_capacity(void)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     receive_generation++;
     if (receive_wait.head && network_work_wake) network_work_wake(network_context);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 static void protocol_work_ready(void)
 {
@@ -253,14 +274,14 @@ static void protocol_input(struct tcp_pcb *pcb)
     if (pcb->callback_arg)
         socket_schedule(pcb->callback_arg, SOCKET_WORK_OUTPUT | SOCKET_WORK_REAP | SOCKET_WORK_LISTENER);
 }
-static void service_inline(void)
+static void service_inline(const struct kernel_socket_protocol_scope *scope)
 {
-    /* 短路径仅在raw栈已经退出后执行；回调只发布下一批工作。 */
-    if (!protocol_depth)
-        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8, 8, 1});
+    /* raw API已返回但outer资格尚未交接；同步回调借用scope时不重入服务。 */
+    if (scope->outer)
+        (void)kernel_socket_service_owned(scope, (struct kernel_socket_service_budget){8, 8, 1});
 }
 
-/* Called with interrupts disabled: the list itself owns no socket reference.
+/* Protocol owner required: the list itself owns no socket reference.
  * A socket must remove its entry before its OFD frees it.  Entries stay
  * ordered by write_retry_ms so the earliest retry is the head. */
 static void write_retry_disarm(struct kernel_socket *socket)
@@ -311,10 +332,12 @@ static int lwip_error(err_t error)
 
 static void wake_socket(struct kernel_socket *socket)
 {
+    uintptr_t irq = arch_interrupt_save();
     if (kernel_wait_queue_wake_all(&socket->wait) !=
         KERNEL_SCHEDULER_STATUS_OK) {
         __builtin_trap();
     }
+    arch_interrupt_restore(irq);
 }
 /* 最后OFD关闭后，队列packet仍持有发送者计费owner；最后packet才释放它。 */
 static void unix_uncharge(struct socket_packet *packet)
@@ -358,16 +381,9 @@ static void retire_timewait(struct kernel_socket *socket)
 
 void kernel_socket_expire_timers(void)
 {
-    if (network_timer_wake) { network_timer_wake(network_context); return; }
-    /* 无 owner 的早期/停用窗口仍直接推进有界协议定时器。 */
-    if (socket_initialized) {
-        if (protocol_depth) return;
-        uintptr_t irq = kernel_socket_protocol_enter();
-        socket_timer_irq = socket_timer_running = 1;
-        (void)sys_check_timeouts_budget(1);
-        socket_timer_running = socket_timer_irq = 0;
-        kernel_socket_protocol_leave(irq);
-    }
+    uintptr_t irq = arch_interrupt_save();
+    if (network_timer_wake) network_timer_wake(network_context);
+    arch_interrupt_restore(irq);
 }
 
 static uint64_t socket_next_timer_deadline(void)
@@ -376,7 +392,7 @@ static uint64_t socket_next_timer_deadline(void)
     uint64_t now;
     uint64_t delay;
     u32_t milliseconds;
-    uintptr_t old_status = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope old_status; kernel_socket_protocol_enter(&old_status);
     milliseconds = socket_initialized ? sys_timeouts_sleeptime()
                                       : SYS_TIMEOUTS_SLEEPTIME_INFINITE;
     u32_t current_ms = sys_now();
@@ -387,7 +403,7 @@ static uint64_t socket_next_timer_deadline(void)
         if (milliseconds == SYS_TIMEOUTS_SLEEPTIME_INFINITE ||
             retry < milliseconds) milliseconds = retry;
     }
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&old_status);
     if (milliseconds == SYS_TIMEOUTS_SLEEPTIME_INFINITE) return 0;
     now = kernel_time_monotonic_ns();
     delay = (uint64_t)(milliseconds == 0U ? 1U : milliseconds) *
@@ -516,10 +532,6 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
         socket->peer_closed = 1U;
         wake_socket(socket);
         return ERR_OK;
-    }
-    /* 拒收重试仍由协议持有 pbuf；IRQ 不重入被中断的全局堆操作。 */
-    if (socket_timer_irq) {
-        socket->receive_retry=1;socket_schedule(socket, SOCKET_WORK_RECEIVE);wake_socket(socket);return ERR_MEM;
     }
     if (error != ERR_OK) return error;
     if (payload->tot_len > socket->rx_limit ||
@@ -653,7 +665,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
                          struct kernel_socket **owner)
 {
     struct kernel_socket *socket = 0;
-    uintptr_t old_status;
+    struct kernel_socket_protocol_scope old_status;
 
     if (heap == 0 || owner == 0 || *owner != 0 ||
         (type != SOCKET_DGRAM && type != SOCKET_STREAM) ||
@@ -667,7 +679,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
         return -KERNEL_ENOMEM;
     }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
-    old_status = kernel_socket_protocol_enter();
+    kernel_socket_protocol_enter(&old_status);
     kernel_socket_network_initialize();
     socket->heap = heap;
     socket->type = (uint8_t)type;
@@ -690,16 +702,16 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
             tcp_sent(socket->tcp, tcp_data_sent);
         }
     }
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&old_status);
     if ((type == SOCKET_DGRAM && socket->udp == 0) ||
         (type == SOCKET_STREAM && socket->tcp == 0)) {
         if (kernel_heap_release(heap, socket) != KERNEL_HEAP_STATUS_OK)
             __builtin_trap();
         return -KERNEL_ENOMEM;
     }
-    old_status = kernel_socket_protocol_enter();
+    kernel_socket_protocol_enter(&old_status);
     socket->inet_next = inet_sockets; inet_sockets = socket;
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&old_status);
     *owner = socket;
     return 0;
 }
@@ -752,11 +764,10 @@ int kernel_socket_pair(struct kernel_heap *heap, int type,
 
 void kernel_socket_destroy(struct kernel_socket *socket)
 {
-    if (socket && socket->tx_reserved) __builtin_trap();
-    uintptr_t old_status;
+    struct kernel_socket_protocol_scope old_status;
     if (socket == 0) __builtin_trap();
-    old_status = kernel_socket_protocol_enter();
-    if (socket->read_request != 0) __builtin_trap();
+    kernel_socket_protocol_enter(&old_status);
+    if (socket->read_request != 0 || socket->tx_reserved) __builtin_trap();
     socket->destroying = 1;
     if (socket->listener && socket->pending_ready) {
         if (!socket->listener->pending_live) __builtin_trap();
@@ -814,10 +825,12 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         }
         if (tcp_close(socket->tcp) != ERR_OK) tcp_abort(socket->tcp);
     }
-    kernel_socket_protocol_leave(old_status);
-    if (socket->domain != KERNEL_SOCKET_DOMAIN_UNIX || !socket->unix_packets) {
-        if (socket->unix_memory || socket->tx_reserved) __builtin_trap();
-        if (kernel_heap_release(socket->heap, socket) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    int release_socket = socket->domain != KERNEL_SOCKET_DOMAIN_UNIX || !socket->unix_packets;
+    if (release_socket && (socket->unix_memory || socket->tx_reserved)) __builtin_trap();
+    struct kernel_heap *heap = socket->heap;
+    kernel_socket_protocol_leave(&old_status);
+    if (release_socket) {
+        if (kernel_heap_release(heap, socket) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     }
     receive_capacity();
 }
@@ -825,22 +838,23 @@ void kernel_socket_destroy(struct kernel_socket *socket)
 int kernel_socket_bind(struct kernel_socket *socket,
                        const struct kernel_socket_address *address)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     ip_addr_t local;
-    if (socket->domain != KERNEL_SOCKET_DOMAIN_INET) return -KERNEL_EINVAL;
+    if (socket->domain != KERNEL_SOCKET_DOMAIN_INET) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     if ((socket->udp != 0 && socket->udp->local_port != 0) ||
-        (socket->tcp != 0 && socket->tcp->local_port != 0)) return -KERNEL_EINVAL;
+        (socket->tcp != 0 && socket->tcp->local_port != 0)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     int result = address_import(socket, address, &local, 1);
-    if (result != 0) return result;
+    if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
     if (!ip_addr_isany(&local) &&
         !(IP_IS_V4(&local) ? ip4_addr_isloopback(ip_2_ip4(&local)) : ip6_addr_isloopback(ip_2_ip6(&local)))) {
         int found = 0;
         for (struct netif *n = netif_list; n; n = n->next)
             if (IP_IS_V4(&local) && ip4_addr_eq(ip_2_ip4(&local), netif_ip4_addr(n))) found = 1;
-        if (!found) return -KERNEL_EADDRNOTAVAIL;
+        if (!found) { kernel_socket_protocol_leave(&scope); return -KERNEL_EADDRNOTAVAIL; }
     }
-    uintptr_t old_status = kernel_socket_protocol_enter();
+
     result = port_conflict(socket, &local, address->port, 0);
-    if (result != 0) { kernel_socket_protocol_leave(old_status); return result; }
+    if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
     err_t error = socket->type == SOCKET_DGRAM
         ? udp_bind(socket->udp, &local, address->port)
         : tcp_bind(socket->tcp, &local, address->port);
@@ -850,24 +864,27 @@ int kernel_socket_bind(struct kernel_socket *socket,
         if (socket->udp != 0) ip_addr_copy(socket->udp_bind_ip, socket->udp->local_ip);
         if (IP_IS_V6(&local) && !ip_addr_isany(&local)) socket->v6only = 1;
     }
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&scope);
     return lwip_error(error);
 }
 
 int kernel_socket_getname(struct kernel_socket *socket,
                           struct kernel_socket_address *address)
 {
-    if (socket == 0 || address == 0) return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    if (socket == 0 || address == 0) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
-        *address = (struct kernel_socket_address){.family=1}; return 0;
+        *address = (struct kernel_socket_address){.family=1};
+        kernel_socket_protocol_leave(&scope); return 0;
     }
     if (socket->tcp == 0 && socket->connected && socket->type == SOCKET_STREAM) {
-        *address = socket->saved_local; return 0;
+        *address = socket->saved_local;
+        kernel_socket_protocol_leave(&scope); return 0;
     }
     if (socket->type == SOCKET_DGRAM) {
         address_export(socket, &socket->udp->local_ip, socket->udp->local_port, address);
     } else {
-        if (socket->tcp == 0) return socket->error != 0 ? socket->error : -KERNEL_ENOTCONN;
+        if (socket->tcp == 0) { int result = socket->error != 0 ? socket->error : -KERNEL_ENOTCONN; kernel_socket_protocol_leave(&scope); return result; }
         if (socket->listening) {
             struct tcp_pcb_listen *pcb = (struct tcp_pcb_listen *)socket->tcp;
             address_export(socket, &pcb->local_ip, pcb->local_port, address);
@@ -875,36 +892,39 @@ int kernel_socket_getname(struct kernel_socket *socket,
             address_export(socket, &socket->tcp->local_ip, socket->tcp->local_port, address);
         }
     }
+    kernel_socket_protocol_leave(&scope);
     return 0;
 }
 
 int kernel_socket_getpeer(struct kernel_socket *socket,
                           struct kernel_socket_address *address)
 {
-    if (socket == 0 || address == 0) return -KERNEL_EINVAL;
-    if (!socket->connected) return -KERNEL_ENOTCONN;
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    if (socket == 0 || address == 0) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
+    if (!socket->connected) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENOTCONN; }
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
-        *address = (struct kernel_socket_address){.family=1}; return 0;
+        *address = (struct kernel_socket_address){.family=1};
+        kernel_socket_protocol_leave(&scope); return 0;
     }
     if (socket->udp != 0)
         address_export(socket, &socket->udp->remote_ip, socket->udp->remote_port, address);
     else if (socket->tcp != 0)
         address_export(socket, &socket->tcp->remote_ip, socket->tcp->remote_port, address);
     else { *address = socket->saved_peer; }
+    kernel_socket_protocol_leave(&scope);
     return 0;
 }
 
 int kernel_socket_listen(struct kernel_socket *socket, int backlog)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     err_t error = ERR_OK;
     struct tcp_pcb *replacement;
-    uintptr_t old_status;
-    if (socket->type != SOCKET_STREAM) return -KERNEL_EOPNOTSUPP;
-    if (socket->tcp == 0) return -KERNEL_ENOTCONN;
-    if (socket->listening) return 0;
-    old_status = kernel_socket_protocol_enter();
+    if (socket->type != SOCKET_STREAM) { kernel_socket_protocol_leave(&scope); return -KERNEL_EOPNOTSUPP; }
+    if (socket->tcp == 0) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENOTCONN; }
+    if (socket->listening) { kernel_socket_protocol_leave(&scope); return 0; }
     int conflict = port_conflict(socket, local_ip(socket), local_port(socket), 1);
-    if (conflict != 0) { kernel_socket_protocol_leave(old_status); return conflict; }
+    if (conflict != 0) { kernel_socket_protocol_leave(&scope); return conflict; }
     replacement = tcp_listen_with_backlog_and_err(socket->tcp,
         backlog < 1 ? 1U : backlog > 255 ? 255U : (u8_t)backlog, &error);
     if (replacement != 0) {
@@ -913,7 +933,7 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
         tcp_arg(replacement, socket);
         tcp_accept(replacement, socket_tcp_accepted);
     }
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&scope);
     return replacement != 0 ? 0 : lwip_error(error);
 }
 
@@ -922,9 +942,9 @@ int kernel_socket_connect(struct kernel_socket *socket,
 {
     ip_addr_t remote;
     err_t error;
-    uintptr_t old_status;
+    struct kernel_socket_protocol_scope old_status;
+    kernel_socket_protocol_enter(&old_status);
     if (socket->udp != 0) {
-        old_status = kernel_socket_protocol_enter();
         if (address->family == 0) {
             udp_disconnect(socket->udp); socket->connected = 0;
             if (socket->explicit_bind) ip_addr_copy(socket->udp->local_ip, socket->udp_bind_ip);
@@ -937,58 +957,57 @@ int kernel_socket_connect(struct kernel_socket *socket,
             error = ERR_OK;
         } else {
             int result = address_import(socket, address, &remote, 0);
-            if (result != 0) { kernel_socket_protocol_leave(old_status); return result; }
+            if (result != 0) { kernel_socket_protocol_leave(&old_status); return result; }
             struct netif *route = ip_route(&socket->udp->local_ip, &remote);
             const ip_addr_t *source = route != 0 ? ip_netif_get_local_ip(route, &remote) : 0;
-            if (source == 0) { kernel_socket_protocol_leave(old_status); return -KERNEL_ENETUNREACH; }
+            if (source == 0) { kernel_socket_protocol_leave(&old_status); return -KERNEL_ENETUNREACH; }
             error = udp_connect(socket->udp, &remote, address->port);
             if (error == ERR_OK) {
                 socket->connected = 1;
                 if (ip_addr_isany(&socket->udp->local_ip)) ip_addr_copy(socket->udp->local_ip, *source);
             }
         }
-        kernel_socket_protocol_leave(old_status);
+        kernel_socket_protocol_leave(&old_status);
         return lwip_error(error);
     }
-    if (socket->type != SOCKET_STREAM) return -KERNEL_EOPNOTSUPP;
-    if (socket->tcp == 0) return socket->error != 0 ? socket->error
-                                                     : -KERNEL_ENOTCONN;
-    if (socket->listening) return -KERNEL_EINVAL;
-    if (socket->connected) return -KERNEL_EISCONN;
-    if (socket->connecting) return -KERNEL_EALREADY;
+    if (socket->type != SOCKET_STREAM) { int failure = (-KERNEL_EOPNOTSUPP); kernel_socket_protocol_leave(&old_status); return failure; }
+    if (socket->tcp == 0) { int failure = (socket->error != 0 ? socket->error
+                                                     : -KERNEL_ENOTCONN); kernel_socket_protocol_leave(&old_status); return failure; }
+    if (socket->listening) { int failure = (-KERNEL_EINVAL); kernel_socket_protocol_leave(&old_status); return failure; }
+    if (socket->connected) { int failure = (-KERNEL_EISCONN); kernel_socket_protocol_leave(&old_status); return failure; }
+    if (socket->connecting) { int failure = (-KERNEL_EALREADY); kernel_socket_protocol_leave(&old_status); return failure; }
     int result = address_import(socket, address, &remote, 0);
-    if (result != 0) return result;
-    old_status = kernel_socket_protocol_enter();
+    if (result != 0) { int failure = (result); kernel_socket_protocol_leave(&old_status); return failure; }
     error = tcp_connect(socket->tcp, &remote, address->port, tcp_connected);
     if (error == ERR_OK) socket->connecting = 1U;
-    kernel_socket_protocol_leave(old_status);
+    if (error == ERR_OK) service_inline(&old_status);
+    int connected = socket->error ? socket->error : socket->connected ? 0 : -KERNEL_EINPROGRESS;
+    kernel_socket_protocol_leave(&old_status);
     if (error != ERR_OK) return lwip_error(error);
-    /* NO_SYS has no network thread: the initiating syscall must deliver SYN. */
-    service_inline();
-    if (nonblocking) return -KERNEL_EINPROGRESS;
-    if (socket->error != 0) return socket->error;
-    return socket->connected ? 0 : -KERNEL_EINPROGRESS;
+    return nonblocking ? -KERNEL_EINPROGRESS : connected;
 }
 
 int kernel_socket_connection_result(struct kernel_socket *socket)
 {
-    if (socket->error != 0) return socket->error;
-    return socket->connected ? 0 : -KERNEL_EINPROGRESS;
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    int result = socket->error ? socket->error : socket->connected ? 0 : -KERNEL_EINPROGRESS;
+    kernel_socket_protocol_leave(&scope);
+    return result;
 }
 
 int kernel_socket_accept(struct kernel_socket *socket,
                          struct kernel_socket **owner)
 {
     struct socket_pending *entry;
-    uintptr_t old_status;
-    if (!socket->listening || owner == 0 || *owner != 0)
-        return -KERNEL_EINVAL;
-    service_inline();
-    old_status = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope old_status;
+    if (owner == 0 || *owner != 0) return -KERNEL_EINVAL;
+    kernel_socket_protocol_enter(&old_status);
+    service_inline(&old_status);
+    if (!socket->listening) { kernel_socket_protocol_leave(&old_status); return -KERNEL_EINVAL; }
     purge_dead_pending(socket);
     entry = socket->pending_head;
     if (entry == 0) {
-        kernel_socket_protocol_leave(old_status);
+        kernel_socket_protocol_leave(&old_status);
         return -KERNEL_EAGAIN;
     }
     socket->pending_head = entry->next;
@@ -997,7 +1016,7 @@ int kernel_socket_accept(struct kernel_socket *socket,
     socket->pending_live--; entry->child->pending_ready = 0; entry->child->listener = 0;
     tcp_backlog_accepted(entry->child->tcp);
     *owner = entry->child;
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&old_status);
     if (kernel_heap_release(socket->heap, entry) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
     return 0;
@@ -1005,8 +1024,11 @@ int kernel_socket_accept(struct kernel_socket *socket,
 
 int kernel_socket_accept_check(const struct kernel_socket *socket)
 {
-    if (socket->type != SOCKET_STREAM) return -KERNEL_EOPNOTSUPP;
-    return socket->listening ? 0 : -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    if (socket->type != SOCKET_STREAM) { kernel_socket_protocol_leave(&scope); return -KERNEL_EOPNOTSUPP; }
+    int result = socket->listening ? 0 : -KERNEL_EINVAL;
+    kernel_socket_protocol_leave(&scope);
+    return result;
 }
 
 /* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
@@ -1026,11 +1048,16 @@ static int socket_receive_empty(const struct kernel_socket *socket, int nonblock
 
 int kernel_socket_receive_ready(struct kernel_socket *socket)
 {
-    uintptr_t saved = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     int ready = socket->read_request == 0 &&
         (socket->listening || socket->packets_head != 0 || socket_receive_empty(socket, 0) != -KERNEL_EAGAIN);
-    kernel_socket_protocol_leave(saved);
+    kernel_socket_protocol_leave(&saved);
     return ready;
+}
+
+static uint32_t packet_available(const struct socket_packet *packet)
+{
+    return packet->payload ? packet->payload->tot_len - packet->consumed : packet->length - packet->consumed;
 }
 
 int kernel_socket_reserve_read(struct kernel_socket *socket,
@@ -1040,41 +1067,39 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
                               uint32_t capacity, int nonblocking)
 {
     struct socket_packet *packet;
-    uint32_t available;
-    uint32_t length;
-    uintptr_t old_status;
+    uint32_t length = 0;
+    struct kernel_socket_protocol_scope old_status;
     if (request == 0 || request->socket != 0 ||
         pin_owner == 0 || *pin_owner == 0 ||
         kernel_open_file_socket(*pin_owner) != socket)
         __builtin_trap();
-    if (socket->listening) return -KERNEL_ENOTCONN;
-    if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
-        service_inline();
-    }
-    old_status = kernel_socket_protocol_enter();
+    kernel_socket_protocol_enter(&old_status);
+    if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) service_inline(&old_status);
+    if (socket->listening) { kernel_socket_protocol_leave(&old_status); return -KERNEL_ENOTCONN; }
     if (socket->read_request != 0) {
-        kernel_socket_protocol_leave(old_status);
+        kernel_socket_protocol_leave(&old_status);
         return -KERNEL_EAGAIN;
     }
     packet = socket->packets_head;
     if (packet == 0) {
         int result = socket_receive_empty(socket, nonblocking);
         if (socket->pending_error) socket->pending_error = 0;
-        kernel_socket_protocol_leave(old_status);
+        kernel_socket_protocol_leave(&old_status);
         return result;
     }
     /* recv(0)检查连接/等待状态，但不取得或消费已有stream数据。 */
     if (capacity == 0U && socket->type == SOCKET_STREAM) {
-        kernel_socket_protocol_leave(old_status);
+        kernel_socket_protocol_leave(&old_status);
         return 0;
     }
-    available = packet->payload != 0 ? (uint32_t)(packet->payload->tot_len - packet->consumed)
-                                     : (packet->length - packet->consumed);
-    length = capacity < available ? capacity : available;
+    if (capacity > (uint32_t)__INT_MAX__) capacity = __INT_MAX__;
+    uint32_t available = socket->type == SOCKET_DGRAM ? packet_available(packet) : socket->rx_bytes;
+    length = available < capacity ? available : capacity;
     request->socket = socket;
     request->task = task;
     request->packet = packet;
     request->bytes = length;
+    request->completed_bytes = 0;
     request->datagram = socket->type == SOCKET_DGRAM;
     request->pin = *pin_owner;
     request->pin_owner = pin_owner;
@@ -1083,7 +1108,7 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
         kernel_task_socket_read_register(task, request) != KERNEL_TASK_STATUS_OK)
         __builtin_trap();
     socket->read_request = request;
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&old_status);
     return (int)length;
 }
 
@@ -1108,120 +1133,122 @@ void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
     if (request->socket == 0 || request->socket->read_request != request ||
         offset > request->bytes || length > request->bytes - offset)
         __builtin_trap();
-    if (length == 0) return;
-    if (packet->payload != 0) {
-        if (pbuf_copy_partial(packet->payload, buffer, (u16_t)length,
-                              packet->consumed + offset) != length)
-            __builtin_trap();
-    } else {
-        __builtin_memcpy(buffer, (const char *)packet->data + packet->consumed + offset, length);
+    unsigned char *destination = buffer;
+    while (length) {
+        if (!packet) __builtin_trap();
+        uint32_t available = packet_available(packet);
+        if (offset >= available) { offset -= available; packet = packet->next; continue; }
+        uint32_t take = available - offset < length ? available - offset : length;
+        if (packet->payload) {
+            if (pbuf_copy_partial(packet->payload, destination, (u16_t)take,
+                                  packet->consumed + offset) != take) __builtin_trap();
+        } else __builtin_memcpy(destination, packet->data + packet->consumed + offset, take);
+        destination += take; length -= take; offset = 0; packet = packet->next;
     }
 }
 
-int kernel_socket_read_user(const struct kernel_socket_read_request *request,
+int kernel_socket_read_user(struct kernel_socket_read_request *request,
     struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor)
 {
     const struct socket_packet *packet = request->packet;
     if (!request->socket || request->socket->read_request != request || !packet)
         __builtin_trap();
-    const struct pbuf *part = packet->payload;
-    uint32_t offset = packet->consumed, remaining = request->bytes;
-    /* reservation保活完整payload；只前移当前段，不反复扫描已消费的pbuf前缀。 */
+    uint32_t remaining = request->bytes;
+    struct kernel_uaccess_write_cursor pages = {0};
+    int result = 0;
+    request->completed_bytes = 0;
+    /* bytes固定本次借用的队列前缀；后来追加的packet不扩充本次用户复制。 */
     while (remaining) {
-        const void *source;
-        size_t length = remaining, copied = 0;
-        if (part) {
-            while (offset >= part->len) {
-                offset -= part->len;
-                part = part->next;
-                if (!part) __builtin_trap();
+        if (!packet) __builtin_trap();
+        uint32_t take = packet_available(packet);
+        if (take > remaining) take = remaining;
+        const struct pbuf *part = packet->payload;
+        uint32_t offset = packet->consumed, pending = take;
+        while (pending) {
+            const void *source;
+            size_t length = pending, copied = 0;
+            if (part) {
+                while (offset >= part->len) {
+                    offset -= part->len; part = part->next;
+                    if (!part) __builtin_trap();
+                }
+                if (length > (size_t)(part->len - offset)) length = part->len - offset;
+                source = (const unsigned char *)part->payload + offset;
+            } else {
+                if (packet->payload) __builtin_trap();
+                source = packet->data + offset;
             }
-            if (length > (size_t)(part->len - offset)) length = part->len - offset;
-            source = (const unsigned char *)part->payload + offset;
-        } else {
-            if (packet->payload) __builtin_trap();
-            source = (const unsigned char *)packet->data + offset;
+            enum kernel_uaccess_status status = kernel_copy_to_user_iov_cursor(mm, cursor, &pages, source, length, &copied);
+            if (status == KERNEL_UACCESS_STATUS_FAULT) { result = -KERNEL_EFAULT; goto out; }
+            if (status || copied != length) __builtin_trap();
+            pending -= (uint32_t)length; offset += (uint32_t)length;
         }
-        enum kernel_uaccess_status status = kernel_copy_to_user_iov(mm, cursor,
-            source, length, &copied);
-        if (status == KERNEL_UACCESS_STATUS_FAULT) return -KERNEL_EFAULT;
-        if (status || copied != length) __builtin_trap();
-        remaining -= (uint32_t)length;
-        offset += (uint32_t)length;
+        /* 故障packet即使写入用户前缀也不消费；此前完整成功的packet可提交短读。 */
+        request->completed_bytes += take;
+        remaining -= take; packet = packet->next;
     }
-    return 0;
+out:
+    kernel_uaccess_write_cursor_finish(&pages);
+    return result;
 }
 
-void kernel_socket_finish_read(struct kernel_socket_read_request *request,
-                               int user_fault)
+uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, int user_fault)
 {
-    uintptr_t old_status = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     struct kernel_socket *socket = request->socket;
-    struct socket_packet *packet;
-    uint32_t bytes = request->bytes;
-    uint32_t available;
-    if (socket == 0 || socket->read_request != request ||
-        socket->packets_head != request->packet) __builtin_trap();
-    packet = socket->packets_head;
-    available = packet->payload != 0 ? (uint32_t)(packet->payload->tot_len - packet->consumed)
-                                     : (packet->length - packet->consumed);
-    if (bytes > available ||
-        (socket->type == SOCKET_STREAM && bytes == 0U))
-        __builtin_trap();
-    /* TCP/STREAM advances only after the complete staged copy succeeds. A fault in
-     * this skb leaves its bytes queued, even when usercopy wrote a prefix.
-     * UDP drops the datagram on copy fault, matching udp_recvmsg. */
-    if (socket->type == SOCKET_STREAM && user_fault) {
-        socket->read_request = 0;
-        if (request->task != 0 &&
-            kernel_task_socket_read_clear(request->task, request) !=
-                KERNEL_TASK_STATUS_OK) __builtin_trap();
-        if (*request->pin_owner != 0 || request->pin == 0) __builtin_trap();
-        *request->pin_owner = request->pin;
-        request->pin = 0;
-        request->socket = 0;
-        wake_socket(socket);
-        kernel_socket_protocol_leave(old_status);
-        return;
+    if (!socket || socket->read_request != request || socket->packets_head != request->packet ||
+        request->completed_bytes > request->bytes || (!request->datagram && !request->bytes)) __builtin_trap();
+    uint32_t bytes = user_fault && !request->datagram ? request->completed_bytes : request->bytes;
+    uint32_t remaining = bytes, charge = bytes;
+    unsigned freed = 0;
+    if (request->datagram) {
+        charge = packet_available(socket->packets_head);
+        if (!charge) charge = 1;
     }
-    if (socket->type == SOCKET_DGRAM || bytes == available) {
-        socket->packets_head = packet->next;
-        if (socket->packets_head == 0) socket->packets_tail = 0;
-        if (packet->payload != 0) socket_pbuf_free(packet->payload);
-        unix_uncharge(packet);
-        if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
-        receive_capacity();
-    } else {
-        packet->consumed += bytes;
+    while (remaining || request->datagram) {
+        struct socket_packet *packet = socket->packets_head;
+        if (!packet) __builtin_trap();
+        uint32_t available = packet_available(packet);
+        uint32_t take = remaining < available ? remaining : available;
+        if (request->datagram || take == available) {
+            socket->packets_head = packet->next;
+            if (!socket->packets_head) socket->packets_tail = 0;
+            if (packet->payload) socket_pbuf_free(packet->payload);
+            unix_uncharge(packet);
+            if (kernel_heap_release(socket->heap, packet) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            freed = 1;
+        } else packet->consumed += take;
+        remaining -= take;
+        if (request->datagram) break;
     }
-    {
-        uint32_t charge = socket->type == SOCKET_DGRAM ? (available ? available : 1U) : bytes;
-        if (socket->rx_bytes < charge) __builtin_trap();
-        socket->rx_bytes -= charge;
-        if (socket->peer != 0) {
-            wake_socket(socket->peer);
+    if (socket->rx_bytes < charge) __builtin_trap();
+    socket->rx_bytes -= charge;
+    if (freed) receive_capacity();
+    if (charge && socket->peer) wake_socket(socket->peer);
+    if (!request->datagram && socket->tcp && bytes) {
+        uint32_t credit = bytes;
+        while (credit) {
+            u16_t part = credit > UINT16_MAX ? UINT16_MAX : (u16_t)credit;
+            tcp_recved(socket->tcp, part); credit -= part;
         }
-    }
-    if (socket->type == SOCKET_STREAM && socket->tcp != 0) {
-        tcp_recved(socket->tcp, (u16_t)bytes);
         socket_schedule(socket, SOCKET_WORK_RECEIVE | SOCKET_WORK_OUTPUT | SOCKET_WORK_REAP);
     }
     socket->read_request = 0;
-    if (request->task != 0 &&
-        kernel_task_socket_read_clear(request->task, request) !=
-            KERNEL_TASK_STATUS_OK) __builtin_trap();
-    if (*request->pin_owner != 0 || request->pin == 0) __builtin_trap();
+    if (request->task && kernel_task_socket_read_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
+        __builtin_trap();
+    if (*request->pin_owner || !request->pin) __builtin_trap();
     *request->pin_owner = request->pin;
     request->pin = 0;
     request->socket = 0;
     wake_socket(socket);
-    kernel_socket_protocol_leave(old_status);
+    uint32_t delivered = user_fault && request->datagram ? 0 : bytes;
+    kernel_socket_protocol_leave(&scope);
+    return delivered;
 }
 
 void kernel_socket_abort_read(struct kernel_socket_read_request *request)
 {
-    uintptr_t old_status = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope old_status; kernel_socket_protocol_enter(&old_status);
     struct kernel_socket *socket;
     struct kernel_open_file_description *pin;
     if (request == 0 || request->socket == 0) __builtin_trap();
@@ -1237,7 +1264,7 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
     request->pin = 0;
     request->socket = 0;
     wake_socket(socket);
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&old_status);
     if (kernel_open_file_release(&pin) != KERNEL_OPEN_FILE_STATUS_OK)
         __builtin_trap();
 }
@@ -1263,9 +1290,9 @@ static void clear_write_request(struct kernel_socket_write_request *request)
 {
     free_write_packet(request);
     kernel_socket_stream_cancel(request);
-    uintptr_t irq=kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     if (request->progressed & SOCKET_WRITE_DEFERRED) tcp_flush_output(request->socket);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
     if (request->task && kernel_task_socket_write_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
         __builtin_trap();
 }
@@ -1289,38 +1316,47 @@ static int unix_peer_failure(struct kernel_socket *socket)
 }
 int kernel_socket_unix_wait_error(struct kernel_socket *socket)
 {
-    uintptr_t irq=kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     int error=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX ? socket->pending_error : 0;
     if(error)socket->pending_error=0;
-    kernel_socket_protocol_leave(irq);return error;
+    kernel_socket_protocol_leave(&irq);return error;
 }
 static int unix_reserve_packet(struct kernel_socket_write_request *request,uint32_t count,uint32_t flags)
 {
-    uintptr_t saved=arch_interrupt_save();uint64_t deadline=0;
-    if(request->socket->send_timeout_ns) {
-        uint64_t now=kernel_time_monotonic_ns(),timeout=request->socket->send_timeout_ns;
+    uint64_t deadline=0;
+    uint64_t timeout=(flags & KERNEL_SOCKET_MSG_DONTWAIT)?0:kernel_socket_send_timeout(request->socket);
+    if(timeout) {
+        uint64_t now=kernel_time_monotonic_ns();
         if(kernel_time_deadline_from_monotonic(timeout>UINT64_MAX-now ? UINT64_MAX : now+timeout,&deadline)!=KERNEL_TIME_STATUS_OK)__builtin_trap();
     }
-    int result=0;
     for(;;) {
+        uintptr_t irq=arch_interrupt_save();
+        struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
         struct kernel_socket *sender=request->socket,*peer=sender->peer;
-        if(!peer || sender->write_closed || peer->read_closed) {result=unix_peer_failure(sender);break;}
-        if(sender->unix_memory+sender->tx_reserved<sender->tx_limit) {
+        int result=0, ready=0;
+        if(!peer || sender->write_closed || peer->read_closed) {result=unix_peer_failure(sender);ready=1;}
+        else if(sender->unix_memory+sender->tx_reserved<sender->tx_limit) {
             request->reserved=unix_charge(count);
             if(sender->tx_reserved>UINT32_MAX-request->reserved)__builtin_trap();
-            sender->tx_reserved+=request->reserved;break;
-        }
-        if(flags&KERNEL_SOCKET_MSG_DONTWAIT) {result=-KERNEL_EAGAIN;break;}
-        enum kernel_wait_wake_reason reason;
-        if(KERNEL_WAIT_RECHECK(&sender->wait,deadline,1,&reason,
-                (sender->unix_memory + sender->tx_reserved >= sender->tx_limit))!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
-        if(reason==KERNEL_WAIT_TIMEOUT) {result=-KERNEL_EAGAIN;break;}
+            sender->tx_reserved+=request->reserved;ready=1;
+        } else if(flags&KERNEL_SOCKET_MSG_DONTWAIT) {result=-KERNEL_EAGAIN;ready=1;}
+        if(ready) {kernel_socket_protocol_leave(&scope);arch_interrupt_restore(irq);return result;}
+        (void)arch_interrupt_save();
+        struct kernel_wait_token token={0};
+        enum kernel_wait_wake_reason reason=KERNEL_WAIT_WOKEN;
+        if(kernel_wait_prepare(&sender->wait,deadline,1,&token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        int sleep=sender->unix_memory+sender->tx_reserved>=sender->tx_limit &&
+            sender->peer && !sender->write_closed && !sender->peer->read_closed;
+        kernel_socket_protocol_leave(&scope);
+        if(sleep && kernel_wait_park(&token,&reason)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        if(kernel_wait_finish(&token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        arch_interrupt_restore(irq);
+        if(reason==KERNEL_WAIT_TIMEOUT)return -KERNEL_EAGAIN;
         if(reason==KERNEL_WAIT_SIGNALLED) {
-            if(deadline)result=-KERNEL_EINTR;
-            else {kernel_signal_note_syscall_restart(request->task);result=-KERNEL_ERESTARTSYS;}break;
+            if(deadline)return -KERNEL_EINTR;
+            kernel_signal_note_syscall_restart(request->task);return -KERNEL_ERESTARTSYS;
         }
     }
-    arch_interrupt_restore(saved);return result;
 }
 static int socket_write_packet_source(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
@@ -1330,27 +1366,27 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
 {
     if (user_fault) *user_fault=0;
     struct kernel_socket *socket = kernel_open_file_socket(*pin_owner);
+    struct kernel_socket_protocol_scope preflight; kernel_socket_protocol_enter(&preflight);
     if (socket->type == SOCKET_STREAM) {
         if (socket->domain != KERNEL_SOCKET_DOMAIN_UNIX) __builtin_trap();
-        uintptr_t saved=kernel_socket_protocol_enter();
         int failure=(!socket->peer || socket->write_closed || socket->peer->read_closed)
             ?unix_peer_failure(socket):0;
-        kernel_socket_protocol_leave(saved);
-        if (failure) return failure;
-        if (!count) return 0;
+        if (failure) { kernel_socket_protocol_leave(&preflight); return failure; }
+        if (!count) { kernel_socket_protocol_leave(&preflight); return 0; }
         uint32_t limit=socket->tx_limit/2U-64U;
         if (limit>32768U) limit=32768U;
         if (count>limit) count=limit;
     } else {
         /* sendfile 的 UDP actor 在协议长度检查前解析缺失的 connected peer。 */
         if (kernel_buffer && socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination &&
-            !socket->connected && count <= UINT16_MAX) return -KERNEL_EDESTADDRREQ;
+            !socket->connected && count <= UINT16_MAX) { kernel_socket_protocol_leave(&preflight); return -KERNEL_EDESTADDRREQ; }
         if (count > (socket->domain == KERNEL_SOCKET_DOMAIN_INET ? UDP_MAX_PAYLOAD : socket->tx_limit-32U) ||
-            count > socket->tx_limit) return -KERNEL_EMSGSIZE;
-        if (socket->write_closed) return -KERNEL_EPIPE;
+            count > socket->tx_limit) { kernel_socket_protocol_leave(&preflight); return -KERNEL_EMSGSIZE; }
+        if (socket->write_closed) { kernel_socket_protocol_leave(&preflight); return -KERNEL_EPIPE; }
         if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)
-            return -KERNEL_EDESTADDRREQ;
+            { kernel_socket_protocol_leave(&preflight); return -KERNEL_EDESTADDRREQ; }
     }
+    kernel_socket_protocol_leave(&preflight);
     struct kernel_socket_write_request request = {
         .socket = kernel_open_file_socket(*pin_owner), .task = kernel_task_current(),
         .pin = *pin_owner, .pin_owner = pin_owner,
@@ -1370,12 +1406,12 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
     void *data = 0;
     ip_addr_t remote;
     if (request.socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
+        struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
         int imported = destination ? address_import(request.socket, destination, &remote, 0) : 0;
-        if (imported) { result = imported; goto out; }
-        uintptr_t saved = kernel_socket_protocol_enter();
+        if (imported) { kernel_socket_protocol_leave(&saved); result = imported; goto out; }
         struct pbuf *payload = pbuf_alloc(PBUF_TRANSPORT, (u16_t)count, PBUF_RAM);
         request.protocol_payload = payload;
-        kernel_socket_protocol_leave(saved);
+        kernel_socket_protocol_leave(&saved);
         if (!payload) goto out;
         data = payload->payload;
     } else {
@@ -1405,18 +1441,18 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
         } else if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
     }
     if (request.socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
-        uintptr_t saved = kernel_socket_protocol_enter();
+        struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
         struct pbuf *payload = request.protocol_payload;
         err_t error = destination ? udp_sendto(request.socket->udp, payload, &remote, destination->port)
                                  : udp_send(request.socket->udp, payload);
         socket_pbuf_free(payload);
         request.protocol_payload = 0;
-        kernel_socket_protocol_leave(saved);
-        if (error == ERR_OK) service_inline();
+        if (error == ERR_OK) service_inline(&saved);
+        kernel_socket_protocol_leave(&saved);
         result = error == ERR_OK ? (int)count : lwip_error(error);
         goto out;
     }
-    uintptr_t saved=arch_interrupt_save();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     struct kernel_socket *peer=request.socket->peer;
     if(!peer || request.socket->write_closed || peer->read_closed) {
         result=unix_peer_failure(request.socket);
@@ -1431,7 +1467,7 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
         if(peer->rx_bytes>UINT32_MAX-payload)__builtin_trap();
         peer->rx_bytes+=payload;request.packet=0;wake_socket(peer);result=(int)count;
     }
-    arch_interrupt_restore(saved);
+    kernel_socket_protocol_leave(&saved);
 out:
     clear_write_request(&request);
     *pin_owner = request.pin;
@@ -1471,13 +1507,15 @@ int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t f
 static struct kernel_socket_statistics socket_statistics;
 void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     *statistics = socket_statistics;
+    kernel_socket_protocol_leave(&scope);
 }
 
 #if BOAROS_COST_DIAGNOSTICS
 void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALUES])
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     const uint64_t snapshot[KERNEL_SOCKET_PROTOCOL_VALUES] = {
         socket_statistics.tcp_write_calls, socket_statistics.tcp_written_bytes,
         lwip_stats.tcp.xmit,lwip_stats.tcp.recv,lwip_stats.tcp.memerr,
@@ -1494,7 +1532,7 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
         (lwip_stats.memp[MEMP_TCP_PCB_LISTEN] ? lwip_stats.memp[MEMP_TCP_PCB_LISTEN]->max : 0)
     };
     __builtin_memcpy(values,snapshot,sizeof(snapshot));
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 #endif
 
@@ -1549,7 +1587,7 @@ void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
 int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     uint32_t size, uint32_t flags)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     if (!request->pin || request->reserved) __builtin_trap();
     int error = tcp_write_state(request->socket, flags, !request->progressed);
     uint32_t available = error ? 0 : tcp_admission_capacity(request->socket);
@@ -1562,40 +1600,46 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
         }
         else { request->reserved = size; request->socket->tx_reserved += size; }
     }
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
     return error ? error : (int)size;
 }
 static void stream_release_reservation(struct kernel_socket_write_request *request, int notify)
 {
     if (!request->reserved) return;
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     if (request->socket->tx_reserved < request->reserved) __builtin_trap();
     request->socket->tx_reserved -= request->reserved; request->reserved = 0;
     if (notify) wake_socket(request->socket);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
 { stream_release_reservation(request, 1); }
 void kernel_socket_stream_finish(struct kernel_socket_write_request *request)
 {
-    kernel_socket_stream_cancel(request);
     int deferred=(request->progressed & SOCKET_WRITE_DEFERRED)!=0;
-    uintptr_t irq=kernel_socket_protocol_enter();
-    if (deferred) tcp_flush_output(request->socket);
-    kernel_socket_protocol_leave(irq);
+    if (request->reserved || deferred) {
+        struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+        stream_release_reservation(request, 1);
+        if (deferred) {
+            tcp_flush_output(request->socket);
+            service_inline(&scope);
+        }
+        kernel_socket_protocol_leave(&scope);
+    }
     if (request->task && kernel_task_socket_write_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
         __builtin_trap();
     if (*request->pin_owner || !request->pin) __builtin_trap();
     *request->pin_owner = request->pin;
-    request->pin = 0; request->socket = 0;
-    if (deferred) service_inline();
+    request->pin = 0;
+    request->socket = 0;
 }
+
 int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
     const void *buffer, uint32_t size, uint32_t flags)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     if (!size || size > request->reserved) __builtin_trap();
-    /* 仅在同一个raw临界区内解除本请求预算并提交；其他writer仍看到剩余reservation。 */
+    /* 仅在同一个协议owner范围内解除本请求预算并提交；其他writer仍看到剩余reservation。 */
     stream_release_reservation(request, 0);
     /* 已交付前缀优先：保留后来错误供下一次调用观察，也不为短成功发送SIGPIPE。 */
     int result = tcp_write_state(request->socket, flags, !request->progressed);
@@ -1610,37 +1654,37 @@ int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
     }
     if (result == -KERNEL_EAGAIN) COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
     if (tcp_admission_capacity(request->socket)) wake_socket(request->socket);
-    kernel_socket_protocol_leave(irq);
-    if (result > 0 && !(request->progressed & SOCKET_WRITE_DEFERRED)) service_inline();
+    if (result > 0 && !(request->progressed & SOCKET_WRITE_DEFERRED)) service_inline(&irq);
+    kernel_socket_protocol_leave(&irq);
     return result;
 }
 
 int kernel_socket_write_buffer(struct kernel_socket *socket,
                                const void *buffer, uint32_t size, uint32_t flags)
 {
-    uintptr_t old_status;
+    struct kernel_socket_protocol_scope old_status;
 
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
-        old_status = kernel_socket_protocol_enter();
+        kernel_socket_protocol_enter(&old_status);
         if (socket->peer == 0 || socket->write_closed || socket->peer->read_closed) {
             int failure=unix_peer_failure(socket);
             struct kernel_task *curr = kernel_task_current();
-            kernel_socket_protocol_leave(old_status);
+            kernel_socket_protocol_leave(&old_status);
             if (curr != 0 && failure==-KERNEL_EPIPE && socket->type==SOCKET_STREAM && !(flags & KERNEL_SOCKET_MSG_NOSIGNAL)) {
                 (void)kernel_signal_send_task(curr, 13U, 0);
             }
             return failure;
         }
         if (size == 0U && socket->type == SOCKET_STREAM) {
-            kernel_socket_protocol_leave(old_status);
+            kernel_socket_protocol_leave(&old_status);
             return 0;
         }
         if (socket->type == SOCKET_DGRAM && size > socket->tx_limit-32U) {
-            kernel_socket_protocol_leave(old_status); return -KERNEL_EMSGSIZE;
+            kernel_socket_protocol_leave(&old_status); return -KERNEL_EMSGSIZE;
         }
         struct kernel_socket *peer = socket->peer;
         if(socket->unix_memory+socket->tx_reserved>=socket->tx_limit) {
-            kernel_socket_protocol_leave(old_status);return -KERNEL_EAGAIN;
+            kernel_socket_protocol_leave(&old_status);return -KERNEL_EAGAIN;
         }
         uint32_t to_write=size;
         if(socket->type==SOCKET_STREAM) {
@@ -1653,7 +1697,7 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
         heap_status=kernel_heap_allocate_zeroed(peer->heap,1U,sizeof(*packet)+to_write,(void **)&packet);
         if(heap_status!=KERNEL_HEAP_STATUS_OK) {
             if(heap_status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
-            kernel_socket_protocol_leave(old_status);return -KERNEL_ENOMEM;
+            kernel_socket_protocol_leave(&old_status);return -KERNEL_ENOMEM;
         }
         if(to_write)__builtin_memcpy(packet->data,buffer,to_write);
         packet->length = to_write;
@@ -1669,15 +1713,15 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
         peer->rx_bytes += to_write ? to_write : 1U;
 
         wake_socket(peer);
-        kernel_socket_protocol_leave(old_status);
+        kernel_socket_protocol_leave(&old_status);
         return (int)to_write;
     }
 
-    old_status = kernel_socket_protocol_enter();
+    kernel_socket_protocol_enter(&old_status);
     int state=socket->type==SOCKET_DGRAM?-KERNEL_EDESTADDRREQ:tcp_write_state(socket,flags,1);
     int result=state || !size?state:tcp_write_buffer_locked(socket,buffer,size,flags);
-    kernel_socket_protocol_leave(old_status);
-    if (result>0) service_inline();
+    if (result>0) service_inline(&old_status);
+    kernel_socket_protocol_leave(&old_status);
     return result;
 }
 
@@ -1716,7 +1760,7 @@ static int tcp_write_buffer_locked(struct kernel_socket *socket,
 int kernel_socket_shutdown(struct kernel_socket *socket, int how)
 {
     if (how < 0 || how > 2) return -KERNEL_EINVAL;
-    uintptr_t saved = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     int result = 0;
     if (how != 1) socket->read_closed = 1;
     if (how != 0 && !socket->write_closed) {
@@ -1734,15 +1778,15 @@ int kernel_socket_shutdown(struct kernel_socket *socket, int how)
     wake_socket(socket);
     if (socket->peer != 0) wake_socket(socket->peer);
     socket_schedule(socket, SOCKET_WORK_REAP | SOCKET_WORK_OUTPUT);
-    kernel_socket_protocol_leave(saved);
-    service_inline();
+    service_inline(&saved);
+    kernel_socket_protocol_leave(&saved);
     return result;
 }
 
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value)
 {
-    uintptr_t saved = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     int result = 0;
     struct ip_pcb *pcb = socket->udp != 0 ? (struct ip_pcb *)socket->udp : (struct ip_pcb *)socket->tcp;
     switch (option) {
@@ -1793,14 +1837,14 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         break;
     default: result = -KERNEL_ENOPROTOOPT;
     }
-    kernel_socket_protocol_leave(saved);
+    kernel_socket_protocol_leave(&saved);
     return result;
 }
 
 int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value)
 {
-    uintptr_t saved = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     int result = 0;
     switch (option) {
     case KERNEL_SOCKET_REUSEADDR: *value = socket->reuseaddr; break;
@@ -1824,34 +1868,44 @@ int kernel_socket_get_option(struct kernel_socket *socket,
         break;
     default: result = -KERNEL_ENOPROTOOPT;
     }
-    kernel_socket_protocol_leave(saved);
+    kernel_socket_protocol_leave(&saved);
     return result;
 }
 void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     socket->send_timeout_ns = nanoseconds;
+    kernel_socket_protocol_leave(&scope);
 }
 uint64_t kernel_socket_send_timeout(const struct kernel_socket *socket)
 {
-    return socket->send_timeout_ns;
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    uint64_t timeout = socket->send_timeout_ns;
+    kernel_socket_protocol_leave(&scope);
+    return timeout;
 }
 
 void kernel_socket_set_receive_timeout(struct kernel_socket *socket,
                                        uint64_t nanoseconds)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     socket->receive_timeout_ns = nanoseconds;
+    kernel_socket_protocol_leave(&scope);
 }
 
 uint64_t kernel_socket_receive_timeout(const struct kernel_socket *socket)
 {
-    return socket->receive_timeout_ns;
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    uint64_t timeout = socket->receive_timeout_ns;
+    kernel_socket_protocol_leave(&scope);
+    return timeout;
 }
 
 uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue)
 {
     uint32_t events = 0;
-    uintptr_t snapshot_irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope snapshot_irq; kernel_socket_protocol_enter(&snapshot_irq);
     COST_ADD(NETWORK_POLL_CALLS, 1);
 #if BOAROS_COST_DIAGNOSTICS
     polling_snapshot++;
@@ -1859,7 +1913,7 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
     if (queue != 0) *queue = &socket->wait;
 
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
-        uintptr_t saved = kernel_socket_protocol_enter();
+        struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
         if(socket->pending_error)events|=KERNEL_POLLERR;
         if (socket->type == SOCKET_DGRAM) {
             if ((socket->packets_head != 0 || socket->read_closed) && socket->read_request == 0)
@@ -1888,11 +1942,11 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
                 events |= KERNEL_POLLOUT | KERNEL_POLLWRNORM | KERNEL_POLLERR;
             }
         }
-        kernel_socket_protocol_leave(saved);
+        kernel_socket_protocol_leave(&saved);
 #if BOAROS_COST_DIAGNOSTICS
         polling_snapshot--;
 #endif
-        kernel_socket_protocol_leave(snapshot_irq);
+        kernel_socket_protocol_leave(&snapshot_irq);
         return events;
     }
 
@@ -1909,10 +1963,10 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
         if ((socket->packets_head != 0 || socket->peer_closed || socket->read_closed) &&
             socket->read_request == 0)
             events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
-        uintptr_t saved = kernel_socket_protocol_enter();
+        struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
         if (tcp_admission_capacity(socket))
             events |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;
-        kernel_socket_protocol_leave(saved);
+        kernel_socket_protocol_leave(&saved);
     } else if (socket->peer_closed) {
         events |= KERNEL_POLLHUP | KERNEL_POLLOUT | KERNEL_POLLRDHUP | KERNEL_POLLIN;
     } else if (socket_receive_empty(socket, 0) == -KERNEL_ENOTCONN) {
@@ -1922,7 +1976,7 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
 #if BOAROS_COST_DIAGNOSTICS
     polling_snapshot--;
 #endif
-    kernel_socket_protocol_leave(snapshot_irq);
+    kernel_socket_protocol_leave(&snapshot_irq);
     return events;
 }
 
@@ -1948,32 +2002,34 @@ static struct netif *loopback_netif(void)
 
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     struct netif *loopback;
-    if (flags == 0 || !is_loopback_name(name)) return -KERNEL_ENODEV;
+    if (flags == 0 || !is_loopback_name(name)) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENODEV; }
     loopback = loopback_netif();
-    if (loopback == 0) return -KERNEL_ENODEV;
+    if (loopback == 0) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENODEV; }
     *flags = UINT16_C(0x8); /* IFF_LOOPBACK */
     if (netif_is_up(loopback)) *flags |= UINT16_C(0x1);
     if (netif_is_link_up(loopback)) *flags |= UINT16_C(0x40);
+    kernel_socket_protocol_leave(&scope);
     return 0;
 }
 
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     struct netif *loopback;
-    uintptr_t old_status;
-    if (!is_loopback_name(name)) return -KERNEL_ENODEV;
+    if (!is_loopback_name(name)) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENODEV; }
     loopback = loopback_netif();
-    if (loopback == 0) return -KERNEL_ENODEV;
-    old_status = kernel_socket_protocol_enter();
+    if (loopback == 0) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENODEV; }
     if ((flags & UINT16_C(0x1)) != 0U) netif_set_up(loopback);
     else netif_set_down(loopback);
-    kernel_socket_protocol_leave(old_status);
+    kernel_socket_protocol_leave(&scope);
     return 0;
 }
 
 void kernel_socket_network_initialize(void)
 {
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     if (!socket_initialized) {
         const struct boaros_lwip_hooks hooks = {
             .input = protocol_input, .work = protocol_work_ready, .capacity = protocol_capacity,
@@ -1982,21 +2038,24 @@ void kernel_socket_network_initialize(void)
         boaros_lwip_set_hooks(&hooks);
         lwip_init(); socket_initialized = 1;
     }
+    kernel_socket_protocol_leave(&scope);
 }
 void kernel_socket_network_hooks(void (*timer_wake)(void *), void (*work_wake)(void *),
     int (*udp_capacity)(void *), void *context)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
+    uintptr_t interrupts = arch_interrupt_save();
     network_timer_wake = timer_wake; network_work_wake = work_wake;
     network_udp_capacity = udp_capacity; network_context = context;
-    kernel_socket_protocol_leave(irq);
+    arch_interrupt_restore(interrupts);
+    kernel_socket_protocol_leave(&irq);
 }
 void kernel_socket_network_capacity(void)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     nic_generation++;
     if (nic_wait.head && network_work_wake) network_work_wake(network_context);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 void kernel_socket_network_blocked(void) { nic_blocked = 1; }
 static int capacity_ready(const struct socket_work_queue *queue, uint64_t generation)
@@ -2004,13 +2063,12 @@ static int capacity_ready(const struct socket_work_queue *queue, uint64_t genera
 
 int kernel_socket_work_pending(void)
 {
+    if (protocol_owner != kernel_io_context_current() || !protocol_depth) __builtin_trap();
     if (!socket_initialized) return 0;
-    uintptr_t irq = kernel_socket_protocol_enter();
     int runnable = ready_work.head || loopback_pending ||
         capacity_ready(&pool_wait, pool_generation) || capacity_ready(&nic_wait, nic_generation) ||
         capacity_ready(&receive_wait, receive_generation) || sys_timeouts_sleeptime() == 0 ||
         (write_retry_head && (int32_t)(sys_now() - write_retry_head->write_retry_ms) >= 0);
-    kernel_socket_protocol_leave(irq);
     return runnable;
 }
 
@@ -2062,14 +2120,15 @@ static int service_retry_deadline(void)
     return 1;
 }
 
-struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
+struct kernel_socket_service_result kernel_socket_service_owned(const struct kernel_socket_protocol_scope *scope,
+    struct kernel_socket_service_budget budget)
 {
     struct kernel_socket_service_result result = {0};
 #if BOAROS_COST_DIAGNOSTICS
     if (polling_snapshot) COST_ADD(NETWORK_POLL_SERVICES, 1);
 #endif
-    if (!socket_initialized || protocol_depth) return result;
-    uintptr_t irq = kernel_socket_protocol_enter();
+    if (!scope->outer || protocol_owner != kernel_io_context_current() || protocol_depth != 1) __builtin_trap();
+    if (!socket_initialized) return result;
     COST_ADD(NETWORK_SERVICE_CALLS, 1);
     loopback_pending = 0;
     for (struct netif *netif = netif_list; netif; netif = netif->next) {
@@ -2098,13 +2157,21 @@ struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_
     COST_ADD(NETWORK_SOCKET_VISITS, result.sockets);
     COST_ADD(NETWORK_LOOP_PACKETS, result.packets);
     COST_ADD(NETWORK_TIMER_CALLBACKS, result.timers);
-    kernel_socket_protocol_leave(irq);
+    return result;
+}
+
+struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
+{
+    if (protocol_owner == kernel_io_context_current()) return (struct kernel_socket_service_result){0};
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    struct kernel_socket_service_result result = kernel_socket_service_owned(&scope, budget);
+    kernel_socket_protocol_leave(&scope);
     return result;
 }
 
 void kernel_socket_network_failed(uint32_t address)
 {
-    uintptr_t saved = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     socket_device_failed = 1;
     COST_ADD(NETWORK_GLOBAL_SCANS, 1);
     for (struct kernel_socket *s = inet_sockets; s; s = s->inet_next) {
@@ -2122,7 +2189,7 @@ void kernel_socket_network_failed(uint32_t address)
         wake_socket(s);
     }
     socket_device_failed = 0;
-    kernel_socket_protocol_leave(saved);
+    kernel_socket_protocol_leave(&saved);
 }
 static void interface_snapshot(struct netif *n, struct kernel_socket_interface *s)
 {
@@ -2140,45 +2207,45 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
 }
 int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *s)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     for (struct netif *n = netif_list; n; n = n->next) if (netif_get_index(n) == index) {
-        interface_snapshot(n, s); kernel_socket_protocol_leave(irq); return 0;
+        interface_snapshot(n, s); kernel_socket_protocol_leave(&irq); return 0;
     }
-    kernel_socket_protocol_leave(irq); return -KERNEL_ENODEV;
+    kernel_socket_protocol_leave(&irq); return -KERNEL_ENODEV;
 }
 int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *s)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     for (struct netif *n = netif_list; n; n = n->next) {
         int loop = n->name[0] == 'l' && n->name[1] == 'o';
         if (!__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) {
-            interface_snapshot(n, s); kernel_socket_protocol_leave(irq); return 0;
+            interface_snapshot(n, s); kernel_socket_protocol_leave(&irq); return 0;
         }
     }
-    kernel_socket_protocol_leave(irq); return -KERNEL_ENODEV;
+    kernel_socket_protocol_leave(&irq); return -KERNEL_ENODEV;
 }
 int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface *s)
 {
-    uintptr_t irq = kernel_socket_protocol_enter(); unsigned previous = 0;
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq); unsigned previous = 0;
     for (uint32_t i = 0; i <= ordinal; i++) {
         struct netif *selected = 0;
         for (struct netif *n = netif_list; n; n = n->next)
             if (netif_get_index(n) > previous && (!selected || netif_get_index(n) < netif_get_index(selected))) selected = n;
-        if (!selected) { kernel_socket_protocol_leave(irq); return -KERNEL_ENODEV; }
+        if (!selected) { kernel_socket_protocol_leave(&irq); return -KERNEL_ENODEV; }
         previous = netif_get_index(selected);
-        if (i == ordinal) { interface_snapshot(selected, s); kernel_socket_protocol_leave(irq); return 0; }
+        if (i == ordinal) { interface_snapshot(selected, s); kernel_socket_protocol_leave(&irq); return 0; }
     }
     __builtin_trap();
 }
 int kernel_socket_interface_set_flags(const char name[16], uint16_t flags)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     for (struct netif *n = netif_list; n; n = n->next) {
         int loop = n->name[0] == 'l' && n->name[1] == 'o';
         if (!__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) {
             if (flags & 1) netif_set_up(n); else netif_set_down(n);
-            kernel_socket_protocol_leave(irq); return 0;
+            kernel_socket_protocol_leave(&irq); return 0;
         }
     }
-    kernel_socket_protocol_leave(irq); return -KERNEL_ENODEV;
+    kernel_socket_protocol_leave(&irq); return -KERNEL_ENODEV;
 }

@@ -28,6 +28,19 @@ IRQ owner，允许显式重试。运行期间同样保留owner，60秒后先重�
 
 `struct riscv_root_boot` 持有实例，其基线在 RNG 分配前采样。根结束和失败清理先 stop/join，再检查页及堆基线。joinable RNG 不发布用户 completion；根 cleanup 只识别 USER PID 1，不会把 RNG worker 当成剩余用户任务。没有 RNG 时用户仍可启动，普通 nonblocking getrandom 保持 `EAGAIN`。
 
+## 用户请求
+
+`getrandom` 在随机核心自己的短保护范围内生成数据，用户复制时允许 IRQ 与正常
+调度。最多 256 字节使用栈缓冲区；更大的请求复用任务已有的页工作区，按目标用户页
+边界生成和复制，避免每 256 字节重新 pin 同一用户页。工作区取得失败返回 ENOMEM。
+已经返回数据的长请求在后续页边界响应信号；复制错误按成功前缀返回。
+中间批次覆盖同一工作区，最后一次实际使用结束后统一擦除使用范围，再归还借用；
+任务最终释放仍负责归还缓存页。入口和退出恢复调用者原有 IRQ 状态。
+显式擦除复用普通 RAM 的宽字 `memset`，随后以指针输入和编译器 memory clobber
+阻止死存储删除，与固定 Linux 的 `memzero_explicit` 一致，不再另写逐字节擦除循环。
+RV 的 ChaCha block 函数代码按 2 KiB 对齐，当前函数小于这一范围，输出循环不会因其他函数尺寸变化而让一条压缩指令旁的 32 位 store 横跨代码页；这避免 QEMU 拆分热点翻译块，不改变算法或输出缓冲区的对齐要求。
+吞吐与定时响应对照见[数据路径实验](../learning/data-path-budget-experiments.md#大-getrandom)。
+
 ## 固定依据与验证
 
 - Linux `references/linux/drivers/char/hw_random/virtio-rng.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：请求缓冲、合法短响应和 reset 后回收。

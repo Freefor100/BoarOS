@@ -63,8 +63,10 @@ struct arch_mmu_mapping {
     uint64_t physical_address;
     uint32_t permissions;
 };
-enum arch_mmu_status arch_mmu_user_detach_page(
-    struct arch_mmu_user_space *, uint64_t, struct kernel_mm_retirement *);
+enum arch_mmu_status arch_mmu_user_detach_range(
+    struct arch_mmu_user_space *, uint64_t start, uint64_t end,
+    struct kernel_mm_detach_cursor *, struct kernel_mm_retirement *,
+    void (*before_detach)(void *, uint64_t, uint64_t), void *);
 void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
     int instructions);
 void arch_mmu_flush_all(void);
@@ -138,6 +140,7 @@ enum arch_mmu_status arch_mmu_user_unmap_owned_range(
  * Missing leaves are unchanged; present leaves retain content.
  */
 /* Same ownership/PROT_NONE contract, with a single page walk and local VA flush. */
+/* Pure PTE update; caller publishes TLB/instruction changes outside raw. */
 enum arch_mmu_status arch_mmu_user_protect_owned_page(
     struct arch_mmu_user_space *space, uint64_t address, uint32_t permissions);
 

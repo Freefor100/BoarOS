@@ -330,18 +330,23 @@ static enum kernel_vma_status split_at(struct kernel_vma_set *set,
 
 static void merge_all(struct kernel_vma_set *set)
 {
-    uint32_t index = 1U;
-
-    while (index < set->count) {
-        COST_ADD(VMA_MERGE, 1);
-        if (can_merge(&set->entries[index - 1U],
-                      &set->entries[index])) {
-            set->entries[index - 1U].end = set->entries[index].end;
-            erase_entry(set, index);
+    if (!set->count) return;
+    uint32_t output=0;
+    for (uint32_t index=1;index<set->count;index++) {
+        COST_ADD(VMA_MERGE,1);
+        if (can_merge(&set->entries[output],&set->entries[index])) {
+            set->entries[output].end=set->entries[index].end;
+            if (set->entries[index].shm_attachment)
+                kernel_shm_attachment_close(set->entries[index].shm_attachment);
         } else {
-            index++;
+            output++;
+            if (output!=index) {
+                set->entries[output]=set->entries[index];
+                COST_ADD(VMA_MOVED,1);
+            }
         }
     }
+    set->count=output+1;
 }
 
 enum kernel_vma_status kernel_vma_set_create(

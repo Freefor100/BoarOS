@@ -23,7 +23,9 @@
 
 struct kernel_elf_layout {
     uint64_t main_bias;
+    uint64_t main_start;
     uint64_t interpreter_bias;
+    uint64_t interpreter_start;
     uint64_t interpreter_end;
     uint64_t main_entry;
     uint64_t interpreter_entry;
@@ -695,13 +697,13 @@ static int choose_vdso(const struct kernel_elf_layout *layout,
         return 0;
     }
 
-    if (range_conflict(layout->main_bias,
+    if (range_conflict(layout->main_start,
                        layout->main_end,
                        lower,
                        upper)) {
-        starts[blocked_count] = layout->main_bias < lower
+        starts[blocked_count] = layout->main_start < lower
                                     ? lower
-                                    : layout->main_bias;
+                                    : layout->main_start;
         ends[blocked_count] = layout->main_end > upper
                                   ? upper
                                   : layout->main_end;
@@ -710,13 +712,13 @@ static int choose_vdso(const struct kernel_elf_layout *layout,
         }
     }
     if (layout->has_interpreter &&
-        range_conflict(layout->interpreter_bias,
+        range_conflict(layout->interpreter_start,
                        layout->interpreter_end,
                        lower,
                        upper)) {
-        starts[blocked_count] = layout->interpreter_bias < lower
+        starts[blocked_count] = layout->interpreter_start < lower
                                     ? lower
-                                    : layout->interpreter_bias;
+                                    : layout->interpreter_start;
         ends[blocked_count] = layout->interpreter_end > upper
                                   ? upper
                                   : layout->interpreter_end;
@@ -801,7 +803,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
 
     if (request == 0 || request->executable_source == 0 || heap == 0 ||
         allocator == 0 || kernel_table == 0 || image == 0 ||
-        image->mm.state != KERNEL_MM_EMPTY || image->arch_private != 0 ||
+        image->mm.state != KERNEL_MM_EMPTY ||
         kernel_table->allocator != allocator ||
         kernel_table->state != ARCH_MMU_STATE_ACTIVE) {
         return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
@@ -907,12 +909,15 @@ enum kernel_elf_image_status kernel_elf_image_build(
                                 &base.main_bias)) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
-    if (!source_highest_end(request->executable_source,
+    if (base.main_bias > UINT64_MAX - main_minimum ||
+        !source_highest_end(request->executable_source,
                             base.main_bias,
                             &base.main_end) ||
         base.main_end >= base.stack_guard) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
+    /* bias用于重定位；冲突和洞选择使用实际加载区间。ET_EXEC的bias可同时为0。 */
+    base.main_start = base.main_bias + main_minimum;
     base.has_interpreter = request->interpreter_source != 0;
     if (base.has_interpreter) {
         if (interpreter_header->type == KERNEL_ELF64_TYPE_EXECUTABLE) {
@@ -923,13 +928,17 @@ enum kernel_elf_image_status kernel_elf_image_build(
                                             &base.interpreter_bias)) {
             return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
         }
-        if (!source_highest_end(request->interpreter_source,
+        if (base.interpreter_bias > UINT64_MAX - interpreter_minimum ||
+            !source_highest_end(request->interpreter_source,
                                 base.interpreter_bias,
                                 &base.interpreter_end) ||
-            base.interpreter_end >= base.stack_guard ||
-            range_conflict(base.main_bias,
+            base.interpreter_end >= base.stack_guard) {
+            return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
+        }
+        base.interpreter_start = base.interpreter_bias + interpreter_minimum;
+        if (range_conflict(base.main_start,
                            base.main_end,
-                           base.interpreter_bias,
+                           base.interpreter_start,
                            base.interpreter_end)) {
             return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
         }
@@ -959,9 +968,9 @@ enum kernel_elf_image_status kernel_elf_image_build(
     }
     base.brk_limit = base.mmap_base;
     if (base.has_interpreter &&
-        base.interpreter_bias + interpreter_minimum > base.main_end &&
-        base.interpreter_bias + interpreter_minimum < base.brk_limit)
-        base.brk_limit = base.interpreter_bias + interpreter_minimum;
+        base.interpreter_start > base.main_end &&
+        base.interpreter_start < base.brk_limit)
+        base.brk_limit = base.interpreter_start;
     if (base.main_end >= base.brk_limit)
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     if (!random_pages(18U, &random_value)) {

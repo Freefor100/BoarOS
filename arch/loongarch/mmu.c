@@ -333,42 +333,89 @@ enum arch_mmu_status arch_mmu_user_lookup(const struct arch_mmu_user_space *s,ui
 }
 static int table_empty(uint64_t *p)
 { for (unsigned i=0;i<ENTRIES;i++) if (p[i]) return 0; return 1; }
-enum arch_mmu_status arch_mmu_user_detach_page(struct arch_mmu_user_space *s,
-    uint64_t address, struct kernel_mm_retirement *batch)
+enum arch_mmu_status arch_mmu_user_detach_range(
+    struct arch_mmu_user_space *s, uint64_t start, uint64_t end,
+    struct kernel_mm_detach_cursor *cursor, struct kernel_mm_retirement *batch,
+    void (*before_detach)(void *,uint64_t,uint64_t), void *owner)
 {
-    if (!live(s) || !batch || batch->count > KERNEL_MM_RETIRE_CAPACITY - 3 ||
-        (address & BOAROS_PAGE_MASK) || address < BOAROS_PAGE_SIZE ||
-        address >= ARCH_MMU_USER_LIMIT) return ARCH_MMU_STATUS_INVALID;
-    uint64_t *root = table(s, s->root_address);
-    unsigned r = (address >> 36) & (ENTRIES - 1), m = (address >> 25) & (ENTRIES - 1);
-    if (!root[r]) return ARCH_MMU_STATUS_NOT_MAPPED;
-    uint64_t *middle = table(s, root[r]);
-    if (!middle[m]) return ARCH_MMU_STATUS_NOT_MAPPED;
-    uint64_t *leaves = table(s, middle[m]);
-    unsigned l = (address >> 14) & (ENTRIES - 1);
-    uint64_t old = leaves[l];
-    if (!old) return ARCH_MMU_STATUS_NOT_MAPPED;
-    if (!(old & PTE_PRESENT) || !s->leaf_pages || s->table_pages < 3 ||
-        ((old & PTE_NONE) && !s->protected_pages) ||
-        ((old & PTE_COW) && !s->cow_pages)) return ARCH_MMU_STATUS_STATE;
-    (void)table(s, old & PTE_ADDRESS);
-    __atomic_store_n(&leaves[l], 0, __ATOMIC_RELEASE);
-    kernel_mm_retirement_add(batch, old & PTE_ADDRESS, 0);
-    s->leaf_pages--;
-    if (old & PTE_NONE) s->protected_pages--;
-    if (old & PTE_COW) s->cow_pages--;
-    if (table_empty(leaves)) {
-        kernel_mm_retirement_add(batch, middle[m], 1);
-        __atomic_store_n(&middle[m], 0, __ATOMIC_RELEASE);
-        s->table_pages--;
-        if (table_empty(middle)) {
-            kernel_mm_retirement_add(batch, root[r], 1);
-            __atomic_store_n(&root[r], 0, __ATOMIC_RELEASE);
-            s->table_pages--;
+    if (!s || s->state != ARCH_MMU_USER_SPACE_LIVE || !cursor || !batch || start>end ||
+        end>ARCH_MMU_USER_LIMIT || ((start|end)&BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
+    const uint64_t leaf_span=UINT64_C(1)<<25, middle_span=UINT64_C(1)<<36;
+    if (cursor->phase==3 || start==end) return ARCH_MMU_STATUS_NOT_MAPPED;
+    if (!cursor->phase) { cursor->address=start & ~(leaf_span-1); cursor->phase=1; }
+    unsigned visits=0;
+    while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
+        uint64_t *root;
+        root=table(s,s->root_address);
+        if (cursor->phase==2) {
+            unsigned r=cursor->middle_address>>36;
+            if (!root[r]) return ARCH_MMU_STATUS_STATE;
+
+            uint64_t *middle;
+            middle=table(s,root[r]);
+            /* 摘叶表后只在本middle段结束时检查一次；扫描同样受16项预算约束。 */
+            visits++;
+            if (middle[cursor->scan++]) { cursor->phase=1; cursor->scan=0; continue; }
+            if (cursor->scan==ENTRIES) {
+                kernel_mm_retirement_add(batch,root[r],1);
+                __atomic_store_n(&root[r],0,__ATOMIC_RELEASE);
+                s->table_pages--; cursor->phase=1; cursor->scan=0;
+            }
+            continue;
+        }
+        if (cursor->address>=end && !(cursor->address & (leaf_span-1))) { cursor->phase=3; return ARCH_MMU_STATUS_NOT_MAPPED; }
+        uint64_t address=cursor->address;
+        unsigned r=address>>36, m=(address>>25)&(ENTRIES-1);
+        unsigned l=(address>>BOAROS_PAGE_SHIFT)&(ENTRIES-1);
+        if (!root[r]) {
+            cursor->address=(address & ~(middle_span-1))+middle_span;
+            visits++; continue;
+        }
+
+        uint64_t *middle;
+        middle=table(s,root[r]);
+        if (!middle[m]) {
+            cursor->address=(address & ~(leaf_span-1))+leaf_span;
+            visits++;
+        } else {
+
+            uint64_t *leaves;
+            leaves=table(s,middle[m]);
+            uint64_t old=leaves[l];
+            visits++;
+            if (old && address>=start && address<end) {
+                if (!(old&PTE_PRESENT) || !s->leaf_pages || s->table_pages<3 ||
+                    ((old&PTE_NONE) && !s->protected_pages) || ((old&PTE_COW) && !s->cow_pages)) return ARCH_MMU_STATUS_STATE;
+                uint64_t physical=old & PTE_ADDRESS;
+                void *owned;
+                if (physical_page_map_owned(s->allocator,physical,&owned)!=PHYSICAL_PAGE_STATUS_OK)
+                    return ARCH_MMU_STATUS_STATE;
+                /* resident必须在身份仍属于这个PTE时解绑；释放仍由MM在raw外完成。 */
+                if (before_detach) before_detach(owner,address,physical);
+                __atomic_store_n(&leaves[l],0,__ATOMIC_RELEASE);
+                kernel_mm_retirement_add(batch,physical,0);
+                s->leaf_pages--;
+                if (old&PTE_NONE) s->protected_pages--;
+                if (old&PTE_COW) s->cow_pages--;
+            } else if (old) cursor->occupied=1;
+            cursor->address+=BOAROS_PAGE_SIZE;
+            /* 末尾范围外的叶也只检查一次，不能提前结束而误回收部分使用的表。 */
+            if (l+1<ENTRIES) continue;
+            if (!cursor->occupied) {
+                kernel_mm_retirement_add(batch,middle[m],1);
+                __atomic_store_n(&middle[m],0,__ATOMIC_RELEASE);
+                s->table_pages--;
+            }
+            cursor->occupied=0;
+        }
+        if ((cursor->address>>36)!=r || cursor->address>=end) {
+            cursor->middle_address=(uint64_t)r<<36;
+            cursor->phase=2; cursor->scan=0;
         }
     }
     return ARCH_MMU_STATUS_OK;
 }
+
 static void unmap_tree(struct arch_mmu_user_space *s,uint64_t root,unsigned level,uint64_t base,uint64_t start,uint64_t end)
 {
     uint64_t *p=table(s,root), span=UINT64_C(1)<<(14+level*11);
@@ -409,11 +456,9 @@ enum arch_mmu_status arch_mmu_user_protect_owned_page(struct arch_mmu_user_space
     if (status!=ARCH_MMU_STATUS_OK) return status;
     if (!*slot) return ARCH_MMU_STATUS_OK;
     uint64_t old=*slot;
-    *slot=encode(old&PTE_ADDRESS,perms,(old&PTE_COW)!=0);
+    __atomic_store_n(slot,encode(old&PTE_ADDRESS,perms,(old&PTE_COW)!=0),__ATOMIC_RELEASE);
     if (old&PTE_NONE) s->protected_pages--;
     if (!perms) s->protected_pages++;
-    arch_mmu_flush_address(v); s->protect_address_flushes++;
-    if (perms&ARCH_MMU_EXECUTE) arch_mmu_sync_instructions();
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_protect_owned_range(struct arch_mmu_user_space *s,uint64_t start,uint64_t end,uint32_t perms)
@@ -422,6 +467,11 @@ enum arch_mmu_status arch_mmu_user_protect_owned_range(struct arch_mmu_user_spac
     for (uint64_t v=start;v<end;v+=BOAROS_PAGE_SIZE) {
         enum arch_mmu_status status=arch_mmu_user_protect_owned_page(s,v,perms);
         if (status!=ARCH_MMU_STATUS_OK) return status;
+    }
+    if (start<end) {
+        if (end-start==BOAROS_PAGE_SIZE) { arch_mmu_flush_address(start); s->protect_address_flushes++; }
+        else { flush_all(); s->protect_global_flushes++; }
+        if (perms&ARCH_MMU_EXECUTE) arch_mmu_sync_instructions();
     }
     return ARCH_MMU_STATUS_OK;
 }

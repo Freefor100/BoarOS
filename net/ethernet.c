@@ -51,9 +51,9 @@ static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
 static void release_owner(void *owner)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     pbuf_free((struct pbuf *)owner);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 static err_t link_output(struct netif *interface, struct pbuf *p)
 {
@@ -115,7 +115,9 @@ static struct kernel_wait_queue *progress(struct kernel_network *n)
 static void work_wake(void *context)
 {
     struct kernel_network *network = context;
+    uintptr_t irq = arch_interrupt_save();
     (void)kernel_wait_queue_wake_all(progress(network));
+    arch_interrupt_restore(irq);
 }
 static void release_completed(struct kernel_network *network)
 {
@@ -129,37 +131,60 @@ static void release_completed(struct kernel_network *network)
 static void timer_wake(void *context)
 {
     struct kernel_network *n = context;
+    uintptr_t irq = arch_interrupt_save();
     if (n->deadline && (int64_t)(arch_time_read() - n->deadline) >= 0)
         (void)kernel_wait_queue_wake_all(progress(n));
+    arch_interrupt_restore(irq);
+}
+/* 本批服务的outer owner直接覆盖等待登记，避免向FIFO交接后立刻再次排队。 */
+static void wait_progress(struct kernel_network *n, struct kernel_socket_protocol_scope *scope,
+    struct kernel_socket_service_result service, uint64_t generation)
+{
+    (void)arch_interrupt_save();
+    struct virtio_net_device *d = n->device;
+    int runnable = kernel_socket_work_pending() ||
+        (d && (generation != d->tx_capacity_generation || d->tx_done_count || (!d->failed && d->ready_count)));
+    if (n->stopping || runnable) {
+        kernel_socket_protocol_leave(scope);
+        if (!n->stopping && kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        return;
+    }
+    n->deadline = service.next_deadline;
+    uint64_t timeout = arch_time_read() + 5 * n->frequency;
+    if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
+    struct kernel_wait_token token = {0};
+    enum kernel_wait_wake_reason reason;
+    if (kernel_wait_prepare(progress(n), n->deadline, 0, &token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    int sleep = !n->stopping && !kernel_socket_work_pending() &&
+        (!d || (generation == d->tx_capacity_generation && !d->tx_done_count && (d->failed || !d->ready_count)));
+    /* 保持IRQ关闭直到park/finish，避免唤醒登记间隙。 */
+    kernel_socket_protocol_leave(scope);
+    if (sleep && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+}
+static int stopping(struct kernel_network *n)
+{
+    uintptr_t irq = arch_interrupt_save();
+    int result = n->stopping;
+    arch_interrupt_restore(irq);
+    return result;
 }
 /* 无 NIC 的 timer-only owner：IRQ 只唤醒它，协议定时器在 worker 上下文推进。 */
 static void timer_worker(void *context)
 {
     struct kernel_network *n = context;
-    for (;;) {
+    while (!stopping(n)) {
         uintptr_t irq = arch_interrupt_save();
-        if (n->stopping) { arch_interrupt_restore(irq); return; }
-        struct kernel_socket_service_result service = kernel_socket_service_pending(
+        struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+        struct kernel_socket_service_result service = kernel_socket_service_owned(&scope,
             (struct kernel_socket_service_budget){8, 8, 1});
-        if (service.runnable || kernel_socket_work_pending()) {
-            arch_interrupt_restore(irq);
-            irq = arch_interrupt_save();
-            if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            arch_interrupt_restore(irq); continue;
-        }
-        n->deadline = service.next_deadline;
-        uint64_t timeout = arch_time_read() + 5 * n->frequency;
-        if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
-        COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
-        enum kernel_wait_wake_reason reason;
-        if (KERNEL_WAIT_RECHECK(progress(n), n->deadline, 0, &reason,
-                (!n->stopping && !kernel_socket_work_pending())) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        wait_progress(n, &scope, service, 0);
         arch_interrupt_restore(irq);
     }
 }
 static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     const unsigned char *data = frame->data;
     int udp = frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17;
     int address_ok = frame->size >= 14 &&
@@ -184,22 +209,22 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
     }
     /* 成功input消耗或接纳pbuf；失败才由当前接收请求释放。 */
     if (n->interface.input(p, &n->interface) != ERR_OK) pbuf_free(p);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
     return;
 dropped:
     n->device->statistics.drops++;
     virtio_net_release(n->device, frame->buffer);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
 }
 static void device_failed(struct kernel_network *n)
 {
-    uintptr_t irq = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     if (!n->failure_delivered) {
         n->failure_delivered = 1;
         kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
     }
     netif_set_link_down(&n->interface);
-    kernel_socket_protocol_leave(irq);
+    kernel_socket_protocol_leave(&irq);
     /* 失败不等于DMA停止：设备仍可能读取已投递的TX描述符与payload，
      * 在途owner保留到stop()复位确认，与RX借用同一策略；已完成owner
      * 仍由worker的release(0)归还。 */
@@ -208,48 +233,31 @@ static void worker(void *context)
 {
     struct kernel_network *n = context;
     struct virtio_net_device *d = n->device;
-    for (;;) {
-        uintptr_t irq = arch_interrupt_save();
-        if (n->stopping) { arch_interrupt_restore(irq); return; }
+    while (!stopping(n)) {
         unsigned handled = 0;
         int failed = virtio_net_service(d);
-        /* RX和协议回调都可能发送；先归还完成owner及其槽位。 */
         release_completed(n);
+        uintptr_t irq = arch_interrupt_save();
         uint64_t capacity_generation = d->tx_capacity_generation;
+        struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
         if (failed) {
             device_failed(n);
         } else {
-            uintptr_t core = kernel_socket_protocol_enter();
             if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
-            kernel_socket_protocol_leave(core);
             struct virtio_net_frame frame;
             while (!d->failed && handled < 8 && virtio_net_receive(d, &frame)) {
                 input_frame(n, &frame); handled++;
             }
         }
-        /* 失败NIC不再收发，但共享的loopback与协议期限仍须独立进展。 */
-        struct kernel_socket_service_result service = kernel_socket_service_pending(
+        struct kernel_socket_service_result service = kernel_socket_service_owned(&scope,
             (struct kernel_socket_service_budget){8, 8, 1});
         if (virtio_net_service(d)) device_failed(n);
-        release_completed(n);
-        /* 最后一次收割也会归还复制路径的容量，不能只检查SG done链。 */
-        if (service.runnable || kernel_socket_work_pending() || capacity_generation != d->tx_capacity_generation || (!d->failed && d->ready_count)) {
-            /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
-            arch_interrupt_restore(irq);
-            irq = arch_interrupt_save();
-            if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            arch_interrupt_restore(irq); continue;
-        }
-        n->deadline = service.next_deadline;
-        uint64_t timeout = arch_time_read() + 5 * d->frequency;
-        if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
-        COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
-        enum kernel_wait_wake_reason reason;
-        if (KERNEL_WAIT_RECHECK(&d->progress, n->deadline, 0, &reason,
-                (!n->stopping && !kernel_socket_work_pending() && capacity_generation == d->tx_capacity_generation && (d->failed || !d->ready_count))) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        /* 新TX_DONE由下轮开头在owner外归还；当前条件保证不会睡过完成。 */
+        wait_progress(n, &scope, service, capacity_generation);
         arch_interrupt_restore(irq);
     }
 }
+
 int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap,
     struct virtio_net_device *device, uint64_t frequency)
 {
@@ -261,22 +269,22 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
     if (allocation != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     n->heap = heap; n->device = device; n->frequency = frequency; *owner = n;
     kernel_wait_queue_init(&n->progress);
-    uintptr_t saved = kernel_socket_protocol_enter();
+    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
     kernel_socket_network_initialize();
     if (device) {
         ip4_addr_t address = {lwip_htonl(BOAROS_NET_IPV4)}, mask = {lwip_htonl(BOAROS_NET_NETMASK)}, gateway = {0};
         if (!netif_add(&n->interface, &address, &mask, &gateway, n, interface_init, ethernet_input)) {
-            kernel_socket_protocol_leave(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
+            kernel_socket_protocol_leave(&saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
         }
         n->attached = 1;
         netif_set_up(&n->interface); if (device->link_up) netif_set_link_up(&n->interface);
         netif_set_default(&n->interface);
     }
     if (kernel_thread_create_joinable(device ? worker : timer_worker, n, &n->worker) != KERNEL_SCHEDULER_STATUS_OK) {
-        kernel_socket_protocol_leave(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
+        kernel_socket_protocol_leave(&saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
     }
     kernel_socket_network_hooks(timer_wake, work_wake, device ? udp_capacity : 0, n);
-    kernel_socket_protocol_leave(saved);
+    kernel_socket_protocol_leave(&saved);
     if (device) {
         print_text("BoarOS: eth0 ready transport="); print_text(device->version == 1 ? "legacy" : "modern");
         print_text(" irq="); print_u64(device->irq_source); print_text(" MTU=1500 RX/TX=32 DMA-bytes=");
@@ -293,14 +301,16 @@ int kernel_network_stop(struct kernel_network **owner)
     n->stopping = 1;
     if (n->device) n->device->stopping = 1;
     (void)kernel_wait_queue_wake_all(progress(n));
+    kernel_assert_can_block();
+    arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
     if (n->worker.task) kernel_thread_join(&n->worker);
     if (n->device && virtio_net_quiesce(n->device)) { arch_interrupt_restore(irq); return -KERNEL_EIO; }
     if (n->attached) {
-        uintptr_t core = kernel_socket_protocol_enter();
+        struct kernel_socket_protocol_scope core; kernel_socket_protocol_enter(&core);
         ip4_reass_cleanup_netif(&n->interface);
         etharp_cleanup_netif(&n->interface);
         netif_set_down(&n->interface); netif_remove(&n->interface); n->attached = 0;
-        kernel_socket_protocol_leave(core);
+        kernel_socket_protocol_leave(&core);
     }
     /* reset已确认DMA停止；worker已join，归还剩余TX owner。 */
     if (n->device) {

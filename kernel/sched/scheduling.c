@@ -31,6 +31,7 @@ static int user_reserved_out_locked(struct kernel_cpu *cpu, struct kernel_task *
            task->scheduling.priority<=(int)node->priority;
 }
 
+#if BOAROS_COST_DIAGNOSTICS
 static void finish_service_sample_locked(struct kernel_task *task)
 {
     if (!task->service_started_ticks) return;
@@ -42,6 +43,7 @@ static void finish_service_sample_locked(struct kernel_task *task)
     task->service_started_ticks=0;
     task->service_running_ns=0;
 }
+#endif
 #endif
 
 #if BOAROS_MAX_CPUS > 1
@@ -148,32 +150,38 @@ static void enter_user_service(void)
     struct kernel_task *task = kernel_cpu_current()->current;
     if (!task || !task->arch.user_mode || !task->wait.on_cpu) __builtin_trap();
     if (!kernel_cpu_current()->logical_id && task->user_service && task->cpu_mask) {
+#if BOAROS_COST_DIAGNOSTICS
         if (!task->service_started_ticks) {
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             scheduler_account_runtime_locked();
             task->service_started_ticks=arch_time_read();
         }
+#endif
         arch_interrupt_restore(irq);
         return;
     }
+#if BOAROS_COST_DIAGNOSTICS
     uint64_t start=arch_time_read();
     unsigned remote=kernel_cpu_current()->logical_id;
+#endif
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler_account_runtime_locked();
         if (!task->cpu_mask) task->cpu_mask=online_user_mask_locked();
         scheduler_user_service_set_locked(task, 1);
+#if BOAROS_COST_DIAGNOSTICS
         task->service_started_ticks=arch_time_read();
-        task->service_entries++;
-        if (kernel_cpu_current()->logical_id) task->service_migrations++;
+#endif
     }
     if (kernel_cpu_current()->logical_id &&
         scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     if (kernel_cpu_current()->logical_id || kernel_cpu_current()->current != task) __builtin_trap();
+#if BOAROS_COST_DIAGNOSTICS
     if (remote) {
         kernel_cpu_current()->service_migrations++;
         kernel_cpu_current()->service_queue_ticks += arch_time_read()-start;
     }
+#endif
     arch_interrupt_restore(irq);
 }
 
@@ -196,7 +204,9 @@ void kernel_scheduler_leave_user_service(void)
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler_account_runtime_locked();
+#if BOAROS_COST_DIAGNOSTICS
         finish_service_sample_locked(task);
+#endif
         scheduler_user_service_set_locked(task, 0);
     }
     /* 服务队列与用户资格是不同调度类；恢复时必须重查逻辑资格，
@@ -255,7 +265,7 @@ static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
 #endif
     if (now < cpu->rt_bandwidth.last_account_ns) __builtin_trap();
     uint64_t delta = now - cpu->rt_bandwidth.last_account_ns;
-#if BOAROS_USER_SMP
+#if BOAROS_USER_SMP && BOAROS_COST_DIAGNOSTICS
     if (cpu->current && cpu->current->arch.user_mode && cpu->current->user_service &&
         cpu->current->service_started_ticks) cpu->current->service_running_ns += delta;
 #endif
@@ -377,7 +387,9 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
 #if BOAROS_USER_SMP
     if (previous->state==KERNEL_THREAD_STATE_EXITED) {
         scheduler_user_reservation_release_locked(previous);
+#if BOAROS_COST_DIAGNOSTICS
         finish_service_sample_locked(previous);
+#endif
     }
 #endif
     if (!next || next->wait.on_cpu || (next->idle && next->cpu != cpu)) __builtin_trap();
@@ -408,13 +420,8 @@ struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
     return claim_next_locked(cpu, previous, ready_allowed ? ready_best_locked() : 0);
 }
 
-void scheduler_rearm_timer(void)
+uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
 {
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    uint64_t deadline;
-    {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
         is_rt(cpu->current),
 #if BOAROS_MAX_CPUS > 1
@@ -428,7 +435,7 @@ void scheduler_rearm_timer(void)
         if (!slice) slice = 1;
         if (!delay || slice < delay) delay = slice;
     }
-    deadline = 0;
+    uint64_t deadline = 0;
     if (delay && kernel_time_is_initialized()) {
         uint64_t now = cpu->rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
@@ -442,21 +449,36 @@ void scheduler_rearm_timer(void)
         cpu->logical_id ? 0 :
 #endif
         deadline_index_first();
-    if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
-        deadline = blocked->wakeup_deadline;
-    cpu->armed_deadline = deadline;
-    }
+    if (blocked != 0 && (!deadline || blocked->wait.deadline < deadline))
+        deadline = blocked->wait.deadline;
+    return deadline;
+}
+
+void scheduler_arm_timer(uint64_t deadline)
+{
     enum arch_timer_status status = arch_timer_set_scheduler_deadline(deadline);
-    if (status != ARCH_TIMER_STATUS_OK && status != ARCH_TIMER_STATUS_NOT_STARTED)
-        __builtin_trap();
+    if (status != ARCH_TIMER_STATUS_OK && status != ARCH_TIMER_STATUS_NOT_STARTED) __builtin_trap();
+}
+
+void scheduler_rearm_timer(void)
+{
+    uintptr_t irq = arch_interrupt_save();
+    uint64_t deadline;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        deadline = scheduler_deadline_locked(kernel_cpu_current());
+    }
+    scheduler_arm_timer(deadline);
     arch_interrupt_restore(irq);
 }
+
 void kernel_scheduler_deadline_changed(void) { scheduler_rearm_timer(); }
 
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues)
 {
     /* 调用者保持IRQ关闭；CPU借用在切换前结束，不跨睡眠或恢复点。 */
     struct kernel_cpu *cpu = kernel_cpu_current();
+    uint64_t deadline;
     if (cpu->preempt_depth) {
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -465,11 +487,12 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
                 if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
             }
             scheduler_account_runtime_locked();
+            deadline = scheduler_deadline_locked(cpu);
         }
         if (voluntary) __builtin_trap();
         kernel_cpu_request_schedule(cpu);
         cpu->rotate_other |= rotate_other != 0;
-        scheduler_rearm_timer();
+        scheduler_arm_timer(deadline);
         return KERNEL_SCHEDULER_STATUS_OK;
     }
     struct kernel_task *current = cpu->current;
@@ -522,8 +545,9 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 #endif
     if (expired) kernel_sched_policy_rotate(&current->scheduling);
     if (!disallowed && !service_preempt && !throttled && !higher && !(rotate && same_priority)) {
+        deadline = scheduler_deadline_locked(cpu);
         kernel_raw_lock_release(&guard);
-        scheduler_rearm_timer();
+        scheduler_arm_timer(deadline);
         return KERNEL_SCHEDULER_STATUS_OK;
     }
     if (current != cpu->idle) {
@@ -536,8 +560,10 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
             !(disallowed && current->scheduling.policy==KERNEL_SCHED_OTHER);
     } else cpu->idle_context_saved = 1U;
     selected = claim_next_locked(cpu, current, next);
+    deadline = scheduler_deadline_locked(cpu);
     }
     if (!selected) __builtin_trap();
+    scheduler_arm_timer(deadline);
     return scheduler_switch_claimed(current, selected);
 }
 

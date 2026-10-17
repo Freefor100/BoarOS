@@ -10,6 +10,7 @@ struct wait_siginfo {
 struct wait_action { unsigned long handler, flags, mask; };
 static volatile int handled_signal;
 static void signal_fault_cases(void);
+static void signal_child_cases(void);
 
 static void wait_handler(int signal)
 {
@@ -89,7 +90,99 @@ void abi_signal_wait_cases(void)
     abi_require(SC4(260, child, &status, 0, 0) == child && status == 0);
     abi_require(SC4(134, 12, 0, 0, 8) == 0);
     abi_require(SC4(135, 2, &old_mask, 0, 8) == 0);
+    signal_child_cases();
     signal_fault_cases();
+}
+
+static volatile int child_handler_seen, child_handler_pid, child_handler_code, child_handler_status;
+static void child_info_handler(int signal, struct wait_siginfo *info, void *context)
+{
+    (void)context;
+    if (signal != 17) abi_exit(93);
+    child_handler_pid=info->pid;child_handler_code=info->code;
+    child_handler_status=*(int *)info->extra;child_handler_seen++;
+}
+static void record_child(const char *name, long result, const struct wait_siginfo *info, long child)
+{
+    abi_record(name,result,result==17?*(const int *)info->extra:-1,
+        result==17?info->code:-1,result==17 && info->pid==child,
+        result==17?&info->uid:0,result==17?sizeof(info->uid):0);
+}
+static long child_wait_info(const unsigned long *mask, struct wait_siginfo *info, int immediate)
+{
+    const struct wait_timespec timeout={immediate?0:2,0};
+    return SC4(137,mask,info,&timeout,8);
+}
+static long child_held(int pipefd[2])
+{
+    abi_require(SC2(59,pipefd,0)==0);
+    long child=CALL(220,17,0,0,0,0,0);abi_require(child>=0);
+    if(!child) {
+        char byte;abi_require(SC1(57,pipefd[1])==0);
+        long n;do { n=SC3(63,pipefd[0],&byte,1); } while(n==-4);
+        abi_require(n==1);abi_exit(37);
+    }
+    abi_require(SC1(57,pipefd[0])==0);return child;
+}
+static void child_release(int pipefd[2])
+{ char byte=1;abi_require(SC3(64,pipefd[1],&byte,1)==1 && SC1(57,pipefd[1])==0); }
+static void signal_child_cases(void)
+{
+    const unsigned long mask=1UL<<16;
+    unsigned long oldmask;
+    struct wait_action saved, action={0};struct wait_siginfo info;
+    abi_require(SC4(135,0,&mask,&oldmask,8)==0);
+    abi_require(SC4(134,17,&action,&saved,8)==0);
+    while(child_wait_info(&mask,&info,1)==17) { }
+    int pipefd[2],status=0;long child=child_held(pipefd);
+    abi_require(SC2(129,child,19)==0 && SC4(260,child,&status,2,0)==child);
+    long result=child_wait_info(&mask,&info,0);record_child("signal.child-stop",result,&info,child);
+    abi_require(SC2(129,child,18)==0 && SC4(260,child,&status,8,0)==child);
+    result=child_wait_info(&mask,&info,0);record_child("signal.child-continue",result,&info,child);
+    child_release(pipefd);
+    result=child_wait_info(&mask,&info,0);record_child("signal.child-exit",result,&info,child);
+    abi_require(SC4(260,child,&status,0,0)==child && status==(37<<8));
+    child=child_held(pipefd);abi_require(SC2(129,child,9)==0);
+    result=child_wait_info(&mask,&info,0);record_child("signal.child-killed",result,&info,child);
+    abi_require(SC1(57,pipefd[1])==0 && SC4(260,child,&status,0,0)==child && status==9);
+
+    /* Two committed exits leave one standard signal, with the first payload. */
+    long first=CALL(220,17,0,0,0,0,0);abi_require(first>=0);if(!first)abi_exit(31);
+    abi_require(SC4(260,first,&status,0,0)==first);
+    long second=CALL(220,17,0,0,0,0,0);abi_require(second>=0);if(!second)abi_exit(32);
+    abi_require(SC4(260,second,&status,0,0)==second);
+    result=child_wait_info(&mask,&info,0);record_child("signal.child-coalesced",result,&info,first);
+    abi_record("signal.child-coalesced-empty",child_wait_info(&mask,&info,1),-1,-1,0,0,0);
+
+    action.flags=1;abi_require(SC4(134,17,&action,0,8)==0);
+    child=child_held(pipefd);
+    abi_require(SC2(129,child,19)==0 && SC4(260,child,&status,2,0)==child);
+    abi_record("signal.child-nocldstop",child_wait_info(&mask,&info,1),-1,-1,0,0,0);
+    abi_require(SC2(129,child,18)==0 && SC4(260,child,&status,8,0)==child);
+    abi_record("signal.child-nocldcontinue",child_wait_info(&mask,&info,1),-1,-1,0,0,0);
+    child_release(pipefd);result=child_wait_info(&mask,&info,0);
+    record_child("signal.child-nocldstop-exit",result,&info,child);
+    abi_require(SC4(260,child,&status,0,0)==child);
+    action.flags=2;abi_require(SC4(134,17,&action,0,8)==0);
+    child=child_held(pipefd);child_release(pipefd);result=child_wait_info(&mask,&info,0);
+    record_child("signal.child-nocldwait",result,&info,child);
+    abi_record("signal.child-nocldwait-reap",SC4(260,child,&status,0,0),-1,-1,0,0,0);
+    action=(struct wait_action){1,0,0};abi_require(SC4(134,17,&action,0,8)==0);
+    child=child_held(pipefd);child_release(pipefd);
+    abi_record("signal.child-ignored-reap",SC4(260,child,&status,0,0),-1,-1,0,0,0);
+    abi_record("signal.child-ignored-pending",child_wait_info(&mask,&info,1),-1,-1,0,0,0);
+
+    action=(struct wait_action){(unsigned long)child_info_handler,4,0};
+    abi_require(SC4(134,17,&action,0,8)==0 && SC4(135,1,&mask,0,8)==0);
+    child_handler_seen=0;child=child_held(pipefd);child_release(pipefd);
+    do { result=SC4(260,child,&status,0,0); } while(result==-4);
+    abi_require(result==child);
+    /* A syscall return delivers the pending handler before user code resumes. */
+    abi_record("signal.child-handler",child_handler_seen,child_handler_status,
+        child_handler_code,child_handler_pid==child,0,0);
+    abi_require(SC4(135,0,&mask,0,8)==0 && SC4(134,17,&saved,0,8)==0);
+    while(child_wait_info(&mask,&info,1)==17) { }
+    abi_require(SC4(135,2,&oldmask,0,8)==0);
 }
 
 static volatile unsigned long fault_expected_address;
