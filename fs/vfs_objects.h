@@ -118,7 +118,8 @@ struct kernel_vfs_backend {
      * NULL denotes a memory-only backend without persistent metadata. */
     void (*sync_prepare)(struct kernel_vfs_node *node, int data_only,
                          struct kernel_vfs_sync_request *request);
-    /* NULL denotes a memory-only backend without persistent writeback. */
+    /* Publishes metadata failures on their affected inode before returning.
+     * NULL denotes a memory-only backend without persistent writeback. */
     int (*sync_filesystem)(struct kernel_vfs_instance *instance,
                            struct kernel_vfs_node *root);
     int (*flush)(struct kernel_vfs_instance *instance);

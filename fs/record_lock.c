@@ -23,6 +23,7 @@ struct kernel_record_lock {
 #ifdef BOAROS_RECORD_LOCK_MEASURE
 static size_t record_lock_conflict_visits;
 static size_t record_lock_remove_visits;
+static size_t record_lock_edit_visits;
 #endif
 
 static int height(const struct kernel_record_lock *lock)
@@ -128,6 +129,35 @@ static struct kernel_record_lock *tree_remove(struct kernel_record_lock *root,
     next->left = root->left;
     next->right = right;
     return balance(next);
+}
+
+/* A range removal can shrink either subtree by more than one level. */
+static struct kernel_record_lock *join_root(struct kernel_record_lock *left,
+                                             struct kernel_record_lock *root,
+                                             struct kernel_record_lock *right)
+{
+    if (height(left) > height(right) + 1) {
+        left->right = join_root(left->right, root, right);
+        return balance(left);
+    }
+    if (height(right) > height(left) + 1) {
+        right->left = join_root(left, root, right->left);
+        return balance(right);
+    }
+    root->left = left;
+    root->right = right;
+    update(root);
+    return root;
+}
+
+static struct kernel_record_lock *join_trees(struct kernel_record_lock *left,
+                                              struct kernel_record_lock *right)
+{
+    if (!left) return right;
+    if (!right) return left;
+    struct kernel_record_lock *root;
+    right = extract_min(right, &root);
+    return join_root(left, root, right);
 }
 
 static void owner_insert(struct kernel_record_lock **head,
@@ -239,6 +269,59 @@ static int adjacent(const struct kernel_record_lock *lock,
            (end != INT64_MAX && end + 1 == lock->start);
 }
 
+/* Owner intervals are disjoint and equal types already coalesce. A left
+ * extension cannot expose another predecessor; right extensions are still
+ * ahead of an in-order walk. A containing different type cannot merge. */
+static void prepare_edit(struct kernel_record_lock *root,
+                         const void *owner, uint8_t kind, int16_t type,
+                         int64_t *start, int64_t *end, size_t *needed)
+{
+    if (!root) return;
+#ifdef BOAROS_RECORD_LOCK_MEASURE
+    record_lock_edit_visits++;
+#endif
+    int64_t first = *start;
+    if (type != 2 && first != INT64_MIN) first--;
+    if (root->max_end < first) return;
+    prepare_edit(root->left, owner, kind, type, start, end, needed);
+    int64_t last = *end;
+    if (type != 2 && last != INT64_MAX) last++;
+    if (root->start > last) return;
+    if (root->owner == owner && root->kind == kind) {
+        if (type != 2 && root->type == type &&
+            (touching(root, *start, *end) || adjacent(root, *start, *end))) {
+            if (root->start < *start) *start = root->start;
+            if (root->end > *end) *end = root->end;
+        } else if (root->start < *start && root->end > *end) {
+            ++*needed;
+        }
+    }
+    prepare_edit(root->right, owner, kind, type, start, end, needed);
+}
+
+static struct kernel_record_lock *extract_owned(
+    struct kernel_record_lock *root, const void *owner, uint8_t kind,
+    int64_t start, int64_t end, struct kernel_record_lock **removed)
+{
+    if (!root) return 0;
+#ifdef BOAROS_RECORD_LOCK_MEASURE
+    record_lock_edit_visits++;
+#endif
+    if (root->max_end < start) return root;
+    struct kernel_record_lock *left = extract_owned(root->left, owner, kind,
+                                                      start, end, removed);
+    if (root->start > end) return join_root(left, root, root->right);
+    struct kernel_record_lock *right = extract_owned(root->right, owner, kind,
+                                                       start, end, removed);
+    if (root->owner != owner || root->kind != kind || root->end < start)
+        return join_root(left, root, right);
+    /* Keep owner membership intact until replacement. Detached tree links are
+     * available for the edit list without adding another index or allocation. */
+    root->left = *removed;
+    *removed = root;
+    return join_trees(left, right);
+}
+
 int kernel_record_lock_set(struct kernel_record_lock_state *state,
                            struct kernel_record_lock **owner_head,
                            const void *owner, uint8_t kind, int32_t pid,
@@ -251,24 +334,7 @@ int kernel_record_lock_set(struct kernel_record_lock_state *state,
     if (type != 2 && conflict(state->root, owner, kind,
                               start, end, type)) return -KERNEL_EAGAIN;
 
-    /* Adjacent same-type intervals join, including a chain of neighbors. */
-    if (type != 2) {
-        int changed;
-        do {
-            changed = 0;
-            for (old = *owner_head; old; old = old->owner_next) {
-                if (old->state != state || old->type != type ||
-                    (!touching(old, start, end) &&
-                     !adjacent(old, start, end))) continue;
-                if (old->start < start) { start = old->start; changed = 1; }
-                if (old->end > end) { end = old->end; changed = 1; }
-            }
-        } while (changed);
-    }
-    for (old = *owner_head; old; old = old->owner_next) {
-        if (old->state == state && touching(old, start, end) &&
-            old->start < start && old->end > end) needed++;
-    }
+    prepare_edit(state->root, owner, kind, type, &start, &end, &needed);
     for (size_t i = 0; i < needed; ++i) {
         struct kernel_record_lock *fresh = allocate(heap);
         if (!fresh) {
@@ -283,15 +349,12 @@ int kernel_record_lock_set(struct kernel_record_lock_state *state,
         spares = fresh;
     }
 
-    for (old = *owner_head; old;) {
-        struct kernel_record_lock *next = old->owner_next;
-        if (old->state != state || !touching(old, start, end)) {
-            old = next;
-            continue;
-        }
+    old = 0;
+    state->root = extract_owned(state->root, owner, kind, start, end, &old);
+    while (old) {
+        struct kernel_record_lock *next = old->left;
         int left = old->start < start, right = old->end > end;
         int64_t old_end = old->end;
-        state->root = tree_remove(state->root, old);
         owner_remove(old);
         if (left) {
             old->end = start - 1;

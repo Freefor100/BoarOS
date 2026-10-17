@@ -56,6 +56,8 @@ static unsigned source_pages[64], source_batch_sizes[8];
 static unsigned source_fault_index;
 static int source_fault_error;
 static unsigned write_error;
+static ext4_file *metadata_fault_file;
+static unsigned timestamp_fault, metadata_sync_fault;
 static struct kernel_page_cache *current_cache;
 static struct {
     struct kernel_vfs_node *writer, *reader;
@@ -69,6 +71,11 @@ static struct {
     unsigned armed, flush_entered, resume_flush, wait_entered, second_wait_entered, fail_flush;
     uint64_t target;
 } durable_wait;
+static struct {
+    struct kernel_vfs_file *file;
+    struct kernel_wait_queue *queues[8];
+    unsigned prepared,waiting,completed,seen[8];
+} durable_cohort;
 static void (*durable_prepare)(struct kernel_vfs_node *,int,struct kernel_vfs_sync_request *);
 static void observe_sync_prepare(struct kernel_vfs_node *node,int data_only,
     struct kernel_vfs_sync_request *request)
@@ -83,6 +90,22 @@ static void observe_sync_prepare(struct kernel_vfs_node *node,int data_only,
         assert(request->target);
         __atomic_store_n(&durable_wait.second_queue,&request->changed,__ATOMIC_RELEASE);
     }
+    if (request->file==durable_cohort.file) {
+        unsigned index=durable_cohort.prepared;
+        assert(index<8 && request->target==durable_wait.target);
+        durable_cohort.queues[index]=&request->changed;
+        __atomic_store_n(&durable_cohort.prepared,index+1,__ATOMIC_RELEASE);
+    }
+}
+void __real_kernel_vfs_sync_complete(struct kernel_vfs_sync_request *,int);
+void __wrap_kernel_vfs_sync_complete(struct kernel_vfs_sync_request *request,int result)
+{
+    if (request->target &&
+        (request->file==durable_wait.file || request->file==durable_wait.second_file))
+        assert(arch_interrupt_is_enabled() && "durable completion must run outside the pending-index IRQ section");
+    if (request->file==durable_cohort.file)
+        __atomic_fetch_add(&durable_cohort.completed,1,__ATOMIC_RELEASE);
+    __real_kernel_vfs_sync_complete(request,result);
 }
 static enum kernel_page_cache_status expected_status;
 static unsigned watch_stop, stop_entered, stop_done;
@@ -204,6 +227,9 @@ enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
+    for (unsigned i=0;i<__atomic_load_n(&durable_cohort.prepared,__ATOMIC_ACQUIRE);i++)
+        if (queue==durable_cohort.queues[i] && !__atomic_exchange_n(&durable_cohort.seen[i],1,__ATOMIC_ACQ_REL))
+            __atomic_fetch_add(&durable_cohort.waiting,1,__ATOMIC_RELEASE);
     if (queue==__atomic_load_n(&durable_wait.queue,__ATOMIC_ACQUIRE)) {
         assert(kernel_cpu_current()->logical_id==1 && !kernel_page_cache_is_executor(current_cache));
         __atomic_store_n(&durable_wait.wait_entered,1,__ATOMIC_RELEASE);
@@ -254,12 +280,41 @@ enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,siz
     return __real_kernel_heap_allocate(heap,bytes,out);
 }
 int __real_ext4_fpwrite_batch(ext4_file *,struct file_write_span *,unsigned);
+int __real_ext4_file_writeback_times(ext4_file *,bool);
+int __wrap_ext4_file_writeback_times(ext4_file *file,bool wait)
+{
+    if (file==metadata_fault_file && timestamp_fault) {
+        timestamp_fault=0;
+        return KERNEL_EIO;
+    }
+    return __real_ext4_file_writeback_times(file,wait);
+}
+int __real_ext4_file_sync_metadata_mode(ext4_file *,bool);
+int __wrap_ext4_file_sync_metadata_mode(ext4_file *file,bool data_only)
+{
+    if (file==metadata_fault_file && metadata_sync_fault) {
+        metadata_sync_fault=0;
+        return KERNEL_EIO;
+    }
+    return __real_ext4_file_sync_metadata_mode(file,data_only);
+}
 int __wrap_ext4_fpwrite_batch(ext4_file *file,struct file_write_span *spans,unsigned count)
 {
     if(write_counts) {
         if((const void *)spans!=(const void *)write_counts->spans)
             fprintf(stderr,"writeback descriptors copied: VFS=%p ext4=%p\n",(const void *)write_counts->spans,(void *)spans);
         assert((const void *)spans==(const void *)write_counts->spans);
+    }
+    unsigned fault=__atomic_exchange_n(&write_error,0,__ATOMIC_ACQ_REL);
+    if (fault) {
+        for (unsigned i=0;i<count;i++) spans[i].written=0;
+        if (fault==2 && count && spans[0].size>1) {
+            struct file_write_span prefix=spans[0]; prefix.size/=2;
+            int result=__real_ext4_fpwrite_batch(file,&prefix,1);
+            assert(!result && prefix.written==prefix.size);
+            spans[0].written=prefix.written;
+        }
+        return fault==2?0:KERNEL_EIO;
     }
     return __real_ext4_fpwrite_batch(file,spans,count);
 }
@@ -574,18 +629,6 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_wr
         __atomic_store_n(&write_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_write,__ATOMIC_ACQUIRE)) sched_yield();
     }
-    unsigned fault=__atomic_exchange_n(&write_error,0,__ATOMIC_ACQ_REL);
-    if (fault) {
-        for (size_t i=0;i<count;i++) spans[i].written=0;
-        if (fault==2 && count && spans[0].size>1) {
-            struct file_write_span prefix=spans[0]; prefix.size/=2;
-            int result=__real_kernel_vfs_node_writeback(node,&prefix,1);
-            assert(!result && prefix.written==prefix.size);
-            spans[0].written=prefix.written;
-        }
-        kernel_vfs_record_writeback_error(node,-KERNEL_EIO);
-        return fault==2?0:-KERNEL_EIO;
-    }
     return __real_kernel_vfs_node_writeback(node,spans,count);
 }
 static void *sync_file(void *arg)
@@ -813,6 +856,66 @@ static void wait_writeback_round(struct kernel_page_cache *cache, uint64_t befor
         assert(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);
         sched_yield();
     }
+}
+
+static void writeback_error_publication(struct kernel_page_cache *cache,
+    struct kernel_vfs_mount *mount,unsigned actors)
+{
+    struct kernel_vfs_file file={0};
+    char name[40]; snprintf(name,sizeof(name),"/writeback-errors-%u",actors);
+    assert(!kernel_vfs_create(mount,name,0600,&file));
+    size_t written;
+    assert(!kernel_vfs_pwrite(&file,0,"initial",7,&written) && written==7);
+    uint64_t observed=kernel_vfs_error_sequence(&file);
+    assert(!kernel_vfs_sync(&file,0,&observed));
+    for (unsigned mode=0;mode<3;mode++) for (unsigned fault=1;fault<=2;fault++) {
+        assert(!kernel_vfs_pwrite(&file,0,"changed",7,&written) && written==7);
+        uint64_t before=kernel_vfs_error_sequence(&file), independent=before;
+        uint64_t mount_before=kernel_vfs_mount_error_sequence(mount), mount_observed=mount_before;
+        write_error=fault;
+        if (mode==0) assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_EIO);
+        else if (mode==1) {
+            assert(!kernel_page_cache_start_worker(cache));
+            struct kernel_page_cache_concurrency_state state;
+            kernel_page_cache_get_concurrency_state(cache,&state);
+            assert(!kernel_page_cache_request_writeback(cache));
+            wait_writeback_round(cache,state.writeback_rounds);
+            kernel_page_cache_stop_worker(cache);
+        } else assert(kernel_vfs_sync_mount(mount,&mount_observed)==-KERNEL_EIO);
+        assert(!write_error && kernel_vfs_error_sequence(&file)==before+1);
+        assert(kernel_vfs_mount_error_sequence(mount)==mount_before+1);
+        if (mode) assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_EIO);
+        assert(!kernel_vfs_sync(&file,0,&observed));
+        assert(kernel_vfs_sync(&file,0,&independent)==-KERNEL_EIO);
+        assert(!kernel_vfs_sync(&file,0,&independent));
+        assert(kernel_vfs_sync_mount(mount,&mount_observed)==(mode==2?0:-KERNEL_EIO));
+        assert(!kernel_vfs_sync_mount(mount,&mount_observed));
+    }
+    struct kernel_vfs_file root={0};
+    assert(!kernel_vfs_open(mount,"/",&root));
+    for (unsigned root_error=0;root_error<2;root_error++) {
+        uint64_t before=kernel_vfs_error_sequence(&file);
+        uint64_t root_before=kernel_vfs_error_sequence(&root);
+        uint64_t mount_before=kernel_vfs_mount_error_sequence(mount), mount_observed=mount_before;
+        if (root_error) {
+            metadata_fault_file=lwext4_node_file(kernel_vfs_file_node(&root));
+            metadata_sync_fault=1;
+        } else {
+            assert(!kernel_vfs_file_modified(&file,0,0));
+            metadata_fault_file=lwext4_node_file(kernel_vfs_file_node(&file));
+            timestamp_fault=1;
+        }
+        assert(kernel_vfs_sync_mount(mount,&mount_observed)==-KERNEL_EIO);
+        assert(!timestamp_fault && !metadata_sync_fault);
+        assert(kernel_vfs_error_sequence(&file)==before+!root_error);
+        assert(kernel_vfs_error_sequence(&root)==root_before+root_error);
+        assert(kernel_vfs_mount_error_sequence(mount)==mount_before+1);
+        assert(!kernel_vfs_sync_mount(mount,&mount_observed));
+        metadata_fault_file=NULL;
+    }
+    assert(!kernel_vfs_close(&root));
+    assert(!kernel_vfs_close(&file));
+    puts("PASS writeback error publication: data/short writes/timestamps/root metadata each publish once on the failed inode; independent observers consume once");
 }
 static void foreground_windows(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
 {
@@ -2205,6 +2308,7 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     expanded_index_case(cache,&file,pages);
     version_reuse_case(cache,&file);
     foreground_windows(cache,&file);
+    writeback_error_publication(cache,&mount,actors);
     if(actors==2) {version_capacity_case(cache,&file);version_oom_case(cache,&file);version_prefix_cycle(cache,&file);version_empty_cycle(cache,&file);}
     foreground_window_truncate(cache,&file);
     dirty_index_case(cache,&mount,&file,actors);
@@ -2302,13 +2406,21 @@ static void executor_durable_progress(struct kernel_heap *heap,
     memset(bytes,0x35,sizeof(bytes));
     assert(!kernel_vfs_pwrite(&writer,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     durable_wait=(__typeof__(durable_wait)){.file=&writer,.armed=1};
+    durable_cohort=(__typeof__(durable_cohort)){.file=&writer};
     executor_fairness=(__typeof__(executor_fairness)){.reader=kernel_vfs_file_node(&reader)};
     struct executor_sync sync={.file=&writer,.observed=kernel_vfs_error_sequence(&writer)};
+    struct executor_sync siblings[7];pthread_t sibling_threads[7];
     pthread_t syncing,reading,close_thread;
     assert(!pthread_create(&syncing,NULL,executor_sync_client,&sync));
     wait_progress(&durable_wait.wait_entered,1);
     wait_progress(&durable_wait.flush_entered,1);
     assert(durable_wait.target && !__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE));
+    for (unsigned i=0;i<7;i++) {
+        siblings[i]=(struct executor_sync){.file=&writer,.observed=kernel_vfs_error_sequence(&writer)};
+        assert(!pthread_create(&sibling_threads[i],NULL,executor_sync_client,&siblings[i]));
+    }
+    wait_progress(&durable_cohort.waiting,8);
+    for (unsigned i=0;i<7;i++) assert(!__atomic_load_n(&siblings[i].done,__ATOMIC_ACQUIRE));
     /* 封口版本尚未持久化时应用继续改页；旧fsync只等待已捕获版本。 */
     memset(bytes,0x36,sizeof(bytes));
     assert(!kernel_vfs_pwrite(&writer,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
@@ -2320,10 +2432,13 @@ static void executor_durable_progress(struct kernel_heap *heap,
     assert(!__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE));
     __atomic_store_n(&durable_wait.resume_flush,1,__ATOMIC_RELEASE);
     assert(!pthread_join(syncing,NULL) && !sync.result);
+    for (unsigned i=0;i<7;i++) assert(!pthread_join(sibling_threads[i],NULL) && !siblings[i].result);
+    assert(durable_cohort.prepared==8 && durable_cohort.completed==8);
     assert(kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&writer))->count==1);
     unsigned char old;
     assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(&writer),0,&old,1,&done) && done==1 && old==0x35);
-    durable_wait=(__typeof__(durable_wait)){0};executor_fairness=(__typeof__(executor_fairness)){0};
+    durable_wait=(__typeof__(durable_wait)){0};durable_cohort=(__typeof__(durable_cohort)){0};
+    executor_fairness=(__typeof__(executor_fairness)){0};
     assert(!kernel_vfs_sync(&writer,0,&sync.observed));
     kernel_page_cache_stop_worker(&cache);
     instance->ops=backend;

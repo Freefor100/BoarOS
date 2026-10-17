@@ -5,14 +5,19 @@
 #include <kernel/page.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
+#include "../third_party/lwext4/include/misc/tree.h"
 #include <string.h>
 
 /* Fixed Linux mm/shmem.c BOGO_DIRENT_SIZE: includes . and .. in i_size. */
 #define TMPFS_DIRENT_SIZE 20U
 #define TMPFS_INODE_SPACE 1024U
 
+RB_HEAD(tmp_name_tree, tmp_entry);
+RB_HEAD(tmp_cookie_tree, tmp_entry);
 struct tmp_inode {
-    struct tmp_inode *next;
+    RB_ENTRY(tmp_inode) index;
+    struct tmp_name_tree names;
+    struct tmp_cookie_tree cookies;
     uint64_t number, parent, size;
     uint32_t mode, links, handles, uid, gid;
     struct kernel_memory_object *memory;
@@ -20,19 +25,35 @@ struct tmp_inode {
     struct kernel_vfs_timespec atime, mtime, ctime;
 };
 struct tmp_entry {
-    struct tmp_entry *next;
-    struct tmp_inode *inode;
-    uint64_t parent, cookie;
+    RB_ENTRY(tmp_entry) name_index;
+    RB_ENTRY(tmp_entry) cookie_index;
+    struct tmp_inode *inode, *parent;
+    uint64_t cookie;
+    size_t name_length;
     char name[];
 };
+RB_HEAD(tmp_inode_tree, tmp_inode);
 struct tmp_mount {
     struct kernel_vfs_mount mount;
     struct kernel_vfs_instance instance;
-    struct tmp_inode *inodes;
-    struct tmp_entry *entries;
+    struct tmp_inode_tree inodes;
     struct kernel_memory_budget pages;
     uint64_t inode_limit, inode_count, next_inode, next_cookie;
 };
+static int inode_compare(const struct tmp_inode *a, const struct tmp_inode *b)
+{ return (a->number > b->number) - (a->number < b->number); }
+static int name_compare(const char *a, size_t an, const char *b, size_t bn)
+{
+    int order = memcmp(a, b, an < bn ? an : bn);
+    return order ? order : (an > bn) - (an < bn);
+}
+static int entry_name_compare(const struct tmp_entry *a, const struct tmp_entry *b)
+{ return name_compare(a->name, a->name_length, b->name, b->name_length); }
+static int cookie_compare(const struct tmp_entry *a, const struct tmp_entry *b)
+{ return (a->cookie > b->cookie) - (a->cookie < b->cookie); }
+RB_GENERATE_INTERNAL(tmp_inode_tree, tmp_inode, index, inode_compare, static inline)
+RB_GENERATE_INTERNAL(tmp_name_tree, tmp_entry, name_index, entry_name_compare, static inline)
+RB_GENERATE_INTERNAL(tmp_cookie_tree, tmp_entry, cookie_index, cookie_compare, static inline)
 static struct kernel_vfs_backend tmp_ops;
 int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount)
 {
@@ -68,20 +89,26 @@ static int allocate(struct tmp_mount *m, size_t n, void **out)
     return r == KERNEL_HEAP_STATUS_OK ? 0 : r == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
 }
 static struct tmp_inode *inode(struct tmp_mount *m, uint64_t id)
-{ for (struct tmp_inode *i = m->inodes; i; i = i->next) if (i->number == id) return i; return 0; }
-static struct tmp_entry *entry(struct tmp_mount *m, uint64_t parent, const char *name, size_t n)
 {
-    for (struct tmp_entry *e = m->entries; e; e = e->next)
-        if (e->parent == parent && strlen(e->name) == n && !memcmp(e->name, name, n)) return e;
+    struct tmp_inode key = {.number = id};
+    return RB_FIND(tmp_inode_tree, &m->inodes, &key);
+}
+static struct tmp_entry *entry(struct tmp_inode *parent, const char *name, size_t n)
+{
+    struct tmp_entry *e = RB_ROOT(&parent->names);
+    while (e) {
+        int order = name_compare(name, n, e->name, e->name_length);
+        if (!order) return e;
+        e = order < 0 ? RB_LEFT(e, name_index) : RB_RIGHT(e, name_index);
+    }
     return 0;
 }
 static void collect_inode(struct tmp_mount *m, struct tmp_inode *i)
 {
     if (i->links || i->handles) return;
-    struct tmp_inode **p = &m->inodes;
-    while (*p && *p != i) p = &(*p)->next;
-    if (!*p || !m->inode_count) __builtin_trap();
-    *p = i->next; m->inode_count--;
+    if (!m->inode_count || !RB_EMPTY(&i->names) || !RB_EMPTY(&i->cookies) ||
+        RB_REMOVE(tmp_inode_tree, &m->inodes, i) != i) __builtin_trap();
+    m->inode_count--;
     if (!i->memory) dispose(m, i->target);
     if (i->memory) kernel_memory_object_release(&i->memory);
     dispose(m, i);
@@ -95,7 +122,7 @@ static int resolve(struct tmp_mount *m, const char *path, struct tmp_inode **out
         const char *end = path;
         while (*end && *end != '/') end++;
         if ((i->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-        struct tmp_entry *e = entry(m, i->number, path, (size_t)(end - path));
+        struct tmp_entry *e = entry(i, path, (size_t)(end - path));
         if (!e) return -KERNEL_ENOENT;
         i = e->inode; path = end;
         while (*path == '/') path++;
@@ -116,41 +143,42 @@ static int parent_name(struct tmp_mount *m, const char *path, struct tmp_inode *
         const char *next = end;
         while (*next == '/') next++;
         if (!*next) { *parent = i; *name = path; *len = n; return 0; }
-        struct tmp_entry *e = entry(m, i->number, path, n);
+        struct tmp_entry *e = entry(i, path, n);
         if (!e) return -KERNEL_ENOENT;
         if ((e->inode->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
         i = e->inode; path = next;
     }
 }
-static int new_entry(struct tmp_mount *m, uint64_t parent, const char *name, size_t n,
-                      struct tmp_entry **out)
+static int allocate_entry(struct tmp_mount *m, struct tmp_inode *parent,
+                          const char *name, size_t n, struct tmp_entry **out)
 {
-    if (entry(m, parent, name, n)) return -KERNEL_EEXIST;
     if (m->next_cookie == UINT64_MAX) return -KERNEL_EOVERFLOW;
     int r = allocate(m, sizeof(**out) + n + 1, (void **)out);
     if (r) return r;
     (*out)->parent = parent; (*out)->cookie = m->next_cookie++;
+    (*out)->name_length = n;
     memcpy((*out)->name, name, n); return 0;
 }
-static void publish_entry(struct tmp_mount *m, struct tmp_entry *e, struct tmp_inode *i)
+static void publish_entry(struct tmp_entry *e, struct tmp_inode *i)
 {
-    struct tmp_inode *parent = inode(m, e->parent);
-    if (!parent || parent->size > UINT64_MAX - TMPFS_DIRENT_SIZE) __builtin_trap();
+    struct tmp_inode *parent = e->parent;
+    if (parent->size > UINT64_MAX - TMPFS_DIRENT_SIZE) __builtin_trap();
     parent->size += TMPFS_DIRENT_SIZE;
-    e->inode = i; e->next = m->entries; m->entries = e;
+    e->inode = i;
+    if (RB_INSERT(tmp_name_tree, &parent->names, e) ||
+        RB_INSERT(tmp_cookie_tree, &parent->cookies, e)) __builtin_trap();
 }
 static void remove_entry(struct tmp_mount *m, struct tmp_entry *e)
 {
-    struct tmp_entry **p = &m->entries;
-    while (*p && *p != e) p = &(*p)->next;
-    if (!*p) __builtin_trap();
-    struct tmp_inode *parent = inode(m, e->parent);
-    if (!parent || parent->size < 3 * TMPFS_DIRENT_SIZE) __builtin_trap();
+    struct tmp_inode *parent = e->parent;
+    if (parent->size < 3 * TMPFS_DIRENT_SIZE ||
+        RB_REMOVE(tmp_name_tree, &parent->names, e) != e ||
+        RB_REMOVE(tmp_cookie_tree, &parent->cookies, e) != e) __builtin_trap();
     parent->size -= TMPFS_DIRENT_SIZE;
-    *p = e->next; dispose(m, e);
+    dispose(m, e);
 }
-static int create_inode(struct tmp_mount *m, const char *path, uint32_t mode,
-                         const char *target, struct tmp_inode **out)
+static int create_path(struct tmp_mount *m, const char *path, uint32_t mode,
+                        const char *target, struct tmp_entry **out)
 {
     if (m->instance.read_only) return -KERNEL_EROFS;
     if (m->inode_limit && m->inode_count >= m->inode_limit) return -KERNEL_ENOSPC;
@@ -159,7 +187,8 @@ static int create_inode(struct tmp_mount *m, const char *path, uint32_t mode,
     const char *name; size_t n;
     int r = parent_name(m, path, &parent, &name, &n);
     if (r) return r;
-    r = new_entry(m, parent->number, name, n, &e);
+    if (entry(parent, name, n)) return -KERNEL_EEXIST;
+    r = allocate_entry(m, parent, name, n, &e);
     if (r) return r;
     r = allocate(m, sizeof(*i), (void **)&i);
     if (r) { dispose(m, e); return r; }
@@ -210,11 +239,13 @@ static int create_inode(struct tmp_mount *m, const char *path, uint32_t mode,
     i->number = m->next_inode++;
     i->links = (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ? 2 : 1;
     i->atime = i->mtime = i->ctime = now();
-    i->next = m->inodes; m->inodes = i; m->inode_count++;
-    publish_entry(m, e, i);
+    if (RB_INSERT(tmp_inode_tree, &m->inodes, i)) __builtin_trap();
+    m->inode_count++;
+    publish_entry(e, i);
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) parent->links++;
     parent->mtime = parent->ctime = now();
-    *out = i; return 0;
+    if (out) *out = e;
+    return 0;
 }
 static int error(struct kernel_vfs_instance *instance) { (void)instance; return 0; }
 static int root(struct kernel_vfs_instance *instance, uint64_t *id, uint32_t *mode)
@@ -225,7 +256,7 @@ static int lookup(struct kernel_vfs_instance *instance, uint64_t parent, const c
     struct tmp_mount *m = tm(instance); struct tmp_inode *p = inode(m, parent);
     if (!p) return -KERNEL_ENOENT;
     if ((p->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-    struct tmp_entry *e = entry(m, parent, name, n);
+    struct tmp_entry *e = entry(p, name, n);
     if (!e) return -KERNEL_ENOENT;
     *id = e->inode->number; *mode = e->inode->mode; return 0;
 }
@@ -252,28 +283,26 @@ static int close_node(struct kernel_vfs_node *n)
 static int create(struct kernel_vfs_mount *mount, const char *path, uint32_t mode,
                    struct kernel_vfs_file *file)
 {
-    struct tmp_mount *m = tm(mount->private_data); struct tmp_inode *i;
-    int r = create_inode(m, path, KERNEL_VFS_S_IFREG | (mode & 07777), 0, &i);
+    struct tmp_mount *m = tm(mount->private_data); struct tmp_entry *e;
+    int r = create_path(m, path, KERNEL_VFS_S_IFREG | (mode & 07777), 0, &e);
     if (r) return r;
+    struct tmp_inode *i = e->inode;
     r = open_inode(mount, 0, i->number, i->mode, file);
     if (r) {
-        struct tmp_entry *e = m->entries;
-        if (!e || e->inode != i) __builtin_trap();
         remove_entry(m, e); i->links = 0; collect_inode(m, i);
     }
     return r;
 }
 static int mkdir(struct kernel_vfs_mount *mount, const char *path, uint32_t mode)
-{ struct tmp_inode *i; return create_inode(tm(mount->private_data), path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, &i); }
+{ return create_path(tm(mount->private_data), path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, 0); }
 static int symlink(struct kernel_vfs_instance *instance, const char *target, const char *path)
-{ struct tmp_inode *i; return create_inode(tm(instance), path, KERNEL_VFS_S_IFLNK | 0777, target, &i); }
+{ return create_path(tm(instance), path, KERNEL_VFS_S_IFLNK | 0777, target, 0); }
 static int mknod_regular(struct kernel_vfs_instance *instance, const char *path,
     uint32_t type, uint32_t mode, uint32_t device)
 {
     (void)device;
     if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO) return -KERNEL_ENOTSUP;
-    struct tmp_inode *created;
-    return create_inode(tm(instance), path, type | (mode & 07777), 0, &created);
+    return create_path(tm(instance), path, type | (mode & 07777), 0, 0);
 }
 static int readlink(struct kernel_vfs_node *n, char *buffer, size_t size, size_t *count)
 {
@@ -282,8 +311,7 @@ static int readlink(struct kernel_vfs_node *n, char *buffer, size_t size, size_t
     *count = i->size < size ? i->size : size;
     memcpy(buffer, i->target, *count); return 0;
 }
-static int empty(struct tmp_mount *m, struct tmp_inode *i)
-{ for (struct tmp_entry *e = m->entries; e; e = e->next) if (e->parent == i->number) return 0; return 1; }
+static int empty(struct tmp_inode *i) { return RB_EMPTY(&i->names); }
 static void unlink_inode(struct tmp_mount *m, struct tmp_inode *i)
 {
     if (!i->links) __builtin_trap();
@@ -303,11 +331,11 @@ static int remove_path(struct kernel_vfs_mount *mount, const char *path, int dir
     struct tmp_mount *m = tm(mount->private_data); struct tmp_inode *parent;
     const char *name; size_t n;
     int r = parent_name(m, path, &parent, &name, &n); if (r) return r;
-    struct tmp_entry *e = entry(m, parent->number, name, n); if (!e) return -KERNEL_ENOENT;
+    struct tmp_entry *e = entry(parent, name, n); if (!e) return -KERNEL_ENOENT;
     struct tmp_inode *i = e->inode;
     int isdir = (i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
     if (directory != isdir) return directory ? -KERNEL_ENOTDIR : -KERNEL_EISDIR;
-    if (isdir && !empty(m, i)) return -KERNEL_ENOTEMPTY;
+    if (isdir && !empty(i)) return -KERNEL_ENOTEMPTY;
     remove_entry(m, e); if (isdir) parent->links--;
     parent->ctime = parent->mtime = now(); unlink_inode(m, i); return 0;
 }
@@ -326,26 +354,30 @@ static int link_inode(struct kernel_vfs_instance *instance, uint64_t source, uin
     if ((i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) return -KERNEL_EPERM;
     if (i->links == UINT32_MAX) return -KERNEL_EMLINK;
     if (m->inode_limit && m->inode_count >= m->inode_limit) return -KERNEL_ENOSPC;
-    struct tmp_entry *e = 0; int r = new_entry(m,parent,name,strlen(name),&e); if(r) return r;
-    publish_entry(m,e,i); m->inode_count++; i->links++; i->ctime = now(); p->ctime = p->mtime = now(); return 0;
+    size_t n = strlen(name);
+    if (entry(p, name, n)) return -KERNEL_EEXIST;
+    struct tmp_entry *e = 0; int r = allocate_entry(m,p,name,n,&e); if(r) return r;
+    publish_entry(e,i); m->inode_count++; i->links++; i->ctime = now(); p->ctime = p->mtime = now(); return 0;
 }
 static int rename_inode(struct kernel_vfs_instance *instance, uint64_t old_parent, const char *old_name,
                           uint64_t new_parent, const char *new_name, unsigned flags,
                           struct kernel_vfs_rename_result *result)
 {
     struct tmp_mount *m = tm(instance);
-    struct tmp_entry *old = entry(m,old_parent,old_name,strlen(old_name));
-    struct tmp_entry *dest = entry(m,new_parent,new_name,strlen(new_name));
+    struct tmp_inode *op = inode(m, old_parent), *np = inode(m, new_parent);
+    if (!np || !op) return -KERNEL_ENOENT;
+    struct tmp_entry *old = entry(op,old_name,strlen(old_name));
+    size_t new_length = strlen(new_name);
+    struct tmp_entry *dest = entry(np,new_name,new_length);
     if (!old) return -KERNEL_ENOENT;
     if (dest && (flags & 1)) return -KERNEL_EEXIST;
     if (dest && dest->inode == old->inode) return 0;
-    struct tmp_inode *i = old->inode, *op = inode(m,old_parent), *np = inode(m,new_parent);
+    struct tmp_inode *i = old->inode;
     int dir = (i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
-    if (!np || !op) return -KERNEL_ENOENT;
     if (dest) {
         int dd = (dest->inode->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
         if (dir != dd) return dir ? -KERNEL_ENOTDIR : -KERNEL_EISDIR;
-        if (dd && !empty(m,dest->inode)) return -KERNEL_ENOTEMPTY;
+        if (dd && !empty(dest->inode)) return -KERNEL_ENOTEMPTY;
     }
     if (dir) for (struct tmp_inode *p = np;; p = inode(m,p->parent)) {
         if (!p) __builtin_trap();
@@ -354,17 +386,15 @@ static int rename_inode(struct kernel_vfs_instance *instance, uint64_t old_paren
     }
     struct tmp_entry *replacement = 0;
     /* 先预留新名字，之后的目录项与 link count 提交不再分配。 */
-    int r = allocate(m,sizeof(*replacement)+strlen(new_name)+1,(void **)&replacement);
+    int r = allocate_entry(m,np,new_name,new_length,&replacement);
     if(r) return r;
-    replacement->parent=new_parent; replacement->cookie=m->next_cookie++;
-    memcpy(replacement->name,new_name,strlen(new_name)+1);
     if(dest) {
         struct tmp_inode *di=dest->inode;
         result->replaced_inode=di->number;
         result->replaced_last_link=dir || di->links==1;
         remove_entry(m,dest); if(dir) np->links--; unlink_inode(m,di);
     }
-    remove_entry(m,old); publish_entry(m,replacement,i);
+    remove_entry(m,old); publish_entry(replacement,i);
     if(dir && op!=np) { op->links--; np->links++; i->parent=new_parent; }
     i->ctime=now(); op->mtime=op->ctime=np->mtime=np->ctime=now(); result->changed=1;
     return 0;
@@ -390,15 +420,14 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
 static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint64_t *id,
                        uint8_t *type,char *name,size_t capacity)
 {
-    struct kernel_vfs_node *n=f->private_data; struct tmp_mount *m=tm(n->instance); struct tmp_inode *i=ti(n);
+    struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
     if((i->mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
     if(pos<2) { if(capacity<3) return -KERNEL_ENAMETOOLONG; strcpy(name,pos ? ".." : ".");
         *id=pos ? i->parent : i->number; *next=pos+1; *type=4; return 1; }
-    struct tmp_entry *best=0;
-    for(struct tmp_entry *e=m->entries;e;e=e->next)
-        if(e->parent==i->number && e->cookie>=pos && (!best || e->cookie<best->cookie)) best=e;
+    struct tmp_entry key = {.cookie = pos};
+    struct tmp_entry *best = RB_NFIND(tmp_cookie_tree, &i->cookies, &key);
     if(!best) return 0;
-    if(strlen(best->name)>=capacity) return -KERNEL_ENAMETOOLONG;
+    if(best->name_length>=capacity) return -KERNEL_ENAMETOOLONG;
     strcpy(name,best->name); *id=best->inode->number; *next=best->cookie+1;
     *type=(best->inode->mode & KERNEL_VFS_S_IFMT)>>12; return 1;
 }
@@ -521,16 +550,21 @@ static int unmount(struct kernel_vfs_mount *mount)
 {
     struct tmp_mount *m=tm(mount->private_data);
     if(mount->covered_path || mount->root_path || mount->child_mounts || m->instance.external_files || m->instance.nodes) return -KERNEL_EBUSY;
-    while (m->entries) {
-        struct tmp_inode *i = m->entries->inode;
-        /* 额外硬链接预留也属于挂载；保留 inode 到所有父目录项移除之后。 */
-        if ((i->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR && i->links > 1) {
-            if (!m->inode_count) __builtin_trap();
-            i->links--; m->inode_count--;
+    struct tmp_inode *parent;
+    RB_FOREACH(parent, tmp_inode_tree, &m->inodes) {
+        struct tmp_entry *e;
+        while ((e = RB_MIN(tmp_name_tree, &parent->names))) {
+            struct tmp_inode *i = e->inode;
+            /* 父目录仍被inode索引持有；移除所有名字后再统一释放inode。 */
+            if ((i->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR && i->links > 1) {
+                if (!m->inode_count) __builtin_trap();
+                i->links--; m->inode_count--;
+            }
+            remove_entry(m, e);
         }
-        remove_entry(m, m->entries);
     }
-    while(m->inodes) { m->inodes->links=0; collect_inode(m,m->inodes); }
+    struct tmp_inode *i;
+    while ((i = RB_MIN(tmp_inode_tree, &m->inodes))) { i->links=0; collect_inode(m,i); }
     if(__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) || m->inode_count) __builtin_trap();
     struct kernel_heap *heap=m->instance.heap;
     kernel_heap_release(heap,m);
@@ -633,7 +667,9 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     if(r) {dispose(m,m);return r;}
     i->number=i->parent=1; i->mode=KERNEL_VFS_S_IFDIR|mode; i->links=2;
     i->size=2 * TMPFS_DIRENT_SIZE;
-    i->atime=i->mtime=i->ctime=now(); m->inodes=i; m->inode_count=1; m->next_inode=2; m->next_cookie=2;
+    i->atime=i->mtime=i->ctime=now();
+    if (RB_INSERT(tmp_inode_tree, &m->inodes, i)) __builtin_trap();
+    m->inode_count=1; m->next_inode=2; m->next_cookie=2;
     initialize_ops(); m->instance.ops=&tmp_ops; m->instance.read_only=(flags & 1)!=0;
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
     m->mount.private_data=&m->instance; m->mount.id=kernel_vfs_allocate_mount_id(); m->mount.state=VFS_MOUNT_STATE_LIVE;

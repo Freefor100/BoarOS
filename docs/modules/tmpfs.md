@@ -44,6 +44,14 @@ inode 内存，长符号链接使用有配额的后备页。
 硬链接共享数据、链接计数、锁，但独立打开产生独立 OFD。目录继续位置是
 稳定递增 cookie，修改期间不保证额外快照一致性。
 
+挂载按 inode 号维护红黑树，每个目录分别按名字和 cookie 维护目录项红黑树；
+这些索引同时承担对象登记与卸载遍历，不保留另一份全挂载链表。inode 查找为
+O(log I)，名字查找和 cookie 继续定位为 O(log D)，其中 I 为挂载 inode 数，
+D 为当前目录的项数。读取一个目录不会扫描其他目录。目录项借用仍在索引中
+存活的父 inode，直接维护其大小；卸载先删除全部目录项，再释放 inode。
+创建先准备名字、inode 与后备对象，重命名先分配新名字；提交索引不再分配。
+重命名取得新 cookie，cookie 耗尽返回 EOVERFLOW 并保留原名字与替换目标。
+
 用户态创建挂载点并调用 mount；内核不会自动覆盖 `/tmp` 或 `/dev/shm`。
 支持 `size`、`nr_blocks`、`nr_inodes`、`mode`；默认页数和 inode 数分别为受管
 页数的一半，默认根模式 01777。零取消相应显式限额。数字按固定 Linux
@@ -64,6 +72,7 @@ SysV 共享内存已由共用内存后备对象实现。挂载扩展的剩余工
 ```sh
 make test-vma-riscv test-files-riscv
 make test-memory-object-concurrency-host
+make test-tmpfs-host
 make test-file-mapping-concurrency-host
 make test-diff-abi-riscv
 make test-userland-riscv
@@ -77,6 +86,10 @@ make test-busybox-tmpfs-riscv
 通过管道握手验证 fork、不同地址别名、重建同名对象与最后映射的忙引用。
 离线 GCC 的工作目录和 TMPDIR 都位于 tmpfs；最终产物复制到根盘仅用于主机
 核验，不是 tmpfs 持久化证据。
+
+宿主 tmpfs 用真实后端、内存对象、heap 和页分配器检查混合大目录的查找与
+枚举、cookie seek/继续、插入删除与跨目录重命名、替换和硬链接、分配失败回滚、
+inode/页预算及最终资源归还；VFS 发布由宿主适配，完整路径集成由文件与客户机测试覆盖。
 
 共享映射的直接写缺页更新 mtime/ctime，私有 COW 不更新文件时间。读缺页可以
 直接发布可写 PTE，之后的 store 不保证另一次时间通知；这与固定 Linux 的

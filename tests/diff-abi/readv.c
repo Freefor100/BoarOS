@@ -2,6 +2,33 @@
 
 static void close_fd(long fd) { abi_require(SC1(57, fd) == 0); }
 
+static void vector_import_edges(void)
+{
+    long source=abi_open("/data",0);
+    long output=abi_open("/vector-import",2|0100|01000);
+    /* Keep the capped range below either architecture's user limit; an
+     * arbitrary high mmap address can fail access_ok even after the cap. */
+    long map=CALL(222,0x10000000,2*ABI_PAGE_SIZE,3,0x32,-1,0);
+    abi_require(source>=0 && output>=0 && map==0x10000000);
+    abi_require(SC3(226,map+ABI_PAGE_SIZE,ABI_PAGE_SIZE,0)==0);
+    struct abi_iovec vectors[2]={{(void *)map,0x7fffffffffffffffUL},{(void *)map,1}};
+    long ret=SC3(65,source,vectors,1);
+    abi_record("readv.single-large-length",ret,abi_size(source),abi_offset(source),0,0,0);
+    for (usize i=0;i<ABI_PAGE_SIZE;i++) ((unsigned char *)map)[i]=(unsigned char)(i%251);
+    ret=SC3(66,output,vectors,1);
+    abi_record("writev.single-large-length",ret,abi_size(output),abi_offset(output),0,0,0);
+    ret=SC3(66,output,vectors,2);
+    abi_record("writev.multi-original-range",ret,abi_size(output),abi_offset(output),0,0,0);
+    vectors[0]=(struct abi_iovec){(void *)-1,1};
+    vectors[1]=(struct abi_iovec){(void *)map,(usize)-1};
+    ret=SC3(65,source,vectors,2);
+    abi_record("readv.length-before-range",ret,abi_size(source),abi_offset(source),0,0,0);
+    ret=SC3(66,output,vectors,2);
+    abi_record("writev.length-before-range",ret,abi_size(output),abi_offset(output),0,0,0);
+    abi_require(SC2(215,map,2*ABI_PAGE_SIZE)==0);
+    close_fd(output);close_fd(source);
+}
+
 static void readv_file_edges(void)
 {
     static struct abi_iovec many[1025];
@@ -332,6 +359,7 @@ void abi_readv_cases(void)
     close_fd(pipefd[0]); close_fd(pipefd[1]);
 
     readv_file_edges();
+    vector_import_edges();
     readv_pipe_edges();
     pipe_write_fragment_fault();
     readv_more_edges();

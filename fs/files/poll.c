@@ -269,7 +269,6 @@ static int core_poll_run(
     while (!ready_count && !error && !immediate) {
         /* 查询、绑定、复查共用短IRQ范围；不在已准备的token内等待其他锁。 */
         uintptr_t saved_intr = arch_interrupt_save();
-        (void)arch_interrupt_save();
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
         if (kernel_wait_prepare(0, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK) {

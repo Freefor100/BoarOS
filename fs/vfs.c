@@ -2277,17 +2277,12 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
         if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG || !instance->page_cache)
             continue;
         int error = kernel_page_cache_writeback(instance->page_cache, node);
-        if (error && error != -KERNEL_ENOMEM && error != -KERNEL_EBUSY)
-            kernel_vfs_record_writeback_error(node, error);
         if (error && !result) result = error;
     }
     /* 捕获此前数据交接与namespace修改的durable目标一次，不等待checkpoint。 */
     if (instance->ops->sync_filesystem) {
         int error = instance->ops->sync_filesystem(instance, root->file.private_data);
-        if (error) {
-            kernel_vfs_record_writeback_error(root->file.private_data, error);
-            if (!result) result = error;
-        }
+        if (error && !result) result = error;
     } else if (instance->page_cache) __builtin_trap();
 observe:
     if (observed_error) {
@@ -2405,7 +2400,7 @@ static void vfs_sync_observe_complete(struct kernel_vfs_sync_request *request, i
     }
     {
         KERNEL_RAW_SCOPE(guard, &request->metadata);
-        if (request->done || request->next) __builtin_trap();
+        if (request->done || request->index_height) __builtin_trap();
         request->result = result;
         request->done = 1;
         if (request->changed.initialized)
@@ -2421,7 +2416,7 @@ void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *request, int resul
     vfs_sync_observe_complete(request, result);
 }
 
-int kernel_vfs_sync_wait(struct kernel_vfs_sync_request *request)
+static int vfs_sync_wait(struct kernel_vfs_sync_request *request)
 {
     int result;
     for (;;) {
@@ -2485,7 +2480,7 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
             cache, vfs_sync_prepare, &call, borrowed);
         if (status) return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     } else vfs_sync_prepare(&call);
-    return kernel_vfs_sync_wait(&request);
+    return vfs_sync_wait(&request);
 }
 
 int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
@@ -2727,6 +2722,7 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    *next_position = position;
     return instance->ops->dir_entry(file, position, next_position, inode, type, name, name_size);
 }
 
@@ -2798,7 +2794,15 @@ int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
 {
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;
-    return instance->ops->writeback(node, spans, count);
+    int result = instance->ops->writeback(node, spans, count);
+    for (size_t i = 0; i < count; i++) {
+        if (spans[i].written > spans[i].size) __builtin_trap();
+        if (!result && spans[i].written != spans[i].size) result = -KERNEL_EIO;
+    }
+    /* One backend submission publishes one error before its cache completion;
+     * foreground, background and mount callers only propagate this result. */
+    if (result) kernel_vfs_record_writeback_error(node, result);
+    return result;
 }
 
 /* 后端已准备好私有 handle；同一实例的活 inode 只发布一个通用节点。 */

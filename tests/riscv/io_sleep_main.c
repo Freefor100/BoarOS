@@ -21,6 +21,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 #include <kernel/vfs.h>
+#include <ext4.h>
 #include "../../fs/vfs_internal.h"
 #include "../../fs/open_file_internal.h"
 #include "../../fs/write_source.h"
@@ -571,9 +572,20 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file
     return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
 }
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
+int __real_ext4_fpwrite_batch(ext4_file *, struct file_write_span *, unsigned);
+int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+{
+    if (background_fail && kernel_io_context_current()->background_reclaim) {
+        background_fail=0;
+        background_failed_pages=count;
+        failed_offset=count?spans[0].offset:0;
+        for (unsigned i=0;i<count;i++) spans[i].written=0;
+        return KERNEL_EIO;
+    }
+    return __real_ext4_fpwrite_batch(file,spans,count);
+}
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
 {
-    uint64_t offset=count?spans[0].offset:0;
     const void *buffer=count?spans[0].buffer:NULL;
     if (instance_hold && kernel_io_context_current()->background_reclaim) {
         KERNEL_IRQ_SCOPE(block_irq);
@@ -590,13 +602,6 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
         stop_entered = 1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&held_write, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 116);
-    }
-    if (background_fail && kernel_io_context_current()->background_reclaim) {
-        background_fail = 0;
-        background_failed_pages=count;
-        failed_offset = offset;
-        for (size_t i=0;i<count;i++) spans[i].written=0;
-        return -5;
     }
     if (write_probe) {
         unsigned char first = *(const unsigned char *)buffer;
