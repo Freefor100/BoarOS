@@ -289,6 +289,15 @@ int la_root_boot(struct physical_page_allocator *allocator)
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
     for(;;) arch_cpu_wait();
 }
+#if BOAROS_LA_CONTRACT
 void la_user_contract(struct physical_page_allocator *);
+#endif
 void la_boot_tasks(struct physical_page_allocator *allocator)
-{ if(!la_root_boot(allocator)) la_user_contract(allocator); }
+{
+    if (la_root_boot(allocator)) return;
+#if BOAROS_LA_CONTRACT
+    la_user_contract(allocator);
+#else
+    la_virt_fatal("root block device missing");
+#endif
+}

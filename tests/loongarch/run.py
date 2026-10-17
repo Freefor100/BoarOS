@@ -10,7 +10,7 @@ from guest import run_guest
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--kernel', default='kernel-la')
+    parser.add_argument('--kernel', default='build/loongarch/kernel-contract-la')
     parser.add_argument('--qemu', default=os.environ.get(
         'QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
     parser.add_argument('--stage', choices=('boot', 'mmu', 'user'), default='user')

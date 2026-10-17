@@ -919,7 +919,7 @@ test-lwext4-recovery-host:
 	sh tests/lwext4-recovery-host.sh
 	sh tests/lwext4-reclaim-host.sh
 
-$(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
+$(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
 		-o $@ $(OBJECTS)
 
@@ -1257,7 +1257,7 @@ $(BUILD_DIR)/net/ethernet.o \
 $(BUILD_DIR)/third_party/lwip/src/netif/ethernet.o: CPPFLAGS += $(LWIP_CPPFLAGS)
 
 $(BUILD_DIR)/third_party/lwext4/src/%.o: \
-		third_party/lwext4/src/%.c
+		third_party/lwext4/src/%.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
 		-Wno-unused-but-set-variable -Wno-stringop-truncation \
@@ -1905,9 +1905,20 @@ test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 # Cost variants never reuse objects compiled with a different observation flag.
 .PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv test-cost-diagnostic-host test-cost-diagnostic-plugin-host
 force-cost-config:
-$(BUILD_DIR)/generated/cost-config.h: force-cost-config
+# Shared prerequisite content must not depend on whichever target reaches it first.
+build-quote = '$(subst ','"'"',$(1))'
+BUILD_CONFIG_CC := $(CC)
+BUILD_CONFIG_FLAGS := $(CPPFLAGS) $(CFLAGS) $(ASFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS)
+BUILD_CONFIG_LINK := $(LDFLAGS) $(OBJECTS)
+$(BUILD_DIR)/generated/cost-config.h: force-cost-config Makefile
 	@mkdir -p $(dir $@)
-	@printf '#define BOAROS_COST_DIAGNOSTICS %s\n#define BOAROS_LOCK_DEBUG %s\n' '$(COST_DIAGNOSTICS)' '$(LOCK_DEBUG)' > $@.tmp
+	@{ printf '#define BOAROS_COST_DIAGNOSTICS %s\n#define BOAROS_LOCK_DEBUG %s\n/* compile inputs\n' '$(COST_DIAGNOSTICS)' '$(LOCK_DEBUG)'; \
+	  printf '%s\n' $(call build-quote,$(BUILD_CONFIG_CC)) $(call build-quote,$(BUILD_CONFIG_FLAGS)); \
+	  $(BUILD_CONFIG_CC) --version; sha256sum Makefile; printf '*/\n'; } > $@.tmp
+	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
+$(BUILD_DIR)/generated/link-config: force-cost-config Makefile
+	@mkdir -p $(dir $@)
+	@printf '%s\n' $(call build-quote,$(BUILD_CONFIG_CC)) $(call build-quote,$(BUILD_CONFIG_LINK)) > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
 COST_CASE ?= all
 test-cost-match-host:
@@ -2117,12 +2128,14 @@ test-demand-read-riscv:
 
 include arch/loongarch/build.mk
 
-.PHONY: test-elf-layout-host
+.PHONY: test-build-config-host test-elf-layout-host
+test-build-config-host:
+	python3 -B tests/host/build_config.py
 test-elf-layout-host:
 	sh tests/elf-layout-host.sh
 
 .PHONY: test-ci-host
-test-ci-host:
+test-ci-host: test-build-config-host
 	python3 -B -m unittest discover -s tests/ci -p 'test_*.py'
 
 .PHONY: test-virtio-block-host
