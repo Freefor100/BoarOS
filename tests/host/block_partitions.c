@@ -145,6 +145,9 @@ static void invalid_tables(void)
     assert(!kernel_block_register(&d,0xfc20));
     memset(disk,0,sizeof(disk)); assert(!kernel_block_scan_mbr(&d,p) && !d.references);
     disk[510]=0x55; disk[511]=0xaa;
+    disk[446]=0x7f;
+    assert(kernel_block_scan_mbr(&d,p)==-KERNEL_EINVAL && !d.references && !kernel_block_lookup(0xfc21));
+    disk[446]=0;
     entry(0,8,16); entry(1,16,16);
     assert(kernel_block_scan_mbr(&d,p)==-KERNEL_EINVAL && !d.references && !kernel_block_lookup(0xfc21));
     entry(1,120,16); assert(kernel_block_scan_mbr(&d,p)==-KERNEL_EINVAL && !d.references);

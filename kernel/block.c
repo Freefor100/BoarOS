@@ -586,8 +586,9 @@ int kernel_block_scan_mbr(struct kernel_block_device *device,
         const unsigned char *entry = sector + 446 + i * 16;
         uint32_t first = mbr_u32(entry + 8), count = mbr_u32(entry + 12);
         if (children[i].registered || children[i].references) return -KERNEL_EBUSY;
+        if (entry[0] && entry[0] != 0x80) return -KERNEL_EINVAL;
         if (!entry[4] && !first && !count) continue;
-        if (!entry[4] || !first || !count || (entry[0] && entry[0] != 0x80)) return -KERNEL_EINVAL;
+        if (!entry[4] || !first || !count) return -KERNEL_EINVAL;
         /* Extended/GPT containers are not usable primary data partitions. */
         if (entry[4] == 0x05 || entry[4] == 0x0f || entry[4] == 0x85 || entry[4] == 0xee)
             return -KERNEL_ENOTSUP;
