@@ -578,7 +578,7 @@ ordered data 版本，允许调用者随后在同一事务内用稳定写入版�
 
 写回固定本批页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回只借用当前窗口的精确页集合，归还时使用同一集合；跨窗口只保留页号与范围，续批重查当前脏页索引，不长期借用链表后继。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
-每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate/fallocate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
+每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate/fallocate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只回收干净页，可按正向顺序等待元数据资格，不能等待脏页或设备 I/O；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页的物理引用归还后，node 与 entry 的释放在可进入后端的现场完成；固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 
@@ -649,9 +649,13 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
   QEMU_RISCV_FIRMWARE=build/data-path-baselines/sync-b3/firmware.bin
 ```
 
-每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。根盘运行期启动、用户磁盘挂载时创建，所属实例卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只发布请求，低水位先回收无别名/额外引用的干净页，再写回合格脏页；仅脏阈值触发则保留清洁缓存。
+每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。根盘运行期启动、用户磁盘挂载时创建，所属实例卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只为脏页发布回收请求；低水位先回收无别名/额外引用的干净页，worker 再写回合格脏页；仅脏阈值触发则保留清洁缓存。
 
-干净回收在缓存 mutex 内检查现有 LRU 候选，退休后在锁外归还页，忙对象不等待；脏页按本节开头的 inode 队列选择。启动时预留写回窗口内的稳定页与控制工作区，其借用和归还见[当前成本边界](#当前成本边界)。
+干净回收在缓存 mutex 内检查现有 LRU 候选，退休后在锁外归还页，跳过仍有数据借用或别名的对象。注册表遍历锁只保护缓存寿命，锁序为后端 40 → 聚合遍历 41 → 缓存元数据 45；元数据锁忙时等待其完成，不能将竞争当成 OOM。已持同级或更高资格时跳过，避免自身重入。持聚合锁时只归还页，不执行 entry/node 的最终关闭；退休元数据由 worker 在离开该保护后释放，避免回收路径反向进入后端。脏页按本节开头的 inode 队列选择。
+
+后台写回、前景 fsync/legacy 完成和写入接纳共用批次前后的干净回收：固定稳定版本及取得 inode 前先回收，归还本批 entry 借用后再次恢复原高水位余量。前景工作区申请亦在此前回收，不让连续批次积累分配压力后才在后端内部失败。水位未改变；不能回收的页面和真实内存耗尽仍返回 ENOMEM。启动时预留写回窗口内的稳定页与控制工作区，其借用和归还见[当前成本边界](#当前成本边界)。连续页分配按真实回收进展重试的规则见[物理页](physical-pages.md)。
+
+`FALLOCATE_HOST_CASES='namespace-reclaim namespace-pressure' FALLOCATE_HOST_IMAGE_SIZE=256M FALLOCATE_HOST_TIMEOUT=60 sh tests/fallocate-host.sh` 使用同一个 16 MiB 物理池承载页缓存、VFS 堆、块缓存和 journal；长场景创建 48 个 4 MiB 文件，各自 fsync、重开并完整读回。握手场景在真实后端锁内耗尽空闲页，检查 cache 元数据资格忙时等待并取得干净页，同锁或更高资格重入时跳过，随后无干净页时返回 EMPTY；设备入口断言禁止该线程递归 I/O。两种页大小、两种文件系统块大小及有／无 journal 共 16 个组合，最终检查堆、物理页及 e2fsck。真实写回 EIO、ENOSPC 和不可回收页耗尽仍由前述 pressure 场景保护。
 后端元数据仍可能分配失败。映射重新设保护与 generation 协议保持不变，旧完成不能
 清除新修改。写回错误留在 inode/mount，当前失败页在成功前不计入 MemAvailable；
 同一轮继续处理其他对象。后台完成不替代 fsync/fdatasync 的错误观察与 flush。

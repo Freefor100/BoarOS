@@ -31,7 +31,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
                 features=has_journal
                 [ "$journal" = journal ] || features=^has_journal
                 mkfs.ext4 -q -F -b "$block" -O "$features" "$image"
-                timeout 30s "$build_dir/concurrency-$shift" "$image" "$scenario"
+                timeout "${FALLOCATE_HOST_TIMEOUT:-30}s" "$build_dir/concurrency-$shift" "$image" "$scenario"
                 e2fsck -fn "$image" > "$build_dir/fsck-$scenario-$shift-$block-$journal.log" 2>&1
                 printf 'PASS %s page_shift=%s fs_block=%s %s; e2fsck clean\n' "$scenario" "$shift" "$block" "$journal"
               done
