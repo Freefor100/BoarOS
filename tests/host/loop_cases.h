@@ -152,7 +152,13 @@ static void loop_readonly_case(struct kernel_files *local,struct kernel_fs_conte
     struct kernel_loop_info64 info;
     assert(!kernel_copy_from_user(&mm,&info,0x200400,sizeof(info),&copied));
     assert(info.offset==128 && info.sizelimit==4096 && (info.flags&KERNEL_LOOP_READ_ONLY));
-    assert(loop_test_open(local,local_fs,"/loop0",2)==-KERNEL_EACCES);
+    const unsigned writer_modes[]={2,1};
+    for (unsigned i=0;i<sizeof(writer_modes)/sizeof(writer_modes[0]);i++) {
+        int writer=loop_test_open(local,local_fs,"/loop0",writer_modes[i]);assert(writer>=0);
+        assert(!kernel_files_write(local,&mm,writer,0x200800,1,&result) && result==-KERNEL_EPERM);
+        assert(!kernel_files_pwrite(local,&mm,writer,0x200800,1,0,&result) && result==-KERNEL_EPERM);
+        loop_test_close(local,writer);
+    }
     assert(!kernel_files_pread(local,&mm,loop,0x200800,512,0,&result) && result==512);
     assert(!loop_test_ioctl(local,loop,0x4c01,0));
     assert(loop_test_ioctl(local,loop,0x4c05,0x200400)==-KERNEL_ENXIO);

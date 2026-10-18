@@ -208,7 +208,16 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     value = 1; assert(!kernel_copy_to_user(&mm, 0x200500, &value, 4, &done));
     assert(!kernel_files_ioctl(&local, &mm, 0, 0x125d, 0x200500, &result) && result == 0);
     assert(!kernel_files_write(&local, &mm, 0, 0x200200, 1, &result) && result == -KERNEL_EPERM);
-    assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, 2, 0, &result) && result == -KERNEL_EACCES);
+    const unsigned writer_modes[] = {2, 1};
+    for (unsigned i = 0; i < sizeof(writer_modes) / sizeof(writer_modes[0]); i++) {
+        assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, writer_modes[i], 0, &result));
+        if (result != 2) fprintf(stderr, "read-only block open: mode=%u result=%lld expected=2\n",
+            writer_modes[i], (long long)result);
+        assert(result == 2);
+        assert(!kernel_files_write(&local, &mm, 2, 0x200200, 1, &result) && result == -KERNEL_EPERM);
+        assert(!kernel_files_pwrite(&local, &mm, 2, 0x200200, 1, 0, &result) && result == -KERNEL_EPERM);
+        assert(!kernel_files_close(&local, 2, &result) && !result);
+    }
     value = 0; assert(!kernel_copy_to_user(&mm, 0x200500, &value, 4, &done));
     assert(!kernel_files_ioctl(&local, &mm, 0, 0x125d, 0x200500, &result) && result == 0);
     int mount_owner;

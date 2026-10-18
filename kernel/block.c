@@ -376,7 +376,6 @@ void kernel_block_usage(struct kernel_block_device *device, uint32_t *references
 int kernel_block_open(struct kernel_block_device *device, const void *owner, uint32_t flags)
 {
     if (!device || !owner) return -KERNEL_EINVAL;
-    if ((flags & 3U) && kernel_block_read_only(device)) return -KERNEL_EACCES;
     uintptr_t irq = registry_lock();
     int error = (flags & 0200U) && device->claim_owner ? -KERNEL_EBUSY : 0;
     if (!error) {
