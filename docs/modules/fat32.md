@@ -47,5 +47,18 @@ FAT 按镜像设置维护副本，支持 512～4096 字节扇区及 FAT32 合法
 盘满短写和回滚、删除后的身份回收及时间持久化。正常卸载后的镜像用 `fsck.fat -vn`
 检查；设备故障用例检查错误返回、dirty 标志和仍存活的实际 owner。
 
+`make INIT_CONFIG=config/init.json test-fat32-user-riscv` 在真实用户态检查普通与向量
+I/O、共享偏移、名称／dirfd、打开后删除、共享映射与 private COW、映射尾部截断及只读
+重挂载。LA 可使用已编译的静态 ELF：
+
+```sh
+python3 -B tests/fat32-user.py --arch loongarch --program <ELF> --kernel kernel-la \
+  --qemu <QEMU> --output build/fat32-user-la
+```
+
+内核以 `/init` 为 PID1，LA ELF 的 LOAD 支持 16 KiB 页。runner 创建独立的 ext4 根盘
+及 MBR p2 FAT32 盘，检查完整成功输出、正常 PID1／堆归还，并在卸载后分别运行
+e2fsck 与 fsck.fat。启动使用普通 VirtIO 块设备和串口，程序不依赖随机设备。
+
 介质范围为 FAT32。FAT12/16、exFAT、额外挂载选项、硬链接及符号链接的后续需求维护在
 [开发路线](../goals.md)。官方磁盘布局及工具交付属于兼容分支的启动配置。
