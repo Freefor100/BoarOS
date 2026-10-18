@@ -79,6 +79,8 @@ not-reached、incomplete、timeout、script-failure和completed，另保留监�
 外层已ENTER但装载包装器失败不能误记未到达。原分数与语义判断、owner证据分开。
 自然结束才核对PID1状态和根资源基线；被总预算杀死的启动回收证据为未验证。
 输出目录必须新建且位于build内；错误、中断和参考侧失败不能补记通过。
+无总时限完整诊断的分组得分、LTP 能力与失败归因、lmbench 成本及 3600 秒取舍，见
+[完整评测分析](../learning/oscomp-ltp-analysis.md)；该本地结果与下文官方容器成绩分开。
 
 ```sh
 make prepare-oscomp-inputs  # 显式恢复；普通运行不自动下载
@@ -123,8 +125,9 @@ Linux对照bootstrap为程序建立真实正进程组，因为直接内核init�
 实际判分及重建命令见[集成范围](../learning/oscomp-compat-baseline.md#当前主线集成的验证范围)。brk原ELF把64位返回地址截断为32位；vfat是共同内核缺失能力，
 umount先卡在mount，没有到达卸载。原测例mount/umount还需要真实/dev/vda2分区环境，
 不是添加一个名字即可满足；归因见[basic与运行时差异](../learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
-LTP还可能需要scratch/loop设备、
-账户、工具和真实熵；准备依赖与缺失内核功能分开。原kill判分标签与实际后台PID、
+LTP 的 scratch 准备当前同时缺少独立测试盘环境和用户态块设备 ABI/loop 能力；
+建立设备节点或只设置 `LTP_DEV` 不足以完成原设备流程，具体边界见上述完整评测分析。
+账户、工具和真实熵仍按各自前置条件检查。原kill判分标签与实际后台PID、
 iperf连续脚本在Linux也有的listener重建竞态，以及cyclictest历史零采样，保留各自
 归因边界；历史证据见[程序清单](../learning/user-program-inventory.md)与
 [预算记录](../learning/data-path-budget-experiments.md)。本阶段不要求清空所有有效
