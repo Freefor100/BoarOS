@@ -686,9 +686,12 @@ ext4_extent_block_csum_set(struct ext4_inode_ref *inode_ref __unused,
 static int ext4_ext_dirty(struct ext4_inode_ref *inode_ref,
 			  struct ext4_extent_path *path)
 {
-	if (path->block.lb_id)
+	if (path->block.lb_id) {
+		/* 校验和由本次修改更新；BC_DIRTY 还包含旧日志版本，
+		 * 只读路径归还引用时据此重算会重复改写未变的数据。 */
+		ext4_extent_block_csum_set(inode_ref, path->header);
 		return ext4_trans_set_block_dirty(path->block.buf);
-	else
+	} else
 		inode_ref->dirty = true;
 
 	return EOK;
@@ -708,10 +711,6 @@ static void ext4_ext_drop_refs(struct ext4_inode_ref *inode_ref,
 
 	for (i = 0; i <= depth; i++, path++) {
 		if (path->block.lb_id) {
-			if (ext4_bcache_test_flag(path->block.buf, BC_DIRTY))
-				ext4_extent_block_csum_set(inode_ref,
-							   path->header);
-
 			ext4_block_set(inode_ref->fs->bdev, &path->block);
 		}
 	}
@@ -1069,6 +1068,9 @@ static int ext4_ext_split_node(struct ext4_inode_ref *inode_ref,
 						  newblock);
 		if (ret != EOK)
 			goto cleanup;
+		/* cleanup 从此由 npath 归还引用和分配，局部变量不再重复释放。 */
+		npath[npath_at].block = bh;
+		newblock = 0;
 
 		if (i == depth) {
 			/* start copy from next extent */
@@ -1100,9 +1102,6 @@ static int ext4_ext_split_node(struct ext4_inode_ref *inode_ref,
 			npath[npath_at].maxdepth = 0;
 			npath[npath_at].index = NULL;
 			npath[npath_at].header = neh;
-			npath[npath_at].block = bh;
-
-			ext4_trans_set_block_dirty(bh.buf);
 		} else {
 			int m = EXT_MAX_INDEX(path[i].header) - path[i].index;
 			struct ext4_extent_header *neh;
@@ -1132,12 +1131,10 @@ static int ext4_ext_split_node(struct ext4_inode_ref *inode_ref,
 			npath[npath_at].extent = NULL;
 			npath[npath_at].index = ix;
 			npath[npath_at].header = neh;
-			npath[npath_at].block = bh;
-
-			ext4_trans_set_block_dirty(bh.buf);
 		}
+		ret = ext4_ext_dirty(inode_ref, npath + npath_at);
+		if (ret != EOK) goto cleanup;
 	}
-	newblock = 0;
 
 	/*
 	 * If newext->first_block can be included into the
@@ -1915,7 +1912,7 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 					path[i - 1].index++;
 			}
 
-			/* 内部索引也已修改；释放前更新校验和，后续查找才可验证同一版本。 */
+			/* 索引修改已更新校验和，降层前按旧路径归还引用。 */
 			if (i)
 				ext4_ext_drop_refs(inode_ref, path + i, true);
 

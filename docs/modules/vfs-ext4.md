@@ -80,6 +80,12 @@ Castagnoli参考覆盖CRC32C的种子、对齐、分段与守卫页边界，并�
 验证真实用户程序、持久数据、正常退出和e2fsck，保留普通错误fixture的原格式。
 来源及反例见时间戳学习记录。
 
+extent 树在读取节点时校验当前字节；实际修改通过 `ext4_ext_dirty()` 同步更新
+该节点的 checksum，新建分裂节点使用同一入口。路径释放只归还引用：缓冲的
+`BC_DIRTY` 表示仍待日志／落盘，不能据此给一次只读查询重复重写 checksum。
+`sh tests/lwext4-metadata-host.sh extent-lookup` 检查脏节点的只读查找成本、
+缓存字节损坏仍返回 EUCLEAN，以及恢复后的映射、资源与磁盘一致性。
+
 `kernel_vfs_file_set_mode()` 通过持有的 inode handle 事务修改低 12 个权限位，
 保留类型和其余位并更新 ctime；路径入口复用同一 handle。后端
 `ext4_file_set_mode()` 不用 pathname，因此 fd 已 unlink 时仍可修改原 inode，
