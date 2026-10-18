@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|truncate|pressure|fallocate) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure|fallocate]' >&2; exit 2;; esac
+case "${1:-all}" in all|truncate|pressure|pressure-errors|fallocate) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure|pressure-errors|fallocate]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -24,20 +24,22 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
         if [ "${1:-all}" = fallocate ]; then
-            for journal in journal nonjournal; do
+            for journal in ${FALLOCATE_HOST_JOURNALS:-journal nonjournal}; do
                 image="$build_dir/fallocate-$shift-$block-$journal.img"
                 truncate -s 32M "$image"
                 features=has_journal
                 [ "$journal" = journal ] || features=^has_journal
                 mkfs.ext4 -q -F -b "$block" -O "$features" "$image"
-                timeout 30s "$build_dir/concurrency-$shift" "$image" fallocate
+                timeout 30s "$build_dir/concurrency-$shift" "$image" "${FALLOCATE_HOST_CASE:-fallocate}"
                 e2fsck -fn "$image" > "$build_dir/fsck-fallocate-$shift-$block-$journal.log" 2>&1
                 printf 'PASS fallocate page_shift=%s fs_block=%s %s; e2fsck clean\n' "$shift" "$block" "$journal"
             done
             continue
         fi
-        if [ "${1:-all}" = pressure ]; then
-            for scenario in write-pressure write-pressure-full write-pressure-eio write-pressure-oom; do
+        if [ "${1:-all}" = pressure ] || [ "${1:-all}" = pressure-errors ]; then
+            scenarios='write-pressure-other-eio write-pressure-other-enospc'
+            if [ "${1:-all}" = pressure ]; then scenarios="write-pressure write-pressure-full write-pressure-eio write-pressure-oom $scenarios"; fi
+            for scenario in $scenarios; do
                 image="$build_dir/$scenario-$shift-$block.img"
                 truncate -s 32M "$image"
                 mkfs.ext4 -q -F -b "$block" "$image"

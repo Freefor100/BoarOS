@@ -321,7 +321,7 @@ int __wrap_ext4_fpwrite_batch(ext4_file *file,struct file_write_span *spans,unsi
             assert(!result && prefix.written==prefix.size);
             spans[0].written=prefix.written;
         }
-        return fault==2?0:KERNEL_EIO;
+        return fault==2?0:fault==3?KERNEL_ENOSPC:KERNEL_EIO;
     }
     return __real_ext4_fpwrite_batch(file,spans,count);
 }
@@ -2609,6 +2609,61 @@ static void truncate_writeback_publication(struct kernel_page_cache *cache, cons
     puts("PASS truncate publication: zero/partial shrink and partial EIO exclude queued old writeback, preserve prefix/zero regrowth and return owners");
 }
 
+struct pressure_isolation {
+    struct kernel_vfs_file *failed,*healthy;
+    int injected,error;
+    size_t written;
+};
+static void pressure_isolation_write(void *argument)
+{
+    struct pressure_isolation *test=argument;
+    unsigned char *bytes=malloc(1024*1024);assert(bytes);memset(bytes,0x45,1024*1024);
+    size_t done;
+    assert(!kernel_vfs_pwrite(test->failed,0,bytes,1024*1024,&done) && done==1024*1024);
+    free(bytes);
+    struct physical_page_allocator *pages=current_cache->allocator;
+    uint64_t *held=calloc(physical_page_total(pages),sizeof(*held));assert(held);
+    size_t count=0;uint64_t reserve=physical_page_total(pages)/100;
+    while (physical_page_available(pages)>reserve) {
+        if (physical_page_allocate(pages,&held[count])) break;
+        count++;
+    }
+    write_error=test->injected;
+    test->error=kernel_vfs_pwrite(test->healthy,0,"new!",4,&test->written);
+    for (size_t i=0;i<count;i++) assert(!physical_page_release(pages,held[i]));
+    free(held);
+}
+static void pressure_error_isolation(struct kernel_page_cache *cache,const char *path,int injected)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);
+    struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    assert(!kernel_vfs_start_journal_worker(&mount));
+    struct kernel_vfs_file failed={0},healthy={0};size_t done;uint64_t observed=0;
+    assert(!kernel_vfs_create(&mount,"/failed",0600,&failed));
+    assert(!kernel_vfs_create(&mount,"/healthy",0600,&healthy));
+    assert(!kernel_vfs_pwrite(&healthy,0,"old!",4,&done) && done==4 && !kernel_vfs_sync(&healthy,0,&observed));
+    current_cache=cache;assert(!kernel_page_cache_start_worker(cache));
+    struct pressure_isolation test={.failed=&failed,.healthy=&healthy,.injected=injected};
+    assert(!kernel_page_cache_run_cpu0(cache,pressure_isolation_write,&test));
+    fprintf(stderr,"pressure unrelated writeback error=%d healthy error=%d written=%zu\n",
+        injected==3?-KERNEL_ENOSPC:-KERNEL_EIO,test.error,test.written);
+    assert(!test.error && test.written==4 && !write_error);
+    assert(!kernel_vfs_error_sequence(&healthy) && kernel_vfs_error_sequence(&failed));
+    assert(!kernel_vfs_sync(&healthy,0,&observed));
+    char actual[4];assert(!kernel_vfs_pread(&healthy,0,actual,4,&done) && done==4 && !memcmp(actual,"new!",4));
+    observed=0;
+    assert(kernel_vfs_sync(&failed,0,&observed)==(injected==3?-KERNEL_ENOSPC:-KERNEL_EIO));
+    assert(!kernel_vfs_sync(&failed,0,&observed));
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_vfs_close(&failed) && !kernel_vfs_close(&healthy) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS write pressure error ownership: failed inode retains ENOSPC/EIO, independent overwrite and sync succeed, exact observers and all owners return");
+}
+
 struct pressure_write {
     struct kernel_vfs_file *file;
     unsigned char *bytes;
@@ -2641,6 +2696,7 @@ static void write_pressure_case(struct kernel_page_cache *cache,const char *path
         .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0};
     assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    assert(!kernel_vfs_start_journal_worker(&mount));
     struct kernel_vfs_file file={0};
     assert(!kernel_vfs_create(&mount,"/pressure",0600,&file));
     current_cache=cache;
@@ -2720,6 +2776,10 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"write-pressure-other-eio") || !strcmp(argv[2],"write-pressure-other-enospc")) {
+            pressure_error_isolation(&cache,argv[1],!strcmp(argv[2],"write-pressure-other-enospc")?3:1);
+            goto owners;
+        }
         if (!strncmp(argv[2],"write-pressure",14)) {
             int mode=!strcmp(argv[2],"write-pressure-full")?1:
                 !strcmp(argv[2],"write-pressure-eio")?2:!strcmp(argv[2],"write-pressure-oom")?3:0;

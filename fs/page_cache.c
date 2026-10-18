@@ -2041,7 +2041,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
 }
 
 static void resize_apply(struct kernel_page_cache_resize *,uint64_t);
-static int write_admission(struct kernel_page_cache *cache);
+static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node);
 /* 已发布entry的借用覆盖其数据页，不再另加物理引用；完整冷覆盖只准备私有候选，
  * 用户来源缺页结束后才发布，避免把未初始化数据交给读取者或等待自身加载。 */
 static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cache *cache,
@@ -2091,7 +2091,7 @@ static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs
     size_t window=0;
     while (*written<size) {
         if (!window) {
-            int error=write_admission(cache);
+            int error=write_admission(cache,node);
             if (error) return error;
             window=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
         }
@@ -2475,6 +2475,7 @@ static int writeback_run(struct kernel_page_cache *cache,
 
 struct write_admission_request {
     struct kernel_page_cache *cache;
+    struct kernel_vfs_node *node;
     int result;
 };
 static void write_admission_window(void *argument)
@@ -2482,15 +2483,10 @@ static void write_admission_window(void *argument)
     struct write_admission_request *request=argument;
     struct kernel_page_cache *cache=request->cache;
     struct kernel_page_cache_record *r=cache->record;
-    /* executor在处理本次请求，后台工作不可能同时借用它的workspace。
-     * 其他CPU0调用者使用独立前景workspace，不能跨睡眠复用worker缓冲。 */
-    int executor=kernel_page_cache_is_executor(cache);
-    union foreground_workspace *lease=executor?NULL:foreground_workspace_take(cache);
-    if (!executor && !lease) { request->result=-KERNEL_ENOMEM; return; }
-    struct writeback_workspace foreground=lease?(struct writeback_workspace){
-        .prepared=lease->writeback.prepared,.spans=lease->writeback.spans,
-        .selected=lease->writeback.selected}:(struct writeback_workspace){0};
-    struct writeback_workspace *workspace=executor?r->writeback_workspace:&foreground;
+    /* 有界接纳工作统一由本cache执行者推进，独占其挂载期预留工作区；
+     * 内存紧张时不再为了释放脏页而额外分配一份前景控制区。 */
+    if (!kernel_page_cache_is_executor(cache)) __builtin_trap();
+    struct writeback_workspace *workspace=r->writeback_workspace;
     struct kernel_page_cache_entry *selected[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
     size_t count=0;
     {
@@ -2506,13 +2502,22 @@ static void write_admission_window(void *argument)
     }
     if (count) {
         size_t used;
-        request->result=writeback_run(cache,selected,count,UINT64_MAX,&used,workspace);
+        int error=writeback_run(cache,selected,count,UINT64_MAX,&used,workspace);
+        /* 写回已把错误记在实际inode；不能把A的空间/I/O错误归给B的覆盖写。
+         * 失败队首仍保留脏owner，但移到队尾，让后面的可回收数据取得进展。 */
+        if (selected[0]->node==request->node && error!=-KERNEL_EBUSY && error!=-KERNEL_ENOMEM)
+            request->result=error;
         CACHE_SCOPE(guard,cache);
+        struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(selected[0]->node);
+        if (error && dirty==r->dirty_head && dirty->queue_next) {
+            r->dirty_head=dirty->queue_next;r->dirty_head->queue_previous=NULL;
+            dirty->queue_previous=r->dirty_tail;dirty->queue_next=NULL;
+            r->dirty_tail->queue_next=dirty;r->dirty_tail=dirty;
+        }
         for (size_t i=0;i<count;i++) entry_return(selected[i]);
     }
-    if (lease) foreground_workspace_put(cache,lease);
 }
-static int write_admission(struct kernel_page_cache *cache)
+static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
 {
     struct kernel_page_cache_record *r=cache->record;
     if (!r->started || r->stopping) return 0;
@@ -2527,10 +2532,10 @@ static int write_admission(struct kernel_page_cache *cache)
     for (struct kernel_lock_guard *guard=io->locks;guard;guard=guard->previous)
         if (guard->lock->rank>15) return 0;
     if (available<r->high) (void)kernel_page_cache_reclaim(cache,r->high-available);
-    struct write_admission_request request={.cache=cache};
+    struct write_admission_request request={.cache=cache,.node=node};
     /* 这里只借用缓存owner与调用栈；worker不取得调用者的OFD/写操作锁。
      * 保留整次write互斥，仍允许独立worker取得inode后推进一批写回。 */
-    if (kernel_page_cache_needs_cpu0(cache)) {
+    if (!kernel_page_cache_is_executor(cache)) {
         if (run_request(cache,write_admission_window,&request,1,NULL)) return -KERNEL_EIO;
     } else write_admission_window(&request);
     available=physical_page_available(cache->allocator);
