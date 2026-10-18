@@ -186,7 +186,7 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 
 截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`；legacy block-map inode 取指针树容量、`EXT_MAX_BLOCKS` 个可安全计数的逻辑块和 inode `i_blocks` 容量（包含间接块开销）的最小值，再乘以 `block_size`。因此 legacy 最后可用逻辑块也是 `0xfffffffe`：即使 8 KiB 三级间接树容量超过 2^32，也不会让 `ext4_lblk_t` 在 2^45 字节处回绕到块 0。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size。
 
-新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。对预置 unwritten extent 的初始化和 caller 部分写使用同一个 block-cache buffer，避免延迟的 zero buffer 在 direct I/O 之后覆盖用户数据；读取 mapped block 前先排空该物理块的 dirty cache，flush 失败则返回错误而不从旧磁盘内容读取。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
+新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。unwritten extent 的初始化和 caller 写入版本规则见[文件空间预留与打洞](#文件空间预留与打洞)。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
 
 extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/lwext4-metadata-host.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
 
@@ -522,7 +522,11 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 扇区数和空闲计数；读取这些块合成零，首次写入在同一事务内分割、转换相应范围。
 只有逻辑、物理相邻且初始化状态一致的 extent 才能合并。unwritten 转换的零数据使用
 ordered data 版本，允许调用者随后在同一事务内用稳定写入版本替换；不能把这些文件
-数据块登记为 journal 元数据。完整打洞块释放映射，两个部分块仅清零请求内的字节，
+数据块登记为 journal 元数据。磁盘满而 extent 分割需要新的索引块时，转换改为初始化
+当前 unwritten extent：用一个文件系统块的缓冲逐块清零并 flush，再发布初始化状态，
+请求内的新数据仍使用原 ordered data 版本。这样写入已预留块不再额外消耗磁盘空间，
+也不需要为整个 extent 保留零数据镜像；I/O 失败保留 unwritten 状态并返回实际错误。
+完整打洞块释放映射，两个部分块仅清零请求内的字节，
 不为洞或 unwritten 边界分配或初始化块。未实现该能力的后端与其他模式返回
 `EOPNOTSUPP`，超出 maxbytes 返回 `EFBIG`。
 
@@ -534,11 +538,20 @@ ordered data 版本，允许调用者随后在同一事务内用稳定写入版�
 结果更新缓存，错误不改成成功。相同 EOF 的截断也回收 EOF 外预留；orphan 索引的
 运行时截断意图参加事务 undo，区分真正待回收的缩短映射与仍打开的无链接文件。
 后者保留合法预留，最后 owner 释放时才完整回收；重启恢复仍按持久 EOF 检查。
+即时提交和组提交的 journal 都保留释放块的 quarantine，直到 abort 或 checkpoint
+归还；即时提交路径的新操作在低空间时先完成旧 checkpoint。外层事务仍拥有的旧块
+不能提前分给新的 unwritten 范围，否则直接清零会破坏回滚后的原内容。
 此操作不承诺无日志文件系统的断电原子性。
 
 `sh tests/fallocate-host.sh` 使用 1/4 KiB ext4 块与 4/16 KiB 页检查预留及空闲计数、
 混合 extent、部分块、缓存重读、真实共享 mmap/私有 COW、握手控制的活动写回、范围
 中途失败回滚、无 journal 的部分失败和所有者归还；每个镜像卸载后运行 `e2fsck -fn`。
+同一入口的 `FALLOCATE_HOST_CASE=reserved-full` 检查磁盘满时的已预留写入；
+`reserved-middle` 检查分割到一半后的空间失败，`reserved-large` 用 512 KiB 组预算
+转换 8 MiB 的 unwritten extent，`reserved-zero-error` 检查清零 I/O 失败和重试，
+`reserved-abort-reuse` 检查外层事务的原内容归还。`reserved-large` 和
+`reserved-abort-reuse` 需设置 `FALLOCATE_HOST_JOURNALS=journal`；除 large 外的磁盘满
+场景可用 `FALLOCATE_HOST_IMAGE_SIZE=8M` 限定填盘和清理工作量，large 保留默认 32 MiB。
 
 ## 单 hart 可睡眠存储契约
 

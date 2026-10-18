@@ -901,6 +901,12 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
 	uintptr_t owner = mp->os_locks && mp->os_locks->owner ? mp->os_locks->owner(mp->os_locks->context) : 0;
 	if (mp->transaction_depth && mp->transaction_owner != owner) __builtin_trap();
 	if (mp->transaction_depth == 0) {
+        /* 即时提交仍可能保留旧 checkpoint。低空间时先归还其块，不能
+         * 在新操作或外层原子事务内复用尚由旧版本持有的分配。 */
+        if (!journal->grouped && ext4_space_waits_checkpoint(mp)) {
+            int r = jbd_journal_purge_cp_trans(journal, true, false);
+            if (r != EOK) return r;
+        }
 		while (journal->grouped) {
 			int r = EOK;
 			if (ext4_group_due(mp, false)) {

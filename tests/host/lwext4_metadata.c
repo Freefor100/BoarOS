@@ -2138,6 +2138,11 @@ static void extent_middle_oom(struct ext4_fs *fs)
 }
 static void extent_range(struct ext4_blockdev *dev)
 {
+    /* This case measures a contiguous fresh run; prior independent cases may
+     * still own freed ranges through checkpoint, including immediate journals. */
+    CHECK(ext4_cache_flush("/")==EOK);
+    if (dev->fs->jbd_journal)
+        CHECK(jbd_journal_purge_cp_trans(dev->fs->jbd_journal,true,false)==EOK);
     ext4_file f; CHECK(ext4_fopen(&f,"/range","w+")==EOK);
     CHECK(ext4_transaction_begin("/")==EOK);
     struct ext4_inode_ref ref;
@@ -2386,6 +2391,10 @@ static void fragmented_range(struct ext4_blockdev *dev)
     for(unsigned i=3;i;i--)CHECK(ext4_fs_release_inode_dblk_idx(&ref,i-1,first+i-1)==EOK);
     ext4_inode_set_size(ref.inode,4*dev->lg_bsize);ref.dirty=true;
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
+    /* The freed gaps become allocator input only after their old owners have
+     * checkpointed; allocation in the next transaction must not reuse undo. */
+    if (dev->fs->jbd_journal)
+        CHECK(jbd_journal_purge_cp_trans(dev->fs->jbd_journal,true,false)==EOK);
     CHECK(ext4_transaction_begin("/")==EOK && ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
     uint64_t free_before=ext4_sb_get_free_blocks_cnt(&dev->fs->sb);
     ext4_fsblk_t block;uint32_t count;

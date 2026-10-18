@@ -6,7 +6,16 @@
 #include <ext4_super.h>
 #include <ext4_inode.h>
 #include <kernel/tmpfs.h>
-static unsigned fail_reserve, fail_remove;
+static unsigned fail_reserve, fail_remove, failed_direct_calls;
+static ext4_fsblk_t fail_direct_block;
+int __real_ext4_blocks_set_direct(struct ext4_blockdev *,const void *,uint64_t,uint32_t);
+int __wrap_ext4_blocks_set_direct(struct ext4_blockdev *dev,const void *bytes,uint64_t block,uint32_t count)
+{
+    if (fail_direct_block && block<=fail_direct_block && fail_direct_block-block<count) {
+        fail_direct_block=0; failed_direct_calls++; return EIO;
+    }
+    return __real_ext4_blocks_set_direct(dev,bytes,block,count);
+}
 int __real_ext4_extent_reserve_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,struct ext4_inode_block_range *);
 int __wrap_ext4_extent_reserve_range(struct ext4_inode_ref *ref,ext4_lblk_t first,uint32_t count,struct ext4_inode_block_range *range)
 {
@@ -201,6 +210,105 @@ static void nonjournal_failure(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_close(&file));
     puts("PASS nonjournal partial failure: ENOSPC retains actual reservation prefix; same-size truncate returns its blocks");
 }
+static void fill_free_space(struct kernel_vfs_mount *mount,struct kernel_vfs_file *filler,
+    struct kernel_vfs_file *last,size_t block)
+{
+    struct kernel_vfs_statfs stat; assert(!kernel_vfs_mount_statfs(mount,&stat));
+    uint64_t offset=0,step=stat.free_blocks;
+    while (step) {
+        int result=kernel_vfs_fallocate(filler,1,offset,step*block);
+        if (result==-KERNEL_ENOSPC) { step/=2; continue; }
+        assert(!result); offset+=step*block;
+        assert(!kernel_vfs_mount_statfs(mount,&stat)); step=stat.free_blocks;
+    }
+    assert(!kernel_vfs_mount_statfs(mount,&stat));
+    if (stat.free_blocks) assert(stat.free_blocks==1 && !kernel_vfs_fallocate(last,1,0,block));
+    assert(!kernel_vfs_mount_statfs(mount,&stat) && !stat.free_blocks);
+}
+static void reserved_write_full(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,
+    unsigned count,int middle,int grouped,int fail_zero)
+{
+    struct kernel_vfs_file victim={0},filler={0},last={0};
+    assert(!create_file(mount,"/reserved-full",0600,&victim));
+    assert(!create_file(mount,"/filler",0600,&filler) && !create_file(mount,"/last-block",0600,&last));
+    size_t block=kernel_vfs_file_node(&victim)->instance->writeback_block_size,done;
+    unsigned second=middle?count-1:2;
+    assert(!kernel_vfs_fallocate(&victim,0,0,count*block));
+    uint64_t observed=0;
+    unsigned char value=0x45;
+    assert(!kernel_vfs_pwrite(&victim,0,&value,1,&done) && done==1 && !kernel_vfs_sync(&victim,0,&observed));
+    value=0x67;
+    assert(!kernel_vfs_pwrite(&victim,second*block,&value,1,&done) && done==1 && !kernel_vfs_sync(&victim,0,&observed));
+    assert(!mapped(&victim,0).unwritten && mapped(&victim,1).unwritten && !mapped(&victim,second).unwritten);
+    if (!middle) assert(mapped(&victim,3).unwritten);
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    unsigned char *poison=malloc(block); assert(poison); memset(poison,0xc3,block);
+    for (unsigned logical=1;logical<count;logical++) {
+        struct ext4_inode_block_range range=mapped(&victim,logical);
+        if (range.unwritten) assert(!ext4_blocks_set_direct(&adapter->device,poison,range.block,1));
+    }
+    free(poison);
+    fill_free_space(mount,&filler,&last,block);
+    if (grouped) assert(adapter->device.fs->jbd_journal && !kernel_vfs_start_journal_worker(mount));
+    uint64_t blocks=allocated(&victim);
+    if (fail_zero) fail_direct_block=mapped(&victim,3).block+1;
+    value=0x89;
+    assert(!kernel_vfs_pwrite(&victim,4*block,&value,1,&done) && done==1);
+    int synced=kernel_vfs_sync(&victim,0,&observed);
+    fprintf(stderr,"reserved write at full disk: sync=%d block=%zu allocated=%llu\n",synced,block,(unsigned long long)blocks);
+    if (fail_zero) {
+        assert(synced==-KERNEL_EIO && failed_direct_calls==1 && !fail_direct_block);
+        assert(mapped(&victim,4).unwritten && allocated(&victim)==blocks);
+        unsigned char *old=calloc(count,block),*actual=malloc(count*block); assert(old && actual);
+        old[0]=0x45; old[second*block]=0x67;
+        assert(!ext4_fpread(lwext4_node_file(kernel_vfs_file_node(&victim)),0,actual,count*block,&done) &&
+            done==count*block && !memcmp(actual,old,count*block));
+        free(old); free(actual);
+        synced=kernel_vfs_sync(&victim,0,&observed);
+    }
+    assert(!synced && allocated(&victim)==blocks);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&victim)));
+    unsigned char *expected=calloc(count,block); assert(expected);
+    expected[0]=0x45; expected[second*block]=0x67; expected[4*block]=0x89;
+    expect_bytes(&victim,expected,count*block); free(expected);
+    assert(!kernel_vfs_ftruncate(&filler,0) && !kernel_vfs_ftruncate(&last,0));
+    assert(!kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&victim));
+    puts("PASS reserved full disk: conversion needs no new space; initialized neighbors and zero unwritten bytes persist");
+}
+static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    assert(adapter->device.fs->jbd_journal && !adapter->device.fs->jbd_journal->grouped);
+    struct kernel_vfs_file victim={0},filler={0},last={0};
+    assert(!create_file(mount,"/abort-reuse",0600,&victim));
+    assert(!create_file(mount,"/filler",0600,&filler) && !create_file(mount,"/last-block",0600,&last));
+    size_t block=adapter->device.lg_bsize,length=16*block,done;
+    unsigned char *expected=malloc(length); assert(expected); memset(expected,0x5e,length);
+    assert(!kernel_vfs_pwrite(&victim,0,expected,length,&done) && done==length);
+    uint64_t observed=0; assert(!kernel_vfs_sync(&victim,0,&observed));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&victim)));
+    fill_free_space(mount,&filler,&last,block);
+    ext4_file *file=lwext4_node_file(kernel_vfs_file_node(&victim));
+    KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(kernel_vfs_file_node(&victim),&io,1);
+    assert(!ext4_transaction_begin(adapter->mount_point) && !ext4_ftruncate(file,0));
+    bool changed;
+    int reserved=ext4_fallocate(file,0,0,length,&changed);
+    fprintf(stderr,"private free/reuse reservation=%d\n",reserved);
+    assert(!reserved || reserved==ENOSPC);
+    if (!reserved) {
+        unsigned char value=0x45;
+        assert(!ext4_fpwrite(file,0,&value,1,&done) && done==1);
+        assert(!ext4_fpwrite(file,2*block,&value,1,&done) && done==1);
+        assert(!ext4_fpwrite(file,4*block,&value,1,&done) && done==1);
+    }
+    assert(ext4_transaction_abort(adapter->mount_point,ECANCELED)==(reserved?reserved:ECANCELED));
+    kernel_lock_release(&io);
+    assert(!kernel_vfs_close(&victim) && !kernel_vfs_open(mount,"/abort-reuse",&victim));
+    expect_bytes(&victim,expected,length); free(expected);
+    assert(!kernel_vfs_ftruncate(&filler,0) && !kernel_vfs_ftruncate(&last,0));
+    assert(!kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&victim));
+    puts("PASS private free/reuse abort: retained allocation owners protect original initialized contents");
+}
 static unsigned punch_started,punch_completed;
 static struct kernel_vfs_file *punch_file;
 static size_t punch_block;
@@ -295,6 +403,16 @@ int main(int argc,char **argv)
     struct kernel_block_device device={.read=image_read,.write=image_write,.flush=image_flush,
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,&backend_heap,&cache,0));
+    if (!strcmp(argv[2],"reserved-abort-reuse")) {
+        reserved_abort_reuse(&cache,&mount);
+        goto mounted_done;
+    }
+    if (!strncmp(argv[2],"reserved-",9)) {
+        int large=!strcmp(argv[2],"reserved-large");
+        reserved_write_full(&cache,&mount,large?2048:16,!strcmp(argv[2],"reserved-middle"),
+            large,!strcmp(argv[2],"reserved-zero-error"));
+        goto mounted_done;
+    }
     basic_ranges(&cache,&mount); pending_truncate(&mount);
     if (lwext4_instance(mount.private_data)->device.fs->jbd_journal) rollback_ranges(&mount);
     else nonjournal_failure(&mount);
@@ -302,6 +420,7 @@ int main(int argc,char **argv)
 #ifdef CACHE_MM_CASES
     mmap_ranges(&cache,&heap,&pages,&mount);
 #endif
+mounted_done:
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache) && !close(image_fd));
     struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file unsupported={0};
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));

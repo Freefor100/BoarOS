@@ -24,6 +24,7 @@
 #include <ext4_crc32.h>
 #include <ext4_balloc.h>
 #include <ext4_extent.h>
+#include <ext4_journal.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -2093,6 +2094,40 @@ static int ext4_ext_zero_unwritten_range(struct ext4_inode_ref *inode_ref,
 	return err;
 }
 
+/* Allocation is already owned by this unwritten extent. If splitting needs
+ * unavailable metadata space, persist zeros before publishing the whole extent
+ * as initialized. Direct writes use one block of scratch instead of retaining
+ * a potentially 128 MiB zero version in the journal operation. An abort still
+ * exposes only the original unwritten zeros; initialized neighbors are untouched. */
+static int ext4_ext_initialize_unsplit(struct ext4_inode_ref *inode_ref,
+    struct ext4_extent_path **path, ext4_lblk_t iblock, uint32_t blocks)
+{
+    struct ext4_fs *fs = inode_ref->fs;
+    if (fs->jbd_journal && fs->jbd_journal->error) return fs->jbd_journal->error;
+    if (fs->curr_trans && fs->curr_trans->error) return fs->curr_trans->error;
+    int r = ext4_find_extent(inode_ref, iblock, path, 0);
+    if (r != EOK) return r;
+    unsigned depth = ext_depth(inode_ref->inode);
+    struct ext4_extent *ex = (*path)[depth].extent;
+    if (!ex || !ext4_ext_is_unwritten(ex)) return EIO;
+    ext4_lblk_t first = to_le32(ex->first_block);
+    uint32_t count = ext4_ext_get_actual_len(ex);
+    if (iblock < first || iblock - first >= count || blocks > count - (iblock - first)) return EIO;
+    uint32_t block_size = fs->bdev->lg_bsize;
+    void *zeros = ext4_calloc(1, block_size);
+    if (!zeros) return ENOMEM;
+    ext4_fsblk_t physical = ext4_ext_pblock(ex);
+    for (uint32_t i = 0; i < count; i++) {
+        r = ext4_blocks_set_direct(fs->bdev, zeros, physical + i, 1);
+        if (r != EOK) break;
+    }
+    ext4_free(zeros);
+    if (r == EOK) r = ext4_blockdev_flush(fs->bdev);
+    if (r != EOK) return r;
+    ext4_ext_mark_initialized(ex);
+    return ext4_ext_dirty(inode_ref, *path + depth);
+}
+
 __unused static void print_path(struct ext4_extent_path *path)
 {
 	int32_t i = path->depth;
@@ -2185,6 +2220,8 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 
 			err = ext4_ext_convert_to_initialized(
 			    inode_ref, &path, iblock, zero_range);
+            if (err == ENOSPC)
+                err = ext4_ext_initialize_unsplit(inode_ref, &path, iblock, zero_range);
 			if (err != EOK)
 				goto out2;
 

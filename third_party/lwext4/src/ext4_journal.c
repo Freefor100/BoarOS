@@ -3494,7 +3494,9 @@ int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
     uint32_t count, bool inode)
 {
     struct jbd_journal *journal = fs->jbd_journal;
-    if (!journal || !journal->grouped || !count) return EOK;
+    if (!journal || !count) return EOK;
+    /* 即时提交同样持有私有 undo 和尚未结束的 checkpoint；这些块不能
+     * 在原操作 abort 或旧版本回写之前进入新所有者的 unwritten 映射。 */
     if (!fs->curr_trans || count > UINT64_MAX - first) return EINVAL;
     struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
     struct jbd_quarantine key = {.first = first};
@@ -3521,7 +3523,7 @@ bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address,
 {
     if (next) *next = UINT64_MAX;
     struct jbd_journal *journal = fs->jbd_journal;
-    if (!journal || !journal->grouped) return false;
+    if (!journal) return false;
     struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
     struct jbd_quarantine key = {.first = address};
     struct jbd_quarantine *after = RB_NFIND(jbd_quarantine_tree, index, &key);

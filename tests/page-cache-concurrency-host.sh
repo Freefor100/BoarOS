@@ -26,7 +26,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         if [ "${1:-all}" = fallocate ]; then
             for journal in ${FALLOCATE_HOST_JOURNALS:-journal nonjournal}; do
                 image="$build_dir/fallocate-$shift-$block-$journal.img"
-                truncate -s 32M "$image"
+                truncate -s "${FALLOCATE_HOST_IMAGE_SIZE:-32M}" "$image"
                 features=has_journal
                 [ "$journal" = journal ] || features=^has_journal
                 mkfs.ext4 -q -F -b "$block" -O "$features" "$image"
