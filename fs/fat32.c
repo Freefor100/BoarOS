@@ -16,7 +16,7 @@ struct fat_inode {
     uint64_t id, entry, parent, first_slot;
     uint32_t first, tail, clusters, size, mode, handles;
     uint32_t cursor, cursor_index;
-    uint8_t slots, linked, measured;
+    uint8_t slots, linked, measured, times_dirty;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct fat_inode *retired_next;
 };
@@ -492,14 +492,16 @@ static void entry_times(uint8_t raw[32], struct fat_inode *i)
 }
 static int store_inode(struct fat_mount *m, struct fat_inode *i)
 {
-    if (!i->linked || i->id == 1) return 0;
+    if (!i->linked || i->id == 1) { i->times_dirty = 0; return 0; }
     uint8_t raw[32]; int r = bytes(m, i->entry, raw, 32, 0); if (r) return r;
     if (!raw[0] || raw[0] == 0xe5 || raw[11] == 15) return fail(m, -KERNEL_EUCLEAN);
     put16(raw + 20, i->first >> 16); put16(raw + 26, i->first);
     put32(raw + 28, (i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ? 0 : i->size);
     raw[11] = (raw[11] & ~1U) | ((i->mode & 0222) ? 0 : 1);
     entry_times(raw, i);
-    return bytes(m, i->entry, raw, 32, 1);
+    r = bytes(m, i->entry, raw, 32, 1);
+    if (!r) i->times_dirty = 0;
+    return r;
 }
 static int free_slots(struct fat_mount *m, struct fat_inode *dir, unsigned count, uint64_t *first, int *past_end)
 {
@@ -966,7 +968,12 @@ static int truncate_inode(struct kernel_vfs_node *node, uint64_t size, uint64_t 
 static struct kernel_block_device *block_device(struct kernel_vfs_instance *instance)
 { return fm(instance)->block; }
 static int writeback_allowed(struct kernel_vfs_instance *instance)
-{ return !fat_error(instance); }
+{
+    (void)instance;
+    /* A latched media error is a writeback result, not temporary lock
+     * contention. Let the backend report that errno to the sync caller. */
+    return 1;
+}
 static int stat_inode(const struct kernel_vfs_file *file, struct kernel_vfs_stat *stat)
 {
     struct kernel_vfs_node *node = file->private_data;
@@ -990,8 +997,20 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *stat
         .fsid = mount->id, .name_length = 255, .flags = m->instance.read_only ? 1 : 0};
     return fat_error(&m->instance);
 }
+static int time_not_after(struct kernel_vfs_timespec a, struct kernel_vfs_timespec b)
+{ return a.seconds < b.seconds || (a.seconds == b.seconds && a.nanoseconds <= b.nanoseconds); }
 static void accessed(struct kernel_vfs_file *file)
-{ (void)file; } /* Reads do not manufacture persistent timestamp I/O. */
+{
+    struct kernel_vfs_node *node = file->private_data;
+    if (node->instance->read_only) return;
+    struct fat_mount *m = fm(node->instance);
+    KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
+    struct fat_inode *i = fi(node); struct kernel_vfs_timespec time = now();
+    if (time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
+        (time.seconds >= i->atime.seconds && (uint64_t)time.seconds - i->atime.seconds >= 86400)) {
+        i->atime = time; i->times_dirty = 1;
+    }
+}
 static int modified(struct kernel_vfs_file *file, uint64_t offset, int append)
 {
     (void)offset; (void)append;
@@ -1000,7 +1019,10 @@ static int modified(struct kernel_vfs_file *file, uint64_t offset, int append)
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     int r = fat_error(node->instance); if (r) return r;
     fi(node)->mtime = fi(node)->ctime = now();
-    return store_inode(m, fi(node));
+    /* Hot reads/writes can run on the calling CPU. Actual metadata I/O stays
+     * with writeback/fsync's CPU0 owner, including a write that later faults. */
+    fi(node)->times_dirty = 1;
+    return 0;
 }
 static int set_times(struct kernel_vfs_file *file, const struct kernel_vfs_timespec times[2])
 {
@@ -1058,6 +1080,11 @@ static int flush(struct kernel_vfs_instance *instance)
 {
     struct fat_mount *m = fm(instance);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
+    int error = fat_error(instance); if (error) return error;
+    struct fat_inode *i;
+    RB_FOREACH(i, fat_id_tree, &m->inodes) if (i->times_dirty) {
+        int r = store_inode(m, i); if (r) return r;
+    }
     return flush_locked(m);
 }
 static int sync_filesystem(struct kernel_vfs_instance *instance, struct kernel_vfs_node *root_node)
@@ -1065,7 +1092,12 @@ static int sync_filesystem(struct kernel_vfs_instance *instance, struct kernel_v
 static void sync_prepare(struct kernel_vfs_node *node, int data_only, struct kernel_vfs_sync_request *request)
 {
     (void)data_only;
-    kernel_vfs_sync_complete(request, flush(node->instance));
+    struct fat_mount *m = fm(node->instance);
+    KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
+    int r = fat_error(node->instance);
+    if (!r && fi(node)->times_dirty) r = store_inode(m, fi(node));
+    if (!r) r = flush_locked(m);
+    kernel_vfs_sync_complete(request, r);
 }
 static int prepare_unmount(struct kernel_vfs_mount *mount)
 {
@@ -1095,6 +1127,10 @@ static int prepare_unmount(struct kernel_vfs_mount *mount)
     }
     if (m->instance.nodes != root_node || (root_node && root_node->next)) return -KERNEL_EBUSY;
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
+    struct fat_inode *i;
+    RB_FOREACH(i, fat_id_tree, &m->inodes) if (i->times_dirty) {
+        int r = store_inode(m, i); if (r) return r;
+    }
     int r = flush_locked(m); if (r) return r;
     if (!m->instance.read_only) {
         uint32_t state; r = fat_get(m, 1, &state);
