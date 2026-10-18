@@ -176,13 +176,18 @@ Linux对照bootstrap为程序建立真实正进程组，因为直接内核init�
 这些probe仅是诊断fixture，不是官方镜像结果。GNU空LOAD问题在main修正后合入，
 不通过修改链接产物绕过exec差异；背景见[ELF记录](../learning/elf-loading.md)。
 
+当前双盘和 VFAT 接入后，basic 四种配置均为100/102，mount/umount各5/5；
+原始24个选定LTP、四个满盘/文件程序、磁盘检查和具体缺口见
+[官方交付与原程序结果](../learning/oscomp-official-delivery.md)。
+
 历史默认basic在RV/LA、glibc/musl四份结果均为90/102：brk为1/3，mount与umount均为0/5，
 其余29条89/89。本次集成聚焦的RV glibc因父子cpid输出交错为86，其他三格90；
-实际判分及重建命令见[集成范围](../learning/oscomp-compat-baseline.md#当前主线集成的验证范围)。brk原ELF把64位返回地址截断为32位；vfat是共同内核缺失能力，
+实际判分及重建命令见[集成范围](../learning/oscomp-compat-baseline.md#当前主线集成的验证范围)。brk原ELF把64位返回地址截断为32位；当时vfat是共同内核缺失能力，
 umount先卡在mount，没有到达卸载。原测例mount/umount还需要真实/dev/vda2分区环境，
 不是添加一个名字即可满足；归因见[basic与运行时差异](../learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
-LTP 的 scratch 准备当前同时缺少独立测试盘环境和用户态块设备 ABI/loop 能力；
-建立设备节点或只设置 `LTP_DEV` 不足以完成原设备流程，具体边界见上述完整评测分析。
+LTP scratch 原准备失败涉及独立测试盘环境、用户态块设备 ABI、loop 与空间接纳/回收；
+这些机制已交付，具体原因与修复见上述完整评测分析。当前 preadv03/pwritev03
+已完成原 mkfs/挂载/扇区查询，停在 O_DIRECT open 的 EOPNOTSUPP。
 账户、工具和真实熵仍按各自前置条件检查。原kill判分标签与实际后台PID、
 iperf连续脚本在Linux也有的listener重建竞态，以及cyclictest历史零采样，保留各自
 归因边界；历史证据见[程序清单](../learning/user-program-inventory.md)与
@@ -230,7 +235,7 @@ Linux返回故障profile验证同一因果链，512MiB/1GiB都正常回收。参
 [首次errno写入](../learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
 原RV musl的四个sched查询/设置函数执行真实syscall，原LA同名函数直接ENOSYS；
 上游1.2.0与1.2.5都为ENOSYS，不能把原RV二进制内容差异归为版本新旧。
-两侧共用内核调度实现；原输入能力差异与共同VFAT缺口分别记录，见上述basic记录。
+两侧共用内核调度实现；原输入调度差异见上述basic历史记录，VFAT已在当前主线补齐。
 
 用户批准后新增独立用户态修正入口：只在临时盘修正已校验SHA的brk截断，LA
 cyclictest借用原libc的syscall并通过LD_PRELOAD提供四个真实调度接口；原cyclictest
@@ -245,9 +250,9 @@ basic92/102、cyclictest四场景真实采样及正常回收，见[公开修正�
 16KiB ELF段对齐和`-nostdlib`，没有宿主libc/CRT依赖。四个sched接口借用原盘libc
 公开的`syscall`，由它设置真实线程errno；内核仍走两架构共用的调度syscall实现。
 
-`prepare.py --runtime`校验ELF64/LA/ET_DYN/LP64D身份，将gzip压缩的DSO及
-`runtime.sh`嵌入LA PID1启动命令。原盘BusyBox在guest中解压至临时文件，成功后
-以只读权限rename发布`/lib/boaros-linux-sched.so`；发布失败即终止bootstrap。
+`prepare.py --runtime`校验ELF64/LA/ET_DYN/LP64D身份，并在启动环境中设置
+`/boaros-tools/linux-sched.so`。磁盘准备器将真实DSO写入工具分区，PID1只读挂载
+该分区后供动态加载器使用。
 宿主构建不读取或改写评测盘。musl环境的所有动态程序统一继承LD_PRELOAD，
 glibc环境显式清除；不按测试名称、组别或ELF指纹决定是否开启。RV不携带LA库。
 原cyclictest、原libc、原测试脚本和judge字节保持，既有监督和显式shell适配继续使用。
@@ -256,7 +261,8 @@ glibc环境显式清除；不按测试名称、组别或ELF指纹决定是否开
 容器编译器产物不能用宿主编译器产物身份代替。官方Harness仍在干净提交快照中
 执行普通`make all`，不调用独立用户态修正诊断。显式INIT_CONFIG继续支持通用fixture。
 已确认保持当前地址布局和原brk输入，不启用默认brk指令修正或低地址布局。
-默认basic90/102与独立诊断92/102分别记录；VFAT仍是共同缺失能力。
+原默认basic90/102与独立诊断92/102属于上述历史批次；当前VFAT和真实分区
+已接入，basic100/102结果见[官方交付结果](../learning/oscomp-official-delivery.md)。
 
 ```sh
 make all
