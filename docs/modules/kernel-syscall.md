@@ -34,13 +34,14 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 |---|---|
 | epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
 | getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
-| ftruncate/fallocate（46/47）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64（63–67） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
+| ftruncate/fallocate（46/47）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64/pwrite64/preadv/pwritev（63–70） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
 | sendfile（71） | [文件模块](kernel-files.md)：有界内核复制、位置、来源片段、整包与同步错误 |
 | statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
 
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `sched_yield` 编号 124 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选；只有较低优先级 READY 任务时 FIFO/RR 可继续当前任务，RR 保留剩余时间片。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
+- `preadv/pwritev` 编号 69/70，复用向量复制和定位 I/O；一次调用固定一份 OFD，保留完成前缀并保持共享当前位置。管道等不可定位对象返回 `ESPIPE`。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
 - `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、WAIT_BITSET、WAKE_BITSET、PRIVATE 和 WAIT_BITSET 的 CLOCK_REALTIME 标志。key、FIFO、掩码、绝对/相对超时、错误码与同 MM 边界见[调度模块](kernel-scheduler.md)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。PI、wake-op、futex2 等命令仍返回 ENOSYS，不计作能力完成。
@@ -53,13 +54,13 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按 4 KiB 对齐；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
 - `clone` 编号为 220。支持 SIGCHLD fork/vfork 和 VM/FS/FILES/SIGHAND/THREAD 共享线程形态；进程形态接受 CHILD_SETTID、CHILD_CLEARTID 及 CLONE_FS，线程形态接受 SETTLS、PARENT_SETTID、CHILD_SETTID、CHILD_CLEARTID、SYSVSEM、DETACHED 位。RISC-V 参数顺序为 flags/stack/parent_tid/tls/child_tid。非法 flag 依赖返回 EINVAL，未支持的合法资源组合返回 ENOTSUP；资源、vfork 致命取消、发布和回滚契约见[调度模块](kernel-scheduler.md)。
 - `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
-- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED`，以及任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、未对齐 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
+- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_LOCKED/MAP_GROWSDOWN` 返回 `EOPNOTSUPP`；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（回收先行，子进程不可再次 wait）。
 - `prlimit64` 编号为 261，当前实现 `RLIMIT_NOFILE(7)` 与 `RLIMIT_STACK(3)` 的查询和设置；pid 0 指当前线程组，正 pid 指存活任务所属组。新值先从用户复制，设置和旧值快照完成后才向用户写回旧值，因此旧值地址故障仍保留已生效的设置。软值不得大于硬值；当前硬容量分别是 1024 个 fd 和 8 MiB 栈，超出拒绝。其他有效 resource 返回 `-ENOTSUP`，未知 resource 返回 `-EINVAL`，不返回虚假的成功。
 - `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
-- RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件与字符节点创建，不能分派为 fd 替换。
+- RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件、字符／块节点和 FIFO 创建。
 - `times` 编号为 153，填写可选的 32 字节 `tms`（`utime/stime/cutime/cstime`，单位为 scheduler tick，`CLK_TCK`=100）并返回自启动的 uptime tick 数；tms 为 NULL 时只返回 uptime。记账在 tick 边界记到被中断任务，idle 不记账；子进程记账在 wait 回收时回卷给父进程，孙辈随回收归并。
 - `shmget`/`shmctl`/`shmat`/`shmdt` 编号为 194/195/196/197，构成 System V 共享内存族。支持 `IPC_PRIVATE` 与命名 key，`IPC_STAT`/`IPC_SET`/`IPC_RMID` 控制命令，延迟释放与末引用清理，以及多进程跨地址附加；详见 [SysV 共享内存模块](sysv-shm.md)。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
@@ -68,7 +69,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。普通 clone 已覆盖独立父子进程，线程 clone 子集共享 MM、files、fs context 和信号 disposition；完整线程组与共享资源矩阵仍有限。接口语义和内部字段已经分离，内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 
-`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
+`make test-selected-abi-riscv test-selected-abi-loongarch` 对本节的定位向量、错误顺序、时间输出、信号及嵌套 epoll 等边界运行同 ELF Linux 差分。`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
 
 身份查询依据本地 `references/linux/kernel/sys.c` 的四个 `SYSCALL_DEFINE0` 和
 `references/linux/include/uapi/asm-generic/unistd.h`，commit
@@ -77,7 +78,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 也没有改变凭据。`test-syscall-riscv` 保护四项返回与忽略参数，
 `test-diff-abi-riscv` 保护真实 U-mode 查询及 fork/exec 继承。
 
-`mknodat(33)` 已接入普通文件和字符节点创建；支持边界与错误见[文件模块](kernel-files.md#节点创建)，不代表块设备、FIFO 或 socket 文件后端已完成。
+`mknodat(33)` 已接入普通文件、字符／块节点和 FIFO；块节点按真实 `st_rdev` 打开块设备 OFD，FIFO 使用管道后端。具体接口见[文件模块](kernel-files.md#节点创建)。
 
 `sysinfo(179)` 使用 RV64 的 112 字节结构（编译期检查），先清零全部字段与填充。内存/共享/缓冲以字节返回且 `mem_unit=1`，无 swap/highmem 的字段为真实零；uptime 为 monotonic 秒向上取整，任务数与负载来自调度器。坏输出地址返回 `EFAULT`，查询不执行 I/O。`tests/diff-abi/proc.c` 验证字段边界和 fault，不要求两内核的 RAM 容量、启动时长和负载逐字相等。
 

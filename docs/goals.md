@@ -18,7 +18,7 @@
 ### P6b 锁、等待与中断规则
 
 CPU 本地/current、抢占控制、buddy/slab raw、代次等待与可睡眠锁内部保护已存在。
-压力挂钩使用实际组引用，可由远端发布通知；同步干净回收只尝试取得缓存保护，忙时跳过，脏数据交给worker。网络端点、命名空间及设备业务仍有CPU0边界。可睡眠锁释放内部raw后才显式调度，不能机械替换IRQ域。
+压力挂钩使用实际组引用，可由远端发布通知；干净回收按正向锁序等待缓存元数据，归还物理引用后处理 node/entry 释放；脏数据由 worker 写回，写入接纳边界推进有界回收。网络端点、命名空间及设备业务仍有CPU0边界。可睡眠锁释放内部raw后才显式调度。
 接口契约和调用边界见[调度模块](modules/kernel-scheduler.md#smp前置的同步与等待契约2026-10-09)。
 
 任务索引、身份发布、查找借用和退休归还已在统一短调度域保护。
@@ -42,13 +42,15 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 |---|---|---|
 | 信号、线程与事件 | sigaltstack、实时信号队列/计费；CMP_REQUEUE/WAKE_OP、PI futex；扩展 clone；eventfd/timerfd/signalfd | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
 | 用户内存 | mremap、按操作区分的 madvise、mlock；文件映射截断/退出错误的进一步交错验证 | [MM](modules/kernel-mm.md)；地址迁移依赖对象和并发边界稳定 |
+| 进程查询与 IPC | waitid、getrusage、SysV 消息队列及信号量；preadv2/pwritev2 的扩展标志 | wait4、times、SysV 共享内存及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
+| 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
 | 凭据与限制 | 可变 UID/GID/补充组及完整权限；合成对象权限、AS/DATA/FSIZE/CPU 等限额 | [文件接口](modules/kernel-files.md)、[syscall](modules/kernel-syscall.md)；现有固定 root 和 NOFILE/STACK 不重复立项 |
 | 网络与系统接口 | 命名 AF_UNIX/控制消息、原生 accept4、外部 IPv6 与运行时网络配置；CPU-time clock、VIRTUAL/PROF timer、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；DNS/TLS 另核对真实随机/时间/证书依赖 |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 
 ### P1h 虚拟文件系统与多挂载
 
-基础 proc/tmpfs/devpts/ext4 挂载、覆盖、只读与普通忙卸载已存在；这里保留扩展缺口。
+基础 proc/tmpfs/devpts/ext4/vfat 挂载、覆盖、只读与普通忙卸载已存在；这里保留扩展缺口。
 
 | 扩展 | 尚缺语义 |
 |---|---|
