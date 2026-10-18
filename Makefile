@@ -1611,6 +1611,15 @@ include tests/diff-abi/Makefile.inc
 test-fat32-host:
 	sh tests/fat32-host.sh
 
+FAT32_USER_RV := $(BUILD_DIR)/tests/user/fat32-rv
+$(FAT32_USER_RV): tests/userland/fat32.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
+.PHONY: test-fat32-user-riscv
+test-fat32-user-riscv: $(KERNEL_RV) $(FAT32_USER_RV)
+	python3 -B tests/fat32-user.py --arch riscv --kernel $(KERNEL_RV) \
+		--program $(FAT32_USER_RV) --qemu $(QEMU_RISCV64)
+
 .PHONY: test-block-host
 test-block-host:
 	mkdir -p build/host
