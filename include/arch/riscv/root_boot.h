@@ -71,6 +71,7 @@ struct riscv_root_boot {
     struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;
     struct riscv_virtio_mmio_block extra_devices[DTB_MAX_VIRTIO_MMIO_RANGES - 1U];
+    struct kernel_block_device partitions[DTB_MAX_VIRTIO_MMIO_RANGES][4];
     uint32_t device_count;
     struct kernel_vfs_mount mount;
     struct kernel_exec_image cleanup_image;

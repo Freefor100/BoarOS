@@ -88,8 +88,9 @@ static int range_from_flock(const struct linux_flock *flock,
         if (size > INT64_MAX) return -KERNEL_EOVERFLOW;
         base = (int64_t)size;
     } else return -KERNEL_EINVAL;
-    if (__builtin_add_overflow(base, flock->start, start) || *start < 0)
-        return -KERNEL_EINVAL;
+    if (__builtin_add_overflow(base, flock->start, start))
+        return -KERNEL_EOVERFLOW;
+    if (*start < 0) return -KERNEL_EINVAL;
     if (flock->length > 0) {
         if (__builtin_add_overflow(*start, flock->length - 1, end))
             return -KERNEL_EOVERFLOW;
@@ -141,16 +142,16 @@ enum kernel_files_status kernel_files_fcntl_lock(
         goto out;
     }
     /* fd pin 先于复制；有效 fd 的坏 flock 不能被对象类型错误遮蔽。 */
-    node = kernel_open_file_node(file);
-    if (!node) { *linux_result = -KERNEL_EBADF; goto out; }
-    if (flock.type < 0 || flock.type > 2 ||
-        (query && !kind && flock.type == 2) ||
-        (kind && flock.pid != 0)) {
+    if (query && !kind && flock.type != 0 && flock.type != 1) {
         *linux_result = -KERNEL_EINVAL;
         goto out;
     }
     result = range_from_flock(&flock, file, &start, &end);
     if (result) { *linux_result = result; goto out; }
+    if (flock.type < 0 || flock.type > 2) {
+        *linux_result = -KERNEL_EINVAL;
+        goto out;
+    }
     if (!query && flock.type == 0 && !kernel_open_file_readable(file)) {
         *linux_result = -KERNEL_EBADF;
         goto out;
@@ -159,6 +160,9 @@ enum kernel_files_status kernel_files_fcntl_lock(
         *linux_result = -KERNEL_EBADF;
         goto out;
     }
+    if (kind && flock.pid != 0) { *linux_result = -KERNEL_EINVAL; goto out; }
+    node = kernel_open_file_node(file);
+    if (!node) { *linux_result = -KERNEL_EBADF; goto out; }
     state = kernel_vfs_node_record_locks(node);
     owner_head = kind ? &file->record_locks : &files->record->record_locks;
     if (kernel_task_tgid(task, &tgid) != KERNEL_TASK_STATUS_OK) {

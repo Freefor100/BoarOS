@@ -1025,8 +1025,19 @@ static unsigned long run_memory_mapping_cases(void)
     request.arguments[3] = UINT64_C(0x80000022);
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x41000)) || mmap_mm_flags != 0U) {
         failures++;
+    }
+
+    /* Real unsupported mapping flags must not become ordinary mappings merely
+     * because legacy callers may supply otherwise unknown extension bits. */
+    const uint64_t unsupported_flags[] = {0x40022U, 0x40021U, 0x122U, 0x2022U};
+    for (size_t index = 0; index < sizeof(unsupported_flags) / sizeof(unsupported_flags[0]); index++) {
+        request.arguments[3] = unsupported_flags[index];
+        if (kernel_syscall_dispatch(caller, &request, &result) != KERNEL_SYSCALL_STATUS_OK ||
+            result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
+                index < 2 ? -KERNEL_EINVAL : -KERNEL_EOPNOTSUPP)) failures++;
     }
 
     request.arguments[0] = UINT64_C(0x45000);
@@ -1090,7 +1101,7 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22) ||
-        file_mmap_validation_calls != 4U || file_mmap_calls != 2U ||
+        file_mmap_validation_calls != 3U || file_mmap_calls != 2U ||
         file_release_calls != 4U) {
         failures++;
     }
@@ -1099,7 +1110,7 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -17) ||
-        file_mmap_validation_calls != 5U || file_mmap_calls != 2U ||
+        file_mmap_validation_calls != 4U || file_mmap_calls != 2U ||
         file_release_calls != 5U) {
         failures++;
     }
@@ -1291,6 +1302,7 @@ static unsigned long run_time_cases(void)
 
     request.number = 169U;
     request.arguments[0] = 0U;
+    request.arguments[1] = 0U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0)) {
@@ -1330,6 +1342,12 @@ static unsigned long run_time_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+    request.arguments[0] = 3U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -KERNEL_EOPNOTSUPP)) {
         failures++;
     }
     request.arguments[0] = 1U;

@@ -25,8 +25,8 @@ RV 两核调度支持受控内核任务和独立 `kernel-rv-user-smp` 的真实�
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
 | 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；private/共享匿名/共享文件/SysV futex、robust-list、标准信号和同步 fault | 默认用户任务限CPU0，独立 RV 用户 SMP 仅在需要串行的业务范围进入 CPU0；无 PI futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
 | 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename；受控RV共享FD/匿名pipe两核 | 普通文件数据访问可就地执行，socket/epoll/FIFO 业务仍在 CPU0；无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
-| 文件系统与挂载 | ext4、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount 与普通忙卸载、独立第二 ext4 盘 | 无 bind/remount/move/传播、扩展卸载 flags 或 mount namespace；[VFS](docs/modules/vfs-ext4.md)、[tmpfs](docs/modules/tmpfs.md) |
-| 存储 | 共用 VirtIO transport/split queue、批量/乱序 I/O、flush/reset、页缓存、后台写回/压力回收、ordered journal、durable commit/checkpoint、orphan/replay | RV legacy/modern MMIO；LA modern PCI及transitional设备的modern接口，纯legacy PCI未接；[框架](docs/modules/virtio-framework.md)、[存储](docs/modules/vfs-ext4.md) |
+| 文件系统与挂载 | ext4、FAT32/VFAT、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount、只读与普通忙卸载 | 挂载扩展见[开发路线](docs/goals.md)；[VFS](docs/modules/vfs-ext4.md)、[VFAT](docs/modules/fat32.md)、[tmpfs](docs/modules/tmpfs.md) |
+| 存储 | VirtIO 批量 I/O、flush/reset；MBR 主分区、用户态块设备、真实文件后备 loop；页缓存、压力回收、ext4 日志及空间预留／打洞 | RV MMIO、LA modern PCI；[块设备与 loop](docs/modules/riscv-virtio-block.md)、[文件系统与缓存](docs/modules/vfs-ext4.md) |
 | 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
 | 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 

@@ -513,6 +513,36 @@ enum kernel_syscall_status syscall_handle_readv(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_positioned_iov(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    /* Both 64-bit architectures pass the full low word in argument four. */
+    int64_t offset = (int64_t)request->arguments[3];
+    if (offset < 0) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    enum kernel_task_status task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    enum kernel_files_status status = request->number == 69U
+        ? kernel_files_preadv(files, mm, (int64_t)request->arguments[0],
+            request->arguments[1], request->arguments[2], offset, &decoded->value)
+        : kernel_files_pwritev(files, mm, (int64_t)request->arguments[0],
+            request->arguments[1], request->arguments[2], offset, &decoded->value);
+    return status == KERNEL_FILES_STATUS_OK ? KERNEL_SYSCALL_STATUS_OK
+                                          : KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+}
+
 enum kernel_syscall_status syscall_handle_pread64(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

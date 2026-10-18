@@ -53,6 +53,8 @@
 #define LINUX_SYSCALL_WRITEV 66U
 #define LINUX_SYSCALL_PREAD64 67U
 #define LINUX_SYSCALL_PWRITE64 68U
+#define LINUX_SYSCALL_PREADV 69U
+#define LINUX_SYSCALL_PWRITEV 70U
 #define LINUX_SYSCALL_SENDFILE 71U
 #define LINUX_SYSCALL_PSELECT6 72U
 #define LINUX_SYSCALL_PPOLL 73U
@@ -457,6 +459,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_PREADV ||
+               request->number == LINUX_SYSCALL_PWRITEV) {
+        if (syscall_handle_positioned_iov(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_SENDFILE) {
         if (syscall_handle_sendfile(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

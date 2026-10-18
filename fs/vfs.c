@@ -381,8 +381,8 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
     if (result) return result;
     for (child = adapter->paths; child != 0; child = child->next) {
         if (!child->detached && child->parent == parent &&
-            strlen(child->name) == name_length &&
-            !memcmp(child->name, name, name_length)) {
+            ((adapter->ops->entry_name && kernel_vfs_path_inode(child) == inode) ||
+             (strlen(child->name) == name_length && !memcmp(child->name, name, name_length)))) {
             if (kernel_vfs_path_inode(child) != inode) {
                 child->detached = 1U;
                 continue;
@@ -394,6 +394,13 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
             if (result) (void)kernel_vfs_path_release(owner);
             return result;
         }
+    }
+    char canonical[256];
+    if (adapter->ops->entry_name) {
+        result = adapter->ops->entry_name(adapter, inode, canonical, sizeof(canonical));
+        if (result) return result;
+        name = canonical;
+        name_length = strlen(name);
     }
     allocation = kernel_heap_allocate_zeroed(adapter->heap, 1U,
                     sizeof(*child) + name_length + 1U, (void **)&child);
@@ -2020,13 +2027,13 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                  kernel_vfs_path_inode(source->parent), source->name,
                  kernel_vfs_path_inode(new_parent), new_name, flags, &renamed);
     if (result || !renamed.changed) goto Finish;
-    if (target && renamed.replaced_inode !=
+    if (target && target != source && renamed.replaced_inode !=
                       kernel_vfs_path_inode(target)) __builtin_trap();
-    if (!target && renamed.replaced_inode) __builtin_trap();
+    if ((!target || target == source) && renamed.replaced_inode) __builtin_trap();
     struct kernel_vfs_path *old_parent = source->parent;
     char *old_name = source->name;
     uintptr_t irq = arch_interrupt_save();
-    if (target) {
+    if (target && target != source) {
         struct kernel_vfs_node *node = target->file.private_data;
         target->detached = 1U;
         if (renamed.replaced_last_link) node->unlinked = 1U;
@@ -2787,6 +2794,9 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
     *next_position = position;
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (node && node->unlinked && (node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
+        return -KERNEL_ENOENT;
     return instance->ops->dir_entry(file, position, next_position, inode, type, name, name_size);
 }
 
@@ -2944,6 +2954,20 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
 
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file)
 { struct kernel_vfs_node *n = kernel_vfs_file_node(file); return n ? n->memory : 0; }
+
+int kernel_vfs_check_io_domain(const struct kernel_vfs_node *node, const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    if (!node || !node->instance || !node->instance->ops->check_domain) return -KERNEL_EINVAL;
+    return node->instance->ops->check_domain(node, heap, allocator);
+}
+int kernel_vfs_check_mapping_domain(const struct kernel_vfs_node *node, const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    int r = kernel_vfs_check_io_domain(node, heap, allocator);
+    if (r || (!node->memory && !__atomic_load_n(&node->mapping_state, __ATOMIC_ACQUIRE))) return -KERNEL_EINVAL;
+    return 0;
+}
 
 #if BOAROS_COST_DIAGNOSTICS
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file)

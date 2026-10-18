@@ -38,11 +38,11 @@ int main(void) {
     assert(!kernel_random_ready());
     assert(kernel_random_wait_ready(1) == -KERNEL_EAGAIN);
     assert(kernel_random_wait_ready(0) == -KERNEL_EINTR);
-    for(unsigned i=0;i<100;i++) kernel_random_mix(seed,32,0);
+    for(unsigned i=0;i<100;i++) kernel_random_mix(seed,32);
     assert(!kernel_random_ready());
-    kernel_random_mix(seed,31,1); assert(!kernel_random_ready());
-    kernel_random_mix(seed,1,1); assert(kernel_random_ready());
-    kernel_random_mix(seed,32,0); assert(kernel_random_ready());
+    kernel_random_mix(seed,31); kernel_random_credit_bits(248); assert(!kernel_random_ready());
+    kernel_random_mix(seed,1); kernel_random_credit_bits(8); assert(kernel_random_ready());
+    kernel_random_mix(seed,32); assert(kernel_random_ready());
     assert(kernel_random_initialize(0,0)==KERNEL_RANDOM_STATUS_UNAVAILABLE);
     assert(kernel_random_ready());
     static const unsigned char abc[32] = {

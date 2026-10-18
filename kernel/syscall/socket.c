@@ -24,12 +24,14 @@
 #define LINUX_AF_MAX 46
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
+#define LINUX_SOCK_RAW 3
 #define LINUX_SOCK_MAX 11
 #define LINUX_SOCK_TYPE_MASK 0xf
 #define LINUX_SOCK_NONBLOCK 00004000
 #define LINUX_SOCK_CLOEXEC 02000000
 #define LINUX_IPPROTO_TCP 6
 #define LINUX_IPPROTO_UDP 17
+#define LINUX_IPPROTO_MAX 263
 #define LINUX_SOL_SOCKET 1
 #define LINUX_SO_RCVTIMEO 20
 #define LINUX_SO_SNDTIMEO 21
@@ -335,6 +337,14 @@ enum kernel_syscall_status syscall_handle_socket(
     }
     if (family != LINUX_AF_INET && family != LINUX_AF_INET6) {
         decoded->value = -KERNEL_EAFNOSUPPORT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (protocol < 0 || protocol >= LINUX_IPPROTO_MAX) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (base_type == LINUX_SOCK_RAW && protocol == 0) {
+        decoded->value = -KERNEL_EPROTONOSUPPORT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if ((base_type == LINUX_SOCK_STREAM &&

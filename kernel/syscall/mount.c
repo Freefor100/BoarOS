@@ -49,8 +49,9 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     if (result) return result;
     int tmpfs = !strcmp(type, "tmpfs");
     int ext4 = !strcmp(type, "ext4");
+    int disk = ext4 || !strcmp(type, "vfat");
     int devpts = !strcmp(type, "devpts");
-    if (!tmpfs && !ext4 && !devpts && strcmp(type, "proc")) return -KERNEL_ENODEV;
+    if (!tmpfs && !disk && !devpts && strcmp(type, "proc")) return -KERNEL_ENODEV;
     enum kernel_heap_status allocation = kernel_heap_allocate(fs->heap,
         2U * KERNEL_FS_PATH_MAX, (void **)&target);
     if (allocation != KERNEL_HEAP_STATUS_OK)
@@ -60,7 +61,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         result = import_string(mm, source_name, KERNEL_FS_PATH_MAX,
                                request->arguments[0]);
         if (result) goto Finish;
-        if (ext4) {
+        if (disk) {
             struct kernel_vfs_path *source = 0;
             struct kernel_vfs_stat stat;
             result = kernel_vfs_path_resolve(kernel_fs_context_cwd(fs),
@@ -72,7 +73,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
             if (source && kernel_vfs_path_release(&source)) __builtin_trap();
             if (result) goto Finish;
         }
-    } else if (ext4) { result = -KERNEL_EINVAL; goto Finish; }
+    } else if (disk) { result = -KERNEL_EINVAL; goto Finish; }
     if (request->arguments[4]) {
         result = import_string(mm, options, sizeof(options),
                                request->arguments[4]);
@@ -92,7 +93,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         result = -KERNEL_ENOTDIR;
         goto Finish;
     }
-    result = ext4 ? kernel_vfs_disk_create(fs->heap, source_device, flags & LINUX_MS_RDONLY, source_name, &mounted)
+    result = disk ? kernel_vfs_disk_create(fs->heap, source_device, flags & LINUX_MS_RDONLY, source_name, type, &mounted)
            : devpts ? kernel_devpts_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
            : tmpfs ? kernel_tmpfs_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
                    : kernel_procfs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted);
@@ -100,7 +101,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     result = kernel_vfs_mount_attach(mounted, covered);
     if (result) {
         int cleanup = kernel_vfs_unmount(mounted);
-        if (cleanup) { if (ext4) kernel_vfs_disk_defer_cleanup(mounted); else __builtin_trap(); }
+        if (cleanup) { if (disk) kernel_vfs_disk_defer_cleanup(mounted); else __builtin_trap(); }
         mounted = 0;
     }
 Finish:

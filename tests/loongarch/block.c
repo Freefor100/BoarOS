@@ -7,6 +7,7 @@
 #include <kernel/task.h>
 #include <kernel/tick.h>
 #include <string.h>
+#include "../common/block_partitions.h"
 static struct virtio_pci_block devices[2];
 static unsigned char data[8][528] __attribute__((aligned(16)));
 static volatile unsigned io_done,cpu_progress,io_masked;
@@ -92,6 +93,8 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
     for(unsigned i=0;i<512;i++) buffer[i]=(i*13+7)%256;
     if(kernel_block_write_at(&devices[0].device.block,32768,buffer,512)!=KERNEL_BLOCK_STATUS_OK ||
         kernel_block_flush(&devices[0].device.block)!=KERNEL_BLOCK_STATUS_OK) la_virt_fatal("PCI write flush");
+    if(test_primary_partitions(&devices[0].device.block)) la_virt_fatal("PCI MBR primary partitions");
+    la_virt_puts("LA MBR primary partition I/O and owners passed\n");
     la_virt_puts("LA PCI IRQ hold\n");
     uint64_t ready_deadline=arch_time_read()+la_timer_frequency()*5;
     while(!arch_uart_rx_ready())

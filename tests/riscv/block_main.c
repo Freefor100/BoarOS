@@ -5,6 +5,7 @@
 #include <arch/riscv/virt_uart.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/block.h>
+#include "../common/block_partitions.h"
 #include <kernel/dtb.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -525,6 +526,10 @@ static void test_real_virtio_block(const void *dtb)
     }
     virt_uart_puts(rw_dev->block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK
         ? "BoarOS: block cache writeback\n" : "BoarOS: block cache writethrough\n");
+
+    int partition_error = test_primary_partitions(&rw_dev->block);
+    if (partition_error) fail_block(90, 0, partition_error);
+    virt_uart_puts("BoarOS: MBR primary partition I/O and owners passed\n");
 
     test_irq_reads(dtb, &allocator, rw_dev, buffer);
 

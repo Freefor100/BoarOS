@@ -188,8 +188,11 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
 int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     struct kernel_block_device *block, struct kernel_heap *heap,
     struct kernel_page_cache *page_cache, int read_only);
+int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only);
 int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
-    int read_only, const char *source, struct kernel_vfs_mount **owner);
+    int read_only, const char *source, const char *type, struct kernel_vfs_mount **owner);
 /* Shutdown-only, after user tasks have exited: drain real I/O cleanup
  * retained by failed, unpublished disk mounts. */
 int kernel_vfs_disk_cleanup_pending(void);

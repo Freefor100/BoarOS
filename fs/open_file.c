@@ -954,8 +954,7 @@ enum kernel_open_file_status kernel_open_file_check_mapping_domain(
     if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR)
         return KERNEL_OPEN_FILE_STATUS_STATE;
     struct kernel_vfs_node *node=kernel_open_file_node(file);
-    int error=kernel_open_file_memory_backed((struct kernel_open_file_description *)file) ?
-        kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_mapping_domain(node,heap,allocator);
+    int error=kernel_vfs_check_mapping_domain(node,heap,allocator);
     return error ? KERNEL_OPEN_FILE_STATUS_STATE : KERNEL_OPEN_FILE_STATUS_OK;
 }
 enum kernel_open_file_status kernel_open_file_check_io_domain(
@@ -966,8 +965,7 @@ enum kernel_open_file_status kernel_open_file_check_io_domain(
         file->ep_items || file->record_locks || file->device_opened || file->generated_ready)
         return KERNEL_OPEN_FILE_STATUS_STATE;
     struct kernel_vfs_node *node=kernel_open_file_node(file);
-    int error=kernel_open_file_memory_backed((struct kernel_open_file_description *)file) ?
-        kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_io_domain(node,heap,allocator);
+    int error=kernel_vfs_check_io_domain(node,heap,allocator);
     return error?KERNEL_OPEN_FILE_STATUS_STATE:KERNEL_OPEN_FILE_STATUS_OK;
 }
 int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,

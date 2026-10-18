@@ -186,19 +186,30 @@ enum kernel_syscall_status syscall_handle_gettimeofday(
     int64_t seconds;
     int64_t sub_nanoseconds;
 
-    if (request->arguments[0] == 0U) {
-        /* Linux returns success for a NULL timeval; tz is ignored. */
-        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = 0;
-        return KERNEL_SYSCALL_STATUS_OK;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = 0;
+    if (request->arguments[0] != 0U) {
+        nanoseconds = kernel_time_realtime_ns();
+        syscall_split_nanoseconds(nanoseconds, &seconds, &sub_nanoseconds);
+        enum kernel_syscall_status status = syscall_return_time(caller,
+            request->arguments[0], seconds, sub_nanoseconds / 1000, decoded);
+        /* Linux writes timeval first; a failed write leaves timezone untouched. */
+        if (status != KERNEL_SYSCALL_STATUS_OK || decoded->value != 0)
+            return status;
     }
-    nanoseconds = kernel_time_realtime_ns();
-    syscall_split_nanoseconds(nanoseconds, &seconds, &sub_nanoseconds);
-    return syscall_return_time(caller,
-                                request->arguments[0],
-                                seconds,
-                                sub_nanoseconds / 1000,
-                                decoded);
+    if (request->arguments[1] != 0U) {
+        struct kernel_mm *mm;
+        const int32_t timezone[2] = {0, 0};
+        size_t copied;
+        if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        enum kernel_uaccess_status access = kernel_copy_to_user(mm,
+            request->arguments[1], timezone, sizeof(timezone), &copied);
+        if (access == KERNEL_UACCESS_STATUS_FAULT) decoded->value = -KERNEL_EFAULT;
+        else if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(timezone))
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    return KERNEL_SYSCALL_STATUS_OK;
 }
 
 struct linux_timespec {
@@ -392,7 +403,7 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     uint64_t deadline;
     uint64_t now_ns;
 
-    if (syscall_clock_id_coarse(clock_id)) {
+    if (syscall_clock_id_coarse(clock_id) || clock_id == 3U) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EOPNOTSUPP;
         return KERNEL_SYSCALL_STATUS_OK;

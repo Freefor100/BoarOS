@@ -204,7 +204,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_SIGRETURN_ONLY
+#ifdef ABI_SELECTED_ONLY
+    abi_selected_cases();
+#elif defined(ABI_SIGRETURN_ONLY)
     abi_sigreturn_cases();
 #elif defined(ABI_FAULT_COUNT_ONLY)
     abi_fault_count_cases();

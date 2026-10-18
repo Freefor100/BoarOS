@@ -337,6 +337,13 @@ enum kernel_files_status kernel_files_writev(
     uint64_t iovcnt,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_preadv(struct kernel_files *files,
+    struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
+    int64_t offset, int64_t *linux_result);
+enum kernel_files_status kernel_files_pwritev(struct kernel_files *files,
+    struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
+    int64_t offset, int64_t *linux_result);
+
 /* Install the console description at an empty fixed slot for PID 1 stdio. */
 enum kernel_files_status kernel_files_open_console(
     struct kernel_files *files,

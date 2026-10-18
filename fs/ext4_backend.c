@@ -174,7 +174,7 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count);
 
 static struct kernel_vfs_backend ext4_backend;
-int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
+static int ext4_check_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
 {
     if (!node || !node->instance || !node->mount ||
@@ -184,13 +184,6 @@ int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
     return 0;
 }
 
-int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
-    const struct kernel_heap *heap,const struct physical_page_allocator *allocator)
-{
-    if (kernel_ext4_check_io_domain(node,heap,allocator) ||
-        !__atomic_load_n(&node->mapping_state,__ATOMIC_ACQUIRE)) return -KERNEL_EINVAL;
-    return 0;
-}
 static void initialize_backend(void);
 static int mount_error(const struct lwext4_mount_adapter *adapter)
 {
@@ -586,7 +579,7 @@ static int block_write(struct ext4_blockdev *device,
         block > UINT64_MAX / device->bdif->ph_bsize) {
         return EINVAL;
     }
-    if (adapter->block->write == 0) {
+    if (kernel_block_read_only(adapter->block)) {
         return EROFS;
     }
     offset = block * device->bdif->ph_bsize;
@@ -652,8 +645,9 @@ static int block_write_batch(struct ext4_blockdev *device,
     }
 }
 
-static int block_phase_next(const void **cursor, struct kernel_block_span *span)
+static int block_phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
+    (void)context;
     const struct ext4_block_write *io = *cursor;
     if (!io) return 0;
     *span = (struct kernel_block_span){io->offset, io->data, io->size};
@@ -665,7 +659,7 @@ static int block_write_phase(struct ext4_blockdev *device,
                             const struct ext4_block_write *first)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
-    switch (kernel_block_write_phase(adapter->block, block_phase_next, first)) {
+    switch (kernel_block_write_phase(adapter->block, block_phase_next, 0, first)) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
     case KERNEL_BLOCK_STATUS_UNSUPPORTED:
@@ -1285,7 +1279,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_EMPTY ||
         mount->private_data != 0 || mount->id != 0U ||
-        block == 0 || block->read == 0 ||
+        block == 0 || (block->parent ? block->parent : block)->read == 0 ||
         heap == 0 || page_cache == 0 ||
         page_cache->state != KERNEL_PAGE_CACHE_LIVE) {
         return -KERNEL_EINVAL;
@@ -1368,7 +1362,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     adapter->registered = 1U;
-    read_only = read_only || block->write == 0;
+    read_only = read_only || kernel_block_read_only(block);
     adapter->instance.read_only = (uint8_t)(read_only != 0 ? 1U : 0U);
     result = ext4_mount(adapter->device_name, adapter->mount_point, read_only != 0);
     if (result != EOK) {
@@ -2461,6 +2455,7 @@ static void initialize_backend(void)
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;
     ops->readlink = ext4_backend_readlink;
+    ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;
     ops->fallocate = ext4_backend_fallocate;
     ops->prepare_write = ext4_backend_prepare_write;

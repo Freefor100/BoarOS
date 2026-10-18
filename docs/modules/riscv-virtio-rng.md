@@ -12,7 +12,7 @@
 legacy分配两个目标物理页、used对齐到第二页；modern分配一个物理页，RV为4KiB、
 LA为16KiB。队列及64字节数据区由实例持有，不与块设备共享请求/等待者。
 
-worker 首次运行即请求 64 字节。IRQ 获取 used index 后执行 DMA acquire barrier，检查仅一个新完成、descriptor ID 为 0、长度不超过 64，然后仅记录结果并唤醒 worker。worker 将成功的非零响应传给 `kernel_random_mix(..., trusted=1)`，短响应在本轮累计到至少 32 字节后休眠 60 秒，再补种。可信累计和 ready 唤醒由随机核心负责；DTB seed 与用户写入不计熵。已 ready 后的设备失败不撤销 ready。
+worker 首次运行即请求 64 字节。IRQ 获取 used index 后执行 DMA acquire barrier，检查仅一个新完成、descriptor ID 为 0、长度不超过 64，然后仅记录结果并唤醒 worker。worker 将成功的非零响应传给 `kernel_random_mix()`，然后按响应字节数乘 8 调用 `kernel_random_credit_bits()`，短响应在本轮累计到至少 32 字节后休眠 60 秒，再补种。可信累计和 ready 唤醒由随机核心负责；DTB seed 与用户写入不计熵。已 ready 后的设备失败不撤销 ready。
 
 单次请求最多等待 5 秒。零响应、非法完成和超时先 reset，随后等待 60 秒才重新协商和请求，避免零响应忙循环；正常短响应可以立即继续。worker 的等待检查与 IRQ 唤醒由单 hart 关中断区协调，睡眠会让其他任务运行。IRQ 不生成或复制用户随机数据。
 

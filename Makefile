@@ -345,6 +345,7 @@ COMMON_C_SOURCES := \
 	fs/procfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
+	fs/fat32.c \
 	fs/ext4_backend.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
@@ -1672,6 +1673,10 @@ test-allocator-cost-host:
 
 include tests/diff-abi/Makefile.inc
 
+.PHONY: test-fat32-host
+test-fat32-host:
+	sh tests/fat32-host.sh
+
 .PHONY: test-block-host
 test-block-host:
 	mkdir -p build/host
@@ -1679,6 +1684,8 @@ test-block-host:
 	build/host/block-flush
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_registry.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-registry
 	build/host/block-registry
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-partitions
+	build/host/block-partitions
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
 	build/host/block-fault
 

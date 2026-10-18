@@ -30,8 +30,8 @@ int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
 #endif
 struct kernel_heap;
 struct physical_page_allocator;
-/* 实际ext4 inode及其已开放cache的固定绑定；借用已有来源owner，不扫描注册表。 */
-int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *,
+/* The owning backend checks its inode/storage domain without pathname lookup. */
+int kernel_vfs_check_mapping_domain(const struct kernel_vfs_node *,
     const struct kernel_heap *, const struct physical_page_allocator *);
 struct kernel_record_lock_state;
 
@@ -65,7 +65,7 @@ int kernel_vfs_file_is_control(const struct kernel_vfs_file *file);
 int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
     uint64_t offset, char *buffer, size_t size, size_t *count);
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
-int kernel_ext4_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,
+int kernel_vfs_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,
     const struct physical_page_allocator *);
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
                              struct kernel_heap *heap,

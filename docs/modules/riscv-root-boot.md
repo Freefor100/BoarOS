@@ -68,17 +68,22 @@ NUL、路径/向量/字符串超限在构建期拒绝，最终初始栈仍由公
 
 块设备号采用 Linux `new_encode_dev(252, index * 16)`，首盘为 `0xfc00`，
 第二盘为 `0xfc10`；index 是 DTB 地址顺序中的成功 block device 序号。
-无分区和热插拔，设备节点的设备号在本次启动内稳定。`kernel_block_get()`
+两架构在每个整盘登记后读取 MBR，最多登记四个主分区，设备号为整盘号加 1..4；
+无有效签名时保留整盘文件系统，有签名的越界、重叠或空长度分区表使启动失败。
+扩展分区和 GPT 容器返回不支持。设备节点的设备号在本次启动内稳定。`kernel_block_get()`
 在登记表保护内取得设备引用；动态挂载和块设备 OFD 用真实引用覆盖所有睡眠操作。
 mount 通过 `kernel_block_claim()` 与 `O_EXCL` 打开竞争独占 owner，普通打开仍可并存。
+同一分区的不同路径别名使用同一个登记对象。整盘 claim 与任一分区 claim 冲突，
+兄弟分区可独立占用，例如 p1 挂载时仍可独占打开 p3。子对象登记期间持有父盘引用，
+挂载、打开和在途 I/O 各自保留子对象；清理先注销所有子分区，再注销和销毁父盘。
 挂载、OFD 与在途请求全部释放后才允许注销。挂载失败清理和 unmount 仅在后端实际
 结束后调用 `kernel_block_release_claim()`；错误 owner 或重复释放是内部不变量错误。
 有 claim 时注销返回 `EBUSY`，因此真实卸载错误仍保留设备 owner。
 
 编码和 claim 语义依据固定 Linux
 `references/linux/include/linux/kdev_t.h` 与 `references/linux/block/bdev.c`
-（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）。BoarOS 不实现 Linux
-分区或同 holder 的嵌套 claim，mount 仅持有一次独占 claim。
+（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）。主分区表格式参考 `references/linux/block/partitions/msdos.c`。
+BoarOS 不实现同 holder 的嵌套 claim，mount 仅持有一次独占 claim。
 
 `make test-root-multi-block-riscv` 构建 `tests/userland/multi_mount.c` 的写入与
 只读校验两个 musl ELF，在 legacy 和 modern 下各执行两次真实双盘启动。

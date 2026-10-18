@@ -113,7 +113,8 @@ static void worker(void *owner)
                 (void)reset(d);
                 break;
             }
-            kernel_random_mix(data(d), d->response_length, 1);
+            kernel_random_mix(data(d), d->response_length);
+            kernel_random_credit_bits(d->response_length * 8U);
             collected += d->response_length;
             d->bytes += d->response_length;
             kernel_random_erase(data(d), 64);

@@ -20,8 +20,10 @@ enum kernel_random_status kernel_random_initialize(
 int kernel_random_available(void);
 int kernel_random_ready(void);
 unsigned kernel_random_credited_bits(void);
-/* Only successful trusted hardware RNG bytes may be credited. IRQ-safe. */
-void kernel_random_mix(const void *data, size_t size, int trusted);
+/* Mixing alone never credits entropy. Both operations are IRQ-safe. */
+void kernel_random_mix(const void *data, size_t size);
+/* Credit only after a trusted source has successfully mixed its full input. */
+void kernel_random_credit_bits(unsigned bits);
 void kernel_random_erase(void *buffer, size_t size);
 struct kernel_wait_queue;
 struct kernel_wait_queue *kernel_random_wait_queue(void);
