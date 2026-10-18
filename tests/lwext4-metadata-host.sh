@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership|truncate|extent) ;; *) echo 'usage: lwext4-metadata-host.sh [all|ownership|truncate|extent]' >&2; exit 2;; esac
+case "${1:-all}" in all|ownership|truncate|extent|prepend) ;; *) echo 'usage: lwext4-metadata-host.sh [all|ownership|truncate|extent|prepend]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -21,6 +21,15 @@ for block in 1024 4096; do
         mkfs.ext4 -q -F -b "$block" -I "$inode" "$work/base.img"
         overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
         "$work/probe" "$work/base.img" seed
+        if [ "${1:-all}" = all ] || [ "${1:-all}" = extent ] || [ "${1:-all}" = prepend ]; then
+            for mode in extent-prepend extent-prepend-group extent-prepend-tree extent-prepend-tree-group; do
+                cp "$work/base.img" "$work/test.img"
+                "$work/probe" "$work/test.img" "$mode"
+                check_fs "$work/test.img"
+            done
+            printf 'PASS: extent prepend block=%s inode=%s; inline/tree mappings, grouped/sync truncate and e2fsck\n' "$block" "$inode"
+        fi
+        if [ "${1:-all}" = prepend ]; then continue; fi
         if [ "${1:-all}" = all ] || [ "${1:-all}" = extent ]; then
             cp "$work/base.img" "$work/test.img"
             "$work/probe" "$work/test.img" extent-range

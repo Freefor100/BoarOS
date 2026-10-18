@@ -2400,6 +2400,68 @@ static void fragmented_range(struct ext4_blockdev *dev)
     CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/range-fragments")==EOK);
     puts("fragmented allocator: bounded prefix, occupied goal, one owner per run");
 }
+static int extent_prepend(struct ext4_fs *fs, bool grouped, bool tree)
+{
+    uint32_t size=fs->bdev->lg_bsize;
+    unsigned char *bytes=malloc(2*size);
+    CHECK(bytes);
+    if(grouped) {
+        struct ext4_journal_runtime runtime={.now_ns=group_clock};
+        CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    }
+    ext4_file pad,file;
+    size_t count;
+    CHECK(ext4_fopen(&pad,"/prepend-pad","w+")==EOK);
+    memset(bytes,'P',size);
+    CHECK(ext4_fwrite(&pad,bytes,size,&count)==EOK && count==size);
+    CHECK(ext4_fopen(&file,"/prepend-file","w+")==EOK);
+    CHECK(ext4_fseek(&file,size,SEEK_SET)==EOK);
+    memset(bytes,'R',size);
+    CHECK(ext4_fwrite(&file,bytes,size,&count)==EOK && count==size);
+    if(tree) {
+        /* 五个不连续逻辑区间使 leaf 离开 inode，同时让错误映射撞上活块。 */
+        for(unsigned i=1;i<5;i++) {
+            CHECK(ext4_fseek(&file,(uint64_t)(2*i+1)*size,SEEK_SET)==EOK);
+            CHECK(ext4_fwrite(&file,bytes,size,&count)==EOK && count==size);
+        }
+    }
+    struct ext4_inode_ref ref;
+    ext4_fsblk_t left,right;
+    CHECK(ext4_fs_get_inode_ref(fs,pad.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,0,&left,false)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,1,&right,false)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(left && right==left+1);
+    /* 先归还右侧 extent 前的物理块，再补逻辑左洞，确定进入 prepend 合并。 */
+    CHECK(ext4_ftruncate(&pad,0)==EOK);
+    CHECK(ext4_fclose(&pad)==EOK);
+    if(grouped)CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_fseek(&file,0,SEEK_SET)==EOK);
+    memset(bytes,'L',size);
+    CHECK(ext4_fwrite(&file,bytes,size,&count)==EOK && count==size);
+    if(grouped)CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_fseek(&file,0,SEEK_SET)==EOK);
+    CHECK(ext4_fread(&file,bytes,2*size,&count)==EOK && count==2*size);
+    int failed=0;
+    for(uint32_t i=0;i<2*size;i++) if(bytes[i]!=(i<size?'L':'R')) {
+        fprintf(stderr,"prepend content mismatch offset=%u actual=%u expected=%u left=%llu right=%llu\n",
+            i,bytes[i],i<size?'L':'R',(unsigned long long)left,(unsigned long long)right);
+        failed=1;break;
+    }
+    if(tree) {
+        int result=ext4_ftruncate(&file,0);
+        if(result!=EOK) {
+            fprintf(stderr,"prepend truncate failed: %d\n",result);
+            failed=1;
+        }
+    }
+    CHECK(ext4_fclose(&file)==EOK);
+    free(bytes);
+    return failed;
+}
+
 static void extent_read_failure(struct ext4_blockdev *dev, bool io, unsigned point)
 {
     ext4_file f;unsigned char byte=0x5a;size_t written;
@@ -2434,6 +2496,7 @@ static void extent_read_failure(struct ext4_blockdev *dev, bool io, unsigned poi
 
 int main(int argc,char **argv)
 {
+    int exit_status=0;
     if(argc==2 && !strcmp(argv[1],"bitmap")){bitmap_test();return 0;}
     CHECK(argc>=3);CHECK(fault_block_open(&disk,argv[1])==0);unsigned char scratch[512];
     struct ext4_blockdev_iface iface={.open=dev_open,.close=dev_open,.bread=dev_read,.bwrite=dev_write,.flush=dev_flush,.ph_bsize=512,.ph_bcnt=disk.device.capacity_bytes/512,.ph_bbuf=scratch};
@@ -2444,7 +2507,10 @@ int main(int argc,char **argv)
     if(ext4_sb_feature_com(&dev.fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
         CHECK(ext4_recover("/")==EOK);CHECK(ext4_journal_start("/")==EOK);CHECK(ext4_orphan_recover("/")==EOK);
     }
-    if(!strcmp(argv[2],"extent-read-oom") || !strcmp(argv[2],"extent-read-error"))
+    if(!strcmp(argv[2],"extent-prepend") || !strcmp(argv[2],"extent-prepend-group") ||
+       !strcmp(argv[2],"extent-prepend-tree") || !strcmp(argv[2],"extent-prepend-tree-group"))
+        exit_status=extent_prepend(dev.fs,strstr(argv[2],"group")!=NULL,strstr(argv[2],"tree")!=NULL);
+    else if(!strcmp(argv[2],"extent-read-oom") || !strcmp(argv[2],"extent-read-error"))
         extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);legacy_leaf_batch(&dev);legacy_chain_abort(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
     else if(!strcmp(argv[2],"seed"))seed();
@@ -2531,6 +2597,6 @@ int main(int argc,char **argv)
     }
     else CHECK(!"unknown mode");
     CHECK(ext4_umount("/")==EOK);
-    if(!strncmp(argv[2],"extent-read-",12))CHECK(!live_allocations);
-    fault_block_close(&disk);return 0;
+    if(!strncmp(argv[2],"extent-read-",12) || !strncmp(argv[2],"extent-prepend",14))CHECK(!live_allocations);
+    fault_block_close(&disk);return exit_status;
 }
