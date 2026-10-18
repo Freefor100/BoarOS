@@ -343,6 +343,8 @@ def main():
         # 原Harness在PATH前面放旧Kendryte；明确选择镜像已提供且支持当前ISA的编译器。
         build_env = {'CROSS_COMPILE': tools['riscv64-unknown-elf-gcc']['path'].removesuffix('gcc'),
                      'LA_CROSS_COMPILE': tools['loongarch64-linux-gnu-gcc']['path'].removesuffix('gcc'),
+                     # 本地双盘准备不属于原Harness；官方设备与原始根盘保持固定配置。
+                     'OSCOMP_LOCAL_DISKS': '0',
                      # 镜像GCC13不识别-mno-lsx/-mno-lasx；soft-float与禁自动向量化保持整数C。
                      'LA_FLAGS': '-march=loongarch64 -mabi=lp64s -msoft-float -mcmodel=normal '
                                  '-fno-tree-vectorize -fno-tree-slp-vectorize'}

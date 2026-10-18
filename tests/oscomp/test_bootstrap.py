@@ -97,6 +97,26 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('BOAROS_LINUX_SCHED_PRELOAD=',profile['envp'])
         self.assertNotIn('BOAROS_RUNTIME_GZIP=',profile['argv'][3])
 
+    def test_local_profile_checks_real_disk_before_exporting_ltp_device(self):
+        result, target = self.generate('riscv', 243, '--local-disks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        script = json.loads(target.read_text())['argv'][3]
+        self.assertIn('/dev/block/252:16 b 252 16', script)
+        self.assertIn('/dev/loop-control c 10 237', script)
+        self.assertIn('/dev/loop7 b 7 7', script)
+        self.assertLess(script.index('/boaros-tools/scratch-check'), script.index('export LTP_DEV='))
+        self.assertIn('LTP_DEV=/dev/block/252:16 LTP_DEV_FS_TYPE=ext4 LTP_SINGLE_FS_TYPE=ext4', script)
+        self.assertIn('/boaros-tools/mke2fs /bin/mkfs.ext4', script)
+        self.assertNotIn('MKE2FS_PAYLOAD=', script)
+        subprocess.run(['sh', '-n', '-c', script], check=True)
+
+    def test_official_profile_does_not_require_local_disk_or_injected_tools(self):
+        result, target = self.generate('riscv', 243)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        script = json.loads(target.read_text())['argv'][3]
+        self.assertNotIn('/boaros-tools/', script)
+        self.assertNotIn('export LTP_DEV=', script)
+
     def test_runtime_with_wrong_machine_or_soft_float_is_rejected(self):
         runtime=self.root/'wrong.so'
         for machine,flags in [(243,0x43),(258,0x41)]:

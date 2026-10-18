@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--groups', default='basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp')
     parser.add_argument('--case-timeout', type=int, default=300)
+    parser.add_argument('--local-disks', action='store_true', help='require the prepared local root and scratch disks')
     parser.add_argument('--diagnostic-exclude', default='', help='space-separated LTP basenames, empty by default')
     args = parser.parse_args()
     known = {'basic','busybox','cyclictest','iozone','iperf','libcbench','libctest','lmbench','lua','netperf','ltp'}
@@ -28,7 +29,8 @@ def main():
     exclusions = args.diagnostic_exclude.split()
     if any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..') for name in exclusions):
         parser.error('diagnostic exclusions must be literal LTP basenames')
-    facts = json.loads((HERE / 'inputs.json').read_text())['architectures'][args.arch]
+    inputs = json.loads((HERE / 'inputs.json').read_text())
+    facts = inputs['architectures'][args.arch]
     helper = args.case.read_bytes()
     if (len(helper) < 64 or helper[:7] != b'\x7fELF\x02\x01\x01' or
             struct.unpack_from('<H', helper, 18)[0] != facts['elf_machine']):
@@ -58,6 +60,19 @@ def main():
     elif args.runtime is not None:
         parser.error('LA scheduling runtime cannot be attached to RV')
     startup = startup.replace('# BOAROS_RUNTIME_PAYLOAD', runtime_startup)
+    devices = local = ''
+    if args.local_disks:
+        disk = inputs['local_disk']
+        devices = ('$BB mknod -m 600 ' + disk['scratch_device'] + ' b 252 16\n'
+                   '$BB mknod -m 600 /dev/loop-control c 10 237\n' +
+                   '\n'.join(f'$BB mknod -m 600 /dev/loop{i} b 7 {i}' for i in range(8)))
+        local = (f"/boaros-tools/scratch-check {disk['root_device']} {disk['scratch_device']} {disk['scratch_bytes']}\n"
+                 '$BB ln -sf /boaros-tools/mke2fs /bin/mke2fs\n' +
+                 '\n'.join(f'$BB ln -sf /boaros-tools/mke2fs /bin/mkfs.ext{i}' for i in (2, 3, 4)) + '\n'
+                 'export MKE2FS_CONFIG=/boaros-tools/mke2fs.conf\n'
+                 f"export LTP_DEV={disk['scratch_device']} LTP_DEV_FS_TYPE=ext4 LTP_SINGLE_FS_TYPE=ext4")
+    startup = startup.replace('# BOAROS_LOCAL_DEVICE_NODES', devices)
+    startup = startup.replace('# BOAROS_LOCAL_DISKS', local)
     # Decode a build-owned executable with the original BusyBox; no host disk injection.
     startup = startup.replace('# BOAROS_CASE_PAYLOAD',
         f"$BB printf '%b' '{payload}' > /tmp/boaros-case\n$BB chmod 755 /tmp/boaros-case\n"

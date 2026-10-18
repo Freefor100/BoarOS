@@ -727,6 +727,14 @@ DEPS := \
 OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
 OSCOMP_CASE_TIMEOUT ?= 300
 OSCOMP_DIAGNOSTIC_EXCLUDE ?=
+OSCOMP_LOCAL_DISKS ?= 1
+OSCOMP_LOCAL_CACHE ?= build/tools/oscomp-local
+OSCOMP_TOOLCHAIN_ROOT ?= $(CURDIR)
+OSCOMP_LOCAL_ARGS = --cache '$(OSCOMP_LOCAL_CACHE)' --toolchain-root '$(OSCOMP_TOOLCHAIN_ROOT)'
+ifeq ($(OSCOMP_LOCAL_DISKS),1)
+OSCOMP_LOCAL_INIT_ARG := --local-disks
+all: prepare-oscomp-local-riscv prepare-oscomp-local-loongarch
+endif
 OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
 OSCOMP_CASE_LA := build/loongarch/oscomp/case
@@ -760,12 +768,19 @@ force-oscomp-init:
 $(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/runtime.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch riscv --case $(OSCOMP_CASE) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
-		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
+		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)' $(OSCOMP_LOCAL_INIT_ARG)
 
 $(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) $(OSCOMP_RUNTIME_LA) tests/oscomp/init.sh tests/oscomp/runtime.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch loongarch --case $(OSCOMP_CASE_LA) --runtime $(OSCOMP_RUNTIME_LA) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
-		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
+		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)' $(OSCOMP_LOCAL_INIT_ARG)
+
+.PHONY: prepare-oscomp-local-riscv prepare-oscomp-local-loongarch
+prepare-oscomp-local-riscv:
+	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS)
+
+prepare-oscomp-local-loongarch:
+	python3 -B tests/oscomp/local_disks.py --arch loongarch $(OSCOMP_LOCAL_ARGS)
 
 all: $(KERNEL_RV) kernel-la
 
@@ -1220,12 +1235,12 @@ $(BUILD_DIR)/%.o: %.S $(BUILD_DIR)/generated/cost-config.h
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
 
 run-riscv: $(KERNEL_RV)
-	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
-		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot
+	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) \
+		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY)
 
 debug-riscv: $(KERNEL_RV)
-	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
-		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
+	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) \
+		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY) --gdb
 
 .NOTPARALLEL: test-riscv
 test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \

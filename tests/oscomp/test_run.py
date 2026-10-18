@@ -41,7 +41,7 @@ class DiskImageCopyTests(unittest.TestCase):
             if source_hole == size:
                 self.skipTest('temporary filesystem does not distinguish real sparse holes')
 
-            runner.copy_disk_image(source, destination)
+            runner.local_disks.copy_disk_image(source, destination)
 
             self.assertEqual(destination.read_bytes(), source.read_bytes())
             self.assertEqual(destination.stat().st_size, size)
@@ -56,11 +56,23 @@ class DiskImageCopyTests(unittest.TestCase):
             source.write_bytes(b'original image bytes')
             with patch.object(runner.os, 'fsync', side_effect=OSError(errno.EIO, 'sync failed')):
                 with self.assertRaises(OSError) as caught:
-                    runner.copy_disk_image(source, destination)
+                    runner.local_disks.copy_disk_image(source, destination)
             self.assertEqual(caught.exception.errno, errno.EIO)
 
 
 class ReportTests(unittest.TestCase):
+    def test_diagnostic_command_uses_both_writable_disks_and_keeps_original_resources(self):
+        for arch in ('riscv', 'loongarch'):
+            command = runner.boot_command(arch, 'qemu', 'kernel', 'root.img', 'scratch.img',
+                                          {'qemu.mem': '1G', 'qemu.smp': 1}, rng=True)
+            self.assertEqual(command.count('-drive'), 2)
+            self.assertIn('file=root.img,if=none,format=raw,id=x0', command)
+            self.assertIn('file=scratch.img,if=none,format=raw,id=x1', command)
+            self.assertEqual(command[command.index('-m') + 1], '1G')
+            self.assertEqual(command[command.index('-smp') + 1], '1')
+            self.assertIn('user,id=net0', command)
+            self.assertIn('rng-random,id=entropy,filename=/dev/urandom', command)
+
     def test_runtime_identity_uses_actual_target_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

@@ -16,6 +16,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import local_disks
 REF = ROOT / 'references/oscomp-autotest'
 GROUPS = ['basic', 'busybox', 'cyclictest', 'iozone', 'iperf', 'libcbench',
           'libctest', 'lmbench', 'lua', 'netperf', 'ltp']
@@ -29,14 +31,6 @@ def sha(path):
 
 def output(args, cwd=ROOT):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
-
-
-def copy_disk_image(source, destination):
-    # Guest flushes must not pay for first allocating holes or breaking shared
-    # host extents. Finish a written copy before starting either guest clock.
-    subprocess.run(['cp', '--reflink=never', '--sparse=never', str(source), str(destination)], check=True)
-    with Path(destination).open('rb') as stream:
-        os.fsync(stream.fileno())
 
 
 def validate(verify_assets=False, architectures=('riscv', 'loongarch')):
@@ -217,15 +211,14 @@ def judge(log, config):
     return results
 
 
-def boot_command(arch, qemu, kernel, disk, config, rng=False):
+def boot_command(arch, qemu, kernel, disk, scratch, config, rng=False):
     command = [qemu]
     if arch == 'riscv': command += ['-machine', 'virt']
     command += ['-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
                 '-nographic', '-smp', str(config.get('qemu.smp', 1))]
     if arch == 'riscv': command += ['-bios', 'default']
-    command += ['-drive', f'file={disk},if=none,format=raw,id=x0', '-device',
-        'virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0' if arch == 'riscv' else 'virtio-blk-pci,drive=x0',
-        '-no-reboot', '-device', 'virtio-net-device,netdev=net0' if arch == 'riscv' else 'virtio-net-pci,netdev=net0',
+    command += local_disks.disk_arguments(arch, disk, scratch)
+    command += ['-no-reboot', '-device', 'virtio-net-device,netdev=net0' if arch == 'riscv' else 'virtio-net-pci,netdev=net0',
         '-netdev', 'user,id=net0', '-rtc', 'base=utc']
     if rng:
         command += ['-object', 'rng-random,id=entropy,filename=/dev/urandom', '-device',
@@ -279,7 +272,7 @@ def diagnostic_build(architectures, selected, case_timeout, exclusions):
                for arch in architectures}
     command = ['make', '-j8', *('kernel-rv' if arch == 'riscv' else 'kernel-la' for arch in architectures),
         'OSCOMP_GROUPS=' + ' '.join(selected), 'OSCOMP_CASE_TIMEOUT=' + str(case_timeout),
-        'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions)]
+        'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions), 'OSCOMP_LOCAL_DISKS=1']
     for arch, config in configs.items():
         command.append(('INIT_CONFIG_RV=' if arch == 'riscv' else 'INIT_CONFIG_LA=') + str(config))
     return command, environment, configs
@@ -297,6 +290,8 @@ def main():
     ap.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
     ap.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
     ap.add_argument('--rng', action='store_true', help='add real entropy only to this labelled diagnostic profile')
+    ap.add_argument('--local-cache', type=Path, default=Path(os.environ.get('OSCOMP_LOCAL_CACHE', ROOT / 'build/tools/oscomp-local')))
+    ap.add_argument('--toolchain-root', type=Path, default=Path(os.environ.get('OSCOMP_TOOLCHAIN_ROOT', ROOT)))
     args = ap.parse_args()
     architectures = tuple(ARCH_KEYS) if args.arch == 'both' else (args.arch,)
     directory = args.output.resolve() if args.output else ROOT / 'build' / ('oscomp-diagnostic-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
@@ -330,19 +325,22 @@ def main():
             target = directory / ARCH_KEYS[arch]; target.mkdir()
             facts = identity['architectures'][arch]
             kernel = target / facts['kernel']; shutil.copyfile(ROOT / facts['kernel'], kernel)
-            disk = target / 'root.img'
-            copy_disk_image(REF / facts['image'], disk)
+            assets = local_disks.prepare_assets(args.local_cache, args.toolchain_root, arch)
+            disk, scratch = local_disks.prepare_run(REF, assets, target, arch)
             qemu = args.qemu_riscv if arch == 'riscv' else args.qemu_loongarch
             executable = Path(shutil.which(qemu) or qemu).resolve(strict=True)
             base = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
-            command = boot_command(arch, str(executable), kernel, disk, config, args.rng)
+            command = boot_command(arch, str(executable), kernel, disk, scratch, config, args.rng)
             entry = {'kernel_sha256': sha(kernel), 'fixture_sha256': sha(disk), 'boot_count': 1,
                 'backing_preparation': 'written-and-synced',
                 'init_config_path': str(configs[arch]), 'init_config_sha256': sha(ROOT / configs[arch]),
                 'case_sha256': sha(base / 'case'),
                 'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],
                 'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
-                'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable), 'extra_disk': None}
+                'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable),
+                'disk_profile': 'local-two-disk-ext4',
+                'extra_disk': {'path': str(scratch), 'sha256': sha(scratch), **identity['local_disk']},
+                'filesystem_tools': json.loads((assets / 'identity.json').read_text())}
             entry['runtime_compatibility'] = runtime_info(base)
             for name in ('init.sh', 'ltp-hook.sh', 'libctest-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):
                 entry[name + '_sha256'] = sha(HERE / name)

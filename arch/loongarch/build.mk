@@ -86,7 +86,8 @@ test-pci-host:
 	build/host/pci
 	python3 -B tests/host/loongarch_irq.py
 run-loongarch: kernel-la
-	$(QEMU_LOONGARCH64) -machine virt -cpu la464 -smp 1 -m 1G -kernel kernel-la -nographic -no-reboot
+	python3 -B tests/oscomp/local_disks.py --arch loongarch $(OSCOMP_LOCAL_ARGS) \
+		--qemu '$(QEMU_LOONGARCH64)' --kernel $(KERNEL_LA) --memory 1G
 test-loongarch: kernel-la-contract prepare-la-linux test-stack-usage-la test-loongarch-fatal
 	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-contract-la --qemu $(QEMU_LOONGARCH64) --log $(LA_BUILD)/boaros.log
 	python3 -B tests/loongarch/reference.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --boaros-log $(LA_BUILD)/boaros.log

@@ -16,6 +16,7 @@ $BB mknod -m 600 /dev/rtc0 c 10 135
 $BB ln -s /dev/rtc0 /dev/rtc
 $BB ln -s /dev/rtc0 /dev/misc/rtc
 $BB mknod -m 600 /dev/block/252:0 b 252 0
+# BOAROS_LOCAL_DEVICE_NODES
 exec </dev/console >/dev/console 2>&1
 $BB mount -t proc proc /proc
 $BB mount -t tmpfs -o mode=1777 tmpfs /dev/shm
@@ -25,6 +26,7 @@ $BB chmod +x /glibc/basic/run-all.sh /musl/basic/run-all.sh
 export HOME=/ TERM=vt100
 # BOAROS_CASE_PAYLOAD
 # BOAROS_RUNTIME_PAYLOAD
+# BOAROS_LOCAL_DISKS
 groups=${BOAROS_EVAL_GROUPS:-'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'}
 export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-300}
 for group in $groups; do

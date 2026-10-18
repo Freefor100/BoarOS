@@ -12,7 +12,7 @@
 
 `tests/oscomp/inputs.json`固定pre-20250615原RV/LA盘和压缩包SHA-256，以及
 `references/oscomp-autotest` commit `d1bb3a3c4b27274e196a2648518525c1a304e339`。
-原盘只读保留，运行使用独立稀疏副本；`--verify-inputs`显式复查全部四个资产。
+原盘只读保留，运行使用独立副本；`--verify-inputs`显式复查全部四个资产。
 新机器显式make prepare-oscomp-inputs恢复固定Harness及SHA绑定资产；普通运行缺失
 或身份错误直接失败，不暗中下载替代输入。gzip输入缓存位于build/tools/oscomp，
 命中核对解压内容、权限和链接，既有pruner保留该可复用工具输入。
@@ -30,10 +30,57 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 `INIT_CONFIG=config/init.json`同时恢复通用fixture。构建中不可让另一组不同配置
 覆盖正在冻结的kernel；先构建、复制内核及身份，再运行。
 
+## 本地根盘、scratch 与格式化工具
+
+默认 `make all` 为两个架构准备独立的 2 GiB、4 KiB 块 ext4 scratch 模板，以及
+真实静态 `mke2fs` 和设备检查程序。源码版本和 SHA-256 统一由
+`tests/oscomp/inputs.json` 维护；缓存位于 `build/tools/oscomp-local/`，源码、同源
+宿主工具和两个目标工具各自保留，命中时核对输入及实际产物。构建复用现有
+`build/riscv/musl-root`、`build/loongarch/musl-root`、LA soft-float GCC 和目标 UAPI，
+缺失时明确报错。`OSCOMP_TOOLCHAIN_ROOT` 可指向已有工具链的仓库根目录，
+`OSCOMP_LOCAL_CACHE` 可指定共享工具缓存；不在 worktree 中重复构建它们。
+
+`make run-riscv`、`make debug-riscv`、`make run-loongarch` 与 `tests/oscomp/run.py` 共用
+`local_disks.py`：每次生成新运行目录，把保留根盘和该架构 scratch 模板复制成
+两个独立可写文件。复制使用 `cp --reflink=never --sparse=never` 并 fsync，宿主
+分配和写盘在启动 guest 计时前结束。宿主 debugfs 仅向运行根盘的
+`/boaros-tools` 写入目标工具、原版 mke2fs 配置及检查程序；原镜像、LTP/libc
+程序、judge 和原参数不变。两个架构的副本不共用可写后端，scratch 可以由 LTP
+重新格式化。`make prune-build` 保留 tools 缓存，运行目录按已有规则清理。
+
+PID 1 创建根盘 `252:0`、scratch `252:16`、loop0..7 和 loop-control 节点。
+设备检查程序通过 stat/fstat、BLKGETSIZE64、BLKSSZGET 和 BLKROGET 核对
+`/` 对应根块设备、scratch 与根盘不同、容量为模板规定值、扇区为 512 字节且
+实际可写；失败打印具体对象、操作或设备号，不进入评测。通过后才设置
+`LTP_DEV`、`LTP_DEV_FS_TYPE=ext4`、`LTP_SINGLE_FS_TYPE=ext4`，并在 `/bin`
+提供真实 `mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4`。这既让 LTP 复用
+额外物理盘，也保留其正常格式化调用；loop 节点服务需要 loop 接口的原用例。
+
+这是本地双盘 profile。官方容器构建显式设置 `OSCOMP_LOCAL_DISKS=0`，保留原
+Harness 的单根盘设备配置，bootstrap 不依赖本地注入工具，也不设置上述 LTP
+设备变量。不能把本地双盘结果归为官方固定 profile 的运行结果。
+
+手工 QEMU 使用同一套准备好的副本，例如 RV：
+
+```sh
+make all
+python3 -B tests/oscomp/local_disks.py --arch riscv --output build/oscomp-manual-rv
+qemu-system-riscv64 -machine virt -bios default -kernel kernel-rv -m 1G -smp 1 -nographic -no-reboot \
+  -drive file=build/oscomp-manual-rv/root.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -drive file=build/oscomp-manual-rv/scratch.img,if=none,format=raw,id=x1 \
+  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+```
+
+LA 将准备参数改为 `--arch loongarch` 并使用独立目录，QEMU 改为
+`-machine virt -cpu la464 -kernel kernel-la`、移除 `-bios default`，两块设备分别
+使用 `virtio-blk-pci,drive=x0` 与 `virtio-blk-pci,drive=x1`。每次准备必须选择
+新目录；不要把保留原盘或模板直接作为可写 QEMU 后端。
+
 ## 原盘bootstrap与监督
 
-PID1直接exec原盘`/musl/busybox`，bootstrap作为sh -c参数编入内核，不由宿主
-向原盘注入helper。启动创建/bin、设备、proc和/dev/shm，并从目标profile建立
+PID1直接exec原盘`/musl/busybox`，bootstrap作为sh -c参数编入内核，原监督
+helper仍由启动脚本解码。本地格式化工具按上节写入运行副本。启动创建/bin、设备、proc和/dev/shm，并从目标profile建立
 原loader链接。LA使用/lib、/lib64、/usr/lib64三个实际interpreter路径；RV的
 普通/sf musl名称保留。两个libc的LD_LIBRARY_PATH和工作目录分别设置。
 
@@ -71,7 +118,7 @@ EXCLUDE。原LA BusyBox1.33.1的hush不支持set -u/-f；自有脚本按需要�
 内核和fixture，再同时启动；每架构一次启动，两种libc共有22组，双架构44组状态。
 本地入口始终是diagnostic，记录实际QEMU内容/模式/路径、启动参数、kernel/helper/
 bootstrap/fixture身份、真实串口和退出原因。增加RNG或改变预算须显式标记。
-默认仍遵循原Harness设备参数，无RNG时不伪造可信熵ready。
+本地默认使用上述独立双盘 profile，无RNG时不伪造可信熵ready。
 
 使用原parser、22个judge和postwork。联合summary来自本次两份实际输出，LTP
 在联合原始分上调用原非线性公式，不把独立整数分相加。分组状态区分not-selected、
