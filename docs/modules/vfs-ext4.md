@@ -186,6 +186,8 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 
 新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。对预置 unwritten extent 的初始化和 caller 部分写使用同一个 block-cache buffer，避免延迟的 zero buffer 在 direct I/O 之后覆盖用户数据；读取 mapped block 前先排空该物理块的 dirty cache，flush 失败则返回错误而不从旧磁盘内容读取。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
 
+extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/lwext4-metadata-host.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
+
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。根 mount 保存稳定的内部 ID 1 作为 `dev`，不表达物理设备 major/minor。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
 目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
 - `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
@@ -213,12 +215,14 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 
 ## 当前成本边界
 
-增长与缩小分别进入 `kernel_page_cache_extend` 和 `kernel_page_cache_truncate`。
+增长与缩小通过 `kernel_page_cache_resize_prepare/finish` 管理非对齐 EOF 尾页，缩小另由 `kernel_page_cache_truncate` 退休整页。
 增长只查询旧 EOF 的非对齐尾页，清零新暴露字节并重新保护别名，再发布长度；
 页对齐或同长度不访问 inode 页链，也不排空历史 cleanup。真正缩小仍在撤映射后
 处理越界页、尾页脏范围和 owner。该优化不改变私有 COW 副本，哈希探测与尾页
 实际别名工作单独计量。`make test-cache-growth-riscv` 在 COST 构建检查
 1/4/16/64 MiB × 1/4/64 KiB 写入的增长访问界及全文件内容，见[规模成本](../learning/single-hart-scale.md)。
+
+截断后端修改映射后，VFS 保持同一次 inode 写保护，发布实际 EOF、退休越界缓存页并完成尾页处理；不能先解锁再更新缓存，否则排队的写回仍会按旧 EOF 重建已删除的映射，扩展时读出旧内容。后端部分修改后报错时，也先发布实际尺寸与退休整页，再释放保护重取对应尾页资格；无变化失败保留原脏数据。`sh tests/page-cache-concurrency-host.sh truncate` 用明确握手让旧尾页写回排在后端截断之后，检查截零、部分截断及部分修改后 EIO 的前缀保留、扩展补零、资源归还和 `e2fsck -fn`，覆盖 4/16 KiB 页和 1/4 KiB 文件系统块。
 
 普通文件的当前内容由 VFS 页缓存持有。`ext4_fpread` 和 `ext4_fpread_batch`
 先查私有操作、运行组、已封口组和提交中的最新数据版本；命中时从该版本读取。

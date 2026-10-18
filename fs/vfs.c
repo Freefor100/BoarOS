@@ -1437,25 +1437,22 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
         int changed;
         kernel_vfs_node_lock(node,&node_guard,1);
         result = node->instance->ops->truncate(node,size,&actual,&changed);
-        kernel_lock_release(&node_guard);
-        if (!changed) {
-            /* 撤映射可以重建；脏页与尾部内容不能在无变化失败时被提前丢弃。 */
-            kernel_vfs_node_lock(node,&node_guard,1);
-            kernel_page_cache_resize_finish(&resize,old_size);
-        } else {
-            if (actual != size) {
-                kernel_page_cache_resize_finish(&resize,old_size);
-                if (actual < size) kernel_file_mapping_notify(node,actual);
-                if (kernel_page_cache_resize_prepare(cache,node,old_size,actual,&resize))
-                    __builtin_trap();
-            }
-            /* 关闭代次只拒绝MM提交，不能替代缓存lookup的inode保护。
-             * 结果收敛重新取写保护，阻止冷加载越过整页退休与size发布。 */
-            kernel_vfs_node_lock(node,&node_guard,1);
-            kernel_page_cache_resize_finish(&resize,actual);
+        /* 后端映射、缓存退休和尺寸必须在同一次 inode 写保护内发布。
+         * MM 关闭代次不排斥写回；提前解锁会按旧 EOF 重建刚删除的映射。 */
+        if (changed) {
+            __atomic_store_n(&node->size,actual,__ATOMIC_RELEASE); file->size=actual;
             if (actual < old_size) kernel_page_cache_truncate(cache,node,actual);
         }
-        if (changed) { __atomic_store_n(&node->size,actual,__ATOMIC_RELEASE); file->size=actual; }
+        if (changed && actual != size) {
+            kernel_page_cache_resize_finish(&resize,old_size);
+            kernel_lock_release(&node_guard);
+            if (actual < size) kernel_file_mapping_notify(node,actual);
+            if (kernel_page_cache_resize_prepare(cache,node,old_size,actual,&resize))
+                __builtin_trap();
+            kernel_vfs_node_lock(node,&node_guard,1);
+        }
+        /* 无变化失败保留原脏页；部分变化已先发布实际 EOF，再重取尾页资格。 */
+        kernel_page_cache_resize_finish(&resize,changed ? actual : old_size);
         kernel_file_mapping_open(node);
         return result;
     }

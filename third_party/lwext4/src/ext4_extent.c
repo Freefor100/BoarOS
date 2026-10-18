@@ -1311,13 +1311,18 @@ static int ext4_ext_insert_leaf(struct ext4_inode_ref *inode_ref,
 		    ext4_ext_can_prepend(curp->extent, newext)) {
 			unwritten = ext4_ext_is_unwritten(curp->extent);
 			curp->extent->first_block = newext->first_block;
+			/* 左并同时移动逻辑、物理起点，保留原右侧块的映射。 */
+			ext4_ext_store_pblock(curp->extent, ext4_ext_pblock(newext));
 			curp->extent->block_count =
 			    to_le16(ext4_ext_get_actual_len(curp->extent) +
 				    ext4_ext_get_actual_len(newext));
 			if (unwritten)
 				ext4_ext_mark_unwritten(curp->extent);
 
-			err = ext4_ext_dirty(inode_ref, curp);
+			/* 首叶的边界改变也必须发布到祖先索引。 */
+			err = ext4_ext_correct_indexes(inode_ref, path);
+			if (err == EOK)
+				err = ext4_ext_dirty(inode_ref, curp);
 			goto out;
 		}
 	}

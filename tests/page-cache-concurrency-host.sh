@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+case "${1:-all}" in all|truncate) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -22,6 +23,11 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode ${CACHE_HOST_LDFLAGS:-} \
         -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
+        truncate -s 32M "$build_dir/truncate-$shift-$block.img"
+        mkfs.ext4 -q -F -b "$block" "$build_dir/truncate-$shift-$block.img"
+        timeout 15s "$build_dir/concurrency-$shift" "$build_dir/truncate-$shift-$block.img" truncate-writeback
+        e2fsck -fn "$build_dir/truncate-$shift-$block.img" > "$build_dir/fsck-truncate-$shift-$block.log" 2>&1
+        if [ "${1:-all}" = truncate ]; then continue; fi
         truncate -s 32M "$build_dir/image-$shift-$block.img"
         mkfs.ext4 -q -F -b "$block" "$build_dir/image-$shift-$block.img"
         timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift-$block.img"
