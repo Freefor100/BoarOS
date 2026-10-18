@@ -199,6 +199,20 @@ static int mount_error(const struct lwext4_mount_adapter *adapter)
     struct ext4_fs *fs = adapter->device.fs;
     return fs && fs->jbd_journal ? __atomic_load_n(&fs->jbd_journal->error,__ATOMIC_ACQUIRE) : EOK;
 }
+static int free_orphan_inode(struct lwext4_mount_adapter *adapter,uint32_t inode)
+{
+    int result=ext4_orphan_free(adapter->mount_point,inode);
+    if (!result) {
+        /* 失败 close 的旧 handle 不再进入 inode 索引。真正释放 inode 时
+         * 同时退休它的待清理状态，不能在该 inode 复用后再截断新所有者。 */
+        for (struct kernel_vfs_node *node=adapter->instance.cleanup_nodes;node;node=node->next)
+            if (node->inode==inode) {
+                ((struct lwext4_node *)node)->write_completion=0;
+                node->retired=1;
+            }
+    }
+    return result;
+}
 
 static int prepare_journal_mount(struct lwext4_mount_adapter *adapter)
 {
@@ -864,7 +878,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         struct lwext4_orphan *next = orphan->next;
 
         if (!orphan->orphan_freed) {
-            result = ext4_orphan_free(adapter->mount_point, orphan->inode);
+            result = free_orphan_inode(adapter, orphan->inode);
             if (result != EOK) {
                 return lwext4_error(result);
             }
@@ -879,12 +893,17 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         struct kernel_vfs_node *next = node->next;
 
         if (node->unlinked && !node->retired) {
-            result = ext4_orphan_free(adapter->mount_point, node->inode);
+            result = free_orphan_inode(adapter, node->inode);
             if (result == EOK) {
                 node->retired = 1U;
             } else {
                 return lwext4_error(result);
             }
+        }
+        if (((struct lwext4_node *)node)->write_completion && !node->retired) {
+            result=ext4_file_complete_write(lwext4_node_file(node));
+            if (result!=EOK) return lwext4_error(result);
+            ((struct lwext4_node *)node)->write_completion=0;
         }
         if (!node->closed) {
             result = ext4_fclose(lwext4_node_file(node));
@@ -893,6 +912,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
             }
             node->closed = 1U;
         }
+        kernel_file_mapping_destroy(node);
         kernel_heap_release(adapter->instance.heap, node);
         *cleanup_link = next;
     }
@@ -1932,7 +1952,7 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
     } else if (is_orphan) {
         orphan->inode = inode;
         orphan->orphan_freed = 0U;
-        result = ext4_orphan_free(adapter->mount_point, inode);
+        result = free_orphan_inode(adapter, inode);
         if (result != EOK) {
             queue_orphan(adapter, orphan);
             return 0;
@@ -1987,7 +2007,7 @@ static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
     }
     orphan->inode = inode;
     orphan->orphan_freed = 0U;
-    result = ext4_orphan_free(adapter->mount_point, inode);
+    result = free_orphan_inode(adapter, inode);
     if (result != EOK) {
         queue_orphan(adapter, orphan);
         return 0;
@@ -2018,7 +2038,7 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
                                                 node);
     }
 
-    result = ext4_orphan_free(lwext4_instance(node->instance)->mount_point, node->inode);
+    result = free_orphan_inode(lwext4_instance(node->instance), node->inode);
     if (result == EOK) {
         node->retired = 1U;
         struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
@@ -2252,10 +2272,35 @@ static int ext4_backend_fallocate(struct kernel_vfs_node *node, unsigned mode,
     *changed = committed;
     return lwext4_error(result);
 }
+static int ext4_backend_prepare_write(struct kernel_vfs_node *node,uint64_t offset,
+    size_t length,size_t *ready,int *complete)
+{
+    bool needed;
+    int result=ext4_file_prepare_write(lwext4_node_file(node),offset,length,ready,&needed);
+    if (needed && !lwext4_instance(node->instance)->device.fs->jbd_journal)
+        ((struct lwext4_node *)node)->write_completion=1;
+    *complete=needed;
+    return lwext4_error(result);
+}
+static int ext4_backend_complete_write(struct kernel_vfs_node *node)
+{
+    /* Legacy 指针没有 unwritten 状态。已接纳数据先交给后端，再按持久
+     * EOF 回收没有被复制的尾部；失败保留脏数据及持久 orphan owner。 */
+    int result=kernel_page_cache_writeback(node->instance->page_cache,node);
+    if (result) return result;
+    KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,1);
+    result=ext4_file_complete_write(lwext4_node_file(node));
+    if (!result) ((struct lwext4_node *)node)->write_completion=0;
+    return lwext4_error(result);
+}
 static struct kernel_block_device *ext4_backend_block_device(struct kernel_vfs_instance *instance)
 { return lwext4_instance(instance)->block; }
 static int ext4_backend_close_node(struct kernel_vfs_node *node)
-{ return lwext4_error(ext4_fclose(lwext4_node_file(node))); }
+{
+    /* close 不做递归 I/O；通用末引用路径把未完成的对象交给 cleanup_nodes。 */
+    if (((struct lwext4_node *)node)->write_completion) return -KERNEL_EIO;
+    return lwext4_error(ext4_fclose(lwext4_node_file(node)));
+}
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
 static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_only,
@@ -2366,6 +2411,8 @@ static void initialize_backend(void)
     ops->readlink = ext4_backend_readlink;
     ops->truncate = ext4_backend_truncate;
     ops->fallocate = ext4_backend_fallocate;
+    ops->prepare_write = ext4_backend_prepare_write;
+    ops->complete_write = ext4_backend_complete_write;
     ops->block_device = ext4_backend_block_device;
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;

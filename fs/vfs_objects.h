@@ -113,6 +113,12 @@ struct kernel_vfs_backend {
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*fallocate)(struct kernel_vfs_node *node, unsigned mode, uint64_t offset,
         uint64_t length, uint64_t *actual, int *changed);
+    /* prepare returns a physically backed prefix without publishing EOF.
+     * If complete is set, the caller must finish accepted data and unused tail
+     * cleanup under its write-operation qualification, including error exits. */
+    int (*prepare_write)(struct kernel_vfs_node *node, uint64_t offset,
+        size_t length, size_t *ready, int *complete);
+    int (*complete_write)(struct kernel_vfs_node *node);
     struct kernel_block_device *(*block_device)(struct kernel_vfs_instance *instance);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);

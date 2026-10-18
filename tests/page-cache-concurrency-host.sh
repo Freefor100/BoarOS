@@ -25,14 +25,16 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
         if [ "${1:-all}" = fallocate ]; then
             for journal in ${FALLOCATE_HOST_JOURNALS:-journal nonjournal}; do
-                image="$build_dir/fallocate-$shift-$block-$journal.img"
+              for scenario in ${FALLOCATE_HOST_CASES:-${FALLOCATE_HOST_CASE:-fallocate}}; do
+                image="$build_dir/$scenario-$shift-$block-$journal.img"
                 truncate -s "${FALLOCATE_HOST_IMAGE_SIZE:-32M}" "$image"
                 features=has_journal
                 [ "$journal" = journal ] || features=^has_journal
                 mkfs.ext4 -q -F -b "$block" -O "$features" "$image"
-                timeout 30s "$build_dir/concurrency-$shift" "$image" "${FALLOCATE_HOST_CASE:-fallocate}"
-                e2fsck -fn "$image" > "$build_dir/fsck-fallocate-$shift-$block-$journal.log" 2>&1
-                printf 'PASS fallocate page_shift=%s fs_block=%s %s; e2fsck clean\n' "$shift" "$block" "$journal"
+                timeout 30s "$build_dir/concurrency-$shift" "$image" "$scenario"
+                e2fsck -fn "$image" > "$build_dir/fsck-$scenario-$shift-$block-$journal.log" 2>&1
+                printf 'PASS %s page_shift=%s fs_block=%s %s; e2fsck clean\n' "$scenario" "$shift" "$block" "$journal"
+              done
             done
             continue
         fi

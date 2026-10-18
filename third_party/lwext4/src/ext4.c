@@ -1590,10 +1590,7 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 	uint64_t size = ext4_inode_get_size(&mp->fs.sb, ref.inode);
     /* Preallocation can extend mappings past unchanged i_size. A truncate
      * retires those reservations even when its requested size is identical. */
-    if (new_size <= size && ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_EXTENTS)) {
-        r = ext4_extent_remove_space(&ref, (ext4_lblk_t)((new_size + mp->fs.bdev->lg_bsize - 1) /
-            mp->fs.bdev->lg_bsize), EXT_MAX_BLOCKS);
-    }
+    bool tail=new_size<=size;
 	/* The public operation owns the transaction. Never commit an enclosing
 	 * unlink/rename halfway through a truncate. */
 	while (r == EOK && size > new_size) {
@@ -1601,6 +1598,10 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 		       ? size - CONFIG_MAX_TRUNCATE_SIZE : new_size;
 		r = ext4_fs_truncate_inode(&ref, size);
 	}
+    /* legacy 的已初始化指针也可能来自写入准备，而逻辑 EOF 尚未推进。
+     * 按实际映射回收，不能以 old_size==new_size 判断已经没有尾部 owner。 */
+    bool done=false;
+    while (r==EOK && tail && !done) r=ext4_inode_truncate_step(&ref,&done);
 	int cleanup = ext4_fs_put_inode_ref(&ref);
 	return r == EOK ? cleanup : r;
 }
@@ -1636,7 +1637,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 			ref.dirty = true;
 		}
 		if (ext4_inode_can_truncate(&mp->fs.sb, ref.inode))
-			r = ext4_orphan_truncate_step(&ref, &done);
+			r = ext4_inode_truncate_step(&ref, &done);
 		else done = true;
         if (r == EOK && done && dead && !release_inode)
             r = ext4_orphan_mark_truncate(&ref, false);
@@ -1686,7 +1687,7 @@ static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 		if (r == EOK) r = ext4_reclaim_orphan(mp, file->inode, false);
 	} else {
 		do {
-			r = ext4_orphan_truncate_step(&ref, &done);
+			r = ext4_inode_truncate_step(&ref, &done);
 		} while (r == EOK && !done);
         if (r == EOK) r = ext4_inode_get_links_cnt(ref.inode)
             ? ext4_orphan_remove(&ref) : ext4_orphan_mark_truncate(&ref,false);
@@ -2998,6 +2999,133 @@ static int ext4_zero_file_range(struct ext4_inode_ref *ref,
         begin += count;
     }
     return EOK;
+}
+
+int ext4_file_prepare_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,bool *complete)
+{
+    ext4_assert(file && file->mp && ready && complete);
+    *ready=0; *complete=false;
+    if (file->mp->fs.read_only) return EROFS;
+    if (offset>file->fmax || length>file->fmax-offset) return EFBIG;
+    EXT4_MP_LOCK(file->mp);
+    struct ext4_fs *fs=&file->mp->fs;
+    struct jbd_journal *journal=fs->jbd_journal;
+    uint32_t block=fs->bdev->lg_bsize;
+    int r=ext4_prepare_growth(file,offset+length);
+    while (!r && *ready<length) {
+        uint64_t position=offset+*ready;
+        ext4_lblk_t logical=position/block;
+        uint64_t needed=(position%block+length-*ready+block-1)/block;
+        uint32_t maximum=needed<EXT4_BLOCK_BATCH_MAX?needed:EXT4_BLOCK_BATCH_MAX;
+        struct ext4_inode_ref ref;
+        struct ext4_inode_block_range range;
+        r=ext4_fs_get_inode_ref(fs,file->inode,&ref);
+        if (r) break;
+        bool extent=ext4_inode_has_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS);
+        uint64_t eof_blocks=(ext4_inode_get_size(&fs->sb,ref.inode)+block-1)/block;
+        r=ext4_fs_get_inode_dblk_range(&ref,logical,maximum,false,&range);
+        int cleanup=ext4_fs_put_inode_ref(&ref);
+        if (!r) r=cleanup;
+        if (r) break;
+        if (!range.block) {
+Retry:
+            if (journal && journal->grouped && !file->mp->transaction_depth) {
+                while (!jbd_journal_operation_room(journal,maximum,extent?0:maximum,NULL,0)) {
+                    uint64_t target=jbd_journal_reclaim_target(journal);
+                    if (!target || target<=journal->checkpoint_sequence) { r=ENOMEM; break; }
+                    r=ext4_group_wait(file->mp,target,EXT4_JOURNAL_WAIT_CHECKPOINT);
+                    if (r) break;
+                }
+            }
+            if (r) break;
+            r=ext4_trans_start(file->mp);
+            if (r) break;
+            uint64_t failures=journal?journal->budget_failures:0;
+            r=ext4_fs_get_inode_ref(fs,file->inode,&ref);
+            if (!r) {
+                if (!extent && journal && (uint64_t)logical+maximum>eof_blocks) {
+                    r=ext4_orphan_add(&ref);
+                    if (!r) r=ext4_orphan_mark_truncate(&ref,false);
+                }
+                /* 无日志分配可在发布指针后的 buffer 归还处报错，并清空
+                 * range 输出；在创建前保留责任，不能依赖成功输出找 owner。 */
+                if (!extent && !journal && (uint64_t)logical+maximum>eof_blocks) *complete=true;
+                if (!r) r=extent?ext4_extent_reserve_range(&ref,logical,maximum,&range):
+                    ext4_fs_get_inode_dblk_range(&ref,logical,maximum,true,&range);
+                if (!r && !extent && range.allocated) {
+                    for (uint32_t i=0;i<range.count && !r;i++)
+                        r=ext4_initialize_fblock(&ref,range.block+i);
+                    if (r && !journal) {
+                        for (uint32_t i=range.count;i;i--) {
+                            int discarded=ext4_fs_release_inode_dblk_idx(&ref,logical+i-1,range.block+i-1);
+                            if (discarded) { r=discarded; break; }
+                        }
+                    }
+                }
+                cleanup=ext4_fs_put_inode_ref(&ref);
+                if (!r) r=cleanup;
+            }
+            r=ext4_trans_finish(file->mp,r);
+            if (r==ENOMEM && journal && journal->grouped && !file->mp->transaction_depth &&
+                failures!=journal->budget_failures && !journal->error) {
+                uint64_t target=jbd_journal_reclaim_target(journal);
+                if (target>journal->checkpoint_sequence) {
+                    r=ext4_group_wait(file->mp,target,EXT4_JOURNAL_WAIT_CHECKPOINT);
+                    if (!r) goto Retry;
+                }
+            }
+            if (r) break;
+            ext4_file_completed(file,EOK);
+        }
+        if (!range.block || !range.count) { r=EIO; break; }
+        if (!extent && (uint64_t)logical+range.count>eof_blocks) *complete=true;
+        size_t bytes=(size_t)range.count*block-position%block;
+        if (bytes>length-*ready) bytes=length-*ready;
+        *ready+=bytes;
+    }
+    EXT4_MP_UNLOCK(file->mp);
+    return r;
+}
+
+int ext4_file_complete_write(ext4_file *file)
+{
+    ext4_assert(file && file->mp);
+    EXT4_MP_LOCK(file->mp);
+    struct ext4_fs *fs=&file->mp->fs;
+    int r=EOK;
+    if (fs->jbd_journal) {
+        bool present;
+        r=ext4_orphan_contains(fs,file->inode,&present);
+        if (!r && present) {
+            r=ext4_trans_start(file->mp);
+            if (!r) {
+                struct ext4_inode_ref ref;
+                r=ext4_fs_get_inode_ref(fs,file->inode,&ref);
+                if (!r) {
+                    r=ext4_orphan_mark_truncate(&ref,true);
+                    int put=ext4_fs_put_inode_ref(&ref); if (!r) r=put;
+                }
+                r=ext4_trans_finish(file->mp,r);
+            }
+            if (!r) r=ext4_reclaim_orphan(file->mp,file->inode,false);
+        }
+    } else {
+        r=ext4_trans_start(file->mp);
+        if (!r) {
+            struct ext4_inode_ref ref;
+            r=ext4_fs_get_inode_ref(fs,file->inode,&ref);
+            uint64_t size=0;
+            if (!r) {
+                size=ext4_inode_get_size(&fs->sb,ref.inode);
+                r=ext4_fs_put_inode_ref(&ref);
+            }
+            if (!r) r=ext4_trunc_inode(file->mp,file->inode,size);
+            r=ext4_trans_finish(file->mp,r);
+        }
+    }
+    ext4_file_completed(file,r);
+    EXT4_MP_UNLOCK(file->mp);
+    return r;
 }
 
 int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,

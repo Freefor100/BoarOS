@@ -122,16 +122,18 @@ static int legacy_tail(struct ext4_inode_ref *ref, uint64_t keep, bool *changed)
     return EOK;
 }
 
-int ext4_orphan_truncate_step(struct ext4_inode_ref *ref, bool *done)
+int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
 {
     if (!ref || !ref->fs || !ref->inode || !done) return EINVAL;
     *done = false;
     struct ext4_fs *fs = ref->fs;
     struct ext4_sblock *sb = &fs->sb;
     if (fs->read_only) return EROFS;
-    if (!fs->jbd_journal || !fs->curr_trans) return EINVAL;
-    if (fs->jbd_journal->error) return fs->jbd_journal->error;
-    if (fs->curr_trans->error) return fs->curr_trans->error;
+    if (fs->jbd_journal) {
+        if (!fs->curr_trans) return EINVAL;
+        if (fs->jbd_journal->error) return fs->jbd_journal->error;
+        if (fs->curr_trans->error) return fs->curr_trans->error;
+    }
     uint32_t size = fs->bdev->lg_bsize;
     uint64_t target = ext4_inode_get_size(sb, ref->inode);
     uint64_t keep = target / size + (target % size != 0);

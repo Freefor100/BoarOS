@@ -54,6 +54,7 @@ struct lwext4_node {
     struct lwext4_node *dirty_next, **dirty_previous, *staged_next;
     unsigned dirty_fields, staged_fields, extra_times;
     uint8_t noatime;
+    uint8_t write_completion;
 
 };
 _Static_assert(offsetof(struct lwext4_mount_adapter, instance) == 0,
