@@ -94,10 +94,14 @@ void riscv_plic_unregister(uint32_t s, void *arg)
     assert(arg == irq_arg);
     irq_fn = 0;
 }
-void kernel_random_mix(const void *p, size_t n, int trusted)
+void kernel_random_mix(const void *p, size_t n)
 {
-    assert(p && n <= 64 && trusted);
-    credit += (int)n;
+    assert(p && n <= 64);
+}
+void kernel_random_credit_bits(unsigned bits)
+{
+    assert(bits <= 512 && bits % 8 == 0);
+    credit += (int)(bits / 8);
 }
 int kernel_random_ready(void)
 {

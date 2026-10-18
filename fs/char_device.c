@@ -110,7 +110,7 @@ static int random_read(void *instance, struct kernel_task *caller, uint32_t flag
 static int random_write(void *instance, struct kernel_task *caller, uint32_t flags, const void *buffer, size_t size, size_t *bytes_written)
 {
     (void)instance; (void)caller; (void)flags;
-    kernel_random_mix(buffer, size, 0);
+    kernel_random_mix(buffer, size);
     *bytes_written = size;
     return 0;
 }
@@ -136,8 +136,42 @@ static int random_ioctl(void *instance, struct kernel_task *caller, struct kerne
                    KERNEL_UACCESS_STATUS_OK && copied == sizeof(bits)
                    ? 0 : -KERNEL_EFAULT;
     }
+    case 0x40085203U: { /* RNDADDENTROPY: native Linux rand_pool_info. */
+        int entropy_count, length;
+        size_t copied = 0;
+        /* Credentials are currently fixed to root, including CAP_SYS_ADMIN. */
+        if (kernel_copy_from_user(mm, &entropy_count, argument, sizeof(entropy_count), &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != sizeof(entropy_count))
+            return -KERNEL_EFAULT;
+        if (entropy_count < 0) return -KERNEL_EINVAL;
+        if (argument > UINT64_MAX - 2 * sizeof(int)) return -KERNEL_EFAULT;
+        copied = 0;
+        if (kernel_copy_from_user(mm, &length, argument + sizeof(int), sizeof(length), &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != sizeof(length))
+            return -KERNEL_EFAULT;
+        if (length < 0 || argument > UINT64_MAX - 2 * sizeof(int) - (unsigned)length)
+            return -KERNEL_EFAULT;
+        uint8_t input[256];
+        uint64_t address = argument + 2 * sizeof(int);
+        size_t remaining = (unsigned)length;
+        while (remaining) {
+            size_t size = remaining < sizeof(input) ? remaining : sizeof(input);
+            copied = 0;
+            if (kernel_copy_from_user(mm, input, address, size, &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != size) {
+                kernel_random_erase(input, sizeof(input));
+                return -KERNEL_EFAULT;
+            }
+            kernel_random_mix(input, size);
+            address += size;
+            remaining -= size;
+        }
+        kernel_random_erase(input, sizeof(input));
+        /* Partial input may be mixed, but a failed request earns no credit. */
+        kernel_random_credit_bits((unsigned)entropy_count);
+        return 0;
+    }
     case 0x40045201U: /* RNDADDTOENTCNT */
-    case 0x40085203U: /* RNDADDENTROPY */
     case 0x5204U: /* RNDZAPENTCNT */
     case 0x5206U: /* RNDCLEARPOOL */
     case 0x5207U: /* RNDRESEEDCRNG */

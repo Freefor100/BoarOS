@@ -11,7 +11,7 @@
 struct kernel_random_state {
     uint32_t key[8];
     uint8_t seeded;
-    uint8_t credited;
+    unsigned credited_bits;
 };
 
 static struct kernel_random_state random_state;
@@ -126,11 +126,11 @@ struct kernel_wait_queue *kernel_random_wait_queue(void)
     return &ready_queue;
 }
 
-unsigned kernel_random_credited_bits(void) { return random_state.credited * 8U; }
-int kernel_random_ready(void) { return random_state.credited == 32U; }
+unsigned kernel_random_credited_bits(void) { return random_state.credited_bits; }
+int kernel_random_ready(void) { return random_state.credited_bits == 256U; }
 int kernel_random_available(void) { return random_state.seeded != 0U; }
 
-void kernel_random_mix(const void *data, size_t size, int trusted)
+void kernel_random_mix(const void *data, size_t size)
 {
     const uint8_t *p = data;
     uint8_t input[64];
@@ -138,18 +138,11 @@ void kernel_random_mix(const void *data, size_t size, int trusted)
     while (size) {
         size_t n = size > 32U ? 32U : size;
         uintptr_t irq = arch_interrupt_save();
-        int was_ready = kernel_random_ready();
         memcpy(input, random_state.key, 32U);
         memcpy(input + 32U, p, n);
         /* 有界压缩在关中断区完成，避免 IRQ 混种被旧快照覆盖。 */
         kernel_blake2s(input, 32U + n, (uint8_t *)random_state.key);
         random_state.seeded = 1U;
-        if (trusted && !was_ready) {
-            size_t remaining = 32U - random_state.credited;
-            random_state.credited += (uint8_t)(n < remaining ? n : remaining);
-        }
-        if (!was_ready && kernel_random_ready())
-            (void)kernel_wait_queue_wake_all(kernel_random_wait_queue());
         arch_interrupt_restore(irq);
         p += n;
         size -= n;
@@ -157,11 +150,21 @@ void kernel_random_mix(const void *data, size_t size, int trusted)
     kernel_random_erase(input, sizeof(input));
 }
 
+void kernel_random_credit_bits(unsigned bits)
+{
+    uintptr_t irq = arch_interrupt_save();
+    unsigned remaining = 256U - random_state.credited_bits;
+    random_state.credited_bits += bits < remaining ? bits : remaining;
+    if (remaining && kernel_random_ready())
+        (void)kernel_wait_queue_wake_all(kernel_random_wait_queue());
+    arch_interrupt_restore(irq);
+}
+
 enum kernel_random_status kernel_random_initialize(const uint8_t *seed,
                                                    size_t seed_size)
 {
     if (!seed || seed_size < 32U) return KERNEL_RANDOM_STATUS_UNAVAILABLE;
-    kernel_random_mix(seed, seed_size, 0);
+    kernel_random_mix(seed, seed_size);
     return KERNEL_RANDOM_STATUS_OK;
 }
 

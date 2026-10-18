@@ -12,6 +12,7 @@ void kernel_console_putc(char c) { (void)c; }
 const struct kernel_char_device *kernel_tty_device_lookup(uint64_t rdev)
 { (void)rdev; return 0; }
 const struct kernel_char_device *kernel_tty_device_template(void) { return 0; }
+const struct kernel_char_device kernel_loop_control_device = { .rdev = 0xaed };
 const struct kernel_char_device kernel_rtc_device = { .rdev = 0xa87 };
 uint32_t kernel_console_poll(uint32_t requested, struct kernel_wait_queue **q)
 { (void)requested;(void)q; return 0; }
@@ -27,6 +28,16 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,
     (void)mm; *copied=0;
     if (!address) return KERNEL_UACCESS_STATUS_FAULT;
     memcpy((void *)(uintptr_t)address, source, size); *copied=size;
+    return KERNEL_UACCESS_STATUS_OK;
+}
+static uintptr_t fault_at;
+enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,
+    void *destination, uint64_t address, size_t size, size_t *copied)
+{
+    (void)mm; *copied=0;
+    if (!address || (fault_at && address + size > fault_at))
+        return KERNEL_UACCESS_STATUS_FAULT;
+    memcpy(destination, (const void *)(uintptr_t)address, size); *copied=size;
     return KERNEL_UACCESS_STATUS_OK;
 }
 int main(void)
@@ -49,9 +60,29 @@ int main(void)
     assert(!count && restarted==1);
     assert(urandom->read(0,0,KERNEL_FILES_O_NONBLOCK,data,32,&count)==0 && count==32);
     assert(random->write(0,0,0,data,32,&count)==0 && !kernel_random_ready());
-    kernel_random_mix(data,31,1);
-    assert(urandom->ioctl(0,0,0,0,0,0x80045200U,(uintptr_t)&bits)==0 && bits==248);
-    kernel_random_mix(data,1,1);
+    struct { int entropy_count, buf_size; unsigned char bytes[512]; } pool = {1, 512, {0}};
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,0)==-KERNEL_EFAULT);
+    pool.entropy_count=-1;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==-KERNEL_EINVAL);
+    fault_at=(uintptr_t)&pool.buf_size;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==-KERNEL_EINVAL);
+    pool.entropy_count=1;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==-KERNEL_EFAULT);
+    fault_at=0;
+    pool.entropy_count=1; pool.buf_size=-1;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==-KERNEL_EFAULT);
+    pool.buf_size=512;
+    fault_at=(uintptr_t)pool.bytes+256;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==-KERNEL_EFAULT);
+    assert(kernel_random_credited_bits()==0 && !kernel_random_ready());
+    fault_at=0;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==0);
+    assert(kernel_random_credited_bits()==1 && !kernel_random_ready());
+    pool.entropy_count=254; pool.buf_size=1;
+    assert(urandom->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==0);
+    assert(kernel_random_credited_bits()==255 && !kernel_random_ready());
+    pool.entropy_count=2147483647; pool.buf_size=0;
+    assert(random->ioctl(0,0,0,0,0,0x40085203U,(uintptr_t)&pool)==0);
     assert(urandom->ioctl(0,0,0,0,0,0x80045200U,(uintptr_t)&bits)==0 && bits==256);
     assert(random->read(0,0,KERNEL_FILES_O_NONBLOCK,data,32,&count)==0 && count==32);
     assert(random->poll(0,0,0,0)==(KERNEL_POLLIN|KERNEL_POLLRDNORM));
