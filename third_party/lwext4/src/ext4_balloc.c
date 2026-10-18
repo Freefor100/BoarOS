@@ -376,7 +376,7 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
     for (uint32_t step = 0; step < groups; step++) {
         uint32_t group = (first_group + step) % groups;
         struct ext4_block_group_ref bg;
-        int r = ext4_fs_get_block_group_ref_alloc(fs, group, &bg);
+        int r = ext4_fs_get_block_group_ref_alloc(fs, group, &bg, false);
         if (r) return r;
         if (!ext4_bg_get_free_blocks_count(bg.block_group, sb)) {
             r = ext4_fs_put_block_group_ref(&bg);
@@ -465,7 +465,7 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 
 	/* Load block group reference */
 	struct ext4_block_group_ref bg_ref;
-	rc = ext4_fs_get_block_group_ref_alloc(fs, block_group, &bg_ref);
+	rc = ext4_fs_get_block_group_ref_alloc(fs, block_group, &bg_ref, false);
 	if (rc != EOK)
 		return rc;
 

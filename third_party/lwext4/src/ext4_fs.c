@@ -460,48 +460,6 @@ static int ext4_fs_init_inode_bitmap(struct ext4_block_group_ref *bg_ref)
 	return ext4_block_set(bg_ref->fs->bdev, &b);
 }
 
-/**@brief Initialize i-node table in block group.
- * @param bg_ref Reference to block group
- * @return Error code
- */
-static int ext4_fs_init_inode_table(struct ext4_block_group_ref *bg_ref)
-{
-	struct ext4_sblock *sb = &bg_ref->fs->sb;
-	struct ext4_bgroup *bg = bg_ref->block_group;
-
-	uint32_t inode_size = ext4_get16(sb, inode_size);
-	uint32_t block_size = ext4_sb_get_block_size(sb);
-	uint32_t inodes_per_block = block_size / inode_size;
-	uint32_t inodes_in_group = ext4_inodes_in_group_cnt(sb, bg_ref->index);
-	uint32_t table_blocks = inodes_in_group / inodes_per_block;
-	ext4_fsblk_t fblock;
-
-	if (inodes_in_group % inodes_per_block)
-		table_blocks++;
-
-	/* Compute initialization bounds */
-	ext4_fsblk_t first_block = ext4_bg_get_inode_table_first_block(bg, sb);
-
-	ext4_fsblk_t last_block = first_block + table_blocks - 1;
-
-	/* Initialization of all itable blocks */
-	for (fblock = first_block; fblock <= last_block; ++fblock) {
-		struct ext4_block b;
-		int rc = ext4_trans_block_get_noread(bg_ref->fs->bdev, &b, fblock);
-		if (rc != EOK)
-			return rc;
-
-		memset(b.data, 0, block_size);
-		ext4_trans_set_block_dirty(b.buf);
-
-		rc = ext4_block_set(bg_ref->fs->bdev, &b);
-		if (rc != EOK)
-			return rc;
-	}
-
-	return EOK;
-}
-
 static ext4_fsblk_t ext4_fs_get_descriptor_block(struct ext4_sblock *s,
 					     uint32_t bgid,
 					     uint32_t dsc_per_block)
@@ -717,7 +675,8 @@ int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks)
 /* Lookup and validation never initialize disk structures. Only allocation
  * enters this path, after the caller has established its transaction. */
 int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
-				      struct ext4_block_group_ref *ref)
+				      struct ext4_block_group_ref *ref,
+                                      bool inode_allocation)
 {
 	if (fs->read_only)
 		return EROFS;
@@ -736,7 +695,7 @@ int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
 		ref->dirty = true;
 	}
 
-	if (ext4_bg_has_flag(bg, EXT4_BLOCK_GROUP_INODE_UNINIT)) {
+	if (inode_allocation && ext4_bg_has_flag(bg, EXT4_BLOCK_GROUP_INODE_UNINIT)) {
 		rc = ext4_fs_init_inode_bitmap(ref);
 		if (rc != EOK) {
 			ext4_block_set(ref->fs->bdev, &ref->block);
@@ -745,16 +704,9 @@ int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
 
 		ext4_bg_clear_flag(bg, EXT4_BLOCK_GROUP_INODE_UNINIT);
 
-		if (!ext4_bg_has_flag(bg, EXT4_BLOCK_GROUP_ITABLE_ZEROED)) {
-			rc = ext4_fs_init_inode_table(ref);
-			if (rc != EOK) {
-				ext4_block_set(fs->bdev, &ref->block);
-				return rc;
-			}
-
-			ext4_bg_set_flag(bg, EXT4_BLOCK_GROUP_ITABLE_ZEROED);
-		}
-
+		/* 新 inode 在发布位图和 itable_unused 的同一事务内逐个清零。
+         * 整张表可能大于 journal 预算，且数据分配不拥有 inode 初始化；
+         * 未清零的尾部保持 ITABLE_ZEROED 为假，不能声明整表已初始化。 */
 		ref->dirty = true;
 	}
 

@@ -261,7 +261,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 
 		/* Load block group to check */
 		struct ext4_block_group_ref bg_ref;
-		int rc = ext4_fs_get_block_group_ref_alloc(fs, bgid, &bg_ref);
+		int rc = ext4_fs_get_block_group_ref_alloc(fs, bgid, &bg_ref, true);
 		if (rc != EOK)
 			return rc;
 
