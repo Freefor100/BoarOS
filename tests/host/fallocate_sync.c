@@ -10,12 +10,28 @@
 #include <ext4_fs.h>
 #include <ext4_journal.h>
 #include <kernel/time.h>
+#include <stdlib.h>
 enum kernel_time_status __wrap_kernel_time_deadline_from_monotonic(uint64_t target,uint64_t *deadline)
 {
     *deadline=target;
     return target<=kernel_time_monotonic_ns()?KERNEL_TIME_STATUS_DEADLINE_PASSED:KERNEL_TIME_STATUS_OK;
 }
 
+static struct lwext4_mount_adapter *residual_adapter;
+static unsigned shutdown_entered,recovery_live_accepts;
+int __real_jbd_journal_accept(struct jbd_journal *,struct jbd_trans *,uint64_t);
+int __wrap_jbd_journal_accept(struct jbd_journal *journal,struct jbd_trans *operation,uint64_t now)
+{
+    int result=__real_jbd_journal_accept(journal,operation,now);
+    if (!result && residual_adapter && shutdown_entered && journal->accepted_sequence>journal->checkpoint_sequence) {
+        if (!residual_adapter->journal_started)
+            fprintf(stderr,"orphan cleanup after workers stopped: accepted=%llu checkpoint=%llu\n",
+                (unsigned long long)journal->accepted_sequence,(unsigned long long)journal->checkpoint_sequence);
+        assert(residual_adapter->journal_started);
+        recovery_live_accepts++;
+    }
+    return result;
+}
 static unsigned hold_flush,flush_entered,release_flush,fallocate_done;
 static enum kernel_block_status fallocate_flush(void *unused)
 {
@@ -82,6 +98,35 @@ static void synchronous_case(struct kernel_heap *heap,struct kernel_heap *backen
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
     printf("PASS synchronous fallocate: flags=%o cpu=%u mode=%u held actual flush, released operation/offset, durable target and reloaded bytes\n",flags,cpu,mode);
 }
+static void residual_orphan_shutdown(struct kernel_heap *heap,struct kernel_heap *backend_heap,
+    struct physical_page_allocator *pages,struct kernel_block_device *disk)
+{
+    struct kernel_page_cache cache={0}; struct kernel_vfs_mount mount={0};
+    assert(!kernel_page_cache_init(&cache,heap,pages) && !kernel_vfs_mount_ext4(&mount,disk,backend_heap,&cache,0));
+    assert(!kernel_page_cache_start_worker(&cache) && !kernel_vfs_start_journal_worker(&mount));
+    residual_adapter=lwext4_instance(mount.private_data);
+    char path[96]; snprintf(path,sizeof(path),"%sresidual-shrink",residual_adapter->mount_point);
+    ext4_file file; assert(!ext4_fopen(&file,path,"w+"));
+    unsigned char bytes[16384]; memset(bytes,0x4d,sizeof(bytes)); size_t done;
+    assert(!ext4_fwrite(&file,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    /* An accepted outer shrink legitimately leaves persisted orphan work;
+     * no VFS node or external file owner remains to describe that work. */
+    assert(!ext4_transaction_begin(residual_adapter->mount_point));
+    assert(!ext4_ftruncate(&file,4096));
+    assert(!ext4_transaction_end(residual_adapter->mount_point) && !ext4_fclose(&file));
+    shutdown_entered=1;
+    assert(!kernel_vfs_unmount(&mount)); residual_adapter=NULL;
+    assert(recovery_live_accepts && !kernel_page_cache_destroy(&cache));
+    cache=(struct kernel_page_cache){0}; mount=(struct kernel_vfs_mount){0};
+    assert(!kernel_page_cache_init(&cache,heap,pages) && !kernel_vfs_mount_ext4(&mount,disk,backend_heap,&cache,0));
+    struct kernel_vfs_file restored={0}; struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_open(&mount,"/residual-shrink",&restored) && !kernel_vfs_fstat(&restored,&stat));
+    assert(stat.size==4096 && stat.blocks==8);
+    assert(!kernel_vfs_pread(&restored,0,bytes,4096,&done) && done==4096);
+    for (size_t i=0;i<done;i++) assert(bytes[i]==0x4d);
+    assert(!kernel_vfs_close(&restored) && !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
+    puts("PASS residual orphan shutdown: cleanup accepted and checkpointed with live workers; final stop, remount, prefix and block return");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,NULL,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -96,7 +141,8 @@ int main(int argc,char **argv)
     image=open(argv[1],O_RDWR); assert(image>=0); struct stat info; assert(!fstat(image,&info));
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=fallocate_flush,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
-    for (unsigned kind=0;kind<2;kind++) for (unsigned cpu=0;cpu<2;cpu++) for (unsigned punch=0;punch<2;punch++)
+    if (getenv("FALLOCATE_SYNC_RESIDUAL")) residual_orphan_shutdown(&heap,&backend_heap,&pages,&disk);
+    else for (unsigned kind=0;kind<2;kind++) for (unsigned cpu=0;cpu<2;cpu++) for (unsigned punch=0;punch<2;punch++)
         synchronous_case(&heap,&backend_heap,&pages,&disk,kind?KERNEL_FILES_O_SYNC:KERNEL_FILES_O_DSYNC,cpu,punch?3:1);
     assert(!close(image)); mm_test_context=0;
     assert(!kernel_mm_release(&mm) && !physical_page_release(&pages,kernel.root_address));

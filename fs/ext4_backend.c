@@ -908,6 +908,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     }
     if (adapter->journal_started) {
         if (adapter->device.fs->jbd_journal) {
+            /* 持久 orphan 意图可由已关闭的外层事务留下；恢复会接受
+             * 新的日志组，必须在提交与 checkpoint worker 仍存活时完成。 */
+            result = ext4_orphan_recover(adapter->mount_point);
+            if (result != EOK) return lwext4_error(result);
             result = ext4_journal_group_drain(adapter->mount_point);
             if (result != EOK) return lwext4_error(result);
         }

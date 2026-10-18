@@ -55,7 +55,7 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 普通卸载当前针对非根挂载；绝对根挂载没有 parent/covered 边，用户态
 `umount2("/", 0)` 返回 `EINVAL`。固定 Linux 对该情形尝试只读重配置，
 这条根挂载路径须随 remount 独立实现，内核关机的根盘收口不代替它。
-卸载先检查忙引用并标记 quiescing，阻止新操作，再停 worker、完成在途 I/O 和持久化交接。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。
+卸载先检查忙引用并标记 quiescing，阻止新操作，排空页缓存和在途 I/O。遗留的持久 orphan 意图在 journal worker 仍存活时恢复；恢复可能接受新日志组，因此先完成最终 checkpoint drain，再停止 journal worker 和卸载 lwext4。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。`FALLOCATE_SYNC_RESIDUAL=1 sh tests/fallocate-sync-host.sh` 检查已关闭外层截断留下的恢复工作、worker 生命周期、重挂载内容与块归还。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
