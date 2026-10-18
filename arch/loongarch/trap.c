@@ -110,6 +110,12 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
                 request.arguments[2],request.arguments[3],&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
                 la_virt_fatal("wait4");
             break;
+        case KERNEL_SYSCALL_ACTION_WAITID:
+            if (kernel_scheduler_waitid_current((int32_t)request.arguments[0],
+                (int64_t)(int32_t)(uint32_t)request.arguments[1],request.arguments[2],
+                (uint32_t)request.arguments[3],request.arguments[4],&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
+                la_virt_fatal("waitid");
+            break;
         case KERNEL_SYSCALL_ACTION_EXEC:
             if (kernel_scheduler_exec_commit()!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("exec commit");
             return;

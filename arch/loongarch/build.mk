@@ -1,3 +1,6 @@
+ifneq ($(wildcard build/tools/loongarch/bin/loongarch64-unknown-linux-gnu-gcc),)
+export PATH := $(abspath build/tools/loongarch/bin):$(PATH)
+endif
 LA_CROSS_COMPILE ?= loongarch64-unknown-linux-gnu-
 QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
 LA_BUILD ?= build/loongarch

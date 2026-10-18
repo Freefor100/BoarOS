@@ -142,6 +142,14 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     uint64_t rusage_address,
     int64_t *linux_result);
 
+enum kernel_scheduler_status kernel_scheduler_waitid_current(
+    int32_t which,
+    int64_t upid,
+    uint64_t infop_address,
+    uint32_t options,
+    uint64_t rusage_address,
+    int64_t *linux_result);
+
 enum kernel_wait_wake_reason {
     KERNEL_WAIT_WOKEN = 0,
     KERNEL_WAIT_TIMEOUT = 1,

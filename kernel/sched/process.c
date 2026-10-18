@@ -29,14 +29,27 @@
 
 #define LINUX_WNOHANG UINT32_C(0x00000001)
 #define LINUX_WUNTRACED UINT32_C(0x00000002)
+#define LINUX_WSTOPPED UINT32_C(0x00000002)
+#define LINUX_WEXITED UINT32_C(0x00000004)
 #define LINUX_WCONTINUED UINT32_C(0x00000008)
+#define LINUX_WNOWAIT UINT32_C(0x01000000)
 #define LINUX_WAIT_CONTINUED UINT32_C(0xffff)
 #define LINUX___WNOTHREAD UINT32_C(0x20000000)
 #define LINUX___WALL UINT32_C(0x40000000)
 #define LINUX___WCLONE UINT32_C(0x80000000)
+
+#define LINUX_P_ALL 0
+#define LINUX_P_PID 1
+#define LINUX_P_PGID 2
+#define LINUX_P_PIDFD 3
+
 #define LINUX_WAIT4_SUPPORTED_OPTIONS \
     (LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED | \
      LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
+
+#define LINUX_WAITID_SUPPORTED_OPTIONS \
+    (LINUX_WNOHANG | LINUX_WNOWAIT | LINUX_WEXITED | LINUX_WSTOPPED | \
+     LINUX_WCONTINUED | LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
@@ -977,33 +990,31 @@ enum kernel_scheduler_status arch_process_clone_current(
 
 static int wait_child_matches(const struct kernel_task *parent,
                               const struct kernel_task *child,
-                              int64_t pid)
+                              int32_t which,
+                              int64_t upid)
 {
-    if (pid > 0) {
-        return child->tid == pid;
-    }
-    if (pid == 0) {
-        return process_identity_number(child, KERNEL_PID_PGID) == process_identity_number(parent, KERNEL_PID_PGID);
-    }
-    if (pid == -1) {
+    if (which == LINUX_P_ALL) {
         return 1;
     }
-    return process_identity_number(child, KERNEL_PID_PGID) == -pid;
+    if (which == LINUX_P_PID) {
+        return child->tid == upid;
+    }
+    if (which == LINUX_P_PGID) {
+        int64_t target_pgid = (upid == 0)
+            ? process_identity_number(parent, KERNEL_PID_PGID)
+            : upid;
+        return process_identity_number(child, KERNEL_PID_PGID) == target_pgid;
+    }
+    return 0;
 }
 
-static enum kernel_scheduler_status reap_waited_child(
+static enum kernel_scheduler_status retire_waited_zombie(
     struct kernel_task *parent,
     struct kernel_task *child,
-    uint64_t status_address,
-    uint64_t rusage_address,
-    int64_t *linux_result)
+    uint64_t user_ticks,
+    uint64_t kernel_ticks)
 {
     kernel_pid_t pid = child->tid;
-    uint32_t wait_status = child->wait_status;
-    uint64_t user_ticks = child->user_ticks + child->child_user_ticks;
-    uint64_t kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
-    size_t copied = 0U;
-    enum kernel_uaccess_status access_status = KERNEL_UACCESS_STATUS_OK;
 
     if (child->state != KERNEL_THREAD_STATE_ZOMBIE ||
         child->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
@@ -1021,48 +1032,65 @@ static enum kernel_scheduler_status reap_waited_child(
      * Scratch disposal stays outside rank40, before the retirement transaction. */
     kernel_task_release_io_scratch(child);
     {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    parent->group_leader->child_user_ticks += user_ticks;
-    parent->group_leader->child_kernel_ticks += kernel_ticks;
-    parent->group_leader->child_minor_faults +=
-        child->minor_faults + child->child_minor_faults;
-    parent->group_leader->child_major_faults +=
-        child->major_faults + child->child_major_faults;
-    child_remove_locked(parent->group_leader, child);
-    if (scheduler.init_task == child) {
-        scheduler.init_task = 0;
-    }
-    child->group_leader = 0;
-    child->group_members = 0U;
-    child->publish_completion = 0U;
-    struct kernel_wait_cursor unused;
-    if (scheduler_forget_task_locked(child, &unused)) __builtin_trap();
-    if (!child->storage_borrows) __builtin_trap();
-    scheduler_task_retire_locked(child);
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        parent->group_leader->child_user_ticks += user_ticks;
+        parent->group_leader->child_kernel_ticks += kernel_ticks;
+        parent->group_leader->child_minor_faults +=
+            child->minor_faults + child->child_minor_faults;
+        parent->group_leader->child_major_faults +=
+            child->major_faults + child->child_major_faults;
+        child_remove_locked(parent->group_leader, child);
+        if (scheduler.init_task == child) {
+            scheduler.init_task = 0;
+        }
+        child->group_leader = 0;
+        child->group_members = 0U;
+        child->publish_completion = 0U;
+        struct kernel_wait_cursor unused;
+        if (scheduler_forget_task_locked(child, &unused)) __builtin_trap();
+        if (!child->storage_borrows) __builtin_trap();
+        scheduler_task_retire_locked(child);
     }
     process_identity_collect();
     (void)kernel_wait_queue_wake_all(&parent->group_leader->child_exit_queue);
-    /* The selected borrow still prevents disposal. Its last put (or the
-     * remaining lookup owner) collects the record after the event claim ends. */
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 
+static enum kernel_scheduler_status reap_waited_child(
+    struct kernel_task *parent,
+    struct kernel_task *child,
+    uint64_t status_address,
+    uint64_t rusage_address,
+    int64_t *linux_result)
+{
+    kernel_pid_t pid = child->tid;
+    uint32_t wait_status = child->wait_status;
+    uint64_t user_ticks = child->user_ticks + child->child_user_ticks;
+    uint64_t kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
+
+    enum kernel_scheduler_status status =
+        retire_waited_zombie(parent, child, user_ticks, kernel_ticks);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+
+    size_t copied = 0U;
+    enum kernel_uaccess_status access_status = KERNEL_UACCESS_STATUS_OK;
     if (status_address != 0U) {
         access_status = kernel_copy_to_user(&parent->mm,
                                             status_address,
                                             &wait_status,
                                             sizeof(wait_status),
                                             &copied);
-    }
-    if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-        *linux_result = -KERNEL_EFAULT;
-        return KERNEL_SCHEDULER_STATUS_OK;
-    }
-    if (access_status != KERNEL_UACCESS_STATUS_OK ||
-        (status_address != 0U && copied != sizeof(wait_status))) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(wait_status)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
     }
     if (rusage_address != 0U) {
         struct kernel_linux_rusage rusage = {0};
-        size_t rusage_copied = 0U;
         rusage.ru_utime.tv_sec = (int64_t)(user_ticks /
                                            KERNEL_TICKS_PER_SECOND);
         rusage.ru_utime.tv_usec =
@@ -1077,11 +1105,14 @@ static enum kernel_scheduler_status reap_waited_child(
                                             rusage_address,
                                             &rusage,
                                             sizeof(rusage),
-                                            &rusage_copied);
-        if (access_status != KERNEL_UACCESS_STATUS_OK ||
-            rusage_copied != sizeof(rusage)) {
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
             *linux_result = -KERNEL_EFAULT;
             return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(rusage)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
     *linux_result = pid;
@@ -1116,6 +1147,14 @@ static enum kernel_scheduler_status report_wait_event(
     }
     if (rusage_address != 0U) {
         struct kernel_linux_rusage rusage = {0};
+        uint64_t user_ticks = child->user_ticks + child->child_user_ticks;
+        uint64_t kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
+        rusage.ru_utime.tv_sec = (int64_t)(user_ticks / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_utime.tv_usec = (int64_t)(user_ticks % KERNEL_TICKS_PER_SECOND) *
+                                  (int64_t)(1000000U / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_stime.tv_sec = (int64_t)(kernel_ticks / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_stime.tv_usec = (int64_t)(kernel_ticks % KERNEL_TICKS_PER_SECOND) *
+                                  (int64_t)(1000000U / KERNEL_TICKS_PER_SECOND);
 
         copied = 0U;
         access_status = kernel_copy_to_user(&parent->mm,
@@ -1136,8 +1175,92 @@ static enum kernel_scheduler_status report_wait_event(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+static enum kernel_scheduler_status report_waitid_event(
+    struct kernel_task *parent,
+    int event_found,
+    int32_t signo,
+    int32_t cause,
+    int32_t pid,
+    uint32_t uid,
+    int32_t status_code,
+    uint64_t rusage_address,
+    uint64_t infop_address,
+    uint64_t user_ticks,
+    uint64_t kernel_ticks,
+    int64_t *linux_result)
+{
+    size_t copied = 0U;
+    enum kernel_uaccess_status access_status;
+
+    if (event_found && rusage_address != 0U) {
+        struct kernel_linux_rusage rusage = {0};
+        rusage.ru_utime.tv_sec = (int64_t)(user_ticks / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_utime.tv_usec = (int64_t)(user_ticks % KERNEL_TICKS_PER_SECOND) *
+                                  (int64_t)(1000000U / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_stime.tv_sec = (int64_t)(kernel_ticks / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_stime.tv_usec = (int64_t)(kernel_ticks % KERNEL_TICKS_PER_SECOND) *
+                                  (int64_t)(1000000U / KERNEL_TICKS_PER_SECOND);
+
+        copied = 0U;
+        access_status = kernel_copy_to_user(&parent->mm,
+                                            rusage_address,
+                                            &rusage,
+                                            sizeof(rusage),
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(rusage)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+    }
+
+    if (infop_address != 0U) {
+        if (kernel_user_range_check(infop_address, 128U) != KERNEL_UACCESS_STATUS_OK) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        int32_t head[3] = {signo, 0, cause};
+        copied = 0U;
+        access_status = kernel_copy_to_user(&parent->mm,
+                                            infop_address,
+                                            head,
+                                            sizeof(head),
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(head)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+
+        int32_t body[3] = {pid, (int32_t)uid, status_code};
+        copied = 0U;
+        access_status = kernel_copy_to_user(&parent->mm,
+                                            infop_address + 16U,
+                                            body,
+                                            sizeof(body),
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(body)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+    }
+
+    *linux_result = 0;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
 static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent,
-    int64_t pid, uint32_t options, struct kernel_task **selected, uint32_t *event, int *matching)
+    int32_t which, int64_t upid, uint32_t options, struct kernel_task **selected, uint32_t *event, int *matching)
 {
     *selected = 0;
     *event = 0;
@@ -1178,17 +1301,29 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
                     break;
                 }
                 if (!((options & LINUX___WNOTHREAD) && child->child_creator != process_identity(parent, KERNEL_PID_TID)) &&
-                    !((options & LINUX___WCLONE) && !(options & LINUX___WALL)) && wait_child_matches(parent, child, pid)) {
-                    *matching = 1;
-                    uint32_t kind = child->state == KERNEL_THREAD_STATE_ZOMBIE ? 1 :
-                        child->group_stopped && (options & LINUX_WUNTRACED) && !child->stop_notified ? 2 :
-                        !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
-                    if (kind && !child->reaping) {
-                        child->reaping = 1;
-                        scheduler_task_get_locked(child);
-                        *selected = child;
-                        *event = kind;
-                        return KERNEL_SCHEDULER_STATUS_OK;
+                    !((options & LINUX___WCLONE) && !(options & LINUX___WALL)) && wait_child_matches(parent, child, which, upid)) {
+                    if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
+                        if (options & LINUX_WEXITED) {
+                            *matching = 1;
+                            if (!child->reaping) {
+                                child->reaping = 1;
+                                scheduler_task_get_locked(child);
+                                *selected = child;
+                                *event = 1;
+                                return KERNEL_SCHEDULER_STATUS_OK;
+                            }
+                        }
+                    } else {
+                        *matching = 1;
+                        uint32_t kind = child->group_stopped && (options & (LINUX_WUNTRACED | LINUX_WSTOPPED)) && !child->stop_notified ? 2 :
+                            !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
+                        if (kind && !child->reaping) {
+                            child->reaping = 1;
+                            scheduler_task_get_locked(child);
+                            *selected = child;
+                            *event = kind;
+                            return KERNEL_SCHEDULER_STATUS_OK;
+                        }
                     }
                 }
                 previous = (uintptr_t)child;
@@ -1224,6 +1359,24 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
     if (!linux_result || arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (options & ~LINUX_WAIT4_SUPPORTED_OPTIONS) { *linux_result = -KERNEL_EINVAL; return KERNEL_SCHEDULER_STATUS_OK; }
     if (pid == INT32_MIN) { *linux_result = -KERNEL_ESRCH; return KERNEL_SCHEDULER_STATUS_OK; }
+
+    int32_t which;
+    int64_t upid;
+    if (pid < -1) {
+        which = LINUX_P_PGID;
+        upid = -pid;
+    } else if (pid == -1) {
+        which = LINUX_P_ALL;
+        upid = 0;
+    } else if (pid == 0) {
+        which = LINUX_P_PGID;
+        upid = 0;
+    } else {
+        which = LINUX_P_PID;
+        upid = pid;
+    }
+    options |= LINUX_WEXITED;
+
     for (;;) {
         enum kernel_scheduler_status status = validate_current();
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
@@ -1237,12 +1390,12 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
         struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = 0;
         uint32_t event;
         int matching;
-        status = select_wait_child(parent, pid, options, &child, &event, &matching);
+        status = select_wait_child(parent, which, upid, options, &child, &event, &matching);
         claim = child;
         if (status == KERNEL_SCHEDULER_STATUS_OK && !child && matching && !(options & LINUX_WNOHANG)) {
             status = kernel_wait_prepare(&parent->group_leader->child_exit_queue, 0, 1, &token);
             if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-            status = select_wait_child(parent, pid, options, &child, &event, &matching);
+            status = select_wait_child(parent, which, upid, options, &child, &event, &matching);
             claim = child;
         }
         if (status != KERNEL_SCHEDULER_STATUS_OK || child || !matching || (options & LINUX_WNOHANG)) {
@@ -1251,20 +1404,164 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
             if (finished != KERNEL_SCHEDULER_STATUS_OK) return finished;
             if (!child) { *linux_result = matching ? 0 : -KERNEL_ECHILD; return KERNEL_SCHEDULER_STATUS_OK; }
             if (event == 1) return reap_waited_child(parent, child, status_address, rusage_address, linux_result);
-            kernel_pid_t number;
             uint32_t reported;
             {
                 KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-                number = child->tid;
                 reported = event == 2 ? child->wait_status : LINUX_WAIT_CONTINUED;
+                if (event == 2) child->stop_notified = 1;
+                else if (event == 3) child->continue_notified = 0;
             }
             status = report_wait_event(parent, child, reported, status_address, rusage_address, linux_result);
-            if (status == KERNEL_SCHEDULER_STATUS_OK && *linux_result == number) {
-                KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-                if (event == 2) child->stop_notified = 1;
-                else child->continue_notified = 0;
-            }
             return status;
+        }
+        enum kernel_wait_wake_reason reason;
+        status = kernel_wait_park(&token, &reason);
+        enum kernel_scheduler_status finished = kernel_wait_finish(&token);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        if (finished != KERNEL_SCHEDULER_STATUS_OK) return finished;
+        if (reason == KERNEL_WAIT_SIGNALLED) {
+            *linux_result = -KERNEL_ERESTARTSYS;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+    }
+}
+
+enum kernel_scheduler_status kernel_scheduler_waitid_current(
+    int32_t which,
+    int64_t upid,
+    uint64_t infop_address,
+    uint32_t options,
+    uint64_t rusage_address,
+    int64_t *linux_result)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    if (!linux_result || arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+
+    if (options & ~LINUX_WAITID_SUPPORTED_OPTIONS) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+    if (!(options & (LINUX_WEXITED | LINUX_WSTOPPED | LINUX_WCONTINUED))) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+
+    switch (which) {
+    case LINUX_P_ALL:
+        break;
+    case LINUX_P_PID:
+        if (upid <= 0) {
+            *linux_result = -KERNEL_EINVAL;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        break;
+    case LINUX_P_PGID:
+        if (upid < 0) {
+            *linux_result = -KERNEL_EINVAL;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        break;
+    case LINUX_P_PIDFD:
+        if (upid < 0) {
+            *linux_result = -KERNEL_EINVAL;
+        } else {
+            *linux_result = -KERNEL_EBADF;
+        }
+        return KERNEL_SCHEDULER_STATUS_OK;
+    default:
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+
+    for (;;) {
+        enum kernel_scheduler_status status = validate_current();
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        status = validate_queues();
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        struct kernel_task *parent = kernel_cpu_current()->current;
+        if (parent == kernel_cpu_current()->idle || parent->arch.user_mode != 1 || !parent->tid_owned)
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        struct kernel_wait_token token = {0};
+        SCHEDULER_TASK_BORROW(child, 0);
+        struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = 0;
+        uint32_t event;
+        int matching;
+        status = select_wait_child(parent, which, upid, options, &child, &event, &matching);
+        claim = child;
+        if (status == KERNEL_SCHEDULER_STATUS_OK && !child && matching && !(options & LINUX_WNOHANG)) {
+            status = kernel_wait_prepare(&parent->group_leader->child_exit_queue, 0, 1, &token);
+            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+            status = select_wait_child(parent, which, upid, options, &child, &event, &matching);
+            claim = child;
+        }
+        if (status != KERNEL_SCHEDULER_STATUS_OK || child || !matching || (options & LINUX_WNOHANG)) {
+            enum kernel_scheduler_status finished = token.task ? kernel_wait_finish(&token) : KERNEL_SCHEDULER_STATUS_OK;
+            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+            if (finished != KERNEL_SCHEDULER_STATUS_OK) return finished;
+            if (!child) {
+                if (!matching) {
+                    *linux_result = -KERNEL_ECHILD;
+                    return KERNEL_SCHEDULER_STATUS_OK;
+                }
+                return report_waitid_event(parent, 0, 0, 0, 0, 0, 0,
+                                           rusage_address, infop_address, 0, 0, linux_result);
+            }
+
+            int32_t signo = 17; /* SIGCHLD */
+            int32_t cause = 0;
+            int32_t status_code = 0;
+            kernel_pid_t child_pid = 0;
+            uint32_t child_uid = 0;
+            uint64_t user_ticks = 0;
+            uint64_t kernel_ticks = 0;
+
+            if (event == 1) {
+                child_pid = child->tid;
+                uint32_t ws = child->wait_status;
+                user_ticks = child->user_ticks + child->child_user_ticks;
+                kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
+                if ((ws & 0x7fU) == 0U) {
+                    cause = 1; /* CLD_EXITED */
+                    status_code = (int32_t)((ws >> 8U) & 0xffU);
+                } else {
+                    cause = (ws & 0x80U) ? 3 /* CLD_DUMPED */ : 2 /* CLD_KILLED */;
+                    status_code = (int32_t)(ws & 0x7fU);
+                }
+
+                if (!(options & LINUX_WNOWAIT)) {
+                    status = retire_waited_zombie(parent, child, user_ticks, kernel_ticks);
+                    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+                }
+            } else if (event == 2) {
+                {
+                    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+                    child_pid = child->tid;
+                    uint32_t ws = child->wait_status;
+                    cause = 5; /* CLD_STOPPED */
+                    status_code = (int32_t)((ws >> 8U) & 0xffU);
+                    user_ticks = child->user_ticks + child->child_user_ticks;
+                    kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
+                    if (!(options & LINUX_WNOWAIT)) {
+                        child->stop_notified = 1;
+                    }
+                }
+            } else if (event == 3) {
+                {
+                    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+                    child_pid = child->tid;
+                    cause = 6; /* CLD_CONTINUED */
+                    status_code = 18; /* SIGCONT */
+                    user_ticks = child->user_ticks + child->child_user_ticks;
+                    kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
+                    if (!(options & LINUX_WNOWAIT)) {
+                        child->continue_notified = 0;
+                    }
+                }
+            }
+
+            return report_waitid_event(parent, 1, signo, cause, child_pid, child_uid, status_code,
+                                       rusage_address, infop_address, user_ticks, kernel_ticks, linux_result);
         }
         enum kernel_wait_wake_reason reason;
         status = kernel_wait_park(&token, &reason);

@@ -20,6 +20,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。
 - `KERNEL_SYSCALL_ACTION_CLONE`：参数符合当前支持的进程/线程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造任务。
 - `KERNEL_SYSCALL_ACTION_WAIT4`：参数保持 Linux ABI 形态，由 scheduler 完成选择、阻塞、唤醒与 zombie 回收。
+- `KERNEL_SYSCALL_ACTION_WAITID`：参数保持 Linux ABI 形态（支持 which, upid, infop, options, rusage），由 scheduler 完成选择、阻塞、唤醒与事件消费/zombie 回收。
 - `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选。
 - `KERNEL_SYSCALL_ACTION_SIGNAL_RETURN`：由架构信号返回路径恢复用户现场。
 - `KERNEL_SYSCALL_ACTION_EXIT_GROUP`：终止调用任务所属线程组，各成员沿原栈清理资源。
@@ -56,7 +57,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
 - `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_LOCKED/MAP_GROWSDOWN` 返回 `EOPNOTSUPP`；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
-- `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（回收先行，子进程不可再次 wait）。
+- `waitid` 编号为 95，支持 `P_ALL/P_PID/P_PGID/P_PIDFD`，`WEXITED/WSTOPPED/WCONTINUED/WNOHANG/WNOWAIT` 及 `__WNOTHREAD/__WCLONE/__WALL` 标志。事件先于用户态复制消费（WNOWAIT 保持事件未消费并保留 zombie）；退出事件支持 NULL infop，输出用户态 EFAULT 不回滚已消费事件。
+- `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（事件消费与回收先行，子进程不可再次 wait）。
 - `prlimit64` 编号为 261，当前实现 `RLIMIT_NOFILE(7)` 与 `RLIMIT_STACK(3)` 的查询和设置；pid 0 指当前线程组，正 pid 指存活任务所属组。新值先从用户复制，设置和旧值快照完成后才向用户写回旧值，因此旧值地址故障仍保留已生效的设置。软值不得大于硬值；当前硬容量分别是 1024 个 fd 和 8 MiB 栈，超出拒绝。其他有效 resource 返回 `-ENOTSUP`，未知 resource 返回 `-EINVAL`，不返回虚假的成功。
 - `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
