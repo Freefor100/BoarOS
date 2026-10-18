@@ -132,6 +132,9 @@ uint64_t __wrap_physical_page_available(const struct physical_page_allocator *al
 static _Thread_local struct kernel_rwlock *attempt_inode_lock;
 static _Thread_local unsigned *inode_read_attempts;
 static _Thread_local unsigned *inode_read_resume;
+static struct kernel_rwlock *truncate_publish_lock;
+static unsigned truncate_backend_done,truncate_writer_attempt,truncate_writer_done;
+static _Thread_local unsigned truncate_after_backend,truncate_writer;
 void __real_kernel_rwlock_read(struct kernel_rwlock *, struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
@@ -140,6 +143,8 @@ void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_gu
         __atomic_fetch_add(inode_read_attempts,1,__ATOMIC_RELEASE);
         while(inode_read_resume && !__atomic_load_n(inode_read_resume,__ATOMIC_ACQUIRE))sched_yield();
     }
+    if (truncate_writer && lock==truncate_publish_lock)
+        __atomic_store_n(&truncate_writer_attempt,1,__ATOMIC_RELEASE);
     __real_kernel_rwlock_read(lock, guard);
 }
 void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
@@ -152,6 +157,8 @@ void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_g
     }
     if (read_counts && lock == cache_metadata_lock) read_counts->metadata_locks++;
     if (read_counts && lock == read_inode_lock) read_counts->inode_locks++;
+    if (truncate_after_backend && lock==truncate_publish_lock)
+        while (!__atomic_load_n(&truncate_writer_done,__ATOMIC_ACQUIRE)) sched_yield();
     __real_kernel_rwlock_write(lock, guard);
 }
 int __real_kernel_rwlock_try_write(struct kernel_rwlock *,struct kernel_lock_guard *);
@@ -2525,6 +2532,83 @@ static void executor_durable_fault(struct kernel_heap *heap,
     _Exit(0);
 }
 
+static int (*truncate_backend)(struct kernel_vfs_node *,uint64_t,uint64_t *,int *);
+static uint64_t truncate_length;
+static int truncate_partial_error;
+static int hold_truncate_result(struct kernel_vfs_node *node,uint64_t size,uint64_t *actual,int *changed)
+{
+    int result=truncate_backend(node,truncate_partial_error ? BOAROS_PAGE_SIZE+17 : size,actual,changed);
+    if (!result && truncate_partial_error) result=-KERNEL_EIO;
+    truncate_after_backend=1;
+    __atomic_store_n(&truncate_backend_done,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&truncate_writer_attempt,__ATOMIC_ACQUIRE)) sched_yield();
+    return result;
+}
+static void *truncate_before_publish(void *file)
+{
+    cache_test_attach(0);
+    assert(kernel_vfs_ftruncate(file,truncate_length)==(truncate_partial_error ? -KERNEL_EIO : 0));
+    truncate_after_backend=0;
+    return NULL;
+}
+static void *writeback_after_truncate(void *file)
+{
+    cache_test_attach(0); truncate_writer=1;
+    assert(!kernel_page_cache_writeback_range(current_cache,kernel_vfs_file_node(file),
+        2*BOAROS_PAGE_SIZE,3*BOAROS_PAGE_SIZE));
+    truncate_writer=0;
+    __atomic_store_n(&truncate_writer_done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void truncate_writeback_publication(struct kernel_page_cache *cache, const char *path)
+{
+    image_fd=open(path,O_RDWR); assert(image_fd>=0);
+    struct stat st; assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    for (unsigned scenario=0;scenario<3;scenario++) {
+        struct kernel_vfs_file file={0}; char name[40];
+        snprintf(name,sizeof(name),"/truncate-writeback-%u",scenario);
+        assert(!kernel_vfs_create(&mount,name,0600,&file));
+        unsigned char bytes[3*BOAROS_PAGE_SIZE]; memset(bytes,0x53,sizeof(bytes)); size_t done;
+        assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+        const struct kernel_vfs_backend *backend=node->instance->ops;
+        struct kernel_vfs_backend observed=*backend;
+        truncate_backend=backend->truncate; observed.truncate=hold_truncate_result;
+        node->instance->ops=&observed; current_cache=cache;
+        truncate_publish_lock=&node->io_lock;
+        truncate_backend_done=truncate_writer_attempt=truncate_writer_done=0;
+        truncate_length=scenario==1 ? BOAROS_PAGE_SIZE+17 : 0;
+        truncate_partial_error=scenario==2;
+        pthread_t truncator,writer;
+        assert(!pthread_create(&truncator,NULL,truncate_before_publish,&file));
+        while (!__atomic_load_n(&truncate_backend_done,__ATOMIC_ACQUIRE)) sched_yield();
+        /* 后端已缩小但仍持 inode 写保护；旧尾页写回排队取读保护。
+         * 第三种情况保留真实后端已接受的部分变化，并向 VFS 报告 EIO。 */
+        assert(!pthread_create(&writer,NULL,writeback_after_truncate,&file));
+        assert(!pthread_join(truncator,NULL) && !pthread_join(writer,NULL));
+        node->instance->ops=backend; truncate_publish_lock=NULL;
+        uint64_t retained=scenario ? BOAROS_PAGE_SIZE+17 : 0;
+        assert(kernel_vfs_node_size(node)==retained);
+        assert(!kernel_vfs_ftruncate(&file,sizeof(bytes)));
+        memset(bytes,0xcc,sizeof(bytes));
+        assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        for (size_t i=0;i<sizeof(bytes);i++) {
+            unsigned char expected=i<retained ? 0x53 : 0;
+            if (bytes[i]!=expected) fprintf(stderr,"truncate scenario %u resurrected byte at %zu: 0x%x != 0x%x\n",
+                scenario,i,bytes[i],expected);
+            assert(bytes[i]==expected);
+        }
+        assert(!kernel_vfs_close(&file));
+    }
+    assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(cache));
+    current_cache=NULL;
+    puts("PASS truncate publication: zero/partial shrink and partial EIO exclude queued old writeback, preserve prefix/zero regrowth and return owners");
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
@@ -2555,6 +2639,10 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"truncate-writeback")) {
+            truncate_writeback_publication(&cache,argv[1]);
+            goto owners;
+        }
         if (!strcmp(argv[2],"executor-range")) {
             executor_range_cases(&cache,argv[1]);
             goto owners;
