@@ -82,7 +82,7 @@ iozone 的完整命令核对见[原脚本对照](oscomp-compat-baseline.md#2026-
 | `doio` | `iogen` 提供结构化标准输入。 | 过滤单独执行。 |
 | `shell_pipe01.sh`、`tst_hexdump`、`timed_forkbomb` | 分别需要上游管道、输入及 EOF、控制器启动令牌。 | 过滤单独执行。 |
 | `pthserv`、`ftp-download-stress02-rmt.sh` | 对应客户端／服务端、持续时间与结束控制。 | 过滤单独执行。 |
-| `netstress` | 默认作为 server，`-l` 才选择 client；完整测试需要配套端点。历史无参数运行等待客户端约 300 秒，得零。 | 当前仍交给 300 秒单项监督；后续需要按原网络测试的配对调用方式执行。 |
+| `netstress` | 默认作为 server，`-l` 才选择 client；`server_run()` 持续循环 accept，需要客户端产生负载、控制程序结束服务端。历史无参数运行等待约 300 秒，得零。 | 共享跳过表过滤独立无参数调用，原因是 `controller-client-and-termination-required`；配对网络测试继续由其控制程序运行。 |
 
 逐名来源和原因以 [ltp-skips.tsv](../../tests/oscomp/ltp-skips.tsv) 为准。
 netstress 的默认模式见[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/netstress/netstress.c)。
@@ -107,8 +107,9 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 覆盖 RV/LA 的 glibc/musl。仍保留完整原始 ELF，存储专项回归直接运行它。工作量、
 校验和修复及测量见[fs_fill 成本分析](oscomp-ltp-analysis.md#fs_fill-的工作量内核成本与优化)。
 
-当前表有 35 个名字，在两张固定盘各匹配 glibc 35 项、musl 32 项，其中各包含一个
-`fs_fill`。执行适配器返回 125，原 judge 对跳过项记零；控制台原因为预算取舍。
+当前表共36个名字：35个按控制器、输入或配套端点等调用条件过滤，1个 `fs_fill`
+按预算跳过。两张固定盘每架构各匹配 glibc 36项、musl 33项。匹配时适配器返回125，
+控制台原因取自对应条目的reason；原judge对跳过项记零。
 
 当前内核能力与后续实现方向仍由 [goals](../goals.md) 和各模块维护。例如
 O_DIRECT、普通 AF_UNIX socket、CPU 计时器的缺口按内核能力处理；对应实际失败和

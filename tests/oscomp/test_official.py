@@ -124,16 +124,23 @@ class OfficialFlowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 125)
 
     def test_confirmed_controller_helper_is_skipped_without_success(self):
-        program = Path(self.temp.name) / 'cgroup_fj_proc'
-        program.write_text('#!/bin/sh\necho SHOULD-NOT-RUN\n')
-        program.chmod(0o755)
-        result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
-            str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
-            capture_output=True, text=True, timeout=5)
-        self.assertEqual(result.returncode, 125)
-        self.assertEqual(result.stdout, '')
-        self.assertIn('BOAROS-CASE SKIP', result.stderr)
-        self.assertIn('cgroup_fj_proc', result.stderr)
+        helpers = (('cgroup_fj_proc', 'controller-SIGUSR1-required'),
+                   ('netstress', 'controller-client-and-termination-required'))
+        for libc in ('glibc', 'musl'):
+            for name, reason in helpers:
+                with self.subTest(libc=libc, helper=name):
+                    program = Path(self.temp.name) / 'controller-helpers' / libc / name
+                    program.parent.mkdir(parents=True, exist_ok=True)
+                    program.write_text('#!/bin/sh\necho SHOULD-NOT-RUN\n')
+                    program.chmod(0o755)
+                    result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+                        str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 125, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('BOAROS-CASE SKIP', result.stderr)
+                    self.assertIn('command=' + str(program), result.stderr)
+                    self.assertIn('reason=' + reason, result.stderr)
 
     def test_budget_policy_skips_fs_fill_for_both_libcs(self):
         for libc in ('glibc', 'musl'):

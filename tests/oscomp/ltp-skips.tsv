@@ -32,6 +32,7 @@ fs_racer_file_symlink.sh	testcases/kernel/fs/racer/fs_racer_file_symlink.sh	unbo
 fs_fill	testcases/kernel/fs/fs_fill/fs_fill.c	evaluation-time-budget
 memcg_test_2	testcases/kernel/controllers/memcg/regression/memcg_test_2.c	controller-SIGUSR1-and-kill-required
 memcg_test_4	testcases/kernel/controllers/memcg/regression/memcg_test_4.c	controller-SIGUSR1-and-kill-required
+netstress	testcases/network/netstress/netstress.c	controller-client-and-termination-required
 pids_task2	testcases/kernel/controllers/pids/pids_task2.c	controller-kill-required
 pthserv	testcases/kernel/sched/clisrv/pthserv.c	controller-client-and-termination-required
 shell_pipe01.sh	testcases/commands/shell/shell_pipe01.sh	upstream-pipeline-stdin-required
