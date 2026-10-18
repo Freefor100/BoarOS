@@ -117,12 +117,10 @@ fallocate06 为 55–84 秒、8 个原始分，满盘准备占主要时间段。
 | loop | 无真实后备 OFD、查找/绑定/状态/解绑接口 | main 提供原生 Linux loop/control ABI、独立 worker、只读/offset/sizelimit/AUTOCLEAR；依赖者先于后备文件系统释放 |
 | 文件空间与内存接纳 | fallocate 缺失；大写入可能在仍有可回收脏页时耗尽分配 | main 实现 unwritten 预分配/KEEP_SIZE/打洞，并在进入 inode 锁和用户 pin 前推进有界写回/回收 |
 
-本地原输入盘不直接写入 QEMU：准备器制作独立根盘与 scratch 运行副本，仅向根盘副本加入
-固定 e2fsprogs 1.47.2 工具；不替换原 LTP、libc 或 judge。QEMU 提供真实 VirtIO RNG，
-避免 mke2fs 等待未初始化的可信熵。mke2fs 的 BoarOS 系统识别补丁按实际 UTS version
-`#1 BoarOS` 跳过 Linux 年代猜测，避免把项目版本 0.1.0 当作 Linux 0.1 并生成 revision 0；
-官方归档、补丁及产物校验集中在 inputs.json 与工具 identity。原官方单盘配置独立保留。
-使用方法与手写 QEMU 等价命令见[评测兼容配置](../modules/oscomp-compat.md)。
+当前交付的原盘副本不注入工具；第二块磁盘承载工具、FAT32 与 scratch，启动熵由
+一次性宿主种子经擦除、原盘 fsync 后注入，机制见[评测模块](../modules/oscomp-compat.md)。
+下列历史测量使用当时的本地双盘与 VirtIO RNG 环境，不能据此认定当前官方交付已
+取得相同应用结果。格式化工具移植补丁和当前准备方法见上述评测模块。
 
 ### fallocate06/fs_fill 的 ENOSYS 与 ENOMEM
 

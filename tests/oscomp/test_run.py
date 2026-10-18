@@ -71,30 +71,25 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(command[command.index('-m') + 1], '1G')
             self.assertEqual(command[command.index('-smp') + 1], '1')
             self.assertIn('user,id=net0', command)
-            self.assertIn('rng-random,id=entropy,filename=/dev/urandom', command)
-            self.assertIn(('virtio-rng-device' if arch == 'riscv' else 'virtio-rng-pci') + ',rng=entropy', command)
+            self.assertNotIn('-object', command)
+            self.assertFalse(any('rng=' in value for value in command))
 
-    def test_diagnostic_explicit_no_rng_override_omits_hardware(self):
-        command = runner.boot_command('riscv', 'qemu', 'kernel', 'root.img', 'scratch.img', {}, rng=False)
-        self.assertNotIn('-object', command)
-
-    def test_cli_records_default_rng_and_explicit_no_rng(self):
-        for options, expected in (([], True), (['--no-rng'], False), (['--rng'], True)):
-            with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                with patch.object(sys, 'argv', ['run.py', *options]), patch.object(runner, 'ROOT', root), \
-                        patch.object(runner, 'output', return_value='fixture'), \
-                        patch.object(runner, 'validate', side_effect=RuntimeError('stop before build')):
-                    with self.assertRaisesRegex(RuntimeError, 'stop before build'): runner.main()
-                reports = list((root / 'build').glob('*/report.json'))
-                self.assertEqual(len(reports), 1)
-                self.assertEqual(json.loads(reports[0].read_text())['rng_added'], expected)
+    def test_cli_records_no_rng_device(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(sys, 'argv', ['run.py']), patch.object(runner, 'ROOT', root), \
+                    patch.object(runner, 'output', return_value='fixture'), \
+                    patch.object(runner, 'validate', side_effect=RuntimeError('stop before build')):
+                with self.assertRaisesRegex(RuntimeError, 'stop before build'): runner.main()
+            reports = list((root / 'build').glob('*/report.json'))
+            self.assertEqual(len(reports), 1)
+            self.assertFalse(json.loads(reports[0].read_text())['rng_added'])
 
     def test_runtime_identity_uses_actual_target_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             (base / 'init.json').write_text(json.dumps({'envp': [
-                'BOAROS_LINUX_SCHED_PRELOAD=/lib/boaros-linux-sched.so']}))
+                'BOAROS_LINUX_SCHED_PRELOAD=/boaros-tools/linux-sched.so']}))
             runtime = base / 'linux-sched.so'
             runtime.write_bytes(b'container compiler output')
             info = runner.runtime_info(base)['linux_sched']

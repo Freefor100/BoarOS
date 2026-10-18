@@ -211,8 +211,7 @@ def judge(log, config):
     return results
 
 
-def boot_command(arch, qemu, kernel, disk, scratch, config,
-                 rng=local_disks.INPUTS['local_profile']['rng']['default_enabled']):
+def boot_command(arch, qemu, kernel, disk, scratch, config):
     command = [qemu]
     if arch == 'riscv': command += ['-machine', 'virt']
     command += ['-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
@@ -221,8 +220,6 @@ def boot_command(arch, qemu, kernel, disk, scratch, config,
     command += local_disks.disk_arguments(arch, disk, scratch)
     command += ['-no-reboot', '-device', 'virtio-net-device,netdev=net0' if arch == 'riscv' else 'virtio-net-pci,netdev=net0',
         '-netdev', 'user,id=net0', '-rtc', 'base=utc']
-    if rng:
-        command += local_disks.rng_arguments(arch)
     return command
 
 
@@ -272,7 +269,7 @@ def diagnostic_build(architectures, selected, case_timeout, exclusions):
                for arch in architectures}
     command = ['make', '-j8', *('kernel-rv' if arch == 'riscv' else 'kernel-la' for arch in architectures),
         'OSCOMP_GROUPS=' + ' '.join(selected), 'OSCOMP_CASE_TIMEOUT=' + str(case_timeout),
-        'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions), 'OSCOMP_LOCAL_DISKS=1']
+        'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions)]
     for arch, config in configs.items():
         command.append(('INIT_CONFIG_RV=' if arch == 'riscv' else 'INIT_CONFIG_LA=') + str(config))
     return command, environment, configs
@@ -289,11 +286,7 @@ def main():
     ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE')
     ap.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
     ap.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
-    ap.add_argument('--rng', action=argparse.BooleanOptionalAction,
-                    default=local_disks.INPUTS['local_profile']['rng']['default_enabled'],
-                    help='attach real VirtIO entropy (default enabled; --no-rng is a diagnostic override)')
     ap.add_argument('--local-cache', type=Path, default=Path(os.environ.get('OSCOMP_LOCAL_CACHE', ROOT / 'build/tools/oscomp-local')))
-    ap.add_argument('--toolchain-root', type=Path, default=Path(os.environ.get('OSCOMP_TOOLCHAIN_ROOT', ROOT)))
     args = ap.parse_args()
     architectures = tuple(ARCH_KEYS) if args.arch == 'both' else (args.arch,)
     directory = args.output.resolve() if args.output else ROOT / 'build' / ('oscomp-diagnostic-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
@@ -311,7 +304,7 @@ def main():
         'requested_architectures': architectures, 'selected_groups': selected,
         'ltp_case_timeout_seconds': args.case_timeout, 'ltp_diagnostic_exclusions': args.diagnostic_exclude,
         'script_adaptations': script_adaptations(selected),
-        'rng_added': args.rng, 'architectures': {}, 'baseline_completed': False}
+        'rng_added': False, 'architectures': {}, 'baseline_completed': False}
     stage = 'preparation'
     try:
         identity = validate(args.verify_inputs, architectures)
@@ -327,12 +320,12 @@ def main():
             target = directory / ARCH_KEYS[arch]; target.mkdir()
             facts = identity['architectures'][arch]
             kernel = target / facts['kernel']; shutil.copyfile(ROOT / facts['kernel'], kernel)
-            assets = local_disks.prepare_assets(args.local_cache, args.toolchain_root, arch)
+            assets = local_disks.prepare_assets(args.local_cache, arch)
             disk, scratch = local_disks.prepare_run(REF, assets, target, arch)
             qemu = args.qemu_riscv if arch == 'riscv' else args.qemu_loongarch
             executable = Path(shutil.which(qemu) or qemu).resolve(strict=True)
             base = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
-            command = boot_command(arch, str(executable), kernel, disk, scratch, config, args.rng)
+            command = boot_command(arch, str(executable), kernel, disk, scratch, config)
             entry = {'kernel_sha256': sha(kernel), 'fixture_sha256': sha(disk), 'boot_count': 1,
                 'backing_preparation': 'written-and-synced',
                 'init_config_path': str(configs[arch]), 'init_config_sha256': sha(ROOT / configs[arch]),

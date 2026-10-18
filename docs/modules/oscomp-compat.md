@@ -25,57 +25,58 @@
 本次实际本地提交与容器运行身份、完整结果摘要及重建入口见
 [双架构评测学习记录](../learning/oscomp-compat-baseline.md#本次正式容器结果)。
 
-默认`make all`同时生成kernel-rv/kernel-la。RV/LA分别生成整数raw supervisor、
+默认`make all`离线生成kernel-rv/kernel-la/disk.img/disk-la.img。RV/LA分别生成整数raw supervisor、
 init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式共同
 `INIT_CONFIG=config/init.json`同时恢复通用fixture。构建中不可让另一组不同配置
 覆盖正在冻结的kernel；先构建、复制内核及身份，再运行。
 
-## 本地根盘、scratch 与格式化工具
+## 官方双盘、启动熵与格式化工具
 
-默认 `make all` 为两个架构准备独立的 2 GiB、4 KiB 块 ext4 scratch 模板，以及
-真实静态 `mke2fs` 和设备检查程序。源码版本和 SHA-256 统一由
-`tests/oscomp/inputs.json` 维护；缓存位于 `build/tools/oscomp-local/`，源码、同源
-宿主工具和两个目标工具各自保留，命中时核对输入及实际产物。构建复用现有
-`build/riscv/musl-root`、`build/loongarch/musl-root`、LA soft-float GCC 和目标 UAPI，
-缺失时明确报错。`OSCOMP_TOOLCHAIN_ROOT` 可指向已有工具链的仓库根目录，
-`OSCOMP_LOCAL_CACHE` 可指定共享工具缓存；不在 worktree 中重复构建它们。
+默认 `make all` 在固定官方容器内完全离线构建两套内核和额外磁盘：RV 使用
+`disk.img`，LA 使用 `disk-la.img`。原 Harness 已支持将它们作为第二块磁盘：
+RV 先复制成 `disk-rv.img`，LA 直接使用 `disk-la.img`；QEMU 命令不增加 RNG。
+每块盘均为 2304 MiB 的 MBR 磁盘，固定布局由 `tests/oscomp/inputs.json` 维护。
 
-工具以固定 e2fsprogs 源归档加一项可核对的 BoarOS 移植补丁构建。上游
-`is_before_linux_ver` 原先直接把 release 当成 Linux 版本，BoarOS 的自身版本号
-会因此被当作 Linux 2.2 以前的内核，使 `-t ext4` 也退成 revision 0、无 feature
-的文件系统。补丁按 UTS version `#1 BoarOS` 识别平台，将其 Linux 年代视为未知，
-沿用上游非 Linux 路径的判断结果；真实 Linux 的新旧版本判断保持。补丁 SHA-256、
-目标源码修改前后的 SHA-256 和工具构建身份均被核对，重复准备不重复修改源码，
-仅补丁改变时保留库并重编 mke2fs。内核的 release 身份及原格式化参数不变。
+| 分区 | 起点 / 容量 | 格式与用途 |
+| --- | --- | --- |
+| `/dev/vdb1` | 1 MiB / 128 MiB | 1 KiB ext4，挂到 `/boaros-tools`，只读工具、脚本、监督器 |
+| `/dev/vdb2` | 129 MiB / 64 MiB | FAT32，512 字节簇，`/dev/vda2` 指向此设备 |
+| `/dev/vdb3` | 193 MiB / 2048 MiB | 4 KiB ext4，LTP 可重新格式化的 scratch |
 
-`make run-riscv`、`make debug-riscv`、`make run-loongarch` 与 `tests/oscomp/run.py` 共用
-`local_disks.py`：每次生成新运行目录，把保留根盘和该架构 scratch 模板复制成
-两个独立可写文件。复制使用 `cp --reflink=never --sparse=never` 并 fsync，宿主
-分配和写盘在启动 guest 计时前结束。宿主 debugfs 仅向运行根盘的
-`/boaros-tools` 写入目标工具、原版 mke2fs 配置及检查程序；原镜像、LTP/libc
-程序、judge 和原参数不变。两个架构的副本不共用可写后端，scratch 可以由 LTP
-重新格式化。`make prune-build` 保留 tools 缓存，运行目录按已有规则清理。
+固定 e2fsprogs 源归档随仓库保存在 `third_party/sources/`，URL、版本和 SHA-256
+集中维护于输入清单。构建使用官方容器已有的 RV/LA musl 交叉编译器，生成静态
+ELF EXEC、LP64D 工具；LA LOAD 段符合 16 KiB 页对齐。宿主 `mke2fs` 和 `e2fsck`
+由同一源码构建，FAT32 由该固定容器的 dosfstools 创建。缓存位于
+`build/tools/oscomp-local/`，`OSCOMP_LOCAL_CACHE` 可另选路径；检查编译器、libc、
+源码、编译参数和实际工具哈希后复用，不构建工具链，也不访问网络。宿主没有这些
+固定工具时，本地准备入口用已有 pinned 容器、`--pull=never --network none` 执行同一
+准备器；容器使用宿主 UID/GID，继续复用同一缓存。
 
-本地 profile 同时默认附带真实 VirtIO RNG，QEMU 的 `rng-random` 从宿主
-`/dev/urandom` 供给设备，RV 使用 MMIO，LA 使用 PCI。内核按现有驱动和熵池
-规则达到就绪后，`getrandom(..., 0)` 才可返回；真实 mke2fs 的 libuuid 依赖这一
-正常阻塞语义生成 UUID。profile 的双盘数量、RNG 后端与默认启用状态集中维护于
-`inputs.json`。本地诊断可显式使用 `--no-rng` 复现缺少熵设备的环境，报告保留
-`rng_added=false` 和实际 QEMU 参数；这种配置的格式化程序可能等待熵池就绪。
+移植补丁只让 e2fsprogs 的 `is_before_linux_ver` 将 UTS version `#1 BoarOS`
+识别为未知 Linux 年代，避免把自身 release 当作旧 Linux 而生成 revision 0。
+真实 Linux 的版本判断保持；补丁及目标源码的前后 SHA-256 均在输入清单核对。
+`/bin/mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4` 均链接真实上游工具，原参数
+直接传入，配置使用原版 `mke2fs.conf`。
 
-PID 1 创建根盘 `252:0`、scratch `252:16`、loop0..7 和 loop-control 节点。
-设备检查程序通过 stat/fstat、BLKGETSIZE64、BLKSSZGET 和 BLKROGET 核对
-`/` 对应根块设备、scratch 与根盘不同、容量为模板规定值、扇区为 512 字节且
-实际可写；失败打印具体对象、操作或设备号，不进入评测。通过后才设置
-`LTP_DEV`、`LTP_DEV_FS_TYPE=ext4`、`LTP_SINGLE_FS_TYPE=ext4`，并在 `/bin`
-提供真实 `mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4`。这既让 LTP 复用
-额外物理盘，也保留其正常格式化调用；loop 节点服务需要 loop 接口的原用例。
+缓存模板的 LBA 8 起 4096 字节槽始终全零。每次 `make all` 或本地准备交付盘时，
+宿主为每个架构分别调用 `getrandom` 取得新的 64 字节，写入带版本、架构、长度和
+CRC32 的种子记录。记录只存在于本次交付盘，不能把已启动消耗过种子的盘当作新
+启动盘；即使种子消耗后的启动失败，重试也必须重新执行准备，生成新种子。
+CRC32 检测意外损坏，种子来源是可信宿主。
 
-这是本地双盘加 RNG profile。官方容器构建显式设置 `OSCOMP_LOCAL_DISKS=0`，保留原
-Harness 的单根盘设备配置，bootstrap 不依赖本地注入工具，也不设置上述 LTP
-设备变量。不能把本地双盘结果归为官方固定 profile 的运行结果。
+PID1 创建根盘 `252:0`、第二整盘 `252:16`、分区 `252:17..19` 及 loop 节点，
+先只读挂载工具分区。其 `seed` 程序核对 `/` 的设备身份、整盘与各分区的容量、
+512 字节扇区、可写状态、MBR 布局和种子记录；整槽覆零并对原始块设备 `fsync`
+成功后才用 `RNDADDENTROPY` 注入 64 字节、声明 256 bit，检查随机源就绪并清除
+内存副本。任何失败记录操作和 errno，停止启动。随后创建 `/dev/vda2` 别名；
+已有同名节点视为冲突。设置 `LTP_DEV=/dev/vdb3`、`LTP_DEV_FS_TYPE=ext4` 和
+`LTP_SINGLE_FS_TYPE=ext4` 后再执行测例。
 
-手工 QEMU 使用同一套准备好的副本，例如 RV：
+`make run-riscv`、`make debug-riscv`、`make run-loongarch` 和 `tests/oscomp/run.py`
+共用这套准备逻辑。根盘只进行原样复制，工具全部放在第二盘 p1，不通过宿主
+`debugfs` 修改根盘。运行副本以 `cp --reflink=never --sparse=never` 复制并 `fsync`，
+宿主分配和写盘发生在 guest 计时前。原比赛镜像、LTP/libc 字节及 judge 保持原样。
+本地示例：
 
 ```sh
 make all
@@ -84,21 +85,17 @@ qemu-system-riscv64 -machine virt -bios default -kernel kernel-rv -m 1G -smp 1 -
   -drive file=build/oscomp-manual-rv/root.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -drive file=build/oscomp-manual-rv/scratch.img,if=none,format=raw,id=x1 \
-  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
-  -object rng-random,id=entropy,filename=/dev/urandom \
-  -device virtio-rng-device,rng=entropy
+  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 ```
 
-LA 将准备参数改为 `--arch loongarch` 并使用独立目录，QEMU 改为
-`-machine virt -cpu la464 -kernel kernel-la`、移除 `-bios default`，两块设备分别
-使用 `virtio-blk-pci,drive=x0` 与 `virtio-blk-pci,drive=x1`，RNG 改用
-`virtio-rng-pci,rng=entropy`。每次准备必须选择
-新目录；不要把保留原盘或模板直接作为可写 QEMU 后端。
+LA 使用 `--arch loongarch` 和独立目录，QEMU 使用 `-cpu la464 -kernel kernel-la`、
+移除 `-bios default`，两块盘均为 `virtio-blk-pci`。运行目录必须新建；保留原盘
+和模板不直接作为可写后端。`make prune-build` 保留工具缓存。
 
 ## 原盘bootstrap与监督
 
-PID1直接exec原盘`/musl/busybox`，bootstrap作为sh -c参数编入内核，原监督
-helper仍由启动脚本解码。本地格式化工具按上节写入运行副本。启动创建/bin、设备、proc和/dev/shm，并从目标profile建立
+PID1直接exec原盘`/musl/busybox`，bootstrap作为sh -c参数编入内核，监督器、脚本和
+LA 调度共享对象从只读工具分区加载。启动创建/bin、设备、proc和/dev/shm，并从目标profile建立
 原loader链接。LA使用/lib、/lib64、/usr/lib64三个实际interpreter路径；RV的
 普通/sf musl名称保留。两个libc的LD_LIBRARY_PATH和工作目录分别设置。
 
@@ -135,8 +132,8 @@ EXCLUDE。原LA BusyBox1.33.1的hush不支持set -u/-f；自有脚本按需要�
 `tests/oscomp/run.py --arch riscv|loongarch|both`默认both。一次调用先冻结全部
 内核和fixture，再同时启动；每架构一次启动，两种libc共有22组，双架构44组状态。
 本地入口始终是diagnostic，记录实际QEMU内容/模式/路径、启动参数、kernel/helper/
-bootstrap/fixture身份、真实串口和退出原因。RNG 实际启用状态和预算变化均显式记录。
-本地默认使用上述独立双盘加 RNG profile，`--no-rng` 时不伪造可信熵ready。
+bootstrap/fixture身份、真实串口和退出原因。两种入口均使用上述双盘与一次性启动种子；
+报告记录没有 RNG 设备及实际预算。
 
 使用原parser、22个judge和postwork。联合summary来自本次两份实际输出，LTP
 在联合原始分上调用原非线性公式，不把独立整数分相加。分组状态区分not-selected、

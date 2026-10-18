@@ -26,17 +26,15 @@ def selected_configs(command, environment):
 
 
 class BuildTests(unittest.TestCase):
-    def test_local_entrypoints_share_preparation_and_official_can_disable_it(self):
+    def test_local_and_official_entrypoints_share_preparation(self):
         environment = os.environ.copy()
         for name in ('MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES'): environment.pop(name, None)
         command = subprocess.check_output(['make', '-n', '--no-print-directory', 'all', 'run-riscv', 'debug-riscv', 'run-loongarch'], cwd=ROOT, env=environment, text=True)
         self.assertEqual(command.count('tests/oscomp/local_disks.py --arch riscv'), 3)
         self.assertEqual(command.count('tests/oscomp/local_disks.py --arch loongarch'), 2)
-        self.assertIn('--local-disks', command)
+        self.assertIn('--delivery disk.img', command)
+        self.assertIn('--delivery disk-la.img', command)
         self.assertIn('--gdb', command)
-        command = subprocess.check_output(['make', '-n', '--no-print-directory', 'all', 'OSCOMP_LOCAL_DISKS=0'], cwd=ROOT, env=environment, text=True)
-        self.assertNotIn('tests/oscomp/local_disks.py', command)
-        self.assertNotIn('--local-disks', command)
 
     def test_common_config_overrides_command_line_and_environment_arch_configs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -59,14 +57,13 @@ class BuildTests(unittest.TestCase):
         with patch.dict(os.environ, {'INIT_CONFIG': 'config/init.json',
                                     'INIT_CONFIG_RV': 'config/init.json',
                                     'INIT_CONFIG_LA': 'config/init.json',
-                                    'MAKEFLAGS': '-- INIT_CONFIG=config/init.json',
-                                    'OSCOMP_LOCAL_DISKS': '0'}):
+                                    'MAKEFLAGS': '-- INIT_CONFIG=config/init.json'}):
             command, environment, configs = runner.diagnostic_build(('riscv', 'loongarch'), ['basic'], 17, [])
         self.assertEqual(set(configs), {'riscv', 'loongarch'})
         self.assertEqual(set(selected_configs(command, environment)), set(map(str, configs.values())))
         self.assertNotIn('MAKEFLAGS', environment)
         self.assertNotIn('INIT_CONFIG', environment)
-        self.assertIn('OSCOMP_LOCAL_DISKS=1', command)
+        self.assertFalse(any('OSCOMP_LOCAL_DISKS' in value for value in command))
 
 
 if __name__ == '__main__':

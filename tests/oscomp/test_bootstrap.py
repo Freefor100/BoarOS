@@ -1,6 +1,5 @@
 """Bootstrap output must select the original target loader and helper ABI."""
 import json
-import gzip
 from pathlib import Path
 import struct
 import subprocess
@@ -77,17 +76,13 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('BOAROS_LTP_CASE_TIMEOUT=17', env)
         self.assertIn('BOAROS_DIAGNOSTIC_EXCLUDE=finite-test', env)
 
-    def test_la_kernel_bootstrap_contains_runtime_for_all_musl_groups(self):
+    def test_la_bootstrap_uses_readonly_tools_runtime_for_all_musl_groups(self):
         result,target=self.generate('loongarch',258,'--groups','basic')
         self.assertEqual(result.returncode,0,result.stderr)
         profile=json.loads(target.read_text());script=profile['argv'][3]
-        self.assertIn('BOAROS_LINUX_SCHED_PRELOAD=/lib/boaros-linux-sched.so',profile['envp'])
-        self.assertIn('/tmp/boaros-runtime.sh',script)
+        self.assertIn('BOAROS_LINUX_SCHED_PRELOAD=/boaros-tools/linux-sched.so',profile['envp'])
         self.assertIn('export LD_PRELOAD=',script)
-        marker='BOAROS_RUNTIME_GZIP='
-        encoded=script.split(marker,1)[1].split('\n',1)[0].strip("'")
-        payload=bytes(int(encoded[i+2:i+5],8) for i in range(0,len(encoded),5))
-        self.assertEqual(gzip.decompress(payload),(self.root/'runtime.so').read_bytes())
+        self.assertNotIn('BOAROS_RUNTIME_GZIP=',script)
         self.assertNotIn('if [ "$group" = cyclictest',script)
 
     def test_rv_bootstrap_does_not_publish_la_runtime(self):
@@ -98,24 +93,55 @@ class BootstrapTests(unittest.TestCase):
         self.assertNotIn('BOAROS_RUNTIME_GZIP=',profile['argv'][3])
 
     def test_local_profile_checks_real_disk_before_exporting_ltp_device(self):
-        result, target = self.generate('riscv', 243, '--local-disks')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        script = json.loads(target.read_text())['argv'][3]
-        self.assertIn('/dev/block/252:16 b 252 16', script)
-        self.assertIn('/dev/loop-control c 10 237', script)
-        self.assertIn('/dev/loop7 b 7 7', script)
-        self.assertLess(script.index('/boaros-tools/scratch-check'), script.index('export LTP_DEV='))
-        self.assertIn('LTP_DEV=/dev/block/252:16 LTP_DEV_FS_TYPE=ext4 LTP_SINGLE_FS_TYPE=ext4', script)
-        self.assertIn('/boaros-tools/mke2fs /bin/mkfs.ext4', script)
-        self.assertNotIn('MKE2FS_PAYLOAD=', script)
-        subprocess.run(['sh', '-n', '-c', script], check=True)
-
-    def test_official_profile_does_not_require_local_disk_or_injected_tools(self):
         result, target = self.generate('riscv', 243)
         self.assertEqual(result.returncode, 0, result.stderr)
         script = json.loads(target.read_text())['argv'][3]
-        self.assertNotIn('/boaros-tools/', script)
-        self.assertNotIn('export LTP_DEV=', script)
+        self.assertIn('/dev/vdb b 252 16', script)
+        self.assertIn('/dev/loop-control c 10 237', script)
+        self.assertIn('/dev/loop7 b 7 7', script)
+        self.assertLess(script.index('/boaros-tools/seed'), script.index('export LTP_DEV='))
+        self.assertIn('LTP_DEV=/dev/vdb3 LTP_DEV_FS_TYPE=ext4 LTP_SINGLE_FS_TYPE=ext4', script)
+        self.assertIn('/boaros-tools/mkfs.ext4 /bin/mkfs.ext4', script)
+        self.assertNotIn('MKE2FS_PAYLOAD=', script)
+        subprocess.run(['sh', '-n', '-c', script], check=True)
+
+    def test_tools_are_readonly_mounted_before_seed_and_supervision(self):
+        result, target = self.generate('riscv', 243)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        script = json.loads(target.read_text())['argv'][3]
+        self.assertLess(script.index('mount -t ext4 -o ro'), script.index('/boaros-tools/seed'))
+        self.assertLess(script.index('/boaros-tools/seed'), script.index('ln -s /boaros-tools/case'))
+        self.assertIn('ln -s /dev/vdb2 /dev/vda2', script)
+        self.assertIn('/dev/vda2 already exists', script)
+        self.assertNotIn("printf '%b'", script)
+
+    def test_known_busybox_mkfs_links_are_replaced_and_foreign_files_rejected(self):
+        result, target = self.generate('riscv', 243)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        script = json.loads(target.read_text())['argv'][3]
+        links = script.split('install_mkfs() {', 1)[1].split('export MKE2FS_CONFIG=', 1)[0]
+        links = 'install_mkfs() {' + links
+        binary = self.root / 'bin'; binary.mkdir()
+        tools = self.root / 'tools'; tools.mkdir()
+        busybox = self.root / 'busybox'
+        busybox.write_text('#!/bin/sh\nexec "$@"\n'); busybox.chmod(0o755)
+        links = links.replace('/bin/', str(binary) + '/').replace('/boaros-tools/', str(tools) + '/')
+        for name in ('mke2fs', 'mkfs.ext2'): (binary / name).symlink_to(busybox)
+        command = 'set -e\nBB=' + str(busybox) + '\n' + links
+        result = subprocess.run(['sh', '-c', command], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ('mke2fs', 'mkfs.ext2', 'mkfs.ext3', 'mkfs.ext4'):
+            self.assertEqual((binary / name).readlink(), tools / name)
+            (binary / name).unlink()
+        foreign = binary / 'mke2fs'; foreign.write_text('existing external tool')
+        result = subprocess.run(['sh', '-c', command], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 125)
+        self.assertIn('unexpected tool', result.stderr)
+        self.assertEqual(foreign.read_text(), 'existing external tool')
+        foreign.unlink(); foreign.symlink_to('/external/mke2fs')
+        result = subprocess.run(['sh', '-c', command], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(foreign.readlink(), Path('/external/mke2fs'))
 
     def test_runtime_with_wrong_machine_or_soft_float_is_rejected(self):
         runtime=self.root/'wrong.so'

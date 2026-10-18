@@ -1,11 +1,16 @@
 CROSS_COMPILE ?= $(shell \
-	if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then \
+	if test -x /usr/bin/riscv64-unknown-elf-gcc; then \
+		printf '%s' /usr/bin/riscv64-unknown-elf-; \
+	elif command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then \
 		printf '%s' riscv64-unknown-elf-; \
 	elif command -v riscv64-elf-gcc >/dev/null 2>&1; then \
 		printf '%s' riscv64-elf-; \
 	else \
 		printf '%s' riscv64-unknown-elf-; \
 	fi)
+
+# 官方 GCC13 以 soft-float 和禁自动向量化生成整数内核，支持原 Harness 默认 make。
+LA_FLAGS ?= -march=loongarch64 -mabi=lp64s -msoft-float -mcmodel=normal -fno-tree-vectorize -fno-tree-slp-vectorize
 
 CC := $(CROSS_COMPILE)gcc
 NM := $(CROSS_COMPILE)nm
@@ -730,15 +735,10 @@ DEPS := \
 OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
 OSCOMP_CASE_TIMEOUT ?= 300
 OSCOMP_DIAGNOSTIC_EXCLUDE ?=
-OSCOMP_LOCAL_DISKS ?= 1
 OSCOMP_LOCAL_CACHE ?= build/tools/oscomp-local
-OSCOMP_TOOLCHAIN_ROOT ?= $(CURDIR)
-OSCOMP_LOCAL_ARGS = --cache '$(OSCOMP_LOCAL_CACHE)' --toolchain-root '$(OSCOMP_TOOLCHAIN_ROOT)'
-ifeq ($(OSCOMP_LOCAL_DISKS),1)
-OSCOMP_LOCAL_INIT_ARG := --local-disks
+OSCOMP_LOCAL_ARGS = --cache '$(OSCOMP_LOCAL_CACHE)'
 all: prepare-oscomp-local-riscv prepare-oscomp-local-loongarch
-endif
-OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
+OSCOMP_CASE := build/riscv/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
 OSCOMP_CASE_LA := build/loongarch/oscomp/case
 OSCOMP_INIT_LA := build/loongarch/oscomp/init.json
@@ -768,22 +768,22 @@ $(OSCOMP_RUNTIME_LA): tests/oscomp/sched_compat.c Makefile
 .PHONY: force-oscomp-init
 force-oscomp-init:
 
-$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/runtime.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch riscv --case $(OSCOMP_CASE) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
-		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)' $(OSCOMP_LOCAL_INIT_ARG)
+		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
-$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) $(OSCOMP_RUNTIME_LA) tests/oscomp/init.sh tests/oscomp/runtime.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) $(OSCOMP_RUNTIME_LA) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch loongarch --case $(OSCOMP_CASE_LA) --runtime $(OSCOMP_RUNTIME_LA) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
-		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)' $(OSCOMP_LOCAL_INIT_ARG)
+		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
 .PHONY: prepare-oscomp-local-riscv prepare-oscomp-local-loongarch
-prepare-oscomp-local-riscv:
-	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS)
+prepare-oscomp-local-riscv: $(OSCOMP_CASE)
+	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) --delivery disk.img
 
-prepare-oscomp-local-loongarch:
-	python3 -B tests/oscomp/local_disks.py --arch loongarch $(OSCOMP_LOCAL_ARGS)
+prepare-oscomp-local-loongarch: $(OSCOMP_CASE_LA) $(OSCOMP_RUNTIME_LA)
+	python3 -B tests/oscomp/local_disks.py --arch loongarch $(OSCOMP_LOCAL_ARGS) --delivery disk-la.img
 
 all: $(KERNEL_RV) kernel-la
 

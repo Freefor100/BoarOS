@@ -27,7 +27,7 @@ class PatchTests(unittest.TestCase):
 
     def test_patch_is_idempotent_and_rejects_changed_source(self):
         facts = disks.INPUTS['e2fsprogs']
-        archive = CACHE / Path(facts['url']).name
+        archive = ROOT / facts['archive']
         if not archive.is_file(): self.skipTest('prepare the pinned e2fsprogs archive first')
         self.assertEqual(disks.sha(archive), facts['sha256'])
         port = facts['portability_patch']

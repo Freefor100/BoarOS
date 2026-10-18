@@ -10,19 +10,41 @@
     "sdcard-la.img.xz": "3cbeae1095d788cd8255e4929bcc6dace96dbe4999b6eaec003ae6fe2cdba42b"
   },
   "local_profile": {
-    "name": "local-two-disk-ext4",
-    "disk_count": 2,
-    "rng": {
-      "default_enabled": true,
-      "backend": "rng-random",
-      "host_source": "/dev/urandom"
-    }
+    "name": "official-two-disk",
+    "disk_count": 2
   },
   "local_disk": {
+    "bytes": 2415919104,
+    "root_device": "/dev/vda",
+    "device": "/dev/vdb",
+    "scratch_device": "/dev/vdb3",
     "scratch_bytes": 2147483648,
     "block_bytes": 4096,
-    "root_device": "/dev/block/252:0",
-    "scratch_device": "/dev/block/252:16"
+    "seed_offset": 4096,
+    "seed_bytes": 4096,
+    "partitions": [
+      {
+        "start_mib": 1,
+        "size_mib": 128,
+        "type": 131,
+        "filesystem": "ext4",
+        "block_bytes": 1024
+      },
+      {
+        "start_mib": 129,
+        "size_mib": 64,
+        "type": 12,
+        "filesystem": "vfat",
+        "cluster_bytes": 512
+      },
+      {
+        "start_mib": 193,
+        "size_mib": 2048,
+        "type": 131,
+        "filesystem": "ext4",
+        "block_bytes": 4096
+      }
+    ]
   },
   "e2fsprogs": {
     "version": "1.47.2",
@@ -35,7 +57,8 @@
       "target": "misc/mke2fs.c",
       "original_sha256": "48f60b0aef7170a178d753813dc081b2e946ff35480267b60ef3901b1c362e5b",
       "patched_sha256": "fef0edf19e0309c26f249cf88fd4bc12d1cb498a8d847c505a203080aecbeee4"
-    }
+    },
+    "archive": "third_party/sources/e2fsprogs-1.47.2.tar.xz"
   },
   "architectures": {
     "riscv": {
@@ -56,7 +79,8 @@
           "/musl/lib/libc.so",
           "/lib/ld-musl-riscv64-sf.so.1"
         ]
-      ]
+      ],
+      "tools_prefix": "/opt/riscv64-linux-musl-cross/bin/riscv64-linux-musl-"
     },
     "loongarch": {
       "elf_machine": 258,
@@ -84,7 +108,8 @@
           "/musl/lib/libc.so",
           "/lib64/ld-musl-loongarch-lp64d.so.1"
         ]
-      ]
+      ],
+      "tools_prefix": "/opt/loongarch64-linux-musl-cross/bin/loongarch64-linux-musl-"
     }
   },
   "container": {
@@ -92,5 +117,10 @@
     "reference": "zhouzhouyi/os-contest@sha256:85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d",
     "verified_on": "2026-10-07",
     "qemu_version": "10.0.2"
+  },
+  "dosfstools": {
+    "version": "4.2",
+    "path": "/usr/sbin/mkfs.fat",
+    "source": "fixed official container"
   }
 }

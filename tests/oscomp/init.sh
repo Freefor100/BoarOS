@@ -24,9 +24,8 @@ $BB chmod 1777 /tmp
 # 发布镜像将此脚本存成 0644；补执行权限，不改测例内容或判断。
 $BB chmod +x /glibc/basic/run-all.sh /musl/basic/run-all.sh
 export HOME=/ TERM=vt100
-# BOAROS_CASE_PAYLOAD
-# BOAROS_RUNTIME_PAYLOAD
 # BOAROS_LOCAL_DISKS
+# BOAROS_CASE_PAYLOAD
 groups=${BOAROS_EVAL_GROUPS:-'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'}
 export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-300}
 for group in $groups; do

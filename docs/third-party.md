@@ -44,19 +44,17 @@ BoarOS 采用 GPL-2.0-only；仓库根目录 `LICENSE` 保存完整许可证文�
 
 SQLite 3.53.4 作为固定外部测试构建输入使用：官方 amalgamation 压缩包保存在被忽略的 `references/sqlite/`，来源和 SHA-256 由 `references/sources.tsv` 固定；构建时在 `build/riscv/sqlite/` 解包，未把 SQLite 源码导入 Git，也未对上游源码作本地修改。其发布声明为 public domain；用途是验证原生 Unix VFS、记录锁与回滚日志持久性，见[程序环境](modules/program-environment.md)。
 
-e2fsprogs 作为本地 OSComp 双盘环境的外部构建输入使用：版本、kernel.org 官方
-归档 URL、SHA-256 与官方校验清单地址集中记录于 `tests/oscomp/inputs.json`。
-`tests/oscomp/local_disks.py` 在忽略的 `build/tools/oscomp-local/` 校验并解包原版
-源码，复用已有 RV/LA musl 工具链，启用上游私有 uuid/blkid，构建真正的静态
-`mke2fs`；同源宿主工具创建 ext4 scratch 模板。官方归档保持原 SHA-256，配置
-不修改；唯一移植补丁为 `tests/oscomp/e2fsprogs-boaros-uname.patch`，其 SHA-256 和
-目标文件修改前后的 SHA-256 同样集中维护于输入清单。补丁仅让 `is_before_linux_ver`
-将 UTS version `#1 BoarOS` 识别为未知 Linux 年代，避免把 BoarOS 自身的 release
-误判为旧 Linux 后生成 revision 0 文件系统；真实 Linux 的版本检查和 feature
-选择保留。上游源码不导入 Git，构建验证补丁后按需重编 mke2fs 对象，保留既有库。
+e2fsprogs 作为 OSComp 官方双盘交付的外部构建输入使用：原版源码归档随仓库保存在
+`third_party/sources/`，版本、kernel.org URL、SHA-256 和官方校验清单集中记录于
+`tests/oscomp/inputs.json`。准备器离线校验、解包到忽略的工具缓存，使用固定官方
+容器已有的 musl 编译器生成 RV/LA 静态 `mke2fs`，并从同源构建宿主 `mke2fs`、
+`e2fsck`。配置不修改；唯一移植补丁为 `tests/oscomp/e2fsprogs-boaros-uname.patch`，
+其 SHA-256 和目标源码修改前后的哈希均在输入清单核对。该补丁避免把 BoarOS 自身
+release 当作旧 Linux；真实 Linux 的版本检查和 feature 选择保留。
 许可按归档 `NOTICE`：工具 GPL-2.0，ext2fs/e2p 库 LGPL-2.0，uuid 为 BSD 风格，
-et/ss 为 MIT 风格，保留所有上游许可。仅向每次运行的根盘副本写入工具和配置，
-不改原比赛镜像、LTP 程序或官方设备配置；用法见[评测模块](modules/oscomp-compat.md)。
+et/ss 为 MIT 风格，归档保留完整上游许可。工具部署到额外磁盘只读 p1，原根盘、
+LTP 程序与 libc 不注入或替换。FAT32 由固定官方容器的 dosfstools 创建，用法与
+磁盘布局见[评测模块](modules/oscomp-compat.md)。
 
 glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略的 `references/glibc/`，来源和 SHA-256 由 `references/sources.tsv` 固定；RV64 loader/libc 直接取自宿主 GNU 交叉工具链，并由 `tests/userland/glibc/inputs.json` 的 SHA-256 固定，未导入 Git 或修改。相关源码按 LGPL-2.1-or-later 发布，归档含 `COPYING.LIB` 和 `LICENSES`；本仓库新增的探针只测试其原生启动、TLS、pthread、信号与退出路径，见[程序环境](modules/program-environment.md)。
 
