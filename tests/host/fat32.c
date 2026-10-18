@@ -17,11 +17,11 @@ void mm_test_attach(unsigned);
 static unsigned char pool[32 * 1024 * 1024] __attribute__((aligned(16384)));
 static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
-static int fd, write_fail;
+static int fd, write_fail; static unsigned writes;
 static enum kernel_block_status rd(void *ctx, uint64_t at, void *p, size_t n)
 { (void)ctx; return pread(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO; }
 static enum kernel_block_status wr(void *ctx, uint64_t at, const void *p, size_t n)
-{ (void)ctx; return !write_fail && pwrite(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO; }
+{ (void)ctx; writes++; return !write_fail && pwrite(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO; }
 static enum kernel_block_status fl(void *ctx)
 { (void)ctx; return fsync(fd) ? KERNEL_BLOCK_STATUS_IO : 0; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t target, uint64_t *deadline)
@@ -74,13 +74,24 @@ static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
     assert(!kernel_vfs_rmdir(mount,"/second/moved directory") && !kernel_vfs_rmdir(mount,"/second") &&
         !kernel_vfs_rmdir(mount,"/first"));
 }
-static struct kernel_vfs_timespec persisted_mtime;
+static struct kernel_vfs_timespec persisted_mtime, remote_mtime;
 static void metadata(struct kernel_vfs_mount *mount,struct kernel_heap *heap)
 {
     struct kernel_vfs_file file={0},dir={0}; struct kernel_vfs_stat stat;
     assert(!kernel_vfs_create(mount,"/readonly",0444,&file));
     assert(!kernel_vfs_fstat(&file,&stat) && !(stat.mode&0222));
     assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_create(mount,"/remote-time",0666,&file));
+    struct kernel_vfs_timespec old_time[2]={{946684800,0},{946684800,0}};
+    assert(!kernel_vfs_file_set_times(&file,old_time)); sync_file(&file);
+    unsigned before_writes=writes;
+    mm_test_attach(1);
+    assert(!kernel_vfs_file_modified(&file,0,0)); kernel_vfs_file_accessed(&file);
+    assert(writes==before_writes);
+    mm_test_attach(0);
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.mtime.seconds>old_time[1].seconds+86400);
+    remote_mtime=stat.mtime;
+    sync_file(&file); assert(writes>before_writes && !kernel_vfs_close(&file));
     assert(!kernel_vfs_mkdir(mount,"/times",0777) && !kernel_vfs_open(mount,"/times",&dir));
     struct kernel_vfs_timespec past[2]={{946684800,0},{946684800,0}};
     assert(!kernel_vfs_file_set_times(&dir,past));
@@ -161,7 +172,10 @@ int main(int argc, char **argv)
     if(argc==3 && !strcmp(argv[2],"fault")) {
         assert(!kernel_vfs_create(&mount,"/fault",0666,&file) && !kernel_vfs_ftruncate(&file,4096));
         unsigned char data=91; assert(!kernel_vfs_pwrite(&file,0,&data,1,&done) && done==1);
-        write_fail=1; uint64_t observed=kernel_vfs_error_sequence(&file);
+        write_fail=1; unsigned attempted=writes;
+        uint64_t mount_observed=kernel_vfs_mount_error_sequence(&mount);
+        assert(kernel_vfs_sync_mount(&mount,&mount_observed)==-KERNEL_EIO && writes==attempted+1);
+        uint64_t observed=kernel_vfs_error_sequence(&file);
         assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_EIO);
         assert(!kernel_vfs_close(&file));
         assert(kernel_vfs_unmount(&mount)==-KERNEL_EIO && mount.private_data && kernel_block_claimed(&block));
@@ -213,6 +227,9 @@ int main(int argc, char **argv)
     assert(saved.mtime.seconds==(persisted_mtime.seconds&~INT64_C(1)));
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_open(&mount,"/readonly",&file) && !kernel_vfs_fstat(&file,&saved) && !(saved.mode&0222));
+    assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_open(&mount,"/remote-time",&file) && !kernel_vfs_fstat(&file,&saved));
+    assert(saved.mtime.seconds==(remote_mtime.seconds&~INT64_C(1)));
     assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&read_cache));
     assert(!kernel_block_unregister(&block));
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);

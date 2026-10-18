@@ -227,8 +227,114 @@ static void socket_parameters(void)
     close_fd(client); close_fd(listener);
 }
 
+struct selected_msghdr {
+    unsigned long name;
+    int name_length;
+    unsigned padding;
+    unsigned long iov, iov_count, control, control_length;
+    int flags;
+    unsigned tail_padding;
+};
+
+static void socket_address_lengths(void)
+{
+    /* Every declared byte through 128 is readable; AF_INET still consumes only
+     * its 16-byte address after the common socket layer imports the range. */
+    static union { struct selected_address address; unsigned char bytes[128]; } storage = {
+        .address = {2, 0, {127,0,0,1}, {0}}
+    };
+    const long lengths[] = {-1L, 129, 0xffffffff00000010UL, 16, 128};
+    const char *bind_names[] = {"selected.addrlen.bind-negative", "selected.addrlen.bind-129",
+        "selected.addrlen.bind-high-truncate", "selected.addrlen.bind-16", "selected.addrlen.bind-128"};
+    for (unsigned i = 0; i < 5; ++i) {
+        long fd = SC3(198, 2, 2, 0); abi_require(fd >= 0);
+        long rc = SC3(200, fd, &storage, lengths[i]);
+        struct selected_address observed = {0}; unsigned size = sizeof(observed);
+        long state = SC3(204, fd, &observed, &size);
+        abi_record(bind_names[i], rc, state, observed.port != 0, 0, 0, 0);
+        close_fd(fd);
+    }
+    long receiver = SC3(198, 2, 2 | 0x800, 0); abi_require(receiver >= 0);
+    abi_require(SC3(200, receiver, &storage, sizeof(storage.address)) == 0);
+    unsigned size = sizeof(storage.address);
+    abi_require(SC3(204, receiver, &storage, &size) == 0);
+    const char *connect_names[] = {"selected.addrlen.connect-negative", "selected.addrlen.connect-129",
+        "selected.addrlen.connect-high-truncate", "selected.addrlen.connect-16", "selected.addrlen.connect-128"};
+    for (unsigned i = 0; i < 5; ++i) {
+        long fd = SC3(198, 2, 2, 0); abi_require(fd >= 0);
+        long rc = SC3(203, fd, &storage, lengths[i]);
+        struct selected_address observed = {0}; unsigned peer_size = sizeof(observed);
+        long state = SC3(205, fd, &observed, &peer_size);
+        abi_record(connect_names[i], rc, state, observed.port == storage.address.port,
+            0, observed.ip, sizeof(observed.ip));
+        close_fd(fd);
+    }
+    long sender = SC3(198, 2, 2, 0); abi_require(sender >= 0);
+    abi_require(SC3(203, sender, &storage, sizeof(storage.address)) == 0);
+    const char *send_names[] = {"selected.addrlen.sendto-negative", "selected.addrlen.sendto-129",
+        "selected.addrlen.sendto-high-truncate", "selected.addrlen.sendto-16", "selected.addrlen.sendto-128"};
+    for (unsigned i = 0; i < 5; ++i) {
+        char sent = 'a' + i, received = 0;
+        long rc = SC6(206, sender, &sent, 1, 0, &storage, lengths[i]);
+        long state = SC6(207, receiver, &received, 1, 0, 0, 0);
+        abi_record(send_names[i], rc, state, -1, 0, &received, sizeof(received));
+    }
+    /* A valid long address must copy its declared tail before any send. */
+    long map = SC6(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
+    abi_require(map > 0 && SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
+    unsigned char *edge = (unsigned char *)(map + ABI_PAGE_SIZE - sizeof(storage.address));
+    for (unsigned i = 0; i < sizeof(storage.address); ++i) edge[i] = storage.bytes[i];
+    char received = 0;
+    long rc = SC6(206, sender, "x", 1, 0, edge, 128);
+    long state = SC6(207, receiver, &received, 1, 0, 0, 0);
+    abi_record("selected.addrlen.sendto-tail-fault", rc, state, -1, 0, &received, 1);
+    result("selected.addrlen.bind-tail-fault", SC3(200, sender, edge, 128));
+    result("selected.addrlen.connect-tail-fault", SC3(203, sender, edge, 128));
+    result("selected.addrlen.bind-zero-before-pointer", SC3(200, sender, -1, 0));
+    result("selected.addrlen.connect-zero-before-pointer", SC3(203, sender, -1, 0));
+    result("selected.addrlen.sendto-zero-before-pointer", SC6(206, sender, "x", 1, 0, -1, 0));
+    result("selected.addrlen.bind-long-before-pointer", SC3(200, sender, -1, 129));
+    result("selected.addrlen.connect-long-before-pointer", SC3(203, sender, -1, 129));
+    result("selected.addrlen.sendto-long-before-pointer", SC6(206, sender, "x", 1, 0, -1, 129));
+    struct abi_iovec iov = {(void *)"m", 1};
+    struct selected_msghdr message = {.name = (unsigned long)&storage,
+        .iov = (unsigned long)&iov, .iov_count = 1};
+    const int name_lengths[] = {-1, 129, 128, 16, 0, -1};
+    const char *message_names[] = {"selected.addrlen.sendmsg-negative", "selected.addrlen.sendmsg-clamp-129",
+        "selected.addrlen.sendmsg-128", "selected.addrlen.sendmsg-16",
+        "selected.addrlen.sendmsg-zero-name-length", "selected.addrlen.sendmsg-null-negative"};
+    for (unsigned i = 0; i < 6; ++i) {
+        message.name_length = name_lengths[i];
+        message.name = i == 5 ? 0 : (unsigned long)&storage;
+        received = 0;
+        rc = SC3(211, sender, &message, 0);
+        state = SC6(207, receiver, &received, 1, 0, 0, 0);
+        abi_record(message_names[i], rc, state, -1, 0, &received, 1);
+    }
+    message.name = (unsigned long)edge; message.name_length = 129;
+    received = 0;
+    rc = SC3(211, sender, &message, 0);
+    state = SC6(207, receiver, &received, 1, 0, 0, 0);
+    abi_record("selected.addrlen.sendmsg-clamped-tail-fault", rc, state, -1, 0, &received, 1);
+    message.name = (unsigned long)&storage;
+    message.name_length = sizeof(storage.address);
+    storage.address.family = 123;
+    message.iov = 1; message.iov_count = 1;
+    result("selected.addrlen.sendmsg-family-iov-fault", SC3(211, sender, &message, 0));
+    message.iov_count = 1025;
+    result("selected.addrlen.sendmsg-family-iov-count", SC3(211, sender, &message, 0));
+    storage.address.family = 2; message.name_length = 1;
+    message.iov_count = 1;
+    result("selected.addrlen.sendmsg-short-iov-fault", SC3(211, sender, &message, 0));
+    message.iov_count = 1025;
+    result("selected.addrlen.sendmsg-short-iov-count", SC3(211, sender, &message, 0));
+    abi_require(SC2(215, map, 2 * ABI_PAGE_SIZE) == 0);
+    close_fd(sender); close_fd(receiver);
+}
+
 void abi_selected_cases(void)
 {
     positioned_vectors(); lock_parameters(); path_parameters(); time_parameters();
     mapping_parameters(); reset_action(); epoll_nesting(); socket_parameters();
+    socket_address_lengths();
 }

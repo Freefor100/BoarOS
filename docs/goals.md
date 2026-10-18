@@ -41,11 +41,11 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
 | 信号、线程与事件 | sigaltstack、实时信号队列/计费；CMP_REQUEUE/WAKE_OP、PI futex；扩展 clone；eventfd/timerfd/signalfd | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
-| 用户内存 | mremap、按操作区分的 madvise、mlock；文件映射截断/退出错误的进一步交错验证 | [MM](modules/kernel-mm.md)；地址迁移依赖对象和并发边界稳定 |
+| 用户内存 | mremap、按操作区分的 madvise、mlock/MAP_LOCKED、/proc/<pid>/pagemap；文件映射截断/退出错误的进一步交错验证 | [MM](modules/kernel-mm.md)；地址迁移依赖对象和并发边界稳定 |
 | 进程查询与 IPC | waitid、getrusage、SysV 消息队列及信号量；preadv2/pwritev2 的扩展标志 | wait4、times、SysV 共享内存及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
 | 凭据与限制 | 可变 UID/GID/补充组及完整权限；合成对象权限、AS/DATA/FSIZE/CPU 等限额 | [文件接口](modules/kernel-files.md)、[syscall](modules/kernel-syscall.md)；现有固定 root 和 NOFILE/STACK 不重复立项 |
-| 网络与系统接口 | 命名 AF_UNIX/控制消息、原生 accept4、外部 IPv6 与运行时网络配置；CPU-time clock、VIRTUAL/PROF timer、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；DNS/TLS 另核对真实随机/时间/证书依赖 |
+| 网络与系统接口 | 普通 AF_UNIX socket 创建、命名与控制消息（socketpair 子集已提供）；原生 accept4、外部 IPv6 与运行时网络配置；CPU-time clock、VIRTUAL/PROF timer、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；DNS/TLS 另核对真实随机/时间/证书依赖 |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 
 ### P1h 虚拟文件系统与多挂载
