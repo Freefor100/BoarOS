@@ -64,7 +64,7 @@ class ReportTests(unittest.TestCase):
     def test_diagnostic_command_uses_both_writable_disks_and_keeps_original_resources(self):
         for arch in ('riscv', 'loongarch'):
             command = runner.boot_command(arch, 'qemu', 'kernel', 'root.img', 'scratch.img',
-                                          {'qemu.mem': '1G', 'qemu.smp': 1}, rng=True)
+                                          {'qemu.mem': '1G', 'qemu.smp': 1})
             self.assertEqual(command.count('-drive'), 2)
             self.assertIn('file=root.img,if=none,format=raw,id=x0', command)
             self.assertIn('file=scratch.img,if=none,format=raw,id=x1', command)
@@ -72,6 +72,23 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(command[command.index('-smp') + 1], '1')
             self.assertIn('user,id=net0', command)
             self.assertIn('rng-random,id=entropy,filename=/dev/urandom', command)
+            self.assertIn(('virtio-rng-device' if arch == 'riscv' else 'virtio-rng-pci') + ',rng=entropy', command)
+
+    def test_diagnostic_explicit_no_rng_override_omits_hardware(self):
+        command = runner.boot_command('riscv', 'qemu', 'kernel', 'root.img', 'scratch.img', {}, rng=False)
+        self.assertNotIn('-object', command)
+
+    def test_cli_records_default_rng_and_explicit_no_rng(self):
+        for options, expected in (([], True), (['--no-rng'], False), (['--rng'], True)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with patch.object(sys, 'argv', ['run.py', *options]), patch.object(runner, 'ROOT', root), \
+                        patch.object(runner, 'output', return_value='fixture'), \
+                        patch.object(runner, 'validate', side_effect=RuntimeError('stop before build')):
+                    with self.assertRaisesRegex(RuntimeError, 'stop before build'): runner.main()
+                reports = list((root / 'build').glob('*/report.json'))
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(json.loads(reports[0].read_text())['rng_added'], expected)
 
     def test_runtime_identity_uses_actual_target_build(self):
         with tempfile.TemporaryDirectory() as temporary:

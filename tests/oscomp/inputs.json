@@ -9,6 +9,15 @@
     "sdcard-rv.img.xz": "2b59aee4d26681b2d78a8faa615ac216f723a8ea157544e7867bbc8c77aac087",
     "sdcard-la.img.xz": "3cbeae1095d788cd8255e4929bcc6dace96dbe4999b6eaec003ae6fe2cdba42b"
   },
+  "local_profile": {
+    "name": "local-two-disk-ext4",
+    "disk_count": 2,
+    "rng": {
+      "default_enabled": true,
+      "backend": "rng-random",
+      "host_source": "/dev/urandom"
+    }
+  },
   "local_disk": {
     "scratch_bytes": 2147483648,
     "block_bytes": 4096,

@@ -48,6 +48,13 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 程序、judge 和原参数不变。两个架构的副本不共用可写后端，scratch 可以由 LTP
 重新格式化。`make prune-build` 保留 tools 缓存，运行目录按已有规则清理。
 
+本地 profile 同时默认附带真实 VirtIO RNG，QEMU 的 `rng-random` 从宿主
+`/dev/urandom` 供给设备，RV 使用 MMIO，LA 使用 PCI。内核按现有驱动和熵池
+规则达到就绪后，`getrandom(..., 0)` 才可返回；真实 mke2fs 的 libuuid 依赖这一
+正常阻塞语义生成 UUID。profile 的双盘数量、RNG 后端与默认启用状态集中维护于
+`inputs.json`。本地诊断可显式使用 `--no-rng` 复现缺少熵设备的环境，报告保留
+`rng_added=false` 和实际 QEMU 参数；这种配置的格式化程序可能等待熵池就绪。
+
 PID 1 创建根盘 `252:0`、scratch `252:16`、loop0..7 和 loop-control 节点。
 设备检查程序通过 stat/fstat、BLKGETSIZE64、BLKSSZGET 和 BLKROGET 核对
 `/` 对应根块设备、scratch 与根盘不同、容量为模板规定值、扇区为 512 字节且
@@ -56,7 +63,7 @@ PID 1 创建根盘 `252:0`、scratch `252:16`、loop0..7 和 loop-control 节点
 提供真实 `mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4`。这既让 LTP 复用
 额外物理盘，也保留其正常格式化调用；loop 节点服务需要 loop 接口的原用例。
 
-这是本地双盘 profile。官方容器构建显式设置 `OSCOMP_LOCAL_DISKS=0`，保留原
+这是本地双盘加 RNG profile。官方容器构建显式设置 `OSCOMP_LOCAL_DISKS=0`，保留原
 Harness 的单根盘设备配置，bootstrap 不依赖本地注入工具，也不设置上述 LTP
 设备变量。不能把本地双盘结果归为官方固定 profile 的运行结果。
 
@@ -69,12 +76,15 @@ qemu-system-riscv64 -machine virt -bios default -kernel kernel-rv -m 1G -smp 1 -
   -drive file=build/oscomp-manual-rv/root.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -drive file=build/oscomp-manual-rv/scratch.img,if=none,format=raw,id=x1 \
-  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
+  -object rng-random,id=entropy,filename=/dev/urandom \
+  -device virtio-rng-device,rng=entropy
 ```
 
 LA 将准备参数改为 `--arch loongarch` 并使用独立目录，QEMU 改为
 `-machine virt -cpu la464 -kernel kernel-la`、移除 `-bios default`，两块设备分别
-使用 `virtio-blk-pci,drive=x0` 与 `virtio-blk-pci,drive=x1`。每次准备必须选择
+使用 `virtio-blk-pci,drive=x0` 与 `virtio-blk-pci,drive=x1`，RNG 改用
+`virtio-rng-pci,rng=entropy`。每次准备必须选择
 新目录；不要把保留原盘或模板直接作为可写 QEMU 后端。
 
 ## 原盘bootstrap与监督
@@ -117,8 +127,8 @@ EXCLUDE。原LA BusyBox1.33.1的hush不支持set -u/-f；自有脚本按需要�
 `tests/oscomp/run.py --arch riscv|loongarch|both`默认both。一次调用先冻结全部
 内核和fixture，再同时启动；每架构一次启动，两种libc共有22组，双架构44组状态。
 本地入口始终是diagnostic，记录实际QEMU内容/模式/路径、启动参数、kernel/helper/
-bootstrap/fixture身份、真实串口和退出原因。增加RNG或改变预算须显式标记。
-本地默认使用上述独立双盘 profile，无RNG时不伪造可信熵ready。
+bootstrap/fixture身份、真实串口和退出原因。RNG 实际启用状态和预算变化均显式记录。
+本地默认使用上述独立双盘加 RNG profile，`--no-rng` 时不伪造可信熵ready。
 
 使用原parser、22个judge和postwork。联合summary来自本次两份实际输出，LTP
 在联合原始分上调用原非线性公式，不把独立整数分相加。分组状态区分not-selected、

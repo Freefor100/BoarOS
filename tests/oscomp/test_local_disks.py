@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -34,6 +35,11 @@ class LocalDiskTests(unittest.TestCase):
         self.assertEqual(source['sha256'], '08242e64ca0e8194d9c1caad49762b19209a06318199b63ce74ae4ef2d74e63c')
         self.assertEqual(disks.INPUTS['local_disk']['scratch_bytes'], 2 * 1024**3)
         self.assertEqual(disks.INPUTS['local_disk']['block_bytes'], 4096)
+        profile = disks.INPUTS['local_profile']
+        self.assertEqual(profile['disk_count'], 2)
+        self.assertTrue(profile['rng']['default_enabled'])
+        self.assertEqual(profile['rng']['backend'], 'rng-random')
+        self.assertEqual(profile['rng']['host_source'], '/dev/urandom')
 
     def test_static_tool_machine_and_dynamic_program_headers_are_checked(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,6 +110,31 @@ class LocalDiskTests(unittest.TestCase):
             devices = [command[i + 1] for i, value in enumerate(command) if value == '-device']
             self.assertTrue(all(device.startswith(transport + ',') for device in devices))
             if arch == 'riscv': self.assertIn('bus=virtio-mmio-bus.1', devices[1])
+
+    def test_local_launch_and_debug_default_to_real_rng_on_both_architectures(self):
+        for arch, device in (('riscv', 'virtio-rng-device'), ('loongarch', 'virtio-rng-pci')):
+            for options in ([], ['--gdb']):
+                with self.subTest(arch=arch, options=options), \
+                        patch.object(sys, 'argv', ['local_disks.py', '--arch', arch, '--qemu', 'qemu',
+                                                  '--kernel', 'kernel', '--output', 'run', *options]), \
+                        patch.object(disks, 'prepare_assets', return_value=Path('assets')), \
+                        patch.object(disks, 'prepare_run', return_value=(Path('root.img'), Path('scratch.img'))), \
+                        patch.object(disks.subprocess, 'run') as launch, patch('builtins.print'):
+                    disks.main()
+                    command = launch.call_args.args[0]
+                    self.assertIn('rng-random,id=entropy,filename=/dev/urandom', command)
+                    self.assertIn(device + ',rng=entropy', command)
+                    self.assertEqual(command.count('-drive'), 2)
+                    self.assertEqual('-S' in command, '--gdb' in options)
+
+    def test_explicit_no_rng_override_omits_hardware(self):
+        with patch.object(sys, 'argv', ['local_disks.py', '--arch', 'riscv', '--qemu', 'qemu',
+                                      '--kernel', 'kernel', '--output', 'run', '--no-rng']), \
+                patch.object(disks, 'prepare_assets', return_value=Path('assets')), \
+                patch.object(disks, 'prepare_run', return_value=(Path('root.img'), Path('scratch.img'))), \
+                patch.object(disks.subprocess, 'run') as launch, patch('builtins.print'):
+            disks.main()
+            self.assertNotIn('-object', launch.call_args.args[0])
 
 if __name__ == '__main__':
     unittest.main()

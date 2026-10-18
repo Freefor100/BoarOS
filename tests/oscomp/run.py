@@ -211,7 +211,8 @@ def judge(log, config):
     return results
 
 
-def boot_command(arch, qemu, kernel, disk, scratch, config, rng=False):
+def boot_command(arch, qemu, kernel, disk, scratch, config,
+                 rng=local_disks.INPUTS['local_profile']['rng']['default_enabled']):
     command = [qemu]
     if arch == 'riscv': command += ['-machine', 'virt']
     command += ['-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
@@ -221,8 +222,7 @@ def boot_command(arch, qemu, kernel, disk, scratch, config, rng=False):
     command += ['-no-reboot', '-device', 'virtio-net-device,netdev=net0' if arch == 'riscv' else 'virtio-net-pci,netdev=net0',
         '-netdev', 'user,id=net0', '-rtc', 'base=utc']
     if rng:
-        command += ['-object', 'rng-random,id=entropy,filename=/dev/urandom', '-device',
-                    'virtio-rng-device,rng=entropy' if arch == 'riscv' else 'virtio-rng-pci,rng=entropy']
+        command += local_disks.rng_arguments(arch)
     return command
 
 
@@ -289,7 +289,9 @@ def main():
     ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE')
     ap.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
     ap.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
-    ap.add_argument('--rng', action='store_true', help='add real entropy only to this labelled diagnostic profile')
+    ap.add_argument('--rng', action=argparse.BooleanOptionalAction,
+                    default=local_disks.INPUTS['local_profile']['rng']['default_enabled'],
+                    help='attach real VirtIO entropy (default enabled; --no-rng is a diagnostic override)')
     ap.add_argument('--local-cache', type=Path, default=Path(os.environ.get('OSCOMP_LOCAL_CACHE', ROOT / 'build/tools/oscomp-local')))
     ap.add_argument('--toolchain-root', type=Path, default=Path(os.environ.get('OSCOMP_TOOLCHAIN_ROOT', ROOT)))
     args = ap.parse_args()
@@ -338,7 +340,7 @@ def main():
                 'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],
                 'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
                 'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable),
-                'disk_profile': 'local-two-disk-ext4',
+                'disk_profile': identity['local_profile']['name'],
                 'extra_disk': {'path': str(scratch), 'sha256': sha(scratch), **identity['local_disk']},
                 'filesystem_tools': json.loads((assets / 'identity.json').read_text())}
             entry['runtime_compatibility'] = runtime_info(base)

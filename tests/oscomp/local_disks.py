@@ -238,6 +238,13 @@ def disk_arguments(arch, root, scratch):
     return devices
 
 
+def rng_arguments(arch):
+    facts = INPUTS['local_profile']['rng']
+    transport = 'virtio-rng-device' if arch == 'riscv' else 'virtio-rng-pci'
+    return ['-object', f"{facts['backend']},id=entropy,filename={facts['host_source']}",
+            '-device', transport + ',rng=entropy']
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--arch', choices=('riscv', 'loongarch'), required=True)
@@ -249,6 +256,9 @@ def main():
     parser.add_argument('--kernel', type=Path)
     parser.add_argument('--memory', default='1G')
     parser.add_argument('--gdb', action='store_true', help='start QEMU paused with its GDB stub')
+    parser.add_argument('--rng', action=argparse.BooleanOptionalAction,
+                        default=INPUTS['local_profile']['rng']['default_enabled'],
+                        help='attach real VirtIO entropy (default enabled; --no-rng is a diagnostic override)')
     args = parser.parse_args()
     if bool(args.qemu) != bool(args.kernel):
         parser.error('--qemu and --kernel require each other')
@@ -266,6 +276,7 @@ def main():
             if args.arch == 'riscv': command += ['-bios', 'default']
             else: command += ['-cpu', 'la464']
             command += disk_arguments(args.arch, root, scratch)
+            if args.rng: command += rng_arguments(args.arch)
             if args.gdb: command += ['-S', '-s']
             print('Local two-disk profile:', ' '.join(command), flush=True)
             subprocess.run(command, check=True)
