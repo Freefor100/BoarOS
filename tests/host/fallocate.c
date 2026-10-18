@@ -1,4 +1,5 @@
 /* Reuse the existing real-device/cache/MM host fixture, with separate cases. */
+#include <kernel/files.h>
 #define main cache_fixture_main
 #include "page_cache_concurrency.c"
 #undef main
@@ -6,7 +7,10 @@
 #include <ext4_super.h>
 #include <ext4_inode.h>
 #include <kernel/tmpfs.h>
-static unsigned fail_reserve, fail_remove, failed_direct_calls;
+static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
+int __real_ext4_file_complete_write(ext4_file *);
+int __wrap_ext4_file_complete_write(ext4_file *file)
+{ if (fail_complete) { fail_complete=0; return EIO; } return __real_ext4_file_complete_write(file); }
 static ext4_fsblk_t fail_direct_block;
 int __real_ext4_blocks_set_direct(struct ext4_blockdev *,const void *,uint64_t,uint32_t);
 int __wrap_ext4_blocks_set_direct(struct ext4_blockdev *dev,const void *bytes,uint64_t block,uint32_t count)
@@ -309,6 +313,81 @@ static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_v
     assert(!kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&victim));
     puts("PASS private free/reuse abort: retained allocation owners protect original initialized contents");
 }
+struct admission_fill {
+    struct kernel_vfs_file files[2];
+    size_t acknowledged[2];
+    int error;
+};
+static void admission_legacy(struct kernel_vfs_mount *mount,struct kernel_vfs_file *file)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,1);
+    int journal=adapter->device.fs->jbd_journal!=NULL;
+    if (journal) assert(!ext4_transaction_begin(adapter->mount_point));
+    struct ext4_inode_ref ref; assert(!ext4_fs_get_inode_ref(adapter->device.fs,node->inode,&ref));
+    ext4_inode_clear_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS); memset(ref.inode->blocks,0,sizeof(ref.inode->blocks));ref.dirty=true;
+    assert(!ext4_fs_put_inode_ref(&ref));
+    assert(!(journal?ext4_transaction_end(adapter->mount_point):ext4_cache_flush(adapter->mount_point)));
+}
+static void admission_prefix(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,int legacy)
+{
+    struct kernel_vfs_file target={0},filler={0},last={0},spare={0};
+    assert(!create_file(mount,"/prefix",0600,&target) && !create_file(mount,"/filler",0600,&filler) &&
+        !create_file(mount,"/last",0600,&last) && !create_file(mount,"/spare",0600,&spare));
+    if (legacy) admission_legacy(mount,&target);
+    size_t block=kernel_vfs_file_node(&target)->instance->writeback_block_size;
+    assert(!kernel_vfs_fallocate(&last,0,0,2*block));
+    fill_free_space(mount,&filler,&spare,block);
+    assert(!kernel_vfs_ftruncate(&last,0));
+    unsigned char bytes[4*BOAROS_PAGE_SIZE];memset(bytes,0x37,sizeof(bytes));size_t done;
+    assert(!kernel_vfs_pwrite(&target,0,bytes,sizeof(bytes),&done));
+    fprintf(stderr,"partial storage admission: accepted=%zu expected=%zu legacy=%d\n",done,2*block,legacy);
+    assert(done==2*block && kernel_vfs_file_size(&target)==done);
+    uint64_t observed=0; assert(!kernel_vfs_sync(&target,0,&observed) && !kernel_vfs_error_sequence(&target));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&target)));
+    expect_bytes(&target,bytes,done);
+    assert(kernel_vfs_pwrite(&target,done,bytes,1,&done)==-KERNEL_ENOSPC && !done);
+    assert(!kernel_vfs_sync(&target,0,&observed));
+    assert(!kernel_vfs_close(&target) && !kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&spare));
+    puts("PASS partial storage admission: exact filesystem-block prefix, unchanged rejected EOF, sync and reloaded bytes");
+}
+static void admission_fill_disk(void *argument)
+{
+    struct admission_fill *fill=argument;
+    unsigned char bytes[128*1024];
+    for (unsigned step=0;step<4096;step++) {
+        unsigned which=step%2; memset(bytes,0x61+which,sizeof(bytes)); size_t done;
+        int error=kernel_vfs_pwrite(&fill->files[which],fill->acknowledged[which],bytes,sizeof(bytes),&done);
+        fill->acknowledged[which]+=done;
+        if (error) { assert(error==-KERNEL_ENOSPC && !done); fill->error=error; return; }
+    }
+    assert(!"filesystem did not become full");
+}
+static void admission_full(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,int legacy)
+{
+    struct admission_fill fill={0};
+    assert(!create_file(mount,"/accepted-a",0600,&fill.files[0]) &&
+        !create_file(mount,"/accepted-b",0600,&fill.files[1]));
+    if (legacy) admission_legacy(mount,&fill.files[1]);
+    assert(!kernel_page_cache_start_worker(cache) && !kernel_vfs_start_journal_worker(mount));
+    assert(!kernel_page_cache_run_cpu0(cache,admission_fill_disk,&fill) && fill.error==-KERNEL_ENOSPC);
+    for (unsigned which=0;which<2;which++) {
+        uint64_t observed=0; int synced=kernel_vfs_sync(&fill.files[which],0,&observed);
+        fprintf(stderr,"full admission inode=%u acknowledged=%zu fsync=%d\n",which,fill.acknowledged[which],synced);
+        assert(!synced && !kernel_vfs_error_sequence(&fill.files[which]));
+        struct kernel_vfs_stat stat; assert(!kernel_vfs_fstat(&fill.files[which],&stat) && stat.size==fill.acknowledged[which]);
+        assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&fill.files[which])));
+        unsigned char *expected=malloc(fill.acknowledged[which]);assert(expected);
+        memset(expected,0x61+which,fill.acknowledged[which]);
+        expect_bytes(&fill.files[which],expected,fill.acknowledged[which]); free(expected);
+        size_t done; assert(kernel_vfs_pwrite(&fill.files[which],fill.acknowledged[which],"!",1,&done)==-KERNEL_ENOSPC && !done);
+        assert(!kernel_vfs_pwrite(&fill.files[which],0,"+",1,&done) && done==1 && !kernel_vfs_sync(&fill.files[which],0,&observed));
+        assert(!kernel_vfs_close(&fill.files[which]));
+    }
+    kernel_page_cache_stop_worker(cache);
+    puts("PASS full admission: ENOSPC rejects unaccepted bytes; all prior inodes fsync/reload exact prefixes, overwrite and clean shutdown");
+}
 static unsigned punch_started,punch_completed;
 static struct kernel_vfs_file *punch_file;
 static size_t punch_block;
@@ -346,6 +425,149 @@ static void active_writeback(struct kernel_vfs_mount *mount)
     puts("PASS active writeback: handshake waits for old I/O, then punched mappings stay absent and outside bytes survive");
 }
 #ifdef CACHE_MM_CASES
+static unsigned prepare_pause,prepare_entered,prepare_resume;
+static int replaced_prepare_error;
+int __real_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *,struct kernel_vfs_node *,uint64_t);
+int __wrap_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,uint64_t index)
+{
+    int held=__atomic_exchange_n(&prepare_pause,0,__ATOMIC_ACQ_REL);
+    if (held) {
+        assert(!kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&prepare_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&prepare_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    int error=__real_kernel_page_cache_prepare_mapping_write(cache,node,index);
+    if (held) replaced_prepare_error=error;
+    return error;
+}
+struct replaced_fault {
+    struct kernel_mm *mm;
+    uint64_t address;
+    size_t done;
+    enum kernel_uaccess_status result;
+};
+static void *replace_fault_actor(void *argument)
+{
+    struct replaced_fault *fault=argument;
+    cache_test_attach(1); mm_test_bind(fault->mm);
+    assert(!kernel_mm_context(fault->mm,&mm_test_context));
+    unsigned char byte=0xa7;
+    fault->result=kernel_copy_to_user(fault->mm,fault->address,&byte,1,&fault->done);
+    mm_test_bind(NULL);mm_test_context=0;
+    return NULL;
+}
+static void admission_fault(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_vfs_mount *mount)
+{
+    struct arch_mmu_page_table kernel={0};struct arch_mmu_user_space space={0};struct kernel_mm mm={0};
+    assert(!riscv_sv39_page_table_init(&kernel,pages));kernel.state=ARCH_MMU_STATE_ACTIVE;
+    assert(!arch_mmu_user_space_init(&space,pages,&kernel) && !kernel_mm_create(&mm,&space) && !kernel_mm_vma_enable(&mm,heap));
+    assert(!kernel_mm_context(&mm,&mm_test_context) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+    for (unsigned legacy=0;legacy<2;legacy++) {
+        struct kernel_vfs_file file={0};assert(!create_file(mount,legacy?"/fault-legacy":"/fault-extents",0600,&file));
+        if (legacy) admission_legacy(mount,&file);
+        struct kernel_uaccess_iovec source={.base=0x900000,.length=BOAROS_PAGE_SIZE};
+        struct kernel_vfs_user_write_result result;
+        assert(!kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,&result));
+        assert(result.access==KERNEL_UACCESS_STATUS_FAULT && !result.written && !result.end_offset);
+        struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && (legacy?!stat.blocks:stat.blocks>0));
+        uint64_t observed=0;assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_error_sequence(&file));
+        assert(!kernel_vfs_close(&file));
+    }
+    for (unsigned cleanup=0;cleanup<3;cleanup++) {
+        const char *name=cleanup==2?"/fault-close":cleanup?"/fault-unlink":"/fault-truncate";
+        struct kernel_vfs_file file={0}; assert(!create_file(mount,name,0600,&file));admission_legacy(mount,&file);
+        struct kernel_vfs_statfs before,after;assert(!kernel_vfs_mount_statfs(mount,&before));
+        struct kernel_uaccess_iovec source={.base=0x900000,.length=BOAROS_PAGE_SIZE};
+        struct kernel_vfs_user_write_result result; fail_complete=1;
+        assert(kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,&result)==-KERNEL_EIO && !fail_complete);
+        assert(result.access==KERNEL_UACCESS_STATUS_FAULT && !result.written && !kernel_vfs_error_sequence(&file));
+        struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && stat.blocks);
+        if (cleanup==1) assert(!kernel_vfs_unlink(mount,name));
+        else if (!cleanup) assert(!kernel_vfs_ftruncate(&file,0));
+        assert(!kernel_vfs_close(&file) && !kernel_vfs_mount_statfs(mount,&after));
+        if (cleanup!=2) assert(after.free_blocks==before.free_blocks);
+    }
+    {
+        struct kernel_vfs_file file={0}; assert(!create_file(mount,"/legacy-wb-error",0600,&file));admission_legacy(mount,&file);
+        unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x59,sizeof(bytes));size_t done;
+        write_error=1;
+        assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes) && !write_error);
+        uint64_t observed=0;assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_EIO && !kernel_vfs_sync(&file,0,&observed));
+        assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+        expect_bytes(&file,bytes,sizeof(bytes));assert(!kernel_vfs_close(&file));
+    }
+    mm_test_bind(NULL);mm_test_context=0;
+    assert(!kernel_mm_release(&mm) && !physical_page_release(pages,kernel.root_address));
+    struct kernel_block_device *disk=lwext4_instance(mount->private_data)->block;
+    if (!lwext4_instance(mount->private_data)->device.fs->jbd_journal) {
+        fail_complete=1;
+        assert(kernel_vfs_unmount(mount)==-KERNEL_EIO && !fail_complete);
+    }
+    assert(!kernel_vfs_unmount(mount) && !kernel_page_cache_destroy(cache));
+    *mount=(struct kernel_vfs_mount){0}; *cache=(struct kernel_page_cache){0};
+    assert(!kernel_page_cache_init(cache,heap,pages) && !kernel_vfs_mount_ext4(mount,disk,&backend_heap,cache,0));
+    struct kernel_vfs_file closed={0};struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_open(mount,"/fault-close",&closed) && !kernel_vfs_fstat(&closed,&stat));
+    fprintf(stderr,"closed legacy cleanup after remount: size=%llu blocks=%llu\n",(unsigned long long)stat.size,(unsigned long long)stat.blocks);
+    assert(!stat.size && !stat.blocks && !kernel_vfs_close(&closed));
+    puts("PASS source fault: unchanged EOF; legacy blocks returned on completion/truncate/unlink/close and unmount retry; real WB error retains acknowledged bytes and all owners return");
+}
+static void admission_mmap(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_file created={0},filler={0},last={0},spare={0};
+    assert(!create_file(mount,"/mmap-full",0600,&created) && !kernel_vfs_ftruncate(&created,BOAROS_PAGE_SIZE) && !kernel_vfs_close(&created));
+    assert(!create_file(mount,"/fill",0600,&filler) && !create_file(mount,"/last",0600,&last) && !create_file(mount,"/spare",0600,&spare));
+    size_t block=kernel_vfs_file_node(&filler)->instance->writeback_block_size;
+    int partial=BOAROS_PAGE_SIZE>block;
+    if (partial) assert(!kernel_vfs_fallocate(&last,0,0,block));
+    fill_free_space(mount,&filler,&spare,block);
+    if (partial) assert(!kernel_vfs_ftruncate(&last,0));
+    struct kernel_open_file_description *file=NULL; int error;
+    assert(!kernel_open_file_create(heap,mount,"/mmap-full",&file,&error) && !error); file->open_flags=2;
+    struct arch_mmu_page_table kernel={0}; struct arch_mmu_user_space space={0}; struct kernel_mm mm={0};
+    assert(!riscv_sv39_page_table_init(&kernel,pages));kernel.state=ARCH_MMU_STATE_ACTIVE;
+    assert(!arch_mmu_user_space_init(&space,pages,&kernel) && !kernel_mm_create(&mm,&space) && !kernel_mm_vma_enable(&mm,heap));
+    assert(!kernel_mm_context(&mm,&mm_test_context) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000)); uint64_t shared,private;
+    struct kernel_open_file_description *source=file; assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x40000,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&shared));
+    source=file;assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x80000,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&private));
+    assert(!disk_read(&mm,shared) && !disk_read(&mm,private));
+    enum kernel_mm_status result=kernel_mm_resolve_user_fault(&mm,shared,KERNEL_MM_WRITE);
+    fprintf(stderr,"full shared mmap: result=%u partial=%d\n",result,partial);
+    assert(result==KERNEL_MM_STATUS_BUS_FAULT && !kernel_vfs_error_sequence(&file->file));
+    struct kernel_mm_mapping mapping; assert(!kernel_mm_lookup(&mm,shared,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+    unsigned char byte=0x91;size_t done;
+    assert(!kernel_copy_to_user(&mm,private,&byte,1,&done) && done==1 && disk_read(&mm,private)==byte && !disk_read(&mm,shared));
+    uint64_t observed=0;assert(!kernel_vfs_sync(&file->file,0,&observed));
+    if (partial) {
+        assert(mapped(&file->file,0).block && mapped(&file->file,0).unwritten);
+        assert(!kernel_vfs_pwrite(&file->file,0,"!",1,&done) && done==1 && !kernel_vfs_sync(&file->file,0,&observed));
+        assert(disk_read(&mm,shared)=='!' && disk_read(&mm,private)==byte);
+    }
+    assert(!kernel_page_cache_start_worker(cache));
+    prepare_pause=1;prepare_entered=prepare_resume=0;replaced_prepare_error=0;
+    struct replaced_fault fault={.mm=&mm,.address=shared};pthread_t writer;
+    assert(!pthread_create(&writer,NULL,replace_fault_actor,&fault));
+    wait_progress(&prepare_entered,1);
+    uint64_t replacement;
+    assert(!kernel_mm_mmap_anonymous(&mm,shared,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&replacement) && replacement==shared);
+    __atomic_store_n(&prepare_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(writer,NULL));
+    fprintf(stderr,"replaced shared mapping: old prepare=%d access=%u done=%zu\n",
+        replaced_prepare_error,fault.result,fault.done);
+    assert(replaced_prepare_error==-KERNEL_ENOSPC && !fault.result && fault.done==1 && disk_read(&mm,shared)==0xa7);
+    kernel_page_cache_stop_worker(cache);
+    mm_test_bind(NULL);mm_test_context=0;
+    assert(!kernel_mm_release(&mm) && !kernel_open_file_release(&file) && !physical_page_release(pages,kernel.root_address));
+    assert(!kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&spare));
+    (void)cache;
+    puts("PASS mmap admission: full valid page required before writable PTE; private COW survives full disk, no dirty error");
+}
 static void mmap_ranges(struct kernel_page_cache *cache,struct kernel_heap *heap,
     struct physical_page_allocator *pages,struct kernel_vfs_mount *mount)
 {
@@ -403,6 +625,20 @@ int main(int argc,char **argv)
     struct kernel_block_device device={.read=image_read,.write=image_write,.flush=image_flush,
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,&backend_heap,&cache,0));
+#ifdef CACHE_MM_CASES
+    if (!strcmp(argv[2],"admission-fault")) {
+        admission_fault(&cache,&heap,&pages,&mount); goto mounted_done;
+    }
+    if (!strcmp(argv[2],"admission-mmap")) {
+        admission_mmap(&cache,&heap,&pages,&mount); goto mounted_done;
+    }
+#endif
+    if (!strncmp(argv[2],"admission-",10)) {
+        if (!strncmp(argv[2],"admission-prefix",16))
+            admission_prefix(&cache,&mount,!strcmp(argv[2],"admission-prefix-legacy"));
+        else admission_full(&cache,&mount,!strcmp(argv[2],"admission-legacy"));
+        goto mounted_done;
+    }
     if (!strcmp(argv[2],"reserved-abort-reuse")) {
         reserved_abort_reuse(&cache,&mount);
         goto mounted_done;

@@ -504,6 +504,13 @@ int ext4_ftruncate(ext4_file *file, uint64_t size);
 /* changed reports committed mapping/data changes even on a partial failure. */
 int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
                    uint64_t length, bool *changed);
+/* Prepare storage without publishing EOF or file bytes. A committed prefix
+ * remains usable when a later range cannot be allocated. If complete is set,
+ * write back accepted bytes before calling complete_write to trim unused
+ * initialized legacy mappings; retain this duty when either operation fails. */
+int ext4_file_prepare_write(ext4_file *file, uint64_t offset, size_t length,
+                            size_t *ready, bool *complete);
+int ext4_file_complete_write(ext4_file *file);
 
 /**@brief   Read data from file.
  *

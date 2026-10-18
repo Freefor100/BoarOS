@@ -63,7 +63,7 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 
 `kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。若目标 node 存在活动的写打开者（`node->write_openers > 0`），返回 `-ETXTBSY`；检查通过后累加 `node->exec_users` 并持有 `file->exec_lease`。对应地，以写权限打开普通文件需调用 `kernel_vfs_file_acquire_write()`，当 `node->exec_users > 0` 时准确返回 `-ETXTBSY`，否则累加 `node->write_openers` 并持有 `file->write_lease`。该租约在 `kernel_vfs_close()` 时释放，严格保障运行中二进制与写入者之间的互斥。
 
-挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。普通文件的共享 inode 节点持有 atime/mtime/ctime 与脏字段位，首次打开从实际 inode 解码，硬链接和多个描述符共用该对象。`kernel_vfs_file_accessed()` 直接按这组运行时值判断 relatime，`kernel_vfs_file_modified()` 在非零写请求复制前更新 mtime/ctime；两条普通 I/O 路径都不读取磁盘 inode 或创建时间事务，首字节 EFAULT 仍保留此前的时间更新。只读挂载与 inode 的 NOATIME 标志禁止访问时间更新；O_NOATIME open 选项仍明确返回 ENOTSUP。已知 mount 错误在写侧当场传播，读侧时间错误不改变数据结果。
+挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。普通文件的共享 inode 节点持有 atime/mtime/ctime 与脏字段位，首次打开从实际 inode 解码，硬链接和多个描述符共用该对象。`kernel_vfs_file_accessed()` 直接按这组运行时值判断 relatime，`kernel_vfs_file_modified()` 在非零写请求复制前更新 mtime/ctime；这两个时间更新入口不读取磁盘 inode 或创建时间事务，首字节 EFAULT 仍保留此前的时间更新。只读挂载与 inode 的 NOATIME 标志禁止访问时间更新；O_NOATIME open 选项仍明确返回 ENOTSUP。已知 mount 错误在写侧当场传播，读侧时间错误不改变数据结果。
 
 脏时间字段随数据写回的同一事务编码；无脏数据页时由现有挂载后台线程在首次变脏约 100ms 后、显式同步或卸载编码。该线程在所有可写 ext4 上启动；没有 journal 时只处理脏时间，有 journal 时同时推进组提交。脏字段持有节点引用，最后描述符关闭不会丢失时间。脏时间队列的节点数在入队和摘链时维护，每轮直接用该计数限定处理量，不先遍历队列计数。worker 使用非阻塞事务准入，空间不足时先推进 journal，避免等待自身。namespace、truncate、chmod/chown 和显式 utimens 仍在原 metadata 事务修改时间；挂载回调暂存规范化值，外层事务成功后才发布到共享节点。每个字段的版本检查保留操作等待期间发生的更新，abort 丢弃暂存值，写回仅清除仍等于已编码快照的脏字段。短暂的内存发布依赖现有 CPU0 service 执行域与 IRQ 排斥，不构成通用 SMP inode 锁。操作时机、编码及错误语义的依据见[时间戳学习记录](../learning/file-timestamps.md)。
 
@@ -111,7 +111,15 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 每个 ext4 实例建立独立的架构页缓存（RV64 为 4 KiB，LA64 为 16 KiB），键为 `(node, page_index)`：开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。删除产生的墓碑通过同容量重排清除；只有下一项存活元素使占用超过 75% 时才扩容，候选表分配后再次按当前占用判断发布。缓存项持有 node 引用和一份物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 与文件私有/共享映射可以安全引用同一页。共享 PTE 另持物理引用；MM 拥有的别名记录由缓存项反向索引借用，含别名的缓存项不能失效或回收。
 
-普通写先在 inode 数据锁外解析并固定来源用户页，再直接复制到同一缓存页并更新 node 的逻辑大小；不同 fd、VFS pread、ELF 读源与映射缺页立即看到该内容。跨 EOF 的普通写在复制后清零将要暴露的空隙，避免来源映射恰好位于旧 EOF 尾部时提前破坏输入；显式扩展亦清零新暴露字节，并重新保护共享别名，防止页仍可写时漏记脏。缓存项按 inode 另建全页链供截断/失效使用，脏页则由按页号排序的红黑树索引，计数随标脏和清脏增减。范围写回从范围起点查树，依次取得范围内的有序脏页窗口；按范围 `msync` 只提交目标文件页。每项保留脏范围、修改代次与 writeback 状态；写回前重新保护本页共享别名，再固定页面，只有完整提交且代次未变才清脏。失败保留缓存页/node owner；VFS 的后端提交入口统一检查短写并发布一次 inode 错误，后台、文件同步和挂载同步只传递同一结果。lwext4 非 journal 写入/截断用操作范围固定本次修改的缓冲，建立完整的分配所有权后才提交该集合；不会全量 drain 历史 dirty list。底层最后引用的 flush 错误显式返回，失败缓冲仍在 mount dirty list。最后一个 fd 关闭不释放仍有脏页的 inode。
+普通写在文件写操作互斥内，先为有限窗口准备实际磁盘空间，再在 inode 数据锁外解析并固定来源用户页，直接复制到同一缓存页并更新 node 的逻辑大小；不同 fd、VFS pread、ELF 读源与映射缺页立即看到该内容。跨 EOF 的普通写在复制后清零将要暴露的空隙，避免来源映射恰好位于旧 EOF 尾部时提前破坏输入；显式扩展亦清零新暴露字节，并重新保护共享别名，防止页仍可写时漏记脏。缓存项按 inode 另建全页链供截断/失效使用，脏页则由按页号排序的红黑树索引，计数随标脏和清脏增减。范围写回从范围起点查树，依次取得范围内的有序脏页窗口；按范围 `msync` 只提交目标文件页。每项保留脏范围、修改代次与 writeback 状态；写回前重新保护本页共享别名，再固定页面，只有完整提交且代次未变才清脏。失败保留缓存页/node owner；VFS 的后端提交入口统一检查短写并发布一次 inode 错误，后台、文件同步和挂载同步只传递同一结果。lwext4 非 journal 写入/截断用操作范围固定本次修改的缓冲，建立完整的分配所有权后才提交该集合；不会全量 drain 历史 dirty list。底层最后引用的 flush 错误显式返回，失败缓冲仍在 mount dirty list。最后一个 fd 关闭不释放仍有脏页的 inode。
+
+空间准备由后端维护真实映射：已有 initialized 或 unwritten 块直接复用，hole 才分配 unwritten extent；tmpfs 不需要此步骤。每次后端操作最多处理 32 个文件系统块，已提交的连续字节数只属于本次请求，不另建预留缓存。空间不足时只复制已准备的前缀，拒绝部分不改变 EOF；普通分配 ENOSPC 不登记写回错误，先前已接纳的数据仍须正常 fsync 和读回。真正的写回 ENOSPC／EIO 保留脏数据与错误游标。CPU0 执行后端准备时短暂持 inode writer，在来源缺页或 pin 前归还；外层文件写操作互斥继续固定本次写资格，避免等待同文件来源缺页时自锁。
+
+legacy 间接指针格式没有 unwritten 状态，新分配块先清零。若映射越过持久 EOF，journal 操作同时保留已有 orphan 意图但暂不回收；复制结束后先写回已接纳字节，再将意图设为可回收并按实际磁盘 EOF 删除未用尾部。写回或清理失败分别由脏缓存和持久 orphan 保持恢复责任。无 journal 时节点在创建映射前持有完成标记，只在成功完成后清除；最后关闭不递归存储 I/O，而由既有 `cleanup_nodes` 保留节点供卸载重试。清理失败不释放节点或 mapping 对象，成功后一起销毁；inode 真正释放时退休对应旧清理节点，避免 inode 复用后误截断新文件。同尺寸 truncate 和 unlink 也遍历实际映射及空的间接树，能回收大小仍为零的尾部。来源首字节 EFAULT 不增长 EOF；extent 格式可以留下仍读零的真实预分配，legacy 未用尾部由上述完成路径回收。
+
+共享映射写缺页在授予可写 PTE 前调用同一空间准备，要求整页中所有有效 EOF 字节都有存储；16 KiB 页只准备出部分 1/4 KiB 块时返回 BUS fault，不能开放其余 hole。等待期间释放 MM gate 和 inode 读资格，返回后先重新检查 VMA 代次、映射代次与 EOF，再解释后端错误并核对驻留页；若地址已被 MAP_FIXED 替换，重试新映射，不把旧文件的 ENOSPC 施加到新地址。private COW 不需要后端存储，仍可在磁盘满时生成私有副本。
+
+`FALLOCATE_HOST_CASES='admission-full admission-legacy admission-prefix admission-prefix-legacy admission-fault admission-mmap' FALLOCATE_HOST_IMAGE_SIZE=8M sh tests/fallocate-host.sh` 检查磁盘满前的接纳与准确短写、fsync 和失效后读回、来源 EFAULT、legacy 清理失败后的 truncate／unlink／仅关闭及卸载重试、真实写回错误，以及共享映射和 private COW。默认组合为 4/16 KiB 页、1/4 KiB 文件系统块和有／无 journal，共 48 个场景，每个场景检查资源归还及 e2fsck。
 
 截断只写回新 EOF 之前的脏范围，再调用后端；成功后按实际结果更新逻辑长度、通知 MM、丢弃越界页并清零尾页。后端失败且磁盘 size 未变时保留原逻辑长度与脏 owner，截零不需要保存待丢弃数据。删除仍打开的文件保留缓存；只有 orphan 最后一个打开/执行 owner 退出时，才丢弃已不再可观察的缓存并回收 inode。
 

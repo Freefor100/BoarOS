@@ -2083,22 +2083,91 @@ static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cach
     return status;
 }
 
-static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_file *file,
-    uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written)
+struct prepare_space {
+    struct kernel_vfs_node *node;
+    uint64_t offset;
+    size_t length,ready;
+    int mapping,error,complete;
+};
+static void prepare_space(void *argument)
+{
+    struct prepare_space *request=argument;
+    struct kernel_vfs_node *node=request->node;
+    KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,1);
+    size_t length=request->length;
+    if (request->mapping) {
+        if (request->offset>=node->size) { request->error=-KERNEL_EFAULT; return; }
+        if (length>node->size-request->offset) length=node->size-request->offset;
+    }
+    request->error=node->instance->ops->error(node->instance);
+    if (!request->error) {
+        if (node->instance->ops->prepare_write)
+            request->error=node->instance->ops->prepare_write(node,request->offset,length,&request->ready,&request->complete);
+        else request->ready=length;
+    }
+    if (request->ready>length || (!request->error && request->ready!=length)) __builtin_trap();
+    if (request->mapping && request->ready!=length && !request->error) __builtin_trap();
+}
+static void complete_space(void *argument)
+{
+    struct prepare_space *request=argument;
+    request->error=request->node->instance->ops->complete_write(request->node);
+}
+static int prepare_space_request(struct kernel_page_cache *cache,struct prepare_space *request,
+    void (*execute)(void *))
+{
+    /* 调用者只保留 write/offset 的互斥；源缺页、inode 和页写许可均不跨
+     * CPU0 空间准备，worker 不反向取得调用者的低层互斥。 */
+    struct kernel_io_context *context=kernel_io_context_current();
+    if (context->user_pins || context->cache_writes || context->backend_depth || kernel_cpu_current()->raw_locks)
+        __builtin_trap();
+    for (struct kernel_lock_guard *g=context->locks;g;g=g->previous)
+        if (g->lock->rank>15) __builtin_trap();
+    if (kernel_page_cache_needs_cpu0(cache)) {
+        if (run_request(cache,execute,request,1,NULL)) return -KERNEL_EIO;
+    } else execute(request);
+    return request->error;
+}
+int kernel_page_cache_prepare_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
+    uint64_t offset,size_t length,size_t *ready,int *complete)
+{
+    struct prepare_space request={.node=node,.offset=offset,.length=length};
+    int error=prepare_space_request(cache,&request,prepare_space);
+    *ready=request.ready;
+    *complete=request.complete;
+    return error;
+}
+int kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
+    uint64_t index)
+{
+    struct prepare_space request={.node=node,.offset=index<<BOAROS_PAGE_SHIFT,
+        .length=BOAROS_PAGE_SIZE,.mapping=1};
+    return prepare_space_request(cache,&request,prepare_space);
+}
+
+static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_file *file,
+    uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written,int *complete)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     *written=0;
-    size_t window=0;
+    size_t ready=0;
+    int space_error=0;
     while (*written<size) {
-        if (!window) {
+        if (!ready) {
+            if (space_error) return space_error;
             int error=write_admission(cache,node);
             if (error) return error;
-            window=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+            size_t length=BOAROS_PAGE_CACHE_WRITEBACK_PAGES*BOAROS_PAGE_SIZE-(offset&BOAROS_PAGE_MASK);
+            if (length>size-*written) length=size-*written;
+            int needed=0;
+            space_error=kernel_page_cache_prepare_write(cache,node,offset,length,&ready,&needed);
+            *complete|=needed;
+            if (!ready) return space_error;
         }
-        window--;
         size_t start=offset&BOAROS_PAGE_MASK;
         size_t count=BOAROS_PAGE_SIZE-start;
         if (count>size-*written) count=size-*written;
+        if (count>ready) count=ready;
         count=kernel_vfs_write_source_span(source,count);
         if (!count) { source->access=KERNEL_UACCESS_STATUS_STATE; return 0; }
         KERNEL_LOCK_SCOPE(io);
@@ -2199,9 +2268,21 @@ static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs
         if (pin.registration) kernel_mm_unpin_user_page(&pin);
         kernel_page_cache_resize_finish(&resize,old_size);
         kernel_vfs_write_source_advance(source,count);
-        offset+=count; *written+=count;
+        offset+=count; *written+=count; ready-=count;
     }
     return 0;
+}
+static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_file *file,
+    uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written)
+{
+    int complete=0;
+    int error=copy_cached_source(cache,file,offset,source,size,written,&complete);
+    if (complete) {
+        struct prepare_space request={.node=kernel_vfs_file_node(file)};
+        int result=prepare_space_request(cache,&request,complete_space);
+        if (!error) error=result;
+    }
+    return error;
 }
 
 int kernel_page_cache_write_source(struct kernel_page_cache *cache,

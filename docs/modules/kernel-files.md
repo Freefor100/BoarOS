@@ -33,7 +33,7 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 
 普通 `read/pread/readv` 与 `write/pwrite/writev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选，把实际缺失批次交给既有 CPU0 worker。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
 
-共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
+共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写先在用户来源 pin 前经 CPU0 准备真实空间，归还该步骤的 inode writer 后才解析来源；空间接纳与 legacy 格式的完成职责见 [VFS/ext4](vfs-ext4.md#文件节点与页缓存)。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
 
 请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。最后缓存 OFD 的后端释放交给同一 worker，普通用户 pipe 的最后关闭在 CPU0 发布端点变化，因为另一端可以登记 epoll 回调。受控内核 pipe 的普通等待者已在任务创建时限定，不把端点 EOF 推迟到退出清理。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
 

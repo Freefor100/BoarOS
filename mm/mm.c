@@ -3593,13 +3593,31 @@ static enum kernel_mm_status allocate_private_page(struct physical_page_allocato
 }
 
 /* gate固定resident/alias，许可由页write状态仲裁；等待时结束全部对象保护。 */
+static int fault_inode_lock(struct mm_operation *,struct kernel_vfs_node *,struct kernel_lock_guard *);
 static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
     struct kernel_open_file_description *file,const struct kernel_vma *vma,uint64_t address,
     struct kernel_lock_guard *inode)
 {
     struct kernel_mm_record *record=operation->record;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    uint64_t generation=kernel_vma_set_generation(record->vmas),epoch,latest;
+    if (kernel_file_mapping_epoch(node,&epoch)) return KERNEL_MM_STATUS_CONFLICT;
+    uint64_t offset=vma->backing_offset+address-vma->start;
+    /* 准备磁盘空间不能持有 MM gate 或 inode 读资格；同文件源缺页、
+     * truncate 与后端预算等待都需要这些对象继续推进。返回后重查身份。 */
+    if (inode->lock) kernel_lock_release(inode);
+    mm_gate_release(record,&operation->guard);
+    int error=kernel_page_cache_prepare_mapping_write(kernel_open_file_page_cache(file),node,offset>>BOAROS_PAGE_SHIFT);
+    enum kernel_mm_status locked=mm_operation_lock(operation);
+    if (locked) return locked;
+    if (generation!=kernel_vma_set_generation(record->vmas) || !fault_inode_lock(operation,node,inode))
+        return KERNEL_MM_STATUS_CONFLICT;
+    if (kernel_file_mapping_epoch(node,&latest) || latest!=epoch || offset>=kernel_open_file_size(file))
+        return KERNEL_MM_STATUS_CONFLICT;
+    if (error) return error==-KERNEL_ENOMEM?KERNEL_MM_STATUS_NO_MEMORY:
+        error==-KERNEL_EBUSY?KERNEL_MM_STATUS_CONFLICT:KERNEL_MM_STATUS_BUS_FAULT;
     struct mm_file_resident *resident=find_file_resident(record,address);
-    if (!resident || !kernel_page_cache_alias_active(&resident->alias)) __builtin_trap();
+    if (!resident || !kernel_page_cache_alias_active(&resident->alias)) return KERNEL_MM_STATUS_CONFLICT;
     struct kernel_page_cache_write_borrow permit={0};
     enum kernel_page_cache_status admitted=kernel_page_cache_alias_write_begin(&resident->alias,&permit);
     if (admitted==KERNEL_PAGE_CACHE_STATUS_BUSY) {

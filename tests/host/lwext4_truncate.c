@@ -106,7 +106,7 @@ static bool step(struct ext4_fs *fs)
     uint64_t target = ext4_inode_get_size(&fs->sb, ref.inode);
     uint64_t before = ext4_inode_get_blocks_count(&fs->sb, ref.inode);
     bool done = false;
-    CHECK(ext4_orphan_truncate_step(&ref, &done) == EOK);
+    CHECK(ext4_inode_truncate_step(&ref, &done) == EOK);
     CHECK(ext4_inode_get_size(&fs->sb, ref.inode) == target);
     if (!done) CHECK(ext4_inode_get_blocks_count(&fs->sb, ref.inode) < before);
     if (done) {
