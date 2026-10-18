@@ -1236,6 +1236,43 @@ int ext4_transaction_abort(const char *mount_point, int error)
 	return result;
 }
 
+static int ext4_metadata_execute_locked(struct ext4_mountpoint *mp,
+    int (*apply)(void *),void *context)
+{
+    struct jbd_journal *journal=mp->fs.jbd_journal;
+    bool outer=!mp->transaction_depth;
+    int result;
+    if (!journal) result=apply(context);
+    else for (;;) {
+        result=ext4_trans_start(mp);
+        if (result) break;
+        uint64_t failures=journal->budget_failures;
+        result=apply(context);
+        result=ext4_trans_finish(mp,result);
+        if (result!=ENOMEM || !outer || !journal->grouped || journal->error ||
+            !mp->transaction_aborted || failures==journal->budget_failures) break;
+        /* 等待前已完整撤销本次私有操作，不能只重做其中的fopen或mode。
+         * 无旧组可归还时，单次操作本身超预算；保留ENOMEM而不空转。 */
+        if (mp->transaction_depth || mp->fs.curr_trans) __builtin_trap();
+        uint64_t target=jbd_journal_reclaim_target(journal);
+        if (target<=journal->checkpoint_sequence) break;
+        result=ext4_group_wait(mp,target,EXT4_JOURNAL_WAIT_CHECKPOINT);
+        if (result) break;
+    }
+    return result;
+}
+
+int ext4_metadata_execute(const char *mount_point,int (*apply)(void *),void *context)
+{
+    if (!mount_point || !apply) return EINVAL;
+    struct ext4_mountpoint *mp=ext4_get_mount(mount_point);
+    if (!mp) return ENOENT;
+    EXT4_MP_LOCK(mp);
+    int result=ext4_metadata_execute_locked(mp,apply,context);
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
 
 int ext4_mount_point_stats(const char *mount_point,
 			   struct ext4_mount_stats *stats)
@@ -1480,7 +1517,7 @@ int ext4_file_set_mode(ext4_file *file, uint32_t mode)
 int ext4_file_set_mode_initial(ext4_file *file, uint32_t mode)
 { return ext4_file_set_mode_common(file, mode, true); }
 
-int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid)
+static int ext4_file_set_owner_once(ext4_file *file, uint32_t uid, uint32_t gid)
 {
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     struct ext4_mountpoint *mp = file->mp;
@@ -1510,12 +1547,29 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid)
         r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
     }
     r = ext4_trans_finish(mp, r);
-    ext4_file_completed(file, r);
 Unlock:
     if (r != EOK && mp->fs.curr_trans && !mp->fs.curr_trans->error)
         mp->fs.curr_trans->error = r;
     EXT4_MP_UNLOCK(mp);
     return r;
+}
+
+struct ext4_owner_change { ext4_file *file;uint32_t uid,gid; };
+static int ext4_apply_owner(void *context)
+{
+    struct ext4_owner_change *request=context;
+    return ext4_file_set_owner_once(request->file,request->uid,request->gid);
+}
+int ext4_file_set_owner(ext4_file *file,uint32_t uid,uint32_t gid)
+{
+    if (!file || !file->mp || !file->mp->mounted) return EINVAL;
+    struct ext4_mountpoint *mp=file->mp;
+    struct ext4_owner_change request={file,uid,gid};
+    EXT4_MP_LOCK(mp);
+    int result=ext4_metadata_execute_locked(mp,ext4_apply_owner,&request);
+    ext4_file_completed(file,result);
+    EXT4_MP_UNLOCK(mp);
+    return result;
 }
 
 /********************************FILE OPERATIONS*****************************/
