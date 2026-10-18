@@ -1,4 +1,5 @@
 #include "open_file_internal.h"
+#include "block_file_internal.h"
 #include "record_lock.h"
 #include "pipe_internal.h"
 #include "vfs_internal.h"
@@ -578,6 +579,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_PATH;
     case KERNEL_OPEN_FILE_KIND_RTC:
         return KERNEL_OPEN_FILE_KIND_RTC;
+    case KERNEL_OPEN_FILE_KIND_BLOCK:
+        return KERNEL_OPEN_FILE_KIND_BLOCK;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -616,6 +619,7 @@ enum kernel_open_file_status kernel_open_file_acquire(
 
 int kernel_open_file_io_requires_cpu0(const struct kernel_open_file_description *file)
 {
+    if (file && file->kind == KERNEL_OPEN_FILE_KIND_BLOCK) return 0;
     struct kernel_page_cache *cache = file ? kernel_vfs_file_page_cache(&file->file) : NULL;
     return cache && kernel_page_cache_needs_cpu0(cache);
 }
@@ -649,6 +653,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     KERNEL_SERVICE_SCOPE_IF(service, !local);
     if (!local) kernel_assert_service_context();
     if (first) { reset_read_prediction(file); release_record_locks(file); }
+    kernel_block_file_close(file);
     if (file->device_opened) {
         file->device_opened = 0;
         if (file->device->release) file->device->release(file->device_instance);
@@ -769,6 +774,8 @@ struct kernel_vfs_node *kernel_open_file_node(
 uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file)
 {
+    if (open_file_live(file) && file->block)
+        return __atomic_load_n(&file->block->capacity_bytes, __ATOMIC_ACQUIRE);
     if (open_file_live(file) && file->kind == KERNEL_OPEN_FILE_KIND_GENERATED)
         return file->generated_ready ? file->generated_length : 0U;
     return open_file_live(file) ? kernel_vfs_file_size(&file->file) : 0U;
@@ -839,6 +846,7 @@ int kernel_open_file_readable(
     access_mode = kernel_open_file_flags(file) & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
@@ -1110,6 +1118,8 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
                            size_t size,
                            size_t *bytes_read)
 {
+    if (open_file_live(file) && file->block)
+        return kernel_block_file_pread(file, offset, buffer, size, bytes_read);
     if (!open_file_live(file)) return -KERNEL_EINVAL;
     if (bytes_read) *bytes_read = 0;
     if (size) kernel_open_file_read_begin(file, offset);
@@ -1152,6 +1162,7 @@ uint32_t kernel_open_file_poll(
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, file->pipe_observed_writers, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
         return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;

@@ -68,10 +68,11 @@ NUL、路径/向量/字符串超限在构建期拒绝，最终初始栈仍由公
 
 块设备号采用 Linux `new_encode_dev(252, index * 16)`，首盘为 `0xfc00`，
 第二盘为 `0xfc10`；index 是 DTB 地址顺序中的成功 block device 序号。
-无分区和热插拔，设备节点的设备号在本次启动内稳定。`kernel_block_lookup()`
-借用根启动持有的设备生命周期；mount 通过 `kernel_block_claim()` 独占设备，
-不同节点别名不能绕过同一设备的 claim。卸载成功后原 owner 必须调用
-`kernel_block_release_claim()`；错误 owner 或重复释放是内部不变量错误。
+无分区和热插拔，设备节点的设备号在本次启动内稳定。`kernel_block_get()`
+在登记表保护内取得设备引用；动态挂载和块设备 OFD 用真实引用覆盖所有睡眠操作。
+mount 通过 `kernel_block_claim()` 与 `O_EXCL` 打开竞争独占 owner，普通打开仍可并存。
+挂载、OFD 与在途请求全部释放后才允许注销。挂载失败清理和 unmount 仅在后端实际
+结束后调用 `kernel_block_release_claim()`；错误 owner 或重复释放是内部不变量错误。
 有 claim 时注销返回 `EBUSY`，因此真实卸载错误仍保留设备 owner。
 
 编码和 claim 语义依据固定 Linux
@@ -82,7 +83,7 @@ NUL、路径/向量/字符串超限在构建期拒绝，最终初始栈仍由公
 `make test-root-multi-block-riscv` 构建 `tests/userland/multi_mount.c` 的写入与
 只读校验两个 musl ELF，在 legacy 和 modern 下各执行两次真实双盘启动。
 写入阶段通过任意名字的 block 节点挂载第二盘，检查设备别名独占 claim、
-裸盘 open 拒绝、独立盘内容、hardlink/nlink、嵌套 tmpfs、跨 mount EXDEV、
+独立盘内容、hardlink/nlink、嵌套 tmpfs、跨 mount EXDEV、
 fd/mmap 阻止卸载、卸载重挂和共享映射写回。退出时保留第二盘 mount，要求
 root finish 停止其 worker、同步日志和释放全部设备并精确恢复 heap/page 基线。
 第二次启动把同一第二盘设为设备只读，读回包括 root finish 刷新的最后文件；

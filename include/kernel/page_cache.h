@@ -201,6 +201,11 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *,
 void kernel_page_cache_truncate(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t new_size);
 
+/* Inode write owner excludes writeback capture; caller first drains dirty
+ * bytes in every intersecting page and closes its mmap publication epoch. */
+void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end);
+
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 /* A queue slot pins only the inode. The opaque cookie cancels unsubmitted
  * work; a published read retains its owners through completion/reset. */

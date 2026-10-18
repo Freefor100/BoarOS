@@ -638,6 +638,33 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
     drain_retired_residents(record,retired);
 }
 
+static void invalidate_file_residents(void *owner, struct kernel_vfs_node *node,
+    uint64_t start, uint64_t end)
+{
+    struct kernel_mm_record *record = owner;
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_mutex_lock(&record->operations,&operation);
+    if (record->stage != KERNEL_MM_RECORD_LIVE) return;
+    struct mm_file_resident **link = &record->file_residents;
+    while (*link) {
+        struct mm_file_resident *page = *link;
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(record->vmas,page->address,&vma)) __builtin_trap();
+        uint64_t offset = vma.backing_offset + page->address - vma.start;
+        /* Private COW owns its bytes independently of later file mutations. */
+        if (kernel_open_file_node(vma.backing) != node || page->private ||
+            offset >= end || offset + BOAROS_PAGE_SIZE <= start) {
+            link = &page->next;
+            continue;
+        }
+        if (unmap_space_range(record,page->address,page->address+BOAROS_PAGE_SIZE)) __builtin_trap();
+    }
+    struct mm_file_resident *retired = record->retired_file_residents;
+    record->retired_file_residents = 0;
+    if (operation.lock) mm_gate_release(record,&operation);
+    drain_retired_residents(record,retired);
+}
+
 static enum kernel_mm_status prepare_file_registration(
     struct kernel_mm_record *record,
     struct kernel_open_file_description *file,
@@ -662,6 +689,7 @@ static enum kernel_mm_status prepare_file_registration(
     (*prepared)->registration.node = node;
     (*prepared)->registration.owner = record;
     (*prepared)->registration.truncate = truncate_file_residents;
+    (*prepared)->registration.invalidate_range = invalidate_file_residents;
     return KERNEL_MM_STATUS_OK;
 }
 

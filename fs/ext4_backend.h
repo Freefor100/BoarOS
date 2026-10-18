@@ -12,6 +12,7 @@ struct lwext4_orphan {
 };
 struct lwext4_mount_adapter {
     struct kernel_vfs_instance instance;
+    struct kernel_vfs_mount *mount;
     struct kernel_block_device *block;
     struct kernel_rwlock backend_lock;
 #if BOAROS_MAX_CPUS > 1

@@ -28,6 +28,10 @@ void ext4_orphan_trans_finish(struct jbd_trans *trans, bool abort);
 int ext4_orphan_validate(struct ext4_fs *fs);
 int ext4_orphan_peek(struct ext4_fs *fs, uint32_t *inode);
 int ext4_orphan_contains(struct ext4_fs *fs, uint32_t inode, bool *present);
+/* Runtime intent distinguishes a live unlinked owner from pending EOF reclaim;
+ * changes join the operation undo, and mount recovery defaults to inspection. */
+int ext4_orphan_truncate_pending(struct ext4_fs *, uint32_t inode, bool *pending);
+int ext4_orphan_mark_truncate(struct ext4_inode_ref *, bool pending);
 int ext4_orphan_add(struct ext4_inode_ref *inode);
 int ext4_orphan_remove(struct ext4_inode_ref *inode);
 

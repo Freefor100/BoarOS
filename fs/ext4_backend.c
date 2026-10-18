@@ -32,7 +32,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LWEXT4_PHYSICAL_BLOCK_SIZE 512U
 static struct lwext4_mount_adapter *adapters;
 static uintptr_t adapter_serial;
 
@@ -523,11 +522,11 @@ static int block_read(struct ext4_blockdev *device,
     }
     adapter = device->bdif->p_user;
     if (adapter == 0 || adapter->block == 0 ||
-        block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE) {
+        block > UINT64_MAX / device->bdif->ph_bsize) {
         return EINVAL;
     }
-    offset = block * LWEXT4_PHYSICAL_BLOCK_SIZE;
-    byte_count = (uint64_t)count * LWEXT4_PHYSICAL_BLOCK_SIZE;
+    offset = block * device->bdif->ph_bsize;
+    byte_count = (uint64_t)count * device->bdif->ph_bsize;
     if (byte_count > SIZE_MAX) {
         return EINVAL;
     }
@@ -570,14 +569,14 @@ static int block_write(struct ext4_blockdev *device,
     }
     adapter = device->bdif->p_user;
     if (adapter == 0 || adapter->block == 0 ||
-        block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE) {
+        block > UINT64_MAX / device->bdif->ph_bsize) {
         return EINVAL;
     }
     if (adapter->block->write == 0) {
         return EROFS;
     }
-    offset = block * LWEXT4_PHYSICAL_BLOCK_SIZE;
-    byte_count = (uint64_t)count * LWEXT4_PHYSICAL_BLOCK_SIZE;
+    offset = block * device->bdif->ph_bsize;
+    byte_count = (uint64_t)count * device->bdif->ph_bsize;
     if (byte_count > SIZE_MAX) {
         return EINVAL;
     }
@@ -592,6 +591,7 @@ static int block_write(struct ext4_blockdev *device,
     case KERNEL_BLOCK_STATUS_NO_MEMORY:
         return ENOMEM;
     case KERNEL_BLOCK_STATUS_UNSUPPORTED:
+    case KERNEL_BLOCK_STATUS_READ_ONLY:
         return EROFS;
     case KERNEL_BLOCK_STATUS_INVALID:
         return EINVAL;
@@ -618,20 +618,21 @@ static int block_write_batch(struct ext4_blockdev *device,
     if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
             count * sizeof(*physical), (void **)&physical)) return ENOMEM;
     for (unsigned i = 0; i < count; i++) {
-        if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
+        if (spans[i].block > UINT64_MAX / device->bdif->ph_bsize ||
+            (uint64_t)spans[i].count * device->bdif->ph_bsize > SIZE_MAX) {
             if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
             return EINVAL;
         }
-        physical[i] = (struct kernel_block_span){spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
-            spans[i].data, (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE};
+        physical[i] = (struct kernel_block_span){spans[i].block * device->bdif->ph_bsize,
+            spans[i].data, (size_t)spans[i].count * device->bdif->ph_bsize};
     }
     enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
     if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
     switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
-    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED:
+    case KERNEL_BLOCK_STATUS_READ_ONLY: return EROFS;
     case KERNEL_BLOCK_STATUS_INVALID: return EINVAL;
     default: return EIO;
     }
@@ -653,7 +654,8 @@ static int block_write_phase(struct ext4_blockdev *device,
     switch (kernel_block_write_phase(adapter->block, block_phase_next, first)) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
-    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED:
+    case KERNEL_BLOCK_STATUS_READ_ONLY: return EROFS;
     default: return EIO;
     }
 }
@@ -712,6 +714,46 @@ static uint64_t ext4_buffer_bytes(void *context)
             total += (uint64_t)bc->ref_blocks * bc->itemsize;
     }
     return total;
+}
+
+int kernel_vfs_sync_block_device(struct kernel_block_device *device)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    if (!device) return -KERNEL_EINVAL;
+    struct lwext4_mount_adapter *selected = NULL;
+    uintptr_t irq = arch_interrupt_save();
+    /* 设备的独占 mount claim 保证至多一个匹配实例。 */
+    for (struct lwext4_mount_adapter *a = adapters; a; a = a->next_adapter)
+        if (a->block == device && a->mount->state == VFS_MOUNT_STATE_LIVE) {
+            selected = a;
+            break;
+        }
+    if (!selected) { arch_interrupt_restore(irq); return 0; }
+    if (selected->instance.quiescing) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
+    struct kernel_vfs_path *root = NULL;
+    for (struct kernel_vfs_path *p = selected->instance.paths; p; p = p->next)
+        if (!p->parent) { root = p; break; }
+    int result = 0;
+    if (root) {
+        result = kernel_vfs_path_acquire(root);
+        if (result) root = NULL;
+    } else {
+        /* 没有现存 path 时，先保留本次打开的挂载资格；路径分配可睡眠，
+         * 不能让卸载在取得真实 root path owner 之前释放 adapter。 */
+        if (selected->instance.external_files == UINT32_MAX) result = -KERNEL_EOVERFLOW;
+        else selected->instance.external_files++;
+    }
+    arch_interrupt_restore(irq);
+    if (!root && !result) {
+        result = kernel_vfs_path_root(selected->mount,selected->instance.heap,&root);
+        irq = arch_interrupt_save();
+        if (!selected->instance.external_files) __builtin_trap();
+        selected->instance.external_files--;
+        arch_interrupt_restore(irq);
+    }
+    if (!result) result = kernel_vfs_sync_mount(root->file.mount,NULL);
+    if (root && kernel_vfs_path_release(&root)) __builtin_trap();
+    return result;
 }
 
 static int release_mount_storage(struct kernel_vfs_mount *mount)
@@ -866,6 +908,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     }
     if (adapter->journal_started) {
         if (adapter->device.fs->jbd_journal) {
+            /* 持久 orphan 意图可由已关闭的外层事务留下；恢复会接受
+             * 新的日志组，必须在提交与 checkpoint worker 仍存活时完成。 */
+            result = ext4_orphan_recover(adapter->mount_point);
+            if (result != EOK) return lwext4_error(result);
             result = ext4_journal_group_drain(adapter->mount_point);
             if (result != EOK) return lwext4_error(result);
         }
@@ -1220,7 +1266,6 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_EMPTY ||
         mount->private_data != 0 || mount->id != 0U ||
         block == 0 || block->read == 0 ||
-        block->logical_block_size != LWEXT4_PHYSICAL_BLOCK_SIZE ||
         heap == 0 || page_cache == 0 ||
         page_cache->state != KERNEL_PAGE_CACHE_LIVE) {
         return -KERNEL_EINVAL;
@@ -1243,6 +1288,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
 #if BOAROS_MAX_CPUS > 1
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
 #endif
+    adapter->mount = mount;
     adapter->next_adapter = adapters;
     adapters = adapter;
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
@@ -1258,9 +1304,14 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     result = kernel_block_claim(block, mount);
     if (result) { (void)cleanup_mount(mount); return result; }
     adapter->block_claimed = 1U;
+    /* Claim excludes loop reconfiguration before allocating its sector buffer. */
+    const uint32_t sector = block->logical_block_size;
+    if (sector < 512 || sector > BOAROS_PAGE_SIZE || (sector & (sector - 1))) {
+        (void)cleanup_mount(mount); return -KERNEL_EINVAL;
+    }
 
     heap_status = kernel_heap_allocate(heap,
-                                       LWEXT4_PHYSICAL_BLOCK_SIZE,
+                                       sector,
                                        (void **)&adapter->physical_buffer);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
         (void)cleanup_mount(mount);
@@ -1278,9 +1329,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
     adapter->interface.unlock = 0;
-    adapter->interface.ph_bsize = LWEXT4_PHYSICAL_BLOCK_SIZE;
+    adapter->interface.ph_bsize = sector;
     adapter->interface.ph_bcnt =
-        block->capacity_bytes / LWEXT4_PHYSICAL_BLOCK_SIZE;
+        block->capacity_bytes / sector;
     adapter->interface.ph_bbuf = adapter->physical_buffer;
     adapter->interface.p_user = adapter;
     adapter->interface.wait_read = boaros_lwext4_wait;
@@ -1289,7 +1340,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->device.bdif = &adapter->interface;
     adapter->device.part_offset = 0U;
     adapter->device.part_size =
-        adapter->interface.ph_bcnt * LWEXT4_PHYSICAL_BLOCK_SIZE;
+        adapter->interface.ph_bcnt * sector;
 
     result = ext4_device_register(&adapter->device, adapter->device_name);
     if (result != EOK) {
@@ -1416,7 +1467,8 @@ static void fill_stat(struct kernel_vfs_mount *mount,
     uint32_t creator_os;
 
     memset(stat, 0, sizeof(*stat));
-    stat->dev = mount->id;
+    struct kernel_block_device *block = lwext4_instance(mount->private_data)->block;
+    stat->dev = block->device_number ? block->device_number : mount->id;
     stat->ino = inode_number;
     stat->mode = ext4_inode_get_mode(superblock, inode);
     stat->nlink = ext4_inode_get_links_cnt(inode);
@@ -2191,6 +2243,17 @@ static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, ui
     *changed = result == EOK || before != *actual;
     return lwext4_error(result);
 }
+static int ext4_backend_fallocate(struct kernel_vfs_node *node, unsigned mode,
+    uint64_t offset, uint64_t length, uint64_t *actual, int *changed)
+{
+    bool committed;
+    int result = ext4_fallocate(lwext4_node_file(node), mode, offset, length, &committed);
+    *actual = ext4_fsize(lwext4_node_file(node));
+    *changed = committed;
+    return lwext4_error(result);
+}
+static struct kernel_block_device *ext4_backend_block_device(struct kernel_vfs_instance *instance)
+{ return lwext4_instance(instance)->block; }
 static int ext4_backend_close_node(struct kernel_vfs_node *node)
 { return lwext4_error(ext4_fclose(lwext4_node_file(node))); }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
@@ -2302,6 +2365,8 @@ static void initialize_backend(void)
     ops->lookup = ext4_backend_lookup;
     ops->readlink = ext4_backend_readlink;
     ops->truncate = ext4_backend_truncate;
+    ops->fallocate = ext4_backend_fallocate;
+    ops->block_device = ext4_backend_block_device;
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;
     ops->sync_prepare = ext4_backend_sync_prepare;

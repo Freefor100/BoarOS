@@ -9,6 +9,7 @@ struct kernel_epoll;
 struct kernel_epoll_item;
 struct kernel_record_lock;
 struct kernel_char_device;
+struct kernel_block_device;
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
@@ -37,6 +38,7 @@ struct kernel_open_file_description {
     struct kernel_socket *socket;
     struct kernel_epoll_item *ep_items;
     struct kernel_record_lock *record_locks;
+    struct kernel_block_device *block;
     const struct kernel_char_device *device;
     void *device_instance;
     uint8_t device_opened;

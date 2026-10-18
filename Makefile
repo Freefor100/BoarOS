@@ -316,6 +316,7 @@ COMMON_C_SOURCES := \
 	fs/files/table.c \
 	fs/files/locks.c \
 	fs/files/io.c \
+	fs/files/range.c \
 	fs/files/path.c \
 	fs/files/metadata.c \
 	fs/files/console.c \
@@ -329,6 +330,8 @@ COMMON_C_SOURCES := \
 	fs/pty.c \
 	fs/rtc_device.c \
 	fs/open_file.c \
+	fs/block_file.c \
+	fs/loop.c \
 	fs/pipe.c \
 	fs/record_lock.c \
 	fs/page_cache.c \
@@ -1672,11 +1675,11 @@ include tests/diff-abi/Makefile.inc
 .PHONY: test-block-host
 test-block-host:
 	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_flush.c kernel/block.c -o build/host/block-flush
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_flush.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-flush
 	build/host/block-flush
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_registry.c kernel/block.c -o build/host/block-registry
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_registry.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-registry
 	build/host/block-registry
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c -o build/host/block-fault
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
 	build/host/block-fault
 
 .PHONY: test-record-lock-host
@@ -1685,9 +1688,9 @@ test-record-lock-host:
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/sync -idirafter include tests/host/record_lock_test.c -o build/host/record-lock
 	build/host/record-lock
 
-build/host/nbd-fault: tests/host/nbd_fault.c tests/host/block_fault.c tests/host/block_fault.h kernel/block.c
+build/host/nbd-fault: tests/host/nbd_fault.c tests/host/block_fault.c tests/host/block_fault.h kernel/block.c tests/host/block_runtime.c tests/host/block_model/arch/context.h
 	@mkdir -p $(dir $@)
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/nbd_fault.c tests/host/block_fault.c kernel/block.c -o $@
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/nbd_fault.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o $@
 
 .PHONY: test-nbd-host
 test-nbd-host: build/host/nbd-fault

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <common/block_io.h>
+#include <kernel/sync.h>
 
 enum kernel_block_status {
     KERNEL_BLOCK_STATUS_OK = 0,
@@ -15,9 +16,13 @@ enum kernel_block_status {
     KERNEL_BLOCK_STATUS_NO_MEMORY,
     KERNEL_BLOCK_STATUS_STATE,
     KERNEL_BLOCK_STATUS_NOT_SUBMITTED,
+    KERNEL_BLOCK_STATUS_READ_ONLY,
 };
 
 struct kernel_block_device;
+struct kernel_files;
+struct kernel_open_file_description;
+struct kernel_mm;
 
 enum kernel_block_cache_mode {
     KERNEL_BLOCK_CACHE_UNKNOWN = 0,
@@ -72,7 +77,17 @@ struct kernel_block_device {
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
     enum kernel_block_cache_mode cache_mode;
-    /* Registry membership is owned by the device lifetime, claims by mounts. */
+    /* Registration owns the object lifetime; references cover OFDs, mounts and
+     * in-flight requests. Callbacks never run with registry protection held. */
+    int (*open)(struct kernel_block_device *, uint32_t flags);
+    void (*close)(struct kernel_block_device *, uint32_t flags);
+    void (*owners_changed)(struct kernel_block_device *);
+    int64_t (*ioctl)(struct kernel_block_device *, struct kernel_files *,
+        struct kernel_open_file_description **, struct kernel_mm *, uint64_t, uint64_t);
+    struct kernel_mutex io_lock;
+    uint32_t io_initialized, references, open_count, notifications;
+    uint32_t read_only, soft_block_size;
+
     struct kernel_block_device *registry_next;
     const void *claim_owner;
     uint64_t device_number;
@@ -84,11 +99,32 @@ struct kernel_block_device {
     (UINT64_C(0xfc00) | (((uint64_t)(index) * 16U) & 0xffU) | \
      ((((uint64_t)(index) * 16U) & ~UINT64_C(0xff)) << 12))
 
-/* Return zero or negative errno. Lookup borrows the boot-owned lifetime;
- * successful claims prevent unregister until the exact owner releases them. */
+/* Return zero or negative errno. get pins registry membership; put consumes
+ * that owner. A raw device pointer requires an existing lifetime owner.
+ * Unregister is refused while any open, mount or request retains a reference. */
 int kernel_block_register(struct kernel_block_device *device, uint64_t number);
 int kernel_block_unregister(struct kernel_block_device *device);
+/* Boot/test inspection only; callers that may sleep must use get. */
 struct kernel_block_device *kernel_block_lookup(uint64_t number);
+struct kernel_block_device *kernel_block_get(uint64_t number);
+void kernel_block_get_device(struct kernel_block_device *device);
+void kernel_block_put(struct kernel_block_device *device);
+int kernel_block_open(struct kernel_block_device *, const void *owner, uint32_t flags);
+void kernel_block_close(struct kernel_block_device *, const void *owner, uint32_t flags);
+int kernel_block_claimed(struct kernel_block_device *);
+void kernel_block_usage(struct kernel_block_device *, uint32_t *references, uint32_t *opens);
+void kernel_block_set_capacity(struct kernel_block_device *, uint64_t bytes);
+int kernel_block_set_read_only(struct kernel_block_device *, int read_only);
+int kernel_block_read_only(const struct kernel_block_device *);
+/* Byte I/O holds io_lock across each sector read/modify/write. scratch must
+ * hold one logical sector and remains borrowed until the request returns.
+ * completed always reports the prefix confirmed by successful callbacks,
+ * including before a later error. A failing callback supplies no finer progress;
+ * its unreported disk or buffer effects remain unspecified. */
+enum kernel_block_status kernel_block_read_bytes(struct kernel_block_device *,
+    uint64_t, void *, size_t, void *scratch, size_t scratch_size, size_t *completed);
+enum kernel_block_status kernel_block_write_bytes(struct kernel_block_device *,
+    uint64_t, const void *, size_t, void *scratch, size_t scratch_size, size_t *completed);
 int kernel_block_claim(struct kernel_block_device *device, const void *owner);
 void kernel_block_release_claim(struct kernel_block_device *device,
                                 const void *owner);

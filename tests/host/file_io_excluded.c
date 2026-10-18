@@ -49,4 +49,8 @@ EXCLUDED(kernel_signal_clear_syscall_restart)
 EXCLUDED(kernel_signal_note_futex_timed_restart)
 EXCLUDED(kernel_time_boot_realtime_offset)
 EXCLUDED(kernel_signal_has_pending)
+#if !defined(FALLOCATE_SYNC_CASES) && !defined(LOOP_IO_CASES)
 EXCLUDED(kernel_time_deadline_from_monotonic)
+#endif
+EXCLUDED(kernel_char_device_lookup)
+EXCLUDED(kernel_char_device_open)

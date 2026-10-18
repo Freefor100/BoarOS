@@ -55,7 +55,7 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 普通卸载当前针对非根挂载；绝对根挂载没有 parent/covered 边，用户态
 `umount2("/", 0)` 返回 `EINVAL`。固定 Linux 对该情形尝试只读重配置，
 这条根挂载路径须随 remount 独立实现，内核关机的根盘收口不代替它。
-卸载先检查忙引用并标记 quiescing，阻止新操作，再停 worker、完成在途 I/O 和持久化交接。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。
+卸载先检查忙引用并标记 quiescing，阻止新操作，排空页缓存和在途 I/O。遗留的持久 orphan 意图在 journal worker 仍存活时恢复；恢复可能接受新日志组，因此先完成最终 checkpoint drain，再停止 journal worker 和卸载 lwext4。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。`FALLOCATE_SYNC_RESIDUAL=1 sh tests/fallocate-sync-host.sh` 检查已关闭外层截断留下的恢复工作、worker 生命周期、重挂载内容与块归还。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
@@ -118,6 +118,8 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 缓存索引失效本身不撤销用户 PTE。向下截断另通过稳定 node–MM 登记通知相关地址空间，撤销越过新 EOF 的整页（含 private COW 与 PROT_NONE），并按驻留来源处理非对齐尾页；普通写直接修改共享缓存，不撤销 private COW 页面。VMA 保留，后续访问重新缺页并检查 live inode size。实现与单 hart 同步边界见本文末尾及[MM 模块](kernel-mm.md)。
 
 miss 路径私有分配未清零页，通过 node 的无 offset 副作用批量 `pread` 初始化有效内容；稀疏区由后端合成零，成功后只清 EOF 尾部。有效字节数按 node 的逻辑大小计算。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器的压力入口由多缓存共同 owner 注册，按实例轮转；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。物理引用数为 1 仍可能有等待回写的 entry 借用；后台完成 I/O 后，在缓存索引保护内归还本批借用，重新检查其他借用、loading、writeback、脏范围和映射，再决定退休。批量选择与干净页退休共用该保护，实际 I/O 和资源释放放在保护外。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
+
+普通写入还在接纳边界处理脏页压力：每最多 32 个来源页，在取得 inode 数据锁和用户页 pin 之前检查一次水位；脏页达到全局高水位或可用页低于保留水位时，推进一批已有脏页，再回收可释放的干净页。整次 write 的 OFD 位置与文件写操作互斥保持不变。若写入正在缓存执行者内运行，就地使用其独占工作区推进，不能排队等待自己的后台线程；其他调用者只提交这批写回，执行者不取得原调用者的 OFD／写操作锁，也不为回收内存另分配前景工作区。写回错误记录在实际 inode；无关文件的 ENOSPC／EIO 不归给当前覆盖写，失败队首保留脏数据并让出后续可回收工作。分配器内的重入、锁和 I/O 限制保持不变，真实 ENOSPC、EIO、ENOMEM 继续返回；已有成功前缀仍按 Linux 短写规则交给调用者。`sh tests/page-cache-concurrency-host.sh pressure` 在生产分组日志与 16 MiB 页池内检查大于内存的完整写入、磁盘满、写回 EIO、真实无空闲页，以及另一 inode 失败后的独立覆盖写，覆盖 4/16 KiB 页与 1/4 KiB 文件系统块，并检查读回、资源归还和 e2fsck。
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join 页缓存 worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node；日志 worker 继续服务这些交接，排空到 checkpoint 后才停止并 join，之后允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
@@ -184,7 +186,7 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 
 截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`；legacy block-map inode 取指针树容量、`EXT_MAX_BLOCKS` 个可安全计数的逻辑块和 inode `i_blocks` 容量（包含间接块开销）的最小值，再乘以 `block_size`。因此 legacy 最后可用逻辑块也是 `0xfffffffe`：即使 8 KiB 三级间接树容量超过 2^32，也不会让 `ext4_lblk_t` 在 2^45 字节处回绕到块 0。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size。
 
-新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。对预置 unwritten extent 的初始化和 caller 部分写使用同一个 block-cache buffer，避免延迟的 zero buffer 在 direct I/O 之后覆盖用户数据；读取 mapped block 前先排空该物理块的 dirty cache，flush 失败则返回错误而不从旧磁盘内容读取。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
+新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。unwritten extent 的初始化和 caller 写入版本规则见[文件空间预留与打洞](#文件空间预留与打洞)。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
 
 extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/lwext4-metadata-host.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
 
@@ -513,6 +515,44 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 元数据收口历史验证：当时 `build/recoverable-fs-host-final.log` 的全部 host/断电矩阵通过；`build/recoverable-fs-regression-final.log` 的 RISC-V 全套、真实 musl/pthread、320 条固定 Linux 差分、1000 个函数栈界及工具自测通过。日志已清理；最大单函数当时为 kernel_main 的 1952 字节，assembly trap 288、保留 1024。这不是实板性能或 SMP 验证。
 
+## 文件空间预留与打洞
+
+`kernel_vfs_fallocate()` 将范围操作交给后端，ext4 支持 mode 0、`KEEP_SIZE` 和
+`PUNCH_HOLE | KEEP_SIZE`。预留通过真实 unwritten extent 占用块并维护位图、inode
+扇区数和空闲计数；读取这些块合成零，首次写入在同一事务内分割、转换相应范围。
+只有逻辑、物理相邻且初始化状态一致的 extent 才能合并。unwritten 转换的零数据使用
+ordered data 版本，允许调用者随后在同一事务内用稳定写入版本替换；不能把这些文件
+数据块登记为 journal 元数据。磁盘满而 extent 分割需要新的索引块时，转换改为初始化
+当前 unwritten extent：用一个文件系统块的缓冲逐块清零并 flush，再发布初始化状态，
+请求内的新数据仍使用原 ordered data 版本。这样写入已预留块不再额外消耗磁盘空间，
+也不需要为整个 extent 保留零数据镜像；I/O 失败保留 unwritten 状态并返回实际错误。
+完整打洞块释放映射，两个部分块仅清零请求内的字节，
+不为洞或 unwritten 边界分配或初始化块。未实现该能力的后端与其他模式返回
+`EOPNOTSUPP`，超出 maxbytes 返回 `EFBIG`。
+
+写操作互斥覆盖整个操作。通用层先关闭 mmap 发布代次，打洞时撤销相交页的文件别名、
+保留私有 COW，然后写回脏页，使后端看见缓冲写已经发布的 EOF，并保存边界页的范围外
+字节。后端结果、实际 EOF 和相交缓存页退休在同一 inode 写锁内发布，再开放新缺页。
+等待 inode 读锁的旧写回候选在捕获前看到缓存页退休，不能重建已打掉的映射。日志事务
+失败恢复本次位图、extent、部分块数据与 EOF；无日志后端已完成的部分变化仍按实际
+结果更新缓存，错误不改成成功。相同 EOF 的截断也回收 EOF 外预留；orphan 索引的
+运行时截断意图参加事务 undo，区分真正待回收的缩短映射与仍打开的无链接文件。
+后者保留合法预留，最后 owner 释放时才完整回收；重启恢复仍按持久 EOF 检查。
+即时提交和组提交的 journal 都保留释放块的 quarantine，直到 abort 或 checkpoint
+归还；即时提交路径的新操作在低空间时先完成旧 checkpoint。外层事务仍拥有的旧块
+不能提前分给新的 unwritten 范围，否则直接清零会破坏回滚后的原内容。
+此操作不承诺无日志文件系统的断电原子性。
+
+`sh tests/fallocate-host.sh` 使用 1/4 KiB ext4 块与 4/16 KiB 页检查预留及空闲计数、
+混合 extent、部分块、缓存重读、真实共享 mmap/私有 COW、握手控制的活动写回、范围
+中途失败回滚、无 journal 的部分失败和所有者归还；每个镜像卸载后运行 `e2fsck -fn`。
+同一入口的 `FALLOCATE_HOST_CASE=reserved-full` 检查磁盘满时的已预留写入；
+`reserved-middle` 检查分割到一半后的空间失败，`reserved-large` 用 512 KiB 组预算
+转换 8 MiB 的 unwritten extent，`reserved-zero-error` 检查清零 I/O 失败和重试，
+`reserved-abort-reuse` 检查外层事务的原内容归还。`reserved-large` 和
+`reserved-abort-reuse` 需设置 `FALLOCATE_HOST_JOURNALS=journal`；除 large 外的磁盘满
+场景可用 `FALLOCATE_HOST_IMAGE_SIZE=8M` 限定填盘和清理工作量，large 保留默认 32 MiB。
+
 ## 单 hart 可睡眠存储契约
 
 锁序为 OFD offset（10）→ inode 写操作门闩（15）→ 命名空间（20）→ 按稳定 node 身份排序的 inode → 后端读写锁。VFS 缓存命中不需取得后端锁；纯定位读 `ext4_fpread` 使用独立游标和共享后端锁，写入、事务提交/回滚、孤儿回收、恢复、journal start/stop 和卸载持独占锁。事务只允许同一任务 owner 嵌套；写者排队后不再放入新读者。RELATIME 先在读阶段判断，确需更新时间才在释放读锁后进入独占阶段，不允许读锁升级。
@@ -521,7 +561,7 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 写回固定本批页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回只借用当前窗口的精确页集合，归还时使用同一集合；跨窗口只保留页号与范围，续批重查当前脏页索引，不长期借用链表后继。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
-每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
+每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate/fallocate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 
@@ -611,9 +651,35 @@ flags 0、AT_SYMLINK_FOLLOW、AT_EMPTY_PATH 不重新解析 fd 的旧名字。�
 非 journal 修改仍明确不支持，不缩减原恢复契约。
 
 DTB 枚举的每块设备独立维护队列、IRQ、DMA 和超时。设备登记、文件系统实例、
-挂载树节点分别拥有生命周期；mknodat 块节点仅用于 stat、命名和 mount 的 st_rdev
-识别，裸盘 open 返回不支持。同一设备重复独占挂载为 EBUSY。lwext4 注册名及内部
+挂载树节点分别拥有生命周期；mknodat 块节点按 st_rdev 同时支持挂载和[裸设备 OFD](riscv-virtio-block.md#用户态块设备)。同一设备重复独占挂载为 EBUSY。lwext4 注册名及内部
 路径按实例生成，生成配置容纳八实例；root 单盘入口仍可使用。
+
+## 文件后备 loop
+
+`fs/loop.c` 登记 Linux major 7 的 loop0～loop7，10:237 的 loop-control 提供
+GET_FREE、ADD 和 REMOVE；节点由用户态 mknodat 创建。块 OFD 使用原生 RV64/LA64
+Linux loop_info（160 字节）、loop_info64（232 字节）和 loop_config（304 字节），
+支持 SET_FD、SET/GET_STATUS、SET/GET_STATUS64、CONFIGURE、SET_CAPACITY 和 CLR_FD。
+配置支持只读、字节 offset、sizelimit、AUTOCLEAR 及 512 到架构页大小的逻辑扇区；
+文件系统块必须是逻辑扇区的整数倍。分区扫描、加密、direct I/O、CHANGE_FD 和
+SET_BLOCK_SIZE 返回不支持。配置与挂载／O_EXCL 竞争真实设备 claim。
+
+绑定持有真实后备 OFD，因此原 fd 关闭和后备文件 unlink 不改变绑定。每个绑定拥有
+一个独立 I/O worker；上层文件系统提交的请求借用调用者缓冲直到完成，worker 通过
+后备 OFD 的 VFS／页缓存读写，flush 同步后备文件。独立栈不继承上层文件系统锁，
+避免 ext4 调用块层时倒序获取后备 inode 的锁。依赖从 loop 指向后备文件所在块设备；
+绑定在控制锁内检查整个有向链，只接受已绑定且无环的祖先，不接纳空闲或 rundown 父设备。
+
+普通打开和 mount claim 都是真实 owner；CLR_FD 在仍有其他打开／挂载时设置
+AUTOCLEAR，唯一打开者则进入 rundown，拒绝新打开和 I/O，到最后关闭才解绑。
+worker 只在全部设备引用与在途请求归还后同步并释放后备 OFD；失败保留实际 owner
+和错误，不报告为空闲。正常退出交错卸载可卸的叶挂载与清理无人使用的 loop，
+让后备所在挂载在依赖者之后释放，最后停止根缓存并卸载根盘。
+
+`sh tests/loop-host.sh` 使用真实 journal ext4 后备与两层文件系统，覆盖绑定／unlink、
+原生结构布局、配置、只读、rundown、占用、循环拒绝、持久化读回和退出释放；
+保存实际两层后备镜像以 e2fsck 检查。4 KiB 文件系统可另设
+`BOAROS_LOOP_SECTOR=4096 LOOP_HOST_BLOCKS=4096` 检查非默认逻辑扇区。
 
 `fs/disk_mount.c` 拥有动态 mount/cache/source 名称。构造中的实例不进入可清理
 状态；真正 I/O 清理失败才移交待清理注册表。关机重试逐个认领 owner，不跨睡眠

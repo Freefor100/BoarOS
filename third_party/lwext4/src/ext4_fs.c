@@ -101,6 +101,11 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	}
 
 	bsize = ext4_sb_get_block_size(&fs->sb);
+	/* A filesystem block must contain whole device sectors. Validate before
+	 * mount can modify the superblock; assertions are optional in production. */
+	if (!bdev->bdif->ph_bsize || bsize < bdev->bdif->ph_bsize ||
+	    bsize % bdev->bdif->ph_bsize)
+		return EINVAL;
 	if (bsize > EXT4_MAX_BLOCK_SIZE)
 		return ENXIO;
 	if (ext4_sb_get_blocks_cnt(&fs->sb) > bdev->part_size / bsize)

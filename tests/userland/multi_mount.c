@@ -7,6 +7,8 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/ioctl.h>
+#include <stdint.h>
 #include <unistd.h>
 
 static int stage;
@@ -33,13 +35,25 @@ int main(void)
     if (mknod("/same-device-alias", S_IFBLK | 0600, makedev(252, 16))) CHECK(errno == EEXIST);
     struct stat st;
     CHECK(stat("/arbitrary-disk", &st) == 0 && S_ISBLK(st.st_mode) && st.st_rdev == makedev(252, 16));
-    FAILS(open("/arbitrary-disk", O_RDONLY), ENOTSUP);
+    int raw = open("/arbitrary-disk", O_RDONLY);
+    unsigned sector = 0;uint64_t capacity = 0;unsigned char magic[2];
+    CHECK(raw >= 0 && ioctl(raw, 0x1268, &sector) == 0 && sector == 512 &&
+          ioctl(raw, 0x80081272UL, &capacity) == 0 && capacity >= 8*1024*1024 &&
+          pread(raw, magic, sizeof(magic), 1080) == sizeof(magic) &&
+          magic[0] == 0x53 && magic[1] == 0xef);
+    int exclusive = open("/same-device-alias", O_RDONLY | O_EXCL);
+    CHECK(exclusive >= 0);
+    FAILS(mount("/arbitrary-disk", "/second", "ext4", 0, 0), EBUSY);
+    CHECK(close(exclusive) == 0);
 #ifdef READ_ONLY_BOOT
     CHECK(mount("/arbitrary-disk", "/second", "ext4", MS_RDONLY, 0) == 0);
 #else
     CHECK(mount("/arbitrary-disk", "/second", "ext4", 0, 0) == 0);
 #endif
     FAILS(mount("/same-device-alias", "/duplicate", "ext4", 0, 0), EBUSY);
+    FAILS(open("/same-device-alias", O_RDONLY | O_EXCL), EBUSY);
+    CHECK(stat("/second", &st) == 0 && st.st_dev == makedev(252, 16) &&
+          pread(raw, magic, sizeof(magic), 1080) == sizeof(magic) && close(raw) == 0);
     stage = 2;
     CHECK(value("/identity", "ROOT") && value("/second/identity", "SECOND"));
 #ifdef READ_ONLY_BOOT

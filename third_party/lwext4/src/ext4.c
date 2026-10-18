@@ -55,6 +55,7 @@
 #include <ext4_journal.h>
 #include <ext4_orphan.h>
 #include <ext4_truncate.h>
+#include <ext4_extent.h>
 
 
 #include <stddef.h>
@@ -900,6 +901,12 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
 	uintptr_t owner = mp->os_locks && mp->os_locks->owner ? mp->os_locks->owner(mp->os_locks->context) : 0;
 	if (mp->transaction_depth && mp->transaction_owner != owner) __builtin_trap();
 	if (mp->transaction_depth == 0) {
+        /* 即时提交仍可能保留旧 checkpoint。低空间时先归还其块，不能
+         * 在新操作或外层原子事务内复用尚由旧版本持有的分配。 */
+        if (!journal->grouped && ext4_space_waits_checkpoint(mp)) {
+            int r = jbd_journal_purge_cp_trans(journal, true, false);
+            if (r != EOK) return r;
+        }
 		while (journal->grouped) {
 			int r = EOK;
 			if (ext4_group_due(mp, false)) {
@@ -1581,6 +1588,12 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 	int r = ext4_fs_get_inode_ref(&mp->fs, index, &ref);
 	if (r != EOK) return r;
 	uint64_t size = ext4_inode_get_size(&mp->fs.sb, ref.inode);
+    /* Preallocation can extend mappings past unchanged i_size. A truncate
+     * retires those reservations even when its requested size is identical. */
+    if (new_size <= size && ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_EXTENTS)) {
+        r = ext4_extent_remove_space(&ref, (ext4_lblk_t)((new_size + mp->fs.bdev->lg_bsize - 1) /
+            mp->fs.bdev->lg_bsize), EXT_MAX_BLOCKS);
+    }
 	/* The public operation owns the transaction. Never commit an enclosing
 	 * unlink/rename halfway through a truncate. */
 	while (r == EOK && size > new_size) {
@@ -1603,9 +1616,9 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 	if (mp->fs.jbd_journal->error) return mp->fs.jbd_journal->error;
 	if (mp->transaction_depth) return EBUSY;
 	if (!release_inode) {
-		/* 新建、同尺寸截断和普通扩展没有待回收映射，不创建清理事务。 */
+		/* 活的无链接 owner 本身不代表有缩短映射需要回收。 */
 		bool present;
-		r = ext4_orphan_contains(&mp->fs, index, &present);
+		r = ext4_orphan_truncate_pending(&mp->fs, index, &present);
 		if (r != EOK || !present) return r;
 	}
 	/* 意图与回收按同一 journal FIFO 提交；同组则原子合并。已释放的
@@ -1625,6 +1638,8 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 		if (ext4_inode_can_truncate(&mp->fs.sb, ref.inode))
 			r = ext4_orphan_truncate_step(&ref, &done);
 		else done = true;
+        if (r == EOK && done && dead && !release_inode)
+            r = ext4_orphan_mark_truncate(&ref, false);
 		if (r == EOK && done && (!dead || release_inode)) {
 			r = ext4_orphan_remove(&ref);
 			if (r == EOK && dead) {
@@ -1645,8 +1660,8 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
  * reclaimed. Remove those mappings before a later grow can expose them. An
  * ordinary call uses bounded transactions; an explicitly grouped operation
  * must retain its caller's atomic boundary and rollback on resource failure.
- * Keep the orphan record in that outer transaction, especially for a live
- * unlinked inode whose last owner has not released it yet. */
+ * Completed linked truncates can leave that same operation's orphan set;
+ * live unlinked records remain until their last VFS owner releases them. */
 static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 {
 	struct ext4_mountpoint *mp = file->mp;
@@ -1658,7 +1673,7 @@ static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 	if (fs->jbd_journal->error) return fs->jbd_journal->error;
 	if (mp->transaction_error) return mp->transaction_error;
 	if (fs->curr_trans && fs->curr_trans->error) return fs->curr_trans->error;
-	r = ext4_orphan_contains(fs, file->inode, &present);
+	r = ext4_orphan_truncate_pending(fs, file->inode, &present);
 	if (r != EOK || !present) goto Finish;
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
 	if (r != EOK) goto Finish;
@@ -1673,6 +1688,8 @@ static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 		do {
 			r = ext4_orphan_truncate_step(&ref, &done);
 		} while (r == EOK && !done);
+        if (r == EOK) r = ext4_inode_get_links_cnt(ref.inode)
+            ? ext4_orphan_remove(&ref) : ext4_orphan_mark_truncate(&ref,false);
 		r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
 	}
 Finish:
@@ -1920,8 +1937,9 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 	if (is_goal) {
 
 		if ((f->flags & O_TRUNC) && (imode == EXT4_INODE_MODE_FILE)) {
-			if (mp->fs.jbd_journal && ext4_inode_get_size(sb, ref.inode)) {
+			if (mp->fs.jbd_journal) {
 				r = ext4_orphan_add(&ref);
+                if (r == EOK) r = ext4_orphan_mark_truncate(&ref,true);
 				if (r == EOK) {
 					ext4_inode_set_size(ref.inode, 0);
 					ref.dirty = true;
@@ -2890,9 +2908,6 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	r = ext4_xattr_remove(&ref, 6, "capability", 10);
 	if (r == ENODATA) r = EOK;
 	if (r != EOK) goto Finish;
-	if (old_size == size)
-		goto Finish;
-
 	if (old_size < size) {
 		r = ext4_zero_allocated_eof_tail(&ref, old_size, size);
 		if (r == EOK) {
@@ -2902,6 +2917,7 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	} else {
 		if (file->mp->fs.jbd_journal) {
 			r = ext4_orphan_add(&ref);
+            if (r == EOK) r = ext4_orphan_mark_truncate(&ref,true);
 			if (r == EOK) {
 				ext4_inode_set_size(ref.inode, size);
 				ref.dirty = true;
@@ -2959,6 +2975,125 @@ int ext4_ftruncate(ext4_file *f, uint64_t size)
 
 	EXT4_MP_UNLOCK(f->mp);
 	return r;
+}
+
+/* Holes and unwritten mappings already read as zero and must not acquire
+ * storage or become initialized just to erase a partial boundary. */
+static int ext4_zero_file_range(struct ext4_inode_ref *ref,
+    uint64_t begin, uint64_t end)
+{
+    uint32_t block_size = ext4_sb_get_block_size(&ref->fs->sb);
+    while (begin < end) {
+        struct ext4_inode_block_range range;
+        int r = ext4_extent_get_range(ref, (ext4_lblk_t)(begin / block_size),
+            1, false, &range);
+        if (r != EOK) return r;
+        uint32_t offset = begin % block_size;
+        uint32_t count = block_size - offset;
+        if (count > end - begin) count = end - begin;
+        if (range.block && !range.unwritten) {
+            r = ext4_zero_fblock_range(ref, range.block, offset, count);
+            if (r != EOK) return r;
+        }
+        begin += count;
+    }
+    return EOK;
+}
+
+int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
+                   uint64_t length, bool *changed)
+{
+    ext4_assert(file && file->mp && changed);
+    *changed = false;
+    if (mode != 0 && mode != EXT4_FALLOC_KEEP_SIZE &&
+        mode != (EXT4_FALLOC_KEEP_SIZE | EXT4_FALLOC_PUNCH_HOLE)) return ENOTSUP;
+    if (!length || offset > INT64_MAX || length > INT64_MAX) return EINVAL;
+    if (length > INT64_MAX - offset) return EFBIG;
+    if (file->mp->fs.read_only) return EROFS;
+    if (file->flags & O_RDONLY) return EPERM;
+    uint64_t end = offset + length;
+    if (end > file->fmax) return EFBIG;
+    EXT4_MP_LOCK(file->mp);
+    int r = ext4_prepare_growth(file, end);
+    if (r == EOK) r = ext4_trans_start(file->mp);
+    if (r != EOK) { EXT4_MP_UNLOCK(file->mp); return r; }
+    uint64_t saved_size = file->fsize;
+    struct ext4_inode_ref ref;
+    r = ext4_fs_get_inode_ref(&file->mp->fs, file->inode, &ref);
+    if (r != EOK) goto Finish;
+    struct ext4_sblock *sb = &file->mp->fs.sb;
+    uint32_t block_size = ext4_sb_get_block_size(sb);
+    uint64_t size = ext4_inode_get_size(sb, ref.inode);
+    if (!ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_EXTENTS)) {
+        r = ENOTSUP;
+        goto Put;
+    }
+    if (ext4_inode_type(sb, ref.inode) != EXT4_INODE_MODE_FILE) {
+        r = EINVAL;
+        goto Put;
+    }
+    if (ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_IMMUTABLE) ||
+        ((mode & EXT4_FALLOC_PUNCH_HOLE) && ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_APPEND))) {
+        r = EPERM;
+        goto Put;
+    }
+    /* A nonjournal failure may retain a prefix. Journal abort restores every
+     * modified bitmap, extent and boundary data version together. */
+    *changed = true;
+    r = ext4_xattr_remove(&ref, 6, "capability", 10);
+    if (r == ENODATA) r = EOK;
+    if (r != EOK) goto Put;
+    if ((mode & EXT4_FALLOC_PUNCH_HOLE) && offset >= size) goto Touch;
+    if (mode & EXT4_FALLOC_PUNCH_HOLE) {
+        uint64_t eof_block = (size + block_size - 1) / block_size * block_size;
+        if (end > eof_block) end = eof_block;
+        uint64_t first = (offset + block_size - 1) / block_size;
+        uint64_t last = end / block_size;
+        uint64_t left_end = first * block_size;
+        if (left_end > end) left_end = end;
+        if (offset < left_end) r = ext4_zero_file_range(&ref, offset, left_end);
+        if (r == EOK && first < last)
+            r = ext4_extent_remove_space(&ref, (ext4_lblk_t)first,
+                (ext4_lblk_t)(last - 1));
+        uint64_t right = last * block_size;
+        if (r == EOK && right >= left_end && right < end)
+            r = ext4_zero_file_range(&ref, right, end);
+    } else {
+        uint64_t first = offset / block_size;
+        uint64_t last = (end + block_size - 1) / block_size;
+        while (r == EOK && first < last) {
+            struct ext4_inode_block_range range;
+            uint64_t count = last - first;
+            if (count > UINT32_MAX) count = UINT32_MAX;
+            r = ext4_extent_reserve_range(&ref, (ext4_lblk_t)first,
+                (uint32_t)count, &range);
+            if (r != EOK) break;
+            if (!range.count) { r = EIO; break; }
+            first += range.count;
+        }
+        if (r == EOK && !(mode & EXT4_FALLOC_KEEP_SIZE) && end > size) {
+            r = ext4_zero_allocated_eof_tail(&ref, size, end);
+            if (r == EOK) {
+                ext4_inode_set_size(ref.inode, end);
+                ref.dirty = true;
+            }
+        }
+    }
+Touch:
+    if (r == EOK) ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+Put:
+    file->fsize = ext4_inode_get_size(sb, ref.inode);
+    r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
+Finish:
+    r = ext4_trans_finish(file->mp, r);
+    if (ext4_file_rolled_back(file, r)) {
+        file->fsize = saved_size;
+        *changed = false;
+    }
+    ext4_file_completed(file, r);
+    if (r == EOK) file->data_sequence = file->sync_sequence;
+    EXT4_MP_UNLOCK(file->mp);
+    return r;
 }
 
 /* Copy only an unpublished file version or an explicitly deferred standalone

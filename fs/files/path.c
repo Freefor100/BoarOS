@@ -3,6 +3,7 @@
 #include "../pipe_internal.h"
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
+#include "../block_file_internal.h"
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -416,6 +417,18 @@ enum kernel_files_status kernel_files_openat(
             kernel_files_queue_description(files, description);
             (void)kernel_files_drain_file_cleanup(files);
             *linux_result = stat_result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFBLK) {
+        struct kernel_vfs_stat stat;
+        int error = (flags & LINUX_O_DIRECTORY) ? -KERNEL_ENOTDIR :
+            kernel_vfs_fstat(&description->file, &stat);
+        if (!error) error = kernel_block_file_open(description, stat.rdev, (uint32_t)flags);
+        if (error) {
+            KERNEL_FILES_NOTE(files, open_failures, 1);
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = error;
             return KERNEL_FILES_STATUS_OK;
         }
     } else {

@@ -31,7 +31,11 @@ void mm_test_bind_files(struct kernel_files *);
 void mm_test_finish(void);
 void mm_test_activate_task(void);
 extern _Thread_local uint64_t mm_test_context;
+#ifdef LOOP_IO_CASES
+static unsigned char arena[64*1024*1024] __attribute__((aligned(16384)));
+#else
 static unsigned char arena[32*1024*1024] __attribute__((aligned(16384)));
+#endif
 static unsigned char backend[16*1024*1024] __attribute__((aligned(16384)));
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int page_address(const void *page,uint64_t *address) { *address=(uintptr_t)page; return 1; }
@@ -880,6 +884,10 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
 }
 
+#include "block_file_cases.h"
+#ifdef LOOP_IO_CASES
+#include "loop_cases.h"
+#endif
 #ifdef TCP_IO_CASES
 #include "tcp_usercopy_cases.h"
 #endif
@@ -917,6 +925,10 @@ int main(int argc,char **argv)
     assert(!kernel_tmpfs_create(&heap,0,"",&memory)); sendfile_pipe_case(&heap,memory); file_case(&heap,memory,0);
     directory_eof(&heap,memory);
     vector_boundaries(&heap,memory);
+    raw_block_case(&heap,memory);
+#ifdef LOOP_IO_CASES
+    loop_case(&heap,memory);
+#endif
     close_lock_case(&heap,memory);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,memory,0,actors,append);
@@ -925,7 +937,9 @@ int main(int argc,char **argv)
     struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init(&cache,&heap,&pages));
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=flush_image,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    raw_mounted_flush_case(&heap,&mount,&disk);
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
@@ -935,7 +949,8 @@ int main(int argc,char **argv)
     sync_offset_case(&heap,&mount,&cache,1);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,&mount,&cache,actors,append);
-    assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache)); assert(!close(image));
+    assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
+    assert(!kernel_block_unregister(&disk)); assert(!close(image));
     mm_test_context=0; /* 页表最终释放在可信kernel上下文。 */
     assert(!kernel_mm_release(&mm) && !physical_page_release(&pages,kernel.root_address));
     struct kernel_heap_statistics statistics;

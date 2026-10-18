@@ -41,6 +41,7 @@
 #define LINUX_SYSCALL_LINKAT 37U
 #define LINUX_SYSCALL_TRUNCATE 45U
 #define LINUX_SYSCALL_FTRUNCATE 46U
+#define LINUX_SYSCALL_FALLOCATE 47U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
 #define LINUX_SYSCALL_PIPE2 59U
@@ -407,6 +408,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_TRUNCATE) {
         if (syscall_handle_truncate(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_FALLOCATE) {
+        if (syscall_handle_fallocate(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_FTRUNCATE) {
         if (syscall_handle_ftruncate(caller, request, &decoded) !=
