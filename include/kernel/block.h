@@ -117,11 +117,14 @@ void kernel_block_set_capacity(struct kernel_block_device *, uint64_t bytes);
 int kernel_block_set_read_only(struct kernel_block_device *, int read_only);
 int kernel_block_read_only(const struct kernel_block_device *);
 /* Byte I/O holds io_lock across each sector read/modify/write. scratch must
- * hold one logical sector and remains borrowed until the request returns. */
+ * hold one logical sector and remains borrowed until the request returns.
+ * completed always reports the prefix confirmed by successful callbacks,
+ * including before a later error. A failing callback supplies no finer progress;
+ * its unreported disk or buffer effects remain unspecified. */
 enum kernel_block_status kernel_block_read_bytes(struct kernel_block_device *,
-    uint64_t, void *, size_t, void *scratch, size_t scratch_size);
+    uint64_t, void *, size_t, void *scratch, size_t scratch_size, size_t *completed);
 enum kernel_block_status kernel_block_write_bytes(struct kernel_block_device *,
-    uint64_t, const void *, size_t, void *scratch, size_t scratch_size);
+    uint64_t, const void *, size_t, void *scratch, size_t scratch_size, size_t *completed);
 int kernel_block_claim(struct kernel_block_device *device, const void *owner);
 void kernel_block_release_claim(struct kernel_block_device *device,
                                 const void *owner);

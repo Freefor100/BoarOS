@@ -3,14 +3,15 @@
 static unsigned raw_pause_read, raw_read_copied, raw_resume_read, raw_aligned_done;
 struct raw_test_disk {
     unsigned char bytes[4096];
-    unsigned reads, writes, flushes;
+    unsigned reads, writes, flushes, fail_read_at, fail_write_at;
     enum kernel_block_status fail_read, fail_write, fail_flush;
 };
 static enum kernel_block_status raw_test_read(void *context, uint64_t offset, void *buffer, size_t size)
 {
     struct raw_test_disk *disk = context;
     assert(!(offset % 512) && !(size % 512)); disk->reads++;
-    if (disk->fail_read) return disk->fail_read;
+    if (disk->fail_read && (!disk->fail_read_at || disk->reads == disk->fail_read_at))
+        return disk->fail_read;
     memcpy(buffer, disk->bytes + offset, size);
     if (__atomic_exchange_n(&raw_pause_read, 0, __ATOMIC_ACQ_REL)) {
         __atomic_store_n(&raw_read_copied, 1, __ATOMIC_RELEASE);
@@ -22,7 +23,8 @@ static enum kernel_block_status raw_test_write(void *context, uint64_t offset, c
 {
     struct raw_test_disk *disk = context;
     assert(!(offset % 512) && !(size % 512)); disk->writes++;
-    if (disk->fail_write) return disk->fail_write;
+    if (disk->fail_write && (!disk->fail_write_at || disk->writes == disk->fail_write_at))
+        return disk->fail_write;
     memcpy(disk->bytes + offset, buffer, size); return 0;
 }
 static enum kernel_block_status raw_test_flush(void *context)
@@ -37,7 +39,8 @@ static void *raw_rmw_actor(void *argument)
 {
     struct raw_race_call *call = argument; mm_test_attach(1);
     unsigned char sector[512], byte = 0x77;
-    assert(!kernel_block_write_bytes(call->device, 13, &byte, 1, sector, sizeof(sector)));
+    size_t done;
+    assert(!kernel_block_write_bytes(call->device, 13, &byte, 1, sector, sizeof(sector), &done) && done == 1);
     mm_test_finish(); return 0;
 }
 static void *raw_aligned_actor(void *argument)
@@ -76,6 +79,66 @@ static void raw_write_serialization(struct kernel_block_device *device, struct r
     }
     mm_test_finish(); mm_test_attach(0); mm_test_activate_task();
     puts("PASS raw sector RMW vs scalar/batch/journal-phase writes: actual mutex waiter, complete data and request owners");
+}
+static void raw_kernel_prefix_case(struct kernel_open_file_description *file, struct raw_test_disk *disk,
+    struct kernel_files *local)
+{
+    size_t done;
+    uint64_t before_offset = kernel_open_file_offset(file);
+    uint32_t before_references = file->block->references;
+    unsigned char actual[1024];
+    memcpy(disk->bytes + 509, "1234567", 7);
+    memset(actual, 0xa5, sizeof(actual));
+    disk->fail_read = KERNEL_BLOCK_STATUS_IO; disk->fail_read_at = disk->reads + 2;
+    int error = kernel_block_file_pread(file, 509, actual, 7, &done);
+    if (error != -KERNEL_EIO || done != 3)
+        fprintf(stderr, "kernel block pread prefix: error=%d completed=%zu expected=-EIO/3\n", error, done);
+    assert(error == -KERNEL_EIO && done == 3 && !memcmp(actual, "123", 3));
+    for (unsigned i = 3; i < 7; i++) assert(actual[i] == 0xa5);
+    disk->fail_read = 0; disk->fail_read_at = 0;
+    for (unsigned fail_read = 0; fail_read < 2; fail_read++) {
+        memset(disk->bytes, 0x3c, sizeof(disk->bytes));
+        if (fail_read) { disk->fail_read = KERNEL_BLOCK_STATUS_IO; disk->fail_read_at = disk->reads + 2; }
+        else { disk->fail_write = KERNEL_BLOCK_STATUS_IO; disk->fail_write_at = disk->writes + 2; }
+        error = kernel_block_file_pwrite(file, 509, "abcdefg", 7, &done);
+        assert(error == -KERNEL_EIO && done == 3 && !memcmp(disk->bytes + 509, "abc", 3));
+        assert(disk->bytes[508] == 0x3c);
+        for (unsigned i = 512; i < 516; i++) assert(disk->bytes[i] == 0x3c);
+        disk->fail_read = disk->fail_write = 0; disk->fail_read_at = disk->fail_write_at = 0;
+    }
+    /* A failed multi-sector callback has no finer completion report. Preserve
+     * its one large submission and report only the prefix confirmed before it. */
+    memset(actual, 0xa5, sizeof(actual));
+    disk->fail_read = KERNEL_BLOCK_STATUS_IO; disk->fail_read_at = disk->reads + 1;
+    unsigned before = disk->reads;
+    assert(kernel_block_file_pread(file, 512, actual, sizeof(actual), &done) == -KERNEL_EIO &&
+        !done && disk->reads == before + 1);
+    for (unsigned i = 0; i < sizeof(actual); i++) assert(actual[i] == 0xa5);
+    disk->fail_read = 0; disk->fail_read_at = 0;
+    disk->fail_write = KERNEL_BLOCK_STATUS_IO; disk->fail_write_at = disk->writes + 1;
+    before = disk->writes;
+    assert(kernel_block_file_pwrite(file, 512, actual, sizeof(actual), &done) == -KERNEL_EIO &&
+        !done && disk->writes == before + 1);
+    disk->fail_write = 0; disk->fail_write_at = 0;
+    assert(!kernel_block_file_pwrite(file, 509, "abcdefg", 7, &done) && done == 7);
+    assert(!kernel_block_file_pread(file, 509, actual, 7, &done) && done == 7 && !memcmp(actual, "abcdefg", 7));
+    memset(actual, 0xa5, 7);
+    assert(!kernel_copy_to_user(&mm, 0x200600, actual, 7, &done) && done == 7);
+    disk->fail_read = KERNEL_BLOCK_STATUS_IO; disk->fail_read_at = disk->reads + 2;
+    int64_t result;
+    assert(!kernel_files_pread(local, &mm, 0, 0x200600, 7, 509, &result) && result == 3);
+    assert(!kernel_copy_from_user(&mm, actual, 0x200600, 7, &done) && done == 7 && !memcmp(actual, "abc", 3));
+    for (unsigned i = 3; i < 7; i++) assert(actual[i] == 0xa5);
+    disk->fail_read = 0; disk->fail_read_at = 0;
+    memset(disk->bytes, 0x3c, sizeof(disk->bytes));
+    assert(!kernel_copy_to_user(&mm, 0x200600, "abcdefg", 7, &done) && done == 7);
+    disk->fail_write = KERNEL_BLOCK_STATUS_IO; disk->fail_write_at = disk->writes + 2;
+    assert(!kernel_files_pwrite(local, &mm, 0, 0x200600, 7, 509, &result) && result == 3 &&
+        !memcmp(disk->bytes + 509, "abc", 3));
+    for (unsigned i = 512; i < 516; i++) assert(disk->bytes[i] == 0x3c);
+    disk->fail_write = 0; disk->fail_write_at = 0;
+    assert(kernel_open_file_offset(file) == before_offset && file->block->references == before_references);
+    puts("PASS kernel/user block byte prefixes: second-sector read/write/RMW errors retain confirmed 3 bytes; aligned callbacks remain batched");
 }
 static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mount)
 {
@@ -180,6 +243,7 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     assert(!kernel_files_pread(&local, &mm, 0, fault_edge, 7, 31, &result) && result == 3);
     struct kernel_open_file_description *mapping = 0;
     assert(!kernel_files_pin_data(&local, 0, &mapping, &result) && !result);
+    raw_kernel_prefix_case(mapping, &disk, &local);
     uint64_t mapped;
     assert(kernel_mm_mmap_file_private(&mm, &mapping, 0, BOAROS_PAGE_SIZE, 0,
         KERNEL_MM_READ, 0, &mapped) == KERNEL_MM_STATUS_INVALID_ARGUMENT && mapping);

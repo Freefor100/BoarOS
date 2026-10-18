@@ -434,8 +434,10 @@ int kernel_block_set_read_only(struct kernel_block_device *device, int read_only
     return 0;
 }
 static enum kernel_block_status byte_io(struct kernel_block_device *device,
-    uint64_t offset, void *buffer, size_t size, void *scratch, size_t scratch_size, int writing)
+    uint64_t offset, void *buffer, size_t size, void *scratch, size_t scratch_size, int writing, size_t *completed)
 {
+    if (!completed) return KERNEL_BLOCK_STATUS_INVALID;
+    *completed = 0;
     if (!device || !device->read || !device->logical_block_size ||
         (writing && !device->write)) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);
@@ -466,13 +468,14 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
             } else __builtin_memcpy(bytes, (unsigned char *)scratch + within, amount);
         }
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
+        *completed += amount;
         offset += amount; bytes += amount; size -= amount;
     }
     return KERNEL_BLOCK_STATUS_OK;
 }
 enum kernel_block_status kernel_block_read_bytes(struct kernel_block_device *device,
-    uint64_t offset, void *buffer, size_t size, void *scratch, size_t scratch_size)
-{ return byte_io(device, offset, buffer, size, scratch, scratch_size, 0); }
+    uint64_t offset, void *buffer, size_t size, void *scratch, size_t scratch_size, size_t *completed)
+{ return byte_io(device, offset, buffer, size, scratch, scratch_size, 0, completed); }
 enum kernel_block_status kernel_block_write_bytes(struct kernel_block_device *device,
-    uint64_t offset, const void *buffer, size_t size, void *scratch, size_t scratch_size)
-{ return byte_io(device, offset, (void *)buffer, size, scratch, scratch_size, 1); }
+    uint64_t offset, const void *buffer, size_t size, void *scratch, size_t scratch_size, size_t *completed)
+{ return byte_io(device, offset, (void *)buffer, size, scratch, scratch_size, 1, completed); }
