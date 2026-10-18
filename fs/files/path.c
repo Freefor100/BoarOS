@@ -340,7 +340,7 @@ enum kernel_files_status kernel_files_openat(
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
         if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
-            (flags & LINUX_O_TRUNC) != 0U) {
+            (flags & (LINUX_O_TRUNC | LINUX_O_CREAT)) != 0U) {
             KERNEL_FILES_NOTE(files, open_failures, 1);
             kernel_files_queue_description(files, description);
             (void)kernel_files_drain_file_cleanup(files);

@@ -15,18 +15,25 @@
 #define LINUX_PROT_EXEC UINT64_C(0x4)
 #define LINUX_MAP_PRIVATE UINT64_C(0x2)
 #define LINUX_MAP_SHARED UINT64_C(0x1)
-#define LINUX_MAP_TYPE_MASK UINT64_C(0x3)
+#define LINUX_MAP_TYPE_MASK UINT64_C(0xf)
+#define LINUX_MAP_SHARED_VALIDATE UINT64_C(0x3)
 #define LINUX_MAP_FIXED UINT64_C(0x10)
 #define LINUX_MAP_ANONYMOUS UINT64_C(0x20)
+#define LINUX_MAP_GROWSDOWN UINT64_C(0x100)
+#define LINUX_MAP_LOCKED UINT64_C(0x2000)
+#define LINUX_MAP_HUGETLB UINT64_C(0x40000)
 #define LINUX_MAP_DENYWRITE UINT64_C(0x800)
 #define LINUX_MAP_POPULATE UINT64_C(0x8000)
 #define LINUX_MAP_EXECUTABLE UINT64_C(0x1000)
 #define LINUX_MAP_FIXED_NOREPLACE UINT64_C(0x100000)
+/* Fixed Linux LEGACY_MAP_MASK also accepts huge-page size encoding bits even
+ * without MAP_HUGETLB; they do not request huge pages on their own. */
+#define LINUX_MAP_LEGACY_EXTRA UINT64_C(0x7c010000)
 #define LINUX_MAP_KNOWN_FLAGS                                             \
     (LINUX_MAP_TYPE_MASK | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS |       \
      LINUX_MAP_DENYWRITE | LINUX_MAP_EXECUTABLE | LINUX_MAP_NORESERVE |  \
      LINUX_MAP_POPULATE | LINUX_MAP_STACK |                               \
-     LINUX_MAP_FIXED_NOREPLACE)
+     LINUX_MAP_FIXED_NOREPLACE | LINUX_MAP_LEGACY_EXTRA)
 #define LINUX_MAP_NORESERVE UINT64_C(0x4000)
 #define LINUX_MAP_STACK UINT64_C(0x20000)
 
@@ -95,19 +102,33 @@ enum kernel_syscall_status syscall_handle_mmap(
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((protections & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
                          LINUX_PROT_EXEC)) != 0U ||
-        (flags & ~LINUX_MAP_KNOWN_FLAGS) != 0U ||
         ((flags & LINUX_MAP_FIXED) != 0U &&
          (flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) ||
         (request->arguments[5] & BOAROS_PAGE_MASK) != 0U) {
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_PRIVATE &&
-         (flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_SHARED) ||
-        (flags & LINUX_MAP_POPULATE) != 0U) {
-        decoded->value = -KERNEL_ENOTSUP;
-        return KERNEL_SYSCALL_STATUS_OK;
+    uint64_t mapping_type = flags & LINUX_MAP_TYPE_MASK;
+    int type_error = 0;
+    if (mapping_type != LINUX_MAP_PRIVATE && mapping_type != LINUX_MAP_SHARED &&
+        (mapping_type != LINUX_MAP_SHARED_VALIDATE || (flags & LINUX_MAP_ANONYMOUS))) {
+        type_error = -KERNEL_EINVAL;
     }
+    if (!type_error && mapping_type == LINUX_MAP_SHARED_VALIDATE &&
+        (flags & ~LINUX_MAP_KNOWN_FLAGS)) {
+        type_error = -KERNEL_EOPNOTSUPP;
+    }
+    /* No huge-page hstate exists here. Linux rejects unknown huge sizes before
+     * do_mmap; accepting ordinary pages would silently change the contract. */
+    if (flags & LINUX_MAP_HUGETLB)
+        type_error = -KERNEL_EINVAL;
+    else if (!request->arguments[1])
+        type_error = -KERNEL_EINVAL;
+    else if (!type_error && (flags & (LINUX_MAP_GROWSDOWN | LINUX_MAP_LOCKED)))
+        type_error = -KERNEL_EOPNOTSUPP;
+    /* Legacy mmap ignores extension flags; SHARED_VALIDATE rejects them. */
+    if (mapping_type == LINUX_MAP_SHARED_VALIDATE)
+        flags = (flags & ~LINUX_MAP_TYPE_MASK) | LINUX_MAP_SHARED;
     if ((flags & LINUX_MAP_FIXED) != 0U) {
         mm_flags = KERNEL_MM_MAP_FIXED;
     } else if ((flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) {
@@ -120,6 +141,10 @@ enum kernel_syscall_status syscall_handle_mmap(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     if ((flags & LINUX_MAP_ANONYMOUS) != 0U) {
+        if (type_error) {
+            decoded->value = type_error;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
         status = kernel_mm_mmap_anonymous(
             mm,
             request->arguments[0],
@@ -142,6 +167,12 @@ enum kernel_syscall_status syscall_handle_mmap(
         }
         if (linux_result != 0) {
             decoded->value = linux_result;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (type_error) {
+            if (kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK)
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            decoded->value = type_error;
             return KERNEL_SYSCALL_STATUS_OK;
         }
         if (kernel_open_file_kind(file) !=

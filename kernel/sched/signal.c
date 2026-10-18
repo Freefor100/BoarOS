@@ -1397,8 +1397,6 @@ enum kernel_signal_select_result kernel_signal_select(
                     &signal_table_of(task)->actions[sig - 1U];
 
                 reset->handler = KERNEL_SIGNAL_DFL;
-                reset->flags = 0U;
-                reset->mask = 0U;
             }
             return KERNEL_SIGNAL_SELECT_HANDLER;
         }

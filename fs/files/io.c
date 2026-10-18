@@ -655,13 +655,19 @@ enum kernel_files_status kernel_files_read(
     return release_io_description(files, &description, status);
 }
 
-enum kernel_files_status kernel_files_readv(
+static enum kernel_files_status pread_iov_pinned(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count,
+    uint64_t count, int64_t offset, int scalar, int64_t *linux_result);
+
+static enum kernel_files_status readv_request(
     struct kernel_files *files,
     struct kernel_mm *mm,
     int64_t fd,
     uint64_t user_iov,
     uint64_t iovcnt,
-    int64_t *linux_result)
+    int positioned, int64_t offset, int64_t *linux_result)
 {
     struct kernel_uaccess_iovec local[8];
     struct kernel_uaccess_iovec *iov = local;
@@ -684,8 +690,14 @@ enum kernel_files_status kernel_files_readv(
     }
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        *linux_result = -KERNEL_EINVAL;
+        *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         status = KERNEL_FILES_STATUS_OK;
+        goto out;
+    }
+    if (positioned && ((description->device && !description->device->positioned) ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
+        *linux_result = -KERNEL_ESPIPE;
         goto out;
     }
     if (!kernel_open_file_readable(description)) {
@@ -720,7 +732,10 @@ enum kernel_files_status kernel_files_readv(
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
-    if (description->device && description->device->readv) {
+    if (positioned) {
+        status = pread_iov_pinned(files, mm, description, iov, iovcnt,
+                                  total, offset, 0, linux_result);
+    } else if (description->device && description->device->readv) {
         status = description->device->readv(description->device_instance,
             kernel_task_current(), files, &description,
             iov == local ? 0 : (void **)&iov, mm, iov, (size_t)iovcnt,
@@ -741,19 +756,32 @@ out:
 }
 
 
-static enum kernel_files_status pread_pinned(
+enum kernel_files_status kernel_files_readv(struct kernel_files *files,
+    struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
+    int64_t *linux_result)
+{
+    return readv_request(files, mm, fd, user_iov, iovcnt, 0, 0, linux_result);
+}
+
+enum kernel_files_status kernel_files_preadv(struct kernel_files *files,
+    struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
+    int64_t offset, int64_t *linux_result)
+{
+    return readv_request(files, mm, fd, user_iov, iovcnt, 1, offset, linux_result);
+}
+
+static enum kernel_files_status pread_iov_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
     struct kernel_open_file_description *description,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count,
-    int64_t offset,
+    int64_t offset, int scalar,
     int64_t *linux_result)
 {
     if (description->block) {
         if (offset < 0) { *linux_result = -KERNEL_EINVAL; return KERNEL_FILES_STATUS_OK; }
-        struct kernel_uaccess_iovec iov = {user_buffer, count};
-        enum kernel_files_status status = kernel_block_file_io(description, mm, &iov, 1,
+        enum kernel_files_status status = kernel_block_file_io(description, mm, iov, iov_count,
             count, 0, 1, offset, linux_result);
         if (!status) {
             if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
@@ -796,14 +824,10 @@ static enum kernel_files_status pread_pinned(
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
-    /* Linux vfs_read checks the caller's original range before MAX_RW_COUNT
-     * clipping and before EOF. Its empty range permits the user limit itself
-     * but rejects higher addresses; generic uaccess deliberately skips zeros. */
-    if (kernel_user_range_check(user_buffer, (size_t)count) !=
-            KERNEL_UACCESS_STATUS_OK ||
-        scalar_empty_range_fault(user_buffer, count)) {
-        KERNEL_FILES_NOTE(files, read_failures, 1);
+    if (scalar && (kernel_user_range_check(iov[0].base, (size_t)count) !=
+            KERNEL_UACCESS_STATUS_OK || scalar_empty_range_fault(iov[0].base, count))) {
         *linux_result = -KERNEL_EFAULT;
+        KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
     if (count == 0U) {
@@ -813,16 +837,14 @@ static enum kernel_files_status pread_pinned(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) {
         KERNEL_LOCK_SCOPE(offset_guard);
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
-        struct kernel_uaccess_iovec iov = {user_buffer, count};
-        struct kernel_uaccess_iov_cursor cursor = {&iov, 1U, 0U, 0U};
+        struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
         uint64_t capped = count > KERNEL_FILES_MAX_RW_COUNT
                             ? KERNEL_FILES_MAX_RW_COUNT : count;
         return generated_read(files, mm, description, &cursor, capped,
                               (uint64_t)offset, 0, linux_result);
     }
     if (description->device && description->device->positioned) {
-        const struct kernel_uaccess_iovec iov = {user_buffer, count};
-        return read_pinned(files, mm, description, 0, &iov, 1U, count,
+        return read_pinned(files, mm, description, 0, iov, iov_count, count,
                            linux_result, 0U, 0, 0);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
@@ -842,12 +864,10 @@ static enum kernel_files_status pread_pinned(
         request = file_size - position;
     }
     if (kernel_open_file_memory_backed(description)) {
-        const struct kernel_uaccess_iovec iov = {user_buffer, request};
-        struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
+        struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
         return memory_read(files, mm, description, &cursor, request, position, 0, linux_result);
     }
-    const struct kernel_uaccess_iovec iov = {user_buffer, request};
-    struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
     return disk_read(files, mm, description, &cursor, request, position, 0, linux_result
         );
 }
@@ -869,8 +889,9 @@ enum kernel_files_status kernel_files_pread(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    status = pread_pinned(files, mm, description, user_buffer, count,
-                          offset, linux_result);
+    struct kernel_uaccess_iovec iov = {user_buffer, count};
+    status = pread_iov_pinned(files, mm, description, &iov, 1,
+                              count, offset, 1, linux_result);
     return release_io_description(files, &description, status);
 }
 
@@ -1677,15 +1698,14 @@ enum kernel_files_status kernel_files_pwrite(
     }
     kind = kernel_open_file_kind(description);
     if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
-        kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
+        kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+        (description->device && !description->device->positioned))
         *linux_result = -KERNEL_ESPIPE;
     else if (!description_writable(description))
         *linux_result = -KERNEL_EBADF;
     else if (offset < 0)
         *linux_result = -KERNEL_EINVAL;
-    else if ((description->device && !description->device->positioned) ||
-             kind == KERNEL_OPEN_FILE_KIND_PIPE)
-        *linux_result = -KERNEL_ESPIPE;
     else if (kind == KERNEL_OPEN_FILE_KIND_DIRECTORY)
         *linux_result = -KERNEL_EISDIR;
     else
@@ -1711,9 +1731,10 @@ enum kernel_files_status kernel_files_pwrite(
     return release_io_description(files, &description, status);
 }
 
-enum kernel_files_status kernel_files_writev(
+static enum kernel_files_status writev_request(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
-    uint64_t user_iov, uint64_t iovcnt, int64_t *linux_result)
+    uint64_t user_iov, uint64_t iovcnt, int positioned, int64_t offset,
+    int64_t *linux_result)
 {
     struct kernel_uaccess_iovec local[8];
     struct kernel_uaccess_iovec *iov = local;
@@ -1736,10 +1757,16 @@ enum kernel_files_status kernel_files_writev(
     }
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        *linux_result = -KERNEL_EINVAL;
+        *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
+    }
+    if (positioned && ((description->device && !description->device->positioned) ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
+        *linux_result = -KERNEL_ESPIPE;
+        goto out;
     }
     if (!description_writable(description)) {
         *linux_result = -KERNEL_EBADF;
@@ -1767,19 +1794,33 @@ enum kernel_files_status kernel_files_writev(
     }
     *linux_result=kernel_uaccess_iov_import(mm,user_iov,iov,iovcnt,&total);
     if (*linux_result) goto out;
-    if (description->device && description->device->writev) {
+    if (!positioned && description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description,
             iov == local ? 0 : (void **)&iov, mm, iov, iovcnt,
             total, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, iov, iovcnt, total,
-                           0, 0U, linux_result, 0U,NULL);
+                           positioned, (uint64_t)offset, linux_result, 0U,NULL);
 out:
     if (iov && iov != local) kernel_files_release_allocation(files, iov);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
     return release_io_description(files, &description, status);
+}
+
+enum kernel_files_status kernel_files_writev(struct kernel_files *files,
+    struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
+    int64_t *linux_result)
+{
+    return writev_request(files, mm, fd, user_iov, iovcnt, 0, 0, linux_result);
+}
+
+enum kernel_files_status kernel_files_pwritev(struct kernel_files *files,
+    struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
+    int64_t offset, int64_t *linux_result)
+{
+    return writev_request(files, mm, fd, user_iov, iovcnt, 1, offset, linux_result);
 }
 
 static enum kernel_files_status lseek_pinned(

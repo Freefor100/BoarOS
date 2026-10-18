@@ -2787,6 +2787,9 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
     *next_position = position;
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (node && node->unlinked && (node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
+        return -KERNEL_ENOENT;
     return instance->ops->dir_entry(file, position, next_position, inode, type, name, name_size);
 }
 

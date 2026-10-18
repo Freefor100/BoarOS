@@ -130,6 +130,9 @@ static int address_import(const struct kernel_socket *socket,
     if (address->family == KERNEL_SOCKET_AF_INET) {
         IP_SET_TYPE(ip, IPADDR_TYPE_V4);
         __builtin_memcpy(&ip_2_ip4(ip)->addr, address->bytes, 4);
+        /* Linux treats an IPv4 destination of INADDR_ANY as loopback. */
+        if (!binding && ip4_addr_isany_val(*ip_2_ip4(ip)))
+            IP4_ADDR(ip_2_ip4(ip), 127, 0, 0, 1);
     } else {
         static const uint8_t mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (__builtin_memcmp(address->bytes, mapped, 12) == 0) {
