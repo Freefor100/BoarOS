@@ -18,6 +18,7 @@
 
 #ifdef TEST_RANGE_WORK_COUNTERS
 static uint32_t watched_bitmap_bytes, bitmap_crc_calls;
+static uint32_t watched_extent_bytes, extent_crc_calls;
 static unsigned range_queries, watched_indirect_gets;
 static ext4_fsblk_t watched_indirect_leaf;
 int __real_ext4_trans_block_get(struct ext4_blockdev *, struct ext4_block *, uint64_t);
@@ -36,6 +37,7 @@ uint32_t __real_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes);
 uint32_t __wrap_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes)
 {
     if (bytes == watched_bitmap_bytes) bitmap_crc_calls++;
+    if (watched_extent_bytes && bytes == watched_extent_bytes) extent_crc_calls++;
     return __real_ext4_crc32c(crc,data,bytes);
 }
 #endif
@@ -1931,6 +1933,56 @@ static void corrupt_stats(struct ext4_fs *fs,const char *kind)
     if(memcmp(&stats,&before,sizeof(stats)) || disk.writes!=writes || fs->bdev->fs!=fs) fprintf(stderr,"corrupt %s bytes=%d writes=%llu/%llu owner=%d\n",kind,memcmp(&stats,&before,sizeof(stats)),(unsigned long long)disk.writes,(unsigned long long)writes,fs->bdev->fs==fs);
     CHECK(!memcmp(&stats,&before,sizeof(stats)) && disk.writes==writes && fs->bdev->fs==fs);
 }
+/* A read of a dirty extent must verify its bytes without rewriting its checksum. */
+static void extent_lookup_checksums(struct ext4_blockdev *dev)
+{
+    ext4_file file;
+    uint32_t block=ext4_sb_get_block_size(&dev->fs->sb);
+    CHECK(ext4_fopen(&file,"/extent-checksum-lookups","w+")==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    for (unsigned i=0;i<6;i++) {
+        bool changed=false;
+        CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,(uint64_t)i*2*block,block,&changed)==EOK);
+        CHECK(changed);
+    }
+    struct ext4_inode_ref ref;
+    CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+    struct ext4_inode_block_range range;
+    ext4_fsblk_t physical=0;
+#ifdef TEST_RANGE_WORK_COUNTERS
+    watched_extent_bytes=block-4;extent_crc_calls=0;
+#endif
+    for (unsigned i=0;i<32;i++) {
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,0,1,false,&range)==EOK);
+        CHECK(range.block && range.count==1 && range.unwritten);
+        if (!i) physical=range.block;
+        CHECK(range.block==physical);
+    }
+#ifdef TEST_RANGE_WORK_COUNTERS
+    printf("extent read checksums: lookups=32 CRC=%u\n",extent_crc_calls);
+    CHECK(extent_crc_calls<=32);
+    watched_extent_bytes=0;
+#endif
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_transaction_end("/")==EOK);
+    /* Corrupt only the held cache copy, then restore it before releasing it. */
+    CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
+    const unsigned char *root=(const unsigned char *)ref.inode->blocks;
+    uint16_t depth,high;uint32_t low;
+    memcpy(&depth,root+6,sizeof(depth));CHECK(to_le16(depth)==1);
+    memcpy(&low,root+16,sizeof(low));memcpy(&high,root+20,sizeof(high));
+    ext4_fsblk_t leaf=(uint64_t)to_le32(low)|((uint64_t)to_le16(high)<<32);
+    struct ext4_block cached;
+    CHECK(ext4_trans_block_get(dev,&cached,leaf)==EOK);
+    cached.data[block-1]^=1;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,1,false,&range)==EUCLEAN);
+    cached.data[block-1]^=1;
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,1,false,&range)==EOK && range.block==physical);
+    CHECK(ext4_block_set(dev,&cached)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_fclose(&file)==EOK);
+}
+
 static void public_batch_ranges(struct ext4_blockdev *dev)
 {
     (void)dev; /* Some host runners build this fixture without work counters. */
@@ -2521,6 +2573,7 @@ int main(int argc,char **argv)
         exit_status=extent_prepend(dev.fs,strstr(argv[2],"group")!=NULL,strstr(argv[2],"tree")!=NULL);
     else if(!strcmp(argv[2],"extent-read-oom") || !strcmp(argv[2],"extent-read-error"))
         extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
+    else if(!strcmp(argv[2],"extent-lookup")){extent_lookup_checksums(&dev);}
     else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);legacy_leaf_batch(&dev);legacy_chain_abort(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
