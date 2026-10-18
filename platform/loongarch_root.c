@@ -27,6 +27,7 @@ static struct {
     struct kernel_page_cache cache;
     struct kernel_vfs_mount mount;
     struct virtio_pci_block devices[ROOT_DEVICES];
+    struct kernel_block_device partitions[ROOT_DEVICES][4];
     struct virtio_pci_rng rng;
     struct virtio_pci_net net;
     struct kernel_network *network;
@@ -132,6 +133,10 @@ static int release_root(void)
        kernel_page_cache_destroy(&root.cache)!=KERNEL_PAGE_CACHE_STATUS_OK) return -KERNEL_EIO;
     while(root.count) {
         struct virtio_pci_block *device=&root.devices[root.count-1];
+        for(unsigned p=0;p<4;p++) {
+            struct kernel_block_device *child=&root.partitions[root.count-1][p];
+            if(child->registered && kernel_block_unregister(child)) return -KERNEL_EBUSY;
+        }
         if(device->device.block.registered && kernel_block_unregister(&device->device.block)) return -KERNEL_EBUSY;
         if(virtio_pci_block_destroy(device)!=VIRTIO_BLOCK_DRIVER_STATUS_OK) return -KERNEL_EIO;
         root.count--;
@@ -250,6 +255,7 @@ static int start_root(void)
         }
         unsigned number=root.count++;
         if(kernel_block_register(&device->device.block,KERNEL_BLOCK_DEVICE_NUMBER(number))) error=-KERNEL_EBUSY;
+        if(!error) error=kernel_block_scan_mbr(&device->device.block,root.partitions[number]);
     }
     if(!error && kernel_page_cache_init(&root.cache,&root.heap,allocator)!=KERNEL_PAGE_CACHE_STATUS_OK) error=-KERNEL_ENOMEM;
     if(!error) error=kernel_vfs_mount_root(&root.mount,&root.devices[0].device.block,&root.heap,&root.cache);

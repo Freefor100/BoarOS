@@ -1063,7 +1063,7 @@ static void phase_ready_insert(struct batch_transfer *parts, uint8_t *head, unsi
 static enum kernel_block_status transfer_batch_parts(struct virtio_block_device *device,
     const struct kernel_block_span *writes, struct block_read_span *reads, size_t count,
     struct batch_transfer *parts, struct block_segment *segments,
-    kernel_block_phase_next_fn next, const void *cursor,
+    kernel_block_phase_next_fn next, const void *next_context, const void *cursor,
     const struct block_read_completion *completion)
 {
     struct kernel_wait_queue done;
@@ -1138,7 +1138,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
         if (next && result == KERNEL_BLOCK_STATUS_OK) {
             for (size_t i = 0; i < count; i++) {
                 if (parts[i].remaining || parts[i].copied || parts[i].request) continue;
-                while (!phase_span.size && next(&cursor, &phase_span)) {}
+                while (!phase_span.size && next(next_context, &cursor, &phase_span)) {}
                 if (!phase_span.size) break;
                 size_t length = phase_span.size < VIRTIO_BLOCK_TRANSFER_BYTES ?
                     phase_span.size : VIRTIO_BLOCK_TRANSFER_BYTES;
@@ -1259,7 +1259,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
 
 static enum kernel_block_status transfer_batch(struct virtio_block_device *device,
     const struct kernel_block_span *writes, struct block_read_span *reads, size_t count,
-    kernel_block_phase_next_fn next, const void *cursor,
+    kernel_block_phase_next_fn next, const void *next_context, const void *cursor,
     const struct block_read_completion *completion)
 {
     uintptr_t irq = arch_interrupt_save();
@@ -1282,7 +1282,7 @@ static enum kernel_block_status transfer_batch(struct virtio_block_device *devic
     struct block_batch_workspace *workspace = (void *)((unsigned char *)device->batch_memory[slot / per_page] +
         (slot % per_page) * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES);
     enum kernel_block_status status = transfer_batch_parts(device, writes, reads, count,
-        workspace->parts, workspace->segments, next, cursor, completion);
+        workspace->parts, workspace->segments, next, next_context, cursor, completion);
     /* 全部本次 DMA 完成或 reset 确认后，才归还槽位供另一调用使用。 */
     irq = arch_interrupt_save();
     if (!(device->batch_claimed & (1U << slot))) __builtin_trap();
@@ -1294,15 +1294,15 @@ static enum kernel_block_status transfer_batch(struct virtio_block_device *devic
 
 static enum kernel_block_status virtio_block_write_batch(void *context,
     const struct kernel_block_span *spans, size_t count)
-{ return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL); }
+{ return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL, NULL); }
 
 static enum kernel_block_status virtio_block_read_batch(void *context,
     struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
-{ return transfer_batch(context, NULL, spans, count, NULL, NULL, completion); }
+{ return transfer_batch(context, NULL, spans, count, NULL, NULL, NULL, completion); }
 
 static enum kernel_block_status virtio_block_write_phase(void *context,
-    kernel_block_phase_next_fn next, const void *first)
-{ return transfer_batch(context, NULL, NULL, KERNEL_BLOCK_BATCH_MAX, next, first, NULL); }
+    kernel_block_phase_next_fn next, const void *next_context, const void *first)
+{ return transfer_batch(context, NULL, NULL, KERNEL_BLOCK_BATCH_MAX, next, next_context, first, NULL); }
 
 enum virtio_block_status virtio_block_init(
     struct virtio_block_device *device,const struct virtio_transport *transport,

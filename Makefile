@@ -1613,6 +1613,8 @@ test-block-host:
 	build/host/block-flush
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_registry.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-registry
 	build/host/block-registry
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-partitions
+	build/host/block-partitions
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
 	build/host/block-fault
 

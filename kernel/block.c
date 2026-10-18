@@ -5,6 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+static struct kernel_block_device *physical(struct kernel_block_device *device)
+{ return device->parent ? device->parent : device; }
+
 static uint64_t capacity(const struct kernel_block_device *device)
 { return __atomic_load_n(&device->capacity_bytes, __ATOMIC_ACQUIRE); }
 /* Registry updates never sleep. IRQ masking also excludes same-hart preemption;
@@ -75,11 +78,12 @@ enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
         return KERNEL_BLOCK_STATUS_INVALID;
     }
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
-    if (device->flush != 0) {
-        return device->flush(device->context);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
+    if (disk->flush != 0) {
+        return disk->flush(disk->context);
     }
-    return device->cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
+    return disk->cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
                ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_UNSUPPORTED;
 }
 
@@ -90,12 +94,13 @@ enum kernel_block_status kernel_block_read_at(
     size_t size)
 {
     kernel_assert_service_context();
-    if (device == 0 || device->read == 0 ||
+    if (device == 0 || physical(device)->read == 0 ||
         device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_INVALID;
     }
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     const uint64_t limit = capacity(device);
     if (offset > limit ||
         (uint64_t)size > limit - offset) {
@@ -108,7 +113,7 @@ enum kernel_block_status kernel_block_read_at(
         return KERNEL_BLOCK_STATUS_INVALID;
     }
 
-    return device->read(device->context, offset, buffer, size);
+    return disk->read(disk->context, device->start_bytes + offset, buffer, size);
 }
 
 enum kernel_block_status kernel_block_write_at(
@@ -118,12 +123,13 @@ enum kernel_block_status kernel_block_write_at(
     size_t size)
 {
     kernel_assert_service_context();
-    if (device == 0 || device->write == 0 ||
+    if (device == 0 || physical(device)->write == 0 ||
         device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     }
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     const uint64_t limit = capacity(device);
     if (offset > limit ||
         (uint64_t)size > limit - offset) {
@@ -137,7 +143,7 @@ enum kernel_block_status kernel_block_write_at(
     }
 
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
-    return device->write(device->context, offset, buffer, size);
+    return disk->write(disk->context, device->start_bytes + offset, buffer, size);
 }
 
 enum kernel_block_status kernel_block_write_batch(
@@ -148,12 +154,13 @@ enum kernel_block_status kernel_block_write_batch(
     kernel_assert_service_context();
     if (!device || !device->logical_block_size)
         return KERNEL_BLOCK_STATUS_INVALID;
-    if (!device->write && !device->write_batch)
+    if (!physical(device)->write && !physical(device)->write_batch)
         return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
         return KERNEL_BLOCK_STATUS_INVALID;
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     const uint64_t limit = capacity(device);
     int nonempty = 0;
     for (size_t i = 0; i < count; i++) {
@@ -173,12 +180,20 @@ enum kernel_block_status kernel_block_write_batch(
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
-    if (device->write_batch)
-        return device->write_batch(device->context, spans, count);
+    struct kernel_block_span translated[KERNEL_BLOCK_BATCH_MAX];
+    const struct kernel_block_span *physical_spans = spans;
+    if (device->parent) {
+        for (size_t i = 0; i < count; i++) {
+            translated[i] = spans[i]; translated[i].offset += device->start_bytes;
+        }
+        physical_spans = translated;
+    }
+    if (disk->write_batch)
+        return disk->write_batch(disk->context, physical_spans, count);
     for (size_t i = 0; i < count; i++) {
         if (!spans[i].size) continue;
-        enum kernel_block_status result = device->write(device->context,
-            spans[i].offset, spans[i].buffer, spans[i].size);
+        enum kernel_block_status result = disk->write(disk->context,
+            physical_spans[i].offset, spans[i].buffer, spans[i].size);
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
     }
     return KERNEL_BLOCK_STATUS_OK;
@@ -187,19 +202,33 @@ enum kernel_block_status kernel_block_write_batch(
 static int memory_overlaps(uintptr_t a, size_t an, uintptr_t b, size_t bn)
 { return an && bn && (a < b ? b - a < an : a - b < bn); }
 
+struct translated_phase {
+    kernel_block_phase_next_fn next;
+    const void *context;
+    uint64_t offset;
+};
+static int phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
+{
+    const struct translated_phase *phase = context;
+    if (!phase->next(phase->context, cursor, span)) return 0;
+    span->offset += phase->offset;
+    return 1;
+}
+
 enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
-    kernel_block_phase_next_fn next, const void *first)
+    kernel_block_phase_next_fn next, const void *next_context, const void *first)
 {
     kernel_assert_service_context();
     if (!device || !device->logical_block_size || !next) return KERNEL_BLOCK_STATUS_INVALID;
-    if (!device->write && !device->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    if (!physical(device)->write && !physical(device)->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     const uint64_t limit = capacity(device);
     const void *cursor = first;
     struct kernel_block_span span;
     unsigned nonempty = 0;
-    while (next(&cursor, &span)) {
+    while (next(next_context, &cursor, &span)) {
         if (span.offset > limit || span.size > limit - span.offset)
             return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
         if (!span.size) continue;
@@ -210,14 +239,29 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
-    if (device->write_phase) return device->write_phase(device->context, next, first);
+    struct translated_phase phase = { next, next_context, device->start_bytes };
+    if (disk->write_phase)
+        return device->parent ? disk->write_phase(disk->context, phase_next, &phase, first)
+            : disk->write_phase(disk->context, next, next_context, first);
     cursor = first;
-    while (next(&cursor, &span)) {
+    while (next(next_context, &cursor, &span)) {
         if (!span.size) continue;
-        enum kernel_block_status result = device->write(device->context, span.offset, span.buffer, span.size);
+        enum kernel_block_status result = disk->write(disk->context, device->start_bytes + span.offset, span.buffer, span.size);
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
     }
     return KERNEL_BLOCK_STATUS_OK;
+}
+
+struct translated_completion {
+    struct block_read_span *spans;
+    const struct block_read_completion *completion;
+};
+static void read_completed(void *context, unsigned index, const struct block_read_span *span)
+{
+    struct translated_completion *state = context;
+    state->spans[index].status = span->status;
+    state->spans[index].completed = span->completed;
+    state->completion->complete(state->completion->context, index, &state->spans[index]);
 }
 
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
@@ -226,9 +270,10 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
     kernel_assert_service_context();
     if (!device || !device->logical_block_size || count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
         return KERNEL_BLOCK_STATUS_INVALID;
-    if (!device->read && !device->read_batch) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    if (!physical(device)->read && !physical(device)->read_batch) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     const uint64_t limit = capacity(device);
     for (size_t i = 0; i < count; i++) {
         spans[i].completed = 0; spans[i].status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
@@ -255,11 +300,25 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
         nonempty = 1;
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
-    if (device->read_batch) return device->read_batch(device->context, spans, count, completion);
+    if (disk->read_batch) {
+        if (!device->parent) return disk->read_batch(disk->context, spans, count, completion);
+        struct block_read_span translated[KERNEL_BLOCK_BATCH_MAX];
+        for (size_t i = 0; i < count; i++) {
+            translated[i] = spans[i]; translated[i].offset += device->start_bytes;
+        }
+        struct translated_completion state = { spans, completion };
+        struct block_read_completion notify = { read_completed, &state };
+        enum kernel_block_status result = disk->read_batch(disk->context, translated, count,
+            completion ? &notify : 0);
+        for (size_t i = 0; i < count; i++) {
+            spans[i].status = translated[i].status; spans[i].completed = translated[i].completed;
+        }
+        return result;
+    }
     enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
     for (size_t i = 0; i < count; i++) {
         if (spans[i].size) {
-            spans[i].status = device->read(device->context, spans[i].offset, spans[i].buffer, spans[i].size);
+            spans[i].status = disk->read(disk->context, device->start_bytes + spans[i].offset, spans[i].buffer, spans[i].size);
             if (spans[i].status == KERNEL_BLOCK_STATUS_OK) spans[i].completed = spans[i].size;
             else if (result == KERNEL_BLOCK_STATUS_OK) result = spans[i].status;
         }
@@ -272,14 +331,21 @@ static struct kernel_block_device *registered_devices;
 
 int kernel_block_register(struct kernel_block_device *device, uint64_t number)
 {
-    if (!device || !device->read || !device->logical_block_size)
+    if (!device || !physical(device)->read || !device->logical_block_size)
         return -KERNEL_EINVAL;
     uintptr_t irq = registry_lock();
     int error = 0;
     if (device->registered || device->references || device->notifications || device->claim_owner) error = -KERNEL_EBUSY;
     for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
         if (it->device_number == number) error = -KERNEL_EBUSY;
+    if (device->parent && (!device->parent->registered || device->parent->parent ||
+        device->start_bytes > capacity(device->parent) ||
+        capacity(device) > capacity(device->parent) - device->start_bytes)) error = -KERNEL_EINVAL;
     if (!error) {
+        if (device->parent) {
+            if (device->parent->references == UINT32_MAX) __builtin_trap();
+            device->parent->references++;
+        }
         prepare_locked(device);
         device->device_number = number;
         device->claim_owner = 0;
@@ -305,6 +371,10 @@ int kernel_block_unregister(struct kernel_block_device *device)
         *link = device->registry_next;
         device->registered = 0U;
         device->registry_next = 0;
+        if (device->parent) {
+            if (!device->parent->references) __builtin_trap();
+            device->parent->references--;
+        }
     }
     registry_unlock(irq);
     return error;
@@ -319,11 +389,20 @@ struct kernel_block_device *kernel_block_lookup(uint64_t number)
     return device;
 }
 
+static int claim_conflicts_locked(struct kernel_block_device *device)
+{
+    if (device->claim_owner) return 1;
+    if (device->parent) return device->parent->claim_owner != 0;
+    for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
+        if (it->parent == device && it->claim_owner) return 1;
+    return 0;
+}
+
 int kernel_block_claim(struct kernel_block_device *device, const void *owner)
 {
     if (!device || !owner) return -KERNEL_EINVAL;
     uintptr_t irq = registry_lock();
-    int error = device->claim_owner ? -KERNEL_EBUSY : 0;
+    int error = claim_conflicts_locked(device) ? -KERNEL_EBUSY : 0;
     if (!error) {
         prepare_locked(device);
         if (device->references == UINT32_MAX) __builtin_trap();
@@ -362,7 +441,7 @@ struct kernel_block_device *kernel_block_get(uint64_t number)
 int kernel_block_claimed(struct kernel_block_device *device)
 {
     uintptr_t irq = registry_lock();
-    int claimed = device->claim_owner != 0;
+    int claimed = claim_conflicts_locked(device);
     registry_unlock(irq);
     return claimed;
 }
@@ -377,7 +456,7 @@ int kernel_block_open(struct kernel_block_device *device, const void *owner, uin
 {
     if (!device || !owner) return -KERNEL_EINVAL;
     uintptr_t irq = registry_lock();
-    int error = (flags & 0200U) && device->claim_owner ? -KERNEL_EBUSY : 0;
+    int error = (flags & 0200U) && claim_conflicts_locked(device) ? -KERNEL_EBUSY : 0;
     if (!error) {
         prepare_locked(device);
         if (device->references == UINT32_MAX || device->open_count == UINT32_MAX) __builtin_trap();
@@ -414,6 +493,7 @@ void kernel_block_close(struct kernel_block_device *device, const void *owner, u
 }
 void kernel_block_set_capacity(struct kernel_block_device *device, uint64_t bytes)
 {
+    if (device->parent) __builtin_trap();
     kernel_block_get_device(device);
     {
         KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
@@ -422,13 +502,18 @@ void kernel_block_set_capacity(struct kernel_block_device *device, uint64_t byte
     kernel_block_put(device);
 }
 int kernel_block_read_only(const struct kernel_block_device *device)
-{ return __atomic_load_n(&device->read_only, __ATOMIC_ACQUIRE) != 0 ||
-    (!device->write && !device->write_batch && !device->write_phase); }
+{
+    const struct kernel_block_device *disk = device->parent ? device->parent : device;
+    return __atomic_load_n(&device->read_only, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&disk->read_only, __ATOMIC_ACQUIRE) ||
+        (!disk->write && !disk->write_batch && !disk->write_phase);
+}
 int kernel_block_set_read_only(struct kernel_block_device *device, int read_only)
 {
     if (!device) return -KERNEL_EINVAL;
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     __atomic_store_n(&device->read_only, !!read_only, __ATOMIC_RELEASE);
     return 0;
 }
@@ -437,10 +522,11 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
 {
     if (!completed) return KERNEL_BLOCK_STATUS_INVALID;
     *completed = 0;
-    if (!device || !device->read || !device->logical_block_size ||
-        (writing && !device->write)) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    if (!device || !physical(device)->read || !device->logical_block_size ||
+        (writing && !physical(device)->write)) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);
-    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&device->io_lock, &io);
+    struct kernel_block_device *disk = physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&disk->io_lock, &io);
     const uint64_t limit = capacity(device);
     if (offset > limit || size > limit - offset)
         return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
@@ -460,14 +546,14 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
         if (!within && amount == sector) {
             /* Whole sectors form one request, preserving the backend's batching. */
             amount = size - size % sector;
-            result = writing ? device->write(device->context, offset, bytes, amount)
-                             : device->read(device->context, offset, bytes, amount);
+            result = writing ? disk->write(disk->context, device->start_bytes + offset, bytes, amount)
+                             : disk->read(disk->context, device->start_bytes + offset, bytes, amount);
         } else {
-            result = device->read(device->context, first, scratch, span);
+            result = disk->read(disk->context, device->start_bytes + first, scratch, span);
             if (result != KERNEL_BLOCK_STATUS_OK) return result;
             if (writing) {
                 __builtin_memcpy((unsigned char *)scratch + within, bytes, amount);
-                result = device->write(device->context, first, scratch, span);
+                result = disk->write(disk->context, device->start_bytes + first, scratch, span);
             } else __builtin_memcpy(bytes, (unsigned char *)scratch + within, amount);
         }
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
@@ -482,3 +568,45 @@ enum kernel_block_status kernel_block_read_bytes(struct kernel_block_device *dev
 enum kernel_block_status kernel_block_write_bytes(struct kernel_block_device *device,
     uint64_t offset, const void *buffer, size_t size, void *scratch, size_t scratch_size, size_t *completed)
 { return byte_io(device, offset, (void *)buffer, size, scratch, scratch_size, 1, completed); }
+
+static uint32_t mbr_u32(const unsigned char *p)
+{ return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+int kernel_block_scan_mbr(struct kernel_block_device *device,
+    struct kernel_block_device children[4])
+{
+    if (!device || !children || !device->registered || device->parent ||
+        device->logical_block_size != 512) return -KERNEL_EINVAL;
+    unsigned char sector[512];
+    enum kernel_block_status status = kernel_block_read_at(device, 0, sector, sizeof(sector));
+    if (status != KERNEL_BLOCK_STATUS_OK) return -KERNEL_EIO;
+    if (sector[510] != 0x55 || sector[511] != 0xaa) return 0;
+    uint64_t starts[4] = {0}, sizes[4] = {0};
+    for (unsigned i = 0; i < 4; i++) {
+        const unsigned char *entry = sector + 446 + i * 16;
+        uint32_t first = mbr_u32(entry + 8), count = mbr_u32(entry + 12);
+        if (children[i].registered || children[i].references) return -KERNEL_EBUSY;
+        if (!entry[4] && !first && !count) continue;
+        if (!entry[4] || !first || !count || (entry[0] && entry[0] != 0x80)) return -KERNEL_EINVAL;
+        /* Extended/GPT containers are not usable primary data partitions. */
+        if (entry[4] == 0x05 || entry[4] == 0x0f || entry[4] == 0x85 || entry[4] == 0xee)
+            return -KERNEL_ENOTSUP;
+        starts[i] = (uint64_t)first * 512;
+        sizes[i] = (uint64_t)count * 512;
+        if (starts[i] > capacity(device) || sizes[i] > capacity(device) - starts[i]) return -KERNEL_EINVAL;
+        for (unsigned j = 0; j < i; j++)
+            if (sizes[j] && starts[i] < starts[j] + sizes[j] && starts[j] < starts[i] + sizes[i])
+                return -KERNEL_EINVAL;
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        if (!sizes[i]) continue;
+        children[i] = (struct kernel_block_device){ .parent = device,
+            .start_bytes = starts[i], .capacity_bytes = sizes[i], .logical_block_size = 512 };
+        int error = kernel_block_register(&children[i], device->device_number + i + 1);
+        if (error) {
+            while (i) { i--; if (sizes[i] && kernel_block_unregister(&children[i])) __builtin_trap(); }
+            return error;
+        }
+    }
+    return 0;
+}

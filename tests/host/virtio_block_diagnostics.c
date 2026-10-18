@@ -873,8 +873,9 @@ static void sg_128k_case(unsigned version, unsigned queue_size, int writing,
 }
 
 struct phase_entry { struct kernel_block_span span; struct phase_entry *next; };
-static int phase_next(const void **cursor, struct kernel_block_span *span)
+static int phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
+    (void)context;
     const struct phase_entry *entry=*cursor;
     if (!entry) return 0;
     *span=entry->span; *cursor=entry->next; return 1;
@@ -899,9 +900,9 @@ static void write_phase_case(unsigned version, int failing)
     }
     /* A malformed final range must prevent publication of the valid prefix. */
     entries[79].span.offset=sizeof(sg_disk);
-    assert(kernel_block_write_phase(&device.block,phase_next,entries)==KERNEL_BLOCK_STATUS_OUT_OF_RANGE && !device.statistics.requests);
+    assert(kernel_block_write_phase(&device.block,phase_next,0,entries)==KERNEL_BLOCK_STATUS_OUT_OF_RANGE && !device.statistics.requests);
     entries[79].span.offset=79*1024;
-    enum kernel_block_status result=kernel_block_write_phase(&device.block,phase_next,entries);
+    enum kernel_block_status result=kernel_block_write_phase(&device.block,phase_next,0,entries);
     assert(result==(failing?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK));
     assert(phase_crossed_window && !phase_held_status);
     assert(first_notify_heads==8 && device.statistics.max_inflight==8);
@@ -927,7 +928,7 @@ static void large_phase_case(unsigned version)
     unsigned char *bytes=(void *)batch_output;
     for (unsigned i=0;i<512*1024;i++) bytes[i]=(unsigned char)(i*13+i/512);
     struct phase_entry entry={{0,bytes,512*1024},NULL};
-    assert(kernel_block_write_phase(&device.block,phase_next,&entry)==KERNEL_BLOCK_STATUS_OK);
+    assert(kernel_block_write_phase(&device.block,phase_next,0,&entry)==KERNEL_BLOCK_STATUS_OK);
     assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==4);
     assert(device.statistics.max_inflight==4 && !memcmp(bytes,sg_disk,512*1024));
     struct kernel_block_span public_span={0,bytes,512*1024};

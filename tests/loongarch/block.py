@@ -92,7 +92,7 @@ for memory in ('512M','1G'):
             command+=['-drive',f'file={image},format=raw,if=none,id=d{index},readonly={"on" if index else "off"}',
                       '-device',f'virtio-blk-pci,drive=d{index},disable-legacy=on,addr={1 if index==0 else 5}.0']
         code,text=run_block(command,images[0],directory)
-        if code or 'LA PCI block contracts passed' not in text or 'fatal' in text:
+        if code or 'LA PCI block contracts passed' not in text or 'LA MBR primary partition I/O and owners passed' not in text or 'fatal' in text:
             raise SystemExit(f'LA PCI block failed ({memory})')
         with images[0].open('rb') as stream:
             stream.seek(32768);observed=stream.read(512)

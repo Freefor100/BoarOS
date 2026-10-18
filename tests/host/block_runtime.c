@@ -20,9 +20,12 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
     *lock = (struct kernel_rwlock){.rank = rank, .key = key};
     assert(!pthread_mutex_unlock(&registry));
 }
+extern void block_model_before_lock(struct kernel_rwlock *) __attribute__((weak));
+static _Thread_local unsigned lock_depth;
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
-    assert(!guard->lock);
+    assert(!guard->lock && !lock_depth++);
+    if (block_model_before_lock) block_model_before_lock(lock);
     assert(!pthread_mutex_lock(&registry));
     struct model_mutex *object = objects;
     while (object && object->object != lock) object = object->next;
@@ -32,7 +35,7 @@ void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g
 }
 void kernel_lock_release(struct kernel_lock_guard *guard)
 {
-    assert(guard->lock && guard->owner);
+    assert(guard->lock && guard->owner && lock_depth-- == 1);
     struct model_mutex *object = (void *)guard->owner;
     guard->lock = 0; guard->owner = 0;
     assert(!pthread_mutex_unlock(&object->mutex));

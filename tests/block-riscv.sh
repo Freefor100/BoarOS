@@ -77,6 +77,11 @@ run_case()
         echo "$mode VirtIO block test did not verify the 128KiB discrete SG payload" >&2
         exit 1
     fi
+    if ! grep -qxF 'BoarOS: MBR primary partition I/O and owners passed' "$output"; then
+        show_output
+        echo "missing primary partition contract result" >&2
+        exit 1
+    fi
     if grep -qF 'BoarOS: block test failed' "$output"; then
         show_output
         echo "$mode VirtIO block test kernel reported a failed case" >&2

@@ -30,8 +30,9 @@ static enum kernel_block_status raw_test_write(void *context, uint64_t offset, c
 static enum kernel_block_status raw_test_flush(void *context)
 { struct raw_test_disk *disk = context; disk->flushes++; return disk->fail_flush; }
 struct raw_race_call { struct kernel_block_device *device; unsigned mode; };
-static int raw_phase_next(const void **cursor, struct kernel_block_span *span)
+static int raw_phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
+    (void)context;
     if (!*cursor) return 0;
     *span = *(const struct kernel_block_span *)*cursor; *cursor = 0; return 1;
 }
@@ -51,7 +52,7 @@ static void *raw_aligned_actor(void *argument)
     enum kernel_block_status status = call->mode == 0 ?
         kernel_block_write_at(call->device, 0, bytes, sizeof(bytes)) : call->mode == 1 ?
         kernel_block_write_batch(call->device, &span, 1) :
-        kernel_block_write_phase(call->device, raw_phase_next, &span);
+        kernel_block_write_phase(call->device, raw_phase_next, 0, &span);
     assert(!status); __atomic_store_n(&raw_aligned_done, 1, __ATOMIC_RELEASE);
     mm_test_finish(); return 0;
 }

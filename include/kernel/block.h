@@ -59,14 +59,18 @@ typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
 typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
     void *context, const struct kernel_block_span *spans, size_t count);
 
-/* Restartable immutable producer for one journal I/O phase. The owner has
+/* Restartable immutable producer for one journal I/O phase. context is stable
+ * across independent cursor traversals. The owner has
  * already established disjoint disk ranges. Each span is sector aligned. */
-typedef int (*kernel_block_phase_next_fn)(const void **cursor,
+typedef int (*kernel_block_phase_next_fn)(const void *context, const void **cursor,
     struct kernel_block_span *span);
 typedef enum kernel_block_status (*kernel_block_write_phase_fn)(void *context,
-    kernel_block_phase_next_fn next, const void *first);
+    kernel_block_phase_next_fn next, const void *next_context, const void *first);
 
 struct kernel_block_device {
+    /* Immutable while registered; each child registration retains its parent. */
+    struct kernel_block_device *parent;
+    uint64_t start_bytes;
     void *context;
     kernel_block_read_fn read;
     kernel_block_write_fn write;
@@ -94,7 +98,7 @@ struct kernel_block_device {
     uint32_t registered;
 };
 
-/* Linux new_encode_dev(252, disk_index * 16); whole disks only. */
+/* Linux new_encode_dev(252, disk_index * 16); primary partitions add 1..4. */
 #define KERNEL_BLOCK_DEVICE_NUMBER(index) \
     (UINT64_C(0xfc00) | (((uint64_t)(index) * 16U) & 0xffU) | \
      ((((uint64_t)(index) * 16U) & ~UINT64_C(0xff)) << 12))
@@ -104,6 +108,10 @@ struct kernel_block_device {
  * Unregister is refused while any open, mount or request retains a reference. */
 int kernel_block_register(struct kernel_block_device *device, uint64_t number);
 int kernel_block_unregister(struct kernel_block_device *device);
+/* Boot discovery. Caller owns four zeroed, stable child objects until teardown.
+ * No signature means a whole-disk filesystem; invalid tables publish nothing. */
+int kernel_block_scan_mbr(struct kernel_block_device *device,
+    struct kernel_block_device children[4]);
 /* Boot/test inspection only; callers that may sleep must use get. */
 struct kernel_block_device *kernel_block_lookup(uint64_t number);
 struct kernel_block_device *kernel_block_get(uint64_t number);
@@ -113,10 +121,11 @@ int kernel_block_open(struct kernel_block_device *, const void *owner, uint32_t 
 void kernel_block_close(struct kernel_block_device *, const void *owner, uint32_t flags);
 int kernel_block_claimed(struct kernel_block_device *);
 void kernel_block_usage(struct kernel_block_device *, uint32_t *references, uint32_t *opens);
+/* Whole-device capacity only; published partition extents are immutable. */
 void kernel_block_set_capacity(struct kernel_block_device *, uint64_t bytes);
 int kernel_block_set_read_only(struct kernel_block_device *, int read_only);
 int kernel_block_read_only(const struct kernel_block_device *);
-/* Byte I/O holds io_lock across each sector read/modify/write. scratch must
+/* Byte I/O holds the physical parent io_lock across each sector read/modify/write. scratch must
  * hold one logical sector and remains borrowed until the request returns.
  * completed always reports the prefix confirmed by successful callbacks,
  * including before a later error. A failing callback supplies no finer progress;
@@ -161,7 +170,7 @@ enum kernel_block_status kernel_block_write_batch(
  * journal's block ownership/indexes; this interface validates alignment,
  * capacity and RAM bounds. A missing callback writes in producer order. */
 enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
-    kernel_block_phase_next_fn next, const void *first);
+    kernel_block_phase_next_fn next, const void *next_context, const void *first);
 
 /* Preflight all spans before I/O. Disk ranges may overlap, but mutable outputs
  * must be disjoint from each other and these descriptors. Every span reports
