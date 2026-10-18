@@ -59,5 +59,9 @@ enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
                 fallocate_cpu0,&call,&operation)) return KERNEL_FILES_STATUS_STATE;
         *linux_result = call.result;
     } else *linux_result = kernel_vfs_fallocate(&file->file,mode,(uint64_t)offset,(uint64_t)length);
+    /* 范围事务接纳后先归还写操作资格，再等待本 OFD 的完整持久目标。
+     * O_DSYNC 也可能修改分配和 EOF；与 O_SYNC 共用完整文件同步。 */
+    if (!*linux_result && (file->open_flags & KERNEL_FILES_O_DSYNC))
+        *linux_result = kernel_vfs_sync(&file->file,0,&file->observed_writeback_error);
     return KERNEL_FILES_STATUS_OK;
 }
