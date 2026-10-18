@@ -83,7 +83,7 @@ mount 通过 `kernel_block_claim()` 与 `O_EXCL` 打开竞争独占 owner，普�
 `make test-root-multi-block-riscv` 构建 `tests/userland/multi_mount.c` 的写入与
 只读校验两个 musl ELF，在 legacy 和 modern 下各执行两次真实双盘启动。
 写入阶段通过任意名字的 block 节点挂载第二盘，检查设备别名独占 claim、
-裸盘 open 拒绝、独立盘内容、hardlink/nlink、嵌套 tmpfs、跨 mount EXDEV、
+独立盘内容、hardlink/nlink、嵌套 tmpfs、跨 mount EXDEV、
 fd/mmap 阻止卸载、卸载重挂和共享映射写回。退出时保留第二盘 mount，要求
 root finish 停止其 worker、同步日志和释放全部设备并精确恢复 heap/page 基线。
 第二次启动把同一第二盘设为设备只读，读回包括 root finish 刷新的最后文件；

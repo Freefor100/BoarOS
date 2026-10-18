@@ -331,6 +331,7 @@ COMMON_C_SOURCES := \
 	fs/rtc_device.c \
 	fs/open_file.c \
 	fs/block_file.c \
+	fs/loop.c \
 	fs/pipe.c \
 	fs/record_lock.c \
 	fs/page_cache.c \

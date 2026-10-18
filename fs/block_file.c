@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
+#include <kernel/loop.h>
 #include <kernel/uaccess.h>
 
 static int block_error(enum kernel_block_status status)
@@ -20,6 +21,8 @@ static int block_error(enum kernel_block_status status)
 }
 int kernel_block_file_open(struct kernel_open_file_description *file, uint64_t number, uint32_t flags)
 {
+    int initialized = kernel_loop_initialize(file->heap);
+    if (initialized) return initialized;
     struct kernel_block_device *device = kernel_block_get(number);
     if (!device) return -KERNEL_ENXIO;
     int error = kernel_block_open(device, file, flags);

@@ -638,9 +638,35 @@ flags 0、AT_SYMLINK_FOLLOW、AT_EMPTY_PATH 不重新解析 fd 的旧名字。�
 非 journal 修改仍明确不支持，不缩减原恢复契约。
 
 DTB 枚举的每块设备独立维护队列、IRQ、DMA 和超时。设备登记、文件系统实例、
-挂载树节点分别拥有生命周期；mknodat 块节点仅用于 stat、命名和 mount 的 st_rdev
-识别，裸盘 open 返回不支持。同一设备重复独占挂载为 EBUSY。lwext4 注册名及内部
+挂载树节点分别拥有生命周期；mknodat 块节点按 st_rdev 同时支持挂载和[裸设备 OFD](riscv-virtio-block.md#用户态块设备)。同一设备重复独占挂载为 EBUSY。lwext4 注册名及内部
 路径按实例生成，生成配置容纳八实例；root 单盘入口仍可使用。
+
+## 文件后备 loop
+
+`fs/loop.c` 登记 Linux major 7 的 loop0～loop7，10:237 的 loop-control 提供
+GET_FREE、ADD 和 REMOVE；节点由用户态 mknodat 创建。块 OFD 使用原生 RV64/LA64
+Linux loop_info（160 字节）、loop_info64（232 字节）和 loop_config（304 字节），
+支持 SET_FD、SET/GET_STATUS、SET/GET_STATUS64、CONFIGURE、SET_CAPACITY 和 CLR_FD。
+配置支持只读、字节 offset、sizelimit、AUTOCLEAR 及 512 到架构页大小的逻辑扇区；
+文件系统块必须是逻辑扇区的整数倍。分区扫描、加密、direct I/O、CHANGE_FD 和
+SET_BLOCK_SIZE 返回不支持。配置与挂载／O_EXCL 竞争真实设备 claim。
+
+绑定持有真实后备 OFD，因此原 fd 关闭和后备文件 unlink 不改变绑定。每个绑定拥有
+一个独立 I/O worker；上层文件系统提交的请求借用调用者缓冲直到完成，worker 通过
+后备 OFD 的 VFS／页缓存读写，flush 同步后备文件。独立栈不继承上层文件系统锁，
+避免 ext4 调用块层时倒序获取后备 inode 的锁。依赖从 loop 指向后备文件所在块设备；
+绑定在控制锁内检查整个有向链，只接受已绑定且无环的祖先，不接纳空闲或 rundown 父设备。
+
+普通打开和 mount claim 都是真实 owner；CLR_FD 在仍有其他打开／挂载时设置
+AUTOCLEAR，唯一打开者则进入 rundown，拒绝新打开和 I/O，到最后关闭才解绑。
+worker 只在全部设备引用与在途请求归还后同步并释放后备 OFD；失败保留实际 owner
+和错误，不报告为空闲。正常退出交错卸载可卸的叶挂载与清理无人使用的 loop，
+让后备所在挂载在依赖者之后释放，最后停止根缓存并卸载根盘。
+
+`sh tests/loop-host.sh` 使用真实 journal ext4 后备与两层文件系统，覆盖绑定／unlink、
+原生结构布局、配置、只读、rundown、占用、循环拒绝、持久化读回和退出释放；
+保存实际两层后备镜像以 e2fsck 检查。4 KiB 文件系统可另设
+`BOAROS_LOOP_SECTOR=4096 LOOP_HOST_BLOCKS=4096` 检查非默认逻辑扇区。
 
 `fs/disk_mount.c` 拥有动态 mount/cache/source 名称。构造中的实例不进入可清理
 状态；真正 I/O 清理失败才移交待清理注册表。关机重试逐个认领 owner，不跨睡眠

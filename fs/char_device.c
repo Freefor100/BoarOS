@@ -13,6 +13,7 @@
 #include <kernel/devpts.h>
 #include <kernel/uaccess.h>
 #include <kernel/tty.h>
+#include <kernel/loop.h>
 
 #include <string.h>
 
@@ -199,6 +200,7 @@ const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
     if (tty) return tty;
     if (rdev == 0x502 || (rdev >= 0x8800 && rdev < 0x8840)) return kernel_tty_device_template();
     if (rdev == kernel_rtc_device.rdev) return &kernel_rtc_device;
+    if (rdev == kernel_loop_control_device.rdev) return &kernel_loop_control_device;
     initialize_devices();
     for (size_t i = 0U; i < sizeof(devices) / sizeof(devices[0]); i++)
         if (devices[i].rdev == rdev) return &devices[i];

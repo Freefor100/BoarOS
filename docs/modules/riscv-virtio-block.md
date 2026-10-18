@@ -49,6 +49,8 @@ VirtIO 批量读支持 direct DMA 与逐扇区 bounce；一个 span 出错不会
 
 VirtIO 将发布、通知、等待和收割分开。同一 batch 将磁盘连续、扇区对齐且能直接 DMA 的多个 span 组成一个 SG 请求，各 span 保留独立的数据描述符，无需搬到连续内存；32 个独立 4 KiB 页可组成一个 128 KiB 请求，其完整链为 header、32 个数据描述符、status，共 34 项。设备 QueueNumMax 较小时向下选择队列容量并拆成多条请求；协商 SIZE_MAX/SEG_MAX 时读取对应上限，将每个数据描述符按整扇区截断，并限制每条链的数据段数。一个 span 可由多段描述符承载，其 completed 只在所属请求完成后推进。每个请求不超过 128 KiB，并受空闲描述符限制；请求槽维持八个，队列扩大不增加请求槽或 bounce。磁盘不连续的 span 在同一轮发布多个请求，然后只通知队列一次。请求可以乱序完成，并在其他调用释放槽或描述符后继续补发；不要求先凑齐整批资源。一个 SG 请求的成员共用设备完成状态，读失败时各成员保留此前已确认的 completed 前缀。每个请求保留独立的 I/O context、期限、状态、DMA buffer 和成本身份。batch 只占一个逻辑调用 owner，`active` 统计逻辑调用数，共用队列的 `inflight` 是已经发布的请求数的唯一计数；释放某个槽不会提前释放整批 owner。不同字节区间仍可能落在同一物理扇区，因此本批内涉及同扇区的 span 按输入顺序串行推进读改写，其他 span 可并发；不会因两个独立 bounce 快照覆盖相邻字节。
 
+## 用户态块设备
+
 块设备节点按真实 `st_rdev` 查找登记设备，普通打开建立独立的 block OFD，保留设备节点路径与设备引用，不进入普通文件页缓存。read/write/readv/writev 支持非扇区对齐的字节范围；pread/pwrite 不修改共享偏移，dup/fork 别名共同持有同一偏移和设备打开引用。读取容量末尾返回 0，跨末尾写返回可容纳的前缀，末尾开始的非空写返回 ENOSPC；lseek 仅允许设备容量以内的位置。普通打开可以与挂载或独占打开并存，`O_EXCL` 与挂载 claim 竞争同一个独占 owner。设备、挂载、OFD 和请求引用全部释放后才能注销。
 
 块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。新写打开在只读状态下返回 EACCES，已经打开的 OFD 写入返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、`O_DIRECT`、discard、secure discard 和 zeroout 当前明确不支持。

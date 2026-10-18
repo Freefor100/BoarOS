@@ -13,6 +13,7 @@
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/procfs.h>
+#include <kernel/loop.h>
 #include <kernel/shm.h>
 #include <kernel/errno.h>
 
@@ -612,9 +613,9 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (root->finish_failure != RISCV_ROOT_FINISH_NONE) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
-    kernel_page_cache_stop_worker(&root->page_cache);
     error = kernel_vfs_disk_cleanup_pending();
-    if (!error) error = kernel_procfs_unmount_children(&root->mount);
+    if (!error) error = kernel_loop_shutdown_mounts(&root->mount);
+    if (!error) kernel_page_cache_stop_worker(&root->page_cache);
     if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error != 0) {
         root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;

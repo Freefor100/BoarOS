@@ -9,6 +9,7 @@
 #include <kernel/page_cache.h>
 #include <kernel/vfs.h>
 #include <kernel/procfs.h>
+#include <kernel/loop.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/open_file.h>
@@ -119,11 +120,11 @@ static int release_root(void)
         la_virt_puts(" rng-timeouts=");la_virt_hex(root.rng.device.timeouts);
         la_virt_puts(" block-irqs=");la_virt_hex(block_irqs);la_virt_puts("\n");
     }
-    kernel_page_cache_stop_worker(&root.cache);
     int error=kernel_vfs_disk_cleanup_pending();
     if(error) return error;
     if(root.mount.private_data) {
-        error=kernel_procfs_unmount_children(&root.mount);
+        error=kernel_loop_shutdown_mounts(&root.mount);
+        if(!error) kernel_page_cache_stop_worker(&root.cache);
         if(!error) error=kernel_vfs_unmount(&root.mount);
         if(error) return error;
     }

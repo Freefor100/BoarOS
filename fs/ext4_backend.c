@@ -32,7 +32,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LWEXT4_PHYSICAL_BLOCK_SIZE 512U
 static struct lwext4_mount_adapter *adapters;
 static uintptr_t adapter_serial;
 
@@ -523,11 +522,11 @@ static int block_read(struct ext4_blockdev *device,
     }
     adapter = device->bdif->p_user;
     if (adapter == 0 || adapter->block == 0 ||
-        block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE) {
+        block > UINT64_MAX / device->bdif->ph_bsize) {
         return EINVAL;
     }
-    offset = block * LWEXT4_PHYSICAL_BLOCK_SIZE;
-    byte_count = (uint64_t)count * LWEXT4_PHYSICAL_BLOCK_SIZE;
+    offset = block * device->bdif->ph_bsize;
+    byte_count = (uint64_t)count * device->bdif->ph_bsize;
     if (byte_count > SIZE_MAX) {
         return EINVAL;
     }
@@ -570,14 +569,14 @@ static int block_write(struct ext4_blockdev *device,
     }
     adapter = device->bdif->p_user;
     if (adapter == 0 || adapter->block == 0 ||
-        block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE) {
+        block > UINT64_MAX / device->bdif->ph_bsize) {
         return EINVAL;
     }
     if (adapter->block->write == 0) {
         return EROFS;
     }
-    offset = block * LWEXT4_PHYSICAL_BLOCK_SIZE;
-    byte_count = (uint64_t)count * LWEXT4_PHYSICAL_BLOCK_SIZE;
+    offset = block * device->bdif->ph_bsize;
+    byte_count = (uint64_t)count * device->bdif->ph_bsize;
     if (byte_count > SIZE_MAX) {
         return EINVAL;
     }
@@ -619,13 +618,13 @@ static int block_write_batch(struct ext4_blockdev *device,
     if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
             count * sizeof(*physical), (void **)&physical)) return ENOMEM;
     for (unsigned i = 0; i < count; i++) {
-        if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
-            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) {
+        if (spans[i].block > UINT64_MAX / device->bdif->ph_bsize ||
+            (uint64_t)spans[i].count * device->bdif->ph_bsize > SIZE_MAX) {
             if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
             return EINVAL;
         }
-        physical[i] = (struct kernel_block_span){spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
-            spans[i].data, (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE};
+        physical[i] = (struct kernel_block_span){spans[i].block * device->bdif->ph_bsize,
+            spans[i].data, (size_t)spans[i].count * device->bdif->ph_bsize};
     }
     enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
     if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
@@ -1263,7 +1262,6 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_EMPTY ||
         mount->private_data != 0 || mount->id != 0U ||
         block == 0 || block->read == 0 ||
-        block->logical_block_size != LWEXT4_PHYSICAL_BLOCK_SIZE ||
         heap == 0 || page_cache == 0 ||
         page_cache->state != KERNEL_PAGE_CACHE_LIVE) {
         return -KERNEL_EINVAL;
@@ -1302,9 +1300,14 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     result = kernel_block_claim(block, mount);
     if (result) { (void)cleanup_mount(mount); return result; }
     adapter->block_claimed = 1U;
+    /* Claim excludes loop reconfiguration before allocating its sector buffer. */
+    const uint32_t sector = block->logical_block_size;
+    if (sector < 512 || sector > BOAROS_PAGE_SIZE || (sector & (sector - 1))) {
+        (void)cleanup_mount(mount); return -KERNEL_EINVAL;
+    }
 
     heap_status = kernel_heap_allocate(heap,
-                                       LWEXT4_PHYSICAL_BLOCK_SIZE,
+                                       sector,
                                        (void **)&adapter->physical_buffer);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
         (void)cleanup_mount(mount);
@@ -1322,9 +1325,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
     adapter->interface.unlock = 0;
-    adapter->interface.ph_bsize = LWEXT4_PHYSICAL_BLOCK_SIZE;
+    adapter->interface.ph_bsize = sector;
     adapter->interface.ph_bcnt =
-        block->capacity_bytes / LWEXT4_PHYSICAL_BLOCK_SIZE;
+        block->capacity_bytes / sector;
     adapter->interface.ph_bbuf = adapter->physical_buffer;
     adapter->interface.p_user = adapter;
     adapter->interface.wait_read = boaros_lwext4_wait;
@@ -1333,7 +1336,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->device.bdif = &adapter->interface;
     adapter->device.part_offset = 0U;
     adapter->device.part_size =
-        adapter->interface.ph_bcnt * LWEXT4_PHYSICAL_BLOCK_SIZE;
+        adapter->interface.ph_bcnt * sector;
 
     result = ext4_device_register(&adapter->device, adapter->device_name);
     if (result != EOK) {
