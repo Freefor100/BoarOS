@@ -211,8 +211,24 @@ static int run(int argc, char **argv, char **envp)
     return status & 127 ? 128 + (status & 127) : (status >> 8) & 255;
 }
 
+static int timed_run(int argc, char **argv, char **envp)
+{
+    const char *program = argc > 3 ? argv[3] : "invalid-arguments";
+    long start = now();
+    message("BOAROS-CASE START command="); message(program);
+    message(" monotonic_ms="); number(start); message("\n");
+    int result = run(argc, argv, envp);
+    long end = now();
+    message("BOAROS-CASE END command="); message(program);
+    message(" status="); number(result);
+    message(" elapsed_ms=");
+    if (start >= 0 && end >= start) number(end - start); else message("unavailable");
+    message("\n");
+    return result;
+}
+
 #ifdef CASE_HOST
-int main(int argc, char **argv, char **envp) { return run(argc, argv, envp); }
+int main(int argc, char **argv, char **envp) { return timed_run(argc, argv, envp); }
 #else
 #if defined(__loongarch__)
 __asm__(".section .text.start,\"ax\"\n.global _start\n_start:\n"
@@ -225,6 +241,6 @@ __asm__(".section .text.start,\"ax\"\n.global _start\n_start:\n"
 int entry(const unsigned long *sp)
 {
     char **argv = (void *)(sp + 1);
-    return run((int)sp[0], argv, argv + sp[0] + 1);
+    return timed_run((int)sp[0], argv, argv + sp[0] + 1);
 }
 #endif

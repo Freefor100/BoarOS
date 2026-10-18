@@ -30,22 +30,29 @@ class OfficialFlowTests(unittest.TestCase):
         result = self.run_case('printf "native output\\n"; exit 7')
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'native output\n')
+        self.assertRegex(result.stderr, r'BOAROS-CASE START command=/bin/sh monotonic_ms=\d+\n')
+        self.assertRegex(result.stderr, r'BOAROS-CASE END command=/bin/sh status=7 elapsed_ms=\d+\n')
 
     def test_bad_budget_reports_setup_failure_without_running_command(self):
         result = self.run_case('printf SHOULD-NOT-RUN', limit='-1')
         self.assertEqual(result.returncode, 125)
         self.assertEqual(result.stdout, '')
         self.assertIn('BOAROS-CASE SETUP-ERROR stage=arguments', result.stderr)
+        self.assertRegex(result.stderr, r'BOAROS-CASE END command=/bin/sh status=125 elapsed_ms=\d+')
 
     def test_disabled_timeout_waits_for_native_completion(self):
         result = self.run_case('sleep 1.2; printf "completed without deadline\\n"; exit 7', limit='0')
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'completed without deadline\n')
         self.assertNotIn('BOAROS-CASE TIMEOUT', result.stderr)
+        elapsed = re.search(r'BOAROS-CASE END command=/bin/sh status=7 elapsed_ms=(\d+)', result.stderr)
+        self.assertIsNotNone(elapsed, result.stderr)
+        self.assertGreaterEqual(int(elapsed.group(1)), 1200)
 
     def test_timeout_is_not_success_and_next_case_runs(self):
         result = self.run_case('while :; do :; done', limit='1')
         self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertRegex(result.stderr, r'BOAROS-CASE END command=/bin/sh status=124 elapsed_ms=\d+')
         self.assertIn('BOAROS-CASE TIMEOUT', result.stderr)
         self.assertIn('wait_status=', result.stderr)
         context = re.search(r'child_pid=(\d+) test_pgid=(\d+) deadline_elapsed_ms=(\d+) total_elapsed_ms=(\d+)', result.stderr)
