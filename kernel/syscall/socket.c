@@ -32,6 +32,7 @@
 #define LINUX_IPPROTO_TCP 6
 #define LINUX_IPPROTO_UDP 17
 #define LINUX_IPPROTO_MAX 263
+#define LINUX_SOCKADDR_STORAGE_SIZE 128
 #define LINUX_SOL_SOCKET 1
 #define LINUX_SO_RCVTIMEO 20
 #define LINUX_SO_SNDTIMEO 21
@@ -105,33 +106,52 @@ static enum kernel_syscall_status release_socket(
                : KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
 }
 
-static int copy_address_in(struct kernel_mm *mm, uint64_t user,
-                           uint64_t length, struct kernel_socket_address *address)
+union linux_sockaddr_storage {
+    struct linux_sockaddr_in v4;
+    struct linux_sockaddr_in6 v6;
+    uint8_t bytes[LINUX_SOCKADDR_STORAGE_SIZE];
+};
+
+static int copy_address_snapshot(struct kernel_mm *mm, uint64_t user,
+    uint64_t raw_length, union linux_sockaddr_storage *snapshot)
+{
+    /* bind/connect/sendto take an int addrlen, including raw 64-bit calls.
+     * Import every declared byte before the protocol interprets the snapshot. */
+    int32_t length = (int32_t)raw_length;
+    size_t copied = 0;
+    if (length < 0 || length > (int32_t)sizeof(*snapshot)) return -KERNEL_EINVAL;
+    if (length == 0) return 0;
+    if (kernel_copy_from_user(mm, snapshot, user, (size_t)length, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != (size_t)length) return -KERNEL_EFAULT;
+    return 0;
+}
+
+static int parse_address(const union linux_sockaddr_storage *snapshot,
+    int32_t length, struct kernel_socket_address *address)
 {
     uint16_t family;
-    size_t copied = 0;
-    if (length < sizeof(family)) return -KERNEL_EINVAL;
-    if (kernel_copy_from_user(mm, &family, user, sizeof(family), &copied) !=
-            KERNEL_UACCESS_STATUS_OK || copied != sizeof(family)) return -KERNEL_EFAULT;
+    if (length < (int32_t)sizeof(family)) return -KERNEL_EINVAL;
+    __builtin_memcpy(&family, snapshot->bytes, sizeof(family));
     *address = (struct kernel_socket_address){.family = family};
     if (family == LINUX_AF_INET) {
-        struct linux_sockaddr_in local;
-        if (length < sizeof(local)) return -KERNEL_EINVAL;
-        if (kernel_copy_from_user(mm, &local, user, sizeof(local), &copied) !=
-                KERNEL_UACCESS_STATUS_OK || copied != sizeof(local)) return -KERNEL_EFAULT;
-        __builtin_memcpy(address->bytes, &local.address, 4);
-        address->port = network_port(local.port);
+        if ((size_t)length < sizeof(snapshot->v4)) return -KERNEL_EINVAL;
+        __builtin_memcpy(address->bytes, &snapshot->v4.address, 4);
+        address->port = network_port(snapshot->v4.port);
     } else if (family == LINUX_AF_INET6) {
-        struct linux_sockaddr_in6 local = {0};
-        if (length < 24U) return -KERNEL_EINVAL;
-        size_t size = length < sizeof(local) ? (size_t)length : sizeof(local);
-        if (kernel_copy_from_user(mm, &local, user, size, &copied) !=
-                KERNEL_UACCESS_STATUS_OK || copied != size) return -KERNEL_EFAULT;
-        __builtin_memcpy(address->bytes, local.address, 16);
-        address->scope = local.scope;
-        address->port = network_port(local.port);
+        if (length < 24) return -KERNEL_EINVAL;
+        __builtin_memcpy(address->bytes, snapshot->v6.address, 16);
+        address->scope = snapshot->v6.scope;
+        address->port = network_port(snapshot->v6.port);
     } else if (family != 0) return -KERNEL_EAFNOSUPPORT;
     return 0;
+}
+
+static int copy_address_in(struct kernel_mm *mm, uint64_t user,
+    uint64_t raw_length, struct kernel_socket_address *address)
+{
+    union linux_sockaddr_storage snapshot = {0};
+    int result = copy_address_snapshot(mm, user, raw_length, &snapshot);
+    return result ? result : parse_address(&snapshot, (int32_t)raw_length, address);
 }
 
 static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
@@ -486,7 +506,20 @@ static enum kernel_files_status socket_message(
     if (kernel_copy_from_user(mm, &header, request->arguments[1], sizeof(header), &copied) !=
             KERNEL_UACCESS_STATUS_OK || copied != sizeof(header)) return status;
     if (flags & ~allowed) { *result = -KERNEL_EOPNOTSUPP; return status; }
+    /* Linux __copy_msghdr ignores namelen for a NULL name and clamps positive
+     * lengths; this differs from the direct socket syscalls' rejection. */
+    if (header.name == 0) header.name_length = 0;
     if (header.name_length < 0) { *result = -KERNEL_EINVAL; return status; }
+    if (header.name_length > LINUX_SOCKADDR_STORAGE_SIZE)
+        header.name_length = LINUX_SOCKADDR_STORAGE_SIZE;
+    union linux_sockaddr_storage name_snapshot = {0};
+    struct kernel_socket_address address = {0};
+    const struct kernel_socket_address *destination = 0;
+    if (writing && header.name != 0 && header.name_length != 0) {
+        *result = copy_address_snapshot(mm, header.name,
+            (uint32_t)header.name_length, &name_snapshot);
+        if (*result != 0) return status;
+    }
     if (header.iov_count > 1024) { *result = -KERNEL_EMSGSIZE; return status; }
     if (writing && header.control_length != 0) { *result = -KERNEL_EOPNOTSUPP; return status; }
     if (header.iov_count > 8) {
@@ -498,14 +531,14 @@ static enum kernel_files_status socket_message(
     uint64_t count = 0;
     *result=kernel_uaccess_iov_import(mm,header.iov,iov,header.iov_count,&count);
     if (*result) goto out;
-    struct kernel_socket *socket = kernel_open_file_socket(*file);
-    struct kernel_socket_address address = {0};
-    const struct kernel_socket_address *destination = 0;
-    if (writing && header.name != 0) {
-        *result = copy_address_in(mm, header.name, (uint32_t)header.name_length, &address);
+    /* __copy_msghdr copies the name before importing iov, but the protocol
+     * validates its family/length only after iov import has succeeded. */
+    if (writing && header.name != 0 && header.name_length != 0) {
+        *result = parse_address(&name_snapshot, header.name_length, &address);
         if (*result != 0) goto out;
         destination = &address;
     }
+    struct kernel_socket *socket = kernel_open_file_socket(*file);
     if (writing && kernel_socket_is_datagram(socket)) {
         if (kernel_open_file_flags(*file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
         *result = kernel_socket_write_datagram(file, mm, iov, (size_t)header.iov_count, count, flags, destination);
