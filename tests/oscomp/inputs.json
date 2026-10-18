@@ -9,6 +9,18 @@
     "sdcard-rv.img.xz": "2b59aee4d26681b2d78a8faa615ac216f723a8ea157544e7867bbc8c77aac087",
     "sdcard-la.img.xz": "3cbeae1095d788cd8255e4929bcc6dace96dbe4999b6eaec003ae6fe2cdba42b"
   },
+  "local_disk": {
+    "scratch_bytes": 2147483648,
+    "block_bytes": 4096,
+    "root_device": "/dev/block/252:0",
+    "scratch_device": "/dev/block/252:16"
+  },
+  "e2fsprogs": {
+    "version": "1.47.2",
+    "url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/e2fsprogs-1.47.2.tar.xz",
+    "sha256": "08242e64ca0e8194d9c1caad49762b19209a06318199b63ce74ae4ef2d74e63c",
+    "checksums_url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/sha256sums.asc"
+  },
   "architectures": {
     "riscv": {
       "elf_machine": 243,
