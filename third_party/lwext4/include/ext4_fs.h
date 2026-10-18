@@ -165,9 +165,11 @@ int ext4_fs_check_features(struct ext4_fs *fs, bool *read_only);
  */
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref);
-/* Allocation-only variant: may initialize uninitialized group bitmaps. */
+/* Allocation prepares the block bitmap; inode allocation also prepares its
+ * inode bitmap. New inode slots are initialized by ext4_fs_alloc_inode. */
 int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
-				      struct ext4_block_group_ref *ref);
+				      struct ext4_block_group_ref *ref,
+                                      bool inode_allocation);
 
 /**@brief Put reference to block group.
  * @param ref Pointer for reference to be put back
