@@ -36,7 +36,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         tests/host/file_io_concurrency.c tests/host/file_io_excluded.c tests/host/mm/context.c tests/host/mm/disk_context.c \
         kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/futex.c "$build_dir/process-$shift.o" \
         kernel/physical_page.c mm/heap.c mm/memory_object.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
-        fs/files/table.c fs/files/io.c fs/files/locks.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c fs/open_file.c \
+        fs/files/table.c fs/files/io.c fs/files/locks.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c fs/open_file.c fs/block_file.c fs/disk_mount.c \
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \
         fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c kernel/block.c net/socket.c \
         third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \

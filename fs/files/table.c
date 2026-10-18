@@ -5,6 +5,7 @@
 #include "../record_lock.h"
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
+#include "../block_file_internal.h"
 
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -35,7 +36,8 @@ enum kernel_files_status kernel_files_ioctl(
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
-    *linux_result = description->device && description->device->ioctl
+    *linux_result = description->block ? kernel_block_file_ioctl(files, &description, mm, command, argument) :
+        description->device && description->device->ioctl
         ? description->device->ioctl(description->device_instance, kernel_task_current(), files, &description, mm, command, argument) : -KERNEL_ENOTTY;
     enum kernel_open_file_status release = kernel_open_file_release(&description);
     if (release == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && description) {

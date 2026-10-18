@@ -20,7 +20,7 @@ for shift in ${FILES_HOST_SHIFTS:-12 14}; do
         kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
         kernel/physical_page.c mm/heap.c mm/memory_object.c \
         mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
-        "$build_dir/table-$shift.o" fs/files/path.c fs/files/metadata.c fs/fs_context.c fs/open_file.c fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
+        "$build_dir/table-$shift.o" fs/files/path.c fs/files/metadata.c fs/fs_context.c fs/open_file.c fs/block_file.c fs/disk_mount.c fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
         fs/record_lock.c fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c \
         ${FILES_HOST_LDFLAGS:-} -Wl,--gc-sections,--wrap=kernel_open_file_acquire,--wrap=kernel_open_file_release,--wrap=kernel_vfs_path_acquire,--wrap=kernel_heap_allocate_zeroed,--wrap=memcpy,--wrap=kernel_raw_lock_acquire -o "$build_dir/concurrency-$shift"

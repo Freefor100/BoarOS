@@ -53,6 +53,8 @@ D 为当前目录的项数。读取一个目录不会扫描其他目录。目录
 重命名取得新 cookie，cookie 耗尽返回 EOVERFLOW 并保留原名字与替换目标。
 
 用户态创建挂载点并调用 mount；内核不会自动覆盖 `/tmp` 或 `/dev/shm`。
+设备节点可由 mknod 创建字符或块设备类型，inode 保留真实 `rdev`；它们不分配文件数据对象和数据页，stat 的大小与块数为 0。打开时由通用设备路径按 `rdev` 分派。
+
 支持 `size`、`nr_blocks`、`nr_inodes`、`mode`；默认页数和 inode 数分别为受管
 页数的一半，默认根模式 01777。零取消相应显式限额。数字按固定 Linux
 memparse 的 base 0、K/M/G/T/P/E、溢出和百分比规则解析，重复参数以后项为准；

@@ -2,6 +2,7 @@
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
 #include "../char_device_internal.h"
+#include "../block_file_internal.h"
 #include "../uaccess_iov_internal.h"
 #include "../../mm/uaccess_internal.h"
 #include "../vfs_internal.h"
@@ -279,7 +280,8 @@ static enum kernel_files_status sync_pinned(struct kernel_open_file_description 
     if (kernel_open_file_io_requires_cpu0(description) && !borrowed && !regular_caller_ready())
         return KERNEL_FILES_STATUS_STATE;
     enum kernel_open_file_kind kind=kernel_open_file_kind(description);
-    *linux_result=kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ?
+    *linux_result=kind==KERNEL_OPEN_FILE_KIND_BLOCK ? kernel_block_file_sync(description) :
+        kind==KERNEL_OPEN_FILE_KIND_REGULAR || kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ?
         kernel_vfs_sync_borrowing(&description->file,datasync,
             &description->observed_writeback_error,borrowed):-KERNEL_EINVAL;
     return KERNEL_FILES_STATUS_OK;
@@ -396,6 +398,15 @@ static enum kernel_files_status read_pinned(
     int64_t *linux_result, uint32_t socket_flags,
     struct kernel_socket_address *peer, uint32_t *message_size)
 {
+    if (description->block) {
+        enum kernel_files_status status = kernel_block_file_io(description, mm, iov, iov_count,
+            count, 0, 0, 0, linux_result);
+        if (!status) {
+            if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
+            else KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
+        }
+        return status;
+    }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
     /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
@@ -739,6 +750,17 @@ static enum kernel_files_status pread_pinned(
     int64_t offset,
     int64_t *linux_result)
 {
+    if (description->block) {
+        if (offset < 0) { *linux_result = -KERNEL_EINVAL; return KERNEL_FILES_STATUS_OK; }
+        struct kernel_uaccess_iovec iov = {user_buffer, count};
+        enum kernel_files_status status = kernel_block_file_io(description, mm, &iov, 1,
+            count, 0, 1, offset, linux_result);
+        if (!status) {
+            if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
+            else KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
+        }
+        return status;
+    }
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR);
     uint64_t position;
     uint64_t request;
@@ -862,7 +884,8 @@ static int description_writable(
         return 0;
     }
     access_mode = kernel_open_file_flags(description) & 3U;
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_BLOCK) {
         return access_mode == 1U || access_mode == 2U;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
@@ -1464,6 +1487,8 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed)
 {
+    if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
+        count, 1, positioned, requested_offset, linux_result);
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
     /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
@@ -1829,7 +1854,7 @@ static enum kernel_files_status lseek_pinned(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (target < 0) {
+    if (target < 0 || (description->block && (uint64_t)target > kernel_open_file_size(description))) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }

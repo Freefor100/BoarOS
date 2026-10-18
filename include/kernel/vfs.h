@@ -273,6 +273,9 @@ int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
     const struct kernel_uaccess_iovec *,size_t iov_count,size_t count,
     uint64_t offset,int append,struct kernel_vfs_user_write_result *);
 
+/* Flush the mounted filesystem holding this device before raw invalidation. */
+int kernel_vfs_sync_block_device(struct kernel_block_device *device);
+
 int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
                          uint64_t size);
 

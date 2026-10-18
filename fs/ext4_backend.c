@@ -592,6 +592,7 @@ static int block_write(struct ext4_blockdev *device,
     case KERNEL_BLOCK_STATUS_NO_MEMORY:
         return ENOMEM;
     case KERNEL_BLOCK_STATUS_UNSUPPORTED:
+    case KERNEL_BLOCK_STATUS_READ_ONLY:
         return EROFS;
     case KERNEL_BLOCK_STATUS_INVALID:
         return EINVAL;
@@ -631,7 +632,8 @@ static int block_write_batch(struct ext4_blockdev *device,
     switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
-    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED:
+    case KERNEL_BLOCK_STATUS_READ_ONLY: return EROFS;
     case KERNEL_BLOCK_STATUS_INVALID: return EINVAL;
     default: return EIO;
     }
@@ -653,7 +655,8 @@ static int block_write_phase(struct ext4_blockdev *device,
     switch (kernel_block_write_phase(adapter->block, block_phase_next, first)) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
-    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED:
+    case KERNEL_BLOCK_STATUS_READ_ONLY: return EROFS;
     default: return EIO;
     }
 }
@@ -712,6 +715,46 @@ static uint64_t ext4_buffer_bytes(void *context)
             total += (uint64_t)bc->ref_blocks * bc->itemsize;
     }
     return total;
+}
+
+int kernel_vfs_sync_block_device(struct kernel_block_device *device)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    if (!device) return -KERNEL_EINVAL;
+    struct lwext4_mount_adapter *selected = NULL;
+    uintptr_t irq = arch_interrupt_save();
+    /* 设备的独占 mount claim 保证至多一个匹配实例。 */
+    for (struct lwext4_mount_adapter *a = adapters; a; a = a->next_adapter)
+        if (a->block == device && a->mount->state == VFS_MOUNT_STATE_LIVE) {
+            selected = a;
+            break;
+        }
+    if (!selected) { arch_interrupt_restore(irq); return 0; }
+    if (selected->instance.quiescing) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
+    struct kernel_vfs_path *root = NULL;
+    for (struct kernel_vfs_path *p = selected->instance.paths; p; p = p->next)
+        if (!p->parent) { root = p; break; }
+    int result = 0;
+    if (root) {
+        result = kernel_vfs_path_acquire(root);
+        if (result) root = NULL;
+    } else {
+        /* 没有现存 path 时，先保留本次打开的挂载资格；路径分配可睡眠，
+         * 不能让卸载在取得真实 root path owner 之前释放 adapter。 */
+        if (selected->instance.external_files == UINT32_MAX) result = -KERNEL_EOVERFLOW;
+        else selected->instance.external_files++;
+    }
+    arch_interrupt_restore(irq);
+    if (!root && !result) {
+        result = kernel_vfs_path_root(selected->mount,selected->instance.heap,&root);
+        irq = arch_interrupt_save();
+        if (!selected->instance.external_files) __builtin_trap();
+        selected->instance.external_files--;
+        arch_interrupt_restore(irq);
+    }
+    if (!result) result = kernel_vfs_sync_mount(root->file.mount,NULL);
+    if (root && kernel_vfs_path_release(&root)) __builtin_trap();
+    return result;
 }
 
 static int release_mount_storage(struct kernel_vfs_mount *mount)
@@ -1243,6 +1286,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
 #if BOAROS_MAX_CPUS > 1
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
 #endif
+    adapter->mount = mount;
     adapter->next_adapter = adapters;
     adapters = adapter;
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
@@ -1416,7 +1460,8 @@ static void fill_stat(struct kernel_vfs_mount *mount,
     uint32_t creator_os;
 
     memset(stat, 0, sizeof(*stat));
-    stat->dev = mount->id;
+    struct kernel_block_device *block = lwext4_instance(mount->private_data)->block;
+    stat->dev = block->device_number ? block->device_number : mount->id;
     stat->ino = inode_number;
     stat->mode = ext4_inode_get_mode(superblock, inode);
     stat->nlink = ext4_inode_get_links_cnt(inode);

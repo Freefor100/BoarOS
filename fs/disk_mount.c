@@ -11,6 +11,7 @@ struct disk_mount {
     struct disk_mount *next;
     int pending;
     char *source;
+    struct kernel_block_device *block;
 };
 static struct disk_mount *disk_mounts;
 
@@ -30,6 +31,7 @@ static void release_disk(struct kernel_vfs_mount *mount)
     *link = disk->next;
     arch_interrupt_restore(irq);
     if (disk->source) kernel_heap_release(heap, disk->source);
+    if (disk->block) kernel_block_put(disk->block);
     kernel_heap_release(heap, disk);
 }
 
@@ -61,15 +63,17 @@ int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
     int read_only, const char *source, struct kernel_vfs_mount **owner)
 {
     if (!heap || !owner || *owner || !source) return -KERNEL_EINVAL;
-    struct kernel_block_device *block = kernel_block_lookup(device_number);
+    struct kernel_block_device *block = kernel_block_get(device_number);
     if (!block) return -KERNEL_ENXIO;
-    if (block->claim_owner) return -KERNEL_EBUSY;
     struct disk_mount *disk = 0;
     enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap, 1,
         sizeof(*disk), (void **)&disk);
-    if (allocation != KERNEL_HEAP_STATUS_OK)
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        kernel_block_put(block);
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    }
     disk->heap = heap;
+    disk->block = block;
     uintptr_t irq = arch_interrupt_save();
     disk->next = disk_mounts;
     disk_mounts = disk;

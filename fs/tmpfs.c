@@ -18,7 +18,7 @@ struct tmp_inode {
     RB_ENTRY(tmp_inode) index;
     struct tmp_name_tree names;
     struct tmp_cookie_tree cookies;
-    uint64_t number, parent, size;
+    uint64_t number, parent, size, rdev;
     uint32_t mode, links, handles, uid, gid;
     struct kernel_memory_object *memory;
     char *target;
@@ -297,12 +297,16 @@ static int mkdir(struct kernel_vfs_mount *mount, const char *path, uint32_t mode
 { return create_path(tm(mount->private_data), path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, 0); }
 static int symlink(struct kernel_vfs_instance *instance, const char *target, const char *path)
 { return create_path(tm(instance), path, KERNEL_VFS_S_IFLNK | 0777, target, 0); }
-static int mknod_regular(struct kernel_vfs_instance *instance, const char *path,
+static int mknod_node(struct kernel_vfs_instance *instance, const char *path,
     uint32_t type, uint32_t mode, uint32_t device)
 {
-    (void)device;
-    if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO) return -KERNEL_ENOTSUP;
-    return create_path(tm(instance), path, type | (mode & 07777), 0, 0);
+    if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO &&
+        type != KERNEL_VFS_S_IFCHR && type != KERNEL_VFS_S_IFBLK) return -KERNEL_ENOTSUP;
+    struct tmp_entry *created = 0;
+    int result = create_path(tm(instance), path, type | (mode & 07777), 0, &created);
+    if (!result && (type == KERNEL_VFS_S_IFCHR || type == KERNEL_VFS_S_IFBLK))
+        created->inode->rdev = device;
+    return result;
 }
 static int readlink(struct kernel_vfs_node *n, char *buffer, size_t size, size_t *count)
 {
@@ -403,7 +407,7 @@ static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
-    *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,
+    *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
         .size=i->size,.blksize=BOAROS_PAGE_SIZE,
         .blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*(BOAROS_PAGE_SIZE/512) : 0,
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
@@ -574,7 +578,7 @@ static void initialize_ops(void)
 {
     volatile struct kernel_vfs_backend *o=&tmp_ops;
     o->error=error; o->root=root; o->lookup=lookup; o->open=open_inode; o->close_node=close_node;
-    o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_regular; o->readlink=readlink; o->unlink=unlink_file;
+    o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_node; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;

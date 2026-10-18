@@ -68,10 +68,11 @@ NUL、路径/向量/字符串超限在构建期拒绝，最终初始栈仍由公
 
 块设备号采用 Linux `new_encode_dev(252, index * 16)`，首盘为 `0xfc00`，
 第二盘为 `0xfc10`；index 是 DTB 地址顺序中的成功 block device 序号。
-无分区和热插拔，设备节点的设备号在本次启动内稳定。`kernel_block_lookup()`
-借用根启动持有的设备生命周期；mount 通过 `kernel_block_claim()` 独占设备，
-不同节点别名不能绕过同一设备的 claim。卸载成功后原 owner 必须调用
-`kernel_block_release_claim()`；错误 owner 或重复释放是内部不变量错误。
+无分区和热插拔，设备节点的设备号在本次启动内稳定。`kernel_block_get()`
+在登记表保护内取得设备引用；动态挂载和块设备 OFD 用真实引用覆盖所有睡眠操作。
+mount 通过 `kernel_block_claim()` 与 `O_EXCL` 打开竞争独占 owner，普通打开仍可并存。
+挂载、OFD 与在途请求全部释放后才允许注销。挂载失败清理和 unmount 仅在后端实际
+结束后调用 `kernel_block_release_claim()`；错误 owner 或重复释放是内部不变量错误。
 有 claim 时注销返回 `EBUSY`，因此真实卸载错误仍保留设备 owner。
 
 编码和 claim 语义依据固定 Linux
