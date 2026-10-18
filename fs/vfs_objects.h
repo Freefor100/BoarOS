@@ -111,6 +111,9 @@ struct kernel_vfs_backend {
     int (*control)(struct kernel_vfs_node *node, int write, uint64_t offset,
         char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
+    int (*fallocate)(struct kernel_vfs_node *node, unsigned mode, uint64_t offset,
+        uint64_t length, uint64_t *actual, int *changed);
+    struct kernel_block_device *(*block_device)(struct kernel_vfs_instance *instance);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
     /* Returns after capturing/registering a fixed target. The backend completes

@@ -273,6 +273,12 @@ int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
     const struct kernel_uaccess_iovec *,size_t iov_count,size_t count,
     uint64_t offset,int append,struct kernel_vfs_user_write_result *);
 
+#define KERNEL_VFS_FALLOC_KEEP_SIZE 1U
+#define KERNEL_VFS_FALLOC_PUNCH_HOLE 2U
+int kernel_vfs_fallocate(struct kernel_vfs_file *file, unsigned mode,
+    uint64_t offset, uint64_t length);
+/* Borrowed while the caller retains its file/OFD owner. */
+struct kernel_block_device *kernel_vfs_file_block_device(const struct kernel_vfs_file *file);
 /* Flush the mounted filesystem holding this device before raw invalidation. */
 int kernel_vfs_sync_block_device(struct kernel_block_device *device);
 

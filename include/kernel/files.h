@@ -360,6 +360,9 @@ enum kernel_files_status kernel_files_truncate(
     struct kernel_mm *mm, uint64_t user_path, int64_t length,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
+    int64_t fd, unsigned mode, int64_t offset, int64_t length, int64_t *linux_result);
+
 enum kernel_files_status kernel_files_ftruncate(
     struct kernel_files *files,
     int64_t fd,

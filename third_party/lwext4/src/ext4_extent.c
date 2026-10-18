@@ -1225,6 +1225,7 @@ static int ext4_ext_correct_indexes(struct ext4_inode_ref *inode_ref,
 static inline bool ext4_ext_can_prepend(struct ext4_extent *ex1,
 					struct ext4_extent *ex2)
 {
+    if (ext4_ext_is_unwritten(ex1) != ext4_ext_is_unwritten(ex2)) return false;
 	if (ext4_ext_pblock(ex2) + ext4_ext_get_actual_len(ex2) !=
 	    ext4_ext_pblock(ex1))
 		return 0;
@@ -1253,6 +1254,7 @@ static inline bool ext4_ext_can_prepend(struct ext4_extent *ex1,
 static inline bool ext4_ext_can_append(struct ext4_extent *ex1,
 				       struct ext4_extent *ex2)
 {
+    if (ext4_ext_is_unwritten(ex1) != ext4_ext_is_unwritten(ex2)) return false;
 	if (ext4_ext_pblock(ex1) + ext4_ext_get_actual_len(ex1) !=
 	    ext4_ext_pblock(ex2))
 		return 0;
@@ -2082,17 +2084,11 @@ static int ext4_ext_zero_unwritten_range(struct ext4_inode_ref *inode_ref,
 	uint32_t i;
 	uint32_t block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
 	for (i = 0; i < blocks_count; i++) {
-		struct ext4_block bh = EXT4_BLOCK_ZERO();
-		err = ext4_trans_block_get_noread(inode_ref->fs->bdev, &bh,
-						  block + i);
-		if (err != EOK)
-			break;
-
-		memset(bh.data, 0, block_size);
-		ext4_trans_set_block_dirty(bh.buf);
-		err = ext4_block_set(inode_ref->fs->bdev, &bh);
-		if (err != EOK)
-			break;
+        /* These are file bytes, not journal metadata. The data version may be
+         * replaced by the caller's stable write in this same conversion. */
+        err = ext4_trans_write_data(inode_ref->fs->bdev, block + i,
+            0, NULL, block_size, true, NULL);
+        if (err != EOK) break;
 	}
 	return err;
 }
@@ -2122,8 +2118,8 @@ __unused static void print_path(struct ext4_extent_path *path)
 	}
 }
 
-int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
-    uint32_t max_blocks, bool create, struct ext4_inode_block_range *range)
+static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, bool create, bool reserve, struct ext4_inode_block_range *range)
 {
 	struct ext4_extent_path *path = NULL;
 	struct ext4_extent newex, *ex;
@@ -2170,7 +2166,7 @@ int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 				goto out;
 			}
 
-			if (!create) {
+			if (!create || reserve) {
                 range->unwritten = true;
                 newblock = iblock - ee_block + ee_start;
 				goto out;
@@ -2216,7 +2212,8 @@ int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	allocated = next - iblock;
 	if (allocated > max_blocks)
 		allocated = max_blocks;
-    if (allocated > EXT4_EXT_MAX_LEN_WRITTEN) allocated = EXT4_EXT_MAX_LEN_WRITTEN;
+    uint32_t maximum = reserve ? EXT_UNWRITTEN_MAX_LEN : EXT_INIT_MAX_LEN;
+    if (allocated > maximum) allocated = maximum;
 
 	/* allocate new block */
 	goal = ext4_ext_find_goal(inode_ref, path, iblock);
@@ -2228,11 +2225,12 @@ int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	newex.first_block = to_le32(iblock);
 	ext4_ext_store_pblock(&newex, newblock);
 	newex.block_count = to_le16(allocated);
+    if (reserve) ext4_ext_mark_unwritten(&newex);
 	err = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
 	if (err != EOK) {
 		/* free data blocks we just allocated */
 		int cleanup = ext4_ext_free_blocks(inode_ref, ext4_ext_pblock(&newex),
-                     to_le16(newex.block_count), 0);
+                     ext4_ext_get_actual_len(&newex), 0);
         if (cleanup) err = cleanup;
 		goto out2;
 	}
@@ -2240,6 +2238,7 @@ int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	/* previous routine could use block we allocated */
 	newblock = ext4_ext_pblock(&newex);
     range->allocated = true;
+    range->unwritten = reserve;
 
 out:
 	if (allocated > max_blocks)
@@ -2256,6 +2255,18 @@ out2:
 
 	return err;
 }
+int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, bool create, struct ext4_inode_block_range *range)
+{
+    return extent_get_range(inode_ref, iblock, max_blocks, create, false, range);
+}
+
+int ext4_extent_reserve_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, struct ext4_inode_block_range *range)
+{
+    return extent_get_range(inode_ref, iblock, max_blocks, true, true, range);
+}
+
 int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
     uint32_t max_blocks, ext4_fsblk_t *result, bool create, uint32_t *blocks_count)
 {

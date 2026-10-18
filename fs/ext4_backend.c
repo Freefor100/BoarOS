@@ -2236,6 +2236,17 @@ static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, ui
     *changed = result == EOK || before != *actual;
     return lwext4_error(result);
 }
+static int ext4_backend_fallocate(struct kernel_vfs_node *node, unsigned mode,
+    uint64_t offset, uint64_t length, uint64_t *actual, int *changed)
+{
+    bool committed;
+    int result = ext4_fallocate(lwext4_node_file(node), mode, offset, length, &committed);
+    *actual = ext4_fsize(lwext4_node_file(node));
+    *changed = committed;
+    return lwext4_error(result);
+}
+static struct kernel_block_device *ext4_backend_block_device(struct kernel_vfs_instance *instance)
+{ return lwext4_instance(instance)->block; }
 static int ext4_backend_close_node(struct kernel_vfs_node *node)
 { return lwext4_error(ext4_fclose(lwext4_node_file(node))); }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
@@ -2347,6 +2358,8 @@ static void initialize_backend(void)
     ops->lookup = ext4_backend_lookup;
     ops->readlink = ext4_backend_readlink;
     ops->truncate = ext4_backend_truncate;
+    ops->fallocate = ext4_backend_fallocate;
+    ops->block_device = ext4_backend_block_device;
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;
     ops->sync_prepare = ext4_backend_sync_prepare;

@@ -98,6 +98,8 @@ void kernel_vfs_namespace_lock(struct kernel_vfs_mount *mount, struct kernel_loc
 /* 调用者已取得write_operation，CPU0执行者只借用，不能排队后再等同一门闩。 */
 int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *, uint64_t,
     const struct kernel_lock_guard *);
+int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *, unsigned,
+    uint64_t, uint64_t, const struct kernel_lock_guard *);
 /* Whole syscall write/truncate gate; rank 15, before namespace/inode locks. */
 void kernel_vfs_file_write_lock(struct kernel_vfs_file *file,
     struct kernel_lock_guard *guard);

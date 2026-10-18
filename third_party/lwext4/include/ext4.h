@@ -499,6 +499,11 @@ int ext4_fclose(ext4_file *file);
  *
  * @return  Standard error code.*/
 int ext4_ftruncate(ext4_file *file, uint64_t size);
+#define EXT4_FALLOC_KEEP_SIZE 1U
+#define EXT4_FALLOC_PUNCH_HOLE 2U
+/* changed reports committed mapping/data changes even on a partial failure. */
+int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
+                   uint64_t length, bool *changed);
 
 /**@brief   Read data from file.
  *

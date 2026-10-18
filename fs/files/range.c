@@ -1,0 +1,63 @@
+#include "private.h"
+#include "../open_file_internal.h"
+#include "../vfs_internal.h"
+#include <kernel/cpu.h>
+#include <kernel/errno.h>
+#include <kernel/page_cache.h>
+#include <kernel/scheduler.h>
+#include <arch/context.h>
+#include <arch/platform_io.h>
+
+struct fallocate_call {
+    struct kernel_vfs_file *file;
+    const struct kernel_lock_guard *operation;
+    uint64_t offset, length;
+    unsigned mode;
+    int result;
+};
+static void fallocate_cpu0(void *argument)
+{
+    struct fallocate_call *call = argument;
+    call->result = kernel_vfs_fallocate_borrowing(call->file,call->mode,
+        call->offset,call->length,call->operation);
+}
+
+enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
+    int64_t fd, unsigned mode, int64_t offset, int64_t length, int64_t *linux_result)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    if (!kernel_files_is_live(files) || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file = kernel_files_hold_fd(files,fd,&pin);
+    *linux_result = -KERNEL_EBADF;
+    if (!file) return KERNEL_FILES_STATUS_OK;
+    if (offset < 0 || length <= 0) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (mode != 0 && mode != KERNEL_VFS_FALLOC_KEEP_SIZE &&
+        mode != (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE)) {
+        *linux_result = -KERNEL_EOPNOTSUPP;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PATH || (file->open_flags & 3U) == 0)
+        return KERNEL_FILES_STATUS_OK;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE) *linux_result = -KERNEL_ESPIPE;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_DIRECTORY) *linux_result = -KERNEL_EISDIR;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_BLOCK) *linux_result = -KERNEL_EOPNOTSUPP;
+    else if (file->kind != KERNEL_OPEN_FILE_KIND_REGULAR) *linux_result = -KERNEL_ENODEV;
+    else if (length > INT64_MAX - offset) *linux_result = -KERNEL_EFBIG;
+    else if (kernel_open_file_io_requires_cpu0(file)) {
+        struct kernel_io_context *io = kernel_io_context_current();
+        if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
+            !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return KERNEL_FILES_STATUS_STATE;
+        KERNEL_LOCK_SCOPE(operation);
+        kernel_vfs_file_write_lock(&file->file,&operation);
+        struct fallocate_call call = {.file=&file->file,.operation=&operation,
+            .offset=(uint64_t)offset,.length=(uint64_t)length,.mode=mode,.result=-KERNEL_EIO};
+        if (kernel_page_cache_run_cpu0_borrowing(kernel_open_file_page_cache(file),
+                fallocate_cpu0,&call,&operation)) return KERNEL_FILES_STATUS_STATE;
+        *linux_result = call.result;
+    } else *linux_result = kernel_vfs_fallocate(&file->file,mode,(uint64_t)offset,(uint64_t)length);
+    return KERNEL_FILES_STATUS_OK;
+}

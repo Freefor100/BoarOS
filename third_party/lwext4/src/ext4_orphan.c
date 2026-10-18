@@ -22,7 +22,7 @@ struct orphan_tail { uint32_t magic, checksum; };
 struct orphan_record {
     uint32_t inode, previous, next, file_block, slot;
     uint32_t list_previous, list_next;
-    uint8_t state;
+    uint8_t state, truncate_pending;
 };
 struct orphan_file_block {
     ext4_fsblk_t lba;
@@ -40,7 +40,7 @@ struct ext4_orphan_undo {
     struct ext4_orphan_index *index;
     struct orphan_record old;
     uint32_t inode;
-    bool restore;
+    bool restore, state_only;
 };
 
 static struct orphan_record *index_find(struct ext4_orphan_index *index, uint32_t inode)
@@ -92,6 +92,7 @@ static int index_load_record(struct ext4_orphan_index *index, struct orphan_reco
     if (index_find(index, record.inode)) return EUCLEAN;
     int r = index_reserve(index);
     if (r != EOK) return r;
+    record.truncate_pending = 1; /* Restart recovery must inspect persisted EOF. */
     record.list_next = index->head;
     if (index->head) index_find(index, index->head)->list_previous = record.inode;
     index->head = record.inode;
@@ -193,7 +194,11 @@ void ext4_orphan_trans_finish(struct jbd_trans *trans, bool abort)
     while ((undo = trans->orphan_undo)) {
         trans->orphan_undo = undo->next;
         if (abort) {
-            if (undo->restore) index_insert(undo->index, undo->old);
+            if (undo->state_only) {
+                struct orphan_record *record = index_find(undo->index, undo->inode);
+                if (!record) __builtin_trap();
+                record->truncate_pending = undo->old.truncate_pending;
+            } else if (undo->restore) index_insert(undo->index, undo->old);
             else index_remove(undo->index, undo->inode);
         }
         if (!undo->index->pending) __builtin_trap();
@@ -469,6 +474,34 @@ int ext4_orphan_contains(struct ext4_fs *fs, uint32_t inode, bool *present)
     return r;
 }
 
+int ext4_orphan_truncate_pending(struct ext4_fs *fs, uint32_t inode, bool *pending)
+{
+    if (!fs || !inode || !pending) return EINVAL;
+    int r = ensure_index(fs, NULL);
+    if (r != EOK) return r;
+    struct orphan_record *record = index_find(fs->orphan_index, inode);
+    *pending = record && record->truncate_pending;
+    return EOK;
+}
+
+int ext4_orphan_mark_truncate(struct ext4_inode_ref *inode, bool pending)
+{
+    struct ext4_fs *fs = inode->fs;
+    int r = require_transaction(fs);
+    if (r != EOK) return r;
+    r = ensure_index(fs, inode);
+    if (r != EOK) return r;
+    struct orphan_record *record = index_find(fs->orphan_index, inode->index);
+    if (!record) return ENOENT;
+    if (record->truncate_pending == pending) return EOK;
+    struct ext4_orphan_undo *undo = reserve_undo(fs, record, inode->index);
+    if (!undo) return ENOMEM;
+    undo->state_only = true;
+    record->truncate_pending = pending;
+    record_undo(fs,undo);
+    return EOK;
+}
+
 static int update_slot(struct ext4_fs *fs, struct orphan_record *record,
                        uint32_t expected, uint32_t value, bool *changed)
 {
@@ -511,7 +544,8 @@ int ext4_orphan_add(struct ext4_inode_ref *inode)
     struct ext4_orphan_undo *undo = reserve_undo(fs, NULL, inode->index);
     if (!undo) return ENOMEM;
     struct orphan_record record = {.inode = inode->index, .file_block = index->free_head,
-                                   .list_next = index->head};
+                                   .list_next = index->head,
+                                   .truncate_pending = ext4_inode_get_links_cnt(inode->inode) != 0};
     bool changed = false;
     if (record.file_block != ORPHAN_NO_BLOCK) {
         uint64_t *bits = &index->free_slots[(size_t)record.file_block * index->words];

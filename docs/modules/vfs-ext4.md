@@ -515,6 +515,31 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 元数据收口历史验证：当时 `build/recoverable-fs-host-final.log` 的全部 host/断电矩阵通过；`build/recoverable-fs-regression-final.log` 的 RISC-V 全套、真实 musl/pthread、320 条固定 Linux 差分、1000 个函数栈界及工具自测通过。日志已清理；最大单函数当时为 kernel_main 的 1952 字节，assembly trap 288、保留 1024。这不是实板性能或 SMP 验证。
 
+## 文件空间预留与打洞
+
+`kernel_vfs_fallocate()` 将范围操作交给后端，ext4 支持 mode 0、`KEEP_SIZE` 和
+`PUNCH_HOLE | KEEP_SIZE`。预留通过真实 unwritten extent 占用块并维护位图、inode
+扇区数和空闲计数；读取这些块合成零，首次写入在同一事务内分割、转换相应范围。
+只有逻辑、物理相邻且初始化状态一致的 extent 才能合并。unwritten 转换的零数据使用
+ordered data 版本，允许调用者随后在同一事务内用稳定写入版本替换；不能把这些文件
+数据块登记为 journal 元数据。完整打洞块释放映射，两个部分块仅清零请求内的字节，
+不为洞或 unwritten 边界分配或初始化块。未实现该能力的后端与其他模式返回
+`EOPNOTSUPP`，超出 maxbytes 返回 `EFBIG`。
+
+写操作互斥覆盖整个操作。通用层先关闭 mmap 发布代次，打洞时撤销相交页的文件别名、
+保留私有 COW，然后写回脏页，使后端看见缓冲写已经发布的 EOF，并保存边界页的范围外
+字节。后端结果、实际 EOF 和相交缓存页退休在同一 inode 写锁内发布，再开放新缺页。
+等待 inode 读锁的旧写回候选在捕获前看到缓存页退休，不能重建已打掉的映射。日志事务
+失败恢复本次位图、extent、部分块数据与 EOF；无日志后端已完成的部分变化仍按实际
+结果更新缓存，错误不改成成功。相同 EOF 的截断也回收 EOF 外预留；orphan 索引的
+运行时截断意图参加事务 undo，区分真正待回收的缩短映射与仍打开的无链接文件。
+后者保留合法预留，最后 owner 释放时才完整回收；重启恢复仍按持久 EOF 检查。
+此操作不承诺无日志文件系统的断电原子性。
+
+`sh tests/fallocate-host.sh` 使用 1/4 KiB ext4 块与 4/16 KiB 页检查预留及空闲计数、
+混合 extent、部分块、缓存重读、真实共享 mmap/私有 COW、握手控制的活动写回、范围
+中途失败回滚、无 journal 的部分失败和所有者归还；每个镜像卸载后运行 `e2fsck -fn`。
+
 ## 单 hart 可睡眠存储契约
 
 锁序为 OFD offset（10）→ inode 写操作门闩（15）→ 命名空间（20）→ 按稳定 node 身份排序的 inode → 后端读写锁。VFS 缓存命中不需取得后端锁；纯定位读 `ext4_fpread` 使用独立游标和共享后端锁，写入、事务提交/回滚、孤儿回收、恢复、journal start/stop 和卸载持独占锁。事务只允许同一任务 owner 嵌套；写者排队后不再放入新读者。RELATIME 先在读阶段判断，确需更新时间才在释放读锁后进入独占阶段，不允许读锁升级。
@@ -523,7 +548,7 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 写回固定本批页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回只借用当前窗口的精确页集合，归还时使用同一集合；跨窗口只保留页号与范围，续批重查当前脏页索引，不长期借用链表后继。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
-每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
+每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate/fallocate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 

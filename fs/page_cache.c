@@ -2751,6 +2751,31 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
     }
 }
 
+void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    if (!cache_live(cache) || start >= end || !kernel_lock_held(&node->io_lock,1)) __builtin_trap();
+    readahead_cancel_node(cache,node);
+    uint64_t first = start >> BOAROS_PAGE_SHIFT, last = (end - 1) >> BOAROS_PAGE_SHIFT;
+    {
+        CACHE_SCOPE(guard,cache);
+        struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
+        while (entry) {
+            struct kernel_page_cache_entry *next = entry->node_next;
+            if (entry->page_index >= first && entry->page_index <= last) {
+                /* A prepared old snapshot waits for inode read protection. It
+                 * observes retirement before capture and cannot restore a hole. */
+                if (entry->dirty_end) __builtin_trap();
+                remove_entry(cache,entry);
+                cache_wake(&entry->ready);
+            }
+            entry = next;
+        }
+    }
+    uint64_t released = 0;
+    (void)drain_entries(cache,&released);
+}
+
 uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t target_pages)
 {
     if (!cache_live(cache) || !target_pages) return 0;

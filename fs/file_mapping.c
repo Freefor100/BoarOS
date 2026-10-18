@@ -178,7 +178,8 @@ void kernel_file_mapping_unregister(struct kernel_file_mapping *mapping)
     kernel_file_mapping_drain(mapping);
 }
 
-void kernel_file_mapping_notify(struct kernel_vfs_node *node, uint64_t size)
+static void notify(struct kernel_vfs_node *node, uint64_t size,
+    uint64_t end, int range)
 {
     struct kernel_file_mapping_state *s = state(node);
     if (!s) return;
@@ -188,7 +189,11 @@ void kernel_file_mapping_notify(struct kernel_vfs_node *node, uint64_t size)
     while (mapping) {
         int active;
         { KERNEL_RAW_SCOPE(guard, &s->metadata); active = mapping->previous != 0; }
-        if (active) mapping->truncate(mapping->owner, node, size);
+        if (active) {
+            if (!range) mapping->truncate(mapping->owner, node, size);
+            else if (mapping->invalidate_range)
+                mapping->invalidate_range(mapping->owner, node, size, end);
+        }
         struct kernel_file_mapping *next;
         { KERNEL_RAW_SCOPE(guard, &s->metadata);
           next = mapping->previous ? mapping->next : mapping->retired_next; borrow(s, next); }
@@ -196,6 +201,13 @@ void kernel_file_mapping_notify(struct kernel_vfs_node *node, uint64_t size)
         mapping = next;
     }
 }
+
+void kernel_file_mapping_notify(struct kernel_vfs_node *node, uint64_t size)
+{ notify(node, size, 0, 0); }
+
+void kernel_file_mapping_invalidate_range(struct kernel_vfs_node *node,
+    uint64_t start, uint64_t end)
+{ notify(node, start, end, 1); }
 
 void kernel_file_mapping_close(struct kernel_vfs_node *node)
 {

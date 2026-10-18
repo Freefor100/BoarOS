@@ -33,7 +33,7 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 
 普通 `read/pread/readv` 与 `write/pwrite/writev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选，把实际缺失批次交给既有 CPU0 worker。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
 
-共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate 同样在排队前取得文件写操作门。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
+共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
 
 请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。最后缓存 OFD 的后端释放交给同一 worker，普通用户 pipe 的最后关闭在 CPU0 发布端点变化，因为另一端可以登记 epoll 回调。受控内核 pipe 的普通等待者已在任务创建时限定，不把端点 EOF 推迟到退出清理。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
 
@@ -182,6 +182,8 @@ make test-files-partial-write-riscv
 - `kernel_files_mkdirat()`：取得 root/cwd/dirfd 起点后调用 `kernel_vfs_mkdir_at()`；只读挂载返回 `-EROFS`。
 - `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()`，仍打开的对象保留页缓存；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
 - `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。向下截断根据实际新大小通知稳定 node–MM 登记，撤销所有相关 MM 中越过新 EOF 的整页 PTE（包含私有 COW 与 PROT_NONE），保留 VMA 以便随后 fault/SIGBUS。非对齐尾页的文件来源后缀清零，已私有化内容保留；来源记录不依赖缓存索引或 PTE COW 位。
+
+- `kernel_files_fallocate()`：复用 fd 所持 OFD 的生命周期，要求可写普通文件，校验有符号范围和模式，不修改 OFD offset。RV64/LoongArch64 共用 syscall 47 分派；ext4 支持预留、保持大小和打洞，其余后端或模式返回 `EOPNOTSUPP`。实际 extent、缓存和 mmap 一致性见 [VFS 范围操作](vfs-ext4.md#文件空间预留与打洞)。
 
 `read/readv` 与 `write/writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
 

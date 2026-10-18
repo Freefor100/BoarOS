@@ -1357,6 +1357,73 @@ int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size)
     return kernel_vfs_ftruncate(&path->file, size);
 }
 
+struct kernel_block_device *kernel_vfs_file_block_device(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!node || !node->instance || !node->instance->ops->block_device) return NULL;
+    return node->instance->ops->block_device(node->instance);
+}
+
+int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
+    uint64_t offset, uint64_t length, const struct kernel_lock_guard *borrowed)
+{
+    if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return -KERNEL_EINVAL;
+    if (!length || offset > INT64_MAX || length > INT64_MAX) return -KERNEL_EINVAL;
+    if (length > INT64_MAX - offset) return -KERNEL_EFBIG;
+    if (mode != 0 && mode != KERNEL_VFS_FALLOC_KEEP_SIZE &&
+        mode != (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE))
+        return -KERNEL_EOPNOTSUPP;
+    struct kernel_vfs_node *node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation);
+    if (borrowed) {
+        if (borrowed->lock != &node->write_operation.lock || !borrowed->write || !borrowed->owner) __builtin_trap();
+    } else kernel_vfs_file_write_lock(file,&operation);
+    KERNEL_LOCK_SCOPE(io);
+    kernel_vfs_node_lock(node,&io,1);
+    if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) return -KERNEL_EISDIR;
+    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) return -KERNEL_ENODEV;
+    if (!node->instance || node->instance->read_only) return -KERNEL_EROFS;
+    if (node->exec_users) return -KERNEL_ETXTBSY;
+    if (!node->instance->ops->fallocate) return -KERNEL_EOPNOTSUPP;
+    uint64_t end = offset + length, old_size = node->size;
+    if (end > node->max_size) return -KERNEL_EFBIG;
+    struct kernel_page_cache *cache = node->instance->page_cache;
+    int result = kernel_file_mapping_prepare(node);
+    if (result) return result;
+    kernel_file_mapping_close(node);
+    kernel_lock_release(&io);
+    int punch = mode & KERNEL_VFS_FALLOC_PUNCH_HOLE;
+    uint64_t first = offset & ~BOAROS_PAGE_MASK;
+    uint64_t last = (end + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    if (punch) kernel_file_mapping_invalidate_range(node,first,last);
+    /* Buffered EOF can lead persistent EOF. Publish its dirty prefix before
+     * the backend computes KEEP_SIZE or clamps a punch at i_size. */
+    result = cache ? kernel_page_cache_writeback(cache,node) : 0;
+    struct kernel_page_cache_resize resize = {0};
+    if (!result && cache && !mode && end > old_size)
+        result = kernel_page_cache_resize_prepare(cache,node,old_size,end,&resize);
+    kernel_vfs_node_lock(node,&io,1);
+    if (!result) {
+        uint64_t actual;
+        int changed;
+        result = node->instance->ops->fallocate(node,mode,offset,length,&actual,&changed);
+        if (changed) {
+            __atomic_store_n(&node->size,actual,__ATOMIC_RELEASE);
+            file->size = actual;
+            /* The same inode writer publishes disk mappings, cache retirement
+             * and EOF; queued old writeback cannot capture between them. */
+            if (punch && cache) kernel_page_cache_invalidate_range(cache,node,first,last);
+        }
+    }
+    kernel_page_cache_resize_finish(&resize,node->size);
+    kernel_file_mapping_open(node);
+    return result;
+}
+
+int kernel_vfs_fallocate(struct kernel_vfs_file *file, unsigned mode,
+    uint64_t offset, uint64_t length)
+{ return kernel_vfs_fallocate_borrowing(file,mode,offset,length,NULL); }
+
 int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
     uint64_t size, const struct kernel_lock_guard *borrowed)
 {

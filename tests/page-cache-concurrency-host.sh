@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|truncate|pressure) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure]' >&2; exit 2;; esac
+case "${1:-all}" in all|truncate|pressure|fallocate) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure|fallocate]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -12,7 +12,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -include tests/host/lwext4_memory.h \
         -Wno-unused-but-set-variable -Wno-stringop-truncation -Ithird_party/lwext4/include \
         -Itests/host/mm -Itests/host/sync -idirafter include \
-        tests/host/page_cache_concurrency.c tests/host/mm/context.c \
+        ${CACHE_HOST_TEST_SOURCE:-tests/host/page_cache_concurrency.c} tests/host/mm/context.c \
         tests/host/mm/disk_context.c kernel/cpu.c kernel/raw_lock.c \
         kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c \
         mm/heap.c mm/memory_object.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
@@ -23,6 +23,19 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode ${CACHE_HOST_LDFLAGS:-} \
         -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
+        if [ "${1:-all}" = fallocate ]; then
+            for journal in journal nonjournal; do
+                image="$build_dir/fallocate-$shift-$block-$journal.img"
+                truncate -s 32M "$image"
+                features=has_journal
+                [ "$journal" = journal ] || features=^has_journal
+                mkfs.ext4 -q -F -b "$block" -O "$features" "$image"
+                timeout 30s "$build_dir/concurrency-$shift" "$image" fallocate
+                e2fsck -fn "$image" > "$build_dir/fsck-fallocate-$shift-$block-$journal.log" 2>&1
+                printf 'PASS fallocate page_shift=%s fs_block=%s %s; e2fsck clean\n' "$shift" "$block" "$journal"
+            done
+            continue
+        fi
         if [ "${1:-all}" = pressure ]; then
             for scenario in write-pressure write-pressure-full write-pressure-eio write-pressure-oom; do
                 image="$build_dir/$scenario-$shift-$block.img"
