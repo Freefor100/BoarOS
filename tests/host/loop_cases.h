@@ -163,6 +163,79 @@ static void loop_readonly_case(struct kernel_files *local,struct kernel_fs_conte
     puts("PASS loop CONFIGURE: reserved validation, read-only loop fd inference, unaligned backing offset, and sole-opener rundown rejecting new use");
 }
 
+static void loop_partial_sector_case(struct kernel_vfs_mount *mount,
+    struct kernel_files *local,struct kernel_fs_context *local_fs)
+{
+    for (unsigned limited=0;limited<2;limited++) {
+        const char *path=limited?"/limited-sector-backing":"/short-sector-backing";
+        size_t backing_size=limited?8192:4608;
+        uint64_t backing_offset=limited?128:0;
+        unsigned char *expected=malloc(backing_size),*actual=malloc(backing_size);
+        assert(expected && actual);
+        for (size_t i=0;i<backing_size;i++) expected[i]=(unsigned char)(i*29+limited*7+3);
+        int backing=loop_test_open(local,local_fs,path,0102|2);assert(backing>=0);
+        struct kernel_open_file_description *backing_file=NULL,*loop_file=NULL;
+        int64_t result;size_t done;
+        assert(!kernel_files_pin_data(local,backing,&backing_file,&result) && !result);
+        assert(!kernel_vfs_pwrite(&backing_file->file,0,expected,backing_size,&done) && done==backing_size);
+        int loop=loop_test_open(local,local_fs,"/loop0",2);assert(loop>=0);
+        struct kernel_loop_config config={.fd=(uint32_t)backing,.block_size=4096,
+            .info={.offset=backing_offset,.sizelimit=limited?4608:0}};
+        assert(!kernel_copy_to_user(&mm,0x200400,&config,sizeof(config),&done));
+        assert(!loop_test_ioctl(local,loop,0x4c0a,0x200400));
+        assert(!loop_test_ioctl(local,loop,0x80081272,0x200400));
+        uint64_t capacity;
+        assert(!kernel_copy_from_user(&mm,&capacity,0x200400,sizeof(capacity),&done) && capacity==4608);
+        assert(!loop_test_ioctl(local,loop,0x1268,0x200400));
+        unsigned sector;
+        assert(!kernel_copy_from_user(&mm,&sector,0x200400,sizeof(sector),&done) && sector==4096);
+        assert(!kernel_files_pin_data(local,loop,&loop_file,&result) && !result);
+        uint32_t references,opens;
+        kernel_block_usage(loop_file->block,&references,&opens);
+        assert(references==1 && opens==1);
+        assert(!kernel_files_pread(local,&mm,loop,0x201000,1,4096,&result));
+        if (result!=1) fprintf(stderr,"loop partial sector: limited=%u capacity=%llu sector=%u tail pread=%lld expected=1\n",
+            limited,(unsigned long long)capacity,sector,(long long)result);
+        assert(result==1);
+        assert(!kernel_copy_from_user(&mm,actual,0x201000,1,&done) && actual[0]==expected[backing_offset+4096]);
+        assert(!kernel_copy_to_user(&mm,0x200800,"tail-rmw",8,&done));
+        assert(!kernel_files_pwrite(local,&mm,loop,0x200800,8,4096,&result) && result==8);
+        memcpy(expected+backing_offset+4096,"tail-rmw",8);
+        assert(!kernel_block_file_pwrite(loop_file,4599,"last-nine-and-more",18,&done) && done==9);
+        memcpy(expected+backing_offset+4599,"last-nine",9);
+        memset(actual,0xa5,1024);
+        assert(!kernel_open_file_pread(loop_file,4094,actual,1024,&done) && done==514 &&
+            !memcmp(actual,expected+backing_offset+4094,514));
+        for (size_t i=514;i<1024;i++) assert(actual[i]==0xa5);
+        assert(!kernel_files_dup(local,loop,&result) && result>=0);int alias=(int)result;
+        assert(!kernel_files_lseek(local,loop,4094,0,&result) && result==4094);
+        assert(!kernel_files_read(local,&mm,alias,0x201000,1024,&result) && result==514);
+        assert(!kernel_copy_from_user(&mm,actual,0x201000,514,&done) &&
+            !memcmp(actual,expected+backing_offset+4094,514));
+        assert(!kernel_files_lseek(local,loop,0,1,&result) && result==4608);
+        assert(!kernel_files_lseek(local,alias,-1,2,&result) && result==4607);
+        assert(!kernel_files_write(local,&mm,loop,0x200800,8,&result) && result==1);
+        expected[backing_offset+4607]='t';
+        assert(!kernel_files_lseek(local,alias,0,1,&result) && result==4608);
+        assert(!kernel_files_write(local,&mm,alias,0x200800,1,&result) && result==-KERNEL_ENOSPC);
+        assert(!kernel_files_pread(local,&mm,loop,0x201000,1,4608,&result) && result==0);
+        assert(!kernel_files_pwrite(local,&mm,loop,0x200800,1,4608,&result) && result==-KERNEL_ENOSPC);
+        assert(!kernel_files_sync(local,loop,0,&result) && !result);
+        uint32_t after_references,after_opens;
+        kernel_block_usage(loop_file->block,&after_references,&after_opens);
+        assert(after_references==references && after_opens==opens);
+        assert(!kernel_open_file_release(&loop_file));loop_test_close(local,alias);
+        assert(!loop_test_ioctl(local,loop,0x4c01,0));loop_test_close(local,loop);
+        assert(kernel_loop_release_unused()>=0 && backing_file->references==2);
+        assert(kernel_open_file_size(backing_file)==backing_size);
+        assert(!kernel_open_file_pread(backing_file,0,actual,backing_size,&done) && done==backing_size &&
+            !memcmp(actual,expected,backing_size));
+        assert(!kernel_open_file_release(&backing_file));loop_test_close(local,backing);
+        assert(!kernel_vfs_unlink(mount,path));free(actual);free(expected);
+    }
+    puts("PASS loop partial final sector: 4096-byte logical sector with 4608-byte backing/view, tail prefixes, shared offset and outside-view bytes preserved");
+}
+
 static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_fs_context local_fs={0};struct kernel_files local={0};
@@ -213,6 +286,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     assert(loop_test_ioctl(&local,loop,0x4c00,unbound)==-KERNEL_EINVAL);
     loop_test_close(&local,unbound);loop_test_close(&local,loop);
     loop_readonly_case(&local,&local_fs);
+    loop_partial_sector_case(mount,&local,&local_fs);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c80,12)==12);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c81,12)==0);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c82,0)==0);

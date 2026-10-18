@@ -452,7 +452,11 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
     unsigned char *bytes = buffer;
     while (size) {
         size_t within = offset % sector;
-        size_t amount = size < sector - within ? size : sector - within;
+        uint64_t first = offset - within;
+        /* loop 的容量按 512 字节取整，末尾可能不足一个配置的逻辑扇区。
+         * RMW 只借用设备暴露的字节，不能越过容量读取或改写后备文件。 */
+        size_t span = limit - first < sector ? (size_t)(limit - first) : sector;
+        size_t amount = size < span - within ? size : span - within;
         enum kernel_block_status result;
         if (!within && amount == sector) {
             /* Whole sectors form one request, preserving the backend's batching. */
@@ -460,11 +464,11 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
             result = writing ? device->write(device->context, offset, bytes, amount)
                              : device->read(device->context, offset, bytes, amount);
         } else {
-            result = device->read(device->context, offset - within, scratch, sector);
+            result = device->read(device->context, first, scratch, span);
             if (result != KERNEL_BLOCK_STATUS_OK) return result;
             if (writing) {
                 __builtin_memcpy((unsigned char *)scratch + within, bytes, amount);
-                result = device->write(device->context, offset - within, scratch, sector);
+                result = device->write(device->context, first, scratch, span);
             } else __builtin_memcpy(bytes, (unsigned char *)scratch + within, amount);
         }
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
