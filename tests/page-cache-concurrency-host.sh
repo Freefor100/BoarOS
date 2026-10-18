@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|truncate) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate]' >&2; exit 2;; esac
+case "${1:-all}" in all|truncate|pressure) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -23,6 +23,16 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode ${CACHE_HOST_LDFLAGS:-} \
         -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
+        if [ "${1:-all}" = pressure ]; then
+            for scenario in write-pressure write-pressure-full write-pressure-eio write-pressure-oom; do
+                image="$build_dir/$scenario-$shift-$block.img"
+                truncate -s 32M "$image"
+                mkfs.ext4 -q -F -b "$block" "$image"
+                timeout 30s "$build_dir/concurrency-$shift" "$image" "$scenario"
+                e2fsck -fn "$image" > "$build_dir/fsck-$scenario-$shift-$block.log" 2>&1
+            done
+            continue
+        fi
         truncate -s 32M "$build_dir/truncate-$shift-$block.img"
         mkfs.ext4 -q -F -b "$block" "$build_dir/truncate-$shift-$block.img"
         timeout 15s "$build_dir/concurrency-$shift" "$build_dir/truncate-$shift-$block.img" truncate-writeback

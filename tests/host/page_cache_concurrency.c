@@ -2609,6 +2609,87 @@ static void truncate_writeback_publication(struct kernel_page_cache *cache, cons
     puts("PASS truncate publication: zero/partial shrink and partial EIO exclude queued old writeback, preserve prefix/zero regrowth and return owners");
 }
 
+struct pressure_write {
+    struct kernel_vfs_file *file;
+    unsigned char *bytes;
+    size_t size, written;
+    int error;
+};
+static void executor_pressure_write(void *argument)
+{
+    struct pressure_write *write=argument;
+    assert(kernel_page_cache_is_executor(current_cache));
+    while (write->written<write->size) {
+        size_t done=0,chunk=1024*1024;
+        if (chunk>write->size-write->written) chunk=write->size-write->written;
+        int error=kernel_vfs_pwrite(write->file,write->written,
+            write->bytes+write->written,chunk,&done);
+        write->written+=done;
+        if (error || done!=chunk) {
+            if (!error) error=kernel_vfs_pwrite(write->file,write->written,
+                write->bytes+write->written,1,&done);
+            write->error=error;
+            return;
+        }
+    }
+}
+static void write_pressure_case(struct kernel_page_cache *cache,const char *path,int mode)
+{
+    image_fd=open(path,O_RDWR); assert(image_fd>=0);
+    struct stat st; assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_create(&mount,"/pressure",0600,&file));
+    current_cache=cache;
+    assert(!kernel_page_cache_start_worker(cache));
+    size_t length=mode==1?48*1024*1024:24*1024*1024;
+    uint64_t *held=NULL; size_t held_count=0;
+    if (mode==2) write_error=1;
+    if (mode==3) {
+        held=calloc(physical_page_total(cache->allocator),sizeof(*held)); assert(held);
+        while (!physical_page_allocate(cache->allocator,&held[held_count])) held_count++;
+    }
+    unsigned char *bytes=malloc(length); assert(bytes);
+    for (size_t i=0;i<length;i++) bytes[i]=(unsigned char)(i*37+(i>>12));
+    struct pressure_write write={.file=&file,.bytes=bytes,.size=length};
+    assert(!kernel_page_cache_run_cpu0(cache,executor_pressure_write,&write));
+    fprintf(stderr,"pressure mode=%d progress=%zu/%zu error=%d free=%llu\n",mode,
+        write.written,length,write.error,(unsigned long long)physical_page_available(cache->allocator));
+    if (mode==3) {
+        assert(write.error==-KERNEL_ENOMEM && !write.written);
+        for (size_t i=0;i<held_count;i++) assert(!physical_page_release(cache->allocator,held[i]));
+        free(held);
+    } else if (mode==2) {
+        assert(write.written && write.written<length && !write_error);
+        assert(kernel_vfs_file_node(&file)->writeback_error==-KERNEL_EIO);
+        uint64_t observed=0;
+        assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_EIO);
+        assert(!kernel_vfs_ftruncate(&file,0));
+    } else if (mode==1) {
+        assert(write.error==-KERNEL_ENOSPC && write.written>16*1024*1024 && write.written<length);
+        assert(!kernel_vfs_ftruncate(&file,0));
+    } else {
+        assert(!write.error && write.written==length);
+        uint64_t observed=kernel_vfs_error_sequence(&file);
+        assert(!kernel_vfs_sync(&file,0,&observed));
+        assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+        unsigned char actual[BOAROS_PAGE_SIZE];
+        for (size_t offset=0;offset<length;offset+=sizeof(actual)) {
+            size_t done;
+            assert(!kernel_vfs_pread(&file,offset,actual,sizeof(actual),&done) &&
+                done==sizeof(actual) && !memcmp(actual,bytes+offset,done));
+        }
+    }
+    free(bytes);
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(cache) && !close(image_fd)); current_cache=NULL;
+    puts("PASS write admission: executor makes bounded dirty-page progress; disk space and memory exhaustion remain distinct; contents and owners returned");
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
@@ -2639,6 +2720,12 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strncmp(argv[2],"write-pressure",14)) {
+            int mode=!strcmp(argv[2],"write-pressure-full")?1:
+                !strcmp(argv[2],"write-pressure-eio")?2:!strcmp(argv[2],"write-pressure-oom")?3:0;
+            write_pressure_case(&cache,argv[1],mode);
+            goto owners;
+        }
         if (!strcmp(argv[2],"truncate-writeback")) {
             truncate_writeback_publication(&cache,argv[1]);
             goto owners;
