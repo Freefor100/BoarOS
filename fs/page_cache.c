@@ -835,8 +835,8 @@ static uint64_t group_reclaim(void *context, uint64_t target)
     struct page_cache_group *g=context;
     struct kernel_lock_guard *held=kernel_io_context_current()->locks;
     KERNEL_LOCK_SCOPE(walk);
-    if ((held && held->lock->rank>=g->walk.lock.rank) ||
-        !kernel_mutex_try_lock(&g->walk,&walk)) return 0;
+    if (held && held->lock->rank>=g->walk.lock.rank) return 0;
+    kernel_mutex_lock(&g->walk,&walk);
     struct kernel_page_cache_record *first=g->cursor?g->cursor:g->head,*r=first;
     uint64_t released=0;
     if (!r) return 0;
@@ -970,7 +970,9 @@ static enum kernel_page_cache_status cache_init(
             if (heap_status) goto failed;
             group->allocator=allocator;group->heap=heap;group->refs=1;
             kernel_raw_lock_init(&group->metadata,KERNEL_RAW_RANK_OBJECT);
-            kernel_mutex_init(&group->walk,35,(uintptr_t)group);
+            /* 聚合遍历只回收clean页，退休node由worker处理；允许后端
+             * rank40内的分配先取walk，再取cache45，不递归存储I/O。 */
+            kernel_mutex_init(&group->walk,41,(uintptr_t)group);
             kernel_wait_queue_init(&group->progress);
             struct physical_page_reclaim_hooks hooks={.reclaim=group_reclaim,.notify=group_notify,
                 .wait=pressure_wait,.snapshot=group_snapshot,.depth=reclaim_depth,
@@ -2486,6 +2488,15 @@ static int capture_writeback(struct kernel_page_cache *cache,
     return captured;
 }
 
+static void reclaim_window_memory(struct kernel_page_cache *cache)
+{
+    struct kernel_page_cache_record *r=cache->record;
+    uint64_t available=physical_page_available(cache->allocator);
+    /* 每批在取得inode/后端及稳定版本之前回收干净页，归还本批借用后
+     * 也恢复余量，避免连续窗口只累积元数据与稳定版本的分配压力。 */
+    if (available<r->high) (void)kernel_page_cache_reclaim(cache,r->high-available);
+}
+
 /* Candidates are already pinned. Each selected page supplies a separate stable
  * version, so the batch never requires physically contiguous snapshot storage. */
 static int writeback_run(struct kernel_page_cache *cache,
@@ -2493,6 +2504,7 @@ static int writeback_run(struct kernel_page_cache *cache,
     struct writeback_workspace *workspace)
 {
     if (!count || count>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) __builtin_trap();
+    reclaim_window_memory(cache);
     if (kernel_io_context_current()->background_reclaim && cache->record->started && count>cache->record->writeback_capacity)
         count=cache->record->writeback_capacity;
     int background=kernel_io_context_current()->background_reclaim && cache->record->started;
@@ -2597,6 +2609,7 @@ static void write_admission_window(void *argument)
         }
         for (size_t i=0;i<count;i++) entry_return(selected[i]);
     }
+    reclaim_window_memory(cache);
 }
 static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
 {
@@ -2658,6 +2671,7 @@ static void writeback_window(void *argument)
         CACHE_SCOPE(guard,cache);
         for (size_t i=0;i<count;i++) entry_return(request->selected[i]);
     }
+    reclaim_window_memory(cache);
     request->done=request->result || request->cursor>request->last;
 }
 
@@ -2681,6 +2695,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
         multiple=next && next->page_index<=last;
     }
+    reclaim_window_memory(cache);
     union foreground_workspace *lease=multiple?foreground_workspace_take(cache):NULL;
     if (multiple && !lease) return -KERNEL_ENOMEM;
     struct writeback_workspace work=multiple?(struct writeback_workspace){
@@ -2870,8 +2885,9 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
     struct kernel_page_cache_entry *retired=NULL;
     {
         KERNEL_LOCK_SCOPE(guard);
-        if (kernel_lock_held(&cache->record->metadata.lock,1) ||
-            !kernel_mutex_try_lock(&cache->record->metadata,&guard)) return released;
+        struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+        if (held && held->lock->rank>=cache->record->metadata.lock.rank) return released;
+        kernel_mutex_lock(&cache->record->metadata,&guard);
         struct kernel_page_cache_record *r=cache->record;
         r->statistics.reclaim_calls++;
         struct kernel_page_cache_entry *entry=r->lru_tail;
@@ -3000,6 +3016,7 @@ static void cache_background(struct kernel_page_cache *cache)
                 else if (result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM) r->statistics.worker_failed+=used;
                 for (size_t i=0;i<count;i++) entry_return(batch[i]);
             }
+            reclaim_window_memory(cache);
         }
         int demands;
         { CACHE_SCOPE(guard,cache); demands=r->reads_head!=0; r->statistics.worker_batches++; }

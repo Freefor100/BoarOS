@@ -388,6 +388,126 @@ static void admission_full(struct kernel_page_cache *cache,struct kernel_vfs_mou
     kernel_page_cache_stop_worker(cache);
     puts("PASS full admission: ENOSPC rejects unaccepted bytes; all prior inodes fsync/reload exact prefixes, overwrite and clean shutdown");
 }
+static struct kernel_rwlock *reclaim_held_lock;
+static unsigned reclaim_lock_ready,reclaim_lock_resume,reclaim_allocate_done,reclaim_backend_ready,reclaim_probe_start;
+static struct kernel_vfs_mount *reclaim_mount;
+static enum physical_page_status reclaim_result;
+static uint64_t *reclaim_held_pages;
+static size_t reclaim_held_count;
+static void *hold_reclaim_metadata(void *unused)
+{
+    (void)unused;cache_test_attach(2);KERNEL_LOCK_SCOPE(guard);
+    kernel_rwlock_write(reclaim_held_lock,&guard);
+    __atomic_store_n(&reclaim_lock_ready,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&reclaim_lock_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    return NULL;
+}
+static void *allocate_under_backend(void *unused)
+{
+    (void)unused;cache_test_attach(1);kernel_cpu_current()->logical_id=0;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(reclaim_mount->private_data);
+    struct kernel_page_cache *cache=adapter->instance.page_cache;
+    adapter->locks.lock(adapter->locks.context);
+    __atomic_store_n(&reclaim_backend_ready,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&reclaim_probe_start,__ATOMIC_ACQUIRE)) sched_yield();
+    uint64_t page;
+    reclaim_result=physical_page_allocate(cache->allocator,&page);
+    if (!reclaim_result) {
+        reclaim_held_pages[reclaim_held_count++]=page;
+        assert(!physical_page_available(cache->allocator));
+        {
+            KERNEL_LOCK_SCOPE(held);kernel_rwlock_write(reclaim_held_lock,&held);
+            assert(physical_page_allocate(cache->allocator,&page)==PHYSICAL_PAGE_STATUS_EMPTY);
+        }
+        {
+            struct kernel_mutex same_rank;kernel_mutex_init(&same_rank,41,(uintptr_t)&same_rank);
+            KERNEL_LOCK_SCOPE(held);kernel_mutex_lock(&same_rank,&held);
+            assert(physical_page_allocate(cache->allocator,&page)==PHYSICAL_PAGE_STATUS_EMPTY);
+        }
+        while (!physical_page_allocate(cache->allocator,&page)) reclaim_held_pages[reclaim_held_count++]=page;
+        struct kernel_page_cache_statistics stats;kernel_page_cache_get_statistics(cache,&stats);
+        assert(!stats.current_pages && !physical_page_available(cache->allocator));
+    }
+    adapter->locks.unlock(adapter->locks.context);
+    __atomic_store_n(&reclaim_allocate_done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void namespace_reclaim(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    if (adapter->device.fs->jbd_journal) assert(!ext4_journal_group_drain(adapter->mount_point));
+    kernel_page_cache_stop_worker(cache);
+    struct kernel_page_cache_statistics stats;
+    observe_cache_metadata=1;kernel_page_cache_get_statistics(cache,&stats);observe_cache_metadata=0;
+    assert(stats.current_pages && cache_metadata_lock);
+    reclaim_held_lock=cache_metadata_lock;reclaim_mount=mount;
+    reclaim_held_pages=calloc(physical_page_total(cache->allocator),sizeof(*reclaim_held_pages));assert(reclaim_held_pages);
+    reclaim_held_count=0;
+    reclaim_lock_ready=reclaim_lock_resume=reclaim_allocate_done=reclaim_backend_ready=reclaim_probe_start=0;
+    pthread_t holder,allocator;
+    assert(!pthread_create(&allocator,NULL,allocate_under_backend,NULL));
+    wait_progress(&reclaim_backend_ready,1);
+    while (physical_page_available(cache->allocator)) {
+        assert(!physical_page_allocate(cache->allocator,&reclaim_held_pages[reclaim_held_count]));reclaim_held_count++;
+    }
+    uint64_t cached=stats.current_pages;
+    do {
+        assert(!physical_page_allocate(cache->allocator,&reclaim_held_pages[reclaim_held_count]));reclaim_held_count++;
+        kernel_page_cache_get_statistics(cache,&stats);
+    } while (stats.current_pages==cached);
+    assert(stats.current_pages && !physical_page_available(cache->allocator));
+    assert(!pthread_create(&holder,NULL,hold_reclaim_metadata,NULL));
+    wait_progress(&reclaim_lock_ready,1);unsigned parked=mm_test_parked(1);
+    __atomic_store_n(&reclaim_probe_start,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&reclaim_allocate_done,__ATOMIC_ACQUIRE) && mm_test_parked(1)==parked) sched_yield();
+    fprintf(stderr,"busy clean reclaim: done=%u result=%u\n",reclaim_allocate_done,reclaim_result);
+    assert(!reclaim_allocate_done);
+    __atomic_store_n(&reclaim_lock_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(holder,NULL) && !pthread_join(allocator,NULL) && !reclaim_result);
+    for (size_t i=0;i<reclaim_held_count;i++) assert(!physical_page_release(cache->allocator,reclaim_held_pages[i]));
+    free(reclaim_held_pages);
+    puts("PASS backend clean reclaim: busy metadata waits, clean pages allocate under backend lock without I/O, no-clean exhaustion remains EMPTY");
+}
+static void namespace_pressure(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,int direct)
+{
+    assert(!kernel_page_cache_start_worker(cache) && !kernel_vfs_start_journal_worker(mount));
+    size_t length=4*1024*1024,chunk=128*1024;
+    unsigned char *bytes=malloc(length);assert(bytes);memset(bytes,0x68,length);
+    for (unsigned index=0;index<(direct?1:48);index++) {
+        char name[32];snprintf(name,sizeof(name),"/namespace-%u",index);
+        struct kernel_vfs_file file={0};
+        int error=create_file(mount,name,0600,&file);
+        fprintf(stderr,"namespace index=%u create=%d free=%llu\n",index,error,
+            (unsigned long long)physical_page_available(cache->allocator));
+        assert(!error);
+        for (size_t offset=0;offset<length;offset+=chunk) {
+            size_t done;
+            error=kernel_vfs_pwrite(&file,offset,bytes+offset,chunk,&done);
+            if (error || done!=chunk) {
+                struct kernel_vfs_statfs space;assert(!kernel_vfs_mount_statfs(mount,&space));
+                struct kernel_memory_statistics memory;kernel_memory_snapshot(cache->allocator,&memory);
+                fprintf(stderr,"namespace write failure index=%u offset=%zu error=%d prefix=%zu disk-free=%llu free=%llu cached=%llu dirty=%llu reclaimable=%llu\n",
+                    index,offset,error,done,(unsigned long long)space.free_blocks,(unsigned long long)memory.free,
+                    (unsigned long long)memory.cached,(unsigned long long)memory.dirty,(unsigned long long)memory.reclaimable);
+            }
+            assert(!error && done==chunk);
+        }
+        uint64_t observed=0;error=kernel_vfs_sync(&file,0,&observed);
+        fprintf(stderr,"namespace index=%u sync=%d free=%llu\n",index,error,
+            (unsigned long long)physical_page_available(cache->allocator));
+        assert(!error);
+        assert(!kernel_vfs_close(&file));
+        error=kernel_vfs_open(mount,name,&file);
+        fprintf(stderr,"namespace index=%u reopen=%d free=%llu\n",index,error,
+            (unsigned long long)physical_page_available(cache->allocator));
+        assert(!error);
+        expect_bytes(&file,bytes,length);
+        assert(!kernel_vfs_close(&file));
+    }
+    free(bytes);
+    namespace_reclaim(cache,mount);
+    puts("PASS namespace pressure: unified allocator writes then creates/reopens files and returns all owners");
+}
 static unsigned punch_started,punch_completed;
 static struct kernel_vfs_file *punch_file;
 static size_t punch_block;
@@ -624,7 +744,11 @@ int main(int argc,char **argv)
     image_fd=open(argv[1],O_RDWR); assert(image_fd>=0); struct stat stat; assert(!fstat(image_fd,&stat));
     struct kernel_block_device device={.read=image_read,.write=image_write,.flush=image_flush,
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
-    struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,&backend_heap,&cache,0));
+    struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
+        !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
+    if (!strncmp(argv[2],"namespace-",10)) {
+        namespace_pressure(&cache,&mount,!strcmp(argv[2],"namespace-reclaim"));goto mounted_done;
+    }
 #ifdef CACHE_MM_CASES
     if (!strcmp(argv[2],"admission-fault")) {
         admission_fault(&cache,&heap,&pages,&mount); goto mounted_done;
@@ -667,7 +791,11 @@ mounted_done:
     assert(!kernel_vfs_file_block_device(&unsupported));
     assert(!kernel_vfs_close(&unsupported) && !kernel_vfs_unmount(memory));
     assert(!physical_page_allocator_audit(&pages) && physical_page_available(&pages)==baseline);
-    struct kernel_heap_statistics stats; kernel_heap_get_statistics(&backend_heap,&stats);
+    struct kernel_heap_statistics stats;
+    if (!strncmp(argv[2],"namespace-",10)) {
+        kernel_heap_get_statistics(&heap,&stats);assert(!stats.live_allocations && !stats.current_pages);
+    }
+    kernel_heap_get_statistics(&backend_heap,&stats);
     assert(!stats.live_allocations && !stats.current_pages && !physical_page_allocator_audit(&backend_pages) &&
         physical_page_available(&backend_pages)==backend_baseline);
     puts("PASS fallocate owners returned");

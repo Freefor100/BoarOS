@@ -43,8 +43,7 @@ finalized 后，`physical_page_allocate_order(order)` 分配 `2^order` 个物理
 匹配。wrong-order、allocated tail、internal、越界、非对齐地址和已经释放的 head/tail
 都是分配器不变量错误，直接触发 fatal trap；不会把释放失败变成可重试状态。现有
 `physical_page_allocate/release` 签名保持不变，在 finalized 模式委托给 order 0，因此
-Sv39 和 MM 的单页接口不需要识别分配器模式；scheduler 初始化要求 finalized allocator，为独立内核栈取得 order-1 连续页。分配耗尽仍返回 `EMPTY`，分配调用不会
-修改输出或 `available_pages`。
+Sv39 和 MM 的单页接口不需要识别分配器模式；scheduler 初始化要求 finalized allocator，为独立内核栈取得 order-1 连续页。分配耗尽仍返回 `EMPTY`，不产生新 owner 或修改输出；压力回收实际归还的页仍计入 `available_pages`。
 
 释放的 fatal 分支先输出 guard 原因、调用者传入的物理地址和 requested order，再触发
 原 fatal trap。wrong-order、非 allocated head、重复释放、可用页计数、buddy 元数据和
@@ -63,7 +62,7 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
 
 分配器还允许注册一个压力回收回调。一次 buddy 分配返回 `EMPTY` 时，若当前不在回调中，
-分配器以所需页数调用非阻塞干净页回收器；只有可睡眠且无 worker 所需锁的普通任务路径，才可等一轮后台回收，然后只重试一次；递归抑制防止回收器内部的堆/页分配再次进入自身。
+分配器以所需页数调用干净页回收器，每次实际归还后重新申请目标 order；仍缺连续块且回收有进展时继续，不用空闲页总数代替物理相邻性。没有可归还页时保留 `EMPTY`。干净回收可按正向锁序等待元数据资格，不等待脏页或设备 I/O；只有可睡眠且无 worker 所需锁的普通任务路径，才可额外等一轮后台回收并重试。递归抑制防止回收器内部的堆/页分配再次进入自身。
 同一分配器的磁盘缓存登记到共同 owner，干净回收按实例轮转；停止一个实例不注销其他实例。最后实例及等待者都释放引用后才销毁共同 owner。
 
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap

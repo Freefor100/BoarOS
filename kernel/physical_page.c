@@ -1286,12 +1286,20 @@ enum physical_page_status physical_page_allocate_order(
                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         }
         if (entered) {
-            (void)hooks.reclaim(hooks.context, order_page_count(order));
+            uint64_t released;
+            do {
+                released=hooks.reclaim(hooks.context,order_page_count(order));
+                status=physical_page_allocate_order_once(allocator,order,address,NULL);
+                /* LRU归还的页不保证物理相邻；有实际进展就继续尝试所需
+                 * order，不能用空闲页总数代替连续块是否已经形成。 */
+            } while (status==PHYSICAL_PAGE_STATUS_EMPTY && released);
             if (hooks.depth) *depth = 0;
             else __atomic_store_n(depth, 0, __ATOMIC_RELEASE);
-            if (physical_page_available(allocator) < order_page_count(order) && hooks.wait)
+            if (status==PHYSICAL_PAGE_STATUS_EMPTY &&
+                physical_page_available(allocator)<order_page_count(order) && hooks.wait) {
                 hooks.wait(hooks.context);
-            status = physical_page_allocate_order_once(allocator, order, address,NULL);
+                status=physical_page_allocate_order_once(allocator,order,address,NULL);
+            }
         }
     }
     reclaim_hooks_release(&hooks);
