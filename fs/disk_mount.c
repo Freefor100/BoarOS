@@ -60,9 +60,11 @@ int kernel_vfs_disk_cleanup_pending(void)
 }
 
 int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
-    int read_only, const char *source, struct kernel_vfs_mount **owner)
+    int read_only, const char *source, const char *type, struct kernel_vfs_mount **owner)
 {
-    if (!heap || !owner || *owner || !source) return -KERNEL_EINVAL;
+    if (!heap || !owner || *owner || !source || !type) return -KERNEL_EINVAL;
+    int ext4 = !strcmp(type, "ext4"), fat = !strcmp(type, "vfat");
+    if (!ext4 && !fat) return -KERNEL_ENODEV;
     struct kernel_block_device *block = kernel_block_get(device_number);
     if (!block) return -KERNEL_ENXIO;
     struct disk_mount *disk = 0;
@@ -91,11 +93,12 @@ int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
         release_disk(&disk->mount);
         return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
-    int result = kernel_vfs_mount_ext4(&disk->mount, block, heap, &disk->cache, read_only);
+    int result = ext4 ? kernel_vfs_mount_ext4(&disk->mount, block, heap, &disk->cache, read_only)
+                     : kernel_vfs_mount_fat32(&disk->mount, block, heap, &disk->cache, read_only);
     /* 后端失败可能仍持有日志和 I/O；发布到清理注册表而非丢失真实 owner。 */
     disk->mount.release_owner = release_disk;
     if (!result) result = kernel_page_cache_start_worker(&disk->cache);
-    if (!result) result = kernel_vfs_start_journal_worker(&disk->mount);
+    if (!result && ext4) result = kernel_vfs_start_journal_worker(&disk->mount);
     if (result) {
         if (disk->mount.private_data) {
             int cleanup = kernel_vfs_unmount(&disk->mount);

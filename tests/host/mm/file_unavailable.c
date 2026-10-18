@@ -52,7 +52,7 @@ EXCLUDED(kernel_page_cache_wait_writable)
 EXCLUDED(kernel_page_cache_alias_hold)
 EXCLUDED(kernel_page_cache_alias_put)
 EXCLUDED(kernel_page_cache_retry_alias)
-EXCLUDED(kernel_ext4_check_mapping_domain)
+EXCLUDED(kernel_vfs_check_mapping_domain)
 
 EXCLUDED(kernel_page_cache_write_source)
 

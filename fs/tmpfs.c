@@ -577,6 +577,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 static void initialize_ops(void)
 {
     volatile struct kernel_vfs_backend *o=&tmp_ops;
+    o->check_domain=kernel_tmpfs_check_domain;
     o->error=error; o->root=root; o->lookup=lookup; o->open=open_inode; o->close_node=close_node;
     o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_node; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;

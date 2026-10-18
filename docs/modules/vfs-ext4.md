@@ -4,7 +4,7 @@
 
 ## 通用边界
 
-`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
+`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、FAT32/VFAT、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
 
 `fs/vfs_objects.h` 定义通用实例、inode 节点、路径与后端操作表；
 `fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁和缓存；
@@ -47,7 +47,7 @@
 完成后端事务；记录锁、OFD 和页缓存仍按各自 owner 同步。ext4 inode 仍是
 32 位，但通用 inode 标识已扩展至 64 位；ext4 适配层拒绝越界标识。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
-已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
+已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
 卸载恢复均有真实 U-mode 验证。`kernel/syscall/mount.c` 当前只接受这两个 mount
 flags 和 flags=0 的 `umount2`；其他 flags 返回 `ENOTSUP`。bind/rbind、remount、
 move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/expire/nofollow
@@ -159,7 +159,7 @@ journal 路径已包含持久化屏障，不额外发设备 flush；无 journal 
 
 ## lwext4 配置和生命周期
 
-内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
+内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改。元数据修改前保留原内容，供 abort 恢复仍被引用的元数据缓冲；普通文件数据在私有新版本上修改，abort 只丢弃新版本，不再备份或改写旧数据缓存。有 journal 时，发生在日志提交前的分配或关联数据 I/O 失败完整回滚本次操作并返回实际错误；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 

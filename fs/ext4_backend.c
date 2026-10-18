@@ -174,7 +174,7 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count);
 
 static struct kernel_vfs_backend ext4_backend;
-int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
+static int ext4_check_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
 {
     if (!node || !node->instance || !node->mount ||
@@ -184,13 +184,6 @@ int kernel_ext4_check_io_domain(const struct kernel_vfs_node *node,
     return 0;
 }
 
-int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
-    const struct kernel_heap *heap,const struct physical_page_allocator *allocator)
-{
-    if (kernel_ext4_check_io_domain(node,heap,allocator) ||
-        !__atomic_load_n(&node->mapping_state,__ATOMIC_ACQUIRE)) return -KERNEL_EINVAL;
-    return 0;
-}
 static void initialize_backend(void);
 static int mount_error(const struct lwext4_mount_adapter *adapter)
 {
@@ -2462,6 +2455,7 @@ static void initialize_backend(void)
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;
     ops->readlink = ext4_backend_readlink;
+    ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;
     ops->fallocate = ext4_backend_fallocate;
     ops->prepare_write = ext4_backend_prepare_write;

@@ -340,6 +340,7 @@ COMMON_C_SOURCES := \
 	fs/procfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
+	fs/fat32.c \
 	fs/ext4_backend.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
@@ -1605,6 +1606,10 @@ test-allocator-cost-host:
 	done
 
 include tests/diff-abi/Makefile.inc
+
+.PHONY: test-fat32-host
+test-fat32-host:
+	sh tests/fat32-host.sh
 
 .PHONY: test-block-host
 test-block-host:

@@ -89,10 +89,15 @@ struct kernel_open_file_description;
 /* 回调返回负 errno；close_node 只释放私有 handle，不等待设备。
  * 后端分配的 node 必须位于同一堆对象首部，发布后由通用层回收。 */
 struct kernel_vfs_backend {
+    int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
+        const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
     int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
         const char *name, size_t length, uint64_t *inode, uint32_t *mode);
+    /* A backend with one directory entry per inode can expose several lookup
+     * spellings (VFAT long/short names). They share one canonical path owner. */
+    int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);
     int (*readlink)(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count);
     /* Object links resolve to a pinned path without a pathname relookup. */
     int (*follow_link)(struct kernel_vfs_node *node,
