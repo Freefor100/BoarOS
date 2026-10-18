@@ -3,6 +3,7 @@
 当前维护分支为 main 与 oscomp-compat，通用修复从 main 单向集成；
 旧专项名称仅保留历史输入、提交和结果身份。构建/监督入口见
 [兼容模块](../modules/oscomp-compat.md)。
+发布程序、调用方式、版本预期与判分差异集中见[评测问题](oscomp-test-issues.md)。
 
 ## 2026-10-17 CPU0 存储分批与同步等待集成
 
@@ -181,11 +182,11 @@ observer，分开记录采集器提交与实际内核提交；此操作本身不
 本次采集摘要的两侧 `supervision.timed_out` 均为0：没有完成的TIMEOUT-END记录，
 不能用总预算截止反推某个命令越过单项上限，或断言最后命令永久卡住。
 
-`ltp-skips.tsv`与旧兼容提交47cf15a完全一致，34项表的SHA-256仍为
+该次运行的 `ltp-skips.tsv` 与旧兼容提交47cf15a完全一致，34项表的SHA-256为
 `75b01a673bde74a003d1c92c3fb14476b2fefc55ca8ac79c6c1006208279ad2b`；
 本次已走到的区间两侧各命中27项。额外 `diagnostic_exclusions` 是空列表。
-静态跳过只涵盖已核实缺控制器/输入的辅助程序，有限但昂贵的压力测试没有因此
-自动进入跳过表。现有监督/跳过接入没有丢失，但不能保证两套完整LTP在3600秒跑完。
+该次静态跳过只涵盖缺控制器/输入的辅助程序。当前评测另按预算跳过fs_fill，
+见[评测问题](oscomp-test-issues.md#fs_fill评测预算取舍)。
 
 两侧的 `fs_fill` 均只报告一次TBROK，因准备 `test_dev.img` 返回ENOSYS而未运行主体。
 其他错误、skip和ELF loader阶段仍按原串口、shell状态与结构化观察归属；观察项计数
@@ -674,7 +675,7 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 以及批量读取、复制布局和无 FD 等待修复。双架构默认构建、兼容 uname、原盘 loader、
 监督/显式 shell 及 LA 调度 DSO 继续使用。LA 构建保留可覆盖的编译选项，接入 main 的
 统一锁调试配置。I/O 通路见 [VFS/ext4](../modules/vfs-ext4.md)；本轮 main 的五组普通内核
-吞吐与 USER_SMP 原程序比较见[数据路径实验](data-path-budget-experiments.md#通知完成与复制路径2026-10-17)。
+吞吐与 USER_SMP 原程序比较见[数据路径实验](data-path-budget-experiments.md#通知完成与复制路径348e4a7-记录)。
 它们直接在 main 测量，不是下面兼容分支原脚本的结果。
 
 2026-10-17 将上述 main 集成后重新构建，在兼容分支分别独占启动 RV、LA 的原 iozone

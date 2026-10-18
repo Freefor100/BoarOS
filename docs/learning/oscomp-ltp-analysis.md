@@ -11,6 +11,8 @@
 本文完整分数来自修复前 `7b6b88b` 的**本地无总时限诊断**，不是 3600 秒官方成绩。目录为 `build/oscomp-full-main-merge-20261017/`，整理输入为 `build/oscomp-feedback-20261018/`。两侧原脚本均走到末尾，但退出/文件系统一致性失败，所以这轮不是健康完成的基线。后续修复按下节运行原始 ftest01/ftest05、fallocate06/fs_fill 和直接相关短回归，没有重跑整套 LTP，也没有新的完整总分。
 
 当前官方双盘、无 RNG 设备的定向结果见[官方交付与原程序结果](oscomp-official-delivery.md)：basic 四组均100/102，24个LTP子集及全部磁盘检查已完成。下文保留此前完整运行和块空间批次的数据，用于解释原失败与修复。
+当前评测按预算跳过 `fs_fill`；测例、调用与版本预期差异见
+[评测输入与测例问题](oscomp-test-issues.md)。
 
 原输入、工具和运行身份继续以现有 `tests/oscomp/inputs.json`、运行 `identity.json/report.json` 为准，不把本地 QEMU 成绩与既有官方容器成绩混用。
 
@@ -307,8 +309,8 @@ LA/musl原始ELF在同一官方容器和原QEMU设备配置下完成：**199.273
 
 原四配置中，此项每架构的两种libc合计占RV约578秒、LA约444秒，即3600秒预算的
 16.1%和12.3%。它对写入接纳、满盘、持久化及资源回收很有价值；以预算内得分为目标，
-优先保留能换来更多通过断言的短例更划算。建议把fs_fill放在专门存储回归中执行，
-计分流程的取舍结合其前后测例及剩余预算决定。
+优先保留能换来更多通过断言的短例更划算。经用户确认，当前评测跳过fs_fill，
+保留为专项存储回归；配置及执行方式见[预算取舍](oscomp-test-issues.md#fs_fill评测预算取舍)。
 
 源码依据：[fs_fill.c](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/fs/fs_fill/fs_fill.c)、
 [tst_fill_fs.c](https://github.com/linux-test-project/ltp/blob/20240524/lib/tst_fill_fs.c)、
@@ -416,7 +418,10 @@ RV 17.59 秒、LA 17.49 秒；正常关机，heap-live=0，根盘、scratch 与�
 | mallocstress | RV 22–32 秒；LA 63–98 秒；1 分 | 60 线程分配负载，600 秒是上限而非必须跑满。需区分用户分配器、缺页、brk/mmap、线程调度，不能把全部时间归给内核分配器。 |
 | glibc float_* | 数十秒计算后 abort，0 分 | 原完整日志已出现 `libgcc_s.so.1` 缺失，pthread_exit/cancel 无法展开；是原镜像依赖问题，非后续短复现新增。musl 的 SIGSEGV 尚未归因，不能套用缺库结论。 |
 
-已有 helper 跳过表为 glibc 34 项、musl 31 项，属于调用契约过滤；它不依据时间，也不是 watchdog。300 秒单程序监督才是外层 watchdog，TERM 后 2 秒必要时 KILL。LTP 自己的 30/270 秒内部超时与总运行预算分别独立；本次总预算为 0，即禁用。
+上述完整运行时，helper 跳过表命中 glibc 34 项、musl 31 项，依据是辅助程序的调用条件。
+当前评测另按预算跳过fs_fill，完整清单与分类见[评测问题](oscomp-test-issues.md)。
+跳过发生在启动前；外层 watchdog 则在单程序运行300秒后发TERM，2秒后必要时KILL。
+LTP自身的30/270秒内部超时与总预算分别独立；上述完整诊断的总预算为0，即禁用。
 
 ## lmbench 测什么，以及怎样缩短反馈
 

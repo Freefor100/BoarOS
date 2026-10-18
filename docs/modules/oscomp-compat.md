@@ -4,7 +4,8 @@
 单向合入此分支。本分支保留兼容uname4.15.0、原盘启动配置、监督与判分。分支
 由oscomp-rv-compat更名，现行维护名称为oscomp-compat，与main共同保留。旧名称
 仅用于历史提交与RV专项结果身份；运行时DSO留在本分支，main默认不预加载。
-输入与逐次失败的证据边界见[评测学习记录](../learning/oscomp-compat-baseline.md)。
+原盘、调用与判分问题集中见[评测输入与测例问题](../learning/oscomp-test-issues.md)；
+历次结果和具体对照见[评测学习记录](../learning/oscomp-compat-baseline.md)。
 当前共同内核已集成 main 的 CPU 本地/raw、buddy/slab、代次等待和切换尾部；
 生产仍是单 CPU，业务对象与共享 MM 尚未完成跨核同步。
 
@@ -117,7 +118,8 @@ LTP 的临时脚本副本在原单项执行点调用监督程序，测例的参�
 默认 300 秒发 TERM，再等 2 秒后按需要 KILL 并回收，超时返回 124；准备错误返回 125
 并报告操作阶段。直接子进程结束后清理组内后代，脱离组的 daemon 由 PID1 退出路径处理。
 
-无参数运行时缺少控制程序的 helper 列在 ltp-skips.tsv，输出原因并返回 125；显式诊断排除
+共享 `ltp-skips.tsv` 过滤缺少控制器／输入的辅助程序，以及按评测预算跳过的 `fs_fill`，
+输出原因并返回 125；逐项依据见[评测问题](../learning/oscomp-test-issues.md)。显式诊断排除
 使用 EXCLUDE 记录。原 LA BusyBox 的 hush 脚本以显式返回值处理失败和循环结束，兼容其
 实际支持的 shell 功能。结果分析按原 judge 分数、LTP 断言、退出状态和计时记录说明表现。
 

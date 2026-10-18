@@ -1,5 +1,5 @@
 #!/bin/sh
-# 官方仍逐项遍历；只跳过已核实缺少控制器或输入的辅助程序，不伪造 LTP 结果。
+# 官方逐项遍历时应用共享跳过表，其余项目交给监督程序。
 # 原盘hush会把while的正常结束当作errexit；此适配器逐项显式检查失败。
 [ "$#" = 5 ] || exit 125
 runner=$1
@@ -9,7 +9,7 @@ shell=$4
 file=$5
 name=${file##*/}
 [ -r "$skips" ] || exit 125
-# 显式诊断排除与缺少控制器的辅助程序分开；默认为空，不制造通过结果。
+# 显式诊断排除独立于共享跳过表，默认为空。
 # 原LA盘hush没有set -f；赋值中按空格拆分，避免把literal排除名展开为路径。
 exclusions=${BOAROS_DIAGNOSTIC_EXCLUDE:-}
 while [ -n "$exclusions" ]; do

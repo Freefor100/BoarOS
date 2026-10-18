@@ -135,6 +135,22 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertIn('BOAROS-CASE SKIP', result.stderr)
         self.assertIn('cgroup_fj_proc', result.stderr)
 
+    def test_budget_policy_skips_fs_fill_for_both_libcs(self):
+        for libc in ('glibc', 'musl'):
+            with self.subTest(libc=libc):
+                program = Path(self.temp.name) / libc / 'fs_fill'
+                program.parent.mkdir()
+                program.write_text('#!/bin/sh\necho FILL-WORKLOAD-RAN\n')
+                program.chmod(0o755)
+                result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+                    str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('BOAROS-CASE SKIP', result.stderr)
+                self.assertIn('reason=evaluation-time-budget', result.stderr)
+                self.assertIn('source=testcases/kernel/fs/fs_fill/fs_fill.c', result.stderr)
+
     def test_unlisted_case_keeps_native_exit_and_output(self):
         program = Path(self.temp.name) / 'ordinary-test'
         program.write_text('#!/bin/sh\necho real-result\nexit 7\n')

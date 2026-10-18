@@ -1,5 +1,6 @@
 # ltp-full-20240524; fixed pre-2025 source in references/oscomp-testsuits.
-# Only direct no-argument execution is skipped; controllers themselves still run.
+# Policy for the official flat, no-argument enumeration; reasons are per entry.
+# See docs/learning/oscomp-test-issues.md for invocation contracts and budget choices.
 # name	source	reason
 cgroup_fj_proc	testcases/kernel/controllers/cgroup_fj/cgroup_fj_proc.c	controller-SIGUSR1-required
 cgroup_regression_3_1.sh	testcases/kernel/controllers/cgroup/cgroup_regression_3_1.sh	controller-stop-signal-required
@@ -28,6 +29,7 @@ fs_racer_file_list.sh	testcases/kernel/fs/racer/fs_racer_file_list.sh	unbounded-
 fs_racer_file_rename.sh	testcases/kernel/fs/racer/fs_racer_file_rename.sh	unbounded-racer-worker-requires-controller
 fs_racer_file_rm.sh	testcases/kernel/fs/racer/fs_racer_file_rm.sh	unbounded-racer-worker-requires-controller
 fs_racer_file_symlink.sh	testcases/kernel/fs/racer/fs_racer_file_symlink.sh	unbounded-racer-worker-requires-controller
+fs_fill	testcases/kernel/fs/fs_fill/fs_fill.c	evaluation-time-budget
 memcg_test_2	testcases/kernel/controllers/memcg/regression/memcg_test_2.c	controller-SIGUSR1-and-kill-required
 memcg_test_4	testcases/kernel/controllers/memcg/regression/memcg_test_4.c	controller-SIGUSR1-and-kill-required
 pids_task2	testcases/kernel/controllers/pids/pids_task2.c	controller-kill-required
