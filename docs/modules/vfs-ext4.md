@@ -161,7 +161,29 @@ journal 路径已包含持久化屏障，不额外发设备 flush；无 journal 
 
 内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
 
-事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改。元数据修改前保留原内容，供 abort 恢复仍被引用的元数据缓冲；普通文件数据在私有新版本上修改，abort 只丢弃新版本，不再备份或改写旧数据缓存。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
+事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改。元数据修改前保留原内容，供 abort 恢复仍被引用的元数据缓冲；普通文件数据在私有新版本上修改，abort 只丢弃新版本，不再备份或改写旧数据缓存。有 journal 时，发生在日志提交前的分配或关联数据 I/O 失败完整回滚本次操作并返回实际错误；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
+
+namespace 的创建、mkdir、mknod、rename、link、symlink、unlink 和 rmdir 通过
+`ext4_metadata_execute` 执行完整原子操作；chown 删除外部 capability EA 也复用同一
+执行核心。开始时的固定 credits 只保证基本准入，目录增长或位图等后续修改仍可能
+遇到硬预算。只有外层操作返回 ENOMEM、本次成功开始之后预算拒绝计数增加、私有
+事务已完整 abort 且 journal 没有持久错误时，才释放后端锁等待旧组的 checkpoint，
+并从整个操作起点重做。没有待回收旧组或 checkpoint 未能前进时保留错误；单次操作
+自身超过预算、真实物理 OOM、ENOSPC 和设备 EIO 不因此变成无限重试。嵌套操作不
+自行等待或重做，由仍持有修改的外层决定回滚；事务开始失败沿用原准入错误。
+
+每次重做前重新初始化未发布的临时 handle 和输出，创建同时完成 mode 设置；只有
+最终成功才发布 VFS 节点、rename 结果、时间值和 live orphan 责任。chown 的文件
+同步序号在同一 mount guard 内、外层成功接纳后发布，等待时只保留执行入口的锁层。
+无 journal 时没有上述回滚重做；各操作保留原边界，原本依赖显式 journal 事务的
+create、mkdir、mknod 仍返回 EOPNOTSUPP。
+
+`FALLOCATE_HOST_CASE=namespace-budget FALLOCATE_HOST_JOURNALS=journal sh tests/fallocate-host.sh`
+在 4/16 KiB 页和 1/4 KiB 块上让上述操作实际遭遇硬预算，检查 checkpoint 后成功、
+mode/身份/链接与已打开 orphan 内容、chown capability 和同步依赖；另检查单操作
+超预算、显式外层嵌套、真实物理 OOM 和设备读 EIO 的错误与回滚、旧内容、资源归还
+及 e2fsck。`sh tests/lwext4-metadata-host.sh ownership` 另覆盖共享 EA、所有权更改的
+分配失败和持久化错误。
 
 `ext4_journal_group_enable/commit/checkpoint/drain` 由可写 journal mount 的两个 joinable 线程驱动：
 commit 线程处理封口与日志提交，checkpoint 线程处理已持久前缀的 home 写入和日志回收。

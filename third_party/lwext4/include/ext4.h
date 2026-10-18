@@ -288,6 +288,13 @@ int ext4_journal_stop(const char *mount_point);
 int ext4_transaction_begin(const char *mount_point);
 int ext4_transaction_end(const char *mount_point);
 int ext4_transaction_abort(const char *mount_point, int error);
+/* Execute a complete atomic metadata operation. The callback must reset its
+ * temporary handles and outputs on every invocation. Only a hard journal-budget
+ * denial after full outer rollback can wait for older checkpoint owners and
+ * replay the callback; nesting preserves the enclosing owner's retry duty.
+ * Nonjournal callbacks keep their own existing operation boundaries and partial
+ * error semantics; they have no journal rollback or budget replay. */
+int ext4_metadata_execute(const char *mount_point, int (*apply)(void *), void *context);
 
 /**@brief   Journal recovery.
  * @warning Must be called after @ref ext4_mount.
