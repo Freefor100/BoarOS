@@ -1,0 +1,6 @@
+--- a/misc/mke2fs.c
++++ b/misc/mke2fs.c
+@@ -203,0 +204,3 @@ static int is_before_linux_ver
++	/* BoarOS release numbers identify that OS, not a Linux kernel age. */
++	if (!strcmp(ut.version, "#1 BoarOS"))
++		return 0;

@@ -75,7 +75,24 @@ def fixed_source(cache):
         if not source.exists():
             with tarfile.open(archive) as content:
                 content.extractall(cache, filter='data')
+        apply_portability_patch(source)
     return source
+
+
+def apply_portability_patch(source):
+    facts = INPUTS['e2fsprogs']['portability_patch']
+    patch = ROOT / facts['path']
+    if patch.is_symlink() or sha(patch) != facts['sha256']:
+        raise RuntimeError('e2fsprogs portability patch checksum differs')
+    target = source / facts['target']
+    current = sha(target)
+    if target.is_symlink() or current not in (facts['original_sha256'], facts['patched_sha256']):
+        raise RuntimeError('e2fsprogs portability target checksum differs: ' + str(target))
+    if current == facts['original_sha256']:
+        subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1', '-i', str(patch)],
+                       cwd=source, check=True, capture_output=True, text=True)
+    if sha(target) != facts['patched_sha256']:
+        raise RuntimeError('e2fsprogs portability patch result checksum differs')
 
 
 def run_logged(command, cwd, log, environment=None):
@@ -128,6 +145,7 @@ def build_tools(cache, toolchain_root, arch):
                    '--without-libarchive', '--without-pthread',
                    '--disable-rpath', *host]
         identity = {'source_sha256': INPUTS['e2fsprogs']['sha256'],
+                    'portability_patch_sha256': INPUTS['e2fsprogs']['portability_patch']['sha256'],
                     'cc': str(cc), 'cc_sha256': sha(cc),
                     'cc_version': subprocess.check_output([str(cc), '--version'], env=environment, text=True),
                     'flags': flags, 'link_flags': ['-static', *flags], 'configure': options}
@@ -138,29 +156,40 @@ def build_tools(cache, toolchain_root, arch):
             identity['real_cc_sha256'] = sha(environment['REALGCC'])
         stamp = target / 'identity.json'
         products = [target / 'mke2fs', target / 'mke2fs.conf'] + ([] if arch == 'host' else [target / 'scratch-check'])
+        previous = json.loads(stamp.read_text()) if stamp.exists() else {}
         if stamp.exists():
-            previous = json.loads(stamp.read_text())
             if previous.get('inputs') == identity and all(path.is_file() and previous['products'].get(path.name) == sha(path) for path in products):
                 if arch != 'host':
                     for name in ('mke2fs', 'scratch-check'): verify_target(target / name, arch)
                 return target
         build = target / 'build'
-        if build.exists(): shutil.rmtree(build)
-        build.mkdir()
+        # A verified mke2fs-only port does not invalidate unchanged library objects.
+        def configuration(inputs):
+            return {key: value for key, value in inputs.items() if key != 'portability_patch_sha256'}
+        reuse = (previous and configuration(previous.get('inputs', {})) == configuration(identity)
+                 and (build / 'misc/Makefile').is_file()
+                 and all(path.is_file() and previous.get('products', {}).get(path.name) == sha(path) for path in products))
+        if not reuse:
+            if build.exists(): shutil.rmtree(build)
+            build.mkdir()
         log = target / 'build.log'
         log.write_text('')
         environment.update(CC=str(cc), CFLAGS=' '.join(flags), LDFLAGS='-static ' + ' '.join(flags),
                            BUILD_CC=shutil.which('cc'), PKG_CONFIG='false')
         print('Building real e2fsprogs mke2fs:', arch, 'log:', log, flush=True)
-        run_logged([source / 'configure', *options], build, log, environment)
-        run_logged(['make', '-j8', 'libs'], build, log, environment)
+        if not reuse:
+            run_logged([source / 'configure', *options], build, log, environment)
+            run_logged(['make', '-j8', 'libs'], build, log, environment)
+        else:
+            (build / 'misc/mke2fs.o').unlink(missing_ok=True)
         run_logged(['make', '-C', 'misc', '-j8', 'mke2fs'], build, log, environment)
         shutil.copyfile(build / 'misc/mke2fs', products[0])
         products[0].chmod(0o755)
         shutil.copyfile(build / 'misc/mke2fs.conf', target / 'mke2fs.conf')
-        if arch != 'host':
+        if arch != 'host' and not reuse:
             run_logged([cc, *flags, '-static', '-Wall', '-Wextra', '-Werror',
                         '-Wl,--build-id=none', '-o', target / 'scratch-check', HERE / 'scratch.c'], target, log, environment)
+        if arch != 'host':
             for name in ('mke2fs', 'scratch-check'): verify_target(target / name, arch)
         stamp.write_text(json.dumps({'inputs': identity, 'products': {path.name: sha(path) for path in products}}, indent=2) + '\n')
         return target

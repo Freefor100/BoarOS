@@ -28,7 +28,14 @@
     "version": "1.47.2",
     "url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/e2fsprogs-1.47.2.tar.xz",
     "sha256": "08242e64ca0e8194d9c1caad49762b19209a06318199b63ce74ae4ef2d74e63c",
-    "checksums_url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/sha256sums.asc"
+    "checksums_url": "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/sha256sums.asc",
+    "portability_patch": {
+      "path": "tests/oscomp/e2fsprogs-boaros-uname.patch",
+      "sha256": "ae04c082c8c37eb3e012b10010cfb213fc03ea5678b3d7c1b543aa10aae1aa94",
+      "target": "misc/mke2fs.c",
+      "original_sha256": "48f60b0aef7170a178d753813dc081b2e946ff35480267b60ef3901b1c362e5b",
+      "patched_sha256": "fef0edf19e0309c26f249cf88fd4bc12d1cb498a8d847c505a203080aecbeee4"
+    }
   },
   "architectures": {
     "riscv": {

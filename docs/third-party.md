@@ -48,7 +48,12 @@ e2fsprogs 作为本地 OSComp 双盘环境的外部构建输入使用：版本�
 归档 URL、SHA-256 与官方校验清单地址集中记录于 `tests/oscomp/inputs.json`。
 `tests/oscomp/local_disks.py` 在忽略的 `build/tools/oscomp-local/` 校验并解包原版
 源码，复用已有 RV/LA musl 工具链，启用上游私有 uuid/blkid，构建真正的静态
-`mke2fs`；同源宿主工具创建 ext4 scratch 模板。原版源码和配置均不修改或导入 Git。
+`mke2fs`；同源宿主工具创建 ext4 scratch 模板。官方归档保持原 SHA-256，配置
+不修改；唯一移植补丁为 `tests/oscomp/e2fsprogs-boaros-uname.patch`，其 SHA-256 和
+目标文件修改前后的 SHA-256 同样集中维护于输入清单。补丁仅让 `is_before_linux_ver`
+将 UTS version `#1 BoarOS` 识别为未知 Linux 年代，避免把 BoarOS 自身的 release
+误判为旧 Linux 后生成 revision 0 文件系统；真实 Linux 的版本检查和 feature
+选择保留。上游源码不导入 Git，构建验证补丁后按需重编 mke2fs 对象，保留既有库。
 许可按归档 `NOTICE`：工具 GPL-2.0，ext2fs/e2p 库 LGPL-2.0，uuid 为 BSD 风格，
 et/ss 为 MIT 风格，保留所有上游许可。仅向每次运行的根盘副本写入工具和配置，
 不改原比赛镜像、LTP 程序或官方设备配置；用法见[评测模块](modules/oscomp-compat.md)。

@@ -40,6 +40,14 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 缺失时明确报错。`OSCOMP_TOOLCHAIN_ROOT` 可指向已有工具链的仓库根目录，
 `OSCOMP_LOCAL_CACHE` 可指定共享工具缓存；不在 worktree 中重复构建它们。
 
+工具以固定 e2fsprogs 源归档加一项可核对的 BoarOS 移植补丁构建。上游
+`is_before_linux_ver` 原先直接把 release 当成 Linux 版本，BoarOS 的自身版本号
+会因此被当作 Linux 2.2 以前的内核，使 `-t ext4` 也退成 revision 0、无 feature
+的文件系统。补丁按 UTS version `#1 BoarOS` 识别平台，将其 Linux 年代视为未知，
+沿用上游非 Linux 路径的判断结果；真实 Linux 的新旧版本判断保持。补丁 SHA-256、
+目标源码修改前后的 SHA-256 和工具构建身份均被核对，重复准备不重复修改源码，
+仅补丁改变时保留库并重编 mke2fs。内核的 release 身份及原格式化参数不变。
+
 `make run-riscv`、`make debug-riscv`、`make run-loongarch` 与 `tests/oscomp/run.py` 共用
 `local_disks.py`：每次生成新运行目录，把保留根盘和该架构 scratch 模板复制成
 两个独立可写文件。复制使用 `cp --reflink=never --sparse=never` 并 fsync，宿主
