@@ -756,7 +756,7 @@ static void admission_fault(struct kernel_page_cache *cache,struct kernel_heap *
         if (legacy) admission_legacy(mount,&file);
         struct kernel_uaccess_iovec source={.base=0x900000,.length=BOAROS_PAGE_SIZE};
         struct kernel_vfs_user_write_result result;
-        assert(!kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,&result));
+        assert(!kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,NULL,&result));
         assert(result.access==KERNEL_UACCESS_STATUS_FAULT && !result.written && !result.end_offset);
         struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && (legacy?!stat.blocks:stat.blocks>0));
         uint64_t observed=0;assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_error_sequence(&file));
@@ -768,7 +768,7 @@ static void admission_fault(struct kernel_page_cache *cache,struct kernel_heap *
         struct kernel_vfs_statfs before,after;assert(!kernel_vfs_mount_statfs(mount,&before));
         struct kernel_uaccess_iovec source={.base=0x900000,.length=BOAROS_PAGE_SIZE};
         struct kernel_vfs_user_write_result result; fail_complete=1;
-        assert(kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,&result)==-KERNEL_EIO && !fail_complete);
+        assert(kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,NULL,&result)==-KERNEL_EIO && !fail_complete);
         assert(result.access==KERNEL_UACCESS_STATUS_FAULT && !result.written && !kernel_vfs_error_sequence(&file));
         struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && stat.blocks);
         if (cleanup==1) assert(!kernel_vfs_unlink(mount,name));

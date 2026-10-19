@@ -110,6 +110,15 @@ void abi_core_limit_cases(void)
     abi_require(!core_set(child,999) && !core_get(child,&value));
     core_check("core.other-target",value.current==999);
     abi_require(!SC2(129,child,9) && SC4(260,child,&status,0,0)==child);
+    child=CALL(220,17,0,0,0,0,0);abi_require(child>=0);
+    if (!child) abi_exit(57);
+    unsigned char info[128];
+    abi_require(!SC5(95,1,child,info,0x1000004,0));
+    result=core_get(child,&value);
+    abi_record("core.zombie-get",result,result==0 ? (long)value.current : -1,-1,0,0,0);
+    abi_record("core.zombie-set",core_set(child,77),-1,-1,0,0,0);
+    abi_require(SC4(260,child,&status,0,0)==child);
+    abi_record("core.reaped-get",core_get(child,&value),-1,-1,0,0,0);
     abi_require(!SC4(261,0,4,&saved,0) && !core_get(0,&value));
     core_check("core.restore",value.current==saved.current && value.maximum==saved.maximum);
 }

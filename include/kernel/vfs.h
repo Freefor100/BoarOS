@@ -10,6 +10,12 @@
 #include <stdint.h>
 
 struct kernel_vfs_node;
+/* 单次用户操作借用调用者的限额；后台写回不重新套用它。
+ * exceeded只报告限额拒绝，文件系统自身的最大尺寸错误保持独立。 */
+struct kernel_vfs_size_limit {
+    uint64_t maximum;
+    unsigned exceeded;
+};
 
 #define KERNEL_VFS_S_IFMT UINT32_C(0170000)
 #define KERNEL_VFS_S_IFREG UINT32_C(0100000)
@@ -107,7 +113,8 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner);
 uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path);
-int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size);
+int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
+    struct kernel_vfs_size_limit *limit);
 uint32_t kernel_vfs_path_mode(const struct kernel_vfs_path *path);
 int kernel_vfs_path_readlink(struct kernel_vfs_path *path, char *buffer, size_t size, size_t *read);
 int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
@@ -274,7 +281,8 @@ struct kernel_vfs_user_write_result {
  * 用户fault保留已提交前缀，内部uaccess错误单独报告，不转换为磁盘I/O错误。 */
 int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
     const struct kernel_uaccess_iovec *,size_t iov_count,size_t count,
-    uint64_t offset,int append,struct kernel_vfs_user_write_result *);
+    uint64_t offset,int append,struct kernel_vfs_size_limit *,
+    struct kernel_vfs_user_write_result *);
 
 #define KERNEL_VFS_FALLOC_KEEP_SIZE 1U
 #define KERNEL_VFS_FALLOC_PUNCH_HOLE 2U

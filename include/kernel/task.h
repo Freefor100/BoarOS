@@ -88,6 +88,8 @@ enum kernel_task_status kernel_task_set_rlimit(
 
 /* Current user task's stack soft limit; default capacity for kernel setup. */
 uint64_t kernel_task_current_stack_limit(void);
+/* Snapshot at the original user request; internal kernel I/O has no file limit. */
+uint64_t kernel_task_current_fsize_limit(void);
 
 enum kernel_task_status kernel_task_ppid(
     const struct kernel_task *task,

@@ -24,7 +24,7 @@ RV 两核调度支持受控内核任务和独立 `kernel-rv-user-smp` 的真实�
 | 文件系统与挂载 | ext4、FAT32/VFAT、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount、只读与普通忙卸载 | 挂载扩展见[开发路线](docs/goals.md)；[VFS](docs/modules/vfs-ext4.md)、[VFAT](docs/modules/fat32.md)、[tmpfs](docs/modules/tmpfs.md) |
 | 存储 | VirtIO 批量 I/O、flush/reset；MBR 主分区、用户态块设备、真实文件后备 loop；页缓存、压力回收、ext4 日志及空间预留／打洞 | RV MMIO、LA modern PCI；[块设备与 loop](docs/modules/riscv-virtio-block.md)、[文件系统与缓存](docs/modules/vfs-ext4.md) |
 | 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
-| 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
+| 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK/CORE/FSIZE、capget查询 | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
 2026-10-14 本地默认单核组合复核：RV/LA在512MiB、1GiB下的BoarOS各完成 **229 项原程序**；RV 1GiB和LA双RAM的同ELF联合对照全部通过。RV 512MiB固定Linux原BusyBox脚本的`du`动态`/proc`遍历失败，该组保留`reference-not-pass`，BoarOS该组成功；此前LA参考失败也保留原证据，详见[程序基线](docs/learning/user-program-inventory.md)。
 两侧各 **1400 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。

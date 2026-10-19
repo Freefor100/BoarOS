@@ -57,7 +57,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     }
     target = pid == 0 ? caller :
              pid > 0 && pid <= INT32_MAX
-                 ? kernel_signal_find_by_tid((kernel_pid_t)pid) : 0;
+                 ? kernel_task_find_by_tid((kernel_pid_t)pid) : 0;
     struct kernel_task *lookup __attribute__((cleanup(lookup_end))) = pid > 0 ? target : 0;
     if (target == 0) {
         decoded->value = -KERNEL_ESRCH;
@@ -68,7 +68,8 @@ enum kernel_syscall_status syscall_handle_prlimit64(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (resource != KERNEL_RLIMIT_NOFILE &&
-        resource != KERNEL_RLIMIT_STACK && resource != KERNEL_RLIMIT_CORE) {
+        resource != KERNEL_RLIMIT_STACK && resource != KERNEL_RLIMIT_CORE &&
+        resource != KERNEL_RLIMIT_FSIZE) {
         decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
     }

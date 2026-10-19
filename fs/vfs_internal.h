@@ -9,6 +9,8 @@
 #include <stdint.h>
 
 struct kernel_vfs_file;
+struct kernel_vfs_size_limit;
+int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *, uint64_t, size_t *);
 struct kernel_memory_object;
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file);
 struct kernel_page_cache;
@@ -97,9 +99,9 @@ int kernel_vfs_node_try_read(struct kernel_vfs_node *node, struct kernel_lock_gu
 void kernel_vfs_namespace_lock(struct kernel_vfs_mount *mount, struct kernel_lock_guard *guard);
 /* 调用者已取得write_operation，CPU0执行者只借用，不能排队后再等同一门闩。 */
 int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *, uint64_t,
-    const struct kernel_lock_guard *);
+    const struct kernel_lock_guard *, struct kernel_vfs_size_limit *);
 int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *, unsigned,
-    uint64_t, uint64_t, const struct kernel_lock_guard *);
+    uint64_t, uint64_t, const struct kernel_lock_guard *, struct kernel_vfs_size_limit *);
 /* Whole syscall write/truncate gate; rank 15, before namespace/inode locks. */
 void kernel_vfs_file_write_lock(struct kernel_vfs_file *file,
     struct kernel_lock_guard *guard);

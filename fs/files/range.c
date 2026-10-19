@@ -5,12 +5,14 @@
 #include <kernel/errno.h>
 #include <kernel/page_cache.h>
 #include <kernel/scheduler.h>
+#include <kernel/task.h>
 #include <arch/context.h>
 #include <arch/platform_io.h>
 
 struct fallocate_call {
     struct kernel_vfs_file *file;
     const struct kernel_lock_guard *operation;
+    struct kernel_vfs_size_limit *size_limit;
     uint64_t offset, length;
     unsigned mode;
     int result;
@@ -19,7 +21,7 @@ static void fallocate_cpu0(void *argument)
 {
     struct fallocate_call *call = argument;
     call->result = kernel_vfs_fallocate_borrowing(call->file,call->mode,
-        call->offset,call->length,call->operation);
+        call->offset,call->length,call->operation,call->size_limit);
 }
 
 enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
@@ -29,6 +31,7 @@ enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
     if (!kernel_files_is_live(files) || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     KERNEL_FILES_PIN_SCOPE(pin);
     struct kernel_open_file_description *file = kernel_files_hold_fd(files,fd,&pin);
+    struct kernel_vfs_size_limit limit={.maximum=kernel_task_current_fsize_limit()};
     *linux_result = -KERNEL_EBADF;
     if (!file) return KERNEL_FILES_STATUS_OK;
     if (offset < 0 || length <= 0) {
@@ -54,11 +57,12 @@ enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&file->file,&operation);
         struct fallocate_call call = {.file=&file->file,.operation=&operation,
-            .offset=(uint64_t)offset,.length=(uint64_t)length,.mode=mode,.result=-KERNEL_EIO};
+            .offset=(uint64_t)offset,.length=(uint64_t)length,.mode=mode,.result=-KERNEL_EIO,.size_limit=&limit};
         if (kernel_page_cache_run_cpu0_borrowing(kernel_open_file_page_cache(file),
                 fallocate_cpu0,&call,&operation)) return KERNEL_FILES_STATUS_STATE;
         *linux_result = call.result;
-    } else *linux_result = kernel_vfs_fallocate(&file->file,mode,(uint64_t)offset,(uint64_t)length);
+    } else *linux_result = kernel_vfs_fallocate_borrowing(&file->file,mode,(uint64_t)offset,(uint64_t)length,NULL,&limit);
+    kernel_files_size_limit_notify(&limit);
     /* 范围事务接纳后先归还写操作资格，再等待本 OFD 的完整持久目标。
      * O_DSYNC 也可能修改分配和 EOF；与 O_SYNC 共用完整文件同步。 */
     if (!*linux_result && (file->open_flags & KERNEL_FILES_O_DSYNC))

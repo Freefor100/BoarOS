@@ -13,4 +13,7 @@ core.exec-inherit
 core.nonleader-exec
 core.leader-exit
 core.other-target
+core.zombie-get
+core.zombie-set
+core.reaped-get
 core.restore

@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/selected.c tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/core_limit.c tests/diff-abi/capability.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c tests/diff-abi/waitid.c tests/diff-abi/usage.c tests/diff-abi/cpu_clock.c tests/diff-abi/itimer.c
+DIFF_ABI_SOURCES := tests/diff-abi/selected.c tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/core_limit.c tests/diff-abi/fsize.c tests/diff-abi/capability.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c tests/diff-abi/waitid.c tests/diff-abi/usage.c tests/diff-abi/cpu_clock.c tests/diff-abi/itimer.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -215,27 +215,41 @@ build/diff-abi/core-limit-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/ris
 build/loongarch/core-limit-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld
 	@mkdir -p $(@D)
 	$(LA_CC) $(LA_FLAGS) -DABI_CORE_LIMIT_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
-.PHONY: test-core-limit-abi-riscv test-core-limit-abi-loongarch test-core-limit-smp-riscv
+.PHONY: test-core-limit-abi-riscv test-core-limit-abi-loongarch
 test-core-limit-abi-riscv: $(KERNEL_RV) build/diff-abi/core-limit-rv
 	python3 -B tests/diff-abi/harness.py --kernel $(KERNEL_RV) --program build/diff-abi/core-limit-rv --case-manifest tests/diff-abi/core-limit-cases.txt --timeout 30 $(TEST_MEMORY_ARGS) --output build/core-limit-abi-rv
 test-core-limit-abi-loongarch: kernel-la build/loongarch/core-limit-la prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/core-limit-la --case-manifest tests/diff-abi/core-limit-cases.txt --timeout 30 $(TEST_MEMORY_ARGS) --output build/core-limit-abi-la
-test-core-limit-smp-riscv: build/diff-abi/core-limit-rv
-	$(MAKE) kernel-rv-user-smp
-	python3 -B tests/smp/user.py --kernel build/riscv-user-smp/kernel-rv --program build/diff-abi/core-limit-rv --manifest tests/diff-abi/core-limit-cases.txt --require-parallel --firmware $(QEMU_RISCV_FIRMWARE) $(TEST_MEMORY_ARGS)
-
-
 build/diff-abi/capability-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
 	$(CC) -march=rv64gc -mabi=lp64d -DABI_CAPABILITY_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
 build/loongarch/capability-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld
 	@mkdir -p $(@D)
 	$(LA_CC) $(LA_FLAGS) -DABI_CAPABILITY_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
-.PHONY: test-capability-abi-riscv test-capability-abi-loongarch test-capability-smp-riscv
+.PHONY: test-capability-abi-riscv test-capability-abi-loongarch
 test-capability-abi-riscv: $(KERNEL_RV) build/diff-abi/capability-rv
 	python3 -B tests/diff-abi/harness.py --kernel $(KERNEL_RV) --program build/diff-abi/capability-rv --case-manifest tests/diff-abi/capability-cases.txt --timeout 30 $(TEST_MEMORY_ARGS) --output build/capability-abi-rv
 test-capability-abi-loongarch: kernel-la build/loongarch/capability-la prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/capability-la --case-manifest tests/diff-abi/capability-cases.txt --timeout 30 $(TEST_MEMORY_ARGS) --output build/capability-abi-la
-test-capability-smp-riscv: build/diff-abi/capability-rv
-	$(MAKE) kernel-rv-user-smp
-	python3 -B tests/smp/user.py --kernel build/riscv-user-smp/kernel-rv --program build/diff-abi/capability-rv --manifest tests/diff-abi/capability-cases.txt --require-parallel --firmware $(QEMU_RISCV_FIRMWARE) $(TEST_MEMORY_ARGS)
+build/diff-abi/fsize-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) -march=rv64gc -mabi=lp64d -DABI_FSIZE_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/fsize-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_FSIZE_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+.PHONY: test-fsize-abi-riscv test-fsize-abi-loongarch
+test-fsize-abi-riscv: $(KERNEL_RV) build/diff-abi/fsize-rv
+	python3 -B tests/diff-abi/harness.py --kernel $(KERNEL_RV) --program build/diff-abi/fsize-rv --case-manifest tests/diff-abi/fsize-cases.txt --timeout 30 $(TEST_MEMORY_ARGS) --output build/fsize-abi-rv
+test-fsize-abi-loongarch: kernel-la build/loongarch/fsize-la prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/fsize-la --case-manifest tests/diff-abi/fsize-cases.txt --timeout 30 $(TEST_MEMORY_ARGS) --output build/fsize-abi-la
+
+build/diff-abi/resource-limits-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) -march=rv64gc -mabi=lp64d -DABI_RESOURCE_LIMITS_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/diff-abi/resource-limits-cases.txt: tests/diff-abi/core-limit-cases.txt tests/diff-abi/capability-cases.txt tests/diff-abi/fsize-cases.txt tests/diff-abi/itimer-cases.txt
+	@mkdir -p $(@D)
+	cat $^ > $@
+.PHONY: test-resource-limits-smp-riscv
+test-resource-limits-smp-riscv: build/diff-abi/resource-limits-rv build/diff-abi/resource-limits-cases.txt
+	$(MAKE) SMP=1 USER_SMP=1 build/riscv-user-smp/kernel-rv
+	python3 -B tests/smp/user.py --kernel build/riscv-user-smp/kernel-rv --program build/diff-abi/resource-limits-rv --manifest build/diff-abi/resource-limits-cases.txt --require-parallel --firmware $(QEMU_RISCV_FIRMWARE) $(TEST_MEMORY_ARGS)

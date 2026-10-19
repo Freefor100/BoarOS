@@ -189,6 +189,10 @@ void abi_main(const unsigned long *initial_stack)
         usize index = 0;
         while (marker[index] && argument[index] == marker[index]) ++index;
         if (!marker[index] && !argument[index]) abi_limit_exec_probe();
+        static const char fsize_marker[]="fsize-exec";
+        index=0;
+        while (fsize_marker[index] && argument[index]==fsize_marker[index]) ++index;
+        if (!fsize_marker[index] && !argument[index]) abi_fsize_exec_probe();
         static const char core_marker[] = "core-limit-exec";
         index=0;
         while (core_marker[index] && argument[index]==core_marker[index]) ++index;
@@ -222,7 +226,14 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#if defined(ABI_CAPABILITY_ONLY)
+#if defined(ABI_RESOURCE_LIMITS_ONLY)
+    abi_core_limit_cases();
+    abi_capability_cases();
+    abi_fsize_cases();
+    abi_itimer_cases();
+#elif defined(ABI_FSIZE_ONLY)
+    abi_fsize_cases();
+#elif defined(ABI_CAPABILITY_ONLY)
     abi_capability_cases();
 #elif defined(ABI_CORE_LIMIT_ONLY)
     abi_core_limit_cases();
@@ -279,6 +290,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_limit_cases();
     abi_core_limit_cases();
     abi_capability_cases();
+    abi_fsize_cases();
     identity_cases();
     abi_device_cases();
     abi_sync_cases();

@@ -8,6 +8,7 @@
 #include <kernel/heap.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
+#include <kernel/task.h>
 
 #include <string.h>
 
@@ -83,7 +84,9 @@ enum kernel_files_status kernel_files_truncate(
     enum kernel_files_status status = copy_metadata_path(files, fs, mm,
         KERNEL_FS_AT_FDCWD, user_path, 0, &path, &result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
-    if (!result) result = kernel_vfs_path_truncate(path, (uint64_t)length);
+    struct kernel_vfs_size_limit limit={.maximum=kernel_task_current_fsize_limit()};
+    if (!result) result = kernel_vfs_path_truncate(path, (uint64_t)length, &limit);
+    kernel_files_size_limit_notify(&limit);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }
