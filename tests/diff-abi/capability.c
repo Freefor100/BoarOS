@@ -80,6 +80,18 @@ static long cap_swap_kib(const char *data, long length)
     return -1;
 }
 
+static long cap_pid_max(const char *data, long length)
+{
+    if (length < 2 || data[length - 1] != '\n') return -1;
+    long value = 0;
+    for (long i = 0; i < length - 1; ++i) {
+        if (data[i] < '0' || data[i] > '9') return -1;
+        value = value * 10 + data[i] - '0';
+        if (value > 0x7fffffffL) return -1;
+    }
+    return value > 0 ? value : -1;
+}
+
 void abi_capability_cases(void)
 {
     struct cap_header header = {CAP_VERSION_3, 0};
@@ -225,5 +237,33 @@ void abi_capability_cases(void)
     long length = SC3(63, fd, status, sizeof(status));
     abi_record("capget.proc-vmswap", length < 0 ? length : 0,
                length > 0 ? cap_swap_kib(status, length) : -1, -1, 0, 0, 0);
+    abi_require(!SC1(57, fd));
+    fd = abi_open("/cap-proc/sys/kernel/pid_max", 0);
+    length = fd >= 0 ? SC3(63, fd, status, sizeof(status)) : fd;
+    long maximum = length > 0 ? cap_pid_max(status, length) : -1;
+    abi_record("capget.proc-pidmax", length < 0 ? length : 0,
+               maximum > SC0(178), -1, 0, 0, 0);
+    header = (struct cap_header){CAP_VERSION_3, (int)maximum};
+    result = maximum > 0 ? SC2(90, &header, data) : length < 0 ? length : -1;
+    abi_record("capget.pidmax-unused", result, -1, -1, 0, 0, 0);
+    if (fd >= 0) abi_require(!SC1(57, fd));
+
+    fd = abi_open("/cap-proc/sys/kernel", 0x10000);
+    abi_require(fd >= 0);
+    int listed = 0;
+    while ((length = SC3(61, fd, status, sizeof(status))) > 0) {
+        for (long at = 0; at + 19 < length;) {
+            unsigned short record = (unsigned char)status[at + 16] |
+                ((unsigned short)(unsigned char)status[at + 17] << 8);
+            abi_require(record >= 20 && at + record <= length);
+            static const char wanted[] = "pid_max";
+            unsigned i = 0;
+            while (i < sizeof(wanted) && at + 19 + i < at + record &&
+                   status[at + 19 + i] == wanted[i]) ++i;
+            if (i == sizeof(wanted) && status[at + 18] == 8) listed = 1;
+            at += record;
+        }
+    }
+    abi_record("capget.proc-pidmax-listed", length, listed, -1, 0, 0, 0);
     abi_require(!SC1(57, fd) && !SC2(39, path, 0) && !SC3(35, -100, path, 0x200));
 }

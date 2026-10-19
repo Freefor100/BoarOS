@@ -49,6 +49,8 @@ struct kernel_proc_process_snapshot {
 
 /* Identity changes on PID reuse; zero asks for the current allocation. */
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
+/* Exclusive upper bound of the live PID/TID allocator. */
+uint32_t kernel_proc_pid_max(void);
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
                              uint64_t *identity);
 int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,

@@ -34,6 +34,7 @@
 #define PROC_COST_CONTROL_INODE UINT64_C(11)
 #define PROC_NETWORK_STATS_INODE UINT64_C(12)
 #define PROC_MEMORY_STATS_INODE UINT64_C(13)
+#define PROC_PID_MAX_INODE UINT64_C(14)
 #define PROC_PID_DIR_KIND 1U
 #define PROC_PID_EXE_KIND 2U
 #define PROC_PID_CWD_KIND 3U
@@ -146,8 +147,11 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             *inode = PROC_RT_PERIOD_INODE;
         else if (length == 19U && !memcmp(name, "sched_rt_runtime_us", 19U))
             *inode = PROC_RT_RUNTIME_INODE;
+        else if (length == 7U && !memcmp(name, "pid_max", 7U))
+            *inode = PROC_PID_MAX_INODE;
         else return -KERNEL_ENOENT;
-        *mode = KERNEL_VFS_S_IFREG | 0644U;
+        *mode = KERNEL_VFS_S_IFREG |
+            (*inode == PROC_PID_MAX_INODE ? 0444U : 0644U);
         return 0;
     }
     if (parent != PROC_ROOT_INODE) {
@@ -262,7 +266,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE &&
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
          inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
-         inode != PROC_RT_RUNTIME_INODE &&
+         inode != PROC_RT_RUNTIME_INODE && inode != PROC_PID_MAX_INODE &&
 #if BOAROS_COST_DIAGNOSTICS
          inode != PROC_COST_INODE && inode != PROC_COST_CONTROL_INODE &&
          inode != PROC_NETWORK_STATS_INODE && inode != PROC_MEMORY_STATS_INODE &&
@@ -283,7 +287,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         (inode >= (UINT64_C(1) << 30U) &&
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_kind_mode(proc_inode_kind(inode)) & KERNEL_VFS_S_IFMT)) ||
-        ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE) &&
+        ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE ||
+          inode == PROC_PID_MAX_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
         return -KERNEL_EINVAL;
     if (inode >= (UINT64_C(1) << 30U)) {
@@ -368,10 +373,11 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     *next_position = position;
     uint64_t directory = kernel_vfs_file_inode(file);
     if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
-        if (position > (directory == PROC_SYS_INODE ? 2U : 3U)) return 0;
+        if (position > (directory == PROC_SYS_INODE ? 2U : 4U)) return 0;
         const char *entry = position == 0 ? "." : position == 1 ? ".." :
             directory == PROC_SYS_INODE ? "kernel" : position == 2 ?
-            "sched_rt_period_us" : "sched_rt_runtime_us";
+            "sched_rt_period_us" : position == 3 ? "sched_rt_runtime_us" :
+            "pid_max";
         size_t length = strlen(entry) + 1U;
         if (name_size < length) return -KERNEL_ERANGE;
         memcpy(name, entry, length);
@@ -379,7 +385,8 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         *inode = position == 0 ? directory : position == 1 ?
             (directory == PROC_SYS_INODE ? PROC_ROOT_INODE : PROC_SYS_INODE) :
             directory == PROC_SYS_INODE ? PROC_KERNEL_INODE : position == 2 ?
-            PROC_RT_PERIOD_INODE : PROC_RT_RUNTIME_INODE;
+            PROC_RT_PERIOD_INODE : position == 3 ? PROC_RT_RUNTIME_INODE :
+            PROC_PID_MAX_INODE;
         *type = position < 2 || directory == PROC_SYS_INODE ? 4U : 8U;
         return 1;
     }
@@ -1102,7 +1109,8 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
         return proc_mounts_snapshot(node, heap, buffer, length);
     }
     if (node->inode != PROC_MEMINFO_INODE &&
-        node->inode != PROC_UPTIME_INODE) return -KERNEL_EINVAL;
+        node->inode != PROC_UPTIME_INODE &&
+        node->inode != PROC_PID_MAX_INODE) return -KERNEL_EINVAL;
     char *data = 0;
     enum kernel_heap_status status = kernel_heap_allocate(heap, 512U,
                                                            (void **)&data);
@@ -1123,6 +1131,9 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
             memory.writeback, 0, 0, 0};
         for (unsigned i = 0; i < sizeof(bytes) / sizeof(bytes[0]); i++)
             used += append_kib(data + used, names[i], bytes[i]);
+    } else if (node->inode == PROC_PID_MAX_INODE) {
+        used = decimal(data, kernel_proc_pid_max());
+        data[used++] = '\n';
     } else {
         uint64_t uptime = kernel_time_monotonic_ns() / 10000000U;
         uint64_t idle_ticks = kernel_scheduler_idle_ticks();
