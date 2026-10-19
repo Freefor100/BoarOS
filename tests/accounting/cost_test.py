@@ -46,6 +46,18 @@ class CostTests(unittest.TestCase):
             ('after','virtual-armed'),('after','prof-armed'),('after','virtual-periodic'),('after','prof-periodic')})
         self.assertEqual(len(first),7);self.assertEqual(second,first[1:]+first[:1])
 
+    def test_multiple_kernel_timer_states_share_one_rotating_comparison(self):
+        first=cost.timer_run_plan(['before','after','control'],('before','after'),0)
+        self.assertEqual(set(first),{
+            ('before','off'),('before','virtual-armed'),('before','prof-armed'),
+            ('before','virtual-periodic'),('before','prof-periodic'),
+            ('after','off'),('after','virtual-armed'),('after','prof-armed'),
+            ('after','virtual-periodic'),('after','prof-periodic'),('control','off')})
+        self.assertEqual(len(first),11)
+        self.assertEqual(cost.timer_run_plan(['before','after','control'],('before','after'),1),first[1:]+first[:1])
+        self.assertEqual(cost.timer_run_plan(['before','after','control'],('after',),0,('off',)),
+                         [('before','off'),('after','off'),('control','off')])
+
     def test_native_workload_executes_requested_mode_and_fixed_work(self):
         with tempfile.TemporaryDirectory(prefix='boaros-cost-') as folder:
             binary=Path(folder)/'cost'
