@@ -183,24 +183,24 @@ main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 
 
 ## CPU 间隔定时器与信号等待
 
-进程CPU定时器由main `6dc2737`提供，`4105d5b`整理无事件的信号返回路径。本轮另交付CORE状态（`d623054`）、固定root capget及VmSwap（`365a050`）、FSIZE接纳与查询语义（`f20db2a`），以及实际PID上限查询（`15b3ea9`）。VIRTUAL累计全组用户CPU时间，PROF累计用户加内核CPU时间；状态、信号和生命周期见[时间模块](../modules/kernel-time.md#进程-cpu-间隔定时器)，限额及查询见[syscall模块](../modules/kernel-syscall.md)。
+进程CPU定时器由main `6dc2737`提供，`4105d5b`整理无事件的信号返回路径。后续提供CORE状态（`d623054`）、固定root capget及VmSwap（`365a050`）、FSIZE接纳与查询语义（`f20db2a`），以及实际PID上限查询（`15b3ea9`）。`396d049`及`02c1adc`将RV SMP普通信号递送和sigreturn放到实际执行CPU，共享状态以短锁保护，普通返回复用原通知检查。VIRTUAL累计全组用户CPU时间，PROF累计用户加内核CPU时间；状态、信号和生命周期见[时间模块](../modules/kernel-time.md#进程-cpu-间隔定时器)及[信号模块](../modules/kernel-signal.md#smp上的状态和执行位置)，限额及查询见[syscall模块](../modules/kernel-syscall.md)。
 
 ### 原程序结果与时间
 
-固定官方容器内断网`make all`及85项适配检查通过。使用容器QEMU10.0.2、原双盘命令、1 CPU/1 GiB和独立运行盘，启动熵来自交付盘种子。两架构并行，各架构的glibc/musl及程序顺序运行。定向PID1只选择下表六个原程序，原ELF、libc、参数、judge及内部时限保持；单程序监督仍为300秒。
+固定官方容器内断网`make all`及85项适配检查通过。使用容器QEMU10.0.2、原双盘命令、1 CPU/1 GiB和独立运行盘，启动熵来自交付盘种子。两架构并行，各架构的glibc/musl及程序顺序运行。最近一次定向PID1选择getitimer01、setitimer01、setitimer02，原ELF、libc、参数、judge及内部时限保持；单程序监督仍为300秒。
 
-首次六项运行源码为main `8039037`、compat `fb75278`。capget02停在读取缺失的pid_max后，补入真实查询，再单独复测该程序，源码为main `15b3ea9`、compat `f3a641c`。下表是最终逐项结果，时间单位为秒，包含准备、执行和清理；capget02的四列来自补测，其余来自首次六项运行。
+首次六项运行源码为main `8039037`、compat `fb75278`。capget02补入真实pid_max查询后的单独复测源码为main `15b3ea9`、compat `f3a641c`。信号本地递送后的三项计时器复核源码为main `02c1adc`、compat `6bb6142`。下表按程序维护最新结果，时间单位为秒，包含准备、执行和清理：三项计时器来自最近复核，capget02来自单独补测，capget01/getrusage03沿用首次六项运行。
 
 | 原程序 | 每组原始分与结果 | RV glibc | RV musl | LA glibc | LA musl |
 |---|---|---:|---:|---:|---:|
-| getitimer01 | 30/30；30通过 | 0.127 | 0.083 | 0.137 | 0.063 |
-| setitimer01 | 18/18；18通过 | 1.222 | 1.190 | 1.179 | 1.175 |
-| setitimer02 | 3/3；3通过 | 0.063 | 0.044 | 0.062 | 0.043 |
+| getitimer01 | 30/30；30通过 | 0.127 | 0.083 | 0.117 | 0.062 |
+| setitimer01 | 18/18；18通过 | 1.238 | 1.199 | 1.191 | 1.168 |
+| setitimer02 | 3/3；3通过 | 0.042 | 0.043 | 0.063 | 0.043 |
 | capget01 | 0/1；1个条件跳过 | 0.042 | 0.042 | 0.064 | 0.046 |
 | capget02 | 5/5；5通过（补测） | 0.124 | 0.089 | 0.132 | 0.065 |
 | getrusage03 | 9/9；9通过 | 13.644 | 12.714 | 3.557 | 3.186 |
 
-按这些最终逐项结果，每种配置合计 **65/66**，65个TPASS、1个TCONF，零TFAIL/TBROK/超时。首次六项运行本身为60/62，capget02准备失败占0/1；补测为5/5，汇总时保留了两个运行来源。capget01退出32，其余程序退出0。历史完整LTP总分仍对应前文的旧版本。
+按这些最新逐项结果，每种配置合计 **65/66**，65个TPASS、1个TCONF，零TFAIL/TBROK/超时。最近的三项计时器复核每种配置为51/51，12次程序运行全部退出0。首次六项运行本身为60/62，capget02准备失败占0/1，补测为5/5；汇总保留上述三个运行来源。capget01的既有结果退出32。历史完整LTP总分仍对应前文的旧版本。
 
 ### 得分对应的实际能力
 
@@ -212,16 +212,18 @@ main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 
 
 ### musl 原输入差异
 
-原sigtimedwait01/sigwaitinfo01继续采用已确认的原输入与计分。首项期待被SIGUSR1打断后返回EINTR，原musl会自行重试；同一原ELF/libc在固定Linux的两架构也各30秒后超时。直接syscall的EINTR行为包括SA_RESTART均与Linux匹配，具体版本和机器码见[测例问题](oscomp-test-issues.md#musl-信号等待库重试-eintr测例等待它返回-eintr)。这两项沿用前次调查结果，本轮原程序选择为上表六项。
+原sigtimedwait01/sigwaitinfo01继续采用已确认的原输入与计分。首项期待被SIGUSR1打断后返回EINTR，原musl会自行重试；同一原ELF/libc在固定Linux的两架构也各30秒后超时。直接syscall的EINTR行为包括SA_RESTART均与Linux匹配，具体版本和机器码见[测例问题](oscomp-test-issues.md#musl-信号等待库重试-eintr测例等待它返回-eintr)。这两项沿用前次调查结果。
 
 ### 通用验证与磁盘
 
 CORE19、capget31、FSIZE59项分别在RV/LA的512MiB和1GiB与固定Linux匹配；RV将它们和既有CPU定时器36项合为145项，再完成真实1/2CPU、两种内存配置。信号等待31项及调度、handoff、用户SMP相关短回归通过。组长退出由真实clear-TID完成握手，非组长exec检查状态迁移；限额查询覆盖未回收zombie及reap后的ESRCH。
 
+信号本地递送后的最终源码重新完成RV/LA的36项定时器、31项等待和3项恢复检查，显式覆盖512MiB/1GiB；RV另完成145项ABI及静态/动态musl程序的1/2CPU、双RAM验证。共享action更换、屏蔽/结束等待/退出时转交组信号、SIGCONT恢复通知与迁移时取消STOP的确定性交错均修复后通过。
+
 FSIZE验证普通、定位、向量、追加及sendfile的完成前缀、内容、offset和SIGXFSZ；truncate、fallocate、KEEP_SIZE、打洞及下调限额后的脏mmap同步分别检查。VFAT在两架构完成真实用户操作、卸载、只读重挂载读回和ext4/FAT离线检查。宿主另保留1/4KiB文件系统块、4/16KiB页的范围操作、活动写回、失败与同步持久化回归。超出文件系统最大尺寸的fallocate在进程限额检查前拒绝，避免额外SIGXFSZ；该边界有直接修复前后对照。
 
-首次六项原程序运行RV35.660秒、LA15.799秒；capget02补测RV8.383秒、LA5.516秒。两批均正常关机、heap-live=0，种子槽已擦除；每批根盘、工具分区、VFAT和scratch共8次磁盘检查全部返回0。定向运行后已重新构建默认交付文件。
+首次六项原程序运行RV35.660秒、LA15.799秒；capget02补测RV8.383秒、LA5.516秒；最近三项计时器复核RV8.222秒、LA8.027秒。三批均正常关机、heap-live=0，种子槽已擦除；每批根盘、工具分区、VFAT和scratch共8次磁盘检查全部返回0。定向运行后重新构建的默认内核与同批保存的默认构建逐字节相同。
 
-CPU记账的旧成本、本轮功能对未设置定时器程序的净影响，以及VIRTUAL/PROF启用后的成本分别维护在[成本分析](cpu-accounting-cost.md#资源限制与定时器启用成本)。
+CPU记账的旧成本、资源限制一轮的功能净影响及定时器启用成本，由[成本分析](cpu-accounting-cost.md#资源限制与定时器启用成本)分别维护。信号本地递送后的同批五轮对照中，RV双核8进程VIRTUAL/PROF周期额外成本由12.39%/12.66%降为1.05%/0.58%；普通返回及小I/O的实测差值见[本地递送成本](cpu-accounting-cost.md#rv-双核信号本地递送后的成本)。性能对照固定宿主P核CPU0/1并串行运行，与这里并行的官方功能验证分开。
 
-本批原始输出、逐项结果、实际kernel/init/QEMU身份与fsck位于`build/resource-limits-timers/original/`及`original-capget02/`。`current-original-results.json`逐项保存来源；通用最终回归为`core-final-*`、`fsize-final-*`、`capability-pidmax-*`和`limits-pidmax-smp/`。构建缓存、ELF和必要日志保留，检查后的运行盘清理。
+原始输出、逐项结果、实际kernel/init/QEMU身份与fsck分别位于`build/resource-limits-timers/original/`、`original-capget02/`及`build/signal-local-rv/original/`。最新汇总`build/signal-local-rv/current-original-results.json`逐项保存来源；信号最终通用回归位于同目录`*-return/`，限额/查询的既有独立回归仍保留在前一目录。构建缓存、ELF和必要日志保留，检查后的运行盘清理。
