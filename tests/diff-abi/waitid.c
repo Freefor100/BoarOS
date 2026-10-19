@@ -131,8 +131,8 @@ static void child_release(int pipefd[2], unsigned char exit_code)
 
 struct thread_wait_arg {
     long child;
-    volatile int ready;
-    volatile int done;
+    int go;
+    int done;
     long result;
     struct diff_siginfo info;
 };
@@ -143,9 +143,9 @@ static void thread_wait_fn(void *arg)
 {
     struct thread_wait_arg *t = arg;
     mem_set(&t->info, 0x5a, sizeof(t->info));
-    t->ready = 1;
+    while (!__atomic_load_n(&t->go, __ATOMIC_ACQUIRE)) SC0(124);
     t->result = SC5(95, P_PID, t->child, &t->info, WEXITED, 0);
-    t->done = 1;
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
 }
 
 void abi_waitid_cases(void)
@@ -153,6 +153,21 @@ void abi_waitid_cases(void)
     struct diff_siginfo info;
     struct diff_rusage ru;
     long ret;
+
+    /* 出错也写六个定义字段，保留padding和其余字节；ru仅在有事件时写。 */
+    mem_set(&info, 0x5a, sizeof(info));
+    mem_set(&ru, 0x5a, sizeof(ru));
+    ret = SC5(95, P_ALL, 0, &info, WEXITED | WNOHANG, &ru);
+    abi_record("waitid.error.echild-output", ret, -1, -1,
+               mem_all(&ru, 0x5a, sizeof(ru)), &info, sizeof(info));
+    abi_record("waitid.error.echild-badinfo",
+               SC5(95, P_ALL, 0, (void *)-1, WEXITED, 0), -1, -1, 0, 0, 0);
+    mem_set(&info, 0x5a, sizeof(info));
+    ret = SC5(95, P_ALL, 0, &info, 0, &ru);
+    abi_record("waitid.error.einval-output", ret, -1, -1,
+               mem_all(&ru, 0x5a, sizeof(ru)), &info, sizeof(info));
+    abi_record("waitid.error.einval-badinfo",
+               SC5(95, -1, 0, (void *)-1, WEXITED, 0), -1, -1, 0, 0, 0);
 
     /* 1. Invalid arguments */
     abi_record("waitid.invalid.which-negative", SC5(95, -1, 0, 0, WEXITED, 0), -1, -1, 0, 0, 0);
@@ -352,20 +367,18 @@ void abi_waitid_cases(void)
     abi_require(SC4(134, SIGCHLD, &sa, &old_sa, 8) == 0);
     long child10 = child_held(pipefd);
     child_release(pipefd, 49);
-    /* Small pause to allow autoreap */
-    for (int i = 0; i < 50; i++) SC0(124);
     mem_set(&info, 0x5a, sizeof(info));
     abi_record("waitid.cldwait.nocldwait",
                SC5(95, P_PID, child10, &info, WEXITED, 0), -1, -1, 0, 0, 0);
     abi_require(SC4(134, SIGCHLD, &old_sa, 0, 8) == 0);
 
-    /* 12. Multithread WNOWAIT competition */
+    /* WNOWAIT完成后才允许另一线程消费；实际claim交接由受控测试覆盖。 */
     long child11 = child_held(pipefd);
     child_release(pipefd, 55);
 
     struct thread_wait_arg targ = {
         .child = child11,
-        .ready = 0,
+        .go = 0,
         .done = 0,
         .result = -1,
     };
@@ -374,21 +387,22 @@ void abi_waitid_cases(void)
                                &helper_tid, thread_wait_fn, &targ);
     abi_require(tid > 0);
 
-    /* Wait for helper thread to start waitid */
-    while (!targ.ready) SC0(124);
-
     /* Main thread does waitid with WNOWAIT */
     struct diff_siginfo info_nowait;
     mem_set(&info_nowait, 0x5a, sizeof(info_nowait));
     long ret_nowait = SC5(95, P_PID, child11, &info_nowait, WEXITED | WNOWAIT, 0);
 
-    /* Wait for helper thread to finish its reaping waitid */
-    while (!targ.done) SC0(124);
+    __atomic_store_n(&targ.go, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&targ.done, __ATOMIC_ACQUIRE)) SC0(124);
 
-    abi_record("waitid.multithread.nowait-compete",
-               (ret_nowait == 0 && targ.result == 0) ? 0 : -1,
+    abi_record("waitid.multithread.nowait-before-consume",
+               (ret_nowait == 0 && targ.result == 0 && info_nowait.si_pid == child11 &&
+                info_nowait.si_status == 55 && targ.info.si_pid == child11) ? 0 : -1,
                -1, -1,
                targ.info.si_status, 0, 0);
+
+    abi_record("waitid.multithread.after-consume",
+               SC5(95, P_PID, child11, &info, WEXITED | WNOHANG, 0), -1, -1, 0, 0, 0);
 
     /* Wait for helper thread to exit */
     while (SC2(130, tid, 0) == 0) SC0(124);

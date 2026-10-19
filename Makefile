@@ -444,7 +444,7 @@ OBJECTS := \
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
 LDFLAGS += -Wl,--wrap=ns16550_stop_report
-LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
+LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_copy_to_user,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
 endif
 ifeq ($(SMP_TEST),1)
 ifeq ($(MM_SMP_TEST),1)
@@ -2307,7 +2307,7 @@ test-user-smp-riscv: $(USER_SMP_ELF) $(USER_SMP_DYNAMIC_ELF) $(PTHREAD_TLS_DSO_R
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
 .PHONY: test-user-smp-runtime-riscv
 .PHONY: test-user-smp-programs-riscv
-.PHONY: test-user-smp-composition-host test-user-smp-composition-riscv
+.PHONY: test-user-smp-composition-host test-user-smp-composition-riscv test-wait-process-smp-riscv
 COMPOSITION_ELF := build/riscv-user-smp-composition/composition-rv
 $(COMPOSITION_ELF): tests/userland/user_smp_composition.c tests/smp/composition_protocol.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
@@ -2316,6 +2316,8 @@ test-user-smp-composition-host:
 	python3 -B tests/smp/test_composition.py
 test-user-smp-composition-riscv: $(COMPOSITION_ELF) $(SQLITE_ROLLBACK_RV) $(SQLITE_WAL_RV) $(SQLITE_CLI_INIT_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(MUSL_LDSO) test-user-smp-composition-host
 	python3 -B tests/smp/composition.py --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --program $(COMPOSITION_ELF) $(TEST_MEMORY_ARGS)
+test-wait-process-smp-riscv: $(COMPOSITION_ELF) test-user-smp-composition-host
+	python3 -B tests/smp/composition.py --scene wait --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --program $(COMPOSITION_ELF) $(TEST_MEMORY_ARGS)
 test-user-smp-programs-riscv: test-program-inventory-host
 	$(MAKE) kernel-rv-user-smp
 	python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --reuse-builds $(TEST_MEMORY_ARGS)

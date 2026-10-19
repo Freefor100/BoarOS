@@ -18,6 +18,7 @@
 #include "../../fs/vfs_internal.h"
 #include "../../fs/char_device_internal.h"
 #include "../smp/composition_protocol.h"
+#include "../../kernel/sched/private.h"
 
 struct held_page { uint64_t address; uint32_t order; };
 static struct riscv_root_boot *root;
@@ -45,6 +46,7 @@ static struct kernel_task *read_waiter;
 static uint64_t read_wait_generation;
 static struct kernel_mm *read_revoke_mm;
 static unsigned read_copy_active;
+static uint64_t wait_tid,wait_child,wait_address,wait_claims;
 
 static void check_at(int valid,unsigned line)
 {
@@ -247,6 +249,19 @@ static void run(void *unused)
         case COMPOSITION_RELEASE:release_pages();break;
         case COMPOSITION_READ_ARM:arm_read();break;
         case COMPOSITION_READ_FINISH:finish_read();break;
+        case COMPOSITION_WAIT_ARM:
+            check(!composition_load(&wait_tid));
+            wait_child=composition_load(&control->wait_child);
+            wait_address=composition_load(&control->wait_address);
+            check(composition_load(&control->wait_tid) && wait_child && wait_address);
+            composition_store(&wait_tid,composition_load(&control->wait_tid));
+            break;
+        case COMPOSITION_WAIT_FINISH:
+            check(composition_load(&wait_tid) && composition_load(&control->wait_entered) &&
+                  composition_load(&control->wait_release));
+            composition_store(&wait_tid,0);
+            wait_child=wait_address=0;
+            break;
         case COMPOSITION_OOM:check(!failed_tid);failed_tid=control->target_tid;break;
         case COMPOSITION_RFENCE:check(!watched_tid);watched_tid=control->target_tid;break;
         case COMPOSITION_FAULT_RACE:
@@ -293,7 +308,7 @@ void riscv_user_composition_finish(void)
 {
     stopping=1;kernel_thread_join(&controller);
     check(!control && !ledger && !ledger_count && held==released && !failed_tid && !watched_tid &&
-          !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm);
+          !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm && !composition_load(&wait_tid));
     /* 留下超过worker单轮预算的真实TTY尾部，直到stop才允许发送。 */
     uintptr_t irq=arch_interrupt_save();
     const struct kernel_char_device *device=kernel_tty_device_lookup(0x440);
@@ -314,6 +329,8 @@ void riscv_user_composition_finish(void)
 }
 void riscv_user_composition_report(void)
 {
+    virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);
+    virt_uart_puts(" active=");virt_uart_put_hex(composition_load(&wait_tid));virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION ordinary-io phases=");virt_uart_put_hex(read_phases);
     virt_uart_puts(" local=");virt_uart_put_hex(read_local_phases);
     virt_uart_puts(" copy0=");virt_uart_put_hex(read_total_copies[0]);
@@ -343,6 +360,26 @@ void riscv_user_composition_report(void)
     virt_uart_puts(" resumed=");virt_uart_put_hex(fault_file_resumed);
     virt_uart_puts(" resolved=");virt_uart_put_hex(fault_file_resolved);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION file-fault-race-syncs=");virt_uart_put_hex(fault_file_syncs);virt_uart_puts("\n");
+}
+enum kernel_uaccess_status __real_kernel_copy_to_user(struct kernel_mm *,uint64_t,const void *,size_t,size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint64_t address,
+    const void *source,size_t size,size_t *copied)
+{
+    kernel_pid_t tid=0;
+    uint64_t selected=composition_load(&wait_tid);
+    if (selected && !kernel_task_tid(kernel_task_current(),&tid) &&
+        (uint64_t)tid==selected && address==wait_address) {
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_task *child=process_find_identity((kernel_pid_t)wait_child,KERNEL_PID_TID);
+            check(child && child->reaping && child->storage_borrows &&
+                  child->state==KERNEL_THREAD_STATE_ZOMBIE);
+        }
+        wait_claims++;
+        composition_store(&control->wait_entered,1);
+        while (!composition_load(&control->wait_release)) relinquish();
+    }
+    return __real_kernel_copy_to_user(mm,address,source,size,copied);
 }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __real_physical_page_allocate_order(struct physical_page_allocator *,uint32_t,uint64_t *);

@@ -8,9 +8,9 @@ Linux 与 BoarOS 生产内核。两次 QEMU system 均为 `virt`、一个 hart�
 Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于被忽略的
 `build/diff-abi/`，不复制 Linux 源码进入 BoarOS。
 
-当前完整清单为两侧各 **1400 条**，同 ELF 的 Linux/BoarOS 对照在 512 MiB、1 GiB 通过。
+完整案例清单由 `cases.txt` 维护；聚焦入口使用各组独立清单，结果按实际执行范围记录。
 其中 `exec_boundaries.c`、`fault_count.c`、`sigreturn.c` 和 `boundaries.c` 保护参数容量失败原子性、tmpfs 成功/失败缺页记账、真实偏移恢复帧及 I/O 输入顺序。
-`test-elf-boundary-riscv/loongarch` 另用显式 GNU_STACK RWE、RW 和无标记的三个 ELF 检查初始/扩展栈执行，不计入1400条。
+`test-elf-boundary-riscv/loongarch` 另用显式 GNU_STACK RWE、RW 和无标记的三个 ELF 单独检查初始/扩展栈执行。
 历史小清单结果保持其当时身份，不替代当前验证。
 
 ## 入口与契约
@@ -26,6 +26,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 - `readv.c`：覆盖向量导入顺序、零项及零长度、1024/1025 项、`MAX_RW_COUNT`、普通文件跨页/共享 OFD/EOF、0/1/32/63/64/65 字节可写前缀，以及 pipe 的未完成片段保留、写入故障、尾片段合并、环回、非阻塞/EOF 和可写 poll 边界。与上述测试合计 126 条记录；不以手工 Linux 输出替代双侧执行。
 - `links.c`、`signals.c`、`limits.c`：覆盖符号链接解析和元数据、同步信号等待、NOFILE 对 open/dup/pipe/fcntl 的实际约束、降低限制后保留旧 fd、跨 PID 访问、fork/exec 继承、STACK fault，以及 `prlimit64` 参数错误和设置后旧值输出故障。exec 子进程仍执行同一 `/init` ELF，由启动栈中的专用参数进入查询分支，不另造参考程序。
 - `robust.c`：9 条 raw syscall 记录覆盖注册长度、当前线程查询、缺失 TID、输出故障顺序、fork 不继承和注销；内核退出写字与唤醒另由真实 U-mode 探针保护。
+- `waitid.c`：`test-waitid-abi-riscv/loongarch` 使用 58 条 raw 记录核对事件选择、WNOWAIT、停止/继续/退出、参数错误与无子进程时的六字段输出、rusage 写入顺序、EFAULT 后事件消费及线程有序交接；保持 siginfo padding 与其余字段的原始字节。实际持有 claim 时的竞争、阻塞期间换组及信号中断由[等待组合](riscv-smp.md#用户态原程序与压力组合)补充。
 - `file_locks.c`：同一 ELF 核对传统与 OFD 锁的区间边界、权限与坏指针、负长度/EOF、互相冲突、dup/exec/CLOEXEC、unlink 后的 inode 身份、阻塞唤醒、信号打断/重启和有限死锁检测。Linux profile 显式启用 `CONFIG_FILE_LOCKING`；否则最小配置的参考内核并不具备记录锁，不能将其 `EACCES` 当成目标 ABI。
 - `access.c`、`mode.c`：raw `O_NOCTTY` 对普通文件/字符设备的 open 结果，`umask` 的创建掩码、fork/`CLONE_FS` 身份，`fchmodat/fchmod` 的路径/fd 错误、ctime、执行权限与 unlink 后活 inode。
   `mode.c` 比较 ctime 是否变化：镜像旧时间来自宿主，而固定 Linux 客体时钟可从 epoch 起步，不能把数值递增当作 chmod 契约。

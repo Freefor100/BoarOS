@@ -1444,6 +1444,10 @@ boundary.sendto-huge-badfd
 boundary.recvfrom-huge-message
 boundary.recvfrom-huge-high
 boundary.recvfrom-after-rejection
+waitid.error.echild-output
+waitid.error.echild-badinfo
+waitid.error.einval-output
+waitid.error.einval-badinfo
 waitid.invalid.which-negative
 waitid.invalid.which-unknown
 waitid.invalid.which-high
@@ -1496,4 +1500,5 @@ wait4.fault.stopped-status-bad-after
 waitid.clone.wclone
 waitid.clone.wall
 waitid.cldwait.nocldwait
-waitid.multithread.nowait-compete
+waitid.multithread.nowait-before-consume
+waitid.multithread.after-consume

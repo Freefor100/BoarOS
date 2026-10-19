@@ -41,7 +41,8 @@ static void command(unsigned action)
     if (!controlled && !observed) return;
     if (!controlled && action!=COMPOSITION_STOP && action!=COMPOSITION_FAULT_RACE &&
         action!=COMPOSITION_FILE_FAULT_RACE && action!=COMPOSITION_READ_ARM &&
-        action!=COMPOSITION_READ_FINISH) return;
+        action!=COMPOSITION_READ_FINISH && action!=COMPOSITION_WAIT_ARM &&
+        action!=COMPOSITION_WAIT_FINISH) return;
     composition_store(&control->command,action);
     composition_store(&control->request,++request);
     wait_value(&control->reply,request);
@@ -422,6 +423,96 @@ static void wait_registered(unsigned count)
         CHECK(now()<end);sched_yield();
     }
 }
+struct child_wait { pid_t child;int group,nowait,result,error;siginfo_t info;uint64_t go,ready; };
+static void *child_wait(void *opaque)
+{
+    struct child_wait *test=opaque;pin(test->nowait ? 1 : 0);
+    composition_store(&control->participants[0],syscall(SYS_gettid));
+    composition_store(&test->ready,1);wait_value(&test->go,1);
+    if (test->group==2) {
+        int status=0;
+        test->result=waitpid(0,&status,0);
+        if (test->result==test->child) CHECK(WIFEXITED(status) && WEXITSTATUS(status)==57);
+    } else test->result=waitid(test->group ? P_PGID : P_PID,
+        test->group ? 0 : test->child,&test->info,WEXITED|(test->nowait ? WNOWAIT : 0));
+    test->error=errno;
+    if (test->nowait) {
+        /* 保留CPU1上的真实用户计算，覆盖本地timer返回；交接顺序由控制页决定。 */
+        uint64_t end=now()+UINT64_C(100000000),value=1;
+        do {
+            for (unsigned i=0;i<100000;i++) {
+                value=(value<<3)^(value>>7)^17;
+                __asm__ volatile("" : "+r"(value));
+            }
+        } while (now()<end);
+    }
+    return 0;
+}
+static pid_t held_child(int pipefd[2])
+{
+    CHECK(!pipe(pipefd));pid_t child=fork();CHECK(child>=0);
+    if (!child) { char byte;CHECK(!close(pipefd[1]) && read(pipefd[0],&byte,1)==1);_exit(57); }
+    CHECK(!close(pipefd[0]));return child;
+}
+static void release_child(int pipefd[2])
+{ CHECK(write(pipefd[1],"X",1)==1 && !close(pipefd[1])); }
+static void wait_signal(int signal) { CHECK(signal==SIGUSR1); }
+static void wait_processes(void)
+{
+    /* 子进程保留旧组，等待线程实际登记后，另一线程改变父进程的组。 */
+    for (int group=1;group<=2;group++) {
+        epoch_begin();
+        pid_t parent=fork();CHECK(parent>=0);
+        if (!parent) {
+            int pipefd[2];struct child_wait test={.group=group};test.child=held_child(pipefd);
+            pthread_t thread;CHECK(!pthread_create(&thread,0,child_wait,&test));
+            wait_value(&test.ready,1);composition_store(&test.go,1);wait_registered(1);
+            CHECK(!setpgid(0,0));release_child(pipefd);CHECK(!pthread_join(thread,0));
+            if (test.result!=(group==2 ? test.child : 0))
+                dprintf(2,"COMPOSITION wait group=%d result=%d errno=%d child=%d\n",group,test.result,test.error,test.child);
+            CHECK(test.result==(group==2 ? test.child : 0));
+            if (group==1) CHECK(test.info.si_pid==test.child && test.info.si_status==57);
+            CHECK(waitpid(test.child,0,WNOHANG)==-1 && errno==ECHILD);_exit(0);
+        }
+        int status;CHECK(waitpid(parent,&status,0)==parent && WIFEXITED(status) && !WEXITSTATUS(status));
+        record(group==1 ? "waitid-pgid-entry" : "wait4-pgid-entry");
+    }
+    int signal_pipe[2];struct child_wait interrupted={0};interrupted.child=held_child(signal_pipe);
+    memset(&interrupted.info,0x5a,sizeof(interrupted.info));
+    struct sigaction action={.sa_handler=wait_signal},previous;
+    sigemptyset(&action.sa_mask);CHECK(!sigaction(SIGUSR1,&action,&previous));
+    epoch_begin();pthread_t thread;CHECK(!pthread_create(&thread,0,child_wait,&interrupted));
+    wait_value(&interrupted.ready,1);composition_store(&interrupted.go,1);wait_registered(1);
+    CHECK(!pthread_kill(thread,SIGUSR1) && !pthread_join(thread,0));
+    CHECK(interrupted.result==-1 && interrupted.error==EINTR &&
+        !interrupted.info.si_signo && !interrupted.info.si_errno && !interrupted.info.si_code &&
+        !interrupted.info.si_pid && !interrupted.info.si_uid && !interrupted.info.si_status);
+    CHECK(!sigaction(SIGUSR1,&previous,0));release_child(signal_pipe);
+    CHECK(waitpid(interrupted.child,0,0)==interrupted.child);record("waitid-interrupted-output");
+    int pipefd[2];struct child_wait first={.nowait=1};first.child=held_child(pipefd);
+    composition_store(&control->epoch,0);
+    pthread_t a,b;CHECK(!pthread_create(&a,0,child_wait,&first));wait_value(&first.ready,1);
+    if (observed) {
+        composition_store(&control->wait_tid,composition_load(&control->participants[0]));
+        composition_store(&control->wait_child,first.child);
+        composition_store(&control->wait_address,(uintptr_t)&first.info);
+        command(COMPOSITION_WAIT_ARM);
+    }
+    release_child(pipefd);composition_store(&first.go,1);
+    if (observed) wait_value(&control->wait_entered,1);
+    else CHECK(!pthread_join(a,0));
+    epoch_begin();struct child_wait second={.child=first.child};
+    CHECK(!pthread_create(&b,0,child_wait,&second));wait_value(&second.ready,1);composition_store(&second.go,1);
+    if (observed) {
+        wait_registered(1);composition_store(&control->wait_release,1);
+        CHECK(!pthread_join(a,0));
+    }
+    CHECK(!pthread_join(b,0));
+    CHECK(!first.result && !second.result && first.info.si_pid==first.child &&
+        second.info.si_pid==first.child && first.info.si_status==57 && second.info.si_status==57);
+    CHECK(waitpid(first.child,0,WNOHANG)==-1 && errno==ECHILD);
+    command(COMPOSITION_WAIT_FINISH);record("waitid-claim-handoff");puts("COMPOSITION END 4");
+}
 static void waiters(unsigned count,int use_futex)
 {
     int pipefd[2],replacement[2];CHECK(!pipe(pipefd) && !pipe(replacement));
@@ -489,7 +580,8 @@ static void sqlite(void)
 int main(void)
 {
     setup();
-    if (!access("/sqlite-scene",F_OK)) sqlite();
+    if (!access("/wait-scene",F_OK)) wait_processes();
+    else if (!access("/sqlite-scene",F_OK)) sqlite();
     else if (!access("/ordinary-read-scene",F_OK)) {
         ordinary_reads();puts("COMPOSITION END 9");
     }
