@@ -4,6 +4,8 @@
 
 资源统计与CPU时钟的既有结果见[下文](#资源统计与-cpu-时钟)；最新CORE/FSIZE、capget及六项原程序结果见[当前定向结果](#cpu-间隔定时器与信号等待)。
 
+ext4 冷读并发改造后的三项原程序复测见[文件 I/O 当前结果](#文件-io-当前结果)。
+
 当前评测按预算跳过 `fs_fill`；下文保留已完成的原程序结果。
 `brk`、`epoll_ctl04`、命令和判分差异集中见[评测输入与测例问题](oscomp-test-issues.md)。
 
@@ -227,3 +229,40 @@ FSIZE验证普通、定位、向量、追加及sendfile的完成前缀、内容�
 CPU记账的旧成本、资源限制一轮的功能净影响及定时器启用成本，由[成本分析](cpu-accounting-cost.md#资源限制与定时器启用成本)分别维护。信号本地递送后的同批五轮对照中，RV双核8进程VIRTUAL/PROF周期额外成本由12.39%/12.66%降为1.05%/0.58%；普通返回及小I/O的实测差值见[本地递送成本](cpu-accounting-cost.md#rv-双核信号本地递送后的成本)。性能对照固定宿主P核CPU0/1并串行运行，与这里并行的官方功能验证分开。
 
 原始输出、逐项结果、实际kernel/init/QEMU身份与fsck分别位于`build/resource-limits-timers/original/`、`original-capget02/`及`build/signal-local-rv/original/`。最新汇总`build/signal-local-rv/current-original-results.json`逐项保存来源；信号最终通用回归位于同目录`*-return/`，限额/查询的既有独立回归仍保留在前一目录。构建缓存、ELF和必要日志保留，检查后的运行盘清理。
+
+## 文件 I/O 当前结果
+
+通用冷读实现来自 main `5e7ffef`、`f6db8e1`、`fe9e531`，RV 晚到 timer IRQ 修正为 `e5b0cfe`，
+通过 `9a2ff97` 集成后执行本表。CPU1 的 ext4 冷读和 mmap 装入位置、1/2 核正确性与
+匹配性能统一见[数据路径实验](data-path-budget-experiments.md#rv-ext4-在调用-cpu-冷装入2026-10-19)。
+官方默认继续使用原单核参数；本表检查集成后的文件行为与磁盘一致性。
+
+沿用上文固定官方容器，断网 `make all` 和 85 项适配检查通过。实际 QEMU 为10.0.2，
+两架构各1 CPU/1 GiB，原双盘命令；RV、LA 并行，每架构 glibc 后接 musl。
+PID1 沿现有双盘准备建立工具、VFAT、scratch，`LTP_DEV=/dev/vdb3`；
+两边均报告种子擦除4096字节并注入256 bit。原ELF、libc、参数、judge和内部时限保留，
+外层只枚举 `ftest01`、`ftest05`、`fallocate06`。
+
+下面时间为单程序监督记录的总耗时，包含建立进程、准备、运行与回收，单位秒。
+12 次均正常退出，单项与外层运行超时均为0。
+
+| 原程序 | 原 judge；功能结果 | RV/glibc | RV/musl | LA/glibc | LA/musl |
+|---|---|---:|---:|---:|---:|
+| ftest01 | 0/0；2 PASS | 21.702 | 20.241 | 21.013 | 19.380 |
+| ftest05 | 0/0；1 PASS | 22.150 | 20.748 | 19.937 | 19.110 |
+| fallocate06 | 8/9；8 PASS、1 TCONF | 92.685 | 88.655 | 59.861 | 62.516 |
+
+`ftest01/05` 完成多进程文件检查；它们没有原 judge 读取的 Summary 行，分数保持0/0。
+`fallocate06` 在有空闲空间、填满文件系统两种情形下，实际完成非对齐预留、写入、
+打洞后清零及范围外数据保留。COW 文件分支（复制文件后共享磁盘块）由原测例记1 TCONF。
+选定三项每配置合计8/9，四配置合计32/36；44 条功能 PASS、4 条 TCONF。
+
+两台外层运行分别为 RV 272.184 秒、LA 208.857 秒，包含启动准备与收尾。
+正式结束后两边块设备 errors/timeouts 均为0，根生命周期释放完成、heap-live 为0。
+同源 e2fsck 1.47.2 检查两张根盘和两侧 p1/p3，fsck.fat 检查两侧 p2，
+共8次返回值全部为0；运行盘种子槽也已清零。
+
+原始串口、内核/init/QEMU 身份、逐程序结果、原 judge 输出与磁盘检查集中在
+`build/file-backend-smp/original/`；容器构建及命令记录在其父目录 `compat-*.log`、
+`compat-commands.json`。默认内核已恢复，并逐字节比对定向构建前保存的默认内核。
+运行盘在检查后清理，保留构建缓存、ELF、身份与必要日志。
