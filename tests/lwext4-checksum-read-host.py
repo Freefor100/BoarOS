@@ -16,12 +16,15 @@ def main():
     command = ['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
         '-Wno-unused-but-set-variable', '-Wno-stringop-truncation',
         '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-no-pie',
-        '-DCONFIG_USE_DEFAULT_CFG=1', '-DCONFIG_USE_USER_MALLOC=1',
+        '-DBOAROS_MAX_CPUS=2', '-DCONFIG_USE_DEFAULT_CFG=1', '-DCONFIG_USE_USER_MALLOC=1',
         '-include', str(source/'tests/host/lwext4_memory.h'),
-        '-I'+str(source/'third_party/lwext4/include'), '-idirafter', str(source/'include')]
+        '-I'+str(source/'third_party/lwext4/include'), '-I'+str(ROOT/'tests/host/block_model'),
+        '-idirafter', str(source/'include'), '-pthread']
     command += [str(p) for p in sorted((source/'third_party/lwext4/src').glob('*.c'))]
     command += [str(ROOT/'tests/host/lwext4_checksum_read.c'), str(source/'tests/host/block_fault.c'),
-        str(source/'kernel/block.c'), '-Wl,--wrap=ext4_crc32c', '-o', str(program)]
+        str(source/'kernel/block.c'), str(source/'kernel/raw_lock.c'),
+        str(ROOT/'tests/host/block_runtime.c'), str(ROOT/'tests/host/sync/notifications.c'),
+        '-Wl,--wrap=ext4_crc32c', '-o', str(program)]
     subprocess.run(command, check=True)
     with (out/'results.log').open('w') as log:
         for block in (1024, 4096):

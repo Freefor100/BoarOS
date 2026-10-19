@@ -17,8 +17,16 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 static struct fault_block disk;
-static uint64_t reads, lookup_allocations;
+static uint64_t reads, lookup_allocations, cache_lookups;
 static bool measuring_lookup, fail_allocation;
+struct ext4_buf *__real_ext4_bcache_find_get(struct ext4_bcache *,struct ext4_block *,
+    uint64_t,enum ext4_bcache_read_state *);
+struct ext4_buf *__wrap_ext4_bcache_find_get(struct ext4_bcache *bc,struct ext4_block *block,
+    uint64_t lba,enum ext4_bcache_read_state *read)
+{
+    if (measuring_lookup) cache_lookups++;
+    return __real_ext4_bcache_find_get(bc,block,lba,read);
+}
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__wrap_malloc(size_t size)
@@ -88,7 +96,7 @@ static void check_membership(struct ext4_fs *fs, const uint32_t *members,
                              unsigned count, uint32_t absent)
 {
     uint64_t initial_reads = reads, initial_allocations = lookup_allocations;
-    uint32_t initial_lru = fs->bdev->bc->lru_ctr;
+    uint64_t initial_lookups = cache_lookups;
     measuring_lookup = true;
     for (unsigned repeat = 0; repeat < 4; repeat++) {
         for (unsigned i = 0; i < count; i++) {
@@ -102,7 +110,7 @@ static void check_membership(struct ext4_fs *fs, const uint32_t *members,
     }
     measuring_lookup = false;
     CHECK(lookup_allocations == initial_allocations);
-    CHECK(reads == initial_reads && fs->bdev->bc->lru_ctr == initial_lru);
+    CHECK(reads == initial_reads && cache_lookups == initial_lookups);
 }
 
 static uint32_t fixture_seed(struct ext4_inode_ref *ref)
@@ -383,7 +391,7 @@ int main(int argc, char **argv)
         CHECK(ext4_orphan_add(&refs[0]) == EOK);
         CHECK(ext4_orphan_add(&refs[2]) == EOK);
         uint64_t initial_reads = reads;
-        uint32_t initial_lru = dev.bc->lru_ctr;
+        uint64_t initial_lookups = cache_lookups;
         measuring_lookup = true;
         for (unsigned i = 0; i < 1024; i++) {
             bool present;
@@ -394,7 +402,7 @@ int main(int argc, char **argv)
         }
         measuring_lookup = false;
         CHECK(lookup_allocations == 0);
-        CHECK(reads == initial_reads && dev.bc->lru_ctr == initial_lru);
+        CHECK(reads == initial_reads && cache_lookups == initial_lookups);
         for (unsigned i = 0; i < 3; i++) CHECK(ext4_fs_put_inode_ref(&refs[i]) == EOK);
         CHECK(commit(fs) == EOK);
     } else if (!strcmp(argv[2], "fill")) {

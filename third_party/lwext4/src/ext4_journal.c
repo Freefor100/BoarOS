@@ -1441,7 +1441,7 @@ static void jbd_replay_block_tags(struct jbd_fs *jbd_fs,
 		 * metadata can already be cached. Refresh those live buffers too. */
 		struct ext4_block cached = EXT4_BLOCK_ZERO();
 		struct ext4_buf *buf = ext4_bcache_find_get(fs->bdev->bc, &cached,
-							  tag_info->block);
+							  tag_info->block, NULL);
 		if (buf) {
 			memcpy(buf->data, log.data, block_size);
 			ext4_bcache_clear_dirty(buf);
@@ -1871,7 +1871,7 @@ static int jbd_journal_flush_trans(struct jbd_trans *trans)
 		struct jbd_buf *jb = TAILQ_FIRST(&trans->buf_queue);
 		struct ext4_block block = EXT4_BLOCK_ZERO();
 		struct ext4_buf *buf = ext4_bcache_find_get(bdev->bc, &block,
-							jb->block_rec->lba);
+							jb->block_rec->lba, NULL);
 		int r;
 		if (buf && ext4_bcache_test_flag(buf, BC_UPTODATE) &&
 		    jb->block_rec->trans == trans) {
@@ -3050,7 +3050,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 			 */
 			buf = ext4_bcache_find_get(journal->jbd_fs->bdev->bc,
 					&block,
-					jbd_buf->block_rec->lba);
+					jbd_buf->block_rec->lba, NULL);
 			jbd_trans_end_write(journal->jbd_fs->bdev->bc,
 					buf,
 					EOK,

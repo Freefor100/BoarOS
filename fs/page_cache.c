@@ -89,7 +89,9 @@ struct kernel_page_cache_record {
     struct kernel_mutex metadata;
     struct cache_request *reads_head, **reads_tail;
     struct kernel_io_context *executor_io;
-    uint32_t read_requests, reads_running, request_borrows;
+    uint32_t read_requests, reads_running;
+    /* Atomic lifetime: final unwind returns without reacquiring metadata. */
+    uint32_t request_borrows;
     uint64_t requests_queued, requests_completed, entry_borrows;
     uint64_t deferred_snapshots;
     uint64_t executions_queued, executions_completed;
@@ -1703,6 +1705,18 @@ int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *cache)
     return cache_live(cache) && !kernel_page_cache_is_executor(cache) && remote_cache_client();
 }
 
+static inline void request_borrow_locked(struct kernel_page_cache_record *record)
+{
+    /* Admission is serialized by metadata; concurrent returns only lower it. */
+    if (__atomic_load_n(&record->request_borrows,__ATOMIC_RELAXED)==UINT32_MAX) __builtin_trap();
+    __atomic_fetch_add(&record->request_borrows,1,__ATOMIC_RELAXED);
+}
+static inline void request_return(struct kernel_page_cache_record *record)
+{
+    /* No record access follows the release: destroy may consume the zero. */
+    if (!__atomic_fetch_sub(&record->request_borrows,1,__ATOMIC_RELEASE)) __builtin_trap();
+}
+
 static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache,
     void (*execute)(void *),void *argument,unsigned observed,const int *finished)
 {
@@ -1716,8 +1730,8 @@ static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache
     {
         CACHE_SCOPE(publish, cache);
         if (!r->started || r->stopping) return KERNEL_PAGE_CACHE_STATUS_STATE;
-        if (r->read_requests == UINT32_MAX || r->request_borrows == UINT32_MAX) __builtin_trap();
-        r->request_borrows++;
+        if (r->read_requests == UINT32_MAX) __builtin_trap();
+        request_borrow_locked(r);
         if (!r->reads_head) r->reads_tail = &r->reads_head;
         *r->reads_tail = &request; r->reads_tail = &request.next; r->read_requests++;
         r->requests_queued++;
@@ -1736,9 +1750,7 @@ static enum kernel_page_cache_status run_request(struct kernel_page_cache *cache
     }
     if (kernel_wait_queue_close(&request.changed) ||
         kernel_wait_queue_destroy(&request.changed)) __builtin_trap();
-    { CACHE_SCOPE(guard, cache);
-      if (!r->request_borrows) __builtin_trap();
-      r->request_borrows--; }
+    request_return(r);
     return request.status;
 }
 static enum kernel_page_cache_status run_cpu0_until(struct kernel_page_cache *cache,
@@ -1952,8 +1964,7 @@ static int read_cached_batch(struct cache_read_batch_request *request)
         if (pending || retry) {
             /* Private preparation has no indexed entry yet. Retain the same
              * cache lifetime used by queued requests until caller unwind. */
-            if (cache->record->request_borrows==UINT32_MAX) __builtin_trap();
-            cache->record->request_borrows++;
+            request_borrow_locked(cache->record);
         }
     }
     if (retry) {
@@ -2043,9 +2054,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
     if (read_cached_batch(&request)) {
         prepare_read_batch(&request);
-        CACHE_SCOPE(guard,cache);
-        if (!cache->record->request_borrows) __builtin_trap();
-        cache->record->request_borrows--;
+        request_return(cache->record);
     }
     enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_OK;
     for (size_t i = 0; i < count; i++) if (pages[i].status) {
@@ -3323,7 +3332,7 @@ enum kernel_page_cache_status kernel_page_cache_destroy(struct kernel_page_cache
         if (flush_cache_mount(cache,NULL)) return KERNEL_PAGE_CACHE_STATUS_IO;
         {
             CACHE_SCOPE(guard,cache);
-            if (cache->record->request_borrows) return KERNEL_PAGE_CACHE_STATUS_STATE;
+            if (__atomic_load_n(&cache->record->request_borrows,__ATOMIC_ACQUIRE)) return KERNEL_PAGE_CACHE_STATUS_STATE;
             for (struct kernel_page_cache_entry *entry=cache->record->lru_tail;entry;entry=entry->lru_previous) {
                 uint32_t references;
                 if (physical_page_reference_count(cache->allocator,entry->physical_address,&references)) __builtin_trap();

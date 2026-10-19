@@ -54,19 +54,31 @@ static int ext4_bcache_lba_compare(struct ext4_buf *a, struct ext4_buf *b)
 	 return 0;
 }
 
-static int ext4_bcache_lru_compare(struct ext4_buf *a, struct ext4_buf *b)
-{
-	if (a->lru_id > b->lru_id)
-		return 1;
-	else if (a->lru_id < b->lru_id)
-		return -1;
-	return 0;
-}
-
 RB_GENERATE_INTERNAL(ext4_buf_lba, ext4_buf, lba_node,
 		     ext4_bcache_lba_compare, static inline)
-RB_GENERATE_INTERNAL(ext4_buf_lru, ext4_buf, lru_node,
-		     ext4_bcache_lru_compare, static inline)
+
+static void idle_remove_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
+{
+    if (buf->lru_previous) buf->lru_previous->lru_next=buf->lru_next;
+    else {
+        if (bc->lru_head!=buf) __builtin_trap();
+        bc->lru_head=buf->lru_next;
+    }
+    if (buf->lru_next) buf->lru_next->lru_previous=buf->lru_previous;
+    else {
+        if (bc->lru_tail!=buf) __builtin_trap();
+        bc->lru_tail=buf->lru_previous;
+    }
+    buf->lru_previous=buf->lru_next=NULL;
+}
+static void idle_append_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
+{
+    if (buf->lru_previous || buf->lru_next || bc->lru_head==buf) __builtin_trap();
+    buf->lru_previous=bc->lru_tail;
+    if (bc->lru_tail) bc->lru_tail->lru_next=buf;
+    else bc->lru_head=buf;
+    bc->lru_tail=buf;
+}
 
 static struct ext4_buf *lookup_locked(struct ext4_bcache *bc, uint64_t lba)
 {
@@ -86,13 +98,13 @@ static void dirty_insert_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
     buf->on_dirty_list=true;
 }
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *bc, struct ext4_buf *buf)
-{ KERNEL_RAW_SCOPE(guard,&bc->metadata); dirty_remove_locked(bc,buf); }
+{ KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata); dirty_remove_locked(bc,buf); }
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *bc, struct ext4_buf *buf)
-{ KERNEL_RAW_SCOPE(guard,&bc->metadata); dirty_insert_locked(bc,buf); }
+{ KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata); dirty_insert_locked(bc,buf); }
 static void get_locked(struct ext4_bcache *bc, struct ext4_block *block, struct ext4_buf *buf)
 {
     if (!buf->refctr) {
-        RB_REMOVE(ext4_buf_lru,&bc->lru_root,buf);
+        idle_remove_locked(bc,buf);
         dirty_remove_locked(bc,buf);
     }
     if (buf->refctr==UINT32_MAX) __builtin_trap();
@@ -102,7 +114,7 @@ static void get_locked(struct ext4_bcache *bc, struct ext4_block *block, struct 
 static void drop_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
     if (buf->refctr || buf->loading) __builtin_trap();
-    RB_REMOVE(ext4_buf_lru,&bc->lru_root,buf);
+    idle_remove_locked(bc,buf);
     RB_REMOVE(ext4_buf_lba,&bc->lba_root,buf);
     dirty_remove_locked(bc,buf);
     if (!bc->ref_blocks) __builtin_trap();
@@ -131,7 +143,7 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc)
     for (;;) {
         struct ext4_buf *buf;
         {
-            KERNEL_RAW_SCOPE(guard,&bc->metadata);
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
             buf=RB_MIN(ext4_buf_lba,&bc->lba_root);
             if (!buf) return;
             if (buf->refctr || buf->loading) __builtin_trap();
@@ -140,32 +152,41 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc)
         }
         ext4_block_flush_buf(bc->bdev,buf);
         {
-            KERNEL_RAW_SCOPE(guard,&bc->metadata);
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
             if (buf->refctr!=1) __builtin_trap();
             buf->refctr=0;
-            RB_INSERT(ext4_buf_lru,&bc->lru_root,buf);
+            idle_append_locked(bc,buf);
             drop_locked(bc,buf);
         }
         free_buffer(buf);
     }
 }
 
-struct ext4_buf *ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block *b, uint64_t lba)
+static void read_state_locked(struct ext4_buf *buf, enum ext4_bcache_read_state *read)
 {
-    KERNEL_RAW_SCOPE(guard,&bc->metadata);
+    if (!read) return;
+    if (buf->loading || buf->load_error) *read=EXT4_BCACHE_READ_WAIT;
+    else if (ext4_bcache_test_flag(buf,BC_UPTODATE)) *read=EXT4_BCACHE_READ_READY;
+    else { buf->loading=true;*read=EXT4_BCACHE_READ_LOAD; }
+}
+struct ext4_buf *ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block *b,
+    uint64_t lba, enum ext4_bcache_read_state *read)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
     struct ext4_buf *buf=lookup_locked(bc,lba);
-    if (buf) get_locked(bc,b,buf);
+    if (buf) { get_locked(bc,b,buf);read_state_locked(buf,read); }
     return buf;
 }
 void ext4_bcache_inc_ref(struct ext4_buf *buf)
 {
-    KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
     if (!buf->refctr || buf->refctr==UINT32_MAX) __builtin_trap();
     buf->refctr++;
 }
-int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b, bool *is_new)
+int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
+    enum ext4_bcache_read_state *read)
 {
-    if (ext4_bcache_find_get(bc,b,b->lb_id)) { *is_new=false;return EOK; }
+    if (ext4_bcache_find_get(bc,b,b->lb_id,read)) return EOK;
     /* Candidates are private until the second lookup. Allocation may reclaim
      * or sleep while another CPU publishes the same block. */
     struct ext4_buf *candidate=ext4_calloc(1,sizeof(*candidate));
@@ -175,18 +196,19 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b, bool *is_new
     }
     struct ext4_buf *buf;
     {
-        KERNEL_RAW_SCOPE(guard,&bc->metadata);
+        KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
         buf=lookup_locked(bc,b->lb_id);
         if (buf) {
-            get_locked(bc,b,buf);*is_new=false;
+            get_locked(bc,b,buf);
         } else if (candidate) {
             buf=candidate;candidate=NULL;
             buf->bc=bc;buf->lba=b->lb_id;buf->refctr=1;
             if (RB_INSERT(ext4_buf_lba,&bc->lba_root,buf)) __builtin_trap();
             bc->ref_blocks++;
             if (bc->max_ref_blocks<bc->ref_blocks) bc->max_ref_blocks=bc->ref_blocks;
-            *b=(struct ext4_block){buf->lba,buf,buf->data};*is_new=true;
+            *b=(struct ext4_block){buf->lba,buf,buf->data};
         }
+        if (buf) read_state_locked(buf,read);
     }
     if (candidate) free_buffer(candidate);
     return buf ? EOK : ENOMEM;
@@ -199,11 +221,11 @@ static void invalidate_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
     ext4_bcache_clear_dirty(buf);
 }
 void ext4_bcache_invalidate_buf(struct ext4_bcache *bc, struct ext4_buf *buf)
-{ KERNEL_RAW_SCOPE(guard,&bc->metadata);invalidate_locked(bc,buf); }
+{ KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);invalidate_locked(bc,buf); }
 void ext4_bcache_invalidate_lba(struct ext4_bcache *bc, uint64_t from, uint32_t cnt)
 {
     if (!cnt) return;
-    KERNEL_RAW_SCOPE(guard,&bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
     struct ext4_buf key={.lba=from};
     struct ext4_buf *buf=RB_NFIND(ext4_buf_lba,&bc->lba_root,&key);
     while (buf && buf->lba-from<cnt) {
@@ -217,26 +239,26 @@ static int put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_on
     struct ext4_buf *buf=b->buf;
     bool flush=false,drop=false;
     int result=EOK;
-    KERNEL_RAW_SCOPE(guard,&bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
     if (!buf || !buf->refctr || buf->bc!=bc) __builtin_trap();
     flush=buf->refctr==1 && !read_only && ext4_bcache_test_flag(buf,BC_DIRTY) &&
         ext4_bcache_test_flag(buf,BC_UPTODATE) && (!bc->bdev->cache_write_back ||
         ext4_bcache_test_flag(buf,BC_FLUSH) || ext4_bcache_test_flag(buf,BC_TMP));
+    /* The context callback is a nonblocking query. Clean/shared references and
+     * deferred dirty buffers need no flush decision from the calling task. */
+    if (flush && bc->bdev->bdif->read_context && bc->bdev->bdif->read_context()) flush=false;
     /* The final writer keeps its reference across flush. A concurrent lookup
      * cannot detach this buffer while the device borrows its payload. */
     if (flush) {
-        kernel_raw_lock_release(&guard);
+        kernel_task_lock_release(&guard);
         result=ext4_block_flush_buf(bc->bdev,buf);
-        kernel_raw_lock_acquire(&bc->metadata,&guard);
+        kernel_task_lock_acquire(&bc->metadata,&guard);
     }
     {
         if (flush && !result) ext4_bcache_clear_flag(buf,BC_FLUSH);
         if (!--buf->refctr) {
-            /* LRU counter wrap retains a unique key among live idle buffers. */
-            struct ext4_buf key;
-            do { key.lru_id=++bc->lru_ctr; } while (RB_FIND(ext4_buf_lru,&bc->lru_root,&key));
-            buf->lru_id=key.lru_id;
-            if (RB_INSERT(ext4_buf_lru,&bc->lru_root,buf)) __builtin_trap();
+            /* A zero-reference return is newest; no search or age counter. */
+            idle_append_locked(bc,buf);
             if (ext4_bcache_test_flag(buf,BC_DIRTY) && ext4_bcache_test_flag(buf,BC_UPTODATE))
                 dirty_insert_locked(bc,buf);
             drop=!result && (!ext4_bcache_test_flag(buf,BC_UPTODATE) || ext4_bcache_test_flag(buf,BC_TMP));
@@ -244,7 +266,7 @@ static int put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_on
         }
         b->lb_id=0;b->data=NULL;
     }
-    kernel_raw_lock_release(&guard);
+    kernel_task_lock_release(&guard);
     if (drop) free_buffer(buf);
     return result;
 }
@@ -252,11 +274,11 @@ int ext4_bcache_free_read(struct ext4_bcache *bc, struct ext4_block *b)
 { return put_buffer(bc,b,true); }
 int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 {
-    return put_buffer(bc,b,bc->bdev->bdif->read_context && bc->bdev->bdif->read_context());
+    return put_buffer(bc,b,false);
 }
 struct ext4_buf *ext4_bcache_dirty_get(struct ext4_bcache *bc, struct ext4_block *b)
 {
-    KERNEL_RAW_SCOPE(guard,&bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
     struct ext4_buf *buf=SLIST_FIRST(&bc->dirty_list);
     if (buf) get_locked(bc,b,buf);
     return buf;
@@ -266,7 +288,7 @@ int ext4_bcache_shake(struct ext4_bcache *bc)
     bool read_only=bc->bdev->bdif->read_context && bc->bdev->bdif->read_context();
     int result=EOK;
     {
-        KERNEL_RAW_SCOPE(guard,&bc->metadata);
+        KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
         if (bc->dont_shake) return EOK;
         bc->dont_shake=true;
     }
@@ -275,8 +297,8 @@ int ext4_bcache_shake(struct ext4_bcache *bc)
         struct ext4_block owned;
         bool dirty;
         {
-            KERNEL_RAW_SCOPE(guard,&bc->metadata);
-            buf=RB_MIN(ext4_buf_lru,&bc->lru_root);
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+            buf=bc->lru_head;
             if (!buf || bc->ref_blocks<bc->cnt) break;
             dirty=ext4_bcache_test_flag(buf,BC_DIRTY);
             if (dirty && read_only) break;
@@ -293,20 +315,20 @@ int ext4_bcache_shake(struct ext4_bcache *bc)
         COST_ADD(BLOCK_CACHE_EVICTIONS,1);
         free_buffer(buf);
     }
-    { KERNEL_RAW_SCOPE(guard,&bc->metadata);bc->dont_shake=false; }
+    { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);bc->dont_shake=false; }
     return result;
 }
 
 void ext4_bcache_scope_begin(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
 {
-    KERNEL_RAW_SCOPE(guard,&bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
     scope->head=NULL;scope->previous=bc->writeback_scope;
     if (!bc->writeback_scope) bc->writeback_scope=scope;
     bc->bdev->cache_write_back++;
 }
 void ext4_bcache_scope_track(struct ext4_buf *buf)
 {
-    KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
     struct ext4_writeback_scope *scope=buf->bc->writeback_scope;
     if (!scope || buf->writeback_scope) return;
     if (!buf->refctr || buf->refctr==UINT32_MAX) __builtin_trap();
@@ -317,17 +339,17 @@ int ext4_bcache_scope_end(struct ext4_bcache *bc, struct ext4_writeback_scope *s
 {
     int result=EOK;
     struct ext4_buf *buf;
-    { KERNEL_RAW_SCOPE(guard,&bc->metadata);buf=scope->head;if (!scope->previous) bc->writeback_scope=NULL; }
+    { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);buf=scope->head;if (!scope->previous) bc->writeback_scope=NULL; }
     while (buf) {
         struct ext4_buf *next;
         struct ext4_block b={buf->lba,buf,buf->data};
         if (bc->bdev->cache_write_back==1) {
             int r=ext4_block_flush_buf(bc->bdev,buf);if (!result) result=r;
         }
-        { KERNEL_RAW_SCOPE(guard,&bc->metadata);next=buf->writeback_next;buf->writeback_scope=NULL;buf->writeback_next=NULL; }
+        { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);next=buf->writeback_next;buf->writeback_scope=NULL;buf->writeback_next=NULL; }
         int r=ext4_bcache_free(bc,&b);if (!result) result=r;
         buf=next;
     }
-    { KERNEL_RAW_SCOPE(guard,&bc->metadata);bc->bdev->cache_write_back--;scope->head=NULL; }
+    { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);bc->bdev->cache_write_back--;scope->head=NULL; }
     return result;
 }

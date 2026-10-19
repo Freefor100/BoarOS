@@ -30,8 +30,16 @@ USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务�
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 同一 API 按 CPU 数编译：UP 关闭中断、保持抢占嵌套并使用编译器屏障，SMP 另以 acquire/release 原子操作互斥。
 `LOCK_DEBUG=1` 开启递归扫描和等级审计，默认关闭；持有链始终保留，用于禁止等待、嵌套恢复和最外层解锁后的通知发布。pthread 宿主夹具明确使用 SMP 配置，`test-sync-host` 覆盖 UP/SMP 与锁调试的四种组合。
+
+短对象保护按实际访问者选择：`KERNEL_TASK_LOCK_SCOPE` 用于只由任务修改的 ext4
+缓冲元数据，`KERNEL_IRQ_LOCK_SCOPE` 用于任务和设备中断共享的 VirtIO 请求状态。
+默认 UP 构建中，前者通过抢占深度和编译器屏障排除其他任务，保留原中断状态；
+后者再关闭本地中断。UP 的互斥由抢占深度提供，检查嵌套归还并禁止阻塞，无需读写对象锁字。
+SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有链和对象初始化检查，递归及等级审计由 `LOCK_DEBUG` 开启。调度器和分配器继续使用原 raw
+持有链；`test-lwext4-exclusion-host` 检查四种 UP/SMP、debug 组合及真实共享更新。
+
 任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
-受控任务可绑定匿名及私有arena tmpfs映射 MM，信号内容、文件/SysV/设备业务及其统计仍限定单CPU；调度元数据互斥不表示整个内核支持SMP。
+受控任务可绑定匿名及私有arena tmpfs映射 MM；RV 用户路径中的信号递送、sigreturn 和 ext4 冷读在实际执行 CPU 推进，命名空间修改、日志和挂载管理继续由 CPU0 执行。具体交接见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
 `kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定

@@ -1,5 +1,4 @@
 #include <kernel/raw_lock.h>
-#define KERNEL_RAW_INITIALIZED UINT32_C(0x52415731)
 _Static_assert(__atomic_always_lock_free(4, 0), "raw locks require inline 32-bit atomics");
 
 void kernel_raw_lock_init(struct kernel_raw_lock *lock, uint32_t rank)

@@ -10,7 +10,7 @@ cc=${HOST_CC:-cc}
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_orphan.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread \
-    -Wl,--wrap=malloc -Wl,--wrap=calloc -o "$work/probe"
+    -Wl,--wrap=malloc -Wl,--wrap=calloc,--wrap=ext4_bcache_find_get -o "$work/probe"
 printf 'persistent orphan fixture' > "$work/data"
 for features in '^orphan_file' orphan_file 'orphan_file,^metadata_csum_seed' 'orphan_file,^metadata_csum,^metadata_csum_seed'; do
     image="$work/$features.img"

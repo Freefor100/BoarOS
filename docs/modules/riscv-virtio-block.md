@@ -29,6 +29,12 @@ RV `arch/riscv/virtio_mmio_block.c` 负责PLIC绑定，MMIO身份/版本和寄�
 
 ## 请求和 DMA
 
+请求槽、描述符、used 收割、完成通知和设备失败状态共用设备元数据保护。
+任务和 IRQ 均使用 `KERNEL_IRQ_LOCK_SCOPE`：默认 UP 关闭本地中断并禁止抢占，
+SMP 使用完整 raw 锁。保护规则见[调度模块](kernel-scheduler.md)；驱动不再在同一
+元数据保护外重复保存中断状态。等待条件检查与 PREPARED 登记在保护内完成，
+释放后再 park/finish，重新取得保护后消费结果；提前到达的完成仍由原 token 接收。
+
 请求槽、描述符、used 收割、完成状态、接纳门闩、工作槽与统计由每设备的一把 raw 短锁保护。任务提交者与 CPU0 中断使用相同规则；读任务可在发起 CPU 调用 `kernel_block_read_at/read_batch`，物理盘及分区仍共用 `io_lock` 和单队列。等待者在设备锁内检查条件并登记，释放锁后 park/finish，再取得锁消费结果。完成者持锁到私有等待队列通知结束，远端任务随后才能归还并复用请求槽。
 
 超时或队列损坏先停止接纳，在锁内完成同步 transport reset 并确认 DMA 停止，再发布错误和通知；调用者消费结果后归还槽和工作区。配置、IRQ 登记与最终销毁仍在 CPU0 执行，销毁要求没有活动调用和工作槽借用。设备锁内只做有界队列处理和直接 DMA 地址转换，分配、释放和休眠在锁外。
@@ -73,7 +79,7 @@ reset 停止 DMA 的依据是固定 `references/qemu/hw/virtio/virtio-mmio.c` �
 
 flush 先阻止新逻辑调用并排空此前逻辑调用，再发送 FLUSH，完成后才放行后续调用；已入场的 batch 在 flush 等待期间仍可补发余下 span，避免屏障与未发布项互锁。无 FLUSH 特性的 write-through 同样经过软件排空屏障。batch 收到一个错误后停止发布所有剩余项，包含已读入 bounce 但尚未写出的 RMW；已发布 DMA 继续收割，或在期限到达时 reset 并确认 DMA 停止，最后才返回实际失败。取消和信号不会中断内部等待或提前归还 buffer。普通构建记录提交数、实际最大已发布在途数、IRQ、完成等待睡眠/唤醒、队列等待及错误，不把已预留但未发布槽计入在途。仅 `BOAROS_COST_DIAGNOSTICS=1` 累计在途深度积分（inflight-ticks，单位 深度·tick）、忙时、总时间、队列等待与服务时间，销毁时将这些时间写入最终统计；普通构建不为这类统计读取时钟，相关字段保持零。请求期限仍在所有构建中正常检查。
 
-PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、启动 hart 的 supervisor cause 9 和 VirtIO interrupt-parent 关联；不硬编码 IRQ/context 编号。外部中断执行 claim、设备分派/ack、complete；IRQ 不分配或做文件清理。块/VFS 同步接口不变，设备内部允许多个调用同时等待。实板、IOMMU、非一致 DMA 和 SMP 仍不在此边界内。
+PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、启动 hart 的 supervisor cause 9 和 VirtIO interrupt-parent 关联；不硬编码 IRQ/context 编号。外部中断执行 claim、设备分派/ack、complete；IRQ 不分配或做文件清理。设备允许 CPU0/CPU1 调用者同时等待，由 CPU0 处理设备中断。当前验证覆盖 QEMU 一致 DMA；实板、IOMMU 和非一致 DMA 由相应平台验证。
 
 完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 超出队列范围、指向数据/status 描述符为 `used-element`；legacy 的零长度完成同样被拒绝；指向未发布 head、重复 head 或非 submitted 请求为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 transport context/device status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 transport、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。modern IN 只有 used length 覆盖全部数据和末尾 status、且 status 成功时才交付数据；零长和其他短完成直接使该请求返回 I/O 错误，不读取未覆盖的 status，不补零，也不因此复位整台设备。合法 used 已结束本次 DMA，完成 owner 照常归还，后续请求仍可执行。legacy 保留现有长度兼容范围。正常完成、短完成和普通 IOERR/UNSUPP 不输出这段诊断，其他损坏的 reset 与 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
 
