@@ -177,13 +177,6 @@ main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 
 
 修复前，exec会丢失换出MM的历史RSS峰值；短复现先失败，保存旧MM峰值后两架构通过。两核exec还暴露了读盘调用链的8KiB内核栈耗尽：块层给每次读取都预留32项分区转换数组，连整盘单页缺页也付出1.25KiB栈开销。整盘现在直接借用原向量，分区按本次请求大小转换；同一短复现通过，栈最小剩余约1.25KiB。
 
-相同ELF、1CPU/1GiB、同一QEMU11.1.2，关闭诊断，旧/新核交替各5轮的中位数：
-
-| 工作量 | 修改前 | 修改后 | 变化 |
-|---|---:|---:|---:|
-| 10000次getpid | 15.390ms | 22.273ms | +44.7% |
-| 1000次sched_yield | 2.487ms | 3.454ms | +38.9% |
-
-这是每次trap/返回读取时钟并同步记账的成本；getpid每次增加约0.688µs。它是单核QEMU微基准结果，未据此推算应用吞吐或lmbench得分。
+后续CPU记账已改为CPU本地执行片段，并优化了counter访问。新的同批三版本对照、原版SQLite负载与观测到的LA事务耗时上升，统一见[CPU记账成本](cpu-accounting-cost.md)。本节六项原程序的分数仍对应前面标明的`1b2b3a8`运行；后续优化的资源/时钟、真实两核和程序成本记录由该报告维护。
 
 本批运行原始文件保存在 `build/cpu-usage/official-probe/`：`probe-run.json`记录QEMU命令和kernel/init/盘身份，`container-identity.json`记录固定容器工具，`results.json`、各组judge输出和串口记录包含24次程序的结果与耗时，`disk-checks.json`与对应fsck日志记录8次磁盘检查。主线差分与并发日志在同目录上级；配对计时为 `matched-benchmark/results.json`。复用缓存继续保留，完成检查的运行盘删除。
