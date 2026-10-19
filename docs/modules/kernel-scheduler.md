@@ -39,7 +39,7 @@ SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有
 持有链；`test-lwext4-exclusion-host` 检查四种 UP/SMP、debug 组合及真实共享更新。
 
 任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
-受控任务可绑定匿名及私有arena tmpfs映射 MM，信号内容、文件/SysV/设备业务及其统计仍限定单CPU；调度元数据互斥不表示整个内核支持SMP。
+受控任务可绑定匿名及私有arena tmpfs映射 MM；RV 用户路径中的信号递送、sigreturn 和 ext4 冷读在实际执行 CPU 推进，命名空间修改、日志和挂载管理继续由 CPU0 执行。具体交接见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
 `kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定

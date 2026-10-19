@@ -71,6 +71,8 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 以一个或两个本地零字段计算同一 CRC，不复制整个 inode、不分配或等待；真正的修改路径
 另写入计算结果。CRC32C共用4 KiB只读表的 slicing-by-4 实现，对齐后的四字节
 一起更新，首尾逐字节处理，不越过输入区间；种子、分段更新和校验比较保持原格式。
+RV 将小型 CRC32C 函数按 256 字节对齐，使热循环保持在同一 4 KiB 指令页，
+减少 QEMU 的跨页翻译块查找；`make test-lwext4-crc-layout-riscv` 检查实际链接后的函数范围。
 普通 inode 与 orphan 的计算共用归一化原语，128-byte/扩展 inode
 字段规则保持原语义。布局由挂载几何验证保护，helper 的非法内部布局触发 fatal，
 损坏镜像仍按原验证返回格式/校验错误。`make test-lwext4-checksum-host` 以独立逐位

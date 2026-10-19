@@ -780,6 +780,10 @@ test-lwext4-checksum-host:
 	build/host/lwext4-checksum
 	python3 -B tests/lwext4-checksum-read-host.py
 
+.PHONY: test-lwext4-crc-layout-riscv
+test-lwext4-crc-layout-riscv: $(KERNEL_RV)
+	python3 -B tests/lwext4-crc-layout.py --nm $(NM) $(KERNEL_RV)
+
 .PHONY: test-string-host
 test-string-host:
 	sh tests/string-host.sh

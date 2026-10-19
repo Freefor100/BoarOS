@@ -382,6 +382,11 @@ uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size)
 
 typedef uint32_t crc32c_word __attribute__((__may_alias__));
 
+#if defined(__riscv)
+/* 保持小型校验循环处于同一4KiB代码页；跨页会使QEMU反复查找翻译块。
+ * 256字节对齐避免布局变化把每四字节执行的热循环拆开。 */
+__attribute__((aligned(256)))
+#endif
 static uint32_t crc32c(uint32_t crc, const void *buf, uint32_t size)
 {
 	const uint8_t *bytes = buf;
