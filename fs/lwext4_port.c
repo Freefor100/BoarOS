@@ -4,6 +4,7 @@
 #include <kernel/sync.h>
 #include <arch/context.h>
 #include <ext4.h>
+#include <ext4_bcache.h>
 
 #include <stddef.h>
 
@@ -12,7 +13,7 @@ static unsigned heap_users;
 static struct kernel_wait_queue channels[64];
 static void backend_enter(void *lock, int read)
 {
-    kernel_assert_service_context();
+    if (!read) kernel_assert_service_context();
     struct kernel_io_context *context = kernel_io_context_current();
     if (context->backend_depth) {
         if (context->backend_guard.lock != lock || (!read && context->backend_read)) __builtin_trap();
@@ -66,19 +67,25 @@ static struct kernel_wait_queue *channel(void *key)
 { return &channels[((uintptr_t)key >> 4) % 64]; }
 void boaros_lwext4_wait(void *key)
 {
-    uintptr_t irq = arch_interrupt_save();
+    struct ext4_buf *buf=key;
+    struct kernel_wait_token token;
+    {
+        KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+        /* Completion may precede this callback. Check and register together. */
+        if (!buf->loading) return;
+        if (kernel_wait_prepare(channel(buf),0,0,&token)!=KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+    }
     enum kernel_wait_wake_reason reason;
-    if (KERNEL_WAIT_RECHECK(channel(key), 0, 0, &reason,
-                (1)) != KERNEL_SCHEDULER_STATUS_OK)
-        __builtin_trap();
-    arch_interrupt_restore(irq);
+    if (kernel_wait_park(&token,&reason)!=KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_wait_finish(&token)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 }
 void boaros_lwext4_wake(void *key)
 {
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_wait_queue *queue = channel(key);
-    if (queue->head && kernel_wait_queue_wake_all(queue) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    arch_interrupt_restore(irq);
+    /* Caller holds the buffer-cache metadata lock and a producer reference. */
+    struct kernel_wait_queue *queue=channel(key);
+    if (__atomic_load_n(&queue->head,__ATOMIC_RELAXED) &&
+        kernel_wait_queue_wake_all(queue)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 }
 
 int boaros_lwext4_allocation_active(void)

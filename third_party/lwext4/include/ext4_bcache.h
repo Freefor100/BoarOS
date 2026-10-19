@@ -47,6 +47,7 @@ extern "C" {
 #include <stdbool.h>
 #include <misc/tree.h>
 #include <misc/queue.h>
+#include <kernel/raw_lock.h>
 
 #define EXT4_BLOCK_ZERO() 	\
 	{.lb_id = 0, .data = 0}
@@ -126,6 +127,8 @@ struct ext4_buf {
 
 /**@brief   Block cache descriptor*/
 struct ext4_bcache {
+	/* Index, LRU, references and load publication; no allocation/I/O inside. */
+	struct kernel_raw_lock metadata;
 	struct ext4_writeback_scope *writeback_scope;
 
 	/**@brief   Item count in block cache*/
@@ -175,14 +178,12 @@ enum bcache_state_bits {
 	BC_TMP
 };
 
-#define ext4_bcache_set_flag(buf, b)    \
-	(buf)->flags |= 1 << (b)
-
-#define ext4_bcache_clear_flag(buf, b)    \
-	(buf)->flags &= ~(1 << (b))
-
-#define ext4_bcache_test_flag(buf, b)    \
-	(((buf)->flags & (1 << (b))) >> (b))
+#define ext4_bcache_set_flag(buf, b) \
+    ((void)__atomic_fetch_or(&(buf)->flags, 1 << (b), __ATOMIC_RELAXED))
+#define ext4_bcache_clear_flag(buf, b) \
+    ((void)__atomic_fetch_and(&(buf)->flags, ~(1 << (b)), __ATOMIC_RELAXED))
+#define ext4_bcache_test_flag(buf, b) \
+    ((__atomic_load_n(&(buf)->flags, __ATOMIC_RELAXED) >> (b)) & 1)
 
 void ext4_bcache_scope_track(struct ext4_buf *buf);
 void ext4_bcache_scope_begin(struct ext4_bcache *bc,
@@ -201,34 +202,15 @@ static inline void ext4_bcache_clear_dirty(struct ext4_buf *buf) {
 	ext4_bcache_clear_flag(buf, BC_DIRTY);
 }
 
-/**@brief   Increment reference counter of buf by 1.*/
-#define ext4_bcache_inc_ref(buf) ((buf)->refctr++)
-
-/**@brief   Decrement reference counter of buf by 1.*/
-#define ext4_bcache_dec_ref(buf) ((buf)->refctr--)
-
-/**@brief   Insert buffer to dirty cache list
- * @param   bc block cache descriptor
- * @param   buf buffer descriptor */
-static inline void
-ext4_bcache_insert_dirty_node(struct ext4_bcache *bc, struct ext4_buf *buf) {
-	if (!buf->on_dirty_list) {
-		SLIST_INSERT_HEAD(&bc->dirty_list, buf, dirty_node);
-		buf->on_dirty_list = true;
-	}
-}
-
-/**@brief   Remove buffer to dirty cache list
- * @param   bc block cache descriptor
- * @param   buf buffer descriptor */
-static inline void
-ext4_bcache_remove_dirty_node(struct ext4_bcache *bc, struct ext4_buf *buf) {
-	if (buf->on_dirty_list) {
-		SLIST_REMOVE(&bc->dirty_list, buf, ext4_buf, dirty_node);
-		buf->on_dirty_list = false;
-	}
-}
-
+/* The caller already owns a reference; journal/scope pins share the index lock. */
+void ext4_bcache_inc_ref(struct ext4_buf *buf);
+void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
+void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
+/* Select and detach clean victims atomically, flushing only in a write context. */
+int ext4_bcache_shake(struct ext4_bcache *);
+int ext4_bcache_free_read(struct ext4_bcache *, struct ext4_block *);
+/* Caller owns the returned dirty buffer across lock-free device I/O. */
+struct ext4_buf *ext4_bcache_dirty_get(struct ext4_bcache *, struct ext4_block *);
 
 /**@brief   Dynamic initialization of block cache.
  * @param   bc block cache descriptor
@@ -246,16 +228,6 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc);
  * @param   bc block cache descriptor
  * @return  standard error code*/
 int ext4_bcache_fini_dynamic(struct ext4_bcache *bc);
-
-/**@brief   Get a buffer with the lowest LRU counter in bcache.
- * @param   bc block cache descriptor
- * @return  buffer with the lowest LRU counter*/
-struct ext4_buf *ext4_buf_lowest_lru(struct ext4_bcache *bc);
-
-/**@brief   Drop unreferenced buffer from bcache.
- * @param   bc block cache descriptor
- * @param   buf buffer*/
-void ext4_bcache_drop_buf(struct ext4_bcache *bc, struct ext4_buf *buf);
 
 /**@brief   Invalidate a buffer.
  * @param   bc block cache descriptor
@@ -301,7 +273,7 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b);
 /**@brief   Return a full status of block cache.
  * @param   bc block cache descriptor
  * @return  full status*/
-bool ext4_bcache_is_full(struct ext4_bcache *bc);
+
 
 #ifdef __cplusplus
 }

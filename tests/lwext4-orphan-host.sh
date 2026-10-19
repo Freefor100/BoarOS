@@ -6,10 +6,10 @@ trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work"; else echo "test ar
 trap 'exit 1' HUP INT TERM
 cc=${HOST_CC:-cc}
 "$cc" -std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-unused-but-set-variable \
-    -Wno-stringop-truncation -DCONFIG_USE_DEFAULT_CFG=1 ${ORPHAN_TEST_CFLAGS:-} \
+    -Wno-stringop-truncation -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${ORPHAN_TEST_CFLAGS:-} \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_orphan.c" \
-    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" -I"$root/tests/host/block_model" -pthread \
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread \
     -Wl,--wrap=malloc -Wl,--wrap=calloc -o "$work/probe"
 printf 'persistent orphan fixture' > "$work/data"
 for features in '^orphan_file' orphan_file 'orphan_file,^metadata_csum_seed' 'orphan_file,^metadata_csum,^metadata_csum_seed'; do

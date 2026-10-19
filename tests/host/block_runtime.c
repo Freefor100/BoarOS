@@ -45,3 +45,6 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
 _Thread_local uint64_t block_test_read_bytes, block_test_write_bytes;
 void kernel_task_account_read(uint64_t bytes) { block_test_read_bytes += bytes; }
 void kernel_task_account_write(uint64_t bytes) { block_test_write_bytes += bytes; }
+
+static _Thread_local struct kernel_cpu model_cpu = {.initialized=KERNEL_CPU_INITIALIZED};
+void *block_model_cpu(void) { return &model_cpu; }

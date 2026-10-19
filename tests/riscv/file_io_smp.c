@@ -173,6 +173,19 @@ static void verify(void *unused)
     check(raw_submissions && raw_read_cpu==(cpus==2?1U:0U),"block-read-caller-actual-virtio-submit");
     virt_uart_puts("BoarOS: BLOCK caller reads hart=");virt_uart_put_hex(raw_read_cpu);
     virt_uart_puts(" submissions=");virt_uart_put_hex(raw_submissions);virt_uart_putc('\n');
+    raw_read_active=1;raw_submissions=0;
+    struct file_read_span direct={0,raw_bytes,4,0,0};
+    {
+        KERNEL_LOCK_SCOPE(inode);
+        kernel_vfs_node_lock(kernel_open_file_node(cold_control),&inode,0);
+        check(!__real_kernel_vfs_node_pread_batch(kernel_open_file_node(cold_control),&direct,1,NULL,NULL) &&
+            !direct.error && direct.completed==4 && !memcmp(raw_bytes,"COLD",4),
+            "ext4-direct-caller-content");
+    }
+    raw_read_active=0;
+    check(raw_submissions,"ext4-direct-caller-actual-submit");
+    virt_uart_puts("BoarOS: EXT4 direct backend read hart=");virt_uart_put_hex(raw_read_cpu);
+    virt_uart_puts(" submissions=");virt_uart_put_hex(raw_submissions);virt_uart_putc('\n');
     struct kernel_mm *mm=0; struct kernel_files *files=0; current(&mm,&files);
     int64_t result; size_t copied;
     struct kernel_page_cache_concurrency_state before,after;

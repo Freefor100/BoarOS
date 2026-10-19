@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sched.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"cache:%d: %s\n",__LINE__,#x); exit(1); } } while (0)
 static unsigned live, allocations, fail_allocation, reads, writes, waits;
@@ -11,12 +13,33 @@ static int read_error, write_error, shared_read;
 static struct ext4_block *loading_owner;
 static struct ext4_block interleaved;
 static int insert_during_write;
-void *ext4_user_malloc(size_t n) { if (++allocations==fail_allocation) return NULL; void *p=malloc(n); if(p)live++; return p; }
-void *ext4_user_calloc(size_t n,size_t s) { if (++allocations==fail_allocation) return NULL; void *p=calloc(n,s); if(p)live++; return p; }
+static struct ext4_blockdev *allocate_peer;
+static struct ext4_block allocation_peer;
+static unsigned parallel_load,load_entered,load_release,load_waiter;
+void *ext4_user_malloc(size_t n)
+{
+    CHECK(!kernel_cpu_current()->raw_locks);
+    if (__atomic_add_fetch(&allocations,1,__ATOMIC_RELAXED)==fail_allocation) return NULL;
+    void *p=malloc(n); if(p)__atomic_add_fetch(&live,1,__ATOMIC_RELAXED);
+    if (p && allocate_peer) {
+        struct ext4_blockdev *peer=allocate_peer; allocate_peer=NULL;
+        CHECK(ext4_block_get(peer,&allocation_peer,7)==EOK);
+    }
+    return p;
+}
+void *ext4_user_calloc(size_t n,size_t s) { CHECK(!kernel_cpu_current()->raw_locks); if (__atomic_add_fetch(&allocations,1,__ATOMIC_RELAXED)==fail_allocation) return NULL; void *p=calloc(n,s); if(p)__atomic_add_fetch(&live,1,__ATOMIC_RELAXED); return p; }
 void *ext4_user_realloc(void *p,size_t n) { (void)p;(void)n;abort(); }
-void ext4_user_free(void *p) { if(p){CHECK(live);live--;free(p);} }
+void ext4_user_free(void *p) { CHECK(!kernel_cpu_current()->raw_locks); if(p){CHECK(__atomic_fetch_sub(&live,1,__ATOMIC_RELAXED));free(p);} }
 static int dev_read(struct ext4_blockdev *b,void *out,uint64_t block,uint32_t count)
-{ (void)b;reads++;if(read_error)return read_error;memset(out,(unsigned char)(block/8),count*512);return EOK; }
+{
+    (void)b;__atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+    if (parallel_load && block==56) {
+        __atomic_store_n(&load_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&load_release,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    if(read_error)return read_error;
+    memset(out,(unsigned char)(block/8),count*512);return EOK;
+}
 static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t block,uint32_t count)
 {
     (void)p;(void)block;(void)count;writes++;
@@ -30,7 +53,17 @@ static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t block,uint32
 static int read_context(void) { return shared_read; }
 static void wait_read(void *key)
 {
-    struct ext4_buf *buf=key;waits++;
+    struct ext4_buf *buf=key;
+    __atomic_add_fetch(&waits,1,__ATOMIC_RELAXED);
+    if (parallel_load) {
+        __atomic_store_n(&load_waiter,1,__ATOMIC_RELEASE);
+        for (;;) {
+            bool loading;
+            { KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);loading=buf->loading; }
+            if (!loading) return;
+            sched_yield();
+        }
+    }
     CHECK(loading_owner && loading_owner->buf==buf && buf->refctr==2);
     memset(buf->data,(unsigned char)buf->lba,4096);
     ext4_bcache_set_flag(buf,BC_UPTODATE);buf->loading=false;
@@ -216,4 +249,38 @@ static void invalid_physical_batch(void)
     for (unsigned i=0;i<2;i++) CHECK(spans[i].status==EINVAL && !spans[i].completed);
     finish(&cache);
 }
-int main(void) { cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }
+static void competing_allocation(void)
+{
+    struct ext4_bcache cache;struct ext4_blockdev dev;struct ext4_blockdev_iface iface;
+    struct ext4_block block={0};init(&cache,&dev,&iface,8);
+    allocate_peer=&dev;
+    CHECK(ext4_block_get(&dev,&block,7)==EOK);
+    CHECK(block.buf==allocation_peer.buf && block.buf->refctr==2 && cache.ref_blocks==1 && reads==1);
+    CHECK(ext4_block_set(&dev,&block)==EOK && ext4_block_set(&dev,&allocation_peer)==EOK);
+    finish(&cache);
+    puts("cache competing allocation: one indexed buffer, one load, both owners returned");
+}
+struct parallel_read { struct ext4_blockdev *dev;struct ext4_block block; };
+static void *parallel_reader(void *arg)
+{
+    struct parallel_read *reader=arg;
+    get(reader->dev,&reader->block,7);
+    return NULL;
+}
+static void concurrent_load(void)
+{
+    struct ext4_bcache cache;struct ext4_blockdev dev;struct ext4_blockdev_iface iface;
+    init(&cache,&dev,&iface,8);parallel_load=1;load_entered=load_release=load_waiter=0;
+    struct parallel_read readers[2]={{.dev=&dev},{.dev=&dev}};
+    pthread_t threads[2];CHECK(!pthread_create(&threads[0],NULL,parallel_reader,&readers[0]));
+    while (!__atomic_load_n(&load_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    CHECK(!pthread_create(&threads[1],NULL,parallel_reader,&readers[1]));
+    while (!__atomic_load_n(&load_waiter,__ATOMIC_ACQUIRE)) sched_yield();
+    __atomic_store_n(&load_release,1,__ATOMIC_RELEASE);
+    for (unsigned i=0;i<2;i++) CHECK(!pthread_join(threads[i],NULL));
+    CHECK(reads==1 && readers[0].block.buf==readers[1].block.buf && readers[0].block.buf->refctr==2);
+    for (unsigned i=0;i<2;i++) CHECK(ext4_block_set(&dev,&readers[i].block)==EOK);
+    parallel_load=0;finish(&cache);
+    puts("cache concurrent cold readers: one loader, stable bytes and balanced references");
+}
+int main(void) { competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }

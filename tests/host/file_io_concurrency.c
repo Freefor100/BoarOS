@@ -10,6 +10,8 @@
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
+#include <ext4_bcache.h>
+#include "../../fs/lwext4_port.h"
 #include <kernel/file_mapping.h>
 #include <kernel/irq.h>
 #include "../../fs/files/private.h"
@@ -55,6 +57,7 @@ struct packet { uint32_t actor,sequence; unsigned char payload[24]; };
 static pthread_barrier_t launch;
 #define FUTEX_ADDRESS UINT64_C(0x600000)
 static _Thread_local unsigned futex_role;
+static _Thread_local unsigned completed_buffer_wait;
 static unsigned futex_registered,futex_edit_ready,futex_word_read;
 #ifdef TCP_IO_CASES
 static void tcp_wait_preparing(struct kernel_wait_queue *);
@@ -70,6 +73,7 @@ enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
+    assert(!completed_buffer_wait && "completed ext4 load registered an unconditional wait");
 #ifdef TCP_IO_CASES
     tcp_wait_preparing(queue);
 #endif
@@ -899,6 +903,14 @@ int main(int argc,char **argv)
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
     borrowed_page_case(&pages);
+    struct ext4_bcache done_cache;
+    assert(!ext4_bcache_init_dynamic(&done_cache,1,4096));
+    struct ext4_buf done_buffer={.bc=&done_cache,.loading=false};
+    completed_buffer_wait=1;
+    boaros_lwext4_wait(&done_buffer);
+    completed_buffer_wait=0;
+    assert(!ext4_bcache_fini_dynamic(&done_cache));
+    puts("PASS ext4 completion before wait callback: no registration and no sleep");
     struct arch_mmu_page_table kernel={0}; struct arch_mmu_user_space user={0};
     assert(!riscv_sv39_page_table_init(&kernel,&pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
     assert(!arch_mmu_user_space_init(&user,&pages,&kernel) && !kernel_mm_create(&mm,&user) &&

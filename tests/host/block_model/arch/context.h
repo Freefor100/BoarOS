@@ -4,7 +4,8 @@
 #ifndef BOAROS_PAGE_SHIFT
 #define BOAROS_PAGE_SHIFT 12
 #endif
-static inline void *arch_current_cpu_get(void) { return (void *)0; }
+void *block_model_cpu(void);
+static inline void *arch_current_cpu_get(void) { return block_model_cpu(); }
 /* Standalone block fixtures execute host threads, without guest interrupts.
  * Device exclusion is provided by block_runtime.c's blocking mutex model. */
 static inline uintptr_t arch_interrupt_save(void) { return 0; }

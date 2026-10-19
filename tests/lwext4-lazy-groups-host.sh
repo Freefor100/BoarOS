@@ -7,11 +7,11 @@ build_dir=${LAZY_HOST_BUILD:-build/host/lwext4-lazy-groups}
 mkdir -p "$build_dir"
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
+    -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
     -DTEST_RANGE_WORK_COUNTERS=1 -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
     -include tests/host/lwext4_memory.h -Ithird_party/lwext4/include -idirafter include \
     third_party/lwext4/src/*.c tests/host/lwext4_lazy_groups.c tests/host/block_fault.c \
-    kernel/block.c tests/host/block_runtime.c -Itests/host/block_model -pthread -o "$build_dir/probe"
+    kernel/block.c tests/host/block_runtime.c kernel/raw_lock.c tests/host/sync/notifications.c -Itests/host/block_model -pthread -o "$build_dir/probe"
 for block in ${LAZY_HOST_BLOCKS:-1024 4096}; do
     for journal in ${LAZY_HOST_JOURNALS:-journal nonjournal}; do
         features=has_journal

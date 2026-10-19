@@ -71,7 +71,7 @@ static int ext4_bdif_bread(struct ext4_blockdev *bdev, void *buf,
 {
 	ext4_bdif_lock(bdev);
 	int r = bdev->bdif->bread(bdev, buf, blk_id, blk_cnt);
-	bdev->bdif->bread_ctr++;
+	__atomic_fetch_add(&bdev->bdif->bread_ctr,1,__ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	return r;
 }
@@ -81,7 +81,7 @@ static int ext4_bdif_bwrite(struct ext4_blockdev *bdev, const void *buf,
 {
 	ext4_bdif_lock(bdev);
 	int r = bdev->bdif->bwrite(bdev, buf, blk_id, blk_cnt);
-	bdev->bdif->bwrite_ctr++;
+	__atomic_fetch_add(&bdev->bdif->bwrite_ctr,1,__ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	return r;
 }
@@ -153,6 +153,15 @@ int ext4_block_fini(struct ext4_blockdev *bdev)
 	return bdev->bdif->close(bdev);
 }
 
+static void ext4_block_end_write(struct ext4_bcache *bc, struct ext4_buf *buf, int error)
+{
+    if (!buf->end_write) return;
+    bool previous;
+    { KERNEL_RAW_SCOPE(guard,&bc->metadata);previous=bc->dont_shake;bc->dont_shake=true; }
+    buf->end_write(bc,buf,error,buf->end_write_arg);
+    { KERNEL_RAW_SCOPE(guard,&bc->metadata);bc->dont_shake=previous; }
+}
+
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 {
 	int r;
@@ -163,22 +172,14 @@ int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 	    ext4_bcache_test_flag(buf, BC_UPTODATE)) {
 		r = ext4_blocks_set_direct(bdev, buf->data, buf->lba, 1);
 		if (r) {
-			if (buf->end_write) {
-				bc->dont_shake = true;
-				buf->end_write(bc, buf, r, buf->end_write_arg);
-				bc->dont_shake = false;
-			}
+            ext4_block_end_write(bc,buf,r);
 
 			return r;
 		}
 
 		ext4_bcache_remove_dirty_node(bc, buf);
 		ext4_bcache_clear_flag(buf, BC_DIRTY);
-		if (buf->end_write) {
-			bc->dont_shake = true;
-			buf->end_write(bc, buf, r, buf->end_write_arg);
-			bc->dont_shake = false;
-		}
+        ext4_block_end_write(bc,buf,r);
 	}
 	return EOK;
 }
@@ -197,33 +198,7 @@ int ext4_block_flush_lba(struct ext4_blockdev *bdev, uint64_t lba)
 }
 
 int ext4_block_cache_shake(struct ext4_blockdev *bdev)
-{
-	int r = EOK;
-	struct ext4_buf *buf;
-	if (bdev->bc->dont_shake)
-		return EOK;
-
-	bdev->bc->dont_shake = true;
-
-	while (!RB_EMPTY(&bdev->bc->lru_root) &&
-		ext4_bcache_is_full(bdev->bc)) {
-
-		buf = ext4_buf_lowest_lru(bdev->bc);
-		ext4_assert(buf);
-		if (ext4_bcache_test_flag(buf, BC_DIRTY)) {
-			if (bdev->bdif->read_context && bdev->bdif->read_context()) break;
-			r = ext4_block_flush_buf(bdev, buf);
-			if (r != EOK)
-				break;
-
-		}
-
-		COST_ADD(BLOCK_CACHE_EVICTIONS, 1);
-		ext4_bcache_drop_buf(bdev->bc, buf);
-	}
-	bdev->bc->dont_shake = false;
-	return r;
-}
+{ return ext4_bcache_shake(bdev->bc); }
 
 int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
 			  uint64_t lba)
@@ -263,46 +238,47 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
 	return EOK;
 }
 
-int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
-		   uint64_t lba)
+static bool ext4_block_claim_load(struct ext4_buf *buf)
 {
-	int r = ext4_block_get_noread(bdev, b, lba);
-	if (r != EOK)
-		return r;
-
-	while (b->buf->loading) {
-		if (!bdev->bdif->wait_read) {
-			ext4_bcache_free(bdev->bc, b);
-			return EBUSY;
-		}
-		COST_ADD(BLOCK_CACHE_LOAD_WAITS, 1);
-		bdev->bdif->wait_read(b->buf);
-	}
-	if (b->buf->load_error) {
-		r = b->buf->load_error; ext4_bcache_free(bdev->bc, b); return r;
-	}
-	if (ext4_bcache_test_flag(b->buf, BC_UPTODATE)) {
-		/* Data in the cache is up-to-date.
-		 * Reading from physical device is not required */
-		return EOK;
-	}
-
-	b->buf->loading = true;
-	r = ext4_blocks_get_direct(bdev, b->data, lba, 1);
-	b->buf->load_error = r;
-	if (r == EOK) ext4_bcache_set_flag(b->buf, BC_UPTODATE);
-	b->buf->loading = false;
-	if (bdev->bdif->wake_read) bdev->bdif->wake_read(b->buf);
-	if (r != EOK) {
-		ext4_bcache_free(bdev->bc, b);
-		b->lb_id = 0;
-		return r;
-	}
-
-	/* Mark buffer up-to-date, since
-	 * fresh data is read from physical device just now. */
-	ext4_bcache_set_flag(b->buf, BC_UPTODATE);
-	return EOK;
+    KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+    if (buf->loading || buf->load_error || ext4_bcache_test_flag(buf,BC_UPTODATE)) return false;
+    buf->loading=true;
+    return true;
+}
+static void ext4_block_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf, int error)
+{
+    KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+    if (!buf->loading || !buf->refctr) __builtin_trap();
+    buf->load_error=error;
+    if (!error) ext4_bcache_set_flag(buf,BC_UPTODATE);
+    buf->loading=false;
+    /* Notification borrows the buffer through the producer reference. */
+    if (bdev->bdif->wake_read) bdev->bdif->wake_read(buf);
+}
+static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf)
+{
+    for (;;) {
+        {
+            KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+            if (!buf->loading) return buf->load_error;
+            if (!bdev->bdif->wait_read) return EBUSY;
+        }
+        COST_ADD(BLOCK_CACHE_LOAD_WAITS,1);
+        /* The callback checks loading again and registers under metadata. */
+        bdev->bdif->wait_read(buf);
+    }
+}
+int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
+{
+    int r=ext4_block_get_noread(bdev,b,lba);
+    if (r) return r;
+    if (ext4_block_claim_load(b->buf)) {
+        r=ext4_blocks_get_direct(bdev,b->data,lba,1);
+        ext4_block_loaded(bdev,b->buf,r);
+    }
+    r=ext4_block_wait_loaded(bdev,b->buf);
+    if (r) ext4_bcache_free_read(bdev->bc,b);
+    return r;
 }
 
 static void ext4_bread_completed(void *context, unsigned index, const struct block_read_span *span)
@@ -334,7 +310,7 @@ int ext4_blockdev_read_batch(struct ext4_blockdev *bdev,
 	if (count && bdev->bdif->bread_batch) {
 		ext4_bdif_lock(bdev);
 		bdev->bdif->bread_batch(bdev, spans, count, completion ? &forward : NULL);
-		bdev->bdif->bread_ctr += count;
+		__atomic_fetch_add(&bdev->bdif->bread_ctr,count,__ATOMIC_RELAXED);
 		ext4_bdif_unlock(bdev);
 	} else for (unsigned i = 0; i < count; i++) {
 		spans[i].status = ext4_bdif_bread(bdev, spans[i].buffer,
@@ -373,32 +349,21 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 		errors[i] = ext4_block_get_noread(bdev, &blocks[i], lbas[i]);
 		if (errors[i]) continue;
 		struct ext4_buf *buf = blocks[i].buf;
-		if (buf->loading || buf->load_error || ext4_bcache_test_flag(buf, BC_UPTODATE)) continue;
-		buf->loading = true;
+		if (!ext4_block_claim_load(buf)) continue;
 		owners[pending] = i;
 		reads[pending++] = (struct block_read_span){lbas[i] * bdev->lg_bsize + bdev->part_offset,
 			blocks[i].data, bdev->lg_bsize, 0, EIO};
 	}
 	/* 先完成自己发布的加载，再等待别人的 loading，重叠批次不会互等未发布页。 */
 	ext4_blockdev_read_batch(bdev, reads, pending, NULL);
-	for (unsigned i = 0; i < pending; i++) {
-		struct ext4_buf *buf = blocks[owners[i]].buf;
-		buf->load_error = reads[i].status;
-		if (!buf->load_error) ext4_bcache_set_flag(buf, BC_UPTODATE);
-		buf->loading = false;
-		if (bdev->bdif->wake_read) bdev->bdif->wake_read(buf);
-	}
+    for (unsigned i=0;i<pending;i++) {
+        ext4_block_loaded(bdev,blocks[owners[i]].buf,reads[i].status);
+    }
 	int first = EOK;
 	for (unsigned i = 0; i < count; i++) {
 		if (!errors[i]) {
-			struct ext4_buf *buf = blocks[i].buf;
-			while (buf->loading) {
-				if (!bdev->bdif->wait_read) { errors[i] = EBUSY; break; }
-				COST_ADD(BLOCK_CACHE_LOAD_WAITS, 1);
-				bdev->bdif->wait_read(buf);
-			}
-			if (!errors[i]) errors[i] = buf->load_error;
-			if (errors[i]) ext4_bcache_free(bdev->bc, &blocks[i]);
+            errors[i]=ext4_block_wait_loaded(bdev,blocks[i].buf);
+            if (errors[i]) ext4_bcache_free_read(bdev->bc,&blocks[i]);
 		}
 		if (!first) first = errors[i];
 	}
@@ -508,7 +473,7 @@ int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 		}
 		if (r != EOK) break;
 	}
-	for (const struct ext4_block_write *io = first; io; io = io->next) bdev->bdif->bwrite_ctr++;
+	for (const struct ext4_block_write *io = first; io; io = io->next) __atomic_fetch_add(&bdev->bdif->bwrite_ctr,1,__ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	return r;
 }
@@ -650,16 +615,14 @@ int ext4_block_readbytes(struct ext4_blockdev *bdev, uint64_t off, void *buf,
 
 int ext4_block_cache_flush(struct ext4_blockdev *bdev)
 {
-	while (!SLIST_EMPTY(&bdev->bc->dirty_list)) {
-		int r;
-		struct ext4_buf *buf = SLIST_FIRST(&bdev->bc->dirty_list);
-		ext4_assert(buf);
-		r = ext4_block_flush_buf(bdev, buf);
-		if (r != EOK)
-			return r;
-
-	}
-	return EOK;
+    for (;;) {
+        struct ext4_block borrowed;
+        struct ext4_buf *buf=ext4_bcache_dirty_get(bdev->bc,&borrowed);
+        if (!buf) return EOK;
+        int r=ext4_block_flush_buf(bdev,buf);
+        ext4_bcache_free_read(bdev->bc,&borrowed);
+        if (r) return r;
+    }
 }
 
 int ext4_block_cache_write_back(struct ext4_blockdev *bdev, uint8_t on_off)
