@@ -2,8 +2,6 @@
 #include <arch/context.h>
 #include <kernel/cpu.h>
 static uint64_t period, tick_deadline;
-uint64_t arch_time_read(void)
-{ uint64_t value; __asm__ volatile("rdtime.d %0, $zero" : "=r"(value)); return value; }
 uint32_t la_timer_frequency(void)
 {
     uint64_t base, ratio, index=4;

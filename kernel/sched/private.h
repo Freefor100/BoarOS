@@ -402,7 +402,7 @@ enum kernel_signal_status kernel_signal_release_table(
 void ready_enqueue_locked(struct kernel_task *task, int head);
 struct kernel_task *ready_best_locked(void);
 void ready_remove_locked(struct kernel_task *task);
-/* 调度域保护执行片段及统计快照；返回值为纳秒。 */
+/* 调度域固定task与CPU owner；CPU片段数值由本CPU序列发布，快照返回纳秒。 */
 void scheduler_cpu_time_switch(struct kernel_task *, struct kernel_task *);
 void scheduler_task_cpu_time_locked(const struct kernel_task *, uint64_t *, uint64_t *);
 

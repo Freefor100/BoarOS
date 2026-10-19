@@ -7,6 +7,15 @@
 
 enum { ACCOUNT_KERNEL, ACCOUNT_USER, ACCOUNT_INTERRUPT };
 
+static inline uint64_t accounting_counter(void)
+{
+#if BOAROS_MAX_CPUS > 1
+    return arch_time_read_ordered();
+#else
+    return arch_time_read();
+#endif
+}
+
 /* 只有实际执行本栈的CPU能写执行片段，入口/返回/切栈均已关闭IRQ。
  * 远端查询持调度域固定owner及task存储；序列只覆盖数值发布，写者不等待。 */
 static inline void accounting_write_begin(struct kernel_cpu *cpu)
@@ -50,14 +59,14 @@ static int accounting_initialize(struct kernel_cpu *cpu)
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if (!cpu->current) return 0;
     cpu->accounting_owner=cpu->current;
-    __atomic_store_n(&cpu->accounting_started_ticks,arch_time_read(),__ATOMIC_RELAXED);
+    __atomic_store_n(&cpu->accounting_started_ticks,accounting_counter(),__ATOMIC_RELAXED);
     return 1;
 }
 void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *next)
 {
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     struct kernel_cpu *cpu=kernel_cpu_current();
-    uint64_t now=arch_time_read();
+    uint64_t now=accounting_counter();
     if (!cpu->accounting_owner) {
         cpu->accounting_owner=previous;
         cpu->accounting_started_ticks=now;
@@ -92,7 +101,7 @@ void scheduler_task_cpu_time_locked(const struct kernel_task *task,uint64_t *use
             uint64_t k=__atomic_load_n(&cpu->accounting_kernel_ticks,__ATOMIC_RELAXED);
             uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
             uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
-            uint64_t now=arch_time_read();
+            uint64_t now=accounting_counter();
 #if BOAROS_MAX_CPUS > 1
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             if (sequence!=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_RELAXED)) continue;
@@ -115,7 +124,7 @@ void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *scope,int us
     if (!cpu->accounting_owner && !accounting_initialize(cpu)) return;
     struct kernel_task *task=cpu->accounting_owner;
     accounting_write_begin(cpu);
-    account_time(cpu,arch_time_read());
+    account_time(cpu,accounting_counter());
     scope->task=task;
     /* U trap后续返回准备仍计内核工作；最终USER切换在架构返回入口完成。 */
     scope->restore_mode=user ? ACCOUNT_KERNEL : task->accounting_mode;
@@ -128,7 +137,7 @@ void kernel_cpu_account_trap_end(struct kernel_cpu_account_scope *scope)
     struct kernel_cpu *cpu=kernel_cpu_current();
     if (cpu->accounting_owner!=scope->task) __builtin_trap();
     accounting_write_begin(cpu);
-    account_time(cpu,arch_time_read());
+    account_time(cpu,accounting_counter());
     __atomic_store_n(&scope->task->accounting_mode,scope->restore_mode,__ATOMIC_RELAXED);
     accounting_write_end(cpu);
 }
@@ -137,7 +146,7 @@ void kernel_cpu_account_user_return(void)
     struct kernel_cpu *cpu=kernel_cpu_current();
     if (!cpu->accounting_owner && !accounting_initialize(cpu)) __builtin_trap();
     accounting_write_begin(cpu);
-    account_time(cpu,arch_time_read());
+    account_time(cpu,accounting_counter());
     __atomic_store_n(&cpu->accounting_owner->accounting_mode,ACCOUNT_USER,__ATOMIC_RELAXED);
     accounting_write_end(cpu);
 }

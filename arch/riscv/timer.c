@@ -23,11 +23,13 @@ struct riscv_timer_state {
 static struct riscv_timer_state timer_state;
 #endif
 
-uint64_t riscv_time_read(void)
+uint64_t riscv_time_read_ordered(void)
 {
     uint64_t value;
-
-    asm volatile("csrr %0, time" : "=r"(value));
+    /* Zicsr将TIME读归为I输入；普通acquire/release内存屏障不覆盖它。
+     * 奇数seq发布/读payload先于采样，采样先于最终seq读取。 */
+    asm volatile("fence rw, i\n\tcsrr %0, time\n\tfence i, r"
+                 : "=r"(value) : : "memory");
     return value;
 }
 
