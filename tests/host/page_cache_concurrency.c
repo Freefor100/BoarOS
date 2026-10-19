@@ -1540,7 +1540,7 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
              * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
             assert(read.counts.inode_locks == !warm);
             if (warm) assert(read.counts.metadata_locks==1);
-            else assert(read.counts.metadata_locks<=8);
+            else assert(read.counts.metadata_locks<=(count==1?4:6));
             printf("read operation counts: page=%u cpu=%s cache=%s pages=%u metadata=%llu inode=%llu acquire=%llu release=%llu cache_probes=unavailable(COST=0) scope=caller\n",
                 (unsigned)BOAROS_PAGE_SIZE, remote ? "remote" : "native", warm ? "hot" : "cold", count,
                 (unsigned long long)read.counts.metadata_locks, (unsigned long long)read.counts.inode_locks,
