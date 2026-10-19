@@ -1,3 +1,4 @@
+#include <kernel/accounting.h>
 #include "private.h"
 
 #include <arch/timer.h>
@@ -134,12 +135,15 @@ enum kernel_syscall_status syscall_handle_clock_gettime(
     int64_t seconds;
     int64_t sub_nanoseconds;
 
-    if (!syscall_clock_id_valid(request->arguments[0])) {
-        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    switch (request->arguments[0]) {
+    int32_t clock = (int32_t)request->arguments[0];
+    if (!syscall_clock_id_valid((uint64_t)(int64_t)clock)) {
+        int error = kernel_task_cpu_clock(caller, clock, 0, &nanoseconds);
+        if (error) {
+            decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+            decoded->value = error;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+    } else switch (clock) {
     case LINUX_CLOCK_REALTIME: nanoseconds = kernel_time_realtime_ns(); break;
     case LINUX_CLOCK_MONOTONIC: nanoseconds = kernel_time_monotonic_ns(); break;
     case LINUX_CLOCK_REALTIME_COARSE: nanoseconds = kernel_time_coarse_realtime_ns(); break;
@@ -158,23 +162,24 @@ enum kernel_syscall_status syscall_handle_clock_getres(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    if (!syscall_clock_id_valid(request->arguments[0])) {
-        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
+    int32_t clock = (int32_t)request->arguments[0];
+    uint64_t resolution;
+    if (syscall_clock_id_valid((uint64_t)(int64_t)clock))
+        resolution = syscall_clock_id_coarse(clock) ? kernel_time_coarse_resolution_ns() : 1;
+    else {
+        int error = kernel_task_cpu_clock(caller, clock, 1, &resolution);
+        if (error) {
+            decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+            decoded->value = error;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
     }
     if (request->arguments[1] == 0U) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    /* Coarse reports the actual timer period; fine keeps its existing ABI. */
-    return syscall_return_time(caller,
-                                request->arguments[1],
-                                0,
-                                syscall_clock_id_coarse(request->arguments[0])
-                                    ? kernel_time_coarse_resolution_ns() : 1,
-                                decoded);
+    return syscall_return_time(caller, request->arguments[1], 0, (int64_t)resolution, decoded);
 }
 
 enum kernel_syscall_status syscall_handle_gettimeofday(
@@ -225,8 +230,8 @@ struct linux_tms {
 };
 
 /*
- * times(153): fills the optional tms buffer with scheduler-tick CPU
- * accounting (CLK_TCK = KERNEL_TICKS_PER_SECOND) and returns the tick
+ * times(153): fills the optional tms buffer by converting nanosecond CPU
+ * execution accounting (CLK_TCK = KERNEL_TICKS_PER_SECOND) and returns the tick
  * count since boot.  A NULL tms pointer only samples the uptime ticks.
  */
 enum kernel_syscall_status syscall_handle_times(
@@ -531,5 +536,21 @@ enum kernel_syscall_status syscall_handle_sleep_for(
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_getrusage(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_linux_rusage usage;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_task_getrusage(caller, (int32_t)request->arguments[0], &usage);
+    if (decoded->value) return KERNEL_SYSCALL_STATUS_OK;
+    struct kernel_mm *mm;size_t copied=0;
+    if (kernel_task_mm_borrow_mutable(caller,&mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    enum kernel_uaccess_status status=kernel_copy_to_user(mm,request->arguments[1],&usage,sizeof(usage),&copied);
+    if (status==KERNEL_UACCESS_STATUS_FAULT) decoded->value=-KERNEL_EFAULT;
+    else if (status || copied!=sizeof(usage)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     return KERNEL_SYSCALL_STATUS_OK;
 }

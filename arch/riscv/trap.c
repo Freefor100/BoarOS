@@ -1,3 +1,4 @@
+#include <kernel/accounting.h>
 #include <kernel/cost.h>
 #include <arch/riscv/smp.h>
 #include <arch/riscv/plic.h>
@@ -135,6 +136,8 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     kernel_cost_irq_disabled(kernel_cost_trap_timestamp);
 #endif
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
+    struct kernel_cpu_account_scope accounting __attribute__((cleanup(kernel_cpu_account_trap_end)));
+    kernel_cpu_account_trap_begin(&accounting, from_user, !!(frame->scause & RISCV_SCAUSE_INTERRUPT));
 #if BOAROS_USER_SMP
     if (from_user) {
         kernel_cpu_current()->user_traps++;
@@ -404,6 +407,7 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
     __asm__ volatile("csrr %0, sstatus" : "=r"(live_status));
     frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
                      (live_status & RISCV_SSTATUS_FS_MASK);
+    if (!(frame->sstatus & RISCV_SSTATUS_SPP)) kernel_cpu_account_user_return();
 }
 
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)

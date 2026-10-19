@@ -76,9 +76,4 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
 int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
                                int fd, struct kernel_vfs_stat *stat);
 
-/* Fault I/O attribution belongs to the running task, including after sleep. */
-void kernel_proc_task_note_block_read(void);
-uint64_t kernel_proc_task_block_reads(const struct kernel_task *task);
-void kernel_proc_task_note_fault(struct kernel_task *task, int major);
-
 #endif

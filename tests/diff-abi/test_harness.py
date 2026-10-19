@@ -57,10 +57,12 @@ class ProtocolTests(unittest.TestCase):
                 (base/'.config').write_text('CONFIG_16KB_3LEVEL=y\n')
                 (base/'boaros-identity.json').write_text(json.dumps({'revision':'pin','image_sha256':harness.digest(linux)}))
                 manifest=base/'cases.txt';manifest.write_text('result\n')
-                calls=[]
+                calls=[];checks=[]
                 def fixture(work,elf):
                     image=work/'fixture.img';image.write_bytes(b'model fixture');return image
-                def logged(argv,path,timeout):
+                def logged(argv,path,timeout=None):
+                    if argv[0]=='e2fsck':
+                        checks.append(argv);path.write_text('clean filesystem\n');return
                     calls.append(argv)
                     good=GOOD
                     if corrupt_last and len(calls)==4:good=good.replace('616263','616264')
@@ -76,6 +78,8 @@ class ProtocolTests(unittest.TestCase):
                     if corrupt_last:
                         with self.assertRaisesRegex(RuntimeError,'ABI mismatch'):harness.run(args)
                     else:harness.run(args)
+                self.assertEqual(len(checks),2)
+                self.assertTrue(all(row[:2]==['e2fsck','-fn'] for row in checks))
                 self.assertEqual(len(calls),4)
                 self.assertEqual([row[row.index('-m')+1] for row in calls],['512M','1G','512M','1G'])
                 metadata=json.loads((base/'run/metadata.json').read_text())

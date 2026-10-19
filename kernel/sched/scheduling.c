@@ -265,6 +265,7 @@ static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
 #endif
     if (now < cpu->rt_bandwidth.last_account_ns) __builtin_trap();
     uint64_t delta = now - cpu->rt_bandwidth.last_account_ns;
+    scheduler_cpu_time_account_locked(cpu, now);
 #if BOAROS_USER_SMP && BOAROS_COST_DIAGNOSTICS
     if (cpu->current && cpu->current->arch.user_mode && cpu->current->user_service &&
         cpu->current->service_started_ticks) cpu->current->service_running_ns += delta;

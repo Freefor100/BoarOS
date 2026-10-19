@@ -346,4 +346,5 @@ void kernel_user_thread_exit(
     uint64_t status,
     uint64_t detail) __attribute__((noreturn));
 
+
 #endif

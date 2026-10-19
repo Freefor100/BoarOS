@@ -12,6 +12,7 @@
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
+#include <kernel/accounting.h>
 #include <kernel/time.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
@@ -676,6 +677,7 @@ static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size
     if (begin>=end || end>BOAROS_PAGE_SIZE) __builtin_trap();
     struct kernel_page_cache_record *r=entry->cache->record;
     if (!entry->dirty_end) {
+        kernel_task_account_write(BOAROS_PAGE_SIZE);
         if (entry->cache->record->group) __atomic_fetch_add(&entry->cache->record->group->dirty,1,__ATOMIC_RELAXED);
         struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(entry->node);
         if (entry->dirty_indexed) __builtin_trap();

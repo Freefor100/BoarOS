@@ -97,4 +97,7 @@ void abi_sched_stat_cases(void);
 void abi_shm_cases(void);
 void abi_environment_cases(void);
 void abi_waitid_cases(void);
+void abi_usage_cases(void);
+void abi_cpu_clock_cases(void);
+void abi_usage_exec_probe(const char *) __attribute__((noreturn));
 #endif

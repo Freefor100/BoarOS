@@ -41,7 +41,8 @@ class RtHandshake(unittest.TestCase):
                         '-idirafter', str(ROOT / 'include'),
                         str(ROOT / 'tests/host/nbd_fault.c'),
                         str(ROOT / 'tests/host/block_fault.c'),
-                        str(ROOT / 'kernel/block.c'), '-o', str(cls.binary)], check=True)
+                        str(ROOT / 'kernel/block.c'), str(ROOT / 'tests/host/block_runtime.c'),
+                        '-pthread', '-I', str(ROOT / 'tests/host/block_model'), '-o', str(cls.binary)], check=True)
 
     @classmethod
     def tearDownClass(cls):

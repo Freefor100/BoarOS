@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/selected.c tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c tests/diff-abi/waitid.c
+DIFF_ABI_SOURCES := tests/diff-abi/selected.c tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c tests/diff-abi/waitid.c tests/diff-abi/usage.c tests/diff-abi/cpu_clock.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -149,3 +149,33 @@ test-waitid-abi-riscv: $(KERNEL_RV) build/diff-abi/waitid-rv
 	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/waitid-rv --case-manifest tests/diff-abi/waitid-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/waitid-abi-rv
 test-waitid-abi-loongarch: kernel-la build/loongarch/waitid-la prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/waitid-la --case-manifest tests/diff-abi/waitid-cases.txt --timeout 180 $(TEST_MEMORY_ARGS) --output build/waitid-abi-la
+
+# Resource and CPU-clock queries share the same raw syscall case pack.
+build/diff-abi/resource-rv: USAGE_CASE_FLAGS := -DABI_RESOURCE_ONLY
+build/diff-abi/usage-rv build/diff-abi/resource-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) -march=rv64gc -mabi=lp64d -DABI_USAGE_ONLY $(USAGE_CASE_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/resource-la: USAGE_CASE_FLAGS := -DABI_RESOURCE_ONLY
+build/loongarch/usage-la build/loongarch/resource-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_USAGE_ONLY $(USAGE_CASE_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+.PHONY: test-resource-abi-riscv test-resource-abi-loongarch test-resource-smp-riscv
+test-resource-abi-riscv: $(KERNEL_RV) build/diff-abi/resource-rv
+	python3 -B tests/diff-abi/harness.py --kernel $(KERNEL_RV) --program build/diff-abi/resource-rv --case-manifest tests/diff-abi/resource-cases.txt --timeout 90 $(TEST_MEMORY_ARGS) --output build/resource-abi-rv
+test-resource-abi-loongarch: kernel-la build/loongarch/resource-la prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/resource-la --case-manifest tests/diff-abi/resource-cases.txt --timeout 90 $(TEST_MEMORY_ARGS) --output build/resource-abi-la
+test-resource-smp-riscv: build/diff-abi/resource-rv
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/user.py --kernel build/riscv-user-smp/kernel-rv --program build/diff-abi/resource-rv --manifest tests/diff-abi/resource-cases.txt --require-parallel --firmware $(QEMU_RISCV_FIRMWARE) $(TEST_MEMORY_ARGS)
+
+.PHONY: test-usage-abi-riscv test-usage-abi-loongarch test-usage-smp-riscv test-cpu-clock-process-smp-riscv
+test-usage-abi-riscv: $(KERNEL_RV) build/diff-abi/usage-rv
+	python3 -B tests/diff-abi/harness.py --kernel $(KERNEL_RV) --program build/diff-abi/usage-rv --case-manifest tests/diff-abi/usage-cases.txt --timeout 90 $(TEST_MEMORY_ARGS) --output build/usage-abi-rv
+test-usage-abi-loongarch: kernel-la build/loongarch/usage-la prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/usage-la --case-manifest tests/diff-abi/usage-cases.txt --timeout 90 $(TEST_MEMORY_ARGS) --output build/usage-abi-la
+test-usage-smp-riscv: build/diff-abi/usage-rv
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/user.py --kernel build/riscv-user-smp/kernel-rv --program build/diff-abi/usage-rv --manifest tests/diff-abi/usage-cases.txt --require-parallel --firmware $(QEMU_RISCV_FIRMWARE) $(TEST_MEMORY_ARGS)
+test-cpu-clock-process-smp-riscv: build/riscv-user-smp-composition/composition-rv test-user-smp-composition-host
+	python3 -B tests/smp/composition.py --scene cpu-clock --firmware $(QEMU_RISCV_FIRMWARE) --program $(COMPOSITION_ELF) $(TEST_MEMORY_ARGS)

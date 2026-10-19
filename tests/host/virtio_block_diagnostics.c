@@ -283,7 +283,8 @@ int riscv_plic_register(uint32_t source, void (*handler)(void *), void *owner)
 { (void)source; (void)handler; (void)owner; return 1; }
 void riscv_plic_unregister(uint32_t source, void *owner)
 { (void)source; (void)owner; }
-void kernel_proc_task_note_block_read(void) {}
+void kernel_task_account_read(uint64_t bytes) { (void)bytes; }
+void kernel_task_account_write(uint64_t bytes) { (void)bytes; }
 static struct kernel_wait_queue *watched_queues[3];
 static unsigned watched_wakes[3];
 enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *queue,

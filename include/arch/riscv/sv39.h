@@ -55,6 +55,7 @@ struct riscv_sv39_user_space {
     uint32_t table_pages;
     uint32_t leaf_pages;
     uint32_t protected_pages;
+    uint64_t peak_resident_pages;
     uint32_t cow_pages;
     uint64_t cow_copies;
     uint64_t cow_in_place;

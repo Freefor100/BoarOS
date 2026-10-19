@@ -1,3 +1,4 @@
+#include <kernel/accounting.h>
 #include <arch/task.h>
 #include <arch/timer.h>
 #include <arch/loongarch/signal.h>
@@ -44,6 +45,8 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
 {
     uint64_t code=(frame->estat>>16)&63;
     int user=(frame->prmd&3)==3;
+    struct kernel_cpu_account_scope accounting __attribute__((cleanup(kernel_cpu_account_trap_end)));
+    kernel_cpu_account_trap_begin(&accounting,user,!code);
     if(!user && code>=1 && code<=7 && frame->badv>=ARCH_KERNEL_STACK_WINDOW_BASE &&
        frame->badv-ARCH_KERNEL_STACK_WINDOW_BASE<ARCH_KERNEL_STACK_WINDOW_SIZE &&
        (frame->badv-ARCH_KERNEL_STACK_WINDOW_BASE)%ARCH_KERNEL_STACK_SLOT_SIZE<BOAROS_PAGE_SIZE)
@@ -158,6 +161,7 @@ void la_trap_return_prepare(struct arch_trap_frame *frame)
     if ((frame->prmd&3)==3) {
         kernel_task_prepare_user_return();
         la_signal_prepare_user_return(frame);
+        kernel_cpu_account_user_return();
     }
     else kernel_scheduler_prepare_idle_return();
 }

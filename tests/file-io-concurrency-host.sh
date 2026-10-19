@@ -34,7 +34,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         -Ithird_party/lwext4/include -Itests/host/mm -Itests/host/sync -idirafter net/lwip_port/include \
         -idirafter third_party/lwip/src/include -idirafter include \
         ${FILE_IO_HOST_TEST_SOURCE:-tests/host/file_io_concurrency.c} tests/host/file_io_excluded.c tests/host/mm/context.c tests/host/mm/disk_context.c \
-        kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/futex.c "$build_dir/process-$shift.o" \
+        kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/sched/futex.c "$build_dir/process-$shift.o" \
         kernel/physical_page.c mm/heap.c mm/memory_object.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         fs/files/table.c fs/files/io.c fs/files/locks.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c fs/open_file.c fs/block_file.c fs/loop.c fs/disk_mount.c \
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \

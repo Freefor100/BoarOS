@@ -7,7 +7,7 @@
 #include <kernel/heap.h>
 #include <kernel/irq.h>
 #include <kernel/open_file.h>
-#include <kernel/proc_task.h>
+#include <kernel/accounting.h>
 #include <kernel/page.h>
 #include <kernel/memory_object.h>
 #include <kernel/task.h>
@@ -3333,6 +3333,14 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
     return status;
 }
 
+uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record(mm, &record) != KERNEL_MM_STATUS_OK) __builtin_trap();
+    KERNEL_RAW_SCOPE(guard, &record->metadata);
+    return record->space.peak_resident_pages;
+}
+
 void kernel_mm_get_statistics(const struct kernel_mm *mm,
                                     struct kernel_mm_statistics *statistics)
 {
@@ -4170,11 +4178,11 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
         kernel_task_mm_borrow(task, &task_mm) !=
                      KERNEL_TASK_STATUS_OK ||
         task_mm->record != mm->record) task = 0;
-    uint64_t block_reads = task ? kernel_proc_task_block_reads(task) : 0U;
+    uint64_t block_reads = task ? kernel_task_read_bytes(task) : 0U;
     enum kernel_mm_status status = resolve_user_fault(mm, address, access);
     if (status == KERNEL_MM_STATUS_OK && task)
-        kernel_proc_task_note_fault(task,
-            kernel_proc_task_block_reads(task) != block_reads);
+        kernel_task_account_fault(task,
+            kernel_task_read_bytes(task) != block_reads);
     return status;
 }
 

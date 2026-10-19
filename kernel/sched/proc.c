@@ -88,28 +88,6 @@ static struct kernel_task *find_resource_owner(kernel_pid_t pid,
     return leader;
 }
 
-void kernel_proc_task_note_block_read(void)
-{
-    struct kernel_task *task = kernel_io_context_current()->account_task;
-    if (!task) task = kernel_task_current();
-    if (!task || !task->arch.user_mode) return;
-    uint64_t value = __atomic_load_n(&task->block_reads, __ATOMIC_RELAXED);
-    while (value != UINT64_MAX && !__atomic_compare_exchange_n(&task->block_reads,
-        &value, value + 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-}
-
-uint64_t kernel_proc_task_block_reads(const struct kernel_task *task)
-{
-    return task ? __atomic_load_n(&task->block_reads, __ATOMIC_RELAXED) : 0U;
-}
-
-void kernel_proc_task_note_fault(struct kernel_task *task, int major)
-{
-    if (!task || !task->arch.user_mode) return;
-    KERNEL_IRQ_SCOPE(proc_irq);
-    uint64_t *counter = major ? &task->major_faults : &task->minor_faults;
-    if (*counter != UINT64_MAX) (*counter)++;
-}
 
 int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                                  struct kernel_proc_process_snapshot *result)
@@ -141,8 +119,8 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                  task->state == KERNEL_THREAD_STATE_RUNNING ||
                  task->state == KERNEL_THREAD_STATE_READY ? 'R' :
                  task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' : 'S',
-        .child_minor_faults = leader->child_minor_faults,
-        .child_major_faults = leader->child_major_faults,
+        .child_minor_faults = leader->child_usage.minor_faults,
+        .child_major_faults = leader->child_usage.major_faults,
         .signal_pending = leader->signal_pending & UINT64_C(0x7fffffff),
         .signal_blocked = leader->signal_blocked & UINT64_C(0x7fffffff),
         .threads = threads,
@@ -169,27 +147,16 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                 result->signal_caught |= UINT64_C(1) << sig;
         }
     }
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
-    while (cursor.task) {
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            struct kernel_task *member = cursor.task;
-            if (member->accounted && member->group_leader == leader) {
-                if (member != leader && member->proc_exiting && result->threads)
-                    result->threads--;
-                result->minor_faults += member->minor_faults;
-                result->major_faults += member->major_faults;
-                result->user_ticks += member->user_ticks;
-                result->kernel_ticks += member->kernel_ticks;
-            }
-        }
-        scheduler_task_cursor_next(&cursor);
-    }
+    struct kernel_task_usage usage = {0};
+    scheduler_usage_snapshot(leader, 0, &usage);
+    result->minor_faults = usage.minor_faults;
+    result->major_faults = usage.major_faults;
+    result->user_ticks = usage.user_ns / 10000000U;
+    result->kernel_ticks = usage.kernel_ns / 10000000U;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        result->child_user_ticks = leader->child_user_ticks;
-        result->child_kernel_ticks = leader->child_kernel_ticks;
+        result->child_user_ticks = leader->child_usage.user_ns / 10000000U;
+        result->child_kernel_ticks = leader->child_usage.kernel_ns / 10000000U;
     }
     if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE) {
         struct kernel_mm_proc_memory memory;

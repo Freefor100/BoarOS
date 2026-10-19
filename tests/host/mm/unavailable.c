@@ -18,8 +18,8 @@ EXCLUDED(kernel_page_cache_alias_detach)
 EXCLUDED(kernel_task_mm_borrow)
 #endif
 #if !BOAROS_USER_SMP
-EXCLUDED(kernel_proc_task_block_reads)
-EXCLUDED(kernel_proc_task_note_fault)
+EXCLUDED(kernel_task_read_bytes)
+EXCLUDED(kernel_task_account_fault)
 #endif
 EXCLUDED(kernel_vfs_node_lock)
 EXCLUDED(kernel_vfs_node_try_read)
@@ -63,3 +63,5 @@ EXCLUDED(kernel_page_cache_wait_writable)
 EXCLUDED(kernel_page_cache_alias_hold)
 EXCLUDED(kernel_page_cache_alias_put)
 EXCLUDED(kernel_page_cache_retry_alias)
+
+EXCLUDED(kernel_page_cache_prepare_mapping_write)
