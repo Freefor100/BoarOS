@@ -311,6 +311,21 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             }
             result.action = KERNEL_SYSCALL_ACTION_RETURN;
         }
+        if (result.action == KERNEL_SYSCALL_ACTION_WAITID) {
+            enum kernel_scheduler_status scheduler_status =
+                kernel_scheduler_waitid_current(
+                    (int32_t)request.arguments[0],
+                    (int64_t)(int32_t)(uint32_t)request.arguments[1],
+                    request.arguments[2],
+                    (uint32_t)request.arguments[3],
+                    request.arguments[4],
+                    &result.value);
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+            result.action = KERNEL_SYSCALL_ACTION_RETURN;
+        }
         if (result.action == KERNEL_SYSCALL_ACTION_YIELD) {
             enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_yield_current();

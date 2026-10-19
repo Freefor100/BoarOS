@@ -54,6 +54,18 @@ class CompositionReports(unittest.TestCase):
                     lines.replace('COMPOSITION CASE mm-reclaim OK',''),lines+lines):
             with self.assertRaises(RuntimeError):module.validate_functional(bad)
 
+    def test_wait_scene_requires_claim_and_four_real_registrations(self):
+        module=self.checker()
+        lines='\n'.join(f'COMPOSITION CASE {case} OK' for case in module.WAIT_CASES)+'\nCOMPOSITION END 4\n'
+        self.assertEqual(module.validate_functional(lines,wait=True),list(module.WAIT_CASES))
+        good=('COMPOSITION wait claims=0x1 active=0x0\n'
+              'COMPOSITION owners held=0x0 released=0x0 reclaimed=0x0 oom=0x0 '
+              'retirement=0x0 remote-retirement=0x0 waits=0x4 ledger=0x0 control=0x0\n')
+        module.validate_wait(good)
+        for bad in ('',good+good,good.replace('claims=0x1','claims=0x0'),
+                    good.replace('waits=0x4','waits=0x3'),good.replace('active=0x0','active=0x1')):
+            with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_wait(bad)
+
     def test_remote_fault_race_requires_two_faults_one_stale_retry_and_two_successes(self):
         module=self.checker()
         good='COMPOSITION fault-race arrivals=0x2 stale=0x1 resolved=0x2\n'

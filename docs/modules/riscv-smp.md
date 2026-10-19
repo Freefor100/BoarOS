@@ -32,6 +32,8 @@ make run-user-smp-riscv
 
 ### 用户态原程序与压力组合
 
+`make test-wait-process-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin` 单独检查子进程等待，复用组合控制页和实际等待登记观察者。四个场景覆盖 waitid(P_PGID,0)、wait4(0) 阻塞后另一线程 setpgid、中断时 siginfo 输出，以及 WNOWAIT 持有真实 zombie claim 和任务借用时另一个线程登记等待，归还后消费一次。Linux 通过 `/proc/<tid>/stat` 确认已阻塞；BoarOS 在真实 park 入口观察登记，并在结果复制处暂停第一个线程。最终检查再次等待为 ECHILD、四次登记、一次 claim 暂停、控制页与页引用归还及根盘 fsck。该聚焦入口运行 1/2 CPU、512 MiB/1 GiB，`TEST_MEMORIES` 可指定内存矩阵。
+
 `tests/program-inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。`native-extended.yml`配置相同四格的独立定时job，托管job尚未运行不能由本地结果代替。
 
 `test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF 有 21 个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。加压前准备未映射的干净observer文件页，回收统计覆盖账本分配和显式回收，并等待后台轮次发布实际回收数；不要求同步调用抢在后台worker之前回收候选。普通 I/O 控制器在真实 ecall 的复制、来源 pin、匿名 fault 与后端批次处观察 CPU。十种读场景共复制 65,666 字节，双核全部留在发起 CPU1，单核全部在 CPU0；其中冷 64 KiB 请求仅产生一个后端批次，后端必须在 CPU0。三种普通写场景的四次来源 pin 同样留在发起 CPU。共享 offset、竞争 seek、close 复用、fork 排空写 pin、精确 EFAULT 前缀和最终 fsync 继续核对。无观察钩子的正式内核运行九项普通 I/O 场景，测试控制器与 link wrap 不进入发布构建。

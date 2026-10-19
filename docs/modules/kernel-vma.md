@@ -86,7 +86,7 @@ make test-riscv
 
 聚焦测试覆盖相邻合并、孔洞、冲突、两端拆分、hint/top-down、fixed replace/noreplace、文件 backing/offset 合并边界、`PROT_NONE` 内容保持、W→RW、mprotect 全覆盖、munmap 洞语义、打洞后的 brk、fork COW、metadata OOM 和资源基线。真实 ext4 `/init` ELF 从 U-mode 调用匿名与文件私有 mmap/mprotect/munmap，验证写隔离、EOF/SIGBUS、errno 与最终回收；非法分配器释放由 fatal-path 测试覆盖。
 
-当前实现共享匿名、普通文件 private/shared mapping 和 `msync`，没有 `MAP_POPULATE`、内存承诺 accounting、VMA 数量上限或 SMP 并发修改。ELF source-backed demand paging 和 RISC-V Sv39 ASLR 已接入；没有任何随机材料时沿用确定性布局；仅有 DTB 材料时的随机布局不构成可信安全保证。`MAP_STACK` 目前只是兼容性标志，不改变增长方向；`MAP_NORESERVE` 与全局尚无 commit accounting 的当前策略等价。
+当前实现共享匿名、普通文件 private/shared mapping 与 `msync`，支持 best-effort `MAP_POPULATE` 预填，以及 RISC-V USER_SMP 下的两核匿名缺页、用户复制和 TLB 失效协议；尚无全局内存承诺 accounting 或 VMA 数量上限。ELF source-backed demand paging 和 RISC-V Sv39 ASLR 已接入；没有任何随机材料时沿用确定性布局；仅有 DTB 材料时的随机布局不构成可信安全保证。`MAP_STACK` 目前只是兼容性标志，不改变增长方向；`MAP_NORESERVE` 与全局尚无 commit accounting 的当前策略等价。
 
 ## 文件缺页跨 I/O 等待
 

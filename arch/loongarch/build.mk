@@ -1,3 +1,6 @@
+ifneq ($(wildcard build/tools/loongarch/bin/loongarch64-unknown-linux-gnu-gcc),)
+export PATH := $(abspath build/tools/loongarch/bin):$(PATH)
+endif
 LA_CROSS_COMPILE ?= $(shell \
 	if command -v loongarch64-unknown-linux-gnu-gcc >/dev/null 2>&1; then \
 		printf '%s' loongarch64-unknown-linux-gnu-; \

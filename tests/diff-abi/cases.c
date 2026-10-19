@@ -13,6 +13,12 @@ long abi_call(long nr, long a, long b, long c, long d, long e, long f)
     return test_syscall6(nr,a,b,c,d,e,f);
 }
 void abi_exit(long code) { SC1(93, code); for (;;) {} }
+void *memset(void *dst, int val, usize n)
+{
+    unsigned char *d = dst;
+    for (usize i = 0; i < n; i++) d[i] = (unsigned char)val;
+    return dst;
+}
 void abi_require_at(int condition, const char *file, unsigned source_line)
 {
     if (!condition) {
@@ -204,7 +210,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_SELECTED_ONLY
+#ifdef ABI_WAITID_ONLY
+    abi_waitid_cases();
+#elif defined(ABI_SELECTED_ONLY)
     abi_selected_cases();
 #elif defined(ABI_SIGRETURN_ONLY)
     abi_sigreturn_cases();
@@ -267,6 +275,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_shm_cases();
     abi_environment_cases();
     abi_boundary_cases();
+    abi_waitid_cases();
 #endif
 #endif
     text("ABI END "); number(records); flush();

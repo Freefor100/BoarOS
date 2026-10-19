@@ -65,6 +65,7 @@
 #define LINUX_SYSCALL_FDATASYNC 83U
 #define LINUX_SYSCALL_EXIT 93U
 #define LINUX_SYSCALL_EXIT_GROUP 94U
+#define LINUX_SYSCALL_WAITID 95U
 #define LINUX_SYSCALL_SET_TID_ADDRESS 96U
 #define LINUX_SYSCALL_SET_ROBUST_LIST 99U
 #define LINUX_SYSCALL_GET_ROBUST_LIST 100U
@@ -702,6 +703,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         syscall_decode_clone(request, &decoded);
     } else if (request->number == LINUX_SYSCALL_WAIT4) {
         decoded.action = KERNEL_SYSCALL_ACTION_WAIT4;
+        decoded.value = 0;
+    } else if (request->number == LINUX_SYSCALL_WAITID) {
+        decoded.action = KERNEL_SYSCALL_ACTION_WAITID;
         decoded.value = 0;
     } else if (request->number == LINUX_SYSCALL_SCHED_YIELD) {
         decoded.action = KERNEL_SYSCALL_ACTION_YIELD;
