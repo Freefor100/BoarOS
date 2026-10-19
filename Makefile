@@ -378,6 +378,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/socket.c \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
+	kernel/syscall/capability.c \
 	kernel/syscall/random.c \
 	kernel/syscall/log.c \
 	kernel/syscall/sched.c \

@@ -34,6 +34,9 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
+/* User-visible TID lookup includes unreaped process zombies and keeps one
+ * storage borrow; completed nonleaders await cleanup without staying visible. */
+struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid);
 /* 当前执行owner覆盖读取；内核任务没有用户信号/重启上下文。 */
 int kernel_task_has_user_context(const struct kernel_task *);
 /* Releases only a lookup storage borrow, not MM/files or a running owner. */

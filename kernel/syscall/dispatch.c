@@ -118,6 +118,7 @@
 #define LINUX_SYSCALL_MPROTECT 226U
 #define LINUX_SYSCALL_WAIT4 260U
 #define LINUX_SYSCALL_PRLIMIT64 261U
+#define LINUX_SYSCALL_CAPGET 90U
 #define LINUX_SYSCALL_NEWFSTATAT 79U
 #define LINUX_SYSCALL_STATX 291U
 #define LINUX_SYSCALL_FACCESSAT 48U
@@ -508,6 +509,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_CAPGET) {
+        if (syscall_handle_capget(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_PRLIMIT64) {
         if (syscall_handle_prlimit64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

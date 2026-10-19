@@ -34,6 +34,22 @@ struct kernel_task *scheduler_task_lookup(kernel_pid_t number,
     return scheduler_task_lookup_locked(number, role, generation);
 }
 
+struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid)
+{
+    struct kernel_task *task;
+    int visible;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        task = scheduler_task_lookup_locked(tid, KERNEL_PID_TID, 0U);
+        /* 退出线程的 TID 仍供清理者迁移 child_creator；进程身份则需
+         * 保留到最后成员离开及父进程 wait，不能按信号可投递性过滤。 */
+        visible = task && (task->state != KERNEL_THREAD_STATE_EXITED ||
+                           task->identities[KERNEL_PID_TGID].identity);
+    }
+    if (task && !visible) scheduler_task_put(task);
+    return visible ? task : 0;
+}
+
 static void queue_disposal_locked(struct kernel_task *task)
 {
     if (task->retirement != 2 || task->storage_borrows) return;

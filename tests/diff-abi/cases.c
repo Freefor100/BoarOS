@@ -222,7 +222,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#if defined(ABI_CORE_LIMIT_ONLY)
+#if defined(ABI_CAPABILITY_ONLY)
+    abi_capability_cases();
+#elif defined(ABI_CORE_LIMIT_ONLY)
     abi_core_limit_cases();
 #elif defined(ABI_ITIMER_ONLY)
     abi_itimer_cases();
@@ -276,6 +278,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_robust_cases();
     abi_limit_cases();
     abi_core_limit_cases();
+    abi_capability_cases();
     identity_cases();
     abi_device_cases();
     abi_sync_cases();
