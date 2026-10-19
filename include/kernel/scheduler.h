@@ -346,4 +346,9 @@ void kernel_user_thread_exit(
     uint64_t status,
     uint64_t detail) __attribute__((noreturn));
 
+struct kernel_cpu_account_scope { struct kernel_task *task; uint32_t restore_mode; };
+void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *, int, int);
+void kernel_cpu_account_trap_end(struct kernel_cpu_account_scope *);
+void kernel_cpu_account_user_return(void);
+
 #endif

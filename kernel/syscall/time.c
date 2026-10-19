@@ -225,8 +225,8 @@ struct linux_tms {
 };
 
 /*
- * times(153): fills the optional tms buffer with scheduler-tick CPU
- * accounting (CLK_TCK = KERNEL_TICKS_PER_SECOND) and returns the tick
+ * times(153): fills the optional tms buffer by converting nanosecond CPU
+ * execution accounting (CLK_TCK = KERNEL_TICKS_PER_SECOND) and returns the tick
  * count since boot.  A NULL tms pointer only samples the uptime ticks.
  */
 enum kernel_syscall_status syscall_handle_times(

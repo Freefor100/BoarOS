@@ -496,6 +496,7 @@ enum kernel_scheduler_status scheduler_switch_claimed(
 #endif
     arch_fpu_switch(&previous->fpu, &next->fpu);
     /* 新栈完成handoff；raw已释放，IRQ仍关闭，旧任务尚不能再次运行/回收。 */
+    scheduler_cpu_time_switch(previous, next);
     arch_context_switch(&previous->context, &next->context);
     kernel_scheduler_switch_finish();
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -1429,11 +1430,7 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
         current->magic != KERNEL_THREAD_MAGIC) {
         return;
     }
-    if (from_user) {
-        current->user_ticks += elapsed_ticks;
-    } else {
-        current->kernel_ticks += elapsed_ticks;
-    }
+    (void)from_user; /* 用户/内核用量由执行边界结算，tick只保留idle与负载采样。 */
 }
 
 uint64_t kernel_scheduler_idle_ticks(void)

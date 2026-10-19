@@ -180,17 +180,21 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                     result->threads--;
                 result->minor_faults += member->minor_faults;
                 result->major_faults += member->major_faults;
-                result->user_ticks += member->user_ticks;
-                result->kernel_ticks += member->kernel_ticks;
+                uint64_t user_ns, kernel_ns;
+                scheduler_task_cpu_time_locked(member, &user_ns, &kernel_ns);
+                result->user_ticks += user_ns;
+                result->kernel_ticks += kernel_ns;
             }
         }
         scheduler_task_cursor_next(&cursor);
     }
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        result->child_user_ticks = leader->child_user_ticks;
-        result->child_kernel_ticks = leader->child_kernel_ticks;
+        result->child_user_ticks = leader->child_user_ns / 10000000U;
+        result->child_kernel_ticks = leader->child_kernel_ns / 10000000U;
     }
+    result->user_ticks /= 10000000U;
+    result->kernel_ticks /= 10000000U;
     if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE) {
         struct kernel_mm_proc_memory memory;
         if (kernel_mm_proc_memory_snapshot(&task->mm, &memory) !=

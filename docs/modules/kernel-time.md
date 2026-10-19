@@ -51,9 +51,12 @@ RR时间片、最早睡眠deadline)，到期由按(deadline, tid)排序的索引
 短睡眠不再固定等到下一次100Hz tick。IRQ延迟、关中断段和更高优先级任务仍会延后
 实际运行，不宣称硬上界；提高HZ的取舍不再用于唤醒精度。
 
-`times(153)`与proc的user/kernel统计来自timer采样：trap按当时的U/S状态记账，
-不是逐段结算的运行时间。频繁短syscall、关中断与延迟tick会影响归属，不能把
-`tms_stime=0`解释成没有内核工作；CPU-time clock或PROF timer扩展前需核对该边界。
+任务CPU时间以纳秒累计：U/S trap、嵌套IRQ进入/返回、实际切栈及用户返回边界结算执行片段。
+IRQ处理不计入任务CPU用量；睡眠和CPU0服务排队没有执行片段，实际CPU0服务计入该任务内核时间。
+每任务的执行模式随内核栈恢复，每CPU的执行借用在真正切栈前转移；提前发布的current不改变旧栈的归属。
+查询包含尚在CPU上执行的片段，并在同一调度域核对远端owner。
+`times(153)`与proc从共同累计值换算为100Hz用户tick，wait4/waitid换算为微秒。
+线程退出先归并到组，消费子进程时再归并给父组，WNOWAIT保留事件与统计。
 
 Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC转换、OFD独占和限制见[文件设备](kernel-files.md#仅读rtc与ofd设备资格)。这没有增加RTC写入或clock_settime能力。
 

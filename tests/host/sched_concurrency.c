@@ -393,7 +393,7 @@ static void group_exit_work(void)
         kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
         struct kernel_task *leader = &tasks[0];
         for (unsigned i = 0; i < members; i++) {
-            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY, .magic = KERNEL_THREAD_MAGIC, .user_ticks = i+1, .kernel_ticks = 2*(i+1)};
+            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY, .magic = KERNEL_THREAD_MAGIC, .user_ns = (i+1)*10000000U, .kernel_ns = 2*(i+1)*10000000U};
             tasks[i].group_leader = leader;
             tasks[i].group_next = &tasks[(i + 1) % members];
             tasks[i].group_previous = &tasks[(i + members - 1) % members];
@@ -409,7 +409,7 @@ static void group_exit_work(void)
             }
         }
         uint64_t user, kernel, child_user, child_kernel;
-        leader->child_user_ticks=7;leader->child_kernel_ticks=9;
+        leader->child_user_ns=70000000U;leader->child_kernel_ns=90000000U;
         group_lock_calls=0;
         kernel_task_cpu_ticks(&tasks[members-1],&user,&kernel,&child_user,&child_kernel);
         assert(user==members*(members+1)/2 && kernel==members*(members+1));
@@ -808,8 +808,45 @@ static void concurrent_claim(unsigned count)
     assert(!pthread_barrier_destroy(&start));
 }
 
+static void cpu_time_without_ticks(void)
+{
+    scheduler = (struct kernel_scheduler){.initialized=KERNEL_SCHEDULER_INITIALIZED};
+    tasks[0] = (struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.arch.user_mode=1,.group_members=1};
+    tasks[0].group_leader=&tasks[0];
+    kernel_cpu_initialize(&cpus[0],0,0);active_cpu=&cpus[0];cpus[0].current=&tasks[0];
+    kernel_rt_bandwidth_init(&cpus[0].rt_bandwidth,0);
+    scheduler.cpus=&cpus[0];kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
+    now=0;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);scheduler_account_runtime_locked(); }
+    now=20000000;
+    uint64_t user=0,system=0,children_user=0,children_system=0;
+    kernel_task_cpu_ticks(&tasks[0],&user,&system,&children_user,&children_system);
+    assert(user==0 && system==2 && !children_user && !children_system);
+    kernel_cpu_account_user_return();
+    now+=700;
+    struct kernel_cpu_account_scope irq,nested;
+    kernel_cpu_account_trap_begin(&irq,1,1);now+=500;
+    kernel_cpu_account_trap_begin(&nested,0,1);now+=100;
+    kernel_cpu_account_trap_end(&nested);now+=500;
+    kernel_cpu_account_trap_end(&irq);now+=200;
+    kernel_cpu_account_user_return();now+=300;
+    uint64_t u,k;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);scheduler_task_cpu_time_locked(&tasks[0],&u,&k); }
+    assert(u==1000 && k==20000200);
+    struct kernel_cpu_account_scope syscall;
+    kernel_cpu_account_trap_begin(&syscall,1,0);now+=30;
+    tasks[1]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC};
+    cpus[0].current=&tasks[1];scheduler_cpu_time_switch(&tasks[0],&tasks[1]);now+=1000;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      scheduler_task_cpu_time_locked(&tasks[0],&u,&k);assert(u==1000 && k==20000230);
+      scheduler_task_cpu_time_locked(&tasks[1],&u,&k);assert(!u && k==1000); }
+    now=0;
+    puts("CPU elapsed user/kernel time, nested IRQ exclusion and exact execution-owner transfer passed");
+}
+
 int main(void)
 {
+    cpu_time_without_ticks();
     for (unsigned threads = 2; threads <= 4; threads += 2) {
         shutdown_during_disposal(threads, 0);
         for (unsigned window = 2; window <= 4; window++)
