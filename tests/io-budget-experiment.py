@@ -174,11 +174,29 @@ def records(text, name):
             for line in text.splitlines() if line.startswith('IO ' + name + ' ')]
 
 
+def kernel_heap_peak(raw):
+    values=re.findall(r'(?m)^ root-heap-peak-pages=(\d+)\r?$',raw)
+    if len(values)!=1: raise RuntimeError('missing/duplicate root heap high watermark')
+    return int(values[0])*4096
+
+
 def validate(text, case):
     if not text.endswith('IO PASS all\n'):
         raise RuntimeError('incomplete durable guest results')
     if case['operation'] == 'mixed-read':
-        return validate_mixed(text, case)
+        result=validate_mixed(text,case)
+    else:
+        result=validate_regular(text,case)
+    bindings,resources=records(text,'AFFINITY'),records(text,'RESOURCE')
+    if len(bindings)!=case['files'] or {r.get('role') for r in bindings}!=set(range(case['files'])) or any(r.get('cpu',-1)<0 for r in bindings):
+        raise RuntimeError('missing/duplicate actor affinity')
+    if len(resources)!=1 or resources[0].get('self_maxrss_kib',0)<=0 or resources[0].get('children_maxrss_kib',-1)<0:
+        raise RuntimeError('missing workload resource high watermarks')
+    result.update(affinity=bindings,resources=resources[0])
+    return result
+
+
+def validate_regular(text,case):
     windows, rows, sizes = records(text, 'WINDOW'), records(text, 'FILE'), records(text, 'SIZE')
     if len(windows) != 1 or len(rows) != case['files'] or {r.get('id') for r in rows} != set(range(case['files'])):
         raise RuntimeError('missing, duplicate or wrong file/window identity')
@@ -216,12 +234,24 @@ def validate(text, case):
     metrics.update(data_mib_s=window['bytes'] * 1e9 / (1048576 * window['data_ns']),
                    completion_mib_s=window['bytes'] * 1e9 / (1048576 * window['elapsed_ns']),
                    file_completion_span_ns=max(r['end_ns'] for r in rows) - min(r['end_ns'] for r in rows))
-    return dict(window=window, files=rows, sizes=sizes, metrics=metrics)
+    samples=records(text,'SAMPLE')
+    per_file=(case['bytes']+case['request']-1)//case['request']
+    if len(samples)!=case['files']*per_file: raise RuntimeError('missing request intervals')
+    for row in rows:
+        own=[s for s in samples if s.get('id')==row['id']]
+        if len(own)!=per_file or [s.get('sequence') for s in own]!=list(range(per_file)):
+            raise RuntimeError('wrong request interval identity/order')
+        if any(not row['start_ns']<=s['start_ns']<=s['end_ns']<=row['end_ns'] for s in own):
+            raise RuntimeError('request interval outside file window')
+    latencies={'io':latency_metrics([s['end_ns']-s['start_ns'] for s in samples])}
+    metrics.update({'io_'+k:v for k,v in latencies['io'].items()})
+    return dict(window=window,files=rows,sizes=sizes,metrics=metrics,latencies=latencies)
 
 
 def latency_metrics(samples):
     ordered = sorted(samples)
     return dict(samples=len(ordered), p50_ns=ordered[(len(ordered) - 1) // 2] if ordered else None,
+                p95_ns=ordered[max(0,(len(ordered)*95+99)//100-1)] if ordered else None,
                 p99_ns=ordered[max(0, (len(ordered) * 99 + 99) // 100 - 1)] if ordered else None,
                 maximum_ns=ordered[-1] if ordered else None)
 
@@ -310,8 +340,8 @@ def boot(work, kernel, image, case, name, repetition, args, program_sha):
     subprocess.run(['cp', '--reflink=never', '--sparse=never', str(image), str(disk)], check=True)
     with disk.open('rb') as backing:
         os.fsync(backing.fileno())
-    command = [args.qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel), '-m', args.ram,
-               '-smp', str(getattr(args, 'cpus', 1)), '-nographic', '-no-reboot', '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
+    command = [args.qemu, '-machine', 'virt', '-bios', str(getattr(args,'firmware','default')), '-kernel', str(kernel), '-m', args.ram,
+               '-smp', str(getattr(args, 'cpus', 1)), '-accel','tcg,thread=multi','-nographic', '-no-reboot', '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
                '-drive', f'file={disk},if=none,format=raw,id=root,cache=writeback',
                '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
     if name == 'linux':
@@ -325,7 +355,12 @@ def boot(work, kernel, image, case, name, repetition, args, program_sha):
         if name != 'linux' and ('heap-live=0x0; shutting down' not in raw or 'exited status=0x0 ' not in raw):
             raise RuntimeError('BoarOS clean exit/heap teardown missing')
         text, row['readout'] = extract(disk, work)
+        harness.run_logged(['e2fsck','-fn',str(disk)],work/'fsck.log')
+        row['filesystem_check']={'command':['e2fsck','-fn',str(disk)],'returncode':0}
         row.update(validate(text, case))
+        if name!='linux':
+            row['resources']['root_heap_peak_bytes']=kernel_heap_peak(raw)
+            row['resource_scope']='process RSS and root heap lifetime high watermarks; includes setup/result writing; components are not additive'
         bodies = re.findall(r'^IO COST BEGIN\n(.*?)^IO COST END$', text, re.M | re.S)
         if bool(bodies) != args.observe or len(bodies) > 1:
             raise RuntimeError('diagnostic snapshot/mode mismatch')
@@ -440,6 +475,7 @@ def run_locked(args):
         cases=cases, repeat=args.repeat, observe=args.observe, smoke=args.smoke, linux_identity=linux_identity,
         evidence_kind='functional-smoke-not-performance' if args.smoke else 'diagnostic' if args.observe else 'performance',
         qemu_version=output([args.qemu, '--version']), qemu_sha256=digest(args.qemu), compiler=output([str(compiler), '--version']),
+        firmware={'selection':args.firmware,'sha256':digest(args.firmware) if args.firmware!='default' else None},
         ram=args.ram, cpus=args.cpus, transport=args.transport, disk_cache='writeback', timeout_seconds=args.timeout, baseline_commit=helpers.BASELINE_COMMIT,
         cache_policy='Fresh kernel boot and matched image copy per case/variant/repetition; no drop_caches or host cache eviction')
     save(work / 'identity.json', identity); rows = []
@@ -469,6 +505,7 @@ def main():
         p.add_argument('--observe', action='store_true'); p.add_argument('--output', type=Path)
         p.add_argument('--ram', default='512M'); p.add_argument('--transport', choices=('legacy', 'modern'), default='modern')
         p.add_argument('--cpus', type=int, choices=(1, 2), default=1, help='guest CPUs; two requires a USER_SMP kernel')
+        p.add_argument('--firmware',default='default',help='explicit OpenSBI firmware or QEMU default')
         p.add_argument('--timeout', type=int, default=240, help='explicit guest budget in seconds, 1..3600; excludes no failed runs')
     args = parser.parse_args()
     if args.command == 'profiles': print(json.dumps(profiles('all'), indent=2))

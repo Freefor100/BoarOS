@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +25,32 @@ static FILE *evidence;
 static char result_path[1024];
 static pid_t mixed_children[MAX_FILES];
 static unsigned mixed_child_count;
+static unsigned available_cpus[2],available_count;
+struct io_interval { uint64_t start,end; };
+
+static void choose_cpus(void)
+{
+    cpu_set_t mask;CPU_ZERO(&mask);
+    CHECK(sched_getaffinity(0,sizeof(mask),&mask)==0);
+    for (unsigned cpu=0;cpu<CPU_SETSIZE && available_count<2;cpu++)
+        if (CPU_ISSET(cpu,&mask)) available_cpus[available_count++]=cpu;
+    CHECK(available_count);
+}
+static unsigned pin_cpu(unsigned secondary)
+{
+    unsigned cpu=available_cpus[secondary && available_count>1];
+    cpu_set_t mask,actual;CPU_ZERO(&mask);CPU_SET(cpu,&mask);
+    CHECK(sched_setaffinity(0,sizeof(mask),&mask)==0 && sched_getaffinity(0,sizeof(actual),&actual)==0);
+    CHECK(CPU_COUNT(&actual)==1 && CPU_ISSET(cpu,&actual));
+    return cpu;
+}
+static void resources(void)
+{
+    struct rusage self,children;
+    CHECK(!getrusage(RUSAGE_SELF,&self) && !getrusage(RUSAGE_CHILDREN,&children));
+    fprintf(evidence,"IO RESOURCE self_maxrss_kib=%llu children_maxrss_kib=%llu\n",
+        (unsigned long long)self.ru_maxrss,(unsigned long long)children.ru_maxrss);
+}
 struct result {
     int fd;
     uint64_t bytes, calls, start, end, sync_end, size_before, size_after, checksum;
@@ -130,7 +158,7 @@ static void start_observation(void)
 
 struct mixed_sample { uint64_t open_start, start, end; };
 struct mixed_report {
-    unsigned id, sample_count;
+    unsigned id, sample_count, cpu;
     uint64_t start, end, data_start, data_end, sync_start, sync_end;
     uint64_t bytes, calls, checksum;
 };
@@ -165,7 +193,7 @@ static void mixed_child(const char *directory, unsigned id, int ready, int gate,
     /* 先触及记录页，样本写入自身的首次缺页不混进读取窗口。 */
     for (size_t offset = 0; offset < count * sizeof(*samples); offset += 4096)
         ((volatile unsigned char *)samples)[offset] = 0;
-    struct mixed_report report = {.id = id, .sample_count = count};
+    struct mixed_report report = {.id = id, .sample_count = count, .cpu=pin_cpu(id==1)};
     int fd = mixed_open(directory, id, id ? O_RDONLY : O_RDWR | O_APPEND);
     CHECK(size_of(fd) == (id ? file_bytes : 0));
     if (!id) {
@@ -291,6 +319,7 @@ static int mixed_read(const char *directory)
             (unsigned long long)start, (unsigned long long)end, (unsigned long long)(file_bytes * 2));
     for (unsigned id = 0; id < MAX_FILES; ++id) {
         const struct mixed_report *r = &completed[id];
+        fprintf(evidence,"IO AFFINITY role=%u cpu=%u\n",id,r->cpu);
         fprintf(evidence, "IO MIXED_FILE id=%u bytes=%llu calls=%llu start_ns=%llu end_ns=%llu data_start_ns=%llu data_end_ns=%llu sync_start_ns=%llu sync_end_ns=%llu checksum=%llu samples=%u complete=1\n",
                 id, (unsigned long long)r->bytes, (unsigned long long)r->calls,
                 (unsigned long long)r->start, (unsigned long long)r->end,
@@ -303,6 +332,7 @@ static int mixed_read(const char *directory)
                     (unsigned long long)samples[id][sequence].start, (unsigned long long)samples[id][sequence].end);
         free(samples[id]);
     }
+    resources();
     fputs("IO PASS all\n", evidence);
     CHECK(fflush(evidence) == 0 && fsync(fileno(evidence)) == 0 && fclose(evidence) == 0);
     puts("IO PASS all");
@@ -345,6 +375,8 @@ int main(int argc, char **argv)
     int n = snprintf(result_path, sizeof(result_path), "%s.results", config_path);
     CHECK(n > 0 && (size_t)n < sizeof(result_path));
     const char *directory = argc > 2 ? argv[2] : memory ? "/memory" : "/data";
+    choose_cpus();
+    unsigned cpu=pin_cpu(1);
     if (mixed) return mixed_read(directory);
     if (memory && argc <= 2) CHECK(mount("tmpfs", directory, "tmpfs", 0, "size=384m") == 0);
     struct result results[MAX_FILES] = {{0}};
@@ -367,6 +399,10 @@ int main(int argc, char **argv)
         CHECK(results[id].size_before == (append ? 0 : file_bytes));
         if (hot) (void)verify(results[id].fd, id, 0);
     }
+    size_t per_file=(file_bytes+request_bytes-1)/request_bytes;
+    struct io_interval *samples=calloc(files*per_file,sizeof(*samples));CHECK(samples);
+    for (size_t offset=0;offset<files*per_file*sizeof(*samples);offset+=4096)
+        ((volatile unsigned char *)samples)[offset]=0;
     start_observation();
     uint64_t start = now();
     /* 单任务逐请求轮转；每文件进展可核对，但不声称覆盖并发调度公平性。 */
@@ -377,7 +413,10 @@ int main(int argc, char **argv)
             struct result *r = &results[id];
             if (!offset) r->start = now();
             if (writing) fill(id, offset, count, 1);
+            struct io_interval *sample=&samples[id*per_file+offset/request_bytes];
+            sample->start=now();
             exact(r->fd, count, writing, &r->calls);
+            sample->end=now();
             r->bytes += count;
             if (!writing) r->checksum += check(id, offset, count, 0);
             if (writing && (offset == 0 || r->bytes == file_bytes / 4 || r->bytes == file_bytes / 2 || r->bytes == file_bytes * 3 / 4 || r->bytes == file_bytes)) {
@@ -418,6 +457,12 @@ int main(int argc, char **argv)
             (unsigned long long)(verify_end - verify_start), (unsigned long long)(cleanup_end - cleanup_start), cleanup_sync_calls);
     for (unsigned id = 0; id < files; ++id) {
         const struct result *r = &results[id];
+        fprintf(evidence,"IO AFFINITY role=%u cpu=%u\n",id,cpu);
+        for (size_t sequence=0;sequence<per_file;sequence++) {
+            const struct io_interval *sample=&samples[id*per_file+sequence];
+            fprintf(evidence,"IO SAMPLE id=%u sequence=%llu start_ns=%llu end_ns=%llu\n",id,
+                (unsigned long long)sequence,(unsigned long long)sample->start,(unsigned long long)sample->end);
+        }
         fprintf(evidence, "IO FILE id=%u bytes=%llu calls=%llu start_ns=%llu end_ns=%llu sync_end_ns=%llu size_before=%llu size_after=%llu checksum=%llu complete=1\n",
                 id, (unsigned long long)r->bytes, (unsigned long long)r->calls, (unsigned long long)r->start,
                 (unsigned long long)r->end, (unsigned long long)r->sync_end, (unsigned long long)r->size_before,
@@ -425,7 +470,9 @@ int main(int argc, char **argv)
         for (unsigned j = 0; j < r->growth_count; ++j)
             fprintf(evidence, "IO SIZE id=%u sample=%u bytes=%llu\n", id, j, (unsigned long long)r->growth[j]);
     }
+    free(samples);
     if (memory && argc <= 2) CHECK(umount(directory) == 0);
+    resources();
     fputs("IO PASS all\n", evidence);
     CHECK(fflush(evidence) == 0 && fsync(fileno(evidence)) == 0 && fclose(evidence) == 0);
     puts("IO PASS all");

@@ -6,9 +6,9 @@
 
 ## 近期方向
 
-架构主线是SMP正确性；受控RV映射域已包含匿名、私有tmpfs及CPU0 I/O交接的ext4。真实RV用户两核按业务入口交接仍需CPU0的操作，229项原程序及有限压力/生命周期组合已有本地两核与单核退化验证；下一步明确inode、mount和journal的实际共享状态，缩小文件后端串行范围，再推进端点跨CPU所有权及LA多核。
+架构主线是SMP正确性；受控RV映射域已包含匿名、私有tmpfs及在发起CPU冷装入的ext4。真实RV用户两核按业务入口交接仍需CPU0的操作，229项原程序及有限压力/生命周期组合已有本地两核与单核退化验证；ext4 冷读已具备 inode/mount 读资格、共享缓存短锁及块完成保护；下一步推进前台元数据写本地化、RV 四核和端点跨 CPU 所有权及 LA 多核。
 维持现有调度策略、全局运行队列和串行 lwIP 核心，先证明并发正确，再依据锁等待与 CPU 分布决定并行优化。
-默认生产仍为单 CPU；普通与受控对象共用保护与引用规则，普通文件缓存读写、用户复制与匿名缺页在发起 CPU 执行。冷读与后端释放复用既有 CPU0 worker，范围写回按窗口续批，fsync捕获固定持久化目标后由原调用者等待，CPU0完成事件处理错误观察并直接通知结果。系统分配器通知和干净页回收可由远端调用，脏数据仍由 worker 写回。网络已将端点队列的短IRQ保护与开中断的lwIP核心互斥分开；端点仍依赖CPU0，不能据此视为支持跨CPU消费。
+默认生产仍为单 CPU；普通与受控对象共用保护与引用规则，普通文件缓存读写、用户复制与匿名缺页在发起 CPU 执行。ext4 冷读在发起 CPU 解析映射并提交块请求；其他磁盘后端冷读与后端释放复用既有 CPU0 worker，范围写回按窗口续批，fsync捕获固定持久化目标后由原调用者等待，CPU0完成事件处理错误观察并直接通知结果。系统分配器通知和干净页回收可由远端调用，脏数据仍由 worker 写回。网络已将端点队列的短IRQ保护与开中断的lwIP核心互斥分开；端点仍依赖CPU0，不能据此视为支持跨CPU消费。
 
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
@@ -70,7 +70,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 |---|---|---|
 | allocator 与批量 MM 成本 | 森林13.6%–22.4%、raw互斥6.0%–7.3%、等待交接的默认匿名新增2.5%–4.0%分别测量；后台提交/退出交错与批量MM的IRQ尾延迟仍有成本 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间)、[等待交接](learning/cost-baseline.md#等待交接的匹配时间) |
 | 共享调度域短窗口 | 4KiB复制唤醒与32等待者OFD的正式成本仍未决，归因已停止；保留数据，不追加诊断，不作为RV两核规划前置项 | [匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
-| 文件后端串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；inode数据处理、mount元数据与journal接纳仍在CPU0，继续按实际共享状态拆分执行范围 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
+| 文件后端串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；ext4 冷读和 mmap 冷页在调用 CPU 装入；前台元数据写、mount 管理与 journal 接纳继续在 CPU0，下一阶段推进元数据写本地化 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
 | 网络端点与原生构建成本 | 端点队列已离开lwIP全局互斥，但短IRQ保护仍依赖CPU0；本地消费需要实际端点锁与引用，lwIP可继续单一owner。默认预算、同步/排空及Lua工程的剩余成本按对应负载检查 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
 | 未归因现场 | 历史Virtqueue/页释放fatal/偶发取消、RV块统计case47及固定Linux LA终端等待，保留各自首个阶段与缺失证据；同类修复和重跑不关闭原事件 | [事故边界](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)、[程序证据](learning/user-program-inventory.md)、[块诊断](modules/riscv-virtio-block.md) |

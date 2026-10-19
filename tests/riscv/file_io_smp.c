@@ -21,6 +21,7 @@
 
 #define IO_BUFFER UINT64_C(0xe0000000)
 #define IO_ANON UINT64_C(0xe0100000)
+#define IO_COLD UINT64_C(0xe0200000)
 static struct kernel_files table;
 static struct kernel_mm *space;
 static struct kernel_open_file_description *control;
@@ -30,7 +31,7 @@ static struct kernel_vfs_mount *memory_mount;
 static struct kernel_page_cache *cache;
 static struct kernel_thread_join peer;
 static unsigned cpus,stop,progress,user_overlap;
-static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads;
+static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads,watch_cold;
 static unsigned watch_timeout,timeout_copies;
 static struct kernel_block_device *raw_device;
 static struct virtio_split_queue *raw_queue;
@@ -61,8 +62,8 @@ int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
     struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
-    if(cold_control && node==kernel_open_file_node(cold_control)) {
-        if(kernel_cpu_current()->logical_id)riscv_smp_fail("file-io-cold-backend-left-cpu0",-1);
+    if(watch_cold && cold_control && node==kernel_open_file_node(cold_control)) {
+        if(kernel_cpu_current()->logical_id!=copy_cpu)riscv_smp_fail("file-io-cold-backend-left-caller",-1);
         cold_loads++;
     }
     return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace, completion);
@@ -223,17 +224,25 @@ static void verify(void *unused)
     virt_uart_puts(" copies=");virt_uart_put_hex(timeout_copies);virt_uart_putc('\n');
     kernel_page_cache_get_concurrency_state(cache,&before);
     unsigned loads=cold_loads;
-    watch_copy=1;
+    watch_copy=watch_cold=1;raw_read_active=1;raw_submissions=0;
     check(!kernel_files_pread(files,mm,3,IO_ANON,4,0,&result) && result==4,"file-io-cold-request");
-    watch_copy=0;
+    watch_copy=watch_cold=raw_read_active=0;
     kernel_page_cache_get_concurrency_state(cache,&after);
-    check(cold_loads>loads && after.requests_queued>before.requests_queued &&
-        after.executions_queued==before.executions_queued,"file-io-cold-only-backend-dispatched");
+    check(cold_loads>loads && raw_submissions && after.requests_queued==before.requests_queued &&
+        after.executions_queued==before.executions_queued,"file-io-cold-backend-kept-caller");
     char cold[4];
     check(!kernel_copy_from_user(mm,cold,IO_ANON,4,&copied) && copied==4 && !memcmp(cold,"COLD",4),"file-io-cold-content");
     virt_uart_puts("BoarOS: FILE IO local hot copy hart=");virt_uart_put_hex(copy_cpu);
     virt_uart_puts(" copies=");virt_uart_put_hex(local_copies[copy_cpu]);
-    virt_uart_puts(" cold backend CPU0 loads=");virt_uart_put_hex(cold_loads-loads);virt_uart_putc('\n');
+    virt_uart_puts(" cold caller backend loads=");virt_uart_put_hex(cold_loads-loads);virt_uart_putc('\n');
+    loads=cold_loads;watch_cold=raw_read_active=1;raw_submissions=0;
+    check(!kernel_copy_from_user(mm,raw_bytes,IO_COLD,sizeof(raw_bytes),&copied) &&
+        copied==sizeof(raw_bytes) && !memcmp(raw_bytes,"COLD",4),"file-io-cold-mmap-content");
+    watch_cold=raw_read_active=0;
+    for (unsigned i=4;i<sizeof(raw_bytes);i++) check(!raw_bytes[i],"file-io-cold-mmap-eof-zero");
+    check(cold_loads>loads && raw_submissions,"file-io-cold-mmap-caller-backend-submit");
+    virt_uart_puts("BoarOS: FILE IO cold mmap backend/submit hart=");virt_uart_put_hex(copy_cpu);
+    virt_uart_puts(" loads=");virt_uart_put_hex(cold_loads-loads);virt_uart_putc('\n');
     transfer();
     check(!kernel_files_pread(files,mm,0,IO_ANON,4,0,&result) && result==4,"file-io-cold-anonymous-buffer");
     struct kernel_mm_user_pin pin={0};
@@ -326,12 +335,18 @@ void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigne
     uint64_t observed=0;
     check(!kernel_vfs_file_acquire_write(&cold_control->file) &&
         !kernel_vfs_pwrite(&cold_control->file,0,"COLD",4,&written) && written==4 &&
+        !kernel_vfs_pwrite(&cold_control->file,BOAROS_PAGE_SIZE,"COLD",4,&written) && written==4 &&
         !kernel_vfs_sync(&cold_control->file,0,&observed) &&
         !kernel_page_cache_invalidate_node(cache,kernel_open_file_node(cold_control)),"file-io-cold-home");
     uint64_t address; struct kernel_open_file_description *mapping=control;
     check(!kernel_open_file_acquire(mapping) && !kernel_mm_mmap_file_private(space,&mapping,IO_BUFFER,
         BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && !mapping,"file-io-buffer-source-owner");
+    mapping=cold_control;
+    check(!kernel_open_file_acquire(mapping) && !kernel_mm_mmap_file_private(space,&mapping,IO_COLD,
+        BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ,
+        KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && !mapping,
+        "file-io-cold-mmap-source-owner");
     check(!kernel_mm_mmap_anonymous(space,IO_ANON,2*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address),"file-io-anonymous-buffer");
     check(!kernel_files_create(&table,heap),"file-io-table");

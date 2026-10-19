@@ -440,7 +440,7 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	}
 	ext4_bdif_lock(bdev);
 	int r = bdev->bdif->bwrite_batch(bdev, physical, count);
-	bdev->bdif->bwrite_ctr += count;
+	__atomic_fetch_add(&bdev->bdif->bwrite_ctr,count,__ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	return r;
 }

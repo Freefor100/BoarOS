@@ -422,24 +422,32 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     struct crossing first={.id=1},queued={.id=2}; pthread_t active,pending,stopper;
     assert(!pthread_create(&active,0,crossing_read,&first));
     while (!__atomic_load_n(&access_entered,__ATOMIC_ACQUIRE)) sched_yield();
-    /* worker已取得原OFD；fd0替换不会重定向正在使用它的请求。 */
+    /* The caller pins the original OFD; fd0 replacement cannot redirect it. */
     assert(!kernel_files_close(&files,0,&result) && !result && controls[0]->references==2);
     assert(!kernel_files_dup3(&files,1,0,0,&result) && result==0);
     assert(!pthread_create(&pending,0,crossing_read,&queued));
+    struct kernel_block_device *device=kernel_vfs_file_block_device(&controls[1]->file);
+    assert(device);
+    for (;;) {
+        unsigned waiting;
+        { KERNEL_RAW_SCOPE(guard,&device->io_lock.lock.metadata);
+          waiting=device->io_lock.lock.pending_head!=NULL; }
+        if (waiting) break;
+        sched_yield();
+    }
     struct kernel_page_cache_concurrency_state state;
-    do { kernel_page_cache_get_concurrency_state(cache,&state); sched_yield(); } while (state.pending!=1);
-    assert(state.running==1 && !pthread_create(&stopper,0,stop_requests,cache));
-    assert(!pthread_join(pending,0) && !queued.status && queued.result==-KERNEL_EIO);
-    assert(!__atomic_load_n(&stop_done,__ATOMIC_ACQUIRE));
-    assert(controls[0]->references==2); /* cancel不是正在执行请求的完成。 */
+    kernel_page_cache_get_concurrency_state(cache,&state);
+    assert(!state.running && !state.pending && !pthread_create(&stopper,0,stop_requests,cache));
+    assert(!pthread_join(stopper,0) && __atomic_load_n(&stop_done,__ATOMIC_ACQUIRE));
+    assert(controls[0]->references==2);
     __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);
     assert(!pthread_join(active,0) && !first.status && !memcmp(first.bytes,"original",8));
-    assert(!pthread_join(stopper,0));
+    assert(!pthread_join(pending,0) && !queued.status && queued.result==8 && !memcmp(queued.bytes,"replaced",8));
     kernel_page_cache_get_concurrency_state(cache,&state);
     assert(!state.pending && !state.running && !state.entry_borrows && state.executions_queued==state.executions_completed);
     mm_test_attach(0); mm_test_activate_task(); assert(!kernel_files_release(&files));
     for (unsigned i=0;i<2;i++) assert(!kernel_open_file_release(&controls[i]));
-    puts("PASS executing OFD survives close/reuse; queued cancellation drains before stop; actual prefix and final owners");
+    puts("PASS caller OFD survives close/reuse and worker stop; physical I/O waiter reads replacement identity; final owners");
 }
 static void *crossing_seek(void *argument)
 {

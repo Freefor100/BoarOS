@@ -103,8 +103,16 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     assert(!kernel_vfs_pwrite(&file,0,"nested-loop-durable",19,&done) && done==19);
     assert(!kernel_vfs_sync(&file,0,&observed));
     assert(!kernel_page_cache_invalidate_node(&caches[1],kernel_vfs_file_node(&file)));
+    struct kernel_page_cache_concurrency_state before_read,after_read;
+    kernel_page_cache_get_concurrency_state(&caches[1],&before_read);
+    mm_test_attach(1);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
     char actual[19];assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done) &&
         done==sizeof(actual) && !memcmp(actual,"nested-loop-durable",sizeof(actual)));
+    assert(kernel_cpu_current()->logical_id==1);
+    kernel_page_cache_get_concurrency_state(&caches[1],&after_read);
+    assert(before_read.requests_queued==after_read.requests_queued);
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    puts("PASS loop upper cold read on caller CPU1: worker backing I/O and mount/loop owners preserved");
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_mkdir(mount,"/outer",0755) && !kernel_vfs_mkdir(mount,"/inner",0755));
     struct kernel_vfs_path *covered=NULL;

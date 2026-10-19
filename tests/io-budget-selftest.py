@@ -31,6 +31,11 @@ class Profiles(unittest.TestCase):
                     'ext4:mixed-read:fdatasync:4:1M:4K', 'ext4:mixed-read:fsync:1:1M:4K'):
             with self.assertRaises(ValueError): io.parse_case(bad)
 
+    def test_kernel_heap_peak_records(self):
+        self.assertEqual(io.kernel_heap_peak(' root-heap-peak-pages=3\n'),12288)
+        for raw in ('',' root-heap-peak-pages=3\n root-heap-peak-pages=4\n'):
+            with self.assertRaises(RuntimeError): io.kernel_heap_peak(raw)
+
     def test_smoke_is_not_promoted_to_performance(self):
         case = io.parse_case('ext4:cold-read:cache:1:1M:4K')
         identity = dict(cases=[case], variants={'current': {'kernel_sha256': 'K', 'management': 'unmanaged'}},
@@ -75,9 +80,20 @@ class Workload(unittest.TestCase):
             evidence = Path(str(config) + '.results').read_text()
             parsed = io.validate(evidence, case)
             self.assertEqual(parsed['metrics']['bytes'], case['files'] * case['bytes'])
+            for kind in ('SAMPLE','AFFINITY','RESOURCE'):
+                incomplete=''.join(line for line in evidence.splitlines(keepends=True) if not line.startswith('IO '+kind+' '))
+                with self.assertRaises(RuntimeError): io.validate(incomplete,case)
             with self.assertRaises(RuntimeError): io.validate(evidence.replace('complete=1', 'complete=0', 1), case)
             with self.assertRaises(RuntimeError): io.validate(evidence.replace('sync_calls=0', 'sync_calls=9', 1) if 'sync_calls=0' in evidence else evidence.replace('sync_calls=1', 'sync_calls=9', 1), case)
             return parsed
+
+    def test_request_latency_and_affinity(self):
+        result=self.exercise('ext4:cold-read:cache:1:1M:64K')
+        self.assertEqual(result['latencies']['io']['samples'],16)
+        self.assertGreaterEqual(result['latencies']['io']['p95_ns'],result['latencies']['io']['p50_ns'])
+        self.assertEqual(len(result['affinity']),1)
+        self.assertEqual(result['affinity'][0]['role'],0)
+        self.assertGreater(result['resources']['self_maxrss_kib'],0)
 
     def test_ext4_workload_logic(self):
         # Host files test program semantics; real filesystem identities are QEMU evidence.
@@ -128,8 +144,8 @@ class Workload(unittest.TestCase):
             with self.assertRaises(RuntimeError): io.validate(altered, case)
 
     def test_mixed_latency_percentile_and_absent_overlap(self):
-        self.assertEqual(io.latency_metrics([]), dict(samples=0, p50_ns=None, p99_ns=None, maximum_ns=None))
-        self.assertEqual(io.latency_metrics(range(1, 101)), dict(samples=100, p50_ns=50, p99_ns=99, maximum_ns=100))
+        self.assertEqual(io.latency_metrics([]), dict(samples=0, p50_ns=None, p95_ns=None, p99_ns=None, maximum_ns=None))
+        self.assertEqual(io.latency_metrics(range(1, 101)), dict(samples=100, p50_ns=50, p95_ns=95, p99_ns=99, maximum_ns=100))
 
 
 if __name__ == '__main__': unittest.main()

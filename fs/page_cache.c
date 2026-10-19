@@ -1888,7 +1888,8 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
         struct read_batch_load request={cache,file,first,pages,count,candidates,entries,loads,outputs,spans,
             workspace?&workspace->backend:NULL,allocation};
         enum kernel_page_cache_status submitted=KERNEL_PAGE_CACHE_STATUS_OK;
-        if (remote_cache_client()) submitted=run_request(cache,commit_read_batch,&request,0,NULL);
+        if (node->instance->ops->read_execution==KERNEL_VFS_READ_CPU0 && remote_cache_client())
+            submitted=run_request(cache,commit_read_batch,&request,0,NULL);
         else commit_read_batch(&request);
         if (submitted) {
             for (size_t i=0;i<count;i++) {
@@ -1947,6 +1948,12 @@ static int read_cached_batch(struct cache_read_batch_request *request)
             size_t valid=size-offset<BOAROS_PAGE_SIZE?size-offset:BOAROS_PAGE_SIZE;
             take_read_page(cache,entry,&page->physical_address,&page->valid_bytes,valid);
             page->status=KERNEL_PAGE_CACHE_STATUS_OK;
+        }
+        if (pending || retry) {
+            /* Private preparation has no indexed entry yet. Retain the same
+             * cache lifetime used by queued requests until caller unwind. */
+            if (cache->record->request_borrows==UINT32_MAX) __builtin_trap();
+            cache->record->request_borrows++;
         }
     }
     if (retry) {
@@ -2034,7 +2041,12 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct cache_read_batch_request request = {cache, file, first, pages, count};
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
-    if (read_cached_batch(&request)) prepare_read_batch(&request);
+    if (read_cached_batch(&request)) {
+        prepare_read_batch(&request);
+        CACHE_SCOPE(guard,cache);
+        if (!cache->record->request_borrows) __builtin_trap();
+        cache->record->request_borrows--;
+    }
     enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_OK;
     for (size_t i = 0; i < count; i++) if (pages[i].status) {
         pages[i].physical_address = 0;

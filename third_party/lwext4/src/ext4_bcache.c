@@ -217,18 +217,19 @@ static int put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_on
     struct ext4_buf *buf=b->buf;
     bool flush=false,drop=false;
     int result=EOK;
-    {
-        KERNEL_RAW_SCOPE(guard,&bc->metadata);
-        if (!buf || !buf->refctr || buf->bc!=bc) __builtin_trap();
-        flush=buf->refctr==1 && !read_only && ext4_bcache_test_flag(buf,BC_DIRTY) &&
-            ext4_bcache_test_flag(buf,BC_UPTODATE) && (!bc->bdev->cache_write_back ||
-            ext4_bcache_test_flag(buf,BC_FLUSH) || ext4_bcache_test_flag(buf,BC_TMP));
-    }
+    KERNEL_RAW_SCOPE(guard,&bc->metadata);
+    if (!buf || !buf->refctr || buf->bc!=bc) __builtin_trap();
+    flush=buf->refctr==1 && !read_only && ext4_bcache_test_flag(buf,BC_DIRTY) &&
+        ext4_bcache_test_flag(buf,BC_UPTODATE) && (!bc->bdev->cache_write_back ||
+        ext4_bcache_test_flag(buf,BC_FLUSH) || ext4_bcache_test_flag(buf,BC_TMP));
     /* The final writer keeps its reference across flush. A concurrent lookup
      * cannot detach this buffer while the device borrows its payload. */
-    if (flush) result=ext4_block_flush_buf(bc->bdev,buf);
+    if (flush) {
+        kernel_raw_lock_release(&guard);
+        result=ext4_block_flush_buf(bc->bdev,buf);
+        kernel_raw_lock_acquire(&bc->metadata,&guard);
+    }
     {
-        KERNEL_RAW_SCOPE(guard,&bc->metadata);
         if (flush && !result) ext4_bcache_clear_flag(buf,BC_FLUSH);
         if (!--buf->refctr) {
             /* LRU counter wrap retains a unique key among live idle buffers. */
@@ -243,6 +244,7 @@ static int put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_on
         }
         b->lb_id=0;b->data=NULL;
     }
+    kernel_raw_lock_release(&guard);
     if (drop) free_buffer(buf);
     return result;
 }

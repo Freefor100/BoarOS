@@ -96,10 +96,15 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
                 "FD/OFD/pipe/wait owners returned" not in text or
                 "BoarOS: PID 1 exited status=0x2a" not in text):
                 raise RuntimeError(f"missing native FD/pipe/root closure:\n{text[-5000:]}")
-        if contract=="file-io" and "FILE IO native cold buffer/offset/prefix/sync/close owners passed" not in text:
-            raise RuntimeError("missing ordinary file IO and owner closure")
+        if contract=="file-io":
+            caller=f"0x{1 if cpus==2 else 0:x}"
+            for marker in ("FILE IO native cold buffer/offset/prefix/sync/close owners passed",
+                           "BLOCK caller reads hart="+caller,
+                           "EXT4 direct backend read hart="+caller,
+                           "FILE IO cold mmap backend/submit hart="+caller):
+                if marker not in text: raise RuntimeError("missing caller file I/O evidence: "+marker)
         if contract=="file-io" and f"FILE IO local hot copy hart=0x{1 if cpus==2 else 0:x}" not in text:
-            raise RuntimeError("missing actual caller-hart hot copy and CPU0 cold backend evidence")
+            raise RuntimeError("missing actual caller-hart hot copy evidence")
         for disk in disks:
             subprocess.run(["e2fsck","-fn",str(disk)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
         print(f"RV {contract} cpus={cpus} RAM={memory} actual I/O and owner closure passed",flush=True)
