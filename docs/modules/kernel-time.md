@@ -43,7 +43,7 @@ syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME
 
 `make test-syscall-riscv` 覆盖换算、coarse 初始化一致性、无 timer 时的稳定读数、延迟采样与 10ms 分辨率；`tests/diff-abi/coarse.c` 覆盖真实 U-mode timer 推进、查询错误和拒绝 coarse sleep。固定 Linux 必须启用 `CONFIG_POSIX_TIMERS` 才能对照 raw coarse syscall；Linux HZ=250 的 4ms 与 BoarOS HZ=100 的 10ms 分辨率按各自真实周期验证，不要求裸值相等。`make test-userland-riscv` 用 musl 验证真实 trap→expire→wake 闭环和 RTC 墙钟。
 
-当前限制：无 NTP/阶跃调整及 CPU-time sleep/timer；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
+当前限制：无 NTP/阶跃调整、CPU-time sleep 或 POSIX timer_create 系列；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
 检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、
@@ -70,11 +70,19 @@ Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC
 因此旧值输出 EFAULT 不回滚新 alarm；NULL 新值按固定 Linux 取消。时间取整与
 100 Hz timer delivery 的界限如上，不宣称高精度到期交付。
 
-依据本地 `references/linux/kernel/time/itimer.c`（Linux 7.2，版本见来源清单）。
-ITIMER_VIRTUAL / ITIMER_PROF 的 CPU 时间定时器仍返回 ENOSYS；未知 which 返回
-EINVAL。重建 `python3 -B tests/network-riscv.py --workload timer`：同 ELF 对照
+未知 which 返回EINVAL。重建 `python3 -B tests/network-riscv.py --workload timer`：同 ELF 对照
 Linux，核对阻塞 read 的 EINTR、周期、坏参数/指针、fork、线程组长退出及非组长
 exec 后的交付和最终物理页/堆回收。
+
+### 进程 CPU 间隔定时器
+
+`ITIMER_VIRTUAL`累计全组用户执行时间，发送SIGVTALRM；`ITIMER_PROF`累计用户与内核执行时间，发送SIGPROF。两者使用[共同CPU记账](kernel-accounting.md)，含退出成员和各CPU尚未结算的执行片段，睡眠及IRQ不计入。状态由组身份持有，设置线程退出后继续；fork清零，exec保留，非组长exec迁移，最后成员清理时摘除活动索引。REAL、VIRTUAL、PROF相互独立。
+
+CPU0在既有timer路径只遍历启用了CPU定时器的组，并在短调度域内按各CPU的真实`accounting_owner`判断该组是否正在执行。整组睡眠时保留CPU阈值；恢复执行后再检查，避免微秒周期的历史欠账按墙钟继续产生信号。用量快照在调度域外按现有成员借用与CPU发布序列取得。未启用时，系统调用进出与CPU本地记账保持原路径；空索引只在原timer处理处检查。
+
+按固定Linux的`kernel/time/itimer.c`与`posix-cpu-timers.c`，首次到期额外加一个实际100Hz记账tick；每次到期的周期阈值增加原interval，标准信号按pending位合并。CPU定时器停用时保留interval查询值，过期尚待处理时返回一个tick的剩余量。输出旧值EFAULT保留已安装的新值。CPU0处理时机和IRQ延迟决定实际递送时刻。
+
+`make test-itimer-abi-riscv test-itimer-abi-loongarch TEST_MEMORIES="512M 1G"`检查三类独立性、部分失败、睡眠、微秒周期、信号合并、真实handler及默认终止、设置者/组长退出和exec迁移。`make test-itimer-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin`另验证真实两核：各线程分别不足180ms，合计超过阈值时进程定时器触发，同时保留单核对照。
 
 ## LA LS7A RTC
 

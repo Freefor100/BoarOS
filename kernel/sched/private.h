@@ -181,7 +181,7 @@ struct kernel_task {
     uint32_t group_members;
     struct kernel_task *group_next;
     struct kernel_task *group_previous;
-    /* 组身份拥有 alarm；仅排队的到期对象进入非持引用链。 */
+    /* 组身份拥有定时器；活动索引在最后成员清理前摘除。 */
     struct kernel_task *real_timer_next;
     uint64_t real_timer_deadline;
     uint64_t real_timer_interval;
@@ -227,6 +227,10 @@ struct kernel_task {
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_task cost;
 #endif
+    /* 稀用的进程CPU定时器状态置尾，保持普通信号返回路径的原有字段布局。 */
+    struct kernel_task *cpu_timer_next;
+    struct { uint64_t expires, interval; } cpu_timers[2];
+    uint32_t cpu_timer_active;
 } __attribute__((aligned(16)));
 
 struct kernel_scheduler {
