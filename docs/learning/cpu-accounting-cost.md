@@ -11,12 +11,12 @@
 ## 同批对照方法
 
 - `pre-p1b`：main `6b84d38`，P1-B工作之前；`locked`：`31dd8ed`的完整记账实现；`local`：`2f42294`、`db42593`的CPU本地片段和counter访问优化。
-- 同一架构内，三个核使用完全相同的程序ELF和SQLite CLI。单CPU、1GiB，固定宿主CPU14/15，诊断关闭。五轮轮换版本顺序，架构和版本之间均串行计时。每次从独立盘启动，核对内容、退出和正常e2fsck。
+- 同一架构内，三个内核版本使用完全相同的程序ELF和SQLite CLI。单CPU、1GiB，固定宿主CPU14/15，诊断关闭。宿主为i5-12500H，CPU0–7为P核逻辑CPU，CPU8–15为E核；本节五轮数据均在E核上取得。五轮轮换版本顺序，架构和版本之间均串行计时。每次从独立盘启动，核对内容、退出和正常e2fsck。
 - RV实际QEMU11.1.2及显式OpenSBI；LA实际QEMU11.1.0 RTC版。程序、核、QEMU、固件、affinity及完整命令由结果文件记录。不同架构使用各自的ELF和平台，表内按同架构比较。
 
 ## 短系统调用
 
-使用最初保存的同一raw syscall ELF，计时1万次getpid及1000次sched_yield。下表为五轮中位数，单位ms。原先报告的44.7%来自此前未固定宿主CPU位置的一批；本表重新在同一批比较三个版本。
+使用最初保存的同一raw syscall ELF，计时1万次getpid及1000次sched_yield。下表为五轮中位数，单位ms。首次报告的15.3896→22.2727ms（+44.7%）来自未固定宿主CPU的一批；后续选择CPU14/15，将运行范围固定到了E核。两个旧核、程序和QEMU的SHA256均与首次一致，启动日志的固件版本及10MHz时钟频率也一致。这里保留E核上的三版本同批比较，并在下节验证绑核造成的差距。
 
 | 工作量 | P1-B前 | 原记账版 | 优化版 | 优化版相对原记账版 |
 |---|---:|---:|---:|---:|
@@ -24,6 +24,19 @@
 | 1000次sched_yield | 5.691 | 6.905 | 5.938 | -14.0% |
 
 getpid每次从约4.205µs降到3.429µs。相对P1-B前，本批额外耗时由50.3%降至22.6%，约去掉一半额外成本。sched_yield相对P1-B前为+4.4%。这些是整条调用的同批差值，保留了新旧源码其他公共路径的差异。
+
+### 两批绝对耗时为什么不同
+
+只改变QEMU的宿主CPU绑定，使用上表相同的三个内核版本、原程序、显式固件及启动参数，每组串行执行三轮并轮换顺序。核对宿主`cpu_core/cpus`与`cpu_atom/cpus`后，将CPU0/1作为P核组，CPU14/15作为E核组。下表为1万次getpid的中位数，单位ms。
+
+| 宿主绑定 | P1-B前 | 原记账版 | 优化版 |
+|---|---:|---:|---:|
+| P核，CPU0/1 | 15.440 | 21.160 | 17.726 |
+| E核，CPU14/15 | 27.838 | 41.273 | 33.366 |
+
+相同旧核从P核移到E核，耗时从15.44ms变为27.84ms，复现了两批绝对值的主要差距。首次未记录逐次运行的宿主核编号，其耗时与本次P核结果接近。后续选择E核改变了测量条件，原先报告应同时说明这一点。
+
+优化收益也按CPU类型分别比较：本次P核为16.2%，E核为19.2%；优化版相对P1-B前分别多14.8%、19.9%。前一张五轮对照表中的18.5%收益和22.6%剩余差值，适用于原E核五轮批次。所有组均检查完整输出、正常退出及e2fsck，运行盘检查后删除。
 
 ## 程序与实际I/O
 
@@ -69,4 +82,4 @@ taskset -c 14,15 python3 -B tests/accounting/cost.py \
 
 LA使用`--arch loongarch`、`build/loongarch/cpu-account-cost`及`build/loongarch/sqlite3-static`，对应核为`before-la`和`kernel-la`，按其平台直接启动。
 
-原始资料保存在`build/cpu-account-opt/`：`micro-current`、`apps-current-rv`、`apps-current-la`、`apps-confirm-la`是本页计时输入；各目录的results.json、逐轮串口和fsck日志包含完整数值。`final-usage-*`、`final-wait-*`及`final-lifecycle`为最终正确性结果。较早的中间实现测量按原核哈希独立保留，正式结论使用本页列出的批次。检查后的运行盘删除，保留构建缓存、ELF和日志。
+原始资料保存在`build/cpu-account-opt/`：`micro-current`、`apps-current-rv`、`apps-current-la`、`apps-confirm-la`是五轮计时输入；`host-core-check`保留P/E核三轮对照、CPU类型和相同二进制标识；各目录的results.json、逐轮串口和fsck日志包含完整数值。首次15.39→22.27ms的记录位于`build/cpu-usage/matched-benchmark/`。`final-usage-*`、`final-wait-*`及`final-lifecycle`为最终正确性结果。较早的中间实现测量按原核哈希独立保留，正式结论使用本页列出的批次。检查后的运行盘删除，保留构建缓存、ELF和日志。
