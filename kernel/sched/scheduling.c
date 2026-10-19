@@ -130,17 +130,6 @@ void scheduler_signal_request_locked(struct kernel_task *task)
 #endif
 }
 
-int kernel_scheduler_user_service_pending(void)
-{
-#if BOAROS_USER_SMP
-    struct kernel_task *task = kernel_cpu_current()->current;
-    return task && task->arch.user_mode &&
-        (__atomic_load_n(&task->user_return_pending, __ATOMIC_ACQUIRE) & KERNEL_USER_RETURN_CPU0);
-#else
-    return 0;
-#endif
-}
-
 int kernel_scheduler_user_return_pending(void)
 {
 #if BOAROS_USER_SMP

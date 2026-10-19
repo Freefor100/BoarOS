@@ -8,7 +8,6 @@
 
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
-extern int kernel_scheduler_user_service_pending(void);
 static int cancel_stop_on_handoff;
 void user_signal_cancel_stop(struct kernel_task *);
 void user_signal_retarget_case(struct kernel_task *,struct kernel_task *);
@@ -167,14 +166,14 @@ int main(void)
         cpus[1].switch_previous = 0;
         scheduler_user_request_locked(&tasks[0]);
     }
-    assert(kernel_scheduler_user_service_pending());
+    assert(tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0);
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         scheduler_signal_request_locked(&tasks[0]);
     }
     assert(kernel_scheduler_user_return_pending());
     assert(kernel_scheduler_take_signal_work());
-    assert(!kernel_scheduler_take_signal_work() && kernel_scheduler_user_service_pending());
+    assert(!kernel_scheduler_take_signal_work() && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler_user_service_set_locked(&tasks[0], 1);
@@ -210,10 +209,10 @@ int main(void)
         kernel_wait_switch_finish_locked(&idles[1]); active->switch_previous=0;
     }
     kernel_scheduler_enter_user_service();
-    assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
+    assert(active==&cpus[0] && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain); scheduler_signal_request_locked(&tasks[0]); }
     kernel_scheduler_ack_user_service();
-    assert(!kernel_scheduler_user_service_pending() && kernel_scheduler_user_return_pending());
+    assert(!(tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0) && kernel_scheduler_user_return_pending());
     assert(kernel_scheduler_take_signal_work() && !kernel_scheduler_user_return_pending());
     assert(!pthread_barrier_init(&gate,0,2)); pthread_t notifier;
     assert(!pthread_create(&notifier,0,late_service_notice,0));
@@ -221,11 +220,11 @@ int main(void)
     assert(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
     assert(!pthread_join(notifier,0)); pthread_barrier_destroy(&gate);
     kernel_scheduler_leave_user_service();
-    assert(active==&cpus[1] && kernel_scheduler_user_service_pending());
+    assert(active==&cpus[1] && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     kernel_scheduler_enter_user_service();
-    assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
+    assert(active==&cpus[0] && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     kernel_scheduler_ack_user_service();
-    assert(!kernel_scheduler_user_service_pending());
+    assert(!(tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     assert(active==&cpus[0] && active->current==&tasks[0] && tasks[0].user_service && tasks[0].cpu_mask==2);
     puts("PASS local signal notices and CPU0 requests consume only their own work, preserving concurrent publications");
     /* 实际任务临时服务不能把来源CPU的FIFO运行资格让给同级任务。 */

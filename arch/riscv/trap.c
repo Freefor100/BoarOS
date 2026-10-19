@@ -386,9 +386,7 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 #if BOAROS_USER_SMP
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
         do {
-            kernel_task_prepare_user_return();
-            int signal=kernel_scheduler_take_signal_work();
-            if (signal || kernel_scheduler_user_service_active()) {
+            if (kernel_task_prepare_user_return()) {
                 riscv_signal_prepare_user_return(frame);
                 if (kernel_scheduler_user_service_active())
                     kernel_scheduler_leave_user_service();

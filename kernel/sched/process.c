@@ -2545,16 +2545,21 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
-void kernel_task_prepare_user_return(void)
+int kernel_task_prepare_user_return(void)
 {
     if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
     struct kernel_task *task = kernel_cpu_current()->current;
-    if (task == 0 || task->arch.user_mode != 1U) return;
+    if (task == 0 || task->arch.user_mode != 1U) return 0;
     if (task->files.state==KERNEL_FILES_LIVE) (void)kernel_files_drain_file_cleanup(&task->files);
     kernel_mm_drain_sources(&task->mm);
 #if BOAROS_USER_SMP
-    if (!kernel_scheduler_user_service_active() && !kernel_scheduler_user_service_pending()) return;
+    /* 业务准备已持有当前执行者；共用一次通知读取，普通返回不另作信号查询。 */
+    uint32_t work=__atomic_load_n(&task->user_return_pending,__ATOMIC_ACQUIRE);
+    int service=task->user_service || (work & KERNEL_USER_RETURN_CPU0);
+    int signal=(work & KERNEL_USER_RETURN_SIGNAL)!=0;
+    if (signal) (void)kernel_scheduler_take_signal_work();
+    if (!service) return signal;
     kernel_scheduler_enter_user_service();
     kernel_scheduler_ack_user_service();
 #endif
@@ -2566,6 +2571,7 @@ void kernel_task_prepare_user_return(void)
         (void)kernel_copy_to_user(&task->mm, address, &task->tid,
                                   sizeof(task->tid), &copied);
     }
+    return 1;
 }
 
 enum kernel_task_status kernel_task_socket_write_register(

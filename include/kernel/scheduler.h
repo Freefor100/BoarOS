@@ -304,7 +304,6 @@ void kernel_scheduler_prepare_idle_return(void);
  * 同一内核栈保留调用现场，switch_finish后才可在另一CPU继续执行。 */
 void kernel_scheduler_enter_user_service(void);
 void kernel_scheduler_leave_user_service(void);
-int kernel_scheduler_user_service_pending(void);
 int kernel_scheduler_user_service_active(void);
 int kernel_scheduler_user_return_pending(void);
 int kernel_scheduler_take_signal_work(void);

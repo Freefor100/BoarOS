@@ -63,7 +63,8 @@ void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
     struct physical_page_allocator *allocator, uint64_t physical_address);
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer);
 
-void kernel_task_prepare_user_return(void);
+/* 非零表示本次返回需要选择信号；USER_SMP在这里消费本批本地通知。 */
+int kernel_task_prepare_user_return(void);
 
 /* Records the set_tid_address clear pointer and returns the caller tid. */
 enum kernel_task_status kernel_task_set_tid_address(
