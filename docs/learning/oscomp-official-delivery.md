@@ -2,7 +2,7 @@
 
 2026-10-18，在固定官方容器和原 QEMU 设备参数下，两架构并行完成 glibc、musl 各 32 个 basic 原程序和 24 个选定 LTP 原程序。basic 四组均为 **100/102**；`fallocate06`、`fs_fill` 与两项 ftest 均完成其实际文件检查，全部磁盘检查正常。下文给出这组结果、逐例耗时、原因及地址长度修复后的短复测。
 
-资源统计与 CPU 时钟的后续定向结果见[下文](#资源统计与-cpu-时钟)。
+资源统计与CPU时钟的既有结果见[下文](#资源统计与-cpu-时钟)；最新CORE/FSIZE、capget及六项原程序结果见[当前定向结果](#cpu-间隔定时器与信号等待)。
 
 当前评测按预算跳过 `fs_fill`；下文保留已完成的原程序结果。
 `brk`、`epoll_ctl04`、命令和判分差异集中见[评测输入与测例问题](oscomp-test-issues.md)。
@@ -155,7 +155,7 @@ LTP只更换外层枚举为24个名字，原ELF、参数与内部循环保持不
 
 main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 和 CPU 时钟，兼容提交 `1b2b3a8` 单向集成。机制见[任务资源记账](../modules/kernel-accounting.md)。固定官方容器内 `make all` 与85项适配检查通过；两架构使用原 QEMU 10.0.2 命令、1 CPU、1 GiB、官方双盘入口和独立运行盘，并行执行下列六个原始 LTP 20240524 程序。glibc/musl 在各架构内顺序运行，原参数和300秒单程序监督保持。默认启动配置与定向枚举配置分别构建，交付物恢复默认配置。
 
-四种配置均为 **59/77 原始分，59 TPASS、18 TCONF，零 TFAIL/TBROK/超时**；其中 getrusage03 因前置条件跳过，其余五项退出0。该分数是这六项的原 judge 通过断言数。下表单位为秒，包含程序准备、执行与监督回收。
+该版本运行的四种配置均为 **59/77 原始分，59 TPASS、18 TCONF，零 TFAIL/TBROK/超时**；其中 getrusage03 因前置条件跳过，其余五项退出0。该分数是这六项的原 judge 通过断言数。下表单位为秒，包含程序准备、执行与监督回收。
 
 | 原程序 | 每组原始分与结果 | RV glibc | RV musl | LA glibc | LA musl |
 |---|---|---:|---:|---:|---:|
@@ -167,7 +167,7 @@ main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 
 | clock_getres01 | 28/44；28通过、16条件跳过 | 0.086 | 0.063 | 0.063 | 0.066 |
 
 - getrusage01 验证 SELF/CHILDREN 入口。getrusage02 的 raw 错误检查通过；libc 非法输出地址变体由原测例跳过一次。
-- getrusage03 在申请 CAP_IPC_LOCK 前调用 capget(90)，当前入口返回 ENOSYS，LTP 以 TCONF 结束，RSS 主体尚未进入。这是凭据查询入口缺口。该原程序没有验证本轮 RSS 实现；RSS 的实际检查由下面的 raw 差分完成。其辅助程序仅由父程序按原参数调用。
+- 表内旧版本的getrusage03在申请CAP_IPC_LOCK前调用capget(90)，当时入口返回ENOSYS，以TCONF结束。当前查询与VmSwap补齐后的原程序四组均9/9，已进入RSS主体，见[当前结果](#cpu-间隔定时器与信号等待)。辅助程序仍由父程序按原参数调用。
 - clock_gettime01/02 覆盖所支持时钟、非法参数与坏地址，均通过。clock_getres01 的16次 TCONF 来自四个测试变体各遇到 MONOTONIC_RAW、BOOTTIME、REALTIME_ALARM、BOOTTIME_ALARM 四个未提供的时钟；PROCESS/THREAD CPU 时钟检查实际通过。
 - 两架构均正常结束，用户对象释放完成。两个根盘、两盘的工具/ext4 scratch/FAT 分区共8次磁盘检查全部返回0，启动种子槽已擦除。
 
@@ -183,38 +183,45 @@ main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 
 
 ## CPU 间隔定时器与信号等待
 
-main 的 `6dc2737` 增加 ITIMER_VIRTUAL/PROF，`4105d5b` 整理无事件的信号返回路径，兼容提交 `63c261f` 单向集成。VIRTUAL 消耗整个线程组的用户 CPU 时间，PROF 消耗用户加内核 CPU 时间；睡眠、子进程与中断时间分别处理，线程退出前的累计用量继续保留。计时器由进程持有，fork 后关闭，exec 时保留；状态与实际 CPU 执行者的关系见[时间模块](../modules/kernel-time.md#进程-cpu-间隔定时器)。
+进程CPU定时器由main `6dc2737`提供，`4105d5b`整理无事件的信号返回路径。本轮另交付CORE状态（`d623054`）、固定root capget及VmSwap（`365a050`）、FSIZE接纳与查询语义（`f20db2a`），以及实际PID上限查询（`15b3ea9`）。VIRTUAL累计全组用户CPU时间，PROF累计用户加内核CPU时间；状态、信号和生命周期见[时间模块](../modules/kernel-time.md#进程-cpu-间隔定时器)，限额及查询见[syscall模块](../modules/kernel-syscall.md)。
 
-### 原测例的结果、得分和耗时
+### 原程序结果与时间
 
-固定官方容器内断网构建，`make all` 与85项适配检查通过。实际运行使用该容器的 QEMU 10.0.2、原双盘启动参数、1 CPU/1 GiB和独立运行盘，未增加 RNG 设备。两架构并行，每架构内依次运行两种 libc 的以下五个原程序。定向 PID1 只更改外层程序枚举；原 ELF、libc、参数和程序内部时限均保持，监督器仍为300秒。未设置 `LTP_TIMEOUT_MUL`，两项信号等待沿用原30秒内部时限。
+固定官方容器内断网`make all`及85项适配检查通过。使用容器QEMU10.0.2、原双盘命令、1 CPU/1 GiB和独立运行盘，启动熵来自交付盘种子。两架构并行，各架构的glibc/musl及程序顺序运行。定向PID1只选择下表六个原程序，原ELF、libc、参数、judge及内部时限保持；单程序监督仍为300秒。
 
-下表的时间单位为秒，包含准备、执行和回收。分数为原 judge 的通过断言数。
+首次六项运行源码为main `8039037`、compat `fb75278`。capget02停在读取缺失的pid_max后，补入真实查询，再单独复测该程序，源码为main `15b3ea9`、compat `f3a641c`。下表是最终逐项结果，时间单位为秒，包含准备、执行和清理；capget02的四列来自补测，其余来自首次六项运行。
 
 | 原程序 | 每组原始分与结果 | RV glibc | RV musl | LA glibc | LA musl |
 |---|---|---:|---:|---:|---:|
-| getitimer01 | 30/30；30通过 | 0.144 | 0.082 | 0.133 | 0.088 |
-| setitimer01 | 0/6；3个准备失败、3个失败 | 0.090 | 0.062 | 0.085 | 0.044 |
-| setitimer02 | 3/3；3通过 | 0.062 | 0.042 | 0.064 | 0.042 |
-| sigtimedwait01 | glibc 11/11；musl 0/1、1个运行超时 TBROK | 1.390 | 30.062 | 1.366 | 30.049 |
-| sigwaitinfo01 | glibc 9/9；musl 0/1、1个运行超时 TBROK | 0.368 | 30.039 | 0.369 | 30.053 |
+| getitimer01 | 30/30；30通过 | 0.127 | 0.083 | 0.137 | 0.063 |
+| setitimer01 | 18/18；18通过 | 1.222 | 1.190 | 1.179 | 1.175 |
+| setitimer02 | 3/3；3通过 | 0.063 | 0.044 | 0.062 | 0.043 |
+| capget01 | 0/1；1个条件跳过 | 0.042 | 0.042 | 0.064 | 0.046 |
+| capget02 | 5/5；5通过（补测） | 0.124 | 0.089 | 0.132 | 0.065 |
+| getrusage03 | 9/9；9通过 | 13.644 | 12.714 | 3.557 | 3.186 |
 
-每架构 glibc 合计 **53/59**，musl 合计 **33/41**。这是所选五项的原始分；前文完整运行的总分继续对应其原版本。getitimer01、setitimer02及glibc信号等待退出0，setitimer01退出3，musl两项等待退出2；外层监督均未到300秒。
+按这些最终逐项结果，每种配置合计 **65/66**，65个TPASS、1个TCONF，零TFAIL/TBROK/超时。首次六项运行本身为60/62，capget02准备失败占0/1；补测为5/5，汇总时保留了两个运行来源。capget01退出32，其余程序退出0。历史完整LTP总分仍对应前文的旧版本。
 
-`getitimer01` 从旧结果20/32变为30/30。新增的实际通过数为10；分母减少2，是因为清理时的两次 `TST_EXP_PASS_SILENT(setitimer(...))` 成功后不打印通过，旧版返回 ENOSYS 时则各打印一次失败。两次清理仍执行。`setitimer02` 从1通过、1条件跳过变为3/3：三种计时器的坏输出指针现在均走到 EFAULT 检查。
+### 得分对应的实际能力
 
-### 两类剩余失败的具体原因
+- **setitimer01从0/6到18/18。**此前子进程在`tst_no_corefile(0)`查询CORE时退出，父进程又将提前退出判为失败。CORE状态补齐后，REAL/VIRTUAL/PROF各完成6条通过：设置、替换与旧值间隔查询、周期设置、handler反复递送，以及恢复默认动作后的正确终止信号。实际周期约30ms，三个种类合计约1.2秒。
+- **getrusage03从前置退出进入RSS主体，9/9。**固定root查询已有有效CAP_IPC_LOCK，LTP助手直接继续；VmSwap反映当前无swap的真实零值。原程序实际触碰100–500MiB内存，检查fork/exec继承、子孙峰值、zombie与wait回收前后的统计。它调用mlockall后未检查返回，锁页能力仍由单独缺口维护；本结果验证的是RSS语义。RV约12.7–13.6秒、LA约3.2–3.6秒，两架构的页大小与模拟平台分别记录。
+- **capget02从准备失败到5/5。**LTP用pid_max取得保证不存在的TID。新节点返回实际分配器最大编号加1，当前为32769；随后五个原检查分别验证坏header、坏data、版本协商、负PID和不存在PID的错误。节点只读，未增加可变PID配置。
+- **capget01停在capset准备步骤。**能力助手先用capget查询当前权限，再用capset撤销CAP_NET_RAW。初次查询成功，撤销时capset(91)返回ENOSYS，原LTP记TCONF；测例主体中撤销后的capget检查仍未执行。可变凭据与实际权限检查属于后续能力。
+- **getitimer01保持30/30、setitimer02保持3/3。**getitimer01更早的20/32变为30/30时，新增实际通过数为10；分母减少2来自两次成功后静默的清理调用，调用本身仍执行。setitimer02覆盖三种计时器的坏输出指针EFAULT。
 
-**setitimer01 被 RLIMIT_CORE 前置条件挡住。**每个子进程先调用 `tst_no_corefile(0)`，其 `getrlimit(4)` 在内核的资源限制分支返回 EOPNOTSUPP(95)，于是 TBROK 并退出2。父进程原本等待定时器信号终止子进程，看到退出2后再报 TFAIL；三种计时器共3个TBROK、3个TFAIL。该程序尚未执行设置与触发定时器的主体。main 的[能力目录](../goals.md)记录了 RLIMIT_CORE 缺口；本轮的真实信号触发由下面的通用短例验证。
+### musl 原输入差异
 
-**musl 两项等待超时来自库与测例预期的差异。**首项使用空等待集合，测例期待被 SIGUSR1 打断后返回 EINTR；原 musl 在内核返回 EINTR 后自行重试，继续等待。固定 Linux 使用同一原 ELF 和原 libc，两架构同样各30秒后超时，glibc则分别11/11、9/9。BoarOS 直接 syscall 的 EINTR 行为与 Linux 一致，包括 SA_RESTART。原输入与计分继续保留；库机器码、版本和具体调用解释见[测例问题](oscomp-test-issues.md#musl-信号等待库重试-eintr测例等待它返回-eintr)。
+原sigtimedwait01/sigwaitinfo01继续采用已确认的原输入与计分。首项期待被SIGUSR1打断后返回EINTR，原musl会自行重试；同一原ELF/libc在固定Linux的两架构也各30秒后超时。直接syscall的EINTR行为包括SA_RESTART均与Linux匹配，具体版本和机器码见[测例问题](oscomp-test-issues.md#musl-信号等待库重试-eintr测例等待它返回-eintr)。这两项沿用前次调查结果，本轮原程序选择为上表六项。
 
-### 短回归、成本和磁盘检查
+### 通用验证与磁盘
 
-通用定时器36项、信号等待31项，在RV/LA的512 MiB和1 GiB均与固定Linux匹配。RV另用真实用户态SMP完成1/2 CPU、两种内存配置，检查两核实际执行、线程组用量合计、设置者/主线程退出、非主线程exec、周期信号合并及默认动作。新增1µs周期睡眠短例曾在开发版失败：进程已经睡眠，过期阈值仍随墙钟检查推进；现在只在该组确有正在执行的成员时处理CPU计时器，睡眠期间保留阈值，修复后与Linux一致。宿主调度并发、handoff、用户SMP以及实际RV counter顺序检查也通过。
+CORE19、capget31、FSIZE59项分别在RV/LA的512MiB和1GiB与固定Linux匹配；RV将它们和既有CPU定时器36项合为145项，再完成真实1/2CPU、两种内存配置。信号等待31项及调度、handoff、用户SMP相关短回归通过。组长退出由真实clear-TID完成握手，非组长exec检查状态迁移；限额查询覆盖未回收zombie及reap后的ESRCH。
 
-未开启计时器的成本使用宿主同一P核类型、固定CPU0/1，所有计时串行，五轮轮换新旧版本和字节相同的旧版自对照。getpid耗时RV为−0.39%、LA为+0.68%，处于本组自对照幅度内；小块读写仍有RV +1.56%、LA +3.88%，RV yield +1.61%。具体负载、绝对值和剩余开销见[成本分析](cpu-accounting-cost.md#未启用-cpu-间隔定时器的成本)。这些配对计时与上面并行功能运行的耗时分别记录。
+FSIZE验证普通、定位、向量、追加及sendfile的完成前缀、内容、offset和SIGXFSZ；truncate、fallocate、KEEP_SIZE、打洞及下调限额后的脏mmap同步分别检查。VFAT在两架构完成真实用户操作、卸载、只读重挂载读回和ext4/FAT离线检查。宿主另保留1/4KiB文件系统块、4/16KiB页的范围操作、活动写回、失败与同步持久化回归。超出文件系统最大尺寸的fallocate在进程限额检查前拒绝，避免额外SIGXFSZ；该边界有直接修复前后对照。
 
-正式原程序运行RV为68.391秒、LA为68.021秒，均正常关机、heap-live=0，启动种子槽全零。根盘、工具分区、VFAT和scratch共8次离线磁盘检查全部返回0。默认交付配置在定向运行后重新构建。原始枚举与源码提交、实际kernel/init/QEMU身份、逐程序输出和判分、8次fsck结果集中在 `build/cpu-timer-signal/after-original/`；通用最终回归为同目录上级的 `itimer-*-final-fast`、`signal-wait-*-final-fast`，Linux原libc对照为 `musl-linux/`。中间版本与正式计时分开保存，完成检查的运行盘删除。
+首次六项原程序运行RV35.660秒、LA15.799秒；capget02补测RV8.383秒、LA5.516秒。两批均正常关机、heap-live=0，种子槽已擦除；每批根盘、工具分区、VFAT和scratch共8次磁盘检查全部返回0。定向运行后已重新构建默认交付文件。
 
-轮前第一次RV定向启动曾停在首个程序START后，随后相同内核的两次新盘重放及本轮正式运行均完成。该一次性停顿尚未复现和归因，未计作正常结果，也未据后续通过宣称修复。
+CPU记账的旧成本、本轮功能对未设置定时器程序的净影响，以及VIRTUAL/PROF启用后的成本分别维护在[成本分析](cpu-accounting-cost.md#资源限制与定时器启用成本)。
+
+本批原始输出、逐项结果、实际kernel/init/QEMU身份与fsck位于`build/resource-limits-timers/original/`及`original-capget02/`。`current-original-results.json`逐项保存来源；通用最终回归为`core-final-*`、`fsize-final-*`、`capability-pidmax-*`和`limits-pidmax-smp/`。构建缓存、ELF和必要日志保留，检查后的运行盘清理。

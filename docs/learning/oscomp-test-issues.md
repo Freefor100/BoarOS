@@ -121,5 +121,5 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 控制台原因取自对应条目的reason；原judge对跳过项记零。
 
 当前内核能力与后续实现方向仍由 [goals](../goals.md) 和各模块维护。例如
-O_DIRECT、普通 AF_UNIX socket、CPU 计时器的缺口按内核能力处理；对应实际失败和
+O_DIRECT、普通 AF_UNIX socket、CPU-time sleep 与 POSIX timer 的缺口按内核能力处理；对应实际失败和
 已修复语义见[原程序结果](oscomp-official-delivery.md)。

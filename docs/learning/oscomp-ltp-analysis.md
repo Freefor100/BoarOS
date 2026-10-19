@@ -16,7 +16,7 @@
 
 原输入、工具和运行身份继续以现有 `tests/oscomp/inputs.json`、运行 `identity.json/report.json` 为准，不把本地 QEMU 成绩与既有官方容器成绩混用。
 
-资源统计与 CPU 时钟已完成两架构短回归和六项原程序定向运行，结果、得分、耗时及capget前置缺口见[官方原程序结果](oscomp-official-delivery.md#资源统计与-cpu-时钟)。
+资源统计、CPU时钟及CORE/FSIZE、capget已完成两架构短回归；六项原程序的当前结果、得分、耗时及capset准备缺口见[官方原程序结果](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
 
 ## 块设备与空间管理批次定向验证
 
@@ -397,7 +397,7 @@ RV 17.59 秒、LA 17.49 秒；正常关机，heap-live=0，根盘、scratch 与�
 - **futex 基础等待/唤醒可用。**例如 RV glibc 的 `futex_wait01` 为 4/4，`futex_wake01` 为 6/6；只覆盖这些超时、值不等和唤醒条件，不代表所有 futex 操作均实现。
 - **目录创建标志已修复。**修复前 `open11` 为26/28，目录及指向目录的链接以 `O_RDONLY|O_CREAT` 打开被误接受；目录分支漏查 O_CREAT。main `8eff5ad` 已统一修复打开检查，当前官方原程序四组均28/28，见[定向结果](oscomp-official-delivery.md)。
 - **CPU 间隔定时器已补齐。**完整旧运行的 `getitimer01` 为20/32，当时VIRTUAL/PROF返回ENOSYS；main `6dc2737` 增加进程CPU计时器后，四种配置的原程序均30/30，`setitimer02`均3/3。分母变化、实际信号触发与两核回归见[定向结果](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
-- **资源限制前置会挡住别的测试。**例如 `abort01`、部分 `shmat01` 在 RLIMIT_CORE 查询返回 EOPNOTSUPP 后被中止。当前原 `setitimer01` 也在同一准备步骤退出，每组0/6；设置与触发定时器的主体尚未执行。缺口属于资源限制能力。
+- **资源限制前置会挡住别的测试。**旧完整运行中，`abort01`、部分 `shmat01` 在 RLIMIT_CORE 查询返回 EOPNOTSUPP 后被中止。此前原 `setitimer01` 也在同一准备步骤退出；本轮CORE状态补齐后四组均18/18，已运行设置、周期handler与默认信号终止。其余限额缺口按具体资源继续记录，见[当前定向结果](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
 - **Kconfig 探测失败不证明目标功能缺失。**每架构 172 次相关零分项在解析 Linux `.config` 时退出；不能伪造配置骗过探测，也不能仅凭这批记录宣称每个目标 API 均不存在。
 - **IPv4 零目的地址已修复。**修复前将 bind 得到的 `0.0.0.0` 用作目的地址时，导入路径原样交给 lwIP，约18秒后 ETIMEDOUT。main `8eff5ad` 已将连接/发送中的零目的地址按 Linux 处理为本机目的地，bind 继续保持通配地址；定向对照及原 connect01 的四组7项均通过。
 
