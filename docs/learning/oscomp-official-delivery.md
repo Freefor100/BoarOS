@@ -2,6 +2,8 @@
 
 2026-10-18，在固定官方容器和原 QEMU 设备参数下，两架构并行完成 glibc、musl 各 32 个 basic 原程序和 24 个选定 LTP 原程序。basic 四组均为 **100/102**；`fallocate06`、`fs_fill` 与两项 ftest 均完成其实际文件检查，全部磁盘检查正常。下文给出这组结果、逐例耗时、原因及地址长度修复后的短复测。
 
+资源统计与 CPU 时钟的后续定向结果见[下文](#资源统计与-cpu-时钟)。
+
 当前评测按预算跳过 `fs_fill`；下文保留已完成的原程序结果。
 `brk`、`epoll_ctl04`、命令和判分差异集中见[评测输入与测例问题](oscomp-test-issues.md)。
 
@@ -148,3 +150,40 @@ LTP只更换外层枚举为24个名字，原ELF、参数与内部循环保持不
 
 - rv: `54ace6cf4dfe77dc7266cdd8cda18c99d9e7fae1cb4e8479cdc9af1585e521a1`
 - la: `9c221101ce702c95f6495520424401b1d515a0d5c2d888cd8d640ec9805afab5`
+
+## 资源统计与 CPU 时钟
+
+main 的 `7f64307`、`df9a3d4`、`31dd8ed` 实现执行区间记账、getrusage 和 CPU 时钟，兼容提交 `1b2b3a8` 单向集成。机制见[任务资源记账](../modules/kernel-accounting.md)。固定官方容器内 `make all` 与85项适配检查通过；两架构使用原 QEMU 10.0.2 命令、1 CPU、1 GiB、官方双盘入口和独立运行盘，并行执行下列六个原始 LTP 20240524 程序。glibc/musl 在各架构内顺序运行，原参数和300秒单程序监督保持。默认启动配置与定向枚举配置分别构建，交付物恢复默认配置。
+
+四种配置均为 **59/77 原始分，59 TPASS、18 TCONF，零 TFAIL/TBROK/超时**；其中 getrusage03 因前置条件跳过，其余五项退出0。该分数是这六项的原 judge 通过断言数。下表单位为秒，包含程序准备、执行与监督回收。
+
+| 原程序 | 每组原始分与结果 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---|---:|---:|---:|---:|
+| getrusage01 | 2/2；2通过 | 0.128 | 0.083 | 0.129 | 0.066 |
+| getrusage02 | 3/4；3通过、1条件跳过 | 0.084 | 0.064 | 0.062 | 0.045 |
+| getrusage03 | 0/1；0通过、1条件跳过 | 0.208 | 0.164 | 0.126 | 0.104 |
+| clock_gettime01 | 16/16；16通过 | 0.256 | 0.237 | 0.216 | 0.211 |
+| clock_gettime02 | 10/10；10通过 | 0.063 | 0.064 | 0.042 | 0.041 |
+| clock_getres01 | 28/44；28通过、16条件跳过 | 0.086 | 0.063 | 0.063 | 0.066 |
+
+- getrusage01 验证 SELF/CHILDREN 入口。getrusage02 的 raw 错误检查通过；libc 非法输出地址变体由原测例跳过一次。
+- getrusage03 在申请 CAP_IPC_LOCK 前调用 capget(90)，当前入口返回 ENOSYS，LTP 以 TCONF 结束，RSS 主体尚未进入。这是凭据查询入口缺口。该原程序没有验证本轮 RSS 实现；RSS 的实际检查由下面的 raw 差分完成。其辅助程序仅由父程序按原参数调用。
+- clock_gettime01/02 覆盖所支持时钟、非法参数与坏地址，均通过。clock_getres01 的16次 TCONF 来自四个测试变体各遇到 MONOTONIC_RAW、BOOTTIME、REALTIME_ALARM、BOOTTIME_ALARM 四个未提供的时钟；PROCESS/THREAD CPU 时钟检查实际通过。
+- 两架构均正常结束，用户对象释放完成。两个根盘、两盘的工具/ext4 scratch/FAT 分区共8次磁盘检查全部返回0，启动种子槽已擦除。
+
+### 短复现与开销
+
+资源与 CPU 时钟54项、waitid58项、相关ABI111项，在RV64/LA64及512MiB/1GiB均与固定Linux匹配。RV的真实用户SMP在1/2CPU、两种内存配置通过54项；目标查询被暂停后强制回收、非主线程exec的12次启动均通过，检查实际task借用结束和正常磁盘一致性。
+
+修复前，exec会丢失换出MM的历史RSS峰值；短复现先失败，保存旧MM峰值后两架构通过。两核exec还暴露了读盘调用链的8KiB内核栈耗尽：块层给每次读取都预留32项分区转换数组，连整盘单页缺页也付出1.25KiB栈开销。整盘现在直接借用原向量，分区按本次请求大小转换；同一短复现通过，栈最小剩余约1.25KiB。
+
+相同ELF、1CPU/1GiB、同一QEMU11.1.2，关闭诊断，旧/新核交替各5轮的中位数：
+
+| 工作量 | 修改前 | 修改后 | 变化 |
+|---|---:|---:|---:|
+| 10000次getpid | 15.390ms | 22.273ms | +44.7% |
+| 1000次sched_yield | 2.487ms | 3.454ms | +38.9% |
+
+这是每次trap/返回读取时钟并同步记账的成本；getpid每次增加约0.688µs。它是单核QEMU微基准结果，未据此推算应用吞吐或lmbench得分。
+
+本批运行原始文件保存在 `build/cpu-usage/official-probe/`：`probe-run.json`记录QEMU命令和kernel/init/盘身份，`container-identity.json`记录固定容器工具，`results.json`、各组judge输出和串口记录包含24次程序的结果与耗时，`disk-checks.json`与对应fsck日志记录8次磁盘检查。主线差分与并发日志在同目录上级；配对计时为 `matched-benchmark/results.json`。复用缓存继续保留，完成检查的运行盘删除。

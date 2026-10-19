@@ -16,6 +16,8 @@
 
 原输入、工具和运行身份继续以现有 `tests/oscomp/inputs.json`、运行 `identity.json/report.json` 为准，不把本地 QEMU 成绩与既有官方容器成绩混用。
 
+资源统计与 CPU 时钟已完成两架构短回归和六项原程序定向运行，结果、得分、耗时及capget前置缺口见[官方原程序结果](oscomp-official-delivery.md#资源统计与-cpu-时钟)。
+
 ## 块设备与空间管理批次定向验证
 
 下表是原始无参数程序的单调时钟总耗时，不含 QEMU 启动、最终关机和宿主 fsck。
