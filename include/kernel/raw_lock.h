@@ -48,7 +48,6 @@ typedef struct kernel_raw_guard kernel_irq_lock_guard;
 #define KERNEL_IRQ_LOCK_SCOPE KERNEL_RAW_SCOPE
 #else
 typedef struct {
-    struct kernel_raw_lock *lock;
     struct kernel_cpu *cpu;
     uint32_t previous_depth;
 } kernel_task_lock_guard;
@@ -56,30 +55,30 @@ static inline void kernel_task_lock_acquire(struct kernel_raw_lock *lock,
     kernel_task_lock_guard *guard)
 {
     struct kernel_cpu *cpu=kernel_cpu_current();
-    if (!lock || guard->lock || lock->initialized!=KERNEL_RAW_INITIALIZED ||
+    if (!lock || guard->cpu ||
         cpu->preempt_depth==UINT32_MAX) __builtin_trap();
     guard->cpu=cpu;
     guard->previous_depth=cpu->preempt_depth++;
-    /* UP interrupt handlers balance their own depth before returning. Publish
-     * the task exclusion before any protected access; migration is absent. */
+    /* UP has no competing CPU. Preemption exclusion protects task-only state;
+     * IRQ-shared callers also mask interrupts. No per-object lock word is
+     * needed. Full raw ownership diagnostics remain in SMP/debug builds. */
     __asm__ volatile("" ::: "memory");
-    if (lock->word) __builtin_trap();
-    lock->word=1;guard->lock=lock;
 }
 static inline void kernel_task_lock_release(kernel_task_lock_guard *guard)
 {
-    if (!guard->lock || guard->previous_depth==UINT32_MAX ||
-        guard->cpu->preempt_depth!=guard->previous_depth+1U || guard->lock->word!=1U)
+    struct kernel_cpu *cpu=guard->cpu;
+    if (!cpu || guard->previous_depth==UINT32_MAX ||
+        cpu->preempt_depth!=guard->previous_depth+1U)
         __builtin_trap();
-    guard->lock->word=0;guard->lock=0;
+    guard->cpu=0;
     __asm__ volatile("" ::: "memory");
-    guard->cpu->preempt_depth=guard->previous_depth;
+    cpu->preempt_depth=guard->previous_depth;
 }
 static inline void kernel_task_lock_scope_release(kernel_task_lock_guard *guard)
-{ if (guard->lock) kernel_task_lock_release(guard); }
+{ if (guard->cpu) kernel_task_lock_release(guard); }
 #define KERNEL_TASK_LOCK_SCOPE(name, object) \
     kernel_task_lock_guard name __attribute__((cleanup(kernel_task_lock_scope_release))); \
-    name.lock=0; \
+    name.cpu=0; \
     kernel_task_lock_acquire((object),&name)
 typedef struct {
     kernel_task_lock_guard task;
@@ -98,10 +97,10 @@ static inline void kernel_irq_lock_release(kernel_irq_lock_guard *guard)
     arch_interrupt_restore(guard->interrupts);
 }
 static inline void kernel_irq_lock_scope_release(kernel_irq_lock_guard *guard)
-{ if (guard->task.lock) kernel_irq_lock_release(guard); }
+{ if (guard->task.cpu) kernel_irq_lock_release(guard); }
 #define KERNEL_IRQ_LOCK_SCOPE(name, object) \
     kernel_irq_lock_guard name __attribute__((cleanup(kernel_irq_lock_scope_release))); \
-    name.task.lock=0; \
+    name.task.cpu=0; \
     kernel_irq_lock_acquire((object),&name)
 #endif
 #endif

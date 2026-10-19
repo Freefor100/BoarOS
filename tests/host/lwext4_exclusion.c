@@ -43,6 +43,7 @@ static void *increment(void *unused)
     return NULL;
 }
 #endif
+#if BOAROS_MAX_CPUS>1 || BOAROS_LOCK_DEBUG || BOAROS_COST_DIAGNOSTICS
 static void invalid_object(int recursive)
 {
     pid_t child=fork();assert(child>=0);
@@ -53,14 +54,37 @@ static void invalid_object(int recursive)
     }
     int status;assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
 }
+#endif
+static void invalid_depth(unsigned mode)
+{
+    pid_t child=fork();assert(child>=0);
+    if (!child) {
+        struct kernel_raw_lock nested;kernel_raw_lock_init(&nested,KERNEL_RAW_RANK_SCHEDULER);
+        if (!mode) {
+            cpu.preempt_depth=UINT32_MAX;
+            KERNEL_TASK_LOCK_SCOPE(guard,&object);
+        } else if (mode==1) {
+            kernel_task_lock_guard guard={0};kernel_task_lock_release(&guard);
+        } else {
+            KERNEL_TASK_LOCK_SCOPE(first,&object);
+            if (mode==2) { KERNEL_TASK_LOCK_SCOPE(second,&nested);kernel_task_lock_release(&first); }
+            else { kernel_task_lock_release(&first);kernel_task_lock_release(&first); }
+        }
+        _exit(99);
+    }
+    int status;assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
+}
 int main(void)
 {
     struct rlimit no_core={0,0};assert(!setrlimit(RLIMIT_CORE,&no_core));
     struct kernel_raw_lock outer;
     kernel_raw_lock_init(&outer,KERNEL_RAW_RANK_PAGE);
     kernel_raw_lock_init(&object,KERNEL_RAW_RANK_OBJECT);
+    for (unsigned mode=0;mode<4;mode++) invalid_depth(mode);
+#if BOAROS_MAX_CPUS>1 || BOAROS_LOCK_DEBUG || BOAROS_COST_DIAGNOSTICS
     invalid_object(0);
-#if BOAROS_MAX_CPUS==1 || BOAROS_LOCK_DEBUG
+#endif
+#if BOAROS_LOCK_DEBUG || (BOAROS_MAX_CPUS==1 && BOAROS_COST_DIAGNOSTICS)
     invalid_object(1);
 #endif
     raw_acquires=0;
@@ -68,7 +92,7 @@ int main(void)
         KERNEL_TASK_LOCK_SCOPE(guard,&object);
         /* Default UP need not mask device interrupts for task-only cache state. */
 #if BOAROS_MAX_CPUS==1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
-        /* No cross-CPU owner exists; default UP needs only its saved IRQ state. */
+        /* Task exclusion is entirely in preemption depth; IRQ state is intact. */
         assert(sync_test_irq==2 && !cpu.raw_locks && cpu.preempt_depth==1 && !raw_acquires);
 #else
         assert(!sync_test_irq && cpu.raw_locks && cpu.preempt_depth==1 && raw_acquires==1);
