@@ -133,6 +133,7 @@ struct ext4_blockdev_iface {
 	void* p_user;
 	void (*wait_read)(void *key);
 	void (*wake_read)(void *key);
+	/* Nonblocking current-task query; may run under bcache protection. */
 	int (*read_context)(void);
 
 	/** Persist all prior writes. Required for journal durability. */

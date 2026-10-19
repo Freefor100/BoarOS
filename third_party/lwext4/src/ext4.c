@@ -3289,7 +3289,7 @@ static bool ext4_copy_pending_data(struct ext4_blockdev *bdev, ext4_fsblk_t bloc
         return true;
     }
 	struct ext4_block cached = EXT4_BLOCK_ZERO();
-	struct ext4_buf *buf = ext4_bcache_find_get(bdev->bc, &cached, block);
+	struct ext4_buf *buf = ext4_bcache_find_get(bdev->bc, &cached, block, NULL);
 	if (!buf) return false;
 	bool current = ext4_bcache_test_flag(buf, BC_DIRTY) || buf->journal_pending;
     if (current && out) memcpy(out, cached.data + offset, length);

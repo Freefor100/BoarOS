@@ -87,12 +87,6 @@ struct ext4_buf {
 	/**@brief   Data buffer.*/
 	uint8_t *data;
 
-	/**@brief   LRU priority. (unused) */
-	uint32_t lru_prio;
-
-	/**@brief   LRU id.*/
-	uint32_t lru_id;
-
 	/**@brief   Reference count table*/
 	uint32_t refctr;
 
@@ -105,8 +99,8 @@ struct ext4_buf {
 	/**@brief   LBA tree node*/
 	RB_ENTRY(ext4_buf) lba_node;
 
-	/**@brief   LRU tree node*/
-	RB_ENTRY(ext4_buf) lru_node;
+	/* Unreferenced buffers, oldest at the cache head. */
+	struct ext4_buf *lru_previous, *lru_next;
 
 	/**@brief   Dirty list node*/
 	SLIST_ENTRY(ext4_buf) dirty_node;
@@ -137,9 +131,6 @@ struct ext4_bcache {
 	/**@brief   Item size in block cache*/
 	uint32_t itemsize;
 
-	/**@brief   Last recently used counter*/
-	uint32_t lru_ctr;
-
 	/**@brief   Currently referenced datablocks*/
 	uint32_t ref_blocks;
 
@@ -155,8 +146,8 @@ struct ext4_bcache {
 	/**@brief   A tree holding all bufs*/
 	RB_HEAD(ext4_buf_lba, ext4_buf) lba_root;
 
-	/**@brief   A tree holding unreferenced bufs*/
-	RB_HEAD(ext4_buf_lru, ext4_buf) lru_root;
+	/**@brief   Unreferenced buffers in idle age order. */
+	struct ext4_buf *lru_head, *lru_tail;
 
 	/**@brief   A singly-linked list holding dirty buffers*/
 	SLIST_HEAD(ext4_buf_dirty, ext4_buf) dirty_list;
@@ -176,6 +167,13 @@ enum bcache_state_bits {
 	BC_DIRTY,
 	BC_FLUSH,
 	BC_TMP
+};
+
+/* Taken with the reference under metadata; WAIT also observes a saved error. */
+enum ext4_bcache_read_state {
+	EXT4_BCACHE_READ_READY,
+	EXT4_BCACHE_READ_LOAD,
+	EXT4_BCACHE_READ_WAIT,
 };
 
 #define ext4_bcache_set_flag(buf, b) \
@@ -249,20 +247,21 @@ void ext4_bcache_invalidate_lba(struct ext4_bcache *bc,
  * @param   bc block cache descriptor
  * @param   b block to alloc
  * @param   lba logical block address
+ * @param   read optional read decision; atomically claims the unique loader
  * @return  block cache buffer */
 struct ext4_buf *
 ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block *b,
-		     uint64_t lba);
+		     uint64_t lba, enum ext4_bcache_read_state *read);
 
 /**@brief   Allocate block from block cache memory.
  *          Unreferenced block allocation is based on LRU
  *          (Last Recently Used) algorithm.
  * @param   bc block cache descriptor
  * @param   b block to alloc
- * @param   is_new block is new (needs to be read)
+ * @param   read optional read decision, taken with publication/reference
  * @return  standard error code*/
 int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
-		      bool *is_new);
+		      enum ext4_bcache_read_state *read);
 
 /**@brief   Free block from cache memory (decrement reference counter).
  * @param   bc block cache descriptor

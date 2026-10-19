@@ -10,12 +10,21 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"cache:%d: %s\n",__LINE__,#x); exit(1); } } while (0)
 static unsigned live, allocations, fail_allocation, reads, writes, waits;
 static int read_error, write_error, shared_read;
+static unsigned read_context_queries;
 static struct ext4_block *loading_owner;
 static struct ext4_block interleaved;
 static int insert_during_write;
 static struct ext4_blockdev *allocate_peer;
 static struct ext4_block allocation_peer;
 static unsigned parallel_load,load_entered,load_release,load_waiter;
+static struct kernel_raw_lock *observed_metadata;
+static unsigned metadata_acquisitions;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{
+    if (lock==observed_metadata) metadata_acquisitions++;
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 void *ext4_user_malloc(size_t n)
 {
     CHECK(!kernel_cpu_current()->raw_locks);
@@ -44,13 +53,13 @@ static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t block,uint32
 {
     (void)p;(void)block;(void)count;writes++;
     if(insert_during_write){
-        bool fresh;insert_during_write=0;interleaved.lb_id=1;
-        CHECK(ext4_bcache_alloc(b->bc,&interleaved,&fresh)==EOK && fresh);
+        insert_during_write=0;interleaved.lb_id=1;
+        CHECK(ext4_bcache_alloc(b->bc,&interleaved,NULL)==EOK);
         memset(interleaved.data,1,4096);ext4_bcache_set_flag(interleaved.buf,BC_UPTODATE);
     }
     return write_error;
 }
-static int read_context(void) { return shared_read; }
+static int read_context(void) { __atomic_fetch_add(&read_context_queries,1,__ATOMIC_RELAXED);return shared_read; }
 static void wait_read(void *key)
 {
     struct ext4_buf *buf=key;
@@ -283,4 +292,44 @@ static void concurrent_load(void)
     parallel_load=0;finish(&cache);
     puts("cache concurrent cold readers: one loader, stable bytes and balanced references");
 }
-int main(void) { competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }
+static void ready_read_work(void)
+{
+    struct ext4_bcache cache;struct ext4_blockdev dev;struct ext4_blockdev_iface iface;
+    init(&cache,&dev,&iface,16);
+    for (unsigned i=0;i<8;i++) warm(&dev,i);
+    unsigned before_reads=reads,before_allocations=allocations;
+    read_context_queries=0;
+    struct ext4_block scalar={0},batch[8]={0};uint64_t lbas[8];int errors[8];
+    observed_metadata=&cache.metadata;metadata_acquisitions=0;
+    get(&dev,&scalar,0);
+    unsigned single=metadata_acquisitions;metadata_acquisitions=0;
+    for (unsigned i=0;i<8;i++) lbas[i]=i;
+    CHECK(cache_batch(&dev,batch,lbas,errors,8)==EOK);
+    unsigned multiple=metadata_acquisitions;observed_metadata=NULL;
+    CHECK(reads==before_reads && allocations==before_allocations && !waits && !writes);
+    for (unsigned i=0;i<8;i++) {
+        CHECK(!errors[i] && batch[i].data[0]==i);
+        CHECK(ext4_block_set(&dev,&batch[i])==EOK);
+    }
+    CHECK(ext4_block_set(&dev,&scalar)==EOK);
+    printf("cache clean reference returns: read-context queries=%u\n",read_context_queries);
+    CHECK(!read_context_queries);finish(&cache);
+    printf("cache ready-read protected decisions: scalar=%u batch8=%u; no read/allocation/wait\n",single,multiple);
+    /* 命中引用与装入状态取同一快照；完成状态只在真实等待时复查。 */
+    CHECK(single<=1 && multiple<=8);
+}
+static void idle_order(void)
+{
+    struct ext4_bcache cache;struct ext4_blockdev dev;struct ext4_blockdev_iface iface;
+    init(&cache,&dev,&iface,4);warm(&dev,0);warm(&dev,1);
+    warm(&dev,2);warm(&dev,3);warm(&dev,4);
+    unsigned before=reads;
+    warm(&dev,3);CHECK(reads==before);
+    warm(&dev,0);CHECK(reads==before+1 && cache.ref_blocks==4);
+    warm(&dev,5);warm(&dev,6);
+    before=reads;warm(&dev,3);CHECK(reads==before);
+    warm(&dev,4);CHECK(reads==before+1 && cache.ref_blocks==4);
+    finish(&cache);
+    puts("cache LRU eviction follows idle age, without making a recent return oldest");
+}
+int main(void) { ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }

@@ -3,6 +3,7 @@
 #include <kernel/heap.h>
 #include <kernel/sync.h>
 #include <arch/context.h>
+#include <kernel/irq.h>
 #include <ext4.h>
 #include <ext4_bcache.h>
 
@@ -70,7 +71,7 @@ void boaros_lwext4_wait(void *key)
     struct ext4_buf *buf=key;
     struct kernel_wait_token token;
     {
-        KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+        KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
         /* Completion may precede this callback. Check and register together. */
         if (!buf->loading) return;
         if (kernel_wait_prepare(channel(buf),0,0,&token)!=KERNEL_SCHEDULER_STATUS_OK)
@@ -84,8 +85,10 @@ void boaros_lwext4_wake(void *key)
 {
     /* Caller holds the buffer-cache metadata lock and a producer reference. */
     struct kernel_wait_queue *queue=channel(key);
-    if (__atomic_load_n(&queue->head,__ATOMIC_RELAXED) &&
-        kernel_wait_queue_wake_all(queue)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    if (__atomic_load_n(&queue->head,__ATOMIC_RELAXED)) {
+        KERNEL_IRQ_SCOPE(irq);
+        if (kernel_wait_queue_wake_all(queue)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
 }
 
 int boaros_lwext4_allocation_active(void)

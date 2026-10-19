@@ -129,7 +129,7 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     if (r) return r;
     for (unsigned i = 0; i < count; i++) for (uint32_t j = 0; j < spans[i].count; j++) {
         struct ext4_block cached = EXT4_BLOCK_ZERO();
-        struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].block + j);
+        struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].block + j, NULL);
         if (!old) continue;
         memcpy(cached.data, (const uint8_t *)spans[i].data + (size_t)j * bdev->lg_bsize, bdev->lg_bsize);
         ext4_bcache_set_flag(old, BC_UPTODATE);
@@ -159,7 +159,7 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
             return ext4_trans_write_data_batch(bdev, &span, 1);
         }
 		struct ext4_block cached = EXT4_BLOCK_ZERO();
-		struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, lba);
+		struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, lba, NULL);
 		void *assembled = NULL;
 		const void *payload = data;
 		int r = EOK;

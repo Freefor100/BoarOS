@@ -157,9 +157,9 @@ static void ext4_block_end_write(struct ext4_bcache *bc, struct ext4_buf *buf, i
 {
     if (!buf->end_write) return;
     bool previous;
-    { KERNEL_RAW_SCOPE(guard,&bc->metadata);previous=bc->dont_shake;bc->dont_shake=true; }
+    { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);previous=bc->dont_shake;bc->dont_shake=true; }
     buf->end_write(bc,buf,error,buf->end_write_arg);
-    { KERNEL_RAW_SCOPE(guard,&bc->metadata);bc->dont_shake=previous; }
+    { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);bc->dont_shake=previous; }
 }
 
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
@@ -189,7 +189,7 @@ int ext4_block_flush_lba(struct ext4_blockdev *bdev, uint64_t lba)
 	int r = EOK;
 	struct ext4_buf *buf;
 	struct ext4_block b;
-	buf = ext4_bcache_find_get(bdev->bc, &b, lba);
+	buf = ext4_bcache_find_get(bdev->bc, &b, lba, NULL);
 	if (buf) {
 		r = ext4_block_flush_buf(bdev, buf);
 		ext4_bcache_free(bdev->bc, &b);
@@ -200,10 +200,9 @@ int ext4_block_flush_lba(struct ext4_blockdev *bdev, uint64_t lba)
 int ext4_block_cache_shake(struct ext4_blockdev *bdev)
 { return ext4_bcache_shake(bdev->bc); }
 
-int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
-			  uint64_t lba)
+static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
+    uint64_t lba, enum ext4_bcache_read_state *read)
 {
-	bool is_new;
 	int r;
 
 	ext4_assert(bdev && b);
@@ -217,7 +216,7 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
 	b->lb_id = lba;
 
 	/* 命中先取得引用：无需新分配的访问不能因回收而淘汰自身。 */
-	if (ext4_bcache_find_get(bdev->bc, b, lba)) {
+	if (ext4_bcache_find_get(bdev->bc, b, lba, read)) {
 		COST_ADD(BLOCK_CACHE_HITS, 1);
 		return EOK;
 	}
@@ -228,7 +227,7 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
 		return r;
 
 	/* 回收可能等待I/O；allocator重查期间被其他任务加载的同一块。 */
-	r = ext4_bcache_alloc(bdev->bc, b, &is_new);
+	r = ext4_bcache_alloc(bdev->bc, b, read);
 	if (r != EOK)
 		return r;
 
@@ -238,16 +237,14 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
 	return EOK;
 }
 
-static bool ext4_block_claim_load(struct ext4_buf *buf)
+int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
+    uint64_t lba)
 {
-    KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
-    if (buf->loading || buf->load_error || ext4_bcache_test_flag(buf,BC_UPTODATE)) return false;
-    buf->loading=true;
-    return true;
+    return block_get_reference(bdev,b,lba,NULL);
 }
 static void ext4_block_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf, int error)
 {
-    KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+    KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
     if (!buf->loading || !buf->refctr) __builtin_trap();
     buf->load_error=error;
     if (!error) ext4_bcache_set_flag(buf,BC_UPTODATE);
@@ -259,7 +256,7 @@ static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *b
 {
     for (;;) {
         {
-            KERNEL_RAW_SCOPE(guard,&buf->bc->metadata);
+            KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
             if (!buf->loading) return buf->load_error;
             if (!bdev->bdif->wait_read) return EBUSY;
         }
@@ -270,13 +267,13 @@ static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *b
 }
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
 {
-    int r=ext4_block_get_noread(bdev,b,lba);
+    enum ext4_bcache_read_state read;
+    int r=block_get_reference(bdev,b,lba,&read);
     if (r) return r;
-    if (ext4_block_claim_load(b->buf)) {
+    if (read==EXT4_BCACHE_READ_LOAD) {
         r=ext4_blocks_get_direct(bdev,b->data,lba,1);
         ext4_block_loaded(bdev,b->buf,r);
-    }
-    r=ext4_block_wait_loaded(bdev,b->buf);
+    } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
     if (r) ext4_bcache_free_read(bdev->bc,b);
     return r;
 }
@@ -345,11 +342,13 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	}
 	struct block_read_span reads[EXT4_BLOCK_BATCH_MAX];
 	unsigned owners[EXT4_BLOCK_BATCH_MAX], pending = 0;
+	uint32_t waiters=0;
 	for (unsigned i = 0; i < count; i++) {
-		errors[i] = ext4_block_get_noread(bdev, &blocks[i], lbas[i]);
+		enum ext4_bcache_read_state read;
+		errors[i] = block_get_reference(bdev, &blocks[i], lbas[i], &read);
 		if (errors[i]) continue;
-		struct ext4_buf *buf = blocks[i].buf;
-		if (!ext4_block_claim_load(buf)) continue;
+		if (read==EXT4_BCACHE_READ_WAIT) { waiters|=UINT32_C(1)<<i;continue; }
+		if (read==EXT4_BCACHE_READ_READY) continue;
 		owners[pending] = i;
 		reads[pending++] = (struct block_read_span){lbas[i] * bdev->lg_bsize + bdev->part_offset,
 			blocks[i].data, bdev->lg_bsize, 0, EIO};
@@ -357,11 +356,14 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	/* 先完成自己发布的加载，再等待别人的 loading，重叠批次不会互等未发布页。 */
 	ext4_blockdev_read_batch(bdev, reads, pending, NULL);
     for (unsigned i=0;i<pending;i++) {
-        ext4_block_loaded(bdev,blocks[owners[i]].buf,reads[i].status);
+        unsigned owner=owners[i];
+        errors[owner]=reads[i].status;
+        ext4_block_loaded(bdev,blocks[owner].buf,errors[owner]);
+        if (errors[owner]) ext4_bcache_free_read(bdev->bc,&blocks[owner]);
     }
 	int first = EOK;
 	for (unsigned i = 0; i < count; i++) {
-		if (!errors[i]) {
+		if (!errors[i] && (waiters & (UINT32_C(1)<<i))) {
             errors[i]=ext4_block_wait_loaded(bdev,blocks[i].buf);
             if (errors[i]) ext4_bcache_free_read(bdev->bc,&blocks[i]);
 		}

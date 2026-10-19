@@ -1061,7 +1061,7 @@ static void group_data_owner(struct ext4_fs *fs)
         ext4_fsblk_t physical;
         CHECK(ext4_fs_get_inode_dblk_idx(&ref,i,&physical,true)==EOK && physical);
         struct ext4_block cached=EXT4_BLOCK_ZERO();
-        CHECK(!ext4_bcache_find_get(fs->bdev->bc,&cached,physical));
+        CHECK(!ext4_bcache_find_get(fs->bdev->bc,&cached,physical, NULL));
     }
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
     unsigned allocated=allocations; fail_allocation=allocations+1;
