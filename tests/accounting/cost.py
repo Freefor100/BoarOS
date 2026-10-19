@@ -135,6 +135,7 @@ def main():
                 harness.run_logged(['e2fsck','-fn',str(disk)],base/f'{name}-fsck.log')
                 report['runs'].append({'repeat':repeat,'label':label,'mode':mode,'values':values,'command':command} if args.timer_suite else
                                       {'repeat':repeat,'label':label,'ns':values,'command':command})
+                (base/'results.json').write_text(json.dumps(report,indent=2)+'\n')
                 disk.unlink();print(label,mode,repeat,values,flush=True)
         if args.timer_suite:
             report['median']={label:{mode:{case:{field:statistics.median(row['values'][case][field] for row in report['runs']
