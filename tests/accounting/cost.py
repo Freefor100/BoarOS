@@ -55,8 +55,9 @@ def timer_measurements(raw,mode,expected=None,cpus=1):
         values[name]=row
     return values
 
-def timer_run_plan(labels,timer_kernel,repeat):
-    plan=[(label,mode) for label in labels for mode in (TIMER_MODES if label==timer_kernel else ('off',))]
+def timer_run_plan(labels,timer_kernel,repeat,modes=TIMER_MODES):
+    timer_kernels={timer_kernel} if isinstance(timer_kernel,str) else set(timer_kernel or ())
+    plan=[(label,mode) for label in labels for mode in (modes if label in timer_kernels else ('off',))]
     shift=repeat%len(plan)
     return plan[shift:]+plan[:shift]
 
@@ -67,7 +68,8 @@ def main():
     parser.add_argument('--program',type=Path,required=True)
     parser.add_argument('--sqlite',type=Path,help='required for the legacy SQLite cost suite')
     parser.add_argument('--timer-suite',action='store_true',help='same-ELF fixed CPU timer workloads instead of legacy SQLite')
-    parser.add_argument('--timer-kernel',help='kernel label receiving all five modes; other labels run off')
+    parser.add_argument('--timer-kernel',action='append',help='kernel label receiving timer modes; repeat for matched old/new states')
+    parser.add_argument('--timer-modes',nargs='+',choices=TIMER_MODES,help='timer states to measure; default all five')
     parser.add_argument('--cpus',type=int,choices=(1,2),default=1)
     parser.add_argument('--qemu',help='explicit QEMU binary; default follows the native architecture profile')
     parser.add_argument('--firmware',type=Path,help='explicit RV OpenSBI firmware')
@@ -85,9 +87,11 @@ def main():
             parser.error('kernel labels must be unique literal names')
         sources[label]=Path(path)
     if args.timer_suite:
-        args.timer_kernel=args.timer_kernel or ('after' if 'after' in sources else next(iter(sources)))
-        if args.timer_kernel not in sources:parser.error('--timer-kernel must name a supplied kernel')
-    elif args.timer_kernel:parser.error('--timer-kernel requires --timer-suite')
+        args.timer_kernel=args.timer_kernel or [('after' if 'after' in sources else next(iter(sources)))]
+        if any(label not in sources for label in args.timer_kernel):parser.error('--timer-kernel must name supplied kernels')
+        args.timer_modes=args.timer_modes or TIMER_MODES
+        if len(set(args.timer_modes))!=len(args.timer_modes):parser.error('--timer-modes must not repeat a state')
+    elif args.timer_kernel or args.timer_modes:parser.error('--timer-kernel/--timer-modes require --timer-suite')
     if args.output.exists() and any(args.output.iterdir()):parser.error('output must be new or empty')
     args.output.mkdir(parents=True,exist_ok=True);base=args.output.resolve()
     profile=harness.PROFILES[args.arch];kernels={}
@@ -108,7 +112,7 @@ def main():
     try:
         for repeat in range(args.repeat):
             # 每个轮次轮换全部组合；相同旧核control仍是独立启动。
-            plan=timer_run_plan(list(kernels),args.timer_kernel,repeat) if args.timer_suite else timer_run_plan(list(kernels),None,repeat)
+            plan=timer_run_plan(list(kernels),args.timer_kernel,repeat,args.timer_modes) if args.timer_suite else timer_run_plan(list(kernels),None,repeat)
             for label,mode in plan:
                 name=f'{repeat}-{label}-{mode}' if args.timer_suite else f'{repeat}-{label}'
                 disk=base/f'{name}.img';shutil.copyfile(fixture,disk)
@@ -140,7 +144,7 @@ def main():
         if args.timer_suite:
             report['median']={label:{mode:{case:{field:statistics.median(row['values'][case][field] for row in report['runs']
                     if row['label']==label and row['mode']==mode) for field in ('wall_ns','user_ns','system_ns','signals')}
-                    for case in TIMER_CASES} for mode in (TIMER_MODES if label==args.timer_kernel else ('off',))} for label in kernels}
+                    for case in TIMER_CASES} for mode in (args.timer_modes if label in args.timer_kernel else ('off',))} for label in kernels}
             report['status']='passed'
         else:
             report['median_ns']={label:{case:statistics.median(row['ns'][case] for row in report['runs'] if row['label']==label)

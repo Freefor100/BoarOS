@@ -18,6 +18,8 @@ static pthread_barrier_t start;
 static struct kernel_task *selected[4];
 void *sync_test_cpu(void) { return active_cpu; }
 void *sync_test_current_task(void) { return active_cpu->current; }
+void signal_owner_bind_cpu(struct kernel_cpu *cpu)
+{ active_cpu=cpu; sync_test_irq=0; }
 static _Thread_local unsigned group_lock_calls;
 static _Thread_local unsigned cleanup_domain_entry, complete_disposal_at;
 static void complete_held_disposal(void);

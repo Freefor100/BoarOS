@@ -386,12 +386,12 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 #if BOAROS_USER_SMP
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
         do {
-            kernel_task_prepare_user_return();
-            if (kernel_scheduler_user_service_active()) {
+            if (kernel_task_prepare_user_return()) {
                 riscv_signal_prepare_user_return(frame);
-                kernel_scheduler_leave_user_service();
+                if (kernel_scheduler_user_service_active())
+                    kernel_scheduler_leave_user_service();
             }
-        } while (kernel_scheduler_user_service_pending());
+        } while (kernel_scheduler_user_return_pending());
         kernel_cpu_current()->user_returns++;
     } else kernel_scheduler_prepare_idle_return();
 #else

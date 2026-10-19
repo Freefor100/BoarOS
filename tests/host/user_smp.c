@@ -1,5 +1,6 @@
 /* 实际换栈由客户机验证；本测试直接使用生产资格索引及执行owner交接。 */
 #define main controlled_smp_main
+#define SMP_TEST_USE_LIFETIME
 #include "smp_sched.c"
 #undef main
 #include <arch/timer.h>
@@ -7,10 +8,19 @@
 
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
-extern int kernel_scheduler_user_service_pending(void);
+static int cancel_stop_on_handoff;
+void user_signal_cancel_stop(struct kernel_task *);
+void user_signal_retarget_case(struct kernel_task *,struct kernel_task *);
+void user_signal_take_retargeted(struct kernel_task *);
+void user_signal_stop_selection(struct kernel_task *);
 struct kernel_task *process_find_identity(kernel_pid_t pid, enum kernel_pid_role role)
 { (void)role; for (unsigned i=0; i<4; i++) if (tasks[i].tid==pid) return &tasks[i]; return 0; }
 struct kernel_task *kernel_task_current(void) { return active->current; }
+void process_identity_commit_locked(struct kernel_task *task)
+{ (void)task;assert(!"host actors already own published identities"); }
+struct kernel_cpu *riscv_smp_cpu(unsigned id) { assert(id<2);return &cpus[id]; }
+enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *task)
+{ (void)task;assert(!"unexpected wait in the host signal transition");return KERNEL_SCHEDULER_STATUS_INVALID_STATE; }
 uint32_t kernel_time_is_initialized(void) { return 0; }
 uint64_t riscv_time_read(void) { return 1; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *ticks)
@@ -30,6 +40,10 @@ enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,st
         kernel_wait_switch_finish_locked(old); active->switch_previous=0;
     }
     active=&cpus[other];
+    if(cancel_stop_on_handoff && !active->logical_id){
+        cancel_stop_on_handoff=0;
+        user_signal_cancel_stop(old);
+    }
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         struct kernel_task *previous=active->current;
@@ -152,7 +166,14 @@ int main(void)
         cpus[1].switch_previous = 0;
         scheduler_user_request_locked(&tasks[0]);
     }
-    assert(kernel_scheduler_user_service_pending());
+    assert(tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        scheduler_signal_request_locked(&tasks[0]);
+    }
+    assert(kernel_scheduler_user_return_pending());
+    assert(kernel_scheduler_take_signal_work());
+    assert(!kernel_scheduler_take_signal_work() && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler_user_service_set_locked(&tasks[0], 1);
@@ -188,21 +209,24 @@ int main(void)
         kernel_wait_switch_finish_locked(&idles[1]); active->switch_previous=0;
     }
     kernel_scheduler_enter_user_service();
-    assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
+    assert(active==&cpus[0] && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain); scheduler_signal_request_locked(&tasks[0]); }
     kernel_scheduler_ack_user_service();
-    assert(!kernel_scheduler_user_service_pending());
+    assert(!(tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0) && kernel_scheduler_user_return_pending());
+    assert(kernel_scheduler_take_signal_work() && !kernel_scheduler_user_return_pending());
     assert(!pthread_barrier_init(&gate,0,2)); pthread_t notifier;
     assert(!pthread_create(&notifier,0,late_service_notice,0));
     int barrier=pthread_barrier_wait(&gate);
     assert(!barrier || barrier==PTHREAD_BARRIER_SERIAL_THREAD);
     assert(!pthread_join(notifier,0)); pthread_barrier_destroy(&gate);
     kernel_scheduler_leave_user_service();
-    assert(active==&cpus[1] && kernel_scheduler_user_service_pending());
+    assert(active==&cpus[1] && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     kernel_scheduler_enter_user_service();
-    assert(active==&cpus[0] && kernel_scheduler_user_service_pending());
+    assert(active==&cpus[0] && (tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     kernel_scheduler_ack_user_service();
-    assert(!kernel_scheduler_user_service_pending());
+    assert(!(tasks[0].user_return_pending & KERNEL_USER_RETURN_CPU0));
     assert(active==&cpus[0] && active->current==&tasks[0] && tasks[0].user_service && tasks[0].cpu_mask==2);
+    puts("PASS local signal notices and CPU0 requests consume only their own work, preserving concurrent publications");
     /* 实际任务临时服务不能把来源CPU的FIFO运行资格让给同级任务。 */
     assert(!kernel_sched_policy_set(&tasks[0].scheduling,KERNEL_SCHED_FIFO,40,0));
     kernel_scheduler_leave_user_service();
@@ -260,8 +284,33 @@ int main(void)
     stop_armed=1; user_stop_case(&tasks[3]);
     assert(!pthread_join(stopper,0) && stop_claimed);
     assert(tasks[3].state==KERNEL_THREAD_STATE_RUNNING && tasks[3].wait.on_cpu);
-    assert(tasks[3].signal_pending==(UINT64_C(1)<<18) && tasks[3].user_service_pending);
+    assert(tasks[3].signal_pending==(UINT64_C(1)<<18) && (tasks[3].user_return_pending & KERNEL_USER_RETURN_CPU0));
     assert(!tasks[3].ready_node.queued);
+    active=&cpus[1];
+    tasks[2]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.arch.user_mode=1,
+        .state=KERNEL_THREAD_STATE_RUNNING,.accounted=1,.cpu_mask=1};
+    assert(!kernel_sched_policy_set(&tasks[2].scheduling,KERNEL_SCHED_OTHER,0,0));
+    user_signal_retarget_case(&tasks[3],&tasks[2]);
+    active=&cpus[0];
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_task *previous=active->current;
+        assert(scheduler_select_next_locked(active,previous,1)==&tasks[2]);
+        kernel_wait_switch_finish_locked(previous);active->switch_previous=0;
+    }
+    user_signal_take_retargeted(&tasks[2]);
+    struct kernel_wait_token delivered={&tasks[2],tasks[2].wait.generation};
+    assert(!kernel_wait_finish(&delivered));
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        tasks[2].state=KERNEL_THREAD_STATE_EXITED;
+        assert(scheduler_select_next_locked(active,&tasks[2],1)!=&tasks[2]);
+        kernel_wait_switch_finish_locked(&tasks[2]);active->switch_previous=0;
+    }
+    active=&cpus[1];cancel_stop_on_handoff=1;
+    user_signal_stop_selection(&tasks[3]);
+    assert(!cancel_stop_on_handoff && active==&cpus[1] && active->current==&tasks[3]);
+    assert(!tasks[3].storage_borrows && !tasks[2].storage_borrows && !scheduler.blocked_head && !scheduler.stopped_head);
     puts("user SMP service eligibility and old-stack execution owner passed");
     return 0;
 }
