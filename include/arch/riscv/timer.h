@@ -21,6 +21,17 @@ enum riscv_timer_status riscv_timer_handle_interrupt(
     uint64_t *elapsed_ticks);
 /* Independent scheduler event; zero cancels, periodic tick phase is preserved. */
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline);
+#if defined(__riscv)
+static inline uint64_t riscv_time_read(void)
+{
+    uint64_t value;
+    __asm__ volatile("csrr %0, time" : "=r"(value) : : "memory");
+    return value;
+}
+#else
 uint64_t riscv_time_read(void);
+#endif
+/* 与普通内存发布/快照中的TIME输入建立顺序。 */
+uint64_t riscv_time_read_ordered(void);
 
 #endif

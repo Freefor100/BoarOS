@@ -4,7 +4,16 @@
 enum arch_timer_status { ARCH_TIMER_STATUS_OK=0, ARCH_TIMER_STATUS_INVALID_ARGUMENT,
     ARCH_TIMER_STATUS_INVALID_FREQUENCY, ARCH_TIMER_STATUS_ALREADY_STARTED,
     ARCH_TIMER_STATUS_NOT_STARTED, ARCH_TIMER_STATUS_EARLY_INTERRUPT };
+#if defined(__loongarch__)
+static inline uint64_t arch_time_read(void)
+{
+    uint64_t value;
+    __asm__ volatile("rdtime.d %0, $zero" : "=r"(value) : : "memory");
+    return value;
+}
+#else
 uint64_t arch_time_read(void);
+#endif
 uint32_t la_timer_frequency(void);
 enum arch_timer_status la_timer_start(uint32_t, uint32_t);
 enum arch_timer_status la_timer_interrupt(uint64_t *);

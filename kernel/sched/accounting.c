@@ -1,94 +1,154 @@
 #include "private.h"
 #include <kernel/time.h>
+#include <arch/timer.h>
 #include <kernel/errno.h>
 #include <kernel/irq.h>
 #include <kernel/accounting.h>
 
 enum { ACCOUNT_KERNEL, ACCOUNT_USER, ACCOUNT_INTERRUPT };
 
-void scheduler_cpu_time_account_locked(struct kernel_cpu *cpu, uint64_t now)
+static inline uint64_t accounting_counter(void)
 {
-    if (!cpu->accounting_owner) {
-        cpu->accounting_owner = cpu->current;
-        cpu->accounting_started_ns = now;
-        return;
-    }
-    if (now < cpu->accounting_started_ns) __builtin_trap();
-    struct kernel_task *task = cpu->accounting_owner;
-    uint64_t elapsed = now - cpu->accounting_started_ns;
-    if (!task->idle && task != cpu->idle) {
-        if (task->accounting_mode == ACCOUNT_USER) task->usage.user_ns += elapsed;
-        else if (task->accounting_mode == ACCOUNT_KERNEL) task->usage.kernel_ns += elapsed;
-    }
-    cpu->accounting_started_ns = now;
+#if BOAROS_MAX_CPUS > 1
+    return arch_time_read_ordered();
+#else
+    return arch_time_read();
+#endif
 }
 
-void scheduler_cpu_time_switch(struct kernel_task *previous, struct kernel_task *next)
+/* 只有实际执行本栈的CPU能写执行片段，入口/返回/切栈均已关闭IRQ。
+ * 远端查询持调度域固定owner及task存储；序列只覆盖数值发布，写者不等待。 */
+static inline void accounting_write_begin(struct kernel_cpu *cpu)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    uint64_t now = kernel_time_monotonic_ns();
-    if (!cpu->accounting_owner) {
-        cpu->accounting_owner = previous;
-        cpu->accounting_started_ns = now;
+#if BOAROS_MAX_CPUS > 1
+    uint64_t sequence=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_RELAXED);
+    __atomic_store_n(&cpu->accounting_sequence,sequence+1,__ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+#else
+    (void)cpu;
+#endif
+}
+static inline void accounting_write_end(struct kernel_cpu *cpu)
+{
+#if BOAROS_MAX_CPUS > 1
+    uint64_t sequence=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_RELAXED);
+    __atomic_store_n(&cpu->accounting_sequence,sequence+1,__ATOMIC_RELEASE);
+#else
+    (void)cpu;
+#endif
+}
+static __attribute__((always_inline)) inline void account_time(struct kernel_cpu *cpu,uint64_t now)
+{
+    uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
+    if (now<started) __builtin_trap();
+    struct kernel_task *task=cpu->accounting_owner;
+    uint64_t elapsed=now-started;
+    if (!task->idle && task!=cpu->idle) {
+        uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
+        uint64_t *counter=mode==ACCOUNT_USER ? &cpu->accounting_user_ticks :
+            mode==ACCOUNT_KERNEL ? &cpu->accounting_kernel_ticks : 0;
+        if (counter) __atomic_store_n(counter,
+            __atomic_load_n(counter,__ATOMIC_RELAXED)+elapsed,__ATOMIC_RELAXED);
     }
-    if (cpu->accounting_owner != previous) __builtin_trap();
-    scheduler_cpu_time_account_locked(cpu, now);
-    /* current已发布next，旧栈的执行借用仍覆盖previous，到真正切栈前才转移记账。 */
+    __atomic_store_n(&cpu->accounting_started_ticks,now,__ATOMIC_RELAXED);
+}
+/* 冷启动首次绑定也沿调度域发布owner；常规trap无需重复取全局锁。 */
+static int accounting_initialize(struct kernel_cpu *cpu)
+{
+    if (scheduler.initialized!=KERNEL_SCHEDULER_INITIALIZED || !kernel_time_is_initialized()) return 0;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if (!cpu->current) return 0;
+    cpu->accounting_owner=cpu->current;
+    __atomic_store_n(&cpu->accounting_started_ticks,accounting_counter(),__ATOMIC_RELAXED);
+    return 1;
+}
+void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *next)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    uint64_t now=accounting_counter();
+    if (!cpu->accounting_owner) {
+        cpu->accounting_owner=previous;
+        cpu->accounting_started_ticks=now;
+    }
+    if (cpu->accounting_owner!=previous) __builtin_trap();
+    accounting_write_begin(cpu);
+    account_time(cpu,now);
+    /* task保存已结束执行片段的纳秒值；本CPU的硬件tick只在查询/交接换算。 */
+    previous->usage.user_ns+=kernel_time_ticks_to_ns(cpu->accounting_user_ticks);
+    previous->usage.kernel_ns+=kernel_time_ticks_to_ns(cpu->accounting_kernel_ticks);
+    __atomic_store_n(&cpu->accounting_user_ticks,0,__ATOMIC_RELAXED);
+    __atomic_store_n(&cpu->accounting_kernel_ticks,0,__ATOMIC_RELAXED);
+    accounting_write_end(cpu);
+    /* current已发布next，旧栈借用覆盖previous，真正切栈前才转移owner。 */
     if (previous->arch.user_mode) {
-        if (previous->state == KERNEL_THREAD_STATE_BLOCKED || previous->state == KERNEL_THREAD_STATE_STOPPED ||
-            previous->state == KERNEL_THREAD_STATE_EXITED) previous->usage.voluntary++;
+        if (previous->state==KERNEL_THREAD_STATE_BLOCKED || previous->state==KERNEL_THREAD_STATE_STOPPED ||
+            previous->state==KERNEL_THREAD_STATE_EXITED) previous->usage.voluntary++;
         else previous->usage.involuntary++;
     }
-    cpu->accounting_owner = next;
+    cpu->accounting_owner=next;
 }
-
-void scheduler_task_cpu_time_locked(const struct kernel_task *task, uint64_t *user, uint64_t *system)
+void scheduler_task_cpu_time_locked(const struct kernel_task *task,uint64_t *user,uint64_t *system)
 {
-    *user = task->usage.user_ns;
-    *system = task->usage.kernel_ns;
-    uint64_t now = kernel_time_monotonic_ns();
-    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next) {
-        if (cpu->accounting_owner != task || task->idle || task == cpu->idle) continue;
-        if (now < cpu->accounting_started_ns) __builtin_trap();
-        uint64_t elapsed = now - cpu->accounting_started_ns;
-        if (task->accounting_mode == ACCOUNT_USER) *user += elapsed;
-        else if (task->accounting_mode == ACCOUNT_KERNEL) *system += elapsed;
+    for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        if (cpu->accounting_owner!=task || task->idle || task==cpu->idle) continue;
+        for (;;) {
+#if BOAROS_MAX_CPUS > 1
+            uint64_t sequence=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_ACQUIRE);
+            if (sequence&1U) continue;
+#endif
+            uint64_t u=__atomic_load_n(&cpu->accounting_user_ticks,__ATOMIC_RELAXED);
+            uint64_t k=__atomic_load_n(&cpu->accounting_kernel_ticks,__ATOMIC_RELAXED);
+            uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
+            uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
+            uint64_t now=accounting_counter();
+#if BOAROS_MAX_CPUS > 1
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (sequence!=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_RELAXED)) continue;
+#endif
+            if (now<started) __builtin_trap();
+            uint64_t elapsed=now-started;
+            *user=task->usage.user_ns+kernel_time_ticks_to_ns(u+(mode==ACCOUNT_USER ? elapsed : 0));
+            *system=task->usage.kernel_ns+kernel_time_ticks_to_ns(k+(mode==ACCOUNT_KERNEL ? elapsed : 0));
+            return;
+        }
     }
+    *user=__atomic_load_n(&task->usage.user_ns,__ATOMIC_RELAXED);
+    *system=__atomic_load_n(&task->usage.kernel_ns,__ATOMIC_RELAXED);
 }
-
-void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *scope, int user, int interrupt)
+void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *scope,int user,int interrupt)
 {
-    scope->task = 0;
-    if ((!user && !interrupt) || scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        !kernel_time_is_initialized()) return;
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    struct kernel_task *task = cpu->current;
-    if (!task) return;
-    scheduler_cpu_time_account_locked(cpu, kernel_time_monotonic_ns());
-    scope->task = task;
-    /* U trap的后续返回准备仍是内核工作，最终USER切换在架构返回入口完成。 */
-    scope->restore_mode = user ? ACCOUNT_KERNEL : task->accounting_mode;
-    task->accounting_mode = interrupt ? ACCOUNT_INTERRUPT : ACCOUNT_KERNEL;
+    scope->task=0;
+    if (!user && !interrupt) return;
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (!cpu->accounting_owner && !accounting_initialize(cpu)) return;
+    struct kernel_task *task=cpu->accounting_owner;
+    accounting_write_begin(cpu);
+    account_time(cpu,accounting_counter());
+    scope->task=task;
+    /* U trap后续返回准备仍计内核工作；最终USER切换在架构返回入口完成。 */
+    scope->restore_mode=user ? ACCOUNT_KERNEL : task->accounting_mode;
+    __atomic_store_n(&task->accounting_mode,interrupt ? ACCOUNT_INTERRUPT : ACCOUNT_KERNEL,__ATOMIC_RELAXED);
+    accounting_write_end(cpu);
 }
-
 void kernel_cpu_account_trap_end(struct kernel_cpu_account_scope *scope)
 {
-    if (!scope->task || scope->task->accounting_mode == scope->restore_mode) return;
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    if (cpu->current != scope->task) __builtin_trap();
-    scheduler_cpu_time_account_locked(cpu, kernel_time_monotonic_ns());
-    scope->task->accounting_mode = scope->restore_mode;
+    if (!scope->task || scope->task->accounting_mode==scope->restore_mode) return;
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (cpu->accounting_owner!=scope->task) __builtin_trap();
+    accounting_write_begin(cpu);
+    account_time(cpu,accounting_counter());
+    __atomic_store_n(&scope->task->accounting_mode,scope->restore_mode,__ATOMIC_RELAXED);
+    accounting_write_end(cpu);
 }
-
 void kernel_cpu_account_user_return(void)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    scheduler_cpu_time_account_locked(cpu, kernel_time_monotonic_ns());
-    cpu->current->accounting_mode = ACCOUNT_USER;
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (!cpu->accounting_owner && !accounting_initialize(cpu)) __builtin_trap();
+    accounting_write_begin(cpu);
+    account_time(cpu,accounting_counter());
+    __atomic_store_n(&cpu->accounting_owner->accounting_mode,ACCOUNT_USER,__ATOMIC_RELAXED);
+    accounting_write_end(cpu);
 }
 
 void scheduler_usage_add(struct kernel_task_usage *to, const struct kernel_task_usage *from)
