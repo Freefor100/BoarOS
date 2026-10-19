@@ -42,7 +42,7 @@ learning 面向读者解释机制、结果和适用条件。正文使用可识�
 |---|---|
 | 架构基础 | [启动](learning/riscv-boot.md)、[Trap](learning/riscv-traps.md)、[用户态](learning/riscv-user-mode.md)、[时间](learning/riscv-time.md) |
 | 内存 / ELF | [内存管理](learning/memory-management.md)、[ELF 装载](learning/elf-loading.md) |
-| 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md)、[两核交接与失效](learning/smp-handoff.md)、[可信随机源](learning/random-source.md)、[会话/调度消费者](learning/session-consumers.md) |
+| 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[CPU记账成本](learning/cpu-accounting-cost.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md)、[两核交接与失效](learning/smp-handoff.md)、[可信随机源](learning/random-source.md)、[会话/调度消费者](learning/session-consumers.md) |
 | 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md)、[记录锁与恢复](learning/record-lock-sqlite-recovery.md)、[可睡眠存储](learning/sleepable-storage.md)、[多挂载验收](learning/memory-backed-mounts.md)、[proc 控制](learning/proc-controls.md)、[网络 owner](learning/network-ownership.md) |
 | 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[客体内编译探针](learning/offline-toolchain-probe.md)、[单核规模](learning/single-hart-scale.md) |
 | CI 复现 | [固定原工具环境、缓存身份与干净 runner](learning/ci-native-environment.md) |

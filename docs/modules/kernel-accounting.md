@@ -49,3 +49,5 @@ make test-usage-smp-riscv test-cpu-clock-process-smp-riscv QEMU_RISCV_FIRMWARE=/
 ```
 
 CPU 时钟差分检查编码、进程/线程归属、消失的 TID、zombie/reap、执行增长、睡眠排除和输出地址。组合测试在真实目标存储借用之后暂停查询，分别强制父进程回收及非主线程 exec，再检查结果、实际借用释放和正常磁盘检查。
+
+程序耗时影响、同批三版本对照及复测方法见[CPU记账成本](../learning/cpu-accounting-cost.md)。

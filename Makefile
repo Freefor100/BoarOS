@@ -2478,3 +2478,12 @@ test-files-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHR
 .PHONY: test-instruction-sync-host
 test-instruction-sync-host:
 	python3 -B tests/test-instruction-sync.py
+
+# Fixed CPU-accounting cost workloads; supply saved baseline kernels to cost.py.
+.PHONY: build-accounting-cost
+build-accounting-cost: $(BUILD_DIR)/tests/user/cpu-account-cost-rv $(LA_BUILD)/cpu-account-cost $(SQLITE_CLI_STATIC_RV) $(LA_BUILD)/sqlite3-static
+$(BUILD_DIR)/tests/user/cpu-account-cost-rv: tests/accounting/cost.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+$(LA_BUILD)/cpu-account-cost: tests/accounting/cost.c $(LA_SQLITE_CC)
+	REALGCC=$(LA_CC) $(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
