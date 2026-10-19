@@ -1535,8 +1535,12 @@ test-stack-guard-riscv: $(STACK_GUARD_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) STACK_GUARD_TEST_KERNEL_RV=$< \
 		./tests/stack-guard-riscv.sh
 
+.PHONY: test-riscv-timer-host
+test-riscv-timer-host:
+	python3 -B tests/host/riscv_timer_events.py
+
 test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
-		$(TIMER_BOOT_TEST_KERNEL_RV)
+		$(TIMER_BOOT_TEST_KERNEL_RV) test-riscv-timer-host
 	QEMU_RISCV64=$(QEMU_RISCV64) TIMER_CASES_TEST_KERNEL_RV=$< \
 		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
 		./tests/timer-riscv.sh

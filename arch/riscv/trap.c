@@ -25,7 +25,7 @@ static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
 static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
 {
 #if BOAROS_MAX_CPUS > 1
-    riscv_smp_trap_fatal(frame);
+    riscv_smp_trap_fatal(frame, "trap", 0);
 #endif
     virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: fatal trap scause=");
@@ -49,8 +49,7 @@ static void riscv_timer_fatal(const struct riscv_trap_frame *frame,
                               enum riscv_timer_status status)
 {
 #if BOAROS_MAX_CPUS > 1
-    (void)status;
-    riscv_smp_trap_fatal(frame);
+    riscv_smp_trap_fatal(frame, "timer", status);
 #endif
     virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: timer error status=");
@@ -72,8 +71,7 @@ static void riscv_scheduler_fatal(
     enum kernel_scheduler_status status)
 {
 #if BOAROS_MAX_CPUS > 1
-    (void)status;
-    riscv_smp_trap_fatal(frame);
+    riscv_smp_trap_fatal(frame, "scheduler", status);
 #endif
     virt_uart_emergency_begin();
     struct kernel_task *curr = kernel_task_current();
