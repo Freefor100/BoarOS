@@ -94,7 +94,6 @@ enum kernel_block_status kernel_block_read_at(
     void *buffer,
     size_t size)
 {
-    kernel_assert_service_context();
     if (device == 0 || physical(device)->read == 0 ||
         device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_INVALID;
@@ -294,7 +293,6 @@ static __attribute__((noinline)) enum kernel_block_status partition_read_batch(
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
     struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
 {
-    kernel_assert_service_context();
     if (!device || !device->logical_block_size || count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
         return KERNEL_BLOCK_STATUS_INVALID;
     if (!physical(device)->read && !physical(device)->read_batch) return KERNEL_BLOCK_STATUS_UNSUPPORTED;

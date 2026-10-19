@@ -56,6 +56,7 @@ struct virtio_block_device {
     uint64_t batch_physical[VIRTIO_BLOCK_BATCH_POOL_PAGES];
     void *batch_memory[VIRTIO_BLOCK_BATCH_POOL_PAGES];
     unsigned batch_claimed;
+    struct kernel_raw_lock metadata;
     struct virtio_split_queue queue;
     uint32_t transport_version;
     uint32_t queue_allocation_order;

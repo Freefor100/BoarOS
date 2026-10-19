@@ -86,7 +86,9 @@ static void producer(void *unused)
         check(!kernel_files_write(files,mm,1,SOURCE,sizeof(payload),&value) && value==sizeof(payload),"files-producer-packet");
         __atomic_fetch_add(&progress,1,__ATOMIC_RELEASE);
         { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-          if (scheduler.init_task && scheduler.init_task->user_ticks &&
+          struct kernel_task_usage usage = {0};
+          if (scheduler.init_task) scheduler_usage_thread_locked(scheduler.init_task, &usage);
+          if (scheduler.init_task && usage.user_ns &&
               scheduler.init_task->state!=KERNEL_THREAD_STATE_EXITED &&
               scheduler.init_task->state!=KERNEL_THREAD_STATE_GROUP_DEAD)
               __atomic_fetch_add(&user_overlap,1,__ATOMIC_RELAXED); }
