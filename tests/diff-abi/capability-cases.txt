@@ -26,3 +26,6 @@ capget.zombie
 capget.reaped
 capget.departed-group-leader
 capget.proc-vmswap
+capget.proc-pidmax
+capget.pidmax-unused
+capget.proc-pidmax-listed

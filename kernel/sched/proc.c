@@ -40,6 +40,13 @@ static int proc_visible(const struct kernel_task *task)
            task->parent != 0;
 }
 
+uint32_t kernel_proc_pid_max(void)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    /* 分配器的 limit 是包含端点的编号；proc 的 pid_max 是排他上界。 */
+    return scheduler.pid_allocator.limit + 1U;
+}
+
 static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
 {
     struct kernel_task *leader;
