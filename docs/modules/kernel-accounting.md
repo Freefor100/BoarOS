@@ -31,3 +31,19 @@ make test-sched-concurrency-host test-user-smp-host
 ```
 
 raw syscall对照检查返回值、字段单位、线程隔离、后代累计、睡眠排除、RSS保护/解除映射、冷热I/O及输出fault前缀。动态计数比较操作前后关系，保留原值，不把两台独立运行的实际CPU时间逐字比较。RV两核入口要求两个CPU实际运行用户代码、系统调用和本地timer返回，并检查正常退出、资源归还和fsck。
+
+## CPU 时钟
+
+clock_gettime/getres 支持 CLOCK_PROCESS_CPUTIME_ID(2)、CLOCK_THREAD_CPUTIME_ID(3)，以及 Linux 编码的 PROF、VIRT、SCHED 进程/线程时钟。VIRT 读取用户时间，PROF/SCHED 读取用户与内核时间之和；IRQ 和睡眠按上面的执行规则排除。SCHED 分辨率为 1 ns，PROF/VIRT 为 100 Hz tick。CPU 时间睡眠与定时器另列在能力目录。
+
+clockid_t 按有符号 32 位解释。PID 0 选择自身；线程时钟限定同一线程组。进程时钟接受 TGID，gettime 额外接受调用线程自己的 TID，getres 沿 Linux 的权限校验规则只接受 TGID。非法编码或消失的目标返回 EINVAL，合法目标的输出地址错误返回 EFAULT；getres 允许空输出。
+
+查询在发起 CPU 读取数值，不借用远端 MM。PID 引用固定进程身份，task 存储借用覆盖快照；两者各自释放。目标被回收时返回 EINVAL，其他线程 exec 将同一个 TGID 转交新容器时，放弃旧容器快照并重取新容器。已退出非主线程的清理存储仍可保留，其线程时钟已结束。
+
+
+```sh
+make test-usage-abi-riscv test-usage-abi-loongarch TEST_MEMORIES="512M 1G"
+make test-usage-smp-riscv test-cpu-clock-process-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin
+```
+
+CPU 时钟差分检查编码、进程/线程归属、消失的 TID、zombie/reap、执行增长、睡眠排除和输出地址。组合测试在真实目标存储借用之后暂停查询，分别强制父进程回收及非主线程 exec，再检查结果、实际借用释放和正常磁盘检查。

@@ -23,15 +23,27 @@ def validate_boot_output(text):
     if len(rows)!=1 or first_user<0 or rows[0].start()>first_user:
         raise RuntimeError('startup output was incomplete or overlapped user output')
 
+CLOCK_CASES=('cpu-clock-reap-held-target','cpu-clock-nonleader-exec-held-target')
+
 WAIT_CASES=('waitid-pgid-entry','wait4-pgid-entry','waitid-interrupted-output','waitid-claim-handoff')
 
-def validate_functional(text,sqlite=False,wait=False):
-    expected=WAIT_CASES if wait else ('sqlite-pressure',) if sqlite else CASES
+def validate_functional(text,sqlite=False,wait=False,clock=False):
+    expected=CLOCK_CASES if clock else WAIT_CASES if wait else ('sqlite-pressure',) if sqlite else CASES
     rows=[line[line.index('COMPOSITION CASE '):] for line in text.splitlines() if 'COMPOSITION CASE ' in line]
     ends=re.findall(r'COMPOSITION END (\d+)',text)
     if rows!=[f'COMPOSITION CASE {name} OK' for name in expected] or ends!=[str(len(expected))] or 'COMPOSITION FAIL' in text:
         raise RuntimeError('incomplete or failed composition stream')
     return list(expected)
+
+def validate_clock(text):
+    rows=re.findall(r'COMPOSITION clock claims=(0x[0-9a-f]+) active=(0x[0-9a-f]+)',text)
+    if len(rows)!=1 or tuple(int(value,16) for value in rows[0])!=(2,0):
+        raise RuntimeError('two real CPU-clock target borrows or their release missing')
+    owners=re.findall(r'COMPOSITION owners held=(0x[0-9a-f]+) released=(0x[0-9a-f]+) reclaimed=(0x[0-9a-f]+) '
+        r'oom=(0x[0-9a-f]+) retirement=(0x[0-9a-f]+) remote-retirement=(0x[0-9a-f]+) '
+        r'waits=(0x[0-9a-f]+) ledger=(0x[0-9a-f]+) control=(0x[0-9a-f]+)',text)
+    if len(owners)!=1 or any(int(value,16) for value in owners[0]):
+        raise RuntimeError('CPU-clock lifecycle owners remain at shutdown')
 
 def validate_wait(text):
     rows=re.findall(r'COMPOSITION wait claims=(0x[0-9a-f]+) active=(0x[0-9a-f]+)',text)
@@ -116,7 +128,7 @@ def main():
     parser.add_argument('--qemu',default='qemu-system-riscv64');parser.add_argument('--firmware',required=True)
     parser.add_argument('--program',type=Path,default=ROOT/'build/riscv-user-smp-composition/composition-rv')
     parser.add_argument('--memory',choices=('512M','1G'),action='append');parser.add_argument('--cpus',type=int,choices=(1,2),action='append')
-    parser.add_argument('--scene',choices=('mm','wait','sqlite-delete','sqlite-wal'),action='append')
+    parser.add_argument('--scene',choices=('mm','wait','cpu-clock','sqlite-delete','sqlite-wal'),action='append')
     parser.add_argument('--mode',choices=('common','controlled','both'),default='both')
     parser.add_argument('--build-root',type=Path,help='isolated common/controlled kernel build cache')
     parser.add_argument('--output',type=Path)
@@ -150,6 +162,7 @@ def main():
                     marker=group/'marker';marker.write_text('controlled composition scene\n')
                     if is_sqlite:install(fixture,'/sqlite-scene',marker,group)
                     if scene=='wait':install(fixture,'/wait-scene',marker,group)
+                    if scene=='cpu-clock':install(fixture,'/cpu-clock-scene',marker,group)
                     support={}
                     if scene=='sqlite-delete':
                         for name in ('sqlite-cli-init','sqlite3-static','sqlite3-dynamic'):
@@ -176,7 +189,7 @@ def main():
                             phase_dir=folder/phase;phase_dir.mkdir()
                             text,run,log=boot_user(args.qemu,args.firmware,kernel,disk,memory,cpus,phase_dir,target=='linux','/composition-supervisor')
                             validate_execution(text,cpus,target!='linux',require_parallel=True)
-                            validate_functional(text,is_sqlite,scene=='wait')
+                            validate_functional(text,is_sqlite,scene=='wait',scene=='cpu-clock')
                             if target!='linux':
                                 validate_boot_output(text)
                                 validate_shutdown_output(text)
@@ -185,7 +198,8 @@ def main():
                                 validate_file_fault_race(text)
                                 validate_ordinary_io(text,cpus)
                             if target!='linux' and scene=='wait':validate_wait(text)
-                            owners=validate_controlled(text,is_sqlite,cpus) if mode=='controlled' and scene!='wait' else None
+                            if target!='linux' and scene=='cpu-clock':validate_clock(text)
+                            owners=validate_controlled(text,is_sqlite,cpus) if mode=='controlled' and scene not in ('wait','cpu-clock') else None
                             if is_sqlite:
                                 wanted=('BoarOS: SQLite WAL multiprocess passed' if phase=='initial' else 'BoarOS: SQLite WAL reboot verified') if scene=='sqlite-wal' else (
                                     'BoarOS: SQLite rollback smoke passed' if phase=='initial' else 'BoarOS: SQLite CLI static and dynamic passed')

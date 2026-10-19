@@ -8,6 +8,7 @@ void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *, int user, 
 void kernel_cpu_account_trap_end(struct kernel_cpu_account_scope *);
 void kernel_cpu_account_user_return(void);
 int kernel_task_getrusage(struct kernel_task *, int32_t who, struct kernel_linux_rusage *);
+int kernel_task_cpu_clock(struct kernel_task *, int32_t clock, int resolution, uint64_t *);
 /* I/O在实际发起/首次弄脏时记给原调用者，背景执行沿现有account_task借用。 */
 void kernel_task_account_read(uint64_t bytes);
 void kernel_task_account_write(uint64_t bytes);

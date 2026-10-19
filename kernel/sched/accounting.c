@@ -121,34 +121,26 @@ void scheduler_usage_save_mm(struct kernel_task *task)
     if (task->usage.maxrss_pages < peak) task->usage.maxrss_pages = peak;
 }
 
-/* 数值快照不触及MM句柄，CPU时钟和times可在发起CPU查询。 */
-void scheduler_usage_snapshot(const struct kernel_task *task, int who,
-                              struct kernel_task_usage *usage)
+/* 显式group容器由调用者借用。退出/exec可清除其group_leader；
+ * 此时只读该容器已保留的数值，由PID查询者检查身份并决定重试。 */
+void scheduler_group_usage_snapshot(struct kernel_task *leader, int children,
+                                   struct kernel_task_usage *usage)
 {
-    struct kernel_task *leader;
-    int single = 0;
+    struct scheduler_group_cursor cursor = {0};
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        leader = task->group_leader;
-        if (!leader) __builtin_trap();
-        if (who == -1) { *usage = leader->child_usage; return; }
-        if (who == 1) {
-            scheduler_usage_thread_locked(task, usage);
-            uint64_t peak = leader->dead_usage.maxrss_pages;
-            if (peak < leader->usage.maxrss_pages) peak = leader->usage.maxrss_pages;
-            if (usage->maxrss_pages < peak) usage->maxrss_pages = peak;
-        } else if (leader->group_members == 1) {
+        *usage = leader->dead_usage;
+        if (children) scheduler_usage_add(usage, &leader->child_usage);
+        if (leader->group_members <= 1 || leader->retirement || leader->group_leader != leader) {
             struct kernel_task_usage own;
             scheduler_usage_thread_locked(leader, &own);
-            *usage = leader->dead_usage;
             scheduler_usage_add(usage, &own);
-            if (who == -2) scheduler_usage_add(usage, &leader->child_usage);
-            single = 1;
+            return;
         }
+        scheduler_task_get_locked(leader);
+        cursor.leader = cursor.task = leader;
+        cursor.epoch = leader->group_epoch;
     }
-    if (who == 1 || single) return;
-    struct scheduler_group_cursor cursor;
-    scheduler_group_cursor_begin(leader, &cursor);
     uint64_t epoch = UINT64_MAX;
     while (cursor.task) {
         struct kernel_task *member = cursor.task;
@@ -156,7 +148,7 @@ void scheduler_usage_snapshot(const struct kernel_task *task, int who,
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             if (epoch != cursor.epoch) {
                 *usage = leader->dead_usage;
-                if (who == -2) scheduler_usage_add(usage, &leader->child_usage);
+                if (children) scheduler_usage_add(usage, &leader->child_usage);
                 epoch = cursor.epoch;
             }
             if (leader->group_epoch == cursor.epoch && member->group_leader == leader) {
@@ -168,6 +160,27 @@ void scheduler_usage_snapshot(const struct kernel_task *task, int who,
         scheduler_group_cursor_next(&cursor);
     }
     scheduler_group_cursor_end(&cursor);
+}
+
+/* 数值快照不触及MM句柄，CPU时钟和times可在发起CPU查询。 */
+void scheduler_usage_snapshot(const struct kernel_task *task, int who,
+                              struct kernel_task_usage *usage)
+{
+    struct kernel_task *leader;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        leader = task->group_leader;
+        if (!leader) __builtin_trap();
+        if (who == -1) { *usage = leader->child_usage; return; }
+        if (who == 1) {
+            scheduler_usage_thread_locked(task, usage);
+            uint64_t peak = leader->dead_usage.maxrss_pages;
+            if (peak < leader->usage.maxrss_pages) peak = leader->usage.maxrss_pages;
+            if (usage->maxrss_pages < peak) usage->maxrss_pages = peak;
+            return;
+        }
+    }
+    scheduler_group_usage_snapshot(leader, who == -2, usage);
 }
 
 /* CPU0与IRQ关闭保证借用中的task MM句柄不会被cleanup并发move/release；

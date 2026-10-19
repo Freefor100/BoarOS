@@ -37,13 +37,13 @@ CLOCK_REALTIME 的墙钟完全取决于启动时的 RTC 探测。goldfish RTC �
 
 ## 消费者与验证
 
-syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC` 和两种 `COARSE`（5、6），其余 clockid（含 CPU-time 时钟）返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者为 UTC 的两个零值。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
+syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者为 UTC 的两个零值。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
 睡眠时钟校验独立于可读时钟：`clock_nanosleep(115)` 的 coarse 时钟及 CLOCK_THREAD_CPUTIME_ID 返回 `-EOPNOTSUPP`，在读取用户 timespec 前拒绝；不把它们接入 sleep deadline 换算。其余既有 `CLOCK_REALTIME` / `CLOCK_MONOTONIC` 睡眠和 `nanosleep(101)` 保持不变。
 
 `make test-syscall-riscv` 覆盖换算、coarse 初始化一致性、无 timer 时的稳定读数、延迟采样与 10ms 分辨率；`tests/diff-abi/coarse.c` 覆盖真实 U-mode timer 推进、查询错误和拒绝 coarse sleep。固定 Linux 必须启用 `CONFIG_POSIX_TIMERS` 才能对照 raw coarse syscall；Linux HZ=250 的 4ms 与 BoarOS HZ=100 的 10ms 分辨率按各自真实周期验证，不要求裸值相等。`make test-userland-riscv` 用 musl 验证真实 trap→expire→wake 闭环和 RTC 墙钟。
 
-当前限制：无 NTP/阶跃调整、无 CPU-time clockid；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
+当前限制：无 NTP/阶跃调整及 CPU-time sleep/timer；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
 检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、

@@ -42,7 +42,8 @@ static void command(unsigned action)
     if (!controlled && action!=COMPOSITION_STOP && action!=COMPOSITION_FAULT_RACE &&
         action!=COMPOSITION_FILE_FAULT_RACE && action!=COMPOSITION_READ_ARM &&
         action!=COMPOSITION_READ_FINISH && action!=COMPOSITION_WAIT_ARM &&
-        action!=COMPOSITION_WAIT_FINISH) return;
+        action!=COMPOSITION_WAIT_FINISH && action!=COMPOSITION_CLOCK_ARM &&
+        action!=COMPOSITION_CLOCK_FINISH) return;
     composition_store(&control->command,action);
     composition_store(&control->request,++request);
     wait_value(&control->reply,request);
@@ -513,6 +514,63 @@ static void wait_processes(void)
     CHECK(waitpid(first.child,0,WNOHANG)==-1 && errno==ECHILD);
     command(COMPOSITION_WAIT_FINISH);record("waitid-claim-handoff");puts("COMPOSITION END 4");
 }
+struct clock_query { pid_t pid;uint64_t ready,go;long result;int error;struct timespec value; };
+static void *query_clock(void *opaque)
+{
+    struct clock_query *q=opaque;pin(1);
+    uint64_t end=now()+UINT64_C(20000000),value=1;
+    while (now()<end) {value=(value<<3)^(value>>7)^17;__asm__ volatile("" : "+r"(value));}
+    composition_store(&control->clock_tid,syscall(SYS_gettid));
+    composition_store(&q->ready,1);wait_value(&q->go,1);
+    clockid_t id=(clockid_t)(~(unsigned)q->pid<<3 | 2U);
+    errno=0;q->result=syscall(SYS_clock_gettime,id,&q->value);q->error=errno;
+    return 0;
+}
+static pthread_t clock_arm(struct clock_query *q)
+{
+    composition_store(&control->clock_entered,0);composition_store(&control->clock_release,0);
+    composition_store(&control->clock_pid,q->pid);
+    pthread_t thread;CHECK(!pthread_create(&thread,0,query_clock,q));wait_value(&q->ready,1);
+    command(COMPOSITION_CLOCK_ARM);
+    if (observed) {composition_store(&q->go,1);wait_value(&control->clock_entered,1);}
+    return thread;
+}
+static void clock_release(struct clock_query *q,pthread_t thread)
+{
+    if (observed) composition_store(&control->clock_release,1);
+    else composition_store(&q->go,1);
+    CHECK(!pthread_join(thread,0));command(COMPOSITION_CLOCK_FINISH);
+}
+struct clock_exec {int command,ack;};
+static void *clock_exec_worker(void *opaque)
+{
+    struct clock_exec *p=opaque;char byte,command_fd[24],ack_fd[24];
+    CHECK(read(p->command,&byte,1)==1 && byte=='X');
+    snprintf(command_fd,sizeof(command_fd),"%d",p->command);snprintf(ack_fd,sizeof(ack_fd),"%d",p->ack);
+    execl("/composition-supervisor","/composition-supervisor","--clock-exec-child",command_fd,ack_fd,(char *)0);
+    _exit(97);
+}
+static void cpu_clock_processes(void)
+{
+    int pipefd[2];pid_t child=held_child(pipefd);struct clock_query reaped={.pid=child};
+    pthread_t query=clock_arm(&reaped);release_child(pipefd);
+    int status;CHECK(waitpid(child,&status,0)==child && status==(57<<8));
+    clock_release(&reaped,query);CHECK(reaped.result==-1 && reaped.error==EINVAL);
+    record("cpu-clock-reap-held-target");
+    int commands[2],ack[2];CHECK(!pipe(commands) && !pipe(ack));child=fork();CHECK(child>=0);
+    if (!child) {
+        CHECK(!close(commands[1]) && !close(ack[0]));
+        struct clock_exec p={commands[0],ack[1]};pthread_t worker;
+        CHECK(!pthread_create(&worker,0,clock_exec_worker,&p));
+        for (;;) pause();
+    }
+    CHECK(!close(commands[0]) && !close(ack[1]));struct clock_query exec={.pid=child};query=clock_arm(&exec);
+    CHECK(write(commands[1],"X",1)==1);char byte;CHECK(read(ack[0],&byte,1)==1 && byte=='E');
+    clock_release(&exec,query);CHECK(!exec.result && exec.value.tv_sec>=0 && exec.value.tv_nsec>=0 && exec.value.tv_nsec<1000000000L);
+    CHECK(write(commands[1],"Q",1)==1 && waitpid(child,&status,0)==child && status==(57<<8));
+    CHECK(!close(commands[1]) && !close(ack[0]));record("cpu-clock-nonleader-exec-held-target");
+    puts("COMPOSITION END 2");
+}
 static void waiters(unsigned count,int use_futex)
 {
     int pipefd[2],replacement[2];CHECK(!pipe(pipefd) && !pipe(replacement));
@@ -577,10 +635,16 @@ static void sqlite(void)
     composition_store(&compute_stop,1);CHECK(!pthread_join(thread,0));
     record("sqlite-pressure");puts("COMPOSITION END 1");
 }
-int main(void)
+int main(int argc,char **argv)
 {
+    if (argc==4 && !strcmp(argv[1],"--clock-exec-child")) {
+        int command_fd=atoi(argv[2]),ack_fd=atoi(argv[3]);char byte;
+        CHECK(write(ack_fd,"E",1)==1 && read(command_fd,&byte,1)==1 && byte=='Q');
+        _exit(57);
+    }
     setup();
-    if (!access("/wait-scene",F_OK)) wait_processes();
+    if (!access("/cpu-clock-scene",F_OK)) cpu_clock_processes();
+    else if (!access("/wait-scene",F_OK)) wait_processes();
     else if (!access("/sqlite-scene",F_OK)) sqlite();
     else if (!access("/ordinary-read-scene",F_OK)) {
         ordinary_reads();puts("COMPOSITION END 9");

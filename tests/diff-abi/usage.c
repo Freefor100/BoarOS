@@ -156,5 +156,7 @@ void abi_usage_cases(void)
     abi_record("usage.thread-badptr",SC2(165,1,(void *)-1),-1,-1,0,0,0);
     abi_record("usage.children-badptr",SC2(165,-1,(void *)-1),-1,-1,0,0,0);
     abi_record("usage.self-null",SC2(165,0,0),-1,-1,0,0,0);
-
+#ifndef ABI_RESOURCE_ONLY
+    abi_cpu_clock_cases();
+#endif
 }

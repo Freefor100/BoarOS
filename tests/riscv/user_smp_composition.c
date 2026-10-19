@@ -47,6 +47,7 @@ static uint64_t read_wait_generation;
 static struct kernel_mm *read_revoke_mm;
 static unsigned read_copy_active;
 static uint64_t wait_tid,wait_child,wait_address,wait_claims;
+static uint64_t clock_tid,clock_pid,clock_claims,clock_active;
 
 static void check_at(int valid,unsigned line)
 {
@@ -249,6 +250,17 @@ static void run(void *unused)
         case COMPOSITION_RELEASE:release_pages();break;
         case COMPOSITION_READ_ARM:arm_read();break;
         case COMPOSITION_READ_FINISH:finish_read();break;
+        case COMPOSITION_CLOCK_ARM:
+            check(!clock_tid && !clock_active);
+            clock_pid=composition_load(&control->clock_pid);
+            clock_tid=composition_load(&control->clock_tid);
+            check(clock_pid && clock_tid);
+            break;
+        case COMPOSITION_CLOCK_FINISH:
+            check(clock_tid && !clock_active && composition_load(&control->clock_entered) &&
+                  composition_load(&control->clock_release));
+            clock_tid=clock_pid=0;
+            break;
         case COMPOSITION_WAIT_ARM:
             check(!composition_load(&wait_tid));
             wait_child=composition_load(&control->wait_child);
@@ -308,7 +320,7 @@ void riscv_user_composition_finish(void)
 {
     stopping=1;kernel_thread_join(&controller);
     check(!control && !ledger && !ledger_count && held==released && !failed_tid && !watched_tid &&
-          !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm && !composition_load(&wait_tid));
+          !clock_tid && !clock_active && !fault_race_armed && !read_tid && !read_waiter && !read_revoke_mm && !composition_load(&wait_tid));
     /* 留下超过worker单轮预算的真实TTY尾部，直到stop才允许发送。 */
     uintptr_t irq=arch_interrupt_save();
     const struct kernel_char_device *device=kernel_tty_device_lookup(0x440);
@@ -329,6 +341,8 @@ void riscv_user_composition_finish(void)
 }
 void riscv_user_composition_report(void)
 {
+    virt_uart_puts("BoarOS: COMPOSITION clock claims=");virt_uart_put_hex(clock_claims);
+    virt_uart_puts(" active=");virt_uart_put_hex(clock_active);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);
     virt_uart_puts(" active=");virt_uart_put_hex(composition_load(&wait_tid));virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION ordinary-io phases=");virt_uart_put_hex(read_phases);
@@ -360,6 +374,27 @@ void riscv_user_composition_report(void)
     virt_uart_puts(" resumed=");virt_uart_put_hex(fault_file_resumed);
     virt_uart_puts(" resolved=");virt_uart_put_hex(fault_file_resolved);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION file-fault-race-syncs=");virt_uart_put_hex(fault_file_syncs);virt_uart_puts("\n");
+}
+void __real_scheduler_group_usage_snapshot(struct kernel_task *,int,struct kernel_task_usage *);
+void __wrap_scheduler_group_usage_snapshot(struct kernel_task *target,int children,struct kernel_task_usage *usage)
+{
+    kernel_pid_t tid=0;
+    int hold=clock_tid && !kernel_task_tid(kernel_task_current(),&tid) &&
+        (uint64_t)tid==clock_tid && (uint64_t)target->tid==clock_pid &&
+        !composition_load(&control->clock_entered);
+    if (hold) {
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_pid *id=kernel_pid_find(&scheduler.identities,(kernel_pid_t)clock_pid);
+            check(id && id->members[KERNEL_PID_TGID] &&
+                id->members[KERNEL_PID_TGID]->task==target && target->storage_borrows);
+        }
+        clock_claims++;clock_active++;
+        composition_store(&control->clock_entered,1);
+        while (!composition_load(&control->clock_release)) relinquish();
+    }
+    __real_scheduler_group_usage_snapshot(target,children,usage);
+    if (hold) clock_active--;
 }
 enum kernel_uaccess_status __real_kernel_copy_to_user(struct kernel_mm *,uint64_t,const void *,size_t,size_t *);
 enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint64_t address,

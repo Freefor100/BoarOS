@@ -328,6 +328,7 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);
 void process_identity_collect(void);
+void kernel_task_identity_put(struct kernel_pid *);
 int process_group_is_orphaned(const struct kernel_task *task);
 void process_orphan_notify(struct kernel_task *task, struct kernel_task *old_parent);
 enum kernel_signal_status signal_send_kernel_group(struct kernel_task *task, uint32_t sig);
@@ -406,6 +407,7 @@ void scheduler_cpu_time_account_locked(struct kernel_cpu *, uint64_t);
 void scheduler_cpu_time_switch(struct kernel_task *, struct kernel_task *);
 void scheduler_task_cpu_time_locked(const struct kernel_task *, uint64_t *, uint64_t *);
 
+void scheduler_group_usage_snapshot(struct kernel_task *, int, struct kernel_task_usage *);
 void scheduler_usage_add(struct kernel_task_usage *, const struct kernel_task_usage *);
 void scheduler_usage_thread_locked(const struct kernel_task *, struct kernel_task_usage *);
 void scheduler_usage_snapshot(const struct kernel_task *, int, struct kernel_task_usage *);

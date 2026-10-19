@@ -357,7 +357,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c kernel/sched/accounting.c \
+	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/cpu_clock.c \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
 	kernel/sched/exec.c \
@@ -443,7 +443,7 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
-LDFLAGS += -Wl,--wrap=ns16550_stop_report
+LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot
 LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_copy_to_user,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
 endif
 ifeq ($(SMP_TEST),1)

@@ -66,6 +66,18 @@ class CompositionReports(unittest.TestCase):
                     good.replace('waits=0x4','waits=0x3'),good.replace('active=0x0','active=0x1')):
             with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_wait(bad)
 
+    def test_cpu_clock_scene_checks_real_borrows_and_release(self):
+        module=self.checker()
+        lines='\n'.join(f'COMPOSITION CASE {case} OK' for case in module.CLOCK_CASES)+'\nCOMPOSITION END 2\n'
+        self.assertEqual(module.validate_functional(lines,clock=True),list(module.CLOCK_CASES))
+        good=('COMPOSITION clock claims=0x2 active=0x0\n'
+              'COMPOSITION owners held=0x0 released=0x0 reclaimed=0x0 oom=0x0 '
+              'retirement=0x0 remote-retirement=0x0 waits=0x0 ledger=0x0 control=0x0\n')
+        module.validate_clock(good)
+        for bad in ('',good+good,good.replace('claims=0x2','claims=0x1'),
+                    good.replace('active=0x0','active=0x1'),good.replace('control=0x0','control=0x1')):
+            with self.subTest(bad=bad),self.assertRaises(RuntimeError):module.validate_clock(bad)
+
     def test_remote_fault_race_requires_two_faults_one_stale_retry_and_two_successes(self):
         module=self.checker()
         good='COMPOSITION fault-race arrivals=0x2 stale=0x1 resolved=0x2\n'

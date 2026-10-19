@@ -231,6 +231,8 @@ def run(args):
                 result = normalize(raw, expected)
                 if platform == 'boaros' and not profile.root_success(raw,42):
                     raise RuntimeError('BoarOS did not report successful full resource cleanup')
+                if platform == 'boaros':
+                    run_logged(['e2fsck','-fn',str(target)],directory / (name + '-fsck.log'))
                 (directory / (name + '.normalized')).write_text(''.join(result))
                 normalized.append(result)
             except (RuntimeError, TimeoutError, ValueError) as error:
