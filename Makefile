@@ -793,7 +793,11 @@ test-lwext4-deep-truncate-host:
 test-lwext4-batch-read-host:
 	sh tests/lwext4-batch-read-host.sh
 
-test-lwext4-cache-host:
+.PHONY: test-lwext4-exclusion-host
+test-lwext4-exclusion-host:
+	sh tests/lwext4-exclusion-host.sh
+
+test-lwext4-cache-host: test-lwext4-exclusion-host
 	sh tests/lwext4-cache-host.sh
 
 .PHONY: test-lwext4-group-host
