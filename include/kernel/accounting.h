@@ -4,6 +4,7 @@
 struct kernel_task;
 struct kernel_linux_rusage;
 struct kernel_cpu_account_scope { struct kernel_task *task; uint32_t restore_mode; };
+/* 架构trap/返回入口已关闭本地IRQ；数值发布期间不等待、不迁移。 */
 void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *, int user, int interrupt);
 void kernel_cpu_account_trap_end(struct kernel_cpu_account_scope *);
 void kernel_cpu_account_user_return(void);

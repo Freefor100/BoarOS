@@ -4,11 +4,13 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sched.h>
 
 struct kernel_scheduler scheduler;
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu *active_cpu;
 static uint64_t now;
+static _Thread_local uint64_t accounting_sample_time;
 static _Thread_local int check_policy_domain;
 static struct kernel_cpu cpus[4];
 static struct kernel_task tasks[4], idles[4];
@@ -19,11 +21,15 @@ void *sync_test_current_task(void) { return active_cpu->current; }
 static _Thread_local unsigned group_lock_calls;
 static _Thread_local unsigned cleanup_domain_entry, complete_disposal_at;
 static void complete_held_disposal(void);
+static unsigned accounting_progress_check,accounting_lock_attempt,accounting_finished,accounting_go;
 void signal_owner_cases(unsigned *lock_calls);
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
     group_lock_calls++;
+    if (__atomic_load_n(&accounting_progress_check,__ATOMIC_ACQUIRE) &&
+        active_cpu==&cpus[1] && lock==&kernel_wait_domain)
+        __atomic_store_n(&accounting_lock_attempt,1,__ATOMIC_RELEASE);
     if (complete_disposal_at && ++cleanup_domain_entry == complete_disposal_at) {
         assert(lock == &kernel_wait_domain && !active_cpu->raw_locks);
         assert(scheduler.cleanup_queue.registrations == (complete_disposal_at > 2));
@@ -35,7 +41,8 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_
 /* STOPPED state removal is covered by real guest signals; this READY-only
  * group cost model must never take that separate state transition. */
 void stopped_unlink_locked(struct kernel_task *task) { (void)task; __builtin_trap(); }
-uint64_t kernel_time_monotonic_ns(void) { return now; }
+uint64_t kernel_time_monotonic_ns(void)
+{ return accounting_sample_time=__atomic_load_n(&now,__ATOMIC_RELAXED); }
 void __real_kernel_sched_policy_charge(struct kernel_sched_policy *, uint64_t);
 void __wrap_kernel_sched_policy_charge(struct kernel_sched_policy *policy, uint64_t delta)
 {
@@ -51,7 +58,9 @@ int __wrap_kernel_sched_policy_set(struct kernel_sched_policy *policy,
     return __real_kernel_sched_policy_set(policy, kind, priority, keep);
 }
 uint32_t kernel_time_is_initialized(void) { return 1; }
-uint64_t riscv_time_read(void) { return now; }
+uint64_t riscv_time_read(void)
+{ return accounting_sample_time=__atomic_load_n(&now,__ATOMIC_RELAXED); }
+uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { (void)deadline; return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
@@ -817,7 +826,8 @@ static void cpu_time_without_ticks(void)
     kernel_rt_bandwidth_init(&cpus[0].rt_bandwidth,0);
     scheduler.cpus=&cpus[0];kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
     now=0;
-    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);scheduler_account_runtime_locked(); }
+    struct kernel_cpu_account_scope boot;
+    kernel_cpu_account_trap_begin(&boot,0,1);kernel_cpu_account_trap_end(&boot);
     now=20000000;
     uint64_t user=0,system=0,children_user=0,children_system=0;
     kernel_task_cpu_ticks(&tasks[0],&user,&system,&children_user,&children_system);
@@ -844,6 +854,55 @@ static void cpu_time_without_ticks(void)
     puts("CPU elapsed user/kernel time, nested IRQ exclusion and exact execution-owner transfer passed");
 }
 
+static void *account_on_other_cpu(void *unused)
+{
+    (void)unused;active_cpu=&cpus[1];sync_test_irq=0;
+    while (!__atomic_load_n(&accounting_go,__ATOMIC_ACQUIRE)) sched_yield();
+    for (unsigned i=0;i<10000;i++) {
+        struct kernel_cpu_account_scope call;
+        __atomic_add_fetch(&now,1,__ATOMIC_RELAXED);
+        kernel_cpu_account_trap_begin(&call,1,0);
+        kernel_cpu_account_trap_end(&call);
+        __atomic_add_fetch(&now,1,__ATOMIC_RELAXED);
+        kernel_cpu_account_user_return();
+    }
+    __atomic_store_n(&accounting_finished,1,__ATOMIC_RELEASE);
+    return 0;
+}
+static void accounting_progress_without_scheduler_lock(void)
+{
+    scheduler=(struct kernel_scheduler){.initialized=KERNEL_SCHEDULER_INITIALIZED};now=1000;
+    kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
+    for (unsigned i=0;i<2;i++) {
+        kernel_cpu_initialize(&cpus[i],i,0);active_cpu=&cpus[i];sync_test_irq=0;
+        tasks[i]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.arch.user_mode=1,.group_members=1};
+        tasks[i].group_leader=&tasks[i];cpus[i].current=&tasks[i];
+        cpus[i].scheduler_next=i ? &cpus[0] : 0;
+        kernel_cpu_account_user_return();
+    }
+    scheduler.cpus=&cpus[1];active_cpu=&cpus[0];
+    accounting_lock_attempt=accounting_finished=accounting_go=0;
+    __atomic_store_n(&accounting_progress_check,1,__ATOMIC_RELEASE);
+    pthread_t writer;int progressed;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!pthread_create(&writer,0,account_on_other_cpu,0));
+        __atomic_store_n(&accounting_go,1,__ATOMIC_RELEASE);
+        do {
+            uint64_t user,system;
+            scheduler_task_cpu_time_locked(&tasks[1],&user,&system);
+            assert(user+system==accounting_sample_time-1000);
+        } while (!__atomic_load_n(&accounting_finished,__ATOMIC_ACQUIRE) &&
+                 !__atomic_load_n(&accounting_lock_attempt,__ATOMIC_ACQUIRE));
+        progressed=__atomic_load_n(&accounting_finished,__ATOMIC_ACQUIRE);
+    }
+    assert(!pthread_join(writer,0));
+    __atomic_store_n(&accounting_progress_check,0,__ATOMIC_RELEASE);
+    assert(progressed && !accounting_lock_attempt);
+    assert(!cpus[1].preempt_depth && !cpus[1].raw_locks);
+    puts("CPU accounting: 20000 remote mode transitions and coherent snapshots while scheduler domain is held");
+}
+
 static void resource_snapshot(void)
 {
     scheduler=(struct kernel_scheduler){0};kernel_cpu_initialize(&cpus[0],0,0);
@@ -865,6 +924,7 @@ static void resource_snapshot(void)
 
 int main(void)
 {
+    accounting_progress_without_scheduler_lock();
     cpu_time_without_ticks();
     resource_snapshot();
     for (unsigned threads = 2; threads <= 4; threads += 2) {

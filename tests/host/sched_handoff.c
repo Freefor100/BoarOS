@@ -72,6 +72,7 @@ void *sync_test_current_task(void) { return cpu.current; }
 void sync_test_current_task_set(void *task) { cpu.current = task; }
 uintptr_t sync_test_stack(void) { return cpu.current->stack_high - 16; }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
+uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 uint32_t kernel_time_is_initialized(void) { return 1; }
 enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
                                                    uint64_t address, uint32_t access)
