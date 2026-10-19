@@ -205,6 +205,10 @@ void abi_main(const unsigned long *initial_stack)
         index=0;while(usage_marker[index] && argument[index]==usage_marker[index])++index;
         if(!usage_marker[index] && !argument[index] && initial_stack[0]>2)
             abi_usage_exec_probe((const char *)initial_stack[3]);
+        static const char itimer_marker[] = "itimer-exec";
+        index = 0;
+        while (itimer_marker[index] && argument[index] == itimer_marker[index]) ++index;
+        if (!itimer_marker[index] && !argument[index]) abi_itimer_exec_probe();
         static const char lock_marker[] = "lock-exec-";
         index = 0;
         while (lock_marker[index] &&
@@ -214,8 +218,12 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#if defined(ABI_USAGE_ONLY)
+#if defined(ABI_ITIMER_ONLY)
+    abi_itimer_cases();
+#elif defined(ABI_USAGE_ONLY)
     abi_usage_cases();
+#elif defined(ABI_SIGNAL_WAIT_ONLY)
+    abi_signal_wait_cases();
 #elif defined(ABI_WAITID_ONLY)
     abi_waitid_cases();
 #elif defined(ABI_SELECTED_ONLY)
@@ -236,6 +244,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_sync_cases();
 #else
 #ifndef ABI_PATH_ONLY
+    abi_itimer_cases();
     abi_usage_cases();
     abi_sigreturn_cases();
     abi_exec_boundary_cases();

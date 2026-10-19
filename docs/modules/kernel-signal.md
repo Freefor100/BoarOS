@@ -16,7 +16,7 @@
 
 `SA_RESETHAND` 在交付时只将处理动作恢复为默认值，保留已登记的 action flags 和 mask，后续 rt_sigaction 查询仍可观察这些设置。
 
-用户返回直接观察线程及组 pending 中未屏蔽的位；没有可交付信号、故障、退出请求或临时掩码恢复时立即返回，不取得锁。等待者的 wait_mask 不参与交付判断，被屏蔽的信号仍留给 sigtimedwait。需要处理事件时在调度 raw 内重取位与载荷；并发新增信号仍通过既有通知请求返回检查。
+用户返回直接观察线程及组 pending 中未屏蔽的位；没有可交付信号、故障、退出请求或临时掩码恢复时立即返回，不取得锁；完整事件交付保留独立调用边界，使其临时载荷和保存寄存器留在有事件的路径。等待者的 wait_mask 不参与交付判断，被屏蔽的信号仍留给 sigtimedwait。需要处理事件时在调度 raw 内重取位与载荷；并发新增信号仍通过既有通知请求返回检查。
 
 默认动作包括忽略、继续、停止、终止和 core 标志；core 位不意味着已经生成 core 文件。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
 
@@ -24,7 +24,7 @@ SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait
 
 ## 输入、信号帧与恢复
 
-rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR。实时信号位明确返回 ENOTSUP，因为现有位图不能保存其队列语义。
+rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR，SA_RESTART也保留这一返回。实时信号位明确返回 ENOTSUP，因为现有位图不能保存其队列语义。
 
 RISC-V 交付 frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
 
@@ -58,6 +58,8 @@ RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节fr
 控制块中，不为交付分配内存。函数与调用链预算通过 `make test-stack-usage`、
 `make test-stack-usage-la`、真实任务 canary 与退出时栈统计核对；单函数统计和
 一次回归不能证明所有深层 I/O/fault 清理链。
+
+`make test-signal-wait-abi-riscv test-signal-wait-abi-loongarch`提供等待的聚焦差分：包含空等待集合和SA_RESTART，子进程通过真实`/proc/<pid>/stat`睡眠状态握手后发信号，直接检查syscall返回，区分libc自身的EINTR重试。
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 

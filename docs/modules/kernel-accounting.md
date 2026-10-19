@@ -36,7 +36,7 @@ raw syscall对照检查返回值、字段单位、线程隔离、后代累计、
 
 ## CPU 时钟
 
-clock_gettime/getres 支持 CLOCK_PROCESS_CPUTIME_ID(2)、CLOCK_THREAD_CPUTIME_ID(3)，以及 Linux 编码的 PROF、VIRT、SCHED 进程/线程时钟。VIRT 读取用户时间，PROF/SCHED 读取用户与内核时间之和；IRQ 和睡眠按上面的执行规则排除。SCHED 分辨率为 1 ns，PROF/VIRT 为 100 Hz tick。CPU 时间睡眠与定时器另列在能力目录。
+clock_gettime/getres 支持 CLOCK_PROCESS_CPUTIME_ID(2)、CLOCK_THREAD_CPUTIME_ID(3)，以及 Linux 编码的 PROF、VIRT、SCHED 进程/线程时钟。VIRT 读取用户时间，PROF/SCHED 读取用户与内核时间之和；IRQ 和睡眠按上面的执行规则排除。SCHED 分辨率为 1 ns，PROF/VIRT 为 100 Hz tick。[VIRTUAL/PROF间隔定时器](kernel-time.md#进程-cpu-间隔定时器)复用此统计；CPU时间睡眠与POSIX定时器另列在能力目录。
 
 clockid_t 按有符号 32 位解释。PID 0 选择自身；线程时钟限定同一线程组。进程时钟接受 TGID，gettime 额外接受调用线程自己的 TID，getres 沿 Linux 的权限校验规则只接受 TGID。非法编码或消失的目标返回 EINVAL，合法目标的输出地址错误返回 EFAULT；getres 允许空输出。
 

@@ -99,5 +99,7 @@ void abi_environment_cases(void);
 void abi_waitid_cases(void);
 void abi_usage_cases(void);
 void abi_cpu_clock_cases(void);
+void abi_itimer_cases(void);
+void abi_itimer_exec_probe(void) __attribute__((noreturn));
 void abi_usage_exec_probe(const char *) __attribute__((noreturn));
 #endif

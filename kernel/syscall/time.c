@@ -53,14 +53,14 @@ enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
             decoded->value = -KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
         }
     }
-    if (which != 0) {
-        decoded->value = which == 1 || which == 2 ? -KERNEL_ENOSYS : -KERNEL_EINVAL;
+    if (which < 0 || which > 2) {
+        decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     uintptr_t irq = arch_interrupt_save();
-    if (setting) kernel_signal_timer_set(caller,itimer_ns(input.seconds,input.usec),
+    if (setting) kernel_signal_timer_set(caller,(uint32_t)which,itimer_ns(input.seconds,input.usec),
         itimer_ns(input.interval_seconds,input.interval_usec),&remaining,&interval);
-    else kernel_signal_timer_get(caller,&remaining,&interval);
+    else kernel_signal_timer_get(caller,(uint32_t)which,&remaining,&interval);
     arch_interrupt_restore(irq);
     output.seconds = (int64_t)(remaining/1000000000U);
     output.usec = (int64_t)((remaining%1000000000U)/1000U);

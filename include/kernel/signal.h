@@ -7,8 +7,9 @@
 
 struct kernel_task;
 
-void kernel_signal_timer_get(struct kernel_task *task, uint64_t *remaining, uint64_t *interval);
-void kernel_signal_timer_set(struct kernel_task *task, uint64_t value, uint64_t interval,
+void kernel_signal_timer_get(struct kernel_task *task, uint32_t which,
+    uint64_t *remaining, uint64_t *interval);
+void kernel_signal_timer_set(struct kernel_task *task, uint32_t which, uint64_t value, uint64_t interval,
     uint64_t *old_remaining, uint64_t *old_interval);
 void kernel_signal_timer_expire(void);
 void kernel_signal_timer_cancel(struct kernel_task *leader);

@@ -83,3 +83,33 @@ taskset -c 14,15 python3 -B tests/accounting/cost.py \
 LA使用`--arch loongarch`、`build/loongarch/cpu-account-cost`及`build/loongarch/sqlite3-static`，对应核为`before-la`和`kernel-la`，按其平台直接启动。
 
 原始资料保存在`build/cpu-account-opt/`：`micro-current`、`apps-current-rv`、`apps-current-la`、`apps-confirm-la`是五轮计时输入；`host-core-check`保留P/E核三轮对照、CPU类型和相同二进制标识；各目录的results.json、逐轮串口和fsck日志包含完整数值。首次15.39→22.27ms的记录位于`build/cpu-usage/matched-benchmark/`。`final-usage-*`、`final-wait-*`及`final-lifecycle`为最终正确性结果。较早的中间实现测量按原核哈希独立保留，正式结论使用本页列出的批次。检查后的运行盘删除，保留构建缓存、ELF和日志。
+
+## 未启用 CPU 间隔定时器的成本
+
+本节比较轮前main `211b101`与补齐VIRTUAL/PROF后的最终版本，全部程序均未开启间隔定时器。固定宿主P核逻辑CPU0/1、客机1CPU/1GiB、诊断关闭；两架构及全部启动串行，程序、SQLite、工作量与最终同步条件相同。每架构五轮轮换`before/after/control`顺序；`control`与`before`是字节完全相同的旧内核，用于观察同核重复运行的差值。表中均为中位数，耗时单位ms，自对照列为control相对before。
+
+新增CPU定时器沿既有timer入口检查启用索引，进出内核的CPU记账没有增加操作。状态置于task尾部，既有热字段偏移保持原值；默认RV task从2864增至2912字节，实际仍分配一张4KiB元数据页。空索引提前返回，省去无用途的时间读取。普通信号返回另拆出完整交付函数：RV无事件入口栈帧由224降至32字节，事件消费、忽略/停止及临时mask的检查顺序保持原语义。
+
+| 架构／工作量 | 轮前 | 最终版本 | 变化 | 同核自对照变化 |
+|---|---:|---:|---:|---:|
+| RV／1万次getpid | 17.725 | 17.656 | -0.39% | -0.62% |
+| RV／1000次yield | 2.735 | 2.778 | +1.61% | -0.64% |
+| LA／1万次getpid | 10.826 | 10.900 | +0.68% | +1.52% |
+| LA／1000次yield | 1.897 | 1.872 | -1.29% | +0.66% |
+
+| 架构／工作量 | 轮前 | 最终版本 | 变化 | 同核自对照变化 |
+|---|---:|---:|---:|---:|
+| RV／整数计算 | 186.188 | 185.938 | -0.13% | -0.43% |
+| RV／64字节小块读写 | 223.599 | 227.084 | +1.56% | +0.08% |
+| RV／SQLite内存SQL | 247.788 | 248.479 | +0.28% | -0.19% |
+| RV／SQLite同步事务 | 1069.728 | 1073.422 | +0.35% | +0.10% |
+| LA／整数计算 | 183.411 | 182.599 | -0.44% | +0.89% |
+| LA／64字节小块读写 | 165.075 | 171.483 | +3.88% | +0.30% |
+| LA／SQLite内存SQL | 154.552 | 156.393 | +1.19% | -0.56% |
+| LA／SQLite同步事务 | 1037.119 | 1009.474 | -2.67% | -0.30% |
+
+getpid在这组自对照幅度内：RV为−0.39%，LA为+0.68%；计算负载基本持平。仍有实际增加：RV yield约+1.6%，小块读写RV约+1.6%、LA约+3.9%，后者大于本组自对照差值。它们保留为当前剩余成本，具体占比归因尚未完成；未据“没有新增每次syscall操作”推断程序整体零开销。SQLite结果和完整同步条件也保留在上表。
+
+定时器的36项、信号等待31项在RV/LA的512MiB/1GiB与固定Linux匹配，RV另完成1/2CPU；其中两线程各不足180ms、合计超过阈值后触发，验证进程用量合计。1µs周期睡眠复现先在初版失败，再由实际执行owner资格修正；正常BoarOS盘均通过检查。机制及命令见[时间模块](../modules/kernel-time.md#进程-cpu-间隔定时器)和[信号模块](../modules/kernel-signal.md)。
+
+最终记录为`build/cpu-timer-signal/disabled-micro-rv`、`disabled-micro-la`、`disabled-apps-rv`、`disabled-apps-la`，包含各轮原始输出、二进制身份、命令及fsck；`performance-commands-final.json`记录可重建命令。中间候选按`disabled-prelayout-*`、`disabled-layout-before-fast-*`分开保存；`*-overlap`有并行诊断干扰，排除在正式表外。

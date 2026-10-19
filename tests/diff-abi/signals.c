@@ -28,6 +28,26 @@ static void record_wait(const char *name, long result,
                result > 0 ? sizeof(info->uid) : 0);
 }
 
+static void wait_parent_sleeping(long pid)
+{
+    char path[40] = "/proc/", digits[20];
+    unsigned n = 6, count = 0;
+    do { digits[count++] = '0' + pid % 10; pid /= 10; } while (pid);
+    while (count) path[n++] = digits[--count];
+    const char *tail = "/stat";
+    while (*tail) path[n++] = *tail++;
+    path[n] = 0;
+    for (unsigned attempt = 0; attempt < 100000; ++attempt) {
+        long fd = abi_open(path, 0); abi_require(fd >= 0);
+        char text[256]; long size = SC3(63, fd, text, sizeof(text));
+        abi_require(size > 0 && !SC1(57, fd));
+        for (long i = size - 3; i >= 0; --i)
+            if (text[i] == ')') { if (text[i + 2] == 'S') return; break; }
+        abi_require(!SC0(124));
+    }
+    abi_require(0);
+}
+
 void abi_signal_wait_cases(void)
 {
     const unsigned long mask = 1UL << (10 - 1);
@@ -88,6 +108,33 @@ void abi_signal_wait_cases(void)
     abi_record("signal.wait-interrupted", result, -1, -1,
                handled_signal, 0, 0);
     abi_require(SC4(260, child, &status, 0, 0) == child && status == 0);
+    /* 原LTP空集合要求EINTR；直接验证syscall，含SA_RESTART，绕开libc重试策略。
+     * 子进程观察父进程已真正睡眠后发信号，避免依赖随机延时。 */
+    action.flags = 0x10000000UL;
+    abi_require(!SC4(134, 12, &action, 0, 8));
+    handled_signal = 0;
+    const unsigned long empty = 0;
+    unsigned long fs[16];
+    int mounted_proc = SC2(43, "/proc", fs) != 0 || fs[0] != 0x9fa0;
+    int made_proc = 0;
+    if (mounted_proc) {
+        long r = SC3(34, -100, "/proc", 0755);
+        abi_require(r == 0 || r == -17);
+        made_proc = r == 0;
+        abi_require(!CALL(40, "proc", "/proc", "proc", 0, 0, 0));
+    }
+    child = CALL(220, 17, 0, 0, 0, 0, 0); abi_require(child >= 0);
+    if (!child) {
+        long parent = SC0(173);
+        wait_parent_sleeping(parent);
+        abi_exit(!SC2(129, parent, 12) ? 0 : 93);
+    }
+    result = SC4(137, &empty, &info, 0, 8);
+    abi_record("signal.wait-empty-restart", result, -1, -1, handled_signal, 0, 0);
+    abi_require(result == -4 && handled_signal == 12);
+    abi_require(SC4(260, child, &status, 0, 0) == child && status == 0);
+    if (mounted_proc) abi_require(!SC2(39, "/proc", 0));
+    if (made_proc) abi_require(!SC3(35, -100, "/proc", 0x200));
     abi_require(SC4(134, 12, 0, 0, 8) == 0);
     abi_require(SC4(135, 2, &old_mask, 0, 8) == 0);
     signal_child_cases();
