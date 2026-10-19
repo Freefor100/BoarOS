@@ -383,6 +383,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/socket.c \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
+	kernel/syscall/capability.c \
 	kernel/syscall/random.c \
 	kernel/syscall/log.c \
 	kernel/syscall/sched.c \
@@ -2585,6 +2586,10 @@ test-instruction-sync-host:
 build-accounting-cost: $(BUILD_DIR)/tests/user/cpu-account-cost-rv $(LA_BUILD)/cpu-account-cost $(SQLITE_CLI_STATIC_RV) $(LA_BUILD)/sqlite3-static
 $(BUILD_DIR)/tests/user/cpu-account-cost-rv: tests/accounting/cost.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
 $(LA_BUILD)/cpu-account-cost: tests/accounting/cost.c $(LA_SQLITE_CC)
-	REALGCC=$(LA_CC) $(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+	REALGCC=$(LA_CC) $(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-accounting-cost-host
+test-accounting-cost-host:
+	python3 -B tests/accounting/cost_test.py

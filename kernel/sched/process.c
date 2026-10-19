@@ -611,6 +611,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->group_child_info = leader->group_child_info;
         task->nofile_limit = leader->nofile_limit;
         task->stack_limit = leader->stack_limit;
+        task->core_limit = leader->core_limit;
+        task->fsize_limit = leader->fsize_limit;
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
@@ -879,6 +881,8 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->fork_no_exec = 1U;
     child->nofile_limit = parent->group_leader->nofile_limit;
     child->stack_limit = parent->group_leader->stack_limit;
+    child->core_limit = parent->group_leader->core_limit;
+    child->fsize_limit = parent->group_leader->fsize_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -2312,22 +2316,31 @@ enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_
     return task_tgid_locked(task, tgid);
 }
 
+static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint32_t resource)
+{
+    switch (resource) {
+    case KERNEL_RLIMIT_NOFILE: return &leader->nofile_limit;
+    case KERNEL_RLIMIT_STACK: return &leader->stack_limit;
+    case KERNEL_RLIMIT_CORE: return &leader->core_limit;
+    case KERNEL_RLIMIT_FSIZE: return &leader->fsize_limit;
+    default: return NULL;
+    }
+}
+
 enum kernel_task_status kernel_task_get_rlimit(
     const struct kernel_task *task, uint32_t resource,
     struct kernel_rlimit64 *limit)
 {
-    const struct kernel_task *leader;
     kernel_pid_t tgid;
 
-    if (limit == 0 || (resource != KERNEL_RLIMIT_NOFILE &&
-                       resource != KERNEL_RLIMIT_STACK))
+    if (limit == NULL)
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
         return KERNEL_TASK_STATUS_STATE;
-    leader = task->group_leader;
-    *limit = resource == KERNEL_RLIMIT_NOFILE ? leader->nofile_limit :
-             leader->stack_limit;
+    struct kernel_rlimit64 *slot = task_limit_slot(task->group_leader, resource);
+    if (!slot) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    *limit = *slot;
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2342,17 +2355,24 @@ enum kernel_task_status kernel_task_set_rlimit(
          limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
         (resource == KERNEL_RLIMIT_STACK &&
          limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
-        (resource != KERNEL_RLIMIT_NOFILE &&
-         resource != KERNEL_RLIMIT_STACK))
+        (resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
+         resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE))
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
         return KERNEL_TASK_STATUS_STATE;
-    if (resource == KERNEL_RLIMIT_NOFILE) {
-        __atomic_store_n(&task->group_leader->nofile_limit.current, limit->current, __ATOMIC_RELAXED);
-        task->group_leader->nofile_limit.maximum = limit->maximum;
-    } else task->group_leader->stack_limit = *limit;
+    struct kernel_rlimit64 *slot = task_limit_slot(task->group_leader, resource);
+    __atomic_store_n(&slot->current, limit->current, __ATOMIC_RELAXED);
+    slot->maximum = limit->maximum;
     return KERNEL_TASK_STATUS_OK;
+}
+
+uint64_t kernel_task_current_fsize_limit(void)
+{
+    struct kernel_task *task = kernel_task_current();
+    if (!kernel_task_has_user_context(task)) return KERNEL_RLIM_INFINITY;
+    /* 当前执行owner保持组身份；限额接纳只读软值，不取得整组快照锁。 */
+    return __atomic_load_n(&task->group_leader->fsize_limit.current, __ATOMIC_RELAXED);
 }
 
 uint64_t kernel_task_current_stack_limit(void)

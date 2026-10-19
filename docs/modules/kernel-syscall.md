@@ -60,7 +60,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `waitid` 编号为 95，支持 `P_ALL/P_PID/P_PGID`，`WEXITED/WSTOPPED/WCONTINUED/WNOHANG/WNOWAIT` 及 `__WNOTHREAD/__WCLONE/__WALL` 标志。`P_PIDFD` 校验负数并对其余值返回 `EBADF`，pidfd 对象待实现。waitid/wait4 在调用开始时持有 PID/进程组 identity，阻塞期间 setpgid 或数字重用不改变等待目标。事件先于用户态复制消费（WNOWAIT 保持事件未消费并保留 zombie）；退出事件支持 NULL infop，EFAULT 不回滚已消费事件。有事件时先输出 rusage，再输出 siginfo 六个定义字段；EINVAL、ECHILD、中断和无事件也写六个零字段，保留 siginfo padding 与其余字段，rusage 保持原值。siginfo 复制失败以 EFAULT 覆盖原错误。wait claim 与任务借用覆盖输出过程，归还 claim 时唤醒排队的父线程。
 - `getrusage(165)` 支持 SELF、THREAD、CHILDREN，字段、单位和退出归并见[资源记账](kernel-accounting.md)。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（事件消费与回收先行，子进程不可再次 wait）。
-- `prlimit64` 编号为 261，当前实现 `RLIMIT_NOFILE(7)` 与 `RLIMIT_STACK(3)` 的查询和设置；pid 0 指当前线程组，正 pid 指存活任务所属组。新值先从用户复制，设置和旧值快照完成后才向用户写回旧值，因此旧值地址故障仍保留已生效的设置。软值不得大于硬值；当前硬容量分别是 1024 个 fd 和 8 MiB 栈，超出拒绝。其他有效 resource 返回 `-ENOTSUP`，未知 resource 返回 `-EINVAL`，不返回虚假的成功。
+- `capget(90)` 支持Linux版本1/2/3及版本协商。当前固定root凭据的effective/permitted覆盖固定Linux的有效capability位，inheritable为零；这些位表示权限，接口是否实现仍由各syscall报告。查询接受自身、有效TID、存活组长及未回收进程zombie，已退出普通线程返回ESRCH。版本字段回写、NULL data、目标检查及部分输出fault的顺序与Linux一致；capset和可变凭据另行实现。
+- `prlimit64(261)`支持NOFILE、STACK、CORE、FSIZE。限额由线程组共享，fork复制，exec和组长替换保留；pid0选择自身，正pid选择可查询任务所属组，包含未回收zombie。新值先导入，设置及旧值快照完成后输出旧值；输出EFAULT保留已提交的新值。软值不得超过硬值，NOFILE/STACK仍受1024个fd/8MiB栈容量约束。CORE默认0/无限，FSIZE默认无限/无限；其他有效resource返回ENOTSUP，未知resource返回EINVAL。
+- CORE当前提供状态管理，core文件写出另列能力缺口；wait状态仅在实际生成转储后才含core位。FSIZE在用户文件操作接纳处执行，短写、SIGXFSZ和后台写回边界见[文件接口](kernel-files.md#描述符-writewritev-与文件修改)。
 - `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
 - RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件、字符／块节点和 FIFO 创建。
@@ -71,6 +73,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 当前 `brk`/mmap 还没有 `RLIMIT_DATA`、VMA 数量上限、内存承诺或 overcommit accounting；`MAP_NORESERVE` 因而与普通匿名映射等价。成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。
 
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。普通 clone 已覆盖独立父子进程，线程 clone 子集共享 MM、files、fs context 和信号 disposition；完整线程组与共享资源矩阵仍有限。接口语义和内部字段已经分离，内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
+
+`make test-core-limit-abi-riscv test-core-limit-abi-loongarch test-capability-abi-riscv test-capability-abi-loongarch test-fsize-abi-riscv test-fsize-abi-loongarch`提供限额与capget的聚焦Linux对照；`make test-resource-limits-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin`合并这些边界及CPU定时器，验证实际RV两核。
 
 `make test-selected-abi-riscv test-selected-abi-loongarch` 对本节的定位向量、错误顺序、时间输出、信号及嵌套 epoll 等边界运行同 ELF Linux 差分。`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
 

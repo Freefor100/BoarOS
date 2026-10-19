@@ -231,6 +231,8 @@ struct kernel_task {
     struct kernel_task *cpu_timer_next;
     struct { uint64_t expires, interval; } cpu_timers[2];
     uint32_t cpu_timer_active;
+    struct kernel_rlimit64 core_limit;
+    struct kernel_rlimit64 fsize_limit;
 } __attribute__((aligned(16)));
 
 struct kernel_scheduler {

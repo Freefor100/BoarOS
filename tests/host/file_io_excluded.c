@@ -46,6 +46,7 @@ EXCLUDED(kernel_signal_send_task)
 #endif
 EXCLUDED(kernel_signal_note_syscall_restart)
 EXCLUDED(kernel_signal_clear_syscall_restart)
+EXCLUDED(kernel_signal_send_file_limit)
 EXCLUDED(kernel_signal_note_futex_timed_restart)
 EXCLUDED(kernel_time_boot_realtime_offset)
 EXCLUDED(kernel_signal_has_pending)

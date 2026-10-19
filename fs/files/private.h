@@ -10,6 +10,8 @@
 struct kernel_pipe;
 struct kernel_record_lock;
 struct kernel_vfs_path;
+struct kernel_vfs_size_limit;
+void kernel_files_size_limit_notify(const struct kernel_vfs_size_limit *);
 struct kernel_files_pin_guard {
     struct kernel_files *files;
     struct kernel_open_file_description *description;

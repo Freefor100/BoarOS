@@ -1272,6 +1272,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
         KERNEL_RLIMIT_NOFILE_CAP, KERNEL_RLIMIT_NOFILE_CAP};
     thread->stack_limit = (struct kernel_rlimit64){
         KERNEL_RLIMIT_STACK_CAP, KERNEL_RLIMIT_STACK_CAP};
+    thread->core_limit = (struct kernel_rlimit64){0, KERNEL_RLIM_INFINITY};
+    thread->fsize_limit = (struct kernel_rlimit64){KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
     process_group_initialize(thread);
     thread->completion.tid = tid;
     thread->completion.tgid = tid;

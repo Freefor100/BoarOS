@@ -158,6 +158,8 @@ enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target,
     uint32_t sig,
     kernel_pid_t sender_tid);
+/* Linux send_sig(SIGXFSZ, current, 0): thread directed with SI_USER metadata. */
+enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *);
 
 enum kernel_signal_status kernel_signal_get_action(
     struct kernel_task *task,

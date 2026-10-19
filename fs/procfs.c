@@ -1026,6 +1026,8 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
         used += append_number_line(data + used, "VmRSS:\t",
                                    process.resident_pages *
                                       (BOAROS_PAGE_SIZE / 1024U), " kB\n");
+        /* 当前没有 swap 后端，驻留页不会换出到交换设备。 */
+        used += append_number_line(data + used, "VmSwap:\t", 0U, " kB\n");
         static const char identity[] =
             "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
         memcpy(data + used, identity, sizeof(identity) - 1U);

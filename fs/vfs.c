@@ -1225,8 +1225,21 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
     return 0;
 }
 
+int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *limit,
+    uint64_t offset, size_t *size)
+{
+    if (!limit || limit->maximum == UINT64_MAX) return 0;
+    if (offset >= limit->maximum) {
+        limit->exceeded = 1;
+        return -KERNEL_EFBIG;
+    }
+    if (*size > limit->maximum - offset) *size = (size_t)(limit->maximum - offset);
+    return 0;
+}
+
 static int vfs_write_source(struct kernel_vfs_file *file,uint64_t offset,
-    struct kernel_vfs_write_source *source,size_t size,size_t *bytes_written)
+    struct kernel_vfs_write_source *source,size_t size,
+    struct kernel_vfs_size_limit *limit,size_t *bytes_written)
 {
     struct kernel_vfs_node *node;
     size_t written = 0U;
@@ -1255,9 +1268,17 @@ static int vfs_write_source(struct kernel_vfs_file *file,uint64_t offset,
         return 0;
     }
 
+    /* 追加写的实际EOF已在写操作保护内确定；在时间戳、复制和分配前接纳范围。 */
+    result = kernel_vfs_check_write_limit(limit, offset, &size);
+    if (result) return result;
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     if (size > node->max_size - offset)
         size = (size_t)(node->max_size - offset);
+    if (source->mm) {
+        /* 首字节用户fault仍保留修改时间；限额拒绝则没有这项副作用。 */
+        result = kernel_vfs_file_modified(file, offset, 0);
+        if (result) return result;
+    }
     kernel_lock_release(&node_guard);
     result = node->memory
         ? memory_write_source(node,offset,source,size,&written)
@@ -1276,14 +1297,15 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
     if ((!buffer && size) || !bytes_written) return -KERNEL_EINVAL;
     struct kernel_vfs_write_source source={.data=buffer};
     size_t written=0;
-    int error=vfs_write_source(file,offset,&source,size,&written);
+    int error=vfs_write_source(file,offset,&source,size,NULL,&written);
     *bytes_written=written;
     return written?0:error;
 }
 
 int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
     const struct kernel_uaccess_iovec *iov,size_t iov_count,size_t count,
-    uint64_t offset,int append,struct kernel_vfs_user_write_result *result)
+    uint64_t offset,int append,struct kernel_vfs_size_limit *limit,
+    struct kernel_vfs_user_write_result *result)
 {
     if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data ||
         !mm || !iov || !result) return -KERNEL_EINVAL;
@@ -1298,7 +1320,7 @@ int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
         result->end_offset=offset;
     }
     struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0}};
-    int error=vfs_write_source(file,offset,&source,count,&result->written);
+    int error=vfs_write_source(file,offset,&source,count,limit,&result->written);
     result->end_offset=offset+result->written;
     result->access=source.access;
     result->chunks=source.chunks;
@@ -1355,13 +1377,14 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
     return 0;
 }
 
-int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size)
+int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
+    struct kernel_vfs_size_limit *limit)
 {
     if (!path || !path->references) return -KERNEL_EINVAL;
     VFS_PATH_PIN(path_pin, path);
     if ((kernel_vfs_path_mode(path) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
         return -KERNEL_EISDIR;
-    return kernel_vfs_ftruncate(&path->file, size);
+    return kernel_vfs_ftruncate_borrowing(&path->file, size, NULL, limit);
 }
 
 struct kernel_block_device *kernel_vfs_file_block_device(const struct kernel_vfs_file *file)
@@ -1372,7 +1395,8 @@ struct kernel_block_device *kernel_vfs_file_block_device(const struct kernel_vfs
 }
 
 int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
-    uint64_t offset, uint64_t length, const struct kernel_lock_guard *borrowed)
+    uint64_t offset, uint64_t length, const struct kernel_lock_guard *borrowed,
+    struct kernel_vfs_size_limit *limit)
 {
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return -KERNEL_EINVAL;
     if (!length || offset > INT64_MAX || length > INT64_MAX) return -KERNEL_EINVAL;
@@ -1393,7 +1417,12 @@ int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (node->exec_users) return -KERNEL_ETXTBSY;
     if (!node->instance->ops->fallocate) return -KERNEL_EOPNOTSUPP;
     uint64_t end = offset + length, old_size = node->size;
+    /* vfs_fallocate先拒绝文件系统上限，后端的进程限额检查才可能发信号。 */
     if (end > node->max_size) return -KERNEL_EFBIG;
+    if (!mode && end > old_size && limit && end > limit->maximum) {
+        limit->exceeded = 1;
+        return -KERNEL_EFBIG;
+    }
     struct kernel_page_cache *cache = node->instance->page_cache;
     int result = kernel_file_mapping_prepare(node);
     if (result) return result;
@@ -1429,10 +1458,11 @@ int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
 
 int kernel_vfs_fallocate(struct kernel_vfs_file *file, unsigned mode,
     uint64_t offset, uint64_t length)
-{ return kernel_vfs_fallocate_borrowing(file,mode,offset,length,NULL); }
+{ return kernel_vfs_fallocate_borrowing(file,mode,offset,length,NULL,NULL); }
 
 int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
-    uint64_t size, const struct kernel_lock_guard *borrowed)
+    uint64_t size, const struct kernel_lock_guard *borrowed,
+    struct kernel_vfs_size_limit *limit)
 {
     struct kernel_vfs_node *node;
     int result;
@@ -1459,6 +1489,10 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
         return -KERNEL_ETXTBSY;
     }
 
+    if (size > node->size && limit && size > limit->maximum) {
+        limit->exceeded = 1;
+        return -KERNEL_EFBIG;
+    }
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
@@ -1573,7 +1607,7 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
 }
 
 int kernel_vfs_ftruncate(struct kernel_vfs_file *file, uint64_t size)
-{ return kernel_vfs_ftruncate_borrowing(file, size, NULL); }
+{ return kernel_vfs_ftruncate_borrowing(file, size, NULL, NULL); }
 
 int kernel_vfs_close(struct kernel_vfs_file *file)
 {

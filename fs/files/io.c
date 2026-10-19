@@ -45,6 +45,7 @@ static int scalar_empty_range_fault(uint64_t address, uint64_t count)
 struct regular_call {
     struct kernel_open_file_description *description;
     const struct kernel_lock_guard *offset_borrow, *operation_borrow;
+    struct kernel_vfs_size_limit *size_limit;
     uint64_t length, whence;
     int64_t offset;
     int64_t *result;
@@ -74,6 +75,12 @@ static int regular_borrows_offset(struct kernel_open_file_description *descripti
 }
 static void seek_cpu0(void *);
 static void truncate_cpu0(void *);
+
+void kernel_files_size_limit_notify(const struct kernel_vfs_size_limit *limit)
+{
+    if (limit->exceeded && kernel_signal_send_file_limit(kernel_task_current()) != KERNEL_SIGNAL_STATUS_OK)
+        __builtin_trap();
+}
 
 /* 核心只报告接纳/断端；仅真实用户调用有SIGPIPE及syscall restart上下文。 */
 static enum kernel_files_status pipe_user_result(int64_t bytes,unsigned broken)
@@ -927,7 +934,8 @@ static int description_writable(
 
 static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
                                const void *buffer, size_t size,
-                               uint64_t position, uint64_t deadline, uint32_t socket_flags)
+                               uint64_t position, uint64_t deadline, uint32_t socket_flags,
+                               struct kernel_vfs_size_limit *limit, int first)
 {
     struct kernel_open_file_description *output = *output_owner;
     enum kernel_open_file_kind kind = kernel_open_file_kind(output);
@@ -958,10 +966,26 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
         }
     }
     size_t written = 0;
-    int error;
+    int error = 0;
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        /* pwrite 每批自取 rank 15；跨输入读取持目标门闩会形成交叉 inode 等待。 */
-        error = kernel_vfs_pwrite(&output->file, position, buffer, size, &written);
+        size_t total = 0;
+        /* splice会继续提交未完成的buffer；限额前缀成功后，剩余范围拒绝并产生SIGXFSZ。 */
+        while (total < size) {
+            size_t allowed = size - total;
+            error = kernel_vfs_check_write_limit(limit, position + total, &allowed);
+            if (error) break;
+            if (first && !total) {
+                error = kernel_vfs_file_modified(&output->file, position, 0);
+                if (error) break;
+            }
+            /* 跨输入读取不持目标门闩；pwrite每批自取rank15。 */
+            error = kernel_vfs_pwrite(&output->file, position + total,
+                (const unsigned char *)buffer + total, allowed, &written);
+            if (written > allowed) __builtin_trap();
+            total += written;
+            if (error || written < allowed) break;
+        }
+        return total ? (int64_t)total : error;
     } else if (output->device && output->device->write) {
         error = output->device->write(output->device_instance, kernel_task_current(), kernel_open_file_flags(output), buffer, size, &written);
     } else return -KERNEL_EINVAL;
@@ -991,6 +1015,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (second != 0) kernel_mutex_lock(&second->offset_lock, &second_guard);
     uint64_t start = explicit_offset ? (uint64_t)*position : input->offset;
     uint64_t out_start = output->offset, total = 0;
+    struct kernel_vfs_size_limit size_limit = {.maximum=kernel_task_current_fsize_limit()};
     int error = 0;
     if (count > (uint64_t)INT64_MAX || start > (uint64_t)INT64_MAX - count)
         return -KERNEL_EINVAL;
@@ -1084,12 +1109,8 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             if (direct && source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
             break;
         }
-        if (total == 0U && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
-            int modified = kernel_vfs_file_modified(&output->file, out_start, 0);
-            if (modified != 0) { error = modified; break; }
-        }
         int64_t sent = sendfile_output(output_owner, staging, available,
-                                       out_start + total, deadline, socket_flags);
+                                       out_start + total, deadline, socket_flags, &size_limit, total == 0);
         if (direct) kernel_task_io_buffer_release(&source_buffer);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
@@ -1104,6 +1125,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     }
     if (datagram_staging) kernel_heap_release(files->heap, datagram_staging);
     if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
+    kernel_files_size_limit_notify(&size_limit);
     if (total != 0U && error == -KERNEL_ERESTARTSYS)
         kernel_signal_clear_syscall_restart(kernel_task_current());
     if (total != 0U) {
@@ -1214,12 +1236,11 @@ static enum kernel_files_status regular_write_request(
     if (!count) { *linux_result=0; return KERNEL_FILES_STATUS_OK; }
     int append=(kernel_open_file_flags(description)&KERNEL_FILES_O_APPEND)!=0;
     uint64_t offset=positioned?requested_offset:kernel_open_file_offset(description);
-    /* 修改时间在复制前提交；首字节fault也保留真实的mtime/ctime更新。 */
-    int touched=kernel_vfs_file_modified(&description->file,offset,append);
-    if (touched) { *linux_result=touched; return KERNEL_FILES_STATUS_OK; }
+    struct kernel_vfs_size_limit size_limit={.maximum=kernel_task_current_fsize_limit()};
     struct kernel_vfs_user_write_result completed={0};
     int error=kernel_vfs_write_user(&description->file,mm,iov,iov_count,
-        (size_t)count,offset,append,&completed);
+        (size_t)count,offset,append,&size_limit,&completed);
+    kernel_files_size_limit_notify(&size_limit);
     if ((completed.access!=KERNEL_UACCESS_STATUS_OK &&
          completed.access!=KERNEL_UACCESS_STATUS_FAULT) || completed.written>count)
         return KERNEL_FILES_STATUS_STATE;
@@ -1933,14 +1954,15 @@ enum kernel_files_status kernel_files_lseek(
 }
 
 static enum kernel_files_status truncate_pinned(struct kernel_open_file_description *description,
-    uint64_t length,int64_t *linux_result,const struct kernel_lock_guard *borrowed)
+    uint64_t length,int64_t *linux_result,const struct kernel_lock_guard *borrowed,
+    struct kernel_vfs_size_limit *limit)
 {
     if (kernel_open_file_io_requires_cpu0(description)) {
         if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&description->file, &operation);
         struct regular_call call={.description=description,.length=length,.result=linux_result,
-            .operation_borrow=&operation};
+            .operation_borrow=&operation,.size_limit=limit};
         return regular_dispatch(&call,truncate_cpu0);
     }
 
@@ -1956,13 +1978,13 @@ static enum kernel_files_status truncate_pinned(struct kernel_open_file_descript
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    *linux_result=kernel_vfs_ftruncate_borrowing(&description->file,length,borrowed);
+    *linux_result=kernel_vfs_ftruncate_borrowing(&description->file,length,borrowed,limit);
     return KERNEL_FILES_STATUS_OK;
 }
 static void truncate_cpu0(void *argument)
 {
     struct regular_call *call=argument;
-    call->status=truncate_pinned(call->description,call->length,call->result,call->operation_borrow);
+    call->status=truncate_pinned(call->description,call->length,call->result,call->operation_borrow,call->size_limit);
 }
 enum kernel_files_status kernel_files_ftruncate(struct kernel_files *files,int64_t fd,
     uint64_t length,int64_t *linux_result)
@@ -1971,7 +1993,9 @@ enum kernel_files_status kernel_files_ftruncate(struct kernel_files *files,int64
     struct kernel_open_file_description *description=0;
     enum kernel_files_status status=kernel_files_pin_data(files,fd,&description,linux_result);
     if (status || *linux_result) return status;
-    status=truncate_pinned(description,length,linux_result,NULL);
+    struct kernel_vfs_size_limit limit={.maximum=kernel_task_current_fsize_limit()};
+    status=truncate_pinned(description,length,linux_result,NULL,&limit);
+    kernel_files_size_limit_notify(&limit);
     return release_io_description(files,&description,status);
 }
 

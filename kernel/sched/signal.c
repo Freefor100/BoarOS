@@ -1108,6 +1108,14 @@ enum kernel_signal_status kernel_signal_send_task(
     return signal_send_one(target, sig, sender_tid, 0, -6, 0);
 }
 
+enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *target)
+{
+    kernel_pid_t sender;
+    if (kernel_task_tgid(target, &sender) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    return signal_send_one(target, 25U, sender, 0, 0, NULL);
+}
+
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
 {
     struct kernel_task *task = scheduler_task_lookup(tid, KERNEL_PID_TID, 0);
