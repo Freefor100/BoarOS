@@ -1067,6 +1067,7 @@ enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, u
 
 void kernel_signal_timer_expire(void)
 {
+    if (!real_timers && !cpu_timers) return;
     uint64_t now = kernel_time_monotonic_ns();
     while (real_timers && real_timers->real_timer_deadline <= now) {
         struct kernel_task *leader = real_timers;
@@ -1424,19 +1425,21 @@ void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
 #endif
 }
 
-enum kernel_signal_select_result kernel_signal_select(
-    struct kernel_task *task,
-    struct kernel_signal_delivery *delivery)
+static inline int signal_return_work(const struct kernel_task *task)
 {
-    for (;;) {
-        /* 无事件只观察可交付的pending位，不消费载荷；不借用等待者的
-         * wait_mask规则。真正取走事件仍在下面同一调度保护内完成。 */
-        struct kernel_task *leader = signal_group_leader(task);
-        uint64_t observed = task->signal_pending | (leader ? leader->group_pending : 0);
-        if (!task->signal_fault.signal && !task->terminate_requested &&
-            !task->signal_restore_mask && !(observed & ~task->signal_blocked))
-            return KERNEL_SIGNAL_SELECT_NONE;
+    struct kernel_task *leader = signal_group_leader(task);
+    uint64_t observed = task->signal_pending | (leader ? leader->group_pending : 0);
+    return task->signal_fault.signal || task->terminate_requested ||
+           task->signal_restore_mask || (observed & ~task->signal_blocked);
+}
 
+/* 事件交付需要的临时载荷和保存寄存器留在有事件的路径，普通返回只检查位。
+ * 每次继续处理忽略/停止等事件前仍重查，真正消费保留原调度域保护。 */
+static __attribute__((noinline)) enum kernel_signal_select_result signal_select_active(
+    struct kernel_task *task, struct kernel_signal_delivery *delivery)
+{
+    do {
+        struct kernel_task *leader;
         struct kernel_signal_fault fault;
         struct kernel_signal_wait_info info = {0};
         uint64_t pending;
@@ -1529,5 +1532,13 @@ enum kernel_signal_select_result kernel_signal_select(
         default:
             signal_terminate(sig, 0);
         }
-    }
+    } while (signal_return_work(task));
+    return KERNEL_SIGNAL_SELECT_NONE;
+}
+
+enum kernel_signal_select_result kernel_signal_select(
+    struct kernel_task *task, struct kernel_signal_delivery *delivery)
+{
+    if (!signal_return_work(task)) return KERNEL_SIGNAL_SELECT_NONE;
+    return signal_select_active(task, delivery);
 }
