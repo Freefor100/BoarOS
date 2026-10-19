@@ -39,7 +39,7 @@ enum riscv_timer_status riscv_timer_handle_interrupt(
     uint64_t *elapsed_ticks);
 ```
 
-成功启动只允许一次。失败状态区分参数或频率错误、重复启动、SBI probe 失败、TIME 不可用、set_timer 失败、未启动和提前中断。输出参数只在整个处理成功后写入。
+成功启动只允许一次。失败状态区分参数或频率错误、重复启动、SBI probe 失败、TIME 不可用、set_timer 失败和未启动。输出参数只在整个处理成功后写入。
 
 ## 启动和中断不变量
 
@@ -76,6 +76,11 @@ next    = previous_deadline + elapsed * period
 
 时间先后按 64 位模运算判断，要求两次有效处理的距离小于 `2^63` 个 timebase 计数。成功计算保证新 deadline 位于采样的 `now` 之后。候选 deadline 和 elapsed 先保存在局部变量；只有 SBI set_timer 成功后才提交新状态和输出。若固件调用失败，dispatcher 输出 timer 状态并关机，不以旧状态伪造成功。
 
+改写或取消调度期限后，旧的 STIP 可能尚未撤销，handler 因而会在当前所有期限之前进入。
+[RISC-V Sstc 规范](https://docs.riscv.org/reference/isa/v20250508/priv/sstc.html)允许这种延迟撤销。
+handler 此时保留下一周期 tick 和尚未到期的调度事件，重新设置当前最早期限，返回零个 elapsed tick。
+到期事件照常清除；这种晚到的中断不会增加 CPU 时间片或推进周期相位。
+
 ## 验证与限制
 
 ```sh
@@ -88,7 +93,7 @@ make test-trap-return-riscv
 make test-riscv
 ```
 
-合成 DTB 覆盖缺失、错误位置、错误长度、零值、重复属性和失败输出不变。timer cases 覆盖全部启动状态，以及恰好到期、周期内迟到、跨周期迟到、无效输出和 `UINT64_MAX` 回绕。真实 QEMU 测试使用实际 DTB、`time` CSR、OpenSBI TIME 和 Trap Frame 返回路径，至少两次返回 `wfi` 后由测试链接包装在第三个累计 tick 关机。无根盘的正常 `kernel-rv` 持续 idle；挂载生产根盘时，timer 调度 PID 1，退出后由根生命周期主动关机。
+合成 DTB 覆盖缺失、错误位置、错误长度、零值、重复属性和失败输出不变。timer cases 覆盖全部启动状态，以及恰好到期、周期内迟到、跨周期迟到、无效输出和 `UINT64_MAX` 回绕。`test-riscv-timer-host` 在真实 handler 的 TIME/SBI/IRQ 边界控制输入，覆盖取消及替换期限后的晚到中断、零 tick、周期相位、固件失败和两 CPU 状态独立。真实 QEMU 测试使用实际 DTB、`time` CSR、OpenSBI TIME 和 Trap Frame 返回路径，至少两次返回 `wfi` 后由测试链接包装在第三个累计 tick 关机。无根盘的正常 `kernel-rv` 持续 idle；挂载生产根盘时，timer 调度 PID 1，退出后由根生命周期主动关机。
 
 调度事件期限由当前CPU记录。IRQ关闭期间，相同的已确认事件不重复调用SBI；
 新期限仅在固件成功后发布，失败保留旧值。周期IRQ仍推进周期期限、清除到期事件并

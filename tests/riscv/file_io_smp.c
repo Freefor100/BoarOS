@@ -9,6 +9,7 @@
 #include <kernel/open_file.h>
 #include <kernel/uaccess.h>
 #include <kernel/page_cache.h>
+#include <kernel/virtio_block.h>
 #include <kernel/tmpfs.h>
 #include <kernel/memory_object.h>
 #include "../../fs/vfs_internal.h"
@@ -20,6 +21,7 @@
 
 #define IO_BUFFER UINT64_C(0xe0000000)
 #define IO_ANON UINT64_C(0xe0100000)
+#define IO_COLD UINT64_C(0xe0200000)
 static struct kernel_files table;
 static struct kernel_mm *space;
 static struct kernel_open_file_description *control;
@@ -29,8 +31,21 @@ static struct kernel_vfs_mount *memory_mount;
 static struct kernel_page_cache *cache;
 static struct kernel_thread_join peer;
 static unsigned cpus,stop,progress,user_overlap;
-static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads;
+static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads,watch_cold;
 static unsigned watch_timeout,timeout_copies;
+static struct kernel_block_device *raw_device;
+static struct virtio_split_queue *raw_queue;
+static unsigned raw_read_active,raw_read_cpu,raw_submissions;
+static unsigned char raw_expected[18],raw_bytes[64];
+enum virtio_status __real_virtio_split_enqueue(struct virtio_split_queue *,struct virtio_transport *,
+    uint16_t,void *,uint32_t,uint32_t);
+enum virtio_status __wrap_virtio_split_enqueue(struct virtio_split_queue *queue,struct virtio_transport *transport,
+    uint16_t head,void *token,uint32_t minimum,uint32_t maximum)
+{
+    if (raw_read_active && queue==raw_queue && kernel_cpu_current()->logical_id==raw_read_cpu)
+        raw_submissions++;
+    return __real_virtio_split_enqueue(queue,transport,head,token,minimum,maximum);
+}
 enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
     struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
@@ -47,8 +62,8 @@ int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
     struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
-    if(cold_control && node==kernel_open_file_node(cold_control)) {
-        if(kernel_cpu_current()->logical_id)riscv_smp_fail("file-io-cold-backend-left-cpu0",-1);
+    if(watch_cold && cold_control && node==kernel_open_file_node(cold_control)) {
+        if(kernel_cpu_current()->logical_id!=copy_cpu)riscv_smp_fail("file-io-cold-backend-left-caller",-1);
         cold_loads++;
     }
     return __real_kernel_vfs_node_pread_batch(node,spans,count,workspace, completion);
@@ -132,7 +147,9 @@ static void overlap(void *unused)
     while (!__atomic_load_n(&stop,__ATOMIC_ACQUIRE)) {
         transfer(); __atomic_fetch_add(&progress,1,__ATOMIC_RELEASE);
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if (scheduler.init_task && scheduler.init_task->user_ticks &&
+        struct kernel_task_usage usage = {0};
+          if (scheduler.init_task) scheduler_usage_thread_locked(scheduler.init_task, &usage);
+          if (scheduler.init_task && usage.user_ns &&
             scheduler.init_task->state!=KERNEL_THREAD_STATE_EXITED &&
             scheduler.init_task->state!=KERNEL_THREAD_STATE_GROUP_DEAD)
             __atomic_fetch_add(&user_overlap,1,__ATOMIC_RELAXED);
@@ -141,14 +158,52 @@ static void overlap(void *unused)
 static void verify(void *unused)
 {
     (void)unused;
+    raw_read_cpu=kernel_cpu_current()->logical_id;raw_submissions=0;raw_read_active=1;
+    memset(raw_bytes,0xa5,sizeof(raw_bytes));
+    check(!kernel_block_read_at(raw_device,1128,raw_bytes,16) &&
+        !memcmp(raw_bytes,raw_expected,16),"block-read-caller-uuid");
+    struct block_read_span raw_spans[2]={{1128,raw_bytes,16,0,0},{1080,raw_bytes+32,2,0,0}};
+    check(!kernel_block_read_batch(raw_device,raw_spans,2,NULL) &&
+        raw_spans[0].status==KERNEL_BLOCK_STATUS_OK && raw_spans[0].completed==16 &&
+        raw_spans[1].status==KERNEL_BLOCK_STATUS_OK && raw_spans[1].completed==2 &&
+        !memcmp(raw_bytes,raw_expected,16) && !memcmp(raw_bytes+32,raw_expected+16,2),
+        "block-read-caller-batch-prefix");
+    raw_read_active=0;
+    for (unsigned i=0;i<sizeof(raw_bytes);i++)
+        if ((i>=16 && i<32) || i>=34) check(raw_bytes[i]==0xa5,"block-read-caller-canary");
+    check(raw_submissions && raw_read_cpu==(cpus==2?1U:0U),"block-read-caller-actual-virtio-submit");
+    virt_uart_puts("BoarOS: BLOCK caller reads hart=");virt_uart_put_hex(raw_read_cpu);
+    virt_uart_puts(" submissions=");virt_uart_put_hex(raw_submissions);virt_uart_putc('\n');
+    raw_read_active=1;raw_submissions=0;
+    struct file_read_span direct={0,raw_bytes,4,0,0};
+    {
+        KERNEL_LOCK_SCOPE(inode);
+        kernel_vfs_node_lock(kernel_open_file_node(cold_control),&inode,0);
+        check(!__real_kernel_vfs_node_pread_batch(kernel_open_file_node(cold_control),&direct,1,NULL,NULL) &&
+            !direct.error && direct.completed==4 && !memcmp(raw_bytes,"COLD",4),
+            "ext4-direct-caller-content");
+    }
+    raw_read_active=0;
+    check(raw_submissions,"ext4-direct-caller-actual-submit");
+    virt_uart_puts("BoarOS: EXT4 direct backend read hart=");virt_uart_put_hex(raw_read_cpu);
+    virt_uart_puts(" submissions=");virt_uart_put_hex(raw_submissions);virt_uart_putc('\n');
     struct kernel_mm *mm=0; struct kernel_files *files=0; current(&mm,&files);
     int64_t result; size_t copied;
     struct kernel_page_cache_concurrency_state before,after;
+    /* The hot-copy probe excludes a first fault of its file-backed output. */
+    char initialized=0;
+    check(!kernel_copy_to_user(mm,IO_BUFFER,&initialized,1,&copied) && copied==1,
+        "file-io-hot-destination-resident");
     kernel_page_cache_get_concurrency_state(cache,&before);
     copy_cpu=kernel_cpu_current()->logical_id;watch_copy=1;
     check(!kernel_files_pread(files,mm,0,IO_BUFFER,4,0,&result) && result==4,"file-io-hot-local-pread");
     watch_copy=0;
     kernel_page_cache_get_concurrency_state(cache,&after);
+    if (!local_copies[copy_cpu] || before.requests_queued!=after.requests_queued) {
+        virt_uart_puts("BoarOS: hot copies=");virt_uart_put_hex(local_copies[copy_cpu]);
+        virt_uart_puts(" requests before=");virt_uart_put_hex(before.requests_queued);
+        virt_uart_puts(" after=");virt_uart_put_hex(after.requests_queued);virt_uart_putc('\n');
+    }
     check(local_copies[copy_cpu] && before.requests_queued==after.requests_queued,"file-io-hot-no-cpu0-request");
     char zero=0;
     check(!kernel_copy_to_user(mm,IO_ANON,&zero,1,&copied) && copied==1,"file-io-cold-destination-ready");
@@ -169,17 +224,25 @@ static void verify(void *unused)
     virt_uart_puts(" copies=");virt_uart_put_hex(timeout_copies);virt_uart_putc('\n');
     kernel_page_cache_get_concurrency_state(cache,&before);
     unsigned loads=cold_loads;
-    watch_copy=1;
+    watch_copy=watch_cold=1;raw_read_active=1;raw_submissions=0;
     check(!kernel_files_pread(files,mm,3,IO_ANON,4,0,&result) && result==4,"file-io-cold-request");
-    watch_copy=0;
+    watch_copy=watch_cold=raw_read_active=0;
     kernel_page_cache_get_concurrency_state(cache,&after);
-    check(cold_loads>loads && after.requests_queued>before.requests_queued &&
-        after.executions_queued==before.executions_queued,"file-io-cold-only-backend-dispatched");
+    check(cold_loads>loads && raw_submissions && after.requests_queued==before.requests_queued &&
+        after.executions_queued==before.executions_queued,"file-io-cold-backend-kept-caller");
     char cold[4];
     check(!kernel_copy_from_user(mm,cold,IO_ANON,4,&copied) && copied==4 && !memcmp(cold,"COLD",4),"file-io-cold-content");
     virt_uart_puts("BoarOS: FILE IO local hot copy hart=");virt_uart_put_hex(copy_cpu);
     virt_uart_puts(" copies=");virt_uart_put_hex(local_copies[copy_cpu]);
-    virt_uart_puts(" cold backend CPU0 loads=");virt_uart_put_hex(cold_loads-loads);virt_uart_putc('\n');
+    virt_uart_puts(" cold caller backend loads=");virt_uart_put_hex(cold_loads-loads);virt_uart_putc('\n');
+    loads=cold_loads;watch_cold=raw_read_active=1;raw_submissions=0;
+    check(!kernel_copy_from_user(mm,raw_bytes,IO_COLD,sizeof(raw_bytes),&copied) &&
+        copied==sizeof(raw_bytes) && !memcmp(raw_bytes,"COLD",4),"file-io-cold-mmap-content");
+    watch_cold=raw_read_active=0;
+    for (unsigned i=4;i<sizeof(raw_bytes);i++) check(!raw_bytes[i],"file-io-cold-mmap-eof-zero");
+    check(cold_loads>loads && raw_submissions,"file-io-cold-mmap-caller-backend-submit");
+    virt_uart_puts("BoarOS: FILE IO cold mmap backend/submit hart=");virt_uart_put_hex(copy_cpu);
+    virt_uart_puts(" loads=");virt_uart_put_hex(cold_loads-loads);virt_uart_putc('\n');
     transfer();
     check(!kernel_files_pread(files,mm,0,IO_ANON,4,0,&result) && result==4,"file-io-cold-anonymous-buffer");
     struct kernel_mm_user_pin pin={0};
@@ -245,6 +308,14 @@ void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigne
     struct kernel_open_file_description *source,struct kernel_page_cache *page_cache)
 {
     space=mm; cpus=count; cache=page_cache; int error; size_t written;
+    raw_device=kernel_vfs_file_block_device(&source->file);check(raw_device!=NULL,"block-read-caller-device");
+    kernel_block_get_device(raw_device);
+    struct kernel_block_device *physical=raw_device->parent?raw_device->parent:raw_device;
+    struct virtio_block_device *virtio=physical->context;
+    check(&virtio->block==physical,"block-read-caller-virtio-owner");raw_queue=&virtio->queue;
+    check(!kernel_block_read_at(raw_device,1128,raw_expected,16) &&
+        !kernel_block_read_at(raw_device,1080,raw_expected+16,2) &&
+        raw_expected[16]==0x53 && raw_expected[17]==0xef,"block-read-caller-reference");
     check(!kernel_open_file_create(heap,source->file.mount,"/file-io-smp",&control,&error),"file-io-open");
     if (error) check(error==-KERNEL_ENOENT &&
         !kernel_open_file_create_mode(heap,source->file.mount,"/file-io-smp",0600,&control,&error) && !error,"file-io-create");
@@ -264,12 +335,18 @@ void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigne
     uint64_t observed=0;
     check(!kernel_vfs_file_acquire_write(&cold_control->file) &&
         !kernel_vfs_pwrite(&cold_control->file,0,"COLD",4,&written) && written==4 &&
+        !kernel_vfs_pwrite(&cold_control->file,BOAROS_PAGE_SIZE,"COLD",4,&written) && written==4 &&
         !kernel_vfs_sync(&cold_control->file,0,&observed) &&
         !kernel_page_cache_invalidate_node(cache,kernel_open_file_node(cold_control)),"file-io-cold-home");
     uint64_t address; struct kernel_open_file_description *mapping=control;
     check(!kernel_open_file_acquire(mapping) && !kernel_mm_mmap_file_private(space,&mapping,IO_BUFFER,
         BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && !mapping,"file-io-buffer-source-owner");
+    mapping=cold_control;
+    check(!kernel_open_file_acquire(mapping) && !kernel_mm_mmap_file_private(space,&mapping,IO_COLD,
+        BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ,
+        KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && !mapping,
+        "file-io-cold-mmap-source-owner");
     check(!kernel_mm_mmap_anonymous(space,IO_ANON,2*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address),"file-io-anonymous-buffer");
     check(!kernel_files_create(&table,heap),"file-io-table");
@@ -327,6 +404,7 @@ void riscv_file_io_run(void)
         !kernel_open_file_sync_range(control,0,UINT64_MAX),"file-io-durable-marker");
     /* MM来源仍持实际引用；后端末次归还由原CPU0 arena收口执行。 */
     check(!kernel_open_file_release(&control),"file-io-control-owner-return");
+    kernel_block_put(raw_device);raw_device=NULL;raw_queue=NULL;
     virt_uart_puts("BoarOS: FILE IO durability/close ticks="); virt_uart_put_hex(riscv_time_read()-started); virt_uart_putc('\n');
     virt_uart_puts("BoarOS: FILE IO native cold buffer/offset/prefix/sync/close owners passed\n");
 }

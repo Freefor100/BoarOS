@@ -3294,10 +3294,8 @@ static bool ext4_copy_pending_data(struct ext4_blockdev *bdev, ext4_fsblk_t bloc
 	bool current = ext4_bcache_test_flag(buf, BC_DIRTY) || buf->journal_pending;
     if (current && out) memcpy(out, cached.data + offset, length);
 	/* Lookup is only a borrow: it must not flush unrelated data in a read. */
-	bdev->cache_write_back++;
-	if (ext4_block_set(bdev, &cached)) __builtin_trap();
-	bdev->cache_write_back--;
-	return current;
+    if (ext4_bcache_free_read(bdev->bc,&cached)) __builtin_trap();
+    return current;
 }
 
 static int ext4_read_pending_data(struct ext4_blockdev *bdev,

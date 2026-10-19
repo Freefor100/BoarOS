@@ -39,7 +39,8 @@ static void claim_fatal(void)
     virt_uart_emergency_begin();
 }
 
-void riscv_smp_trap_fatal(const struct riscv_trap_frame *frame)
+void riscv_smp_trap_fatal(const struct riscv_trap_frame *frame,
+                          const char *source, unsigned long status)
 {
     claim_fatal();
     virt_uart_puts("BoarOS: SMP fatal hart=");
@@ -52,6 +53,10 @@ void riscv_smp_trap_fatal(const struct riscv_trap_frame *frame)
     virt_uart_put_hex(frame->sp);
     virt_uart_puts(" stval=");
     virt_uart_put_hex(frame->stval);
+    virt_uart_puts(" source=");
+    virt_uart_puts(source);
+    virt_uart_puts(" status=");
+    virt_uart_put_hex(status);
     virt_uart_putc('\n');
     sbi_shutdown();
 }

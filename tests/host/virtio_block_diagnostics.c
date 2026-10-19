@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "virtio_mmio_block_native.c"
 
@@ -14,7 +15,19 @@ static unsigned allocations;
 static unsigned releases;
 static uint64_t clock_value;
 static uint64_t complete_at;
-static struct kernel_io_context caller;
+static _Thread_local struct kernel_io_context caller;
+static _Thread_local struct kernel_cpu block_cpu = {.initialized=KERNEL_CPU_INITIALIZED};
+void *allocator_host_cpu_get(void) { return &block_cpu; }
+static unsigned probe_wake, wake_paused, wake_release, acquire_attempted, waiter_finished, early_finish;
+static struct kernel_raw_lock *notification_lock;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    if (block_cpu.logical_id==1 && __atomic_load_n(&wake_paused,__ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&wake_release,__ATOMIC_ACQUIRE) && lock==notification_lock)
+        __atomic_store_n(&acquire_attempted,1,__ATOMIC_RELEASE);
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 static char diagnostic[8192];
 static size_t diagnostic_length;
 static enum fault_kind {
@@ -38,6 +51,17 @@ static void (*before_take)(void);
 static struct kernel_wait_queue *late_wait_queue;
 static struct kernel_wait_node late_waiter;
 static unsigned late_wakes;
+static enum kernel_block_status publish_for_test(struct virtio_block_device *device,
+    struct block_request *request,uint32_t type,uint64_t sector,uint64_t address,uint32_t size,int bounce)
+{
+    KERNEL_RAW_SCOPE(guard,&device->metadata);
+    return publish_request_locked(device,request,type,sector,address,size,bounce);
+}
+static void collect_for_test(struct virtio_block_device *device)
+{
+    KERNEL_RAW_SCOPE(guard,&device->metadata);
+    collect_used_locked(device);
+}
 enum virtio_status __real_virtio_split_take(struct virtio_split_queue *, struct virtio_completion *);
 enum virtio_status __wrap_virtio_split_take(struct virtio_split_queue *queue, struct virtio_completion *completion)
 {
@@ -283,8 +307,6 @@ int riscv_plic_register(uint32_t source, void (*handler)(void *), void *owner)
 { (void)source; (void)handler; (void)owner; return 1; }
 void riscv_plic_unregister(uint32_t source, void *owner)
 { (void)source; (void)owner; }
-void kernel_task_account_read(uint64_t bytes) { (void)bytes; }
-void kernel_task_account_write(uint64_t bytes) { (void)bytes; }
 static struct kernel_wait_queue *watched_queues[3];
 static unsigned watched_wakes[3];
 enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *queue,
@@ -298,6 +320,12 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 { memset(queue, 0, sizeof(*queue)); }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 {
+    if (probe_wake && block_cpu.logical_id==0 && queue==late_wait_queue) {
+        probe_wake=0;
+        notification_lock=block_cpu.raw_locks ? block_cpu.raw_locks->lock : NULL;
+        __atomic_store_n(&wake_paused,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&wake_release,__ATOMIC_ACQUIRE)) {}
+    }
     int watched = 0;
     for (unsigned i = 0; i < 3; i++) if (queue == watched_queues[i]) {
         watched_wakes[i]++; watched = 1;
@@ -313,6 +341,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_q
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 {
     (void)queue; (void)deadline; (void)interruptible;
+    assert(!block_cpu.raw_locks && !block_cpu.preempt_depth);
     park_calls++;
     if (wait_irq_device) {
         if (release_batch_slot) {
@@ -591,7 +620,7 @@ static void queue_reuse_case(unsigned version)
         for (unsigned i = 0; i < 8; i++) {
             requests[i] = reserve_request(&device);
             assert(requests[i]);
-            assert(publish_request(&device, requests[i], VIRTIO_BLOCK_REQUEST_IN,
+            assert(publish_for_test(&device, requests[i], VIRTIO_BLOCK_REQUEST_IN,
                 i, UINT64_C(0x82000000) + i * 512, 512, 0) == KERNEL_BLOCK_STATUS_OK);
         }
         assert((uint16_t)(available[1] - popped) == 8);
@@ -936,7 +965,7 @@ static void large_phase_case(unsigned version)
     assert(kernel_block_write_batch(&device.block,&public_span,1)==KERNEL_BLOCK_STATUS_OK);
     assert(device.statistics.requests==8 && sg_max_bytes==128*1024);
     unsigned before=ack_calls;
-    for (unsigned i=0;i<32;i++) collect_used(&device);
+    for (unsigned i=0;i<32;i++) collect_for_test(&device);
     assert(ack_calls==before);
     block_irq(&device);
     assert(ack_calls==before+1); /* A real IRQ is acknowledged even with no used entry. */
@@ -961,7 +990,7 @@ static void late_harvest_case(unsigned version)
     for (unsigned i=0;i<8;i++) {
         requests[i]=reserve_request(&device); assert(requests[i]);
         requests[i]->completion=&done;
-        assert(publish_request(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
+        assert(publish_for_test(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
             UINT64_C(0x82000000)+i*512,512,0)==KERNEL_BLOCK_STATUS_OK);
     }
     late_waiter=(struct kernel_wait_node){.queue=&done};
@@ -996,7 +1025,7 @@ static void notification_conditions_case(unsigned version)
     struct block_request *requests[8];
     for (unsigned i=0;i<8;i++) {
         assert(begin_call(&device,0)); requests[i]=reserve_request(&device); assert(requests[i]);
-        assert(!publish_request(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
+        assert(!publish_for_test(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
             UINT64_C(0x82000000)+i*512,512,0));
     }
     watched_queues[0]=&device.slots; watched_queues[1]=&device.idle; watched_queues[2]=&device.descriptors;
@@ -1004,7 +1033,7 @@ static void notification_conditions_case(unsigned version)
     memset(watched_wakes,0,sizeof(watched_wakes));
     for (unsigned i=0;i<3;i++) watched_queues[i]->head=watched_queues[i]->tail=&sentinels[i];
     device.barrier_waiters=1;
-    sg_device_step(); collect_used(&device);
+    sg_device_step(); collect_for_test(&device);
     printf("block notification harvest: slots=%u idle=%u descriptors=%u\n",
         watched_wakes[0],watched_wakes[1],watched_wakes[2]);
     assert(!watched_wakes[0] && !watched_wakes[1] && watched_wakes[2]==1);
@@ -1124,8 +1153,8 @@ static void fragmented_descriptors_case(unsigned version)
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     assert(begin_call(&device, 0));
     struct block_request *first = reserve_request(&device), *held = reserve_request(&device);
-    assert(publish_request(&device, first, 0, 0, UINT64_C(0x82000200), 512, 0) == KERNEL_BLOCK_STATUS_OK);
-    assert(publish_request(&device, held, 0, 0, UINT64_C(0x82000400), 512, 0) == KERNEL_BLOCK_STATUS_OK);
+    assert(publish_for_test(&device, first, 0, 0, UINT64_C(0x82000200), 512, 0) == KERNEL_BLOCK_STATUS_OK);
+    assert(publish_for_test(&device, held, 0, 0, UINT64_C(0x82000400), 512, 0) == KERNEL_BLOCK_STATUS_OK);
     unsigned first_head = device.queue.available->ring[0], held_head = device.queue.available->ring[1];
     struct virtio_descriptor saved[3]; unsigned at = held_head;
     for (unsigned i = 0; i < 3; i++) { saved[i] = device.queue.descriptors[at]; at = saved[i].next; }
@@ -1200,8 +1229,63 @@ static void short_read_case(unsigned version, unsigned mode, unsigned length_kin
     printf("PASS read completion transport=%u mode=%u bytes=%u used=%u\n", version, mode, bytes, length);
 }
 
+static void *paused_irq_actor(void *argument)
+{
+    block_cpu.logical_id=0;
+    block_irq(argument);
+    return NULL;
+}
+static void *release_notification_actor(void *unused)
+{
+    (void)unused;
+    while (!__atomic_load_n(&acquire_attempted,__ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&waiter_finished,__ATOMIC_ACQUIRE)) {}
+    early_finish=__atomic_load_n(&waiter_finished,__ATOMIC_ACQUIRE);
+    __atomic_store_n(&wake_release,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void cross_cpu_notification_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device={0};
+    struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976;registers[1]=version;registers[2]=2;
+    registers[0x10/4]=1|(1<<9);registers[0x34/4]=32;registers[0x100/4]=128;
+    fault=SG_BATCH;batch_popped=batch_pushed=0;clock_value=0;sg_fail_sector=UINT32_MAX;
+    diagnostic_length=notifications=0;sg_used_length=UINT32_MAX;
+    for (unsigned i=0;i<1024;i++) sg_disk[i]=(unsigned char)(i*7+i/512+3);
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==0);
+    device.irq_source=1;block_cpu.logical_id=1;
+    assert(begin_call(&device,0));
+    struct block_request *request=reserve_request(&device);assert(request);
+    assert(!publish_for_test(&device,request,0,0,UINT64_C(0x82000000),512,0));
+    late_wait_queue=&request->done;
+    late_waiter=(struct kernel_wait_node){.queue=late_wait_queue};
+    late_wait_queue->head=late_wait_queue->tail=&late_waiter;late_wakes=0;
+    wake_paused=wake_release=acquire_attempted=waiter_finished=early_finish=0;probe_wake=1;
+    pthread_t irq,observer;
+    assert(!pthread_create(&observer,NULL,release_notification_actor,NULL));
+    assert(!pthread_create(&irq,NULL,paused_irq_actor,&device));
+    while (!__atomic_load_n(&wake_paused,__ATOMIC_ACQUIRE)) {}
+    assert(wait_request(&device,request)==KERNEL_BLOCK_STATUS_OK);
+    __atomic_store_n(&waiter_finished,1,__ATOMIC_RELEASE);
+    assert(!publish_for_test(&device,request,0,1,UINT64_C(0x82000200),512,0));
+    assert(!pthread_join(observer,NULL) && !pthread_join(irq,NULL));
+    assert(!early_finish && "CPU1 reused a completed request while CPU0 still borrowed its notification");
+    assert(wait_request(&device,request)==KERNEL_BLOCK_STATUS_OK);
+    release_request(&device,request);end_call(&device,0);
+    assert(!memcmp(batch_output[0],sg_disk,1024) && late_wakes==1);
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !request->state);
+    late_wait_queue=NULL;device.irq_source=0;block_cpu.logical_id=0;
+    assert(destroy_model(&device)==0 && allocations==releases);
+    printf("PASS cross-CPU completion transport=%u: notification ends before request reuse; payload and owners returned\n",version);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc==2 && !strcmp(argv[1],"cross-cpu")) {
+        cross_cpu_notification_case(1);cross_cpu_notification_case(2);return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "short-read")) {
         short_read_case(2, 0, 1);
         for (unsigned version = 1; version <= 2; version++)
@@ -1277,6 +1361,7 @@ int main(int argc, char **argv)
         for (unsigned mode = 0; mode < 3; mode++)
             for (unsigned length = 0; length < 5; length++) short_read_case(version, mode, length);
         late_harvest_case(version); notification_conditions_case(version);
+        cross_cpu_notification_case(version);
         large_phase_case(version);
         write_phase_case(version,0);
         write_phase_case(version,1);

@@ -86,9 +86,15 @@ struct kernel_vfs_rename_result {
 
 struct kernel_open_file_description;
 
+/* 冷装入按后端的状态所有权选择执行位置，元数据写沿原路径。 */
+enum kernel_vfs_read_execution {
+    KERNEL_VFS_READ_CPU0 = 0,
+    KERNEL_VFS_READ_CALLER,
+};
 /* 回调返回负 errno；close_node 只释放私有 handle，不等待设备。
  * 后端分配的 node 必须位于同一堆对象首部，发布后由通用层回收。 */
 struct kernel_vfs_backend {
+    enum kernel_vfs_read_execution read_execution;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);

@@ -449,7 +449,7 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
-LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot
+LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot,--wrap=virtio_split_enqueue
 LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_copy_to_user,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
 endif
 ifeq ($(SMP_TEST),1)
@@ -471,6 +471,7 @@ endif
 ifeq ($(FILE_IO_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/file_io_smp.o
 LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
+LDFLAGS += -Wl,--wrap=virtio_split_enqueue
 endif
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
@@ -1600,8 +1601,12 @@ test-stack-guard-riscv: $(STACK_GUARD_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) STACK_GUARD_TEST_KERNEL_RV=$< \
 		./tests/stack-guard-riscv.sh
 
+.PHONY: test-riscv-timer-host
+test-riscv-timer-host:
+	python3 -B tests/host/riscv_timer_events.py
+
 test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
-		$(TIMER_BOOT_TEST_KERNEL_RV)
+		$(TIMER_BOOT_TEST_KERNEL_RV) test-riscv-timer-host
 	QEMU_RISCV64=$(QEMU_RISCV64) TIMER_CASES_TEST_KERNEL_RV=$< \
 		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
 		./tests/timer-riscv.sh

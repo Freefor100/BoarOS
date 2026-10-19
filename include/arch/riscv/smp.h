@@ -22,7 +22,8 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size,
 struct kernel_cpu *riscv_smp_cpu(unsigned logical);
 void riscv_smp_fail(const char *stage, long error) __attribute__((noreturn));
 struct riscv_trap_frame;
-void riscv_smp_trap_fatal(const struct riscv_trap_frame *) __attribute__((noreturn));
+void riscv_smp_trap_fatal(const struct riscv_trap_frame *, const char *,
+                          unsigned long) __attribute__((noreturn));
 int riscv_smp_output_allowed(void);
 #endif
 #endif

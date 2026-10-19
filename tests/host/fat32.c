@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -17,9 +18,16 @@ void mm_test_attach(unsigned);
 static unsigned char pool[32 * 1024 * 1024] __attribute__((aligned(16384)));
 static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
-static int fd, write_fail; static unsigned writes;
+static int fd, write_fail; static unsigned writes,watch_remote_read,remote_reads;
 static enum kernel_block_status rd(void *ctx, uint64_t at, void *p, size_t n)
-{ (void)ctx; return pread(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO; }
+{
+    (void)ctx;
+    if (watch_remote_read) {
+        assert(!kernel_cpu_current()->logical_id);
+        __atomic_fetch_add(&remote_reads,1,__ATOMIC_RELAXED);
+    }
+    return pread(fd,p,n,at)==(ssize_t)n?0:KERNEL_BLOCK_STATUS_IO;
+}
 static enum kernel_block_status wr(void *ctx, uint64_t at, const void *p, size_t n)
 { (void)ctx; writes++; return !write_fail && pwrite(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO; }
 static enum kernel_block_status fl(void *ctx)
@@ -36,6 +44,15 @@ static void contents(struct kernel_vfs_file *file, uint64_t at, const void *expe
     unsigned char actual[32768]; size_t done;
     assert(n <= sizeof(actual));
     assert(!kernel_vfs_pread(file, at, actual, n, &done) && done == n && !memcmp(actual, expected, n));
+}
+static void *remote_contents(void *argument)
+{
+    mm_test_attach(1);kernel_cpu_current()->logical_id=1;
+    assert(kernel_cpu_current()->logical_id==1);
+    unsigned char zeros[17001]={0};
+    contents(argument,0,zeros,sizeof(zeros));
+    assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
+    return NULL;
 }
 static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
 {
@@ -85,7 +102,7 @@ static void metadata(struct kernel_vfs_mount *mount,struct kernel_heap *heap)
     struct kernel_vfs_timespec old_time[2]={{946684800,0},{946684800,0}};
     assert(!kernel_vfs_file_set_times(&file,old_time)); sync_file(&file);
     unsigned before_writes=writes;
-    mm_test_attach(1);
+    mm_test_attach(1);kernel_cpu_current()->logical_id=1;
     assert(!kernel_vfs_file_modified(&file,0,0)); kernel_vfs_file_accessed(&file);
     assert(writes==before_writes);
     mm_test_attach(0);
@@ -219,6 +236,18 @@ int main(int argc, char **argv)
     assert(!kernel_page_cache_init(&read_cache,&heap,&pages));
     assert(!kernel_vfs_mount_fat32(&mount,&block,&heap,&read_cache,1));
     assert(!kernel_vfs_open(&mount,"/REUSED.BIN",&file));
+    assert(!kernel_page_cache_start_worker(&read_cache));
+    struct kernel_page_cache_concurrency_state before_read,after_read;
+    kernel_page_cache_get_concurrency_state(&read_cache,&before_read);
+    watch_remote_read=1;remote_reads=0;
+    pthread_t remote;
+    assert(!pthread_create(&remote,NULL,remote_contents,&file) && !pthread_join(remote,NULL));
+    watch_remote_read=0;
+    kernel_page_cache_get_concurrency_state(&read_cache,&after_read);
+    assert(remote_reads && after_read.requests_queued>before_read.requests_queued &&
+        after_read.requests_queued==after_read.requests_completed);
+    kernel_page_cache_stop_worker(&read_cache);
+    puts("PASS FAT caller CPU1 retains CPU0 backend policy: actual device reads, content and owners");
     contents(&file,0,zero,17001);
     assert(kernel_vfs_pwrite(&file,0,data,1,&done)==-KERNEL_EROFS && !done);
     assert(!kernel_vfs_close(&file));

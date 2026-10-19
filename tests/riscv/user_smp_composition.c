@@ -4,6 +4,7 @@
 #include <arch/context.h>
 #include <arch/riscv/context.h>
 #include <kernel/cpu.h>
+#include <kernel/virtio_split_queue.h>
 #include <kernel/irq.h>
 #include <kernel/memory_object.h>
 #include <kernel/mm.h>
@@ -40,7 +41,7 @@ static unsigned boot_banner_waiting, boot_user_output;
 static unsigned shutdown_tail_held;
 static uint64_t read_tid,read_address,read_size,read_flags,read_hart;
 static uint64_t read_copies[2],read_phases,read_local_phases,write_phases,write_pins[2],write_total_pins[2];
-static uint64_t read_backend_calls,read_backend_bytes,read_batches,read_user_faults;
+static uint64_t read_backend_calls,read_backend_bytes,read_batches,read_user_faults,read_submissions;
 static uint64_t read_close_phases,read_seek_phases,read_fork_phases,read_total_copies[2];
 static struct kernel_task *read_waiter;
 static uint64_t read_wait_generation;
@@ -128,7 +129,7 @@ static void arm_read(void)
     read_hart=composition_load(&control->read_hart);
     check(read_tid && read_address && read_size && read_hart<2);
     read_copies[0]=read_copies[1]=write_pins[0]=write_pins[1]=0;
-    read_backend_calls=read_backend_bytes=0;read_waiter=NULL;
+    read_backend_calls=read_backend_bytes=read_submissions=0;read_waiter=NULL;
     if(read_flags&COMPOSITION_READ_COLD) {
         struct kernel_vfs_file source={0};
         check(!kernel_vfs_open(&root->mount,"/ordinary-read-source",&source));
@@ -144,7 +145,7 @@ static void finish_read(void)
         read_local_phases++;
     }
     if(read_flags&COMPOSITION_READ_BATCH) {
-        check(read_backend_calls==1 && read_backend_bytes==65536);
+        check(read_backend_calls==1 && read_backend_bytes==65536 && read_submissions);
         read_batches++;
     }
     if(read_flags&COMPOSITION_WRITE_LOCAL) {
@@ -490,14 +491,26 @@ int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_descrip
     }
     return status;
 }
+enum virtio_status __real_virtio_split_enqueue(struct virtio_split_queue *,struct virtio_transport *,
+    uint16_t,void *,uint32_t,uint32_t);
+enum virtio_status __wrap_virtio_split_enqueue(struct virtio_split_queue *queue,struct virtio_transport *transport,
+    uint16_t head,void *token,uint32_t minimum,uint32_t maximum)
+{
+    if (reading_task() && (read_flags&COMPOSITION_READ_BATCH)) {
+        check(kernel_cpu_current()->logical_id==read_hart);
+        read_submissions++;
+    }
+    return __real_virtio_split_enqueue(queue,transport,head,token,minimum,maximum);
+}
 int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *, const struct file_read_completion *);
 int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,struct file_read_span *spans,size_t count,
     struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
     kernel_pid_t tid=0;
-    struct kernel_task *owner=kernel_io_context_current()->account_task;
+    struct kernel_task *owner=kernel_task_current();
+    if (!kernel_task_has_user_context(owner)) owner=kernel_io_context_current()->account_task;
     if(owner && read_tid && !kernel_task_tid(owner,&tid) && (uint64_t)tid==read_tid) {
-        check(!kernel_cpu_current()->logical_id);
+        check(kernel_cpu_current()->logical_id==read_hart && owner==kernel_task_current());
         read_backend_calls++;
         for(size_t i=0;i<count;i++)read_backend_bytes+=spans[i].size;
     }

@@ -5,10 +5,10 @@ work=$(mktemp -d)
 trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work"; else echo "test artifacts retained: $work" >&2; fi' EXIT
 trap 'exit 1' HUP INT TERM
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-unused-but-set-variable \
-    -Wno-stringop-truncation -DCONFIG_USE_DEFAULT_CFG=1 ${JOURNAL_TEST_CFLAGS:-} \
+    -Wno-stringop-truncation -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${JOURNAL_TEST_CFLAGS:-} \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_ordered.c" \
-    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
 truncate -s 32M "$work/base.img"
 mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"

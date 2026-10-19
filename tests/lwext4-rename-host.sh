@@ -5,11 +5,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 ${RENAME_TEST_CFLAGS:-} \
+    -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 ${RENAME_TEST_CFLAGS:-} \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_rename.c" \
-    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
 check_fs() {
     e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
 }

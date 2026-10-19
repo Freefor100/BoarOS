@@ -1,12 +1,12 @@
 # RV 两核执行与服务边界
 
-默认构建和 LA 仍为单 CPU。`kernel-rv-smp` 提供两核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户两核执行。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，实际写回继续由既有 CPU0 worker 完成。两种配置中的文件后端、命名空间、设备和网络业务按下述边界串行。
+默认构建和 LA 仍为单 CPU。`kernel-rv-smp` 提供两核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户两核执行。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，实际写回继续由既有 CPU0 worker 完成。两种配置中的ext4 读可在两核执行，元数据写、命名空间、设备配置和网络业务按下述边界推进。
 
 ## 真实用户态与CPU0业务交接
 
 `SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
 
-通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，只有实际后端工作进入既有缓存 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。命名空间、进程生命周期、设备、网络及尚未并行化的业务在操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
+通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析和块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。命名空间、进程生命周期、设备、网络及尚未并行化的业务在操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
 `kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。返回通知字区分CPU0业务与本地信号，两类消费者分别取走自己的位，业务范围的进入不提前消费通知。普通信号在执行CPU内完成共享状态选择、构帧与sigreturn；组停止/退出及REAL定时器重装进入其CPU0范围。共享action快照、mask和并发通知协议见[信号模块](kernel-signal.md#smp上的状态和执行位置)。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
 
@@ -16,7 +16,7 @@ FIFO/RR用户任务进入CPU0服务时，在来源CPU保留逻辑实时资格；
 
 服务内 wait finish 用真实在途借用及两线程握手核对归还；显式 yield 在调用 CPU 走统一调度入口。普通任务因服务或 affinity 迁移时排到目标核队尾，不能反复插到已就绪的后端、checkpoint 或缓存 worker 前面；实时抢占、节流和来源资格保留原有顺序。服务期间耗尽 RR 片的状态在恢复用户资格时消费，不把非阻塞业务当成 yield。
 
-所有 MM 共用 operation gate 与 MM raw 发布协议，不保留 `remote_user` 或并发模式字段。匿名、COW 和 ELF 缺页在发起 CPU 准备和提交；文件缺页借用真实来源，冷页的后端读取交 CPU0 worker，恢复后重查 VMA/PTE。撤映射、降权、fork、截断和缓存撤写均在失效确认后归还退休页。驻留匿名复制保持四次实际锁获取，文件来源不使无关匿名 pin 增加 gate。
+所有 MM 共用 operation gate 与 MM raw 发布协议，不保留 `remote_user` 或并发模式字段。匿名、COW 和 ELF 缺页在发起 CPU 准备和提交；文件缺页借用真实来源，ext4 冷页由发起 CPU 装入，恢复后重查 VMA/PTE。撤映射、降权、fork、截断和缓存撤写均在失效确认后归还退休页。驻留匿名复制保持四次实际锁获取，文件来源不使无关匿名 pin 增加 gate。
 
 ```sh
 make kernel-rv-user-smp
@@ -36,7 +36,7 @@ make run-user-smp-riscv
 
 `tests/program-inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。`native-extended.yml`配置相同四格的独立定时job，托管job尚未运行不能由本地结果代替。
 
-`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF 有 21 个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。加压前准备未映射的干净observer文件页，回收统计覆盖账本分配和显式回收，并等待后台轮次发布实际回收数；不要求同步调用抢在后台worker之前回收候选。普通 I/O 控制器在真实 ecall 的复制、来源 pin、匿名 fault 与后端批次处观察 CPU。十种读场景共复制 65,666 字节，双核全部留在发起 CPU1，单核全部在 CPU0；其中冷 64 KiB 请求仅产生一个后端批次，后端必须在 CPU0。三种普通写场景的四次来源 pin 同样留在发起 CPU。共享 offset、竞争 seek、close 复用、fork 排空写 pin、精确 EFAULT 前缀和最终 fsync 继续核对。无观察钩子的正式内核运行九项普通 I/O 场景，测试控制器与 link wrap 不进入发布构建。
+`test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF 有 21 个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。加压前准备未映射的干净observer文件页，回收统计覆盖账本分配和显式回收，并等待后台轮次发布实际回收数；不要求同步调用抢在后台worker之前回收候选。普通 I/O 控制器在真实 ecall 的复制、来源 pin、匿名 fault 与后端批次处观察 CPU。十种读场景共复制 65,666 字节，双核全部留在发起 CPU1，单核全部在 CPU0；其中冷 64 KiB 请求只产生一个后端批次，后端和实际 VirtIO 提交均在发起 CPU。三种普通写场景的四次来源 pin 同样留在发起 CPU。共享 offset、竞争 seek、close 复用、fork 排空写 pin、精确 EFAULT 前缀和最终 fsync 继续核对。无观察钩子的正式内核运行九项普通 I/O 场景，测试控制器与 link wrap 不进入发布构建。
 
 同一共享匿名页的双线程首缺页被加入确定性交错：双CPU时两个真实用户任务固定到不同逻辑CPU写同一未驻留页，首个 resolver 在候选提交前等待另一实际任务，直到第二个resolver已提交可写PTE后再继续；单CPU退化时两个任务同绑CPU0。旧路径此时返回`ADDRESS_SPACE`并fatal；固定Linux `mm/memory.c`的`fix_spurious_fault()`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）也将并发页表更新后的fault作为spurious fault处理。现在在所有 MM 的VMA权限仍允许且当前PTE已满足请求时成功返回，不重复发送页级RFENCE：PTE提交者完成其同步，迟到fault返回用户态前的MM激活完成本地刷新；VMA拒绝或PTE权限不足仍走原拒绝/COW流程。测试要求两次真实fault、一次stale retry、两次成功及一次页级同步。该行为见[MM硬件缺页解析](kernel-mm.md#硬件用户缺页解析)。
 
@@ -56,7 +56,7 @@ make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bi
 
 普通用户的驻留复制复用任务已持有的 MM/files 句柄、实际 OFD 引用与 MM raw pin 协议，不为每次复制建立第二组业务owner。来源退休节点保留原有OFD/ELF引用，放开MM gate并排空登记回调后才执行真实关闭。
 
-COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4、设备、协议和命名空间仍在各自 CPU0 边界执行；分配器通知和同步干净回收可就地执行。LA 仍为单核。
+COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4 元数据写、日志、设备配置、协议和命名空间仍在各自 CPU0 边界执行；分配器通知和同步干净回收可就地执行。LA 仍为单核。
 
 ## 启动与本地状态
 
@@ -195,13 +195,13 @@ make test-mm-file-smp-userland-riscv INIT_CONFIG=config/init.json
 ## 受控 ext4 映射域
 
 `build/riscv-mm-disk-smp-test/`使用真实第二ext4盘、arena缓存和原系统堆的后端metadata，
-根盘与私有挂载同时存在。CPU1或受控CPU0的冷缺页由普通CPU0缓存worker执行，
+根盘与私有挂载同时存在。CPU1 或受控 CPU0 的 ext4 冷缺页由发起任务装入并提交设备读取，
 命中直接取得物理引用；控制者保留OFD/挂载/缓存至任务、MM、别名、pin及请求结束。
-范围同步、文件读写/截断和后端最终释放仍由普通CPU0任务负责，未开放一般FD业务。
+范围同步的交接、元数据写、截断和后端最终释放继续由普通 CPU0 任务负责；普通 FD 读取沿共同调用者路径，详见文件 I/O 执行位置。
 
 2026-10-13本地MTTCG验证覆盖2/1CPU、512MiB/1GiB各一次新盘和同盘独立重启，
 共8次正常启动；检查冷读、跨根共享、私有COW、EOF/增长、protected fork、pin与失效回收。
-实际SUM写证明撤W/RFENCE后不能继续使用旧翻译；持写pin阻止快照完成而无关页继续。
+当时的实际 SUM 写证明撤 W/RFENCE 后不能继续使用旧翻译；持写pin阻止快照完成而无关页继续。
 既有CPU0 worker先延期忙快照、继续冷读，再实际写入下一代脏数据；后端直接读回及
 独立重启读回各自验证，不能由worker计数替代内容。两次RFENCE错误启动核对
 页/表/来源/cache/mount owner保留，不记自然退出。原静态/pthread ELF另在双RAM
@@ -234,17 +234,17 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 产物默认位于`build/riscv-files-smp-test/`；`FILES_SMP_BUILD`可为独立本地/CI构建选择目录，runner使用Make传入路径。2026-10-13本地QEMU11.1.2及Ubuntu24.04/QEMU8.2.2各完成2/1CPU、512MiB/1GiB的新盘与独立重启8次正常启动，并完成双RAM的原静态/pthread组合。两核使用实际MTTCG线程，无icount；记录各自固件/内核/工具身份，不能由本地容器结果推定远程CI已运行。
 
-实际登记后的提前wake、fd复用后旧请求、EOF/信号仲裁、blocked/off_cpu迁移、两种任务创建OOM和pipe2输出跨页fault均核对原请求内容及owner。持续4KiB包由CPU0写入、CPU1读入真实受控磁盘映射，冷缺页由CPU0 worker前进；原用户组合要求init实际执行且仍存活期间有包接纳。宿主另使用真实tmpfs映射作为缺页读写缓冲，覆盖4/16KiB几何。本受控配置的普通用户仍在CPU0；pipe接口不开放socket/epoll/FIFO或一般文件系统业务，普通文件交接见下节。
+实际登记后的提前wake、fd复用后旧请求、EOF/信号仲裁、blocked/off_cpu迁移、两种任务创建OOM和pipe2输出跨页fault均核对原请求内容及owner。持续 4 KiB 包由 CPU0 写入、CPU1 读入真实受控磁盘映射，ext4 冷缺页由读取者装入；原用户组合要求init实际执行且仍存活期间有包接纳。宿主另使用真实tmpfs映射作为缺页读写缓冲，覆盖4/16KiB几何。本受控配置的普通用户仍在CPU0；pipe接口不开放socket/epoll/FIFO或一般文件系统业务，普通文件交接见下节。
 
 自然退出同时核对PID1状态、FD/OFD/端点/等待、MM/pin、页/堆/任务栈、私有挂载与根盘设备owner，并运行两盘fsck；不是只检查串口marker。RV产物FD record160字节、pipe504字节、task2784字节，前两者保持256/512字节slab；复用task已有files字段，未新增任务页。扩容锁内复制上限8192字节，pin/close不分配或全表扫描；没有新增数据中转缓冲或worker。OFF工作tick与收尾分别保留，不据此宣称性能提升。
 
 ## 普通文件IO的执行位置
 
-普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，冷文件数据只把缺失批次交给既有 CPU0 worker，不迁移整个调用。
+普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 
-候选页、entry 和读取工作区在调用 CPU 准备，未初始化数据保持私有，worker 取得 inode 资格后复查并发布 loading，再复用 128 KiB SG 后端读取。完成后用户复制和错误前缀仍由原调用者处理。共享文件来源写入先完成 pin，再关闭目标写资格；完整冷覆盖不读取旧数据或预清整页。
+候选页、entry 和读取工作区在调用 CPU 准备，未初始化数据保持私有。ext4 由调用者取得 inode 资格后复查并发布 loading，再复用 128 KiB SG 后端读取；CPU0 策略的后端由 worker 完成这些步骤。完成后用户复制和错误前缀仍由原调用者处理。共享文件来源写入先完成 pin，再关闭目标写资格；完整冷覆盖不读取旧数据或预清整页。
 
-范围写回复用同一执行队列，每个请求一次只推进最多 128 KiB，未完成时接回队尾，让其他 inode 的冷读、关闭和同步准备先行。调用者只提交一个实际请求并等待最终完成，控制工作区跨窗口复用；每批 entry 借用在本批结束时归还，续批按页号重查。单核直接调用在批末设置短 IRQ 安全点，不逐窗口强制 yield。停止 worker 后取消尚未执行的续批，已经接纳的版本和仍脏的数据分别保留原 owner。worker 的退休清理也按每轮最多 16 项推进，然后让出 CPU。
+范围写回复用同一执行队列，每个请求一次只推进最多 128 KiB，未完成时接回队尾，让关闭、同步准备及采用 CPU0 策略的读取先行；ext4 调用者冷读独立推进。调用者只提交一个实际请求并等待最终完成，控制工作区跨窗口复用；每批 entry 借用在本批结束时归还，续批按页号重查。单核直接调用在批末设置短 IRQ 安全点，不逐窗口强制 yield。停止 worker 后取消尚未执行的续批，已经接纳的版本和仍脏的数据分别保留原 owner。worker 的退休清理也按每轮最多 16 项推进，然后让出 CPU。
 
 fsync 的 CPU0 prepare 捕获固定 durable 目标并登记调用者栈上的等待请求，随后执行者继续处理队列。原调用者持有 OFD/file 或映射来源引用；journal worker 在 CPU0 处理完成或失败、消费共享 OFD 错误游标，并在原请求的 raw 保护内发布结果，调用者醒来直接返回。数据交接失败不重复记录写回错误，只读及内存后端即时完成；同步不再有完成后的第二次 CPU0 排队。commit/checkpoint 的既有独立推进和设备屏障不变。独立同步不取得 offset 锁，O_SYNC/O_DSYNC 仍借用真实写操作已经持有的位置资格。
 
@@ -263,8 +263,10 @@ make test-file-io-smp-userland-riscv INIT_CONFIG=config/init.json \
 
 产物默认`build/riscv-file-io-smp-test/`，可用`FILE_IO_SMP_BUILD`隔离另一工具环境。2026-10-13，本地QEMU11.1.2/OpenSBI1.8.1及Ubuntu24.04/QEMU8.2.2/其实际安装固件各通过2/1CPU、512MiB/1GiB的新盘和独立重启8次，以及双RAM的原静态/pthread组合；实际MTTCG线程、退出状态、页/堆/任务栈/等待、私有挂载和两盘fsck由runner核对。本地容器验证不表示远程CI已经运行。
 
-宿主4/16KiB、2/4线程核对共享offset及独立OFD整次追加的内容隔离；强制暂停实际执行者后close/dup复用、取消排队者并停止worker，原请求仍读原OFD，运行者完成前不得join。真实客户机同时验证磁盘映射作为缓冲区的冷缺页、精确短读写内容/哨兵、tmpfs本地I/O和最后控制引用结束后的arena基线。本受控配置的普通用户仍只在CPU0，USER_SMP另行验收。
+宿主4/16KiB、2/4线程核对共享offset及独立OFD整次追加的内容隔离；暂停实际设备读后 close/dup 复用并停止 worker，原调用者仍读原 OFD；另一读取者在真实物理 I/O 互斥处等待，释放后读取替换后的身份，最后归还实际 owner。真实客户机同时验证磁盘映射作为缓冲区的冷缺页、精确短读写内容/哨兵、tmpfs本地I/O和最后控制引用结束后的arena基线。本受控配置的普通用户仍只在CPU0，USER_SMP另行验收。
 
-热读不创建执行请求，用户copy仍在调用hart；冷请求只排入缺失页，不把整个文件操作转交。运行时时间戳由挂载点raw锁保护共享值与dirty/staged链，锁外唤醒和归还节点；读取不为atime单独排队。可选预读的OFD预测用已有短锁，队列由缓存保护；取消只标记，CPU0预读worker在锁外归还节点。
+热读不创建执行请求，用户 copy 在调用 hart；ext4 冷请求同样就地装入。慢路在候选发布前借用 cache，归还工作区后结束借用；worker 停止与调用者读取具有各自的寿命。运行时时间戳由挂载点raw锁保护共享值与dirty/staged链，锁外唤醒和归还节点；读取不为atime单独排队。可选预读的OFD预测用已有短锁，队列由缓存保护；取消只标记，CPU0预读worker在锁外归还节点。
 
-2026-10-16本地QEMU11.1.2分别以RA0、RA2完成受控文件任务的2/1hart、512MiB/1GiB新盘及独立重启。两hart日志要求实际用户copy发生在hart1，热读requests_queued不增加；冷缺页由CPU0加载且不增加整操作执行请求。共享read/readv、短fault与offset、close/reuse、同步和最终owner继续检查。RA2另通过1/4KiB和held DMA检查。该证据来自受控内核文件入口；真实用户 `ecall` 使用前述完整共同路径。
+原生文件检查覆盖 1/2 hart、512 MiB/1 GiB、新盘与独立重启。双 hart 直接核对 CPU1 的块读、ext4 读取、普通冷读和 mmap 冷缺页，以及实际 VirtIO enqueue；单 hart 归到 CPU0。内容、EOF 补零、精确短读写、offset、close 与最终 arena 引用同时检查。真实用户 `ecall` 由 composition 检查发起 CPU 的后端批次和实际设备提交，静态与动态 musl 再检查共同入口。
+
+冷读执行位置的匹配时间、单核成本及混合负载的等待分布见[数据路径实验](../learning/data-path-budget-experiments.md#rv-ext4-在调用-cpu-冷装入2026-10-19)。

@@ -7,10 +7,10 @@ trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work"; else echo "test ar
 trap 'exit 1' HUP INT TERM
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DCONFIG_USE_DEFAULT_CFG=1 ${TRUNCATE_TEST_CFLAGS:-} \
+    -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${TRUNCATE_TEST_CFLAGS:-} \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_truncate.c" \
-    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
 for blocksize in 1024 4096; do
     truncate -s 64M "$work/root.img"
     mkfs.ext4 -q -F -b "$blocksize" -O orphan_file "$work/root.img"

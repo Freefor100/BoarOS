@@ -108,16 +108,18 @@ static unsigned long run_deadline_cases(void)
     unsigned long failures = 0U;
     uint64_t output = 0xa5a5a5a5a5a5a5a5ULL;
     uint64_t next, elapsed;
-    if (riscv_timer_event_advance(250U, 10000U, 10000U, 250U,
+    if (riscv_timer_event_advance(250U, 10000U, 10000U,
                                 &next, &elapsed) != RISCV_TIMER_STATUS_OK ||
         next != 10000U || elapsed != 0U) failures++;
-    if (riscv_timer_event_advance(500U, 10000U, 10000U, 500U,
+    if (riscv_timer_event_advance(500U, 10000U, 10000U,
                                 &next, &elapsed) != RISCV_TIMER_STATUS_OK ||
         next != 10000U || elapsed != 0U) failures++;
-    if (riscv_timer_event_advance(10000U, 10000U, 10000U, 500U,
+    if (riscv_timer_event_advance(10000U, 10000U, 10000U,
                                 &next, &elapsed) != RISCV_TIMER_STATUS_OK ||
         next != 20000U || elapsed != 1U) failures++;
-
+    /* A pending IRQ can outlive both a cancellation and a future replacement. */
+    if (riscv_timer_event_advance(9999U,10000U,10000U,&next,&elapsed)!=RISCV_TIMER_STATUS_OK ||
+        next!=10000U || elapsed!=0U) failures++;
 
     failures += expect_deadline(RISCV_TIMER_STATUS_OK,
                                 100U, 10U, 100U, 110U, 1U);

@@ -2449,8 +2449,10 @@ static int ext4_backend_link(struct kernel_vfs_instance *instance,
 
 static void initialize_backend(void)
 {
-    /* 模块测试尚用物理地址；逐项生成当前执行域的回调，不能复制高半区常量表。 */
+    /* 首次在当前执行域生成回调；其他挂载不能再写远端读者共享的表。 */
+    if (__atomic_load_n(&ext4_backend.pread_batch,__ATOMIC_ACQUIRE)) return;
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
+    ops->read_execution = KERNEL_VFS_READ_CALLER;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;
@@ -2487,6 +2489,6 @@ static void initialize_backend(void)
     ops->release_unlinked = ext4_backend_release_unlinked;
     ops->dir_entry = ext4_backend_dir_entry;
     ops->pread = ext4_backend_pread;
-    ops->pread_batch = ext4_backend_pread_batch;
     ops->writeback = ext4_backend_writeback;
+    __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);
 }

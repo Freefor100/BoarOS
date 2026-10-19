@@ -105,13 +105,14 @@ enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
 }
 
 enum riscv_timer_status riscv_timer_event_advance(uint64_t now, uint64_t period,
-    uint64_t tick_deadline, uint64_t scheduler_deadline,
+    uint64_t tick_deadline,
     uint64_t *next_tick, uint64_t *elapsed_ticks)
 {
     enum riscv_timer_status status = riscv_timer_deadline_advance(now, period,
         tick_deadline, next_tick, elapsed_ticks);
-    if (status == RISCV_TIMER_STATUS_EARLY_INTERRUPT && scheduler_deadline &&
-        (int64_t)(now - scheduler_deadline) >= 0) {
+    /* STIP may remain pending after a deadline is cancelled or replaced.
+     * Keep the periodic phase and let the IRQ caller rearm the current event. */
+    if (status == RISCV_TIMER_STATUS_EARLY_INTERRUPT) {
         *next_tick = tick_deadline;
         *elapsed_ticks = 0;
         return RISCV_TIMER_STATUS_OK;
@@ -149,7 +150,7 @@ enum riscv_timer_status riscv_timer_handle_interrupt(uint64_t *elapsed_ticks)
     if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
     uint64_t now = riscv_time_read();
     enum riscv_timer_status status = riscv_timer_event_advance(now,
-        timer_state.period, timer_state.next_deadline, event,
+        timer_state.period, timer_state.next_deadline,
         &candidate_deadline, &candidate_elapsed);
     if (status != RISCV_TIMER_STATUS_OK) return status;
     if (event && (int64_t)(now - event) >= 0) event = 0;

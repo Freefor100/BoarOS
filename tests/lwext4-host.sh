@@ -67,7 +67,7 @@ for source in "$project_root"/third_party/lwext4/src/*.c; do
 	object="$work_dir/objects/$(basename "${source%.c}").o"
 	"$host_cc" -std=gnu11 -O2 -Wall -Wextra -Werror \
 		-Wno-unused-but-set-variable -Wno-stringop-truncation \
-		-DCONFIG_USE_DEFAULT_CFG=1 \
+		-DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 \
 		-I"$project_root/third_party/lwext4/include" \
 		-idirafter "$project_root/include" \
 		-c "$source" -o "$object"
@@ -75,7 +75,7 @@ for source in "$project_root"/third_party/lwext4/src/*.c; do
 done
 
 "$host_cc" -std=gnu11 -O2 -Wall -Wextra -Werror \
-	-DCONFIG_USE_DEFAULT_CFG=1 \
+	-DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 \
 	-I"$project_root/third_party/lwext4/include" \
 	-idirafter "$project_root/include" \
 	-c "$project_root/tests/host/lwext4_read.c" \
@@ -86,6 +86,9 @@ done
 # with their respective flags.
 # shellcheck disable=SC2086
 "$host_cc" $objects "$work_dir/objects/lwext4_read.o" \
+    -DBOAROS_MAX_CPUS=2 -I"$project_root/tests/host/block_model" -idirafter "$project_root/include" \
+    "$project_root/kernel/raw_lock.c" "$project_root/tests/host/block_runtime.c" \
+    "$project_root/tests/host/sync/notifications.c" -pthread \
 	-o "$work_dir/lwext4-read"
 
 "$work_dir/lwext4-read" "$image" /boaros-probe "$expected"
