@@ -8,7 +8,7 @@
 
 通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，只有实际后端工作进入既有缓存 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。命名空间、进程生命周期、设备、网络及尚未并行化的业务在操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
-`kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。信号、组退出及停止发布原子 pending 并通知目标 CPU；返回准备才消费通知，业务范围的进入不能提前吞掉它。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
+`kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。返回通知字区分CPU0业务与本地信号，两类消费者分别取走自己的位，业务范围的进入不提前消费通知。普通信号在执行CPU内完成共享状态选择、构帧与sigreturn；组停止/退出及REAL定时器重装进入其CPU0范围。共享action快照、mask和并发通知协议见[信号模块](kernel-signal.md#smp上的状态和执行位置)。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
 
 FIFO/RR用户任务进入CPU0服务时，在来源CPU保留逻辑实时资格；非阻塞syscall不是yield。来源核只允许该owner恢复或更高优先级用户抢占。真正阻塞、yield、RR片尾、降为OTHER、移除来源affinity或退出会结束资格；多个被抢占者可同时保留，按原优先级/FIFO组织。CPU0 的特殊资格索引仅接纳实时服务，避免本核高优先级用户计算饿死异核实时服务；普通服务与缓存 worker 按 OTHER 队列轮转，不能因反复查询而饿死其正在等待的 I/O。服务完成后重新检查用户资格，不把首次准备完的子任务直接送到U-mode。两种节点均借用既有执行/runnable owner，回收前必须摘尽；不固定MM/files，也不引入worker。
 

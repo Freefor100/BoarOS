@@ -8,6 +8,8 @@
 #define kernel_scheduler_wake_signal signal_owner_unexpected_wake
 #define scheduler_switch_current_away signal_owner_unexpected_switch
 #define stopped_append_locked signal_owner_unexpected_stop
+#define physical_page_allocate signal_owner_unexpected_allocate
+#define physical_page_resolve signal_owner_unexpected_resolve
 #ifndef SIGNAL_SOURCE
 #define SIGNAL_SOURCE "../../kernel/sched/signal.c"
 #endif
@@ -18,6 +20,8 @@
 #undef kernel_scheduler_wake_signal
 #undef scheduler_switch_current_away
 #undef stopped_append_locked
+#undef physical_page_allocate
+#undef physical_page_resolve
 #include <stdlib.h>
 void signal_owner_unexpected_group_exit(struct kernel_task *task,enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
 { (void)task;(void)reason;(void)status;(void)detail;abort(); }
@@ -27,8 +31,59 @@ int signal_owner_unexpected_orphan(const struct kernel_task *task) { (void)task;
 enum kernel_scheduler_status signal_owner_unexpected_wake(struct kernel_task *task) { (void)task;abort(); }
 enum kernel_scheduler_status signal_owner_unexpected_switch(struct kernel_task *task) { (void)task;abort(); }
 void signal_owner_unexpected_stop(struct kernel_task *task) { (void)task;abort(); }
+enum physical_page_status signal_owner_unexpected_allocate(struct physical_page_allocator *allocator,uint64_t *address)
+{ (void)allocator;(void)address;abort(); }
+enum physical_page_status signal_owner_unexpected_resolve(const struct physical_page_allocator *allocator,uint64_t address,void **page)
+{ (void)allocator;(void)address;(void)page;abort(); }
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
+
+extern void signal_owner_bind_cpu(struct kernel_cpu *);
+static unsigned action_phase;
+static _Thread_local unsigned pause_selection;
+static struct kernel_task *action_target;
+static struct kernel_cpu action_cpu;
+
+void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
+{
+    int pause=pause_selection && guard->lock==&kernel_wait_domain;
+    if(pause)pause_selection=0;
+    __real_kernel_raw_lock_release(guard);
+    if(pause){
+        __atomic_store_n(&action_phase,1,__ATOMIC_RELEASE);
+        while(__atomic_load_n(&action_phase,__ATOMIC_ACQUIRE)!=2){}
+    }
+}
+static void *replace_selected_action(void *unused)
+{
+    (void)unused;signal_owner_bind_cpu(&action_cpu);
+    while(__atomic_load_n(&action_phase,__ATOMIC_ACQUIRE)!=1){}
+    const struct kernel_linux_sigaction replacement={.handler=0x2000,.flags=LINUX_SA_NODEFER,.mask=UINT64_C(1)<<14};
+    assert(!kernel_signal_set_action(action_target,17,&replacement,0));
+    __atomic_store_n(&action_phase,2,__ATOMIC_RELEASE);
+    return 0;
+}
+static void selected_action_snapshot(struct kernel_task *task,struct kernel_signal_table *table)
+{
+    struct kernel_cpu *current=kernel_cpu_current();
+    kernel_cpu_initialize(&action_cpu,19,0);
+    action_cpu.logical_id=1;
+    task->signal_blocked=0;task->group_pending=UINT64_C(1)<<16;
+    table->actions[16]=(struct kernel_signal_action){.handler=0x1000,.flags=LINUX_SA_RESETHAND,.mask=UINT64_C(1)<<11};
+    action_target=task;action_phase=0;
+    pthread_t setter;assert(!pthread_create(&setter,0,replace_selected_action,0));
+    struct kernel_signal_delivery delivery={0};
+    pause_selection=1;
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
+    assert(!pthread_join(setter,0));
+    assert(delivery.handler==0x1000 && delivery.flags==LINUX_SA_RESETHAND);
+    assert(delivery.restore_mask==0 && task->signal_blocked==((UINT64_C(1)<<11)|(UINT64_C(1)<<16)));
+    assert(table->actions[16].handler==0x2000 && table->actions[16].flags==LINUX_SA_NODEFER);
+    assert(!task->group_pending && !current->raw_locks && !action_cpu.raw_locks);
+    puts("signal selection keeps the committed action/mask snapshot; later replacement survives SA_RESETHAND");
+}
 void signal_owner_cases(unsigned *lock_calls)
 {
     struct kernel_task leader = {0}, member = {0};
@@ -83,6 +138,7 @@ void signal_owner_cases(unsigned *lock_calls)
     kernel_signal_encode_info(encoded,&info,1,UINT64_C(0x123456789));
     uint64_t address;memcpy(&address,encoded+16,8);assert(address==UINT64_C(0x123456789));
     assert(!kernel_signal_wait_take(&leader,&info) && !info.signal);
+    selected_action_snapshot(&leader,&table);
     kernel_cpu_current()->current=previous;
     puts("SIGCHLD: blocked default stop policy, protected pending payload and common ABI encoding passed");
     /* The caller's real target owner already covers a self-representing

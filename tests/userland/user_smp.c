@@ -142,6 +142,25 @@ static void thread_signal(void)
     void *result; CHECK(!pthread_join(thread,&result) && result==(void *)(uintptr_t)73);
     CHECK(atomic_load_explicit(&receiver_done,memory_order_acquire));
     empty_wait_signal(0);empty_wait_signal(1);
+    pid_t pending=fork();CHECK(pending>=0);
+    if(!pending){
+        pin(online&2 ? 1 : 0);tls_value=73;
+        atomic_store(&signal_seen,0);atomic_store(&nested_seen,0);
+        sigset_t blocked,previous,empty,observed;
+        sigemptyset(&blocked);sigaddset(&blocked,SIGUSR1);sigaddset(&blocked,SIGUSR2);
+        CHECK(!sigprocmask(SIG_BLOCK,&blocked,&previous));
+        CHECK(!raise(SIGUSR1) && !sigpending(&observed) && sigismember(&observed,SIGUSR1));
+        /* 屏蔽时的返回检查已经消费通知；suspend解除屏蔽必须重新检查旧pending。 */
+        sigemptyset(&empty);alarm(2);
+        CHECK(sigsuspend(&empty)==-1 && errno==EINTR);
+        alarm(0);
+        CHECK(atomic_load(&signal_seen)==1 && atomic_load(&nested_seen)==1);
+        CHECK(!sigprocmask(SIG_SETMASK,NULL,&observed));
+        CHECK(sigismember(&observed,SIGUSR1) && sigismember(&observed,SIGUSR2));
+        CHECK(!sigprocmask(SIG_SETMASK,&previous,NULL));
+        _exit(0);
+    }
+    int pending_status;CHECK(waitpid(pending,&pending_status,0)==pending && pending_status==0);
     record("pthread-tls-registers-nested-signal");
 }
 struct mapping_case { unsigned char *page; atomic_uint ready, command, result; int file; };

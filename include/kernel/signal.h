@@ -167,11 +167,13 @@ enum kernel_signal_status kernel_signal_get_action(
     struct kernel_linux_sigaction *action);
 
 /* Installs one disposition; KILL/STOP bits are stripped from the mask
- * and SIGKILL/SIGSTOP cannot be given a handler. */
+ * and SIGKILL/SIGSTOP cannot be given a handler. The optional old action
+ * is captured in the same commit as replacement and handler selection. */
 enum kernel_signal_status kernel_signal_set_action(
     struct kernel_task *task,
     uint32_t sig,
-    const struct kernel_linux_sigaction *action);
+    const struct kernel_linux_sigaction *action,
+    struct kernel_linux_sigaction *old_action);
 
 /* Fork inheritance: dispositions and blocked mask are copied, pending
  * signals are cleared, and an allocated disposition page is duplicated. */

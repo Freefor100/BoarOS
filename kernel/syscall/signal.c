@@ -97,16 +97,10 @@ enum kernel_syscall_status syscall_handle_rt_sigaction(
             return signal_copy_error(copy_status, decoded);
         }
     }
-    status = kernel_signal_get_action(caller, sig, &old_action);
-    if (status != KERNEL_SIGNAL_STATUS_OK) {
-        return signal_result(status, decoded);
-    }
     if (input != 0U) {
-        status = kernel_signal_set_action(caller, sig, &action);
-        if (status != KERNEL_SIGNAL_STATUS_OK) {
-            return signal_result(status, decoded);
-        }
-    }
+        status = kernel_signal_set_action(caller, sig, &action, &old_action);
+    } else status = kernel_signal_get_action(caller, sig, &old_action);
+    if (status != KERNEL_SIGNAL_STATUS_OK) return signal_result(status, decoded);
     if (output != 0U) {
         copy_status = signal_copy_to_user(mm, output, &old_action,
                                           sizeof(old_action));

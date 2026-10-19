@@ -2148,6 +2148,7 @@ static void kernel_thread_finish(
         current->proc_exiting = 1;
         if (!current->group_exiting) current->completion = *completion;
     }
+    if (current->arch.user_mode) kernel_signal_task_exit(current);
     /* proc readers must see departure before clear_child_tid wakes a joiner. */
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_task_exit();

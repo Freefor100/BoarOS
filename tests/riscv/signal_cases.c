@@ -113,11 +113,13 @@ enum kernel_signal_status __wrap_kernel_signal_get_action(
 enum kernel_signal_status __wrap_kernel_signal_set_action(
     struct kernel_task *task,
     uint32_t sig,
-    const struct kernel_linux_sigaction *action)
+    const struct kernel_linux_sigaction *action,
+    struct kernel_linux_sigaction *previous)
 {
     if (task != (struct kernel_task *)(uintptr_t)1U || action == 0) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
+    if (previous) *previous=old_action;
     set_sig = sig;
     set_action_value = *action;
     return signal_status;

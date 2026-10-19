@@ -94,6 +94,11 @@ struct kernel_signal_table {
     struct kernel_signal_action actions[KERNEL_SIGNAL_COUNT];
 };
 
+enum kernel_user_return_work {
+    KERNEL_USER_RETURN_CPU0 = 1U,
+    KERNEL_USER_RETURN_SIGNAL = 2U,
+};
+
 struct kernel_task {
     struct arch_thread_state arch;
     struct kernel_cpu *cpu;
@@ -121,8 +126,8 @@ struct kernel_task {
     uint64_t bound_mm_context;
 #endif
 #if BOAROS_USER_SMP
-    /* 调度域保护phase；pending仅传递CPU0业务通知，不包含业务状态。 */
-    uint32_t user_service, user_service_pending;
+    /* 调度域保护phase；返回通知区分CPU0业务和执行者本地信号，不复制业务载荷。 */
+    uint32_t user_service, user_return_pending;
     struct kernel_sched_node service_node, reservation_node;
     struct kernel_cpu *reservation_cpu;
     uint32_t user_slice_expired;
@@ -279,6 +284,7 @@ extern struct kernel_scheduler scheduler;
 /* 已持调度域；变更资格不修改用户请求affinity，也不结束执行owner。 */
 void scheduler_user_service_set_locked(struct kernel_task *, int);
 void scheduler_user_request_locked(struct kernel_task *);
+void scheduler_signal_request_locked(struct kernel_task *);
 /* 同一调度域内结束逻辑实时资格；不结束任务执行或存储owner。 */
 void scheduler_user_reservation_release_locked(struct kernel_task *);
 static inline enum kernel_scheduler_status scheduler_failure(void)
@@ -403,6 +409,8 @@ void stopped_append(struct kernel_task *thread);
 void stopped_unlink(struct kernel_task *thread);
 enum kernel_signal_status kernel_signal_release_table(
     struct kernel_task *task);
+/* proc_exiting已在调度域发布，组身份仍附着；转交该退出者未消费的组信号。 */
+void kernel_signal_task_exit(struct kernel_task *task);
 
 
 void ready_enqueue_locked(struct kernel_task *task, int head);

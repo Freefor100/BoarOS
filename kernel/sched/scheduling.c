@@ -110,9 +110,21 @@ void scheduler_user_request_locked(struct kernel_task *task)
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!cpu->raw_locks || cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
     if (!task || !task->arch.user_mode || task->retirement) return;
-    /* CPU1只读取这个发布位，完整信号/进程业务状态仍由CPU0处理。 */
-    __atomic_store_n(&task->user_service_pending, 1, __ATOMIC_RELEASE);
+    __atomic_fetch_or(&task->user_return_pending, KERNEL_USER_RETURN_CPU0, __ATOMIC_RELEASE);
     if (task->wait.on_cpu) kernel_cpu_request_schedule(task->cpu);
+#else
+    (void)task;
+#endif
+}
+
+void scheduler_signal_request_locked(struct kernel_task *task)
+{
+#if BOAROS_USER_SMP
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (!cpu->raw_locks || cpu->raw_locks->lock!=&kernel_wait_domain) __builtin_trap();
+    if (!task || !task->arch.user_mode || task->retirement) return;
+    __atomic_fetch_or(&task->user_return_pending, KERNEL_USER_RETURN_SIGNAL, __ATOMIC_RELEASE);
+    if (task!=cpu->current && task->wait.on_cpu) kernel_cpu_request_schedule(task->cpu);
 #else
     (void)task;
 #endif
@@ -123,7 +135,30 @@ int kernel_scheduler_user_service_pending(void)
 #if BOAROS_USER_SMP
     struct kernel_task *task = kernel_cpu_current()->current;
     return task && task->arch.user_mode &&
-        __atomic_load_n(&task->user_service_pending, __ATOMIC_ACQUIRE);
+        (__atomic_load_n(&task->user_return_pending, __ATOMIC_ACQUIRE) & KERNEL_USER_RETURN_CPU0);
+#else
+    return 0;
+#endif
+}
+
+int kernel_scheduler_user_return_pending(void)
+{
+#if BOAROS_USER_SMP
+    struct kernel_task *task=kernel_cpu_current()->current;
+    return task && task->arch.user_mode &&
+        __atomic_load_n(&task->user_return_pending,__ATOMIC_ACQUIRE);
+#else
+    return 0;
+#endif
+}
+
+int kernel_scheduler_take_signal_work(void)
+{
+#if BOAROS_USER_SMP
+    struct kernel_task *task=kernel_cpu_current()->current;
+    if (!task || !(__atomic_load_n(&task->user_return_pending,__ATOMIC_ACQUIRE) & KERNEL_USER_RETURN_SIGNAL)) return 0;
+    /* 先取走本批通知；消费期间的新发布留给下一次返回检查。 */
+    return (__atomic_fetch_and(&task->user_return_pending,~KERNEL_USER_RETURN_SIGNAL,__ATOMIC_ACQ_REL) & KERNEL_USER_RETURN_SIGNAL)!=0;
 #else
     return 0;
 #endif
@@ -234,7 +269,7 @@ void kernel_scheduler_ack_user_service(void)
 {
     struct kernel_task *task = kernel_task_current();
     if (!kernel_scheduler_user_service_active()) __builtin_trap();
-    (void)__atomic_exchange_n(&task->user_service_pending, 0, __ATOMIC_ACQ_REL);
+    (void)__atomic_fetch_and(&task->user_return_pending, ~KERNEL_USER_RETURN_CPU0, __ATOMIC_ACQ_REL);
 }
 #endif
 

@@ -18,7 +18,9 @@ static unsigned first_claimed;
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
+#ifndef SMP_TEST_USE_LIFETIME
 void scheduler_task_publish_locked(struct kernel_task *task) { (void)task; assert(0); }
+#endif
 void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
 {
     assert(active->raw_locks && active->raw_locks->lock == &kernel_wait_domain);

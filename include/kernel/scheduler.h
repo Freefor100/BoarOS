@@ -306,6 +306,8 @@ void kernel_scheduler_enter_user_service(void);
 void kernel_scheduler_leave_user_service(void);
 int kernel_scheduler_user_service_pending(void);
 int kernel_scheduler_user_service_active(void);
+int kernel_scheduler_user_return_pending(void);
+int kernel_scheduler_take_signal_work(void);
 /* 实际业务入口持有最外层服务范围；嵌套调用借用当前执行资格。 */
 struct kernel_service_scope { unsigned entered; };
 #if BOAROS_USER_SMP

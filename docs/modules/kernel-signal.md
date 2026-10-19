@@ -18,9 +18,19 @@
 
 用户返回直接观察线程及组 pending 中未屏蔽的位；没有可交付信号、故障、退出请求或临时掩码恢复时立即返回，不取得锁；完整事件交付保留独立调用边界，使其临时载荷和保存寄存器留在有事件的路径。等待者的 wait_mask 不参与交付判断，被屏蔽的信号仍留给 sigtimedwait。需要处理事件时在调度 raw 内重取位与载荷；并发新增信号仍通过既有通知请求返回检查。
 
-默认动作包括忽略、继续、停止、终止和 core 标志；core 位不意味着已经生成 core 文件。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
+默认动作包括忽略、继续、停止、终止和core动作；当前提供CORE限额状态，core文件写出仍列为缺口，wait状态反映实际是否产生转储。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
 
 SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。
+
+## SMP上的状态和执行位置
+
+RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护：选择信号时一次取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位，并重置一次性动作。锁外只使用线程栈上的delivery快照。后续rt_sigaction替换同一项时，本次递送继续使用已选版本；替换的新动作也保留。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
+
+构造信号帧、用户复制、寄存器/FPU恢复由当前线程执行。任务执行所有权持有本线程存储、MM及disposition表引用；uaccess借用实际物理页，缺页和等待沿共同MM路径处理。调度raw不跨用户复制、缺页或等待。sigreturn完整导入并检查用户上下文后，在短锁内恢复mask，再更新本线程寄存器和FPU。
+
+既有返回通知字区分“CPU0业务”和“本地信号”两种工作。发布者在保护下置相应位，需要时通知远端CPU；用户返回先取走本批信号通知，消费期间的新发布留在下一轮。两种消费者只清除各自的位。mask解除屏蔽时重新检查旧pending，覆盖sigprocmask、sigreturn、sigsuspend和临时等待mask；一批信号中仍有可交付项时保留后续检查。新增屏蔽位若挡住仍pending的组信号，锁外复用组游标通知并唤醒另一合适成员；发布时也重查候选，退出者在proc_exiting提交后、组拆除前转交未消费的组信号。sigtimedwait的接收集合在同一raw内发布，结束等待时也转交因退出集合而被本线程屏蔽的组pending。SIGCONT恢复READY成员时重新发布已有可递送信号的通知。游标持有真实task存储，短锁不跨等待唤醒，单成员路径无需遍历。普通周期CPU定时器的handler和sigreturn沿该本地路径运行。
+
+组停止/退出仍进入进程生命周期的CPU0范围。默认停止动作先迁移、再重新选择和消费pending，途中SIGCONT清除的停止请求会被丢弃；REAL定时器消费后的重装仍进入CPU0的墙钟期限索引。临时mask尚需等待真正handler时沿原等待路径阻塞，相应操作在短锁外取得执行资格。新增屏蔽位转交与停止取消的Linux依据为固定`references/linux/kernel/signal.c`中的`retarget_shared_pending`、`__set_task_blocked`和`get_signal`。调度交接见[RV两核](riscv-smp.md#真实用户态与cpu0业务交接)，CPU定时器统计见[时间模块](kernel-time.md#进程-cpu-间隔定时器)。
 
 ## 输入、信号帧与恢复
 
@@ -61,6 +71,8 @@ RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节fr
 
 `make test-signal-wait-abi-riscv test-signal-wait-abi-loongarch`提供等待的聚焦差分：包含空等待集合和SA_RESTART，子进程通过真实`/proc/<pid>/stat`睡眠状态握手后发信号，直接检查syscall返回，区分libc自身的EINTR重试。
 
+`test-sched-concurrency-host`在真实选择解锁后让另一宿主线程替换action，检查旧delivery快照、mask、SA_RESETHAND及新动作均保持正确；旧实现会读到后来的handler。`test-user-smp-host`检查两类通知分别消费及晚发布、handler新增屏蔽位、接收者退出和结束sigtimedwait后转交组信号、真实COMMITTED等待者被唤醒及消费，以及CPU0换栈窗口中的SIGCONT取消STOP、恢复成员重新取得信号通知。`test-user-smp-riscv`的静态/动态musl案例另覆盖屏蔽后已pending的信号经sigsuspend解除屏蔽、嵌套handler和sigreturn恢复原mask，运行真实1/2CPU及双RAM。
+
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
 标准信号使用线程组与线程位图 pending，发布和消费共用调度保护；尚无实时信号队列、sigaltstack 或 signalfd。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
@@ -85,7 +97,7 @@ U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR�
 
 线程有一个独立同步故障记录，经统一用户返回路径优先选取；交付 handler 时保留故障 PC，可由 handler 修复映射后重试，或修改 ucontext 跳过指令。被阻塞或忽略的致命同步信号改为默认动作并解除阻塞；默认动作终止全组。坏 signal frame 同样终止全组。fork/exec 清除故障记录；syscall 用户复制仍返回 EFAULT，内核自身 trap 仍 fatal。
 
-`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。sigaltstack、ptrace、实时队列及 SMP 不在本次交付中。
+`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。sigaltstack、ptrace、实时队列仍列在能力目录；RV真实两核的递送与恢复使用上面的共同协议。
 
 TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
 的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write
