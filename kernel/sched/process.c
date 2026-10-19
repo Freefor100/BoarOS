@@ -604,14 +604,9 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->session_leader = leader->session_leader;
         task->child_creator = leader->child_creator;
         leader->child_creator = 0;
-        task->user_ns += leader->user_ns;
-        task->kernel_ns += leader->kernel_ns;
-        task->child_user_ns = leader->child_user_ns;
-        task->child_kernel_ns = leader->child_kernel_ns;
-        task->minor_faults += leader->minor_faults;
-        task->major_faults += leader->major_faults;
-        task->child_minor_faults = leader->child_minor_faults;
-        task->child_major_faults = leader->child_major_faults;
+        task->dead_usage = leader->dead_usage;
+        scheduler_usage_add(&task->dead_usage, &leader->usage);
+        task->child_usage = leader->child_usage;
         task->group_pending = leader->group_pending;
         task->group_child_info = leader->group_child_info;
         task->nofile_limit = leader->nofile_limit;
@@ -684,6 +679,7 @@ static int release_clone_resources(struct kernel_task *thread)
     }
     if (thread->mm.state == KERNEL_MM_LIVE ||
         thread->mm.state == KERNEL_MM_CLEANUP) {
+        scheduler_usage_save_mm(thread);
         if (kernel_mm_release(&thread->mm) != KERNEL_MM_STATUS_OK) {
             cleanup_failed = 1;
         }
@@ -1012,8 +1008,7 @@ static int wait_child_matches(const struct kernel_task *child, int32_t which,
 static enum kernel_scheduler_status retire_waited_zombie(
     struct kernel_task *parent,
     struct kernel_task *child,
-    uint64_t user_ns,
-    uint64_t kernel_ns)
+    const struct kernel_task_usage *usage)
 {
     kernel_pid_t pid = child->tid;
 
@@ -1034,12 +1029,7 @@ static enum kernel_scheduler_status retire_waited_zombie(
     kernel_task_release_io_scratch(child);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        parent->group_leader->child_user_ns += user_ns;
-        parent->group_leader->child_kernel_ns += kernel_ns;
-        parent->group_leader->child_minor_faults +=
-            child->minor_faults + child->child_minor_faults;
-        parent->group_leader->child_major_faults +=
-            child->major_faults + child->child_major_faults;
+        scheduler_usage_add(&parent->group_leader->child_usage, usage);
         child_remove_locked(parent->group_leader, child);
         if (scheduler.init_task == child) {
             scheduler.init_task = 0;
@@ -1066,11 +1056,11 @@ static enum kernel_scheduler_status reap_waited_child(
 {
     kernel_pid_t pid = child->tid;
     uint32_t wait_status = child->wait_status;
-    uint64_t user_ns = child->user_ns + child->child_user_ns;
-    uint64_t kernel_ns = child->kernel_ns + child->child_kernel_ns;
-
-    enum kernel_scheduler_status status =
-        retire_waited_zombie(parent, child, user_ns, kernel_ns);
+    struct kernel_task_usage usage = {0};
+    scheduler_usage_snapshot_mm(child, -2, &usage);
+    struct kernel_linux_rusage rusage;
+    scheduler_usage_format(&usage, &rusage);
+    enum kernel_scheduler_status status = retire_waited_zombie(parent, child, &usage);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
 
     size_t copied = 0U;
@@ -1091,17 +1081,6 @@ static enum kernel_scheduler_status reap_waited_child(
         }
     }
     if (rusage_address != 0U) {
-        struct kernel_linux_rusage rusage = {0};
-        rusage.ru_utime.tv_sec = (int64_t)(user_ns /
-                                           UINT64_C(1000000000));
-        rusage.ru_utime.tv_usec =
-            (int64_t)(user_ns % UINT64_C(1000000000)) *
-            (int64_t)1U / 1000U;
-        rusage.ru_stime.tv_sec = (int64_t)(kernel_ns /
-                                           UINT64_C(1000000000));
-        rusage.ru_stime.tv_usec =
-            (int64_t)(kernel_ns % UINT64_C(1000000000)) *
-            (int64_t)1U / 1000U;
         access_status = kernel_copy_to_user(&parent->mm,
                                             rusage_address,
                                             &rusage,
@@ -1147,17 +1126,10 @@ static enum kernel_scheduler_status report_wait_event(
         }
     }
     if (rusage_address != 0U) {
-        struct kernel_linux_rusage rusage = {0};
-        uint64_t user_ns = child->user_ns + child->child_user_ns;
-        uint64_t kernel_ns = child->kernel_ns + child->child_kernel_ns;
-        rusage.ru_utime.tv_sec = (int64_t)(user_ns / UINT64_C(1000000000));
-        rusage.ru_utime.tv_usec = (int64_t)(user_ns % UINT64_C(1000000000)) *
-                                  (int64_t)1U / 1000U;
-        rusage.ru_stime.tv_sec = (int64_t)(kernel_ns / UINT64_C(1000000000));
-        rusage.ru_stime.tv_usec = (int64_t)(kernel_ns % UINT64_C(1000000000)) *
-                                  (int64_t)1U / 1000U;
-
-        copied = 0U;
+        struct kernel_task_usage usage = {0};
+        struct kernel_linux_rusage rusage;
+        scheduler_usage_snapshot_mm(child, -2, &usage);
+        scheduler_usage_format(&usage, &rusage);
         access_status = kernel_copy_to_user(&parent->mm,
                                             rusage_address,
                                             &rusage,
@@ -1178,7 +1150,6 @@ static enum kernel_scheduler_status report_wait_event(
 
 static enum kernel_scheduler_status report_waitid_event(
     struct kernel_task *parent,
-    int event_found,
     int32_t signo,
     int32_t cause,
     int32_t pid,
@@ -1186,34 +1157,25 @@ static enum kernel_scheduler_status report_waitid_event(
     int32_t status_code,
     uint64_t rusage_address,
     uint64_t infop_address,
-    uint64_t user_ns,
-    uint64_t kernel_ns,
+    const struct kernel_linux_rusage *usage,
     int64_t *linux_result)
 {
     size_t copied = 0U;
     enum kernel_uaccess_status access_status;
 
-    if (event_found && rusage_address != 0U) {
-        struct kernel_linux_rusage rusage = {0};
-        rusage.ru_utime.tv_sec = (int64_t)(user_ns / UINT64_C(1000000000));
-        rusage.ru_utime.tv_usec = (int64_t)(user_ns % UINT64_C(1000000000)) *
-                                  (int64_t)1U / 1000U;
-        rusage.ru_stime.tv_sec = (int64_t)(kernel_ns / UINT64_C(1000000000));
-        rusage.ru_stime.tv_usec = (int64_t)(kernel_ns % UINT64_C(1000000000)) *
-                                  (int64_t)1U / 1000U;
-
+    if (usage && rusage_address != 0U) {
         copied = 0U;
         access_status = kernel_copy_to_user(&parent->mm,
                                             rusage_address,
-                                            &rusage,
-                                            sizeof(rusage),
+                                            usage,
+                                            sizeof(*usage),
                                             &copied);
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
             *linux_result = -KERNEL_EFAULT;
             return KERNEL_SCHEDULER_STATUS_OK;
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK ||
-            copied != sizeof(rusage)) {
+            copied != sizeof(*usage)) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
@@ -1463,15 +1425,16 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
     }
 
     int32_t cause = 0, status_code = 0, child_pid = 0;
-    uint64_t user_ns = 0, kernel_ns = 0;
+    struct kernel_task_usage usage = {0};
+    struct kernel_linux_rusage rusage;
     if (child) {
+        scheduler_usage_snapshot_mm(child, -2, &usage);
+        scheduler_usage_format(&usage, &rusage);
         uint32_t ws;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             child_pid = child->tid;
             ws = child->wait_status;
-            user_ns = child->user_ns + child->child_user_ns;
-            kernel_ns = child->kernel_ns + child->child_kernel_ns;
             if (event == 2 && !(options & LINUX_WNOWAIT)) child->stop_notified = 1;
             if (event == 3 && !(options & LINUX_WNOWAIT)) child->continue_notified = 0;
         }
@@ -1479,7 +1442,7 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
             cause = !(ws & 0x7fU) ? 1 /* CLD_EXITED */ : (ws & 0x80U) ? 3 /* CLD_DUMPED */ : 2 /* CLD_KILLED */;
             status_code = (int32_t)(cause == 1 ? (ws >> 8U) & 0xffU : ws & 0x7fU);
             if (!(options & LINUX_WNOWAIT)) {
-                status = retire_waited_zombie(parent, child, user_ns, kernel_ns);
+                status = retire_waited_zombie(parent, child, &usage);
                 if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
             }
         } else if (event == 2) {
@@ -1492,9 +1455,9 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
     }
     /* Linux在EINVAL/ECHILD/被信号中断时也输出六个零字段；复制错误覆盖原errno。
      * 有事件时先复制rusage，再复制siginfo；已消费事件不因EFAULT回滚。 */
-    return report_waitid_event(parent, child != 0, child ? 17 : 0, cause,
+    return report_waitid_event(parent, child ? 17 : 0, cause,
         child_pid, 0, status_code, rusage_address, infop_address,
-        user_ns, kernel_ns, linux_result);
+        child ? &rusage : 0, linux_result);
 }
 
 
@@ -1731,10 +1694,9 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             reassign_child_creators(leader, thread);
             {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            leader->user_ns += thread->user_ns;
-            leader->kernel_ns += thread->kernel_ns;
-            leader->minor_faults += thread->minor_faults;
-            leader->major_faults += thread->major_faults;
+            struct kernel_task_usage departed;
+            scheduler_usage_thread_locked(thread, &departed);
+            scheduler_usage_add(&leader->dead_usage, &departed);
             thread->group_previous->group_next = thread->group_next;
             thread->group_next->group_previous = thread->group_previous;
             if (!leader->group_members || ++leader->group_epoch == 0) __builtin_trap();
@@ -1915,6 +1877,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     }
     if (thread->mm.state == KERNEL_MM_LIVE ||
         thread->mm.state == KERNEL_MM_CLEANUP) {
+        scheduler_usage_save_mm(thread);
         mm_status = kernel_mm_release(&thread->mm);
         if (mm_status != KERNEL_MM_STATUS_OK) {
             if (mm_status == KERNEL_MM_STATUS_PAGE_ACCESS) {
@@ -2432,50 +2395,17 @@ enum kernel_task_status kernel_task_ppid(
 }
 
 void kernel_task_cpu_ticks(const struct kernel_task *task,
-                           uint64_t *user_ns, uint64_t *kernel_ns,
-                           uint64_t *child_user_ns, uint64_t *child_kernel_ns)
+                           uint64_t *user_ticks, uint64_t *kernel_ticks,
+                           uint64_t *child_user_ticks, uint64_t *child_kernel_ticks)
 {
-    if (!task || task->magic != KERNEL_THREAD_MAGIC) return;
-    struct kernel_task *leader;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        leader = task->group_leader;
-        *child_user_ns = (leader ? leader->child_user_ns : task->child_user_ns) / 10000000U;
-        *child_kernel_ns = (leader ? leader->child_kernel_ns : task->child_kernel_ns) / 10000000U;
-        if (!leader || leader->group_members == 1) {
-            scheduler_task_cpu_time_locked(task, user_ns, kernel_ns);
-            *user_ns /= 10000000U;
-            *kernel_ns /= 10000000U;
-            return;
-        }
-        scheduler_task_get_locked(leader);
-    }
-    *user_ns = *kernel_ns = 0;
-    struct scheduler_group_cursor cursor;
-    scheduler_group_cursor_begin(leader, &cursor);
-    uint64_t epoch = cursor.epoch;
-    while (cursor.task) {
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            /* 组成员变化会使游标从leader重走，旧前缀不能重复累计。 */
-            if (epoch != cursor.epoch) {
-                *user_ns = *kernel_ns = 0;
-                epoch = cursor.epoch;
-            }
-            struct kernel_task *member = cursor.task;
-            if (leader->group_epoch == cursor.epoch && member->accounted && member->group_leader == leader) {
-                uint64_t u, k;
-                scheduler_task_cpu_time_locked(member, &u, &k);
-                *user_ns += u;
-                *kernel_ns += k;
-            }
-        }
-        scheduler_group_cursor_next(&cursor);
-    }
-    scheduler_group_cursor_end(&cursor);
-    scheduler_task_put(leader);
-    *user_ns /= 10000000U;
-    *kernel_ns /= 10000000U;
+    if (!task || task->magic != KERNEL_THREAD_MAGIC) __builtin_trap();
+    struct kernel_task_usage usage = {0}, children = {0};
+    scheduler_usage_snapshot(task, 0, &usage);
+    scheduler_usage_snapshot(task, -1, &children);
+    *user_ticks = usage.user_ns / 10000000U;
+    *kernel_ticks = usage.kernel_ns / 10000000U;
+    *child_user_ticks = children.user_ns / 10000000U;
+    *child_kernel_ticks = children.kernel_ns / 10000000U;
 }
 
 enum kernel_task_status kernel_task_mm_borrow(

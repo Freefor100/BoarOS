@@ -1,3 +1,4 @@
+#include <kernel/accounting.h>
 #include <kernel/cost.h>
 #include <arch/riscv/smp.h>
 #include <arch/riscv/plic.h>

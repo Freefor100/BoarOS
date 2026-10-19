@@ -2,7 +2,6 @@
 #include <kernel/virtio_block.h>
 #include <kernel/page.h>
 #include <kernel/sync.h>
-#include <kernel/proc_task.h>
 #include <arch/context.h>
 #include <arch/timer.h>
 #include <arch/platform_io.h>
@@ -703,7 +702,6 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
         !legacy_transport(device) && type == VIRTIO_BLOCK_REQUEST_IN ? 0 : 1,
         1U + (type == VIRTIO_BLOCK_REQUEST_IN ? data_length : 0)) != VIRTIO_OK) __builtin_trap();
     if (device->queue.inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->queue.inflight;
-    if (type == VIRTIO_BLOCK_REQUEST_IN) kernel_proc_task_note_block_read();
     return KERNEL_BLOCK_STATUS_OK;
 }
 

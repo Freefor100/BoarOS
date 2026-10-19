@@ -3,6 +3,7 @@
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
 #include <kernel/cost.h>
+#include <kernel/accounting.h>
 #include <kernel/cpu.h>
 #include <kernel/wait_internal.h>
 #include <arch/context.h>
@@ -29,6 +30,12 @@
 #define KERNEL_THREAD_NO_PAGE UINT64_MAX
 #define KERNEL_STACK_FILL 0xa5U
 #define KERNEL_PID_LIMIT 32768U
+
+struct kernel_task_usage {
+    uint64_t user_ns, kernel_ns;
+    uint64_t minor_faults, major_faults, maxrss_pages;
+    uint64_t voluntary, involuntary, read_bytes, write_bytes;
+};
 
 struct kernel_exec_transaction;
 struct kernel_memory_object;
@@ -161,15 +168,7 @@ struct kernel_task {
     struct kernel_tty *controlling_tty;
     struct kernel_io_context io_context;
     uint32_t accounting_mode;
-    uint64_t user_ns;
-    uint64_t kernel_ns;
-    uint64_t child_user_ns;
-    uint64_t child_kernel_ns;
-    uint64_t minor_faults;
-    uint64_t major_faults;
-    uint64_t child_minor_faults;
-    uint64_t child_major_faults;
-    uint64_t block_reads;
+    struct kernel_task_usage usage, dead_usage, child_usage;
     uint64_t proc_start_ticks;
     char comm[16];
     struct kernel_wait_queue child_exit_queue;
@@ -407,4 +406,10 @@ void scheduler_cpu_time_account_locked(struct kernel_cpu *, uint64_t);
 void scheduler_cpu_time_switch(struct kernel_task *, struct kernel_task *);
 void scheduler_task_cpu_time_locked(const struct kernel_task *, uint64_t *, uint64_t *);
 
+void scheduler_usage_add(struct kernel_task_usage *, const struct kernel_task_usage *);
+void scheduler_usage_thread_locked(const struct kernel_task *, struct kernel_task_usage *);
+void scheduler_usage_snapshot(const struct kernel_task *, int, struct kernel_task_usage *);
+void scheduler_usage_snapshot_mm(const struct kernel_task *, int, struct kernel_task_usage *);
+void scheduler_usage_format(const struct kernel_task_usage *, struct kernel_linux_rusage *);
+void scheduler_usage_save_mm(struct kernel_task *);
 #endif

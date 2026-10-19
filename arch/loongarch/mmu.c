@@ -17,6 +17,12 @@ extern void la_tlb_refill(void);
 void arch_mmu_sync_instructions(void) { __asm__ volatile("ibar 0" ::: "memory"); }
 void arch_mmu_flush_address(uint64_t address)
 { __asm__ volatile("invtlb 0x5, $zero, %0" :: "r"(address) : "memory"); }
+static void resident_peak(struct arch_mmu_user_space *space)
+{
+    uint64_t pages = (uint64_t)space->leaf_pages + space->protected_pages;
+    if (space->peak_resident_pages < pages) space->peak_resident_pages = pages;
+}
+
 static void flush_all(void) { __asm__ volatile("invtlb 0, $zero, $zero" ::: "memory"); }
 void arch_mmu_flush_all(void) { flush_all(); }
 void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
@@ -191,7 +197,7 @@ enum arch_mmu_status arch_mmu_user_map_prepared_page(struct arch_mmu_user_space 
     if (missing & 1) {
         __atomic_store_n(&root[r], middle_address, __ATOMIC_RELEASE); prepared->tables[0] = KERNEL_MM_NO_PAGE;
     }
-    s->table_pages += extra; s->leaf_pages++;
+    s->table_pages += extra; s->leaf_pages++; resident_peak(s);
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_cow_snapshot(struct arch_mmu_user_space *s,
@@ -291,8 +297,9 @@ static enum arch_mmu_status map_owned(struct arch_mmu_user_space *s,uint64_t v,u
     enum arch_mmu_status status=walk(s,v,1,&slot);
     if (status!=ARCH_MMU_STATUS_OK) return status;
     if (*slot) return ARCH_MMU_STATUS_CONFLICT;
-    *slot=encode(p,permissions,cow); s->leaf_pages++;
-    if (!permissions) s->protected_pages++;
+    *slot=encode(p,permissions,cow);
+    if (!permissions) s->protected_pages++; else s->leaf_pages++;
+    resident_peak(s);
     if (cow) s->cow_pages++;
     arch_mmu_flush_address(v); if (permissions&4) arch_mmu_sync_instructions();
     return ARCH_MMU_STATUS_OK;
@@ -384,7 +391,7 @@ enum arch_mmu_status arch_mmu_user_detach_range(
             uint64_t old=leaves[l];
             visits++;
             if (old && address>=start && address<end) {
-                if (!(old&PTE_PRESENT) || !s->leaf_pages || s->table_pages<3 ||
+                if (!(old&PTE_PRESENT) || (!(old&PTE_NONE) && !s->leaf_pages) || s->table_pages<3 ||
                     ((old&PTE_NONE) && !s->protected_pages) || ((old&PTE_COW) && !s->cow_pages)) return ARCH_MMU_STATUS_STATE;
                 uint64_t physical=old & PTE_ADDRESS;
                 void *owned;
@@ -394,8 +401,7 @@ enum arch_mmu_status arch_mmu_user_detach_range(
                 if (before_detach) before_detach(owner,address,physical);
                 __atomic_store_n(&leaves[l],0,__ATOMIC_RELEASE);
                 kernel_mm_retirement_add(batch,physical,0);
-                s->leaf_pages--;
-                if (old&PTE_NONE) s->protected_pages--;
+                if (old&PTE_NONE) s->protected_pages--; else s->leaf_pages--;
                 if (old&PTE_COW) s->cow_pages--;
             } else if (old) cursor->occupied=1;
             cursor->address+=BOAROS_PAGE_SIZE;
@@ -435,8 +441,7 @@ static void unmap_tree(struct arch_mmu_user_space *s,uint64_t root,unsigned leve
             /* 先失效翻译再归还页，避免旧 TLB 指向已复用物理 owner。 */
             arch_mmu_flush_address(address);
             if (physical_page_release(s->allocator,leaf&PTE_ADDRESS)!=PHYSICAL_PAGE_STATUS_OK) la_virt_fatal("leaf release");
-            s->leaf_pages--;
-            if (leaf&PTE_NONE) s->protected_pages--;
+            if (leaf&PTE_NONE) s->protected_pages--; else s->leaf_pages--;
             if (leaf&PTE_COW) s->cow_pages--;
         }
     }
@@ -457,8 +462,8 @@ enum arch_mmu_status arch_mmu_user_protect_owned_page(struct arch_mmu_user_space
     if (!*slot) return ARCH_MMU_STATUS_OK;
     uint64_t old=*slot;
     __atomic_store_n(slot,encode(old&PTE_ADDRESS,perms,(old&PTE_COW)!=0),__ATOMIC_RELEASE);
-    if (old&PTE_NONE) s->protected_pages--;
-    if (!perms) s->protected_pages++;
+    if ((old&PTE_NONE) && perms) { s->protected_pages--; s->leaf_pages++; }
+    if (!(old&PTE_NONE) && !perms) { s->leaf_pages--; s->protected_pages++; }
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_protect_owned_range(struct arch_mmu_user_space *s,uint64_t start,uint64_t end,uint32_t perms)

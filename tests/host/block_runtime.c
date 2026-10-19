@@ -40,3 +40,8 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
     guard->lock = 0; guard->owner = 0;
     assert(!pthread_mutex_unlock(&object->mutex));
 }
+
+/* 此块层模型没有用户task；保留真实提交钩子的字节观察。 */
+_Thread_local uint64_t block_test_read_bytes, block_test_write_bytes;
+void kernel_task_account_read(uint64_t bytes) { block_test_read_bytes += bytes; }
+void kernel_task_account_write(uint64_t bytes) { block_test_write_bytes += bytes; }

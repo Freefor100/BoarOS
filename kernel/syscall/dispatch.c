@@ -367,6 +367,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                 request->number == LINUX_SYSCALL_FCHMOD) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 165U) {
+        if (syscall_handle_getrusage(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_GETITIMER || request->number == LINUX_SYSCALL_SETITIMER) {
         if (syscall_handle_itimer(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

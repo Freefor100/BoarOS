@@ -393,7 +393,7 @@ static void group_exit_work(void)
         kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
         struct kernel_task *leader = &tasks[0];
         for (unsigned i = 0; i < members; i++) {
-            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY, .magic = KERNEL_THREAD_MAGIC, .user_ns = (i+1)*10000000U, .kernel_ns = 2*(i+1)*10000000U};
+            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY, .magic = KERNEL_THREAD_MAGIC, .usage={.user_ns = (i+1)*10000000U, .kernel_ns = 2*(i+1)*10000000U}};
             tasks[i].group_leader = leader;
             tasks[i].group_next = &tasks[(i + 1) % members];
             tasks[i].group_previous = &tasks[(i + members - 1) % members];
@@ -409,7 +409,7 @@ static void group_exit_work(void)
             }
         }
         uint64_t user, kernel, child_user, child_kernel;
-        leader->child_user_ns=70000000U;leader->child_kernel_ns=90000000U;
+        leader->child_usage.user_ns=70000000U;leader->child_usage.kernel_ns=90000000U;
         group_lock_calls=0;
         kernel_task_cpu_ticks(&tasks[members-1],&user,&kernel,&child_user,&child_kernel);
         assert(user==members*(members+1)/2 && kernel==members*(members+1));
@@ -844,9 +844,29 @@ static void cpu_time_without_ticks(void)
     puts("CPU elapsed user/kernel time, nested IRQ exclusion and exact execution-owner transfer passed");
 }
 
+static void resource_snapshot(void)
+{
+    scheduler=(struct kernel_scheduler){0};kernel_cpu_initialize(&cpus[0],0,0);
+    active_cpu=&cpus[0];kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
+    tasks[0]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.group_members=1};
+    tasks[0].group_leader=&tasks[0];
+    tasks[0].usage=(struct kernel_task_usage){.user_ns=1000000,.minor_faults=3,.read_bytes=1024,.voluntary=1};
+    tasks[0].dead_usage=(struct kernel_task_usage){.user_ns=2000000,.minor_faults=5,.maxrss_pages=7,.write_bytes=4096};
+    tasks[0].child_usage=(struct kernel_task_usage){.user_ns=4000000,.minor_faults=11,.maxrss_pages=3};
+    struct kernel_task_usage u={0};struct kernel_linux_rusage r;
+    scheduler_usage_snapshot(&tasks[0],1,&u);assert(u.user_ns==1000000 && u.minor_faults==3 && u.maxrss_pages==7);
+    scheduler_usage_snapshot(&tasks[0],0,&u);assert(u.user_ns==3000000 && u.minor_faults==8);
+    scheduler_usage_format(&u,&r);assert(r.ru_utime.tv_usec==3000 && r.ru_minflt==8 &&
+        r.ru_maxrss==7*(BOAROS_PAGE_SIZE/1024) && r.ru_inblock==2 && r.ru_oublock==8 && r.ru_nvcsw==1);
+    scheduler_usage_snapshot(&tasks[0],-1,&u);assert(u.user_ns==4000000 && u.minor_faults==11 && u.maxrss_pages==3);
+    scheduler_usage_snapshot(&tasks[0],-2,&u);assert(u.user_ns==7000000 && u.minor_faults==19 && u.maxrss_pages==7);
+    puts("resource SELF/THREAD/CHILDREN snapshots preserve units, dead-thread separation and RSS maximum");
+}
+
 int main(void)
 {
     cpu_time_without_ticks();
+    resource_snapshot();
     for (unsigned threads = 2; threads <= 4; threads += 2) {
         shutdown_during_disposal(threads, 0);
         for (unsigned window = 2; window <= 4; window++)

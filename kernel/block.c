@@ -1,4 +1,5 @@
 #include <kernel/block.h>
+#include <kernel/accounting.h>
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <arch/context.h>
@@ -113,6 +114,7 @@ enum kernel_block_status kernel_block_read_at(
         return KERNEL_BLOCK_STATUS_INVALID;
     }
 
+    kernel_task_account_read(size);
     return disk->read(disk->context, device->start_bytes + offset, buffer, size);
 }
 
@@ -144,6 +146,19 @@ enum kernel_block_status kernel_block_write_at(
 
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
     return disk->write(disk->context, device->start_bytes + offset, buffer, size);
+}
+
+/* 分区转换单独使用本次请求大小的临时向量；整盘与单页缺页读取
+ * 不再承担最大批量的栈空间。io_lock及request owner覆盖驱动完成。 */
+static __attribute__((noinline)) enum kernel_block_status partition_write_batch(
+    struct kernel_block_device *device, const struct kernel_block_span *spans, size_t count)
+{
+    struct kernel_block_span translated[count];
+    for (size_t i = 0; i < count; i++) {
+        translated[i] = spans[i]; translated[i].offset += device->start_bytes;
+    }
+    struct kernel_block_device *disk = physical(device);
+    return disk->write_batch(disk->context, translated, count);
 }
 
 enum kernel_block_status kernel_block_write_batch(
@@ -180,20 +195,13 @@ enum kernel_block_status kernel_block_write_batch(
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
-    struct kernel_block_span translated[KERNEL_BLOCK_BATCH_MAX];
-    const struct kernel_block_span *physical_spans = spans;
-    if (device->parent) {
-        for (size_t i = 0; i < count; i++) {
-            translated[i] = spans[i]; translated[i].offset += device->start_bytes;
-        }
-        physical_spans = translated;
-    }
     if (disk->write_batch)
-        return disk->write_batch(disk->context, physical_spans, count);
+        return device->parent ? partition_write_batch(device, spans, count) :
+            disk->write_batch(disk->context, spans, count);
     for (size_t i = 0; i < count; i++) {
         if (!spans[i].size) continue;
         enum kernel_block_status result = disk->write(disk->context,
-            physical_spans[i].offset, spans[i].buffer, spans[i].size);
+            device->start_bytes + spans[i].offset, spans[i].buffer, spans[i].size);
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
     }
     return KERNEL_BLOCK_STATUS_OK;
@@ -264,6 +272,25 @@ static void read_completed(void *context, unsigned index, const struct block_rea
     state->completion->complete(state->completion->context, index, &state->spans[index]);
 }
 
+static __attribute__((noinline)) enum kernel_block_status partition_read_batch(
+    struct kernel_block_device *device, struct block_read_span *spans, size_t count,
+    const struct block_read_completion *completion)
+{
+    struct block_read_span translated[count];
+    for (size_t i = 0; i < count; i++) {
+        translated[i] = spans[i]; translated[i].offset += device->start_bytes;
+    }
+    struct translated_completion state = { spans, completion };
+    struct block_read_completion notify = { read_completed, &state };
+    struct kernel_block_device *disk = physical(device);
+    enum kernel_block_status result = disk->read_batch(disk->context, translated, count,
+        completion ? &notify : 0);
+    for (size_t i = 0; i < count; i++) {
+        spans[i].status = translated[i].status; spans[i].completed = translated[i].completed;
+    }
+    return result;
+}
+
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
     struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
 {
@@ -300,21 +327,10 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
         nonempty = 1;
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
-    if (disk->read_batch) {
-        if (!device->parent) return disk->read_batch(disk->context, spans, count, completion);
-        struct block_read_span translated[KERNEL_BLOCK_BATCH_MAX];
-        for (size_t i = 0; i < count; i++) {
-            translated[i] = spans[i]; translated[i].offset += device->start_bytes;
-        }
-        struct translated_completion state = { spans, completion };
-        struct block_read_completion notify = { read_completed, &state };
-        enum kernel_block_status result = disk->read_batch(disk->context, translated, count,
-            completion ? &notify : 0);
-        for (size_t i = 0; i < count; i++) {
-            spans[i].status = translated[i].status; spans[i].completed = translated[i].completed;
-        }
-        return result;
-    }
+    for (size_t i = 0; i < count; i++) kernel_task_account_read(spans[i].size);
+    if (disk->read_batch)
+        return device->parent ? partition_read_batch(device, spans, count, completion) :
+            disk->read_batch(disk->context, spans, count, completion);
     enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
     for (size_t i = 0; i < count; i++) {
         if (spans[i].size) {
@@ -543,12 +559,17 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
         size_t span = limit - first < sector ? (size_t)(limit - first) : sector;
         size_t amount = size < span - within ? size : span - within;
         enum kernel_block_status result;
+        size_t submitted;
         if (!within && amount == sector) {
             /* Whole sectors form one request, preserving the backend's batching. */
             amount = size - size % sector;
+            submitted = amount;
+            if (!writing) kernel_task_account_read(amount);
             result = writing ? disk->write(disk->context, device->start_bytes + offset, bytes, amount)
                              : disk->read(disk->context, device->start_bytes + offset, bytes, amount);
         } else {
+            submitted = span;
+            kernel_task_account_read(span);
             result = disk->read(disk->context, device->start_bytes + first, scratch, span);
             if (result != KERNEL_BLOCK_STATUS_OK) return result;
             if (writing) {
@@ -557,6 +578,7 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
             } else __builtin_memcpy(bytes, (unsigned char *)scratch + within, amount);
         }
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
+        if (writing) kernel_task_account_write(submitted);
         *completed += amount;
         offset += amount; bytes += amount; size -= amount;
     }

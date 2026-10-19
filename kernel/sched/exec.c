@@ -119,6 +119,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     if (kernel_mm_activate(&transaction->image.mm, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
+    scheduler_usage_save_mm(thread);
     transaction->retired_mm = thread->mm;
     thread->mm = transaction->image.mm;
     kernel_mm_add_user(&thread->mm);

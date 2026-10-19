@@ -275,4 +275,6 @@ enum kernel_mm_status kernel_mm_shmdt(
 /* Success consumes one reference; last-reference cleanup can retain VFS owners. */
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
+/* MM句柄owner覆盖此无等待快照；保护页仍占用RSS，高水位跨unmap保留。 */
+uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm);
 #endif

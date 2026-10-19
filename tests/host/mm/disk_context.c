@@ -107,8 +107,6 @@ void mm_test_fence(uint64_t address, int instructions)
 void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 { (void)targets; (void)size; mm_test_fence(address,instructions); }
 #endif
-EXCLUDED(kernel_proc_task_block_reads)
-EXCLUDED(kernel_proc_task_note_fault)
 #ifndef FILE_IO_CASES
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)

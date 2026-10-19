@@ -1,3 +1,4 @@
+#include <kernel/accounting.h>
 #include "private.h"
 
 #include <arch/timer.h>
@@ -531,5 +532,21 @@ enum kernel_syscall_status syscall_handle_sleep_for(
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_getrusage(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_linux_rusage usage;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_task_getrusage(caller, (int32_t)request->arguments[0], &usage);
+    if (decoded->value) return KERNEL_SYSCALL_STATUS_OK;
+    struct kernel_mm *mm;size_t copied=0;
+    if (kernel_task_mm_borrow_mutable(caller,&mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    enum kernel_uaccess_status status=kernel_copy_to_user(mm,request->arguments[1],&usage,sizeof(usage),&copied);
+    if (status==KERNEL_UACCESS_STATUS_FAULT) decoded->value=-KERNEL_EFAULT;
+    else if (status || copied!=sizeof(usage)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     return KERNEL_SYSCALL_STATUS_OK;
 }

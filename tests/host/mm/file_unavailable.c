@@ -29,8 +29,8 @@ EXCLUDED(kernel_elf64_source_page)
 #if BOAROS_MAX_CPUS == 1
 EXCLUDED(kernel_task_mm_borrow)
 #endif
-EXCLUDED(kernel_proc_task_block_reads)
-EXCLUDED(kernel_proc_task_note_fault)
+EXCLUDED(kernel_task_read_bytes)
+EXCLUDED(kernel_task_account_fault)
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)
 EXCLUDED(kernel_socket_destroy)
@@ -52,7 +52,6 @@ EXCLUDED(kernel_page_cache_wait_writable)
 EXCLUDED(kernel_page_cache_alias_hold)
 EXCLUDED(kernel_page_cache_alias_put)
 EXCLUDED(kernel_page_cache_retry_alias)
-EXCLUDED(kernel_vfs_check_mapping_domain)
 
 EXCLUDED(kernel_page_cache_write_source)
 
@@ -61,3 +60,5 @@ EXCLUDED(kernel_page_cache_resize_finish)
 
 EXCLUDED(kernel_page_cache_needs_cpu0)
 EXCLUDED(kernel_page_cache_run_cpu0)
+
+EXCLUDED(kernel_page_cache_prepare_mapping_write)

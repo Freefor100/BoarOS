@@ -1,3 +1,4 @@
+#include <kernel/accounting.h>
 #include <arch/task.h>
 #include <arch/timer.h>
 #include <arch/loongarch/signal.h>

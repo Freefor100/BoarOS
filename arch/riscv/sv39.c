@@ -31,6 +31,12 @@
 #define RISCV_SV39_SATP_ASID_MASK (UINT64_C(0xffff) << 44U)
 #define RISCV_SV39_SATP_PPN_MASK ((UINT64_C(1) << 44U) - UINT64_C(1))
 
+static void resident_peak(struct riscv_sv39_user_space *space)
+{
+    uint64_t pages = (uint64_t)space->leaf_pages + space->protected_pages;
+    if (space->peak_resident_pages < pages) space->peak_resident_pages = pages;
+}
+
 static int canonical_virtual_address(uint64_t address)
 {
     uint64_t upper = address >> 39U;
@@ -1004,6 +1010,7 @@ enum riscv_sv39_status riscv_sv39_user_map_owned_page(
     }
     *leaf = user_leaf_entry(physical_address, permissions);
     space->leaf_pages++;
+    resident_peak(space);
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -1045,6 +1052,7 @@ enum riscv_sv39_status riscv_sv39_user_map_cow_page(
     *leaf = user_cow_entry(physical_address, permissions);
     space->leaf_pages++;
     space->cow_pages++;
+    resident_peak(space);
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -1109,6 +1117,7 @@ enum riscv_sv39_status riscv_sv39_user_map_zeroed_page(
     }
     *leaf = user_leaf_entry(physical_address, permissions);
     space->leaf_pages++;
+    resident_peak(space);
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -1476,7 +1485,7 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_
         __atomic_store_n(&root[r], table_entry(middle_address), __ATOMIC_RELEASE);
         prepared->tables[0] = KERNEL_MM_NO_PAGE;
     }
-    s->table_pages += tables; s->leaf_pages++;
+    s->table_pages += tables; s->leaf_pages++; resident_peak(s);
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_cow_snapshot(struct riscv_sv39_user_space *s,
@@ -2291,6 +2300,7 @@ static enum riscv_sv39_status share_user_leaf(
             destination->protected_pages++;
         else
             destination->leaf_pages++;
+        resident_peak(destination);
         return RISCV_SV39_STATUS_OK;
     }
     if (destination->cow_pages == UINT32_MAX) {
@@ -2307,6 +2317,7 @@ static enum riscv_sv39_status share_user_leaf(
         destination->leaf_pages++;
     }
     destination->cow_pages++;
+    resident_peak(destination);
     return RISCV_SV39_STATUS_OK;
 }
 

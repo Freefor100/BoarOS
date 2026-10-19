@@ -84,6 +84,7 @@ def main():
     parser.add_argument('--loader',type=Path,help='fixed musl loader for the dynamic native ELF')
     parser.add_argument('--library',type=Path,help='original TLS DSO paired with --loader')
     parser.add_argument('--manifest',type=Path,help='ABI record manifest instead of the native case stream')
+    parser.add_argument('--require-parallel',action='store_true',help='require actual user execution, syscalls and local IRQs on both CPUs')
     parser.add_argument('--qemu',default='qemu-system-riscv64')
     parser.add_argument('--firmware',default='default')
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -130,7 +131,7 @@ def main():
                     if expected is None:rows=validate(text,cpus,target=='boaros',dynamic=bool(args.loader))
                     else:
                         rows=harness.normalize(text,expected)
-                        validate_execution(text,cpus,target=='boaros')
+                        validate_execution(text,cpus,target=='boaros',require_parallel=args.require_parallel)
                         (folder/f'{target}.normalized').write_text(''.join(rows))
                     if reference is None:reference=rows
                     elif rows!=reference:

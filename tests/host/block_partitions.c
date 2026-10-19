@@ -5,6 +5,8 @@
 #include <string.h>
 #include <pthread.h>
 
+extern _Thread_local uint64_t block_test_read_bytes, block_test_write_bytes;
+
 static unsigned char disk[128 * 512];
 static unsigned reads, writes, flushes, batches, phases, notifications;
 static uint64_t fail_offset = UINT64_MAX;
@@ -97,7 +99,9 @@ static void io_batches(struct kernel_block_device *d, struct kernel_block_device
     assert(!kernel_block_write_batch(p,spans,2) && batches==1);
     assert(!memcmp(disk+8*512,data,sizeof(data)) && spans[0].offset==0);
     fail_offset=9*512;
+    uint64_t submitted = block_test_read_bytes;
     assert(kernel_block_read_batch(p,reads,2,&complete)==KERNEL_BLOCK_STATUS_IO);
+    assert(block_test_read_bytes-submitted==1024);
     assert(batches==2 && notifications==1 && reads[0].completed==512 && reads[1].completed==0 && reads[1].status==KERNEL_BLOCK_STATUS_IO);
     fail_offset=UINT64_MAX;
     assert(!kernel_block_write_phase(p,produce,spans+2,spans) && phases==1);
@@ -109,7 +113,9 @@ static void io_batches(struct kernel_block_device *d, struct kernel_block_device
     assert(!kernel_block_write_phase(p,produce,spans+2,spans));
     fail_offset=9*512;
     unsigned char scratch[512]; size_t done;
+    uint64_t previous_read=block_test_read_bytes,previous_write=block_test_write_bytes;
     assert(kernel_block_write_bytes(p,3,data,700,scratch,sizeof(scratch),&done)==KERNEL_BLOCK_STATUS_IO && done==509);
+    assert(block_test_read_bytes-previous_read==1024 && block_test_write_bytes-previous_write==512);
     fail_offset=UINT64_MAX;
 }
 static void *rmw_thread(void *arg)
