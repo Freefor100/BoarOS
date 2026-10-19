@@ -396,8 +396,8 @@ RV 17.59 秒、LA 17.49 秒；正常关机，heap-live=0，根盘、scratch 与�
 - **pipe11 的 70 分是实际内容检查。**它以 1/2/3/4/10/50 个子进程读取并核对管道长度与字节，再回收；四种配置合计 280 分。这与上面的参数组合检查含义不同。
 - **futex 基础等待/唤醒可用。**例如 RV glibc 的 `futex_wait01` 为 4/4，`futex_wake01` 为 6/6；只覆盖这些超时、值不等和唤醒条件，不代表所有 futex 操作均实现。
 - **目录创建标志已修复。**修复前 `open11` 为26/28，目录及指向目录的链接以 `O_RDONLY|O_CREAT` 打开被误接受；目录分支漏查 O_CREAT。main `8eff5ad` 已统一修复打开检查，当前官方原程序四组均28/28，见[定向结果](oscomp-official-delivery.md)。
-- **CPU 计时器确实缺能力。**`getitimer01` 为 20/32；当前 `which=0` 的 REAL 路径可用，VIRTUAL/PROF 明确返回 ENOSYS。应按计时器种类描述，不能说整个接口全过或全无。
-- **资源限制前置会挡住别的测试。**例如 `abort01`、部分 `shmat01` 在 RLIMIT_CORE 查询返回 EOPNOTSUPP 后被中止。缺口属于资源限制能力；未到达的目标功能不能再据这次结果判失败。
+- **CPU 间隔定时器已补齐。**完整旧运行的 `getitimer01` 为20/32，当时VIRTUAL/PROF返回ENOSYS；main `6dc2737` 增加进程CPU计时器后，四种配置的原程序均30/30，`setitimer02`均3/3。分母变化、实际信号触发与两核回归见[定向结果](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
+- **资源限制前置会挡住别的测试。**例如 `abort01`、部分 `shmat01` 在 RLIMIT_CORE 查询返回 EOPNOTSUPP 后被中止。当前原 `setitimer01` 也在同一准备步骤退出，每组0/6；设置与触发定时器的主体尚未执行。缺口属于资源限制能力。
 - **Kconfig 探测失败不证明目标功能缺失。**每架构 172 次相关零分项在解析 Linux `.config` 时退出；不能伪造配置骗过探测，也不能仅凭这批记录宣称每个目标 API 均不存在。
 - **IPv4 零目的地址已修复。**修复前将 bind 得到的 `0.0.0.0` 用作目的地址时，导入路径原样交给 lwIP，约18秒后 ETIMEDOUT。main `8eff5ad` 已将连接/发送中的零目的地址按 Linux 处理为本机目的地，bind 继续保持通配地址；定向对照及原 connect01 的四组7项均通过。
 
@@ -416,7 +416,7 @@ RV 17.59 秒、LA 17.49 秒；正常关机，heap-live=0，根盘、scratch 与�
 | inode02 | RV 各约 238 秒；LA 186–207 秒；0 分 | 5 子进程、depth=6、breadth=5 的目录树创建/校验/删除，规模随树深增长。覆盖路径解析、元数据事务、回收；原程序打印 TPASS，但无现代 Summary，judge 得零。尚无路径/事务/回收占比。 |
 | hackbench | RV 61–64 秒；LA 48–49 秒；0 分 | 默认约 400 任务的 socketpair 消息交换，覆盖队列、阻塞唤醒和调度；旧输出无 Summary。退出 0 不单独证明全部协议内容检查通过。 |
 | getrandom01–05 | 每项约 30 秒内部超时，0 分 | 修复前 QEMU 未提供 virtio-rng，可信熵未就绪，安全随机调用等待。当前交付通过一次性宿主种子及 RNDADDENTROPY 完成真实初始化，官方无 RNG 设备启动已通过，见[启动机制](../modules/oscomp-compat.md#官方双盘启动熵与格式化工具)。 |
-| sigtimedwait01 / sigwaitinfo01 | glibc 约 0.45–1.52 秒，分别 11/11、9/9；musl 各约 30 秒内部超时、0 分 | 跨 libc 差异明确，内核/运行库边界未隔离，后续需同 ELF 的 Linux 对照及等待/唤醒记录。 |
+| sigtimedwait01 / sigwaitinfo01 | glibc 约 0.45–1.52 秒，分别 11/11、9/9；musl 各约 30 秒内部超时、0 分 | 已用同一原ELF/libc在固定Linux的两架构复现：musl重试EINTR，而首项等待它返回EINTR。内核直接syscall行为与Linux匹配，详见[测例问题](oscomp-test-issues.md#musl-信号等待库重试-eintr测例等待它返回-eintr)。 |
 | mallocstress | RV 22–32 秒；LA 63–98 秒；1 分 | 60 线程分配负载，600 秒是上限而非必须跑满。需区分用户分配器、缺页、brk/mmap、线程调度，不能把全部时间归给内核分配器。 |
 | glibc float_* | 数十秒计算后 abort，0 分 | 原完整日志已出现 `libgcc_s.so.1` 缺失，pthread_exit/cancel 无法展开；是原镜像依赖问题，非后续短复现新增。musl 的 SIGSEGV 尚未归因，不能套用缺库结论。 |
 

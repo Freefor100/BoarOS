@@ -56,6 +56,14 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 [LTP 修正](https://github.com/linux-test-project/ltp/commit/e84f0689cf7a8a77478a0e70aa62560f66c3bceb)、
 [Linux 修改](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f2e467a48287c868818085aa35389a224d226732)。
 
+### musl 信号等待：库重试 EINTR，测例等待它返回 EINTR
+
+`sigtimedwait01`、`sigwaitinfo01`的[首项](https://github.com/linux-test-project/ltp/blob/20240524/libs/libltpsigwait/sigwait.c#L12)使用空等待集合，要求SIGUSR1打断调用并返回EINTR。原musl库收到syscall的`-EINTR`后会重新调用；空集合没有可成功取走的匹配信号，于是反复等待，最后由LTP的30秒watchdog结束。
+
+原RV库标注musl1.2.0、LA库为1.2.5，两份原库反汇编均确认该重试。固定Linux使用同一原ELF和原libc，两个架构均得到：glibc分别11/11、9/9通过，musl各30秒后以0通过、1个TBROK（运行超时）结束。BoarOS的直接syscall对照覆盖空集合与SA_RESTART，返回EINTR的行为与Linux相同。
+
+当前沿用原输入和原judge计分。调整这一差异应落在测试调用方式或显式libc接口适配；原结果、运行身份与短回归见[CPU定时器与信号等待](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
+
 ## 原脚本调用与判分差异
 
 | 项目 | 具体问题与影响 | 当前处理 |
@@ -95,6 +103,7 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 | glibc `float_*` 的线程退出／取消 | 完整旧日志已有 `libgcc_s.so.1` 缺失；glibc 需要它展开线程栈，缺库会 abort。 | 属于原盘依赖。musl 的 SIGSEGV 单独保留归因；见[慢项分类](oscomp-ltp-analysis.md#慢项与超时分类)。 |
 | LA musl 的四个 `sched_*` 函数 | 原 libc 直接返回 ENOSYS，尚未进入内核；对应上游 musl 的接口语义取舍。 | 默认 LA musl 通过调度 DSO 调用真实 Linux syscall，原 cyclictest 已获得样本；见[运行时接入](oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。 |
 | RV 原静态 glibc 的 clock 测试 | malloc 初始化遇 getrandom/EAGAIN 后把 errno 留到 main；后续 clock 调用成功，原断言仍看到旧 errno。 | 当前启动种子在运行测例前完成随机源初始化；指令级对照见[errno 来源](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
+| RV 原 musl 的浮点 ABI 标注 | 原测例标注double-float ABI，原libc标注soft-float；设置`LTP_TIMEOUT_MUL=0.1`时观察到异常巨大时限。 | 信号等待的正式复核沿用未设置该变量的默认30秒；该原输入差异独立于EINTR重试，保留在定向运行记录。 |
 | libc-test 的部分共同失败 | 固定 Linux 上同一原 ELF 也失败，例如缺 UTF-8 locale、glibc 的 ERE 扩展与原断言预期不同。 | 逐项 Linux/BoarOS 输出见[对照附件](oscomp-libctest-original-failures.tsv)及[具体触发条件](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
 
 ## fs_fill：评测预算取舍
