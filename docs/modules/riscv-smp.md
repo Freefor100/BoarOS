@@ -242,7 +242,7 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 
-候选页、entry 和读取工作区在调用 CPU 准备，未初始化数据保持私有，worker 取得 inode 资格后复查并发布 loading，再复用 128 KiB SG 后端读取。完成后用户复制和错误前缀仍由原调用者处理。共享文件来源写入先完成 pin，再关闭目标写资格；完整冷覆盖不读取旧数据或预清整页。
+候选页、entry 和读取工作区在调用 CPU 准备，未初始化数据保持私有。ext4 由调用者取得 inode 资格后复查并发布 loading，再复用 128 KiB SG 后端读取；CPU0 策略的后端由 worker 完成这些步骤。完成后用户复制和错误前缀仍由原调用者处理。共享文件来源写入先完成 pin，再关闭目标写资格；完整冷覆盖不读取旧数据或预清整页。
 
 范围写回复用同一执行队列，每个请求一次只推进最多 128 KiB，未完成时接回队尾，让关闭、同步准备及采用 CPU0 策略的读取先行；ext4 调用者冷读独立推进。调用者只提交一个实际请求并等待最终完成，控制工作区跨窗口复用；每批 entry 借用在本批结束时归还，续批按页号重查。单核直接调用在批末设置短 IRQ 安全点，不逐窗口强制 yield。停止 worker 后取消尚未执行的续批，已经接纳的版本和仍脏的数据分别保留原 owner。worker 的退休清理也按每轮最多 16 项推进，然后让出 CPU。
 
@@ -268,3 +268,5 @@ make test-file-io-smp-userland-riscv INIT_CONFIG=config/init.json \
 热读不创建执行请求，用户 copy 在调用 hart；ext4 冷请求同样就地装入。慢路在候选发布前借用 cache，归还工作区后结束借用；worker 停止与调用者读取具有各自的寿命。运行时时间戳由挂载点raw锁保护共享值与dirty/staged链，锁外唤醒和归还节点；读取不为atime单独排队。可选预读的OFD预测用已有短锁，队列由缓存保护；取消只标记，CPU0预读worker在锁外归还节点。
 
 原生文件检查覆盖 1/2 hart、512 MiB/1 GiB、新盘与独立重启。双 hart 直接核对 CPU1 的块读、ext4 读取、普通冷读和 mmap 冷缺页，以及实际 VirtIO enqueue；单 hart 归到 CPU0。内容、EOF 补零、精确短读写、offset、close 与最终 arena 引用同时检查。真实用户 `ecall` 由 composition 检查发起 CPU 的后端批次和实际设备提交，静态与动态 musl 再检查共同入口。
+
+冷读执行位置的匹配时间、单核成本及混合负载的等待分布见[数据路径实验](../learning/data-path-budget-experiments.md#rv-ext4-在调用-cpu-冷装入2026-10-19)。

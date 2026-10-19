@@ -65,7 +65,7 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 
 挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。普通文件的共享 inode 节点持有 atime/mtime/ctime 与脏字段位，首次打开从实际 inode 解码，硬链接和多个描述符共用该对象。`kernel_vfs_file_accessed()` 直接按这组运行时值判断 relatime，`kernel_vfs_file_modified()` 在非零写请求复制前更新 mtime/ctime；这两个时间更新入口不读取磁盘 inode 或创建时间事务，首字节 EFAULT 仍保留此前的时间更新。只读挂载与 inode 的 NOATIME 标志禁止访问时间更新；O_NOATIME open 选项仍明确返回 ENOTSUP。已知 mount 错误在写侧当场传播，读侧时间错误不改变数据结果。
 
-脏时间字段随数据写回的同一事务编码；无脏数据页时由现有挂载后台线程在首次变脏约 100ms 后、显式同步或卸载编码。该线程在所有可写 ext4 上启动；没有 journal 时只处理脏时间，有 journal 时同时推进组提交。脏字段持有节点引用，最后描述符关闭不会丢失时间。脏时间队列的节点数在入队和摘链时维护，每轮直接用该计数限定处理量，不先遍历队列计数。worker 使用非阻塞事务准入，空间不足时先推进 journal，避免等待自身。namespace、truncate、chmod/chown 和显式 utimens 仍在原 metadata 事务修改时间；挂载回调暂存规范化值，外层事务成功后才发布到共享节点。每个字段的版本检查保留操作等待期间发生的更新，abort 丢弃暂存值，写回仅清除仍等于已编码快照的脏字段。短暂的内存发布依赖现有 CPU0 service 执行域与 IRQ 排斥，不构成通用 SMP inode 锁。操作时机、编码及错误语义的依据见[时间戳学习记录](../learning/file-timestamps.md)。
+脏时间字段随数据写回的同一事务编码；无脏数据页时由现有挂载后台线程在首次变脏约 100ms 后、显式同步或卸载编码。该线程在所有可写 ext4 上启动；没有 journal 时只处理脏时间，有 journal 时同时推进组提交。脏字段持有节点引用，最后描述符关闭不会丢失时间。脏时间队列的节点数在入队和摘链时维护，每轮直接用该计数限定处理量，不先遍历队列计数。worker 使用非阻塞事务准入，空间不足时先推进 journal，避免等待自身。namespace、truncate、chmod/chown 和显式 utimens 仍在原 metadata 事务修改时间；挂载回调暂存规范化值，外层事务成功后才发布到共享节点。每个字段的版本检查保留操作等待期间发生的更新，abort 丢弃暂存值，写回仅清除仍等于已编码快照的脏字段。运行时字段与脏时间链由挂载点时间戳 raw 锁保护；锁外通知及归还节点，磁盘编码和事务提交仍在 CPU0 完成。操作时机、编码及错误语义的依据见[时间戳学习记录](../learning/file-timestamps.md)。
 
 共享查询的 GDT/inode checksum 校验不临时清零 cache 字段。`ext4_crc32c_zeroed()`
 以一个或两个本地零字段计算同一 CRC，不复制整个 inode、不分配或等待；真正的修改路径
