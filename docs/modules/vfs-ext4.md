@@ -40,7 +40,7 @@
 被链接对象的元数据；普通路径与悬空链接继续沿原解析结果返回。proc fd
 的伪对象回调只在短关中断区内取得当前槽的元数据，不分配、不等待。
 
-root/cwd 由共享 FS 记录持有；路径使用者取得带引用的成对快照，快照覆盖路径解析、等待和用户结果准备。同一次操作解析起点和绝对路径根共用这一对快照，起点助手直接借用它，不再次采样共享 cwd。`CLONE_FS` 共享 cwd 更新，fork 复制路径引用；上下文移动、退出与快照发布使用同一 VFS 状态短保护。存活路径按父路径身份和规范名称建立索引，rename 在目录事务成功后同步移动索引及父引用。最后引用先摘除弱索引，再在保护外关闭后端和归还存储。短保护内仅操作索引、引用、挂载连接及有长度上限的路径文本快照。
+root/cwd 由共享 FS 记录持有；路径使用者取得带引用的成对快照，快照覆盖路径解析、等待和用户结果准备。同一次操作解析起点和绝对路径根共用这一对快照，起点助手直接借用它，不再次采样共享 cwd。空路径的 fd 属性查询直接借用 OFD，跳过无用的路径快照。`CLONE_FS` 共享 cwd 更新，fork 复制路径引用；上下文移动、退出与快照发布使用同一 VFS 状态短保护。存活路径按父路径身份和规范名称建立索引，rename 在目录事务成功后同步移动索引及父引用。最后引用先摘除弱索引，再在保护外关闭后端和归还存储。短保护内仅操作索引、引用、挂载连接及有长度上限的路径文本快照。
 
 通用路径已有内部挂载树：挂载持有新实例根路径与被遮蔽路径的引用，父挂载记录
 子挂载数；进入、同点覆盖、`..` 和 `getcwd` 都沿对象身份遍历。普通卸载须先
@@ -252,7 +252,7 @@ extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移
 - `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_unlink_child` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
 - 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->retired = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，避免双重释放与页缓存回收深度嵌套额外消耗任务栈；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
-由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 通过 `ext4_fdir_unlink_dentry` 只摘目标目录项；后端 `ext4_dir_check_empty` 校验目录记录和 checksum、跳过 `.`/`..` 并拒绝非空目录。被持有的目录 inode 延至最后引用释放才回收；同名重建得到不同 inode，旧路径对象仍可查询零链接状态。目录项 checksum 在设置 inode 字段后计算，卸载后的 `e2fsck -fn` 验证磁盘结构。
+由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 通过带目录标志的 `ext4_unlink_child` 只摘目标目录项；后端 `ext4_dir_check_empty` 校验目录记录和 checksum、跳过 `.`/`..` 并拒绝非空目录。被持有的目录 inode 延至最后引用释放才回收；同名重建得到不同 inode，旧路径对象仍可查询零链接状态。目录项 checksum 在设置 inode 字段后计算，卸载后的 `e2fsck -fn` 验证磁盘结构。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
