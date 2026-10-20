@@ -2007,7 +2007,6 @@ enum kernel_files_status kernel_files_getdents(
     uint64_t count,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *description;
     unsigned char record[(19U + 256U + 7U) & ~(size_t)7U];
     /* Fill the name directly in the outgoing dirent. Keeping a second
@@ -2048,6 +2047,7 @@ enum kernel_files_status kernel_files_getdents(
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
 
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(description->file.mount));
     KERNEL_LOCK_SCOPE(offset_guard);
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
     /* The descriptor offset is the backend cookie for the next record. */

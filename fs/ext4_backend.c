@@ -2099,8 +2099,10 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
     }
 
     if (node->instance != 0 && node->instance->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(node->instance->page_cache,
-                                                node);
+        /* Inode writer qualification has drained submitted backend I/O.
+         * Retire prepared snapshots through the same path as truncation;
+         * they observe retirement before obtaining the inode read side. */
+        kernel_page_cache_truncate(node->instance->page_cache, node, 0);
     }
 
     result = free_orphan_inode(lwext4_instance(node->instance), node->inode);
@@ -2152,16 +2154,14 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
     struct kernel_vfs_stat current;
     result = kernel_vfs_fstat(file, &current);
     if (result) return result;
-    node->size = current.size;
-    (*lwext4_node_file(node)).fsize = current.size;
-    file->size = current.size;
     *next_position = position;
-    if (position >= node->size) {
-        *next_position = node->size;
+    if (position >= current.size) {
+        *next_position = current.size;
         return 0;
     }
     start = position & ~UINT64_C(3);
     directory.f = (*lwext4_node_file(node));
+    directory.f.fsize = current.size;
     directory.next_off = start;
     for (;;) {
         result = ext4_dir_entry_next_status(&directory,
@@ -2171,7 +2171,7 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
             return lwext4_error(result);
         }
         if (entry_offset == UINT64_MAX) {
-            *next_position = node->size;
+            *next_position = current.size;
             return 0;
         }
         if (entry_offset < position) {
@@ -2190,8 +2190,8 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
         *inode = directory.de.inode;
         *type = dirent_type_from_ext4(directory.de.inode_type);
         *next_position = directory.next_off;
-        if (entry_offset >= node->size || *next_position <= entry_offset ||
-            *next_position > node->size ||
+        if (entry_offset >= current.size || *next_position <= entry_offset ||
+            *next_position > current.size ||
             *next_position == UINT64_MAX) {
             return -KERNEL_EIO;
         }
@@ -2461,6 +2461,7 @@ static void initialize_backend(void)
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
     ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->file_metadata_execution = KERNEL_VFS_EXECUTION_CALLER;
+    ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;

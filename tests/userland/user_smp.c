@@ -5,6 +5,7 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <net/if.h>
 #include <pthread.h>
 #include <poll.h>
@@ -391,6 +392,55 @@ static void dynamic_tls(void)
     record("dynamic-musl-dlopen-tls");
 }
 #endif
+struct namespace_shared { pthread_barrier_t changed, observed; };
+static void *namespace_cwd_peer(void *argument)
+{
+    struct namespace_shared *shared=argument;
+    pin(0);
+    CHECK(!chdir("/ns-second"));
+    pthread_barrier_wait(&shared->changed);
+    pthread_barrier_wait(&shared->observed);
+    return 0;
+}
+static void caller_namespace(void)
+{
+    pin(online==3 ? 1 : 0);
+    CHECK(!chdir("/"));
+    CHECK(!mkdir("/ns-first",0750) && !mkdir("/ns-second",0750));
+    int parent=open("/ns-first",O_RDONLY|O_DIRECTORY);CHECK(parent>=0);
+    int old=openat(parent,"data",O_CREAT|O_EXCL|O_RDWR,0640);CHECK(old>=0);
+    CHECK(write(old,"original",8)==8 && !fsync(old));
+    char *mapped=mmap(0,4096,PROT_READ,MAP_SHARED,old,0);CHECK(mapped!=MAP_FAILED);
+    CHECK(!memcmp(mapped,"original",8));
+    struct namespace_shared shared;
+    CHECK(!pthread_barrier_init(&shared.changed,0,2) && !pthread_barrier_init(&shared.observed,0,2));
+    pthread_t thread;CHECK(!pthread_create(&thread,0,namespace_cwd_peer,&shared));
+    pthread_barrier_wait(&shared.changed);
+    char cwd[128];CHECK(getcwd(cwd,sizeof(cwd)) && !strcmp(cwd,"/ns-second"));
+    CHECK(!rename("/ns-first","/ns-renamed"));
+    CHECK(!linkat(parent,"data",parent,"hard",0) && !symlinkat("data",parent,"alias"));
+    char link[32];CHECK(readlinkat(parent,"alias",link,sizeof(link))==4 && !memcmp(link,"data",4));
+    DIR *directory=fdopendir(dup(parent));CHECK(directory);
+    unsigned names=0;struct dirent *entry;
+    while ((entry=readdir(directory))) {
+        if (!strcmp(entry->d_name,"data")) names|=1;
+        if (!strcmp(entry->d_name,"hard")) names|=2;
+        if (!strcmp(entry->d_name,"alias")) names|=4;
+    }
+    CHECK(names==7 && !closedir(directory));
+    CHECK(!unlinkat(parent,"data",0) && !unlinkat(parent,"hard",0));
+    int replacement=openat(parent,"data",O_CREAT|O_EXCL|O_RDWR,0600);CHECK(replacement>=0);
+    CHECK(write(replacement,"replaced",8)==8 && !fsync(replacement));
+    char bytes[8];CHECK(pread(old,bytes,8,0)==8 && !memcmp(bytes,"original",8));
+    CHECK(!memcmp(mapped,"original",8) && !munmap(mapped,4096) && !close(old));
+    CHECK(!close(replacement) && !unlinkat(parent,"data",0) && !unlinkat(parent,"alias",0));
+    CHECK(!fsync(parent) && !close(parent) && !rmdir("/ns-renamed"));
+    pthread_barrier_wait(&shared.observed);
+    CHECK(!pthread_join(thread,0));
+    CHECK(!pthread_barrier_destroy(&shared.changed) && !pthread_barrier_destroy(&shared.observed));
+    CHECK(!chdir("/") && !rmdir("/ns-second"));
+    record("caller-namespace-identity");pin(0);
+}
 int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--exec-child")) return 23;
@@ -399,11 +449,11 @@ int main(int argc,char **argv)
     CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3));
     printf("USER-SMP BEGIN cpus=%u\n",online==3 ? 2 : 1); fflush(stdout);
     pin(0);
-    process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress();
+    process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress(); caller_namespace();
 #ifdef BOAROS_SMP_DYNAMIC
-    dynamic_tls(); puts("USER-SMP END 9");
+    dynamic_tls(); puts("USER-SMP END 10");
 #else
-    puts("USER-SMP END 8");
+    puts("USER-SMP END 9");
 #endif
     fflush(stdout); CHECK(!fsync(1) || errno==EINVAL);
     sync(); (void)reboot(RB_POWER_OFF); return 42;

@@ -100,6 +100,7 @@ enum kernel_vfs_execution {
 struct kernel_vfs_backend {
     enum kernel_vfs_execution read_execution;
     enum kernel_vfs_execution file_metadata_execution;
+    enum kernel_vfs_execution namespace_execution;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);

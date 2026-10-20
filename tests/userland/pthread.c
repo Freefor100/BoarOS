@@ -1562,7 +1562,8 @@ static int check_group_limits(void)
         setrlimit(RLIMIT_STACK, &test.stack) != 0)
         return 6;
     errno = 0;
-    if (getrlimit(RLIMIT_CORE, &observed) != -1 || errno != ENOTSUP)
+    if (getrlimit(RLIMIT_CORE, &observed) != 0 ||
+        observed.rlim_cur != 0 || observed.rlim_max != RLIM_INFINITY)
         return 7;
     return result;
 }

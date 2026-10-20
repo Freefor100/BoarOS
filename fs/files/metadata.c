@@ -73,7 +73,6 @@ enum kernel_files_status kernel_files_truncate(
     struct kernel_mm *mm, uint64_t user_path, int64_t length,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (length < 0) {
@@ -97,7 +96,6 @@ enum kernel_files_status kernel_files_utimensat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint64_t user_times, uint32_t flags, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_vfs_timespec times[2];
     struct kernel_vfs_path *path = 0;
@@ -146,12 +144,12 @@ enum kernel_files_status kernel_files_fchmod(
     struct kernel_files *files, int64_t fd, uint32_t mode,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *description =
         kernel_files_hold_fd(files, fd, &pin_guard);
+    KERNEL_SERVICE_SCOPE_IF(service, description && description->kind == KERNEL_OPEN_FILE_KIND_PIPE);
     if (!description || description->kind == KERNEL_OPEN_FILE_KIND_PATH) *linux_result = -KERNEL_EBADF;
     else if (description->kind == KERNEL_OPEN_FILE_KIND_PIPE && !description->file.private_data)
         *linux_result = kernel_pipe_set_mode(description->pipe, mode);
@@ -165,7 +163,6 @@ enum kernel_files_status kernel_files_fchmodat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint32_t mode, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_path *path = 0;
     int result;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
@@ -183,11 +180,11 @@ enum kernel_files_status kernel_files_fchown(
     struct kernel_files *files, int64_t fd, uint32_t uid, uint32_t gid,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
+    KERNEL_SERVICE_SCOPE_IF(service, file && file->kind == KERNEL_OPEN_FILE_KIND_PIPE);
     if (!file || file->kind == KERNEL_OPEN_FILE_KIND_PATH) *linux_result = -KERNEL_EBADF;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
         *linux_result = kernel_pipe_set_owner(file->pipe, uid, gid);
@@ -201,7 +198,6 @@ enum kernel_files_status kernel_files_fchownat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint32_t uid, uint32_t gid, uint32_t flags, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) || !mm || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (flags & ~(KERNEL_FILES_AT_SYMLINK_NOFOLLOW | KERNEL_FILES_AT_EMPTY_PATH)) {
@@ -289,7 +285,6 @@ enum kernel_files_status kernel_files_statfs(
     struct kernel_mm *mm, uint64_t user_path, uint64_t user_buffer,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_path *path = 0;
     int result;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
@@ -307,7 +302,6 @@ enum kernel_files_status kernel_files_fstatfs(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !mm || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;

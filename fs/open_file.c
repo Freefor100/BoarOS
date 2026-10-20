@@ -637,6 +637,10 @@ static void close_cpu0(void *argument)
 static int close_is_local(const struct kernel_open_file_description *file)
 {
     if (file->vfs_closed) return 1;
+    if (file->file.mount && !kernel_vfs_namespace_requires_cpu0(file->file.mount) &&
+        (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR || file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ||
+         file->kind==KERNEL_OPEN_FILE_KIND_PATH) && !file->ep_items && !file->device_opened &&
+        !file->record_locks && !file->generated_ready) return 1;
     /* 普通用户pipe的另一端可以登记epoll，最后关闭须在CPU0通知。
      * 受控内核pipe消费者在创建时已排除协议观察者，端点结束必须
      * 就地唤醒其普通等待者，不能把EOF推迟到等待双方退出后的清理。 */

@@ -125,7 +125,6 @@ int kernel_files_path_start(struct kernel_files *files,
                               struct kernel_vfs_path **start)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     /* fd被关闭后，这个pin仍覆盖借用路径，直到取得独立path引用。 */
     KERNEL_FILES_PIN_SCOPE(selected_fd);
     if (!path[0]) return -KERNEL_ENOENT;
@@ -170,8 +169,8 @@ enum kernel_files_status kernel_files_openat(
     uint64_t mode,
     int64_t *linux_result)
 {
+    KERNEL_SERVICE_SCOPE_IF(service, 0);
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *description = 0;
     struct kernel_vfs_mount *mount;
     KERNEL_FILES_PATH_SCOPE(start);
@@ -295,6 +294,10 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
+    uint32_t object_type = kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT;
+    if (kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
+        (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
+        kernel_service_scope_begin(&service);
     if (!created && (flags & LINUX_O_CREAT) != 0U &&
         (flags & LINUX_O_EXCL) != 0U) {
         KERNEL_FILES_NOTE(files, open_failures, 1);
@@ -470,7 +473,6 @@ enum kernel_files_status kernel_files_symlinkat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_mount *mount;
     KERNEL_FILES_PATH_SCOPE(start);
     char *storage;
@@ -531,7 +533,6 @@ enum kernel_files_status kernel_files_readlinkat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PATH_SCOPE(start);
     char *storage;
     char *buffer;
@@ -698,7 +699,7 @@ static void stat_cpu0(void *);
 static enum kernel_files_status stat_pinned(struct kernel_open_file_description *description,
     struct kernel_mm *mm,uint64_t user_buffer,int64_t *linux_result)
 {
-    if (kernel_open_file_io_requires_cpu0(description)) {
+    if (kernel_vfs_namespace_requires_cpu0(description->file.mount) && kernel_open_file_io_requires_cpu0(description)) {
         struct stat_call call={description,mm,user_buffer,linux_result,KERNEL_FILES_STATUS_STATE};
         enum kernel_page_cache_status status=kernel_page_cache_run_cpu0(
             kernel_open_file_page_cache(description),stat_cpu0,&call);
@@ -730,11 +731,12 @@ static void stat_cpu0(void *argument)
 enum kernel_files_status kernel_files_fstat(struct kernel_files *files,struct kernel_mm *mm,
     int64_t fd,uint64_t user_buffer,int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!kernel_files_is_live(files) || !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_open_file_description *description=kernel_files_hold_fd(files,fd,&pin_guard);
     if (!description) { *linux_result=-KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
+        (!description->file.mount && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PATH));
     return stat_pinned(description,mm,user_buffer,linux_result);
 }
 
@@ -841,7 +843,6 @@ enum kernel_files_status kernel_files_fstatat(struct kernel_files *files,
     const struct kernel_fs_context *fs,struct kernel_mm *mm,int64_t dirfd,
     uint64_t user_path,uint64_t user_buffer,uint64_t flags,int64_t *result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,0);
 }
 
@@ -849,7 +850,6 @@ enum kernel_files_status kernel_files_statx(struct kernel_files *files,
     const struct kernel_fs_context *fs,struct kernel_mm *mm,int64_t dirfd,
     uint64_t user_path,uint64_t flags,uint32_t mask,uint64_t user_buffer,int64_t *result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if(!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) || !mm || !result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if((mask&0x80000000U) || (flags&0x6000)==0x6000) {
@@ -864,7 +864,6 @@ enum kernel_files_status kernel_files_faccessat(
     uint64_t mode, int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PATH_SCOPE(start);
     struct kernel_vfs_stat stat;
     char *path;
@@ -924,7 +923,6 @@ enum kernel_files_status kernel_files_mkdirat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_mount *mount;
     KERNEL_FILES_PATH_SCOPE(start);
     char *path;
@@ -981,7 +979,6 @@ enum kernel_files_status kernel_files_mknodat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_mount *mount;
     KERNEL_FILES_PATH_SCOPE(start);
     char *path;
@@ -1037,7 +1034,6 @@ enum kernel_files_status kernel_files_unlinkat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_mount *mount;
     KERNEL_FILES_PATH_SCOPE(start);
     char *path;
@@ -1095,7 +1091,6 @@ enum kernel_files_status kernel_files_chdir(
     struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     char *path;
     KERNEL_FILES_PATH_SCOPE(start);
     struct kernel_vfs_path *resolved = 0;
@@ -1129,7 +1124,6 @@ enum kernel_files_status kernel_files_fchdir(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     int64_t fd, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1147,7 +1141,6 @@ enum kernel_files_status kernel_files_getcwd(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     char *path;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1185,7 +1178,6 @@ enum kernel_files_status kernel_files_linkat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     KERNEL_FILES_PIN_SCOPE(source_pin);
     KERNEL_FILES_PATH_SCOPE(old_start);
     KERNEL_FILES_PATH_SCOPE(new_start);
@@ -1258,7 +1250,6 @@ enum kernel_files_status kernel_files_renameat(
     int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    KERNEL_SERVICE_SCOPE(service);
     char *paths;
     KERNEL_FILES_PATH_SCOPE(old_start);
     KERNEL_FILES_PATH_SCOPE(new_start);
