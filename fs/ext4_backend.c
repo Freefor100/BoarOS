@@ -145,11 +145,8 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
  * indexed target before reclaim can rotate the tree or retire its last owner. */
 static struct kernel_vfs_node *pin_linked_node(struct lwext4_mount_adapter *adapter, uint32_t inode)
 {
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_vfs_node *node = kernel_vfs_node_find(&adapter->instance, inode);
-    if (node && node->unlinked) node = 0;
-    if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
-    arch_interrupt_restore(irq);
+    struct kernel_vfs_node *node = kernel_vfs_node_pin(&adapter->instance, inode);
+    if (node && node->unlinked && kernel_vfs_node_release(&node)) __builtin_trap();
     return node;
 }
 
@@ -283,6 +280,7 @@ static int free_orphan_inode(struct lwext4_mount_adapter *adapter,uint32_t inode
     if (!result) {
         /* 失败 close 的旧 handle 不再进入 inode 索引。真正释放 inode 时
          * 同时退休它的待清理状态，不能在该 inode 复用后再截断新所有者。 */
+        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
         for (struct kernel_vfs_node *node=adapter->instance.cleanup_nodes;node;node=node->next)
             if (node->inode==inode) {
                 ((struct lwext4_node *)node)->write_completion=0;
@@ -432,14 +430,10 @@ static void time_stage(void *context, void *owner, uint32_t inode, unsigned fiel
                        struct ext4_timestamp value)
 {
     struct lwext4_mount_adapter *adapter = context;
+    struct kernel_vfs_node *pin = owner ? 0 : kernel_vfs_node_pin(&adapter->instance, inode);
+    struct kernel_vfs_node *base = owner ? owner : pin;
+    {
     TIMESTAMP_SCOPE(times, adapter);
-    struct kernel_vfs_node *base = owner;
-    if (!base) {
-        /* Namespace operations remain on CPU0. Handle operations already own
-         * their live inode and must not traverse the CPU0-only registry. */
-        kernel_assert_service_context();
-        base = kernel_vfs_node_find(&adapter->instance, inode);
-    }
     if (base && (base->instance != &adapter->instance || base->inode != inode)) __builtin_trap();
     if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         struct lwext4_node *node = (struct lwext4_node *)base;
@@ -452,6 +446,8 @@ static void time_stage(void *context, void *owner, uint32_t inode, unsigned fiel
         node->staged_version[field] = node->time_version[field];
         node->staged_fields |= 1U << field;
     }
+    }
+    if (pin && kernel_vfs_node_release(&pin)) __builtin_trap();
 }
 
 static void time_finish(void *context, bool accepted)
@@ -822,15 +818,16 @@ int kernel_vfs_sync_block_device(struct kernel_block_device *device)
     KERNEL_SERVICE_SCOPE(service);
     if (!device) return -KERNEL_EINVAL;
     struct lwext4_mount_adapter *selected = NULL;
-    uintptr_t irq = arch_interrupt_save();
+    kernel_task_lock_guard irq = {0};
+    kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
     /* 设备的独占 mount claim 保证至多一个匹配实例。 */
     for (struct lwext4_mount_adapter *a = adapters; a; a = a->next_adapter)
         if (a->block == device && a->mount->state == VFS_MOUNT_STATE_LIVE) {
             selected = a;
             break;
         }
-    if (!selected) { arch_interrupt_restore(irq); return 0; }
-    if (selected->instance.quiescing) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
+    if (!selected) { kernel_task_lock_release(&irq); return 0; }
+    if (selected->instance.quiescing) { kernel_task_lock_release(&irq); return -KERNEL_EBUSY; }
     struct kernel_vfs_path *root = NULL;
     for (struct kernel_vfs_path *p = selected->instance.paths; p; p = p->next)
         if (!p->parent) { root = p; break; }
@@ -842,15 +839,15 @@ int kernel_vfs_sync_block_device(struct kernel_block_device *device)
         /* 没有现存 path 时，先保留本次打开的挂载资格；路径分配可睡眠，
          * 不能让卸载在取得真实 root path owner 之前释放 adapter。 */
         if (selected->instance.external_files == UINT32_MAX) result = -KERNEL_EOVERFLOW;
-        else selected->instance.external_files++;
+        else __atomic_fetch_add(&selected->instance.external_files, 1, __ATOMIC_RELAXED);
     }
-    arch_interrupt_restore(irq);
+    kernel_task_lock_release(&irq);
     if (!root && !result) {
         result = kernel_vfs_path_root(selected->mount,selected->instance.heap,&root);
-        irq = arch_interrupt_save();
+        kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
         if (!selected->instance.external_files) __builtin_trap();
-        selected->instance.external_files--;
-        arch_interrupt_restore(irq);
+        __atomic_fetch_sub(&selected->instance.external_files, 1, __ATOMIC_RELEASE);
+        kernel_task_lock_release(&irq);
     }
     if (!result) result = kernel_vfs_sync_mount(root->file.mount,NULL);
     if (root && kernel_vfs_path_release(&root)) __builtin_trap();
@@ -1769,8 +1766,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     if (result) {
         if (ext4_fclose(lwext4_node_file(node)) != EOK) {
             node->instance = &adapter->instance;
-            node->next = adapter->instance.cleanup_nodes;
-            adapter->instance.cleanup_nodes = node;
+            kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap, node);
         return lwext4_error(result);
     }
@@ -1887,7 +1883,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
          * uncertain journal state. An aborted create must not unlink by name. */
         if (lwext4_node_file(node)->mp && ext4_fclose(lwext4_node_file(node))!=EOK) {
             node->instance=&adapter->instance;
-            node->next=adapter->instance.cleanup_nodes;adapter->instance.cleanup_nodes=node;
+            kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap,node);
         return lwext4_error(result);
     }
@@ -1900,8 +1896,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     if (result) {
         if (ext4_fclose(lwext4_node_file(node)) != EOK) {
             node->instance = &adapter->instance;
-            node->next = adapter->instance.cleanup_nodes;
-            adapter->instance.cleanup_nodes = node;
+            kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap, node);
         return lwext4_error(result);
     }

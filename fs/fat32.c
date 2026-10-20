@@ -748,6 +748,7 @@ static void unlink_identity(struct fat_mount *m, struct fat_inode *i)
     if (!i->linked || RB_REMOVE(fat_entry_tree, &m->entries, i) != i) __builtin_trap();
     __atomic_store_n(&i->linked, 0, __ATOMIC_RELEASE);
     uintptr_t irq = arch_interrupt_save();
+    KERNEL_TASK_LOCK_SCOPE(vfs_state, &kernel_vfs_state_lock);
     struct kernel_vfs_node *node = kernel_vfs_node_find(&m->instance, i->id);
     if (node) node->unlinked = 1;
     arch_interrupt_restore(irq);

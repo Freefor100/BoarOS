@@ -345,14 +345,16 @@ static void run_mount_tree_regression(struct kernel_vfs_mount *root_mount,
     if (kernel_vfs_path_release(&parent) ||
         kernel_fs_context_create(&context, root_mount, heap) !=
             KERNEL_FS_CONTEXT_STATUS_OK ||
-        kernel_fs_context_set_cwd(&context, first_root) ||
-        kernel_vfs_path_resolve(kernel_fs_context_cwd(&context),
-                                kernel_fs_context_root(&context),
+        kernel_fs_context_set_cwd(&context, first_root)) fail_vfs(127U, 0, -1);
+    KERNEL_FS_PATHS(paths, &context);
+    if (kernel_vfs_path_resolve(paths.cwd,
+                                paths.root,
                                 "..", 1, &parent) ||
         parent != root ||
         kernel_vfs_path_release(&parent) ||
         kernel_fs_context_release(&context) != KERNEL_FS_CONTEXT_STATUS_OK)
         fail_vfs(127U, 0, -1);
+    kernel_fs_paths_release(&paths);
     if (kernel_vfs_symlink_at(first_root, root, "mount-anchor", "/cross-symlink") ||
         kernel_vfs_unlink(root_mount, "/cross-symlink"))
         fail_vfs(128U, 0, -1);
@@ -1291,15 +1293,20 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(12U, failed_fclose_calls, retried_fclose_calls);
     }
 
-    device.block.write = 0;
-    device.block.flush = 0;
-    device.block.cache_mode = KERNEL_BLOCK_CACHE_UNKNOWN;
+    /* A physical device can write through single, batch or phase callbacks.
+     * Exercise actual read-only state rather than disabling just one entry. */
+    if (kernel_block_set_read_only(&device.block, 1)) fail_vfs(177U, 0, -1);
     uint64_t observed_error = 0;
-    if (kernel_vfs_mount_root(&mount, &device.block, &heap, &page_cache) ||
-        kernel_vfs_open(&mount, "/init", &file) ||
-        kernel_vfs_sync(&file, 0, &observed_error) ||
-        kernel_vfs_close(&file) || kernel_vfs_unmount(&mount))
-        fail_vfs(78U, 0, -1);
+    result = kernel_vfs_mount_root(&mount, &device.block, &heap, &page_cache);
+    if (result) fail_vfs(178U, 0, result);
+    result = kernel_vfs_open(&mount, "/init", &file);
+    if (result) fail_vfs(179U, 0, result);
+    result = kernel_vfs_sync(&file, 0, &observed_error);
+    if (result) fail_vfs(180U, 0, result);
+    result = kernel_vfs_close(&file);
+    if (result) fail_vfs(181U, 0, result);
+    result = kernel_vfs_unmount(&mount);
+    if (result) fail_vfs(182U, 0, result);
 
     riscv_virtio_mmio_block_get_statistics(&device, &statistics);
     if (statistics.requests == 0U || statistics.timeouts != 0U ||

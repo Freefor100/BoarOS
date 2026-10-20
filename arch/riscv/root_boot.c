@@ -503,9 +503,11 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
         }
     }
     /* 运行期串口TTY必须先发布，初始OFD才能保存正确的实例。 */
+    {
+    KERNEL_FS_PATHS(paths, &fs);
     for (stdio_index = 0U; stdio_index < 3U; stdio_index++) {
         if (kernel_files_open_boot_console(&files,
-                                      kernel_fs_context_root(&fs),
+                                      paths.root,
                                       (int64_t)stdio_index,
                                       &console_result) !=
                 KERNEL_FILES_STATUS_OK ||
@@ -513,6 +515,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
             failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
             goto fail;
         }
+    }
     }
     scheduler_status = kernel_user_thread_create(&image.mm,
                                                  &files,

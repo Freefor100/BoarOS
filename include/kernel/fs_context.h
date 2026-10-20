@@ -55,9 +55,16 @@ enum kernel_fs_context_status kernel_fs_context_move(
 
 int kernel_fs_context_is_live(const struct kernel_fs_context *fs);
 
-/* Borrowed identities remain live while this context is held. */
-struct kernel_vfs_path *kernel_fs_context_root(const struct kernel_fs_context *fs);
-struct kernel_vfs_path *kernel_fs_context_cwd(const struct kernel_fs_context *fs);
+/* An owned pair is coherent with CLONE_FS cwd replacement and context move. */
+struct kernel_fs_paths {
+    struct kernel_vfs_path *root, *cwd;
+    uint32_t umask;
+};
+struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *);
+void kernel_fs_paths_release(struct kernel_fs_paths *);
+#define KERNEL_FS_PATHS(name, fs) \
+    struct kernel_fs_paths name __attribute__((cleanup(kernel_fs_paths_release))) = \
+        kernel_fs_context_snapshot(fs)
 uint32_t kernel_fs_context_umask(const struct kernel_fs_context *fs);
 int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
                                     uint32_t requested, uint32_t *previous);
@@ -65,7 +72,7 @@ int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
                               struct kernel_vfs_path *path);
 
 /* Legacy kernel pathname adapter for an existing object (root boot).
- * User operations use borrowed root/cwd and VFS *at APIs directly.
+ * User operations use owned root/cwd snapshots and VFS *at APIs directly.
  * path_length excludes NUL; normal path errors use linux_result. */
 enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
     const struct kernel_fs_context *fs,

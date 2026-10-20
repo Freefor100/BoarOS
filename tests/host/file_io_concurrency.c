@@ -896,6 +896,7 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
 }
 
+#include "namespace_cases.h"
 #include "block_file_cases.h"
 #ifdef LOOP_IO_CASES
 #include "loop_cases.h"
@@ -959,6 +960,8 @@ int main(int argc,char **argv)
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    namespace_retirement_case(&heap,&mount);
+    namespace_snapshot_case(&heap,&mount);
     raw_mounted_flush_case(&heap,&mount,&disk);
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);

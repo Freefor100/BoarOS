@@ -31,7 +31,8 @@ static int loop_backing_image(struct kernel_files *local,struct kernel_fs_contex
     int fd=loop_test_open(local,local_fs,path,0102|2);
     if (fd<0) {
         struct kernel_vfs_stat stat={0};
-        struct kernel_vfs_mount *back_mount=kernel_vfs_path_mount(kernel_fs_context_root(local_fs));
+        KERNEL_FS_PATHS(paths, local_fs);
+        struct kernel_vfs_mount *back_mount=kernel_vfs_path_mount(paths.root);
         int error=kernel_vfs_stat_path(back_mount,path,1,&stat);
         fprintf(stderr,"loop backing open %s: %d stat=%d mode=%o size=%llu\n",path,fd,error,stat.mode,(unsigned long long)stat.size);
     }
@@ -46,7 +47,8 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
 {
     const char *outer_path=getenv("BOAROS_LOOP_OUTER_IMAGE"),*inner_path=getenv("BOAROS_LOOP_INNER_IMAGE");
     assert(outer_path && inner_path);
-    struct kernel_vfs_path *root=kernel_fs_context_root(local_fs);
+    KERNEL_FS_PATHS(paths, local_fs);
+    struct kernel_vfs_path *root=paths.root;
     assert(!kernel_vfs_mknod_at(root,root,"/loop1",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(1)));
     int backing=loop_backing_image(local,local_fs,"/outer-backing",outer_path);
     int first=loop_test_open(local,local_fs,"/loop0",2);assert(first>=0);
@@ -254,7 +256,8 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_fs_context local_fs={0};struct kernel_files local={0};
     assert(!kernel_fs_context_create(&local_fs,mount,heap) && !kernel_files_create(&local,heap));
-    struct kernel_vfs_path *root=kernel_fs_context_root(&local_fs);
+    KERNEL_FS_PATHS(paths, &local_fs);
+    struct kernel_vfs_path *root=paths.root;
     assert(!kernel_vfs_mknod_at(root,root,"/loop0",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(0)));
     int backing=loop_test_open(&local,&local_fs,"/loop-backing",0102|2); assert(backing>=0);
     int64_t result;assert(!kernel_files_ftruncate(&local,backing,2*1024*1024,&result) && !result);

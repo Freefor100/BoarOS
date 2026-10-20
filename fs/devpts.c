@@ -209,6 +209,7 @@ void kernel_devpts_unpublish(struct kernel_devpts_entry *entry)
         struct devpts_mount *m = entry->mount;
         m->root.stat.mtime = m->root.stat.ctime = time;
         /* 下线只改变目录可见性；旧 inode 可继续 stat/chmod，但不会重新绑定。 */
+        KERNEL_TASK_LOCK_SCOPE(vfs_state, &kernel_vfs_state_lock);
         struct kernel_vfs_node *node = kernel_vfs_node_find(&m->instance, entry->stat.ino);
         if (node && node->backend_data == entry) node->unlinked = 1;
     }

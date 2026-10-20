@@ -31,6 +31,7 @@ struct kernel_vfs_instance {
     uint8_t read_only;
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
+    struct kernel_vfs_path *path_index;
 };
 
 struct kernel_vfs_node {
@@ -77,6 +78,8 @@ struct kernel_vfs_path {
     uint32_t references;
     uint8_t detached;
     char *name;
+    struct kernel_vfs_path *index_left, *index_right;
+    uint8_t index_height;
     char initial_name[];
 };
 

@@ -592,7 +592,9 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                                                         : -KERNEL_EIO;
         goto Finish;
     }
-    result = kernel_vfs_path_link_string(path, kernel_fs_context_root(fs),
+    {
+    KERNEL_FS_PATHS(paths, fs);
+    result = kernel_vfs_path_link_string(path, paths.root,
                                          text, KERNEL_FS_PATH_MAX);
     if (!result) {
         size_t length = strlen(text);
@@ -601,6 +603,7 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
         *count = length;
     }
     kernel_heap_release(node->instance->heap, text);
+    }
 Finish:
     if (kernel_vfs_path_release(&path)) __builtin_trap();
     return result;
@@ -818,7 +821,8 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
     const struct kernel_fs_context *fs = 0;
     if (kernel_task_fs_context_borrow(kernel_task_current(), &fs) !=
         KERNEL_TASK_STATUS_OK) return -KERNEL_ENOENT;
-    struct kernel_vfs_path *root_path = kernel_fs_context_root(fs);
+    KERNEL_FS_PATHS(paths, fs);
+    struct kernel_vfs_path *root_path = paths.root;
     if (!root_path) return -KERNEL_ENOENT;
     struct kernel_vfs_mount *top = node->mount;
     while (top->parent) top = top->parent;

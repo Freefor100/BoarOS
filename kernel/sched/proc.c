@@ -199,10 +199,10 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
                 KERNEL_MM_STATUS_OK) result = 0;
     } else if (kind == KERNEL_PROC_PATH_CWD ||
                kind == KERNEL_PROC_PATH_ROOT) {
-        if (kernel_fs_context_is_live(&task->fs)) {
+        KERNEL_FS_PATHS(paths, &task->fs);
+        if (paths.root) {
             struct kernel_vfs_path *path = kind == KERNEL_PROC_PATH_CWD
-                ? kernel_fs_context_cwd(&task->fs)
-                : kernel_fs_context_root(&task->fs);
+                ? paths.cwd : paths.root;
             if (path && !kernel_vfs_path_acquire(path)) {
                 *owner = path;
                 result = 0;

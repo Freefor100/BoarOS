@@ -324,6 +324,7 @@ static void unlink_inode(struct tmp_mount *m, struct tmp_inode *i)
     i->ctime = now();
     if (!i->links) {
         uintptr_t irq = arch_interrupt_save();
+        KERNEL_TASK_LOCK_SCOPE(vfs_state, &kernel_vfs_state_lock);
         struct kernel_vfs_node *node = kernel_vfs_node_find(&m->instance, i->number);
         if (node) node->unlinked = 1;
         arch_interrupt_restore(irq);
