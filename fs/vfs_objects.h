@@ -148,8 +148,8 @@ struct kernel_vfs_backend {
     int (*sync_filesystem)(struct kernel_vfs_instance *instance,
                            struct kernel_vfs_node *root);
     int (*flush)(struct kernel_vfs_instance *instance);
-    int (*symlink)(struct kernel_vfs_instance *instance, const char *target, const char *path);
-    int (*mknod)(struct kernel_vfs_instance *instance, const char *path,
+    int (*symlink)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path);
+    int (*mknod)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
         uint32_t type, uint32_t mode, uint32_t device);
     int (*link)(struct kernel_vfs_instance *instance, uint64_t source_inode,
         uint64_t target_parent, const char *name);
@@ -170,7 +170,7 @@ struct kernel_vfs_backend {
         uint32_t inode_mode,
         struct kernel_vfs_file *file);
     int (*create)(struct kernel_vfs_mount *mount,
-        const char *path,
+        uint64_t parent_inode, const char *path,
         uint32_t mode,
         struct kernel_vfs_file *file);
     void (*accessed)(struct kernel_vfs_file *file);
@@ -179,12 +179,12 @@ struct kernel_vfs_backend {
     int (*stat)(const struct kernel_vfs_file *file,
         struct kernel_vfs_stat *stat);
     int (*mkdir)(struct kernel_vfs_mount *mount,
-        const char *path,
+        uint64_t parent_inode, const char *path,
         uint32_t mode);
     int (*unlink)(struct kernel_vfs_mount *mount,
-        const char *path);
+        uint64_t parent_inode, const char *path);
     int (*rmdir)(struct kernel_vfs_mount *mount,
-        const char *path);
+        uint64_t parent_inode, const char *path);
     void (*release_unlinked)(struct kernel_vfs_node *node);
     int (*dir_entry)(struct kernel_vfs_file *file,
         uint64_t position,

@@ -72,3 +72,37 @@ static void namespace_snapshot_case(struct kernel_heap *heap,
     assert(!kernel_vfs_rmdir(mount,"/namespace-cwd-b"));
     puts("PASS shared cwd replacement: owned snapshot, fork isolation, move and final context release");
 }
+
+/* 目录身份由 dirfd/path 引用固定，改名后直接在同一个父 inode 下操作。 */
+static void namespace_parent_case(struct kernel_heap *heap,
+                                  struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL,*parent=NULL,*child=NULL;
+    struct kernel_vfs_file file={0};struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-parent",02770));
+    assert(!kernel_vfs_path_lookup(root,"namespace-parent",16,&parent));
+    assert(!kernel_vfs_rename_at(root,root,root,"/namespace-parent","/namespace-renamed",0));
+    assert(!kernel_vfs_create_at(parent,root,"data",0640,&file));
+    assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_mkdir_at(parent,root,"nested",0750));
+    assert(!kernel_vfs_stat_at(parent,root,"nested",1,&stat) && (stat.mode&02000));
+    assert(!kernel_vfs_symlink_at(parent,root,"data","alias"));
+    char text[16];size_t count;
+    assert(!kernel_vfs_readlink_at(parent,root,"alias",text,sizeof(text),&count) &&
+        count==4 && !memcmp(text,"data",4));
+    assert(!kernel_vfs_path_lookup(parent,"data",4,&child));
+    assert(!kernel_vfs_link_at(child,parent,root,"hard"));
+    assert(!kernel_vfs_mknod_at(parent,root,"fifo",KERNEL_VFS_S_IFIFO|0600,0));
+    assert(!kernel_vfs_unlink_at(parent,root,"data",0));
+    assert(!kernel_vfs_path_stat(child,&stat) && stat.nlink==1);
+    assert(!kernel_vfs_path_release(&child));
+    assert(!kernel_vfs_unlink_at(parent,root,"hard",0));
+    assert(!kernel_vfs_unlink_at(parent,root,"alias",0));
+    assert(!kernel_vfs_unlink_at(parent,root,"fifo",0));
+    assert(!kernel_vfs_unlink_at(parent,root,"nested",1));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-renamed",1));
+    assert(kernel_vfs_create_at(parent,root,"gone",0600,&file)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_path_release(&parent) && !kernel_vfs_path_release(&root));
+    puts("PASS parent inode namespace: renamed dirfd, setgid, link/symlink/fifo, deletion and dead directory");
+}

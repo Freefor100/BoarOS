@@ -269,28 +269,33 @@ void kernel_devpts_mount_set_private(struct kernel_vfs_mount *mount, void *priva
 static int no_error(struct kernel_vfs_instance *instance) { (void)instance; return 0; }
 /* Fixed Linux simple_dir_inode_operations has no namespace mutation methods.
  * namei.c returns EACCES for create and EPERM for the remaining operations. */
-static int denied_create(struct kernel_vfs_mount *mount, const char *path,
+static int denied_create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path,
     uint32_t mode, struct kernel_vfs_file *file)
 {
+    (void)parent_inode;
     (void)path; (void)mode; (void)file;
     return devpts(mount)->instance.read_only ? -KERNEL_EROFS : -KERNEL_EACCES;
 }
-static int denied_path(struct kernel_vfs_mount *mount, const char *path)
+static int denied_path(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path)
 {
+    (void)parent_inode;
     (void)path;
     return devpts(mount)->instance.read_only ? -KERNEL_EROFS : -KERNEL_EPERM;
 }
-static int denied_mkdir(struct kernel_vfs_mount *mount, const char *path, uint32_t mode)
-{ (void)mode; return denied_path(mount, path); }
-static int denied_symlink(struct kernel_vfs_instance *instance,
-    const char *target, const char *path)
+static int denied_mkdir(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode)
 {
+    (void)parent_inode; (void)mode; return denied_path(mount, parent_inode, path); }
+static int denied_symlink(struct kernel_vfs_instance *instance,
+    uint64_t parent_inode, const char *target, const char *path)
+{
+    (void)parent_inode;
     (void)target; (void)path;
     return instance->read_only ? -KERNEL_EROFS : -KERNEL_EPERM;
 }
-static int denied_mknod(struct kernel_vfs_instance *instance, const char *path,
+static int denied_mknod(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
     uint32_t type, uint32_t mode, uint32_t device)
 {
+    (void)parent_inode;
     (void)path; (void)mode; (void)device;
     return instance->read_only ? -KERNEL_EROFS :
         type == KERNEL_VFS_S_IFREG ? -KERNEL_EACCES : -KERNEL_EPERM;

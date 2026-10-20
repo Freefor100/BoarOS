@@ -680,12 +680,15 @@ static int close_node(struct kernel_vfs_node *node)
         retire_inode(fm(node->instance), i);
     return 0;
 }
-static int create_path(struct fat_mount *m, const char *path, uint32_t mode, struct fat_inode **out)
+static int create_child(struct fat_mount *m, uint64_t parent_inode, const char *path, uint32_t mode, struct fat_inode **out)
 {
     if (m->instance.read_only) return -KERNEL_EROFS;
     collect_retired(m);
     struct fat_inode *parent; const char *name; size_t n;
-    int r = parent_path(m, path, &parent, &name, &n); if (r) return r;
+    parent = inode_id(m, parent_inode);
+    if (!parent || !parent->linked) return -KERNEL_ENOENT;
+    name = path; n = strlen(name);
+    int r;
     struct fat_record record;
     r = find_record(m, parent, name, n, &record);
     if (r != -KERNEL_ENOENT) return r ? r : -KERNEL_EEXIST;
@@ -716,24 +719,24 @@ static int create_path(struct fat_mount *m, const char *path, uint32_t mode, str
     if (out) *out = i;
     return 0;
 }
-static int create(struct kernel_vfs_mount *mount, const char *path, uint32_t mode, struct kernel_vfs_file *file)
+static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode, struct kernel_vfs_file *file)
 {
     struct fat_mount *m = fm(mount->private_data); uint64_t id;
     {
         KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
         int r = fat_error(&m->instance); if (r) return r;
-        struct fat_inode *i; r = create_path(m, path, KERNEL_VFS_S_IFREG | (mode & 0777), &i);
+        struct fat_inode *i; r = create_child(m, parent_inode, path, KERNEL_VFS_S_IFREG | (mode & 0777), &i);
         if (r) return r;
         id = i->id;
     }
     return open_inode(mount, 0, id, 0, file);
 }
-static int mkdir_inode(struct kernel_vfs_mount *mount, const char *path, uint32_t mode)
+static int mkdir_inode(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode)
 {
     struct fat_mount *m = fm(mount->private_data);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     int r = fat_error(&m->instance);
-    return r ? r : create_path(m, path, KERNEL_VFS_S_IFDIR | (mode & 0777), 0);
+    return r ? r : create_child(m, parent_inode, path, KERNEL_VFS_S_IFDIR | (mode & 0777), 0);
 }
 static int empty_directory(struct fat_mount *m, struct fat_inode *i)
 {
@@ -753,13 +756,15 @@ static void unlink_identity(struct fat_mount *m, struct fat_inode *i)
     if (node) node->unlinked = 1;
     arch_interrupt_restore(irq);
 }
-static int remove_path(struct kernel_vfs_mount *mount, const char *path, int directory)
+static int remove_path(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, int directory)
 {
     struct fat_mount *m = fm(mount->private_data);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     int r = fat_error(&m->instance); if (r) return r;
     struct fat_inode *parent, *i; const char *name; size_t n;
-    r = parent_path(m, path, &parent, &name, &n); if (r) return r;
+    parent = inode_id(m, parent_inode);
+    if (!parent || !parent->linked) return -KERNEL_ENOENT;
+    name = path; n = strlen(name);
     r = child_inode(m, parent, name, n, &i); if (r) return r;
     int isdir = (i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
     if (directory != isdir) return directory ? -KERNEL_ENOTDIR : -KERNEL_EISDIR;
@@ -774,8 +779,8 @@ static int remove_path(struct kernel_vfs_mount *mount, const char *path, int dir
     }
     return r ? r : store_inode(m, parent);
 }
-static int unlink_file(struct kernel_vfs_mount *m, const char *p) { return remove_path(m, p, 0); }
-static int rmdir_inode(struct kernel_vfs_mount *m, const char *p) { return remove_path(m, p, 1); }
+static int unlink_file(struct kernel_vfs_mount *m, uint64_t parent_inode, const char *p) { return remove_path(m, parent_inode, p, 0); }
+static int rmdir_inode(struct kernel_vfs_mount *m, uint64_t parent_inode, const char *p) { return remove_path(m, parent_inode, p, 1); }
 static void release_unlinked(struct kernel_vfs_node *node)
 {
     KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node, &io, 1);
