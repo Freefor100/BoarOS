@@ -125,7 +125,7 @@ struct ext4_bcache {
 	struct kernel_raw_lock metadata;
 	struct ext4_writeback_scope *writeback_scope;
 
-	/**@brief   Item count in block cache*/
+	/**@brief   Retained idle-buffer target; active/journal owners are separate. */
 	uint32_t cnt;
 
 	/**@brief   Item size in block cache*/
@@ -148,6 +148,7 @@ struct ext4_bcache {
 
 	/**@brief   Unreferenced buffers in idle age order. */
 	struct ext4_buf *lru_head, *lru_tail;
+	uint32_t idle_blocks;
 
 	/**@brief   A singly-linked list holding dirty buffers*/
 	SLIST_HEAD(ext4_buf_dirty, ext4_buf) dirty_list;

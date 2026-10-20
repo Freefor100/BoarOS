@@ -57,8 +57,10 @@ static int ext4_bcache_lba_compare(struct ext4_buf *a, struct ext4_buf *b)
 RB_GENERATE_INTERNAL(ext4_buf_lba, ext4_buf, lba_node,
 		     ext4_bcache_lba_compare, static inline)
 
-static void idle_remove_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
+static inline __attribute__((always_inline)) void idle_remove_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
+    if (!bc->idle_blocks) __builtin_trap();
+    bc->idle_blocks--;
     if (buf->lru_previous) buf->lru_previous->lru_next=buf->lru_next;
     else {
         if (bc->lru_head!=buf) __builtin_trap();
@@ -71,9 +73,11 @@ static void idle_remove_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
     }
     buf->lru_previous=buf->lru_next=NULL;
 }
-static void idle_append_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
+static inline __attribute__((always_inline)) void idle_append_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
     if (buf->lru_previous || buf->lru_next || bc->lru_head==buf) __builtin_trap();
+    if (bc->idle_blocks==UINT32_MAX) __builtin_trap();
+    bc->idle_blocks++;
     buf->lru_previous=bc->lru_tail;
     if (bc->lru_tail) bc->lru_tail->lru_next=buf;
     else bc->lru_head=buf;
@@ -234,7 +238,9 @@ void ext4_bcache_invalidate_lba(struct ext4_bcache *bc, uint64_t from, uint32_t 
     }
 }
 
-static int put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_only)
+/* Every metadata read returns here. Keep the RV translated hot path in one
+ * code page; the existing layout check also bounds this function's size. */
+static int __attribute__((aligned(1024))) put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_only)
 {
     struct ext4_buf *buf=b->buf;
     bool flush=false,drop=false;
@@ -299,7 +305,10 @@ int ext4_bcache_shake(struct ext4_bcache *bc)
         {
             KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
             buf=bc->lru_head;
-            if (!buf || bc->ref_blocks<bc->cnt) break;
+            /* Borrowed journal/in-flight buffers cannot be reclaimed here.
+             * Charging them against idle retention evicts every clean path
+             * block while a transaction owns more than cnt buffers. */
+            if (!buf || bc->idle_blocks<bc->cnt) break;
             dirty=ext4_bcache_test_flag(buf,BC_DIRTY);
             if (dirty && read_only) break;
             if (dirty) get_locked(bc,&owned,buf);

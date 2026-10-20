@@ -313,13 +313,18 @@ struct kernel_service_scope { unsigned entered; };
 void kernel_service_scope_begin(struct kernel_service_scope *);
 void kernel_service_scope_end(struct kernel_service_scope *);
 void kernel_scheduler_ack_user_service(void);
-#else
-static inline void kernel_service_scope_begin(struct kernel_service_scope *scope) { (void)scope; }
-static inline void kernel_service_scope_end(struct kernel_service_scope *scope) { (void)scope; }
-#endif
 #define KERNEL_SERVICE_SCOPE_IF(name, condition) \
     struct kernel_service_scope name __attribute__((cleanup(kernel_service_scope_end))) = {0}; \
     if (condition) kernel_service_scope_begin(&(name))
+#else
+static inline void kernel_service_scope_begin(struct kernel_service_scope *scope) { (void)scope; }
+static inline void kernel_service_scope_end(struct kernel_service_scope *scope) { (void)scope; }
+/* Execution-domain predicates have no work when user service migration is
+ * absent. Keep type checking without calling out-of-line backend queries. */
+#define KERNEL_SERVICE_SCOPE_IF(name, condition) \
+    struct kernel_service_scope name __attribute__((cleanup(kernel_service_scope_end))) = {0}; \
+    (void)sizeof(!!(condition))
+#endif
 #define KERNEL_SERVICE_SCOPE(name) KERNEL_SERVICE_SCOPE_IF(name, 1)
 
 /* Resolves a hardware fault in the running user task's active MM. */

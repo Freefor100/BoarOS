@@ -2154,17 +2154,9 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
         return -KERNEL_ENOTDIR;
     }
-    struct kernel_vfs_stat current;
-    result = kernel_vfs_fstat(file, &current);
-    if (result) return result;
     *next_position = position;
-    if (position >= current.size) {
-        *next_position = current.size;
-        return 0;
-    }
     start = position & ~UINT64_C(3);
     directory.f = (*lwext4_node_file(node));
-    directory.f.fsize = current.size;
     directory.next_off = start;
     for (;;) {
         result = ext4_dir_entry_next_status(&directory,
@@ -2174,7 +2166,7 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
             return lwext4_error(result);
         }
         if (entry_offset == UINT64_MAX) {
-            *next_position = current.size;
+            *next_position = directory.f.fsize;
             return 0;
         }
         if (entry_offset < position) {
@@ -2193,8 +2185,8 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
         *inode = directory.de.inode;
         *type = dirent_type_from_ext4(directory.de.inode_type);
         *next_position = directory.next_off;
-        if (entry_offset >= current.size || *next_position <= entry_offset ||
-            *next_position > current.size ||
+        if (entry_offset >= directory.f.fsize || *next_position <= entry_offset ||
+            *next_position > directory.f.fsize ||
             *next_position == UINT64_MAX) {
             return -KERNEL_EIO;
         }

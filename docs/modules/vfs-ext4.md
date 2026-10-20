@@ -40,7 +40,7 @@
 被链接对象的元数据；普通路径与悬空链接继续沿原解析结果返回。proc fd
 的伪对象回调只在短关中断区内取得当前槽的元数据，不分配、不等待。
 
-root/cwd 由共享 FS 记录持有；路径使用者取得带引用的成对快照，快照覆盖路径解析、等待和用户结果准备。`CLONE_FS` 共享 cwd 更新，fork 复制路径引用；上下文移动、退出与快照发布使用同一 VFS 状态短保护。存活路径按父路径身份和规范名称建立索引，rename 在目录事务成功后同步移动索引及父引用。最后引用先摘除弱索引，再在保护外关闭后端和归还存储。短保护内仅操作索引、引用、挂载连接及有长度上限的路径文本快照。
+root/cwd 由共享 FS 记录持有；路径使用者取得带引用的成对快照，快照覆盖路径解析、等待和用户结果准备。同一次操作解析起点和绝对路径根共用这一对快照，起点助手直接借用它，不再次采样共享 cwd。`CLONE_FS` 共享 cwd 更新，fork 复制路径引用；上下文移动、退出与快照发布使用同一 VFS 状态短保护。存活路径按父路径身份和规范名称建立索引，rename 在目录事务成功后同步移动索引及父引用。最后引用先摘除弱索引，再在保护外关闭后端和归还存储。短保护内仅操作索引、引用、挂载连接及有长度上限的路径文本快照。
 
 通用路径已有内部挂载树：挂载持有新实例根路径与被遮蔽路径的引用，父挂载记录
 子挂载数；进入、同点覆盖、`..` 和 `getcwd` 都沿对象身份遍历。普通卸载须先
@@ -153,6 +153,8 @@ journal 路径已包含持久化屏障，不额外发设备 flush；无 journal 
 
 日志请求、checkpoint 请求和进度等待队列随挂载实例一起初始化，同步推进日志与后台 worker 共用这些队列。后台线程启动只建立执行者，不重置等待关系；受限日志预算在前台同步推进旧组后也可正常发布进度。
 
+lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入、被调用者或日志借用的块另持真实引用。miss 在短保护下按闲置 LRU 选择释放者，日志版本的 home 缓冲仍计入原日志内存预算。批量借用归还和并发 miss 可短时超过闲置目标，内存压力沿现有回收入口处理。将日志借用计入闲置目标会使其占满名额，导致根目录和父目录反复驱逐、读盘。
+
 ## 挂载范围与全局同步
 
 `kernel_vfs_sync_mount()`先取得根路径owner，按注册时增减的节点计数准备快照容量，
@@ -246,15 +248,15 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/lwext4-metadata-host.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
 
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。根 mount 保存稳定的内部 ID 1 作为 `dev`，不表达物理设备 major/minor。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
-目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
-- `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
+目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
+- `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_unlink_child` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
 - 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->retired = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，避免双重释放与页缓存回收深度嵌套额外消耗任务栈；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 通过 `ext4_fdir_unlink_dentry` 只摘目标目录项；后端 `ext4_dir_check_empty` 校验目录记录和 checksum、跳过 `.`/`..` 并拒绝非空目录。被持有的目录 inode 延至最后引用释放才回收；同名重建得到不同 inode，旧路径对象仍可查询零链接状态。目录项 checksum 在设置 inode 字段后计算，卸载后的 `e2fsck -fn` 验证磁盘结构。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存与逐分量权限检查；后台写回按阈值和压力触发，顺序预读有独立候选实现，默认关闭。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存与逐分量权限检查；后台写回按阈值和压力触发，顺序预读有独立候选实现，默认关闭。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -265,7 +267,7 @@ unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_
 文件资源层将该值放进 OFD offset 和 `linux_dirent64.d_off`，只有完整 usercopy 后才提交。
 
 `ext4_dir_entry_next_status()` 是当前适配器的错误保留入口：一次调用从 `next_off` 定位并推进
-一个或多个物理记录，inode 为零的目录尾记录不会被误判为 EOF；返回 `UINT64_MAX` 只表示真实结束。
+一个或多个物理记录，同一次 inode 读取同时取得实际目录尺寸并发布给适配层，省去每条记录前的重复 stat。inode 为零的目录尾记录不会被误判为 EOF；返回 `UINT64_MAX` 只表示真实结束。
 `kernel_vfs_dir_entry()` 对任意 seek 位置向前对齐到 4 字节边界并规范化到下一个记录，因而保存的
 cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所以独立 open 的游标独立，dup/fork
 共享游标；目录节点本身不保存可变遍历状态。

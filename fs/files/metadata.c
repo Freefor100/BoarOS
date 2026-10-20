@@ -35,7 +35,7 @@ static int metadata_path(struct kernel_files *files,
         if (!result) *path = start;
         return result;
     }
-    int result = kernel_files_path_start(files, fs, dirfd, name, &start);
+    int result = kernel_files_path_start(files, &fs_paths, dirfd, name, &start);
     if (result) return result;
     result = kernel_vfs_path_resolve(start, fs_paths.root, name,
                     !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), path);
