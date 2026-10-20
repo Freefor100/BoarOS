@@ -368,7 +368,7 @@ static void ext4_time_store(struct ext4_inode_ref *ref, size_t base_offset,
 }
 
 static void ext4_publish_times(struct ext4_mountpoint *mp,
-                              struct ext4_inode_ref *ref, unsigned fields)
+                              struct ext4_inode_ref *ref, unsigned fields, void *owner)
 {
     static const size_t base[3] = {offsetof(struct ext4_inode, access_time),
         offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, change_inode_time)};
@@ -376,12 +376,12 @@ static void ext4_publish_times(struct ext4_mountpoint *mp,
         offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
     if (!mp->time_observer.store) return;
     for (unsigned i = 0; i < 3; i++) if (fields & (1U << i))
-        mp->time_observer.store(mp->time_observer.context, ref->index, i,
+        mp->time_observer.store(mp->time_observer.context, owner, ref->index, i,
                                ext4_time_load(ref, base[i], extra[i]));
 }
 
 static void ext4_touch_inode(struct ext4_mountpoint *mp,
-                             struct ext4_inode_ref *ref, unsigned int fields)
+                             struct ext4_inode_ref *ref, unsigned int fields, void *owner)
 {
     struct ext4_timestamp now;
     if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return;
@@ -407,7 +407,7 @@ static void ext4_touch_inode(struct ext4_mountpoint *mp,
     if (fields & EXT4_TIME_CTIME)
         ext4_time_store(ref, offsetof(struct ext4_inode, change_inode_time),
                         offsetof(struct ext4_inode, ctime_extra), now);
-    ext4_publish_times(mp, ref, fields);
+    ext4_publish_times(mp, ref, fields, owner);
 }
 
 static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
@@ -462,7 +462,7 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		ext4_fs_inode_links_count_inc(parent);
 		ch->dirty = true;
 		parent->dirty = true;
-		ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+		ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 		return r;
 	}
 	/*
@@ -501,7 +501,7 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		ch->dirty = true;
 	}
 
-	ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+	ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 	return r;
 }
 
@@ -533,8 +533,8 @@ static int ext4_unlink(struct ext4_mountpoint *mp,
 		parent->dirty = true;
 	}
 
-    ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
-    ext4_touch_inode(mp, child, EXT4_TIME_CTIME);
+    ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+    ext4_touch_inode(mp, child, EXT4_TIME_CTIME, NULL);
 	if (ext4_inode_get_links_cnt(child->inode)) {
 		ext4_fs_inode_links_count_dec(child);
 		child->dirty = true;
@@ -1410,7 +1410,7 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     if (result == EOK) {
         /* Shared query grants no upgrade; ext4_touch_inode rechecks current
          * inode times under the exclusive gate after any competing edit. */
-        ext4_touch_inode(mp, &ref, fields);
+        ext4_touch_inode(mp, &ref, fields, file->time_owner);
         result = ext4_fs_put_inode_ref(&ref);
     }
     result = ext4_trans_finish(mp, result);
@@ -1462,7 +1462,7 @@ static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
     if (r == EOK) {
         for (unsigned i = 0; i < 3; i++)
             if (fields & (1U << i)) ext4_time_store(&ref, base[i], extra[i], times[i]);
-        if (publish) ext4_publish_times(mp, &ref, fields);
+        if (publish) ext4_publish_times(mp, &ref, fields, file->time_owner);
         r = ext4_fs_put_inode_ref(&ref);
     }
     r = ext4_trans_finish(mp, r);
@@ -1499,7 +1499,7 @@ static int ext4_file_set_mode_common(ext4_file *file, uint32_t mode, bool initia
         ext4_inode_set_mode(&mp->fs.sb, ref.inode,
                             (previous & ~0xfffU) | (mode & 0xfffU));
         ref.dirty = true;
-        if (!initial) ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME);
+        if (!initial) ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME, file->time_owner);
         r = ext4_fs_put_inode_ref(&ref);
     }
     r = ext4_trans_finish(mp, r);
@@ -1542,7 +1542,7 @@ static int ext4_file_set_owner_once(ext4_file *file, uint32_t uid, uint32_t gid)
             if (gid != UINT32_MAX) ext4_inode_set_gid(ref.inode, gid);
             ext4_inode_set_mode(&mp->fs.sb, ref.inode, mode);
             ref.dirty = true;
-            ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME);
+            ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME, file->time_owner);
         }
         r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
     }
@@ -1910,7 +1910,7 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 					ext4_inode_set_mode(sb, child_ref.inode, child_mode | 02000U);
 			}
 			ext4_touch_inode(mp, &child_ref,
-			    EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+			    EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 
 			/*Link with root dir.*/
 			r = ext4_link(mp, &ref, &child_ref, path, len, false);
@@ -2324,8 +2324,8 @@ int ext4_link_child(const char *mount_point, uint32_t source_inode,
     if (r != EOK) goto Put;
     ext4_fs_inode_links_count_inc(&source);
     source.dirty = true;
-    ext4_touch_inode(mp, &source, EXT4_TIME_CTIME);
-    ext4_touch_inode(mp, &parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+    ext4_touch_inode(mp, &source, EXT4_TIME_CTIME, NULL);
+    ext4_touch_inode(mp, &parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 Put:
     if (parent.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&parent));
     if (source.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&source));
@@ -2477,14 +2477,14 @@ int ext4_rename_child(const char *mount_point,
 		if (target_dir) ext4_inode_set_links_cnt(victim.inode, 0);
 		else ext4_fs_inode_links_count_dec(&victim);
 		victim.dirty = true;
-		ext4_touch_inode(mp, &victim, EXT4_TIME_CTIME);
+		ext4_touch_inode(mp, &victim, EXT4_TIME_CTIME, NULL);
 		output.replaced_inode = victim_ino;
 		output.replaced_last_link = !ext4_inode_get_links_cnt(victim.inode);
 	}
-	ext4_touch_inode(mp, &source, EXT4_TIME_CTIME);
-	ext4_touch_inode(mp, &old, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+	ext4_touch_inode(mp, &source, EXT4_TIME_CTIME, NULL);
+	ext4_touch_inode(mp, &old, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 	if (destination != &old)
-		ext4_touch_inode(mp, destination, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+		ext4_touch_inode(mp, destination, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 	output.changed = true;
 Put:
 	if (victim.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&victim));
@@ -2984,7 +2984,7 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 
 Finish:
 	if (r == EOK || ext4_inode_get_size(sb, ref.inode) != old_size) {
-		ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+		ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME, file->time_owner);
 	}
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
 	cleanup_r = ext4_fs_put_inode_ref(&ref);
@@ -3262,7 +3262,7 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
         }
     }
 Touch:
-    if (r == EOK) ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+    if (r == EOK) ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME, file->time_owner);
 Put:
     file->fsize = ext4_inode_get_size(sb, ref.inode);
     r = ext4_result(r, ext4_fs_put_inode_ref(&ref));

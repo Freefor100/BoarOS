@@ -1,4 +1,5 @@
 #include <kernel/block.h>
+#include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <assert.h>
 #include <stdio.h>
@@ -173,6 +174,10 @@ static void invalid_tables(void)
 }
 int main(void)
 {
+#if BOAROS_MAX_CPUS > 1
+    /* Exercise the real block entrypoints from a non-service task CPU. */
+    kernel_cpu_current()->logical_id = 1;
+#endif
     struct kernel_block_device d={.read=rd,.write=wr,.flush=flush,
         .logical_block_size=512,.capacity_bytes=sizeof(disk)}, p[4]={0};
     assert(!kernel_block_register(&d,KERNEL_BLOCK_DEVICE_NUMBER(1)));

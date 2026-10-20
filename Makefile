@@ -470,7 +470,9 @@ LDFLAGS += -Wl,--wrap=kernel_wait_park
 endif
 ifeq ($(FILE_IO_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/file_io_smp.o
+$(BUILD_DIR)/tests/riscv/file_io_smp.o: CPPFLAGS += $(LWEXT4_CPPFLAGS)
 LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
+LDFLAGS += -Wl,--wrap=ext4_file_prepare_write,--wrap=ext4_ftruncate,--wrap=ext4_fallocate,--wrap=ext4_file_sync_metadata_prepare
 LDFLAGS += -Wl,--wrap=virtio_split_enqueue
 endif
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
@@ -1709,6 +1711,8 @@ test-block-host:
 	build/host/block-registry
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-partitions
 	build/host/block-partitions
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c tests/host/sync/notifications.c -pthread -Itests/host/block_model -o build/host/block-partitions-smp
+	build/host/block-partitions-smp
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
 	build/host/block-fault
 

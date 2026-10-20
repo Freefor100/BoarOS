@@ -14,7 +14,6 @@ static unsigned heap_users;
 static struct kernel_wait_queue channels[64];
 static void backend_enter(void *lock, int read)
 {
-    if (!read) kernel_assert_service_context();
     struct kernel_io_context *context = kernel_io_context_current();
     if (context->backend_depth) {
         if (context->backend_guard.lock != lock || (!read && context->backend_read)) __builtin_trap();
@@ -27,7 +26,7 @@ static void backend_enter(void *lock, int read)
 }
 static void backend_read(void *lock) { backend_enter(lock, 1); }
 static void backend_write(void *lock) { backend_enter(lock, 0); }
-static void backend_leave(void *lock)
+void boaros_lwext4_unlock(void *lock)
 {
     struct kernel_io_context *context = kernel_io_context_current();
     if (!context->backend_depth || context->backend_guard.lock != lock) __builtin_trap();
@@ -53,7 +52,7 @@ void boaros_lwext4_resume(void *lock, unsigned depth)
 void boaros_lwext4_lock_init(struct ext4_lock *callbacks, struct kernel_rwlock *lock)
 {
     callbacks->lock = backend_write;
-    callbacks->unlock = backend_leave;
+    callbacks->unlock = boaros_lwext4_unlock;
     callbacks->read_lock = backend_read;
     callbacks->owner = backend_owner;
     callbacks->context = lock;

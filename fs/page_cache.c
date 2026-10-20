@@ -667,6 +667,15 @@ static int drain_cleanup_entries(struct kernel_page_cache *cache,
 static int drain_entries(struct kernel_page_cache *cache,
                          uint64_t *pages_released)
 {
+    if (remote_cache_client()) {
+        CACHE_SCOPE(guard,cache);
+        if (!cache->record->cleanup_entries) return 1;
+        /* The shared retired list may own the final reference to a different
+         * inode. Its backend close and registry removal remain CPU0 work. */
+        cache->record->requested=1;
+        cache_wake(&cache->record->work);
+        return 0;
+    }
     struct kernel_page_cache_entry *entries;
     take_cleanup_entries(cache,&entries);
     return drain_cleanup_entries(cache,&entries,SIZE_MAX,pages_released);
@@ -1349,14 +1358,9 @@ static enum kernel_page_cache_status finish_read_page(
         if (park && kernel_wait_park(&token, &reason)) __builtin_trap();
         if (kernel_wait_finish(&token)) __builtin_trap();
     }
-    /* 仅CPU0结束node/backend owner；远端最后失败者请求worker收尾。 */
     if (clean) {
-        if (!remote_cache_client()) { uint64_t released = 0; (void)drain_entries(cache, &released); }
-        else {
-            CACHE_SCOPE(notify, cache);
-            cache->record->requested = 1;
-            cache_wake(&cache->record->work);
-        }
+        uint64_t released = 0;
+        (void)drain_entries(cache, &released);
     }
     return status;
 }
@@ -1760,11 +1764,16 @@ static enum kernel_page_cache_status run_cpu0_until(struct kernel_page_cache *ca
     if (!cache_live(cache) || !execute)
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     struct kernel_io_context *io=kernel_io_context_current();
-    if (borrowed && (io->locks!=borrowed || borrowed->owner!=io || borrowed->previous ||
+    if (borrowed && (io->locks!=borrowed || borrowed->owner!=io ||
         !borrowed->lock || !borrowed->write || !kernel_lock_held(borrowed->lock,1) ||
         io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
         !kernel_scheduler_can_sleep() || arch_external_interrupt_active()))
         return KERNEL_PAGE_CACHE_STATUS_STATE;
+    /* A blocked writer can retain both its offset and operation guards. The
+     * worker starts at inode rank and never acquires either caller guard. */
+    if (borrowed) for (const struct kernel_lock_guard *g=borrowed;g;g=g->previous)
+        if (g->owner!=io || !g->write || !g->lock ||
+            (g->lock->rank!=10 && g->lock->rank!=15)) return KERNEL_PAGE_CACHE_STATUS_STATE;
     if (kernel_page_cache_is_executor(cache)) {
         do { execute(argument); } while (finished && !*finished);
         return KERNEL_PAGE_CACHE_STATUS_OK;
@@ -1900,7 +1909,7 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
         struct read_batch_load request={cache,file,first,pages,count,candidates,entries,loads,outputs,spans,
             workspace?&workspace->backend:NULL,allocation};
         enum kernel_page_cache_status submitted=KERNEL_PAGE_CACHE_STATUS_OK;
-        if (node->instance->ops->read_execution==KERNEL_VFS_READ_CPU0 && remote_cache_client())
+        if (node->instance->ops->read_execution==KERNEL_VFS_EXECUTION_CPU0 && remote_cache_client())
             submitted=run_request(cache,commit_read_batch,&request,0,NULL);
         else commit_read_batch(&request);
         if (submitted) {
@@ -2136,19 +2145,23 @@ static void prepare_space(void *argument)
 static void complete_space(void *argument)
 {
     struct prepare_space *request=argument;
-    request->error=request->node->instance->ops->complete_write(request->node);
+    struct kernel_vfs_node *node=request->node;
+    request->error=kernel_page_cache_writeback_range_borrowing(node->instance->page_cache,
+        node,0,UINT64_MAX,kernel_io_context_current()->locks);
+    if (!request->error) request->error=node->instance->ops->complete_write(node);
 }
 static int prepare_space_request(struct kernel_page_cache *cache,struct prepare_space *request,
     void (*execute)(void *))
 {
-    /* 调用者只保留 write/offset 的互斥；源缺页、inode 和页写许可均不跨
-     * CPU0 空间准备，worker 不反向取得调用者的低层互斥。 */
+    /* 来源pin和页写资格在空间准备前归还；write/offset门闩保持同次写互斥。
+     * CPU0后端借用这些门闩，CALLER后端直接使用当前任务的事务现场。 */
     struct kernel_io_context *context=kernel_io_context_current();
     if (context->user_pins || context->cache_writes || context->backend_depth || kernel_cpu_current()->raw_locks)
         __builtin_trap();
     for (struct kernel_lock_guard *g=context->locks;g;g=g->previous)
         if (g->lock->rank>15) __builtin_trap();
-    if (kernel_page_cache_needs_cpu0(cache)) {
+    if (request->node->instance->ops->file_metadata_execution == KERNEL_VFS_EXECUTION_CPU0 &&
+        kernel_page_cache_needs_cpu0(cache)) {
         if (run_request(cache,execute,request,1,NULL)) return -KERNEL_EIO;
     } else execute(request);
     return request->error;
@@ -2752,10 +2765,6 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node,uint64_t start,uint64_t end)
 { return kernel_page_cache_writeback_range_borrowing(cache,node,start,end,NULL); }
 
-int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t end)
-{ return end ? kernel_page_cache_writeback_range(cache, node, 0, end) : 0; }
-
 int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
 { return kernel_page_cache_writeback_range(cache, node, 0, UINT64_MAX); }
 
@@ -2855,7 +2864,6 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
 {
     if (cache_live(cache)) readahead_cancel_node(cache, node);
     {
-        kernel_assert_service_context();
         {
             CACHE_SCOPE(guard,cache);
             struct kernel_page_cache_entry *entry=*kernel_vfs_node_cache_pages(node);

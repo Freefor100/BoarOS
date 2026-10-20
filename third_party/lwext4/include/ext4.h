@@ -137,10 +137,11 @@ struct ext4_timestamp {
 };
 typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
 /* Adapter-owned live inode times. Stores are tentative until the outer
- * transaction completes. Callbacks run under the mount write lock. */
+ * transaction completes. Handle stores borrow time_owner; namespace stores
+ * pass NULL. Callbacks run under the mount write lock. */
 struct ext4_time_observer {
     void *context;
-    void (*store)(void *context, uint32_t inode, unsigned field,
+    void (*store)(void *context, void *owner, uint32_t inode, unsigned field,
                   struct ext4_timestamp value);
     void (*finish)(void *context, bool accepted);
     unsigned (*snapshot)(void *owner, struct ext4_timestamp times[3]);

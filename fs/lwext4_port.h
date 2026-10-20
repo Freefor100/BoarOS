@@ -11,6 +11,7 @@ void boaros_lwext4_wake(void *key);
 int boaros_lwext4_read_context(void);
 unsigned boaros_lwext4_pause(void);
 void boaros_lwext4_resume(void *lock, unsigned depth);
+void boaros_lwext4_unlock(void *lock);
 
 int boaros_lwext4_heap_bind(struct kernel_heap *heap);
 void boaros_lwext4_heap_unbind(struct kernel_heap *heap);

@@ -528,6 +528,7 @@ int kernel_devpts_create(struct kernel_heap *heap, uint64_t flags,
     m->instance.ops = &devpts_backend; m->instance.backend_data = m;
     m->instance.read_only = (flags & 1U) != 0;
     kernel_mutex_init(&m->instance.namespace_lock, 20U, (uintptr_t)&m->instance);
+    kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data = &m->instance; m->mount.id = kernel_vfs_allocate_mount_id();
     m->mount.state = VFS_MOUNT_STATE_LIVE;
     m->root.mount = m; m->root.embedded = m->root.published = 1;

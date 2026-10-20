@@ -28,6 +28,7 @@ static struct kernel_thread_join controller;
 static struct composition_control *control;
 static struct held_page *ledger;
 static uint64_t ledger_count, held, released, reclaimed, injections, retirements, waits;
+static uint64_t oom_fork_tid;
 static uint64_t failed_tid, retired_address, watched_tid, epoch, registered_mask;
 static uint64_t fault_race_address, fault_race_tasks[2];
 static uint64_t fault_race_arrivals, fault_race_stale, fault_race_resolved, fault_race_syncs;
@@ -421,7 +422,7 @@ enum physical_page_status __real_physical_page_allocate(struct physical_page_all
 enum physical_page_status __real_physical_page_allocate_order(struct physical_page_allocator *,uint32_t,uint64_t *);
 static int fail_allocation(struct physical_page_allocator *a)
 {
-    if (!failed_tid || a!=allocator) return 0;
+    if (!failed_tid || oom_fork_tid!=failed_tid || a!=allocator) return 0;
     kernel_pid_t tid=0;
     if (kernel_task_tid(kernel_task_current(),&tid) || tid<=0 || (uint64_t)tid!=failed_tid) return 0;
     failed_tid=0;injections++;return 1;
@@ -597,11 +598,19 @@ enum kernel_mm_status __real_kernel_mm_fork(struct kernel_mm *,struct kernel_mm 
 enum kernel_mm_status __wrap_kernel_mm_fork(struct kernel_mm *destination,struct kernel_mm *source)
 {
     kernel_pid_t tid=0;
+    int injecting=!kernel_task_tid(kernel_task_current(),&tid) && tid>0 && (uint64_t)tid==failed_tid;
+    /* Dynamic libc can fault before entering fork. Fail an allocation owned
+     * by the requested MM operation, preserving those unrelated user faults. */
+    if (injecting) oom_fork_tid=(uint64_t)tid;
     int watched=read_tid && (read_flags&COMPOSITION_READ_FORK) &&
         !kernel_task_tid(kernel_task_current(),&tid) && tid>0 &&
         (uint64_t)tid==composition_load(&control->read_waiter_tid);
     if(watched) { check(!read_revoke_mm);read_revoke_mm=source; }
     enum kernel_mm_status result=__real_kernel_mm_fork(destination,source);
+    if (injecting) {
+        check(!failed_tid && result==KERNEL_MM_STATUS_NO_MEMORY);
+        oom_fork_tid=0;
+    }
     if(watched) {
         struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(source,&state);
         check(!result && !state.write_pins && composition_load(&control->read_waited)==1);

@@ -13,6 +13,7 @@
 #include <kernel/tmpfs.h>
 #include <kernel/memory_object.h>
 #include "../../fs/vfs_internal.h"
+#include "../../fs/ext4_backend.h"
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
 #include "../../kernel/sched/private.h"
@@ -33,10 +34,32 @@ static struct kernel_thread_join peer;
 static unsigned cpus,stop,progress,user_overlap;
 static unsigned watch_copy,copy_cpu,local_copies[2],cold_loads,watch_cold;
 static unsigned watch_timeout,timeout_copies;
+static unsigned watch_metadata, metadata_calls[4], metadata_submissions;
+static struct kernel_io_context *metadata_owner;
+static void observe_metadata(ext4_file *file, unsigned operation)
+{
+    if (!watch_metadata || file != lwext4_node_file(kernel_open_file_node(control))) return;
+    if (kernel_cpu_current()->logical_id != copy_cpu || kernel_io_context_current() != metadata_owner)
+        riscv_smp_fail("file-metadata-left-caller", operation);
+    metadata_calls[operation]++;
+}
+int __real_ext4_file_prepare_write(ext4_file *,uint64_t,size_t,size_t *,bool *);
+int __wrap_ext4_file_prepare_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,bool *complete)
+{ observe_metadata(file,0); return __real_ext4_file_prepare_write(file,offset,length,ready,complete); }
+int __real_ext4_ftruncate(ext4_file *,uint64_t);
+int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size)
+{ observe_metadata(file,1); return __real_ext4_ftruncate(file,size); }
+int __real_ext4_fallocate(ext4_file *,unsigned,uint64_t,uint64_t,bool *);
+int __wrap_ext4_fallocate(ext4_file *file,unsigned mode,uint64_t offset,uint64_t length,bool *changed)
+{ observe_metadata(file,2); return __real_ext4_fallocate(file,mode,offset,length,changed); }
+int __real_ext4_file_sync_metadata_prepare(ext4_file *,bool,uint64_t *);
+int __wrap_ext4_file_sync_metadata_prepare(ext4_file *file,bool data_only,uint64_t *target)
+{ observe_metadata(file,3); return __real_ext4_file_sync_metadata_prepare(file,data_only,target); }
 static struct kernel_block_device *raw_device;
 static struct virtio_split_queue *raw_queue;
 static unsigned raw_read_active,raw_read_cpu,raw_submissions;
 static unsigned char raw_expected[18],raw_bytes[64];
+static unsigned char raw_boot[512];
 enum virtio_status __real_virtio_split_enqueue(struct virtio_split_queue *,struct virtio_transport *,
     uint16_t,void *,uint32_t,uint32_t);
 enum virtio_status __wrap_virtio_split_enqueue(struct virtio_split_queue *queue,struct virtio_transport *transport,
@@ -44,6 +67,10 @@ enum virtio_status __wrap_virtio_split_enqueue(struct virtio_split_queue *queue,
 {
     if (raw_read_active && queue==raw_queue && kernel_cpu_current()->logical_id==raw_read_cpu)
         raw_submissions++;
+    if (watch_metadata && queue == raw_queue && kernel_io_context_current() == metadata_owner) {
+        if (kernel_cpu_current()->logical_id != copy_cpu) riscv_smp_fail("metadata-submit-left-caller", -1);
+        metadata_submissions++;
+    }
     return __real_virtio_split_enqueue(queue,transport,head,token,minimum,maximum);
 }
 enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
@@ -174,6 +201,16 @@ static void verify(void *unused)
     check(raw_submissions && raw_read_cpu==(cpus==2?1U:0U),"block-read-caller-actual-virtio-submit");
     virt_uart_puts("BoarOS: BLOCK caller reads hart=");virt_uart_put_hex(raw_read_cpu);
     virt_uart_puts(" submissions=");virt_uart_put_hex(raw_submissions);virt_uart_putc('\n');
+    raw_read_active=1; raw_submissions=0;
+    /* ext4 reserves this boot prefix; preserve it byte-for-byte while checking
+     * a caller write and real FLUSH through the live VirtIO queue. */
+    check(!kernel_block_read_at(raw_device,0,raw_boot,sizeof(raw_boot)) &&
+        !kernel_block_write_at(raw_device,0,raw_boot,sizeof(raw_boot)) &&
+        !kernel_block_flush(raw_device),"block-write-flush-caller");
+    raw_read_active=0;
+    check(raw_submissions>=3,"block-write-flush-caller-actual-submit");
+    virt_uart_puts("BoarOS: BLOCK caller writes/flush hart="); virt_uart_put_hex(raw_read_cpu);
+    virt_uart_puts(" submissions="); virt_uart_put_hex(raw_submissions); virt_uart_putc('\n');
     raw_read_active=1;raw_submissions=0;
     struct file_read_span direct={0,raw_bytes,4,0,0};
     {
@@ -286,8 +323,30 @@ static void verify(void *unused)
     check(!kernel_files_pread(files,mm,0,IO_ANON+128,4,32,&result) && result==4 &&
         !kernel_copy_from_user(mm,prefix,IO_ANON+128,4,&copied) && copied==4 &&
         !memcmp(prefix,"IO\0\0",4),"file-io-prefix-file-content");
+    metadata_owner = kernel_io_context_current(); watch_metadata = 1;
+    check(!kernel_files_pwrite(files,mm,0,IO_ANON+128,4,4*BOAROS_PAGE_SIZE+37,&result) && result==4,
+        "file-io-caller-growth");
+    enum kernel_files_status allocation = kernel_files_fallocate(files,0,KERNEL_VFS_FALLOC_KEEP_SIZE,
+        6*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,&result);
+    if (allocation || result) {
+        virt_uart_puts("BoarOS: metadata fallocate status="); virt_uart_put_hex(allocation);
+        virt_uart_puts(" result="); virt_uart_put_hex(result); virt_uart_putc('\n');
+    }
+    check(!allocation && !result,"file-io-caller-keep-size");
+    check(!kernel_files_fallocate(files,0,KERNEL_VFS_FALLOC_KEEP_SIZE|KERNEL_VFS_FALLOC_PUNCH_HOLE,
+        6*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,&result) && !result,"file-io-caller-punch");
+    check(!kernel_files_fallocate(files,0,0,8*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,&result) && !result,
+        "file-io-caller-reserve-growth");
     check(!kernel_files_sync(files,0,0,&result) && !result,"file-io-fsync");
+    check(!kernel_files_sync(files,0,1,&result) && !result,"file-io-fdatasync");
     check(!kernel_files_ftruncate(files,0,3*BOAROS_PAGE_SIZE,&result) && !result,"file-io-ftruncate");
+    watch_metadata = 0;
+    check(metadata_calls[0] && metadata_calls[1] && metadata_calls[2]==3 && metadata_calls[3]>=2,
+        "file-io-caller-metadata-complete-path");
+    virt_uart_puts("BoarOS: FILE IO caller metadata/submit hart="); virt_uart_put_hex(copy_cpu);
+    virt_uart_puts(" prepare/truncate/fallocate/sync=");
+    for (unsigned i=0;i<4;i++) { virt_uart_put_hex(metadata_calls[i]); virt_uart_putc(' '); }
+    virt_uart_puts("submits="); virt_uart_put_hex(metadata_submissions); virt_uart_putc('\n');
     check(!kernel_files_fstat(files,mm,0,IO_ANON,&result) && !result,"file-io-fstat");
     struct kernel_linux_stat stat;
     check(!kernel_copy_from_user(mm,&stat,IO_ANON,sizeof(stat),&copied) && copied==sizeof(stat) &&

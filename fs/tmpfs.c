@@ -677,6 +677,7 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     m->inode_count=1; m->next_inode=2; m->next_cookie=2;
     initialize_ops(); m->instance.ops=&tmp_ops; m->instance.read_only=(flags & 1)!=0;
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
+    kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance; m->mount.id=kernel_vfs_allocate_mount_id(); m->mount.state=VFS_MOUNT_STATE_LIVE;
     *owner=&m->mount; return 0;
 }

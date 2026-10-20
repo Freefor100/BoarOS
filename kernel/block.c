@@ -74,7 +74,6 @@ static void block_request_put(struct kernel_block_device **device)
 
 enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
 {
-    kernel_assert_service_context();
     if (device == 0 || device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_INVALID;
     }
@@ -123,7 +122,6 @@ enum kernel_block_status kernel_block_write_at(
     const void *buffer,
     size_t size)
 {
-    kernel_assert_service_context();
     if (device == 0 || physical(device)->write == 0 ||
         device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_UNSUPPORTED;
@@ -165,7 +163,6 @@ enum kernel_block_status kernel_block_write_batch(
     const struct kernel_block_span *spans,
     size_t count)
 {
-    kernel_assert_service_context();
     if (!device || !device->logical_block_size)
         return KERNEL_BLOCK_STATUS_INVALID;
     if (!physical(device)->write && !physical(device)->write_batch)
@@ -225,7 +222,6 @@ static int phase_next(const void *context, const void **cursor, struct kernel_bl
 enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
     kernel_block_phase_next_fn next, const void *next_context, const void *first)
 {
-    kernel_assert_service_context();
     if (!device || !device->logical_block_size || !next) return KERNEL_BLOCK_STATUS_INVALID;
     if (!physical(device)->write && !physical(device)->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);

@@ -11,6 +11,12 @@ descriptor/token由[共用VirtIO框架](virtio-framework.md)提供。transport�
 MMIO 与 PCI 的总线偏移、访问宽度和 read-to-clear 差异留在各自实现；IRQ/DMA
 CPU 屏障由构建期架构操作提供，不是运行期架构 vtable。
 
+任务可在任意 CPU 调用共同块层的读取、写入、批量/阶段写入及 FLUSH。
+设备引用和物理父盘 I/O mutex 覆盖整个调用；VirtIO 的提交者与完成中断
+共用设备短保护，FLUSH 与实际写入按原屏障协议排序。设备配置和销毁
+继续由 CPU0 的管理现场执行。`test-block-host` 的双核模型从 CPU1 检查
+分区读写、RMW、批量与阶段写入、只读、FLUSH、错误及引用归还。
+
 RV `arch/riscv/virtio_mmio_block.c` 负责PLIC绑定，MMIO身份/版本和寄存器映射由共用adapter实现；
 旧类型和入口保留薄适配。`riscv_virtio_mmio_block_base()` 仅暴露已有 MMIO 资源
 用于 DTB IRQ 匹配。启动 fixture 可在物理别名执行，函数指针必须从实际 PC 初始化，

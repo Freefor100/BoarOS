@@ -1206,6 +1206,7 @@ int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
     proc->instance.read_only = (flags & 1U) != 0U;
     kernel_mutex_init(&proc->instance.namespace_lock, 20U,
                       (uintptr_t)&proc->instance);
+    kernel_raw_lock_init(&proc->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     proc->mount.id = kernel_vfs_allocate_mount_id();
     proc->mount.private_data = &proc->instance;
     proc->mount.state = VFS_MOUNT_STATE_LIVE;

@@ -8,8 +8,8 @@ r"""Matched data-path I/O experiments; smoke timings are never performance evide
       --cases ext4:append:fsync:1:16M:64K,ext4:cold-read:cache:4:4M:4K --repeat 3
 
 Cases: backend:operation:completion:files:bytes_per_file:request_bytes.
-Backends ext4/tmpfs; operations append/overwrite/cold-read/hot-read/read/mixed-read;
-completion cache/fsync/fdatasync; files 1/4; sizes 1/4/16/64M; requests 1/4/64K.
+Backends ext4/tmpfs; operations append/overwrite/cold-read/hot-read/read/mixed-read/parallel-append/range-modify;
+completion cache/fsync/fdatasync; files 1/4 (paired append uses 2); sizes 1/4/16/64M; requests 1/4/64K.
 Cold-read is ext4 only, from an unread preloaded image. tmpfs read is resident
 memory, never a claim of cold disk. A single task rotates requests among files;
 completion spread is not a concurrent scheduler fairness or starvation bound.
@@ -109,21 +109,27 @@ def parse_case(name):
     if len(parts) != 6:
         raise ValueError('case needs backend:operation:completion:files:size:request')
     backend, operation, completion, files, size, request = parts
-    if backend not in ('ext4', 'tmpfs') or operation not in ('append', 'overwrite', 'cold-read', 'hot-read', 'read', 'mixed-read') or completion not in ('cache', 'fsync', 'fdatasync'):
+    if backend not in ('ext4', 'tmpfs') or operation not in ('append', 'overwrite', 'cold-read', 'hot-read', 'read', 'mixed-read', 'parallel-append', 'range-modify') or completion not in ('cache', 'fsync', 'fdatasync'):
         raise ValueError('unsupported case ' + name)
-    if files not in ('1', '4') or size not in ('1M', '4M', '16M', '64M') or request not in ('1K', '4K', '64K'):
+    if files not in ('1', '2', '4') or size not in ('1M', '4M', '16M', '64M') or request not in ('1K', '4K', '64K'):
         raise ValueError('outside bounded file/request matrix ' + name)
+    if files == '2' and operation != 'parallel-append':
+        raise ValueError('two files select the paired append workload')
+    if operation == 'parallel-append' and (backend != 'ext4' or completion != 'fsync' or files != '2'):
+        raise ValueError('parallel-append requires ext4/fsync and two files')
+    if operation == 'range-modify' and (backend != 'ext4' or completion != 'fsync' or files != '1'):
+        raise ValueError('range-modify requires ext4/fsync and one file')
     if backend == 'tmpfs' and operation == 'cold-read':
         raise ValueError('tmpfs cannot provide a cold-disk read')
     if operation == 'mixed-read' and (backend != 'ext4' or completion != 'fsync' or files != '4'):
         raise ValueError('mixed-read requires ext4, fsync and four independent files')
-    if operation not in ('append', 'overwrite', 'mixed-read') and completion != 'cache':
+    if operation not in ('append', 'overwrite', 'mixed-read', 'parallel-append', 'range-modify') and completion != 'cache':
         raise ValueError('read cases do not pretend a redundant fsync measures write durability')
     if backend == 'ext4' and operation == 'read':
         raise ValueError('ext4 read must explicitly choose cold-read or hot-read')
     return dict(name=name, backend=backend, operation=operation, completion=completion,
                 files=int(files), bytes=int(size[:-1]) * 1048576, request=int(request[:-1]) * 1024,
-                schedule='four processes, writer dirtied before release, final fsync and two cold readers plus last-FD closes' if operation == 'mixed-read' else 'one task, one request per file per round',
+                schedule='four processes, writer dirtied before release, final fsync and two cold readers plus last-FD closes' if operation == 'mixed-read' else 'two fixed-affinity appenders, fixed bytes and final fsync each' if operation == 'parallel-append' else 'one task, fixed four range syscalls per iteration and final fsync' if operation == 'range-modify' else 'one task, one request per file per round',
                 cache_scope='first guest data read of preloaded image' if operation in ('cold-read', 'mixed-read') else 'one complete verified preread' if operation == 'hot-read' else 'resident tmpfs setup' if backend == 'tmpfs' else 'no target-data preread',
                 persistence_scope='prepared dirty writer final fsync, separate reader/close intervals; not append throughput' if operation == 'mixed-read' else 'memory only' if backend == 'tmpfs' else 'explicit per-file sync syscall' if completion != 'cache' else 'cache completion; no durability claim for timed window')
 
@@ -141,7 +147,7 @@ def seed(directory, case):
     directory.mkdir(parents=True, exist_ok=True)
     for identifier in range(case['files']):
         with (directory / f'file-{identifier}').open('wb') as stream:
-            if case['operation'] != 'append' and not (case['operation'] == 'mixed-read' and identifier == 0):
+            if case['operation'] not in ('append', 'parallel-append') and not (case['operation'] == 'mixed-read' and identifier == 0):
                 for offset in range(0, case['bytes'], 65536):
                     stream.write(pattern(identifier, offset, min(65536, case['bytes'] - offset)))
 
@@ -201,18 +207,20 @@ def validate_regular(text,case):
     if len(windows) != 1 or len(rows) != case['files'] or {r.get('id') for r in rows} != set(range(case['files'])):
         raise RuntimeError('missing, duplicate or wrong file/window identity')
     window = windows[0]
-    writing = case['operation'] in ('append', 'overwrite')
+    writing = case['operation'] in ('append', 'overwrite', 'parallel-append')
+    range_mode = case['operation'] == 'range-modify'
+    expected_bytes = 0 if range_mode else case['bytes']
     sync_calls = case['files'] if case['completion'] != 'cache' else 0
-    if window.get('bytes') != case['bytes'] * case['files'] or window.get('complete') != 1 or window.get('sync_calls') != sync_calls:
+    if window.get('bytes') != expected_bytes * case['files'] or window.get('complete') != 1 or window.get('sync_calls') != sync_calls:
         raise RuntimeError('wrong effective bytes, completion or actual sync count')
     if not window['start_ns'] < window['data_end_ns'] <= window['end_ns'] or window['elapsed_ns'] != window['end_ns'] - window['start_ns'] or window['data_ns'] != window['data_end_ns'] - window['start_ns'] or window['sync_ns'] != window['end_ns'] - window['data_end_ns']:
         raise RuntimeError('inconsistent I/O time window')
     if window['cleanup_sync_calls'] != (case['files'] if writing and not sync_calls else 0):
         raise RuntimeError('cache completion confused with cleanup durability')
     for row in rows:
-        if row.get('bytes') != case['bytes'] or row.get('size_after') != case['bytes'] or row.get('size_before') != (0 if case['operation'] == 'append' else case['bytes']) or row.get('complete') != 1:
+        if row.get('bytes') != expected_bytes or row.get('size_after') != case['bytes'] or row.get('size_before') != (0 if case['operation'] in ('append','parallel-append') else case['bytes']) or row.get('complete') != 1:
             raise RuntimeError('file content/size/completion invalid')
-        if row['calls'] < (case['bytes'] + case['request'] - 1) // case['request']:
+        if row['calls'] < ((case['bytes'] + case['request'] - 1) // case['request']) * (4 if range_mode else 1):
             raise RuntimeError('reported calls cannot cover effective bytes')
         if not window['start_ns'] <= row['start_ns'] < row['end_ns'] <= window['data_end_ns']:
             raise RuntimeError('file data completion outside window')
@@ -225,7 +233,7 @@ def validate_regular(text,case):
             if len(growth) != 5 or [s['sample'] for s in growth] != list(range(5)):
                 raise RuntimeError('missing independent file-size checkpoints')
             wanted = [case['request'], case['bytes'] // 4, case['bytes'] // 2, case['bytes'] * 3 // 4, case['bytes']]
-            if case['operation'] != 'append': wanted = [case['bytes']] * 5
+            if case['operation'] not in ('append','parallel-append'): wanted = [case['bytes']] * 5
             if [s['bytes'] for s in growth] != wanted:
                 raise RuntimeError('append growth or fixed-size overwrite contract failed')
         elif growth:
@@ -234,6 +242,11 @@ def validate_regular(text,case):
     metrics.update(data_mib_s=window['bytes'] * 1e9 / (1048576 * window['data_ns']),
                    completion_mib_s=window['bytes'] * 1e9 / (1048576 * window['elapsed_ns']),
                    file_completion_span_ns=max(r['end_ns'] for r in rows) - min(r['end_ns'] for r in rows))
+    if range_mode:
+        operations=4*(case['bytes']//case['request'])
+        if window.get('range_operations')!=operations or rows[0]['calls']!=operations:
+            raise RuntimeError('range operation count changed')
+        metrics.update(range_operations=operations,range_operations_s=operations*1e9/window['elapsed_ns'])
     samples=records(text,'SAMPLE')
     per_file=(case['bytes']+case['request']-1)//case['request']
     if len(samples)!=case['files']*per_file: raise RuntimeError('missing request intervals')

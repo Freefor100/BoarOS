@@ -1266,6 +1266,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     r = measure(m, root_inode); if (r) goto invalid;
     kernel_mutex_init(&m->metadata, 40, (uintptr_t)m);
     kernel_mutex_init(&m->instance.namespace_lock, 20, (uintptr_t)&m->instance);
+    kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->instance.writeback_block_size = bps;
     mount->private_data = &m->instance; mount->id = kernel_vfs_allocate_mount_id(); mount->state = VFS_MOUNT_STATE_CLEANUP;
     if (!read_only) {

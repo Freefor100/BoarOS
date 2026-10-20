@@ -13,7 +13,7 @@ from user import ROOT,boot_user,harness,identity,validate_execution,create_run_d
 CASES=('concurrent-first-fault','concurrent-file-first-fault',
     'ordinary-hot-read-pread-readv','ordinary-cold-cache','ordinary-cold-batch-local','ordinary-user-fault',
     'ordinary-read-fault-prefix','ordinary-read-seek','ordinary-read-close-signal',
-    'ordinary-read-fork-pin','ordinary-write-pwrite-writev-local','mm-reclaim')+tuple(f'{name}-{count}' for count in (1,8,32)
+    'ordinary-read-fork-pin','ordinary-file-write-space-sync-local','mm-reclaim')+tuple(f'{name}-{count}' for count in (1,8,32)
     for name in ('fd-pipe','futex','group-exit'))
 
 def validate_boot_output(text):
@@ -127,6 +127,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--qemu',default='qemu-system-riscv64');parser.add_argument('--firmware',required=True)
     parser.add_argument('--program',type=Path,default=ROOT/'build/riscv-user-smp-composition/composition-rv')
+    parser.add_argument('--loader',type=Path,help='musl loader for the same dynamic composition ELF on both kernels')
     parser.add_argument('--memory',choices=('512M','1G'),action='append');parser.add_argument('--cpus',type=int,choices=(1,2),action='append')
     parser.add_argument('--scene',choices=('mm','wait','cpu-clock','sqlite-delete','sqlite-wal'),action='append')
     parser.add_argument('--mode',choices=('common','controlled','both'),default='both')
@@ -140,6 +141,7 @@ def main():
         'build_root':str(build_root),'executor':{
             'qemu':executable_identity(args.qemu),'make':executable_identity('make'),
             'kernel_compiler':executable_identity(compiler)}}
+    if args.loader: report['loader']=identity(args.loader)
     try:
         kernels={}
         for mode in ('common','controlled'):
@@ -169,7 +171,9 @@ def main():
                             source=ROOT/'build/riscv/tests/user'/(name+'-rv')
                             support[name]=group/name;shutil.copyfile(source,support[name])
                             install(fixture,'/'+name,support[name],group)
-                        support['loader']=group/'musl-loader';shutil.copyfile(ROOT/'build/riscv/musl-root/lib/ld-musl-riscv64.so.1',support['loader'])
+                    if args.loader or scene=='sqlite-delete':
+                        support['loader']=group/'musl-loader'
+                        shutil.copyfile(args.loader or ROOT/'build/riscv/musl-root/lib/ld-musl-riscv64.so.1',support['loader'])
                         harness.run_logged(['debugfs','-w','-R','mkdir /lib',str(fixture)],group/'mkdir-lib.log')
                         install(fixture,'/lib/ld-musl-riscv64.so.1',support['loader'],group)
                         harness.run_logged(['debugfs','-w','-R','symlink /lib/libc.so /lib/ld-musl-riscv64.so.1',str(fixture)],group/'libc-link.log')
