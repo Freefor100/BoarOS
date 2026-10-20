@@ -61,6 +61,54 @@ static unsigned write_error;
 static ext4_file *metadata_fault_file;
 static unsigned timestamp_fault, metadata_sync_fault;
 static struct kernel_page_cache *current_cache;
+static struct kernel_vfs_instance *metadata_owner_instance;
+struct kernel_vfs_node *__real_kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t);
+struct kernel_vfs_node *__wrap_kernel_vfs_node_find(struct kernel_vfs_instance *instance, uint64_t inode)
+{
+    if (instance == metadata_owner_instance)
+        assert(kernel_cpu_current()->logical_id == 0 &&
+            "caller metadata must use the handle owner, not the CPU0 inode registry");
+    return __real_kernel_vfs_node_find(instance, inode);
+}
+static int (*metadata_close_node)(struct kernel_vfs_node *);
+static unsigned metadata_closed;
+static struct kernel_vfs_node *metadata_nodes[3];
+static unsigned metadata_closed_mask;
+static struct {
+    struct kernel_vfs_node *target;
+    struct kernel_vfs_file *closing;
+    unsigned entered, close_done;
+} timestamp_owner;
+static void (*metadata_store)(void *,void *,uint32_t,unsigned,struct ext4_timestamp);
+static void observe_metadata_store(void *context, void *owner, uint32_t inode,
+    unsigned field, struct ext4_timestamp value)
+{
+    if (owner && owner == timestamp_owner.target) {
+        assert(kernel_cpu_current()->logical_id == 1 &&
+            owner == lwext4_node_file(owner)->time_owner);
+        __atomic_store_n(&timestamp_owner.entered,1,__ATOMIC_RELEASE);
+        wait_progress(&timestamp_owner.close_done,1);
+    }
+    metadata_store(context,owner,inode,field,value);
+}
+int __real_ext4_mount_setup_time_observer(const char *,const struct ext4_time_observer *);
+int __wrap_ext4_mount_setup_time_observer(const char *path,const struct ext4_time_observer *observer)
+{
+    if (!observer) return __real_ext4_mount_setup_time_observer(path,observer);
+    struct ext4_time_observer observed=*observer;
+    metadata_store=observer->store; observed.store=observe_metadata_store;
+    return __real_ext4_mount_setup_time_observer(path,&observed);
+}
+static int observe_metadata_close(struct kernel_vfs_node *node)
+{
+    assert(kernel_cpu_current()->logical_id == 0 && "final node close belongs to CPU0");
+    for (unsigned i=0;i<3;i++) if (node==metadata_nodes[i]) {
+        assert(!(metadata_closed_mask & (1U<<i)));
+        metadata_closed_mask |= 1U<<i;
+    }
+    metadata_closed++;
+    return metadata_close_node(node);
+}
 static struct lwext4_mount_adapter *journal_wait_owner;
 static struct { unsigned hold, entered, release; } durable_before_park;
 static _Thread_local unsigned hold_durable_wait;
@@ -407,7 +455,7 @@ static enum kernel_block_status image_read(void *context, uint64_t off, void *ou
 static enum kernel_block_status image_write(void *context, uint64_t off, const void *in, size_t size)
 {
     (void)context;
-    assert(kernel_cpu_current()->hardware_id == 0);
+    assert(!kernel_cpu_current()->raw_locks);
     return pwrite(image_fd, in, size, off) == (ssize_t)size ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status image_flush(void *context)
@@ -2833,6 +2881,68 @@ static void write_pressure_case(struct kernel_page_cache *cache,const char *path
     puts("PASS write admission: executor makes bounded dirty-page progress; disk space and memory exhaustion remain distinct; contents and owners returned");
 }
 
+static void *close_during_timestamp(void *unused)
+{
+    (void)unused; cache_test_attach(0);
+    wait_progress(&timestamp_owner.entered,1);
+    assert(!kernel_vfs_close(timestamp_owner.closing));
+    __atomic_store_n(&timestamp_owner.close_done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void caller_metadata_owners(struct kernel_page_cache *cache, const char *path)
+{
+    image_fd=open(path,O_RDWR); assert(image_fd>=0);
+    struct stat st; assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    struct kernel_vfs_file caller={0}, unrelated={0}, closing={0};
+    assert(!kernel_vfs_create(&mount,"/caller",0600,&caller));
+    assert(!kernel_vfs_create(&mount,"/unrelated",0600,&unrelated));
+    assert(!kernel_vfs_create(&mount,"/closing",0600,&closing));
+    struct kernel_vfs_node *other=kernel_vfs_file_node(&unrelated);
+    metadata_nodes[0]=kernel_vfs_file_node(&caller);
+    metadata_nodes[1]=other; metadata_nodes[2]=kernel_vfs_file_node(&closing);
+    metadata_closed_mask=0;
+    unsigned char bytes[BOAROS_PAGE_SIZE]; memset(bytes,0x53,sizeof(bytes)); size_t done;
+    assert(!kernel_vfs_pwrite(&unrelated,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t error=0; assert(!kernel_vfs_sync(&unrelated,0,&error));
+    assert(!kernel_vfs_close(&unrelated) && other->cache_pages);
+    struct kernel_vfs_instance *instance=mount.private_data;
+    const struct kernel_vfs_backend *backend=instance->ops;
+    struct kernel_vfs_backend observed=*backend;
+    metadata_close_node=backend->close_node; observed.close_node=observe_metadata_close;
+    instance->ops=&observed; metadata_closed=0;
+    cache_test_attach(1);
+    assert(kernel_page_cache_reclaim(cache,UINT64_MAX) && !other->cache_pages && !metadata_closed);
+    assert(other->references==1);
+    /* 另一 inode 的退休页仍持最后引用。调用者截断只能退休自己的页；
+     * 真正的节点关闭由 CPU0 排空，不能顺便消费全局 cleanup 链。 */
+    {
+        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(kernel_vfs_file_node(&caller),&io,1);
+        kernel_page_cache_invalidate_range(cache,kernel_vfs_file_node(&caller),0,BOAROS_PAGE_SIZE);
+    }
+    assert(!metadata_closed);
+    timestamp_owner=(__typeof__(timestamp_owner)){.target=kernel_vfs_file_node(&caller),.closing=&closing};
+    pthread_t closer; assert(!pthread_create(&closer,NULL,close_during_timestamp,NULL));
+    metadata_owner_instance=instance;
+    assert(!kernel_vfs_ftruncate(&caller,2*BOAROS_PAGE_SIZE));
+    assert(!pthread_join(closer,NULL));
+    assert(timestamp_owner.entered && timestamp_owner.close_done);
+    timestamp_owner=(__typeof__(timestamp_owner)){0};
+    metadata_owner_instance=NULL;
+    cache_test_attach(0);
+    error=0; assert(!kernel_vfs_sync(&caller,0,&error));
+    assert(!kernel_vfs_close(&caller));
+    assert(!kernel_page_cache_purge_mount(cache,&mount));
+    assert(metadata_closed_mask==7);
+    memset(metadata_nodes,0,sizeof(metadata_nodes));
+    instance->ops=backend; metadata_close_node=NULL;
+    assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(cache));
+    puts("PASS caller metadata ownership: handle timestamps and deferred CPU0 final close");
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
@@ -2863,6 +2973,10 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"caller-metadata-owners")) {
+            caller_metadata_owners(&cache,argv[1]);
+            goto owners;
+        }
         if (!strcmp(argv[2],"write-pressure-other-eio") || !strcmp(argv[2],"write-pressure-other-enospc")) {
             pressure_error_isolation(&cache,argv[1],!strcmp(argv[2],"write-pressure-other-enospc")?3:1);
             goto owners;

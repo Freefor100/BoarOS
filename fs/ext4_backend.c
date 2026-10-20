@@ -428,12 +428,19 @@ static uint64_t time_deadline(struct lwext4_mount_adapter *adapter)
     return adapter->times_deadline;
 }
 
-static void time_stage(void *context, uint32_t inode, unsigned field,
+static void time_stage(void *context, void *owner, uint32_t inode, unsigned field,
                        struct ext4_timestamp value)
 {
     struct lwext4_mount_adapter *adapter = context;
     TIMESTAMP_SCOPE(times, adapter);
-    struct kernel_vfs_node *base = kernel_vfs_node_find(&adapter->instance, inode);
+    struct kernel_vfs_node *base = owner;
+    if (!base) {
+        /* Namespace operations remain on CPU0. Handle operations already own
+         * their live inode and must not traverse the CPU0-only registry. */
+        kernel_assert_service_context();
+        base = kernel_vfs_node_find(&adapter->instance, inode);
+    }
+    if (base && (base->instance != &adapter->instance || base->inode != inode)) __builtin_trap();
     if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         struct lwext4_node *node = (struct lwext4_node *)base;
         if (!node->staged_fields) {

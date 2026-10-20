@@ -2239,6 +2239,9 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
             continue;
         }
         if (references != 1U) __builtin_trap();
+        /* Final retirement mutates the CPU0 inode registry. Remote users may
+         * drop borrowed pins; shared cache retirement is drained by CPU0. */
+        kernel_assert_service_context();
         uintptr_t irq = arch_interrupt_save();
         if (!__atomic_compare_exchange_n(&node->references, &references, 0, 0,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { arch_interrupt_restore(irq); continue; }

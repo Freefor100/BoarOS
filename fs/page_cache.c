@@ -667,6 +667,15 @@ static int drain_cleanup_entries(struct kernel_page_cache *cache,
 static int drain_entries(struct kernel_page_cache *cache,
                          uint64_t *pages_released)
 {
+    if (remote_cache_client()) {
+        CACHE_SCOPE(guard,cache);
+        if (!cache->record->cleanup_entries) return 1;
+        /* The shared retired list may own the final reference to a different
+         * inode. Its backend close and registry removal remain CPU0 work. */
+        cache->record->requested=1;
+        cache_wake(&cache->record->work);
+        return 0;
+    }
     struct kernel_page_cache_entry *entries;
     take_cleanup_entries(cache,&entries);
     return drain_cleanup_entries(cache,&entries,SIZE_MAX,pages_released);
@@ -1349,14 +1358,9 @@ static enum kernel_page_cache_status finish_read_page(
         if (park && kernel_wait_park(&token, &reason)) __builtin_trap();
         if (kernel_wait_finish(&token)) __builtin_trap();
     }
-    /* 仅CPU0结束node/backend owner；远端最后失败者请求worker收尾。 */
     if (clean) {
-        if (!remote_cache_client()) { uint64_t released = 0; (void)drain_entries(cache, &released); }
-        else {
-            CACHE_SCOPE(notify, cache);
-            cache->record->requested = 1;
-            cache_wake(&cache->record->work);
-        }
+        uint64_t released = 0;
+        (void)drain_entries(cache, &released);
     }
     return status;
 }
