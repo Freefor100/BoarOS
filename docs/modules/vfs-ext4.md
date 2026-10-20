@@ -149,6 +149,10 @@ miss 路径私有分配未清零页，通过 node 的无 offset 副作用批量 
 
 journal 路径已包含持久化屏障，不额外发设备 flush；无 journal 路径仍显式 flush。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；共享 inode 的后端 handle 记录完整和数据序号。full 同步为涵盖经其他 handle 的 namespace 修改，捕获当前 mount 序号一次；data 同步等待数据/检索依赖序号，纯时间修改不推进它。同组时间字段可以顺带持久化；新修改不延长已捕获的目标。`O_SYNC/O_DSYNC` 分别对已接受的写入前缀执行 full/data 同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。commit 与 checkpoint 仍沿用既有独立推进、稳定版本和屏障顺序。
 
+摘出 inode 弱索引后，最终关闭与 heap 释放继续以 `retiring_nodes` 占有挂载实例；卸载在短保护内检查索引和这些执行者，等待其结束后再释放后端。rename 可替换名称内存，因此 comm 等消费者在同一短保护内复制 basename。lwext4 的全局挂载槽在短保护下查找、预留和发布，初始化与设备 I/O 在保护外进行；操作所持的挂载引用覆盖返回槽的使用。
+
+日志请求、checkpoint 请求和进度等待队列随挂载实例一起初始化，同步推进日志与后台 worker 共用这些队列。后台线程启动只建立执行者，不重置等待关系；受限日志预算在前台同步推进旧组后也可正常发布进度。
+
 ## 挂载范围与全局同步
 
 `kernel_vfs_sync_mount()`先取得根路径owner，按注册时增减的节点计数准备快照容量，

@@ -238,6 +238,14 @@ static void namespace_work(struct kernel_mm *mm,struct kernel_files *files)
     check(before.executions_queued==after.executions_queued,"namespace-no-cpu0-handoff");
     for (unsigned i=0;i<5;i++) check(namespace_calls[i]>0,"namespace-complete-caller-path");
     virt_uart_puts("BoarOS: NAMESPACE caller lookup/create/unlink/rename/readdir hart=");virt_uart_put_hex(copy_cpu);virt_uart_putc('\n');
+    /* Crossing to tmpfs chooses its service CPU before path metadata locks. */
+    struct kernel_vfs_statfs space;
+    check(!kernel_vfs_mount_statfs(memory_control->file.mount,&space),"namespace-tmpfs-statfs-domain");
+    check(!kernel_vfs_path_root(memory_control->file.mount,cache->heap,&root),"namespace-tmpfs-root");
+    struct kernel_vfs_path *memory_path=NULL;
+    check(!kernel_vfs_path_lookup(root,"memory-io",9,&memory_path) &&
+          !kernel_vfs_path_truncate(memory_path,0,NULL),"namespace-tmpfs-path-truncate-domain");
+    check(!kernel_vfs_path_release(&memory_path) && !kernel_vfs_path_release(&root),"namespace-tmpfs-path-owners");
 }
 static void verify(void *unused)
 {

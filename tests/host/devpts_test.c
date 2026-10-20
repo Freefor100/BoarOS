@@ -1,3 +1,8 @@
+#define BOAROS_ARCH_CONTEXT_H
+static void *devpts_cpu(void);
+#define arch_current_cpu_get devpts_cpu
+#define arch_interrupt_save riscv_interrupt_save
+#define arch_interrupt_restore riscv_interrupt_restore
 #define BOAROS_ARCH_RISCV_CONTEXT_H
 #include <stdint.h>
 static inline uintptr_t riscv_interrupt_save(void) { return 0; }
@@ -7,6 +12,11 @@ static inline void riscv_interrupt_restore(uintptr_t flags) { (void)flags; }
 #include <stdio.h>
 #include <stdlib.h>
 
+int kernel_vfs_nodes_idle(struct kernel_vfs_instance *i, struct kernel_vfs_node *root)
+{ return !i->retiring_nodes && i->nodes == root && (!root || !root->next); }
+static struct kernel_cpu test_cpu = {.initialized=KERNEL_CPU_INITIALIZED};
+static void *devpts_cpu(void) { return &test_cpu; }
+struct kernel_raw_lock kernel_vfs_state_lock = {.rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED};
 static size_t live_allocations;
 static int allocation_budget = -1, start_error, stop_error;
 static uint64_t clock_ns;
@@ -138,14 +148,14 @@ static void options_and_isolation(struct kernel_heap *heap)
     assert(kernel_devpts_file_entry(&slave) == eb && kernel_devpts_entry_binding(eb) == &binding_b);
     struct kernel_vfs_instance *mutations = b->private_data;
     assert(mutations->ops->mkdir && mutations->ops->unlink && mutations->ops->rmdir);
-    assert(mutations->ops->mkdir(b, "/new", 0755) == -KERNEL_EPERM);
-    assert(mutations->ops->unlink(b, "/0") == -KERNEL_EPERM);
-    assert(mutations->ops->rmdir(b, "/new") == -KERNEL_EPERM);
+    assert(mutations->ops->mkdir(b, 1, "new", 0755) == -KERNEL_EPERM);
+    assert(mutations->ops->unlink(b, 1, "0") == -KERNEL_EPERM);
+    assert(mutations->ops->rmdir(b, 1, "new") == -KERNEL_EPERM);
     assert(mutations->ops->create && mutations->ops->symlink && mutations->ops->mknod);
     struct kernel_vfs_file denied = {0};
-    assert(mutations->ops->create(b, "/new", 0600, &denied) == -KERNEL_EACCES);
-    assert(mutations->ops->symlink(mutations, "0", "/link") == -KERNEL_EPERM);
-    assert(mutations->ops->mknod(mutations, "/node", KERNEL_VFS_S_IFCHR, 0600, 0x103) == -KERNEL_EPERM);
+    assert(mutations->ops->create(b, 1, "new", 0600, &denied) == -KERNEL_EACCES);
+    assert(mutations->ops->symlink(mutations, 1, "0", "link") == -KERNEL_EPERM);
+    assert(mutations->ops->mknod(mutations, 1, "node", KERNEL_VFS_S_IFCHR, 0600, 0x103) == -KERNEL_EPERM);
     assert(find(b, "0") == st.ino && kernel_devpts_entry_binding(eb) == &binding_b);
     close_file(&slave); close_file(&ptmx); close_file(&root);
     kernel_devpts_retire(ea); kernel_devpts_entry_release(&ea);

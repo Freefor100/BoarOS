@@ -912,6 +912,7 @@ int main(int argc,char **argv)
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
     borrowed_page_case(&pages);
+    namespace_retiring_mount_case(&heap);
     struct ext4_bcache done_cache;
     assert(!ext4_bcache_init_dynamic(&done_cache,1,4096));
     struct ext4_buf done_buffer={.bc=&done_cache,.loading=false};
@@ -944,6 +945,7 @@ int main(int argc,char **argv)
 #endif
     struct kernel_vfs_mount *memory=0;
     assert(!kernel_tmpfs_create(&heap,0,"",&memory)); sendfile_pipe_case(&heap,memory); file_case(&heap,memory,0);
+    namespace_publication_case(&heap,memory);
     directory_eof(&heap,memory);
     vector_boundaries(&heap,memory);
     raw_block_case(&heap,memory);
@@ -955,6 +957,7 @@ int main(int argc,char **argv)
         parallel_case(&heap,memory,0,actors,append);
     assert(!kernel_vfs_unmount(memory));
     image=open(argv[1],O_RDWR); assert(image>=0); struct stat info; assert(!fstat(image,&info));
+    namespace_mount_slot_case(&heap,&backend_heap,&pages,info.st_size);
     struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init(&cache,&heap,&pages));
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=flush_image,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};

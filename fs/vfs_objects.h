@@ -32,6 +32,7 @@ struct kernel_vfs_instance {
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
     struct kernel_vfs_path *path_index;
+    size_t retiring_nodes; /* Removed from weak index; close/free still owns instance. */
 };
 
 struct kernel_vfs_node {

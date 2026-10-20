@@ -492,7 +492,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 {
     struct devpts_mount *m = devpts(mount);
     if (mount->covered_path || mount->root_path || mount->child_mounts ||
-        m->instance.external_files || m->instance.nodes || m->instance.cleanup_nodes ||
+        m->instance.external_files || !kernel_vfs_nodes_idle(&m->instance, NULL) || m->instance.cleanup_nodes ||
         m->instance.paths || m->entries || m->reserved_numbers ||
         m->root.references || m->ptmx.references) return -KERNEL_EBUSY;
     int result = prepare_unmount(mount);

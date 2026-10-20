@@ -1162,7 +1162,7 @@ static int proc_unmount(struct kernel_vfs_mount *mount)
     struct procfs_mount *proc = (struct procfs_mount *)mount;
     struct kernel_vfs_instance *instance = &proc->instance;
     if (mount->covered_path || mount->root_path || mount->child_mounts ||
-        instance->external_files || instance->nodes || instance->paths)
+        instance->external_files || !kernel_vfs_nodes_idle(instance, NULL) || instance->paths)
         return -KERNEL_EBUSY;
     struct kernel_heap *heap = proc->heap;
     kernel_heap_release(heap, proc);

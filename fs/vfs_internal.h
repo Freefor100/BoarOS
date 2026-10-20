@@ -53,6 +53,8 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t inode);
 struct kernel_vfs_node *kernel_vfs_node_pin(struct kernel_vfs_instance *, uint64_t inode);
 void kernel_vfs_cleanup_node(struct kernel_vfs_node *);
+/* Terminal node snapshot; includes final releases already removed from the index. */
+int kernel_vfs_nodes_idle(struct kernel_vfs_instance *, struct kernel_vfs_node *root);
 
 #define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX
 /* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX

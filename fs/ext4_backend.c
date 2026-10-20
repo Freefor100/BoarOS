@@ -959,6 +959,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     }
     result = writeback_mount_times(adapter, true);
     if (result != EOK) return lwext4_error(result);
+    if (!kernel_vfs_nodes_idle(&adapter->instance, root)) return -KERNEL_EBUSY;
     orphan_link = &adapter->orphans;
     while (*orphan_link != 0) {
         struct lwext4_orphan *orphan = *orphan_link;
@@ -1004,7 +1005,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         *cleanup_link = next;
     }
     if (adapter->orphans != 0 || adapter->instance.cleanup_nodes != 0 ||
-        adapter->instance.nodes != root || (root && root->next)) {
+        !kernel_vfs_nodes_idle(&adapter->instance, root)) {
         return -KERNEL_EIO;
     }
     /* root 的路径身份保留至摘树；私有 handle 不再访问即将释放的 lwext4 mount。 */
@@ -1265,9 +1266,6 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
     if (adapter->instance.backend_data != adapter || !adapter->mounted) return -KERNEL_EINVAL;
     if (adapter->instance.read_only) return 0;
     if (adapter->journal_started) return -KERNEL_EBUSY;
-    kernel_wait_queue_init(&adapter->journal_work);
-    kernel_wait_queue_init(&adapter->checkpoint_work);
-    kernel_wait_queue_init(&adapter->journal_progress);
     /* The same mount worker also owns timestamp-only writeback on writable
      * filesystems without JBD; dirty inode pins need a consumer there too. */
     if (adapter->device.fs->jbd_journal) {
@@ -1342,6 +1340,11 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock);
     adapter->locks.unlock = backend_unlock;
     kernel_raw_lock_init(&adapter->journal_control, KERNEL_RAW_RANK_OBJECT);
+    /* Progress publication also runs during synchronous journal service,
+     * before background workers exist. Queues belong to the mount lifetime. */
+    kernel_wait_queue_init(&adapter->journal_work);
+    kernel_wait_queue_init(&adapter->checkpoint_work);
+    kernel_wait_queue_init(&adapter->journal_progress);
 #if BOAROS_MAX_CPUS > 1
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
 #endif
@@ -2423,6 +2426,7 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
 {
     if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
+    if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
         .path=name, .type=type, .mode=mode & 07777U, .device=device};
     return lwext4_error(ext4_metadata_execute(adapter->mount_point, apply_namespace_create, &request));

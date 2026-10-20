@@ -417,6 +417,8 @@ static void caller_namespace(void)
     pthread_t thread;CHECK(!pthread_create(&thread,0,namespace_cwd_peer,&shared));
     pthread_barrier_wait(&shared.changed);
     char cwd[128];CHECK(getcwd(cwd,sizeof(cwd)) && !strcmp(cwd,"/ns-second"));
+    char proc_cwd[128];
+    CHECK(readlink("/proc/self/cwd",proc_cwd,sizeof(proc_cwd))==10 && !memcmp(proc_cwd,"/ns-second",10));
     CHECK(!rename("/ns-first","/ns-renamed"));
     CHECK(!linkat(parent,"data",parent,"hard",0) && !symlinkat("data",parent,"alias"));
     char link[32];CHECK(readlinkat(parent,"alias",link,sizeof(link))==4 && !memcmp(link,"data",4));

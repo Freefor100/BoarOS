@@ -36,6 +36,7 @@
 
 #include <ext4_config.h>
 #include <kernel/cost.h>
+#include <kernel/raw_lock.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
 #include <ext4_errno.h>
@@ -203,6 +204,10 @@ static struct ext4_block_devices s_bdevices[CONFIG_EXT4_BLOCKDEVS_COUNT];
 
 /**@brief   Mountpoints.*/
 static struct ext4_mountpoint s_mp[CONFIG_EXT4_MOUNTPOINTS_COUNT];
+/* Names and publication belong to the registry, not to any one mount lock. */
+static struct kernel_raw_lock mount_index_lock = {
+    .rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED
+};
 
 int ext4_device_register(struct ext4_blockdev *bd,
 			 const char *dev_name)
@@ -574,6 +579,8 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	if (!bd)
 		return ENODEV;
 
+	{
+	KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock);
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!s_mp[i].reserved && !s_mp[i].mounted) {
 			memset(&s_mp[i], 0, sizeof(s_mp[i]));
@@ -593,16 +600,17 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 			return s_mp[i].mounted ? EOK : EBUSY;
 	}
 
+	}
 	if (!mp)
 		return ENOMEM;
 
 	r = ext4_block_init(bd);
-	if (r != EOK) { mp->reserved = false; return r; }
+	if (r != EOK) { { KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; } return r; }
 
 	r = ext4_fs_init(&mp->fs, bd, read_only);
 	if (r != EOK) {
 		ext4_block_fini(bd);
-		mp->reserved = false;
+		{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
 		return r;
 	}
 
@@ -613,14 +621,14 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	r = ext4_bcache_init_dynamic(bc, CONFIG_BLOCK_DEV_CACHE_SIZE, bsize);
 	if (r != EOK) {
 		ext4_block_fini(bd);
-		mp->reserved = false;
+		{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
 		return r;
 	}
 
 	if (bsize != bc->itemsize) {
 		ext4_bcache_fini_dynamic(bc);
 		ext4_block_fini(bd);
-		mp->reserved = false;
+		{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
 		return ENOTSUP;
 	}
 
@@ -630,12 +638,12 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 		ext4_bcache_cleanup(bc);
 		ext4_block_fini(bd);
 		ext4_bcache_fini_dynamic(bc);
-		mp->reserved = false;
+		{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
 		return r;
 	}
 
 	bd->fs = &mp->fs;
-	mp->mounted = 1;
+	{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->mounted = 1; }
 	return r;
 }
 
@@ -644,13 +652,7 @@ static struct ext4_mountpoint *ext4_get_mount(const char *path);
 
 static int ext4_umount_locked(const char *mount_point)
 {
-	struct ext4_mountpoint *mp = NULL;
-	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; i++) {
-		if (s_mp[i].mounted && !strcmp(s_mp[i].name, mount_point)) {
-			mp = &s_mp[i];
-			break;
-		}
-	}
+	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENODEV;
 	if (mp->transaction_depth) return EBUSY;
 	int r = EOK;
@@ -674,7 +676,7 @@ static int ext4_umount_locked(const char *mount_point)
 	ext4_bcache_cleanup(mp->fs.bdev->bc);
 	ext4_bcache_fini_dynamic(mp->fs.bdev->bc);
 	mp->fs.bdev->fs = NULL;
-	mp->mounted = false;
+	{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->mounted = false; }
 	return EOK;
 }
 
@@ -685,12 +687,13 @@ int ext4_umount(const char *mount_point)
 	EXT4_MP_LOCK(mp);
 	int result = ext4_umount_locked(mount_point);
 	EXT4_MP_UNLOCK(mp);
-	if (result == EOK) mp->reserved = false;
+	if (result == EOK) { KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
 	return result;
 }
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path)
 {
+	KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock);
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 
 		if (!s_mp[i].mounted)
@@ -1320,6 +1323,7 @@ int ext4_mount_point_stats(const char *mount_point,
 int ext4_mount_setup_locks(const char *mount_point,
 			   const struct ext4_lock *locks)
 {
+	KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock);
 	uint32_t i;
 	struct ext4_mountpoint *mp = 0;
 

@@ -15,6 +15,9 @@ int __wrap_ext4_transaction_begin(const char *mount)
 int __real_ext4_fopen2(ext4_file *,const char *,int);
 int __wrap_ext4_fopen2(ext4_file *file,const char *path,int flags)
 { if(metadata_probe)metadata_open_calls++;int r=__real_ext4_fopen2(file,path,flags);if(metadata_probe && r)metadata_failed_stage=2;return r; }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *);
+int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file)
+{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file);if(metadata_probe && r)metadata_failed_stage=2;return r; }
 int __real_ext4_file_set_mode_initial(ext4_file *,uint32_t);
 int __wrap_ext4_file_set_mode_initial(ext4_file *file,uint32_t mode)
 { int r=__real_ext4_file_set_mode_initial(file,mode);if(metadata_probe && r)metadata_failed_stage=3;return r; }
@@ -81,6 +84,15 @@ static int create_file(struct kernel_vfs_mount *mount,const char *name,uint32_t 
 {
     struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
     if (adapter->device.fs->jbd_journal) return kernel_vfs_create(mount,name,mode,file);
+    struct kernel_vfs_path *root=NULL;
+    assert(!kernel_vfs_path_root(mount,adapter->instance.heap, &root));
+    const uint32_t types[]={KERNEL_VFS_S_IFREG,KERNEL_VFS_S_IFIFO,KERNEL_VFS_S_IFCHR};
+    for (unsigned i=0;i<sizeof(types)/sizeof(types[0]);i++) {
+        assert(kernel_vfs_mknod_at(root,root,"/nojournal-denied",types[i]|0600,0)==-KERNEL_EOPNOTSUPP);
+        struct kernel_vfs_file missing={0};
+        assert(kernel_vfs_open(mount,"/nojournal-denied",&missing)==-KERNEL_ENOENT);
+    }
+    assert(!kernel_vfs_path_release(&root));
     /* Namespace create+chmod needs an atomic journal group in the VFS backend.
      * Seed nojournal fixtures through the library, then exercise real VFS I/O. */
     char path[96]; snprintf(path,sizeof(path),"%s%s",adapter->mount_point,name+1);

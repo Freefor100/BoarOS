@@ -1117,6 +1117,7 @@ static int prepare_unmount(struct kernel_vfs_mount *mount)
     enum kernel_page_cache_status status = kernel_page_cache_purge_mount(m->instance.page_cache, mount);
     if (status != KERNEL_PAGE_CACHE_STATUS_OK)
         return status == KERNEL_PAGE_CACHE_STATUS_STATE ? -KERNEL_EBUSY : -KERNEL_EIO;
+    if (!kernel_vfs_nodes_idle(&m->instance, root_node)) return -KERNEL_EBUSY;
     while (m->instance.cleanup_nodes) {
         struct kernel_vfs_node *node = m->instance.cleanup_nodes;
         if (node->unlinked && !node->retired) {
@@ -1131,7 +1132,7 @@ static int prepare_unmount(struct kernel_vfs_mount *mount)
         if (!node->closed) close_node(node);
         kernel_file_mapping_destroy(node); dispose(m, node);
     }
-    if (m->instance.nodes != root_node || (root_node && root_node->next)) return -KERNEL_EBUSY;
+    if (!kernel_vfs_nodes_idle(&m->instance, root_node)) return -KERNEL_EBUSY;
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     struct fat_inode *i;
     RB_FOREACH(i, fat_id_tree, &m->inodes) if (i->times_dirty) {

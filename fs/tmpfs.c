@@ -540,7 +540,7 @@ static int no_writeback(struct kernel_vfs_instance *i) { (void)i; return 0; }
 static int unmount(struct kernel_vfs_mount *mount)
 {
     struct tmp_mount *m=tm(mount->private_data);
-    if(mount->covered_path || mount->root_path || mount->child_mounts || m->instance.external_files || m->instance.nodes) return -KERNEL_EBUSY;
+    if(mount->covered_path || mount->root_path || mount->child_mounts || m->instance.external_files || !kernel_vfs_nodes_idle(&m->instance, NULL)) return -KERNEL_EBUSY;
     struct tmp_inode *parent;
     RB_FOREACH(parent, tmp_inode_tree, &m->inodes) {
         struct tmp_entry *e;
