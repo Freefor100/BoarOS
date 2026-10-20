@@ -100,7 +100,9 @@ struct kernel_page_cache;
 struct kernel_vfs_path;
 
 /* An owned path identity; root and cwd may name the same object while each
- * holding an independent reference. */
+ * holding an independent reference. Input paths are borrowed: callers retain
+ * a live reference through the entire call, including migration and waits.
+ * Returned paths and successfully opened files own independent references. */
 int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
                          struct kernel_heap *heap,
                          struct kernel_vfs_path **owner);

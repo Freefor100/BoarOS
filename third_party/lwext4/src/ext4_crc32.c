@@ -381,26 +381,57 @@ uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size)
 }
 
 typedef uint32_t crc32c_word __attribute__((__may_alias__));
+typedef uint64_t crc32c_pair __attribute__((__may_alias__));
 
-#if defined(__riscv)
-/* 保持小型校验循环处于同一4KiB代码页；跨页会使QEMU反复查找翻译块。
- * 256字节对齐避免布局变化把每四字节执行的热循环拆开。 */
-__attribute__((aligned(256)))
+static inline uint32_t crc32c_fold_word(uint32_t crc, uint32_t word)
+{
+	crc ^= word;
+	return crc32c_slices[2][crc & 0xff] ^
+	       crc32c_slices[1][(crc >> 8) & 0xff] ^
+	       crc32c_slices[0][(crc >> 16) & 0xff] ^
+	       crc32c_tab[crc >> 24];
+}
+
+static inline uint32_t crc32c_fold_pair(uint32_t crc, uint64_t pair)
+{
+	pair = to_le64(pair);
+	crc = crc32c_fold_word(crc, (uint32_t)pair);
+	return crc32c_fold_word(crc, (uint32_t)(pair >> 32));
+}
+
+#if defined(__riscv) || defined(__loongarch__)
+/* 同一指令页容纳批量校验循环，布局检查约束其实际长度。 */
+__attribute__((aligned(2048)))
 #endif
 static uint32_t crc32c(uint32_t crc, const void *buf, uint32_t size)
 {
 	const uint8_t *bytes = buf;
-	while (size && ((uintptr_t)bytes & (sizeof(crc32c_word) - 1))) {
+	while (size && ((uintptr_t)bytes & (sizeof(crc32c_pair) - 1))) {
 		crc = crc32c_tab[(crc ^ *bytes++) & 0xff] ^ (crc >> 8);
 		size--;
 	}
+	while (size >= 8 * sizeof(crc32c_pair)) {
+		const crc32c_pair *words = (const void *)bytes;
+		uint64_t a = words[0], b = words[1], c = words[2], d = words[3];
+		uint64_t e = words[4], f = words[5], g = words[6], h = words[7];
+		/* 先将连续输入读入寄存器，再查表，避免每四字节在输入页与
+		 * 表页间往返；空汇编仅约束编译器的加载顺序。 */
+		__asm__ volatile("" : "+r"(a), "+r"(b), "+r"(c), "+r"(d),
+				    "+r"(e), "+r"(f), "+r"(g), "+r"(h) : : "memory");
+		crc = crc32c_fold_pair(crc, a);
+		crc = crc32c_fold_pair(crc, b);
+		crc = crc32c_fold_pair(crc, c);
+		crc = crc32c_fold_pair(crc, d);
+		crc = crc32c_fold_pair(crc, e);
+		crc = crc32c_fold_pair(crc, f);
+		crc = crc32c_fold_pair(crc, g);
+		crc = crc32c_fold_pair(crc, h);
+		bytes += 8 * sizeof(crc32c_pair);
+		size -= 8 * sizeof(crc32c_pair);
+	}
 	while (size >= sizeof(crc32c_word)) {
 		/* 对齐读只触及当前四字节；LE归一化保持逐字节反射CRC顺序。 */
-		crc ^= to_le32(*(const crc32c_word *)(const void *)bytes);
-		crc = crc32c_slices[2][crc & 0xff] ^
-		      crc32c_slices[1][(crc >> 8) & 0xff] ^
-		      crc32c_slices[0][(crc >> 16) & 0xff] ^
-		      crc32c_tab[crc >> 24];
+		crc = crc32c_fold_word(crc, to_le32(*(const crc32c_word *)(const void *)bytes));
 		bytes += sizeof(crc32c_word);
 		size -= sizeof(crc32c_word);
 	}

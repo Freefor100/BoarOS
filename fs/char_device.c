@@ -9,7 +9,7 @@
 #include <kernel/task.h>
 #include "open_file_internal.h"
 #include "pty_internal.h"
-#include "vfs_objects.h"
+#include "vfs_internal.h"
 #include <kernel/devpts.h>
 #include <kernel/uaccess.h>
 #include <kernel/tty.h>
@@ -256,12 +256,13 @@ int kernel_char_device_open(struct kernel_open_file_description *file,
         error = pty_category ? (file->file.private_data ?
             kernel_vfs_fstat(&file->file, &stat) : -KERNEL_EIO) : 0;
         if (!error && pty_category && file->file.private_data && stat.rdev == 0x502) {
-            struct kernel_vfs_path *parent = file->file.path ? file->file.path->parent : 0;
+            struct kernel_vfs_path *parent = kernel_vfs_path_parent_pin(file->file.path);
             struct kernel_vfs_path *pts = 0;
             error = parent ? kernel_vfs_path_lookup(parent, "pts", 3, &pts) : -KERNEL_ENODEV;
             if (!error) error = kernel_pty_open_ptmx(kernel_vfs_path_mount(pts), file->heap,
                 kernel_task_current(), flags, &file->device_instance, &file->device);
             if (pts && kernel_vfs_path_release(&pts)) __builtin_trap();
+            if (parent && kernel_vfs_path_release(&parent)) __builtin_trap();
         } else if (!error && pty_category) error = -KERNEL_EIO;
         else if (!error) error = file->device->open ? file->device->open(file->heap,
         kernel_task_current(), flags, &file->file, &file->device_instance) : 0;
