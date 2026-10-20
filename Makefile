@@ -1643,6 +1643,8 @@ test-block-host:
 	build/host/block-registry
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-partitions
 	build/host/block-partitions
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c tests/host/sync/notifications.c -pthread -Itests/host/block_model -o build/host/block-partitions-smp
+	build/host/block-partitions-smp
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
 	build/host/block-fault
 

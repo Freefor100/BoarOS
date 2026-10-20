@@ -125,7 +125,9 @@ void kernel_block_usage(struct kernel_block_device *, uint32_t *references, uint
 void kernel_block_set_capacity(struct kernel_block_device *, uint64_t bytes);
 int kernel_block_set_read_only(struct kernel_block_device *, int read_only);
 int kernel_block_read_only(const struct kernel_block_device *);
-/* Byte I/O holds the physical parent io_lock across each sector read/modify/write. scratch must
+/* Task I/O and flush may execute on any CPU. Device references and the physical
+ * parent io_lock cover completion; configuration and teardown retain their owners.
+ * Byte I/O holds that lock across each sector read/modify/write. scratch must
  * hold one logical sector and remains borrowed until the request returns.
  * completed always reports the prefix confirmed by successful callbacks,
  * including before a later error. A failing callback supplies no finer progress;
