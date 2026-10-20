@@ -30,6 +30,7 @@ struct kernel_vfs_instance {
     int writeback_error;
     uint8_t read_only;
     uint8_t quiescing;
+    struct kernel_raw_lock error_lock;
 };
 
 struct kernel_vfs_node {

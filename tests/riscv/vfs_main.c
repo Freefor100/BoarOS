@@ -96,6 +96,7 @@ static void run_backend_inode_identity_regression(struct kernel_heap *heap)
 {
     static struct kernel_vfs_backend callbacks;
     struct kernel_vfs_instance instance = {.heap = heap, .ops = &callbacks};
+    kernel_raw_lock_init(&instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     struct kernel_vfs_mount mount = {
         .private_data = &instance, .state = VFS_MOUNT_STATE_LIVE
     };
@@ -128,6 +129,7 @@ static void run_inode_index_regression(struct kernel_heap *heap)
     static struct kernel_vfs_file files[COUNT];
     static struct kernel_vfs_backend callbacks;
     struct kernel_vfs_instance instance = {.heap = heap, .ops = &callbacks};
+    kernel_raw_lock_init(&instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     struct kernel_vfs_mount mount = {.private_data = &instance, .state = VFS_MOUNT_STATE_LIVE};
     volatile struct kernel_vfs_backend *active = &callbacks;
     active->close_node = synthetic_node_close;
@@ -253,6 +255,7 @@ static void synthetic_mount_init(struct kernel_vfs_mount *mount,
     instance->ops = &callbacks;
     instance->read_only = 1U;
     kernel_mutex_init(&instance->namespace_lock, 20U, (uintptr_t)instance);
+    kernel_raw_lock_init(&instance->error_lock, KERNEL_RAW_RANK_OBJECT);
     mount->private_data = instance;
     mount->id = id;
     mount->state = VFS_MOUNT_STATE_LIVE;

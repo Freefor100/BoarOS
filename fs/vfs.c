@@ -2295,7 +2295,7 @@ int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node)
 
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
 {
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_TASK_LOCK_SCOPE(guard, &node->instance->error_lock);
     node->writeback_error = error;
     node->writeback_error_sequence++;
     if (node->writeback_error_sequence == 0) __builtin_trap();
@@ -2304,16 +2304,14 @@ void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
         node->instance->writeback_error = error;
         if (++node->instance->writeback_error_sequence == 0) __builtin_trap();
     }
-    arch_interrupt_restore(irq);
 }
 
 uint64_t kernel_vfs_mount_error_sequence(const struct kernel_vfs_mount *mount)
 {
     if (!mount || !mount->private_data) return 0;
-    uintptr_t irq = arch_interrupt_save();
-    uint64_t sequence = ((struct kernel_vfs_instance *)mount->private_data)->writeback_error_sequence;
-    arch_interrupt_restore(irq);
-    return sequence;
+    struct kernel_vfs_instance *instance = mount->private_data;
+    KERNEL_TASK_LOCK_SCOPE(guard, &instance->error_lock);
+    return instance->writeback_error_sequence;
 }
 
 struct sync_nodes {
@@ -2391,12 +2389,11 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
     } else if (instance->page_cache) __builtin_trap();
 observe:
     if (observed_error) {
-        uintptr_t irq = arch_interrupt_save();
+        KERNEL_TASK_LOCK_SCOPE(guard, &instance->error_lock);
         if (*observed_error != instance->writeback_error_sequence) {
             if (!result) result = instance->writeback_error;
             *observed_error = instance->writeback_error_sequence;
         }
-        arch_interrupt_restore(irq);
     }
     return result;
 }
@@ -2491,17 +2488,21 @@ void kernel_vfs_sync_all(struct kernel_vfs_path *root)
 uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    return node != 0 ? node->writeback_error_sequence : 0;
+    if (!node) return 0;
+    KERNEL_TASK_LOCK_SCOPE(guard, &node->instance->error_lock);
+    return node->writeback_error_sequence;
 }
 
 static void vfs_sync_observe_complete(struct kernel_vfs_sync_request *request, int result)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
-    /* 完成事件已在CPU0；共享OFD游标在通知caller前一并消费，不再为此交接一次。 */
-    uintptr_t irq = arch_interrupt_save();
-    if (*request->observed_error != node->writeback_error_sequence) {
-        if (!result) result = node->writeback_error;
-        *request->observed_error = node->writeback_error_sequence;
+    /* 完成可来自任一CPU；错误与共享OFD游标在通知前成对消费。 */
+    {
+        KERNEL_TASK_LOCK_SCOPE(error, &node->instance->error_lock);
+        if (*request->observed_error != node->writeback_error_sequence) {
+            if (!result) result = node->writeback_error;
+            *request->observed_error = node->writeback_error_sequence;
+        }
     }
     {
         KERNEL_RAW_SCOPE(guard, &request->metadata);
@@ -2512,7 +2513,6 @@ static void vfs_sync_observe_complete(struct kernel_vfs_sync_request *request, i
             (void)kernel_wait_queue_wake_all(&request->changed);
         /* request can retire once this raw lock is released. */
     }
-    arch_interrupt_restore(irq);
 }
 
 void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *request, int result)

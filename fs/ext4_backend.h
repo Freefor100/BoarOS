@@ -45,6 +45,9 @@ struct lwext4_mount_adapter {
     uint8_t recovery_pending;
     uint8_t unmount_prepared;
     int mount_error;
+    struct kernel_raw_lock journal_control;
+    uint64_t published_sealed, published_durable, published_checkpoint;
+    int published_error;
 };
 struct lwext4_node {
     struct kernel_vfs_node node;

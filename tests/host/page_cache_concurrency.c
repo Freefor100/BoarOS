@@ -61,6 +61,9 @@ static unsigned write_error;
 static ext4_file *metadata_fault_file;
 static unsigned timestamp_fault, metadata_sync_fault;
 static struct kernel_page_cache *current_cache;
+static struct lwext4_mount_adapter *journal_wait_owner;
+static struct { unsigned hold, entered, release; } durable_before_park;
+static _Thread_local unsigned hold_durable_wait;
 static struct {
     struct kernel_vfs_node *writer, *reader;
     unsigned batches, first_entered, resume_first, read_completed, close_completed, fault_batch;
@@ -224,6 +227,12 @@ enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_to
 enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,
     enum kernel_wait_wake_reason *reason)
 {
+    if (hold_durable_wait) {
+        hold_durable_wait = 0;
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&durable_before_park.entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&durable_before_park.release, __ATOMIC_ACQUIRE)) sched_yield();
+    }
     assert(!delayed_load_token.generation || token->generation != delayed_load_token.generation ||
         token->task != delayed_load_token.task);
     if (hold_ordinary_wait) {
@@ -236,6 +245,9 @@ enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
+    if (journal_wait_owner && (queue == &journal_wait_owner->journal_work ||
+        queue == &journal_wait_owner->checkpoint_work || queue == &journal_wait_owner->journal_progress))
+        assert(kernel_cpu_current()->raw_locks && "journal condition and registration need shared state protection");
     for (unsigned i=0;i<__atomic_load_n(&durable_cohort.prepared,__ATOMIC_ACQUIRE);i++)
         if (queue==durable_cohort.queues[i] && !__atomic_exchange_n(&durable_cohort.seen[i],1,__ATOMIC_ACQ_REL))
             __atomic_fetch_add(&durable_cohort.waiting,1,__ATOMIC_RELEASE);
@@ -254,6 +266,8 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
         while (!__atomic_load_n(&load_registration_resume, __ATOMIC_ACQUIRE)) sched_yield();
     }
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && queue == __atomic_load_n(&durable_wait.queue, __ATOMIC_ACQUIRE) &&
+        __atomic_exchange_n(&durable_before_park.hold, 0, __ATOMIC_ACQ_REL)) hold_durable_wait = 1;
     if (delaying) { assert(!status); delayed_load_token = *token; }
     if (!status && kernel_io_context_current()->background_reclaim &&
         __atomic_load_n(&cycle_alloc_entered,__ATOMIC_ACQUIRE) &&
@@ -2071,6 +2085,48 @@ static void *executor_sync_client(void *argument)
     __atomic_store_n(&sync->done,1,__ATOMIC_RELEASE);
     return NULL;
 }
+
+struct error_consumer {
+    struct kernel_vfs_sync_request request;
+    pthread_barrier_t *barrier;
+    unsigned id;
+};
+static void *consume_shared_error(void *argument)
+{
+    struct error_consumer *client = argument;
+    cache_test_attach(8 + client->id);
+    kernel_cpu_current()->logical_id = client->id % 2;
+    for (unsigned i = 0; i < 32; i++)
+        kernel_vfs_record_writeback_error(kernel_vfs_file_node(client->request.file), -KERNEL_ENOMEM);
+    int status = pthread_barrier_wait(client->barrier);
+    assert(!status || status == PTHREAD_BARRIER_SERIAL_THREAD);
+    kernel_vfs_sync_complete(&client->request, 0);
+    return NULL;
+}
+static void shared_error_cursor(struct kernel_vfs_file *file)
+{
+    uint64_t observed = kernel_vfs_error_sequence(file), before = observed;
+    struct error_consumer clients[8] = {0};
+    pthread_t threads[8]; pthread_barrier_t barrier;
+    assert(!pthread_barrier_init(&barrier, NULL, 8));
+    for (unsigned i = 0; i < 8; i++) {
+        clients[i].request.file = file;
+        clients[i].request.observed_error = &observed;
+        clients[i].barrier = &barrier; clients[i].id = i;
+        kernel_raw_lock_init(&clients[i].request.metadata, KERNEL_RAW_RANK_OBJECT);
+        assert(!pthread_create(&threads[i], NULL, consume_shared_error, &clients[i]));
+    }
+    unsigned consumed = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        assert(!pthread_join(threads[i], NULL) && clients[i].request.done);
+        int error = clients[i].request.result;
+        assert(!error || error == -KERNEL_ENOMEM);
+        consumed += error != 0;
+    }
+    assert(consumed == 1 && observed == before + 256 &&
+        kernel_vfs_error_sequence(file) == observed && !pthread_barrier_destroy(&barrier));
+    puts("PASS shared error cursor: 256 publications, one observation across CPU0/CPU1, eight completions");
+}
 static void *executor_cold_client(void *argument)
 {
     struct kernel_vfs_file *file=argument;
@@ -2421,10 +2477,12 @@ static void executor_durable_progress(struct kernel_heap *heap,
     observed=kernel_vfs_error_sequence(&closing);
     assert(!kernel_vfs_sync(&closing,0,&observed));
     assert(!kernel_page_cache_invalidate_node(&cache,kernel_vfs_file_node(&reader)));
+    journal_wait_owner = mount.private_data;
     assert(!kernel_vfs_start_journal_worker(&mount) && !kernel_page_cache_start_worker(&cache));
     memset(bytes,0x35,sizeof(bytes));
     assert(!kernel_vfs_pwrite(&writer,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     durable_wait=(__typeof__(durable_wait)){.file=&writer,.armed=1};
+    durable_before_park=(__typeof__(durable_before_park)){.hold=1};
     durable_cohort=(__typeof__(durable_cohort)){.file=&writer};
     executor_fairness=(__typeof__(executor_fairness)){.reader=kernel_vfs_file_node(&reader)};
     struct executor_sync sync={.file=&writer,.observed=kernel_vfs_error_sequence(&writer)};
@@ -2432,6 +2490,7 @@ static void executor_durable_progress(struct kernel_heap *heap,
     pthread_t syncing,reading,close_thread;
     assert(!pthread_create(&syncing,NULL,executor_sync_client,&sync));
     wait_progress(&durable_wait.wait_entered,1);
+    wait_progress(&durable_before_park.entered,1);
     wait_progress(&durable_wait.flush_entered,1);
     assert(durable_wait.target && !__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE));
     for (unsigned i=0;i<7;i++) {
@@ -2460,6 +2519,9 @@ static void executor_durable_progress(struct kernel_heap *heap,
     assert(!__atomic_load_n(&executor_fairness.read_completed,__ATOMIC_ACQUIRE) &&
         !__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE) && !pthread_join(close_thread,NULL));
     __atomic_store_n(&durable_wait.resume_flush,1,__ATOMIC_RELEASE);
+    wait_progress(&durable_cohort.completed,8);
+    assert(!__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&durable_before_park.release,1,__ATOMIC_RELEASE);
     assert(!pthread_join(syncing,NULL) && !sync.result && !pthread_join(reading,NULL));
     assert(__atomic_load_n(&executor_fairness.read_completed,__ATOMIC_ACQUIRE));
     for (unsigned i=0;i<7;i++) assert(!pthread_join(sibling_threads[i],NULL) && !siblings[i].result);
@@ -2475,8 +2537,10 @@ static void executor_durable_progress(struct kernel_heap *heap,
     assert(!kernel_page_cache_invalidate_node(&cache,kernel_vfs_file_node(&writer)));
     unsigned char actual[BOAROS_PAGE_SIZE];
     assert(!kernel_vfs_pread(&writer,0,actual,sizeof(actual),&done) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(actual)));
+    shared_error_cursor(&writer);
     assert(!kernel_vfs_close(&writer) && !kernel_vfs_close(&reader) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
+    journal_wait_owner = NULL;
     puts("PASS durable caller wait: paused precommit flush retains physical I/O exclusion; hot read/CPU0 close progress; cold reader finishes after flush; fixed old version completes without clearing new dirt, next sync persists it and owners return");
 }
 

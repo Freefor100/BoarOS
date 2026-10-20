@@ -192,6 +192,91 @@ static int mount_error(const struct lwext4_mount_adapter *adapter)
     struct ext4_fs *fs = adapter->device.fs;
     return fs && fs->jbd_journal ? __atomic_load_n(&fs->jbd_journal->error,__ATOMIC_ACQUIRE) : EOK;
 }
+
+static void journal_wake(struct kernel_wait_queue *queue)
+{
+    KERNEL_IRQ_SCOPE(irq);
+    if (kernel_wait_queue_wake_all(queue)) __builtin_trap();
+}
+
+/* Only the backend writer publishes these values. Waiters borrow the short
+ * control domain instead of reading a live transaction while its lock sleeps. */
+static int journal_publish_locked(struct lwext4_mount_adapter *adapter)
+{
+    struct ext4_fs *fs = adapter->device.fs;
+    struct jbd_journal *journal = fs ? fs->jbd_journal : NULL;
+    if (!journal || !journal->grouped) return 0;
+    int error = adapter->published_error ? adapter->published_error : mount_error(adapter);
+    if (adapter->published_sealed == journal->sealed_sequence &&
+        adapter->published_durable == journal->durable_sequence &&
+        adapter->published_checkpoint == journal->checkpoint_sequence &&
+        adapter->published_error == error) return 0;
+    int committed = adapter->published_durable != journal->durable_sequence;
+    int reclaimed = adapter->published_checkpoint != journal->checkpoint_sequence;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        adapter->published_sealed = journal->sealed_sequence;
+        adapter->published_durable = journal->durable_sequence;
+        adapter->published_checkpoint = journal->checkpoint_sequence;
+        adapter->published_error = error;
+        if (committed) adapter->checkpoint_requested = 1;
+        if (reclaimed) adapter->journal_requested = 1;
+    }
+    journal_wake(&adapter->journal_progress);
+    if (committed) journal_wake(&adapter->checkpoint_work);
+    if (reclaimed) journal_wake(&adapter->journal_work);
+    return 1;
+}
+
+static void backend_unlock(void *lock)
+{
+    struct lwext4_mount_adapter *adapter = (void *)((char *)lock -
+        offsetof(struct lwext4_mount_adapter, backend_lock));
+    struct kernel_io_context *context = kernel_io_context_current();
+    int changed = context->backend_depth == 1 && !context->backend_read &&
+        journal_publish_locked(adapter);
+    boaros_lwext4_unlock(lock);
+    if (changed) complete_sync_waiters(adapter);
+}
+
+static void journal_request_flags(struct lwext4_mount_adapter *adapter, int force)
+{
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        adapter->journal_requested = adapter->checkpoint_requested = 1;
+        if (force) adapter->journal_force = 1;
+    }
+    journal_wake(&adapter->journal_work);
+    journal_wake(&adapter->checkpoint_work);
+}
+
+static void journal_stop_workers(struct lwext4_mount_adapter *adapter)
+{
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        adapter->journal_stopping = 1;
+    }
+    journal_wake(&adapter->journal_work);
+    journal_wake(&adapter->checkpoint_work);
+    journal_wake(&adapter->journal_progress);
+}
+
+static void journal_idle(struct lwext4_mount_adapter *adapter, int checkpoint, uint64_t deadline)
+{
+    struct kernel_wait_token token;
+    int needed;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        needed = !adapter->journal_stopping &&
+            !(checkpoint ? adapter->checkpoint_requested : adapter->journal_requested);
+        if (needed && kernel_wait_prepare(checkpoint ? &adapter->checkpoint_work :
+            &adapter->journal_work, deadline, 0, &token)) __builtin_trap();
+    }
+    if (needed) {
+        enum kernel_wait_wake_reason reason;
+        if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
+    }
+}
 static int free_orphan_inode(struct lwext4_mount_adapter *adapter,uint32_t inode)
 {
     int result=ext4_orphan_free(adapter->mount_point,inode);
@@ -318,10 +403,11 @@ static int time_dirty_locked(struct lwext4_node *node, unsigned fields,
 static void time_notify(struct lwext4_mount_adapter *adapter, int notify)
 {
     if (!notify) return;
-    uintptr_t irq = arch_interrupt_save();
-    __atomic_store_n(&adapter->journal_requested, 1, __ATOMIC_RELEASE);
-    (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-    arch_interrupt_restore(irq);
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        adapter->journal_requested = 1;
+    }
+    journal_wake(&adapter->journal_work);
 }
 
 static void time_dirty(struct lwext4_node *node, unsigned fields,
@@ -839,7 +925,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         return -KERNEL_EBUSY;
     /* Each outstanding sync still borrows its file and mount. Leave the
      * completion workers alive until those callers have consumed the result. */
-    if (adapter->sync_waiters) return -KERNEL_EBUSY;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        if (adapter->sync_waiters) return -KERNEL_EBUSY;
+    }
     adapter->instance.quiescing = 1U;
     /* 停止并等待本实例 worker；后续失败仍保持静止，不能重新发布可写挂载。 */
     if (adapter->instance.page_cache)
@@ -929,11 +1018,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
             result = ext4_journal_group_drain(adapter->mount_point);
             if (result != EOK) return lwext4_error(result);
         }
-        uintptr_t irq = arch_interrupt_save();
-        adapter->journal_stopping = 1;
-        (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-        (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
-        arch_interrupt_restore(irq);
+        journal_stop_workers(adapter);
         kernel_thread_join(&adapter->journal_worker);
         if (adapter->checkpoint_started) {
             kernel_thread_join(&adapter->checkpoint_worker);
@@ -971,19 +1056,13 @@ static uint64_t journal_now(void *context)
 
 static void journal_request(void *context)
 {
-    struct lwext4_mount_adapter *adapter = context;
-    uintptr_t irq = arch_interrupt_save();
-    __atomic_store_n(&adapter->journal_requested, 1, __ATOMIC_RELEASE);
-    adapter->checkpoint_requested = 1;
-    (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-    (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
-    arch_interrupt_restore(irq);
+    journal_request_flags(context, 0);
 }
 
-static uint64_t journal_reached(const struct jbd_journal *journal, enum ext4_journal_wait kind)
+static uint64_t journal_reached(const struct lwext4_mount_adapter *adapter, enum ext4_journal_wait kind)
 {
-    return kind == EXT4_JOURNAL_WAIT_SEALED ? journal->sealed_sequence :
-        kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
+    return kind == EXT4_JOURNAL_WAIT_SEALED ? adapter->published_sealed :
+        kind == EXT4_JOURNAL_WAIT_DURABLE ? adapter->published_durable : adapter->published_checkpoint;
 }
 
 static unsigned sync_target_height(const struct kernel_vfs_sync_request *request)
@@ -1055,21 +1134,21 @@ static struct kernel_vfs_sync_request *sync_target_take_first(struct kernel_vfs_
 static void complete_sync_waiters(struct lwext4_mount_adapter *adapter)
 {
     for (;;) {
-        uintptr_t irq=arch_interrupt_save();
-        struct kernel_vfs_sync_request *request=adapter->sync_waiters;
-        while (request && request->index_left) request=request->index_left;
-        int error=mount_error(adapter);
-        if (!request || (!error && adapter->device.fs->jbd_journal->durable_sequence<request->target)) {
-            arch_interrupt_restore(irq);
-            return;
+        struct kernel_vfs_sync_request *request;
+        int error;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+            request = adapter->sync_waiters;
+            while (request && request->index_left) request = request->index_left;
+            error = adapter->published_error;
+            if (!request || (!error && adapter->published_durable < request->target)) return;
+            adapter->sync_waiters = sync_target_take_first(adapter->sync_waiters);
+            request->index_left = request->index_right = NULL;
+            request->index_height = 0;
         }
-        adapter->sync_waiters=sync_target_take_first(adapter->sync_waiters);
-        request->index_left=request->index_right=NULL;
-        request->index_height=0;
-        arch_interrupt_restore(irq);
-        /* The caller owns the removed request until this single completion;
-         * notification can retire its stack, so do not access it afterwards. */
-        kernel_vfs_sync_complete(request,lwext4_error(error));
+        /* Notification can retire the caller's stack. The removed request is
+         * borrowed through this completion; never touch it afterwards. */
+        kernel_vfs_sync_complete(request, lwext4_error(error));
     }
 }
 
@@ -1080,34 +1159,26 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
         kind == EXT4_JOURNAL_WAIT_SEALED ? COST_JOURNAL_WAIT_SEALED_TICKS :
         kind == EXT4_JOURNAL_WAIT_DURABLE ? COST_JOURNAL_WAIT_DURABLE_TICKS : COST_JOURNAL_WAIT_CHECKPOINT_TICKS);
 #endif
-    if (kind == EXT4_JOURNAL_WAIT_SEALED) { COST_ADD(JOURNAL_WAIT_SEALED, 1); }
-    else if (kind == EXT4_JOURNAL_WAIT_DURABLE) { COST_ADD(JOURNAL_WAIT_DURABLE, 1); }
-    else { COST_ADD(JOURNAL_WAIT_CHECKPOINT, 1); }
+    if (kind == EXT4_JOURNAL_WAIT_SEALED) COST_ADD(JOURNAL_WAIT_SEALED, 1);
+    else if (kind == EXT4_JOURNAL_WAIT_DURABLE) COST_ADD(JOURNAL_WAIT_DURABLE, 1);
+    else COST_ADD(JOURNAL_WAIT_CHECKPOINT, 1);
     struct lwext4_mount_adapter *adapter = context;
-    adapter->journal_force = 1;
-    journal_request(adapter);
+    int changed = journal_publish_locked(adapter);
+    journal_request_flags(adapter, 1);
     unsigned depth = boaros_lwext4_pause();
-    int result = EOK;
+    if (changed) complete_sync_waiters(adapter);
+    int result;
     for (;;) {
-        struct ext4_journal_progress progress;
-        result = ext4_journal_group_progress(adapter->mount_point, &progress);
-        if (result != EOK || progress.error) {
-            if (result == EOK) result = progress.error;
-            break;
+        struct kernel_wait_token token;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+            result = adapter->published_error;
+            if (result || journal_reached(adapter, kind) >= sequence) break;
+            if (adapter->journal_stopping) { result = EIO; break; }
+            if (kernel_wait_prepare(&adapter->journal_progress, 0, 0, &token)) __builtin_trap();
         }
-        uint64_t reached = kind == EXT4_JOURNAL_WAIT_SEALED ? progress.sealed :
-            kind == EXT4_JOURNAL_WAIT_DURABLE ? progress.durable : progress.checkpoint;
-        if (reached >= sequence) break;
-        uintptr_t irq = arch_interrupt_save();
-        /* Only the workers advance completion, and neither runs between the
-         * disabled-IRQ predicate and queue insertion on this single hart. */
-        struct jbd_journal *journal = adapter->device.fs->jbd_journal;
-        if (!journal->error && journal_reached(journal, kind) < sequence) {
-            enum kernel_wait_wake_reason reason;
-            if (KERNEL_WAIT_RECHECK(&adapter->journal_progress, 0, 0, &reason,
-                (!journal->error && journal_reached(journal, kind) < sequence)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        }
-        arch_interrupt_restore(irq);
+        enum kernel_wait_wake_reason reason;
+        if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
     boaros_lwext4_resume(&adapter->backend_lock, depth);
     return result;
@@ -1118,12 +1189,13 @@ static void journal_worker(void *context)
     struct lwext4_mount_adapter *adapter = context;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
-        uintptr_t irq = arch_interrupt_save();
-        int force = adapter->journal_force;
-        adapter->journal_force = 0;
-        (void)__atomic_exchange_n(&adapter->journal_requested, 0, __ATOMIC_ACQ_REL);
-        int stopping = adapter->journal_stopping;
-        arch_interrupt_restore(irq);
+        int force, stopping;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+            force = adapter->journal_force;
+            adapter->journal_force = adapter->journal_requested = 0;
+            stopping = adapter->journal_stopping;
+        }
         if (stopping) break;
         int metadata = EOK;
         uint64_t times_due = time_deadline(adapter);
@@ -1132,33 +1204,17 @@ static void journal_worker(void *context)
         int result = EOK;
         struct ext4_journal_progress progress = {0};
         if (adapter->device.fs->jbd_journal) {
-            uint64_t before = adapter->device.fs->jbd_journal->durable_sequence;
             result = ext4_journal_group_commit(adapter->mount_point, force || metadata == EAGAIN);
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
-            if (progress.durable != before) {
-                irq = arch_interrupt_save();
-                adapter->checkpoint_requested = 1;
-                (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
-                arch_interrupt_restore(irq);
-            }
         }
         complete_sync_waiters(adapter);
-        irq = arch_interrupt_save();
-        (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
-        arch_interrupt_restore(irq);
         uint64_t deadline = 0;
         uint64_t due = progress.deadline_ns;
         times_due = time_deadline(adapter);
         if (!result && times_due && (!due || times_due < due)) due = times_due;
         if (!result && (progress.commit_ready || (due &&
             kernel_time_deadline_from_monotonic(due, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
-        irq = arch_interrupt_save();
-        if (!__atomic_load_n(&adapter->journal_requested, __ATOMIC_ACQUIRE) && !adapter->journal_stopping) {
-            enum kernel_wait_wake_reason reason;
-            if (KERNEL_WAIT_RECHECK(&adapter->journal_work, deadline, 0, &reason,
-                (!__atomic_load_n(&adapter->journal_requested, __ATOMIC_ACQUIRE) && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        }
-        arch_interrupt_restore(irq);
+        journal_idle(adapter, 0, deadline);
     }
     kernel_io_context_current()->background_reclaim = 0;
 }
@@ -1169,13 +1225,13 @@ static void journal_checkpoint_worker(void *context)
     uint64_t pending_deadline = 0;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
-        uintptr_t irq = arch_interrupt_save();
-        adapter->checkpoint_requested = 0;
-        int stopping = adapter->journal_stopping;
-        arch_interrupt_restore(irq);
+        int stopping;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+            adapter->checkpoint_requested = 0;
+            stopping = adapter->journal_stopping;
+        }
         if (stopping) break;
-        struct jbd_journal *journal = adapter->device.fs->jbd_journal;
-        uint64_t before = journal->checkpoint_sequence;
         struct ext4_journal_progress progress;
         if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
         if (!progress.checkpoint_pending) pending_deadline = 0;
@@ -1187,29 +1243,13 @@ static void journal_checkpoint_worker(void *context)
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
             if (!progress.checkpoint_pending) pending_deadline = 0;
         }
-        if (mount_error(adapter)) complete_sync_waiters(adapter);
-        irq = arch_interrupt_save();
-        (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
-        if (progress.checkpoint != before) {
-            /* Reclaim returns log/RAM credits to a commit waiting for space. */
-            __atomic_store_n(&adapter->journal_requested, 1, __ATOMIC_RELEASE);
-            (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-        }
-        arch_interrupt_restore(irq);
         if (!result && progress.checkpoint_ready) continue;
         uint64_t deadline = 0;
-        /* Later durable groups share the first pending group's window. They
-         * cannot postpone home durability indefinitely by waking this worker. */
+        /* New groups share the first pending group's checkpoint window. */
         if (!result && pending_deadline &&
             kernel_time_deadline_from_monotonic(pending_deadline, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED)
             continue;
-        irq = arch_interrupt_save();
-        if (!adapter->checkpoint_requested && !adapter->journal_stopping) {
-            enum kernel_wait_wake_reason reason;
-            if (KERNEL_WAIT_RECHECK(&adapter->checkpoint_work, deadline, 0, &reason,
-                (!adapter->checkpoint_requested && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        }
-        arch_interrupt_restore(irq);
+        journal_idle(adapter, 1, deadline);
     }
     kernel_io_context_current()->background_reclaim = 0;
 }
@@ -1242,10 +1282,7 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
         status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         if (adapter->checkpoint_started) {
-            uintptr_t irq = arch_interrupt_save();
-            adapter->journal_stopping = 1;
-            (void)kernel_wait_queue_wake_all(&adapter->checkpoint_work);
-            arch_interrupt_restore(irq);
+            journal_stop_workers(adapter);
             kernel_thread_join(&adapter->checkpoint_worker);
             adapter->checkpoint_started = adapter->journal_stopping = 0;
         }
@@ -1299,6 +1336,8 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     }
     adapter_names(adapter);
     boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock);
+    adapter->locks.unlock = backend_unlock;
+    kernel_raw_lock_init(&adapter->journal_control, KERNEL_RAW_RANK_OBJECT);
 #if BOAROS_MAX_CPUS > 1
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
 #endif
@@ -1306,6 +1345,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->next_adapter = adapters;
     adapters = adapter;
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
+    kernel_raw_lock_init(&adapter->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     initialize_backend();
     adapter->instance.backend_data = adapter;
     adapter->instance.ops = &ext4_backend;
@@ -2373,14 +2413,14 @@ static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_onl
         kernel_vfs_sync_complete(request, lwext4_error(result));
         return;
     }
-    uintptr_t irq = arch_interrupt_save();
-    result=mount_error(adapter);
-    /* Capture may have yielded. CPU0 cannot advance durable between this
-     * recheck and insertion; already reached targets need no pending index. */
-    int reached=result || adapter->device.fs->jbd_journal->durable_sequence>=request->target;
-    if (!reached) adapter->sync_waiters=sync_target_insert(adapter->sync_waiters,request);
-    arch_interrupt_restore(irq);
-    if (reached) kernel_vfs_sync_complete(request,lwext4_error(result));
+    int reached;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        result = adapter->published_error;
+        reached = result || adapter->published_durable >= request->target;
+        if (!reached) adapter->sync_waiters = sync_target_insert(adapter->sync_waiters, request);
+    }
+    if (reached) kernel_vfs_sync_complete(request, lwext4_error(result));
 }
 static int ext4_backend_flush(struct kernel_vfs_instance *instance)
 {
