@@ -93,7 +93,7 @@ static int path_walk_select(struct vfs_path_walk *walk,struct kernel_vfs_path *p
 
 static int resolve_object(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root,
-                          const char *path, int follow_final,
+                          const char *path, size_t length, int follow_final,
                           int allow_missing_final,
                           int allow_missing_trailing,
                           enum vfs_trailing_policy follow_trailing_final,
@@ -561,7 +561,7 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
 
 static int resolve_object(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root,
-                          const char *path, int follow_final,
+                          const char *path, size_t length, int follow_final,
                           int allow_missing_final,
                           int allow_missing_trailing,
                           enum vfs_trailing_policy follow_trailing_final,
@@ -571,9 +571,9 @@ static int resolve_object(struct kernel_vfs_path *start,
     struct kernel_vfs_path *current;
     struct kernel_vfs_instance *adapter;
     char *work = 0;
-    char *pending, *target;
+    const char *pending=path;
+    char *target=NULL;
     size_t cursor = 0U;
-    size_t length;
     uint32_t follows = 0U;
     enum kernel_heap_status allocation;
     int result = 0;
@@ -582,26 +582,16 @@ static int resolve_object(struct kernel_vfs_path *start,
         *owner != 0 || start->file.mount == 0 ||
         start->file.mount->private_data == 0)
         return -KERNEL_EINVAL;
-    if (path[0] == '\0') return -KERNEL_ENOENT;
+    if (!length) return -KERNEL_ENOENT;
     adapter = start->file.mount->private_data;
-    length = strlen(path);
     if (length >= KERNEL_FS_PATH_MAX) return -KERNEL_ENAMETOOLONG;
-    allocation = kernel_heap_allocate(adapter->heap,
-                                      2U * KERNEL_FS_PATH_MAX,
-                                      (void **)&work);
-    if (allocation != KERNEL_HEAP_STATUS_OK)
-        return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
-                                                      : -KERNEL_EIO;
-    pending = work;
-    target = work + KERNEL_FS_PATH_MAX;
-    memcpy(pending, path, length + 1U);
     current = pending[0] == '/' ? root : start;
     result = kernel_vfs_path_acquire(current);
     if (result != 0) {
         current = 0;
         goto Finish;
     }
-    while (pending[cursor] != '\0') {
+    while (cursor<length) {
         result=path_walk_select(walk,current);
         if (result) goto Finish;
         struct kernel_vfs_path *next = 0;
@@ -609,17 +599,17 @@ static int resolve_object(struct kernel_vfs_path *start,
         int suffix;
         int trailing_only;
 
-        while (pending[cursor] == '/') cursor++;
-        if (pending[cursor] == '\0') break;
+        while (cursor<length && pending[cursor] == '/') cursor++;
+        if (cursor==length) break;
         begin = cursor;
-        while (pending[cursor] != '\0' && pending[cursor] != '/') cursor++;
+        while (cursor<length && pending[cursor] != '/') cursor++;
         end = cursor;
         component_length = end - begin;
-        suffix = pending[end] != '\0';
+        suffix = end<length;
         {
             size_t remainder = end;
-            while (pending[remainder] == '/') remainder++;
-            trailing_only = pending[remainder] == '\0';
+            while (remainder<length && pending[remainder] == '/') remainder++;
+            trailing_only = remainder==length;
         }
         /* open(O_CREAT)拒绝最后的斜杠；此前父路径的错误仍先返回。 */
         if (suffix && trailing_only && follow_trailing_final==VFS_TRAILING_CREATE) {
@@ -660,7 +650,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             ((suffix && (!trailing_only || follow_trailing_final == VFS_TRAILING_FOLLOW)) ||
              follow_final)) {
             size_t target_length = 0U;
-            size_t remainder = strlen(pending + end);
+            size_t remainder = length-end;
             int backend;
             if (++follows > VFS_SYMLINK_MAX_FOLLOWS) {
                 result = -KERNEL_ELOOP;
@@ -687,6 +677,15 @@ static int resolve_object(struct kernel_vfs_path *start,
                     goto Finish;
                 }
             }
+            if (!work) {
+                allocation=kernel_heap_allocate(adapter->heap,2U*KERNEL_FS_PATH_MAX,(void **)&work);
+                if (allocation!=KERNEL_HEAP_STATUS_OK) {
+                    result=allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+                    if (kernel_vfs_path_release(&next)) __builtin_trap();
+                    goto Finish;
+                }
+                target=work+KERNEL_FS_PATH_MAX;
+            }
             backend = target_instance->ops->readlink(next->file.private_data,
                          target, KERNEL_FS_PATH_MAX - 1U, &target_length);
             (void)kernel_vfs_path_release(&next);
@@ -702,8 +701,11 @@ static int resolve_object(struct kernel_vfs_path *start,
                 result = -KERNEL_ENAMETOOLONG;
                 goto Finish;
             }
-            memmove(pending + target_length, pending + end, remainder + 1U);
-            memcpy(pending, target, target_length);
+            memmove(work+target_length,pending+end,remainder);
+            memcpy(work,target,target_length);
+            length=target_length+remainder;
+            work[length]=0;
+            pending=work;
             if (target[0] == '/') {
                 (void)kernel_vfs_path_release(&current);
                 current = root;
@@ -734,7 +736,7 @@ Finish:
         if (result && kernel_vfs_path_release(owner)) __builtin_trap();
     }
     if (current != 0) (void)kernel_vfs_path_release(&current);
-    kernel_heap_release(adapter->heap, work);
+    if (work) kernel_heap_release(adapter->heap, work);
     return result;
 }
 
@@ -743,9 +745,9 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner)
 {
-    if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
+    if (!path || !start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
-    return resolve_object(start, root, path, follow_final, 0, 0, VFS_TRAILING_FOLLOW,
+    return resolve_object(start, root, path, strlen(path), follow_final, 0, 0, VFS_TRAILING_FOLLOW,
                           owner, 0, &walk);
 }
 
@@ -1051,7 +1053,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     {
         struct kernel_vfs_path *resolved=NULL;
         char missing[256]={0};
-        result=resolve_object(start,root,path,follow,create,1,
+        result=resolve_object(start,root,path,strlen(path),follow,create,1,
             create?VFS_TRAILING_CREATE:VFS_TRAILING_FOLLOW,&resolved,missing,&walk);
         if (result) goto Complete;
         if (((struct kernel_vfs_instance *)resolved->file.mount->private_data)->quiescing)
@@ -1146,7 +1148,7 @@ static int mutation_path(struct kernel_vfs_path *start,
                           struct vfs_path_walk *walk)
 {
     if (!start || !root || !input) return -KERNEL_EINVAL;
-    return resolve_object(start, root, input, follow, missing, trailing,
+    return resolve_object(start, root, input, strlen(input), follow, missing, trailing,
                           follow_trailing, path, missing_name, walk);
 }
 
@@ -2131,16 +2133,7 @@ static int rename_parent(struct kernel_vfs_path *start,
         }
         return result;
     }
-    char *prefix;
-    enum kernel_heap_status allocation = kernel_heap_allocate(start->heap,
-                                                   begin + 1U, (void **)&prefix);
-    if (allocation != KERNEL_HEAP_STATUS_OK)
-        return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-    memcpy(prefix, input, begin);
-    prefix[begin] = 0;
-    int result=resolve_object(start,root,prefix,1,0,0,VFS_TRAILING_FOLLOW,parent,NULL,walk);
-    release_path(start->heap, prefix);
-    return result;
+    return resolve_object(start,root,input,begin,1,0,0,VFS_TRAILING_FOLLOW,parent,NULL,walk);
 }
 
 int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,

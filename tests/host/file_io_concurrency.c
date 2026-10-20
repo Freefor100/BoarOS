@@ -108,6 +108,16 @@ enum kernel_scheduler_status __wrap_kernel_wait_finish(struct kernel_wait_token 
     return status;
 }
 #endif
+static unsigned path_expansion_observed,path_expansion_failed,path_expansion_allocations;
+enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t size,void **owner)
+{
+    if (path_expansion_observed && size==2U*KERNEL_FS_PATH_MAX) {
+        path_expansion_allocations++;
+        if (path_expansion_failed) return KERNEL_HEAP_STATUS_EMPTY;
+    }
+    return __real_kernel_heap_allocate(heap,size,owner);
+}
 static struct kernel_rwlock *namespace_observed_lock;
 static unsigned namespace_lock_acquisitions;
 void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
@@ -975,6 +985,7 @@ int main(int argc,char **argv)
     namespace_open_request_case(&heap,&mount);
     namespace_create_competing_case(&heap,&mount);
     namespace_walk_qualification_case(&heap,&mount);
+    namespace_walk_workspace_case(&heap,&mount);
     raw_mounted_flush_case(&heap,&mount,&disk);
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);

@@ -200,6 +200,30 @@ static void namespace_walk_qualification_case(struct kernel_heap *heap,
     puts("PASS one same-mount namespace qualification per open/create, stat, rename and unlink");
 }
 
+static void namespace_walk_workspace_case(struct kernel_heap *heap,
+                                          struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL;struct kernel_vfs_file file={0};struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    assert(!kernel_vfs_create_at(root,root,"/namespace-workspace",0600,&file));
+    uint64_t inode=kernel_vfs_file_inode(&file);assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_symlink_at(root,root,"namespace-workspace","/namespace-expansion-a"));
+    assert(!kernel_vfs_symlink_at(root,root,"namespace-expansion-a","/namespace-expansion-b"));
+    path_expansion_observed=path_expansion_failed=1;path_expansion_allocations=0;
+    assert(!kernel_vfs_stat_at(root,root,"/namespace-workspace",1,&stat) && stat.ino==inode);
+    assert(!path_expansion_allocations);
+    assert(kernel_vfs_stat_at(root,root,"/namespace-expansion-b",1,&stat)==-KERNEL_ENOMEM);
+    path_expansion_failed=0;path_expansion_allocations=0;
+    assert(!kernel_vfs_stat_at(root,root,"/namespace-expansion-b",1,&stat) && stat.ino==inode);
+    assert(path_expansion_allocations==1);
+    path_expansion_observed=0;
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-expansion-a",0));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-expansion-b",0));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-workspace",0));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS plain path needs no expansion allocation; two text links share one workspace; OOM returns owners");
+}
+
 struct namespace_parent_move {
     struct kernel_vfs_path *root;
     pthread_barrier_t gate;

@@ -599,6 +599,9 @@ static int fill_linux_stat(
     struct kernel_linux_stat *stat,
     const struct kernel_open_file_description *description)
 {
+    KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
+        (!description->file.mount && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PATH));
+
     memset(stat, 0, sizeof(*stat));
     struct kernel_vfs_stat vfs_stat;
     int result = kernel_open_file_pseudo_stat(description, &vfs_stat);
@@ -662,23 +665,9 @@ static int copy_stat_to_user(struct kernel_mm *mm,
                : -1;
 }
 
-struct stat_call {
-    struct kernel_open_file_description *description;
-    struct kernel_mm *mm;
-    uint64_t user_buffer;
-    int64_t *result;
-    enum kernel_files_status status;
-};
-static void stat_cpu0(void *);
 static enum kernel_files_status stat_pinned(struct kernel_open_file_description *description,
     struct kernel_mm *mm,uint64_t user_buffer,int64_t *linux_result)
 {
-    if (kernel_vfs_namespace_requires_cpu0(description->file.mount) && kernel_open_file_io_requires_cpu0(description)) {
-        struct stat_call call={description,mm,user_buffer,linux_result,KERNEL_FILES_STATUS_STATE};
-        enum kernel_page_cache_status status=kernel_page_cache_run_cpu0(
-            kernel_open_file_page_cache(description),stat_cpu0,&call);
-        return status?KERNEL_FILES_STATUS_STATE:call.status;
-    }
     struct kernel_linux_stat stat;
     int copy_result;
     int result;
@@ -697,11 +686,6 @@ static enum kernel_files_status stat_pinned(struct kernel_open_file_description 
     }
     return KERNEL_FILES_STATUS_OK;
 }
-static void stat_cpu0(void *argument)
-{
-    struct stat_call *call=argument;
-    call->status=stat_pinned(call->description,call->mm,call->user_buffer,call->result);
-}
 enum kernel_files_status kernel_files_fstat(struct kernel_files *files,struct kernel_mm *mm,
     int64_t fd,uint64_t user_buffer,int64_t *linux_result)
 {
@@ -709,8 +693,6 @@ enum kernel_files_status kernel_files_fstat(struct kernel_files *files,struct ke
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_open_file_description *description=kernel_files_hold_fd(files,fd,&pin_guard);
     if (!description) { *linux_result=-KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
-        (!description->file.mount && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PATH));
     return stat_pinned(description,mm,user_buffer,linux_result);
 }
 

@@ -141,7 +141,9 @@ struct kernel_vfs_file {
 };
 
 /* Paths are borrowed for the duration of a call; successful opens own a path
- * reference independently of the caller. Absolute paths start at root. */
+ * reference independently of the caller. Kernel path bytes stay immutable
+ * through the call; expansion storage is needed only for textual symlinks.
+ * Absolute paths start at root. */
 int kernel_vfs_path_open(struct kernel_vfs_path *path,
                          struct kernel_vfs_file *file);
 int kernel_vfs_path_string(const struct kernel_vfs_path *path,
