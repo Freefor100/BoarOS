@@ -31,7 +31,10 @@
 生产路径仍只有一个 ext4 根实例；proc 是首个非磁盘后端，内容范围见[procfs 模块](procfs.md)。
 普通文件继续使用同一页缓存与 inode 同步，pipe/socket/epoll 维持文件层独立 owner。
 后端操作表在挂载前逐项初始化，支持分页前物理地址测试与高半区生产入口。
-对象符号链接可由后端 `follow_link` 返回带引用的目标路径。proc 的 pipe fd
+对象符号链接可由后端 `follow_link` 返回带引用的目标路径。
+跟随和读取链接时先归还 namespace 保护，保留链接 inode 的真实引用，再按链接后端选择执行位置。
+链接内容在该 inode 生命周期内保持不变；对象回调归还最后 OFD 时可以取得目标挂载的 namespace，
+返回后解析器再为实际目标取得保护。proc 的 pipe fd
 没有 VFS 路径，普通打开得到 `ENOENT` 后可对同一个最终链接调用可选
 `reopen_link`；VFS 只核对链接类型和保留解析后的节点引用，后端在文件层
 创建新的 OFD。其他后端未实现该回调时返回 `ENOTSUP`，不根据展示文本

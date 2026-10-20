@@ -224,6 +224,91 @@ static void namespace_walk_workspace_case(struct kernel_heap *heap,
     puts("PASS plain path needs no expansion allocation; two text links share one workspace; OOM returns owners");
 }
 
+/* An object-link lookup may drop the final OFD pin after another CPU closes
+ * its owner. Exercise the real close path while returning the acquired path. */
+struct namespace_link_close {
+    pthread_barrier_t gate;
+    struct kernel_open_file_description *file;
+    unsigned callbacks;
+};
+static struct namespace_link_close *namespace_link_closing;
+static int namespace_follow_last_pin(struct kernel_vfs_node *node,
+                                     struct kernel_vfs_path **owner)
+{
+    (void)node;
+    struct namespace_link_close *race=namespace_link_closing;
+    struct kernel_open_file_description *pin=race->file;
+    assert(kernel_open_file_acquire(pin)==KERNEL_OPEN_FILE_STATUS_OK);
+    pthread_barrier_wait(&race->gate);
+    pthread_barrier_wait(&race->gate);
+    struct kernel_vfs_path *target=kernel_open_file_path(pin);
+    assert(target && !kernel_vfs_path_acquire(target));
+    *owner=target;
+    assert(kernel_open_file_release(&pin)==KERNEL_OPEN_FILE_STATUS_OK && !pin);
+    race->callbacks++;
+    return 0;
+}
+static int namespace_readlink_last_pin(struct kernel_vfs_node *node,
+                                       char *buffer,size_t size,size_t *count)
+{
+    struct kernel_vfs_path *target=NULL;
+    int result=namespace_follow_last_pin(node,&target);
+    if (result) return result;
+    assert(!kernel_vfs_path_release(&target) && size);
+    buffer[0]='T';*count=1;return 0;
+}
+static void *namespace_close_link_target(void *argument)
+{
+    struct namespace_link_close *race=argument;
+    mm_test_attach(1);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
+    pthread_barrier_wait(&race->gate);
+    assert(kernel_open_file_release(&race->file)==KERNEL_OPEN_FILE_STATUS_OK && !race->file);
+    pthread_barrier_wait(&race->gate);
+    mm_test_finish();return NULL;
+}
+static void namespace_object_link_close_case(struct kernel_heap *heap)
+{
+    for (unsigned text=0;text<2;text++) {
+        struct kernel_vfs_mount *mounts[2]={NULL,NULL};
+        assert(!kernel_tmpfs_create(heap,0,"",&mounts[0]) && !kernel_tmpfs_create(heap,0,"",&mounts[1]));
+        struct kernel_vfs_instance *a=mounts[0]->private_data,*b=mounts[1]->private_data;
+        /* Either allocation order: follow from the higher real lock key to lower. */
+        struct kernel_vfs_mount *source=a->namespace_lock.lock.key>b->namespace_lock.lock.key ? mounts[0]:mounts[1];
+        struct kernel_vfs_mount *target=source==mounts[0] ? mounts[1]:mounts[0];
+        struct kernel_vfs_path *from=NULL,*to=NULL,*found=NULL;
+        assert(!kernel_vfs_path_root(source,heap,&from) && !kernel_vfs_path_root(target,heap,&to));
+        struct namespace_link_close race={0};int error=0;
+        struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW | KERNEL_VFS_OPEN_CREATE,.mode=0600};
+        assert(kernel_open_file_create_at(heap,to,to,"/last-object",&request,&race.file,NULL,&error)==KERNEL_OPEN_FILE_STATUS_OK && !error);
+        uint64_t inode=kernel_vfs_file_inode(kernel_open_file_vfs_borrow(race.file));
+        assert(!kernel_vfs_unlink_at(to,to,"/last-object",0));
+        assert(!kernel_vfs_symlink_at(from,from,"unused-display-text","/object-link"));
+        struct kernel_vfs_instance *instance=source->private_data;
+        const struct kernel_vfs_backend *original=instance->ops;
+        struct kernel_vfs_backend callbacks=*original;callbacks.follow_link=namespace_follow_last_pin;
+        callbacks.readlink=namespace_readlink_last_pin;
+        instance->ops=&callbacks;namespace_link_closing=&race;
+        pthread_t closer;assert(!pthread_barrier_init(&race.gate,NULL,2));
+        assert(!pthread_create(&closer,NULL,namespace_close_link_target,&race));
+        if (text) {
+            char display[4];size_t size=0;
+            assert(!kernel_vfs_readlink_at(from,from,"/object-link",display,sizeof(display),&size) && size==1 && display[0]=='T');
+        } else assert(!kernel_vfs_path_resolve(from,from,"/object-link",1,&found));
+        assert(!pthread_join(closer,NULL) && !pthread_barrier_destroy(&race.gate));
+        assert(race.callbacks==1 && !race.file);
+        if (!text) {
+            assert(kernel_vfs_path_mount(found)==target);
+            struct kernel_vfs_stat stat;assert(!kernel_vfs_path_stat(found,&stat) && stat.ino==inode && !stat.nlink);
+            assert(!kernel_vfs_path_release(&found));
+        }
+        namespace_link_closing=NULL;instance->ops=original;
+        assert(!kernel_vfs_unlink_at(from,from,"/object-link",0));
+        assert(!kernel_vfs_path_release(&from) && !kernel_vfs_path_release(&to));
+        assert(!kernel_vfs_unmount(mounts[0]) && !kernel_vfs_unmount(mounts[1]));
+    }
+    puts("PASS follow/readlink vs CPU1 last close: foreign unlinked OFD retires without nested namespaces; path identity and owners");
+}
+
 struct namespace_parent_move {
     struct kernel_vfs_path *root;
     pthread_barrier_t gate;

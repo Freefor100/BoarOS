@@ -424,8 +424,8 @@ int kernel_vfs_path_readlink(struct kernel_vfs_path *path, char *buffer,
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->references) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
+    /* The owned symlink inode pins immutable link contents. Proc link queries
+     * may close a foreign OFD, so they run without this namespace mutex. */
     struct kernel_vfs_instance *instance = path->file.mount->private_data;
     if ((kernel_vfs_path_mode(path) & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK)
         return -KERNEL_EINVAL;
@@ -657,6 +657,10 @@ static int resolve_object(struct kernel_vfs_path *start,
                 (void)kernel_vfs_path_release(&next);
                 goto Finish;
             }
+            /* next/current own their inodes while the callback acquires and
+             * releases foreign objects. Drop names and the old execution
+             * scope before choosing the callback's actual backend domain. */
+            path_walk_release(walk);
             KERNEL_SERVICE_SCOPE_IF(link_service, kernel_vfs_namespace_requires_cpu0(next->file.mount));
             struct kernel_vfs_instance *target_instance =
                 next->file.mount->private_data;
