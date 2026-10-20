@@ -215,8 +215,8 @@ static int prepare_init(void)
     const char *interpreter=kernel_elf64_source_interpreter(root.source,0);
     if(interpreter) {
         opened=kernel_open_file_create_at(&root.heap,paths.cwd,
-            paths.root,interpreter,KERNEL_OPEN_PATH_EXECUTABLE,0,
-            &root.interpreter_file,&error);
+            paths.root,interpreter,&(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW | KERNEL_VFS_OPEN_EXECUTABLE},
+            &root.interpreter_file, NULL,&error);
         if(opened!=KERNEL_OPEN_FILE_STATUS_OK)return opened==KERNEL_OPEN_FILE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
         if(error)return error;
         source=kernel_elf64_source_create_interpreter(&root.heap,&root.interpreter_file,BOAROS_PAGE_SIZE,

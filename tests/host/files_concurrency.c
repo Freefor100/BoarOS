@@ -106,7 +106,7 @@ static void directory_pin_handoff(struct kernel_heap *heap,int metadata)
     assert(!kernel_vfs_path_root(mount,heap,&root));
     if (metadata) assert(!kernel_fs_context_create(&fs,mount,heap));
     assert(!kernel_vfs_mkdir_at(root,root,"/dir",0755));
-    assert(!kernel_open_file_create_at(heap,root,root,"/dir",KERNEL_OPEN_PATH_FOLLOW,0,&description,&result) && !result);
+    assert(!kernel_open_file_create_at(heap,root,root,"/dir",&(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW},&description, NULL,&result) && !result);
     assert(!kernel_files_create(&files,heap));
     watched_path=description->file.path; path_description=description; path_acquired=0;
     assert(watched_path!=root); /* root/cwd不能替被观察目录额外持path引用。 */

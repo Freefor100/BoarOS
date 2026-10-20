@@ -628,8 +628,9 @@ static int proc_follow_link(struct kernel_vfs_node *node,
             proc_inode_identity(node->inode), proc_inode_fd(node->inode),
             &pseudo);
         if (result) return result;
+        /* 无路径的管道由OFD重新打开；其展示文本不参与路径创建。 */
         return pseudo.kind == KERNEL_OPEN_FILE_KIND_PIPE
-            ? -KERNEL_ENOTSUP : -KERNEL_ENXIO;
+            ? -KERNEL_ENOENT : -KERNEL_ENXIO;
     }
     if (!path_kind) return -KERNEL_ENOTSUP;
     return kernel_proc_process_path_acquire(proc_inode_pid(node->inode),

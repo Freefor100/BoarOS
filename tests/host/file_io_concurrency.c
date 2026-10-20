@@ -107,13 +107,28 @@ enum kernel_scheduler_status __wrap_kernel_wait_finish(struct kernel_wait_token 
     if (!status) tcp_wait_finished();
     return status;
 }
+#endif
+static unsigned path_expansion_observed,path_expansion_failed,path_expansion_allocations;
+enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t size,void **owner)
+{
+    if (path_expansion_observed && size==2U*KERNEL_FS_PATH_MAX) {
+        path_expansion_allocations++;
+        if (path_expansion_failed) return KERNEL_HEAP_STATUS_EMPTY;
+    }
+    return __real_kernel_heap_allocate(heap,size,owner);
+}
+static struct kernel_rwlock *namespace_observed_lock;
+static unsigned namespace_lock_acquisitions;
 void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 {
+    if (lock==namespace_observed_lock) namespace_lock_acquisitions++;
+#ifdef TCP_IO_CASES
     tcp_wait_locking(lock);
+#endif
     __real_kernel_rwlock_write(lock,guard);
 }
-#endif
 void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
 void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 {
@@ -967,6 +982,11 @@ int main(int argc,char **argv)
     namespace_snapshot_case(&heap,&mount);
     namespace_parent_snapshot_case(&heap,&mount);
     namespace_parent_case(&heap,&mount);
+    namespace_open_request_case(&heap,&mount);
+    namespace_create_competing_case(&heap,&mount);
+    namespace_walk_qualification_case(&heap,&mount);
+    namespace_walk_workspace_case(&heap,&mount);
+    namespace_object_link_close_case(&heap);
     raw_mounted_flush_case(&heap,&mount,&disk);
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);

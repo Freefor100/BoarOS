@@ -20,7 +20,9 @@
 - 固定版本：`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`
 - 导入路径：`third_party/lwext4/`
 - GDT/inode 与 orphan 的 CRC 计算通过只读归一化原语跳过 checksum 字段，不再
-  临时改写输入；CRC32C 使用 4 KiB 只读 slicing-by-4 表，保留种子、分段更新和校验语义。
+  临时改写输入；CRC32C 使用4 KiB 对齐的 8 KiB 只读 slicing-by-8 表，保留种子、分段更新和校验语义。
+  每批先读取四个 64 位输入，再合并八字节查表结果，降低串行依赖；小范围和尾部仍准确处理。
+  raw inode 输出直接复制实际前缀，只清零磁盘格式中缺失的后缀。
   `make test-lwext4-checksum-host` 保护并发读者、只读输入、CRC 参考与格式边界。
   固定来源和反例见[时间戳背景](learning/file-timestamps.md#共享读取中的-checksum-计算2026-10-08)。
 - 导入内容：`include/`、`src/`、`LICENSE`、`README.md`、`CHANGELOG`

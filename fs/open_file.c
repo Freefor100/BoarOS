@@ -157,12 +157,13 @@ static enum kernel_open_file_status create_open_file(
 enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
-    enum kernel_open_file_path_operation operation, uint32_t mode,
-    struct kernel_open_file_description **owner, int *linux_result)
+    const struct kernel_vfs_open_request *request,
+    struct kernel_open_file_description **owner, int *created, int *linux_result)
 {
     struct kernel_open_file_description *file;
-    if (!heap || !start || !root || !path || !owner || *owner || !linux_result)
+    if (!heap || !start || !root || !path || !request || !owner || *owner || !linux_result)
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    if (created) *created=0;
     enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap,
                                          1U, sizeof(*file), (void **)&file);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
@@ -170,31 +171,9 @@ enum kernel_open_file_status kernel_open_file_create_at(
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    int result;
-    switch (operation) {
-    case KERNEL_OPEN_PATH_ONLY:
-    case KERNEL_OPEN_PATH_ONLY_NOFOLLOW:
-        result = kernel_vfs_path_resolve(start, root, path,
-                    operation == KERNEL_OPEN_PATH_ONLY, &file->file.path);
-        if (!result) {
-            file->kind = KERNEL_OPEN_FILE_KIND_PATH;
-            file->file.mount = kernel_vfs_path_mount(file->file.path);
-            file->file.mode = kernel_vfs_path_mode(file->file.path);
-        }
-        break;
-    case KERNEL_OPEN_PATH_CREATE:
-        result = kernel_vfs_create_at(start, root, path, mode, &file->file);
-        break;
-    case KERNEL_OPEN_PATH_EXECUTABLE:
-        result = kernel_vfs_open_executable_at(start, root, path, &file->file);
-        break;
-    case KERNEL_OPEN_PATH_FOLLOW:
-    case KERNEL_OPEN_PATH_NOFOLLOW:
-        result = kernel_vfs_open_at(start, root, path,
-                    operation == KERNEL_OPEN_PATH_FOLLOW, &file->file);
-        break;
-    default: result = -KERNEL_EINVAL; break;
-    }
+    int result=kernel_vfs_open_at(start,root,path,request,&file->file,created);
+    if (!result && (request->flags & KERNEL_VFS_OPEN_PATH_ONLY))
+        file->kind=KERNEL_OPEN_FILE_KIND_PATH;
     if (result) {
         kernel_heap_release(heap, file);
     } else {
