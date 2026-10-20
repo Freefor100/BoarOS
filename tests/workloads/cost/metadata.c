@@ -3,6 +3,7 @@
 #include "consumer.c"
 #undef main
 #include <termios.h>
+#include "metadata_fixed.h"
 
 static void metadata_loop(unsigned mode, int held)
 {
@@ -61,6 +62,7 @@ static void lmbench_command(unsigned libc, unsigned index)
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);cost_init();
+    if(access("/cost-metadata-fixed",F_OK)==0)return metadata_fixed_main();
     CHECK(mkdir("/dev",0755)==0 || errno==EEXIST);
     CHECK(mknod("/dev/null",S_IFCHR|0666,makedev(1,3))==0 || errno==EEXIST);
     CHECK(mknod("/dev/zero",S_IFCHR|0666,makedev(1,5))==0 || errno==EEXIST);

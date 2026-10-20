@@ -661,4 +661,32 @@ class CostReportTest(unittest.TestCase):
         self.assertEqual(percentile(bins,1),(1<<63,(1<<64)-1))
         self.assertEqual(percentile([0]*65,.5),None)
 
+class FixedMetadataTest(unittest.TestCase):
+    def fixture(self):
+        from cost_report import METADATA_FIXED_WORK
+        rows=['COST METADATA CPUS 2']
+        for name,count in METADATA_FIXED_WORK.items():
+            rows += [f'COST METADATA WORK {name} {count}',
+                     f'COST METADATA LATENCY {name} 10 20 30',
+                     f'COST METADATA RSS {name} 128 256']
+        return '\n'.join(rows), {name:100 for name in METADATA_FIXED_WORK}
+    def test_fixed_work_and_resource_coverage(self):
+        from cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        rows=validate_metadata_fixed(output,timings,2)
+        self.assertEqual(rows['metadata-create']['operations'],2048)
+        self.assertEqual(rows['metadata-create']['children_maxrss_kib'],256)
+        validate_resume_selection('metadata',{'metadata_fixed_only':True},None)
+    def test_duplicate_missing_wrong_cpu_and_bad_latency_are_errors(self):
+        from cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        for bad in (output+'\nCOST METADATA WORK metadata-create 2048',
+                    output.replace('COST METADATA WORK metadata-create 2048',''),
+                    output.replace('CPUS 2','CPUS 1'),output.replace(' 10 20 30',' 20 10 30'),
+                    output.replace('COST METADATA RSS metadata-create 128 256','')):
+            with self.subTest(output=bad),self.assertRaises(ValueError):
+                validate_metadata_fixed(bad,timings,2)
+        with self.assertRaises(ValueError):validate_metadata_fixed(output,{**timings,'metadata-create':0},2)
+        with self.assertRaises(ValueError):validate_resume_selection('metadata',{'metadata_fixed_only':True,'consumer_command_names':['consumer-musl-1']},None)
+
 if __name__ == '__main__': unittest.main()

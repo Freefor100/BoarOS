@@ -205,6 +205,10 @@ def validate_locking(timings, snapshots, diagnostics):
 def validate_resume_selection(case, record, selected):
     if case not in ('consumer', 'metadata'):
         return
+    if case == 'metadata' and record.get('metadata_fixed_only'):
+        if record.get('consumer_command_names'):
+            raise ValueError('fixed metadata includes original consumers')
+        return
     expected = ['consumer-musl-1', 'consumer-glibc-1'] if case == 'metadata' else selected
     if record.get('consumer_command_names') != expected:
         raise ValueError('resume command selection differs')
@@ -226,3 +230,43 @@ def validate_scheduler(timings, snapshots, output, diagnostics):
                 if snapshot['values'][f'foreground.{metric}.samples'] <= 0:
                     raise ValueError(f'scheduler {metric} not measured')
     return {'operations': expected, 'waited_children': 1026}
+
+
+METADATA_FIXED_WORK = {
+    'metadata-stat-held': 4096, 'metadata-fstat-held': 4096,
+    'metadata-open-held': 4096, 'metadata-create': 2048,
+    'metadata-rename-same': 2048, 'metadata-rename-cross': 2048,
+    'metadata-readdir': 64, 'metadata-paired-shared': 2048,
+    'metadata-paired-separate': 2048, 'metadata-final-sync': 1,
+}
+
+
+def validate_metadata_fixed(output, timings, cpus):
+    """Require each fixed window, actual work and ordered latency/RSS outputs."""
+    import re
+    if re.findall(r'^COST METADATA CPUS (\d+)$', output, re.M) != [str(cpus)]:
+        raise ValueError('metadata guest affinity differs')
+    work = re.findall(r'^COST METADATA WORK (\S+) (\d+)$', output, re.M)
+    if len(work) != len(METADATA_FIXED_WORK) or {k: int(v) for k, v in work} != METADATA_FIXED_WORK:
+        raise ValueError('metadata fixed work incomplete or duplicated')
+    if set(timings) != set(METADATA_FIXED_WORK) or any(v <= 0 for v in timings.values()):
+        raise ValueError('metadata fixed windows incomplete')
+    latency = re.findall(r'^COST METADATA LATENCY (\S+) (\d+) (\d+) (\d+)$', output, re.M)
+    rss = re.findall(r'^COST METADATA RSS (\S+) (\d+) (\d+)$', output, re.M)
+    keys = set(METADATA_FIXED_WORK)
+    if len(latency) != len(keys) or {row[0] for row in latency} != keys:
+        raise ValueError('metadata latency incomplete or duplicated')
+    if len(rss) != len(keys) or {row[0] for row in rss} != keys:
+        raise ValueError('metadata RSS incomplete or duplicated')
+    result = {}
+    resources = {name: (int(own), int(child)) for name, own, child in rss}
+    for name, p50, p95, maximum in latency:
+        p50, p95, maximum = int(p50), int(p95), int(maximum)
+        if not 0 < p50 <= p95 <= maximum <= timings[name]:
+            raise ValueError('metadata latency order/range')
+        own, child = resources[name]
+        result[name] = dict(operations=METADATA_FIXED_WORK[name], elapsed_ns=timings[name],
+            operations_per_second=METADATA_FIXED_WORK[name]*1e9/timings[name],
+            p50_ns=p50, p95_ns=p95, max_ns=maximum, self_maxrss_kib=own,
+            children_maxrss_kib=child)
+    return result
