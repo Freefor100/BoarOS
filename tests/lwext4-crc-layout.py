@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep hot RV checksum and buffer-return paths within a translated code page."""
+"""Keep hot checksum and buffer-return paths within a translated code page."""
 import argparse
 import subprocess
 
@@ -8,11 +8,11 @@ parser.add_argument('kernel')
 parser.add_argument('--nm', default='riscv64-elf-nm')
 args = parser.parse_args()
 symbols = subprocess.check_output([args.nm, '-S', '--defined-only', args.kernel], text=True)
-for name, alignment in [('crc32c', 256), ('put_buffer', 1024)]:
+for name, alignment in [('crc32c', 2048), ('put_buffer', 1024)]:
     matches = [line.split() for line in symbols.splitlines() if line.split()[-1:] == [name]]
     if len(matches) != 1:
         raise SystemExit(f'expected one {name} function')
     address, size = (int(value, 16) for value in matches[0][:2])
     if not 0 < size <= alignment or address % alignment or address // 4096 != (address + size - 1) // 4096:
         raise SystemExit(f'{name} exceeds its aligned code slot: address={address:#x} bytes={size} slot={alignment}')
-    print(f'PASS RV {name} stays within one code page: address={address:#x} bytes={size}')
+    print(f'PASS {name} stays within one code page: address={address:#x} bytes={size}')

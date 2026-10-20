@@ -71,10 +71,13 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 
 共享查询的 GDT/inode checksum 校验不临时清零 cache 字段。`ext4_crc32c_zeroed()`
 以一个或两个本地零字段计算同一 CRC，不复制整个 inode、不分配或等待；真正的修改路径
-另写入计算结果。CRC32C共用4 KiB只读表的 slicing-by-4 实现，对齐后的四字节
-一起更新，首尾逐字节处理，不越过输入区间；种子、分段更新和校验比较保持原格式。
-RV 将小型 CRC32C 函数按 256 字节对齐，使热循环保持在同一 4 KiB 指令页，
-减少 QEMU 的跨页翻译块查找；`make test-lwext4-crc-layout-riscv` 检查实际链接后的函数范围。
+另写入计算结果。CRC32C 共用 4 KiB 只读表的 slicing-by-4 实现。对齐后先将连续 64 字节读入
+八个寄存器，再按原顺序更新 CRC；不足一批时按四字节和单字节处理，不越过输入区间。
+这减少输入页与查表页之间的切换；在 QEMU 软件 TLB 中两页占用同一槽时，
+逐四字节交错读取会反复替换该槽。寄存器批次保留原种子、分段更新及校验格式，
+空汇编仅约束编译器的加载顺序。RV/LA 将 CRC32C 函数按 2048 字节对齐，
+使整个函数留在同一 4 KiB 指令页；`make test-lwext4-crc-layout-riscv`
+检查实际链接后的对齐与长度，同时检查 `put_buffer` 的 1024 字节槽。
 普通 inode 与 orphan 的计算共用归一化原语，128-byte/扩展 inode
 字段规则保持原语义。布局由挂载几何验证保护，helper 的非法内部布局触发 fatal，
 损坏镜像仍按原验证返回格式/校验错误。`make test-lwext4-checksum-host` 以独立逐位
