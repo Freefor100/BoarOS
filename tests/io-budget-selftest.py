@@ -79,7 +79,7 @@ class Workload(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             evidence = Path(str(config) + '.results').read_text()
             parsed = io.validate(evidence, case)
-            self.assertEqual(parsed['metrics']['bytes'], case['files'] * case['bytes'])
+            self.assertEqual(parsed['metrics']['bytes'], 0 if case['operation']=='range-modify' else case['files'] * case['bytes'])
             for kind in ('SAMPLE','AFFINITY','RESOURCE'):
                 incomplete=''.join(line for line in evidence.splitlines(keepends=True) if not line.startswith('IO '+kind+' '))
                 with self.assertRaises(RuntimeError): io.validate(incomplete,case)
@@ -111,6 +111,24 @@ class Workload(unittest.TestCase):
 
     def test_actual_content_corruption_is_rejected(self):
         self.exercise('ext4:cold-read:cache:1:1M:4K', corrupt=True)
+
+    def test_two_fixed_work_appenders(self):
+        result=self.exercise('ext4:parallel-append:fsync:2:1M:4K')
+        self.assertEqual(len(result['files']),2)
+        self.assertEqual(result['metrics']['sync_calls'],2)
+        self.assertEqual(result['latencies']['io']['samples'],512)
+        for bad in ('tmpfs:parallel-append:fsync:2:1M:4K','ext4:parallel-append:cache:2:1M:4K',
+                    'ext4:parallel-append:fsync:4:1M:4K','ext4:append:fsync:2:1M:4K'):
+            with self.assertRaises(ValueError):io.parse_case(bad)
+
+    def test_fixed_range_work_and_preserved_prefix(self):
+        result=self.exercise('ext4:range-modify:fsync:1:1M:64K')
+        self.assertEqual(result['metrics']['range_operations'],64)
+        self.assertEqual(result['metrics']['bytes'],0)
+        self.assertEqual(result['latencies']['io']['samples'],16)
+        for bad in ('tmpfs:range-modify:fsync:1:1M:64K','ext4:range-modify:cache:1:1M:64K',
+                    'ext4:range-modify:fsync:4:1M:64K'):
+            with self.assertRaises(ValueError):io.parse_case(bad)
 
     def test_mixed_read_and_close_intervals(self):
         case = io.parse_case('ext4:mixed-read:fsync:4:1M:4K')

@@ -160,7 +160,8 @@ struct mixed_sample { uint64_t open_start, start, end; };
 struct mixed_report {
     unsigned id, sample_count, cpu;
     uint64_t start, end, data_start, data_end, sync_start, sync_end;
-    uint64_t bytes, calls, checksum;
+    uint64_t bytes, calls, checksum, growth[5];
+    unsigned growth_count;
 };
 
 static void transfer(int fd, void *storage, size_t length, int writing)
@@ -184,19 +185,20 @@ static int mixed_open(const char *directory, unsigned id, int flags)
     return fd;
 }
 
-static void mixed_child(const char *directory, unsigned id, int ready, int gate, int result)
+static void mixed_child(const char *directory, unsigned id, int ready, int gate, int result, int appending)
 {
     mixed_child_count = 0;
-    unsigned count = id == 0 ? 0 : id == 3 ? 256 : (unsigned)((file_bytes + request_bytes - 1) / request_bytes);
+    unsigned count = appending ? (unsigned)((file_bytes + request_bytes - 1) / request_bytes) :
+        id == 0 ? 0 : id == 3 ? 256 : (unsigned)((file_bytes + request_bytes - 1) / request_bytes);
     struct mixed_sample *samples = count ? calloc(count, sizeof(*samples)) : NULL;
     CHECK(!count || samples);
     /* 先触及记录页，样本写入自身的首次缺页不混进读取窗口。 */
     for (size_t offset = 0; offset < count * sizeof(*samples); offset += 4096)
         ((volatile unsigned char *)samples)[offset] = 0;
     struct mixed_report report = {.id = id, .sample_count = count, .cpu=pin_cpu(id==1)};
-    int fd = mixed_open(directory, id, id ? O_RDONLY : O_RDWR | O_APPEND);
-    CHECK(size_of(fd) == (id ? file_bytes : 0));
-    if (!id) {
+    int fd = mixed_open(directory, id, appending || !id ? O_RDWR | O_APPEND : O_RDONLY);
+    CHECK(size_of(fd) == (appending || !id ? 0 : file_bytes));
+    if (!appending && !id) {
         report.data_start = now();
         for (uint64_t offset = 0; offset < file_bytes;) {
             size_t length = file_bytes - offset;
@@ -214,7 +216,27 @@ static void mixed_child(const char *directory, unsigned id, int ready, int gate,
     transfer(gate, &go, sizeof(go), 0);
     CHECK(go == 1 && close(gate) == 0 && close(ready) == 0);
     report.start = now();
-    if (!id) {
+    if (appending) {
+        report.data_start = report.start;
+        for (unsigned sequence=0; sequence<count; sequence++) {
+            uint64_t offset=(uint64_t)sequence*request_bytes;
+            size_t length=file_bytes-offset;
+            if (length>request_bytes) length=request_bytes;
+            fill(id,offset,length,1);
+            samples[sequence].start=now();
+            exact(fd,length,1,&report.calls);
+            samples[sequence].end=now();
+            report.bytes+=length;
+            if (!offset || report.bytes==file_bytes/4 || report.bytes==file_bytes/2 ||
+                report.bytes==file_bytes*3/4 || report.bytes==file_bytes) {
+                CHECK(report.growth_count<5 && size_of(fd)==report.bytes);
+                report.growth[report.growth_count++]=report.bytes;
+            }
+        }
+        report.data_end=now();
+        report.sync_start=report.data_end;
+        CHECK(!fsync(fd)); report.sync_end=now();
+    } else if (!id) {
         report.sync_start = now();
         CHECK(fsync(fd) == 0);
         report.sync_end = now();
@@ -253,36 +275,36 @@ static void mixed_child(const char *directory, unsigned id, int ready, int gate,
     _exit(0);
 }
 
-static int mixed_read(const char *directory)
+static int mixed_read(const char *directory, int appending)
 {
     int ready[2], gates[MAX_FILES][2], reports[MAX_FILES][2];
     CHECK(pipe(ready) == 0);
-    for (unsigned id = 0; id < MAX_FILES; ++id)
+    for (unsigned id = 0; id < files; ++id)
         CHECK(pipe(gates[id]) == 0 && pipe(reports[id]) == 0);
-    for (unsigned id = 0; id < MAX_FILES; ++id) {
+    for (unsigned id = 0; id < files; ++id) {
         pid_t child = fork(); CHECK(child >= 0);
         if (!child) {
             CHECK(close(ready[0]) == 0);
-            for (unsigned other = 0; other < MAX_FILES; ++other) {
+            for (unsigned other = 0; other < files; ++other) {
                 CHECK(close(gates[other][1]) == 0 && close(reports[other][0]) == 0);
                 if (other != id) CHECK(close(gates[other][0]) == 0 && close(reports[other][1]) == 0);
             }
-            mixed_child(directory, id, ready[1], gates[id][0], reports[id][1]);
+            mixed_child(directory, id, ready[1], gates[id][0], reports[id][1], appending);
         }
         mixed_children[mixed_child_count++] = child;
     }
     CHECK(close(ready[1]) == 0);
     unsigned seen = 0;
-    for (unsigned i = 0; i < MAX_FILES; ++i) {
+    for (unsigned i = 0; i < files; ++i) {
         unsigned id;
         transfer(ready[0], &id, sizeof(id), 0);
-        CHECK(id < MAX_FILES && !(seen & (1U << id)));
+        CHECK(id < files && !(seen & (1U << id)));
         seen |= 1U << id;
     }
     CHECK(close(ready[0]) == 0);
     start_observation();
     uint64_t start = now();
-    for (unsigned id = 0; id < MAX_FILES; ++id) {
+    for (unsigned id = 0; id < files; ++id) {
         CHECK(close(gates[id][0]) == 0 && close(reports[id][1]) == 0);
         unsigned char go = 1;
         transfer(gates[id][1], &go, sizeof(go), 1);
@@ -290,11 +312,12 @@ static int mixed_read(const char *directory)
     }
     struct mixed_report completed[MAX_FILES];
     struct mixed_sample *samples[MAX_FILES] = {0};
-    for (unsigned id = 0; id < MAX_FILES; ++id) {
+    for (unsigned id = 0; id < files; ++id) {
         transfer(reports[id][0], &completed[id], sizeof(completed[id]), 0);
         CHECK(completed[id].id == id);
         unsigned count = completed[id].sample_count;
-        CHECK(count == (id == 0 ? 0 : id == 3 ? 256 : (file_bytes + request_bytes - 1) / request_bytes));
+        CHECK(count == (appending ? (file_bytes + request_bytes - 1) / request_bytes :
+            id == 0 ? 0 : id == 3 ? 256 : (file_bytes + request_bytes - 1) / request_bytes));
         if (count) {
             samples[id] = calloc(count, sizeof(*samples[id])); CHECK(samples[id]);
             transfer(reports[id][0], samples[id], count * sizeof(*samples[id]), 0);
@@ -309,27 +332,56 @@ static int mixed_read(const char *directory)
     mixed_child_count = 0;
     uint64_t end = now();
     stop_observation();
+    uint64_t verification_started=now();
     char path[1024];
     int n = snprintf(path, sizeof(path), "%s/file-0", directory);
     CHECK(n > 0 && (size_t)n < sizeof(path));
     int fd = open(path, O_RDONLY); CHECK(fd >= 0);
     completed[0].checksum = verify(fd, 0, 1);
     CHECK(close(fd) == 0);
-    fprintf(evidence, "IO MIXED_WINDOW start_ns=%llu end_ns=%llu bytes=%llu complete=1\n",
+    if (appending) {
+        uint64_t data_end=0,sync_end=0;
+        for (unsigned id=0;id<files;id++) {
+            if (completed[id].data_end>data_end) data_end=completed[id].data_end;
+            if (completed[id].sync_end>sync_end) sync_end=completed[id].sync_end;
+            if (id) {
+                int other=mixed_open(directory,id,O_RDONLY);
+                completed[id].checksum=verify(other,id,1); CHECK(!close(other));
+            }
+        }
+        CHECK(start<data_end && data_end<=sync_end && sync_end<=end);
+        fprintf(evidence,"IO WINDOW start_ns=%llu data_end_ns=%llu end_ns=%llu elapsed_ns=%llu data_ns=%llu sync_ns=%llu bytes=%llu sync_calls=%u verify_ns=%llu cleanup_sync_ns=0 cleanup_sync_calls=0 complete=1\n",
+            (unsigned long long)start,(unsigned long long)data_end,(unsigned long long)sync_end,
+            (unsigned long long)(sync_end-start),(unsigned long long)(data_end-start),
+            (unsigned long long)(sync_end-data_end),(unsigned long long)(file_bytes*files),files,
+            (unsigned long long)(now()-verification_started));
+    } else fprintf(evidence, "IO MIXED_WINDOW start_ns=%llu end_ns=%llu bytes=%llu complete=1\n",
             (unsigned long long)start, (unsigned long long)end, (unsigned long long)(file_bytes * 2));
-    for (unsigned id = 0; id < MAX_FILES; ++id) {
+    for (unsigned id = 0; id < files; ++id) {
         const struct mixed_report *r = &completed[id];
         fprintf(evidence,"IO AFFINITY role=%u cpu=%u\n",id,r->cpu);
-        fprintf(evidence, "IO MIXED_FILE id=%u bytes=%llu calls=%llu start_ns=%llu end_ns=%llu data_start_ns=%llu data_end_ns=%llu sync_start_ns=%llu sync_end_ns=%llu checksum=%llu samples=%u complete=1\n",
+        if (appending) {
+            fprintf(evidence,"IO FILE id=%u bytes=%llu calls=%llu start_ns=%llu end_ns=%llu sync_end_ns=%llu size_before=0 size_after=%llu checksum=%llu complete=1\n",
+                id,(unsigned long long)r->bytes,(unsigned long long)r->calls,(unsigned long long)r->start,
+                (unsigned long long)r->data_end,(unsigned long long)r->sync_end,
+                (unsigned long long)file_bytes,(unsigned long long)r->checksum);
+            CHECK(r->growth_count==5);
+            for (unsigned j=0;j<r->growth_count;j++)
+                fprintf(evidence,"IO SIZE id=%u sample=%u bytes=%llu\n",id,j,(unsigned long long)r->growth[j]);
+        } else fprintf(evidence, "IO MIXED_FILE id=%u bytes=%llu calls=%llu start_ns=%llu end_ns=%llu data_start_ns=%llu data_end_ns=%llu sync_start_ns=%llu sync_end_ns=%llu checksum=%llu samples=%u complete=1\n",
                 id, (unsigned long long)r->bytes, (unsigned long long)r->calls,
                 (unsigned long long)r->start, (unsigned long long)r->end,
                 (unsigned long long)r->data_start, (unsigned long long)r->data_end,
                 (unsigned long long)r->sync_start, (unsigned long long)r->sync_end,
                 (unsigned long long)r->checksum, r->sample_count);
-        for (unsigned sequence = 0; sequence < r->sample_count; ++sequence)
-            fprintf(evidence, "IO MIXED_SAMPLE id=%u sequence=%u open_start_ns=%llu start_ns=%llu end_ns=%llu\n",
+        for (unsigned sequence = 0; sequence < r->sample_count; ++sequence) {
+            if (appending)
+                fprintf(evidence,"IO SAMPLE id=%u sequence=%u start_ns=%llu end_ns=%llu\n",id,sequence,
+                    (unsigned long long)samples[id][sequence].start,(unsigned long long)samples[id][sequence].end);
+            else fprintf(evidence, "IO MIXED_SAMPLE id=%u sequence=%u open_start_ns=%llu start_ns=%llu end_ns=%llu\n",
                     id, sequence, (unsigned long long)samples[id][sequence].open_start,
                     (unsigned long long)samples[id][sequence].start, (unsigned long long)samples[id][sequence].end);
+        }
         free(samples[id]);
     }
     resources();
@@ -337,6 +389,51 @@ static int mixed_read(const char *directory)
     CHECK(fflush(evidence) == 0 && fsync(fileno(evidence)) == 0 && fclose(evidence) == 0);
     puts("IO PASS all");
     return 0;
+}
+
+static int range_modify(const char *directory, unsigned cpu)
+{
+    int fd=mixed_open(directory,0,O_RDWR);
+    CHECK(size_of(fd)==file_bytes && file_bytes>=2*request_bytes);
+    size_t count=file_bytes/request_bytes;
+    struct io_interval *samples=calloc(count,sizeof(*samples));CHECK(samples);
+    for (size_t i=0;i<count*sizeof(*samples);i+=4096) ((volatile unsigned char *)samples)[i]=0;
+    uint64_t calls=0;
+    start_observation();uint64_t start=now();
+    for (size_t i=0;i<count;i++) {
+        samples[i].start=now();
+        CHECK(!ftruncate(fd,file_bytes-request_bytes));calls++;
+        CHECK(!fallocate(fd,FALLOC_FL_KEEP_SIZE,file_bytes,request_bytes));calls++;
+        CHECK(!fallocate(fd,0,file_bytes-2*request_bytes,2*request_bytes));calls++;
+        CHECK(!fallocate(fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,
+            file_bytes-2*request_bytes,request_bytes));calls++;
+        samples[i].end=now();
+    }
+    uint64_t data_end=now();CHECK(!fsync(fd));uint64_t end=now();stop_observation();
+    uint64_t verify_start=now(),checksum=0;
+    CHECK(size_of(fd)==file_bytes && lseek(fd,0,SEEK_CUR)==0);
+    for (uint64_t offset=0;offset<file_bytes;) {
+        size_t length=file_bytes-offset;if(length>sizeof(buffer))length=sizeof(buffer);
+        exact(fd,length,0,NULL);
+        for (size_t j=0;j<length;j++) {
+            unsigned char expected=offset+j<file_bytes-2*request_bytes?pattern(0,offset+j,0):0;
+            CHECK(buffer[j]==expected);checksum+=buffer[j];
+        }
+        offset+=length;
+    }
+    CHECK(read(fd,buffer,1)==0);uint64_t verify_end=now();
+    fprintf(evidence,"IO WINDOW start_ns=%llu data_end_ns=%llu end_ns=%llu elapsed_ns=%llu data_ns=%llu sync_ns=%llu bytes=0 sync_calls=1 verify_ns=%llu cleanup_sync_ns=0 cleanup_sync_calls=0 range_operations=%llu complete=1\n",
+        (unsigned long long)start,(unsigned long long)data_end,(unsigned long long)end,
+        (unsigned long long)(end-start),(unsigned long long)(data_end-start),(unsigned long long)(end-data_end),
+        (unsigned long long)(verify_end-verify_start),(unsigned long long)calls);
+    fprintf(evidence,"IO AFFINITY role=0 cpu=%u\n",cpu);
+    fprintf(evidence,"IO FILE id=0 bytes=0 calls=%llu start_ns=%llu end_ns=%llu sync_end_ns=%llu size_before=%llu size_after=%llu checksum=%llu complete=1\n",
+        (unsigned long long)calls,(unsigned long long)start,(unsigned long long)data_end,
+        (unsigned long long)end,(unsigned long long)file_bytes,(unsigned long long)file_bytes,(unsigned long long)checksum);
+    for(size_t i=0;i<count;i++)fprintf(evidence,"IO SAMPLE id=0 sequence=%zu start_ns=%llu end_ns=%llu\n",
+        i,(unsigned long long)samples[i].start,(unsigned long long)samples[i].end);
+    CHECK(!close(fd));free(samples);resources();fputs("IO PASS all\n",evidence);
+    CHECK(!fflush(evidence) && !fsync(fileno(evidence)) && !fclose(evidence));puts("IO PASS all");return 0;
 }
 
 static void timed_out(int signal_number)
@@ -365,19 +462,21 @@ int main(int argc, char **argv)
     int memory = !strcmp(backend, "tmpfs"), append = !strcmp(operation, "append");
     int writing = append || !strcmp(operation, "overwrite"), hot = !strcmp(operation, "hot-read");
     int mixed = !strcmp(operation, "mixed-read");
+    int parallel = !strcmp(operation,"parallel-append"), range = !strcmp(operation,"range-modify");
     int sync_mode = !strcmp(completion, "fsync") ? 1 : !strcmp(completion, "fdatasync") ? 2 : 0;
-    CHECK((memory || !strcmp(backend, "ext4")) && (writing || hot || mixed || !strcmp(operation, "cold-read") || !strcmp(operation, "read")));
-    CHECK((sync_mode || !strcmp(completion, "cache")) && (writing || mixed || !sync_mode));
+    CHECK((memory || !strcmp(backend, "ext4")) && (writing || hot || mixed || parallel || range || !strcmp(operation, "cold-read") || !strcmp(operation, "read")));
+    CHECK((sync_mode || !strcmp(completion, "cache")) && (writing || mixed || parallel || range || !sync_mode));
     CHECK(!mixed || (!memory && files == 4 && sync_mode == 1));
     CHECK(!(memory && !strcmp(operation, "cold-read")));
-    CHECK((files == 1 || files == 4) && file_bytes > 0 && file_bytes <= 64U * 1024U * 1024U);
+    CHECK((files == 1 || files == 2 || files == 4) && file_bytes > 0 && file_bytes <= 64U * 1024U * 1024U);
     CHECK(request_bytes == 1024 || request_bytes == 4096 || request_bytes == 65536);
     int n = snprintf(result_path, sizeof(result_path), "%s.results", config_path);
     CHECK(n > 0 && (size_t)n < sizeof(result_path));
     const char *directory = argc > 2 ? argv[2] : memory ? "/memory" : "/data";
     choose_cpus();
     unsigned cpu=pin_cpu(1);
-    if (mixed) return mixed_read(directory);
+    if (mixed || parallel) { CHECK(!parallel || (!memory && files==2 && sync_mode==1)); return mixed_read(directory,parallel); }
+    if (range) { CHECK(!memory && files==1 && sync_mode==1); return range_modify(directory,cpu); }
     if (memory && argc <= 2) CHECK(mount("tmpfs", directory, "tmpfs", 0, "size=384m") == 0);
     struct result results[MAX_FILES] = {{0}};
     for (unsigned id = 0; id < files; ++id) {
