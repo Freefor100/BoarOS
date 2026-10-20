@@ -22,10 +22,13 @@ static inline __attribute__((always_inline)) void *copy_forward(
         memory_word *words_out = (memory_word *)(void *)output;
         const memory_word *words_in = (const memory_word *)(const void *)input;
         while (size >= 4U * width) {
-            words_out[0] = words_in[0];
-            words_out[1] = words_in[1];
-            words_out[2] = words_in[2];
-            words_out[3] = words_in[3];
+            memory_word a=words_in[0], b=words_in[1];
+            memory_word c=words_in[2], d=words_in[3];
+            /* 先读完本批，再写目标，避免源/目标映射争用同一地址转换槽。
+             * 前向重叠只覆盖已读输入；屏障防止编译器重新交错读写。 */
+            __asm__ volatile("" : "+r"(a), "+r"(b), "+r"(c), "+r"(d) : : "memory");
+            words_out[0]=a; words_out[1]=b;
+            words_out[2]=c; words_out[3]=d;
             words_out += 4;
             words_in += 4;
             size -= 4U * width;
@@ -101,12 +104,13 @@ __attribute__((aligned(2048))) void *memmove(void *destination, const void *sour
         if (((uintptr_t)input & (width - 1U)) == 0U) {
             memory_word *words_out = (memory_word *)(void *)output;
             const memory_word *words_in = (const memory_word *)(const void *)input;
-            /* 从高地址逐字提交，距离小于展开块时也不覆盖待读源字。 */
+            /* 高地址批次先读后写；短距离重叠也不会覆盖下一批源字。 */
             while (size >= 4U * width) {
-                words_out[-1] = words_in[-1];
-                words_out[-2] = words_in[-2];
-                words_out[-3] = words_in[-3];
-                words_out[-4] = words_in[-4];
+                memory_word a=words_in[-1], b=words_in[-2];
+                memory_word c=words_in[-3], d=words_in[-4];
+                __asm__ volatile("" : "+r"(a), "+r"(b), "+r"(c), "+r"(d) : : "memory");
+                words_out[-1]=a; words_out[-2]=b;
+                words_out[-3]=c; words_out[-4]=d;
                 words_out -= 4;
                 words_in -= 4;
                 size -= 4U * width;
