@@ -154,7 +154,8 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     memset(disk.bytes, 0x3c, sizeof(disk.bytes));
     struct kernel_fs_context local_fs = {0}; struct kernel_files local = {0}, child = {0};
     assert(!kernel_fs_context_create(&local_fs, mount, heap) && !kernel_files_create(&local, heap));
-    struct kernel_vfs_path *root = kernel_fs_context_root(&local_fs);
+    KERNEL_FS_PATHS(paths, &local_fs);
+    struct kernel_vfs_path *root = paths.root;
     assert(!kernel_vfs_mknod_at(root, root, "/raw-block", KERNEL_VFS_S_IFBLK | 0600, number));
     size_t done; int64_t result;
     struct kernel_open_file_description *node = 0; int node_error;
@@ -283,7 +284,8 @@ static void raw_mounted_flush_case(struct kernel_heap *heap, struct kernel_vfs_m
 {
     struct kernel_fs_context local_fs = {0}; struct kernel_files local = {0};
     assert(!kernel_fs_context_create(&local_fs, mount, heap) && !kernel_files_create(&local, heap));
-    struct kernel_vfs_path *root = kernel_fs_context_root(&local_fs);
+    KERNEL_FS_PATHS(paths, &local_fs);
+    struct kernel_vfs_path *root = paths.root;
     assert(!kernel_vfs_mknod_at(root, root, "/mounted-block", KERNEL_VFS_S_IFBLK | 0600, device->device_number));
     size_t done; int64_t result; int error;
     assert(!kernel_copy_to_user(&mm, 0x200000, "/mounted-block", 15, &done) && done == 15);

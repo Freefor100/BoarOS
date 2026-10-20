@@ -31,6 +31,8 @@ struct kernel_vfs_instance {
     uint8_t read_only;
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
+    struct kernel_vfs_path *path_index;
+    size_t retiring_nodes; /* Removed from weak index; close/free still owns instance. */
 };
 
 struct kernel_vfs_node {
@@ -77,6 +79,8 @@ struct kernel_vfs_path {
     uint32_t references;
     uint8_t detached;
     char *name;
+    struct kernel_vfs_path *index_left, *index_right;
+    uint8_t index_height;
     char initial_name[];
 };
 
@@ -97,6 +101,7 @@ enum kernel_vfs_execution {
 struct kernel_vfs_backend {
     enum kernel_vfs_execution read_execution;
     enum kernel_vfs_execution file_metadata_execution;
+    enum kernel_vfs_execution namespace_execution;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
@@ -145,8 +150,8 @@ struct kernel_vfs_backend {
     int (*sync_filesystem)(struct kernel_vfs_instance *instance,
                            struct kernel_vfs_node *root);
     int (*flush)(struct kernel_vfs_instance *instance);
-    int (*symlink)(struct kernel_vfs_instance *instance, const char *target, const char *path);
-    int (*mknod)(struct kernel_vfs_instance *instance, const char *path,
+    int (*symlink)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path);
+    int (*mknod)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
         uint32_t type, uint32_t mode, uint32_t device);
     int (*link)(struct kernel_vfs_instance *instance, uint64_t source_inode,
         uint64_t target_parent, const char *name);
@@ -167,7 +172,7 @@ struct kernel_vfs_backend {
         uint32_t inode_mode,
         struct kernel_vfs_file *file);
     int (*create)(struct kernel_vfs_mount *mount,
-        const char *path,
+        uint64_t parent_inode, const char *path,
         uint32_t mode,
         struct kernel_vfs_file *file);
     void (*accessed)(struct kernel_vfs_file *file);
@@ -176,12 +181,12 @@ struct kernel_vfs_backend {
     int (*stat)(const struct kernel_vfs_file *file,
         struct kernel_vfs_stat *stat);
     int (*mkdir)(struct kernel_vfs_mount *mount,
-        const char *path,
+        uint64_t parent_inode, const char *path,
         uint32_t mode);
     int (*unlink)(struct kernel_vfs_mount *mount,
-        const char *path);
+        uint64_t parent_inode, const char *path);
     int (*rmdir)(struct kernel_vfs_mount *mount,
-        const char *path);
+        uint64_t parent_inode, const char *path);
     void (*release_unlinked)(struct kernel_vfs_node *node);
     int (*dir_entry)(struct kernel_vfs_file *file,
         uint64_t position,

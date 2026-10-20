@@ -1,3 +1,4 @@
+#include "vfs_internal.h"
 #include <kernel/errno.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
@@ -29,9 +30,35 @@ static void finish_context(struct kernel_fs_context *fs,
     fs->state = state;
 }
 
-int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
+static int context_live(const struct kernel_fs_context *fs)
 {
     return fs && fs->state==KERNEL_FS_CONTEXT_LIVE && fs->heap && fs->record;
+}
+
+int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
+{
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    return context_live(fs);
+}
+
+struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *fs)
+{
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    struct kernel_fs_paths paths = {0};
+    if (context_live(fs)) {
+        paths.root = fs->record->root;
+        paths.cwd = fs->record->cwd;
+        paths.umask = fs->record->umask;
+        if (kernel_vfs_path_acquire(paths.root) || kernel_vfs_path_acquire(paths.cwd))
+            __builtin_trap();
+    }
+    return paths;
+}
+
+void kernel_fs_paths_release(struct kernel_fs_paths *paths)
+{
+    if (paths->cwd && kernel_vfs_path_release(&paths->cwd)) __builtin_trap();
+    if (paths->root && kernel_vfs_path_release(&paths->root)) __builtin_trap();
 }
 
 static enum kernel_fs_context_status create_context(
@@ -76,6 +103,7 @@ static enum kernel_fs_context_status create_context(
     record->cwd = cwd;
     record->umask = umask;
     record->references = 1U;
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
     fs->heap = heap;
     fs->record = record;
     fs->state = KERNEL_FS_CONTEXT_LIVE;
@@ -103,7 +131,8 @@ enum kernel_fs_context_status kernel_fs_context_acquire(
     if (destination == 0 || source == 0 || destination == source) {
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
-    if (!empty_context(destination) || !kernel_fs_context_is_live(source) ||
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (!empty_context(destination) || !context_live(source) ||
         source->record->references == UINT32_MAX) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
@@ -121,13 +150,19 @@ enum kernel_fs_context_status kernel_fs_context_fork(
     if (destination == 0 || source == 0 || destination == source) {
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
-    if (!empty_context(destination) ||
-        !kernel_fs_context_is_live(source)) {
-        return KERNEL_FS_CONTEXT_STATUS_STATE;
+    struct kernel_heap *heap;
+    struct kernel_fs_paths paths __attribute__((cleanup(kernel_fs_paths_release))) = {0};
+    {
+        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+        if (!empty_context(destination) || !context_live(source))
+            return KERNEL_FS_CONTEXT_STATUS_STATE;
+        heap = source->heap;
+        paths = (struct kernel_fs_paths){source->record->root, source->record->cwd,
+                                         source->record->umask};
+        if (kernel_vfs_path_acquire(paths.root) || kernel_vfs_path_acquire(paths.cwd))
+            __builtin_trap();
     }
-    return create_context(destination, source->record->root,
-                          source->record->cwd, 0,
-                          source->heap, __atomic_load_n(&source->record->umask,__ATOMIC_RELAXED));
+    return create_context(destination, paths.root, paths.cwd, 0, heap, paths.umask);
 }
 
 enum kernel_fs_context_status kernel_fs_context_move(
@@ -137,6 +172,7 @@ enum kernel_fs_context_status kernel_fs_context_move(
     if (destination == 0 || source == 0 || destination == source) {
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
     if (!empty_context(destination) ||
         source->state != KERNEL_FS_CONTEXT_LIVE ||
         source->heap == 0 || source->record == 0) {
@@ -147,26 +183,19 @@ enum kernel_fs_context_status kernel_fs_context_move(
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
-struct kernel_vfs_path *kernel_fs_context_root(const struct kernel_fs_context *fs)
-{
-    return kernel_fs_context_is_live(fs) ? fs->record->root : 0;
-}
-
-struct kernel_vfs_path *kernel_fs_context_cwd(const struct kernel_fs_context *fs)
-{
-    return kernel_fs_context_is_live(fs) ? fs->record->cwd : 0;
-}
-
 uint32_t kernel_fs_context_umask(const struct kernel_fs_context *fs)
 {
-    return kernel_fs_context_is_live(fs) ? __atomic_load_n(&fs->record->umask,__ATOMIC_RELAXED) : 0U;
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    return context_live(fs) ? fs->record->umask : 0U;
 }
 
 int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
                                     uint32_t requested, uint32_t *previous)
 {
-    if (!kernel_fs_context_is_live(fs) || previous == 0) return -KERNEL_EINVAL;
-    *previous = __atomic_exchange_n(&fs->record->umask,requested & 0777U,__ATOMIC_RELAXED);
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (!context_live(fs) || previous == 0) return -KERNEL_EINVAL;
+    *previous = fs->record->umask;
+    fs->record->umask = requested & 0777U;
     return 0;
 }
 
@@ -181,8 +210,13 @@ int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
         return -KERNEL_ENOTDIR;
     result = kernel_vfs_path_acquire(path);
     if (result) return result;
-    struct kernel_vfs_path *previous = fs->record->cwd;
-    fs->record->cwd = path;
+    struct kernel_vfs_path *previous;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+        if (!context_live(fs)) __builtin_trap();
+        previous = fs->record->cwd;
+        fs->record->cwd = path;
+    }
     if (kernel_vfs_path_release(&previous)) __builtin_trap();
     return 0;
 }
@@ -241,6 +275,7 @@ enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
     struct kernel_vfs_mount **mount,
     int *linux_result)
 {
+    KERNEL_FS_PATHS(paths, fs);
     struct kernel_vfs_path *resolved = 0;
     if (!kernel_fs_context_is_live(fs) || !path || !buffer ||
         capacity != KERNEL_FS_PATH_MAX || !mount || !linux_result)
@@ -250,11 +285,11 @@ enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
     else if (path[0] != '/' && dirfd != KERNEL_FS_AT_FDCWD)
         *linux_result = -KERNEL_EBADF;
     else {
-        *linux_result = kernel_vfs_path_resolve(fs->record->cwd,
-                            fs->record->root, path, 1, &resolved);
+        *linux_result = kernel_vfs_path_resolve(paths.cwd,
+                            paths.root, path, 1, &resolved);
         if (!*linux_result) {
             *mount = kernel_vfs_path_mount(resolved);
-            *linux_result = kernel_vfs_path_string(resolved, fs->record->root,
+            *linux_result = kernel_vfs_path_string(resolved, paths.root,
                                                    buffer, capacity);
             if (*linux_result == -KERNEL_ERANGE)
                 *linux_result = -KERNEL_ENAMETOOLONG;
@@ -264,33 +299,22 @@ enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
-enum kernel_fs_context_status kernel_fs_context_release(
-    struct kernel_fs_context *fs)
+enum kernel_fs_context_status kernel_fs_context_release(struct kernel_fs_context *fs)
 {
-    if (fs == 0) {
-        return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
-    }
-    if (fs->state != KERNEL_FS_CONTEXT_LIVE ||
-        fs->heap == 0 || fs->record == 0 ||
-        fs->record->references == 0U ||
-        fs->record->root == 0) {
-        return KERNEL_FS_CONTEXT_STATUS_STATE;
-    }
-    if (fs->state == KERNEL_FS_CONTEXT_LIVE &&
-        fs->record->references > 1U) {
-        fs->record->references--;
+    if (!fs) return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
+    struct kernel_fs_context_record *record;
+    struct kernel_heap *heap;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+        if (!context_live(fs) || !fs->record->references || !fs->record->root)
+            return KERNEL_FS_CONTEXT_STATUS_STATE;
+        heap = fs->heap;
+        record = fs->record;
         finish_context(fs, KERNEL_FS_CONTEXT_RELEASED);
-        return KERNEL_FS_CONTEXT_STATUS_OK;
+        if (--record->references) return KERNEL_FS_CONTEXT_STATUS_OK;
     }
-    if (fs->record->references != 1U) {
-        return KERNEL_FS_CONTEXT_STATUS_STATE;
-    }
-    if (fs->record->cwd != 0 &&
-        kernel_vfs_path_release(&fs->record->cwd) != 0)
-        return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
-    if (kernel_vfs_path_release(&fs->record->root) != 0)
-        return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
-    kernel_heap_release(fs->heap, fs->record);
-    finish_context(fs, KERNEL_FS_CONTEXT_RELEASED);
+    if (kernel_vfs_path_release(&record->cwd) || kernel_vfs_path_release(&record->root))
+        __builtin_trap();
+    kernel_heap_release(heap, record);
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }

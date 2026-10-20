@@ -37,7 +37,7 @@ def writable_root_path(record):
 
 class FrozenFixture:
     def __init__(self, directory, case, elf_sha256):
-        if case not in ('allocator', 'latency', 'locking', 'scheduler'):
+        if case not in ('allocator', 'latency', 'locking', 'scheduler', 'metadata'):
             raise ValueError('unsupported frozen fixture case')
         self.directory = Path(directory) / case
         self.case = case

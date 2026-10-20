@@ -411,7 +411,8 @@ enum kernel_syscall_status syscall_handle_sync(
         const struct kernel_fs_context *fs;
         if (kernel_task_fs_context_borrow(caller, &fs) != KERNEL_TASK_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-        kernel_vfs_sync_all(kernel_fs_context_root(fs));
+        KERNEL_FS_PATHS(paths, fs);
+        kernel_vfs_sync_all(paths.root);
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = result;

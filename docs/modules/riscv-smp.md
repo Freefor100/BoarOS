@@ -240,6 +240,8 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 ## 普通文件IO的执行位置
 
+ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。同一挂载仍以 namespace mutex 串行修改目录和事务；journal/checkpoint 与后台数据写回由 CPU0 推进。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
+
 普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 
 候选页、entry 和读取工作区在调用 CPU 准备，未初始化数据保持私有。ext4 由调用者取得 inode 资格后复查并发布 loading，再复用 128 KiB SG 后端读取；CPU0 策略的后端由 worker 完成这些步骤。完成后用户复制和错误前缀仍由原调用者处理。共享文件来源写入先完成 pin，再关闭目标写资格；完整冷覆盖不读取旧数据或预清整页。
@@ -252,7 +254,7 @@ SEEK_DATA/HOLE 和最终缓存 OFD 释放仍复用该执行队列。需要共享
 
 ### 受控文件任务
 
-受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。命名空间、FIFO、socket/epoll、记录锁及设备业务仍在实际入口进入 CPU0 范围。
+受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。非 ext4 命名空间、FIFO、socket/epoll、记录锁及设备业务在实际入口进入 CPU0 范围。
 
 ```sh
 make test-file-io-concurrency-host

@@ -130,7 +130,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
                         uint32_t inode_mode,
                         struct kernel_vfs_file *file);
 static int ext4_backend_create(struct kernel_vfs_mount *mount,
-                          const char *path,
+                          uint64_t parent_inode, const char *path,
                           uint32_t mode,
                           struct kernel_vfs_file *file);
 static void ext4_backend_accessed(struct kernel_vfs_file *file);
@@ -139,24 +139,21 @@ static int ext4_backend_modified(struct kernel_vfs_file *file,
 static int ext4_backend_stat(const struct kernel_vfs_file *file,
                      struct kernel_vfs_stat *stat);
 static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
-                         const char *path,
+                         uint64_t parent_inode, const char *path,
                          uint32_t mode);
 /* The namespace lock holds names, not cache-only registry ancestors. Pin the
  * indexed target before reclaim can rotate the tree or retire its last owner. */
 static struct kernel_vfs_node *pin_linked_node(struct lwext4_mount_adapter *adapter, uint32_t inode)
 {
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_vfs_node *node = kernel_vfs_node_find(&adapter->instance, inode);
-    if (node && node->unlinked) node = 0;
-    if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
-    arch_interrupt_restore(irq);
+    struct kernel_vfs_node *node = kernel_vfs_node_pin(&adapter->instance, inode);
+    if (node && node->unlinked && kernel_vfs_node_release(&node)) __builtin_trap();
     return node;
 }
 
 static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
-                          const char *path);
+                          uint64_t parent_inode, const char *path);
 static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
-                         const char *path);
+                         uint64_t parent_inode, const char *path);
 static void ext4_backend_release_unlinked(struct kernel_vfs_node *node);
 static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
                          uint64_t position,
@@ -283,6 +280,7 @@ static int free_orphan_inode(struct lwext4_mount_adapter *adapter,uint32_t inode
     if (!result) {
         /* 失败 close 的旧 handle 不再进入 inode 索引。真正释放 inode 时
          * 同时退休它的待清理状态，不能在该 inode 复用后再截断新所有者。 */
+        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
         for (struct kernel_vfs_node *node=adapter->instance.cleanup_nodes;node;node=node->next)
             if (node->inode==inode) {
                 ((struct lwext4_node *)node)->write_completion=0;
@@ -432,14 +430,10 @@ static void time_stage(void *context, void *owner, uint32_t inode, unsigned fiel
                        struct ext4_timestamp value)
 {
     struct lwext4_mount_adapter *adapter = context;
+    struct kernel_vfs_node *pin = owner ? 0 : kernel_vfs_node_pin(&adapter->instance, inode);
+    struct kernel_vfs_node *base = owner ? owner : pin;
+    {
     TIMESTAMP_SCOPE(times, adapter);
-    struct kernel_vfs_node *base = owner;
-    if (!base) {
-        /* Namespace operations remain on CPU0. Handle operations already own
-         * their live inode and must not traverse the CPU0-only registry. */
-        kernel_assert_service_context();
-        base = kernel_vfs_node_find(&adapter->instance, inode);
-    }
     if (base && (base->instance != &adapter->instance || base->inode != inode)) __builtin_trap();
     if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         struct lwext4_node *node = (struct lwext4_node *)base;
@@ -452,6 +446,8 @@ static void time_stage(void *context, void *owner, uint32_t inode, unsigned fiel
         node->staged_version[field] = node->time_version[field];
         node->staged_fields |= 1U << field;
     }
+    }
+    if (pin && kernel_vfs_node_release(&pin)) __builtin_trap();
 }
 
 static void time_finish(void *context, bool accepted)
@@ -822,15 +818,16 @@ int kernel_vfs_sync_block_device(struct kernel_block_device *device)
     KERNEL_SERVICE_SCOPE(service);
     if (!device) return -KERNEL_EINVAL;
     struct lwext4_mount_adapter *selected = NULL;
-    uintptr_t irq = arch_interrupt_save();
+    kernel_task_lock_guard irq = {0};
+    kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
     /* 设备的独占 mount claim 保证至多一个匹配实例。 */
     for (struct lwext4_mount_adapter *a = adapters; a; a = a->next_adapter)
         if (a->block == device && a->mount->state == VFS_MOUNT_STATE_LIVE) {
             selected = a;
             break;
         }
-    if (!selected) { arch_interrupt_restore(irq); return 0; }
-    if (selected->instance.quiescing) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
+    if (!selected) { kernel_task_lock_release(&irq); return 0; }
+    if (selected->instance.quiescing) { kernel_task_lock_release(&irq); return -KERNEL_EBUSY; }
     struct kernel_vfs_path *root = NULL;
     for (struct kernel_vfs_path *p = selected->instance.paths; p; p = p->next)
         if (!p->parent) { root = p; break; }
@@ -842,15 +839,15 @@ int kernel_vfs_sync_block_device(struct kernel_block_device *device)
         /* 没有现存 path 时，先保留本次打开的挂载资格；路径分配可睡眠，
          * 不能让卸载在取得真实 root path owner 之前释放 adapter。 */
         if (selected->instance.external_files == UINT32_MAX) result = -KERNEL_EOVERFLOW;
-        else selected->instance.external_files++;
+        else __atomic_fetch_add(&selected->instance.external_files, 1, __ATOMIC_RELAXED);
     }
-    arch_interrupt_restore(irq);
+    kernel_task_lock_release(&irq);
     if (!root && !result) {
         result = kernel_vfs_path_root(selected->mount,selected->instance.heap,&root);
-        irq = arch_interrupt_save();
+        kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
         if (!selected->instance.external_files) __builtin_trap();
-        selected->instance.external_files--;
-        arch_interrupt_restore(irq);
+        __atomic_fetch_sub(&selected->instance.external_files, 1, __ATOMIC_RELEASE);
+        kernel_task_lock_release(&irq);
     }
     if (!result) result = kernel_vfs_sync_mount(root->file.mount,NULL);
     if (root && kernel_vfs_path_release(&root)) __builtin_trap();
@@ -962,6 +959,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     }
     result = writeback_mount_times(adapter, true);
     if (result != EOK) return lwext4_error(result);
+    if (!kernel_vfs_nodes_idle(&adapter->instance, root)) return -KERNEL_EBUSY;
     orphan_link = &adapter->orphans;
     while (*orphan_link != 0) {
         struct lwext4_orphan *orphan = *orphan_link;
@@ -1007,7 +1005,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         *cleanup_link = next;
     }
     if (adapter->orphans != 0 || adapter->instance.cleanup_nodes != 0 ||
-        adapter->instance.nodes != root || (root && root->next)) {
+        !kernel_vfs_nodes_idle(&adapter->instance, root)) {
         return -KERNEL_EIO;
     }
     /* root 的路径身份保留至摘树；私有 handle 不再访问即将释放的 lwext4 mount。 */
@@ -1268,9 +1266,6 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
     if (adapter->instance.backend_data != adapter || !adapter->mounted) return -KERNEL_EINVAL;
     if (adapter->instance.read_only) return 0;
     if (adapter->journal_started) return -KERNEL_EBUSY;
-    kernel_wait_queue_init(&adapter->journal_work);
-    kernel_wait_queue_init(&adapter->checkpoint_work);
-    kernel_wait_queue_init(&adapter->journal_progress);
     /* The same mount worker also owns timestamp-only writeback on writable
      * filesystems without JBD; dirty inode pins need a consumer there too. */
     if (adapter->device.fs->jbd_journal) {
@@ -1345,6 +1340,11 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock);
     adapter->locks.unlock = backend_unlock;
     kernel_raw_lock_init(&adapter->journal_control, KERNEL_RAW_RANK_OBJECT);
+    /* Progress publication also runs during synchronous journal service,
+     * before background workers exist. Queues belong to the mount lifetime. */
+    kernel_wait_queue_init(&adapter->journal_work);
+    kernel_wait_queue_init(&adapter->checkpoint_work);
+    kernel_wait_queue_init(&adapter->journal_progress);
 #if BOAROS_MAX_CPUS > 1
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
 #endif
@@ -1769,8 +1769,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     if (result) {
         if (ext4_fclose(lwext4_node_file(node)) != EOK) {
             node->instance = &adapter->instance;
-            node->next = adapter->instance.cleanup_nodes;
-            adapter->instance.cleanup_nodes = node;
+            kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap, node);
         return lwext4_error(result);
     }
@@ -1778,54 +1777,33 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
 }
 
 struct namespace_create {
-    const char *path;
+    const char *mount, *path, *target;
     ext4_file *file;
-    uint32_t mode,type,device;
+    uint32_t parent, mode, type, device;
 };
 static int apply_namespace_create(void *context)
 {
-    struct namespace_create *request=context;
-    int result;
-    if (request->file) {
-        /* 未发布handle可能来自已回滚的上一轮，不能沿用inode/size/序号。 */
-        if (request->file->mp) {
-            result=ext4_fclose(request->file);
-            if (result) return result;
-        }
-        memset(request->file,0,sizeof(*request->file));
-        result=ext4_fopen2(request->file,request->path,O_CREAT|O_RDWR);
-        if (!result) result=ext4_file_set_mode_initial(request->file,request->mode|KERNEL_VFS_S_IFREG);
-        return result;
+    struct namespace_create *request = context;
+    if (request->file && request->file->mp) {
+        int result = ext4_fclose(request->file);
+        if (result) return result;
+        memset(request->file, 0, sizeof(*request->file));
     }
-    if (request->type==KERNEL_VFS_S_IFDIR) {
-        result=ext4_dir_mk(request->path);
-        if (!result) result=ext4_mode_set_initial(request->path,request->mode|KERNEL_VFS_S_IFDIR);
-        return result;
-    }
-    if (request->type==KERNEL_VFS_S_IFIFO) result=ext4_mknod(request->path,EXT4_DE_FIFO,0);
-    else if (request->type==KERNEL_VFS_S_IFCHR) result=ext4_mknod(request->path,EXT4_DE_CHRDEV,request->device);
-    else if (request->type==KERNEL_VFS_S_IFBLK) result=ext4_mknod(request->path,EXT4_DE_BLKDEV,request->device);
-    else {
-        ext4_file file={0};
-        result=ext4_fopen2(&file,request->path,O_CREAT|O_EXCL|O_RDWR);
-        if (!result) result=ext4_fclose(&file);
-    }
-    if (!result) result=ext4_mode_set(request->path,request->type|request->mode);
-    return result;
+    return ext4_create_child(request->mount, request->parent, request->path,
+        request->mode | request->type, request->device, request->target, request->file);
 }
-struct namespace_remove { const char *path;uint32_t inode;bool orphan;int directory; };
+struct namespace_remove {
+    const char *mount, *path;
+    uint32_t parent, inode;
+    bool orphan;
+    int directory;
+};
 static int apply_namespace_remove(void *context)
 {
-    struct namespace_remove *request=context;
-    request->inode=0;request->orphan=false;
-    return request->directory?ext4_fdir_unlink_dentry(request->path,&request->inode):
-        ext4_funlink_dentry(request->path,&request->inode,&request->orphan);
-}
-struct namespace_symlink { const char *target,*path; };
-static int apply_namespace_symlink(void *context)
-{
-    struct namespace_symlink *request=context;
-    return ext4_fsymlink(request->target,request->path);
+    struct namespace_remove *request = context;
+    request->inode = 0; request->orphan = false;
+    return ext4_unlink_child(request->mount, request->parent, request->path,
+        request->directory, &request->inode, &request->orphan);
 }
 struct namespace_rename {
     const char *mount,*old_name,*new_name;
@@ -1849,7 +1827,7 @@ static int apply_namespace_link(void *context)
 
 
 static int ext4_backend_create(struct kernel_vfs_mount *mount,
-                          const char *path,
+                          uint64_t parent_inode, const char *path,
                           uint32_t mode,
                           struct kernel_vfs_file *file)
 {
@@ -1859,13 +1837,12 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
-        mount->private_data == 0 || path == 0 || path[0] != '/' ||
+        mount->private_data == 0 || path == 0 || !parent_inode || parent_inode > UINT32_MAX ||
         file == 0 || file->state != VFS_FILE_STATE_EMPTY ||
         file->private_data != 0) {
         return -KERNEL_EINVAL;
     }
     adapter = mount->private_data;
-    BACKEND_PATH(adapter, path);
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
@@ -1880,14 +1857,14 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     }
 
     node->backend_data = &((struct lwext4_node *)node)->file;
-    struct namespace_create request={.path=path,.file=lwext4_node_file(node),.mode=mode&07777U};
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.file=lwext4_node_file(node),.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
     result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any
          * uncertain journal state. An aborted create must not unlink by name. */
         if (lwext4_node_file(node)->mp && ext4_fclose(lwext4_node_file(node))!=EOK) {
             node->instance=&adapter->instance;
-            node->next=adapter->instance.cleanup_nodes;adapter->instance.cleanup_nodes=node;
+            kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap,node);
         return lwext4_error(result);
     }
@@ -1900,8 +1877,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     if (result) {
         if (ext4_fclose(lwext4_node_file(node)) != EOK) {
             node->instance = &adapter->instance;
-            node->next = adapter->instance.cleanup_nodes;
-            adapter->instance.cleanup_nodes = node;
+            kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap, node);
         return lwext4_error(result);
     }
@@ -1986,31 +1962,30 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
 }
 
 static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
-                         const char *path,
+                         uint64_t parent_inode, const char *path,
                          uint32_t mode)
 {
     struct lwext4_mount_adapter *adapter;
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
-        mount->private_data == 0 || path == 0 || path[0] != '/') {
+        mount->private_data == 0 || path == 0 || !parent_inode || parent_inode > UINT32_MAX) {
         return -KERNEL_EINVAL;
     }
     adapter = mount->private_data;
-    BACKEND_PATH(adapter, path);
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
 
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
-    struct namespace_create request={.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR};
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR};
     result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
     if (result != EOK) return lwext4_error(result);
     return 0;
 }
 
 static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
-                          const char *path)
+                          uint64_t parent_inode, const char *path)
 {
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_node *node;
@@ -2020,11 +1995,10 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
-        mount->private_data == 0 || path == 0 || path[0] != '/') {
+        mount->private_data == 0 || path == 0 || !parent_inode || parent_inode > UINT32_MAX) {
         return -KERNEL_EINVAL;
     }
     adapter = mount->private_data;
-    BACKEND_PATH(adapter, path);
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
@@ -2033,7 +2007,7 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
         return result;
     }
 
-    struct namespace_remove request={.path=path};
+    struct namespace_remove request={.mount=adapter->mount_point,.parent=parent_inode,.path=path};
     result=ext4_metadata_execute(adapter->mount_point,apply_namespace_remove,&request);
     inode=request.inode;is_orphan=request.orphan;
     if (result != EOK) {
@@ -2066,35 +2040,25 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
 }
 
 static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
-                         const char *path)
+                         uint64_t parent_inode, const char *path)
 {
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_node *node;
     struct lwext4_orphan *orphan = 0;
-    uint32_t mode = 0U;
     uint32_t inode = 0U;
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
-        mount->private_data == 0 || path == 0 || path[0] != '/') {
+        mount->private_data == 0 || path == 0 || !parent_inode || parent_inode > UINT32_MAX) {
         return -KERNEL_EINVAL;
     }
     adapter = mount->private_data;
-    BACKEND_PATH(adapter, path);
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
-    result = ext4_mode_get(path, &mode);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    if ((mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
-        return -KERNEL_ENOTDIR;
-    }
-
     result = reserve_orphan(adapter, &orphan);
     if (result != 0) return result;
-    struct namespace_remove request={.path=path,.directory=1};
+    struct namespace_remove request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.directory=1};
     result=ext4_metadata_execute(adapter->mount_point,apply_namespace_remove,&request);
     inode=request.inode;
     if (result != EOK) {
@@ -2138,8 +2102,10 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
     }
 
     if (node->instance != 0 && node->instance->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(node->instance->page_cache,
-                                                node);
+        /* Inode writer qualification has drained submitted backend I/O.
+         * Retire prepared snapshots through the same path as truncation;
+         * they observe retirement before obtaining the inode read side. */
+        kernel_page_cache_truncate(node->instance->page_cache, node, 0);
     }
 
     result = free_orphan_inode(lwext4_instance(node->instance), node->inode);
@@ -2191,16 +2157,14 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
     struct kernel_vfs_stat current;
     result = kernel_vfs_fstat(file, &current);
     if (result) return result;
-    node->size = current.size;
-    (*lwext4_node_file(node)).fsize = current.size;
-    file->size = current.size;
     *next_position = position;
-    if (position >= node->size) {
-        *next_position = node->size;
+    if (position >= current.size) {
+        *next_position = current.size;
         return 0;
     }
     start = position & ~UINT64_C(3);
     directory.f = (*lwext4_node_file(node));
+    directory.f.fsize = current.size;
     directory.next_off = start;
     for (;;) {
         result = ext4_dir_entry_next_status(&directory,
@@ -2210,7 +2174,7 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
             return lwext4_error(result);
         }
         if (entry_offset == UINT64_MAX) {
-            *next_position = node->size;
+            *next_position = current.size;
             return 0;
         }
         if (entry_offset < position) {
@@ -2229,8 +2193,8 @@ static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
         *inode = directory.de.inode;
         *type = dirent_type_from_ext4(directory.de.inode_type);
         *next_position = directory.next_off;
-        if (entry_offset >= node->size || *next_position <= entry_offset ||
-            *next_position > node->size ||
+        if (entry_offset >= current.size || *next_position <= entry_offset ||
+            *next_position > current.size ||
             *next_position == UINT64_MAX) {
             return -KERNEL_EIO;
         }
@@ -2448,22 +2412,24 @@ static int ext4_backend_sync_filesystem(struct kernel_vfs_instance *instance,
     if (result != EOK) kernel_vfs_record_writeback_error(root, lwext4_error(result));
     return lwext4_error(result);
 }
-static int ext4_backend_symlink(struct kernel_vfs_instance *instance, const char *target, const char *path)
+static int ext4_backend_symlink(struct kernel_vfs_instance *instance,
+    uint64_t parent_inode, const char *target, const char *name)
 {
+    if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
-    BACKEND_PATH(adapter, path);
-    struct namespace_symlink request={target,path};
-    return lwext4_error(ext4_metadata_execute(adapter->mount_point,apply_namespace_symlink,&request));
+    struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
+        .path=name, .target=target, .type=KERNEL_VFS_S_IFLNK, .mode=0777};
+    return lwext4_error(ext4_metadata_execute(adapter->mount_point, apply_namespace_create, &request));
 }
-static int ext4_backend_mknod(struct kernel_vfs_instance *instance, const char *path,
-    uint32_t type, uint32_t mode, uint32_t device)
+static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
+    uint64_t parent_inode, const char *name, uint32_t type, uint32_t mode, uint32_t device)
 {
+    if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
-    BACKEND_PATH(adapter, path);
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
-    struct namespace_create request={.path=path,.mode=mode&07777U,.type=type,.device=device};
-    int status=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
-    return lwext4_error(status);
+    struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
+        .path=name, .type=type, .mode=mode & 07777U, .device=device};
+    return lwext4_error(ext4_metadata_execute(adapter->mount_point, apply_namespace_create, &request));
 }
 static int ext4_backend_rename(struct kernel_vfs_instance *instance,
     uint64_t old_parent, const char *old_name, uint64_t new_parent,
@@ -2499,6 +2465,7 @@ static void initialize_backend(void)
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
     ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->file_metadata_execution = KERNEL_VFS_EXECUTION_CALLER;
+    ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;

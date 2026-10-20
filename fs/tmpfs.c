@@ -129,26 +129,7 @@ static int resolve(struct tmp_mount *m, const char *path, struct tmp_inode **out
     }
     *out = i; return 0;
 }
-static int parent_name(struct tmp_mount *m, const char *path, struct tmp_inode **parent,
-                       const char **name, size_t *len)
-{
-    if (!path || path[0] != '/') return -KERNEL_EINVAL;
-    struct tmp_inode *i = inode(m, 1);
-    while (*path == '/') path++;
-    for (;;) {
-        const char *end = path;
-        while (*end && *end != '/') end++;
-        size_t n = (size_t)(end - path);
-        if (!n || n > 255) return n ? -KERNEL_ENAMETOOLONG : -KERNEL_EINVAL;
-        const char *next = end;
-        while (*next == '/') next++;
-        if (!*next) { *parent = i; *name = path; *len = n; return 0; }
-        struct tmp_entry *e = entry(i, path, n);
-        if (!e) return -KERNEL_ENOENT;
-        if ((e->inode->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-        i = e->inode; path = next;
-    }
-}
+
 static int allocate_entry(struct tmp_mount *m, struct tmp_inode *parent,
                           const char *name, size_t n, struct tmp_entry **out)
 {
@@ -177,7 +158,7 @@ static void remove_entry(struct tmp_mount *m, struct tmp_entry *e)
     parent->size -= TMPFS_DIRENT_SIZE;
     dispose(m, e);
 }
-static int create_path(struct tmp_mount *m, const char *path, uint32_t mode,
+static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *path, uint32_t mode,
                         const char *target, struct tmp_entry **out)
 {
     if (m->instance.read_only) return -KERNEL_EROFS;
@@ -185,8 +166,11 @@ static int create_path(struct tmp_mount *m, const char *path, uint32_t mode,
     struct tmp_inode *parent, *i = 0;
     struct tmp_entry *e = 0;
     const char *name; size_t n;
-    int r = parent_name(m, path, &parent, &name, &n);
-    if (r) return r;
+    parent = inode(m, parent_inode);
+    if (!parent || !parent->links) return -KERNEL_ENOENT;
+    if ((parent->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
+    name = path; n = strlen(name);
+    int r = 0;
     if (entry(parent, name, n)) return -KERNEL_EEXIST;
     r = allocate_entry(m, parent, name, n, &e);
     if (r) return r;
@@ -280,11 +264,11 @@ static int close_node(struct kernel_vfs_node *n)
     if (!i->handles) __builtin_trap();
     i->handles--; collect_inode(m, i); return 0;
 }
-static int create(struct kernel_vfs_mount *mount, const char *path, uint32_t mode,
+static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode,
                    struct kernel_vfs_file *file)
 {
     struct tmp_mount *m = tm(mount->private_data); struct tmp_entry *e;
-    int r = create_path(m, path, KERNEL_VFS_S_IFREG | (mode & 07777), 0, &e);
+    int r = create_child(m, parent_inode, path, KERNEL_VFS_S_IFREG | (mode & 07777), 0, &e);
     if (r) return r;
     struct tmp_inode *i = e->inode;
     r = open_inode(mount, 0, i->number, i->mode, file);
@@ -293,17 +277,17 @@ static int create(struct kernel_vfs_mount *mount, const char *path, uint32_t mod
     }
     return r;
 }
-static int mkdir(struct kernel_vfs_mount *mount, const char *path, uint32_t mode)
-{ return create_path(tm(mount->private_data), path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, 0); }
-static int symlink(struct kernel_vfs_instance *instance, const char *target, const char *path)
-{ return create_path(tm(instance), path, KERNEL_VFS_S_IFLNK | 0777, target, 0); }
-static int mknod_node(struct kernel_vfs_instance *instance, const char *path,
+static int mkdir(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode)
+{ return create_child(tm(mount->private_data), parent_inode, path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, 0); }
+static int symlink(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path)
+{ return create_child(tm(instance), parent_inode, path, KERNEL_VFS_S_IFLNK | 0777, target, 0); }
+static int mknod_node(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
     uint32_t type, uint32_t mode, uint32_t device)
 {
     if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO &&
         type != KERNEL_VFS_S_IFCHR && type != KERNEL_VFS_S_IFBLK) return -KERNEL_ENOTSUP;
     struct tmp_entry *created = 0;
-    int result = create_path(tm(instance), path, type | (mode & 07777), 0, &created);
+    int result = create_child(tm(instance), parent_inode, path, type | (mode & 07777), 0, &created);
     if (!result && (type == KERNEL_VFS_S_IFCHR || type == KERNEL_VFS_S_IFBLK))
         created->inode->rdev = device;
     return result;
@@ -324,17 +308,20 @@ static void unlink_inode(struct tmp_mount *m, struct tmp_inode *i)
     i->ctime = now();
     if (!i->links) {
         uintptr_t irq = arch_interrupt_save();
+        KERNEL_TASK_LOCK_SCOPE(vfs_state, &kernel_vfs_state_lock);
         struct kernel_vfs_node *node = kernel_vfs_node_find(&m->instance, i->number);
         if (node) node->unlinked = 1;
         arch_interrupt_restore(irq);
     }
     collect_inode(m, i);
 }
-static int remove_path(struct kernel_vfs_mount *mount, const char *path, int directory)
+static int remove_path(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, int directory)
 {
     struct tmp_mount *m = tm(mount->private_data); struct tmp_inode *parent;
     const char *name; size_t n;
-    int r = parent_name(m, path, &parent, &name, &n); if (r) return r;
+    parent = inode(m, parent_inode);
+    if (!parent || !parent->links) return -KERNEL_ENOENT;
+    name = path; n = strlen(name);
     struct tmp_entry *e = entry(parent, name, n); if (!e) return -KERNEL_ENOENT;
     struct tmp_inode *i = e->inode;
     int isdir = (i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
@@ -343,8 +330,8 @@ static int remove_path(struct kernel_vfs_mount *mount, const char *path, int dir
     remove_entry(m, e); if (isdir) parent->links--;
     parent->ctime = parent->mtime = now(); unlink_inode(m, i); return 0;
 }
-static int unlink_file(struct kernel_vfs_mount *m, const char *p) { return remove_path(m,p,0); }
-static int rmdir(struct kernel_vfs_mount *m, const char *p) { return remove_path(m,p,1); }
+static int unlink_file(struct kernel_vfs_mount *m, uint64_t parent_inode, const char *p) { return remove_path(m,parent_inode,p,0); }
+static int rmdir(struct kernel_vfs_mount *m, uint64_t parent_inode, const char *p) { return remove_path(m,parent_inode,p,1); }
 static void release_unlinked(struct kernel_vfs_node *n)
 {
     KERNEL_LOCK_SCOPE(guard);
@@ -553,7 +540,7 @@ static int no_writeback(struct kernel_vfs_instance *i) { (void)i; return 0; }
 static int unmount(struct kernel_vfs_mount *mount)
 {
     struct tmp_mount *m=tm(mount->private_data);
-    if(mount->covered_path || mount->root_path || mount->child_mounts || m->instance.external_files || m->instance.nodes) return -KERNEL_EBUSY;
+    if(mount->covered_path || mount->root_path || mount->child_mounts || m->instance.external_files || !kernel_vfs_nodes_idle(&m->instance, NULL)) return -KERNEL_EBUSY;
     struct tmp_inode *parent;
     RB_FOREACH(parent, tmp_inode_tree, &m->inodes) {
         struct tmp_entry *e;

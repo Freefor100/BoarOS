@@ -989,13 +989,14 @@ static void run_cwd_operations(struct kernel_files *files,
         fail_files(543U, 0, result);
     expect_open(files, fs, mm, TEST_AT_FDCWD, ".", TEST_O_DIRECTORY, 0, 544U);
     expect_open(files, fs, mm, 0, "../data", 0U, 1, 545U);
+    KERNEL_FS_PATHS(paths, fs);
     if (kernel_files_close(files, 1, &result) != KERNEL_FILES_STATUS_OK || result ||
         kernel_files_getcwd(files, fs, mm, TEST_USER_BUFFER, 1, &result) !=
             KERNEL_FILES_STATUS_OK || result != -KERNEL_ERANGE ||
         kernel_files_fchdir(files, &copied, 0, &result) != KERNEL_FILES_STATUS_OK || result ||
         kernel_files_getcwd(files, &copied, mm, TEST_USER_BUFFER, sizeof(cwd), &result) !=
             KERNEL_FILES_STATUS_OK || result != 12 ||
-        kernel_fs_context_set_cwd(fs, kernel_fs_context_root(fs)) ||
+        kernel_fs_context_set_cwd(fs, paths.root) ||
         kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK || result ||
         kernel_fs_context_release(&copied) != KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_fs_context_release(&shared) != KERNEL_FS_CONTEXT_STATUS_OK)
@@ -3730,7 +3731,7 @@ static void run_partial_write_test(const void *dtb)
         fail_readv_allocation || kernel_files_syncfs(&files, 0, &result) != KERNEL_FILES_STATUS_OK || result)
         fail_files(324U, 0, result);
     fail_readv_allocation = 1U;
-    kernel_vfs_sync_all(kernel_fs_context_root(&fs));
+    { KERNEL_FS_PATHS(paths, &fs); kernel_vfs_sync_all(paths.root); }
     if (fail_readv_allocation || kernel_files_syncfs(&files, 0, &result) != KERNEL_FILES_STATUS_OK || result)
         fail_files(325U, 0, result);
 #endif

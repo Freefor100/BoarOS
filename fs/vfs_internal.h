@@ -6,6 +6,10 @@
 #include <kernel/cost.h>
 #include <stddef.h>
 #include <kernel/sync.h>
+#include <kernel/raw_lock.h>
+
+/* Weak identities, mount edges and FS context publication; no I/O or callbacks. */
+extern struct kernel_raw_lock kernel_vfs_state_lock;
 #include <stdint.h>
 
 struct kernel_vfs_file;
@@ -39,14 +43,18 @@ struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(
     const struct kernel_vfs_file *file);
+int kernel_vfs_namespace_requires_cpu0(const struct kernel_vfs_mount *);
 int kernel_vfs_file_metadata_requires_cpu0(const struct kernel_vfs_file *file);
 uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file);
 struct kernel_record_lock_state *kernel_vfs_node_record_locks(
     struct kernel_vfs_node *node);
 
-/* Borrow with IRQs disabled; pin before restoring IRQs unless a live owner
- * already covers the target. Namespace locking alone does not exclude reclaim. */
+/* Borrow under kernel_vfs_state_lock; pin before dropping the protection. */
 struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t inode);
+struct kernel_vfs_node *kernel_vfs_node_pin(struct kernel_vfs_instance *, uint64_t inode);
+void kernel_vfs_cleanup_node(struct kernel_vfs_node *);
+/* Terminal node snapshot; includes final releases already removed from the index. */
+int kernel_vfs_nodes_idle(struct kernel_vfs_instance *, struct kernel_vfs_node *root);
 
 #define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX
 /* Caller owns a live node/read gate and at most KERNEL_VFS_READ_BATCH_MAX

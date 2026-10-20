@@ -15,6 +15,9 @@ int __wrap_ext4_transaction_begin(const char *mount)
 int __real_ext4_fopen2(ext4_file *,const char *,int);
 int __wrap_ext4_fopen2(ext4_file *file,const char *path,int flags)
 { if(metadata_probe)metadata_open_calls++;int r=__real_ext4_fopen2(file,path,flags);if(metadata_probe && r)metadata_failed_stage=2;return r; }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *);
+int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file)
+{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file);if(metadata_probe && r)metadata_failed_stage=2;return r; }
 int __real_ext4_file_set_mode_initial(ext4_file *,uint32_t);
 int __wrap_ext4_file_set_mode_initial(ext4_file *file,uint32_t mode)
 { int r=__real_ext4_file_set_mode_initial(file,mode);if(metadata_probe && r)metadata_failed_stage=3;return r; }
@@ -81,6 +84,15 @@ static int create_file(struct kernel_vfs_mount *mount,const char *name,uint32_t 
 {
     struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
     if (adapter->device.fs->jbd_journal) return kernel_vfs_create(mount,name,mode,file);
+    struct kernel_vfs_path *root=NULL;
+    assert(!kernel_vfs_path_root(mount,adapter->instance.heap, &root));
+    const uint32_t types[]={KERNEL_VFS_S_IFREG,KERNEL_VFS_S_IFIFO,KERNEL_VFS_S_IFCHR};
+    for (unsigned i=0;i<sizeof(types)/sizeof(types[0]);i++) {
+        assert(kernel_vfs_mknod_at(root,root,"/nojournal-denied",types[i]|0600,0)==-KERNEL_EOPNOTSUPP);
+        struct kernel_vfs_file missing={0};
+        assert(kernel_vfs_open(mount,"/nojournal-denied",&missing)==-KERNEL_ENOENT);
+    }
+    assert(!kernel_vfs_path_release(&root));
     /* Namespace create+chmod needs an atomic journal group in the VFS backend.
      * Seed nojournal fixtures through the library, then exercise real VFS I/O. */
     char path[96]; snprintf(path,sizeof(path),"%s%s",adapter->mount_point,name+1);
@@ -713,6 +725,51 @@ static void active_writeback(struct kernel_vfs_mount *mount)
     free(expected); assert(!kernel_vfs_close(&file));
     puts("PASS active writeback: handshake waits for old I/O, then punched mappings stay absent and outside bytes survive");
 }
+struct orphan_writeback { struct kernel_page_cache *cache; struct kernel_vfs_node *node; uint64_t length; };
+static unsigned orphan_close_done;
+static void *orphan_writeback(void *argument)
+{
+    struct orphan_writeback *request=argument;
+    cache_test_attach(0);
+    assert(!kernel_page_cache_writeback_range(request->cache,request->node,0,request->length));
+    assert(!kernel_vfs_node_release(&request->node));
+    return NULL;
+}
+static void *orphan_last_close(void *argument)
+{
+    cache_test_attach(2);
+    assert(!kernel_vfs_close(argument));
+    __atomic_store_n(&orphan_close_done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void unlink_during_writeback(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_file file={0};size_t done;
+    assert(!create_file(mount,"/unlink-active",0600,&file));
+    unsigned char bytes[4096];memset(bytes,0x76,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    assert(!kernel_vfs_unlink(mount,"/unlink-active"));
+    struct orphan_writeback request={cache,kernel_vfs_file_node(&file),sizeof(bytes)};
+    assert(!kernel_vfs_node_acquire(request.node));
+    pause_write=1;write_entered=resume_write=orphan_close_done=0;
+    pthread_t writer,closer;
+    assert(!pthread_create(&writer,NULL,orphan_writeback,&request));
+    wait_progress(&write_entered,1);
+    unsigned parked=mm_test_parked(2);
+    assert(!pthread_create(&closer,NULL,orphan_last_close,&file));
+    while (mm_test_parked(2)==parked) sched_yield();
+    assert(!__atomic_load_n(&orphan_close_done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(writer,NULL) && !pthread_join(closer,NULL));
+    assert(orphan_close_done && !request.node);
+    cache_test_attach(0);
+    assert(!create_file(mount,"/unlink-active",0600,&file));
+    memset(bytes,0x29,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t error=0;assert(!kernel_vfs_sync(&file,0,&error));expect_bytes(&file,bytes,sizeof(bytes));
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unlink(mount,"/unlink-active"));
+    puts("PASS unlink/final CPU1 close waits for old writeback, retires snapshots and preserves reused inode data");
+}
 #ifdef CACHE_MM_CASES
 static unsigned prepare_pause,prepare_entered,prepare_resume;
 static int replaced_prepare_error;
@@ -947,6 +1004,7 @@ int main(int argc,char **argv)
     if (lwext4_instance(mount.private_data)->device.fs->jbd_journal) rollback_ranges(&mount);
     else nonjournal_failure(&mount);
     active_writeback(&mount);
+    if (lwext4_instance(mount.private_data)->device.fs->jbd_journal) unlink_during_writeback(&cache,&mount);
 #ifdef CACHE_MM_CASES
     mmap_ranges(&cache,&heap,&pages,&mount);
 #endif

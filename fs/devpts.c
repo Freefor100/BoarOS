@@ -209,6 +209,7 @@ void kernel_devpts_unpublish(struct kernel_devpts_entry *entry)
         struct devpts_mount *m = entry->mount;
         m->root.stat.mtime = m->root.stat.ctime = time;
         /* 下线只改变目录可见性；旧 inode 可继续 stat/chmod，但不会重新绑定。 */
+        KERNEL_TASK_LOCK_SCOPE(vfs_state, &kernel_vfs_state_lock);
         struct kernel_vfs_node *node = kernel_vfs_node_find(&m->instance, entry->stat.ino);
         if (node && node->backend_data == entry) node->unlinked = 1;
     }
@@ -268,28 +269,33 @@ void kernel_devpts_mount_set_private(struct kernel_vfs_mount *mount, void *priva
 static int no_error(struct kernel_vfs_instance *instance) { (void)instance; return 0; }
 /* Fixed Linux simple_dir_inode_operations has no namespace mutation methods.
  * namei.c returns EACCES for create and EPERM for the remaining operations. */
-static int denied_create(struct kernel_vfs_mount *mount, const char *path,
+static int denied_create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path,
     uint32_t mode, struct kernel_vfs_file *file)
 {
+    (void)parent_inode;
     (void)path; (void)mode; (void)file;
     return devpts(mount)->instance.read_only ? -KERNEL_EROFS : -KERNEL_EACCES;
 }
-static int denied_path(struct kernel_vfs_mount *mount, const char *path)
+static int denied_path(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path)
 {
+    (void)parent_inode;
     (void)path;
     return devpts(mount)->instance.read_only ? -KERNEL_EROFS : -KERNEL_EPERM;
 }
-static int denied_mkdir(struct kernel_vfs_mount *mount, const char *path, uint32_t mode)
-{ (void)mode; return denied_path(mount, path); }
-static int denied_symlink(struct kernel_vfs_instance *instance,
-    const char *target, const char *path)
+static int denied_mkdir(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode)
 {
+    (void)parent_inode; (void)mode; return denied_path(mount, parent_inode, path); }
+static int denied_symlink(struct kernel_vfs_instance *instance,
+    uint64_t parent_inode, const char *target, const char *path)
+{
+    (void)parent_inode;
     (void)target; (void)path;
     return instance->read_only ? -KERNEL_EROFS : -KERNEL_EPERM;
 }
-static int denied_mknod(struct kernel_vfs_instance *instance, const char *path,
+static int denied_mknod(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
     uint32_t type, uint32_t mode, uint32_t device)
 {
+    (void)parent_inode;
     (void)path; (void)mode; (void)device;
     return instance->read_only ? -KERNEL_EROFS :
         type == KERNEL_VFS_S_IFREG ? -KERNEL_EACCES : -KERNEL_EPERM;
@@ -486,7 +492,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 {
     struct devpts_mount *m = devpts(mount);
     if (mount->covered_path || mount->root_path || mount->child_mounts ||
-        m->instance.external_files || m->instance.nodes || m->instance.cleanup_nodes ||
+        m->instance.external_files || !kernel_vfs_nodes_idle(&m->instance, NULL) || m->instance.cleanup_nodes ||
         m->instance.paths || m->entries || m->reserved_numbers ||
         m->root.references || m->ptmx.references) return -KERNEL_EBUSY;
     int result = prepare_unmount(mount);

@@ -205,6 +205,7 @@ static void cleanup_worker(void *unused)
 static int prepare_init(void)
 {
     if(kernel_fs_context_create(&root.fs,&root.mount,&root.heap)!=KERNEL_FS_CONTEXT_STATUS_OK) return -KERNEL_ENOMEM;
+    KERNEL_FS_PATHS(paths, &root.fs);
     int error=0; enum kernel_open_file_status opened=kernel_open_file_create_executable(&root.heap,&root.mount,init_path,&root.file,&error);
     if(opened!=KERNEL_OPEN_FILE_STATUS_OK) return opened==KERNEL_OPEN_FILE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     if(error) return error;
@@ -213,8 +214,8 @@ static int prepare_init(void)
         source==KERNEL_ELF64_SOURCE_STATUS_IO ? -KERNEL_EIO : -KERNEL_ENOEXEC;
     const char *interpreter=kernel_elf64_source_interpreter(root.source,0);
     if(interpreter) {
-        opened=kernel_open_file_create_at(&root.heap,kernel_fs_context_cwd(&root.fs),
-            kernel_fs_context_root(&root.fs),interpreter,KERNEL_OPEN_PATH_EXECUTABLE,0,
+        opened=kernel_open_file_create_at(&root.heap,paths.cwd,
+            paths.root,interpreter,KERNEL_OPEN_PATH_EXECUTABLE,0,
             &root.interpreter_file,&error);
         if(opened!=KERNEL_OPEN_FILE_STATUS_OK)return opened==KERNEL_OPEN_FILE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
         if(error)return error;
@@ -232,7 +233,7 @@ static int prepare_init(void)
     if(image!=KERNEL_EXEC_IMAGE_STATUS_OK) return result ? (int)result : -KERNEL_EIO;
     if(kernel_files_create(&root.files,&root.heap)!=KERNEL_FILES_STATUS_OK) return -KERNEL_ENOMEM;
     for(unsigned i=0;i<3;i++) {
-        if(kernel_files_open_boot_console(&root.files,kernel_fs_context_root(&root.fs),i,&result)!=KERNEL_FILES_STATUS_OK) return -KERNEL_ENOMEM;
+        if(kernel_files_open_boot_console(&root.files,paths.root,i,&result)!=KERNEL_FILES_STATUS_OK) return -KERNEL_ENOMEM;
         if(result) return (int)result;
     }
     return 0;

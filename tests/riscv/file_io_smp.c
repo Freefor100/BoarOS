@@ -5,6 +5,7 @@
 #include <kernel/errno.h>
 #include <kernel/irq.h>
 #include <kernel/files.h>
+#include <kernel/fs_context.h>
 #include <kernel/mm_backend.h>
 #include <kernel/open_file.h>
 #include <kernel/uaccess.h>
@@ -55,6 +56,29 @@ int __wrap_ext4_fallocate(ext4_file *file,unsigned mode,uint64_t offset,uint64_t
 int __real_ext4_file_sync_metadata_prepare(ext4_file *,bool,uint64_t *);
 int __wrap_ext4_file_sync_metadata_prepare(ext4_file *file,bool data_only,uint64_t *target)
 { observe_metadata(file,3); return __real_ext4_file_sync_metadata_prepare(file,data_only,target); }
+static unsigned watch_namespace, namespace_calls[5];
+static struct kernel_io_context *namespace_owner;
+static void observe_namespace(unsigned kind)
+{
+    if (!watch_namespace || kernel_io_context_current()!=namespace_owner) return;
+    if (kernel_cpu_current()->logical_id!=copy_cpu) riscv_smp_fail("namespace-left-caller",kind);
+    namespace_calls[kind]++;
+}
+int __real_ext4_lookup_child(const char *,uint32_t,const char *,uint32_t,uint32_t *,uint32_t *);
+int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,uint32_t length,uint32_t *ino,uint32_t *mode)
+{ observe_namespace(0);return __real_ext4_lookup_child(mount,parent,name,length,ino,mode); }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *);
+int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file)
+{ observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file); }
+int __real_ext4_unlink_child(const char *,uint32_t,const char *,bool,uint32_t *,bool *);
+int __wrap_ext4_unlink_child(const char *mount,uint32_t parent,const char *name,bool dir,uint32_t *ino,bool *orphan)
+{ observe_namespace(2);return __real_ext4_unlink_child(mount,parent,name,dir,ino,orphan); }
+int __real_ext4_rename_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,uint32_t,unsigned,struct ext4_rename_result *);
+int __wrap_ext4_rename_child(const char *mount,uint32_t a,const char *an,uint32_t al,uint32_t b,const char *bn,uint32_t bl,unsigned flags,struct ext4_rename_result *out)
+{ observe_namespace(3);return __real_ext4_rename_child(mount,a,an,al,b,bn,bl,flags,out); }
+int __real_ext4_dir_entry_next_status(ext4_dir *,ext4_direntry *,uint64_t *);
+int __wrap_ext4_dir_entry_next_status(ext4_dir *dir,ext4_direntry *entry,uint64_t *offset)
+{ observe_namespace(4);return __real_ext4_dir_entry_next_status(dir,entry,offset); }
 static struct kernel_block_device *raw_device;
 static struct virtio_split_queue *raw_queue;
 static unsigned raw_read_active,raw_read_cpu,raw_submissions;
@@ -181,6 +205,47 @@ static void overlap(void *unused)
             scheduler.init_task->state!=KERNEL_THREAD_STATE_GROUP_DEAD)
             __atomic_fetch_add(&user_overlap,1,__ATOMIC_RELAXED);
     }
+}
+static void namespace_work(struct kernel_mm *mm,struct kernel_files *files)
+{
+    struct kernel_fs_context fs={0};
+    check(!kernel_fs_context_create(&fs,control->file.mount,cache->heap),"namespace-fs-create");
+    namespace_owner=kernel_io_context_current();watch_namespace=1;
+    struct kernel_page_cache_concurrency_state before,after;
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    const char names[]="/caller-namespace\0/caller-namespace/file\0/caller-namespace/renamed\0";
+    size_t copied;int64_t result;
+    check(!kernel_copy_to_user(mm,IO_ANON,names,sizeof(names),&copied) && copied==sizeof(names),"namespace-user-names");
+    uint64_t old=IO_ANON+sizeof("/caller-namespace"),next=old+sizeof("/caller-namespace/file");
+    check(!kernel_files_mkdirat(files,&fs,mm,-100,IO_ANON,0750,&result) && !result,"namespace-mkdir");
+    check(!kernel_files_openat(files,&fs,mm,-100,old,0102,0640,&result) && result==2,"namespace-create-open");
+    check(!kernel_files_fstat(files,mm,2,IO_ANON+512,&result) && !result,"namespace-stat");
+    check(!kernel_files_close(files,2,&result) && !result,"namespace-final-file-close");
+    check(!kernel_files_renameat(files,&fs,mm,-100,old,-100,next,0,&result) && !result,"namespace-rename");
+    check(!kernel_files_openat(files,&fs,mm,-100,IO_ANON,00200000,0,&result) && result==2,"namespace-directory-open");
+    check(!kernel_files_getdents(files,mm,2,IO_ANON+512,512,&result) && result>0,"namespace-getdents");
+    check(!kernel_files_fchdir(files,&fs,2,&result) && !result,"namespace-fchdir");
+    check(!kernel_files_getcwd(files,&fs,mm,IO_ANON+512,128,&result) && result==sizeof("/caller-namespace"),"namespace-getcwd");
+    check(!kernel_files_sync(files,2,0,&result) && !result,"namespace-directory-fsync");
+    check(!kernel_files_close(files,2,&result) && !result,"namespace-final-directory-close");
+    check(!kernel_files_unlinkat(files,&fs,mm,-100,next,0,&result) && !result,"namespace-unlink");
+    check(!kernel_fs_context_release(&fs),"namespace-fs-release");
+    struct kernel_vfs_path *root=NULL;
+    check(!kernel_vfs_path_root(control->file.mount,cache->heap,&root) &&
+        !kernel_vfs_unlink_at(root,root,"/caller-namespace",1) && !kernel_vfs_path_release(&root),"namespace-rmdir-final-path");
+    watch_namespace=0;
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    check(before.executions_queued==after.executions_queued,"namespace-no-cpu0-handoff");
+    for (unsigned i=0;i<5;i++) check(namespace_calls[i]>0,"namespace-complete-caller-path");
+    virt_uart_puts("BoarOS: NAMESPACE caller lookup/create/unlink/rename/readdir hart=");virt_uart_put_hex(copy_cpu);virt_uart_putc('\n');
+    /* Crossing to tmpfs chooses its service CPU before path metadata locks. */
+    struct kernel_vfs_statfs space;
+    check(!kernel_vfs_mount_statfs(memory_control->file.mount,&space),"namespace-tmpfs-statfs-domain");
+    check(!kernel_vfs_path_root(memory_control->file.mount,cache->heap,&root),"namespace-tmpfs-root");
+    struct kernel_vfs_path *memory_path=NULL;
+    check(!kernel_vfs_path_lookup(root,"memory-io",9,&memory_path) &&
+          !kernel_vfs_path_truncate(memory_path,0,NULL),"namespace-tmpfs-path-truncate-domain");
+    check(!kernel_vfs_path_release(&memory_path) && !kernel_vfs_path_release(&root),"namespace-tmpfs-path-owners");
 }
 static void verify(void *unused)
 {
@@ -323,6 +388,10 @@ static void verify(void *unused)
     check(!kernel_files_pread(files,mm,0,IO_ANON+128,4,32,&result) && result==4 &&
         !kernel_copy_from_user(mm,prefix,IO_ANON+128,4,&copied) && copied==4 &&
         !memcmp(prefix,"IO\0\0",4),"file-io-prefix-file-content");
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    check(!kernel_files_fstat(files,mm,0,IO_ANON+768,&result) && !result,"file-io-caller-fstat");
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    check(before.executions_queued==after.executions_queued,"file-io-fstat-no-cpu0-handoff");
     metadata_owner = kernel_io_context_current(); watch_metadata = 1;
     check(!kernel_files_pwrite(files,mm,0,IO_ANON+128,4,4*BOAROS_PAGE_SIZE+37,&result) && result==4,
         "file-io-caller-growth");
@@ -360,8 +429,7 @@ static void verify(void *unused)
         !kernel_files_lseek(files,1,0,1,&result) && result==4,"file-io-local-tmpfs-offset");
     check(!kernel_files_ftruncate(files,1,0,&result) && !result && !kernel_open_file_size(memory_control),
         "file-io-tmpfs-truncate-common-path");
-    /* 命名空间/网络不由这个绑定文件任务执行；创建时检查实际消费者，
-     * 不再用FD表的资格标记模拟另一套业务语义。 */
+    namespace_work(mm,files);
 }
 void riscv_file_io_prepare(struct kernel_heap *heap,struct kernel_mm *mm,unsigned count,
     struct kernel_open_file_description *source,struct kernel_page_cache *page_cache)

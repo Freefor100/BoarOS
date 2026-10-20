@@ -10,7 +10,7 @@
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
 - pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有16个片段槽、按需分配的单页后备、端点引用和等待队列。metadata raw 保护 ring、端点、代次与 readiness；用户复制、缺页和通知在 raw 外执行。关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格。核心分别返回接纳前缀和断端事实，SIGPIPE/重启由真实用户调用层处理。受控任务创建仍检查当前支持的消费者；这项检查不切换 pipe 同步方式；复制资格与页归还规则见下文 [pipe2](#pipe2-与-fifo-endpoint)。
 - socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
-- `kernel_fs_context` 的 umask 以原子交换返回前值，读取与 fork 快照使用原子读取；root/cwd 的命名空间修改仍在 CPU0。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
+- `kernel_fs_context` 在共同 VFS 状态短保护下读取和交换 umask，并为使用者生成带独立引用的 root/cwd 快照；cwd 替换、记录共享、移动和退出使用同一保护。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
 用它把文件生命周期从 fd 槽中分离：映射成功后 MM 消耗该引用，之后即使所有 fd 都关闭，
@@ -31,13 +31,13 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW；未支持的 DIRECT/NOATIME 仍返回 EINVAL。FD_CLOEXEC 仍属于各张表。
 普通与受控 FD 表共同使用这些保护和引用规则，不再封存 OFD、pipe 或表的并发资格。`kernel_files_check_task_domain()` 在受控任务创建时检查当前实际消费者和资源绑定；它不改变对象状态，也不要求额外保留 CPU0 控制引用来规避末次释放。
 
-普通 `read/pread/readv/preadv` 与 `write/pwrite/writev/pwritev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选，把实际缺失批次交给既有 CPU0 worker。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
+普通 `read/pread/readv/preadv` 与 `write/pwrite/writev/pwritev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选；ext4 由调用者完成缺失批次装入，其他磁盘后端沿其 CPU0 策略。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
 
-共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写先在用户来源 pin 前经 CPU0 准备真实空间，归还该步骤的 inode writer 后才解析来源；空间接纳与 legacy 格式的完成职责见 [VFS/ext4](vfs-ext4.md#文件节点与页缓存)。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
+共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写先在用户来源 pin 前按后端策略准备真实空间，ext4 在发起 CPU 完成，归还该步骤的 inode writer 后才解析来源；空间接纳与 legacy 格式的完成职责见 [VFS/ext4](vfs-ext4.md#文件节点与页缓存)。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
 
-请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。最后缓存 OFD 的后端释放交给同一 worker，普通用户 pipe 的最后关闭在 CPU0 发布端点变化，因为另一端可以登记 epoll 回调。受控内核 pipe 的普通等待者已在任务创建时限定，不把端点 EOF 推迟到退出清理。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
+请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。普通 ext4 文件、目录与 O_PATH 的最后关闭在发起 CPU 结束；缓存退休清理继续由既有 worker 推进。普通用户 pipe 的最后关闭在 CPU0 发布端点变化，因为另一端可以登记 epoll 回调。受控内核 pipe 的普通等待者已在任务创建时限定，不把端点 EOF 推迟到退出清理。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
 
-命名空间、目录、设备和网络操作在实际业务入口进入 CPU0 范围，嵌套调用只由最外层迁移和恢复。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
+ext4 路径查找、目录操作与文件元数据在发起 CPU 执行；VFS 在实际解析出的后端选择执行位置。设备、管道、proc 等对象在取得锁和用户页借用前进入所需的 CPU0 范围，嵌套调用借用同一执行资格。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
 
 `make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持 pin 拒绝及最终引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
 host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。独立 fsync 与范围同步分别停在实际 CPU0 执行入口后，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步排队后只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。

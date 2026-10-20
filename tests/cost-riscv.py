@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_scheduler, validate_resume_selection
+from cost_report import validate_metadata_fixed
 from cost_seed import replica_seed, seed_arguments, validate_resume_seed
 from cost_fixture import FrozenFixture, validate_resume_fixture
 from cost_measurement import acquire_measurement_lock
@@ -39,12 +40,15 @@ def main():
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture',help='official hardware: fixed RAM/hart, default VirtIO, net/RTC, no RNG')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--fixture-cache',type=Path,help='freeze and reuse preboot images for allocator/latency/locking/scheduler')
+    parser.add_argument('--metadata-fixed-only',action='store_true',help='fixed namespace work, no original consumers')
+    parser.add_argument('--cpus',type=int,choices=(1,2),default=1)
+    parser.add_argument('--ram',choices=('512M','1G'),default='512M')
     parser.add_argument('--metadata-core-only',action='store_true',help='accept only fixed metadata/lmbench measurements from a frozen coordinator; retain failed extra consumer attempts explicitly')
     parser.add_argument('--two-disks',action='store_true')
     parser.add_argument('--off',action='store_true',help='run identical ELF with diagnostics disabled')
     parser.add_argument('--transport',choices=('legacy','modern'),default='modern')
     parser.add_argument('--cache',choices=('writeback','writethrough'),default='writeback')
-    parser.add_argument('--replicas',type=int,choices=(1,3),default=3,help='1 is a pilot, never a complete baseline')
+    parser.add_argument('--replicas',type=int,choices=(1,3,5),default=3,help='1 is a pilot, never a complete baseline')
     parser.add_argument('--consumer-timeout-ms',type=int,default=180000,
                         help='explicit per-command guest budget, 1000..3600000 ms; completion checks remain mandatory')
     parser.add_argument('--consumer-commands',default='all',help='all or comma-separated libc:index (0..7); partial selection is targeted attribution')
@@ -57,7 +61,11 @@ def main():
     except ValueError as error: parser.error(str(error))
     if args.qemu_seed is not None and args.platform_config=='official':
         parser.error('paired QEMU seed applies only to fixture measurements')
-    if args.fixture_cache and (args.case not in ('allocator','latency','locking','scheduler') or
+    if args.metadata_fixed_only and (args.case!='metadata' or args.metadata_core_only or args.platform_config!='fixture'):
+        parser.error('fixed metadata requires metadata fixture mode')
+    if args.cpus!=1 and not args.metadata_fixed_only:
+        parser.error('two CPUs currently require fixed metadata mode')
+    if args.fixture_cache and (args.case not in ('allocator','latency','locking','scheduler') and not args.metadata_fixed_only or
             args.two_disks or args.linux or args.platform_config!='fixture'):
         parser.error('frozen fixture requires one supported single-disk BoarOS fixture case')
     names=[f'consumer-{libc}-{i}' for libc in ('musl','glibc') for i in range(8)]
@@ -88,13 +96,14 @@ def main():
     work=args.resume_from.resolve() if args.resume_from else args.output or Path(tempfile.mkdtemp(prefix='cost-run.',dir=ROOT/'build'))
     if not work.exists():work.mkdir(parents=True)
     elif args.output and not args.resume_from and any(work.iterdir()):parser.error("output directory is not empty")
-    identity={'tree':subprocess.check_output(['git','write-tree'],cwd=ROOT,text=True).strip(),
+    identity={'tree':subprocess.check_output(['git','rev-parse','HEAD^{tree}'],cwd=ROOT,text=True).strip(),
         'base':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         'source_sha256':hashlib.sha256(b''.join(p.encode()+b'\0'+digest(ROOT/p).encode()+b'\n' for p in sorted(subprocess.check_output(['git','ls-files','-co','--exclude-standard'],cwd=ROOT,text=True).splitlines()) if '__pycache__' not in Path(p).parts)).hexdigest(),
         'diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=ROOT)).hexdigest(),
         'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
         'qemu_sha256':digest(shutil.which(args.qemu)), 'cost_diagnostics':0 if args.off else 1,
-        'replicas':args.replicas,'acceptance':args.replicas==3,'transport':args.transport,'cache':args.cache,'two_disks':args.two_disks,'platform_config':args.platform_config,'platform':'linux' if args.linux else 'boaros','linux_reference':linux_identity}
+        'metadata_fixed_only':args.metadata_fixed_only,'guest_cpus':args.cpus,'guest_ram':args.ram,
+        'replicas':args.replicas,'acceptance':args.replicas>=3,'transport':args.transport,'cache':args.cache,'two_disks':args.two_disks,'platform_config':args.platform_config,'platform':'linux' if args.linux else 'boaros','linux_reference':linux_identity}
     kernel=work/'kernel'; shutil.copyfile(args.kernel,kernel); identity['kernel_sha256']=digest(kernel)
     bios=work/'firmware'; shutil.copyfile(args.bios,bios); identity['firmware_sha256']=digest(bios)
     if args.kernel_identity:
@@ -104,7 +113,7 @@ def main():
     identity['root_drain_fixture']=args.root_drain_fixture
     identity['trace_read_lbas']=args.trace_read_lbas
     original=None
-    if set(cases)&{'consumer','metadata'}:
+    if set(cases)&{'consumer','metadata'} and not args.metadata_fixed_only:
         original,consumer_identity=originals(ROOT,work,digest); identity.update(consumer_identity)
         identity['consumer_timeout_ms']=args.consumer_timeout_ms
         identity['consumer_command_names']=selected
@@ -121,7 +130,7 @@ def main():
             if args.coordinator_elf:shutil.copyfile(args.coordinator_elf,program)
             else:run([str(compiler),'-fno-link-libatomic','-static','-O2','-pthread','-Wall','-Wextra','-Werror',
                 str(ROOT/'tests/workloads/cost'/f'{case}.c'),'-o',str(program)])
-            if case=='metadata':
+            if case=='metadata' and not args.metadata_fixed_only:
                 identity['lmbench_elf_sha256']={}
                 for libc in ('musl','glibc'):
                     elf=work/(libc+'-lmbench_all')
@@ -138,7 +147,8 @@ def main():
                                       'qemu_sha256':identity['qemu_sha256'],'cost_diagnostics':identity['cost_diagnostics'],
                                       'transport':args.transport,'cache':args.cache,'replica':replica,
                                       'case':case,'root_drain_fixture':args.root_drain_fixture,
-                                      'trace_read_lbas':args.trace_read_lbas}.items():
+                                      'trace_read_lbas':args.trace_read_lbas,'metadata_fixed_only':args.metadata_fixed_only,
+                                      'guest_cpus':args.cpus,'guest_ram':args.ram}.items():
                         if record[key]!=value:raise ValueError('resume input differs: '+key)
                     validate_resume_selection(case,record,selected)
                     validate_resume_seed(record,qemu_seed)
@@ -156,12 +166,14 @@ def main():
                         disk.chmod(0o600)
                         if digest(disk)!=fixture.sha256:raise ValueError('frozen fixture copy differs')
                     else:
-                        if case in ('consumer','metadata'): run(['cp','--sparse=always','--reflink=auto',str(original),str(disk)])
+                        if case in ('consumer','metadata') and not args.metadata_fixed_only: run(['cp','--sparse=always','--reflink=auto',str(original),str(disk)])
                         else:
                             with disk.open('wb') as stream: stream.truncate(256*1024*1024)
                             run(['mkfs.ext4','-q','-F','-b','4096',str(disk)])
                         commands=folder/'fixture.commands'
                         contents=f'write {program} /init\nset_inode_field /init mode 0100755\n'
+                        if args.metadata_fixed_only:
+                            flag=folder/'metadata-fixed';flag.write_text('fixed namespace work\n');contents+=f'write {flag} /cost-metadata-fixed\n'
                         if case=='consumer':
                             nonce=folder/'replica-id';nonce.write_text(str(replica)+'\n');contents+=f'write {nonce} /cost-replica\n'
                             policy=folder/'consumer-budget';policy.write_text(str(args.consumer_timeout_ms)+'\n')
@@ -195,15 +207,17 @@ def main():
                     record={**identity,'case':case,'replica':replica,'elf_sha256':digest(program),'fixture_sha256':digest(disk),'timebase_hz':10000000}
                     if fixture:record.update(fixture_mode='frozen',fixture_input_sha256=fixture.sha256)
                     if qemu_seed is not None:record['qemu_seed']=qemu_seed
-                    if case=='metadata':
+                    if case=='metadata' and not args.metadata_fixed_only:
                         record['consumer_command_names']=['consumer-musl-1','consumer-glibc-1']
                         record['scope']='metadata fixed work and two selected original iozone commands'
                         record['acceptance']=args.replicas==3 and not args.metadata_core_only
                     invocation=[args.qemu,'-machine','virt','-bios',str(bios),'-kernel',str(kernel),
-                        '-m','512M','-smp','1','-nographic','-no-reboot',
+                        '-m',args.ram,'-smp',str(args.cpus),'-nographic','-no-reboot',
                         '-drive',f'file={disk},if=none,format=raw,id=root,cache={args.cache}',
                         '-global','virtio-mmio.force-legacy='+('true' if args.transport=='legacy' else 'false'),
                         '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+                    if args.metadata_fixed_only:
+                        invocation += ['-accel','tcg,thread=multi','-name','boaros-cost,debug-threads=on']
                     invocation+=seed_arguments(qemu_seed)
                     if args.platform_config=='official':
                         invocation[invocation.index('-m')+1]='1G'
@@ -231,7 +245,7 @@ def main():
                     record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
                     with (folder/'boot.log').open('w') as boot_log:
                         result=subprocess.Popen(invocation,stdin=subprocess.DEVNULL,stdout=boot_log,stderr=subprocess.STDOUT,text=True)
-                        try: returncode=result.wait(timeout=16*args.consumer_timeout_ms/1000+120 if case in ('consumer','metadata') else 180)
+                        try: returncode=result.wait(timeout=180 if args.metadata_fixed_only else 16*args.consumer_timeout_ms/1000+120 if case in ('consumer','metadata') else 180)
                         except subprocess.TimeoutExpired:
                             result.kill();result.wait();raise
                 output=(folder/'boot.log').read_text()
@@ -296,7 +310,12 @@ def main():
                     if args.consumer_sync:required|={f'consumer-sync-{i}' for i in range(4)}
                     if args.consumer_readers:required|={f'readers-{relation}-{hot}' for relation in (0,1) for hot in (0,1)}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('consumer coverage')
-                if case=='metadata':
+                if case=='metadata' and args.metadata_fixed_only:
+                    record['fixed_metrics']=validate_metadata_fixed(output,timings,args.cpus)
+                    record['actual_scope']='fixed namespace work including final directory sync'
+                    if not args.off and {v['name'] for v in snapshots}!=set(timings):
+                        raise ValueError('fixed metadata diagnostic coverage')
+                elif case=='metadata':
                     required={f'metadata-{kind}-{held}' for kind in ('stat','open') for held in ('held','unheld')}|{'metadata-fstat-held','metadata-create','metadata-final-sync'}
                     required|={f'metadata-{libc}-lmbench-{i}' for libc in ('musl','glibc') for i in range(4)}|{'consumer-musl-1','consumer-glibc-1'}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required):raise ValueError('metadata workload coverage')

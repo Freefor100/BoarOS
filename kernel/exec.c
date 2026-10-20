@@ -430,6 +430,7 @@ static enum exec_capture_status expand_scripts(
     struct kernel_exec_transaction *transaction, const struct kernel_fs_context *fs,
     int64_t *error)
 {
+    KERNEL_FS_PATHS(fs_paths, fs);
     char header[256], next_path[256];
     const char *script_path = transaction->original_path;
     for (unsigned depth = 0;; depth++) {
@@ -498,7 +499,7 @@ static enum exec_capture_status expand_scripts(
         }
         int path_result;
         if (kernel_open_file_create_at(transaction->heap,
-                kernel_fs_context_cwd(fs), kernel_fs_context_root(fs), name,
+                fs_paths.cwd, fs_paths.root, name,
                 KERNEL_OPEN_PATH_EXECUTABLE, 0, &transaction->executable_file,
                 &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
             return EXEC_CAPTURE_STATE;
@@ -626,8 +627,9 @@ enum kernel_exec_status kernel_execve_prepare(
     if (access_status != KERNEL_UACCESS_STATUS_OK) {
         return finish_prepare_state(task, transaction);
     }
+    KERNEL_FS_PATHS(fs_paths, fs);
     if (kernel_open_file_create_at(transaction->heap,
-            kernel_fs_context_cwd(fs), kernel_fs_context_root(fs),
+            fs_paths.cwd, fs_paths.root,
             transaction->original_path, KERNEL_OPEN_PATH_EXECUTABLE, 0,
             &transaction->executable_file, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
         return finish_prepare_state(task, transaction);
@@ -702,7 +704,7 @@ enum kernel_exec_status kernel_execve_prepare(
         &interpreter_length);
     if (interpreter_path != 0) {
         if (kernel_open_file_create_at(transaction->heap,
-                kernel_fs_context_cwd(fs), kernel_fs_context_root(fs),
+                fs_paths.cwd, fs_paths.root,
                 interpreter_path, KERNEL_OPEN_PATH_EXECUTABLE, 0,
                 &transaction->interpreter_file, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
             return finish_prepare_state(task, transaction);

@@ -805,6 +805,10 @@ int ext4_dir_open_file(ext4_file *file, const char *path);
 int ext4_chrdev_open_file(ext4_file *file, const char *path);
 int ext4_fopen_inode(ext4_file *file, const char *mount_point,
                      uint32_t inode_number);
+int ext4_create_child(const char *mount, uint32_t parent, const char *name,
+    uint32_t mode, uint32_t device, const char *target, ext4_file *output);
+int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
+    bool directory, uint32_t *inode, bool *orphan);
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
                       uint32_t *child_inode, uint32_t *child_mode);

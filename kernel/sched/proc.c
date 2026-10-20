@@ -18,13 +18,7 @@ void kernel_proc_task_update_comm(struct kernel_task *task)
     struct kernel_vfs_path *path = 0;
     if (kernel_mm_executable_path_acquire(&task->mm, &path) !=
         KERNEL_MM_STATUS_OK) return;
-    const char *name = kernel_vfs_path_name(path);
-    if (name) {
-        size_t length = strlen(name);
-        if (length >= sizeof(task->comm)) length = sizeof(task->comm) - 1U;
-        memcpy(task->comm, name, length);
-        task->comm[length] = '\0';
-    }
+    if (kernel_vfs_path_copy_name(path, task->comm, sizeof(task->comm))) __builtin_trap();
     if (kernel_vfs_path_release(&path)) __builtin_trap();
 }
 
@@ -199,10 +193,10 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
                 KERNEL_MM_STATUS_OK) result = 0;
     } else if (kind == KERNEL_PROC_PATH_CWD ||
                kind == KERNEL_PROC_PATH_ROOT) {
-        if (kernel_fs_context_is_live(&task->fs)) {
+        KERNEL_FS_PATHS(paths, &task->fs);
+        if (paths.root) {
             struct kernel_vfs_path *path = kind == KERNEL_PROC_PATH_CWD
-                ? kernel_fs_context_cwd(&task->fs)
-                : kernel_fs_context_root(&task->fs);
+                ? paths.cwd : paths.root;
             if (path && !kernel_vfs_path_acquire(path)) {
                 *owner = path;
                 result = 0;

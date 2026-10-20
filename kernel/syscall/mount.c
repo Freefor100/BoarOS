@@ -34,6 +34,7 @@ static int import_string(struct kernel_mm *mm, char *buffer, size_t capacity,
 static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context *fs,
                       const struct kernel_syscall_request *request)
 {
+    KERNEL_FS_PATHS(fs_paths, fs);
     uint64_t flags = request->arguments[3];
     char type[64], options[256] = {0};
     char *target = 0;
@@ -64,8 +65,8 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         if (disk) {
             struct kernel_vfs_path *source = 0;
             struct kernel_vfs_stat stat;
-            result = kernel_vfs_path_resolve(kernel_fs_context_cwd(fs),
-                kernel_fs_context_root(fs), source_name, 1, &source);
+            result = kernel_vfs_path_resolve(fs_paths.cwd,
+                fs_paths.root, source_name, 1, &source);
             if (!result) result = kernel_vfs_path_stat(source, &stat);
             if (!result && (stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFBLK)
                 result = -KERNEL_ENOTBLK;
@@ -83,8 +84,8 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     result = import_string(mm, target, KERNEL_FS_PATH_MAX,
                            request->arguments[1]);
     if (result) goto Finish;
-    result = kernel_vfs_path_resolve(kernel_fs_context_cwd(fs),
-              kernel_fs_context_root(fs), target, 1, &covered);
+    result = kernel_vfs_path_resolve(fs_paths.cwd,
+              fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     struct kernel_vfs_stat stat;
     result = kernel_vfs_path_stat(covered, &stat);
@@ -114,6 +115,7 @@ static int unmount_filesystem(struct kernel_mm *mm,
                         const struct kernel_fs_context *fs,
                         const struct kernel_syscall_request *request)
 {
+    KERNEL_FS_PATHS(fs_paths, fs);
     if (request->arguments[1]) return -KERNEL_ENOTSUP;
     if (!request->arguments[0]) return -KERNEL_EFAULT;
     char *target = 0;
@@ -125,8 +127,8 @@ static int unmount_filesystem(struct kernel_mm *mm,
     int result = import_string(mm, target, KERNEL_FS_PATH_MAX,
                                request->arguments[0]);
     if (result) goto Finish;
-    result = kernel_vfs_path_resolve(kernel_fs_context_cwd(fs),
-             kernel_fs_context_root(fs), target, 1, &root);
+    result = kernel_vfs_path_resolve(fs_paths.cwd,
+             fs_paths.root, target, 1, &root);
     if (result) goto Finish;
     struct kernel_vfs_mount *mount = kernel_vfs_path_mount(root);
     if (mount->root_path != root) {
