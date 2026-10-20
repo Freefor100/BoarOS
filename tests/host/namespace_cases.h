@@ -170,6 +170,36 @@ static void namespace_open_request_case(struct kernel_heap *heap,
     puts("PASS unified open/create: created identity, exclusive/symlink and read-only precedence");
 }
 
+static void namespace_walk_qualification_case(struct kernel_heap *heap,
+                                              struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL;struct kernel_vfs_file file={0};
+    struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW |
+        KERNEL_VFS_OPEN_CREATE | KERNEL_VFS_OPEN_EXCLUSIVE,.mode=0600};
+    struct kernel_vfs_instance *instance=mount->private_data;
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-walk",0700));
+    namespace_observed_lock=&instance->namespace_lock.lock;
+    namespace_lock_acquisitions=0;
+    assert(!kernel_vfs_open_at(root,root,"/namespace-walk/file",&request,&file,NULL));
+    namespace_observed_lock=NULL;
+    assert(namespace_lock_acquisitions==1);
+    assert(!kernel_vfs_close(&file));
+    struct kernel_vfs_stat stat;
+    namespace_lock_acquisitions=0;namespace_observed_lock=&instance->namespace_lock.lock;
+    assert(!kernel_vfs_stat_at(root,root,"/namespace-walk/file",1,&stat));
+    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==1);
+    namespace_lock_acquisitions=0;namespace_observed_lock=&instance->namespace_lock.lock;
+    assert(!kernel_vfs_rename_at(root,root,root,"/namespace-walk/file","/namespace-walk/new",0));
+    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==1);
+    namespace_lock_acquisitions=0;namespace_observed_lock=&instance->namespace_lock.lock;
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-walk/new",0));
+    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==1);
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-walk",1));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS one same-mount namespace qualification per open/create, stat, rename and unlink");
+}
+
 struct namespace_parent_move {
     struct kernel_vfs_path *root;
     pthread_barrier_t gate;

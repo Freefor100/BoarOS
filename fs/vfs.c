@@ -52,6 +52,45 @@ enum vfs_trailing_policy {
     VFS_TRAILING_CREATE,
 };
 
+struct vfs_path_walk {
+    const struct kernel_vfs_path *start, *root;
+    struct kernel_vfs_mount *mount;
+    struct kernel_vfs_path *mount_owner;
+    struct kernel_lock_guard guard;
+    struct kernel_service_scope service;
+};
+static void path_walk_release(struct vfs_path_walk *walk)
+{
+    kernel_lock_scope_release(&walk->guard);
+    if (walk->mount_owner && kernel_vfs_path_release(&walk->mount_owner)) __builtin_trap();
+    kernel_service_scope_end(&walk->service);
+    walk->service.entered=0;
+    walk->mount=NULL;
+}
+static int path_walk_select(struct vfs_path_walk *walk,struct kernel_vfs_path *path)
+{
+    struct kernel_vfs_mount *mount=path->file.mount;
+    if (walk->mount==mount) return 0;
+    path_walk_release(walk);
+    /* 输入起点/根的caller owner覆盖整次操作；其他挂载保留一个实际路径，
+     * 直到解锁及通知结束，避免最后分量退休后实例先于mutex归还。 */
+    if ((!walk->start || walk->start->file.mount!=mount) &&
+        (!walk->root || walk->root->file.mount!=mount)) {
+        int result=kernel_vfs_path_acquire(path);
+        if (result) return result;
+        walk->mount_owner=path;
+    }
+#if BOAROS_USER_SMP
+    if (kernel_vfs_namespace_requires_cpu0(mount)) kernel_service_scope_begin(&walk->service);
+#endif
+    kernel_vfs_namespace_lock(mount,&walk->guard);
+    walk->mount=mount;
+    return ((struct kernel_vfs_instance *)mount->private_data)->quiescing ? -KERNEL_EIO : 0;
+}
+#define VFS_PATH_WALK(name, initial, boundary) \
+    struct vfs_path_walk name __attribute__((cleanup(path_walk_release))) = { \
+        .start=(initial), .root=(boundary) }
+
 static int resolve_object(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root,
                           const char *path, int follow_final,
@@ -59,7 +98,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                           int allow_missing_trailing,
                           enum vfs_trailing_policy follow_trailing_final,
                           struct kernel_vfs_path **owner,
-                          char missing_name[256]);
+                          char missing_name[256], struct vfs_path_walk *walk);
 
 static void release_path(struct kernel_heap *heap, char *work)
 {
@@ -405,17 +444,10 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
     return kernel_vfs_fstat(&path->file, stat);
 }
 
-int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
+static int path_lookup_locked(struct kernel_vfs_path *parent,
                            const char *name, size_t name_length,
                            struct kernel_vfs_path **owner)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, parent && kernel_vfs_namespace_requires_cpu0(parent->file.mount));
-    if (!parent || !parent->file.mount || !parent->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    kernel_vfs_namespace_lock(parent->file.mount, &namespace_guard);
-    if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing)
-        return -KERNEL_EIO;
-
     struct kernel_vfs_path *child;
     struct kernel_vfs_mount *mount;
     struct kernel_vfs_instance *adapter;
@@ -516,6 +548,17 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
     return result;
 }
 
+int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
+                           const char *name,size_t length,struct kernel_vfs_path **owner)
+{
+    KERNEL_SERVICE_SCOPE_IF(service,parent && kernel_vfs_namespace_requires_cpu0(parent->file.mount));
+    if (!parent || !parent->file.mount || !parent->file.mount->private_data) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_namespace_lock(parent->file.mount,&guard);
+    if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing) return -KERNEL_EIO;
+    return path_lookup_locked(parent,name,length,owner);
+}
+
 static int resolve_object(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root,
                           const char *path, int follow_final,
@@ -523,7 +566,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                           int allow_missing_trailing,
                           enum vfs_trailing_policy follow_trailing_final,
                           struct kernel_vfs_path **owner,
-                          char missing_name[256])
+                          char missing_name[256], struct vfs_path_walk *walk)
 {
     struct kernel_vfs_path *current;
     struct kernel_vfs_instance *adapter;
@@ -559,6 +602,8 @@ static int resolve_object(struct kernel_vfs_path *start,
         goto Finish;
     }
     while (pending[cursor] != '\0') {
+        result=path_walk_select(walk,current);
+        if (result) goto Finish;
         struct kernel_vfs_path *next = 0;
         size_t begin, end, component_length;
         int suffix;
@@ -590,7 +635,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             result = kernel_vfs_path_acquire(root);
             if (!result) next = root;
         } else {
-            result = kernel_vfs_path_lookup(current, pending + begin,
+            result = path_lookup_locked(current, pending + begin,
                                             component_length, &next);
         }
         if (result == -KERNEL_ENOENT && allow_missing_final &&
@@ -604,6 +649,13 @@ static int resolve_object(struct kernel_vfs_path *start,
             goto Finish;
         }
         if (result != 0) goto Finish;
+        if (next->file.mount!=current->file.mount) {
+            /* 挂载根及向上的跨挂载目标是目录；先在旧执行域归还旧分量，
+             * 下一轮或返回前再切换保护，切换时始终持有next。 */
+            if (kernel_vfs_path_release(&current)) __builtin_trap();
+            current=next;
+            continue;
+        }
         if ((next->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFLNK &&
             ((suffix && (!trailing_only || follow_trailing_final == VFS_TRAILING_FOLLOW)) ||
              follow_final)) {
@@ -677,6 +729,10 @@ static int resolve_object(struct kernel_vfs_path *start,
     *owner = current;
     current = 0;
 Finish:
+    if (!result && *owner) {
+        result=path_walk_select(walk,*owner);
+        if (result && kernel_vfs_path_release(owner)) __builtin_trap();
+    }
     if (current != 0) (void)kernel_vfs_path_release(&current);
     kernel_heap_release(adapter->heap, work);
     return result;
@@ -688,8 +744,9 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path **owner)
 {
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    return resolve_object(start, root, path, follow_final, 0, 0, 1,
-                          owner, 0);
+    VFS_PATH_WALK(walk,start,root);
+    return resolve_object(start, root, path, follow_final, 0, 0, VFS_TRAILING_FOLLOW,
+                          owner, 0, &walk);
 }
 
 int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
@@ -923,14 +980,9 @@ int kernel_vfs_path_copy_name(const struct kernel_vfs_path *path, char *buffer, 
     return 0;
 }
 
-int kernel_vfs_path_open(struct kernel_vfs_path *path,
+static int path_open_locked(struct kernel_vfs_path *path,
                          struct kernel_vfs_file *file)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
-    if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
-
     if (!path || !file || file->path) return -KERNEL_EINVAL;
     int result = kernel_vfs_path_acquire(path);
     if (result) return result;
@@ -939,6 +991,15 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,
     if (result) (void)kernel_vfs_path_release(&path);
     else file->path = path;
     return result;
+}
+
+int kernel_vfs_path_open(struct kernel_vfs_path *path,struct kernel_vfs_file *file)
+{
+    KERNEL_SERVICE_SCOPE_IF(service,path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
+    if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_namespace_lock(path->file.mount,&guard);
+    return path_open_locked(path,file);
 }
 
 static int create_at_parent(struct kernel_vfs_path **owner, const char *name,
@@ -986,15 +1047,13 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     int exclusive=create && (flags & KERNEL_VFS_OPEN_EXCLUSIVE);
     int follow=!!(flags & KERNEL_VFS_OPEN_FOLLOW);
     int result;
-    for (;;) {
+    VFS_PATH_WALK(walk,start,root);
+    {
         struct kernel_vfs_path *resolved=NULL;
         char missing[256]={0};
         result=resolve_object(start,root,path,follow,create,1,
-            create?VFS_TRAILING_CREATE:VFS_TRAILING_FOLLOW,&resolved,missing);
-        if (result) break;
-        KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(resolved->file.mount));
-        KERNEL_LOCK_SCOPE(guard);
-        kernel_vfs_namespace_lock(resolved->file.mount,&guard);
+            create?VFS_TRAILING_CREATE:VFS_TRAILING_FOLLOW,&resolved,missing,&walk);
+        if (result) goto Complete;
         if (((struct kernel_vfs_instance *)resolved->file.mount->private_data)->quiescing)
             result=-KERNEL_EIO;
         else if (!missing[0]) {
@@ -1007,29 +1066,18 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                 result=-KERNEL_ELOOP;
             else if (create && (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
                 result=-KERNEL_EISDIR;
-            else result=kernel_vfs_path_open(resolved,file);
+            else result=path_open_locked(resolved,file);
         } else {
-            /* lookup之后另一个创建者可能已发布名称；检查与创建共用资格。 */
-            struct kernel_vfs_instance *instance=resolved->file.mount->private_data;
-            uint64_t inode;uint32_t mode;
-            result=instance->ops->lookup(instance,kernel_vfs_path_inode(resolved),
-                                        missing,strlen(missing),&inode,&mode);
-            if (!result && !exclusive) {
-                if (kernel_vfs_path_release(&resolved)) __builtin_trap();
-                continue;
-            }
-            if (!result) result=-KERNEL_EEXIST;
-            else if (result==-KERNEL_ENOENT) {
-                if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
-                else {
-                    result=create_at_parent(&resolved,missing,request->mode,file);
-                    if (!result && created) *created=1;
-                }
+            if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
+            else {
+                result=create_at_parent(&resolved,missing,request->mode,file);
+                if (!result && created) *created=1;
             }
         }
         if (resolved && kernel_vfs_path_release(&resolved)) __builtin_trap();
-        break;
     }
+Complete:
+    path_walk_release(&walk);
     return flags & KERNEL_VFS_OPEN_EXECUTABLE ? finish_executable_open(file,result) : result;
 }
 
@@ -1095,20 +1143,11 @@ static int mutation_path(struct kernel_vfs_path *start,
                           int follow, int missing, int trailing,
                           int follow_trailing, struct kernel_vfs_path **path,
                           char missing_name[256],
-                          struct kernel_lock_guard *guard,
-                          struct kernel_service_scope *service)
+                          struct vfs_path_walk *walk)
 {
     if (!start || !root || !input) return -KERNEL_EINVAL;
-    int result = resolve_object(start, root, input, follow, missing, trailing,
-                                follow_trailing, path, missing_name);
-    if (result) return result;
-    if (kernel_vfs_namespace_requires_cpu0((*path)->file.mount)) kernel_service_scope_begin(service);
-    kernel_vfs_namespace_lock((*path)->file.mount, guard);
-    if (((struct kernel_vfs_instance *)(*path)->file.mount->private_data)->quiescing) {
-        (void)kernel_vfs_path_release(path);
-        return -KERNEL_EIO;
-    }
-    return 0;
+    return resolve_object(start, root, input, follow, missing, trailing,
+                          follow_trailing, path, missing_name, walk);
 }
 
 int kernel_vfs_create_at(struct kernel_vfs_path *start,
@@ -1842,7 +1881,6 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *input,
                         uint32_t mode, uint32_t device)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, 0);
     if (!start || !start->file.mount || !start->file.mount->private_data)
         return -KERNEL_EINVAL;
     uint32_t type = mode & KERNEL_VFS_S_IFMT;
@@ -1853,11 +1891,11 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
         type != KERNEL_VFS_S_IFBLK && type != KERNEL_VFS_S_IFIFO)
         return -KERNEL_EINVAL;
     if (!type) type = KERNEL_VFS_S_IFREG;
-    KERNEL_LOCK_SCOPE(namespace_guard);
+    VFS_PATH_WALK(walk,start,root);
     struct kernel_vfs_path *path = 0;
     char name[256] = {0};
     int result = mutation_path(start, root, input, 0, 1, 0, 2,
-                                &path, name, &namespace_guard, &service);
+                                &path, name, &walk);
     if (result) return result;
     if (!name[0]) {
         result = -KERNEL_EEXIST;
@@ -1875,14 +1913,13 @@ int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *input,
                         uint32_t mode)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, 0);
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
+    VFS_PATH_WALK(walk,start,root);
 
     struct kernel_vfs_path *path = 0;
     char name[256] = {0};
     int result = mutation_path(start, root, input, 0, 1, 1, 2,
-                                &path, name, &namespace_guard, &service);
+                                &path, name, &walk);
     if (result) return result;
     result = !name[0] ? -KERNEL_EEXIST :
                  kernel_vfs_mount_is_readonly(path->file.mount) ? -KERNEL_EROFS :
@@ -1917,30 +1954,27 @@ static int special_last_component(const char *path)
 }
 
 static int rename_parent(struct kernel_vfs_path *, struct kernel_vfs_path *,
-    const char *, struct kernel_vfs_path **, char [256], int *, int *);
+    const char *, struct kernel_vfs_path **, char [256], int *, int *, struct vfs_path_walk *);
 
 int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *input,
                          int directory)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, 0);
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
+    VFS_PATH_WALK(walk,start,root);
     struct kernel_vfs_path *parent = 0, *path = 0;
     char name[256];
     int special = special_last_component(input), trailing;
     if (special == 3) return directory ? -KERNEL_EBUSY : -KERNEL_EISDIR;
-    int result = rename_parent(start, root, input, &parent, name, &special, &trailing);
+    int result = rename_parent(start, root, input, &parent, name, &special, &trailing, &walk);
     if (result) return result;
     if (special) {
         (void)kernel_vfs_path_release(&parent);
         return !directory ? -KERNEL_EISDIR : special == 1 ? -KERNEL_EINVAL : -KERNEL_ENOTEMPTY;
     }
-    if (kernel_vfs_namespace_requires_cpu0(parent->file.mount)) kernel_service_scope_begin(&service);
-    kernel_vfs_namespace_lock(parent->file.mount, &namespace_guard);
     /* Keep basename lookup and removal in one namespace operation; a racing
      * rename must not redirect unlink to the object's new name. */
-    result = kernel_vfs_path_lookup(parent, name, strlen(name), &path);
+    result = path_lookup_locked(parent, name, strlen(name), &path);
     if (result) goto Finish;
     if (path->file.mount != parent->file.mount) result = -KERNEL_EBUSY;
     else if (trailing && (path->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
@@ -1983,15 +2017,14 @@ int kernel_vfs_link_at(struct kernel_vfs_path *source,
                        struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *input)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, 0);
     if (!start || !start->file.mount || !start->file.mount->private_data)
         return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
+    VFS_PATH_WALK(walk,start,root);
     KERNEL_LOCK_SCOPE(inode_guard);
     struct kernel_vfs_path *parent = 0;
     char name[256] = {0};
     int result = mutation_path(start, root, input, 0, 1, 0, 2,
-                                &parent, name, &namespace_guard, &service);
+                                &parent, name, &walk);
     if (result) return result;
     struct kernel_vfs_instance *instance = parent->file.mount->private_data;
     /* 目标存在优先于跨挂载；NULL 源表示已 pin 的无路径 pipe/socket OFD。 */
@@ -2018,15 +2051,14 @@ int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root, const char *target,
                           const char *input)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, 0);
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
+    VFS_PATH_WALK(walk,start,root);
 
     struct kernel_vfs_path *path = 0;
     char name[256] = {0};
     if (!start || !target || !target[0]) return -KERNEL_EINVAL;
     int result = mutation_path(start, root, input, 0, 1, 0, 2,
-                                &path, name, &namespace_guard, &service);
+                                &path, name, &walk);
     if (result) return result;
     struct kernel_vfs_instance *instance = path->file.mount->private_data;
     result = !name[0] ? -KERNEL_EEXIST :
@@ -2076,7 +2108,7 @@ int kernel_vfs_readlink(struct kernel_vfs_mount *mount, const char *path,
 static int rename_parent(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root, const char *input,
                           struct kernel_vfs_path **parent, char name[256],
-                          int *special, int *trailing)
+                          int *special, int *trailing, struct vfs_path_walk *walk)
 {
     if (!input[0]) return -KERNEL_ENOENT;
     size_t length = strlen(input), end = length, begin;
@@ -2092,7 +2124,11 @@ static int rename_parent(struct kernel_vfs_path *start,
     if (!begin) {
         struct kernel_vfs_path *base = end ? start : root;
         int result = kernel_vfs_path_acquire(base);
-        if (!result) *parent = base;
+        if (!result) {
+            *parent=base;
+            result=path_walk_select(walk,base);
+            if (result && kernel_vfs_path_release(parent)) __builtin_trap();
+        }
         return result;
     }
     char *prefix;
@@ -2102,7 +2138,7 @@ static int rename_parent(struct kernel_vfs_path *start,
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     memcpy(prefix, input, begin);
     prefix[begin] = 0;
-    int result = kernel_vfs_path_resolve(start, root, prefix, 1, parent);
+    int result=resolve_object(start,root,prefix,1,0,0,VFS_TRAILING_FOLLOW,parent,NULL,walk);
     release_path(start->heap, prefix);
     return result;
 }
@@ -2113,9 +2149,8 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                          const char *old_input, const char *new_input,
                          unsigned flags)
 {
-    KERNEL_SERVICE_SCOPE_IF(service, 0);
     if (!old_start || !old_start->file.mount || !old_start->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
+    VFS_PATH_WALK(walk,old_start,root);
 
     struct kernel_vfs_path *source = 0, *target = 0, *new_parent = 0;
     struct kernel_vfs_path *source_parent = 0;
@@ -2129,17 +2164,15 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
     if (!old_start || !new_start || !root || !old_input || !new_input)
         return -KERNEL_EINVAL;
     result = rename_parent(old_start, root, old_input, &source_parent,
-                             old_component, &old_special, &old_trailing);
+                             old_component, &old_special, &old_trailing, &walk);
     if (result) goto Finish;
     result = rename_parent(new_start, root, new_input, &new_parent,
-                             missing, &new_special, &new_trailing);
+                             missing, &new_special, &new_trailing, &walk);
     if (result) goto Finish;
     if (source_parent->file.mount != new_parent->file.mount) {
         result = -KERNEL_EXDEV;
         goto Finish;
     }
-    if (kernel_vfs_namespace_requires_cpu0(source_parent->file.mount)) kernel_service_scope_begin(&service);
-    kernel_vfs_namespace_lock(source_parent->file.mount, &namespace_guard);
     struct kernel_vfs_instance *adapter = source_parent->file.mount->private_data;
     if (old_special) { result = -KERNEL_EBUSY; goto Finish; }
     if (new_special) { result = flags & 1U ? -KERNEL_EEXIST : -KERNEL_EBUSY; goto Finish; }
@@ -2147,14 +2180,14 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
         result = -KERNEL_EROFS;
         goto Finish;
     }
-    result = kernel_vfs_path_lookup(source_parent, old_component,
+    result = path_lookup_locked(source_parent, old_component,
                                     strlen(old_component), &source);
     if (result) goto Finish;
     if (source->file.mount != source_parent->file.mount) {
         result = -KERNEL_EBUSY;
         goto Finish;
     }
-    result = kernel_vfs_path_lookup(new_parent, missing, strlen(missing), &target);
+    result = path_lookup_locked(new_parent, missing, strlen(missing), &target);
     if (result && result != -KERNEL_ENOENT) goto Finish;
     if (target && target->file.mount != new_parent->file.mount) {
         result = -KERNEL_EBUSY;
@@ -2206,6 +2239,7 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
     if (old_name != source->initial_name) release_path(adapter->heap, old_name);
     (void)kernel_vfs_path_release(&old_parent);
 Finish:
+    if (source_parent && walk.mount!=source_parent->file.mount) path_walk_release(&walk);
     if (new_name) release_path(old_start->heap, new_name);
     if (new_parent) (void)kernel_vfs_path_release(&new_parent);
     if (target) (void)kernel_vfs_path_release(&target);
