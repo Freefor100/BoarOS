@@ -1434,7 +1434,8 @@ int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (punch) kernel_file_mapping_invalidate_range(node,first,last);
     /* Buffered EOF can lead persistent EOF. Publish its dirty prefix before
      * the backend computes KEEP_SIZE or clamps a punch at i_size. */
-    result = cache ? kernel_page_cache_writeback(cache,node) : 0;
+    result = cache ? kernel_page_cache_writeback_range_borrowing(cache,node,0,UINT64_MAX,
+        borrowed ? borrowed : &operation) : 0;
     struct kernel_page_cache_resize resize = {0};
     if (!result && cache && !mode && end > old_size)
         result = kernel_page_cache_resize_prepare(cache,node,old_size,end,&resize);
@@ -1521,14 +1522,16 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
         return result;
     }
     if (node->instance->page_cache != NULL) {
-        kernel_assert_service_context();
+        if (node->instance->ops->file_metadata_execution == KERNEL_VFS_EXECUTION_CPU0)
+            kernel_assert_service_context();
         struct kernel_page_cache *cache = node->instance->page_cache;
         uint64_t old_size = node->size;
         result = kernel_file_mapping_prepare(node);
         if (result) return result;
         /* 写操作门保留，inode保护必须在MM回调、pin排空和磁盘等待前释放。 */
         kernel_lock_release(&node_guard);
-        result = kernel_page_cache_writeback_before(cache, node, size);
+        result = size ? kernel_page_cache_writeback_range_borrowing(cache,node,0,size,
+            borrowed ? borrowed : &operation_guard) : 0;
         if (result) return result;
         kernel_vfs_node_lock(node, &node_guard, 1);
         kernel_file_mapping_close(node);
@@ -1564,7 +1567,8 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
         kernel_file_mapping_open(node);
         return result;
     }
-    result = node->memory ? 0 : kernel_page_cache_writeback_before(node->instance->page_cache, node, size);
+    result = node->memory || !size ? 0 : kernel_page_cache_writeback_range_borrowing(
+        node->instance->page_cache,node,0,size,borrowed ? borrowed : &operation_guard);
     if (result != 0) return result;
     uint64_t actual;
     int changed;
@@ -1673,6 +1677,13 @@ uint64_t kernel_vfs_file_inode(const struct kernel_vfs_file *file)
     }
     node = file->private_data;
     return node->inode;
+}
+
+int kernel_vfs_file_metadata_requires_cpu0(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node && node->instance->ops->file_metadata_execution == KERNEL_VFS_EXECUTION_CPU0 &&
+        kernel_page_cache_needs_cpu0(node->instance->page_cache);
 }
 
 uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
@@ -2580,7 +2591,7 @@ static int vfs_sync_range_mode(struct kernel_vfs_file *file,
         call.result = cache ? kernel_page_cache_writeback_range_borrowing(
             cache, node, start, end, borrowed) : 0;
     kernel_raw_lock_init(&request.metadata, KERNEL_RAW_RANK_OBJECT);
-    if (cache && kernel_page_cache_needs_cpu0(cache)) {
+    if (kernel_vfs_file_metadata_requires_cpu0(file)) {
         enum kernel_page_cache_status status = kernel_page_cache_run_cpu0_borrowing(
             cache, vfs_sync_prepare, &call, borrowed);
         if (status) return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;

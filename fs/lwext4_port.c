@@ -14,7 +14,6 @@ static unsigned heap_users;
 static struct kernel_wait_queue channels[64];
 static void backend_enter(void *lock, int read)
 {
-    if (!read) kernel_assert_service_context();
     struct kernel_io_context *context = kernel_io_context_current();
     if (context->backend_depth) {
         if (context->backend_guard.lock != lock || (!read && context->backend_read)) __builtin_trap();

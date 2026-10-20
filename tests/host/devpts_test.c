@@ -34,6 +34,8 @@ uint64_t kernel_vfs_allocate_mount_id(void)
 { static uint64_t id; return ++id; }
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 { *lock = (struct kernel_rwlock){.rank = rank, .key = key}; }
+void kernel_raw_lock_init(struct kernel_raw_lock *lock, uint32_t rank)
+{ *lock = (struct kernel_raw_lock){.rank=rank,.initialized=KERNEL_RAW_INITIALIZED}; }
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g)
 { assert(!g->lock); g->lock = lock; }
 void kernel_lock_release(struct kernel_lock_guard *g) { g->lock = 0; }

@@ -2383,10 +2383,8 @@ static int ext4_backend_complete_write(struct kernel_vfs_node *node)
 {
     /* Legacy 指针没有 unwritten 状态。已接纳数据先交给后端，再按持久
      * EOF 回收没有被复制的尾部；失败保留脏数据及持久 orphan owner。 */
-    int result=kernel_page_cache_writeback(node->instance->page_cache,node);
-    if (result) return result;
     KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,1);
-    result=ext4_file_complete_write(lwext4_node_file(node));
+    int result=ext4_file_complete_write(lwext4_node_file(node));
     if (!result) ((struct lwext4_node *)node)->write_completion=0;
     return lwext4_error(result);
 }
@@ -2492,7 +2490,8 @@ static void initialize_backend(void)
     /* 首次在当前执行域生成回调；其他挂载不能再写远端读者共享的表。 */
     if (__atomic_load_n(&ext4_backend.pread_batch,__ATOMIC_ACQUIRE)) return;
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
-    ops->read_execution = KERNEL_VFS_READ_CALLER;
+    ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
+    ops->file_metadata_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;

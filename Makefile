@@ -465,7 +465,9 @@ LDFLAGS += -Wl,--wrap=kernel_wait_park
 endif
 ifeq ($(FILE_IO_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/file_io_smp.o
+$(BUILD_DIR)/tests/riscv/file_io_smp.o: CPPFLAGS += $(LWEXT4_CPPFLAGS)
 LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
+LDFLAGS += -Wl,--wrap=ext4_file_prepare_write,--wrap=ext4_ftruncate,--wrap=ext4_fallocate,--wrap=ext4_file_sync_metadata_prepare
 LDFLAGS += -Wl,--wrap=virtio_split_enqueue
 endif
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)

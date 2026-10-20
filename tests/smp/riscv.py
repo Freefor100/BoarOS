@@ -100,7 +100,9 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
             caller=f"0x{1 if cpus==2 else 0:x}"
             for marker in ("FILE IO native cold buffer/offset/prefix/sync/close owners passed",
                            "BLOCK caller reads hart="+caller,
+                           "BLOCK caller writes/flush hart="+caller,
                            "EXT4 direct backend read hart="+caller,
+                           "FILE IO caller metadata/submit hart="+caller,
                            "FILE IO cold mmap backend/submit hart="+caller):
                 if marker not in text: raise RuntimeError("missing caller file I/O evidence: "+marker)
         if contract=="file-io" and f"FILE IO local hot copy hart=0x{1 if cpus==2 else 0:x}" not in text:

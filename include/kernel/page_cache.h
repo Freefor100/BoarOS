@@ -196,12 +196,11 @@ enum kernel_page_cache_status kernel_page_cache_wait_writable(
 
 int kernel_page_cache_writeback(struct kernel_page_cache *cache,
                                  struct kernel_vfs_node *node);
-int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t end);
 int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end);
 /* 调用者持node/OFD寿命；每个128KiB窗口独立交给既有CPU0队列。
- * 跨窗口只保留页号及独占工作区，offset资格可随本次同步借用。 */
+ * 跨窗口只保留页号及独占工作区；可借用offset、文件写操作门闩的实际guard链，
+ * worker不反向获取这些低层门闩，调用者等待至全部窗口结束。 */
 int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *,
     struct kernel_vfs_node *, uint64_t start, uint64_t end,
     const struct kernel_lock_guard *borrowed);

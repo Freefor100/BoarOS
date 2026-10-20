@@ -368,7 +368,7 @@ static enum kernel_block_status read_image(void *unused,uint64_t offset,void *da
 }
 static enum kernel_block_status write_image(void *unused,uint64_t offset,const void *data,size_t size)
 {
-    (void)unused; assert(!kernel_cpu_current()->logical_id && !kernel_cpu_current()->raw_locks);
+    (void)unused; assert(!kernel_cpu_current()->raw_locks);
     return pwrite(image,data,size,offset)==(ssize_t)size?KERNEL_BLOCK_STATUS_OK:KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status flush_image(void *unused)

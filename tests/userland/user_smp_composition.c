@@ -340,7 +340,24 @@ static void ordinary_reads(void)
     unsigned char actual[48],expected[48];
     memcpy(expected,buffer,16);memcpy(expected+16,buffer,5);memcpy(expected+21,buffer+32,11);memcpy(expected+32,buffer,16);
     CHECK(pread(output,actual,sizeof(actual),0)==sizeof(actual) && !memcmp(actual,expected,sizeof(actual)));
-    CHECK(!close(output) && !unlink("/ordinary-write-target"));record("ordinary-write-pwrite-writev-local");
+    pin(1);
+    CHECK(!ftruncate(output,3*4096+17));
+    CHECK(!fallocate(output,FALLOC_FL_KEEP_SIZE,6*4096,4096));
+    struct stat space_stat;CHECK(!fstat(output,&space_stat) && space_stat.st_size==3*4096+17);
+    CHECK(!fallocate(output,0,4*4096,4096));
+    CHECK(!fstat(output,&space_stat) && space_stat.st_size==5*4096);
+    unsigned char *shared=mmap(0,8192,PROT_READ|PROT_WRITE,MAP_SHARED,output,0);
+    unsigned char *private=mmap(0,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE,output,0);
+    CHECK(shared!=MAP_FAILED && private!=MAP_FAILED && !shared[4096+7]);
+    private[4096+7]=0x6c;shared[4096+7]=0x5a;
+    CHECK(!msync(shared,8192,MS_SYNC) && !fsync(output));
+    CHECK(!fallocate(output,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,4096+3,4096-5));
+    CHECK(!shared[4096+7] && private[4096+7]==0x6c && !fdatasync(output));
+    CHECK(!munmap(shared,8192) && !munmap(private,8192) && !ftruncate(output,sizeof(actual)));
+    CHECK(lseek(output,0,SEEK_CUR)==32 && pread(output,actual,sizeof(actual),0)==sizeof(actual) &&
+        !memcmp(actual,expected,sizeof(actual)) && !fsync(output));
+    pin(0);
+    CHECK(!close(output) && !unlink("/ordinary-write-target"));record("ordinary-file-write-space-sync-local");
     CHECK(!munmap(buffer,17*4096));
 }
 static void mappings(void)

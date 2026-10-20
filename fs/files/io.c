@@ -1957,7 +1957,7 @@ static enum kernel_files_status truncate_pinned(struct kernel_open_file_descript
     uint64_t length,int64_t *linux_result,const struct kernel_lock_guard *borrowed,
     struct kernel_vfs_size_limit *limit)
 {
-    if (kernel_open_file_io_requires_cpu0(description)) {
+    if (kernel_vfs_file_metadata_requires_cpu0(&description->file)) {
         if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&description->file, &operation);

@@ -27,7 +27,6 @@ static void fallocate_cpu0(void *argument)
 enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
     int64_t fd, unsigned mode, int64_t offset, int64_t length, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!kernel_files_is_live(files) || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     KERNEL_FILES_PIN_SCOPE(pin);
     struct kernel_open_file_description *file = kernel_files_hold_fd(files,fd,&pin);
@@ -50,7 +49,7 @@ enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
     else if (file->kind == KERNEL_OPEN_FILE_KIND_BLOCK) *linux_result = -KERNEL_EOPNOTSUPP;
     else if (file->kind != KERNEL_OPEN_FILE_KIND_REGULAR) *linux_result = -KERNEL_ENODEV;
     else if (length > INT64_MAX - offset) *linux_result = -KERNEL_EFBIG;
-    else if (kernel_open_file_io_requires_cpu0(file)) {
+    else if (kernel_vfs_file_metadata_requires_cpu0(&file->file)) {
         struct kernel_io_context *io = kernel_io_context_current();
         if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
             !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return KERNEL_FILES_STATUS_STATE;
