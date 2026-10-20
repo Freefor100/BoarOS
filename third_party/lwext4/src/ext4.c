@@ -5533,6 +5533,21 @@ int ext4_dir_entry_next_status(ext4_dir *dir,
     }
     directory_size = ext4_inode_get_size(&dir_inode.fs->sb,
                                          dir_inode.inode);
+    /* The iterator already owns this inode snapshot. Publish its size to the
+     * adapter instead of requiring a second stat before every dirent. */
+    dir->f.fsize = directory_size;
+    if (!ext4_inode_is_type(&dir_inode.fs->sb, dir_inode.inode, EXT4_INODE_MODE_DIRECTORY)) {
+        result = ENOTDIR;
+        goto Finish;
+    }
+    if (!ext4_inode_get_links_cnt(dir_inode.inode)) {
+        result = ENOENT;
+        goto Finish;
+    }
+    if (dir->next_off >= directory_size) {
+        dir->next_off = UINT64_MAX;
+        goto Finish;
+    }
     result = ext4_dir_iterator_init(&it, &dir_inode, dir->next_off);
     if (result == EOK && it.curr != 0) {
         for (;;) {
@@ -5574,6 +5589,7 @@ int ext4_dir_entry_next_status(ext4_dir *dir,
     if (result == EOK && it.curr == 0) {
         dir->next_off = UINT64_MAX;
     }
+Finish:
     if (it.inode_ref != 0) {
         finish_result = ext4_dir_iterator_fini(&it);
         if (result == EOK && finish_result != EOK) {

@@ -729,12 +729,19 @@ int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
 int kernel_vfs_path_acquire(struct kernel_vfs_path *path)
 {
     if (!path) return -KERNEL_EINVAL;
+#if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (!path->references || path->references == UINT32_MAX) return -KERNEL_EOVERFLOW;
+    path->references++;
+    return 0;
+#else
     uint32_t references = __atomic_load_n(&path->references, __ATOMIC_ACQUIRE);
     for (;;) {
         if (!references || references == UINT32_MAX) return -KERNEL_EOVERFLOW;
         if (__atomic_compare_exchange_n(&path->references, &references, references + 1, 1,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
     }
+#endif
 }
 
 int kernel_vfs_path_release(struct kernel_vfs_path **owner)
@@ -743,6 +750,14 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
     struct kernel_vfs_path *path = *owner;
     *owner = 0;
     while (path) {
+#if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
+        {
+            KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+            if (!path->references) __builtin_trap();
+            if (--path->references) return 0;
+            unregister_path(path);
+        }
+#else
         uint32_t references = __atomic_load_n(&path->references, __ATOMIC_ACQUIRE);
         if (!references) __builtin_trap();
         if (references > 1) {
@@ -756,6 +771,7 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
             unregister_path(path);
         }
+#endif
         KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(path->file.mount));
         struct kernel_vfs_path *parent = path->parent;
         /* Registry retirement precedes backend close; close failures belong

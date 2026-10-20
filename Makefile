@@ -2406,6 +2406,7 @@ run-user-smp-riscv: kernel-rv-user-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp/kernel-rv
 test-user-smp-host:
 	@mkdir -p build/host/mm
+	$(MAKE) test-service-scope-host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
@@ -2611,3 +2612,11 @@ $(LA_BUILD)/cpu-account-cost: tests/accounting/cost.c $(LA_SQLITE_CC)
 .PHONY: test-accounting-cost-host
 test-accounting-cost-host:
 	python3 -B tests/accounting/cost_test.py
+
+.PHONY: test-service-scope-host
+test-service-scope-host:
+	@mkdir -p build/host/scope
+	@for mode in 0 1; do \
+	  cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=$$mode -idirafter include tests/host/service_scope.c -o build/host/scope/service-$$mode || exit; \
+	  build/host/scope/service-$$mode || exit; \
+	done

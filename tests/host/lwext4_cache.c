@@ -91,7 +91,7 @@ static void init(struct ext4_bcache *cache,struct ext4_blockdev *dev,
 static void finish(struct ext4_bcache *cache)
 {
     CHECK(!read_error && !write_error && !shared_read);
-    ext4_bcache_cleanup(cache);CHECK(!cache->ref_blocks && !live);
+    ext4_bcache_cleanup(cache);CHECK(!cache->ref_blocks && !cache->idle_blocks && !live);
     CHECK(ext4_bcache_fini_dynamic(cache)==EOK);
 }
 static void get(struct ext4_blockdev *dev,struct ext4_block *block,unsigned lba)
@@ -332,4 +332,4 @@ static void idle_order(void)
     finish(&cache);
     puts("cache LRU eviction follows idle age, without making a recent return oldest");
 }
-int main(void) { ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }
+int main(void) { ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(8,8,2,100);cycle(8,8,8,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }

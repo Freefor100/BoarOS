@@ -1,3 +1,4 @@
+#include "../../fs/ext4_backend.h"
 /* 最后一个目录/文件路径引用可由发起任务归还，不依赖 CPU0。 */
 static void namespace_retirement_case(struct kernel_heap *heap,
                                        struct kernel_vfs_mount *mount)
@@ -59,6 +60,9 @@ static void namespace_snapshot_case(struct kernel_heap *heap,
     char text[128];
     assert(!kernel_vfs_path_string(held.cwd,held.root,text,sizeof(text)) &&
            !strcmp(text,"/namespace-cwd-a"));
+    struct kernel_vfs_path *selected=NULL;
+    assert(!kernel_files_path_start(NULL,&held,KERNEL_FS_AT_FDCWD,"child",&selected) && selected==a);
+    assert(!kernel_vfs_path_release(&selected));
     struct kernel_fs_paths changed=kernel_fs_context_snapshot(&original);
     assert(changed.cwd==b);
     struct kernel_fs_paths isolated=kernel_fs_context_snapshot(&forked);
@@ -106,6 +110,10 @@ static void namespace_parent_case(struct kernel_heap *heap,
     assert(!kernel_vfs_unlink_at(parent,root,"hard",0));
     assert(!kernel_vfs_unlink_at(parent,root,"alias",0));
     assert(!kernel_vfs_unlink_at(parent,root,"fifo",0));
+    struct kernel_vfs_node *directory_node=kernel_vfs_file_node(&parent->file);
+    ext4_dir iterator={.f=*lwext4_node_file(directory_node),.next_off=UINT64_MAX-3};
+    iterator.f.fsize=0;ext4_direntry entry;uint64_t offset;
+    assert(!ext4_dir_entry_next_status(&iterator,&entry,&offset) && offset==UINT64_MAX && iterator.f.fsize>0);
     assert(!kernel_vfs_unlink_at(parent,root,"nested",1));
     assert(!kernel_vfs_unlink_at(root,root,"/namespace-renamed",1));
     assert(kernel_vfs_create_at(parent,root,"gone",0600,&file)==-KERNEL_ENOENT);

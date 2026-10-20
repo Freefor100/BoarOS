@@ -10,6 +10,7 @@
 struct kernel_pipe;
 struct kernel_record_lock;
 struct kernel_vfs_path;
+struct kernel_fs_paths;
 struct kernel_vfs_size_limit;
 void kernel_files_size_limit_notify(const struct kernel_vfs_size_limit *);
 struct kernel_files_pin_guard {
@@ -24,7 +25,7 @@ void kernel_files_path_guard_release(struct kernel_vfs_path **path);
 #define KERNEL_FILES_PATH_SCOPE(name) struct kernel_vfs_path *name __attribute__((cleanup(kernel_files_path_guard_release))) = 0
 
 int kernel_files_path_start(struct kernel_files *files,
-                            const struct kernel_fs_context *fs,
+                            const struct kernel_fs_paths *snapshot,
                             int64_t dirfd, const char *path,
                             struct kernel_vfs_path **start);
 
