@@ -681,7 +681,8 @@ static struct kernel_vfs_file *punch_file;
 static size_t punch_block;
 static void *punch_during_writeback(void *unused)
 {
-    (void)unused; cache_test_attach(0);
+    /* actor2 在 CPU1，等待 CPU0 worker 归还旧写回版本。 */
+    (void)unused; cache_test_attach(2);
     __atomic_store_n(&punch_started,1,__ATOMIC_RELEASE);
     assert(!kernel_vfs_fallocate(punch_file,3,punch_block,3*punch_block));
     __atomic_store_n(&punch_completed,1,__ATOMIC_RELEASE);
@@ -698,10 +699,10 @@ static void active_writeback(struct kernel_vfs_mount *mount)
     assert(!pthread_create(&writer,NULL,sync_file,&file));
     wait_progress(&write_entered,1);
     punch_file=&file; punch_block=kernel_vfs_file_node(&file)->instance->writeback_block_size;
-    unsigned parked=mm_test_parked(0);
+    unsigned parked=mm_test_parked(2);
     assert(!pthread_create(&puncher,NULL,punch_during_writeback,NULL));
     wait_progress(&punch_started,1);
-    while (mm_test_parked(0)==parked) sched_yield();
+    while (mm_test_parked(2)==parked) sched_yield();
     assert(!punch_completed);
     __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
     assert(!pthread_join(writer,NULL) && !pthread_join(puncher,NULL));
