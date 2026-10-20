@@ -61,10 +61,14 @@ int main(int argc, char **argv)
     second_reader = &f;
     armed = true;
     struct ext4_inode actual;
+    memset(&actual, 0xa5, sizeof(actual));
     int outer = ext4_fraw_inode_fill(&f, &actual);
     printf("checksum read %s: block=%u inode=%u outer=%d second=%d modified=%d\n",
         argv[2], dev.lg_bsize, ext4_get16(&fs->sb, inode_size), outer, nested_status, changed);
     CHECK(!armed && outer == EOK && nested_status == EOK && !changed);
+    if (!gdt) CHECK(!memcmp(&actual, original, observed_size < sizeof(actual) ? observed_size : sizeof(actual)));
+    size_t inode_size=ext4_get16(&fs->sb, inode_size);
+    for (size_t i=inode_size;i<sizeof(actual);i++) CHECK(!((unsigned char *)&actual)[i]);
     CHECK(!memcmp(original, observed, observed_size));
     CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
     CHECK(ext4_fs_put_block_group_ref(&group) == EOK);

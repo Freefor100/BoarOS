@@ -4252,8 +4252,9 @@ int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode)
 	inode_size = ext4_get16(&mp->fs.sb, inode_size);
 	if (inode_size > sizeof(*inode))
 		inode_size = sizeof(*inode);
-	memset(inode, 0, sizeof(*inode));
 	memcpy(inode, inode_ref.inode, inode_size);
+	/* Only the absent suffix needs zeros; the on-disk prefix is overwritten. */
+	memset((uint8_t *)inode + inode_size, 0, sizeof(*inode) - inode_size);
 	r = ext4_fs_put_inode_ref(&inode_ref);
 	EXT4_MP_UNLOCK(mp);
 	return r;
