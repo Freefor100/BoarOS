@@ -53,7 +53,12 @@ enum kernel_fs_context_status kernel_fs_context_move(
     struct kernel_fs_context *destination,
     struct kernel_fs_context *source);
 
-int kernel_fs_context_is_live(const struct kernel_fs_context *fs);
+/* The caller owns this wrapper throughout the query. CLONE_FS shares the
+ * record, not the wrapper; borrowing its mutable contents requires snapshot. */
+static inline int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
+{
+    return fs && fs->state == KERNEL_FS_CONTEXT_LIVE && fs->heap && fs->record;
+}
 
 /* An owned pair is coherent with CLONE_FS cwd replacement and context move. */
 struct kernel_fs_paths {

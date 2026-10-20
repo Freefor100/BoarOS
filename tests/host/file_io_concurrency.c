@@ -965,6 +965,7 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     namespace_retirement_case(&heap,&mount);
     namespace_snapshot_case(&heap,&mount);
+    namespace_parent_snapshot_case(&heap,&mount);
     namespace_parent_case(&heap,&mount);
     raw_mounted_flush_case(&heap,&mount,&disk);
     worker_lock_close_case(&heap,&mount,&cache);

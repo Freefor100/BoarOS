@@ -364,6 +364,14 @@ uint32_t kernel_vfs_path_mode(const struct kernel_vfs_path *path)
     return node->mode;
 }
 
+struct kernel_vfs_path *kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path)
+{
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    struct kernel_vfs_path *parent = path ? path->parent : NULL;
+    if (parent && kernel_vfs_path_acquire(parent)) __builtin_trap();
+    return parent;
+}
+
 int kernel_vfs_path_readlink(struct kernel_vfs_path *path, char *buffer,
                               size_t size, size_t *read)
 {
@@ -381,16 +389,11 @@ static void release_path_pin(struct kernel_vfs_path **path)
 {
     if (*path && kernel_vfs_path_release(path) != 0) __builtin_trap();
 }
-#define VFS_PATH_PIN(name, value) \
-    struct kernel_vfs_path *name __attribute__((cleanup(release_path_pin))) = (struct kernel_vfs_path *)(value); \
-    if (kernel_vfs_path_acquire(name) != 0) __builtin_trap()
-
 int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
                          struct kernel_vfs_stat *stat)
 {
     if (path == 0 || path->references == 0U)
         return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     return kernel_vfs_fstat(&path->file, stat);
 }
 
@@ -400,7 +403,6 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
 {
     KERNEL_SERVICE_SCOPE_IF(service, parent && kernel_vfs_namespace_requires_cpu0(parent->file.mount));
     if (!parent || !parent->file.mount || !parent->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, parent);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(parent->file.mount, &namespace_guard);
     if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing)
@@ -673,7 +675,6 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path **owner)
 {
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, start);
     return resolve_object(start, root, path, follow_final, 0, 0, 1,
                           owner, 0);
 }
@@ -804,7 +805,6 @@ int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
 
@@ -816,7 +816,6 @@ int kernel_vfs_path_set_mode(struct kernel_vfs_path *path, uint32_t mode)
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
 
@@ -836,7 +835,6 @@ static int path_string(const struct kernel_vfs_path *path,
                        char *buffer, size_t capacity, int allow_deleted)
 {
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     if (!root || !buffer || capacity < 2U) return -KERNEL_ERANGE;
     kernel_task_lock_guard irq = {0};
     kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
@@ -917,7 +915,6 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
 
@@ -1454,7 +1451,6 @@ int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->references) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     if ((kernel_vfs_path_mode(path) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
         return -KERNEL_EISDIR;
     return kernel_vfs_ftruncate_borrowing(&path->file, size, NULL, limit);
@@ -2852,7 +2848,6 @@ int kernel_vfs_path_set_owner(struct kernel_vfs_path *path, uint32_t uid, uint32
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    VFS_PATH_PIN(path_pin, path);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
     return kernel_vfs_file_set_owner(&path->file, uid, gid);

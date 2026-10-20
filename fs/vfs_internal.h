@@ -10,6 +10,9 @@
 
 /* Weak identities, mount edges and FS context publication; no I/O or callbacks. */
 extern struct kernel_raw_lock kernel_vfs_state_lock;
+struct kernel_vfs_path;
+/* Capture a mutable parent edge and its owner in the same state protection. */
+struct kernel_vfs_path *kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path);
 #include <stdint.h>
 
 struct kernel_vfs_file;

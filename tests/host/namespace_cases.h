@@ -80,6 +80,49 @@ static void namespace_snapshot_case(struct kernel_heap *heap,
     puts("PASS shared cwd replacement: owned snapshot, fork isolation, move and final context release");
 }
 
+struct namespace_parent_move {
+    struct kernel_vfs_path *root;
+    pthread_barrier_t gate;
+};
+static void *namespace_move_child(void *argument)
+{
+    struct namespace_parent_move *move=argument;
+    mm_test_attach(1);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
+    pthread_barrier_wait(&move->gate);
+    assert(!kernel_vfs_rename_at(move->root,move->root,move->root,
+        "/namespace-old-parent/child","/namespace-new-parent/child",0));
+    assert(!kernel_vfs_unlink_at(move->root,move->root,"/namespace-old-parent",1));
+    mm_test_finish();return NULL;
+}
+static void namespace_parent_snapshot_case(struct kernel_heap *heap,
+                                           struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL,*child=NULL,*parent;
+    struct kernel_vfs_file file={0};struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-old-parent",0700));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-new-parent",0700));
+    assert(!kernel_vfs_create_at(root,root,"/namespace-old-parent/child",0600,&file));
+    assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_path_resolve(root,root,"/namespace-old-parent/child",1,&child));
+    parent=kernel_vfs_path_parent_pin(child);assert(parent);
+    uint64_t inode=kernel_vfs_path_inode(parent);
+    struct namespace_parent_move move={.root=root};pthread_t thread;
+    assert(!pthread_barrier_init(&move.gate,NULL,2));
+    assert(!pthread_create(&thread,NULL,namespace_move_child,&move));
+    pthread_barrier_wait(&move.gate);
+    assert(!pthread_join(thread,NULL) && !pthread_barrier_destroy(&move.gate));
+    assert(!kernel_vfs_path_stat(parent,&stat) && stat.ino==inode && !stat.nlink);
+    struct kernel_vfs_path *next=kernel_vfs_path_parent_pin(child);
+    assert(next && kernel_vfs_path_inode(next)!=inode);
+    assert(!kernel_vfs_path_release(&next) && !kernel_vfs_path_release(&parent));
+    assert(!kernel_vfs_path_release(&child));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-new-parent/child",0));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-new-parent",1));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS owned parent snapshot survives remote child rename and old-parent removal");
+}
+
 /* 目录身份由 dirfd/path 引用固定，改名后直接在同一个父 inode 下操作。 */
 static void namespace_parent_case(struct kernel_heap *heap,
                                   struct kernel_vfs_mount *mount)

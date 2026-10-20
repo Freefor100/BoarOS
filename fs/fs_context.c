@@ -30,22 +30,11 @@ static void finish_context(struct kernel_fs_context *fs,
     fs->state = state;
 }
 
-static int context_live(const struct kernel_fs_context *fs)
-{
-    return fs && fs->state==KERNEL_FS_CONTEXT_LIVE && fs->heap && fs->record;
-}
-
-int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
-{
-    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-    return context_live(fs);
-}
-
 struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *fs)
 {
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
     struct kernel_fs_paths paths = {0};
-    if (context_live(fs)) {
+    if (kernel_fs_context_is_live(fs)) {
         paths.root = fs->record->root;
         paths.cwd = fs->record->cwd;
         paths.umask = fs->record->umask;
@@ -132,7 +121,7 @@ enum kernel_fs_context_status kernel_fs_context_acquire(
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-    if (!empty_context(destination) || !context_live(source) ||
+    if (!empty_context(destination) || !kernel_fs_context_is_live(source) ||
         source->record->references == UINT32_MAX) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
@@ -154,7 +143,7 @@ enum kernel_fs_context_status kernel_fs_context_fork(
     struct kernel_fs_paths paths __attribute__((cleanup(kernel_fs_paths_release))) = {0};
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-        if (!empty_context(destination) || !context_live(source))
+        if (!empty_context(destination) || !kernel_fs_context_is_live(source))
             return KERNEL_FS_CONTEXT_STATUS_STATE;
         heap = source->heap;
         paths = (struct kernel_fs_paths){source->record->root, source->record->cwd,
@@ -186,14 +175,14 @@ enum kernel_fs_context_status kernel_fs_context_move(
 uint32_t kernel_fs_context_umask(const struct kernel_fs_context *fs)
 {
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-    return context_live(fs) ? fs->record->umask : 0U;
+    return kernel_fs_context_is_live(fs) ? fs->record->umask : 0U;
 }
 
 int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
                                     uint32_t requested, uint32_t *previous)
 {
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-    if (!context_live(fs) || previous == 0) return -KERNEL_EINVAL;
+    if (!kernel_fs_context_is_live(fs) || previous == 0) return -KERNEL_EINVAL;
     *previous = fs->record->umask;
     fs->record->umask = requested & 0777U;
     return 0;
@@ -213,7 +202,7 @@ int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
     struct kernel_vfs_path *previous;
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-        if (!context_live(fs)) __builtin_trap();
+        if (!kernel_fs_context_is_live(fs)) __builtin_trap();
         previous = fs->record->cwd;
         fs->record->cwd = path;
     }
@@ -306,7 +295,7 @@ enum kernel_fs_context_status kernel_fs_context_release(struct kernel_fs_context
     struct kernel_heap *heap;
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-        if (!context_live(fs) || !fs->record->references || !fs->record->root)
+        if (!kernel_fs_context_is_live(fs) || !fs->record->references || !fs->record->root)
             return KERNEL_FS_CONTEXT_STATUS_STATE;
         heap = fs->heap;
         record = fs->record;
