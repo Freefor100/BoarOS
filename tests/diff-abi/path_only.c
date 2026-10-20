@@ -27,9 +27,41 @@ static void directory_capacity_cases(void)
     abi_require(SC1(57, fd) == 0);
 }
 
+static void create_open_cases(void)
+{
+    abi_require(SC3(34,-100,"/open-create-dir",0755)==0);
+    long file=abi_open("/open-create-file",2|64);abi_require(file>=0 && !SC1(57,file));
+    abi_require(!SC3(36,"open-create-absent",-100,"/open-create-link"));
+    abi_require(!SC3(36,"open-create-dir",-100,"/open-create-linkdir"));
+    static const struct {const char *id,*path;long flags;} cases[]={
+        {"create.existing","/open-create-file",64},
+        {"create.directory","/open-create-dir",64},
+        {"create.exclusive-directory","/open-create-dir",64|128},
+        {"create.exclusive-link","/open-create-link",64|128},
+        {"create.nofollow-link","/open-create-link",64|0400000},
+        {"create.dangling","/open-create-link",64},
+        {"create.file-slash","/open-create-file/",64},
+        {"create.exclusive-file-slash","/open-create-file/",64|128},
+        {"create.exclusive-directory-slash","/open-create-dir/",64|128},
+        {"create.linkdir-slash","/open-create-linkdir/",64|0400000},
+        {"create.missing-slash","/open-create-missing/",64},
+        {"create.parent-missing-slash","/open-create-parent/child/",64},
+    };
+    for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        long fd=abi_open(cases[i].path,cases[i].flags);
+        record(cases[i].id,fd<0?fd:0);if(fd>=0)SC1(57,fd);
+    }
+    abi_require(!SC3(35,-100,"/open-create-absent",0));
+    abi_require(!SC3(35,-100,"/open-create-link",0));
+    abi_require(!SC3(35,-100,"/open-create-linkdir",0));
+    abi_require(!SC3(35,-100,"/open-create-file",0));
+    abi_require(!SC3(35,-100,"/open-create-dir",0x200));
+}
+
 void abi_path_only_cases(void)
 {
     directory_capacity_cases();
+    create_open_cases();
     abi_require(SC3(34,-100,"/path-proc",0755)==0 && SC5(40,"proc","/path-proc","proc",0,0)==0);
     long fd=abi_open("/path-target",2|64|128); abi_require(fd>=0);
     abi_require(SC3(64,fd,"data",4)==4);
@@ -110,6 +142,19 @@ void abi_path_only_cases(void)
     else abi_record("path.proc-live-content",reopened,-1,-1,0,0,0);
     struct abi_stat followed;long followed_result=SC4(79,-100,proc_live,&followed,0);
     abi_record("path.proc-live-stat",followed_result,followed_result? -1:followed.size,-1,0,0,0);
+    int pipe_fds[2];abi_require(SC2(59,pipe_fds,0)==0);
+    live_pos=0;while(base[live_pos]){proc_live[live_pos]=base[live_pos];live_pos++;}
+    live_num=(unsigned)pipe_fds[0];live_used=0;
+    do {live_digits[live_used++]=(char)('0'+live_num%10);live_num/=10;}while(live_num);
+    while(live_used)proc_live[live_pos++]=live_digits[--live_used];
+    proc_live[live_pos]=0;
+    long pipe_open=abi_open(proc_live,64);
+    record("path.proc-pipe-create",pipe_open<0?pipe_open:0);
+    abi_require(SC3(64,pipe_fds[1],"Q",1)==1);
+    char pipe_data=0;long pipe_count=pipe_open>=0?SC3(63,pipe_open,&pipe_data,1):pipe_open;
+    abi_record("path.proc-pipe-content",pipe_count,-1,-1,0,&pipe_data,1);
+    if(pipe_open>=0)SC1(57,pipe_open);
+    abi_require(SC1(57,pipe_fds[0])==0 && SC1(57,pipe_fds[1])==0);
     long fsinfo[15];long fsresult=SC2(44,path,fsinfo);
     abi_record("path.statfs",fsresult,-1,-1,0,fsresult?0:fsinfo,fsresult?0:2*sizeof(long));
     abi_require(SC3(35,dir,"path-target",0)==0);

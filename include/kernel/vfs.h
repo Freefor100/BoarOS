@@ -152,9 +152,21 @@ int kernel_vfs_path_link_string(const struct kernel_vfs_path *path,
                                 char *buffer, size_t capacity);
 /* Copy one bounded basename while rename publication is protected. */
 int kernel_vfs_path_copy_name(const struct kernel_vfs_path *path, char *buffer, size_t capacity);
+enum kernel_vfs_open_flags {
+    KERNEL_VFS_OPEN_FOLLOW = 1U << 0,
+    KERNEL_VFS_OPEN_CREATE = 1U << 1,
+    KERNEL_VFS_OPEN_EXCLUSIVE = 1U << 2,
+    KERNEL_VFS_OPEN_EXECUTABLE = 1U << 3,
+    KERNEL_VFS_OPEN_PATH_ONLY = 1U << 4,
+};
+struct kernel_vfs_open_request { unsigned flags; uint32_t mode; };
+/* One lookup yields an existing identity or its held parent and missing name.
+ * FOLLOW is explicit: syscall O_EXCL omits it; strict VFS create may follow.
+ * created reports an actual filesystem creation, independently of OFD setup. */
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
-                       int follow_final, struct kernel_vfs_file *file);
+                       const struct kernel_vfs_open_request *request,
+                       struct kernel_vfs_file *file, int *created);
 /* Only special final links handle this; ENOTSUP means ordinary resolution. */
 int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path, struct kernel_heap *heap,
@@ -162,9 +174,6 @@ int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
 int kernel_vfs_create_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          uint32_t mode, struct kernel_vfs_file *file);
-int kernel_vfs_open_executable_at(struct kernel_vfs_path *start,
-                                  struct kernel_vfs_path *root,
-                                  const char *path, struct kernel_vfs_file *file);
 int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *path,
                         uint32_t mode, uint32_t device);

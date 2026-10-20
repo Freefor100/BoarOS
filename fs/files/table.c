@@ -666,8 +666,7 @@ enum kernel_files_status kernel_files_open_boot_console(
     }
     struct kernel_open_file_description *description = 0;
     enum kernel_open_file_status open_status = kernel_open_file_create_at(
-        files->heap, root, root, "/dev/console", KERNEL_OPEN_PATH_FOLLOW,
-        0U, &description, &result);
+        files->heap, root, root, "/dev/console", &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW}, &description, NULL, &result);
     if (open_status != KERNEL_OPEN_FILE_STATUS_OK)
         return open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
             ? KERNEL_FILES_STATUS_NO_MEMORY : KERNEL_FILES_STATUS_STATE;

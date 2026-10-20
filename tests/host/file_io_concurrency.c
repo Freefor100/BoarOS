@@ -967,6 +967,8 @@ int main(int argc,char **argv)
     namespace_snapshot_case(&heap,&mount);
     namespace_parent_snapshot_case(&heap,&mount);
     namespace_parent_case(&heap,&mount);
+    namespace_open_request_case(&heap,&mount);
+    namespace_create_competing_case(&heap,&mount);
     raw_mounted_flush_case(&heap,&mount,&disk);
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);

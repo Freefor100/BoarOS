@@ -2611,8 +2611,8 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
         kernel_vfs_mknod_at(root, root, "/fifo", KERNEL_VFS_S_IFIFO | 0600, 0))
         fail_files(600U, 0, -1);
     int result;
-    if (kernel_open_file_create_at(heap, root, root, "/fifo", KERNEL_OPEN_PATH_FOLLOW, 0,
-            &file, &result) != KERNEL_OPEN_FILE_STATUS_OK || result)
+    if (kernel_open_file_create_at(heap, root, root, "/fifo", &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW},
+            &file, NULL, &result) != KERNEL_OPEN_FILE_STATUS_OK || result)
         fail_files(601U, 0, result);
     struct kernel_vfs_node *node = file->file.private_data;
     struct kernel_pipe *pipe = 0;

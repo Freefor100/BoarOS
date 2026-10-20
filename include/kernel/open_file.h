@@ -55,19 +55,12 @@ enum kernel_open_file_kind {
 
 /* VFS errors are returned through linux_result when status is OK. */
 struct kernel_vfs_path;
-enum kernel_open_file_path_operation {
-    KERNEL_OPEN_PATH_FOLLOW,
-    KERNEL_OPEN_PATH_NOFOLLOW,
-    KERNEL_OPEN_PATH_CREATE,
-    KERNEL_OPEN_PATH_EXECUTABLE,
-    KERNEL_OPEN_PATH_ONLY,
-    KERNEL_OPEN_PATH_ONLY_NOFOLLOW,
-};
+struct kernel_vfs_open_request;
 enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
-    enum kernel_open_file_path_operation operation, uint32_t mode,
-    struct kernel_open_file_description **owner, int *linux_result);
+    const struct kernel_vfs_open_request *request,
+    struct kernel_open_file_description **owner, int *created, int *linux_result);
 
 enum kernel_open_file_status kernel_open_file_create(
     struct kernel_heap *heap,

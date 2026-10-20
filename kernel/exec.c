@@ -500,7 +500,7 @@ static enum exec_capture_status expand_scripts(
         int path_result;
         if (kernel_open_file_create_at(transaction->heap,
                 fs_paths.cwd, fs_paths.root, name,
-                KERNEL_OPEN_PATH_EXECUTABLE, 0, &transaction->executable_file,
+                &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW | KERNEL_VFS_OPEN_EXECUTABLE}, &transaction->executable_file, NULL,
                 &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
             return EXEC_CAPTURE_STATE;
         if (path_result) {
@@ -630,8 +630,8 @@ enum kernel_exec_status kernel_execve_prepare(
     KERNEL_FS_PATHS(fs_paths, fs);
     if (kernel_open_file_create_at(transaction->heap,
             fs_paths.cwd, fs_paths.root,
-            transaction->original_path, KERNEL_OPEN_PATH_EXECUTABLE, 0,
-            &transaction->executable_file, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
+            transaction->original_path, &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW | KERNEL_VFS_OPEN_EXECUTABLE},
+            &transaction->executable_file, NULL, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
         return finish_prepare_state(task, transaction);
     if (path_result != 0) {
         return finish_prepare_failure(task,
@@ -705,8 +705,8 @@ enum kernel_exec_status kernel_execve_prepare(
     if (interpreter_path != 0) {
         if (kernel_open_file_create_at(transaction->heap,
                 fs_paths.cwd, fs_paths.root,
-                interpreter_path, KERNEL_OPEN_PATH_EXECUTABLE, 0,
-                &transaction->interpreter_file, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
+                interpreter_path, &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW | KERNEL_VFS_OPEN_EXECUTABLE},
+                &transaction->interpreter_file, NULL, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
             return finish_prepare_state(task, transaction);
         if (path_result != 0) {
             return finish_prepare_failure(task,

@@ -237,44 +237,27 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    enum kernel_open_file_path_operation operation =
-        ((flags & LINUX_O_NOFOLLOW) ||
-         (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) == (LINUX_O_CREAT | LINUX_O_EXCL))
-            ? KERNEL_OPEN_PATH_NOFOLLOW : KERNEL_OPEN_PATH_FOLLOW;
-    if (flags & LINUX_O_PATH)
-        operation = (flags & LINUX_O_NOFOLLOW) ? KERNEL_OPEN_PATH_ONLY_NOFOLLOW : KERNEL_OPEN_PATH_ONLY;
-    for (;;) {
-        created = 0;
-        open_status = kernel_open_file_create_at(files->heap, start,
-                        fs_paths.root, path, operation, 0,
-                        &description, &result);
-        if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
-            result == -KERNEL_ENOENT && operation == KERNEL_OPEN_PATH_FOLLOW) {
-            int link_result = kernel_vfs_reopen_link_at(start,
-                fs_paths.root, path, files->heap,
-                (uint32_t)flags, &description);
-            if (link_result != -KERNEL_ENOTSUP) {
-                result = link_result;
-                special_link = !result;
-            }
+    struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW,
+        .mode=(uint32_t)(mode & ~fs_paths.umask)};
+    if (flags & LINUX_O_NOFOLLOW) request.flags &= ~KERNEL_VFS_OPEN_FOLLOW;
+    if (flags & LINUX_O_PATH) request.flags |= KERNEL_VFS_OPEN_PATH_ONLY;
+    else if (flags & LINUX_O_CREAT) {
+        request.flags |= KERNEL_VFS_OPEN_CREATE;
+        if (flags & LINUX_O_EXCL) {
+            request.flags |= KERNEL_VFS_OPEN_EXCLUSIVE;
+            request.flags &= ~KERNEL_VFS_OPEN_FOLLOW;
         }
-        if (result == -KERNEL_ELOOP &&
-            (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
-                (LINUX_O_CREAT | LINUX_O_EXCL))
-            result = -KERNEL_EEXIST;
-        if (open_status != KERNEL_OPEN_FILE_STATUS_OK ||
-            result != -KERNEL_ENOENT || !(flags & LINUX_O_CREAT))
-            break;
-        created = 1;
-        open_status = kernel_open_file_create_at(files->heap, start,
-                        fs_paths.root, path, KERNEL_OPEN_PATH_CREATE,
-                        (uint32_t)(mode & ~kernel_fs_context_umask(fs)),
-                        &description, &result);
-        /* Another creator won between lookup and the target mount lock. */
-        if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
-            result == -KERNEL_EEXIST && !(flags & LINUX_O_EXCL))
-            continue;
-        break;
+    }
+    open_status=kernel_open_file_create_at(files->heap,start,fs_paths.root,path,
+                        &request,&description,&created,&result);
+    if (open_status==KERNEL_OPEN_FILE_STATUS_OK && result==-KERNEL_ENOENT &&
+        (request.flags & KERNEL_VFS_OPEN_FOLLOW) &&
+        !(request.flags & KERNEL_VFS_OPEN_EXCLUSIVE)) {
+        int link_result=kernel_vfs_reopen_link_at(start,fs_paths.root,path,files->heap,
+                                                (uint32_t)flags,&description);
+        if (link_result!=-KERNEL_ENOTSUP) {
+            result=link_result;special_link=!result;
+        }
     }
     kernel_files_release_allocation(files, path);
     if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
@@ -297,14 +280,6 @@ enum kernel_files_status kernel_files_openat(
     if (kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
         (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
         kernel_service_scope_begin(&service);
-    if (!created && (flags & LINUX_O_CREAT) != 0U &&
-        (flags & LINUX_O_EXCL) != 0U) {
-        KERNEL_FILES_NOTE(files, open_failures, 1);
-        kernel_files_queue_description(files, description);
-        (void)kernel_files_drain_file_cleanup(files);
-        *linux_result = -KERNEL_EEXIST;
-        return KERNEL_FILES_STATUS_OK;
-    }
     if (flags & LINUX_O_PATH) {
         if ((flags & LINUX_O_DIRECTORY) &&
             (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {

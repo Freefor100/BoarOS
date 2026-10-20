@@ -80,6 +80,96 @@ static void namespace_snapshot_case(struct kernel_heap *heap,
     puts("PASS shared cwd replacement: owned snapshot, fork isolation, move and final context release");
 }
 
+struct namespace_creator {
+    struct kernel_vfs_path *root;
+    const char *name;
+    pthread_barrier_t *gate;
+    unsigned actor,exclusive;
+    int error,created;
+    uint64_t inode;
+};
+static void *namespace_create_competing(void *argument)
+{
+    struct namespace_creator *creator=argument;
+    mm_test_attach(creator->actor+1);mm_test_activate_task();
+    kernel_cpu_current()->logical_id=creator->actor;
+    struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW |
+        KERNEL_VFS_OPEN_CREATE | (creator->exclusive?KERNEL_VFS_OPEN_EXCLUSIVE:0),.mode=0600};
+    struct kernel_vfs_file file={0};
+    pthread_barrier_wait(creator->gate);
+    creator->error=kernel_vfs_open_at(creator->root,creator->root,creator->name,
+                                     &request,&file,&creator->created);
+    if (!creator->error) {
+        creator->inode=kernel_vfs_file_inode(&file);
+        assert(!kernel_vfs_close(&file));
+    }
+    mm_test_finish();return NULL;
+}
+static void namespace_create_competing_case(struct kernel_heap *heap,
+                                            struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL;
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    for(unsigned exclusive=0;exclusive<2;exclusive++) {
+        pthread_barrier_t gate;pthread_t threads[2];
+        struct namespace_creator creators[2];
+        assert(!pthread_barrier_init(&gate,NULL,3));
+        for(unsigned i=0;i<2;i++) {
+            creators[i]=(struct namespace_creator){.root=root,.name="/namespace-competing",
+                .gate=&gate,.actor=i,.exclusive=exclusive};
+            assert(!pthread_create(&threads[i],NULL,namespace_create_competing,&creators[i]));
+        }
+        pthread_barrier_wait(&gate);
+        for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+        assert(!pthread_barrier_destroy(&gate));
+        assert(creators[0].created+creators[1].created==1);
+        if(exclusive)assert((!creators[0].error && creators[1].error==-KERNEL_EEXIST) ||
+                            (!creators[1].error && creators[0].error==-KERNEL_EEXIST));
+        else assert(!creators[0].error && !creators[1].error &&
+                    creators[0].inode==creators[1].inode);
+        assert(!kernel_vfs_unlink_at(root,root,"/namespace-competing",0));
+    }
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS competing opens: one creator, shared existing inode, exclusive loser and final owners");
+}
+
+static void namespace_open_request_case(struct kernel_heap *heap,
+                                        struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL;
+    struct kernel_vfs_file file={0};int created=-1;
+    struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW |
+        KERNEL_VFS_OPEN_CREATE,.mode=0640};
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    assert(!kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created) && created==1);
+    uint64_t inode=kernel_vfs_file_inode(&file);
+    assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created) && !created);
+    assert(kernel_vfs_file_inode(&file)==inode && !kernel_vfs_close(&file));
+    request.flags|=KERNEL_VFS_OPEN_EXCLUSIVE;
+    request.flags&=~KERNEL_VFS_OPEN_FOLLOW;
+    assert(kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created)==-KERNEL_EEXIST && !created);
+    assert(!kernel_vfs_symlink_at(root,root,"namespace-open-target","/namespace-open-link"));
+    assert(kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&created)==-KERNEL_EEXIST);
+    request.flags=KERNEL_VFS_OPEN_CREATE;
+    assert(kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&created)==-KERNEL_ELOOP);
+    request.flags|=KERNEL_VFS_OPEN_FOLLOW;
+    assert(!kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&created) && created);
+    assert(!kernel_vfs_close(&file));
+    struct kernel_vfs_instance *instance=mount->private_data;
+    unsigned read_only=instance->read_only;instance->read_only=1;
+    request.flags|=KERNEL_VFS_OPEN_EXCLUSIVE;
+    request.flags&=~KERNEL_VFS_OPEN_FOLLOW;
+    assert(kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created)==-KERNEL_EEXIST);
+    assert(kernel_vfs_open_at(root,root,"/namespace-open-missing",&request,&file,&created)==-KERNEL_EROFS);
+    instance->read_only=read_only;
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-open-link",0));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-open-target",0));
+    assert(!kernel_vfs_unlink_at(root,root,"/namespace-open",0));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS unified open/create: created identity, exclusive/symlink and read-only precedence");
+}
+
 struct namespace_parent_move {
     struct kernel_vfs_path *root;
     pthread_barrier_t gate;

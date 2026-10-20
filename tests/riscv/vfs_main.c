@@ -766,7 +766,7 @@ static void run_shared_path_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_path_release(&dot) != 0 ||
         kernel_vfs_path_lookup(first, "..", 2U, &dot) != 0 || dot != root ||
         kernel_vfs_path_release(&dot) != 0 ||
-        kernel_vfs_open_at(first, root, ".", 1, &reopened) != 0 ||
+        kernel_vfs_open_at(first, root, ".", &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW}, &reopened, NULL) != 0 ||
         !kernel_vfs_files_share_node(&directory, &reopened) ||
         kernel_vfs_path_string(first, root, name, sizeof(name)) != -KERNEL_ENOENT ||
         kernel_vfs_close(&reopened) != 0 ||
@@ -853,7 +853,7 @@ static void run_deep_relative_path_regression(struct kernel_vfs_mount *mount,
     if (kernel_vfs_create_at(current, root, "leaf", 0600, &file) ||
         kernel_vfs_close(&file) ||
         kernel_vfs_symlink_at(current, root, "leaf", "link") ||
-        kernel_vfs_open_at(current, root, "link", 1, &file) ||
+        kernel_vfs_open_at(current, root, "link", &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW}, &file, NULL) ||
         kernel_vfs_close(&file) ||
         kernel_vfs_unlink_at(current, root, "link", 0) ||
         kernel_vfs_unlink_at(current, root, "leaf", 0))

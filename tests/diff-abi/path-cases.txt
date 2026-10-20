@@ -3,6 +3,18 @@ getdents.small-before-eof
 getdents.capacity-cookie
 getdents.zero-at-eof
 getdents.zero-after-rewind
+create.existing
+create.directory
+create.exclusive-directory
+create.exclusive-link
+create.nofollow-link
+create.dangling
+create.file-slash
+create.exclusive-file-slash
+create.exclusive-directory-slash
+create.linkdir-slash
+create.missing-slash
+create.parent-missing-slash
 path.open
 path.getfl
 path.getfd
@@ -53,6 +65,8 @@ path.dup
 path.proc-live-reopen
 path.proc-live-content
 path.proc-live-stat
+path.proc-pipe-create
+path.proc-pipe-content
 path.statfs
 path.recreate-identity
 path.poll
