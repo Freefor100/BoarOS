@@ -103,7 +103,7 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 | glibc `float_*` 的线程退出／取消 | 完整旧日志已有 `libgcc_s.so.1` 缺失；glibc 需要它展开线程栈，缺库会 abort。 | 属于原盘依赖。musl 的 SIGSEGV 单独保留归因；见[慢项分类](oscomp-ltp-analysis.md#慢项与超时分类)。 |
 | LA musl 的四个 `sched_*` 函数 | 原 libc 直接返回 ENOSYS，尚未进入内核；对应上游 musl 的接口语义取舍。 | 默认 LA musl 通过调度 DSO 调用真实 Linux syscall，原 cyclictest 已获得样本；见[运行时接入](oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。 |
 | RV 原静态 glibc 的 clock 测试 | malloc 初始化遇 getrandom/EAGAIN 后把 errno 留到 main；后续 clock 调用成功，原断言仍看到旧 errno。 | 当前启动种子在运行测例前完成随机源初始化；指令级对照见[errno 来源](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
-| `mkdir02/readlink01` 的用户数据库 | 固定输入根盘缺少 `/etc/passwd`，`getpwnam("nobody")` 返回 ENOENT，准备阶段即结束。 | 本轮四配置各丢两分；程序尚未进入权限断言。当前得分和准备位置见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)，可变凭据能力继续由 goals 维护。 |
+| `mkdir02/readlink01` 的用户数据库 | 固定输入根盘缺少 `/etc/passwd`，`getpwnam("nobody")` 返回 ENOENT，准备阶段即结束。 | 本轮四配置均在 setup 结束；mkdir02 的 GID/SGID 继承和 readlink01 的 root/nobody 两身份读取尚未执行。账户文件补齐后仍需真实凭据切换能力。当前得分和准备位置见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)，可变凭据能力继续由 goals 维护。 |
 | `getdents01` 的四种入口 | 旧 getdents syscall 在两种架构上无入口，部分 libc 也没有导出相应 wrapper；这些分项记 TCONF。 | 四配置共七条 TCONF；有效 getdents64 分项通过。对应分项、得分和时间见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)。 |
 | RV 原 musl 的浮点 ABI 标注 | 原测例标注double-float ABI，原libc标注soft-float；设置`LTP_TIMEOUT_MUL=0.1`时观察到异常巨大时限。 | 信号等待的正式复核沿用未设置该变量的默认30秒；该原输入差异独立于EINTR重试，保留在定向运行记录。 |
 | libc-test 的部分共同失败 | 固定 Linux 上同一原 ELF 也失败，例如缺 UTF-8 locale、glibc 的 ERE 扩展与原断言预期不同。 | 逐项 Linux/BoarOS 输出见[对照附件](oscomp-libctest-original-failures.tsv)及[具体触发条件](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |

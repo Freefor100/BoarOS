@@ -261,8 +261,13 @@ RV glibc/LA glibc 的 libc getdents() 未导出，LA musl 的 libc getdents64() 
 
 `mkdir02.c:54` 和 `readlink01.c:74` 调用 getpwnam("nobody") 时返回 ENOENT；
 固定输入盘缺少 `/etc/passwd`，两程序在改变凭据和测试主体之前结束。
-共同短回归检查了目录/链接的实际语义；本批原程序未进入的权限步骤仍列为未执行，
-多用户凭据与权限执行继续在能力目录中维护。输入与判分差异的索引见 [测例问题](oscomp-test-issues.md)。
+`mkdir02` 随后需要设置父目录 GID/SGID、切换实际/有效 UID/GID，检查新目录继承组和 SGID；
+`readlink01` 则在 root 和 nobody 两种身份下读取相同符号链接，setup 失败也挡住了 root 分项。
+补充账户文件解决名字到 UID/GID 的查询；后续身份切换仍依赖 main 中待实现的可变凭据。
+89/104 是本批日志的实际判分；`readlink01` 此时只记一个 broken，进入主体后有两个身份分项，分母会随输出改变。
+四份原 libc 的动态符号亦已核对：两份 glibc 只有 getdents64，RV musl 两个名字同地址，
+LA musl 只有 getdents。可用 wrapper 和 raw getdents64 均进入同一个内核目录枚举接口。
+输入与判分差异的索引见 [测例问题](oscomp-test-issues.md)。
 
 两架构正常退出后，根盘、工具 ext4、VFAT 和 scratch ext4 共八次检查均为 0；
 启动种子槽已擦除。定向运行结束后恢复默认 `make all`，两架构默认内核与保存副本逐字节一致。
