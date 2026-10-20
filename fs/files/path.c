@@ -749,7 +749,6 @@ static enum kernel_files_status stat_at_to_user(
     uint64_t flags,
     int64_t *linux_result, int extended)
 {
-    KERNEL_FS_PATHS(fs_paths, fs);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_linux_stat stat = {0};
     struct kernel_vfs_stat vfs_stat;
@@ -795,6 +794,9 @@ static enum kernel_files_status stat_at_to_user(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
+    /* A descriptor-only stat borrows its OFD, not root/cwd. Acquire the
+     * path snapshot only for operations that actually resolve a path. */
+    KERNEL_FS_PATHS(fs_paths, fs);
     if (!empty) {
         enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
                                              KERNEL_FS_PATH_MAX, (void **)&path);
