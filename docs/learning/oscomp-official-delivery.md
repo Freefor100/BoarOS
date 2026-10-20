@@ -230,6 +230,47 @@ CPU记账的旧成本、资源限制一轮的功能净影响及定时器启用�
 
 原始输出、逐项结果、实际kernel/init/QEMU身份与fsck分别位于`build/resource-limits-timers/original/`、`original-capget02/`及`build/signal-local-rv/original/`。最新汇总`build/signal-local-rv/current-original-results.json`逐项保存来源；信号最终通用回归位于同目录`*-return/`，限额/查询的既有独立回归仍保留在前一目录。构建缓存、ELF和必要日志保留，检查后的运行盘清理。
 
+## 目录与路径当前结果
+
+通用源码为 main `9d428eb`，兼容集成为 `f688084`。默认交付与定向配置分别生成内核；
+定向配置只将原 LTP 外层枚举限定为下表十项，保留原 ELF、libc、参数、内部时限及 judge。
+固定官方容器、两架构 QEMU 10.0.2、1 CPU/1 GiB 和官方设备参数沿用前文。
+RV/LA 功能运行并行，各架构内 glibc/musl 顺序运行。
+
+共 40 次程序运行，零超时；32 次程序正常结束，8 次在准备阶段报 TBROK。
+原 judge 合计 **89/104**：RV glibc 22/26、RV musl 23/26、LA 两种 libc 各 22/26。
+时间为程序总墙钟秒数，包含其自身准备、子进程与清理。
+
+| 原程序 | 原 judge 得分 RV-g/RV-m/LA-g/LA-m | RV glibc s | RV musl s | LA glibc s | LA musl s |
+|---|---|---:|---:|---:|---:|
+| open01 | 2/2（四配置相同） | 0.172 | 0.084 | 0.136 | 0.065 |
+| openat01 | 5/5（四配置相同） | 0.088 | 0.063 | 0.065 | 0.042 |
+| getdents01 | 2/4 / 3/4 / 2/4 / 2/4 | 0.084 | 0.062 | 0.106 | 0.090 |
+| mkdir02 | 0/1（四配置相同） | 0.066 | 0.063 | 0.063 | 0.043 |
+| rename01 | 8/8（四配置相同） | 9.324 | 8.939 | 7.169 | 6.806 |
+| link02 | 2/2（四配置相同） | 0.065 | 0.062 | 0.062 | 0.042 |
+| symlink01 | 0/0（四配置相同） | 0.063 | 0.042 | 0.068 | 0.042 |
+| readlink01 | 0/1（四配置相同） | 0.063 | 0.042 | 0.069 | 0.041 |
+| unlink05 | 2/2（四配置相同） | 0.062 | 0.062 | 0.069 | 0.063 |
+| rmdir01 | 1/1（四配置相同） | 0.065 | 0.064 | 0.066 | 0.064 |
+
+`open01/openat01/rename01/link02/unlink05/rmdir01` 的有效断言通过；`symlink01` 每配置五条 TPASS，原 judge 记 0/0。
+`getdents01` 的七条 TCONF 来自旧 getdents 架构入口或 libc 导出差异：四配置均没有旧 syscall，
+RV glibc/LA glibc 的 libc getdents() 未导出，LA musl 的 libc getdents64() 对应分项缺入口；
+原始 raw getdents64 和可用 libc 分项通过。原 judge 将这些分项计入分母。
+
+`mkdir02.c:54` 和 `readlink01.c:74` 调用 getpwnam("nobody") 时返回 ENOENT；
+固定输入盘缺少 `/etc/passwd`，两程序在改变凭据和测试主体之前结束。
+共同短回归检查了目录/链接的实际语义；本批原程序未进入的权限步骤仍列为未执行，
+多用户凭据与权限执行继续在能力目录中维护。输入与判分差异的索引见 [测例问题](oscomp-test-issues.md)。
+
+两架构正常退出后，根盘、工具 ext4、VFAT 和 scratch ext4 共八次检查均为 0；
+启动种子槽已擦除。定向运行结束后恢复默认 `make all`，两架构默认内核与保存副本逐字节一致。
+当前源码的通用回归与性能见 [数据路径实验](data-path-budget-experiments.md#rv-ext4-目录与路径在调用-cpu-执行2026-10-20)。
+原始程序结果、得分、耗时、QEMU/内核/盘身份、判分及磁盘检查保存在
+`build/namespace-stage/delivery/original/`；构建与恢复记录在上级。运行盘完成检查后清理，
+缓存、ELF、串口与必要日志保留。
+
 ## 文件 I/O 当前结果
 
 本表完成于2026-10-20，源码为 main `442bb26`，经 `2528bbb` 合入兼容分支。
