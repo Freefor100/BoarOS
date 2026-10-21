@@ -274,7 +274,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无普通用户任务跨核及文件/共享后备 MM 的 SMP 闭环、PI futex、实时信号队列、sigaltstack 或 clone3。受控 RV 两核边界见[两核模块](riscv-smp.md)。LoongArch 已验证整数 context、timer 抢占、信号、musl TLS/pthread、动态 musl/DSO TLS、标量 FPU 与 LSX/LASX；更广程序与多核仍需独立验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作已支持真实双核，执行位置和后端并发范围见[两核模块](riscv-smp.md)。四核、PI futex、实时信号队列、sigaltstack和clone3仍属后续能力。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
@@ -284,8 +284,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 ## 存储等待与清理任务
 
-任务 I/O owner 来自当前执行栈的 TP；调度器提前发布 cpu.current 时仍归旧栈。
-`include/kernel/task_state.h` 提供实际嵌入字段的共同内部布局，RV/LA 使用相同任务所有权。
+任务的 I/O 上下文随当前执行栈保存。RV/LA 从内核 TP 取得实际任务；调度器可以在切栈前将 `cpu.current` 发布为下一任务，此时 I/O owner 仍属于旧栈。RV 用编译器的固定 TP 寄存器变量表达同一状态，切换和陷入汇编沿原规则保存／恢复；CPU 字段仍在需要时从当前任务读取。热点直接按共同任务布局取得嵌入字段，普通外部入口与宿主替身保留相同行为。
 
 `kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal。争用者按 FIFO 排队；释放时先给队首写者预留独占资格，或给连续队首读者预留共享资格，再定向唤醒。预留者尚未运行时也阻止新到任务抢占；排队写者后的读者及 try_read 不能越过队列。等待不可中断，信号退出在取得与释放后处理，栈上的等待记录不被提前销毁。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
 
