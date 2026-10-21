@@ -644,7 +644,7 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 `kernel_vfs_*_at()` 使用持有引用的 start/root 对象，修改传入父 inode 和单个名称；已解析父目录不会因改名而变为同名新对象。活路径和 inode 使用弱 AVL 索引，查找与发布由状态短保护同步，目录并发规则见前文。没有负目录项缓存。目录枚举读取真实 inode 大小，打开后扩展目录不会漏掉新块。
 
-`ext4_rename_child()` 以父 inode 和名称为入口，调用者持有相关目录和拓扑的 namespace 资格。先检查类型、目标空目录、祖先关系和资源，再在一个事务里处理目录项、`..`、父目录 nlink、时间与覆盖目标的持久 orphan。VFS 在调用前从 source 路径所属堆预留新名并取得父引用；替换、失败及最后释放均向同一堆归还名称。成功后在状态短保护内替换 source 的 parent/name 并断开 target。无失败后的内存分配，也不会将已打开的 target 换成 source。rmdir 同样用检查 checksum 和记录边界的空目录扫描，损坏目录不能被当作空目录删除。
+`ext4_rename_child()` 以父 inode 和名称为入口，调用者持有相关目录和拓扑的 namespace 资格。先检查类型、目标空目录、祖先关系和资源，再在一个事务里处理目录项、`..`、父目录 nlink、时间与覆盖目标的持久 orphan。VFS 在调用前从 source 路径所属堆预留新名并取得父引用；替换、失败及最后释放均向同一堆归还名称。成功后在状态短保护内替换 source 的 parent/name 并断开 target。无失败后的内存分配，也不会将已打开的 target 换成 source。rmdir 同样用检查 checksum 和记录边界的空目录扫描，损坏目录不能被当作空目录删除。HTree 根升层及内部结点分裂共用扣除 checksum 尾部后的容量，目录索引项与尾部校验值各占自己的空间。
 
 聚焦验证：`make test-vfs-riscv test-files-riscv test-lwext4-rename-host`，组合验证为 `make test-userland-riscv test-diff-abi-riscv`。rename host 矩阵包含 1/4 KiB、linear/HTree、orphan_file/传统链、覆盖/插入/目录扩展，逐点 OOM 和断电后重复恢复及 `e2fsck -fn`；VFS 测试另覆盖改名后对象共享、活覆盖目标、删除 cwd、17 层 255 字节目录名的相对修改。
 

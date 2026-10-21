@@ -114,11 +114,15 @@ static void seed_split(struct ext4_fs *fs)
         snprintf(name, 12, "fill-%05u-", i); name[11] = 'x';
         snprintf(path, sizeof(path), "/new/%s", name);
         write_file(path, "FILL");
-        uint64_t before = ext4_sb_get_free_blocks_cnt(&fs->sb);
+        uint64_t before = ext4_fs_available_blocks(fs);
         CHECK(ext4_transaction_begin("/") == EOK);
         struct ext4_rename_result out;
-        CHECK(rename_entry(old, "dir", new, split_name, 0, &out) == EOK);
-        bool allocated = ext4_sb_get_free_blocks_cnt(&fs->sb) < before;
+        int renamed = rename_entry(old, "dir", new, split_name, 0, &out);
+        if (renamed != EOK) fprintf(stderr, "split preparation: iteration=%u errno=%d old=%u new=%u\n", i, renamed, old, new);
+        CHECK(renamed == EOK);
+        /* Accepted counters stay unchanged until admission; availability
+         * includes the allocation owned by this still-private operation. */
+        bool allocated = ext4_fs_available_blocks(fs) < before;
         CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
         CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb) == before);
         if (allocated) return;
@@ -226,7 +230,8 @@ static void basic(struct ext4_fs *fs)
 static void wide(struct ext4_fs *fs)
 {
     uint32_t parent = directory("/new");
-    for (unsigned i = 0; i < 180; i++) {
+    /* 512 long names force a checksummed 1 KiB HTree above its root. */
+    for (unsigned i = 0; i < 512; i++) {
         char old[240], new[240], path[260];
         memset(old, 'a' + i % 26, 220); old[220] = 0;
         snprintf(old, 12, "old-%06u-", i); old[11] = 'x';
@@ -241,6 +246,19 @@ static void wide(struct ext4_fs *fs)
         content(path, "WIDE");
     }
     CHECK(links(fs, parent) == 3);
+    if (ext4_sb_get_block_size(&fs->sb) == 1024) {
+        struct ext4_inode_ref ref;
+        CHECK(ext4_fs_get_inode_ref_read(fs, parent, &ref) == EOK);
+        if (ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_INDEX)) {
+            ext4_fsblk_t home;
+            struct ext4_block root;
+            CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &home, false) == EOK);
+            CHECK(ext4_block_get(fs->bdev, &root, home) == EOK);
+            CHECK(((struct ext4_dir_idx_root *)root.data)->info.indirect_levels == 1);
+            CHECK(ext4_block_set(fs->bdev, &root) == EOK);
+        }
+        CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
+    }
 }
 
 static void damage(struct ext4_fs *fs, const char *kind)

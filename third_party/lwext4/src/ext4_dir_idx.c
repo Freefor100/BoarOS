@@ -1069,9 +1069,10 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 
 	uint32_t block_size = ext4_sb_get_block_size(&ino_ref->fs->sb);
 	uint32_t entry_space = block_size - sizeof(struct ext4_fake_dir_entry);
-	uint32_t node_limit =  entry_space / sizeof(struct ext4_dir_idx_entry);
-
 	bool meta_csum = ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM);
+	/* The limit locates the checksum tail as well as bounding entries. */
+	if (meta_csum) entry_space -= sizeof(struct ext4_dir_idx_tail);
+	uint32_t node_limit = entry_space / sizeof(struct ext4_dir_idx_entry);
 
 	if (dxb == dx_blks)
 		e = ((struct ext4_dir_idx_root *)dxb->b.data)->en;
@@ -1139,9 +1140,6 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 			ext4_dir_dx_climit_set_count(left_climit, count_left);
 			ext4_dir_dx_climit_set_count(right_climit, count_right);
 
-			if (meta_csum)
-				entry_space -= sizeof(struct ext4_dir_idx_tail);
-
 			ext4_dir_dx_climit_set_limit(right_climit, node_limit);
 
 			/* Which index block is target for new entry */
@@ -1183,9 +1181,6 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 			memcpy(new_en, e, sz);
 
 			struct ext4_dir_idx_climit *new_climit = (void*)new_en;
-			if (meta_csum)
-				entry_space -= sizeof(struct ext4_dir_idx_tail);
-
 			ext4_dir_dx_climit_set_limit(new_climit, node_limit);
 
 			/* Set values in root node */
