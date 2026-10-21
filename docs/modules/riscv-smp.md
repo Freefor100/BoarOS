@@ -145,7 +145,7 @@ host直接链接生产DTB、调度/策略/runqueue/raw实现，验证稀疏身�
 同配置生产ELF的BSS比单CPU多25056字节，包含新增记录和链接对齐。
 资格挑选O(1)，入队/摘除最多维护两份资格索引。每次启动报告IPI发送/接收、RFENCE请求与整启动耗时，
 次数随交错变化，不作为固定协议常数；未以这些正确性运行宣称并行吞吐收益。
-`SMP=1 COST_DIAGNOSTICS=1`在构建前拒绝，单CPU成本路径保持。
+上述 2026-10-11 验证当时不支持 SMP 成本观测；当前 SMP 观测独立构建在 `build/cost-smp/`，使用方法见[成本观测模块](kernel-cost.md)。正式性能关闭 COST 与锁调试。
 
 实际RFENCE执行器及输入SHA由runner记录；使用`-bios default`时只记录默认选择，
 精确固件身份需显式传入`QEMU_RISCV_FIRMWARE`。本地封存执行器和CI执行器各自记录，
@@ -193,7 +193,7 @@ make test-mm-file-smp-riscv
 make test-mm-file-smp-userland-riscv INIT_CONFIG=config/init.json
 ```
 
-产物缓存位于 `build/riscv-mm-file-smp-test/`，默认单CPU入口及SMP+COST拒绝规则保持。新登记状态采用inode独占的首次映射准备，不增加任务字段或永久MM引用；每次启动核对arena、页/表、堆、栈、等待、OFD/登记和私有挂载owner。
+产物缓存位于 `build/riscv-mm-file-smp-test/`，默认单CPU入口保持。新登记状态采用inode独占的首次映射准备，不增加任务字段或永久MM引用；每次启动核对arena、页/表、堆、栈、等待、OFD/登记和私有挂载owner。
 
 ## 受控 ext4 映射域
 
@@ -221,7 +221,7 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 自然退出要求arena回到4079页、页/表/堆/任务栈/等待/请求/别名及挂载owner归还，
 根盘PID1与设备收口另核对；两盘e2fsck必须成功。OFF日志分列setup/业务/清理tick，
 缓存请求、peak pages、后台写入/延期和MM准备/退休计数；它们随交错变化，不是并行收益。
-存储配置见[VFS/ext4](vfs-ext4.md#当前成本边界)，SMP+COST继续拒绝；实际QEMU/OpenSBI身份由runner保存。
+存储配置见[VFS/ext4](vfs-ext4.md#当前成本边界)；实际QEMU/OpenSBI身份由runner保存。
 接口、结构成本和竞态背景见[MM](kernel-mm.md#ext4-文件映射)、
 [VFS](vfs-ext4.md#后台写回与水位回收)及[存储学习说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。
 
@@ -243,7 +243,7 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 ## 普通文件IO的执行位置
 
-ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。SMP journal 挂载的路径操作按实际目录取得共享或独占资格，rename 另由挂载拓扑互斥协调；已打开文件操作按实际 inode／块组取得资格。不同对象的私有修改可同时准备，接纳时合并版本和计数。默认单核、无 journal 挂载及其他后端保留原串行策略。journal/checkpoint 与后台数据写回由 CPU0 推进，启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
+ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。实际启动多个 CPU 的可写 journal 挂载，其路径操作按实际目录取得共享或独占资格，rename 另由挂载拓扑互斥协调；已打开文件操作按实际 inode／块组取得资格。不同对象的私有修改可同时准备，接纳时合并版本和计数。实际单 CPU、只读、无 journal 挂载及其他后端保留原串行策略。journal/checkpoint 与后台数据写回由 CPU0 推进，启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
 
 普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 
