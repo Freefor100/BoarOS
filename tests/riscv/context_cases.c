@@ -1,4 +1,4 @@
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
 
@@ -103,7 +103,10 @@ static unsigned long run_init_cases(void)
 static unsigned long run_register_helper_cases(void)
 {
     void *original_thread = riscv_current_thread_get();
-    void *test_thread = (void *)(uintptr_t)UINT64_C(0xffffffff80003000);
+    static struct { uintptr_t prefix[4]; void *cpu; } records[2];
+    records[0].cpu = &records[0];
+    records[1].cpu = &records[1];
+    void *test_thread = &records[0];
     uintptr_t old_status;
     unsigned long failures = 0U;
 
@@ -132,10 +135,22 @@ static unsigned long run_register_helper_cases(void)
     __asm__ volatile("csrci sstatus, 2" ::: "memory");
 
     riscv_current_thread_set(test_thread);
-    if (riscv_current_thread_get() != test_thread) {
+    void *observed;
+    __asm__ volatile("mv %0, tp" : "=r"(observed));
+    if (riscv_current_thread_get() != test_thread || observed != test_thread ||
+        arch_current_cpu_get() != records[0].cpu) {
+        failures++;
+    }
+    void *saved_thread = riscv_current_thread_get();
+    riscv_current_thread_set(&records[1]);
+    __asm__ volatile("mv %0, tp" : "=r"(observed));
+    if (saved_thread != test_thread || riscv_current_thread_get() != &records[1] ||
+        observed != &records[1] || arch_current_cpu_get() != records[1].cpu) {
         failures++;
     }
     riscv_current_thread_set(original_thread);
+    __asm__ volatile("mv %0, tp" : "=r"(observed));
+    if (observed != original_thread) failures++;
 
     return failures;
 }
