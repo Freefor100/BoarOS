@@ -92,7 +92,7 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
     unsigned tail=(JBD_HAS_INCOMPAT_FEATURE(wire,JBD_FEATURE_INCOMPAT_CSUM_V2) ||
         JBD_HAS_INCOMPAT_FEATURE(wire,JBD_FEATURE_INCOMPAT_CSUM_V3))?sizeof(struct jbd_block_tail):0;
     unsigned tags=(journal->block_size-sizeof(struct jbd_bhdr)-tail-UUID_SIZE)/tag_bytes;
-    unsigned boundary=0,changed_shape=0;
+    unsigned boundary=0,changed_shape=0,heap_prefixes=0;
     for(unsigned index=0;index<512 && !boundary;index++) {
         uint64_t lba=adapter->device.lg_bcnt-1-index;
         struct jbd_trans *pending=NULL;
@@ -108,11 +108,15 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
         baseline=jbd_memory_used(journal);credits=journal->log_reserved;
         unsigned images=journal->running->reserved_log_images;
         trans=serial_log_private(adapter,lba);used=jbd_memory_used(journal);
+        serial_heap_failure=UINT32_MAX;serial_heap_calls=0;
         assert(!jbd_trans_prepare_operation(trans));
+        serial_heap_failure=0;
+        unsigned allocations=serial_heap_calls;
         assert(trans->reservation_group_sequence==journal->running->sequence &&
                trans->reserved_logs==1+trans->reserved_log_images && trans->reserved_log_images<=1);
         if(trans->reserved_log_images) {
             boundary=1;
+            heap_prefixes=allocations;assert(heap_prefixes);
             size_t charge=jbd_memory_used(journal)-used;
             assert(charge && journal->log_reserved==credits+2);
             jbd_journal_free_trans(journal,trans,true);
@@ -125,7 +129,9 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
             jbd_memory_set_limit(journal,limit);
             jbd_journal_free_trans(journal,trans,true);
             assert(journal->log_reserved==credits && jbd_memory_used(journal)==baseline);
-            for(unsigned failure=1;failure<=4;failure++) {
+            /* Count this real descriptor-boundary preparation first: batching
+             * changes heap calls, but every remaining failure must roll back. */
+            for(unsigned failure=1;failure<=heap_prefixes;failure++) {
                 trans=serial_log_private(adapter,lba);
                 denials=jbd_memory_budget_failures(journal);
                 serial_heap_failure=failure;serial_heap_calls=0;
@@ -161,7 +167,7 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
     }
     jbd_memory_set_cache_disabled(journal,false);
     adapter->locks.unlock(adapter->locks.context);
-    puts("PASS serial log delta: real qualification/target loss, same-sequence shape change, duplicate LBA/revoke, descriptor boundary, exact quota and four actual OOM prefixes return owners");
+    printf("PASS serial log delta: real qualification/target loss, same-sequence shape change, duplicate LBA/revoke, descriptor boundary, exact quota and %u actual OOM prefixes return owners\n",heap_prefixes);
 }
 int __real_jbd_trans_get_write_access_range(struct jbd_trans *,struct ext4_block *,uint32_t,uint32_t);
 int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_block *block,

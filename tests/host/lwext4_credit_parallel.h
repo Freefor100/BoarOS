@@ -33,6 +33,11 @@ static struct {
     unsigned baseline, fail_after, calls, paused_credits;
     bool paused, resume, blocked, finished;
 } credit_test;
+static struct {
+    bool capture, io_active;
+    void *allocation;
+    unsigned released, io_calls;
+} log_batch_owner;
 
 static void credit_state_lock(void *context)
 {
@@ -76,10 +81,28 @@ static bool credit_heap_failure(void)
 }
 void *__real_calloc(size_t, size_t);
 void *__real_malloc(size_t);
+void __real_free(void *);
 void *__wrap_calloc(size_t count, size_t bytes)
-{ return credit_heap_failure() ? NULL : __real_calloc(count, bytes); }
+{
+    void *result = credit_heap_failure() ? NULL : __real_calloc(count, bytes);
+    /* Only the controlled four-node preparation allocates a 512-byte header
+     * while capture is enabled; images use 128-byte headers plus 1/4K data. */
+    if (result && log_batch_owner.capture && count * bytes == 512) {
+        CHECK(!log_batch_owner.allocation);
+        log_batch_owner.allocation = result;
+    }
+    return result;
+}
 void *__wrap_malloc(size_t bytes)
 { return credit_heap_failure() ? NULL : __real_malloc(bytes); }
+void __wrap_free(void *pointer)
+{
+    if (pointer && pointer == log_batch_owner.allocation) {
+        log_batch_owner.allocation = NULL;
+        log_batch_owner.released++;
+    }
+    __real_free(pointer);
+}
 
 struct credit_call {
     struct ext4_blockdev *dev;
@@ -464,7 +487,7 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
     uint64_t baseline_budget_failures = jbd_memory_budget_failures(journal);
     unsigned cases = 0, failures = 0;
     for (unsigned private_access = 0; private_access < 2; private_access++) {
-        unsigned last_failure = private_access ? 9 : 8;
+        unsigned last_failure = 0;
         for (unsigned fail_after = 0; fail_after <= last_failure; fail_after++) {
             /* Keep a genuine immutable group in the ring while both new
              * preparers own independent credits. No disk writes run yet. */
@@ -531,6 +554,9 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
             CHECK(!pthread_join(first, NULL) && !pthread_join(second, NULL));
             CHECK(!blocked); /* B must complete before A's allocator returns. */
             CHECK(a.result == (fail_after ? ENOMEM : EOK));
+            /* Exercise every real allocation prefix, including the new batch
+             * owner, without preserving the old one-call-per-node layout. */
+            if (!fail_after) { last_failure = credit_test.calls; CHECK(last_failure); }
             if (fail_after) CHECK(credit_test.calls == fail_after);
             if (a.trans) jbd_journal_free_trans(journal, a.trans, true);
             if (private_access) CHECK(ext4_block_set(dev, &a.block) == EOK);

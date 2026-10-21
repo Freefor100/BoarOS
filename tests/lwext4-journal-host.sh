@@ -8,7 +8,7 @@ cc=${HOST_CC:-cc}
 "$cc" -std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-unused-but-set-variable \
     -Wno-stringop-truncation -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${JOURNAL_TEST_CFLAGS:-} \
     -DTEST_JBD_RECORD_COPY -DTEST_JBD_CREDIT_PARALLEL -fno-builtin-memcpy \
-    -Wl,--wrap=memcpy -Wl,--wrap=calloc -Wl,--wrap=malloc -Wl,--wrap=ext4_crc32c \
+    -Wl,--wrap=memcpy -Wl,--wrap=calloc -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=ext4_crc32c \
     -Wl,--wrap=kernel_raw_lock_acquire,--wrap=ext4_bcache_find_get,--wrap=ext4_bcache_publish \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_journal.c" \
@@ -21,6 +21,14 @@ for block in 1024 4096; do
     truncate -s 32M "$work/group-base.img"
     mkfs.ext4 -q -F -b "$block" "$work/group-base.img"
     debugfs -w -R "write $work/data /probe" "$work/group-base.img" >/dev/null 2>&1
+    for fault in 0 1 2; do
+        cp "$work/group-base.img" "$work/log-batch.img"
+        timeout 30 "$work/probe" "$work/log-batch.img" log-batch "$fault"
+        expected=65
+        [ "$fault" -eq 0 ] || expected=79
+        timeout 30 "$work/probe" "$work/log-batch.img" recover-crash "$expected"
+        e2fsck -fn "$work/log-batch.img" >/dev/null
+    done
     cp "$work/group-base.img" "$work/record-borrow.img"
     timeout 30 "$work/probe" "$work/record-borrow.img" record-borrow
     e2fsck -fn "$work/record-borrow.img" >/dev/null

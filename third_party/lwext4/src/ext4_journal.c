@@ -654,6 +654,7 @@ static int jbd_block_set(struct jbd_fs *jbd_fs,
 /* Reserve all log buffers, mappings and transaction space before touching
  * ordered data. Otherwise a later ENOMEM could roll back inode size while
  * leaving already-written data outside the aborted size change visible. */
+struct jbd_log_batch;
 struct jbd_log_block {
 	struct ext4_block_write io;
 	struct ext4_block_write *escaped_rest;
@@ -661,12 +662,26 @@ struct jbd_log_block {
 	struct ext4_block block;
 	struct jbd_image *image;
 	TAILQ_ENTRY(jbd_log_block) node;
+	struct jbd_log_batch *batch;
+};
+
+struct jbd_log_batch {
+    unsigned remaining;
+    struct jbd_log_block nodes[];
 };
 
 static void jbd_log_free(struct jbd_log_block *log)
 {
+    struct jbd_log_batch *batch = log->batch;
     jbd_image_free(log->image);
-    jbd_free(log);
+    if (!batch) jbd_free(log);
+    else {
+        /* Siblings start in one private operation and move together into one
+         * group. STATE trims that group; its frozen consumer then owns every
+         * survivor through I/O completion. No cross-group release races exist. */
+        if (!batch->remaining) __builtin_trap();
+        if (!--batch->remaining) jbd_free(batch);
+    }
 }
 
 static unsigned jbd_log_free_blocks(const struct jbd_journal *journal)
@@ -798,15 +813,29 @@ static int jbd_reserve_logs(struct jbd_trans *trans, unsigned payloads, unsigned
         journal->log_reserved += count;
     }
 	while (count) {
-		struct jbd_log_block *log = jbd_alloc(trans->journal, sizeof(*log));
-		if (!log) {
+        /* 4/2/1 keeps the existing per-node charge without a large allocation.
+         * Partial trim retains the whole allocated block until its last node;
+         * its actual charge stays with the original journal memory owner. */
+        unsigned nodes = count >= 4 ? 4 : count >= 2 ? 2 : 1;
+        struct jbd_log_batch *batch = NULL;
+        struct jbd_log_block *logs;
+        if (nodes == 1) logs = jbd_alloc(journal, sizeof(*logs));
+        else {
+            batch = jbd_alloc(journal, sizeof(*batch) + nodes * sizeof(*logs));
+            logs = batch ? batch->nodes : NULL;
+        }
+		if (!logs) {
             JBD_STATE_SCOPE(journal);
             if (journal->log_reserved < count) __builtin_trap();
             journal->log_reserved -= count;
             return ENOMEM;
         }
-		jbd_log_reserve_insert(trans, log);
-        count--;
+        if (batch) batch->remaining = nodes;
+        for (unsigned i = 0; i < nodes; i++) {
+            logs[i].batch = batch;
+            jbd_log_reserve_insert(trans, &logs[i]);
+        }
+        count -= nodes;
 	}
 	return jbd_reserve_log_images(trans, images);
 }
