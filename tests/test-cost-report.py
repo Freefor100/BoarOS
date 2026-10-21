@@ -706,6 +706,23 @@ class FixedMetadataTest(unittest.TestCase):
         self.assertEqual(rows['metadata-create']['operations'],2048)
         self.assertEqual(rows['metadata-create']['children_maxrss_kib'],256)
         validate_resume_selection('metadata',{'metadata_fixed_only':True},None)
+    def test_parallel_work_requires_the_new_fixed_windows(self):
+        from cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        with self.assertRaises(ValueError):
+            validate_metadata_fixed(output,timings,2,parallel=True)
+        extra={'metadata-paired-stat':4096,'metadata-paired-open':4096,
+               'metadata-paired-rename':2048,'metadata-paired-append':4096}
+        for name,count in extra.items():
+            output += (f'\nCOST METADATA WORK {name} {count}'
+                       f'\nCOST METADATA LATENCY {name} 10 20 30'
+                       f'\nCOST METADATA RSS {name} 128 256')
+            timings[name]=100
+        rows=validate_metadata_fixed(output,timings,2,parallel=True)
+        self.assertEqual(rows['metadata-paired-append']['operations'],4096)
+        with self.assertRaises(ValueError):
+            validate_metadata_fixed(output,timings,2)
+
     def test_duplicate_missing_wrong_cpu_and_bad_latency_are_errors(self):
         from cost_report import validate_metadata_fixed
         output,timings=self.fixture()
@@ -717,5 +734,15 @@ class FixedMetadataTest(unittest.TestCase):
                 validate_metadata_fixed(bad,timings,2)
         with self.assertRaises(ValueError):validate_metadata_fixed(output,{**timings,'metadata-create':0},2)
         with self.assertRaises(ValueError):validate_resume_selection('metadata',{'metadata_fixed_only':True,'consumer_command_names':['consumer-musl-1']},None)
+
+    def test_malformed_extra_metadata_record_is_rejected(self):
+        from cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        for line in ('COST METADATA WORK metadata-create 2048 junk',
+                     'COST METADATA CPUS 2 junk',
+                     'COST METADATA LATENCY metadata-create 10 20 30 junk',
+                     'COST METADATA RSS metadata-create 128 256 junk'):
+            with self.subTest(line=line),self.assertRaises(ValueError):
+                validate_metadata_fixed(output+'\n'+line,timings,2)
 
 if __name__ == '__main__': unittest.main()

@@ -200,7 +200,7 @@ def prepare(args):
                                     fixture_identity=file_identity(image.parent / 'input.json'))
     scripts = ('cost-match-riscv.py', 'cost-riscv.py', 'cost_match.py', 'cost_match_report.py',
                'cost_policy.py', 'cost_measurement.py', 'cost_report.py', 'cost_fixture.py',
-               'cost_seed.py', 'cost_consumer.py', 'cost_policy_guard.py')
+               'cost_seed.py', 'cost_consumer.py', 'cost_policy_guard.py', 'qemu_thread_affinity.py')
     inputs['scripts'] = {name: file_identity(ROOT / 'tests' / name) for name in scripts}
     paths = sorted(subprocess.check_output(['git', 'ls-files', '-co', '--exclude-standard'], cwd=ROOT,
                                           text=True).splitlines())

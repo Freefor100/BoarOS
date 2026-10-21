@@ -1930,6 +1930,7 @@ test-cost-host: test-cost-match-host test-cost-diagnostic-host test-cost-boundar
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
 	build/cost/host/memory-test
 	python3 -B tests/test-cost-report.py
+	python3 -B tests/test-cost-qmp.py
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all
 	python3 -B tests/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)

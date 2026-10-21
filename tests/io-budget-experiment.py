@@ -29,6 +29,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,8 @@ _spec.loader.exec_module(helpers)
 digest, save, output = helpers.digest, helpers.save, helpers.output
 harness = helpers.harness
 contracts = helpers.contracts
+from qemu_thread_affinity import pin_qemu_threads, host_cpu_selection, host_cpu_topology
+from cost_seed import seed_arguments, validate_resume_seed
 DEFAULT_CASES = ('ext4:append:cache:1:1M:4K,ext4:overwrite:fsync:1:1M:64K,'
                  'ext4:cold-read:cache:4:1M:4K,ext4:hot-read:cache:1:1M:1K,'
                  'tmpfs:append:cache:1:1M:4K,tmpfs:read:cache:1:1M:4K')
@@ -176,8 +179,32 @@ def fixture(work, program, case, observe, timeout=240):
 
 
 def records(text, name):
-    return [{key: int(value) for key, value in re.findall(r'(\w+)=(\d+)', line)}
-            for line in text.splitlines() if line.startswith('IO ' + name + ' ')]
+    fields = {
+        'WINDOW': 'start_ns data_end_ns end_ns elapsed_ns data_ns sync_ns bytes sync_calls verify_ns cleanup_sync_ns cleanup_sync_calls complete',
+        'FILE': 'id bytes calls start_ns end_ns sync_end_ns size_before size_after checksum complete',
+        'SIZE': 'id sample bytes', 'SAMPLE': 'id sequence start_ns end_ns',
+        'AFFINITY': 'role cpu', 'RESOURCE': 'self_maxrss_kib children_maxrss_kib',
+        'MIXED_WINDOW': 'start_ns end_ns bytes complete',
+        'MIXED_FILE': 'id bytes calls start_ns end_ns data_start_ns data_end_ns sync_start_ns sync_end_ns checksum samples complete',
+        'MIXED_SAMPLE': 'id sequence open_start_ns start_ns end_ns',
+    }
+    required = set(fields[name].split())
+    allowed = required | ({'range_operations'} if name == 'WINDOW' else set())
+    result, seen = [], set()
+    for line in text.splitlines():
+        if line.split(maxsplit=2)[:2] != ['IO', name]:
+            continue
+        if not re.fullmatch(r'IO ' + name + r'(?: [a-z_]+=[0-9]+)+', line):
+            raise RuntimeError('invalid I/O record: ' + name)
+        pairs = [field.split('=') for field in line.split()[2:]]
+        row = {key: int(value) for key, value in pairs}
+        if len(row) != len(pairs) or not required <= row.keys() <= allowed:
+            raise RuntimeError('missing, duplicate or unknown I/O field: ' + name)
+        identity = tuple(sorted(row.items()))
+        if identity in seen:
+            raise RuntimeError('duplicate I/O record: ' + name)
+        seen.add(identity); result.append(row)
+    return result
 
 
 def kernel_heap_peak(raw):
@@ -348,22 +375,42 @@ def extract(disk, work):
     return text, identity
 
 
-def boot(work, kernel, image, case, name, repetition, args, program_sha):
-    work.mkdir(); disk = work / 'disk.img'
-    subprocess.run(['cp', '--reflink=never', '--sparse=never', str(image), str(disk)], check=True)
-    with disk.open('rb') as backing:
-        os.fsync(backing.fileno())
+def qemu_command(kernel,disk,name,args):
     command = [args.qemu, '-machine', 'virt', '-bios', str(getattr(args,'firmware','default')), '-kernel', str(kernel), '-m', args.ram,
                '-smp', str(getattr(args, 'cpus', 1)), '-accel','tcg,thread=multi','-nographic', '-no-reboot', '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
                '-drive', f'file={disk},if=none,format=raw,id=root,cache=writeback',
                '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+    command += seed_arguments(getattr(args,'qemu_seed',None))
     if name == 'linux':
         command += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
+    return command
+
+
+def boot(work, kernel, image, case, name, repetition, args, program_sha):
+    disk=work/'disk.img';command=qemu_command(kernel,disk,name,args)
+    work.mkdir()
+    subprocess.run(['cp', '--reflink=never', '--sparse=never', str(image), str(disk)], check=True)
+    with disk.open('rb') as backing:
+        os.fsync(backing.fileno())
     row = dict(case=case, variant=name, repetition=repetition, kernel_sha256=digest(kernel), program_sha256=program_sha,
                fixture_sha256=digest(image), observation_enabled=args.observe, smoke=args.smoke,
-               backing_preparation='written-and-synced', command=command)
+               backing_preparation='written-and-synced', command=command,qemu_seed=getattr(args,'qemu_seed',None))
     try:
-        harness.run_logged(command, work / 'console.log', args.timeout + 20)
+        host_io=getattr(args,'host_io_cpu',4)
+        host_vcpus=host_cpu_selection(getattr(args,'host_vcpu_cpus',None),getattr(args,'cpus',1),host_io)
+        if host_vcpus:
+            with tempfile.TemporaryDirectory(prefix='io-qmp.') as temporary, (work/'console.log').open('w') as log:
+                qmp_path=Path(temporary)/'control';command+=['-S','-qmp',f'unix:{qmp_path},server=on,wait=off']
+                process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,
+                    preexec_fn=lambda:os.sched_setaffinity(0,{host_io}))
+                try:
+                    row['host_cpu_topology']=host_cpu_topology(host_vcpus+[host_io])
+                    row['host_thread_affinity']=pin_qemu_threads(process,qmp_path,host_vcpus,host_io)
+                    status=process.wait(timeout=args.timeout+20)
+                    if status:raise subprocess.CalledProcessError(status,command)
+                except BaseException:
+                    process.kill();process.wait();raise
+        else:harness.run_logged(command, work / 'console.log', args.timeout + 20)
         raw = (work / 'console.log').read_text(errors='replace')
         if name != 'linux' and ('heap-live=0x0; shutting down' not in raw or 'exited status=0x0 ' not in raw):
             raise RuntimeError('BoarOS clean exit/heap teardown missing')
@@ -412,6 +459,7 @@ def summarize(work, identity, rows):
         variant, case = row['variant'], row['case']['name']
         if row['case'] != expected_cases.get(case) or variant not in identity['variants'] or row['kernel_sha256'] != identity['variants'][variant]['kernel_sha256'] or row['program_sha256'] != identity['program_sha256'] or row['observation_enabled'] != identity['observe']:
             raise RuntimeError('mismatched input in I/O results')
+        validate_resume_seed({'qemu_seed':row.get('qemu_seed'),'argv':row.get('command',[])},identity.get('qemu_seed'))
         if fixtures.setdefault(case, row['fixture_sha256']) != row['fixture_sha256']:
             raise RuntimeError('fixture changed within matched case')
         key = (variant, case, row['repetition'])
@@ -488,6 +536,7 @@ def run_locked(args):
         cases=cases, repeat=args.repeat, observe=args.observe, smoke=args.smoke, linux_identity=linux_identity,
         evidence_kind='functional-smoke-not-performance' if args.smoke else 'diagnostic' if args.observe else 'performance',
         qemu_version=output([args.qemu, '--version']), qemu_sha256=digest(args.qemu), compiler=output([str(compiler), '--version']),
+        qemu_seed=getattr(args,'qemu_seed',None),
         firmware={'selection':args.firmware,'sha256':digest(args.firmware) if args.firmware!='default' else None},
         ram=args.ram, cpus=args.cpus, transport=args.transport, disk_cache='writeback', timeout_seconds=args.timeout, baseline_commit=helpers.BASELINE_COMMIT,
         cache_policy='Fresh kernel boot and matched image copy per case/variant/repetition; no drop_caches or host cache eviction')
@@ -518,6 +567,9 @@ def main():
         p.add_argument('--observe', action='store_true'); p.add_argument('--output', type=Path)
         p.add_argument('--ram', default='512M'); p.add_argument('--transport', choices=('legacy', 'modern'), default='modern')
         p.add_argument('--cpus', type=int, choices=(1, 2), default=1, help='guest CPUs; two requires a USER_SMP kernel')
+        p.add_argument('--host-vcpu-cpus',help='comma-separated host CPUs; pin actual TCG vCPU threads before guest start')
+        p.add_argument('--host-io-cpu',type=int,default=4,help='host CPU for QEMU main/I/O threads when vCPU pinning is enabled')
+        p.add_argument('--qemu-seed',type=lambda value:int(value,0),help='fixed fixture guest PRNG seed, paired across variants and repetitions')
         p.add_argument('--firmware',default='default',help='explicit OpenSBI firmware or QEMU default')
         p.add_argument('--timeout', type=int, default=240, help='explicit guest budget in seconds, 1..3600; excludes no failed runs')
     args = parser.parse_args()
@@ -525,6 +577,10 @@ def main():
     elif args.command == 'build': build(args)
     else:
         if not 1 <= args.timeout <= 3600: parser.error('timeout must be in 1..3600 seconds')
+        try:
+            seed_arguments(args.qemu_seed)
+            args.host_vcpu_cpus=host_cpu_selection(args.host_vcpu_cpus,args.cpus,args.host_io_cpu)
+        except ValueError as error:parser.error(str(error))
         return run(args)
     return 0
 

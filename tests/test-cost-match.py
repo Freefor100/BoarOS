@@ -301,6 +301,8 @@ class MatchControllerTest(unittest.TestCase):
             with patch('sys.argv', ['cost-match-riscv.py', '--output', folder]), \
                     patch.object(self.driver, 'prepare', return_value=manifest), \
                     patch.object(self.driver, 'host_state', return_value=state), \
+                    patch.object(self.driver, 'acquire_measurement_lock',
+                                 side_effect=lambda _: acquire_fixture_lock(Path(folder) / 'measurement.lock')), \
                     patch.object(self.driver.PolicyClient, 'acquire', side_effect=RuntimeError('no_new_privs')), \
                     patch.object(self.driver, 'campaign') as start, patch('builtins.print'):
                 self.assertEqual(self.driver.main(), 2)

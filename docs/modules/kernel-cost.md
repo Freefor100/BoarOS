@@ -101,7 +101,12 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
 
+`tests/cost-riscv.py --case metadata --metadata-fixed-only --metadata-parallel` 在同一个协调 ELF 中执行固定总工作量：双任务 stat/open 各总计4096次、rename总计2048次、追加总计16MiB，另保留既有目录负载。单客核时两个任务都在CPU0，双客核时分别固定CPU0/1；单任务在双核时固定CPU1。每个修改窗口在计时结束前完成对应文件或父目录的真实fsync，最后全局排空单列。
+
+fixture runner 的 `--host-vcpu-cpus 0,2 --host-io-cpu 4` 通过QMP暂停启动，核对真实vCPU线程、设置并读回亲和性后恢复；主线程及已有I/O线程留在I/O核，后续块I/O worker沿QEMU主线程创建规则继承。`--qemu-seed` 写入匹配身份；同一比较组使用同一ELF、工作量、输入和完成条件，before/control内核逐字节一致。正式耗时使用关闭诊断的内核，观测版本单独解释锁与日志经过时间。原格式记录按整行、字段集合和唯一性解析，尾随垃圾、重复字段或损坏的额外记录直接报错。
+
 C2 按 rank 10/15/20/21/30/31/32/35/40/other 记录尝试、取得、阻塞、唤醒、重阻塞、取消及等待/持有直方图。
+资格等待包含 grant 前实际发生的诊断工作，按观察到的经过时间解释。
 等待止于 metadata 资格中实际授予 writer/readers 的时刻，持有由该 grant 开始、
 在实际撤销资格时结束；随后等待诊断发布不能改变这两个边界。排队者从授予预留起
 计入占用，恢复运行延迟不再计入资格等待。释放后的定点 scope 提交仍消费真实在途登记。

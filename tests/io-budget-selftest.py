@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,50 @@ class Profiles(unittest.TestCase):
         self.assertEqual(io.kernel_heap_peak(' root-heap-peak-pages=3\n'),12288)
         for raw in ('',' root-heap-peak-pages=3\n root-heap-peak-pages=4\n'):
             with self.assertRaises(RuntimeError): io.kernel_heap_peak(raw)
+
+    def test_invalid_host_cpu_selection_is_rejected_before_build(self):
+        result=subprocess.run(['python3','-B',str(ROOT/'tests/io-budget-experiment.py'),
+            'smoke','--variant','current=missing-kernel','--cpus','2',
+            '--host-vcpu-cpus','0'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,2)
+        self.assertIn('one per guest CPU',result.stderr)
+
+    def test_seed_is_part_of_matched_input(self):
+        case=io.parse_case('ext4:hot-read:cache:1:1M:4K')
+        identity=dict(cases=[case],variants={'current':{'kernel_sha256':'K','management':'unmanaged'}},
+            program_sha256='P',repeat=1,observe=False,smoke=True,qemu_seed=123,
+            evidence_kind='functional-smoke-not-performance')
+        row=dict(case=case,variant='current',repetition=1,kernel_sha256='K',program_sha256='P',
+            fixture_sha256='F',observation_enabled=False,status='passed',metrics={},qemu_seed=123,
+            command=['qemu','-seed','123'])
+        with tempfile.TemporaryDirectory() as directory:
+            work=Path(directory);io.summarize(work,identity,[row])
+            for altered in (row|{'qemu_seed':124},row|{'command':['qemu','-seed','124']},
+                row|{'command':['qemu']},row|{'command':['qemu','-seed','123','-seed','123']}):
+                with self.assertRaises(ValueError):io.summarize(work,identity,[altered])
+
+    def test_qemu_seed_is_fixed_across_variants_and_repetitions(self):
+        args=SimpleNamespace(qemu='qemu',firmware='firmware',ram='1G',cpus=2,transport='modern',qemu_seed=123)
+        for _ in range(5):
+            for name in ('before','final','control'):
+                command=io.qemu_command(Path(name),Path('disk'),name,args)
+                self.assertEqual(command.count('-seed'),1)
+                self.assertEqual(command[command.index('-seed')+1],'123')
+        args.qemu_seed=None
+        self.assertNotIn('-seed',io.qemu_command(Path('kernel'),Path('disk'),'current',args))
+
+    def test_invalid_qemu_seed_is_rejected_before_build(self):
+        for seed in ('-1','0x10000000000000000'):
+            result=subprocess.run(['python3','-B',str(ROOT/'tests/io-budget-experiment.py'),
+                'smoke','--variant','current=missing-kernel','--qemu-seed',seed],capture_output=True,text=True)
+            self.assertEqual(result.returncode,2)
+            self.assertIn('fit uint64',result.stderr)
+
+    def test_official_platform_rejects_fixture_seed_before_launch(self):
+        result=subprocess.run(['python3','-B',str(ROOT/'tests/cost-riscv.py'),
+            '--platform-config','official','--qemu-seed','123'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,2)
+        self.assertIn('only to fixture measurements',result.stderr)
 
     def test_smoke_is_not_promoted_to_performance(self):
         case = io.parse_case('ext4:cold-read:cache:1:1M:4K')
@@ -84,6 +129,9 @@ class Workload(unittest.TestCase):
                 incomplete=''.join(line for line in evidence.splitlines(keepends=True) if not line.startswith('IO '+kind+' '))
                 with self.assertRaises(RuntimeError): io.validate(incomplete,case)
             with self.assertRaises(RuntimeError): io.validate(evidence.replace('complete=1', 'complete=0', 1), case)
+            for replacement in ('complete=1junk', 'complete=0 complete=1'):
+                with self.subTest(damaged_completion=replacement), self.assertRaises(RuntimeError):
+                    io.validate(evidence.replace('complete=1', replacement, 1), case)
             with self.assertRaises(RuntimeError): io.validate(evidence.replace('sync_calls=0', 'sync_calls=9', 1) if 'sync_calls=0' in evidence else evidence.replace('sync_calls=1', 'sync_calls=9', 1), case)
             return parsed
 
