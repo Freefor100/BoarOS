@@ -19,6 +19,8 @@ static _Thread_local unsigned segment_restores;
 static _Thread_local struct kernel_cpu cpu;
 static void publish_task(struct kernel_cpu *target,struct kernel_task *task) { target->current = task; }
 static _Thread_local struct host_task host_current;
+static _Thread_local struct kernel_io_context bootstrap_io;
+static _Thread_local unsigned publishing_next;
 static _Thread_local unsigned notification_flushes;
 #define current host_current.task
 static _Thread_local unsigned ready;
@@ -61,10 +63,11 @@ void kernel_cpu_flush_notifications(void)
     notification_flushes++;
     cpu.outbound=0;
 }
-struct kernel_task *kernel_task_current(void) { return &current; }
+struct kernel_task *kernel_task_current(void) { return publishing_next ? NULL : &current; }
+void *sync_test_current_task(void) { return &current; }
 static void initialize(unsigned id)
 {
-    kernel_cpu_initialize(&cpu, id, &current.io_context);
+    kernel_cpu_initialize(&cpu, id, &bootstrap_io);
     current = (struct kernel_task){0};
     host_current.id = id;
     current.wait.on_cpu = 1;
@@ -409,6 +412,12 @@ static void queued_spin_owner_case(enum spin_owner_case kind,unsigned expire,uin
 int main(void)
 {
     initialize(0);
+    /* CPU publication can name the next task while this stack and tp still
+     * belong to the previous owner. Its I/O qualifications stay with it. */
+    struct kernel_task next = {0};
+    publish_task(&cpu,&next); publishing_next = 1;
+    assert(kernel_io_context_current() == &current.io_context && sync_test_irq == 1);
+    publishing_next = 0; publish_task(&cpu,&current);
     struct kernel_raw_lock outer, inner;
     struct kernel_raw_guard first={0}, second={0};
     kernel_raw_lock_init(&outer,KERNEL_RAW_RANK_OBJECT);

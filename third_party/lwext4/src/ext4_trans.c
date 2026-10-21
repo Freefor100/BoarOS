@@ -50,9 +50,10 @@
 static int trans_error(struct ext4_blockdev *bdev, int r)
 {
 #if CONFIG_JOURNALING_ENABLE
-	if (r && bdev->fs && bdev->fs->curr_trans &&
-	    !bdev->fs->curr_trans->error)
-		bdev->fs->curr_trans->error = r;
+	if (r && bdev->fs) {
+		struct jbd_trans *trans = ext4_current_trans(bdev->fs);
+		if (trans && !trans->error) trans->error = r;
+	}
 #else
 	(void)bdev;
 #endif
@@ -72,14 +73,23 @@ int ext4_trans_set_block_dirty(struct ext4_buf *buf)
 
 	if (fs && fs->jbd_journal && fs->jbd_journal->error)
 		return trans_error(buf->bc->bdev, fs->jbd_journal->error);
-	if (fs && fs->jbd_journal && fs->curr_trans) {
-		struct jbd_trans *trans = fs->curr_trans;
+	if (fs && fs->jbd_journal && ext4_current_trans(fs)) {
+		struct jbd_trans *trans = ext4_current_trans(fs);
 		return trans_error(buf->bc->bdev,
 			jbd_trans_set_block_dirty(trans, &block));
 	}
 #endif
 	ext4_bcache_set_dirty(buf);
 	return r;
+}
+
+int ext4_trans_set_block_dirty_range(struct ext4_block *block, uint32_t offset, uint32_t length)
+{
+    struct ext4_fs *fs = block->buf->bc->bdev->fs;
+    struct jbd_trans *trans = fs ? ext4_current_trans(fs) : NULL;
+    if (trans) return trans_error(fs->bdev,
+        jbd_trans_set_block_dirty_range(trans, block, offset, length));
+    return ext4_trans_set_block_dirty(block->buf);
 }
 
 int ext4_trans_block_get_noread(struct ext4_blockdev *bdev,
@@ -89,7 +99,7 @@ int ext4_trans_block_get_noread(struct ext4_blockdev *bdev,
 #if CONFIG_JOURNALING_ENABLE
 	/* Rollback must also restore any existing held reference. Read the old
 	 * block before handing writable storage to a transaction. */
-	if (bdev->fs && bdev->fs->curr_trans)
+	if (bdev->fs && ext4_current_trans(bdev->fs))
 		return ext4_trans_block_get(bdev, b, lba);
 #endif
 	int r = ext4_block_get_noread(bdev, b, lba);
@@ -99,28 +109,17 @@ int ext4_trans_block_get_noread(struct ext4_blockdev *bdev,
 	return r;
 }
 
-int ext4_trans_block_get(struct ext4_blockdev *bdev,
-		   struct ext4_block *b,
-		   uint64_t lba)
+int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
+    struct ext4_block *b, uint64_t lba, uint32_t offset, uint32_t length)
 {
-	int r = ext4_block_get(bdev, b, lba);
-	if (r != EOK)
-		return trans_error(bdev, r);
-
-#if CONFIG_JOURNALING_ENABLE
-	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans) {
-		r = jbd_trans_get_write_access(bdev->fs->curr_trans, b);
-		if (r != EOK) {
-			bdev->cache_write_back++;
-			ext4_block_set(bdev, b);
-			bdev->cache_write_back--;
-			return trans_error(bdev, r);
-		}
-	}
-#endif
-
+	b->payload = NULL;
+	int r = ext4_block_get_range(bdev, b, lba, offset, length, EXT4_BLOCK_WRITE);
+	if (r && b->payload) ext4_bcache_free_read(bdev->bc, b);
 	return trans_error(bdev, r);
 }
+int ext4_trans_block_get(struct ext4_blockdev *bdev,
+    struct ext4_block *b, uint64_t lba)
+{ return ext4_trans_block_get_range(bdev,b,lba,0,bdev->lg_bsize); }
 
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     const struct ext4_block_span *spans, unsigned count)
@@ -141,14 +140,13 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     }
     return r;
 }
-
 int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
 	const struct file_data_source *source)
 {
 #if CONFIG_JOURNALING_ENABLE
-	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans)
-		return trans_error(bdev, jbd_trans_write_data(bdev->fs->curr_trans,
+	if (bdev->fs && bdev->fs->jbd_journal && ext4_current_trans(bdev->fs))
+		return trans_error(bdev, jbd_trans_write_data(ext4_current_trans(bdev->fs),
 			lba, offset, data, length, initialize, source));
 #endif
 	/* Standalone non-journal users may explicitly request deferred bcache
@@ -209,8 +207,8 @@ int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev __unused,
 	int r = EOK;
 #if CONFIG_JOURNALING_ENABLE
 	struct ext4_fs *fs = bdev->fs;
-	if (fs->jbd_journal && fs->curr_trans) {
-		struct jbd_trans *trans = fs->curr_trans;
+	if (fs->jbd_journal && ext4_current_trans(fs)) {
+		struct jbd_trans *trans = ext4_current_trans(fs);
 		r = jbd_trans_try_revoke_block(trans, lba);
 	} else if (fs->jbd_journal) {
 		r = ext4_block_flush_lba(fs->bdev, lba);

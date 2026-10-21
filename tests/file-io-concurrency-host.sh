@@ -46,7 +46,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user \
         -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
-    mkfs.ext4 -q -F -b 4096 "$build_dir/image-$shift.img"
+    mkfs.ext4 -q -F -b 4096 ${FILE_IO_HOST_MKFS_ARGS:-} "$build_dir/image-$shift.img"
     timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift.img"
     e2fsck -fn "$build_dir/image-$shift.img" > "$build_dir/fsck-$shift.log" 2>&1
 done

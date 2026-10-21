@@ -93,6 +93,7 @@ void mm_test_attach(unsigned id)
 }
 /* 普通MM调用使用bootstrap I/O owner；实际park运行在TLS调度模型中。 */
 #ifndef FILE_IO_CASES
+void *sync_test_current_task(void) { return kernel_task_current(); }
 int kernel_task_has_user_context(const struct kernel_task *task)
 { return task && task->arch.user_mode==1; }
 struct kernel_task *kernel_task_current(void)

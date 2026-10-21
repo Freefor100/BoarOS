@@ -20,7 +20,8 @@
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
-| `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
+| `include/kernel/task_state.h` | 任务存储的共同内部布局 |
+| `kernel/sched/private.h` | 调度器状态、组与队列成员关系 |
 
 USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务；普通服务与已有worker按OTHER队列轮转，迁移排到目标核队尾。用户`sched_yield`在发起CPU调用共同的`kernel_scheduler_yield_current()`，等待游标和回调借用归还也使用真实内核调度。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
@@ -282,6 +283,9 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 读写锁按 FIFO 交接，读者每 16 项释放 metadata raw，并在分段之间恢复调用者原本的 IRQ 状态；再次取得短保护后继续原来的边界。`handoff_owner` 保留交接资格，新读者不能越过已排队的 writer。调用者进入时已关闭 IRQ，则交接不会自行开启。FIFO 交接当前不实现优先级继承，RT 带宽预算也不传递锁依赖。
 
 ## 存储等待与清理任务
+
+任务 I/O owner 来自当前执行栈的 TP；调度器提前发布 cpu.current 时仍归旧栈。
+`include/kernel/task_state.h` 提供实际嵌入字段的共同内部布局，RV/LA 使用相同任务所有权。
 
 `kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal。争用者按 FIFO 排队；释放时先给队首写者预留独占资格，或给连续队首读者预留共享资格，再定向唤醒。预留者尚未运行时也阻止新到任务抢占；排队写者后的读者及 try_read 不能越过队列。等待不可中断，信号退出在取得与释放后处理，栈上的等待记录不被提前销毁。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
 

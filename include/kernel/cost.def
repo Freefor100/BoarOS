@@ -237,3 +237,12 @@ X(PAGE_META_WRITTEN, page_meta_written, entries, 0)
 X(ALLOCATOR_META_TICKS, allocator_meta_ticks, ticks, 0)
 X(RAW_WAIT_TICKS, raw_wait_ticks, ticks, 0)
 X(RAW_HOLD_TICKS, raw_hold_ticks, ticks, 0)
+
+X(JOURNAL_RECORD_PREPARE_TICKS, journal_record_prepare_ticks, ticks, 1)
+X(JOURNAL_PREPARE_TICKS, journal_prepare_ticks, ticks, 1)
+X(JOURNAL_PUBLISH_TICKS, journal_publish_ticks, ticks, 1)
+
+/* Retried only after the failed attempt has completely returned its owners. */
+X(JOURNAL_RESOURCE_RETRIES, journal_resource_retries, count, 0)
+X(JOURNAL_MEMORY_RETRIES, journal_memory_retries, count, 0)
+X(JOURNAL_LOG_RETRIES, journal_log_retries, count, 0)

@@ -1,3 +1,4 @@
+#include <ext4_operation.h>
 #include "lwext4_port.h"
 #include "ext4_backend.h"
 #include "vfs_internal.h"
@@ -196,32 +197,42 @@ static void journal_wake(struct kernel_wait_queue *queue)
     if (kernel_wait_queue_wake_all(queue)) __builtin_trap();
 }
 
-/* Only the backend writer publishes these values. Waiters borrow the short
- * control domain instead of reading a live transaction while its lock sleeps. */
+/* Journal state qualification stabilizes progress; the short control domain
+ * publishes only completed values and keeps waiter registration independent. */
 static int journal_publish_locked(struct lwext4_mount_adapter *adapter)
 {
     struct ext4_fs *fs = adapter->device.fs;
     struct jbd_journal *journal = fs ? fs->jbd_journal : NULL;
     if (!journal || !journal->grouped) return 0;
-    int error = adapter->published_error ? adapter->published_error : mount_error(adapter);
-    if (adapter->published_sealed == journal->sealed_sequence &&
-        adapter->published_durable == journal->durable_sequence &&
-        adapter->published_checkpoint == journal->checkpoint_sequence &&
-        adapter->published_error == error) return 0;
-    int committed = adapter->published_durable != journal->durable_sequence;
-    int reclaimed = adapter->published_checkpoint != journal->checkpoint_sequence;
+    int wake_commit = 0, wake_checkpoint = 0;
     {
         KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+        /* Stable journal readers may publish concurrently. Compare and update
+         * the adapter's waiter-visible progress under its actual owner lock. */
+        int error = adapter->published_error ? adapter->published_error : mount_error(adapter);
+        if (adapter->published_sealed == journal->sealed_sequence &&
+            adapter->published_durable == journal->durable_sequence &&
+            adapter->published_checkpoint == journal->checkpoint_sequence &&
+            adapter->published_error == error) return 0;
+        int committed = adapter->published_durable != journal->durable_sequence;
+        int reclaimed = adapter->published_checkpoint != journal->checkpoint_sequence;
+        int failed = adapter->published_error != error;
         adapter->published_sealed = journal->sealed_sequence;
         adapter->published_durable = journal->durable_sequence;
         adapter->published_checkpoint = journal->checkpoint_sequence;
         adapter->published_error = error;
-        if (committed) adapter->checkpoint_requested = 1;
-        if (reclaimed) adapter->journal_requested = 1;
+        if (committed || failed) {
+            wake_checkpoint = !adapter->checkpoint_requested;
+            adapter->checkpoint_requested = 1;
+        }
+        if (reclaimed || failed) {
+            wake_commit = !adapter->journal_requested;
+            adapter->journal_requested = 1;
+        }
     }
     journal_wake(&adapter->journal_progress);
-    if (committed) journal_wake(&adapter->checkpoint_work);
-    if (reclaimed) journal_wake(&adapter->journal_work);
+    if (wake_checkpoint) journal_wake(&adapter->checkpoint_work);
+    if (wake_commit) journal_wake(&adapter->journal_work);
     return 1;
 }
 
@@ -230,21 +241,34 @@ static void backend_unlock(void *lock)
     struct lwext4_mount_adapter *adapter = (void *)((char *)lock -
         offsetof(struct lwext4_mount_adapter, backend_lock));
     struct kernel_io_context *context = kernel_io_context_current();
-    int changed = context->backend_depth == 1 && !context->backend_read &&
-        journal_publish_locked(adapter);
+    int changed=0;
+    if (context->backend_depth==1 && !context->backend_read) {
+        boaros_lwext4_state_read_lock(lock);
+        changed=journal_publish_locked(adapter);
+        boaros_lwext4_state_unlock(lock);
+    }
     boaros_lwext4_unlock(lock);
     if (changed) complete_sync_waiters(adapter);
 }
 
-static void journal_request_flags(struct lwext4_mount_adapter *adapter, int force)
+static void journal_request_flags(struct lwext4_mount_adapter *adapter,
+    int commit, int checkpoint, int force)
 {
+    int wake_commit = 0, wake_checkpoint = 0;
     {
         KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
-        adapter->journal_requested = adapter->checkpoint_requested = 1;
+        if (commit) {
+            wake_commit = !adapter->journal_requested;
+            adapter->journal_requested = 1;
+        }
+        if (checkpoint) {
+            wake_checkpoint = !adapter->checkpoint_requested;
+            adapter->checkpoint_requested = 1;
+        }
         if (force) adapter->journal_force = 1;
     }
-    journal_wake(&adapter->journal_work);
-    journal_wake(&adapter->checkpoint_work);
+    if (wake_commit) journal_wake(&adapter->journal_work);
+    if (wake_checkpoint) journal_wake(&adapter->checkpoint_work);
 }
 
 static void journal_stop_workers(struct lwext4_mount_adapter *adapter)
@@ -272,6 +296,22 @@ static void journal_idle(struct lwext4_mount_adapter *adapter, int checkpoint, u
     if (needed) {
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
+    }
+}
+
+static int journal_await_start(struct lwext4_mount_adapter *adapter,int checkpoint)
+{
+    for(;;) {
+        struct kernel_wait_token token;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard,&adapter->journal_control);
+            if(adapter->journal_stopping)return 0;
+            if(adapter->journal_started)return 1;
+            if(kernel_wait_prepare(checkpoint?&adapter->checkpoint_work:&adapter->journal_work,
+                0,0,&token))__builtin_trap();
+        }
+        enum kernel_wait_wake_reason reason;
+        if(kernel_wait_park(&token,&reason) || kernel_wait_finish(&token))__builtin_trap();
     }
 }
 static int free_orphan_inode(struct lwext4_mount_adapter *adapter,uint32_t inode)
@@ -426,54 +466,74 @@ static uint64_t time_deadline(struct lwext4_mount_adapter *adapter)
     return adapter->times_deadline;
 }
 
+struct lwext4_staged_time {
+    struct lwext4_staged_time *next;
+    struct lwext4_node *node;
+    struct jbd_journal *journal;
+    struct ext4_timestamp values[3];
+    uint64_t versions[3];
+    unsigned fields;
+};
+
 static void time_stage(void *context, void *owner, uint32_t inode, unsigned field,
                        struct ext4_timestamp value)
 {
     struct lwext4_mount_adapter *adapter = context;
+    struct ext4_operation *operation = ext4_current_operation(adapter->device.fs);
     struct kernel_vfs_node *pin = owner ? 0 : kernel_vfs_node_pin(&adapter->instance, inode);
     struct kernel_vfs_node *base = owner ? owner : pin;
-    {
-    TIMESTAMP_SCOPE(times, adapter);
+    if (!operation) __builtin_trap();
     if (base && (base->instance != &adapter->instance || base->inode != inode)) __builtin_trap();
     if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
-        struct lwext4_node *node = (struct lwext4_node *)base;
-        if (!node->staged_fields) {
+        struct lwext4_staged_time *record = operation->staged_times;
+        while (record && &record->node->node != base) record = record->next;
+        if (!record) {
+            struct jbd_journal *journal = adapter->device.fs->jbd_journal;
+            record = journal ? jbd_journal_alloc(journal, sizeof(*record)) :
+                ext4_user_calloc(1, sizeof(*record));
+            if (!record) {
+                if (!operation->error) operation->error = ENOMEM;
+                if (operation->trans && !operation->trans->error) operation->trans->error = ENOMEM;
+                goto Release;
+            }
+            *record = (struct lwext4_staged_time){.next = operation->staged_times,
+                .node = (struct lwext4_node *)base, .journal = journal};
             if (kernel_vfs_node_acquire(base)) __builtin_trap();
-            node->staged_next = adapter->staged_times;
-            adapter->staged_times = node;
+            operation->staged_times = record;
         }
-        node->staged[field] = value;
-        node->staged_version[field] = node->time_version[field];
-        node->staged_fields |= 1U << field;
+        TIMESTAMP_SCOPE(times, adapter);
+        record->values[field] = value;
+        record->versions[field] = record->node->time_version[field];
+        record->fields |= 1U << field;
     }
-    }
+Release:
     if (pin && kernel_vfs_node_release(&pin)) __builtin_trap();
 }
 
-static void time_finish(void *context, bool accepted)
+static void time_finish(void *context, void *staged_times, bool accepted)
 {
     struct lwext4_mount_adapter *adapter = context;
-    for (;;) {
-        struct kernel_vfs_node *dirty_pin, *staged_pin;
+    struct lwext4_staged_time *record = staged_times;
+    while (record) {
+        struct lwext4_staged_time *next = record->next;
+        struct lwext4_node *node = record->node;
+        struct kernel_vfs_node *dirty_pin, *staged_pin = &node->node;
         {
             TIMESTAMP_SCOPE(times, adapter);
-            struct lwext4_node *node = adapter->staged_times;
-            if (!node) break;
-            adapter->staged_times = node->staged_next;
             for (unsigned i = 0; i < 3; i++) {
-                if (!accepted || !(node->staged_fields & (1U << i)) ||
-                    node->staged_version[i] != node->time_version[i]) continue;
-                node->times[i] = node->staged[i];
+                if (!accepted || !(record->fields & (1U << i)) ||
+                    record->versions[i] != node->time_version[i]) continue;
+                node->times[i] = record->values[i];
                 if (!++node->time_version[i]) __builtin_trap();
                 node->dirty_fields &= ~(1U << i);
             }
-            node->staged_fields = 0;
-            node->staged_next = 0;
             dirty_pin = time_drop_dirty(node);
-            staged_pin = &node->node;
         }
+        if (record->journal) jbd_journal_free(record);
+        else ext4_user_free(record);
         if (dirty_pin && kernel_vfs_node_release(&dirty_pin)) __builtin_trap();
         if (kernel_vfs_node_release(&staged_pin)) __builtin_trap();
+        record = next;
     }
 }
 
@@ -805,10 +865,11 @@ static int block_flush(struct ext4_blockdev *device)
 static uint64_t ext4_buffer_bytes(void *context)
 {
     uint64_t total = 0;
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     for (struct lwext4_mount_adapter *adapter = adapters; adapter; adapter = adapter->next_adapter) {
         struct ext4_bcache *bc = adapter->device.bc;
-        if (adapter->instance.heap == context && adapter->mounted && bc)
-            total += (uint64_t)bc->ref_blocks * bc->itemsize;
+        if (adapter->instance.heap == context && adapter->mounted && !adapter->instance.quiescing && bc)
+            total += (uint64_t)__atomic_load_n(&bc->ref_blocks,__ATOMIC_ACQUIRE) * bc->itemsize;
     }
     return total;
 }
@@ -859,17 +920,21 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
     struct lwext4_mount_adapter *adapter = mount->private_data;
     struct kernel_heap *heap = adapter->instance.heap;
 
-    struct lwext4_mount_adapter **link = &adapters;
-    while (*link && *link != adapter) link = &(*link)->next_adapter;
-    if (*link) *link = adapter->next_adapter;
-    if (!adapters && heap->page_allocator->buffer_context == heap) {
-        heap->page_allocator->buffer_bytes = 0;
-        heap->page_allocator->buffer_context = 0;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        struct lwext4_mount_adapter **link = &adapters;
+        while (*link && *link != adapter) link = &(*link)->next_adapter;
+        if (*link) *link = adapter->next_adapter;
+        if (!adapters && heap->page_allocator->buffer_context == heap) {
+            heap->page_allocator->buffer_bytes = 0;
+            heap->page_allocator->buffer_context = 0;
+        }
     }
     if (adapter->physical_buffer != 0) {
         kernel_heap_release(heap, adapter->physical_buffer);
         adapter->physical_buffer = 0;
     }
+    boaros_lwext4_lock_fini(&adapter->backend_lock);
     if (adapter->heap_bound) {
         boaros_lwext4_heap_unbind(heap);
         adapter->heap_bound = 0U;
@@ -887,6 +952,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
 static void queue_orphan(struct lwext4_mount_adapter *adapter,
                          struct lwext4_orphan *orphan)
 {
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     orphan->next = adapter->orphans;
     adapter->orphans = orphan;
 }
@@ -933,7 +999,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
         if (adapter->sync_waiters) return -KERNEL_EBUSY;
     }
-    adapter->instance.quiescing = 1U;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        adapter->instance.quiescing = 1U;
+    }
     /* 停止并等待本实例 worker；后续失败仍保持静止，不能重新发布可写挂载。 */
     if (adapter->instance.page_cache)
         kernel_page_cache_stop_worker(adapter->instance.page_cache);
@@ -1059,9 +1128,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
 static uint64_t journal_now(void *context)
 { (void)context; return kernel_time_monotonic_ns(); }
 
-static void journal_request(void *context)
+static void journal_request(void *context, unsigned work)
 {
-    journal_request_flags(context, 0);
+    journal_request_flags(context, work & EXT4_JOURNAL_WORK_COMMIT,
+        work & EXT4_JOURNAL_WORK_CHECKPOINT, 0);
 }
 
 static uint64_t journal_reached(const struct lwext4_mount_adapter *adapter, enum ext4_journal_wait kind)
@@ -1168,8 +1238,10 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
     else if (kind == EXT4_JOURNAL_WAIT_DURABLE) COST_ADD(JOURNAL_WAIT_DURABLE, 1);
     else COST_ADD(JOURNAL_WAIT_CHECKPOINT, 1);
     struct lwext4_mount_adapter *adapter = context;
+    boaros_lwext4_state_read_lock(&adapter->backend_lock);
     int changed = journal_publish_locked(adapter);
-    journal_request_flags(adapter, 1);
+    boaros_lwext4_state_unlock(&adapter->backend_lock);
+    journal_request_flags(adapter, 1, kind == EXT4_JOURNAL_WAIT_CHECKPOINT, 1);
     unsigned depth = boaros_lwext4_pause();
     if (changed) complete_sync_waiters(adapter);
     int result;
@@ -1192,6 +1264,7 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
 static void journal_worker(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
+    if(!journal_await_start(adapter,0))return;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
         int force, stopping;
@@ -1227,6 +1300,7 @@ static void journal_worker(void *context)
 static void journal_checkpoint_worker(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
+    if(!journal_await_start(adapter,1))return;
     uint64_t pending_deadline = 0;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
@@ -1265,6 +1339,8 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
     struct lwext4_mount_adapter *adapter = mount->private_data;
     if (adapter->instance.backend_data != adapter || !adapter->mounted) return -KERNEL_EINVAL;
     if (adapter->instance.read_only) return 0;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(mount,&namespace_guard);
     if (adapter->journal_started) return -KERNEL_EBUSY;
     /* The same mount worker also owns timestamp-only writeback on writable
      * filesystems without JBD; dirty inode pins need a consumer there too. */
@@ -1288,11 +1364,16 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
             kernel_thread_join(&adapter->checkpoint_worker);
             adapter->checkpoint_started = adapter->journal_stopping = 0;
         }
-        /* No operation could join while startup held this execution path. */
         if (adapter->device.fs->jbd_journal) jbd_journal_group_fini(adapter->device.fs->jbd_journal);
         return status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
-    adapter->journal_started = 1;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&adapter->journal_control);
+        adapter->journal_started=1;
+        adapter->journal_requested=adapter->checkpoint_requested=1;
+    }
+    journal_wake(&adapter->journal_work);
+    journal_wake(&adapter->checkpoint_work);
     return 0;
 }
 
@@ -1337,7 +1418,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
                    -KERNEL_ENOMEM : -KERNEL_EIO;
     }
     adapter_names(adapter);
-    boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock);
+    boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock, heap);
     adapter->locks.unlock = backend_unlock;
     kernel_raw_lock_init(&adapter->journal_control, KERNEL_RAW_RANK_OBJECT);
     /* Progress publication also runs during synchronous journal service,
@@ -1349,8 +1430,11 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     kernel_raw_lock_init(&adapter->timestamp_lock, KERNEL_RAW_RANK_OBJECT);
 #endif
     adapter->mount = mount;
-    adapter->next_adapter = adapters;
-    adapters = adapter;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        adapter->next_adapter = adapters;
+        adapters = adapter;
+    }
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
     kernel_raw_lock_init(&adapter->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     initialize_backend();
@@ -1944,6 +2028,11 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(inode_guard);
+    /* Directory attributes come from one immutable accepted inode payload.
+     * Regular stat also snapshots live EOF, so it retains the data gate. */
+    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
+        kernel_vfs_node_lock((struct kernel_vfs_node *)node,&inode_guard,0);
     if (node->instance == 0 || lwext4_instance(node->instance)->superblock == 0)
         return -KERNEL_EIO;
     result = ext4_fraw_inode_fill(lwext4_node_file(node), &inode);
@@ -2314,7 +2403,12 @@ static int ext4_backend_lookup(struct kernel_vfs_instance *instance, uint64_t pa
     return error;
 }
 static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count)
-{ return lwext4_error(ext4_readlink_inode(lwext4_instance(node->instance)->mount_point, node->inode, buffer, size, count)); }
+{
+    KERNEL_LOCK_SCOPE(inode_guard);
+    kernel_vfs_node_lock(node,&inode_guard,0);
+    return lwext4_error(ext4_readlink_inode(lwext4_instance(node->instance)->mount_point,
+        node->inode,buffer,size,count));
+}
 static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed)
 {
     uint64_t before = ext4_fsize(lwext4_node_file(node));

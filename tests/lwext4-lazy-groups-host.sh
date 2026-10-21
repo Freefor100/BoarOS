@@ -17,7 +17,9 @@ for block in ${LAZY_HOST_BLOCKS:-1024 4096}; do
         features=has_journal
         [ "$journal" = journal ] || features=^has_journal
         truncate -s 384M "$build_dir/base.img"
-        mkfs.ext4 -q -F -b "$block" -O "$features" \
+        # Several equally sized groups let real directory placement select two
+        # untouched lazy groups at both filesystem block sizes.
+        mkfs.ext4 -q -F -b "$block" -g 8192 -O "$features" \
             -E nodiscard,lazy_itable_init=1,lazy_journal_init=0 "$build_dir/base.img"
         cases=${1:-all}
         [ "$cases" != all ] || cases='data inode'

@@ -9,6 +9,7 @@
 #include <ext4_inode.h>
 #include <ext4_orphan.h>
 #include <ext4_super.h>
+#include <kernel/sync.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,13 +24,11 @@ static unsigned event, cut;
 static int reorder;
 static unsigned allocations, fail_allocation;
 static unsigned lock_depth, check_storage_owner;
-static uintptr_t owner_identity = 1;
 static void storage_lock(void *context) { CHECK(context == &lock_depth); lock_depth++; }
 static void storage_unlock(void *context) { CHECK(context == &lock_depth); CHECK(lock_depth); lock_depth--; }
-static uintptr_t storage_owner(void *context) { CHECK(context == &lock_depth); CHECK(lock_depth); return owner_identity; }
 static struct ext4_lock storage_locks = {
     .lock = storage_lock, .unlock = storage_unlock,
-    .read_lock = storage_lock, .owner = storage_owner, .context = &lock_depth,
+    .read_lock = storage_lock, .context = &lock_depth,
 };
 void *ext4_user_malloc(size_t size)
 { return ++allocations == fail_allocation ? NULL : malloc(size); }
@@ -280,15 +279,16 @@ int main(int argc, char **argv)
     event = 0;
     if (!strcmp(argv[2], "owner-check")) {
         CHECK(ext4_transaction_begin("/") == EOK);
-        for (unsigned begin = 0; begin < 2; begin++) {
+        {
             pid_t child = fork();
             CHECK(child >= 0);
             if (!child) {
                 struct rlimit limit = {0, 0};
                 CHECK(setrlimit(RLIMIT_CORE, &limit) == 0);
-                owner_identity = 2;
-                if (begin) (void)ext4_transaction_begin("/");
-                else (void)ext4_transaction_end("/");
+                /* The host fork copies TLS. A new kernel task starts with
+                 * its own empty I/O context, not the parent's operation. */
+                memset(kernel_io_context_current(), 0, sizeof(struct kernel_io_context));
+                (void)ext4_transaction_end("/");
                 _Exit(0);
             }
             int status;

@@ -45,6 +45,35 @@
 #include <string.h>
 #include <stdlib.h>
 
+void ext4_block_payload_init(struct ext4_block_payload *payload, uint8_t *data,
+    void (*release)(struct ext4_block_payload *))
+{
+    if (!payload || !data) __builtin_trap();
+    *payload=(struct ext4_block_payload){.data=data,.references=1,.release=release};
+}
+void ext4_block_rebind(struct ext4_block *block, struct ext4_block_payload *payload)
+{
+    if (!block || !block->buf || !block->payload || !payload || !payload->data) __builtin_trap();
+    if (block->payload==payload) return;
+    ext4_block_payload_get(payload);
+    struct ext4_block_payload *old=block->payload;
+    block->payload=payload;block->data=payload->data;
+    ext4_block_payload_put(old);
+}
+void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload)
+{
+    struct ext4_block_payload *old;
+    if (!buf || !payload || !payload->data) __builtin_trap();
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
+        if (!buf->refctr || buf->loading) __builtin_trap();
+        if (buf->current_payload==payload) return;
+        ext4_block_payload_get(payload);old=buf->current_payload;
+        buf->current_payload=payload;buf->data=payload->data;
+    }
+    ext4_block_payload_put(old);
+}
+
 static int ext4_bcache_lba_compare(struct ext4_buf *a, struct ext4_buf *b)
 {
 	 if (a->lba > b->lba)
@@ -113,7 +142,8 @@ static void get_locked(struct ext4_bcache *bc, struct ext4_block *block, struct 
     }
     if (buf->refctr==UINT32_MAX) __builtin_trap();
     buf->refctr++;
-    *block=(struct ext4_block){buf->lba,buf,buf->data};
+    ext4_block_payload_get(buf->current_payload);
+    *block=(struct ext4_block){buf->lba,buf,buf->data,buf->current_payload};
 }
 static void drop_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
@@ -125,7 +155,13 @@ static void drop_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
     bc->ref_blocks--;
 }
 static void free_buffer(struct ext4_buf *buf)
-{ ext4_free(buf->data); ext4_free(buf); }
+{
+    uint8_t *original=buf->initial_payload.data;
+    ext4_block_payload_put(buf->current_payload);
+    if (__atomic_load_n(&buf->initial_payload.references,__ATOMIC_RELAXED)!=1) __builtin_trap();
+    ext4_block_payload_put(&buf->initial_payload);
+    ext4_free(original);ext4_free(buf);
+}
 
 int ext4_bcache_init_dynamic(struct ext4_bcache *bc, uint32_t cnt, uint32_t itemsize)
 {
@@ -146,12 +182,12 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc)
     /* Unmount owns the mount writer and has drained inode/journal borrowers. */
     for (;;) {
         struct ext4_buf *buf;
+        struct ext4_block borrowed;
         {
             KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
             buf=RB_MIN(ext4_buf_lba,&bc->lba_root);
             if (!buf) return;
             if (buf->refctr || buf->loading) __builtin_trap();
-            struct ext4_block borrowed;
             get_locked(bc,&borrowed,buf);
         }
         ext4_block_flush_buf(bc->bdev,buf);
@@ -162,6 +198,7 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc)
             idle_append_locked(bc,buf);
             drop_locked(bc,buf);
         }
+        ext4_block_payload_put(borrowed.payload);
         free_buffer(buf);
     }
 }
@@ -181,12 +218,50 @@ struct ext4_buf *ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block 
     if (buf) { get_locked(bc,b,buf);read_state_locked(buf,read); }
     return buf;
 }
-void ext4_bcache_inc_ref(struct ext4_buf *buf)
+void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
+    struct ext4_block_payload *private_payload)
 {
-    KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
-    if (!buf->refctr || buf->refctr==UINT32_MAX) __builtin_trap();
-    buf->refctr++;
+    if (!client || !client->buf || !client->payload || !accepted || client==accepted ||
+        !private_payload || !private_payload->data) __builtin_trap();
+    struct ext4_buf *buf=client->buf;
+    struct ext4_block_payload *old=NULL;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
+        if (!buf->refctr || buf->loading || buf->refctr==UINT32_MAX) __builtin_trap();
+        struct ext4_block_payload *current=buf->current_payload;
+        if (client->payload!=current) {
+            ext4_block_payload_get(current);
+            old=client->payload;
+        }
+        /* 当前版本的原有 loan 直接交给 accepted；两份 descriptor 仍各持
+         * 一个 buf 引用，client 另借已经分配好的私有 payload。 */
+        buf->refctr++;
+        *accepted=(struct ext4_block){buf->lba,buf,buf->data,current};
+        ext4_block_payload_get(private_payload);
+        client->data=private_payload->data;client->payload=private_payload;
+    }
+    if (old) ext4_block_payload_put(old);
 }
+
+struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *owner,
+    struct ext4_block_payload *view, bool snapshot, struct ext4_block *borrowed)
+{
+    if (!owner || !owner->buf || !owner->payload || !view || !borrowed || owner == borrowed)
+        __builtin_trap();
+    struct ext4_buf *buf = owner->buf;
+    struct ext4_block_payload *newer = NULL;
+    KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
+    if (!buf->refctr || buf->refctr == UINT32_MAX || buf->loading) __builtin_trap();
+    buf->refctr++;
+    ext4_block_payload_get(view);
+    *borrowed = (struct ext4_block){owner->lb_id, buf, view->data, view};
+    if (snapshot && buf->current_payload != owner->payload) {
+        newer = buf->current_payload;
+        ext4_block_payload_get(newer);
+    }
+    return newer;
+}
+
 int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
     enum ext4_bcache_read_state *read)
 {
@@ -197,6 +272,11 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
     if (candidate) {
         candidate->data=ext4_malloc(bc->itemsize);
         if (!candidate->data) { ext4_free(candidate);candidate=NULL; }
+        else {
+            ext4_block_payload_init(&candidate->initial_payload,candidate->data,NULL);
+            candidate->current_payload=&candidate->initial_payload;
+            ext4_block_payload_get(candidate->current_payload);
+        }
     }
     struct ext4_buf *buf;
     {
@@ -210,7 +290,8 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
             if (RB_INSERT(ext4_buf_lba,&bc->lba_root,buf)) __builtin_trap();
             bc->ref_blocks++;
             if (bc->max_ref_blocks<bc->ref_blocks) bc->max_ref_blocks=bc->ref_blocks;
-            *b=(struct ext4_block){buf->lba,buf,buf->data};
+            ext4_block_payload_get(buf->current_payload);
+            *b=(struct ext4_block){buf->lba,buf,buf->data,buf->current_payload};
         }
         if (buf) read_state_locked(buf,read);
     }
@@ -218,23 +299,40 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
     return buf ? EOK : ENOMEM;
 }
 
-static void invalidate_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
+/* Free/reuse ends this LBA identity. Existing readers retain their buffer
+ * and exact payload; a later lookup must allocate a distinct object. */
+static void detach_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
-    buf->end_write=NULL;buf->end_write_arg=NULL;
+    if (ext4_bcache_test_flag(buf,BC_DETACHED)) __builtin_trap();
+    if (!buf->refctr) idle_remove_locked(bc,buf);
+    RB_REMOVE(ext4_buf_lba,&bc->lba_root,buf);
     dirty_remove_locked(bc,buf);
     ext4_bcache_clear_dirty(buf);
+    ext4_bcache_set_flag(buf,BC_DETACHED);
 }
-void ext4_bcache_invalidate_buf(struct ext4_bcache *bc, struct ext4_buf *buf)
-{ KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);invalidate_locked(bc,buf); }
 void ext4_bcache_invalidate_lba(struct ext4_bcache *bc, uint64_t from, uint32_t cnt)
 {
     if (!cnt) return;
-    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
-    struct ext4_buf key={.lba=from};
-    struct ext4_buf *buf=RB_NFIND(ext4_buf_lba,&bc->lba_root,&key);
-    while (buf && buf->lba-from<cnt) {
-        invalidate_locked(bc,buf);
-        buf=RB_NEXT(ext4_buf_lba,&bc->lba_root,buf);
+    struct ext4_buf *garbage=NULL;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+        struct ext4_buf key={.lba=from};
+        struct ext4_buf *buf=RB_NFIND(ext4_buf_lba,&bc->lba_root,&key);
+        while (buf && buf->lba-from<cnt) {
+            struct ext4_buf *next=RB_NEXT(ext4_buf_lba,&bc->lba_root,buf);
+            detach_locked(bc,buf);
+            if (!buf->refctr) {
+                if (buf->loading || !bc->ref_blocks) __builtin_trap();
+                bc->ref_blocks--;
+                /* Detached idle objects need no persistent retirement list. */
+                buf->lru_next=garbage;garbage=buf;
+            }
+            buf=next;
+        }
+    }
+    while (garbage) {
+        struct ext4_buf *next=garbage->lru_next;
+        free_buffer(garbage);garbage=next;
     }
 }
 
@@ -243,18 +341,24 @@ void ext4_bcache_invalidate_lba(struct ext4_bcache *bc, uint64_t from, uint32_t 
 static int __attribute__((aligned(1024))) put_buffer(struct ext4_bcache *bc, struct ext4_block *b, bool read_only)
 {
     struct ext4_buf *buf=b->buf;
+    struct ext4_block_payload *payload=b->payload;
     bool flush=false,drop=false;
     int result=EOK;
+    if (!buf || !payload) __builtin_trap();
+    b->lb_id=0;b->data=NULL;b->payload=NULL;
+    /* Keep the buffer reference while returning an embedded initial payload.
+     * Publishing an idle buffer first would let another CPU free that storage. */
+    ext4_block_payload_put(payload);
     KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
-    if (!buf || !buf->refctr || buf->bc!=bc) __builtin_trap();
-    flush=buf->refctr==1 && !read_only && ext4_bcache_test_flag(buf,BC_DIRTY) &&
+    if (!buf->refctr || buf->bc!=bc) __builtin_trap();
+    flush=buf->refctr==1 && !read_only && !ext4_bcache_test_flag(buf,BC_DETACHED) && ext4_bcache_test_flag(buf,BC_DIRTY) &&
         ext4_bcache_test_flag(buf,BC_UPTODATE) && (!bc->bdev->cache_write_back ||
         ext4_bcache_test_flag(buf,BC_FLUSH) || ext4_bcache_test_flag(buf,BC_TMP));
     /* The context callback is a nonblocking query. Clean/shared references and
      * deferred dirty buffers need no flush decision from the calling task. */
     if (flush && bc->bdev->bdif->read_context && bc->bdev->bdif->read_context()) flush=false;
-    /* The final writer keeps its reference across flush. A concurrent lookup
-     * cannot detach this buffer while the device borrows its payload. */
+    /* The writer keeps its buffer reference across flush and device use.
+     * A retired buffer's last return releases it without another home write. */
     if (flush) {
         kernel_task_lock_release(&guard);
         result=ext4_block_flush_buf(bc->bdev,buf);
@@ -263,14 +367,18 @@ static int __attribute__((aligned(1024))) put_buffer(struct ext4_bcache *bc, str
     {
         if (flush && !result) ext4_bcache_clear_flag(buf,BC_FLUSH);
         if (!--buf->refctr) {
-            /* A zero-reference return is newest; no search or age counter. */
-            idle_append_locked(bc,buf);
-            if (ext4_bcache_test_flag(buf,BC_DIRTY) && ext4_bcache_test_flag(buf,BC_UPTODATE))
-                dirty_insert_locked(bc,buf);
-            drop=!result && (!ext4_bcache_test_flag(buf,BC_UPTODATE) || ext4_bcache_test_flag(buf,BC_TMP));
-            if (drop) drop_locked(bc,buf);
+            if (ext4_bcache_test_flag(buf,BC_DETACHED)) {
+                if (buf->loading || !bc->ref_blocks) __builtin_trap();
+                bc->ref_blocks--;drop=true;
+            } else {
+                /* A zero-reference return is newest; no search or age counter. */
+                idle_append_locked(bc,buf);
+                if (ext4_bcache_test_flag(buf,BC_DIRTY) && ext4_bcache_test_flag(buf,BC_UPTODATE))
+                    dirty_insert_locked(bc,buf);
+                drop=!result && (!ext4_bcache_test_flag(buf,BC_UPTODATE) || ext4_bcache_test_flag(buf,BC_TMP));
+                if (drop) drop_locked(bc,buf);
+            }
         }
-        b->lb_id=0;b->data=NULL;
     }
     kernel_task_lock_release(&guard);
     if (drop) free_buffer(buf);
@@ -351,7 +459,12 @@ int ext4_bcache_scope_end(struct ext4_bcache *bc, struct ext4_writeback_scope *s
     { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);buf=scope->head;if (!scope->previous) bc->writeback_scope=NULL; }
     while (buf) {
         struct ext4_buf *next;
-        struct ext4_block b={buf->lba,buf,buf->data};
+        struct ext4_block b;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+            ext4_block_payload_get(buf->current_payload);
+            b=(struct ext4_block){buf->lba,buf,buf->data,buf->current_payload};
+        }
         if (bc->bdev->cache_write_back==1) {
             int r=ext4_block_flush_buf(bc->bdev,buf);if (!result) result=r;
         }

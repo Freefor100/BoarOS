@@ -67,15 +67,18 @@ bool ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb,
  */
 int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir);
 
-/**@brief I-node allocation algorithm.
- * This is more simple algorithm, than Orlov allocator used
- * in the Linux kernel.
+/**@brief Allocate files near their parent and distribute new directories
+ * by their component name, group capacity and directory population.
  * @param fs     Filesystem to allocate i-node on
  * @param index  Output value - allocated i-node number
  * @param is_dir Flag if allocated i-node will be file or directory
+ * @param parent_inode Parent i-node number, or zero when formatting the root
+ * @param name Final component name, borrowed for this call
+ * @param name_len Component length; zero when parent_inode is zero
  * @return Error code
  */
-int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *index, bool is_dir);
+int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *index, bool is_dir,
+    uint32_t parent_inode, const char *name, uint32_t name_len);
 
 #ifdef __cplusplus
 }

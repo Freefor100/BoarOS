@@ -49,6 +49,7 @@ extern "C" {
  * @param   buf buffer
  * @return  standard error code*/
 int ext4_trans_set_block_dirty(struct ext4_buf *buf);
+int ext4_trans_set_block_dirty_range(struct ext4_block *block, uint32_t offset, uint32_t length);
 
 /**@brief   Block get function (through cache, don't read).
  *          jbd_trans_get_access would be called in order to
@@ -71,6 +72,9 @@ int ext4_trans_block_get_noread(struct ext4_blockdev *bdev,
 int ext4_trans_block_get(struct ext4_blockdev *bdev,
 		   struct ext4_block *b,
 		   uint64_t lba);
+/* Only this record is exposed from a transaction's private block view. */
+int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
+    struct ext4_block *b, uint64_t lba, uint32_t offset, uint32_t length);
 
 struct ext4_block_span;
 /* Synchronous non-journal stable blocks; explicit bcache borrows remain coherent. */

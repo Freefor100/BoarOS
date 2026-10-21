@@ -52,6 +52,31 @@ extern "C" {
 #define EXT4_BLOCK_ZERO() 	\
 	{.lb_id = 0, .data = 0}
 
+/* The storage owner survives cache publication and every descriptor/DMA loan. */
+struct ext4_block_payload {
+	uint8_t *data;
+	uint32_t references;
+	void (*release)(struct ext4_block_payload *);
+};
+void ext4_block_payload_init(struct ext4_block_payload *, uint8_t *,
+	void (*release)(struct ext4_block_payload *));
+static inline __attribute__((always_inline)) void ext4_block_payload_get(struct ext4_block_payload *payload)
+{
+    if (!payload) __builtin_trap();
+    uint32_t before=__atomic_fetch_add(&payload->references,1,__ATOMIC_RELAXED);
+    if (!before || before==UINT32_MAX) __builtin_trap();
+}
+static inline __attribute__((always_inline)) void ext4_block_payload_put(struct ext4_block_payload *payload)
+{
+    if (!payload) __builtin_trap();
+    uint32_t before=__atomic_fetch_sub(&payload->references,1,__ATOMIC_RELEASE);
+    if (!before) __builtin_trap();
+    if (before==1) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (payload->release) payload->release(payload);
+    }
+}
+
 /**@brief   Single block descriptor*/
 struct ext4_block {
 	/**@brief   Logical block ID*/
@@ -62,6 +87,9 @@ struct ext4_block {
 
 	/**@brief   Data buffer.*/
 	uint8_t *data;
+
+	/* Owns the exact data version, independently of the cache's current one. */
+	struct ext4_block_payload *payload;
 };
 
 struct ext4_bcache;
@@ -117,6 +145,11 @@ struct ext4_buf {
 
 	/**@brief   argument passed to end_write() callback.*/
 	void *end_write_arg;
+
+	/* The original allocation remains anchored until this buffer is freed.
+	 * Every borrower of this embedded payload also holds a buffer reference. */
+	struct ext4_block_payload initial_payload;
+	struct ext4_block_payload *current_payload;
 };
 
 /**@brief   Block cache descriptor*/
@@ -167,7 +200,9 @@ enum bcache_state_bits {
 	BC_UPTODATE,
 	BC_DIRTY,
 	BC_FLUSH,
-	BC_TMP
+	BC_TMP,
+	/* Removed from lookup; outstanding descriptors retain the old bytes. */
+	BC_DETACHED
 };
 
 /* Taken with the reference under metadata; WAIT also observes a saved error. */
@@ -197,12 +232,22 @@ static inline void ext4_bcache_set_dirty(struct ext4_buf *buf) {
 }
 
 static inline void ext4_bcache_clear_dirty(struct ext4_buf *buf) {
-	ext4_bcache_clear_flag(buf, BC_UPTODATE);
 	ext4_bcache_clear_flag(buf, BC_DIRTY);
 }
 
-/* The caller already owns a reference; journal/scope pins share the index lock. */
-void ext4_bcache_inc_ref(struct ext4_buf *buf);
+/* Transfer the client's current accepted loan to a separate descriptor and
+ * lend private_payload to the client. A stale client instead borrows the latest
+ * accepted version; its old payload is returned outside cache metadata. */
+void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
+    struct ext4_block_payload *private_payload);
+/* The owner already keeps this home buffer and baseline alive. Borrow view
+ * directly; a requested newer accepted version gets its own snapshot loan. */
+struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *owner,
+    struct ext4_block_payload *view, bool snapshot, struct ext4_block *borrowed);
+/* Rebind keeps the buffer reference; publication retains its own payload loan.
+ * Both return the old payload outside the cache metadata short lock. */
+void ext4_block_rebind(struct ext4_block *, struct ext4_block_payload *);
+void ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 /* Select and detach clean victims atomically, flushing only in a write context. */
@@ -228,13 +273,7 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc);
  * @return  standard error code*/
 int ext4_bcache_fini_dynamic(struct ext4_bcache *bc);
 
-/**@brief   Invalidate a buffer.
- * @param   bc block cache descriptor
- * @param   buf buffer*/
-void ext4_bcache_invalidate_buf(struct ext4_bcache *bc,
-				struct ext4_buf *buf);
-
-/**@brief   Invalidate a range of buffers.
+/**@brief   Retire a range from lookup while existing loans keep their bytes.
  * @param   bc block cache descriptor
  * @param   from starting lba
  * @param   cnt block counts*/

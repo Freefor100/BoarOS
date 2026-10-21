@@ -153,35 +153,46 @@ int ext4_block_fini(struct ext4_blockdev *bdev)
 	return bdev->bdif->close(bdev);
 }
 
-static void ext4_block_end_write(struct ext4_bcache *bc, struct ext4_buf *buf, int error)
+static void ext4_block_end_write(struct ext4_bcache *bc, struct ext4_buf *buf, int error,
+    void (*complete)(struct ext4_bcache *, struct ext4_buf *, int, void *), void *argument)
 {
-    if (!buf->end_write) return;
+    if (!complete) return;
     bool previous;
     { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);previous=bc->dont_shake;bc->dont_shake=true; }
-    buf->end_write(bc,buf,error,buf->end_write_arg);
+    complete(bc,buf,error,argument);
     { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);bc->dont_shake=previous; }
 }
 
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 {
-	int r;
-	struct ext4_bcache *bc = bdev->bc;
-	if (buf->journal_pending) return EBUSY;
-
-	if (ext4_bcache_test_flag(buf, BC_DIRTY) &&
-	    ext4_bcache_test_flag(buf, BC_UPTODATE)) {
-		r = ext4_blocks_set_direct(bdev, buf->data, buf->lba, 1);
-		if (r) {
-            ext4_block_end_write(bc,buf,r);
-
-			return r;
-		}
-
-		ext4_bcache_remove_dirty_node(bc, buf);
-		ext4_bcache_clear_flag(buf, BC_DIRTY);
-        ext4_block_end_write(bc,buf,r);
-	}
-	return EOK;
+    struct ext4_bcache *bc=bdev->bc;
+    struct ext4_block_payload *payload;
+    void (*complete)(struct ext4_bcache *, struct ext4_buf *, int, void *);
+    void *argument;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+        if (!buf->refctr || buf->bc!=bc) __builtin_trap();
+        if (buf->journal_pending) return EBUSY;
+        if (!ext4_bcache_test_flag(buf,BC_DIRTY) || !ext4_bcache_test_flag(buf,BC_UPTODATE)) return EOK;
+        payload=buf->current_payload;ext4_block_payload_get(payload);
+        complete=buf->end_write;argument=buf->end_write_arg;
+    }
+    int result=ext4_blocks_set_direct(bdev,payload->data,buf->lba,1);
+    if (!result) {
+        KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+        /* A later publication still needs its own write, even when this older
+         * payload completed successfully while its device loan stayed alive. */
+        if (buf->current_payload==payload) {
+            if (buf->on_dirty_list) {
+                SLIST_REMOVE(&bc->dirty_list,buf,ext4_buf,dirty_node);
+                buf->on_dirty_list=false;
+            }
+            ext4_bcache_clear_flag(buf,BC_DIRTY);
+        }
+    }
+    ext4_block_end_write(bc,buf,result,complete,argument);
+    ext4_block_payload_put(payload);
+    return result;
 }
 
 int ext4_block_flush_lba(struct ext4_blockdev *bdev, uint64_t lba)
@@ -201,7 +212,8 @@ int ext4_block_cache_shake(struct ext4_blockdev *bdev)
 { return ext4_bcache_shake(bdev->bc); }
 
 static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
-    uint64_t lba, enum ext4_bcache_read_state *read)
+    uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access,
+    enum ext4_bcache_read_state *read, bool *private)
 {
 	int r;
 
@@ -214,6 +226,26 @@ static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
 		return ENXIO;
 
 	b->lb_id = lba;
+	if (private) *private = false;
+#if CONFIG_JOURNALING_ENABLE
+    if (bdev->fs) {
+        struct jbd_trans *trans = ext4_current_trans(bdev->fs);
+        if (trans) {
+            bool found;
+            r = jbd_trans_borrow_private(trans, b, lba, offset, length, access, &found);
+            if (found) {
+                COST_ADD(BLOCK_CACHE_HITS, 1);
+                if (!r) {
+                    if (read) *read = EXT4_BCACHE_READ_READY;
+                    if (private) *private = true;
+                }
+                return r;
+            }
+        }
+    }
+#else
+    (void)offset; (void)length; (void)access;
+#endif
 
 	/* 命中先取得引用：无需新分配的访问不能因回收而淘汰自身。 */
 	if (ext4_bcache_find_get(bdev->bc, b, lba, read)) {
@@ -240,7 +272,7 @@ static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
 int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba)
 {
-    return block_get_reference(bdev,b,lba,NULL);
+    return block_get_reference(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,NULL,NULL);
 }
 static void ext4_block_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf, int error)
 {
@@ -265,18 +297,35 @@ static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *b
         bdev->bdif->wait_read(buf);
     }
 }
-int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
+int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
+    uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access)
 {
+    if (offset > bdev->lg_bsize || !length || length > bdev->lg_bsize - offset) return EINVAL;
     enum ext4_bcache_read_state read;
-    int r=block_get_reference(bdev,b,lba,&read);
+    bool private;
+    int r=block_get_reference(bdev,b,lba,offset,length,access,&read,&private);
     if (r) return r;
+    if (private) return EOK;
     if (read==EXT4_BCACHE_READ_LOAD) {
         r=ext4_blocks_get_direct(bdev,b->data,lba,1);
         ext4_block_loaded(bdev,b->buf,r);
     } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
     if (r) ext4_bcache_free_read(bdev->bc,b);
+#if CONFIG_JOURNALING_ENABLE
+    else if (bdev->fs) {
+        struct jbd_trans *trans=ext4_current_trans(bdev->fs);
+        if (trans) {
+            if (access == EXT4_BLOCK_WRITE)
+                r=jbd_trans_get_write_access_range(trans,b,offset,length);
+        }
+    }
+#else
+    (void)access;
+#endif
     return r;
 }
+int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
+{ return ext4_block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ); }
 
 static void ext4_bread_completed(void *context, unsigned index, const struct block_read_span *span)
 {
@@ -345,7 +394,8 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	uint32_t waiters=0;
 	for (unsigned i = 0; i < count; i++) {
 		enum ext4_bcache_read_state read;
-		errors[i] = block_get_reference(bdev, &blocks[i], lbas[i], &read);
+		errors[i] = block_get_reference(bdev, &blocks[i], lbas[i], 0, bdev->lg_bsize,
+            EXT4_BLOCK_READ, &read, NULL);
 		if (errors[i]) continue;
 		if (read==EXT4_BCACHE_READ_WAIT) { waiters|=UINT32_C(1)<<i;continue; }
 		if (read==EXT4_BCACHE_READ_READY) continue;

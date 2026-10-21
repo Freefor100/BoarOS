@@ -593,7 +593,7 @@ class CostReportTest(unittest.TestCase):
     def test_valid(self): self.assertEqual(parse(self.render(self.valid()), 3)['epoch'], 3)
     def test_reject_corrupt(self):
         for key, value in [('version','2'), ('epoch','2'), ('state','incomplete'),
-            ('overflow','1'), ('inflight','1'), ('task_bytes','65'), ('storage_bytes','65537'),
+            ('overflow','1'), ('inflight','1'), ('task_bytes','161'), ('storage_bytes','98305'),
             ('foreground.operations.unit','bytes'), ('foreground.operations.value','-1'),
             ('foreground.operation_ticks.samples','1')]:
             with self.subTest(key=key):

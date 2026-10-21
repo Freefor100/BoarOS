@@ -1,5 +1,6 @@
 /* Real orphan records, real JBD transactions, volatile device power cuts. */
 #include "block_fault.h"
+#include "lwext4_operation.h"
 #include <ext4.h>
 #include <ext4_blockdev.h>
 #include <ext4_block_group.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 static struct fault_block disk;
@@ -52,8 +54,10 @@ static int dev_flush(struct ext4_blockdev *b)
 static void begin(struct ext4_fs *fs, struct jbd_journal *journal)
 {
     fs->jbd_journal = journal;
-    fs->curr_trans = jbd_journal_new_trans(journal);
-    CHECK(fs->curr_trans != NULL);
+    struct jbd_trans *trans; CHECK(jbd_journal_new_trans(journal, &trans) == EOK);
+    CHECK(trans);
+    test_operation_bind(fs,trans);
+    CHECK(ext4_current_trans(fs) != NULL);
 }
 
 /* Exercise the integration contract: include the in-memory superblock in this
@@ -62,34 +66,50 @@ static struct jbd_trans *record_super(struct ext4_fs *fs)
 {
     struct ext4_block block;
     uint32_t size = fs->bdev->lg_bsize;
-    if (ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_METADATA_CSUM))
-        fs->sb.checksum = to_le32(ext4_crc32c(EXT4_CRC32_INIT, &fs->sb,
+    if (ext4_sb_feature_ro_com(ext4_fs_super(fs), EXT4_FRO_COM_METADATA_CSUM))
+        ext4_fs_super(fs)->checksum = to_le32(ext4_crc32c(EXT4_CRC32_INIT, ext4_fs_super(fs),
             offsetof(struct ext4_sblock, checksum)));
     CHECK(ext4_trans_block_get(fs->bdev, &block, EXT4_SUPERBLOCK_OFFSET / size) == EOK);
     CHECK(ext4_trans_set_block_dirty(block.buf) == EOK);
-    memcpy(block.data + EXT4_SUPERBLOCK_OFFSET % size, &fs->sb, sizeof(fs->sb));
+    memcpy(block.data + EXT4_SUPERBLOCK_OFFSET % size, ext4_fs_super(fs), sizeof(fs->sb));
     CHECK(ext4_block_set(fs->bdev, &block) == EOK);
-    struct jbd_trans *tx = fs->curr_trans;
-    fs->curr_trans = NULL;
+    struct jbd_trans *tx = ext4_current_trans(fs);
+    test_operation_bind(fs,NULL);
     return tx;
 }
 
 static int commit(struct ext4_fs *fs)
 {
-    return jbd_journal_commit_trans(fs->jbd_journal, record_super(fs));
+    struct jbd_trans *trans=record_super(fs);
+    int result=jbd_trans_prepare_operation(trans);
+    if(result) { jbd_journal_free_trans(fs->jbd_journal,trans,true);return result; }
+    return jbd_journal_commit_trans(fs->jbd_journal,trans);
 }
 
 static int accept(struct ext4_fs *fs)
 {
-    return jbd_journal_accept(fs->jbd_journal, record_super(fs), 1);
+    struct jbd_trans *trans=record_super(fs);
+    int result=jbd_trans_prepare_operation(trans);
+    if(result) { jbd_journal_free_trans(fs->jbd_journal,trans,true);return result; }
+    return jbd_journal_accept(fs->jbd_journal,trans,1);
 }
 
 static void abort_transaction(struct ext4_fs *fs, const struct ext4_sblock *before)
 {
-    struct jbd_trans *tx = fs->curr_trans;
-    fs->curr_trans = NULL;
+    (void)before;
+    struct jbd_trans *tx = ext4_current_trans(fs);
+    test_operation_bind(fs,NULL);
     jbd_journal_free_trans(fs->jbd_journal, tx, true);
-    fs->sb = *before;
+}
+
+static int public_orphan_change(struct ext4_fs *fs, uint32_t inode, bool add)
+{
+    struct ext4_inode_ref ref;
+    int result = ext4_fs_get_inode_ref(fs, inode, &ref);
+    if (result) return result;
+    result = add ? ext4_orphan_add(&ref) : ext4_orphan_remove(&ref);
+    int cleanup = ext4_fs_put_inode_ref(&ref);
+    return result ? result : cleanup;
 }
 
 static void check_membership(struct ext4_fs *fs, const uint32_t *members,
@@ -120,13 +140,39 @@ static uint32_t fixture_seed(struct ext4_inode_ref *ref)
     return ext4_crc32c(sum, &gen, sizeof(gen));
 }
 
+static unsigned find_orphan_file_entry(struct ext4_fs *fs, struct ext4_inode_ref *file,
+                                        uint32_t inode, struct ext4_block *block)
+{
+    unsigned slots = (fs->bdev->lg_bsize - 8) / 4;
+    uint64_t blocks = ext4_inode_get_size(&fs->sb, file->inode) / fs->bdev->lg_bsize;
+    for (uint32_t logical = 0; logical < blocks; logical++) {
+        ext4_fsblk_t lba;
+        CHECK(ext4_fs_get_inode_dblk_idx(file, logical, &lba, false) == EOK);
+        CHECK(ext4_block_get(fs->bdev, block, lba) == EOK);
+        const uint32_t *entries = (const void *)block->data;
+        for (unsigned slot = 0; slot < slots; slot++)
+            if (to_le32(entries[slot]) == inode) return slot;
+        CHECK(ext4_block_set(fs->bdev, block) == EOK);
+    }
+    CHECK(!"orphan inode not found in its persistent file");
+    return 0;
+}
+
 static void damage_records(struct ext4_fs *fs, const char *kind)
 {
     struct ext4_inode_ref ref;
     if (!strncmp(kind, "file-", 5)) {
-        CHECK(ext4_fs_get_inode_ref(fs, ext4_get32(&fs->sb, orphan_file_inum), &ref) == EOK);
+        CHECK(ext4_fs_get_inode_ref(fs, ext4_get32(ext4_fs_super(fs), orphan_file_inum), &ref) == EOK);
         ext4_fsblk_t lba;
-        CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &lba, false) == EOK);
+        unsigned source_slot = 0;
+        if (!strcmp(kind, "file-duplicate")) {
+            uint32_t inode;
+            struct ext4_block block;
+            CHECK(ext4_orphan_peek(fs, &inode) == EOK && inode);
+            source_slot = find_orphan_file_entry(fs, &ref, inode, &block);
+            lba = block.lb_id;
+            CHECK(ext4_block_set(fs->bdev, &block) == EOK);
+        } else CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &lba, false) == EOK);
         uint32_t size = fs->bdev->lg_bsize;
         unsigned char *data = malloc(size);
         CHECK(data != NULL);
@@ -136,9 +182,12 @@ static void damage_records(struct ext4_fs *fs, const char *kind)
         if (!strcmp(kind, "file-magic")) tail[0] ^= 1;
         else if (!strcmp(kind, "file-checksum")) tail[1] ^= 1;
         else {
-            if (!strcmp(kind, "file-range")) entries[0] = to_le32(ext4_get32(&fs->sb, inodes_count) + 1);
+            if (!strcmp(kind, "file-range")) entries[0] = to_le32(ext4_get32(ext4_fs_super(fs), inodes_count) + 1);
             else if (!strcmp(kind, "file-free")) entries[0] = fs->sb.inodes_count;
-            else if (!strcmp(kind, "file-duplicate")) { CHECK(entries[0] != 0); entries[1] = entries[0]; }
+            else if (!strcmp(kind, "file-duplicate")) {
+                CHECK(entries[source_slot] != 0);
+                entries[source_slot ? 0 : 1] = entries[source_slot];
+            }
             else CHECK(!"unknown file damage");
             uint64_t physical = to_le64(lba);
             uint32_t sum = ext4_crc32c(fixture_seed(&ref), &physical, sizeof(physical));
@@ -152,12 +201,12 @@ static void damage_records(struct ext4_fs *fs, const char *kind)
         CHECK(ext4_orphan_peek(fs, &ino) == EOK && ino != 0);
         struct ext4_block_group_ref group;
         CHECK(ext4_fs_get_block_group_ref(fs,
-            (ino - 1) / ext4_get32(&fs->sb, inodes_per_group), &group) == EOK);
+            (ino - 1) / ext4_get32(ext4_fs_super(fs), inodes_per_group), &group) == EOK);
         if (!strcmp(kind, "bitmap-uninit")) {
             group.block_group->flags |= to_le16(EXT4_BLOCK_GROUP_INODE_UNINIT);
             group.dirty = true;
         } else {
-            ext4_fsblk_t lba = ext4_bg_get_inode_bitmap(group.block_group, &fs->sb);
+            ext4_fsblk_t lba = ext4_bg_get_inode_bitmap(group.block_group, ext4_fs_super(fs));
             unsigned char *data = malloc(fs->bdev->lg_bsize);
             CHECK(data != NULL);
             CHECK(ext4_blocks_get_direct(fs->bdev, data, lba, 1) == EOK);
@@ -171,25 +220,99 @@ static void damage_records(struct ext4_fs *fs, const char *kind)
     } else if (!strcmp(kind, "mixed-duplicate")) {
         uint32_t ino;
         CHECK(ext4_orphan_peek(fs, &ino) == EOK && ino != 0);
-        ext4_set32(&fs->sb, last_orphan, ino);
-        CHECK(ext4_sb_write(fs->bdev, &fs->sb) == EOK);
+        ext4_set32(ext4_fs_super(fs), last_orphan, ino);
+        CHECK(ext4_sb_write(fs->bdev, ext4_fs_super(fs)) == EOK);
     } else if (!strcmp(kind, "chain-free")) {
         fs->sb.last_orphan = fs->sb.inodes_count;
-        CHECK(ext4_sb_write(fs->bdev, &fs->sb) == EOK);
+        CHECK(ext4_sb_write(fs->bdev, ext4_fs_super(fs)) == EOK);
     } else {
-        uint32_t ino = ext4_get32(&fs->sb, last_orphan);
+        uint32_t ino = ext4_fs_orphan_head(fs);
         CHECK(ino != 0);
         CHECK(ext4_fs_get_inode_ref(fs, ino, &ref) == EOK);
         ext4_inode_set_del_time(ref.inode, !strcmp(kind, "chain-cycle") ? ino :
-            ext4_get32(&fs->sb, inodes_count) + 1);
-        ext4_inode_set_csum(&fs->sb, ref.inode, 0);
+            ext4_get32(ext4_fs_super(fs), inodes_count) + 1);
+        ext4_inode_set_csum(ext4_fs_super(fs), ref.inode, 0);
         uint32_t sum = ext4_crc32c(fixture_seed(&ref), ref.inode,
-            ext4_get16(&fs->sb, inode_size));
-        ext4_inode_set_csum(&fs->sb, ref.inode, sum);
+            ext4_get16(ext4_fs_super(fs), inode_size));
+        ext4_inode_set_csum(ext4_fs_super(fs), ref.inode, sum);
         CHECK(ext4_blocks_set_direct(fs->bdev, ref.block.data, ref.block.lb_id, 1) == EOK);
         CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
     }
     CHECK(dev_flush(fs->bdev) == EOK);
+}
+
+static ext4_fsblk_t operation_orphan_block(struct jbd_trans *trans)
+{
+    struct jbd_buf *buffer;
+    TAILQ_FOREACH(buffer, &trans->buf_queue, buf_node) {
+        const uint32_t *tail = (const void *)(buffer->block.data + trans->journal->block_size - 8);
+        if (to_le32(tail[0]) == EXT4_ORPHAN_BLOCK_MAGIC) return buffer->block.lb_id;
+    }
+    return 0;
+}
+
+struct sibling_operation {
+    struct ext4_fs *fs;
+    struct jbd_journal *journal;
+    uint32_t first, second;
+    ext4_fsblk_t second_block;
+};
+
+static void *accept_sibling_orphan(void *argument)
+{
+    struct sibling_operation *sibling = argument;
+    bool present;
+    CHECK(ext4_orphan_contains(sibling->fs, sibling->first, &present) == EOK && !present);
+    begin(sibling->fs, sibling->journal);
+    struct ext4_inode_ref inode;
+    CHECK(ext4_fs_get_inode_ref(sibling->fs, sibling->second, &inode) == EOK);
+    CHECK(ext4_orphan_add(&inode) == EOK);
+    sibling->second_block = operation_orphan_block(ext4_current_trans(sibling->fs));
+    CHECK(sibling->second_block != 0);
+    CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
+    CHECK(accept(sibling->fs) == EOK);
+    CHECK(ext4_orphan_contains(sibling->fs, sibling->first, &present) == EOK && !present);
+    CHECK(ext4_orphan_contains(sibling->fs, sibling->second, &present) == EOK && present);
+    return NULL;
+}
+
+static void sibling_private_orphans(struct ext4_fs *fs, struct jbd_journal *journal)
+{
+    CHECK(ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT));
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    ext4_file a, b;
+    CHECK(ext4_fopen(&a, "/a", "r+") == EOK && ext4_fopen(&b, "/b", "r+") == EOK);
+    struct sibling_operation sibling = {fs, journal, a.inode, b.inode, 0};
+    struct ext4_sblock before = fs->sb;
+    begin(fs, journal);
+    struct ext4_inode_ref inode;
+    CHECK(ext4_fs_get_inode_ref(fs, a.inode, &inode) == EOK);
+    CHECK(ext4_orphan_add(&inode) == EOK);
+    ext4_fsblk_t first_block = operation_orphan_block(ext4_current_trans(fs));
+    CHECK(first_block != 0);
+    CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
+    pthread_t other;
+    CHECK(!pthread_create(&other, NULL, accept_sibling_orphan, &sibling));
+    CHECK(!pthread_join(other, NULL));
+    CHECK(first_block != sibling.second_block);
+    abort_transaction(fs, &before);
+    bool present;
+    CHECK(ext4_orphan_contains(fs, a.inode, &present) == EOK && !present);
+    CHECK(ext4_orphan_contains(fs, b.inode, &present) == EOK && present);
+    CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_ORPHAN_PRESENT_RO_COMPAT));
+    begin(fs, journal);
+    CHECK(ext4_fs_get_inode_ref(fs, b.inode, &inode) == EOK);
+    CHECK(ext4_orphan_remove(&inode) == EOK);
+    CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
+    CHECK(accept(fs) == EOK);
+    CHECK(!ext4_sb_feature_ro_com(&fs->sb, EXT4_ORPHAN_PRESENT_RO_COMPAT));
+    CHECK(ext4_fclose(&a) == EOK && ext4_fclose(&b) == EOK);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    while (jbd_journal_select(journal)) {
+        int result = journal->committing ? jbd_journal_submit(journal) : jbd_journal_checkpoint(journal);
+        CHECK(result == EOK && jbd_journal_retire(journal, result) == EOK);
+    }
+    puts("PASS independent orphan blocks: private visibility, sibling acceptance and abort isolation");
 }
 
 int main(int argc, char **argv)
@@ -233,7 +356,7 @@ int main(int argc, char **argv)
         CHECK(ext4_orphan_validate(fs) == expected);
         CHECK(ext4_orphan_peek(fs, &untouched) == expected);
         CHECK(untouched == 12345);
-        CHECK(memcmp(&original, &fs->sb, sizeof(original)) == 0);
+        CHECK(memcmp(&original, ext4_fs_super(fs), sizeof(original)) == 0);
         CHECK(disk.writes == writes);
         return 0;
     }
@@ -251,7 +374,65 @@ int main(int argc, char **argv)
     }
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
-    if (!strcmp(argv[2], "group-rollback")) {
+    if (!strncmp(argv[2], "slot-reuse", 10)) {
+        fs->jbd_journal = &journal;
+        bool grouped = strstr(argv[2], "-group") != NULL;
+        if (grouped) CHECK(jbd_journal_group_init(&journal, 4 * 1024 * 1024) == EOK);
+        ext4_file files[3];
+        uint32_t ids[3];
+        const char *names[] = {"/a", "/b", "/c"};
+        for (unsigned i = 0; i < 3; i++) {
+            CHECK(ext4_fopen(&files[i], names[i], "r+") == EOK);
+            ids[i] = files[i].inode;
+        }
+        CHECK(ext4_transaction_begin("/") == EOK);
+        CHECK(public_orphan_change(fs, ids[0], true) == EOK);
+        CHECK(ext4_transaction_end("/") == EOK);
+        if (grouped) CHECK(ext4_journal_group_drain("/") == EOK);
+        unsigned additions = strstr(argv[2], "-multiple") ? 2 : 1;
+        for (unsigned abort = 1;; abort--) {
+            CHECK(ext4_transaction_begin("/") == EOK);
+            CHECK(ext4_transaction_begin("/") == EOK);
+            CHECK(public_orphan_change(fs, ids[0], false) == EOK);
+            for (unsigned i = 1; i <= additions; i++)
+                CHECK(public_orphan_change(fs, ids[i], true) == EOK);
+            CHECK(ext4_transaction_end("/") == EOK);
+            if (abort) {
+                CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+                check_membership(fs, ids, 1, ids[1]);
+                CHECK(ext4_orphan_validate(fs) == EOK);
+            } else {
+                CHECK(ext4_transaction_end("/") == EOK);
+                check_membership(fs, ids + 1, additions, ids[0]);
+                if (grouped) CHECK(ext4_journal_group_drain("/") == EOK);
+                CHECK(ext4_orphan_validate(fs) == EOK);
+                break;
+            }
+        }
+        CHECK(ext4_transaction_begin("/") == EOK);
+        for (unsigned i = 1; i <= additions; i++)
+            CHECK(public_orphan_change(fs, ids[i], false) == EOK);
+        CHECK(ext4_transaction_end("/") == EOK);
+        if (grouped) {
+            CHECK(ext4_journal_group_drain("/") == EOK);
+            jbd_journal_group_fini(&journal);
+        }
+        for (unsigned i = 0; i < 3; i++) CHECK(ext4_fclose(&files[i]) == EOK);
+        struct jbd_memory *memory = journal.memory;
+        jbd_memory_get(memory);
+        CHECK(jbd_journal_stop(&journal) == EOK && jbd_put_fs(&jfs) == EOK);
+        fs->jbd_journal = NULL;
+        CHECK(ext4_umount("/") == EOK && dev_flush(&dev) == EOK);
+        struct jbd_memory_stats stats;
+        jbd_memory_snapshot(memory, &stats);
+        CHECK(!stats.used && !stats.reserved && !stats.cached);
+        jbd_memory_put(memory);
+        printf("PASS: orphan slot reuse block=%u additions=%u grouped=%u: actual nested begin/end/abort, private overlays, accepted membership and resource return\n",
+            dev.lg_bsize, additions, grouped);
+        return 0;
+    } else if (!strcmp(argv[2], "sibling-private")) {
+        sibling_private_orphans(fs, &journal);
+    } else if (!strcmp(argv[2], "group-rollback")) {
         ext4_file files[2];
         struct ext4_inode_ref refs[2];
         uint32_t ids[2];
@@ -273,7 +454,7 @@ int main(int argc, char **argv)
         CHECK(ext4_orphan_remove(&refs[1]) == EOK);
         CHECK(ext4_orphan_add(&refs[0]) == EOK);
         abort_transaction(fs, &before);
-        check_membership(fs, ids, 2, ext4_get32(&fs->sb, inodes_count));
+        check_membership(fs, ids, 2, ext4_get32(ext4_fs_super(fs), inodes_count));
         begin(fs, &journal);
         CHECK(ext4_orphan_remove(&refs[0]) == EOK);
         CHECK(accept(fs) == EOK);
@@ -304,7 +485,7 @@ int main(int argc, char **argv)
         begin(fs, &journal);
         CHECK(ext4_orphan_set_present(fs, true) == EOK);
         CHECK(ext4_orphan_remove(&refs[1]) == EOK);
-        CHECK(!ext4_sb_feature_ro_com(&fs->sb, EXT4_ORPHAN_PRESENT_RO_COMPAT));
+        CHECK(!(ext4_fs_ro_flags(fs) & EXT4_ORPHAN_PRESENT_RO_COMPAT));
         abort_transaction(fs, &before);
         begin(fs, &journal);
         for (unsigned i = 0; i < 3; i++) CHECK(ext4_orphan_add(&refs[i]) == EOK);
@@ -323,7 +504,7 @@ int main(int argc, char **argv)
         CHECK(ext4_orphan_remove(&refs[0]) == EOK);
         CHECK(ext4_orphan_add(&refs[1]) == EOK);
         abort_transaction(fs, &before);
-        check_membership(fs, ids, 3, ext4_get32(&fs->sb, inodes_count));
+        check_membership(fs, ids, 3, ext4_get32(ext4_fs_super(fs), inodes_count));
         CHECK(ext4_orphan_validate(fs) == EOK);
         begin(fs, &journal);
         CHECK(ext4_orphan_remove(&refs[1]) == EOK);
@@ -354,17 +535,14 @@ int main(int argc, char **argv)
         CHECK(commit(fs) == EOK);
         struct ext4_sblock before = fs->sb;
         begin(fs, &journal);
-        if (ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT)) {
+        if (ext4_sb_feature_com(ext4_fs_super(fs), EXT4_ORPHAN_FILE_COMPAT)) {
             struct ext4_inode_ref table;
             struct ext4_block block;
             ext4_fsblk_t lba;
-            CHECK(ext4_fs_get_inode_ref(fs, ext4_get32(&fs->sb, orphan_file_inum), &table) == EOK);
-            CHECK(ext4_fs_get_inode_dblk_idx(&table, 0, &lba, false) == EOK);
-            CHECK(ext4_block_get(fs->bdev, &block, lba) == EOK);
+            CHECK(ext4_fs_get_inode_ref(fs, ext4_get32(ext4_fs_super(fs), orphan_file_inum), &table) == EOK);
+            unsigned slot = find_orphan_file_entry(fs, &table, ref.index, &block);
+            lba = block.lb_id;
             uint32_t *entries = (void *)block.data;
-            unsigned slot = 0;
-            while (slot < (dev.lg_bsize - 8) / 4 && to_le32(entries[slot]) != ref.index) slot++;
-            CHECK(slot < (dev.lg_bsize - 8) / 4);
             entries[slot] = 0;
             uint64_t physical = to_le64(lba);
             uint32_t sum = ext4_crc32c(fixture_seed(&table), &physical, sizeof(physical));
@@ -376,7 +554,7 @@ int main(int argc, char **argv)
         CHECK(ext4_orphan_remove(&ref) == EUCLEAN);
         bool present;
         CHECK(ext4_orphan_contains(fs, ref.index, &present) == EOK && present);
-        CHECK(memcmp(&before, &fs->sb, sizeof(before)) == 0);
+        CHECK(memcmp(&before, ext4_fs_super(fs), sizeof(before)) == 0);
         abort_transaction(fs, &before);
         CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
     } else if (!strcmp(argv[2], "lookup")) {
@@ -407,8 +585,8 @@ int main(int argc, char **argv)
         CHECK(commit(fs) == EOK);
     } else if (!strcmp(argv[2], "fill")) {
         struct ext4_inode_ref table;
-        CHECK(ext4_fs_get_inode_ref(fs, ext4_get32(&fs->sb, orphan_file_inum), &table) == EOK);
-        uint64_t blocks = ext4_inode_get_size(&fs->sb, table.inode) / dev.lg_bsize;
+        CHECK(ext4_fs_get_inode_ref(fs, ext4_get32(ext4_fs_super(fs), orphan_file_inum), &table) == EOK);
+        uint64_t blocks = ext4_inode_get_size(ext4_fs_super(fs), table.inode) / dev.lg_bsize;
         unsigned capacity = blocks * (dev.lg_bsize - 8) / 4;
         CHECK(blocks == 1); /* Runner builds a small valid preallocated table. */
         CHECK(ext4_fs_put_inode_ref(&table) == EOK);
@@ -427,14 +605,14 @@ int main(int argc, char **argv)
             last = ref.index;
             members[i] = last;
             if (!((i + 1) & i) || i + 1 == capacity + 4)
-                check_membership(fs, members, i + 1, ext4_get32(&fs->sb, inodes_count));
+                check_membership(fs, members, i + 1, ext4_get32(ext4_fs_super(fs), inodes_count));
             CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
             CHECK(commit(fs) == EOK);
             CHECK(ext4_fclose(&file) == EOK);
         }
-        CHECK(ext4_get32(&fs->sb, last_orphan) == last);
+        CHECK(ext4_fs_orphan_head(fs) == last);
         CHECK(ext4_orphan_validate(fs) == EOK);
-        check_membership(fs, members, capacity + 4, ext4_get32(&fs->sb, inodes_count));
+        check_membership(fs, members, capacity + 4, ext4_get32(ext4_fs_super(fs), inodes_count));
         /* Remove a non-head legacy entry and a file slot, then restore both. */
         struct ext4_sblock before = fs->sb;
         begin(fs, &journal);
@@ -446,7 +624,7 @@ int main(int argc, char **argv)
             CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
         }
         abort_transaction(fs, &before);
-        check_membership(fs, members, capacity + 4, ext4_get32(&fs->sb, inodes_count));
+        check_membership(fs, members, capacity + 4, ext4_get32(ext4_fs_super(fs), inodes_count));
         CHECK(ext4_orphan_validate(fs) == EOK);
         free(members);
     } else if (!strncmp(argv[2], "add", 3)) {
@@ -486,8 +664,8 @@ int main(int argc, char **argv)
                 CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
                 CHECK(commit(fs) == EOK);
                 CHECK(ext4_orphan_peek(fs, &ino) == EOK);
-                CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_ORPHAN_PRESENT) ==
-                    (ino != 0 && ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT)));
+                CHECK(ext4_sb_feature_ro_com(ext4_fs_super(fs), EXT4_FRO_COM_ORPHAN_PRESENT) ==
+                    (ino != 0 && ext4_sb_feature_com(ext4_fs_super(fs), EXT4_ORPHAN_FILE_COMPAT)));
             }
         }
         if (!strcmp(argv[2], "remove-one") || !strcmp(argv[2], "remove-error")) {

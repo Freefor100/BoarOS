@@ -215,7 +215,7 @@ static uint32_t ext4_dir_dx_checksum(struct ext4_inode_ref *inode_ref, void *de,
 				     int count_offset, int count,
 				     struct ext4_dir_idx_tail *t)
 {
-	uint32_t orig_cum, csum = 0;
+	uint32_t csum = 0;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
 	int sz;
 
@@ -226,8 +226,10 @@ static uint32_t ext4_dir_dx_checksum(struct ext4_inode_ref *inode_ref, void *de,
 		ino_gen = to_le32(ext4_inode_get_generation(inode_ref->inode));
 
 		sz = count_offset + (count * sizeof(struct ext4_dir_idx_tail));
-		orig_cum = t->checksum;
-		t->checksum = 0;
+		/* Lookup readers share the accepted index block. Normalize a local
+		 * tail so checksum verification never changes their borrowed bytes. */
+		struct ext4_dir_idx_tail tail = *t;
+		tail.checksum = 0;
 		/* Start with the filesystem metadata checksum seed. */
 		csum = ext4_sb_get_csum_seed(sb);
 		/* Then calculate crc32 checksum against inode number
@@ -237,8 +239,7 @@ static uint32_t ext4_dir_dx_checksum(struct ext4_inode_ref *inode_ref, void *de,
 		/* After that calculate crc32 checksum against all the dx_entry */
 		csum = ext4_crc32c(csum, de, sz);
 		/* Finally calculate crc32 checksum for dx_tail */
-		csum = ext4_crc32c(csum, t, sizeof(struct ext4_dir_idx_tail));
-		t->checksum = orig_cum;
+		csum = ext4_crc32c(csum, &tail, sizeof(tail));
 	}
 	return csum;
 }

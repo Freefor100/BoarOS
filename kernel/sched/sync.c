@@ -16,7 +16,9 @@ struct kernel_lock_waiter {
 };
 struct kernel_io_context *kernel_io_context_current(void)
 {
-    struct kernel_task *task = kernel_task_current();
+    /* I/O ownership follows the executing stack/tp across cpu.current
+     * publication, before the actual stack switch completes. */
+    struct kernel_task *task = arch_current_thread_get();
     return task ? &task->io_context : kernel_cpu_current()->bootstrap_io;
 }
 

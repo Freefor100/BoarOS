@@ -25,7 +25,8 @@ def supported_schemas():
     admission_previous=current[:next(i for i,x in enumerate(current) if x[0]=='stream_admit_blocked')]
     allocator_previous=current[:next(i for i,x in enumerate(current) if x[0]=='page_meta_checked')]
     raw_previous=current[:next(i for i,x in enumerate(current) if x[0]=='raw_wait_ticks')]
-    registries=(current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
+    operation_previous=current[:next(i for i,x in enumerate(current) if x[0]=='journal_record_prepare_ticks')]
+    registries=(current,operation_previous,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
     # Frozen historical snapshots retain their original metric names and
     # values. They are separate registries, never aliases in current output.
     historical=tuple([(name.replace('_precommit_body','_journal_write'),unit,hist)
@@ -59,7 +60,7 @@ def parse(text, epoch, metrics=None):
     if fields['version'] != 1 or fields['epoch'] != epoch or epoch < 1: raise ValueError('version/epoch')
     if fields['state'] != 'complete' or fields['mode'] not in ('user','fixture'): raise ValueError('incomplete snapshot')
     if fields['overflow'] or fields['inflight']: raise ValueError('overflow/inflight')
-    if not 0 < fields['task_bytes'] <= 64 or not 0 < fields['storage_bytes'] <= 65536: raise ValueError('storage budget')
+    if not 0 < fields['task_bytes'] <= 160 or not 0 < fields['storage_bytes'] <= 96*1024: raise ValueError('storage budget')
     if not fields['owner'] or not fields['timebase_hz'] or fields['end_ticks'] < fields['start_ticks']: raise ValueError('invalid timing/owner')
     if fields['resolution_ns_numerator'] != 1000000000 or fields['resolution_ns_denominator'] != fields['timebase_hz']: raise ValueError('clock resolution')
     for lane in LANES:

@@ -1,5 +1,6 @@
 /* Ordered-data transactions over actual volatile sectors, not a mock journal. */
 #include "block_fault.h"
+#include "lwext4_operation.h"
 #include <ext4.h>
 #include <ext4_fs.h>
 #include <ext4_inode.h>
@@ -123,14 +124,15 @@ int main(int argc, char **argv)
     bool reuse=!strcmp(argv[2],"reuse");
     bool critical=!strncmp(argv[2],"log-",4) || !strcmp(argv[2],"write-error") || !strcmp(argv[2],"flush-error");
     if (reuse) {
-        struct jbd_trans *old=jbd_journal_new_trans(&journal);
+        struct jbd_trans *old; CHECK(jbd_journal_new_trans(&journal, &old) == EOK);
         struct ext4_block oldblock;
-        dev.fs->curr_trans=old;
+        test_operation_bind(dev.fs,old);
         CHECK(ext4_trans_block_get(&dev,&oldblock,home) == EOK);
         memset(oldblock.data,'P',dev.lg_bsize);
         CHECK(ext4_trans_set_block_dirty(oldblock.buf) == EOK);
         CHECK(ext4_block_set(&dev,&oldblock) == EOK);
-        dev.fs->curr_trans=NULL;
+        test_operation_bind(dev.fs,NULL);
+        CHECK(jbd_trans_prepare_operation(old) == EOK);
         CHECK(jbd_journal_commit_trans(&journal,old) == EOK);
     }
     uint64_t writes=disk.writes;
@@ -138,16 +140,19 @@ int main(int argc, char **argv)
     CHECK(dev.lg_bsize == sizeof(replacement));
     memset(replacement, 'D', sizeof(replacement));
     for (unsigned attempt=0; attempt<2; attempt++) {
-        struct jbd_trans *tx=jbd_journal_new_trans(&journal);
+        struct jbd_trans *tx; CHECK(jbd_journal_new_trans(&journal, &tx) == EOK);
         CHECK(tx != NULL);
-        dev.fs->curr_trans=tx;
+        test_operation_bind(dev.fs,tx);
         struct ext4_block block;
         CHECK(ext4_block_get(&dev,&block,home) == EOK);
         unsigned char old_first = block.data[0];
         if (!access_only) {
             CHECK(ext4_trans_write_data(&dev,home,0,replacement,sizeof(replacement),false,NULL) == EOK);
-            const unsigned char *pending = jbd_journal_read_data(dev.fs,home);
-            CHECK(pending && pending[0] == 'D' && block.data[0] == old_first);
+            struct jbd_data_borrow borrow = {0};
+            CHECK(jbd_journal_borrow_data(dev.fs,home,&borrow));
+            const unsigned char *pending = borrow.data;
+            CHECK(pending[0] == 'D' && block.data[0] == old_first);
+            jbd_journal_release_borrow(&borrow);
         }
         unsigned char actual; size_t read;
         CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 &&
@@ -159,10 +164,11 @@ int main(int argc, char **argv)
         CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
         }
         if (!reuse) CHECK(disk.writes == writes); /* Acquiring/marking must not write. */
-        dev.fs->curr_trans=NULL;
+        test_operation_bind(dev.fs,NULL);
         if (!strcmp(argv[2],"abort")) {
             jbd_journal_free_trans(&journal,tx,true);
-            CHECK(!jbd_journal_read_data(dev.fs,home) && block.data[0] == old_first);
+            struct jbd_data_borrow borrow = {0};
+            CHECK(!jbd_journal_borrow_data(dev.fs,home,&borrow) && block.data[0] == old_first);
             CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 && actual == 'O');
             CHECK(ext4_block_set(&dev,&block) == EOK);
             CHECK(disk.writes == writes);
@@ -177,17 +183,22 @@ int main(int argc, char **argv)
 
         if (!strcmp(argv[2],"log-commit-flush-error")) disk.fail_flush=disk.flushes+2;
         uint32_t start=journal.start, tid=journal.committed_id;
+        CHECK(jbd_trans_prepare_operation(tx) == EOK);
         int r=jbd_journal_commit_trans(&journal,tx);
         if (critical) {
             CHECK(r == EIO && journal.error == EIO && journal.start == start && journal.committed_id == tid);
             CHECK(journal.failed_trans == tx);
-            const unsigned char *pending=jbd_journal_read_data(dev.fs,home);
-            CHECK(pending && pending[0]=='D' && tx->ordered_count==1);
+            struct jbd_data_borrow borrow = {0};
+            CHECK(jbd_journal_borrow_data(dev.fs,home,&borrow));
+            const unsigned char *pending = borrow.data;
+            CHECK(pending[0]=='D' && tx->ordered_count==1);
+            jbd_journal_release_borrow(&borrow);
             CHECK(ext4_fpread(&file,0,&actual,1,&read)==EOK && read==1 && actual=='D');
             for (unsigned retry=0; retry<2; retry++)
                 CHECK(jbd_journal_commit_trans(&journal,tx) == EIO);
             CHECK(journal.failed_trans == tx);
-            CHECK(jbd_journal_new_trans(&journal) == NULL);
+            struct jbd_trans *denied = tx;
+            CHECK(jbd_journal_new_trans(&journal, &denied) == EIO && !denied);
             CHECK(fault_block_crash(&disk) == 0);
             return 0;
         }
@@ -195,7 +206,8 @@ int main(int argc, char **argv)
         CHECK(log_writes == ((data_only || access_only) ? 0 : 2));
         if (data_only || access_only) CHECK(journal.committed_id == tid);
         if (access_only) {
-            CHECK(!jbd_journal_read_data(dev.fs,home) && block.data[0] == old_first);
+            struct jbd_data_borrow borrow = {0};
+            CHECK(!jbd_journal_borrow_data(dev.fs,home,&borrow) && block.data[0] == old_first);
             CHECK(disk.writes == writes);
             CHECK(ext4_block_set(&dev,&block) == EOK);
             return 0;

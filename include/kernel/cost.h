@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_COST_H
 #include <stddef.h>
 #include <stdint.h>
+#include <kernel/cpu_config.h>
 #ifndef BOAROS_COST_DIAGNOSTICS
 #define BOAROS_COST_DIAGNOSTICS 0
 #endif
@@ -11,7 +12,9 @@ struct kernel_cost_task {
     uint32_t depth;
     uint8_t suppress, operation, wait_rank, wait_flags;
 };
-_Static_assert(sizeof(struct kernel_cost_task) + 16 <= 64, "cost task budget");
+/* Actual IO storage owns two backend and four inline request guards. */
+#define KERNEL_COST_TASK_BYTES (sizeof(struct kernel_cost_task) + 6U * 16U + (BOAROS_USER_SMP ? 16U : 0U))
+_Static_assert(KERNEL_COST_TASK_BYTES <= 160, "cost task budget");
 enum kernel_cost_metric {
 #define X(id, name, unit, hist) COST_##id,
 #include <kernel/cost.def>

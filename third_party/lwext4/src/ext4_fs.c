@@ -52,6 +52,7 @@
 
 #include <ext4_trans.h>
 #include <ext4_fs.h>
+#include <ext4_journal.h>
 #include <ext4_blockdev.h>
 #include <ext4_super.h>
 #include <ext4_crc32.h>
@@ -76,7 +77,9 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	ext4_assert(fs && bdev);
 
 	fs->bdev = bdev;
-	fs->curr_trans = NULL;
+	fs->active_operations = 0;
+	fs->reserved_blocks = 0;
+	fs->reserved_inodes = 0;
 	fs->jbd_journal = NULL;
 	fs->jbd_fs = NULL;
 	fs->orphan_index = NULL;
@@ -85,22 +88,22 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 	fs->read_only = read_only;
 
-	r = ext4_sb_read(fs->bdev, &fs->sb);
+	r = ext4_sb_read(fs->bdev, ext4_fs_super(fs));
 	if (r != EOK)
 		return r;
 
-	if (!ext4_sb_check_geometry(&fs->sb))
+	if (!ext4_sb_check_geometry(ext4_fs_super(fs)))
 		return EUCLEAN;
-	if (!ext4_sb_check(&fs->sb)) {
+	if (!ext4_sb_check(ext4_fs_super(fs))) {
 		/* A checkpoint can tear a 1 KiB superblock across atomic sectors.
 		 * Its immutable geometry is checked here; recovery must supply a
 		 * fully checksummed committed superblock before any user access. */
-		if (read_only || !ext4_sb_feature_com(&fs->sb, EXT4_FCOM_HAS_JOURNAL))
+		if (read_only || !ext4_sb_feature_com(ext4_fs_super(fs), EXT4_FCOM_HAS_JOURNAL))
 			return EUCLEAN;
 		fs->super_replay_required = true;
 	}
 
-	bsize = ext4_sb_get_block_size(&fs->sb);
+	bsize = ext4_sb_get_block_size(ext4_fs_super(fs));
 	/* A filesystem block must contain whole device sectors. Validate before
 	 * mount can modify the superblock; assertions are optional in production. */
 	if (!bdev->bdif->ph_bsize || bsize < bdev->bdif->ph_bsize ||
@@ -108,7 +111,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 		return EINVAL;
 	if (bsize > EXT4_MAX_BLOCK_SIZE)
 		return ENXIO;
-	if (ext4_sb_get_blocks_cnt(&fs->sb) > bdev->part_size / bsize)
+	if (ext4_sb_get_blocks_cnt(ext4_fs_super(fs)) > bdev->part_size / bsize)
 		return EUCLEAN;
 
 	r = ext4_fs_check_features(fs, &read_only);
@@ -133,7 +136,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	}
 
 	/*Validate FS*/
-	tmp = ext4_get16(&fs->sb, state);
+	tmp = ext4_get16(ext4_fs_super(fs), state);
 	if (tmp & EXT4_SUPERBLOCK_STATE_ERROR_FS)
 		ext4_dbg(DEBUG_FS, DBG_WARN
 				"last umount error: superblock fs_error flag\n");
@@ -142,12 +145,12 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	if (!fs->read_only) {
 		/* Recovery must see the original disk superblock. The journal start
 		 * barrier records RECOVER only after its format has been checked. */
-		if (!ext4_sb_feature_com(&fs->sb, EXT4_FCOM_HAS_JOURNAL)) {
-			ext4_set16(&fs->sb, mount_count,
-				ext4_get16(&fs->sb, mount_count) + 1);
-			ext4_set16(&fs->sb, state,
-				ext4_get16(&fs->sb, state) & ~EXT4_SUPERBLOCK_STATE_VALID_FS);
-			r = ext4_sb_write(fs->bdev, &fs->sb);
+		if (!ext4_sb_feature_com(ext4_fs_super(fs), EXT4_FCOM_HAS_JOURNAL)) {
+			ext4_set16(ext4_fs_super(fs), mount_count,
+				ext4_get16(ext4_fs_super(fs), mount_count) + 1);
+			ext4_set16(ext4_fs_super(fs), state,
+				ext4_get16(ext4_fs_super(fs), state) & ~EXT4_SUPERBLOCK_STATE_VALID_FS);
+			r = ext4_sb_write(fs->bdev, ext4_fs_super(fs));
 			if (r != EOK)
 				return r;
 		}
@@ -167,9 +170,9 @@ int ext4_fs_fini(struct ext4_fs *fs)
 	}
 
 	/*Set superblock state*/
-	ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_VALID_FS);
+	ext4_set16(ext4_fs_super(fs), state, EXT4_SUPERBLOCK_STATE_VALID_FS);
 
-	int r = ext4_sb_write(fs->bdev, &fs->sb);
+	int r = ext4_sb_write(fs->bdev, ext4_fs_super(fs));
 	if (r == EOK) ext4_orphan_index_fini(fs);
 	return r;
 }
@@ -249,22 +252,22 @@ int ext4_fs_check_features(struct ext4_fs *fs, bool *read_only)
 {
 	ext4_assert(fs && read_only);
 	uint32_t v;
-	if (ext4_get32(&fs->sb, rev_level) == 0) {
+	if (ext4_get32(ext4_fs_super(fs), rev_level) == 0) {
 		*read_only = false;
 		return EOK;
 	}
 
 	ext4_dbg(DEBUG_FS, DBG_INFO "sblock features_incompatible:\n");
-	ext4_fs_debug_features_inc(ext4_get32(&fs->sb, features_incompatible));
+	ext4_fs_debug_features_inc(ext4_get32(ext4_fs_super(fs), features_incompatible));
 
 	ext4_dbg(DEBUG_FS, DBG_INFO "sblock features_compatible:\n");
-	ext4_fs_debug_features_comp(ext4_get32(&fs->sb, features_compatible));
+	ext4_fs_debug_features_comp(ext4_get32(ext4_fs_super(fs), features_compatible));
 
 	ext4_dbg(DEBUG_FS, DBG_INFO "sblock features_read_only:\n");
-	ext4_fs_debug_features_ro(ext4_get32(&fs->sb, features_read_only));
+	ext4_fs_debug_features_ro(ext4_get32(ext4_fs_super(fs), features_read_only));
 
 	/*Check features_incompatible*/
-	v = (ext4_get32(&fs->sb, features_incompatible) &
+	v = (ext4_get32(ext4_fs_super(fs), features_incompatible) &
 	     (~CONFIG_SUPPORTED_FINCOM));
 	if (v) {
 		ext4_dbg(DEBUG_FS, DBG_ERROR
@@ -274,7 +277,7 @@ int ext4_fs_check_features(struct ext4_fs *fs, bool *read_only)
 	}
 
 	/*Check features_read_only*/
-	v = ext4_get32(&fs->sb, features_read_only);
+	v = ext4_get32(ext4_fs_super(fs), features_read_only);
 	v &= ~CONFIG_SUPPORTED_FRO_COM;
 	if (v) {
 		ext4_dbg(DEBUG_FS, DBG_WARN
@@ -562,23 +565,25 @@ static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 #define ext4_fs_verify_bg_csum(...) true
 #endif
 
-int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
-				struct ext4_block_group_ref *ref)
+static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
+    struct ext4_block_group_ref *ref, bool write)
 {
 	COST_PHASE_SCOPE(read_source, 6);
-	if (bgid >= ext4_block_group_cnt(&fs->sb))
+	if (bgid >= ext4_block_group_cnt(ext4_fs_super(fs)))
 		return EUCLEAN;
 	/* Compute number of descriptors, that fits in one data block */
-	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
-	uint32_t dsc_cnt = block_size / ext4_sb_get_desc_size(&fs->sb);
+	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(fs));
+	uint32_t size = ext4_sb_get_desc_size(ext4_fs_super(fs));
+	uint32_t dsc_cnt = block_size / size;
 
 	/* Block group descriptor table starts at the next block after
 	 * superblock */
-	uint64_t block_id = ext4_fs_get_descriptor_block(&fs->sb, bgid, dsc_cnt);
+	uint64_t block_id = ext4_fs_get_descriptor_block(ext4_fs_super(fs), bgid, dsc_cnt);
 
-	uint32_t offset = (bgid % dsc_cnt) * ext4_sb_get_desc_size(&fs->sb);
+	uint32_t offset = (bgid % dsc_cnt) * size;
 
-	int rc = ext4_trans_block_get(fs->bdev, &ref->block, block_id);
+	int rc = write ? ext4_trans_block_get_range(fs->bdev, &ref->block, block_id, offset, size) :
+        ext4_block_get_range(fs->bdev, &ref->block, block_id, offset, size, EXT4_BLOCK_READ);
 	if (rc != EOK)
 		return rc;
 
@@ -588,7 +593,7 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 	ref->dirty = false;
 	struct ext4_bgroup *bg = ref->block_group;
 
-	if (!ext4_fs_verify_bg_csum(&fs->sb, bgid, bg)) {
+	if (!ext4_fs_verify_bg_csum(ext4_fs_super(fs), bgid, bg)) {
 		ext4_dbg(DEBUG_FS,
 			 DBG_WARN "Block group descriptor checksum failed."
 			 "Block group index: %" PRIu32"\n",
@@ -599,10 +604,21 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 	return EOK;
 }
 
+int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
+    struct ext4_block_group_ref *ref)
+{ return ext4_fs_get_block_group_ref_mode(fs, bgid, ref, false); }
+
+int ext4_fs_get_block_group_ref_write(struct ext4_fs *fs, uint32_t bgid,
+    struct ext4_block_group_ref *ref)
+{
+    int result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, bgid);
+    return result ? result : ext4_fs_get_block_group_ref_mode(fs, bgid, ref, true);
+}
+
 int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks)
 {
 	if (!fs || !fs->bdev || !blocks) return EINVAL;
-	struct ext4_sblock *sb = &fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(fs);
 	if (fs->super_replay_required || !ext4_sb_check_geometry(sb)) return EUCLEAN;
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_BIGALLOC)) return ENOTSUP;
 	uint64_t total = ext4_sb_get_blocks_cnt(sb);
@@ -657,7 +673,7 @@ int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks)
 		uint32_t number = ext4_get32(sb, journal_inode_number);
 		if (!number) return ENOTSUP; /* External journals are not supported. */
 		struct ext4_inode_ref ref;
-		int r = ext4_fs_get_inode_ref(fs, number, &ref);
+		int r = ext4_fs_get_inode_ref_read(fs, number, &ref);
 		if (r != EOK) return r;
 		uint64_t size = ext4_inode_get_size(sb, ref.inode);
 		if (!ext4_inode_is_type(sb, ref.inode, EXT4_INODE_MODE_FILE) ||
@@ -680,7 +696,7 @@ int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
 {
 	if (fs->read_only)
 		return EROFS;
-	int rc = ext4_fs_get_block_group_ref(fs, bgid, ref);
+	int rc = ext4_fs_get_block_group_ref_write(fs, bgid, ref);
 	if (rc != EOK)
 		return rc;
 	struct ext4_bgroup *bg = ref->block_group;
@@ -719,12 +735,14 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref)
 	if (ref->dirty) {
 		/* Compute new checksum of block group */
 		uint16_t cs;
-		cs = ext4_fs_bg_checksum(&ref->fs->sb, ref->index,
+		cs = ext4_fs_bg_checksum(ext4_fs_super(ref->fs), ref->index,
 					 ref->block_group);
 		ref->block_group->checksum = to_le16(cs);
 
 		/* Mark block dirty for writing changes to physical device */
-		ext4_trans_set_block_dirty(ref->block.buf);
+		ext4_trans_set_block_dirty_range(&ref->block,
+            (uint32_t)((uint8_t *)ref->block_group - ref->block.data),
+            ext4_sb_get_desc_size(ext4_fs_super(ref->fs)));
 	}
 
 	/* Put back block, that contains block group descriptor */
@@ -735,7 +753,7 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref)
 static uint32_t ext4_fs_inode_checksum(struct ext4_inode_ref *inode_ref)
 {
 	uint32_t checksum = 0;
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	uint16_t inode_size = ext4_get16(sb, inode_size);
 
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
@@ -769,7 +787,7 @@ static uint32_t ext4_fs_inode_checksum(struct ext4_inode_ref *inode_ref)
 
 static void ext4_fs_set_inode_checksum(struct ext4_inode_ref *inode_ref)
 {
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
 		return;
 
@@ -780,7 +798,7 @@ static void ext4_fs_set_inode_checksum(struct ext4_inode_ref *inode_ref)
 #if CONFIG_META_CSUM_ENABLE
 static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *inode_ref)
 {
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
 		return true;
 
@@ -794,13 +812,13 @@ static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *inode_ref)
 static int
 __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			struct ext4_inode_ref *ref,
-			bool initialized)
+			bool initialized, bool write)
 {
 	COST_PHASE_SCOPE(read_source, 6);
-	if (index == 0 || index > ext4_get32(&fs->sb, inodes_count))
+	if (index == 0 || index > ext4_get32(ext4_fs_super(fs), inodes_count))
 		return EUCLEAN;
 	/* Compute number of i-nodes, that fits in one data block */
-	uint32_t inodes_per_group = ext4_get32(&fs->sb, inodes_per_group);
+	uint32_t inodes_per_group = ext4_get32(ext4_fs_super(fs), inodes_per_group);
 
 	/*
 	 * Inode numbers are 1-based, but it is simpler to work with 0-based
@@ -820,7 +838,7 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 
 	/* Load block address, where i-node table is located */
 	ext4_fsblk_t inode_table_start =
-	    ext4_bg_get_inode_table_first_block(bg_ref.block_group, &fs->sb);
+	    ext4_bg_get_inode_table_first_block(bg_ref.block_group, ext4_fs_super(fs));
 
 	/* Put back block group reference (not needed more) */
 	rc = ext4_fs_put_block_group_ref(&bg_ref);
@@ -829,21 +847,27 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	}
 
 	/* Compute position of i-node in the block group */
-	uint16_t inode_size = ext4_get16(&fs->sb, inode_size);
-	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
+	uint16_t inode_size = ext4_get16(ext4_fs_super(fs), inode_size);
+	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(fs));
 	uint32_t byte_offset_in_group = offset_in_group * inode_size;
 
 	/* Compute block address */
 	ext4_fsblk_t block_id =
 	    inode_table_start + (byte_offset_in_group / block_size);
 
-	rc = ext4_trans_block_get(fs->bdev, &ref->block, block_id);
+	uint32_t offset_in_block = byte_offset_in_group % block_size;
+	if (write && initialized && ext4_current_trans(fs)) {
+		rc = ext4_operation_require_resource(fs, EXT4_RESOURCE_INODE, index + 1);
+		if (rc != EOK) return rc;
+	}
+	rc = write ? ext4_trans_block_get_range(fs->bdev, &ref->block, block_id,
+        offset_in_block, inode_size) : ext4_block_get_range(fs->bdev, &ref->block,
+        block_id, offset_in_block, inode_size, EXT4_BLOCK_READ);
 	if (rc != EOK) {
 		return rc;
 	}
 
 	/* Compute position of i-node in the data block */
-	uint32_t offset_in_block = byte_offset_in_group % block_size;
 	ref->inode = (struct ext4_inode *)(ref->block.data + offset_in_block);
 
 	/* We need to store the original value of index in the reference */
@@ -866,7 +890,24 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 int ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			  struct ext4_inode_ref *ref)
 {
-	return __ext4_fs_get_inode_ref(fs, index, ref, true);
+	return __ext4_fs_get_inode_ref(fs, index, ref, true, true);
+}
+
+int ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t index,
+    struct ext4_inode_ref *ref)
+{ return __ext4_fs_get_inode_ref(fs, index, ref, true, false); }
+
+int ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
+{
+    struct jbd_trans *trans = ext4_current_trans(ref->fs);
+    if (!trans) return EOK;
+    int result = ext4_operation_require_resource(ref->fs, EXT4_RESOURCE_INODE, ref->index);
+    if (result) return result;
+    uint32_t offset = (uint32_t)((uint8_t *)ref->inode - ref->block.data);
+    uint32_t size = ext4_get16(&ref->fs->sb, inode_size);
+    result = jbd_trans_get_write_access_range(trans, &ref->block, offset, size);
+    if (!result) ref->inode = (void *)(ref->block.data + offset);
+    return result;
 }
 
 int ext4_fs_put_inode_ref(struct ext4_inode_ref *ref)
@@ -875,7 +916,9 @@ int ext4_fs_put_inode_ref(struct ext4_inode_ref *ref)
 	if (ref->dirty) {
 		/* Mark block dirty for writing changes to physical device */
 		ext4_fs_set_inode_checksum(ref);
-		ext4_trans_set_block_dirty(ref->block.buf);
+		ext4_trans_set_block_dirty_range(&ref->block,
+            (uint32_t)((uint8_t *)ref->inode - ref->block.data),
+            ext4_get16(ext4_fs_super(ref->fs), inode_size));
 	}
 
 	/* Put back block, that contains i-node */
@@ -889,7 +932,7 @@ void ext4_fs_inode_blocks_init(struct ext4_fs *fs,
 
 	/* Reset blocks array. For inode which is not directory or file, just
 	 * fill in blocks with 0 */
-	switch (ext4_inode_type(&fs->sb, inode_ref->inode)) {
+	switch (ext4_inode_type(ext4_fs_super(fs), inode_ref->inode)) {
 	case EXT4_INODE_MODE_FILE:
 	case EXT4_INODE_MODE_DIRECTORY:
 		break;
@@ -899,7 +942,7 @@ void ext4_fs_inode_blocks_init(struct ext4_fs *fs,
 
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
 	/* Initialize extents if needed */
-	if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS)) {
+	if (ext4_sb_feature_incom(ext4_fs_super(fs), EXT4_FINCOM_EXTENTS)) {
 		ext4_inode_set_flag(inode, EXT4_INODE_FLAG_EXTENTS);
 
 		/* Initialize extent root header */
@@ -933,23 +976,29 @@ uint32_t ext4_fs_correspond_inode_mode(int filetype)
 }
 
 int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
-			int filetype)
+    int filetype, uint32_t parent_inode, const char *name, uint32_t name_len)
 {
 	/* Check if newly allocated i-node will be a directory */
 	bool is_dir;
-	uint16_t inode_size = ext4_get16(&fs->sb, inode_size);
+	uint16_t inode_size = ext4_get16(ext4_fs_super(fs), inode_size);
 
 	is_dir = (filetype == EXT4_DE_DIR);
 
 	/* Allocate inode by allocation algorithm */
 	uint32_t index;
-	int rc = ext4_ialloc_alloc_inode(fs, &index, is_dir);
+	int rc = ext4_ialloc_alloc_inode(fs, &index, is_dir, parent_inode, name, name_len);
 	if (rc != EOK)
 		return rc;
 
 	/* Load i-node from on-disk i-node table */
-	rc = __ext4_fs_get_inode_ref(fs, index, inode_ref, false);
+	rc = __ext4_fs_get_inode_ref(fs, index, inode_ref, false, true);
 	if (rc != EOK) {
+		ext4_ialloc_free_inode(fs, index, is_dir);
+		return rc;
+	}
+	rc = ext4_operation_claim_inode(fs, index);
+	if (rc != EOK) {
+		ext4_fs_put_inode_ref(inode_ref);
 		ext4_ialloc_free_inode(fs, index, is_dir);
 		return rc;
 	}
@@ -986,7 +1035,7 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 		mode = 0666;
 		mode |= ext4_fs_correspond_inode_mode(filetype);
 	}
-	ext4_inode_set_mode(&fs->sb, inode, mode);
+	ext4_inode_set_mode(ext4_fs_super(fs), inode, mode);
 
 	ext4_inode_set_links_cnt(inode, 0);
 	ext4_inode_set_uid(inode, 0);
@@ -996,12 +1045,12 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 	ext4_inode_set_change_inode_time(inode, 0);
 	ext4_inode_set_modif_time(inode, 0);
 	ext4_inode_set_del_time(inode, 0);
-	ext4_inode_set_blocks_count(&fs->sb, inode, 0);
+	ext4_inode_set_blocks_count(ext4_fs_super(fs), inode, 0);
 	ext4_inode_set_flags(inode, 0);
 	ext4_inode_set_generation(inode, 0);
 	if (inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
-		uint16_t size = ext4_get16(&fs->sb, want_extra_isize);
-		ext4_inode_set_extra_isize(&fs->sb, inode, size);
+		uint16_t size = ext4_get16(ext4_fs_super(fs), want_extra_isize);
+		ext4_inode_set_extra_isize(ext4_fs_super(fs), inode, size);
 	}
 
 	memset(inode->blocks, 0, sizeof(inode->blocks));
@@ -1018,7 +1067,7 @@ int ext4_fs_free_inode(struct ext4_inode_ref *inode_ref)
 	int rc;
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
 	/* For extents must be data block destroyed by other way */
-	if ((ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS)) &&
+	if ((ext4_sb_feature_incom(ext4_fs_super(fs), EXT4_FINCOM_EXTENTS)) &&
 	    (ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS))) {
 		/* Data structures are released during truncate operation... */
 		goto finish;
@@ -1036,7 +1085,7 @@ int ext4_fs_free_inode(struct ext4_inode_ref *inode_ref)
 		ext4_inode_set_indirect_block(inode_ref->inode, 0, 0);
 	}
 
-	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
+	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(fs));
 	uint32_t count = block_size / sizeof(uint32_t);
 
 	struct ext4_block block;
@@ -1130,7 +1179,7 @@ finish:
 
 	/* Free block with extended attributes if present */
 	ext4_fsblk_t xattr_block =
-	    ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
+	    ext4_inode_get_file_acl(inode_ref->inode, ext4_fs_super(fs));
 	if (xattr_block) {
 #if CONFIG_XATTR_ENABLE
 		int rc = ext4_xattr_release_inode_block(inode_ref);
@@ -1143,7 +1192,7 @@ finish:
 	}
 
 	/* Free inode by allocator */
-	if (ext4_inode_is_type(&fs->sb, inode_ref->inode,
+	if (ext4_inode_is_type(ext4_fs_super(fs), inode_ref->inode,
 			       EXT4_INODE_MODE_DIRECTORY))
 		rc = ext4_ialloc_free_inode(fs, inode_ref->index, true);
 	else
@@ -1168,7 +1217,7 @@ static int ext4_fs_release_inode_block(struct ext4_inode_ref *inode_ref,
 	/* Extents are handled otherwise = there is not support in this function
 	 */
 	ext4_assert(!(
-	    ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+	    ext4_sb_feature_incom(ext4_fs_super(fs), EXT4_FINCOM_EXTENTS) &&
 	    (ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS))));
 
 	struct ext4_inode *inode = inode_ref->inode;
@@ -1260,7 +1309,7 @@ static int ext4_fs_release_inode_block(struct ext4_inode_ref *inode_ref,
 
 int ext4_fs_truncate_inode(struct ext4_inode_ref *inode_ref, uint64_t new_size)
 {
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	uint32_t i;
 	int r;
 	bool v;
@@ -1347,8 +1396,8 @@ int ext4_fs_truncate_inode(struct ext4_inode_ref *inode_ref, uint64_t new_size)
  */
 ext4_fsblk_t ext4_fs_inode_to_goal_block(struct ext4_inode_ref *inode_ref)
 {
-	uint32_t grp_inodes = ext4_get32(&inode_ref->fs->sb, inodes_per_group);
-	return ext4_fs_first_bg_block_no(&inode_ref->fs->sb,
+	uint32_t grp_inodes = ext4_get32(ext4_fs_super(inode_ref->fs), inodes_per_group);
+	return ext4_fs_first_bg_block_no(ext4_fs_super(inode_ref->fs),
 				       (inode_ref->index - 1) / grp_inodes);
 }
 
@@ -1360,7 +1409,7 @@ int ext4_fs_indirect_find_goal(struct ext4_inode_ref *inode_ref,
 			       ext4_fsblk_t *goal)
 {
 	int r;
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	*goal = 0;
 
 	uint64_t inode_size = ext4_inode_get_size(sb, inode_ref->inode);
@@ -1430,14 +1479,14 @@ static int ext4_fs_get_inode_dblk_idx_internal(struct ext4_inode_ref *inode_ref,
     ext4_lblk_t iblock, ext4_fsblk_t *fblock, bool extent_create,
     bool support_unwritten __unused)
 {
-    if (!ext4_inode_get_size(&inode_ref->fs->sb, inode_ref->inode)) {
+    if (!ext4_inode_get_size(ext4_fs_super(inode_ref->fs), inode_ref->inode)) {
         *fblock = 0;
         return EOK;
     }
     bool create = false;
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
     create = extent_create &&
-        ext4_sb_feature_incom(&inode_ref->fs->sb, EXT4_FINCOM_EXTENTS) &&
+        ext4_sb_feature_incom(ext4_fs_super(inode_ref->fs), EXT4_FINCOM_EXTENTS) &&
         ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS);
 #else
     (void)extent_create;
@@ -1592,7 +1641,7 @@ int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,
     *range = (struct ext4_inode_block_range){0};
     struct ext4_fs *fs = ref->fs;
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
-    if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+    if (ext4_sb_feature_incom(ext4_fs_super(fs), EXT4_FINCOM_EXTENTS) &&
         ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_EXTENTS))
         return ext4_extent_get_range(ref, iblock, max_blocks, create, range);
 #endif
@@ -1609,7 +1658,7 @@ int ext4_fs_release_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 		return EINVAL;
 
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
-	if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+	if (ext4_sb_feature_incom(ext4_fs_super(fs), EXT4_FINCOM_EXTENTS) &&
 	    ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
 		ext4_fsblk_t current;
 		int rc = ext4_extent_get_blocks(inode_ref, iblock, 1,
@@ -1630,11 +1679,11 @@ int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 {
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
 	/* Handle extents separately */
-	if ((ext4_sb_feature_incom(&inode_ref->fs->sb, EXT4_FINCOM_EXTENTS)) &&
+	if ((ext4_sb_feature_incom(ext4_fs_super(inode_ref->fs), EXT4_FINCOM_EXTENTS)) &&
 	    (ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS))) {
 		int rc;
 		ext4_fsblk_t current_fsblk;
-		struct ext4_sblock *sb = &inode_ref->fs->sb;
+		struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 		uint64_t inode_size = ext4_inode_get_size(sb, inode_ref->inode);
 		uint32_t block_size = ext4_sb_get_block_size(sb);
 		*iblock = (uint32_t)((inode_size + block_size - 1) / block_size);
@@ -1654,7 +1703,7 @@ int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 		return rc;
 	}
 #endif
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 
 	/* Compute next block index and allocate data block */
 	uint64_t inode_size = ext4_inode_get_size(sb, inode_ref->inode);
@@ -1690,17 +1739,14 @@ void ext4_fs_inode_links_count_inc(struct ext4_inode_ref *inode_ref)
 	link++;
 	ext4_inode_set_links_cnt(inode_ref->inode, link);
 
-	is_dx = ext4_sb_feature_com(&inode_ref->fs->sb, EXT4_FCOM_DIR_INDEX) &&
+	is_dx = ext4_sb_feature_com(ext4_fs_super(inode_ref->fs), EXT4_FCOM_DIR_INDEX) &&
 		ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_INDEX);
 
 	if (is_dx && link > 1) {
 		if (link >= EXT4_LINK_MAX || link == 2) {
 			ext4_inode_set_links_cnt(inode_ref->inode, 1);
 
-			uint32_t v;
-			v = ext4_get32(&inode_ref->fs->sb, features_read_only);
-			v |= EXT4_FRO_COM_DIR_NLINK;
-			ext4_set32(&inode_ref->fs->sb, features_read_only, v);
+			ext4_fs_add_ro_flags(inode_ref->fs, EXT4_FRO_COM_DIR_NLINK);
 		}
 	}
 }
@@ -1708,7 +1754,7 @@ void ext4_fs_inode_links_count_inc(struct ext4_inode_ref *inode_ref)
 void ext4_fs_inode_links_count_dec(struct ext4_inode_ref *inode_ref)
 {
 	uint16_t links = ext4_inode_get_links_cnt(inode_ref->inode);
-	if (!ext4_inode_is_type(&inode_ref->fs->sb, inode_ref->inode,
+	if (!ext4_inode_is_type(ext4_fs_super(inode_ref->fs), inode_ref->inode,
 				EXT4_INODE_MODE_DIRECTORY)) {
 		if (links > 0)
 			ext4_inode_set_links_cnt(inode_ref->inode, links - 1);

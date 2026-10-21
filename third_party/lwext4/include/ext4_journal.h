@@ -44,6 +44,8 @@ extern "C" {
 #include <ext4_config.h>
 #include <ext4_types.h>
 #include <ext4_blockdev.h>
+#include <ext4_operation.h>
+#include <ext4_journal_memory.h>
 #include <misc/queue.h>
 #include <misc/tree.h>
 
@@ -57,19 +59,25 @@ struct jbd_fs {
 
 /* 块载荷独立分配，控制记录不会把一个整块申请推到下一阶。 */
 struct jbd_image {
+	struct ext4_block_payload payload;
 	void *data;
-	struct jbd_journal *journal;
+	struct jbd_memory *memory;
 	struct jbd_image *next;
 	bool active;
 };
 
 struct jbd_buf {
+	bool private_access;
+	struct jbd_block_rec *reserved_rec;
 	bool escaped;
 	bool modified;
 	bool was_dirty;
+	/* Materialized only when a record's baseline differs from block.payload. */
 	struct jbd_image *before;
 	struct jbd_image *after;
-	void *escaped_prefix;
+	/* Actual latest accepted version replaced by provisional publication. */
+	struct ext4_block_payload *rollback;
+	void *escaped_prefix; /* Owns a separately charged physical-sector buffer. */
 	struct ext4_block_write home_io;
 	uint32_t jbd_lba;
 	struct ext4_block block;
@@ -78,6 +86,9 @@ struct jbd_buf {
 	TAILQ_ENTRY(jbd_buf) buf_node;
 	TAILQ_ENTRY(jbd_buf) dirty_buf_node;
 	TAILQ_ENTRY(jbd_buf) checkpoint_node;
+	/* Dirty words followed by initialized words, one bit per 32-byte fragment.
+	 * Each map includes a whole final word, including for 1K blocks. */
+	uint64_t dirty_ranges[];
 };
 
 struct jbd_source;
@@ -111,11 +122,13 @@ struct jbd_quarantine {
 	bool inode;
 	RB_ENTRY(jbd_quarantine) index_node;
 	LIST_ENTRY(jbd_quarantine) node;
+	struct jbd_trans *owner;
 };
 
 struct ext4_orphan_undo;
 
 struct jbd_trans {
+	struct ext4_operation operation;
 	uint32_t trans_id;
 
 	uint32_t start_iblock;
@@ -126,7 +139,9 @@ struct jbd_trans {
 	int error;
 	uint64_t sequence;
 	uint64_t first_dirty_ns;
-	unsigned reserved_logs, reserved_log_images, reserved_payloads;
+	unsigned reserved_logs, reserved_log_images;
+	/* Nonzero sequence binds a delta reservation to the actual running group. */
+	uint64_t reservation_group_sequence;
 	unsigned ordered_count, revoke_count;
 	bool frozen;
 	struct jbd_image *checkpoint_image;
@@ -164,13 +179,8 @@ struct jbd_journal {
 	 * block/inode indexes borrow the same nodes across accept and sealing. */
 	RB_HEAD(jbd_quarantine_tree, jbd_quarantine) quarantine_index[2];
 	uint64_t quarantined_blocks, quarantined_inodes;
-	size_t memory_used, memory_peak, memory_limit;
-	size_t memory_cached;
-	uint64_t budget_failures;
+	struct jbd_memory *memory;
 	RB_HEAD(jbd_source_tree, jbd_source) sources;
-	struct jbd_image *image_cache;
-	void *allocation_cache[6];
-	bool cache_disabled;
 	uint64_t accepted_sequence, sealed_sequence, durable_sequence, checkpoint_sequence;
 	uint64_t seal_target;
 	ext4_fsblk_t *log_map;
@@ -189,6 +199,9 @@ struct jbd_journal {
 	struct jbd_fs *jbd_fs;
 };
 
+static inline int jbd_journal_error(const struct jbd_journal *journal)
+{ return __atomic_load_n(&journal->error, __ATOMIC_ACQUIRE); }
+
 int jbd_get_fs(struct ext4_fs *fs,
 	       struct jbd_fs *jbd_fs);
 int jbd_put_fs(struct jbd_fs *jbd_fs);
@@ -202,18 +215,26 @@ int jbd_recover(struct jbd_fs *jbd_fs);
 int jbd_journal_start(struct jbd_fs *jbd_fs,
 		      struct jbd_journal *journal);
 int jbd_journal_stop(struct jbd_journal *journal);
-struct jbd_trans *
-jbd_journal_new_trans(struct jbd_journal *journal);
+int jbd_journal_new_trans(struct jbd_journal *journal, struct jbd_trans **out);
 int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 			      struct ext4_block *block);
 /* Reserve the journal owner and rollback image before changing a buffer. */
 int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
+int jbd_trans_get_write_access_range(struct jbd_trans *trans,
+    struct ext4_block *block, uint32_t offset, uint32_t length);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
 	const struct file_data_source *source);
-/* The mount lock stabilizes this borrowed version. NULL means read home. */
-const void *jbd_journal_read_data(struct ext4_fs *fs, ext4_fsblk_t block);
+/* State protection selects a version and retains its payload/source. The
+ * caller copies outside that protection and releases the actual borrow. */
+struct jbd_data_borrow {
+    const void *data;
+    struct ext4_block_payload *payload;
+    struct jbd_source *source;
+};
+bool jbd_journal_borrow_data(struct ext4_fs *, ext4_fsblk_t, struct jbd_data_borrow *);
+void jbd_journal_release_borrow(struct jbd_data_borrow *);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
 			   ext4_fsblk_t lba);
 int jbd_trans_try_revoke_block(struct jbd_trans *trans,
@@ -221,9 +242,14 @@ int jbd_trans_try_revoke_block(struct jbd_trans *trans,
 void jbd_journal_free_trans(struct jbd_journal *journal,
 			    struct jbd_trans *trans,
 			    bool abort);
-/* Consumes trans on success or a retryable precommit failure (journal.error
+/* The caller owns this journal's STATE through admission or complete abort.
+ * Independent callers use the public entrypoints which acquire it once. */
+void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
+    struct jbd_trans *trans, bool abort);
+/* Requires one successful prepare_operation after the final private mutation.
+ * Consumes trans on success or a retryable precommit failure (journal.error
  * stays zero). On critical journal I/O failure, failed_trans retains ownership.
- * The caller must restore its in-memory superblock on a retryable failure. */
+ * A failed operation discards its own superblock deltas and reservations. */
 int jbd_journal_commit_trans(struct jbd_journal *journal,
 			     struct jbd_trans *trans);
 int
@@ -236,10 +262,30 @@ jbd_journal_purge_cp_trans(struct jbd_journal *journal,
  * This does not write unrelated home buffers. Returns EAGAIN for future IDs.
  */
 int jbd_journal_sync(struct jbd_journal *journal, uint32_t trans_id);
+/* Operation-owned auxiliary records use the same mount budget as versions. */
+void *jbd_journal_alloc(struct jbd_journal *journal, size_t bytes);
+void jbd_journal_free(void *pointer);
+
+/* An existing private access owns its loaded home buffer and replacement.
+ * On a hit lend those owners directly; errors return no descriptor loan. */
+int jbd_trans_borrow_private(struct jbd_trans *trans, struct ext4_block *block,
+    ext4_fsblk_t lba, uint32_t offset, uint32_t length,
+    enum ext4_block_access access, bool *found);
+int jbd_trans_set_block_dirty_range(struct jbd_trans *trans,
+    struct ext4_block *block, uint32_t offset, uint32_t length);
+
+/* Prepare final private mutations and escape storage. Parallel grouping
+ * reserves standalone credits; a serial writer reserves its bound group's
+ * delta. Failure or a lost group requires abort before preparing again. */
+int jbd_trans_prepare_operation(struct jbd_trans *trans);
 int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 	uint64_t now_ns);
+int jbd_journal_accept_state_held(struct jbd_journal *journal,
+    struct jbd_trans *operation, uint64_t now_ns);
 int jbd_journal_group_init(struct jbd_journal *journal, size_t limit);
 void jbd_journal_group_fini(struct jbd_journal *journal);
+/* Freeze transfers accepted versions and a complete ring interval to the
+ * sealed FIFO. The selected commit owner encodes and submits it outside state. */
 int jbd_journal_freeze(struct jbd_journal *journal);
 int jbd_journal_submit(struct jbd_journal *journal);
 enum jbd_journal_stage {
@@ -258,16 +304,19 @@ bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal);
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_retire(struct jbd_journal *journal, int error);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
-bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads, size_t data_images,
+/* Caller holds STATE. An allocated transaction already charges this journal's
+ * budget; NULL includes the control storage still needed before attachment. */
+bool jbd_journal_operation_room(struct jbd_journal *journal, const struct jbd_trans *allocated,
+    size_t payloads, size_t data_images,
 	const struct file_data_source *const *sources, unsigned count);
 uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);
-/* Return whether address is reserved for an older incarnation. When next is
- * supplied, report the end of that interval, or the next reserved start when
- * address is free (UINT64_MAX if none). The modification lock stabilizes it. */
-bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address,
-	bool inode, ext4_fsblk_t *next);
+/* The caller pins the bitmap and owns its block-group modification right.
+ * Find one clear run while walking the protected quarantine index once. */
+int jbd_journal_find_reusable(struct ext4_fs *fs, const void *bitmap,
+    ext4_fsblk_t base, uint32_t start, uint32_t end, uint32_t maximum,
+    bool inode, uint32_t *found, uint32_t *length);
 
 #ifdef __cplusplus
 }

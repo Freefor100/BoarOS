@@ -264,6 +264,7 @@ LWEXT4_SOURCES := \
 	third_party/lwext4/src/ext4_ialloc.c \
 	third_party/lwext4/src/ext4_inode.c \
 	third_party/lwext4/src/ext4_journal.c \
+	third_party/lwext4/src/ext4_journal_memory.c \
 	third_party/lwext4/src/ext4_orphan.c \
 	third_party/lwext4/src/ext4_super.c \
 	third_party/lwext4/src/ext4_trans.c \
@@ -804,12 +805,29 @@ test-lwext4-batch-read-host:
 test-lwext4-exclusion-host:
 	sh tests/lwext4-exclusion-host.sh
 
-test-lwext4-cache-host: test-lwext4-exclusion-host
+.PHONY: test-lwext4-payload-host test-lwext4-memory-owner-host
+test-lwext4-payload-host:
+	sh tests/lwext4-payload-host.sh
+
+test-lwext4-memory-owner-host:
+	sh tests/lwext4-memory-owner-host.sh
+
+test-lwext4-cache-host: test-lwext4-exclusion-host test-lwext4-payload-host test-lwext4-memory-owner-host
 	sh tests/lwext4-cache-host.sh
 
 .PHONY: test-lwext4-group-host
 test-lwext4-group-host:
 	sh tests/lwext4-group-host.sh
+
+.PHONY: test-lwext4-operation-host test-lwext4-port-host test-lwext4-parallel-host
+test-lwext4-operation-host:
+	sh tests/lwext4-operation-host.sh
+
+test-lwext4-port-host:
+	sh tests/lwext4-port-host.sh
+
+test-lwext4-parallel-host: test-lwext4-operation-host test-lwext4-port-host
+	sh tests/lwext4-parallel-host.sh
 
 JOURNAL_GROUP_KERNEL := $(BUILD_DIR)/tests/kernel-journal-group-rv
 JOURNAL_GROUP_RUNTIME_OBJECTS := $(filter-out $(BUILD_DIR)/fs/ext4_backend.o,$(TEST_RUNTIME_OBJECTS)) $(BUILD_DIR)/tests/riscv/journal_group_backend.o

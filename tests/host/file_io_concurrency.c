@@ -382,7 +382,8 @@ static void parallel_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
 }
 static enum kernel_block_status read_image(void *unused,uint64_t offset,void *data,size_t size)
 {
-    (void)unused; assert(!kernel_cpu_current()->logical_id && !kernel_cpu_current()->raw_locks);
+    /* Namespace and file I/O submit on the initiating task's CPU. */
+    (void)unused; assert(!kernel_cpu_current()->raw_locks);
     if (__atomic_exchange_n(&pause_access,0,__ATOMIC_ACQ_REL)) {
         __atomic_store_n(&access_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_access,__ATOMIC_ACQUIRE)) sched_yield();
@@ -986,6 +987,7 @@ int main(int argc,char **argv)
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    assert(!kernel_vfs_start_journal_worker(&mount));
     namespace_retirement_case(&heap,&mount);
     namespace_snapshot_case(&heap,&mount);
     namespace_parent_snapshot_case(&heap,&mount);

@@ -511,7 +511,7 @@ static int ext4_ext_free_blocks(struct ext4_inode_ref *inode_ref,
 static uint16_t ext4_ext_space_block(struct ext4_inode_ref *inode_ref)
 {
 	uint16_t size;
-	uint32_t block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
+	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(inode_ref->fs));
 
 	size = (block_size - sizeof(struct ext4_extent_header)) /
 	       sizeof(struct ext4_extent);
@@ -525,7 +525,7 @@ static uint16_t ext4_ext_space_block(struct ext4_inode_ref *inode_ref)
 static uint16_t ext4_ext_space_block_idx(struct ext4_inode_ref *inode_ref)
 {
 	uint16_t size;
-	uint32_t block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
+	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(inode_ref->fs));
 
 	size = (block_size - sizeof(struct ext4_extent_header)) /
 	       sizeof(struct ext4_extent_index);
@@ -650,7 +650,7 @@ static uint32_t ext4_ext_block_csum(struct ext4_inode_ref *inode_ref,
 				    struct ext4_extent_header *eh)
 {
 	uint32_t checksum = 0;
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
 		uint32_t ino_index = to_le32(inode_ref->index);
@@ -725,7 +725,7 @@ static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
 			  ext4_fsblk_t pblk __unused)
 {
 	struct ext4_extent_tail *tail;
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	const char *error_msg;
 	(void)error_msg;
 
@@ -2080,7 +2080,7 @@ static int ext4_ext_zero_unwritten_range(struct ext4_inode_ref *inode_ref,
 {
 	int err = EOK;
 	uint32_t i;
-	uint32_t block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
+	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(inode_ref->fs));
 	for (i = 0; i < blocks_count; i++) {
         /* These are file bytes, not journal metadata. The data version may be
          * replaced by the caller's stable write in this same conversion. */
@@ -2101,7 +2101,7 @@ static int ext4_ext_initialize_unsplit(struct ext4_inode_ref *inode_ref,
 {
     struct ext4_fs *fs = inode_ref->fs;
     if (fs->jbd_journal && fs->jbd_journal->error) return fs->jbd_journal->error;
-    if (fs->curr_trans && fs->curr_trans->error) return fs->curr_trans->error;
+    if (ext4_current_trans(fs) && ext4_current_trans(fs)->error) return ext4_current_trans(fs)->error;
     int r = ext4_find_extent(inode_ref, iblock, path, 0);
     if (r != EOK) return r;
     unsigned depth = ext_depth(inode_ref->inode);

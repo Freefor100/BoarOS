@@ -14,7 +14,7 @@ enum { cost_histograms = 0
 #define X(id, name, unit, hist) _Static_assert(sizeof(#name) <= 32, "cost metric name budget");
 #include <kernel/cost.def>
 #undef X
-/* 名称按实际长度保存，给新增诊断留空间而不提高64KiB聚合上限。 */
+/* 名称按实际长度保存，给新增诊断留空间而保持固定聚合上限。 */
 struct cost_metric_names {
 #define X(id, name, unit, hist) char id[sizeof(#name)];
 #include <kernel/cost.def>
@@ -62,7 +62,7 @@ static struct {
 } cost;
 enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(name_offsets) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 768 };
 /* Includes bridge/IRQ scalars and the read-only protocol snapshot key table. */
-_Static_assert(cost_storage <= 65536, "cost aggregate budget");
+_Static_assert(cost_storage <= 96 * 1024, "cost aggregate budget");
 static struct { struct kernel_cost_tag tag; uint64_t start; unsigned opened, suppressed; } irq;
 uint64_t kernel_cost_return_timestamp, kernel_cost_return_pending;
 void kernel_cost_irq_flush(void)
@@ -420,7 +420,7 @@ int kernel_cost_format(char *buffer, size_t capacity)
     field(&f, "owner", cost.owner); field(&f, "timebase_hz", cost.frequency);
     field(&f, "resolution_ns_numerator", 1000000000); field(&f, "resolution_ns_denominator", cost.frequency);
     field(&f, "start_ticks", cost.start); field(&f, "end_ticks", cost.end);
-    field(&f, "storage_bytes", cost_storage); field(&f, "task_bytes", sizeof(struct kernel_cost_task) + 16);
+    field(&f, "storage_bytes", cost_storage); field(&f, "task_bytes", KERNEL_COST_TASK_BYTES);
     field(&f, "overflow", cost.overflow); field(&f, "inflight", cost.inflight);
     for (unsigned lane = 0; lane < 3; ++lane) for (unsigned m = 0; m < COST_METRIC_COUNT; ++m) {
         char key[128]; size_t n = strlen(lanes[lane]); memcpy(key, lanes[lane], n); key[n++] = '.';
