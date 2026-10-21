@@ -1,8 +1,575 @@
 #include "../../fs/ext4_backend.h"
+#ifdef NAMESPACE_PARALLEL_CASES
+#include <ext4_fs.h>
+static struct kernel_vfs_instance *namespace_parallel_instance;
+static _Thread_local unsigned namespace_parallel_actor;
+static unsigned namespace_parallel_pause, namespace_parallel_resume;
+static unsigned namespace_parallel_entered[2], namespace_parallel_closed;
+static unsigned namespace_parallel_created[2], namespace_parallel_creates,namespace_parallel_moved;
+static struct kernel_vfs_node *namespace_stat_node;
+static _Thread_local unsigned namespace_stat_reader;
+static unsigned namespace_stat_entered,namespace_stat_resume,namespace_stat_written;
+static struct kernel_rwlock *namespace_directory_resource;
+int __real_ext4_fs_get_inode_ref(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
+int __wrap_ext4_fs_get_inode_ref(struct ext4_fs *fs,uint32_t index,struct ext4_inode_ref *ref)
+{
+    int result=__real_ext4_fs_get_inode_ref(fs,index,ref);
+    if(!result && (namespace_stat_reader==4 || namespace_stat_reader==5) &&
+        namespace_stat_node && index==namespace_stat_node->inode) {
+        struct kernel_io_context *context=kernel_io_context_current();
+        assert(ext4_current_operation(fs));
+        struct kernel_lock_guard *guard=context->locks;
+        while(guard && (guard->lock->rank!=31 || guard->lock->key!=index))guard=guard->previous;
+        assert(guard && guard->write && guard->owner==context);
+        namespace_directory_resource=guard->lock;
+        __atomic_store_n(&namespace_stat_entered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&namespace_stat_resume,__ATOMIC_ACQUIRE))sched_yield();
+        namespace_stat_reader=0;
+    }
+    return result;
+}
+int __real_ext4_fraw_inode_fill(const ext4_file *,struct ext4_inode *);
+int __wrap_ext4_fraw_inode_fill(const ext4_file *file,struct ext4_inode *inode)
+{
+    int result=__real_ext4_fraw_inode_fill(file,inode);
+    if(namespace_stat_reader && namespace_stat_node && file==lwext4_node_file(namespace_stat_node)) {
+        if((namespace_stat_node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG)
+            assert(kernel_lock_held(&namespace_stat_node->io_lock,0));
+        __atomic_store_n(&namespace_stat_entered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&namespace_stat_resume,__ATOMIC_ACQUIRE))sched_yield();
+    }
+    return result;
+}
+int __real_ext4_file_set_times(ext4_file *,unsigned,const struct ext4_timestamp [3]);
+int __wrap_ext4_file_set_times(ext4_file *file,unsigned fields,const struct ext4_timestamp times[3])
+{
+    if(namespace_stat_reader==2 && namespace_stat_node && file==lwext4_node_file(namespace_stat_node)) {
+        assert(kernel_lock_held(&namespace_stat_node->io_lock,1));
+        __atomic_store_n(&namespace_stat_entered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&namespace_stat_resume,__ATOMIC_ACQUIRE))sched_yield();
+    }
+    return __real_ext4_file_set_times(file,fields,times);
+}
+struct namespace_stat_request {
+    struct kernel_vfs_file *file;
+    struct kernel_vfs_path *directory;
+    struct kernel_vfs_stat stat;
+    unsigned writer;
+};
+static void *namespace_stat_thread(void *argument)
+{
+    struct namespace_stat_request *request=argument;
+    mm_test_attach(request->writer+1);mm_test_activate_task();kernel_cpu_current()->logical_id=!request->writer;
+    if(request->writer==3 || request->writer==5) {
+        namespace_stat_reader=request->writer;
+        assert(!kernel_vfs_file_set_mode(request->file,0711));
+        __atomic_store_n(&namespace_stat_written,1,__ATOMIC_RELEASE);
+    } else if(request->writer==2 || request->writer==4) {
+        namespace_stat_reader=request->writer;
+        const struct kernel_vfs_timespec times[2]={{1234,0},{2345,0}};
+        assert(!kernel_vfs_file_set_times(request->file,times));
+    } else if(request->writer) {
+        if(request->directory)assert(!kernel_vfs_mkdir_at(request->directory,request->directory,"child",0700));
+        else assert(!kernel_vfs_ftruncate(request->file,1));
+        __atomic_store_n(&namespace_stat_written,1,__ATOMIC_RELEASE);
+    } else {
+        namespace_stat_reader=1;
+        assert(!kernel_vfs_fstat(request->file,&request->stat));
+    }
+    mm_test_finish();return NULL;
+}
+static void namespace_stat_qualification_case(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_create(mount,"/namespace-stat",0600,&file));
+    namespace_stat_node=file.private_data;namespace_stat_entered=namespace_stat_resume=namespace_stat_written=0;
+    struct namespace_stat_request requests[2]={{.file=&file},{.file=&file,.writer=1}};
+    pthread_t threads[2];assert(!pthread_create(&threads[0],NULL,namespace_stat_thread,&requests[0]));
+    while(!__atomic_load_n(&namespace_stat_entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_create(&threads[1],NULL,namespace_stat_thread,&requests[1]));
+    for(;;) {
+        unsigned waiting;
+        {KERNEL_RAW_SCOPE(guard,&namespace_stat_node->io_lock.metadata);
+         waiting=namespace_stat_node->io_lock.pending_head!=NULL;}
+        if(waiting)break;
+        sched_yield();
+    }
+    assert(!__atomic_load_n(&namespace_stat_written,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&namespace_stat_resume,1,__ATOMIC_RELEASE);
+    for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+    namespace_stat_node=NULL;
+    struct kernel_vfs_stat stat;
+    assert(!requests[0].stat.size && !kernel_vfs_fstat(&file,&stat) && stat.size==1);
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unlink(mount,"/namespace-stat"));
+    puts("PASS actual ext4 fstat holds inode read qualification through raw inode fill and final snapshot; ftruncate waits");
+}
+static void namespace_directory_stat_qualification_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    if (!((struct kernel_vfs_instance *)mount->private_data)->namespace_parallel) return;
+    struct kernel_vfs_path *root=NULL,*directory=NULL;
+    assert(!kernel_vfs_path_root(mount,heap,&root) &&
+           !kernel_vfs_mkdir_at(root,root,"namespace-directory-stat",0700) &&
+           !kernel_vfs_path_lookup(root,"namespace-directory-stat",24,&directory));
+    for(unsigned setter=0;setter<3;setter++) {
+        namespace_stat_node=directory->file.private_data;
+        namespace_stat_entered=namespace_stat_resume=namespace_stat_written=0;
+        struct namespace_stat_request requests[2]={{.file=&directory->file,.writer=setter==1?2:0},
+            {.file=&directory->file,.directory=directory,.writer=setter==2?3:1}};
+        pthread_t threads[2];assert(!pthread_create(&threads[0],NULL,namespace_stat_thread,&requests[0]));
+        while(!__atomic_load_n(&namespace_stat_entered,__ATOMIC_ACQUIRE))sched_yield();
+        assert(!pthread_create(&threads[1],NULL,namespace_stat_thread,&requests[1]));
+        unsigned waiting=0;
+        for(;;) {
+            if(__atomic_load_n(&namespace_stat_written,__ATOMIC_ACQUIRE))break;
+            {KERNEL_RAW_SCOPE(guard,&namespace_stat_node->io_lock.metadata);
+             waiting=namespace_stat_node->io_lock.pending_head!=NULL;}
+            if(waiting)break;
+            sched_yield();
+        }
+        __atomic_store_n(&namespace_stat_resume,1,__ATOMIC_RELEASE);
+        for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+        namespace_stat_node=NULL;
+        assert(!waiting); /* A copied directory snapshot need not pin future edits. */
+        struct kernel_vfs_stat stat;
+        assert(!kernel_vfs_fstat(&directory->file,&stat));
+        if(!setter)assert(stat.nlink==requests[0].stat.nlink+1);
+        else if(setter==1)assert(stat.atime.seconds==1234);
+        else assert((stat.mode&07777)==0711 && (requests[0].stat.mode&07777)==0700);
+        if(setter!=2)assert(!kernel_vfs_unlink_at(directory,directory,"child",1));
+    }
+    for(unsigned setter=4;setter<=5;setter++) {
+        namespace_stat_node=directory->file.private_data;
+        namespace_stat_entered=namespace_stat_resume=namespace_stat_written=0;
+        namespace_directory_resource=NULL;
+        struct kernel_vfs_stat before,after;
+        assert(!kernel_vfs_fstat(&directory->file,&before));
+        struct namespace_stat_request requests[2]={{.file=&directory->file,.writer=setter},
+            {.file=&directory->file,.directory=directory,.writer=1}};
+        pthread_t threads[2];assert(!pthread_create(&threads[0],NULL,namespace_stat_thread,&requests[0]));
+        while(!__atomic_load_n(&namespace_stat_entered,__ATOMIC_ACQUIRE))sched_yield();
+        assert(namespace_directory_resource);
+        assert(!pthread_create(&threads[1],NULL,namespace_stat_thread,&requests[1]));
+        for(;;) {
+            unsigned waiting;
+            {KERNEL_RAW_SCOPE(guard,&namespace_directory_resource->metadata);
+             waiting=namespace_directory_resource->pending_head!=NULL;}
+            if(waiting)break;
+            {KERNEL_RAW_SCOPE(guard,&namespace_stat_node->io_lock.metadata);
+             assert(!namespace_stat_node->io_lock.pending_head);}
+            assert(!__atomic_load_n(&namespace_stat_written,__ATOMIC_ACQUIRE));
+            sched_yield();
+        }
+        __atomic_store_n(&namespace_stat_resume,1,__ATOMIC_RELEASE);
+        for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+        namespace_stat_node=NULL;namespace_directory_resource=NULL;
+        assert(!kernel_vfs_fstat(&directory->file,&after) && after.nlink==before.nlink+1);
+        if(setter==4)assert(after.atime.seconds==1234);
+        else assert((after.mode&07777)==0711);
+        uint64_t observed=kernel_vfs_error_sequence(&directory->file);
+        assert(!kernel_vfs_sync_borrowing(&directory->file,0,&observed,NULL));
+        assert(!kernel_vfs_unlink_at(directory,directory,"child",1));
+    }
+    assert(!kernel_vfs_path_release(&directory) &&
+           !kernel_vfs_unlink_at(root,root,"namespace-directory-stat",1) && !kernel_vfs_path_release(&root));
+    puts("PASS directory stat retains its copied snapshot while mkdir/chmod progress; FD utimens merges the latest nlink");
+    puts("PASS directory FD utimens/chmod and mkdir serialize through actual backend inode owner; fsync and final owners return");
+}
+static int namespace_parallel_truncate(struct kernel_vfs_node *node,uint64_t size,
+    uint64_t *actual,int *changed)
+{
+    assert(!size && kernel_lock_held(&node->io_lock,1));
+    __atomic_store_n(&namespace_parallel_entered[0],1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&namespace_parallel_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    *actual=size;*changed=1;return 0;
+}
+static void namespace_parallel_link_enter(struct kernel_vfs_instance *instance,uint64_t inode)
+{
+    __atomic_store_n(&namespace_parallel_entered[1],1,__ATOMIC_RELEASE);
+    struct kernel_vfs_node *node=kernel_vfs_node_pin(instance,inode);
+    assert(node && kernel_lock_held(&node->io_lock,1));
+    assert(!kernel_vfs_node_release(&node));
+}
+static int namespace_parallel_unlink(struct kernel_vfs_mount *mount,uint64_t parent,const char *name)
+{
+    assert(parent==20 && !strcmp(name,"created"));
+    unsigned inode=__atomic_load_n(&namespace_parallel_created[1],__ATOMIC_ACQUIRE);
+    namespace_parallel_link_enter(mount->private_data,inode);
+    assert(inode && inode==namespace_parallel_created[0]);
+    __atomic_store_n(&namespace_parallel_created[1],0,__ATOMIC_RELEASE);return 0;
+}
+static int namespace_parallel_link(struct kernel_vfs_instance *instance,uint64_t inode,
+    uint64_t parent,const char *name)
+{
+    assert(parent==20 && !strcmp(name,"created") && inode==namespace_parallel_created[0]);
+    namespace_parallel_link_enter(instance,inode);
+    assert(!__atomic_exchange_n(&namespace_parallel_created[1],inode,__ATOMIC_ACQ_REL));return 0;
+}
+
+void __real_kernel_file_mapping_init(struct kernel_vfs_node *);
+void __wrap_kernel_file_mapping_init(struct kernel_vfs_node *node)
+{
+    __real_kernel_file_mapping_init(node);
+    if (namespace_parallel_pause == 1 && node->instance == namespace_parallel_instance) {
+        __atomic_store_n(&namespace_parallel_entered[namespace_parallel_actor], 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&namespace_parallel_resume, __ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,
+    size_t count, size_t size, void **owner)
+{
+    enum kernel_heap_status result=__real_kernel_heap_allocate_zeroed(heap,count,size,owner);
+    if (!result && namespace_parallel_pause==2 && count==1 &&
+        size==sizeof(struct kernel_vfs_path)+5) {
+        __atomic_store_n(&namespace_parallel_entered[namespace_parallel_actor],1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&namespace_parallel_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return result;
+}
+static int namespace_parallel_close(struct kernel_vfs_node *node)
+{
+    assert(node->instance==namespace_parallel_instance);
+    __atomic_fetch_add(&namespace_parallel_closed,1,__ATOMIC_RELAXED);
+    return 0;
+}
+static int namespace_parallel_root(struct kernel_vfs_instance *instance,uint64_t *inode,uint32_t *mode)
+{
+    assert(instance==namespace_parallel_instance);
+    *inode=1;*mode=KERNEL_VFS_S_IFDIR|0755;return 0;
+}
+static int namespace_parallel_lookup(struct kernel_vfs_instance *instance,uint64_t parent,
+    const char *name,size_t length,uint64_t *inode,uint32_t *mode)
+{
+    assert(instance==namespace_parallel_instance);
+    if (parent==1 && ((length==1 && name[0]=='b') ||
+        (!namespace_parallel_moved && length==1 && name[0]=='a') ||
+        (namespace_parallel_moved && length==5 && !memcmp(name,"moved",5)))) {
+        *inode=length==1 && name[0]=='b'?20:10;*mode=KERNEL_VFS_S_IFDIR|0700;return 0;
+    }
+    if (parent==1 && length==4 && !memcmp(name,"leaf",4)) {
+        *inode=2;*mode=KERNEL_VFS_S_IFREG|0600;return 0;
+    }
+    if ((parent==10 || parent==20) && length==7 && !memcmp(name,"created",7) &&
+        __atomic_load_n(&namespace_parallel_created[parent==20],__ATOMIC_ACQUIRE)) {
+        *inode=__atomic_load_n(&namespace_parallel_created[parent==20],__ATOMIC_ACQUIRE);
+        *mode=KERNEL_VFS_S_IFREG|0600;return 0;
+    }
+    return -KERNEL_ENOENT;
+}
+static int namespace_parallel_open(struct kernel_vfs_mount *mount,const char *path,
+    uint64_t inode,uint32_t mode,struct kernel_vfs_file *file)
+{
+    (void)path;struct kernel_vfs_node *node=NULL;
+    struct kernel_vfs_instance *instance=mount->private_data;
+    assert(!kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*node),(void **)&node));
+    node->inode=inode;node->mode=mode;
+    return kernel_vfs_publish_node(mount,node,file,0);
+}
+static int namespace_parallel_create(struct kernel_vfs_mount *mount,uint64_t parent,
+    const char *name,uint32_t mode,struct kernel_vfs_file *file)
+{
+    assert((parent==10 || parent==20) && !strcmp(name,"created"));
+    struct kernel_vfs_node *directory=kernel_vfs_node_pin(mount->private_data,parent);
+    assert(directory && kernel_lock_held(&directory->namespace_lock,1));
+    assert(!kernel_vfs_node_release(&directory));
+    if (namespace_parallel_pause==3) {
+        __atomic_store_n(&namespace_parallel_entered[namespace_parallel_actor],1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&namespace_parallel_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    __atomic_fetch_add(&namespace_parallel_creates,1,__ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&namespace_parallel_created[parent==20],parent+1,__ATOMIC_ACQ_REL))
+        return -KERNEL_EEXIST;
+    return namespace_parallel_open(mount,NULL,parent+1,KERNEL_VFS_S_IFREG|mode,file);
+}
+static void namespace_parallel_assert_writer(struct kernel_vfs_instance *instance,uint64_t inode)
+{
+    struct kernel_vfs_node *node=kernel_vfs_node_pin(instance,inode);
+    assert(node && kernel_lock_held(&node->namespace_lock,1));
+    assert(!kernel_vfs_node_release(&node));
+}
+static int namespace_parallel_rmdir(struct kernel_vfs_mount *mount,uint64_t parent,const char *name)
+{
+    assert(parent==1 && !strcmp(name,"a"));
+    namespace_parallel_assert_writer(mount->private_data,1);
+    namespace_parallel_assert_writer(mount->private_data,10);
+    assert(__atomic_load_n(&namespace_parallel_created[0],__ATOMIC_ACQUIRE));
+    return -KERNEL_ENOTEMPTY;
+}
+static int namespace_parallel_rename(struct kernel_vfs_instance *instance,uint64_t old_parent,
+    const char *old_name,uint64_t new_parent,const char *new_name,unsigned flags,
+    struct kernel_vfs_rename_result *result)
+{
+    if(old_parent==10 && new_parent==20) {
+        assert(!strcmp(old_name,"created") && !strcmp(new_name,"created") && !flags);
+        unsigned source=namespace_parallel_created[0],target=namespace_parallel_created[1];
+        assert(source && target);
+        if(source==target)return 0;
+        namespace_parallel_link_enter(instance,target);
+        namespace_parallel_created[0]=0;namespace_parallel_created[1]=source;
+        result->replaced_inode=target;result->replaced_last_link=1;result->changed=1;return 0;
+    }
+    assert(old_parent==1 && new_parent==1 && !strcmp(old_name,"a") &&
+           !strcmp(new_name,"moved") && !flags);
+    namespace_parallel_assert_writer(instance,1);
+    namespace_parallel_assert_writer(instance,10);
+    namespace_parallel_moved=1;result->changed=1;return 0;
+}
+static void namespace_parallel_release_unlinked(struct kernel_vfs_node *node)
+{
+    KERNEL_LOCK_SCOPE(guard);kernel_vfs_node_lock(node,&guard,1);
+    if (!node->open_files)node->retired=1;
+}
+struct namespace_parallel_request {
+    struct kernel_vfs_mount *mount;
+    struct kernel_vfs_path *root,*found;
+    struct kernel_vfs_file file;
+    unsigned actor,operation,done;
+    int error;
+    struct kernel_vfs_file *borrowed;
+    struct kernel_vfs_path *source;
+    struct kernel_vfs_path *destination;
+};
+static void *namespace_parallel_thread(void *argument)
+{
+    struct namespace_parallel_request *request=argument;
+    mm_test_attach(request->actor+1);mm_test_activate_task();
+    kernel_cpu_current()->logical_id=request->actor;
+    namespace_parallel_actor=request->actor;
+    if (request->operation==8)
+        request->error=kernel_vfs_rename_at(request->source,request->destination,
+            request->root,"created","created",0);
+    else if (request->operation==5)
+        request->error=kernel_vfs_ftruncate(request->borrowed,0);
+    else if (request->operation==6)
+        request->error=kernel_vfs_unlink_at(request->root,request->root,"created",0);
+    else if (request->operation==7)
+        request->error=kernel_vfs_link_at(request->source,request->root,request->root,"created");
+    else if (request->operation==3)
+        request->error=kernel_vfs_unlink_at(request->root,request->root,"a",1);
+    else if (request->operation==4)
+        request->error=kernel_vfs_rename_at(request->root,request->root,request->root,"a","moved",0);
+    else if (request->operation==2) {
+        struct kernel_vfs_open_request open={.flags=KERNEL_VFS_OPEN_CREATE|KERNEL_VFS_OPEN_FOLLOW,.mode=0600};
+        assert(!kernel_vfs_open_at(request->root,request->root,"created",&open,&request->file,NULL));
+    } else if (request->root) assert(!kernel_vfs_path_lookup(request->root,"leaf",4,&request->found));
+    else assert(!namespace_parallel_open(request->mount,NULL,2,KERNEL_VFS_S_IFREG|0600,&request->file));
+    mm_test_finish();
+    __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+static void namespace_parallel_publication_case(struct kernel_heap *heap)
+{
+    struct kernel_vfs_backend ops={.namespace_execution=KERNEL_VFS_EXECUTION_CALLER,
+        .close_node=namespace_parallel_close,
+        .root=namespace_parallel_root,.lookup=namespace_parallel_lookup,.open=namespace_parallel_open,
+        .create=namespace_parallel_create,.rmdir=namespace_parallel_rmdir,.rename=namespace_parallel_rename,
+        .unlink=namespace_parallel_unlink,.link=namespace_parallel_link,.truncate=namespace_parallel_truncate,
+        .release_unlinked=namespace_parallel_release_unlinked};
+    struct kernel_vfs_instance instance={.ops=&ops,.heap=heap,.namespace_parallel=1};
+    struct kernel_vfs_mount mount={.private_data=&instance,.state=VFS_MOUNT_STATE_LIVE,.id=900};
+    kernel_mutex_init(&instance.namespace_lock,20,(uintptr_t)&instance);
+    namespace_parallel_instance=&instance;namespace_parallel_closed=0;
+    struct namespace_parallel_request requests[2]={{.mount=&mount,.actor=0},{.mount=&mount,.actor=1}};
+    pthread_t threads[2];
+    namespace_parallel_pause=1;namespace_parallel_resume=0;
+    memset(namespace_parallel_entered,0,sizeof(namespace_parallel_entered));
+    for(unsigned i=0;i<2;i++)assert(!pthread_create(&threads[i],NULL,namespace_parallel_thread,&requests[i]));
+    while (!__atomic_load_n(&namespace_parallel_entered[0],__ATOMIC_ACQUIRE) ||
+           !__atomic_load_n(&namespace_parallel_entered[1],__ATOMIC_ACQUIRE)) sched_yield();
+    __atomic_store_n(&namespace_parallel_resume,1,__ATOMIC_RELEASE);
+    for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+    assert(requests[0].file.private_data==requests[1].file.private_data && instance.node_count==1 &&
+           instance.external_files==2 && namespace_parallel_closed==1);
+    namespace_parallel_pause=0;
+    struct kernel_vfs_path *root=NULL;
+    assert(!kernel_vfs_path_root(&mount,heap,&root));
+    for(unsigned i=0;i<2;i++)requests[i].root=root;
+    namespace_parallel_pause=2;namespace_parallel_resume=0;
+    memset(namespace_parallel_entered,0,sizeof(namespace_parallel_entered));
+    assert(!pthread_create(&threads[0],NULL,namespace_parallel_thread,&requests[0]));
+    while (!__atomic_load_n(&namespace_parallel_entered[0],__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!pthread_create(&threads[1],NULL,namespace_parallel_thread,&requests[1]));
+    unsigned parallel=0;
+    for (;;) {
+        parallel=__atomic_load_n(&namespace_parallel_entered[1],__ATOMIC_ACQUIRE);
+        if (parallel) break;
+        unsigned waiting;
+        { KERNEL_RAW_SCOPE(guard,&instance.namespace_lock.lock.metadata);
+          waiting=instance.namespace_lock.lock.pending_head!=NULL; }
+        if (waiting) break;
+        sched_yield();
+    }
+    __atomic_store_n(&namespace_parallel_resume,1,__ATOMIC_RELEASE);
+    for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+    assert(parallel && requests[0].found==requests[1].found && instance.node_count==2);
+    namespace_parallel_pause=0;
+    for(unsigned i=0;i<2;i++)assert(!kernel_vfs_path_release(&requests[i].found) &&
+                                  !kernel_vfs_close(&requests[i].file));
+    assert(namespace_parallel_closed==2);
+    struct kernel_vfs_path *parents[2]={NULL,NULL};
+    assert(!kernel_vfs_path_lookup(root,"a",1,&parents[0]) &&
+           !kernel_vfs_path_lookup(root,"b",1,&parents[1]));
+    for (unsigned shared=0;shared<2;shared++) {
+        memset(namespace_parallel_created,0,sizeof(namespace_parallel_created));
+        memset(namespace_parallel_entered,0,sizeof(namespace_parallel_entered));
+        namespace_parallel_creates=0;namespace_parallel_pause=3;namespace_parallel_resume=0;
+        for(unsigned i=0;i<2;i++) requests[i]=(struct namespace_parallel_request){
+            .mount=&mount,.root=parents[shared?0:i],.actor=i,.operation=2};
+        assert(!pthread_create(&threads[0],NULL,namespace_parallel_thread,&requests[0]));
+        while (!__atomic_load_n(&namespace_parallel_entered[0],__ATOMIC_ACQUIRE)) sched_yield();
+        assert(!pthread_create(&threads[1],NULL,namespace_parallel_thread,&requests[1]));
+        unsigned overlap=0;
+        for (;;) {
+            overlap=__atomic_load_n(&namespace_parallel_entered[1],__ATOMIC_ACQUIRE);
+            if (overlap) break;
+            struct kernel_vfs_node *directory=parents[shared?0:1]->file.private_data;
+            unsigned waiting;
+            { KERNEL_RAW_SCOPE(guard,&directory->namespace_lock.metadata);
+              waiting=directory->namespace_lock.pending_head!=NULL; }
+            if (waiting) break;
+            sched_yield();
+        }
+        assert(overlap==!shared);
+        __atomic_store_n(&namespace_parallel_resume,1,__ATOMIC_RELEASE);
+        for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+        assert(namespace_parallel_creates==(shared?1U:2U));
+        assert((requests[0].file.private_data==requests[1].file.private_data)==!!shared);
+        namespace_parallel_pause=0;
+        for(unsigned i=0;i<2;i++)assert(!kernel_vfs_close(&requests[i].file));
+    }
+    for(unsigned operation=3;operation<=4;operation++) {
+        memset(namespace_parallel_created,0,sizeof(namespace_parallel_created));
+        memset(namespace_parallel_entered,0,sizeof(namespace_parallel_entered));
+        namespace_parallel_pause=3;namespace_parallel_resume=0;
+        requests[0]=(struct namespace_parallel_request){.mount=&mount,.root=parents[0],.actor=0,.operation=2};
+        requests[1]=(struct namespace_parallel_request){.mount=&mount,.root=root,.actor=1,.operation=operation};
+        assert(!pthread_create(&threads[0],NULL,namespace_parallel_thread,&requests[0]));
+        while (!__atomic_load_n(&namespace_parallel_entered[0],__ATOMIC_ACQUIRE)) sched_yield();
+        assert(!pthread_create(&threads[1],NULL,namespace_parallel_thread,&requests[1]));
+        for (;;) {
+            struct kernel_vfs_node *directory=parents[0]->file.private_data;unsigned waiting;
+            { KERNEL_RAW_SCOPE(guard,&directory->namespace_lock.metadata);
+              waiting=directory->namespace_lock.pending_head!=NULL; }
+            if (waiting) break;
+            sched_yield();
+        }
+        __atomic_store_n(&namespace_parallel_resume,1,__ATOMIC_RELEASE);
+        for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+        assert(requests[1].error==(operation==3?-KERNEL_ENOTEMPTY:0));
+        if (operation==4) {
+            char text[64];
+            assert(!kernel_vfs_path_string(requests[0].file.path,root,text,sizeof(text)) &&
+                   !strcmp(text,"/moved/created"));
+        }
+        namespace_parallel_pause=0;
+        assert(!kernel_vfs_close(&requests[0].file));
+    }
+    for(unsigned operation=6;operation<=7;operation++) {
+        memset(namespace_parallel_created,0,sizeof(namespace_parallel_created));
+        struct kernel_vfs_file held={0};
+        struct kernel_vfs_open_request open={.flags=KERNEL_VFS_OPEN_CREATE|KERNEL_VFS_OPEN_FOLLOW,.mode=0600};
+        assert(!kernel_vfs_open_at(parents[0],root,"created",&open,&held,NULL));
+        unsigned inode=(unsigned)kernel_vfs_file_inode(&held);
+        if(operation==6)namespace_parallel_created[1]=inode;
+        memset(namespace_parallel_entered,0,sizeof(namespace_parallel_entered));
+        namespace_parallel_resume=0;
+        requests[0]=(struct namespace_parallel_request){.actor=0,.operation=5,.borrowed=&held};
+        requests[1]=(struct namespace_parallel_request){.root=parents[1],.actor=1,.operation=operation,.source=held.path};
+        assert(!pthread_create(&threads[0],NULL,namespace_parallel_thread,&requests[0]));
+        while (!__atomic_load_n(&namespace_parallel_entered[0],__ATOMIC_ACQUIRE)) sched_yield();
+        assert(!pthread_create(&threads[1],NULL,namespace_parallel_thread,&requests[1]));
+        unsigned waiting=0;
+        for (;;) {
+            if (__atomic_load_n(&namespace_parallel_entered[1],__ATOMIC_ACQUIRE)) break;
+            struct kernel_vfs_node *node=held.private_data;
+            { KERNEL_RAW_SCOPE(guard,&node->io_lock.metadata);waiting=node->io_lock.pending_head!=NULL; }
+            if(waiting)break;
+            sched_yield();
+        }
+        assert(waiting && namespace_parallel_created[1]==(operation==6?inode:0));
+        __atomic_store_n(&namespace_parallel_resume,1,__ATOMIC_RELEASE);
+        for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL) && !requests[i].error);
+        assert(namespace_parallel_created[1]==(operation==6?0:inode));
+        assert(!kernel_vfs_close(&held));
+    }
+    for(unsigned alias=0;alias<2;alias++) for(unsigned held=0;held<3;held++) {
+        memset(namespace_parallel_created,0,sizeof(namespace_parallel_created));
+        struct kernel_vfs_file source={0},target={0};
+        struct kernel_vfs_open_request open={.flags=KERNEL_VFS_OPEN_CREATE|KERNEL_VFS_OPEN_FOLLOW,.mode=0600};
+        assert(!kernel_vfs_open_at(parents[0],root,"created",&open,&source,NULL));
+        uint64_t source_inode=kernel_vfs_file_inode(&source);
+        if(alias)namespace_parallel_created[1]=(unsigned)source_inode;
+        assert(!kernel_vfs_open_at(parents[1],root,"created",&open,&target,NULL));
+        uint64_t target_inode=kernel_vfs_file_inode(&target);
+        if (!held) {
+            assert(!kernel_vfs_rename_at(parents[0],parents[1],root,"created","created",0));
+        } else {
+            memset(namespace_parallel_entered,0,sizeof(namespace_parallel_entered));
+            namespace_parallel_resume=0;
+            requests[0]=(struct namespace_parallel_request){.actor=0,.operation=5,
+                .borrowed=held==1?&source:&target};
+            requests[1]=(struct namespace_parallel_request){.actor=1,.operation=8,
+                .source=parents[0],.destination=parents[1],.root=root};
+            assert(!pthread_create(&threads[0],NULL,namespace_parallel_thread,&requests[0]));
+            while (!__atomic_load_n(&namespace_parallel_entered[0],__ATOMIC_ACQUIRE)) sched_yield();
+            assert(!pthread_create(&threads[1],NULL,namespace_parallel_thread,&requests[1]));
+            struct kernel_vfs_node *busy=requests[0].borrowed->private_data;
+            unsigned waiting=0;
+            /* Observe the actual completed rename or registration on the
+             * held data lock, rather than deciding progress by elapsed time. */
+            while (!__atomic_load_n(&requests[1].done,__ATOMIC_ACQUIRE)) {
+                { KERNEL_RAW_SCOPE(guard,&busy->io_lock.metadata);
+                  waiting=busy->io_lock.pending_head!=NULL; }
+                if (waiting) break;
+                sched_yield();
+            }
+            if (waiting!=(held==2 && !alias))
+                fprintf(stderr,"rename/truncate alias=%u held=%u waiting=%u done=%u error=%d\n",
+                    alias,held,waiting,__atomic_load_n(&requests[1].done,__ATOMIC_ACQUIRE),requests[1].error);
+            assert(waiting==(held==2 && !alias));
+            if (!waiting) assert(!requests[1].error);
+            __atomic_store_n(&namespace_parallel_resume,1,__ATOMIC_RELEASE);
+            for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL) && !requests[i].error);
+        }
+        assert(kernel_vfs_file_inode(&source)==source_inode && kernel_vfs_file_inode(&target)==target_inode);
+        struct kernel_vfs_path *found=NULL;
+        assert(!kernel_vfs_path_lookup(parents[1],"created",7,&found));
+        assert(found==(alias?target.path:source.path));
+        assert(!kernel_vfs_path_release(&found));
+        if(!alias)assert(kernel_vfs_path_lookup(parents[0],"created",7,&found)==-KERNEL_ENOENT &&
+                         ((struct kernel_vfs_node *)target.private_data)->unlinked);
+        assert(!kernel_vfs_close(&target) && !kernel_vfs_close(&source));
+    }
+    /* Model the retained object after a deleted dirfd's disk number is reused.
+     * It is a separate identity and cannot share the live endpoint's lock. */
+    struct kernel_vfs_node retired={.instance=&instance,.mount=&mount,.inode=20,
+        .references=1,.mode=KERNEL_VFS_S_IFDIR|0700,.unlinked=1,.retired=1};
+    kernel_rwlock_init(&retired.namespace_lock,21,20);
+    struct kernel_vfs_path retired_path={.file={.mount=&mount,.private_data=&retired,
+        .mode=KERNEL_VFS_S_IFDIR|0700,.state=VFS_FILE_STATE_LIVE},.heap=heap,
+        .references=1,.name="retired"};
+    assert(kernel_vfs_rename_at(&retired_path,parents[1],root,"created","different",0)==-KERNEL_ENOENT &&
+           retired_path.references==1 && retired.references==1);
+    for(unsigned i=0;i<2;i++)assert(!kernel_vfs_path_release(&parents[i]));
+    assert(!kernel_vfs_path_release(&root) && !instance.nodes && !instance.paths &&
+           !instance.node_count && !instance.external_files && !instance.retiring_nodes);
+    namespace_parallel_instance=NULL;
+    puts("PASS parallel shared lookup and unique inode/path candidate publication; losing candidates and all owners returned");
+    puts("PASS independent directory creates overlap; shared directory creation waits, rechecks the name and opens one inode");
+    puts("PASS rmdir and rename wait for the child's directory qualification; moved descendant path identity survives");
+    puts("PASS deleted parent identity and reused live disk inode return ENOENT before equal-key qualification");
+    puts("PASS cross-parent unlink/link of one regular inode wait for actual ftruncate before changing links");
+    puts("PASS rename progresses during source truncate, waits for replacement truncate and preserves open/hard-link identities");
+}
+#endif
 /* 最后一个目录/文件路径引用可由发起任务归还，不依赖 CPU0。 */
 static void namespace_retirement_case(struct kernel_heap *heap,
                                        struct kernel_vfs_mount *mount)
 {
+#ifdef NAMESPACE_PARALLEL_CASES
+    namespace_stat_qualification_case(mount);
+    namespace_directory_stat_qualification_case(heap,mount);
+#endif
     struct kernel_vfs_file created={0};
     struct kernel_vfs_path *root=NULL,*child=NULL;
     assert(!kernel_vfs_create(mount,"/namespace-retirement",0600,&created));
@@ -177,27 +744,30 @@ static void namespace_walk_qualification_case(struct kernel_heap *heap,
     struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW |
         KERNEL_VFS_OPEN_CREATE | KERNEL_VFS_OPEN_EXCLUSIVE,.mode=0600};
     struct kernel_vfs_instance *instance=mount->private_data;
+    unsigned ordinary_qualifications=instance->namespace_parallel?0:1;
     assert(!kernel_vfs_path_root(mount,heap,&root));
     assert(!kernel_vfs_mkdir_at(root,root,"/namespace-walk",0700));
     namespace_observed_lock=&instance->namespace_lock.lock;
     namespace_lock_acquisitions=0;
     assert(!kernel_vfs_open_at(root,root,"/namespace-walk/file",&request,&file,NULL));
     namespace_observed_lock=NULL;
-    assert(namespace_lock_acquisitions==1);
+    assert(namespace_lock_acquisitions==ordinary_qualifications);
     assert(!kernel_vfs_close(&file));
     struct kernel_vfs_stat stat;
     namespace_lock_acquisitions=0;namespace_observed_lock=&instance->namespace_lock.lock;
     assert(!kernel_vfs_stat_at(root,root,"/namespace-walk/file",1,&stat));
-    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==1);
+    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==ordinary_qualifications);
     namespace_lock_acquisitions=0;namespace_observed_lock=&instance->namespace_lock.lock;
     assert(!kernel_vfs_rename_at(root,root,root,"/namespace-walk/file","/namespace-walk/new",0));
     namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==1);
     namespace_lock_acquisitions=0;namespace_observed_lock=&instance->namespace_lock.lock;
     assert(!kernel_vfs_unlink_at(root,root,"/namespace-walk/new",0));
-    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==1);
+    namespace_observed_lock=NULL;assert(namespace_lock_acquisitions==ordinary_qualifications);
     assert(!kernel_vfs_unlink_at(root,root,"/namespace-walk",1));
     assert(!kernel_vfs_path_release(&root));
-    puts("PASS one same-mount namespace qualification per open/create, stat, rename and unlink");
+    puts(instance->namespace_parallel?
+        "PASS directory-qualified open/create, stat and unlink; rename takes mount topology once":
+        "PASS one same-mount namespace qualification per open/create, stat, rename and unlink");
 }
 
 static void namespace_walk_workspace_case(struct kernel_heap *heap,
@@ -409,6 +979,9 @@ static void *namespace_retire_node(void *argument)
 }
 static void namespace_retiring_mount_case(struct kernel_heap *heap)
 {
+#ifdef NAMESPACE_PARALLEL_CASES
+    namespace_parallel_publication_case(heap);
+#endif
     struct kernel_vfs_mount *mount=NULL;
     struct kernel_vfs_file file={0};
     assert(!kernel_tmpfs_create(heap,0,"",&mount));

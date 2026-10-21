@@ -240,7 +240,7 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 ## 普通文件IO的执行位置
 
-ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。同一挂载的路径操作仍以 namespace mutex 串行；SMP journal 挂载的已打开文件操作按实际 inode／块组并行准备私有修改，接纳时合并版本和计数。journal/checkpoint 与后台数据写回由 CPU0 推进，启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
+ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。SMP journal 挂载的路径操作按实际目录取得共享或独占资格，rename 另由挂载拓扑互斥协调；已打开文件操作按实际 inode／块组取得资格。不同对象的私有修改可同时准备，接纳时合并版本和计数。默认单核、无 journal 挂载及其他后端保留原串行策略。journal/checkpoint 与后台数据写回由 CPU0 推进，启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
 
 普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 

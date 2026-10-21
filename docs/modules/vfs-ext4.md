@@ -55,12 +55,35 @@ root/cwd 由共享 FS 记录持有；路径使用者取得带引用的成对快�
 用户 O_EXCL 请求不跟随最终链接；严格 VFS 创建仍可显式跟随悬空链接。
 O_CREAT 的最终斜杠在父路径解析后返回 EISDIR；此前父路径错误保持原顺序。
 proc 管道链接没有 VFS 路径，由原 OFD 的重新打开接口处理，展示文本不参与文件创建。
-一次路径操作在同一挂载内复用 namespace 保护，内部 lookup 和最终操作直接使用已有资格。
-起点和根借用调用者的 owner；进入其他挂载时保留一个实际路径引用，覆盖解锁和完成通知。
-跨挂载先取得目标引用，再释放旧锁和执行范围，之后切换执行位置并取得新锁。
-创建、删除、mkdir、symlink 和 mknod 直接把已解析父 inode 与单个名称交给后端；link/rename 沿用相同身份，不再把目录链拼回绝对路径后重新查找。ext4 的父 inode 创建与删除复用原事务、目录校验及持久 orphan 实现。修改操作只在目标实例锁下
-完成后端事务；记录锁、OFD 和页缓存仍按各自 owner 同步。ext4 inode 仍是
-32 位，但通用 inode 标识已扩展至 64 位；ext4 适配层拒绝越界标识。
+SMP 构建的可写 journal ext4 在后端并行资格准备完成后、发布 worker 启动状态前，
+按实际挂载启用目录并行。逐段查找和枚举取得目录共享资格；创建、删除和最终名称检查
+取得父目录独占资格。rename 先归还逐目录资格，再取得挂载拓扑互斥，按 inode 顺序
+锁定两个父目录及涉及的子目录；集合扩展后重新核对名称和对象身份。rmdir 同样排序
+取得父目录和待删除目录并重核名称。同目录 rename 也取得拓扑互斥。默认单核、无
+journal ext4 和其他后端继续按实例独占处理 namespace。
+
+link 源、删除目标和真正的 rename 覆盖目标取得 VFS inode I/O 写资格，与打开文件、
+页缓存及最后关闭的退休状态同步。hardlink 别名指向同一 node 时不当作真正覆盖目标。
+父目录及改名源的元数据修改使用后端 inode 修改资格，不另取得 VFS 数据锁；改名源的
+EOF 与映射保持原值。新建且尚未发布的 inode 由本操作独占。
+
+起点和根借用调用者的 owner；逐目录交接另持一个路径引用，覆盖目录解锁。
+跨挂载先取得目标引用，再释放旧资格和执行范围，之后切换执行位置并取得新资格。
+创建、删除、mkdir、symlink 和 mknod 直接把已解析父 inode 与单个名称交给后端；
+link/rename 沿用相同身份，不把目录链拼回绝对路径后重新查找。inode 和路径候选在
+共同状态短保护内重新查找后发布，竞争失败的候选在保护外关闭并释放，共享查找只发布
+一个存活身份。挂载连接修改仍由 CPU0 执行，按拓扑互斥、被遮蔽路径的父目录资格、
+共同状态短保护的顺序发布。记录锁、OFD 和页缓存按各自 owner 同步。ext4 inode 仍是
+32 位，通用 inode 标识为 64 位；ext4 适配层拒绝越界标识。
+
+`make test-namespace-parallel-host` 保留独立 FD 回归，并运行 VFS 目录直接交错及真实
+ext4 目录并行检查。`tests/namespace-parallel-host.sh` 检查共享身份发布、同名创建、
+目录内创建与 rmdir/rename、hardlink 别名和覆盖退休。`tests/ext4-namespace-parallel-host.sh`
+检查不同目录的私有修改重叠、同块组分配排队、同一 inode/GDT 物理块的记录合并、
+单方 abort，以及 CPU0 checkpoint 期间 CPU1 查找和其他私有操作继续执行。固定多轮
+创建／删除检查跨 checkpoint 的位图复用；共享外部 EA 的 chown/COW 和最后 unlink
+检查实际块组资格及单方 abort 后的引用数。runner 支持 4/16 KiB 页及通过
+`FILE_IO_HOST_BLOCK_SIZE` 选择 1/4 KiB 文件系统块，每张正常卸载镜像随后运行 e2fsck。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
 已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
 卸载恢复均有真实 U-mode 验证。`kernel/syscall/mount.c` 当前只接受这两个 mount
@@ -131,14 +154,14 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 
 后端域包含串行资格、日志状态资格及按 inode／块组的实际操作请求。SMP 构建的
 journal 挂载在两个后台线程创建成功后取得 legacy 后端 writer，排空此前的执行者并
-启用资源并行，再发布 worker 启动状态。已排队的 legacy 调用取得资格后重新检查模式，
+启用资源及目录并行，再发布 worker 启动状态。已排队的 legacy 调用取得资格后重新检查模式，
 交还旧锁后按实际对象取得资格。线程创建失败先停止并等待已创建线程，归还分组状态，
 挂载继续沿串行后端执行，后续可重新启动。
 
 已打开文件的空间、属性、时间戳及同步操作按实际 inode／块组取得资格，不同对象的
 私有修改可以同时准备，接纳时合并元数据记录、空间增量和时间戳。资格索引只保留等待、
-活动及重放请求的实际引用，最后请求摘除对象并释放。同一挂载的路径操作仍由 namespace
-mutex 串行，journal/checkpoint 及后台数据写回仍由 CPU0 推进。默认单核与非 journal
+活动及重放请求的实际引用，最后请求摘除对象并释放。路径调用的目录与拓扑资格见前文，
+journal/checkpoint 及后台数据写回仍由 CPU0 推进。默认单核与非 journal
 挂载保留串行后端。操作上下文从当前执行栈的任务取得，跨调度发布窗口也保持归属；
 缓存释放意图随 quarantine 持有，成功 checkpoint 后才开放复用。
 
@@ -155,7 +178,7 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 ext4 的普通文件 stat 取得 inode I/O 读资格，将磁盘属性与实时 EOF 合成一次快照；readlink 保留对应读资格。
 目录 stat 直接复制所借用的稳定 inode，不阻止后续修改。目录 nlink、FD 时间和权限修改由后端
 inode 修改资格串行，私有版本接纳后才替换可见 payload；复制完成的旧快照继续有效。
-FD 属性修改仍持有 VFS I/O 写资格，保护共享 handle 及缓存 mode；目录修改仍由挂载 namespace 资格覆盖；直接端口回归另检查同一 inode 表块的记录合并。
+FD 属性修改仍持有 VFS I/O 写资格，保护共享 handle 及缓存 mode；目录名称修改使用前述目录资格，仅在 link 源、删除或真正覆盖目标需要协调退休时取得 VFS I/O 写资格。直接端口回归另检查同一 inode 表块的记录合并。
 
 活 node 还嵌入记录锁区间树与等待队列，因此独立 open 必须在同一 inode 上冲突；unlink 后仍打开的旧 inode 保持原锁身份，同名重建使用新 inode 和新锁状态。末节点释放要求树与等待队列都为空；锁 owner、close/退出释放与阻塞 pin 契约见[文件资源模块](kernel-files.md)。记录锁的查询、更新和带记录锁的最终关闭沿 CPU0 消费者路径执行。
 
@@ -619,9 +642,9 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 挂载内以 `(parent identity, name)` 复用活路径对象，root 也只有一个活身份；inode 节点独立于名字。注册链只借用对象，OFD、fs context 和解析过程拥有引用，最后一个引用释放时摘除注册并迭代释放父链。路径内置的 inode handle 不再持有自身路径，避免循环引用；打开文件持路径引用且独立保留 node，因此关闭时可先释放路径再减少自身 open_files。
 
-`kernel_vfs_*_at()` 使用 start/root 对象；只有仍使用 lwext4 路径接口的修改需要构造临时名字，解析与身份以已持有对象为准。活路径查找注册链成本 O(活路径数)，修改适配成本 O(祖先名称总字节数)，当前未引入负缓存或跨核锁。目录枚举每次刷新真实 inode 大小，打开后扩展目录不会漏掉新块。
+`kernel_vfs_*_at()` 使用持有引用的 start/root 对象，修改传入父 inode 和单个名称；已解析父目录不会因改名而变为同名新对象。活路径和 inode 使用弱 AVL 索引，查找与发布由状态短保护同步，目录并发规则见前文。没有负目录项缓存。目录枚举读取真实 inode 大小，打开后扩展目录不会漏掉新块。
 
-`ext4_rename_child()` 以父 inode 和名称为入口。先检查类型、目标空目录、祖先关系和资源，再在一个事务里处理目录项、`..`、父目录 nlink、时间与覆盖目标的持久 orphan。VFS 在调用前预留新名和父引用；成功后不可调度地替换 source 的 parent/name 并断开 target。无失败后的内存分配，也不会将已打开的 target 换成 source。rmdir 同样用检查 checksum 和记录边界的空目录扫描，损坏目录不能被当作空目录删除。
+`ext4_rename_child()` 以父 inode 和名称为入口，调用者持有相关目录和拓扑的 namespace 资格。先检查类型、目标空目录、祖先关系和资源，再在一个事务里处理目录项、`..`、父目录 nlink、时间与覆盖目标的持久 orphan。VFS 在调用前从 source 路径所属堆预留新名并取得父引用；替换、失败及最后释放均向同一堆归还名称。成功后在状态短保护内替换 source 的 parent/name 并断开 target。无失败后的内存分配，也不会将已打开的 target 换成 source。rmdir 同样用检查 checksum 和记录边界的空目录扫描，损坏目录不能被当作空目录删除。
 
 聚焦验证：`make test-vfs-riscv test-files-riscv test-lwext4-rename-host`，组合验证为 `make test-userland-riscv test-diff-abi-riscv`。rename host 矩阵包含 1/4 KiB、linear/HTree、orphan_file/传统链、覆盖/插入/目录扩展，逐点 OOM 和断电后重复恢复及 `e2fsck -fn`；VFS 测试另覆盖改名后对象共享、活覆盖目标、删除 cwd、17 层 255 字节目录名的相对修改。
 

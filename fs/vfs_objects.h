@@ -33,6 +33,7 @@ struct kernel_vfs_instance {
     struct kernel_raw_lock error_lock;
     struct kernel_vfs_path *path_index;
     size_t retiring_nodes; /* Removed from weak index; close/free still owns instance. */
+    uint8_t namespace_parallel; /* Enabled only after this mount's metadata owners are ready. */
 };
 
 struct kernel_vfs_node {
@@ -67,6 +68,8 @@ struct kernel_vfs_node {
 #if BOAROS_COST_DIAGNOSTICS
     uint8_t generated_diagnostic;
 #endif
+    /* Directory entries use a separate qualification from file data I/O. */
+    struct kernel_rwlock namespace_lock;
 };
 
 struct kernel_vfs_path {
