@@ -16,9 +16,9 @@ int __wrap_ext4_transaction_begin(const char *mount)
 int __real_ext4_fopen2(ext4_file *,const char *,int);
 int __wrap_ext4_fopen2(ext4_file *file,const char *path,int flags)
 { if(metadata_probe)metadata_open_calls++;int r=__real_ext4_fopen2(file,path,flags);if(metadata_probe && r)metadata_failed_step="open";return r; }
-int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *);
-int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file)
-{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file);if(metadata_probe && r)metadata_failed_step="create";return r; }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *);
+int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file,struct ext4_inode *initial)
+{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file,initial);if(metadata_probe && r)metadata_failed_step="create";return r; }
 int __real_ext4_transaction_end(const char *);
 int __wrap_ext4_transaction_end(const char *mount)
 { int r=__real_ext4_transaction_end(mount);if(metadata_probe && r)metadata_failed_step="end";return r; }
@@ -569,7 +569,7 @@ struct metadata_nested { const char *mount;ext4_file file;unsigned calls; };
 static int apply_metadata_nested(void *context)
 {
     struct metadata_nested *request=context;request->calls++;
-    return ext4_create_child(request->mount,EXT4_INODE_ROOT_INDEX,"budget-nested",0100640,0,NULL,&request->file);
+    return ext4_create_child(request->mount,EXT4_INODE_ROOT_INDEX,"budget-nested",0100640,0,NULL,&request->file,NULL);
 }
 static void namespace_budget(struct kernel_vfs_mount *mount)
 {

@@ -1,4 +1,13 @@
 #include "../../fs/ext4_backend.h"
+static _Thread_local unsigned namespace_create_initial_watch,namespace_create_raw_reads;
+#ifndef NAMESPACE_PARALLEL_CASES
+int __real_ext4_fraw_inode_fill(const ext4_file *,struct ext4_inode *);
+int __wrap_ext4_fraw_inode_fill(const ext4_file *file,struct ext4_inode *inode)
+{
+    if(namespace_create_initial_watch)namespace_create_raw_reads++;
+    return __real_ext4_fraw_inode_fill(file,inode);
+}
+#endif
 #ifdef NAMESPACE_PARALLEL_CASES
 #include <ext4_fs.h>
 static struct kernel_vfs_instance *namespace_parallel_instance;
@@ -31,6 +40,7 @@ int __wrap_ext4_fs_get_inode_ref(struct ext4_fs *fs,uint32_t index,struct ext4_i
 int __real_ext4_fraw_inode_fill(const ext4_file *,struct ext4_inode *);
 int __wrap_ext4_fraw_inode_fill(const ext4_file *file,struct ext4_inode *inode)
 {
+    if(namespace_create_initial_watch)namespace_create_raw_reads++;
     int result=__real_ext4_fraw_inode_fill(file,inode);
     if(namespace_stat_reader && namespace_stat_node && file==lwext4_node_file(namespace_stat_node)) {
         if((namespace_stat_node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG)
@@ -935,7 +945,11 @@ static void namespace_parent_case(struct kernel_heap *heap,
     assert(!kernel_vfs_rename_at(root,root,root,"/namespace-parent","/namespace-renamed",0));
     char basename[12];
     assert(!kernel_vfs_path_copy_name(parent,basename,sizeof(basename)) && !strcmp(basename,"namespace-r"));
+    namespace_create_raw_reads=0;namespace_create_initial_watch=1;
     assert(!kernel_vfs_create_at(parent,root,"data",0640,&file));
+    namespace_create_initial_watch=0;
+    printf("create initial attributes: raw inode rereads=%u\n",namespace_create_raw_reads);
+    assert(!namespace_create_raw_reads);
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_mkdir_at(parent,root,"nested",0750));
     assert(!kernel_vfs_stat_at(parent,root,"nested",1,&stat) && (stat.mode&02000));

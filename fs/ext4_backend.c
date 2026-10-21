@@ -615,26 +615,31 @@ static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait
 
 /* The node is still unpublished; its initial times and immutable format flags
  * become visible together when kernel_vfs_publish_node exposes it. */
+static void initialize_times(struct kernel_vfs_node *base,
+    struct lwext4_mount_adapter *adapter, struct ext4_inode *inode)
+{
+    struct lwext4_node *node = (struct lwext4_node *)base;
+    lwext4_node_file(base)->time_owner = base;
+    node->noatime = ext4_inode_has_flag(inode, EXT4_INODE_FLAG_NOATIME);
+    size_t offsets[3] = {offsetof(struct ext4_inode, atime_extra),
+        offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
+    uint32_t seconds[3] = {inode->access_time, inode->modification_time, inode->change_inode_time};
+    uint32_t extra[3] = {inode->atime_extra, inode->mtime_extra, inode->ctime_extra};
+    for (unsigned i = 0; i < 3; i++) {
+        int extended = inode_extra_field_present(adapter->superblock, inode, offsets[i], sizeof(uint32_t));
+        if (extended) node->extra_times |= 1U << i;
+        struct kernel_vfs_timespec value = decode_inode_time(seconds[i], extra[i], extended);
+        node->times[i] = (struct ext4_timestamp){value.seconds, value.nanoseconds};
+    }
+}
+
 static int load_times(struct kernel_vfs_node *base, struct lwext4_mount_adapter *adapter)
 {
     if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) return EOK;
     struct ext4_inode inode;
     int result = ext4_fraw_inode_fill(lwext4_node_file(base), &inode);
-    if (result) return result;
-    struct lwext4_node *node = (struct lwext4_node *)base;
-    lwext4_node_file(base)->time_owner = base;
-    node->noatime = ext4_inode_has_flag(&inode, EXT4_INODE_FLAG_NOATIME);
-    size_t offsets[3] = {offsetof(struct ext4_inode, atime_extra),
-        offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
-    uint32_t seconds[3] = {inode.access_time, inode.modification_time, inode.change_inode_time};
-    uint32_t extra[3] = {inode.atime_extra, inode.mtime_extra, inode.ctime_extra};
-    for (unsigned i = 0; i < 3; i++) {
-        int extended = inode_extra_field_present(adapter->superblock, &inode, offsets[i], sizeof(uint32_t));
-        if (extended) node->extra_times |= 1U << i;
-        struct kernel_vfs_timespec value = decode_inode_time(seconds[i], extra[i], extended);
-        node->times[i] = (struct ext4_timestamp){value.seconds, value.nanoseconds};
-    }
-    return EOK;
+    if (!result) initialize_times(base, adapter, &inode);
+    return result;
 }
 
 static int lwext4_error(int error)
@@ -1869,6 +1874,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
 struct namespace_create {
     const char *mount, *path, *target;
     ext4_file *file;
+    struct ext4_inode *initial;
     uint32_t parent, mode, type, device;
 };
 static int apply_namespace_create(void *context)
@@ -1880,7 +1886,8 @@ static int apply_namespace_create(void *context)
         memset(request->file, 0, sizeof(*request->file));
     }
     return ext4_create_child(request->mount, request->parent, request->path,
-        request->mode | request->type, request->device, request->target, request->file);
+        request->mode | request->type, request->device, request->target, request->file,
+        request->initial);
 }
 struct namespace_remove {
     const char *mount, *path;
@@ -1947,7 +1954,8 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     }
 
     node->backend_data = &((struct lwext4_node *)node)->file;
-    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.file=lwext4_node_file(node),.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
+    struct ext4_inode initial;
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.file=lwext4_node_file(node),.initial=&initial,.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
     result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any
@@ -1963,14 +1971,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->max_size = lwext4_node_file(node)->fmax;
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode = (mode & 07777U) | KERNEL_VFS_S_IFREG;
-    result = load_times(node, adapter);
-    if (result) {
-        if (ext4_fclose(lwext4_node_file(node)) != EOK) {
-            node->instance = &adapter->instance;
-            kernel_vfs_cleanup_node(node);
-        } else kernel_heap_release(adapter->instance.heap, node);
-        return lwext4_error(result);
-    }
+    initialize_times(node, adapter, &initial);
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
 

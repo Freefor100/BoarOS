@@ -67,9 +67,9 @@ static void observe_namespace(unsigned kind)
 int __real_ext4_lookup_child(const char *,uint32_t,const char *,uint32_t,uint32_t *,uint32_t *);
 int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,uint32_t length,uint32_t *ino,uint32_t *mode)
 { observe_namespace(0);return __real_ext4_lookup_child(mount,parent,name,length,ino,mode); }
-int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *);
-int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file)
-{ observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file); }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *);
+int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file,struct ext4_inode *initial)
+{ observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file,initial); }
 int __real_ext4_unlink_child(const char *,uint32_t,const char *,bool,uint32_t *,bool *);
 int __wrap_ext4_unlink_child(const char *mount,uint32_t parent,const char *name,bool dir,uint32_t *ino,bool *orphan)
 { observe_namespace(2);return __real_ext4_unlink_child(mount,parent,name,dir,ino,orphan); }

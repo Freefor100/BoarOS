@@ -5442,7 +5442,8 @@ Finish:
 /* One already resolved parent and basename share the existing create undo
  * boundary. The optional output is published only after all initialization. */
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
-    uint32_t mode, uint32_t device, const char *target, ext4_file *output)
+    uint32_t mode, uint32_t device, const char *target, ext4_file *output,
+    struct ext4_inode *initial)
 {
     struct ext4_mountpoint *mp = ext4_get_mount(mount);
     if (!mp) return ENOENT;
@@ -5454,6 +5455,7 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     if (type == EXT4_DE_UNKNOWN || (type == EXT4_DE_SYMLINK && !target)) return EINVAL;
     EXT4_MP_LOCK(mp);
     ext4_file file = {0};
+    struct ext4_inode attributes;
     struct ext4_inode_ref ref;
     int result = ext4_trans_start(mp);
     if (result == EOK) {
@@ -5468,12 +5470,19 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
             } else if (type == EXT4_DE_CHRDEV || type == EXT4_DE_BLKDEV)
                 ext4_mknod_inode_set(&ref, device);
             file.fsize = ext4_inode_get_size(ext4_fs_super(&mp->fs), ref.inode);
+            if (result == EOK && initial) {
+                size_t size = ext4_get16(ext4_fs_super(&mp->fs), inode_size);
+                if (size > sizeof(attributes)) size = sizeof(attributes);
+                memcpy(&attributes, ref.inode, size);
+                memset((uint8_t *)&attributes + size, 0, sizeof(attributes) - size);
+            }
             result = ext4_result(result, ext4_fs_put_inode_ref(&ref));
         }
         result = ext4_trans_finish(mp, result);
     }
     if (result == EOK && output) *output = file;
     else if (file.mp) result = ext4_result(result, ext4_fclose(&file));
+    if (result == EOK && initial) *initial = attributes;
     EXT4_MP_UNLOCK(mp);
     return result;
 }
