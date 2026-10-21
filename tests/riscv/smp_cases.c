@@ -49,7 +49,7 @@ static uint64_t root_background_count, root_background_begin;
 static struct kernel_thread_join root_background_join, root_controller_join;
 static uint64_t last_fence_address, last_fence_size;
 static unsigned allocation_fail_after, allocation_attempt;
-static unsigned alias_read, alias_continue, alias_checked;
+static unsigned alias_mapped, alias_read, alias_continue, alias_checked;
 static uint64_t alias_address;
 static unsigned borrow_may_exit, borrow_put_done, borrow_migrate, borrow_put_allowed, borrow_owner_checked;
 static struct kernel_wait_queue borrow_gate;
@@ -116,6 +116,43 @@ static int arena_physical(const void *p, uint64_t *address)
 
 static void require(int ok, const char *what)
 { if (!ok) riscv_smp_fail(what, -1); }
+
+/* CPU0 IRQ exclusion covers selection through unmap. Other tasks must already
+ * have their stacks: no creation/join may occur while these L0s are borrowed. */
+static uint64_t *window_level1(void)
+{
+    uint64_t *root, *level1;
+    require(!kernel_cpu_current()->logical_id && !arch_interrupt_is_enabled() &&
+        riscv_sv39_kernel_window_active(), "window-test-owner");
+    uint64_t root_address = (riscv_sv39_current_satp() & ((UINT64_C(1) << 44) - 1)) << 12;
+    require(physical_page_resolve(allocator, root_address, (void **)&root) ==
+        PHYSICAL_PAGE_STATUS_OK, "window-test-root-owner");
+    uint64_t entry = root[(RISCV_KERNEL_STACK_WINDOW_BASE >> 30) & 511];
+    require((entry & UINT64_C(0x3ff)) == 1, "window-test-root-nonleaf");
+    require(physical_page_resolve(allocator, (entry >> 10) << 12, (void **)&level1) ==
+        PHYSICAL_PAGE_STATUS_OK, "window-test-level1-owner");
+    return level1;
+}
+
+static uint64_t empty_window_l0(uint64_t *level1, unsigned tables)
+{
+    _Static_assert(RISCV_KERNEL_STACK_WINDOW_BASE % RISCV_SV39_PAGE_SIZE_2M == 0 &&
+        RISCV_KERNEL_STACK_WINDOW_SIZE % RISCV_SV39_PAGE_SIZE_2M == 0,
+        "MMU fixture needs complete L0 regions in the stack window");
+    require(tables && tables <= 2 && !arch_interrupt_is_enabled(), "window-test-region-count");
+    uint64_t span = tables * RISCV_SV39_PAGE_SIZE_2M;
+    for (uint64_t offset = RISCV_KERNEL_STACK_WINDOW_SIZE - span;; offset -= RISCV_SV39_PAGE_SIZE_2M) {
+        uint64_t address = RISCV_KERNEL_STACK_WINDOW_BASE + offset;
+        unsigned index = (address >> 21) & 511;
+        require(index + tables <= 512, "window-test-region-boundary");
+        unsigned empty = 0;
+        while (empty < tables && !__atomic_load_n(&level1[index + empty], __ATOMIC_ACQUIRE)) empty++;
+        if (empty == tables) return address;
+        if (!offset) break;
+    }
+    riscv_smp_fail("window-test-no-empty-L0", -1);
+    return 0;
+}
 
 static void root_background(void *unused)
 {
@@ -290,27 +327,25 @@ static void fence_observer(void *unused)
 static void fence_case(void)
 {
     if (!riscv_smp_cpu(1)) return;
-    uint64_t va = RISCV_KERNEL_STACK_WINDOW_BASE + (UINT64_C(1) << 22);
     require(physical_page_allocate(allocator, &fence_page) == PHYSICAL_PAGE_STATUS_OK,
             "RFENCE-page-create");
-    require(riscv_sv39_kernel_window_map(allocator, va, fence_page) == RISCV_SV39_STATUS_OK,
-            "RFENCE-map");
-    uint64_t *root, *level1;
-    require(physical_page_resolve(allocator,
-        (riscv_sv39_current_satp() & ((UINT64_C(1) << 44) - 1)) << 12,
-        (void **)&root) == PHYSICAL_PAGE_STATUS_OK, "RFENCE-root");
-    require(physical_page_resolve(allocator, (root[(va >> 30) & 511] >> 10) << 12,
-        (void **)&level1) == PHYSICAL_PAGE_STATUS_OK, "RFENCE-level1");
-    fence_table = (level1[(va >> 21) & 511] >> 10) << 12;
     require(kernel_thread_create_joinable_mask(fence_observer, 0, &edge_join, 2) ==
             KERNEL_SCHEDULER_STATUS_OK, "RFENCE-observer-create");
+    uintptr_t irq = arch_interrupt_save();
+    uint64_t *level1 = window_level1();
+    uint64_t va = empty_window_l0(level1, 1);
+    require(riscv_sv39_kernel_window_map(allocator, va, fence_page) == RISCV_SV39_STATUS_OK,
+            "RFENCE-map");
+    fence_table = (level1[(va >> 21) & 511] >> 10) << 12;
     uint64_t available = physical_page_available(allocator);
     fence_hold = 1;
     require(riscv_sv39_kernel_window_unmap(allocator, va) == RISCV_SV39_STATUS_OK,
             "RFENCE-unmap");
     fence_hold = 0;
-    require(fence_observed && physical_page_available(allocator) == available + 1,
+    require(fence_observed && !level1[(va >> 21) & 511] &&
+            physical_page_available(allocator) == available + 1,
             "RFENCE-table-release-after-return");
+    arch_interrupt_restore(irq);
     physical_page_release(allocator, fence_page);
     kernel_thread_join(&edge_join);
     virt_uart_puts("BoarOS: SMP delayed RFENCE return retains table and page owners\n");
@@ -319,6 +354,7 @@ static void fence_case(void)
 static void alias_observer(void *unused)
 {
     (void)unused;
+    wait_flag(&alias_mapped, "alias-mapping-ready");
     require(*(volatile uint64_t *)(uintptr_t)alias_address == UINT64_C(0x1111222233334444),
             "alias-original");
     __atomic_store_n(&alias_read, 1, __ATOMIC_RELEASE);
@@ -333,37 +369,50 @@ static void map_failure_and_reuse(void)
     uint64_t pages;
     require(physical_page_allocate_order(allocator, 1, &pages) == PHYSICAL_PAGE_STATUS_OK,
             "map-failure-pages");
-    uint64_t va = RISCV_KERNEL_STACK_WINDOW_BASE + (UINT64_C(5) << 21) - 4096;
-    uint64_t available = physical_page_available(allocator);
-    allocation_attempt = 0;
-    allocation_fail_after = 2;
-    enum riscv_sv39_status status = riscv_sv39_kernel_window_map_pages(allocator, va, pages, 2);
-    allocation_fail_after = 0;
-    require(status == RISCV_SV39_STATUS_NO_MEMORY && allocation_attempt == 2 &&
-            physical_page_available(allocator) == available, "second-table-OOM-rollback");
-    require(riscv_sv39_kernel_window_map_pages(allocator, va, pages, 2) == RISCV_SV39_STATUS_OK &&
-            riscv_sv39_kernel_window_unmap_pages(allocator, va, 2) == RISCV_SV39_STATUS_OK &&
-            physical_page_available(allocator) == available, "OOM-retry-no-partial-leaves");
     if (riscv_smp_cpu(1)) {
         void *data;
         require(physical_page_resolve(allocator, pages, &data) == PHYSICAL_PAGE_STATUS_OK, "alias-page0");
         *(uint64_t *)data = UINT64_C(0x1111222233334444);
         require(physical_page_resolve(allocator, pages + 4096, &data) == PHYSICAL_PAGE_STATUS_OK, "alias-page1");
         *(uint64_t *)data = UINT64_C(0x9999aaaabbbbcccc);
-        alias_address = RISCV_KERNEL_STACK_WINDOW_BASE + (UINT64_C(1) << 23);
-        require(riscv_sv39_kernel_window_map(allocator, alias_address, pages) == RISCV_SV39_STATUS_OK,
-                "alias-map-old");
         require(kernel_thread_create_joinable_mask(alias_observer, 0, &edge_join, 2) ==
                 KERNEL_SCHEDULER_STATUS_OK, "alias-observer-create");
+    }
+    uintptr_t irq = arch_interrupt_save();
+    uint64_t *level1 = window_level1();
+    uint64_t region = empty_window_l0(level1, 2);
+    unsigned first = (region >> 21) & 511;
+    uint64_t va = region + RISCV_SV39_PAGE_SIZE_2M - RISCV_SV39_PAGE_SIZE_4K;
+    uint64_t available = physical_page_available(allocator);
+    allocation_attempt = 0;
+    allocation_fail_after = 2;
+    enum riscv_sv39_status status = riscv_sv39_kernel_window_map_pages(allocator, va, pages, 2);
+    allocation_fail_after = 0;
+    require(status == RISCV_SV39_STATUS_NO_MEMORY && allocation_attempt == 2 &&
+            !level1[first] && !level1[first + 1] &&
+            physical_page_available(allocator) == available, "second-table-OOM-rollback");
+    require(riscv_sv39_kernel_window_map_pages(allocator, va, pages, 2) == RISCV_SV39_STATUS_OK &&
+            riscv_sv39_kernel_window_unmap_pages(allocator, va, 2) == RISCV_SV39_STATUS_OK &&
+            !level1[first] && !level1[first + 1] &&
+            physical_page_available(allocator) == available, "OOM-retry-no-partial-leaves");
+    if (riscv_smp_cpu(1)) {
+        alias_address = empty_window_l0(level1, 1);
+        require(riscv_sv39_kernel_window_map(allocator, alias_address, pages) == RISCV_SV39_STATUS_OK,
+                "alias-map-old");
+        __atomic_store_n(&alias_mapped, 1, __ATOMIC_RELEASE);
         wait_flag(&alias_read, "alias-cached-handshake");
         require(riscv_sv39_kernel_window_unmap(allocator, alias_address) == RISCV_SV39_STATUS_OK &&
                 riscv_sv39_kernel_window_map(allocator, alias_address, pages + 4096) == RISCV_SV39_STATUS_OK,
                 "alias-replace");
         __atomic_store_n(&alias_continue, 1, __ATOMIC_RELEASE);
-        kernel_thread_join(&edge_join);
+        wait_flag(&alias_checked, "alias-replacement-observed");
         require(alias_checked && riscv_sv39_kernel_window_unmap(allocator, alias_address) ==
                 RISCV_SV39_STATUS_OK, "alias-observer-owner-return");
+        require(!level1[(alias_address >> 21) & 511] &&
+            physical_page_available(allocator) == available, "alias-table-owner-return");
     }
+    arch_interrupt_restore(irq);
+    if (riscv_smp_cpu(1)) kernel_thread_join(&edge_join);
     physical_page_release_order(allocator, pages, 1);
     virt_uart_puts("BoarOS: SMP map OOM rollback and stale translation replacement passed\n");
 }
@@ -376,6 +425,8 @@ static void borrowed_exit(void *unused)
 
 static void return_borrow(void *argument)
 {
+    struct kernel_task *borrow = argument;
+    uint64_t borrow_pa = borrow->physical_address;
     if (borrow_migrate) {
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason;
@@ -386,11 +437,19 @@ static void return_borrow(void *argument)
     }
     wait_flag(&borrow_put_allowed, "borrow-put-qualification");
     uintptr_t irq = arch_interrupt_save();
-    scheduler_task_put(argument);
+    scheduler_task_put(borrow);
     if (!kernel_cpu_current()->logical_id) {
+        {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        require(scheduler.retired_pending == 1 && scheduler.retired_tasks &&
-                scheduler.retired_tasks->retirement == 3, "controlled-put-queue-owner");
+        require(scheduler.retired_pending == 1 && scheduler.retired_tasks == borrow &&
+                !borrow->retired_next && borrow->retirement == 3 && !borrow->storage_borrows &&
+                borrow->physical_address == borrow_pa &&
+                borrow->stack_physical_address == KERNEL_THREAD_NO_PAGE && !borrow->wait.on_cpu,
+                "controlled-put-queue-owner");
+        }
+        uint32_t references;
+        require(physical_page_reference_count(allocator, borrow_pa, &references) ==
+                PHYSICAL_PAGE_STATUS_OK && references == 1, "controlled-put-metadata-owner");
         __atomic_store_n(&borrow_owner_checked, 1, __ATOMIC_RELEASE);
     }
     __atomic_store_n(&borrow_put_done, 1, __ATOMIC_RELEASE);
@@ -408,8 +467,10 @@ static void retirement_case(void)
         require(kernel_thread_create_joinable_mask(borrowed_exit, 0, &edge_join, 2) ==
                 KERNEL_SCHEDULER_STATUS_OK, "borrow-target-create");
         struct kernel_task *borrow;
+        uint64_t borrow_pa;
         { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
           borrow = edge_join.task;
+          borrow_pa = borrow->physical_address;
           scheduler_task_get_locked(borrow); }
         __atomic_store_n(&borrow_may_exit, 1, __ATOMIC_RELEASE);
         kernel_thread_join(&edge_join);
@@ -418,6 +479,9 @@ static void retirement_case(void)
                   borrow->stack_physical_address == KERNEL_THREAD_NO_PAGE && !borrow->wait.on_cpu,
                   "borrow-retains-only-storage"); }
         require(physical_page_available(allocator) == available - 1, "borrow-metadata-retained");
+        uint32_t references;
+        require(physical_page_reference_count(allocator, borrow_pa, &references) ==
+                PHYSICAL_PAGE_STATUS_OK && references == 1, "borrow-metadata-physical-owner");
         require(kernel_thread_create_joinable_mask(return_borrow, borrow, &edge_join, route == 1 ? 1 : 2) ==
                 KERNEL_SCHEDULER_STATUS_OK, "borrow-returner-create");
         if (borrow_migrate) {
@@ -438,18 +502,31 @@ static void retirement_case(void)
         }
         /* CPU1归还期间CPU0禁止抢占，检查队列owner；CPU0受控归还则由actor
          * 在IRQ关闭区检查，避免把后续合法idle收集误判为提前释放。 */
-        if (!route) kernel_preempt_disable();
+        uint64_t available_after_create = 0;
+        if (!route) {
+            kernel_preempt_disable();
+            /* The returner's live footprint includes whichever L0 tables
+             * its actual stack placement needed; none may retire on CPU1. */
+            available_after_create = physical_page_available(allocator);
+        }
         __atomic_store_n(&borrow_put_allowed, 1, __ATOMIC_RELEASE);
         wait_flag(&borrow_put_done, "remote-borrow-return");
         if (!route) {
             { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-              require(scheduler.retired_pending == 1 && scheduler.retired_tasks &&
-                      scheduler.retired_tasks->retirement == 3, "remote-put-retirement-owner"); }
-            require(physical_page_available(allocator) == available - 4, "remote-put-no-early-free");
+              require(scheduler.retired_pending == 1 && scheduler.retired_tasks == borrow &&
+                      !borrow->retired_next && borrow->retirement == 3 && !borrow->storage_borrows &&
+                      borrow->physical_address == borrow_pa &&
+                      borrow->stack_physical_address == KERNEL_THREAD_NO_PAGE && !borrow->wait.on_cpu,
+                      "remote-put-retirement-owner"); }
+            require(physical_page_reference_count(allocator, borrow_pa, &references) ==
+                    PHYSICAL_PAGE_STATUS_OK && references == 1, "remote-put-metadata-owner");
+            require(physical_page_available(allocator) == available_after_create, "remote-put-no-early-free");
             kernel_preempt_enable();
         } else require(borrow_owner_checked, "controlled-put-owner-check");
         kernel_thread_join(&edge_join);
         require(physical_page_available(allocator) == available, "borrow-final-owner-return");
+        { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+          require(!scheduler.retired_pending && !scheduler.retired_tasks, "borrow-final-retirement-return"); }
         require(!borrow_gate.registrations && !borrow_gate.borrows, "borrow-wait-owner-return");
     }
     virt_uart_puts("BoarOS: SMP join/retirement borrow and CPU0 collection passed\n");
@@ -925,7 +1002,12 @@ static void orchestrate(void *unused)
     require(physical_page_allocate_order(allocator, 1, &page) == PHYSICAL_PAGE_STATUS_OK,
             "test-pages");
     /* 两页跨2MiB表边界；第二个表准备失败不得提交第一个叶子。 */
-    uint64_t va = RISCV_KERNEL_STACK_WINDOW_BASE + (UINT64_C(1) << 21) - 4096;
+    uintptr_t irq = arch_interrupt_save();
+    uint64_t *level1 = window_level1();
+    uint64_t region = empty_window_l0(level1, 2);
+    unsigned first = (region >> 21) & 511;
+    uint64_t va = region + RISCV_SV39_PAGE_SIZE_2M - RISCV_SV39_PAGE_SIZE_4K;
+    uint64_t available = physical_page_available(allocator);
     require(riscv_sv39_kernel_window_map_pages(allocator, va, page, 2) == RISCV_SV39_STATUS_OK,
             "batch-map");
     if (riscv_smp_cpu(1)) require(!last_fence_address && (!last_fence_size || last_fence_size == UINT64_MAX),
@@ -937,6 +1019,9 @@ static void orchestrate(void *unused)
             *(uint64_t *)physical == 0x12345678, "batch-alias");
     require(riscv_sv39_kernel_window_unmap_pages(allocator, va, 2) == RISCV_SV39_STATUS_OK,
             "batch-unmap");
+    require(!level1[first] && !level1[first + 1] &&
+        physical_page_available(allocator) == available, "batch-table-owner-return");
+    arch_interrupt_restore(irq);
     physical_page_release_order(allocator, page, 1);
     parallel_tasks();
     global_tick_case();

@@ -535,25 +535,40 @@ _Static_assert(KERNEL_STACK_BYTES + BOAROS_PAGE_SIZE ==
 #define KERNEL_STACK_SLOT_COUNT \
     ((uint32_t)(ARCH_KERNEL_STACK_WINDOW_SIZE / ARCH_KERNEL_STACK_SLOT_SIZE))
 #define KERNEL_STACK_SLOT_WORDS ((KERNEL_STACK_SLOT_COUNT + 63U) / 64U)
+#define KERNEL_STACK_ALIAS_PAGES (BOAROS_PAGE_SIZE / sizeof(uint64_t))
+_Static_assert(KERNEL_STACK_ALIAS_PAGES > 1 &&
+                   (KERNEL_STACK_ALIAS_PAGES + 1) % 3 == 0 &&
+                   ARCH_KERNEL_STACK_SLOT_SIZE == 3 * BOAROS_PAGE_SIZE &&
+                   (ARCH_KERNEL_STACK_WINDOW_BASE / BOAROS_PAGE_SIZE) % KERNEL_STACK_ALIAS_PAGES == 0,
+               "stack aliases require an aligned three-page slot geometry");
 static uint64_t kernel_stack_slot_bitmap[KERNEL_STACK_SLOT_WORDS];
 
-static int kernel_stack_slot_acquire(uint64_t *window_address)
+static int kernel_stack_slot_acquire(uint64_t stack_address, uint64_t *window_address)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    /* 线性槽号曾让热栈与ext4对象反复争用QEMU soft-TLB同一槽；
+     * 按物理栈页号分散别名。3的模逆元为(N+1)/3，无同色空槽仍用全容量。 */
+    uint32_t selected = (uint32_t)(((stack_address / BOAROS_PAGE_SIZE - 1) *
+        ((KERNEL_STACK_ALIAS_PAGES + 1) / 3)) & (KERNEL_STACK_ALIAS_PAGES - 1));
+    for (; selected < KERNEL_STACK_SLOT_COUNT; selected += KERNEL_STACK_ALIAS_PAGES) {
+        if (!(kernel_stack_slot_bitmap[selected / 64U] & (UINT64_C(1) << (selected % 64U))))
+            goto found;
+    }
     for (uint32_t word = 0U; word < KERNEL_STACK_SLOT_WORDS; word++) {
         uint64_t free_bits = ~kernel_stack_slot_bitmap[word];
         uint32_t bit = 0U;
 
         if (free_bits == 0U) continue;
         while ((free_bits & (UINT64_C(1) << bit)) == 0U) bit++;
-        if (word * 64U + bit >= KERNEL_STACK_SLOT_COUNT) return -1;
-        kernel_stack_slot_bitmap[word] |= UINT64_C(1) << bit;
-        *window_address = ARCH_KERNEL_STACK_WINDOW_BASE +
-                          (uint64_t)(word * 64U + bit) *
-                              ARCH_KERNEL_STACK_SLOT_SIZE;
-        return 0;
+        selected = word * 64U + bit;
+        if (selected >= KERNEL_STACK_SLOT_COUNT) return -1;
+        goto found;
     }
     return -1;
+found:
+    kernel_stack_slot_bitmap[selected / 64U] |= UINT64_C(1) << (selected % 64U);
+    *window_address = ARCH_KERNEL_STACK_WINDOW_BASE + (uint64_t)selected * ARCH_KERNEL_STACK_SLOT_SIZE;
+    return 0;
 }
 
 static void kernel_stack_slot_release(uint64_t window_address)
@@ -623,7 +638,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
         uint64_t stack_va;
         enum arch_mmu_status map_status;
 
-        if (kernel_stack_slot_acquire(&window) != 0) {
+        if (kernel_stack_slot_acquire(stack_address, &window) != 0) {
             (void)physical_page_release_order(scheduler.allocator,
                                               stack_address,
                                               KERNEL_STACK_ORDER);

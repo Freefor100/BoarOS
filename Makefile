@@ -2279,8 +2279,16 @@ test-files-concurrency-host:
 test-pipe-concurrency-host:
 	sh tests/pipe-concurrency-host.sh
 
+.PHONY: test-scheduler-stack-slots-host
+test-scheduler-stack-slots-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/kernel_stack_slots.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c -Wl,--gc-sections -o build/host/kernel-stack-slots-$$shift; \
+		build/host/kernel-stack-slots-$$shift; \
+	done
+
 .PHONY: test-scheduler-handoff-host
-test-scheduler-handoff-host:
+test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
