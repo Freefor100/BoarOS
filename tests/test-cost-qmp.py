@@ -29,6 +29,7 @@ class QemuPinTest(unittest.TestCase):
                         '-m', '128M', '-smp', str(count), '-display', 'none',
                         '-accel', 'tcg,thread=multi', '-object', 'iothread,id=cost-io', '-S', '-qmp',
                         f'unix:{socket},server=on,wait=off']
+                expected_personality=int(Path('/proc/self/personality').read_text(),16)
                 process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     preexec_fn=lambda: os.sched_setaffinity(0, {host_io}))
@@ -42,6 +43,7 @@ class QemuPinTest(unittest.TestCase):
                         self.assertEqual(row['cpu_index'], index)
                         self.assertEqual(row['host_cpus'], [host_cpus[index]])
                     self.assertTrue(actual['continued_after_pin'])
+                    self.assertEqual(actual['process_personality'],expected_personality)
                     self.assertEqual(len(actual['iothreads']), 1)
                     self.assertEqual(actual['iothreads'][0]['id'], 'cost-io')
                     self.assertEqual(actual['iothreads'][0]['host_cpus'], [host_io])

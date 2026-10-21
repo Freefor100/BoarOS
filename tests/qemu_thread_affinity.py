@@ -68,6 +68,7 @@ def pin_qemu_threads(process, qmp_path, host_vcpus, host_io):
                     'other_threads':[row for row in other if row['tid']!=process.pid]}
             result['iothreads']=[dict(next(item for item in other if item['tid']==row['thread-id']),id=row['id'])
                                  for row in iothreads]
+            result['process_personality']=int((Path('/proc')/str(process.pid)/'personality').read_text(),16)
             command('cont')
             result['continued_after_pin']=True
             return result
