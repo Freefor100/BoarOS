@@ -819,7 +819,7 @@ test-lwext4-cache-host: test-lwext4-exclusion-host test-lwext4-payload-host test
 test-lwext4-group-host:
 	sh tests/lwext4-group-host.sh
 
-.PHONY: test-lwext4-operation-host test-lwext4-port-host test-lwext4-parallel-host
+.PHONY: test-lwext4-operation-host test-lwext4-port-host test-lwext4-parallel-host test-ext4-backend-parallel-host
 test-lwext4-operation-host:
 	sh tests/lwext4-operation-host.sh
 
@@ -828,6 +828,9 @@ test-lwext4-port-host:
 
 test-lwext4-parallel-host: test-lwext4-operation-host test-lwext4-port-host
 	sh tests/lwext4-parallel-host.sh
+
+test-ext4-backend-parallel-host:
+	sh tests/ext4-backend-parallel-host.sh
 
 JOURNAL_GROUP_KERNEL := $(BUILD_DIR)/tests/kernel-journal-group-rv
 JOURNAL_GROUP_RUNTIME_OBJECTS := $(filter-out $(BUILD_DIR)/fs/ext4_backend.o,$(TEST_RUNTIME_OBJECTS)) $(BUILD_DIR)/tests/riscv/journal_group_backend.o

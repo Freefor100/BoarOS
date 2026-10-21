@@ -1017,4 +1017,5 @@ int main(int argc,char **argv)
     assert(!physical_page_allocator_audit(&pages) && !physical_page_allocator_audit(&backend_pages) &&
         physical_page_available(&pages)==baseline && physical_page_available(&backend_pages)==backend_baseline);
     printf("PASS file I/O owners returned: OFD=%zu FD=%zu\n",sizeof(*control),sizeof(struct kernel_files_record));
+    return 0;
 }
