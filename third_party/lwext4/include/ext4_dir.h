@@ -262,6 +262,11 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 			  uint32_t name_len);
 
+/* Modify an entry found in a validated, held writable block. The caller owns
+ * result and must relocate dentry after any rearrangement of that block. */
+int ext4_dir_remove_found(struct ext4_inode_ref *parent,
+                         struct ext4_dir_search_result *result);
+
 /**@brief Try to insert entry to concrete data block.
  * @param sb           Superblock
  * @param inode_ref    Directory i-node

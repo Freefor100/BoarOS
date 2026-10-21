@@ -2994,6 +2994,7 @@ int ext4_rename_child(const char *mount_point,
 	struct ext4_inode_ref old = {0}, new = {0}, source = {0}, victim = {0};
 	struct ext4_inode_ref *destination = old_parent == new_parent ? &old : &new;
 	struct ext4_rename_result output = {0};
+	struct ext4_dir_search_result found = {0};
 	uint32_t source_ino = 0, victim_ino = 0, parent;
 	bool is_dir = false, target_dir = false;
 	bool ordered = fs->os_locks && fs->os_locks->resource_acquire;
@@ -3022,8 +3023,9 @@ int ext4_rename_child(const char *mount_point,
 	}
 	if (!ext4_inode_get_links_cnt(old.inode) ||
 	    !ext4_inode_get_links_cnt(destination->inode)) { r = ENOENT; goto Put; }
-	r = ext4_rename_lookup(&old, old_name, old_len, &source_ino);
+	r = ext4_dir_find_entry(&found, &old, old_name, old_len);
 	if (r != EOK) goto Put;
+	source_ino = ext4_dir_en_get_inode(found.dentry);
 	r = ext4_rename_lookup(destination, new_name, new_len, &victim_ino);
 	if (r != EOK && r != ENOENT) goto Put;
 	if (victim_ino && flags == 1) { r = EEXIST; goto Put; }
@@ -3098,8 +3100,19 @@ int ext4_rename_child(const char *mount_point,
 	if (victim_ino)
 		r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
 	else r = ext4_dir_add_entry(destination, new_name, new_len, &source);
-	/* Adding an entry can split/rearrange the source's directory block. */
-	if (r == EOK) r = ext4_dir_remove_entry(&old, old_name, old_len);
+	/* The held block borrows this transaction's private payload. Same-parent
+	 * insertion may repack it or move the source to a new leaf; discard the
+	 * old entry pointer and scan the current records before deleting. */
+	if (r == EOK && old_parent == new_parent) {
+		found.dentry = NULL;
+		r = ext4_dir_find_in_block(&found.block, sb, old_len, old_name, &found.dentry);
+		if (r == ENOENT) {
+			r = ext4_dir_destroy_result(&old, &found);
+			if (r == EOK) r = ext4_dir_find_entry(&found, &old, old_name, old_len);
+		}
+	}
+	if (r == EOK && ext4_dir_en_get_inode(found.dentry) != source_ino) r = EUCLEAN;
+	if (r == EOK) r = ext4_dir_remove_found(&old, &found);
 	if (r == EOK && is_dir && old_parent != new_parent)
 		r = ext4_dir_reparent(&source, old_parent, new_parent);
 	if (r != EOK) goto Put;
@@ -3125,6 +3138,7 @@ int ext4_rename_child(const char *mount_point,
 		ext4_touch_inode(mp, destination, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 	output.changed = true;
 Put:
+	if (found.block.lb_id) r = ext4_result(r, ext4_dir_destroy_result(&old, &found));
 	if (victim.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&victim));
 	if (source.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&source));
 	if (new.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&new));
