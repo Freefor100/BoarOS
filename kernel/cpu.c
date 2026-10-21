@@ -1,6 +1,29 @@
 #include <kernel/cpu.h>
 #include <kernel/raw_lock.h>
 
+#if BOAROS_MAX_CPUS > 1
+static unsigned boot_count;
+#endif
+void kernel_cpu_set_boot_count(unsigned count)
+{
+    if (!count || count > BOAROS_MAX_CPUS) __builtin_trap();
+#if BOAROS_MAX_CPUS > 1
+    unsigned unpublished=0;
+    if (!__atomic_compare_exchange_n(&boot_count,&unpublished,count,0,
+                                    __ATOMIC_RELEASE,__ATOMIC_RELAXED)) __builtin_trap();
+#endif
+}
+unsigned kernel_cpu_get_boot_count(void)
+{
+#if BOAROS_MAX_CPUS > 1
+    unsigned count=__atomic_load_n(&boot_count,__ATOMIC_ACQUIRE);
+    if (!count) __builtin_trap();
+    return count;
+#else
+    return 1;
+#endif
+}
+
 void kernel_cpu_initialize(struct kernel_cpu *cpu, uint64_t id,
                            struct kernel_io_context *bootstrap_io)
 {

@@ -19,10 +19,10 @@ enum kernel_time_status __wrap_kernel_time_deadline_from_monotonic(uint64_t targ
 
 static struct lwext4_mount_adapter *residual_adapter;
 static unsigned shutdown_entered,recovery_live_accepts;
-int __real_jbd_journal_accept(struct jbd_journal *,struct jbd_trans *,uint64_t);
-int __wrap_jbd_journal_accept(struct jbd_journal *journal,struct jbd_trans *operation,uint64_t now)
+int __real_jbd_journal_accept_state_held(struct jbd_journal *,struct jbd_trans *,uint64_t);
+int __wrap_jbd_journal_accept_state_held(struct jbd_journal *journal,struct jbd_trans *operation,uint64_t now)
 {
-    int result=__real_jbd_journal_accept(journal,operation,now);
+    int result=__real_jbd_journal_accept_state_held(journal,operation,now);
     if (!result && residual_adapter && shutdown_entered && journal->accepted_sequence>journal->checkpoint_sequence) {
         if (!residual_adapter->journal_started)
             fprintf(stderr,"orphan cleanup after workers stopped: accepted=%llu checkpoint=%llu\n",

@@ -13,8 +13,10 @@ static struct kernel_io_context io_context;
 static uint64_t ticks=100, mapped[2];
 static unsigned mapped_count=2;
 uint64_t kernel_cost_clock(void) { return ticks++; }
-uint64_t kernel_cost_lock(void) { return 0; }
-void kernel_cost_unlock(uint64_t s) { (void)s; }
+uint64_t kernel_cost_irq_save(void) { return 0; }
+void kernel_cost_irq_restore(uint64_t s) { (void)s; }
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void) { return &actor; }
 struct kernel_io_context *kernel_io_context_current(void) { return &io_context; }
 void kernel_console_putc(char c) { (void)c; assert(0); }
@@ -93,7 +95,17 @@ int main(void)
     const char *storage_field = strstr(snapshot, "storage_bytes=");
     unsigned long long storage_bytes = 0;
     assert(storage_field && sscanf(storage_field, "storage_bytes=%llu", &storage_bytes) == 1);
-    assert(storage_bytes > 0 && storage_bytes <= 65536);
+    assert(storage_bytes > 0 && storage_bytes <= 96 * 1024);
+    const char *task_field = strstr(snapshot, "task_bytes=");
+    unsigned long long task_bytes = 0;
+    assert(task_field && sscanf(task_field, "task_bytes=%llu", &task_bytes) == 1);
+    size_t guards = 2 + sizeof(io_context.backend_resources.requests) /
+        sizeof(io_context.backend_resources.requests[0]);
+    size_t diagnostics = sizeof(actor) + guards *
+        (sizeof(io_context.backend_guard.cost_start) + sizeof(io_context.backend_guard.cost_registered));
+    assert(task_bytes == diagnostics + (BOAROS_USER_SMP ? 16 : 0) &&
+        task_bytes == KERNEL_COST_TASK_BYTES);
+
     assert(!strstr(snapshot,"heap_zero_ticks.bucket."));
     kernel_heap_release(&heap,fresh);
     for(unsigned i=0;i<2;i++) assert(physical_page_release(&allocator,mapped[i])==0);

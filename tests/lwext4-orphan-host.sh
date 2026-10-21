@@ -12,6 +12,21 @@ cc=${HOST_CC:-cc}
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread \
     -Wl,--wrap=malloc -Wl,--wrap=calloc,--wrap=ext4_bcache_find_get -o "$work/probe"
 printf 'persistent orphan fixture' > "$work/data"
+for block in 1024 4096; do
+    truncate -s 32M "$work/slot-base.img"
+    mkfs.ext4 -q -F -b "$block" -O orphan_file "$work/slot-base.img"
+    orphan_ino=$(dumpe2fs -h "$work/slot-base.img" 2>/dev/null | sed -n 's/^Orphan file inode:[[:space:]]*//p')
+    debugfs -w -R "punch <$orphan_ino> 1 4294967295" "$work/slot-base.img" >/dev/null 2>&1
+    debugfs -w -R "set_inode_field <$orphan_ino> size $block" "$work/slot-base.img" >/dev/null 2>&1
+    for name in a b c; do
+        debugfs -w -R "write $work/data /$name" "$work/slot-base.img" >/dev/null 2>&1
+    done
+    for action in slot-reuse slot-reuse-multiple slot-reuse-group slot-reuse-group-multiple; do
+        cp "$work/slot-base.img" "$work/slot-reuse.img"
+        timeout 30 "$work/probe" "$work/slot-reuse.img" "$action"
+        e2fsck -fn "$work/slot-reuse.img" >/dev/null
+    done
+done
 for features in '^orphan_file' orphan_file 'orphan_file,^metadata_csum_seed' 'orphan_file,^metadata_csum,^metadata_csum_seed'; do
     image="$work/$features.img"
     truncate -s 32M "$image"
@@ -20,6 +35,12 @@ for features in '^orphan_file' orphan_file 'orphan_file,^metadata_csum_seed' 'or
         debugfs -w -R "write $work/data /$name" "$image" >/dev/null 2>&1
     done
     cp "$image" "$work/base-$features.img"
+    if [ "$features" != '^orphan_file' ]; then
+        cp "$image" "$work/sibling.img"
+        timeout 30 "$work/probe" "$work/sibling.img" sibling-private
+        timeout 30 "$work/probe" "$work/sibling.img" drain
+        e2fsck -fn "$work/sibling.img" >/dev/null
+    fi
     timeout 30 "$work/probe" "$image" readonly
     cp "$image" "$work/lookup.img"
     timeout 30 "$work/probe" "$work/lookup.img" lookup

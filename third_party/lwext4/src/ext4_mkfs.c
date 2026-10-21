@@ -548,7 +548,7 @@ static int alloc_inodes(struct ext4_fs *fs)
 			break;
 		}
 
-		r = ext4_fs_alloc_inode(fs, &inode_ref, filetype);
+		r = ext4_fs_alloc_inode(fs, &inode_ref, filetype, 0, NULL, 0);
 		if (r != EOK)
 			return r;
 

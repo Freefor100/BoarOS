@@ -13,10 +13,11 @@ import shutil
 import subprocess
 import tempfile
 from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_scheduler, validate_resume_selection
-from cost_report import validate_metadata_fixed
+from cost_report import validate_metadata_fixed, schema
 from cost_seed import replica_seed, seed_arguments, validate_resume_seed
 from cost_fixture import FrozenFixture, validate_resume_fixture
 from cost_measurement import acquire_measurement_lock
+from qemu_thread_affinity import pin_qemu_threads, host_cpu_selection, host_cpu_topology
 ROOT=Path(__file__).resolve().parents[1]
 CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator','scheduler')
 IMPLEMENTED=set(CASES)
@@ -41,7 +42,10 @@ def main():
     parser.add_argument('--output',type=Path)
     parser.add_argument('--fixture-cache',type=Path,help='freeze and reuse preboot images for allocator/latency/locking/scheduler')
     parser.add_argument('--metadata-fixed-only',action='store_true',help='fixed namespace work, no original consumers')
+    parser.add_argument('--metadata-parallel',action='store_true',help='add paired fixed-total-work lookup, rename and append windows')
     parser.add_argument('--cpus',type=int,choices=(1,2),default=1)
+    parser.add_argument('--host-vcpu-cpus',help='comma-separated physical host CPUs, one per guest CPU; QMP pins before guest start')
+    parser.add_argument('--host-io-cpu',type=int,default=4,help='host CPU for the QEMU main/I/O threads when vCPU pinning is enabled')
     parser.add_argument('--ram',choices=('512M','1G'),default='512M')
     parser.add_argument('--metadata-core-only',action='store_true',help='accept only fixed metadata/lmbench measurements from a frozen coordinator; retain failed extra consumer attempts explicitly')
     parser.add_argument('--two-disks',action='store_true')
@@ -63,8 +67,13 @@ def main():
         parser.error('paired QEMU seed applies only to fixture measurements')
     if args.metadata_fixed_only and (args.case!='metadata' or args.metadata_core_only or args.platform_config!='fixture'):
         parser.error('fixed metadata requires metadata fixture mode')
-    if args.cpus!=1 and not args.metadata_fixed_only:
-        parser.error('two CPUs currently require fixed metadata mode')
+    if args.metadata_parallel and not args.metadata_fixed_only:
+        parser.error('parallel metadata requires fixed metadata mode')
+    try:host_vcpus=host_cpu_selection(args.host_vcpu_cpus,args.cpus,args.host_io_cpu)
+    except ValueError as error:parser.error(str(error))
+    if host_vcpus and not args.metadata_fixed_only:parser.error('host thread pinning currently requires fixed metadata mode')
+    if args.cpus!=1 and not args.metadata_fixed_only and args.case!='contract':
+        parser.error('two CPUs require contract or fixed metadata mode')
     if args.fixture_cache and (args.case not in ('allocator','latency','locking','scheduler') and not args.metadata_fixed_only or
             args.two_disks or args.linux or args.platform_config!='fixture'):
         parser.error('frozen fixture requires one supported single-disk BoarOS fixture case')
@@ -102,14 +111,20 @@ def main():
         'diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=ROOT)).hexdigest(),
         'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
         'qemu_sha256':digest(shutil.which(args.qemu)), 'cost_diagnostics':0 if args.off else 1,
-        'metadata_fixed_only':args.metadata_fixed_only,'guest_cpus':args.cpus,'guest_ram':args.ram,
+        'metadata_fixed_only':args.metadata_fixed_only,'metadata_parallel':args.metadata_parallel,
+        'host_vcpu_cpus':host_vcpus,'host_io_cpu':args.host_io_cpu if host_vcpus else None,
+        'guest_cpus':args.cpus,'guest_ram':args.ram,
         'replicas':args.replicas,'acceptance':args.replicas>=3,'transport':args.transport,'cache':args.cache,'two_disks':args.two_disks,'platform_config':args.platform_config,'platform':'linux' if args.linux else 'boaros','linux_reference':linux_identity}
+    if host_vcpus:
+        identity['host_cpu_topology']=host_cpu_topology(host_vcpus+[args.host_io_cpu])
     kernel=work/'kernel'; shutil.copyfile(args.kernel,kernel); identity['kernel_sha256']=digest(kernel)
     bios=work/'firmware'; shutil.copyfile(args.bios,bios); identity['firmware_sha256']=digest(bios)
     if args.kernel_identity:
         build_identity=json.loads(args.kernel_identity.read_text())
         if build_identity['kernel_sha256']!=identity['kernel_sha256']:raise ValueError('kernel build identity mismatch')
         identity['kernel_build_identity']=build_identity
+    if not args.off:
+        identity['metric_schema']=identity.get('kernel_build_identity',{}).get('metric_schema',schema())
     identity['root_drain_fixture']=args.root_drain_fixture
     identity['trace_read_lbas']=args.trace_read_lbas
     original=None
@@ -129,6 +144,7 @@ def main():
             program=work/(case+'.elf')
             if args.coordinator_elf:shutil.copyfile(args.coordinator_elf,program)
             else:run([str(compiler),'-fno-link-libatomic','-static','-O2','-pthread','-Wall','-Wextra','-Werror',
+                *(['-DCOST_END_WAIT_ASYNC=1'] if args.cpus==2 else []),
                 str(ROOT/'tests/workloads/cost'/f'{case}.c'),'-o',str(program)])
             if case=='metadata' and not args.metadata_fixed_only:
                 identity['lmbench_elf_sha256']={}
@@ -136,7 +152,8 @@ def main():
                     elf=work/(libc+'-lmbench_all')
                     run(['debugfs','-R',f'dump /{libc}/lmbench_all {elf}',str(original)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                     identity['lmbench_elf_sha256'][libc]=digest(elf)
-            fixture=FrozenFixture(args.fixture_cache,case,digest(program)) if args.fixture_cache else None
+            fixture_directory=args.fixture_cache/'parallel' if args.fixture_cache and args.metadata_parallel else args.fixture_cache
+            fixture=FrozenFixture(fixture_directory,case,digest(program)) if fixture_directory else None
             for replica in range(args.replicas):
                 qemu_seed=replica_seed(args.qemu_seed,replica)
                 folder=work/f'{case}-{replica}'; folder.mkdir(exist_ok=bool(args.resume_from))
@@ -150,6 +167,9 @@ def main():
                                       'trace_read_lbas':args.trace_read_lbas,'metadata_fixed_only':args.metadata_fixed_only,
                                       'guest_cpus':args.cpus,'guest_ram':args.ram}.items():
                         if record[key]!=value:raise ValueError('resume input differs: '+key)
+                    if record.get('metadata_parallel',False)!=args.metadata_parallel:raise ValueError('resume metadata work differs')
+                    if record.get('host_vcpu_cpus')!=host_vcpus or record.get('host_io_cpu')!=(args.host_io_cpu if host_vcpus else None):
+                        raise ValueError('resume host affinity differs')
                     validate_resume_selection(case,record,selected)
                     validate_resume_seed(record,qemu_seed)
                     if fixture:
@@ -174,6 +194,8 @@ def main():
                         contents=f'write {program} /init\nset_inode_field /init mode 0100755\n'
                         if args.metadata_fixed_only:
                             flag=folder/'metadata-fixed';flag.write_text('fixed namespace work\n');contents+=f'write {flag} /cost-metadata-fixed\n'
+                            if args.metadata_parallel:
+                                flag=folder/'metadata-parallel';flag.write_text('paired fixed-total work\n');contents+=f'write {flag} /cost-metadata-parallel\n'
                         if case=='consumer':
                             nonce=folder/'replica-id';nonce.write_text(str(replica)+'\n');contents+=f'write {nonce} /cost-replica\n'
                             policy=folder/'consumer-budget';policy.write_text(str(args.consumer_timeout_ms)+'\n')
@@ -239,14 +261,19 @@ def main():
                     dtb=folder/'boot.dtb'; probe=list(invocation); probe[probe.index('-machine')+1]='virt,dumpdtb='+str(dtb)
                     run(probe,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                     record['dtb_sha256']=digest(dtb); invocation+=['-dtb',str(dtb)]
-                    record['argv']=invocation
-                    frozen=json.dumps(record,sort_keys=True,separators=(',',':'))+'\n'
-                    (folder/'input.json').write_text(frozen)
-                    record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
-                    with (folder/'boot.log').open('w') as boot_log:
-                        result=subprocess.Popen(invocation,stdin=subprocess.DEVNULL,stdout=boot_log,stderr=subprocess.STDOUT,text=True)
-                        try: returncode=result.wait(timeout=180 if args.metadata_fixed_only else 16*args.consumer_timeout_ms/1000+120 if case in ('consumer','metadata') else 180)
-                        except subprocess.TimeoutExpired:
+                    with tempfile.TemporaryDirectory(prefix='cost-qmp.') as qmp_temporary, (folder/'boot.log').open('w') as boot_log:
+                        qmp_path=Path(qmp_temporary)/'control'
+                        if host_vcpus:invocation+=['-S','-qmp',f'unix:{qmp_path},server=on,wait=off']
+                        record['argv']=invocation
+                        result=subprocess.Popen(invocation,stdin=subprocess.DEVNULL,stdout=boot_log,stderr=subprocess.STDOUT,text=True,
+                            preexec_fn=(lambda:os.sched_setaffinity(0,{args.host_io_cpu})) if host_vcpus else None)
+                        try:
+                            if host_vcpus:record['host_thread_affinity']=pin_qemu_threads(result,qmp_path,host_vcpus,args.host_io_cpu)
+                            frozen=json.dumps(record,sort_keys=True,separators=(',',':'))+'\n'
+                            (folder/'input.json').write_text(frozen)
+                            record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
+                            returncode=result.wait(timeout=180 if args.metadata_fixed_only else 16*args.consumer_timeout_ms/1000+120 if case in ('consumer','metadata') else 180)
+                        except BaseException:
                             result.kill();result.wait();raise
                 output=(folder/'boot.log').read_text()
                 if returncode or output.count(f'COST PASS {case}\n')!=1 or 'cost contract failed' in output or 'cost workload failed' in output or (not args.linux and ('PID 1 exited status=0x0' not in output or 'heap-live=0x0' not in output)):
@@ -279,7 +306,7 @@ def main():
                     elif line=='COST END':
                         if current is None: raise ValueError('extra snapshot end')
                         name,epoch=current
-                        registry=identity.get('kernel_build_identity',{}).get('metric_schema')
+                        registry=identity.get('metric_schema')
                         snap=parse('\n'.join(body),epoch,[tuple(metric) for metric in registry] if registry is not None else None)
                         if name in expectations: validate_expected(snap,expectations[name])
                         if snapshots and epoch<=snapshots[-1]['values']['epoch']: raise ValueError('stale epoch')
@@ -311,7 +338,7 @@ def main():
                     if args.consumer_readers:required|={f'readers-{relation}-{hot}' for relation in (0,1) for hot in (0,1)}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('consumer coverage')
                 if case=='metadata' and args.metadata_fixed_only:
-                    record['fixed_metrics']=validate_metadata_fixed(output,timings,args.cpus)
+                    record['fixed_metrics']=validate_metadata_fixed(output,timings,args.cpus,parallel=args.metadata_parallel)
                     record['actual_scope']='fixed namespace work including final directory sync'
                     if not args.off and {v['name'] for v in snapshots}!=set(timings):
                         raise ValueError('fixed metadata diagnostic coverage')

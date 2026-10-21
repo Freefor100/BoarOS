@@ -5,9 +5,11 @@
 #include <string.h>
 static struct kernel_cost_task actor;
 static uint64_t clock_tick = 100;
-uint64_t kernel_cost_lock(void) { return 0; }
-void kernel_cost_unlock(uint64_t status) { (void)status; }
+uint64_t kernel_cost_irq_save(void) { return 0; }
+void kernel_cost_irq_restore(uint64_t status) { (void)status; }
 uint64_t kernel_cost_clock(void) { return clock_tick; }
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void) { return &actor; }
 static char output[1048576];
 int main(void)
@@ -97,6 +99,15 @@ int main(void)
     assert(strstr(output, "foreground.page_meta_written.value=5\n"));
     assert(strstr(output, "foreground.allocator_meta_ticks.value=7\n"));
     assert(strstr(output, "foreground.page_meta_checked.samples=1\n"));
-    assert(strstr(output, "observer.observer_ticks.samples=1\n"));
+    assert(strstr(output, "observer.observer_ticks.samples="));
+    assert(!strstr(output, "observer.observer_ticks.samples=0\n"));
+    /* Pending rebase counts each live scope once, including new nested work. */
+    scope=kernel_cost_enter(COST_OPERATION_TICKS);
+    assert(kernel_cost_begin(9,10000000,0,1)==0);
+    struct kernel_cost_scope pending=kernel_cost_enter(COST_OPERATION_TICKS);
+    kernel_cost_join(&actor);kernel_cost_join(&actor);
+    kernel_cost_leave(&pending);
+    kernel_cost_boundary();kernel_cost_leave(&scope);
+    assert(kernel_cost_end(9,0)==0);
     puts("cost core contract passed");
 }

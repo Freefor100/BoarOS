@@ -67,12 +67,24 @@ int memcmp(const void *left, const void *right, size_t size)
 {
     const unsigned char *left_bytes = left;
     const unsigned char *right_bytes = right;
-    size_t index;
-
-    for (index = 0U; index < size; index++) {
-        if (left_bytes[index] != right_bytes[index]) {
-            return (int)left_bytes[index] - (int)right_bytes[index];
+    const size_t width = sizeof(memory_word);
+    /* Metadata comparisons usually cover equal aligned records or blocks.
+     * Compare complete words in bounds; resolve a differing word bytewise so
+     * ordering stays unsigned-byte ordering on either endianness. */
+    while (size && ((uintptr_t)left_bytes & (width - 1U))) {
+        if (*left_bytes != *right_bytes) return (int)*left_bytes - (int)*right_bytes;
+        left_bytes++; right_bytes++; size--;
+    }
+    if (!((uintptr_t)right_bytes & (width - 1U))) {
+        while (size >= width) {
+            if (*(const memory_word *)(const void *)left_bytes !=
+                *(const memory_word *)(const void *)right_bytes) break;
+            left_bytes += width; right_bytes += width; size -= width;
         }
+    }
+    while (size--) {
+        if (*left_bytes != *right_bytes) return (int)*left_bytes - (int)*right_bytes;
+        left_bytes++; right_bytes++;
     }
 
     return 0;

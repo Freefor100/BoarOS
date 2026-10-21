@@ -52,39 +52,64 @@ extern "C" {
 #include <ext4_debug.h>
 
 #include <ext4_blockdev.h>
+#include <ext4_operation.h>
 
 /********************************OS LOCK INFERFACE***************************/
 
 /**@brief   OS dependent lock interface.*/
 struct ext4_lock {
 
-	/**@brief   Lock access to mount point.*/
+	/* Enter the backend operation. Legacy ports serialize the mount here;
+     * parallel ports retain call qualification while object/resource locks
+     * protect the actual directory, inode and allocation mutations. */
 	void (*lock)(void *context);
 
 	/**@brief   Unlock access to mount point.*/
 	void (*unlock)(void *context);
 	void (*read_lock)(void *context);
-	uintptr_t (*owner)(void *context);
+	/* True only while this caller holds the actual sleeping mount writer.
+	 * It stabilizes running/index owners through private preparation/accept. */
+	bool (*serial_writer)(void *context);
 	void *context;
+	void (*state_lock)(void *context);
+	/* Read-only snapshots borrow accepted records until state_unlock. A port
+	 * without shared qualification keeps using its exclusive state_lock. */
+	void (*state_read_lock)(void *context);
+	void (*state_unlock)(void *context);
+	int (*resource_acquire)(void *context, struct ext4_operation *operation,
+	                        enum ext4_resource_kind kind, uint32_t key);
+	int (*resource_claim_inode)(void *context, struct ext4_operation *operation,
+	                            uint32_t inode);
+	void (*resource_release)(void *context);
+	bool (*resource_retry)(void *context);
 };
 
-/* Runtime callbacks run with the mount modification lock held. wait() must
- * release that lock while sleeping and reacquire it before returning. */
+/* now_ns supplies a bounded clock snapshot. request() carries actual COMMIT /
+ * CHECKPOINT consumer bits: first running/deadline or due work requests COMMIT,
+ * actionable reclaim requests CHECKPOINT. Ordinary merges do not reset timers.
+ * request() and wait() run outside shared journal-state protection. wait()
+ * releases any legacy mount qualification before sleeping and restores it
+ * before returning. */
 enum ext4_journal_wait {
 	EXT4_JOURNAL_WAIT_SEALED,
 	EXT4_JOURNAL_WAIT_DURABLE,
 	EXT4_JOURNAL_WAIT_CHECKPOINT,
 };
+enum ext4_journal_work {
+	EXT4_JOURNAL_WORK_COMMIT = 1,
+	EXT4_JOURNAL_WORK_CHECKPOINT = 2,
+};
 struct ext4_journal_runtime {
 	void *context;
 	uint64_t (*now_ns)(void *context);
-	void (*request)(void *context);
+	void (*request)(void *context, unsigned work);
 	int (*wait)(void *context, uint64_t sequence, enum ext4_journal_wait kind);
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);
-/* A runtime supplies one consumer for each stage. Freezing and retirement use
- * the mount lock; each consumer owns its immutable images during device I/O.
+/* A runtime supplies one consumer for each stage. Selection, freezing and
+ * retirement publish shared state under state_lock. Consumers retain exact
+ * immutable image references across device I/O outside that protection.
  * service() drives either stage synchronously when no runtime is supplied. */
 int ext4_journal_group_service(const char *mount_point, bool force);
 int ext4_journal_group_commit(const char *mount_point, bool force);
@@ -138,12 +163,13 @@ struct ext4_timestamp {
 typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
 /* Adapter-owned live inode times. Stores are tentative until the outer
  * transaction completes. Handle stores borrow time_owner; namespace stores
- * pass NULL. Callbacks run under the mount write lock. */
+ * pass NULL. The store callback attaches its records to the current operation;
+ * finish receives only that operation's records, after journal acceptance. */
 struct ext4_time_observer {
     void *context;
     void (*store)(void *context, void *owner, uint32_t inode, unsigned field,
                   struct ext4_timestamp value);
-    void (*finish)(void *context, bool accepted);
+    void (*finish)(void *context, void *staged_times, bool accepted);
     unsigned (*snapshot)(void *owner, struct ext4_timestamp times[3]);
     void (*written)(void *owner, unsigned fields,
                     const struct ext4_timestamp times[3], int result);
@@ -173,8 +199,6 @@ int ext4_file_writeback_times(ext4_file *file, bool wait);
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
-/* Creation permission setup preserves the inode creation timestamps. */
-int ext4_file_set_mode_initial(ext4_file *file, uint32_t mode);
 /* Live inode owner update, set-ID/capability removal and ctime share one
  * operation transaction. UINT32_MAX preserves the corresponding ID. */
 int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid);
@@ -282,8 +306,9 @@ int ext4_journal_stop(const char *mount_point);
 
 /* Group modifications into one journal transaction. Calls nest; a failed
  * inner transaction poisons the outer transaction, which restores its in-memory
- * state when its last level ends. The caller serializes access to this mount.
- * These explicit grouping APIs require an active journal. After an outer
+ * state when its last level ends. The caller holds the actual directory,
+ * inode and resource qualifications for its operation; independent tasks own
+ * independent contexts. These explicit grouping APIs require an active journal. After an outer
  * abort, reopen file handles modified within that group before reusing their
  * cached size/position. Passing zero to abort reports ECANCELED. */
 int ext4_transaction_begin(const char *mount_point);
@@ -413,8 +438,8 @@ struct ext4_rename_result {
 };
 
 /* Rename one directory entry without resolving an absolute pathname. Flags
- * are 0 or 1 (NOREPLACE). Requires an active journal and serialized namespace
- * access. A replaced inode keeps its contents; its last link is transferred
+ * are 0 or 1 (NOREPLACE). Requires an active journal and caller-held
+ * namespace qualifications for the affected directories and inodes. A replaced inode keeps its contents; its last link is transferred
  * to the persistent orphan owner until the caller releases live references.
  * Results are published only on success. Within an outer transaction they
  * remain provisional until that transaction commits. */
@@ -529,7 +554,8 @@ int ext4_file_complete_write(ext4_file *file);
  *
  * @return  Standard error code.*/
 int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt);
-/* Positioned data read; mount read lock excludes every writer. */
+/* Positioned data read. The caller stabilizes the inode mapping; returned
+ * bytes borrow exact payload versions while accepted cache versions advance. */
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt);
 /* At most FILE_READ_BATCH_MAX disjoint outputs; every span reports a contiguous prefix.
  * Reads consult cache versions, including dirty and journal-pending data.
@@ -805,8 +831,13 @@ int ext4_dir_open_file(ext4_file *file, const char *path);
 int ext4_chrdev_open_file(ext4_file *file, const char *path);
 int ext4_fopen_inode(ext4_file *file, const char *mount_point,
                      uint32_t inode_number);
+/* The file output is published only on success. Optional initial attributes
+ * are caller scratch filled before releasing the new inode reference, not a
+ * disk/checksum image. Discard them on failure; a successful result remains
+ * provisional until an outer transaction accepts it. */
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
-    uint32_t mode, uint32_t device, const char *target, ext4_file *output);
+    uint32_t mode, uint32_t device, const char *target, ext4_file *output,
+    struct ext4_inode *initial);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,

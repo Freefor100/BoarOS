@@ -11,6 +11,34 @@
 void *boaros_memcpy(void *, const void *, size_t);
 void *boaros_memmove(void *, const void *, size_t);
 void *boaros_memset(void *, int, size_t);
+int boaros_memcmp(const void *, const void *, size_t);
+static void fill(unsigned char *, size_t);
+
+static int sign(int value) { return (value > 0) - (value < 0); }
+static void comparisons(void)
+{
+    unsigned char left[4160], right[4160];
+    const size_t large[] = {255, 256, 257, 4095, 4096, 4097};
+    fill(left, sizeof(left));
+    for (size_t a = 0; a < 2 * sizeof(uintptr_t); a++)
+        for (size_t b = 0; b < 2 * sizeof(uintptr_t); b++)
+            for (size_t which = 0; which < 130 + sizeof(large) / sizeof(large[0]); which++) {
+                size_t size = which < 130 ? which : large[which - 130];
+                memcpy(right + b, left + a, size);
+                assert(!boaros_memcmp(left + a, right + b, size));
+                if (!size) continue;
+                size_t positions[] = {0, size / 2, size - 1};
+                for (unsigned i = 0; i < 3; i++) {
+                    size_t at = positions[i]; unsigned char saved = right[b + at];
+                    right[b + at] ^= 0x80;
+                    assert(sign(boaros_memcmp(left + a, right + b, size)) ==
+                           sign(memcmp(left + a, right + b, size)));
+                    assert(sign(boaros_memcmp(right + b, left + a, size)) ==
+                           sign(memcmp(right + b, left + a, size)));
+                    right[b + at] = saved;
+                }
+            }
+}
 
 static void fill(unsigned char *bytes, size_t size)
 {
@@ -93,6 +121,7 @@ static void boundaries(void)
             assert(boaros_memcpy(actual + starts[to], source + starts[from], size) ==
                    actual + starts[to]);
             assert(!memcmp(actual, expected, page));
+            assert(!boaros_memcmp(source + starts[from], actual + starts[to], size));
         }
         for (unsigned end = 0; end < 2; end++) {
             fill(actual, page);
@@ -116,8 +145,9 @@ static void boundaries(void)
 int main(void)
 {
     alignments();
+    comparisons();
     overlaps();
     boundaries();
-    puts("RAM copy/fill alignments, overlap directions and guard-page boundaries verified");
+    puts("RAM compare/copy/fill alignments, ordering, overlap directions and guard-page boundaries verified");
     return 0;
 }

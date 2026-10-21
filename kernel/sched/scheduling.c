@@ -285,7 +285,9 @@ void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
 static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
 {
 #if BOAROS_COST_DIAGNOSTICS
-    if (cpu->current) kernel_cost_account(&cpu->current->cost);
+    uint64_t cost_irq=kernel_cost_lock();
+    if (cpu->cost.running) kernel_cost_account(cpu->cost.running);
+    kernel_cost_unlock(cost_irq);
 #endif
     if (now < cpu->rt_bandwidth.last_account_ns) __builtin_trap();
     uint64_t delta = now - cpu->rt_bandwidth.last_account_ns;

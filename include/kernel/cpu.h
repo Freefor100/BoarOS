@@ -4,6 +4,7 @@
 #include <arch/switch_context.h>
 #include <kernel/sched_policy.h>
 #include <kernel/cpu_config.h>
+#include <kernel/cost.h>
 #if BOAROS_MAX_CPUS > 1
 #include <kernel/sched_runqueue.h>
 #endif
@@ -26,6 +27,9 @@ struct kernel_cpu {
     /* 定位校验与本地raw状态靠近current；远程请求保留在记录尾部。 */
     struct kernel_raw_guard *raw_locks;
     uint32_t initialized, preempt_depth;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_cpu cost;
+#endif
     struct kernel_task *switch_previous;
     /* 由实际栈交接转移；current可提前发布下一任务。 */
     struct kernel_task *accounting_owner;
@@ -67,6 +71,9 @@ struct kernel_cpu {
 #endif
 #endif
 };
+#if BOAROS_COST_DIAGNOSTICS
+_Static_assert(offsetof(struct kernel_cpu, cost) == 32, "cost assembly CPU prefix");
+#endif
 #if BOAROS_MAX_CPUS > 1
 static inline int kernel_cpu_online(const struct kernel_cpu *cpu)
 { return __atomic_load_n(&cpu->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_ONLINE; }
@@ -77,6 +84,10 @@ static inline struct kernel_cpu *kernel_cpu_current(void)
     if (!cpu || cpu->initialized != KERNEL_CPU_INITIALIZED) __builtin_trap();
     return cpu;
 }
+/* Validated boot topology, published before mounts and unchanged thereafter.
+ * This counts configured executors, including secondaries not yet started. */
+void kernel_cpu_set_boot_count(unsigned count);
+unsigned kernel_cpu_get_boot_count(void);
 void kernel_cpu_initialize(struct kernel_cpu *, uint64_t, struct kernel_io_context *);
 void kernel_cpu_boot_initialize(uint64_t hardware_id);
 void kernel_cpu_boot_rebind(void);

@@ -10,6 +10,7 @@
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
+#include <kernel/time.h>
 #include <ext4_bcache.h>
 #include "../../fs/lwext4_port.h"
 #include <kernel/file_mapping.h>
@@ -33,6 +34,13 @@ void mm_test_bind_files(struct kernel_files *);
 void mm_test_finish(void);
 void mm_test_activate_task(void);
 extern _Thread_local uint64_t mm_test_context;
+#if !defined(TCP_IO_CASES) && !defined(LOOP_IO_CASES) && !defined(FALLOCATE_SYNC_CASES)
+enum kernel_time_status __wrap_kernel_time_deadline_from_monotonic(uint64_t target,uint64_t *deadline)
+{
+    *deadline=target;
+    return target<=kernel_time_monotonic_ns()?KERNEL_TIME_STATUS_DEADLINE_PASSED:KERNEL_TIME_STATUS_OK;
+}
+#endif
 #ifdef LOOP_IO_CASES
 static unsigned char arena[64*1024*1024] __attribute__((aligned(16384)));
 #else
@@ -189,6 +197,113 @@ static void futex_pin_case(void)
     struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);
     assert(!state.pins && !state.write_pins && !state.pending_retirement);
     puts("PASS futex registration vs actual mprotect: pin survives final comparison, unpin precedes park, exact wake and final owners");
+}
+unsigned mm_test_parked(unsigned);
+enum robust_futex_mode { ROBUST_FUTEX_OWNER_DIED, ROBUST_FUTEX_PENDING_UNLOCK,
+                         ROBUST_FUTEX_BEFORE_WAIT };
+struct robust_futex_user {
+    uint64_t next;
+    int64_t offset;
+    uint64_t pending,entry_next;
+    uint32_t word;
+};
+struct robust_futex_case {
+    enum robust_futex_mode mode;
+    int32_t owner_tid;
+    unsigned park_before,cleaned;
+};
+#define ROBUST_FUTEX_WORD (FUTEX_ADDRESS+offsetof(struct robust_futex_user,word))
+static void robust_futex_owners_returned(void)
+{
+    struct kernel_task *task=kernel_task_current();
+    struct kernel_wait_node *node=&task->default_wait_node;
+    assert(!task->robust_list_head && !task->futex_bitset &&
+        !task->futex_key.identity && !task->futex_key.offset && !task->futex_key.shared_object &&
+        task->futex_key.kind==KERNEL_FUTEX_KEY_PRIVATE);
+    /* wait_finish清除token绑定；record.generation自身仍保留历史代号。 */
+    assert(task->wait.phase==KERNEL_WAIT_FINISHED && task->wait.on_cpu &&
+        !task->wait.nodes && !task->wait.borrows && !task->wait.deadline &&
+        !task->wait.interruptible && !task->wait.ready_pending &&
+        !node->generation && !node->token_next && !node->queue &&
+        !node->borrow_owner && !node->references);
+    assert(!kernel_io_context_current()->user_pins && !kernel_cpu_current()->raw_locks);
+}
+static void *robust_futex_waiter(void *opaque)
+{
+    struct robust_futex_case *test=opaque;
+    mm_test_attach(1);mm_test_bind(&mm);mm_test_context=context;
+    struct kernel_task *task=kernel_task_current();task->tid=test->owner_tid+1;
+    if(test->mode==ROBUST_FUTEX_BEFORE_WAIT)
+        while(!__atomic_load_n(&test->cleaned,__ATOMIC_ACQUIRE))sched_yield();
+    uint32_t expected=test->mode==ROBUST_FUTEX_PENDING_UNLOCK?0:
+        (uint32_t)test->owner_tid|UINT32_C(0x80000000);
+    uintptr_t irq=arch_interrupt_save();enum kernel_scheduler_status status;
+    int64_t result=kernel_futex(task,ROBUST_FUTEX_WORD,0,expected,0,0,0,&status);
+    assert(status==KERNEL_SCHEDULER_STATUS_OK &&
+        result==(test->mode==ROBUST_FUTEX_BEFORE_WAIT?-KERNEL_EAGAIN:0));
+    arch_interrupt_restore(irq);
+    assert(mm_test_parked(1)==test->park_before+(test->mode!=ROBUST_FUTEX_BEFORE_WAIT));
+    assert((task->wait.generation!=0)==(test->mode!=ROBUST_FUTEX_BEFORE_WAIT));
+    robust_futex_owners_returned();mm_test_finish();return NULL;
+}
+static void *robust_futex_owner(void *opaque)
+{
+    struct robust_futex_case *test=opaque;
+    mm_test_attach(2);mm_test_bind(&mm);mm_test_context=context;
+    struct kernel_task *task=kernel_task_current();task->tid=test->owner_tid;
+    kernel_futex_set_robust_list(task,FUTEX_ADDRESS);
+    assert(kernel_futex_get_robust_list(task)==FUTEX_ADDRESS);
+    if(test->mode!=ROBUST_FUTEX_BEFORE_WAIT) {
+        /* 只在真实wait_park提交后清理；用户ready或等待时长不能证明已登记。 */
+        while(mm_test_parked(1)==test->park_before)sched_yield();
+        assert(mm_test_parked(1)==test->park_before+1);
+    }
+    uintptr_t irq=arch_interrupt_save();
+    assert(task->tid==test->owner_tid);
+    kernel_futex_release_robust(task,task->tid);
+    assert(!kernel_futex_get_robust_list(task));
+    arch_interrupt_restore(irq);
+    robust_futex_owners_returned();
+    __atomic_store_n(&test->cleaned,1,__ATOMIC_RELEASE);
+    mm_test_finish();return NULL;
+}
+static void futex_robust_cases(void)
+{
+    uint64_t pages_before=physical_page_available(mm.allocator),address;
+    struct kernel_mm_concurrency_state before,after;
+    kernel_mm_get_concurrency_state(&mm,&before);
+    assert(!before.pins && !before.write_pins && !before.pending_retirement);
+    /* 前例已munmap；重新取得RW映射，不继承其mprotect留下的只读许可。 */
+    assert(!kernel_mm_mmap_anonymous(&mm,FUTEX_ADDRESS,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && address==FUTEX_ADDRESS);
+    for(enum robust_futex_mode mode=ROBUST_FUTEX_OWNER_DIED;mode<=ROBUST_FUTEX_BEFORE_WAIT;mode++) {
+        struct robust_futex_case test={.mode=mode,.owner_tid=1234+mode,.park_before=mm_test_parked(1)};
+        uint64_t entry=FUTEX_ADDRESS+offsetof(struct robust_futex_user,entry_next);
+        struct robust_futex_user user={.next=mode==ROBUST_FUTEX_PENDING_UNLOCK?FUTEX_ADDRESS:entry,
+            .offset=offsetof(struct robust_futex_user,word)-offsetof(struct robust_futex_user,entry_next),
+            .pending=mode==ROBUST_FUTEX_PENDING_UNLOCK?entry:0,.entry_next=FUTEX_ADDRESS,
+            .word=mode==ROBUST_FUTEX_PENDING_UNLOCK?0:(uint32_t)test.owner_tid|UINT32_C(0x80000000)};
+        size_t copied;
+        assert(!kernel_copy_to_user(&mm,address,&user,sizeof(user),&copied) && copied==sizeof(user));
+        uint64_t resident_pages=physical_page_available(mm.allocator);
+        pthread_t waiter,owner;
+        assert(!pthread_create(&owner,NULL,robust_futex_owner,&test) &&
+            !pthread_create(&waiter,NULL,robust_futex_waiter,&test));
+        assert(!pthread_join(waiter,NULL) && !pthread_join(owner,NULL));
+        assert(__atomic_load_n(&test.cleaned,__ATOMIC_ACQUIRE));
+        assert(!kernel_copy_from_user(&mm,&user,address,sizeof(user),&copied) && copied==sizeof(user));
+        assert(user.word==(mode==ROBUST_FUTEX_PENDING_UNLOCK?0:UINT32_C(0xc0000000)));
+        kernel_mm_get_concurrency_state(&mm,&after);
+        assert(!after.pins && !after.write_pins && !after.pending_retirement &&
+            after.references==before.references && after.users==before.users &&
+            physical_page_available(mm.allocator)==resident_pages);
+    }
+    assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE));
+    kernel_mm_get_concurrency_state(&mm,&after);
+    assert(!after.pins && !after.write_pins && !after.pending_retirement &&
+        after.references==before.references && after.users==before.users &&
+        physical_page_available(mm.allocator)==pages_before);
+    puts("PASS robust futex cleanup: committed owner-death/pending-unlock wakes, early EAGAIN, wait/pin/page owners returned");
 }
 static unsigned lock_set_entered,lock_close_done;
 static _Thread_local int pause_lock_set;
@@ -374,7 +489,8 @@ static void parallel_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
 }
 static enum kernel_block_status read_image(void *unused,uint64_t offset,void *data,size_t size)
 {
-    (void)unused; assert(!kernel_cpu_current()->logical_id && !kernel_cpu_current()->raw_locks);
+    /* Namespace and file I/O submit on the initiating task's CPU. */
+    (void)unused; assert(!kernel_cpu_current()->raw_locks);
     if (__atomic_exchange_n(&pause_access,0,__ATOMIC_ACQ_REL)) {
         __atomic_store_n(&access_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_access,__ATOMIC_ACQUIRE)) sched_yield();
@@ -948,6 +1064,7 @@ int main(int argc,char **argv)
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     futex_pin_case();
+    futex_robust_cases();
 #ifdef TCP_IO_CASES
     unix_receive_deadline_case(&heap);
     unix_receive_error_prefix_case(&heap);
@@ -978,6 +1095,7 @@ int main(int argc,char **argv)
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+    assert(!kernel_vfs_start_journal_worker(&mount));
     namespace_retirement_case(&heap,&mount);
     namespace_snapshot_case(&heap,&mount);
     namespace_parent_snapshot_case(&heap,&mount);
@@ -1007,4 +1125,5 @@ int main(int argc,char **argv)
     assert(!physical_page_allocator_audit(&pages) && !physical_page_allocator_audit(&backend_pages) &&
         physical_page_available(&pages)==baseline && physical_page_available(&backend_pages)==backend_baseline);
     printf("PASS file I/O owners returned: OFD=%zu FD=%zu\n",sizeof(*control),sizeof(struct kernel_files_record));
+    return 0;
 }

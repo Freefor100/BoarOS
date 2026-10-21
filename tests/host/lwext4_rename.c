@@ -21,6 +21,62 @@ static unsigned allocations, fail_allocation, events, cut, allocation_hits, io_h
 static int reorder;
 static unsigned injected_allocation;
 static const char *operation_kind = "setup", *operation_mode = "setup";
+static bool serial_refs_watch;
+static unsigned serial_read_refs,serial_write_upgrades;
+static struct {
+    bool active;
+    uint32_t parent,block_size;
+    const char *name;
+    unsigned depth,lookups,leaf_crcs;
+    ext4_fsblk_t first_leaf,last_leaf;
+} source_search;
+static bool source_search_match(struct ext4_inode_ref *parent,const char *name,uint32_t length)
+{
+    return source_search.active && parent->index==source_search.parent &&
+        strlen(source_search.name)==length && !memcmp(source_search.name,name,length);
+}
+int __real_ext4_dir_find_entry(struct ext4_dir_search_result *,struct ext4_inode_ref *,const char *,uint32_t);
+int __wrap_ext4_dir_find_entry(struct ext4_dir_search_result *found,struct ext4_inode_ref *parent,
+    const char *name,uint32_t length)
+{
+    bool watched=source_search_match(parent,name,length);
+    if(watched && !source_search.depth++)source_search.lookups++;
+    int result=__real_ext4_dir_find_entry(found,parent,name,length);
+    if(watched && result==EOK) {
+        if(!source_search.first_leaf)source_search.first_leaf=found->block.lb_id;
+        source_search.last_leaf=found->block.lb_id;
+    }
+    if(watched)source_search.depth--;
+    return result;
+}
+int __real_ext4_dir_remove_entry(struct ext4_inode_ref *,const char *,uint32_t);
+int __wrap_ext4_dir_remove_entry(struct ext4_inode_ref *parent,const char *name,uint32_t length)
+{
+    bool watched=source_search_match(parent,name,length);
+    if(watched && !source_search.depth++)source_search.lookups++;
+    int result=__real_ext4_dir_remove_entry(parent,name,length);
+    if(watched)source_search.depth--;
+    return result;
+}
+uint32_t __real_ext4_crc32c(uint32_t,const void *,uint32_t);
+uint32_t __wrap_ext4_crc32c(uint32_t crc,const void *bytes,uint32_t length)
+{
+    if(source_search.active && length==source_search.block_size-sizeof(struct ext4_dir_entry_tail))
+        source_search.leaf_crcs++;
+    return __real_ext4_crc32c(crc,bytes,length);
+}
+int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
+int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct ext4_inode_ref *ref)
+{
+    if(serial_refs_watch)serial_read_refs++;
+    return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
+}
+int __real_ext4_fs_inode_ref_write(struct ext4_inode_ref *);
+int __wrap_ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
+{
+    if(serial_refs_watch)serial_write_upgrades++;
+    return __real_ext4_fs_inode_ref_write(ref);
+}
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%d: %s (kind=%s mode=%s allocation=%u event=%u)\n", __LINE__, #x, operation_kind, operation_mode, injected_allocation, events); exit(1); } } while (0)
 void *ext4_user_malloc(size_t n) { if (++allocations == fail_allocation) { allocation_hits++; return NULL; } return malloc(n); }
 void *ext4_user_calloc(size_t n, size_t s) { if (++allocations == fail_allocation) { allocation_hits++; return NULL; } return calloc(n, s); }
@@ -114,11 +170,15 @@ static void seed_split(struct ext4_fs *fs)
         snprintf(name, 12, "fill-%05u-", i); name[11] = 'x';
         snprintf(path, sizeof(path), "/new/%s", name);
         write_file(path, "FILL");
-        uint64_t before = ext4_sb_get_free_blocks_cnt(&fs->sb);
+        uint64_t before = ext4_fs_available_blocks(fs);
         CHECK(ext4_transaction_begin("/") == EOK);
         struct ext4_rename_result out;
-        CHECK(rename_entry(old, "dir", new, split_name, 0, &out) == EOK);
-        bool allocated = ext4_sb_get_free_blocks_cnt(&fs->sb) < before;
+        int renamed = rename_entry(old, "dir", new, split_name, 0, &out);
+        if (renamed != EOK) fprintf(stderr, "split preparation: iteration=%u errno=%d old=%u new=%u\n", i, renamed, old, new);
+        CHECK(renamed == EOK);
+        /* Accepted counters stay unchanged until admission; availability
+         * includes the allocation owned by this still-private operation. */
+        bool allocated = ext4_fs_available_blocks(fs) < before;
         CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
         CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb) == before);
         if (allocated) return;
@@ -223,10 +283,109 @@ static void basic(struct ext4_fs *fs)
     CHECK(length == strlen("/old/source") && !memcmp(name, "/old/source", length));
 }
 
+static void serial_refs(struct ext4_fs *fs)
+{
+    CHECK(!fs->os_locks || !fs->os_locks->resource_acquire);
+    uint32_t old=directory("/old"),new=directory("/new"),source=inode("/old/source");
+    struct {uint32_t from,to;const char *before,*after,*path;} cases[]={
+        {old,old,"source","renamed","/old/renamed"},
+        {old,old,"renamed","source","/old/source"},
+        {old,new,"source","renamed","/new/renamed"},
+        {new,old,"renamed","source","/old/source"},
+    };
+    for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        struct ext4_rename_result out={0};
+        serial_read_refs=serial_write_upgrades=0;serial_refs_watch=true;
+        source_search=(__typeof__(source_search)){.active=true,.parent=cases[i].from,
+            .block_size=ext4_sb_get_block_size(&fs->sb),.name=cases[i].before};
+        int result=rename_entry(cases[i].from,cases[i].before,cases[i].to,cases[i].after,0,&out);
+        serial_refs_watch=false;
+        source_search.active=false;
+        CHECK(result==EOK && out.changed && !out.replaced_inode);
+        CHECK(inode(cases[i].path)==source && links(fs,source)==1);
+        content(cases[i].path,"SOURCE");
+        printf("serial rename refs: same_parent=%u read_borrows=%u write_upgrades=%u\n",
+            cases[i].from==cases[i].to,serial_read_refs,serial_write_upgrades);
+        CHECK(!serial_read_refs && !serial_write_upgrades);
+        printf("rename source leaf: full_lookups=%u operation_leaf_crcs=%u\n",
+            source_search.lookups,source_search.leaf_crcs);
+        CHECK(source_search.lookups==1 && source_search.leaf_crcs==
+            5U*(unsigned)ext4_sb_feature_ro_com(&fs->sb,EXT4_FRO_COM_METADATA_CSUM));
+    }
+    /* Existing checks cover replacement, directories, ancestry and rollback;
+     * their legitimate ancestor READ references are not optimization failures. */
+    basic(fs);
+    CHECK(!fs->active_operations && !ext4_current_operation(fs));
+    puts("PASS serial rename uses writable inode refs directly; same/cross identities, replacement, directories and abort owners");
+}
+
+static uint64_t directory_size(struct ext4_fs *fs,uint32_t number,bool *indexed)
+{
+    struct ext4_inode_ref ref;
+    CHECK(ext4_fs_get_inode_ref_read(fs,number,&ref)==EOK);
+    uint64_t size=ext4_inode_get_size(&fs->sb,ref.inode);
+    if(indexed)*indexed=ext4_inode_has_flag(ref.inode,EXT4_INODE_FLAG_INDEX);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    return size;
+}
+
+static void source_leaf_split(struct ext4_fs *fs)
+{
+    CHECK(ext4_dir_mk("/leaf-split")==EOK);
+    uint32_t parent=directory("/leaf-split"),numbers[64];
+    bool indexed;
+    uint64_t size=directory_size(fs,parent,&indexed);
+    char names[64][224],path[256];unsigned count=0;
+    /* Stop at the first actual directory growth and abort that insertion.
+     * This leaves one full leaf without assuming hash seed or block numbers. */
+    for(;count<64;count++) {
+        memset(names[count],'a'+count%26,220);names[count][220]=0;
+        snprintf(names[count],12,"item-%05u-",count);names[count][11]='x';
+        snprintf(path,sizeof(path),"/leaf-split/%.220s",names[count]);
+        CHECK(ext4_transaction_begin("/")==EOK);
+        ext4_file file;CHECK(ext4_fopen(&file,path,"w+")==EOK);
+        numbers[count]=file.inode;CHECK(ext4_fclose(&file)==EOK);
+        if(directory_size(fs,parent,NULL)!=size) {
+            CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+            break;
+        }
+        CHECK(ext4_transaction_end("/")==EOK);
+    }
+    CHECK(count>=2 && count<64);
+    char target[224];memset(target,'z',220);target[220]=0;
+    unsigned moved=0;
+    for(unsigned i=0;i<count;i++) {
+        uint64_t blocks=ext4_fs_available_blocks(fs);
+        uint32_t inodes=ext4_fs_available_inodes(fs);
+        CHECK(ext4_transaction_begin("/")==EOK);
+        source_search=(__typeof__(source_search)){.active=true,.parent=parent,
+            .block_size=ext4_sb_get_block_size(&fs->sb),.name=names[i]};
+        struct ext4_rename_result out;
+        int result=rename_entry(parent,names[i],parent,target,0,&out);
+        source_search.active=false;
+        CHECK(result==EOK && out.changed && !out.replaced_inode);
+        CHECK(directory_size(fs,parent,NULL)>size);
+        snprintf(path,sizeof(path),"/leaf-split/%s",target);
+        CHECK(inode(path)==numbers[i]);
+        if(source_search.first_leaf!=source_search.last_leaf) {
+            CHECK(source_search.lookups==2);moved++;
+        } else CHECK(source_search.lookups==1);
+        CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+        CHECK(directory_size(fs,parent,NULL)==size && !exists(path));
+        snprintf(path,sizeof(path),"/leaf-split/%.220s",names[i]);
+        CHECK(inode(path)==numbers[i] && ext4_fs_available_blocks(fs)==blocks &&
+            ext4_fs_available_inodes(fs)==inodes && !fs->active_operations && !ext4_current_operation(fs));
+        if(moved || !indexed)break;
+    }
+    CHECK(!indexed || moved);
+    printf("PASS retained source leaf: indexed=%u actual_source_relocations=%u; growth, identity and abort space/owners\n",indexed,moved);
+}
+
 static void wide(struct ext4_fs *fs)
 {
     uint32_t parent = directory("/new");
-    for (unsigned i = 0; i < 180; i++) {
+    /* 512 long names force a checksummed 1 KiB HTree above its root. */
+    for (unsigned i = 0; i < 512; i++) {
         char old[240], new[240], path[260];
         memset(old, 'a' + i % 26, 220); old[220] = 0;
         snprintf(old, 12, "old-%06u-", i); old[11] = 'x';
@@ -241,6 +400,19 @@ static void wide(struct ext4_fs *fs)
         content(path, "WIDE");
     }
     CHECK(links(fs, parent) == 3);
+    if (ext4_sb_get_block_size(&fs->sb) == 1024) {
+        struct ext4_inode_ref ref;
+        CHECK(ext4_fs_get_inode_ref_read(fs, parent, &ref) == EOK);
+        if (ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_INDEX)) {
+            ext4_fsblk_t home;
+            struct ext4_block root;
+            CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &home, false) == EOK);
+            CHECK(ext4_block_get(fs->bdev, &root, home) == EOK);
+            CHECK(((struct ext4_dir_idx_root *)root.data)->info.indirect_levels == 1);
+            CHECK(ext4_block_set(fs->bdev, &root) == EOK);
+        }
+        CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
+    }
 }
 
 static void damage(struct ext4_fs *fs, const char *kind)
@@ -422,6 +594,14 @@ static void verify(struct ext4_fs *fs, const char *kind, bool old_only)
 {
     if (lifecycle(kind)) { verify_lifecycle(fs, kind, old_only); return; }
     uint32_t old = directory("/old"), new = directory("/new");
+    if (!strcmp(kind,"same")) {
+        bool before=exists("/old/source"),after=exists("/old/renamed");
+        CHECK(before!=after && (!old_only || before));
+        const char *path=before?"/old/source":"/old/renamed";
+        content(path,"SOURCE");content("/new/target","TARGET");
+        CHECK(links(fs,inode(path))==1 && links(fs,old)==3 && links(fs,new)==3);
+        return;
+    }
     if (!strcmp(kind, "link") || !strcmp(kind, "link-split")) {
         char path[256];
         snprintf(path, sizeof(path), "/new/%s", !strcmp(kind, "link") ? "linked" : split_name);
@@ -483,6 +663,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[3], "orphan-reclaim")) return 0;
     }
     else if (!strcmp(argv[2], "basic")) basic(dev.fs);
+    else if (!strcmp(argv[2], "serial-refs")) serial_refs(dev.fs);
+    else if (!strcmp(argv[2], "source-leaf-split")) source_leaf_split(dev.fs);
     else if (!strcmp(argv[2], "hardlink")) hardlink(dev.fs);
     else if (!strcmp(argv[2], "wide")) wide(dev.fs);
     else if (!strcmp(argv[2], "damage")) { CHECK(argc >= 4); damage(dev.fs, argv[3]); }
@@ -507,10 +689,12 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2], "verify")) verify(dev.fs, kind, false);
         else {
             uint32_t old = directory("/old"), new = directory("/new");
+            bool same=!strcmp(kind,"same");
+            if(same)new=old;
             bool linking = !strcmp(kind, "link") || !strcmp(kind, "link-split");
             uint32_t source = linking ? inode("/old/source") : 0;
-            const char *from = !strcmp(kind, "file") ? "source" : "dir";
-            const char *to = !strcmp(kind, "link") ? "linked" : !strcmp(kind, "link-split") ? split_name : !strcmp(kind, "file") ? "target" : !strcmp(kind, "split") ? split_name :
+            const char *from = same || !strcmp(kind, "file") ? "source" : "dir";
+            const char *to = same ? "renamed" : !strcmp(kind, "link") ? "linked" : !strcmp(kind, "link-split") ? split_name : !strcmp(kind, "file") ? "target" : !strcmp(kind, "split") ? split_name :
                              !strcmp(kind, "insert") ? "moved" : "empty";
             struct link_witness w = {0};
             if (lifecycle(kind)) w = witness();

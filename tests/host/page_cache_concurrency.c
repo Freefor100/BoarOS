@@ -2656,7 +2656,7 @@ static void executor_durable_fault(struct kernel_heap *heap,
     struct kernel_page_cache_concurrency_state state;kernel_page_cache_get_concurrency_state(&cache,&state);
     assert(!state.running && !state.pending && !state.entry_borrows && state.requests_queued==state.requests_completed);
     struct jbd_journal *journal=adapter->device.fs->jbd_journal;
-    assert(!adapter->sync_waiters && journal->error && journal->failed_trans && journal->memory_used && journal->sources.rbh_root);
+    assert(!adapter->sync_waiters && journal->error && journal->failed_trans && jbd_memory_used(journal) && journal->sources.rbh_root);
     int error=journal->error;
     adapter->instance.ops=backend;
     for (unsigned i=0;i<3;i++)assert(!kernel_vfs_close(&files[i]));

@@ -12,6 +12,9 @@ struct kernel_lock_waiter;
 struct kernel_mm_user_pin;
 struct kernel_page_cache_write_borrow;
 struct kernel_task;
+struct ext4_operation;
+struct ext4_fs;
+struct boaros_lwext4_resource;
 /* 任务级可睡眠对象锁；独立rank30 raw保护内部资格，登记时嵌套rank40调度锁。
  * rank/key、不可递归和guard owner随任务保留。释放内部raw后park，先授资格再wake；
  * 尚未运行的获得者也计入占用。读者批次保留handoff owner及原边界，每段最多16项，
@@ -36,6 +39,19 @@ struct kernel_lock_guard {
     uint64_t cost_start, cost_registered;
 #endif
 };
+#define BOAROS_LWEXT4_INLINE_RESOURCES 4U
+struct boaros_lwext4_resource_request {
+    struct boaros_lwext4_resource_request *next, *previous;
+    struct boaros_lwext4_resource *resource;
+    struct kernel_lock_guard guard;
+    unsigned private_inode;
+};
+struct boaros_lwext4_resource_set {
+    struct ext4_operation *operation;
+    struct boaros_lwext4_resource_request *head, *tail, *held_last;
+    unsigned retry, request_count;
+    struct boaros_lwext4_resource_request requests[BOAROS_LWEXT4_INLINE_RESOURCES];
+};
 struct kernel_io_context {
     struct kernel_lock_guard *locks;
     struct kernel_mm_user_pin *user_pins;
@@ -48,10 +64,23 @@ struct kernel_io_context {
     unsigned background_reclaim;
     int backend_read;
     struct kernel_lock_guard backend_guard;
+    struct ext4_operation *ext4_operations;
+    struct ext4_fs *ext4_last_fs;
+    unsigned ext4_last_aborted;
+    unsigned ext4_last_log_reservation_failed, ext4_last_memory_reservation_failed;
+    uint64_t ext4_last_sequence;
+    uint32_t ext4_last_tid;
+    void *backend_domain;
+    unsigned backend_state_depth;
+    /* 默认UP可借用同domain的实际backend写guard；此时state guard为空。
+     * 独立state调用者持有serial写guard，读者及SMP/观测构建持state mutex。 */
+    struct kernel_lock_guard backend_state_guard;
+    /* 操作请求随 owner 保留；共享 mutex 仍由最后一个请求归还，不缓存 inode。 */
+    struct boaros_lwext4_resource_set backend_resources;
 };
 struct kernel_mutex { struct kernel_rwlock lock; };
 
-/* Single-hart task context, or the bootstrap context before scheduling. */
+/* I/O owner of the executing task, or the bootstrap context before scheduling. */
 struct kernel_io_context *kernel_io_context_current(void);
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key);
 int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);

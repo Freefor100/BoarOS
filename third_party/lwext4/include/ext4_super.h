@@ -148,7 +148,7 @@ static inline bool ext4_sb_feature_incom(const struct ext4_sblock *s,
  * @return  true if flag is supported*/
 static inline bool ext4_sb_feature_ro_com(struct ext4_sblock *s, uint32_t v)
 {
-	return to_le32(s->features_read_only) & v;
+	return to_le32(__atomic_load_n(&s->features_read_only, __ATOMIC_RELAXED)) & v;
 }
 
 /**@brief   Block group to flex group.

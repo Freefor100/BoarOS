@@ -18,6 +18,9 @@ for symbol in $(sed -n 's/^EXCLUDED(\([^)]*\)).*/\1/p' tests/host/file_io_exclud
     fi
     set -- "$@" "-Wl,--wrap=$symbol"
 done
+if [ "${FILE_IO_HOST_TCP:-1}" = 0 ]; then
+    set -- "$@" "-Wl,--wrap=kernel_time_deadline_from_monotonic"
+fi
 for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
     ${HOST_CC:-cc} -std=gnu11 -O2 -g -Wall -Wextra -Werror -pthread \
         -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 \
@@ -40,10 +43,10 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \
         fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c kernel/block.c net/socket.c \
         third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
-        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user \
+        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=ext4_fraw_inode_fill,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user \
         -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
-    mkfs.ext4 -q -F -b 4096 "$build_dir/image-$shift.img"
+    mkfs.ext4 -q -F -b "${FILE_IO_HOST_BLOCK_SIZE:-4096}" ${FILE_IO_HOST_MKFS_ARGS:-} "$build_dir/image-$shift.img"
     timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift.img"
     e2fsck -fn "$build_dir/image-$shift.img" > "$build_dir/fsck-$shift.log" 2>&1
 done

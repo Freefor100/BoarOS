@@ -25,8 +25,8 @@ static void lazy_data(struct ext4_fs *fs)
     bool changed;
     int result=ext4_fallocate(&file,0,0,bytes,&changed);
     fprintf(stderr,"lazy data reservation: result=%d bytes=%llu budget=%zu failures=%llu\n",result,
-        (unsigned long long)bytes,fs->jbd_journal?fs->jbd_journal->memory_limit:0,
-        (unsigned long long)(fs->jbd_journal?fs->jbd_journal->budget_failures:0));
+        (unsigned long long)bytes,fs->jbd_journal?jbd_memory_limit(fs->jbd_journal):0,
+        (unsigned long long)(fs->jbd_journal?jbd_memory_budget_failures(fs->jbd_journal):0));
     CHECK(result==EOK && changed && file.fsize==bytes);
     CHECK(lazy_flags(fs,1,NULL,NULL)==flags1);
     CHECK((lazy_flags(fs,2,NULL,NULL)&~EXT4_BLOCK_GROUP_BLOCK_UNINIT)==
@@ -52,101 +52,173 @@ static void lazy_data(struct ext4_fs *fs)
     CHECK(ext4_fclose(&file)==EOK);
     puts("PASS lazy data: crossed physical groups, reserved write/reload; inode flags and tables remain lazy");
 }
-static void lazy_inode_rollback(struct ext4_fs *fs,unsigned group,const char *name)
+struct lazy_snapshot {
+    unsigned char descriptor[EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE];
+    unsigned char *bitmap;
+    ext4_fsblk_t bitmap_block, table;
+    uint16_t flags;
+    uint32_t unused;
+};
+static struct lazy_snapshot *lazy_snapshots;
+static unsigned lazy_snapshot_count;
+static bool lazy_watch_tables;
+static int lazy_dev_write(struct ext4_blockdev *dev,const void *data,uint64_t sector,uint32_t count)
+{
+    if (lazy_watch_tables) for (unsigned i=0;i<lazy_snapshot_count;i++) {
+        if (!(lazy_snapshots[i].flags&EXT4_BLOCK_GROUP_INODE_UNINIT)) continue;
+        uint64_t tail=(lazy_snapshots[i].table+1)*dev->lg_bsize/512;
+        CHECK(!(sector<=tail && tail<sector+count));
+    }
+    return dev_write(dev,data,sector,count);
+}
+static void lazy_snapshot_take(struct ext4_fs *fs)
+{
+    lazy_snapshot_count=ext4_block_group_cnt(&fs->sb);
+    lazy_snapshots=calloc(lazy_snapshot_count,sizeof(*lazy_snapshots)); CHECK(lazy_snapshots);
+    unsigned desc=ext4_sb_get_desc_size(&fs->sb),block=fs->bdev->lg_bsize;
+    for (unsigned group=0;group<lazy_snapshot_count;group++) {
+        struct lazy_snapshot *snapshot=&lazy_snapshots[group];
+        struct ext4_block_group_ref ref; CHECK(ext4_fs_get_block_group_ref(fs,group,&ref)==EOK);
+        memcpy(snapshot->descriptor,ref.block_group,desc);
+        snapshot->flags=to_le16(ref.block_group->flags);
+        snapshot->unused=ext4_bg_get_itable_unused(ref.block_group,&fs->sb);
+        snapshot->bitmap_block=ext4_bg_get_inode_bitmap(ref.block_group,&fs->sb);
+        snapshot->table=ext4_bg_get_inode_table_first_block(ref.block_group,&fs->sb);
+        CHECK(ext4_fs_put_block_group_ref(&ref)==EOK);
+        struct ext4_block bitmap; CHECK(ext4_block_get(fs->bdev,&bitmap,snapshot->bitmap_block)==EOK);
+        snapshot->bitmap=malloc(block); CHECK(snapshot->bitmap); memcpy(snapshot->bitmap,bitmap.data,block);
+        CHECK(ext4_block_set(fs->bdev,&bitmap)==EOK);
+    }
+}
+static void lazy_snapshot_release(void)
+{
+    for (unsigned group=0;group<lazy_snapshot_count;group++) free(lazy_snapshots[group].bitmap);
+    free(lazy_snapshots); lazy_snapshots=NULL; lazy_snapshot_count=0;
+}
+static void lazy_inode_tail(struct ext4_fs *fs,uint32_t number)
+{
+    struct ext4_inode_ref inode; CHECK(ext4_fs_get_inode_ref(fs,number,&inode)==EOK);
+    unsigned size=ext4_get16(&fs->sb,inode_size);
+    for (unsigned i=size-16;i<size;i++) CHECK(!((unsigned char *)inode.inode)[i]);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+}
+static void lazy_inode_rollback(struct ext4_fs *fs,const char *directory,const char *name)
 {
     if (!fs->jbd_journal) return;
-    struct ext4_block_group_ref ref; CHECK(ext4_fs_get_block_group_ref(fs,group,&ref)==EOK);
     unsigned desc=ext4_sb_get_desc_size(&fs->sb),block=fs->bdev->lg_bsize;
-    unsigned char descriptor[EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE];
-    memcpy(descriptor,ref.block_group,desc);
-    ext4_fsblk_t bitmap=ext4_bg_get_inode_bitmap(ref.block_group,&fs->sb);
-    CHECK(ext4_fs_put_block_group_ref(&ref)==EOK);
-    struct ext4_block before;
-    CHECK(ext4_block_get(fs->bdev,&before,bitmap)==EOK);
-    unsigned char *bits=malloc(block); CHECK(bits); memcpy(bits,before.data,block);
-    CHECK(ext4_block_set(fs->bdev,&before)==EOK);
     uint32_t free_inodes=ext4_get32(&fs->sb,free_inodes_count);
     uint64_t free_blocks=ext4_sb_get_free_blocks_cnt(&fs->sb);
     unsigned failures=0;
-    for (unsigned point=0;point<=128;point++) {
-        fs->last_inode_bg_id=group;
+    for (unsigned point=0;point<=256;point++) {
         CHECK(ext4_transaction_begin("/")==EOK);
         if (point) fail_allocation=allocations+point;
-        ext4_file file; int result=ext4_fopen(&file,name,"w+");
+        int result=ext4_dir_mk(directory);
+        ext4_file file;
+        if (result==EOK) {
+            result=ext4_fopen(&file,name,"w+");
+            if (result==EOK) {
+                unsigned char byte=0x7c; size_t done;
+                result=ext4_fwrite(&file,&byte,1,&done);
+                if (!result) CHECK(done==1);
+                CHECK(ext4_fclose(&file)==EOK);
+            }
+        }
         bool injected=point && allocations>=fail_allocation;
         fail_allocation=0;
-        if (injected) { CHECK(result==ENOMEM); failures++; }
-        else CHECK(result==EOK);
-        if (result==EOK) {
-            if (!point) { unsigned char byte=0x7c; size_t done; CHECK(ext4_fwrite(&file,&byte,1,&done)==EOK && done==1); }
-            CHECK(ext4_fclose(&file)==EOK);
+        if (injected) {
+            if (result!=ENOMEM) fprintf(stderr,"lazy OOM point=%u result=%d allocations=%u\n",point,result,allocations);
+            CHECK(result==ENOMEM); failures++;
         }
+        else CHECK(result==EOK);
         CHECK(ext4_transaction_abort("/",result?result:ECANCELED)==(result?result:ECANCELED));
         CHECK(ext4_get32(&fs->sb,free_inodes_count)==free_inodes && ext4_sb_get_free_blocks_cnt(&fs->sb)==free_blocks);
-        CHECK(ext4_fs_get_block_group_ref(fs,group,&ref)==EOK && !memcmp(descriptor,ref.block_group,desc));
-        CHECK(ext4_fs_put_block_group_ref(&ref)==EOK);
-        CHECK(ext4_block_get(fs->bdev,&before,bitmap)==EOK && !memcmp(bits,before.data,block));
-        CHECK(ext4_block_set(fs->bdev,&before)==EOK && ext4_fopen(&file,name,"r")==ENOENT);
+        for (unsigned group=0;group<lazy_snapshot_count;group++) {
+            struct lazy_snapshot *snapshot=&lazy_snapshots[group];
+            struct ext4_block_group_ref ref;
+            CHECK(ext4_fs_get_block_group_ref(fs,group,&ref)==EOK && !memcmp(snapshot->descriptor,ref.block_group,desc));
+            CHECK(ext4_fs_put_block_group_ref(&ref)==EOK);
+            struct ext4_block bitmap;
+            CHECK(ext4_block_get(fs->bdev,&bitmap,snapshot->bitmap_block)==EOK && !memcmp(snapshot->bitmap,bitmap.data,block));
+            CHECK(ext4_block_set(fs->bdev,&bitmap)==EOK);
+        }
+        ext4_dir parent;
+        CHECK(ext4_dir_open(&parent,directory)==ENOENT && ext4_fopen(&file,name,"r")==ENOENT);
         if (point && !injected) break;
-        CHECK(point<128);
+        CHECK(point<256);
     }
-    CHECK(failures); free(bits);
-    printf("PASS lazy inode group=%u: outer abort and %u OOM points restore bitmap, flags, unused count and namespace\n",group,failures);
+    CHECK(failures);
+    printf("PASS lazy inode: outer abort and %u OOM points restore all candidate groups, counts and namespace\n",failures);
 }
 static void lazy_inode(struct ext4_fs *fs)
 {
-    for (unsigned group=1;group<=2;group++) {
-        uint32_t unused;
-        uint16_t before=lazy_flags(fs,group,NULL,&unused);
-        CHECK((before&EXT4_BLOCK_GROUP_INODE_UNINIT) && !(before&EXT4_BLOCK_GROUP_ITABLE_ZEROED));
-        CHECK(unused==ext4_get32(&fs->sb,inodes_per_group));
-        struct ext4_block_group_ref bg; CHECK(ext4_fs_get_block_group_ref(fs,group,&bg)==EOK);
-        ext4_fsblk_t table=ext4_bg_get_inode_table_first_block(bg.block_group,&fs->sb);
-        CHECK(ext4_fs_put_block_group_ref(&bg)==EOK);
+    uint32_t previous_group=UINT32_MAX;
+    for (unsigned round=0;round<2;round++) {
+        /* Directory placement chooses a real lazy group. Poison every eligible
+         * first slot before that choice, then check the selected group rather
+         * than steering the allocator with a test-only global cursor. */
         unsigned char *poison=calloc(1,fs->bdev->lg_bsize); CHECK(poison);
         memset(poison,0xa5,ext4_get16(&fs->sb,inode_size));
-        CHECK(ext4_blocks_set_direct(fs->bdev,poison,table,1)==EOK && ext4_blockdev_flush(fs->bdev)==EOK);
-        free(poison);
-        fs->last_inode_bg_id=group;
-        char name[32]; snprintf(name,sizeof(name),"/lazy-inode-%u",group);
-        lazy_inode_rollback(fs,group,name);
-        fs->last_inode_bg_id=group;
-        forbidden_lba=(table+1)*fs->bdev->lg_bsize/512; forbidden_writes=0;
+        for (unsigned group=0;group<ext4_block_group_cnt(&fs->sb);group++) {
+            struct ext4_block_group_ref ref; CHECK(ext4_fs_get_block_group_ref(fs,group,&ref)==EOK);
+            uint16_t flags=to_le16(ref.block_group->flags);
+            ext4_fsblk_t table=ext4_bg_get_inode_table_first_block(ref.block_group,&fs->sb);
+            CHECK(ext4_fs_put_block_group_ref(&ref)==EOK);
+            if (flags&EXT4_BLOCK_GROUP_INODE_UNINIT)
+                CHECK(ext4_blocks_set_direct(fs->bdev,poison,table,1)==EOK);
+        }
+        CHECK(ext4_blockdev_flush(fs->bdev)==EOK); free(poison);
+        lazy_snapshot_take(fs); lazy_watch_tables=true;
+        char directory[32],name[48];
+        snprintf(directory,sizeof(directory),"/lazy-parent-%u",round);
+        snprintf(name,sizeof(name),"%s/file",directory);
+        lazy_inode_rollback(fs,directory,name);
+        CHECK(ext4_dir_mk(directory)==EOK);
+        ext4_dir parent; CHECK(ext4_dir_open(&parent,directory)==EOK);
+        uint32_t inodes_per_group=ext4_get32(&fs->sb,inodes_per_group);
+        unsigned group=(parent.f.inode-1)/inodes_per_group;
+        CHECK(group<lazy_snapshot_count && group!=previous_group); previous_group=group;
+        struct lazy_snapshot *before=&lazy_snapshots[group];
+        CHECK((before->flags&EXT4_BLOCK_GROUP_INODE_UNINIT) && !(before->flags&EXT4_BLOCK_GROUP_ITABLE_ZEROED));
+        CHECK(before->unused==inodes_per_group && parent.f.inode==group*inodes_per_group+1);
+        lazy_inode_tail(fs,parent.f.inode); CHECK(ext4_dir_close(&parent)==EOK);
         ext4_file file; int result=ext4_fopen(&file,name,"w+");
-        fprintf(stderr,"lazy inode allocation: group=%u result=%d budget=%zu failures=%llu\n",group,result,
-            fs->jbd_journal?fs->jbd_journal->memory_limit:0,
-            (unsigned long long)(fs->jbd_journal?fs->jbd_journal->budget_failures:0));
-        CHECK(result==EOK && file.inode==group*unused+1);
-        uint16_t after=lazy_flags(fs,group,NULL,&unused);
+        fprintf(stderr,"lazy inode allocation: parent group=%u result=%d budget=%zu failures=%llu\n",group,result,
+            fs->jbd_journal?jbd_memory_limit(fs->jbd_journal):0,
+            (unsigned long long)(fs->jbd_journal?jbd_memory_budget_failures(fs->jbd_journal):0));
+        CHECK(result==EOK && file.inode==group*inodes_per_group+2);
+        uint32_t unused; uint16_t after=lazy_flags(fs,group,NULL,&unused);
         CHECK(!(after&(EXT4_BLOCK_GROUP_INODE_UNINIT|EXT4_BLOCK_GROUP_BLOCK_UNINIT|EXT4_BLOCK_GROUP_ITABLE_ZEROED)));
-        CHECK(unused==ext4_get32(&fs->sb,inodes_per_group)-1);
-        struct ext4_inode_ref inode; CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
-        unsigned size=ext4_get16(&fs->sb,inode_size);
-        for (unsigned i=size-16;i<size;i++) CHECK(!((unsigned char *)inode.inode)[i]);
-        CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
-        unsigned char marker=group,actual=0; size_t done;
+        CHECK(unused==inodes_per_group-2); lazy_inode_tail(fs,file.inode);
+        unsigned char marker=round+1,actual=0; size_t done;
         CHECK(ext4_fwrite(&file,&marker,1,&done)==EOK && done==1 && ext4_file_sync_metadata_mode(&file,false)==EOK);
         CHECK(ext4_fclose(&file)==EOK && ext4_fopen(&file,name,"r")==EOK);
         CHECK(ext4_fread(&file,&actual,1,&done)==EOK && done==1 && actual==marker && ext4_fclose(&file)==EOK);
-        CHECK(!forbidden_writes); forbidden_lba=UINT64_MAX;
+        lazy_watch_tables=false; lazy_snapshot_release();
     }
-    puts("PASS lazy inode: initialized bitmap and fresh slot, untouched table tail, truthful zeroed flag and unused count");
+    puts("PASS lazy inode: real directory group placement, parent-local child, fresh slots and untouched table tails");
 }
 static void lazy_verify(struct ext4_fs *fs)
 {
-    for (unsigned group=1;group<=2;group++) {
-        char name[32]; snprintf(name,sizeof(name),"/lazy-inode-%u",group);
-        ext4_file file; int result=ext4_fopen(&file,name,"r");
+    for (unsigned round=0;round<2;round++) {
+        char directory[32],name[48];
+        snprintf(directory,sizeof(directory),"/lazy-parent-%u",round);
+        snprintf(name,sizeof(name),"%s/file",directory);
+        ext4_dir parent; int result=ext4_dir_open(&parent,directory);
         CHECK(result==EOK || result==ENOENT);
         if (result==ENOENT) continue;
-        uint32_t unused;
+        uint32_t inodes_per_group=ext4_get32(&fs->sb,inodes_per_group);
+        unsigned group=(parent.f.inode-1)/inodes_per_group;
+        CHECK(parent.f.inode==group*inodes_per_group+1);
+        lazy_inode_tail(fs,parent.f.inode); CHECK(ext4_dir_close(&parent)==EOK);
+        ext4_file file; result=ext4_fopen(&file,name,"r");
+        CHECK(result==EOK || result==ENOENT);
+        uint32_t unused; unsigned allocated=result==EOK?2:1;
         CHECK(!(lazy_flags(fs,group,NULL,&unused)&(EXT4_BLOCK_GROUP_INODE_UNINIT|EXT4_BLOCK_GROUP_ITABLE_ZEROED)));
-        CHECK(unused==ext4_get32(&fs->sb,inodes_per_group)-1 && file.fsize<=1);
-        struct ext4_inode_ref inode; CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
-        unsigned size=ext4_get16(&fs->sb,inode_size);
-        for (unsigned i=size-16;i<size;i++) CHECK(!((unsigned char *)inode.inode)[i]);
-        CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
-        if (file.fsize) { unsigned char byte; size_t done; CHECK(ext4_fread(&file,&byte,1,&done)==EOK && done==1 && byte==group); }
+        CHECK(unused==inodes_per_group-allocated);
+        if (result==ENOENT) continue;
+        CHECK(file.inode==group*inodes_per_group+2 && file.fsize<=1);
+        lazy_inode_tail(fs,file.inode);
+        if (file.fsize) { unsigned char byte; size_t done; CHECK(ext4_fread(&file,&byte,1,&done)==EOK && done==1 && byte==round+1); }
         CHECK(ext4_fclose(&file)==EOK);
     }
 }
@@ -154,7 +226,7 @@ int main(int argc,char **argv)
 {
     CHECK((argc==3 || argc==4) && fault_block_open(&disk,argv[1])==0);
     unsigned char scratch[512];
-    struct ext4_blockdev_iface iface={.open=dev_open,.close=dev_open,.bread=dev_read,.bwrite=dev_write,.flush=dev_flush,
+    struct ext4_blockdev_iface iface={.open=dev_open,.close=dev_open,.bread=dev_read,.bwrite=lazy_dev_write,.flush=dev_flush,
         .ph_bsize=512,.ph_bcnt=disk.device.capacity_bytes/512,.ph_bbuf=scratch};
     struct ext4_blockdev dev={.bdif=&iface,.part_size=disk.device.capacity_bytes};
     CHECK(ext4_device_register(&dev,"metadata")==EOK && ext4_mount("metadata","/",false)==EOK);

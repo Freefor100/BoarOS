@@ -2,6 +2,7 @@
 #define BOAROS_FS_EXT4_BACKEND_H
 
 #include "vfs_objects.h"
+#include "lwext4_port.h"
 #include <ext4.h>
 #include <ext4_blockdev.h>
 
@@ -14,7 +15,7 @@ struct lwext4_mount_adapter {
     struct kernel_vfs_instance instance;
     struct kernel_vfs_mount *mount;
     struct kernel_block_device *block;
-    struct kernel_rwlock backend_lock;
+    struct boaros_lwext4_domain backend_lock;
 #if BOAROS_MAX_CPUS > 1
     struct kernel_raw_lock timestamp_lock;
 #endif
@@ -33,7 +34,7 @@ struct lwext4_mount_adapter {
     unsigned char *physical_buffer;
     struct ext4_sblock *superblock;
     struct lwext4_orphan *orphans;
-    struct lwext4_node *dirty_times, **dirty_times_tail, *staged_times;
+    struct lwext4_node *dirty_times, **dirty_times_tail;
     uint64_t times_deadline;
     size_t dirty_times_count;
 
@@ -52,10 +53,13 @@ struct lwext4_mount_adapter {
 struct lwext4_node {
     struct kernel_vfs_node node;
     ext4_file file;
-    struct ext4_timestamp times[3], staged[3];
-    uint64_t time_version[3], staged_version[3];
-    struct lwext4_node *dirty_next, **dirty_previous, *staged_next;
-    unsigned dirty_fields, staged_fields, extra_times;
+    struct ext4_timestamp times[3];
+    uint64_t time_version[3];
+    struct lwext4_node *dirty_next, **dirty_previous;
+#if BOAROS_MAX_CPUS > 1
+    struct boaros_lwext4_resource *inode_resource;
+#endif
+    unsigned dirty_fields, extra_times;
     uint8_t noatime;
     uint8_t write_completion;
 

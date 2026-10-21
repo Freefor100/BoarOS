@@ -25,7 +25,13 @@ def supported_schemas():
     admission_previous=current[:next(i for i,x in enumerate(current) if x[0]=='stream_admit_blocked')]
     allocator_previous=current[:next(i for i,x in enumerate(current) if x[0]=='page_meta_checked')]
     raw_previous=current[:next(i for i,x in enumerate(current) if x[0]=='raw_wait_ticks')]
-    registries=(current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
+    smp_previous=current[:next(i for i,x in enumerate(current) if x[0]=='lock21_attempts')]
+    smp_initial=current[:next(i for i,x in enumerate(current) if x[0]=='journal_resource_retries')]
+    # M1 already published journal stages/retries before the new lock ranks.
+    # That complete frozen registry is not a prefix of the current registry.
+    pre_smp=[metric for metric in current if not metric[0].startswith(
+        ('lock21_','lock31_','lock32_','lock35_'))]
+    registries=(current,pre_smp,smp_initial,smp_previous,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
     # Frozen historical snapshots retain their original metric names and
     # values. They are separate registries, never aliases in current output.
     historical=tuple([(name.replace('_precommit_body','_journal_write'),unit,hist)
@@ -59,7 +65,7 @@ def parse(text, epoch, metrics=None):
     if fields['version'] != 1 or fields['epoch'] != epoch or epoch < 1: raise ValueError('version/epoch')
     if fields['state'] != 'complete' or fields['mode'] not in ('user','fixture'): raise ValueError('incomplete snapshot')
     if fields['overflow'] or fields['inflight']: raise ValueError('overflow/inflight')
-    if not 0 < fields['task_bytes'] <= 64 or not 0 < fields['storage_bytes'] <= 65536: raise ValueError('storage budget')
+    if not 0 < fields['task_bytes'] <= 160 or not 0 < fields['storage_bytes'] <= 96*1024: raise ValueError('storage budget')
     if not fields['owner'] or not fields['timebase_hz'] or fields['end_ticks'] < fields['start_ticks']: raise ValueError('invalid timing/owner')
     if fields['resolution_ns_numerator'] != 1000000000 or fields['resolution_ns_denominator'] != fields['timebase_hz']: raise ValueError('clock resolution')
     for lane in LANES:
@@ -239,21 +245,37 @@ METADATA_FIXED_WORK = {
     'metadata-readdir': 64, 'metadata-paired-shared': 2048,
     'metadata-paired-separate': 2048, 'metadata-final-sync': 1,
 }
+METADATA_PARALLEL_WORK = {
+    'metadata-paired-stat':4096, 'metadata-paired-open':4096,
+    'metadata-paired-rename':2048, 'metadata-paired-append':4096,
+}
 
 
-def validate_metadata_fixed(output, timings, cpus):
+def validate_metadata_fixed(output, timings, cpus, parallel=False):
     """Require each fixed window, actual work and ordered latency/RSS outputs."""
     import re
-    if re.findall(r'^COST METADATA CPUS (\d+)$', output, re.M) != [str(cpus)]:
+    cpu_rows, work, latency, rss = [], [], [], []
+    for line in output.splitlines():
+        if line.split(maxsplit=2)[:2] != ['COST', 'METADATA']:
+            continue
+        if match := re.fullmatch(r'COST METADATA CPUS ([0-9]+)', line):
+            cpu_rows.append(match[1])
+        elif match := re.fullmatch(r'COST METADATA WORK (\S+) ([0-9]+)', line):
+            work.append(match.groups())
+        elif match := re.fullmatch(r'COST METADATA LATENCY (\S+) ([0-9]+) ([0-9]+) ([0-9]+)', line):
+            latency.append(match.groups())
+        elif match := re.fullmatch(r'COST METADATA RSS (\S+) ([0-9]+) ([0-9]+)', line):
+            rss.append(match.groups())
+        else:
+            raise ValueError('invalid metadata record')
+    if cpu_rows != [str(cpus)]:
         raise ValueError('metadata guest affinity differs')
-    work = re.findall(r'^COST METADATA WORK (\S+) (\d+)$', output, re.M)
-    if len(work) != len(METADATA_FIXED_WORK) or {k: int(v) for k, v in work} != METADATA_FIXED_WORK:
+    expected={**METADATA_FIXED_WORK,**(METADATA_PARALLEL_WORK if parallel else {})}
+    if len(work) != len(expected) or {k: int(v) for k, v in work} != expected:
         raise ValueError('metadata fixed work incomplete or duplicated')
-    if set(timings) != set(METADATA_FIXED_WORK) or any(v <= 0 for v in timings.values()):
+    if set(timings) != set(expected) or any(v <= 0 for v in timings.values()):
         raise ValueError('metadata fixed windows incomplete')
-    latency = re.findall(r'^COST METADATA LATENCY (\S+) (\d+) (\d+) (\d+)$', output, re.M)
-    rss = re.findall(r'^COST METADATA RSS (\S+) (\d+) (\d+)$', output, re.M)
-    keys = set(METADATA_FIXED_WORK)
+    keys = set(expected)
     if len(latency) != len(keys) or {row[0] for row in latency} != keys:
         raise ValueError('metadata latency incomplete or duplicated')
     if len(rss) != len(keys) or {row[0] for row in rss} != keys:
@@ -265,8 +287,8 @@ def validate_metadata_fixed(output, timings, cpus):
         if not 0 < p50 <= p95 <= maximum <= timings[name]:
             raise ValueError('metadata latency order/range')
         own, child = resources[name]
-        result[name] = dict(operations=METADATA_FIXED_WORK[name], elapsed_ns=timings[name],
-            operations_per_second=METADATA_FIXED_WORK[name]*1e9/timings[name],
+        result[name] = dict(operations=expected[name], elapsed_ns=timings[name],
+            operations_per_second=expected[name]*1e9/timings[name],
             p50_ns=p50, p95_ns=p95, max_ns=maximum, self_maxrss_kib=own,
             children_maxrss_kib=child)
     return result

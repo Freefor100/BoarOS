@@ -158,13 +158,14 @@ ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb __unused,
 
 int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 {
-	struct ext4_sblock *sb = &fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(fs);
 
 	/* Compute index of block group and load it */
 	uint32_t block_group = ext4_ialloc_get_bgid_of_inode(sb, index);
+	int rc;
 
 	struct ext4_block_group_ref bg_ref;
-	int rc = ext4_fs_get_block_group_ref(fs, block_group, &bg_ref);
+	rc = ext4_fs_get_block_group_ref_write(fs, block_group, &bg_ref);
 	if (rc != EOK)
 		return rc;
 
@@ -232,33 +233,65 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 		return rc;
 
 	/* Update superblock free inodes count */
-	ext4_set32(sb, free_inodes_count,
-		   ext4_get32(sb, free_inodes_count) + 1);
+    ext4_fs_account_inodes(fs, 1);
 
 	return EOK;
 }
 
-int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
+static int ext4_ialloc_start_group(struct ext4_fs *fs, uint32_t parent_inode,
+    bool is_dir, const char *name, uint32_t name_len, uint32_t *start)
 {
-	struct ext4_sblock *sb = &fs->sb;
+    struct ext4_sblock *sb = ext4_fs_super(fs);
+    uint32_t groups = ext4_block_group_cnt(sb);
+    uint32_t parent_group = parent_inode ? ext4_ialloc_get_bgid_of_inode(sb, parent_inode) : 0;
+    if (parent_group >= groups) return EINVAL;
+    *start = parent_group;
+    if (!is_dir || !parent_inode || groups == 1) return EOK;
+    uint32_t minimum_inodes = ext4_fs_available_inodes(fs) / groups / 2;
+    uint64_t minimum_blocks = ext4_fs_available_blocks(fs) / groups / 2;
+    uint32_t origin = ext4_crc32c(parent_inode, name, name_len) % groups;
+    uint32_t first = 0, first_dirs = 0, best = 0, best_dirs = 0;
+    bool found = false, best_capacity = false;
+    /* 元数据和系统目录会使健康组略低于平均；以一半平均作资源下限，
+     * 再按实际名字分散起点，不让初始目录数的一点差异固定所有新目录。 */
+    for (uint32_t step = 0; step < groups; step++) {
+        uint32_t group = (origin + step) % groups;
+        struct ext4_block_group_ref ref;
+        int result = ext4_fs_get_block_group_ref(fs, group, &ref);
+        if (result) return result;
+        uint32_t inodes = ext4_bg_get_free_inodes_count(ref.block_group, sb);
+        uint32_t blocks = ext4_bg_get_free_blocks_count(ref.block_group, sb);
+        uint32_t directories = ext4_bg_get_used_dirs_count(ref.block_group, sb);
+        result = ext4_fs_put_block_group_ref(&ref);
+        if (result) return result;
+        if (!inodes || !blocks) continue;
+        bool capacity = inodes >= minimum_inodes && blocks >= minimum_blocks;
+        if (!found || capacity > best_capacity) {
+            first = best = group;
+            first_dirs = best_dirs = directories;
+            best_capacity = capacity; found = true;
+        } else if (capacity == best_capacity && directories < best_dirs) {
+            best = group;
+            best_dirs = directories;
+        }
+    }
+    if (!found) return ENOSPC;
+    /* 仅在负载差超过一个目录时覆盖散列顺序；无充足组时仍用真实可用组。 */
+    *start = first_dirs - best_dirs <= 1 ? first : best;
+    return EOK;
+}
 
-	uint32_t bgid = fs->last_inode_bg_id;
-	uint32_t bg_count = ext4_block_group_cnt(sb);
-	uint32_t sb_free_inodes = ext4_get32(sb, free_inodes_count);
-	bool rewind = false;
-
-	/* Try to find free i-node in all block groups */
-	while (bgid <= bg_count) {
-
-		if (bgid == bg_count) {
-			if (rewind)
-				break;
-			bg_count = fs->last_inode_bg_id;
-			bgid = 0;
-			rewind = true;
-			continue;
-		}
-
+int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
+    uint32_t parent_inode, const char *name, uint32_t name_len)
+{
+    struct ext4_sblock *sb = ext4_fs_super(fs);
+    uint32_t first_group;
+    int selected = ext4_ialloc_start_group(fs, parent_inode, is_dir, name,
+        name_len, &first_group);
+    if (selected) return selected;
+    uint32_t bg_count = ext4_block_group_cnt(sb);
+    for (uint32_t step = 0; step < bg_count; step++) {
+        uint32_t bgid = (first_group + step) % bg_count;
 		/* Load block group to check */
 		struct ext4_block_group_ref bg_ref;
 		int rc = ext4_fs_get_block_group_ref_alloc(fs, bgid, &bg_ref, true);
@@ -298,15 +331,10 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 			uint32_t idx_in_bg;
 
 			inodes_in_bg = ext4_inodes_in_group_cnt(sb, bgid);
-			rc = ext4_bmap_bit_find_clr(b.data, 0, inodes_in_bg,
-						    &idx_in_bg);
-			while (rc == EOK) {
-			    ext4_fsblk_t address = (uint64_t)bgid * ext4_get32(sb, inodes_per_group) + idx_in_bg + 1, next;
-			    if (!jbd_journal_quarantined(fs, address, true, &next)) break;
-			    uint64_t skip = next - address;
-			    uint32_t start = skip >= inodes_in_bg - idx_in_bg ? inodes_in_bg : idx_in_bg + (uint32_t)skip;
-			    rc = ext4_bmap_bit_find_clr(b.data, start, inodes_in_bg, &idx_in_bg);
-			}
+            uint32_t reusable;
+            rc=jbd_journal_find_reusable(fs,b.data,
+                (uint64_t)bgid*ext4_get32(sb,inodes_per_group)+1,
+                0,inodes_in_bg,1,true,&idx_in_bg,&reusable);
 			/* Block group has not any free i-node */
 			if (rc == ENOSPC) {
 				rc = ext4_block_set(fs->bdev, &b);
@@ -322,6 +350,12 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 				continue;
 			}
 
+            rc = ext4_fs_reserve_inodes(fs, 1);
+            if (rc) {
+                ext4_block_set(fs->bdev, &b);
+                ext4_fs_put_block_group_ref(&bg_ref);
+                return rc;
+            }
 			ext4_bmap_bit_set(b.data, idx_in_bg);
 
 			/* Free i-node found, save the bitmap */
@@ -329,7 +363,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 						    b.data);
 			ext4_trans_set_block_dirty(b.buf);
 
-			ext4_block_set(fs->bdev, &b);
+			rc = ext4_block_set(fs->bdev, &b);
 			if (rc != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
 				return rc;
@@ -364,13 +398,11 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 				return rc;
 
 			/* Update superblock */
-			sb_free_inodes--;
-			ext4_set32(sb, free_inodes_count, sb_free_inodes);
+            ext4_fs_account_inodes(fs, -1);
 
 			/* Compute the absolute i-nodex number */
 			*idx = ext4_ialloc_bgidx_to_inode(sb, idx_in_bg, bgid);
 
-			fs->last_inode_bg_id = bgid;
 
 			return EOK;
 		}
@@ -381,7 +413,6 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 		if (rc != EOK)
 			return rc;
 
-		++bgid;
 	}
 
 	return ENOSPC;

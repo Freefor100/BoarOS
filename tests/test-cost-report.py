@@ -506,6 +506,35 @@ class CostReportTest(unittest.TestCase):
         with self.assertRaises(ValueError): parse(self.render(fields), 3)
         with self.assertRaises(ValueError): parse(self.render(fields), 3, old[:-1])
 
+    def test_frozen_smp_schema_before_retry_counters_remains_complete(self):
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='journal_resource_retries')]
+        fields=self.valid()
+        for lane in ('foreground','background','observer'):
+            for name,_,_ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'):del fields[key]
+        parsed=parse(self.render(fields),3,old)
+        self.assertNotIn('foreground.journal_resource_retries.value',parsed)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[:-1])
+
+    def test_frozen_pre_smp_registry_keeps_journal_stages_and_retries(self):
+        current=schema()
+        ranks=('lock21_','lock31_','lock32_','lock35_')
+        old=[metric for metric in current if not metric[0].startswith(ranks)]
+        self.assertIn('journal_prepare_ticks',{metric[0] for metric in old})
+        self.assertIn('journal_log_retries',{metric[0] for metric in old})
+        fields=self.valid()
+        for lane in ('foreground','background','observer'):
+            for key in list(fields):
+                if any(key.startswith(lane+'.'+rank) for rank in ranks):del fields[key]
+        parsed=parse(self.render(fields),3,old)
+        self.assertIn('foreground.journal_log_retries.value',parsed)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[:-1])
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[::-1])
+
     def test_replicas_use_the_frozen_kernel_registry(self):
         from copy import deepcopy
         current=schema()
@@ -593,7 +622,7 @@ class CostReportTest(unittest.TestCase):
     def test_valid(self): self.assertEqual(parse(self.render(self.valid()), 3)['epoch'], 3)
     def test_reject_corrupt(self):
         for key, value in [('version','2'), ('epoch','2'), ('state','incomplete'),
-            ('overflow','1'), ('inflight','1'), ('task_bytes','65'), ('storage_bytes','65537'),
+            ('overflow','1'), ('inflight','1'), ('task_bytes','161'), ('storage_bytes','98305'),
             ('foreground.operations.unit','bytes'), ('foreground.operations.value','-1'),
             ('foreground.operation_ticks.samples','1')]:
             with self.subTest(key=key):
@@ -677,6 +706,23 @@ class FixedMetadataTest(unittest.TestCase):
         self.assertEqual(rows['metadata-create']['operations'],2048)
         self.assertEqual(rows['metadata-create']['children_maxrss_kib'],256)
         validate_resume_selection('metadata',{'metadata_fixed_only':True},None)
+    def test_parallel_work_requires_the_new_fixed_windows(self):
+        from cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        with self.assertRaises(ValueError):
+            validate_metadata_fixed(output,timings,2,parallel=True)
+        extra={'metadata-paired-stat':4096,'metadata-paired-open':4096,
+               'metadata-paired-rename':2048,'metadata-paired-append':4096}
+        for name,count in extra.items():
+            output += (f'\nCOST METADATA WORK {name} {count}'
+                       f'\nCOST METADATA LATENCY {name} 10 20 30'
+                       f'\nCOST METADATA RSS {name} 128 256')
+            timings[name]=100
+        rows=validate_metadata_fixed(output,timings,2,parallel=True)
+        self.assertEqual(rows['metadata-paired-append']['operations'],4096)
+        with self.assertRaises(ValueError):
+            validate_metadata_fixed(output,timings,2)
+
     def test_duplicate_missing_wrong_cpu_and_bad_latency_are_errors(self):
         from cost_report import validate_metadata_fixed
         output,timings=self.fixture()
@@ -688,5 +734,15 @@ class FixedMetadataTest(unittest.TestCase):
                 validate_metadata_fixed(bad,timings,2)
         with self.assertRaises(ValueError):validate_metadata_fixed(output,{**timings,'metadata-create':0},2)
         with self.assertRaises(ValueError):validate_resume_selection('metadata',{'metadata_fixed_only':True,'consumer_command_names':['consumer-musl-1']},None)
+
+    def test_malformed_extra_metadata_record_is_rejected(self):
+        from cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        for line in ('COST METADATA WORK metadata-create 2048 junk',
+                     'COST METADATA CPUS 2 junk',
+                     'COST METADATA LATENCY metadata-create 10 20 30 junk',
+                     'COST METADATA RSS metadata-create 128 256 junk'):
+            with self.subTest(line=line),self.assertRaises(ValueError):
+                validate_metadata_fixed(output+'\n'+line,timings,2)
 
 if __name__ == '__main__': unittest.main()

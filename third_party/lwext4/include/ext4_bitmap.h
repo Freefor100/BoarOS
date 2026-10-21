@@ -65,7 +65,7 @@ static inline void ext4_bmap_bit_clr(uint8_t *bmap, uint32_t bit)
 /**@brief   Check if the bitmap bit is set.
  * @param   bmap bitmap buffer
  * @param   bit bit to check*/
-static inline bool ext4_bmap_is_bit_set(uint8_t *bmap, uint32_t bit)
+static inline bool ext4_bmap_is_bit_set(const uint8_t *bmap, uint32_t bit)
 {
 	return (*(bmap + (bit >> 3)) & (1 << (bit & 7)));
 }
@@ -73,7 +73,7 @@ static inline bool ext4_bmap_is_bit_set(uint8_t *bmap, uint32_t bit)
 /**@brief   Check if the bitmap bit is clear.
  * @param   bmap bitmap buffer
  * @param   bit bit to check*/
-static inline bool ext4_bmap_is_bit_clr(uint8_t *bmap, uint32_t bit)
+static inline bool ext4_bmap_is_bit_clr(const uint8_t *bmap, uint32_t bit)
 {
 	return !ext4_bmap_is_bit_set(bmap, bit);
 }
@@ -89,7 +89,7 @@ void ext4_bmap_bits_free(uint8_t *bmap, uint32_t sbit, uint32_t bcnt);
  * @param   ebit end bit of search
  * @param   bit_id output parameter (first free bit)
  * @return  standard error code*/
-int ext4_bmap_bit_find_clr(uint8_t *bmap, uint32_t sbit, uint32_t ebit,
+int ext4_bmap_bit_find_clr(const uint8_t *bmap, uint32_t sbit, uint32_t ebit,
 			   uint32_t *bit_id);
 
 #ifdef __cplusplus

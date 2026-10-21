@@ -185,11 +185,8 @@ static uint32_t ext4_xattr_block_checksum(struct ext4_inode_ref *inode_ref,
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
 
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
-		uint32_t orig_checksum;
-
-		/* Preparation: temporarily set bg checksum to 0 */
-		orig_checksum = header->h_checksum;
-		header->h_checksum = 0;
+        /* Readers borrow immutable payloads. Normalize the checksum bytes in
+         * the CRC calculation instead of changing a shared accepted block. */
 		/* Start with the filesystem metadata checksum seed. */
 		checksum = ext4_sb_get_csum_seed(sb);
 		/* Then calculate crc32 checksum block number */
@@ -197,9 +194,9 @@ static uint32_t ext4_xattr_block_checksum(struct ext4_inode_ref *inode_ref,
 		    ext4_crc32c(checksum, &le64_blocknr, sizeof(le64_blocknr));
 		/* Finally calculate crc32 checksum against
 		 * the entire xattr block */
-		checksum =
-		    ext4_crc32c(checksum, header, ext4_sb_get_block_size(sb));
-		header->h_checksum = orig_checksum;
+        checksum = ext4_crc32c_zeroed(checksum, header, ext4_sb_get_block_size(sb),
+            offsetof(struct ext4_xattr_header, h_checksum),
+            offsetof(struct ext4_xattr_header, h_checksum) + 2);
 	}
 	return checksum;
 }
@@ -217,6 +214,20 @@ static void ext4_xattr_set_block_checksum(struct ext4_inode_ref *inode_ref,
 
 	header->h_checksum =
 	    ext4_xattr_block_checksum(inode_ref, blocknr, header);
+}
+
+static int ext4_xattr_get_write_block(struct ext4_inode_ref *inode,
+                                      ext4_fsblk_t lba, struct ext4_block *block)
+{
+    struct ext4_fs *fs = inode->fs;
+    if (lba < ext4_get32(&fs->sb, first_data_block) || lba >= ext4_sb_get_blocks_cnt(&fs->sb))
+        return EUCLEAN;
+    /* Several independent inodes may own this EA block. The physical group
+     * qualification covers refcount, payload and checksum through acceptance;
+     * borrow the latest write view only after a previous owner has left. */
+    int result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP,
+        ext4_balloc_get_bgid_of_block(&fs->sb, lba));
+    return result ? result : ext4_trans_block_get(fs->bdev, block, lba);
 }
 
 struct xattr_prefix {
@@ -839,7 +850,7 @@ int ext4_xattr_release_inode_block(struct ext4_inode_ref *inode_ref)
 	ext4_fsblk_t lba = ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
 	if (!lba) return EOK;
 	struct ext4_block block;
-	int ret = ext4_trans_block_get(fs->bdev, &block, lba);
+	int ret = ext4_xattr_get_write_block(inode_ref, lba, &block);
 	if (ret != EOK) return ret;
 	struct ext4_xattr_header *header = EXT4_XATTR_BHDR(&block);
 	uint32_t references = to_le32(header->h_refcount);
@@ -961,7 +972,7 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 	 * If there is a xattr block used by the inode
 	 */
 	if (xattr_block) {
-		ret = ext4_trans_block_get(fs->bdev, &block, xattr_block);
+		ret = ext4_block_get(fs->bdev, &block, xattr_block);
 		if (ret != EOK)
 			goto out;
 
@@ -1087,7 +1098,7 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		}
 
 		block_finder.i = i;
-		ret = ext4_trans_block_get(fs->bdev, &block, xattr_block);
+		ret = ext4_block_get(fs->bdev, &block, xattr_block);
 		if (ret != EOK)
 			goto out;
 
@@ -1253,7 +1264,7 @@ int ext4_xattr_remove(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		goto out;
 	}
 	if (ibody_finder.s.not_found && xattr_block) {
-		ret = ext4_trans_block_get(fs->bdev, &block, xattr_block);
+		ret = ext4_xattr_get_write_block(inode_ref, xattr_block, &block);
 		if (ret != EOK)
 			goto out;
 
@@ -1372,7 +1383,7 @@ static int ext4_xattr_block_set(struct ext4_inode_ref *inode_ref,
 
 		orig_xattr_block =
 		    ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
-		ret = ext4_trans_block_get(fs->bdev, &block, orig_xattr_block);
+		ret = ext4_xattr_get_write_block(inode_ref, orig_xattr_block, &block);
 		if (ret != EOK) {
 			ext4_xattr_try_free_block(inode_ref);
 			goto out;
@@ -1402,7 +1413,7 @@ static int ext4_xattr_block_set(struct ext4_inode_ref *inode_ref,
 		struct ext4_xattr_finder finder;
 		struct ext4_xattr_header *header;
 		finder.i = *i;
-		ret = ext4_trans_block_get(fs->bdev, &block, orig_xattr_block);
+		ret = ext4_xattr_get_write_block(inode_ref, orig_xattr_block, &block);
 		if (ret != EOK)
 			goto out;
 
@@ -1442,7 +1453,7 @@ static int ext4_xattr_block_set(struct ext4_inode_ref *inode_ref,
 
 		if (allocated) {
 			ext4_block_set(fs->bdev, &block);
-			new_block = block;
+			block = new_block;
 		}
 
 		ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
@@ -1492,7 +1503,7 @@ static int ext4_xattr_block_remove(struct ext4_inode_ref *inode_ref,
 	orig_xattr_block = ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
 
 	ext4_assert(orig_xattr_block);
-	ret = ext4_trans_block_get(fs->bdev, &block, orig_xattr_block);
+	ret = ext4_xattr_get_write_block(inode_ref, orig_xattr_block, &block);
 	if (ret != EOK)
 		goto out;
 

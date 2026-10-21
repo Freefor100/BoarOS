@@ -23,7 +23,7 @@ static bool valid_block(struct ext4_inode_ref *ref, ext4_fsblk_t block)
 static int free_block(struct ext4_inode_ref *ref, ext4_fsblk_t block)
 {
     if (!valid_block(ref, block) ||
-        ext4_inode_get_blocks_count(&ref->fs->sb, ref->inode) <
+        ext4_inode_get_blocks_count(ext4_fs_super(ref->fs), ref->inode) <
         ref->fs->bdev->lg_bsize / EXT4_INODE_BLOCK_SIZE) return EUCLEAN;
     return ext4_balloc_free_block(ref, block);
 }
@@ -127,12 +127,12 @@ int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
     if (!ref || !ref->fs || !ref->inode || !done) return EINVAL;
     *done = false;
     struct ext4_fs *fs = ref->fs;
-    struct ext4_sblock *sb = &fs->sb;
+    struct ext4_sblock *sb = ext4_fs_super(fs);
     if (fs->read_only) return EROFS;
     if (fs->jbd_journal) {
-        if (!fs->curr_trans) return EINVAL;
+        if (!ext4_current_trans(fs)) return EINVAL;
         if (fs->jbd_journal->error) return fs->jbd_journal->error;
-        if (fs->curr_trans->error) return fs->curr_trans->error;
+        if (ext4_current_trans(fs)->error) return ext4_current_trans(fs)->error;
     }
     uint32_t size = fs->bdev->lg_bsize;
     uint64_t target = ext4_inode_get_size(sb, ref->inode);

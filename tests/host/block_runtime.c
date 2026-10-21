@@ -2,6 +2,8 @@
 #include <pthread.h>
 #include <assert.h>
 #include <stdlib.h>
+static _Thread_local struct kernel_io_context model_io;
+struct kernel_io_context *kernel_io_context_current(void) { return &model_io; }
 /* Explicit host execution model for standalone block/lwext4 fixtures. Keep
  * the production lock calls intact; each device gets a real blocking mutex. */
 struct model_mutex { struct kernel_rwlock *object; pthread_mutex_t mutex; struct model_mutex *next; };

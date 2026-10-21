@@ -106,7 +106,7 @@ void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
     if (!target || target->logical_id >= cpu_count) __builtin_trap();
     __atomic_fetch_or(&target->events, events, __ATOMIC_RELEASE);
     if (target != source) source->outbound |= 1U << target->logical_id;
-    if (!source->raw_locks) kernel_cpu_flush_notifications();
+    if (!source->raw_locks && source->outbound) kernel_cpu_flush_notifications();
     arch_interrupt_restore(irq);
 }
 
@@ -192,7 +192,8 @@ void riscv_smp_secondary_high(void)
 void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
                      uint64_t final, uint32_t frequency)
 {
-    if (!info || !info->count || info->count > BOAROS_MAX_CPUS || cpu_count ||
+    if (!info || !info->count || info->count > BOAROS_MAX_CPUS ||
+        info->count != kernel_cpu_get_boot_count() || cpu_count ||
         !frequency || info->hart_ids[0] != kernel_cpu_current()->hardware_id)
         riscv_smp_fail("CPU-input", -1);
     cpus[0] = kernel_cpu_current();

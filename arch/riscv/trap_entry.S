@@ -1,5 +1,6 @@
 #include <arch/riscv/trap.h>
 #include <arch/riscv/thread.h>
+#include <arch/riscv/context.h>
 
     .section .text, "ax", @progbits
     .align 2
@@ -19,8 +20,8 @@ riscv_trap_entry:
 #if BOAROS_COST_DIAGNOSTICS
     sd t1, RISCV_TRAP_FRAME_T1(sp)
     rdtime t0
-    la t1, kernel_cost_trap_timestamp
-    sd t0, 0(t1)
+    ld t1, RISCV_THREAD_STATE_CPU(tp)
+    sd t0, RISCV_CPU_COST_OFFSET+RISCV_COST_TRAP_TIMESTAMP(t1)
 #endif
     sd tp, RISCV_TRAP_FRAME_TP(sp)
     sd zero, RISCV_TRAP_FRAME_KERNEL_TP(sp)
@@ -37,8 +38,8 @@ riscv_trap_entry:
 #if BOAROS_COST_DIAGNOSTICS
     sd t1, RISCV_TRAP_FRAME_T1(sp)
     rdtime t0
-    la t1, kernel_cost_trap_timestamp
-    sd t0, 0(t1)
+    ld t1, RISCV_THREAD_STATE_CPU(tp)
+    sd t0, RISCV_CPU_COST_OFFSET+RISCV_COST_TRAP_TIMESTAMP(t1)
 #endif
     ld t0, RISCV_THREAD_STATE_USER_SP(tp)
     sd t0, RISCV_TRAP_FRAME_SP(sp)
@@ -167,15 +168,19 @@ riscv_trap_return:
     ld t5, RISCV_TRAP_FRAME_T5(sp)
     ld t6, RISCV_TRAP_FRAME_T6(sp)
 #if BOAROS_COST_DIAGNOSTICS
-    la t0, kernel_cost_return_pending
-    ld t1, 0(t0)
+    /* tp already contains user TLS here; recover the kernel owner from the frame. */
+    ld t0, RISCV_TRAP_FRAME_KERNEL_TP(sp)
+    bnez t0, .Lcost_return_owner
+    ld t0, RISCV_TRAP_FRAME_TP(sp)
+.Lcost_return_owner:
+    ld t0, RISCV_THREAD_STATE_CPU(t0)
+    ld t1, RISCV_CPU_COST_OFFSET+RISCV_COST_RETURN_PENDING(t0)
     beqz t1, .Lcost_return_saved
     rdtime t1
-    la t0, kernel_cost_return_timestamp
-    sd t1, 0(t0)
-    la t0, kernel_cost_return_pending
+    sd t1, RISCV_CPU_COST_OFFSET+RISCV_COST_RETURN_TIMESTAMP(t0)
     li t1, 1
-    sd t1, 0(t0)
+    fence w, w
+    sd t1, RISCV_CPU_COST_OFFSET+RISCV_COST_RETURN_PENDING(t0)
 .Lcost_return_saved:
     ld t0, RISCV_TRAP_FRAME_T0(sp)
     ld t1, RISCV_TRAP_FRAME_T1(sp)

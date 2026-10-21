@@ -10,8 +10,10 @@ static struct kernel_cost_task task;
 static uint64_t ticks;
 void *sync_test_cpu(void) { return &cpu; }
 uint64_t kernel_cost_clock(void) { return ++ticks; }
-uint64_t kernel_cost_lock(void) { return arch_interrupt_save(); }
-void kernel_cost_unlock(uint64_t saved) { arch_interrupt_restore(saved); }
+uint64_t kernel_cost_irq_save(void) { return arch_interrupt_save(); }
+void kernel_cost_irq_restore(uint64_t saved) { arch_interrupt_restore(saved); }
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void) { return &task; }
 int main(void)
 {

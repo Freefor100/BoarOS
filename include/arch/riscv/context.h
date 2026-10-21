@@ -19,6 +19,10 @@
 #define RISCV_SWITCH_CONTEXT_SIZE 128
 
 #define RISCV_SSTATUS_SIE 0x2
+#define RISCV_CPU_COST_OFFSET 32
+#define RISCV_COST_TRAP_TIMESTAMP 0
+#define RISCV_COST_RETURN_TIMESTAMP 8
+#define RISCV_COST_RETURN_PENDING 16
 
 #ifndef __ASSEMBLER__
 
@@ -113,18 +117,22 @@ static inline int riscv_interrupt_is_enabled(void)
     return (status & RISCV_SSTATUS_SIE) != 0U;
 }
 
+#if defined(__riscv)
+/* TP names the executing stack owner. Giving it a C register identity lets
+ * embedded-state reads share that owner without repeated asm moves. */
+register void *riscv_current_is_tp __asm__("tp");
+
 static inline void riscv_current_thread_set(void *thread)
 {
-    __asm__ volatile("mv tp, %0" : : "r"(thread) : "memory");
+    riscv_current_is_tp = thread;
+    __asm__ volatile("" : : "r"(riscv_current_is_tp) : "memory");
 }
 
 static inline void *riscv_current_thread_get(void)
 {
-    void *thread;
-
-    __asm__ volatile("mv %0, tp" : "=r"(thread));
-    return thread;
+    return riscv_current_is_tp;
 }
+#endif
 
 #endif
 

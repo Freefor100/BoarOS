@@ -247,6 +247,15 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
  * @return  standard error code*/
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 		   uint64_t lba);
+enum ext4_block_access {
+    EXT4_BLOCK_READ,
+    EXT4_BLOCK_WRITE,
+};
+/* Select one private-view action after loading this record. Failed loads are
+ * returned here; WRITE preparation failures leave the descriptor for the
+ * transaction wrapper to return without flushing. Ordinary get reads all. */
+int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
+    uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access);
 /* Cache-aware reads. Successful blocks retain one caller reference each,
  * failed blocks are released. Duplicate LBAs share content and loading. */
 int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,

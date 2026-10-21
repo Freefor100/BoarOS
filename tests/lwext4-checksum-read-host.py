@@ -33,11 +33,11 @@ def main():
                 with base.open('wb') as f: f.truncate(32*1024*1024)
                 subprocess.run(['mkfs.ext4', '-q', '-F', '-b', str(block), '-I', str(inode), str(base)], check=True)
                 subprocess.run([str(program), str(base), 'seed'], check=True, stdout=log, stderr=log)
-                for mode in ('gdt', 'inode'):
+                for mode in ('gdt', 'inode', 'dx'):
                     image = out/f'{block}-{inode}-{mode}.img'
                     subprocess.run(['cp', '--sparse=always', str(base), str(image)], check=True)
                     subprocess.run([str(program), str(image), mode], check=True, stdout=log, stderr=log)
                     subprocess.run(['e2fsck', '-fn', str(image)], check=True, stdout=log, stderr=log)
-    print('PASS: 8 overlapping checksum reads, immutable buffers, heap owners and independent e2fsck')
+    print('PASS: 12 overlapping GDT/inode/htree checksum reads, immutable buffers, corrupt htree rejection, heap owners and independent e2fsck')
 
 if __name__ == '__main__': main()

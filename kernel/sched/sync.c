@@ -1,5 +1,7 @@
 #include <arch/context.h>
+#include <arch/timer.h>
 #include <kernel/sync.h>
+#include <kernel/time.h>
 #include <kernel/wait_internal.h>
 #include "private.h"
 
@@ -14,7 +16,10 @@ struct kernel_lock_waiter {
 };
 struct kernel_io_context *kernel_io_context_current(void)
 {
-    struct kernel_task *task = kernel_task_current();
+    /* I/O ownership follows the executing stack/tp, including the interval
+     * after cpu.current publishes the next task but before the stack switch.
+     * It needs no borrowed CPU record or interrupt-masked task lookup. */
+    struct kernel_task *task = arch_current_thread_get();
     return task ? &task->io_context : kernel_cpu_current()->bootstrap_io;
 }
 
@@ -34,9 +39,29 @@ static __attribute__((noinline)) void register_waiter(struct kernel_rwlock *lock
     else lock->pending_head = waiter;
     lock->pending_tail = waiter;
 }
+#if BOAROS_MAX_CPUS > 1
+static uint64_t queued_spin_budget(struct kernel_rwlock *lock,struct kernel_lock_waiter *waiter)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    unsigned online=0;
+    unsigned local=kernel_cpu_current()->logical_id;
+    int running_writer=0;
+    for(struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        if(!kernel_cpu_online(cpu))continue;
+        online++;
+        struct kernel_task *task=cpu->current;
+        if(lock->pending_head==waiter && lock->writer && cpu->logical_id!=local &&
+           task && task->state==KERNEL_THREAD_STATE_RUNNING && task->wait.on_cpu &&
+           &task->io_context==lock->writer)running_writer=1;
+    }
+    /* CPU current can name the next stack before its switch. This snapshot
+     * only selects a bounded wait, never grants ownership or pins that task. */
+    return online<2?0:running_writer?UINT64_C(1000000):UINT64_C(50000);
+}
+#endif
 /* waiter仅竞争时驻留慢路径栈；返回前结束token，且对象raw仍由调用者持有。 */
 static __attribute__((noinline)) uint64_t acquire_waiter(struct kernel_rwlock *lock,
-    struct kernel_io_context *owner, int write, struct kernel_raw_guard *metadata
+    struct kernel_io_context *owner, int write, struct kernel_raw_guard *metadata,uintptr_t irq
 #if BOAROS_COST_DIAGNOSTICS
     , unsigned rank, enum kernel_cost_metric metric
 #endif
@@ -44,17 +69,41 @@ static __attribute__((noinline)) uint64_t acquire_waiter(struct kernel_rwlock *l
 {
     struct kernel_lock_waiter waiter = {.owner = owner, .write = write};
     register_waiter(lock, &waiter);
+#if BOAROS_MAX_CPUS > 1
+    uint64_t spin=queued_spin_budget(lock,&waiter);
+#else
+    (void)irq;
+#endif
     while (!waiter.granted) {
         struct kernel_wait_token parked = waiter.token;
         kernel_raw_lock_release(metadata);
+#if BOAROS_MAX_CPUS > 1
+        if(spin) {
+            uint64_t budget=spin;
+            spin=0;
+            /* The FIFO waiter remains registered and owns its stack. Restore
+             * the caller's IRQ state while a remote owner can finish; neither
+             * a later arrival nor this poll may steal another waiter's grant. */
+            arch_interrupt_restore(irq);
+            uint64_t now=kernel_time_monotonic_ns(),deadline;
+            if(now<=UINT64_MAX-budget && kernel_time_deadline_from_monotonic(
+                now+budget,&deadline)==KERNEL_TIME_STATUS_OK) {
+                while(!__atomic_load_n(&waiter.granted,__ATOMIC_ACQUIRE) &&
+                      (int64_t)(arch_time_read()-deadline)<0) {}
+            }
+            (void)arch_interrupt_save();
+        }
+#endif
         enum kernel_wait_wake_reason reason;
 #if BOAROS_COST_DIAGNOSTICS
+        uint64_t cost_irq=kernel_cost_lock();
         struct kernel_cost_task *task = kernel_cost_current();
         if (task) {
             if (task->wait_flags & 1) kernel_cost_add((enum kernel_cost_metric)(metric+4),1);
             task->wait_flags &= (uint8_t)~1U; task->wait_rank = (uint8_t)(rank+1);
         }
         kernel_cost_add((enum kernel_cost_metric)(metric+2),1);
+        kernel_cost_unlock(cost_irq);
 #endif
         if (kernel_wait_park(&parked, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         /* pending中的token只在对象raw内更新；finish清局部副本，允许间隙授资格。 */
@@ -79,8 +128,8 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (!lock || !guard || guard->lock || !lock->waiters.initialized) __builtin_trap();
-    for (struct kernel_lock_guard *held = owner->locks; held; held = held->previous)
-        if (held->lock == lock) __builtin_trap();
+    /* Held keys increase strictly. The top check also rejects reacquiring
+     * any earlier lock, so acquisition never needs another full-stack scan. */
     if (owner->locks) {
         const struct kernel_rwlock *outer = owner->locks->lock;
         if (outer->rank > lock->rank ||
@@ -88,9 +137,8 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     }
 #if BOAROS_COST_DIAGNOSTICS
     unsigned rank = kernel_cost_rank(lock->rank);
-    enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_LOCK10_ATTEMPTS + rank*8);
+    enum kernel_cost_metric metric = kernel_cost_lock_metric(rank);
     uint64_t wait_start = kernel_cost_clock();
-    uint64_t hold_start = wait_start;
     kernel_cost_add(metric,1);
 #endif
     struct kernel_raw_guard metadata = {0};
@@ -102,13 +150,13 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         return 0;
     }
 #if BOAROS_COST_DIAGNOSTICS
-    uint64_t grant_ticks = hold_start;
+    uint64_t grant_ticks;
 #endif
     if (busy) {
 #if BOAROS_COST_DIAGNOSTICS
-        grant_ticks = acquire_waiter(lock, owner, write, &metadata, rank, metric);
+        grant_ticks = acquire_waiter(lock, owner, write, &metadata, irq, rank, metric);
 #else
-        (void)acquire_waiter(lock, owner, write, &metadata);
+        (void)acquire_waiter(lock, owner, write, &metadata, irq);
 #endif
     } else {
         if (write) lock->writer = owner;
@@ -116,6 +164,9 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
             if (lock->readers == UINT32_MAX) __builtin_trap();
             lock->readers++;
         }
+#if BOAROS_COST_DIAGNOSTICS
+        grant_ticks = kernel_cost_clock();
+#endif
     }
     kernel_raw_lock_release(&metadata);
     *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write
@@ -124,12 +175,14 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
 #endif
     };
 #if BOAROS_COST_DIAGNOSTICS
+    uint64_t cost_irq=kernel_cost_lock();
     struct kernel_cost_task *task = kernel_cost_current();
     if (task) { task->wait_rank = 0; task->wait_flags &= (uint8_t)~1U; }
     kernel_cost_add((enum kernel_cost_metric)(metric+1),1);
-    kernel_cost_sample((enum kernel_cost_metric)(metric+5),kernel_cost_clock()-wait_start);
+    kernel_cost_sample((enum kernel_cost_metric)(metric+5),grant_ticks-wait_start);
     struct kernel_cost_scope hold = kernel_cost_enter((enum kernel_cost_metric)(metric+6));
     guard->cost_start = grant_ticks; guard->cost_registered = hold.actor != 0;
+    kernel_cost_unlock(cost_irq);
 #endif
     owner->locks = guard;
     arch_interrupt_restore(irq);
@@ -151,6 +204,13 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
     if (!guard || !guard->lock || guard->owner != owner || owner->locks != guard)
         __builtin_trap();
     struct kernel_rwlock *lock = guard->lock;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_scope hold = {
+        .start=guard->cost_start,
+        .actor=guard->cost_registered ? kernel_cost_current() : 0,
+        .metric=(enum kernel_cost_metric)(kernel_cost_lock_metric(kernel_cost_rank(lock->rank))+6)};
+    uint64_t released;
+#endif
     struct kernel_raw_guard metadata = {0};
     kernel_raw_lock_acquire(&lock->metadata, &metadata);
     if (guard->write) {
@@ -161,11 +221,7 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
         lock->readers--;
     }
 #if BOAROS_COST_DIAGNOSTICS
-    struct kernel_cost_scope hold = {
-        .tag={guard->cost_registered ? kernel_cost_epoch() : 0,0}, .start=guard->cost_start,
-        .actor=guard->cost_registered ? kernel_cost_current() : 0,
-        .metric=(enum kernel_cost_metric)(COST_LOCK10_HOLD_TICKS+kernel_cost_rank(lock->rank)*8)};
-    kernel_cost_leave(&hold);
+    released = kernel_cost_clock();
 #endif
     owner->locks = guard->previous;
     *guard = (struct kernel_lock_guard){0};
@@ -186,10 +242,10 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
                     if (lock->readers == UINT32_MAX) __builtin_trap();
                     lock->readers++;
                 }
-                next->granted = 1;
 #if BOAROS_COST_DIAGNOSTICS
                 next->grant_ticks = kernel_cost_clock();
 #endif
+                __atomic_store_n(&next->granted,1,__ATOMIC_RELEASE);
                 /* token定向通知；资格先于wake，非运行获得者也计入占用。 */
                 if (kernel_wait_notify(&next->token, KERNEL_WAIT_WOKEN) != KERNEL_SCHEDULER_STATUS_OK)
                     __builtin_trap();
@@ -209,6 +265,10 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
     }
     kernel_raw_lock_release(&metadata);
     arch_interrupt_restore(irq);
+#if BOAROS_COST_DIAGNOSTICS
+    /* Qualification has ended; observer publication must not extend its hold. */
+    kernel_cost_leave_at(&hold,released);
+#endif
 }
 
 int kernel_lock_held(const struct kernel_rwlock *lock, int write)

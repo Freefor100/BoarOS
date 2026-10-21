@@ -62,6 +62,9 @@ COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务
 
 `dtb_read_cpu_info()`验证固定容量的CPU快照，保留真实hart ID，忽略disabled CPU和cpu-map拓扑节点；
 boot hart固定在逻辑0，其余按ID排序。重复、损坏、缺boot hart或超容量失败时不改输出。
+高地址入口在首次挂载前一次性发布已验证的启动 CPU 数，后续 HSM 启动核对同一快照。
+文件系统据此选择单执行者或并行策略；根挂载启动 worker 时，secondary 尚未 ONLINE，
+因此在线计数不用于这项选择。
 `secondary.S`使用独立16KiB静态栈与镜像mailbox，不清BSS；过渡映射后的高地址入口重绑gp/tp、
 stvec/sscratch及最终satp。内核仍通过`tp→任务→CPU`定位，用户TLS契约保持。
 
@@ -240,7 +243,7 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 ## 普通文件IO的执行位置
 
-ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。同一挂载仍以 namespace mutex 串行修改目录和事务；journal/checkpoint 与后台数据写回由 CPU0 推进。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
+ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。SMP journal 挂载的路径操作按实际目录取得共享或独占资格，rename 另由挂载拓扑互斥协调；已打开文件操作按实际 inode／块组取得资格。不同对象的私有修改可同时准备，接纳时合并版本和计数。默认单核、无 journal 挂载及其他后端保留原串行策略。journal/checkpoint 与后台数据写回由 CPU0 推进，启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
 
 普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 

@@ -17,8 +17,10 @@ static uint64_t ticks;
 static int inaccessible;
 void kernel_console_putc(char c) { fputc(c, stderr); }
 uint64_t kernel_cost_clock(void) { return ++ticks; }
-uint64_t kernel_cost_lock(void) { return 0; }
-void kernel_cost_unlock(uint64_t saved) { (void)saved; }
+uint64_t kernel_cost_irq_save(void) { return 0; }
+void kernel_cost_irq_restore(uint64_t saved) { (void)saved; }
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void) { return &task; }
 static void *access_page(uint64_t address)
 {

@@ -8,22 +8,20 @@
 #include <ext4_inode.h>
 #include <kernel/tmpfs.h>
 static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
-static unsigned metadata_probe,metadata_open_calls,metadata_failed_stage;
+static unsigned metadata_probe,metadata_open_calls;
+static const char *metadata_failed_step;
 int __real_ext4_transaction_begin(const char *);
 int __wrap_ext4_transaction_begin(const char *mount)
-{ int r=__real_ext4_transaction_begin(mount);if(metadata_probe && r)metadata_failed_stage=1;return r; }
+{ int r=__real_ext4_transaction_begin(mount);if(metadata_probe && r)metadata_failed_step="begin";return r; }
 int __real_ext4_fopen2(ext4_file *,const char *,int);
 int __wrap_ext4_fopen2(ext4_file *file,const char *path,int flags)
-{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_fopen2(file,path,flags);if(metadata_probe && r)metadata_failed_stage=2;return r; }
-int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *);
-int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file)
-{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file);if(metadata_probe && r)metadata_failed_stage=2;return r; }
-int __real_ext4_file_set_mode_initial(ext4_file *,uint32_t);
-int __wrap_ext4_file_set_mode_initial(ext4_file *file,uint32_t mode)
-{ int r=__real_ext4_file_set_mode_initial(file,mode);if(metadata_probe && r)metadata_failed_stage=3;return r; }
+{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_fopen2(file,path,flags);if(metadata_probe && r)metadata_failed_step="open";return r; }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *);
+int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file,struct ext4_inode *initial)
+{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file,initial);if(metadata_probe && r)metadata_failed_step="create";return r; }
 int __real_ext4_transaction_end(const char *);
 int __wrap_ext4_transaction_end(const char *mount)
-{ int r=__real_ext4_transaction_end(mount);if(metadata_probe && r)metadata_failed_stage=4;return r; }
+{ int r=__real_ext4_transaction_end(mount);if(metadata_probe && r)metadata_failed_step="end";return r; }
 int __real_ext4_file_complete_write(ext4_file *);
 int __wrap_ext4_file_complete_write(ext4_file *file)
 { if (fail_complete) { fail_complete=0; return EIO; } return __real_ext4_file_complete_write(file); }
@@ -536,12 +534,15 @@ static void namespace_pressure(struct kernel_page_cache *cache,struct kernel_vfs
 static uint64_t metadata_clock(void *unused) { (void)unused;return 1; }
 static void metadata_limit(struct jbd_journal *journal,size_t block)
 {
-    journal->memory_limit=journal->memory_used;
-    (void)jbd_journal_operation_room(journal,0,0,NULL,0);
-    assert(!journal->memory_cached);
-    size_t occupied=journal->memory_used,margin=block;
-    do { journal->memory_limit=occupied+margin;margin+=block; }
-    while (!jbd_journal_operation_room(journal,0,0,NULL,0));
+    struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
+    ext4_fs_state_read_lock(fs);
+    jbd_memory_set_limit(journal,jbd_memory_used(journal));
+    (void)jbd_journal_operation_room(journal,NULL,0,0,NULL,0);
+    assert(!jbd_memory_cached(journal));
+    size_t occupied=jbd_memory_used(journal),margin=block;
+    do { jbd_memory_set_limit(journal,occupied+margin);margin+=block; }
+    while (!jbd_journal_operation_room(journal,NULL,0,0,NULL,0));
+    ext4_fs_state_unlock(fs);
 }
 static enum kernel_block_status (*metadata_original_read)(void *,uint64_t,void *,size_t);
 static unsigned metadata_read_error;
@@ -564,13 +565,11 @@ static int apply_metadata_fault(void *context)
     assert(kernel_heap_allocate(fault->adapter->instance.heap,2*BOAROS_PAGE_SIZE,&allocation)==KERNEL_HEAP_STATUS_EMPTY);
     return ENOMEM;
 }
-struct metadata_nested { const char *path;ext4_file file;unsigned calls; };
+struct metadata_nested { const char *mount;ext4_file file;unsigned calls; };
 static int apply_metadata_nested(void *context)
 {
     struct metadata_nested *request=context;request->calls++;
-    int result=ext4_fopen2(&request->file,request->path,O_CREAT|O_RDWR);
-    if (!result) result=ext4_file_set_mode_initial(&request->file,0640);
-    return result;
+    return ext4_create_child(request->mount,EXT4_INODE_ROOT_INDEX,"budget-nested",0100640,0,NULL,&request->file,NULL);
 }
 static void namespace_budget(struct kernel_vfs_mount *mount)
 {
@@ -600,11 +599,11 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
     assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,4*1024*1024));
     static const char *operations[]={"create","mkdir","mknod","rename","link","symlink","unlink","rmdir","chown"};
     for (unsigned operation=0;operation<9;operation++) {
-        journal->memory_limit=4*1024*1024;assert(!ext4_journal_group_drain(adapter->mount_point));
+        jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
         memset(bytes,0x69+operation,length);assert(!ext4_fpwrite(&seed,0,bytes,length,&done) && done==length);
         metadata_limit(journal,block);
-        uint64_t before=journal->budget_failures,checkpoint=journal->checkpoint_sequence;
-        metadata_probe=1;metadata_open_calls=metadata_failed_stage=0;
+        uint64_t before=jbd_memory_budget_failures(journal),checkpoint=journal->checkpoint_sequence;
+        metadata_probe=1;metadata_open_calls=0;metadata_failed_step=NULL;
         struct kernel_vfs_file file={0};int result;
         switch (operation) {
         case 0:result=create_file(mount,"/budget-created",0640,&file);break;
@@ -618,13 +617,13 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
         default:result=kernel_vfs_file_set_owner(&source,12345,23456);break;
         }
         metadata_probe=0;
-        fprintf(stderr,"metadata budget %s result=%d stage=%u attempts=%u failures=%llu checkpoint=%llu->%llu\n",
-            operations[operation],result,metadata_failed_stage,metadata_open_calls,(unsigned long long)(journal->budget_failures-before),
+        fprintf(stderr,"metadata budget %s result=%d step=%s attempts=%u failures=%llu checkpoint=%llu->%llu\n",
+            operations[operation],result,metadata_failed_step?metadata_failed_step:"none",metadata_open_calls,(unsigned long long)(jbd_memory_budget_failures(journal)-before),
             (unsigned long long)checkpoint,(unsigned long long)journal->checkpoint_sequence);
         assert(!result);
-        assert(journal->budget_failures>before && journal->checkpoint_sequence>checkpoint);
+        assert(jbd_memory_budget_failures(journal)>before && journal->checkpoint_sequence>checkpoint);
         if (operation==8) assert(owner->sync_sequence==journal->accepted_sequence);
-        journal->memory_limit=4*1024*1024;assert(!ext4_journal_group_drain(adapter->mount_point));
+        jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
         struct kernel_vfs_stat stat;
         if (!operation) assert(!kernel_vfs_fstat(&file,&stat) && (stat.mode&0777)==0640 && !kernel_vfs_close(&file));
         if (operation==1) assert(!kernel_vfs_open(mount,"/budget-created-dir",&file) && !kernel_vfs_fstat(&file,&stat) && (stat.mode&0777)==0710 && !kernel_vfs_close(&file));
@@ -645,44 +644,43 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
         }
     }
     assert(!kernel_vfs_path_release(&root) && !kernel_vfs_close(&source) && !kernel_vfs_close(&victim) && !kernel_vfs_close(&removed) && !kernel_vfs_close(&directory));
-    journal->memory_limit=4*1024*1024;assert(!ext4_journal_group_drain(adapter->mount_point));
+    jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
     struct kernel_vfs_statfs space_before,space_after;
     assert(!kernel_vfs_mount_statfs(mount,&space_before));
     metadata_limit(journal,block);
-    uint64_t before=journal->budget_failures,checkpoint=journal->checkpoint_sequence;
+    uint64_t before=jbd_memory_budget_failures(journal),checkpoint=journal->checkpoint_sequence;
     struct kernel_vfs_file absent={0};metadata_open_calls=0;metadata_probe=1;
     int result=create_file(mount,"/budget-too-large",0600,&absent);metadata_probe=0;
-    fprintf(stderr,"metadata no older owner: result=%d attempts=%u failures=%llu\n",result,metadata_open_calls,(unsigned long long)(journal->budget_failures-before));
-    assert(result==-KERNEL_ENOMEM && metadata_open_calls==1 && journal->budget_failures>before && journal->checkpoint_sequence==checkpoint);
-    journal->memory_limit=4*1024*1024;assert(!ext4_journal_group_drain(adapter->mount_point));
+    fprintf(stderr,"metadata no older owner: result=%d attempts=%u failures=%llu\n",result,metadata_open_calls,(unsigned long long)(jbd_memory_budget_failures(journal)-before));
+    assert(result==-KERNEL_ENOMEM && metadata_open_calls==1 && jbd_memory_budget_failures(journal)>before && journal->checkpoint_sequence==checkpoint);
+    jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
     assert(kernel_vfs_open(mount,"/budget-too-large",&absent)==-KERNEL_ENOENT && !kernel_vfs_mount_statfs(mount,&space_after));
     assert(space_before.free_blocks==space_after.free_blocks && space_before.free_inodes==space_after.free_inodes);
 
     assert(!ext4_fpwrite(&seed,0,bytes,length,&done) && done==length);metadata_limit(journal,block);
-    char nested_path[96];snprintf(nested_path,sizeof(nested_path),"%sbudget-nested",adapter->mount_point);
-    struct metadata_nested nested={.path=nested_path};checkpoint=journal->checkpoint_sequence;
+    struct metadata_nested nested={.mount=adapter->mount_point};checkpoint=journal->checkpoint_sequence;
     assert(!ext4_transaction_begin(adapter->mount_point));
     assert(ext4_metadata_execute(adapter->mount_point,apply_metadata_nested,&nested)==ENOMEM && nested.calls==1 && journal->checkpoint_sequence==checkpoint);
     assert(ext4_transaction_abort(adapter->mount_point,ENOMEM)==ENOMEM);
     if (nested.file.mp) assert(!ext4_fclose(&nested.file));
-    journal->memory_limit=4*1024*1024;assert(!ext4_journal_group_drain(adapter->mount_point));
+    jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
     assert(kernel_vfs_open(mount,"/budget-nested",&absent)==-KERNEL_ENOENT);
 
     assert(!ext4_fpwrite(&seed,0,bytes,length,&done) && done==length);
     struct ext4_inode_ref inode;struct ext4_inode_block_range range;
     assert(!ext4_fs_get_inode_ref(adapter->device.fs,seed.inode,&inode) && !ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range) && range.block && !ext4_fs_put_inode_ref(&inode));
     struct metadata_fault fault={.adapter=adapter,.block=range.block,.bytes=bytes,.io=1};
-    before=journal->budget_failures;checkpoint=journal->checkpoint_sequence;
+    before=jbd_memory_budget_failures(journal);checkpoint=journal->checkpoint_sequence;
     metadata_original_read=adapter->block->read;adapter->block->read=metadata_device_read;metadata_read_error=1;
     result=ext4_metadata_execute(adapter->mount_point,apply_metadata_fault,&fault);adapter->block->read=metadata_original_read;
-    assert(result==EIO && fault.calls==1 && !metadata_read_error && journal->budget_failures==before && journal->checkpoint_sequence==checkpoint && !journal->error);
+    assert(result==EIO && fault.calls==1 && !metadata_read_error && jbd_memory_budget_failures(journal)==before && journal->checkpoint_sequence==checkpoint && !journal->error);
     uint64_t *held=calloc(physical_page_total(adapter->instance.heap->page_allocator),sizeof(*held));assert(held);size_t count=0;
     while (!physical_page_allocate(adapter->instance.heap->page_allocator,&held[count])) count++;
     fault.io=0;fault.calls=0;
     result=ext4_metadata_execute(adapter->mount_point,apply_metadata_fault,&fault);
-    assert(result==ENOMEM && fault.calls==1 && journal->budget_failures==before && journal->checkpoint_sequence==checkpoint);
+    assert(result==ENOMEM && fault.calls==1 && jbd_memory_budget_failures(journal)==before && journal->checkpoint_sequence==checkpoint);
     for (size_t i=0;i<count;i++) assert(!physical_page_release(adapter->instance.heap->page_allocator,held[i]));
-    free(held);journal->memory_limit=4*1024*1024;assert(!ext4_journal_group_drain(adapter->mount_point));
+    free(held);jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
     unsigned char *actual=malloc(length);assert(actual);
     assert(!ext4_fpread(&seed,0,actual,length,&done) && done==length && !memcmp(bytes,actual,length));
     free(actual);free(bytes);assert(!ext4_fclose(&seed));

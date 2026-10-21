@@ -131,7 +131,7 @@ static int user_page_fault_access(uint64_t scause, uint32_t *access)
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
 #if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_irq_disabled(kernel_cost_trap_timestamp);
+    kernel_cost_irq_disabled(kernel_cost_cpu_current()->trap_timestamp);
 #endif
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
     struct kernel_cpu_account_scope accounting __attribute__((cleanup(kernel_cpu_account_trap_end)));

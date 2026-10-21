@@ -16,6 +16,7 @@ for block in 1024 4096; do
     truncate -s 32M "$work/disk.img"
     mkfs.ext4 -q -F -b "$block" -I 256 "$work/disk.img"
     "$work/probe" "$work/disk.img" seed
+    "$work/probe" "$work/disk.img" operation-context
     cp "$work/disk.img" "$work/base.img"
     for mode in group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure; do
         cp "$work/base.img" "$work/checkpoint.img"

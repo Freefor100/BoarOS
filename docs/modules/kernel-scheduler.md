@@ -20,7 +20,8 @@
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
-| `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
+| `include/kernel/task_state.h` | 任务存储的共同内部布局 |
+| `kernel/sched/private.h` | 调度器状态、组与队列成员关系 |
 
 USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务；普通服务与已有worker按OTHER队列轮转，迁移排到目标核队尾。用户`sched_yield`在发起CPU调用共同的`kernel_scheduler_yield_current()`，等待游标和回调借用归还也使用真实内核调度。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
@@ -72,11 +73,12 @@ COMMITTED任务的模拟backend与生产一样在通知中摘除默认节点，�
 回调保留借用并在锁外执行。
 finish每段最多摘16个登记，未借用的小批登记可在同一保护下结束；存在借用才等待归还。
 
-可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw再park。
+可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw后等待。
 `kernel_rwlock_try_write()`及mutex包装只尝试取得，不登记等待者；已有读/写owner、pending或handoff均返回忙，guard和IRQ状态保持。它保留相同rank/key、owner与上下文检查，不能用于越过FIFO或在raw内取得任务锁。
-未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束及pending摘除。
+未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束、pending摘除及重新取得对象raw，覆盖通知者的最后访问。
 FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
 已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。
+实际在线至少两CPU时，已登记的争用者在锁外恢复入口IRQ状态，短时间轮询自己的release/acquire资格标记。基础上限为50µs；仅FIFO队首且独占writer对应另一在线CPU的RUNNING/on_cpu任务时，上限为1ms。CPU/current只用于当时的预算提示，锁外不保留或解引用该任务；任务随后阻塞或切换仍受同一个绝对截止约束。到界沿原park路径等待，提前通知直接完成；单次取得只使用一次预算。默认UP构建消去此路径，SMP内核仅启动一CPU时也直接park。
 通知不等于资格：额外唤醒只更新等待token，不重排FIFO；旧登记结束与重取对象raw之间也允许授资格。guard的rank/key和任务owner
 保持原契约；等待仍不可中断，没有新增timed/interruptible API。
 
@@ -252,6 +254,12 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
+栈窗口优先选择首栈页与物理栈页号的低位一致的空槽，范围为一张末级页表的页数
+（RV为512，LA为2048）；同类槽用尽后沿位图查找任意空槽，保留完整容量。
+这样分散栈别名，减少实测QEMU中热栈与ext4对象的soft-TLB槽冲突；这项测量对应
+软件地址转换，真机收益尚未测量。RV的早期任务可能分布到三张L0表，相比原紧密
+布局最多多占两页，最后叶撤除后按原规则归还；LA沿用预建表。
+
 页/栈初始化只写已独占、对齐的私有存储，完整初始化后才发布。可信栈回收时用整字
 跳过全为填充值的前缀，再逐字节定位首处差异；不跨canary或高边界，余量统计仍精确
 到字节。host在4/16KiB下遍历全部前缀边界并检查坏canary拒绝回收，真实guard另测。
@@ -266,7 +274,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无普通用户任务跨核及文件/共享后备 MM 的 SMP 闭环、PI futex、实时信号队列、sigaltstack 或 clone3。受控 RV 两核边界见[两核模块](riscv-smp.md)。LoongArch 已验证整数 context、timer 抢占、信号、musl TLS/pthread、动态 musl/DSO TLS、标量 FPU 与 LSX/LASX；更广程序与多核仍需独立验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作已支持真实双核，执行位置和后端并发范围见[两核模块](riscv-smp.md)。四核、PI futex、实时信号队列、sigaltstack和clone3仍属后续能力。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
@@ -275,6 +283,8 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 读写锁按 FIFO 交接，读者每 16 项释放 metadata raw，并在分段之间恢复调用者原本的 IRQ 状态；再次取得短保护后继续原来的边界。`handoff_owner` 保留交接资格，新读者不能越过已排队的 writer。调用者进入时已关闭 IRQ，则交接不会自行开启。FIFO 交接当前不实现优先级继承，RT 带宽预算也不传递锁依赖。
 
 ## 存储等待与清理任务
+
+任务的 I/O 上下文随当前执行栈保存。RV/LA 从内核 TP 取得实际任务；调度器可以在切栈前将 `cpu.current` 发布为下一任务，此时 I/O owner 仍属于旧栈。RV 用编译器的固定 TP 寄存器变量表达同一状态，切换和陷入汇编沿原规则保存／恢复；CPU 字段仍在需要时从当前任务读取。热点直接按共同任务布局取得嵌入字段，普通外部入口与宿主替身保留相同行为。
 
 `kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal。争用者按 FIFO 排队；释放时先给队首写者预留独占资格，或给连续队首读者预留共享资格，再定向唤醒。预留者尚未运行时也阻止新到任务抢占；排队写者后的读者及 try_read 不能越过队列。等待不可中断，信号退出在取得与释放后处理，栈上的等待记录不被提前销毁。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
 

@@ -22,7 +22,6 @@ static int dev_flush(struct ext4_blockdev *dev)
 { struct fixture *f = dev->bdif->p_user; return kernel_block_flush(&f->disk.device) == 0 ? EOK : EIO; }
 static void lock(void *context) { struct fixture *f = context; CHECK(f); f->depth++; f->acquisitions++; }
 static void unlock(void *context) { struct fixture *f = context; CHECK(f->depth); f->depth--; }
-static uintptr_t owner(void *context) { struct fixture *f = context; CHECK(f->depth); return (uintptr_t)f; }
 static void mount_fixture(struct fixture *f, const char *image, const char *name, const char *mount)
 {
     CHECK(fault_block_open(&f->disk, image) == 0);
@@ -30,7 +29,7 @@ static void mount_fixture(struct fixture *f, const char *image, const char *name
         .bread=dev_read, .bwrite=dev_write, .flush=dev_flush, .p_user=f,
         .ph_bbuf=f->scratch, .ph_bsize=512, .ph_bcnt=f->disk.device.capacity_bytes/512 };
     f->device = (struct ext4_blockdev){ .bdif=&f->iface, .part_size=f->disk.device.capacity_bytes };
-    f->locks = (struct ext4_lock){ .lock=lock, .unlock=unlock, .read_lock=lock, .owner=owner, .context=f };
+    f->locks = (struct ext4_lock){ .lock=lock, .unlock=unlock, .read_lock=lock, .context=f };
     CHECK(ext4_device_register(&f->device, name) == EOK);
     CHECK(ext4_mount(name, mount, false) == EOK);
     CHECK(ext4_mount_setup_locks(mount, &f->locks) == EOK);

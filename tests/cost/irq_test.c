@@ -5,8 +5,10 @@ static struct kernel_cost_task foreground, background;
 static struct kernel_cost_task *actor=&foreground;
 static uint64_t ticks=100;
 uint64_t kernel_cost_clock(void){return ticks;}
-uint64_t kernel_cost_lock(void){return 0;}
-void kernel_cost_unlock(uint64_t s){(void)s;}
+uint64_t kernel_cost_irq_save(void){return 0;}
+void kernel_cost_irq_restore(uint64_t s){(void)s;}
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void){return actor;}
 int main(void)
 {

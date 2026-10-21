@@ -5,52 +5,63 @@
 #include <kernel/time.h>
 #include <string.h>
 uint64_t kernel_cost_clock(void) { uint64_t t; __asm__ volatile("rdtime %0" : "=r"(t)); return t; }
-uint64_t kernel_cost_lock(void)
+uint64_t kernel_cost_irq_save(void)
 {
     uint64_t s; __asm__ volatile("csrrc %0, sstatus, %1" : "=r"(s) : "r"((uint64_t)2) : "memory");
-    if (s & 2) kernel_cost_irq_observer(kernel_cost_clock());
-    return s;
+    return !!(s & 2);
 }
-void kernel_cost_unlock(uint64_t s)
-{ if (s & 2) { kernel_cost_irq_enable_now(); __asm__ volatile("csrsi sstatus, 2" ::: "memory"); } }
-uint64_t kernel_cost_trap_timestamp;
-void kernel_cost_irq_enable_now(void)
+void kernel_cost_irq_restore(uint64_t enabled)
+{ if (enabled) __asm__ volatile("csrsi sstatus, 2" ::: "memory"); }
+struct kernel_cost_cpu *kernel_cost_cpu_current(void)
+{ return &kernel_cpu_current()->cost; }
+static struct kernel_task *executing_task(void)
 {
-    kernel_cost_irq_flush();
-    kernel_cost_return_timestamp = kernel_cost_clock();
-    kernel_cost_return_pending = 1;
+    if (!kernel_cpu_current()->current) return 0;
+    /* current may already name the next task before the physical stack handoff. */
+    return arch_current_thread_get();
 }
-void kernel_cost_irq_return(uint64_t status)
-{
-    kernel_cost_irq_flush();
-    /* Assembly publishes the final timestamp only after all safe register restores. */
-    kernel_cost_return_pending = status & 32 ? 2 : 0;
-}
-static struct kernel_cost_task bootstrap_cost;
 struct kernel_cost_task *kernel_cost_current(void)
 {
-    if (!kernel_cpu_current()->current) return &bootstrap_cost;
-    if (kernel_cpu_current()->current->io_context.background_reclaim) kernel_cpu_current()->current->cost.wait_flags |= 64;
-    else kernel_cpu_current()->current->cost.wait_flags &= (uint8_t)~64U;
-    return &kernel_cpu_current()->current->cost;
+    uint64_t irq=kernel_cost_lock();
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    struct kernel_task *task=executing_task();
+    struct kernel_cost_task *result=task ? &task->cost : &cpu->cost.bootstrap;
+    if (task && task->io_context.background_reclaim) result->wait_flags |= 64;
+    else result->wait_flags &= (uint8_t)~64U;
+    kernel_cost_unlock(irq);
+    return result;
 }
 void kernel_cost_syscall(uint64_t number, int64_t fd)
 {
-    struct kernel_task *task = kernel_cpu_current()->current;
+    struct kernel_task *task = executing_task();
     if (!task) return;
     kernel_cost_account(&task->cost);
-    if ((number >= 62 && number <= 70) || number == 57)
-        task->cost.suppress = kernel_files_cost_descriptor(&task->files, fd);
-    if (task->cost.suppress) kernel_cost_irq_suppress();
+    /* Descriptor lookup takes files locks, so do it before the COST lock. */
+    int suppress=((number >= 62 && number <= 70) || number == 57) ?
+        kernel_files_cost_descriptor(&task->files,fd) : 0;
+    uint64_t irq=kernel_cost_lock();
+    task->cost.suppress=(uint8_t)suppress;
+    if (suppress) kernel_cost_irq_suppress();
+    kernel_cost_unlock(irq);
 }
 int kernel_cost_control(const char *command, size_t size)
 {
-    struct kernel_task *task = kernel_cpu_current()->current;
+    struct kernel_task *task = executing_task();
     if (!task || !task->group_leader) return -KERNEL_EINVAL;
     uint64_t owner = process_identity_generation(task);
     if (size == 6 && !memcmp(command, "begin\n", 6)) {
         int result = kernel_cost_begin(owner, kernel_cost_timebase(), 0, 1);
         if (!result) {
+            {
+                KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+                for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+                    uint64_t irq=kernel_cost_lock();
+                    kernel_cost_register_cpu(&cpu->cost);
+                    cpu->cost.running=cpu->accounting_owner ? &cpu->accounting_owner->cost :
+                        cpu->current ? &cpu->current->cost : &cpu->cost.bootstrap;
+                    kernel_cost_unlock(irq);
+                }
+            }
             struct scheduler_task_cursor cursor;
             scheduler_task_cursor_begin(&cursor);
             while (cursor.task) {
@@ -59,10 +70,12 @@ int kernel_cost_control(const char *command, size_t size)
                     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
                     struct kernel_task *t = cursor.task;
                     if (t->accounted) {
+                        uint64_t irq=kernel_cost_lock();
                         if (belongs) kernel_cost_join(&t->cost);
                         else kernel_cost_rebase(&t->cost);
                         if (t->state == KERNEL_THREAD_STATE_BLOCKED) t->cost.blocked_start = kernel_cost_clock();
                         if (t->state == KERNEL_THREAD_STATE_READY) kernel_cost_ready(&t->cost);
+                        kernel_cost_unlock(irq);
                     }
                 }
                 scheduler_task_cursor_next(&cursor);
@@ -78,19 +91,23 @@ int kernel_cost_control(const char *command, size_t size)
 }
 void kernel_cost_user_return(void)
 {
+    uint64_t irq=kernel_cost_lock();
     struct kernel_cost_task *task = kernel_cost_current();
     if (task) kernel_cost_account(task);
     kernel_cost_boundary();
     if (task) { task->suppress = 0; task->run_start = kernel_cost_clock(); task->wait_flags |= 8; }
+    kernel_cost_unlock(irq);
 }
 void kernel_cost_task_exit(void)
 {
-    struct kernel_task *task = kernel_cpu_current()->current;
+    struct kernel_task *task = executing_task();
     if (!task) return;
+    uint64_t irq=kernel_cost_lock();
     kernel_cost_account(&task->cost);
     if (task->cost.wait_rank) kernel_cost_add_tag(kernel_cost_task_tag(&task->cost),
-        (enum kernel_cost_metric)(COST_LOCK10_CANCELLED+(task->cost.wait_rank-1)*8),1);
+        (enum kernel_cost_metric)(kernel_cost_lock_metric(task->cost.wait_rank-1)+7),1);
     kernel_cost_cancel(&task->cost);
+    kernel_cost_unlock(irq);
     if (task->group_leader && (task->group_leader->group_exiting ||
         task->group_leader->group_members <= 1))
         kernel_cost_abort(process_identity_generation(task));

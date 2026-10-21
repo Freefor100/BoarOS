@@ -1156,16 +1156,6 @@ struct robust_exit_probe {
 
 static volatile int robust_cow_go;
 
-static void *robust_release_after_delay(void *opaque)
-{
-    struct robust_exit_probe *probe = opaque;
-    struct timespec delay = {.tv_nsec = 20000000L};
-
-    nanosleep(&delay, 0);
-    probe->go = 1;
-    return 0;
-}
-
 static void *robust_raw_exit_worker(void *opaque)
 {
     struct robust_exit_probe *probe = opaque;
@@ -1241,16 +1231,9 @@ static int robust_raw_exit_case(int mode, int *wait_result)
                            result == -1 && errno == EAGAIN ? 0 : -1;
     }
     if (mode == ROBUST_PENDING_UNLOCK_WAKE) {
-        struct timespec timeout = {.tv_sec = 1};
-        pthread_t releaser;
-        long result;
-
-        if (pthread_create(&releaser, 0, robust_release_after_delay,
-                           probe) != 0) return 9;
-        result = syscall(SYS_futex, &probe->entry.word, FUTEX_WAIT,
-                         0, &timeout, 0, 0);
-        if (pthread_join(releaser, 0) != 0) return 10;
-        if (wait_result != 0) *wait_result = result == 0 ? 1 : -1;
+        /* The zero word cannot tell userspace whether cleanup already woke.
+         * The host regression observes a committed waiter before cleanup. */
+        probe->go = 1;
     }
     for (int tries = 0; tries < 10000; tries++) {
         errno = 0;
@@ -1276,8 +1259,6 @@ static int robust_raw_exit_case(int mode, int *wait_result)
 
 static int check_robust_raw_exit(void)
 {
-    int woken = 0;
-
     for (int mode = ROBUST_LIST_OWNER; mode <= ROBUST_BAD_HEAD; mode++) {
         int result = robust_raw_exit_case(mode, 0);
         if (result != 0) return 10 * mode + result;
@@ -1285,19 +1266,14 @@ static int check_robust_raw_exit(void)
     if (robust_raw_exit_case(ROBUST_COW, 0) != 0) return 80;
     if (robust_raw_exit_case(ROBUST_PI_MARKER, 0) != 0) return 81;
     if (robust_raw_exit_case(ROBUST_BAD_OFFSET, 0) != 0) return 83;
-    {
-        int woken_pending = -1;
-        if (robust_raw_exit_case(ROBUST_PENDING_UNLOCK_WAKE,
-                                 &woken_pending) != 0 ||
-            woken_pending != 1) return 82;
-    }
+    if (robust_raw_exit_case(ROBUST_PENDING_UNLOCK_WAKE, 0) != 0) return 82;
     for (int tries = 0; tries < 4; tries++) {
         int observed = -1;
         int result = robust_raw_exit_case(ROBUST_WAIT_OWNER, &observed);
         if (result != 0 || observed < 0) return 60 + result;
-        woken += observed;
     }
-    return woken != 0 ? 0 : 70;
+    /* Owner exit may legally precede every WAIT and make each return EAGAIN. */
+    return 0;
 }
 
 static int check_robust_registration(void)

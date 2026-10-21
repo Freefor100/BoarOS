@@ -11,12 +11,17 @@ struct host_task { struct kernel_task task; unsigned *dispatch; unsigned id; };
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <kernel/time.h>
 
 _Thread_local uintptr_t sync_test_irq = 1;
 _Thread_local unsigned sync_test_irq_restores;
 static _Thread_local unsigned segment_restores;
 static _Thread_local struct kernel_cpu cpu;
+static void publish_task(struct kernel_cpu *target,struct kernel_task *task) { target->current = task; }
 static _Thread_local struct host_task host_current;
+static _Thread_local struct kernel_io_context bootstrap_io;
+static _Thread_local unsigned publishing_next;
+static _Thread_local unsigned notification_flushes;
 #define current host_current.task
 static _Thread_local unsigned ready;
 static struct kernel_rwlock lock;
@@ -26,11 +31,43 @@ static pthread_barrier_t segment_entered, segment_released;
 static unsigned segment_enabled, finish_pause;
 static unsigned handoff_irq = 1;
 static pthread_barrier_t finish_entered, finish_released;
+static unsigned spin_mode,spin_clock_entered,spin_clock_resume,spin_metadata_seen;
+static unsigned spin_long_expected,spin_long_seen,spin_clock_finish;
+static _Thread_local unsigned spin_clock_reads;
+static uintptr_t spin_irq;
+static struct kernel_cpu spin_cpus[2];
+uint64_t riscv_time_read(void)
+{
+    if(!spin_mode || host_current.id!=1)return 0;
+    spin_clock_reads++;
+    assert(sync_test_irq==spin_irq && !cpu.raw_locks && !cpu.preempt_depth);
+    if(spin_clock_reads==1) {
+        __atomic_store_n(&spin_clock_entered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&spin_clock_resume,__ATOMIC_ACQUIRE))sched_yield();
+    }
+    if(spin_mode==4 && spin_clock_reads>2) {
+        if(spin_clock_reads==4) {
+            assert(spin_long_expected);
+            __atomic_store_n(&spin_long_seen,1,__ATOMIC_RELEASE);
+            while(!__atomic_load_n(&spin_clock_finish,__ATOMIC_ACQUIRE))sched_yield();
+        }
+        return 100000;
+    }
+    if(spin_mode==5 && spin_clock_reads>2)return 1000001;
+    return spin_mode==2 && spin_clock_reads>2?UINT64_C(1000000000):0;
+}
 void *sync_test_cpu(void) { return &cpu; }
-struct kernel_task *kernel_task_current(void) { return &current; }
+void kernel_cpu_flush_notifications(void)
+{
+    assert(!cpu.raw_locks);
+    notification_flushes++;
+    cpu.outbound=0;
+}
+struct kernel_task *kernel_task_current(void) { return publishing_next ? NULL : &current; }
+void *sync_test_current_task(void) { return &current; }
 static void initialize(unsigned id)
 {
-    kernel_cpu_initialize(&cpu, id, &current.io_context);
+    kernel_cpu_initialize(&cpu, id, &bootstrap_io);
     current = (struct kernel_task){0};
     host_current.id = id;
     current.wait.on_cpu = 1;
@@ -60,6 +97,9 @@ void kernel_wait_backend_quiesce(void) { sched_yield(); }
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_raw_guard *guard)
 {
+    if(spin_mode==1 && raw==&lock.metadata && host_current.id==1 &&
+       current.wait.phase==KERNEL_WAIT_FINISHED && spin_clock_reads)
+        __atomic_store_n(&spin_metadata_seen,1,__ATOMIC_RELEASE);
     if (segment_enabled && raw == &lock.metadata && lock.handoff_owner &&
         lock.readers == 16 && host_current.id == 2) {
         assert((handoff_irq ? sync_test_irq_restores > segment_restores :
@@ -82,6 +122,14 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_r
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
+    if(spin_mode==4 && spin_long_expected && guard->lock==&lock.metadata &&
+       host_current.id==0 && lock.writer && lock.writer!=&current.io_context && !lock.pending_head)
+        __atomic_store_n(&spin_clock_finish,1,__ATOMIC_RELEASE);
+    if(spin_mode==1 && guard->lock==&lock.metadata && host_current.id==0 &&
+       lock.writer && lock.writer!=&current.io_context && !lock.pending_head) {
+        __atomic_store_n(&spin_clock_resume,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&spin_metadata_seen,__ATOMIC_ACQUIRE))sched_yield();
+    }
     if (segment_enabled && guard->lock == &lock.metadata &&
         lock.handoff_owner && lock.readers == 16 && host_current.id == 2)
         segment_restores = sync_test_irq_restores;
@@ -248,9 +296,141 @@ static void try_write_busy(void)
         assert(sync_test_irq == irq && !current.io_context.locks);
     }
 }
+static void *spin_waiter(void *unused)
+{
+    (void)unused;initialize(1);host_current.dispatch=&ready;spin_clock_reads=0;
+    sync_test_irq=spin_irq;
+    struct kernel_lock_guard guard={0};kernel_rwlock_write(&lock,&guard);
+    assert(sync_test_irq==spin_irq && guard.owner==&current.io_context && guard.write &&
+           current.wait.phase==KERNEL_WAIT_FINISHED && !cpu.raw_locks && !cpu.preempt_depth);
+    assert(spin_mode==1?!parked[0]:parked[0]==1);
+    __atomic_store_n(&entered[0],1,__ATOMIC_RELEASE);
+    kernel_lock_release(&guard);
+    assert(sync_test_irq==spin_irq && !current.io_context.locks);
+    return NULL;
+}
+static void queued_spin_case(unsigned mode,unsigned parallel,uintptr_t irq)
+{
+    struct kernel_lock_guard owner={0};pthread_t thread;
+    kernel_rwlock_init(&lock,10,1);kernel_rwlock_write(&lock,&owner);
+    memset(spin_cpus,0,sizeof(spin_cpus));spin_cpus[0].state=KERNEL_CPU_ONLINE;
+    spin_cpus[1].state=KERNEL_CPU_ONLINE;spin_cpus[1].logical_id=1;
+    spin_cpus[0].scheduler_next=parallel?&spin_cpus[1]:NULL;
+    scheduler.cpus=spin_cpus;spin_mode=mode;spin_irq=irq;
+    spin_clock_entered=spin_clock_resume=spin_metadata_seen=0;
+    entered[0]=parked[0]=granted[0]=0;
+    assert(!pthread_create(&thread,NULL,spin_waiter,NULL));queued(1);
+    if(parallel) {
+        while(!__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE) &&
+              !__atomic_load_n(&parked[0],__ATOMIC_ACQUIRE))sched_yield();
+        assert(__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE));
+        if(mode==2)__atomic_store_n(&spin_clock_resume,1,__ATOMIC_RELEASE);
+    }
+    if(mode==2 || !parallel)
+        while(!__atomic_load_n(&parked[0],__ATOMIC_ACQUIRE))sched_yield();
+    kernel_lock_release(&owner);assert(!pthread_join(thread,NULL));
+    assert(entered[0] && !lock.writer && !lock.readers && !lock.pending_head &&
+           !lock.waiters.registrations && !lock.waiters.borrows &&
+           (!parallel?!spin_clock_entered:mode!=1 || spin_metadata_seen));
+    scheduler.cpus=NULL;spin_mode=0;
+}
+static void queued_spin_fifo(void)
+{
+    struct kernel_lock_guard owner={0};pthread_t threads[3];
+    kernel_rwlock_init(&lock,10,1);kernel_rwlock_write(&lock,&owner);
+    memset(spin_cpus,0,sizeof(spin_cpus));spin_cpus[0].state=spin_cpus[1].state=KERNEL_CPU_ONLINE;
+    spin_cpus[1].logical_id=1;spin_cpus[0].scheduler_next=&spin_cpus[1];scheduler.cpus=spin_cpus;
+    spin_mode=3;spin_irq=1;spin_clock_entered=spin_clock_resume=spin_metadata_seen=0;count=0;
+    for(unsigned i=0;i<3;i++) {
+        entered[i]=leave[i]=parked[i]=granted[i]=0;
+        assert(!pthread_create(&threads[i],NULL,worker,(void *)(uintptr_t)i));queued(i+1);
+        if(!i)while(!__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE))sched_yield();
+    }
+    __atomic_store_n(&spin_clock_resume,1,__ATOMIC_RELEASE);kernel_lock_release(&owner);
+    for(unsigned i=0;i<3;i++) {
+        while(!__atomic_load_n(&entered[i],__ATOMIC_ACQUIRE))sched_yield();
+        if(i<2)assert(!__atomic_load_n(&entered[i+1],__ATOMIC_ACQUIRE));
+        __atomic_store_n(&leave[i],1,__ATOMIC_RELEASE);assert(!pthread_join(threads[i],NULL));
+    }
+    assert(count==3 && order[0]==0 && order[1]==1 && order[2]==2 &&
+           !lock.writer && !lock.readers && !lock.pending_head && !lock.pending_tail &&
+           !lock.waiters.registrations && !lock.waiters.borrows);
+    scheduler.cpus=NULL;spin_mode=0;
+}
+enum spin_owner_case { SPIN_REMOTE_RUNNING,SPIN_REMOTE_BLOCKED,SPIN_SAME_CPU,
+    SPIN_NOT_HEAD,SPIN_READERS,SPIN_REMOTE_READY };
+static void *spin_budget_waiter(void *unused)
+{
+    (void)unused;initialize(1);cpu.logical_id=1;host_current.dispatch=&ready;spin_clock_reads=0;
+    sync_test_irq=spin_irq;
+    struct kernel_lock_guard guard={0};kernel_rwlock_write(&lock,&guard);
+    assert(sync_test_irq==spin_irq && guard.owner==&current.io_context && guard.write &&
+           current.wait.phase==KERNEL_WAIT_FINISHED && !cpu.raw_locks && !cpu.preempt_depth &&
+           (spin_long_expected?!parked[0]:parked[0]==1));
+    __atomic_store_n(&entered[0],1,__ATOMIC_RELEASE);kernel_lock_release(&guard);
+    assert(sync_test_irq==spin_irq && !current.io_context.locks);return NULL;
+}
+static void queued_spin_owner_case(enum spin_owner_case kind,unsigned expire,uintptr_t irq)
+{
+    struct kernel_lock_guard owner={0};pthread_t thread,prior;
+    kernel_rwlock_init(&lock,10,1);
+    if(kind==SPIN_READERS)kernel_rwlock_read(&lock,&owner);
+    else kernel_rwlock_write(&lock,&owner);
+    memset(spin_cpus,0,sizeof(spin_cpus));spin_cpus[0].state=spin_cpus[1].state=KERNEL_CPU_ONLINE;
+    spin_cpus[1].logical_id=1;spin_cpus[0].scheduler_next=&spin_cpus[1];publish_task(&spin_cpus[0],&current);
+    current.state=kind==SPIN_REMOTE_BLOCKED?KERNEL_THREAD_STATE_BLOCKED:
+        kind==SPIN_REMOTE_READY?KERNEL_THREAD_STATE_READY:KERNEL_THREAD_STATE_RUNNING;
+    current.wait.on_cpu=kind!=SPIN_REMOTE_READY;
+    if(kind==SPIN_SAME_CPU) {publish_task(&spin_cpus[0],NULL);publish_task(&spin_cpus[1],&current);}
+    scheduler.cpus=spin_cpus;spin_mode=expire?5:4;spin_irq=irq;
+    spin_long_expected=kind==SPIN_REMOTE_RUNNING && !expire;
+    spin_clock_entered=spin_clock_resume=spin_long_seen=spin_clock_finish=0;
+    for(unsigned i=0;i<2;i++)entered[i]=leave[i]=parked[i]=granted[i]=0;
+    if(kind==SPIN_NOT_HEAD) {
+        assert(!pthread_create(&prior,NULL,worker,(void *)(uintptr_t)1));queued(1);
+    }
+    assert(!pthread_create(&thread,NULL,spin_budget_waiter,NULL));queued(kind==SPIN_NOT_HEAD?2:1);
+    while(!__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE))sched_yield();
+    __atomic_store_n(&spin_clock_resume,1,__ATOMIC_RELEASE);
+    if(spin_long_expected) {
+        while(!__atomic_load_n(&spin_long_seen,__ATOMIC_ACQUIRE) &&
+              !__atomic_load_n(&parked[0],__ATOMIC_ACQUIRE))sched_yield();
+        assert(spin_long_seen && !parked[0]);
+    } else while(!__atomic_load_n(&parked[0],__ATOMIC_ACQUIRE))sched_yield();
+    kernel_lock_release(&owner);
+    if(kind==SPIN_NOT_HEAD) {
+        while(!__atomic_load_n(&entered[1],__ATOMIC_ACQUIRE))sched_yield();
+        assert(!__atomic_load_n(&entered[0],__ATOMIC_ACQUIRE));
+        __atomic_store_n(&leave[1],1,__ATOMIC_RELEASE);assert(!pthread_join(prior,NULL));
+    }
+    assert(!pthread_join(thread,NULL));
+    assert(entered[0] && !lock.writer && !lock.readers && !lock.pending_head &&
+           !lock.pending_tail && !lock.waiters.registrations && !lock.waiters.borrows);
+    current.state=KERNEL_THREAD_STATE_RUNNING;current.wait.on_cpu=1;
+    scheduler.cpus=NULL;spin_mode=spin_long_expected=0;
+}
 int main(void)
 {
     initialize(0);
+    /* CPU publication can name the next task while this stack and tp still
+     * belong to the previous owner. Its I/O qualifications stay with it. */
+    struct kernel_task next = {0};
+    publish_task(&cpu,&next); publishing_next = 1;
+    assert(kernel_io_context_current() == &current.io_context && sync_test_irq == 1);
+    publishing_next = 0; publish_task(&cpu,&current);
+    struct kernel_raw_lock outer, inner;
+    struct kernel_raw_guard first={0}, second={0};
+    kernel_raw_lock_init(&outer,KERNEL_RAW_RANK_OBJECT);
+    kernel_raw_lock_init(&inner,KERNEL_RAW_RANK_SCHEDULER);
+    notification_flushes=0;
+    kernel_raw_lock_acquire(&outer,&first);kernel_raw_lock_release(&first);
+    assert(!notification_flushes);
+    kernel_raw_lock_acquire(&outer,&first);
+    cpu.outbound=2;
+    kernel_raw_lock_acquire(&inner,&second);kernel_raw_lock_release(&second);
+    assert(!notification_flushes && cpu.outbound==2);
+    kernel_raw_lock_release(&first);
+    assert(notification_flushes==1 && !cpu.outbound && sync_test_irq==1);
     kernel_wait_domain_init();
     fatal_cases();
     try_write_busy();
@@ -265,5 +445,17 @@ int main(void)
     sync_test_irq = 1;
     fifo(1); fifo(8); fifo(32);
     handoff_irq = 0; fifo(32);
+    assert(!kernel_time_init(1000000000U,0));
+    for(uintptr_t irq=0;irq<2;irq++) {
+        queued_spin_case(1,1,irq);queued_spin_case(2,1,irq);queued_spin_case(2,0,irq);
+    }
+    queued_spin_fifo();
+    for(uintptr_t irq=0;irq<2;irq++) {
+        for(unsigned kind=SPIN_REMOTE_RUNNING;kind<=SPIN_REMOTE_READY;kind++)
+            queued_spin_owner_case(kind,0,irq);
+        queued_spin_owner_case(SPIN_REMOTE_RUNNING,1,irq);
+    }
+    puts("sleep lock: only FIFO head behind a remote running writer receives extended budget; blocked/ready/same-CPU/readers/queued predecessors retain base; extended wait expires and all owners return");
+    puts("sleep lock: queued grant avoids park/MM switch; 50us expiry and real single-CPU inventory retain sleeping path; IRQ, final notifier borrow and owners preserved");
     puts("sleep lock: deterministic FIFO writer boundary, reserved grants and 1/8/32 waiters passed");
 }

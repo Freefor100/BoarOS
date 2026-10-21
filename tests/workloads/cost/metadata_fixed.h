@@ -121,6 +121,92 @@ static void metadata_fixed_paired(int separate,unsigned cpus)
     CHECK(!close(ready[0]) && !close(ready[1]) && !close(gate[0]) && !close(gate[1]));
     metadata_pin(cpus==2?1:0);
 }
+enum metadata_parallel_kind { METADATA_PAIRED_STAT, METADATA_PAIRED_OPEN,
+    METADATA_PAIRED_RENAME, METADATA_PAIRED_APPEND };
+static void metadata_parallel_loop(enum metadata_parallel_kind kind,unsigned actor,unsigned count,
+    int fd,uint64_t *samples,struct stat *observed)
+{
+    const char *directory=actor?"/metadata-b":"/metadata-a";
+    char first[64],second[64],bytes[4096];
+    snprintf(first,sizeof(first),"%s/paired-rename-a",directory);
+    snprintf(second,sizeof(second),"%s/paired-rename-b",directory);
+    memset(bytes,'A'+actor,sizeof(bytes));
+    struct stat st={0};
+    for(unsigned i=0;i<count;i++) {
+        uint64_t start=nanoseconds();
+        if(kind==METADATA_PAIRED_STAT)CHECK(!stat("/metadata-target",&st));
+        else if(kind==METADATA_PAIRED_OPEN) {
+            int opened=open("/metadata-target",O_RDONLY);
+            CHECK(opened>=0 && !fstat(opened,&st) && !close(opened));
+        } else if(kind==METADATA_PAIRED_RENAME)CHECK(!rename(i&1?second:first,i&1?first:second));
+        else CHECK(write(fd,bytes,sizeof(bytes))==(ssize_t)sizeof(bytes));
+        samples[i]=nanoseconds()-start;
+    }
+    if(kind<=METADATA_PAIRED_OPEN)*observed=st;
+}
+static void metadata_parallel_verify_append(int fd,unsigned actor,unsigned count)
+{
+    struct stat st;CHECK(!fstat(fd,&st) && st.st_size==(off_t)count*4096 && lseek(fd,0,SEEK_SET)==0);
+    char bytes[4096];
+    for(unsigned i=0;i<count;i++) {
+        CHECK(read(fd,bytes,sizeof(bytes))==(ssize_t)sizeof(bytes));
+        for(unsigned j=0;j<sizeof(bytes);j++)CHECK(bytes[j]=='A'+actor);
+    }
+}
+static void metadata_parallel_paired(enum metadata_parallel_kind kind,unsigned cpus)
+{
+    static const char *names[]={"metadata-paired-stat","metadata-paired-open",
+        "metadata-paired-rename","metadata-paired-append"};
+    unsigned count=kind==METADATA_PAIRED_RENAME?1024:2048;
+    size_t sample_bytes=2*count*sizeof(uint64_t);
+    struct {struct stat observed[2];uint64_t samples[4096];} *shared;
+    shared=mmap(NULL,sizeof(*shared),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    CHECK(shared!=MAP_FAILED);uint64_t *samples=shared->samples;
+    int files[2]={-1,-1};
+    if(kind>=METADATA_PAIRED_RENAME) {
+        for(unsigned actor=0;actor<2;actor++) {
+            char path[64];snprintf(path,sizeof(path),"/metadata-%c/paired-%s-a",actor?'b':'a',
+                kind==METADATA_PAIRED_RENAME?"rename":"append");
+            files[actor]=open(path,O_CREAT|O_EXCL|O_RDWR|O_APPEND,0600);CHECK(files[actor]>=0);
+            CHECK(!fsync(files[actor]));
+        }
+        metadata_directory_sync("/metadata-a");metadata_directory_sync("/metadata-b");
+    }
+    int ready[2],gate[2];CHECK(!pipe(ready) && !pipe(gate));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child) {
+        metadata_pin(cpus==2?1:0);char c='r';
+        CHECK(write(ready[1],&c,1)==1 && read(gate[0],&c,1)==1);
+        metadata_parallel_loop(kind,1,count,files[1],samples+count,&shared->observed[1]);_exit(0);
+    }
+    char c;CHECK(read(ready[0],&c,1)==1);metadata_pin(0);
+    cost_begin();CHECK(write(gate[1],"g",1)==1);
+    metadata_parallel_loop(kind,0,count,files[0],samples,&shared->observed[0]);
+    int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    if(kind==METADATA_PAIRED_APPEND)CHECK(!fsync(files[0]) && !fsync(files[1]));
+    if(kind==METADATA_PAIRED_RENAME) {
+        metadata_directory_sync("/metadata-a");metadata_directory_sync("/metadata-b");
+    }
+    cost_end(names[kind],0,0,0,0);memcpy(metadata_samples,samples,sample_bytes);
+    metadata_statistics(names[kind],2*count);
+    if(kind<=METADATA_PAIRED_OPEN) {
+        struct stat expected;CHECK(!stat("/metadata-target",&expected));
+        for(unsigned actor=0;actor<2;actor++)CHECK(shared->observed[actor].st_ino==expected.st_ino &&
+            shared->observed[actor].st_size==8 && shared->observed[actor].st_mode==expected.st_mode);
+    }
+    if(kind>=METADATA_PAIRED_RENAME) {
+        for(unsigned actor=0;actor<2;actor++) {
+            char path[64];snprintf(path,sizeof(path),"/metadata-%c/paired-%s-a",actor?'b':'a',
+                kind==METADATA_PAIRED_RENAME?"rename":"append");
+            if(kind==METADATA_PAIRED_APPEND)metadata_parallel_verify_append(files[actor],actor,count);
+            else {struct stat named,held;CHECK(!stat(path,&named) && !fstat(files[actor],&held) && named.st_ino==held.st_ino);}
+            CHECK(!close(files[actor]) && !unlink(path));
+        }
+    }
+    CHECK(!munmap(shared,sizeof(*shared)));
+    CHECK(!close(ready[0]) && !close(ready[1]) && !close(gate[0]) && !close(gate[1]));
+    metadata_pin(cpus==2?1:0);
+}
 static int metadata_fixed_main(void)
 {
     unsigned cpus=metadata_cpus();metadata_pin(cpus==2?1:0);
@@ -131,6 +217,10 @@ static int metadata_fixed_main(void)
     for(unsigned i=0;i<3;i++)metadata_fixed_lookup(i);
     metadata_fixed_create();metadata_fixed_rename(0);metadata_fixed_rename(1);metadata_fixed_readdir();
     metadata_fixed_paired(0,cpus);metadata_fixed_paired(1,cpus);
+    if(access("/cost-metadata-parallel",F_OK)==0) {
+        for(unsigned kind=METADATA_PAIRED_STAT;kind<=METADATA_PAIRED_APPEND;kind++)
+            metadata_parallel_paired(kind,cpus);
+    }
     cost_begin();uint64_t start=nanoseconds();metadata_directory_sync("/");metadata_samples[0]=nanoseconds()-start;
     metadata_result("metadata-final-sync",1);
     puts("COST PASS metadata");CHECK(!fflush(NULL) && !tcdrain(STDOUT_FILENO));return 0;

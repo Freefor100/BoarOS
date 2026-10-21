@@ -55,6 +55,7 @@
 #include <ext4_journal.h>
 #include <ext4_bitmap.h>
 #include <ext4_inode.h>
+#include <ext4_orphan.h>
 
 /**@brief Compute number of block group from block address.
  * @param s superblock pointer.
@@ -151,21 +152,50 @@ ext4_balloc_verify_bitmap_csum(struct ext4_sblock *sb,
 #define ext4_balloc_verify_bitmap_csum(...) true
 #endif
 
+static int ext4_balloc_prepare_free_groups(struct ext4_inode_ref *inode,
+    uint32_t first, uint32_t last)
+{
+    struct ext4_fs *fs = inode->fs;
+    struct ext4_operation *operation = ext4_current_operation(fs);
+    if (!operation || !operation->orphan_metadata) return EOK;
+    bool present;
+    int result = ext4_orphan_contains(fs, inode->index, &present);
+    if (result || !present) return result;
+    uint32_t inode_group = (inode->index - 1) /
+        ext4_get32(ext4_fs_super(fs), inodes_per_group);
+    /* orphan 移除还要校验 inode 位图；此处已经知道实际释放的物理范围，
+     * 将两者按组号合并取得，避免先拿任何一个高组后才请求已知的低组。
+     * 后续范围若发现新的低组，仍由操作的完整撤销、排序重放处理。 */
+    if (inode_group < first) {
+        result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, inode_group);
+        if (result) return result;
+    }
+    for (uint32_t group = first; group <= last; group++) {
+        result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, group);
+        if (result) return result;
+    }
+    return inode_group > last ?
+        ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, inode_group) : EOK;
+}
+
 int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 {
 	struct ext4_fs *fs = inode_ref->fs;
-	struct ext4_sblock *sb = &fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(fs);
 
 	uint32_t bg_id = ext4_balloc_get_bgid_of_block(sb, baddr);
 	uint32_t index_in_group = ext4_fs_addr_to_idx_bg(sb, baddr);
+	int rc = ext4_balloc_prepare_free_groups(inode_ref, bg_id, bg_id);
+	if (rc != EOK)
+		return rc;
 
 	/* Load block group reference */
 	struct ext4_block_group_ref bg_ref;
-	int rc = jbd_trans_quarantine(fs, baddr, 1, false);
-	if (rc != EOK) return rc;
-	rc = ext4_fs_get_block_group_ref(fs, bg_id, &bg_ref);
+	rc = ext4_fs_get_block_group_ref_write(fs, bg_id, &bg_ref);
 	if (rc != EOK)
 		return rc;
+	rc = jbd_trans_quarantine(fs, baddr, 1, false);
+	if (rc != EOK) { ext4_fs_put_block_group_ref(&bg_ref); return rc; }
 
 	struct ext4_bgroup *bg = bg_ref.block_group;
 
@@ -207,9 +237,7 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 
 	/* Update superblock free blocks count */
-	uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
-	sb_free_blocks++;
-	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+    ext4_fs_account_blocks(fs, 1);
 
 	/* Update inode blocks count */
 	uint64_t ino_blocks = ext4_inode_get_blocks_count(sb, inode_ref->inode);
@@ -230,7 +258,9 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 		ext4_fs_put_block_group_ref(&bg_ref);
 		return rc;
 	}
-	ext4_bcache_invalidate_lba(fs->bdev->bc, baddr, 1);
+	/* A journaled free stays private until acceptance and quarantined until
+     * checkpoint. Abort must leave the accepted cache version untouched. */
+    if (!fs->jbd_journal) ext4_bcache_invalidate_lba(fs->bdev->bc, baddr, 1);
 	/* Release block group reference */
 	rc = ext4_fs_put_block_group_ref(&bg_ref);
 
@@ -244,16 +274,14 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 	uint32_t blk_cnt = count;
 	ext4_fsblk_t start_block = first;
 	struct ext4_fs *fs = inode_ref->fs;
-	struct ext4_sblock *sb = &fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(fs);
 
+	uint32_t bg_first = ext4_balloc_get_bgid_of_block(sb, first);
+	uint32_t bg_last = ext4_balloc_get_bgid_of_block(sb, first + count - 1);
+	rc = ext4_balloc_prepare_free_groups(inode_ref, bg_first, bg_last);
+	if (rc != EOK) return rc;
 	int quarantine = jbd_trans_quarantine(fs, first, count, false);
     if (quarantine != EOK) return quarantine;
-
-    /* Compute indexes */
-	uint32_t bg_first = ext4_balloc_get_bgid_of_block(sb, first);
-
-	/* Compute indexes */
-	uint32_t bg_last = ext4_balloc_get_bgid_of_block(sb, first + count - 1);
 
 	if (!ext4_sb_feature_incom(sb, EXT4_FINCOM_FLEX_BG)) {
 		/*It is not possible without flex_bg that blocks are continuous
@@ -268,8 +296,7 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 	/* Load block group reference */
 	struct ext4_block_group_ref bg_ref;
 	while (bg_first <= bg_last) {
-
-		rc = ext4_fs_get_block_group_ref(fs, bg_first, &bg_ref);
+		rc = ext4_fs_get_block_group_ref_write(fs, bg_first, &bg_ref);
 		if (rc != EOK)
 			return rc;
 
@@ -321,9 +348,7 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 		uint32_t block_size = ext4_sb_get_block_size(sb);
 
 		/* Update superblock free blocks count */
-		uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
-		sb_free_blocks += free_cnt;
-		ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+        ext4_fs_account_blocks(fs, free_cnt);
 
 		/* Update inode blocks count */
 		uint64_t ino_blocks;
@@ -355,7 +380,7 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 
 	}
 
-	ext4_bcache_invalidate_lba(fs->bdev->bc, start_block, blk_cnt);
+	if (!fs->jbd_journal) ext4_bcache_invalidate_lba(fs->bdev->bc, start_block, blk_cnt);
 	/*All blocks should be released*/
 	ext4_assert(count == 0);
 
@@ -368,7 +393,7 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
     if (!max_blocks || !fblock || !count) return EINVAL;
     *fblock = 0; *count = 0;
     struct ext4_fs *fs = inode_ref->fs;
-    struct ext4_sblock *sb = &fs->sb;
+    struct ext4_sblock *sb = ext4_fs_super(fs);
     if (goal < ext4_get32(sb, first_data_block) || goal >= ext4_sb_get_blocks_cnt(sb))
         goal = ext4_fs_inode_to_goal_block(inode_ref);
     uint32_t first_group = ext4_balloc_get_bgid_of_block(sb, goal);
@@ -394,29 +419,24 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
         }
         uint32_t end = ext4_blocks_in_group_cnt(sb, group);
         uint32_t start = step ? 0 : ext4_fs_addr_to_idx_bg(sb, goal);
-        uint32_t index = start, found = end;
-        ext4_fsblk_t next_quarantine = UINT64_MAX;
+        uint32_t found = end, length=0;
         /* Search the goal suffix, then the same group's prefix, without
          * borrowing or checksumming its bitmap a second time. */
         for (unsigned pass = 0; pass < (start ? 2U : 1U); pass++) {
             uint32_t limit = pass ? start : end;
-            index = pass ? 0 : start;
-            while (ext4_bmap_bit_find_clr(bitmap.data, index, limit, &index) == EOK) {
-                ext4_fsblk_t address = ext4_fs_bg_idx_to_addr(sb, index, group);
-                if (!jbd_journal_quarantined(fs, address, false, &next_quarantine)) {
-                    found = index; break;
-                }
-                uint64_t skip = next_quarantine - address;
-                index = skip >= limit - index ? limit : index + (uint32_t)skip;
-            }
-            if (found != end) break;
+            int scan=jbd_journal_find_reusable(fs,bitmap.data,
+                ext4_fs_bg_idx_to_addr(sb,0,group),pass ? 0 : start,limit,
+                max_blocks,false,&found,&length);
+            if (scan==EOK) break;
+            if (scan!=ENOSPC) __builtin_trap();
         }
-        uint32_t length = 0;
-        if (found != end) {
-            ext4_fsblk_t address = ext4_fs_bg_idx_to_addr(sb, found, group);
-            uint64_t reusable = next_quarantine - address;
-            while (length < max_blocks && length < end - found && length < reusable &&
-                ext4_bmap_is_bit_clr(bitmap.data, found + length)) length++;
+        if (length) {
+            length = ext4_fs_reserve_block_range(fs, length);
+            if (!length) {
+                ext4_block_set(fs->bdev, &bitmap);
+                ext4_fs_put_block_group_ref(&bg);
+                return ENOSPC;
+            }
             for (uint32_t i = 0; i < length; i++) ext4_bmap_bit_set(bitmap.data, found + i);
             ext4_balloc_set_bitmap_csum(sb, bg.block_group, bitmap.data);
             ext4_trans_set_block_dirty(bitmap.buf);
@@ -424,7 +444,7 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
         r = ext4_block_set(fs->bdev, &bitmap);
         if (r) { ext4_fs_put_block_group_ref(&bg); return r; }
         if (length) {
-            ext4_sb_set_free_blocks_cnt(sb, ext4_sb_get_free_blocks_cnt(sb) - length);
+            ext4_fs_account_blocks(fs, -(int64_t)length);
             ext4_inode_set_blocks_count(sb, inode_ref->inode,
                 ext4_inode_get_blocks_count(sb, inode_ref->inode) +
                 (uint64_t)length * (ext4_sb_get_block_size(sb) / EXT4_INODE_BLOCK_SIZE));
@@ -457,7 +477,7 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 	int rc;
 
 	struct ext4_fs *fs = inode_ref->fs;
-	struct ext4_sblock *sb = &fs->sb;
+	struct ext4_sblock *sb = ext4_fs_super(fs);
 
 	/* Compute indexes */
 	uint32_t block_group = ext4_balloc_get_bgid_of_block(sb, baddr);
@@ -491,11 +511,20 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 	}
 
 	/* Check if block is free */
-	*free = ext4_bmap_is_bit_clr(b.data, index_in_group) &&
-	    !jbd_journal_quarantined(inode_ref->fs, baddr, false, NULL);
+    uint32_t found,length;
+    rc=jbd_journal_find_reusable(fs,b.data,baddr-index_in_group,
+        index_in_group,index_in_group+1,1,false,&found,&length);
+    if (rc!=EOK && rc!=ENOSPC) __builtin_trap();
+    *free=rc==EOK;
 
 	/* Allocate block if possible */
 	if (*free) {
+        rc = ext4_fs_reserve_blocks(fs, 1);
+        if (rc) {
+            ext4_block_set(fs->bdev, &b);
+            ext4_fs_put_block_group_ref(&bg_ref);
+            return rc;
+        }
 		ext4_bmap_bit_set(b.data, index_in_group);
 		ext4_balloc_set_bitmap_csum(sb, bg_ref.block_group, b.data);
 		ext4_trans_set_block_dirty(b.buf);
@@ -516,9 +545,7 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 
 	/* Update superblock free blocks count */
-	uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
-	sb_free_blocks--;
-	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+    ext4_fs_account_blocks(fs, -1);
 
 	/* Update inode blocks count */
 	uint64_t ino_blocks = ext4_inode_get_blocks_count(sb, inode_ref->inode);

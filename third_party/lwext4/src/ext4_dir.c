@@ -532,16 +532,21 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 		return ENOTDIR;
 
 	/* Try to find entry */
-	struct ext4_dir_search_result result;
+	struct ext4_dir_search_result result = {0};
 	int rc = ext4_dir_find_entry(&result, parent, name, name_len);
-	if (rc != EOK)
-		return rc;
+	if (rc == EOK) rc = ext4_dir_remove_found(parent, &result);
+	int cleanup = ext4_dir_destroy_result(parent, &result);
+	return rc == EOK ? cleanup : rc;
+}
 
+int ext4_dir_remove_found(struct ext4_inode_ref *parent,
+                         struct ext4_dir_search_result *result)
+{
 	/* Invalidate entry */
-	ext4_dir_en_set_inode(result.dentry, 0);
+	ext4_dir_en_set_inode(result->dentry, 0);
 
 	/* Store entry position in block */
-	uint32_t pos = (uint8_t *)result.dentry - result.block.data;
+	uint32_t pos = (uint8_t *)result->dentry - result->block.data;
 
 	/*
 	 * If entry is not the first in block, it must be merged
@@ -551,13 +556,13 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 		uint32_t offset = 0;
 
 		/* Start from the first entry in block */
-		struct ext4_dir_en *tmp_de =(void *)result.block.data;
+		struct ext4_dir_en *tmp_de =(void *)result->block.data;
 		uint16_t de_len = ext4_dir_en_get_entry_len(tmp_de);
 
 		/* Find direct predecessor of removed entry */
 		while ((offset + de_len) < pos) {
 			offset += ext4_dir_en_get_entry_len(tmp_de);
-			tmp_de = (void *)(result.block.data + offset);
+			tmp_de = (void *)(result->block.data + offset);
 			de_len = ext4_dir_en_get_entry_len(tmp_de);
 		}
 
@@ -565,15 +570,13 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 
 		/* Add to removed entry length to predecessor's length */
 		uint16_t del_len;
-		del_len = ext4_dir_en_get_entry_len(result.dentry);
+		del_len = ext4_dir_en_get_entry_len(result->dentry);
 		ext4_dir_en_set_entry_len(tmp_de, de_len + del_len);
 	}
 
 	ext4_dir_set_csum(parent,
-			(struct ext4_dir_en *)result.block.data);
-	ext4_trans_set_block_dirty(result.block.buf);
-
-	return ext4_dir_destroy_result(parent, &result);
+			(struct ext4_dir_en *)result->block.data);
+	return ext4_trans_set_block_dirty(result->block.buf);
 }
 
 int ext4_dir_try_insert_entry(struct ext4_sblock *sb,

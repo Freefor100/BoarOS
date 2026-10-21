@@ -1,5 +1,6 @@
 /* Live-inode explicit timestamps and actual ext4 allocation statistics. */
 #include "block_fault.h"
+#include "lwext4_operation.h"
 #include <ext4.h>
 #include <ext4_fs.h>
 #include <ext4_extent.h>
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #ifdef TEST_RANGE_WORK_COUNTERS
 static uint32_t watched_bitmap_bytes, bitmap_crc_calls;
@@ -83,6 +85,16 @@ static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t n,uint32_t c
         uint64_t sector=checkpoint_homes[i]*checkpoint_watch_block/512;
         if (n<=sector && sector<n+c) checkpoint_home_writes[i]++;
     }
+    if (borrow_watch && borrow_watch_lba == UINT64_MAX) {
+        /* The commit owner assigns per-record wire addresses while encoding.
+         * Observe the actual borrowed bytes at submission, then verify that
+         * address against the completed record rather than a freeze layout. */
+        uint32_t first;
+        memcpy(&first, p, sizeof(first));
+        if (p == borrow_watch || (borrow_watch_escape && !first && c == 1 &&
+            !memcmp((const unsigned char *)p + 4, borrow_watch + 4, 508)))
+            borrow_watch_lba = n;
+    }
     if (borrow_watch && n >= borrow_watch_lba && n < borrow_watch_lba + borrow_watch_size / 512) {
         unsigned offset = (unsigned)(n - borrow_watch_lba) * 512;
         if (borrow_watch_escape && !offset) {
@@ -112,6 +124,14 @@ extern int ext4_journal_group_drain(const char *) __attribute__((weak));
 extern int ext4_file_sync_metadata_mode(ext4_file *, bool) __attribute__((weak));
 static uint64_t group_now;
 static uint64_t group_clock(void *context) { (void)context; return group_now; }
+static unsigned group_requests,group_work[2];
+static void group_request(void *context,unsigned work)
+{
+    (void)context;CHECK(work && !(work & ~(EXT4_JOURNAL_WORK_COMMIT|EXT4_JOURNAL_WORK_CHECKPOINT)));
+    group_requests++;
+    if(work & EXT4_JOURNAL_WORK_COMMIT)group_work[0]++;
+    if(work & EXT4_JOURNAL_WORK_CHECKPOINT)group_work[1]++;
+}
 static unsigned pipeline_waits;
 static enum ext4_journal_wait pipeline_kind;
 static int pipeline_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
@@ -187,7 +207,7 @@ static void group_bounds(struct ext4_fs *fs)
         }
     }
     CHECK(ext4_journal_group_progress("/",&large)==EOK && large.sealed==small.sealed);
-    CHECK(group_now==0 && fs->jbd_journal->memory_peak<=fs->jbd_journal->memory_limit);
+    CHECK(group_now==0 && jbd_memory_peak(fs->jbd_journal)<=jbd_memory_limit(fs->jbd_journal));
     /* Data remains governed by actual retained memory. Exceed that budget
      * at the same clock and force reclaim without a per-256-KiB commit. */
     for (unsigned i=96;i<1536;i++) {
@@ -195,7 +215,7 @@ static void group_bounds(struct ext4_fs *fs)
         CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
     }
     CHECK(ext4_journal_group_progress("/",&large)==EOK && large.sealed>small.sealed);
-    CHECK(group_now==0 && fs->jbd_journal->memory_peak<=fs->jbd_journal->memory_limit);
+    CHECK(group_now==0 && jbd_memory_peak(fs->jbd_journal)<=jbd_memory_limit(fs->jbd_journal));
     CHECK(ext4_journal_group_drain("/")==EOK && ext4_fseek(&f,0,SEEK_SET)==EOK);
     for(unsigned i=0;i<1536;i++) {
         CHECK(ext4_fread(&f,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
@@ -268,7 +288,7 @@ static void group_ring(struct ext4_fs *fs)
         previous=fs->jbd_journal->last;
     }
     CHECK(wrapped && ext4_journal_group_drain("/")==EOK);
-    CHECK(fs->jbd_journal->memory_peak<=fs->jbd_journal->memory_limit);
+    CHECK(jbd_memory_peak(fs->jbd_journal)<=jbd_memory_limit(fs->jbd_journal));
     CHECK(ext4_fclose(&f)==EOK);
     printf("group ring: same-block versions and checkpoint batches survive wrap within budget\n");
 }
@@ -285,14 +305,20 @@ static void group_modify_while_submitting(void)
 static void group_test(struct ext4_fs *fs)
 {
     CHECK(ext4_journal_group_enable && ext4_journal_group_service && ext4_journal_group_drain);
-    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.request=group_request};
     CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
     ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
     uint64_t writes=disk.writes, flushes=disk.flushes;
     uint32_t tid=fs->jbd_journal->committed_id;
     struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
     payload_threshold=fs->bdev->lg_bsize;
-    for(unsigned i=0;i<4;i++)CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    /* Warm actual edits: repeating equal timestamps prunes to a no-op and
+     * does not borrow the log/control/checkpoint images used below. */
+    for(unsigned i=0;i<4;i++) {
+        times[0].nanoseconds=i;
+        CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    }
+    CHECK(group_requests==1);
     unsigned warmed_payloads=payload_allocations;
     struct ext4_journal_progress before_repeat, after_repeat;
     CHECK(ext4_journal_group_progress("/",&before_repeat)==EOK);
@@ -303,6 +329,7 @@ static void group_test(struct ext4_fs *fs)
     /* Repeated edits of one running block must reuse reserved payloads.
      * A fresh block/undo allocation per warm edit fails this cost contract. */
     CHECK(ext4_journal_group_progress("/",&after_repeat)==EOK && after_repeat.sealed==before_repeat.sealed);
+    CHECK(group_requests==1 && group_work[0]==1 && !group_work[1] && after_repeat.deadline_ns==100000000);
     CHECK(payload_allocations==warmed_payloads);
     CHECK(disk.writes==writes && disk.flushes==flushes && fs->jbd_journal->committed_id==tid);
     struct ext4_inode committed, actual;
@@ -341,7 +368,7 @@ static void group_test(struct ext4_fs *fs)
         fail_allocation=0;
         CHECK(result==EOK || result==ENOMEM);
         CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
-        CHECK(fs->jbd_journal->memory_used<=fs->jbd_journal->memory_limit);
+        CHECK(jbd_memory_used(fs->jbd_journal)<=jbd_memory_limit(fs->jbd_journal));
     }
     unsigned char bytes[4096], readback[4096]; size_t count;
     memset(bytes,0x55,sizeof(bytes));
@@ -387,7 +414,7 @@ static void group_log_payload(struct ext4_fs *fs)
     CHECK(ext4_fs_put_inode_ref(&inode) == EOK && ext4_journal_group_drain("/") == EOK);
     struct jbd_journal *journal = fs->jbd_journal;
     for (unsigned escaped = 0; escaped < 2; escaped++) {
-        struct jbd_trans *operation = jbd_journal_new_trans(journal);
+        struct jbd_trans *operation; CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
         struct ext4_block block = EXT4_BLOCK_ZERO();
         CHECK(operation && ext4_block_get(fs->bdev, &block, home) == EOK);
         CHECK(jbd_trans_get_write_access(operation, &block) == EOK);
@@ -395,6 +422,7 @@ static void group_log_payload(struct ext4_fs *fs)
         uint32_t first = to_be32(escaped ? JBD_MAGIC_NUMBER : 0x12345678);
         memcpy(block.data, &first, sizeof(first));
         CHECK(jbd_trans_set_block_dirty(operation, &block) == EOK && ext4_block_set(fs->bdev, &block) == EOK);
+        CHECK(jbd_trans_prepare_operation(operation) == EOK);
         CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
         unsigned before_allocations = allocations;
         fail_allocation = allocations + 1;
@@ -402,10 +430,11 @@ static void group_log_payload(struct ext4_fs *fs)
         struct jbd_buf *version = TAILQ_FIRST(&operation->buf_queue);
         CHECK(version && version->after && !TAILQ_NEXT(version, buf_node));
         borrow_watch = version->after->data; borrow_watch_size = fs->bdev->lg_bsize;
-        borrow_watch_lba = journal->log_map[version->jbd_lba] * borrow_watch_size / 512;
+        borrow_watch_lba = UINT64_MAX;
         borrow_watch_calls = 0; borrow_watch_escape = escaped;
         CHECK(jbd_journal_select(journal) && journal->committing == operation);
         CHECK(jbd_journal_submit(journal) == EOK && borrow_watch_calls == (escaped ? 2U : 1U));
+        CHECK(borrow_watch_lba == journal->log_map[version->jbd_lba] * borrow_watch_size / 512);
         borrow_watch = NULL;
         CHECK(jbd_journal_retire(journal, EOK) == EOK);
         borrow_watch = version->after->data; borrow_watch_lba = home * borrow_watch_size / 512;
@@ -417,32 +446,43 @@ static void group_log_payload(struct ext4_fs *fs)
         CHECK(jbd_journal_retire(journal, EOK) == EOK && allocations == before_allocations);
         fail_allocation = 0;
     }
-    /* A magic-prefixed home needs a private wire sector. Exercise every
-     * allocation failure while acquiring it, including after buffer ownership
-     * was installed but before the caller has changed a byte. */
+    /* Sweep private-view and final prefix/log/control/checkpoint allocation,
+     * including failure after the private owner is installed. The unchanged
+     * immutable home payload is also the operation's rollback baseline. */
     struct ext4_block escaped_home=EXT4_BLOCK_ZERO();
     CHECK(ext4_block_get(fs->bdev,&escaped_home,home)==EOK);
+    struct ext4_block_payload *escaped_baseline=escaped_home.payload;
     bool installed_failure=false;
-    journal->cache_disabled=true;
+    jbd_memory_set_cache_disabled(journal, true);
+    /* Discard warmed controls too: disabling returns alone can let the first
+     * operation use only cached objects and end this sweep before injection. */
+    jbd_trim_cache(journal, 0);
     for (unsigned point=1;;point++) {
         CHECK(point<32);
-        struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
+        struct jbd_trans *operation; CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
         unsigned begin=allocations;
         fail_allocation=begin+point;
         int result=jbd_trans_get_write_access(operation,&escaped_home);
+        if (result==EOK) result=jbd_trans_set_block_dirty(operation,&escaped_home);
+        if (result==EOK) result=jbd_trans_prepare_operation(operation);
         unsigned attempted=allocations-begin;
         fail_allocation=0;
         CHECK(result==EOK || result==ENOMEM);
-        struct jbd_buf *access=escaped_home.buf->end_write_arg;
-        if (result==ENOMEM && access && access->trans==operation && !access->escaped_prefix) {
-            CHECK(access->before);
+        struct jbd_buf *access=TAILQ_FIRST(&operation->buf_queue);
+        if (result==ENOMEM && access) {
+            CHECK(access->private_access && !access->before && access->after &&
+                access->block.payload==escaped_baseline &&
+                escaped_home.payload==&access->after->payload &&
+                escaped_home.data==access->after->data &&
+                !memcmp(escaped_home.data,escaped_baseline->data,fs->bdev->lg_bsize));
             installed_failure=true;
         }
         jbd_journal_free_trans(journal,operation,true);
-        CHECK(!journal->error && !memcmp(escaped_home.data,"\xc0\x3b\x39\x98",4));
+        CHECK(!journal->error && !journal->log_reserved &&
+            !memcmp(escaped_home.data,"\xc0\x3b\x39\x98",4));
         if (result==EOK && point>attempted) break;
     }
-    journal->cache_disabled=false;
+    jbd_memory_set_cache_disabled(journal, false);
     CHECK(installed_failure && ext4_block_set(fs->bdev,&escaped_home)==EOK);
     /* Cross descriptor boundaries without reserving a whole control image
      * per payload. The private operation still owns every undo and version. */
@@ -459,8 +499,8 @@ static void group_log_payload(struct ext4_fs *fs)
     CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
     payload_threshold=fs->bdev->lg_bsize;
     unsigned image_allocations=payload_allocations, cached_images=0;
-    for (struct jbd_image *image=journal->image_cache;image;image=image->next) cached_images++;
-    struct jbd_trans *operation = jbd_journal_new_trans(journal);
+    cached_images=jbd_memory_cached_images(journal);
+    struct jbd_trans *operation; CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
     CHECK(operation);
     for (unsigned i = 0; i < 128; i++) {
         struct ext4_block block = EXT4_BLOCK_ZERO();
@@ -470,13 +510,14 @@ static void group_log_payload(struct ext4_fs *fs)
         CHECK(jbd_trans_set_block_dirty(operation, &block) == EOK && ext4_block_set(fs->bdev, &block) == EOK);
     }
     unsigned remaining_images=0;
-    for (struct jbd_image *image=journal->image_cache;image;image=image->next) remaining_images++;
+    remaining_images=jbd_memory_cached_images(journal);
     /* Count actual block images, including reused cache owners: cached home,
      * undo and frozen version per metadata block, plus a few log controls.
      * A separate log payload image for every version violates this bound. */
     CHECK(payload_allocations-image_allocations+cached_images-remaining_images<=3*128+8);
-    CHECK(journal->memory_peak<=journal->memory_limit);
+    CHECK(jbd_memory_peak(journal)<=jbd_memory_limit(journal));
     payload_threshold=0;
+    CHECK(jbd_trans_prepare_operation(operation) == EOK);
     CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
     unsigned before_allocations = allocations;
     fail_allocation = allocations + 1;
@@ -512,7 +553,7 @@ static void group_checkpoint_collapse(struct ext4_fs *fs, unsigned fault)
     /* Three durable groups: old A/B, revoke A/B, then a new A incarnation
      * and C. The selected prefix must write exactly new A and C. */
     for (unsigned group=0;group<3;group++) {
-        struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
+        struct jbd_trans *operation; CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
         if (group==1) {
             CHECK(jbd_trans_revoke_block(operation,checkpoint_homes[0])==EOK);
             CHECK(jbd_trans_revoke_block(operation,checkpoint_homes[1])==EOK);
@@ -524,6 +565,7 @@ static void group_checkpoint_collapse(struct ext4_fs *fs, unsigned fault)
             memset(block.data,group==0?0x61:0x73,block_size);
             CHECK(jbd_trans_set_block_dirty(operation,&block)==EOK && ext4_block_set(fs->bdev,&block)==EOK);
         }
+        CHECK(jbd_trans_prepare_operation(operation) == EOK);
         CHECK(jbd_journal_accept(journal,operation,0)==EOK && jbd_journal_freeze(journal)==EOK);
         CHECK(jbd_journal_select(journal) && journal->committing==operation);
         CHECK(jbd_journal_submit(journal)==EOK && jbd_journal_retire(journal,EOK)==EOK);
@@ -531,14 +573,15 @@ static void group_checkpoint_collapse(struct ext4_fs *fs, unsigned fault)
     CHECK(journal->checkpoint_count==3 && jbd_journal_select(journal) && journal->checkpointing);
     /* An accepted later version is visible to live readers while the older
      * durable prefix owns home DMA. It must not enter this checkpoint. */
-    struct jbd_trans *future=jbd_journal_new_trans(journal); CHECK(future);
+    struct jbd_trans *future; CHECK(jbd_journal_new_trans(journal, &future) == EOK); CHECK(future);
     struct ext4_block future_block=EXT4_BLOCK_ZERO();
     CHECK(ext4_block_get(fs->bdev,&future_block,checkpoint_homes[0])==EOK);
     CHECK(jbd_trans_get_write_access(future,&future_block)==EOK);
     memset(future_block.data,0x88,block_size);
     CHECK(jbd_trans_set_block_dirty(future,&future_block)==EOK && ext4_block_set(fs->bdev,&future_block)==EOK);
+    CHECK(jbd_trans_prepare_operation(future) == EOK);
     CHECK(jbd_journal_accept(journal,future,0)==EOK);
-    size_t owned=journal->memory_used;
+    size_t owned=jbd_memory_used(journal);
     checkpoint_watch_block=block_size;
     memset(checkpoint_home_writes,0,sizeof(checkpoint_home_writes));
     if (fault==1) disk.fail_write=disk.writes+1;
@@ -551,7 +594,7 @@ static void group_checkpoint_collapse(struct ext4_fs *fs, unsigned fault)
     if (!fault) CHECK(checkpoint_home_writes[0]==1 && !checkpoint_home_writes[1] && checkpoint_home_writes[2]==1);
     CHECK(jbd_journal_retire(journal,result)==result);
     if (fault) {
-        CHECK(journal->error==EIO && journal->checkpoint_count==3 && journal->memory_used==owned);
+        CHECK(journal->error==EIO && journal->checkpoint_count==3 && jbd_memory_used(journal)==owned);
     } else {
         CHECK(!journal->checkpoint_count && !journal->checkpointing);
         CHECK(ext4_blocks_get_direct(fs->bdev,bytes,checkpoint_homes[0],1)==EOK);
@@ -654,6 +697,17 @@ static void group_checkpoint_target(struct ext4_fs *fs)
     CHECK(ext4_fclose(&file)==EOK);
     puts("checkpoint target: ten-group explicit request drains eight plus two, retires its target, later single group waits until explicitly requested");
 }
+/* A clear single-bit allocation window checks retention through each I/O
+ * stage without depending on the journal's former scalar index API. */
+static bool quarantine_blocks_reuse(struct ext4_fs *fs, ext4_fsblk_t address, bool inode)
+{
+    uint8_t bitmap=0; uint32_t found,length;
+    int result=jbd_journal_find_reusable(fs,&bitmap,address,0,1,1,inode,&found,&length);
+    CHECK(result==EOK || result==ENOSPC);
+    CHECK(length==(result==EOK ? 1U : 0U));
+    if (result==EOK) CHECK(!found);
+    return result==ENOSPC;
+}
 static void group_quarantine(struct ext4_fs *fs, bool failed)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -664,37 +718,49 @@ static void group_quarantine(struct ext4_fs *fs, bool failed)
     CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
     CHECK(ext4_fs_get_inode_dblk_idx(&inode,0,&home,false)==EOK && home);
     CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    struct ext4_block held=EXT4_BLOCK_ZERO(),lookup=EXT4_BLOCK_ZERO();
+    CHECK(ext4_block_get(fs->bdev,&held,home)==EOK);
     CHECK(ext4_transaction_begin("/")==EOK);
     CHECK(jbd_trans_quarantine(fs,home,1,false)==EOK);
-    CHECK(jbd_journal_quarantined(fs,home,false,NULL));
+    CHECK(quarantine_blocks_reuse(fs,home,false));
     CHECK(jbd_trans_quarantine(fs,home,1,false)==EUCLEAN);
     CHECK(jbd_trans_quarantine(fs,UINT64_MAX,2,false)==EINVAL);
     for (unsigned i=0;i<64;i++) CHECK(jbd_trans_quarantine(fs,1000+4*i,2,false)==EOK);
     CHECK(jbd_trans_quarantine(fs,1001,4,false)==EUCLEAN);
     CHECK(jbd_trans_quarantine(fs,1000,2,true)==EOK);
     CHECK(journal->quarantined_blocks==129 && journal->quarantined_inodes==2);
-    /* Independent interval oracle includes holes and exact end boundaries;
-     * inode and block namespaces may use the same numeric addresses. */
-    for (ext4_fsblk_t address=990;address<1270;address++) {
-        bool covered=false; ext4_fsblk_t boundary=UINT64_MAX;
-        for (unsigned i=0;i<65;i++) {
-            ext4_fsblk_t first=i==64?home:1000+4*i;
-            unsigned count=i==64?1:2;
-            if (address>=first && address-first<count) {covered=true;boundary=first+count;break;}
-            if (first>address && first<boundary) boundary=first;
+    /* Compare whole allocation windows with independent occupied-bit and
+     * quarantine arrays, including separate inode/block address spaces. */
+    uint8_t empty[35]={0};
+    for (unsigned kind=0;kind<2;kind++) {
+        bool covered[280]={0};
+        for (unsigned bit=0;bit<280;bit++) {
+            ext4_fsblk_t address=990+bit;
+            if (kind) covered[bit]=address>=1000 && address<1002;
+            else for (unsigned i=0;i<65;i++) {
+                ext4_fsblk_t first=i==64 ? home : 1000+4*i;
+                unsigned count=i==64 ? 1 : 2;
+                if (address>=first && address-first<count) covered[bit]=true;
+            }
         }
-        ext4_fsblk_t next;
-        CHECK(jbd_journal_quarantined(fs,address,false,&next)==covered && next==boundary);
-        CHECK(jbd_journal_quarantined(fs,address,true,&next)==(address>=1000 && address<1002));
-        CHECK(next==(address<1000?1000:address<1002?1002:UINT64_MAX));
+        for (uint32_t start=0;start<280;start++) {
+            uint32_t expected=start,count=0,found,length;
+            while (expected<280 && covered[expected]) expected++;
+            while (expected+count<280 && !covered[expected+count]) count++;
+            int result=jbd_journal_find_reusable(fs,empty,990,start,280,280,kind,&found,&length);
+            CHECK(result==(count ? EOK : ENOSPC) && length==count);
+            if (count) CHECK(found==expected);
+        }
     }
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(!journal->quarantined_blocks && !journal->quarantined_inodes);
-    CHECK(!jbd_journal_quarantined(fs,home,false,NULL));
+    CHECK(!quarantine_blocks_reuse(fs,home,false));
+    CHECK(ext4_block_get(fs->bdev,&lookup,home)==EOK && lookup.buf==held.buf);
+    CHECK(ext4_block_set(fs->bdev,&lookup)==EOK);
 
     CHECK(ext4_transaction_begin("/")==EOK);
-    size_t original_limit=journal->memory_limit;
-    journal->memory_limit=journal->memory_used;
+    size_t original_limit=jbd_memory_limit(journal);
+    jbd_memory_set_limit(journal, jbd_memory_used(journal));
     unsigned reserved=0;
     for (;;) {
         CHECK(reserved<4096);
@@ -704,9 +770,9 @@ static void group_quarantine(struct ext4_fs *fs, bool failed)
         reserved++;
     }
     CHECK(reserved && journal->quarantined_blocks==reserved);
-    CHECK(!jbd_journal_quarantined(fs,2000+2*reserved,false,NULL));
-    CHECK(journal->memory_used<=journal->memory_limit);
-    journal->memory_limit=original_limit;
+    CHECK(!quarantine_blocks_reuse(fs,2000+2*reserved,false));
+    CHECK(jbd_memory_used(journal)<=jbd_memory_limit(journal));
+    jbd_memory_set_limit(journal, original_limit);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED && !journal->quarantined_blocks);
 
     /* Run the real bitmap allocator against separated reserved free ranges.
@@ -746,20 +812,28 @@ static void group_quarantine(struct ext4_fs *fs, bool failed)
     CHECK(ext4_transaction_begin("/")==EOK && jbd_trans_quarantine(fs,home+2,1,false)==EOK);
     CHECK(journal->quarantined_blocks==3 && ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(journal->quarantined_blocks==2);
-    CHECK(jbd_journal_quarantined(fs,home,false,NULL) && jbd_journal_select(journal) && journal->committing);
+    CHECK(quarantine_blocks_reuse(fs,home,false) && jbd_journal_select(journal) && journal->committing);
     CHECK(jbd_journal_submit(journal)==EOK && jbd_journal_retire(journal,EOK)==EOK);
     CHECK(journal->quarantined_blocks==2 && jbd_journal_select(journal) && journal->checkpointing);
-    CHECK(jbd_journal_checkpoint(journal)==EOK && jbd_journal_quarantined(fs,home,false,NULL));
+    CHECK(jbd_journal_checkpoint(journal)==EOK && quarantine_blocks_reuse(fs,home,false));
     CHECK(jbd_journal_retire(journal,EOK)==EOK && !journal->quarantined_blocks);
-    CHECK(!jbd_journal_quarantined(fs,home,false,NULL));
+    CHECK(!quarantine_blocks_reuse(fs,home,false));
+    /* No old block_rec/revoke exists for this data block. Its actual q owner
+     * still retires lookup, while the old reader remains a stable snapshot. */
+    CHECK(ext4_block_get(fs->bdev,&lookup,home)==EOK && lookup.buf!=held.buf);
+    CHECK(!memcmp(lookup.data,held.data,fs->bdev->lg_bsize));
+    CHECK(ext4_block_set(fs->bdev,&lookup)==EOK && ext4_block_set(fs->bdev,&held)==EOK);
     if (failed) {
         times[0].seconds=4444;
         CHECK(ext4_transaction_begin("/")==EOK && ext4_file_set_times(&file,7,times)==EOK);
         CHECK(jbd_trans_quarantine(fs,home,1,false)==EOK && ext4_transaction_end("/")==EOK);
         CHECK(jbd_journal_freeze(journal)==EOK && jbd_journal_select(journal) && journal->committing);
+        CHECK(ext4_block_get(fs->bdev,&held,home)==EOK);
         disk.fail_write=disk.writes+1;
         CHECK(jbd_journal_submit(journal)==EIO && jbd_journal_retire(journal,EIO)==EIO);
-        CHECK(journal->quarantined_blocks==1 && jbd_journal_quarantined(fs,home,false,NULL));
+        CHECK(journal->quarantined_blocks==1 && quarantine_blocks_reuse(fs,home,false));
+        CHECK(ext4_block_get(fs->bdev,&lookup,home)==EOK && lookup.buf==held.buf);
+        CHECK(ext4_block_set(fs->bdev,&lookup)==EOK && ext4_block_set(fs->bdev,&held)==EOK);
         CHECK(fault_block_crash(&disk)==0);
     } else CHECK(ext4_fclose(&file)==EOK);
     printf("quarantine index block=%u error=%d: interval holes, double-free, exact counts, bitmap skip, abort and durable owner lifetime\n",fs->bdev->lg_bsize,failed);
@@ -811,7 +885,7 @@ static void group_checkpoint_pressure(struct ext4_fs *fs)
     unsigned char *readback=malloc(bytes); CHECK(readback); memset(readback,0x5a,bytes);
     size_t count;
     CHECK(ext4_fpwrite(&file,0,readback,bytes,&count)==EOK && count==bytes);
-    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.request=group_request};
     CHECK(ext4_journal_group_enable("/",&runtime,512*1024)==EOK);
     struct jbd_journal *journal=fs->jbd_journal;
     ext4_fsblk_t homes[PAGES*PAGE_BYTES/1024];
@@ -829,19 +903,22 @@ static void group_checkpoint_pressure(struct ext4_fs *fs)
     for (unsigned page=0;page<PAGES;page++) {
         owned_page_init(&pages[page],PAGE_BYTES,(unsigned char)(0x60+page));
         struct file_data_source source={&pages[page],owned_page_retain,owned_page_release,PAGE_BYTES};
-        struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
+        struct jbd_trans *operation; CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
         for (unsigned i=0;i<PAGE_BYTES/block;i++)
             CHECK(jbd_trans_write_data(operation,homes[page*PAGE_BYTES/block+i],0,
                 pages[page].bytes+i*block,block,false,&source)==EOK);
+        CHECK(jbd_trans_prepare_operation(operation) == EOK);
         CHECK(jbd_journal_accept(journal,operation,0)==EOK);
         CHECK(pages[page].references==2 && pages[page].retains==1);
         owned_page_release(&pages[page]);
     }
     CHECK(jbd_journal_freeze(journal)==EOK && journal->sealed_count==1);
+    unsigned checkpoint_requests=group_work[1];
     times[0].nanoseconds++;
     CHECK(ext4_file_set_times(&file,7,times)==EOK && journal->running);
-    CHECK(journal->memory_used-journal->memory_cached>journal->memory_limit/2);
-    CHECK(journal->memory_used<=journal->memory_limit);
+    CHECK(group_work[1]==checkpoint_requests+1);
+    CHECK(jbd_memory_used(journal)-jbd_memory_cached(journal)>jbd_memory_limit(journal)/2);
+    CHECK(jbd_memory_used(journal)<=jbd_memory_limit(journal));
     CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
         progress.commit_ready && progress.checkpoint_ready && progress.checkpoint_pending);
     struct jbd_trans *committing=TAILQ_FIRST(&journal->sealed_queue);
@@ -861,7 +938,7 @@ static void group_checkpoint_pressure(struct ext4_fs *fs)
         CHECK(!pages[page].references && !pages[page].bytes && pages[page].releases==2);
     CHECK(ext4_fpread(&file,0,readback,bytes,&count)==EOK && count==bytes);
     for (size_t i=0;i<bytes;i++) CHECK(readback[i]==0x60+i/PAGE_BYTES);
-    CHECK(journal->memory_peak<=journal->memory_limit);
+    CHECK(jbd_memory_peak(journal)<=jbd_memory_limit(journal));
     free(readback); CHECK(ext4_fclose(&file)==EOK);
     puts("checkpoint pressure: actual retained sources cross half budget; one pending group checkpoints beside committing/running owners, exact source release and readback");
 }
@@ -969,13 +1046,17 @@ static void group_partial_owner(struct ext4_fs *fs, bool failed)
     unsigned before_reads=reads;
     CHECK(ext4_fpwrite_batch(&file,&span,1)==EOK && span.written==13);
     CHECK(old.references==2 && old.retains==1 && reads==before_reads);
-    CHECK(jbd_journal_read_data(fs,physical)==old.bytes && file.fsize==4096);
+    struct jbd_data_borrow borrow = {0};
+    CHECK(jbd_journal_borrow_data(fs,physical,&borrow) && borrow.data==old.bytes && file.fsize==4096);
+    jbd_journal_release_borrow(&borrow);
     owned_page_init(&replacement,block,0x5a); memset(replacement.bytes+17,0xb9,13);
     span.buffer=replacement.bytes+17; span.source.context=&replacement; span.source_buffer=replacement.bytes;
     CHECK(ext4_transaction_begin("/")==EOK && ext4_fpwrite_batch(&file,&span,1)==EOK);
-    CHECK(replacement.references==2 && jbd_journal_read_data(fs,physical)==replacement.bytes);
+    CHECK(replacement.references==2 && jbd_journal_borrow_data(fs,physical,&borrow) && borrow.data==replacement.bytes);
+    jbd_journal_release_borrow(&borrow);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED && replacement.references==1);
-    CHECK(jbd_journal_read_data(fs,physical)==old.bytes && old.references==2);
+    CHECK(jbd_journal_borrow_data(fs,physical,&borrow) && borrow.data==old.bytes && old.references==2);
+    jbd_journal_release_borrow(&borrow);
     CHECK(ext4_fpwrite_batch(&file,&span,1)==EOK && replacement.references==2 && old.references==1);
     owned_page_release(&old);
     /* The full source block covers hole zeros and EOF padding, but only one
@@ -1180,13 +1261,13 @@ static void group_borrow_admission(struct ext4_fs *fs)
     struct file_write_span span={.buffer=page.bytes,.size=bytes,
         .source={&page,owned_page_retain,owned_page_release,bytes}};
     struct jbd_journal *journal=fs->jbd_journal;
-    size_t limit=journal->memory_limit;
-    journal->memory_limit=journal->memory_used-journal->memory_cached+bytes+12*block+8192;
+    size_t limit=jbd_memory_limit(journal);
+    jbd_memory_set_limit(journal, jbd_memory_used(journal)-jbd_memory_cached(journal)+bytes+12*block+8192);
     CHECK(ext4_fpwrite_batch(&file,&span,1)==EOK && span.written==bytes);
-    CHECK(page.references==2 && page.retains==1 && journal->memory_used<=journal->memory_limit);
+    CHECK(page.references==2 && page.retains==1 && jbd_memory_used(journal)<=jbd_memory_limit(journal));
     owned_page_release(&page);
     CHECK(ext4_journal_group_drain("/")==EOK && !page.references);
-    journal->memory_limit=limit;
+    jbd_memory_set_limit(journal, limit);
     CHECK(ext4_fpread(&file,0,initial,bytes,&count)==EOK && count==bytes);
     for (size_t i=0;i<bytes;i++) CHECK(initial[i]==0x73);
     free(initial); CHECK(ext4_fclose(&file)==EOK);
@@ -1212,20 +1293,22 @@ static void group_source_budget(struct ext4_fs *fs, bool failed)
     for (unsigned i=0;i<blocks;i++) memset(page.bytes+i*block,0x60+i,block);
     struct file_data_source source={&page,owned_page_retain,owned_page_release,bytes};
     struct jbd_journal *journal=fs->jbd_journal;
-    struct jbd_trans *operation=jbd_journal_new_trans(journal); CHECK(operation);
-    size_t original_limit=journal->memory_limit, baseline=journal->memory_used-journal->memory_cached;
-    journal->memory_limit=baseline+bytes+blocks*(2*sizeof(struct jbd_data)+2*sizeof(void *))+512;
-    fs->curr_trans=operation;
+    struct jbd_trans *operation; CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
+    size_t original_limit=jbd_memory_limit(journal), baseline=jbd_memory_used(journal)-jbd_memory_cached(journal);
+    jbd_memory_set_limit(journal, baseline+bytes+blocks*(2*sizeof(struct jbd_data)+2*sizeof(void *))+512);
+    test_operation_bind(fs,operation);
     for (unsigned i=0;i<blocks;i++) {
-        size_t previous=journal->memory_used;
+        size_t previous=jbd_memory_used(journal);
         CHECK(jbd_trans_write_data(operation,homes[i],0,page.bytes+i*block,block,false,&source)==EOK);
-        CHECK(page.references==2 && page.retains==1 && journal->memory_used<=journal->memory_limit);
-        if (!i) CHECK(journal->memory_used>=baseline+bytes);
-        else CHECK(journal->memory_used-previous<block);
+        CHECK(page.references==2 && page.retains==1 && jbd_memory_used(journal)<=jbd_memory_limit(journal));
+        if (!i) CHECK(jbd_memory_used(journal)>=baseline+bytes);
+        else CHECK(jbd_memory_used(journal)-previous<block);
     }
     struct file_data_source invalid={&rejected,owned_page_retain,owned_page_release,bytes};
     CHECK(jbd_trans_write_data(operation,homes[0],0,rejected.bytes,block,false,&invalid)==ENOMEM);
-    CHECK(rejected.references==1 && !rejected.retains && jbd_journal_read_data(fs,homes[0])==page.bytes);
+    struct jbd_data_borrow borrow = {0};
+    CHECK(rejected.references==1 && !rejected.retains && jbd_journal_borrow_data(fs,homes[0],&borrow) && borrow.data==page.bytes);
+    jbd_journal_release_borrow(&borrow);
     invalid=source; invalid.bytes++;
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&invalid)==EINVAL);
     invalid=source; invalid.release=owned_page_retain;
@@ -1233,17 +1316,19 @@ static void group_source_budget(struct ext4_fs *fs, bool failed)
     invalid=(struct file_data_source){.bytes=1};
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&invalid)==EINVAL);
     CHECK(page.references==2 && page.retains==1 && !page.releases);
-    fs->curr_trans=NULL; journal->memory_limit=original_limit;
+    test_operation_bind(fs,NULL); jbd_memory_set_limit(journal, original_limit);
     owned_page_release(&rejected);
+    CHECK(jbd_trans_prepare_operation(operation) == EOK);
     CHECK(jbd_journal_accept(journal,operation,0)==EOK && jbd_journal_freeze(journal)==EOK && jbd_journal_select(journal));
     /* Private, sealed and running records borrow the same retained owner.
      * Aborting a private operation must leave the accepted blocks readable. */
-    operation=jbd_journal_new_trans(journal); CHECK(operation);
+    CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&source)==EOK);
     jbd_journal_free_trans(journal,operation,true);
     for (unsigned i=1;i<3;i++) {
-        operation=jbd_journal_new_trans(journal); CHECK(operation);
+        CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
         CHECK(jbd_trans_write_data(operation,homes[i],0,page.bytes+i*block,block,false,&source)==EOK);
+        CHECK(jbd_trans_prepare_operation(operation) == EOK);
         CHECK(jbd_journal_accept(journal,operation,0)==EOK);
         if (i==1) CHECK(jbd_journal_freeze(journal)==EOK);
     }
@@ -1503,7 +1588,7 @@ static void group_namespace(struct ext4_fs *fs, bool unlink_files)
             if(i&1) {size_t count;CHECK(ext4_fwrite(&f,data,sizeof(data),&count)==EOK && count==sizeof(data));}
             CHECK(ext4_fclose(&f)==EOK && ext4_fremove(name)==EOK);
             CHECK(ext4_fopen(&f,name,"r")==ENOENT);
-            CHECK(jbd_journal_quarantined(fs,retired[i],true,NULL));
+            CHECK(quarantine_blocks_reuse(fs,retired[i],true));
         }
         /* An open unlinked inode retains its content until its last owner. */
         CHECK(ext4_fopen2(&f,"/namespace-live",O_CREAT|O_RDWR)==EOK);
@@ -1514,7 +1599,7 @@ static void group_namespace(struct ext4_fs *fs, bool unlink_files)
         CHECK(ext4_fpwrite(&f,0,data,sizeof(data),&count)==EOK && count==sizeof(data));
         CHECK(ext4_fpread(&f,0,actual,sizeof(actual),&count)==EOK && count==sizeof(actual) && !memcmp(data,actual,sizeof(data)));
         CHECK(ext4_fclose(&f)==EOK && ext4_orphan_free("/",inode)==EOK);
-        CHECK(jbd_journal_quarantined(fs,inode,true,NULL));
+        CHECK(quarantine_blocks_reuse(fs,inode,true));
     }
     CHECK(namespace_waits==waits && disk.writes==writes && disk.flushes==flushes);
     namespace_hold=false;
@@ -1561,7 +1646,7 @@ static void independent_checkpoint_error_while_commit_held(void)
     CHECK(jbd_journal_checkpoint(journal)==EIO);
     CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_CHECKPOINT,EIO)==EIO);
     CHECK(journal->failed_trans==independent_checkpoint && journal->committing);
-    independent_owned=journal->memory_used;
+    independent_owned=jbd_memory_used(journal);
     independent_handshakes++;
 }
 static void independent_fsync_while_home_held(void)
@@ -1592,7 +1677,7 @@ static void independent_fsync_while_home_held(void)
         CHECK(journal->durable_sequence==journal->accepted_sequence && journal->checkpoint_count==2);
     }
     independent_handshakes++;
-    independent_owned=journal->memory_used;
+    independent_owned=jbd_memory_used(journal);
     if (independent_fault==5) {
         CHECK(fault_block_crash(&disk)==0);
         exit(0);
@@ -1632,7 +1717,7 @@ static void group_independent_progress(struct ext4_fs *fs,unsigned fault)
         CHECK(journal->checkpointing==independent_checkpoint && journal->committing &&
             journal->failed_trans==independent_checkpoint && journal->checkpoint_count==1);
         CHECK(journal->durable_sequence==durable && journal->checkpoint_sequence==before &&
-            journal->memory_used==independent_owned);
+            jbd_memory_used(journal)==independent_owned);
         CHECK(ext4_umount("/")==EIO && fs->bdev->fs==fs && fault_block_crash(&disk)==0);
         printf("independent reverse error block=%u fault=%u: checkpoint failed, completed commit owner retained\n",fs->bdev->lg_bsize,fault);
         return;
@@ -1644,7 +1729,7 @@ static void group_independent_progress(struct ext4_fs *fs,unsigned fault)
     CHECK(result==(failed?EIO:EOK));
     if (failed) {
         CHECK(journal->error==EIO && journal->checkpointing==independent_checkpoint);
-        CHECK(journal->checkpoint_sequence==before && journal->memory_used==independent_owned);
+        CHECK(journal->checkpoint_sequence==before && jbd_memory_used(journal)==independent_owned);
         CHECK(journal->failed_trans==(fault>=10?journal->committing:independent_checkpoint));
         CHECK(ext4_file_sync_metadata(&file)==EIO && ext4_umount("/")==EIO && fs->bdev->fs==fs);
     } else {
@@ -1712,7 +1797,7 @@ static void times_test(struct ext4_fs *fs, bool readonly)
           !ext4_inode_get_links_cnt(&after));
     CHECK(ext4_fclose(&f)==EOK);CHECK(ext4_orphan_free("/",unlinked)==EOK);
 }
-static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool truncating)
+static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool truncating, bool setting)
 {
     uint32_t cap[5]={0x02000000,1,0,0,0}; unsigned char padding[48]={1};size_t length;
     ext4_file first, second;struct ext4_inode initial, other, changed;
@@ -1740,6 +1825,19 @@ static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool trunc
     ext4_inode_set_blocks_count(&fs->sb,ref.inode,ext4_inode_get_blocks_count(&fs->sb,ref.inode)+ext4_sb_get_block_size(&fs->sb)/512);
     ref.dirty=true;CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
     CHECK(ext4_fraw_inode_fill(&second,&other)==EOK);
+    if (setting) {
+        uint32_t replacement[5]={0x02000000,4,0,0,0},value[5];
+        CHECK(ext4_setxattr("/file","security.capability",19,replacement,sizeof(replacement))==EOK);
+        CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==EOK &&
+              length==sizeof(value) && !memcmp(value,replacement,sizeof(value)));
+        CHECK(ext4_getxattr("/owner-other","security.capability",19,value,sizeof(value),&length)==EOK &&
+              length==sizeof(value) && !memcmp(value,cap,sizeof(value)));
+        CHECK(ext4_fraw_inode_fill(&first,&changed)==EOK && ext4_inode_get_file_acl(&changed,&fs->sb)!=shared);
+        CHECK(ext4_fraw_inode_fill(&second,&changed)==EOK && !memcmp(&changed,&other,sizeof(other)));
+        CHECK(ext4_file_sync_metadata(&first)==EOK && ext4_fclose(&first)==EOK && ext4_fclose(&second)==EOK);
+        puts("PASS shared EA set: private replacement retains both owners, values and checksums");
+        return;
+    }
     if(unlink_shared) {
         CHECK(ext4_fclose(&first)==EOK && ext4_fremove("/file")==EOK);
         CHECK(ext4_getxattr("/owner-other","security.capability",19,padding,sizeof(padding),&length)==EOK && length==sizeof(cap) && !memcmp(padding,cap,sizeof(cap)));
@@ -1779,13 +1877,16 @@ static void owner_test(struct ext4_fs *fs, bool readonly)
     uint32_t cap[5]={0x02000000,1,0,0,0}; size_t length;
     CHECK(ext4_file_set_mode(&f,06755)==EOK);
     CHECK(ext4_setxattr("/file","security.capability",19,cap,sizeof(cap))==EOK);
+    uint32_t value[5];
     CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     CHECK(ext4_transaction_begin("/")==EOK);
     CHECK(ext4_file_set_owner(&f,70001,80002)==EOK);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
-    uint32_t value[5];
-    CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==EOK && length==sizeof(cap) && !memcmp(value,cap,sizeof(cap)));
+    int restored_capability=ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length);
+    if (restored_capability || length!=sizeof(cap) || memcmp(value,cap,sizeof(cap)))
+        fprintf(stderr,"capability after abort: error=%d length=%zu value=%x,%x,%x,%x,%x\n",restored_capability,length,value[0],value[1],value[2],value[3],value[4]);
+    CHECK(restored_capability==EOK && length==sizeof(cap) && !memcmp(value,cap,sizeof(cap)));
     CHECK(ext4_file_set_owner(&f,70001,80002)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002 && (ext4_inode_get_mode(&fs->sb,&after)&07777)==0755);
@@ -2555,6 +2656,282 @@ static void extent_read_failure(struct ext4_blockdev *dev, bool io, unsigned poi
     printf("%u\n",attempts);
 }
 
+static void *operation_observer(void *argument)
+{
+    struct ext4_fs *fs = argument;
+    CHECK(ext4_current_trans(fs) == NULL);
+    CHECK(ext4_current_operation(fs) == NULL && ext4_fs_super(fs) == &fs->sb);
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_current_trans(fs) != NULL && fs->active_operations == 2);
+    CHECK(ext4_fs_super(fs) == &fs->sb &&
+        ext4_fs_available_blocks(fs) + 1 == ext4_sb_get_free_blocks_cnt(&fs->sb));
+    ext4_file peer;
+    CHECK(ext4_fopen2(&peer, "/operation-peer", O_RDWR | O_CREAT | O_EXCL) == EOK);
+    CHECK(ext4_fclose(&peer) == EOK);
+    CHECK(ext4_transaction_end("/") == EOK);
+    CHECK(ext4_current_trans(fs) == NULL && fs->active_operations == 1);
+    return NULL;
+}
+
+static void operation_context_test(struct ext4_fs *fs)
+{
+    uint32_t free_inodes = ext4_get32(&fs->sb, free_inodes_count);
+    CHECK(ext4_transaction_begin("/") == EOK);
+    struct jbd_trans *first = ext4_current_trans(fs);
+    CHECK(first != NULL);
+    CHECK(ext4_transaction_begin("/") == EOK && ext4_current_trans(fs) == first);
+    uint64_t free_blocks = ext4_sb_get_free_blocks_cnt(&fs->sb);
+    CHECK(ext4_fs_reserve_blocks(fs, 1) == EOK);
+    ext4_fs_account_blocks(fs, -1);
+    pthread_t observer;
+    CHECK(!pthread_create(&observer, NULL, operation_observer, fs));
+    CHECK(!pthread_join(observer, NULL));
+    CHECK(ext4_current_trans(fs) == first);
+    CHECK(ext4_fs_available_blocks(fs) == free_blocks - 1 &&
+        ext4_sb_get_free_blocks_cnt(&fs->sb) == free_blocks && fs->reserved_blocks == 1 && !fs->reserved_inodes);
+    CHECK(ext4_transaction_end("/") == EOK && ext4_current_trans(fs) == first);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(ext4_current_trans(fs) == NULL && fs->active_operations == 0 &&
+        ext4_sb_get_free_blocks_cnt(&fs->sb) == free_blocks && !fs->reserved_blocks && !fs->reserved_inodes);
+    CHECK(ext4_get32(&fs->sb, free_inodes_count) == free_inodes - 1);
+    ext4_file peer;
+    CHECK(ext4_fopen(&peer, "/operation-peer", "r") == EOK);
+    CHECK(ext4_fclose(&peer) == EOK);
+    CHECK(ext4_fremove("/operation-peer") == EOK);
+    CHECK(ext4_get32(&fs->sb, free_inodes_count) == free_inodes);
+    puts("PASS task-owned ext4 operation context and nesting");
+}
+
+static void operation_super_delta_test(struct ext4_fs *fs)
+{
+    CHECK(ext4_transaction_begin("/") == EOK);
+    struct ext4_operation *operation = ext4_current_operation(fs);
+    uint64_t original_blocks = ext4_sb_get_free_blocks_cnt(&fs->sb);
+    uint32_t original_inodes = ext4_get32(&fs->sb, free_inodes_count);
+    /* Another accepted operation consumed two blocks and one inode after
+     * this caller's snapshot. This caller consumes three more and two. */
+    CHECK(ext4_fs_reserve_blocks(fs, 3) == EOK && ext4_fs_reserve_inodes(fs, 2) == EOK);
+    ext4_fs_account_blocks(fs, -3);
+    ext4_fs_account_inodes(fs, -2);
+    ext4_sb_set_free_blocks_cnt(&fs->sb, original_blocks - 2);
+    ext4_set32(&fs->sb, free_inodes_count, original_inodes - 1);
+    struct ext4_sblock merged;
+    CHECK(ext4_operation_prepare_super(operation, &merged) == EOK);
+    CHECK(ext4_sb_get_free_blocks_cnt(&merged) == original_blocks - 5);
+    CHECK(ext4_get32(&merged, free_inodes_count) == original_inodes - 3);
+    CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb) == original_blocks - 2);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb) == original_blocks - 2 &&
+        ext4_get32(&fs->sb, free_inodes_count) == original_inodes - 1 &&
+        !fs->reserved_blocks && !fs->reserved_inodes);
+    ext4_sb_set_free_blocks_cnt(&fs->sb, original_blocks);
+    ext4_set32(&fs->sb, free_inodes_count, original_inodes);
+    puts("PASS operation superblock deltas preserve accepted counters and abort isolation");
+}
+
+static void *operation_reservation_observer(void *argument)
+{
+    struct ext4_fs *fs = argument;
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_fs_available_blocks(fs) == 0 && ext4_fs_available_inodes(fs) == 0);
+    CHECK(ext4_fs_reserve_blocks(fs, 1) == ENOSPC && ext4_fs_reserve_inodes(fs, 1) == ENOSPC);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    return NULL;
+}
+
+static void operation_reservation_test(struct ext4_fs *fs)
+{
+    uint64_t blocks = ext4_sb_get_free_blocks_cnt(&fs->sb);
+    uint32_t inodes = ext4_get32(&fs->sb, free_inodes_count);
+    CHECK(blocks <= UINT32_MAX);
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_fs_reserve_blocks(fs, blocks) == EOK && ext4_fs_reserve_inodes(fs, inodes) == EOK);
+    pthread_t observer;
+    CHECK(!pthread_create(&observer, NULL, operation_reservation_observer, fs));
+    CHECK(!pthread_join(observer, NULL));
+    CHECK(fs->reserved_blocks == blocks && fs->reserved_inodes == inodes);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(!fs->reserved_blocks && !fs->reserved_inodes);
+    CHECK(ext4_fs_available_blocks(fs) == blocks && ext4_fs_available_inodes(fs) == inodes);
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_fs_reserve_blocks(fs, 1) == EOK && ext4_fs_reserve_inodes(fs, 1) == EOK);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(!fs->reserved_blocks && !fs->reserved_inodes);
+    puts("PASS operation reservations exclude other actual task contexts and abort returns only their own capacity");
+}
+
+static unsigned handle_return_entered,handle_return_resume;
+static _Thread_local bool handle_return_pause;
+static void handle_return_written(void *owner,unsigned fields,
+    const struct ext4_timestamp times[3],int error)
+{
+    (void)owner;(void)fields;(void)times;
+    CHECK(!error);
+    if (!handle_return_pause) return;
+    __atomic_store_n(&handle_return_entered,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&handle_return_resume,__ATOMIC_ACQUIRE)) sched_yield();
+}
+static void *handle_return_first(void *argument)
+{
+    handle_return_pause=true;
+    size_t written;
+    CHECK(ext4_fpwrite(argument,0,"A",1,&written)==EOK && written==1);
+    return NULL;
+}
+static void handle_return_test(struct ext4_fs *fs)
+{
+    const struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file,"/handle-return","w+")==EOK);
+    struct ext4_time_observer observer={.written=handle_return_written};
+    CHECK(ext4_mount_setup_time_observer("/",&observer)==EOK);
+    handle_return_entered=handle_return_resume=0;
+    pthread_t first;
+    CHECK(!pthread_create(&first,NULL,handle_return_first,&file));
+    while (!__atomic_load_n(&handle_return_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    /* A has accepted and released every resource, but has not returned its
+     * local handle. B seals that group and completes a later, larger write. */
+    CHECK(ext4_journal_group_commit("/",true)==EOK);
+    size_t written;
+    CHECK(ext4_fpwrite(&file,8192,"B",1,&written)==EOK && written==1);
+    uint64_t size=file.fsize,sequence=file.sync_sequence,data=file.data_sequence;
+    uint32_t tid=file.sync_tid;
+    CHECK(size==8193 && sequence>1 && data==sequence);
+    __atomic_store_n(&handle_return_resume,1,__ATOMIC_RELEASE);
+    CHECK(!pthread_join(first,NULL));
+    CHECK(file.fsize==size && file.sync_sequence==sequence && file.data_sequence==data && file.sync_tid==tid);
+    struct ext4_inode inode;
+    CHECK(ext4_fraw_inode_fill(&file,&inode)==EOK && ext4_inode_get_size(&fs->sb,&inode)==size);
+    unsigned char byte;size_t read;
+    CHECK(ext4_fpread(&file,0,&byte,1,&read)==EOK && read==1 && byte=='A');
+    CHECK(ext4_fpread(&file,8192,&byte,1,&read)==EOK && read==1 && byte=='B');
+    CHECK(ext4_mount_setup_time_observer("/",NULL)==EOK && ext4_fclose(&file)==EOK);
+    CHECK(ext4_fremove("/handle-return")==EOK && ext4_journal_group_drain("/")==EOK);
+    puts("PASS delayed handle return: another task's larger accepted EOF and later sync/data goals survive");
+}
+
+static void handle_stale_test(struct ext4_fs *fs)
+{
+    ext4_file first,second;size_t written;
+    CHECK(ext4_fopen(&first,"/handle-stale","w+")==EOK);
+    CHECK(ext4_fwrite(&first,"old",3,&written)==EOK && written==3);
+    CHECK(ext4_fopen(&second,"/handle-stale","r+")==EOK && second.fsize==3);
+    CHECK(ext4_ftruncate(&second,1)==EOK && first.fsize==3 && second.fsize==1);
+    CHECK(ext4_fpwrite(&first,0,"N",1,&written)==EOK && written==1 && first.fsize==1);
+    struct ext4_inode inode;
+    CHECK(ext4_fraw_inode_fill(&first,&inode)==EOK && ext4_inode_get_size(&fs->sb,&inode)==1);
+    CHECK(ext4_fclose(&first)==EOK && ext4_fclose(&second)==EOK && ext4_fremove("/handle-stale")==EOK);
+    puts("PASS independent handles: positioned write refreshes an unchanged stale size after another handle truncates");
+}
+
+static void allocation_capacity_test(struct ext4_fs *fs)
+{
+    if (!fs->jbd_journal) return;
+    static const char name[] = "allocation-capacity";
+    struct ext4_sblock *sb = &fs->sb;
+    uint32_t groups = ext4_block_group_cnt(sb);
+    uint32_t origin = ext4_crc32c(EXT4_INODE_ROOT_INDEX, name, sizeof(name) - 1) % groups;
+    unsigned descriptor_size = ext4_sb_get_desc_size(sb);
+    unsigned char *descriptors = malloc((size_t)groups * descriptor_size);
+    CHECK(descriptors);
+    uint32_t free_inodes = ext4_fs_available_inodes(fs);
+    uint64_t free_blocks = ext4_fs_available_blocks(fs);
+    for (uint32_t group = 0; group < groups; group++) {
+        struct ext4_block_group_ref ref;
+        CHECK(ext4_fs_get_block_group_ref(fs, group, &ref) == EOK);
+        memcpy(descriptors + (size_t)group * descriptor_size, ref.block_group, descriptor_size);
+        CHECK(ext4_fs_put_block_group_ref(&ref) == EOK);
+    }
+    for (unsigned scenario = 0; scenario < 6; scenario++) {
+        CHECK(ext4_transaction_begin("/") == EOK);
+        /* These descriptor-only capacity limits model pressure without filling
+         * the image. The outer abort must discard every artificial limit. */
+        for (uint32_t group = 0; group < groups; group++) {
+            struct ext4_block_group_ref ref;
+            CHECK(ext4_fs_get_block_group_ref_write(fs, group, &ref) == EOK);
+            if (scenario < 2) {
+                ext4_bg_set_used_dirs_count(ref.block_group, sb, group == origin ? 0 : 10);
+                if (group == origin && scenario == 0)
+                    ext4_bg_set_free_blocks_count(ref.block_group, sb, 1);
+                if (group == origin && scenario == 1)
+                    ext4_bg_set_free_inodes_count(ref.block_group, sb, 1);
+            } else if (scenario == 2) {
+                ext4_bg_set_free_blocks_count(ref.block_group, sb, 1);
+                ext4_bg_set_free_inodes_count(ref.block_group, sb, 1);
+                ext4_bg_set_used_dirs_count(ref.block_group, sb, 1);
+            } else if (scenario == 3 || (scenario == 5 && group == 0)) {
+                ext4_bg_set_free_inodes_count(ref.block_group, sb, 0);
+            } else if (scenario == 4) {
+                ext4_bg_set_free_blocks_count(ref.block_group, sb, 0);
+            }
+            ref.dirty = true;
+            CHECK(ext4_fs_put_block_group_ref(&ref) == EOK);
+        }
+        struct ext4_inode_ref inode;
+        int result = ext4_fs_alloc_inode(fs, &inode,
+            scenario == 5 ? EXT4_DE_REG_FILE : EXT4_DE_DIR,
+            EXT4_INODE_ROOT_INDEX, name, sizeof(name) - 1);
+        CHECK(result == (scenario == 3 || scenario == 4 ? ENOSPC : EOK));
+        if (result == EOK) {
+            uint32_t group = (inode.index - 1) / ext4_get32(sb, inodes_per_group);
+            if (scenario < 2) CHECK(group != origin);
+            if (scenario == 2) CHECK(group == origin);
+            if (scenario == 5) CHECK(group != 0);
+            CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
+        }
+        CHECK(ext4_transaction_abort("/", result ? result : ECANCELED) == (result ? result : ECANCELED));
+        CHECK(!fs->reserved_blocks && !fs->reserved_inodes &&
+            ext4_fs_available_inodes(fs) == free_inodes && ext4_fs_available_blocks(fs) == free_blocks);
+        for (uint32_t group = 0; group < groups; group++) {
+            struct ext4_block_group_ref ref;
+            CHECK(ext4_fs_get_block_group_ref(fs, group, &ref) == EOK);
+            CHECK(!memcmp(descriptors + (size_t)group * descriptor_size, ref.block_group, descriptor_size));
+            CHECK(ext4_fs_put_block_group_ref(&ref) == EOK);
+        }
+    }
+    free(descriptors);
+    puts("PASS directory capacity floors, scarce-space fallback, ENOSPC, parent-group exhaustion and abort counters");
+}
+
+static void allocation_locality_test(struct ext4_fs *fs)
+{
+    struct ext4_sblock *sb = &fs->sb;
+    static const char *names[] = {"metadata-a", "metadata-b", "locality-0", "locality-1"};
+    uint32_t groups = ext4_block_group_cnt(sb), parent_groups[4];
+    CHECK(groups >= 2);
+    for (unsigned i = 0; i < 4; i++) {
+        char directory[32], path[48];
+        snprintf(directory, sizeof(directory), "/%s", names[i]);
+        CHECK(ext4_dir_mk(directory) == EOK);
+        ext4_dir parent;
+        CHECK(ext4_dir_open(&parent, directory) == EOK);
+        parent_groups[i] = (parent.f.inode - 1) / ext4_get32(sb, inodes_per_group);
+        CHECK(ext4_dir_close(&parent) == EOK);
+        snprintf(path, sizeof(path), "%s/child", directory);
+        ext4_file file;
+        CHECK(ext4_fopen(&file, path, "w+") == EOK);
+        CHECK((file.inode - 1) / ext4_get32(sb, inodes_per_group) == parent_groups[i]);
+        CHECK(ext4_fclose(&file) == EOK);
+    }
+    if (groups == 2) CHECK(parent_groups[0] != parent_groups[1]);
+    unsigned distinct = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        bool seen = false;
+        for (unsigned j = 0; j < i; j++) seen |= parent_groups[j] == parent_groups[i];
+        distinct += !seen;
+    }
+    CHECK(distinct >= 2);
+    printf("PASS directory group distribution (%u,%u,%u,%u) and parent-local regular inode allocation\n",
+        parent_groups[0], parent_groups[1], parent_groups[2], parent_groups[3]);
+    allocation_capacity_test(fs);
+}
+
+#ifdef TEST_OPERATION_LIFECYCLE
+#include "lwext4_operation_lifecycle.h"
+#include "lwext4_create_ref.h"
+#endif
+
 int main(int argc,char **argv)
 {
     int exit_status=0;
@@ -2576,6 +2953,19 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"extent-lookup")){extent_lookup_checksums(&dev);}
     else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);legacy_leaf_batch(&dev);legacy_chain_abort(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
     else if(!strcmp(argv[2],"seed"))seed();
+    else if(!strcmp(argv[2],"operation-context"))operation_context_test(dev.fs);
+#ifdef TEST_OPERATION_LIFECYCLE
+    else if(!strcmp(argv[2],"operation-lifecycle"))operation_lifecycle_test(dev.fs);
+    else if(!strcmp(argv[2],"create-ref"))create_ref_test(dev.fs);
+    else if(!strcmp(argv[2],"unlink-ref"))unlink_ref_test(dev.fs);
+    else if(!strcmp(argv[2],"operation-state-error")) {
+        operation_state_error(dev.fs,argc>3 && atoi(argv[3]));return 0;
+    }
+#endif
+    else if(!strcmp(argv[2],"operation-super-delta")){operation_super_delta_test(dev.fs); operation_reservation_test(dev.fs);}
+    else if(!strcmp(argv[2],"handle-return"))handle_return_test(dev.fs);
+    else if(!strcmp(argv[2],"handle-stale"))handle_stale_test(dev.fs);
+    else if(!strcmp(argv[2],"allocation-locality"))allocation_locality_test(dev.fs);
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
     else if(!strcmp(argv[2],"group-log-payload"))group_log_payload(dev.fs);
@@ -2614,8 +3004,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-data-write-error") || !strcmp(argv[2],"group-data-flush-error")) {
         group_data_error(dev.fs,!strcmp(argv[2],"group-data-flush-error"));return 0;
     }
-    else if(!strcmp(argv[2],"owner-shared") || !strcmp(argv[2],"owner-shared-unlink") || !strcmp(argv[2],"truncate-shared"))
-        owner_shared_test(dev.fs,!strcmp(argv[2],"owner-shared-unlink"),!strcmp(argv[2],"truncate-shared"));
+    else if(!strcmp(argv[2],"owner-shared") || !strcmp(argv[2],"owner-shared-unlink") || !strcmp(argv[2],"truncate-shared") || !strcmp(argv[2],"owner-shared-set"))
+        owner_shared_test(dev.fs,!strcmp(argv[2],"owner-shared-unlink"),!strcmp(argv[2],"truncate-shared"),!strcmp(argv[2],"owner-shared-set"));
     else if(!strcmp(argv[2],"verify-truncate-shared")) {
         ext4_file f;struct ext4_inode ino;uint32_t value[5];size_t length;
         CHECK(ext4_fopen(&f,"/file","r")==EOK && ext4_fraw_inode_fill(&f,&ino)==EOK);

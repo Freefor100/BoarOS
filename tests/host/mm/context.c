@@ -61,7 +61,14 @@ enum kernel_task_status kernel_task_mm_borrow(const struct kernel_task *task, co
 #endif
 #endif
 static unsigned parked[16];
+/* The host model publishes its configured executors before any mount. */
+unsigned mm_test_boot_cpus=BOAROS_MAX_CPUS;
 static pthread_once_t domain_once = PTHREAD_ONCE_INIT;
+static void initialize_domain(void)
+{
+    kernel_cpu_set_boot_count(mm_test_boot_cpus);
+    kernel_wait_domain_init();
+}
 unsigned mm_test_parked(unsigned id) { assert(id < 16); return __atomic_load_n(&parked[id], __ATOMIC_ACQUIRE); }
 void *sync_test_cpu(void)
 {
@@ -75,7 +82,7 @@ void mm_test_attach(unsigned id)
     /* actor_id 区分等待者；CPU 归属由 activity、文件或缓存夹具显式设置。 */
     cpu.logical_id = 0;
 #endif
-    assert(!pthread_once(&domain_once, kernel_wait_domain_init));
+    assert(!pthread_once(&domain_once, initialize_domain));
     assert(id < 16); actor_id = id;
     actor = (struct mm_test_actor){0};
 #ifdef FILE_IO_CASES
@@ -93,6 +100,7 @@ void mm_test_attach(unsigned id)
 }
 /* 普通MM调用使用bootstrap I/O owner；实际park运行在TLS调度模型中。 */
 #ifndef FILE_IO_CASES
+void *sync_test_current_task(void) { return kernel_task_current(); }
 int kernel_task_has_user_context(const struct kernel_task *task)
 { return task && task->arch.user_mode==1; }
 struct kernel_task *kernel_task_current(void)
