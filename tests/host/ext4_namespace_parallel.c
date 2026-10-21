@@ -20,10 +20,15 @@ struct parallel_actor {
 };
 static _Thread_local struct parallel_actor *parallel_current;
 static _Thread_local unsigned orphan_order_watch, orphan_order_aborts;
+static _Thread_local unsigned rename_order_watch,rename_order_aborts,rename_order_retries;
 void __real_jbd_journal_free_trans_state_held(struct jbd_journal *,struct jbd_trans *,bool);
 void __wrap_jbd_journal_free_trans_state_held(struct jbd_journal *journal,struct jbd_trans *trans,bool abort)
 {
     if(orphan_order_watch && abort)orphan_order_aborts++;
+    if(rename_order_watch && abort) {
+        rename_order_aborts++;
+        if(kernel_io_context_current()->backend_resources.retry)rename_order_retries++;
+    }
     __real_jbd_journal_free_trans_state_held(journal,trans,abort);
 }
 static unsigned worker_mode,checkpoint_pause,checkpoint_entered,checkpoint_resume,checkpoint_calls;
@@ -363,6 +368,7 @@ static void namespace_reuse_loop_case(struct lwext4_mount_adapter *adapter,
 #include "ext4_namespace_parallel_orphan.h"
 #include "ext4_namespace_parallel_notify.h"
 #include "ext4_namespace_parallel_reservation.h"
+#include "ext4_namespace_parallel_rename.h"
 int main(int argc,char **argv)
 {
     assert(argc==2);setvbuf(stdout,NULL,_IONBF,0);mm_test_attach(0);mm_test_activate_task();
@@ -398,6 +404,8 @@ int main(int argc,char **argv)
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     worker_notification_case(adapter,root);
+    rename_order_case(adapter,root);
+    rename_order_directory_case(adapter,root);
     rename_inode_case(adapter,root);
     unsigned groups=ext4_block_group_cnt(&fs->sb),per_group=ext4_get32(&fs->sb,inodes_per_group);
     assert(groups>=2 && groups<65);
