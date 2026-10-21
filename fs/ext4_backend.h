@@ -56,6 +56,9 @@ struct lwext4_node {
     struct ext4_timestamp times[3];
     uint64_t time_version[3];
     struct lwext4_node *dirty_next, **dirty_previous;
+#if BOAROS_MAX_CPUS > 1
+    struct boaros_lwext4_resource *inode_resource;
+#endif
     unsigned dirty_fields, extra_times;
     uint8_t noatime;
     uint8_t write_completion;

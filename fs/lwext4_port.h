@@ -22,6 +22,11 @@ struct boaros_lwext4_domain {
 void boaros_lwext4_lock_init(struct ext4_lock *callbacks,
     struct boaros_lwext4_domain *domain, struct kernel_heap *heap);
 void boaros_lwext4_lock_fini(struct boaros_lwext4_domain *domain);
+/* A live backend inode retains the shared object, not its mutex qualification. */
+int boaros_lwext4_inode_get(struct boaros_lwext4_domain *, uint32_t,
+    struct boaros_lwext4_resource **);
+void boaros_lwext4_inode_put(struct boaros_lwext4_domain *,
+    struct boaros_lwext4_resource **);
 /* Caller holds startup namespace qualification; workers await publication.
  * Drains old backend owners before publishing the parallel domain. */
 void boaros_lwext4_enable_parallel(struct boaros_lwext4_domain *domain, struct ext4_fs *fs);

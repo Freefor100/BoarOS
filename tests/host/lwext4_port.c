@@ -203,6 +203,48 @@ static void last_resource_case(struct kernel_heap *heap)
     assert(after.live_allocations==before.live_allocations && after.current_pages==before.current_pages);
     puts("PASS last resource owner detaches before lock-free free; a same-key candidate publishes while old storage is still borrowed, with all owners returned");
 }
+static void inode_lifetime_case(struct kernel_heap *heap)
+{
+    struct kernel_heap_statistics before,after;kernel_heap_get_statistics(heap,&before);
+    struct ext4_lock callbacks={0};struct boaros_lwext4_domain domain={0};
+    struct jbd_journal journal={.grouped=true};struct ext4_fs fs={.jbd_journal=&journal};
+    fs.orphan_index=(struct ext4_orphan_index *)&fs;
+    boaros_lwext4_lock_init(&callbacks,&domain,heap);
+    struct boaros_lwext4_resource *inode=NULL;
+    assert(!boaros_lwext4_inode_get(&domain,777,&inode) && inode);
+    boaros_lwext4_enable_parallel(&domain,&fs);
+    unsigned calls=allocation_calls;
+    for(unsigned i=0;i<8;i++) {
+        struct ext4_operation operation={.fs=&fs};
+        callbacks.lock(&domain);
+        assert(!callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_INODE,777));
+        assert(kernel_io_context_current()->locks->lock->rank==31);
+        callbacks.resource_release(&domain);callbacks.unlock(&domain);
+    }
+    assert(allocation_calls==calls);
+    struct last_resource_actor actors[2]={{.callbacks=&callbacks,.fs=&fs},
+        {.callbacks=&callbacks,.fs=&fs,.actor=1}};
+    pthread_t threads[2];assert(!pthread_create(&threads[0],NULL,last_resource_owner,&actors[0]));
+    while(!__atomic_load_n(&actors[0].entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_create(&threads[1],NULL,last_resource_owner,&actors[1]));
+    for(;;) {
+        unsigned queued;
+        {KERNEL_RAW_SCOPE(guard,&actors[0].lock->metadata);queued=actors[0].lock->pending_head!=NULL;}
+        if(queued)break;
+        sched_yield();
+    }
+    boaros_lwext4_inode_put(&domain,&inode);
+    assert(!inode && !actors[1].entered && domain.resources.rbh_root);
+    __atomic_store_n(&actors[0].resume,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&actors[1].entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(actors[0].lock==actors[1].lock);
+    __atomic_store_n(&actors[1].resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(threads[0],NULL) && !pthread_join(threads[1],NULL));
+    assert(!domain.resources.rbh_root);boaros_lwext4_lock_fini(&domain);
+    kernel_heap_get_statistics(heap,&after);
+    assert(after.live_allocations==before.live_allocations && after.current_pages==before.current_pages);
+    puts("PASS inode reference retains one shared object across eight transactions; final node put during writer/queued-owner handoff preserves exclusion and returns all memory");
+}
 struct transition_actor {
     struct ext4_lock *callbacks;
     struct boaros_lwext4_domain *domain;
@@ -456,7 +498,7 @@ int main(void)
            !physical_page_allocator_finalize(&pages) && !kernel_heap_init(&heap,&pages,page_address));
     uint64_t available=physical_page_available(&pages);
     resources_case(&heap);shared_resource_case(&heap,1);shared_resource_case(&heap,0);transition_case(&heap);
-    resource_reclamation_case(&heap);last_resource_case(&heap);state_readers_case(&heap);
+    resource_reclamation_case(&heap);last_resource_case(&heap);inode_lifetime_case(&heap);state_readers_case(&heap);
     for(unsigned failure=0;failure<5;failure++)state_rejected_case(&heap,failure);
     puts("PASS state read qualification rejects upgrade, wrong domain/owner and premature backend release");
     assert(physical_page_available(&pages)==available);

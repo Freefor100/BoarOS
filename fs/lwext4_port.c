@@ -87,6 +87,22 @@ static void resource_put(struct boaros_lwext4_domain *domain,struct boaros_lwext
     }
     if(last)kernel_heap_release(domain->heap,resource);
 }
+int boaros_lwext4_inode_get(struct boaros_lwext4_domain *domain,uint32_t inode,
+    struct boaros_lwext4_resource **owner)
+{
+    if(!domain || !inode || !owner || *owner)__builtin_trap();
+    *owner=resource_find(domain,EXT4_RESOURCE_INODE,inode);
+    return *owner?EOK:ENOMEM;
+}
+void boaros_lwext4_inode_put(struct boaros_lwext4_domain *domain,
+    struct boaros_lwext4_resource **owner)
+{
+    if(!domain || !owner)__builtin_trap();
+    struct boaros_lwext4_resource *resource=*owner;
+    if(!resource)return;
+    if(resource->kind!=EXT4_RESOURCE_INODE)__builtin_trap();
+    *owner=NULL;resource_put(domain,resource);
+}
 static void resource_request_free(struct boaros_lwext4_domain *domain,
     struct boaros_lwext4_resource_set *set,struct boaros_lwext4_resource_request *request)
 {

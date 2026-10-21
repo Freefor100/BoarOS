@@ -2310,6 +2310,13 @@ $(BUILD_DIR)/sync-%.d: ;
 test-file-io-concurrency-host:
 	sh tests/file-io-concurrency-host.sh
 
+.PHONY: test-ext4-node-resource-host
+test-ext4-node-resource-host:
+	FILE_IO_HOST_BUILD=$${FILE_IO_HOST_BUILD:-build/host/ext4-node-resource} \
+	FILE_IO_HOST_TEST_SOURCE=tests/host/ext4_node_resource.c FILE_IO_HOST_TCP=0 \
+	FILE_IO_HOST_LDFLAGS='-Wl,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_release,--wrap=kernel_rwlock_init,--wrap=jbd_trans_set_block_dirty_range,--wrap=boaros_lwext4_inode_get,--wrap=ext4_metadata_execute,--wrap=ext4_fclose' \
+	sh tests/file-io-concurrency-host.sh
+
 test-files-concurrency-host:
 	sh tests/files-concurrency-host.sh
 

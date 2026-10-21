@@ -100,6 +100,7 @@ static void release_orphan(struct lwext4_mount_adapter *adapter,
                            struct lwext4_orphan *orphan);
 static int reserve_orphan(struct lwext4_mount_adapter *adapter,
                           struct lwext4_orphan **owner);
+static int close_node_file(struct kernel_vfs_node *node);
 static int cleanup_mount(struct kernel_vfs_mount *mount);
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
@@ -1068,7 +1069,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
             ((struct lwext4_node *)node)->write_completion=0;
         }
         if (!node->closed) {
-            result = ext4_fclose(lwext4_node_file(node));
+            result = close_node_file(node);
             if (result != EOK) {
                 return lwext4_error(result);
             }
@@ -1084,7 +1085,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     }
     /* root 的路径身份保留至摘树；私有 handle 不再访问即将释放的 lwext4 mount。 */
     if (root && !root->closed) {
-        result = ext4_fclose(lwext4_node_file(root));
+        result = close_node_file(root);
         if (result != EOK) return lwext4_error(result);
         root->closed = 1U;
     }
@@ -1784,6 +1785,32 @@ static int ext4_backend_set_owner(struct kernel_vfs_file *file, uint32_t uid, ui
     return result;
 }
 
+static int retain_node_inode(struct kernel_vfs_node *node)
+{
+#if BOAROS_MAX_CPUS > 1
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    if(!adapter->locks.resource_acquire || adapter->instance.read_only ||
+       !adapter->device.fs->jbd_journal)return EOK;
+    /* Root and directory handles can precede worker/parallel publication.
+     * Their identity already lives; no mutex is held by this reference. */
+    return boaros_lwext4_inode_get(&adapter->backend_lock,
+        lwext4_node_file(node)->inode,&((struct lwext4_node *)node)->inode_resource);
+#else
+    (void)node;return EOK;
+#endif
+}
+static int close_node_file(struct kernel_vfs_node *node)
+{
+    ext4_file *file=lwext4_node_file(node);
+    int result=file->mp?ext4_fclose(file):EOK;
+    /* Failed close remains owned by the existing cleanup node. */
+#if BOAROS_MAX_CPUS > 1
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    if(!result)boaros_lwext4_inode_put(&adapter->backend_lock,
+        &((struct lwext4_node *)node)->inode_resource);
+#endif
+    return result;
+}
 static int ext4_backend_open(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
@@ -1820,6 +1847,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
                    -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 
+    node->instance=&adapter->instance;
     node->backend_data = &((struct lwext4_node *)node)->file;
     if (path == 0) {
         result = ext4_fopen_inode(lwext4_node_file(node), adapter->mount_point,
@@ -1861,8 +1889,9 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode = mode;
     result = load_times(node, adapter);
+    if(!result)result=retain_node_inode(node);
     if (result) {
-        if (ext4_fclose(lwext4_node_file(node)) != EOK) {
+        if (close_node_file(node) != EOK) {
             node->instance = &adapter->instance;
             kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap, node);
@@ -1873,21 +1902,26 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
 
 struct namespace_create {
     const char *mount, *path, *target;
-    ext4_file *file;
+    struct kernel_vfs_node *node;
     struct ext4_inode *initial;
     uint32_t parent, mode, type, device;
 };
 static int apply_namespace_create(void *context)
 {
     struct namespace_create *request = context;
-    if (request->file && request->file->mp) {
-        int result = ext4_fclose(request->file);
+    ext4_file *file=request->node?lwext4_node_file(request->node):NULL;
+    if (file && file->mp) {
+        int result = close_node_file(request->node);
         if (result) return result;
-        memset(request->file, 0, sizeof(*request->file));
+        memset(file, 0, sizeof(*file));
     }
-    return ext4_create_child(request->mount, request->parent, request->path,
-        request->mode | request->type, request->device, request->target, request->file,
+    int result=ext4_create_child(request->mount, request->parent, request->path,
+        request->mode | request->type, request->device, request->target, file,
         request->initial);
+    /* Bind before the outer operation accepts the new directory entry, so
+     * allocation failure aborts create instead of following a committed name. */
+    if(!result && request->node)result=retain_node_inode(request->node);
+    return result;
 }
 struct namespace_remove {
     const char *mount, *path;
@@ -1953,14 +1987,15 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
                    -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 
+    node->instance=&adapter->instance;
     node->backend_data = &((struct lwext4_node *)node)->file;
     struct ext4_inode initial;
-    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.file=lwext4_node_file(node),.initial=&initial,.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
     result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any
          * uncertain journal state. An aborted create must not unlink by name. */
-        if (lwext4_node_file(node)->mp && ext4_fclose(lwext4_node_file(node))!=EOK) {
+        if (close_node_file(node)!=EOK) {
             node->instance=&adapter->instance;
             kernel_vfs_cleanup_node(node);
         } else kernel_heap_release(adapter->instance.heap,node);
@@ -2458,7 +2493,7 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 {
     /* close 不做递归 I/O；通用末引用路径把未完成的对象交给 cleanup_nodes。 */
     if (((struct lwext4_node *)node)->write_completion) return -KERNEL_EIO;
-    return lwext4_error(ext4_fclose(lwext4_node_file(node)));
+    return lwext4_error(close_node_file(node));
 }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
