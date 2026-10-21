@@ -14,6 +14,7 @@ with tempfile.TemporaryDirectory(prefix='boaros-dir-empty-') as name:
     command=['cc','-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror',
         '-Wno-unused-but-set-variable','-Wno-stringop-truncation','-DCONFIG_USE_DEFAULT_CFG=1',
         '-DCONFIG_USE_USER_MALLOC=1','-include',str(ROOT/'tests/host/lwext4_memory.h'),
+        '-Wl,--wrap=ext4_fs_get_inode_ref_read,--wrap=ext4_fs_inode_ref_write',
         '-I'+str(ROOT/'third_party/lwext4/include'),'-idirafter',str(ROOT/'include'),
         *map(str,sorted((ROOT/'third_party/lwext4/src').glob('*.c'))),
         str(ROOT/'tests/host/lwext4_rename.c'),str(ROOT/'tests/host/block_fault.c'),

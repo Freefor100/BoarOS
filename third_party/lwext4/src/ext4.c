@@ -2996,6 +2996,7 @@ int ext4_rename_child(const char *mount_point,
 	struct ext4_rename_result output = {0};
 	uint32_t source_ino = 0, victim_ino = 0, parent;
 	bool is_dir = false, target_dir = false;
+	bool ordered = fs->os_locks && fs->os_locks->resource_acquire;
 	int r;
 	EXT4_MP_LOCK(mp);
 	if (!result || flags & ~1U || !old_parent || !new_parent ||
@@ -3005,10 +3006,14 @@ int ext4_rename_child(const char *mount_point,
 	if (!fs->jbd_journal) { r = ENOTSUP; goto Unlock; }
 	r = ext4_trans_start(mp);
 	if (r != EOK) goto Unlock;
-	r = ext4_fs_get_inode_ref_read(fs, old_parent, &old);
+	/* Without per-object resources the caller's serial qualification spans
+	 * discovery and modification; create writable records on the first borrow. */
+	r = ordered ? ext4_fs_get_inode_ref_read(fs, old_parent, &old) :
+	              ext4_fs_get_inode_ref(fs, old_parent, &old);
 	if (r != EOK) goto Put;
 	if (destination == &new) {
-		r = ext4_fs_get_inode_ref_read(fs, new_parent, &new);
+		r = ordered ? ext4_fs_get_inode_ref_read(fs, new_parent, &new) :
+		              ext4_fs_get_inode_ref(fs, new_parent, &new);
 		if (r != EOK) goto Put;
 	}
 	if (!ext4_inode_is_type(sb, old.inode, EXT4_INODE_MODE_DIRECTORY) ||
@@ -3024,13 +3029,15 @@ int ext4_rename_child(const char *mount_point,
 	if (victim_ino && flags == 1) { r = EEXIST; goto Put; }
 	if (source_ino == EXT4_INODE_ROOT_INDEX || source_ino == old_parent ||
 	    victim_ino == old_parent || victim_ino == new_parent) { r = EINVAL; goto Put; }
-	r = ext4_fs_get_inode_ref_read(fs, source_ino, &source);
+	r = ordered ? ext4_fs_get_inode_ref_read(fs, source_ino, &source) :
+	              ext4_fs_get_inode_ref(fs, source_ino, &source);
 	if (r != EOK) goto Put;
 	if (!ext4_inode_get_links_cnt(source.inode)) { r = EUCLEAN; goto Put; }
 	if (source_ino == victim_ino) { r = EOK; goto Put; }
 	is_dir = ext4_inode_is_type(sb, source.inode, EXT4_INODE_MODE_DIRECTORY);
 	if (victim_ino) {
-		r = ext4_fs_get_inode_ref_read(fs, victim_ino, &victim);
+		r = ordered ? ext4_fs_get_inode_ref_read(fs, victim_ino, &victim) :
+		              ext4_fs_get_inode_ref(fs, victim_ino, &victim);
 		if (r != EOK) goto Put;
 		if (!ext4_inode_get_links_cnt(victim.inode)) { r = EUCLEAN; goto Put; }
 		target_dir = ext4_inode_is_type(sb, victim.inode, EXT4_INODE_MODE_DIRECTORY);
@@ -3060,7 +3067,7 @@ int ext4_rename_child(const char *mount_point,
     /* Discovery borrows stable records without taking write qualifications.
      * Acquire the complete known set in inode order before creating private
      * records, including a source allocated below either parent. */
-    if (fs->os_locks && fs->os_locks->resource_acquire) {
+    if (ordered) {
         uint32_t inodes[] = {old_parent, new_parent, source_ino, victim_ino};
         for (unsigned i = 1; i < 4; i++) {
             uint32_t inode = inodes[i];
@@ -3075,19 +3082,19 @@ int ext4_rename_child(const char *mount_point,
             r = ext4_operation_require_resource(fs, EXT4_RESOURCE_INODE, inodes[i]);
             if (r != EOK) goto Put;
         }
+        r = ext4_fs_inode_ref_write(&old);
+        if (r == EOK && destination != &old) r = ext4_fs_inode_ref_write(destination);
+        if (r == EOK) r = ext4_fs_inode_ref_write(&source);
+        if (r == EOK && victim_ino) r = ext4_fs_inode_ref_write(&victim);
+        if (r != EOK) goto Put;
+        /* The caller retains namespace qualifications across resource waits:
+         * names and parentage stay fixed. Only inode metadata can have advanced. */
+        if (!ext4_inode_get_links_cnt(old.inode) ||
+            !ext4_inode_get_links_cnt(destination->inode) ||
+            !ext4_inode_get_links_cnt(source.inode) ||
+            (victim_ino && !ext4_inode_get_links_cnt(victim.inode))) r = EUCLEAN;
+        if (r != EOK) goto Put;
     }
-    r = ext4_fs_inode_ref_write(&old);
-    if (r == EOK && destination != &old) r = ext4_fs_inode_ref_write(destination);
-    if (r == EOK) r = ext4_fs_inode_ref_write(&source);
-    if (r == EOK && victim_ino) r = ext4_fs_inode_ref_write(&victim);
-    if (r != EOK) goto Put;
-    /* The caller retains namespace qualifications across resource waits:
-     * names and parentage stay fixed. Only inode metadata can have advanced. */
-    if (!ext4_inode_get_links_cnt(old.inode) ||
-        !ext4_inode_get_links_cnt(destination->inode) ||
-        !ext4_inode_get_links_cnt(source.inode) ||
-        (victim_ino && !ext4_inode_get_links_cnt(victim.inode))) r = EUCLEAN;
-    if (r != EOK) goto Put;
 	if (victim_ino)
 		r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
 	else r = ext4_dir_add_entry(destination, new_name, new_len, &source);

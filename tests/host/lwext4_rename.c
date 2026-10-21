@@ -21,6 +21,20 @@ static unsigned allocations, fail_allocation, events, cut, allocation_hits, io_h
 static int reorder;
 static unsigned injected_allocation;
 static const char *operation_kind = "setup", *operation_mode = "setup";
+static bool serial_refs_watch;
+static unsigned serial_read_refs,serial_write_upgrades;
+int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
+int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct ext4_inode_ref *ref)
+{
+    if(serial_refs_watch)serial_read_refs++;
+    return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
+}
+int __real_ext4_fs_inode_ref_write(struct ext4_inode_ref *);
+int __wrap_ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
+{
+    if(serial_refs_watch)serial_write_upgrades++;
+    return __real_ext4_fs_inode_ref_write(ref);
+}
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%d: %s (kind=%s mode=%s allocation=%u event=%u)\n", __LINE__, #x, operation_kind, operation_mode, injected_allocation, events); exit(1); } } while (0)
 void *ext4_user_malloc(size_t n) { if (++allocations == fail_allocation) { allocation_hits++; return NULL; } return malloc(n); }
 void *ext4_user_calloc(size_t n, size_t s) { if (++allocations == fail_allocation) { allocation_hits++; return NULL; } return calloc(n, s); }
@@ -225,6 +239,35 @@ static void basic(struct ext4_fs *fs)
     char name[40]; size_t length;
     CHECK(ext4_readlink("/new/link", name, sizeof(name), &length) == EOK);
     CHECK(length == strlen("/old/source") && !memcmp(name, "/old/source", length));
+}
+
+static void serial_refs(struct ext4_fs *fs)
+{
+    CHECK(!fs->os_locks || !fs->os_locks->resource_acquire);
+    uint32_t old=directory("/old"),new=directory("/new"),source=inode("/old/source");
+    struct {uint32_t from,to;const char *before,*after,*path;} cases[]={
+        {old,old,"source","renamed","/old/renamed"},
+        {old,old,"renamed","source","/old/source"},
+        {old,new,"source","renamed","/new/renamed"},
+        {new,old,"renamed","source","/old/source"},
+    };
+    for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        struct ext4_rename_result out={0};
+        serial_read_refs=serial_write_upgrades=0;serial_refs_watch=true;
+        int result=rename_entry(cases[i].from,cases[i].before,cases[i].to,cases[i].after,0,&out);
+        serial_refs_watch=false;
+        CHECK(result==EOK && out.changed && !out.replaced_inode);
+        CHECK(inode(cases[i].path)==source && links(fs,source)==1);
+        content(cases[i].path,"SOURCE");
+        printf("serial rename refs: same_parent=%u read_borrows=%u write_upgrades=%u\n",
+            cases[i].from==cases[i].to,serial_read_refs,serial_write_upgrades);
+        CHECK(!serial_read_refs && !serial_write_upgrades);
+    }
+    /* Existing checks cover replacement, directories, ancestry and rollback;
+     * their legitimate ancestor READ references are not optimization failures. */
+    basic(fs);
+    CHECK(!fs->active_operations && !ext4_current_operation(fs));
+    puts("PASS serial rename uses writable inode refs directly; same/cross identities, replacement, directories and abort owners");
 }
 
 static void wide(struct ext4_fs *fs)
@@ -501,6 +544,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[3], "orphan-reclaim")) return 0;
     }
     else if (!strcmp(argv[2], "basic")) basic(dev.fs);
+    else if (!strcmp(argv[2], "serial-refs")) serial_refs(dev.fs);
     else if (!strcmp(argv[2], "hardlink")) hardlink(dev.fs);
     else if (!strcmp(argv[2], "wide")) wide(dev.fs);
     else if (!strcmp(argv[2], "damage")) { CHECK(argc >= 4); damage(dev.fs, argv[3]); }
