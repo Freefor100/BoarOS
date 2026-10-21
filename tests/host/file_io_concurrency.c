@@ -10,6 +10,7 @@
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
+#include <kernel/time.h>
 #include <ext4_bcache.h>
 #include "../../fs/lwext4_port.h"
 #include <kernel/file_mapping.h>
@@ -33,6 +34,13 @@ void mm_test_bind_files(struct kernel_files *);
 void mm_test_finish(void);
 void mm_test_activate_task(void);
 extern _Thread_local uint64_t mm_test_context;
+#if !defined(TCP_IO_CASES) && !defined(LOOP_IO_CASES) && !defined(FALLOCATE_SYNC_CASES)
+enum kernel_time_status __wrap_kernel_time_deadline_from_monotonic(uint64_t target,uint64_t *deadline)
+{
+    *deadline=target;
+    return target<=kernel_time_monotonic_ns()?KERNEL_TIME_STATUS_DEADLINE_PASSED:KERNEL_TIME_STATUS_OK;
+}
+#endif
 #ifdef LOOP_IO_CASES
 static unsigned char arena[64*1024*1024] __attribute__((aligned(16384)));
 #else

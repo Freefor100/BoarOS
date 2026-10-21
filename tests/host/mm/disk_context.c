@@ -67,6 +67,8 @@ uint64_t kernel_time_monotonic_ns(void)
     struct timespec t; if (clock_gettime(CLOCK_MONOTONIC, &t)) abort();
     return (uint64_t)t.tv_sec * 1000000000U + t.tv_nsec;
 }
+/* The host deadline model uses nanoseconds as its architecture tick unit. */
+uint64_t riscv_time_read(void) { return kernel_time_monotonic_ns(); }
 uint64_t kernel_time_realtime_ns(void)
 {
     struct timespec t; if (clock_gettime(CLOCK_REALTIME, &t)) abort();

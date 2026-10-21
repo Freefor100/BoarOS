@@ -72,11 +72,12 @@ COMMITTED任务的模拟backend与生产一样在通知中摘除默认节点，�
 回调保留借用并在锁外执行。
 finish每段最多摘16个登记，未借用的小批登记可在同一保护下结束；存在借用才等待归还。
 
-可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw再park。
+可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw后等待。
 `kernel_rwlock_try_write()`及mutex包装只尝试取得，不登记等待者；已有读/写owner、pending或handoff均返回忙，guard和IRQ状态保持。它保留相同rank/key、owner与上下文检查，不能用于越过FIFO或在raw内取得任务锁。
-未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束及pending摘除。
+未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束、pending摘除及重新取得对象raw，覆盖通知者的最后访问。
 FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
 已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。
+实际在线至少两CPU时，已登记的争用者在锁外恢复入口IRQ状态，短时间轮询自己的release/acquire资格标记。基础上限为50µs；仅FIFO队首且独占writer对应另一在线CPU的RUNNING/on_cpu任务时，上限为1ms。CPU/current只用于当时的预算提示，锁外不保留或解引用该任务；任务随后阻塞或切换仍受同一个绝对截止约束。到界沿原park路径等待，提前通知直接完成；单次取得只使用一次预算。默认UP构建消去此路径，SMP内核仅启动一CPU时也直接park。
 通知不等于资格：额外唤醒只更新等待token，不重排FIFO；旧登记结束与重取对象raw之间也允许授资格。guard的rank/key和任务owner
 保持原契约；等待仍不可中断，没有新增timed/interruptible API。
 

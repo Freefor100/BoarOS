@@ -18,6 +18,9 @@ for symbol in $(sed -n 's/^EXCLUDED(\([^)]*\)).*/\1/p' tests/host/file_io_exclud
     fi
     set -- "$@" "-Wl,--wrap=$symbol"
 done
+if [ "${FILE_IO_HOST_TCP:-1}" = 0 ]; then
+    set -- "$@" "-Wl,--wrap=kernel_time_deadline_from_monotonic"
+fi
 for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
     ${HOST_CC:-cc} -std=gnu11 -O2 -g -Wall -Wextra -Werror -pthread \
         -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 \

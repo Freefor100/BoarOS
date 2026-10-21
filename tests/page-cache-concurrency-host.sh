@@ -13,7 +13,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -Wno-unused-but-set-variable -Wno-stringop-truncation -Ithird_party/lwext4/include \
         -Itests/host/mm -Itests/host/sync -idirafter include \
         ${CACHE_HOST_TEST_SOURCE:-tests/host/page_cache_concurrency.c} tests/host/mm/context.c \
-        tests/host/mm/disk_context.c kernel/cpu.c kernel/raw_lock.c \
+        tests/host/mm/disk_context.c tests/host/sync/notifications.c kernel/cpu.c kernel/raw_lock.c \
         kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/physical_page.c \
         mm/heap.c mm/memory_object.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
         fs/record_lock.c fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c \
