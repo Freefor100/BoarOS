@@ -48,13 +48,12 @@ static int check_nonpi_raw_exit(void)
         int result=robust_raw_exit_case(mode,0);if(result)return 10*mode+result;
     }
     if(robust_raw_exit_case(ROBUST_COW,0) || robust_raw_exit_case(ROBUST_BAD_OFFSET,0))return 80;
-    int woken=0;
-    if(robust_raw_exit_case(ROBUST_PENDING_UNLOCK_WAKE,&woken) || woken!=1)return 81;
+    if(robust_raw_exit_case(ROBUST_PENDING_UNLOCK_WAKE,0))return 81;
     for(int tries=0;tries<20;tries++) {
-        if(robust_raw_exit_case(ROBUST_WAIT_OWNER,&woken))return 82;
-        if(woken==1)return 0;
+        int observed=-1;
+        if(robust_raw_exit_case(ROBUST_WAIT_OWNER,&observed) || observed<0)return 82;
     }
-    return 83;
+    return 0;
 }
 #ifndef LA_PTHREAD_ENTRY
 #define LA_PTHREAD_ENTRY main

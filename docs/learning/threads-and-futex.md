@@ -40,6 +40,8 @@ robust-list 的注册只保存用户地址，不能视作链内容可信或永�
 
 musl 1.2.5 的普通 `pthread_exit` 自己遍历 robust mutex 并处理 owner 死亡，detached 线程还会在释放用户栈前注销链头；仅让 libc-test 的 `pthread_robust_detach` 通过不能证明内核清理。真实 U-mode 测试另用原始 `SYS_exit` 绕开 libc 退出清理，检验 owner-died、pending、唤醒、坏链、PI 标记和 fork COW。跨 MM 共享匿名 futex 的 key 已接入普通 WAIT/WAKE/REQUEUE；共享文件与 SysV 复用同一键解析；PI 协议仍未实现。
 
+raw exit 与 `FUTEX_WAIT` 竞争时，退出先写入 `OWNER_DIED` 可使等待合法返回 `EAGAIN`；用户测试逐次检查返回值、最终字和线程退出，不要求若干次竞跑中至少出现一次睡眠。真正已阻塞后的 owner-death 与 pending-unlock 唤醒由 `tests/host/file_io_concurrency.c` 在生产 wait 提交计数增加后触发真实 robust cleanup，检查唤醒结果及 wait、key、pin 归还，不用延时猜测登记完成。
+
 pthread 成功创建并不证明线程组完整：还应检查 join/TLS、竞争等待、超时和取消，以及组长先退、非组长 exec、阻塞成员终止和最终资源回收。模块验证负责 key 匹配和状态边界，真实 libc 消费者负责组合 ABI；两者不是互相替代关系。
 
 退出路径也属于唤醒链路。`clear_child_tid` 已把 joiner 放入 ready，并不保证它马上
