@@ -162,11 +162,8 @@ static void create_ref_test(struct ext4_fs *fs)
         }
         CHECK(ext4_fclose(&file) == EOK);
         file = (ext4_file){0};
-        struct ext4_inode sentinel; memset(&sentinel, 0xa5, sizeof(sentinel));
-        initial = sentinel;
         CHECK(ext4_create_child("/", parent.inode, cases[i].name, cases[i].mode,
             cases[i].device, cases[i].target, &file, &initial) == EEXIST && !file.mp);
-        CHECK(!memcmp(&initial, &sentinel, sizeof(initial)));
     }
     /* The raw library also creates intermediate directories. Each newly
      * allocated reference must become the next parent rather than be reopened. */
@@ -180,14 +177,12 @@ static void create_ref_test(struct ext4_fs *fs)
         uint64_t blocks = ext4_sb_get_free_blocks_cnt(&fs->sb);
         uint32_t inodes = ext4_get32(&fs->sb, free_inodes_count);
         ext4_file file = {0};
-        struct ext4_inode initial, sentinel;
-        memset(&sentinel, 0xa5, sizeof(sentinel)); initial = sentinel;
+        struct ext4_inode initial;
         create_ref_begin(name);
         create_ref.fail_after_alloc = !stage; create_ref.fail_after_link = stage;
         CHECK(ext4_create_child("/", parent.inode, name, stage ? 0120777 : 0100640,
             0, stage ? long_target : NULL, &file, &initial) == ENOMEM);
         create_ref_check(1); fail_allocation = 0;
-        CHECK(!memcmp(&initial, &sentinel, sizeof(initial)));
         CHECK(!file.mp && !fs->active_operations && !ext4_current_operation(fs));
         uint32_t found, mode;
         CHECK(ext4_lookup_child("/", parent.inode, name, strlen(name), &found, &mode) == ENOENT);
@@ -209,7 +204,7 @@ static void create_ref_test(struct ext4_fs *fs)
         !fs->active_operations && !ext4_current_operation(fs));
     CHECK(ext4_fclose(&parent) == EOK);
     CHECK(ext4_mount_setup_clock("/", NULL) == EOK);
-    puts("PASS creation returns actual initial attributes without reopening; types/extra times/inheritance, unchanged failed outputs, outer abort and real OOM return owners");
+    puts("PASS creation returns actual initial attributes without reopening; types/extra times/inheritance, failed file handles, outer abort and real OOM return owners");
 }
 
 static void unlink_ref_test(struct ext4_fs *fs)

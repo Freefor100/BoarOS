@@ -831,9 +831,10 @@ int ext4_dir_open_file(ext4_file *file, const char *path);
 int ext4_chrdev_open_file(ext4_file *file, const char *path);
 int ext4_fopen_inode(ext4_file *file, const char *mount_point,
                      uint32_t inode_number);
-/* Optional initial attributes come from the created inode before its reference
- * is released. They are not a disk/checksum image. Outputs are published only
- * on success and remain provisional until an outer transaction accepts them. */
+/* The file output is published only on success. Optional initial attributes
+ * are caller scratch filled before releasing the new inode reference, not a
+ * disk/checksum image. Discard them on failure; a successful result remains
+ * provisional until an outer transaction accepts it. */
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
     struct ext4_inode *initial);
