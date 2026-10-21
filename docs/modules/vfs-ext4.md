@@ -242,7 +242,7 @@ lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入�
 
 内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
 
-事务接口 `ext4_transaction_begin/end/abort` 按实际任务的 `kernel_io_context` 查找当前文件系统的操作上下文。同任务、同挂载的嵌套修改共用这份上下文，前台任务及后台 worker 各自持有操作；挂载维护活动操作数。前台 file/path 引用覆盖事务控制分配至接纳或撤销，挂载管理排空这些使用者后停止日志。上下文在 journal transaction 中提供存储，无 journal 时由最外层操作单独持有。内部 `serial_writer` 查询核对实际 backend 写 guard、当前 owner 和串行锁 writer；不根据 CPU 数推断资格。持有该 writer 时，已有 LBA 索引记录在准备至接纳期间不能被其他消费者退休，私有操作借用这份记录，不另分配候选；缺少记录或没有实际 writer 时仍提前保留候选。私有修改持有自己的 after 镜像，原值默认借用第一份已接纳 payload。只有后来初始化的记录需要不同原值，才为原值准备独立镜像。superblock 的计数和 orphan 变化在接纳时按具体字段合并，其他同块字节仍检查版本冲突。两份借用覆盖修改、回滚及并发发布；转义日志前缀另持自己的存储，日志编码借用它，不改写稳定 payload。
+事务接口 `ext4_transaction_begin/end/abort` 按实际任务的 `kernel_io_context` 查找当前文件系统的操作上下文。同任务、同挂载的嵌套修改共用这份上下文，前台任务及后台 worker 各自持有操作；挂载维护活动操作数。前台 file/path 引用覆盖事务控制分配至接纳或撤销，挂载管理排空这些使用者后停止日志。上下文在 journal transaction 中提供存储，无 journal 时由最外层操作单独持有。内部 `serial_writer` 查询核对实际 backend 写 guard、当前 owner 和串行锁 writer；不根据 CPU 数推断资格。私有写访问在挂载状态保护内借用已有 LBA 索引记录，借用覆盖准备至接纳或撤销。checkpoint 可以先退休原事务；尚有私有借用的空记录保留在索引中，接纳时先关联新事务，最后借用归还且已无 dirty/checkpoint 使用者时才释放。仅缺少 LBA 记录时预留未发布候选。索引身份和稳定 payload 分别借用；空记录不表示有旧元数据需要撤销或 flush。私有修改持有自己的 after 镜像，原值默认借用第一份已接纳 payload。只有后来初始化的记录需要不同原值，才为原值准备独立镜像。superblock 的计数和 orphan 变化在接纳时按具体字段合并，其他同块字节仍检查版本冲突。两份借用覆盖修改、回滚及并发发布；转义日志前缀另持自己的存储，日志编码借用它，不改写稳定 payload。
 
 同一操作重复访问已有私有记录时，直接从该记录持有的 home buffer 和 after 版本取得输出引用，省去全局缓存重找及公共版本到私有版本的转换。一次缓存保护同时取得输出引用和需要的较新已接纳快照；版本仍等于原 baseline 时复用原有引用。已修改范围保留私有内容，干净范围按该快照刷新；普通、noread 和批量访问共用此路径。
 

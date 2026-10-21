@@ -182,8 +182,12 @@ int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_
             assert(ext4_fs_serial_writer(trans->operation.fs) && !record->reserved_rec);
             serial_borrowed++;
         } else {
-            assert(!ext4_fs_serial_writer(trans->operation.fs) && record->reserved_rec);
-            serial_reserved++;
+            assert(!ext4_fs_serial_writer(trans->operation.fs));
+            if (record->reserved_rec) serial_reserved++;
+            else {
+                assert(record->block_rec && record->block_rec->private_refs);
+                serial_borrowed++;
+            }
         }
     }
     return result;
@@ -228,7 +232,7 @@ static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int ser
     struct ext4_timestamp times[3]={{11223+serial,1},{44556,2},{77889,3}};
     assert(!ext4_file_set_times(&file,7,times));
     serial_reservation_watch=0;
-    assert(serial?serial_borrowed:serial_reserved);
+    assert(serial?serial_borrowed:serial_borrowed+serial_reserved);
     if(serial) {
         assert(serial_log_saved);
         assert(!__atomic_load_n(&serial_commit_done,__ATOMIC_ACQUIRE));
@@ -240,5 +244,5 @@ static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int ser
     if(!serial)assert(!ext4_fremove(path) && !ext4_journal_group_drain(adapter->mount_point));
     puts(serial?
         "PASS actual serial writer borrows indexed LBA record; missing records retain candidates, queued real commit cannot freeze until writer release":
-        "PASS parallel operation retains its own LBA candidate without serial writer qualification; baseline stays referenced and private replacement remains owned");
+        "PASS parallel operation owns an absent-LBA candidate or indexed-record borrow; baseline and private replacement remain owned without a serial writer");
 }

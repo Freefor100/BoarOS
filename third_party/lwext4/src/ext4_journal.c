@@ -1935,7 +1935,7 @@ static void
 jbd_trans_change_ownership(struct jbd_block_rec *block_rec,
 			   struct jbd_trans *new_trans)
 {
-	LIST_REMOVE(block_rec, tbrec_node);
+	if (block_rec->trans) LIST_REMOVE(block_rec, tbrec_node);
 	if (new_trans) {
 		/* Now this block record belongs to this transaction. */
 		LIST_INSERT_HEAD(&new_trans->tbrec_list, block_rec, tbrec_node);
@@ -2017,6 +2017,39 @@ jbd_trans_finish_callback(struct jbd_journal *journal,
 	}
 }
 
+/* Private preparations retain only the index identity, not the retired
+ * transaction or its payload. Their last release can retire an empty entry. */
+static void jbd_retire_block_rec(struct jbd_journal *journal,
+    struct jbd_block_rec *record)
+{
+    if (record->trans || record->private_refs) return;
+    if (record->checkpoint || !TAILQ_EMPTY(&record->dirty_buf_queue)) __builtin_trap();
+    RB_REMOVE(jbd_block, &journal->block_rec_root, record);
+    jbd_free(record);
+}
+
+static struct jbd_block_rec *jbd_borrow_block_rec(struct jbd_journal *journal,
+    ext4_fsblk_t lba)
+{
+    JBD_STATE_SCOPE(journal);
+    struct jbd_block_rec *record = jbd_trans_block_rec_lookup(journal, lba);
+    if (record) {
+        if (record->private_refs == UINT32_MAX) __builtin_trap();
+        record->private_refs++;
+    }
+    return record;
+}
+
+static void jbd_put_private_record(struct jbd_journal *journal,
+    struct jbd_block_rec *record)
+{
+    if (!record) return;
+    JBD_STATE_SCOPE(journal);
+    if (!record->private_refs) __builtin_trap();
+    record->private_refs--;
+    jbd_retire_block_rec(journal, record);
+}
+
 static inline void
 jbd_trans_remove_block_rec(struct jbd_journal *journal,
 			   struct jbd_block_rec *block_rec,
@@ -2026,10 +2059,8 @@ jbd_trans_remove_block_rec(struct jbd_journal *journal,
 	 * give up.*/
 	if (block_rec->trans == trans) {
 		LIST_REMOVE(block_rec, tbrec_node);
-		RB_REMOVE(jbd_block,
-				&journal->block_rec_root,
-				block_rec);
-		jbd_free(block_rec);
+		block_rec->trans = NULL;
+		jbd_retire_block_rec(journal, block_rec);
 	}
 }
 
@@ -2180,8 +2211,8 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
         {
             JBD_STATE_SCOPE(journal);
             struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, lba);
-            prior_metadata = rec != NULL;
-            if (rec) r = rec->trans == trans ? EINVAL : jbd_trans_revoke_block(trans, lba);
+            prior_metadata = rec && rec->trans;
+            if (prior_metadata) r = rec->trans == trans ? EINVAL : jbd_trans_revoke_block(trans, lba);
         }
         if (!r && prior_metadata) r = ext4_block_flush_lba(bdev, lba);
 		if (r) { jbd_free(data); return r; }
@@ -2488,15 +2519,16 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     jb = jbd_alloc(journal, sizeof(*jb) +
         2 * jbd_range_map_words(journal) * sizeof(*jb->dirty_ranges));
     if (!jb) return ENOMEM;
-    /* A real mount writer prevents checkpoint retirement through acceptance.
-     * An indexed record then remains borrowed; other owners reserve a private
-     * candidate because the old checkpoint may retire during preparation. */
-    bool reserve_rec = !ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs) ||
-        !jbd_trans_block_rec_lookup(journal, block->lb_id);
+    /* Checkpoint may retire its last accepted transaction while this access
+     * prepares. Hold the actual index record through acceptance or discard;
+     * an unindexed candidate is needed only for an absent LBA. */
+    jb->block_rec = jbd_borrow_block_rec(journal, block->lb_id);
+    bool reserve_rec = !jb->block_rec;
     if (reserve_rec) jb->reserved_rec = jbd_alloc(journal, sizeof(*jb->reserved_rec));
     jb->after = journal->grouped ? jbd_version(journal, block->buf) : jbd_image_alloc(journal);
     if ((reserve_rec && !jb->reserved_rec) || !jb->after) {
         if (jb->after) { if (journal->grouped) jbd_unpin_version(journal, block->buf); jbd_image_free(jb->after); }
+        jbd_put_private_record(journal, jb->block_rec);
         jbd_free(jb->reserved_rec); jbd_free(jb);
         return ENOMEM;
     }
@@ -2593,6 +2625,7 @@ static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
         } else { jbd_free(jb->escaped_prefix); jb->escaped_prefix = NULL; }
         jbd_image_free(jb->before); jb->before = NULL;
         struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, jb->block.lb_id);
+        if (jb->block_rec && jb->block_rec != rec) __builtin_trap();
         if (rec) { jbd_free(jb->reserved_rec); jbd_trans_change_ownership(rec, trans); }
         else {
             rec = jb->reserved_rec;
@@ -2602,6 +2635,9 @@ static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
             LIST_INSERT_HEAD(&trans->tbrec_list, rec, tbrec_node);
             if (RB_INSERT(jbd_block, &journal->block_rec_root, rec)) __builtin_trap();
         }
+        /* The accepted transaction now owns the entry before its preparer
+         * drops the borrow; no index gap or replacement allocation is needed. */
+        jbd_put_private_record(journal, jb->block_rec);
         jb->reserved_rec = NULL;
         jb->block_rec = rec;
         TAILQ_INSERT_TAIL(&rec->dirty_buf_queue, jb, dirty_buf_node);
@@ -2676,7 +2712,7 @@ int jbd_trans_try_revoke_block(struct jbd_trans *trans,
 	struct jbd_block_rec *block_rec =
 		jbd_trans_block_rec_lookup(journal, lba);
 
-	if (block_rec) {
+	if (block_rec && block_rec->trans) {
 		if (block_rec->trans == trans) {
 			struct jbd_buf *jbd_buf =
 				TAILQ_LAST(&block_rec->dirty_buf_queue,
@@ -2716,6 +2752,7 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
             ext4_block_set(fs->bdev, &jbd_buf->block);
             jbd_image_free(jbd_buf->after); jbd_image_free(jbd_buf->before);
             jbd_free(jbd_buf->escaped_prefix);
+            jbd_put_private_record(journal, jbd_buf->block_rec);
             jbd_free(jbd_buf->reserved_rec); jbd_free(jbd_buf);
             continue;
         }
@@ -2840,6 +2877,7 @@ static void jbd_trans_prune(struct jbd_journal *journal, struct jbd_trans *trans
             ext4_block_set(fs->bdev, &jbd_buf->block);
             jbd_image_free(jbd_buf->after); jbd_image_free(jbd_buf->before);
             jbd_free(jbd_buf->escaped_prefix);
+            jbd_put_private_record(journal, jbd_buf->block_rec);
             jbd_free(jbd_buf->reserved_rec); jbd_free(jbd_buf);
             continue;
         }

@@ -21,6 +21,9 @@ for block in 1024 4096; do
     truncate -s 32M "$work/group-base.img"
     mkfs.ext4 -q -F -b "$block" "$work/group-base.img"
     debugfs -w -R "write $work/data /probe" "$work/group-base.img" >/dev/null 2>&1
+    cp "$work/group-base.img" "$work/record-borrow.img"
+    timeout 30 "$work/probe" "$work/record-borrow.img" record-borrow
+    e2fsck -fn "$work/record-borrow.img" >/dev/null
     cp "$work/group-base.img" "$work/publication-owners.img"
     timeout 30 "$work/probe" "$work/publication-owners.img" publication-owners
     e2fsck -fn "$work/publication-owners.img" >/dev/null

@@ -192,6 +192,98 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
 }
 #endif
 
+#ifdef TEST_JBD_CREDIT_PARALLEL
+static void private_record_borrow(struct ext4_blockdev *dev,
+    struct jbd_journal *journal, ext4_fsblk_t home)
+{
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    dev->fs->jbd_journal = journal;
+    jbd_memory_set_cache_disabled(journal, true);
+    for (unsigned scenario = 0; scenario < 5; scenario++) {
+        encoding_accept(dev, journal, home, 0, 'A');
+        struct jbd_block_rec *record = TAILQ_FIRST(&journal->running->buf_queue)->block_rec;
+        struct jbd_trans *operation;
+        struct ext4_block client;
+        CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
+        CHECK(ext4_block_get(dev, &client, home) == EOK && client.buf->journal_pending);
+        size_t used = jbd_memory_used(journal), limit = jbd_memory_limit(journal);
+        size_t words = (journal->block_size + 2047U) / 2048U;
+        size_t access = jbd_allocation_charge(sizeof(struct jbd_buf) + 2 * words * sizeof(uint64_t));
+        /* The existing accepted home already pays its pin. First fail the
+         * replacement image, then allow exactly the access plus that image. */
+        jbd_memory_set_limit(journal, used + access);
+        CHECK(jbd_trans_get_write_access_range(operation, &client, 32, 32) == ENOMEM);
+        CHECK(jbd_memory_used(journal) == used && TAILQ_EMPTY(&operation->buf_queue));
+        operation->operation.memory_reservation_failed = false;
+        jbd_memory_set_limit(journal, used + access + jbd_image_charge(journal));
+        int result = jbd_trans_get_write_access_range(operation, &client, 32, 32);
+        printf("record borrow budget block=%u scenario=%u result=%d expected=0\n",
+            dev->lg_bsize, scenario, result);
+        CHECK(result == EOK);
+        jbd_memory_set_limit(journal, limit);
+        uint8_t previous = client.data[32];
+        if (scenario != 2) {
+            client.data[32] = 'B';
+            CHECK(jbd_trans_set_block_dirty_range(operation, &client, 32, 32) == EOK);
+        }
+        struct jbd_trans *other = NULL;
+        struct ext4_block second = EXT4_BLOCK_ZERO();
+        if (scenario == 4) {
+            CHECK(jbd_journal_new_trans(journal, &other) == EOK);
+            CHECK(ext4_block_get(dev, &second, home) == EOK);
+            CHECK(jbd_trans_get_write_access_range(other, &second, 64, 32) == EOK);
+            second.data[64] = 'C';
+            CHECK(jbd_trans_set_block_dirty_range(other, &second, 64, 32) == EOK);
+        }
+        /* The private access is the explicit owner while the entire accepted
+         * group seals, reaches disk and retires. No sleep races are involved. */
+        CHECK(jbd_journal_freeze(journal) == EOK);
+        credit_drain(journal);
+        CHECK(RB_ROOT(&journal->block_rec_root) == record && !record->trans &&
+            !record->checkpoint && TAILQ_EMPTY(&record->dirty_buf_queue));
+        struct jbd_trans *data;
+        CHECK(jbd_journal_new_trans(journal, &data) == EOK);
+        CHECK(jbd_trans_try_revoke_block(data, home) == EOK && !data->revoke_count);
+        uint64_t writes = disk.writes, flushes = disk.flushes;
+        char byte = 'D';
+        CHECK(jbd_trans_write_data(data, home, 96, &byte, 1, false, NULL) == EOK);
+        CHECK(!data->revoke_count && disk.writes == writes && disk.flushes == flushes);
+        jbd_journal_free_trans(journal, data, true);
+        if (scenario == 0) {
+            CHECK(jbd_trans_prepare_operation(operation) == EOK);
+            CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
+            CHECK(RB_ROOT(&journal->block_rec_root) == record && record->trans == journal->running);
+        } else if (scenario == 2) {
+            CHECK(jbd_trans_prepare_operation(operation) == EOK);
+            CHECK(RB_EMPTY(&journal->block_rec_root));
+            CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
+        } else {
+            if (scenario == 3) {
+                jbd_memory_set_limit(journal, jbd_memory_used(journal));
+                CHECK(jbd_trans_prepare_operation(operation) == ENOMEM);
+                jbd_memory_set_limit(journal, limit);
+            }
+            jbd_journal_free_trans(journal, operation, true);
+            CHECK(client.data[32] == previous);
+            if (other) {
+                CHECK(RB_ROOT(&journal->block_rec_root) == record && !record->trans);
+                CHECK(jbd_trans_prepare_operation(other) == EOK);
+                CHECK(jbd_journal_accept(journal, other, 0) == EOK);
+                CHECK(RB_ROOT(&journal->block_rec_root) == record && record->trans == journal->running);
+            } else CHECK(RB_EMPTY(&journal->block_rec_root));
+        }
+        CHECK(ext4_block_set(dev, &client) == EOK);
+        if (second.lb_id) CHECK(ext4_block_set(dev, &second) == EOK);
+        if (journal->running) CHECK(jbd_journal_freeze(journal) == EOK);
+        credit_drain(journal);
+        CHECK(RB_EMPTY(&journal->block_rec_root) && !journal->log_reserved);
+    }
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS existing journal record borrows: exact budget, checkpoint retirement, accept/abort/prune/OOM, two owners and no empty-record revoke/flush");
+}
+#endif
+
 static void private_access_oom(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
 {
@@ -1015,6 +1107,10 @@ int main(int argc, char **argv)
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
 #ifdef TEST_JBD_CREDIT_PARALLEL
+    if (!strcmp(argv[2], "record-borrow")) {
+        private_record_borrow(&dev, &journal, home);
+        return 0;
+    }
     if (!strcmp(argv[2], "publication-owners")) {
         publication_owners(&dev, &journal, home);
         return 0;

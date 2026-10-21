@@ -82,6 +82,7 @@ struct jbd_buf {
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
+	/* Private access borrows the indexed record; accepted access is queued in it. */
 	struct jbd_block_rec *block_rec;
 	TAILQ_ENTRY(jbd_buf) buf_node;
 	TAILQ_ENTRY(jbd_buf) dirty_buf_node;
@@ -110,6 +111,7 @@ struct jbd_revoke_rec {
 struct jbd_block_rec {
 	ext4_fsblk_t lba;
 	struct jbd_trans *trans;
+	uint32_t private_refs;
 	struct jbd_buf *checkpoint;
 	RB_ENTRY(jbd_block_rec) block_rec_node;
 	LIST_ENTRY(jbd_block_rec) tbrec_node;
