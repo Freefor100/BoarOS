@@ -192,7 +192,8 @@ void riscv_smp_secondary_high(void)
 void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
                      uint64_t final, uint32_t frequency)
 {
-    if (!info || !info->count || info->count > BOAROS_MAX_CPUS || cpu_count ||
+    if (!info || !info->count || info->count > BOAROS_MAX_CPUS ||
+        info->count != kernel_cpu_get_boot_count() || cpu_count ||
         !frequency || info->hart_ids[0] != kernel_cpu_current()->hardware_id)
         riscv_smp_fail("CPU-input", -1);
     cpus[0] = kernel_cpu_current();

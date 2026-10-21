@@ -453,6 +453,9 @@ static void state_rejected_case(struct kernel_heap *heap,unsigned failure)
         struct boaros_lwext4_domain domain={0},other={0};
         boaros_lwext4_lock_init(&callbacks,&domain,heap);
         boaros_lwext4_lock_init(&other_callbacks,&other,heap);
+        struct jbd_journal journal={.grouped=true};struct ext4_fs fs={.jbd_journal=&journal};
+        fs.orphan_index=(struct ext4_orphan_index *)&fs;
+        boaros_lwext4_enable_parallel(&domain,&fs);
         callbacks.lock(&domain);callbacks.state_read_lock(&domain);
         switch(failure) {
         case 0: callbacks.state_lock(&domain);break;
@@ -482,15 +485,15 @@ int main(void)
     assert(callbacks.serial_writer && callbacks.serial_writer(callbacks.context));
     callbacks.state_lock(callbacks.context);
     callbacks.state_lock(callbacks.context);
-    assert(kernel_lock_held(&domain.serial,1) && kernel_lock_held(&domain.state.lock,1));
+    assert(kernel_lock_held(&domain.serial,1) && !kernel_io_context_current()->backend_state_guard.lock);
     callbacks.state_unlock(callbacks.context);
-    assert(kernel_lock_held(&domain.state.lock,1));
+    assert(kernel_lock_held(&domain.serial,1) && !kernel_io_context_current()->backend_state_guard.lock);
     callbacks.state_unlock(callbacks.context);
     callbacks.unlock(callbacks.context);
     boaros_lwext4_lock_fini(&domain);
     assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->backend_depth &&
            !kernel_io_context_current()->backend_domain && !kernel_io_context_current()->backend_state_depth);
-    puts("PASS legacy call qualification and nested publication use separate ranks and return all guards");
+    puts("PASS pre-publication state borrows the actual serial writer and returns all guards");
     struct physical_page_allocator pages={0};struct kernel_heap heap={0};
     struct boot_memory_layout layout={.usable_count=1,.usable={{(uintptr_t)arena,sizeof(arena)}}};
     assert(!physical_page_allocator_init(&pages,&layout) &&

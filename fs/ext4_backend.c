@@ -1374,7 +1374,7 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
         return status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 #if BOAROS_MAX_CPUS > 1
-    if(adapter->device.fs->jbd_journal) {
+    if(adapter->device.fs->jbd_journal && adapter->locks.resource_acquire) {
         boaros_lwext4_enable_parallel(&adapter->backend_lock,adapter->device.fs);
         __atomic_store_n(&adapter->instance.namespace_parallel,1,__ATOMIC_RELEASE);
     }

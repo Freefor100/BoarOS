@@ -62,6 +62,9 @@ COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务
 
 `dtb_read_cpu_info()`验证固定容量的CPU快照，保留真实hart ID，忽略disabled CPU和cpu-map拓扑节点；
 boot hart固定在逻辑0，其余按ID排序。重复、损坏、缺boot hart或超容量失败时不改输出。
+高地址入口在首次挂载前一次性发布已验证的启动 CPU 数，后续 HSM 启动核对同一快照。
+文件系统据此选择单执行者或并行策略；根挂载启动 worker 时，secondary 尚未 ONLINE，
+因此在线计数不用于这项选择。
 `secondary.S`使用独立16KiB静态栈与镜像mailbox，不清BSS；过渡映射后的高地址入口重绑gp/tp、
 stvec/sscratch及最终satp。内核仍通过`tp→任务→CPU`定位，用户TLS契约保持。
 

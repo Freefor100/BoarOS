@@ -392,8 +392,9 @@ int main(int argc,char **argv)
                !adapter->backend_lock.parallel && !adapter->instance.namespace_parallel &&
                !fs->jbd_journal->grouped && !fs->active_operations);
         parallel_worker_startup(adapter,0);
+        unsigned parallel=kernel_cpu_get_boot_count()>1;
         assert(adapter->journal_started && adapter->checkpoint_started &&
-               adapter->backend_lock.parallel && adapter->instance.namespace_parallel);
+               !!adapter->backend_lock.parallel==parallel && !!adapter->instance.namespace_parallel==parallel);
     } else {
         const struct ext4_journal_runtime runtime={.now_ns=parallel_now};
         assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,8*1024*1024));

@@ -12,6 +12,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 void mm_test_attach(unsigned);
 void kernel_console_putc(char byte) { fputc(byte,stderr); }
@@ -64,7 +65,7 @@ static void resource_callbacks_absent(struct kernel_heap *heap)
                !kernel_io_context_current()->backend_resources.request_count);
     }
     callbacks.unlock(&domain);boaros_lwext4_lock_fini(&domain);returned();
-    puts("PASS actual UP installs no resource callbacks; journal/nonjournal resource helpers retain the serial qualification and create no resource owners");
+    puts("PASS actual one-CPU mode installs no resource callbacks; journal/nonjournal resource helpers retain the serial qualification and create no resource owners");
 }
 static void queued(struct kernel_rwlock *lock,unsigned count)
 {
@@ -132,7 +133,7 @@ static void borrowed_writer(struct kernel_heap *heap)
     callbacks.unlock(&domain);
     wait_entered(&actor);leave_actor(&actor,thread);
     boaros_lwext4_lock_fini(&domain);returned();
-    puts("PASS UP state borrows the actual backend writer, permits allocation, and excludes external inode-IO state callers");
+    puts("PASS serial-qualified state borrows the actual backend writer, permits allocation, and excludes external inode-IO state callers");
 }
 static void readers_and_external(struct kernel_heap *heap)
 {
@@ -154,7 +155,7 @@ static void readers_and_external(struct kernel_heap *heap)
            kernel_io_context_current()->backend_state_guard.lock==&domain.serial);
     callbacks.state_unlock(&domain);callbacks.state_unlock(&domain);
     boaros_lwext4_lock_fini(&domain);returned();
-    puts("PASS UP backend readers retain state mutex exclusion; external nested state uses the serial writer");
+    puts("PASS serial-qualified backend readers retain state mutex exclusion; external nested state uses the serial writer");
 }
 static void shared_state_readers(struct kernel_heap *heap)
 {
@@ -177,7 +178,7 @@ static void shared_state_readers(struct kernel_heap *heap)
            kernel_io_context_current()->backend_state_guard.write);
     callbacks.state_unlock(&domain);callbacks.state_unlock(&domain);
     boaros_lwext4_lock_fini(&domain);returned();
-    puts("PASS UP backend state readers coexist; read queries borrow the actual serial writer and external nested state retains its exclusion");
+    puts("PASS serial-qualified backend state readers coexist; read queries borrow the actual serial writer and external nested state retains its exclusion");
 }
 struct transition_actor { struct boaros_lwext4_domain *domain;struct ext4_fs *fs; };
 static void *transition_actor(void *argument)
@@ -199,7 +200,7 @@ static void transition_recheck(struct kernel_heap *heap)
     callbacks.unlock(&domain);assert(!pthread_join(publisher,NULL));
     wait_entered(&external);leave_actor(&external,waiter);
     boaros_lwext4_lock_fini(&domain);returned();
-    puts("PASS UP external state queued before parallel publication rechecks mode and acquires the real state mutex");
+    puts("PASS serial-qualified external state queued before parallel publication rechecks mode and acquires the real state mutex");
 }
 static void rejected_ownership(struct kernel_heap *heap,unsigned failure)
 {
@@ -244,20 +245,47 @@ static void rejected_ownership(struct kernel_heap *heap,unsigned failure)
     int status;assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) &&
                      (WTERMSIG(status)==SIGILL || WTERMSIG(status)==SIGTRAP));
 }
-int main(void)
+extern unsigned mm_test_boot_cpus;
+static void rejected_boot_configuration(unsigned failure)
 {
+    pid_t child=fork();assert(child>=0);
+    if(!child) {
+        struct rlimit limit={0};assert(!setrlimit(RLIMIT_CORE,&limit));
+        if(!failure)(void)kernel_cpu_get_boot_count();
+        else kernel_cpu_set_boot_count(failure==1?0:failure==2?3:mm_test_boot_cpus);
+        _exit(0);
+    }
+    int status;assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) &&
+                     (WTERMSIG(status)==SIGILL || WTERMSIG(status)==SIGTRAP));
+}
+int main(int argc,char **argv)
+{
+    if(argc==2)mm_test_boot_cpus=strtoul(argv[1],NULL,10);
+#if BOAROS_MAX_CPUS > 1
+    rejected_boot_configuration(0);
+#endif
+    rejected_boot_configuration(1);rejected_boot_configuration(2);
     mm_test_attach(0);
+    assert(kernel_cpu_get_boot_count()==mm_test_boot_cpus);
+#if BOAROS_MAX_CPUS > 1
+    rejected_boot_configuration(3);
+#endif
     struct physical_page_allocator pages={0};struct kernel_heap heap={0};
     struct boot_memory_layout layout={.usable_count=1,.usable={{(uintptr_t)arena,sizeof(arena)}}};
     assert(!physical_page_allocator_init(&pages,&layout) &&
            !physical_page_allocator_bind_access(&pages,page_access) &&
            !physical_page_allocator_finalize(&pages) && !kernel_heap_init(&heap,&pages,page_address));
     struct kernel_heap_statistics before,after;kernel_heap_get_statistics(&heap,&before);
-    resource_callbacks_absent(&heap);
-    borrowed_writer(&heap);readers_and_external(&heap);shared_state_readers(&heap);transition_recheck(&heap);
+    if(mm_test_boot_cpus==1)resource_callbacks_absent(&heap);
+    borrowed_writer(&heap);readers_and_external(&heap);shared_state_readers(&heap);
+    if(mm_test_boot_cpus>1)transition_recheck(&heap);
     for(unsigned failure=0;failure<9;failure++)rejected_ownership(&heap,failure);
     kernel_heap_get_statistics(&heap,&after);
     assert(before.live_allocations==after.live_allocations && before.current_pages==after.current_pages);
-    puts("PASS UP state rejects cross-domain nesting/unlock, premature backend release/pause/destruction and wrong final guard owner/LIFO; all allocations return");
+    puts("PASS serial-qualified state rejects cross-domain nesting/unlock, premature backend release/pause/destruction and wrong final guard owner/LIFO; all allocations return");
+#if BOAROS_MAX_CPUS > 1
+    puts("PASS unpublished topology and boot-count republication rejected");
+#endif
+    printf("PASS boot topology MAX=%u actual=%u; invalid counts rejected\n",BOAROS_MAX_CPUS,mm_test_boot_cpus);
     return 0;
 }

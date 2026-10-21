@@ -845,6 +845,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 static void kernel_main_high(void)
 {
     kernel_cpu_boot_rebind();
+#if BOAROS_MAX_CPUS > 1
+    kernel_cpu_set_boot_count(boot_cpus.count);
+#endif
     enum riscv_sv39_status sv39_status;
     enum physical_page_status page_status;
     enum kernel_scheduler_status scheduler_status;

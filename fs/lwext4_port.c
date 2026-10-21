@@ -241,15 +241,17 @@ static inline __attribute__((always_inline)) void state_check_owner(struct boaro
     struct kernel_io_context *context)
 {
     struct kernel_lock_guard *guard=&context->backend_state_guard;
-#if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
-    /* 首层已验证真实 writer；backend 释放/暂停拒绝未结束的 state。
-     * 递归只核对 domain，独立 guard 的最终释放仍检查 owner 和 LIFO。 */
-    if(!guard->lock) {
-        if(context->backend_domain==domain && context->backend_depth) return;
-    } else if(guard->lock==&domain->serial || guard->lock==&domain->state.lock) return;
+    if (!guard->lock) {
+#if BOAROS_LOCK_DEBUG || BOAROS_COST_DIAGNOSTICS
+        if (state_backend_writer(domain,context)) return;
 #else
-    if(guard->lock==&domain->state.lock && guard->owner==context) return;
+        /* The first state scope verified this serial writer. Backend release
+         * and pause reject live state scopes; the final guard return checks owner. */
+        if (context->backend_domain==domain && context->backend_depth) return;
 #endif
+    } else if (guard->owner==context &&
+        (guard->lock==&domain->state.lock ||
+         (guard->lock==&domain->serial && guard->write && domain->serial.writer==context))) return;
     __builtin_trap();
 }
 static inline __attribute__((always_inline)) void state_enter(void *opaque,int write)
@@ -264,7 +266,6 @@ static inline __attribute__((always_inline)) void state_enter(void *opaque,int w
             __builtin_trap();
     }
     else {
-#if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
         if(context->backend_state_guard.lock) __builtin_trap();
         if(!__atomic_load_n(&domain->parallel,__ATOMIC_ACQUIRE)) {
             /* State scopes may allocate or perform synchronous journal I/O.
@@ -279,13 +280,10 @@ static inline __attribute__((always_inline)) void state_enter(void *opaque,int w
                 kernel_lock_release(&context->backend_state_guard);
             }
         }
-#endif
         if(write)kernel_mutex_lock(&domain->state,&context->backend_state_guard);
         else kernel_rwlock_read(&domain->state.lock,&context->backend_state_guard);
     }
-#if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
 Acquired:
-#endif
     if (context->backend_state_depth==UINT32_MAX) __builtin_trap();
     context->backend_state_depth++;
 }
@@ -369,11 +367,13 @@ void boaros_lwext4_lock_init(struct ext4_lock *callbacks,
     callbacks->state_lock=boaros_lwext4_state_lock;
     callbacks->state_read_lock=boaros_lwext4_state_read_lock;
     callbacks->state_unlock=boaros_lwext4_state_unlock;
-    /* UP keeps the mount writer; no independent resource consumer exists. */
-    callbacks->resource_acquire=BOAROS_MAX_CPUS>1?resource_acquire:NULL;
-    callbacks->resource_claim_inode=BOAROS_MAX_CPUS>1?resource_claim_inode:NULL;
-    callbacks->resource_release=BOAROS_MAX_CPUS>1?resource_release:NULL;
-    callbacks->resource_retry=BOAROS_MAX_CPUS>1?resource_retry:NULL;
+    /* The boot topology is complete before the first mount, although its
+     * secondary may not be online yet. Hot mounts use the same immutable mode. */
+    unsigned parallel=kernel_cpu_get_boot_count()>1;
+    callbacks->resource_acquire=parallel?resource_acquire:NULL;
+    callbacks->resource_claim_inode=parallel?resource_claim_inode:NULL;
+    callbacks->resource_release=parallel?resource_release:NULL;
+    callbacks->resource_retry=parallel?resource_retry:NULL;
     *domain=(struct boaros_lwext4_domain){.heap=heap};
     kernel_rwlock_init(&domain->serial,31,(uintptr_t)domain);
     kernel_mutex_init(&domain->state,40,(uintptr_t)domain);
@@ -381,7 +381,8 @@ void boaros_lwext4_lock_init(struct ext4_lock *callbacks,
 }
 void boaros_lwext4_enable_parallel(struct boaros_lwext4_domain *domain,struct ext4_fs *fs)
 {
-    if (!domain || !fs || kernel_io_context_inline()->backend_depth) __builtin_trap();
+    if (!domain || !fs || kernel_cpu_get_boot_count()<2 ||
+        kernel_io_context_inline()->backend_depth) __builtin_trap();
     KERNEL_LOCK_SCOPE(serial);
     kernel_rwlock_write(&domain->serial,&serial);
     if (!domain || !fs || fs->read_only || fs->super_replay_required || !fs->orphan_index ||

@@ -45,7 +45,6 @@ int __wrap_jbd_trans_set_block_dirty_range(struct jbd_trans *trans,struct ext4_b
 }
 static unsigned allocations_for(uint32_t inode)
 { unsigned count=0;for(unsigned i=0;i<inode_allocation_count;i++)if(inode_allocations[i].inode==inode)count++;return count; }
-static uint64_t fixture_now(void *unused) { (void)unused;return kernel_time_monotonic_ns(); }
 static int fail_bind;
 static unsigned replay_create,replayed,binds;
 static struct boaros_lwext4_resource **last_bound_slot;
@@ -80,8 +79,10 @@ static ext4_file *close_fault;
 int __real_ext4_fclose(ext4_file *);
 int __wrap_ext4_fclose(ext4_file *file)
 { if(file==close_fault)return EIO;return __real_ext4_fclose(file); }
+extern unsigned mm_test_boot_cpus;
 int main(int argc,char **argv)
 {
+    if(getenv("NODE_BOOT_CPUS"))mm_test_boot_cpus=strtoul(getenv("NODE_BOOT_CPUS"),NULL,10);
     assert(argc==2);setvbuf(stdout,NULL,_IONBF,0);mm_test_attach(0);mm_test_activate_task();
     struct physical_page_allocator pages={0},backend_pages={0};struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena));initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
@@ -93,6 +94,8 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount mount={0};assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(106)) && !kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,read_only));
     struct lwext4_mount_adapter *adapter=mount.private_data;struct kernel_vfs_path *root=NULL;
     assert(!adapter->backend_lock.parallel);
+    printf("mount actual boot CPUs=%u resource callbacks=%u\n",mm_test_boot_cpus,adapter->locks.resource_acquire!=NULL);
+    assert((adapter->locks.resource_acquire!=NULL)==(mm_test_boot_cpus>1));
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     printf("root inode alive before parallel: shared resource retained=%u\n",adapter->backend_lock.resources.rbh_root!=NULL);
     if(read_only || !adapter->device.fs->jbd_journal) {
@@ -102,10 +105,19 @@ int main(int argc,char **argv)
         printf("PASS read-only/nojournal root and eight stats: inode resource allocations=%u\n",before);
         goto Cleanup;
     }
-    assert(((struct lwext4_node *)root->file.private_data)->inode_resource);
-    const struct ext4_journal_runtime runtime={.now_ns=fixture_now};
-    assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,8*1024*1024));
-    boaros_lwext4_enable_parallel(&adapter->backend_lock,adapter->device.fs);adapter->instance.namespace_parallel=1;
+    assert(!!((struct lwext4_node *)root->file.private_data)->inode_resource==(mm_test_boot_cpus>1));
+    assert(!kernel_vfs_start_journal_worker(&mount));
+    assert(!!adapter->backend_lock.parallel==(mm_test_boot_cpus>1) &&
+           !!adapter->instance.namespace_parallel==(mm_test_boot_cpus>1));
+    if(mm_test_boot_cpus==1) {
+        struct kernel_vfs_file serial={0};struct kernel_vfs_stat stat;
+        assert(!kernel_vfs_create_at(root,root,"serial-owner",0600,&serial));
+        for(unsigned i=0;i<8;i++)assert(!kernel_vfs_file_set_mode(&serial,0600|(i&1?040:020)) &&
+                                     !kernel_vfs_fstat(&serial,&stat));
+        assert(!kernel_vfs_close(&serial) && !inode_allocation_count && !qualified);
+        puts("PASS actual one-CPU journal workers retain serial namespace/backend with zero resource owners");
+        goto Cleanup;
+    }
     struct kernel_vfs_file file={0};assert(!kernel_vfs_create_at(root,root,"node-owner",0600,&file));
     checked_inode=kernel_vfs_file_inode(&file);unsigned before=allocations_for(checked_inode);
     for(unsigned i=0;i<inode_allocation_count;i++)if(inode_allocations[i].inode==checked_inode)watched_owner=inode_allocations[i].owner;
@@ -154,12 +166,25 @@ Cleanup:
     close_fault=lwext4_node_file(&mounted_root->node);
     assert(kernel_vfs_mount_prepare_detach(&mount,NULL)==-KERNEL_EIO &&
            !mounted_root->node.closed);
-    if(!read_only && adapter->device.fs->jbd_journal)assert(mounted_root->inode_resource);
+    if(!read_only && adapter->device.fs->jbd_journal && mm_test_boot_cpus>1)assert(mounted_root->inode_resource);
     close_fault=NULL;
     assert(!kernel_vfs_mount_prepare_detach(&mount,NULL));
     printf("prepared attached root: closed=%u resource retained=%u\n",
            mounted_root->node.closed,mounted_root->inode_resource!=NULL);
     assert(!kernel_vfs_mount_detach(&mount,NULL) && !kernel_vfs_unmount(&mount));
+    /* A later mount consumes the same published boot configuration. */
+    struct kernel_vfs_mount hot={0};struct kernel_vfs_path *hot_root=NULL;
+    assert(!kernel_vfs_mount_ext4(&hot,&disk,&backend_heap,&cache,read_only));
+    struct lwext4_mount_adapter *hot_adapter=hot.private_data;
+    assert((hot_adapter->locks.resource_acquire!=NULL)==(mm_test_boot_cpus>1));
+    assert(!kernel_vfs_path_root(&hot,&heap,&hot_root) && !kernel_vfs_mount_attach(&hot,covered));
+    unsigned hot_parallel=!read_only && hot_adapter->device.fs->jbd_journal && mm_test_boot_cpus>1;
+    assert(!!((struct lwext4_node *)hot_root->file.private_data)->inode_resource==hot_parallel);
+    assert(!kernel_vfs_start_journal_worker(&hot));
+    assert(!!hot_adapter->backend_lock.parallel==hot_parallel && !!hot_adapter->instance.namespace_parallel==hot_parallel);
+    assert(!kernel_vfs_path_release(&hot_root) && !kernel_vfs_mount_prepare_detach(&hot,NULL) &&
+           !kernel_vfs_mount_detach(&hot,NULL) && !kernel_vfs_unmount(&hot));
+    printf("PASS later attached mount: actual boot CPUs=%u parallel=%u\n",mm_test_boot_cpus,hot_parallel);
     assert(!kernel_vfs_path_release(&covered) && !kernel_vfs_unmount(parent));
     assert(!kernel_page_cache_destroy(&cache) && !kernel_block_unregister(&disk));
     puts("PASS attached root close fault/retry, prepare_detach/detach/unmount returns inode owner");

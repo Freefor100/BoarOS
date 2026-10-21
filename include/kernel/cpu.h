@@ -84,6 +84,10 @@ static inline struct kernel_cpu *kernel_cpu_current(void)
     if (!cpu || cpu->initialized != KERNEL_CPU_INITIALIZED) __builtin_trap();
     return cpu;
 }
+/* Validated boot topology, published before mounts and unchanged thereafter.
+ * This counts configured executors, including secondaries not yet started. */
+void kernel_cpu_set_boot_count(unsigned count);
+unsigned kernel_cpu_get_boot_count(void);
 void kernel_cpu_initialize(struct kernel_cpu *, uint64_t, struct kernel_io_context *);
 void kernel_cpu_boot_initialize(uint64_t hardware_id);
 void kernel_cpu_boot_rebind(void);
