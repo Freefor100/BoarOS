@@ -106,7 +106,7 @@ void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
     if (!target || target->logical_id >= cpu_count) __builtin_trap();
     __atomic_fetch_or(&target->events, events, __ATOMIC_RELEASE);
     if (target != source) source->outbound |= 1U << target->logical_id;
-    if (!source->raw_locks) kernel_cpu_flush_notifications();
+    if (!source->raw_locks && source->outbound) kernel_cpu_flush_notifications();
     arch_interrupt_restore(irq);
 }
 

@@ -16,6 +16,7 @@ _Thread_local uintptr_t sync_test_irq = 1;
 _Thread_local unsigned sync_test_irq_restores;
 static _Thread_local unsigned segment_restores;
 static _Thread_local struct kernel_cpu cpu;
+static _Thread_local unsigned notification_flushes;
 static _Thread_local struct host_task host_current;
 #define current host_current.task
 static _Thread_local unsigned ready;
@@ -27,6 +28,12 @@ static unsigned segment_enabled, finish_pause;
 static unsigned handoff_irq = 1;
 static pthread_barrier_t finish_entered, finish_released;
 void *sync_test_cpu(void) { return &cpu; }
+void kernel_cpu_flush_notifications(void)
+{
+    assert(!cpu.raw_locks);
+    notification_flushes++;
+    cpu.outbound=0;
+}
 struct kernel_task *kernel_task_current(void) { return &current; }
 static void initialize(unsigned id)
 {
@@ -251,6 +258,19 @@ static void try_write_busy(void)
 int main(void)
 {
     initialize(0);
+    struct kernel_raw_lock outer, inner;
+    struct kernel_raw_guard first={0}, second={0};
+    kernel_raw_lock_init(&outer,KERNEL_RAW_RANK_OBJECT);
+    kernel_raw_lock_init(&inner,KERNEL_RAW_RANK_SCHEDULER);
+    notification_flushes=0;
+    kernel_raw_lock_acquire(&outer,&first);kernel_raw_lock_release(&first);
+    assert(!notification_flushes);
+    kernel_raw_lock_acquire(&outer,&first);
+    cpu.outbound=2;
+    kernel_raw_lock_acquire(&inner,&second);kernel_raw_lock_release(&second);
+    assert(!notification_flushes && cpu.outbound==2);
+    kernel_raw_lock_release(&first);
+    assert(notification_flushes==1 && !cpu.outbound && sync_test_irq==1);
     kernel_wait_domain_init();
     fatal_cases();
     try_write_busy();

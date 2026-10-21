@@ -74,7 +74,9 @@ void kernel_raw_lock_release(struct kernel_raw_guard *guard)
 #endif
     guard->lock = 0;
 #if BOAROS_MAX_CPUS > 1
-    if (!cpu->raw_locks) kernel_cpu_flush_notifications();
+    /* outbound belongs to this CPU until IRQ restore; empty queues need no
+     * firmware dispatch or scan of the other CPUs. */
+    if (!cpu->raw_locks && cpu->outbound) kernel_cpu_flush_notifications();
 #endif
     arch_interrupt_restore(guard->interrupts);
 #if BOAROS_COST_DIAGNOSTICS
