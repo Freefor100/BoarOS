@@ -2517,7 +2517,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans, struct ext4_block *block
 /* All records and credits were reserved before publication. Validate the full
  * operation before publishing any home block; unrelated accepted bytes are
  * retained when separate records share one physical block. */
-static int jbd_publish_private(struct jbd_trans *trans)
+static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
 {
     COST_SCOPE(publish_cost, JOURNAL_PUBLISH_TICKS);
     struct jbd_journal *journal = trans->journal;
@@ -2570,14 +2570,16 @@ static int jbd_publish_private(struct jbd_trans *trans)
     }
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
         if (!jb->private_access || !jb->modified) continue;
-        struct ext4_block_payload *current;
-        {
+        struct ext4_block_payload *current = jb->block.buf->current_payload;
+        if (retain_rollback) {
             KERNEL_TASK_LOCK_SCOPE(guard, &jb->block.buf->bc->metadata);
             current = jb->block.buf->current_payload;
             ext4_block_payload_get(current);
             jb->was_dirty = ext4_bcache_test_flag(jb->block.buf, BC_DIRTY);
+            jb->rollback = current;
         }
-        jb->rollback = current;
+        /* grouped 已完成全部失败检查；STATE 稳定 current，合并在发布
+         * 归还 cache 引用前结束。只有即时提交需跨 I/O 保留回滚版本。 */
         uint32_t end = journal->block_size / 32;
         for (uint32_t unit = 0;
              (unit = jbd_range_next(jb->dirty_ranges, unit, end, false)) < end;) {
@@ -3381,7 +3383,7 @@ int jbd_journal_commit_trans(struct jbd_journal *journal,
 	int r = EOK;
     {
     JBD_STATE_SCOPE(journal);
-    r = jbd_publish_private(trans);
+    r = jbd_publish_private(trans, true);
     }
     if (r) { jbd_journal_free_trans(journal, trans, true); return r; }
 	r = __jbd_journal_commit_trans(journal, trans);
@@ -3468,18 +3470,12 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	unsigned credits = operation->reserved_logs + (running ? running->reserved_logs : 0);
 	uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
 	if (credits >= maxlen - journal->first) __builtin_trap();
-    int publication = jbd_publish_private(operation);
+    int publication = jbd_publish_private(operation, false);
     if (publication) return publication;
     ext4_operation_publish_super(&operation->operation);
 	ext4_orphan_trans_finish_state_held(operation, false);
 	ext4_operation_completed(&operation->operation,
 		running ? running->sequence : journal->accepted_sequence + 1, journal->committed_id);
-	/* Only this newly accepted operation owns undo images. Older accepted
-	 * records already discarded theirs; never rescan the accumulated group. */
-	struct jbd_buf *accepted;
-	TAILQ_FOREACH(accepted, &operation->buf_queue, buf_node) {
-		jbd_release_rollback(accepted);
-	}
 	jbd_quarantine_accept(journal, operation, running ? running : operation);
 	if (!running) {
 		running = operation;

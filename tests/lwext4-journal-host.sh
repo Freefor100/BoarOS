@@ -9,7 +9,7 @@ cc=${HOST_CC:-cc}
     -Wno-stringop-truncation -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${JOURNAL_TEST_CFLAGS:-} \
     -DTEST_JBD_RECORD_COPY -DTEST_JBD_CREDIT_PARALLEL -fno-builtin-memcpy \
     -Wl,--wrap=memcpy -Wl,--wrap=calloc -Wl,--wrap=malloc -Wl,--wrap=ext4_crc32c \
-    -Wl,--wrap=kernel_raw_lock_acquire,--wrap=ext4_bcache_find_get \
+    -Wl,--wrap=kernel_raw_lock_acquire,--wrap=ext4_bcache_find_get,--wrap=ext4_bcache_publish \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_journal.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
@@ -21,6 +21,9 @@ for block in 1024 4096; do
     truncate -s 32M "$work/group-base.img"
     mkfs.ext4 -q -F -b "$block" "$work/group-base.img"
     debugfs -w -R "write $work/data /probe" "$work/group-base.img" >/dev/null 2>&1
+    cp "$work/group-base.img" "$work/publication-owners.img"
+    timeout 30 "$work/probe" "$work/publication-owners.img" publication-owners
+    e2fsck -fn "$work/publication-owners.img" >/dev/null
     for fault in 0 1 2 3; do
         cp "$work/group-base.img" "$work/freeze-owner.img"
         timeout 30 "$work/probe" "$work/freeze-owner.img" freeze-owner "$fault"

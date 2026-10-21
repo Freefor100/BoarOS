@@ -24,6 +24,34 @@ static struct fault_block disk;
 static uint64_t reads, fail_read;
 #ifdef TEST_JBD_CREDIT_PARALLEL
 #include "lwext4_credit_parallel.h"
+static struct {
+    struct ext4_buf *buffer;
+    struct ext4_block_payload *current;
+    uint32_t references, extra;
+    unsigned observed;
+} publication_owner;
+void __real_ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *);
+void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_payload *next)
+{
+    if (buffer == publication_owner.buffer) {
+        CHECK(credit_state_depth && buffer->current_payload == publication_owner.current);
+        uint32_t references = __atomic_load_n(&publication_owner.current->references, __ATOMIC_ACQUIRE);
+        fprintf(stderr, "publication owner: before=%u at_publish=%u required_extra=%u\n",
+            publication_owner.references, references, publication_owner.extra);
+        CHECK(references == publication_owner.references + publication_owner.extra);
+        publication_owner.buffer = NULL;
+        publication_owner.observed++;
+    }
+    __real_ext4_bcache_publish(buffer, next);
+}
+static void publication_watch(struct ext4_buf *buffer, unsigned extra)
+{
+    CHECK(!publication_owner.buffer);
+    publication_owner.buffer = buffer;
+    publication_owner.current = buffer->current_payload;
+    publication_owner.references = __atomic_load_n(&buffer->current_payload->references, __ATOMIC_ACQUIRE);
+    publication_owner.extra = extra;
+}
 #endif
 #ifdef TEST_JBD_RECORD_COPY
 static bool count_record_copies;
@@ -66,7 +94,7 @@ static void close_normal_journal(struct ext4_blockdev *dev, struct jbd_journal *
 {
     struct jbd_memory *memory = journal->memory;
     jbd_memory_get(memory);
-    jbd_journal_group_fini(journal);
+    if (journal->grouped) jbd_journal_group_fini(journal);
     CHECK(journal->log_map == NULL && jbd_memory_cached(journal) == 0);
     CHECK(jbd_journal_stop(journal) == EOK);
     dev->fs->jbd_journal = NULL;
@@ -78,6 +106,91 @@ static void close_normal_journal(struct ext4_blockdev *dev, struct jbd_journal *
     CHECK(stats.used == 0 && stats.reserved == 0 && stats.cached == 0);
     jbd_memory_put(memory);
 }
+
+#ifdef TEST_JBD_CREDIT_PARALLEL
+static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    ext4_fsblk_t home)
+{
+    const struct ext4_lock locks = {.state_lock = credit_state_lock,
+        .state_read_lock = credit_state_lock, .state_unlock = credit_state_unlock};
+    dev->fs->os_locks = &locks;
+    dev->fs->jbd_journal = journal;
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    struct ext4_block original, older, private, visible;
+    CHECK(ext4_block_get(dev, &original, home) == EOK && original.data[0] == 'O');
+    for (unsigned round = 0; round < 2; round++) {
+        struct jbd_trans *operation;
+        CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
+        CHECK(ext4_block_get(dev, &private, home) == EOK);
+        CHECK(jbd_trans_get_write_access_range(operation, &private, 0, 32) == EOK);
+        private.data[0] = 'A' + round;
+        CHECK(jbd_trans_set_block_dirty_range(operation, &private, 0, 32) == EOK);
+        CHECK(ext4_block_set(dev, &private) == EOK);
+        CHECK(jbd_trans_prepare_operation(operation) == EOK);
+        publication_watch(original.buf, 0);
+        CHECK(jbd_journal_accept(journal, operation, 0) == EOK && !publication_owner.buffer);
+        CHECK(original.data[0] == 'O');
+        CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'A' + round);
+        if (!round) older = visible;
+        else CHECK(ext4_block_set(dev, &visible) == EOK && older.data[0] == 'A');
+    }
+    struct jbd_trans *pending;
+    CHECK(jbd_journal_new_trans(journal, &pending) == EOK);
+    CHECK(ext4_block_get(dev, &private, home) == EOK);
+    CHECK(jbd_trans_get_write_access_range(pending, &private, 0, 32) == EOK);
+    private.data[0] = 'C';
+    CHECK(jbd_trans_set_block_dirty_range(pending, &private, 0, 32) == EOK);
+    struct jbd_trans *sibling;
+    CHECK(jbd_journal_new_trans(journal, &sibling) == EOK);
+    CHECK(ext4_block_get(dev, &visible, home) == EOK);
+    CHECK(jbd_trans_get_write_access_range(sibling, &visible, 32, 32) == EOK);
+    visible.data[32] = 'D';
+    CHECK(jbd_trans_set_block_dirty_range(sibling, &visible, 32, 32) == EOK);
+    CHECK(ext4_block_set(dev, &visible) == EOK && jbd_trans_prepare_operation(sibling) == EOK);
+    publication_watch(original.buf, 0);
+    CHECK(jbd_journal_accept(journal, sibling, 0) == EOK && !publication_owner.buffer);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    credit_drain(journal);
+    /* The newer accepted payload now has only its cache owner. The private
+     * operation still owns a different baseline and must merge before publish
+     * returns this last current reference; old readers retain their own bytes. */
+    CHECK(original.buf->current_payload->references == 1);
+    CHECK(jbd_trans_prepare_operation(pending) == EOK);
+    publication_watch(original.buf, 0);
+    CHECK(jbd_journal_accept(journal, pending, 0) == EOK && !publication_owner.buffer);
+    CHECK(original.data[0] == 'O' && older.data[0] == 'A' && private.data[0] == 'C');
+    CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'C' && visible.data[32] == 'D');
+    CHECK(ext4_block_set(dev, &visible) == EOK && ext4_block_set(dev, &private) == EOK);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    credit_drain(journal);
+    jbd_journal_group_fini(journal);
+
+    struct jbd_trans *immediate;
+    CHECK(jbd_journal_new_trans(journal, &immediate) == EOK);
+    CHECK(ext4_block_get(dev, &private, home) == EOK);
+    CHECK(jbd_trans_get_write_access_range(immediate, &private, 0, 32) == EOK);
+    private.data[0] = 'E';
+    CHECK(jbd_trans_set_block_dirty_range(immediate, &private, 0, 32) == EOK);
+    CHECK(jbd_trans_prepare_operation(immediate) == EOK);
+    publication_watch(original.buf, 1);
+    uint64_t writes = disk.writes;
+    /* Fail the first actual log allocation after provisional publication. */
+    credit_test.journal = journal; credit_test.paused = true;
+    credit_test.fail_after = 1; credit_test.calls = 0; credit_actor = 1;
+    CHECK(jbd_journal_commit_trans(journal, immediate) == ENOMEM);
+    credit_actor = 0; credit_test.journal = NULL;
+    CHECK(credit_test.calls && !publication_owner.buffer && publication_owner.observed == 5);
+    CHECK(!jbd_journal_error(journal) && !journal->failed_trans && disk.writes == writes);
+    CHECK(private.data[0] == 'C' && private.data[32] == 'D');
+    CHECK(original.data[0] == 'O' && older.data[0] == 'A');
+    CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'C' && visible.data[32] == 'D');
+    CHECK(ext4_block_set(dev, &visible) == EOK && ext4_block_set(dev, &private) == EOK);
+    CHECK(ext4_block_set(dev, &older) == EOK && ext4_block_set(dev, &original) == EOK);
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    printf("PASS publication owners block=%u: grouped first/merge/stale-cache-only, old readers, immediate rollback after real log OOM, all memory returned\n", dev->lg_bsize);
+}
+#endif
 
 static void private_access_oom(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
@@ -902,6 +1015,10 @@ int main(int argc, char **argv)
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
 #ifdef TEST_JBD_CREDIT_PARALLEL
+    if (!strcmp(argv[2], "publication-owners")) {
+        publication_owners(&dev, &journal, home);
+        return 0;
+    }
     if (!strcmp(argv[2], "freeze-owner")) {
         unsigned fault = argc > 3 ? (unsigned)atoi(argv[3]) : 0;
         journal_freeze_owner(&dev, &journal, home, fault);
