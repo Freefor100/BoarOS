@@ -12,8 +12,10 @@ struct kernel_cost_task {
     uint32_t depth;
     uint8_t suppress, operation, wait_rank, wait_flags;
 };
-/* Actual IO storage owns two backend and four inline request guards. */
+/* Two backend guards and four inline resource request guards live in the
+ * task's IO context. SMP service accounting retains two further timestamps. */
 #define KERNEL_COST_TASK_BYTES (sizeof(struct kernel_cost_task) + 6U * 16U + (BOAROS_USER_SMP ? 16U : 0U))
+#define KERNEL_COST_CPU_SERVICE_BYTES (BOAROS_USER_SMP ? 5U * sizeof(uint64_t) : 0U)
 _Static_assert(KERNEL_COST_TASK_BYTES <= 160, "cost task budget");
 enum kernel_cost_metric {
 #define X(id, name, unit, hist) COST_##id,
@@ -30,6 +32,21 @@ void kernel_cost_add_io(unsigned offset, uint64_t value);
 #define COST_IO_ADD(offset, value) kernel_cost_add_io(offset, value)
 #define COST_PHASE_SCOPE(name, phase) struct kernel_cost_io_scope name __attribute__((cleanup(kernel_cost_io_leave))) = kernel_cost_phase_enter(phase)
 struct kernel_cost_tag { uint64_t epoch; unsigned lane; };
+/* The first three words are used before trap register restoration. */
+struct kernel_cost_cpu {
+    uint64_t trap_timestamp, return_timestamp, return_pending;
+    struct kernel_cost_tag irq_tag;
+    uint64_t irq_start;
+    struct kernel_cost_task *running;
+    uint32_t irq_opened, irq_suppressed, lock_depth, registered;
+    struct kernel_cost_task bootstrap;
+    uint64_t observer_wait_started;
+    /* Physical IRQ entry publishes its supplied boundary before aggregate wait. */
+    uint64_t irq_pending_start;
+};
+_Static_assert(sizeof(struct kernel_cost_cpu) == 136, "cost CPU storage");
+struct kernel_cost_cpu *kernel_cost_cpu_current(void);
+void kernel_cost_register_cpu(struct kernel_cost_cpu *cpu);
 struct kernel_cost_scope {
     struct kernel_cost_tag tag;
     uint64_t start;
@@ -42,12 +59,13 @@ void kernel_cost_irq_enabled(uint64_t ticks);
 void kernel_cost_irq_suppress(void);
 void kernel_cost_irq_enable_now(void);
 void kernel_cost_irq_return(uint64_t status);
-extern uint64_t kernel_cost_trap_timestamp, kernel_cost_return_timestamp;
-extern uint64_t kernel_cost_return_pending;
 void kernel_cost_irq_flush(void);
 void kernel_cost_irq_observer(uint64_t ticks);
 uint64_t kernel_cost_lock(void);
 void kernel_cost_unlock(uint64_t status);
+/* These two hooks change only the local IRQ bit and never observe COST. */
+uint64_t kernel_cost_irq_save(void);
+void kernel_cost_irq_restore(uint64_t enabled);
 struct kernel_cost_task *kernel_cost_current(void);
 uint64_t kernel_cost_epoch(void);
 struct kernel_cost_tag kernel_cost_capture(void);
@@ -61,6 +79,8 @@ void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value);
 void kernel_cost_sample(enum kernel_cost_metric metric, uint64_t value);
 struct kernel_cost_scope kernel_cost_enter(enum kernel_cost_metric metric);
 void kernel_cost_leave(struct kernel_cost_scope *scope);
+/* A resource publisher supplies the instant its physical qualification ended. */
+void kernel_cost_leave_at(struct kernel_cost_scope *scope, uint64_t end);
 void kernel_cost_cancel(struct kernel_cost_task *task);
 struct kernel_cost_tag;
 void kernel_cost_join(struct kernel_cost_task *task);
@@ -71,6 +91,7 @@ void kernel_cost_timeout(struct kernel_cost_task *task, uint64_t deadline);
 void kernel_cost_ready(struct kernel_cost_task *task);
 struct kernel_cost_tag kernel_cost_task_tag(const struct kernel_cost_task *task);
 unsigned kernel_cost_rank(unsigned rank);
+enum kernel_cost_metric kernel_cost_lock_metric(unsigned rank);
 int kernel_cost_begin(uint64_t owner, uint32_t frequency, int fixture, int deferred);
 int kernel_cost_end(uint64_t owner, int deferred);
 void kernel_cost_boundary(void);

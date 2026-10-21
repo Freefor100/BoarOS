@@ -1,16 +1,26 @@
 # 成本观测模块
 
 `COST_DIAGNOSTICS=1` 在 `build/cost/riscv/` 构建观测版本，内核为
-`build/cost/kernel-rv`；默认 0。C/assembly 同用 `BOAROS_COST_DIAGNOSTICS`，
+`build/cost/kernel-rv`；`SMP=1 USER_SMP=1 COST_DIAGNOSTICS=1` 的两核版本独立构建在
+`build/cost-smp/`。默认关闭观测。C/assembly 同用 `BOAROS_COST_DIAGNOSTICS`，
 每个对象依赖只在配置改变时更新的 `generated/cost-config.h`，包括显式覆盖
 `BUILD_DIR` 的构建。关闭时宏为空，任务/VFS 节点布局无观测字段，proc 无观测节点。
 
 `kernel/cost.c` 保持固定聚合，`kernel/sched/cost.c` 连接时钟、任务关系和用户返回。
 诊断存储不持有任务、MM、inode 或 OFD 引用；任务仅有标量 epoch、运行/等待时间戳、
-在途深度及控制抑制状态（当前标量 48 字节，加两个 backend 与四个资源请求 guard 的 96 字节，共 144 字节；USER_SMP 的现有服务字段另加 16 字节），原任务元数据页容量断言继续生效。
-热路径不分配、不打印、不睡眠；原始 CSR SIE save/restore 保护聚合，不走被观测的锁。
-操作私有版本的 prepare、publish 与失败后资源重试复用固定指标表，当前聚合为 69,856 字节，
-上限为 96 KiB。观测仍沿串行 COST 执行规则，SMP 与 COST 的组合构建检查保持原设置。
+在途深度及控制抑制状态（标量48字节）；任务内两个 backend guard 和四个内嵌资源请求 guard 各新增16字节，
+用户两核服务计时再加16字节，故任务字段总开销为单核144字节、用户两核160字节。
+原任务元数据页容量断言继续生效。
+热路径不分配、不打印、不睡眠。聚合由 COST 专用原子锁保护，同一 CPU 的递归深度先于
+IRQ observer 回调建立，退出时恢复原 SIE。它不取得调度域、files 或 VFS 锁；任务关系
+查询和 descriptor 判断在锁外完成。每 CPU 独立保存 trap/return 时间戳、IRQ 区间、
+递归深度和实际执行者借用，共136字节；任务迁移只迁移任务计数，IRQ 区间仍属于原 CPU。
+CPU 原有 service 计数另占40字节/CPU。用户两核注册表、固定聚合和这些 CPU 诊断字段
+按 sizeof 合计84,964字节，编译上限96KiB，快照 `storage_bytes` 如实输出；
+每任务字段另列 `task_bytes`，不计入固定聚合。物理 IRQ 入口在等待聚合锁前保存传入的边界；结束窗口先结算旧 return 尾段，
+再裁剪当前关闭区间。聚合锁等待单列 observer，不重复累计同一物理 IRQ 区间。
+任务增量仍为用户两核160字节；完整 CPU 对象按实际布局包含这些字段和对齐。
+直方图保留全部65桶。
 
 普通构建也不再为诊断单独读取设备服务时间、在途积分和发布阶段时钟；VirtIO 只保留
 完成请求、字节、队列占用等运行统计，以及真实期限所需的时钟。详细时长由同一
@@ -18,7 +28,9 @@
 片段都更新的独立全局原子计数；关闭诊断后不保留这项探针。
 
 仅观测版本提供 `/proc/boaros_cost_control`（完整 `begin\n`、`end\n`）及只读
-`/proc/boaros_cost`。开始在用户返回时激活，结束在用户返回时完成；控制 fd 的完整
+`/proc/boaros_cost`。开始在发起控制命令的线程返回用户态时激活，结束由同一发起线程的返回完成；
+其他 CPU 的用户返回不能代替它越过边界。结束在共享锁内检查真实在途数量，并结算
+所有 CPU 的运行片段和已开放 IRQ 片段，再允许读取固定快照；控制 fd 的完整
 read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数。重复开始 EBUSY，
 状态/命令错误 EINVAL，其他控制组结束 EPERM，在途结束 EBUSY，均不清零原窗口。
 控制组退出中止窗口并标 incomplete。完整用户复制先于控制发布，坏指针 EFAULT。
@@ -27,7 +39,7 @@ read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数�
 consumer 和 write 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
 结束时先记录 `COST RESULT` 的时间边界；`end` 返回 EBUSY 时在用户态有界等待重试，
 最多十秒，并另报 `COST CLOSING name ns retries`。关闭等待属于快照覆盖区间，
-不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。其他受控
+不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。双核 fixed metadata 同样复用这项有界关闭等待；其他受控
 case 的严格结束检查不变；内核的 EBUSY/inflight/complete 契约不放宽。
 
 `contract` 程序打印最后的快照与通过标记后，先 `fflush` 再 `tcdrain`，确认
@@ -89,7 +101,10 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
 
-C2 按 rank 10/15/20/30/40/other 记录尝试、取得、阻塞、唤醒、重阻塞、取消及等待/持有直方图。
+C2 按 rank 10/15/20/21/30/31/32/35/40/other 记录尝试、取得、阻塞、唤醒、重阻塞、取消及等待/持有直方图。
+等待止于 metadata 资格中实际授予 writer/readers 的时刻，持有由该 grant 开始、
+在实际撤销资格时结束；随后等待诊断发布不能改变这两个边界。排队者从授予预留起
+计入占用，恢复运行延迟不再计入资格等待。释放后的定点 scope 提交仍消费真实在途登记。
 持有 scope 参与在途计量，guard 只新增开始时刻和登记标量，不持有诊断任务引用。
 独立假时钟测试区分前台运行20 ticks、后台运行890 ticks、前台睡眠880 ticks和就绪10 ticks。
 低内存 io-sleep fixture 使用相同接口输出 pressure-io/timeout-cancel，完成后才分配快照；
@@ -99,9 +114,9 @@ C2 按 rank 10/15/20/30/40/other 记录尝试、取得、阻塞、唤醒、重�
 实际写入在途取消由低内存io-sleep的operation_mode=3保护。四种设备配置各三次 fixture 启动验证清理。
 
 C3 计数覆盖外围VMA查询/覆盖/权限/数组编辑/合并/recount、resident遍历和实际PTE/TLB，
-prepare/commit/整次改权为嵌套墙上耗时，不能相加。聚合上限包括名称、单位、索引和桥接标量预留。
+prepare/commit/整次改权为嵌套墙上耗时，不能相加。聚合上限包括名称、单位、索引、锁映射表和 CPU 本地状态。
 
-C5 使用hart全局标量跟踪实际SIE转换，嵌套不重起，切换不截断；采样段及明确盲区见成本基线。
+C5 使用每 CPU 独立状态跟踪实际SIE转换，嵌套不重起，切换不截断；采样段及明确盲区见成本基线。
 trap保存t0/t1后首采样，sret恢复其他寄存器后发布尾stamp，下一安全入口聚合。
 C save/restore、trampoline、timer启动、idle/trap/sret均接入；诊断原始临界区单列observer。
 wake_to_run只含实际wake，ready_ticks另含创建/yield等就绪。关闭后C/ASM都无新增指令。
@@ -162,7 +177,7 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 不保证内容已经有效，因此loading命中仍可等待。设备READ在实际发布处只按可证明的
 file_read/metadata_read/prepare_read归因，不能证明的仍为unknown。来源scope嵌套恢复，
 不改变既有OUT的data/journal/checkpoint/super分类。名称容量32字节，逐项编译断言；
-新增13个无直方图聚合后存储65483字节，任务仍64字节；历史182项schema继续可读。
+这13项无直方图指标共用本页开头的固定预算；历史182项schema继续可读。
 `--case readers`是统一起跑、每任务8MiB/1KiB的同/不同inode冷/热读诊断，
 全部工作者完成且内容/状态核对后结束，记录标量时间和字节，不保留对象引用。
 
@@ -186,13 +201,21 @@ JSON指标表先规范化为受支持注册表，再做完整字段/epoch/溢出
 程序、应用durable收尾、剩余内部卸载各自报告；有限收益和未唯一归因的历史分布保留，
 不把这10启动扩写为原八组全套或完整成本矩阵。
 
+`journal_prepare_ticks` 从外层操作成功 attach 计到接受前 detach，覆盖实际私有准备、
+解析及等待；嵌套操作不重复登记，失败准备也结算。每个活动操作在诊断构建中保存40字节
+scope，OFF 无该字段。`journal_record_prepare_ticks` 只计每次实际记录写视图的准备；
+`journal_publish_ticks` 计校验、合并和发布。三者是嵌套经过时间，不能相加当 CPU 时间。
+`journal_resource_retries` 计完整回滚后真实消费排序重放请求的次数；
+`journal_memory_retries` / `journal_log_retries` 只计调用者明确遇到配额/日志预约失败、
+完成回滚和回收等待后重新尝试的次数。真实 malloc 失败和磁盘 ENOSPC 不计作可回收重试。
+
 ## 日志批次定点归因（2026-10-02）
 
 新增五项成功封口原因：operations、bytes、age、target、force。条件可以重叠，
 只能与组数对照，不能相加；operations仅用于旧策略对照，取消操作数阈值后为零。
 新增sealed/durable/checkpoint等待ticks，记录累计值、样本数与最大值；计时覆盖
 释放后端锁、阻塞到恢复取得锁的经过时间，不能当成CPU耗时或跨任务可加的总时间。
-旧195项registry仍明确可读，schema版本1不变；聚合64794字节、每任务64字节。
+旧195项registry仍明确可读，schema版本1不变；当前存储预算和任务开销见本页开头。
 关闭COST时没有这些诊断状态或采样代码。`make test-cost-host`保护接口、预算和解析。
 
 ## 内存消费者的有限计时（2026-10-03）
@@ -204,8 +227,7 @@ uaccess_copy_bytes/ticks。它们只包围实际 calloc 清零、resize 搬迁�
 采样前捕获 epoch/前后台身份，睡眠或切换后仍按该来源记账；不把经过时间称为独占
 CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工作量。
 
-该次加入后的聚合存储为 **65,436 字节**、每任务仍为64字节，距离64KiB上限仅余100字节；编译与
-快照均检查预算，后续新增指标必须重新核对容量。追加前的
+这些指标与其余注册表共用本页开头的固定预算；编译与快照均检查容量。追加前的
 完整203项 schema 继续可读，当时的209项必须齐全，版本1不变。关闭观测时没有新状态
 或指令。独立消费者 fixture 核对真实范围、失败边界、样本和时钟，而不是只测试
 公共内存函数。Lua 的一次定点窗口及候选未上线结论见
@@ -219,9 +241,9 @@ CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工�
 增长指标 `resize_visits` / `resize_tail_pages` / `resize_alias_rearms` 区分缓存项访问、
 实际处理尾页及别名重新保护；哈希探测沿用 `cache_probes`。新指标追加在注册表尾部，
 解析器继续接受固定的旧完整 schema，缺字段不能当零。指标名按实际长度保存，
-聚合存储使用前述固定上限；测试约束公开预算，不绑定某个私有布局字节数。
+聚合存储受本页开头的固定上限保护；测试约束这一公开预算，不绑定某个私有布局字节数。
 
-网络服务指标在版本 1 末尾追加，旧 schema 仍由报告器识别：服务批次、socket 工作单元、loopback 包、timer 回调、全局 registry 扫描、poll 查询及查询触发服务、带可执行工作睡眠次数。socket 工作单元含容量转交与到期重试，不能解释为唯一 socket 数；末项为睡前诊断谓词，正常应为零。没有新增对象引用或动态观测内存，聚合存储使用前述固定上限。
+网络服务指标在版本 1 末尾追加，旧 schema 仍由报告器识别：服务批次、socket 工作单元、loopback 包、timer 回调、全局 registry 扫描、poll 查询及查询触发服务、带可执行工作睡眠次数。socket 工作单元含容量转交与到期重试，不能解释为唯一 socket 数；末项为睡前诊断谓词，正常应为零。没有新增对象引用或动态观测内存，聚合受同一固定上限保护。
 
 TCP admission 新增 `stream_admit_blocked`（预先无容量的尝试）、`stream_protocol_blocked`
 （复制后提交仍为 EAGAIN 的尝试）和 `stream_copy_blocked_bytes`（尚无进展时这些失败新复制的
@@ -234,7 +256,7 @@ payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次
 注册表末尾增加page_meta_checked、page_meta_written（逻辑记录）和allocator_meta_ticks
 （区间累计ticks/samples/max），均不带直方图。每次元数据区内局部累计，离开后一次
 原子提交三个计数；默认关闭，不持对象引用、不分配观测内存。计时不含压力回收与I/O
-等待。加上raw区间观测后当前聚合64570字节、每任务64字节，旧223/226项完整registry仍可显式解析；缺少新
+等待。raw区间观测共用同一固定预算，旧223/226项完整registry仍可显式解析；缺少新
 指标标记不可用，不能填零，也不接受随意缺字段的快照。外部冻结kernel identity中的
 registry与二进制SHA必须匹配；同时声明两份registry时必须一致。
 

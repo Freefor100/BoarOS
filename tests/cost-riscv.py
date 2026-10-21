@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tempfile
 from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_scheduler, validate_resume_selection
-from cost_report import validate_metadata_fixed
+from cost_report import validate_metadata_fixed, schema
 from cost_seed import replica_seed, seed_arguments, validate_resume_seed
 from cost_fixture import FrozenFixture, validate_resume_fixture
 from cost_measurement import acquire_measurement_lock
@@ -63,8 +63,8 @@ def main():
         parser.error('paired QEMU seed applies only to fixture measurements')
     if args.metadata_fixed_only and (args.case!='metadata' or args.metadata_core_only or args.platform_config!='fixture'):
         parser.error('fixed metadata requires metadata fixture mode')
-    if args.cpus!=1 and not args.metadata_fixed_only:
-        parser.error('two CPUs currently require fixed metadata mode')
+    if args.cpus!=1 and not args.metadata_fixed_only and args.case!='contract':
+        parser.error('two CPUs require contract or fixed metadata mode')
     if args.fixture_cache and (args.case not in ('allocator','latency','locking','scheduler') and not args.metadata_fixed_only or
             args.two_disks or args.linux or args.platform_config!='fixture'):
         parser.error('frozen fixture requires one supported single-disk BoarOS fixture case')
@@ -110,6 +110,8 @@ def main():
         build_identity=json.loads(args.kernel_identity.read_text())
         if build_identity['kernel_sha256']!=identity['kernel_sha256']:raise ValueError('kernel build identity mismatch')
         identity['kernel_build_identity']=build_identity
+    if not args.off:
+        identity['metric_schema']=identity.get('kernel_build_identity',{}).get('metric_schema',schema())
     identity['root_drain_fixture']=args.root_drain_fixture
     identity['trace_read_lbas']=args.trace_read_lbas
     original=None
@@ -129,6 +131,7 @@ def main():
             program=work/(case+'.elf')
             if args.coordinator_elf:shutil.copyfile(args.coordinator_elf,program)
             else:run([str(compiler),'-fno-link-libatomic','-static','-O2','-pthread','-Wall','-Wextra','-Werror',
+                *(['-DCOST_END_WAIT_ASYNC=1'] if args.cpus==2 else []),
                 str(ROOT/'tests/workloads/cost'/f'{case}.c'),'-o',str(program)])
             if case=='metadata' and not args.metadata_fixed_only:
                 identity['lmbench_elf_sha256']={}
@@ -279,7 +282,7 @@ def main():
                     elif line=='COST END':
                         if current is None: raise ValueError('extra snapshot end')
                         name,epoch=current
-                        registry=identity.get('kernel_build_identity',{}).get('metric_schema')
+                        registry=identity.get('metric_schema')
                         snap=parse('\n'.join(body),epoch,[tuple(metric) for metric in registry] if registry is not None else None)
                         if name in expectations: validate_expected(snap,expectations[name])
                         if snapshots and epoch<=snapshots[-1]['values']['epoch']: raise ValueError('stale epoch')

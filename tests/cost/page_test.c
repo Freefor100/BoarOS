@@ -12,8 +12,10 @@ static void *access_page(uint64_t address){return (void *)(uintptr_t)address;}
 /* The host has no UART; this legal/OOM workload must never emit a fatal. */
 void kernel_console_putc(char character){(void)character;assert(0);}
 uint64_t kernel_cost_clock(void){return 100;}
-uint64_t kernel_cost_lock(void){return 0;}
-void kernel_cost_unlock(uint64_t s){(void)s;}
+uint64_t kernel_cost_irq_save(void){return 0;}
+void kernel_cost_irq_restore(uint64_t s){(void)s;}
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void){return &task;}
 int main(void)
 {

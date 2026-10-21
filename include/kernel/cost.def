@@ -238,6 +238,46 @@ X(ALLOCATOR_META_TICKS, allocator_meta_ticks, ticks, 0)
 X(RAW_WAIT_TICKS, raw_wait_ticks, ticks, 0)
 X(RAW_HOLD_TICKS, raw_hold_ticks, ticks, 0)
 
+/* Actual resource lock rank 21. */
+X(LOCK21_ATTEMPTS, lock21_attempts, count, 0)
+X(LOCK21_ACQUIRED, lock21_acquired, count, 0)
+X(LOCK21_PARKS, lock21_parks, count, 0)
+X(LOCK21_WAKES, lock21_wakes, count, 0)
+X(LOCK21_REBLOCKS, lock21_reblocks, count, 0)
+X(LOCK21_WAIT_TICKS, lock21_wait_ticks, ticks, 1)
+X(LOCK21_HOLD_TICKS, lock21_hold_ticks, ticks, 1)
+X(LOCK21_CANCELLED, lock21_cancelled, count, 0)
+
+/* Actual resource lock rank 31. */
+X(LOCK31_ATTEMPTS, lock31_attempts, count, 0)
+X(LOCK31_ACQUIRED, lock31_acquired, count, 0)
+X(LOCK31_PARKS, lock31_parks, count, 0)
+X(LOCK31_WAKES, lock31_wakes, count, 0)
+X(LOCK31_REBLOCKS, lock31_reblocks, count, 0)
+X(LOCK31_WAIT_TICKS, lock31_wait_ticks, ticks, 1)
+X(LOCK31_HOLD_TICKS, lock31_hold_ticks, ticks, 1)
+X(LOCK31_CANCELLED, lock31_cancelled, count, 0)
+
+/* Actual resource lock rank 32. */
+X(LOCK32_ATTEMPTS, lock32_attempts, count, 0)
+X(LOCK32_ACQUIRED, lock32_acquired, count, 0)
+X(LOCK32_PARKS, lock32_parks, count, 0)
+X(LOCK32_WAKES, lock32_wakes, count, 0)
+X(LOCK32_REBLOCKS, lock32_reblocks, count, 0)
+X(LOCK32_WAIT_TICKS, lock32_wait_ticks, ticks, 1)
+X(LOCK32_HOLD_TICKS, lock32_hold_ticks, ticks, 1)
+X(LOCK32_CANCELLED, lock32_cancelled, count, 0)
+
+/* Actual resource lock rank 35. */
+X(LOCK35_ATTEMPTS, lock35_attempts, count, 0)
+X(LOCK35_ACQUIRED, lock35_acquired, count, 0)
+X(LOCK35_PARKS, lock35_parks, count, 0)
+X(LOCK35_WAKES, lock35_wakes, count, 0)
+X(LOCK35_REBLOCKS, lock35_reblocks, count, 0)
+X(LOCK35_WAIT_TICKS, lock35_wait_ticks, ticks, 1)
+X(LOCK35_HOLD_TICKS, lock35_hold_ticks, ticks, 1)
+X(LOCK35_CANCELLED, lock35_cancelled, count, 0)
+
 X(JOURNAL_RECORD_PREPARE_TICKS, journal_record_prepare_ticks, ticks, 1)
 X(JOURNAL_PREPARE_TICKS, journal_prepare_ticks, ticks, 1)
 X(JOURNAL_PUBLISH_TICKS, journal_publish_ticks, ticks, 1)

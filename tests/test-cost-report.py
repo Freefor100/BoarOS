@@ -506,6 +506,35 @@ class CostReportTest(unittest.TestCase):
         with self.assertRaises(ValueError): parse(self.render(fields), 3)
         with self.assertRaises(ValueError): parse(self.render(fields), 3, old[:-1])
 
+    def test_frozen_smp_schema_before_retry_counters_remains_complete(self):
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='journal_resource_retries')]
+        fields=self.valid()
+        for lane in ('foreground','background','observer'):
+            for name,_,_ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'):del fields[key]
+        parsed=parse(self.render(fields),3,old)
+        self.assertNotIn('foreground.journal_resource_retries.value',parsed)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[:-1])
+
+    def test_frozen_pre_smp_registry_keeps_journal_stages_and_retries(self):
+        current=schema()
+        ranks=('lock21_','lock31_','lock32_','lock35_')
+        old=[metric for metric in current if not metric[0].startswith(ranks)]
+        self.assertIn('journal_prepare_ticks',{metric[0] for metric in old})
+        self.assertIn('journal_log_retries',{metric[0] for metric in old})
+        fields=self.valid()
+        for lane in ('foreground','background','observer'):
+            for key in list(fields):
+                if any(key.startswith(lane+'.'+rank) for rank in ranks):del fields[key]
+        parsed=parse(self.render(fields),3,old)
+        self.assertIn('foreground.journal_log_retries.value',parsed)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[:-1])
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[::-1])
+
     def test_replicas_use_the_frozen_kernel_registry(self):
         from copy import deepcopy
         current=schema()

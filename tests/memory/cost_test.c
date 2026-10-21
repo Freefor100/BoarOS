@@ -13,8 +13,10 @@ static struct kernel_io_context io_context;
 static uint64_t ticks=100, mapped[2];
 static unsigned mapped_count=2;
 uint64_t kernel_cost_clock(void) { return ticks++; }
-uint64_t kernel_cost_lock(void) { return 0; }
-void kernel_cost_unlock(uint64_t s) { (void)s; }
+uint64_t kernel_cost_irq_save(void) { return 0; }
+void kernel_cost_irq_restore(uint64_t s) { (void)s; }
+static struct kernel_cost_cpu cost_cpu;
+struct kernel_cost_cpu *kernel_cost_cpu_current(void) { return &cost_cpu; }
 struct kernel_cost_task *kernel_cost_current(void) { return &actor; }
 struct kernel_io_context *kernel_io_context_current(void) { return &io_context; }
 void kernel_console_putc(char c) { (void)c; assert(0); }

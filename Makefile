@@ -119,9 +119,6 @@ ifneq ($(MM_DISK_SMP_TEST),1)
 $(error FILES_SMP_TEST requires the controlled disk MM fixture)
 endif
 endif
-ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
-$(error SMP plus COST is unsupported)
-endif
 ifneq ($(filter $(FILE_IO_SMP_TEST),0 1),$(FILE_IO_SMP_TEST))
 $(error FILE_IO_SMP_TEST must be 0 or 1)
 endif
@@ -180,6 +177,10 @@ endif
 ifeq ($(USER_SMP),1)
 BUILD_DIR := $(USER_SMP_BUILD)/riscv
 KERNEL_RV := $(USER_SMP_BUILD)/kernel-rv
+endif
+ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
+BUILD_DIR := build/cost-smp/riscv
+KERNEL_RV := build/cost-smp/kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -819,7 +820,7 @@ test-lwext4-cache-host: test-lwext4-exclusion-host test-lwext4-payload-host test
 test-lwext4-group-host:
 	sh tests/lwext4-group-host.sh
 
-.PHONY: test-lwext4-operation-host test-lwext4-port-host test-lwext4-parallel-host test-ext4-backend-parallel-host test-namespace-parallel-host
+.PHONY: test-lwext4-operation-host test-lwext4-port-host test-lwext4-parallel-host test-ext4-backend-parallel-host
 test-lwext4-operation-host:
 	sh tests/lwext4-operation-host.sh
 
@@ -831,8 +832,6 @@ test-lwext4-parallel-host: test-lwext4-operation-host test-lwext4-port-host
 
 test-ext4-backend-parallel-host:
 	sh tests/ext4-backend-parallel-host.sh
-
-test-namespace-parallel-host: test-ext4-backend-parallel-host
 	sh tests/namespace-parallel-host.sh
 	sh tests/ext4-namespace-parallel-host.sh
 
@@ -1903,7 +1902,18 @@ test-cost-diagnostic-plugin-host:
 COST_MATCH_OUTPUT ?= build/cost-match-riscv
 test-cost-match-riscv: test-cost-match-host
 	python3 -B tests/cost-match-riscv.py --output $(COST_MATCH_OUTPUT)
-test-cost-host: test-cost-match-host test-cost-diagnostic-host
+# Force only this fixture's aggregate atomics through their ordinary ABI so
+# the test can handshake at the actual locked poll, without production hooks.
+.PHONY: test-cost-boundary-host
+test-cost-boundary-host:
+	@mkdir -p build/cost/host
+	cc -std=c11 -O2 -Wall -Wextra -Werror -fno-inline-atomics -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 -c kernel/cost.c -o build/cost/host/boundary-cost.o
+	cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_boundary_test.c build/cost/host/boundary-cost.o -latomic -Wl,--wrap=__atomic_load_4,--wrap=__atomic_exchange_4,--wrap=__atomic_load_8,--wrap=__atomic_exchange_8 -o build/cost/host/irq-boundary-test
+	for scenario in 0 1 2 3; do timeout 10s build/cost/host/irq-boundary-test $$scenario || exit $$?; done
+	cc -std=gnu11 -O2 -g -ffunction-sections -fdata-sections -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 -DBOAROS_USER_SMP=1 -DBOAROS_TEST_IRQ_RESTORE=1 -Itests/host/sync -Ikernel/sched -idirafter include tests/cost/lock_boundary_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/sync.c kernel/time.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_raw_lock_acquire,--wrap=kernel_cost_add -o build/cost/host/lock-boundary-test
+	for scenario in 1 2 3 4 5; do timeout 10s build/cost/host/lock-boundary-test $$scenario || exit $$?; done
+
+test-cost-host: test-cost-match-host test-cost-diagnostic-host test-cost-boundary-host
 	@mkdir -p build/cost/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
 	build/cost/host/core-test
@@ -1911,6 +1921,8 @@ test-cost-host: test-cost-match-host test-cost-diagnostic-host
 	build/cost/host/account-test
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
 	build/cost/host/irq-test
+	cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/smp_test.c kernel/cost.c -o build/cost/host/smp-test
+	build/cost/host/smp-test
 	cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/sync -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/raw_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c -o build/cost/host/raw-test
 	build/cost/host/raw-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test

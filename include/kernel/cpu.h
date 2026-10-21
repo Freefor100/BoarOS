@@ -4,6 +4,7 @@
 #include <arch/switch_context.h>
 #include <kernel/sched_policy.h>
 #include <kernel/cpu_config.h>
+#include <kernel/cost.h>
 #if BOAROS_MAX_CPUS > 1
 #include <kernel/sched_runqueue.h>
 #endif
@@ -26,6 +27,9 @@ struct kernel_cpu {
     /* 定位校验与本地raw状态靠近current；远程请求保留在记录尾部。 */
     struct kernel_raw_guard *raw_locks;
     uint32_t initialized, preempt_depth;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_cpu cost;
+#endif
     struct kernel_task *switch_previous;
     /* 由实际栈交接转移；current可提前发布下一任务。 */
     struct kernel_task *accounting_owner;
@@ -67,6 +71,9 @@ struct kernel_cpu {
 #endif
 #endif
 };
+#if BOAROS_COST_DIAGNOSTICS
+_Static_assert(offsetof(struct kernel_cpu, cost) == 32, "cost assembly CPU prefix");
+#endif
 #if BOAROS_MAX_CPUS > 1
 static inline int kernel_cpu_online(const struct kernel_cpu *cpu)
 { return __atomic_load_n(&cpu->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_ONLINE; }

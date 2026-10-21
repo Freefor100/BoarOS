@@ -18,7 +18,4 @@
 #if BOAROS_MAX_CPUS != 1 && BOAROS_MAX_CPUS != 2
 #error unsupported CPU capacity
 #endif
-#if BOAROS_MAX_CPUS > 1 && BOAROS_COST_DIAGNOSTICS
-#error SMP COST observation has not been implemented
-#endif
 #endif
