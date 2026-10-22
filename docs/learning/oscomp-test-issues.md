@@ -71,7 +71,7 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 | iozone 向量 I/O | 原命令 `./iozone -t 4 -i 11 -i 12 -r 1k -s 1m` 请求 pwritev/preadv，发布二进制却报 `Selected test not available on the version`，随后输出默认 initial writers/rewriters。 | 保留原命令；分析按实际输出判断。该次运行只证明默认写入路径完成，向量能力由独立 ABI 和原 preadv/pwritev 测例验证。 |
 | libc-test 脚本 | `run-static.sh`、`run-dynamic.sh` 没有 shebang；原 LA musl BusyBox 在固定 Linux 也拒绝直接执行，后面的程序尚未开始。 | 临时外层脚本用该 libc 自己的 BusyBox `sh` 显式解释这两行；内层列表和参数原样执行。 |
 | BusyBox 的 `kill 10` | judge 的固定清单要求此标签，发布 `busybox_cmd.txt` 实际执行 `sh -c 'sleep 5' & ./busybox kill $!`，成功标签按整行输出。judge 另补的 `kill 10` 因无对应标签得零。 | 保留原脚本和 judge；**54/55** 的差额按标签错位解释，后台 PID 的实际 kill 单列。 |
-| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench` 等会输出 TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。两架构 ftest 的实际内容与磁盘一致性已通过。 |
+| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench`、`sigaltstack01`等会输出TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。两架构 ftest 的实际内容与磁盘一致性已通过。 |
 | LTP 的 `FAIL LTP CASE … : 0` | 原脚本对每个返回码统一打印这行，名字中的 FAIL 也出现在成功退出时。 | 判读末尾状态及 Summary；保留原结束行作为 judge 的当前测例边界。 |
 
 iozone 的完整命令核对见[原脚本对照](oscomp-compat-baseline.md#2026-10-17-cpu0-存储分批与同步等待集成)。

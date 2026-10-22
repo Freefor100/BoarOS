@@ -2,6 +2,23 @@
 
 各日期节的“当前”“最终”和“本轮”均指该节固定内核与工作负载；最新机制见模块文档，各轮性能结论不跨版本转移。
 
+## sigaltstack原程序短例（2026-10-22）
+
+每线程备用栈、SA_ONSTACK、AUTODISARM与两架构sigreturn恢复已从main单向合入。实际机制和通用验证见[信号模块](../modules/kernel-signal.md#每线程备用栈)；固定18次普通路径及启用成本对照统一见[CPU成本文档](cpu-accounting-cost.md#备用信号栈普通路径与启用成本2026-10-22)。该批保留UP普通信号+3.80%、四核getpid+3.27%的超线项。
+
+固定官方容器断网构建，沿原QEMU参数并行运行两架构，每个架构依次运行glibc、musl的原sigaltstack01/02；仅外层枚举选择这两项。原ELF、libc、参数、judge、300秒单程序监督、3600秒总体预算及跳过表保持原值。全部8次程序退出0，无超时，无准备失败。
+
+下表分别列程序细项成功数、原judge得分／计分总数、整条程序耗时ms。
+
+| 原程序 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---|---|---|---|
+| sigaltstack01 | 1项成功；0/0分；84ms | 1项成功；0/0分；66ms | 1项成功；0/0分；85ms | 1项成功；0/0分；61ms |
+| sigaltstack02 | 2项成功；2/2分；104ms | 2项成功；2/2分；62ms | 2项成功；2/2分；86ms | 2项成功；2/2分；64ms |
+
+`sigaltstack01`实际输出`Functionality of sigaltstack() successful`及1条TPASS，未输出`Summary:`；原judge只从该汇总段读取passed，因此给0/0。`sigaltstack02`的两项分别是非法标志返回EINVAL、尺寸小于架构最小值返回ENOMEM，均进入Summary并各计1分。原脚本末尾的`FAIL LTP CASE … : 0`是统一结束行，末尾0为实际成功退出。判分差异统一索引见[测例问题](oscomp-test-issues.md#原脚本调用与判分差异)。
+
+本次原程序只检查其自身包含的步骤；完整嵌套、AUTODISARM、坏栈、修改uc_stack、线程／exec及跨核构帧交错由通用短例覆盖。正常退出后，两架构各根盘及工具ext4／VFAT／scratch ext4三个分区共8个对象只读检查均为0，启动种子槽已擦除，默认交付内核恢复为同一次默认构建的相同字节。原记录、容器与内核身份保存在`build/sigaltstack/original/`；运行副本在检查后清理。
+
 ## eventfd与timerfd（2026-10-22）
 
 ### 能力、结果与剩余问题
