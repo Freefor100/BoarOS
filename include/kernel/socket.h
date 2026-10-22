@@ -43,6 +43,11 @@ struct kernel_socket_write_request {
     void *packet;
     struct kernel_open_file_description *pin;
     struct kernel_open_file_description **pin_owner;
+    struct kernel_socket_write_request *active_next, **active_previous;
+    const struct kernel_socket_address *destination;
+    void *protocol_address;
+    uint64_t payload_size;
+    uint8_t operation, queued;
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);

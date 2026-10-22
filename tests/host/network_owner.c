@@ -20,6 +20,13 @@ static _Thread_local unsigned reservation_actor;
 static pthread_mutex_t reservation_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reservation_changed=PTHREAD_COND_INITIALIZER;
 static unsigned reservation_first, reservation_second, reservation_release;
+static struct kernel_socket_write_request *remote_write;
+static pthread_mutex_t remote_gate=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t remote_changed=PTHREAD_COND_INITIALIZER;
+static unsigned remote_work,remote_done,remote_mode,remote_testing;
+static unsigned copy_waiting,copy_release,stop_waiting,stop_done,stop_borrows;
+static struct kernel_socket *remote_socket;
+static _Thread_local struct kernel_task *remote_task;
 static void reservation_arrive(void)
 {
     CHECK(!pthread_mutex_lock(&reservation_gate));
@@ -94,7 +101,7 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
 static int work_pending_snapshot(void)
 { struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope); int result=kernel_socket_work_pending(); kernel_socket_protocol_leave(&scope); return result; }
 struct kernel_io_context *kernel_io_context_current(void) { return &test_context; }
-struct kernel_task *kernel_task_current(void) { return NULL; }
+struct kernel_task *kernel_task_current(void) { return remote_task; }
 enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task, uint32_t signal, kernel_pid_t sender)
 { (void)task; (void)signal; (void)sender; abort(); }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
@@ -146,27 +153,49 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
 
 struct kernel_socket *kernel_open_file_socket(struct kernel_open_file_description *f)
 { return (struct kernel_socket *)(uintptr_t)f; }
+enum kernel_open_file_status kernel_open_file_acquire(struct kernel_open_file_description *f)
+{CHECK(remote_testing && f==(void *)remote_socket);stop_borrows++;return KERNEL_OPEN_FILE_STATUS_OK;}
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **f)
-{ CHECK(allow_ofd_release && f && *f);--allow_ofd_release;*f=0;return KERNEL_OPEN_FILE_STATUS_OK; }
+{ CHECK(f && *f);
+  if(stop_borrows && *f==(void *)remote_socket)stop_borrows--;
+  else {CHECK(allow_ofd_release);--allow_ofd_release;}
+  *f=0;return KERNEL_OPEN_FILE_STATUS_OK; }
 enum kernel_task_status kernel_task_socket_write_register(struct kernel_task *t, struct kernel_socket_write_request *r)
-{ (void)t; (void)r; abort(); }
+{CHECK(remote_testing && t==remote_task && (!remote_write || remote_write==r));remote_write=r;return KERNEL_TASK_STATUS_OK;}
 enum kernel_task_status kernel_task_socket_write_clear(struct kernel_task *t, struct kernel_socket_write_request *r)
-{ (void)t; (void)r; abort(); }
+{CHECK(remote_testing && t==remote_task && remote_write==r);remote_write=NULL;return KERNEL_TASK_STATUS_OK;}
 enum kernel_task_status kernel_task_socket_read_register(struct kernel_task *t, struct kernel_socket_read_request *r)
 { (void)t;(void)r;CHECK(reservation_actor);reservation_arrive();return KERNEL_TASK_STATUS_OK; }
 enum kernel_task_status kernel_task_socket_read_clear(struct kernel_task *t, struct kernel_socket_read_request *r)
 { (void)t;(void)r;return KERNEL_TASK_STATUS_OK; }
 void kernel_signal_note_syscall_restart(struct kernel_task *t) { (void)t; abort(); }
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
-{ (void)q;(void)d;(void)i;(void)t;abort(); }
+{ (void)q;(void)d;(void)i;CHECK(remote_write);*t=(struct kernel_wait_token){(void *)remote_write,1};return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
-{ (void)t;(void)r;abort(); }
+{
+    (void)t;CHECK(remote_testing && !kernel_cpu_current()->raw_locks);
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    int stopping_actor=!kernel_cpu_current()->logical_id;
+    if(stopping_actor) {stop_waiting=1;CHECK(!pthread_cond_broadcast(&remote_changed));}
+    for(;;) {
+        int pending;{SOCKET_STATE(state);pending=stopping_actor?remote_socket->active_writes!=NULL:remote_write->queued;}
+        if(!pending)break;
+        CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    }
+    CHECK(!pthread_mutex_unlock(&remote_gate));*r=KERNEL_WAIT_WOKEN;return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
-{ (void)t;abort(); }
+{CHECK(remote_testing && t->generation);*t=(struct kernel_wait_token){0};return KERNEL_SCHEDULER_STATUS_OK;}
 enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,uint64_t in,size_t n,size_t *copied)
 {
-    (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
+    (void)m;CHECK(!caller_owns_protocol() && !kernel_cpu_current()->raw_locks);*copied=n<user_remaining?n:user_remaining;
     memcpy(out,(void *)(uintptr_t)in,*copied);
+    if(remote_testing && remote_mode==3) {
+        CHECK(!pthread_mutex_lock(&remote_gate));copy_waiting=1;
+        CHECK(!pthread_cond_broadcast(&remote_changed));
+        while(!copy_release)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        CHECK(!pthread_mutex_unlock(&remote_gate));
+    }
     if (shutdown_during_copy) {
         struct kernel_socket *peer=shutdown_during_copy;shutdown_during_copy=0;
         CHECK(!kernel_socket_shutdown(peer,1));
@@ -181,7 +210,7 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,u
 
 enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m,uint64_t out,const void *in,size_t n,size_t *copied)
 {
-    (void)m;CHECK(!protocol_depth);*copied=n<user_remaining?n:user_remaining;
+    (void)m;CHECK(!caller_owns_protocol() && !kernel_cpu_current()->raw_locks);*copied=n<user_remaining?n:user_remaining;
     memcpy((void *)(uintptr_t)out,in,*copied);
     if(user_remaining!=SIZE_MAX)user_remaining-=*copied;
     return *copied==n?KERNEL_UACCESS_STATUS_OK:KERNEL_UACCESS_STATUS_FAULT;
@@ -191,7 +220,7 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(struct kernel_mm *mm
     struct kernel_uaccess_write_cursor *pages,uint64_t out,const void *in,size_t count,size_t *copied)
 { (void)pages; return kernel_copy_to_user(mm,out,in,count,copied); }
 void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *pages)
-{ (void)pages; CHECK(!protocol_depth); }
+{ (void)pages; CHECK(!caller_owns_protocol() && !kernel_cpu_current()->raw_locks); }
 
 static err_t physical_output(struct netif *interface, struct pbuf *packet, const ip4_addr_t *destination)
 { (void)destination; return link_output(interface, packet); }
@@ -903,6 +932,94 @@ static void endpoint_ownership(void)
 }
 
 
+
+static void remote_work_ready(void *context)
+{
+    CHECK(context==&remote_work && !kernel_cpu_current()->raw_locks);
+    CHECK(!pthread_mutex_lock(&remote_gate));remote_work=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+}
+static void *remote_writer(void *argument)
+{
+    struct kernel_socket *socket=argument;kernel_cpu_current()->logical_id=1;
+    struct kernel_open_file_description *pin=(void *)socket;
+    remote_task=(void *)&test_context;
+    if(!remote_mode || remote_mode==4) {
+        struct kernel_socket_write_request request={0};
+        kernel_socket_stream_begin(&request,&pin);
+        CHECK(kernel_socket_stream_reserve(&request,1,0)==1);
+        CHECK(kernel_socket_stream_commit(&request,"r",1,0)==(remote_mode==4?-KERNEL_EIO:1));
+        kernel_socket_stream_finish(&request);
+    } else {
+        const struct kernel_uaccess_iovec iov={(uintptr_t)"r",1};
+        int result=kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,1,0,NULL);
+        CHECK(result==(remote_mode==2?-KERNEL_EFAULT:remote_mode==3?-KERNEL_EIO:1));
+    }
+    CHECK(pin==(void *)socket && !remote_write);remote_task=NULL;
+    CHECK(!pthread_mutex_lock(&remote_gate));remote_done=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    return NULL;
+}
+static void *remote_stopper(void *unused)
+{
+    (void)unused;kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    CHECK(!pthread_mutex_lock(&remote_gate));stop_done=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));return NULL;
+}
+static void remote_protocol_request(unsigned mode)
+{
+    remote_testing=1;remote_mode=mode;
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    if(!mode || mode==4)connected_pair(&listener,&client,&server);
+    else {
+        struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24017,.bytes={127,0,0,1}};
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&server));
+        CHECK(!kernel_socket_bind(server,&address));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&client));
+        CHECK(!kernel_socket_connect(client,&address,0));
+        if(mode==2)user_remaining=0;
+    }
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    kernel_socket_network_hooks(NULL,remote_work_ready,NULL,&remote_work);
+    remote_socket=client;
+    pthread_t thread,stopper;unsigned stop_started=0;
+    CHECK(!pthread_create(&thread,NULL,remote_writer,client));
+    for(;;) {
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        while(!remote_work && !remote_done && !(mode==3 && copy_waiting && !stop_started))
+            CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        int done=remote_done;
+        int start_stop=!stop_started && ((mode==3 && copy_waiting) || (mode==4 && remote_work));
+        remote_work=0;CHECK(!pthread_mutex_unlock(&remote_gate));
+        if(done)break;
+        if(start_stop) {
+            stop_started=1;CHECK(!pthread_create(&stopper,NULL,remote_stopper,NULL));
+            CHECK(!pthread_mutex_lock(&remote_gate));
+            while(!stop_waiting)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+            CHECK(!stop_done && stop_borrows==1);
+            {SOCKET_STATE(state);CHECK(client->active_writes && client->active_writes->pin==(void *)client);
+             if(mode==3)CHECK(client->active_writes->protocol_payload && !client->active_writes->queued);
+             else CHECK(client->active_writes->queued && client->active_writes->segments);}
+            copy_release=1;CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+        }
+        kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    }
+    CHECK(!pthread_join(thread,NULL));remote_write=NULL;
+    if(stop_started) {CHECK(!pthread_join(stopper,NULL));CHECK(stop_done && !stop_borrows);}
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(server->rx_bytes==(mode>=2?0:1) && !client->tx_reserved && !client->writes_head && !client->active_writes);
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    if(client->tcp)tcp_abort(client->tcp);
+    if(server->tcp)tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    kernel_socket_destroy(client);kernel_socket_destroy(server);if(listener)kernel_socket_destroy(listener);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    printf("PASS remote protocol %u: CPU1 copies/waits, CPU0 executes, request/OFD/payload returned\n",mode);
+}
+
 struct reservation_attempt {struct kernel_socket *socket;struct kernel_socket_read_request read;struct kernel_open_file_description *pin;int result;unsigned actor;};
 static void *reserve_concurrently(void *argument)
 {
@@ -935,9 +1052,14 @@ static void concurrent_reservation(void)
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "concurrent-reservation")) {concurrent_reservation();return 0;}
-    if (!strcmp(argv[1], "protocol-owner")) { protocol_ownership(); return 0; }
-    if (!strcmp(argv[1], "endpoint-owner")) endpoint_ownership();
+    if (!strcmp(argv[1], "remote-protocol")) remote_protocol_request(0);
+    else if (!strcmp(argv[1], "remote-udp")) remote_protocol_request(1);
+    else if (!strcmp(argv[1], "remote-udp-fault")) remote_protocol_request(2);
+    else if (!strcmp(argv[1], "remote-udp-stop")) remote_protocol_request(3);
+    else if (!strcmp(argv[1], "remote-copy-stop")) remote_protocol_request(4);
+    else if (!strcmp(argv[1], "concurrent-reservation")) {concurrent_reservation();return 0;}
+    else if (!strcmp(argv[1], "protocol-owner")) { protocol_ownership(); return 0; }
+    else if (!strcmp(argv[1], "endpoint-owner")) endpoint_ownership();
     else if (!strcmp(argv[1], "receive-chains")) receive_packet_chains();
     else if (!strcmp(argv[1], "receive-prefix")) receive_prefix();
     else if (!strcmp(argv[1], "protocol-transaction")) protocol_transaction();

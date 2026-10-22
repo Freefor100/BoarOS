@@ -299,13 +299,15 @@ int kernel_network_stop(struct kernel_network **owner)
     struct kernel_network *n = *owner;
     uintptr_t irq = arch_interrupt_save();
     int first_stop = !n->stopping;
-    n->stopping = 1;
     if (n->device) n->device->stopping = 1;
     (void)kernel_wait_queue_wake_all(progress(n));
     kernel_assert_can_block();
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
     /* Close queued admission and finish pinned callers before joining the worker. */
     if (first_stop) kernel_socket_network_hooks(0, 0, 0, 0);
+    uintptr_t stopped_irq=arch_interrupt_save();
+    n->stopping=1;(void)kernel_wait_queue_wake_all(progress(n));
+    arch_interrupt_restore(stopped_irq);
     if (n->worker.task) kernel_thread_join(&n->worker);
     if (n->device && virtio_net_quiesce(n->device)) { arch_interrupt_restore(irq); return -KERNEL_EIO; }
     if (n->attached) {
