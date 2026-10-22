@@ -1376,6 +1376,11 @@ tcp_output(struct tcp_pcb *pcb)
     }
     snd_nxt = lwip_ntohl(seg->tcphdr->seqno) + TCP_TCPLEN(seg);
     if (TCP_SEQ_LT(pcb->snd_nxt, snd_nxt)) {
+      /* Minshall: an outstanding full segment does not hold a first small
+       * segment. Failed output/retransmission must not move this boundary. */
+      if (seg->len && seg->len < tcp_mss(pcb)) {
+        pcb->snd_sml = snd_nxt;
+      }
       pcb->snd_nxt = snd_nxt;
     }
     /* put segment on unacknowledged list if length > 0 */

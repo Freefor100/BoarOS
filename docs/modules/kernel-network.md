@@ -24,9 +24,9 @@ IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的
 
 端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护。同一状态修改中的队列发布、额度查询及更新复用外层保护；嵌套 guard 只记录借用，通知游标仅由实际持锁者初始化和维护。RV 用户的 read/write/readv/writev、sendto/recvfrom/sendmsg/recvmsg 和普通文件到 socket 的 sendfile 在发起 CPU 执行：用户复制、接收预约、发送额度和等待属于原调用者。创建、连接、监听、accept、配置、shutdown、最终销毁以及 lwIP 协议工作继续在 CPU0。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
 
-短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 在自己的外层 scope 中调用 `kernel_socket_service_owned`，沿同一资格登记等待；独立调用者使用 `kernel_socket_service_pending` 取得资格。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队；预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
+短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 在自己的外层 scope 中调用 `kernel_socket_service_owned`，沿同一资格登记等待；独立调用者使用 `kernel_socket_service_pending` 取得资格。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队。服务先按包预算消费旧输入，再处理 socket 工作；后者产生的新回环包使用本批尚余的包预算交付，预算总量保持原值。预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
 
-`kernel_socket_protocol_enter/leave` 用栈上 scope 保存 IRQ 状态与 mutex guard。最外层取得任务 mutex 并开放 IRQ，同一 owner 的同步回调只增加嵌套深度。lwIP 的 PCB、协议池、接口、重试链与 loopback 由该 owner 串行；用户复制、端点查询和设备等待不占用它。持有期间的 allocation_depth 禁止堆回收进入 I/O。NIC IRQ 只收割并通知，timer IRQ 只请求已有 worker 工作。
+`kernel_socket_protocol_enter/leave` 用栈上 scope 保存 IRQ 状态与 mutex guard。最外层取得任务 mutex 并开放 IRQ，同一 owner 的同步回调只增加嵌套深度。lwIP 的 PCB、协议池、接口、重试链与 loopback 由该 owner 串行；用户复制、端点查询和设备等待不占用它。协议池归还代次和 pool 等待链归 CPU0 协议 owner 维护，每次真实资源归还推进代次；存在等待者时才取得端点保护并通知 worker，普通 pbuf 归还直接处理 owner 私有状态。持有期间的 allocation_depth 禁止堆回收进入 I/O。NIC IRQ 只收割并通知，timer IRQ 只请求已有 worker 工作。
 
 读预约持有 OFD 和固定队列前缀，用户复制在保护外完成。finish 在 IRQ 开启时找到消费边界，短临界区一次摘下前缀，并把原 packet 与接收窗口额度转交已有 worker。worker 在协议保护内归还 pbuf 和 `tcp_recved`；最后关闭也排空这些实际引用。RX loan 因此一直保留到 pbuf 最后归还，不能在用户复制完成前复用 DMA 缓冲。AF_UNIX 载荷在端点临界区外释放；关闭清理结束后才把发送者的末次释放权交给剩余 packet。
 
@@ -36,9 +36,8 @@ socket 在最终 OFD 释放时取得协议资格，先摘除弱引用工作链�
 
 `netif_loop_output()` 在成功发布完整回环包队列后调用可选的
 `LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，经端口进入 `protocol_work_ready()`，设置软件
-待处理状态并请求 worker 唤醒；该回调不消费包或重入 raw API。分配/复制失败不
-发布通知。尤其当 socket/timer 阶段在本批 loopback 服务之后产生新包时，服务
-返回值必须保持 runnable，不能依赖下一次定时器重新发现队列。
+待处理状态；从无包变为有包时请求 worker 唤醒，已有待处理包时合并通知。每次轮询结束按真实剩余队列更新状态，包含同批产生又被消费的 ACK。该回调不消费包或重入 raw API。分配/复制失败不
+发布通知。socket/timer 阶段产生的新包若未被本批余量消费，服务返回值保持 runnable，由 worker 继续推进。
 `make test-lwip-host` 已纳入真实 lwIP/端口/socket 的 `loopback-work` 反例：固定
 协议时钟，覆盖 IPv4/IPv6、晚入队、OOM 与重试、内容交付和内存基线。
 
@@ -111,7 +110,7 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 
 ## 发起 CPU 与等待寿命
 
-TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖 CPU0 的实际 COPY 接纳。排队请求使用自己的等待 token，端点锁内登记、发布 result/queued 并定向通知；锁外 park/finish。ACK 和发送额度变化只通知 socket 就绪等待者，避免尚未完成 COPY 的请求被反复唤醒。请求入工作集合只登记待服务，STREAM 的 IO_MORE、窗口耗尽及明确 FLUSH 决定何时输出。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。调用者只在完成状态发布之后归还请求、pin 和 OFD。单核及 CPU0 空闲协议资格保留直接调用。
+TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖 CPU0 的实际 COPY 接纳。排队请求使用自己的等待 token，端点锁内登记、发布 result/queued 并定向通知；锁外 park/finish。ACK 和发送额度变化只通知 socket 就绪等待者，避免尚未完成 COPY 的请求被反复唤醒。请求入工作集合只登记待服务，STREAM 的 IO_MORE、窗口耗尽及明确 FLUSH 决定何时输出。服务先处理此前捕获的 OUTPUT，再接纳新 COPY，保留新前缀的合批资格；纯 tcp_write 成功不产生生命周期回收工作，真实输入和关闭仍负责安排回收。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。调用者只在完成状态发布之后归还请求、pin 和 OFD。单核及 CPU0 空闲协议资格保留直接调用。
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
 
@@ -212,7 +211,7 @@ python3 -B tests/network-consumers.py --only boaros --libc both --suite both --c
 只有 COST 构建提供只读 `/proc/boaros_net_stats`，复用现有协议统计，不保存对象
 引用。TCP写入调用/字节为64位，lwIP包/错误计数为16位，会环绕，不能当作大流量
 窗口的完整总包数；pool用量和高水位是即时值。窗口仍使用已有 cost v1 schema，
-协议排队次数、park 次数、排队到完成的累计 ticks 与实际协议执行 ticks 分开记录，前者包含调度和执行，不能与后者相加。聚合存储沿用内核的编译期预算约束，默认构建没有新增诊断节点。观测影响吞吐，关闭
+协议排队次数、park 次数、排队到完成的累计 ticks 与实际协议执行 ticks 分开记录；排队等待进一步分出入队至执行、完成至调用者恢复，两者包含调度和状态锁等待。多任务累计时间与墙钟分别解释，排队总量已包含执行部分。聚合存储沿用内核的编译期预算约束，默认构建没有新增诊断节点。观测影响吞吐，关闭
 观测的独立批次才是性能结果。此前纠错轮1179条ABI、完整RV64、真实musl/glibc 2.44、
 socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept输出fault、
 TCP MSG_TRUNC、UDP自动端口释放，IRQ仅通知由独立heap包装器检查。
@@ -288,6 +287,8 @@ TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect �
 
 
 ## TCP 发送接纳与复制（2026-10-05）
+
+TCP 默认采用 Nagle 的 Minshall 规则，与固定 Linux `tcp_minshall_check/update` 的边界一致：已经发出的完整 MSS 包不阻止第一个小包，尚未确认的小包会阻止后续小包。PCB 尾部记录最后一个新发小包的结束序列；主动／被动建连初始化该字段，实际输出成功才推进，重传和输出失败保留原值。判断使用 TCP 序列号比较，覆盖 32 位回绕；累计 ACK 越过该边界后解除等待。这样保留小包合并，同时减少整 MSS 在途数据与延迟 ACK 组合产生的等待。
 
 开启 `TCP_NODELAY` 时先禁用 Nagle，再立即尝试输出已有 unsent 数据。NIC 暂无容量时登记原有 NIC 容量等待，协议内存不足时使用原有 pool 等待；容量事件推动重试，不依赖收到 ACK 或推进定时器。关闭 NODELAY 只恢复 Nagle。用户数据报发送使用任务登记的请求和 iovec cursor，退出清理沿同一请求归还 OFD 和包引用。
 

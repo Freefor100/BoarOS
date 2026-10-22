@@ -1153,6 +1153,7 @@ tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port,
   pcb->rcv_nxt = 0;
   pcb->snd_nxt = iss;
   pcb->lastack = iss - 1;
+  pcb->snd_sml = pcb->lastack;
   pcb->snd_wl2 = iss - 1;
   pcb->snd_lbb = iss - 1;
   /* Start with a window that does not need scaling. When window scaling is
