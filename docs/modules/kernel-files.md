@@ -488,3 +488,9 @@ RV继续由files/userland的pipe、FIFO、poll、取消和引用测试保护。
 普通文件的标量 read/write/pread/pwrite 在限长前检查原始数值范围，空范围允许 NULL 和用户地址上界，拒绝高于上界的地址；通用零长度 uaccess 不改变。
 数值拒绝发生在复制、偏移及文件时间修改之前。socket sendto/recvfrom 则沿 Linux import_ubuf 先限长再检查，实际 iovec 使用同一限长值。
 `make test-abi-boundary-riscv test-abi-boundary-loongarch TEST_MEMORIES="512M 1G"` 以同一 ELF 对照固定 Linux，检查溢出无接纳、空范围、共享 OFD 标志和消息拒绝后的队列内容。
+
+## eventfd计数对象
+
+`eventfd2`创建独立的匿名OFD，dup、fork和共享FD表均引用同一计数。普通read取走全部计数，EFD_SEMAPHORE每次取走1；写入总和上限为UINT64_MAX−1，非阻塞的空读或额度不足返回EAGAIN。计数及登记由对象短锁保护，用户复制、缺页、唤醒和休眠在锁外。read在复制前消费计数，输出EFAULT保留已消费的状态；write先完整取得8字节输入再接纳。readv跨向量组成一次8字节读取，writev沿Linux的逐向量write规则接纳完成前缀。
+
+读写和就绪查询在发起CPU执行，epoll复用现有控制与关闭关联协议。无epoll观察者的末次关闭本地完成，有关联时由现有CPU0路径先拆除。匿名对象通过fstat及`/proc/<pid>/fd`显示身份；pread/pwrite返回ESPIPE，lseek保留Linux的noop行为。

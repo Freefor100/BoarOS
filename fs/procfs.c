@@ -556,15 +556,17 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "socket:[";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_EPOLL)
                 prefix = "anon_inode:[eventpoll]";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_EVENTFD)
+                prefix = "anon_inode:[eventfd]";
             else prefix = 0;
-            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL &&
+            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD &&
                             !identity)) result = -KERNEL_ENOENT;
             else {
                 char display[64];
                 prefix_length = strlen(prefix);
                 memcpy(display, prefix, prefix_length);
                 size_t length = prefix_length;
-                if (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL) {
+                if (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD) {
                     length += decimal(display + length, identity);
                     display[length++] = ']';
                 }

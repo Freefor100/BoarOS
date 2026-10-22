@@ -329,6 +329,7 @@ COMMON_C_SOURCES := \
 	fs/files/console.c \
 	fs/files/poll.c \
 	fs/files/epoll.c \
+	fs/event_fd.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
@@ -385,6 +386,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/socket.c \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
+	kernel/syscall/event.c \
 	kernel/syscall/capability.c \
 	kernel/syscall/random.c \
 	kernel/syscall/log.c \
