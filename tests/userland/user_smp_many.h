@@ -3,7 +3,7 @@
 static _Thread_local unsigned many_signals;
 static atomic_uint many_virtual, many_prof;
 struct many_cpu_work {
-    unsigned cpu;
+    unsigned cpu, exclusive;
     pthread_barrier_t *barrier;
     unsigned char *shared;
     uint64_t checksum, cpu_ns;
@@ -40,6 +40,10 @@ static void *many_cpu_worker(void *argument)
     CHECK(!mprotect(private,4096,PROT_READ) && private[0]==91 &&
         !mprotect(private,4096,PROT_READ|PROT_WRITE));
     private[0]=92;CHECK(!munmap(private,4096));
+    many_barrier(w->barrier);
+    int common=open("/many-common",O_CREAT|O_EXCL|O_RDWR,0600);
+    if(common>=0) {w->exclusive=1;CHECK(!close(common));}
+    else CHECK(errno==EEXIST);
     char directory[48],name[80];snprintf(directory,sizeof(directory),"/many-cpu-%u",w->cpu);
     CHECK(!mkdir(directory,0700));
     for(unsigned i=0;i<16;i++) {
@@ -47,6 +51,8 @@ static void *many_cpu_worker(void *argument)
         int fd=open(name,O_CREAT|O_EXCL|O_RDWR,0600);CHECK(fd>=0);
         unsigned char byte=(unsigned char)(33+w->cpu);
         CHECK(pwrite(fd,&byte,1,0)==1 && !ftruncate(fd,4096));
+        /* Keep all four records live until the parent checks their names/data. */
+        if(!i) {many_barrier(w->barrier);many_barrier(w->barrier);}
         unsigned char *mapped=mmap(NULL,4096,PROT_READ,MAP_SHARED,fd,0);
         CHECK(mapped!=MAP_FAILED && mapped[0]==byte && !unlink(name));
         CHECK(!ftruncate(fd,0));expected_fault=SIGBUS;
@@ -82,7 +88,19 @@ static void many_cpu_consumers(void)
     struct many_cpu_work work[4]={0};pthread_t threads[4];
     for(unsigned i=0;i<count;i++) {work[i]=(struct many_cpu_work){.cpu=i,.barrier=&gate,.shared=shared};CHECK(!pthread_create(&threads[i],NULL,many_cpu_worker,&work[i]));}
     many_barrier(&gate);
+    many_barrier(&gate);many_barrier(&gate);
+    ino_t inodes[4];
+    for(unsigned i=0;i<count;i++) {
+        char name[80];snprintf(name,sizeof(name),"/many-cpu-%u/file-0",i);
+        int fd=open(name,O_RDONLY);struct stat st;unsigned char byte=0;
+        CHECK(fd>=0 && !fstat(fd,&st) && st.st_size==4096 &&
+            pread(fd,&byte,1,0)==1 && byte==33+i && !close(fd));
+        inodes[i]=st.st_ino;for(unsigned j=0;j<i;j++)CHECK(inodes[i]!=inodes[j]);
+    }
+    many_barrier(&gate);
     for(unsigned i=0;i<count;i++)CHECK(!pthread_join(threads[i],NULL) && work[i].checksum==work[0].checksum && work[i].checksum && shared[i*64]==71+i);
+    unsigned winners=0;for(unsigned i=0;i<count;i++)winners+=work[i].exclusive;
+    CHECK(winners==1 && !unlink("/many-common"));
     CHECK(atomic_load(&many_virtual) && atomic_load(&many_prof));
     CHECK(!setitimer(ITIMER_VIRTUAL,&zero,NULL) && !setitimer(ITIMER_PROF,&zero,NULL));
     struct timespec timeout={0};
