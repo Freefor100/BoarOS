@@ -301,13 +301,18 @@ static void receive_capacity(void)
 }
 static void protocol_work_ready(void)
 {
-    SOCKET_STATE(state);loopback_pending=1;socket_work_ready_locked();
+    /* loopback队列只有协议owner生产/消费；已有待处理包时不重复通知。 */
+    if(loopback_pending)return;
+    loopback_pending=1;
+    SOCKET_STATE(state);socket_work_ready_locked();
 }
 static void protocol_capacity(int pool)
 {
     if (pool != -1 && pool != MEMP_TCP_SEG && pool != MEMP_PBUF && pool != MEMP_PBUF_POOL) return;
-    SOCKET_STATE(state);pool_generation++;
-    if(pool_wait.head)socket_work_ready_locked();
+    /* 协议池及其等待链归CPU0协议owner；只在实际有等待者时触碰
+     * 跨核端点状态与worker通知存储，真实归还仍逐次推进代次。 */
+    pool_generation++;
+    if(pool_wait.head) {SOCKET_STATE(state);socket_work_ready_locked();}
 }
 static void protocol_input(struct tcp_pcb *pcb)
 {
@@ -1874,6 +1879,9 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
     if(request->queued || request->next || !request->pin)__builtin_trap();
     COST_SCOPE(queued, NETWORK_PROTOCOL_QUEUE_TICKS);
     COST_ADD(NETWORK_PROTOCOL_QUEUED, 1);
+#if BOAROS_COST_DIAGNOSTICS
+    request->queued_ticks=kernel_cost_clock();
+#endif
     request->queued=1;
     if(socket->writes_tail)socket->writes_tail->next=request;else socket->writes_head=request;
     /* 入队只发布待服务请求；STREAM/FLUSH 按实际窗口与 IO_MORE 决定输出。 */
@@ -1887,6 +1895,10 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
         if(kernel_wait_finish(&request->completion)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
         arch_interrupt_restore(interrupts);socket_state_acquire(&state);
     }
+#if BOAROS_COST_DIAGNOSTICS
+    COST_ADD(NETWORK_PROTOCOL_DISPATCH_TICKS,request->executing_ticks-request->queued_ticks);
+    COST_ADD(NETWORK_PROTOCOL_RESUME_TICKS,kernel_cost_clock()-request->completed_ticks);
+#endif
     return request->result;
 }
 int kernel_socket_stream_commitv(struct kernel_socket_write_request *request,
@@ -1931,7 +1943,6 @@ static int tcp_write_buffer_locked(struct kernel_socket *socket,
         /* 单次gather请求先填接纳窗口；末批、窗口满或finish退出时再发送。 */
         if (!(flags & KERNEL_SOCKET_IO_MORE) || tcp_protocol_budget(socket) <= others)
             tcp_flush_output(socket);
-        socket_schedule(socket, SOCKET_WORK_REAP);
     } else if (error == ERR_MEM) {
         /* The global segment/pbuf pool can be full even while sndbuf remains.
          * Hide POLLOUT until an ACK or a bounded protocol-timer retry. */
@@ -2314,7 +2325,13 @@ static void service_write(struct kernel_socket *socket)
     socket_state_release(&irq);
     int result;
     {SOCKET_STATE(state);result=network_stopping && request->operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
+#if BOAROS_COST_DIAGNOSTICS
+    request->executing_ticks=kernel_cost_clock();
+#endif
     if(!result)result=execute_protocol_request(request);
+#if BOAROS_COST_DIAGNOSTICS
+    request->completed_ticks=kernel_cost_clock();
+#endif
     socket_state_acquire(&irq);
     request->result = result;
     request->segments = 0;request->queued=0;
@@ -2335,7 +2352,6 @@ static int service_ready_socket(void)
     work_remove(&ready_work, socket);
     socket_state_release(&irq);
     retire_received(socket);
-    service_write(socket);
     if ((flags & SOCKET_WORK_LISTENER) && socket->listening) purge_dead_pending(socket);
     if ((flags & SOCKET_WORK_RECEIVE) && socket->receive_retry && socket->tcp && socket->tcp->refused_data)
         (void)tcp_process_refused_data(socket->tcp);
@@ -2348,6 +2364,9 @@ static int service_ready_socket(void)
             else socket_pool_wait(socket);
         }
     }
+    /* 已捕获的OUTPUT属于此前输入/重试；先完成它，再接纳新COPY，
+     * 避免旧标记把新请求仍可合批的IO_MORE前缀提前送入协议。 */
+    service_write(socket);
     SOCKET_STATE(state);
     uint32_t previous = tcp_admission_capacity_locked(socket);
     tcp_publish_capacity_locked(socket);
@@ -2383,6 +2402,18 @@ static int service_retry_deadline(void)
     return 1;
 }
 
+static void service_loopback(struct kernel_socket_service_result *result, unsigned budget)
+{
+    for (struct netif *netif = netif_list; netif; netif = netif->next) {
+        if (result->packets < budget)
+            result->packets += netif_poll_budget(netif, budget - result->packets);
+    }
+    /* 输入可产生又被本批消费的ACK；发布实际剩余队列，避免空转一轮。 */
+    loopback_pending = 0;
+    for (struct netif *netif = netif_list; netif; netif = netif->next)
+        if (netif->loop_first) loopback_pending = 1;
+}
+
 struct kernel_socket_service_result kernel_socket_service_owned(const struct kernel_socket_protocol_scope *scope,
     struct kernel_socket_service_budget budget)
 {
@@ -2393,13 +2424,8 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
     if (!scope->outer || protocol_owner != kernel_io_context_current() || protocol_depth != 1) __builtin_trap();
     if (!socket_initialized) return result;
     COST_ADD(NETWORK_SERVICE_CALLS, 1);
-    loopback_pending = 0;
-    for (struct netif *netif = netif_list; netif; netif = netif->next) {
-        if (result.packets < budget.packets)
-            result.packets += netif_poll_budget(netif, budget.packets - result.packets);
-        if (netif->loop_first) loopback_pending = 1;
-    }
-    /* 转交容量、到期重试和实际socket工作共用预算；轮转避免持续流量饿死另一类。 */
+    service_loopback(&result, budget.packets);
+    /* 容量、到期重试和实际socket工作共用额度，沿原游标轮转。 */
     while (result.sockets < budget.sockets) {
         int advanced = 0;
         for (unsigned i = 0; i < 3; i++) {
@@ -2412,6 +2438,10 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
         if (!advanced) break;
         result.sockets++;
     }
+    /* 先批量接收旧ACK归还额度；本批COPY/窗口更新产生了新包时，
+     * 使用尚未用完的原包预算交付，避免无谓地再等worker一次调度。 */
+    if (loopback_pending && result.packets < budget.packets)
+        service_loopback(&result, budget.packets);
     socket_timer_running = 1;
     result.timers = sys_check_timeouts_budget(budget.timers);
     socket_timer_running = 0;

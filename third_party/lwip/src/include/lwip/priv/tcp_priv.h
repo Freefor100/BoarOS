@@ -89,15 +89,17 @@ u32_t            tcp_update_rcv_ann_wnd(struct tcp_pcb *pcb);
 err_t            tcp_process_refused_data(struct tcp_pcb *pcb);
 
 /**
- * This is the Nagle algorithm: try to combine user data to send as few TCP
+ * Nagle with the Minshall rule: combine user data to send as few TCP
  * segments as possible. Only send if
- * - no previously transmitted data on the connection remains unacknowledged or
+ * - no previously transmitted small segment remains unacknowledged or
  * - the TF_NODELAY flag is set (nagle algorithm turned off for this pcb) or
  * - the only unsent segment is at least pcb->mss bytes long (or there is more
  *   than one unsent segment - with lwIP, this can happen although unsent->len < mss)
  * - or if we are in fast-retransmit (TF_INFR)
  */
 #define tcp_do_output_nagle(tpcb) ((((tpcb)->unacked == NULL) || \
+                            !TCP_SEQ_GT((tpcb)->snd_sml, (tpcb)->lastack) || \
+                            TCP_SEQ_GT((tpcb)->snd_sml, (tpcb)->snd_nxt) || \
                             ((tpcb)->flags & (TF_NODELAY | TF_INFR)) || \
                             (((tpcb)->unsent != NULL) && (((tpcb)->unsent->next != NULL) || \
                               ((tpcb)->unsent->len >= (tpcb)->mss))) || \

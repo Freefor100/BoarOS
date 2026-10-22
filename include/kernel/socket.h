@@ -49,6 +49,9 @@ struct kernel_socket_write_request {
     uint64_t payload_size;
     uint8_t operation, queued;
     struct kernel_wait_token completion;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t queued_ticks, executing_ticks, completed_ticks;
+#endif
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);

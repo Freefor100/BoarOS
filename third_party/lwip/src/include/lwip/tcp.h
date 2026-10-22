@@ -386,6 +386,8 @@ struct tcp_pcb {
   u8_t snd_scale;
   u8_t rcv_scale;
 #endif
+  /* End sequence of the last newly transmitted sub-MSS data segment. */
+  u32_t snd_sml;
 };
 
 #if LWIP_EVENT_API

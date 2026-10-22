@@ -684,6 +684,7 @@ tcp_listen_input(struct tcp_pcb_listen *pcb)
     npcb->snd_wl2 = iss;
     npcb->snd_nxt = iss;
     npcb->lastack = iss;
+    npcb->snd_sml = npcb->lastack;
     npcb->snd_lbb = iss;
     npcb->snd_wl1 = seqno - 1;/* initialise to seqno-1 to force window update */
     npcb->callback_arg = pcb->callback_arg;

@@ -17,7 +17,7 @@ static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
 static unsigned heap_allocations,protocol_services,allow_ofd_release;
-static _Thread_local unsigned reservation_actor;
+static _Thread_local unsigned reservation_actor,state_acquires;
 static pthread_mutex_t reservation_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reservation_changed=PTHREAD_COND_INITIALIZER;
 static unsigned reservation_first, reservation_second, reservation_release;
@@ -47,6 +47,7 @@ static void reservation_arrive(void)
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
+    if(lock==&socket_state_lock)state_acquires++;
     if(reservation_actor==2)reservation_arrive();
     __real_kernel_raw_lock_acquire(lock,guard);
 }
@@ -351,6 +352,7 @@ static void copy_capacity(unsigned eligible, unsigned gather)
         CHECK(kernel_socket_stream_reserve(&request,prefix,0)==(int)prefix);
         CHECK(kernel_socket_stream_commit(&request,"owner",prefix,KERNEL_SOCKET_IO_MORE)==(int)prefix);
         CHECK(!copy_attempts && !segment_attempts && !protocol_services);
+        CHECK(!work_pending_snapshot());
         if (gather==2) {
             CHECK(kernel_socket_stream_reserve(&request,3,0)==3);
             CHECK(kernel_socket_stream_commit(&request,"ner",3,0)==3);
@@ -696,11 +698,14 @@ static void loopback_work(void)
         /* 不运行 timer 或 inline service；真实入队必须发布可运行工作并请求唤醒。 */
         struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
         loopback_emit(&observation);
+        loopback_prepare(&observation);loopback_emit(&observation);
         kernel_socket_protocol_leave(&irq);
         CHECK(observation.error == ERR_OK && !observation.received);
-        CHECK(work_pending_snapshot() && observation.wakes);
+        CHECK(work_pending_snapshot() && observation.wakes==1);
         service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
-        CHECK(service.packets == 1 && !service.timers && observation.received == 1);
+        CHECK(service.packets == 1 && !service.timers && observation.received == 1 && service.runnable);
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
+        CHECK(service.packets == 1 && observation.received == 2 && !service.runnable);
 
         /* 模拟 protocol timer 在本批 loopback 阶段之后入队；返回值仍须报告新工作。 */
         unsigned before_wakes = observation.wakes;
@@ -709,9 +714,9 @@ static void loopback_work(void)
         service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 1});
         CHECK(observation.error == ERR_OK && service.packets == 0 && service.timers == 1);
         CHECK(service.runnable && work_pending_snapshot() && observation.wakes > before_wakes);
-        CHECK(observation.received == 1);
+        CHECK(observation.received == 2);
         service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
-        CHECK(service.packets == 1 && !service.timers && observation.received == 2);
+        CHECK(service.packets == 1 && !service.timers && observation.received == 3);
         CHECK(!service.runnable && !work_pending_snapshot());
 
         void *held[MEM_SIZE / 1024 + 128];
@@ -730,7 +735,7 @@ static void loopback_work(void)
         loopback_emit(&observation);
         kernel_socket_protocol_leave(&irq);
         CHECK(observation.error == ERR_MEM && observation.wakes == before_wakes);
-        CHECK(!work_pending_snapshot() && observation.received == 2);
+        CHECK(!work_pending_snapshot() && observation.received == 3);
         while (count) mem_free(held[--count]);
         CHECK(lwip_stats.mem.used == before_memory);
         loopback_prepare(&observation);
@@ -739,7 +744,7 @@ static void loopback_work(void)
         kernel_socket_protocol_leave(&irq);
         CHECK(observation.error == ERR_OK && work_pending_snapshot());
         service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
-        CHECK(service.packets == 1 && !service.timers && observation.received == 3);
+        CHECK(service.packets == 1 && !service.timers && observation.received == 4);
         udp_remove(observation.sender); udp_remove(receiver);
         kernel_socket_network_hooks(NULL, NULL, NULL, NULL);
         CHECK(clock_ns == frozen && lwip_stats.mem.used == initial_memory);
@@ -984,6 +989,56 @@ static void endpoint_ownership(void)
 
 
 
+static void pool_release_owner(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct pbuf *payload=pbuf_alloc(PBUF_RAW,64,PBUF_RAM);CHECK(payload && !pool_wait.head);
+    unsigned before=state_acquires;uint64_t generation=pool_generation;
+    pbuf_free(payload);
+    CHECK(state_acquires==before && pool_generation>generation);
+    kernel_socket_protocol_leave(&scope);
+    puts("PASS protocol pool release: actual pbuf ownership returned and capacity generation published without endpoint contention");
+}
+
+static void minshall_send(void)
+{
+    for(unsigned wrap=0;wrap<2;wrap++) {
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    static unsigned char bytes[TCP_MSS];memset(bytes,'m',sizeof(bytes));
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    client->tcp->cwnd=TCP_SND_BUF;
+    if(wrap) {
+        uint32_t sequence=UINT32_MAX-255U;
+        CHECK(!client->tcp->unacked && !client->tcp->unsent);
+        client->tcp->lastack=client->tcp->snd_nxt=client->tcp->snd_lbb=sequence;
+        client->tcp->snd_sml=client->tcp->snd_wl2=sequence;
+        server->tcp->rcv_nxt=sequence;
+        server->tcp->rcv_ann_right_edge=sequence+server->tcp->rcv_ann_wnd;
+        server->tcp->snd_wl1=sequence-1;
+    }
+    uint32_t start=client->tcp->snd_nxt;
+    CHECK(write_buffer(client,bytes,sizeof(bytes),0)==(int)sizeof(bytes));
+    CHECK(client->tcp->unacked && !client->tcp->unsent && client->tcp->snd_nxt==start+TCP_MSS);
+    CHECK(write_buffer(client,"x",1,0)==1);
+    CHECK(!client->tcp->unsent && client->tcp->snd_nxt==start+TCP_MSS+1);
+    CHECK(write_buffer(client,"y",1,0)==1);
+    CHECK(client->tcp->unsent && client->tcp->snd_nxt==start+TCP_MSS+1);
+    CHECK(write_buffer(client,bytes,TCP_MSS-1,0)==TCP_MSS-1);
+    CHECK(!client->tcp->unsent && client->tcp->snd_nxt==start+2*TCP_MSS+1);
+    CHECK(write_buffer(client,"z",1,0)==1 && client->tcp->unsent);
+    netif_poll_all();
+    CHECK(!client->tcp->unsent && server->rx_bytes==2*TCP_MSS+2);
+    if(client->tcp)tcp_abort(client->tcp);
+    if(server->tcp)tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(client);kernel_socket_destroy(server);kernel_socket_destroy(listener);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    }
+    puts("PASS Minshall: full packet permits first small packet, another small waits for ACK, full packet does not erase small-packet debt, no timer");
+}
+
 static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason)
 {
     CHECK(reason==KERNEL_WAIT_WOKEN && node->context==&remote_work && !kernel_cpu_current()->raw_locks);
@@ -995,12 +1050,12 @@ static void *remote_writer(void *argument)
     struct kernel_socket *socket=argument;kernel_cpu_current()->logical_id=1;
     struct kernel_open_file_description *pin=(void *)socket;
     remote_task=(void *)&test_context;
-    if(!remote_mode || remote_mode==4 || remote_mode==5) {
+    if(!remote_mode || remote_mode==4 || remote_mode==5 || remote_mode==6 || remote_mode==7) {
         struct kernel_socket_write_request request={0};
         kernel_socket_stream_begin(&request,&pin);
         CHECK(kernel_socket_stream_reserve(&request,1,0)==1);
-        CHECK(kernel_socket_stream_commit(&request,"r",1,remote_mode==5?KERNEL_SOCKET_IO_MORE:0)==(remote_mode==4?-KERNEL_EIO:1));
-        if(remote_mode==5) {
+        CHECK(kernel_socket_stream_commit(&request,"r",1,(remote_mode==5 || remote_mode==7)?KERNEL_SOCKET_IO_MORE:0)==(remote_mode==4?-KERNEL_EIO:1));
+        if(remote_mode==5 || remote_mode==7) {
             CHECK(!pthread_mutex_lock(&remote_gate));batch_waiting=1;
             CHECK(!pthread_cond_broadcast(&remote_changed));
             while(!batch_release)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
@@ -1027,7 +1082,7 @@ static void remote_protocol_request(unsigned mode)
 {
     remote_testing=1;remote_mode=mode;
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
-    if(!mode || mode==4 || mode==5)connected_pair(&listener,&client,&server);
+    if(!mode || mode==4 || mode==5 || mode==6 || mode==7)connected_pair(&listener,&client,&server);
     else {
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24017,.bytes={127,0,0,1}};
         CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&server));
@@ -1042,14 +1097,14 @@ static void remote_protocol_request(unsigned mode)
     kernel_socket_network_hooks(NULL,&model_work_queue,NULL,&remote_work);
     remote_socket=client;
     unsigned initial_xmit=lwip_stats.tcp.xmit;
-    pthread_t thread,stopper;unsigned stop_started=0;
+    pthread_t thread,stopper;unsigned stop_started=0,turns=0;
     CHECK(!pthread_create(&thread,NULL,remote_writer,client));
     for(;;) {
         CHECK(!pthread_mutex_lock(&remote_gate));
-        while(!remote_work && !remote_done && !(mode==3 && copy_waiting && !stop_started) && !(mode==5 && batch_waiting && !batch_release))
+        while(!remote_work && !remote_done && !(mode==3 && copy_waiting && !stop_started) && !((mode==5 || mode==7) && batch_waiting && !batch_release))
             CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
         int done=remote_done;
-        int inspect_batch=mode==5 && batch_waiting && !batch_release;
+        int inspect_batch=(mode==5 || mode==7) && batch_waiting && !batch_release;
         int start_stop=!stop_started && ((mode==3 && copy_waiting) || (mode==4 && remote_work));
         remote_work=0;CHECK(!pthread_mutex_unlock(&remote_gate));
         if(done)break;
@@ -1070,7 +1125,15 @@ static void remote_protocol_request(unsigned mode)
              else CHECK(client->active_writes->queued && client->active_writes->segments);}
             copy_release=1;CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
         }
-        kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+        if(mode==7 && !turns) {
+            /* 旧输入回调的OUTPUT早于当前排队COPY，本次IO_MORE仍须合批。 */
+            struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+            protocol_input(client->tcp);kernel_socket_protocol_leave(&scope);
+        }
+        struct kernel_socket_service_result service=kernel_socket_service_pending(
+            mode==6?(struct kernel_socket_service_budget){1,8,0}:(struct kernel_socket_service_budget){8,8,1});
+        if(mode==6 && !turns) CHECK(service.sockets==1 && service.packets && server->rx_bytes==1);
+        turns++;
         CHECK(!pthread_mutex_lock(&remote_gate));
         CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
     }
@@ -1168,6 +1231,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "stop-wait")) stopped_wait_notification();
     else if (!strcmp(argv[1], "remote-protocol")) remote_protocol_request(0);
     else if (!strcmp(argv[1], "remote-batch")) remote_protocol_request(5);
+    else if (!strcmp(argv[1], "remote-batch-ack")) remote_protocol_request(7);
+    else if (!strcmp(argv[1], "remote-turn")) remote_protocol_request(6);
     else if (!strcmp(argv[1], "remote-udp")) remote_protocol_request(1);
     else if (!strcmp(argv[1], "remote-udp-fault")) remote_protocol_request(2);
     else if (!strcmp(argv[1], "remote-udp-stop")) remote_protocol_request(3);
@@ -1179,6 +1244,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "receive-prefix")) receive_prefix();
     else if (!strcmp(argv[1], "protocol-transaction")) protocol_transaction();
     else if (!strcmp(argv[1], "nodelay")) nodelay_pending(0);
+    else if (!strcmp(argv[1], "minshall")) minshall_send();
     else if (!strcmp(argv[1], "nodelay-capacity")) nodelay_pending(1);
     else if (!strcmp(argv[1], "unix-payload")) unix_final_payload();
     else if (!strcmp(argv[1], "receive-payload")) receive_payload();
@@ -1186,6 +1252,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
     else if (!strcmp(argv[1], "tcp-batch")) copy_capacity(0,1);
+    else if (!strcmp(argv[1], "pool-release-owner")) pool_release_owner();
     else if (!strcmp(argv[1], "tcp-batch-last")) copy_capacity(0,2);
     else if (!strcmp(argv[1], "tcp-batch-abort")) copy_capacity(0,3);
     else if (!strcmp(argv[1], "tcp-batch-error")) copy_capacity(0,4);
