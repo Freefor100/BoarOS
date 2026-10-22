@@ -25,6 +25,10 @@ struct kernel_event_fd {
     uint64_t count;
     uint32_t semaphore;
 };
+struct kernel_counter_fd {
+    struct kernel_event_fd event;
+    struct kernel_wait_queue readers,writers;
+};
 static struct kernel_event_fd *event_of(struct kernel_open_file_description *file)
 { return (struct kernel_event_fd *)file; }
 
@@ -241,6 +245,10 @@ static int allocate_event(struct kernel_files *files,size_t size,uint32_t kind,u
     event->file.open_flags=2U|(flags&EVENT_NONBLOCK);
     kernel_mutex_init(&event->file.offset_lock,10,(uintptr_t)event);
     kernel_raw_lock_init(&event->lock,KERNEL_RAW_RANK_OBJECT);kernel_wait_queue_init(&event->waiters);
+    if (kind==KERNEL_OPEN_FILE_KIND_EVENTFD) {
+        struct kernel_counter_fd *counter=(void *)event;
+        kernel_wait_queue_init(&counter->readers);kernel_wait_queue_init(&counter->writers);
+    }
     *owner=event;return 0;
 }
 enum kernel_files_status kernel_files_eventfd_create(struct kernel_files *files,
@@ -249,7 +257,7 @@ enum kernel_files_status kernel_files_eventfd_create(struct kernel_files *files,
     if (!kernel_files_is_live(files)||!result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (flags&~(EVENT_SEMAPHORE|EVENT_NONBLOCK|EVENT_CLOEXEC)) { *result=-KERNEL_EINVAL;return 0; }
     struct kernel_event_fd *event=0;
-    int error=allocate_event(files,sizeof(*event),KERNEL_OPEN_FILE_KIND_EVENTFD,flags,&event);
+    int error=allocate_event(files,sizeof(struct kernel_counter_fd),KERNEL_OPEN_FILE_KIND_EVENTFD,flags,&event);
     if (error) { *result=error;return 0; }
     event->count=initial;event->semaphore=!!(flags&EVENT_SEMAPHORE);
     return install_event(files,event,flags,result);
@@ -262,24 +270,35 @@ void kernel_event_fd_close(struct kernel_open_file_description *file)
           timer_remove(timer);timer_publish(); }
         timer_changed();
     }
-    if (kernel_wait_queue_close(&event->waiters)) __builtin_trap();
+    struct kernel_wait_queue *queues[3]={&event->waiters,0,0};unsigned count=1;
+    if (!is_timer(event)) { struct kernel_counter_fd *counter=(void *)event;queues[1]=&counter->readers;queues[2]=&counter->writers;count=3; }
+    for(unsigned i=0;i<count;i++) if(kernel_wait_queue_close(queues[i])) __builtin_trap();
     /* A timer callback may already have selected a wait cursor before close
      * detached it. Its real borrow keeps the object until notification ends. */
-    for (;;) {
+    for (unsigned i=0;i<count;i++) for (;;) {
         int pending=0;
         if (is_timer(event)) { KERNEL_RAW_SCOPE(guard,&timer_lock);pending=((struct kernel_timer_fd *)event)->notifications!=0; }
         if (pending) { if (kernel_scheduler_yield_current()) __builtin_trap();continue; }
-        enum kernel_scheduler_status status=kernel_wait_queue_destroy(&event->waiters);
+        enum kernel_scheduler_status status=kernel_wait_queue_destroy(queues[i]);
         if (!pending && status==KERNEL_SCHEDULER_STATUS_OK) break;
         if (status!=KERNEL_SCHEDULER_STATUS_BUSY) __builtin_trap();
         if (kernel_scheduler_yield_current()) __builtin_trap();
     }
 }
-uint32_t kernel_event_fd_poll(struct kernel_open_file_description *file,struct kernel_wait_queue **queue)
+uint32_t kernel_event_fd_poll(struct kernel_open_file_description *file,uint32_t requested,struct kernel_wait_queue **queue)
 {
     struct kernel_event_fd *event=event_of(file);
     KERNEL_RAW_SCOPE(guard,event_lock(event));
-    if (queue) *queue=&event->waiters;
+    if (queue) {
+        *queue=&event->waiters;
+        if (!is_timer(event)) {
+            struct kernel_counter_fd *counter=(void *)event;
+            int read=!!(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM));
+            int write=!!(requested&(KERNEL_POLLOUT|KERNEL_POLLWRNORM));
+            if(read&&!write)*queue=&counter->readers;
+            else if(write&&!read)*queue=&counter->writers;
+        }
+    }
     return (event->count?KERNEL_POLLIN:0U) | (!is_timer(event)&&event->count<UINT64_MAX-1?KERNEL_POLLOUT:0U);
 }
 /* The actual caller holds the OFD. State and registration share the object
@@ -287,14 +306,16 @@ uint32_t kernel_event_fd_poll(struct kernel_open_file_description *file,struct k
 static int event_transfer(struct kernel_event_fd *event,uint64_t *value,int writing,uint32_t flags)
 {
     for (;;) {
-        struct kernel_wait_token token={0};struct kernel_wait_cursor cursor={0};
-        int wait=0,notify=0;
+        struct kernel_wait_token token={0};struct kernel_wait_cursor cursor={0},directed={0};
+        int wait=0,notify=0,notify_directed=0;
         {
             KERNEL_RAW_SCOPE(guard,event_lock(event));
             wait=writing ? *value>UINT64_MAX-1-event->count : !event->count;
             if (wait) {
                 if (flags&EVENT_NONBLOCK) return -KERNEL_EAGAIN;
-                if (kernel_wait_prepare(&event->waiters,0,1,&token)) __builtin_trap();
+                struct kernel_wait_queue *queue=&event->waiters;
+                if (!is_timer(event)) {struct kernel_counter_fd *counter=(void *)event;queue=writing?&counter->writers:&counter->readers;}
+                if (kernel_wait_prepare(queue,0,1,&token)) __builtin_trap();
             } else {
                 if (writing) event->count+=*value;
                 else {
@@ -302,17 +323,22 @@ static int event_transfer(struct kernel_event_fd *event,uint64_t *value,int writ
                     *value=event->semaphore?1:event->count;event->count-=*value;
                     if (is_timer(event)) { ((struct kernel_timer_fd *)event)->expired=0;timer_publish(); }
                 }
-                if (!is_timer(event)) notify=kernel_wait_cursor_prepare(&event->waiters,&cursor);
+                if (!is_timer(event)) {
+                    struct kernel_counter_fd *counter=(void *)event;
+                    notify=kernel_wait_cursor_prepare(&event->waiters,&cursor);
+                    notify_directed=kernel_wait_cursor_prepare(writing?&counter->readers:&counter->writers,&directed);
+                }
             }
         }
         if (notify) kernel_wait_cursor_wake(&cursor,1);
+        if (notify_directed) kernel_wait_cursor_wake(&directed,1);
         if (!wait && is_timer(event)) timer_changed();
         if (!wait) return 0;
         enum kernel_wait_wake_reason reason;
         enum kernel_scheduler_status status=kernel_wait_park(&token,&reason);
         if (kernel_wait_finish(&token)||status) __builtin_trap();
         if (reason==KERNEL_WAIT_SIGNALLED) {
-            kernel_signal_note_syscall_restart(kernel_task_current());return -KERNEL_EINTR;
+            return -KERNEL_ERESTARTSYS;
         }
     }
 }
@@ -325,7 +351,7 @@ int64_t kernel_event_fd_io(struct kernel_open_file_description *file,struct kern
     if (!writing) {
         if (length<8) return -KERNEL_EINVAL;
         uint64_t value=0;int error=event_transfer(event,&value,0,flags);
-        if (error) return error;
+        if (error) { if(error==-KERNEL_ERESTARTSYS)kernel_signal_note_syscall_restart(kernel_task_current());return error; }
         struct kernel_uaccess_iov_cursor cursor={iov,count,0,0};size_t copied=0;
         enum kernel_uaccess_status access=kernel_copy_to_user_iov(mm,&cursor,&value,8,&copied);
         if (access && access!=KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
@@ -342,7 +368,7 @@ int64_t kernel_event_fd_io(struct kernel_open_file_description *file,struct kern
         if (access||copied!=8) __builtin_trap();
         if (value==UINT64_MAX) return done?done:-KERNEL_EINVAL;
         int error=event_transfer(event,&value,1,flags);
-        if (error) return done?done:error;
+        if (error) { if(!done&&error==-KERNEL_ERESTARTSYS)kernel_signal_note_syscall_restart(kernel_task_current());return done?done:error; }
         done+=8;
     }
     return done;

@@ -61,6 +61,8 @@ static void check_at(int valid,unsigned line)
 #define check(valid) check_at((valid),__LINE__)
 #include "socket_smp.h"
 #include "pipe_smp.h"
+#include <kernel/syscall.h>
+#include "event_smp.h"
 static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
@@ -376,6 +378,7 @@ void riscv_user_composition_report(void)
 {
     socket_observe_report();
     pipe_observe_report();
+    event_observe_report();
     virt_uart_puts("BoarOS: COMPOSITION clock claims=");virt_uart_put_hex(clock_claims);
     virt_uart_puts(" active=");virt_uart_put_hex(clock_active);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);
@@ -450,7 +453,7 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint6
         while (!composition_load(&control->wait_release)) relinquish();
     }
     enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,source,size,copied);
-    socket_observe_copy(*copied,0);pipe_observe_events(*copied);return result;
+    socket_observe_copy(*copied,0);event_observe_copy(0);pipe_observe_events(*copied);return result;
 }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __real_physical_page_allocate_order(struct physical_page_allocator *,uint32_t,uint64_t *);
@@ -607,7 +610,7 @@ enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *mm,
     uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     enum kernel_mm_status status=__real_kernel_mm_pin_user_page(mm,address,access,pin);
-    if(!status) { socket_observe_copy(0,1);
+    if(!status) { socket_observe_copy(0,1);event_observe_copy(1);
         if(access==KERNEL_MM_READ && kernel_task_current()->socket_write_request)socket_hold(2);
     }
     hold_read_pin(status,address,access,pin);
@@ -624,7 +627,7 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel
     int watched=reading_task() && destination>=read_address && destination-read_address<read_size;
     if(watched) { check(!read_copy_active);read_copy_active=1; }
     enum kernel_uaccess_status result=__real_kernel_uaccess_write_cursor_copy(mm,cursor,destination,source,size,copied);
-    socket_observe_copy(*copied,0);
+    socket_observe_copy(*copied,0);event_observe_copy(0);
     if(watched)read_copy_active=0;
     if(watched && *copied) {
         unsigned cpu=kernel_cpu_current()->logical_id;check(cpu<2);

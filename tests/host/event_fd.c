@@ -55,7 +55,7 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m,uint64_t d,co
 static struct kernel_heap heap;
 static struct kernel_files files={.heap=&heap};
 static struct kernel_event_fd *make(unsigned kind)
-{struct kernel_event_fd *e=0;assert(!allocate_event(&files,kind==KERNEL_OPEN_FILE_KIND_TIMERFD?sizeof(struct kernel_timer_fd):sizeof(*e),kind,0,&e));return e;}
+{struct kernel_event_fd *e=0;assert(!allocate_event(&files,kind==KERNEL_OPEN_FILE_KIND_TIMERFD?sizeof(struct kernel_timer_fd):sizeof(struct kernel_counter_fd),kind,0,&e));return e;}
 static struct kernel_event_fd *blocked;
 static void satisfy(void){uint64_t n=7;assert(!event_transfer(blocked,&n,1,0));}
 static void counters(void)

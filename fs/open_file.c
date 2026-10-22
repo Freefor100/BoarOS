@@ -1159,7 +1159,7 @@ uint32_t kernel_open_file_poll(
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
-        return kernel_event_fd_poll(file,out_queue);
+        return kernel_event_fd_poll(file,requested_events,out_queue);
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, file->pipe_observed_writers, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
