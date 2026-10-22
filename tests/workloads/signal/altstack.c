@@ -23,7 +23,7 @@
 #define MINIMUM 2048U
 #endif
 static unsigned failures;
-#define CHECK(x) do { if (!(x)) { printf("ALTSTACK FAIL line=%d %s errno=%d\n", __LINE__, #x, errno); failures++; } } while (0)
+#define CHECK(x) do { if (!(x)) { printf("ALTSTACK FAIL line=%d %s errno=%d\n", __LINE__, #x, errno); __atomic_fetch_add(&failures,1,__ATOMIC_RELAXED); } } while (0)
 static int error(long value, int code) { return value == -1 && errno == code; }
 static int alt(const stack_t *input, stack_t *output) { return syscall(SYS_sigaltstack, input, output); }
 static void abi(void)
@@ -40,11 +40,12 @@ static void abi(void)
     set.ss_size=MINIMUM; set.ss_flags=SS_ONSTACK;
     CHECK(!alt(&set, 0));
     CHECK(!alt(0, &out) && !out.ss_flags);
-    for (unsigned flags=0; flags<16; flags++) {
-        set.ss_flags=(int)flags;
+    for (unsigned variant=0; variant<2; variant++) for (unsigned flags=0; flags<16; flags++) {
+        set.ss_flags=(int)(flags|(variant?AUTO:0));
         int valid=flags==0 || flags==SS_ONSTACK || flags==SS_DISABLE;
         CHECK(valid ? !alt(&set, 0) : error(alt(&set, 0), EINVAL));
     }
+    set.ss_flags=SS_DISABLE;CHECK(!alt(&set,0));
     set.ss_flags=(int)AUTO;
     CHECK(!alt(&set, &set) && !set.ss_sp && set.ss_flags == SS_DISABLE);
     CHECK(!alt(0, &out) && (unsigned)out.ss_flags == AUTO);
@@ -82,6 +83,13 @@ static void handler(int sig, siginfo_t *info, void *context)
     char local; stack_t query; ucontext_t *uc=context;
     (void)sig; (void)info;
     outer_address=(uintptr_t)&local;
+    if(frame_mode>=6) {
+        HC(!in_area(outer_address,area));
+        HC(uc->uc_stack.ss_sp==area && uc->uc_stack.ss_size==65536);
+        HC((unsigned)uc->uc_stack.ss_flags==(frame_mode==7?AUTO:0));
+        HC(!alt(0,&query) && query.ss_flags==(frame_mode==7?SS_DISABLE:0));
+        entered++;return;
+    }
     HC(in_area(outer_address,area));
     HC(uc->uc_stack.ss_sp==area && uc->uc_stack.ss_size==65536);
     HC(!alt(0,&query));
@@ -109,15 +117,17 @@ static void real_frames(void)
     struct sigaction action={.sa_sigaction=handler,.sa_flags=SA_ONSTACK|SA_SIGINFO};
     sigemptyset(&action.sa_mask); CHECK(!sigaction(SIGUSR1,&action,0));
     action.sa_sigaction=nested_handler; CHECK(!sigaction(SIGUSR2,&action,0));
-    for (frame_mode=0;frame_mode<=5;frame_mode++) {
-        stack_t s={.ss_sp=area,.ss_size=65536,.ss_flags=frame_mode==5?(int)AUTO:0},out;
+    for (frame_mode=0;frame_mode<=7;frame_mode++) {
+        action.sa_sigaction=handler;action.sa_flags=SA_SIGINFO|(frame_mode>=6?0:SA_ONSTACK);
+        CHECK(!sigaction(SIGUSR1,&action,0));
+        stack_t s={.ss_sp=area,.ss_size=65536,.ss_flags=(frame_mode==5||frame_mode==7)?(int)AUTO:0},out;
         CHECK(!alt(&s,0)); CHECK(!raise(SIGUSR1)); CHECK(!handler_bad);
         CHECK(!alt(0,&out));
         if (frame_mode==4) CHECK(out.ss_flags==SS_DISABLE);
         else CHECK(out.ss_sp==(frame_mode==3?replacement:area) && out.ss_size==65536 &&
-                   (unsigned)out.ss_flags==(frame_mode==5?AUTO:0));
+                   (unsigned)out.ss_flags==((frame_mode==5||frame_mode==7)?AUTO:0));
     }
-    CHECK(entered==6 && nested==2);
+    CHECK(entered==8 && nested==2);
     stack_t disabled={.ss_flags=SS_DISABLE}; CHECK(!alt(&disabled,0));
     CHECK(!munmap(area,65536) && !munmap(replacement,65536));
 }
@@ -317,6 +327,112 @@ static void threads(void)
     CHECK(!alt(0,&out) && out.ss_sp==area);
     s.ss_flags=SS_DISABLE;CHECK(!alt(&s,0) && !munmap(area,65536));
 }
+static uint64_t race_go, race_ready, race_tid;
+static int race_unmap;
+static char *race_area;
+static void *frame_racer(void *unused)
+{
+    (void)unused;pin(1);
+    stack_t s={.ss_sp=race_area,.ss_size=65536};CHECK(!alt(&s,0));
+    composition_store(&race_tid,(uint64_t)syscall(SYS_gettid));
+    composition_store(&race_ready,1);
+    while(!composition_load(&race_go))sched_yield();
+    raise(SIGUSR1);_exit(102);
+}
+static void *mapping_racer(void *unused)
+{
+    (void)unused;pin(0);
+    while(!composition_load(&control->read_entered))sched_yield();
+    composition_store(&control->read_waiter_tid,(uint64_t)syscall(SYS_gettid));
+    size_t page=(size_t)sysconf(_SC_PAGESIZE);
+    int rc=race_unmap ? munmap(race_area+65536-page,page) :
+                       mprotect(race_area+65536-page,page,PROT_NONE);
+    if(rc)_exit(103);
+    for(;;)sched_yield();
+    return 0;
+}
+static void copy_races(void)
+{
+    if(!control || cpus<2) {puts("ALTSTACK CASE copy-races SKIP");return;}
+    unsigned before=failures;
+    for(unsigned mode=0;mode<2;mode++) {
+        composition_store(&control->read_entered,0);composition_store(&control->read_release,0);
+        composition_store(&control->read_waiter_tid,0);composition_store(&control->read_waited,0);
+        int info[2],go[2];CHECK(!pipe(info) && !pipe(go));pid_t child=fork();CHECK(child>=0);
+        if(!child) {
+            close(info[0]);close(go[1]);race_unmap=(int)mode;
+            race_area=mmap(0,65536,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            /* Prepopulate so the hold is an actual write pin, not a fault setup. */
+            memset(race_area,0,65536);race_go=race_ready=race_tid=0;
+            pthread_t sender,mutator;
+            CHECK(!pthread_create(&sender,0,frame_racer,0));
+            while(!composition_load(&race_ready))sched_yield();
+            uint64_t data[2]={race_tid,(uintptr_t)race_area};CHECK(write(info[1],data,sizeof(data))==sizeof(data));
+            char byte;CHECK(read(go[0],&byte,1)==1);
+            CHECK(!pthread_create(&mutator,0,mapping_racer,0));
+            composition_store(&race_go,1);for(;;)sched_yield();
+        }
+        close(info[1]);close(go[0]);uint64_t data[2];CHECK(read(info[0],data,sizeof(data))==sizeof(data));
+        composition_store(&control->read_tid,data[0]);composition_store(&control->read_address,data[1]);
+        composition_store(&control->read_size,65536);composition_store(&control->read_hart,1);
+        composition_store(&control->read_flags,COMPOSITION_READ_HOLD|COMPOSITION_READ_LOCAL|COMPOSITION_READ_SIGNAL);
+        command(COMPOSITION_READ_ARM);CHECK(write(go[1],"x",1)==1);
+        int status;CHECK(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
+        CHECK(composition_load(&control->read_entered)==1 && composition_load(&control->read_waited)==(mode?2U:1U));
+        command(COMPOSITION_READ_FINISH);CHECK(!close(info[0]) && !close(go[1]));
+    }
+    printf("ALTSTACK CASE copy-races %s\n",before==failures?"OK":"FAIL");
+}
+#if defined(__loongarch__)
+/* LP64S allocates no FPRs, but these instructions deliberately trigger the
+ * hardware extension state. LP64D also declares its caller-saved clobber. */
+#if __loongarch_frlen
+#define WIDTH_CLOBBERS "$f0", "memory"
+#else
+#define WIDTH_CLOBBERS "memory"
+#endif
+static unsigned frame_width, width_bytes;
+static void width_handler(int signal,siginfo_t *info,void *context)
+{
+    char local;(void)info;char *frame=(char *)context-128;
+    uint32_t *extension=(uint32_t *)(frame+576);
+    unsigned magic=frame_width==4?0x41535801U:frame_width==2?0x53580001U:0x46505501U;
+    if(signal!=SIGUSR1 || extension[0]!=magic || extension[1]<16+256*frame_width+12 ||
+       !in_area((uintptr_t)&local,area))_exit(105);
+    width_bytes=576+extension[1]+16;
+    if(frame<area+65536-4096 || frame+width_bytes>area+65536)_exit(106);
+}
+static void width_frames(void)
+{
+    uint32_t config,index=2;__asm__ volatile("cpucfg %0,%1":"=r"(config):"r"(index));
+    for(unsigned width=1;width<=4;width*=2) {
+        if(width>1 && !(config&(width==2?64U:128U)))continue;
+        pid_t child=fork();CHECK(child>=0);
+        if(!child) {
+            area=mmap(0,65536,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            if(mprotect(area+65536-8192,4096,PROT_NONE))_exit(107);
+            stack_t s={.ss_sp=area+65536-4096,.ss_size=4096};if(alt(&s,0))_exit(108);
+            struct sigaction action={.sa_sigaction=width_handler,.sa_flags=SA_SIGINFO|SA_ONSTACK};
+            sigemptyset(&action.sa_mask);if(sigaction(SIGUSR1,&action,0))_exit(109);
+            frame_width=width;
+            if(width==4)__asm__ volatile("xvxor.v $xr0,$xr0,$xr0":::WIDTH_CLOBBERS);
+            else if(width==2)__asm__ volatile("vxor.v $vr0,$vr0,$vr0":::WIDTH_CLOBBERS);
+            else __asm__ volatile("movgr2fr.d $f0,$zero":::WIDTH_CLOBBERS);
+            if(raise(SIGUSR1) || !width_bytes)_exit(110);
+            /* Leave 16 bytes less than this actual width's frame. The guard
+             * below the registered stack also verifies Linux's copy failure. */
+            uintptr_t sp=(uintptr_t)s.ss_sp+width_bytes-16;
+            long pid=getpid(),tid=syscall(SYS_gettid);
+            __asm__ volatile("move $sp,%0; move $a0,%1; move $a1,%2; li.d $a2,10; li.d $a7,131; syscall 0; li.d $a0,111; li.d $a7,94; syscall 0; break 0"
+                ::"r"(sp),"r"(pid),"r"(tid):"$a0","$a1","$a2","$a7","memory");
+            __builtin_unreachable();
+        }
+        int status;CHECK(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
+    }
+}
+#else
+static void width_frames(void) { }
+#endif
 static void run(const char *name, void (*test)(void))
 { unsigned before=failures;test();printf("ALTSTACK CASE %s %s\n",name,before==failures?"OK":"FAIL"); }
 int main(int argc, char **argv)
@@ -326,11 +442,13 @@ int main(int argc, char **argv)
         stack_t s;return alt(0,&s) || s.ss_flags!=SS_DISABLE || s.ss_sp || s.ss_size;
     }
     run("abi",abi);run("frames",real_frames);run("bad-stacks",bad_stacks);run("lifecycle",lifecycle);
+    width_frames();
     observe();run("threads",threads);
+    copy_races();
     if(control) {
         command(COMPOSITION_STOP);CHECK(!munmap(control,4096) && !close(control_fd));
         CHECK(!unlink("/dev/shm/smp-control"));control=0;
     }
-    printf("ALTSTACK END %u\n",failures?0:5);
+    printf("ALTSTACK END %u\n",failures?0:6);
     return failures ? 1 : 0;
 }

@@ -63,6 +63,7 @@ static void check_at(int valid,unsigned line)
 #include "pipe_smp.h"
 #include <kernel/syscall.h>
 #include "event_smp.h"
+#include "altstack_smp.h"
 static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
@@ -379,6 +380,7 @@ void riscv_user_composition_report(void)
     socket_observe_report();
     pipe_observe_report();
     event_observe_report();
+    altstack_observe_report();
     virt_uart_puts("BoarOS: COMPOSITION clock claims=");virt_uart_put_hex(clock_claims);
     virt_uart_puts(" active=");virt_uart_put_hex(clock_active);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);
@@ -452,7 +454,15 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint6
         composition_store(&control->wait_entered,1);
         while (!composition_load(&control->wait_release)) relinquish();
     }
+    int signal_copy=reading_task() && (read_flags&COMPOSITION_READ_SIGNAL) &&
+        address>=read_address && address-read_address<read_size;
+    if(signal_copy) { check(!read_copy_active);read_copy_active=1; }
     enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,source,size,copied);
+    if(signal_copy) {
+        read_copy_active=0;
+        unsigned cpu=kernel_cpu_current()->logical_id;check(cpu==read_hart);
+        read_copies[cpu]+=*copied;
+    }
     socket_observe_copy(*copied,0);event_observe_copy(0);pipe_observe_events(*copied);return result;
 }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
@@ -482,6 +492,18 @@ enum kernel_mm_status __wrap_kernel_mm_munmap(struct kernel_mm *mm,uint64_t addr
     }
     enum kernel_mm_status result=__real_kernel_mm_munmap(mm,address,length);
     if (watched) retired_address=0;
+    if(control && read_tid && (read_flags&COMPOSITION_READ_SIGNAL) &&
+       composition_load(&control->read_entered) && !composition_load(&control->read_release) &&
+       !kernel_task_tid(kernel_task_current(),&tid) &&
+       (uint64_t)tid==composition_load(&control->read_waiter_tid)) {
+        struct kernel_mm_concurrency_state state;
+        kernel_mm_get_concurrency_state(mm,&state);
+        /* munmap removes the mapping without draining the real page pin.
+         * The held copy must retain that owner until it resumes. */
+        check(!result && state.write_pins && state.pins);
+        composition_store(&control->read_waited,2);
+        composition_store(&control->read_release,1);
+    }
     return result;
 }
 void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
@@ -566,7 +588,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_to
 {
     if (control && token && token->task) {
         kernel_pid_t reader_waiter=0;
-        if(read_tid && (read_flags&(COMPOSITION_READ_SEEK|COMPOSITION_READ_FORK)) &&
+        if(read_tid && (read_flags&(COMPOSITION_READ_SEEK|COMPOSITION_READ_FORK|COMPOSITION_READ_SIGNAL)) &&
            (!(read_flags&COMPOSITION_READ_FORK) || read_revoke_mm) &&
            composition_load(&control->read_entered) &&
            !composition_load(&control->read_release) &&

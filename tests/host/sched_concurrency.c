@@ -68,6 +68,8 @@ enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
 { *ticks = ns; return KERNEL_TIME_STATUS_OK; }
 struct kernel_task *deadline_index_first(void) { return 0; }
+/* This scheduler-only model has no active timerfd deadline. */
+uint64_t kernel_timer_fd_next;
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task)
 { return &task->wait; }
 void kernel_wait_backend_ready(struct kernel_task *task)

@@ -328,8 +328,12 @@ static int timer_main(const char *mode, const char *only)
     printf("ACCOUNT TIMER END %u\n", count);fflush(stdout);
     return 42;
 }
+#include "signal_stack.h"
 int main(int argc, char **argv)
 {
+    FILE *stack_configuration=fopen("/account-altstack","r");
+    if(stack_configuration)return stack_cost_main(stack_configuration);
+    CHECK(errno==ENOENT);
     if (argc > 1) {
         const char *mode = NULL, *only = NULL;
         for (int i = 1; i < argc; ++i) {

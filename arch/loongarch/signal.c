@@ -133,14 +133,13 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
     struct la_linux_mcontext context;
     struct la_context_info extension;
     struct arch_fpu_state fp;
-    struct kernel_signal_stack saved_stack;
-    uint64_t mask,sp=frame->regs[3];
+    struct { struct kernel_signal_stack stack; uint64_t mask; } saved;
+    uint64_t sp=frame->regs[3];
     size_t copied;
     if(sp>UINT64_MAX-LA_SIGNAL_FRAME_BYTES ||
        kernel_task_mm_borrow_mutable(task,&mm)!=KERNEL_TASK_STATUS_OK)bad_frame();
     /* 输入先快照；更宽记录优先，重复的同类记录取最后一条。 */
-    if(kernel_copy_from_user(mm,&saved_stack,sp+128+16,sizeof(saved_stack),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(saved_stack) ||
-       kernel_copy_from_user(mm,&mask,sp+128+40,sizeof(mask),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(mask) ||
+    if(kernel_copy_from_user(mm,&saved,sp+128+16,sizeof(saved),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(saved) ||
        kernel_copy_from_user(mm,&context,sp+128+176,sizeof(context),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(context))bad_frame();
     uint64_t address=sp+576,addresses[5]={0};
     for(;;) {
@@ -167,9 +166,9 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
         fp.fcsr&=~((fp.fcsr&31U)<<24);
         if(kernel_copy_to_user(mm,fp_address+256*width+8,&fp.fcsr,4,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=4)bad_frame();
     }
-    if(kernel_signal_update_blocked(task,LINUX_SIG_SETMASK,&mask,0)!=KERNEL_SIGNAL_STATUS_OK)bad_frame();
+    if(kernel_signal_update_blocked(task,LINUX_SIG_SETMASK,&saved.mask,0)!=KERNEL_SIGNAL_STATUS_OK)bad_frame();
     kernel_signal_clear_syscall_restart(task);
-    (void)kernel_signal_stack_update(task,&saved_stack,0,context.regs[3]);
+    (void)kernel_signal_stack_update(task,&saved.stack,0,context.regs[3]);
     frame->era=context.pc;frame->regs[0]=0;
     memcpy(frame->regs+1,context.regs+1,31*sizeof(uint64_t));
     fp.saved=(context.flags&1)!=0;

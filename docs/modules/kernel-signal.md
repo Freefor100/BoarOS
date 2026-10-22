@@ -4,6 +4,7 @@
 
 ## 职责与入口
 
+- `kernel/signal_stack.c`：每线程备用栈登记、选择、边界与自动停用；
 - `kernel/sched/signal.c`：pending/blocked、disposition、默认动作、stop/continue、进程通知和重启策略。
 - `arch/riscv/signal.c`、`include/arch/riscv/signal.h`：RISC-V 信号帧编码、寄存器恢复和用户返回尾。
 - `arch/loongarch/signal.c`、`include/arch/loongarch/signal.h`：LA 整数/FP/LSX/LASX帧、END终止记录与ERA/GPR恢复；同样调用通用选择和重启策略。
@@ -83,7 +84,7 @@ RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节fr
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
-标准信号使用线程组与线程位图 pending，发布和消费共用调度保护；尚无实时信号队列、sigaltstack 或 signalfd。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
+标准信号使用线程组与线程位图 pending，发布和消费共用调度保护；尚无实时信号队列或signalfd。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
 
 ## 同步故障
 
@@ -99,16 +100,18 @@ break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate �
 `make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
 验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
 SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
-用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；altstack和实时队列仍未支持。
+用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；实时队列仍未支持。
 
 U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 线程有一个独立同步故障记录，经统一用户返回路径优先选取；交付 handler 时保留故障 PC，可由 handler 修复映射后重试，或修改 ucontext 跳过指令。被阻塞或忽略的致命同步信号改为默认动作并解除阻塞；默认动作终止全组。坏 signal frame 同样终止全组。fork/exec 清除故障记录；syscall 用户复制仍返回 EFAULT，内核自身 trap 仍 fatal。
 
-`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。sigaltstack、ptrace、实时队列仍列在能力目录；RV真实两核的递送与恢复使用上面的共同协议。
+`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。ptrace、实时队列仍列在能力目录；RV真实两核的递送与恢复使用上面的共同协议。
 
 TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
 的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write
 实际已交付前缀后不留下 restart 标记，只有整次无进展的 ERESTARTSYS 由 trap 登记重试。
 
 FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮点/SIMD模块](loongarch-fpu.md)。
+
+`tests/workloads/signal/altstack.c`对照两架构Linux，覆盖登记ABI、嵌套、普通栈溢出、坏备用栈、可读无效与不可读恢复字段、fork/vfork/线程及非组长exec。LA在激活FPU/LSX/LASX后，另检查4KiB备用栈上的实际帧及不足该宽度一帧的边界。RV观察构建记录各在线核的构帧和sigreturn；复用composition的真实页pin暂停点检查mprotect已park等待，以及munmap返回后物理页仍由pin保活，再放行复制。共同状态检查入口为`make test-signal-stack-host`（4/16KiB页）；真实多核入口复用`tests/network_runner.py --workload altstack --observe`。

@@ -202,8 +202,10 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
     struct riscv_fpu_state *fpu = riscv_process_fpu_borrow_current();
     struct kernel_mm *mm;
     struct riscv_linux_mcontext context;
-    struct kernel_signal_stack saved_stack;
-    uint64_t sigmask;
+    struct {
+        struct kernel_signal_stack stack;
+        uint64_t mask;
+    } saved;
     uint32_t fcsr;
     size_t copied;
 
@@ -215,14 +217,10 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
         riscv_signal_bad_frame();
     }
     /* Snapshot all restored input before committing registers or mask. */
-    if (kernel_copy_from_user(mm, &saved_stack,
+    if (kernel_copy_from_user(mm, &saved,
                                frame->sp + RISCV_SIGNAL_INFO_SIZE + 16U,
-                               sizeof(saved_stack), &copied) !=
-            KERNEL_UACCESS_STATUS_OK || copied != sizeof(saved_stack) ||
-        kernel_copy_from_user(mm, &sigmask,
-                               frame->sp + RISCV_SIGNAL_INFO_SIZE + 40U,
-                               sizeof(sigmask), &copied) !=
-            KERNEL_UACCESS_STATUS_OK || copied != sizeof(sigmask) ||
+                               sizeof(saved), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(saved) ||
         kernel_copy_from_user(mm, &context,
                                frame->sp + RISCV_SIGNAL_MCONTEXT_OFFSET,
                                sizeof(context), &copied) !=
@@ -235,14 +233,14 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
         context.fp.reserved[2] != 0U) {
         riscv_signal_bad_frame();
     }
-    if (kernel_signal_update_blocked(task, LINUX_SIG_SETMASK, &sigmask, 0) !=
+    if (kernel_signal_update_blocked(task, LINUX_SIG_SETMASK, &saved.mask, 0) !=
         KERNEL_SIGNAL_STATUS_OK) {
         riscv_signal_bad_frame();
     }
     kernel_signal_clear_syscall_restart(task);
     /* Linux ignores readable but invalid restoration settings. Evaluate
      * EPERM using the restored user SP, not the temporary handler SP. */
-    (void)kernel_signal_stack_update(task, &saved_stack, 0, context.gregs[2]);
+    (void)kernel_signal_stack_update(task, &saved.stack, 0, context.gregs[2]);
     for (uint32_t index = 0U; index < 32U; index++) {
         memcpy((uint8_t *)frame + signal_gpr_offsets[index],
                &context.gregs[index], 8U);
