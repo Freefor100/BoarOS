@@ -60,6 +60,9 @@ static void lifetime(unsigned records, unsigned actors)
     kernel_rwlock_init(&node.io_lock, 30, (uintptr_t)&node);
     kernel_file_mapping_init(&node);
     assert(!kernel_file_mapping_prepare(&node));
+    { KERNEL_TASK_LOCK_SCOPE(identity, &kernel_vfs_state_lock);
+      assert(kernel_file_mapping_empty(&node)); }
+
     for (unsigned i = records - 1; i--;) {
         tail[i] = (struct kernel_file_mapping){.node=&node, .owner=&tail[i], .truncate=callback};
         assert(!kernel_file_mapping_register(&tail[i]));

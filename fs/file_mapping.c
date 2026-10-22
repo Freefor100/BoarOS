@@ -32,7 +32,8 @@ int kernel_file_mapping_prepare(struct kernel_vfs_node *node)
         node->instance->heap, 1, sizeof(*candidate), (void **)&candidate);
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-    kernel_raw_lock_init(&candidate->metadata, KERNEL_RAW_RANK_OBJECT);
+    /* 最后 inode 归还在 VFS 索引保护内核对映射；映射通知在本锁外回调。 */
+    kernel_raw_lock_init(&candidate->metadata, KERNEL_RAW_RANK_FILE_MAPPING);
     kernel_wait_queue_init(&candidate->changed);
     candidate->epoch = 1;
     /* I/O 读保护排除无状态截断；已有 I/O metadata 仅用于一次发布，

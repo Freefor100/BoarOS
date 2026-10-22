@@ -2151,7 +2151,7 @@ test-sync-host:
 test-file-mapping-concurrency-host:
 	@mkdir -p build/host/mm
 	@set -e; for shift in 12 14; do \
-		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/file_mapping_concurrency.c tests/host/mm/context.c fs/file_mapping.c fs/vfs.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c \
