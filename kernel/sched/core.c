@@ -29,7 +29,7 @@ static struct kernel_cpu boot_cpu;
 static struct kernel_task bootstrap_task;
 static uintptr_t current_sp(void);
 #if BOAROS_MAX_CPUS > 1
-static struct kernel_task secondary_idle;
+static struct kernel_task secondary_idles[BOAROS_MAX_CPUS - 1];
 void kernel_assert_service_context(void)
 {
     struct kernel_cpu *cpu = kernel_cpu_current();
@@ -39,19 +39,23 @@ void kernel_assert_service_context(void)
 struct kernel_task *kernel_cpu_secondary_prepare(struct kernel_cpu *cpu,
     uint64_t hart, unsigned logical)
 {
-    if (kernel_cpu_current()->logical_id || logical != 1 || cpu->initialized)
+    if (kernel_cpu_current()->logical_id || !logical ||
+        logical >= kernel_cpu_get_boot_count() || !cpu || cpu->initialized)
         __builtin_trap();
-    kernel_cpu_initialize(cpu, hart, &secondary_idle.io_context);
+    struct kernel_task *idle = &secondary_idles[logical - 1];
+    if (idle->cpu) __builtin_trap();
+    kernel_cpu_initialize(cpu, hart, &idle->io_context);
     cpu->logical_id = logical;
-    secondary_idle.cpu = cpu;
-    return &secondary_idle;
+    idle->cpu = cpu;
+    return idle;
 }
 
 void kernel_cpu_secondary_attach(struct kernel_cpu *cpu, uintptr_t low, uintptr_t high)
 {
-    if (arch_interrupt_is_enabled() || !cpu || cpu->logical_id != 1 || cpu->current ||
+    if (arch_interrupt_is_enabled() || !cpu || !cpu->logical_id ||
+        cpu->logical_id >= kernel_cpu_get_boot_count() || cpu->current ||
         current_sp() < low || current_sp() >= high) __builtin_trap();
-    struct kernel_task *idle = &secondary_idle;
+    struct kernel_task *idle = &secondary_idles[cpu->logical_id - 1];
     idle->arch.kernel_sp = high;
     arch_thread_set_mm(&idle->arch, scheduler.kernel_context);
     idle->magic = KERNEL_THREAD_MAGIC;
@@ -1059,7 +1063,7 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
 enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask)
 {
-    if (!join || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (!join || !mask || (mask & ~((1U << BOAROS_MAX_CPUS) - 1U))) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     unsigned available;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       available = available_cpu_mask_locked(); }
@@ -1071,7 +1075,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mm(
     uint32_t mask, struct kernel_mm *mm)
 {
     kernel_assert_service_context();
-    if (!join || !mm || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (!join || !mm || !mask || (mask & ~((1U << BOAROS_MAX_CPUS) - 1U))) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     unsigned available;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
@@ -1083,7 +1087,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_files(
     uint32_t mask, const struct kernel_mm *mm, const struct kernel_files *files)
 {
     kernel_assert_service_context();
-    if (!join || !mm || !files || !mask || (mask & ~3U))
+    if (!join || !mm || !files || !mask || (mask & ~((1U << BOAROS_MAX_CPUS) - 1U)))
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (kernel_files_check_task_domain(files,mm))
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -1103,7 +1107,7 @@ enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_joi
                                                        uint32_t mask)
 {
     kernel_assert_service_context();
-    if (!join || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (!join || !mask || (mask & ~((1U << BOAROS_MAX_CPUS) - 1U))) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *task = join->task;
     if (!task || !task->controlled) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CpuInfo(C.Structure):
-    _fields_ = [("hart_ids", C.c_uint64 * 2), ("count", C.c_uint32)]
+    _fields_ = [("hart_ids", C.c_uint64 * 4), ("count", C.c_uint32)]
 
 
 def blob(cpus, cells=1, parent_status=None):
@@ -85,15 +85,17 @@ def main():
             return status, out
 
         cpu = lambda hart: (hart, None, None, False)
+        status, out = run([cpu(19), cpu(7), cpu(63), cpu(2)], boot=19)
+        assert status == 0 and out.count == 4 and list(out.hart_ids) == [19, 2, 7, 63]
         status, out = run([cpu(19), cpu(7)], boot=19)
-        assert status == 0 and out.count == 2 and list(out.hart_ids) == [19, 7]
+        assert status == 0 and out.count == 2 and list(out.hart_ids) == [19, 7, 0, 0]
         status, out = run([cpu(0), (4, b"disabled\0", None, False)])
         assert status == 0 and out.count == 1
         status, out = run([cpu(0x100000007), cpu(0x100000002)],
                           boot=0x100000002, cells=2)
-        assert status == 0 and list(out.hart_ids) == [0x100000002, 0x100000007]
+        assert status == 0 and list(out.hart_ids) == [0x100000002, 0x100000007, 0, 0]
         for harts, kwargs in [
-            ([cpu(0), cpu(0)], {}), ([cpu(0), cpu(2), cpu(9)], {}),
+            ([cpu(0), cpu(0)], {}), ([cpu(0), cpu(2), cpu(9), cpu(13), cpu(19)], {}),
             ([cpu(3)], {}), ([(0, None, 8, False)], {}),
             ([(0, None, None, True)], {}),
             ([(0, b"broken", None, False)], {}),

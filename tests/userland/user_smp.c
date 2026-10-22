@@ -316,7 +316,7 @@ static void realtime_qualification(void)
 {
     atomic_uint *seen=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_ANONYMOUS|MAP_SHARED,-1,0);
     CHECK(seen!=MAP_FAILED);
-    for (unsigned cpu=0;cpu<(online==3 ? 2U : 1U);cpu++) {
+    for (unsigned cpu=0;cpu<(unsigned)__builtin_popcountll(online);cpu++) {
         pin(cpu);
         /* 库代码的首次执行可真实缺页/睡眠；在FIFO非阻塞窗口之前
          * 完成fork返回与时钟/syscall代码的驻留准备，不把冷I/O当成yield。 */
@@ -443,19 +443,25 @@ static void caller_namespace(void)
     CHECK(!chdir("/") && !rmdir("/ns-second"));
     record("caller-namespace-identity");pin(0);
 }
+#include "user_smp_many.h"
 int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--exec-child")) return 23;
+    if (argc==3 && !strcmp(argv[1],"--many-exec")) {
+        unsigned cpu=(unsigned)atoi(argv[2]);uint64_t mask=0;CHECK(cpu<4);
+        CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)==sizeof(mask) && mask==(UINT64_C(1)<<cpu));
+        CHECK(getpid()>0 && !user_smp_register_probe(0));return 40+(int)cpu;
+    }
     CHECK(!mkdir("/proc",0555) || errno==EEXIST);
     CHECK(!mount("proc","/proc","proc",0,NULL) || errno==EBUSY);
-    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3));
-    printf("USER-SMP BEGIN cpus=%u\n",online==3 ? 2 : 1); fflush(stdout);
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3 || online==7 || online==15));
+    printf("USER-SMP BEGIN cpus=%u\n",(unsigned)__builtin_popcountll(online)); fflush(stdout);
     pin(0);
-    process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress(); caller_namespace();
+    process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress(); caller_namespace(); many_cpu_consumers(); many_service_progress();
 #ifdef BOAROS_SMP_DYNAMIC
-    dynamic_tls(); puts("USER-SMP END 10");
+    dynamic_tls(); puts("USER-SMP END 14");
 #else
-    puts("USER-SMP END 9");
+    puts("USER-SMP END 13");
 #endif
     fflush(stdout); CHECK(!fsync(1) || errno==EINVAL);
     sync(); (void)reboot(RB_POWER_OFF); return 42;

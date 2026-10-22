@@ -8,7 +8,7 @@
 #define DTB_MAX_RESERVED_RANGES 16U
 #define DTB_MAX_MEMORY_RANGES 16U
 #define DTB_MAX_VIRTIO_MMIO_RANGES 16U
-#define DTB_MAX_CPUS 2U
+#define DTB_MAX_CPUS 4U
 
 struct dtb_cpu_info {
     uint64_t hart_ids[DTB_MAX_CPUS];

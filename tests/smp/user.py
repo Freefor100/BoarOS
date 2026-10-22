@@ -17,7 +17,9 @@ from riscv import identity
 CASES=('process-affinity-overlap','pthread-tls-registers-nested-signal',
        'shared-mm-remote-permission-and-truncate','pthread-cancel-pipe-owner',
        'nonleader-exec-remote-exit','group-stop-continue-remote-owner','realtime-service-qualification',
-       'remote-service-forward-progress','caller-namespace-identity')
+       'remote-service-forward-progress','caller-namespace-identity',
+       'all-cpu-tls-fpu-signals-timers','all-cpu-mm-files-orphans','all-cpu-fork-affinity-exec',
+       'all-remote-realtime-services')
 
 DYNAMIC_CASE="dynamic-musl-dlopen-tls"
 
@@ -43,8 +45,8 @@ def validate_execution(text,cpus,boaros,require_parallel=False):
         selected=samples if require_parallel else samples[:1]
         if any(int(traps,16)==0 or int(returns,16)==0 for _,traps,returns,_,_ in selected):
             raise RuntimeError('a requested CPU never entered/returned actual U-mode')
-        if require_parallel and cpus==2 and not int(samples[1][3],16):
-            raise RuntimeError('CPU1 local IRQ return was not exercised')
+        if require_parallel and any(not int(row[3],16) for row in samples[1:]):
+            raise RuntimeError('a secondary local IRQ return was not exercised')
         if require_parallel and any(not int(row[4],16) for row in selected):
             raise RuntimeError('a requested CPU never dispatched a local syscall')
 
@@ -84,18 +86,19 @@ def main():
     parser.add_argument('--loader',type=Path,help='fixed musl loader for the dynamic native ELF')
     parser.add_argument('--library',type=Path,help='original TLS DSO paired with --loader')
     parser.add_argument('--manifest',type=Path,help='ABI record manifest instead of the native case stream')
-    parser.add_argument('--require-parallel',action='store_true',help='require actual user execution, syscalls and local IRQs on both CPUs')
+    parser.add_argument('--require-parallel',action='store_true',help='require actual user execution, syscalls and local IRQs on every requested CPU')
     parser.add_argument('--qemu',default='qemu-system-riscv64')
     parser.add_argument('--firmware',default='default')
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
-    parser.add_argument('--cpus',action='append',type=int,choices=(1,2))
+    parser.add_argument('--cpus',action='append',type=int,choices=(1,2,3,4))
     parser.add_argument('--output',type=Path,help='new or empty explicit run directory')
     args=parser.parse_args()
     if bool(args.loader)!=bool(args.library) or (args.loader and args.manifest):
         parser.error('native dynamic profile requires both loader and library, without ABI manifest')
     linux,linux_identity=harness.linux_build(Path(__file__).with_name('linux-user.config'))
     actual_config=linux.parents[3]/'.config'
-    if 'CONFIG_SMP=y' not in actual_config.read_text(): raise RuntimeError('reference is not SMP-enabled')
+    if 'CONFIG_SMP=y' not in actual_config.read_text() or 'CONFIG_NR_CPUS=4' not in actual_config.read_text():
+        raise RuntimeError('reference requires real four-CPU capacity')
     output=create_run_directory(args.output,ROOT/'build/riscv-user-smp'/('abi' if args.manifest else 'runs'))
     # 冻结双方使用的同一个ELF及核；每次启动拥有独立盘，原fixture只作输入。
     snapshots={}

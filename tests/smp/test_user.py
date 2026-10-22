@@ -25,7 +25,7 @@ class UserReport(unittest.TestCase):
             lines.append(f'BoarOS: USER SMP hart=0x{hart:x} traps=0x20 returns=0x20 local-irqs=0x2 syscalls=0x{15 if hart==0 else 7:x}')
         return '\n'.join(lines)
     def test_exact_stream_and_real_harts(self):
-        for cpus in (1,2):self.assertEqual(len(runner.validate(self.valid(cpus),cpus,True)),len(runner.CASES)+2)
+        for cpus in (1,2,3,4):self.assertEqual(len(runner.validate(self.valid(cpus),cpus,True)),len(runner.CASES)+2)
     def test_dynamic_profile_requires_the_dso_tls_observation(self):
         self.assertEqual(len(runner.validate(self.valid(dynamic=True),2,True,dynamic=True)),len(runner.CASES)+3)
         with self.assertRaises(RuntimeError):runner.validate(self.valid(),2,True,dynamic=True)

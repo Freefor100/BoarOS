@@ -7,10 +7,10 @@ struct kernel_scheduler scheduler;
 struct kernel_raw_lock kernel_wait_domain __attribute__((weak));
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu *active;
-static struct kernel_cpu cpus[2];
-static struct kernel_task idles[2], tasks[4];
+static struct kernel_cpu cpus[BOAROS_MAX_CPUS];
+static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[4];
 static pthread_barrier_t gate;
-static struct kernel_task *selected[2];
+static struct kernel_task *selected[BOAROS_MAX_CPUS];
 static unsigned deliveries;
 static struct kernel_cpu publishers[2];
 static unsigned first_claimed;
@@ -77,6 +77,40 @@ static void *publish_and_claim(void *argument)
         }
     }
 }
+
+#if BOAROS_MAX_CPUS == 4
+static void four_claims(void)
+{
+    for (unsigned task_count = 1; task_count <= 4; task_count += 3) {
+        scheduler = (struct kernel_scheduler){0};
+        scheduler.rt_configuration.period_ns = 1000000000;
+        scheduler.rt_configuration.runtime_ns = 950000000;
+        for (unsigned i=0; i<4; i++) {
+            kernel_cpu_initialize(&cpus[i],7+i*19,0);cpus[i].logical_id=i;
+            active=&cpus[i];idles[i]=(struct kernel_task){0};
+            idles[i].wait.on_cpu=1;idles[i].state=KERNEL_THREAD_STATE_IDLE;
+            cpus[i].current=&idles[i];scheduler_cpu_initialize(active,&idles[i],1);
+            selected[i]=0;
+        }
+        active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          for(unsigned i=0;i<task_count;i++)setup_task(i,15,0); }
+        assert(!pthread_barrier_init(&gate,0,4));pthread_t threads[4];
+        for(unsigned i=0;i<4;i++)assert(!pthread_create(&threads[i],0,claim,(void *)(uintptr_t)i));
+        for(unsigned i=0;i<4;i++)assert(!pthread_join(threads[i],0));
+        for(unsigned t=0;t<task_count;t++) {
+            unsigned owners=0;
+            for(unsigned i=0;i<4;i++) {
+                owners+=selected[i]==&tasks[t];
+                assert(!tasks[t].eligible_nodes[i].queued && !cpus[i].eligible.first);
+            }
+            assert(owners==1 && tasks[t].wait.on_cpu && !tasks[t].ready_node.queued);
+        }
+        assert(!scheduler.runqueue.first);pthread_barrier_destroy(&gate);
+    }
+    puts("SMP four simultaneous selectors claim one/four tasks exactly once and remove every eligibility");
+}
+#endif
 
 int main(void)
 {
@@ -146,6 +180,9 @@ int main(void)
     assert(!scheduler.runqueue.first && !cpus[0].eligible.first && !cpus[1].eligible.first);
     assert(tasks[0].wait.on_cpu && tasks[1].wait.on_cpu && tasks[0].cpu != tasks[1].cpu);
     pthread_barrier_destroy(&gate);
+#if BOAROS_MAX_CPUS == 4
+    four_claims();
+#endif
     puts("SMP eligibility FIFO, global membership and concurrent execution claim passed");
     return 0;
 }
