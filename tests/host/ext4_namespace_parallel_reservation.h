@@ -14,20 +14,28 @@ int __real_jbd_trans_prepare_operation(struct jbd_trans *);
 int __wrap_jbd_trans_prepare_operation(struct jbd_trans *trans)
 {
     int result=__real_jbd_trans_prepare_operation(trans);
-    if(result || serial_reservation_watch!=2)return result;
-    assert(ext4_fs_serial_writer(trans->journal->jbd_fs->inode_ref.fs));
-    assert(trans->journal->running && !trans->checkpoint_image);
-    assert(!trans->revoke_count);
-    struct jbd_buf *private;
-    TAILQ_FOREACH(private,&trans->buf_queue,buf_node) {
+    if(result || !serial_reservation_watch)return result;
+    bool serial=ext4_fs_serial_writer(trans->journal->jbd_fs->inode_ref.fs);
+    assert(serial==(serial_reservation_watch!=3));
+    struct jbd_buf *record;
+    TAILQ_FOREACH(record,&trans->buf_queue,buf_node) {
+        assert(record->private_access && record->modified);
+        if(serial_reservation_watch==1 || record->block.lb_id==serial_reservation_lba) {
+            if(record->reserved_rec)serial_reserved++;
+            else {assert(record->block_rec && record->block_rec->private_refs);serial_borrowed++;}
+        }
+    }
+    if(serial_reservation_watch!=2)return result;
+    assert(trans->journal->running && !trans->revoke_count);
+    TAILQ_FOREACH(record,&trans->buf_queue,buf_node) {
         struct jbd_buf *accepted;
         TAILQ_FOREACH(accepted,&trans->journal->running->buf_queue,buf_node)
-            if(accepted->block.lb_id==private->block.lb_id)break;
+            if(accepted->block.lb_id==record->block.lb_id)break;
         assert(accepted);
     }
-    /* The queued real committer cannot replace the group held by this
-     * serial writer. Updating its existing inode needs no new wire node. */
-    assert(!trans->reserved_logs && !trans->reserved_log_images);
+    /* The actual serial writer keeps the running group while using its
+     * existing records and credits, including across lock-free preparation. */
+    assert(!trans->reserved_logs);
     serial_log_saved++;
     return result;
 }
@@ -62,7 +70,7 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
     jbd_memory_set_limit(journal,used);
     assert(!jbd_trans_prepare_operation(trans));
     assert(trans->reservation_group_sequence==sequence && !trans->reserved_logs &&
-           !trans->reserved_log_images && !trans->checkpoint_image && jbd_memory_used(journal)==used);
+           jbd_memory_used(journal)==used);
     jbd_memory_set_limit(journal,limit);
     adapter->locks.unlock(adapter->locks.context);
     assert(jbd_journal_accept(journal,trans,0)==EAGAIN && journal->log_reserved==credits);
@@ -100,21 +108,20 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
         struct ext4_block_payload *pending_accepted=NULL;
         if((unsigned)journal->running->data_cnt==tags-1) {
             pending=serial_log_private(adapter,lba-1);
-            assert(!jbd_trans_prepare_operation(pending) && pending->reserved_logs==1 &&
-                   !pending->reserved_log_images);
+            assert(!jbd_trans_prepare_operation(pending) && pending->reserved_logs==1);
             pending_home=TAILQ_FIRST(&pending->buf_queue)->block.buf;
             pending_accepted=pending_home->current_payload;
         }
         baseline=jbd_memory_used(journal);credits=journal->log_reserved;
-        unsigned images=journal->running->reserved_log_images;
+        unsigned old_logs=journal->running->reserved_logs;
         trans=serial_log_private(adapter,lba);used=jbd_memory_used(journal);
         serial_heap_failure=UINT32_MAX;serial_heap_calls=0;
         assert(!jbd_trans_prepare_operation(trans));
         serial_heap_failure=0;
         unsigned allocations=serial_heap_calls;
         assert(trans->reservation_group_sequence==journal->running->sequence &&
-               trans->reserved_logs==1+trans->reserved_log_images && trans->reserved_log_images<=1);
-        if(trans->reserved_log_images) {
+               (trans->reserved_logs==1 || trans->reserved_logs==2));
+        if(trans->reserved_logs==2) {
             boundary=1;
             heap_prefixes=allocations;assert(heap_prefixes);
             size_t charge=jbd_memory_used(journal)-used;
@@ -148,7 +155,7 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
             jbd_memory_set_limit(journal,limit);
         }
         assert(!jbd_journal_accept(journal,trans,0));
-        assert(journal->running->reserved_log_images==images+boundary);
+        assert(journal->running->reserved_logs==old_logs+1+boundary);
         if(pending) {
             assert(pending->reservation_group_sequence==journal->running->sequence);
             assert(jbd_journal_accept(journal,pending,0)==EAGAIN &&
@@ -162,12 +169,25 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
         assert(!jbd_journal_new_trans(journal,&trans));
         assert(!jbd_trans_revoke_block(trans,adapter->device.lg_bcnt-1));
         assert(!jbd_trans_prepare_operation(trans));
-        if(duplicate)assert(!trans->reserved_logs && !trans->reserved_log_images);
+        if(duplicate)assert(!trans->reserved_logs);
         assert(!jbd_journal_accept(journal,trans,0) && journal->running->revoke_count==1);
     }
+    /* The operation fits alone, but the current group's union does not.
+     * Only this reclaimable failure should ask the caller to drain and retry. */
+    uint32_t maxlen=wire->maxlen;
+    unsigned capacity=journal->running->reserved_logs+1;
+    assert(capacity>4);
+    wire->maxlen=to_be32(journal->first+capacity);
+    credits=journal->log_reserved;baseline=jbd_memory_used(journal);
+    trans=serial_log_private(adapter,adapter->device.lg_bcnt-900);
+    assert(jbd_trans_prepare_operation(trans)==ENOSPC &&
+        trans->operation.log_reservation_failed);
+    jbd_journal_free_trans(journal,trans,true);
+    assert(journal->log_reserved==credits && jbd_memory_used(journal)==baseline);
+    wire->maxlen=maxlen;
     jbd_memory_set_cache_disabled(journal,false);
     adapter->locks.unlock(adapter->locks.context);
-    printf("PASS serial log delta: real qualification/target loss, same-sequence shape change, duplicate LBA/revoke, descriptor boundary, exact quota and %u actual OOM prefixes return owners\n",heap_prefixes);
+    printf("PASS serial log delta: real qualification/target loss, same-sequence shape change, duplicate LBA/revoke, descriptor boundary, exact quota, reclaimable group overflow and %u actual OOM prefixes return owners\n",heap_prefixes);
 }
 int __real_jbd_trans_get_write_access_range(struct jbd_trans *,struct ext4_block *,uint32_t,uint32_t);
 int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_block *block,
@@ -180,22 +200,7 @@ int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_
     assert(record && record->private_access && record->after && record->block.payload &&
         record->block.payload!=&record->after->payload &&
         block->payload==&record->after->payload && block->data==record->after->data);
-    if(serial_reservation_watch==1) {
-        assert(ext4_fs_serial_writer(trans->operation.fs));
-        if(record->reserved_rec)serial_reserved++;
-    } else if(block->lb_id==serial_reservation_lba) {
-        if(serial_reservation_watch==2) {
-            assert(ext4_fs_serial_writer(trans->operation.fs) && !record->reserved_rec);
-            serial_borrowed++;
-        } else {
-            assert(!ext4_fs_serial_writer(trans->operation.fs));
-            if (record->reserved_rec) serial_reserved++;
-            else {
-                assert(record->block_rec && record->block_rec->private_refs);
-                serial_borrowed++;
-            }
-        }
-    }
+    assert(!record->block_rec && !record->reserved_rec);
     return result;
 }
 static void *serial_commit(void *argument)

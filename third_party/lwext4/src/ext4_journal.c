@@ -615,8 +615,12 @@ static int jbd_block_get(struct jbd_fs *jbd_fs,
 
 	/* Lookup the logical block address of
 	 * fblock.*/
-	rc = jbd_inode_bmap(jbd_fs, iblock,
-			    &fblock);
+	struct jbd_journal *journal = bdev->journal;
+	if (journal && journal->jbd_fs == jbd_fs && journal->log_map) {
+		if (iblock >= jbd_get32(&jbd_fs->sb, maxlen)) return EUCLEAN;
+		fblock = journal->log_map[iblock];
+		rc = EOK;
+	} else rc = jbd_inode_bmap(jbd_fs, iblock, &fblock);
 	if (rc != EOK)
 		return rc;
 
@@ -651,39 +655,6 @@ static int jbd_block_set(struct jbd_fs *jbd_fs,
 	return r != EOK ? r : release;
 }
 
-/* Reserve all log buffers, mappings and transaction space before touching
- * ordered data. Otherwise a later ENOMEM could roll back inode size while
- * leaving already-written data outside the aborted size change visible. */
-struct jbd_log_batch;
-struct jbd_log_block {
-	struct ext4_block_write io;
-	struct ext4_block_write *escaped_rest;
-	const void *escaped_prefix;
-	struct ext4_block block;
-	struct jbd_image *image;
-	TAILQ_ENTRY(jbd_log_block) node;
-	struct jbd_log_batch *batch;
-};
-
-struct jbd_log_batch {
-    unsigned remaining;
-    struct jbd_log_block nodes[];
-};
-
-static void jbd_log_free(struct jbd_log_block *log)
-{
-    struct jbd_log_batch *batch = log->batch;
-    jbd_image_free(log->image);
-    if (!batch) jbd_free(log);
-    else {
-        /* Siblings start in one private operation and move together into one
-         * group. STATE trims that group; its frozen consumer then owns every
-         * survivor through I/O completion. No cross-group release races exist. */
-        if (!batch->remaining) __builtin_trap();
-        if (!--batch->remaining) jbd_free(batch);
-    }
-}
-
 static unsigned jbd_log_free_blocks(const struct jbd_journal *journal)
 {
 	uint32_t capacity = jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->first;
@@ -707,196 +678,81 @@ static unsigned jbd_log_images_needed(const struct jbd_journal *journal,
 		revokes / entries + (revokes % entries != 0) + commit;
 }
 
-/* 可写控制块在队头，借用 metadata 的 payload 节点在队尾；两类预留
- * 分开计数和取用，合并/裁剪不必重复扫描累计的事务。 */
-static void jbd_log_reserve_insert(struct jbd_trans *trans, struct jbd_log_block *log)
-{
-	if (log->image) {
-		TAILQ_INSERT_HEAD(&trans->log_reserve, log, node);
-		trans->reserved_log_images++;
-	} else TAILQ_INSERT_TAIL(&trans->log_reserve, log, node);
-	trans->reserved_logs++;
-}
-
-static struct jbd_log_block *jbd_log_unreserve(struct jbd_trans *trans, bool image)
-{
-	struct jbd_log_block *log = image ? TAILQ_FIRST(&trans->log_reserve) :
-		TAILQ_LAST(&trans->log_reserve, jbd_trans_log);
-	if (!log || !!log->image != image || !trans->reserved_logs) __builtin_trap();
-	TAILQ_REMOVE(&trans->log_reserve, log, node);
-	trans->reserved_logs--;
-    /* Freeze turns the complete reservation into one occupied ring range.
-     * Its encoder consumes private nodes, not another operation's credits. */
-    if (!trans->start_iblock) {
-        if (!trans->journal->log_reserved) __builtin_trap();
-        trans->journal->log_reserved--;
-    }
-	if (image) {
-		if (!trans->reserved_log_images) __builtin_trap();
-		trans->reserved_log_images--;
-	}
-	return log;
-}
-
-static int jbd_reserve_log_images(struct jbd_trans *trans, unsigned images)
-{
-	while (trans->reserved_log_images < images) {
-		struct jbd_log_block *log = TAILQ_LAST(&trans->log_reserve, jbd_trans_log);
-		if (!log || log->image) __builtin_trap();
-		struct jbd_image *image = jbd_image_alloc(trans->journal);
-		if (!image) return ENOMEM;
-		TAILQ_REMOVE(&trans->log_reserve, log, node);
-		log->image = image;
-		TAILQ_INSERT_HEAD(&trans->log_reserve, log, node);
-		trans->reserved_log_images++;
-	}
-	return EOK;
-}
-
-static void jbd_trim_reserved_logs(struct jbd_trans *trans, unsigned credits, unsigned images)
-{
-	if (credits < images || trans->reserved_logs < credits || trans->reserved_log_images < images) __builtin_trap();
-	while (trans->reserved_logs > credits)
-		jbd_log_free(jbd_log_unreserve(trans, trans->reserved_log_images > images));
-	while (trans->reserved_log_images > images) {
-		struct jbd_log_block *log = TAILQ_FIRST(&trans->log_reserve);
-		if (!log || !log->image) __builtin_trap();
-		TAILQ_REMOVE(&trans->log_reserve, log, node);
-		jbd_image_free(log->image); log->image = NULL;
-		TAILQ_INSERT_TAIL(&trans->log_reserve, log, node);
-		trans->reserved_log_images--;
-	}
-}
 
 static int jbd_group_requirements(struct jbd_journal *journal,
     struct jbd_trans *running, struct jbd_trans *operation,
     unsigned *credits, unsigned *images);
 
-static int jbd_reserve_logs(struct jbd_trans *trans, unsigned payloads, unsigned revokes,
-    bool serial_writer)
+/* STATE protects credits, not wire buffers. A paused preparer therefore
+ * cannot lend storage or an unclaimed ring address to the commit consumer. */
+static int jbd_reserve_logs(struct jbd_trans *trans, bool serial_writer)
 {
-	if (!trans->journal->grouped) return EOK;
-	struct jbd_journal *journal = trans->journal;
-	/* Parallel preparers can outlive the current group and need standalone
-	 * storage. A real serial writer keeps its running group through this
-	 * preparation and acceptance, so only new wire records need storage. */
-	unsigned images = jbd_log_images_needed(journal, payloads, revokes, true);
-	unsigned capacity = jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->first;
-    /* An operation larger than an empty ring cannot become reclaimable. */
+    struct jbd_journal *journal = trans->journal;
+    unsigned payloads = trans->data_cnt, revokes = trans->revoke_count;
+    if (!journal->grouped && !payloads && !revokes) return EOK;
+    unsigned images = jbd_log_images_needed(journal, payloads, revokes, true);
+    unsigned capacity = jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->first;
     if (payloads >= capacity || images >= capacity - payloads) return ENOSPC;
-	unsigned count = payloads + images;
-	{
-        JBD_STATE_SCOPE(journal);
-		if (serial_writer && journal->running) {
-			unsigned combined, combined_images;
-			int result = jbd_group_requirements(journal, journal->running, trans,
-			    &combined, &combined_images);
-			if (result) {
-				trans->operation.log_reservation_failed = true;
-				return result;
-			}
-			if (combined < journal->running->reserved_logs ||
-			    combined_images < journal->running->reserved_log_images) __builtin_trap();
-			count = combined - journal->running->reserved_logs;
-			images = combined_images - journal->running->reserved_log_images;
-			trans->reservation_group_sequence = journal->running->sequence;
-		}
-		unsigned available = jbd_log_free_blocks(journal);
-        if (journal->log_reserved > available) __builtin_trap();
-		if (count > available - journal->log_reserved) {
-			trans->operation.log_reservation_failed = true;
-			return ENOSPC;
-		}
-        /* Claim the complete credit delta before allocating private nodes.
-         * Other preparers and sealing see these credits throughout the
-         * unlocked allocation; none can reuse them before abort returns them. */
-        journal->log_reserved += count;
+    unsigned count = payloads + images;
+    if (journal->grouped && serial_writer && journal->running) {
+        unsigned combined, combined_images;
+        int result = jbd_group_requirements(journal, journal->running, trans,
+            &combined, &combined_images);
+        if (result) {
+            /* This operation fits alone; draining the current group can make
+             * room. Preserve that distinction through abort to its caller. */
+            trans->operation.log_reservation_failed = true;
+            return result;
+        }
+        if (combined < journal->running->reserved_logs) __builtin_trap();
+        count = combined - journal->running->reserved_logs;
+        trans->reservation_group_sequence = journal->running->sequence;
     }
-	while (count) {
-        /* 4/2/1 keeps the existing per-node charge without a large allocation.
-         * Partial trim retains the whole allocated block until its last node;
-         * its actual charge stays with the original journal memory owner. */
-        unsigned nodes = count >= 4 ? 4 : count >= 2 ? 2 : 1;
-        struct jbd_log_batch *batch = NULL;
-        struct jbd_log_block *logs;
-        if (nodes == 1) logs = jbd_alloc(journal, sizeof(*logs));
-        else {
-            batch = jbd_alloc(journal, sizeof(*batch) + nodes * sizeof(*logs));
-            logs = batch ? batch->nodes : NULL;
-        }
-		if (!logs) {
-            JBD_STATE_SCOPE(journal);
-            if (journal->log_reserved < count) __builtin_trap();
-            journal->log_reserved -= count;
-            return ENOMEM;
-        }
-        if (batch) batch->remaining = nodes;
-        for (unsigned i = 0; i < nodes; i++) {
-            logs[i].batch = batch;
-            jbd_log_reserve_insert(trans, &logs[i]);
-        }
-        count -= nodes;
-	}
-	return jbd_reserve_log_images(trans, images);
-}
-
-static int jbd_prepare_block_get(struct jbd_trans *trans,
-				 struct ext4_block *block, ext4_fsblk_t index, const void *source)
-{
-	struct jbd_fs *fs = trans->journal->jbd_fs;
-	struct jbd_log_block *log;
-	if (trans->journal->grouped) {
-		log = jbd_log_unreserve(trans, !source);
-	} else {
-		log = jbd_alloc(trans->journal, sizeof(*log));
-		if (log && !source) {
-			log->image = jbd_image_alloc(trans->journal);
-			if (!log->image) { jbd_free(log); log = NULL; }
-		}
-	}
-	if (!log) return ENOMEM;
-	int r = EOK;
-	if (trans->journal->grouped) log->block.lb_id = trans->journal->log_map[index];
-	else r = jbd_inode_bmap(fs, (ext4_lblk_t)index, &log->block.lb_id);
-	if (r != EOK) {
-		jbd_log_free(log);
-		return r;
-	}
-	/* These temporary write images have a transaction owner, not a place
-	 * in the home-block LRU. Reserving a large log must not evict unrelated
-	 * dirty file data merely to obtain temporary serialization buffers. */
-	log->block.data = source ? (uint8_t *)source : log->image->data;
-	TAILQ_INSERT_TAIL(&trans->log_queue, log, node);
-	*block = log->block;
-	return EOK;
-}
-
-static int jbd_prepare_block_set(struct jbd_trans *trans __unused,
-				 struct ext4_block *block)
-{
-	/* The queue retains the sole reference; the builder relinquishes its
-	 * borrowed descriptor without triggering an early log write. */
-	*block = (struct ext4_block)EXT4_BLOCK_ZERO();
-	return EOK;
+    unsigned available = jbd_log_free_blocks(journal);
+    if (journal->log_reserved > available) __builtin_trap();
+    if (count > available - journal->log_reserved) {
+        trans->operation.log_reservation_failed = true;
+        return ENOSPC;
+    }
+    journal->log_reserved += count;
+    trans->reserved_logs = count;
+    return EOK;
 }
 
 static void jbd_release_prepared(struct jbd_trans *trans)
 {
-	struct jbd_log_block *log;
-	while ((log = TAILQ_FIRST(&trans->log_queue))) {
-		TAILQ_REMOVE(&trans->log_queue, log, node);
-		jbd_log_free(log);
-	}
-	while ((log = TAILQ_FIRST(&trans->log_reserve))) {
-		TAILQ_REMOVE(&trans->log_reserve, log, node);
-		if (trans->journal->grouped && !trans->start_iblock) {
-			if (!trans->journal->log_reserved) __builtin_trap();
-			trans->journal->log_reserved--;
-		}
-		jbd_log_free(log);
-	}
-	trans->reserved_logs = 0;
-	trans->reserved_log_images = 0;
+    if (trans->journal->log_reserved < trans->reserved_logs) __builtin_trap();
+    trans->journal->log_reserved -= trans->reserved_logs;
+    trans->reserved_logs = 0;
+}
+
+static void jbd_trim_reserved_logs(struct jbd_trans *trans, unsigned credits)
+{
+    if (trans->reserved_logs < credits) __builtin_trap();
+    unsigned unused = trans->reserved_logs - credits;
+    if (trans->journal->log_reserved < unused) __builtin_trap();
+    trans->journal->log_reserved -= unused;
+    trans->reserved_logs = credits;
+}
+
+static void jbd_claim_logs(struct jbd_trans *trans)
+{
+    struct jbd_journal *journal = trans->journal;
+    unsigned credits = trans->reserved_logs;
+    if (!credits || trans->alloc_blocks || trans->frozen ||
+        journal->log_reserved < credits ||
+        journal->log_reserved > jbd_log_free_blocks(journal) ||
+        credits != (unsigned)trans->data_cnt +
+            jbd_log_images_needed(journal, trans->data_cnt, trans->revoke_count, true))
+        __builtin_trap();
+    trans->start_iblock = journal->last;
+    trans->alloc_blocks = credits;
+    trans->frozen = true;
+    uint64_t end = (uint64_t)journal->last + credits;
+    wrap(&journal->jbd_fs->sb, end);
+    journal->last = (uint32_t)end;
+    journal->log_reserved -= credits;
+    trans->reserved_logs = 0;
 }
 
 /* Nodes belong to the already charged stable version/control owners. The
@@ -929,50 +785,6 @@ static void jbd_ordered_phase(struct jbd_trans *trans, struct jbd_io_phase *phas
         jbd_phase_add(trans->journal, phase, &data->io, data->block.data,
             data->block.lb_id, 0, trans->journal->block_size);
 }
-static void jbd_prepare_phase(struct jbd_trans *trans)
-{
-    struct jbd_journal *journal = trans->journal;
-    struct jbd_io_phase phase = {0};
-    jbd_ordered_phase(trans, &phase);
-    struct jbd_log_block *log;
-    TAILQ_FOREACH(log, &trans->log_queue, node) {
-        if (!TAILQ_NEXT(log, node)) break;
-        if (log->escaped_prefix) {
-            uint32_t prefix = journal->jbd_fs->bdev->bdif->ph_bsize;
-            if (prefix < sizeof(uint32_t)) prefix = sizeof(uint32_t);
-            memcpy((void *)log->escaped_prefix, log->block.data, prefix);
-            ((struct jbd_bhdr *)log->escaped_prefix)->magic = 0;
-            jbd_phase_add(journal, &phase, &log->io, log->escaped_prefix,
-                log->block.lb_id, 0, prefix);
-            if (prefix < journal->block_size)
-                jbd_phase_add(journal, &phase, log->escaped_rest, log->block.data + prefix,
-                    log->block.lb_id, prefix, journal->block_size - prefix);
-        } else jbd_phase_add(journal, &phase, &log->io, log->block.data,
-            log->block.lb_id, 0, journal->block_size);
-    }
-    trans->io_head = phase.first;
-}
-static int jbd_write_prepared(struct jbd_trans *trans, bool *submitted)
-{
-    struct ext4_blockdev *bdev = trans->journal->jbd_fs->bdev;
-    if (!trans->frozen) jbd_prepare_phase(trans);
-    int r;
-    {
-        COST_PHASE_SCOPE(precommit_body, 2);
-        r = ext4_blocks_set_phase(bdev, trans->io_head);
-        if (r == EOK) r = ext4_blockdev_flush(bdev);
-    }
-    if (r == EOK) {
-        struct jbd_log_block *commit = TAILQ_LAST(&trans->log_queue, jbd_trans_log);
-        if (!commit) __builtin_trap();
-        *submitted = true;
-        r = ext4_blocks_set_direct(bdev, commit->block.data, commit->block.lb_id, 1);
-        if (r == EOK) r = ext4_blockdev_flush(bdev);
-    }
-    if (!trans->frozen) jbd_release_prepared(trans);
-    return r;
-}
-
 /**@brief  helper functions to calculate
  *         block tag size, not including UUID part.
  * @param  jbd_fs jbd filesystem
@@ -1692,6 +1504,37 @@ static int jbd_journal_update_super(struct jbd_journal *journal, bool active)
  * @param  jbd_fs jbd filesystem
  * @param  journal current journal session
  * @return standard error code*/
+static void jbd_release_session_storage(struct jbd_journal *journal)
+{
+    jbd_image_free(journal->commit_image);
+    jbd_image_free(journal->checkpoint_image);
+    journal->commit_image = journal->checkpoint_image = NULL;
+    jbd_free(journal->log_map);
+    journal->log_map = NULL;
+}
+
+static int jbd_prepare_session_storage(struct jbd_journal *journal)
+{
+    uint32_t blocks = jbd_get32(&journal->jbd_fs->sb, maxlen);
+    size_t bytes = (size_t)blocks * sizeof(*journal->log_map);
+    if (bytes / sizeof(*journal->log_map) != blocks) return ENOMEM;
+    journal->log_map = jbd_alloc(journal, bytes);
+    if (!journal->log_map) return ENOMEM;
+    for (uint32_t i = 0; i < blocks; i++) {
+        int result = jbd_inode_bmap(journal->jbd_fs, i, &journal->log_map[i]);
+        if (result) return result;
+    }
+    journal->commit_image = jbd_image_alloc(journal);
+    journal->checkpoint_image = jbd_image_alloc(journal);
+    if (!journal->commit_image || !journal->checkpoint_image) return ENOMEM;
+    /* Only start/sequence/checksum change during this session. Keep the
+     * immutable parameters here so checkpoint need not copy a live sb. */
+    memcpy(journal->checkpoint_image->data, &journal->jbd_fs->sb, sizeof(struct jbd_sb));
+    memset((uint8_t *)journal->checkpoint_image->data + sizeof(struct jbd_sb), 0,
+        journal->block_size - sizeof(struct jbd_sb));
+    return EOK;
+}
+
 int jbd_journal_start(struct jbd_fs *jbd_fs,
 		      struct jbd_journal *journal)
 {
@@ -1727,6 +1570,13 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	RB_INIT(&journal->block_rec_root);
 	RB_INIT(&journal->sources);
 	journal->jbd_fs = jbd_fs;
+    TAILQ_INIT(&journal->sealed_queue);
+    r = jbd_prepare_session_storage(journal);
+    if (r) {
+        jbd_release_session_storage(journal);
+        jbd_memory_stop(journal);
+        return r;
+    }
 	/* From this point the mount owns a live journal, including on failure. */
 	jbd_fs->bdev->journal = journal;
 	fs->journaled_session = true;
@@ -1755,6 +1605,7 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 		}
         else {
             jbd_fs->bdev->journal = NULL;
+            jbd_release_session_storage(journal);
             jbd_memory_stop(journal);
         }
 	}
@@ -1886,38 +1737,11 @@ int jbd_journal_stop(struct jbd_journal *journal)
 		r = ext4_blockdev_flush(jbd_fs->bdev);
 	if (r != EOK)
 		__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
-    else jbd_memory_stop(journal);
-	return r;
-}
-
-/**@brief  Allocate a block in the journal.
- * @param  journal current journal session
- * @param  trans transaction
- * @return allocated block address*/
-static uint32_t jbd_journal_alloc_block(struct jbd_journal *journal,
-					struct jbd_trans *trans)
-{
-    if (journal->grouped && trans->frozen) {
-        if (!trans->reserved_logs || trans->alloc_blocks < 0) __builtin_trap();
-        uint64_t block = (uint64_t)trans->start_iblock + (unsigned)trans->alloc_blocks;
-        wrap(&journal->jbd_fs->sb, block);
-        trans->alloc_blocks++;
-        return (uint32_t)block;
+    else {
+        jbd_release_session_storage(journal);
+        jbd_memory_stop(journal);
     }
-	uint32_t next = journal->last + 1;
-	wrap(&journal->jbd_fs->sb, next);
-	if (next == journal->start) {
-		if (journal->grouped) { trans->error = ENOSPC; return 0; }
-		int r = jbd_journal_purge_cp_trans(journal, true, true);
-		if (r != EOK || next == journal->start) {
-			trans->error = r != EOK ? r : ENOSPC;
-			return 0;
-		}
-	}
-	uint32_t block = journal->last;
-	journal->last = next;
-	trans->alloc_blocks++;
-	return block;
+	return r;
 }
 
 static struct jbd_block_rec *
@@ -1978,72 +1802,12 @@ jbd_trans_change_ownership(struct jbd_block_rec *block_rec,
 static void
 jbd_trans_finish_callback(struct jbd_journal *journal,
 			  const struct jbd_trans *trans,
-			  struct jbd_block_rec *block_rec,
-			  bool abort,
-			  bool revoke)
+			  struct jbd_block_rec *block_rec)
 {
-	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
-	if (block_rec->trans != trans)
-		return;
-
-	if (!abort) {
-		struct jbd_buf *jbd_buf, *tmp;
-		TAILQ_FOREACH_SAFE(jbd_buf,
-				&block_rec->dirty_buf_queue,
-				dirty_buf_node,
-				tmp) {
-			jbd_trans_end_write(fs->bdev->bc,
-					NULL,
-					EOK,
-					jbd_buf);
-		}
-	} else {
-		/*
-		 * We have to roll back data if the block is going to be
-		 * aborted.
-		 */
-		struct jbd_buf *jbd_buf;
-		struct ext4_block jbd_block = EXT4_BLOCK_ZERO(),
-				  block = EXT4_BLOCK_ZERO();
-		jbd_buf = TAILQ_LAST(&block_rec->dirty_buf_queue,
-				jbd_buf_dirty);
-		if (jbd_buf) {
-			if (!revoke) {
-				int r;
-				r = ext4_block_get_noread(fs->bdev, &block, block_rec->lba);
-				if (r == EOK)
-					r = jbd_block_get(journal->jbd_fs, &jbd_block, jbd_buf->jbd_lba);
-				if (r != EOK) {
-					/* The earlier committed transaction still owns its
-					 * log record even when rollback cannot read it. */
-					__atomic_store_n(&journal->error,r,__ATOMIC_RELEASE);
-					jbd_trans_change_ownership(block_rec, jbd_buf->trans);
-					if (block.lb_id)
-						ext4_block_set(fs->bdev, &block);
-					return;
-				}
-				memcpy(block.data, jbd_block.data,
-						journal->block_size);
-
-				jbd_trans_change_ownership(block_rec,
-						jbd_buf->trans);
-
-				block.buf->end_write = jbd_trans_end_write;
-				block.buf->end_write_arg = jbd_buf;
-
-				ext4_bcache_set_flag(jbd_block.buf, BC_TMP);
-				ext4_bcache_set_dirty(block.buf);
-
-				ext4_block_set(fs->bdev, &jbd_block);
-				ext4_block_set(fs->bdev, &block);
-				return;
-			} else {
-				/* The revoked buffer is yet written. */
-				jbd_trans_change_ownership(block_rec,
-						jbd_buf->trans);
-			}
-		}
-	}
+    if (block_rec->trans != trans) return;
+    struct jbd_buf *jb, *next;
+    TAILQ_FOREACH_SAFE(jb, &block_rec->dirty_buf_queue, dirty_buf_node, next)
+        jbd_trans_end_write(journal->jbd_fs->bdev->bc, NULL, EOK, jb);
 }
 
 /* Private preparations retain only the index identity, not the retired
@@ -2060,7 +1824,6 @@ static void jbd_retire_block_rec(struct jbd_journal *journal,
 static struct jbd_block_rec *jbd_borrow_block_rec(struct jbd_journal *journal,
     ext4_fsblk_t lba)
 {
-    JBD_STATE_SCOPE(journal);
     struct jbd_block_rec *record = jbd_trans_block_rec_lookup(journal, lba);
     if (record) {
         if (record->private_refs == UINT32_MAX) __builtin_trap();
@@ -2480,12 +2243,6 @@ static int jbd_initialize_range(struct jbd_buf *jb,
     return EOK;
 }
 
-static void jbd_release_rollback(struct jbd_buf *jb)
-{
-    if (jb->rollback) ext4_block_payload_put(jb->rollback);
-    jb->rollback = NULL;
-}
-
 static int jbd_rebind_private_range(struct jbd_buf *jb,
     struct ext4_block *block, uint32_t offset, uint32_t length)
 {
@@ -2548,19 +2305,8 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     jb = jbd_alloc(journal, sizeof(*jb) +
         2 * jbd_range_map_words(journal) * sizeof(*jb->dirty_ranges));
     if (!jb) return ENOMEM;
-    /* Checkpoint may retire its last accepted transaction while this access
-     * prepares. Hold the actual index record through acceptance or discard;
-     * an unindexed candidate is needed only for an absent LBA. */
-    jb->block_rec = jbd_borrow_block_rec(journal, block->lb_id);
-    bool reserve_rec = !jb->block_rec;
-    if (reserve_rec) jb->reserved_rec = jbd_alloc(journal, sizeof(*jb->reserved_rec));
     jb->after = journal->grouped ? jbd_version(journal, block->buf) : jbd_image_alloc(journal);
-    if ((reserve_rec && !jb->reserved_rec) || !jb->after) {
-        if (jb->after) { if (journal->grouped) jbd_unpin_version(journal, block->buf); jbd_image_free(jb->after); }
-        jbd_put_private_record(journal, jb->block_rec);
-        jbd_free(jb->reserved_rec); jbd_free(jb);
-        return ENOMEM;
-    }
+    if (!jb->after) { jbd_free(jb); return ENOMEM; }
     /* A reference can survive earlier transactions. Its read view remains
      * stable, but a new write must start from the latest accepted version. */
     jb->trans = trans;
@@ -2578,7 +2324,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans, struct ext4_block *block
 /* All records and credits were reserved before publication. Validate the full
  * operation before publishing any home block; unrelated accepted bytes are
  * retained when separate records share one physical block. */
-static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
+static int jbd_publish_private(struct jbd_trans *trans)
 {
     COST_SCOPE(publish_cost, JOURNAL_PUBLISH_TICKS);
     struct jbd_journal *journal = trans->journal;
@@ -2596,10 +2342,6 @@ static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
     }
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
         if (!jb->private_access || !jb->modified) continue;
-        const void *prefix = jbd_range_bit(jb->dirty_ranges, 0) ?
-            jb->after->data : jb->block.buf->data;
-        if (((const struct jbd_bhdr *)prefix)->magic == to_be32(JBD_MAGIC_NUMBER) &&
-            !jb->escaped_prefix) __builtin_trap();
         const uint8_t *base = jbd_before_data(jb), *next = jb->after->data;
         const uint8_t *current = jb->block.buf->data;
         /* Accepted versions are immutable. The original version still being
@@ -2632,15 +2374,7 @@ static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
         if (!jb->private_access || !jb->modified) continue;
         struct ext4_block_payload *current = jb->block.buf->current_payload;
-        if (retain_rollback) {
-            KERNEL_TASK_LOCK_SCOPE(guard, &jb->block.buf->bc->metadata);
-            current = jb->block.buf->current_payload;
-            ext4_block_payload_get(current);
-            jb->was_dirty = ext4_bcache_test_flag(jb->block.buf, BC_DIRTY);
-            jb->rollback = current;
-        }
-        /* grouped 已完成全部失败检查；STATE 稳定 current，合并在发布
-         * 归还 cache 引用前结束。只有即时提交需跨 I/O 保留回滚版本。 */
+        /* STATE keeps the latest accepted version stable through this merge. */
         uint32_t end = journal->block_size / 32;
         for (uint32_t unit = 0;
              (unit = jbd_range_next(jb->dirty_ranges, unit, end, false)) < end;) {
@@ -2649,9 +2383,6 @@ static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
             memcpy((uint8_t *)jb->after->data + first * 32U,
                 current->data + first * 32U, (unit - first) * 32U);
         }
-        if (((struct jbd_bhdr *)jb->after->data)->magic == to_be32(JBD_MAGIC_NUMBER)) {
-            if (!jb->escaped_prefix) __builtin_trap();
-        } else { jbd_free(jb->escaped_prefix); jb->escaped_prefix = NULL; }
         jbd_image_free(jb->before); jb->before = NULL;
         struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, jb->block.lb_id);
         if (jb->block_rec && jb->block_rec != rec) __builtin_trap();
@@ -2678,27 +2409,6 @@ static int jbd_publish_private(struct jbd_trans *trans, bool retain_rollback)
         ext4_bcache_set_dirty(jb->block.buf);
     }
     return EOK;
-}
-
-/* The caller has already removed this access from dirty_buf_queue. Restore
- * existing references in place and return the earlier committed owner. This
- * path performs no I/O and cannot fail after a successful reservation. */
-static void jbd_trans_restore_access(struct jbd_buf *jb)
-{
-	struct ext4_buf *buf = jb->block.buf;
-	struct jbd_buf *previous =
-		TAILQ_LAST(&jb->block_rec->dirty_buf_queue, jbd_buf_dirty);
-    jbd_copy_initialized(jb, jb->after->data, jb->rollback->data);
-    ext4_bcache_publish(buf, jb->rollback);
-	ext4_bcache_set_flag(buf, BC_UPTODATE);
-	if (jb->was_dirty)
-		ext4_bcache_set_dirty(buf);
-	else
-		ext4_bcache_clear_flag(buf, BC_DIRTY);
-	buf->end_write = previous ? jbd_trans_end_write : NULL;
-	buf->end_write_arg = previous;
-	if (previous)
-		jbd_trans_change_ownership(jb->block_rec, previous->trans);
 }
 
 /**@brief  Add block to be revoked to a transaction
@@ -2780,7 +2490,6 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
             if (journal->grouped) jbd_unpin_version(journal, jbd_buf->block.buf);
             ext4_block_set(fs->bdev, &jbd_buf->block);
             jbd_image_free(jbd_buf->after); jbd_image_free(jbd_buf->before);
-            jbd_free(jbd_buf->escaped_prefix);
             jbd_put_private_record(journal, jbd_buf->block_rec);
             jbd_free(jbd_buf->reserved_rec); jbd_free(jbd_buf);
             continue;
@@ -2790,32 +2499,13 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
 			if (!jbd_buf->block.buf->journal_pending) __builtin_trap();
 			jbd_unpin_version(journal, jbd_buf->block.buf);
 		}
-		if (abort && !jbd_buf->rollback) {
-			jbd_buf->block.buf->end_write = NULL;
-			jbd_buf->block.buf->end_write_arg = NULL;
-			ext4_bcache_invalidate_lba(fs->bdev->bc, jbd_buf->block.lb_id, 1);
-			ext4_block_set(fs->bdev, &jbd_buf->block);
-		}
-
-		TAILQ_REMOVE(&jbd_buf->block_rec->dirty_buf_queue,
-			jbd_buf,
-			dirty_buf_node);
-		if (abort && jbd_buf->rollback) {
-			jbd_trans_restore_access(jbd_buf);
-			fs->bdev->cache_write_back++;
-			ext4_block_set(fs->bdev, &jbd_buf->block);
-			fs->bdev->cache_write_back--;
-		} else jbd_trans_finish_callback(journal,
-				trans,
-				block_rec,
-				abort,
-				false);
+        if (abort) __builtin_trap();
+        TAILQ_REMOVE(&jbd_buf->block_rec->dirty_buf_queue, jbd_buf, dirty_buf_node);
+        jbd_trans_finish_callback(journal, trans, block_rec);
 		TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
 		if (jbd_buf->after) {
 			jbd_image_free(jbd_buf->after);
 		}
-		jbd_free(jbd_buf->escaped_prefix);
-		jbd_release_rollback(jbd_buf);
 		jbd_free(jbd_buf);
 	}
 	RB_FOREACH_SAFE(rec, jbd_revoke_tree, &trans->revoke_root,
@@ -2845,7 +2535,6 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
 	}
 	ext4_orphan_trans_finish_state_held(trans, abort);
 	ext4_operation_discard_super_state_held(&trans->operation);
-	jbd_image_free(trans->checkpoint_image);
 	jbd_free(trans);
 }
 
@@ -2856,322 +2545,161 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
     jbd_journal_free_trans_state_held(journal, trans, abort);
 }
 
-/**@brief  Write commit block for a transaction
- * @param  trans transaction
- * @return standard error code*/
-static int jbd_trans_prepare_commit_block(struct jbd_trans *trans)
-{
-	int rc;
-	struct ext4_block block;
-	struct jbd_commit_header *header;
-	uint32_t commit_iblock;
-	struct jbd_journal *journal = trans->journal;
-
-	commit_iblock = jbd_journal_alloc_block(journal, trans);
-	if (!commit_iblock)
-		return trans->error;
-
-	rc = jbd_prepare_block_get(trans, &block, commit_iblock, NULL);
-	if (rc != EOK)
-		return rc;
-
-	memset(block.data, 0, journal->block_size);
-	header = (struct jbd_commit_header *)block.data;
-	jbd_set32(&header->header, magic, JBD_MAGIC_NUMBER);
-	jbd_set32(&header->header, blocktype, JBD_COMMIT_BLOCK);
-	jbd_set32(&header->header, sequence, trans->trans_id);
-
-	if (JBD_HAS_INCOMPAT_FEATURE(&journal->jbd_fs->sb,
-				JBD_FEATURE_COMPAT_CHECKSUM)) {
-		header->chksum_type = JBD_CRC32_CHKSUM;
-		header->chksum_size = JBD_CRC32_CHKSUM_SIZE;
-		jbd_set32(header, chksum[0], trans->data_csum);
-	}
-	jbd_commit_csum_set(journal->jbd_fs, header);
-	rc = jbd_prepare_block_set(trans, &block);
-	return rc;
-}
-
 static void jbd_trans_prune(struct jbd_journal *journal, struct jbd_trans *trans)
 {
-    struct jbd_buf *jbd_buf, *tmp;
-    struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
-	/* Reads reserve rollback ownership but do not become log records. */
-	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node, tmp) {
-        if (jbd_buf->private_access) {
-            if (jbd_buf->modified) continue;
-            TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
-            trans->data_cnt--;
-            if (journal->grouped) jbd_unpin_version(journal, jbd_buf->block.buf);
-            ext4_block_set(fs->bdev, &jbd_buf->block);
-            jbd_image_free(jbd_buf->after); jbd_image_free(jbd_buf->before);
-            jbd_free(jbd_buf->escaped_prefix);
-            jbd_put_private_record(journal, jbd_buf->block_rec);
-            jbd_free(jbd_buf->reserved_rec); jbd_free(jbd_buf);
-            continue;
-        }
-		if (jbd_buf->modified &&
-		    ext4_bcache_test_flag(jbd_buf->block.buf, BC_DIRTY))
-			continue;
-		struct jbd_revoke_rec key = { .lba = jbd_buf->block_rec->lba };
-		TAILQ_REMOVE(&jbd_buf->block_rec->dirty_buf_queue,
-			     jbd_buf, dirty_buf_node);
-		if (jbd_buf->rollback) {
-			jbd_trans_restore_access(jbd_buf);
-		} else {
-			jbd_buf->block.buf->end_write = NULL;
-			jbd_buf->block.buf->end_write_arg = NULL;
-			jbd_trans_finish_callback(journal, trans, jbd_buf->block_rec,
-				true, RB_FIND(jbd_revoke_tree, &trans->revoke_root, &key));
-		}
-		jbd_trans_remove_block_rec(journal, jbd_buf->block_rec, trans);
-		trans->data_cnt--;
-		fs->bdev->cache_write_back++;
-		ext4_block_set(fs->bdev, &jbd_buf->block);
-		fs->bdev->cache_write_back--;
-		TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
-		if (jbd_buf->after) {
-			if (!jbd_buf->block.buf->journal_pending) __builtin_trap();
-			jbd_unpin_version(journal, jbd_buf->block.buf);
-			jbd_image_free(jbd_buf->after);
-		}
-		jbd_free(jbd_buf->escaped_prefix);
-		jbd_release_rollback(jbd_buf);
-		jbd_free(jbd_buf);
-	}
+    struct jbd_buf *jb, *next;
+    TAILQ_FOREACH_SAFE(jb, &trans->buf_queue, buf_node, next) {
+        if (!jb->private_access || jb->block_rec || jb->reserved_rec) __builtin_trap();
+        if (jb->modified) continue;
+        TAILQ_REMOVE(&trans->buf_queue, jb, buf_node);
+        trans->data_cnt--;
+        if (journal->grouped) jbd_unpin_version(journal, jb->block.buf);
+        ext4_block_set(journal->jbd_fs->bdev, &jb->block);
+        jbd_image_free(jb->after);
+        jbd_image_free(jb->before);
+        jbd_free(jb);
+    }
 }
 
-/**@brief  Write descriptor block for a transaction
- * @param  journal current journal session
- * @param  trans transaction
- * @return standard error code*/
-static int jbd_journal_prepare(struct jbd_journal *journal,
-			       struct jbd_trans *trans)
+
+/* A frozen group owns its complete ring interval. The cursor is local to its
+ * real consumer; all addresses and storage were prepared before publication. */
+static uint32_t jbd_wire_next(struct jbd_trans *trans, unsigned *used)
 {
-	int rc = EOK, i = 0;
-	struct ext4_block desc_block = EXT4_BLOCK_ZERO(),
-			  data_block = EXT4_BLOCK_ZERO();
-	int32_t tag_tbl_size = 0;
-	uint32_t desc_iblock = 0;
-	uint32_t data_iblock = 0;
-	char *tag_start = NULL, *tag_ptr = NULL;
-	struct jbd_buf *jbd_buf, *tmp;
-	uint32_t checksum = EXT4_CRC32_INIT;
-	struct jbd_bhdr *bhdr = NULL;
-
-	if (!trans->frozen) jbd_trans_prune(journal, trans);
-
-	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node, tmp) {
-		struct tag_info tag_info = {0};
-		bool uuid_exist = false;
-		bool is_escape = false;
-
-		if (((struct jbd_bhdr *)jbd_buf->block.data)->magic ==
-				to_be32(JBD_MAGIC_NUMBER))
-			is_escape = true;
-
-again:
-		if (!desc_iblock) {
-			desc_iblock = jbd_journal_alloc_block(journal, trans);
-			if (!desc_iblock) {
-				rc = trans->error;
-				break;
-			}
-			rc = jbd_prepare_block_get(trans, &desc_block, desc_iblock, NULL);
-			if (rc != EOK)
-				break;
-
-			memset(desc_block.data, 0, journal->block_size);
-			bhdr = (struct jbd_bhdr *)desc_block.data;
-			jbd_set32(bhdr, magic, JBD_MAGIC_NUMBER);
-			jbd_set32(bhdr, blocktype, JBD_DESCRIPTOR_BLOCK);
-			jbd_set32(bhdr, sequence, trans->trans_id);
-
-			tag_start = (char *)(bhdr + 1);
-			tag_ptr = tag_start;
-			uuid_exist = true;
-			tag_tbl_size = journal->block_size -
-				sizeof(struct jbd_bhdr);
-
-			if (jbd_has_csum(&journal->jbd_fs->sb))
-				tag_tbl_size -= sizeof(struct jbd_block_tail);
-
-			if (!trans->start_iblock)
-				trans->start_iblock = desc_iblock;
-
-		}
-		tag_info.block = jbd_buf->block.lb_id;
-		tag_info.uuid_exist = uuid_exist;
-		tag_info.is_escape = is_escape;
-		/* LAST terminates every descriptor, not just the transaction.
-		 * Account for the first tag's UUID before checking next-tag space. */
-		int tag_bytes = jbd_tag_bytes(journal->jbd_fs);
-		if (i == trans->data_cnt - 1 ||
-		    tag_tbl_size - tag_bytes - (uuid_exist ? UUID_SIZE : 0) < tag_bytes)
-			tag_info.last_tag = true;
-		else
-			tag_info.last_tag = false;
-
-		checksum = jbd_block_csum(journal->jbd_fs, jbd_buf->block.data,
-					 checksum, trans->trans_id, is_escape);
-		tag_info.checksum = checksum;
-
-		if (uuid_exist)
-			memcpy(tag_info.uuid, journal->jbd_fs->sb.uuid,
-					UUID_SIZE);
-
-		rc = jbd_write_block_tag(journal->jbd_fs,
-				tag_ptr,
-				tag_tbl_size,
-				&tag_info);
-		if (rc != EOK) {
-			jbd_meta_csum_set(journal->jbd_fs, bhdr);
-			desc_iblock = 0;
-			rc = jbd_prepare_block_set(trans, &desc_block);
-			if (rc != EOK)
-				break;
-
-			goto again;
-		}
-
-		data_iblock = jbd_journal_alloc_block(journal, trans);
-		if (!data_iblock) {
-			rc = trans->error;
-			jbd_prepare_block_set(trans, &desc_block);
-			desc_iblock = 0;
-			break;
-		}
-		rc = jbd_prepare_block_get(trans, &data_block, data_iblock, jbd_buf->block.data);
-		if (rc != EOK) {
-			desc_iblock = 0;
-			jbd_prepare_block_set(trans, &desc_block);
-			break;
-		}
-
-        if (is_escape) {
-            if (!jbd_buf->escaped_prefix) __builtin_trap();
-            struct jbd_log_block *log = TAILQ_LAST(&trans->log_queue, jbd_trans_log);
-            log->escaped_prefix = jbd_buf->escaped_prefix;
-            log->escaped_rest = &jbd_buf->home_io;
-        }
-		rc = jbd_prepare_block_set(trans, &data_block);
-		if (rc != EOK) {
-			desc_iblock = 0;
-			jbd_prepare_block_set(trans, &desc_block);
-			break;
-		}
-		jbd_buf->jbd_lba = data_iblock;
-		jbd_buf->escaped = is_escape;
-
-		tag_ptr += tag_info.tag_bytes;
-		tag_tbl_size -= tag_info.tag_bytes;
-
-		i++;
-	}
-	if (rc == EOK && desc_iblock) {
-		jbd_meta_csum_set(journal->jbd_fs,
-				(struct jbd_bhdr *)bhdr);
-		trans->data_csum = checksum;
-		rc = jbd_prepare_block_set(trans, &desc_block);
-	}
-
-	return rc;
+    if (*used >= (unsigned)trans->alloc_blocks) __builtin_trap();
+    uint64_t block = (uint64_t)trans->start_iblock + (*used)++;
+    wrap(&trans->journal->jbd_fs->sb, block);
+    return (uint32_t)block;
 }
 
-/**@brief  Write revoke block for a transaction
- * @param  journal current journal session
- * @param  trans transaction
- * @return standard error code*/
-static int
-jbd_journal_prepare_revoke(struct jbd_journal *journal,
-			   struct jbd_trans *trans)
+static int jbd_submit_phase(struct jbd_trans *trans, struct jbd_io_phase *phase)
 {
-	int rc = EOK, i = 0;
-	struct ext4_block desc_block = EXT4_BLOCK_ZERO();
-	int32_t tag_tbl_size = 0;
-	uint32_t desc_iblock = 0;
-	char *blocks_entry = NULL;
-	struct jbd_revoke_rec *rec, *tmp;
-	struct jbd_revoke_header *header = NULL;
-	int32_t record_len = 4;
-	uint32_t checksum_size = jbd_has_csum(&journal->jbd_fs->sb) ?
-		sizeof(struct jbd_revoke_tail) : 0;
-	struct jbd_bhdr *bhdr = NULL;
+    int result = ext4_blocks_set_phase(trans->journal->jbd_fs->bdev, phase->first);
+    *phase = (struct jbd_io_phase){0};
+    return result;
+}
 
-	if (JBD_HAS_INCOMPAT_FEATURE(&journal->jbd_fs->sb,
-				     JBD_FEATURE_INCOMPAT_64BIT))
-		record_len = 8;
-
-	RB_FOREACH_SAFE(rec, jbd_revoke_tree, &trans->revoke_root,
-			  tmp) {
-again:
-		if (!desc_iblock) {
-			desc_iblock = jbd_journal_alloc_block(journal, trans);
-			if (!desc_iblock) {
-				rc = trans->error;
-				break;
-			}
-			rc = jbd_prepare_block_get(trans, &desc_block,
-						  desc_iblock, NULL);
-			if (rc != EOK)
-				break;
-
-			memset(desc_block.data, 0, journal->block_size);
-			bhdr = (struct jbd_bhdr *)desc_block.data;
-			jbd_set32(bhdr, magic, JBD_MAGIC_NUMBER);
-			jbd_set32(bhdr, blocktype, JBD_REVOKE_BLOCK);
-			jbd_set32(bhdr, sequence, trans->trans_id);
-			
-			header = (struct jbd_revoke_header *)bhdr;
-			blocks_entry = (char *)(header + 1);
-			tag_tbl_size = journal->block_size -
-				sizeof(struct jbd_revoke_header);
-
-			if (jbd_has_csum(&journal->jbd_fs->sb))
-				tag_tbl_size -= sizeof(struct jbd_block_tail);
-
-			if (!trans->start_iblock)
-				trans->start_iblock = desc_iblock;
-
-		}
-
-		if (tag_tbl_size < record_len) {
-			jbd_set32(header, count,
-				  journal->block_size - tag_tbl_size - checksum_size);
-			jbd_meta_csum_set(journal->jbd_fs, bhdr);
-			bhdr = NULL;
-			desc_iblock = 0;
-			header = NULL;
-			rc = jbd_prepare_block_set(trans, &desc_block);
-			if (rc != EOK)
-				break;
-
-			goto again;
-		}
-		if (record_len == 8) {
-			uint64_t *blocks =
-				(uint64_t *)blocks_entry;
-			*blocks = to_be64(rec->lba);
-		} else {
-			uint32_t *blocks =
-				(uint32_t *)blocks_entry;
-			*blocks = to_be32((uint32_t)rec->lba);
-		}
-		blocks_entry += record_len;
-		tag_tbl_size -= record_len;
-
-		i++;
-	}
-	if (rc == EOK && desc_iblock) {
-		if (header != NULL)
-			jbd_set32(header, count,
-				  journal->block_size - tag_tbl_size - checksum_size);
-
-		jbd_meta_csum_set(journal->jbd_fs, bhdr);
-		rc = jbd_prepare_block_set(trans, &desc_block);
-	}
-
-	return rc;
+static int jbd_encode_submit(struct jbd_trans *trans)
+{
+    struct jbd_journal *journal = trans->journal;
+    struct jbd_fs *fs = journal->jbd_fs;
+    struct ext4_blockdev *bdev = fs->bdev;
+    if (!trans->frozen || !journal->commit_image || !journal->log_map) __builtin_trap();
+    uint8_t *wire = journal->commit_image->data;
+    unsigned used = 0;
+    struct ext4_block_write control_io;
+    struct jbd_io_phase phase = {0};
+    jbd_ordered_phase(trans, &phase);
+    struct jbd_buf *first = TAILQ_FIRST(&trans->buf_queue);
+    uint32_t checksum = EXT4_CRC32_INIT;
+    unsigned tail = jbd_has_csum(&fs->sb) ? sizeof(struct jbd_block_tail) : 0;
+    int result;
+    while (first) {
+        uint32_t descriptor = jbd_wire_next(trans, &used);
+        memset(wire, 0, journal->block_size);
+        struct jbd_bhdr *header = (void *)wire;
+        jbd_set32(header, magic, JBD_MAGIC_NUMBER);
+        jbd_set32(header, blocktype, JBD_DESCRIPTOR_BLOCK);
+        jbd_set32(header, sequence, trans->trans_id);
+        char *tag = (char *)(header + 1);
+        int remaining = journal->block_size - sizeof(*header) - tail;
+        struct jbd_buf *next = first;
+        bool uuid = true;
+        do {
+            struct jbd_buf *jb = next;
+            next = TAILQ_NEXT(jb, buf_node);
+            bool escape = ((const struct jbd_bhdr *)jb->block.data)->magic ==
+                to_be32(JBD_MAGIC_NUMBER);
+            int bytes = jbd_tag_bytes(fs) + (uuid ? UUID_SIZE : 0);
+            struct tag_info info = {
+                .block = jb->block.lb_id, .uuid_exist = uuid, .is_escape = escape,
+                .last_tag = !next || remaining - bytes < jbd_tag_bytes(fs),
+            };
+            checksum = jbd_block_csum(fs, jb->block.data, checksum, trans->trans_id, escape);
+            info.checksum = checksum;
+            if (uuid) memcpy(info.uuid, fs->sb.uuid, UUID_SIZE);
+            if (jbd_write_block_tag(fs, tag, remaining, &info)) __builtin_trap();
+            jb->jbd_lba = jbd_wire_next(trans, &used);
+            jb->escaped = escape;
+            tag += info.tag_bytes;
+            remaining -= info.tag_bytes;
+            uuid = false;
+            if (info.last_tag) break;
+        } while (next);
+        jbd_meta_csum_set(fs, header);
+        jbd_phase_add(journal, &phase, &control_io, wire,
+            journal->log_map[descriptor], 0, journal->block_size);
+        for (struct jbd_buf *jb = first; jb != next; jb = TAILQ_NEXT(jb, buf_node)) {
+            const void *payload = jb->block.data;
+            if (jb->escaped) {
+                /* End the descriptor's actual DMA borrow before overwriting
+                 * its image. The accepted payload remains immutable. */
+                result = jbd_submit_phase(trans, &phase);
+                if (result) return result;
+                memcpy(wire, payload, journal->block_size);
+                ((struct jbd_bhdr *)wire)->magic = 0;
+                payload = wire;
+            }
+            jbd_phase_add(journal, &phase, &jb->home_io, payload,
+                journal->log_map[jb->jbd_lba], 0, journal->block_size);
+            if (jb->escaped) {
+                result = jbd_submit_phase(trans, &phase);
+                if (result) return result;
+            }
+        }
+        result = jbd_submit_phase(trans, &phase);
+        if (result) return result;
+        first = next;
+    }
+    /* Ordered-only groups also need to finish borrowing the work sources. */
+    if (phase.first) {
+        result = jbd_submit_phase(trans, &phase);
+        if (result) return result;
+    }
+    struct jbd_revoke_rec *revoke = RB_MIN(jbd_revoke_tree, &trans->revoke_root);
+    unsigned entry = JBD_HAS_INCOMPAT_FEATURE(&fs->sb, JBD_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
+    while (revoke) {
+        uint32_t address = jbd_wire_next(trans, &used);
+        memset(wire, 0, journal->block_size);
+        struct jbd_revoke_header *header = (void *)wire;
+        jbd_set32(&header->header, magic, JBD_MAGIC_NUMBER);
+        jbd_set32(&header->header, blocktype, JBD_REVOKE_BLOCK);
+        jbd_set32(&header->header, sequence, trans->trans_id);
+        unsigned offset = sizeof(*header);
+        do {
+            if (entry == 8) { uint64_t value = to_be64(revoke->lba); memcpy(wire + offset, &value, 8); }
+            else { uint32_t value = to_be32((uint32_t)revoke->lba); memcpy(wire + offset, &value, 4); }
+            offset += entry;
+            revoke = RB_NEXT(jbd_revoke_tree, &trans->revoke_root, revoke);
+        } while (revoke && journal->block_size - tail - offset >= entry);
+        jbd_set32(header, count, offset);
+        jbd_meta_csum_set(fs, (struct jbd_bhdr *)wire);
+        jbd_phase_add(journal, &phase, &control_io, wire,
+            journal->log_map[address], 0, journal->block_size);
+        result = jbd_submit_phase(trans, &phase);
+        if (result) return result;
+    }
+    {
+        COST_PHASE_SCOPE(precommit_body, 2);
+        result = ext4_blockdev_flush(bdev);
+    }
+    if (result) return result;
+    uint32_t commit = jbd_wire_next(trans, &used);
+    if (used != (unsigned)trans->alloc_blocks) __builtin_trap();
+    trans->data_csum = checksum;
+    memset(wire, 0, journal->block_size);
+    struct jbd_commit_header *header = (void *)wire;
+    jbd_set32(&header->header, magic, JBD_MAGIC_NUMBER);
+    jbd_set32(&header->header, blocktype, JBD_COMMIT_BLOCK);
+    jbd_set32(&header->header, sequence, trans->trans_id);
+    if (JBD_HAS_INCOMPAT_FEATURE(&fs->sb, JBD_FEATURE_COMPAT_CHECKSUM)) {
+        header->chksum_type = JBD_CRC32_CHKSUM;
+        header->chksum_size = JBD_CRC32_CHKSUM_SIZE;
+        jbd_set32(header, chksum[0], checksum);
+    }
+    jbd_commit_csum_set(fs, header);
+    result = ext4_blocks_set_direct(bdev, wire, journal->log_map[commit], 1);
+    return result ? result : ext4_blockdev_flush(bdev);
 }
 
 /**@brief  Put references of block descriptors in a transaction.
@@ -3185,7 +2713,6 @@ static void jbd_journal_cp_trans(struct jbd_journal *journal, struct jbd_trans *
 	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node,
 			tmp) {
 		struct ext4_block block = jbd_buf->block;
-		jbd_release_rollback(jbd_buf);
 		ext4_block_set(fs->bdev, &block);
 	}
 	fs->bdev->cache_write_back--;
@@ -3215,9 +2742,7 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 
 	jbd_trans_finish_callback(journal,
 			trans,
-			jbd_buf->block_rec,
-			false,
-			false);
+			jbd_buf->block_rec);
 	if (block_rec->trans == trans && buf) {
 		/* Clear the end_write and end_write_arg fields. */
 		buf->end_write = NULL;
@@ -3228,8 +2753,6 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
         if (journal->grouped) jbd_unpin_version(journal, buf);
         jbd_image_free(jbd_buf->after);
     }
-	jbd_free(jbd_buf->escaped_prefix);
-	jbd_release_rollback(jbd_buf);
 	jbd_free(jbd_buf);
 
 	trans->written_cnt++;
@@ -3245,8 +2768,6 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 {
 	int rc = EOK;
 	struct jbd_revoke_rec *rec, *tmp;
-	uint32_t old_last = journal->last;
-	bool commit_submitted = false;
 	if (jbd_journal_error(journal)) {
 		/* A failed commit remains journal-owned even if a caller repeats
 		 * the request; never free the pinned recovery owner here. */
@@ -3260,15 +2781,6 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		jbd_journal_free_trans(journal, trans, true);
 		return rc;
 	}
-
-	trans->trans_id = journal->alloc_trans_id;
-	rc = jbd_journal_prepare(journal, trans);
-	if (rc != EOK)
-		goto Finish;
-
-	rc = jbd_journal_prepare_revoke(journal, trans);
-	if (rc != EOK)
-		goto Finish;
 
 	if (TAILQ_EMPTY(&trans->buf_queue) &&
 	    RB_EMPTY(&trans->revoke_root)) {
@@ -3287,12 +2799,8 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		return rc;
 	}
 
-	rc = jbd_trans_prepare_commit_block(trans);
-	if (rc != EOK)
-		goto Finish;
-	rc = jbd_write_prepared(trans, &commit_submitted);
-	if (rc != EOK)
-		goto Finish;
+	rc = jbd_encode_submit(trans);
+	if (rc != EOK) goto Finish;
     {
     JBD_STATE_SCOPE(journal);
     ext4_orphan_trans_finish_state_held(trans, false);
@@ -3343,16 +2851,6 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 	jbd_journal_cp_trans(journal, trans);
 	return jbd_journal_error(journal);
 Finish:
-	jbd_release_prepared(trans);
-	if ((rc == ENOMEM || rc == ENOSPC) && !jbd_journal_error(journal) &&
-	    !commit_submitted) {
-		/* No commit block was submitted for an allocation failure. The
-		 * incomplete suffix can be reused; completed checkpoints may have
-		 * advanced start meanwhile and must not be rolled back. */
-		journal->last = old_last;
-		jbd_journal_free_trans(journal, trans, true);
-		return rc;
-	}
 	if (rc != EOK) {
 		/* Never recycle possibly committed log blocks after uncertain I/O.
 		 * The journal owns this pinned transaction until recovery/remount. */
@@ -3387,54 +2885,43 @@ int jbd_journal_new_trans(struct jbd_journal *journal, struct jbd_trans **out)
 	trans->error = EOK;
 	TAILQ_INIT(&trans->buf_queue);
 	TAILQ_INIT(&trans->data_queue);
-	TAILQ_INIT(&trans->log_queue);
-	TAILQ_INIT(&trans->log_reserve);
 	*out = trans;
 	return EOK;
 }
 
 int jbd_trans_prepare_operation(struct jbd_trans *trans)
 {
-    struct jbd_journal *journal=trans->journal;
+    struct jbd_journal *journal = trans->journal;
     if (jbd_journal_error(journal) || trans->error)
         return jbd_journal_error(journal) ? jbd_journal_error(journal) : trans->error;
-    if (trans->reserved_logs || trans->reserved_log_images || trans->reservation_group_sequence ||
-        !TAILQ_EMPTY(&trans->log_reserve) || trans->checkpoint_image) __builtin_trap();
-    /* Read-only private views need rollback ownership while executing, but
-     * never consume ring blocks or serialization nodes. */
-    jbd_trans_prune(journal,trans);
+    if (trans->reserved_logs || trans->reservation_group_sequence || trans->frozen) __builtin_trap();
+    jbd_trans_prune(journal, trans);
     if (TAILQ_EMPTY(&trans->buf_queue) && TAILQ_EMPTY(&trans->data_queue) &&
         RB_EMPTY(&trans->revoke_root)) return EOK;
-    int result=EOK;
-    /* The operation retains this backend qualification through preparation. */
-    bool serial_writer=ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs);
-    uint32_t prefix=journal->jbd_fs->bdev->bdif->ph_bsize;
-    if (prefix<sizeof(uint32_t)) prefix=sizeof(uint32_t);
+    bool serial_writer = ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs);
     struct jbd_buf *jb;
-    TAILQ_FOREACH(jb,&trans->buf_queue,buf_node) {
-        if (result) break;
-        if (!jb->private_access || !jb->modified || jb->escaped_prefix) continue;
-        /* Another record can publish a magic prefix after preparation when
-         * this operation leaves unit zero clean. Reserve its real wire sector
-         * before acceptance; accepted payloads are never patched for escape. */
-        if (jbd_range_bit(jb->dirty_ranges,0) &&
-            ((struct jbd_bhdr *)jb->after->data)->magic!=to_be32(JBD_MAGIC_NUMBER)) continue;
-        if (!jbd_range_bit(jb->dirty_ranges,0) &&
-            serial_writer &&
-            ((const struct jbd_bhdr *)jb->block.buf->data)->magic!=to_be32(JBD_MAGIC_NUMBER)) continue;
-        jb->escaped_prefix=jbd_alloc(journal,prefix);
-        if (!jb->escaped_prefix) result=ENOMEM;
+    int result;
+    for (;;) {
+        uint32_t start;
+        {
+            JBD_STATE_SCOPE(journal);
+            TAILQ_FOREACH(jb, &trans->buf_queue, buf_node)
+                if (!jb->block_rec) jb->block_rec = jbd_borrow_block_rec(journal, jb->block.lb_id);
+            result = jbd_reserve_logs(trans, serial_writer);
+            start = journal->start;
+        }
+        if (result != ENOSPC || journal->grouped || TAILQ_EMPTY(&journal->cp_queue)) break;
+        /* Immediate writers previously reclaimed a full ring while encoding.
+         * Reclaim before publication, without STATE or private log mappings. */
+        result = jbd_journal_purge_cp_trans(journal, true, true);
+        if (result || journal->start == start) { if (!result) result = ENOSPC; break; }
     }
-    if (!result && journal->grouped)
-        result=jbd_reserve_logs(trans,trans->data_cnt,trans->revoke_count,serial_writer);
-    if (!result && journal->grouped &&
-        (!serial_writer || !journal->running)) {
-        /* A real serial writer keeps the current running group's checkpoint
-         * alive until acceptance. Parallel operations can outlive its freeze. */
-        trans->checkpoint_image=jbd_image_alloc(journal);
-        if (!trans->checkpoint_image) result=ENOMEM;
+    if (!result) TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
+        if (jb->block_rec) continue;
+        jb->reserved_rec = jbd_alloc(journal, sizeof(*jb->reserved_rec));
+        if (!jb->reserved_rec) { result = ENOMEM; break; }
     }
-    if (result) trans->error=result;
+    if (result) trans->error = result;
     return result;
 }
 
@@ -3445,16 +2932,19 @@ int jbd_trans_prepare_operation(struct jbd_trans *trans)
 int jbd_journal_commit_trans(struct jbd_journal *journal,
 			     struct jbd_trans *trans)
 {
-	if (jbd_journal_error(journal) || trans->error)
-		return __jbd_journal_commit_trans(journal, trans);
-	int r = EOK;
+    if (jbd_journal_error(journal) || trans->error)
+        return __jbd_journal_commit_trans(journal, trans);
+    int result;
     {
-    JBD_STATE_SCOPE(journal);
-    r = jbd_publish_private(trans, true);
+        JBD_STATE_SCOPE(journal);
+        result = jbd_publish_private(trans);
+        if (!result && (!TAILQ_EMPTY(&trans->buf_queue) || !RB_EMPTY(&trans->revoke_root))) {
+            trans->trans_id = journal->alloc_trans_id;
+            jbd_claim_logs(trans);
+        }
     }
-    if (r) { jbd_journal_free_trans(journal, trans, true); return r; }
-	r = __jbd_journal_commit_trans(journal, trans);
-	return r;
+    if (result) { jbd_journal_free_trans(journal, trans, true); return result; }
+    return __jbd_journal_commit_trans(journal, trans);
 }
 
 /* The operation has passed publication: its ranges can now share the same
@@ -3500,8 +2990,7 @@ static void jbd_quarantine_accept(struct jbd_journal *journal,
     }
 }
 
-/* Accepting an operation never allocates or performs I/O. Its rollback images
- * stay private until all version and log credits have been reserved. */
+/* Acceptance validates and publishes already prepared private versions. */
 int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans *operation,
 	uint64_t now_ns)
 {
@@ -3523,13 +3012,11 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 		    running->sequence != operation->reservation_group_sequence) return EAGAIN;
 		unsigned required, required_images;
 		if (jbd_group_requirements(journal, running, operation, &required, &required_images) ||
-		    running->reserved_logs + operation->reserved_logs < required ||
-		    running->reserved_log_images + operation->reserved_log_images < required_images)
+		    running->reserved_logs + operation->reserved_logs < required)
 			return EAGAIN;
 	} else {
 		unsigned required_images=jbd_log_images_needed(journal,operation->data_cnt,operation->revoke_count,true);
-		if (operation->reserved_logs != operation->data_cnt+required_images ||
-		    operation->reserved_log_images != required_images || (!running && !operation->checkpoint_image))
+		if (operation->reserved_logs != operation->data_cnt+required_images)
 			__builtin_trap();
 	}
 	/* Private reservations cover the actual serialized payload/control count.
@@ -3537,7 +3024,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	unsigned credits = operation->reserved_logs + (running ? running->reserved_logs : 0);
 	uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
 	if (credits >= maxlen - journal->first) __builtin_trap();
-    int publication = jbd_publish_private(operation, false);
+    int publication = jbd_publish_private(operation);
     if (publication) return publication;
     ext4_operation_publish_super(&operation->operation);
 	ext4_orphan_trans_finish_state_held(operation, false);
@@ -3564,8 +3051,6 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 				journal->jbd_fs->bdev->cache_write_back++;
 				ext4_block_set(journal->jbd_fs->bdev, &jb->block);
 				journal->jbd_fs->bdev->cache_write_back--;
-                jbd_free(old->escaped_prefix);
-                old->escaped_prefix = jb->escaped_prefix; jb->escaped_prefix = NULL;
             if (jb->after) {
                 ext4_block_rebind(&old->block, &jb->after->payload);
                 jbd_image_free(old->after); old->after = jb->after; jb->after = NULL;
@@ -3595,15 +3080,12 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 			if (RB_FIND(jbd_revoke_tree, &running->revoke_root, rec)) jbd_free(rec);
 			else { RB_INSERT(jbd_revoke_tree, &running->revoke_root, rec); running->revoke_count++; }
 		}
-		struct jbd_log_block *log;
-		while ((log = TAILQ_FIRST(&operation->log_reserve))) {
-			TAILQ_REMOVE(&operation->log_reserve, log, node);
-			jbd_log_reserve_insert(running, log);
-		}
-		jbd_image_free(operation->checkpoint_image); jbd_free(operation);
+        running->reserved_logs += operation->reserved_logs;
+        operation->reserved_logs = 0;
+        jbd_free(operation);
 	}
 	unsigned images = jbd_log_images_needed(journal, running->data_cnt, running->revoke_count, true);
-	jbd_trim_reserved_logs(running, running->data_cnt + images, images);
+	jbd_trim_reserved_logs(running, running->data_cnt + images);
 	COST_ADD(JOURNAL_ACCEPTED, 1);
 	return EOK;
 }
@@ -3628,28 +3110,10 @@ int jbd_journal_freeze(struct jbd_journal *journal)
         ext4_block_rebind(&jb->block, &jb->after->payload);
 	}
 
-	trans->frozen = true;
-	COST_ADD(JOURNAL_GROUPS, 1);
-	COST_ADD(JOURNAL_MEMORY_PEAK, jbd_memory_peak(journal));
-	trans->trans_id = journal->alloc_trans_id;
-	trans->start_iblock = journal->last;
-	unsigned credits = trans->reserved_logs;
-    if (trans->alloc_blocks || !credits || !trans->checkpoint_image ||
-        credits != (unsigned)trans->data_cnt +
-            jbd_log_images_needed(journal, trans->data_cnt, trans->revoke_count, true) ||
-        journal->log_reserved < credits || journal->log_reserved > jbd_log_free_blocks(journal))
-        __builtin_trap();
-    /* Transfer every address before releasing state. The selected commit
-     * owner later encodes this immutable group with its own local cursor. */
-    uint64_t end = (uint64_t)journal->last + credits;
-    wrap(&journal->jbd_fs->sb, end);
-    journal->last = (uint32_t)end;
-    journal->log_reserved -= credits;
-	trans->checkpoint_lba = journal->log_map[0];
-	struct jbd_sb sb = journal->jbd_fs->sb;
-	jbd_set32(&sb, start, journal->last);
-	jbd_set32(&sb, sequence, trans->trans_id + 1);
-	memcpy(trans->checkpoint_image->data, &sb, sizeof(sb));
+    jbd_claim_logs(trans);
+    COST_ADD(JOURNAL_GROUPS, 1);
+    COST_ADD(JOURNAL_MEMORY_PEAK, jbd_memory_peak(journal));
+    trans->trans_id = journal->alloc_trans_id;
 	journal->running = NULL;
 	TAILQ_INSERT_TAIL(&journal->sealed_queue, trans, trans_node);
 	journal->sealed_count++;
@@ -3662,24 +3126,11 @@ int jbd_journal_freeze(struct jbd_journal *journal)
  * records and device I/O use its reserved storage without holding state. */
 int jbd_journal_submit(struct jbd_journal *journal)
 {
-	COST_SCOPE(submit_cost, JOURNAL_SUBMIT_TICKS);
-	struct jbd_trans *trans = journal->committing;
-	if (!trans) return EOK;
+    COST_SCOPE(submit_cost, JOURNAL_SUBMIT_TICKS);
+    struct jbd_trans *trans = journal->committing;
+    if (!trans) return EOK;
     if (jbd_journal_error(journal)) return jbd_journal_error(journal);
-    if (!trans->frozen || trans->alloc_blocks || !TAILQ_EMPTY(&trans->log_queue)) __builtin_trap();
-    unsigned credits = trans->reserved_logs;
-    int result = jbd_journal_prepare(journal, trans);
-    if (!result) result = jbd_journal_prepare_revoke(journal, trans);
-    if (!result) result = jbd_trans_prepare_commit_block(trans);
-    if (result) return result;
-    if (trans->reserved_logs || trans->reserved_log_images ||
-        trans->alloc_blocks != (int)credits) __builtin_trap();
-    memset((uint8_t *)trans->checkpoint_image->data + sizeof(struct jbd_sb), 0,
-        journal->block_size - sizeof(struct jbd_sb));
-    jbd_sb_csum_set(trans->checkpoint_image->data);
-    jbd_prepare_phase(trans);
-	bool submitted = false;
-	return jbd_write_prepared(trans, &submitted);
+    return jbd_encode_submit(trans);
 }
 
 bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
@@ -3776,7 +3227,16 @@ int jbd_journal_checkpoint(struct jbd_journal *journal)
 	}
 	trans = journal->checkpoint_last;
 	COST_PHASE_SCOPE(checkpoint_phase, 4);
-	if (r == EOK) r = ext4_blocks_set_direct(bdev, trans->checkpoint_image->data, trans->checkpoint_lba, 1);
+    if (r == EOK) {
+        uint32_t end = trans->start_iblock + trans->alloc_blocks;
+        wrap(&journal->jbd_fs->sb, end);
+        struct jbd_sb *sb = journal->checkpoint_image->data;
+        jbd_set32(sb, start, end);
+        jbd_set32(sb, sequence, trans->trans_id + 1);
+        memset((uint8_t *)sb + sizeof(*sb), 0, journal->block_size - sizeof(*sb));
+        jbd_sb_csum_set(sb);
+        r = ext4_blocks_set_direct(bdev, sb, journal->log_map[0], 1);
+    }
 	return r != EOK ? r : ext4_blockdev_flush(bdev);
 }
 
@@ -3987,21 +3447,12 @@ int jbd_journal_find_reusable(struct ext4_fs *fs, const void *bitmap,
 
 int jbd_journal_group_init(struct jbd_journal *journal, size_t limit)
 {
-	uint32_t blocks = jbd_get32(&journal->jbd_fs->sb, maxlen);
-	jbd_memory_set_limit(journal, limit);
-	journal->log_map = jbd_alloc(journal, (size_t)blocks * sizeof(*journal->log_map));
-	if (!journal->log_map) return ENOMEM;
-	for (uint32_t i = 0; i < blocks; i++) {
-		int r = jbd_inode_bmap(journal->jbd_fs, i, &journal->log_map[i]);
-		if (r != EOK) {
-			jbd_free(journal->log_map); journal->log_map = NULL;
-			return r;
-		}
-	}
-	TAILQ_INIT(&journal->sealed_queue);
-	journal->grouped = true;
+    if (!journal->log_map || !journal->commit_image || !journal->checkpoint_image) __builtin_trap();
+    if (limit && jbd_memory_used(journal) > limit) return ENOMEM;
+    jbd_memory_set_limit(journal, limit);
+    journal->grouped = true;
     jbd_memory_set_grouped(journal, true);
-	return EOK;
+    return EOK;
 }
 
 void jbd_journal_group_fini(struct jbd_journal *journal)
@@ -4013,7 +3464,6 @@ void jbd_journal_group_fini(struct jbd_journal *journal)
         journal->quarantined_blocks || journal->quarantined_inodes) __builtin_trap();
 	journal->grouped = false;
     jbd_memory_set_grouped(journal, false);
-	jbd_free(journal->log_map); journal->log_map = NULL;
 	jbd_trim_cache(journal, 0);
 }
 

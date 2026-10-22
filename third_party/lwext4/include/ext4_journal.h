@@ -71,18 +71,14 @@ struct jbd_buf {
 	struct jbd_block_rec *reserved_rec;
 	bool escaped;
 	bool modified;
-	bool was_dirty;
 	/* Materialized only when a record's baseline differs from block.payload. */
 	struct jbd_image *before;
 	struct jbd_image *after;
-	/* Actual latest accepted version replaced by provisional publication. */
-	struct ext4_block_payload *rollback;
-	void *escaped_prefix; /* Owns a separately charged physical-sector buffer. */
 	struct ext4_block_write home_io;
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
-	/* Private access borrows the indexed record; accepted access is queued in it. */
+	/* Prepare borrows the index identity; accepted access is queued in it. */
 	struct jbd_block_rec *block_rec;
 	TAILQ_ENTRY(jbd_buf) buf_node;
 	TAILQ_ENTRY(jbd_buf) dirty_buf_node;
@@ -141,14 +137,11 @@ struct jbd_trans {
 	int error;
 	uint64_t sequence;
 	uint64_t first_dirty_ns;
-	unsigned reserved_logs, reserved_log_images;
+	unsigned reserved_logs;
 	/* Nonzero sequence binds a delta reservation to the actual running group. */
 	uint64_t reservation_group_sequence;
 	unsigned ordered_count, revoke_count;
 	bool frozen;
-	struct jbd_image *checkpoint_image;
-	ext4_fsblk_t checkpoint_lba;
-	struct ext4_block_write *io_head;
 
 	struct jbd_journal *journal;
 	struct ext4_orphan_undo *orphan_undo;
@@ -156,8 +149,6 @@ struct jbd_trans {
 	TAILQ_HEAD(jbd_trans_buf, jbd_buf) buf_queue;
 	TAILQ_HEAD(jbd_trans_data, jbd_data) data_queue;
 	RB_HEAD(jbd_data_tree, jbd_data) data_root;
-	TAILQ_HEAD(jbd_trans_log, jbd_log_block) log_queue;
-	struct jbd_trans_log log_reserve;
 	LIST_HEAD(jbd_quarantine_list, jbd_quarantine) quarantine;
 	RB_HEAD(jbd_revoke_tree, jbd_revoke_rec) revoke_root;
 	LIST_HEAD(jbd_trans_block_rec, jbd_block_rec) tbrec_list;
@@ -186,6 +177,8 @@ struct jbd_journal {
 	uint64_t accepted_sequence, sealed_sequence, durable_sequence, checkpoint_sequence;
 	uint64_t seal_target;
 	ext4_fsblk_t *log_map;
+	/* Each actual consumer owns one block until its synchronous I/O ends. */
+	struct jbd_image *commit_image, *checkpoint_image;
 
 	uint32_t first;
 	uint32_t start;
@@ -220,7 +213,7 @@ int jbd_journal_stop(struct jbd_journal *journal);
 int jbd_journal_new_trans(struct jbd_journal *journal, struct jbd_trans **out);
 int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 			      struct ext4_block *block);
-/* Reserve the journal owner and rollback image before changing a buffer. */
+/* Obtain a private replacement before changing a buffer. */
 int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
 int jbd_trans_get_write_access_range(struct jbd_trans *trans,
@@ -276,7 +269,7 @@ int jbd_trans_borrow_private(struct jbd_trans *trans, struct ext4_block *block,
 int jbd_trans_set_block_dirty_range(struct jbd_trans *trans,
     struct ext4_block *block, uint32_t offset, uint32_t length);
 
-/* Prepare final private mutations and escape storage. Parallel grouping
+/* Bind final private mutations and reserve ring space. Parallel grouping
  * reserves standalone credits; a serial writer reserves its bound group's
  * delta. Failure or a lost group requires abort before preparing again. */
 int jbd_trans_prepare_operation(struct jbd_trans *trans);

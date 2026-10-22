@@ -88,9 +88,9 @@ static int read_device(struct ext4_blockdev *b, void *p, uint64_t n, uint32_t c)
 static int write_device(struct ext4_blockdev *b, const void *p, uint64_t n, uint32_t c)
 {
 #ifdef TEST_JBD_CREDIT_PARALLEL
-    if (log_batch_owner.io_active) {
-        CHECK(log_batch_owner.allocation && !log_batch_owner.released);
-        log_batch_owner.io_calls++;
+    if (wire_owner.io_active) {
+        CHECK(wire_owner.image && wire_owner.image->active && wire_owner.image->payload.references);
+        wire_owner.io_calls++;
     }
 #endif
     (void)b; return kernel_block_write_at(&disk.device, n * 512, p, (size_t)c * 512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO;
@@ -103,8 +103,10 @@ static void close_normal_journal(struct ext4_blockdev *dev, struct jbd_journal *
     struct jbd_memory *memory = journal->memory;
     jbd_memory_get(memory);
     if (journal->grouped) jbd_journal_group_fini(journal);
-    CHECK(journal->log_map == NULL && jbd_memory_cached(journal) == 0);
+    CHECK(journal->log_map && journal->commit_image && journal->checkpoint_image &&
+        jbd_memory_cached(journal) == 0);
     CHECK(jbd_journal_stop(journal) == EOK);
+    CHECK(!journal->log_map && !journal->commit_image && !journal->checkpoint_image);
     dev->fs->jbd_journal = NULL;
     dev->journal = NULL;
     CHECK(jbd_put_fs(journal->jbd_fs) == EOK);
@@ -116,6 +118,38 @@ static void close_normal_journal(struct ext4_blockdev *dev, struct jbd_journal *
 }
 
 #ifdef TEST_JBD_CREDIT_PARALLEL
+static void prepared_wire(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    ext4_fsblk_t home)
+{
+    const struct ext4_lock locks = {.state_lock = credit_state_lock,
+        .state_read_lock = credit_state_lock, .state_unlock = credit_state_unlock};
+    dev->fs->os_locks = &locks;
+    jbd_memory_set_cache_disabled(journal, true);
+    struct ext4_block original, private, visible;
+    struct jbd_trans *operation;
+    CHECK(ext4_block_get(dev, &original, home) == EOK);
+    CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
+    CHECK(ext4_block_get(dev, &private, home) == EOK);
+    CHECK(jbd_trans_get_write_access_range(operation, &private, 0, 32) == EOK);
+    private.data[0] = 'W';
+    CHECK(jbd_trans_set_block_dirty_range(operation, &private, 0, 32) == EOK);
+    CHECK(ext4_block_set(dev, &private) == EOK);
+    CHECK(jbd_trans_prepare_operation(operation) == EOK);
+    credit_test.journal = journal; credit_test.paused = true;
+    credit_test.fail_after = 1; credit_test.calls = 0; credit_actor = 1;
+    int result = jbd_journal_commit_trans(journal, operation);
+    credit_actor = 0; credit_test.journal = NULL;
+    printf("prepared wire result=%d postprepare_heap_calls=%u expected=0/0\n",
+        result, credit_test.calls);
+    CHECK(result == EOK && !credit_test.calls && !jbd_journal_error(journal));
+    CHECK(original.data[0] == 'O');
+    CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'W');
+    CHECK(ext4_block_set(dev, &visible) == EOK && ext4_block_set(dev, &original) == EOK);
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS prepared journal needs no encoding allocation; old reader and final owners survive");
+}
+
 static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
 {
@@ -142,6 +176,27 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
         if (!round) older = visible;
         else CHECK(ext4_block_set(dev, &visible) == EOK && older.data[0] == 'A');
     }
+    CHECK(jbd_journal_freeze(journal) == EOK); credit_drain(journal);
+    /* Both preparations miss the same index. B must find A's admitted
+     * record, discard its candidate, and retain both admitted ranges. */
+    struct jbd_trans *candidates[2];
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(jbd_journal_new_trans(journal, &candidates[i]) == EOK);
+        CHECK(ext4_block_get(dev, &private, home) == EOK);
+        CHECK(jbd_trans_get_write_access_range(candidates[i], &private, 128 + i * 32, 32) == EOK);
+        private.data[128 + i * 32] = 'R' + i;
+        CHECK(jbd_trans_set_block_dirty_range(candidates[i], &private, 128 + i * 32, 32) == EOK);
+        CHECK(ext4_block_set(dev, &private) == EOK);
+        CHECK(jbd_trans_prepare_operation(candidates[i]) == EOK);
+        struct jbd_buf *jb = TAILQ_FIRST(&candidates[i]->buf_queue);
+        CHECK(jb && !jb->block_rec && jb->reserved_rec);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        publication_watch(original.buf, 0);
+        CHECK(jbd_journal_accept(journal, candidates[i], 0) == EOK && !publication_owner.buffer);
+    }
+    CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[128] == 'R' && visible.data[160] == 'S');
+    CHECK(ext4_block_set(dev, &visible) == EOK);
     struct jbd_trans *pending;
     CHECK(jbd_journal_new_trans(journal, &pending) == EOK);
     CHECK(ext4_block_get(dev, &private, home) == EOK);
@@ -180,217 +235,115 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
     private.data[0] = 'E';
     CHECK(jbd_trans_set_block_dirty_range(immediate, &private, 0, 32) == EOK);
     CHECK(jbd_trans_prepare_operation(immediate) == EOK);
-    publication_watch(original.buf, 1);
+    publication_watch(original.buf, 0);
     uint64_t writes = disk.writes;
-    /* Fail the first actual log allocation after provisional publication. */
+    /* An armed heap fault must remain unused after preparation. */
     credit_test.journal = journal; credit_test.paused = true;
     credit_test.fail_after = 1; credit_test.calls = 0; credit_actor = 1;
-    CHECK(jbd_journal_commit_trans(journal, immediate) == ENOMEM);
+    CHECK(jbd_journal_commit_trans(journal, immediate) == EOK);
     credit_actor = 0; credit_test.journal = NULL;
-    CHECK(credit_test.calls && !publication_owner.buffer && publication_owner.observed == 5);
-    CHECK(!jbd_journal_error(journal) && !journal->failed_trans && disk.writes == writes);
-    CHECK(private.data[0] == 'C' && private.data[32] == 'D');
+    CHECK(!credit_test.calls && !publication_owner.buffer && publication_owner.observed == 7);
+    CHECK(!jbd_journal_error(journal) && !journal->failed_trans && disk.writes > writes);
+    CHECK(private.data[0] == 'E' && private.data[32] == 'D');
     CHECK(original.data[0] == 'O' && older.data[0] == 'A');
-    CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'C' && visible.data[32] == 'D');
+    CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'E' && visible.data[32] == 'D');
     CHECK(ext4_block_set(dev, &visible) == EOK && ext4_block_set(dev, &private) == EOK);
     CHECK(ext4_block_set(dev, &older) == EOK && ext4_block_set(dev, &original) == EOK);
     close_normal_journal(dev, journal);
     CHECK(fault_block_crash(&disk) == 0);
-    printf("PASS publication owners block=%u: grouped first/merge/stale-cache-only, old readers, immediate rollback after real log OOM, all memory returned\n", dev->lg_bsize);
+    printf("PASS publication owners block=%u: grouped first/merge/stale-cache-only, old readers, immediate commit with encoding heap disabled, all memory returned\n", dev->lg_bsize);
 }
 #endif
 
 #ifdef TEST_JBD_CREDIT_PARALLEL
-static void private_record_borrow(struct ext4_blockdev *dev,
+static void private_record_prepare(struct ext4_blockdev *dev,
     struct jbd_journal *journal, ext4_fsblk_t home)
 {
+    const struct ext4_lock locks = {.state_lock = credit_state_lock,
+        .state_read_lock = credit_state_lock, .state_unlock = credit_state_unlock};
+    dev->fs->os_locks = &locks; dev->fs->jbd_journal = journal;
     CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
-    dev->fs->jbd_journal = journal;
-    jbd_memory_set_cache_disabled(journal, true);
-    for (unsigned scenario = 0; scenario < 5; scenario++) {
-        encoding_accept(dev, journal, home, 0, 'A');
-        struct jbd_block_rec *record = TAILQ_FIRST(&journal->running->buf_queue)->block_rec;
+    for (unsigned round = 0; round < 3; round++) {
         struct jbd_trans *operation;
-        struct ext4_block client;
+        struct ext4_block blocks[4];
         CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
-        CHECK(ext4_block_get(dev, &client, home) == EOK && client.buf->journal_pending);
-        size_t used = jbd_memory_used(journal), limit = jbd_memory_limit(journal);
-        size_t words = (journal->block_size + 2047U) / 2048U;
-        size_t access = jbd_allocation_charge(sizeof(struct jbd_buf) + 2 * words * sizeof(uint64_t));
-        /* The existing accepted home already pays its pin. First fail the
-         * replacement image, then allow exactly the access plus that image. */
-        jbd_memory_set_limit(journal, used + access);
-        CHECK(jbd_trans_get_write_access_range(operation, &client, 32, 32) == ENOMEM);
-        CHECK(jbd_memory_used(journal) == used && TAILQ_EMPTY(&operation->buf_queue));
-        operation->operation.memory_reservation_failed = false;
-        jbd_memory_set_limit(journal, used + access + jbd_image_charge(journal));
-        int result = jbd_trans_get_write_access_range(operation, &client, 32, 32);
-        printf("record borrow budget block=%u scenario=%u result=%d expected=0\n",
-            dev->lg_bsize, scenario, result);
-        CHECK(result == EOK);
-        jbd_memory_set_limit(journal, limit);
-        uint8_t previous = client.data[32];
-        if (scenario != 2) {
-            client.data[32] = 'B';
-            CHECK(jbd_trans_set_block_dirty_range(operation, &client, 32, 32) == EOK);
+        unsigned entries = credit_state_entries;
+        for (unsigned i = 0; i < 4; i++) {
+            CHECK(ext4_block_get(dev, &blocks[i], home + i) == EOK);
+            CHECK(jbd_trans_get_write_access_range(operation, &blocks[i], 0, 32) == EOK);
+            CHECK(jbd_trans_set_block_dirty_range(operation, &blocks[i], 0, 32) == EOK);
         }
-        struct jbd_trans *other = NULL;
-        struct ext4_block second = EXT4_BLOCK_ZERO();
-        if (scenario == 4) {
-            CHECK(jbd_journal_new_trans(journal, &other) == EOK);
-            CHECK(ext4_block_get(dev, &second, home) == EOK);
-            CHECK(jbd_trans_get_write_access_range(other, &second, 64, 32) == EOK);
-            second.data[64] = 'C';
-            CHECK(jbd_trans_set_block_dirty_range(other, &second, 64, 32) == EOK);
-        }
-        /* The private access is the explicit owner while the entire accepted
-         * group seals, reaches disk and retires. No sleep races are involved. */
-        CHECK(jbd_journal_freeze(journal) == EOK);
-        credit_drain(journal);
-        CHECK(RB_ROOT(&journal->block_rec_root) == record && !record->trans &&
-            !record->checkpoint && TAILQ_EMPTY(&record->dirty_buf_queue));
-        struct jbd_trans *data;
-        CHECK(jbd_journal_new_trans(journal, &data) == EOK);
-        CHECK(jbd_trans_try_revoke_block(data, home) == EOK && !data->revoke_count);
-        uint64_t writes = disk.writes, flushes = disk.flushes;
-        char byte = 'D';
-        CHECK(jbd_trans_write_data(data, home, 96, &byte, 1, false, NULL) == EOK);
-        CHECK(!data->revoke_count && disk.writes == writes && disk.flushes == flushes);
-        jbd_journal_free_trans(journal, data, true);
-        if (scenario == 0) {
-            CHECK(jbd_trans_prepare_operation(operation) == EOK);
-            CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
-            CHECK(RB_ROOT(&journal->block_rec_root) == record && record->trans == journal->running);
-        } else if (scenario == 2) {
-            CHECK(jbd_trans_prepare_operation(operation) == EOK);
+        printf("record prepare round=%u private_LBAs=4 independent_state_acquires=%u expected=0\n",
+            round, credit_state_entries - entries);
+        CHECK(credit_state_entries == entries);
+        /* Round one lets the previous accepted owner retire before prepare:
+         * payload loans survive independently and reservation finds new records. */
+        if (round == 1) {
+            CHECK(jbd_journal_freeze(journal) == EOK); credit_drain(journal);
             CHECK(RB_EMPTY(&journal->block_rec_root));
-            CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
-        } else {
-            if (scenario == 3) {
-                jbd_memory_set_limit(journal, jbd_memory_used(journal));
-                CHECK(jbd_trans_prepare_operation(operation) == ENOMEM);
-                jbd_memory_set_limit(journal, limit);
-            }
-            jbd_journal_free_trans(journal, operation, true);
-            CHECK(client.data[32] == previous);
-            if (other) {
-                CHECK(RB_ROOT(&journal->block_rec_root) == record && !record->trans);
-                CHECK(jbd_trans_prepare_operation(other) == EOK);
-                CHECK(jbd_journal_accept(journal, other, 0) == EOK);
-                CHECK(RB_ROOT(&journal->block_rec_root) == record && record->trans == journal->running);
-            } else CHECK(RB_EMPTY(&journal->block_rec_root));
         }
-        CHECK(ext4_block_set(dev, &client) == EOK);
-        if (second.lb_id) CHECK(ext4_block_set(dev, &second) == EOK);
-        if (journal->running) CHECK(jbd_journal_freeze(journal) == EOK);
-        credit_drain(journal);
-        CHECK(RB_EMPTY(&journal->block_rec_root) && !journal->log_reserved);
+        entries = credit_state_entries;
+        CHECK(jbd_trans_prepare_operation(operation) == EOK);
+        CHECK(credit_state_entries == entries + 1);
+        if (round == 2) {
+            CHECK(jbd_journal_freeze(journal) == EOK); credit_drain(journal);
+            struct jbd_buf *jb;
+            TAILQ_FOREACH(jb, &operation->buf_queue, buf_node)
+                CHECK(jb->block_rec && jb->block_rec->private_refs && !jb->block_rec->trans);
+            jbd_journal_free_trans(journal, operation, true);
+            CHECK(RB_EMPTY(&journal->block_rec_root));
+        } else CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
+        for (unsigned i = 0; i < 4; i++) CHECK(ext4_block_set(dev, &blocks[i]) == EOK);
     }
+    CHECK(!journal->log_reserved && !credit_state_depth);
     close_normal_journal(dev, journal);
     CHECK(fault_block_crash(&disk) == 0);
-    puts("PASS existing journal record borrows: exact budget, checkpoint retirement, accept/abort/prune/OOM, two owners and no empty-record revoke/flush");
+    puts("PASS private payloads need no independent STATE; four record identities join one prepare scope, retire-before/after-prepare and abort return owners");
 }
 
-static void log_batch_allocation(struct ext4_blockdev *dev,
+
+
+static void wire_ownership(struct ext4_blockdev *dev,
     struct jbd_journal *journal, ext4_fsblk_t home, unsigned fault)
 {
     CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
     dev->fs->jbd_journal = journal;
     jbd_memory_set_cache_disabled(journal, true);
-    size_t baseline = jbd_memory_used(journal), limit = jbd_memory_limit(journal);
-    for (unsigned count = 1; count <= 9; count++) {
-        struct jbd_trans *operation;
-        CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
-        if (count == 1) {
-            const char byte = 'A';
-            CHECK(jbd_trans_write_data(operation, home, 0, &byte, 1, false, NULL) == EOK);
-        } else if (count == 2) {
-            CHECK(jbd_trans_revoke_block(operation, home + 1) == EOK);
-        } else for (unsigned i = 0; i < count - 2; i++) {
-            struct ext4_block block;
-            CHECK(ext4_block_get(dev, &block, home + i) == EOK);
-            CHECK(jbd_trans_get_write_access_range(operation, &block, 0, 32) == EOK);
-            block.data[0] = 'A';
-            CHECK(jbd_trans_set_block_dirty_range(operation, &block, 0, 32) == EOK);
-            CHECK(ext4_block_set(dev, &block) == EOK);
-        }
-        unsigned images = count == 1 ? 1 : 2;
-        unsigned allocations = count / 4 + (count % 4) / 2 + count % 2;
-        size_t used = jbd_memory_used(journal);
-        /* Nodes keep the previous 128-byte-per-credit budget. Every control
-         * and checkpoint image remains independently reserved and allocated. */
-        size_t bytes = 128U * count + (images + 1U) * jbd_image_charge(journal);
-        jbd_memory_set_limit(journal, used + bytes);
-        credit_test = (__typeof__(credit_test)){.journal = journal, .paused = true};
-        credit_actor = 1;
-        CHECK(jbd_trans_prepare_operation(operation) == EOK);
-        credit_actor = 0;
-        printf("log reserve block=%u nodes=%u heap_calls=%u expected=%u bytes=%zu\n",
-            dev->lg_bsize, count, credit_test.calls, allocations + 2 * (images + 1), bytes);
-        CHECK(credit_test.calls == allocations + 2 * (images + 1));
-        CHECK(jbd_memory_used(journal) == used + bytes &&
-            operation->reserved_logs == count && operation->reserved_log_images == images &&
-            journal->log_reserved == count);
-        credit_test.journal = NULL;
-        jbd_memory_set_limit(journal, limit);
-        jbd_journal_free_trans(journal, operation, true);
-        CHECK(jbd_memory_used(journal) == baseline && !journal->log_reserved &&
-            RB_EMPTY(&journal->block_rec_root));
-    }
-    /* A three-credit group merges two private LBAs. Three of the four new
-     * nodes are trimmed, so the one surviving node must retain its allocation. */
+    struct jbd_image *commit = journal->commit_image, *checkpoint = journal->checkpoint_image;
     encoding_accept(dev, journal, home, 0, 'A');
-    struct jbd_trans *operation;
-    CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
-    for (unsigned i = 0; i < 2; i++) {
-        struct ext4_block block;
-        CHECK(ext4_block_get(dev, &block, home + i) == EOK);
-        CHECK(jbd_trans_get_write_access_range(operation, &block, 0, 32) == EOK);
-        /* The second LBA is deliberately unchanged: this checks real journal
-         * reservation/publication ownership without changing filesystem data. */
-        CHECK(jbd_trans_set_block_dirty_range(operation, &block, 0, 32) == EOK);
-        CHECK(ext4_block_set(dev, &block) == EOK);
-    }
-    log_batch_owner = (__typeof__(log_batch_owner)){.capture = true};
-    CHECK(jbd_trans_prepare_operation(operation) == EOK);
-    log_batch_owner.capture = false;
-    CHECK(log_batch_owner.allocation && !log_batch_owner.released);
-    CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
-    CHECK(journal->running->reserved_logs == 4 && journal->running->reserved_log_images == 2);
-    CHECK(log_batch_owner.allocation && !log_batch_owner.released);
-    CHECK(jbd_journal_freeze(journal) == EOK);
+    CHECK(journal->running->reserved_logs == 3 && journal->log_reserved == 3);
+    CHECK(jbd_journal_freeze(journal) == EOK && !journal->log_reserved);
+    CHECK(journal->sealed_count == 1 && journal->running == NULL);
     CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
-    CHECK(log_batch_owner.allocation && !log_batch_owner.released);
     if (fault == 1) disk.fail_write = disk.writes + 1;
     if (fault == 2) disk.fail_flush = disk.flushes + 1;
-    log_batch_owner.io_active = true;
+    wire_owner = (__typeof__(wire_owner)){.image = commit, .io_active = true};
+    credit_test = (__typeof__(credit_test)){.journal = journal, .paused = true, .fail_after = 1};
+    credit_actor = 1;
     int result = jbd_journal_submit(journal);
-    log_batch_owner.io_active = false;
-    CHECK(log_batch_owner.io_calls);
-    CHECK(result == (fault ? EIO : EOK));
-    CHECK(log_batch_owner.allocation && !log_batch_owner.released);
+    credit_actor = 0; credit_test.journal = NULL; wire_owner.io_active = false;
+    CHECK(result == (fault ? EIO : EOK) && !credit_test.calls && wire_owner.io_calls);
+    CHECK(journal->commit_image == commit && journal->checkpoint_image == checkpoint);
     CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT, result) == result);
     if (fault) {
         CHECK(journal->failed_trans == journal->committing && journal->error == EIO);
-        CHECK(log_batch_owner.allocation && !log_batch_owner.released);
+        CHECK(commit->active && checkpoint->active && commit->payload.references);
         CHECK(fault_block_crash(&disk) == 0);
-        printf("PASS log control partial batch block=%u fault=%u: failed group retains the actual allocation through completed I/O\n",
+        printf("PASS wire owner block=%u fault=%u: failed journal retains real consumers and versions\n",
             dev->lg_bsize, fault);
         return;
     }
-    CHECK(!log_batch_owner.allocation && log_batch_owner.released == 1);
     credit_drain(journal);
-    CHECK(!journal->log_reserved);
     close_normal_journal(dev, journal);
     CHECK(fault_block_crash(&disk) == 0);
-    puts("PASS log control batches: 1..9 standalone credits, exact quota/abort, partial trim, freeze/I/O lifetime and last-node return");
+    puts("PASS wire consumer: scalar quota, immutable versions, no encoding allocation, DMA and final return");
 }
 #endif
 
 static void private_access_oom(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
 {
-    for(unsigned stage=0;stage<4;stage++) {
+    for(unsigned stage=0;stage<3;stage++) {
         jbd_memory_set_cache_disabled(journal,true);jbd_trim_cache(journal,0);
         size_t baseline=jbd_memory_used(journal),limit=jbd_memory_limit(journal);
         struct jbd_trans *operation;CHECK(jbd_journal_new_trans(journal,&operation)==EOK);
@@ -402,8 +355,7 @@ static void private_access_oom(struct ext4_blockdev *dev, struct jbd_journal *jo
         uint32_t refs=client.buf->refctr,payload_refs=loan->references;
         size_t room=0,words=(journal->block_size+2047U)/2048U;
         if(stage>0)room+=jbd_allocation_charge(sizeof(struct jbd_buf)+2*words*sizeof(uint64_t));
-        if(stage>1)room+=jbd_allocation_charge(sizeof(struct jbd_block_rec));
-        if(stage>2)room+=jbd_image_charge(journal);
+        if(stage>1)room+=jbd_image_charge(journal);
         uint64_t denials=jbd_memory_budget_failures(journal);
         jbd_memory_set_limit(journal,jbd_memory_used(journal)+room);
         CHECK(jbd_trans_get_write_access_range(operation,&client,0,32)==ENOMEM);
@@ -432,24 +384,27 @@ static void private_prepare_oom(struct ext4_blockdev *dev, struct jbd_journal *j
         uint32_t offset = typed ? EXT4_SUPERBLOCK_OFFSET % dev->lg_bsize : dev->lg_bsize - 32;
         uint32_t length = typed ? sizeof(struct ext4_sblock) : 32;
         struct ext4_block block;
-        CHECK(ext4_block_get(dev, &block, typed ? EXT4_SUPERBLOCK_OFFSET / dev->lg_bsize : home) == EOK);
+        CHECK(ext4_block_get(dev, &block, typed ? EXT4_SUPERBLOCK_OFFSET / dev->lg_bsize :
+            home + (scenario == 2 ? 16 : 0)) == EOK);
         CHECK(jbd_trans_get_write_access_range(operation, &block, offset, length) == EOK);
         uint8_t *original = malloc(length); CHECK(original); memcpy(original, block.data + offset, length);
         block.data[offset] ^= 1;
         CHECK(jbd_trans_set_block_dirty_range(operation, &block, offset, length) == EOK);
         if (typed) operation->operation.block_delta = -1;
         size_t used = jbd_memory_used(journal);
-        size_t prefix = dev->bdif->ph_bsize;
-        if (prefix < sizeof(uint32_t)) prefix = sizeof(uint32_t);
         uint64_t denials = jbd_memory_budget_failures(journal);
-        /* 第三种先允许真实 prefix，再让最终 log 预留失败；不再为已删除的
-         * 强制 SB beforeimage 制造一个不存在的分配步骤。 */
-        jbd_memory_set_limit(journal, used + (scenario == 2 ? jbd_allocation_charge(prefix) : 0));
-        CHECK(jbd_trans_prepare_operation(operation) == ENOMEM && operation->error == ENOMEM);
+        jbd_memory_set_limit(journal, used);
+        int result = jbd_trans_prepare_operation(operation);
         struct jbd_buf *jb = TAILQ_FIRST(&operation->buf_queue);
-        CHECK(jb && (jb->escaped_prefix != NULL) == (scenario == 2));
-        CHECK(jbd_memory_budget_failures(journal) > denials);
-        CHECK(journal->log_reserved == credits);
+        CHECK(jb && !jb->reserved_rec);
+        if (jb->block_rec) {
+            CHECK(result == EOK && !operation->error);
+            CHECK(jbd_memory_budget_failures(journal) == denials);
+        } else {
+            CHECK(result == ENOMEM && operation->error == ENOMEM);
+            CHECK(jbd_memory_budget_failures(journal) > denials);
+        }
+        CHECK(journal->log_reserved == credits + operation->reserved_logs);
         jbd_memory_set_limit(journal, limit);
         test_operation_bind(dev->fs, NULL); jbd_journal_free_trans(journal, operation, true);
         CHECK(!memcmp(block.data + offset, original, length)); free(original);
@@ -589,8 +544,7 @@ static struct ext4_block private_prefix_interleave(struct ext4_blockdev *dev,
     held.data[260] = 'P'; CHECK(jbd_trans_set_block_dirty_range(first, &held, 256, 32) == EOK);
     CHECK(jbd_trans_prepare_operation(first) == EOK);
     struct jbd_buf *jb = TAILQ_FIRST(&first->buf_queue);
-    CHECK(!jb->before && jb->escaped_prefix);
-    void *prefix = jb->escaped_prefix;
+    CHECK(!jb->before);
     CHECK(ext4_block_get(dev, &block, home) == EOK &&
         jbd_trans_get_write_access_range(second, &block, 0, 32) == EOK);
     memcpy(block.data, "\xc0\x3b\x39\x98", 4);
@@ -601,7 +555,7 @@ static struct ext4_block private_prefix_interleave(struct ext4_blockdev *dev,
     CHECK(held.data[260] == 'P' && !memcmp(held.data, "\xc0\x3b\x39\x98", 4));
     TAILQ_FOREACH(jb, &journal->running->buf_queue, buf_node)
         if (jb->block.lb_id == home) break;
-    CHECK(jb && !jb->before && jb->escaped_prefix == prefix);
+    CHECK(jb && !jb->before);
     return held;
 }
 
@@ -1210,14 +1164,18 @@ int main(int argc, char **argv)
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
 #ifdef TEST_JBD_CREDIT_PARALLEL
-    if (!strcmp(argv[2], "log-batch")) {
+    if (!strcmp(argv[2], "wire-owner")) {
         unsigned fault = argc > 3 ? (unsigned)atoi(argv[3]) : 0;
         CHECK(fault <= 2);
-        log_batch_allocation(&dev, &journal, home, fault);
+        wire_ownership(&dev, &journal, home, fault);
         return 0;
     }
-    if (!strcmp(argv[2], "record-borrow")) {
-        private_record_borrow(&dev, &journal, home);
+    if (!strcmp(argv[2], "record-prepare")) {
+        private_record_prepare(&dev, &journal, home);
+        return 0;
+    }
+    if (!strcmp(argv[2], "prepare-wire")) {
+        prepared_wire(&dev, &journal, home);
         return 0;
     }
     if (!strcmp(argv[2], "publication-owners")) {
@@ -1330,8 +1288,16 @@ int main(int argc, char **argv)
     if (!strncmp(argv[2], "checksum3-revoke", 16))
         CHECK(jbd_trans_revoke_block(tx, home + 1) == EOK);
     uint32_t allocation_start = journal.last;
-    CHECK(jbd_trans_prepare_operation(tx) == EOK);
-    int rc = jbd_journal_commit_trans(&journal, tx);
+    int prepared = jbd_trans_prepare_operation(tx);
+    int rc;
+    if (!strcmp(argv[2], "oversize")) {
+        CHECK(prepared == ENOSPC);
+        jbd_journal_free_trans(&journal, tx, true);
+        rc = prepared;
+    } else {
+        CHECK(prepared == EOK);
+        rc = jbd_journal_commit_trans(&journal, tx);
+    }
     if (!strcmp(argv[2], "oversize")) {
         CHECK(rc == ENOSPC);
         CHECK(journal.error == EOK && journal.failed_trans == NULL);
