@@ -224,7 +224,7 @@ static void exercise(void *argument)
     int startup=kernel_vfs_start_journal_worker(&mount);
     if(startup){virt_uart_puts("journal startup errno=");virt_uart_put_hex((uint64_t)(int64_t)startup);virt_uart_putc('\n');
         struct lwext4_mount_adapter *a=mount.private_data;
-        if(a->device.fs->jbd_journal){virt_uart_puts("journal state error/memory/limit=");virt_uart_put_hex(a->device.fs->jbd_journal->error);virt_uart_putc(' ');virt_uart_put_hex(a->device.fs->jbd_journal->memory_used);virt_uart_putc(' ');virt_uart_put_hex(a->device.fs->jbd_journal->memory_limit);virt_uart_putc('\n');}}
+        if(a->device.fs->jbd_journal){virt_uart_puts("journal state error/memory/limit=");virt_uart_put_hex(a->device.fs->jbd_journal->error);virt_uart_putc(' ');virt_uart_put_hex(jbd_memory_used(a->device.fs->jbd_journal));virt_uart_putc(' ');virt_uart_put_hex(jbd_memory_limit(a->device.fs->jbd_journal));virt_uart_putc('\n');}}
     check(startup==0,20);
     struct lwext4_mount_adapter *adapter=mount.private_data;
     struct jbd_journal *journal=adapter->device.fs->jbd_journal;
@@ -251,10 +251,10 @@ static void exercise(void *argument)
     int synced=kernel_vfs_sync(&file,1,&error);
     if(synced){virt_uart_puts("sync errno/journal memory/limit/accepted/durable/cp=");
         virt_uart_put_hex((uint64_t)(int64_t)synced);virt_uart_putc(' ');
-        virt_uart_put_hex(journal->memory_used);virt_uart_putc(' ');virt_uart_put_hex(journal->memory_limit);virt_uart_putc(' ');
+        virt_uart_put_hex(jbd_memory_used(journal));virt_uart_putc(' ');virt_uart_put_hex(jbd_memory_limit(journal));virt_uart_putc(' ');
         virt_uart_put_hex(journal->accepted_sequence);virt_uart_putc(' ');virt_uart_put_hex(journal->durable_sequence);virt_uart_putc(' ');virt_uart_put_hex(journal->checkpoint_sequence);virt_uart_putc('\n');}
     check(synced==0,23);
-    check(journal->durable_sequence==journal->accepted_sequence && journal->memory_peak<=journal->memory_limit,24);
+    check(journal->durable_sequence==journal->accepted_sequence && jbd_memory_peak(journal)<=jbd_memory_limit(journal),24);
     struct riscv_virtio_mmio_block_statistics statistics;
     riscv_virtio_mmio_block_get_statistics(&device,&statistics);
     check(statistics.max_inflight>1 && statistics.max_inflight<=8,42);
