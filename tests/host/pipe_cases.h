@@ -1,5 +1,6 @@
 /* Real pipe/MM/uaccess; only task execution and notification timing are modeled. */
 #include <kernel/uaccess.h>
+#include "../../kernel/sched/private.h"
 #include <kernel/errno.h>
 #include <kernel/irq.h>
 #include <string.h>
@@ -368,6 +369,19 @@ static void pipe_merge_copy_case(struct kernel_heap *heap)
     puts("PASS pipe same-page merge: reader waits actual writer qualification before consuming/freeing tail");
 }
 
+static void user_pipe_last_close(struct kernel_heap *heap)
+{
+    pipe_bind(0,0);pipe_table(heap);mm_test_bind_files(&files);
+    pipe_bind(1,&files);struct kernel_task *task=kernel_task_current();
+    assert(task);task->arch.user_mode=1;
+    int64_t result;
+    assert(!kernel_files_close(&files,0,&result)&&!result);
+    assert(!kernel_files_close(&files,1,&result)&&!result);
+    task->arch.user_mode=0;
+    assert(!kernel_files_release(&files));pipe_bind(0,0);
+    puts("PASS ordinary user last pipe close on CPU1: endpoint notification and final owner returned locally");
+}
+
 static void pipe_cases(struct kernel_heap *heap)
 {
     uint64_t address;
@@ -377,7 +391,7 @@ static void pipe_cases(struct kernel_heap *heap)
     memset(pipe_payload,0x71,sizeof(pipe_payload)); size_t done;
     assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_CAPACITY+1,&done) && done==KERNEL_PIPE_CAPACITY+1);
     pipe_page_ownership_case(heap);pipe_copy_overlap_case(heap);pipe_merge_copy_case(heap);
-    pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);
+    pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);user_pipe_last_close(heap);
     pipe_packet_case(heap,2); pipe_packet_case(heap,4);
     mm_test_bind_files(0); mm_test_bind(0); mm_test_context=0;
 }

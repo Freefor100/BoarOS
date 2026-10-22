@@ -4,9 +4,11 @@
 
 ## 真实用户态与CPU0业务交接
 
+匿名管道和已打开FIFO的数据路径复用读写资格及metadata短锁；poll在持有整份OFD快照后为设备集合选择执行位置，epoll仅在锁外查询设备时交接。普通用户的无观察者匿名端点可本地最后关闭；关联epoll/FIFO的清理保留CPU0执行。
+
 `SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`；增加 `SMP_CPUS=4` 后使用 `build/riscv-user-smp4/`，受控调度、MM 和成本构建也使用对应的 `smp4` 目录。默认单核与两核缓存不混用。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
 
-通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、socket 控制与协议、epoll 控制与等待等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
+通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、socket 控制与协议、epoll 控制等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
 `kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。返回通知字区分CPU0业务与本地信号，两类消费者分别取走自己的位，业务范围的进入不提前消费通知。普通信号在执行CPU内完成共享状态选择、构帧与sigreturn；组停止/退出及REAL定时器重装进入其CPU0范围。共享action快照、mask和并发通知协议见[信号模块](kernel-signal.md#smp上的状态和执行位置)。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
 
@@ -272,7 +274,7 @@ SEEK_DATA/HOLE 和最终缓存 OFD 释放仍复用该执行队列。需要共享
 
 ### 受控文件任务
 
-受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。非 ext4 命名空间、FIFO、socket/epoll、记录锁及设备业务在实际入口进入 CPU0 范围。未启用 USER_SMP 的服务范围直接消去执行位置判定。默认单核的路径引用由禁止任务抢占的短保护维护；SMP、锁调试和成本诊断构建保留跨核原子引用，USER_SMP 另保留实际执行位置判定。
+受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。普通用户的管道/FIFO数据读写、poll/pselect与epoll等待在发起CPU执行；非ext4命名空间、FIFO打开和关联清理、socket控制/协议、epoll控制、记录锁及设备业务在实际入口进入CPU0范围。未启用 USER_SMP 的服务范围直接消去执行位置判定。默认单核的路径引用由禁止任务抢占的短保护维护；SMP、锁调试和成本诊断构建保留跨核原子引用，USER_SMP 另保留实际执行位置判定。
 
 ```sh
 make test-file-io-concurrency-host

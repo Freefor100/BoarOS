@@ -35,9 +35,9 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 
 共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写先在用户来源 pin 前按后端策略准备真实空间，ext4 在发起 CPU 完成，归还该步骤的 inode writer 后才解析来源；空间接纳与 legacy 格式的完成职责见 [VFS/ext4](vfs-ext4.md#文件节点与页缓存)。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
 
-请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。普通 ext4 文件、目录与 O_PATH 的最后关闭在发起 CPU 结束；缓存退休清理继续由既有 worker 推进。普通用户 pipe 的最后关闭在 CPU0 发布端点变化，因为另一端可以登记 epoll 回调。受控内核 pipe 的普通等待者已在任务创建时限定，不把端点 EOF 推迟到退出清理。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
+请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。普通 ext4 文件、目录与 O_PATH 的最后关闭在发起 CPU 结束；缓存退休清理继续由既有 worker 推进。pipe端点与关联清理按下文[pipe2](#pipe2-与-fifo-endpoint)选择执行位置。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
 
-ext4 路径查找、目录操作与文件元数据在发起 CPU 执行；VFS 在实际解析出的后端选择执行位置。设备、管道、proc 等对象在取得锁和用户页借用前进入所需的 CPU0 范围，嵌套调用借用同一执行资格。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
+ext4 路径查找、目录操作与文件元数据在发起 CPU 执行；VFS 在实际解析出的后端选择执行位置。设备、proc等对象在取得锁和用户页借用前进入所需的CPU0范围，嵌套调用借用同一执行资格。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
 
 `make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持 pin 拒绝及最终引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
 host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。独立 fsync 与范围同步分别停在实际 CPU0 执行入口后，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步排队后只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
@@ -102,6 +102,8 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 ## `pipe2` 与 FIFO endpoint
 
+普通用户的匿名管道、已打开FIFO读写及普通文件到管道的sendfile在发起CPU执行，复用下述片段、读写资格和端点短保护。没有附加观察者的匿名管道末OFD在调用者结束端点并通知；存在epoll登记或FIFO inode时仍沿CPU0完成关联清理。pipe2创建和FIFO路径打开沿原CPU0执行位置。
+
 `kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享16个片段槽；各槽在写入时按需取得一张独立目标页，不要求连续物理区间。空 pipe 只分配对象元数据，最大数据容量仍为16个目标页（RV64KiB、LA256KiB）。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
 读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
@@ -132,7 +134,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - 生产 console 经 [TTY](kernel-tty.md) 接受有界 TX、OPOST 和真实输入；不自动建立 ctty。未发布 serial transport 的裸 console fixture 经 kernel_console_putc/原输入暂存。用户 fault、短计数和阻塞 pin 保持所属请求的真实 owner。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
-- `kernel_files_sync()` pin 选定 OFD，分批交接目标 inode 数据，由 CPU0 prepare 捕获一次元数据 durable 目标，再由原调用者等待 journal 完成。栈上等待请求借用这份实际 OFD/file，关闭并复用 fd 不改变同步对象；CPU0 执行者不陪调用者等待。CPU0 的完成事件一次性记录元数据错误、消费 OFD 错误游标并发布原请求结果，调用者取走结果直接返回；数据交接失败不重复递增错误序号。独立 open 各持观察位置，dup/fork 共用，同一历史错误只被该 OFD 观察一次。独立同步不以文件位置锁覆盖设备等待；普通文件和目录支持 fsync/fdatasync，pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。分批、完成与停止边界见[VFS](vfs-ext4.md#文件节点与页缓存)。
+- `kernel_files_sync()` pin 选定 OFD，分批交接目标 inode 数据，按后端执行策略捕获一次元数据durable目标，ext4在发起CPU准备，再由原调用者等待 journal 完成。栈上等待请求借用这份实际 OFD/file，关闭并复用 fd 不改变同步对象；后端执行者释放准备资格后由日志worker推进。完成事件在共享保护内一次性记录元数据错误、消费 OFD 错误游标并发布原请求结果，调用者取走结果直接返回；数据交接失败不重复递增错误序号。独立 open 各持观察位置，dup/fork 共用，同一历史错误只被该 OFD 观察一次。独立同步不以文件位置锁覆盖设备等待；普通文件和目录支持 fsync/fdatasync，pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。分批、完成与停止边界见[VFS](vfs-ext4.md#文件节点与页缓存)。
 - `RLIMIT_FSIZE`来自原调用者线程组，在本次用户文件操作中以栈上限额对象传到VFS；CPU0执行者借用它，完成后由原调用线程处理SIGXFSZ。普通write/writev及定位变体按限额截短，起点已到限额时返回EFBIG并发送线程定向SI_USER信号；零长度写保留原地址检查。追加偏移在整次写操作保护内取实际EOF。sendfile按splice的剩余buffer继续接纳，因此跨限额时可返回已成功前缀并同时产生SIGXFSZ。
 - truncate仅在扩大文件时应用FSIZE；已支持的fallocate仅mode0扩大EOF时应用，KEEP_SIZE和打洞保持原语义。限额拒绝发生在时间戳、用户复制和映射修改之前。普通内核pwrite、loop内部I/O、mmap脏页写回和已接纳版本的同步使用各自既有约束；下调用户限额不会使旧脏页失去持久化资格。
 - `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
@@ -193,9 +195,7 @@ make test-files-partial-write-riscv
 
 `kernel_files_ppoll()` 与 `kernel_files_pselect6()` 提供 Linux I/O 多路就绪通知：
 
-USER_SMP 中，`nfds=0` 且不替换临时信号掩码的调用在发起 CPU 执行，沿同一等待 token
-处理超时、信号和清理。带 FD 或临时信号掩码的调用仍进入 CPU0 业务范围；
-`pselect6` 先解包掩码参数，空掩码指针不会仅因存在 argpack 而触发迁移。
+USER_SMP 中，FD快照、pipe/socket/epoll及普通文件的就绪查询、临时信号掩码、等待和结果复制在发起CPU执行。引擎先取得整份真实OFD引用，再按对象判断设备集合是否需要CPU0；设备集合在准备等待token前进入原业务范围。嵌套epoll在prepared token期间仅观察就绪提示，实际目标查询留在token结束后。
 
 - **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠，并直接交付该次扫描的结果，不在返回前重复查询。零超时调用只准备 OFD 引用数组，不分配或初始化等待节点。
 - **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均绑定同一个task/代次token），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。登记后的复查和唤醒后的扫描直接填写 revents；登记、复查、park 的顺序仍保证事件不会丢失。
@@ -206,11 +206,11 @@ USER_SMP 中，`nfds=0` 且不替换临时信号掩码的调用在发起 CPU 执
 ## epoll 事件通知子系统
 
 `kernel_files_epoll_create1()`、`kernel_files_epoll_ctl()` 与 `kernel_files_epoll_pwait()`
-负责 fd 安装、目标引用和用户 ABI。创建复用普通 fd 安装原语；表满返回 `EMFILE`，
+负责 fd 安装、目标引用和用户 ABI。等待扫描、事件复制和park在发起CPU执行；创建、控制和最终销毁仍由CPU0完成。多个等待者沿已有scan owner和状态短锁竞争，设备目标只在锁外查询时进入其CPU0执行范围。创建复用普通 fd 安装原语；表满返回 `EMFILE`，
 归还尚未安装的 epoll/OFD，不覆盖已有槽。
 
 登记身份是 `(fd, OFD)`，因此指向同一 OFD 的不同 dup fd 可以分别登记。关闭其中一个
-fd 不会使仍由其他引用保活的登记失效；目标 OFD 最终释放时才解绑关联。支持具有真实
+fd 不会使仍由其他引用保活的登记失效；目标 OFD 最终释放时才解绑关联。登记中的目标指针为弱关联；末引用归零至关闭者取得epoll状态锁解绑之间，扫描可能仍看到登记。扫描在状态保护内尝试取得活OFD引用，归零目标直接跳过；关闭者完成解绑后才释放存储，扫描不会复活关闭中的对象。支持具有真实
 等待通知的 pipe、console、socket 和 epoll；普通文件、目录返回 `EPERM`。自监控返回
 `EINVAL`；五个 epoll 对象到管道的链可建立，第六个 epoll 或成环返回 `ELOOP`。Linux 新版本提前检查深度并返回 ELOOP，旧 LTP 的 EINVAL 单值断言由上游 e84f0689 扩为接受两者。
 
