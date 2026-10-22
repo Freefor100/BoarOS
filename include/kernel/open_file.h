@@ -246,6 +246,9 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
 
 struct kernel_wait_queue;
 
+/* The caller holds an OFD reference while choosing the query execution CPU. */
+int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *file);
+
 uint32_t kernel_open_file_poll(
     struct kernel_open_file_description *file,
     uint32_t requested_events,

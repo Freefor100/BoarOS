@@ -226,6 +226,7 @@ static int core_poll_run(
     int mask_modified,
     uint64_t saved_mask)
 {
+    KERNEL_SERVICE_SCOPE_IF(service, 0);
     struct kernel_open_file_description *stack_pinned[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_wait_node stack_nodes[KERNEL_POLL_STACK_CAPACITY];
 
@@ -264,6 +265,13 @@ static int core_poll_run(
             continue;
         }
     }
+#if BOAROS_USER_SMP
+    /* 先持有真实FD快照，再选择设备执行位置；prepared token期间不迁移。 */
+    for (uint32_t i=0;i<nfds;i++) if (pinned[i] && kernel_open_file_poll_requires_cpu0(pinned[i])) {
+        kernel_service_scope_begin(&service);
+        break;
+    }
+#endif
     ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_ALL, 0);
 
     while (!ready_count && !error && !immediate) {
@@ -329,8 +337,6 @@ enum kernel_files_status kernel_files_ppoll(
     size_t sigsetsize,
     int64_t *linux_result)
 {
-    /* nfds 为零且不替换信号掩码时，只操作调用者自己的超时与等待 token。 */
-    KERNEL_SERVICE_SCOPE_IF(service, nfds || user_sigmask);
     struct kernel_pollfd stack_pfds[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
@@ -512,8 +518,6 @@ enum kernel_files_status kernel_files_pselect6(
         sigsetsize = (size_t)argpack.sigsetsize;
     }
 
-    /* libc 可以传入指向空掩码的 argpack，按解包后的实际指针决定。 */
-    KERNEL_SERVICE_SCOPE_IF(service, nfds > 0 || user_sigmask);
     err = poll_compute_deadline(mm,
                                 user_timeout,
                                 &deadline,

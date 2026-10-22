@@ -195,9 +195,7 @@ make test-files-partial-write-riscv
 
 `kernel_files_ppoll()` 与 `kernel_files_pselect6()` 提供 Linux I/O 多路就绪通知：
 
-USER_SMP 中，`nfds=0` 且不替换临时信号掩码的调用在发起 CPU 执行，沿同一等待 token
-处理超时、信号和清理。带 FD 或临时信号掩码的调用仍进入 CPU0 业务范围；
-`pselect6` 先解包掩码参数，空掩码指针不会仅因存在 argpack 而触发迁移。
+USER_SMP 中，FD快照、pipe/socket/epoll及普通文件的就绪查询、临时信号掩码、等待和结果复制在发起CPU执行。引擎先取得整份真实OFD引用，再按对象判断设备集合是否需要CPU0；设备集合在准备等待token前进入原业务范围。嵌套epoll在prepared token期间仅观察就绪提示，实际目标查询留在token结束后。
 
 - **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠，并直接交付该次扫描的结果，不在返回前重复查询。零超时调用只准备 OFD 引用数组，不分配或初始化等待节点。
 - **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均绑定同一个task/代次token），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。登记后的复查和唤醒后的扫描直接填写 revents；登记、复查、park 的顺序仍保证事件不会丢失。

@@ -1120,6 +1120,11 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
                                  &file->observed_writeback_error);
 }
 
+int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *file)
+{
+    return file && (file->device || file->kind==KERNEL_OPEN_FILE_KIND_CONSOLE);
+}
+
 uint32_t kernel_open_file_poll(
     struct kernel_open_file_description *file,
     uint32_t requested_events,
@@ -1136,6 +1141,7 @@ uint32_t kernel_open_file_poll(
     if (!open_file_live(file)) {
         return KERNEL_POLLNVAL;
     }
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_poll_requires_cpu0(file));
     if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:

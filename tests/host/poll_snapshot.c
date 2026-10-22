@@ -20,6 +20,9 @@ static size_t allocated_bytes;
 static int readable, at_bind, at_park, signalled, stale_hint;
 static unsigned hints;
 static unsigned service_entries, service_exits;
+static int target_cpu0;
+int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *f)
+{ CHECK(f==&target);return target_cpu0; }
 static enum kernel_open_file_kind target_kind;
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
 { CHECK(f==&target);return target_kind; }
@@ -68,7 +71,7 @@ void kernel_heap_release(struct kernel_heap *h,void *p)
 static int run(struct kernel_pollfd *p,unsigned n,int immediate)
 { struct kernel_files f={0};int ret=core_poll_run(&f,NULL,p,n,123,immediate,0,0);CHECK(!refs&&!live&&!allocs);return ret; }
 static void reset(void)
-{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;now_ns=1000; }
+{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=0;target_cpu0=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;now_ns=1000; }
 static void empty_waits(void)
 {
     struct kernel_files files={0};struct kernel_mm mm={0};struct kernel_task task={0};
@@ -88,17 +91,20 @@ static void empty_waits(void)
     CHECK(!service_entries && parks==1 && finishes==1 && !ts.tv_nsec);
     reset();uint64_t mask=4;task.signal_blocked=2;pack.sigmask_ptr=(uintptr_t)&mask;ts=(struct kernel_timespec){0};
     CHECK(!kernel_files_pselect6(&files,&mm,&task,0,0,0,0,(uintptr_t)&ts,(uintptr_t)&pack,&result) && !result);
-    CHECK(service_entries==1 && service_exits==1 && task.signal_blocked==2);
+    CHECK(!service_entries && !service_exits && task.signal_blocked==2);
     reset();
     CHECK(!kernel_files_ppoll(&files,&mm,&task,0,0,1,0,0,&result) && result==-KERNEL_EFAULT);
     CHECK(!service_entries && !parks);
     reset();struct kernel_pollfd fd={7,KERNEL_POLLIN,0};readable=1;
     CHECK(!kernel_files_ppoll(&files,&mm,&task,(uintptr_t)&fd,1,0,0,0,&result) && result==1);
-    CHECK(service_entries==1 && service_exits==1 && !refs && !live && !allocs);
+    CHECK(!service_entries && !service_exits && !refs && !live && !allocs);
     reset();uint64_t readfds=UINT64_C(1)<<7;ts=(struct kernel_timespec){0};readable=1;
     CHECK(!kernel_files_pselect6(&files,&mm,&task,8,(uintptr_t)&readfds,0,0,(uintptr_t)&ts,0,&result) && result==1);
-    CHECK(service_entries==1 && service_exits==1 && readfds==(UINT64_C(1)<<7) && !refs && !live && !allocs);
-    puts("empty ppoll/pselect: local timeout and copy, retained signal/FD service scopes passed");
+    CHECK(!service_entries && !service_exits && readfds==(UINT64_C(1)<<7) && !refs && !live && !allocs);
+    reset();target_cpu0=1;readable=1;
+    CHECK(!kernel_files_ppoll(&files,&mm,&task,(uintptr_t)&fd,1,0,0,0,&result) && result==1);
+    CHECK(service_entries==1 && service_exits==1 && !refs && !live && !allocs);
+    puts("ppoll/pselect: caller signal/FD waits, device snapshot selected before wait registration");
 }
 int main(void)
 {
