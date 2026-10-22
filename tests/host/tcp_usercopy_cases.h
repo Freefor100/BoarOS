@@ -136,9 +136,11 @@ static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
         __atomic_store_n(&tcp_write_edit_closed,1,__ATOMIC_RELEASE);
     }
     if(tcp_write_observing && tcp_write_mode>=4 && tcp_write_queued_request &&
-        tcp_write_queued_request->segments && queue==kernel_socket_wait_queue(tcp_write_client_socket)) {
+        tcp_write_queued_request->segments && !queue) {
         assert(!deadline && !kernel_task_current()->wait.interruptible && tcp_write_held==2 &&
-            !tcp_protocol_held() && tcp_write_queued_request->task==kernel_task_current());
+            !tcp_protocol_held() && tcp_write_queued_request->task==kernel_task_current() &&
+            tcp_write_queued_request->completion.task==kernel_task_current() &&
+            tcp_write_queued_request->completion.generation==kernel_task_current()->wait.generation);
         __atomic_fetch_add(&tcp_write_queued_ready,1,__ATOMIC_RELEASE);
     }
     if(unix_deadline_active && queue==unix_deadline_queue) {
@@ -760,10 +762,18 @@ static void *tcp_write_protocol_worker(void *unused)
     assert(request && request->segments && request->segment_count==2 && request->reserved==96 &&
         request->task==tcp_write_caller_task && request->pin && request->pin->references==3);
     assert(tcp_write_notifications && !kernel_io_context_current()->user_pins);
-    /* 同一socket的其他通知不代表COPY完成；唤醒后必须持原pin重新等待。 */
+    /* socket 就绪通知不属于这个 COPY 请求；它继续持 pin 睡眠。 */
+    {
+        KERNEL_IRQ_SCOPE(irq);
+        assert(!kernel_wait_queue_wake_all(kernel_socket_wait_queue(tcp_write_client_socket)));
+    }
     struct kernel_wait_token token;
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(tcp_write_caller_task->wait.phase==KERNEL_WAIT_COMMITTED);
       token=(struct kernel_wait_token){tcp_write_caller_task,tcp_write_caller_task->wait.generation}; }
+    assert(mm_test_parked(0)==tcp_write_park_baseline+1 &&
+        __atomic_load_n(&tcp_write_queued_ready,__ATOMIC_ACQUIRE)==1);
+    /* 直接注入提前通知仍须重新检查真实完成状态，不提前归还来源页。 */
     assert(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));
     while(__atomic_load_n(&tcp_write_queued_ready,__ATOMIC_ACQUIRE)<2 ||
         mm_test_parked(0)<tcp_write_park_baseline+2) sched_yield();

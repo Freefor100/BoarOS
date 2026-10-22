@@ -48,6 +48,7 @@ struct kernel_socket_write_request {
     void *protocol_address;
     uint64_t payload_size;
     uint8_t operation, queued;
+    struct kernel_wait_token completion;
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);

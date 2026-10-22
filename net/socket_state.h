@@ -24,15 +24,17 @@ static void socket_state_acquire(struct socket_state_guard *guard)
 #if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
     uintptr_t interrupts=arch_interrupt_save();
     if(socket_state_active) {guard->owner=socket_state_active;return;}
+    guard->raw.task.cpu=0;
     kernel_task_lock_acquire(&socket_state_lock,&guard->raw.task);
     guard->raw.interrupts=interrupts;socket_state_active=guard;
 #else
     struct kernel_raw_guard *held=kernel_cpu_current()->raw_locks;
     if(held && held->lock==&socket_state_lock) {guard->owner=(void *)held;return;}
+    guard->raw.lock=0;
     kernel_raw_lock_acquire(&socket_state_lock,&guard->raw);
 #endif
     guard->owner=guard;
-    guard->count=0;guard->work=(struct kernel_wait_cursor){0};guard->work_prepared=0;
+    guard->count=0;guard->work.queue=0;guard->work_prepared=0;
 }
 static void socket_state_release(struct socket_state_guard *guard)
 {
@@ -56,8 +58,10 @@ static uintptr_t socket_state_unlock_wait(struct socket_state_guard *guard)
     uintptr_t interrupts=guard->raw.interrupts;guard->raw.interrupts=0;
     socket_state_release(guard);return interrupts;
 }
+/* 嵌套借用不使用 raw/游标，避免每层都清零整份通知存储。 */
 #define SOCKET_STATE(name) \
-    struct socket_state_guard name __attribute__((cleanup(socket_state_release)))={0}; \
+    struct socket_state_guard name __attribute__((cleanup(socket_state_release))); \
+    name.owner=0; \
     socket_state_acquire(&name)
 static struct socket_state_guard *socket_state_owner(void)
 {

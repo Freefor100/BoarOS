@@ -22,7 +22,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的语义转换为 `127.0.0.1`，bind 的 `0.0.0.0` 继续表示通配监听。socket 的 family/type/protocol 分别检查；RAW protocol 0 返回 `EPROTONOSUPPORT`。
 
-端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护。RV 用户的 read/write/readv/writev、sendto/recvfrom/sendmsg/recvmsg 和普通文件到 socket 的 sendfile 在发起 CPU 执行：用户复制、接收预约、发送额度和等待属于原调用者。创建、连接、监听、accept、配置、shutdown、最终销毁以及 lwIP 协议工作继续在 CPU0。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
+端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护。同一状态修改中的队列发布、额度查询及更新复用外层保护；嵌套 guard 只记录借用，通知游标仅由实际持锁者初始化和维护。RV 用户的 read/write/readv/writev、sendto/recvfrom/sendmsg/recvmsg 和普通文件到 socket 的 sendfile 在发起 CPU 执行：用户复制、接收预约、发送额度和等待属于原调用者。创建、连接、监听、accept、配置、shutdown、最终销毁以及 lwIP 协议工作继续在 CPU0。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
 
 短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 在自己的外层 scope 中调用 `kernel_socket_service_owned`，沿同一资格登记等待；独立调用者使用 `kernel_socket_service_pending` 取得资格。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队；预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
 
@@ -111,7 +111,7 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 
 ## 发起 CPU 与等待寿命
 
-TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖 CPU0 的实际 COPY 接纳。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。调用者只在完成状态发布之后归还请求、pin 和 OFD。单核及 CPU0 空闲协议资格保留直接调用。
+TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖 CPU0 的实际 COPY 接纳。排队请求使用自己的等待 token，端点锁内登记、发布 result/queued 并定向通知；锁外 park/finish。ACK 和发送额度变化只通知 socket 就绪等待者，避免尚未完成 COPY 的请求被反复唤醒。请求入工作集合只登记待服务，STREAM 的 IO_MORE、窗口耗尽及明确 FLUSH 决定何时输出。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。调用者只在完成状态发布之后归还请求、pin 和 OFD。单核及 CPU0 空闲协议资格保留直接调用。
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
 
@@ -212,8 +212,8 @@ python3 -B tests/network-consumers.py --only boaros --libc both --suite both --c
 只有 COST 构建提供只读 `/proc/boaros_net_stats`，复用现有协议统计，不保存对象
 引用。TCP写入调用/字节为64位，lwIP包/错误计数为16位，会环绕，不能当作大流量
 窗口的完整总包数；pool用量和高水位是即时值。窗口仍使用已有 cost v1 schema，
-聚合64794字节、每任务64字节，默认构建没有新增诊断节点。观测影响吞吐，关闭
-观测的三次分布才是性能结果。此前纠错轮1179条ABI、完整RV64、真实musl/glibc 2.44、
+协议排队次数、park 次数、排队到完成的累计 ticks 与实际协议执行 ticks 分开记录，前者包含调度和执行，不能与后者相加。聚合存储沿用内核的编译期预算约束，默认构建没有新增诊断节点。观测影响吞吐，关闭
+观测的独立批次才是性能结果。此前纠错轮1179条ABI、完整RV64、真实musl/glibc 2.44、
 socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept输出fault、
 TCP MSG_TRUNC、UDP自动端口释放，IRQ仅通知由独立heap包装器检查。
 
