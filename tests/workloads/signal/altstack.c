@@ -400,18 +400,19 @@ static void width_handler(int signal,siginfo_t *info,void *context)
     if(signal!=SIGUSR1 || extension[0]!=magic || extension[1]<16+256*frame_width+12 ||
        !in_area((uintptr_t)&local,area))_exit(105);
     width_bytes=576+extension[1]+16;
-    if(frame<area+65536-4096 || frame+width_bytes>area+65536)_exit(106);
+    if(frame<area+49152 || frame+width_bytes>area+49152+4096)_exit(106);
 }
 static void width_frames(void)
 {
     uint32_t config,index=2;__asm__ volatile("cpucfg %0,%1":"=r"(config):"r"(index));
     for(unsigned width=1;width<=4;width*=2) {
         if(width>1 && !(config&(width==2?64U:128U)))continue;
-        pid_t child=fork();CHECK(child>=0);
+        int progress[2];CHECK(!pipe(progress));pid_t child=fork();CHECK(child>=0);
         if(!child) {
+            close(progress[0]);
             area=mmap(0,65536,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-            if(mprotect(area+65536-8192,4096,PROT_NONE))_exit(107);
-            stack_t s={.ss_sp=area+65536-4096,.ss_size=4096};if(alt(&s,0))_exit(108);
+            if(mprotect(area+32768,16384,PROT_NONE))_exit(107);
+            stack_t s={.ss_sp=area+49152,.ss_size=4096};if(alt(&s,0))_exit(108);
             struct sigaction action={.sa_sigaction=width_handler,.sa_flags=SA_SIGINFO|SA_ONSTACK};
             sigemptyset(&action.sa_mask);if(sigaction(SIGUSR1,&action,0))_exit(109);
             frame_width=width;
@@ -419,6 +420,7 @@ static void width_frames(void)
             else if(width==2)__asm__ volatile("vxor.v $vr0,$vr0,$vr0":::WIDTH_CLOBBERS);
             else __asm__ volatile("movgr2fr.d $f0,$zero":::WIDTH_CLOBBERS);
             if(raise(SIGUSR1) || !width_bytes)_exit(110);
+            if(write(progress[1],&width_bytes,sizeof(width_bytes))!=sizeof(width_bytes))_exit(112);
             /* Leave 16 bytes less than this actual width's frame. The guard
              * below the registered stack also verifies Linux's copy failure. */
             uintptr_t sp=(uintptr_t)s.ss_sp+width_bytes-16;
@@ -427,7 +429,11 @@ static void width_frames(void)
                 ::"r"(sp),"r"(pid),"r"(tid):"$a0","$a1","$a2","$a7","memory");
             __builtin_unreachable();
         }
+        CHECK(!close(progress[1]));
         int status;CHECK(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
+        unsigned actual=0;CHECK(read(progress[0],&actual,sizeof(actual))==sizeof(actual) && actual>576);
+        CHECK(!close(progress[0]));
+        printf("ALTSTACK LA width=%u frame=%u\n",width,actual);
     }
 }
 #else
