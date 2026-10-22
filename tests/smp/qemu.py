@@ -56,7 +56,9 @@ def main():
         while process.poll() is None:
             threads.update(observe_threads(process.pid))
             for key, _ in selector.select(0.005):
-                data.extend(os.read(key.fd, 65536))
+                chunk=os.read(key.fd,65536)
+                data.extend(chunk)
+                sys.stdout.buffer.write(chunk);sys.stdout.buffer.flush()
             if time.monotonic() - start >= budget:
                 timed_out = True
                 process.terminate()
@@ -67,7 +69,8 @@ def main():
                 break
         process.wait(timeout=2)
         os.set_blocking(process.stdout.fileno(), True)
-        data.extend(process.stdout.read())
+        tail=process.stdout.read();data.extend(tail)
+        sys.stdout.buffer.write(tail);sys.stdout.buffer.flush()
     finally:
         if process.poll() is None:
             process.kill()
@@ -79,8 +82,6 @@ def main():
     record.update(returncode=process.returncode, timeout=timed_out, budget_seconds=budget, elapsed_seconds=time.monotonic() - start,
                   vcpu_threads=sorted(t for t in threads if "/TCG" in t))
     prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
     if timed_out or process.returncode or len(record["vcpu_threads"]) != cpus or "SMP failure" in text or "SMP fatal" in text:
         return 1
     if os.environ.get("BOAROS_USER_SMP") == "1":

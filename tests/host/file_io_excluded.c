@@ -11,6 +11,7 @@ EXCLUDED(kernel_epoll_create)
 EXCLUDED(kernel_socket_copy_read)
 #ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_read_user)
+EXCLUDED(kernel_socket_wait_ready)
 #endif
 EXCLUDED(kernel_socket_discard_receive)
 #ifndef TCP_IO_CASES
@@ -35,12 +36,11 @@ EXCLUDED(kernel_socket_stream_reserve)
 #endif
 EXCLUDED(kernel_socket_unix_wait_error)
 EXCLUDED(kernel_socket_wait_queue)
-EXCLUDED(kernel_socket_write_buffer)
 #ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_write_unix)
 #endif
 EXCLUDED(kernel_socket_write_datagram)
-EXCLUDED(kernel_socket_write_datagram_buffer)
+EXCLUDED(kernel_socket_write_packet_buffer)
 #ifndef TCP_IO_CASES
 EXCLUDED(kernel_signal_send_task)
 #endif

@@ -161,7 +161,7 @@ static uint8_t socket_timer_running;
 static uint8_t socket_device_failed;
 static uint8_t network_stopping;
 static void (*network_timer_wake)(void *);
-static void (*network_work_wake)(void *);
+static struct kernel_wait_queue *network_work_queue;
 static int (*network_udp_capacity)(void *);
 static void *network_context;
 static struct kernel_socket *write_retry_head;
@@ -240,7 +240,10 @@ static void socket_pbuf_free(struct pbuf *payload)
 static void socket_work_ready_locked(void)
 {
     struct socket_state_guard *state=socket_state_owner();
-    state->work=network_work_wake;state->context=network_context;
+    if(!state->work_prepared && network_work_queue) {
+        state->work_prepared=1;
+        (void)kernel_wait_cursor_prepare(network_work_queue,&state->work);
+    }
 }
 static int caller_owns_protocol(void)
 {
@@ -1083,6 +1086,10 @@ int kernel_socket_accept(struct kernel_socket *socket,
     if (owner == 0 || *owner != 0) return -KERNEL_EINVAL;
     kernel_socket_protocol_enter(&old_status);
     service_inline(&old_status);
+    { SOCKET_STATE(state);
+      if (network_stopping) { socket_state_release(&state);
+          kernel_socket_protocol_leave(&old_status); return -KERNEL_EIO; }
+    }
     if (!socket->listening) { kernel_socket_protocol_leave(&old_status); return -KERNEL_EINVAL; }
     purge_dead_pending(socket);
     entry = socket->pending_head;
@@ -1110,6 +1117,44 @@ int kernel_socket_accept_check(const struct kernel_socket *socket)
     int result = socket->listening ? 0 : -KERNEL_EINVAL;
     kernel_socket_protocol_leave(&scope);
     return result;
+}
+
+int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
+    uint64_t target_ns, uint32_t flags)
+{
+    uint64_t deadline = 0;
+    int timed = target_ns == 0;
+    for (;;) {
+        SOCKET_STATE(state);
+        int ready = events == KERNEL_POLLIN && !socket->listening
+            ? kernel_socket_receive_ready(socket)
+            : (kernel_socket_poll(socket, 0) & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0;
+        if (ready) return (events & KERNEL_POLLOUT) ? kernel_socket_unix_wait_error(socket) : 0;
+        if (flags & KERNEL_SOCKET_MSG_DONTWAIT) return -KERNEL_EAGAIN;
+        if (!timed) {
+            enum kernel_time_status status = kernel_time_deadline_from_monotonic(target_ns, &deadline);
+            if (status != KERNEL_TIME_STATUS_OK)
+                return status == KERNEL_TIME_STATUS_DEADLINE_PASSED ? -KERNEL_EAGAIN : -KERNEL_EIO;
+            timed = 1;
+        }
+        struct kernel_wait_token token;
+        enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+        if (kernel_wait_prepare(&socket->wait, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK)
+            return -KERNEL_EIO;
+        /* State cannot change before registration; notification may precede park. */
+        uintptr_t interrupts = socket_state_unlock_wait(&state);
+        enum kernel_scheduler_status status = kernel_wait_park(&token, &reason);
+        if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        arch_interrupt_restore(interrupts);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return -KERNEL_EIO;
+        if (reason == KERNEL_WAIT_TIMEOUT && target_ns && kernel_time_monotonic_ns() >= target_ns)
+            return -KERNEL_EAGAIN;
+        if (reason == KERNEL_WAIT_SIGNALLED) {
+            if (target_ns) return -KERNEL_EINTR;
+            kernel_signal_note_syscall_restart(kernel_task_current());
+            return -KERNEL_ERESTARTSYS;
+        }
+    }
 }
 
 /* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
@@ -1582,7 +1627,7 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
                                         flags, destination, 0, 0);
 }
 
-int kernel_socket_write_datagram_buffer(struct kernel_open_file_description **pin_owner,
+int kernel_socket_write_packet_buffer(struct kernel_open_file_description **pin_owner,
     const void *buffer, uint64_t count, uint32_t flags)
 {
     if (!buffer) return -KERNEL_EINVAL;
@@ -1811,7 +1856,7 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
     local=!kernel_cpu_current()->logical_id;
 #endif
     struct kernel_socket_protocol_scope protocol;
-    if(local && protocol_enter(&protocol,network_work_wake!=0)) {
+    if(local && protocol_enter(&protocol,network_work_queue!=0)) {
         int result;
         {SOCKET_STATE(state);result=network_stopping && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
         if(!result)result=execute_protocol_request(request);
@@ -1822,7 +1867,7 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
         kernel_socket_protocol_leave(&protocol);return result;
     }
     SOCKET_STATE(state);
-    if(!network_work_wake || (network_stopping && operation<SOCKET_PROTOCOL_DISPOSE)) {
+    if(!network_work_queue || (network_stopping && operation<SOCKET_PROTOCOL_DISPOSE)) {
         if(operation>=SOCKET_PROTOCOL_DISPOSE)__builtin_trap();
         request->segments=0;return -KERNEL_EIO;
     }
@@ -1854,74 +1899,6 @@ int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
 {
     const struct kernel_socket_write_segment segment = {buffer, size};
     return kernel_socket_stream_commitv(request, &segment, 1, flags);
-}
-
-int kernel_socket_write_buffer(struct kernel_socket *socket,
-                               const void *buffer, uint32_t size, uint32_t flags)
-{
-    struct kernel_socket_protocol_scope old_status;
-
-    if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
-        kernel_socket_protocol_enter(&old_status);
-        if (socket->peer == 0 || socket->write_closed || socket->peer->read_closed) {
-            int failure=unix_peer_failure(socket);
-            struct kernel_task *curr = kernel_task_current();
-            kernel_socket_protocol_leave(&old_status);
-            if (curr != 0 && failure==-KERNEL_EPIPE && socket->type==SOCKET_STREAM && !(flags & KERNEL_SOCKET_MSG_NOSIGNAL)) {
-                (void)kernel_signal_send_task(curr, 13U, 0);
-            }
-            return failure;
-        }
-        if (size == 0U && socket->type == SOCKET_STREAM) {
-            kernel_socket_protocol_leave(&old_status);
-            return 0;
-        }
-        if (socket->type == SOCKET_DGRAM && size > socket->tx_limit-32U) {
-            kernel_socket_protocol_leave(&old_status); return -KERNEL_EMSGSIZE;
-        }
-        struct kernel_socket *peer = socket->peer;
-        if(socket->unix_memory+socket->tx_reserved>=socket->tx_limit) {
-            kernel_socket_protocol_leave(&old_status);return -KERNEL_EAGAIN;
-        }
-        uint32_t to_write=size;
-        if(socket->type==SOCKET_STREAM) {
-            uint32_t chunk=socket->tx_limit/2U-64U;
-            if(chunk>32768U)chunk=32768U;
-            if(to_write>chunk)to_write=chunk;
-        }
-        struct socket_packet *packet = 0;
-        enum kernel_heap_status heap_status;
-        heap_status=kernel_heap_allocate_zeroed(peer->heap,1U,sizeof(*packet)+to_write,(void **)&packet);
-        if(heap_status!=KERNEL_HEAP_STATUS_OK) {
-            if(heap_status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
-            kernel_socket_protocol_leave(&old_status);return -KERNEL_ENOMEM;
-        }
-        if(to_write)__builtin_memcpy(packet->data,buffer,to_write);
-        packet->length = to_write;
-        packet->consumed = 0U;
-
-        SOCKET_STATE(endpoint);
-        if (peer->packets_tail != 0) {
-            peer->packets_tail->next = packet;
-        } else {
-            peer->packets_head = packet;
-        }
-        peer->packets_tail = packet;
-        unix_publish_owner(socket,packet,unix_charge(to_write));
-        peer->rx_bytes += to_write ? to_write : 1U;
-
-        wake_socket(peer);
-        socket_state_release(&endpoint);
-        kernel_socket_protocol_leave(&old_status);
-        return (int)to_write;
-    }
-
-    kernel_socket_protocol_enter(&old_status);
-    int state=socket->type==SOCKET_DGRAM?-KERNEL_EDESTADDRREQ:tcp_write_state(socket,flags,1,kernel_task_current());
-    int result=state || !size?state:tcp_write_buffer_locked(socket,buffer,size,flags,0);
-    if (result>0) service_inline(&old_status);
-    kernel_socket_protocol_leave(&old_status);
-    return result;
 }
 
 static int tcp_write_buffer_locked(struct kernel_socket *socket,
@@ -2250,12 +2227,18 @@ void kernel_socket_network_initialize(void)
     }
     kernel_socket_protocol_leave(&scope);
 }
-void kernel_socket_network_hooks(void (*timer_wake)(void *),void (*work_wake)(void *),
+void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_queue *work_queue,
     int (*udp_capacity)(void *),void *context)
 {
     struct kernel_socket_protocol_scope protocol;kernel_socket_protocol_enter(&protocol);
-    {SOCKET_STATE(state);network_stopping=work_wake==0;}
-    if(!work_wake)for(;;) {
+    {SOCKET_STATE(state);network_stopping=work_queue==0;}
+    if (!work_queue) for (struct kernel_socket *socket=inet_sockets; socket; socket=socket->inet_next) {
+        SOCKET_STATE(state);
+        /* Empty readers and control waiters have no active payload request to drain. */
+        if (!socket->pending_error) socket->pending_error=-KERNEL_EIO;
+        wake_socket(socket);
+    }
+    if(!work_queue)for(;;) {
         struct kernel_open_file_description *pin=0;
         struct kernel_wait_token token={0};uintptr_t interrupts=0;
         for(struct kernel_socket *socket=inet_sockets;socket;socket=socket->inet_next) {
@@ -2278,10 +2261,19 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),void (*work_wake)(vo
         if(kernel_open_file_release(&pin)!=KERNEL_OPEN_FILE_STATUS_OK)__builtin_trap();
         kernel_socket_protocol_enter(&protocol);
     }
+    struct kernel_wait_queue *old_queue;
     {SOCKET_STATE(state);
-     network_timer_wake=timer_wake;network_work_wake=work_wake;
+     old_queue=network_work_queue;
+     network_timer_wake=timer_wake;network_work_queue=work_queue;
      network_udp_capacity=udp_capacity;network_context=context;}
     kernel_socket_protocol_leave(&protocol);
+    if (!work_queue && old_queue) for (;;) {
+        int borrowed;
+        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);borrowed=old_queue->borrows!=0;}
+        if(!borrowed)break;
+        /* Hooks no longer admit cursors; their real queue borrows cover lock-free delivery. */
+        kernel_wait_backend_quiesce();
+    }
 }
 void kernel_socket_network_capacity(void)
 {

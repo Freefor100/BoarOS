@@ -14,6 +14,20 @@ enum kernel_random_status kernel_random_fill(void *data,size_t size)
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t time,uint64_t *out)
 { *out=time;return KERNEL_TIME_STATUS_OK; }
 extern unsigned mm_test_parked(unsigned);
+static struct kernel_files *tcp_wait_files;
+static int socket_buffer_write(struct kernel_files *files,int fd,const void *bytes,uint32_t size,uint32_t flags)
+{
+    struct kernel_open_file_description *pin=NULL;int64_t error;
+    assert(!kernel_files_pin(files,fd,&pin,&error) && !error);
+    int result;
+    if(kernel_socket_is_tcp(kernel_open_file_socket(pin))) {
+        struct kernel_socket_write_request request={0};kernel_socket_stream_begin(&request,&pin);
+        result=kernel_socket_stream_reserve(&request,size,flags);
+        if(result>0)result=kernel_socket_stream_commit(&request,bytes,(uint32_t)result,flags);
+        kernel_socket_stream_finish(&request);
+    } else result=kernel_socket_write_packet_buffer(&pin,bytes,size,flags);
+    assert(pin && !kernel_open_file_release(&pin));return result;
+}
 static _Thread_local unsigned tcp_wait_role,tcp_finishing_socket;
 static struct kernel_wait_queue *tcp_wait_queue;
 static uint64_t tcp_wait_generation;
@@ -139,7 +153,8 @@ static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
     if(tcp_wait_role!=1 || !tcp_wait_active || queue!=tcp_wait_queue) return;
     assert(!tcp_wait_registered && kernel_task_current()->wait.phase==KERNEL_WAIT_PREPARED);
     tcp_wait_generation=kernel_task_current()->wait.generation;
-    assert(!tcp_protocol_held() && !kernel_cpu_current()->raw_locks);
+    assert(!tcp_protocol_held() && kernel_cpu_current()->raw_locks &&
+        kernel_cpu_current()->raw_locks->lock->rank==KERNEL_RAW_RANK_OBJECT);
     __atomic_store_n(&tcp_wait_registered,1,__ATOMIC_RELEASE);
     /* socket登记不占core；对手在token存活时取得core并持有到端点工作完成。 */
     while(!__atomic_load_n(&tcp_wait_contender_acquired,__ATOMIC_ACQUIRE)) sched_yield();
@@ -205,7 +220,7 @@ static void *tcp_wait_contender(void *unused)
         mm_test_parked(1)==tcp_wait_caller_parked) sched_yield();
     if(tcp_wait_writing) {
         for(size_t i=0;i<tcp_wait_allocation_count;i++) mem_free(tcp_wait_allocations[i]);
-    } else assert(kernel_socket_write_buffer(tcp_wait_client,"wakeonce",8,0)==8);
+    } else assert(socket_buffer_write(tcp_wait_files,0,"wakeonce",8,0)==8);
     /* 在同一个真实core owner内推进loopback或池容量，发出实际socket通知。 */
     for(unsigned i=0;i<8;i++)
         (void)kernel_socket_service_owned(&scope,(struct kernel_socket_service_budget){8,8,1});
@@ -243,7 +258,7 @@ static void tcp_wait_owner_case(struct kernel_heap *heap,int writing)
         while((allocation=mem_malloc(1))) {assert(count<32768);held[count++]=allocation;}
         kernel_socket_protocol_leave(&scope);
     }
-    tcp_wait_queue=kernel_socket_wait_queue(writing?client:server);tcp_wait_client=client;
+    tcp_wait_queue=kernel_socket_wait_queue(writing?client:server);tcp_wait_client=client;tcp_wait_files=&handle;
     tcp_wait_allocations=held;tcp_wait_allocation_count=count;tcp_wait_writing=writing;
     tcp_wait_generation=0;tcp_wait_registered=tcp_wait_contender_acquired=tcp_wait_park_call=0;
     tcp_wait_finish_count=tcp_wait_relocked=0;
@@ -349,7 +364,7 @@ static void tcp_batch_observe(void)
 }
 static void tcp_batch_sent(struct kernel_socket *client,const char *bytes,unsigned count)
 {
-    assert(kernel_socket_write_buffer(client,bytes,count,0)==(int)count);
+    (void)client;assert(socket_buffer_write(tcp_batch_files,0,bytes,count,0)==(int)count);
     (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
 }
 static void *tcp_batch_append(void *unused)
@@ -377,6 +392,7 @@ static void tcp_read_batch_case(struct kernel_heap *heap)
     assert(!kernel_open_file_create_socket(heap,client,2,&out));
     assert(!kernel_open_file_create_socket(heap,server,2|KERNEL_FILES_O_NONBLOCK,&in));
     assert(!kernel_files_install_new_owned_at(&handle,0,0,&out) && !kernel_files_install_new_owned_at(&handle,1,0,&in));
+    tcp_batch_files=&handle;
     const uint64_t destination=0x200080,iov_address=0x100200,readonly=0x200000+2U*BOAROS_PAGE_SIZE;
     size_t copied;int64_t result;char actual[16];
     assert(!kernel_copy_to_user(&mm,destination,"................",16,&copied) && copied==16);
@@ -436,7 +452,7 @@ static void *unix_deadline_competitor(void *unused)
         while(__atomic_load_n(&unix_deadline_parked,__ATOMIC_ACQUIRE)<round) sched_yield();
         while(mm_test_parked(0)<unix_deadline_park_baseline+round) sched_yield();
         char value=(char)('A'+round-1);
-        assert(kernel_socket_write_buffer(unix_deadline_sender,&value,1,0)==1);
+        assert(socket_buffer_write(unix_deadline_files,0,&value,1,0)==1);
         while(__atomic_load_n(&unix_deadline_steal,__ATOMIC_ACQUIRE)<round) sched_yield();
         /* 被唤醒的读者先停在真正reserve之前；另一读者实际取走这一个字节。 */
         int64_t result;size_t copied;char actual;
@@ -453,6 +469,8 @@ static void unix_receive_deadline_case(struct kernel_heap *heap)
     kernel_socket_set_receive_timeout(receiver,20);
     struct kernel_files handle={0};struct kernel_open_file_description *in=0;
     assert(!kernel_files_create(&handle,heap));
+    struct kernel_open_file_description *out=NULL;
+    assert(!kernel_open_file_create_socket(heap,sender,2,&out) && !kernel_files_install_new_owned_at(&handle,0,0,&out));
     assert(!kernel_open_file_create_socket(heap,receiver,2,&in));
     assert(!kernel_files_install_new_owned_at(&handle,1,0,&in));
     unix_deadline_sender=sender;unix_deadline_files=&handle;unix_deadline_queue=kernel_socket_wait_queue(receiver);
@@ -470,7 +488,7 @@ static void unix_receive_deadline_case(struct kernel_heap *heap)
     assert(unix_deadlines[0]==1020 && unix_deadlines[1]==1020 && unix_deadline_stolen==2);
     assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED && !kernel_io_context_current()->user_pins);
     assert(physical_page_available(mm.allocator)==before);
-    assert(!kernel_files_release(&handle));kernel_socket_destroy(sender);
+    assert(!kernel_files_release(&handle));
     puts("PASS UNIX read SO_RCVTIMEO: two actual park/wake cycles lose data to competing reader, one absolute deadline expires without a third wait");
 }
 static void unix_receive_error_prefix_case(struct kernel_heap *heap)
@@ -479,12 +497,14 @@ static void unix_receive_error_prefix_case(struct kernel_heap *heap)
     assert(!kernel_socket_pair(heap,1,&sender,&receiver));
     struct kernel_files handle={0};struct kernel_open_file_description *in=0;
     assert(!kernel_files_create(&handle,heap));
+    struct kernel_open_file_description *out=NULL;
+    assert(!kernel_open_file_create_socket(heap,sender,2,&out) && !kernel_files_install_new_owned_at(&handle,0,0,&out));
     assert(!kernel_open_file_create_socket(heap,receiver,2,&in));
     assert(!kernel_files_install_new_owned_at(&handle,1,0,&in));
-    assert(kernel_socket_write_buffer(sender,"DATA",4,0)==4);
+    assert(socket_buffer_write(&handle,0,"DATA",4,0)==4);
     /* 对端尚有未读数据时关闭，生产UNIX实现向receiver发布ECONNRESET。 */
-    assert(kernel_socket_write_buffer(receiver,"unread",6,0)==6);
-    kernel_socket_destroy(sender);
+    assert(socket_buffer_write(&handle,1,"unread",6,0)==6);
+    int64_t closed;assert(!kernel_files_close(&handle,0,&closed) && !closed);
     int64_t result;size_t copied;char actual[4];
     assert(!kernel_files_read(&handle,&mm,1,0x200080,8,&result) && result==4);
     assert(!kernel_copy_from_user(&mm,actual,0x200080,4,&copied) && copied==4 && !memcmp(actual,"DATA",4));
@@ -562,7 +582,7 @@ static void tcp_nonblock_timeout_case(struct kernel_heap *heap,int unix_socket)
     for(int vector=0;vector<2;vector++) tcp_nonblock_io(&handle,0,vector,0,1);
     static const char payload[1024];int full=0;
     for(unsigned i=0;i<512;i++) {
-        int sent=kernel_socket_write_buffer(client,payload,sizeof(payload),KERNEL_SOCKET_MSG_DONTWAIT);
+        int sent=socket_buffer_write(&handle,0,payload,sizeof(payload),KERNEL_SOCKET_MSG_DONTWAIT);
         if(sent==-KERNEL_EAGAIN) {full=1;break;}
         assert(sent>0 && sent<=(int)sizeof(payload));
         (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
@@ -717,8 +737,8 @@ static void *tcp_write_revoke(void *unused)
     tcp_write_editor=0;__atomic_store_n(&tcp_write_edit_done,1,__ATOMIC_RELEASE);
     mm_test_finish();return NULL;
 }
-static void tcp_write_work_notification(void *unused)
-{ (void)unused;__atomic_fetch_add(&tcp_write_notifications,1,__ATOMIC_RELEASE); }
+static void tcp_write_work_notification(struct kernel_wait_node *node,uint32_t reason)
+{ (void)node;(void)reason;__atomic_fetch_add(&tcp_write_notifications,1,__ATOMIC_RELEASE); }
 /* SIGPIPE is observed at the signal boundary so this fixture can inspect its target.
  * Every unrelated signal remains an unexpected consumer, rather than a success stub. */
 enum kernel_signal_status __wrap_kernel_signal_send_task(struct kernel_task *task,uint32_t signal,kernel_pid_t sender_tid)
@@ -749,14 +769,13 @@ static void *tcp_write_protocol_worker(void *unused)
         mm_test_parked(0)<tcp_write_park_baseline+2) sched_yield();
     assert(request->segments && request->pin->references==3 &&
         !__atomic_load_n(&tcp_write_pins_returned,__ATOMIC_ACQUIRE));
-    if(tcp_write_mode==6) kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
-    else {
+    {
         if(tcp_write_mode==5) assert(!kernel_socket_shutdown(tcp_write_client_socket,1));
         for(unsigned i=0;i<8;i++)
             (void)kernel_socket_service_owned(&scope,(struct kernel_socket_service_budget){8,8,1});
     }
     assert(!request->segments && !request->next && !request->reserved &&
-        request->result==(tcp_write_mode==5?-KERNEL_EPIPE:tcp_write_mode==6?-KERNEL_EIO:96));
+        request->result==(tcp_write_mode==5?-KERNEL_EPIPE:96));
     __atomic_store_n(&tcp_write_worker_published,1,__ATOMIC_RELEASE);
     while(!__atomic_load_n(&tcp_write_pins_returned,__ATOMIC_ACQUIRE)) sched_yield();
     kernel_socket_protocol_leave(&scope);
@@ -764,8 +783,11 @@ static void *tcp_write_protocol_worker(void *unused)
 }
 static void tcp_write_batch_case(struct kernel_heap *heap)
 {
-    kernel_socket_network_hooks(NULL,tcp_write_work_notification,NULL,NULL);
-    for(unsigned mode=0;mode<7;mode++) {
+    struct kernel_wait_queue progress;struct kernel_wait_node work;
+    kernel_wait_queue_init(&progress);kernel_wait_node_init_callback(&work,tcp_write_work_notification,NULL);
+    kernel_wait_queue_add(&progress,&work);kernel_socket_network_hooks(NULL,&progress,NULL,NULL);
+    /* Stop/queued COPY uses a separate stop caller and live worker in network_owner.c. */
+    for(unsigned mode=0;mode<6;mode++) {
         struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=(uint16_t)(24050+mode),.bytes={127,0,0,1}};
         assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener) &&
@@ -845,8 +867,10 @@ static void tcp_write_batch_case(struct kernel_heap *heap)
         kernel_socket_protocol_leave(&scope);
         assert(!kernel_open_file_release(&owner) && !kernel_files_release(&handle));kernel_socket_destroy(listener);
         assert(!tcp_active_pcbs && !tcp_tw_pcbs && !kernel_mm_munmap(&mm,tcp_write_source_page,2U*BOAROS_PAGE_SIZE));
-        static const char *const names[]={"resident cross-page commit", "nonresident second page", "unreadable second page", "mprotect closes pin admission", "busy core worker COPY", "busy core EPIPE and caller SIGPIPE", "stop cancels queued COPY before worker exit"};
+        static const char *const names[]={"resident cross-page commit", "nonresident second page", "unreadable second page", "mprotect closes pin admission", "busy core worker COPY", "busy core EPIPE and caller SIGPIPE"};
         printf("PASS TCP batched write %s: real content/prefix, bounded pins, request result before unpin and final owners\n",names[mode]);
         mm_test_finish();mm_test_attach(0);mm_test_activate_task();mm_test_context=context;
     }
+    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    assert(!kernel_wait_node_remove_sync(&work) && !kernel_wait_queue_close(&progress) && !kernel_wait_queue_destroy(&progress));
 }

@@ -269,64 +269,16 @@ static int sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
     return 0;
 }
 
-static int wait_ready(struct kernel_task *caller,
-                      struct kernel_open_file_description *file,
+static int wait_ready(struct kernel_open_file_description *file,
                       uint32_t event, uint64_t timeout_ns, uint32_t flags)
 {
-    struct kernel_socket *socket = kernel_open_file_socket(file);
-    uint64_t deadline = 0;
-    uint64_t target_ns = 0;
-    uintptr_t saved;
-    /* Ready data wins over even a one-microsecond receive timeout. */
-    if ((kernel_socket_poll(socket, 0) & event) != 0U) return 0;
-    if (timeout_ns != 0) {
+    uint64_t target = 0;
+    if (timeout_ns) {
         uint64_t now = kernel_time_monotonic_ns();
-        uint64_t target = UINT64_MAX - now < timeout_ns
-                              ? UINT64_MAX : now + timeout_ns;
-        target_ns = target;
-        enum kernel_time_status status =
-            kernel_time_deadline_from_monotonic(target, &deadline);
-        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED)
-            return -KERNEL_EAGAIN;
-        if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
+        target = UINT64_MAX - now < timeout_ns ? UINT64_MAX : now + timeout_ns;
     }
-    for (;;) {
-        struct kernel_socket_protocol_scope protocol;
-        saved = arch_interrupt_save();
-        kernel_socket_protocol_enter(&protocol);
-        if ((kernel_socket_poll(socket, 0) & event) != 0U) {
-            kernel_socket_protocol_leave(&protocol);
-            arch_interrupt_restore(saved);
-            return 0;
-        }
-        if ((kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U ||
-            (flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U ||
-            (target_ns && kernel_time_monotonic_ns() >= target_ns)) {
-            kernel_socket_protocol_leave(&protocol);
-            arch_interrupt_restore(saved);
-            return -KERNEL_EAGAIN;
-        }
-        (void)arch_interrupt_save();
-        struct kernel_wait_token token;
-        enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
-        enum kernel_scheduler_status status = kernel_wait_prepare(
-            kernel_socket_wait_queue(socket), deadline, 1, &token);
-        int ready = status == KERNEL_SCHEDULER_STATUS_OK &&
-                    (kernel_socket_poll(socket, 0) & event) != 0U;
-        kernel_socket_protocol_leave(&protocol);
-        if (status == KERNEL_SCHEDULER_STATUS_OK) {
-            if (!ready) status = kernel_wait_park(&token, &reason);
-            if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        }
-        arch_interrupt_restore(saved);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return -KERNEL_EIO;
-        if (ready) return 0;
-        if (reason == KERNEL_WAIT_SIGNALLED) {
-            if (timeout_ns != 0U) return -KERNEL_EINTR;
-            kernel_signal_note_syscall_restart(caller);
-            return -KERNEL_ERESTARTSYS;
-        }
-    }
+    if (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
+    return kernel_socket_wait_ready(kernel_open_file_socket(file), event, target, flags);
 }
 
 enum kernel_syscall_status syscall_handle_socket(
@@ -581,7 +533,8 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
+    int op = (int)request->number;
+    KERNEL_SERVICE_SCOPE_IF(service, op != 206 && op != 207 && op != 211 && op != 212);
     struct kernel_files *files;
     struct kernel_open_file_description *file = 0;
     struct kernel_socket *socket;
@@ -589,7 +542,6 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     struct kernel_socket_address address;
     struct kernel_socket_address peer_address = {0};
     int64_t result = 0;
-    int op = (int)request->number;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     /* 这里只验证数值范围；payload缺页必须留在状态检查和接纳预算之后。 */
@@ -632,7 +584,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
                      (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U);
         if (result == -KERNEL_EINPROGRESS &&
             (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) == 0U) {
-            result = wait_ready(caller, file, KERNEL_POLLOUT | KERNEL_POLLERR,
+            result = wait_ready(file, KERNEL_POLLOUT | KERNEL_POLLERR,
                                 kernel_socket_send_timeout(socket), 0U);
             if (result == 0) result = kernel_socket_connection_result(socket);
         }
@@ -691,7 +643,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     case 202: /* accept */
         result = kernel_socket_accept_check(socket);
         if (result != 0) break;
-        result = wait_ready(caller, file, KERNEL_POLLIN,
+        result = wait_ready(file, KERNEL_POLLIN,
                             kernel_socket_receive_timeout(socket), 0U);
         if (result != 0) break;
         if (kernel_files_socket_accept(files, file, 0U, &peer_address, &result) !=

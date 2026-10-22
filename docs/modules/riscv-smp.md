@@ -6,7 +6,7 @@
 
 `SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`；增加 `SMP_CPUS=4` 后使用 `build/riscv-user-smp4/`，受控调度、MM 和成本构建也使用对应的 `smp4` 目录。默认单核与两核缓存不混用。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
 
-通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、网络等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
+通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、socket 控制与协议、epoll 控制与等待等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
 `kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。返回通知字区分CPU0业务与本地信号，两类消费者分别取走自己的位，业务范围的进入不提前消费通知。普通信号在执行CPU内完成共享状态选择、构帧与sigreturn；组停止/退出及REAL定时器重装进入其CPU0范围。共享action快照、mask和并发通知协议见[信号模块](kernel-signal.md#smp上的状态和执行位置)。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
 
@@ -57,6 +57,8 @@ make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bi
 普通用户的驻留复制复用任务已持有的 MM/files 句柄、实际 OFD 引用与 MM raw pin 协议，不为每次复制建立第二组业务owner。来源退休节点保留原有OFD/ELF引用，放开MM gate并排空登记回调后才执行真实关闭。
 
 COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4 前台文件与目录元数据在发起 CPU 执行；日志、设备配置、网络协议和其他文件系统命名空间沿各自 CPU0 范围执行。分配器通知和同步干净回收可就地执行。LA 仍为单核。
+
+socket 普通收发在实际发起 CPU 完成队列预约、用户复制、发送额度接纳与等待。TCP COPY、UDP pbuf 准备/发送仍交给已有 CPU0 worker；请求及 pin 由调用者保留到结果发布。控制与最终销毁继续在 CPU0，远端 epoll 通知持有真实等待游标借用。具体状态和停止规则见[网络模块](kernel-network.md#发起-cpu-与等待寿命)。
 
 ## 启动与本地状态
 

@@ -112,13 +112,6 @@ static int udp_capacity_after(struct kernel_network *n, unsigned loans, unsigned
 static int udp_capacity(void *context) { return udp_capacity_after(context, 0, 0); }
 static struct kernel_wait_queue *progress(struct kernel_network *n)
 { return n->device ? &n->device->progress : &n->progress; }
-static void work_wake(void *context)
-{
-    struct kernel_network *network = context;
-    uintptr_t irq = arch_interrupt_save();
-    (void)kernel_wait_queue_wake_all(progress(network));
-    arch_interrupt_restore(irq);
-}
 static void release_completed(struct kernel_network *network)
 {
     struct virtio_net_device *device = network->device;
@@ -283,7 +276,7 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
     if (kernel_thread_create_joinable(device ? worker : timer_worker, n, &n->worker) != KERNEL_SCHEDULER_STATUS_OK) {
         kernel_socket_protocol_leave(&saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
     }
-    kernel_socket_network_hooks(timer_wake, work_wake, device ? udp_capacity : 0, n);
+    kernel_socket_network_hooks(timer_wake, progress(n), device ? udp_capacity : 0, n);
     kernel_socket_protocol_leave(&saved);
     if (device) {
         print_text("BoarOS: eth0 ready transport="); print_text(device->version == 1 ? "legacy" : "modern");

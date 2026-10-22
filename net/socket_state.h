@@ -11,8 +11,8 @@ struct socket_state_guard {
     struct socket_state_guard *owner;
     struct kernel_wait_cursor notifications[2];
     unsigned count;
-    void (*work)(void *);
-    void *context;
+    struct kernel_wait_cursor work;
+    unsigned work_prepared;
 };
 #if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
 /* UP 的嵌套 helper 共用 IRQ 保护内的栈 guard，沿用轻量 task/IRQ 原语。 */
@@ -32,7 +32,7 @@ static void socket_state_acquire(struct socket_state_guard *guard)
     kernel_raw_lock_acquire(&socket_state_lock,&guard->raw);
 #endif
     guard->owner=guard;
-    guard->count=0;guard->work=0;
+    guard->count=0;guard->work=(struct kernel_wait_cursor){0};guard->work_prepared=0;
 }
 static void socket_state_release(struct socket_state_guard *guard)
 {
@@ -42,12 +42,12 @@ static void socket_state_release(struct socket_state_guard *guard)
 #if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
     socket_state_active=0;
 #endif
-    if(!guard->count && !guard->work) {kernel_irq_lock_release(&guard->raw);return;}
+    if(!guard->count && !guard->work.queue) {kernel_irq_lock_release(&guard->raw);return;}
     uintptr_t interrupts=guard->raw.interrupts;guard->raw.interrupts=0;
     kernel_irq_lock_release(&guard->raw);
     /* Queue cursors retain their actual storage; callbacks run without state locks. */
     for(unsigned i=0;i<guard->count;i++)kernel_wait_cursor_wake(&guard->notifications[i],1);
-    if(guard->work)guard->work(guard->context);
+    if(guard->work.queue)kernel_wait_cursor_wake(&guard->work,1);
     arch_interrupt_restore(interrupts);
 }
 static uintptr_t socket_state_unlock_wait(struct socket_state_guard *guard)
