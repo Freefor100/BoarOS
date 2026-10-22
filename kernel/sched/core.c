@@ -1234,6 +1234,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     thread->arch.user_sp = 0U;
     thread->arch.user_mode = 1U;
+    kernel_signal_stack_reset(thread);
 #if BOAROS_USER_SMP
     thread->user_service = 1;
     /* PID1在secondary ONLINE前构造；默认集合在首次服务入口固定。 */

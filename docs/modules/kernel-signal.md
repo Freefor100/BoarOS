@@ -40,6 +40,8 @@ RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及�
 
 设置先完整导入输入，检查当前SP后再检查标志和尺寸；栈内修改为EPERM，尺寸不足为ENOMEM。新状态提交后输出旧值，输出EFAULT保留新设置；输入输出可以别名。fork复制调用线程配置，`CLONE_VM`且未指定`CLONE_VFORK`的child停用；vfork保留。成功exec停用，失败exec保留。配置不随共享disposition传播。
 
+`SA_ONSTACK`首次从登记区顶端构帧；已在备用栈上的嵌套处理从当前SP继续向下。两架构按实际对齐后的整数、FP/SIMD帧检查范围，再通过共同uaccess复制；不可写、未映射或空间耗尽终止用户线程组并报告SIGSEGV。`uc_stack`保存交付前的原始登记状态，与查询时计算的`SS_ONSTACK`含义不同。完整构帧成功后，`SS_AUTODISARM`停用原配置，处理函数可以重新设置。sigreturn完整导入`uc_stack`和其他恢复输入后，按恢复后的SP应用登记；字段不可读为坏帧，可读设置产生的EINVAL、ENOMEM、EPERM按固定Linux的`restore_altstack`忽略。恢复后寄存器、mask及浮点状态继续沿原路径处理。
+
 rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR，SA_RESTART也保留这一返回。实时信号位明确返回 ENOTSUP，因为现有位图不能保存其队列语义。
 
 RISC-V 交付 frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。

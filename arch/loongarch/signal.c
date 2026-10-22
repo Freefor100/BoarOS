@@ -60,7 +60,9 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     struct la_linux_frame prefix;
     if(task->fpu.saved)la_fpu_save(&task->fpu);
     unsigned width=task->fpu.saved ? task->fpu.live_width : 0;
-    uint64_t top=frame->regs[3]&~UINT64_C(15),sp,vdso;
+    struct kernel_signal_stack saved_stack;
+    uint64_t top=kernel_signal_stack_prepare(task,frame->regs[3],delivery->flags,
+        &saved_stack)&~UINT64_C(15),sp,vdso;
     size_t copied;
     if(top<LA_SIGNAL_FRAME_BYTES)bad_frame();
     uint64_t end=top-16;
@@ -73,6 +75,8 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
         sp=address-16-576;
         info.magic=record_magic(width);info.size=(uint32_t)(end-(sp+576));
     } else sp=end-576;
+    if(!kernel_signal_stack_frame_valid(&saved_stack,frame->regs[3],delivery->flags,
+                                        sp,top))bad_frame();
     size_t bytes=top-sp;
     if(bytes>sizeof(data))la_virt_fatal("signal frame capacity");
     memset(data,0,bytes);memset(&prefix,0,sizeof(prefix));
@@ -81,7 +85,7 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
         .code = delivery->code, .uid = delivery->uid, .status = delivery->status,
     };
     kernel_signal_encode_info(prefix.info, &signal_info, delivery->fault, delivery->fault_address);
-    prefix.context.stack_flags=2;
+    memcpy(&prefix.context.stack_pointer,&saved_stack,sizeof(saved_stack));
     prefix.context.sigmask[0]=delivery->restore_mask;
     prefix.context.mcontext.pc=frame->era;
     memcpy(prefix.context.mcontext.regs,frame->regs,sizeof(frame->regs));
@@ -100,6 +104,7 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
        kernel_mm_vdso_address(mm,&vdso)!=KERNEL_MM_STATUS_OK)bad_frame();
     frame->regs[3]=sp;frame->regs[1]=vdso;frame->era=delivery->handler;
     frame->regs[4]=delivery->signal;frame->regs[5]=sp;frame->regs[6]=sp+128;
+    kernel_signal_stack_delivered(task);
 }
 
 void la_signal_prepare_user_return(struct arch_trap_frame *frame)
@@ -128,12 +133,14 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
     struct la_linux_mcontext context;
     struct la_context_info extension;
     struct arch_fpu_state fp;
+    struct kernel_signal_stack saved_stack;
     uint64_t mask,sp=frame->regs[3];
     size_t copied;
     if(sp>UINT64_MAX-LA_SIGNAL_FRAME_BYTES ||
        kernel_task_mm_borrow_mutable(task,&mm)!=KERNEL_TASK_STATUS_OK)bad_frame();
     /* 输入先快照；更宽记录优先，重复的同类记录取最后一条。 */
-    if(kernel_copy_from_user(mm,&mask,sp+128+40,sizeof(mask),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(mask) ||
+    if(kernel_copy_from_user(mm,&saved_stack,sp+128+16,sizeof(saved_stack),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(saved_stack) ||
+       kernel_copy_from_user(mm,&mask,sp+128+40,sizeof(mask),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(mask) ||
        kernel_copy_from_user(mm,&context,sp+128+176,sizeof(context),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(context))bad_frame();
     uint64_t address=sp+576,addresses[5]={0};
     for(;;) {
@@ -162,6 +169,7 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
     }
     if(kernel_signal_update_blocked(task,LINUX_SIG_SETMASK,&mask,0)!=KERNEL_SIGNAL_STATUS_OK)bad_frame();
     kernel_signal_clear_syscall_restart(task);
+    (void)kernel_signal_stack_update(task,&saved_stack,0,context.regs[3]);
     frame->era=context.pc;frame->regs[0]=0;
     memcpy(frame->regs+1,context.regs+1,31*sizeof(uint64_t));
     fp.saved=(context.flags&1)!=0;
