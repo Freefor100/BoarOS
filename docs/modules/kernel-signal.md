@@ -31,6 +31,10 @@ pending位图是就绪摘要。普通标准信号继续在任务原有字段保�
 
 `RLIMIT_SIGPENDING(11)`默认软／硬额度4096，同组共享、fork复制、exec保留。当前固定真实UID0，使用量汇总该UID的全部信息记录；接纳按目标软额度判断，`/proc/<pid>/status`的`SigQ`展示使用量／额度。下调额度保留已有消息。实时排队发送额度不足返回EAGAIN；普通kill保留至少一个待决位，并按Linux允许丢失附带信息。标准信号合并不重复计费。`make test-signal-pending-host`在4/16KiB页检查FIFO、跨组额度、候选竞争、分配失败、交接和最终归还。
 
+`rt_sigqueueinfo(138)`和`rt_tgsigqueueinfo(240)`沿现有CPU0目标解析流程发送，保留完整si_code、来源与64位sigval。目标借用覆盖准备和提交，锁内重新核对接收者与当前组容器；有效僵尸身份接受信号但不新增记录。额度耗尽时实时sigqueue和tgkill返回EAGAIN，普通kill保留待决事件。用户输入按固定Linux先导入48字节有效区；已知布局不读取未使用的80字节，未知布局检查扩展全零，否则E2BIG。输入EFAULT先于后续目标和来源检查。
+
+handler与sigtimedwait取得同一规范记录，用户输出在消费之后发生；SIGCHLD退出信息另带真实组CPU用量，单位为100Hz用户时钟tick。标准内联时间数据放任务尾部，不改变原有热字段位置。内核编号32～64均支持；libc预留编号由raw syscall短例覆盖。
+
 ## SMP上的状态和执行位置
 
 RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护：选择信号时一次取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位，并重置一次性动作。锁外只使用线程栈上的delivery快照。后续rt_sigaction替换同一项时，本次递送继续使用已选版本；替换的新动作也保留。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
@@ -108,7 +112,7 @@ break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate �
 `make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
 验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
 SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
-用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；用户态排队发送入口随后接入。
+用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；用户态排队发送与共同消费见前文。
 
 U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 

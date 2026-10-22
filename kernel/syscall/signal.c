@@ -353,6 +353,50 @@ static int64_t syscall_signal_pid(uint64_t value)
     return (int64_t)(int32_t)(uint32_t)value;
 }
 
+static int known_signal_info(unsigned sig,int code)
+{
+    if(code==128 || (code<=0 && code>=-7) || code==-60)return 1;
+    if(code<=0)return 0;
+    unsigned limit=sig==4?11:sig==8?15:sig==11?10:sig==7?5:sig==31?2:6;
+    return (unsigned)code<=limit;
+}
+
+enum kernel_syscall_status syscall_handle_sigqueueinfo(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    int thread=request->number==240;
+    int64_t group=syscall_signal_pid(request->arguments[0]);
+    int64_t pid=thread?syscall_signal_pid(request->arguments[1]):group;
+    unsigned sig=(uint32_t)request->arguments[thread?2:1];
+    uint64_t address=request->arguments[thread?3:2];
+    struct kernel_signal_wait_info info={0};struct kernel_mm *mm;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    /* Linux imports its 48-byte kernel siginfo, then checks the expansion
+     * only for unknown layouts. Known input need not expose unused bytes. */
+    enum kernel_uaccess_status copied=signal_copy_from_user(mm,address,&info,48);
+    if(copied!=KERNEL_UACCESS_STATUS_OK)return signal_copy_error(copied,decoded);
+    info.signal=sig;
+    if(!known_signal_info(sig,info.code)) {
+        uint8_t expansion[80];
+        if(address>UINT64_MAX-48){decoded->value=-KERNEL_EFAULT;return KERNEL_SYSCALL_STATUS_OK;}
+        copied=signal_copy_from_user(mm,address+48,expansion,sizeof(expansion));
+        if(copied!=KERNEL_UACCESS_STATUS_OK)return signal_copy_error(copied,decoded);
+        for(unsigned i=0;i<sizeof(expansion);i++)if(expansion[i]) {
+            decoded->value=-KERNEL_E2BIG;return KERNEL_SYSCALL_STATUS_OK;
+        }
+    }
+    if(thread && (group<=0 || pid<=0)){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
+    kernel_pid_t self;
+    if(kernel_task_tid(caller,&self)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if((info.code>=0 || info.code==-6) && pid!=self) {
+        decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
+    }
+    decoded->value=pid<=0?-KERNEL_ESRCH:kernel_signal_queue_info((int32_t)group,(int32_t)pid,thread,&info);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_signal_send(
     struct kernel_task *caller,
     uint32_t kind,
@@ -365,7 +409,7 @@ enum kernel_syscall_status syscall_handle_signal_send(
                                                    ? 2U
                                                    : 1U];
     kernel_pid_t sender_pid;
-    uint32_t sent;
+    int64_t sent;
     enum kernel_task_status task_status;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
@@ -404,6 +448,6 @@ enum kernel_syscall_status syscall_handle_signal_send(
                                           sig,
                                           sender_pid);
     }
-    decoded->value = sent == 0U ? -KERNEL_ESRCH : 0;
+    decoded->value = sent < 0 ? sent : sent == 0 ? -KERNEL_ESRCH : 0;
     return KERNEL_SYSCALL_STATUS_OK;
 }

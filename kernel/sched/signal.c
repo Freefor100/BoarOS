@@ -27,7 +27,7 @@ void kernel_signal_encode_info(void *output, const struct kernel_signal_wait_inf
 
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *, uint32_t, kernel_pid_t, int, int16_t,
-    const struct kernel_signal_child_info *);
+    const struct kernel_signal_wait_info *, int queued);
 
 static struct kernel_task *real_timers;
 static struct kernel_task *cpu_timers;
@@ -831,9 +831,14 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
     int16_t code, int32_t status)
 {
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(parent));
-    struct kernel_signal_child_info info = {.uid = 0, .status = status};
+    struct kernel_signal_wait_info info = {.signal=17,.sender=(uint32_t)child->tid,.code=code,.uid=0,.status=status};
+    if(code>=1 && code<=3) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        info.user_time=timer_add(child->usage.user_ns,child->dead_usage.user_ns)/UINT64_C(10000000);
+        info.system_time=timer_add(child->usage.kernel_ns,child->dead_usage.kernel_ns)/UINT64_C(10000000);
+    }
     if (representative)
-        (void)signal_send_one(representative, 17, child->tid, 1, code, &info);
+        (void)signal_send_one(representative, 17, child->tid, 1, code, &info, 0);
 }
 
 void kernel_signal_notify_child_exit(struct kernel_task *child)
@@ -1053,7 +1058,7 @@ static struct kernel_task *signal_send_leader(struct kernel_task *target,
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid,
     int process_directed, int16_t code,
-    const struct kernel_signal_child_info *child_info)
+    const struct kernel_signal_wait_info *provided, int queued)
 {
     struct kernel_task *leader;
     struct kernel_task *wake_target;
@@ -1076,8 +1081,8 @@ static enum kernel_signal_status signal_send_one(
                                    sig, 0U);
         return KERNEL_SIGNAL_STATUS_OK;
     }
-    if(child_info){info.uid=child_info->uid;info.status=child_info->status;}
-    signal_pending_prepare(process_directed?leader:target,process_directed,&info,0,&p);
+    if(provided)info=*provided;
+    signal_pending_prepare(process_directed?leader:target,process_directed,&info,queued,&p);
     SCHEDULER_TASK_BORROW(selected, 0);
     wake_target = target;
     if (process_directed && !signal_wants_signal(target, sig)) {
@@ -1086,13 +1091,17 @@ static enum kernel_signal_status signal_send_one(
     }
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        /* Preparation may have slept while exec handed the group container
+         * to another member. Publish to the currently owned queue. */
+        if(!signal_dispatchable_locked(target))return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+        leader=target->group_leader;
         if (process_directed && (!wake_target || wake_target->group_leader!=leader ||
                                   !signal_wants_signal_locked(wake_target,sig))) {
             wake_target=0;
             retarget=signal_mask(sig);
         }
         if (signal_ignored_unblocked(wake_target, sig)) return KERNEL_SIGNAL_STATUS_OK;
-        int posted=signal_pending_post_locked(process_directed?leader:target,process_directed,&info,0,&p);
+        int posted=signal_pending_post_locked(process_directed?leader:target,process_directed,&info,queued,&p);
         if(posted<0)return KERNEL_SIGNAL_STATUS_QUEUE_FULL;
         if(posted>0)return KERNEL_SIGNAL_STATUS_OK;
 #if BOAROS_USER_SMP
@@ -1117,13 +1126,38 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
     if (representative == 0) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
-    return signal_send_one(representative, sig, sender_tid, 1, 0, 0);
+    return signal_send_one(representative, sig, sender_tid, 1, 0, 0, 0);
+}
+
+static enum kernel_signal_status signal_send_info(struct kernel_task *target,int shared,
+    const struct kernel_signal_wait_info *info)
+{
+    if(!shared)return signal_send_one(target,info->signal,info->sender,0,info->code,info,1);
+    SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(target));
+    /* A live zombie identity accepts the signal without creating a record. */
+    return representative ? signal_send_one(representative,info->signal,info->sender,1,info->code,info,1)
+        : KERNEL_SIGNAL_STATUS_OK;
+}
+
+int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
+    const struct kernel_signal_wait_info *info)
+{
+    SCHEDULER_TASK_BORROW(target,scheduler_task_lookup(pid,thread?KERNEL_PID_TID:KERNEL_PID_TGID,0));
+    if(!target)return -KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(!target->group_leader || (thread && target->group_leader->tid!=group))return -KERNEL_ESRCH;
+        if(info->signal>KERNEL_SIGNAL_COUNT)return -KERNEL_EINVAL;
+        if(!info->signal || !signal_dispatchable_locked(target))return 0;
+    }
+    enum kernel_signal_status status=signal_send_info(target,!thread,info);
+    return status==KERNEL_SIGNAL_STATUS_OK?0:status==KERNEL_SIGNAL_STATUS_QUEUE_FULL?-KERNEL_EAGAIN:-KERNEL_ESRCH;
 }
 
 enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, uint32_t sig)
 {
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(target));
-    return representative ? signal_send_one(representative, sig, 0, 1, 128, 0)
+    return representative ? signal_send_one(representative, sig, 0, 1, 128, 0, 0)
         : KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
 }
 
@@ -1135,7 +1169,7 @@ void kernel_signal_timer_expire(void)
         struct kernel_task *leader = real_timers;
         real_timer_remove(leader);
         SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
-        if (representative && signal_send_one(representative, 14U, 0, 1, 128, 0) != KERNEL_SIGNAL_STATUS_OK)
+        if (representative && signal_send_one(representative, 14U, 0, 1, 128, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
             __builtin_trap();
     }
     for (struct kernel_task *leader = cpu_timers, *next; leader; leader = next) {
@@ -1159,7 +1193,7 @@ void kernel_signal_timer_expire(void)
         if (!representative) continue;
         for (unsigned i = 0; i < 2; ++i)
             if ((fired & (1U << i)) &&
-                signal_send_one(representative, 26U + i, 0, 1, 128, 0) != KERNEL_SIGNAL_STATUS_OK)
+                signal_send_one(representative, 26U + i, 0, 1, 128, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
                 __builtin_trap();
     }
 }
@@ -1167,7 +1201,7 @@ void kernel_signal_timer_expire(void)
 enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid)
 {
-    return signal_send_one(target, sig, sender_tid, 0, -6, 0);
+    return signal_send_one(target, sig, sender_tid, 0, -6, 0, 0);
 }
 
 enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *target)
@@ -1175,7 +1209,7 @@ enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *targ
     kernel_pid_t sender;
     if (kernel_task_tgid(target, &sender) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SIGNAL_STATUS_INVALID_STATE;
-    return signal_send_one(target, 25U, sender, 0, 0, NULL);
+    return signal_send_one(target, 25U, sender, 0, 0, NULL, 0);
 }
 
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
@@ -1200,7 +1234,7 @@ static uint32_t signal_target_group(struct kernel_task *leader, uint32_t sig,
     if (!deliver) return 1;
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
     if (!representative) return 1;
-    return signal_send_one(representative, sig, sender, 1, 0, 0) == KERNEL_SIGNAL_STATUS_OK;
+    return signal_send_one(representative, sig, sender, 1, 0, 0, 0) == KERNEL_SIGNAL_STATUS_OK;
 }
 
 static uint32_t signal_target_identities(struct kernel_task *caller, int64_t pid,
@@ -1244,7 +1278,7 @@ uint32_t kernel_signal_send_targets(struct kernel_task *caller, int64_t pid,
     return signal_target_identities(caller, pid, sig, sender_tid, 1);
 }
 
-uint32_t kernel_signal_send_thread(struct kernel_task *caller,
+int64_t kernel_signal_send_thread(struct kernel_task *caller,
                                    kernel_pid_t tgid,
                                    kernel_pid_t tid,
                                    uint32_t sig,
@@ -1265,10 +1299,10 @@ uint32_t kernel_signal_send_thread(struct kernel_task *caller,
     if (sig == 0U) {
         return 1U;
     }
-    if (kernel_signal_send_task(target, sig, sender_tid) !=
-        KERNEL_SIGNAL_STATUS_OK) {
-        return 0U;
-    }
+    enum kernel_signal_status status=kernel_signal_send_task(target,sig,sender_tid);
+    if(status==KERNEL_SIGNAL_STATUS_QUEUE_FULL)return -KERNEL_EAGAIN;
+    if(status!=KERNEL_SIGNAL_STATUS_OK)return 0;
+
     return 1U;
 }
 

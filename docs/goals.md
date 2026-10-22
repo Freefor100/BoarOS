@@ -40,7 +40,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
-| 信号、线程与事件 | 实时信号队列/计费；CMP_REQUEUE/WAKE_OP、PI futex；扩展 clone；signalfd；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
+| 信号、线程与事件 | CMP_REQUEUE/WAKE_OP、PI futex；扩展 clone；signalfd；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
 | 用户内存 | mremap、按操作区分的 madvise、mlock/MAP_LOCKED、/proc/<pid>/pagemap；文件映射截断/退出错误的进一步交错验证 | [MM](modules/kernel-mm.md)；地址迁移依赖对象和并发边界稳定 |
 | 进程查询与 IPC | pidfd 对象及 waitid(P_PIDFD)、SysV 消息队列及信号量；preadv2/pwritev2 的扩展标志 | getrusage、waitid(P_ALL/P_PID/P_PGID)、wait4、times、SysV 共享内存及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |

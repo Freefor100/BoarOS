@@ -229,6 +229,7 @@ struct kernel_task {
     struct kernel_signal_stack signal_stack;
     struct kernel_signal_pending_state signal_queue, group_queue;
     struct kernel_rlimit64 sigpending_limit;
+    uint64_t signal_child_times[2], group_child_times[2];
 } __attribute__((aligned(16)));
 
 #endif

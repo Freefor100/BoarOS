@@ -184,6 +184,8 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                              kernel_pid_t sender_tid);
 
 /* Same target-storage contract; sends a thread-directed signal to one task. */
+int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
+    const struct kernel_signal_wait_info *);
 enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target,
     uint32_t sig,
@@ -265,7 +267,7 @@ uint32_t kernel_signal_send_targets(struct kernel_task *caller,
                                     kernel_pid_t sender_tid);
 
 /* Sends to one thread id, optionally checking its thread-group id. */
-uint32_t kernel_signal_send_thread(struct kernel_task *caller,
+int64_t kernel_signal_send_thread(struct kernel_task *caller,
                                    kernel_pid_t tgid,
                                    kernel_pid_t tid,
                                    uint32_t sig,

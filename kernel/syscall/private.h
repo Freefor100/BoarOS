@@ -284,6 +284,9 @@ enum kernel_syscall_status syscall_handle_sigaltstack(
     struct kernel_task *, const struct kernel_syscall_request *,
     struct kernel_syscall_result *);
 
+enum kernel_syscall_status syscall_handle_sigqueueinfo(
+    struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
+
 enum kernel_syscall_status syscall_handle_rt_sigprocmask(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

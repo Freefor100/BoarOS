@@ -28,9 +28,13 @@ void signal_pending_prepare(struct kernel_task *t,int shared,
     const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
 {
     if(info->signal<32 && !supplied)return;
-    int needs_index;
-    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);needs_index=!state(t,shared)->queue; }
-    struct kernel_heap *heap=t->files.heap;
+    int needs_index;struct kernel_heap *heap;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(t->proc_exiting)return;
+        needs_index=!state(t,shared)->queue;heap=t->files.heap;
+    }
+    if(!heap)return;
     if(needs_index && !kernel_heap_allocate_zeroed(heap,1,sizeof(*p->index),(void **)&p->index))
         p->index->heap=heap;
     if(!kernel_heap_allocate_zeroed(heap,1,sizeof(*p->record),(void **)&p->record))
@@ -69,6 +73,8 @@ int signal_pending_post_locked(struct kernel_task *t,int shared,
         if(sig==17) {
             struct kernel_signal_child_info child={.uid=available?info->uid:0,.status=available?info->status:0};
             if(shared)t->group_child_info=child;else t->signal_child_info=child;
+            uint64_t *times=shared?t->group_child_times:t->signal_child_times;
+            times[0]=available?info->user_time:0;times[1]=available?info->system_time:0;
         }
     }
     *pending|=bit;return 0;
@@ -94,6 +100,8 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
         if(sig==17) {
             struct kernel_signal_child_info child=shared?t->group_child_info:t->signal_child_info;
             out->uid=child.uid;out->status=child.status;
+            uint64_t *times=shared?t->group_child_times:t->signal_child_times;
+            out->user_time=times[0];out->system_time=times[1];
         }
         if(s->inline_charged&bit) {
             if(!root_pending)__builtin_trap();
@@ -146,5 +154,6 @@ void kernel_signal_pending_adopt_locked(struct kernel_task *to,struct kernel_tas
 {
     if(to->group_queue.queue || to->group_queue.inline_charged)__builtin_trap();
     to->group_queue=from->group_queue;from->group_queue=(struct kernel_signal_pending_state){0};
+    memcpy(to->group_child_times,from->group_child_times,sizeof(to->group_child_times));
     from->group_pending=0;
 }
