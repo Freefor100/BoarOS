@@ -1,4 +1,5 @@
 #include "private.h"
+#include <kernel/event_fd.h>
 #include <arch/timer.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
@@ -477,6 +478,12 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         deadline_index_first();
     if (blocked != 0 && (!deadline || blocked->wait.deadline < deadline))
         deadline = blocked->wait.deadline;
+    uint64_t event=0;
+#if BOAROS_MAX_CPUS > 1
+    if (!cpu->logical_id)
+#endif
+        event=kernel_timer_fd_deadline();
+    if (event && (!deadline || event<deadline)) deadline=event;
     return deadline;
 }
 

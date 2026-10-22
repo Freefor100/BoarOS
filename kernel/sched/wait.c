@@ -2,6 +2,7 @@
 #include <arch/timer.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
+#include <kernel/event_fd.h>
 #if BOAROS_MAX_CPUS > 1
 #include <arch/riscv/smp.h>
 #endif
@@ -298,6 +299,8 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
         if (done) break;
     }
     /* 协议和信号业务回调不能进入调度raw域。 */
+    uint64_t event=kernel_timer_fd_deadline();
+    if (event && (int64_t)(now-event)>=0) kernel_timer_fd_expire(now);
     kernel_socket_expire_timers();
     kernel_signal_timer_expire();
     return KERNEL_SCHEDULER_STATUS_OK;

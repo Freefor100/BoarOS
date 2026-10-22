@@ -27,6 +27,7 @@
 #define LINUX_SYSCALL_CHDIR 49U
 #define LINUX_SYSCALL_FCHDIR 50U
 #define LINUX_SYSCALL_RENAMEAT2 276U
+#define LINUX_SYSCALL_EVENTFD2 19U
 #define LINUX_SYSCALL_EPOLL_CREATE1 20U
 #define LINUX_SYSCALL_EPOLL_CTL 21U
 #define LINUX_SYSCALL_EPOLL_PWAIT 22U
@@ -304,6 +305,12 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_RECVMSG) {
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number >= 85U && request->number <= 87U) {
+        if (syscall_handle_timerfd(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_EVENTFD2) {
+        if (syscall_handle_eventfd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_EPOLL_CREATE1) {
         if (syscall_handle_epoll_create1(caller, request, &decoded) !=

@@ -98,3 +98,11 @@ unavailable，realtime offset 为零。固定 QEMU 的 TOY 读数只有整秒，
 `make test-rtc-loongarch-host test-environment-loongarch` 覆盖日期失败、真实 UTC、
 OFD/fork/exec/错误指针和原 BusyBox hwclock/dmesg/df；两项清日志测试各用独立启动。
 派生 QEMU 与固定 Linux 告警的验证见 [LA 平台](loongarch-boot.md#ls7a-rtc-与派生模拟器)。
+
+## timerfd期限
+
+`timerfd_create/settime/gettime`提供MONOTONIC和REALTIME匿名OFD。设置、查询、计数读取和等待由发起CPU执行；CPU0在真实到期中断中发布可读状态。已启用对象进入侵入式AVL期限索引，索引和对象状态由同一短锁保护。发布的最早tick期限供调度器读取，调度锁内不再进入索引锁；远端更新通过既有deadline IPI要求CPU0重装硬件事件。空索引只有常数空检查。
+
+首次到期只记一次并通知。周期在read/gettime中按原绝对期限累计漏过次数、前移和重装，保留周期相位，避免短周期造成密集IRQ。settime完整导入输入后交换设置，输出旧值EFAULT不撤销新设置。timerfd read消费计数后复制，部分输出返回实际完成前缀，区别于eventfd的EFAULT返回。
+
+末次关闭从索引摘除对象后，等待已经取得的到期通知借用和等待游标结束，再归还对象。dup/fork共享设置和计数。BOOTTIME、ALARM时钟仍在能力目录；CANCEL_ON_SET接受并保存，当前墙钟只在启动初始化，运行时调钟的取消通知随调钟接口增加。

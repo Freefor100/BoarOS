@@ -52,3 +52,7 @@ EXCLUDED(kernel_time_boot_realtime_offset)
 EXCLUDED(kernel_signal_has_pending)
 EXCLUDED(kernel_char_device_lookup)
 EXCLUDED(kernel_char_device_open)
+
+EXCLUDED(kernel_event_fd_io)
+EXCLUDED(kernel_event_fd_poll)
+EXCLUDED(kernel_event_fd_close)

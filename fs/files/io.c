@@ -10,6 +10,7 @@
 #include <kernel/cost.h>
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
+#include <kernel/event_fd.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
@@ -359,6 +360,12 @@ static enum kernel_files_status read_pinned(
         return status;
     }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if ((kind==KERNEL_OPEN_FILE_KIND_EVENTFD || kind==KERNEL_OPEN_FILE_KIND_TIMERFD)) {
+        *linux_result=kernel_event_fd_io(description,mm,iov,iov_count,count,0);
+        if (*linux_result<0) KERNEL_FILES_NOTE(files,read_failures,1);
+        else KERNEL_FILES_NOTE(files,bytes_read,(uint64_t)*linux_result);
+        return KERNEL_FILES_STATUS_OK;
+    }
     /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
@@ -601,6 +608,11 @@ enum kernel_files_status kernel_files_read(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
+    if ((description->kind==KERNEL_OPEN_FILE_KIND_EVENTFD || description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD) &&
+        (kernel_user_range_check(user_buffer,(size_t)count) || scalar_empty_range_fault(user_buffer,count))) {
+        *linux_result=-KERNEL_EFAULT;KERNEL_FILES_NOTE(files,read_failures,1);
+        return release_io_description(files,&description,KERNEL_FILES_STATUS_OK);
+    }
     status = read_pinned(files, mm, description, &description, &iov, 1U, count,
                          linux_result, 0U, 0, 0);
     return release_io_description(files, &description, status);
@@ -639,13 +651,14 @@ static enum kernel_files_status readv_request(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
     if (positioned && ((description->device && !description->device->positioned) ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
         *linux_result = -KERNEL_ESPIPE;
@@ -740,7 +753,7 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD);
     uint64_t position;
     uint64_t request;
     uint64_t file_size;
@@ -769,6 +782,7 @@ static enum kernel_files_status pread_iov_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if ((description->device && !description->device->positioned) ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
@@ -865,7 +879,8 @@ static int description_writable(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         return access_mode != 0U;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         return access_mode == 2U;
     }
     if (description->device) {
@@ -1496,6 +1511,10 @@ static enum kernel_files_status write_request(
     if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
         count, 1, positioned, requested_offset, linux_result);
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if ((kind==KERNEL_OPEN_FILE_KIND_EVENTFD || kind==KERNEL_OPEN_FILE_KIND_TIMERFD)) {
+        *linux_result=kernel_event_fd_io(description,mm,iov,iov_count,count,1);
+        return KERNEL_FILES_STATUS_OK;
+    }
     /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
@@ -1624,7 +1643,8 @@ enum kernel_files_status kernel_files_write(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD) {
         *linux_result = -KERNEL_EINVAL;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
@@ -1681,6 +1701,7 @@ enum kernel_files_status kernel_files_pwrite(
     }
     kind = kernel_open_file_kind(description);
     if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        kind == KERNEL_OPEN_FILE_KIND_EVENTFD || kind == KERNEL_OPEN_FILE_KIND_TIMERFD ||
         kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
         kind == KERNEL_OPEN_FILE_KIND_PIPE ||
         (description->device && !description->device->positioned))
@@ -1738,14 +1759,16 @@ static enum kernel_files_status writev_request(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE);
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD);
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD) {
         *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
     if (positioned && ((description->device && !description->device->positioned) ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
         *linux_result = -KERNEL_ESPIPE;
@@ -1777,6 +1800,7 @@ static enum kernel_files_status writev_request(
     }
     *linux_result=kernel_uaccess_iov_import(mm,user_iov,iov,iovcnt,&total);
     if (*linux_result) goto out;
+    if (!total && description->kind==KERNEL_OPEN_FILE_KIND_EVENTFD) { *linux_result=0;goto out; }
     if (!positioned && description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description,
@@ -1833,7 +1857,8 @@ static enum kernel_files_status lseek_pinned(
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         *linux_result = (int64_t)kernel_open_file_offset(description);
         return KERNEL_FILES_STATUS_OK;
     }
