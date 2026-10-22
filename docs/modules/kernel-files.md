@@ -206,7 +206,7 @@ USER_SMP 中，FD快照、pipe/socket/epoll及普通文件的就绪查询、临�
 ## epoll 事件通知子系统
 
 `kernel_files_epoll_create1()`、`kernel_files_epoll_ctl()` 与 `kernel_files_epoll_pwait()`
-负责 fd 安装、目标引用和用户 ABI。创建复用普通 fd 安装原语；表满返回 `EMFILE`，
+负责 fd 安装、目标引用和用户 ABI。等待扫描、事件复制和park在发起CPU执行；创建、控制和最终销毁仍由CPU0完成。多个等待者沿已有scan owner和状态短锁竞争，设备目标只在锁外查询时进入其CPU0执行范围。创建复用普通 fd 安装原语；表满返回 `EMFILE`，
 归还尚未安装的 epoll/OFD，不覆盖已有槽。
 
 登记身份是 `(fd, OFD)`，因此指向同一 OFD 的不同 dup fd 可以分别登记。关闭其中一个

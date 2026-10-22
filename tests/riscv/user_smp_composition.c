@@ -60,6 +60,7 @@ static void check_at(int valid,unsigned line)
 }
 #define check(valid) check_at((valid),__LINE__)
 #include "socket_smp.h"
+#include "pipe_smp.h"
 static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
@@ -374,6 +375,7 @@ void riscv_user_composition_finish(void)
 void riscv_user_composition_report(void)
 {
     socket_observe_report();
+    pipe_observe_report();
     virt_uart_puts("BoarOS: COMPOSITION clock claims=");virt_uart_put_hex(clock_claims);
     virt_uart_puts(" active=");virt_uart_put_hex(clock_active);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);
@@ -448,7 +450,7 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint6
         while (!composition_load(&control->wait_release)) relinquish();
     }
     enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,source,size,copied);
-    socket_observe_copy(*copied,0);return result;
+    socket_observe_copy(*copied,0);pipe_observe_events(*copied);return result;
 }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __real_physical_page_allocate_order(struct physical_page_allocator *,uint32_t,uint64_t *);

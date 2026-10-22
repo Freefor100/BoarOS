@@ -41,6 +41,12 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
 void kernel_cpu_flush_notifications(void) {CHECK(!kernel_cpu_current()->outbound);}
 #endif
 static unsigned preempt_depth, scopes[2], wait_live[2], protocol_cancel;
+static unsigned service_entries;
+void kernel_service_scope_begin(struct kernel_service_scope *scope)
+{ CHECK(!scope->entered);scope->entered=1;service_entries++; }
+void kernel_service_scope_end(struct kernel_service_scope *scope)
+{ scope->entered=0; }
+
 static unsigned prepares, parks, finishes, task_wakes, poll_action;
 static void control(int operation,uint32_t mode,uint64_t data);
 static void cancel_at_protocol_entry(void);
@@ -480,6 +486,10 @@ static void nested_notifications(void)
 }
 int main(int argc, char **argv)
 {
+    setup(0);struct linux_epoll_event local_event;unsigned services=service_entries;
+    CHECK(wait_events(&local_event,1)==1 && service_entries==services);
+    teardown();
+
     if(argc>1 && !strcmp(argv[1],"query-overlap")) { overlapping_observers(); return 0; }
     if(argc>1 && !strcmp(argv[1],"dag")) { nested_notifications(); return 0; }
     if(argc>1 && (!strcmp(argv[1],"allocation") || !strcmp(argv[1],"cycle"))) { allocation_races(!strcmp(argv[1],"cycle")); return 0; }

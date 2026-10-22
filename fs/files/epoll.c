@@ -981,7 +981,6 @@ enum kernel_files_status kernel_files_epoll_pwait(
     size_t sigsetsize,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_epoll *epoll;
     struct kernel_epoll_wait_request request = {0};
