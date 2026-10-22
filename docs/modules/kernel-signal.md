@@ -114,4 +114,4 @@ TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/T
 
 FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮点/SIMD模块](loongarch-fpu.md)。
 
-`tests/workloads/signal/altstack.c`对照两架构Linux，覆盖登记ABI、嵌套、普通栈溢出、坏备用栈、可读无效与不可读恢复字段、fork/vfork/线程及非组长exec。LA在激活FPU/LSX/LASX后，另检查4KiB备用栈上的实际帧及不足该宽度一帧的边界。RV观察构建记录各在线核的构帧和sigreturn；复用composition的真实页pin暂停点检查mprotect已park等待，以及munmap返回后物理页仍由pin保活，再放行复制。共同状态检查入口为`make test-signal-stack-host`（4/16KiB页）；真实多核入口复用`tests/network_runner.py --workload altstack --observe`。
+`tests/workloads/signal/altstack.c`对照两架构Linux，覆盖登记ABI、嵌套、普通栈溢出、坏备用栈、可读无效与不可读恢复字段、fork/vfork/线程及非组长exec。LA在激活FPU/LSX/LASX后，另检查4KiB备用栈上的实际帧（FPU 880、LSX 1136、LASX 1648字节）及不足该宽度一帧的边界，父进程先取得成功构帧记录，再判定后续SIGSEGV。RV观察构建记录各在线核的构帧和sigreturn；复用composition的真实页pin暂停点检查mprotect已park等待，以及munmap返回后物理页仍由pin保活，再放行复制。共同状态检查入口为`make test-signal-stack-host`（4/16KiB页）；真实多核入口复用`tests/network_runner.py --workload altstack --observe`。
