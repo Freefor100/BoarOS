@@ -26,6 +26,7 @@ struct kernel_wait_cursor {
 };
 int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *, struct kernel_wait_cursor *, int);
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *, int);
+int kernel_wait_cursor_prepare(struct kernel_wait_queue *, struct kernel_wait_cursor *);
 void kernel_wait_cursor_begin(struct kernel_wait_queue *, struct kernel_wait_cursor *);
 void kernel_wait_cursor_advance(struct kernel_wait_cursor *);
 void kernel_wait_cursor_end(struct kernel_wait_cursor *);

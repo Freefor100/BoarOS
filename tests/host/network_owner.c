@@ -5,6 +5,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <kernel/random.h>
+#include <kernel/raw_lock.h>
+#include <kernel/wait_internal.h>
 #include "../../net/socket.c"
 #include "../../net/ethernet.c"
 
@@ -14,6 +16,30 @@ static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
 static unsigned heap_allocations,protocol_services,allow_ofd_release;
+static _Thread_local unsigned reservation_actor;
+static pthread_mutex_t reservation_gate=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reservation_changed=PTHREAD_COND_INITIALIZER;
+static unsigned reservation_first, reservation_second, reservation_release;
+static void reservation_arrive(void)
+{
+    CHECK(!pthread_mutex_lock(&reservation_gate));
+    if(reservation_actor==1) {
+        reservation_first=1;CHECK(!pthread_cond_broadcast(&reservation_changed));
+        while(!reservation_release)CHECK(!pthread_cond_wait(&reservation_changed,&reservation_gate));
+    } else {reservation_second=1;CHECK(!pthread_cond_broadcast(&reservation_changed));}
+    CHECK(!pthread_mutex_unlock(&reservation_gate));
+}
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    if(reservation_actor==2)reservation_arrive();
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
+uint64_t kernel_cost_clock(void) {return 0;}
+struct kernel_cost_tag kernel_cost_capture(void) {return (struct kernel_cost_tag){0};}
+void kernel_cost_raw_lock(struct kernel_cost_tag tag,uint64_t wait,uint64_t hold)
+{(void)tag;(void)wait;(void)hold;}
+
 void kernel_cost_add(enum kernel_cost_metric metric,uint64_t value)
 { if (metric==COST_NETWORK_SERVICE_CALLS) protocol_services+=(unsigned)value; }
 static size_t user_remaining = SIZE_MAX;
@@ -24,7 +50,15 @@ static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
 
-void kernel_assert_can_block(void) {}
+void kernel_assert_can_block(void) {CHECK(!kernel_cpu_current()->raw_locks);}
+#if BOAROS_MAX_CPUS > 1
+void kernel_assert_service_context(void) {CHECK(!kernel_cpu_current()->logical_id);}
+void kernel_cpu_flush_notifications(void) {CHECK(!kernel_cpu_current()->outbound);}
+#endif
+int kernel_wait_cursor_prepare(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor)
+{(void)cursor;CHECK(queue->initialized && !queue->head);return 0;}
+void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
+{(void)cursor;(void)all;abort();}
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 { *lock=(struct kernel_rwlock){.rank=rank,.key=key}; }
 static pthread_mutex_t model_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -82,6 +116,11 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 { *queue = (struct kernel_wait_queue){.initialized = 1}; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 { CHECK(queue->initialized && !queue->head && !arch_interrupt_is_enabled()); return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q)
+{CHECK(q->initialized && !q->head);q->closed=1;return KERNEL_SCHEDULER_STATUS_OK;}
+enum kernel_scheduler_status kernel_wait_queue_destroy(struct kernel_wait_queue *q)
+{CHECK(q->closed && !q->head && !q->borrows);*q=(struct kernel_wait_queue){0};return KERNEL_SCHEDULER_STATUS_OK;}
+void kernel_wait_backend_quiesce(void) {abort();}
 uint64_t kernel_time_monotonic_ns(void) { return clock_ns; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t time, uint64_t *out)
 { *out = time; return KERNEL_TIME_STATUS_OK; }
@@ -114,9 +153,9 @@ enum kernel_task_status kernel_task_socket_write_register(struct kernel_task *t,
 enum kernel_task_status kernel_task_socket_write_clear(struct kernel_task *t, struct kernel_socket_write_request *r)
 { (void)t; (void)r; abort(); }
 enum kernel_task_status kernel_task_socket_read_register(struct kernel_task *t, struct kernel_socket_read_request *r)
-{ (void)t; (void)r; abort(); }
+{ (void)t;(void)r;CHECK(reservation_actor);reservation_arrive();return KERNEL_TASK_STATUS_OK; }
 enum kernel_task_status kernel_task_socket_read_clear(struct kernel_task *t, struct kernel_socket_read_request *r)
-{ (void)t; (void)r; abort(); }
+{ (void)t;(void)r;return KERNEL_TASK_STATUS_OK; }
 void kernel_signal_note_syscall_restart(struct kernel_task *t) { (void)t; abort(); }
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
 { (void)q;(void)d;(void)i;(void)t;abort(); }
@@ -863,9 +902,40 @@ static void endpoint_ownership(void)
     puts("PASS endpoint ownership: no core lock for RX/poll/admission, accepted writer sends first, reservations cannot oversell, payload retired once by worker or close");
 }
 
+
+struct reservation_attempt {struct kernel_socket *socket;struct kernel_socket_read_request read;struct kernel_open_file_description *pin;int result;unsigned actor;};
+static void *reserve_concurrently(void *argument)
+{
+    struct reservation_attempt *a=argument;reservation_actor=a->actor;
+    a->pin=(void *)a->socket;
+    a->result=kernel_socket_reserve_read(a->socket,(void *)a,&a->read,&a->pin,4,0);
+    return NULL;
+}
+static void concurrent_reservation(void)
+{
+    struct kernel_socket socket={.heap=&test_heap,.type=SOCKET_STREAM,.domain=KERNEL_SOCKET_DOMAIN_UNIX,.rx_bytes=4};
+    struct socket_packet packet={.length=4};socket.packets_head=socket.packets_tail=&packet;
+    kernel_wait_queue_init(&socket.wait);
+    struct reservation_attempt attempts[2]={{.socket=&socket,.actor=1},{.socket=&socket,.actor=2}};
+    pthread_t threads[2];CHECK(!pthread_create(&threads[0],NULL,reserve_concurrently,&attempts[0]));
+    CHECK(!pthread_mutex_lock(&reservation_gate));
+    while(!reservation_first)CHECK(!pthread_cond_wait(&reservation_changed,&reservation_gate));
+    CHECK(!pthread_mutex_unlock(&reservation_gate));
+    CHECK(!pthread_create(&threads[1],NULL,reserve_concurrently,&attempts[1]));
+    CHECK(!pthread_mutex_lock(&reservation_gate));
+    while(!reservation_second)CHECK(!pthread_cond_wait(&reservation_changed,&reservation_gate));
+    reservation_release=1;CHECK(!pthread_cond_broadcast(&reservation_changed));
+    CHECK(!pthread_mutex_unlock(&reservation_gate));
+    CHECK(!pthread_join(threads[0],NULL) && !pthread_join(threads[1],NULL));
+    CHECK(attempts[0].result==4 && attempts[1].result==-KERNEL_EAGAIN);
+    CHECK(socket.read_request==&attempts[0].read && !attempts[0].pin && attempts[1].pin==(void *)&socket);
+    puts("PASS concurrent receive: one reservation, loser retains its OFD pin");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
+    if (!strcmp(argv[1], "concurrent-reservation")) {concurrent_reservation();return 0;}
     if (!strcmp(argv[1], "protocol-owner")) { protocol_ownership(); return 0; }
     if (!strcmp(argv[1], "endpoint-owner")) endpoint_ownership();
     else if (!strcmp(argv[1], "receive-chains")) receive_packet_chains();

@@ -22,7 +22,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的语义转换为 `127.0.0.1`，bind 的 `0.0.0.0` 继续表示通配监听。socket 的 family/type/protocol 分别检查；RAW protocol 0 返回 `EPROTONOSUPPORT`。
 
-端点队列、读预约、超时、错误消费和发送接纳额度由短 IRQ 临界区保护；当前网络业务仍在 CPU0。就绪查询及等待登记不取得 lwIP mutex，查询、绑定、复查后才 park。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
+端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护；当前网络业务入口仍在 CPU0。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
 
 短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 在自己的外层 scope 中调用 `kernel_socket_service_owned`，沿同一资格登记等待；独立调用者使用 `kernel_socket_service_pending` 取得资格。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队；预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
 

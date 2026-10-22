@@ -7,6 +7,7 @@
 #include <kernel/epoll.h>
 #include <kernel/task.h>
 #include <kernel/socket.h>
+#include <kernel/wait_internal.h>
 #ifndef EPOLL_SOURCE
 #define EPOLL_SOURCE "../../fs/files/epoll.c"
 #endif
@@ -30,6 +31,15 @@ static uintptr_t epoll_test_irq_save(void)
     if(network_host_irq && irq_interleave) { void (*run)(void)=irq_interleave;irq_interleave=NULL;run(); }
     uintptr_t previous=network_host_irq;network_host_irq=0;return previous;
 }
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    uintptr_t interrupts=epoll_test_irq_save();arch_interrupt_restore(interrupts);
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
+#if BOAROS_MAX_CPUS > 1
+void kernel_cpu_flush_notifications(void) {CHECK(!kernel_cpu_current()->outbound);}
+#endif
 static unsigned preempt_depth, scopes[2], wait_live[2], protocol_cancel;
 static unsigned prepares, parks, finishes, task_wakes, poll_action;
 static void control(int operation,uint32_t mode,uint64_t data);
@@ -102,6 +112,17 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue
     for(struct kernel_wait_node *n=q->head;n;n=n->next) { if(n->callback) { callbacks++; n->callback(n,0); } else if(n->task) task_wakes++; }
     notification_depth--;
     return KERNEL_SCHEDULER_STATUS_OK;
+}
+int kernel_wait_cursor_prepare(struct kernel_wait_queue *q,struct kernel_wait_cursor *cursor)
+{
+    if(!q->head)return 0;
+    q->borrows++;*cursor=(struct kernel_wait_cursor){.queue=q,.node=q->head};return 1;
+}
+void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
+{
+    (void)all;struct kernel_wait_queue *q=cursor->queue;
+    CHECK(q && q->borrows && !kernel_cpu_current()->raw_locks);
+    kernel_wait_queue_wake_all(q);q->borrows--;*cursor=(struct kernel_wait_cursor){0};
 }
 enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q)
 { CHECK(q->initialized);q->closed=1;return kernel_wait_queue_wake_all(q); }
