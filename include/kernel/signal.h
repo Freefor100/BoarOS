@@ -55,6 +55,10 @@ struct kernel_signal_wait_info {
 struct kernel_signal_child_info { uint32_t uid; int32_t status; };
 void kernel_signal_encode_info(void *output,
     const struct kernel_signal_wait_info *info);
+struct kernel_wait_queue;
+struct kernel_wait_queue *kernel_signal_fd_source(struct kernel_task *);
+uint64_t kernel_signal_fd_pending_locked(struct kernel_task *,uint64_t);
+int kernel_signal_fd_take(struct kernel_task *,const uint64_t *,struct kernel_signal_wait_info *,int);
 struct kernel_signal_queue;
 struct kernel_signal_pending_state {
     struct kernel_signal_queue *queue;

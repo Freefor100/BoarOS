@@ -309,6 +309,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 74U) {
+        if(syscall_handle_signalfd(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number >= 85U && request->number <= 87U) {
         if (syscall_handle_timerfd(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

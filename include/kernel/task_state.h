@@ -80,6 +80,7 @@ struct kernel_signal_table {
     uint64_t magic;
     uint32_t references;
     struct kernel_signal_action actions[KERNEL_SIGNAL_COUNT];
+    struct kernel_wait_queue signalfd_waiters;
 };
 
 enum kernel_user_return_work {

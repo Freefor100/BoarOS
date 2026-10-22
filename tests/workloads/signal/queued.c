@@ -115,8 +115,10 @@ static void reserved_numbers(void)
     }
     CHECK(!syscall(SYS_rt_sigprocmask,SIG_SETMASK,&old,0,8));
 }
+#include "signalfd_cases.h"
+#include "queued_threads.h"
 int main(void)
 {
-    setvbuf(stdout,0,_IONBF,0);alarm(15);pending();payload();import_bounds();send_limits();reserved_numbers();
+    setvbuf(stdout,0,_IONBF,0);alarm(15);pending();payload();import_bounds();send_limits();reserved_numbers();signal_fd_cases();queued_threads();
     printf("QUEUED END failures=%u\n",failures);return failures?1:0;
 }

@@ -6,7 +6,7 @@
 
 ## 近期方向
 
-架构主线是SMP正确性；受控RV映射域已包含匿名、私有tmpfs及在发起CPU冷装入的ext4。真实RV用户可在1～4核执行，按业务入口交接仍需CPU0的操作，229项原程序及有限压力/生命周期组合已有本地两核与单核退化验证；ext4 冷读已具备 inode/mount 读资格、共享缓存短锁及块完成保护；已打开ext4文件的空间修改和同步准备也在发起CPU执行；目录与路径元数据也已在发起 CPU 执行，共享路径和 FS 上下文由跨核保护维护。实际启动多个 CPU 的可写 journal ext4 挂载使用逐目录资格，不同目录和文件的私有修改可同时准备，rename 仍由挂载拓扑互斥协调；四核短例覆盖线程/进程、共享 MM、信号/CPU 定时器和 ext4 并发；socket 收发的预约、用户复制与等待已在发起 CPU 执行，lwIP 与控制操作保留 CPU0；普通用户管道、poll/pselect和epoll等待也在发起CPU执行，eventfd和MONOTONIC/REALTIME timerfd已接入调用者读写、就绪查询和等待，后续推进signalfd与LA多核。
+架构主线是SMP正确性；受控RV映射域已包含匿名、私有tmpfs及在发起CPU冷装入的ext4。真实RV用户可在1～4核执行，按业务入口交接仍需CPU0的操作，229项原程序及有限压力/生命周期组合已有本地两核与单核退化验证；ext4 冷读已具备 inode/mount 读资格、共享缓存短锁及块完成保护；已打开ext4文件的空间修改和同步准备也在发起CPU执行；目录与路径元数据也已在发起 CPU 执行，共享路径和 FS 上下文由跨核保护维护。实际启动多个 CPU 的可写 journal ext4 挂载使用逐目录资格，不同目录和文件的私有修改可同时准备，rename 仍由挂载拓扑互斥协调；四核短例覆盖线程/进程、共享 MM、信号/CPU 定时器和 ext4 并发；socket 收发的预约、用户复制与等待已在发起 CPU 执行，lwIP 与控制操作保留 CPU0；普通用户管道、poll/pselect和epoll等待也在发起CPU执行，eventfd和MONOTONIC/REALTIME timerfd已接入调用者读写、就绪查询和等待，signalfd读取当前调用线程的待决队列，后续推进LA多核。
 维持现有调度策略、全局运行队列和串行 lwIP 核心，先证明并发正确，再依据锁等待与 CPU 分布决定并行优化。
 默认生产仍为单 CPU；普通与受控对象共用保护与引用规则，普通文件缓存读写、用户复制与匿名缺页在发起 CPU 执行。ext4 冷读在发起 CPU 解析映射并提交块请求；其他磁盘后端冷读与后端释放复用既有 CPU0 worker，范围写回按窗口续批，fsync捕获固定持久化目标后由原调用者等待，完成者在共享短保护下处理错误观察并直接通知结果。系统分配器通知和干净页回收可由远端调用，脏数据仍由 worker 写回。网络端点队列使用跨核短锁，普通 socket 收发在调用 CPU 执行；lwIP、控制操作与最后销毁仍在 CPU0。epoll 远端通知有独立状态保护，控制和最终销毁保持CPU0，等待在发起CPU。
 
@@ -40,11 +40,11 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
-| 信号、线程与事件 | CMP_REQUEUE/WAKE_OP、PI futex；扩展 clone；signalfd；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
+| 信号、线程与事件 | CMP_REQUEUE/WAKE_OP、PI futex；扩展 clone；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
 | 用户内存 | mremap、按操作区分的 madvise、mlock/MAP_LOCKED、/proc/<pid>/pagemap；文件映射截断/退出错误的进一步交错验证 | [MM](modules/kernel-mm.md)；地址迁移依赖对象和并发边界稳定 |
 | 进程查询与 IPC | pidfd 对象及 waitid(P_PIDFD)、SysV 消息队列及信号量；preadv2/pwritev2 的扩展标志 | getrusage、waitid(P_ALL/P_PID/P_PGID)、wait4、times、SysV 共享内存及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
-| 凭据与限制 | capset 与可变 UID/GID/补充组及完整权限；合成对象权限、AS/DATA/CPU 等限额；core 文件写出 | [文件接口](modules/kernel-files.md)、[syscall](modules/kernel-syscall.md)；现有固定 root 查询及 NOFILE/STACK/CORE/FSIZE 不重复立项 |
+| 凭据与限制 | capset 与可变 UID/GID/补充组及完整权限；合成对象权限、AS/DATA/CPU 等限额；core 文件写出 | [文件接口](modules/kernel-files.md)、[syscall](modules/kernel-syscall.md)；现有固定 root 查询及 NOFILE/STACK/CORE/FSIZE/SIGPENDING 不重复立项 |
 | 网络与系统接口 | 普通 AF_UNIX socket 创建、命名与控制消息（socketpair 子集已提供）；原生 accept4、外部 IPv6 与运行时网络配置；CPU-time sleep、POSIX timer_create 系列、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；REAL/VIRTUAL/PROF间隔定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 

@@ -11,6 +11,7 @@
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/event_fd.h>
+#include <kernel/signal_fd.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/task.h>
@@ -470,7 +471,7 @@ int kernel_open_file_pseudo_stat(
         return kernel_pipe_stat(file->pipe, stat);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
         mode = KERNEL_VFS_S_IFSOCK | 0600U;
-    else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD))
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD))
         mode = 0600U;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         mode = KERNEL_VFS_S_IFCHR | 0600U;
@@ -535,6 +536,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_SIGNALFD:
+        return KERNEL_OPEN_FILE_KIND_SIGNALFD;
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
         return KERNEL_OPEN_FILE_KIND_TIMERFD;
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
@@ -577,6 +580,7 @@ int kernel_open_file_supports_epoll(
         return 0;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
     case KERNEL_OPEN_FILE_KIND_PIPE:
@@ -629,7 +633,7 @@ static int close_is_local(const struct kernel_open_file_description *file)
         !file->record_locks && !file->generated_ready) return 1;
     /* 无观察者的匿名端点由最后OFD owner就地结束，通知和等待借用
      * 沿管道短保护归还；有epoll登记或FIFO节点时继续走所属清理路径。 */
-    if ((file->kind==KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind==KERNEL_OPEN_FILE_KIND_TIMERFD) && !file->ep_items) return 1;
+    if ((file->kind==KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind==KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) && !file->ep_items) return 1;
     return file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe && !file->pipe->fifo_node &&
         !file->file.private_data && !file->ep_items && !file->device_opened &&
         !file->record_locks && !file->generated_ready;
@@ -673,8 +677,8 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             if (file->file.private_data && kernel_vfs_close(&file->file))
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
-        } else if ((file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD)) {
-            kernel_event_fd_close(file);
+        } else if ((file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)) {
+            if (file->kind!=KERNEL_OPEN_FILE_KIND_SIGNALFD) kernel_event_fd_close(file);
             file->vfs_closed=1;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
             if (file->epoll != 0) {
@@ -849,6 +853,7 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_SOCKET:
+    case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
         return 1;
@@ -1157,6 +1162,8 @@ uint32_t kernel_open_file_poll(
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_poll_requires_cpu0(file));
     if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_SIGNALFD:
+        return kernel_signal_fd_poll(file,out_queue);
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
         return kernel_event_fd_poll(file,requested_events,out_queue);

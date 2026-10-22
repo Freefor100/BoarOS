@@ -436,6 +436,7 @@ static enum kernel_signal_status signal_alloc_table(
     table = page;
     table->magic = KERNEL_SIGNAL_TABLE_MAGIC;
     table->references = 1U;
+    kernel_wait_queue_init(&table->signalfd_waiters);
     task->signal_table_address = (uintptr_t)page;
     return KERNEL_SIGNAL_STATUS_OK;
 }
@@ -465,6 +466,13 @@ enum kernel_signal_status kernel_signal_release_table(
                                   &physical_address) !=
         ARCH_DIRECT_MAP_STATUS_OK) {
         return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    }
+    kernel_wait_queue_pollfree(&table->signalfd_waiters);
+    for (;;) {
+        enum kernel_scheduler_status status=kernel_wait_queue_destroy(&table->signalfd_waiters);
+        if (!status) break;
+        if (status!=KERNEL_SCHEDULER_STATUS_BUSY) __builtin_trap();
+        kernel_wait_backend_quiesce();
     }
     (void)physical_page_release(scheduler.allocator, physical_address);
     task->signal_table_address = 0U;
@@ -591,9 +599,11 @@ enum kernel_signal_status kernel_signal_fork(
     child_table = page;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        memcpy(child_table, parent_table, sizeof(*child_table));
+        child_table->magic=KERNEL_SIGNAL_TABLE_MAGIC;
+        memcpy(child_table->actions,parent_table->actions,sizeof(child_table->actions));
     }
     child_table->references = 1U;
+    kernel_wait_queue_init(&child_table->signalfd_waiters);
     child->signal_table_address = (uintptr_t)child_table;
     return KERNEL_SIGNAL_STATUS_OK;
 }
@@ -727,32 +737,65 @@ enum kernel_signal_status kernel_signal_wait_begin(struct kernel_task *task,
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
+static uint32_t signal_take_locked(struct kernel_task *task,uint64_t mask,
+    struct kernel_signal_wait_info *info,struct signal_pending_prepared *prepared,
+    struct kernel_task **rearm)
+{
+    uint64_t matching=task->signal_pending & mask;
+    struct kernel_task *leader=signal_group_leader(task);
+    int shared=0;
+    if (!matching && leader) { matching=leader->group_pending & mask;shared=!!matching; }
+    if (!matching) return 0;
+    uint32_t sig=signal_first_set(matching);
+    signal_pending_take_locked(shared?leader:task,shared,sig,info,prepared);
+    if (shared && sig==14U) *rearm=leader;
+    return sig;
+}
 enum kernel_signal_status kernel_signal_wait_take(
     struct kernel_task *task, struct kernel_signal_wait_info *info)
 {
-    struct kernel_task *leader;
-    uint64_t matching;
-    uint32_t sig;
-    struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
-    int shared = 0;
-
-    if (task != kernel_cpu_current()->current || !signal_dispatchable(task) || info == 0)
+    if (task!=kernel_cpu_current()->current || !signal_dispatchable(task) || !info)
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
-    memset(info, 0, sizeof(*info));
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        matching = task->signal_pending & task->signal_wait_mask;
-        leader = signal_group_leader(task);
-        if (matching == 0U && leader != 0) {
-            matching = leader->group_pending & task->signal_wait_mask;
-            shared = matching != 0U;
-        }
-        if (matching == 0U) return KERNEL_SIGNAL_STATUS_OK;
-        sig = signal_first_set(matching);
-        signal_pending_take_locked(shared?leader:task,shared,sig,info,&p);
-    }
-    if (shared && sig == 14U) real_timer_rearm(leader);
+    struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
+    struct kernel_task *rearm=0;
+    memset(info,0,sizeof(*info));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);signal_take_locked(task,task->signal_wait_mask,info,&p,&rearm); }
+    if (rearm) real_timer_rearm(rearm);
     return KERNEL_SIGNAL_STATUS_OK;
+}
+struct kernel_wait_queue *kernel_signal_fd_source(struct kernel_task *task)
+{
+    if (signal_alloc_table(task)) return 0;
+    return &signal_table_of(task)->signalfd_waiters;
+}
+uint64_t kernel_signal_fd_pending_locked(struct kernel_task *task,uint64_t mask)
+{
+    struct kernel_task *leader=signal_group_leader(task);
+    return (task->signal_pending | (leader?leader->group_pending:0)) & mask;
+}
+int kernel_signal_fd_take(struct kernel_task *task,const uint64_t *mask,
+    struct kernel_signal_wait_info *info,int nonblock)
+{
+    struct kernel_wait_queue *queue=kernel_signal_fd_source(task);
+    if (!queue) return -KERNEL_ENOMEM;
+    for (;;) {
+        struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
+        struct kernel_task *rearm=0;struct kernel_wait_token token={0};uint32_t sig;
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            sig=signal_take_locked(task,*mask,info,&p,&rearm);
+            if (!sig) {
+                if (nonblock) return -KERNEL_EAGAIN;
+                if (kernel_wait_prepare_locked(queue,0,1,&token)) __builtin_trap();
+            }
+        }
+        signal_pending_finish(&p);
+        if (rearm) real_timer_rearm(rearm);
+        if (sig) return 0;
+        enum kernel_wait_wake_reason reason;
+        if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
+        if (reason==KERNEL_WAIT_SIGNALLED) return -KERNEL_ERESTARTSYS;
+    }
 }
 
 void kernel_signal_wait_end(struct kernel_task *task)
@@ -1063,6 +1106,7 @@ static enum kernel_signal_status signal_send_one(
     struct kernel_task *leader;
     struct kernel_task *wake_target;
     uint64_t retarget=0;
+    struct kernel_wait_cursor fd_cursor={0};
     struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
     struct kernel_signal_wait_info info={.signal=sig,.sender=(uint32_t)sender_tid,.code=code};
 
@@ -1104,10 +1148,13 @@ static enum kernel_signal_status signal_send_one(
         int posted=signal_pending_post_locked(process_directed?leader:target,process_directed,&info,queued,&p);
         if(posted<0)return KERNEL_SIGNAL_STATUS_QUEUE_FULL;
         if(posted>0)return KERNEL_SIGNAL_STATUS_OK;
+        struct kernel_signal_table *table=signal_table_of(target);
+        if (table) (void)kernel_wait_cursor_prepare_locked(&table->signalfd_waiters,&fd_cursor,1);
 #if BOAROS_USER_SMP
         scheduler_signal_request_locked(wake_target);
 #endif
     }
+    if (fd_cursor.queue) kernel_wait_cursor_wake(&fd_cursor,1);
     signal_retarget_shared(target,retarget);
     if (wake_target != 0 && signal_wants_signal(wake_target, sig) &&
         kernel_scheduler_wake_signal(wake_target) !=

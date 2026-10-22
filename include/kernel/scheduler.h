@@ -154,6 +154,7 @@ enum kernel_wait_wake_reason {
     KERNEL_WAIT_WOKEN = 0,
     KERNEL_WAIT_TIMEOUT = 1,
     KERNEL_WAIT_SIGNALLED = 2,
+    KERNEL_WAIT_POLL_FREE = 3, /* Internal callback: detach a retiring source. */
 };
 
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
@@ -209,6 +210,7 @@ enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *,
     struct kernel_wait_node *, const struct kernel_wait_token *);
 enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_node *);
 enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *);
+void kernel_wait_queue_pollfree(struct kernel_wait_queue *);
 enum kernel_scheduler_status kernel_wait_queue_destroy(struct kernel_wait_queue *);
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *,
     uint64_t deadline, int interruptible, struct kernel_wait_token *);

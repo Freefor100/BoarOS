@@ -4,6 +4,7 @@
 #include <kernel/mm.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
+#include <kernel/signal_fd.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
@@ -450,4 +451,18 @@ enum kernel_syscall_status syscall_handle_signal_send(
     }
     decoded->value = sent < 0 ? sent : sent == 0 ? -KERNEL_ESRCH : 0;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_signalfd(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(request->arguments[2]!=8){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
+    struct kernel_mm *mm;struct kernel_files *files;
+    if(kernel_task_mm_borrow_mutable(caller,&mm)||kernel_task_files_borrow(caller,&files))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    uint64_t mask;
+    enum kernel_uaccess_status copied=signal_copy_from_user(mm,request->arguments[1],&mask,8);
+    if(copied!=KERNEL_UACCESS_STATUS_OK)return signal_copy_error(copied,decoded);
+    return kernel_files_signalfd(files,caller,(int32_t)request->arguments[0],mask,(uint32_t)request->arguments[3],&decoded->value)
+        ?KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT:KERNEL_SYSCALL_STATUS_OK;
 }

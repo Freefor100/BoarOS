@@ -1,9 +1,10 @@
 # 内核信号模块
 
-本文记录标准信号、用户 handler 和可中断等待的当前契约。任务生命周期见[调度模块](kernel-scheduler.md)，用户态边界见[系统调用模块](kernel-syscall.md)。
+本文记录待决信号、用户 handler、signalfd 和可中断等待的当前契约。任务生命周期见[调度模块](kernel-scheduler.md)，用户态边界见[系统调用模块](kernel-syscall.md)。
 
 ## 职责与入口
 
+- `fs/signal_fd.c`：共享FD接收掩码、128字节输出及调用线程的读取和就绪查询。
 - `kernel/signal_stack.c`：每线程备用栈登记、选择、边界与自动停用；
 - `kernel/sched/signal.c`：pending/blocked、disposition、默认动作、stop/continue、进程通知和重启策略。
 - `arch/riscv/signal.c`、`include/arch/riscv/signal.h`：RISC-V 信号帧编码、寄存器恢复和用户返回尾。
@@ -25,7 +26,7 @@ SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait
 
 ## 待决记录与计费
 
-pending位图是就绪摘要。普通标准信号继续在任务原有字段保存首条来源；实时信号及完整用户载荷使用按需分配的记录。每个线程和线程组各有一个按信号编号分槽的FIFO索引，出队不遍历其他信号的记录；handler与sigtimedwait共用一次出队和128字节siginfo快照。同类标准信号合并，同类实时信号按FIFO；线程pending先于共享pending，每个集合按固定Linux的同步信号优先规则选择。
+pending位图是就绪摘要。普通标准信号继续在任务原有字段保存首条来源；实时信号及完整用户载荷使用按需分配的记录。每个线程和线程组各有一个按信号编号分槽的FIFO索引，出队不遍历其他信号的记录；handler、sigtimedwait和signalfd共用一次出队和128字节siginfo快照。同类标准信号合并，同类实时信号按FIFO；线程pending先于共享pending，每个集合按固定Linux的同步信号优先规则选择。
 
 候选记录及索引在锁外分配，位图、记录和额度在调度短锁内共同发布。消费或批量清除在保护内摘链、扣除计费，锁外释放；空索引随所属线程／线程组退出归还。组长交接在同一保护内移动共享索引和计费状态。fork的child无待决记录，exec保留有效pending；忽略动作、stop/continue取消和退出均使用共同清除路径。
 
@@ -34,6 +35,16 @@ pending位图是就绪摘要。普通标准信号继续在任务原有字段保�
 `rt_sigqueueinfo(138)`和`rt_tgsigqueueinfo(240)`沿现有CPU0目标解析流程发送，保留完整si_code、来源与64位sigval。目标借用覆盖准备和提交，锁内重新核对接收者与当前组容器；有效僵尸身份接受信号但不新增记录。额度耗尽时实时sigqueue和tgkill返回EAGAIN，普通kill保留待决事件。用户输入按固定Linux先导入48字节有效区；已知布局不读取未使用的80字节，未知布局检查扩展全零，否则E2BIG。输入EFAULT先于后续目标和来源检查。
 
 handler与sigtimedwait取得同一规范记录，用户输出在消费之后发生；SIGCHLD退出信息另带真实组CPU用量，单位为100Hz用户时钟tick。标准内联时间数据放任务尾部，不改变原有热字段位置。内核编号32～64均支持；libc预留编号由raw syscall短例覆盖。
+
+## signalfd与等待源
+
+`signalfd4(74)`创建独立OFD，保存接收掩码；dup/fork共享该掩码和NONBLOCK状态，CLOEXEC属于FD槽。更新已有FD只替换掩码，创建标志不改变现有FD。SIGKILL/SIGSTOP从接收集合移除，信号的blocked掩码由线程另行维护。
+
+每次read、readv和就绪查询都使用实际调用线程的线程pending及线程组pending。继承FD读取child自己的信号；epoll在ADD时登记的是当时调用线程的共享disposition等待源，fork复制disposition动作但创建新的等待队列。child需要重新登记，才能等待自己的信号通知。FD不持有创建者task或disposition引用。
+
+出队、计费和等待登记在同一调度短锁内完成，记录释放、用户复制和唤醒在锁外。首条消费后输出故障返回EFAULT；后续故障返回此前完整128字节记录数，发生故障的事件同样已消费。普通读要求至少128字节，剩余不足一条的空间忽略；定位I/O为ESPIPE，lseek沿Linux noop行为。read/poll/epoll均在调用CPU运行，发送目标解析保留CPU0。
+
+等待源随最后一个disposition使用者退出而撤销：先停止新登记，以内部POLLFREE回调让epoll摘除节点，再等待已存在的通知游标和回调归还，最后释放存储。撤销通知不产生用户可见的伪造就绪事件。`make test-wait-host`强制暂停撤销回调，并保留更早取得的游标，检查两者结束前destroy保持BUSY。
 
 ## SMP上的状态和执行位置
 

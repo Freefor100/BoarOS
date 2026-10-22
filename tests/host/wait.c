@@ -500,6 +500,40 @@ static void notification_sequences(void)
         assert(!kernel_wait_queue_destroy(&notification_queues[i]));
     }
 }
+static struct kernel_wait_queue retiring;
+static struct kernel_wait_node retiring_node;
+static pthread_barrier_t retiring_entered,retiring_leave;
+static void pollfree_callback(struct kernel_wait_node *node,uint32_t reason)
+{
+    assert(reason==KERNEL_WAIT_POLL_FREE);
+    assert(node==&retiring_node && !kernel_cpu_current()->raw_locks);
+    kernel_wait_queue_remove(node);
+    barrier(&retiring_entered);barrier(&retiring_leave);
+}
+static void *pollfree_worker(void *unused)
+{
+    (void)unused;initialize(1);kernel_wait_queue_pollfree(&retiring);return 0;
+}
+static void pollfree_lifetime(void)
+{
+    kernel_wait_queue_init(&retiring);
+    kernel_wait_node_init_callback(&retiring_node,pollfree_callback,0);
+    kernel_wait_queue_add(&retiring,&retiring_node);
+    /* A prior wake cursor must keep the queue alive even after POLLFREE
+     * detached its registration and completed its own notification. */
+    struct kernel_wait_cursor prior;kernel_wait_cursor_begin(&retiring,&prior);
+    assert(!pthread_barrier_init(&retiring_entered,0,2));
+    assert(!pthread_barrier_init(&retiring_leave,0,2));
+    pthread_t worker;assert(!pthread_create(&worker,0,pollfree_worker,0));barrier(&retiring_entered);
+    assert(retiring.closed && !retiring.registrations);
+    assert(kernel_wait_queue_destroy(&retiring)==KERNEL_SCHEDULER_STATUS_BUSY);
+    barrier(&retiring_leave);assert(!pthread_join(worker,0));
+    assert(kernel_wait_queue_destroy(&retiring)==KERNEL_SCHEDULER_STATUS_BUSY);
+    kernel_wait_cursor_wake(&prior,1);
+    assert(!retiring.borrows && !retiring_node.references && !kernel_wait_queue_destroy(&retiring));
+    assert(!pthread_barrier_destroy(&retiring_entered)&&!pthread_barrier_destroy(&retiring_leave));
+    puts("wait: POLLFREE detaches callbacks and retains source through prior cursors passed");
+}
 int main(void)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
@@ -518,6 +552,7 @@ int main(void)
     arbitration(4);
     callback_lifetime();
     close_lifetime();
+    pollfree_lifetime();
     committed_segments();
     task_segments();
     notification_sequences();
