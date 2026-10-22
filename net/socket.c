@@ -265,17 +265,16 @@ static void work_remove(struct socket_work_queue *queue, struct kernel_socket *s
     *link = (struct socket_link){0};
     socket_state_release(&irq);
 }
-static void work_add(struct socket_work_queue *queue, struct kernel_socket *socket, uint64_t epoch)
+/* 复用调用者已有的端点保护，一次状态修改只取得一次资格。 */
+static void work_add_locked(struct socket_work_queue *queue, struct kernel_socket *socket, uint64_t epoch)
 {
-    SOCKET_STATE(irq);
-    if (socket->destroying || socket->domain != KERNEL_SOCKET_DOMAIN_INET) { socket_state_release(&irq); return; }
+    if (socket->destroying || socket->domain != KERNEL_SOCKET_DOMAIN_INET) return;
     struct socket_link *link = &socket->work_links[queue->slot];
-    if (link->queued) { socket_state_release(&irq); return; }
+    if (link->queued) return;
     *link = (struct socket_link){.previous = queue->tail, .queued = 1, .epoch = epoch};
     if (queue->tail) queue->tail->work_links[queue->slot].next = socket;
     else queue->head = socket;
     queue->tail = socket;
-    socket_state_release(&irq);
 }
 static void socket_schedule(struct kernel_socket *socket, unsigned flags)
 {
@@ -283,14 +282,15 @@ static void socket_schedule(struct kernel_socket *socket, unsigned flags)
     if (socket->destroying || socket->domain != KERNEL_SOCKET_DOMAIN_INET) { socket_state_release(&irq); return; }
     socket->work_flags |= flags;
     unsigned queued = socket->work_links[ready_work.slot].queued;
-    work_add(&ready_work, socket, 0);
+    work_add_locked(&ready_work, socket, 0);
     if (!queued) socket_work_ready_locked();
     socket_state_release(&irq);
 }
 static void socket_pool_wait(struct kernel_socket *socket)
 {
+    SOCKET_STATE(state);
     work_remove(&pool_wait, socket);
-    work_add(&pool_wait, socket, pool_generation);
+    work_add_locked(&pool_wait, socket, pool_generation);
 }
 static void receive_capacity(void)
 {
@@ -370,14 +370,14 @@ static int lwip_error(err_t error)
     }
 }
 
-static void tcp_publish_capacity(struct kernel_socket *socket);
+static void tcp_publish_capacity_locked(struct kernel_socket *socket);
 
 static void wake_socket(struct kernel_socket *socket)
 {
     SOCKET_STATE(state);
     if(caller_owns_protocol() &&
         socket->domain==KERNEL_SOCKET_DOMAIN_INET && socket->type==SOCKET_STREAM)
-        tcp_publish_capacity(socket);
+        tcp_publish_capacity_locked(socket);
     socket_state_notify(&socket->wait);
 }
 /* 最后OFD关闭后，队列packet仍持有发送者计费owner；最后packet才释放它。 */
@@ -594,7 +594,7 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
     }
     status = kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
                                          (void **)&packet);
-    if (status == KERNEL_HEAP_STATUS_EMPTY) { socket->receive_retry = 1; work_remove(&receive_wait, socket); work_add(&receive_wait, socket, receive_generation); return ERR_MEM; }
+    if (status == KERNEL_HEAP_STATUS_EMPTY) { SOCKET_STATE(state);socket->receive_retry = 1; work_remove(&receive_wait, socket); work_add_locked(&receive_wait, socket, receive_generation); return ERR_MEM; }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
     socket->receive_retry=0;
@@ -701,7 +701,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     tcp_err(pcb, tcp_failed);
     tcp_recv(pcb, tcp_data_received);
     tcp_sent(pcb, tcp_data_sent);
-    tcp_publish_capacity(child);
+    {SOCKET_STATE(state);tcp_publish_capacity_locked(child);}
     child->inet_next = inet_sockets; inet_sockets = child;
     tcp_backlog_delayed(pcb);
     entry->child = child;
@@ -1703,13 +1703,10 @@ static int tcp_write_state(struct kernel_socket *socket, uint32_t flags, int obs
     return result;
 }
 
-static uint32_t tcp_admission_capacity(const struct kernel_socket *socket)
+static uint32_t tcp_admission_capacity_locked(const struct kernel_socket *socket)
 {
-    SOCKET_STATE(irq);
     uint32_t budget = socket->tx_budget;
-    uint32_t capacity = budget > socket->tx_reserved ? budget - socket->tx_reserved : 0;
-    socket_state_release(&irq);
-    return capacity;
+    return budget > socket->tx_reserved ? budget - socket->tx_reserved : 0;
 }
 static uint32_t tcp_protocol_budget(const struct kernel_socket *socket)
 {
@@ -1720,11 +1717,9 @@ static uint32_t tcp_protocol_budget(const struct kernel_socket *socket)
     uint32_t budget = outstanding < socket->tx_limit ? socket->tx_limit - outstanding : 0;
     return available < budget ? available : budget;
 }
-static void tcp_publish_capacity(struct kernel_socket *socket)
+static void tcp_publish_capacity_locked(struct kernel_socket *socket)
 {
-    SOCKET_STATE(irq);
     socket->tx_budget = tcp_protocol_budget(socket);
-    socket_state_release(&irq);
 }
 static void tcp_flush_output(struct kernel_socket *socket)
 {
@@ -1733,8 +1728,9 @@ static void tcp_flush_output(struct kernel_socket *socket)
     err_t output = tcp_output(socket->tcp);
     if (output == ERR_MEM) {
         if (nic_blocked) {
+            SOCKET_STATE(state);
             work_remove(&nic_wait, socket);
-            work_add(&nic_wait, socket, nic_generation);
+            work_add_locked(&nic_wait, socket, nic_generation);
         } else socket_pool_wait(socket);
     }
 }
@@ -1751,7 +1747,7 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     SOCKET_STATE(irq);
     if (!request->pin || request->reserved) __builtin_trap();
     int error = tcp_write_state(request->socket, flags, !request->progressed, request->task);
-    uint32_t available = error ? 0 : tcp_admission_capacity(request->socket);
+    uint32_t available = error ? 0 : tcp_admission_capacity_locked(request->socket);
     if (!error && size) {
         if (size > available) size = available;
         if (!size) {
@@ -1805,14 +1801,15 @@ static int stream_commit_owned(struct kernel_socket_write_request *request,
     }
     if (total) result = (int)total;
     SOCKET_STATE(endpoint);
-    tcp_publish_capacity(request->socket);
+    tcp_publish_capacity_locked(request->socket);
     stream_release_reservation(request, 0);
-    socket_state_release(&endpoint);
     if (result > 0) {
         request->progressed = SOCKET_WRITE_ACCEPTED |
-            (((flags & KERNEL_SOCKET_IO_MORE) && tcp_admission_capacity(request->socket))
+            (((flags & KERNEL_SOCKET_IO_MORE) && tcp_admission_capacity_locked(request->socket))
                 ? SOCKET_WRITE_DEFERRED : 0U);
-    } else if (result == -KERNEL_EAGAIN) {
+    }
+    socket_state_release(&endpoint);
+    if (result == -KERNEL_EAGAIN) {
         tcp_flush_output(request->socket);
         request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
     }
@@ -1822,6 +1819,7 @@ static int stream_commit_owned(struct kernel_socket_write_request *request,
 
 static int execute_protocol_request(struct kernel_socket_write_request *request)
 {
+    COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
     struct kernel_socket *socket=request->socket;
     switch(request->operation) {
     case SOCKET_PROTOCOL_STREAM:
@@ -1861,7 +1859,8 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
         {SOCKET_STATE(state);result=network_stopping && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
         if(!result)result=execute_protocol_request(request);
         request->segments=0;
-        if(operation==SOCKET_PROTOCOL_STREAM && tcp_admission_capacity(request->socket))wake_socket(request->socket);
+        {SOCKET_STATE(state);
+         if(operation==SOCKET_PROTOCOL_STREAM && tcp_admission_capacity_locked(request->socket))wake_socket(request->socket);}
         if(result>=0 && operation!=SOCKET_PROTOCOL_UDP_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
             !(request->progressed & SOCKET_WRITE_DEFERRED))service_inline(&protocol);
         kernel_socket_protocol_leave(&protocol);return result;
@@ -1873,15 +1872,19 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
     }
     struct kernel_socket *socket=request->socket;
     if(request->queued || request->next || !request->pin)__builtin_trap();
+    COST_SCOPE(queued, NETWORK_PROTOCOL_QUEUE_TICKS);
+    COST_ADD(NETWORK_PROTOCOL_QUEUED, 1);
     request->queued=1;
     if(socket->writes_tail)socket->writes_tail->next=request;else socket->writes_head=request;
-    socket->writes_tail=request;socket_schedule(socket,SOCKET_WORK_OUTPUT);
+    /* 入队只发布待服务请求；STREAM/FLUSH 按实际窗口与 IO_MORE 决定输出。 */
+    socket->writes_tail=request;socket_schedule(socket,SOCKET_WORK_REAP);
     while(request->queued) {
-        struct kernel_wait_token token={0};enum kernel_wait_wake_reason reason;
-        if(kernel_wait_prepare(&socket->wait,0,0,&token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        COST_ADD(NETWORK_PROTOCOL_PARKS, 1);
+        enum kernel_wait_wake_reason reason;
+        if(kernel_wait_prepare(0,0,0,&request->completion)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
         uintptr_t interrupts=socket_state_unlock_wait(&state);
-        if(kernel_wait_park(&token,&reason)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
-        if(kernel_wait_finish(&token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        if(kernel_wait_park(&request->completion,&reason)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        if(kernel_wait_finish(&request->completion)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
         arch_interrupt_restore(interrupts);socket_state_acquire(&state);
     }
     return request->result;
@@ -1936,7 +1939,7 @@ static int tcp_write_buffer_locked(struct kernel_socket *socket,
         socket_pool_wait(socket);
         tcp_flush_output(socket);
     }
-    tcp_publish_capacity(socket);
+    {SOCKET_STATE(state);tcp_publish_capacity_locked(socket);}
     return error == ERR_OK ? (int)length
                            : error == ERR_MEM ? -KERNEL_EAGAIN
                                               : lwip_error(error);
@@ -2151,7 +2154,7 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
             socket->read_request == 0)
             events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
         SOCKET_STATE(saved);
-        if (tcp_admission_capacity(socket))
+        if (tcp_admission_capacity_locked(socket))
             events |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;
         socket_state_release(&saved);
     } else if (socket->peer_closed) {
@@ -2315,7 +2318,10 @@ static void service_write(struct kernel_socket *socket)
     socket_state_acquire(&irq);
     request->result = result;
     request->segments = 0;request->queued=0;
-    if (socket->writes_head) socket_schedule(socket, SOCKET_WORK_OUTPUT);
+    if (socket->writes_head) socket_schedule(socket, SOCKET_WORK_REAP);
+    /* 原调用者重新取得端点保护前保活请求；在发布结果的同一保护内
+     * 定向通知，ACK/POLLOUT 不再唤醒尚未完成 COPY 的等待者。 */
+    if(kernel_wait_notify(&request->completion,KERNEL_WAIT_WOKEN)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
     wake_socket(socket);
     socket_state_release(&irq);
 }
@@ -2338,13 +2344,14 @@ static int service_ready_socket(void)
         nic_blocked = 0;
         err_t error = tcp_output(socket->tcp);
         if (error == ERR_MEM) {
-            if (nic_blocked) { work_remove(&nic_wait, socket); work_add(&nic_wait, socket, nic_generation); }
+            if (nic_blocked) { SOCKET_STATE(state);work_remove(&nic_wait, socket); work_add_locked(&nic_wait, socket, nic_generation); }
             else socket_pool_wait(socket);
         }
     }
-    uint32_t previous = tcp_admission_capacity(socket);
-    tcp_publish_capacity(socket);
-    if (tcp_admission_capacity(socket) > previous) wake_socket(socket);
+    SOCKET_STATE(state);
+    uint32_t previous = tcp_admission_capacity_locked(socket);
+    tcp_publish_capacity_locked(socket);
+    if (tcp_admission_capacity_locked(socket) > previous) wake_socket(socket);
     return 1;
 }
 static int service_capacity(void)
