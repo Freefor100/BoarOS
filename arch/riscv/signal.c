@@ -92,7 +92,7 @@ static void riscv_signal_bad_frame(void)
 }
 
 static void riscv_signal_build_frame(
-    struct kernel_mm *mm, struct riscv_trap_frame *frame,
+    struct kernel_task *task, struct kernel_mm *mm, struct riscv_trap_frame *frame,
     const struct kernel_signal_delivery *delivery)
 {
     /* Reuse storage for the prefix and mcontext to bound the task stack.
@@ -103,23 +103,27 @@ static void riscv_signal_build_frame(
     } data;
     struct riscv_fpu_state *fpu = riscv_process_fpu_borrow_current();
     uint64_t user_sp;
-    uint32_t disabled = 2U;
+    struct kernel_signal_stack saved_stack;
+    uint64_t top = kernel_signal_stack_prepare(task, frame->sp, delivery->flags,
+                                               &saved_stack);
     uint32_t fcsr;
     uint64_t vdso;
     size_t copied;
 
-    if (frame->sp < RISCV_SIGNAL_FRAME_SIZE) {
+    if (top < RISCV_SIGNAL_FRAME_SIZE) {
         riscv_signal_bad_frame();
     }
-    user_sp = (frame->sp - RISCV_SIGNAL_FRAME_SIZE) & ~UINT64_C(15);
+    user_sp = (top - RISCV_SIGNAL_FRAME_SIZE) & ~UINT64_C(15);
+    if (!kernel_signal_stack_frame_valid(&saved_stack, frame->sp, delivery->flags,
+                                          user_sp, top)) riscv_signal_bad_frame();
     memset(&data, 0, sizeof(data));
     struct kernel_signal_wait_info info = {
         .signal = delivery->signal, .sender = delivery->sender,
         .code = delivery->code, .uid = delivery->uid, .status = delivery->status,
     };
     kernel_signal_encode_info(data.prefix, &info, delivery->fault, delivery->fault_address);
-    memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 24U,
-           &disabled, sizeof(disabled));
+    memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 16U,
+           &saved_stack, sizeof(saved_stack));
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 40U,
            &delivery->restore_mask, sizeof(delivery->restore_mask));
     if (kernel_copy_to_user(mm, user_sp, data.prefix, sizeof(data.prefix),
@@ -151,6 +155,7 @@ static void riscv_signal_build_frame(
     frame->a0 = delivery->signal;
     frame->a1 = user_sp;
     frame->a2 = user_sp + RISCV_SIGNAL_INFO_SIZE;
+    kernel_signal_stack_delivered(task);
 }
 
 void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
@@ -187,7 +192,7 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
         frame->sepc += 4U;
     }
     if (has_handler) {
-        riscv_signal_build_frame(mm, frame, &delivery);
+        riscv_signal_build_frame(task, mm, frame, &delivery);
     }
 }
 
@@ -197,7 +202,10 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
     struct riscv_fpu_state *fpu = riscv_process_fpu_borrow_current();
     struct kernel_mm *mm;
     struct riscv_linux_mcontext context;
-    uint64_t sigmask;
+    struct {
+        struct kernel_signal_stack stack;
+        uint64_t mask;
+    } saved;
     uint32_t fcsr;
     size_t copied;
 
@@ -209,10 +217,10 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
         riscv_signal_bad_frame();
     }
     /* Snapshot all restored input before committing registers or mask. */
-    if (kernel_copy_from_user(mm, &sigmask,
-                               frame->sp + RISCV_SIGNAL_INFO_SIZE + 40U,
-                               sizeof(sigmask), &copied) !=
-            KERNEL_UACCESS_STATUS_OK || copied != sizeof(sigmask) ||
+    if (kernel_copy_from_user(mm, &saved,
+                               frame->sp + RISCV_SIGNAL_INFO_SIZE + 16U,
+                               sizeof(saved), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(saved) ||
         kernel_copy_from_user(mm, &context,
                                frame->sp + RISCV_SIGNAL_MCONTEXT_OFFSET,
                                sizeof(context), &copied) !=
@@ -225,11 +233,14 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
         context.fp.reserved[2] != 0U) {
         riscv_signal_bad_frame();
     }
-    if (kernel_signal_update_blocked(task, LINUX_SIG_SETMASK, &sigmask, 0) !=
+    if (kernel_signal_update_blocked(task, LINUX_SIG_SETMASK, &saved.mask, 0) !=
         KERNEL_SIGNAL_STATUS_OK) {
         riscv_signal_bad_frame();
     }
     kernel_signal_clear_syscall_restart(task);
+    /* Linux ignores readable but invalid restoration settings. Evaluate
+     * EPERM using the restored user SP, not the temporary handler SP. */
+    (void)kernel_signal_stack_update(task, &saved.stack, 0, context.gregs[2]);
     for (uint32_t index = 0U; index < 32U; index++) {
         memcpy((uint8_t *)frame + signal_gpr_offsets[index],
                &context.gregs[index], 8U);

@@ -377,6 +377,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
+	kernel/signal_stack.c \
 	kernel/sched/tty.c \
 	kernel/sched/wait.c \
 	kernel/sched/park.c \
@@ -459,6 +460,7 @@ OBJECTS := \
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
 LDFLAGS += -Wl,--wrap=kernel_pipe_readv,--wrap=kernel_pipe_writev,--wrap=kernel_open_file_poll,--wrap=kernel_event_fd_io,--wrap=syscall_handle_timerfd,--wrap=kernel_timer_fd_expire
+LDFLAGS += -Wl,--wrap=kernel_signal_stack_prepare,--wrap=riscv_signal_restore_current
 LDFLAGS += -Wl,--wrap=kernel_socket_reserve_read,--wrap=kernel_socket_stream_reserve,--wrap=kernel_socket_write_datagram,--wrap=kernel_socket_write_unix,--wrap=kernel_socket_wait_ready,--wrap=kernel_socket_service_owned,--wrap=kernel_copy_from_user,--wrap=kernel_wait_cursor_wake,--wrap=kernel_wait_backend_quiesce
 LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot,--wrap=virtio_split_enqueue
 LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_copy_to_user,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
@@ -2457,6 +2459,13 @@ test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@set -e; for shift in 12 14; do \
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
 		build/host/scheduler-handoff-$$shift; \
+	done
+
+.PHONY: test-signal-stack-host
+test-signal-stack-host:
+	@mkdir -p build/host
+	@for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -idirafter include tests/host/signal_stack.c kernel/signal_stack.c -o build/host/signal-stack-$$shift && build/host/signal-stack-$$shift || exit 1; \
 	done
 
 .PHONY: test-sched-concurrency-host

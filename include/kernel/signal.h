@@ -7,6 +7,24 @@
 
 struct kernel_task;
 
+#define LINUX_SS_ONSTACK 1U
+#define LINUX_SS_DISABLE 2U
+#define LINUX_SS_AUTODISARM UINT32_C(0x80000000)
+/* RV64 and LA64 stack_t: padding is ABI storage, not a flag word. */
+struct kernel_signal_stack {
+    uint64_t pointer;
+    uint32_t flags, padding;
+    uint64_t size;
+};
+int kernel_signal_stack_update(struct kernel_task *,
+    const struct kernel_signal_stack *, struct kernel_signal_stack *, uint64_t sp);
+void kernel_signal_stack_reset(struct kernel_task *);
+uint64_t kernel_signal_stack_prepare(struct kernel_task *, uint64_t sp,
+    uint64_t action_flags, struct kernel_signal_stack *saved);
+int kernel_signal_stack_frame_valid(const struct kernel_signal_stack *,
+    uint64_t old_sp, uint64_t action_flags, uint64_t frame_sp, uint64_t top);
+void kernel_signal_stack_delivered(struct kernel_task *);
+
 void kernel_signal_timer_get(struct kernel_task *task, uint32_t which,
     uint64_t *remaining, uint64_t *interval);
 void kernel_signal_timer_set(struct kernel_task *task, uint32_t which, uint64_t value, uint64_t interval,

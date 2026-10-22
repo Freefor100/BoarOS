@@ -64,6 +64,29 @@ static enum kernel_syscall_status signal_result(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_sigaltstack(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_signal_stack input, old;
+    struct kernel_mm *mm;
+    enum kernel_uaccess_status copied;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if (request->arguments[0]) {
+        copied = signal_copy_from_user(mm, request->arguments[0], &input, sizeof(input));
+        if (copied != KERNEL_UACCESS_STATUS_OK) return signal_copy_error(copied, decoded);
+    }
+    decoded->value = kernel_signal_stack_update(caller,
+        request->arguments[0] ? &input : 0, &old, request->user_sp);
+    if (!decoded->value && request->arguments[1]) {
+        copied = signal_copy_to_user(mm, request->arguments[1], &old, sizeof(old));
+        if (copied != KERNEL_UACCESS_STATUS_OK) return signal_copy_error(copied, decoded);
+    }
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_rt_sigaction(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

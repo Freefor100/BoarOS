@@ -92,7 +92,7 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         la_virt_fatal("fault owner");
     }
     if (user && code==11) {
-        struct kernel_syscall_request request={.number=frame->regs[11]};
+        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
         if (kernel_syscall_dispatch(kernel_task_current(),&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");

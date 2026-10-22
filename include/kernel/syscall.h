@@ -27,6 +27,7 @@ enum kernel_syscall_action {
 struct kernel_syscall_request {
     uint64_t number;
     uint64_t arguments[KERNEL_SYSCALL_ARGUMENT_COUNT];
+    uint64_t user_sp;
 };
 
 struct kernel_syscall_result {

@@ -226,6 +226,7 @@ struct kernel_task {
     uint32_t cpu_timer_active;
     struct kernel_rlimit64 core_limit;
     struct kernel_rlimit64 fsize_limit;
+    struct kernel_signal_stack signal_stack;
 } __attribute__((aligned(16)));
 
 #endif

@@ -244,6 +244,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     if (from_user && frame->scause == RISCV_SCAUSE_USER_ECALL) {
         struct kernel_syscall_request request = {
             .number = frame->a7,
+            .user_sp = frame->sp,
             .arguments = {
                 frame->a0,
                 frame->a1,
