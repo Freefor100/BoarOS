@@ -805,8 +805,11 @@ static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, st
         .notification = item->notification_generation, .interest = item->events,
         .event.data = item->data};
     if (item->linked && !item->oneshot_disarmed && item->target_file) {
-        request->target = item->target_file;
-        if (kernel_open_file_acquire(request->target) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+        struct kernel_open_file_description *target=item->target_file;
+        if (kernel_open_file_acquire(target)==KERNEL_OPEN_FILE_STATUS_OK) request->target=target;
+        else if (__atomic_load_n(&target->references,__ATOMIC_RELAXED)) __builtin_trap();
+        /* 末引用可已归零；关闭者须取得此锁拆关联后才能释放存储。
+         * 该窗口只跳过已退休目标，不复活OFD，也不查询其关闭中的后端。 */
     }
     epoll_state_release(&irq);
     if (request->target)

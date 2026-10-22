@@ -83,7 +83,7 @@ enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_d
 int kernel_open_file_supports_epoll(const struct kernel_open_file_description *f)
 { return f != NULL; }
 enum kernel_open_file_status kernel_open_file_acquire(struct kernel_open_file_description *f)
-{ CHECK(f && f->references); f->references++; return KERNEL_OPEN_FILE_STATUS_OK; }
+{ CHECK(f);if(!f->references || f->references==UINT32_MAX)return KERNEL_OPEN_FILE_STATUS_STATE;f->references++;return KERNEL_OPEN_FILE_STATUS_OK; }
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **p)
 {
     struct kernel_open_file_description *f=*p; CHECK(f && f->references);
@@ -484,8 +484,26 @@ static void nested_notifications(void)
     }
     CHECK(!allocations && !target_wait[0].head);
 }
+static void retiring_target(void)
+{
+    for(unsigned observing=0;observing<2;observing++) {
+        setup(KERNEL_EPOLLET);
+        /* Final close has dropped its last reference; its linked weak target
+         * is still alive until the closer obtains epoll state for unlink. */
+        fds[1]=NULL;targets[0].references=0;
+        unsigned queries=poll_calls;
+        if(observing)CHECK(!kernel_epoll_poll(epfile.epoll,KERNEL_POLLIN,NULL));
+        else { struct linux_epoll_event event;CHECK(!wait_events(&event,1)); }
+        CHECK(!targets[0].references && poll_calls==queries);
+        kernel_epoll_notify_file_release(&targets[0]);
+        teardown();
+    }
+    puts("PASS epoll target retirement: zero-ref linked target is never revived or queried by wait/poll");
+}
+
 int main(int argc, char **argv)
 {
+    retiring_target();
     setup(0);struct linux_epoll_event local_event;unsigned services=service_entries;
     CHECK(wait_events(&local_event,1)==1 && service_entries==services);
     teardown();
