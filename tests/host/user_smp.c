@@ -5,6 +5,8 @@
 #undef main
 #include <arch/timer.h>
 #include <kernel/time.h>
+/* This scheduler/standard-signal model has no active timerfd. */
+uint64_t kernel_timer_fd_next;
 
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);

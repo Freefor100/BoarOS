@@ -257,12 +257,6 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
                     duration > (uint64_t)INT64_MAX - now_ns
                         ? INT64_MAX : now_ns + (uint64_t)duration;
     }
-    /* Standard signals only: a bitmask cannot represent Linux's queued
-     * real-time delivery, so do not claim those requests succeeded. */
-    if ((mask & ~UINT64_C(0x7fffffff)) != 0U) {
-        decoded->value = -KERNEL_ENOTSUP;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
     signal_status = kernel_signal_wait_begin(caller, mask);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -314,7 +308,7 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
     if (taken.signal == 0U) return KERNEL_SYSCALL_STATUS_OK;
     decoded->value = taken.signal;
     if (request->arguments[1] == 0U) return KERNEL_SYSCALL_STATUS_OK;
-    kernel_signal_encode_info(user_info, &taken, 0, 0);
+    kernel_signal_encode_info(user_info, &taken);
     copy_status = signal_copy_to_user(mm, request->arguments[1],
                                       &user_info, sizeof(user_info));
     if (copy_status != KERNEL_UACCESS_STATUS_OK)

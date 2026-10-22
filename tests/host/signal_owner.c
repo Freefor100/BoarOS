@@ -117,7 +117,7 @@ void signal_owner_cases(unsigned *lock_calls)
     *lock_calls=0;
     assert(kernel_signal_select(&leader,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
     assert(*lock_calls==1 && !leader.group_pending);
-    assert(delivery.signal==17 && delivery.sender==41 && delivery.code==1 && delivery.uid==22 && delivery.status==37);
+    assert(delivery.info.signal==17 && delivery.info.sender==41 && delivery.info.code==1 && delivery.info.uid==22 && delivery.info.status==37);
     table.actions[16].handler=KERNEL_SIGNAL_DFL;
     leader.signal_blocked=leader.signal_wait_mask=leader.group_pending=signal_mask(17);
     leader.group_sender[16]=42;leader.group_signal_code[16]=5;
@@ -129,13 +129,13 @@ void signal_owner_cases(unsigned *lock_calls)
     assert(!kernel_signal_wait_take(&leader,&info));
     assert(info.signal==17 && info.sender==42 && info.code==5 && info.uid==23 && info.status==19);
     assert(!leader.group_pending);
-    unsigned char encoded[128];kernel_signal_encode_info(encoded,&info,0,0);
+    unsigned char encoded[128];kernel_signal_encode_info(encoded,&info);
     int32_t value;memcpy(&value,encoded+24,4);assert(value==19);
     memcpy(&value,encoded+20,4);assert(value==23);
     memcpy(&value,encoded+8,4);assert(value==5);
-    info.code=0;kernel_signal_encode_info(encoded,&info,0,0);
+    info=(struct kernel_signal_wait_info){.signal=17};kernel_signal_encode_info(encoded,&info);
     memcpy(&value,encoded+24,4);assert(!value);
-    kernel_signal_encode_info(encoded,&info,1,UINT64_C(0x123456789));
+    info=(struct kernel_signal_wait_info){.signal=11,.address=UINT64_C(0x123456789)};kernel_signal_encode_info(encoded,&info);
     uint64_t address;memcpy(&address,encoded+16,8);assert(address==UINT64_C(0x123456789));
     assert(!kernel_signal_wait_take(&leader,&info) && !info.signal);
     selected_action_snapshot(&leader,&table);
@@ -165,3 +165,10 @@ void signal_owner_cases(unsigned *lock_calls)
     assert(!leader.storage_borrows && !member.storage_borrows);
     puts("signal target selector: direct leader, dead leader fallback and unique borrow passed");
 }
+
+/* These standard-signal models never allocate queued payloads. Real queue
+ * allocation, quota and retirement run in signal_pending.c's focused suite. */
+enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
+{ (void)h;(void)n;(void)size;(void)out;abort(); }
+void kernel_heap_release(struct kernel_heap *h,void *p)
+{ (void)h;(void)p;abort(); }

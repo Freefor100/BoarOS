@@ -117,11 +117,7 @@ static void riscv_signal_build_frame(
     if (!kernel_signal_stack_frame_valid(&saved_stack, frame->sp, delivery->flags,
                                           user_sp, top)) riscv_signal_bad_frame();
     memset(&data, 0, sizeof(data));
-    struct kernel_signal_wait_info info = {
-        .signal = delivery->signal, .sender = delivery->sender,
-        .code = delivery->code, .uid = delivery->uid, .status = delivery->status,
-    };
-    kernel_signal_encode_info(data.prefix, &info, delivery->fault, delivery->fault_address);
+    kernel_signal_encode_info(data.prefix, &delivery->info);
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 16U,
            &saved_stack, sizeof(saved_stack));
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 40U,
@@ -152,7 +148,7 @@ static void riscv_signal_build_frame(
     frame->sp = user_sp;
     frame->sepc = delivery->handler;
     frame->ra = vdso;
-    frame->a0 = delivery->signal;
+    frame->a0 = delivery->info.signal;
     frame->a1 = user_sp;
     frame->a2 = user_sp + RISCV_SIGNAL_INFO_SIZE;
     kernel_signal_stack_delivered(task);

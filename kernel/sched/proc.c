@@ -124,6 +124,8 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         .child_major_faults = leader->child_usage.major_faults,
         .signal_pending = leader->signal_pending & UINT64_C(0x7fffffff),
         .signal_blocked = leader->signal_blocked & UINT64_C(0x7fffffff),
+        .signal_queued=kernel_signal_pending_count_locked(),
+        .signal_queue_limit=leader->sigpending_limit.current,
         .threads = threads,
         .scheduling_priority = leader->scheduling.priority
             ? -(leader->scheduling.priority + 1) : 20,

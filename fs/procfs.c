@@ -1044,6 +1044,8 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                                       (BOAROS_PAGE_SIZE / 1024U), " kB\n");
         /* 当前没有 swap 后端，驻留页不会换出到交换设备。 */
         used += append_number_line(data + used, "VmSwap:\t", 0U, " kB\n");
+        used += append_number_line(data+used,"SigQ:\t",process.signal_queued,"/");
+        used += append_number_line(data+used,"",process.signal_queue_limit,"\n");
         static const char identity[] =
             "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
         memcpy(data + used, identity, sizeof(identity) - 1U);

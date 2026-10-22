@@ -23,6 +23,14 @@
 
 SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。
 
+## 待决记录与计费
+
+pending位图是就绪摘要。普通标准信号继续在任务原有字段保存首条来源；实时信号及完整用户载荷使用按需分配的记录。每个线程和线程组各有一个按信号编号分槽的FIFO索引，出队不遍历其他信号的记录；handler与sigtimedwait共用一次出队和128字节siginfo快照。同类标准信号合并，同类实时信号按FIFO；线程pending先于共享pending，每个集合按固定Linux的同步信号优先规则选择。
+
+候选记录及索引在锁外分配，位图、记录和额度在调度短锁内共同发布。消费或批量清除在保护内摘链、扣除计费，锁外释放；空索引随所属线程／线程组退出归还。组长交接在同一保护内移动共享索引和计费状态。fork的child无待决记录，exec保留有效pending；忽略动作、stop/continue取消和退出均使用共同清除路径。
+
+`RLIMIT_SIGPENDING(11)`默认软／硬额度4096，同组共享、fork复制、exec保留。当前固定真实UID0，使用量汇总该UID的全部信息记录；接纳按目标软额度判断，`/proc/<pid>/status`的`SigQ`展示使用量／额度。下调额度保留已有消息。实时排队发送额度不足返回EAGAIN；普通kill保留至少一个待决位，并按Linux允许丢失附带信息。标准信号合并不重复计费。`make test-signal-pending-host`在4/16KiB页检查FIFO、跨组额度、候选竞争、分配失败、交接和最终归还。
+
 ## SMP上的状态和执行位置
 
 RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护：选择信号时一次取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位，并重置一次性动作。锁外只使用线程栈上的delivery快照。后续rt_sigaction替换同一项时，本次递送继续使用已选版本；替换的新动作也保留。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
@@ -84,7 +92,7 @@ RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节fr
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
-标准信号使用线程组与线程位图 pending，发布和消费共用调度保护；尚无实时信号队列或signalfd。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
+标准信号使用线程组与线程位图 pending，发布和消费共用调度保护；signalfd尚未接入。libc内部信号与其他实时信号共用线程定向队列。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
 
 ## 同步故障
 
@@ -100,13 +108,13 @@ break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate �
 `make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
 验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
 SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
-用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；实时队列仍未支持。
+用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；用户态排队发送入口随后接入。
 
 U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 线程有一个独立同步故障记录，经统一用户返回路径优先选取；交付 handler 时保留故障 PC，可由 handler 修复映射后重试，或修改 ucontext 跳过指令。被阻塞或忽略的致命同步信号改为默认动作并解除阻塞；默认动作终止全组。坏 signal frame 同样终止全组。fork/exec 清除故障记录；syscall 用户复制仍返回 EFAULT，内核自身 trap 仍 fatal。
 
-`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。ptrace、实时队列仍列在能力目录；RV真实两核的递送与恢复使用上面的共同协议。
+`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。ptrace及后续信号接口仍列在能力目录；RV真实两核的递送与恢复使用上面的共同协议。
 
 TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
 的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write

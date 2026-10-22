@@ -80,11 +80,7 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     size_t bytes=top-sp;
     if(bytes>sizeof(data))la_virt_fatal("signal frame capacity");
     memset(data,0,bytes);memset(&prefix,0,sizeof(prefix));
-    struct kernel_signal_wait_info signal_info = {
-        .signal = delivery->signal, .sender = delivery->sender,
-        .code = delivery->code, .uid = delivery->uid, .status = delivery->status,
-    };
-    kernel_signal_encode_info(prefix.info, &signal_info, delivery->fault, delivery->fault_address);
+    kernel_signal_encode_info(prefix.info, &delivery->info);
     memcpy(&prefix.context.stack_pointer,&saved_stack,sizeof(saved_stack));
     prefix.context.sigmask[0]=delivery->restore_mask;
     prefix.context.mcontext.pc=frame->era;
@@ -103,7 +99,7 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     if(kernel_copy_to_user(mm,sp,data,bytes,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=bytes ||
        kernel_mm_vdso_address(mm,&vdso)!=KERNEL_MM_STATUS_OK)bad_frame();
     frame->regs[3]=sp;frame->regs[1]=vdso;frame->era=delivery->handler;
-    frame->regs[4]=delivery->signal;frame->regs[5]=sp;frame->regs[6]=sp+128;
+    frame->regs[4]=delivery->info.signal;frame->regs[5]=sp;frame->regs[6]=sp+128;
     kernel_signal_stack_delivered(task);
 }
 

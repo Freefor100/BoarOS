@@ -613,6 +613,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->stack_limit = leader->stack_limit;
         task->core_limit = leader->core_limit;
         task->fsize_limit = leader->fsize_limit;
+        task->sigpending_limit=leader->sigpending_limit;
+        kernel_signal_pending_adopt_locked(task,leader);
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
@@ -883,6 +885,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->stack_limit = parent->group_leader->stack_limit;
     child->core_limit = parent->group_leader->core_limit;
     child->fsize_limit = parent->group_leader->fsize_limit;
+    child->sigpending_limit=parent->group_leader->sigpending_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -1640,6 +1643,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
+    kernel_signal_pending_cleanup(thread);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
@@ -2327,6 +2331,7 @@ static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint3
     case KERNEL_RLIMIT_STACK: return &leader->stack_limit;
     case KERNEL_RLIMIT_CORE: return &leader->core_limit;
     case KERNEL_RLIMIT_FSIZE: return &leader->fsize_limit;
+    case KERNEL_RLIMIT_SIGPENDING: return &leader->sigpending_limit;
     default: return NULL;
     }
 }
@@ -2360,7 +2365,8 @@ enum kernel_task_status kernel_task_set_rlimit(
         (resource == KERNEL_RLIMIT_STACK &&
          limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
         (resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
-         resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE))
+         resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE &&
+         resource != KERNEL_RLIMIT_SIGPENDING))
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
