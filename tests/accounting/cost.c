@@ -306,7 +306,7 @@ static int timer_main(const char *mode, const char *only)
 {
     for (timer_mode = 0; timer_mode < 5; ++timer_mode)
         if (!strcmp(mode, timer_modes[timer_mode])) break;
-    CHECK(timer_mode < 5 && (expected_cpus == 1 || expected_cpus == 2));
+    CHECK(timer_mode < 5 && (expected_cpus == 1 || expected_cpus == 2 || expected_cpus == 4));
     sigemptyset(&timer_signals);
     sigaddset(&timer_signals, SIGVTALRM);
     sigaddset(&timer_signals, SIGPROF);
