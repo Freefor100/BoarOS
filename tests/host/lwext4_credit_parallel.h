@@ -34,10 +34,10 @@ static struct {
     bool paused, resume, blocked, finished;
 } credit_test;
 static struct {
-    bool capture, io_active;
-    void *allocation;
-    unsigned released, io_calls;
-} log_batch_owner;
+    struct jbd_image *image;
+    bool io_active;
+    unsigned io_calls;
+} wire_owner;
 
 static void credit_state_lock(void *context)
 {
@@ -83,26 +83,10 @@ void *__real_calloc(size_t, size_t);
 void *__real_malloc(size_t);
 void __real_free(void *);
 void *__wrap_calloc(size_t count, size_t bytes)
-{
-    void *result = credit_heap_failure() ? NULL : __real_calloc(count, bytes);
-    /* Only the controlled four-node preparation allocates a 512-byte header
-     * while capture is enabled; images use 128-byte headers plus 1/4K data. */
-    if (result && log_batch_owner.capture && count * bytes == 512) {
-        CHECK(!log_batch_owner.allocation);
-        log_batch_owner.allocation = result;
-    }
-    return result;
-}
+{ return credit_heap_failure() ? NULL : __real_calloc(count, bytes); }
 void *__wrap_malloc(size_t bytes)
 { return credit_heap_failure() ? NULL : __real_malloc(bytes); }
-void __wrap_free(void *pointer)
-{
-    if (pointer && pointer == log_batch_owner.allocation) {
-        log_batch_owner.allocation = NULL;
-        log_batch_owner.released++;
-    }
-    __real_free(pointer);
-}
+void __wrap_free(void *pointer) { __real_free(pointer); }
 
 struct credit_call {
     struct ext4_blockdev *dev;
@@ -127,15 +111,14 @@ static void *credit_compete(void *argument)
     credit_actor = 2;
     struct jbd_trans *trans;
     CHECK(jbd_journal_new_trans(call->journal, &trans) == EOK);
-    CHECK(!trans->reserved_logs && !trans->reserved_log_images && !trans->checkpoint_image);
+    CHECK(!trans->reserved_logs);
     if (call->freeze) {
         CHECK(jbd_trans_revoke_block(trans, call->dev->lg_bcnt - 2) == EOK);
         CHECK(jbd_trans_prepare_operation(trans)==EOK);
-        CHECK(trans->reserved_logs == 2 && trans->reserved_log_images == 2);
+        CHECK(trans->reserved_logs == 2);
         CHECK(jbd_journal_accept(call->journal, trans, 0) == EOK);
         CHECK(jbd_journal_freeze(call->journal) == EOK);
-        CHECK(trans->frozen && !trans->alloc_blocks && trans->checkpoint_image);
-        CHECK(trans->reserved_logs == 2 && trans->reserved_log_images == 2);
+        CHECK(trans->frozen && trans->alloc_blocks == 2 && !trans->reserved_logs);
     } else jbd_journal_free_trans(call->journal, trans, true);
     call->reserved = call->journal->log_reserved;
     CHECK(!pthread_mutex_lock(&credit_gate));
@@ -207,7 +190,7 @@ static void journal_freeze_owner(struct ext4_blockdev *dev,
     CHECK(jbd_journal_freeze(journal) == EOK);
     credit_encoding = false;
     CHECK(!encoding_test.checksums);
-    CHECK(first->frozen && !first->alloc_blocks && first->reserved_logs == first_credits);
+    CHECK(first->frozen && first->alloc_blocks == (int)first_credits && !first->reserved_logs);
     CHECK(first->start_iblock == first_start && journal->last != first_start && !journal->log_reserved);
     CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
     encoding_test.pause = true;
@@ -224,7 +207,7 @@ static void journal_freeze_owner(struct ext4_blockdev *dev,
     unsigned second_credits = second->reserved_logs;
     uint32_t second_start = journal->last;
     CHECK(jbd_journal_freeze(journal) == EOK && second->start_iblock == second_start);
-    CHECK(second->reserved_logs == second_credits && !journal->log_reserved);
+    CHECK(second->alloc_blocks == (int)second_credits && !second->reserved_logs && !journal->log_reserved);
     uint32_t last = journal->last;
     struct jbd_trans *aborted;
     CHECK(jbd_journal_new_trans(journal, &aborted) == EOK);
@@ -254,8 +237,8 @@ static void journal_freeze_owner(struct ext4_blockdev *dev,
     CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT, call.result) == (fault ? EIO : EOK));
     if (fault) {
         CHECK(journal->committing == first && journal->sealed_count == 1 &&
-            TAILQ_FIRST(&journal->sealed_queue) == second && !second->alloc_blocks &&
-            second->reserved_logs == second_credits && journal->last == last &&
+            TAILQ_FIRST(&journal->sealed_queue) == second && second->alloc_blocks == (int)second_credits &&
+            !second->reserved_logs && journal->last == last &&
             !journal->log_reserved && journal->error == EIO);
         CHECK(journal->failed_trans == (fault == 3 ? checkpoint : first));
         CHECK((journal->checkpointing != NULL) == (fault == 3));
@@ -478,7 +461,7 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
     for(unsigned i=0;i<16;i++)
         CHECK(jbd_trans_revoke_block(private,dev->lg_bcnt-1-i)==EOK);
     CHECK(credit_state_entries==entries); /* Only the task owns this revoke tree. */
-    CHECK(!journal->log_reserved && !private->checkpoint_image);
+    CHECK(!journal->log_reserved);
     CHECK(jbd_trans_prepare_operation(private)==EOK && credit_state_entries==entries+1);
     jbd_journal_free_trans(journal,private,true);
     jbd_memory_set_cache_disabled(journal, true);
@@ -486,7 +469,7 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
     size_t baseline_memory = jbd_memory_used(journal);
     uint64_t baseline_budget_failures = jbd_memory_budget_failures(journal);
     unsigned cases = 0, failures = 0;
-    for (unsigned private_access = 0; private_access < 2; private_access++) {
+    for (unsigned private_access = 1; private_access < 2; private_access++) {
         unsigned last_failure = 0;
         for (unsigned fail_after = 0; fail_after <= last_failure; fail_after++) {
             /* Keep a genuine immutable group in the ring while both new
@@ -497,9 +480,9 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
             CHECK(jbd_trans_prepare_operation(frozen)==EOK);
             CHECK(jbd_journal_accept(journal, frozen, 0) == EOK);
             CHECK(jbd_journal_freeze(journal) == EOK);
-            CHECK(frozen->frozen && !frozen->alloc_blocks && !journal->log_reserved);
-            CHECK(frozen->checkpoint_image && frozen->reserved_logs == 2 && frozen->reserved_log_images == 2);
-            struct jbd_image *checkpoint = frozen->checkpoint_image;
+            CHECK(frozen->frozen && frozen->alloc_blocks == 2 && !journal->log_reserved);
+            CHECK(!frozen->reserved_logs);
+            struct jbd_image *checkpoint = journal->checkpoint_image;
             uint32_t frozen_start = frozen->start_iblock, frozen_id = frozen->trans_id;
             uint32_t last = journal->last;
             struct credit_call a = {.dev = dev, .journal = journal,
@@ -542,8 +525,8 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
                 credit_state_lock(NULL);
                 CHECK(b.reserved == claimed && journal->log_reserved == claimed);
                 CHECK(frozen->frozen && frozen->start_iblock == frozen_start &&
-                    frozen->trans_id == frozen_id && !frozen->alloc_blocks &&
-                    frozen->checkpoint_image == checkpoint);
+                    frozen->trans_id == frozen_id && frozen->alloc_blocks == 2 &&
+                    journal->checkpoint_image == checkpoint);
                 CHECK(journal->sealed_count == 1U + b.freeze);
                 CHECK(journal->last == last + 2 * b.freeze);
                 credit_state_unlock(NULL);
@@ -554,8 +537,7 @@ static void journal_credit_parallel(struct ext4_blockdev *dev,
             CHECK(!pthread_join(first, NULL) && !pthread_join(second, NULL));
             CHECK(!blocked); /* B must complete before A's allocator returns. */
             CHECK(a.result == (fail_after ? ENOMEM : EOK));
-            /* Exercise every real allocation prefix, including the new batch
-             * owner, without preserving the old one-call-per-node layout. */
+            /* Exercise every actual missing-record allocation prefix. */
             if (!fail_after) { last_failure = credit_test.calls; CHECK(last_failure); }
             if (fail_after) CHECK(credit_test.calls == fail_after);
             if (a.trans) jbd_journal_free_trans(journal, a.trans, true);

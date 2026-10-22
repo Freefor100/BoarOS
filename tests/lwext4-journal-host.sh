@@ -22,16 +22,18 @@ for block in 1024 4096; do
     mkfs.ext4 -q -F -b "$block" "$work/group-base.img"
     debugfs -w -R "write $work/data /probe" "$work/group-base.img" >/dev/null 2>&1
     for fault in 0 1 2; do
-        cp "$work/group-base.img" "$work/log-batch.img"
-        timeout 30 "$work/probe" "$work/log-batch.img" log-batch "$fault"
+        cp "$work/group-base.img" "$work/wire-owner.img"
+        timeout 30 "$work/probe" "$work/wire-owner.img" wire-owner "$fault"
         expected=65
         [ "$fault" -eq 0 ] || expected=79
-        timeout 30 "$work/probe" "$work/log-batch.img" recover-crash "$expected"
-        e2fsck -fn "$work/log-batch.img" >/dev/null
+        timeout 30 "$work/probe" "$work/wire-owner.img" recover-crash "$expected"
+        e2fsck -fn "$work/wire-owner.img" >/dev/null
     done
-    cp "$work/group-base.img" "$work/record-borrow.img"
-    timeout 30 "$work/probe" "$work/record-borrow.img" record-borrow
-    e2fsck -fn "$work/record-borrow.img" >/dev/null
+    for action in record-prepare prepare-wire; do
+        cp "$work/group-base.img" "$work/$action.img"
+        timeout 30 "$work/probe" "$work/$action.img" "$action"
+        e2fsck -fn "$work/$action.img" >/dev/null
+    done
     cp "$work/group-base.img" "$work/publication-owners.img"
     timeout 30 "$work/probe" "$work/publication-owners.img" publication-owners
     e2fsck -fn "$work/publication-owners.img" >/dev/null
@@ -137,7 +139,8 @@ for feature in commit checksum2 checksum3 checksum3-revoke checksum3-revoke64 \
     case "$feature" in *-escape) expected=192;; esac
     timeout 30 "$work/probe" "$work/independent.img" recover "$expected"
 done
-for point in 1 2 3 4; do
+# One descriptor, one whole escaped payload, then commit: each real write.
+for point in 1 2 3; do
     cp "$work/base.img" "$work/escape-error.img"
     timeout 30 "$work/probe" "$work/escape-error.img" checksum3-escape "$point"
     timeout 30 "$work/probe" "$work/escape-error.img" recover-crash 79
