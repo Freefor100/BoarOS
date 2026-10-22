@@ -127,18 +127,19 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
                          "file MM controller/OFD/registration/private mount owners returned")
         if any(marker not in text for marker in required) or "SMP failure" in text or "SMP fatal" in text:
             raise RuntimeError(f"missing native MM closure:\n{text[-4000:]}")
-        if cpus == 2 and "SMP online logical=1 hart=" not in text:
+        if cpus > 1 and any(f"SMP online logical={i} hart=" not in text for i in range(1,cpus)):
             raise RuntimeError("MM test did not publish the secondary CPU")
         print(f"RV {contract} cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
         return
     if profile != "normal":
         expected = {"missing-rfence": "SMP failure stage=SBI-extension",
                     "denied-start": "SMP failure stage=HSM-start",
+                    "handshake-timeout": "SMP failure stage=start-timeout",
                     "guard": " cause=0xd pc=", "denied-stop": "SMP failure stage=stop-confirmation",
                     "rfence-error": "SMP failure stage=RFENCE"}[profile]
         if expected not in text or "SMP natural exit" in text:
             raise RuntimeError(f"negative profile did not reach its failure boundary:\n{text[-4000:]}")
-        if profile in ("missing-rfence", "denied-start") and "SMP online logical=1" in text:
+        if profile in ("missing-rfence", "denied-start", "handshake-timeout") and f"SMP online logical={1 if profile=='missing-rfence' else cpus-1} " in text:
             raise RuntimeError("failed startup published ONLINE")
         if profile == "rfence-error" and "SMP RFENCE error retains table and page owners" not in text:
             raise RuntimeError("RFENCE error reached without retained-owner evidence")
@@ -146,7 +147,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
         return
     if "BoarOS: SMP natural exit pages/stack/table owners returned" not in text or "SMP failure" in text:
         raise RuntimeError(f"missing natural resource closure:\n{text[-4000:]}")
-    if cpus == 2 and ("SMP online logical=1 hart=" not in text or
+    if cpus > 1 and ("SMP online logical=1 hart=" not in text or
                       "SMP timer preemption, unique execution and FD migration passed" not in text or
                       "SMP early wake, WFI boundary and remote deadline passed" not in text or
                       "SMP delayed RFENCE return retains table and page owners" not in text or
@@ -158,6 +159,8 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
         raise RuntimeError("missing independent SMP execution and migration evidence")
     if require_fpu_setup and cpus==2 and "FPU setup interrupt boundary protected; 8 owners returned" not in text:
         raise RuntimeError("missing forced FPU setup boundary/owner observation")
+    if any(f"SMP online logical={i} hart=" not in text for i in range(1,cpus)):
+        raise RuntimeError("a requested secondary was not online")
     print(f"RV SMP cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
 
 
@@ -182,11 +185,13 @@ def validate_mm_failure(text, profile, contract="mm"):
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument('--cpus',type=int,choices=(1,2,3,4),action='append')
+    parser.add_argument('--memory',choices=('512M','1G'),action='append')
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--firmware", default="default")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build/riscv-smp/runs"))
-    parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
+    parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "handshake-timeout", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
     parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file", "mm-disk", "files", "file-io"), default="scheduler")
     parser.add_argument("--init",type=Path)
     parser.add_argument("--require-fpu-setup",action="store_true")
@@ -198,7 +203,7 @@ def main():
     if args.contract in ("mm-disk","files","file-io"):
         if not args.init or args.profile not in ("normal","rfence-error"): parser.error("disk MM requires --init and normal/rfence-error profile")
         for cpus in ((2,1) if args.profile=="normal" else (2,)):
-            for memory in ("512M","1G"):
+            for memory in (args.memory or ("512M","1G")):
                 folder=args.output/f"{cpus}-{memory}"
                 folder.mkdir(parents=True,exist_ok=True)
                 root=folder/"root.img"; disk=folder/"disk.img"
@@ -217,8 +222,8 @@ def main():
         return
     if (args.contract in ("mm-shared", "mm-file", "mm-disk") and args.profile not in ("normal", "rfence-error")) or (args.contract == "mm" and args.profile not in ("normal", "rfence-error", "mm-fence-i")) or (args.contract != "mm" and args.profile == "mm-fence-i"):
         parser.error("profile does not belong to the selected contract")
-    for cpus in ((2, 1) if args.profile == "normal" else (2,)):
-        for memory in ("512M", "1G"):
+    for cpus in (args.cpus or ((2, 1) if args.profile == "normal" else (2,))):
+        for memory in (args.memory or ("512M", "1G")):
             boot(args.qemu, args.firmware, args.kernel, memory, cpus,
                  args.output / f"{cpus}-{memory}", args.profile, args.contract,
                  require_fpu_setup=args.require_fpu_setup)

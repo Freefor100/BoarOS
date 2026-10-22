@@ -40,7 +40,7 @@ class MMReport(unittest.TestCase):
             (['SMP=1', 'SMP_TEST=1', 'MM_SMP_TEST=1', 'MM_SHARED_SMP_TEST=2'], 'MM_SHARED_SMP_TEST must be'),
             (['SMP=1', 'SMP_TEST=1', 'MM_SMP_TEST=1', 'MM_SHARED_SMP_TEST=1', 'SMP_TEST_PROFILE=mm-fence-i'], 'MM_SHARED_SMP_TEST profile'),
             (['SMP=1', 'SMP_TEST=1', 'MM_SMP_TEST=1', 'SMP_TEST_PROFILE=guard'], 'MM_SMP_TEST profile'),
-            (['SMP=1', 'SMP_TEST=1', 'MM_SMP_TEST=1', 'COST_DIAGNOSTICS=1'], 'SMP plus COST')):
+            (['SMP=1', 'SMP_CPUS=3'], 'SMP_CPUS must be 2 or 4')):
             result = subprocess.run(['make', '-n', *arguments, 'all'], cwd=Path(__file__).resolve().parents[2],
                                     capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)

@@ -88,10 +88,60 @@ void mm_test_fence(uint64_t address, int instructions)
         publish(&exiting); await(&allow_exit);
     }
 }
+#if BOAROS_MAX_CPUS == 4
+static unsigned many_mm_entered, many_mm_release, many_mm_sampled, many_mm_sync;
+static uint64_t many_mm_page;
+static void *many_mm_visitor(void *argument)
+{
+    unsigned id=(uintptr_t)argument;mm_test_attach(id);kernel_cpu_current()->logical_id=id;
+    if(id==3)await(&many_mm_sampled);
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    __atomic_fetch_or(&many_mm_entered,1U<<id,__ATOMIC_RELEASE);
+    await(&many_mm_release);assert(!kernel_mm_activate(0,kernel_context));return NULL;
+}
+static void many_mm_activity(uint64_t address)
+{
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    pthread_t visitors[3];
+    for(unsigned id=1;id<4;id++) {
+        assert(!pthread_create(&visitors[id-1],0,many_mm_visitor,(void *)(uintptr_t)id));
+        if(id<3)while(!(__atomic_load_n(&many_mm_entered,__ATOMIC_ACQUIRE)&(1U<<id)))sched_yield();
+    }
+    struct kernel_mm_mapping mapping;assert(!kernel_mm_lookup(&mm,address,&mapping));many_mm_page=mapping.physical_address;
+    struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);assert(state.active_cpus==7);
+    many_mm_sync=1;assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE));many_mm_sync=0;
+    assert(kernel_mm_lookup(&mm,address,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    kernel_mm_get_concurrency_state(&mm,&state);assert(state.active_cpus==15 && !state.pending_retirement);
+    publish(&many_mm_release);
+    for(unsigned i=0;i<3;i++)assert(!pthread_join(visitors[i],0));
+    assert(!kernel_mm_activate(0,kernel_context));mm_test_context=context;
+    kernel_mm_get_concurrency_state(&mm,&state);assert(!state.active_cpus && !state.pending_retirement);
+    uint64_t placed;assert(!kernel_mm_mmap_anonymous(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&placed));
+    unsigned char byte=19;size_t copied;assert(!kernel_copy_to_user(&mm,address,&byte,1,&copied) && copied==1);
+    puts("MM four executors: sampled targets 0/1/2, late CPU3 joins during retired-page hold, all active and retirement owners returned");
+}
+#endif
 void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int instructions)
 {
     (void)address; (void)size; (void)instructions;
     assert(!kernel_cpu_current()->raw_locks);
+#if BOAROS_MAX_CPUS == 4
+    if(many_mm_sync) {
+        if(many_mm_sync==2) {
+            assert(targets==15);mm_test_fence(size==BOAROS_PAGE_SIZE?address:UINT64_MAX,0);
+            if(instructions)mm_test_fence(0,1);
+            return;
+        }
+        assert(targets==7);many_mm_sync=2;publish(&many_mm_sampled);
+        while(__atomic_load_n(&many_mm_entered,__ATOMIC_ACQUIRE)!=14)sched_yield();
+        struct kernel_mm_concurrency_state state;uint32_t references;
+        kernel_mm_get_concurrency_state(&mm,&state);assert(state.active_cpus==15);
+        assert(!physical_page_reference_count(&allocator,many_mm_page,&references) && references);
+        mm_test_fence(size==BOAROS_PAGE_SIZE?address:UINT64_MAX,0);
+        if(instructions)mm_test_fence(0,1);
+        return;
+    }
+#endif
     assert(targets == (kernel_cpu_current()->active_mm_record ?
         UINT32_C(1) << kernel_cpu_current()->logical_id : 0));
 #ifdef REMOTE_USER_CASE
@@ -263,6 +313,9 @@ int main(void)
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address));
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
     assert(!kernel_mm_check_task_domain(&mm));
+#if BOAROS_MAX_CPUS == 4
+    many_mm_activity(address);
+#endif
     sample_activation=1;
     pthread_t modifier, visitor;
     assert(!pthread_create(&visitor, 0, enter, 0) && !pthread_create(&modifier, 0, modify, 0));

@@ -1,10 +1,10 @@
-# RV 两核执行与服务边界
+# RV 多核执行与服务边界
 
-默认构建和 LA 仍为单 CPU。`kernel-rv-smp` 提供两核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户两核执行。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，实际写回继续由既有 CPU0 worker 完成。两种配置中的 ext4 读、文件空间修改、同步准备、路径和目录操作可在两核执行；挂载管理、设备配置和网络业务按下述边界推进。
+默认构建和 LA 仍为单 CPU。`kernel-rv-smp` 提供多核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户执行。SMP 默认容量为两核，`SMP_CPUS=4` 使用独立产物并支持实际启动 1～4 核。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，实际写回继续由既有 CPU0 worker 完成。两种配置中的 ext4 读、文件空间修改、同步准备、路径和目录操作可在各发起核执行；挂载管理、设备配置和网络业务按下述边界推进。
 
 ## 真实用户态与CPU0业务交接
 
-`SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
+`SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`；增加 `SMP_CPUS=4` 后使用 `build/riscv-user-smp4/`，受控调度、MM 和成本构建也使用对应的 `smp4` 目录。默认单核与两核缓存不混用。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
 
 通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、网络等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
@@ -12,7 +12,7 @@
 
 FIFO/RR用户任务进入CPU0服务时，在来源CPU保留逻辑实时资格；非阻塞syscall不是yield。来源核只允许该owner恢复或更高优先级用户抢占。真正阻塞、yield、RR片尾、降为OTHER、移除来源affinity或退出会结束资格；多个被抢占者可同时保留，按原优先级/FIFO组织。CPU0 的特殊资格索引仅接纳实时服务，避免本核高优先级用户计算饿死异核实时服务；普通服务与缓存 worker 按 OTHER 队列轮转，不能因反复查询而饿死其正在等待的 I/O。服务完成后重新检查用户资格，不把首次准备完的子任务直接送到U-mode。两种节点均借用既有执行/runnable owner，回收前必须摘尽；不固定MM/files，也不引入worker。
 
-2026-10-14 的 RV 整数 ABI 尺寸探针中，实时资格修复使USER_SMP任务由2816增至2896字节，仍由一张4KiB页容纳；每CPU记录由2048增至3664字节，服务索引另为1616字节。每次调度选择O(1)，入/摘维护两CPU及服务索引，现有优先级桶最坏检查仍最多99级，不扫描等待任务。默认及受控SMP构建没有这些新增字段。
+2026-10-14 的 RV 整数 ABI 尺寸探针中，实时资格修复使USER_SMP任务由2816增至2896字节，仍由一张4KiB页容纳；每CPU记录由2048增至3664字节，服务索引另为1616字节。每次调度选择O(1)，入/摘维护编译容量内的CPU及服务索引，现有优先级桶最坏检查仍最多99级，不扫描等待任务。默认及受控SMP构建没有这些新增字段。
 
 服务内 wait finish 用真实在途借用及两线程握手核对归还；显式 yield 在调用 CPU 走统一调度入口。普通任务因服务或 affinity 迁移时排到目标核队尾，不能反复插到已就绪的后端、checkpoint 或缓存 worker 前面；实时抢占、节流和来源资格保留原有顺序。服务期间耗尽 RR 片的状态在恢复用户资格时消费，不把非阻塞业务当成 yield。
 
@@ -65,20 +65,19 @@ boot hart固定在逻辑0，其余按ID排序。重复、损坏、缺boot hart�
 高地址入口在首次挂载前一次性发布已验证的启动 CPU 数，后续 HSM 启动核对同一快照。
 文件系统据此选择单执行者或并行策略；根挂载启动 worker 时，secondary 尚未 ONLINE，
 因此在线计数不用于这项选择。
-`secondary.S`使用独立16KiB静态栈与镜像mailbox，不清BSS；过渡映射后的高地址入口重绑gp/tp、
+每个 secondary 独立持有 CPU 记录、idle、16 KiB 静态栈、镜像 mailbox 及 attach、timer、IPI 和停止状态。`secondary.S`不清BSS；过渡映射后的高地址入口重绑gp/tp、
 stvec/sscratch及最终satp。内核仍通过`tp→任务→CPU`定位，用户TLS契约保持。
 
 `smp.c`探测HSM/IPI/RFENCE，启动与停止预算各5秒。HSM STARTED不作为内核ONLINE证明：
-CPU1完成本地timer和IPI握手才发布ONLINE。停止先收完受控任务的存储owner，确认静态idle、
-无切换前驱及就绪资格，再请求HSM stop；CPU0禁止抢占直到STOPPED确认。失败保留可能仍被使用的owner。
+CPU0 按逻辑编号顺序启动各 secondary，每核完成本地 timer 和 IPI 握手后才发布 ONLINE；全体上线后才开始普通用户调度。停止先检查所有 secondary 均处于静态 idle、无切换前驱、就绪资格和活动 MM，再逐核请求 HSM stop 并确认 STOPPED；CPU0 禁止抢占直到全部确认。失败输出目标 hart 和阶段，保留可能仍被使用的 owner。
 
 timer的周期、下一tick与armed状态属于CPU；本地RR和RT记账保持独立。CPU0推进全局tick、
-coarse time、load、等待期限和服务轮询。CPU1新增期限通知CPU0重装事件。
+coarse time、load、等待期限和服务轮询。任意 secondary 新增期限均通知 CPU0 重装事件。内核映射修改对全部在线远端核同步 RFENCE，最后一个目标确认后才归还页和页表；用户 MM 继续按活动位及代次处理失效与晚加入者。
 
 ## 调度与资源
 
 统一rank40短锁保护全局runnable成员、每CPU资格索引和执行owner。资格节点内嵌任务并借用全局成员；
-摘取任务同时摘除所有CPU索引。选择不扫描另一CPU的任务，索引维护受两CPU容量约束。
+摘取任务同时摘除所有CPU索引。选择不扫描另一CPU的任务，索引维护受编译 CPU 容量约束。
 普通创建接口默认CPU0；`kernel_thread_create_joinable_mask()`只供CPU0创建带join owner的受控任务。
 可睡眠的私有准备不取得已发布owner；最终rank40接纳点重查CPU在线状态，失效时锁外回滚且不发布join。
 `kernel_thread_set_cpu_mask()`要求受控任务已BLOCKED、off_cpu且没有runnable/pending成员，否则BUSY。
@@ -95,6 +94,20 @@ IPI软件事件使用release发布、exchange消费；接收先清SSIP。通知�
 RFENCE错误走fatal并保留owner。单页接口仍是批量接口的包装。
 受控任务只能进入已绑定的 MM 和获准 FD 消费者（匿名 pipe 及下述预开普通 OFD），不得进入一般命名来源、socket/epoll/FIFO、设备或协议。分配器与缓存不再要求私有 arena 或关闭压力挂钩；专项测试可以用独立 arena 制造耗尽，普通用户和压力挂钩测试使用实际系统分配器及已挂载缓存。
 `kernel_thread_create_joinable_mm()`在最终 ONLINE 复查后才转移 caller MM，失败不发布 join 或身份；缓存 root 不取得额外引用。当前任务借用覆盖执行，最后 MM 释放由 CPU0 可信栈的统一 join/reaper 路径完成。活动 MM 借用归零也是 CPU 停止条件。
+
+## 四核短例
+
+```sh
+make kernel-rv-user-smp SMP_CPUS=4
+make test-user-smp-riscv SMP_CPUS=4 INIT_CONFIG=config/init.json
+make test-smp-riscv SMP_CPUS=4
+```
+
+`tests/smp/user.py --cpus` 可选择 1、2、3、4；四核构建的常用 Make 入口选择 4/2/1 核，三核可显式指定。`test-user-smp-runtime-riscv` 沿用原 2/1 核程序矩阵，并显式使用当前容量对应的内核。Linux 同 ELF 参考配置使用独立缓存及 `CONFIG_NR_CPUS=4`，runner 检查实际执行核数。
+
+四核短例让每个在线核执行整数/FPU/TLS、嵌套信号、共享匿名页及文件映射、截断/打洞、unlink 后关闭，以及 fork/affinity/exec；进程 VIRTUAL/PROF 定时器在这些任务执行期间递送。远端实时任务同时进入 CPU0 socket 服务，CPU0 高优先级计算期间仍须完成。每个 hart 的用户陷入、返回、本地中断和本地 syscall 都必须非零。静态 musl 有 13 个有序案例，动态形态另加 dlopen TLS；512 MiB 与 1 GiB 分别运行，退出后检查 heap 和磁盘。
+
+受控调度短例单独检查四核启动、迁移、等待和 RFENCE；启动拒绝、timer 握手超时、停止确认失败及最后一个 RFENCE 目标错误注入在独立启动验证。host MM 握手检查活动集合从三核到四核的晚加入、后续失效目标及确认前的页引用。失败启动的保留资源与正常退出的资源归还分别判定。四核 USER_SMP 任务为 3568 字节，仍由一张 metadata 页存储，架构前缀保持不变；编译断言检查容量。
 
 ## 验证入口与证据边界
 

@@ -30,7 +30,7 @@ TIMER_CASES={'getpid':1000000,'compute':17117817320143602816,'tmpfs-small-io':51
              'compute-threads':13183116052861372952,'compute-processes':13183116052861372952}
 
 def timer_measurements(raw,mode,expected=None,cpus=1):
-    if mode not in TIMER_MODES or cpus not in (1,2):
+    if mode not in TIMER_MODES or cpus not in (1,2,4):
         raise RuntimeError('invalid timer measurement profile')
     expected=list(TIMER_CASES) if expected is None else list(expected)
     lines=[line[line.index('ACCOUNT TIMER '):] for line in raw.replace('\r','').splitlines() if 'ACCOUNT TIMER ' in line]
@@ -45,7 +45,7 @@ def timer_measurements(raw,mode,expected=None,cpus=1):
         row=dict(zip(('wall_ns','user_ns','system_ns','signals','check','workers','cpu_mask','overlap'),map(int,match.groups()[1:])))
         parallel=name in ('compute-threads','compute-processes')
         if (row['check']!=TIMER_CASES[name] or not row['wall_ns'] or row['workers']!=(8 if parallel else 1) or
-                row['cpu_mask']!=((1<<cpus)-1 if parallel else 1) or row['overlap']!=int(parallel and cpus==2)):
+                row['cpu_mask']!=((1<<cpus)-1 if parallel else 1) or row['overlap']!=int(parallel and cpus>1)):
             raise RuntimeError('timer workload content, CPU assignment or completion differs')
         if mode in ('off','virtual-armed','prof-armed') and row['signals']:
             raise RuntimeError('disabled or nonexpiring timer delivered a signal')
@@ -70,16 +70,23 @@ def main():
     parser.add_argument('--timer-suite',action='store_true',help='same-ELF fixed CPU timer workloads instead of legacy SQLite')
     parser.add_argument('--timer-kernel',action='append',help='kernel label receiving timer modes; repeat for matched old/new states')
     parser.add_argument('--timer-modes',nargs='+',choices=TIMER_MODES,help='timer states to measure; default all five')
-    parser.add_argument('--cpus',type=int,choices=(1,2),default=1)
+    parser.add_argument('--cpus',type=int,choices=(1,2,4),default=1)
+    parser.add_argument('--host-vcpu-cpus',help='one pinned host CPU per guest CPU')
+    parser.add_argument('--host-io-cpu',type=int,default=8)
+    parser.add_argument('--qemu-seed',type=int)
     parser.add_argument('--qemu',help='explicit QEMU binary; default follows the native architecture profile')
     parser.add_argument('--firmware',type=Path,help='explicit RV OpenSBI firmware')
     parser.add_argument('--repeat',type=int,default=5)
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
+    sys.path.insert(0,str(ROOT/'tests'))
+    from qemu_thread_affinity import pin_qemu_threads,host_cpu_selection,host_cpu_topology
+    import tempfile
+    host_vcpus=host_cpu_selection(args.host_vcpu_cpus,args.cpus,args.host_io_cpu)
     if args.arch=='riscv' and args.firmware is None:parser.error('RV requires --firmware')
     if args.repeat<1:parser.error('repeat must be positive')
     if not args.timer_suite and args.sqlite is None:parser.error('legacy suite requires --sqlite')
-    if args.cpus==2 and (args.arch!='riscv' or not args.timer_suite):parser.error('two CPUs require RV timer suite and a real USER_SMP kernel')
+    if args.cpus>1 and (args.arch!='riscv' or not args.timer_suite):parser.error('multiple CPUs require RV timer suite and a real USER_SMP kernel')
     sources={}
     for value in args.kernel:
         label,separator,path=value.partition('=')
@@ -105,7 +112,7 @@ def main():
         commands=base/'sqlite.debugfs';commands.write_text(f'write "{sqlite}" /sqlite3\nset_inode_field /sqlite3 mode 0100755\n')
         harness.run_logged(['debugfs','-w','-f',str(commands),str(fixture)],base/'sqlite-install.log')
     qemu=Path(shutil.which(args.qemu or profile.qemu) or args.qemu or profile.qemu).resolve()
-    report={'host_affinity':sorted(os.sched_getaffinity(0)),'arch':args.arch,'status':'running','program':harness.digest(program),'sqlite':harness.digest(sqlite) if not args.timer_suite else None,'suite':'timers' if args.timer_suite else 'legacy','guest_cpus':args.cpus,'runner_sha256':harness.digest(__file__),
+    report={'host_affinity':sorted(os.sched_getaffinity(0)),'arch':args.arch,'status':'running','program':harness.digest(program),'sqlite':harness.digest(sqlite) if not args.timer_suite else None,'suite':'timers' if args.timer_suite else 'legacy','guest_cpus':args.cpus,'host_cpu_topology':host_cpu_topology(host_vcpus+[args.host_io_cpu]) if host_vcpus else None,'runner_sha256':harness.digest(__file__),
         'firmware':{'path':str(args.firmware.resolve()),'sha256':harness.digest(args.firmware)} if args.firmware else None,
         'kernels':{label:harness.digest(path) for label,path in kernels.items()},
         'qemu':{'path':str(qemu),'sha256':harness.digest(qemu),'version':harness.output([str(qemu),'--version'])},'runs':[]}
@@ -125,19 +132,32 @@ def main():
                     '-drive',f'file={disk},if=none,format=raw,id=root','-device',profile.block('modern')]
                 if args.arch=='riscv':
                     command[command.index('-bios')+1]=str(args.firmware.resolve())
-                    command+=['-global','virtio-mmio.force-legacy=false']
-                if args.cpus==2:
-                    command[command.index('-smp')+1]='2'
-                    command+=['-accel','tcg,thread=multi']
-                log=base/f'{name}.log';harness.run_logged(command,log,120);raw=log.read_text(errors='replace')
+                    command+=['-global','virtio-mmio.force-legacy=false','-accel','tcg,thread=multi']
+                if args.cpus>1:
+                    command[command.index('-smp')+1]=str(args.cpus)
+                if args.qemu_seed is not None:command+=['-seed',str(args.qemu_seed)]
+                log=base/f'{name}.log';affinity=None
+                if host_vcpus:
+                    with tempfile.TemporaryDirectory(prefix='account-qmp.') as temporary,log.open('w') as stream:
+                        qmp=Path(temporary)/'control';command+=['-S','-qmp',f'unix:{qmp},server=on,wait=off']
+                        process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=stream,stderr=subprocess.STDOUT,
+                            preexec_fn=lambda:os.sched_setaffinity(0,{args.host_io_cpu}))
+                        try:
+                            affinity=pin_qemu_threads(process,qmp,host_vcpus,args.host_io_cpu)
+                            status=process.wait(timeout=120)
+                            if status:raise subprocess.CalledProcessError(status,command)
+                        except BaseException:
+                            process.kill();process.wait();raise
+                else:harness.run_logged(command,log,120)
+                raw=log.read_text(errors='replace')
                 values=timer_measurements(raw,mode,cpus=args.cpus) if args.timer_suite else measurements(raw)
                 if not profile.root_success(raw,42):raise RuntimeError('native workload resource release failed')
-                if args.cpus==2:
+                if args.cpus>1:
                     sys.path.insert(0,str(ROOT/'tests/smp'))
                     from user import validate_execution
-                    validate_execution(raw,2,True,require_parallel=True)
+                    validate_execution(raw,args.cpus,True,require_parallel=True)
                 harness.run_logged(['e2fsck','-fn',str(disk)],base/f'{name}-fsck.log')
-                report['runs'].append({'repeat':repeat,'label':label,'mode':mode,'values':values,'command':command} if args.timer_suite else
+                report['runs'].append({'repeat':repeat,'label':label,'mode':mode,'values':values,'command':command,'host_thread_affinity':affinity,'qemu_seed':args.qemu_seed} if args.timer_suite else
                                       {'repeat':repeat,'label':label,'ns':values,'command':command})
                 (base/'results.json').write_text(json.dumps(report,indent=2)+'\n')
                 disk.unlink();print(label,mode,repeat,values,flush=True)

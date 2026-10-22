@@ -39,6 +39,15 @@ class CostTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):cost.timer_measurements(row.replace('signals=7','signals=0'),'prof-periodic',['getpid'],1)
         with self.assertRaises(RuntimeError):cost.timer_measurements(row.replace('prof-periodic','prof-armed'),'prof-armed',['getpid'],1)
 
+    def test_four_cpu_fixed_eight_workers_and_full_mask(self):
+        raw=('ACCOUNT TIMER BEGIN mode=off cpus=4\n'
+             'ACCOUNT TIMER compute-threads wall_ns=10000000 user_ns=20000000 system_ns=1000000 signals=0 check=13183116052861372952 workers=8 cpu_mask=15 overlap=1\n'
+             'ACCOUNT TIMER END 1\n')
+        row=cost.timer_measurements(raw,'off',['compute-threads'],4)['compute-threads']
+        self.assertEqual((row['workers'],row['cpu_mask'],row['overlap']),(8,15,1))
+        for bad in (raw.replace('cpu_mask=15','cpu_mask=7'),raw.replace('workers=8','workers=4'),raw.replace('overlap=1','overlap=0')):
+            with self.assertRaises(RuntimeError):cost.timer_measurements(bad,'off',['compute-threads'],4)
+
     def test_run_order_rotates_without_dropping_control_or_modes(self):
         first=cost.timer_run_plan(['before','after','control'],'after',0)
         second=cost.timer_run_plan(['before','after','control'],'after',1)
