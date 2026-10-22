@@ -5,7 +5,7 @@
 enum composition_command { COMPOSITION_PRESSURE=1, COMPOSITION_RELEASE,
     COMPOSITION_OOM, COMPOSITION_RFENCE, COMPOSITION_FAULT_RACE,
     COMPOSITION_FILE_FAULT_RACE, COMPOSITION_READ_ARM, COMPOSITION_READ_FINISH,
-    COMPOSITION_WAIT_ARM, COMPOSITION_WAIT_FINISH, COMPOSITION_CLOCK_ARM, COMPOSITION_CLOCK_FINISH, COMPOSITION_STOP };
+    COMPOSITION_WAIT_ARM, COMPOSITION_WAIT_FINISH, COMPOSITION_CLOCK_ARM, COMPOSITION_CLOCK_FINISH, COMPOSITION_STOP, COMPOSITION_SOCKET_WAIT };
 enum composition_read_flags { COMPOSITION_READ_LOCAL=1, COMPOSITION_WRITE_LOCAL=2,
     COMPOSITION_READ_HOLD=4, COMPOSITION_READ_CLOSE=8, COMPOSITION_READ_FORK=16,
     COMPOSITION_READ_SEEK=32, COMPOSITION_READ_COLD=64, COMPOSITION_READ_PREFIX=128, COMPOSITION_READ_BATCH=256 };
@@ -20,6 +20,7 @@ struct composition_control {
     uint64_t read_entered, read_release, read_waiter_tid, read_waited;
     uint64_t wait_tid, wait_child, wait_address, wait_entered, wait_release;
     uint64_t clock_tid, clock_pid, clock_entered, clock_release;
+    uint64_t socket_tid, socket_mode, socket_entered, socket_release, socket_waiter_tid, socket_waited;
 };
 static inline uint64_t composition_load(const uint64_t *p)
 { return __atomic_load_n(p,__ATOMIC_ACQUIRE); }

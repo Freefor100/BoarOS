@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -31,8 +32,8 @@ def run_loongarch(args):
     program=work/'init'
     environment=os.environ.copy();environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     compiler=ROOT/'build/loongarch/musl-root/bin/musl-gcc'
-    subprocess.run([str(compiler),*profile.raw_flags,'-static','-O2','-Wall','-Wextra','-Werror',
-        '-Wl,-z,max-page-size=16384',str(ROOT/f'tests/workloads/network/{args.workload}.c'),'-o',str(program)],env=environment,check=True)
+    subprocess.run([str(compiler),*profile.raw_flags,'-static','-O2','-pthread','-Wall','-Wextra','-Werror',
+        '-Wl,-z,max-page-size=16384',str(ROOT/('tests/workloads/epoll/delivery.c' if args.workload=='epoll' else f'tests/workloads/network/{args.workload}.c')),'-o',str(program)],env=environment,check=True)
     supervisor=work/'supervisor'
     execute([profile.compiler,*profile.raw_flags,'-O2','-DROOT_NETWORK_SETUP=1','-ffreestanding',
         '-fno-builtin','-fno-stack-protector','-nostdlib','-nostartfiles','-static','-no-pie',
@@ -57,7 +58,7 @@ def run_loongarch(args):
             try:code,raw=run_guest(command,120)
             except subprocess.TimeoutExpired as error:code=-1;raw=error.output
             (case/'console.log').write_text(raw)
-            passed=not code and f'NETWORK PASS {args.workload}' in raw and 'fatal' not in raw and (
+            passed=not code and ('EPOLL PASS delivery' if args.workload=='epoll' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
                 'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
             row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
@@ -66,18 +67,89 @@ def run_loongarch(args):
             (work/'result.json').write_text(json.dumps(metadata,indent=2)+'\n')
             print(platform,memory,'PASS' if passed else 'FAIL',work,flush=True)
             if not passed:print('\n'.join(raw.splitlines()[-20:]));return 1
+            with (case/'fsck.log').open('w') as log:subprocess.run(['e2fsck','-fn',str(image)],stdout=log,stderr=subprocess.STDOUT,check=True)
             image.unlink();snapshot.unlink()
+    return 0
+
+def run_smp(args):
+    sys.path.insert(0,str(ROOT/'tests/smp'))
+    from user import boot_user,identity
+    output=args.output or ROOT/'build/network'/('socket-smp-'+str(time.time_ns()))
+    output.mkdir(parents=True,exist_ok=False)
+    compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
+    program=output/'program'
+    subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),
+        *(['-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1'] if args.dynamic else ['-static']),'-O2','-pthread','-Wall','-Wextra','-Werror',
+        str(ROOT/'tests/workloads/network/smp.c'),'-o',str(program)],check=True)
+    variants=[]
+    if args.only!='boaros':
+        linux,linux_identity=harness.linux_build(ROOT/'tests/smp/linux-user.config')
+        config=(linux.parents[3]/'.config').read_text()
+        if 'CONFIG_NR_CPUS=4' not in config:raise RuntimeError('four-CPU reference required')
+        variants.append(('linux',linux))
+    if args.only!='linux':variants.append(('boaros',args.kernel or ROOT/'kernel-rv'))
+    originals=variants;variants=[]
+    for name,kernel in originals:
+        snapshot=output/(name+'-kernel');shutil.copyfile(kernel,snapshot);variants.append((name,snapshot))
+    report={'program':identity(program),'dynamic':args.dynamic,'runs':[],'status':'running'}
+    (output/'result.json').write_text(json.dumps(report,indent=2)+'\n')
+    expected=[f'SOCKET-SMP CASE {name} OK' for name in ('ipv4-tcp','ipv6-tcp','ipv4-udp','ipv6-udp','unix-stream','unix-dgram','blocking-close-reuse-cancel','fault-empty-trunc-timeout-sendfile','shared-readers-writers','remote-epoll-oneshot-nested')]+['SOCKET-SMP END 10']
+    try:
+        for cpus in args.cpus or [4]:
+            for memory in args.memory or ['512M']:
+                folder=output/f'{cpus}cpu-{memory}';folder.mkdir()
+                fixture=harness.fixture(folder,program)
+                if args.dynamic:
+                    loader=ROOT/'build/riscv/musl-root/lib/libc.so'
+                    batch=folder/'loader.debugfs';batch.write_text(f'mkdir /lib\nwrite "{loader}" /lib/ld-musl-riscv64.so.1\nset_inode_field /lib/ld-musl-riscv64.so.1 mode 0100755\n')
+                    harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'loader.log')
+                for target,kernel in variants:
+                    disk=folder/(target+'.img');shutil.copyfile(fixture,disk)
+                    if target=='boaros' and args.observe:
+                        marker=folder/'socket-observer';marker.write_text('private correctness observations\n')
+                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /socket-observer\n')
+                        harness.run_logged(['debugfs','-w','-f',str(batch),str(disk)],folder/'observer-install.log')
+                    raw,record,_=boot_user('qemu-system-riscv64',args.firmware,str(kernel.resolve()),disk,memory,cpus,folder,target=='linux')
+                    lines=[line[line.index('SOCKET-SMP '):] for line in raw.replace('\r','').splitlines() if 'SOCKET-SMP ' in line]
+                    passed=lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    observations=None
+                    if target=='boaros' and args.observe:
+                        matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
+                        observations=[[int(value,16) for value in row] for row in matches]
+                        active=[row for row in observations if row[0]<cpus]
+                        holds=re.findall(r'SOCKET controlled rx=(0x[0-9a-f]+) tx-pin=(0x[0-9a-f]+) callback=(0x[0-9a-f]+)',raw)
+                        controlled=[line for line in raw.replace('\r','').splitlines() if line.startswith('SOCKET-CONTROL ')]
+                        passed=passed and len(active)==cpus and {row[0] for row in active}==set(range(cpus)) and all(all(row[1:]) for row in active)
+                        passed=passed and len(holds)==1 and all(int(value,16)==1 for value in holds[0]) and controlled==[
+                            'SOCKET-CONTROL reservation-append-last-close OK','SOCKET-CONTROL tx-pin-remote-mprotect OK','SOCKET-CONTROL callback-borrow-del-close OK']
+                        passed=passed and bool(re.search(r'SOCKET CPU0 protocol-calls=0x[1-9a-f][0-9a-f]*',raw))
+                    row=dict(target=target,cpus=cpus,memory=memory,passed=passed,observations=observations,**record);report['runs'].append(row)
+                    print(target,cpus,memory,'PASS' if passed else 'FAIL',output,flush=True)
+                    if not passed:raise RuntimeError('socket SMP stream or owner cleanup failed: '+str(folder))
+                    with (folder/(target+'-fsck.log')).open('w') as log:subprocess.run(['e2fsck','-fn',str(disk)],stdout=log,stderr=subprocess.STDOUT,check=True)
+                    disk.unlink()
+                fixture.unlink()
+        report['status']='passed'
+    except Exception as error:
+        report.update(status='failed',error=str(error));raise
+    finally:(output/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     return 0
 
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','smp','epoll'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--kernel',type=Path)
+    parser.add_argument('--cpus',action='append',type=int,choices=(1,2,4))
+    parser.add_argument('--dynamic',action='store_true')
+    parser.add_argument('--observe',action='store_true')
+    parser.add_argument('--output',type=Path)
+    parser.add_argument('--firmware',default='default')
     args=parser.parse_args()
+    if args.workload=='smp' and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)
@@ -86,8 +158,8 @@ def main(default_arch="riscv"):
     work.mkdir(parents=True)
     program=work/'init'
     compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
-    subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),'-static','-O2','-Wall','-Wextra','-Werror',
-                    str(ROOT/f'tests/workloads/network/{args.workload}.c'),'-o',str(program)],check=True)
+    subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),'-static','-O2','-pthread','-Wall','-Wextra','-Werror',
+                    str(ROOT/('tests/workloads/epoll/delivery.c' if args.workload=='epoll' else f'tests/workloads/network/{args.workload}.c')),'-o',str(program)],check=True)
     image=harness.fixture(work,program)
     metadata={'program_sha256':digest(program),'fixture_sha256':digest(image),'runs':{}}
     variants=[]
@@ -113,7 +185,7 @@ def main(default_arch="riscv"):
             try:harness.run_logged(command,log,60)
             except (RuntimeError,TimeoutError):pass
             raw=log.read_text(errors='replace')
-            passed=f'NETWORK PASS {args.workload}' in raw
+            passed=('EPOLL PASS delivery' if args.workload=='epoll' else f'NETWORK PASS {args.workload}') in raw
             if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
             metadata['runs'][label]={'passed':passed,'memory':memory,'kernel_sha256':digest(snapshot),'command':command}
             print(name,memory,'PASS' if passed else 'FAIL',work)

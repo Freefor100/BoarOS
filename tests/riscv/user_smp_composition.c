@@ -59,6 +59,7 @@ static void check_at(int valid,unsigned line)
     }
 }
 #define check(valid) check_at((valid),__LINE__)
+#include "socket_smp.h"
 static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
@@ -120,6 +121,21 @@ static void release_read_waiter(void)
         composition_store(&control->read_waited,1);
         composition_store(&control->read_release,1);
         read_waiter=NULL;
+    }
+}
+static void release_socket_waiter(void)
+{
+    if(!control || composition_load(&control->socket_mode)!=2 ||
+       !composition_load(&control->socket_entered) || composition_load(&control->socket_release))return;
+    kernel_pid_t tid=(kernel_pid_t)composition_load(&control->socket_waiter_tid);
+    if(!tid)return;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *task=process_find_identity(tid,KERNEL_PID_TID);check(task!=0);
+    struct kernel_wait_record *wait=kernel_wait_record_of(task);
+    if(wait->phase==KERNEL_WAIT_COMMITTED && !wait->on_cpu) {
+        /* The MM writer also blocks the user controller: the kernel observer releases the real pin. */
+        composition_store(&control->socket_waited,1);
+        composition_store(&control->socket_release,1);
     }
 }
 static void arm_read(void)
@@ -244,6 +260,7 @@ static void run(void *unused)
     uint64_t completed=0;
     while (!stopping) {
         release_read_waiter();
+        release_socket_waiter();
         uint64_t request=composition_load(&control->request);
         if (request==completed) { relinquish();continue; }
         check(request==completed+1);
@@ -302,6 +319,19 @@ static void run(void *unused)
             composition_store(&control->fault_file_paused,0);
             __atomic_store_n(&fault_race_armed,1,__ATOMIC_RELEASE);
             break;
+        case COMPOSITION_SOCKET_WAIT:
+            for (;;) {
+                int parked=0;
+                { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+                  struct kernel_task *task=process_find_identity((kernel_pid_t)control->target_tid,KERNEL_PID_TID);
+                  check(task!=0);
+                  struct kernel_wait_record *record=kernel_wait_record_of(task);
+                  parked=record->phase==KERNEL_WAIT_COMMITTED && !record->on_cpu;
+                }
+                if(parked)break;
+                relinquish();
+            }
+            break;
         case COMPOSITION_STOP:stopping=1;break;
         default:__builtin_trap();
         }
@@ -343,6 +373,7 @@ void riscv_user_composition_finish(void)
 }
 void riscv_user_composition_report(void)
 {
+    socket_observe_report();
     virt_uart_puts("BoarOS: COMPOSITION clock claims=");virt_uart_put_hex(clock_claims);
     virt_uart_puts(" active=");virt_uart_put_hex(clock_active);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);
@@ -416,7 +447,8 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint6
         composition_store(&control->wait_entered,1);
         while (!composition_load(&control->wait_release)) relinquish();
     }
-    return __real_kernel_copy_to_user(mm,address,source,size,copied);
+    enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,source,size,copied);
+    socket_observe_copy(*copied,0);return result;
 }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __real_physical_page_allocate_order(struct physical_page_allocator *,uint32_t,uint64_t *);
@@ -573,6 +605,9 @@ enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *mm,
     uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     enum kernel_mm_status status=__real_kernel_mm_pin_user_page(mm,address,access,pin);
+    if(!status) { socket_observe_copy(0,1);
+        if(access==KERNEL_MM_READ && kernel_task_current()->socket_write_request)socket_hold(2);
+    }
     hold_read_pin(status,address,access,pin);
     if(!status && access==KERNEL_MM_READ && reading_task() && (read_flags&COMPOSITION_WRITE_LOCAL) &&
         address>=read_address && address-read_address<read_size) {
@@ -587,6 +622,7 @@ enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel
     int watched=reading_task() && destination>=read_address && destination-read_address<read_size;
     if(watched) { check(!read_copy_active);read_copy_active=1; }
     enum kernel_uaccess_status result=__real_kernel_uaccess_write_cursor_copy(mm,cursor,destination,source,size,copied);
+    socket_observe_copy(*copied,0);
     if(watched)read_copy_active=0;
     if(watched && *copied) {
         unsigned cpu=kernel_cpu_current()->logical_id;check(cpu<2);

@@ -12,18 +12,19 @@ static void delivery(unsigned mode, const char *name, unsigned prefix)
 {
     int pipes[2][2], ep = epoll_create1(0);
     CHECK(ep >= 0);
-    char *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+    long page=sysconf(_SC_PAGESIZE);CHECK(page>=4096);
+    char *pages = mmap(NULL, (size_t)page*2, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    CHECK(pages != MAP_FAILED && !mprotect(pages + 4096, 4096, PROT_NONE));
+    CHECK(pages != MAP_FAILED && !mprotect(pages + page, (size_t)page, PROT_NONE));
     for (unsigned i = 0; i < 2; i++) {
         CHECK(!pipe(pipes[i]));
         struct epoll_event event = {.events = EPOLLIN | mode, .data.u64 = i + 1};
         CHECK(!epoll_ctl(ep, EPOLL_CTL_ADD, pipes[i][0], &event));
         CHECK(write(pipes[i][1], "x", 1) == 1);
     }
-    /* prefix=0 faults immediately; 8 faults inside a RV64 event; one whole
+    /* prefix=0 faults immediately; 8 faults inside a native event; one whole
      * event succeeds before the next page faults in the remaining case. */
-    struct epoll_event *fault = (void *)(pages + 4096 - prefix);
+    struct epoll_event *fault = (void *)(pages + page - prefix);
     errno = 0;
     int first = epoll_wait(ep, fault, 2, 0);
     unsigned delivered = prefix / sizeof(*fault);
@@ -43,7 +44,7 @@ static void delivery(unsigned mode, const char *name, unsigned prefix)
         CHECK(epoll_wait(ep, events, 2, 0) == 1 && events[0].data.u64 == 9);
     }
     for (unsigned i = 0; i < 2; i++) CHECK(!close(pipes[i][0]) && !close(pipes[i][1]));
-    CHECK(!close(ep) && !munmap(pages, 8192));
+    CHECK(!close(ep) && !munmap(pages, (size_t)page*2));
     printf("EPOLL PASS %s prefix=%u\n", name, prefix);
 }
 

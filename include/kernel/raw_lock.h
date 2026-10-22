@@ -8,7 +8,8 @@
 enum kernel_raw_rank {
     KERNEL_RAW_RANK_HEAP = 10, KERNEL_RAW_RANK_MM = 15,
     KERNEL_RAW_RANK_PAGE = 20,
-    KERNEL_RAW_RANK_OBJECT = 30, KERNEL_RAW_RANK_SCHEDULER = 40
+    KERNEL_RAW_RANK_OBJECT = 30, KERNEL_RAW_RANK_FILE_MAPPING = 35,
+    KERNEL_RAW_RANK_SCHEDULER = 40
 };
 /* 初始化/移动仅允许未发布实例；UP 以中断和抢占嵌套互斥，SMP 使用原子字。
  * CPU 持锁链总是保留；线性递归与等级审计只在 LOCK_DEBUG 中执行。 */

@@ -43,6 +43,11 @@ struct kernel_socket_write_request {
     void *packet;
     struct kernel_open_file_description *pin;
     struct kernel_open_file_description **pin_owner;
+    struct kernel_socket_write_request *active_next, **active_previous;
+    const struct kernel_socket_address *destination;
+    void *protocol_address;
+    uint64_t payload_size;
+    uint8_t operation, queued;
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
@@ -109,7 +114,7 @@ int kernel_socket_connection_result(struct kernel_socket *socket);
 int kernel_socket_accept(struct kernel_socket *socket,
                          struct kernel_socket **owner);
 int kernel_socket_accept_check(const struct kernel_socket *socket);
-int kernel_socket_write_datagram_buffer(struct kernel_open_file_description **pin_owner,
+int kernel_socket_write_packet_buffer(struct kernel_open_file_description **pin_owner,
     const void *buffer, uint64_t count, uint32_t flags);
 int kernel_socket_receive_ready(struct kernel_socket *socket);
 int kernel_socket_reserve_read(struct kernel_socket *socket,
@@ -126,8 +131,8 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
 uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
-int kernel_socket_write_buffer(struct kernel_socket *socket,
-                               const void *buffer, uint32_t size, uint32_t flags);
+int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
+    uint64_t target_ns, uint32_t flags);
 #define KERNEL_SOCKET_MSG_DONTWAIT 0x40U
 #define KERNEL_SOCKET_MSG_NOSIGNAL 0x4000U
 #define KERNEL_SOCKET_MSG_TRUNC 0x20U
@@ -190,7 +195,7 @@ int kernel_socket_work_pending(void);
 void kernel_socket_network_capacity(void);
 void kernel_socket_network_blocked(void);
 void kernel_socket_network_failed(uint32_t address);
-void kernel_socket_network_hooks(void (*timer_wake)(void *), void (*work_wake)(void *),
+void kernel_socket_network_hooks(void (*timer_wake)(void *), struct kernel_wait_queue *work_queue,
     int (*udp_capacity)(void *), void *context);
 
 #endif

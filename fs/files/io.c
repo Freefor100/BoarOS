@@ -114,62 +114,6 @@ static enum kernel_files_status release_io_description(
     return KERNEL_FILES_STATUS_STATE;
 }
 
-static int socket_operation_ready(struct kernel_socket *socket, uint32_t events)
-{
-    /* 接收只检查reservation与数据，不再另做一次会重复取得owner的poll。 */
-    if (events == KERNEL_POLLIN) return kernel_socket_receive_ready(socket);
-    return (kernel_socket_poll(socket, 0) & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U;
-}
-
-static int socket_wait_ready(struct kernel_open_file_description *description,
-                             uint32_t events, uint64_t target_ns, uint32_t socket_flags)
-{
-    struct kernel_socket *socket = kernel_open_file_socket(description);
-    uint64_t deadline = 0;
-    int timed = target_ns == 0;
-    if (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) return -KERNEL_EAGAIN;
-    for (;;) {
-        uintptr_t saved = arch_interrupt_save();
-        int ready = socket_operation_ready(socket, events), result = 0;
-        if (ready) {
-            if (events & KERNEL_POLLOUT) result = kernel_socket_unix_wait_error(socket);
-            arch_interrupt_restore(saved);
-            return result;
-        }
-        /* 就绪优先；调用者持有绝对期限，重试与虚唤醒都不能续期。 */
-        if (!timed) {
-            enum kernel_time_status status = kernel_time_deadline_from_monotonic(target_ns, &deadline);
-            if (status != KERNEL_TIME_STATUS_OK) {
-                arch_interrupt_restore(saved);
-                return status == KERNEL_TIME_STATUS_DEADLINE_PASSED ? -KERNEL_EAGAIN : -KERNEL_EIO;
-            }
-            timed = 1;
-        }
-        struct kernel_wait_token token;
-        enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
-        enum kernel_scheduler_status status = kernel_wait_prepare(
-            kernel_socket_wait_queue(socket), deadline, 1, &token);
-        if (status == KERNEL_SCHEDULER_STATUS_OK) {
-            ready = socket_operation_ready(socket, events);
-            if (ready && (events & KERNEL_POLLOUT)) result = kernel_socket_unix_wait_error(socket);
-        }
-        if (status == KERNEL_SCHEDULER_STATUS_OK) {
-            if (!ready) status = kernel_wait_park(&token, &reason);
-            if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        }
-        arch_interrupt_restore(saved);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return -KERNEL_EIO;
-        if (ready) return result;
-        if (reason == KERNEL_WAIT_TIMEOUT && target_ns && kernel_time_monotonic_ns() >= target_ns)
-            return -KERNEL_EAGAIN;
-        if (reason == KERNEL_WAIT_SIGNALLED) {
-            if (target_ns) return -KERNEL_EINTR;
-            kernel_signal_note_syscall_restart(kernel_task_current());
-            return -KERNEL_ERESTARTSYS;
-        }
-    }
-}
-
 /* Sysctl reads commit the offset only after the complete generated prefix was
  * copied. Unlike ordinary proc snapshots, every offset-zero read is fresh. */
 static enum kernel_files_status control_read(
@@ -419,7 +363,7 @@ static enum kernel_files_status read_pinned(
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR);
+    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET);
     KERNEL_LOCK_SCOPE(offset_guard);
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED)
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
@@ -476,7 +420,7 @@ static enum kernel_files_status read_pinned(
                     timeout_captured = 1;
                 }
                 int waited = target && kernel_time_monotonic_ns() >= target ? -KERNEL_EAGAIN :
-                    socket_wait_ready(description, KERNEL_POLLIN, target, socket_flags);
+                    kernel_socket_wait_ready(kernel_open_file_socket(description), KERNEL_POLLIN, target, socket_flags);
                 if (waited == 0) continue;
                 received = waited;
             }
@@ -695,7 +639,7 @@ static enum kernel_files_status readv_request(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         status = KERNEL_FILES_STATUS_OK;
@@ -796,7 +740,7 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET);
     uint64_t position;
     uint64_t request;
     uint64_t file_size;
@@ -954,17 +898,27 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
     }
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         struct kernel_socket *socket = kernel_open_file_socket(output);
-        if (kernel_socket_is_datagram(socket))
-            return kernel_socket_write_datagram_buffer(output_owner, buffer, size, socket_flags);
+        struct kernel_socket_write_request request = {0};
+        int tcp = kernel_socket_is_tcp(socket), result;
+        if (tcp) kernel_socket_stream_begin(&request, output_owner);
         for (;;) {
-            int result = kernel_socket_write_buffer(socket, buffer, (uint32_t)size, socket_flags);
-            if (result != -KERNEL_EAGAIN || (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) return result;
+            if (tcp) {
+                result = kernel_socket_stream_reserve(&request, (uint32_t)size, socket_flags);
+                if (result > 0) result = kernel_socket_stream_commit(&request, buffer, (uint32_t)result, socket_flags);
+            } else result = kernel_socket_write_packet_buffer(output_owner, buffer, size, socket_flags);
+            if (result != -KERNEL_EAGAIN || (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) break;
             uint64_t now = deadline ? kernel_time_monotonic_ns() : 0;
             int waited = deadline && now >= deadline ? -KERNEL_EAGAIN :
-                socket_wait_ready(output, KERNEL_POLLOUT, deadline, socket_flags);
-            if (waited != 0) return waited;
+                kernel_socket_wait_ready(socket, KERNEL_POLLOUT, deadline, socket_flags);
+            if (waited != 0) { result = waited; break; }
         }
+        if (tcp) kernel_socket_stream_finish(&request);
+        else if (result == -KERNEL_EPIPE && !kernel_socket_is_datagram(socket) &&
+                 !(socket_flags & KERNEL_SOCKET_MSG_NOSIGNAL))
+            (void)kernel_signal_send_task(kernel_task_current(), 13U, 0);
+        return result;
     }
+
     size_t written = 0;
     int error = 0;
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
@@ -1143,7 +1097,7 @@ enum kernel_files_status kernel_files_sendfile(
     struct kernel_files *files, struct kernel_mm *mm, int64_t out_fd,
     int64_t in_fd, uint64_t user_offset, uint64_t count, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_SERVICE_SCOPE_IF(service, 0);
     COST_SCOPE(sendfile_cost, OPERATION_TICKS);
     struct kernel_open_file_description *input = 0, *output = 0;
     int64_t position = 0;
@@ -1163,7 +1117,14 @@ enum kernel_files_status kernel_files_sendfile(
             input->kind == KERNEL_OPEN_FILE_KIND_SOCKET || (input->device && !input->device->positioned))) {
         *linux_result = -KERNEL_ESPIPE; goto done;
     }
-    uint64_t checked_position = user_offset != 0U ? (uint64_t)position : input->offset;
+    uint64_t checked_position = (uint64_t)position;
+    if (!user_offset) {
+        /* Linux checks the input range before looking up out_fd. Snapshot the
+         * shared offset here; sendfile_pinned locks and rechecks before I/O. */
+        KERNEL_LOCK_SCOPE(snapshot);
+        kernel_mutex_lock(&input->offset_lock, &snapshot);
+        checked_position = input->offset;
+    }
     if (position < 0 || count > (uint64_t)INT64_MAX ||
         checked_position > (uint64_t)INT64_MAX - count) {
         *linux_result = -KERNEL_EINVAL; goto done;
@@ -1171,6 +1132,8 @@ enum kernel_files_status kernel_files_sendfile(
     status = kernel_files_pin_data(files, out_fd, &output, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
     if (!description_writable(output)) { *linux_result = -KERNEL_EBADF; goto done; }
+    if (input->kind != KERNEL_OPEN_FILE_KIND_REGULAR || output->kind != KERNEL_OPEN_FILE_KIND_SOCKET)
+        kernel_service_scope_begin(&service);
     /* 两份 pin 由仍会恢复的 syscall 栈持有；退出先唤醒等待，正常展开再交还。 */
     *linux_result = sendfile_pinned(files, mm, input, &output, user_offset != 0U, &position, count);
     if (*linux_result > 0) {
@@ -1353,7 +1316,7 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
             flags|KERNEL_SOCKET_MSG_DONTWAIT,&fault);
         if (result==-KERNEL_EAGAIN && !(flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
             uint64_t now=target?kernel_time_monotonic_ns():0;
-            result=target && now>=target?-KERNEL_EAGAIN:socket_wait_ready(borrowed,
+            result=target && now>=target?-KERNEL_EAGAIN:kernel_socket_wait_ready(kernel_open_file_socket(borrowed),
                 KERNEL_POLLOUT,target,flags);
             if (!result) continue;
             if (total && result==-KERNEL_ERESTARTSYS)
@@ -1498,7 +1461,7 @@ static enum kernel_files_status tcp_write_request(
         if (result == -KERNEL_EAGAIN && !(flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
             if (!total) COST_ADD(STREAM_COPY_BLOCKED_BYTES, copied_now);
             uint64_t now = target ? kernel_time_monotonic_ns() : 0;
-            result = target && now >= target ? -KERNEL_EAGAIN : socket_wait_ready(borrowed,
+            result = target && now >= target ? -KERNEL_EAGAIN : kernel_socket_wait_ready(kernel_open_file_socket(borrowed),
                 KERNEL_POLLOUT, target, flags);
             if (!result) continue; /* gather保留暂存尾部；单iov重新pin未接纳的来源。 */
             if (total && result == -KERNEL_ERESTARTSYS)
@@ -1536,7 +1499,7 @@ static enum kernel_files_status write_request(
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR);
+    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET);
     COST_SCOPE(write_cost, OPERATION_TICKS);
     COST_IO_SCOPE(io_cost,
         kernel_socket_is_datagram(kernel_open_file_socket(description)) ? 2 :
@@ -1605,7 +1568,6 @@ enum kernel_files_status kernel_files_socket_iov_io(
     uint32_t flags, int writing, struct kernel_socket_address *peer,
     uint32_t *message_size, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!kernel_files_is_live(files) || mm == 0 || owner == 0 || *owner == 0 ||
         kernel_open_file_socket(*owner) == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1627,7 +1589,6 @@ enum kernel_files_status kernel_files_socket_io(
     struct kernel_open_file_description **owner, uint64_t user_buffer,
     uint64_t count, uint32_t flags, int writing, int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     const struct kernel_uaccess_iovec iov = {user_buffer, count};
     return kernel_files_socket_iov_io(files, mm, owner, &iov, 1, count, flags, writing, 0, 0, linux_result);
 }
@@ -1776,7 +1737,7 @@ static enum kernel_files_status writev_request(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         account_write(files, *linux_result);

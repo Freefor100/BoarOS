@@ -198,7 +198,7 @@ void ip4_reass_cleanup_netif(struct netif *n) {(void)n;if(!protocol_held || !arc
 void etharp_cleanup_netif(struct netif *n) {(void)n;if(!protocol_held) abort();}
 void netif_set_down(struct netif *n) {(void)n;if(!protocol_held) abort();}
 void netif_remove(struct netif *n) {(void)n;if(!protocol_held) abort();removed++;}
-void kernel_socket_network_hooks(void (*timer)(void *),void (*work)(void *),int (*capacity)(void *),void *context)
+void kernel_socket_network_hooks(void (*timer)(void *),struct kernel_wait_queue *work,int (*capacity)(void *),void *context)
 { if(timer || work || capacity || context || protocol_held || !arch_interrupt_is_enabled()) abort();hook_removed++; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
 {(void)q;if(arch_interrupt_is_enabled()) abort();return KERNEL_SCHEDULER_STATUS_OK;}

@@ -312,6 +312,8 @@ static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_curs
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return kernel_wait_cursor_prepare_locked(queue, cursor, direct_notification);
 }
+int kernel_wait_cursor_prepare(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
+{ return cursor_begin(queue, cursor, 1); }
 void kernel_wait_cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
 { (void)cursor_begin(queue, cursor, 0); }
 void kernel_wait_cursor_advance(struct kernel_wait_cursor *cursor)

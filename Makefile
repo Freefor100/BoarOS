@@ -456,6 +456,7 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
+LDFLAGS += -Wl,--wrap=kernel_socket_reserve_read,--wrap=kernel_socket_stream_reserve,--wrap=kernel_socket_write_datagram,--wrap=kernel_socket_write_unix,--wrap=kernel_socket_wait_ready,--wrap=kernel_socket_service_owned,--wrap=kernel_copy_from_user,--wrap=kernel_wait_cursor_wake,--wrap=kernel_wait_backend_quiesce
 LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot,--wrap=virtio_split_enqueue
 LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_copy_to_user,--wrap=kernel_mm_resolve_user_fault,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
 endif
@@ -2149,10 +2150,10 @@ test-poll-host:
 .PHONY: test-epoll-host test-epoll-riscv
 test-epoll-host:
 	@mkdir -p build/host
-	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 \
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_PAGE_SHIFT=12 \
 		-ffunction-sections -fdata-sections -Wl,--gc-sections \
 		-Itests/host/random -idirafter include -fsanitize=address,undefined \
-		tests/host/epoll_delivery.c -o build/host/epoll-delivery
+		tests/host/epoll_delivery.c kernel/raw_lock.c tests/host/cpu_context.c -Wl,--wrap=kernel_raw_lock_acquire -o build/host/epoll-delivery
 	build/host/epoll-delivery
 test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/epoll-riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
@@ -2252,7 +2253,7 @@ test-sync-host:
 test-file-mapping-concurrency-host:
 	@mkdir -p build/host/mm
 	@set -e; for shift in 12 14; do \
-		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/file_mapping_concurrency.c tests/host/mm/context.c fs/file_mapping.c fs/vfs.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c \
