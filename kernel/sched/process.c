@@ -903,6 +903,9 @@ enum kernel_scheduler_status arch_process_clone_current(
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
+    child->signal_stack = parent->signal_stack;
+    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_VFORK))
+        kernel_signal_stack_reset(child);
     mm_status = kernel_mm_context(&child->mm, &child_context);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(

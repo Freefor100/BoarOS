@@ -127,6 +127,7 @@
 #define LINUX_SYSCALL_KILL 129U
 #define LINUX_SYSCALL_TKILL 130U
 #define LINUX_SYSCALL_TGKILL 131U
+#define LINUX_SYSCALL_SIGALTSTACK 132U
 #define LINUX_SYSCALL_RT_SIGSUSPEND 133U
 #define LINUX_SYSCALL_RT_SIGACTION 134U
 #define LINUX_SYSCALL_RT_SIGPROCMASK 135U
@@ -604,6 +605,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                                &decoded) != KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_SIGALTSTACK) {
+        if (syscall_handle_sigaltstack(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_RT_SIGACTION) {
         if (syscall_handle_rt_sigaction(caller,
                                 request,
