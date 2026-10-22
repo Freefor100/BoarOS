@@ -360,7 +360,7 @@ static enum kernel_files_status read_pinned(
         return status;
     }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
-    if (kind==KERNEL_OPEN_FILE_KIND_EVENTFD) {
+    if ((kind==KERNEL_OPEN_FILE_KIND_EVENTFD || kind==KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         *linux_result=kernel_event_fd_io(description,mm,iov,iov_count,count,0);
         if (*linux_result<0) KERNEL_FILES_NOTE(files,read_failures,1);
         else KERNEL_FILES_NOTE(files,bytes_read,(uint64_t)*linux_result);
@@ -646,14 +646,14 @@ static enum kernel_files_status readv_request(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
     if (positioned && ((description->device && !description->device->positioned) ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
         *linux_result = -KERNEL_ESPIPE;
@@ -748,7 +748,7 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD);
     uint64_t position;
     uint64_t request;
     uint64_t file_size;
@@ -777,7 +777,7 @@ static enum kernel_files_status pread_iov_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if ((description->device && !description->device->positioned) ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
@@ -875,7 +875,7 @@ static int description_writable(
         return access_mode != 0U;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD) {
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         return access_mode == 2U;
     }
     if (description->device) {
@@ -1506,7 +1506,7 @@ static enum kernel_files_status write_request(
     if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
         count, 1, positioned, requested_offset, linux_result);
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
-    if (kind==KERNEL_OPEN_FILE_KIND_EVENTFD) {
+    if ((kind==KERNEL_OPEN_FILE_KIND_EVENTFD || kind==KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         *linux_result=kernel_event_fd_io(description,mm,iov,iov_count,count,1);
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1752,7 +1752,7 @@ static enum kernel_files_status writev_request(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         account_write(files, *linux_result);
@@ -1760,7 +1760,7 @@ static enum kernel_files_status writev_request(
                                       KERNEL_FILES_STATUS_OK);
     }
     if (positioned && ((description->device && !description->device->positioned) ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD ||
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
         *linux_result = -KERNEL_ESPIPE;
@@ -1849,7 +1849,7 @@ static enum kernel_files_status lseek_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD) {
+        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         *linux_result = (int64_t)kernel_open_file_offset(description);
         return KERNEL_FILES_STATUS_OK;
     }

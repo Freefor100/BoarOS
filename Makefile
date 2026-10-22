@@ -2592,3 +2592,14 @@ test-service-scope-host:
 	  cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=$$mode -idirafter include tests/host/service_scope.c -o build/host/scope/service-$$mode || exit; \
 	  build/host/scope/service-$$mode || exit; \
 	done
+
+.PHONY: test-event-fd-host
+test-event-fd-host:
+	@mkdir -p build/host/event-fd
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread \
+		-DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_MAX_CPUS=2 \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections -Itests/host/random -idirafter include \
+		-fsanitize=address,undefined tests/host/event_fd.c kernel/raw_lock.c tests/host/cpu_context.c \
+		-o build/host/event-fd/cases-$$shift; \
+	build/host/event-fd/cases-$$shift; done

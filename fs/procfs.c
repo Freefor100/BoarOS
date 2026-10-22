@@ -558,15 +558,17 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "anon_inode:[eventpoll]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_EVENTFD)
                 prefix = "anon_inode:[eventfd]";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_TIMERFD)
+                prefix = "anon_inode:[timerfd]";
             else prefix = 0;
-            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD &&
+            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD &&
                             !identity)) result = -KERNEL_ENOENT;
             else {
                 char display[64];
                 prefix_length = strlen(prefix);
                 memcpy(display, prefix, prefix_length);
                 size_t length = prefix_length;
-                if (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD) {
+                if (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD) {
                     length += decimal(display + length, identity);
                     display[length++] = ']';
                 }
