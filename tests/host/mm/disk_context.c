@@ -1,6 +1,7 @@
 /* 宿主只提供线程执行、时钟与未开放消费者；缓存/VFS/后端均链接生产代码。 */
 #include <kernel/scheduler.h>
 #include <kernel/cpu.h>
+#include <kernel/time.h>
 #include "../../../mm/uaccess_internal.h"
 #include <pthread.h>
 #include <stdlib.h>
@@ -61,12 +62,16 @@ void kernel_thread_yield(void) { sched_yield(); }
 enum kernel_scheduler_status kernel_scheduler_yield_current(void)
 { if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
   sched_yield(); return KERNEL_SCHEDULER_STATUS_OK; }
-int kernel_time_is_initialized(void) { return 1; }
+uint32_t kernel_time_is_initialized(void) { return 1; }
 uint64_t kernel_time_monotonic_ns(void)
 {
     struct timespec t; if (clock_gettime(CLOCK_MONOTONIC, &t)) abort();
     return (uint64_t)t.tv_sec * 1000000000U + t.tv_nsec;
 }
+#if defined(FILES_PIPE_CASES) && !defined(FILE_IO_CASES)
+enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)
+{ *deadline=ns;return KERNEL_TIME_STATUS_OK; }
+#endif
 /* The host deadline model uses nanoseconds as its architecture tick unit. */
 uint64_t riscv_time_read(void) { return kernel_time_monotonic_ns(); }
 uint64_t kernel_time_realtime_ns(void)

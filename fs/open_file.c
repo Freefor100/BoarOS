@@ -620,11 +620,9 @@ static int close_is_local(const struct kernel_open_file_description *file)
         (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR || file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ||
          file->kind==KERNEL_OPEN_FILE_KIND_PATH) && !file->ep_items && !file->device_opened &&
         !file->record_locks && !file->generated_ready) return 1;
-    /* 普通用户pipe的另一端可以登记epoll，最后关闭须在CPU0通知。
-     * 受控内核pipe消费者在创建时已排除协议观察者，端点结束必须
-     * 就地唤醒其普通等待者，不能把EOF推迟到等待双方退出后的清理。 */
-    return !kernel_task_has_user_context(kernel_task_current()) &&
-        file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe && !file->pipe->fifo_node &&
+    /* 无观察者的匿名端点由最后OFD owner就地结束，通知和等待借用
+     * 沿管道短保护归还；有epoll登记或FIFO节点时继续走所属清理路径。 */
+    return file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe && !file->pipe->fifo_node &&
         !file->file.private_data && !file->ep_items && !file->device_opened &&
         !file->record_locks && !file->generated_ready;
 }

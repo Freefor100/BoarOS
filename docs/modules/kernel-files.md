@@ -102,6 +102,8 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 ## `pipe2` 与 FIFO endpoint
 
+普通用户的匿名管道、已打开FIFO读写及普通文件到管道的sendfile在发起CPU执行，复用下述片段、读写资格和端点短保护。没有附加观察者的匿名管道末OFD在调用者结束端点并通知；存在epoll登记或FIFO inode时仍沿CPU0完成关联清理。pipe2创建和FIFO路径打开沿原CPU0执行位置。
+
 `kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享16个片段槽；各槽在写入时按需取得一张独立目标页，不要求连续物理区间。空 pipe 只分配对象元数据，最大数据容量仍为16个目标页（RV64KiB、LA256KiB）。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
 读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。

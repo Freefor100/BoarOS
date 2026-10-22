@@ -15,6 +15,9 @@ static _Thread_local unsigned actor_id;
 static _Thread_local struct kernel_mm *bound_mm;
 static _Thread_local struct kernel_files *bound_files;
 #endif
+#if defined(FILES_PIPE_CASES) && !defined(FILE_IO_CASES)
+struct kernel_scheduler scheduler={.initialized=KERNEL_SCHEDULER_INITIALIZED};
+#endif
 #ifdef FILE_IO_CASES
 static _Thread_local int force_task;
 struct kernel_scheduler scheduler={.initialized=KERNEL_SCHEDULER_INITIALIZED};
