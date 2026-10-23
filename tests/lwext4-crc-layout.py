@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep hot checksum and buffer-return paths within a translated code page."""
+"""Keep hot RISC-V kernel paths within a translated code page."""
 import argparse
 import subprocess
 
@@ -8,7 +8,8 @@ parser.add_argument('kernel')
 parser.add_argument('--nm', default='riscv64-elf-nm')
 args = parser.parse_args()
 symbols = subprocess.check_output([args.nm, '-S', '--defined-only', args.kernel], text=True)
-for name, alignment in [('crc32c', 2048), ('put_buffer', 1024), ('memcpy', 1024), ('memmove', 2048)]:
+for name, alignment in [('crc32c', 2048), ('put_buffer', 1024), ('memcpy', 1024), ('memmove', 2048),
+                        ('kernel_syscall_dispatch', 4096)]:
     matches = [line.split() for line in symbols.splitlines() if line.split()[-1:] == [name]]
     if len(matches) != 1:
         raise SystemExit(f'expected one {name} function')
