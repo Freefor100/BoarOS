@@ -44,6 +44,25 @@ static unsigned action_phase;
 static _Thread_local unsigned pause_selection;
 static struct kernel_task *action_target;
 static struct kernel_cpu action_cpu;
+static struct signal_queue_record native_record;
+static struct kernel_signal_wait_info *native_output;
+static unsigned native_stale, native_completions, queue_allocations;
+static struct kernel_heap queue_heap;
+
+/* Exercise the selector's output lifetime. Timer reservation/generation and
+ * object ownership use the real implementation in test-posix-timer-host. */
+int posix_timer_record_take_locked(struct signal_queue_record *record,
+    struct kernel_signal_wait_info *info,struct signal_pending_prepared *p)
+{
+    assert(record==&native_record && kernel_cpu_current()->raw_locks && !native_output);
+    if(native_stale){info->signal=0;return 0;}
+    native_output=info;record->next=p->completed;p->completed=record;return 1;
+}
+void posix_timer_record_complete(struct signal_queue_record *record)
+{
+    assert(record==&native_record && native_output && !kernel_cpu_current()->raw_locks);
+    native_output->uid=37;native_output=0;native_completions++;
+}
 
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
@@ -83,6 +102,51 @@ static void selected_action_snapshot(struct kernel_task *task,struct kernel_sign
     assert(table->actions[16].handler==0x2000 && table->actions[16].flags==LINUX_SA_NODEFER);
     assert(!task->group_pending && !current->raw_locks && !action_cpu.raw_locks);
     puts("signal selection keeps the committed action/mask snapshot; later replacement survives SA_RESETHAND");
+}
+static void selected_payloads(struct kernel_task *task,struct kernel_signal_table *table)
+{
+    struct kernel_signal_delivery delivery;
+    struct kernel_signal_wait_info expected;
+    table->actions[10]=(struct kernel_signal_action){.handler=0x1000};
+    task->signal_blocked=0;
+    memset(&delivery,0xa5,sizeof(delivery));
+    kernel_signal_force_fault(task,11,2,UINT64_C(0x123456789));
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
+    memset(&expected,0,sizeof(expected));expected.signal=11;expected.code=2;expected.address=UINT64_C(0x123456789);
+    assert(!memcmp(&delivery.info,&expected,sizeof(expected)) && !task->signal_fault.signal);
+
+    struct signal_pending_prepared p={0};
+    signal_pending_prepare_index(task,1,&queue_heap,&p);
+    assert(p.index && queue_allocations==1);
+    native_record=(struct signal_queue_record){.info={.signal=10,.code=-2,.sender=7,.value=UINT64_C(0x1234567887654321)},
+        .timer=(struct kernel_posix_timer *)&native_record};
+    table->actions[9]=(struct kernel_signal_action){.handler=0x3000};
+    task->signal_blocked=0;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);signal_pending_install_index_locked(task,1,&p);signal_pending_post_timer_locked(task,1,&native_record);}
+    signal_pending_finish(&p);
+    memset(&delivery,0xa5,sizeof(delivery));
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
+    expected=native_record.info;expected.uid=37;
+    assert(!memcmp(&delivery.info,&expected,sizeof(expected)) && delivery.handler==0x3000);
+    assert(native_completions==1 && !native_output && !task->group_pending);
+
+    native_stale=1;task->signal_blocked=0;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);signal_pending_post_timer_locked(task,1,&native_record);}
+    task->group_pending|=signal_mask(17);
+    table->actions[16]=(struct kernel_signal_action){.handler=0x4000};
+    memset(&delivery,0xa5,sizeof(delivery));
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
+    memset(&expected,0,sizeof(expected));expected.signal=17;
+    expected.sender=task->group_sender[16];expected.code=task->group_signal_code[16];
+    expected.uid=task->group_child_info.uid;expected.status=task->group_child_info.status;
+    expected.user_time=task->group_child_times[0];expected.system_time=task->group_child_times[1];
+    assert(!memcmp(&delivery.info,&expected,sizeof(expected)) && delivery.handler==0x4000);
+    assert(native_completions==1 && !native_output && !task->group_pending);
+    native_stale=0;
+    unsigned members=task->group_members;task->group_members=1;
+    kernel_signal_pending_cleanup(task);task->group_members=members;
+    assert(!queue_allocations);
+    puts("signal selection publishes complete fault/native payloads and skips stale records before the next handler");
 }
 void signal_owner_cases(unsigned *lock_calls)
 {
@@ -139,6 +203,7 @@ void signal_owner_cases(unsigned *lock_calls)
     uint64_t address;memcpy(&address,encoded+16,8);assert(address==UINT64_C(0x123456789));
     assert(!kernel_signal_wait_take(&leader,&info) && !info.signal);
     selected_action_snapshot(&leader,&table);
+    selected_payloads(&leader,&table);
     kernel_cpu_current()->current=previous;
     puts("SIGCHLD: blocked default stop policy, protected pending payload and common ABI encoding passed");
     /* The caller's real target owner already covers a self-representing
@@ -171,9 +236,10 @@ void signal_owner_cases(unsigned *lock_calls)
     puts("signal target selector: direct leader, dead leader fallback and unique borrow passed");
 }
 
-/* These standard-signal models never allocate queued payloads. Real queue
- * allocation, quota and retirement run in signal_pending.c's focused suite. */
+/* Only selected_payloads installs a native queue index. */
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
-{ (void)h;(void)n;(void)size;(void)out;abort(); }
+{ assert(h==&queue_heap && !queue_allocations && !kernel_cpu_current()->raw_locks);
+  *out=calloc(n,size);assert(*out);queue_allocations++;return KERNEL_HEAP_STATUS_OK; }
 void kernel_heap_release(struct kernel_heap *h,void *p)
-{ (void)h;(void)p;abort(); }
+{ assert(h==&queue_heap && queue_allocations==1 && p && !kernel_cpu_current()->raw_locks);
+  free(p);queue_allocations--; }

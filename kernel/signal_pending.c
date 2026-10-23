@@ -118,7 +118,6 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
 {
     struct kernel_signal_pending_state *s=state(t,shared);uint64_t bit=UINT64_C(1)<<(sig-1);
     if(!(*bits(t,shared)&bit))__builtin_trap();
-    memset(out,0,sizeof(*out));out->signal=sig;
     if(s->queue && !(s->queue->inline_pending&bit) && s->queue->slots[sig-1].head) {
         struct signal_queue_record *record=s->queue->slots[sig-1].head;
         *out=record->info;s->queue->slots[sig-1].head=record->next;
@@ -135,6 +134,7 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
         }
         if(s->queue->slots[sig-1].head)return;
     } else {
+        memset(out,0,sizeof(*out));out->signal=sig;
         if(s->queue)s->queue->inline_pending&=~bit;
         out->sender=shared?t->group_sender[sig-1]:t->signal_sender[sig-1];
         out->code=shared?t->group_signal_code[sig-1]:t->signal_code[sig-1];

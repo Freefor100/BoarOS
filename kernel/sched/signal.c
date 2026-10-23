@@ -1693,7 +1693,7 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
     do {
         struct kernel_task *leader;
         struct kernel_signal_fault fault;
-        struct kernel_signal_wait_info info = {0};
+        struct kernel_signal_wait_info *info = &delivery->info;
         uint64_t pending;
         int shared = 0;
         int needs_service=0;
@@ -1726,16 +1726,15 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
                 } else {
                     if(fault.signal) {
                         task->signal_fault=(struct kernel_signal_fault){0};
-                        info.signal=sig;info.code=fault.code;info.address=fault.address;
-                    } else signal_pending_take_locked(shared?leader:task,shared,sig,&info,&p);
-                    if (info.signal && action.handler!=KERNEL_SIGNAL_DFL && action.handler!=KERNEL_SIGNAL_IGN) {
+                        *info=(struct kernel_signal_wait_info){.signal=sig,.code=fault.code,.address=fault.address};
+                    } else signal_pending_take_locked(shared?leader:task,shared,sig,info,&p);
+                    if (info->signal && action.handler!=KERNEL_SIGNAL_DFL && action.handler!=KERNEL_SIGNAL_IGN) {
                         /* pending、disposition、mask和RESETHAND在同一次选择中提交。
-                         * 解锁后构帧仅借用本线程快照，不再读取共享action指针。 */
-                        *delivery=(struct kernel_signal_delivery){
-                            .info=info,
-                            .handler=action.handler,.flags=action.flags,
-                            .restore_mask=task->signal_restore_mask ? task->signal_saved_mask : task->signal_blocked,
-                        };
+                         * 直接写入本线程delivery，原生定时器完成也更新同一载荷；
+                         * 解锁后构帧不再读取共享action指针。 */
+                        delivery->handler=action.handler;
+                        delivery->flags=action.flags;
+                        delivery->restore_mask=task->signal_restore_mask ? task->signal_saved_mask : task->signal_blocked;
                         task->signal_restore_mask=0;
                         retarget=signal_set_blocked_locked(task,task->signal_blocked | action.mask |
                                                            ((action.flags & LINUX_SA_NODEFER) ? 0 : signal_mask(sig)));
@@ -1749,10 +1748,8 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
             kernel_service_scope_begin(&return_service);
             continue;
         }
-        int native=p.completed!=0;
         signal_pending_finish(&p);
-        if(pending&&!info.signal)continue;
-        if(native&&action.handler!=KERNEL_SIGNAL_DFL&&action.handler!=KERNEL_SIGNAL_IGN)delivery->info=info;
+        if(pending&&!info->signal)continue;
         signal_retarget_shared(task,retarget);
         if (shared && sig == 14) real_timer_rearm(leader);
         if (pending == 0U) {
