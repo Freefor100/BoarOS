@@ -5,6 +5,10 @@
 [兼容模块](../modules/oscomp-compat.md)。
 发布程序、调用方式、版本预期与判分差异集中见[评测问题](oscomp-test-issues.md)。
 
+当前已集成2026年10月23日的共同I/O、proc索引、最终对象access检查与网络协议CPU0资格修复。机制、两架构短例及12次正式／4次补充成本结果见[共同成本记录](cpu-accounting-cost.md)中的“共同 I/O、proc 索引与协议执行资格整理”。proc枚举的重复全任务扫描已经消除；UP signalfd回退的原因仍待定位，向量I/O暂未显示明确吞吐收益。
+
+集成后默认`make all`生成`kernel-rv`、`kernel-la`、`disk.img`及`disk-la.img`；两张第二盘均为2304MiB，工具／VFAT／scratch三分区布局保持既定值，六个分区的e2fsck或fsck.fat均返回0，两架构具有独立的新启动种子。原评测输入、默认单核、跳过表及监督配置沿用现状；原程序得分继续按各次实际运行记录读取。
+
 ## 2026-10-17 CPU0 存储分批与同步等待集成
 
 从 main `ad4d546` 单向集成范围写回的队尾续批、调用者持久化等待和有界退休清理，
