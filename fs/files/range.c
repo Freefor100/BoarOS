@@ -2,6 +2,7 @@
 #include "../open_file_internal.h"
 #include "../vfs_internal.h"
 #include <kernel/cpu.h>
+#include <kernel/credentials.h>
 #include <kernel/errno.h>
 #include <kernel/page_cache.h>
 #include <kernel/scheduler.h>
@@ -10,6 +11,7 @@
 #include <arch/platform_io.h>
 
 struct fallocate_call {
+    const struct kernel_credentials *credentials;
     struct kernel_vfs_file *file;
     const struct kernel_lock_guard *operation;
     struct kernel_vfs_size_limit *size_limit;
@@ -20,8 +22,10 @@ struct fallocate_call {
 static void fallocate_cpu0(void *argument)
 {
     struct fallocate_call *call = argument;
+    const struct kernel_credentials *previous=kernel_credentials_override(call->credentials);
     call->result = kernel_vfs_fallocate_borrowing(call->file,call->mode,
         call->offset,call->length,call->operation,call->size_limit);
+    (void)kernel_credentials_override(previous);
 }
 
 enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
@@ -55,7 +59,7 @@ enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
             !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return KERNEL_FILES_STATUS_STATE;
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&file->file,&operation);
-        struct fallocate_call call = {.file=&file->file,.operation=&operation,
+        struct fallocate_call call = {.credentials=kernel_credentials_current(),.file=&file->file,.operation=&operation,
             .offset=(uint64_t)offset,.length=(uint64_t)length,.mode=mode,.result=-KERNEL_EIO,.size_limit=&limit};
         if (kernel_page_cache_run_cpu0_borrowing(kernel_open_file_page_cache(file),
                 fallocate_cpu0,&call,&operation)) return KERNEL_FILES_STATUS_STATE;

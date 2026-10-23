@@ -63,6 +63,7 @@ struct lwext4_node {
     uint8_t noatime;
     uint8_t write_completion;
 
+    uint8_t capability_absent; /* No user xattr writer exists; cleared only by offline remount. */
 };
 _Static_assert(offsetof(struct lwext4_mount_adapter, instance) == 0,
                "mount private_data begins with its VFS instance");

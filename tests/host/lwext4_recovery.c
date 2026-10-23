@@ -80,13 +80,13 @@ static void shrink_regrow(struct ext4_fs *fs)
             CHECK(removed == ino && orphan);
         }
         CHECK(ext4_transaction_begin("/") == EOK);
-        CHECK(ext4_ftruncate(&file, keep) == EOK);
+        CHECK(ext4_ftruncate(&file, keep, UINT32_MAX) == EOK);
         if (!nested) CHECK(ext4_transaction_end("/") == EOK);
         size_t end = original + 7;
         if (writing) {
             CHECK(ext4_fseek(&file, (int64_t)end - 3, SEEK_SET) == EOK);
             CHECK(ext4_fwrite(&file, "new", 3, &count) == EOK && count == 3);
-        } else CHECK(ext4_ftruncate(&file, end) == EOK);
+        } else CHECK(ext4_ftruncate(&file, end, UINT32_MAX) == EOK);
         if (nested) CHECK(ext4_transaction_end("/") == EOK);
         CHECK(ext4_fseek(&file, 0, SEEK_SET) == EOK);
         CHECK(ext4_fread(&file, bytes, end, &count) == EOK && count == end);
@@ -116,7 +116,7 @@ static void shrink_regrow_oom(struct ext4_fs *fs, bool nested, unsigned fail)
     CHECK(ext4_fopen(&file, "/resize", "w+") == EOK);
     CHECK(ext4_fwrite(&file, bytes, original, &count) == EOK && count == original);
     CHECK(ext4_transaction_begin("/") == EOK);
-    CHECK(ext4_ftruncate(&file, 7) == EOK);
+    CHECK(ext4_ftruncate(&file, 7, UINT32_MAX) == EOK);
     if (!nested) CHECK(ext4_transaction_end("/") == EOK);
     CHECK(ext4_fseek(&file, (int64_t)original + 4, SEEK_SET) == EOK);
     allocations = 0;
@@ -139,7 +139,7 @@ static void shrink_regrow_oom(struct ext4_fs *fs, bool nested, unsigned fail)
             CHECK(ext4_fsize(&file) == original);
             CHECK(ext4_fread(&file, bytes, original, &count) == EOK && count == original);
             for (size_t i = 0; i < original; i++) CHECK(bytes[i] == 0x5a);
-            CHECK(ext4_ftruncate(&file, 7) == EOK);
+            CHECK(ext4_ftruncate(&file, 7, UINT32_MAX) == EOK);
         } else CHECK(count == 0 && ext4_fsize(&file) == 7);
         CHECK(ext4_fseek(&file, (int64_t)original + 4, SEEK_SET) == EOK);
         CHECK(ext4_fwrite(&file, "new", 3, &count) == EOK && count == 3);

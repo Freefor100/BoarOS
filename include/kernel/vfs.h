@@ -29,14 +29,11 @@ struct kernel_vfs_size_limit {
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
-/* 固定 root 的 chown 规则；目录保留 set-ID，非执行组的 setgid 保留。 */
-static inline uint32_t kernel_vfs_chown_mode(uint32_t mode)
-{
-    if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) return mode;
-    mode &= ~04000U;
-    if (mode & KERNEL_VFS_S_IXGRP) mode &= ~02000U;
-    return mode;
-}
+/* Attribute decisions are shared by filesystem inodes and anonymous pipes. */
+int kernel_vfs_chmod_allowed(uint32_t owner, uint32_t group, uint32_t *mode);
+int kernel_vfs_chown_allowed(uint32_t owner, uint32_t group, uint32_t mode, uint32_t uid, uint32_t gid);
+uint32_t kernel_vfs_chown_mode(uint32_t mode, uint32_t old_gid, uint32_t new_gid);
+uint32_t kernel_vfs_write_mode(uint32_t mode, uint32_t gid);
 
 uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
@@ -56,6 +53,7 @@ struct kernel_vfs_mount {
     const char *source_name; /* Borrowed from the mount owner. */
     /* Optional owner release, invoked only after backend teardown succeeds. */
     void (*release_owner)(struct kernel_vfs_mount *mount);
+    uint8_t nosuid;
 };
 
 /* Attachment transfers owned root/covered-path references to the tree.
@@ -160,8 +158,24 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_EXCLUSIVE = 1U << 2,
     KERNEL_VFS_OPEN_EXECUTABLE = 1U << 3,
     KERNEL_VFS_OPEN_PATH_ONLY = 1U << 4,
+    KERNEL_VFS_OPEN_DIRECTORY = 1U << 5,
 };
-struct kernel_vfs_open_request { unsigned flags; uint32_t mode; };
+struct kernel_vfs_open_request { unsigned flags; uint32_t mode; unsigned access; };
+#define KERNEL_VFS_MAY_EXEC 1U
+#define KERNEL_VFS_MAY_WRITE 2U
+#define KERNEL_VFS_MAY_READ 4U
+int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access);
+struct kernel_credentials;
+int kernel_vfs_dac_permission(uint32_t mode,uint32_t uid,uint32_t gid,
+    unsigned access,const struct kernel_credentials *credentials);
+struct kernel_vfs_exec_metadata {
+    uint32_t mode, uid, gid;
+    uint8_t filecap[24];
+    size_t filecap_size;
+    int filecap_present, nosuid, readable;
+};
+int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,
+    struct kernel_vfs_exec_metadata *metadata, int read_filecap);
 /* One lookup yields an existing identity or its held parent and missing name.
  * FOLLOW is explicit: syscall O_EXCL omits it; strict VFS create may follow.
  * created reports an actual filesystem creation, independently of OFD setup. */
@@ -198,7 +212,7 @@ int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
 int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat);
-/* F_OK/X_OK/W_OK/R_OK in the current root credential model. */
+/* access uses real IDs and its Linux capability selection during the walk. */
 int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          unsigned mode);
@@ -392,12 +406,5 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
 /* 已持有 node 的调用者可取得独立引用，跨关闭或撤映射保持 inode 身份。 */
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
-
-struct kernel_vfs_exec_metadata {
-    uint32_t mode, uid, gid;
-    uint8_t filecap[24];
-    size_t filecap_size;
-    int filecap_present, nosuid, readable;
-};
 
 #endif

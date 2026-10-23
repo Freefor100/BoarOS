@@ -68,7 +68,7 @@ uint64_t kernel_time_monotonic_ns(void)
     struct timespec t; if (clock_gettime(CLOCK_MONOTONIC, &t)) abort();
     return (uint64_t)t.tv_sec * 1000000000U + t.tv_nsec;
 }
-#if defined(FILES_PIPE_CASES) && !defined(FILE_IO_CASES)
+#if defined(FILES_PIPE_CASES) && !defined(FILE_IO_CASES) && !defined(CACHE_MM_CASES)
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)
 { *deadline=ns;return KERNEL_TIME_STATUS_OK; }
 #endif

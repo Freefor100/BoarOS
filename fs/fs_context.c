@@ -2,6 +2,7 @@
 #include <kernel/errno.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
+#include <kernel/task.h>
 #include <kernel/mm.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -14,6 +15,7 @@ struct kernel_fs_context_record {
     struct kernel_vfs_path *cwd;
     uint32_t umask;
     uint32_t references;
+    uint32_t exec_users;
 };
 
 static int empty_context(const struct kernel_fs_context *fs)
@@ -125,6 +127,7 @@ enum kernel_fs_context_status kernel_fs_context_acquire(
         source->record->references == UINT32_MAX) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
+    if (source->record->exec_users) return KERNEL_FS_CONTEXT_STATUS_BUSY;
     source->record->references++;
     destination->heap = source->heap;
     destination->record = source->record;
@@ -152,6 +155,24 @@ enum kernel_fs_context_status kernel_fs_context_fork(
             __builtin_trap();
     }
     return create_context(destination, paths.root, paths.cwd, 0, heap, paths.umask);
+}
+
+int kernel_fs_context_exec_begin(const struct kernel_fs_context *fs, struct kernel_task *task)
+{
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (!kernel_fs_context_is_live(fs)) __builtin_trap();
+    unsigned local = kernel_task_fs_group_users(task, fs->record);
+    if (fs->record->references > local) return 1;
+    if (fs->record->exec_users == UINT32_MAX) __builtin_trap();
+    ++fs->record->exec_users;
+    return 0;
+}
+
+void kernel_fs_context_exec_end(const struct kernel_fs_context *fs)
+{
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (!kernel_fs_context_is_live(fs) || !fs->record->exec_users) __builtin_trap();
+    --fs->record->exec_users;
 }
 
 enum kernel_fs_context_status kernel_fs_context_move(
@@ -197,6 +218,8 @@ int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
     if (result) return result;
     if ((stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_ENOTDIR;
+    result = kernel_vfs_path_permission(path,KERNEL_VFS_MAY_EXEC);
+    if (result) return result;
     result = kernel_vfs_path_acquire(path);
     if (result) return result;
     struct kernel_vfs_path *previous;

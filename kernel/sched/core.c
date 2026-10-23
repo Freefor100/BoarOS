@@ -23,6 +23,7 @@
 
 #include "../exec_internal.h"
 #include "private.h"
+#include <kernel/credentials.h>
 
 /* 链接器将CPU控制、调度锁和调度器前缀集中在一页，减少普通入口触达的静态页。 */
 struct kernel_scheduler scheduler __attribute__((section(".bss.scheduler.state")));
@@ -688,6 +689,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
         thread->stack_high = (uintptr_t)stack + KERNEL_STACK_BYTES;
     }
     thread->arch.kernel_sp = thread->stack_high;
+    thread->credentials = kernel_credentials_get(kernel_credentials_initial());
     *(uint64_t *)(thread->stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
     *task = thread;
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -1256,6 +1258,12 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->exec_transaction = 0;
     kernel_wait_queue_init(&thread->child_exit_queue);
     kernel_wait_queue_init(&thread->vfork_done_queue);
+
+    thread->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1U);
+    if(!thread->exec_security){
+        status=release_task_storage(thread,KERNEL_SCHEDULER_STATUS_NO_MEMORY);
+        goto restore_interrupts;
+    }
 
     frame = (struct arch_trap_frame *)(thread->stack_high -
                                         sizeof(*frame));

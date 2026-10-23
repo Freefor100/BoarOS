@@ -44,13 +44,13 @@
 `reopen_link`；VFS 只核对链接类型和保留解析后的节点引用，后端在文件层
 创建新的 OFD。其他后端未实现该回调时返回 `ENOTSUP`，不根据展示文本
 猜测 pseudo 对象。
-跟随式 `stat` 与 `access` 共用最终对象解析和属性读取；普通路径只解析一次，
-最终路径引用覆盖属性读取和访问检查。root 身份对非目录的执行请求要求至少
-一个执行位，再对普通文件和目录的写请求检查最终目标挂载是否只读，保留
-`EACCES` 先于 `EROFS` 的顺序。若最终链接没有可解析的路径，可调用后端
-`stat_link` 取得被链接对象的元数据；访问检查不把链接所在挂载当作无路径
-对象的目标挂载。普通路径与悬空链接继续沿原解析结果返回。proc fd
-的伪对象回调只在短关中断区内取得当前槽的元数据，不分配、不等待。
+路径解析在每个父目录检查搜索权限，最终打开按请求中的读、写或执行意图检查目标；设备打开和 FIFO 等待发生在检查之后。活 inode 保存 `{mode, uid, gid}`，ext4 在已经进行的 inode 读取中一并填入，后续 chmod/chown 与路径操作共用 namespace 资格，再在 inode 写资格下检查并发布属性。目录查找不为权限重新执行完整 stat。proc 的动态所属身份由后端生成权限快照。
+
+普通操作使用调用者 fsuid/fsgid、补充组及 capability；access 在整个路径查找期间使用真实 UID/GID，并按 securebits 选择有效 capability。DAC_OVERRIDE 允许越过读写或目录搜索位；非目录执行仍要求至少一个执行位。DAC_READ_SEARCH 只越过读取和目录搜索。access 的权限错误先于最终挂载只读错误；普通打开保持其 inode_permission 顺序。O_PATH 检查祖先搜索而不检查目标读写，实际创建的 mode=000 文件仍可由这次打开使用。已打开 FD 的正常读写保留打开权利，属性修改检查当前操作者。
+
+创建在 tmpfs 目录发布或 ext4 创建事务中设置调用者 fsuid/fsgid；SGID 父目录决定子项 group，子目录继承 SGID。删除和改名同时检查父目录写入/搜索及 sticky 所有者规则。sticky 源/替换对象的身份在实际 inode 资格内核对，避免在 chown 与删除之间使用过期所有者。读写请求交给现有 worker 时同步借用原调用者凭据，后台写回只处理已接纳数据。
+
+跟随式 stat 与 access 共用最终解析结果。无路径的 proc FD 链接通过 stat_link 取得实际对象属性，其访问判断不使用链接所在挂载代替目标。普通路径和悬空链接保留实际查找错误。
 
 root/cwd 由共享 FS 记录持有；路径使用者取得带引用的成对快照，快照覆盖路径解析、等待和用户结果准备。同一次操作解析起点和绝对路径根共用这一对快照，起点助手直接借用它，不再次采样共享 cwd。空路径的 fd 属性查询直接借用 OFD，跳过无用的路径快照。元数据查询在填充内核 stat 时按实际后端选择执行位置，归还执行范围后再复制用户结果；不再通过旧页缓存回调重复递送同一次查询。`CLONE_FS` 共享记录中的 cwd 更新，各任务的 FS 外壳仍由其执行者持有。外壳的存活查询直接检查状态，读取记录及取得引用时才使用状态保护。fork 复制路径引用；上下文移动、退出与快照发布使用同一 VFS 状态短保护。存活路径按父路径身份和规范名称建立索引，rename 在目录事务成功后同步移动索引及父引用。最后引用先摘除弱索引，再在保护外关闭后端和归还存储。短保护内仅操作索引、引用、挂载连接及有长度上限的路径文本快照。路径入口借用调用者覆盖整次调用的引用，解析结果和新打开文件各自取得独立引用；入口不再叠加相同寿命的临时引用。可变父边的使用者在状态保护内同时读取父对象并取得引用，ptmx 查找同级 pts 时也遵循这一规则。
 
@@ -96,10 +96,10 @@ ext4 目录并行检查。`tests/namespace-parallel-host.sh` 检查共享身份�
 检查实际块组资格及单方 abort 后的引用数。runner 支持 4/16 KiB 页及通过
 `FILE_IO_HOST_BLOCK_SIZE` 选择 1/4 KiB 文件系统块，每张正常卸载镜像随后运行 e2fsck。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
-已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
-卸载恢复均有真实 U-mode 验证。`kernel/syscall/mount.c` 当前只接受这两个 mount
+已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通挂载、`MS_RDONLY`、`MS_NOSUID`、`MS_SILENT`、同点覆盖、cwd 忙引用与
+卸载恢复均有真实 U-mode 验证。`kernel/syscall/mount.c` 当前接受上述 mount
 flags 和 flags=0 的 `umount2`；其他 flags 返回 `ENOTSUP`。bind/rbind、remount、
-move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/expire/nofollow
+move、传播、noexec/nodev 等其他挂载属性，以及 lazy/force/expire/nofollow
 卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 普通卸载当前针对非根挂载；绝对根挂载没有 parent/covered 边，用户态
 `umount2("/", 0)` 返回 `EINVAL`。固定 Linux 对该情形尝试只读重配置，
@@ -251,7 +251,7 @@ lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入�
 
 ## lwext4 配置和生命周期
 
-内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
+内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供exec读取及写入／chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。用户xattr修改和ACL syscall另列能力缺口。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
 
 事务接口 `ext4_transaction_begin/end/abort` 按实际任务的 `kernel_io_context` 查找当前文件系统的操作上下文。同任务、同挂载的嵌套修改共用这份上下文，前台任务及后台 worker 各自持有操作；挂载维护活动操作数。前台 file/path 引用覆盖事务控制分配至接纳或撤销，挂载管理排空这些使用者后停止日志。上下文在 journal transaction 中提供存储，无 journal 时由最外层操作单独持有。内部 `serial_writer` 查询核对实际 backend 写 guard、当前 owner 和串行锁 writer；不根据 CPU 数推断资格。私有访问持有自己的 after 镜像，原值默认借用第一份已接纳 payload；后来初始化的记录需要不同原值时，才准备独立 before 镜像。修改结束先去除未修改视图，再在一次挂载状态保护内借用实际修改集合的 LBA 索引并预留日志环额度；缺少的索引候选在保护外分配。索引借用覆盖准备至接纳或撤销，payload 独立覆盖实际读者。checkpoint 可在准备前退休旧索引；准备后有借用的空记录保留，接纳先关联新事务，最后借用归还且已无 dirty/checkpoint 使用者时释放。superblock 的计数和 orphan 变化按具体字段合并，其他同块字节检查版本冲突。
 
@@ -341,7 +341,7 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先在操作中登记最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。意图与回收可以合入同一运行组，也可以按 journal FIFO 跨组提交；普通 truncate/unlink 仅在真实预算、日志空间或复用压力下等待 checkpoint，释放范围继续由 quarantine 保留。无 orphan 的新建、同尺寸截断和扩展不启动回收事务。恢复根据实际映射查找尾部，支持稀疏 extent 和三级间接块；最后删除 orphan 记录与释放无链接 inode 在同一事务完成。正常运行时仍打开的无链接 inode 保持内容，重启后回收。`sh tests/lwext4-orphan-host.sh` 包含不同 orphan_file 块的两个真实调用上下文交错、另一操作接纳后本操作 abort、传统链及满文件回退、损坏与日志错误恢复；`sh tests/lwext4-operation-host.sh` 检查调用者上下文、计数增量及父组分配。
 
 支持有界的 JBD2 checksum v2/v3、32/64-bit revoke；异步 commit、未知必需特性和旧 CRC32 journal 格式明确拒绝。已提交事务的损坏不能当作未提交尾部丢弃。只读脏日志、恢复 I/O 错误或损坏均拒绝开放用户访问。失败的日志/挂载 owner 保留到重启；普通合法内存释放不建立重试链。挂载准备阶段的 ENOMEM/ENOSPC 与关键 I/O 错误分开：资源不足保留可恢复的准备状态，后续 cleanup 可继续恢复并卸载，不能永久锁住 heap binding。
-已有路径先逐分量取得目录项和 inode 身份，再用 `ext4_fopen_inode` 按 inode 打开普通文件、目录或字符节点。新建由 `ext4_create_child` 接收已解析的父 inode、名称和模式，在同一操作中完成目录链接及初始属性。新 inode 的实际引用继续交给模式、符号链接／设备初始化和 handle 填充，最终归还时生成校验和；路径继续解析也直接接过新子 inode。新建的空普通文件已满足 O_TRUNC，已有文件继续执行正常截断。目录 handle 不在内核任务栈上分配完整 `ext4_dir` 结构。
+已有路径先逐分量取得目录项和 inode 身份，再用 ext4_fopen_inode 按 inode 打开，并把本次已读 inode 的权限和时间属性返回适配层。新建由 ext4_create_child 接收已解析的父 inode、名称、模式及最终 UID/GID，在同一操作内完成目录链接与初始属性；不先创建 root 文件再补 chown。新 inode 的实际引用用于设备/链接初始化及 handle 填充，最终归还时生成校验和。新建空文件满足 O_TRUNC，已有文件走正常截断。
 普通文件随机写入与追加先进入页缓存；append 以共享 node 的逻辑 EOF 为起点并推进实际接收字节。定向写回通过 `ext4_fpwrite_batch` 的独立区间提交脏范围，等待事务预算时不会被其他任务改变共享 handle 的 offset。lwext4 的 `SEEK_SET` 允许定位到 EOF 后，磁盘逻辑块只在写回时按数据范围分配；新分配的部分块先清零，旧 EOF 块尾清零，完整中间 hole 保持未映射。底层部分写失败不缩小缓存已经接收的逻辑长度，整段脏范围由页缓存保留供重试。`st_blocks` 报实际已分配存储，不由逻辑大小猜测；检查磁盘块生命周期的测试需先同步。
 
 截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`；legacy block-map inode 取指针树容量、`EXT_MAX_BLOCKS` 个可安全计数的逻辑块和 inode `i_blocks` 容量（包含间接块开销）的最小值，再乘以 `block_size`。因此 legacy 最后可用逻辑块也是 `0xfffffffe`：即使 8 KiB 三级间接树容量超过 2^32，也不会让 `ext4_lblk_t` 在 2^45 字节处回绕到块 0。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size。
@@ -349,6 +349,10 @@ unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；�
 新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。unwritten extent 的初始化和 caller 写入版本规则见[文件空间预留与打洞](#文件空间预留与打洞)。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
 
 extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/lwext4-metadata-host.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
+
+执行文件持有 exec lease 后，在同一 inode 资格内取得 mode/owner、挂载 nosuid 和可读性，filecap 通过已打开 inode 的 security.capability 读取，支持内部/外部 EA。主 ELF 的属性参与执行凭据计算，PT_INTERP 仅检查可读性；nosuid 挂载跳过 filecap 读取。读取返回真实 EA 错误；属性超过 24 字节读取缓冲时返回 ERANGE，已读入但长度不符合对应 revision 的记录由执行凭据解析返回 EINVAL。
+
+写入在限额和文件最大位置检查后、用户复制前删除 filecap 并按 CAP_FSETID 与所属组清除 set-ID；后续 EFAULT 可以保留这项副作用。已确认没有 filecap 的活 inode 复用该事实，避免每次写入重读 EA；当前用户态没有 xattr 修改入口。截断把清特权和大小修改放在同一事务，拒绝 FSIZE 后保留原属性。ext4 fallocate 按固定 Linux 先接受 file_modified，再判断 FSIZE 和空间分配，因此后续限额/空间失败保留已清除的特权。每次属性事务失败仍回滚自己的模式、EA 和校验数据。共享 mmap 按文件系统既有 page_mkwrite 规则处理，不额外清 set-ID。
 
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。根 mount 保存稳定的内部 ID 1 作为 `dev`，不表达物理设备 major/minor。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
 目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
@@ -727,7 +731,7 @@ VFS 的错误发布和共享 OFD 错误游标消费另由实例任务短锁保�
 
 写回固定本批页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回只借用当前窗口的精确页集合，归还时使用同一集合；跨窗口只保留页号与范围，续批重查当前脏页索引，不长期借用链表后继。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
-每 inode 的写操作门闩覆盖 write/writev/pwrite、append 的数据接纳过程以及 truncate/fallocate；独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只回收干净页，可按正向顺序等待元数据资格，不能等待脏页或设备 I/O；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页的物理引用归还后，node 与 entry 的释放在可进入后端的现场完成；固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
+每 inode 的写操作互斥覆盖 write/writev/pwrite、append 的数据接纳过程、truncate/fallocate，以及 chmod/chown。属性修改按 rank15 写操作互斥 → rank21 namespace → inode 数据保护的顺序取得资格，路径和 FD 使用同一入口；这样写入清除 set-ID 后，另一任务重新授予的 set-ID 只会在整次写入结束后生效。独立 OFD 也不能在页/iovec 边界交错同次写。数据接纳后先归还写操作门，再执行 O_SYNC/O_DSYNC 同步；位置资格和独立同步的保护范围见[文件接口](kernel-files.md)。内层 pwrite/append 借用外层门闩，不递归加锁。来源缺页与 pin 在目标 inode 数据锁和页写资格之外完成，实际复制及脏范围发布在取得目标资格后进行；缺页、读和写回不取得操作门闩，允许用户源缓冲映射同一 inode。普通文件写通过用户 iovec 直接填充页缓存或 tmpfs 后备页，没有请求中转页，保留短写及 EFAULT/EIO；这里的操作互斥不承诺断电原子性。持锁分配、堆和 MM 元数据操作只回收干净页，可按正向顺序等待元数据资格，不能等待脏页或设备 I/O；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页的物理引用归还后，node 与 entry 的释放在可进入后端的现场完成；固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 
@@ -902,8 +906,7 @@ VFS node按mount/inode共享，fifo_pipe是短IRQ区保护的弱关联；候选�
 路径truncate持有解析后的path并直接调用共同截断入口，不安装临时用户fd。
 rank15整次操作锁、inode锁、缓存写回、尾页清零和跨MM失效沿原路径；
 目录返回EISDIR，非普通节点EINVAL，负长度在访问pathname前EINVAL。
-共同ext4截断在原操作undo内删除capability，包含同长度请求；固定root的
-CAP_FSETID语义保留set-ID，不能套用chown清位规则。共享外部EA块继续按引用计数
+权限及清特权按上文共同规则处理，包含同长度请求。共享外部 EA 块按引用计数
 复制或释放，失败只回滚本操作；日志、orphan和持久化顺序不变。
 
 ## 元数据成本复建

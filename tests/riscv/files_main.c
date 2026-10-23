@@ -215,7 +215,7 @@ enum kernel_open_file_status __real_kernel_open_file_release(
 uint64_t __real_riscv_sv39_current_satp(void);
 #ifdef FILES_PARTIAL_WRITE_TEST
 int __real_ext4_fpwrite_batch(ext4_file *, struct file_write_span *, unsigned);
-int __real_ext4_ftruncate(ext4_file *file, uint64_t size);
+int __real_ext4_ftruncate(ext4_file *file, uint64_t size, uint32_t privilege_mode);
 #endif
 
 uint64_t __wrap_riscv_sv39_current_satp(void)
@@ -255,15 +255,15 @@ int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, un
     return !result && prefix.written==5U ? EIO : result;
 }
 
-int __wrap_ext4_ftruncate(ext4_file *file, uint64_t size)
+int __wrap_ext4_ftruncate(ext4_file *file, uint64_t size, uint32_t privilege_mode)
 {
     int result;
 
     if (!inject_truncate_error) {
-        return __real_ext4_ftruncate(file, size);
+        return __real_ext4_ftruncate(file, size, privilege_mode);
     }
     inject_truncate_error = 0;
-    result = __real_ext4_ftruncate(file, size);
+    result = __real_ext4_ftruncate(file, size, privilege_mode);
     return result == EOK ? EIO : result;
 }
 #endif

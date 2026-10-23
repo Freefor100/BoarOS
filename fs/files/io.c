@@ -8,6 +8,7 @@
 #include "../vfs_internal.h"
 
 #include <kernel/cost.h>
+#include <kernel/credentials.h>
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/event_fd.h>
@@ -45,6 +46,8 @@ static int scalar_empty_range_fault(uint64_t address, uint64_t count)
 /* 调用现场持OFD pin及MM/files owner；callback结束之前iov与结果地址不退栈。
  * 队列只借用这些owner，不重查fd或再复制数据。 */
 struct regular_call {
+    const struct kernel_credentials *credentials;
+    void (*execute)(void *);
     struct kernel_open_file_description *description;
     const struct kernel_lock_guard *offset_borrow, *operation_borrow;
     struct kernel_vfs_size_limit *size_limit;
@@ -53,12 +56,20 @@ struct regular_call {
     int64_t *result;
     enum kernel_files_status status;
 };
+static void regular_worker(void *argument)
+{
+    struct regular_call *call=argument;
+    const struct kernel_credentials *previous=kernel_credentials_override(call->credentials);
+    call->execute(call);
+    (void)kernel_credentials_override(previous);
+}
 static enum kernel_files_status regular_dispatch(struct regular_call *call,void (*execute)(void *))
 {
     call->status=KERNEL_FILES_STATUS_STATE;
+    call->credentials=kernel_credentials_current();call->execute=execute;
     struct kernel_page_cache *cache=kernel_open_file_page_cache(call->description);
     const struct kernel_lock_guard *borrow = call->offset_borrow ? call->offset_borrow : call->operation_borrow;
-    enum kernel_page_cache_status status = kernel_page_cache_run_cpu0_borrowing(cache,execute,call,borrow);
+    enum kernel_page_cache_status status = kernel_page_cache_run_cpu0_borrowing(cache,regular_worker,call,borrow);
     return status?KERNEL_FILES_STATUS_STATE:call->status;
 }
 static int regular_caller_ready(void)

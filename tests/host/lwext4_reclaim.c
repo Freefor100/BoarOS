@@ -266,7 +266,7 @@ int main(int argc, char **argv)
             uint32_t ino; bool orphan;
             CHECK(ext4_funlink_dentry("/victim",&ino,&orphan) == EOK);
             CHECK(ino == f.inode && orphan);
-        } else CHECK(ext4_ftruncate(&file,5ULL*dev.lg_bsize+17) == EOK);
+        } else CHECK(ext4_ftruncate(&file,5ULL*dev.lg_bsize+17, UINT32_MAX) == EOK);
         CHECK(ext4_transaction_end("/") == EOK);
         uint32_t orphan;
         CHECK(ext4_orphan_peek(dev.fs,&orphan) == EOK && orphan == f.inode);
@@ -281,7 +281,7 @@ int main(int argc, char **argv)
                 CHECK(ext4_fclose(&file)==EOK);
                 CHECK(ext4_orphan_free("/",f.inode)==EOK);
             } else {
-                CHECK(ext4_ftruncate(&file,5ULL*dev.lg_bsize+17)==EOK);
+                CHECK(ext4_ftruncate(&file,5ULL*dev.lg_bsize+17, UINT32_MAX)==EOK);
                 CHECK(ext4_fclose(&file)==EOK);
             }
             CHECK(ext4_journal_group_drain("/")==EOK);

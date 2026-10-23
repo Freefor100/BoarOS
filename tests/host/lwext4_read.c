@@ -298,7 +298,7 @@ static int check_sparse_address_limit(void)
 		goto close;
 	}
 
-	truncate_rc = ext4_ftruncate(&file, oversized);
+	truncate_rc = ext4_ftruncate(&file, oversized, UINT32_MAX);
 	seek_rc = ext4_fseek(&file, (int64_t)aliased_offset, SEEK_SET);
 	if (seek_rc == EOK) {
 		count = 0;
@@ -329,7 +329,7 @@ close:
 	/* Restore a small position/size even when the regression is present so
 	 * the RED run can still unmount and check the image. */
 	(void)ext4_fseek(&file, 0, SEEK_SET);
-	(void)ext4_ftruncate(&file, 1);
+	(void)ext4_ftruncate(&file, 1, UINT32_MAX);
 	rc = ext4_fclose(&file);
 	if (rc != EOK) {
 		report_error("close sparse limit file", rc);
@@ -359,7 +359,7 @@ static int check_legacy_address_limit(void)
 		goto close;
 	}
 
-	rc = ext4_ftruncate(&file, legacy_max);
+	rc = ext4_ftruncate(&file, legacy_max, UINT32_MAX);
 	if (rc != EOK || ext4_fsize(&file) != legacy_max ||
 	    ext4_ftell(&file) != sizeof(marker) - 1) {
 		fprintf(stderr,
@@ -382,7 +382,7 @@ static int check_legacy_address_limit(void)
 		failed = 1;
 	}
 
-	rc = ext4_ftruncate(&file, beyond);
+	rc = ext4_ftruncate(&file, beyond, UINT32_MAX);
 	if (rc != EFBIG || ext4_fsize(&file) != legacy_max ||
 	    ext4_ftell(&file) != legacy_max) {
 		fprintf(stderr,
@@ -442,7 +442,7 @@ static int check_wide_legacy_address_limit(void)
 		goto close;
 	}
 
-	rc = ext4_ftruncate(&file, legacy_max);
+	rc = ext4_ftruncate(&file, legacy_max, UINT32_MAX);
 	if (rc != EOK || ext4_fsize(&file) != legacy_max ||
 	    ext4_ftell(&file) != sizeof(marker) - 1) {
 		fprintf(stderr,
@@ -465,7 +465,7 @@ static int check_wide_legacy_address_limit(void)
 		failed = 1;
 	}
 
-	rc = ext4_ftruncate(&file, beyond);
+	rc = ext4_ftruncate(&file, beyond, UINT32_MAX);
 	if (rc != EFBIG || ext4_fsize(&file) != legacy_max ||
 	    ext4_ftell(&file) != legacy_max) {
 		fprintf(stderr,
@@ -505,7 +505,7 @@ static int check_wide_legacy_address_limit(void)
 	}
 
 	(void)ext4_fseek(&file, (int64_t)legacy_max, SEEK_SET);
-	rc = ext4_ftruncate(&file, aliased_size);
+	rc = ext4_ftruncate(&file, aliased_size, UINT32_MAX);
 	if (rc != EFBIG || ext4_fsize(&file) != legacy_max ||
 	    ext4_ftell(&file) != legacy_max) {
 		fprintf(stderr,
@@ -731,7 +731,7 @@ static int check_sparse_behavior(struct host_image *image)
 		return report_error("create sparse truncate file", rc);
 	count = 0;
 	rc = ext4_fwrite(&file, "12345", 5, &count);
-	if (rc != EOK || count != 5 || ext4_ftruncate(&file, 8192 + 50) != EOK ||
+	if (rc != EOK || count != 5 || ext4_ftruncate(&file, 8192 + 50, UINT32_MAX) != EOK ||
 	    ext4_ftell(&file) != 5 || ext4_fsize(&file) != 8192 + 50) {
 		failed = report_error("grow sparse truncate file",
 				      rc != EOK ? rc : EIO);

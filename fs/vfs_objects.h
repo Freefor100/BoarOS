@@ -70,6 +70,7 @@ struct kernel_vfs_node {
 #endif
     /* Directory entries use a separate qualification from file data I/O. */
     struct kernel_rwlock namespace_lock;
+    uint32_t uid, gid;
 };
 
 struct kernel_vfs_path {
@@ -170,6 +171,9 @@ struct kernel_vfs_backend {
         const struct kernel_vfs_timespec times[2]);
     int (*set_mode)(struct kernel_vfs_file *file, uint32_t mode);
     int (*set_owner)(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid);
+    int (*permission)(struct kernel_vfs_node *, const struct kernel_credentials *, unsigned);
+    int (*exec_metadata)(struct kernel_vfs_node *, struct kernel_vfs_exec_metadata *);
+    int (*killpriv)(struct kernel_vfs_node *, uint32_t mode);
     int (*open)(struct kernel_vfs_mount *mount,
         const char *path, uint64_t inode_number,
         uint32_t inode_mode,
@@ -210,6 +214,12 @@ struct kernel_vfs_backend {
     int (*writeback)(struct kernel_vfs_node *node,
         struct file_write_span *spans, size_t count);
 };
+/* Called under the same inode writer as the corresponding metadata update. */
+
+
+int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel_vfs_timespec [2]);
+void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
+    uint32_t *mode, uint32_t *uid, uint32_t *gid);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);

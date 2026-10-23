@@ -40,16 +40,16 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,u
     return result;
 }
 static unsigned disk_truncate_error;
-int __real_ext4_ftruncate(ext4_file *,uint64_t);
-int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size)
+int __real_ext4_ftruncate(ext4_file *,uint64_t, uint32_t privilege_mode);
+int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size, uint32_t privilege_mode)
 {
     unsigned error=disk_truncate_error; disk_truncate_error=0;
     if (error==1) return 5;
     if (error==2) {
-        int result=__real_ext4_ftruncate(file,size+123);
+        int result=__real_ext4_ftruncate(file,size+123, privilege_mode);
         assert(!result); return 5;
     }
-    return __real_ext4_ftruncate(file,size);
+    return __real_ext4_ftruncate(file,size, privilege_mode);
 }
 static struct kernel_mm *disk_views[5];
 static uint64_t disk_roots[5],disk_target;

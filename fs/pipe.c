@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "pipe_internal.h"
 #include "vfs_objects.h"
 #include "uaccess_iov_internal.h"
@@ -48,6 +49,8 @@ int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode)
     if (!pipe) return -KERNEL_EINVAL;
     struct kernel_vfs_timespec now=pipe_now();
     PIPE_META(guard,pipe);
+    int error=kernel_vfs_chmod_allowed(pipe->uid,pipe->gid,&mode);
+    if (error) return error;
     /* 共享端点只改权限；访问方向仍由每个OFD拥有。 */
     pipe->mode = KERNEL_VFS_S_IFIFO | (mode & 07777U);
     pipe->ctime = now;
@@ -59,9 +62,12 @@ int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid)
     if (!pipe) return -KERNEL_EINVAL;
     struct kernel_vfs_timespec now=pipe_now();
     PIPE_META(guard,pipe);
+    int error=kernel_vfs_chown_allowed(pipe->uid,pipe->gid,pipe->mode,uid,gid);
+    if (error) return error;
+    uint32_t mode=kernel_vfs_chown_mode(pipe->mode,pipe->gid,gid==UINT32_MAX?pipe->gid:gid);
     if (uid != UINT32_MAX) pipe->uid = uid;
     if (gid != UINT32_MAX) pipe->gid = gid;
-    pipe->mode = kernel_vfs_chown_mode(pipe->mode);
+    pipe->mode = mode;
     pipe->ctime = now;
     return 0;
 }
@@ -117,6 +123,9 @@ enum kernel_pipe_status kernel_pipe_create(
     pipe->heap = heap;
     pipe->allocator = heap->page_allocator;
     pipe->mode = KERNEL_VFS_S_IFIFO | 0600U;
+    const struct kernel_credentials *cred = kernel_credentials_current();
+    pipe->uid = cred->fsuid;
+    pipe->gid = cred->fsgid;
     pipe->atime = pipe->mtime = pipe->ctime = pipe_now();
     pipe->read_slot=pipe->merge_slot=16;
     kernel_wait_queue_init(&pipe->read_queue);

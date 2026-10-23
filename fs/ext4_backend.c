@@ -634,14 +634,6 @@ static void initialize_times(struct kernel_vfs_node *base,
     }
 }
 
-static int load_times(struct kernel_vfs_node *base, struct lwext4_mount_adapter *adapter)
-{
-    if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) return EOK;
-    struct ext4_inode inode;
-    int result = ext4_fraw_inode_fill(lwext4_node_file(base), &inode);
-    if (!result) initialize_times(base, adapter, &inode);
-    return result;
-}
 
 static int lwext4_error(int error)
 {
@@ -1736,6 +1728,7 @@ static int ext4_backend_set_times(struct kernel_vfs_file *file,
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_inode_times_allowed(node,times); if (allowed) return allowed;
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
     struct ext4_timestamp now, values[3];
@@ -1760,6 +1753,7 @@ static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode)
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chmod_allowed(node->uid,node->gid,&mode); if (allowed) return allowed;
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
     result = lwext4_error(ext4_file_set_mode(lwext4_node_file(node), mode & 07777U));
@@ -1778,10 +1772,16 @@ static int ext4_backend_set_owner(struct kernel_vfs_file *file, uint32_t uid, ui
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chown_allowed(node->uid,node->gid,node->mode,uid,gid); if (allowed) return allowed;
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
-    result = lwext4_error(ext4_file_set_owner(lwext4_node_file(node), uid, gid));
-    if (!result) file->mode = node->mode = kernel_vfs_chown_mode(node->mode);
+    uint32_t mode=kernel_vfs_chown_mode(node->mode,node->gid,gid==UINT32_MAX?node->gid:gid);
+    result = lwext4_error(ext4_file_set_owner(lwext4_node_file(node), uid, gid, mode));
+    if (!result) {
+        file->mode = node->mode = mode;
+        if (uid!=UINT32_MAX) node->uid=uid;
+        if (gid!=UINT32_MAX) node->gid=gid;
+    }
     return result;
 }
 
@@ -1820,6 +1820,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     struct kernel_vfs_node *node;
     enum kernel_heap_status heap_status;
     uint32_t mode;
+    struct ext4_inode initial;
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
@@ -1851,7 +1852,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     node->backend_data = &((struct lwext4_node *)node)->file;
     if (path == 0) {
         result = ext4_fopen_inode(lwext4_node_file(node), adapter->mount_point,
-                                  inode_number);
+                                  inode_number, &initial);
         if (result != EOK) {
             kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
@@ -1887,8 +1888,10 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     node->inode = lwext4_node_file(node)->inode;
     node->max_size = lwext4_node_file(node)->fmax;
     node->size = ext4_fsize(lwext4_node_file(node));
-    node->mode = mode;
-    result = load_times(node, adapter);
+    if (path) result=ext4_fraw_inode_fill(lwext4_node_file(node),&initial);
+    node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
+    node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
+    if (!result) initialize_times(node,adapter,&initial);
     if(!result)result=retain_node_inode(node);
     if (result) {
         if (close_node_file(node) != EOK) {
@@ -1905,6 +1908,7 @@ struct namespace_create {
     struct kernel_vfs_node *node;
     struct ext4_inode *initial;
     uint32_t parent, mode, type, device;
+    uint32_t uid,gid;
 };
 static int apply_namespace_create(void *context)
 {
@@ -1917,12 +1921,26 @@ static int apply_namespace_create(void *context)
     }
     int result=ext4_create_child(request->mount, request->parent, request->path,
         request->mode | request->type, request->device, request->target, file,
-        request->initial);
+        request->initial, request->uid, request->gid);
     /* Bind before the outer operation accepts the new directory entry, so
      * allocation failure aborts create instead of following a committed name. */
     if(!result && request->node)result=retain_node_inode(request->node);
     return result;
 }
+static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct namespace_create *request)
+{
+    struct kernel_vfs_node *parent=kernel_vfs_node_pin(&adapter->instance,request->parent);
+    if (!parent) return EIO;
+    uint32_t mode=request->mode|request->type;
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(parent,&io,0);
+        kernel_vfs_creation_identity(parent->mode,parent->gid,&mode,&request->uid,&request->gid);
+    }
+    if (kernel_vfs_node_release(&parent)) __builtin_trap();
+    request->mode=mode;
+    return ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
+}
+
 struct namespace_remove {
     const char *mount, *path;
     uint32_t parent, inode;
@@ -1991,7 +2009,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->backend_data = &((struct lwext4_node *)node)->file;
     struct ext4_inode initial;
     struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
-    result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
+    result=namespace_create_execute(adapter,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any
          * uncertain journal state. An aborted create must not unlink by name. */
@@ -2005,8 +2023,10 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->inode = lwext4_node_file(node)->inode;
     node->max_size = lwext4_node_file(node)->fmax;
     node->size = ext4_fsize(lwext4_node_file(node));
-    node->mode = (mode & 07777U) | KERNEL_VFS_S_IFREG;
+    node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
+    node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
     initialize_times(node, adapter, &initial);
+    ((struct lwext4_node *)node)->capability_absent=1;
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
 
@@ -2033,6 +2053,30 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
             notify = time_dirty_locked(node, EXT4_TIME_ATIME, now);
     }
     time_notify(adapter, notify);
+}
+
+static int ext4_backend_exec_metadata(struct kernel_vfs_node *node,struct kernel_vfs_exec_metadata *out)
+{
+    size_t size=0;
+    int result=ext4_file_capability(lwext4_node_file(node),out->filecap,sizeof(out->filecap),&size);
+    if (result==ENODATA || result==ENOTSUP) return 0;
+    if (result) return lwext4_error(result);
+    out->filecap_size=size;out->filecap_present=1;
+    return 0;
+}
+static int ext4_backend_killpriv(struct kernel_vfs_node *node,uint32_t mode)
+{
+    struct lwext4_node *ext=(struct lwext4_node *)node;
+    if (!ext->capability_absent) {
+        size_t size=0;
+        int result=ext4_file_capability(lwext4_node_file(node),NULL,0,&size);
+        if (result==ENODATA || result==ENOTSUP) ext->capability_absent=1;
+        else if (result && result!=ERANGE) return lwext4_error(result);
+    }
+    if (mode==node->mode && ext->capability_absent) return 0;
+    int result=ext4_file_remove_privileges(lwext4_node_file(node),mode);
+    if (!result) {node->mode=mode;ext->capability_absent=1;}
+    return lwext4_error(result);
 }
 
 static int ext4_backend_modified(struct kernel_vfs_file *file,
@@ -2110,7 +2154,7 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
 
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR};
-    result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,&request);
+    result=namespace_create_execute(adapter,&request);
     if (result != EOK) return lwext4_error(result);
     return 0;
 }
@@ -2454,18 +2498,20 @@ static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, siz
 static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed)
 {
     uint64_t before = ext4_fsize(lwext4_node_file(node));
-    int result = ext4_ftruncate(lwext4_node_file(node), size);
+    int result = ext4_ftruncate(lwext4_node_file(node), size, kernel_vfs_write_mode(node->mode,node->gid));
     *actual = ext4_fsize(lwext4_node_file(node));
     *changed = result == EOK || before != *actual;
+    if (*changed) {node->mode=kernel_vfs_write_mode(node->mode,node->gid);((struct lwext4_node *)node)->capability_absent=1;}
     return lwext4_error(result);
 }
 static int ext4_backend_fallocate(struct kernel_vfs_node *node, unsigned mode,
     uint64_t offset, uint64_t length, uint64_t *actual, int *changed)
 {
     bool committed;
-    int result = ext4_fallocate(lwext4_node_file(node), mode, offset, length, &committed);
+    int result = ext4_fallocate(lwext4_node_file(node), mode, offset, length, &committed, kernel_vfs_write_mode(node->mode,node->gid));
     *actual = ext4_fsize(lwext4_node_file(node));
     *changed = committed;
+    if (committed) {node->mode=kernel_vfs_write_mode(node->mode,node->gid);((struct lwext4_node *)node)->capability_absent=1;}
     return lwext4_error(result);
 }
 static int ext4_backend_prepare_write(struct kernel_vfs_node *node,uint64_t offset,
@@ -2547,7 +2593,7 @@ static int ext4_backend_symlink(struct kernel_vfs_instance *instance,
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
         .path=name, .target=target, .type=KERNEL_VFS_S_IFLNK, .mode=0777};
-    return lwext4_error(ext4_metadata_execute(adapter->mount_point, apply_namespace_create, &request));
+    return lwext4_error(namespace_create_execute(adapter,&request));
 }
 static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
     uint64_t parent_inode, const char *name, uint32_t type, uint32_t mode, uint32_t device)
@@ -2557,7 +2603,7 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
         .path=name, .type=type, .mode=mode & 07777U, .device=device};
-    return lwext4_error(ext4_metadata_execute(adapter->mount_point, apply_namespace_create, &request));
+    return lwext4_error(namespace_create_execute(adapter,&request));
 }
 static int ext4_backend_rename(struct kernel_vfs_instance *instance,
     uint64_t old_parent, const char *old_name, uint64_t new_parent,
@@ -2619,6 +2665,8 @@ static void initialize_backend(void)
     ops->set_times = ext4_backend_set_times;
     ops->set_mode = ext4_backend_set_mode;
     ops->set_owner = ext4_backend_set_owner;
+    ops->exec_metadata=ext4_backend_exec_metadata;
+    ops->killpriv=ext4_backend_killpriv;
     ops->open = ext4_backend_open;
     ops->create = ext4_backend_create;
     ops->accessed = ext4_backend_accessed;

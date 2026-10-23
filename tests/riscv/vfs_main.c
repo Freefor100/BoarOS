@@ -920,7 +920,7 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_pread(&alias, 0, result, sizeof(result), &count) ||
         count != 5 || !bytes_equal((unsigned char *)result, "first", 5))
         fail_vfs(70, 0, -1);
-    if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) || ext4_fsize(&raw) != 0 ||
+    if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first), NULL) || ext4_fsize(&raw) != 0 ||
         ext4_fclose(&raw)) fail_vfs(71, 0, -1);
     struct kernel_vfs_file clean = {0};
     if (kernel_vfs_open(mount, "/init", &clean) ||
@@ -931,12 +931,12 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
     pressure_cache = cache;
     void *allocation = ext4_user_malloc(4096);
     if (allocation == 0 || pressure_cache != 0 || pressure_reclaimed == 0 ||
-        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) || ext4_fsize(&raw) != 0 ||
+        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first), NULL) || ext4_fsize(&raw) != 0 ||
         ext4_fclose(&raw)) fail_vfs(77, 0, -1);
     ext4_user_free(allocation);
     if (kernel_vfs_sync(&first, 0, &observed)) fail_vfs(72, 0, -1);
-    if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) || ext4_fsize(&raw) != 5 ||
-        ext4_fclose(&raw) || ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&second)) ||
+    if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first), NULL) || ext4_fsize(&raw) != 5 ||
+        ext4_fclose(&raw) || ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&second), NULL) ||
         ext4_fsize(&raw) != 0 || ext4_fclose(&raw)) fail_vfs(73, 0, -1);
     if (kernel_vfs_close(&first) || kernel_vfs_close(&alias) ||
         kernel_vfs_close(&second)) fail_vfs(74, 0, -1);
@@ -986,10 +986,10 @@ static void run_mount_sync_regression(struct kernel_vfs_mount *mount,
     sync_probe_calls = 0;
     uint64_t observed = kernel_vfs_mount_error_sequence(mount);
     if (kernel_vfs_sync_mount(mount, &observed) || sync_probe_calls != 1 ||
-        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) ||
+        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first), NULL) ||
         ext4_fread(&raw, data, sizeof(data), &count) || count != 5 || memcmp(data, "first", 5) ||
         ext4_fclose(&raw) ||
-        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&second)) ||
+        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&second), NULL) ||
         ext4_fread(&raw, data, sizeof(data), &count) || count != 6 || memcmp(data, "second", 6) ||
         ext4_fclose(&raw)) fail_vfs(139U, 0, -1);
     sync_probe_child = child;

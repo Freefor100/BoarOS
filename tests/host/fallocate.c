@@ -6,9 +6,41 @@
 #include <ext4_extent.h>
 #include <ext4_super.h>
 #include <ext4_inode.h>
+#include <ext4_xattr.h>
 #include <kernel/tmpfs.h>
+#include <kernel/credentials.h>
+#include "../../fs/pipe_internal.h"
+static unsigned credential_pin_pause,credential_pin_entered,credential_pin_resume;
+enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    if (access==KERNEL_MM_READ && kernel_cpu_current()->hardware_id==1 &&
+        __atomic_exchange_n(&credential_pin_pause,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&credential_pin_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&credential_pin_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return __real_kernel_uaccess_pin_user_page(mm,address,access,pin);
+}
+static unsigned fail_capability_read,fail_capability_remove;
+int __real_ext4_xattr_get(struct ext4_inode_ref *,uint8_t,const char *,size_t,void *,size_t,size_t *);
+int __wrap_ext4_xattr_get(struct ext4_inode_ref *ref,uint8_t index,const char *name,size_t length,void *out,size_t capacity,size_t *size)
+{
+    if (index==6 && length==10 && !memcmp(name,"capability",10) && fail_capability_read) {
+        fail_capability_read=0;return EIO;
+    }
+    return __real_ext4_xattr_get(ref,index,name,length,out,capacity,size);
+}
+int __real_ext4_xattr_remove(struct ext4_inode_ref *,uint8_t,const char *,size_t);
+int __wrap_ext4_xattr_remove(struct ext4_inode_ref *ref,uint8_t index,const char *name,size_t length)
+{
+    if (index==6 && length==10 && !memcmp(name,"capability",10) && fail_capability_remove) {
+        fail_capability_remove=0;return ENOMEM;
+    }
+    return __real_ext4_xattr_remove(ref,index,name,length);
+}
 static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
 static unsigned metadata_probe,metadata_open_calls;
+static unsigned credential_create_pause,credential_create_entered,credential_create_resume,credential_chmod_done;
 static const char *metadata_failed_step;
 int __real_ext4_transaction_begin(const char *);
 int __wrap_ext4_transaction_begin(const char *mount)
@@ -16,9 +48,18 @@ int __wrap_ext4_transaction_begin(const char *mount)
 int __real_ext4_fopen2(ext4_file *,const char *,int);
 int __wrap_ext4_fopen2(ext4_file *file,const char *path,int flags)
 { if(metadata_probe)metadata_open_calls++;int r=__real_ext4_fopen2(file,path,flags);if(metadata_probe && r)metadata_failed_step="open";return r; }
-int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *);
-int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file,struct ext4_inode *initial)
-{ if(metadata_probe)metadata_open_calls++;int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file,initial);if(metadata_probe && r)metadata_failed_step="create";return r; }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *,uint32_t uid,uint32_t gid);
+int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file,struct ext4_inode *initial,uint32_t uid,uint32_t gid)
+{
+    if (credential_create_pause && !strcmp(name,"accepted")) {
+        __atomic_store_n(&credential_create_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&credential_create_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    if(metadata_probe)metadata_open_calls++;
+    int r=__real_ext4_create_child(mp,parent,name,mode,device,target,file,initial,uid,gid);
+    if(metadata_probe && r)metadata_failed_step="create";
+    return r;
+}
 int __real_ext4_transaction_end(const char *);
 int __wrap_ext4_transaction_end(const char *mount)
 { int r=__real_ext4_transaction_end(mount);if(metadata_probe && r)metadata_failed_step="end";return r; }
@@ -212,12 +253,12 @@ static void pending_truncate(struct kernel_vfs_mount *mount)
     ext4_file file; assert(!ext4_fopen(&file,path,"w+"));
     assert(!ext4_fwrite(&file,bytes,length,&done) && done==length);
     assert(!ext4_transaction_begin(adapter->mount_point));
-    assert(!ext4_ftruncate(&file,block+17));
+    assert(!ext4_ftruncate(&file,block+17, UINT32_MAX));
     bool changed;
-    assert(!ext4_fallocate(&file,1,6*block,2*block,&changed) && changed);
+    assert(!ext4_fallocate(&file,1,6*block,2*block,&changed, UINT32_MAX) && changed);
     assert(ext4_fsize(&file)==block+17);
     assert(!ext4_transaction_end(adapter->mount_point));
-    assert(!ext4_fallocate(&file,0,0,length,&changed) && changed);
+    assert(!ext4_fallocate(&file,0,0,length,&changed, UINT32_MAX) && changed);
     memset(bytes+block+17,0,length-block-17);
     unsigned char *actual=malloc(length); assert(actual);
     assert(!ext4_fpread(&file,0,actual,length,&done) && done==length && !memcmp(bytes,actual,length));
@@ -317,9 +358,9 @@ static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_v
     fill_free_space(mount,&filler,&last,block);
     ext4_file *file=lwext4_node_file(kernel_vfs_file_node(&victim));
     KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(kernel_vfs_file_node(&victim),&io,1);
-    assert(!ext4_transaction_begin(adapter->mount_point) && !ext4_ftruncate(file,0));
+    assert(!ext4_transaction_begin(adapter->mount_point) && !ext4_ftruncate(file,0, UINT32_MAX));
     bool changed;
-    int reserved=ext4_fallocate(file,0,0,length,&changed);
+    int reserved=ext4_fallocate(file,0,0,length,&changed, UINT32_MAX);
     fprintf(stderr,"private free/reuse reservation=%d\n",reserved);
     assert(!reserved || reserved==ENOSPC);
     if (!reserved) {
@@ -569,7 +610,7 @@ struct metadata_nested { const char *mount;ext4_file file;unsigned calls; };
 static int apply_metadata_nested(void *context)
 {
     struct metadata_nested *request=context;request->calls++;
-    return ext4_create_child(request->mount,EXT4_INODE_ROOT_INDEX,"budget-nested",0100640,0,NULL,&request->file,NULL);
+    return ext4_create_child(request->mount,EXT4_INODE_ROOT_INDEX,"budget-nested",0100640,0,NULL,&request->file,NULL,0,0);
 }
 static void namespace_budget(struct kernel_vfs_mount *mount)
 {
@@ -952,6 +993,303 @@ static void mmap_ranges(struct kernel_page_cache *cache,struct kernel_heap *heap
     puts("PASS mmap: shared dirty aliases refault zeros and can write again; private COW survives, clean private view follows file");
 }
 #endif
+struct credential_create_race {
+    struct kernel_vfs_path *root,*directory;
+    struct kernel_credentials user;
+    int create_result,chmod_result;
+};
+static void *credential_create_thread(void *argument)
+{
+    struct credential_create_race *race=argument;cache_test_attach(1);
+    (void)kernel_credentials_override(&race->user);
+    struct kernel_vfs_file file={0};
+    race->create_result=kernel_vfs_create_at(race->root,race->root,"/qualified/accepted",0600,&file);
+    if (!race->create_result) assert(!kernel_vfs_close(&file));
+    (void)kernel_credentials_override(NULL);return NULL;
+}
+static void *credential_chmod_thread(void *argument)
+{
+    struct credential_create_race *race=argument;cache_test_attach(2);
+    race->chmod_result=kernel_vfs_path_set_mode(race->directory,0);
+    __atomic_store_n(&credential_chmod_done,1,__ATOMIC_RELEASE);return NULL;
+}
+static void credential_namespace_race(struct kernel_vfs_mount *mount)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    struct ext4_journal_runtime runtime={.now_ns=metadata_clock};
+    assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,4*1024*1024));
+    boaros_lwext4_enable_parallel(&adapter->backend_lock,adapter->device.fs);
+    adapter->instance.namespace_parallel=1;
+    struct credential_create_race race={.user=*kernel_credentials_current()};
+    race.user.uid=race.user.euid=race.user.suid=race.user.fsuid=1000;
+    race.user.gid=race.user.egid=race.user.sgid=race.user.fsgid=100;
+    race.user.effective=race.user.permitted=0;
+    assert(!kernel_vfs_path_root(mount,adapter->instance.heap,&race.root));
+    assert(!kernel_vfs_mkdir_at(race.root,race.root,"/qualified",0777));
+    assert(!kernel_vfs_path_resolve(race.root,race.root,"/qualified",1,&race.directory));
+    credential_create_pause=1;credential_create_entered=credential_create_resume=credential_chmod_done=0;
+    pthread_t creator,changer;
+    assert(!pthread_create(&creator,NULL,credential_create_thread,&race));
+    wait_progress(&credential_create_entered,1);
+    unsigned parked=mm_test_parked(2);
+    assert(!pthread_create(&changer,NULL,credential_chmod_thread,&race));
+    while (mm_test_parked(2)==parked) sched_yield();
+    assert(!__atomic_load_n(&credential_chmod_done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&credential_create_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(creator,NULL) && !pthread_join(changer,NULL));
+    credential_create_pause=0;
+    assert(!race.create_result && !race.chmod_result);
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_stat_at(race.root,race.root,"/qualified/accepted",1,&stat) && stat.uid==1000 && stat.gid==100);
+    (void)kernel_credentials_override(&race.user);
+    struct kernel_vfs_file denied={0};
+    assert(kernel_vfs_create_at(race.root,race.root,"/qualified/denied",0600,&denied)==-KERNEL_EACCES);
+    (void)kernel_credentials_override(NULL);
+    assert(!kernel_vfs_path_release(&race.directory) && !kernel_vfs_path_release(&race.root));
+    assert(!ext4_journal_group_drain(adapter->mount_point));
+    puts("PASS credentials interleave: parent chmod blocks behind accepted create; next create observes revoked directory access; owner and resources survive parallel transaction publication");
+}
+
+/* Linux notify_change creates ATTR_MODE only when old set-ID bits change;
+ * setattr_prepare then checks the requested group for the remaining SGID. */
+static void credential_chown_groups(struct kernel_vfs_mount *mount)
+{
+    const struct kernel_credentials *root=kernel_credentials_current();
+    struct kernel_credentials user=*root;
+    user.uid=user.euid=user.suid=user.fsuid=1000;
+    user.gid=user.egid=user.sgid=user.fsgid=100;
+    user.effective=user.permitted=UINT64_C(1)<<KERNEL_CAP_CHOWN;
+    user.inheritable=user.ambient=0;
+    struct kernel_vfs_file file={0};
+    struct kernel_pipe *pipe=NULL;
+    assert(!kernel_vfs_create(mount,"/chown-groups",0600,&file));
+    assert(!kernel_pipe_create(((struct kernel_vfs_instance *)mount->private_data)->heap,&pipe));
+    static const struct {uint32_t mode,old_gid,new_gid,expected;} cases[]={
+        {06600,100,200,0600}, {02600,100,200,02600},
+        {06600,100,100,02600}, {02600,200,100,0600},
+    };
+    for (unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) for (unsigned anonymous=0;anonymous<2;anonymous++) {
+        (void)kernel_credentials_override(root);
+        assert(!(anonymous ? kernel_pipe_set_owner(pipe,1000,cases[i].old_gid) :
+            kernel_vfs_file_set_owner(&file,1000,cases[i].old_gid)));
+        assert(!(anonymous ? kernel_pipe_set_mode(pipe,cases[i].mode) :
+            kernel_vfs_file_set_mode(&file,cases[i].mode)));
+        (void)kernel_credentials_override(&user);
+        assert(!(anonymous ? kernel_pipe_set_owner(pipe,UINT32_MAX,cases[i].new_gid) :
+            kernel_vfs_file_set_owner(&file,UINT32_MAX,cases[i].new_gid)));
+        struct kernel_vfs_stat stat;
+        assert(!(anonymous ? kernel_pipe_stat(pipe,&stat) : kernel_vfs_fstat(&file,&stat)));
+        if ((stat.mode&07777)!=cases[i].expected)
+            fprintf(stderr,"chown group case=%u pipe=%u mode=%o expected=%o oldgid=%u newgid=%u\n",
+                i,anonymous,stat.mode&07777,cases[i].expected,cases[i].old_gid,cases[i].new_gid);
+        assert(stat.uid==1000 && stat.gid==cases[i].new_gid && (stat.mode&07777)==cases[i].expected);
+    }
+    (void)kernel_credentials_override(root);
+    assert(!kernel_vfs_close(&file) && !kernel_pipe_destroy_unowned(pipe));
+    (void)kernel_credentials_override(NULL);
+    puts("PASS chown old/new group: set-ID removal filters new group only when MODE changes; actual file and pipe metadata");
+}
+
+struct credential_write_race {
+    struct kernel_vfs_file *file;
+    struct kernel_mm *mm;
+    struct kernel_credentials user;
+    struct kernel_vfs_user_write_result written;
+    unsigned change,changed;
+    int write_result,change_result;
+};
+static void *credential_paused_writer(void *argument)
+{
+    struct credential_write_race *race=argument;cache_test_attach(1);
+    mm_test_bind(race->mm);assert(!kernel_mm_context(race->mm,&mm_test_context));
+    (void)kernel_credentials_override(&race->user);
+    struct kernel_uaccess_iovec source={.base=0x10000,.length=BOAROS_PAGE_SIZE+17};
+    race->write_result=kernel_vfs_write_user(race->file,race->mm,&source,1,source.length,0,0,NULL,&race->written);
+    (void)kernel_credentials_override(NULL);mm_test_bind(NULL);mm_test_context=0;return NULL;
+}
+static void *credential_attribute_changer(void *argument)
+{
+    struct credential_write_race *race=argument;cache_test_attach(2);
+    if (race->change==0) race->change_result=kernel_vfs_file_set_mode(race->file,04666);
+    else if (race->change==1) race->change_result=kernel_vfs_path_set_mode(race->file->path,04666);
+    else if (race->change==2) race->change_result=kernel_vfs_file_set_owner(race->file,2000,200);
+    else race->change_result=kernel_vfs_path_set_owner(race->file->path,2000,200);
+    __atomic_store_n(&race->changed,1,__ATOMIC_RELEASE);return NULL;
+}
+static void credential_write_attributes(struct kernel_heap *heap,struct physical_page_allocator *pages,
+    struct kernel_vfs_mount *mount)
+{
+    struct arch_mmu_page_table kernel={0};struct arch_mmu_user_space space={0};struct kernel_mm mm={0};
+    assert(!riscv_sv39_page_table_init(&kernel,pages));kernel.state=ARCH_MMU_STATE_ACTIVE;
+    assert(!arch_mmu_user_space_init(&space,pages,&kernel) && !kernel_mm_create(&mm,&space) && !kernel_mm_vma_enable(&mm,heap));
+    assert(!kernel_mm_context(&mm,&mm_test_context) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+    uint64_t end;assert(!kernel_mm_brk(&mm,0x10000+2*BOAROS_PAGE_SIZE,&end));
+    mm_test_bind(&mm);
+    unsigned char bytes[BOAROS_PAGE_SIZE+17];memset(bytes,0x59,sizeof(bytes));size_t copied;
+    assert(!kernel_copy_to_user(&mm,0x10000,bytes,sizeof(bytes),&copied) && copied==sizeof(bytes));
+    mm_test_bind(NULL);mm_test_context=0;
+    for (unsigned change=0;change<4;change++) {
+        char name[48];snprintf(name,sizeof(name),"/write-attributes-%u",change);
+        struct kernel_vfs_file file={0};assert(!kernel_vfs_create(mount,name,04666,&file));
+        struct credential_write_race race={.file=&file,.mm=&mm,.change=change,.user=*kernel_credentials_current()};
+        race.user.uid=race.user.euid=race.user.suid=race.user.fsuid=1000;
+        race.user.gid=race.user.egid=race.user.sgid=race.user.fsgid=100;
+        race.user.effective=race.user.permitted=race.user.inheritable=race.user.ambient=0;
+        credential_pin_pause=1;credential_pin_entered=credential_pin_resume=0;
+        pthread_t writer,changer;assert(!pthread_create(&writer,NULL,credential_paused_writer,&race));
+        wait_progress(&credential_pin_entered,1);
+        struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !(stat.mode&06000) && !stat.size);
+        unsigned parked=mm_test_parked(2);
+        assert(!pthread_create(&changer,NULL,credential_attribute_changer,&race));
+        while (mm_test_parked(2)==parked && !__atomic_load_n(&race.changed,__ATOMIC_ACQUIRE)) sched_yield();
+        unsigned premature=__atomic_load_n(&race.changed,__ATOMIC_ACQUIRE);
+        __atomic_store_n(&credential_pin_resume,1,__ATOMIC_RELEASE);
+        assert(!pthread_join(writer,NULL) && !pthread_join(changer,NULL));
+        assert(!race.write_result && !race.change_result && !race.written.access && race.written.written==sizeof(bytes));
+        expect_bytes(&file,bytes,sizeof(bytes));
+        assert(!kernel_vfs_fstat(&file,&stat) && stat.size==sizeof(bytes));
+        if (change<2) assert((stat.mode&07777)==04666);
+        else assert(stat.uid==2000 && stat.gid==200 && !(stat.mode&06000));
+        assert(!kernel_vfs_close(&file));
+        if (premature) fprintf(stderr,"attribute change=%u completed while writer awaited source pin; modified bytes followed permission publication\n",change);
+        assert(!premature);
+    }
+    assert(!kernel_mm_release(&mm) && !physical_page_release(pages,kernel.root_address));
+    puts("PASS write/attributes interleave: FD/path chmod/chown wait for all source fragments; final contents, permissions and owners retained");
+}
+
+static void credential_vfs_cases(struct kernel_vfs_mount *mount)
+{
+    const struct kernel_credentials *root=kernel_credentials_current();
+    struct kernel_credentials user=*root,other=*root;
+    user.uid=user.euid=user.suid=user.fsuid=1000;
+    user.gid=user.egid=user.sgid=user.fsgid=100;
+    user.effective=user.permitted=user.inheritable=user.ambient=0;
+    other=user;other.uid=other.euid=other.suid=other.fsuid=1001;
+    struct kernel_vfs_path *path=NULL;
+    assert(!kernel_vfs_path_root(mount,((struct kernel_vfs_instance *)mount->private_data)->heap,&path));
+    assert(!kernel_vfs_mkdir_at(path,path,"/identities",0777));
+    assert(!kernel_vfs_mkdir_at(path,path,"/sticky",01777));
+    assert(!kernel_vfs_mkdir_at(path,path,"/group",02777));
+    struct kernel_vfs_path *group=NULL;
+    assert(!kernel_vfs_path_resolve(path,path,"/group",1,&group));
+    assert(!kernel_vfs_path_set_owner(group,UINT32_MAX,200));
+    assert(!kernel_vfs_path_set_mode(group,02777));
+    assert(!kernel_vfs_path_release(&group));
+    struct kernel_vfs_file root_file={0};
+    assert(!kernel_vfs_create_at(path,path,"/sticky/root",0600,&root_file));
+    assert(!kernel_vfs_close(&root_file));
+    (void)kernel_credentials_override(&user);
+    struct kernel_vfs_open_request create={.flags=KERNEL_VFS_OPEN_CREATE|KERNEL_VFS_OPEN_EXCLUSIVE|KERNEL_VFS_OPEN_FOLLOW,.access=6};
+    struct kernel_vfs_file file={0};int created=0;struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_open_at(path,path,"/identities/zero",&create,&file,&created) && created);
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.uid==1000 && stat.gid==100 && !(stat.mode&0777));
+    size_t done=0;
+    assert(!kernel_vfs_pwrite(&file,0,"owner",5,&done) && done==5);
+    struct kernel_vfs_file denied={0};
+    struct kernel_vfs_open_request read={.flags=KERNEL_VFS_OPEN_FOLLOW,.access=4};
+    assert(kernel_vfs_open_at(path,path,"/identities/zero",&read,&denied,NULL)==-KERNEL_EACCES);
+    struct kernel_vfs_open_request directory=read;directory.flags |= KERNEL_VFS_OPEN_DIRECTORY;
+    assert(kernel_vfs_open_at(path,path,"/identities/zero",&directory,&denied,NULL)==-KERNEL_ENOTDIR);
+    struct kernel_vfs_open_request only_path={.flags=KERNEL_VFS_OPEN_PATH_ONLY};
+    assert(!kernel_vfs_open_at(path,path,"/identities/zero",&only_path,&denied,NULL));
+    assert(!kernel_vfs_path_release(&denied.path));memset(&denied,0,sizeof(denied));
+    assert(!kernel_vfs_file_set_mode(&file,0600));
+    assert(!kernel_vfs_access_at(path,path,"/identities/zero",6));
+    assert(kernel_vfs_access_at(path,path,"/identities/zero",1)==-KERNEL_EACCES);
+    assert(kernel_vfs_file_set_owner(&file,0,UINT32_MAX)==-KERNEL_EPERM);
+    assert(kernel_vfs_file_set_owner(&file,UINT32_MAX,200)==-KERNEL_EPERM);
+    assert(kernel_vfs_unlink_at(path,path,"/sticky/root",0)==-KERNEL_EPERM);
+    assert(!kernel_vfs_create_at(path,path,"/sticky/own",0600,&denied));
+    assert(!kernel_vfs_close(&denied));
+    assert(!kernel_vfs_unlink_at(path,path,"/sticky/own",0));
+    assert(!kernel_vfs_create_at(path,path,"/group/inherited",02770,&denied));
+    assert(!kernel_vfs_fstat(&denied,&stat) && stat.uid==1000 && stat.gid==200 && !(stat.mode&02000));
+    assert(!kernel_vfs_close(&denied));
+    (void)kernel_credentials_override(&other);
+    assert(kernel_vfs_file_set_mode(&file,0666)==-KERNEL_EPERM);
+    assert(!kernel_vfs_file_set_owner(&file,UINT32_MAX,UINT32_MAX));
+    assert(kernel_vfs_file_set_owner(&file,1000,UINT32_MAX)==-KERNEL_EPERM);
+    assert(kernel_vfs_file_set_owner(&file,UINT32_MAX,100)==-KERNEL_EPERM);
+    assert(kernel_vfs_access_at(path,path,"/identities/zero",4)==-KERNEL_EACCES);
+    assert(kernel_vfs_path_truncate(file.path,0,NULL)==-KERNEL_EACCES);
+    /* The existing opened description keeps the access granted to its opener. */
+    assert(!kernel_vfs_pwrite(&file,5,"fd",2,&done) && done==2);
+    (void)kernel_credentials_override(root);
+    assert(!kernel_vfs_file_set_mode(&file,06777));
+    (void)kernel_credentials_override(&other);
+    assert(kernel_vfs_file_set_owner(&file,UINT32_MAX,UINT32_MAX)==-KERNEL_EPERM);
+    (void)kernel_credentials_override(&user);
+    assert(!kernel_vfs_pwrite(&file,0,"x",1,&done) && done==1);
+    assert(!kernel_vfs_fstat(&file,&stat) && !(stat.mode&06000));
+    (void)kernel_credentials_override(root);
+    assert(!kernel_vfs_file_set_mode(&file,06777));
+    (void)kernel_credentials_override(&user);
+    assert(!kernel_vfs_ftruncate(&file,1));
+    assert(!kernel_vfs_fstat(&file,&stat) && !(stat.mode&06000));
+    (void)kernel_credentials_override(root);
+    assert(!kernel_vfs_file_set_mode(&file,06777));
+    (void)kernel_credentials_override(&user);
+    struct kernel_vfs_size_limit limit={.maximum=0};
+    assert(kernel_vfs_ftruncate_borrowing(&file,4096,NULL,&limit)==-KERNEL_EFBIG && limit.exceeded);
+    assert(!kernel_vfs_fstat(&file,&stat) && (stat.mode&06000)==06000);
+    if (!kernel_tmpfs_is_mount(mount)) {
+        limit.exceeded=0;
+        assert(kernel_vfs_fallocate_borrowing(&file,0,0,4096,NULL,&limit)==-KERNEL_EFBIG && limit.exceeded);
+        assert(!kernel_vfs_fstat(&file,&stat) && !(stat.mode&06000));
+        (void)kernel_credentials_override(root);
+        assert(!kernel_vfs_file_set_mode(&file,06777));
+        (void)kernel_credentials_override(&user);
+        size_t block=lwext4_instance(mount->private_data)->device.lg_bsize;
+        uint64_t before_blocks=allocated(&file),before_size=kernel_vfs_file_size(&file);
+        fail_reserve=1;
+        assert(kernel_vfs_fallocate(&file,1,8*block,block)==-KERNEL_ENOMEM && !fail_reserve);
+        assert(allocated(&file)==before_blocks && kernel_vfs_file_size(&file)==before_size);
+        assert(!kernel_vfs_fstat(&file,&stat) && !(stat.mode&06000));
+    }
+    (void)kernel_credentials_override(root);
+    assert(!kernel_vfs_close(&file));
+    if (!kernel_tmpfs_is_mount(mount)) {
+        struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+        char name[100];snprintf(name,sizeof(name),"%sidentities/capability",adapter->mount_point);
+        ext4_file raw={0};
+        assert(!ext4_fopen(&raw,name,"w+") && !ext4_file_set_mode(&raw,0755) && !ext4_fclose(&raw));
+        uint32_t cap[6]={0x02000001,1,0,0,0,0};
+        unsigned char padding[48]={1};
+        assert(!ext4_setxattr(name,"user.padding",12,padding,sizeof(padding)));
+        assert(!ext4_setxattr(name,"security.capability",19,cap,20));
+        assert(!ext4_fopen(&raw,name,"r+"));
+        struct ext4_inode initial,after;
+        assert(!ext4_fraw_inode_fill(&raw,&initial) && ext4_inode_get_file_acl(&initial,&adapter->device.fs->sb));
+        assert(!ext4_transaction_begin(adapter->mount_point));
+        assert(!ext4_file_remove_privileges(&raw,0100700));
+        assert(ext4_transaction_abort(adapter->mount_point,ECANCELED)==ECANCELED);
+        assert(!ext4_fraw_inode_fill(&raw,&after) && !memcmp(&initial,&after,sizeof(initial)));
+        size_t length=0;uint32_t restored[6]={0};
+        assert(!ext4_file_capability(&raw,restored,sizeof(restored),&length) && length==20 && !memcmp(restored,cap,20));
+        assert(!ext4_fclose(&raw));
+        assert(!kernel_vfs_open_executable(mount,"/identities/capability",&file));
+        struct kernel_vfs_exec_metadata exec;
+        fail_capability_read=1;
+        assert(kernel_vfs_exec_metadata(&file,&exec,1)==-KERNEL_EIO && !fail_capability_read);
+        assert(!kernel_vfs_exec_metadata(&file,&exec,1) && exec.filecap_present && exec.filecap_size==20 && !memcmp(exec.filecap,cap,20));
+        assert(exec.uid==0 && exec.gid==0 && exec.readable);
+        mount->nosuid=1;
+        assert(!kernel_vfs_exec_metadata(&file,&exec,1) && exec.nosuid && !exec.filecap_present);
+        mount->nosuid=0;assert(!kernel_vfs_close(&file));
+        assert(!kernel_vfs_open(mount,"/identities/capability",&file));
+        fail_capability_remove=1;done=0;
+        assert(kernel_vfs_pwrite(&file,0,"x",1,&done)==-KERNEL_ENOMEM && !done && !fail_capability_remove);
+        assert(!ext4_file_capability(lwext4_node_file(file.private_data),restored,sizeof(restored),&length) && length==20);
+        assert(!kernel_vfs_pwrite(&file,0,"x",1,&done));
+        size_t bytes=0;assert(ext4_file_capability(lwext4_node_file(file.private_data),cap,sizeof(cap),&bytes)==ENODATA);
+        assert(!kernel_vfs_close(&file));
+    }
+    assert(!kernel_vfs_path_release(&path));
+    (void)kernel_credentials_override(NULL);
+    puts("PASS credentials VFS: numeric owner/group, mode=000 creation, DAC/O_PATH/sticky/SGID, retained FD rights, set-ID clearing and inode filecap snapshot");
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==3); setvbuf(stdout,NULL,_IONBF,0); cache_test_attach(0);
@@ -970,6 +1308,10 @@ int main(int argc,char **argv)
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
         !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
+    if (!strcmp(argv[2],"credential-race")) {credential_namespace_race(&mount);goto mounted_done;}
+    if (!strcmp(argv[2],"credential-chown")) {credential_chown_groups(&mount);goto mounted_done;}
+    if (!strcmp(argv[2],"credential-write-race")) {credential_write_attributes(&heap,&pages,&mount);goto mounted_done;}
+    if (!strcmp(argv[2],"vfs-credentials")) {credential_vfs_cases(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"namespace-budget")) { namespace_budget(&mount);goto mounted_done; }
     if (!strncmp(argv[2],"namespace-",10)) {
         namespace_pressure(&cache,&mount,!strcmp(argv[2],"namespace-reclaim"));goto mounted_done;
@@ -1010,6 +1352,9 @@ mounted_done:
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache) && !close(image_fd));
     struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file unsupported={0};
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
+    if (!strcmp(argv[2],"vfs-credentials")) credential_vfs_cases(memory);
+    if (!strcmp(argv[2],"credential-chown")) credential_chown_groups(memory);
+    if (!strcmp(argv[2],"credential-write-race")) credential_write_attributes(&heap,&pages,memory);
     assert(!kernel_vfs_create(memory,"/unsupported",0600,&unsupported));
     assert(kernel_vfs_fallocate(&unsupported,0,0,4096)==-KERNEL_EOPNOTSUPP);
     assert(kernel_vfs_fallocate(&unsupported,1,0,4096)==-KERNEL_EOPNOTSUPP);

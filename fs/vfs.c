@@ -5,6 +5,8 @@
 #include <arch/context.h>
 
 #include <kernel/block.h>
+#include <kernel/credentials.h>
+#include <kernel/io_context.h>
 #include <kernel/errno.h>
 #include <kernel/file_mapping.h>
 #include <kernel/fs_context.h>
@@ -26,6 +28,130 @@
 struct kernel_raw_lock kernel_vfs_state_lock = {
     .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED
 };
+
+/* The live inode keeps the three DAC fields together. Callers retain the
+ * namespace/inode qualification through mutations; reads take a small snapshot. */
+int kernel_vfs_dac_permission(uint32_t mode, uint32_t uid, uint32_t gid,
+    unsigned access, const struct kernel_credentials *cred)
+{
+    unsigned granted = cred->fsuid == uid ? mode >> 6 :
+        kernel_credentials_in_group(cred, gid) ? mode >> 3 : mode;
+    if (!(access & ~granted & 7U)) return 0;
+    int directory = (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
+    if (kernel_credentials_capable(cred, KERNEL_CAP_DAC_OVERRIDE) &&
+        (directory || !(access & 1U) || (mode & 0111U))) return 0;
+    if (kernel_credentials_capable(cred, KERNEL_CAP_DAC_READ_SEARCH) &&
+        (directory ? !(access & 2U) : access == 4U)) return 0;
+    return -KERNEL_EACCES;
+}
+static int inode_permission(struct kernel_vfs_node *node, unsigned access)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    uint32_t type=node->mode & KERNEL_VFS_S_IFMT;
+    if ((access & 2U) && node->instance->read_only &&
+        (type==KERNEL_VFS_S_IFREG || type==KERNEL_VFS_S_IFDIR || type==KERNEL_VFS_S_IFLNK)) return -KERNEL_EROFS;
+    /* Type is fixed for this inode identity. A DAC override needs no mutable
+     * owner/mode snapshot except the execute-bit check on non-directories. */
+    if (!access || (kernel_credentials_capable(cred,KERNEL_CAP_DAC_OVERRIDE) &&
+        (!(access & 1U) || (node->mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR))) return 0;
+    KERNEL_LOCK_SCOPE(io);
+    kernel_vfs_node_lock(node, &io, 0);
+    return node->instance->ops->permission ? node->instance->ops->permission(node,cred,access) :
+        kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
+}
+int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access)
+{
+    if (!path || !path->file.private_data) return -KERNEL_EINVAL;
+    KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(path->file.mount));
+    return inode_permission(path->file.private_data, access);
+}
+int kernel_vfs_chmod_allowed(uint32_t uid,uint32_t gid,uint32_t *mode)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if (cred->fsuid != uid && !kernel_credentials_capable(cred,KERNEL_CAP_FOWNER))
+        return -KERNEL_EPERM;
+    if ((*mode & 02000U) && !kernel_credentials_in_group(cred,gid) &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_FSETID)) *mode &= ~02000U;
+    return 0;
+}
+int kernel_vfs_chown_allowed(uint32_t old_uid,uint32_t old_gid,uint32_t mode,uint32_t uid,uint32_t gid)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    int privileged=kernel_credentials_capable(cred,KERNEL_CAP_CHOWN);
+    if (uid!=UINT32_MAX && !(cred->fsuid==old_uid && uid==old_uid) && !privileged)
+        return -KERNEL_EPERM;
+    if (gid!=UINT32_MAX && !(cred->fsuid==old_uid &&
+        (gid==old_gid || kernel_credentials_in_group(cred,gid))) && !privileged)
+        return -KERNEL_EPERM;
+    /* notify_change turns an actual set-ID removal into ATTR_MODE. Even an
+     * otherwise empty chown must satisfy that attribute's owner check. */
+    if (kernel_vfs_chown_mode(mode,old_gid,gid==UINT32_MAX?old_gid:gid)!=mode && cred->fsuid!=old_uid &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return -KERNEL_EPERM;
+    return 0;
+}
+
+uint32_t kernel_vfs_chown_mode(uint32_t mode,uint32_t old_gid,uint32_t new_gid)
+{
+    if ((mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) return mode;
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    uint32_t original=mode;
+    mode &= ~04000U;
+    if ((mode & 0010U) || (!kernel_credentials_in_group(cred,old_gid) &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_FSETID))) mode &= ~02000U;
+    /* Linux first removes set-ID against the old inode. Only an actual MODE
+     * update passes the remaining SGID through the requested group's check. */
+    if (mode!=original && !kernel_credentials_in_group(cred,new_gid) &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_FSETID)) mode &= ~02000U;
+    return mode;
+}
+uint32_t kernel_vfs_write_mode(uint32_t mode,uint32_t gid)
+{
+    if (kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_FSETID)) return mode;
+    return (mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG ? kernel_vfs_chown_mode(mode,gid,gid) : mode;
+}
+int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *node,const struct kernel_vfs_timespec times[2])
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if (cred->fsuid==node->uid || kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return 0;
+    if (!times || (times[0].nanoseconds==KERNEL_VFS_UTIME_NOW && times[1].nanoseconds==KERNEL_VFS_UTIME_NOW))
+        return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,2U,cred);
+    return -KERNEL_EPERM;
+}
+void kernel_vfs_creation_identity(uint32_t parent_mode,uint32_t parent_gid,
+    uint32_t *mode,uint32_t *uid,uint32_t *gid)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    *uid=cred->fsuid; *gid=cred->fsgid;
+    if (parent_mode & 02000U) {
+        *gid=parent_gid;
+        if ((*mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) *mode |= 02000U;
+        else if ((mode[0] & 0010U) && !kernel_credentials_in_group(cred,parent_gid) &&
+                 !kernel_credentials_capable(cred,KERNEL_CAP_FSETID)) *mode &= ~02000U;
+    }
+}
+static int directory_mutation_allowed(struct kernel_vfs_path *parent,struct kernel_vfs_path *target)
+{
+    struct kernel_vfs_node *dir=parent->file.private_data;
+    /* Parent namespace qualification also excludes chmod/chown publication. */
+    int result=kernel_vfs_dac_permission(dir->mode,dir->uid,dir->gid,3U,kernel_credentials_current());
+    if (result || !target) return result;
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    struct kernel_vfs_node *node=target->file.private_data;
+    if ((dir->mode & 01000U) && cred->fsuid!=dir->uid && cred->fsuid!=node->uid &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return -KERNEL_EPERM;
+    return 0;
+}
+int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,struct kernel_vfs_exec_metadata *out, int read_filecap)
+{
+    if (!file || !file->exec_lease || !file->private_data || !out) return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node=file->private_data;
+    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,0);
+    *out=(struct kernel_vfs_exec_metadata){.mode=node->mode,.uid=node->uid,.gid=node->gid,
+        .nosuid=file->mount->nosuid,
+        .readable=!kernel_vfs_dac_permission(node->mode,node->uid,node->gid,4U,kernel_credentials_current())};
+    return read_filecap && !out->nosuid && node->instance->ops->exec_metadata
+        ? node->instance->ops->exec_metadata(node,out) : 0;
+}
 
 static int vfs_open_raw(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
@@ -566,6 +692,8 @@ static int path_lookup_locked(struct kernel_vfs_path *parent,
     if (name_length > 255U) return -KERNEL_ENAMETOOLONG;
     if ((parent->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_ENOTDIR;
+    result = inode_permission(parent->file.private_data, KERNEL_VFS_MAY_EXEC);
+    if (result) return result;
     if (name_length == 1U && name[0] == '.') {
         result = kernel_vfs_path_acquire(parent);
         if (result == 0) *owner = parent;
@@ -727,7 +855,8 @@ static int resolve_object(struct kernel_vfs_path *start,
         }
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {
-            result = kernel_vfs_path_acquire(root);
+            result = inode_permission(current->file.private_data, KERNEL_VFS_MAY_EXEC);
+            if (!result) result = kernel_vfs_path_acquire(root);
             if (!result) next = root;
         } else {
             result = path_lookup_locked(current, pending + begin,
@@ -998,9 +1127,6 @@ int kernel_vfs_path_set_mode(struct kernel_vfs_path *path, uint32_t mode)
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    namespace_node_lock(path->file.private_data, &namespace_guard, 1);
-
     if (!path || !path->references) return -KERNEL_EINVAL;
     return kernel_vfs_file_set_mode(&path->file, mode);
 }
@@ -1123,6 +1249,8 @@ static int create_at_parent(struct kernel_vfs_path **owner, const char *name,
     if (instance->read_only || !instance->ops->create) return -KERNEL_EROFS;
     if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked)
         return -KERNEL_ENOENT;
+    int allowed=directory_mutation_allowed(parent,NULL);
+    if (allowed) return allowed;
     enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(
         parent->heap,1U,sizeof(*child)+strlen(name)+1U,(void **)&child);
     if (allocation != KERNEL_HEAP_STATUS_OK)
@@ -1174,6 +1302,8 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         else if (!missing[0]) {
             if (create && path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else if (exclusive) result=-KERNEL_EEXIST;
+            else if ((flags & KERNEL_VFS_OPEN_DIRECTORY) &&
+                (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) result=-KERNEL_ENOTDIR;
             else if (flags & KERNEL_VFS_OPEN_PATH_ONLY) {
                 file->path=resolved;resolved=NULL;
                 file->mount=file->path->file.mount;file->mode=file->path->file.mode;
@@ -1181,7 +1311,15 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                 result=-KERNEL_ELOOP;
             else if (create && (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
                 result=-KERNEL_EISDIR;
-            else result=path_open_locked(resolved,file);
+            else if ((request->access & 2U) &&
+                (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) result=-KERNEL_EISDIR;
+            else if ((flags & KERNEL_VFS_OPEN_EXECUTABLE) &&
+                (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) result=-KERNEL_EACCES;
+            else {
+                result=inode_permission(resolved->file.private_data,request->access |
+                    ((flags & KERNEL_VFS_OPEN_EXECUTABLE) ? KERNEL_VFS_MAY_EXEC : 0));
+                if (!result) result=path_open_locked(resolved,file);
+            }
         } else {
             if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else {
@@ -1306,7 +1444,9 @@ static int finish_executable_open(struct kernel_vfs_file *file, int result)
     {
         KERNEL_LOCK_SCOPE(node_guard);
         kernel_vfs_node_lock(node, &node_guard, 1);
-        if (node->write_openers > 0U) lease_error = -KERNEL_ETXTBSY;
+        lease_error=kernel_vfs_dac_permission(node->mode,node->uid,node->gid,1U,kernel_credentials_current());
+        if (lease_error) {}
+        else if (node->write_openers > 0U) lease_error = -KERNEL_ETXTBSY;
         else if (node->exec_users == UINT32_MAX) lease_error = -KERNEL_EOVERFLOW;
         else {
             node->exec_users++;
@@ -1520,6 +1660,10 @@ static int vfs_write_source(struct kernel_vfs_file *file,uint64_t offset,
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     if (size > node->max_size - offset)
         size = (size_t)(node->max_size - offset);
+    if (node->instance->ops->killpriv) {
+        result=node->instance->ops->killpriv(node,kernel_vfs_write_mode(node->mode,node->gid));
+        if (result) return result;
+    }
     if (source->mm) {
         /* 首字节用户fault仍保留修改时间；限额拒绝则没有这项副作用。 */
         result = kernel_vfs_file_modified(file, offset, 0);
@@ -1630,7 +1774,8 @@ int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
     if (!path || !path->references) return -KERNEL_EINVAL;
     if ((kernel_vfs_path_mode(path) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
         return -KERNEL_EISDIR;
-    return kernel_vfs_ftruncate_borrowing(&path->file, size, NULL, limit);
+    int allowed=kernel_vfs_path_permission(path,KERNEL_VFS_MAY_WRITE);
+    return allowed ? allowed : kernel_vfs_ftruncate_borrowing(&path->file, size, NULL, limit);
 }
 
 struct kernel_block_device *kernel_vfs_file_block_device(const struct kernel_vfs_file *file)
@@ -1665,6 +1810,14 @@ int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     uint64_t end = offset + length, old_size = node->size;
     /* vfs_fallocate先拒绝文件系统上限，后端的进程限额检查才可能发信号。 */
     if (end > node->max_size) return -KERNEL_EFBIG;
+    /* ext4 file_modified precedes its new-size/FSIZE and allocation checks.
+     * A later space failure preserves this already accepted privilege removal. */
+    if (node->instance->ops->killpriv) {
+        int privilege=node->instance->ops->killpriv(node,kernel_vfs_write_mode(node->mode,node->gid));
+        if (privilege) return privilege;
+    }
+    int modified=kernel_vfs_file_modified(file,offset,0);
+    if (modified) return modified;
     if (!mode && end > old_size && limit && end > limit->maximum) {
         limit->exceeded = 1;
         return -KERNEL_EFBIG;
@@ -1994,26 +2147,31 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
     return stat_at_resolved(start, root, path, follow_final, stat, &target);
 }
 
+static void release_credential_override(const struct kernel_credentials **previous)
+{ (void)kernel_credentials_override(*previous); }
+
 int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          unsigned mode)
 {
+    if (mode & ~7U) return -KERNEL_EINVAL;
+    const struct kernel_credentials *current=kernel_credentials_current();
+    struct kernel_credentials access=*current;
+    access.fsuid=access.uid; access.fsgid=access.gid;
+    if (!(access.securebits & KERNEL_SECBIT_NO_SETUID_FIXUP))
+        access.effective=access.uid==0 ? access.permitted : 0;
+    const struct kernel_credentials *previous
+        __attribute__((cleanup(release_credential_override)))=kernel_credentials_override(&access);
     struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_stat stat;
-    if (mode & ~7U) return -KERNEL_EINVAL;
-    int result = stat_at_resolved(start, root, path, 1, &stat, &target);
+    int result=stat_at_resolved(start,root,path,1,&stat,&target);
     if (result) return result;
-    uint32_t type = stat.mode & KERNEL_VFS_S_IFMT;
-    /* Root bypasses read/write DACs and directory search, but every other
-     * inode type still needs an executable bit before readonly is considered. */
-    if ((mode & 1U) && type != KERNEL_VFS_S_IFDIR &&
-        !(stat.mode & (KERNEL_VFS_S_IXUSR | KERNEL_VFS_S_IXGRP |
-                       KERNEL_VFS_S_IXOTH)))
-        return -KERNEL_EACCES;
+    result=kernel_vfs_dac_permission(stat.mode,stat.uid,stat.gid,mode,&access);
+    if (result) return result;
+    uint32_t type=stat.mode & KERNEL_VFS_S_IFMT;
     if ((mode & 2U) && target &&
-        (type == KERNEL_VFS_S_IFREG || type == KERNEL_VFS_S_IFDIR) &&
-        kernel_vfs_mount_is_readonly(target->file.mount))
-        return -KERNEL_EROFS;
+        (type==KERNEL_VFS_S_IFREG || type==KERNEL_VFS_S_IFDIR) &&
+        kernel_vfs_mount_is_readonly(target->file.mount)) return -KERNEL_EROFS;
     return 0;
 }
 
@@ -2052,7 +2210,10 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
         result = -KERNEL_EEXIST;
     } else {
         struct kernel_vfs_instance *instance = path->file.mount->private_data;
-        result = instance->read_only ? -KERNEL_EROFS : !instance->ops->mknod
+        result = instance->read_only ? -KERNEL_EROFS : directory_mutation_allowed(path,NULL);
+        if (!result && (type==KERNEL_VFS_S_IFCHR || type==KERNEL_VFS_S_IFBLK) &&
+            !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_MKNOD)) result=-KERNEL_EPERM;
+        if (!result) result = !instance->ops->mknod
                      ? -KERNEL_ENOTSUP
                      : instance->ops->mknod(instance, kernel_vfs_path_inode(path), name, type, mode, device);
     }
@@ -2074,7 +2235,8 @@ int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
     if (result) return result;
     result = !name[0] ? -KERNEL_EEXIST :
                  kernel_vfs_mount_is_readonly(path->file.mount) ? -KERNEL_EROFS :
-                 vfs_mkdir_raw(path->file.mount, kernel_vfs_path_inode(path), name, mode);
+                 directory_mutation_allowed(path,NULL);
+    if (!result) result=vfs_mkdir_raw(path->file.mount,kernel_vfs_path_inode(path),name,mode);
     (void)kernel_vfs_path_release(&path);
     return result;
 }
@@ -2153,7 +2315,8 @@ int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
     else if (kernel_vfs_mount_is_readonly(parent->file.mount)) result = -KERNEL_EROFS;
     else {
         namespace_inode_lock(path->file.private_data, &inode_guard);
-        result = directory ? vfs_rmdir_raw(parent->file.mount, kernel_vfs_path_inode(parent), name)
+        result = directory_mutation_allowed(parent,path);
+        if (!result) result = directory ? vfs_rmdir_raw(parent->file.mount, kernel_vfs_path_inode(parent), name)
                            : vfs_unlink_raw(parent->file.mount, kernel_vfs_path_inode(parent), name);
     }
     if (!result) {
@@ -2206,6 +2369,7 @@ int kernel_vfs_link_at(struct kernel_vfs_path *source,
     /* 目标存在优先于跨挂载；NULL 源表示已 pin 的无路径 pipe/socket OFD。 */
     if (!name[0]) result = -KERNEL_EEXIST;
     else if (instance->read_only) result = -KERNEL_EROFS;
+    else if ((result=directory_mutation_allowed(parent,NULL))) {}
     else if (!source || source->file.mount != parent->file.mount)
         result = -KERNEL_EXDEV;
     else if ((source->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ||
@@ -2239,7 +2403,8 @@ int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
     struct kernel_vfs_instance *instance = path->file.mount->private_data;
     result = !name[0] ? -KERNEL_EEXIST :
              instance->read_only || !instance->ops->symlink ? -KERNEL_EROFS :
-             instance->ops->symlink(instance, kernel_vfs_path_inode(path), target, name);
+             directory_mutation_allowed(path,NULL);
+    if (!result) result=instance->ops->symlink(instance,kernel_vfs_path_inode(path),target,name);
     (void)kernel_vfs_path_release(&path);
     return result;
 }
@@ -2321,6 +2486,7 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
     KERNEL_LOCK_SCOPE(topology_guard);
     struct namespace_guards directories __attribute__((cleanup(namespace_guards_release)))={0};
     KERNEL_LOCK_SCOPE(inode_guard);
+    KERNEL_LOCK_SCOPE(source_inode_guard);
 
     struct kernel_vfs_path *source = 0, *target = 0, *new_parent = 0;
     struct kernel_vfs_path *source_parent = 0;
@@ -2418,8 +2584,24 @@ LookupNames:
     /* Moving a name preserves source EOF and mapping. Its path reference
      * retains the object; the backend owns ctime. Only a replaced inode can
      * become unlinked and race the last FD's data/cache cleanup. */
-    if (target && target->file.private_data != source->file.private_data)
-        namespace_inode_lock(target->file.private_data, &inode_guard);
+    struct kernel_vfs_node *source_node=source->file.private_data;
+    struct kernel_vfs_node *target_node=target ? target->file.private_data : NULL;
+    const struct kernel_credentials *actor=kernel_credentials_current();
+    int source_identity=((struct kernel_vfs_node *)source_parent->file.private_data)->mode & 01000U;
+    source_identity=source_identity && !kernel_credentials_capable(actor,KERNEL_CAP_FOWNER);
+    if (source_identity && target_node && target_node!=source_node && target_node->inode<source_node->inode) {
+        namespace_inode_lock(target_node,&inode_guard);
+        namespace_inode_lock(source_node,&source_inode_guard);
+    } else {
+        if (source_identity) namespace_inode_lock(source_node,&source_inode_guard);
+        if (target_node && target_node!=source_node) namespace_inode_lock(target_node,&inode_guard);
+    }
+    result=directory_mutation_allowed(source_parent,source);
+    if (!result) result=directory_mutation_allowed(new_parent,target);
+    if (!result && source_parent!=new_parent &&
+        (source_node->mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
+        result=kernel_vfs_dac_permission(source_node->mode,source_node->uid,source_node->gid,2U,actor);
+    if (result) goto Finish;
     enum kernel_heap_status allocation = kernel_heap_allocate(source->heap,
                                   strlen(missing) + 1U, (void **)&new_name);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
@@ -2456,7 +2638,11 @@ LookupNames:
     if (old_name != source->initial_name) release_path(source->heap, old_name);
     (void)kernel_vfs_path_release(&old_parent);
 Finish:
-    kernel_lock_scope_release(&inode_guard);
+    if (inode_guard.lock && source_inode_guard.lock && inode_guard.previous==&source_inode_guard) {
+        kernel_lock_scope_release(&inode_guard);kernel_lock_scope_release(&source_inode_guard);
+    } else {
+        kernel_lock_scope_release(&source_inode_guard);kernel_lock_scope_release(&inode_guard);
+    }
     namespace_guards_release(&directories);
     kernel_lock_scope_release(&topology_guard);
     if (source_parent && walk.mount!=source_parent->file.mount) path_walk_release(&walk);
@@ -3087,7 +3273,9 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
-    return instance->ops->statfs(mount, stat);
+    int result=instance->ops->statfs(mount, stat);
+    if (!result && mount->nosuid) stat->flags |= 2U;
+    return result;
 }
 
 int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
@@ -3095,6 +3283,8 @@ int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
 {
     KERNEL_SERVICE_SCOPE_IF(service, file && kernel_vfs_namespace_requires_cpu0(file->mount));
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    namespace_node_lock(file->private_data,&namespace_guard,1);
     struct kernel_vfs_instance *instance = file->mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->set_times(file, times);
@@ -3104,6 +3294,10 @@ int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode)
 {
     KERNEL_SERVICE_SCOPE_IF(service, file && kernel_vfs_namespace_requires_cpu0(file->mount));
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(file,&operation);
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    namespace_node_lock(file->private_data,&namespace_guard,1);
     struct kernel_vfs_instance *instance = file->mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->set_mode(file, mode);
@@ -3113,6 +3307,10 @@ int kernel_vfs_file_set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32
 {
     KERNEL_SERVICE_SCOPE_IF(service, file && kernel_vfs_namespace_requires_cpu0(file->mount));
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(file,&operation);
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    namespace_node_lock(file->private_data,&namespace_guard,1);
     struct kernel_vfs_instance *instance = file->mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
     if (instance->read_only) return -KERNEL_EROFS;
@@ -3124,8 +3322,6 @@ int kernel_vfs_path_set_owner(struct kernel_vfs_path *path, uint32_t uid, uint32
 {
     KERNEL_SERVICE_SCOPE_IF(service, path && kernel_vfs_namespace_requires_cpu0(path->file.mount));
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    namespace_node_lock(path->file.private_data, &namespace_guard, 1);
     return kernel_vfs_file_set_owner(&path->file, uid, gid);
 }
 

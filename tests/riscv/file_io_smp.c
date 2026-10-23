@@ -47,12 +47,12 @@ static void observe_metadata(ext4_file *file, unsigned operation)
 int __real_ext4_file_prepare_write(ext4_file *,uint64_t,size_t,size_t *,bool *);
 int __wrap_ext4_file_prepare_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,bool *complete)
 { observe_metadata(file,0); return __real_ext4_file_prepare_write(file,offset,length,ready,complete); }
-int __real_ext4_ftruncate(ext4_file *,uint64_t);
-int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size)
-{ observe_metadata(file,1); return __real_ext4_ftruncate(file,size); }
-int __real_ext4_fallocate(ext4_file *,unsigned,uint64_t,uint64_t,bool *);
-int __wrap_ext4_fallocate(ext4_file *file,unsigned mode,uint64_t offset,uint64_t length,bool *changed)
-{ observe_metadata(file,2); return __real_ext4_fallocate(file,mode,offset,length,changed); }
+int __real_ext4_ftruncate(ext4_file *,uint64_t, uint32_t privilege_mode);
+int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size, uint32_t privilege_mode)
+{ observe_metadata(file,1); return __real_ext4_ftruncate(file,size, privilege_mode); }
+int __real_ext4_fallocate(ext4_file *,unsigned,uint64_t,uint64_t,bool *, uint32_t privilege_mode);
+int __wrap_ext4_fallocate(ext4_file *file,unsigned mode,uint64_t offset,uint64_t length,bool *changed, uint32_t privilege_mode)
+{ observe_metadata(file,2); return __real_ext4_fallocate(file,mode,offset,length,changed, privilege_mode); }
 int __real_ext4_file_sync_metadata_prepare(ext4_file *,bool,uint64_t *);
 int __wrap_ext4_file_sync_metadata_prepare(ext4_file *file,bool data_only,uint64_t *target)
 { observe_metadata(file,3); return __real_ext4_file_sync_metadata_prepare(file,data_only,target); }
@@ -67,9 +67,9 @@ static void observe_namespace(unsigned kind)
 int __real_ext4_lookup_child(const char *,uint32_t,const char *,uint32_t,uint32_t *,uint32_t *);
 int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,uint32_t length,uint32_t *ino,uint32_t *mode)
 { observe_namespace(0);return __real_ext4_lookup_child(mount,parent,name,length,ino,mode); }
-int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *);
-int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file,struct ext4_inode *initial)
-{ observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file,initial); }
+int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *,uint32_t uid,uint32_t gid);
+int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file,struct ext4_inode *initial,uint32_t uid,uint32_t gid)
+{ observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file,initial,uid,gid); }
 int __real_ext4_unlink_child(const char *,uint32_t,const char *,bool,uint32_t *,bool *);
 int __wrap_ext4_unlink_child(const char *mount,uint32_t parent,const char *name,bool dir,uint32_t *ino,bool *orphan)
 { observe_namespace(2);return __real_ext4_unlink_child(mount,parent,name,dir,ino,orphan); }

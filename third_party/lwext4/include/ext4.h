@@ -199,9 +199,11 @@ int ext4_file_writeback_times(ext4_file *file, bool wait);
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
+int ext4_file_capability(ext4_file *,void *,size_t,size_t *);
+int ext4_file_remove_privileges(ext4_file *,uint32_t mode);
 /* Live inode owner update, set-ID/capability removal and ctime share one
  * operation transaction. UINT32_MAX preserves the corresponding ID. */
-int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid);
+int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t privilege_mode);
 /* One operation for up to EXT4_BLOCK_BATCH_MAX ordered, disjoint file ranges. Sources are
  * borrowed on entry; a retained owner is released after its last full block's
  * ordered commit or abort. Failed mounts retain accepted versions for readers.
@@ -531,12 +533,12 @@ int ext4_fclose(ext4_file *file);
  * @param   size New file size.
  *
  * @return  Standard error code.*/
-int ext4_ftruncate(ext4_file *file, uint64_t size);
+int ext4_ftruncate(ext4_file *file, uint64_t size, uint32_t privilege_mode);
 #define EXT4_FALLOC_KEEP_SIZE 1U
 #define EXT4_FALLOC_PUNCH_HOLE 2U
 /* changed reports committed mapping/data changes even on a partial failure. */
 int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
-                   uint64_t length, bool *changed);
+                   uint64_t length, bool *changed, uint32_t privilege_mode);
 /* Prepare storage without publishing EOF or file bytes. A committed prefix
  * remains usable when a later range cannot be allocated. If complete is set,
  * write back accepted bytes before calling complete_write to trim unused
@@ -830,14 +832,14 @@ int ext4_dir_open(ext4_dir *dir, const char *path);
 int ext4_dir_open_file(ext4_file *file, const char *path);
 int ext4_chrdev_open_file(ext4_file *file, const char *path);
 int ext4_fopen_inode(ext4_file *file, const char *mount_point,
-                     uint32_t inode_number);
+                     uint32_t inode_number, struct ext4_inode *initial);
 /* The file output is published only on success. Optional initial attributes
  * are caller scratch filled before releasing the new inode reference, not a
  * disk/checksum image. Discard them on failure; a successful result remains
  * provisional until an outer transaction accepts it. */
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
-    struct ext4_inode *initial);
+    struct ext4_inode *initial,uint32_t uid,uint32_t gid);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,

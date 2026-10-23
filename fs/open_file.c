@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "open_file_internal.h"
 #include "block_file_internal.h"
 #include "record_lock.h"
@@ -151,6 +152,7 @@ static enum kernel_open_file_status create_open_file(
     if (kernel_vfs_file_generated(&file->file))
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -186,7 +188,8 @@ enum kernel_open_file_status kernel_open_file_create_at(
         if (kernel_vfs_file_generated(&file->file))
             file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
         file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
-        *owner = file;
+        file->credentials = kernel_credentials_get(kernel_credentials_current());
+    *owner = file;
     }
     *linux_result = result;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -252,6 +255,7 @@ enum kernel_open_file_status kernel_open_file_create_mode(
     file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -295,6 +299,7 @@ enum kernel_open_file_status kernel_open_file_create_executable(
     file->references = 1U;
     file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -331,6 +336,7 @@ enum kernel_open_file_status kernel_open_file_create_console(
         kernel_heap_release(heap, file);
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -381,6 +387,7 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
     file->pipe = pipe;
     file->pipe_endpoint = (uint8_t)endpoint;
     file->vfs_closed = 0U;
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -415,6 +422,7 @@ enum kernel_open_file_status kernel_open_file_create_epoll(
     file->open_flags = flags;
     file->vfs_closed = 0U;
     epoll->file = file;
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -444,6 +452,7 @@ enum kernel_open_file_status kernel_open_file_create_socket(
     if (!next_socket_proc_identity) __builtin_trap();
     file->proc_identity = next_socket_proc_identity++;
     arch_interrupt_restore(irq);
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -484,6 +493,10 @@ int kernel_open_file_pseudo_stat(
         .size = kernel_open_file_size(file),
         .blksize = BOAROS_PAGE_SIZE,
     };
+    if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET && file->credentials) {
+        stat->uid=file->credentials->fsuid;
+        stat->gid=file->credentials->fsgid;
+    }
     return 0;
 }
 
@@ -495,6 +508,13 @@ int kernel_open_file_pipe_pin(
         source->kind != KERNEL_OPEN_FILE_KIND_PIPE) return -KERNEL_EINVAL;
     unsigned mode = flags & 3U;
     if (mode > 2U) return -KERNEL_EINVAL;
+    struct kernel_vfs_stat stat;
+    int result=kernel_pipe_stat(source->pipe,&stat);
+    if (result) return result;
+    /* proc 重新打开创建新权利，区别于保留旧 OFD 的 dup。 */
+    result=kernel_vfs_dac_permission(stat.mode,stat.uid,stat.gid,
+        mode==0U?4U:mode==1U?2U:6U,kernel_credentials_current());
+    if (result) return result;
     uint32_t endpoint = mode == 0U ? KERNEL_PIPE_ENDPOINT_READ :
                         mode == 1U ? KERNEL_PIPE_ENDPOINT_WRITE :
                                      KERNEL_PIPE_ENDPOINT_BOTH;
@@ -702,6 +722,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             file->vfs_closed = 1U;
         }
     }
+    kernel_credentials_put(file->credentials);
     kernel_heap_release(file->heap, file);
     *owner = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -1181,4 +1202,9 @@ uint32_t kernel_open_file_poll(
     default:
         return KERNEL_POLLNVAL;
     }
+}
+
+const struct kernel_credentials *kernel_open_file_credentials(const struct kernel_open_file_description *file)
+{
+    return file->credentials;
 }
