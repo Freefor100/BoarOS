@@ -534,6 +534,8 @@ ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它�
 
 `futex_wait01`、`futex_wait_bitset01`和`futex_wake01`检查已有等待／唤醒与掩码行为；`futex_cmp_requeue01/02`现在到达比较重排主体，所有7／3子项通过。cmp_requeue01的7～11秒属于原程序实际工作量，本轮保留其原有循环。官方盘没有独立WAKE_OP原程序，原子运算、六种有符号比较和错误副作用由固定Linux同ELF短例检查。
 
-自有短例覆盖28个固定命名项及条件变量广播、取消清理、timed EINTR和超时；RV真实单／双／四核、LA、两种libc与Linux对照通过。四核观察确认各核实际进行READ、WRITE和key-only准备。通用机制见[调度模块](../modules/kernel-scheduler.md#等待与-futex)，性能见[CPU成本](cpu-accounting-cost.md#futex调用者执行与普通信号固定批次结果)。性能目标未达到：UP新增getpid、普通信号及futex往返回退，四核往返负扩展，均保留在该成本记录中。
+自有短例覆盖28个固定命名项及条件变量广播、取消清理、timed EINTR和超时；RV真实单／双／四核、LA、两种libc与Linux对照通过。四核观察确认各核实际进行READ、WRITE和key-only准备。通用机制见[调度模块](../modules/kernel-scheduler.md#等待与-futex)，完整初次失败和聚焦优化结果见[CPU成本](cpu-accounting-cost.md)。10月23日17:55构建的优化版去掉私有键准备的MM编辑锁并集中入口调度热状态；两轮小批的UP getpid、普通信号、四核futex往返相对16:18版分别减少19.77%、28.23%、69.54%。最终同SMP一核／四核futex加速比为0.986×，多核加速及其运行波动继续保留。原始LTP的上述88/88结果来自上一批，本次聚焦优化没有重跑原程序。
+
+合入后的兼容内核以`INIT_CONFIG=config/init.json`选择自有fixture的`/init`，RV／LA各28项futex短例通过，正常运行盘检查通过。默认交付PID1运行评测盘中的BusyBox及其启动脚本；将其直接用于只含自有程序的fixture会在启动时得到ENOENT，尚未进入futex。两次误配日志保留在`build/futex-opt/compat-checked-{rv,la}.log`，正确短例在`compat-fixture-{rv,la}.log`。检查结束已重新执行默认`make all`，交付配置与原评测输入保持原设置。
 
 原始输出、逐程序分项和judge结果位于`build/futex-signal/original/`，固定性能批次位于`build/futex-signal/campaign/`。检查后的运行盘已清理，保留ELF、内核身份、日志与缓存。既有`oscomp-official-delivery.md`未提交修改保持原样。
