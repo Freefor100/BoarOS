@@ -560,20 +560,28 @@ static void fill_linux_vfs_stat(struct kernel_linux_stat *stat,
     stat->st_ctime_nsec = vfs_stat->ctime.nanoseconds;
 }
 
-static int fill_linux_stat(
-    struct kernel_linux_stat *stat,
+static int stat_description(
+    struct kernel_vfs_stat *stat,
     const struct kernel_open_file_description *description)
 {
     KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
         (!description->file.mount && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PATH));
 
-    memset(stat, 0, sizeof(*stat));
-    struct kernel_vfs_stat vfs_stat;
-    int result = kernel_open_file_pseudo_stat(description, &vfs_stat);
+    int result = kernel_open_file_pseudo_stat(description, stat);
     if (result == -KERNEL_ENOTSUP)
         result = description->kind == KERNEL_OPEN_FILE_KIND_PATH ?
-            kernel_vfs_path_stat(description->file.path, &vfs_stat) :
-            kernel_vfs_fstat(&description->file, &vfs_stat);
+            kernel_vfs_path_stat(description->file.path, stat) :
+            kernel_vfs_fstat(&description->file, stat);
+    return result;
+}
+
+static int fill_linux_stat(
+    struct kernel_linux_stat *stat,
+    const struct kernel_open_file_description *description)
+{
+    memset(stat, 0, sizeof(*stat));
+    struct kernel_vfs_stat vfs_stat;
+    int result = stat_description(&vfs_stat, description);
     if (result) return result;
     fill_linux_vfs_stat(stat, &vfs_stat);
     return 0;
@@ -781,23 +789,40 @@ enum kernel_files_status kernel_files_statx(struct kernel_files *files,
     return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,1);
 }
 
+static void restore_access_credentials(const struct kernel_credentials **previous)
+{ (void)kernel_credentials_override(*previous); }
+
 enum kernel_files_status kernel_files_faccessat(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
-    uint64_t mode, int64_t *linux_result)
+    uint64_t mode, uint64_t flags, int64_t *linux_result)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     KERNEL_FILES_PATH_SCOPE(start);
+    KERNEL_FILES_PIN_SCOPE(pin_guard);
     char *path;
     size_t length;
     int result;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         mm == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    if ((mode & ~UINT64_C(7)) != 0U) {
+    if ((mode & ~UINT64_C(7)) != 0U ||
+        (flags & ~(KERNEL_FILES_AT_EACCESS | KERNEL_FILES_AT_SYMLINK_NOFOLLOW |
+                   KERNEL_FILES_AT_EMPTY_PATH))) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
+    const struct kernel_credentials *current=kernel_credentials_current();
+    struct kernel_credentials actor=*current;
+    if (!(flags & KERNEL_FILES_AT_EACCESS)) {
+        actor.fsuid=actor.uid; actor.fsgid=actor.gid;
+        if (!(actor.securebits & KERNEL_SECBIT_NO_SETUID_FIXUP))
+            actor.effective=actor.uid==0 ? actor.permitted : 0;
+    }
+    /* proc permission checks and every searched directory see the same actor. */
+    const struct kernel_credentials *previous
+        __attribute__((cleanup(restore_access_credentials)))=
+            kernel_credentials_override(&actor);
     enum kernel_heap_status allocation = kernel_heap_allocate(
         files->heap, KERNEL_FS_PATH_MAX, (void **)&path);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
@@ -817,9 +842,25 @@ enum kernel_files_status kernel_files_faccessat(
             ? -KERNEL_EFAULT : -KERNEL_ENAMETOOLONG;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_files_path_start(files, &fs_paths, dirfd, path, &start);
-    if (!result) result = kernel_vfs_access_at(start,
-        fs_paths.root, path, (unsigned)mode);
+    if (!length && (flags & KERNEL_FILES_AT_EMPTY_PATH)) {
+        struct kernel_vfs_stat stat;
+        const struct kernel_vfs_mount *mount;
+        if (dirfd == KERNEL_FS_AT_FDCWD) {
+            result=kernel_vfs_path_stat(fs_paths.cwd,&stat);
+            mount=kernel_vfs_path_mount(fs_paths.cwd);
+        } else {
+            struct kernel_open_file_description *file=
+                kernel_files_hold_fd(files,dirfd,&pin_guard);
+            result=file ? stat_description(&stat,file) : -KERNEL_EBADF;
+            mount=file ? file->file.mount : NULL;
+        }
+        if (!result) result=kernel_vfs_access_check(&stat,mount,(unsigned)mode);
+    } else {
+        result = kernel_files_path_start(files, &fs_paths, dirfd, path, &start);
+        if (!result) result = kernel_vfs_access_at(start,
+            fs_paths.root, path, (unsigned)mode,
+            !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW));
+    }
     kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;

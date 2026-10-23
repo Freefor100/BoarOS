@@ -1195,8 +1195,8 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_open_at(path,path,"/identities/zero",&only_path,&denied,NULL));
     assert(!kernel_vfs_path_release(&denied.path));memset(&denied,0,sizeof(denied));
     assert(!kernel_vfs_file_set_mode(&file,0600));
-    assert(!kernel_vfs_access_at(path,path,"/identities/zero",6));
-    assert(kernel_vfs_access_at(path,path,"/identities/zero",1)==-KERNEL_EACCES);
+    assert(!kernel_vfs_access_at(path,path,"/identities/zero",6,1));
+    assert(kernel_vfs_access_at(path,path,"/identities/zero",1,1)==-KERNEL_EACCES);
     assert(kernel_vfs_file_set_owner(&file,0,UINT32_MAX)==-KERNEL_EPERM);
     assert(kernel_vfs_file_set_owner(&file,UINT32_MAX,200)==-KERNEL_EPERM);
     assert(kernel_vfs_unlink_at(path,path,"/sticky/root",0)==-KERNEL_EPERM);
@@ -1211,7 +1211,7 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_file_set_owner(&file,UINT32_MAX,UINT32_MAX));
     assert(kernel_vfs_file_set_owner(&file,1000,UINT32_MAX)==-KERNEL_EPERM);
     assert(kernel_vfs_file_set_owner(&file,UINT32_MAX,100)==-KERNEL_EPERM);
-    assert(kernel_vfs_access_at(path,path,"/identities/zero",4)==-KERNEL_EACCES);
+    assert(kernel_vfs_access_at(path,path,"/identities/zero",4,1)==-KERNEL_EACCES);
     assert(kernel_vfs_path_truncate(file.path,0,NULL)==-KERNEL_EACCES);
     /* The existing opened description keeps the access granted to its opener. */
     assert(!kernel_vfs_pwrite(&file,5,"fd",2,&done) && done==2);

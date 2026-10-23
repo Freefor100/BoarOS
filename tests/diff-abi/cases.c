@@ -226,7 +226,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#if defined(ABI_CREDENTIAL_CONSUMERS_ONLY)
+#if defined(ABI_FACCESSAT2_ONLY)
+    abi_faccessat2_cases();
+#elif defined(ABI_CREDENTIAL_CONSUMERS_ONLY)
     abi_credential_consumer_cases();
 #elif defined(ABI_CREDENTIALS_ONLY)
     abi_credentials_cases();

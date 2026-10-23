@@ -240,7 +240,7 @@ console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续
 `fs/namei.c::__getname_maybe_null`与`fs/stat.c::vfs_fstatat`，同ELF差分入口是
 `tests/diff-abi/path_only.c`；文件fixture另检查空路径不产生路径容量的分配。
 
-`faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。access 使用真实 UID/GID、补充组与对应 capability，普通操作使用 fsuid/fsgid。非目录执行的 DAC override 仍要求至少一个执行位；普通文件或目录的写请求检查最终挂载，只读时返回 `EROFS`，权限错误先于只读错误。ACL 与 mount `noexec` 仍未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+`faccessat` syscall 48 与 `faccessat2` syscall 439 共用权限判断。前者固定使用真实 UID/GID、补充组与对应 capability，忽略第四参数；后者以 `AT_EACCESS` 选择当前 fsuid/fsgid/effective capability，以 `AT_SYMLINK_NOFOLLOW` 查询最终链接本身，以 `AT_EMPTY_PATH` 查询 cwd 或实际 FD 的对象，包括 O_PATH、已删除文件与匿名对象。所选凭据同时用于逐级目录搜索、proc 敏感访问及最终对象判断。非法 mode/flags 先返回 `EINVAL`；路径输入 fault 为 `EFAULT`，固定 Linux 的 faccessat2 即使带 `AT_EMPTY_PATH` 也要求可读的空字符串，NULL 仍为 `EFAULT`。非目录执行的 DAC override 仍要求至少一个执行位；普通文件或目录的写请求检查最终挂载，只读时返回 `EROFS`，权限错误先于只读错误。ACL 与 mount `noexec` 仍未实现。边界由 `tests/diff-abi/access.c`、`faccessat2.c` 的同 ELF 差分核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 `kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；即使容量为零也先判断是否存在下一条记录：存在但放不下返回 `-EINVAL`，EOF 返回零。容量不足不消费该项 cookie；用户 fault 在已完整发出的记录上返回前缀计数。
 
