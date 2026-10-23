@@ -198,6 +198,10 @@ int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
 int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat);
+/* F_OK/X_OK/W_OK/R_OK in the current root credential model. */
+int kernel_vfs_access_at(struct kernel_vfs_path *start,
+                         struct kernel_vfs_path *root, const char *path,
+                         unsigned mode);
 int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                          struct kernel_vfs_path *new_start,
                          struct kernel_vfs_path *root,

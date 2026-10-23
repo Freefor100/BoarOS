@@ -1953,16 +1953,19 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
     return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
-int kernel_vfs_stat_at(struct kernel_vfs_path *start,
-                       struct kernel_vfs_path *root, const char *path,
-                       int follow_final, struct kernel_vfs_stat *stat)
+/* A real target stays pinned through its attribute and mount checks. Pathless
+ * link metadata has no target mount; the link's mount must not stand in for it. */
+static int stat_at_resolved(struct kernel_vfs_path *start,
+                            struct kernel_vfs_path *root, const char *path,
+                            int follow_final, struct kernel_vfs_stat *stat,
+                            struct kernel_vfs_path **target)
 {
     struct kernel_vfs_path *resolved = 0;
     int result = kernel_vfs_path_resolve(start, root, path, follow_final,
                                          &resolved);
     if (!result) {
         result = kernel_vfs_path_stat(resolved, stat);
-        (void)kernel_vfs_path_release(&resolved);
+        *target = resolved;
     } else if (follow_final &&
                (result == -KERNEL_ENOENT || result == -KERNEL_ENXIO)) {
         int original = result;
@@ -1981,6 +1984,37 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
         }
     }
     return result;
+}
+
+int kernel_vfs_stat_at(struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *path,
+                       int follow_final, struct kernel_vfs_stat *stat)
+{
+    struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
+    return stat_at_resolved(start, root, path, follow_final, stat, &target);
+}
+
+int kernel_vfs_access_at(struct kernel_vfs_path *start,
+                         struct kernel_vfs_path *root, const char *path,
+                         unsigned mode)
+{
+    struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
+    struct kernel_vfs_stat stat;
+    if (mode & ~7U) return -KERNEL_EINVAL;
+    int result = stat_at_resolved(start, root, path, 1, &stat, &target);
+    if (result) return result;
+    uint32_t type = stat.mode & KERNEL_VFS_S_IFMT;
+    /* Root bypasses read/write DACs and directory search, but every other
+     * inode type still needs an executable bit before readonly is considered. */
+    if ((mode & 1U) && type != KERNEL_VFS_S_IFDIR &&
+        !(stat.mode & (KERNEL_VFS_S_IXUSR | KERNEL_VFS_S_IXGRP |
+                       KERNEL_VFS_S_IXOTH)))
+        return -KERNEL_EACCES;
+    if ((mode & 2U) && target &&
+        (type == KERNEL_VFS_S_IFREG || type == KERNEL_VFS_S_IFDIR) &&
+        kernel_vfs_mount_is_readonly(target->file.mount))
+        return -KERNEL_EROFS;
+    return 0;
 }
 
 int kernel_vfs_stat_path(struct kernel_vfs_mount *mount, const char *path,
