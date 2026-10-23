@@ -4,7 +4,7 @@
 
 ## 实时信号与signalfd原程序短例（2026-10-23）
 
-通用队列、载荷、SIGPENDING额度、发送接口和signalfd已从main单向合入。机制见[信号模块](../modules/kernel-signal.md)，固定27次性能对照、同一SMP内核的1/2/4核加速比及剩余负加速集中见[CPU成本文档](cpu-accounting-cost.md#实时信号队列与signalfd成本2026-10-23)。
+通用队列、载荷、SIGPENDING额度、发送接口和signalfd已从main单向合入。机制见[信号模块](../modules/kernel-signal.md)，固定27次性能对照及后续聚焦优化见[CPU成本文档](cpu-accounting-cost.md#实时信号队列与signalfd成本2026-10-23)。四核负加速已针对CPU0发送往返和共享队列无关唤醒修复，最终短批、单核影响及仍存尾延迟见[调用核发送与通知成本](cpu-accounting-cost.md#实时信号发送与-signalfd-通知成本)。本次只复核通用短例与聚焦性能，下面的原程序和judge记录保持原批次含义。
 
 固定官方容器断网构建，沿原QEMU设备参数运行；RV与LA并行，每个架构内依次执行glibc和musl。只选择signalfd01、signalfd4_01、signalfd4_02、rt_sigqueueinfo01的原始ELF，参数、libc、judge、内部时限、跳过表及现有单程序监督保持原值。16次程序全部退出0，无超时、准备失败或未进入的主体步骤；累计24个细项TPASS。
 
