@@ -539,3 +539,36 @@ ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它�
 合入后的兼容内核以`INIT_CONFIG=config/init.json`选择自有fixture的`/init`，RV／LA各28项futex短例通过，正常运行盘检查通过。默认交付PID1运行评测盘中的BusyBox及其启动脚本；将其直接用于只含自有程序的fixture会在启动时得到ENOENT，尚未进入futex。两次误配日志保留在`build/futex-opt/compat-checked-{rv,la}.log`，正确短例在`compat-fixture-{rv,la}.log`。检查结束已重新执行默认`make all`，交付配置与原评测输入保持原设置。
 
 原始输出、逐程序分项和judge结果位于`build/futex-signal/original/`，固定性能批次位于`build/futex-signal/campaign/`。检查后的运行盘已清理，保留ELF、内核身份、日志与缓存。既有`oscomp-official-delivery.md`未提交修改保持原样。
+
+
+## mremap 常用范围与线程 proc 查询
+
+10月23日将main的通用mremap和线程proc实现合入兼容分支，在固定官方离线容器、原QEMU设备参数及默认单核下，仅选择原`mremap01～06`。RV/LA并行，各自顺序运行glibc、musl；原ELF、参数、judge、内部时限、跳过表及监督设置保持原样。
+
+24次程序执行中23次退出0，LA原musl的`mremap06`第一次搬移时报TBROK并退出2，全部无超时。原judge合计9/10：RV glibc、RV musl、LA glibc各3/3，LA musl为0/1。01～05只输出旧API的TPASS，缺少judge需要的Summary，均为0/0；06使用现代Summary。LA musl在第一项中止，Summary仅记录1个broken，后两项未进入，所以显示分母1而非其原有三个子项。
+
+| 原程序 | 实际检查与输出 | 原judge分数 | RV glibc/ms | RV musl/ms | LA glibc/ms | LA musl/ms |
+|---|---|---:|---:|---:|---:|---:|
+| mremap01 | 共享文件扩大后实际写入、msync；各1 TPASS | 0/0 | 727 | 635 | 970 | 887 |
+| mremap02 | 未对齐旧地址EINVAL；各1 TPASS | 0/0 | 49 | 42 | 42 | 44 |
+| mremap03 | 未映射旧地址EFAULT；各1 TPASS | 0/0 | 42 | 21 | 44 | 43 |
+| mremap04 | SysV源子范围扩大受阻ENOMEM；各1 TPASS | 0/0 | 66 | 42 | 65 | 46 |
+| mremap05 | FIXED参数、替换及搬移；各7 TPASS | 0/0 | 41 | 42 | 44 | 42 |
+| mremap06 | 三种文件映射/权限布局；三组合各3 TPASS，LA musl首项TBROK | 前三组3/3，LA musl0/1 | 84 | 62 | 86 | 62 |
+
+四组程序耗时之和分别为1.009、0.844、1.251、1.124秒；含开机和两种libc的QEMU总耗时RV7.954秒、LA8.101秒。`mremap05`有内容错误仍打印TPASS的源程序问题，实际数据和对象身份由自有同ELF差分及真实libc消费者补充验证，见[输入问题](oscomp-test-issues.md#mremap05内容错误分支仍打印-tpass)。
+
+### LA 原 musl mremap06
+
+原ELF将此次文件拆分粒度写成4096字节，首调用为`mremap(base+4096,4096,4096,3,base+12288)`。LA当前客机使用16384字节页，两个地址分别落在页内4096和12288处。固定16KiB Linux使用同一原ELF和原libc，也在首个mremap得到相同TBROK；GDB在有效原程序执行中确认这组参数。按固定Linux的参数检查，该未对齐旧地址返回EINVAL；原测例没有打印errno，本次未把源码推导写成raw errno实测。
+
+这是发布测例与16KiB页系统的输入兼容问题。内核保留16KiB对齐校验，原输入和分数保持原样。该程序已完成fallocate/初始mmap准备，失败位置是第一次mremap，首种布局的内容校验尚未进入，后两种布局未执行。自有LA 27项ABI差分及按真实页大小运行的musl/glibc消费者均通过。原ELF、libc身份、反汇编、Linux原输出、有效运行参数和未进入主体的诊断准备失败保存在`build/mremap-proc-20261023/la-original-mremap06/`及同名调查报告。
+
+### 通用验证与交付状态
+
+- 两架构各27项mremap和113项proc记录与固定Linux一致；线程目录检查包含线程自身统计、组长退出、非组长exec、旧节点及TID复用。
+- RV四核静态、双核动态musl和默认UP消费者通过；LA及两架构glibc消费者通过。搬移测试实际检查物理内容、共享MM旧地址复用、共享文件同步/截断、远端缩小跨SysV附件的计数与释放；已有双核动态pipe八项重新完整通过。
+- 宿主直接例覆盖准备OOM、COW/PROT_NONE、pin与延迟TLB确认，以及真实ext4旧alias回调，1/4KiB文件系统块检查通过。16KiB页由真实LA验证，未把RV宿主宏替换当作LA结果。
+- 正常退出后八个根盘/分区对象检查全部为0，启动种子槽已擦除，定向内核已恢复默认交付内核并逐字节核对。检查完成的运行盘已清理，保留缓存、ELF和日志；原有`oscomp-official-delivery.md`修改逐字节保留。
+
+通用机制见[MM范围迁移](../modules/kernel-mm.md#mremap-区间调整与搬移)与[procfs](../modules/procfs.md)。固定12次性能对照的realloc收益及UP普通信号/signalfd、四核futex等新增回退统一见[CPU成本](cpu-accounting-cost.md#mremap-与线程-proc-接入后的固定成本)。本批没有追加性能调优或重跑整套LTP。原始程序结果、judge输出、QEMU/内核/输入身份及八盘检查位于`build/mremap-proc-20261023/original/`。

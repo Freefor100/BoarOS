@@ -56,6 +56,18 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 [LTP 修正](https://github.com/linux-test-project/ltp/commit/e84f0689cf7a8a77478a0e70aa62560f66c3bceb)、
 [Linux 修改](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f2e467a48287c868818085aa35389a224d226732)。
 
+### LA 原 musl mremap06：4 KiB 拆分粒度与 16 KiB 页不匹配
+
+原ELF把 `MMAP_GRANULARITY` 编译为4096，第一次请求搬移 `base+4096` 到 `base+12288`。当前LA使用16384字节页，两地址均未页对齐。相同原ELF、原libc在固定16KiB Linux上也在首次mremap报TBROK；实际调用参数与反汇编一致。按两端参数检查，该请求属于EINVAL；原程序未打印errno，调查未捕获raw返回寄存器。
+
+对应LTP头在有 `HAVE_SYS_SHM_H` 时选 `SHMLBA`，否则用 `getpagesize()`；固定musl 1.2.5通用头的SHMLBA为4096。原ELF的常量与此前者一致，官方构建config.h未取得，因此归因以产物与实测参数为准。原libc的mremap正确传递第五参数，getpagesize从运行时数据取值，本次没有证明它返回错误。
+
+保留原输入、对齐语义和原judge的0/1；其余三个组合为3/3。具体得分和耗时见[mremap结果](oscomp-ltp-analysis.md#mremap-常用范围与线程-proc-查询)，原ELF、同输入Linux输出和参数见`build/mremap-proc-20261023/la-original-mremap06.md`。[固定头文件](https://github.com/linux-test-project/ltp/blob/20240524/include/lapi/mmap.h)
+
+### mremap05：内容错误分支仍打印 TPASS
+
+固定20240524源码的 `test_mremap()` 在成功返回目标地址后检查首字节；内容不符时仍调用 `tst_resm(TPASS, ... "value failed")`。因此其7条TPASS和退出0并不独立证明搬移内容正确。当前保留原ELF和judge，内容、源/目标子范围及共享/COW行为由[共同ABI短例](../../tests/diff-abi/mremap.c)实际检查。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/mremap/mremap05.c)
+
 ### musl 信号等待：库重试 EINTR，测例等待它返回 EINTR
 
 `sigtimedwait01`、`sigwaitinfo01`的[首项](https://github.com/linux-test-project/ltp/blob/20240524/libs/libltpsigwait/sigwait.c#L12)使用空等待集合，要求SIGUSR1打断调用并返回EINTR。原musl库收到syscall的`-EINTR`后会重新调用；空集合没有可成功取走的匹配信号，于是反复等待，最后由LTP的30秒watchdog结束。
@@ -71,7 +83,7 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 | iozone 向量 I/O | 原命令 `./iozone -t 4 -i 11 -i 12 -r 1k -s 1m` 请求 pwritev/preadv，发布二进制却报 `Selected test not available on the version`，随后输出默认 initial writers/rewriters。 | 保留原命令；分析按实际输出判断。该次运行只证明默认写入路径完成，向量能力由独立 ABI 和原 preadv/pwritev 测例验证。 |
 | libc-test 脚本 | `run-static.sh`、`run-dynamic.sh` 没有 shebang；原 LA musl BusyBox 在固定 Linux 也拒绝直接执行，后面的程序尚未开始。 | 临时外层脚本用该 libc 自己的 BusyBox `sh` 显式解释这两行；内层列表和参数原样执行。 |
 | BusyBox 的 `kill 10` | judge 的固定清单要求此标签，发布 `busybox_cmd.txt` 实际执行 `sh -c 'sleep 5' & ./busybox kill $!`，成功标签按整行输出。judge 另补的 `kill 10` 因无对应标签得零。 | 保留原脚本和 judge；**54/55** 的差额按标签错位解释，后台 PID 的实际 kill 单列。 |
-| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench`、`sigaltstack01`、`signalfd01/signalfd4_01/signalfd4_02`等会输出TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。两架构 ftest 的实际内容与磁盘一致性已通过。 |
+| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench`、`mremap01～05`、`sigaltstack01`、`signalfd01/signalfd4_01/signalfd4_02`等会输出TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。两架构 ftest 的实际内容与磁盘一致性已通过。 |
 | LTP 的 `FAIL LTP CASE … : 0` | 原脚本对每个返回码统一打印这行，名字中的 FAIL 也出现在成功退出时。 | 判读末尾状态及 Summary；保留原结束行作为 judge 的当前测例边界。 |
 
 iozone 的完整命令核对见[原脚本对照](oscomp-compat-baseline.md#2026-10-17-cpu0-存储分批与同步等待集成)。
