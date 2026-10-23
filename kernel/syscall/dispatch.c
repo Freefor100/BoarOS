@@ -130,6 +130,7 @@
 #define LINUX_SYSCALL_NEWFSTATAT 79U
 #define LINUX_SYSCALL_STATX 291U
 #define LINUX_SYSCALL_FACCESSAT 48U
+#define LINUX_SYSCALL_FACCESSAT2 439U
 #define LINUX_SYSCALL_FSTAT 80U
 #define LINUX_SYSCALL_KILL 129U
 #define LINUX_SYSCALL_TKILL 130U
@@ -521,7 +522,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
-    } else if (request->number == LINUX_SYSCALL_FACCESSAT) {
+    } else if (request->number == LINUX_SYSCALL_FACCESSAT ||
+               request->number == LINUX_SYSCALL_FACCESSAT2) {
         if (syscall_handle_faccessat(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

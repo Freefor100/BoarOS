@@ -60,6 +60,7 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_AT_REMOVEDIR UINT64_C(0x200)
 #define KERNEL_FILES_AT_SYMLINK_FOLLOW UINT64_C(0x400)
 #define KERNEL_FILES_AT_EMPTY_PATH UINT64_C(0x1000)
+#define KERNEL_FILES_AT_EACCESS UINT64_C(0x200)
 #define KERNEL_FILES_F_DUPFD UINT64_C(0)
 #define KERNEL_FILES_F_GETFD UINT64_C(1)
 #define KERNEL_FILES_F_SETFD UINT64_C(2)
@@ -406,7 +407,7 @@ enum kernel_files_status kernel_files_fstatat(
     uint64_t flags,
     int64_t *linux_result);
 
-/* faccessat uses the current immutable root identity for mode checks. */
+/* access uses real IDs; AT_EACCESS retains the caller's fs IDs/capabilities. */
 enum kernel_files_status kernel_files_faccessat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,
@@ -414,6 +415,7 @@ enum kernel_files_status kernel_files_faccessat(
     int64_t dirfd,
     uint64_t user_path,
     uint64_t mode,
+    uint64_t flags,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_getdents(

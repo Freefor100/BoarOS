@@ -212,10 +212,12 @@ int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
 int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat);
-/* access uses real IDs and its Linux capability selection during the walk. */
+/* Both lookup and final access checks use the active actor credentials. */
 int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
-                         unsigned mode);
+                         unsigned mode, int follow_final);
+int kernel_vfs_access_check(const struct kernel_vfs_stat *stat,
+                             const struct kernel_vfs_mount *mount, unsigned mode);
 int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                          struct kernel_vfs_path *new_start,
                          struct kernel_vfs_path *root,

@@ -90,6 +90,7 @@ void abi_futex_shared_cases(void);
 void abi_futex_bitset_cases(void);
 void abi_file_lock_cases(void);
 void abi_access_cases(void);
+void abi_faccessat2_cases(void);
 void abi_mode_cases(void);
 void abi_socket_cases(void);
 void abi_file_lock_exec_probe(unsigned mode) __attribute__((noreturn));

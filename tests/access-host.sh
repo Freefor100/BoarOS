@@ -12,7 +12,7 @@ for shift in ${ACCESS_HOST_SHIFTS:-12 14}; do
         -include tests/host/lwext4_memory.h -Wno-unused-but-set-variable -Wno-stringop-truncation \
         -Ithird_party/lwext4/include -Itests/host/mm -Itests/host/sync -idirafter include \
         tests/host/access.c tests/host/mm/context.c tests/host/mm/disk_context.c \
-        kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c \
+        kernel/cpu.c kernel/credentials.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c \
         kernel/physical_page.c mm/heap.c mm/memory_object.c \
         mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         fs/files/table.c fs/files/path.c fs/files/metadata.c fs/fs_context.c fs/open_file.c \

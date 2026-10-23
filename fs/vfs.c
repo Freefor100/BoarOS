@@ -2147,32 +2147,30 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
     return stat_at_resolved(start, root, path, follow_final, stat, &target);
 }
 
-static void release_credential_override(const struct kernel_credentials **previous)
-{ (void)kernel_credentials_override(*previous); }
+int kernel_vfs_access_check(const struct kernel_vfs_stat *stat,
+                             const struct kernel_vfs_mount *mount, unsigned mode)
+{
+    if (mode & ~7U) return -KERNEL_EINVAL;
+    int result=kernel_vfs_dac_permission(stat->mode,stat->uid,stat->gid,mode,
+                                        kernel_credentials_current());
+    if (result) return result;
+    uint32_t type=stat->mode & KERNEL_VFS_S_IFMT;
+    int special=type==KERNEL_VFS_S_IFCHR || type==KERNEL_VFS_S_IFBLK ||
+                type==KERNEL_VFS_S_IFIFO || type==KERNEL_VFS_S_IFSOCK;
+    if ((mode & 2U) && mount && !special &&
+        kernel_vfs_mount_is_readonly(mount)) return -KERNEL_EROFS;
+    return 0;
+}
 
 int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
-                         unsigned mode)
+                         unsigned mode, int follow_final)
 {
-    if (mode & ~7U) return -KERNEL_EINVAL;
-    const struct kernel_credentials *current=kernel_credentials_current();
-    struct kernel_credentials access=*current;
-    access.fsuid=access.uid; access.fsgid=access.gid;
-    if (!(access.securebits & KERNEL_SECBIT_NO_SETUID_FIXUP))
-        access.effective=access.uid==0 ? access.permitted : 0;
-    const struct kernel_credentials *previous
-        __attribute__((cleanup(release_credential_override)))=kernel_credentials_override(&access);
     struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_stat stat;
-    int result=stat_at_resolved(start,root,path,1,&stat,&target);
-    if (result) return result;
-    result=kernel_vfs_dac_permission(stat.mode,stat.uid,stat.gid,mode,&access);
-    if (result) return result;
-    uint32_t type=stat.mode & KERNEL_VFS_S_IFMT;
-    if ((mode & 2U) && target &&
-        (type==KERNEL_VFS_S_IFREG || type==KERNEL_VFS_S_IFDIR) &&
-        kernel_vfs_mount_is_readonly(target->file.mount)) return -KERNEL_EROFS;
-    return 0;
+    int result=stat_at_resolved(start,root,path,follow_final,&stat,&target);
+    return result ? result : kernel_vfs_access_check(&stat,
+                                      target ? target->file.mount : NULL,mode);
 }
 
 int kernel_vfs_stat_path(struct kernel_vfs_mount *mount, const char *path,

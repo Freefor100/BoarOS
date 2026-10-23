@@ -6,6 +6,7 @@
 #include <kernel/open_file.h>
 #include <kernel/physical_page.h>
 #include <kernel/tmpfs.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include "../../fs/files/private.h"
 #include "../../fs/vfs_objects.h"
@@ -26,6 +27,14 @@ static struct kernel_fs_context fs;
 static struct kernel_mm mm;
 static uint64_t user_path;
 
+/* This fixture's timer ticks use the same nanoseconds as disk_context.c. */
+enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)
+{
+    *deadline=ns;
+    return ns<=kernel_time_monotonic_ns() ? KERNEL_TIME_STATUS_DEADLINE_PASSED :
+                                          KERNEL_TIME_STATUS_OK;
+}
+
 static void check(const char *name, int64_t actual, int64_t expected)
 {
     checks++;
@@ -42,7 +51,7 @@ static void access_case(const char *name, int64_t dirfd, const char *path,
     int64_t result = 1;
     assert(!kernel_copy_to_user(&mm, user_path, path, strlen(path) + 1, &copied));
     assert(copied == strlen(path) + 1);
-    assert(!kernel_files_faccessat(&files, &fs, &mm, dirfd, user_path, mode, &result));
+    assert(!kernel_files_faccessat(&files, &fs, &mm, dirfd, user_path, mode, 0, &result));
     check(name, result, expected);
 }
 /* A pathless backend object supplies metadata, never its enclosing mount.
@@ -119,9 +128,9 @@ int main(void)
     access_case("relative invalid dirfd", -9, "rw-file", 0, -KERNEL_EBADF);
     access_case("absolute ignores dirfd", -9, "/rw-file", 0, 0);
     int64_t result;
-    assert(!kernel_files_faccessat(&files, &fs, &mm, -9, 1, 8, &result));
+    assert(!kernel_files_faccessat(&files, &fs, &mm, -9, 1, 8, 0, &result));
     check("invalid mode before pointer and dirfd", result, -KERNEL_EINVAL);
-    assert(!kernel_files_faccessat(&files, &fs, &mm, -9, 1, 0, &result));
+    assert(!kernel_files_faccessat(&files, &fs, &mm, -9, 1, 0, 0, &result));
     check("invalid pointer before dirfd", result, -KERNEL_EFAULT);
     assert(!kernel_mm_munmap(&mm, user_path, BOAROS_PAGE_SIZE));
     mm_test_bind(0); mm_test_context = 0;
