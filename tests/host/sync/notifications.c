@@ -42,3 +42,9 @@ __attribute__((weak)) void posix_timer_record_clear_locked(struct signal_queue_r
 { (void)r;(void)ignored;(void)p;abort(); }
 __attribute__((weak)) void posix_timer_record_complete(struct signal_queue_record *r) { (void)r;abort(); }
 __attribute__((weak)) void posix_timer_record_free(struct signal_queue_record *r) { (void)r;abort(); }
+
+__attribute__((weak)) void scheduler_cpu_timer_update_locked(struct kernel_task *t,unsigned thread)
+{ assert(!t->cpu_timer_index[thread].timers[0]&&!t->cpu_timer_index[thread].timers[1]&&!t->cpu_timer_index[thread].timers[2]); }
+__attribute__((weak)) void scheduler_cpu_timer_expire(void) {}
+__attribute__((weak)) void kernel_posix_cpu_target_exit(struct kernel_task *t)
+{ assert(!t->cpu_timer_index[0].indexed&&!t->cpu_timer_index[1].indexed); }

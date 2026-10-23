@@ -15,7 +15,8 @@ static struct kernel_task task;
 static struct kernel_pid pid;
 static struct kernel_pid_member members[2];
 static uint64_t now_ns;
-static unsigned live,ignored,allocation_calls,allocation_fail;
+static unsigned live,ignored,allocation_calls,allocation_fail,cpu_samples;
+static uint64_t cpu_user,cpu_kernel;
 static pthread_barrier_t entered,released;
 static _Thread_local int hold_clock;
 static void gate(pthread_barrier_t *p){int r=pthread_barrier_wait(p);assert(!r||r==PTHREAD_BARRIER_SERIAL_THREAD);}
@@ -46,9 +47,15 @@ struct kernel_task *process_find_identity(kernel_pid_t n,enum kernel_pid_role ro
 void kernel_pid_get(struct kernel_pid *p){assert(p==&pid);p->references++;}
 void kernel_task_identity_put(struct kernel_pid *p){assert(p==&pid);KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(p->references>1);p->references--;}
 int scheduler_cpu_clock_resolve(struct kernel_task *t,int32_t c,int strict,struct scheduler_cpu_clock *out)
-{(void)t;(void)c;(void)strict;(void)out;return -KERNEL_EINVAL;}
+{assert(t==&task&&strict);if(c!=2&&c!=3)return -KERNEL_EINVAL;kernel_pid_get(&pid);*out=(struct scheduler_cpu_clock){&pid,2,c==3};return 0;}
 int scheduler_cpu_clock_sample(const struct scheduler_cpu_clock *c,struct kernel_task_usage *u)
-{(void)c;(void)u;abort();}
+{assert(c->identity==&pid&&!kernel_cpu_current()->raw_locks);cpu_samples++;
+ if(task.proc_exiting)return -KERNEL_ESRCH;
+ *u=(struct kernel_task_usage){.user_ns=cpu_user,.kernel_ns=cpu_kernel};return 0;}
+unsigned signal_cpu_timer_check_locked(struct kernel_task *t,const struct kernel_task_usage *u)
+{assert(t==&task&&u->user_ns==cpu_user&&kernel_cpu_current()->raw_locks);return 0;}
+void signal_cpu_timer_notify(struct kernel_task *t,unsigned fired){assert(t==&task&&!fired);}
+void signal_timer_notify(struct kernel_task *t,unsigned sig){(void)t;(void)sig;abort();}
 int signal_timer_disposition_ignored_locked(struct kernel_pid *p,int thread,unsigned sig)
 {assert(p==&pid);(void)thread;(void)sig;return ignored;}
 int signal_timer_post_locked(struct kernel_pid *p,int thread,struct signal_queue_record *record,struct kernel_wait_cursor *cursor,struct kernel_task **wake)
@@ -62,7 +69,7 @@ static void init(void)
     task.sigpending_limit=(struct kernel_rlimit64){4096,4096};task.tid=1;
     pid=(struct kernel_pid){.number=1,.references=1,.generation=1};
     for(unsigned r=0;r<2;r++){members[r]=(struct kernel_pid_member){.identity=&pid,.role=r,.task=&task};pid.members[r]=&members[r];}
-    ignored=allocation_fail=0;now_ns=1000000000;
+    ignored=allocation_fail=cpu_samples=0;cpu_user=cpu_kernel=0;now_ns=1000000000;
 }
 static void finish(void)
 {kernel_posix_timers_exec(&task);kernel_signal_pending_cleanup(&task);assert(!count()&&!live&&!task.storage_borrows&&pid.references==1&&!kernel_posix_timer_deadline());}
@@ -161,8 +168,30 @@ static void completion_reset(void)
     assert(!kernel_posix_timer_delete(&task,changing_id));
     assert(!pthread_barrier_destroy(&entered)&&!pthread_barrier_destroy(&released));finish();
 }
+static void cpu_thresholds(void)
+{
+    init();int ids[3];struct kernel_posix_event event={.notify=0,.signal=36};
+    for(unsigned i=0;i<3;i++) {
+        struct kernel_posix_timer *t;assert(!kernel_posix_timer_prepare(&task,2,&event,&ids[i],&t));
+        kernel_posix_timer_publish(t,1);arm(ids[i],100+i,100);
+    }
+    unsigned before=cpu_samples;cpu_user=101;allocation_fail=1;
+    scheduler_cpu_timer_expire();assert(cpu_samples==before+1);allocation_fail=0;
+    struct kernel_signal_wait_info out=take(36);assert(out.signal==36&&out.sender==(unsigned)ids[0]);
+    out=take(36);assert(out.signal==36&&out.sender==(unsigned)ids[1]);
+    assert(!task.group_pending);
+    cpu_user=1000;scheduler_cpu_timer_expire();out=take(36);assert(out.signal==36&&out.uid>=8);
+    task.proc_exiting=1;kernel_posix_cpu_target_exit(&task);assert(!task.cpu_timer_index[0].indexed);
+    struct kernel_posix_itimerspec setting={.value={0,1}},old;
+    for(unsigned i=0;i<3;i++) {
+        assert(!kernel_posix_timer_get(&task,ids[i],&old)&&!old.value.nanoseconds&&!old.interval.nanoseconds);
+        assert(kernel_posix_timer_set(&task,ids[i],0,&setting,&old)==-KERNEL_ESRCH);
+        assert(!kernel_posix_timer_delete(&task,ids[i]));
+    }
+    finish();
+}
 int main(void)
 {
-    reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();
+    reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase and completion/delete owner passed");return 0;
 }

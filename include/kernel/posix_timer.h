@@ -25,5 +25,6 @@ void kernel_posix_timer_expire(uint64_t);
 void kernel_posix_timer_unignore(struct kernel_task *,unsigned);
 void kernel_posix_timers_exec(struct kernel_task *);
 void kernel_posix_timers_exit(struct kernel_task *);
+void kernel_posix_cpu_target_exit(struct kernel_task *);
 void kernel_posix_timers_adopt_locked(struct kernel_task *,struct kernel_task *);
 #endif

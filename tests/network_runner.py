@@ -106,7 +106,7 @@ def run_smp(args):
     try:
         for cpus in args.cpus or [4]:
             for memory in args.memory or ['512M']:
-                if posix:expected=['POSIX CASE objects OK','POSIX CASE faults-quota OK','POSIX CASE lifecycle OK','POSIX CASE wall OK','POSIX CASE shared-standard-signal OK','POSIX CASE periodic-overrun OK','POSIX CASE stale-ignore-forged OK','POSIX CASE exec-pending OK','POSIX CASE handler-libc-thread OK','POSIX END failures=0']
+                if posix:expected=['POSIX CASE objects OK','POSIX CASE faults-quota OK','POSIX CASE lifecycle OK','POSIX CASE wall OK','POSIX CASE shared-standard-signal OK','POSIX CASE periodic-overrun OK','POSIX CASE stale-ignore-forged OK','POSIX CASE exec-pending OK','POSIX CASE cpu-clocks OK','POSIX CASE cpu-target-exit OK','POSIX CASE handler-libc-thread OK','POSIX CASE pending-oneshot OK','POSIX CASE group-controls OK','POSIX CASE caller-cpus OK','POSIX END failures=0']
                 if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]
                 folder=output/f'{cpus}cpu-{memory}';folder.mkdir()
                 fixture=harness.fixture(folder,program)
@@ -118,7 +118,7 @@ def run_smp(args):
                     disk=folder/(target+'.img');shutil.copyfile(fixture,disk)
                     if target=='boaros' and args.observe:
                         marker=folder/'socket-observer';marker.write_text('private correctness observations\n')
-                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('queued-observer' if queued else 'altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
+                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('posix-observer' if posix else 'queued-observer' if queued else 'altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
                         harness.run_logged(['debugfs','-w','-f',str(batch),str(disk)],folder/'observer-install.log')
                     raw,record,_=boot_user('qemu-system-riscv64',args.firmware,str(kernel.resolve()),disk,memory,cpus,folder,target=='linux')
                     lines=[line[line.index('SOCKET-SMP '):] for line in raw.replace('\r','').splitlines() if 'SOCKET-SMP ' in line]
@@ -154,6 +154,10 @@ def run_smp(args):
                         observations=[[int(v,16) for v in row] for row in re.findall(r'ALTSTACK caller cpu=(0x[0-9a-f]+) frames=(0x[0-9a-f]+) returns=(0x[0-9a-f]+)',raw)]
                         active=[row for row in observations if row[0]<cpus]
                         passed=passed and len(active)==cpus and {row[0] for row in active}==set(range(cpus)) and all(all(row[1:]) for row in active) and all(not any(row[1:]) for row in observations if row[0]>=cpus)
+                    if target=='boaros' and args.observe and posix:
+                        observations=[[int(v,16) for v in row] for row in re.findall(r'POSIX caller cpu=(0x[0-9a-f]+) settings=(0x[0-9a-f]+) consumers=(0x[0-9a-f]+)',raw)]
+                        active=[row for row in observations if row[0]<cpus]
+                        passed=passed and len(active)==cpus and all(all(row[1:]) for row in active) and 'POSIX expiry CPU0 OK' in raw
                     if target=='boaros' and args.observe and queued:
                         observations=[[int(v,16) for v in row] for row in re.findall(r'QUEUED caller cpu=(0x[0-9a-f]+) waits=(0x[0-9a-f]+) reads=(0x[0-9a-f]+) queries=(0x[0-9a-f]+) sends=(0x[0-9a-f]+)',raw)]
                         active=[row for row in observations if row[0]<cpus]

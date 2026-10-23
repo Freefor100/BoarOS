@@ -78,7 +78,7 @@ exec 后的交付和最终物理页/堆回收。
 
 `ITIMER_VIRTUAL`累计全组用户执行时间，发送SIGVTALRM；`ITIMER_PROF`累计用户与内核执行时间，发送SIGPROF。两者使用[共同CPU记账](kernel-accounting.md)，含退出成员和各CPU尚未结算的执行片段，睡眠及IRQ不计入。状态由组身份持有，设置线程退出后继续；fork清零，exec保留，非组长exec迁移，最后成员清理时摘除活动索引。REAL、VIRTUAL、PROF相互独立。
 
-CPU0在既有timer路径只遍历启用了CPU定时器的组，并在短调度域内按各CPU的真实`accounting_owner`判断该组是否正在执行。整组睡眠时保留CPU阈值；恢复执行后再检查，避免微秒周期的历史欠账按墙钟继续产生信号。用量快照在调度域外按现有成员借用与CPU发布序列取得。未启用时，系统调用进出与CPU本地记账保持原路径；空索引只在原timer处理处检查。
+CPU0在既有timer路径只遍历启用了CPU定时器的目标；进程目标与POSIX CPU定时器共用一次组用量快照，并在短调度域内按各CPU的真实`accounting_owner`判断该组是否正在执行。整组睡眠时保留CPU阈值；恢复执行后再检查，避免微秒周期的历史欠账按墙钟继续产生信号。用量快照在调度域外按现有成员借用与CPU发布序列取得。未启用时，系统调用进出与CPU本地记账保持原路径；空索引只在原timer处理处检查。
 
 按固定Linux的`kernel/time/itimer.c`与`posix-cpu-timers.c`，首次到期额外加一个实际100Hz记账tick；每次到期的周期阈值增加原interval，标准信号按pending位合并。CPU定时器停用时保留interval查询值，过期尚待处理时返回一个tick的剩余量。输出旧值EFAULT保留已安装的新值。CPU0处理时机和IRQ延迟决定实际递送时刻。
 
@@ -113,10 +113,14 @@ RV64/LA64使用107～111号入口和原生64字节sigevent、32字节itimerspec�
 
 创建为每只定时器预留通知记录和SIGPENDING额度，SIGEV_NONE同样计费。需要通知时先准备真实目标的pending索引。创建候选在ID输出成功后才发布，用户输出故障归还候选与额度；其他线程查询尚未发布的ID返回EINVAL。普通信号仍在消费时归还额度，预留额度由定时器对象持有。对象和PID身份的最后归还在状态保护外释放内存。
 
-四类时钟的目标解析复用CPU clock查询机制；CPU时钟持有具体PID身份，锁外采样后核对角色仍指向相同对象。对象查询、getoverrun和删除已接入；REALTIME/MONOTONIC期限在调用CPU设置，由CPU0推进到期。CPU时钟对象已接入，CPU阈值推进继续沿后续机制实现。
+REALTIME、MONOTONIC以及进程/线程CPU时钟均在调用CPU创建、设置、查询和删除，由CPU0推进到期。CPU clock目标解析与查询共用，保留PROF、VIRT、SCHED编码，分别使用用户加内核、仅用户、用户加内核时间。SIGEV_SIGNAL和原生SIGEV_THREAD向组投递，SIGEV_THREAD_ID绑定真实线程身份；libc的SIGEV_THREAD通过库的辅助线程完成回调。
+
+每个任务尾部内嵌进程及线程阈值索引，仅活动目标进入共同AVL；每目标按三种CPU时间维护最早阈值，旧VIRTUAL/PROF与原生进程定时器共用一次组采样。遍历按PID代次和角色递增，任务与PID借用覆盖锁外采样，回来后重新核对身份、设置代次和阈值。空集合在原timer路径只检查摘要，普通trap保持既有记账路径。CPU目标退出时摘除阈值，其他组持有的句柄继续有效：gettime归零、settime返回ESRCH，delete归还资源。非组长exec在TGID角色交接时移交进程阈值，创建者、通知目标和CPU时钟目标分别保活。
 
 通知记录区分普通分配和原生定时器预留：每只定时器最多有一条待决记录，不同定时器可同时使用同一标准信号。到期只使用创建时准备的存储。普通内联事件与排队记录共存时，索引保留内联事件的先后位置；原生记录消费不重复计费。用户提供的SI_TIMER仍是普通载荷，不据此执行重装。
 
-REALTIME/MONOTONIC使用共享AVL算法和各自对象保护，调度器只读取最早期限摘要，远端提前设置沿既有deadline IPI通知CPU0。消费先在调度保护内取得记录及原设置快照，锁外计算进度，再核对设置代次决定重装；处理函数、sigwaitinfo和signalfd取得同一份最终overrun。删除或重设后的旧事件被丢弃，已取得的消费借用覆盖最后释放。周期按原期限推进，不按处理完成时刻重新起算。
+REALTIME/MONOTONIC使用共享AVL算法和各自对象保护，调度器只读取最早期限摘要，远端提前设置沿既有deadline IPI通知CPU0。消费先在调度保护内取得记录及原设置快照，锁外计算进度，再核对设置代次决定重装；处理函数、sigwaitinfo和signalfd取得同一份最终overrun。删除或重设后的旧事件被丢弃，已取得的消费借用覆盖最后释放。周期按原期限推进，不按处理完成时刻重新起算。单次到期入队后查询剩余量为零，待决记录仍保留到消费或清除。STOP/CONT沿共同进程组流程清理相反待决信号并恢复停止组；KILL请求整组退出，这些组操作在状态保护外执行。
 
 SIG_IGN的周期事件停放并保留相位，恢复disposition时移回待决队列；单独屏蔽不会重新投递已经停放的事件。SIGEV_NONE只按查询推进，停用后的旧单次期限仍可能返回剩余量，沿固定Linux的common_timer_get行为。timer_settime只解释TIMER_ABSTIME位，其余位按参考Linux忽略；NULL新值返回EINVAL，旧值输出EFAULT保留新设置。exec清除原生及用户提供的SI_TIMER记录，保留其他排队消息的顺序。
+
+`make test-posix-timer-host`以4/16KiB页检查真实通知记录、额度、借用、代次及CPU阈值；`tests/network_runner.py --workload posix`提供两架构与固定Linux的原生ABI、真实handler/libc回调和生命周期检查。四核观察构建复用composition观察点核对调用CPU与CPU0到期位置。

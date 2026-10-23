@@ -36,6 +36,9 @@ pending位图是就绪摘要。普通标准信号继续在任务原有字段保�
 
 handler与sigtimedwait取得同一规范记录，用户输出在消费之后发生；SIGCHLD退出信息另带真实组CPU用量，STOP/CONT携带被报告线程的CPU用量；快照包含尚未归入累计字段的执行片段，单位为100Hz用户时钟tick。标准内联时间数据放任务尾部，不改变原有热字段位置。内核编号32～64均支持；libc预留编号由raw syscall短例覆盖。
 
+原生POSIX定时器的通知使用创建时预留记录和额度，凭内部来源识别重装行为；handler、sigwaitinfo和signalfd在消费时共用代次核对和超期计算。单次已到期查询、忽略停放、进程组控制与对象寿命见[POSIX定时器](kernel-time.md#posix-定时器对象)。
+
+
 ## signalfd与等待源
 
 `signalfd4(74)`创建独立OFD，保存接收掩码；dup/fork共享该掩码和NONBLOCK状态，CLOEXEC属于FD槽。更新已有FD只替换掩码，创建标志不改变现有FD。SIGKILL/SIGSTOP从接收集合移除，信号的blocked掩码由线程另行维护。

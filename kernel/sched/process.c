@@ -616,7 +616,6 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->fsize_limit = leader->fsize_limit;
         task->sigpending_limit=leader->sigpending_limit;
         kernel_signal_pending_adopt_locked(task,leader);
-        kernel_posix_timers_adopt_locked(task,leader);
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
@@ -627,6 +626,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
              * Its group alias resolves the adopted parent identity meanwhile. */
             task->group_leader = task;
             leader->group_leader = task;
+            kernel_posix_timers_adopt_locked(task,leader);
         }
         for (;;) {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);

@@ -15,6 +15,12 @@
 #include <sys/timerfd.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <sched.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include "../../smp/composition_protocol.h"
 
 /* Raw IDs stay separate from libc's opaque timer_t and callback bookkeeping. */
 struct native_event { uint64_t value;int32_t signal,notify;int32_t tid;uint8_t padding[44]; };
@@ -206,6 +212,154 @@ static void callbacks(void)
     CHECK(!timer_settime(timer,0,&in,0));CHECK(read(handler_pipe[0],&byte,1)==1&&byte=='T'&&!handler_bad);
     CHECK(!timer_delete(timer));CHECK(!close(handler_pipe[0])&&!close(handler_pipe[1]));puts("POSIX CASE handler-libc-thread OK");
 }
+static void burn_cpu(uint64_t duration)
+{
+    uint64_t until=clock_ns(CLOCK_THREAD_CPUTIME_ID)+duration,value=1;
+    do{for(unsigned i=0;i<20000;i++){value=(value<<3)^(value>>7)^17;__asm__ volatile("":"+r"(value));}}
+    while(clock_ns(CLOCK_THREAD_CPUTIME_ID)<until);
+}
+static void cpu_clocks(void)
+{
+    int sig=SIGRTMIN+8;sigset_t set,old;sigemptyset(&set);sigaddset(&set,sig);CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
+    int32_t process=(int32_t)((~(uint32_t)getpid())<<3),thread=(int32_t)((~(uint32_t)syscall(SYS_gettid))<<3);
+    int clocks[]={2,3,process,process|1,process|2,thread|4,thread|5,thread|6};
+    for(unsigned i=0;i<sizeof(clocks)/sizeof(clocks[0]);i++) {
+        int id;struct native_event event={.notify=4,.signal=sig,.tid=syscall(SYS_gettid),.value=100+i};
+        CHECK(!create(clocks[i],&event,&id));struct itimerspec in=setting(60000000,0),out;
+        int armed=set_timer(id,0,&in,0);CHECK(!armed);
+        if(!armed) {
+            deadline_passed();CHECK(!get_timer(id,&out)&&(out.it_value.tv_sec||out.it_value.tv_nsec>40000000));
+            burn_cpu(90000000);siginfo_t info;struct timespec zero={0};
+            CHECK(sigtimedwait(&set,&info,&zero)==sig&&info.si_code==SI_TIMER&&info.si_timerid==id&&info.si_value.sival_int==100+(int)i);
+            CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec);
+        }
+        CHECK(!remove_timer(id));
+    }
+    int id;struct native_event event={.notify=4,.signal=sig,.tid=syscall(SYS_gettid),.value=200};CHECK(!create(3,&event,&id));
+    struct itimerspec in=setting(10000000,10000000);int armed=set_timer(id,0,&in,0);CHECK(!armed);
+    if(!armed){burn_cpu(70000000);siginfo_t info;struct timespec zero={0};
+        CHECK(sigtimedwait(&set,&info,&zero)==sig&&info.si_overrun>=4&&syscall(SYS_timer_getoverrun,id)==info.si_overrun);}
+    CHECK(!remove_timer(id));siginfo_t info;struct timespec zero={0};while(sigtimedwait(&set,&info,&zero)>0){}
+    CHECK(!sigprocmask(SIG_SETMASK,&old,0));puts("POSIX CASE cpu-clocks OK");
+}
+static int cpu_ready[2],cpu_go[2];
+static void *clock_target(void *unused)
+{(void)unused;char byte;if(write(cpu_ready[1],"R",1)!=1||read(cpu_go[0],&byte,1)!=1)_exit(74);return 0;}
+static void cpu_target_exit(void)
+{
+    CHECK(!pipe(cpu_ready)&&!pipe(cpu_go));pthread_t worker;CHECK(!pthread_create(&worker,0,clock_target,0));char byte;
+    CHECK(read(cpu_ready[0],&byte,1)==1);clockid_t clock;CHECK(!pthread_getcpuclockid(worker,&clock));
+    struct native_event none={.notify=SIGEV_NONE};int id;CHECK(!create(clock,&none,&id));struct itimerspec in=setting(100000000,0),out;
+    CHECK(!set_timer(id,0,&in,0));CHECK(write(cpu_go[1],"X",1)==1&&!pthread_join(worker,0));
+    CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec&&!out.it_interval.tv_nsec);
+    CHECK(error(set_timer(id,0,&in,0),ESRCH)&&!remove_timer(id));
+    CHECK(!close(cpu_ready[0])&&!close(cpu_ready[1])&&!close(cpu_go[0])&&!close(cpu_go[1]));
+    CHECK(!pipe(cpu_ready)&&!pipe(cpu_go));pid_t child=fork();CHECK(child>=0);
+    if(!child){close(cpu_ready[0]);close(cpu_go[1]);if(write(cpu_ready[1],"R",1)!=1||read(cpu_go[0],&byte,1)!=1)_exit(75);_exit(0);}
+    CHECK(!close(cpu_ready[1])&&!close(cpu_go[0])&&read(cpu_ready[0],&byte,1)==1);
+    CHECK(!clock_getcpuclockid(child,&clock)&&!create(clock,&none,&id));CHECK(!set_timer(id,0,&in,0));
+    burn_cpu(30000000);CHECK(!get_timer(id,&out)&&(out.it_value.tv_sec||out.it_value.tv_nsec>50000000));
+    CHECK(write(cpu_go[1],"X",1)==1);int status;CHECK(waitpid(child,&status,0)==child&&!status);
+    CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec&&!out.it_interval.tv_nsec);
+    CHECK(error(set_timer(id,0,&in,0),ESRCH)&&!remove_timer(id));CHECK(!close(cpu_ready[0])&&!close(cpu_go[1]));
+    puts("POSIX CASE cpu-target-exit OK");
+}
+static void pending_oneshot(void)
+{
+    int sig=SIGRTMIN+9;sigset_t set,old;sigemptyset(&set);sigaddset(&set,sig);CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
+    for(int clock=1;clock<=3;clock+=2) {
+        struct native_event event={.notify=4,.signal=sig,.tid=syscall(SYS_gettid)};int id;
+        CHECK(!create(clock,&event,&id));struct itimerspec in=setting(clock==1?1000000:10000000,0),out;
+        CHECK(!set_timer(id,0,&in,0));if(clock==1)deadline_passed();else burn_cpu(30000000);
+        CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec);
+        in=setting(60000000000ULL,0);CHECK(!set_timer(id,0,&in,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec);
+        CHECK(!remove_timer(id));siginfo_t info;struct timespec zero={0};while(sigtimedwait(&set,&info,&zero)>0){}
+    }
+    CHECK(!sigprocmask(SIG_SETMASK,&old,0));puts("POSIX CASE pending-oneshot OK");
+}
+static void timer_group_controls(void)
+{
+    pid_t parent=getpid();int signals[]={SIGCONT,SIGKILL};
+    for(unsigned i=0;i<2;i++) {
+        int ready[2];CHECK(!pipe(ready));pid_t child=fork();CHECK(child>=0);
+        if(!child) {
+            close(ready[0]);struct native_event event={.notify=0,.signal=signals[i]};int id;
+            int clock=(int32_t)((~(uint32_t)parent)<<3)|2;
+            if(create(clock,&event,&id))_exit(81);
+            struct itimerspec in=setting(60000000,0);if(set_timer(id,0,&in,0))_exit(82);
+            raise(SIGSTOP);if(write(ready[1],"R",1)!=1)_exit(83);_exit(0);
+        }
+        CHECK(!close(ready[1]));int status;CHECK(waitpid(child,&status,WUNTRACED)==child&&WIFSTOPPED(status));
+        burn_cpu(100000000);struct pollfd pollfd={ready[0],POLLIN,0};int result=poll(&pollfd,1,100);
+        CHECK(result==1);if(result!=1)kill(child,SIGKILL);
+        CHECK(waitpid(child,&status,0)==child);
+        CHECK(i?WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL:WIFEXITED(status)&&!WEXITSTATUS(status));
+        CHECK(!close(ready[0]));
+    }
+    int ready[2];CHECK(!pipe(ready));pid_t child=fork();CHECK(child>=0);
+    if(!child) {
+        close(ready[0]);struct native_event event={.notify=0,.signal=SIGCONT};int id;
+        if(create(1,&event,&id))_exit(84);
+        struct itimerspec in=setting(1,1000);
+        if(set_timer(id,0,&in,0))_exit(85);
+        deadline_passed();
+        struct sigaction action={.sa_handler=SIG_DFL};sigemptyset(&action.sa_mask);
+        if(sigaction(SIGCONT,&action,0)||write(ready[1],"Y",1)!=1)_exit(86);
+        _exit(0);
+    }
+    CHECK(!close(ready[1]));struct pollfd pollfd={ready[0],POLLIN,0};int result=poll(&pollfd,1,200);
+    CHECK(result==1);if(result!=1)kill(child,SIGKILL);int status;CHECK(waitpid(child,&status,0)==child&&WIFEXITED(status)&&!WEXITSTATUS(status));
+    CHECK(!close(ready[0]));puts("POSIX CASE group-controls OK");
+}
+static struct composition_control *observer;
+static int observer_fd=-1;
+static pthread_barrier_t parallel_gate;
+static void *parallel_timer(void *argument)
+{
+    unsigned cpu=(uintptr_t)argument;uint64_t mask=UINT64_C(1)<<cpu;
+    CHECK(!syscall(SYS_sched_setaffinity,0,8,&mask));
+    int r=pthread_barrier_wait(&parallel_gate);CHECK(!r||r==PTHREAD_BARRIER_SERIAL_THREAD);
+    int sig=SIGRTMIN+12+(int)cpu;sigset_t set;sigemptyset(&set);sigaddset(&set,sig);
+    struct native_event event={.notify=4,.signal=sig,.tid=syscall(SYS_gettid),.value=cpu+91};int id;
+    for(int clock=1;clock<=3;clock+=2) {
+        CHECK(!create(clock,&event,&id));struct itimerspec in=setting(clock==1?2000000:10000000,0),out;
+        CHECK(!set_timer(id,0,&in,0)&&!get_timer(id,&out));
+        if(clock==3)burn_cpu(20000000);
+        if(cpu&1) {
+            int fd=signalfd(-1,&set,0);struct signalfd_siginfo info;
+            CHECK(fd>=0&&read(fd,&info,128)==128&&info.ssi_code==SI_TIMER&&info.ssi_ptr==event.value&&!close(fd));
+        } else {siginfo_t info;CHECK(sigwaitinfo(&set,&info)==sig&&info.si_code==SI_TIMER&&(uintptr_t)info.si_value.sival_ptr==event.value);}
+        CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec&&!remove_timer(id));
+        uint64_t affinity=0;CHECK(syscall(SYS_sched_getaffinity,0,8,&affinity)>0&&affinity==mask);
+    }
+    return 0;
+}
+static void parallel_timers(void)
+{
+    uint64_t allowed=0;CHECK(syscall(SYS_sched_getaffinity,0,8,&allowed)>0);unsigned cpus=0;
+    while(cpus<4&&(allowed&(UINT64_C(1)<<cpus)))cpus++;
+    sigset_t set,old;sigemptyset(&set);for(unsigned i=0;i<cpus;i++)sigaddset(&set,SIGRTMIN+12+(int)i);
+    CHECK(!pthread_sigmask(SIG_BLOCK,&set,&old));pthread_t threads[4];CHECK(!pthread_barrier_init(&parallel_gate,0,cpus));
+    for(unsigned i=0;i<cpus;i++)CHECK(!pthread_create(&threads[i],0,parallel_timer,(void *)(uintptr_t)i));
+    for(unsigned i=0;i<cpus;i++)CHECK(!pthread_join(threads[i],0));
+    CHECK(!pthread_barrier_destroy(&parallel_gate)&&!pthread_sigmask(SIG_SETMASK,&old,0));
+    puts("POSIX CASE caller-cpus OK");
+}
+static void observe_start(void)
+{
+    if(access("/posix-observer",F_OK))return;
+    CHECK(!mkdir("/dev/shm",0700)||errno==EEXIST);CHECK(!mount("tmpfs","/dev/shm","tmpfs",0,0)||errno==EBUSY);
+    observer_fd=open("/dev/shm/smp-control",O_CREAT|O_EXCL|O_RDWR,0600);CHECK(observer_fd>=0&&!ftruncate(observer_fd,4096));
+    observer=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,observer_fd,0);CHECK(observer!=MAP_FAILED);
+    composition_store(&observer->magic,COMPOSITION_MAGIC);while(!composition_load(&observer->observer_ready))sched_yield();
+}
+static void observe_end(void)
+{
+    if(!observer)return;
+    composition_store(&observer->command,COMPOSITION_STOP);composition_store(&observer->request,1);
+    while(composition_load(&observer->reply)!=1)sched_yield();
+    CHECK(!munmap(observer,4096)&&!close(observer_fd)&&!unlink("/dev/shm/smp-control"));
+}
 static void timeout_exit(int sig){(void)sig;_exit(124);}
 int main(int argc,char **argv)
 {
@@ -215,6 +369,6 @@ int main(int argc,char **argv)
     setvbuf(stdout,0,_IONBF,0);signal(SIGALRM,timeout_exit);alarm(20);
     struct native_event none={.notify=SIGEV_NONE};int entry=-1;
     CHECK(!create(1,&none,&entry));if(entry<0)return 1;CHECK(!remove_timer(entry));
-    objects();faults_quota();lifecycle();wall();queued_notifications();periodic();stale_and_ignored();exec_pending();callbacks();
+    observe_start();objects();faults_quota();lifecycle();wall();queued_notifications();periodic();stale_and_ignored();exec_pending();cpu_clocks();cpu_target_exit();callbacks();pending_oneshot();timer_group_controls();parallel_timers();observe_end();
     printf("POSIX END failures=%u\n",failures);return failures?1:0;
 }

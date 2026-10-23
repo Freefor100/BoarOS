@@ -109,4 +109,12 @@ static inline struct kernel_avl_node *kernel_avl_remove_node(struct kernel_avl_n
 
 static inline struct kernel_avl_node *kernel_avl_first(struct kernel_avl_node *root)
 { while(root&&root->left)root=root->left;return root; }
+static inline struct kernel_avl_node *kernel_avl_last(struct kernel_avl_node *root)
+{ while(root&&root->right)root=root->right;return root; }
+static inline struct kernel_avl_node *kernel_avl_after(struct kernel_avl_node *root,uint64_t key)
+{
+    struct kernel_avl_node *next=0;
+    while(root){if(root->key>key){next=root;root=root->left;}else root=root->right;}
+    return next;
+}
 #endif

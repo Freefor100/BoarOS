@@ -72,6 +72,7 @@ struct kernel_scheduler {
     struct kernel_stack_statistics stack_statistics;
 };
 struct signal_queue_record;
+void signal_timer_notify(struct kernel_task *,unsigned);
 int signal_timer_post_locked(struct kernel_pid *,int,struct signal_queue_record *,struct kernel_wait_cursor *,struct kernel_task **);
 int signal_timer_disposition_ignored_locked(struct kernel_pid *,int,unsigned);
 struct scheduler_cpu_clock {
@@ -80,6 +81,10 @@ struct scheduler_cpu_clock {
 };
 int scheduler_cpu_clock_resolve(struct kernel_task *,int32_t,int,struct scheduler_cpu_clock *);
 int scheduler_cpu_clock_sample(const struct scheduler_cpu_clock *,struct kernel_task_usage *);
+void scheduler_cpu_timer_update_locked(struct kernel_task *,unsigned);
+void scheduler_cpu_timer_expire(void);
+unsigned signal_cpu_timer_check_locked(struct kernel_task *,const struct kernel_task_usage *);
+void signal_cpu_timer_notify(struct kernel_task *,unsigned);
 
 extern struct kernel_scheduler scheduler;
 /* 已持调度域；变更资格不修改用户请求affinity，也不结束执行owner。 */

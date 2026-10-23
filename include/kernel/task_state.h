@@ -5,6 +5,7 @@
  * code using an executing task's embedded state shares this exact layout. */
 #include <arch/task.h>
 #include <kernel/cost.h>
+#include <kernel/avl.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/futex.h>
@@ -23,6 +24,13 @@ struct kernel_task_usage {
     uint64_t user_ns, kernel_ns;
     uint64_t minor_faults, major_faults, maxrss_pages;
     uint64_t voluntary, involuntary, read_bytes, write_bytes;
+};
+
+struct kernel_cpu_timer_index {
+    struct kernel_avl_node node;
+    struct kernel_avl_node *timers[3];
+    struct kernel_task *task;
+    uint32_t thread, indexed;
 };
 
 struct kernel_exec_transaction;
@@ -222,9 +230,7 @@ struct kernel_task {
     struct kernel_cost_task cost;
 #endif
     /* 稀用的进程CPU定时器状态置尾，保持普通信号返回路径的原有字段布局。 */
-    struct kernel_task *cpu_timer_next;
     struct { uint64_t expires, interval; } cpu_timers[2];
-    uint32_t cpu_timer_active;
     struct kernel_rlimit64 core_limit;
     struct kernel_rlimit64 fsize_limit;
     struct kernel_signal_stack signal_stack;
@@ -232,6 +238,7 @@ struct kernel_task {
     struct kernel_rlimit64 sigpending_limit;
     uint64_t signal_child_times[2], group_child_times[2];
     struct kernel_posix_timer_registry *posix_timers;
+    struct kernel_cpu_timer_index cpu_timer_index[2];
 } __attribute__((aligned(16)));
 
 #endif
