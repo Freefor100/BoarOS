@@ -22,7 +22,7 @@
 
 默认动作包括忽略、继续、停止、终止和core动作；当前提供CORE限额状态，core文件写出仍列为缺口，wait状态反映实际是否产生转储。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
 
-SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。用户发送（含 signal=0）按调用者 real/effective UID 与目标 real/saved UID、CAP_KILL 判断；同线程组以及同 session 的 SIGCONT 保留对应许可。进程组内至少一个目标获准即成功，只有存在目标且全部无权限时返回 EPERM。内核产生的 TTY、故障和定时器事件沿其原有来源递送。
+SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。用户发送（含 signal=0）按调用者 real/effective UID 与目标 real/saved UID、CAP_KILL 判断；同线程组以及同 session 的 SIGCONT 保留对应许可。进程组内至少一个目标获准即成功，只有存在目标且全部无权限时返回 EPERM。内核产生的 TTY、故障和定时器事件沿其原有来源递送。 指定 PID/TID 的进程定向发送，授权和 UID 计费使用原目标线程；共享队列归组容器，唤醒者另行选择。线程用原始 syscall 改成不同身份时，也不会把这三个对象的身份混用。
 
 ## 待决记录与计费
 
