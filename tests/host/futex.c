@@ -4,6 +4,7 @@
 #include <kernel/time.h>
 #include <kernel/errno.h>
 #include <kernel/uaccess.h>
+#include <kernel/memory_object.h>
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -19,6 +20,45 @@ static unsigned char pool[8 * 1024 * 1024] __attribute__((aligned(16384)));
 static struct kernel_mm mm;
 static uint64_t context;
 static const uint64_t source = 0x40000, target = 0x41000;
+static unsigned opposite_arm, bucket_entered, bucket_waiter;
+static unsigned remap_arm, fault_entered, fault_resume;
+static const uint64_t cold_target = 0x80000;
+static struct kernel_memory_object *cold_object;
+void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    __real_kernel_rwlock_write(lock, guard);
+    if (lock->rank == 26 && kernel_cpu_current()->hardware_id == 2 &&
+        __atomic_exchange_n(&opposite_arm, 0, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&bucket_entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&bucket_waiter, __ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *, uint64_t, int, struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
+    uint64_t deadline, int interruptible, struct kernel_wait_token *token)
+{
+    enum kernel_scheduler_status result = __real_kernel_wait_prepare(queue, deadline, interruptible, token);
+    if (kernel_cpu_current()->hardware_id == 3 && !interruptible &&
+        __atomic_load_n(&bucket_entered, __ATOMIC_ACQUIRE)) {
+        assert(result == KERNEL_SCHEDULER_STATUS_OK && queue->registrations && token->generation);
+        __atomic_store_n(&bucket_waiter, 1, __ATOMIC_RELEASE);
+    }
+    return result;
+}
+enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(struct kernel_memory_object *, uint64_t, uint64_t *, int *);
+enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(struct kernel_memory_object *object,
+    uint64_t index, uint64_t *page, int *created)
+{
+    enum kernel_memory_object_status result = __real_kernel_memory_object_prepare_page(object, index, page, created);
+    if (object == cold_object && kernel_cpu_current()->hardware_id == 2 &&
+        __atomic_exchange_n(&remap_arm, 0, __ATOMIC_ACQ_REL)) {
+        assert(!result && !kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
+        __atomic_store_n(&fault_entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&fault_resume, __ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return result;
+}
 void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_unavailable(void) { abort(); }
 void mm_test_fence(uint64_t address, int instructions)
@@ -142,6 +182,69 @@ static void requeue(uint64_t destination)
     assert(call(destination, 10 | 128, 2, 0, 0, 2) == 1);
     assert(!pthread_join(y, 0) && b.result == 0);
 }
+struct mover { unsigned id; uint64_t from, to; int64_t result; };
+static void *mover(void *argument)
+{
+    struct mover *m = argument; attach(m->id);
+    if (m->id == 3) while (!__atomic_load_n(&bucket_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    m->result = call(m->from, 3 | 128, 0, 1, m->to, 0);
+    detach(); return 0;
+}
+static void opposite(uint64_t destination)
+{
+    put(source, 0);
+    struct waiter w = {1, 1, source, -99, 0};
+    unsigned before = mm_test_parked(1); pthread_t wait_thread, first, second;
+    assert(!pthread_create(&wait_thread, 0, waiter, &w)); queued(1, before);
+    bucket_entered = bucket_waiter = 0; opposite_arm = 1;
+    struct mover a = {2, source, destination, -99}, b = {3, destination, source, -99};
+    assert(!pthread_create(&first, 0, mover, &a) && !pthread_create(&second, 0, mover, &b));
+    assert(!pthread_join(first, 0) && !pthread_join(second, 0));
+    assert(a.result == 1 && b.result == 1 && bucket_waiter);
+    assert(call(destination, 1 | 128, 1, 0, 0, 0) == 0);
+    assert(call(source, 1 | 128, 1, 0, 0, 0) == 1);
+    assert(!pthread_join(wait_thread, 0) && w.result == 0);
+    bucket_entered = 0;
+}
+static uint64_t old_identity;
+static void *prepare_after_remap(void *unused)
+{
+    (void)unused; attach(2);
+    struct kernel_futex_key keys[2]; struct kernel_mm_user_pin pin = {0};
+    uint64_t addresses[2] = {source, cold_target};
+    assert(!kernel_mm_prepare_futex(&kernel_wait_current_task()->mm,
+        addresses, 2, 1, 0, KERNEL_MM_READ, keys, &pin));
+    assert(keys[0].identity != old_identity && keys[0].kind == KERNEL_FUTEX_KEY_SHARED_MEMORY);
+    uint32_t *word = (uint32_t *)((unsigned char *)pin.page + (source & BOAROS_PAGE_MASK));
+    assert(__atomic_load_n(word, __ATOMIC_ACQUIRE) == UINT32_C(0x44556677));
+    kernel_mm_unpin_user_page(&pin);
+    for (unsigned i = 0; i < 2; i++) kernel_memory_object_release(&keys[i].shared_object);
+    detach(); return 0;
+}
+static void coherent_remap(void)
+{
+    uint64_t out;
+    assert(!kernel_mm_mmap_anonymous(&mm, source, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED, &out));
+    put(source, 0);
+    struct kernel_futex_key old;
+    assert(!kernel_mm_prepare_futex(&mm, &source, 1, 1, 0, 0, &old, 0));
+    old_identity = old.identity;
+    assert(!kernel_mm_mmap_anonymous(&mm, cold_target, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED, &out));
+    struct kernel_vma vma;
+    assert(!kernel_mm_vma_lookup(&mm, cold_target, &vma)); cold_object = vma.backing;
+    remap_arm = 1; fault_entered = fault_resume = 0;
+    pthread_t worker; assert(!pthread_create(&worker, 0, prepare_after_remap, 0));
+    while (!__atomic_load_n(&fault_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_mm_munmap(&mm, source, BOAROS_PAGE_SIZE));
+    assert(!kernel_mm_mmap_anonymous(&mm, source, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED, &out));
+    put(source, UINT32_C(0x44556677));
+    __atomic_store_n(&fault_resume, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(worker, 0));
+    kernel_memory_object_release(&old.shared_object);
+}
 int main(void)
 {
     struct physical_page_allocator allocator = {0};
@@ -163,8 +266,9 @@ int main(void)
     assert(!kernel_mm_mmap_anonymous(&mm, source, 2 * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
     attach(0);
     operations(); requeue(target); requeue(source + 1024); comparisons();
+    opposite(target); opposite(source + 1024); coherent_remap();
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
-    puts("futex native operations, requeue/bitset and owners PASS");
+    puts("futex native operations, requeue/bitset, opposite-lock handoff, coherent remap and owners PASS");
 }
