@@ -22,6 +22,7 @@ static uint64_t now(void)
 {struct timespec t;CHECK(!clock_gettime(CLOCK_MONOTONIC,&t));return (uint64_t)t.tv_sec*1000000000+t.tv_nsec;}
 #include "signal_stack.h"
 #include "../workloads/signal/queued_threads.h"
+#include "futex.h"
 /* The old comparison and new states deliberately share one ELF. The old
  * entry performs no native timer operation on the reference kernel. */
 struct native_event {uint64_t value;int32_t signal,notify,tid;uint8_t padding[44];};
@@ -96,5 +97,5 @@ int main(void)
     if(kind)return new_cost(cpus);
     config=fopen("/account-altstack","r");CHECK(config&&!stack_cost_main(config));
     uint64_t affinity=(UINT64_C(1)<<cpus)-1;CHECK(!syscall(SYS_sched_setaffinity,0,8,&affinity));
-    queue_perf=1;queue_perf_mode=1;queued_threads();puts("POSIX-PERF OLD END 3");return 0;
+    queue_perf=1;queue_perf_mode=1;queued_threads();futex_perf(cpus);puts("POSIX-PERF OLD END 3");return 0;
 }
