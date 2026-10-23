@@ -483,3 +483,37 @@ LTP自身的30/270秒内部超时与总预算分别独立；上述完整诊断�
 完成全部工作直接比较性能。
 
 ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它们采用旧输出格式，不能据此绕过原 judge 的 Summary 规则增加通过分。修复还消除了会污染后续程序状态的磁盘损坏，后续完整得分变化需要独立实际运行才能得到。
+
+## POSIX 定时器原程序：四类时钟完成版
+
+10月23日将main的POSIX定时器实现合入兼容分支后，在固定官方离线容器与原QEMU参数下运行七个原程序。RV与LA并行，各自按glibc、musl顺序执行；原ELF、参数、judge和程序内时限保持现状。仅在外层枚举选择这七项，默认单核、跳过表、监督参数及输入盘保持现有配置。
+
+**四个组合均为51/95分：51项通过、44项因缺少其他时钟跳过，失败0、broken 0、超时0。** 合计204/380分、176项跳过。这44项都在创建BOOTTIME、BOOTTIME_ALARM、REALTIME_ALARM或TAI定时器时返回EOPNOTSUPP；它们属于已知内核能力缺口。本轮四类时钟的主体均已执行，没有用户数据库、工具或输入准备失败。
+
+| 原程序 | 每组合得分／满分 | 每组合跳过 | RV glibc/ms | RV musl/ms | LA glibc/ms | LA musl/ms |
+|---|---:|---:|---:|---:|---:|---:|
+| timer_delete01 | 4/8 | 4 | 147 | 83 | 106 | 63 |
+| timer_delete02 | 1/1 | 0 | 94 | 42 | 64 | 63 |
+| timer_getoverrun01 | 2/2 | 0 | 66 | 43 | 65 | 41 |
+| timer_gettime01 | 3/3 | 0 | 67 | 41 | 65 | 41 |
+| timer_settime01 | 16/32 | 16 | 925 | 935 | 954 | 917 |
+| timer_settime02 | 24/48 | 24 | 66 | 62 | 62 | 42 |
+| timer_settime03 | 1/1 | 0 | 64 | 42 | 64 | 44 |
+
+四个组合的程序总耗时分别为rv-glibc 1.429s、rv-musl 1.248s、la-glibc 1.380s、la-musl 1.211s；这是逐程序监督计时的总和。含启动和两套libc的QEMU总耗时为RV8.924s、LA8.793s，两架构并行。
+
+### 这些结果实际验证了什么
+
+- `timer_delete01/02`覆盖四种已支持时钟的创建／删除，以及非法ID的EINVAL。其余四种时钟在create处跳过，各贡献一个未执行子项。
+- `timer_getoverrun01`检查初始overrun为零和非法ID的EINVAL；`timer_gettime01`检查有效查询、非法ID及坏输出地址EFAULT。
+- `timer_settime01`在四类时钟下各执行四种设置，共16项；其余四类时钟的16项在创建时跳过。`timer_settime02`对每类时钟检查六种无效输入／错误路径，已支持时钟24项通过，另24项跳过。
+- `timer_settime03`实际运行REALTIME的过往绝对周期期限，验证overrun上限，四个组合均报告“Timer overrun count is capped”。
+- 原盘没有独立timer_create程序；创建入口由以上原程序和固定Linux同ELF原生差分检查覆盖。原脚本统一打印`FAIL LTP CASE … : 0`的行为沿现状，按真实退出状态、TPASS及原judge判分解释，见[输入问题](oscomp-test-issues.md)。
+
+自有短例还覆盖：同一标准信号的多个timer、64位载荷、handler／sigwaitinfo／signalfd消费、真实libc SIGEV_THREAD、额度竞争、忽略恢复、CPU目标退出、消费期间删除／重设、单次到期未消费查询及STOP/CONT/KILL组行为。四核内核观察确认设置与消费留在调用CPU，到期由CPU0推进。普通路径的新增成本及未达项统一见[CPU成本记录](cpu-accounting-cost.md#posix-定时器四类时钟与普通路径成本)。
+
+### 运行盘与交付状态
+
+正常退出后，两架构根盘与第二盘p1/p2/p3共八个对象检查通过：ext4使用固定e2fsck 1.47.2 `-fn`，VFAT使用fsck.fat `-n`；启动种子槽已擦除。定向启动的两内核已恢复为原默认交付内核并逐字节核对。原有交付文档的未提交修改保持原样。
+
+原输出、逐程序结果、原judge输出、内核／QEMU／输入身份及磁盘检查位于`build/posix-timer/original/`；已检查的运行盘清理，保留ELF、日志与构建缓存。
