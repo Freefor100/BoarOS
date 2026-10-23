@@ -17,13 +17,24 @@ import harness
 from arch_profiles import PROFILES
 
 def workload_source(name):
-    return ROOT / ({'futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
+    return ROOT / ({'mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
 
 def futex_lines(raw,cpus):
     names=['abi','atomics']+[f'compare-{cmp}-old-{value}' for cmp in range(6) for value in (-1,0,1)]+['requeue-near','requeue-offset','wake-zero','wake-negative','wake-both','shared','robust']
     expected=[f'FUTEX CALLER CPUS {cpus}',*[f'FUTEX CASE {name} PASS' for name in names],*[f'FUTEX CPU {cpu} PASS' for cpu in range(cpus)],'FUTEX CASE caller-cpus PASS','FUTEX CALLER PASS cases=28']
     lines=[line[line.index('FUTEX '):] for line in raw.replace('\r','').splitlines() if any(token in line for token in ('FUTEX CALLER ','FUTEX CASE ','FUTEX CPU '))]
     return lines,expected
+
+def mremap_output(raw,cpus):
+    lines=raw.replace('\r','').splitlines()
+    actual=[line for line in lines if line.startswith(('MREMAP CASE ','MREMAP END '))]
+    expected=[f'MREMAP CASE {name} PASS' for name in ('realloc','remote-move-reuse','shared-file-msync-truncate','sysv-shrink-ownership')]+['MREMAP END 4']
+    remote=re.findall(r'^MREMAP CPU remote index=(\d+) affinity=(\d+) role=(?:mover|reader) content=PASS$',raw.replace('\r',''),re.M)
+    return (actual==expected and [(int(i),int(a)) for i,a in remote]==[(i,i) for i in range(cpus)] and
+            len([line for line in lines if line.startswith(f'MREMAP BEGIN cpus={cpus} ')])==1 and
+            len([line for line in lines if line.startswith('MREMAP METRIC realloc ')])==1 and
+            not any(line.startswith('MREMAP FAIL') for line in lines))
+
 
 def digest(path):
     with Path(path).open('rb') as stream:
@@ -56,7 +67,7 @@ def run_loongarch(args):
         if args.only and args.only!=platform:continue
         for memory in args.memory or ('512M','1G'):
             case=work/f'{platform}-{memory}';case.mkdir()
-            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex') else disk(case,program)
+            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap') else disk(case,program)
             kernel=profile.linux_kernel() if platform=='linux' else args.kernel or ROOT/profile.kernel
             snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
             command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
@@ -72,6 +83,7 @@ def run_loongarch(args):
             if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
             if args.workload=='futex':
                 lines,expected=futex_lines(raw,1);passed=passed and lines==expected
+            if args.workload=='mremap':passed=not code and mremap_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
                 'owner_baseline_checked':platform=='boaros'}
             metadata['runs'][f'{platform}-{memory}']=row
@@ -106,6 +118,7 @@ def run_smp(args):
     (output/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     expected=[f'SOCKET-SMP CASE {name} OK' for name in ('ipv4-tcp','ipv6-tcp','ipv4-udp','ipv6-udp','unix-stream','unix-dgram','blocking-close-reuse-cancel','fault-empty-trunc-timeout-sendfile','shared-readers-writers','remote-epoll-oneshot-nested')]+['SOCKET-SMP END 10']
     pipe=args.workload=='pipe';event=args.workload=='event';altstack=args.workload=='altstack'
+    mremap=args.workload=='mremap'
     futex=args.workload=='futex'
     posix=args.workload=='posix'
     queued=args.workload=='queued'
@@ -141,8 +154,9 @@ def run_smp(args):
                     if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -192,7 +206,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','smp','epoll','pipe','event','altstack','queued','posix','futex'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -203,7 +217,7 @@ def main(default_arch="riscv"):
     parser.add_argument('--output',type=Path)
     parser.add_argument('--firmware',default='default')
     args=parser.parse_args()
-    if args.workload in ('smp','pipe','event','altstack','queued','posix','futex') and args.arch=='riscv':return run_smp(args)
+    if args.workload in ('smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)

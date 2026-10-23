@@ -53,6 +53,7 @@ void abi_exec_boundary_cases(void);
 void abi_stack_boundary_cases(void);
 void abi_mknod_cases(void);
 void abi_proc_cases(void);
+void abi_mremap_cases(void);
 void abi_tmpfs_cases(void);
 void abi_tmpfs_options_cases(void);
 void abi_proc_exec_probe(void) __attribute__((noreturn));

@@ -112,6 +112,7 @@
 #define LINUX_SYSCALL_TIMES 153U
 #define LINUX_CLOCK_REALTIME 0U
 #define LINUX_SYSCALL_MUNMAP 215U
+#define LINUX_SYSCALL_MREMAP 216U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
 #define LINUX_SYSCALL_MMAP 222U
@@ -706,6 +707,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_MUNMAP) {
         if (syscall_handle_munmap(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_MREMAP) {
+        if (syscall_handle_mremap(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
