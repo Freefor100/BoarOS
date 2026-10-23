@@ -1591,6 +1591,16 @@ static void reap_claim_end(struct kernel_task **task)
     scheduler_task_claim_release_locked(*task);
 }
 
+/* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
+static void cleanup_task_io_requests(struct kernel_task *thread)
+{
+    if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
+    if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
+    if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
+    if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
+    if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
+}
+
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion)
 {
@@ -1644,14 +1654,9 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     }
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
-    if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
+    cleanup_task_io_requests(thread);
     kernel_posix_timers_exit(thread);
     kernel_signal_pending_cleanup(thread);
-    if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
-    if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
-    if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
-    /* 阻塞TTY请求仍借用退出任务的栈；先消费真实owner，再归还栈页。 */
-    if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
     status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     result = thread->completion;
@@ -1830,14 +1835,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
-    if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
-    if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
-    if (thread->socket_write_request != 0)
-        kernel_socket_abort_write(thread->socket_write_request);
-    if (thread->socket_read_request != 0)
-        kernel_socket_abort_read(thread->socket_read_request);
-    if (thread->io_buffer != 0)
-        kernel_task_io_buffer_release(thread->io_buffer);
+    cleanup_task_io_requests(thread);
 
     signal_status = thread->group_leader == thread && thread->group_members > 1U
         ? KERNEL_SIGNAL_STATUS_OK : kernel_signal_release_table(thread);

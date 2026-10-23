@@ -289,7 +289,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 RV普通用户任务、共享匿名/文件MM及ext4文件操作已支持真实双核，执行位置和后端并发范围见[两核模块](riscv-smp.md)。四核、PI futex、实时信号队列、sigaltstack和clone3仍属后续能力。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
-活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
+活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
 `make test-sched-policy-host` 的系统调用夹具链接生产 affinity 实现，检查有效掩码、空交集、PID、长度与用户地址错误；该既有目标纳入宿主 CI。
 

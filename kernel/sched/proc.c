@@ -41,6 +41,31 @@ uint32_t kernel_proc_pid_max(void)
     return scheduler.pid_allocator.limit + 1U;
 }
 
+static int proc_group_visible(struct kernel_task *leader)
+{
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!leader->accounted || leader->retirement) return 0;
+        if (proc_visible(leader)) return 1;
+    }
+    /* An EXITED/GROUP_DEAD leader remains visible through a live member.
+     * The storage borrow crosses segments; each role/state check stays locked. */
+    int visible = 0;
+    struct scheduler_group_cursor cursor;
+    scheduler_group_cursor_begin(leader, &cursor);
+    while (cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            struct kernel_task *member = cursor.task;
+            visible = member->accounted && member->group_leader == leader && proc_visible(member);
+        }
+        if (visible) break;
+        scheduler_group_cursor_next(&cursor);
+    }
+    scheduler_group_cursor_end(&cursor);
+    return visible;
+}
+
 static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
 {
     struct kernel_task *leader;
@@ -50,26 +75,12 @@ static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
         if (!leader || process_identity_generation(leader) != identity ||
             !leader->accounted || leader->retirement) return 0;
         scheduler_task_get_locked(leader);
-        if (proc_visible(leader)) return leader;
     }
-    /* An EXITED/GROUP_DEAD leader remains visible through a live member.
-     * The storage borrow crosses segments; each role/state check stays locked. */
-    int visible = 0;
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
-    while (cursor.task) {
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            struct kernel_task *member = cursor.task;
-            visible = member->accounted && member->group_leader == leader && proc_visible(member);
-        }
-        if (visible) break;
-        scheduler_task_cursor_next(&cursor);
-    }
-    scheduler_task_cursor_end(&cursor);
+    int visible = proc_group_visible(leader);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         visible = visible && leader->accounted && !leader->retirement &&
+                  process_find_identity(pid, KERNEL_PID_TGID) == leader &&
                   process_identity_generation(leader) == identity;
     }
     if (!visible) { scheduler_task_put(leader); return 0; }
@@ -145,25 +156,23 @@ int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t group_identity,
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(leader, find_member(tgid, group_identity));
     if (!leader) return -KERNEL_ENOENT;
-    kernel_pid_t best = 0;
-    uint64_t token = 0;
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
-    while (cursor.task) {
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            struct kernel_task *task = cursor.task;
-            if (task->accounted && !task->retirement && task->group_leader == leader &&
-                proc_thread_visible(task) && task->tid > after && (!best || task->tid < best)) {
-                best = task->tid;
-                token = process_identity(task, KERNEL_PID_TID)->generation;
-            }
+    for (;;) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!leader->accounted || leader->retirement ||
+            process_find_identity(tgid, KERNEL_PID_TGID) != leader ||
+            process_identity_generation(leader) != group_identity)
+            return -KERNEL_ENOENT;
+        struct kernel_pid *id = kernel_pid_next_published(&scheduler.identities, after);
+        if (!id) return -KERNEL_ENOENT;
+        after = id->number;
+        struct kernel_task *task = id->members[KERNEL_PID_TID]
+            ? id->members[KERNEL_PID_TID]->task : 0;
+        if (task && task->accounted && !task->retirement &&
+            task->group_leader == leader && proc_thread_visible(task)) {
+            *tid = id->number; *identity = id->generation;
+            return 0;
         }
-        scheduler_task_cursor_next(&cursor);
     }
-    if (!best) return -KERNEL_ENOENT;
-    *tid = best; *identity = token;
-    return 0;
 }
 
 static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
@@ -208,9 +217,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         task->state != KERNEL_THREAD_STATE_RUNNING &&
         task->state != KERNEL_THREAD_STATE_READY;
     memcpy(result->comm, task->comm, sizeof(result->comm));
-    }
-    result->tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader));
-    result->tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader));
+    /* 远端可改写信号动作；查询与修改共用wait域，与其余信号字段一起捕获。 */
     const struct kernel_signal_table *actions =
         (const void *)(uintptr_t)task->signal_table_address;
     if (actions) {
@@ -222,6 +229,9 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
                 result->signal_caught |= UINT64_C(1) << sig;
         }
     }
+    }
+    result->tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader));
+    result->tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader));
     struct kernel_task_usage usage = {0};
     scheduler_usage_snapshot(task, thread, &usage);
     result->minor_faults = usage.minor_faults;
@@ -416,23 +426,21 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     return kernel_open_file_pipe_finish(heap, &pin, flags, owner);
 }
 
-static void consider(const struct kernel_task *task, kernel_pid_t after,
-                     kernel_pid_t *best, uint64_t *identity)
+static int proc_process_visible(struct kernel_task *task, struct kernel_task *root,
+                                kernel_pid_t pid, uint64_t identity)
 {
-    if (!task) return;
-    kernel_pid_t pid = task->group_leader->tid;
-    if (pid > after && (*best == 0 || pid < *best)) {
-        *best = pid;
-        *identity = process_identity_generation(task);
-    }
+    if (!scheduler_task_descends_from(task, root, 0) || !proc_group_visible(task)) return 0;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    /* 存储借用只保证对象未释放；祖先遍历期间exec可转移同一TGID。 */
+    return task->accounted && !task->retirement &&
+        process_find_identity(pid, KERNEL_PID_TGID) == task &&
+        process_identity_generation(task) == identity;
 }
 
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
                              uint64_t *identity)
 {
     if (!pid || !identity || after < 0) return -KERNEL_EINVAL;
-    kernel_pid_t best = 0;
-    uint64_t token = 0U;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(root, 0);
     {
@@ -441,33 +449,46 @@ int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
         if (root) scheduler_task_get_locked(root);
     }
     if (!root) return -KERNEL_ENOENT;
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
-    while (cursor.task) {
-        struct kernel_task *task = cursor.task;
-        int descends = scheduler_task_descends_from(task, root, 0);
+    for (;;) {
+        SCHEDULER_TASK_BORROW(task, 0);
+        uint64_t token;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (descends && task->accounted && proc_visible(task))
-                consider(task, after, &best, &token);
+            struct kernel_pid *id = kernel_pid_next_published(&scheduler.identities, after);
+            if (!id) return -KERNEL_ENOENT;
+            after = id->number;
+            token = id->generation;
+            task = id->members[KERNEL_PID_TGID] ? id->members[KERNEL_PID_TGID]->task : 0;
+            if (task && task->accounted && !task->retirement) scheduler_task_get_locked(task);
+            else task = 0;
         }
-        scheduler_task_cursor_next(&cursor);
+        if (task && proc_process_visible(task, root, after, token)) {
+            *pid = after; *identity = token;
+            return 0;
+        }
     }
-    if (!best) return -KERNEL_ENOENT;
-    *pid = best;
-    *identity = token;
-    return 0;
 }
 
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity)
 {
     if (pid <= 0 || !identity) return -KERNEL_EINVAL;
-    kernel_pid_t found;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, 0);
+    SCHEDULER_TASK_BORROW(root, 0);
     uint64_t token;
-    kernel_pid_t after = pid - 1;
-    int result = kernel_proc_next_process(after, &found, &token);
-    if (result) return result;
-    if (found != pid) return -KERNEL_ENOENT;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        task = process_find_identity(pid, KERNEL_PID_TGID);
+        root = scheduler.init_task;
+        if (!task || !task->accounted || task->retirement || !root) {
+            task = root = 0;
+            return -KERNEL_ENOENT;
+        }
+        token = process_identity_generation(task);
+        scheduler_task_get_locked(task);
+        scheduler_task_get_locked(root);
+    }
+    if (!proc_process_visible(task, root, pid, token)) return -KERNEL_ENOENT;
     *identity = token;
     return 0;
 }

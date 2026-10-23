@@ -44,11 +44,68 @@ static void encoding_boundaries(void)
     }
 }
 
+static void published_iteration(void)
+{
+    enum { COUNT = 300 };
+    uint64_t bitmap[KERNEL_PID_BITMAP_WORDS(COUNT)];
+    struct kernel_pid_allocator numbers = {0};
+    struct kernel_pid_registry registry = {.numbers = &numbers, .next_generation = 1};
+    struct kernel_pid ids[COUNT] = {0}, replacement = {0};
+    assert(kernel_pid_allocator_init(&numbers, bitmap, COUNT) == KERNEL_PID_STATUS_OK);
+    const unsigned published[] = {0, 62, 63, 64, 129, 256, 299};
+    for (unsigned i = 0; i < COUNT; i++)
+        assert(kernel_pid_reserve(&registry, &ids[i]) == KERNEL_PID_STATUS_OK);
+    /* Private reservations fill the gaps, including whole bitmap words. */
+    for (unsigned i = 0; i < sizeof(published)/sizeof(published[0]); i++)
+        assert(kernel_pid_publish_reserved(&ids[published[i]]) == KERNEL_PID_STATUS_OK);
+    kernel_pid_put(&ids[63]); /* Retired storage is still pending disposal. */
+    uint64_t old_generation = ids[63].generation;
+    assert(kernel_pid_publish(&registry, &replacement) == KERNEL_PID_STATUS_OK);
+    assert(replacement.number == 64 && replacement.generation > old_generation);
+    /* Published identities without a TID/TGID are returned for role filtering. */
+    struct kernel_pid_allocator saved_numbers = numbers;
+    uint32_t references[COUNT];
+    for (unsigned i = 0; i < COUNT; i++) references[i] = ids[i].references;
+    kernel_pid_t after = 0;
+    for (unsigned i = 0; i < sizeof(published)/sizeof(published[0]); i++) {
+        struct kernel_pid *expected = published[i] == 63 ? &replacement : &ids[published[i]];
+        struct kernel_pid *next = kernel_pid_next_published(&registry, after);
+        assert(next == expected);
+        after = next->number;
+    }
+    assert(!kernel_pid_next_published(&registry, after));
+    assert(!kernel_pid_next_published(&registry, INT32_MAX));
+    assert(!kernel_pid_next_published(&registry, -1));
+    assert(kernel_pid_next_published(&registry, 63) == &replacement);
+    assert(kernel_pid_next_published(&registry, 64) == &ids[64]);
+    assert(kernel_pid_next_published(&registry, 257) == &ids[299]);
+    assert(numbers.cursor == saved_numbers.cursor && numbers.allocated == saved_numbers.allocated);
+    for (unsigned i = 0; i < COUNT; i++) assert(references[i] == ids[i].references);
+    for (unsigned i = 0; i < COUNT; i++)
+        if (ids[i].published == 0 && ids[i].registry) kernel_pid_put(&ids[i]);
+    /* Now the same continuation crosses true allocator holes and an empty word. */
+    after = 0;
+    for (unsigned i = 0; i < sizeof(published)/sizeof(published[0]); i++) {
+        struct kernel_pid *next = kernel_pid_next_published(&registry, after);
+        assert(next && next->number == (kernel_pid_t)(published[i] + 1U));
+        after = next->number;
+    }
+    assert(!kernel_pid_next_published(&registry, after));
+    kernel_pid_put(&replacement);
+    for (unsigned i = 0; i < COUNT; i++) if (ids[i].registry) kernel_pid_put(&ids[i]);
+    unsigned retired = 0;
+    while (kernel_pid_take_retired(&registry)) retired++;
+    assert(retired == COUNT + 1 && !numbers.allocated);
+    assert(!kernel_pid_next_published(&registry, 0));
+    puts("pid published iteration PASS: reservations, word boundaries, hash collision, retirement/reuse and read-only borrow");
+}
+
 /* Releasing a task must not recycle numbers owned by another role or a pin. */
 int main(void)
 {
     struct rlimit limit = {0}; assert(setrlimit(RLIMIT_CORE, &limit) == 0);
     encoding_boundaries();
+    published_iteration();
     uint64_t bitmap[1];
     struct kernel_pid_allocator numbers = {0};
     struct kernel_pid_registry registry = {.numbers = &numbers, .next_generation = 1};

@@ -80,6 +80,11 @@ enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
                                           struct kernel_pid *prepared);
 struct kernel_pid *kernel_pid_find(struct kernel_pid_registry *registry,
                                    kernel_pid_t number);
+/* Borrow the first published identity with number > after, under the caller's
+ * identity lock. Reservations and retired numbers are not enumeration entries;
+ * callers filter the returned identity's live roles. */
+struct kernel_pid *kernel_pid_next_published(struct kernel_pid_registry *registry,
+                                             kernel_pid_t after);
 void kernel_pid_get(struct kernel_pid *identity);
 void kernel_pid_put(struct kernel_pid *identity);
 void kernel_pid_attach(struct kernel_pid_member *member,

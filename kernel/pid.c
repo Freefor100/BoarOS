@@ -131,6 +131,35 @@ struct kernel_pid *kernel_pid_find(struct kernel_pid_registry *registry,
     return 0;
 }
 
+struct kernel_pid *kernel_pid_next_published(struct kernel_pid_registry *registry,
+                                             kernel_pid_t after)
+{
+    if (!registry || !valid_allocator(registry->numbers) || after < 0 ||
+        (uint32_t)after >= registry->numbers->limit) return 0;
+    struct kernel_pid_allocator *numbers = registry->numbers;
+    uint32_t word = (uint32_t)after >> 6U;
+    uint64_t bits = numbers->bitmap[word] & (UINT64_MAX << ((uint32_t)after & 63U));
+    for (;;) {
+        while (bits) {
+            uint32_t bit = 0;
+            uint64_t low = bits;
+            /* 非零字至多移位63次；基础RV ISA不能依赖libgcc的ctz实现。 */
+            while ((low & UINT64_C(1)) == 0U) {
+                low >>= 1U;
+                bit++;
+            }
+            uint32_t index = (word << 6U) + bit;
+            if (index >= numbers->limit) return 0;
+            struct kernel_pid *id = kernel_pid_find(registry, (kernel_pid_t)(index + 1U));
+            if (id) return id;
+            /* 已分配的数字也可能还属于未发布的fork/clone预留。 */
+            bits &= bits - 1U;
+        }
+        if (++word >= KERNEL_PID_BITMAP_WORDS(numbers->limit)) return 0;
+        bits = numbers->bitmap[word];
+    }
+}
+
 enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
                                           struct kernel_pid *prepared)
 {
