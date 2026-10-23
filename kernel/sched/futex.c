@@ -1,6 +1,5 @@
 #include <kernel/scheduler.h>
 #include "private.h"
-#include "../../mm/uaccess_internal.h"
 
 #include <kernel/errno.h>
 #include <kernel/futex.h>
@@ -22,7 +21,11 @@
 #define FUTEX_TID_MASK UINT32_C(0x3fffffff)
 #define ROBUST_LIST_LIMIT 2048U
 
-static struct kernel_wait_queue buckets[FUTEX_BUCKETS];
+struct futex_bucket {
+    struct kernel_mutex operation;
+    struct kernel_wait_queue waiters;
+};
+static struct futex_bucket buckets[FUTEX_BUCKETS];
 
 static void futex_key_release(struct kernel_futex_key *key)
 {
@@ -33,18 +36,28 @@ static void futex_key_release(struct kernel_futex_key *key)
     *key = (struct kernel_futex_key){0};
 }
 
-static int64_t futex_key_acquire(
-    struct kernel_task *task, uint64_t address, uint32_t operation,
-    struct kernel_futex_key *key, enum kernel_scheduler_status *status)
+static void futex_key_hold(const struct kernel_futex_key *key)
 {
-    enum kernel_mm_status result = kernel_mm_acquire_futex_key(
-        &task->mm, address, (operation & FUTEX_PRIVATE) == 0, key);
+    if (key->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY &&
+        kernel_memory_object_acquire(key->shared_object)) __builtin_trap();
+    if (key->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
+        kernel_vfs_node_acquire(key->file_node)) __builtin_trap();
+}
+
+static int64_t futex_prepare(struct kernel_task *task,
+    const uint64_t *addresses, unsigned count, uint32_t operation,
+    unsigned pin_index, uint32_t access, struct kernel_futex_key *keys,
+    struct kernel_mm_user_pin *pin, enum kernel_scheduler_status *status)
+{
+    enum kernel_mm_status result = kernel_mm_prepare_futex(&task->mm,
+        addresses, count, (operation & FUTEX_PRIVATE) == 0, pin_index,
+        access, keys, pin);
+    if (result == KERNEL_MM_STATUS_INVALID_ARGUMENT) return -KERNEL_EINVAL;
     if (result == KERNEL_MM_STATUS_NO_MEMORY) return -KERNEL_ENOMEM;
     if (result == KERNEL_MM_STATUS_NOT_MAPPED ||
         result == KERNEL_MM_STATUS_ACCESS ||
         result == KERNEL_MM_STATUS_ADDRESS_SPACE ||
-        result == KERNEL_MM_STATUS_BUS_FAULT)
-        return -KERNEL_EFAULT;
+        result == KERNEL_MM_STATUS_BUS_FAULT) return -KERNEL_EFAULT;
     if (result != KERNEL_MM_STATUS_OK)
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     return 0;
@@ -54,47 +67,51 @@ static int futex_key_equal(const struct kernel_futex_key *left,
                            const struct kernel_futex_key *right)
 {
     return left->kind == right->kind &&
-           left->identity == right->identity &&
-           left->offset == right->offset;
+           left->identity == right->identity && left->offset == right->offset;
 }
 
-static struct kernel_wait_queue *futex_bucket(
-    const struct kernel_futex_key *key)
+static struct futex_bucket *futex_bucket(const struct kernel_futex_key *key)
 {
     uint64_t hash = (key->identity >> 4U) ^ key->identity ^
-                    (key->offset >> 2U) ^ (key->offset >> 12U) ^
-                    (uint64_t)key->kind;
-    struct kernel_wait_queue *queue = &buckets[hash & (FUTEX_BUCKETS - 1U)];
-
+                    (key->offset >> 2U) ^ (key->offset >> 12U) ^ key->kind;
+    unsigned index = hash & (FUTEX_BUCKETS - 1U);
+    struct futex_bucket *bucket = &buckets[index];
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      if (queue->initialized == 0U) kernel_wait_queue_init(queue); }
-    return queue;
+      if (!bucket->waiters.initialized) {
+          kernel_wait_queue_init(&bucket->waiters);
+          kernel_mutex_init(&bucket->operation, 26, index + 1U);
+      } }
+    return bucket;
 }
 
-static void futex_key_requeue(struct kernel_task *task,
-                              const struct kernel_futex_key *target)
+static void futex_lock_buckets(const struct kernel_futex_key *keys,
+    unsigned count, struct kernel_lock_guard *guards)
 {
-    struct kernel_futex_key old;
-
-    if (target->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY &&
-        kernel_memory_object_acquire(target->shared_object) !=
-            KERNEL_MEMORY_OBJECT_OK) __builtin_trap();
-    if (target->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
-        kernel_vfs_node_acquire(target->file_node)) __builtin_trap();
-    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      old = task->futex_key;
-      task->futex_key = *target; }
-    futex_key_release(&old);
+    struct futex_bucket *first = futex_bucket(&keys[0]);
+    struct futex_bucket *second = count == 2 ? futex_bucket(&keys[1]) : first;
+    if (first > second) {
+        struct futex_bucket *swap = first; first = second; second = swap;
+    }
+    kernel_mutex_lock(&first->operation, &guards[0]);
+    if (first != second) kernel_mutex_lock(&second->operation, &guards[1]);
 }
 
+static void futex_unlock_buckets(struct kernel_lock_guard *guards)
+{
+    if (guards[1].lock) kernel_lock_release(&guards[1]);
+    kernel_lock_release(&guards[0]);
+}
+
+/* 桶操作锁跨扫描保留比较/登记/迁移的次序，raw只保护一个节点。
+ * moved个源后备引用由caller在解桶锁、归还用户pin之后释放。 */
 static int64_t futex_wake(const struct kernel_futex_key *source,
-                          uint32_t count, uint32_t requeue,
-                          const struct kernel_futex_key *target,
-                          uint32_t bitset)
+    uint32_t count, uint32_t requeue, const struct kernel_futex_key *target,
+    uint32_t bitset, uint32_t *moved_count)
 {
-    struct kernel_wait_queue *queue = futex_bucket(source);
+    struct kernel_wait_queue *queue = &futex_bucket(source)->waiters;
+    struct kernel_wait_queue *destination = target ? &futex_bucket(target)->waiters : 0;
     struct kernel_wait_cursor cursor;
-    uint32_t woken = 0U, moved = 0U;
+    uint32_t woken = 0, moved = 0;
     kernel_wait_cursor_begin(queue, &cursor);
     while (cursor.node && (woken < count || moved < requeue)) {
         struct kernel_wait_node *node = cursor.node;
@@ -102,7 +119,8 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         int move = 0;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (task && node->queue == queue && futex_key_equal(&task->futex_key, source)) {
+            if (task && node->queue == queue && futex_key_equal(&task->futex_key, source) &&
+                kernel_wait_record_of(task)->phase != KERNEL_WAIT_NOTIFIED) {
                 if (woken < count && (task->futex_bitset & bitset)) {
                     struct kernel_wait_token token = {task, node->generation};
                     if (kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN)) woken++;
@@ -110,100 +128,114 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
             }
         }
         if (move) {
-            /* 借task后放游标；不能等自身node引用，也不能持raw回收后备。 */
+            /* 当前node借用覆盖task_pin，放游标后task借用阻止finish回收。
+             * 同桶扫描由operation串行；此时没有其他游标持有要移动的node。 */
             kernel_wait_task_pin(task);
             kernel_wait_cursor_advance(&cursor);
-            futex_key_requeue(task, target);
-            enum kernel_scheduler_status status = kernel_wait_node_move(node, futex_bucket(target));
-            if (status == KERNEL_SCHEDULER_STATUS_OK) {
-                moved++;
-            } else if (status != KERNEL_SCHEDULER_STATUS_EMPTY) __builtin_trap();
+            {
+                KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+                if (node->queue == queue && futex_key_equal(&task->futex_key, source)) {
+                    enum kernel_scheduler_status result =
+                        kernel_wait_node_move_locked(node, destination);
+                    if (result == KERNEL_SCHEDULER_STATUS_OK) {
+                        futex_key_hold(target);
+                        task->futex_key = *target;
+                        moved++;
+                    } else if (result != KERNEL_SCHEDULER_STATUS_EMPTY) __builtin_trap();
+                }
+            }
             kernel_wait_task_unpin(task);
             continue;
         }
         kernel_wait_cursor_advance(&cursor);
     }
     kernel_wait_cursor_end(&cursor);
-
+    if (moved_count) *moved_count = moved;
     return (int64_t)woken + moved;
 }
 
+static uint32_t futex_wake_count(uint32_t count)
+{
+    /* legacy WAKE/WAKE_OP先唤醒再比较signed count，非正数仍可唤醒一个。 */
+    return (int32_t)count <= 0 ? 1U : count;
+}
+
+static int futex_atomic_op(uint32_t *word, uint32_t encoded)
+{
+    unsigned op = (encoded >> 28) & 7U, comparison = (encoded >> 24) & 15U;
+    int32_t argument = (int32_t)(encoded << 8) >> 20;
+    int32_t compare_argument = (int32_t)(encoded << 20) >> 20;
+    uint32_t operand = (uint32_t)argument, old;
+    if (encoded & UINT32_C(0x80000000)) operand = UINT32_C(1) << (operand & 31U);
+    switch (op) {
+    case 0: old = __atomic_exchange_n(word, operand, __ATOMIC_SEQ_CST); break;
+    case 1: old = __atomic_fetch_add(word, operand, __ATOMIC_SEQ_CST); break;
+    case 2: old = __atomic_fetch_or(word, operand, __ATOMIC_SEQ_CST); break;
+    case 3: old = __atomic_fetch_and(word, ~operand, __ATOMIC_SEQ_CST); break;
+    case 4: old = __atomic_fetch_xor(word, operand, __ATOMIC_SEQ_CST); break;
+    default: return -KERNEL_ENOSYS;
+    }
+    /* 未知comparison仍保留已经完成的原子更新，与Linux错误顺序一致。 */
+    switch (comparison) {
+    case 0: return (int32_t)old == compare_argument;
+    case 1: return (int32_t)old != compare_argument;
+    case 2: return (int32_t)old < compare_argument;
+    case 3: return (int32_t)old <= compare_argument;
+    case 4: return (int32_t)old > compare_argument;
+    case 5: return (int32_t)old >= compare_argument;
+    default: return -KERNEL_ENOSYS;
+    }
+}
+
 static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
-                                uint32_t operation, uint32_t value,
-                                int has_timeout, uint64_t deadline_ns,
-                                uint32_t bitset,
-                                enum kernel_scheduler_status *status)
+    uint32_t operation, uint32_t value, int has_timeout, uint64_t deadline_ns,
+    uint32_t bitset, enum kernel_scheduler_status *status)
 {
     struct kernel_futex_key key;
-    uint32_t actual;
-    uint64_t deadline = 0U;
-    int64_t result;
-    int expired = 0;
     struct kernel_mm_user_pin pin = {0};
-    enum kernel_wait_wake_reason reason;
-    enum kernel_uaccess_status access;
-
+    struct kernel_lock_guard guards[2] = {0};
+    uint64_t deadline = 0;
+    int expired = 0;
     if (has_timeout) {
-        enum kernel_time_status time_status =
-            kernel_time_deadline_from_monotonic(deadline_ns, &deadline);
-
-        if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) expired = 1;
-        else if (time_status != KERNEL_TIME_STATUS_OK) {
+        enum kernel_time_status result = kernel_time_deadline_from_monotonic(deadline_ns, &deadline);
+        if (result == KERNEL_TIME_STATUS_DEADLINE_PASSED) expired = 1;
+        else if (result != KERNEL_TIME_STATUS_OK) {
             *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             return 0;
         }
     }
-    result = futex_key_acquire(task, address, operation, &key, status);
-    if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0)
-        return result;
-    access = kernel_uaccess_pin_user_page(&task->mm,address,KERNEL_MM_READ,&pin);
-    if (access != KERNEL_UACCESS_STATUS_OK &&
-        access != KERNEL_UACCESS_STATUS_FAULT) {
-        futex_key_release(&key);
-        *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        return 0;
-    }
-    if (access != KERNEL_UACCESS_STATUS_OK) {
-        futex_key_release(&key);
-        return -KERNEL_EFAULT;
-    }
-    const uint32_t *word=(const uint32_t *)((const unsigned char *)pin.page+(address&BOAROS_PAGE_MASK));
-    actual=__atomic_load_n(word,__ATOMIC_ACQUIRE);
+    int64_t result = futex_prepare(task, &address, 1, operation, 0,
+                                    KERNEL_MM_READ, &key, &pin, status);
+    if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
+    futex_lock_buckets(&key, 1, guards);
+    uint32_t *word = (uint32_t *)((unsigned char *)pin.page + (address & BOAROS_PAGE_MASK));
+    uint32_t actual = __atomic_load_n(word, __ATOMIC_ACQUIRE);
     if (actual != value || expired) {
+        futex_unlock_buckets(guards);
         kernel_mm_unpin_user_page(&pin);
         futex_key_release(&key);
         return actual != value ? -KERNEL_EAGAIN : -KERNEL_ETIMEDOUT;
     }
-
     task->futex_key = key;
     task->futex_bitset = bitset;
     struct kernel_wait_token token;
-    *status = kernel_wait_prepare(futex_bucket(&key), deadline, 1, &token);
+    *status = kernel_wait_prepare(&futex_bucket(&key)->waiters, deadline, 1, &token);
+    /* token登记后不再取得任何可睡眠锁；先放桶锁再归还pin，MM编辑可排空它。 */
+    futex_unlock_buckets(guards);
+    kernel_mm_unpin_user_page(&pin);
     if (*status != KERNEL_SCHEDULER_STATUS_OK) {
-        kernel_mm_unpin_user_page(&pin);
-        futex_key_release(&task->futex_key);
-        task->futex_bitset = 0;
+        futex_key_release(&task->futex_key); task->futex_bitset = 0;
         return 0;
     }
-    /* 登记后只访问已有pin；MM撤权可关闭新许可，不能在外层token内再次等待。
-     * 最后比较仍在登记之后，实际阻塞前归还pin，允许MM编辑继续排空。 */
-    actual=__atomic_load_n(word,__ATOMIC_ACQUIRE);
-    kernel_mm_unpin_user_page(&pin);
-    if (actual == value)
-        *status = kernel_wait_park(&token, &reason);
-    else result=-KERNEL_EAGAIN;
+    enum kernel_wait_wake_reason reason;
+    *status = kernel_wait_park(&token, &reason);
     if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    futex_key_release(&task->futex_key);
-    task->futex_bitset = 0U;
+    futex_key_release(&task->futex_key); task->futex_bitset = 0;
     if (*status != KERNEL_SCHEDULER_STATUS_OK) return 0;
-    if (result) return result;
     if (reason == KERNEL_WAIT_TIMEOUT) return -KERNEL_ETIMEDOUT;
     if (reason == KERNEL_WAIT_SIGNALLED) {
-        if (has_timeout) {
-            kernel_signal_note_futex_timed_restart(task, address, operation,
-                                                   value, deadline_ns,
-                                                   bitset);
-        }
+        if (has_timeout) kernel_signal_note_futex_timed_restart(task, address,
+            operation, value, deadline_ns, bitset);
         return -KERNEL_ERESTARTSYS;
     }
     return 0;
@@ -215,8 +247,6 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                      uint32_t bitset,
                      enum kernel_scheduler_status *status)
 {
-    KERNEL_SERVICE_SCOPE(service);
-    struct kernel_futex_key source, target;
     uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
     uint64_t deadline_ns = 0U;
     int64_t result;
@@ -229,6 +259,7 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         return 0;
     }
     if (command != 0U && command != 1U && command != 3U &&
+        command != 4U && command != 5U &&
         command != FUTEX_WAIT_BITSET && command != FUTEX_WAKE_BITSET)
         return -KERNEL_ENOSYS;
     if ((command == 0U || command == FUTEX_WAIT_BITSET) &&
@@ -271,35 +302,55 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         command != FUTEX_WAIT_BITSET) return -KERNEL_ENOSYS;
     if ((command == FUTEX_WAIT_BITSET || command == FUTEX_WAKE_BITSET) &&
         bitset == 0U) return -KERNEL_EINVAL;
+    int requeue = command == 3U || command == 4U;
+    uint32_t second_count = (uint32_t)timeout_or_count;
+    if (requeue && ((int32_t)value < 0 || (int32_t)second_count < 0))
+        return -KERNEL_EINVAL;
     if ((address & 3U) != 0U) return -KERNEL_EINVAL;
-    if (kernel_user_range_check(address, sizeof(uint32_t)) !=
-        KERNEL_UACCESS_STATUS_OK) return -KERNEL_EFAULT;
-    if (command == 1U || command == 3U || command == FUTEX_WAKE_BITSET) {
-        if ((int32_t)value < 0) return -KERNEL_EINVAL;
-        if (command == 3U && ((address2 & 3U) != 0U ||
-            address == address2 || timeout_or_count > INT32_MAX))
-            return -KERNEL_EINVAL;
-        if (command == 3U && kernel_user_range_check(address2,
-            sizeof(uint32_t)) != KERNEL_UACCESS_STATUS_OK)
-            return -KERNEL_EFAULT;
-        result = futex_key_acquire(task, address, operation, &source, status);
-        if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0)
-            return result;
-        if (command == 3U) {
-            result = futex_key_acquire(task, address2, operation,
-                                       &target, status);
-            if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0) {
-                futex_key_release(&source);
-                return result;
+    if (kernel_user_range_check(address, sizeof(uint32_t)) != KERNEL_UACCESS_STATUS_OK)
+        return -KERNEL_EFAULT;
+    if (command == 1U || requeue || command == 5U || command == FUTEX_WAKE_BITSET) {
+        uint64_t addresses[2] = {address, address2};
+        unsigned count = requeue || command == 5U ? 2 : 1;
+        struct kernel_futex_key keys[2];
+        struct kernel_mm_user_pin pin = {0};
+        struct kernel_lock_guard guards[2] = {0};
+        uint32_t pin_access = command == 4U ? KERNEL_MM_READ :
+                              command == 5U ? KERNEL_MM_WRITE : 0;
+        /* private key不访问映射；未知op先报ENOSYS，不用无关fault覆盖它。 */
+        if (command == 5U && ((bitset >> 28) & 7U) > 4U && (operation & FUTEX_PRIVATE))
+            pin_access = 0;
+        unsigned pin_index = command == 5U ? 1 : 0;
+        result = futex_prepare(task, addresses, count, operation, pin_index,
+                                pin_access, keys, &pin, status);
+        if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
+        futex_lock_buckets(keys, count, guards);
+        uint32_t moved = 0;
+        uint32_t *word = pin_access ? (uint32_t *)((unsigned char *)pin.page +
+                                     (addresses[pin_index] & BOAROS_PAGE_MASK)) : 0;
+        if (command == 4U && __atomic_load_n(word, __ATOMIC_ACQUIRE) != bitset)
+            result = -KERNEL_EAGAIN;
+        else if (command == 5U) {
+            int comparison = ((bitset >> 28) & 7U) > 4U ? -KERNEL_ENOSYS :
+                             futex_atomic_op(word, bitset);
+            if (comparison < 0) result = comparison;
+            else {
+                result = futex_wake(&keys[0], futex_wake_count(value), 0, 0,
+                                    FUTEX_BITSET_MATCH_ANY, 0);
+                if (comparison) result += futex_wake(&keys[1],
+                    futex_wake_count(second_count), 0, 0, FUTEX_BITSET_MATCH_ANY, 0);
             }
+        } else result = futex_wake(&keys[0], requeue ? value : futex_wake_count(value),
+            requeue ? second_count : 0, requeue ? &keys[1] : 0,
+            command == FUTEX_WAKE_BITSET ? bitset : FUTEX_BITSET_MATCH_ANY, &moved);
+        futex_unlock_buckets(guards);
+        if (pin_access) kernel_mm_unpin_user_page(&pin);
+        while (moved--) {
+            struct kernel_futex_key retired = keys[0];
+            futex_key_release(&retired);
         }
-        result = futex_wake(&source, value,
-                            command == 3U ? (uint32_t)timeout_or_count : 0U,
-                            command == 3U ? &target : 0,
-                            command == FUTEX_WAKE_BITSET
-                                ? bitset : FUTEX_BITSET_MATCH_ANY);
-        if (command == 3U) futex_key_release(&target);
-        futex_key_release(&source);
+        if (count == 2) futex_key_release(&keys[1]);
+        futex_key_release(&keys[0]);
         return result;
     }
     return futex_wait_until(task, address, operation, value,
@@ -314,7 +365,6 @@ int64_t kernel_futex_restart_timed(
     uint32_t value, uint64_t deadline_ns, uint32_t bitset,
     enum kernel_scheduler_status *status)
 {
-    KERNEL_SERVICE_SCOPE(service);
     uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 
     *status = KERNEL_SCHEDULER_STATUS_OK;
@@ -338,15 +388,14 @@ int64_t kernel_futex_restart_timed(
 static void futex_wake_user(struct kernel_task *task, uint64_t address)
 {
     struct kernel_futex_key key;
+    struct kernel_lock_guard guards[2] = {0};
     enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
-
-    if ((address & 3U) != 0U ||
-        kernel_user_range_check(address, sizeof(uint32_t)) !=
-            KERNEL_UACCESS_STATUS_OK ||
-        futex_key_acquire(task, address, 0U, &key, &status) != 0 ||
-        status != KERNEL_SCHEDULER_STATUS_OK)
-        return;
-    (void)futex_wake(&key, 1U, 0U, 0, FUTEX_BITSET_MATCH_ANY);
+    if ((address & 3U) || kernel_user_range_check(address, sizeof(uint32_t)) !=
+        KERNEL_UACCESS_STATUS_OK || futex_prepare(task, &address, 1, 0, 0, 0,
+            &key, 0, &status) || status != KERNEL_SCHEDULER_STATUS_OK) return;
+    futex_lock_buckets(&key, 1, guards);
+    (void)futex_wake(&key, 1, 0, 0, FUTEX_BITSET_MATCH_ANY, 0);
+    futex_unlock_buckets(guards);
     futex_key_release(&key);
 }
 

@@ -168,9 +168,13 @@ void kernel_mm_add_user(struct kernel_mm *mm);
 uint32_t kernel_mm_user_count(const struct kernel_mm *mm);
 uint32_t kernel_mm_remove_user(struct kernel_mm *mm);
 
-enum kernel_mm_status kernel_mm_acquire_futex_key(
-    struct kernel_mm *, uint64_t address, int shared,
-    struct kernel_futex_key *);
+/* 最多两个key及一个用户字pin在同一映射视图取得；access为0时不pin，
+ * 否则pin_index指定需要READ/WRITE的字。所有缺页/COW在发布输出前完成，
+ * 不保留部分pin或后备引用跨MM等待。成功后caller先结束桶操作再归还pin。 */
+enum kernel_mm_status kernel_mm_prepare_futex(
+    struct kernel_mm *, const uint64_t *addresses, unsigned count, int shared,
+    unsigned pin_index, uint32_t access, struct kernel_futex_key *keys,
+    struct kernel_mm_user_pin *pin);
 
 /* Unique for the lifetime of the kernel, including after MM page reuse. */
 enum kernel_mm_status kernel_mm_futex_id(

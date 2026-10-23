@@ -15,7 +15,7 @@ enum kernel_futex_key_kind {
     KERNEL_FUTEX_KEY_SHARED_FILE,
 };
 
-/* 排队者持有后备引用；身份与映射在同一 MM operation 内取得。 */
+/* 排队者持有后备引用；身份、映射与所需用户字pin在同一 MM operation 内取得。 */
 struct kernel_futex_key {
     uint64_t identity;
     uint64_t offset;

@@ -2232,6 +2232,10 @@ test-mm-concurrency-host:
 		kernel/physical_page.c arch/riscv/sv39.c -Wl,--gc-sections -o build/host/mm/zero
 	timeout 30s build/host/mm/zero
 
+.PHONY: test-futex-host
+test-futex-host:
+	sh tests/futex-host.sh
+
 test-mm-shared-concurrency-host:
 	@mkdir -p build/host/mm
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \

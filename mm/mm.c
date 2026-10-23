@@ -4111,57 +4111,80 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     }
 }
 
-enum kernel_mm_status kernel_mm_acquire_futex_key(struct kernel_mm *mm,
-    uint64_t address, int shared, struct kernel_futex_key *key)
+enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
+    const uint64_t *addresses, unsigned count, int shared, unsigned pin_index,
+    uint32_t access, struct kernel_futex_key *keys, struct kernel_mm_user_pin *pin)
 {
-    if (!key || (address & 3U) || address >= ARCH_MMU_USER_LIMIT)
+    if (!addresses || !keys || !count || count > 2 ||
+        (access && (!pin || pin_index >= count ||
+         (access != KERNEL_MM_READ && access != KERNEL_MM_WRITE))))
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
-    *key = (struct kernel_futex_key){0};
+    if (access && pin->registration) __builtin_trap();
     for (;;) {
         MM_OPERATION(mm);
         struct kernel_mm_record *record = operation.record;
-        if (!shared) {
-            key->identity = record->futex_id;
-            key->offset = address;
-            return KERNEL_MM_STATUS_OK;
+        struct kernel_vma vmas[2] = {0};
+        unsigned fault_index = count;
+        uint32_t fault_access = KERNEL_MM_READ;
+        /* gate固定两份VMA；raw复查PTE与许可。先检查全部key，最后才取得
+         * 唯一pin，因此目标冷页/撤权不会等待本调用已持有的源pin。 */
+        for (unsigned i = 0; i < count; i++) {
+            uint64_t address = addresses[i];
+            if (address & 3U) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+            if (address >= ARCH_MMU_USER_LIMIT) return KERNEL_MM_STATUS_NOT_MAPPED;
+            if (!shared) continue;
+            if (!record->vmas || kernel_vma_set_lookup(record->vmas, address, &vmas[i]))
+                return KERNEL_MM_STATUS_NOT_MAPPED;
+            struct kernel_mm_mapping mapping;
+            enum kernel_mm_status status;
+            { KERNEL_RAW_SCOPE(guard, &record->metadata);
+              status = lookup_record(record, address, &mapping); }
+            if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
+                fault_index = i;
+                fault_access = access && i == pin_index ? access : KERNEL_MM_READ;
+                break;
+            }
+            if (status) return status;
+            if (!(mapping.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
+                return KERNEL_MM_STATUS_ACCESS;
         }
-        struct kernel_vma vma;
-        if (!record->vmas || kernel_vma_set_lookup(record->vmas, address, &vma) !=
-                KERNEL_VMA_STATUS_OK)
-            return KERNEL_MM_STATUS_NOT_MAPPED;
-        struct kernel_mm_mapping mapping;
-        enum kernel_mm_status status;
-        { KERNEL_RAW_SCOPE(guard, &record->metadata);
-          status = lookup_record(record, address, &mapping); }
-        if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
-            /* 缺页可等待；回来后重新取得映射及其后备，不能沿用旧 VMA。 */
+        if (fault_index == count && access) {
+            enum kernel_mm_status status;
+            { KERNEL_RAW_SCOPE(guard, &record->metadata);
+              if (record->access_closed) __builtin_trap();
+              status = pin_mapping(mm, record, addresses[pin_index], access,
+                                   pin, access == KERNEL_MM_WRITE); }
+            if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
+                fault_index = pin_index; fault_access = access;
+            } else if (status) return status;
+        }
+        if (fault_index != count) {
             if (operation.guard.lock) mm_gate_release(record, &operation.guard);
-            status = kernel_mm_resolve_user_fault(mm, address, KERNEL_MM_READ);
+            enum kernel_mm_status status = kernel_mm_resolve_user_fault(mm,
+                addresses[fault_index], fault_access);
             if (status) return status;
             continue;
         }
-        if (status) return status;
-        /* Linux GUP 对已驻留的可访问叶取身份，不要求可读；WAIT 随后仍需
-         * 读取用户字。PROT_NONE 不能取得身份，冷页沿原缺页权限检查。 */
-        if (!(mapping.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
-            return KERNEL_MM_STATUS_ACCESS;
-        key->offset = vma.backing_offset + address - vma.start;
-        if (vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
-            struct kernel_vfs_node *node = kernel_open_file_node(vma.backing);
-            if (!node || kernel_vfs_node_acquire(node)) __builtin_trap();
-            key->kind = KERNEL_FUTEX_KEY_SHARED_FILE;
-            key->file_node = node;
-            key->identity = (uintptr_t)node;
-        } else if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
-                   vma.kind == KERNEL_VMA_KIND_SYSV_SHM) {
-            struct kernel_memory_object *object = vma.backing;
-            if (!object || kernel_memory_object_acquire(object)) __builtin_trap();
-            key->kind = KERNEL_FUTEX_KEY_SHARED_MEMORY;
-            key->shared_object = object;
-            key->identity = (uintptr_t)object;
-        } else {
-            key->identity = record->futex_id;
-            key->offset = address;
+        for (unsigned i = 0; i < count; i++) {
+            struct kernel_futex_key *key = &keys[i];
+            struct kernel_vma *vma = &vmas[i];
+            *key = (struct kernel_futex_key){ .identity = record->futex_id,
+                                             .offset = addresses[i] };
+            if (!shared) continue;
+            if (vma->kind == KERNEL_VMA_KIND_FILE_SHARED) {
+                struct kernel_vfs_node *node = kernel_open_file_node(vma->backing);
+                if (!node || kernel_vfs_node_acquire(node)) __builtin_trap();
+                key->kind = KERNEL_FUTEX_KEY_SHARED_FILE;
+                key->file_node = node; key->identity = (uintptr_t)node;
+            } else if (vma->kind == KERNEL_VMA_KIND_ANON_SHARED ||
+                       vma->kind == KERNEL_VMA_KIND_SYSV_SHM) {
+                struct kernel_memory_object *object = vma->backing;
+                if (!object || kernel_memory_object_acquire(object)) __builtin_trap();
+                key->kind = KERNEL_FUTEX_KEY_SHARED_MEMORY;
+                key->shared_object = object; key->identity = (uintptr_t)object;
+            }
+            if (key->kind != KERNEL_FUTEX_KEY_PRIVATE)
+                key->offset = vma->backing_offset + addresses[i] - vma->start;
         }
         return KERNEL_MM_STATUS_OK;
     }
