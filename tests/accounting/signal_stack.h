@@ -50,7 +50,7 @@ static int stack_cost_compare(const void *a,const void *b)
 { uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b;return (x>y)-(x<y); }
 static int stack_cost_main(FILE *config)
 {
-    unsigned cpus,only=0;CHECK(fscanf(config,"%u",&cpus)==1 && (cpus==1 || cpus==4));
+    unsigned cpus,only=0;CHECK(fscanf(config,"%u",&cpus)==1 && (cpus==1 || cpus==2 || cpus==4));
     int extra=fscanf(config,"%u",&only);CHECK(extra==EOF || (extra==1 && only==1));CHECK(!fclose(config));
     uint64_t affinity=1;CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(affinity),&affinity));
     stack_t old;errno=0;int available=!syscall(SYS_sigaltstack,0,&old);

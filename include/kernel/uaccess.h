@@ -37,8 +37,8 @@ enum kernel_uaccess_status kernel_copy_from_user(
     size_t size,
     size_t *bytes_copied);
 
-/* 当前单CPU IRQ纪律下比较并更新已解析write/COW的对齐futex字。
- * 这不是跨核原子性或lookup+pin协议；SMP桶锁/页生命周期另行实现。 */
+/* write/COW解析完成后，对实际pin的对齐32位字执行原生原子比较交换。
+ * pin负责页存活；futex键、比较与等待登记的同步由futex桶操作负责。 */
 enum kernel_uaccess_status kernel_user_cmpxchg_u32(
     struct kernel_mm *mm, uint64_t user_address,
     uint32_t expected, uint32_t desired, uint32_t *observed);

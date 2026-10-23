@@ -377,26 +377,22 @@ uint64_t kernel_wait_notification_sequence(void)
 #endif
     return (cpu->wait_notification_sequence << 8) | (logical + 1U);
 }
-enum kernel_scheduler_status kernel_wait_node_move(struct kernel_wait_node *node, struct kernel_wait_queue *queue)
+enum kernel_scheduler_status kernel_wait_node_move_locked(struct kernel_wait_node *node, struct kernel_wait_queue *queue)
 {
     if (!node || !node->task || !queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    kernel_assert_can_block();
-    kernel_wait_queue_remove(node);
-    for (;;) {
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            struct kernel_wait_token token = {node->task, node->generation};
-            if (queue->closed) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            if (!matches(&token) || kernel_wait_record_of(node->task)->phase == KERNEL_WAIT_NOTIFIED)
-                return KERNEL_SCHEDULER_STATUS_EMPTY;
-            if (!node->references) {
-                kernel_wait_node_add_locked(queue, node);
-                return KERNEL_SCHEDULER_STATUS_OK;
-            }
-        }
-        kernel_wait_backend_quiesce();
-    }
+    struct kernel_wait_token token = {node->task, node->generation};
+    if (queue->closed) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (!node->queue || !matches(&token) ||
+        kernel_wait_record_of(node->task)->phase == KERNEL_WAIT_NOTIFIED)
+        return KERNEL_SCHEDULER_STATUS_EMPTY;
+    /* 调用者先归还游标node借用，另借task覆盖重查与移动；不把旧队列的
+     * retired_next/borrow_owner带进新队列，也不拆开可见的登记位置。 */
+    if (node->references || node->retired_next) __builtin_trap();
+    if (node->queue == queue) return KERNEL_SCHEDULER_STATUS_OK;
+    kernel_wait_node_remove_locked(node);
+    kernel_wait_node_add_locked(queue, node);
+    return KERNEL_SCHEDULER_STATUS_OK;
 }
 static void cursor_wake_reason(struct kernel_wait_cursor *cursor, int all, uint32_t reason)
 {

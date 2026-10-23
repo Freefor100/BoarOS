@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <string.h>
 _Thread_local uintptr_t network_host_irq=RISCV_SSTATUS_SIE;
 struct kernel_raw_lock kernel_wait_domain={.rank=KERNEL_RAW_RANK_SCHEDULER,.initialized=KERNEL_RAW_INITIALIZED};
 static unsigned live,fail;
@@ -42,6 +43,7 @@ static int post(struct kernel_task *t,int shared,unsigned sig,int code,uint64_t 
 static struct kernel_signal_wait_info take(struct kernel_task *t,int shared,unsigned sig)
 {
     struct signal_pending_prepared p={0};struct kernel_signal_wait_info info;
+    memset(&info,0xa5,sizeof(info));
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);signal_pending_take_locked(t,shared,sig,&info,&p);}
     signal_pending_finish(&p);return info;
 }
@@ -68,7 +70,9 @@ int main(void)
     struct kernel_task a,b;init(&a);init(&b);
     assert(!post(&a,0,10,0,0,0) && count()==1);
     assert(!post(&a,0,10,0,0,0) && count()==1);
-    assert(take(&a,0,10).sender==42 && !count());
+    struct kernel_signal_wait_info expected={.signal=10,.sender=42};
+    struct kernel_signal_wait_info info=take(&a,0,10);
+    assert(!memcmp(&info,&expected,sizeof(info)) && !count());
     a.sigpending_limit.current=2;
     assert(!post(&a,1,36,-1,UINT64_C(0x1234567887654321),1));
     assert(!post(&a,1,36,-1,2,1));
@@ -78,7 +82,7 @@ int main(void)
     assert(take(&a,1,36).value==UINT64_C(0x1234567887654321));
     assert(take(&a,1,36).value==2 && !count());
     assert(!post(&a,0,10,-6,0,0));
-    struct kernel_signal_wait_info info=take(&a,0,10);assert(!info.code && !info.sender && !count());
+    info=take(&a,0,10);assert(!info.code && !info.sender && !count());
     assert(!post(&a,0,10,0,0,0) && count()==1);assert(take(&a,0,10).sender==42 && !count());
     a.sigpending_limit.current=4096;fail=1;
     assert(post(&b,0,36,-1,3,1)==-KERNEL_EAGAIN && !count());
@@ -89,6 +93,12 @@ int main(void)
     assert(count()==64);unsigned sequence[3]={0};
     for(unsigned i=0;i<64;i++){info=take(&a,0,36);assert(info.sender>=1 && info.sender<=2 && info.value==++sequence[info.sender]);}
     assert(sequence[1]==32 && sequence[2]==32 && !count());assert(!pthread_barrier_destroy(&ready));
+    memset(&expected,0x5a,sizeof(expected));expected.signal=36;expected.code=-1;
+    struct signal_pending_prepared p={0};
+    signal_pending_prepare(&a,0,&heap,&expected,1,&p);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&a,0,&expected,1,&p));}
+    signal_pending_finish(&p);info=take(&a,0,36);
+    assert(!memcmp(&info,&expected,sizeof(info)) && !count());
     assert(!post(&a,1,36,-1,7,1));
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);b.group_pending=a.group_pending;kernel_signal_pending_adopt_locked(&b,&a);}
     kernel_signal_pending_cleanup(&a);assert(count()==1);assert(take(&b,1,36).value==7 && !count());

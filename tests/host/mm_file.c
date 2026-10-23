@@ -317,7 +317,7 @@ static void futex_key_lifetime(void)
         assert(!kernel_open_file_acquire(source));
         assert(!kernel_mm_mmap_file_private(&parent,&source,0,BOAROS_PAGE_SIZE,
             BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED,&addresses[i]));
-        assert(!kernel_mm_acquire_futex_key(&parent,addresses[i]+12,1,&keys[i]));
+        assert(!kernel_mm_prepare_futex(&parent,(uint64_t[]){addresses[i]+12},1,1,0,0,&keys[i],0));
         assert(keys[i].kind==KERNEL_FUTEX_KEY_SHARED_FILE && keys[i].file_node==node &&
                keys[i].offset==BOAROS_PAGE_SIZE+12);
     }
@@ -338,7 +338,7 @@ static void futex_key_lifetime(void)
     assert(held);
     while (count<capacity && !physical_page_allocate(&pages,&held[count])) count++;
     struct kernel_futex_key failed={0};
-    assert(kernel_mm_acquire_futex_key(&parent,cold,1,&failed)==KERNEL_MM_STATUS_NO_MEMORY);
+    assert(kernel_mm_prepare_futex(&parent,&cold,1,1,0,0,&failed,0)==KERNEL_MM_STATUS_NO_MEMORY);
     assert(!failed.identity && !failed.shared_object);
     while (count) assert(!physical_page_release(&pages,held[--count]));
     free(held);

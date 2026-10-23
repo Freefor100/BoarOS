@@ -45,7 +45,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `preadv/pwritev` 编号 69/70，复用向量复制和定位 I/O；一次调用固定一份 OFD，保留完成前缀并保持共享当前位置。管道等不可定位对象返回 `ESPIPE`。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
-- `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、WAIT_BITSET、WAKE_BITSET、PRIVATE 和 WAIT_BITSET 的 CLOCK_REALTIME 标志。key、FIFO、掩码、绝对/相对超时、错误码与同 MM 边界见[调度模块](kernel-scheduler.md)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。PI、wake-op、futex2 等命令仍返回 ENOSYS，不计作能力完成。
+- `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT_BITSET、WAKE_BITSET、PRIVATE 和 WAIT_BITSET 的 CLOCK_REALTIME 标志。key、FIFO、掩码、绝对/相对超时、错误码与同 MM 边界见[调度模块](kernel-scheduler.md)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。PI、futex2 等命令仍返回 ENOSYS，不计作能力完成。
 - `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/4.15.0/#1 BoarOS/riscv64/(none)`；release 用于通过旧 glibc 的启动版本检查，不代表 BoarOS 已实现 Linux 4.15 的全部接口，机器名由架构构建配置提供。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。

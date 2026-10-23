@@ -16,7 +16,7 @@
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
 | `kernel/sched/park.c`、`wait.c` | 代次等待、借用游标、blocked/期限索引及完成仲裁 |
-| `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
+| `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE/CMP_REQUEUE/WAKE_OP、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
@@ -59,7 +59,7 @@ wake在调度锁内判断空队列；为空直接完成，非空才建立跨解�
 被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
 callback在调度锁外同步执行，临时禁止抢占，不能阻塞；自身只能非阻塞remove。
 释放context前必须remove_sync等待借用归零。futex过滤遍历使用同一借用游标；
-requeue先借task、放当前游标，再收完旧node借用并迁移登记，不在raw内归还后备引用。
+requeue先借task、放当前游标，再在同一raw临界区更新key与节点位置；同桶保持链上次序。源后备引用延后到桶操作锁和用户pin都归还后释放。
 queue_close停止新登记并借用队列直到通知完成，空队列也不能在close的解锁间隙销毁。
 queue_destroy在注册或操作/游标/回调借用未归零时返回BUSY，调用者继续持有queue及业务owner。
 
@@ -212,7 +212,13 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务同时进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
 
-WAIT 先固定用户字所在页，再登记等待 token，通过同一 pin 复查 expected，归还 pin 后才 park。驻留页也可能遇到远端 MM 编辑关闭新 pin 许可，因此缺页和 pin 等待必须发生在 token 登记前。登记后的比较不再调用可能睡眠的 uaccess；通知可先于 park 到达。private key 使用不复用的 MM 身份号与四字节对齐地址；共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。MM 在同一映射操作保护内解析身份并取得对象引用；需要缺页时先结束保护，缺页完成后重新解析当前映射。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；WAIT 另需读取用户字，未驻留页沿原缺页权限检查。坏页在 WAKE 中也返回 EFAULT。哈希碰撞需二次匹配，REQUEUE 将目标 key 的引用交给迁移的等待者、保留 FIFO，返回唤醒数与迁移数之和。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，REQUEUE 保留原掩码。值不匹配为 EAGAIN，非法地址为 EFAULT，取共享键时缺页分配耗尽为 ENOMEM，零掩码等非法参数为 EINVAL，超时为 ETIMEDOUT。
+MM 一次准备至多两个 key 和一个用户字 pin：operation gate 固定映射视图，metadata raw 检查当前 PTE 并取得页许可。所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。private key 使用不复用的 MM 身份号与四字节对齐地址，WAKE 不要求该地址仍有映射；共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
+
+每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字并登记 token，通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配；扫描沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
+
+REQUEUE 返回唤醒数与迁移数之和，CMP_REQUEUE 先比较源字，不相等返回 EAGAIN 并保留原队列；同 key 也允许 requeue。同桶迁移保持原链上位置，跨桶追加到目标 FIFO。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，requeue 保留原掩码。WAKE_OP 对第二个用户字执行原生 32 位 SET、ADD、OR、ANDN 或 XOR，以更新前的有符号值执行 EQ、NE、LT、LE、GT、GE 比较，条件成立时追加唤醒第二组 waiter；12 位操作数和比较数先符号扩展，SHIFT 操作按 Linux 的低五位移位规则处理。未知比较返回 ENOSYS，但保留已完成的原子更新。第四参数的计数按低 32 位解释；REQUEUE/CMP_REQUEUE 拒绝负计数，legacy WAKE/WAKE_OP 的非正计数仍可唤醒一个匹配者。错误与副作用顺序依据固定 Linux futex 实现。
+
+值不匹配为 EAGAIN，非法地址或权限为 EFAULT，准备时缺页分配耗尽为 ENOMEM，零掩码及负 requeue 计数等非法参数为 EINVAL，超时为 ETIMEDOUT。
 
 WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或带 `FUTEX_CLOCK_REALTIME` 的绝对 realtime。当前没有 `clock_settime`/`settimeofday` 写入口，启动后的 realtime offset 不变，故可一次转换为 monotonic deadline；将来加入可调时钟时必须重新审查阻塞中的实时截止时刻。无超时等待的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时等待使用 tagged restart state 保存用户地址、expected、operation、掩码和首次调用的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 
@@ -220,7 +226,7 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 退出清理在原 MM 与原 TID 有效时同步完成，早于 clear-child-tid 和资源释放。成功的非组长 exec 在身份接管前保存旧 TID，切换到新页表前、旧 MM 仍激活时清理；可返回的 exec 失败不清理旧链。遍历最多 2048 项，下一链接先于字更新读取；pending 项不会因已在链上而处理两次。owner 等于退出 TID 时通过可处理缺页/COW 的 32 位原子比较交换保留 WAITERS 并置 OWNER_DIED，必要时唤醒一个 waiter；pending 的非 owner 解锁窗口按 Linux 规则补唤醒。坏地址、错位、超长链和内存不足只结束该次尽力清理，不把用户错误升级为内核 fatal 或保留无 owner 的重试状态。
 
-带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名、SysV 和共享文件映射使用上述后备 key，可跨 MM、不同 VA、独立打开和硬链接唤醒或 requeue。私有映射仍使用 MM key。PI 标记项不按普通 robust 字更新；PI、WAKE_OP 和 futex2 仍未实现。单 hart 的 SIE 临界区不构成 SMP 锁协议。
+带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名、SysV 和共享文件映射使用上述后备 key，可跨 MM、不同 VA、独立打开和硬链接唤醒或 requeue。私有映射仍使用 MM key。PI 标记项不按普通 robust 字更新；PI 和 futex2 仍未实现。futex 入口在调用者 CPU 执行，文件或缺页后端需要的 CPU0 业务交接由对应 MM/文件层负责。
 
 ## 退出与 exec
 
@@ -271,6 +277,8 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 该硬件保护和映射失败/骨架OOM回滚由`test-stack-guard-loongarch`验证。
 
 `make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
+
+futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶锁和原子操作，覆盖 4/16 KiB pin、同桶/跨桶与同 key requeue、六种有符号比较、bitset 和 owner 归还；`tests/workloads/futex/caller.c` 可在 Linux 与两种架构上运行相同用户探针。
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
