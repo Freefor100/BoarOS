@@ -257,11 +257,13 @@ test-resource-limits-smp-riscv: build/diff-abi/resource-limits-rv build/diff-abi
 # Focused mapping migration and thread observations reuse the common ABI stream.
 build/diff-abi/mremap-rv: ABI_FOCUSED_FLAGS := -DABI_MREMAP_ONLY
 build/diff-abi/proc-rv: ABI_FOCUSED_FLAGS := -DABI_PROC_ONLY
-build/diff-abi/mremap-rv build/diff-abi/proc-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/Makefile.inc tests/riscv/user_elf.ld
+build/diff-abi/common-io-rv: ABI_FOCUSED_FLAGS := -DABI_COMMON_IO_ONLY
+build/diff-abi/mremap-rv build/diff-abi/proc-rv build/diff-abi/common-io-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/Makefile.inc tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
 	$(CC) $(ARCH_FLAGS) $(ABI_FOCUSED_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
 build/loongarch/mremap-la: ABI_FOCUSED_FLAGS := -DABI_MREMAP_ONLY
 build/loongarch/proc-la: ABI_FOCUSED_FLAGS := -DABI_PROC_ONLY
-build/loongarch/mremap-la build/loongarch/proc-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/Makefile.inc tests/common/user.ld
+build/loongarch/common-io-la: ABI_FOCUSED_FLAGS := -DABI_COMMON_IO_ONLY
+build/loongarch/mremap-la build/loongarch/proc-la build/loongarch/common-io-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/Makefile.inc tests/common/user.ld
 	@mkdir -p $(@D)
 	$(LA_CC) $(LA_FLAGS) $(ABI_FOCUSED_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)

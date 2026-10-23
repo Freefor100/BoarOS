@@ -25,6 +25,20 @@ static void positioned_vectors(void)
     result("selected.pwritev.iovfault", SC5(70, fd, -1, 1, 0, 0));
     result("selected.preadv.empty", SC5(69, fd, -1, 0, 0, 0));
     result("selected.pwritev.empty", SC5(70, fd, -1, 0, 0, 0));
+    struct abi_iovec limits[1024]={{0}};
+    const unsigned counts[]={8,9,1024};
+    const char *reads[]={"selected.preadv.count8","selected.preadv.count9","selected.preadv.count1024"};
+    const char *writes[]={"selected.pwritev.count8","selected.pwritev.count9","selected.pwritev.count1024"};
+    for (unsigned i=0;i<3;i++) {
+        result(reads[i],SC5(69,fd,limits,counts[i],0,0));
+        result(writes[i],SC5(70,fd,limits,counts[i],0,0));
+    }
+    limits[0]=(struct abi_iovec){0,0x7ffff000};
+    limits[1]=(struct abi_iovec){(void *)-1,1};
+    result("selected.preadv.clipped-invalid-tail",SC5(69,fd,limits,2,0,0));
+    result("selected.pwritev.clipped-invalid-tail",SC5(70,fd,limits,2,0,0));
+    limits[1].length=(unsigned long)-1;
+    result("selected.preadv.length-before-range",SC5(69,fd,limits,2,0,0));
     long map = SC6(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
     abi_require(map > 0 && SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     for (long i = 0; i < 8; ++i) ((char *)map)[ABI_PAGE_SIZE - 8 + i] = 'q';
@@ -328,6 +342,24 @@ static void socket_address_lengths(void)
     result("selected.addrlen.sendmsg-short-iov-fault", SC3(211, sender, &message, 0));
     message.iov_count = 1025;
     result("selected.addrlen.sendmsg-short-iov-count", SC3(211, sender, &message, 0));
+    struct abi_iovec limits[1024]={{0}};
+    const unsigned counts[]={8,9,1024};
+    const char *sends[]={"selected.sendmsg.count8","selected.sendmsg.count9","selected.sendmsg.count1024"};
+    const char *receives[]={"selected.recvmsg.count8","selected.recvmsg.count9","selected.recvmsg.count1024"};
+    storage.address.family=2;
+    for (unsigned i=0;i<3;i++) {
+        limits[0]=(struct abi_iovec){(void *)"v",1};
+        message=(struct selected_msghdr){.name=(unsigned long)&storage,
+            .name_length=sizeof(storage.address),.iov=(unsigned long)limits,.iov_count=counts[i]};
+        result(sends[i],SC3(211,sender,&message,0));
+        received=0; limits[0]=(struct abi_iovec){&received,1};
+        message=(struct selected_msghdr){.iov=(unsigned long)limits,.iov_count=counts[i]};
+        rc=SC3(212,receiver,&message,0);
+        abi_record(receives[i],rc,-1,-1,0,&received,1);
+    }
+    message=(struct selected_msghdr){.iov=1,.iov_count=1025};
+    result("selected.sendmsg.count1025",SC3(211,sender,&message,0));
+    result("selected.recvmsg.count1025",SC3(212,receiver,&message,0));
     abi_require(SC2(215, map, 2 * ABI_PAGE_SIZE) == 0);
     close_fd(sender); close_fd(receiver);
 }

@@ -447,7 +447,7 @@ static enum kernel_files_status socket_message(
     const struct kernel_syscall_request *request, int64_t *result)
 {
     struct linux_msghdr header;
-    struct kernel_uaccess_iovec local[8], *iov = local;
+    struct kernel_uaccess_iov_snapshot snapshot = {0};
     size_t copied = 0;
     int writing = request->number == 211;
     uint32_t flags = (uint32_t)request->arguments[2];
@@ -474,15 +474,10 @@ static enum kernel_files_status socket_message(
     }
     if (header.iov_count > 1024) { *result = -KERNEL_EMSGSIZE; return status; }
     if (writing && header.control_length != 0) { *result = -KERNEL_EOPNOTSUPP; return status; }
-    if (header.iov_count > 8) {
-        enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
-            (size_t)header.iov_count * sizeof(*iov), (void **)&iov);
-        if (allocation == KERNEL_HEAP_STATUS_EMPTY) { *result = -KERNEL_ENOMEM; return status; }
-        if (allocation != KERNEL_HEAP_STATUS_OK) __builtin_trap();
-    }
-    uint64_t count = 0;
-    *result=kernel_uaccess_iov_import(mm,header.iov,iov,header.iov_count,&count);
-    if (*result) goto out;
+    status=kernel_uaccess_iov_import(&snapshot,files->heap,mm,header.iov,header.iov_count,result);
+    if (status || *result) goto out;
+    const struct kernel_uaccess_iovec *iov=snapshot.view;
+    uint64_t count=snapshot.total;
     /* __copy_msghdr copies the name before importing iov, but the protocol
      * validates its family/length only after iov import has succeeded. */
     if (writing && header.name != 0 && header.name_length != 0) {
@@ -493,10 +488,10 @@ static enum kernel_files_status socket_message(
     struct kernel_socket *socket = kernel_open_file_socket(*file);
     if (writing && kernel_socket_is_datagram(socket)) {
         if (kernel_open_file_flags(*file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-        *result = kernel_socket_write_datagram(file, mm, iov, (size_t)header.iov_count, count, flags, destination);
+        *result = kernel_socket_write_datagram(file, mm, iov, snapshot.count, count, flags, destination);
     } else {
         uint32_t message_size = 0;
-        status = kernel_files_socket_iov_io(files, mm, file, iov, (size_t)header.iov_count,
+        status = kernel_files_socket_iov_io(files, mm, file, iov, snapshot.count,
             count, flags | KERNEL_SOCKET_IO_MESSAGE, writing, &address, &message_size, result);
         if (status != KERNEL_FILES_STATUS_OK || writing || *result < 0) goto out;
         header.flags = message_size > count ? KERNEL_SOCKET_MSG_TRUNC : 0;
@@ -524,7 +519,7 @@ static enum kernel_files_status socket_message(
             copied != sizeof(header.flags)) *result = -KERNEL_EFAULT;
     }
 out:
-    if (iov != local) kernel_heap_release(files->heap, iov);
+    kernel_uaccess_iov_cleanup(&snapshot,files->heap);
     return status;
 }
 

@@ -179,8 +179,21 @@ static struct kernel_io_context *protocol_owner;
 static struct kernel_mutex protocol_mutex;
 static unsigned protocol_mutex_initialized;
 
-static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_only)
+static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_only, int local_only)
 {
+#if BOAROS_USER_SMP
+    scope->service=(struct kernel_service_scope){0};
+    if (!kernel_service_scope_try_local(&scope->service)) {
+        if (local_only) return 0;
+        kernel_service_scope_begin(&scope->service);
+    }
+#else
+#if BOAROS_MAX_CPUS > 1
+    if (local_only && kernel_cpu_current()->logical_id) return 0;
+#else
+    (void)local_only;
+#endif
+#endif
     kernel_assert_service_context();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (protocol_owner == owner) {
@@ -190,7 +203,8 @@ static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_on
         protocol_depth++;
         return 1;
     }
-    *scope = (struct kernel_socket_protocol_scope){.interrupts = arch_interrupt_save()};
+    scope->interrupts=arch_interrupt_save();
+    scope->guard=(struct kernel_lock_guard){0};
     if (!protocol_mutex_initialized) {
         kernel_mutex_init(&protocol_mutex, 25, (uintptr_t)&protocol_mutex);
         protocol_mutex_initialized = 1;
@@ -198,6 +212,9 @@ static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_on
     /* 竞争者的 guard 留在自己的调用栈；mutex 可调度等待其他协议 owner。 */
     if (try_only) {
         if (!kernel_mutex_try_lock(&protocol_mutex, &scope->guard)) {
+#if BOAROS_USER_SMP
+            kernel_service_scope_end(&scope->service);
+#endif
             arch_interrupt_restore(scope->interrupts);
             return 0;
         }
@@ -214,7 +231,7 @@ static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_on
     return 1;
 }
 void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope)
-{ (void)protocol_enter(scope, 0); }
+{ (void)protocol_enter(scope, 0, 0); }
 void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
 {
     if (!scope->outer) {
@@ -229,6 +246,10 @@ void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
     protocol_owner->allocation_depth--;
     protocol_owner = 0;
     kernel_lock_release(&scope->guard);
+#if BOAROS_USER_SMP
+    /* 先归还协议owner，再允许恢复用户CPU资格；不能带mutex等待迁移。 */
+    kernel_service_scope_end(&scope->service);
+#endif
     arch_interrupt_restore(scope->interrupts);
 }
 static void socket_pbuf_free(struct pbuf *payload)
@@ -1854,12 +1875,8 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
 static int protocol_request(struct kernel_socket_write_request *request,enum socket_protocol_operation operation)
 {
     request->operation=operation;
-    int local=1;
-#if BOAROS_MAX_CPUS > 1
-    local=!kernel_cpu_current()->logical_id;
-#endif
     struct kernel_socket_protocol_scope protocol;
-    if(local && protocol_enter(&protocol,network_work_queue!=0)) {
+    if(protocol_enter(&protocol,network_work_queue!=0,1)) {
         int result;
         {SOCKET_STATE(state);result=network_stopping && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
         if(!result)result=execute_protocol_request(request);

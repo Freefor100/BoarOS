@@ -26,7 +26,7 @@ IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的
 
 短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 在自己的外层 scope 中调用 `kernel_socket_service_owned`，沿同一资格登记等待；独立调用者使用 `kernel_socket_service_pending` 取得资格。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队。服务先按包预算消费旧输入，再处理 socket 工作；后者产生的新回环包使用本批尚余的包预算交付，预算总量保持原值。预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
 
-`kernel_socket_protocol_enter/leave` 用栈上 scope 保存 IRQ 状态与 mutex guard。最外层取得任务 mutex 并开放 IRQ，同一 owner 的同步回调只增加嵌套深度。lwIP 的 PCB、协议池、接口、重试链与 loopback 由该 owner 串行；用户复制、端点查询和设备等待不占用它。协议池归还代次和 pool 等待链归 CPU0 协议 owner 维护，每次真实资源归还推进代次；存在等待者时才取得端点保护并通知 worker，普通 pbuf 归还直接处理 owner 私有状态。持有期间的 allocation_depth 禁止堆回收进入 I/O。NIC IRQ 只收割并通知，timer IRQ 只请求已有 worker 工作。
+`kernel_socket_protocol_enter/leave` 用栈上 scope 保存 CPU0 服务资格、IRQ 状态与 mutex guard。最外层先在 IRQ 保护下核对当前 CPU0 并发布已有的调度资格，再取得任务 mutex、开放 IRQ；持有或等待 mutex 期间允许抢占，恢复仍限于 CPU0。同一 owner 的同步回调只增加嵌套深度，借用外层资格。请求的本地进入失败时沿原工作队列执行，不依赖此前观察到的 CPU；普通强制协议入口仍可在没有业务锁和用户 pin 时沿既有服务入口迁移。CPU0 本地取得资格不迁移、不调度等待，因此已有 TCP pin 批次继续 inline，归还协议 owner 和 mutex 后才结束本 scope 实际取得的服务资格；try-lock 失败也归还它，借来的资格仍由原 owner 结束。UP 编译不增加服务字段和资格操作。lwIP 的 PCB、协议池、接口、重试链与 loopback 由该 owner 串行；用户复制、端点查询和设备等待不占用它。协议池归还代次和 pool 等待链归 CPU0 协议 owner 维护，每次真实资源归还推进代次；存在等待者时才取得端点保护并通知 worker，普通 pbuf 归还直接处理 owner 私有状态。持有期间的 allocation_depth 禁止堆回收进入 I/O。NIC IRQ 只收割并通知，timer IRQ 只请求已有 worker 工作。
 
 读预约持有 OFD 和固定队列前缀，用户复制在保护外完成。finish 在 IRQ 开启时找到消费边界，短临界区一次摘下前缀，并把原 packet 与接收窗口额度转交已有 worker。worker 在协议保护内归还 pbuf 和 `tcp_recved`；最后关闭也排空这些实际引用。RX loan 因此一直保留到 pbuf 最后归还，不能在用户复制完成前复用 DMA 缓冲。AF_UNIX 载荷在端点临界区外释放；关闭清理结束后才把发送者的末次释放权交给剩余 packet。
 

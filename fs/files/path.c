@@ -823,7 +823,6 @@ enum kernel_files_status kernel_files_faccessat(
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     KERNEL_FILES_PATH_SCOPE(start);
-    struct kernel_vfs_stat stat;
     char *path;
     size_t length;
     int result;
@@ -854,18 +853,8 @@ enum kernel_files_status kernel_files_faccessat(
         return KERNEL_FILES_STATUS_OK;
     }
     result = kernel_files_path_start(files, &fs_paths, dirfd, path, &start);
-    if (!result) result = kernel_vfs_stat_at(start,
-        fs_paths.root, path, 1, &stat);
-    if (!result && (mode & 1U) != 0U &&
-        (stat.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG &&
-        (stat.mode & (KERNEL_VFS_S_IXUSR | KERNEL_VFS_S_IXGRP |
-                      KERNEL_VFS_S_IXOTH)) == 0U)
-        result = -KERNEL_EACCES;
-    if (!result && (mode & 2U) != 0U &&
-        ((stat.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG ||
-         (stat.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) &&
-        kernel_vfs_mount_is_readonly(kernel_vfs_path_mount(start)))
-        result = -KERNEL_EROFS;
+    if (!result) result = kernel_vfs_access_at(start,
+        fs_paths.root, path, (unsigned)mode);
     kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;

@@ -1,6 +1,7 @@
 #define main serial_contract_main
 #include "core_host.c"
 #undef main
+#include "../../fs/uaccess_iov_internal.h"
 
 static int external_refs;
 static void refs(void *owner, int delta) { (void)owner; external_refs += delta; }
@@ -33,14 +34,32 @@ int main(void)
     file = (struct kernel_open_file_description){.references = 2, .device = device, .device_instance = instance};
     static struct kernel_open_file_description *pin;
     pin = &file;
-    struct kernel_uaccess_iovec vector = {(uintptr_t)full, 64};
+    struct kernel_uaccess_iov_snapshot snapshot={.count=9,.total=63};
+    assert(!kernel_heap_allocate(&heap,9*sizeof(struct kernel_uaccess_iovec),&snapshot.allocation));
+    struct kernel_uaccess_iovec *vectors=snapshot.allocation;
+    for (unsigned i=0;i<9;i++) vectors[i]=(struct kernel_uaccess_iovec){(uintptr_t)full+i*7,7};
+    snapshot.view=vectors;
+    assert(snapshot.allocation && snapshot.view==snapshot.allocation && live==3);
     sleep_action = cancel_sleep;
     if (!setjmp(cancelled)) {
         int64_t result;
-        device->writev(instance, &task, &files, &pin, 0, 0, &vector, 1, 64, 0, &result);
+        device->writev(instance, &task, &files, &pin, &snapshot.allocation, 0, snapshot.view, snapshot.count, snapshot.total, 0, &result);
         assert(0);
     }
-    assert(!task.request && !pin && file.references == 1 && live == 2);
+    assert(!task.request && !pin && !snapshot.allocation && file.references == 1 && live == 2);
+    kernel_uaccess_iov_cleanup(&snapshot,&heap);
+    kernel_tty_discard(tty);
+    /* 正常恢复把同一个堆owner归还调用者，随后由snapshot cleanup释放。 */
+    assert(!kernel_heap_allocate(&heap,9*sizeof(*vectors),&snapshot.allocation));
+    vectors=snapshot.allocation;
+    for (unsigned i=0;i<9;i++) vectors[i]=(struct kernel_uaccess_iovec){(uintptr_t)full+i*7,7};
+    snapshot.view=vectors;pin=&file;file.references++;
+    int64_t result;
+    assert(!device->writev(instance,&task,&files,&pin,&snapshot.allocation,0,
+        snapshot.view,snapshot.count,snapshot.total,0,&result) && result==63);
+    assert(pin==&file && snapshot.allocation==vectors && snapshot.view==vectors && live==3);
+    kernel_uaccess_iov_cleanup(&snapshot,&heap);
+    assert(!kernel_open_file_release(&pin) && file.references==1 && live==2);
     kernel_tty_discard(tty);
     device->release(instance);
     assert(!external_refs && kernel_tty_base_only(tty));

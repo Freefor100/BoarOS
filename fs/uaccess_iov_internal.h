@@ -5,6 +5,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/page.h>
 #include <kernel/errno.h>
+#include <kernel/heap.h>
 #include "../mm/uaccess_internal.h"
 
 #include <stddef.h>
@@ -16,32 +17,59 @@ struct kernel_uaccess_iov_cursor {
     uint64_t offset;
 };
 
-/* The caller owns storage for the already bounded descriptor count. Linux
- * caps a sole vector before access_ok; multiple vectors check original ranges
- * and cap the aggregate without rejecting a sum larger than ssize_t. */
-static inline int kernel_uaccess_iov_import(struct kernel_mm *mm,
-    uint64_t user_iov,struct kernel_uaccess_iovec *iov,size_t count,uint64_t *total)
+/* 导入后view/count/total不变；allocation单独交接给可取消的TTY请求。 */
+struct kernel_uaccess_iov_snapshot {
+    struct kernel_uaccess_iovec local[8];
+    const struct kernel_uaccess_iovec *view;
+    size_t count;
+    uint64_t total;
+    void *allocation;
+};
+
+/* count已由入口按各自errno限制。先检查所有有符号长度，再检查原始
+ * 数值范围；即使前缀已达到MAX_RW_COUNT，非法尾向量仍须返回EFAULT。 */
+static inline enum kernel_files_status kernel_uaccess_iov_import(
+    struct kernel_uaccess_iov_snapshot *snapshot, struct kernel_heap *heap,
+    struct kernel_mm *mm, uint64_t user_iov, size_t count, int64_t *result)
 {
-    *total=0;
-    if (!count) return 0;
+    snapshot->view=snapshot->local;
+    snapshot->count=count;
+    snapshot->total=0;
+    *result=0;
+    if (!count) return KERNEL_FILES_STATUS_OK;
+    struct kernel_uaccess_iovec *iov=snapshot->local;
+    if (count>sizeof(snapshot->local)/sizeof(snapshot->local[0])) {
+        enum kernel_heap_status status=kernel_heap_allocate(heap,count*sizeof(*iov),&snapshot->allocation);
+        if (status==KERNEL_HEAP_STATUS_EMPTY) { *result=-KERNEL_ENOMEM; return KERNEL_FILES_STATUS_OK; }
+        if (status) return KERNEL_FILES_STATUS_STATE;
+        iov=snapshot->allocation;
+        snapshot->view=iov;
+    }
     size_t copied=0;
-    enum kernel_uaccess_status status=kernel_copy_from_user(mm,iov,user_iov,
-        count*sizeof(*iov),&copied);
-    if (status==KERNEL_UACCESS_STATUS_FAULT) return -KERNEL_EFAULT;
+    enum kernel_uaccess_status status=kernel_copy_from_user(mm,iov,user_iov,count*sizeof(*iov),&copied);
+    if (status==KERNEL_UACCESS_STATUS_FAULT) { *result=-KERNEL_EFAULT; return KERNEL_FILES_STATUS_OK; }
     if (status || copied!=count*sizeof(*iov)) __builtin_trap();
     for (size_t i=0;i<count;i++)
-        if (iov[i].length>INT64_MAX) return -KERNEL_EINVAL;
+        if (iov[i].length>INT64_MAX) { *result=-KERNEL_EINVAL; return KERNEL_FILES_STATUS_OK; }
     for (size_t i=0;i<count;i++) {
         if (count==1 && iov[i].length>KERNEL_FILES_MAX_RW_COUNT)
             iov[i].length=KERNEL_FILES_MAX_RW_COUNT;
         if (kernel_user_range_check(iov[i].base,iov[i].length) ||
-            (!iov[i].length && iov[i].base && kernel_user_range_check(iov[i].base-1,1)))
-            return -KERNEL_EFAULT;
-        if (iov[i].length>KERNEL_FILES_MAX_RW_COUNT-*total)
-            iov[i].length=KERNEL_FILES_MAX_RW_COUNT-*total;
-        *total+=iov[i].length;
+            (!iov[i].length && iov[i].base && kernel_user_range_check(iov[i].base-1,1))) {
+            *result=-KERNEL_EFAULT; return KERNEL_FILES_STATUS_OK;
+        }
+        if (iov[i].length>KERNEL_FILES_MAX_RW_COUNT-snapshot->total)
+            iov[i].length=KERNEL_FILES_MAX_RW_COUNT-snapshot->total;
+        snapshot->total+=iov[i].length;
     }
-    return 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+static inline void kernel_uaccess_iov_cleanup(struct kernel_uaccess_iov_snapshot *snapshot,
+    struct kernel_heap *heap)
+{
+    if (snapshot->allocation) kernel_heap_release(heap,snapshot->allocation);
+    snapshot->allocation=0;
 }
 
 /* 描述下一段但不解析用户页；复制和后端进展分别由调用者提交。 */

@@ -51,11 +51,6 @@ enum kernel_files_status kernel_block_file_io(struct kernel_open_file_descriptio
     if (!positioned) kernel_mutex_lock(&file->offset_lock, &position);
     if ((writing && !kernel_open_file_writable(file)) ||
         (!writing && !kernel_open_file_readable(file))) { *result = -KERNEL_EBADF; return 0; }
-    for (size_t i = 0; i < iov_count; i++)
-        if (kernel_user_range_check(iov[i].base, iov[i].length) ||
-            (!iov[i].length && iov[i].base && kernel_user_range_check(iov[i].base - 1, 1))) {
-            *result = -KERNEL_EFAULT; return 0;
-        }
     if (!count) { *result = 0; return 0; }
     struct kernel_block_device *device = file->block;
     if (writing && kernel_block_read_only(device)) { *result = -KERNEL_EPERM; return 0; }

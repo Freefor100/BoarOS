@@ -2497,6 +2497,24 @@ test-signal-stack-host:
 	done
 
 .PHONY: test-sched-concurrency-host
+.PHONY: test-task-request-cleanup-host
+test-task-request-cleanup-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/task_request_cleanup.c -Wl,--gc-sections -o build/host/task-request-cleanup-$$shift; \
+	build/host/task-request-cleanup-$$shift; done
+
+.PHONY: test-proc-index-host
+test-proc-index-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/proc_index.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -Wl,--gc-sections -o build/host/proc-index-$$shift; \
+	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; done
+
+build/riscv/io-proc-cost: tests/workloads/cost/io-proc.c $(MUSL_STAMP)
+	@mkdir -p $(@D)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
 test-sched-concurrency-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
@@ -2512,6 +2530,13 @@ kernel-rv-user-smp:
 	$(MAKE) SMP=1 USER_SMP=1 COST_DIAGNOSTICS=0 all
 run-user-smp-riscv: kernel-rv-user-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp$(SMP_BUILD_SUFFIX)/kernel-rv
+# Reuse the real scheduler model for protocol-local qualification and owner handoff.
+.PHONY: test-socket-protocol-host
+test-socket-protocol-host:
+	@mkdir -p $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
+	$(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
+
 test-user-smp-host:
 	@mkdir -p build/host/mm
 	$(MAKE) test-service-scope-host

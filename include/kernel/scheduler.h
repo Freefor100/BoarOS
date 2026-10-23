@@ -315,6 +315,8 @@ int kernel_scheduler_take_signal_work(void);
 /* 实际业务入口持有最外层服务范围；嵌套调用借用当前执行资格。 */
 struct kernel_service_scope { unsigned entered; };
 #if BOAROS_USER_SMP
+/* IRQ内只在当前CPU0取得资格；不迁移、不等待，可覆盖已持用户pin的本地协议。 */
+int kernel_service_scope_try_local(struct kernel_service_scope *);
 void kernel_service_scope_begin(struct kernel_service_scope *);
 void kernel_service_scope_end(struct kernel_service_scope *);
 void kernel_scheduler_ack_user_service(void);
@@ -322,6 +324,7 @@ void kernel_scheduler_ack_user_service(void);
     struct kernel_service_scope name __attribute__((cleanup(kernel_service_scope_end))) = {0}; \
     if (condition) kernel_service_scope_begin(&(name))
 #else
+static inline int kernel_service_scope_try_local(struct kernel_service_scope *scope) { (void)scope; return 1; }
 static inline void kernel_service_scope_begin(struct kernel_service_scope *scope) { (void)scope; }
 static inline void kernel_service_scope_end(struct kernel_service_scope *scope) { (void)scope; }
 /* Execution-domain predicates have no work when user service migration is

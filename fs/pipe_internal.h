@@ -93,6 +93,7 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
     struct kernel_pipe *pipe,
     uint32_t endpoint);
 
+/* I/O borrows numerically validated descriptors; copying checks user pages. */
 enum kernel_pipe_status kernel_pipe_readv(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,

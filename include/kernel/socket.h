@@ -183,8 +183,11 @@ struct kernel_socket_service_result {
     unsigned sockets, packets, timers, runnable;
     uint64_t next_deadline;
 };
-/* Caller stack owns the outer mutex guard; callbacks may nest for the same task. */
+/* 最外层scope持CPU0服务资格及mutex；抢占/等待保留它，同任务回调只借用。 */
 struct kernel_socket_protocol_scope {
+#if BOAROS_USER_SMP
+    struct kernel_service_scope service;
+#endif
     uintptr_t interrupts;
     struct kernel_lock_guard guard;
     unsigned outer;

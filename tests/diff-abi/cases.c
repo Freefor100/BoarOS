@@ -230,6 +230,10 @@ void abi_main(const unsigned long *initial_stack)
     abi_mremap_cases();
 #elif defined(ABI_PROC_ONLY)
     abi_proc_cases();
+#elif defined(ABI_COMMON_IO_ONLY)
+    abi_access_cases();
+    abi_proc_cases();
+    abi_selected_cases();
 #elif defined(ABI_RESOURCE_LIMITS_ONLY)
     abi_core_limit_cases();
     abi_capability_cases();
