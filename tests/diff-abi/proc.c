@@ -83,6 +83,52 @@ static long proc_directory_finish(long fd)
     return -1;
 }
 
+static int proc_same_dirent(const char *first, long first_length,
+                            const char *second, long second_length)
+{
+    if (first_length != second_length || first_length < 0) return 0;
+    /* Cookies belong to the filesystem; compare the returned inode and name. */
+    for (long i = 0; i < first_length; i++) {
+        if (i >= 8 && i < 19) continue;
+        if (i >= 19 && (!first[i] || !second[i])) return first[i] == second[i];
+        if (first[i] != second[i]) return 0;
+    }
+    return 1;
+}
+
+static void proc_directory_cookies(const char *path, const char *case_name)
+{
+    long fd = abi_open(path, 65536), before = 0, got = -1;
+    char entry[40], repeated[40], next[40];
+    int numeric = 0, seek_ok = 0, fault_ok = 0, continuation_ok = 0;
+    for (unsigned attempt = 0; fd >= 0 && attempt < 1024U; attempt++) {
+        before = SC3(62, fd, 0, 1);
+        got = SC3(61, fd, entry, sizeof(entry));
+        if (got <= 19) break;
+        if (entry[19] >= '0' && entry[19] <= '9') { numeric = 1; break; }
+    }
+    if (numeric) {
+        unsigned long cookie = 0;
+        for (unsigned i = 0; i < 8; i++)
+            cookie |= (unsigned long)(unsigned char)entry[8 + i] << (8U * i);
+        long next_length = SC3(61, fd, next, sizeof(next));
+        long sought = SC3(62, fd, cookie, 0);
+        long resumed = SC3(61, fd, repeated, sizeof(repeated));
+        continuation_ok = sought == (long)cookie &&
+            proc_same_dirent(next, next_length, repeated, resumed);
+        sought = SC3(62, fd, before, 0);
+        resumed = SC3(61, fd, repeated, sizeof(repeated));
+        seek_ok = sought == before && proc_same_dirent(entry, got, repeated, resumed);
+        abi_require(SC3(62, fd, before, 0) == before);
+        long fault = SC3(61, fd, 1, sizeof(entry));
+        resumed = SC3(61, fd, repeated, sizeof(repeated));
+        fault_ok = fault == -14 && proc_same_dirent(entry, got, repeated, resumed);
+    }
+    abi_record(case_name, numeric && seek_ok && continuation_ok && fault_ok ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    if (fd >= 0) abi_require(SC1(57, fd) == 0);
+}
+
 static void proc_fd_follow_stat(const char *case_name, const char *path,
                                 long descriptor)
 {
@@ -364,6 +410,7 @@ static void proc_thread_cases(void)
     abi_record("proc.task-enumerate-live", proc_directory_has(directory, digits) ? 0 : -1,
                -1, -1, 0, 0, 0);
     if (directory >= 0) abi_require(SC1(57, directory) == 0);
+    proc_directory_cookies("/proc-probe/self/task", "proc.task-cookies-seek-fault");
     abi_require(SC3(64, proc_thread_pipe[1], "x", 1) == 1);
     for (unsigned attempt = 0; proc_thread_tid && attempt < 10000U;
          attempt++) SC0(124);
@@ -644,6 +691,7 @@ void abi_proc_cases(void)
     abi_record("proc.root-eof", proc_directory_finish(root_directory),
                -1, -1, 0, 0, 0);
     if (root_directory >= 0) abi_require(SC1(57, root_directory) == 0);
+    proc_directory_cookies("/proc-probe", "proc.root-cookies-seek-fault");
     long fd = abi_open("/proc-probe/meminfo", 0);
     abi_record("proc.meminfo-open", fd < 0 ? fd : 0, -1, -1, 0, 0, 0);
     proc_memory_cases(fd);

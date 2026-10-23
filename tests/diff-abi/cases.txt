@@ -226,6 +226,15 @@ access.bad-pointer
 open.noctty-regular
 open.noctty-char
 open.noctty-bad-combination
+access.rw-to-readonly-dir
+access.rw-to-readonly-file
+access.readonly-dirfd-to-rw
+access.readonly-dirfd-to-rw-symlink
+access.permission-before-readonly
+access.fifo-exec
+access.fifo-read-write
+access.proc-pipe-exec
+access.proc-pipe-read-write
 mode.umask-initial
 mode.umask-set
 mode.create-under-umask
@@ -1251,6 +1260,7 @@ session.handler-sid-only-no-task
 proc.mount
 proc.root-list
 proc.root-eof
+proc.root-cookies-seek-fault
 proc.meminfo-open
 proc.memory-fields
 sysinfo.shape
@@ -1315,6 +1325,7 @@ proc.thread-status-sleep
 proc.thread-status-fields
 proc.thread-stat
 proc.task-enumerate-live
+proc.task-cookies-seek-fault
 proc.thread-after-exit
 proc.thread-held-exited
 proc.thread-old-after-replacement
