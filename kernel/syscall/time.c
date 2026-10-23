@@ -1,3 +1,4 @@
+#include <kernel/posix_timer.h>
 #include <kernel/accounting.h>
 #include "private.h"
 
@@ -553,4 +554,52 @@ enum kernel_syscall_status syscall_handle_getrusage(struct kernel_task *caller,
     if (status==KERNEL_UACCESS_STATUS_FAULT) decoded->value=-KERNEL_EFAULT;
     else if (status || copied!=sizeof(usage)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status posix_copy(struct kernel_mm *mm,void *value,uint64_t address,size_t length,int output,int *error)
+{
+    size_t copied=0;
+    enum kernel_uaccess_status status=output?kernel_copy_to_user(mm,address,value,length,&copied):
+        kernel_copy_from_user(mm,value,address,length,&copied);
+    if(status==KERNEL_UACCESS_STATUS_FAULT){*error=-KERNEL_EFAULT;return KERNEL_SYSCALL_STATUS_OK;}
+    if(status!=KERNEL_UACCESS_STATUS_OK||copied!=length)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    *error=0;return KERNEL_SYSCALL_STATUS_OK;
+}
+enum kernel_syscall_status syscall_handle_posix_timer(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;int error=0;int32_t id=(int32_t)request->arguments[0];
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if(request->number==107) {
+        struct kernel_posix_event event,*input=0;
+        struct kernel_posix_timer *timer=0;
+        if(request->arguments[1]) {
+            if(posix_copy(mm,&event,request->arguments[1],sizeof(event),0,&error)!=KERNEL_SYSCALL_STATUS_OK)
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            input=&event;
+        }
+        if(!error)error=kernel_posix_timer_prepare(caller,id,input,&id,&timer);
+        if(!error) {
+            enum kernel_syscall_status status=posix_copy(mm,&id,request->arguments[2],sizeof(id),1,&error);
+            kernel_posix_timer_publish(timer,!error&&status==KERNEL_SYSCALL_STATUS_OK);
+            if(status!=KERNEL_SYSCALL_STATUS_OK)return status;
+        }
+    } else if(request->number==108) {
+        struct kernel_posix_itimerspec value;
+        error=kernel_posix_timer_get(caller,id,&value);
+        if(!error&&posix_copy(mm,&value,request->arguments[1],sizeof(value),1,&error)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if(request->number==109)error=kernel_posix_timer_overrun(caller,id);
+    else if(request->number==111)error=kernel_posix_timer_delete(caller,id);
+    else {
+        if(!request->arguments[2]){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
+        struct kernel_posix_itimerspec input,output;
+        if(posix_copy(mm,&input,request->arguments[2],sizeof(input),0,&error)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if(!error)error=kernel_posix_timer_set(caller,id,(int32_t)request->arguments[1],&input,&output);
+        if(!error&&request->arguments[3]&&posix_copy(mm,&output,request->arguments[3],sizeof(output),1,&error)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->value=error;return KERNEL_SYSCALL_STATUS_OK;
 }

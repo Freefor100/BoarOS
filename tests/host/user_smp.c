@@ -24,6 +24,7 @@ struct kernel_cpu *riscv_smp_cpu(unsigned id) { assert(id<2);return &cpus[id]; }
 enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *task)
 { (void)task;assert(!"unexpected wait in the host signal transition");return KERNEL_SCHEDULER_STATUS_INVALID_STATE; }
 uint32_t kernel_time_is_initialized(void) { return 0; }
+uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { (void)ticks;assert(!kernel_time_is_initialized());return 0; }
 uint64_t riscv_time_read(void) { return 1; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *ticks)
 { (void)ns; (void)ticks; __builtin_trap(); }

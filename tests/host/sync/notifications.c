@@ -20,3 +20,31 @@ __attribute__((weak)) void kernel_cpu_flush_notifications(void)
 __attribute__((weak)) void kernel_cpu_notify(struct kernel_cpu *cpu, unsigned events)
 { __atomic_fetch_or(&cpu->events, events, __ATOMIC_RELEASE); }
 #endif
+
+#include <kernel/posix_timer.h>
+#include "../../../kernel/signal_pending.h"
+#include <stdlib.h>
+/* Scheduler/ordinary-signal fixtures publish no POSIX objects. Native timer
+ * ownership has its own fixture linked with the actual timer implementation. */
+__attribute__((weak)) uint64_t kernel_posix_timer_deadline(void) { return 0; }
+__attribute__((weak)) void kernel_posix_timer_expire(uint64_t now) { (void)now;abort(); }
+__attribute__((weak)) void kernel_posix_timers_exec(struct kernel_task *task)
+{ assert(!task->group_leader || !task->group_leader->posix_timers); }
+__attribute__((weak)) void kernel_posix_timers_exit(struct kernel_task *task)
+{ assert(!task->posix_timers); }
+__attribute__((weak)) void kernel_posix_timers_adopt_locked(struct kernel_task *to,struct kernel_task *from)
+{ assert(!to->posix_timers&&!from->posix_timers); }
+__attribute__((weak)) void kernel_posix_timer_unignore(struct kernel_task *task,unsigned sig)
+{ (void)task;(void)sig;abort(); }
+__attribute__((weak)) int posix_timer_record_take_locked(struct signal_queue_record *r,struct kernel_signal_wait_info *info,struct signal_pending_prepared *p)
+{ (void)r;(void)info;(void)p;abort(); }
+__attribute__((weak)) void posix_timer_record_clear_locked(struct signal_queue_record *r,int ignored,struct signal_pending_prepared *p)
+{ (void)r;(void)ignored;(void)p;abort(); }
+__attribute__((weak)) void posix_timer_record_complete(struct signal_queue_record *r) { (void)r;abort(); }
+__attribute__((weak)) void posix_timer_record_free(struct signal_queue_record *r) { (void)r;abort(); }
+
+__attribute__((weak)) void scheduler_cpu_timer_update_locked(struct kernel_task *t,unsigned thread)
+{ assert(!t->cpu_timer_index[thread].timers[0]&&!t->cpu_timer_index[thread].timers[1]&&!t->cpu_timer_index[thread].timers[2]); }
+__attribute__((weak)) void scheduler_cpu_timer_expire(void) {}
+__attribute__((weak)) void kernel_posix_cpu_target_exit(struct kernel_task *t)
+{ assert(!t->cpu_timer_index[0].indexed&&!t->cpu_timer_index[1].indexed); }

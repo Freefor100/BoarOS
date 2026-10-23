@@ -1,3 +1,4 @@
+#include <kernel/posix_timer.h>
 #include <arch/task.h>
 #include <arch/context.h>
 #include <kernel/errno.h>
@@ -625,6 +626,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
              * Its group alias resolves the adopted parent identity meanwhile. */
             task->group_leader = task;
             leader->group_leader = task;
+            kernel_posix_timers_adopt_locked(task,leader);
         }
         for (;;) {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1643,6 +1645,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
+    kernel_posix_timers_exit(thread);
     kernel_signal_pending_cleanup(thread);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);

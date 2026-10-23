@@ -1,6 +1,7 @@
 #include <arch/task.h>
 #include "private.h"
 #include "../signal_pending.h"
+#include <kernel/posix_timer.h>
 
 #include <kernel/errno.h>
 #include <kernel/irq.h>
@@ -31,31 +32,9 @@ static enum kernel_signal_status signal_send_one(
     const struct kernel_signal_wait_info *, int queued, uint64_t thread_generation);
 
 static struct kernel_task *real_timers;
-static struct kernel_task *cpu_timers;
 
 static uint64_t timer_add(uint64_t a, uint64_t b)
 { return b > UINT64_MAX - a ? UINT64_MAX : a + b; }
-
-/* 仅活动进程进入CPU定时器索引；普通trap不增加计数或扫描。状态由CPU0拥有，
- * IRQ关闭覆盖索引操作。快照借用成员，并读取远端CPU已发布的执行片段。 */
-static void cpu_timer_index(struct kernel_task *leader)
-{
-    int active = leader->cpu_timers[0].expires || leader->cpu_timers[1].expires;
-    if (active == (int)leader->cpu_timer_active) return;
-    if (active) {
-        leader->cpu_timer_next = cpu_timers;
-        cpu_timers = leader;
-    } else {
-        struct kernel_task **link = &cpu_timers;
-        while (*link != leader) {
-            if (!*link) __builtin_trap();
-            link = &(*link)->cpu_timer_next;
-        }
-        *link = leader->cpu_timer_next;
-        leader->cpu_timer_next = 0;
-    }
-    leader->cpu_timer_active = active;
-}
 
 static void cpu_timer_sample(struct kernel_task *leader, uint64_t samples[2])
 {
@@ -63,16 +42,6 @@ static void cpu_timer_sample(struct kernel_task *leader, uint64_t samples[2])
     scheduler_group_usage_snapshot(leader, 0, &usage);
     samples[0] = usage.user_ns;
     samples[1] = timer_add(usage.user_ns, usage.kernel_ns);
-}
-
-static int cpu_timer_running(struct kernel_task *leader)
-{
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next) {
-        struct kernel_task *owner = cpu->accounting_owner;
-        if (owner && owner->group_leader == leader && !owner->idle) return 1;
-    }
-    return 0;
 }
 
 static uint64_t cpu_timer_remaining(uint64_t expires, uint64_t now, int setting)
@@ -144,8 +113,9 @@ void kernel_signal_timer_cancel(struct kernel_task *leader)
     uintptr_t irq = arch_interrupt_save();
     real_timer_remove(leader);
     leader->real_timer_deadline = leader->real_timer_interval = 0;
-    memset(leader->cpu_timers, 0, sizeof(leader->cpu_timers));
-    cpu_timer_index(leader);
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     memset(leader->cpu_timers, 0, sizeof(leader->cpu_timers));
+     scheduler_cpu_timer_update_locked(leader,0);}
     arch_interrupt_restore(irq);
 }
 
@@ -160,13 +130,14 @@ void kernel_signal_timer_set(struct kernel_task *task, uint32_t which,
         unsigned index = which - 1;
         uint64_t expires = leader->cpu_timers[index].expires;
         if (expires || value) cpu_timer_sample(leader, samples);
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         *old_remaining = cpu_timer_remaining(expires, samples[index], 1);
         *old_interval = leader->cpu_timers[index].interval;
         /* Linux给首次CPU到期加一tick，使采样计数至少前进一次；周期保留原值。 */
         leader->cpu_timers[index].expires = value ? timer_add(samples[index],
             timer_add(value, UINT64_C(1000000000) / KERNEL_TICKS_PER_SECOND)) : 0;
         leader->cpu_timers[index].interval = interval;
-        cpu_timer_index(leader);
+        scheduler_cpu_timer_update_locked(leader,0);
         return;
     }
     kernel_signal_timer_get(task, which, old_remaining, old_interval);
@@ -188,10 +159,11 @@ void kernel_signal_timer_adopt(struct kernel_task *task, struct kernel_task *old
     task->real_timer_interval = old_leader->real_timer_interval;
     old_leader->real_timer_deadline = old_leader->real_timer_interval = 0;
     if (active) real_timer_insert(task);
-    memcpy(task->cpu_timers, old_leader->cpu_timers, sizeof(task->cpu_timers));
-    memset(old_leader->cpu_timers, 0, sizeof(old_leader->cpu_timers));
-    cpu_timer_index(old_leader);
-    cpu_timer_index(task);
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     memcpy(task->cpu_timers, old_leader->cpu_timers, sizeof(task->cpu_timers));
+     memset(old_leader->cpu_timers, 0, sizeof(old_leader->cpu_timers));
+     scheduler_cpu_timer_update_locked(old_leader,0);}
+    /* The adopted TGID and its native thresholds are published together later. */
     arch_interrupt_restore(irq);
 }
 
@@ -482,20 +454,20 @@ enum kernel_signal_status kernel_signal_release_table(
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
+static void clear_task_pending(struct kernel_task *task,int shared,uint64_t mask,int ignored)
+{
+    for(;;){struct signal_pending_prepared p={0};int more;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);more=ignored?signal_pending_ignore_locked(task,shared,mask,&p):signal_pending_clear_locked(task,shared,mask,&p);}
+        signal_pending_finish(&p);if(!more)break;
+    }
+}
 static void signal_clear_pending_group(struct kernel_task *task,uint64_t mask)
 {
-    struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
-    struct scheduler_group_cursor cursor;
-    scheduler_group_cursor_begin(task,&cursor);
-    if(!cursor.leader) {
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        signal_pending_clear_locked(task,0,mask,&p);
-    } else {
-        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);signal_pending_clear_locked(cursor.leader,1,mask,&p);}
-        while(cursor.task) {
-            {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);signal_pending_clear_locked(cursor.task,0,mask,&p);}
-            scheduler_group_cursor_next(&cursor);
-        }
+    struct scheduler_group_cursor cursor;scheduler_group_cursor_begin(task,&cursor);
+    if(!cursor.leader)clear_task_pending(task,0,mask,1);
+    else {
+        clear_task_pending(cursor.leader,1,mask,1);
+        while(cursor.task){clear_task_pending(cursor.task,0,mask,1);scheduler_group_cursor_next(&cursor);}
     }
     scheduler_group_cursor_end(&cursor);
 }
@@ -551,6 +523,9 @@ enum kernel_signal_status kernel_signal_set_action(
          signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_IGNORE)) {
         signal_clear_pending_group(task, signal_mask(sig));
     }
+    if(task->group_leader->posix_timers&&action->handler!=KERNEL_SIGNAL_IGN&&
+        !(action->handler==KERNEL_SIGNAL_DFL&&signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_IGNORE))
+        kernel_posix_timer_unignore(task,sig);
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -752,20 +727,23 @@ static uint32_t signal_take_locked(struct kernel_task *task,uint64_t mask,
     uint32_t sig=signal_first_set(matching);
     signal_pending_take_locked(shared?leader:task,shared,sig,info,prepared);
     if (shared && sig==14U) *rearm=leader;
-    return sig;
+    return info->signal?sig:KERNEL_SIGNAL_COUNT+1;
 }
 enum kernel_signal_status kernel_signal_wait_take(
     struct kernel_task *task, struct kernel_signal_wait_info *info)
 {
     if (task!=kernel_cpu_current()->current || !signal_dispatchable(task) || !info)
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
-    struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
-    struct kernel_task *rearm=0;
-    memset(info,0,sizeof(*info));
-    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);signal_take_locked(task,task->signal_wait_mask,info,&p,&rearm); }
-    if (rearm) real_timer_rearm(rearm);
-    return KERNEL_SIGNAL_STATUS_OK;
+    for(;;) {
+        struct signal_pending_prepared p={0};struct kernel_task *rearm=0;uint32_t sig;
+        memset(info,0,sizeof(*info));
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);sig=signal_take_locked(task,task->signal_wait_mask,info,&p,&rearm);}
+        signal_pending_finish(&p);
+        if(rearm)real_timer_rearm(rearm);
+        if(sig<=KERNEL_SIGNAL_COUNT)return KERNEL_SIGNAL_STATUS_OK;
+    }
 }
+
 struct kernel_wait_queue *kernel_signal_fd_source(struct kernel_task *task)
 {
     if (signal_alloc_table(task)) return 0;
@@ -796,6 +774,7 @@ int kernel_signal_fd_take(struct kernel_task *task,const uint64_t *mask,
         }
         signal_pending_finish(&p);
         if (rearm) real_timer_rearm(rearm);
+        if(sig>KERNEL_SIGNAL_COUNT)continue;
         if (sig) return 0;
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
@@ -820,6 +799,8 @@ void kernel_signal_wait_end(struct kernel_task *task)
 
 void kernel_signal_reset_on_exec(struct kernel_task *task)
 {
+    kernel_posix_timers_exec(task);
+    signal_pending_flush_timers(task);
     kernel_signal_stack_reset(task);
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_signal_table *table = signal_table_of(task);
@@ -955,7 +936,6 @@ static void signal_prepare_group(struct kernel_task *task, uint32_t sig)
     struct scheduler_group_cursor cursor;
     uint64_t clear;
     int continued;
-    struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
 
     if (sig == SIGNAL_CONTINUE) {
         clear = SIGNAL_MASK_STOP;
@@ -971,10 +951,10 @@ static void signal_prepare_group(struct kernel_task *task, uint32_t sig)
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         continued = leader->group_stopped != 0;
     }
-    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); signal_pending_clear_locked(leader,1,clear,&p); }
+    clear_task_pending(leader,1,clear,0);
     while (cursor.task) {
         struct kernel_task *member = cursor.task;
-        { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); signal_pending_clear_locked(member,0,clear,&p); }
+        clear_task_pending(member,0,clear,0);
         if (sig == SIGNAL_CONTINUE) signal_resume_stopped(member);
         scheduler_group_cursor_next(&cursor);
     }
@@ -1037,6 +1017,7 @@ static void signal_retarget_shared(struct kernel_task *task,uint64_t pending)
 
 void kernel_signal_task_exit(struct kernel_task *task)
 {
+    kernel_posix_cpu_target_exit(task);
     uint64_t pending=0;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -1198,6 +1179,66 @@ static enum kernel_signal_status signal_send_one(
     }
 }
 
+static struct kernel_task *timer_receiver_locked(struct kernel_pid *id,int thread,unsigned sig,struct kernel_task **wake)
+{
+    enum kernel_pid_role role=thread?KERNEL_PID_TID:KERNEL_PID_TGID;
+    struct kernel_task *target=id->members[role]?id->members[role]->task:0;
+    if(!target)return 0;
+    struct kernel_task *actual=0;*wake=0;
+    if(thread){if(signal_dispatchable_locked(target)&&!target->proc_exiting)actual=target;}
+    else {
+        struct kernel_task *cursor=target;
+        do {
+            if(signal_dispatchable_locked(cursor)&&!cursor->proc_exiting){
+                if(!actual)actual=cursor;
+                if(!*wake&&signal_wants_signal_locked(cursor,sig))*wake=cursor;
+            }
+            cursor=cursor->group_next;
+        }while(cursor!=target);
+    }
+    if(thread&&actual&&signal_wants_signal_locked(actual,sig))*wake=actual;
+    return actual;
+}
+int signal_timer_disposition_ignored_locked(struct kernel_pid *id,int thread,unsigned sig)
+{
+    struct kernel_task *wake=0,*actual=timer_receiver_locked(id,thread,sig,&wake);
+    if(!actual)return -1;
+    const struct kernel_signal_action *action=signal_action_of(actual,sig);
+    return (action&&action->handler==KERNEL_SIGNAL_IGN)||
+        ((!action||action->handler==KERNEL_SIGNAL_DFL)&&(signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_IGNORE||signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_CONTINUE));
+}
+int signal_timer_post_locked(struct kernel_pid *id,int thread,struct signal_queue_record *record,
+    struct kernel_wait_cursor *cursor,struct kernel_task **wake)
+{
+    struct kernel_task *actual=timer_receiver_locked(id,thread,record->info.signal,wake);
+    if(!actual){*wake=0;return 0;}
+    unsigned sig=record->info.signal;
+    int control=sig==SIGNAL_KILL||sig==SIGNAL_CONTINUE||(sig>=SIGNAL_STOP&&sig<=22U);
+    int ignored=signal_ignored_unblocked(*wake,sig);
+    /* Group effects apply even when CONT has no pending handler. Keep the
+     * actual identity's storage until the unlocked group traversal ends. */
+    if(control&&!*wake)*wake=actual;
+    if(ignored||sig==SIGNAL_KILL) {
+        if(control)scheduler_task_get_locked(*wake);else *wake=0;
+        return ignored?2:0;
+    }
+    struct kernel_task *pending=thread?actual:actual->group_leader;
+    signal_pending_post_timer_locked(pending,!thread,record);
+    struct kernel_signal_table *table=signal_table_of(actual);
+    if(table)(void)kernel_wait_cursor_prepare_event_locked(&table->signalfd_waiters,cursor,signal_mask(record->info.signal),thread?actual:0);
+    if(*wake){scheduler_task_get_locked(*wake);
+#if BOAROS_USER_SMP
+        scheduler_signal_request_locked(*wake);
+#endif
+    }
+    return 1;
+}
+void signal_timer_notify(struct kernel_task *task,unsigned sig)
+{
+    signal_prepare_group(task,sig);
+    if(sig==SIGNAL_KILL)process_group_request_exit(task,KERNEL_THREAD_EXIT_SIGNAL,sig,0);
+    else (void)kernel_scheduler_wake_signal(task);
+}
 enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                              uint32_t sig,
                                              kernel_pid_t sender_tid)
@@ -1242,41 +1283,46 @@ enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, u
         : KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
 }
 
+unsigned signal_cpu_timer_check_locked(struct kernel_task *leader,const struct kernel_task_usage *usage)
+{
+    /* Sleep does not turn a periodic timer's old CPU debt into wall-clock work. */
+    int running=0;
+    for(struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        struct kernel_task *owner=cpu->accounting_owner;
+        if(owner&&!owner->idle&&owner->group_leader==leader){running=1;break;}
+    }
+    if(!running)return 0;
+    uint64_t samples[2]={usage->user_ns,timer_add(usage->user_ns,usage->kernel_ns)};
+    unsigned fired=0;
+    for(unsigned i=0;i<2;i++) {
+        uint64_t expires=leader->cpu_timers[i].expires;
+        if(!expires||samples[i]<expires)continue;
+        uint64_t interval=leader->cpu_timers[i].interval;
+        leader->cpu_timers[i].expires=interval?timer_add(expires,interval):0;
+        fired|=1U<<i;
+    }
+    scheduler_cpu_timer_update_locked(leader,0);
+    return fired;
+}
+void signal_cpu_timer_notify(struct kernel_task *leader,unsigned fired)
+{
+    if(!fired)return;
+    SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(leader));
+    if(!representative)return;
+    for(unsigned i=0;i<2;i++)if((fired&(1U<<i))&&
+        signal_send_one(representative,26U+i,0,1,128,0,0,0)!=KERNEL_SIGNAL_STATUS_OK)__builtin_trap();
+}
 void kernel_signal_timer_expire(void)
 {
-    if (!real_timers && !cpu_timers) return;
-    uint64_t now = kernel_time_monotonic_ns();
-    while (real_timers && real_timers->real_timer_deadline <= now) {
-        struct kernel_task *leader = real_timers;
-        real_timer_remove(leader);
-        SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
-        if (representative && signal_send_one(representative, 14U, 0, 1, 128, 0, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
-            __builtin_trap();
-    }
-    for (struct kernel_task *leader = cpu_timers, *next; leader; leader = next) {
-        next = leader->cpu_timer_next;
-        /* Linux在执行tick检查当前进程。整组睡眠时保留过期CPU阈值，
-         * 短周期的历史欠账不会被墙钟tick继续变成信号。 */
-        if (!cpu_timer_running(leader)) continue;
-        uint64_t samples[2];
-        cpu_timer_sample(leader, samples);
-        unsigned fired = 0;
-        for (unsigned i = 0; i < 2; ++i) {
-            uint64_t expires = leader->cpu_timers[i].expires;
-            if (!expires || samples[i] < expires) continue;
-            uint64_t interval = leader->cpu_timers[i].interval;
-            leader->cpu_timers[i].expires = interval ? timer_add(expires, interval) : 0;
-            fired |= 1U << i;
+    if(real_timers) {
+        uint64_t now=kernel_time_monotonic_ns();
+        while(real_timers&&real_timers->real_timer_deadline<=now) {
+            struct kernel_task *leader=real_timers;real_timer_remove(leader);
+            SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(leader));
+            if(representative&&signal_send_one(representative,14U,0,1,128,0,0,0)!=KERNEL_SIGNAL_STATUS_OK)__builtin_trap();
         }
-        cpu_timer_index(leader);
-        if (!fired) continue;
-        SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
-        if (!representative) continue;
-        for (unsigned i = 0; i < 2; ++i)
-            if ((fired & (1U << i)) &&
-                signal_send_one(representative, 26U + i, 0, 1, 128, 0, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
-                __builtin_trap();
     }
+    scheduler_cpu_timer_expire();
 }
 
 enum kernel_signal_status kernel_signal_send_task(
@@ -1423,7 +1469,7 @@ static void signal_stop_member(struct kernel_task *task, uint32_t sig)
                task != kernel_cpu_current()->current) {
         return;
     }
-    signal_pending_clear_locked(task,0,bit,&p);
+    while(signal_pending_clear_locked(task,0,bit,&p)) {}
     task->wait_status = (uint32_t)(sig << 8) | LINUX_WAIT_STOPPED;
     task->stop_notified = 0U;
     task->continue_notified = 0U;
@@ -1682,7 +1728,7 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
                         task->signal_fault=(struct kernel_signal_fault){0};
                         info.signal=sig;info.code=fault.code;info.address=fault.address;
                     } else signal_pending_take_locked(shared?leader:task,shared,sig,&info,&p);
-                    if (action.handler!=KERNEL_SIGNAL_DFL && action.handler!=KERNEL_SIGNAL_IGN) {
+                    if (info.signal && action.handler!=KERNEL_SIGNAL_DFL && action.handler!=KERNEL_SIGNAL_IGN) {
                         /* pending、disposition、mask和RESETHAND在同一次选择中提交。
                          * 解锁后构帧仅借用本线程快照，不再读取共享action指针。 */
                         *delivery=(struct kernel_signal_delivery){
@@ -1703,7 +1749,10 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
             kernel_service_scope_begin(&return_service);
             continue;
         }
+        int native=p.completed!=0;
         signal_pending_finish(&p);
+        if(pending&&!info.signal)continue;
+        if(native&&action.handler!=KERNEL_SIGNAL_DFL&&action.handler!=KERNEL_SIGNAL_IGN)delivery->info=info;
         signal_retarget_shared(task,retarget);
         if (shared && sig == 14) real_timer_rearm(leader);
         if (pending == 0U) {

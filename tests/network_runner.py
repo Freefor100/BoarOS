@@ -16,6 +16,9 @@ sys.path.insert(0,str(ROOT/'tests/diff-abi'))
 import harness
 from arch_profiles import PROFILES
 
+def workload_source(name):
+    return ROOT / ({'posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
+
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -33,7 +36,7 @@ def run_loongarch(args):
     environment=os.environ.copy();environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     compiler=ROOT/'build/loongarch/musl-root/bin/musl-gcc'
     subprocess.run([str(compiler),*profile.raw_flags,*(['-DPIPE_SMOKE=1'] if args.workload=='pipe' else ['-DEVENT_SMOKE=1'] if args.workload=='event' else []),'-static','-O2','-pthread','-Wall','-Wextra','-Werror',
-        '-Wl,-z,max-page-size=16384',str(ROOT/('tests/workloads/signal/queued.c' if args.workload=='queued' else 'tests/workloads/signal/altstack.c' if args.workload=='altstack' else 'tests/workloads/event/caller.c' if args.workload=='event' else 'tests/workloads/pipe/caller.c' if args.workload=='pipe' else 'tests/workloads/epoll/delivery.c' if args.workload=='epoll' else f'tests/workloads/network/{args.workload}.c')),'-o',str(program)],env=environment,check=True)
+        '-Wl,-z,max-page-size=16384',str(workload_source(args.workload)),'-o',str(program)],env=environment,check=True)
     supervisor=work/'supervisor'
     execute([profile.compiler,*profile.raw_flags,'-O2','-DROOT_NETWORK_SETUP=1','-ffreestanding',
         '-fno-builtin','-fno-stack-protector','-nostdlib','-nostartfiles','-static','-no-pie',
@@ -47,7 +50,7 @@ def run_loongarch(args):
         if args.only and args.only!=platform:continue
         for memory in args.memory or ('512M','1G'):
             case=work/f'{platform}-{memory}';case.mkdir()
-            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued') else disk(case,program)
+            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix') else disk(case,program)
             kernel=profile.linux_kernel() if platform=='linux' else args.kernel or ROOT/profile.kernel
             snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
             command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
@@ -58,7 +61,7 @@ def run_loongarch(args):
             try:code,raw=run_guest(command,120)
             except subprocess.TimeoutExpired as error:code=-1;raw=error.output
             (case/'console.log').write_text(raw)
-            passed=not code and ('QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
+            passed=not code and ('POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
                 'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
             row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
@@ -80,7 +83,7 @@ def run_smp(args):
     program=output/'program'
     subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),
         *(['-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1'] if args.dynamic else ['-static']),*(['-DEVENT_SMOKE=1'] if args.workload=='event' and not args.observe else []),'-O2','-pthread','-Wall','-Wextra','-Werror',
-        str(ROOT/('tests/workloads/signal/queued.c' if args.workload=='queued' else 'tests/workloads/signal/altstack.c' if args.workload=='altstack' else 'tests/workloads/event/caller.c' if args.workload=='event' else 'tests/workloads/pipe/caller.c' if args.workload=='pipe' else 'tests/workloads/network/smp.c')),'-o',str(program)],check=True)
+        str(workload_source(args.workload)),'-o',str(program)],check=True)
     variants=[]
     if args.only!='boaros':
         linux,linux_identity=harness.linux_build(ROOT/'tests/smp/linux-user.config')
@@ -95,6 +98,7 @@ def run_smp(args):
     (output/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     expected=[f'SOCKET-SMP CASE {name} OK' for name in ('ipv4-tcp','ipv6-tcp','ipv4-udp','ipv6-udp','unix-stream','unix-dgram','blocking-close-reuse-cancel','fault-empty-trunc-timeout-sendfile','shared-readers-writers','remote-epoll-oneshot-nested')]+['SOCKET-SMP END 10']
     pipe=args.workload=='pipe';event=args.workload=='event';altstack=args.workload=='altstack'
+    posix=args.workload=='posix'
     queued=args.workload=='queued'
     if altstack:expected=[f'ALTSTACK CASE {name} OK' for name in ('abi','frames','bad-stacks','lifecycle','threads')]+['ALTSTACK CASE copy-races SKIP','ALTSTACK END 6']
     if event:expected=[f'EVENT CASE {name} OK' for name in ('counter-flags-limit','vectors-fault-alias','timer-clocks-periodic','timer-fault-commit','eventfd-direct','eventfd-epoll','timerfd-remote','lifecycle-close-reuse-signal-exec')]+['EVENT END 8']
@@ -102,6 +106,7 @@ def run_smp(args):
     try:
         for cpus in args.cpus or [4]:
             for memory in args.memory or ['512M']:
+                if posix:expected=['POSIX CASE objects OK','POSIX CASE faults-quota OK','POSIX CASE lifecycle OK','POSIX CASE wall OK','POSIX CASE shared-standard-signal OK','POSIX CASE periodic-overrun OK','POSIX CASE stale-ignore-forged OK','POSIX CASE exec-pending OK','POSIX CASE cpu-clocks OK','POSIX CASE cpu-target-exit OK','POSIX CASE handler-libc-thread OK','POSIX CASE pending-oneshot OK','POSIX CASE group-controls OK','POSIX CASE caller-cpus OK','POSIX END failures=0']
                 if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]
                 folder=output/f'{cpus}cpu-{memory}';folder.mkdir()
                 fixture=harness.fixture(folder,program)
@@ -113,10 +118,11 @@ def run_smp(args):
                     disk=folder/(target+'.img');shutil.copyfile(fixture,disk)
                     if target=='boaros' and args.observe:
                         marker=folder/'socket-observer';marker.write_text('private correctness observations\n')
-                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('queued-observer' if queued else 'altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
+                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('posix-observer' if posix else 'queued-observer' if queued else 'altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
                         harness.run_logged(['debugfs','-w','-f',str(batch),str(disk)],folder/'observer-install.log')
                     raw,record,_=boot_user('qemu-system-riscv64',args.firmware,str(kernel.resolve()),disk,memory,cpus,folder,target=='linux')
                     lines=[line[line.index('SOCKET-SMP '):] for line in raw.replace('\r','').splitlines() if 'SOCKET-SMP ' in line]
+                    if posix:lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('POSIX ')]
                     if queued:lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('QUEUED ')]
                     if pipe:lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('PIPE CASE ') or line.startswith('PIPE END ')]
                     if event:lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('EVENT CASE ') or line.startswith('EVENT END ')]
@@ -126,7 +132,7 @@ def run_smp(args):
                     if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     passed=lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -148,6 +154,10 @@ def run_smp(args):
                         observations=[[int(v,16) for v in row] for row in re.findall(r'ALTSTACK caller cpu=(0x[0-9a-f]+) frames=(0x[0-9a-f]+) returns=(0x[0-9a-f]+)',raw)]
                         active=[row for row in observations if row[0]<cpus]
                         passed=passed and len(active)==cpus and {row[0] for row in active}==set(range(cpus)) and all(all(row[1:]) for row in active) and all(not any(row[1:]) for row in observations if row[0]>=cpus)
+                    if target=='boaros' and args.observe and posix:
+                        observations=[[int(v,16) for v in row] for row in re.findall(r'POSIX caller cpu=(0x[0-9a-f]+) settings=(0x[0-9a-f]+) consumers=(0x[0-9a-f]+)',raw)]
+                        active=[row for row in observations if row[0]<cpus]
+                        passed=passed and len(active)==cpus and all(all(row[1:]) for row in active) and 'POSIX expiry CPU0 OK' in raw
                     if target=='boaros' and args.observe and queued:
                         observations=[[int(v,16) for v in row] for row in re.findall(r'QUEUED caller cpu=(0x[0-9a-f]+) waits=(0x[0-9a-f]+) reads=(0x[0-9a-f]+) queries=(0x[0-9a-f]+) sends=(0x[0-9a-f]+)',raw)]
                         active=[row for row in observations if row[0]<cpus]
@@ -168,7 +178,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','smp','epoll','pipe','event','altstack','queued'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','smp','epoll','pipe','event','altstack','queued','posix'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -179,7 +189,7 @@ def main(default_arch="riscv"):
     parser.add_argument('--output',type=Path)
     parser.add_argument('--firmware',default='default')
     args=parser.parse_args()
-    if args.workload in ('smp','pipe','event','altstack','queued') and args.arch=='riscv':return run_smp(args)
+    if args.workload in ('smp','pipe','event','altstack','queued','posix') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)
@@ -189,7 +199,7 @@ def main(default_arch="riscv"):
     program=work/'init'
     compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
     subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),'-static','-O2','-pthread','-Wall','-Wextra','-Werror',
-                    str(ROOT/('tests/workloads/signal/queued.c' if args.workload=='queued' else 'tests/workloads/signal/altstack.c' if args.workload=='altstack' else 'tests/workloads/event/caller.c' if args.workload=='event' else 'tests/workloads/pipe/caller.c' if args.workload=='pipe' else 'tests/workloads/epoll/delivery.c' if args.workload=='epoll' else f'tests/workloads/network/{args.workload}.c')),'-o',str(program)],check=True)
+                    str(workload_source(args.workload)),'-o',str(program)],check=True)
     image=harness.fixture(work,program)
     metadata={'program_sha256':digest(program),'fixture_sha256':digest(image),'runs':{}}
     variants=[]
@@ -215,7 +225,7 @@ def main(default_arch="riscv"):
             try:harness.run_logged(command,log,60)
             except (RuntimeError,TimeoutError):pass
             raw=log.read_text(errors='replace')
-            passed=('QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 8' if args.workload=='pipe' else f'NETWORK PASS {args.workload}') in raw
+            passed=('POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 8' if args.workload=='pipe' else f'NETWORK PASS {args.workload}') in raw
             if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
             metadata['runs'][label]={'passed':passed,'memory':memory,'kernel_sha256':digest(snapshot),'command':command}
             print(name,memory,'PASS' if passed else 'FAIL',work)

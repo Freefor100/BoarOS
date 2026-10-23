@@ -372,6 +372,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/cpu_clock.c \
+	kernel/sched/posix_timer.c \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
 	kernel/sched/exec.c \
@@ -463,6 +464,7 @@ ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
 LDFLAGS += -Wl,--wrap=kernel_pipe_readv,--wrap=kernel_pipe_writev,--wrap=kernel_open_file_poll,--wrap=kernel_event_fd_io,--wrap=syscall_handle_timerfd,--wrap=kernel_timer_fd_expire
 LDFLAGS += -Wl,--wrap=kernel_signal_queue_info,--wrap=kernel_signal_wait_take,--wrap=kernel_signal_fd_take,--wrap=kernel_signal_fd_poll,--wrap=signal_pending_prepare,--wrap=kernel_signal_release_table
+LDFLAGS += -Wl,--wrap=syscall_handle_posix_timer,--wrap=posix_timer_record_complete,--wrap=kernel_posix_timer_expire,--wrap=scheduler_cpu_timer_expire
 LDFLAGS += -Wl,--wrap=kernel_signal_stack_prepare,--wrap=riscv_signal_restore_current
 LDFLAGS += -Wl,--wrap=kernel_socket_reserve_read,--wrap=kernel_socket_stream_reserve,--wrap=kernel_socket_write_datagram,--wrap=kernel_socket_write_unix,--wrap=kernel_socket_wait_ready,--wrap=kernel_socket_service_owned,--wrap=kernel_copy_from_user,--wrap=kernel_wait_cursor_wake,--wrap=kernel_wait_backend_quiesce
 LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot,--wrap=virtio_split_enqueue
@@ -2463,6 +2465,13 @@ test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
 		build/host/scheduler-handoff-$$shift; \
 	done
+
+.PHONY: test-posix-timer-host
+test-posix-timer-host:
+	@mkdir -p build/host/posix-timer
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/posix_timer.c kernel/sched/posix_timer.c kernel/signal_pending.c kernel/raw_lock.c tests/host/cpu_context.c -o build/host/posix-timer/owner-$$shift; \
+	build/host/posix-timer/owner-$$shift; done
 
 .PHONY: test-signal-pending-host
 test-signal-pending-host:

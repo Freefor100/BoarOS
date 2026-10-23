@@ -1,3 +1,4 @@
+#include <kernel/posix_timer.h>
 #include "private.h"
 #include <kernel/event_fd.h>
 #include <arch/timer.h>
@@ -486,6 +487,8 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
 #endif
         event=kernel_timer_fd_deadline();
     if (event && (!deadline || event<deadline)) deadline=event;
+    event=kernel_posix_timer_deadline();
+    if(event&&(!deadline||event<deadline))deadline=event;
     return deadline;
 }
 

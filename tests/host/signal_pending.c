@@ -21,6 +21,12 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t
 }
 void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap && p && !kernel_cpu_current()->raw_locks);free(p);assert(__atomic_fetch_sub(&live,1,__ATOMIC_RELAXED));}
+int posix_timer_record_take_locked(struct signal_queue_record *r,struct kernel_signal_wait_info *i,struct signal_pending_prepared *p)
+{(void)r;(void)i;(void)p;abort();}
+void posix_timer_record_clear_locked(struct signal_queue_record *r,int ignored,struct signal_pending_prepared *p)
+{(void)r;(void)ignored;(void)p;abort();}
+void posix_timer_record_complete(struct signal_queue_record *r){(void)r;abort();}
+void posix_timer_record_free(struct signal_queue_record *r){(void)r;abort();}
 static void init(struct kernel_task *t)
 {*t=(struct kernel_task){0};t->group_leader=t;t->group_members=1;t->files.heap=&heap;t->sigpending_limit=(struct kernel_rlimit64){4096,4096};}
 static uint64_t count(void)
@@ -87,5 +93,12 @@ int main(void)
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);b.group_pending=a.group_pending;kernel_signal_pending_adopt_locked(&b,&a);}
     kernel_signal_pending_cleanup(&a);assert(count()==1);assert(take(&b,1,36).value==7 && !count());
     assert(!post(&b,0,37,-1,9,1));kernel_signal_pending_cleanup(&b);assert(!count() && !live);
+    b.sigpending_limit.current=1;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_reserve_locked(&b));}
+    assert(count()==1&&post(&a,0,36,-1,1,1)==0);
+    assert(count()==2&&post(&b,0,36,-1,1,1)==-KERNEL_EAGAIN);
+    assert(take(&a,0,36).value==1&&count()==1);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(signal_pending_reserve_locked(&b)==-KERNEL_EAGAIN);signal_pending_unreserve_locked();}
+    kernel_signal_pending_cleanup(&a);assert(!count()&&!live);
     puts("signal pending FIFO/quota/abort/merge/lifetime passed");return 0;
 }
