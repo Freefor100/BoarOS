@@ -49,6 +49,12 @@ SECTIONS
     .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_LOAD_OFFSET)
     {
         __bss_start = .;
+        /* CPU本地写入与跨核调度锁各占独立cacheline；三个热前缀共享现有BSS首页。 */
+        *(.bss.scheduler.cpu)
+        . = ALIGN(64);
+        *(.bss.scheduler.wait)
+        . = ALIGN(64);
+        *(.bss.scheduler.state)
         *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)

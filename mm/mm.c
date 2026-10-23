@@ -4120,6 +4120,30 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
          (access != KERNEL_MM_READ && access != KERNEL_MM_WRITE))))
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (access && pin->registration) __builtin_trap();
+    if (!shared) {
+        uint64_t identity;
+        enum kernel_mm_status status = kernel_mm_futex_id(mm, &identity);
+        if (status) return status;
+        for (unsigned i = 0; i < count; i++) {
+            if (addresses[i] & 3U) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+            if (addresses[i] >= ARCH_MMU_USER_LIMIT) return KERNEL_MM_STATUS_NOT_MAPPED;
+        }
+        /* private身份只依赖存活MM和VA。驻留页沿共同pin协议取得实际owner，
+         * 不等待与身份无关的映射gate；缺页/COW仍在发布pin和key前完成。 */
+        if (access) {
+            for (;;) {
+                status = kernel_mm_pin_user_page(mm, addresses[pin_index], access, pin);
+                if (status != KERNEL_MM_STATUS_NOT_MAPPED &&
+                    status != KERNEL_MM_STATUS_ACCESS) break;
+                status = kernel_mm_resolve_user_fault(mm, addresses[pin_index], access);
+                if (status) return status;
+            }
+            if (status) return status;
+        }
+        for (unsigned i = 0; i < count; i++)
+            keys[i] = (struct kernel_futex_key){ .identity = identity, .offset = addresses[i] };
+        return KERNEL_MM_STATUS_OK;
+    }
     for (;;) {
         MM_OPERATION(mm);
         struct kernel_mm_record *record = operation.record;
@@ -4132,7 +4156,6 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
             uint64_t address = addresses[i];
             if (address & 3U) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
             if (address >= ARCH_MMU_USER_LIMIT) return KERNEL_MM_STATUS_NOT_MAPPED;
-            if (!shared) continue;
             if (!record->vmas || kernel_vma_set_lookup(record->vmas, address, &vmas[i]))
                 return KERNEL_MM_STATUS_NOT_MAPPED;
             struct kernel_mm_mapping mapping;
@@ -4170,7 +4193,6 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
             struct kernel_vma *vma = &vmas[i];
             *key = (struct kernel_futex_key){ .identity = record->futex_id,
                                              .offset = addresses[i] };
-            if (!shared) continue;
             if (vma->kind == KERNEL_VMA_KIND_FILE_SHARED) {
                 struct kernel_vfs_node *node = kernel_open_file_node(vma->backing);
                 if (!node || kernel_vfs_node_acquire(node)) __builtin_trap();

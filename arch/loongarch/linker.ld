@@ -8,7 +8,12 @@ SECTIONS {
  .rodata : AT(ADDR(.rodata) - 0x9000000000000000) { *(.rodata .rodata.*) . = ALIGN(0x4000); } :rodata
  .data : AT(ADDR(.data) - 0x9000000000000000) { *(.data .data.*) . = ALIGN(0x4000); } :data
  .bss (NOLOAD) : AT(ADDR(.bss) - 0x9000000000000000) {
-   __bss_start = .; *(.bss .bss.*) *(COMMON)
+   __bss_start = .;
+   /* 与RV相同：CPU本地状态、共享锁和调度器前缀集中在现有BSS首页。 */
+   *(.bss.scheduler.cpu) . = ALIGN(64);
+   *(.bss.scheduler.wait) . = ALIGN(64);
+   *(.bss.scheduler.state)
+   *(.bss .bss.*) *(COMMON)
    . = ALIGN(16); __boot_stack_bottom = .; . += 0x10000;
    __boot_stack_top = .; __bss_end = .;
  } :data

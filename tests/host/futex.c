@@ -22,12 +22,26 @@ static uint64_t context;
 static const uint64_t source = 0x40000, target = 0x41000;
 static unsigned opposite_arm, bucket_entered, bucket_waiter;
 static unsigned remap_arm, fault_entered, fault_resume;
+static unsigned gate_arm, gate_entered, gate_resume, gate_attempted;
+static unsigned admission_arm, admission_waited;
 static const uint64_t cold_target = 0x80000;
 static struct kernel_memory_object *cold_object;
 void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
+    if (lock->rank == 25 && kernel_cpu_current()->hardware_id != 2 &&
+        __atomic_load_n(&gate_entered, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&gate_resume, __ATOMIC_ACQUIRE)) {
+        /* Release the real gate so the old path fails an assertion, not a timeout. */
+        __atomic_store_n(&gate_attempted, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&gate_resume, 1, __ATOMIC_RELEASE);
+    }
     __real_kernel_rwlock_write(lock, guard);
+    if (lock->rank == 25 && kernel_cpu_current()->hardware_id == 2 &&
+        __atomic_exchange_n(&gate_arm, 0, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&gate_entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&gate_resume, __ATOMIC_ACQUIRE)) sched_yield();
+    }
     if (lock->rank == 26 && kernel_cpu_current()->hardware_id == 2 &&
         __atomic_exchange_n(&opposite_arm, 0, __ATOMIC_ACQ_REL)) {
         __atomic_store_n(&bucket_entered, 1, __ATOMIC_RELEASE);
@@ -39,6 +53,11 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     uint64_t deadline, int interruptible, struct kernel_wait_token *token)
 {
     enum kernel_scheduler_status result = __real_kernel_wait_prepare(queue, deadline, interruptible, token);
+    if (kernel_cpu_current()->hardware_id == 1 && !interruptible &&
+        __atomic_load_n(&admission_arm, __ATOMIC_ACQUIRE)) {
+        assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
+        __atomic_store_n(&admission_waited, 1, __ATOMIC_RELEASE);
+    }
     if (kernel_cpu_current()->hardware_id == 3 && !interruptible &&
         __atomic_load_n(&bucket_entered, __ATOMIC_ACQUIRE)) {
         assert(result == KERNEL_SCHEDULER_STATUS_OK && queue->registrations && token->generation);
@@ -147,6 +166,89 @@ static void operations(void)
     assert(call(source, 4 | 128, 0, 0, source, 0) == 0);
     assert(call(8, 1 | 128, 1, 0, 0, 0) == 0);
     assert(call(8, 1, 1, 0, 0, 0) == -KERNEL_EFAULT);
+}
+static void *hold_mm_gate(void *unused)
+{
+    (void)unused; attach(2);
+    struct kernel_vma vma;
+    assert(!kernel_mm_vma_lookup(&kernel_wait_current_task()->mm, source, &vma));
+    detach(); return 0;
+}
+static void private_with_mm_gate_busy(void)
+{
+    put(source, 0); put(target, 0);
+    gate_entered = gate_resume = gate_attempted = 0; gate_arm = 1;
+    pthread_t holder, waiting;
+    assert(!pthread_create(&holder, 0, hold_mm_gate, 0));
+    while (!__atomic_load_n(&gate_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    assert(call(8, 1 | 128, 1, 0, 0, 0) == 0);
+    assert(!gate_attempted && !gate_resume);
+    assert(call(source, 3 | 128, 0, 1, 8, 0) == 0);
+    assert(call(source, 4 | 128, 0, 1, target, 0) == 0);
+    assert(call(source, 5 | 128, 0, 0, target, encode(1, 0, 1, 0)) == 0);
+    assert(call(source, 0 | 128, 1, 0, 0, 0) == -KERNEL_EAGAIN);
+    struct waiter w = {1, 1, source, -99, 0};
+    unsigned before = mm_test_parked(1);
+    assert(!pthread_create(&waiting, 0, waiter, &w)); queued(1, before);
+    assert(call(source, 1 | 128, 1, 0, 0, 0) == 1);
+    assert(!pthread_join(waiting, 0) && w.result == 0);
+    assert(!gate_attempted && !gate_resume);
+    __atomic_store_n(&gate_resume, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(holder, 0)); gate_entered = 0;
+    assert(get(target) == 1);
+}
+static void private_access(void)
+{
+    const uint64_t address = 0xc0000;
+    uint64_t out;
+    assert(call(address, 0 | 128, 1, 0, 0, 0) == -KERNEL_EFAULT);
+    assert(call(source, 4 | 128, 0, 0, target + 1, 0) == -KERNEL_EINVAL);
+    assert(call(source, 3 | 128, 0, 0, ARCH_MMU_USER_LIMIT, 0) == -KERNEL_EFAULT);
+    assert(!kernel_mm_mmap_anonymous(&mm, address, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
+    /* Cold READ and WRITE use the real resolver before borrowing the page. */
+    assert(call(address, 0 | 128, 1, 0, 0, 0) == -KERNEL_EAGAIN);
+    assert(call(source, 5 | 128, 0, 0, address, encode(1, 0, 3, 0)) == 0);
+    assert(get(address) == 3);
+    struct kernel_mm child = {0};
+    assert(!kernel_mm_fork(&child, &mm));
+    assert(call(source, 5 | 128, 0, 0, address, encode(1, 0, 1, 3)) == 0);
+    uint32_t copied; size_t bytes;
+    assert(get(address) == 4 && !kernel_copy_from_user(&child, &copied, address,
+        sizeof(copied), &bytes) && bytes == sizeof(copied) && copied == 3);
+    assert(!kernel_mm_release(&child));
+    assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    assert(call(address, 0 | 128, 3, 0, 0, 0) == -KERNEL_EAGAIN);
+    assert(call(source, 5 | 128, 0, 0, address, encode(1, 0, 1, 0)) == -KERNEL_EFAULT);
+    assert(get(address) == 4);
+    assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, 0));
+    assert(call(address, 0 | 128, 3, 0, 0, 0) == -KERNEL_EFAULT);
+    assert(call(address, 1 | 128, 1, 0, 0, 0) == 0);
+    assert(!kernel_mm_munmap(&mm, address, BOAROS_PAGE_SIZE));
+}
+static void *revoke_private_read(void *unused)
+{
+    (void)unused; attach(2);
+    assert(!kernel_mm_mprotect(&kernel_wait_current_task()->mm,
+        source, BOAROS_PAGE_SIZE, 0));
+    detach(); return 0;
+}
+static void private_admission(void)
+{
+    put(source, 0);
+    struct kernel_mm_user_pin held = {0};
+    assert(!kernel_mm_pin_user_page(&mm, source, KERNEL_MM_READ, &held));
+    unsigned before_edit = mm_test_parked(2), before_read = mm_test_parked(1);
+    pthread_t edit, read;
+    assert(!pthread_create(&edit, 0, revoke_private_read, 0)); queued(2, before_edit);
+    struct waiter w = {1, 1, source, -99, 1};
+    admission_waited = 0; admission_arm = 1;
+    assert(!pthread_create(&read, 0, waiter, &w)); queued(1, before_read);
+    assert(__atomic_load_n(&admission_waited, __ATOMIC_ACQUIRE));
+    kernel_mm_unpin_user_page(&held);
+    assert(!pthread_join(edit, 0) && !pthread_join(read, 0));
+    assert(w.result == -KERNEL_EFAULT); admission_arm = 0;
+    assert(!kernel_mm_mprotect(&mm, source, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
 }
 static void comparisons(void)
 {
@@ -265,10 +367,11 @@ int main(void)
     assert(!kernel_mm_context(&mm, &context)); mm_test_context = context;
     assert(!kernel_mm_mmap_anonymous(&mm, source, 2 * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
     attach(0);
-    operations(); requeue(target); requeue(source + 1024); comparisons();
+    operations(); private_with_mm_gate_busy(); private_access(); private_admission();
+    requeue(target); requeue(source + 1024); comparisons();
     opposite(target); opposite(source + 1024); coherent_remap();
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
-    puts("futex native operations, requeue/bitset, opposite-lock handoff, coherent remap and owners PASS");
+    puts("futex native operations, gate-independent private keys/pins, admission/COW, requeue/bitset, coherent remap and owners PASS");
 }

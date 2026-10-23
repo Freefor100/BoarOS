@@ -27,6 +27,8 @@ USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务�
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
+`boot_cpu`、`kernel_wait_domain` 和调度器首个 cacheline 按此顺序放在现有 BSS 首页，CPU 本地状态与共享锁各自按 64 字节隔开。对象及其所有权保持独立，普通陷入、身份查询与返回准备因此只需触达一个静态调度控制页。链接布局检查保护同页与隔离要求；它减少必要的 TLB 工作集，不保证任意动态页和链接地址都没有冲突。
+
 等待登记、阻塞提交、期限索引、运行记账、策略更新、队列校验和runnable发布使用统一rank40短锁；heap10→physical20、
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 同一 API 按 CPU 数编译：UP 关闭中断、保持抢占嵌套并使用编译器屏障，SMP 另以 acquire/release 原子操作互斥。
@@ -212,9 +214,9 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务同时进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
 
-MM 一次准备至多两个 key 和一个用户字 pin：operation gate 固定映射视图，metadata raw 检查当前 PTE 并取得页许可。所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。private key 使用不复用的 MM 身份号与四字节对齐地址，WAKE 不要求该地址仍有映射；共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
+MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑 gate；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。private WAIT、CMP_REQUEUE 和 WAKE_OP 沿共同用户 pin 协议，在 metadata raw 内检查当前 PTE、访问许可并取得实际页引用；新许可关闭时先等待开放，缺页或 COW 先调用 resolver，再重新取得 pin。共享 key 需要 operation gate 固定整组映射视图，再由 metadata raw 检查当前 PTE 并取得页许可；所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
 
-每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字并登记 token，通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配；扫描沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
+每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。每次操作只解析一组桶指针，在一次 wait_domain 保护内检查初始化，后续比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字并登记 token，通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配；扫描沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
 
 REQUEUE 返回唤醒数与迁移数之和，CMP_REQUEUE 先比较源字，不相等返回 EAGAIN 并保留原队列；同 key 也允许 requeue。同桶迁移保持原链上位置，跨桶追加到目标 FIFO。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，requeue 保留原掩码。WAKE_OP 对第二个用户字执行原生 32 位 SET、ADD、OR、ANDN 或 XOR，以更新前的有符号值执行 EQ、NE、LT、LE、GT、GE 比较，条件成立时追加唤醒第二组 waiter；12 位操作数和比较数先符号扩展，SHIFT 操作按 Linux 的低五位移位规则处理。未知比较返回 ENOSYS，但保留已完成的原子更新。第四参数的计数按低 32 位解释；REQUEUE/CMP_REQUEUE 拒绝负计数，legacy WAKE/WAKE_OP 的非正计数仍可唤醒一个匹配者。错误与副作用顺序依据固定 Linux futex 实现。
 
@@ -278,7 +280,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 `make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
 
-futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶锁和原子操作，覆盖 4/16 KiB pin、同桶/跨桶与同 key requeue、六种有符号比较、bitset 和 owner 归还；`tests/workloads/futex/caller.c` 可在 Linux 与两种架构上运行相同用户探针。
+futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶锁和原子操作，覆盖 4/16 KiB pin、MM gate 被另一执行者持有时 private 操作继续完成、关闭新许可后的等待与撤权、冷页和 COW、同桶/跨桶与同 key requeue、六种有符号比较、bitset 和 owner 归还；`tests/workloads/futex/caller.c` 可在 Linux 与两种架构上运行相同用户探针。
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 

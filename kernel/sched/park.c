@@ -2,7 +2,7 @@
 #include <kernel/irq.h>
 #include <string.h>
 
-struct kernel_raw_lock kernel_wait_domain;
+struct kernel_raw_lock kernel_wait_domain __attribute__((section(".bss.scheduler.wait")));
 /* 全局不回退代次也覆盖任务页复用，旧token不能命中同地址的新owner。 */
 static uint64_t wait_generation;
 void kernel_wait_domain_init(void)
