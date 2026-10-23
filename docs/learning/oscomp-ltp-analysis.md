@@ -517,3 +517,23 @@ ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它�
 正常退出后，两架构根盘与第二盘p1/p2/p3共八个对象检查通过：ext4使用固定e2fsck 1.47.2 `-fn`，VFAT使用fsck.fat `-n`；启动种子槽已擦除。定向启动的两内核已恢复为原默认交付内核并逐字节核对。原有交付文档的未提交修改保持原样。
 
 原输出、逐程序结果、原judge输出、内核／QEMU／输入身份及磁盘检查位于`build/posix-timer/original/`；已检查的运行盘清理，保留ELF、日志与构建缓存。
+
+## futex补全后的原程序结果
+
+10月23日将通用futex实现合入兼容分支后，在固定官方离线容器、原QEMU设备参数及默认单核下，仅选择以下五个原程序；RV／LA并行，各自顺序运行glibc和musl。保留原ELF、参数、judge、内部时限、跳过表与监督设置。
+
+**四组均22/22分，合计88/88；20次程序执行全部正常，失败、broken、跳过、超时均为0。** 两架构根盘与第二盘p1/p2/p3共八个对象检查全部为0，定向启动后默认交付内核已恢复并逐字节核对。
+
+| 原程序 | 每组合得分 | RV glibc/ms | RV musl/ms | LA glibc/ms | LA musl/ms |
+|---|---:|---:|---:|---:|---:|
+| futex_wait01 | 4/4 | 131 | 83 | 112 | 65 |
+| futex_wait_bitset01 | 2/2 | 270 | 244 | 266 | 245 |
+| futex_wake01 | 6/6 | 62 | 42 | 63 | 42 |
+| futex_cmp_requeue01 | 7/7 | 11357 | 8368 | 10241 | 7432 |
+| futex_cmp_requeue02 | 3/3 | 63 | 42 | 68 | 44 |
+
+`futex_wait01`、`futex_wait_bitset01`和`futex_wake01`检查已有等待／唤醒与掩码行为；`futex_cmp_requeue01/02`现在到达比较重排主体，所有7／3子项通过。cmp_requeue01的7～11秒属于原程序实际工作量，本轮保留其原有循环。官方盘没有独立WAKE_OP原程序，原子运算、六种有符号比较和错误副作用由固定Linux同ELF短例检查。
+
+自有短例覆盖28个固定命名项及条件变量广播、取消清理、timed EINTR和超时；RV真实单／双／四核、LA、两种libc与Linux对照通过。四核观察确认各核实际进行READ、WRITE和key-only准备。通用机制见[调度模块](../modules/kernel-scheduler.md#等待与-futex)，性能见[CPU成本](cpu-accounting-cost.md#futex调用者执行与普通信号固定批次结果)。性能目标未达到：UP新增getpid、普通信号及futex往返回退，四核往返负扩展，均保留在该成本记录中。
+
+原始输出、逐程序分项和judge结果位于`build/futex-signal/original/`，固定性能批次位于`build/futex-signal/campaign/`。检查后的运行盘已清理，保留ELF、内核身份、日志与缓存。既有`oscomp-official-delivery.md`未提交修改保持原样。
