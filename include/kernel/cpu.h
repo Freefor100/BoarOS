@@ -15,6 +15,11 @@ struct kernel_task;
 struct kernel_io_context;
 struct kernel_raw_guard;
 #if BOAROS_MAX_CPUS > 1
+struct kernel_cpu_notification_batch {
+    struct kernel_cpu *cpu;
+    uintptr_t interrupts;
+    uint32_t previous_depth, targets;
+};
 enum kernel_cpu_state {
     KERNEL_CPU_PREPARED = 1, KERNEL_CPU_STARTING, KERNEL_CPU_ONLINE,
     KERNEL_CPU_QUIESCING, KERNEL_CPU_STOPPED
@@ -69,6 +74,8 @@ struct kernel_cpu {
     uint64_t service_samples, service_elapsed_ticks, service_running_ns;
 #endif
 #endif
+    /* 栈上通知批次只在本CPU禁止抢占、IRQ关闭期间借用。 */
+    struct kernel_cpu_notification_batch *notification_batch;
 #endif
 };
 #if BOAROS_COST_DIAGNOSTICS
@@ -95,13 +102,21 @@ void kernel_preempt_disable(void);
 void kernel_preempt_enable(void);
 void kernel_assert_can_block(void);
 #if BOAROS_MAX_CPUS > 1
-/* 固件通知仅在本CPU最后一个raw释放之后发送。 */
+/* raw外发送；操作批次先归还对象资格，再提交其中的远端目标。 */
 void kernel_cpu_flush_notifications(void);
 void kernel_cpu_notify(struct kernel_cpu *, unsigned events);
+/* 对象资格取得后begin，全部归还后end；批次内不允许阻塞。 */
+void kernel_cpu_notification_batch_begin(struct kernel_cpu_notification_batch *);
+void kernel_cpu_notification_batch_end(struct kernel_cpu_notification_batch *);
 struct kernel_task *kernel_cpu_secondary_prepare(struct kernel_cpu *, uint64_t, unsigned);
 void kernel_cpu_secondary_attach(struct kernel_cpu *, uintptr_t stack_low, uintptr_t stack_high);
 void kernel_assert_service_context(void);
 #else
+struct kernel_cpu_notification_batch {};
+static inline void kernel_cpu_notification_batch_begin(struct kernel_cpu_notification_batch *batch)
+{ (void)batch; }
+static inline void kernel_cpu_notification_batch_end(struct kernel_cpu_notification_batch *batch)
+{ (void)batch; }
 static inline void kernel_assert_service_context(void) {}
 #endif
 static inline void kernel_cpu_request_schedule(struct kernel_cpu *cpu)

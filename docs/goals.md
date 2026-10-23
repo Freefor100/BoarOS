@@ -54,6 +54,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 扩展 | 尚缺语义 |
 |---|---|
+| proc 线程信息 | 线程级查询边界见[procfs模块](modules/procfs.md) |
 | bind/rbind、move、传播与 mount namespace | 挂载边/实例/路径/OFD/MM 的引用及摘树关系，跨任务可见性与退出回收 |
 | remount 与其他属性 | 根挂载只读重配置；NOEXEC/NODEV/NOSUID、atime/同步等属性的实际执行点，已打开对象与脏数据的失败交接 |
 | umount2 扩展 | MNT_DETACH/FORCE/EXPIRE/UMOUNT_NOFOLLOW 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |

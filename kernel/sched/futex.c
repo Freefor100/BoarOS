@@ -27,6 +27,15 @@ struct futex_bucket {
 };
 static struct futex_bucket buckets[FUTEX_BUCKETS];
 
+/* 桶表在任务与secondary发布前初始化，热路径只取得实际桶资格。 */
+void kernel_futex_init(void)
+{
+    for (unsigned i = 0; i < FUTEX_BUCKETS; i++) {
+        kernel_wait_queue_init(&buckets[i].waiters);
+        kernel_mutex_init(&buckets[i].operation, 26, (uintptr_t)i + 1U);
+    }
+}
+
 static void futex_key_release(struct kernel_futex_key *key)
 {
     if (key->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY)
@@ -83,14 +92,6 @@ static void futex_lock_buckets(const struct kernel_futex_key *keys,
 {
     struct futex_bucket *first = resolved[0] = futex_bucket(&keys[0]);
     struct futex_bucket *second = resolved[1] = count == 2 ? futex_bucket(&keys[1]) : first;
-    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      for (unsigned i = 0; i < count; i++) {
-          struct futex_bucket *bucket = resolved[i];
-          if (!bucket->waiters.initialized) {
-              kernel_wait_queue_init(&bucket->waiters);
-              kernel_mutex_init(&bucket->operation, 26, (uintptr_t)(bucket - buckets) + 1U);
-          }
-      } }
     if (first > second) {
         struct futex_bucket *swap = first; first = second; second = swap;
     }
@@ -104,7 +105,15 @@ static void futex_unlock_buckets(struct kernel_lock_guard *guards)
     kernel_lock_release(&guards[0]);
 }
 
-/* 桶操作锁跨扫描保留比较/登记/迁移的次序，raw只保护一个节点。
+static int futex_waiter_matches(struct kernel_wait_node *node,
+    struct kernel_wait_queue *queue, const struct kernel_futex_key *key)
+{
+    return node->task && node->queue == queue &&
+        futex_key_equal(&node->task->futex_key, key) &&
+        kernel_wait_record_of(node->task)->phase != KERNEL_WAIT_NOTIFIED;
+}
+
+/* 桶操作锁跨扫描保留比较/登记/迁移的次序，raw内扫描有界。
  * moved个源后备引用由caller在解桶锁、归还用户pin之后释放。 */
 static int64_t futex_wake(const struct kernel_futex_key *source,
     uint32_t count, uint32_t requeue, const struct kernel_futex_key *target,
@@ -115,6 +124,26 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
     struct kernel_wait_queue *destination = target_bucket ? &target_bucket->waiters : 0;
     struct kernel_wait_cursor cursor;
     uint32_t woken = 0, moved = 0;
+    if (!target_bucket) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        /* Futex只登记任务节点，没有必须锁外执行的callback。短链的节点
+         * 使用不跨raw保护，无需为扫描另建游标/任务借用；长链仍分段。 */
+        if (queue->registrations <= 16) {
+            struct kernel_wait_node *node = queue->head;
+            while (node && woken < count) {
+                /* COMMITTED通知会摘除当前节点，先保存仍受保护的后继。 */
+                struct kernel_wait_node *next = node->next;
+                if (futex_waiter_matches(node, queue, source) &&
+                    (node->task->futex_bitset & bitset)) {
+                    struct kernel_wait_token token = {node->task, node->generation};
+                    if (kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN)) woken++;
+                }
+                node = next;
+            }
+            if (moved_count) *moved_count = 0;
+            return woken;
+        }
+    }
     kernel_wait_cursor_begin(queue, &cursor);
     while (cursor.node && (woken < count || moved < requeue)) {
         struct kernel_wait_node *node = cursor.node;
@@ -122,8 +151,7 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         int move = 0;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (task && node->queue == queue && futex_key_equal(&task->futex_key, source) &&
-                kernel_wait_record_of(task)->phase != KERNEL_WAIT_NOTIFIED) {
+            if (futex_waiter_matches(node, queue, source)) {
                 if (woken < count && (task->futex_bitset & bitset)) {
                     struct kernel_wait_token token = {task, node->generation};
                     if (kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN)) woken++;
@@ -330,6 +358,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                                 pin_access, keys, &pin, status);
         if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
         futex_lock_buckets(keys, count, resolved, guards);
+        struct kernel_cpu_notification_batch notifications;
+        kernel_cpu_notification_batch_begin(&notifications);
         uint32_t moved = 0;
         uint32_t *word = pin_access ? (uint32_t *)((unsigned char *)pin.page +
                                      (addresses[pin_index] & BOAROS_PAGE_MASK)) : 0;
@@ -351,6 +381,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
             command == FUTEX_WAKE_BITSET ? bitset : FUTEX_BITSET_MATCH_ANY, &moved,
             resolved[0], requeue ? resolved[1] : 0);
         futex_unlock_buckets(guards);
+        /* READY已发布；归还全部桶资格后再发IPI，远端不必等发送者退出SBI。 */
+        kernel_cpu_notification_batch_end(&notifications);
         if (pin_access) kernel_mm_unpin_user_page(&pin);
         while (moved--) {
             struct kernel_futex_key retired = keys[0];
@@ -402,8 +434,11 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
         KERNEL_UACCESS_STATUS_OK || futex_prepare(task, &address, 1, 0, 0, 0,
             &key, 0, &status) || status != KERNEL_SCHEDULER_STATUS_OK) return;
     futex_lock_buckets(&key, 1, resolved, guards);
+    struct kernel_cpu_notification_batch notifications;
+    kernel_cpu_notification_batch_begin(&notifications);
     (void)futex_wake(&key, 1, 0, 0, FUTEX_BITSET_MATCH_ANY, 0, resolved[0], 0);
     futex_unlock_buckets(guards);
+    kernel_cpu_notification_batch_end(&notifications);
     futex_key_release(&key);
 }
 
