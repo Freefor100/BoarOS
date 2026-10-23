@@ -7,6 +7,15 @@ selected.preadv.iovcount
 selected.pwritev.iovfault
 selected.preadv.empty
 selected.pwritev.empty
+selected.preadv.count8
+selected.pwritev.count8
+selected.preadv.count9
+selected.pwritev.count9
+selected.preadv.count1024
+selected.pwritev.count1024
+selected.preadv.clipped-invalid-tail
+selected.pwritev.clipped-invalid-tail
+selected.preadv.length-before-range
 selected.pwritev.partial
 selected.preadv.partial
 selected.preadv.bufferfault
@@ -109,3 +118,11 @@ selected.addrlen.sendmsg-family-iov-fault
 selected.addrlen.sendmsg-family-iov-count
 selected.addrlen.sendmsg-short-iov-fault
 selected.addrlen.sendmsg-short-iov-count
+selected.sendmsg.count8
+selected.recvmsg.count8
+selected.sendmsg.count9
+selected.recvmsg.count9
+selected.sendmsg.count1024
+selected.recvmsg.count1024
+selected.sendmsg.count1025
+selected.recvmsg.count1025

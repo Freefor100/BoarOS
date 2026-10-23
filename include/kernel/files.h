@@ -265,6 +265,8 @@ enum kernel_files_status kernel_files_pipe2(
 
 struct kernel_uaccess_iovec;
 struct kernel_socket_address;
+/* Descriptors are an immutable, numerically validated request view. Page
+ * permissions and faults are checked when payload is actually copied/pinned. */
 enum kernel_files_status kernel_files_socket_iov_io(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description **owner,

@@ -31,6 +31,8 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW；未支持的 DIRECT/NOATIME 仍返回 EINVAL。FD_CLOEXEC 仍属于各张表。
 普通与受控 FD 表共同使用这些保护和引用规则，不再封存 OFD、pipe 或表的并发资格。`kernel_files_check_task_domain()` 在受控任务创建时检查当前实际消费者和资源绑定；它不改变对象状态，也不要求额外保留 CPU0 控制引用来规避末次释放。
 
+`readv/preadv/writev/pwritev/sendmsg/recvmsg` 在入口通过同一导入实现取得描述符快照：8项以内用调用栈，更多项只有一次堆分配。快照将只读的 view、count、total 与可转移的 allocation owner 分开；后端借用同一份描述符，不重扫数值范围，实际用户页权限和缺页仍在复制或 pin 时检查。导入先检查全部有符号长度，再检查原始范围；单向量先裁剪长度，多向量检查未裁剪的每项范围后裁剪总量，因此达到总量上限也不会掩盖非法尾项。TTY等待期间接管堆owner和OFD，正常完成归还，强制取消消费；栈上view不会因owner置空而改变。标量read/pread保留各对象原有的范围、空读与类型错误顺序。读取分派只传调用者持有的真实OFD owner，pread也沿用该owner；后端入口借用一次description，避免同时传同一对象的裸指针与owner。
+
 普通 `read/pread/readv/preadv` 与 `write/pwrite/writev/pwritev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选；ext4 由调用者完成缺失批次装入，其他磁盘后端沿其 CPU0 策略。tmpfs 数据访问就地执行。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
 
 共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写先在用户来源 pin 前按后端策略准备真实空间，ext4 在发起 CPU 完成，归还该步骤的 inode writer 后才解析来源；空间接纳与 legacy 格式的完成职责见 [VFS/ext4](vfs-ext4.md#文件节点与页缓存)。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
@@ -238,7 +240,7 @@ console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续
 `fs/namei.c::__getname_maybe_null`与`fs/stat.c::vfs_fstatat`，同ELF差分入口是
 `tests/diff-abi/path_only.c`；文件fixture另检查空路径不产生路径容量的分配。
 
-`faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份仅需对普通文件执行请求保留“至少一个执行位”约束，对只读挂载的普通文件或目录写请求返回 `EROFS`；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+`faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份对非目录对象的执行请求保留“至少一个执行位”约束；普通文件或目录的写请求检查解析后的最终挂载，只读时返回 `EROFS`，权限错误先于只读错误；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 `kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；即使容量为零也先判断是否存在下一条记录：存在但放不下返回 `-EINVAL`，EOF 返回零。容量不足不消费该项 cookie；用户 fault 在已完整发出的记录上返回前缀计数。
 

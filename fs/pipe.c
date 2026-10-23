@@ -343,9 +343,6 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
     if (!pipe || !mm || !result || !pipe->heap || !pipe->allocator)
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     if ((flags & 3)==1) { *result=-KERNEL_EBADF; return KERNEL_PIPE_STATUS_OK; }
-    for (size_t i=0;i<iov_count;i++) if (kernel_user_range_check(iov[i].base,(size_t)iov[i].length)) {
-        *result=-KERNEL_EFAULT; return KERNEL_PIPE_STATUS_OK;
-    }
     if (!count) { *result=0; return KERNEL_PIPE_STATUS_OK; }
     uintptr_t irq=arch_interrupt_save();
     KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->read_lock,&copy);

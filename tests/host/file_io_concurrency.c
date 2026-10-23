@@ -117,9 +117,15 @@ enum kernel_scheduler_status __wrap_kernel_wait_finish(struct kernel_wait_token 
 }
 #endif
 static unsigned path_expansion_observed,path_expansion_failed,path_expansion_allocations;
+static size_t iov_allocation_size;
+static unsigned iov_allocations,iov_allocation_failure;
 enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t size,void **owner)
 {
+    if (iov_allocation_size && size==iov_allocation_size) {
+        iov_allocations++;
+        if (iov_allocation_failure) return KERNEL_HEAP_STATUS_EMPTY;
+    }
     if (path_expansion_observed && size==2U*KERNEL_FS_PATH_MAX) {
         path_expansion_allocations++;
         if (path_expansion_failed) return KERNEL_HEAP_STATUS_EMPTY;
@@ -984,9 +990,48 @@ static void vector_boundaries(struct kernel_heap *heap,struct kernel_vfs_mount *
         /* Keep the next case's EOF independent of an earlier accepted prefix. */
         assert(!kernel_files_ftruncate(&local,0,1,&result) && !result);
     }
+    struct kernel_uaccess_iovec many[1024]={0};
+    const unsigned counts[]={8,9,1024,1025};
+    for (unsigned i=0;i<4;i++) {
+        unsigned count=counts[i];
+        assert(!kernel_copy_to_user(&mm,0x200000,many,sizeof(many),&copied) && copied==sizeof(many));
+        iov_allocation_size=count*sizeof(many[0]);
+        for (unsigned op=0;op<4;op++) {
+            iov_allocations=0;
+            enum kernel_files_status status=op==0?kernel_files_readv(&local,&mm,0,0x200000,count,&result):
+                op==1?kernel_files_preadv(&local,&mm,0,0x200000,count,0,&result):
+                op==2?kernel_files_writev(&local,&mm,0,0x200000,count,&result):
+                      kernel_files_pwritev(&local,&mm,0,0x200000,count,0,&result);
+            assert(!status && result==(count>1024?-KERNEL_EINVAL:0));
+            assert(iov_allocations==(count>8 && count<=1024));
+        }
+        iov_allocation_size=0;
+    }
+    /* 堆失败与描述符缺页均不能提交数据；四个入口共享同一导入约束。 */
+    for (unsigned failure=0;failure<2;failure++) for (unsigned op=0;op<4;op++) {
+        iov_allocation_size=9*sizeof(many[0]);iov_allocations=0;iov_allocation_failure=failure;
+        uint64_t address=failure?0x200000:0x200000+4*BOAROS_PAGE_SIZE-8;
+        enum kernel_files_status status=op==0?kernel_files_readv(&local,&mm,0,address,9,&result):
+            op==1?kernel_files_preadv(&local,&mm,0,address,9,0,&result):
+            op==2?kernel_files_writev(&local,&mm,0,address,9,&result):
+                  kernel_files_pwritev(&local,&mm,0,address,9,0,&result);
+        assert(!status && result==(failure?-KERNEL_ENOMEM:-KERNEL_EFAULT) && iov_allocations==1);
+        iov_allocation_size=0;iov_allocation_failure=0;
+    }
+    for (unsigned order=0;order<2;order++) {
+        struct kernel_uaccess_iovec tail[]={{0,KERNEL_FILES_MAX_RW_COUNT},{UINT64_MAX,order?UINT64_MAX:1}};
+        assert(!kernel_copy_to_user(&mm,0x200000,tail,sizeof(tail),&copied));
+        assert(!kernel_files_readv(&local,&mm,0,0x200000,2,&result) && result==(order?-KERNEL_EINVAL:-KERNEL_EFAULT));
+        assert(!kernel_files_writev(&local,&mm,0,0x200000,2,&result) && result==(order?-KERNEL_EINVAL:-KERNEL_EFAULT));
+    }
+    assert(!kernel_files_ftruncate(&local,0,2,&result) && !result);
+    struct kernel_uaccess_iovec partial[]={{0x100000,1},{0x300000,1}};
+    assert(!kernel_copy_to_user(&mm,0x200000,partial,sizeof(partial),&copied));
+    assert(!kernel_files_preadv(&local,&mm,0,0x200000,2,0,&result) && result==1);
+    assert(!kernel_files_pwritev(&local,&mm,0,0x200000,2,0,&result) && result==1);
     assert(!kernel_files_release(&local));
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
-    puts("PASS vector boundaries: empty ranges, signed lengths, single-vector cap before range and multi-vector original-range checks");
+    puts("PASS vector boundaries: 8/9/1024/1025, allocation counts/OOM, descriptor fault, illegal clipped tail, signed-length ordering and partial data");
 }
 
 static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
