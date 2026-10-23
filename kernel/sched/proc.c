@@ -90,29 +90,100 @@ static struct kernel_task *find_resource_owner(kernel_pid_t pid,
 }
 
 
-int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
-                                 struct kernel_proc_process_snapshot *result)
+static int proc_thread_visible(const struct kernel_task *task)
 {
-    if (pid <= 0 || !identity || !result) return -KERNEL_EINVAL;
-    KERNEL_IRQ_SCOPE(proc_irq);
-    SCHEDULER_TASK_BORROW(task, find_member(pid, identity));
-    if (!task) {
+    /* 组长先退出时仍保有TID，直到整组回收或exec转移身份。 */
+    return proc_visible(task) || (task && task == task->group_leader &&
+        task->arch.user_mode && task->tid_owned && task->accounted &&
+        task->group_members > 1U);
+}
+
+static struct kernel_task *find_thread(kernel_pid_t tid, uint64_t identity)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
+    struct kernel_pid *id = process_identity(task, KERNEL_PID_TID);
+    if (!task || !id || id->generation != identity || !task->accounted ||
+        task->retirement || !proc_thread_visible(task)) return 0;
+    scheduler_task_get_locked(task);
+    return task;
+}
+
+int kernel_proc_thread_identity(kernel_pid_t tgid, uint64_t group_identity,
+    kernel_pid_t tid, uint64_t *identity)
+{
+    if (tid <= 0 || !identity || tgid < 0 || (tgid && !group_identity))
+        return -KERNEL_EINVAL;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
+    if (!task || !task->accounted || task->retirement || !proc_thread_visible(task) ||
+        (tgid && (process_identity_number(task, KERNEL_PID_TGID) != tgid ||
+                  process_identity_generation(task) != group_identity)))
         return -KERNEL_ENOENT;
+    *identity = process_identity(task, KERNEL_PID_TID)->generation;
+    return 0;
+}
+
+int kernel_proc_thread_group(kernel_pid_t tid, uint64_t identity,
+    kernel_pid_t *tgid, uint64_t *group_identity)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
+    struct kernel_pid *id = process_identity(task, KERNEL_PID_TID);
+    if (!task || !id || id->generation != identity || !task->accounted ||
+        task->retirement || !proc_thread_visible(task)) return -KERNEL_ENOENT;
+    *tgid = process_identity_number(task, KERNEL_PID_TGID);
+    *group_identity = process_identity_generation(task);
+    return 0;
+}
+
+int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t group_identity,
+    kernel_pid_t after, kernel_pid_t *tid, uint64_t *identity)
+{
+    if (tgid <= 0 || !group_identity || after < 0 || !tid || !identity)
+        return -KERNEL_EINVAL;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(leader, find_member(tgid, group_identity));
+    if (!leader) return -KERNEL_ENOENT;
+    kernel_pid_t best = 0;
+    uint64_t token = 0;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            struct kernel_task *task = cursor.task;
+            if (task->accounted && !task->retirement && task->group_leader == leader &&
+                proc_thread_visible(task) && task->tid > after && (!best || task->tid < best)) {
+                best = task->tid;
+                token = process_identity(task, KERNEL_PID_TID)->generation;
+            }
+        }
+        scheduler_task_cursor_next(&cursor);
     }
-    struct kernel_task *leader = task;
+    if (!best) return -KERNEL_ENOENT;
+    *tid = best; *identity = token;
+    return 0;
+}
+
+static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
+    int thread, struct kernel_proc_process_snapshot *result)
+{
+    struct kernel_task *leader = task->group_leader;
     uint32_t threads = 0;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (leader->retirement || !leader->accounted) return -KERNEL_ENOENT;
     threads = leader->group_members;
     *result = (struct kernel_proc_process_snapshot){
-        .pid = pid,
+        .pid = task->tid,
+        .tgid = leader->tid,
         .ppid = leader->parent && leader->parent->group_leader
             ? leader->parent->group_leader->tid : 0,
         .process_group = process_identity_number(leader, KERNEL_PID_PGID),
         .session_id = process_identity_number(leader, KERNEL_PID_SID),
         .identity = identity,
-        .start_ticks = leader->proc_start_ticks,
+        .start_ticks = task->proc_start_ticks,
         .state = task->proc_exiting ||
                  task->state == KERNEL_THREAD_STATE_EXITED ||
                  task->state == KERNEL_THREAD_STATE_GROUP_DEAD ||
@@ -122,28 +193,29 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                  task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' : 'S',
         .child_minor_faults = leader->child_usage.minor_faults,
         .child_major_faults = leader->child_usage.major_faults,
-        .signal_pending = leader->signal_pending & UINT64_C(0x7fffffff),
-        .signal_blocked = leader->signal_blocked & UINT64_C(0x7fffffff),
+        .signal_pending = task->signal_pending,
+        .signal_shared_pending = leader->group_pending,
+        .signal_blocked = task->signal_blocked,
         .signal_queued=kernel_signal_pending_count_locked(),
         .signal_queue_limit=leader->sigpending_limit.current,
         .threads = threads,
-        .scheduling_priority = leader->scheduling.priority
-            ? -(leader->scheduling.priority + 1) : 20,
-        .rt_priority = (uint32_t)leader->scheduling.priority,
-        .scheduling_policy = (uint32_t)leader->scheduling.policy,
+        .scheduling_priority = task->scheduling.priority
+            ? -(task->scheduling.priority + 1) : 20,
+        .rt_priority = (uint32_t)task->scheduling.priority,
+        .scheduling_policy = (uint32_t)task->scheduling.policy,
     };
-    result->wait_channel_flag = threads < 2U &&
+    result->wait_channel_flag = (thread || threads < 2U) &&
         task->state != KERNEL_THREAD_STATE_RUNNING &&
         task->state != KERNEL_THREAD_STATE_READY;
-    memcpy(result->comm, leader->comm, sizeof(result->comm));
+    memcpy(result->comm, task->comm, sizeof(result->comm));
     }
     result->tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader));
     result->tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader));
     const struct kernel_signal_table *actions =
-        (const void *)(uintptr_t)leader->signal_table_address;
+        (const void *)(uintptr_t)task->signal_table_address;
     if (actions) {
         if (actions->magic != KERNEL_SIGNAL_TABLE_MAGIC) __builtin_trap();
-        for (unsigned sig = 0; sig < 31U; sig++) {
+        for (unsigned sig = 0; sig < 64U; sig++) {
             if (actions->actions[sig].handler == KERNEL_SIGNAL_IGN)
                 result->signal_ignored |= UINT64_C(1) << sig;
             else if (actions->actions[sig].handler != KERNEL_SIGNAL_DFL)
@@ -151,7 +223,7 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         }
     }
     struct kernel_task_usage usage = {0};
-    scheduler_usage_snapshot(leader, 0, &usage);
+    scheduler_usage_snapshot(task, thread, &usage);
     result->minor_faults = usage.minor_faults;
     result->major_faults = usage.major_faults;
     result->user_ticks = usage.user_ns / 10000000U;
@@ -174,6 +246,24 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         result->start_stack = memory.start_stack;
     }
     return 0;
+}
+
+int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
+    struct kernel_proc_process_snapshot *result)
+{
+    if (pid <= 0 || !identity || !result) return -KERNEL_EINVAL;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_member(pid, identity));
+    return task ? proc_task_snapshot(task, identity, 0, result) : -KERNEL_ENOENT;
+}
+
+int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
+    struct kernel_proc_process_snapshot *result)
+{
+    if (tid <= 0 || !identity || !result) return -KERNEL_EINVAL;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_thread(tid, identity));
+    return task ? proc_task_snapshot(task, identity, 1, result) : -KERNEL_ESRCH;
 }
 
 int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,

@@ -18,7 +18,7 @@ enum kernel_proc_path_kind {
 };
 
 struct kernel_proc_process_snapshot {
-    kernel_pid_t pid;
+    kernel_pid_t pid, tgid;
     kernel_pid_t ppid;
     kernel_pid_t process_group;
     kernel_pid_t session_id;
@@ -37,7 +37,7 @@ struct kernel_proc_process_snapshot {
     uint64_t virtual_bytes;
     uint64_t resident_pages;
     uint64_t start_code, end_code, start_stack;
-    uint64_t signal_pending, signal_blocked, signal_ignored, signal_caught;
+    uint64_t signal_pending, signal_shared_pending, signal_blocked, signal_ignored, signal_caught;
     uint64_t signal_queued, signal_queue_limit;
     uint32_t threads;
     uint32_t wait_channel_flag;
@@ -54,6 +54,15 @@ int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
 uint32_t kernel_proc_pid_max(void);
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
                              uint64_t *identity);
+/* A zero tgid skips membership filtering; nonzero also checks its generation. */
+int kernel_proc_thread_identity(kernel_pid_t tgid, uint64_t group_identity,
+    kernel_pid_t tid, uint64_t *identity);
+int kernel_proc_thread_group(kernel_pid_t tid, uint64_t identity,
+    kernel_pid_t *tgid, uint64_t *group_identity);
+int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t group_identity,
+    kernel_pid_t after, kernel_pid_t *tid, uint64_t *identity);
+int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
+    struct kernel_proc_process_snapshot *result);
 int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                                  struct kernel_proc_process_snapshot *result);
 int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
