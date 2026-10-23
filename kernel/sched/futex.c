@@ -358,6 +358,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                                 pin_access, keys, &pin, status);
         if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
         futex_lock_buckets(keys, count, resolved, guards);
+        struct kernel_cpu_notification_batch notifications;
+        kernel_cpu_notification_batch_begin(&notifications);
         uint32_t moved = 0;
         uint32_t *word = pin_access ? (uint32_t *)((unsigned char *)pin.page +
                                      (addresses[pin_index] & BOAROS_PAGE_MASK)) : 0;
@@ -379,6 +381,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
             command == FUTEX_WAKE_BITSET ? bitset : FUTEX_BITSET_MATCH_ANY, &moved,
             resolved[0], requeue ? resolved[1] : 0);
         futex_unlock_buckets(guards);
+        /* READY已发布；归还全部桶资格后再发IPI，远端不必等发送者退出SBI。 */
+        kernel_cpu_notification_batch_end(&notifications);
         if (pin_access) kernel_mm_unpin_user_page(&pin);
         while (moved--) {
             struct kernel_futex_key retired = keys[0];
@@ -430,8 +434,11 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
         KERNEL_UACCESS_STATUS_OK || futex_prepare(task, &address, 1, 0, 0, 0,
             &key, 0, &status) || status != KERNEL_SCHEDULER_STATUS_OK) return;
     futex_lock_buckets(&key, 1, resolved, guards);
+    struct kernel_cpu_notification_batch notifications;
+    kernel_cpu_notification_batch_begin(&notifications);
     (void)futex_wake(&key, 1, 0, 0, FUTEX_BITSET_MATCH_ANY, 0, resolved[0], 0);
     futex_unlock_buckets(guards);
+    kernel_cpu_notification_batch_end(&notifications);
     futex_key_release(&key);
 }
 

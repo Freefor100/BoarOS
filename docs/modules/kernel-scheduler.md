@@ -219,6 +219,8 @@ MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不�
 
 每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。桶表在 boot CPU 初始化 wait_domain 后、任务和 secondary 发布前一次初始化。每次操作只解析一组桶指针，比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字并登记 token，通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配。WAKE 在至多 16 个登记的短链上，只取得一次 wait_domain，完成 key/bitset 匹配和通知；队列只包含任务节点，节点使用始终在保护内，因而无需锁外游标借用。COMMITTED 通知会摘除节点，扫描在通知前保存后继；PREPARED 通知保留登记，重复扫描跳过已经通知的记录。长链与 requeue 沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
 
+SMP下，WAKE/WAKE_OP及退出唤醒在取得全部桶资格后，借用当前调用栈上的通知批次。READY和目标CPU事件位立即发布；实际IPI目标暂存于该批次，全部桶锁归还后才合并发送，避免发送者在持桶期间等待固件。批次保存并恢复原IRQ及抢占深度，期间保持CPU固定且不允许阻塞；撤销CPU上的栈指针后再发送。原始raw释放路径不增加分支，UP编译为空操作。共享key最终释放与用户pin归还在批次结束后执行。
+
 REQUEUE 返回唤醒数与迁移数之和，CMP_REQUEUE 先比较源字，不相等返回 EAGAIN 并保留原队列；同 key 也允许 requeue。同桶迁移保持原链上位置，跨桶追加到目标 FIFO。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，requeue 保留原掩码。WAKE_OP 对第二个用户字执行原生 32 位 SET、ADD、OR、ANDN 或 XOR，以更新前的有符号值执行 EQ、NE、LT、LE、GT、GE 比较，条件成立时追加唤醒第二组 waiter；12 位操作数和比较数先符号扩展，SHIFT 操作按 Linux 的低五位移位规则处理。未知比较返回 ENOSYS，但保留已完成的原子更新。第四参数的计数按低 32 位解释；REQUEUE/CMP_REQUEUE 拒绝负计数，legacy WAKE/WAKE_OP 的非正计数仍可唤醒一个匹配者。错误与副作用顺序依据固定 Linux futex 实现。
 
 值不匹配为 EAGAIN，非法地址或权限为 EFAULT，准备时缺页分配耗尽为 ENOMEM，零掩码及负 requeue 计数等非法参数为 EINVAL，超时为 ETIMEDOUT。

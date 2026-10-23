@@ -57,3 +57,33 @@ void kernel_assert_can_block(void)
     if (cpu->raw_locks || cpu->preempt_depth) __builtin_trap();
     arch_interrupt_restore(irq);
 }
+#if BOAROS_MAX_CPUS > 1
+void kernel_cpu_notification_batch_begin(struct kernel_cpu_notification_batch *batch)
+{
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!batch || cpu->raw_locks || cpu->notification_batch ||
+        cpu->preempt_depth == UINT32_MAX) __builtin_trap();
+    *batch = (struct kernel_cpu_notification_batch){
+        .cpu = cpu, .interrupts = irq, .previous_depth = cpu->preempt_depth,
+    };
+    cpu->preempt_depth++;
+    cpu->notification_batch = batch;
+}
+void kernel_cpu_notification_batch_end(struct kernel_cpu_notification_batch *batch)
+{
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!batch || batch->cpu != cpu || cpu->notification_batch != batch ||
+        cpu->raw_locks || arch_interrupt_is_enabled() ||
+        batch->previous_depth == UINT32_MAX ||
+        cpu->preempt_depth != batch->previous_depth + 1U) __builtin_trap();
+    /* 先结束栈借用；调用者归还对象资格后，才执行实际的固件通知。 */
+    cpu->notification_batch = 0;
+    cpu->outbound |= batch->targets;
+    if (cpu->outbound) kernel_cpu_flush_notifications();
+    cpu->preempt_depth = batch->previous_depth;
+    uintptr_t irq = batch->interrupts;
+    *batch = (struct kernel_cpu_notification_batch){0};
+    arch_interrupt_restore(irq);
+}
+#endif

@@ -128,7 +128,12 @@ void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
     if (!cpu_count && target == source) { arch_interrupt_restore(irq); return; }
     if (!target || target->logical_id >= cpu_count) __builtin_trap();
     __atomic_fetch_or(&target->events, events, __ATOMIC_RELEASE);
-    if (target != source) source->outbound |= 1U << target->logical_id;
+    if (target != source) {
+        COST_ADD(SCHED_IPI_REQUESTS, 1);
+        unsigned bit = 1U << target->logical_id;
+        if (source->notification_batch) source->notification_batch->targets |= bit;
+        else source->outbound |= bit;
+    }
     if (!source->raw_locks && source->outbound) kernel_cpu_flush_notifications();
     arch_interrupt_restore(irq);
 }
@@ -141,7 +146,15 @@ void kernel_cpu_flush_notifications(void)
     source->outbound = 0;
     for (unsigned i = 0; i < cpu_count; i++) {
         if (!(mask & (1U << i))) continue;
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t started = kernel_cost_clock();
+#endif
         long error = sbi_send_ipi(cpus[i]->hardware_id);
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t elapsed = kernel_cost_clock() - started;
+        COST_ADD(SCHED_IPI_SENDS, 1);
+        COST_ADD(SCHED_IPI_TICKS, elapsed);
+#endif
         if (error) fail_hart("IPI", error, cpus[i]->hardware_id);
         source->ipi_sent++;
     }

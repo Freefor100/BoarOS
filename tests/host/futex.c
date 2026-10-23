@@ -26,6 +26,23 @@ static unsigned gate_arm, gate_entered, gate_resume, gate_attempted;
 static unsigned admission_arm, admission_waited;
 static unsigned measure_domain, domain_takes, fast_notification;
 static struct kernel_wait_queue *futex_queue;
+void futex_test_notifications_init(void);
+struct kernel_cpu *futex_test_notification_target(unsigned);
+static unsigned notification_probe, notification_sends, notification_seen;
+long futex_test_send_ipi(uint64_t hart)
+{
+    assert(notification_probe && hart > 0 && hart < 4);
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    for (struct kernel_lock_guard *guard = kernel_io_context_current()->locks;
+         guard; guard = guard->previous)
+        assert(guard->lock->rank != 26);
+    assert(!cpu->raw_locks && !cpu->notification_batch && !sync_test_irq);
+    assert((__atomic_load_n(&futex_test_notification_target((unsigned)hart)->events,
+        __ATOMIC_ACQUIRE) & 3U) == 3U);
+    notification_sends++;
+    notification_seen |= 1U << hart;
+    return 0;
+}
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
@@ -43,6 +60,12 @@ void __wrap_kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason
     /* Production notification removes the default node before ready publication. */
     kernel_wait_node_remove_locked(&task->default_wait_node);
     __real_kernel_wait_backend_notify(task, reason);
+    if (notification_probe && kernel_cpu_current()->hardware_id == 0) {
+        struct kernel_cpu *remote = futex_test_notification_target(1);
+        kernel_cpu_notify(remote, 1);
+        kernel_cpu_notify(remote, 2);
+        assert(!notification_sends && (remote->events & 3U) == 3U);
+    }
 }
 
 static const uint64_t cold_target = 0x80000;
@@ -172,6 +195,44 @@ static int64_t measured_wake(uint64_t address, unsigned bitset)
     measure_domain = 0;
     return result;
 }
+static void notification_batch(void)
+{
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    for (unsigned enabled = 0; enabled < 2; enabled++) {
+        struct kernel_mutex first, second;
+        struct kernel_lock_guard guards[2] = {0};
+        kernel_mutex_init(&first, 26, 1); kernel_mutex_init(&second, 26, 2);
+        sync_test_irq = enabled;
+        kernel_mutex_lock(&first, &guards[0]); kernel_mutex_lock(&second, &guards[1]);
+        struct kernel_cpu_notification_batch batch;
+        notification_probe = 1; notification_sends = notification_seen = 0;
+        kernel_preempt_disable();
+        unsigned previous_depth = cpu->preempt_depth;
+        kernel_cpu_notification_batch_begin(&batch);
+        assert(!sync_test_irq && cpu->notification_batch == &batch);
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            for (unsigned i = 1; i < 3; i++) {
+                struct kernel_cpu *remote = futex_test_notification_target(i);
+                remote->events = 0;
+                kernel_cpu_notify(remote, 1); kernel_cpu_notify(remote, 2);
+                kernel_cpu_notify(remote, 1);
+                assert(remote->events == 3 && !notification_sends);
+            }
+        }
+        assert(!notification_sends && batch.targets == 6 && !cpu->outbound);
+        kernel_lock_release(&guards[1]); kernel_lock_release(&guards[0]);
+        assert(!notification_sends);
+        kernel_cpu_notification_batch_end(&batch);
+        assert(notification_sends == 2 && notification_seen == 6 && !cpu->outbound &&
+            !cpu->notification_batch && !batch.cpu && cpu->preempt_depth == previous_depth &&
+            sync_test_irq == enabled);
+        kernel_preempt_enable();
+        assert(!cpu->preempt_depth);
+        notification_probe = 0;
+    }
+    sync_test_irq = 0;
+}
 static struct kernel_task synthetic[17];
 static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
 {
@@ -217,7 +278,13 @@ static void wake_batches(void)
     synthetic[0].futex_key.offset += 1024;
     synthetic[1].futex_bitset = 2;
     fast_notification = 1;
+    notification_probe = 1; notification_sends = notification_seen = 0;
+    futex_test_notification_target(1)->events = 0;
     assert(measured_wake(source, 1) == 2 && domain_takes == 1);
+    assert(notification_sends == 1 && notification_seen == 2 &&
+        !kernel_cpu_current()->notification_batch && !kernel_cpu_current()->outbound &&
+        !kernel_cpu_current()->preempt_depth);
+    notification_probe = 0;
     fast_notification = 0;
     assert(synthetic[0].wait.phase == KERNEL_WAIT_PREPARED &&
         synthetic[1].wait.phase == KERNEL_WAIT_PREPARED &&
@@ -353,7 +420,17 @@ static void comparisons(void)
         int expected = cmp == 0 ? value == 0 : cmp == 1 ? value != 0 :
                        cmp == 2 ? value < 0 : cmp == 3 ? value <= 0 :
                        cmp == 4 ? value > 0 : value >= 0;
+        int check_notification = cmp == 0 && value == 0;
+        if (check_notification) {
+            notification_probe = 1; notification_sends = notification_seen = 0;
+            futex_test_notification_target(1)->events = 0;
+        }
         int64_t result = call(source, 5 | 128, 1, 1, target, encode(1, cmp, 0, 0));
+        if (check_notification) {
+            assert(notification_sends == 1 && notification_seen == 2 &&
+                !kernel_cpu_current()->notification_batch && !kernel_cpu_current()->outbound);
+            notification_probe = 0;
+        }
         if (result != expected) fprintf(stderr, "comparison %u old=%d result=%lld expected=%d\n", cmp, value, (long long)result, expected);
         assert(result == expected && get(target) == (uint32_t)value);
         if (!expected) assert(call(target, 1 | 128, 1, 0, 0, 0) == 1);
@@ -461,6 +538,7 @@ int main(void)
     struct arch_mmu_page_table table = {0}; struct arch_mmu_user_space space = {0};
     struct kernel_heap heap = {0};
     mm_test_attach(0);
+    futex_test_notifications_init();
     kernel_futex_init();
     layout.usable[0].base = (uintptr_t)pool; layout.usable[0].size = sizeof(pool);
     assert(!physical_page_allocator_init(&allocator, &layout));
@@ -475,11 +553,12 @@ int main(void)
     assert(!kernel_mm_context(&mm, &context)); mm_test_context = context;
     assert(!kernel_mm_mmap_anonymous(&mm, source, 2 * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
     attach(0);
+    notification_batch();
     wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
     requeue(target); requeue(source + 1024); comparisons();
     opposite(target); opposite(source + 1024); coherent_remap(); shared_wake();
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
-    puts("futex native operations, gate-independent private keys/pins, bounded one-lock wake/collisions, admission/COW, requeue/bitset, coherent remap and owners PASS");
+    puts("futex native operations, gate-independent private keys/pins, bounded one-lock wake/collisions, post-bucket IPI/IRQ ownership, admission/COW, requeue/bitset, coherent remap and owners PASS");
 }
