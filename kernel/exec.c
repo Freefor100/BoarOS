@@ -1,4 +1,5 @@
 #include "exec_internal.h"
+#include <kernel/credentials.h>
 
 #include <kernel/errno.h>
 #include <kernel/elf64_source.h>
@@ -11,6 +12,7 @@
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
@@ -63,6 +65,14 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
         transaction->state == KERNEL_EXEC_TRANSACTION_PREPARED) {
         return KERNEL_EXEC_STATUS_STATE;
     }
+    if (transaction->exec_fs) {
+        kernel_fs_context_exec_end(transaction->exec_fs);
+        transaction->exec_fs=0;
+    }
+    kernel_credentials_put(transaction->credentials);
+    transaction->credentials=0;
+    kernel_exec_security_put(transaction->exec_security);
+    transaction->exec_security=0;
     if (kernel_exec_image_cleanup(transaction->heap,
                                   &transaction->image) !=
         KERNEL_EXEC_IMAGE_STATUS_OK) {
@@ -554,7 +564,7 @@ enum kernel_exec_status kernel_execve_prepare(
     struct kernel_exec_transaction *transaction;
     const char *interpreter_path;
     size_t interpreter_length;
-    struct kernel_exec_image_request image_request;
+    struct kernel_exec_image_request image_request={0};
     size_t filename_length;
     int path_result;
     enum kernel_exec_image_status image_status;
@@ -627,6 +637,8 @@ enum kernel_exec_status kernel_execve_prepare(
     if (access_status != KERNEL_UACCESS_STATUS_OK) {
         return finish_prepare_state(task, transaction);
     }
+    transaction->unsafe_fs=kernel_fs_context_exec_begin(fs,task);
+    if (!transaction->unsafe_fs) transaction->exec_fs=fs;
     KERNEL_FS_PATHS(fs_paths, fs);
     if (kernel_open_file_create_at(transaction->heap,
             fs_paths.cwd, fs_paths.root,
@@ -752,6 +764,28 @@ enum kernel_exec_status kernel_execve_prepare(
                            transaction->string_bytes);
     image_request.executable_source = transaction->executable_source;
     image_request.interpreter_source = transaction->interpreter_source;
+    struct kernel_vfs_exec_metadata metadata;
+    struct kernel_open_file_description *main_file=kernel_elf64_source_file(transaction->executable_source);
+    path_result=kernel_vfs_exec_metadata((struct kernel_vfs_file *)kernel_open_file_vfs_borrow(main_file),&metadata,1);
+    if (path_result) return finish_prepare_failure(task,transaction,path_result,linux_result);
+    if (transaction->interpreter_source) {
+        struct kernel_vfs_exec_metadata interpreter_metadata;
+        struct kernel_open_file_description *interp=kernel_elf64_source_file(transaction->interpreter_source);
+        path_result=kernel_vfs_exec_metadata((struct kernel_vfs_file *)kernel_open_file_vfs_borrow(interp),&interpreter_metadata,0);
+        if (path_result) return finish_prepare_failure(task,transaction,path_result,linux_result);
+        metadata.readable &= interpreter_metadata.readable;
+    }
+    const struct kernel_credentials *old=kernel_credentials_current();
+    transaction->credentials=kernel_credentials_clone(transaction->heap,old);
+    if (!transaction->credentials) return finish_prepare_failure(task,transaction,-KERNEL_ENOMEM,linux_result);
+    path_result=kernel_exec_credentials_prepare(transaction->credentials,old,&metadata,
+        transaction->unsafe_fs,task->no_new_privs,&transaction->secureexec,&transaction->dumpable);
+    if (path_result) return finish_prepare_failure(task,transaction,path_result,linux_result);
+    transaction->exec_security=kernel_exec_security_create(transaction->heap,transaction->dumpable);
+    if(!transaction->exec_security) return finish_prepare_failure(task,transaction,-KERNEL_ENOMEM,linux_result);
+    image_request.uid=transaction->credentials->uid; image_request.euid=transaction->credentials->euid;
+    image_request.gid=transaction->credentials->gid; image_request.egid=transaction->credentials->egid;
+    image_request.secureexec=transaction->secureexec;
     {
         struct kernel_rlimit64 stack_limit;
 

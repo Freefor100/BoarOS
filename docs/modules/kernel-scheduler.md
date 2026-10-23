@@ -13,6 +13,7 @@
 | `kernel/pid.c`、`kernel/sched/identity.c` | 私有编号保留、身份发布/角色引用，以及锁外身份存储释放 |
 | `kernel/sched/lifetime.c` | 任务存储借用、退休后继、join/reaper 资格与锁外页归还 |
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
+| `kernel/credentials.c`、`kernel/syscall/credentials.c`、`kernel/syscall/capability.c` | 不可变凭据、UID 账户及身份／capability 控制 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
 | `kernel/sched/park.c`、`wait.c` | 代次等待、借用游标、blocked/期限索引及完成仲裁 |
@@ -138,6 +139,20 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 ## 身份与资源
 
+### 用户凭据
+
+每个实际线程在任务尾部持有一个不可变 `kernel_credentials`，包含 real/effective/saved/fs UID/GID、排序的补充组、effective/permitted/inheritable/bounding/ambient capability 与 securebits。系统使用单一用户命名空间；初始 UID/GID 为 0、补充组为空，E/P/B 为固定 Linux 的有效 41 位，I/A 为零。
+
+设置接口先导入输入并构造完整候选，再在调度短锁内替换任务指针；旧对象和分配失败的候选在锁外释放。线程 clone 最初共享同一对象，后续 raw setxid 只替换调用线程的指针。musl/glibc 的全线程 setxid 由其信号和 futex 协作完成。普通 fork/vfork 则复制小型凭据对象，并继续引用共享的补充组和 UID 账户：Linux 的空路径 `linkat` 会比较打开时与当前的凭据对象身份，仅复制数值而保留同一对象会错误放行子进程。
+
+`no_new_privs` 是独立的线程标志，设置后保持为 1，clone 继承、exec 保留。它不改变凭据指针，因此仅设置 NNP 后，先前打开的 FD 仍满足空路径 `linkat` 的打开身份条件。OFD 持有打开时凭据引用，直至最后一次实际后端关闭完成；已有 FD 的正常数据读写继续使用打开时取得的访问权利。
+
+当前线程直接借用自己的稳定对象；跨线程查询在调度锁内取得引用后于锁外复制或格式化。退出后任务凭据保留至任务索引、等待者和存储借用全部归还的最终 collect 阶段。同步 I/O worker 显式借用原调用者凭据，计账任务与权限对象分别维护。
+
+`RLIMIT_SIGPENDING` 的使用量归真实 UID 账户，普通记录和 POSIX timer 预留记录保持接纳时的账户引用。线程改 UID 影响后续接纳，旧记录消费和删除仍归还原账户；队列细节见[信号模块](kernel-signal.md)。dumpable 由任务持有的执行安全对象保存，共享 MM 的线程与 vfork 共享它；普通 fork 复制状态，exec 替换，最终任务回收才释放。身份变化先更新共享状态再替换凭据；exec 的新 MM、候选凭据与执行安全状态一起发布，见[映像替换](kernel-exec.md)。
+
+### PID 身份
+
 TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的代次、引用计数和四类成员链只有一份真实身份。每个线程挂接 TID；线程组代表挂接 TGID、PGID、SID，其他线程通过代表取得组身份。`tid` 仅为对象编号的派生缓存，由身份事务维护，并由调度校验检查一致性。fork 继承父进程的 PGID/SID 对象；线程 clone 只新增 TID。`__WNOTHREAD` 的创建者关系持有 TID 对象引用，退出、收养和非组长 exec 转移关系，不按可能复用的整数判等。
 
 编号仅在全部角色成员和临时引用都释放后归还 bitmap。对象仍有引用不表示 TID 对应线程仍可收信号；线程 lookup、组 lookup 和 proc 可见性分别检查其角色及生命周期。组长先退出保留身份容器，直到最后线程退出或非组长 exec 原子接管四类成员。zombie 在 wait/reap 前保留进程身份；旧 proc 节点用同一对象的代次防止编号复用后命中新进程。
@@ -193,7 +208,7 @@ commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引�
 
 组长退出或被收割不销毁仍有 PGID/SID 成员的身份。zombie 在被收割前允许查询和符合条件的 setpgid；kill 对仍存在的 zombie 进程或组成功但不向已结束线程排队。kill 的正值按 TID 查找所属进程，零/负 PGID 按角色成员查找，wait4 的零/负 PGID 按当前真实组关系选择子进程；proc stat/status 从对象获取相同组/会话信息。
 
-进程退出与跨进程 reparent 检查最后一个同会话、不同组的父关系是否消失；忽略 init 父关系和真正结束的成员。新孤儿组含已完成 group stop 的任务时，全组依次收到内核 SIGHUP、SIGCONT（SI_KERNEL），恢复停止任务。仅有 TID 的线程回收不触发进程级孤儿事件。固定 Linux `kernel/sys.c` 的 setpgid/setsid 只改角色，不主动调用孤儿 HUP/CONT 检查；`kernel/exit.c` 的调用点是 reparent_leader 和 exit_notify，本实现保持这一范围。已孤儿组的默认 TSTP/TTIN/TTOU 丢弃，SIGSTOP 仍停止；[Serial TTY](kernel-tty.md) 通过稳定 SID/前台 PGID 引用接入 ctty、终端组信号与线程组生命周期；完整凭据权限模型仍未实现。
+进程退出与跨进程 reparent 检查最后一个同会话、不同组的父关系是否消失；忽略 init 父关系和真正结束的成员。新孤儿组含已完成 group stop 的任务时，全组依次收到内核 SIGHUP、SIGCONT（SI_KERNEL），恢复停止任务。仅有 TID 的线程回收不触发进程级孤儿事件。固定 Linux `kernel/sys.c` 的 setpgid/setsid 只改角色，不主动调用孤儿 HUP/CONT 检查；`kernel/exit.c` 的调用点是 reparent_leader 和 exit_notify，本实现保持这一范围。已孤儿组的默认 TSTP/TTIN/TTOU 丢弃，SIGSTOP 仍停止；[Serial TTY](kernel-tty.md) 通过稳定 SID/前台 PGID 引用接入 ctty、终端组信号与线程组生命周期；用户发送与特权控制按调用者当前凭据检查。
 
 `tests/diff-abi/session.c` 使用 pipe/wait4 握手与专用 exec probe，覆盖父子 exec errno、线程目标、非组长 setsid/exec、session 边界、zombie/proc、组定向 kill/wait、进程组长先收割后的组存续、退出/reparent 两条孤儿路径，以及 sigtimedwait 和 SA_SIGINFO 的内核信号来源。启动上下文不同：固定 Linux 裸 PID 1 初始 PGID/SID 为 0，BoarOS 初始身份为 1；测试先建立真实非零会话，再比较用户操作，不把启动整数差异混入会话机制断言。
 
@@ -227,7 +242,7 @@ REQUEUE 返回唤醒数与迁移数之和，CMP_REQUEUE 先比较源字，不相
 
 WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或带 `FUTEX_CLOCK_REALTIME` 的绝对 realtime。当前没有 `clock_settime`/`settimeofday` 写入口，启动后的 realtime offset 不变，故可一次转换为 monotonic deadline；将来加入可调时钟时必须重新审查阻塞中的实时截止时刻。无超时等待的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时等待使用 tagged restart state 保存用户地址、expected、operation、掩码和首次调用的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 
-`set_robust_list` 只核对 RV64 链头长度 24 字节并保存线程私有地址，允许空指针注销，不在注册时预读用户链。`get_robust_list` 支持当前线程及存活目标 TID；当前所有用户线程均为 root，查询其他线程按这一固定凭据模型可访问，输出先写长度再写指针。普通 clone/fork 不继承注册，失败 exec 保留，成功 exec 清理旧链并重置。链头与节点是可变用户内存，退出时才有界读取，不作为内核对象持有引用。
+`set_robust_list` 只核对 RV64 链头长度 24 字节并保存线程私有地址，允许空指针注销，不在注册时预读用户链。`get_robust_list` 支持当前线程及存活目标 TID；跨组查询按 Linux READ_REALCREDS 检查 UID/GID、capability 和目标执行安全状态的 dumpable，输出先写长度再写指针。普通 clone/fork 不继承注册，失败 exec 保留，成功 exec 清理旧链并重置。链头与节点是可变用户内存，退出时才有界读取，不作为内核对象持有引用。
 
 退出清理在原 MM 与原 TID 有效时同步完成，早于 clear-child-tid 和资源释放。成功的非组长 exec 在身份接管前保存旧 TID，切换到新页表前、旧 MM 仍激活时清理；可返回的 exec 失败不清理旧链。遍历最多 2048 项，下一链接先于字更新读取；pending 项不会因已在链上而处理两次。owner 等于退出 TID 时通过可处理缺页/COW 的 32 位原子比较交换保留 WAITERS 并置 OWNER_DIED，必要时唤醒一个 waiter；pending 的非 owner 解锁窗口按 Linux 规则补唤醒。坏地址、错位、超长链和内存不足只结束该次尽力清理，不把用户错误升级为内核 fatal 或保留无 owner 的重试状态。
 
@@ -287,7 +302,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-RV普通用户任务、共享匿名/文件MM及ext4文件操作已支持真实双核，执行位置和后端并发范围见[两核模块](riscv-smp.md)。四核、PI futex、实时信号队列、sigaltstack和clone3仍属后续能力。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI futex和clone3继续后续安排。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

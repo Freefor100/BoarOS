@@ -54,6 +54,7 @@ struct kernel_elf_layout {
     int has_interpreter;
     int has_random;
     uint8_t random_data[16];
+    uint32_t uid, euid, gid, egid, secureexec;
 };
 
 static enum kernel_elf_image_status cleanup_space(
@@ -385,6 +386,9 @@ static enum kernel_elf_image_status prepare_stack_layout(
     size_t index;
 
     *layout = *base;
+    layout->uid=request->uid; layout->euid=request->euid;
+    layout->gid=request->gid; layout->egid=request->egid;
+    layout->secureexec=request->secureexec;
     layout->arguments = request->arguments;
     layout->argument_count = request->argument_count;
     if (layout->argument_count == 0U) {
@@ -656,11 +660,11 @@ static enum kernel_elf_image_status build_stack(
     POPULATE_AUXILIARY(9U, layout->main_entry);
     POPULATE_AUXILIARY(16U, ARCH_ELF_HWCAP);
     POPULATE_AUXILIARY(17U, KERNEL_ELF_CLKTCK);
-    POPULATE_AUXILIARY(11U, 0U);
-    POPULATE_AUXILIARY(12U, 0U);
-    POPULATE_AUXILIARY(13U, 0U);
-    POPULATE_AUXILIARY(14U, 0U);
-    POPULATE_AUXILIARY(23U, 0U);
+    POPULATE_AUXILIARY(11U, layout->uid);
+    POPULATE_AUXILIARY(12U, layout->euid);
+    POPULATE_AUXILIARY(13U, layout->gid);
+    POPULATE_AUXILIARY(14U, layout->egid);
+    POPULATE_AUXILIARY(23U, layout->secureexec);
     if (layout->has_random) {
         POPULATE_AUXILIARY(25U, layout->random_address);
     }

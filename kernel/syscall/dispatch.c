@@ -121,6 +121,12 @@
 #define LINUX_SYSCALL_WAIT4 260U
 #define LINUX_SYSCALL_PRLIMIT64 261U
 #define LINUX_SYSCALL_CAPGET 90U
+#define LINUX_SYSCALL_CAPSET 91U
+#define LINUX_SYSCALL_PRCTL 167U
+#define LINUX_SYSCALL_SETREGID 143U
+#define LINUX_SYSCALL_SETFSGID 152U
+#define LINUX_SYSCALL_GETGROUPS 158U
+#define LINUX_SYSCALL_SETGROUPS 159U
 #define LINUX_SYSCALL_NEWFSTATAT 79U
 #define LINUX_SYSCALL_STATX 291U
 #define LINUX_SYSCALL_FACCESSAT 48U
@@ -528,6 +534,16 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_CAPGET) {
         if (syscall_handle_capget(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_CAPSET) {
+        if (syscall_handle_capset(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_PRCTL) {
+        if (syscall_handle_prctl(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if ((request->number>=LINUX_SYSCALL_SETREGID && request->number<=LINUX_SYSCALL_SETFSGID) ||
+               request->number==LINUX_SYSCALL_GETGROUPS || request->number==LINUX_SYSCALL_SETGROUPS) {
+        if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_PRLIMIT64) {
         if (syscall_handle_prlimit64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
@@ -687,11 +703,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_GETEUID ||
                request->number == LINUX_SYSCALL_GETGID ||
                request->number == LINUX_SYSCALL_GETEGID) {
-        /* Every task currently runs as immutable root, including after
-         * fork/clone and exec. Credential-changing calls remain unsupported;
-         * introducing mutable credentials must replace these queries too. */
-        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded.value = 0;
+        if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_GETTID) {
         task_status = kernel_task_tid(caller, &id);
         if (task_status != KERNEL_TASK_STATUS_OK) {

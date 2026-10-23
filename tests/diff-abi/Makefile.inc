@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/mremap.c tests/diff-abi/selected.c tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/core_limit.c tests/diff-abi/fsize.c tests/diff-abi/capability.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c tests/diff-abi/waitid.c tests/diff-abi/usage.c tests/diff-abi/cpu_clock.c tests/diff-abi/itimer.c
+DIFF_ABI_SOURCES := tests/diff-abi/credential_consumers.c tests/diff-abi/credentials.c tests/diff-abi/mremap.c tests/diff-abi/selected.c tests/diff-abi/sigreturn.c tests/diff-abi/fault_count.c tests/diff-abi/exec_boundaries.c tests/diff-abi/boundaries.c tests/diff-abi/path_only.c tests/diff-abi/sched_stat.c tests/diff-abi/sched_policy.c tests/diff-abi/rt_controls.c tests/diff-abi/session.c tests/diff-abi/random.c tests/diff-abi/coarse.c tests/diff-abi/cases.c tests/diff-abi/environment.c tests/diff-abi/child_tid.c tests/diff-abi/statx.c tests/diff-abi/exec_script.c tests/diff-abi/mknod.c tests/diff-abi/proc.c tests/diff-abi/tmpfs.c tests/diff-abi/tmpfs_options.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/hardlink.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/core_limit.c tests/diff-abi/fsize.c tests/diff-abi/capability.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/ownership.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c tests/diff-abi/socket.c tests/diff-abi/shm.c tests/diff-abi/waitid.c tests/diff-abi/usage.c tests/diff-abi/cpu_clock.c tests/diff-abi/itimer.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -267,3 +267,39 @@ build/loongarch/common-io-la: ABI_FOCUSED_FLAGS := -DABI_COMMON_IO_ONLY
 build/loongarch/mremap-la build/loongarch/proc-la build/loongarch/common-io-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/diff-abi/Makefile.inc tests/common/user.ld
 	@mkdir -p $(@D)
 	$(LA_CC) $(LA_FLAGS) $(ABI_FOCUSED_FLAGS) -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+# Credential transitions use isolated children so every group begins as root.
+build/diff-abi/credentials-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_CREDENTIALS_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/credentials-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_CREDENTIALS_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+build/diff-abi/credential-consumers-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/credential-consumers-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+build/diff-abi/credential-consumers-loop-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -DABI_CREDENTIAL_CONSUMER_LOOP -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/credential-consumers-loop-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -DABI_CREDENTIAL_CONSUMER_LOOP -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+build/diff-abi/credential-access-override-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -DABI_CREDENTIAL_ACCESS_OVERRIDE -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/credential-access-override-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -DABI_CREDENTIAL_ACCESS_OVERRIDE -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+
+build/diff-abi/credential-signal-target-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -DABI_CREDENTIAL_SIGNAL_TARGET -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES)
+build/loongarch/credential-signal-target-la: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/user.ld tests/diff-abi/Makefile.inc
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_CREDENTIAL_CONSUMERS_ONLY -DABI_CREDENTIAL_SIGNAL_TARGET -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)

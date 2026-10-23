@@ -9,7 +9,8 @@
 | `kernel/exec.c`、`include/kernel/exec.h` | 捕获用户路径/argv/envp，打开可执行文件，解析并持有主程序和解释器 source，管理准备期 owner |
 | `kernel/exec_image.c`、`kernel/elf_image.c` | 将 source 变成 MM、入口 PC、SP、VMA、栈和 auxv；页表操作构建期绑定 |
 | `include/arch/elf.h`、`include/arch/task.h` | machine/HWCAP/trampoline 与初始、clone、exec 寄存器操作 |
-| `kernel/sched/exec.c` | 在不可返回提交点切换架构地址空间、替换 MM、重建 Trap Frame 并处理 close-on-exec |
+| `kernel/sched/exec.c` | 撤下 CLOEXEC 后一致发布 MM 与凭据，重建 Trap Frame 并处理旧资源 |
+| `kernel/exec_credentials.c` | 从实际执行 ELF 的属性计算 set-ID、文件 capability、AT_SECURE 和 dumpable |
 | `kernel/syscall/process.c`、`arch/riscv/trap.c` | 解码 syscall 221 和提交动作 |
 
 通用入口 `kernel_execve_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA已通过内存reader、PCI根盘、原版LP64S静态和LP64D动态musl同一image/exec契约的双侧验收。
@@ -26,13 +27,28 @@
 -> 按 #! 转换解释器与 argv，最多五次
 -> 建立一次解析的主 ELF source
 -> 若有 PT_INTERP，解析并打开唯一解释器 source
--> 构造新 MM、source-backed VMA、栈和 auxv
+-> 从已打开的最终主 ELF 取得 mode/owner/filecap，计算候选凭据
+-> 构造新 MM、source-backed VMA、栈和含候选身份的 auxv
 -> 发布 PREPARED
 ```
 
-主程序支持 RISC-V `ET_EXEC` 和 `ET_DYN`；解释器支持非递归 `ET_EXEC`/`ET_DYN`。动态 source 的 `PT_DYNAMIC`/`PT_TLS` 等元数据留给用户动态链接器。主文件格式或架构错误映射为 `-ENOEXEC`；解释器路径不存在时保留路径 errno，不足64字节的解释器header按Linux elf_read返回 `-EIO`，完整header的格式或架构不正确映射为 `-ELIBBAD`；资源、I/O 和参数限制分别返回 `-ENOMEM`、`-EIO`、`-E2BIG`。解析、打开或构造失败时旧进程映像完全不变。
+主程序支持 RISC-V `ET_EXEC` 和 `ET_DYN`；解释器支持非递归 `ET_EXEC`/`ET_DYN`。动态 source 的 `PT_DYNAMIC`/`PT_TLS` 等元数据留给用户动态链接器。主文件格式或架构错误映射为 `-ENOEXEC`；解释器路径不存在时保留路径 errno，不足64字节的解释器header按Linux elf_read返回 `-EIO`，完整header的格式或架构不正确映射为 `-ELIBBAD`；资源、I/O 和参数限制分别返回 `-ENOMEM`、`-EIO`、`-E2BIG`。解析、打开或构造失败时保留旧 MM、凭据、dumpable 和 FD 状态。
 
 事务中的 `executable_file`/`interpreter_file` 是 source 创建前的 OFD owners；source 创建成功后由 source 持有 OFD，事务改为持有 source owner。映像构造给 MM 增加各 source 的引用，事务在提交后释放自己的引用。解析、打开或真实 VFS/I/O 清理失败时保留准确 owner；物理页、VMA metadata 和堆的合法释放完成即结束，分配器不变量错误进入 fatal。参数字符串、向量和路径的纯堆清理直接释放并清空指针，不生成 `CLEANUP_REQUIRED`；重试只处理仍持有的 MM、source 或 OFD。
+
+## 执行凭据
+
+主 ELF 的执行租约固定实际 inode；凭据计算从该对象取得一致的 mode/uid/gid 和 `security.capability`。脚本自身的 set-ID 位忽略，脚本展开后的 ELF 才是身份来源；`PT_INTERP` 负责加载，自己的 set-ID 或 capability 不替代主 ELF。主程序或解释器不可读时，另行降低新映像的 dumpable。
+
+ext4 文件 capability 通过已打开 inode 读取，支持 inode 内与外部 EA，以及 revision 1/2/3 的 12/20/24 字节布局。格式错误返回 EINVAL，实际读取错误按原错误返回；initial namespace 中 rev3 的非零 rootid 按无有效属性处理。有效的全零属性仍会清除 ambient。
+
+普通执行也把 saved/fs IDs 设为最终 effective IDs。setuid 使用文件 UID，setgid 还要求组执行位；`MS_NOSUID` 和 NNP 抑制 set-ID。文件 capability 的 permitted 组合为 `(B & file_P) | (I & file_I)`，随后按 root 兼容规则、securebits、NNP 和共享 FS 状态处理，再加入保留的 ambient。bounding 只约束 file_P 分支；带 effective 标志且所需 file_P 得不到满足时返回 EPERM。exec 清除 KEEP_CAPS 值并保留其锁定位。
+
+`AT_UID/AT_EUID/AT_GID/AT_EGID` 来自候选身份，`AT_SECURE` 表示安全装载要求。dumpable 独立计算：旧的 real/effective 身份关系、主程序和解释器可读性、effective/fs IDs 变化以及 permitted 增益共同决定结果。两者可不同，例如 NNP 抑制文件 capability 增益后仍可能要求安全装载，而新映像可以保持 dumpable。
+
+dumpable 保存在任务持有的小型执行安全对象中：共享 MM 的线程和 vfork 子进程共用该对象，fork 复制当前值，exec 准备独立对象并与新 MM、凭据一同发布。任务退出后立即归还页表和映射；执行安全对象保留到最后一个任务或查询借用结束，因此僵尸和已退出组长的 proc 属主仍反映共享者后续的 dumpable 修改。
+
+准备期间，FS record 在已有 VFS 状态保护下统计共享任务：存在组外共享者时按 unsafe exec 限制权限增益；仅组内共享时登记 `exec_users`，阻止新的 CLONE_FS 加入。成功、准备失败和执行线程退出都归还该登记，早于释放线程的 FS owner。非组长 exec 保留执行线程自己的凭据和 NNP。
 
 ## 映像和初始状态
 
@@ -52,11 +68,10 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 
 ```text
 旧 MM 上完成 robust-list、清 TID 并注销活跃 MM 使用者
--> 切换 new satp
--> 将 old MM 移入待清理 owner
--> 安装新 MM 和缓存 satp
--> 清零并重建 Trap Frame
--> 摘除 FD_CLOEXEC
+-> 撤下所有 FD_CLOEXEC 槽，保留尚待清理的 OFD owner
+-> 激活新地址空间
+-> 在调度短锁内将 old MM 移入待清理 owner，同时发布新 MM 与候选凭据
+-> 安装缓存地址空间信息，清零并重建 Trap Frame
 -> 清理 old MM、source 和事务 owner
 -> sret 到新入口
 ```
@@ -72,7 +87,9 @@ make test-glibc-riscv
 make test-riscv
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵、`execveat`、凭据变化、写入文件的一致性尚未完成；LA原版动态musl/初始及late DSO TLS已双侧验证。有效参数的指针表及 auxv 也计入 128 KiB 序列化限制，超限返回 E2BIG，构造不发布新 MM、也不执行 CLOEXEC；`test-elf-boundary-riscv/loongarch` 对照失败后 PID、数据及 CLOEXEC owner 保持。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵与 `execveat` 留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。有效参数的指针表及 auxv 也计入 128 KiB 序列化限制，超限返回 E2BIG，构造不发布新 MM、也不执行 CLOEXEC；`test-elf-boundary-riscv/loongarch` 对照失败后 PID、数据及 CLOEXEC owner 保持。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+
+凭据规则的宿主直接反例使用 `sh tests/credentials-host.sh`，覆盖 4/16 KiB 页配置和候选／账户归还。`tests/workloads/credentials/exec.c` 用同一真实 ELF 检查 set-ID、filecap、auxv、安全加载、失败 exec、非组长 exec、CLONE_FS、CLOEXEC 与权限清除；`tests/credentials-fixture.py` 向独立 ext4 测试盘写入数字 UID/GID 和固定 EA 样本，并读回校验。固定 Linux 对照须启用 `CONFIG_EXT4_FS_SECURITY`，否则 ext4 不提供文件 capability 属性。
 
 ## 脚本执行
 
