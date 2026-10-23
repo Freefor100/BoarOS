@@ -1076,33 +1076,6 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
             signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_CONTINUE);
 }
 
-/* The caller keeps the target alive by execution or a lookup/cursor borrow.
- * Only a distinct group container needs another cross-unlock storage owner. */
-static struct kernel_task *signal_send_leader(struct kernel_task *target,
-                                             struct kernel_task **borrowed,struct kernel_pid **identity,
-                                             uint64_t *thread_generation)
-{
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_task *leader = target ? target->group_leader : 0;
-    if (!leader || leader->retirement || leader->group_leader != leader) return 0;
-    if(identity) {
-        *identity=process_identity(leader,KERNEL_PID_TGID);
-        if(!*identity)return 0;
-        kernel_pid_get(*identity);
-    }
-    if(thread_generation) {
-        struct kernel_pid *id=process_identity(target,KERNEL_PID_TID);
-        if(!id)return 0;
-        if(*thread_generation && *thread_generation!=id->generation)return 0;
-        *thread_generation=id->generation;
-    }
-    if (leader != target) {
-        scheduler_task_get_locked(leader);
-        *borrowed = leader;
-    }
-    return leader;
-}
-
 static int signal_permitted_locked(struct kernel_task *caller,struct kernel_task *target,unsigned sig)
 {
     if(!caller || caller->group_leader==target->group_leader)return 1;
@@ -1120,18 +1093,46 @@ static enum kernel_signal_status signal_send_one(
     const struct kernel_signal_wait_info *provided, int queued, uint64_t thread_generation)
 {
     if (!target || !sig || sig>KERNEL_SIGNAL_COUNT) return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
-    struct kernel_task *sender=(sender_tid || provided) && code<=0?kernel_task_current():0;
-    if(sender && sender!=target) {
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if(!signal_permitted_locked(sender,target,sig))return KERNEL_SIGNAL_STATUS_PERMISSION;
-    }
+    struct kernel_task *executing=kernel_task_current();
+    struct kernel_task *sender=(sender_tid || provided) && code<=0?executing:0;
     struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
     struct kernel_signal_wait_info info={.signal=sig,.sender=(uint32_t)sender_tid,.code=code};
     struct kernel_pid *identity __attribute__((cleanup(kernel_task_identity_end)))=0;
     SCHEDULER_TASK_BORROW(group_owner,0);
-    struct kernel_task *leader=signal_send_leader(target,&group_owner,process_directed?&identity:0,
-        !process_directed && (sig>=32 || queued)?&thread_generation:0);
-    if(!leader)return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    if(process_directed || target!=executing) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        /* Authorize and acquire the identity/container in the same snapshot.
+         * Allocation may sleep, so publication still rechecks permission. */
+        if(sender && !signal_permitted_locked(sender,target,sig))
+            return KERNEL_SIGNAL_STATUS_PERMISSION;
+        struct kernel_task *leader=target->group_leader;
+        if(!leader || leader->retirement || leader->group_leader!=leader)
+            return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+        if(process_directed) {
+            identity=process_identity(leader,KERNEL_PID_TGID);
+            if(!identity)return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+            kernel_pid_get(identity);
+        } else if(sig>=32 || queued) {
+            struct kernel_pid *id=process_identity(target,KERNEL_PID_TID);
+            if(!id || (thread_generation && thread_generation!=id->generation))
+                return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+            thread_generation=id->generation;
+        }
+        /* The executing member already keeps its group container alive.
+         * A borrowed remote task only protects its storage, so retain its
+         * distinct group owner across unlocked preparation. */
+        if(leader!=target && target!=executing) {
+            scheduler_task_get_locked(leader);group_owner=leader;
+        }
+    }
+    /* The executing thread cannot change its TID/group or credentials
+     * until this call returns; no extra container or identity owner is needed.
+     * A supplied generation still identifies the original queued target. */
+    if(!process_directed && target==executing && thread_generation) {
+        struct kernel_pid *id=process_identity(target,KERNEL_PID_TID);
+        if(!id || thread_generation!=id->generation)
+            return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    }
     signal_prepare_group(target,sig);
     if(sig==SIGNAL_KILL) {process_group_request_exit(target,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return KERNEL_SIGNAL_STATUS_OK;}
     if(provided)info=*provided;
@@ -1201,7 +1202,10 @@ static enum kernel_signal_status signal_send_one(
         }
         if(fd_cursor.queue)kernel_wait_cursor_wake(&fd_cursor,1);
         signal_retarget_shared(actual,retarget);
-        if(wake_target && signal_wants_signal(wake_target,sig) && kernel_scheduler_wake_signal(wake_target))return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+        /* Publication already requests local signal handling. The current
+         * executor is running here and needs no external wait-token wake. */
+        if(wake_target && wake_target!=executing && signal_wants_signal(wake_target,sig) &&
+           kernel_scheduler_wake_signal(wake_target))return KERNEL_SIGNAL_STATUS_INVALID_STATE;
         return KERNEL_SIGNAL_STATUS_OK;
     }
 }
@@ -1451,8 +1455,11 @@ int64_t kernel_signal_send_thread(struct kernel_task *caller,
     if (tgid < 0 || tid <= 0) {
         return 0U;
     }
-    SCHEDULER_TASK_BORROW(borrow, kernel_signal_find_by_tid(tid));
-    target = borrow;
+    SCHEDULER_TASK_BORROW(borrow,0);
+    /* Execution owns this task and its TID until the syscall ends; remote
+     * lookup still takes a storage borrow and validates the requested group. */
+    if(caller==kernel_task_current() && caller->tid==tid)target=caller;
+    else target=borrow=kernel_signal_find_by_tid(tid);
     if (!signal_dispatchable(target) || target->group_leader == 0 ||
         (tgid != 0 && target->group_leader->tid != tgid)) {
         return 0U;
