@@ -3,8 +3,20 @@
 #include <stdlib.h>
 #include <poll.h>
 #include <time.h>
-static unsigned queue_perf;
-static pthread_barrier_t queue_all;
+static unsigned queue_perf,queue_perf_mode=3,queue_perf_rounds=1024;
+static int queue_diagnostics;
+static void queue_cost_command(const char *text)
+{
+    int fd=open("/proc/boaros_cost_control",O_WRONLY);CHECK(fd>=0);
+    CHECK(write(fd,text,strlen(text))==(ssize_t)strlen(text)&&!close(fd));
+}
+static void queue_cost_report(void)
+{
+    FILE *f=fopen("/proc/boaros_cost","r");CHECK(f);char bytes[1024];size_t n;
+    puts("QUEUED-DIAGNOSTICS BEGIN");while((n=fread(bytes,1,sizeof(bytes),f)))CHECK(fwrite(bytes,1,n,stdout)==n);
+    CHECK(!ferror(f)&&!fclose(f));puts("QUEUED-DIAGNOSTICS END");
+}
+static pthread_barrier_t queue_all,queue_ready;
 static uint64_t queue_clock(clockid_t clock)
 {struct timespec t;if(clock_gettime(clock,&t))_exit(45);return (uint64_t)t.tv_sec*1000000000+t.tv_nsec;}
 static unsigned queue_cpus;
@@ -40,6 +52,7 @@ static void *queue_exchange(void *argument)
         siginfo_t info={0},out;info.si_code=SI_KERNEL;info.si_value.sival_ptr=(void *)0x987;
         if(syscall(SYS_rt_sigqueueinfo,p->tid[side],p->signal,&info) || sigwaitinfo(&set,&out)!=p->signal || out.si_code!=SI_KERNEL || out.si_value.sival_ptr!=(void *)0x987)_exit(44);
     }
+    if(queue_diagnostics)queue_gate(&queue_ready);
     queue_gate(queue_perf?&queue_all:&p->gate);
     p->cpu[side]=queue_clock(CLOCK_THREAD_CPUTIME_ID);p->begin[side]=queue_clock(CLOCK_MONOTONIC);
     for(unsigned i=0;i<p->rounds;i++) {
@@ -65,27 +78,31 @@ static void queued_threads(void)
     CHECK(queue_cpus>0);if(!queue_cpus)return;
     sigset_t set,old;sigemptyset(&set);for(unsigned i=0;i<4;i++)sigaddset(&set,SIGRTMIN+8+(int)i);CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
     for(unsigned mode=0;mode<(queue_perf?3U:4U);mode++) {
+        if(queue_perf&&queue_perf_mode<3&&mode!=queue_perf_mode)continue;
         if(queue_perf)CHECK(!pthread_barrier_init(&queue_all,0,9));
+        if(queue_diagnostics)CHECK(!pthread_barrier_init(&queue_ready,0,9));
         struct queue_pair pairs[4];struct queue_actor actors[8];pthread_t threads[8];
         for(unsigned i=0;i<4;i++) {
-            pairs[i]=(struct queue_pair){.signal=SIGRTMIN+8+(int)i,.mode=(int)mode,.id=i,.rounds=queue_perf?1024U:32U};
+            pairs[i]=(struct queue_pair){.signal=SIGRTMIN+8+(int)i,.mode=(int)mode,.id=i,.rounds=queue_perf?queue_perf_rounds:32U};
             CHECK(!pthread_barrier_init(&pairs[i].gate,0,2));
             for(unsigned side=0;side<2;side++){unsigned n=i*2+side;actors[n]=(struct queue_actor){&pairs[i],side};CHECK(!pthread_create(&threads[n],0,queue_exchange,&actors[n]));}
         }
-        if(queue_perf){queue_gate(&queue_all);queue_gate(&queue_all);}
+        if(queue_perf){if(queue_diagnostics)queue_gate(&queue_ready);if(queue_diagnostics)queue_cost_command("begin\n");queue_gate(&queue_all);queue_gate(&queue_all);}
         for(unsigned i=0;i<8;i++)CHECK(!pthread_join(threads[i],0));
+        if(queue_diagnostics)queue_cost_command("end\n");
         for(unsigned i=0;i<4;i++)CHECK(!pthread_barrier_destroy(&pairs[i].gate));
         if(!queue_perf)printf("QUEUED THREADS mode=%u cpus=%u OK\n",mode,queue_cpus);
         else {
             uint64_t begin=UINT64_MAX,end=0,cpu=0,samples[4096];unsigned n=0;
             for(unsigned i=0;i<4;i++){
                 for(unsigned side=0;side<2;side++){if(pairs[i].begin[side]<begin)begin=pairs[i].begin[side];if(pairs[i].end[side]>end)end=pairs[i].end[side];cpu+=pairs[i].cpu[side];}
-                for(unsigned j=0;j<1024;j++)samples[n++]=pairs[i].latency[j];
+                for(unsigned j=0;j<queue_perf_rounds;j++)samples[n++]=pairs[i].latency[j];
             }
             qsort(samples,n,sizeof(*samples),queue_compare);struct rusage usage;CHECK(!getrusage(RUSAGE_SELF,&usage));
-            printf("QUEUED-PERF mode=%s exchanges=4096 messages=8192 ns=%llu p50=%llu p95=%llu max=%llu cpu_ns=%llu rss_kib=%ld\n",
-                mode==0?"sigwaitinfo":mode==1?"signalfd":"epoll",(unsigned long long)(end-begin),(unsigned long long)samples[n/2],(unsigned long long)samples[n*95/100],(unsigned long long)samples[n-1],(unsigned long long)cpu,usage.ru_maxrss);
+            printf("QUEUED-PERF mode=%s exchanges=%u messages=%u ns=%llu p50=%llu p95=%llu max=%llu cpu_ns=%llu rss_kib=%ld\n",
+                mode==0?"sigwaitinfo":mode==1?"signalfd":"epoll",4*queue_perf_rounds,8*queue_perf_rounds,(unsigned long long)(end-begin),(unsigned long long)samples[n/2],(unsigned long long)samples[n*95/100],(unsigned long long)samples[n-1],(unsigned long long)cpu,usage.ru_maxrss);
             CHECK(!pthread_barrier_destroy(&queue_all));
+            if(queue_diagnostics){CHECK(!pthread_barrier_destroy(&queue_ready));queue_cost_report();}
         }
     }
     CHECK(!sigprocmask(SIG_SETMASK,&old,0));

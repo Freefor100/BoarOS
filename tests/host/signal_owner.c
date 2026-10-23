@@ -143,9 +143,9 @@ void signal_owner_cases(unsigned *lock_calls)
     puts("SIGCHLD: blocked default stop policy, protected pending payload and common ABI encoding passed");
     /* The caller's real target owner already covers a self-representing
      * leader; a distinct group container still needs a cross-unlock borrow. */
-    assert(signal_send_leader(&leader, &extra,0) == &leader && !extra);
+    assert(signal_send_leader(&leader, &extra,0,0) == &leader && !extra);
     assert(!leader.storage_borrows);
-    assert(signal_send_leader(&member, &extra,0) == &leader && extra == &leader);
+    assert(signal_send_leader(&member, &extra,0,0) == &leader && extra == &leader);
     assert(leader.storage_borrows == 1);
     scheduler_task_put(extra);
     assert(!leader.storage_borrows);
@@ -156,6 +156,11 @@ void signal_owner_cases(unsigned *lock_calls)
     assert(*lock_calls <= 1);
     scheduler_task_put(result);
     assert(!leader.storage_borrows && !member.storage_borrows);
+    leader.proc_exiting = 1;
+    result = signal_group_representative_get(&member);
+    assert(result == &member);
+    scheduler_task_put(result);
+    leader.proc_exiting = 0;
     leader.state = KERNEL_THREAD_STATE_GROUP_DEAD;
     result = signal_group_representative_get(&member);
     assert(result == &member && member.storage_borrows == 1 && !leader.storage_borrows);

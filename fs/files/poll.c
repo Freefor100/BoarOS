@@ -9,6 +9,7 @@
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
+#include <kernel/signal_fd.h>
 #include <kernel/socket.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
@@ -290,6 +291,7 @@ static int core_poll_run(
             if (kernel_open_file_kind(pinned[i]) == KERNEL_OPEN_FILE_KIND_EPOLL)
                 (void)kernel_epoll_wait_pending(pinned[i], &queue);
             else (void)kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
+            nodes[i].event_mask=kernel_signal_fd_mask(pinned[i]);
             if (queue && kernel_wait_node_bind(queue, &nodes[i], &token) != KERNEL_SCHEDULER_STATUS_OK) {
                 error = -KERNEL_EIO;
                 break;

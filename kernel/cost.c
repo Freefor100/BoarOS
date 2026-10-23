@@ -226,11 +226,12 @@ void kernel_cost_page_metadata(struct kernel_cost_tag tag, uint64_t checked,
     record(tag, COST_ALLOCATOR_META_TICKS, ticks);
     observer(start);
 }
-void kernel_cost_raw_lock(struct kernel_cost_tag tag, uint64_t wait, uint64_t hold)
+void kernel_cost_raw_lock(struct kernel_cost_tag tag, unsigned rank, uint64_t wait, uint64_t hold)
 {
     ATOMIC_SCOPE;
     if (!cost.active || !tag.epoch || tag.epoch != cost.epoch) return;
     uint64_t start = kernel_cost_clock();
+    if(rank==40) { record(tag,COST_RAW_SCHED_WAIT,wait);record(tag,COST_RAW_SCHED_HOLD,hold); }
     record(tag, COST_RAW_WAIT_TICKS, wait);
     record(tag, COST_RAW_HOLD_TICKS, hold);
     observer(start);

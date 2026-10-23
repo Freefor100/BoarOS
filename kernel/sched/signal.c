@@ -28,7 +28,7 @@ void kernel_signal_encode_info(void *output, const struct kernel_signal_wait_inf
 
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *, uint32_t, kernel_pid_t, int, int16_t,
-    const struct kernel_signal_wait_info *, int queued);
+    const struct kernel_signal_wait_info *, int queued, uint64_t thread_generation);
 
 static struct kernel_task *real_timers;
 static struct kernel_task *cpu_timers;
@@ -360,7 +360,7 @@ static struct kernel_task *signal_group_representative_get(struct kernel_task *t
         if (!leader || leader->retirement || leader->group_leader != leader) return 0;
         /* 组长可接收时，发现与取得唯一结果借用在同一保护下完成；
          * 不另建只用来再次发现同一组长的游标owner。 */
-        if (signal_dispatchable_locked(leader)) {
+        if (!leader->proc_exiting && signal_dispatchable_locked(leader)) {
             scheduler_task_get_locked(leader);
             return leader;
         }
@@ -371,7 +371,7 @@ static struct kernel_task *signal_group_representative_get(struct kernel_task *t
     while (cursor.task) {
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (cursor.task->group_leader == cursor.leader && signal_dispatchable_locked(cursor.task)) {
+            if (cursor.task->group_leader == cursor.leader && !cursor.task->proc_exiting && signal_dispatchable_locked(cursor.task)) {
                 result = cursor.task;
                 scheduler_task_get_locked(result);
             }
@@ -438,7 +438,9 @@ static enum kernel_signal_status signal_alloc_table(
     table->magic = KERNEL_SIGNAL_TABLE_MAGIC;
     table->references = 1U;
     kernel_wait_queue_init(&table->signalfd_waiters);
-    task->signal_table_address = (uintptr_t)page;
+    /* 远端发送者在同一保护下取得已完整初始化的信号状态。 */
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+      task->signal_table_address = (uintptr_t)page; }
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -787,7 +789,9 @@ int kernel_signal_fd_take(struct kernel_task *task,const uint64_t *mask,
             sig=signal_take_locked(task,*mask,info,&p,&rearm);
             if (!sig) {
                 if (nonblock) return -KERNEL_EAGAIN;
+                COST_ADD(SIGNAL_FD_PARKS,1);
                 if (kernel_wait_prepare_locked(queue,0,1,&token)) __builtin_trap();
+                kernel_wait_default_node(task)->event_mask=mask;
             }
         }
         signal_pending_finish(&p);
@@ -886,7 +890,7 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
         info.user_time/=UINT64_C(10000000);info.system_time/=UINT64_C(10000000);
     }
     if (representative)
-        (void)signal_send_one(representative, 17, child->tid, 1, code, &info, 0);
+        (void)signal_send_one(representative, 17, child->tid, 1, code, &info, 0, 0);
 }
 
 void kernel_signal_notify_child_exit(struct kernel_task *child)
@@ -1091,7 +1095,8 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
 /* The caller keeps the target alive by execution or a lookup/cursor borrow.
  * Only a distinct group container needs another cross-unlock storage owner. */
 static struct kernel_task *signal_send_leader(struct kernel_task *target,
-                                             struct kernel_task **borrowed,struct kernel_pid **identity)
+                                             struct kernel_task **borrowed,struct kernel_pid **identity,
+                                             uint64_t *thread_generation)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *leader = target ? target->group_leader : 0;
@@ -1100,6 +1105,12 @@ static struct kernel_task *signal_send_leader(struct kernel_task *target,
         *identity=process_identity(leader,KERNEL_PID_TGID);
         if(!*identity)return 0;
         kernel_pid_get(*identity);
+    }
+    if(thread_generation) {
+        struct kernel_pid *id=process_identity(target,KERNEL_PID_TID);
+        if(!id)return 0;
+        if(*thread_generation && *thread_generation!=id->generation)return 0;
+        *thread_generation=id->generation;
     }
     if (leader != target) {
         scheduler_task_get_locked(leader);
@@ -1111,14 +1122,15 @@ static struct kernel_task *signal_send_leader(struct kernel_task *target,
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid,
     int process_directed, int16_t code,
-    const struct kernel_signal_wait_info *provided, int queued)
+    const struct kernel_signal_wait_info *provided, int queued, uint64_t thread_generation)
 {
     if (!target || !sig || sig>KERNEL_SIGNAL_COUNT) return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
     struct kernel_signal_wait_info info={.signal=sig,.sender=(uint32_t)sender_tid,.code=code};
     struct kernel_pid *identity __attribute__((cleanup(kernel_task_identity_end)))=0;
     SCHEDULER_TASK_BORROW(group_owner,0);
-    struct kernel_task *leader=signal_send_leader(target,&group_owner,process_directed?&identity:0);
+    struct kernel_task *leader=signal_send_leader(target,&group_owner,process_directed?&identity:0,
+        !process_directed && (sig>=32 || queued)?&thread_generation:0);
     if(!leader)return KERNEL_SIGNAL_STATUS_INVALID_STATE;
     signal_prepare_group(target,sig);
     if(sig==SIGNAL_KILL) {process_group_request_exit(target,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return KERNEL_SIGNAL_STATUS_OK;}
@@ -1155,9 +1167,17 @@ static enum kernel_signal_status signal_send_one(
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             /* Allocation can sleep through representative exit or nonleader
              * exec. Re-resolve the same held identity, never a recycled PID. */
-            if(process_directed && (!signal_dispatchable_locked(actual) || actual->group_leader!=group ||
+            if(process_directed && (actual->proc_exiting || !signal_dispatchable_locked(actual) || actual->group_leader!=group ||
                 !identity->members[KERNEL_PID_TGID] || identity->members[KERNEL_PID_TGID]->task!=group))continue;
-            if(!process_directed&&!signal_dispatchable_locked(actual))return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+            if(!process_directed) {
+                /* 任务借用保活存储；代次核对识别分配期间 exec 更换
+                 * TID，无需为不跨解锁访问的 PID 对象另增引用。 */
+                struct kernel_pid *id=process_identity(actual,KERNEL_PID_TID);
+                if(thread_generation && (!id || id->generation!=thread_generation))
+                    return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+                if(!signal_dispatchable_locked(actual))return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+                if(actual->proc_exiting)return KERNEL_SIGNAL_STATUS_OK;
+            }
             if(process_directed && (!wake_target || wake_target->group_leader!=group || !signal_wants_signal_locked(wake_target,sig))) {
                 wake_target=0;retarget=signal_mask(sig);
             }
@@ -1166,7 +1186,7 @@ static enum kernel_signal_status signal_send_one(
             if(posted<0)return KERNEL_SIGNAL_STATUS_QUEUE_FULL;
             if(posted>0)return KERNEL_SIGNAL_STATUS_OK;
             struct kernel_signal_table *table=signal_table_of(actual);
-            if(table)(void)kernel_wait_cursor_prepare_locked(&table->signalfd_waiters,&fd_cursor,1);
+            if(table)(void)kernel_wait_cursor_prepare_event_locked(&table->signalfd_waiters,&fd_cursor,signal_mask(sig),process_directed?0:actual);
 #if BOAROS_USER_SMP
             scheduler_signal_request_locked(wake_target);
 #endif
@@ -1187,38 +1207,38 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
     if (representative == 0) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
-    return signal_send_one(representative, sig, sender_tid, 1, 0, 0, 0);
-}
-
-static enum kernel_signal_status signal_send_info(struct kernel_task *target,int shared,
-    const struct kernel_signal_wait_info *info)
-{
-    if(!shared)return signal_send_one(target,info->signal,info->sender,0,info->code,info,1);
-    SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(target));
-    /* A live zombie identity accepts the signal without creating a record. */
-    return representative ? signal_send_one(representative,info->signal,info->sender,1,info->code,info,1)
-        : KERNEL_SIGNAL_STATUS_OK;
+    return signal_send_one(representative, sig, sender_tid, 1, 0, 0, 0, 0);
 }
 
 int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
     const struct kernel_signal_wait_info *info)
 {
-    SCHEDULER_TASK_BORROW(target,scheduler_task_lookup(pid,KERNEL_PID_TID,0));
-    if(!target)return -KERNEL_ESRCH;
+    SCHEDULER_TASK_BORROW(target,0);
+    uint64_t generation;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        target=scheduler_task_lookup_locked(pid,KERNEL_PID_TID,0);
+        if(!target)return -KERNEL_ESRCH;
+        generation=process_identity(target,KERNEL_PID_TID)->generation;
         if(!target->group_leader || (thread && target->group_leader->tid!=group))return -KERNEL_ESRCH;
         if(info->signal>KERNEL_SIGNAL_COUNT)return -KERNEL_EINVAL;
         if(!info->signal || (thread && !signal_dispatchable_locked(target)))return 0;
     }
-    enum kernel_signal_status status=signal_send_info(target,!thread,info);
+    enum kernel_signal_status status;
+    if(thread)status=signal_send_one(target,info->signal,info->sender,0,info->code,info,1,generation);
+    else {
+        SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(target));
+        /* A live zombie identity accepts the signal without creating a record. */
+        status=representative?signal_send_one(representative,info->signal,info->sender,1,info->code,info,1,0)
+            :KERNEL_SIGNAL_STATUS_OK;
+    }
     return status==KERNEL_SIGNAL_STATUS_OK?0:status==KERNEL_SIGNAL_STATUS_QUEUE_FULL?-KERNEL_EAGAIN:-KERNEL_ESRCH;
 }
 
 enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, uint32_t sig)
 {
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(target));
-    return representative ? signal_send_one(representative, sig, 0, 1, 128, 0, 0)
+    return representative ? signal_send_one(representative, sig, 0, 1, 128, 0, 0, 0)
         : KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
 }
 
@@ -1230,7 +1250,7 @@ void kernel_signal_timer_expire(void)
         struct kernel_task *leader = real_timers;
         real_timer_remove(leader);
         SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
-        if (representative && signal_send_one(representative, 14U, 0, 1, 128, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
+        if (representative && signal_send_one(representative, 14U, 0, 1, 128, 0, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
             __builtin_trap();
     }
     for (struct kernel_task *leader = cpu_timers, *next; leader; leader = next) {
@@ -1254,7 +1274,7 @@ void kernel_signal_timer_expire(void)
         if (!representative) continue;
         for (unsigned i = 0; i < 2; ++i)
             if ((fired & (1U << i)) &&
-                signal_send_one(representative, 26U + i, 0, 1, 128, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
+                signal_send_one(representative, 26U + i, 0, 1, 128, 0, 0, 0) != KERNEL_SIGNAL_STATUS_OK)
                 __builtin_trap();
     }
 }
@@ -1262,7 +1282,7 @@ void kernel_signal_timer_expire(void)
 enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid)
 {
-    return signal_send_one(target, sig, sender_tid, 0, -6, 0, 0);
+    return signal_send_one(target, sig, sender_tid, 0, -6, 0, 0, 0);
 }
 
 enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *target)
@@ -1270,7 +1290,7 @@ enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *targ
     kernel_pid_t sender;
     if (kernel_task_tgid(target, &sender) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SIGNAL_STATUS_INVALID_STATE;
-    return signal_send_one(target, 25U, sender, 0, 0, NULL, 0);
+    return signal_send_one(target, 25U, sender, 0, 0, NULL, 0, 0);
 }
 
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
@@ -1295,7 +1315,7 @@ static uint32_t signal_target_group(struct kernel_task *leader, uint32_t sig,
     if (!deliver) return 1;
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(leader));
     if (!representative) return 1;
-    return signal_send_one(representative, sig, sender, 1, 0, 0, 0) == KERNEL_SIGNAL_STATUS_OK;
+    return signal_send_one(representative, sig, sender, 1, 0, 0, 0, 0) == KERNEL_SIGNAL_STATUS_OK;
 }
 
 static uint32_t signal_target_identities(struct kernel_task *caller, int64_t pid,

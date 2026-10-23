@@ -364,11 +364,14 @@ static int known_signal_info(unsigned sig,int code)
 enum kernel_syscall_status syscall_handle_sigqueueinfo(struct kernel_task *caller,
     const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     int thread=request->number==240;
     int64_t group=syscall_signal_pid(request->arguments[0]);
     int64_t pid=thread?syscall_signal_pid(request->arguments[1]):group;
     unsigned sig=(uint32_t)request->arguments[thread?2:1];
+    /* 实时排队与目标存储由共同状态保护；stop/continue 等控制信号
+     * 仍在 CPU0 完成进程控制。 */
+    KERNEL_SERVICE_SCOPE_IF(service,sig<32 || sig>64);
+    COST_SCOPE(cost,SIGNAL_ENQUEUE);
     uint64_t address=request->arguments[thread?3:2];
     struct kernel_signal_wait_info info={0};struct kernel_mm *mm;
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;

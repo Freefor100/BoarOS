@@ -123,7 +123,7 @@ def run_smp(args):
                     if altstack:
                         lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('ALTSTACK CASE ') or line.startswith('ALTSTACK END ')]
                         expected[-2]='ALTSTACK CASE copy-races '+('OK' if target=='boaros' and args.observe and cpus>1 else 'SKIP')
-                    if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
+                    if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     passed=lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
                     if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued:
@@ -149,10 +149,10 @@ def run_smp(args):
                         active=[row for row in observations if row[0]<cpus]
                         passed=passed and len(active)==cpus and {row[0] for row in active}==set(range(cpus)) and all(all(row[1:]) for row in active) and all(not any(row[1:]) for row in observations if row[0]>=cpus)
                     if target=='boaros' and args.observe and queued:
-                        observations=[[int(v,16) for v in row] for row in re.findall(r'QUEUED caller cpu=(0x[0-9a-f]+) waits=(0x[0-9a-f]+) reads=(0x[0-9a-f]+) queries=(0x[0-9a-f]+)',raw)]
+                        observations=[[int(v,16) for v in row] for row in re.findall(r'QUEUED caller cpu=(0x[0-9a-f]+) waits=(0x[0-9a-f]+) reads=(0x[0-9a-f]+) queries=(0x[0-9a-f]+) sends=(0x[0-9a-f]+)',raw)]
                         active=[row for row in observations if row[0]<cpus]
-                        passed=passed and len(active)==cpus and all(all(row[1:]) for row in active)
-                        passed=passed and 'QUEUED source-holds=0x1 prepared-holds=0x1' in raw
+                        passed=passed and 'QUEUED send-mismatch=0x0' in raw and len(active)==cpus and all(all(row[1:]) for row in active)
+                        passed=passed and 'QUEUED source-holds=0x1 prepared-holds=0x2' in raw and 'QUEUED CONTROL prepared-thread-exec OK' in raw
                     row=dict(target=target,cpus=cpus,memory=memory,passed=passed,observations=observations,**record);report['runs'].append(row)
                     print(target,cpus,memory,'PASS' if passed else 'FAIL',output,flush=True)
                     if not passed:raise RuntimeError('socket SMP stream or owner cleanup failed: '+str(folder))
