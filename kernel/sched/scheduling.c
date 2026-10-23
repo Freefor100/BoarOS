@@ -246,6 +246,25 @@ void kernel_scheduler_leave_user_service(void)
 }
 
 #if BOAROS_USER_SMP
+int kernel_service_scope_try_local(struct kernel_service_scope *scope)
+{
+    uintptr_t irq=arch_interrupt_save();
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (cpu->logical_id) { arch_interrupt_restore(irq); return 0; }
+    struct kernel_task *task=cpu->current;
+    if (task && task->arch.user_mode && !task->user_service) {
+        /* 核对CPU与发布资格之间不能抢占；这里只改调度资格，不等业务锁。 */
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        scheduler_account_runtime_locked();
+        scheduler_user_service_set_locked(task,1);
+#if BOAROS_COST_DIAGNOSTICS
+        task->service_started_ticks=arch_time_read();
+#endif
+        scope->entered=1;
+    }
+    arch_interrupt_restore(irq);
+    return 1;
+}
 void kernel_service_scope_begin(struct kernel_service_scope *scope)
 {
     struct kernel_task *task = kernel_cpu_current()->current;

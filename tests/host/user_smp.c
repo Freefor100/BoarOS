@@ -8,6 +8,93 @@
 /* This scheduler/standard-signal model has no active timerfd. */
 uint64_t kernel_timer_fd_next;
 
+#ifdef SOCKET_PROTOCOL_CASES
+#include "../../net/socket.c"
+void kernel_assert_service_context(void)
+{ assert(!active->logical_id && (!active->current || !active->current->controlled)); }
+static int protocol_preempt,protocol_try_failure;
+int __real_kernel_rwlock_try_write(struct kernel_rwlock *,struct kernel_lock_guard *);
+int __wrap_kernel_rwlock_try_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
+{
+    if (protocol_try_failure && lock==&protocol_mutex.lock) {
+        protocol_try_failure=0;
+        assert(tasks[0].user_service && active==&cpus[0]);
+        return 0;
+    }
+    return __real_kernel_rwlock_try_write(lock,guard);
+}
+void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
+{
+    if (protocol_preempt && lock==&protocol_mutex.lock) {
+        protocol_preempt=0;
+        /* mutex取得前的定时器交错；资格必须已发布，不能迁往用户CPU1。 */
+        assert(!kernel_scheduler_yield_current());
+        assert(active==&cpus[0] && active->current==&tasks[0] && tasks[0].user_service);
+    }
+    __real_kernel_rwlock_write(lock,guard);
+}
+static void socket_protocol_cases(void)
+{
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      setup_task(0,1,0);tasks[0].arch.user_mode=1;
+      assert(scheduler_select_next_locked(active,active->current,1)==&tasks[0]);
+      kernel_wait_switch_finish_locked(&idles[0]);active->switch_previous=0; }
+    tasks[0].cpu_mask=2;
+    protocol_preempt=1;
+    struct kernel_socket_protocol_scope outer,nested;
+    kernel_socket_protocol_enter(&outer);
+    assert(!protocol_preempt && tasks[0].user_service && protocol_depth==1);
+    assert(!kernel_scheduler_yield_current() && active==&cpus[0] && tasks[0].user_service);
+    kernel_socket_protocol_enter(&nested);
+    assert(protocol_depth==2 && !nested.outer && tasks[0].user_service);
+    kernel_socket_protocol_leave(&nested);
+    assert(protocol_depth==1 && tasks[0].user_service);
+    kernel_socket_protocol_leave(&outer);
+    assert(!protocol_depth && !protocol_owner && !tasks[0].io_context.locks &&
+        !tasks[0].io_context.allocation_depth && !tasks[0].user_service && active==&cpus[1]);
+    puts("PASS socket protocol: qualification survives deterministic preemption and nested borrow; mutex/allocation/service owners returned");
+    struct kernel_socket_protocol_scope missed;
+    assert(!protocol_enter(&missed,1,1) && !tasks[0].user_service && !protocol_depth && !protocol_owner);
+    tasks[0].cpu_mask=1;
+    assert(!kernel_scheduler_yield_current() && active==&cpus[0]);
+    int previously_local=!active->logical_id;
+    tasks[0].cpu_mask=2;
+    assert(!kernel_scheduler_yield_current() && active==&cpus[1]);
+    /* 模拟旧local判断后抢占迁移：实际进入必须重查，不在CPU1运行协议。 */
+    assert(previously_local && !protocol_enter(&missed,1,1) && !tasks[0].user_service);
+    puts("PASS socket protocol: migration after local observation rejects inline entry without acquiring owners");
+    tasks[0].cpu_mask=1;
+    assert(!kernel_scheduler_yield_current() && active==&cpus[0]);
+    tasks[0].cpu_mask=2;
+    struct kernel_mm_user_pin pin={0};
+    tasks[0].io_context.user_pins=&pin;
+    protocol_try_failure=1;
+    uintptr_t interrupts=sync_test_irq;
+    assert(!protocol_enter(&missed,1,1) && !protocol_try_failure);
+    assert(active==&cpus[1] && !tasks[0].user_service && !protocol_owner &&
+        !protocol_depth && !tasks[0].io_context.locks && !tasks[0].io_context.allocation_depth &&
+        tasks[0].io_context.user_pins==&pin && sync_test_irq==interrupts);
+    tasks[0].cpu_mask=1;
+    assert(!kernel_scheduler_yield_current() && active==&cpus[0]);
+    tasks[0].cpu_mask=2;
+    assert(protocol_enter(&outer,1,1) && tasks[0].user_service && active==&cpus[0]);
+    kernel_socket_protocol_leave(&outer);
+    assert(active==&cpus[1] && tasks[0].io_context.user_pins==&pin && !tasks[0].user_service &&
+        !tasks[0].io_context.locks && !tasks[0].io_context.allocation_depth);
+    tasks[0].io_context.user_pins=0;
+    puts("PASS socket protocol: CPU0 local pin debt keeps inline execution; try failure and leave restore service/IRQ without consuming pin");
+    /* 既有外层业务服务范围由原owner结束，协议嵌套不能消费它。 */
+    kernel_scheduler_enter_user_service();
+    kernel_socket_protocol_enter(&outer);kernel_socket_protocol_leave(&outer);
+    assert(tasks[0].user_service && active==&cpus[0]);
+    kernel_scheduler_leave_user_service();
+    assert(active==&cpus[1] && !tasks[0].user_service);
+    puts("PASS socket protocol: borrowed pre-existing service qualification remains with its original owner");
+
+}
+#endif
+
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
 static int cancel_stop_on_handoff;
@@ -125,6 +212,9 @@ int main(void)
         scheduler_cpu_initialize(active, &idles[i], 1);
     }
     active = &cpus[0];
+#ifdef SOCKET_PROTOCOL_CASES
+    socket_protocol_cases();return 0;
+#endif
     {
         struct kernel_task worker={.accounted=1,.cpu_mask=1,.state=KERNEL_THREAD_STATE_READY};
         struct kernel_task services[2];
