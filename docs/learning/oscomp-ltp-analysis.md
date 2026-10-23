@@ -510,7 +510,7 @@ ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它�
 - `timer_settime03`实际运行REALTIME的过往绝对周期期限，验证overrun上限，四个组合均报告“Timer overrun count is capped”。
 - 原盘没有独立timer_create程序；创建入口由以上原程序和固定Linux同ELF原生差分检查覆盖。原脚本统一打印`FAIL LTP CASE … : 0`的行为沿现状，按真实退出状态、TPASS及原judge判分解释，见[输入问题](oscomp-test-issues.md)。
 
-自有短例还覆盖：同一标准信号的多个timer、64位载荷、handler／sigwaitinfo／signalfd消费、真实libc SIGEV_THREAD、额度竞争、忽略恢复、CPU目标退出、消费期间删除／重设、单次到期未消费查询及STOP/CONT/KILL组行为。四核内核观察确认设置与消费留在调用CPU，到期由CPU0推进。普通路径的新增成本及未达项统一见[CPU成本记录](cpu-accounting-cost.md#posix-定时器四类时钟与普通路径成本)。
+自有短例还覆盖：同一标准信号的多个timer、64位载荷、handler／sigwaitinfo／signalfd消费、两架构musl及官方glibc的真实SIGEV_THREAD、原生通知输出EFAULT和输入输出别名、额度竞争、忽略恢复、CPU目标退出、消费期间删除／重设、单次到期未消费查询及STOP/CONT/KILL组行为。四核内核观察确认设置与消费留在调用CPU，到期由CPU0推进。普通路径的新增成本及未达项统一见[CPU成本记录](cpu-accounting-cost.md#posix-定时器四类时钟与普通路径成本)。
 
 ### 运行盘与交付状态
 
