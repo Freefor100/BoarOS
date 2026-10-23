@@ -46,7 +46,7 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
     }
     signal_waiter=waiter;signal_receiver=receiver;
     struct kernel_signal_delivery delivery={0};
-    assert(kernel_signal_select(receiver,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER && delivery.signal==10);
+    assert(kernel_signal_select(receiver,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER && delivery.info.signal==10);
     assert(waiter->wait.phase==KERNEL_WAIT_NOTIFIED && waiter->wait.reason==KERNEL_WAIT_SIGNALLED);
     assert(waiter->state==KERNEL_THREAD_STATE_READY && waiter->ready_node.queued);
     assert(!receiver->storage_borrows && !waiter->storage_borrows);
@@ -108,7 +108,7 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
 void user_signal_take_retargeted(struct kernel_task *waiter)
 {
     struct kernel_signal_delivery delivery={0};
-    assert(kernel_signal_select(waiter,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER && delivery.signal==12);
+    assert(kernel_signal_select(waiter,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER && delivery.info.signal==12);
     assert(!waiter->group_leader->group_pending && !waiter->storage_borrows);
     signal_waiter=0;
     puts("PASS a handler blocking a shared signal transfers it to another real interruptible waiter");
@@ -133,3 +133,10 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_wake_signal(struct kernel_t
            (task==signal_receiver && task->wait.phase==KERNEL_WAIT_FINISHED));
     return __real_kernel_scheduler_wake_signal(task);
 }
+
+/* These standard-signal models never allocate queued payloads. Real queue
+ * allocation, quota and retirement run in signal_pending.c's focused suite. */
+enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
+{ (void)h;(void)n;(void)size;(void)out;abort(); }
+void kernel_heap_release(struct kernel_heap *h,void *p)
+{ (void)h;(void)p;abort(); }

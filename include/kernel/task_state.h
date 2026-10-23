@@ -80,6 +80,7 @@ struct kernel_signal_table {
     uint64_t magic;
     uint32_t references;
     struct kernel_signal_action actions[KERNEL_SIGNAL_COUNT];
+    struct kernel_wait_queue signalfd_waiters;
 };
 
 enum kernel_user_return_work {
@@ -227,6 +228,9 @@ struct kernel_task {
     struct kernel_rlimit64 core_limit;
     struct kernel_rlimit64 fsize_limit;
     struct kernel_signal_stack signal_stack;
+    struct kernel_signal_pending_state signal_queue, group_queue;
+    struct kernel_rlimit64 sigpending_limit;
+    uint64_t signal_child_times[2], group_child_times[2];
 } __attribute__((aligned(16)));
 
 #endif

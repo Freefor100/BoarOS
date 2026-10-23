@@ -15,6 +15,8 @@ struct kernel_wait_record {
 extern struct kernel_raw_lock kernel_wait_domain;
 void kernel_wait_domain_init(void);
 void kernel_wait_record_init(struct kernel_wait_record *);
+/* Initialized backend, valid queue/token, caller owns wait domain. */
+enum kernel_scheduler_status kernel_wait_prepare_locked(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
 int kernel_wait_notify_locked(const struct kernel_wait_token *, uint32_t);
 void kernel_wait_node_add_locked(struct kernel_wait_queue *, struct kernel_wait_node *);
 void kernel_wait_node_remove_locked(struct kernel_wait_node *);

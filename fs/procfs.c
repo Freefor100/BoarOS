@@ -560,15 +560,17 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "anon_inode:[eventfd]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_TIMERFD)
                 prefix = "anon_inode:[timerfd]";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)
+                prefix = "anon_inode:[signalfd]";
             else prefix = 0;
-            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD &&
+            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD &&
                             !identity)) result = -KERNEL_ENOENT;
             else {
                 char display[64];
                 prefix_length = strlen(prefix);
                 memcpy(display, prefix, prefix_length);
                 size_t length = prefix_length;
-                if (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD) {
+                if (file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD) {
                     length += decimal(display + length, identity);
                     display[length++] = ']';
                 }
@@ -1044,6 +1046,8 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                                       (BOAROS_PAGE_SIZE / 1024U), " kB\n");
         /* 当前没有 swap 后端，驻留页不会换出到交换设备。 */
         used += append_number_line(data + used, "VmSwap:\t", 0U, " kB\n");
+        used += append_number_line(data+used,"SigQ:\t",process.signal_queued,"/");
+        used += append_number_line(data+used,"",process.signal_queue_limit,"\n");
         static const char identity[] =
             "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
         memcpy(data + used, identity, sizeof(identity) - 1U);

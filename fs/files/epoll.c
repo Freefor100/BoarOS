@@ -62,11 +62,16 @@ static void epoll_notify(struct kernel_epoll *epoll)
 
 static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason)
 {
-    (void)reason;
     if (!node || !node->context) return;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = node->context;
     struct kernel_epoll *epoll = item->epoll;
+    if (reason==KERNEL_WAIT_POLL_FREE) {
+        /* The callback owns a cursor borrow. Detach without waiting for
+         * itself; DEL/close still drains this borrow before freeing item. */
+        kernel_wait_queue_remove(node);
+        return;
+    }
     if (epoll && item->linked && !item->oneshot_disarmed) {
         item->notification_generation++;
         /* poll和用户复制都可能重入；通知链不借用扫描者的ready_next。 */

@@ -180,7 +180,7 @@ uint32_t __wrap_kernel_signal_send_targets(struct kernel_task *caller,
     return sent_count;
 }
 
-uint32_t __wrap_kernel_signal_send_thread(struct kernel_task *caller,
+int64_t __wrap_kernel_signal_send_thread(struct kernel_task *caller,
                                           kernel_pid_t tgid,
                                           kernel_pid_t tid,
                                           uint32_t sig,

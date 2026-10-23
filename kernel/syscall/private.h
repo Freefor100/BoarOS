@@ -284,6 +284,9 @@ enum kernel_syscall_status syscall_handle_sigaltstack(
     struct kernel_task *, const struct kernel_syscall_request *,
     struct kernel_syscall_result *);
 
+enum kernel_syscall_status syscall_handle_sigqueueinfo(
+    struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
+
 enum kernel_syscall_status syscall_handle_rt_sigprocmask(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -347,6 +350,7 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     uint64_t remaining_address,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_signalfd(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_timerfd(struct kernel_task *,
     const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_eventfd(struct kernel_task *,

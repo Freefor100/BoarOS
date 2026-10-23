@@ -35,17 +35,38 @@ void kernel_signal_timer_adopt(struct kernel_task *task, struct kernel_task *old
 
 struct kernel_signal_wait_info {
     uint32_t signal;
-    uint32_t sender;
+    int32_t error;
     int32_t code;
-    uint32_t uid;
-    int32_t status;
+    uint32_t padding;
+    union {
+        struct {
+            uint32_t sender, uid;
+            union {
+                uint64_t value;
+                struct { int32_t status; uint32_t status_padding; uint64_t user_time, system_time; };
+            };
+        };
+        uint64_t address;
+        uint8_t payload[112];
+    };
 };
 
 /* 标准 SIGCHLD 只需补充身份和事件状态，无需为每个信号保留用户 ABI。 */
 struct kernel_signal_child_info { uint32_t uid; int32_t status; };
 void kernel_signal_encode_info(void *output,
-    const struct kernel_signal_wait_info *info,
-    int fault, uint64_t fault_address);
+    const struct kernel_signal_wait_info *info);
+struct kernel_wait_queue;
+struct kernel_wait_queue *kernel_signal_fd_source(struct kernel_task *);
+uint64_t kernel_signal_fd_pending_locked(struct kernel_task *,uint64_t);
+int kernel_signal_fd_take(struct kernel_task *,const uint64_t *,struct kernel_signal_wait_info *,int);
+struct kernel_signal_queue;
+struct kernel_signal_pending_state {
+    struct kernel_signal_queue *queue;
+    uint64_t inline_charged;
+};
+void kernel_signal_pending_cleanup(struct kernel_task *);
+void kernel_signal_pending_adopt_locked(struct kernel_task *, struct kernel_task *);
+uint64_t kernel_signal_pending_count_locked(void);
 
 #define KERNEL_SIGNAL_COUNT 64U
 #define KERNEL_SIGNAL_DFL UINT64_C(0)
@@ -79,6 +100,7 @@ enum kernel_signal_status {
     KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT,
     KERNEL_SIGNAL_STATUS_INVALID_STATE,
     KERNEL_SIGNAL_STATUS_NO_MEMORY,
+    KERNEL_SIGNAL_STATUS_QUEUE_FULL,
 };
 
 enum kernel_signal_select_result {
@@ -97,13 +119,7 @@ void kernel_signal_force_fault(struct kernel_task *task, uint32_t signal,
     int32_t code, uint64_t address);
 
 struct kernel_signal_delivery {
-    uint32_t signal;
-    uint32_t sender;
-    int32_t code;
-    uint32_t uid;
-    int32_t status;
-    uint32_t fault;
-    uint64_t fault_address;
+    struct kernel_signal_wait_info info;
     uint64_t handler;
     uint64_t flags;
     uint64_t restore_mask;
@@ -172,6 +188,8 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                              kernel_pid_t sender_tid);
 
 /* Same target-storage contract; sends a thread-directed signal to one task. */
+int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
+    const struct kernel_signal_wait_info *);
 enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target,
     uint32_t sig,
@@ -253,7 +271,7 @@ uint32_t kernel_signal_send_targets(struct kernel_task *caller,
                                     kernel_pid_t sender_tid);
 
 /* Sends to one thread id, optionally checking its thread-group id. */
-uint32_t kernel_signal_send_thread(struct kernel_task *caller,
+int64_t kernel_signal_send_thread(struct kernel_task *caller,
                                    kernel_pid_t tgid,
                                    kernel_pid_t tid,
                                    uint32_t sig,

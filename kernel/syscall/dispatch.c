@@ -133,6 +133,8 @@
 #define LINUX_SYSCALL_RT_SIGPROCMASK 135U
 #define LINUX_SYSCALL_RT_SIGPENDING 136U
 #define LINUX_SYSCALL_RT_SIGTIMEDWAIT 137U
+#define LINUX_SYSCALL_RT_SIGQUEUEINFO 138U
+#define LINUX_SYSCALL_RT_TGSIGQUEUEINFO 240U
 #define LINUX_SYSCALL_RT_SIGRETURN 139U
 #define LINUX_SYSCALL_RESTART_SYSCALL 128U
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
@@ -307,6 +309,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 74U) {
+        if(syscall_handle_signalfd(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number >= 85U && request->number <= 87U) {
         if (syscall_handle_timerfd(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -608,6 +612,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_SIGALTSTACK) {
         if (syscall_handle_sigaltstack(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_RT_SIGQUEUEINFO ||
+               request->number == LINUX_SYSCALL_RT_TGSIGQUEUEINFO) {
+        if(syscall_handle_sigqueueinfo(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_RT_SIGACTION) {
         if (syscall_handle_rt_sigaction(caller,

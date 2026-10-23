@@ -50,12 +50,13 @@ static int stack_cost_compare(const void *a,const void *b)
 { uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b;return (x>y)-(x<y); }
 static int stack_cost_main(FILE *config)
 {
-    unsigned cpus;CHECK(fscanf(config,"%u",&cpus)==1 && (cpus==1 || cpus==4));CHECK(!fclose(config));
+    unsigned cpus,only=0;CHECK(fscanf(config,"%u",&cpus)==1 && (cpus==1 || cpus==4));
+    int extra=fscanf(config,"%u",&only);CHECK(extra==EOF || (extra==1 && only==1));CHECK(!fclose(config));
     uint64_t affinity=1;CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(affinity),&affinity));
     stack_t old;errno=0;int available=!syscall(SYS_sigaltstack,0,&old);
     CHECK(available || errno==ENOSYS);
     const char *names[]={"unregistered","registered","onstack","autodisarm"};
-    for(unsigned mode=0;mode<(available?4U:1U);mode++) {
+    for(unsigned mode=0;mode<(available&&!only?4U:1U);mode++) {
         struct sigaction action={.sa_handler=stack_cost_handler,.sa_flags=mode>=2?SA_ONSTACK:0};
         sigemptyset(&action.sa_mask);CHECK(!sigaction(SIGUSR1,&action,0));
         pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,0,cpus+1));
@@ -89,5 +90,5 @@ static int stack_cost_main(FILE *config)
         }
         free(workers);CHECK(!pthread_barrier_destroy(&gate));
     }
-    printf("ALTSTACK-PERF END %u\n",available?8:2);fflush(stdout);return 0;
+    printf("ALTSTACK-PERF END %u\n",available&&!only?8:2);fflush(stdout);return 0;
 }

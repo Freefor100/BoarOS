@@ -53,6 +53,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_BLOCK,
     KERNEL_OPEN_FILE_KIND_EVENTFD,
     KERNEL_OPEN_FILE_KIND_TIMERFD,
+    KERNEL_OPEN_FILE_KIND_SIGNALFD,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */
