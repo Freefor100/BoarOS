@@ -16,7 +16,7 @@
 
 原输入、工具和运行身份继续以现有 `tests/oscomp/inputs.json`、运行 `identity.json/report.json` 为准，不把本地 QEMU 成绩与既有官方容器成绩混用。
 
-资源统计、CPU时钟及CORE/FSIZE、capget已完成两架构短回归；六项原程序的当前结果、得分、耗时及capset准备缺口见[官方原程序结果](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
+资源统计、CPU时钟及CORE/FSIZE已完成两架构短回归，六项原程序的结果见[官方原程序结果](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。随后补齐真实凭据与capset，最新原程序得分、耗时和准备失败位置见[凭据与权限结果](#可变凭据与权限原程序结果)。
 
 ## 块设备与空间管理批次定向验证
 
@@ -572,3 +572,52 @@ ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它�
 - 正常退出后八个根盘/分区对象检查全部为0，启动种子槽已擦除，定向内核已恢复默认交付内核并逐字节核对。检查完成的运行盘已清理，保留缓存、ELF和日志；原有`oscomp-official-delivery.md`修改逐字节保留。
 
 通用机制见[MM范围迁移](../modules/kernel-mm.md#mremap-区间调整与搬移)与[procfs](../modules/procfs.md)。固定12次性能对照的realloc收益及UP普通信号/signalfd、四核futex等新增回退统一见[CPU成本](cpu-accounting-cost.md#mremap-与线程-proc-接入后的固定成本)。本批没有追加性能调优或重跑整套LTP。原始程序结果、judge输出、QEMU/内核/输入身份及八盘检查位于`build/mremap-proc-20261023/original/`。
+
+
+## 可变凭据与权限原程序结果
+
+10月24日将main的可变凭据、DAC、set-ID与file capability实现合入兼容分支后，在固定官方离线容器、原QEMU设备参数、单核／1GiB内存下，仅运行以下11个原程序。RV与LA并行，各自顺序运行glibc、musl；保留原ELF、参数、judge、程序内部时限与现有监督设置。
+
+表中每格为**原judge得分／分母；程序耗时（毫秒）**。耗时从程序开始到退出，不含开机、关机和宿主磁盘检查；各架构并行运行，因此跨架构、跨libc耗时仅描述这次执行。
+
+| 原程序 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| setuid01 | 1/1；143 | 1/1；84 | 1/1；108 | 1/1；63 |
+| setgid01 | 1/1；76 | 1/1；42 | 1/1；42 | 1/1；61 |
+| setreuid01 | 7/7；63 | 7/7；42 | 7/7；41 | 7/7；42 |
+| setresuid01 | 9/9；62 | 9/9；42 | 9/9；42 | 9/9；44 |
+| setgroups01 | 1/1；63 | 1/1；62 | 1/1；64 | 1/1；43 |
+| getgroups01 | 0/0；43 | 0/0；21 | 0/0；46 | 0/0；21 |
+| capget01 | 6/6；62 | 6/6；42 | 6/6；63 | 6/6；43 |
+| capset01 | 3/3；42 | 3/3；47 | 3/3；63 | 3/3；44 |
+| capset02 | 6/6；62 | 6/6；42 | 6/6；64 | 6/6；43 |
+| access01 | 0/1；86 | 0/1；41 | 0/1；65 | 0/1；42 |
+| faccessat01 | 3/3；63 | 3/3；64 | 0/3；83 | 3/3；63 |
+| 原批合计 | 37/38；765 | 37/38；529 | 34/38；681 | 37/38；509 |
+
+### 得分对应的行为
+
+- `setuid01/setgid01`各检查一次当前身份设置；`setreuid01`的7项覆盖保留、交换和重新设置real/effective UID；`setresuid01`的9项实际切换real/effective/saved UID。`setgroups01`设置补充组，`getgroups01`的4条TPASS覆盖非法长度、失败时不改输出和真实组列表。这批`getgroups01`采用旧API输出，原judge未取得Summary，各记0/0，见[统一判分问题](oscomp-test-issues.md#原脚本调用与判分差异)。
+- `capget01`的6项分别查询三个版本，并撤下`CAP_NET_RAW`后检查effective/permitted确已变化；此前固定root查询无法完成的撤权步骤现在已执行。`capset01`的3项检查三个ABI版本；`capset02`的6项检查坏指针、坏版本，以及effective超出permitted、permitted重新增加、inheritable超出允许集合的拒绝行为。
+- `access01`四组都在`getpwnam("nobody")`准备阶段报TBROK、退出2，权限主体未进入；它需要的账户记录在原输入根盘缺失。内核已支持数字身份降权和权限判断，原账户输入问题集中在[统一问题文档](oscomp-test-issues.md#运行库和原盘依赖)。
+- `faccessat01`检查dirfd相对路径、绝对路径和AT_FDCWD三种查找。首批仅LA glibc三项ENOSYS：该原libc调用`faccessat2(439)`，内核当时只有`faccessat(48)`入口。这是实际内核入口缺失，修复和定向结果见下节。
+
+44次程序执行中，39次退出0，四次`access01`在准备阶段退出2，一次LA glibc `faccessat01`退出1；全部无超时。原批单架构启动驱动的墙钟段为RV8.330秒、LA7.832秒，包含启动前镜像校验、QEMU运行及轮询收尾。正常退出后，两架构根盘与第二盘p1/p2/p3共八个对象检查均为0，启动种子槽已擦除；定向内核恢复为默认交付内核并逐字节核对。
+
+### faccessat2修复后的定向结果
+
+`faccessat2(439)`已与旧`faccessat(48)`共用最终对象的权限判断，同时接入`AT_EACCESS`、`AT_SYMLINK_NOFOLLOW`和`AT_EMPTY_PATH`：分别选择有效身份、检查符号链接自身、使用空路径指定的FD对象。旧三参数入口保持flags为0，错误顺序与固定Linux同ELF短例对照。
+
+修复合入兼容分支后，仅定向重跑`faccessat01`，四配置均为3/3、退出0，无失败、broken、跳过或超时：
+
+| 原程序 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| faccessat01，得分；毫秒 | 3/3；172 | 3/3；107 | 3/3；172 | 3/3；85 |
+
+以这次结果更新`faccessat01`，其余10项沿用首批结果，当前这组已测分项为**四配置各37/38，合计148/152**；剩余4分均为`access01`的nobody账户准备失败。`getgroups01`另有合计16条实际TPASS，原judge继续记0/0。上面的首批表保留原失分和原耗时；两批程序耗时分别记录。
+
+定向输出、judge与运行身份位于`build/credentials-20261023/original-faccessat2/`；该批单架构启动驱动墙钟段为RV7.784秒、LA5.255秒，包含镜像校验、QEMU运行及轮询收尾。两架构正常退出后，根盘与第二盘各分区共八个对象检查均为0，默认交付内核恢复并逐字节核对通过；检查完成的运行盘按同一方式清理，保留内核、ELF、日志与运行身份。
+
+set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两架构musl/glibc消费者覆盖原始syscall的线程独立性、libc全线程setxid、fork／exec、SGID和sticky目录、已有FD权利、降权后信号／proc／IPC访问、nosuid／NNP／ambient／bounding及动态装载的AT_SECURE。原11项程序的得分只表示上面实际运行的分项。普通路径新增成本和仍超3%检查线的UP普通信号、futex统一见[CPU成本文档](cpu-accounting-cost.md#可变凭据与权限执行普通路径成本)。
+
+原始输出、逐程序分项、原judge输出和内核／QEMU／输入身份保存在`build/credentials-20261023/original/`。八个对象检查通过后，四张运行盘已清理，记录见该目录的`image-cleanup.json`；ELF、日志、内核身份与构建缓存保留。正式文档在此维护得分、耗时与归因，临时目录保存可复查的原始材料。

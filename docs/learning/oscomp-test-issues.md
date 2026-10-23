@@ -83,7 +83,7 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 | iozone 向量 I/O | 原命令 `./iozone -t 4 -i 11 -i 12 -r 1k -s 1m` 请求 pwritev/preadv，发布二进制却报 `Selected test not available on the version`，随后输出默认 initial writers/rewriters。 | 保留原命令；分析按实际输出判断。该次运行只证明默认写入路径完成，向量能力由独立 ABI 和原 preadv/pwritev 测例验证。 |
 | libc-test 脚本 | `run-static.sh`、`run-dynamic.sh` 没有 shebang；原 LA musl BusyBox 在固定 Linux 也拒绝直接执行，后面的程序尚未开始。 | 临时外层脚本用该 libc 自己的 BusyBox `sh` 显式解释这两行；内层列表和参数原样执行。 |
 | BusyBox 的 `kill 10` | judge 的固定清单要求此标签，发布 `busybox_cmd.txt` 实际执行 `sh -c 'sleep 5' & ./busybox kill $!`，成功标签按整行输出。judge 另补的 `kill 10` 因无对应标签得零。 | 保留原脚本和 judge；**54/55** 的差额按标签错位解释，后台 PID 的实际 kill 单列。 |
-| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench`、`mremap01～05`、`sigaltstack01`、`signalfd01/signalfd4_01/signalfd4_02`等会输出TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。两架构 ftest 的实际内容与磁盘一致性已通过。 |
+| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench`、`mremap01～05`、`getgroups01`、`sigaltstack01`、`signalfd01/signalfd4_01/signalfd4_02`等会输出TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。`getgroups01` 四配置均输出4条TPASS、退出0，原judge各记0/0；两架构ftest的实际内容与磁盘一致性已通过。 |
 | LTP 的 `FAIL LTP CASE … : 0` | 原脚本对每个返回码统一打印这行，名字中的 FAIL 也出现在成功退出时。 | 判读末尾状态及 Summary；保留原结束行作为 judge 的当前测例边界。 |
 
 iozone 的完整命令核对见[原脚本对照](oscomp-compat-baseline.md#2026-10-17-cpu0-存储分批与同步等待集成)。
@@ -115,7 +115,7 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 | glibc `float_*` 的线程退出／取消 | 完整旧日志已有 `libgcc_s.so.1` 缺失；glibc 需要它展开线程栈，缺库会 abort。 | 属于原盘依赖。musl 的 SIGSEGV 单独保留归因；见[慢项分类](oscomp-ltp-analysis.md#慢项与超时分类)。 |
 | LA musl 的四个 `sched_*` 函数 | 原 libc 直接返回 ENOSYS，尚未进入内核；对应上游 musl 的接口语义取舍。 | 默认 LA musl 通过调度 DSO 调用真实 Linux syscall，原 cyclictest 已获得样本；见[运行时接入](oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。 |
 | RV 原静态 glibc 的 clock 测试 | malloc 初始化遇 getrandom/EAGAIN 后把 errno 留到 main；后续 clock 调用成功，原断言仍看到旧 errno。 | 当前启动种子在运行测例前完成随机源初始化；指令级对照见[errno 来源](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
-| `mkdir02/readlink01` 的用户数据库 | 固定输入根盘缺少 `/etc/passwd`，`getpwnam("nobody")` 返回 ENOENT，准备阶段即结束。 | 本轮四配置均在 setup 结束；mkdir02 的 GID/SGID 继承和 readlink01 的 root/nobody 两身份读取尚未执行。账户文件补齐后仍需真实凭据切换能力。当前得分和准备位置见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)，可变凭据能力继续由 goals 维护。 |
+| `mkdir02/readlink01/access01` 的用户数据库 | 固定输入根盘缺少 `/etc/passwd`，`getpwnam("nobody")` 返回ENOENT，准备阶段结束。 | 原`mkdir02/readlink01`未进入GID/SGID继承、root/nobody读取主体；10月24日`access01`四配置也在`access01.c:275`报TBROK，原judge各为0/1。真实UID/GID切换、capset与DAC现已实现，数字身份的同ELF短例和musl/glibc消费者已通过；原盘仍保持原账户输入。原程序得分与耗时见[凭据与权限结果](oscomp-ltp-analysis.md#可变凭据与权限原程序结果)。 |
 | `eventfd01/02` 的Kconfig输入 | 原ELF请求`CONFIG_EVENTFD`，LTP在解析Linux `.config`时TBROK，退出2；当前启动环境没有该配置文件。 | 四配置均未进入主体，原judge为0/0。eventfd接口差分及原eventfd2测例通过；逐程序得分/耗时见[eventfd与timerfd结果](data-path-budget-experiments.md#eventfd与timerfd2026-10-22)。 |
 | `getdents01` 的四种入口 | 旧 getdents syscall 在两种架构上无入口，部分 libc 也没有导出相应 wrapper；这些分项记 TCONF。 | 四配置共七条 TCONF；有效 getdents64 分项通过。对应分项、得分和时间见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)。 |
 | RV 原 musl 的浮点 ABI 标注 | 原测例标注double-float ABI，原libc标注soft-float；设置`LTP_TIMEOUT_MUL=0.1`时观察到异常巨大时限。 | 信号等待的正式复核沿用未设置该变量的默认30秒；该原输入差异独立于EINTR重试，保留在定向运行记录。 |
@@ -136,5 +136,5 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 控制台原因取自对应条目的reason；原judge对跳过项记零。
 
 当前内核能力与后续实现方向仍由 [goals](../goals.md) 和各模块维护。例如
-O_DIRECT、普通 AF_UNIX socket、CPU-time sleep 与 POSIX timer 的缺口按内核能力处理；对应实际失败和
+O_DIRECT、普通命名AF_UNIX socket、CPU-time sleep等缺口按内核能力处理；POSIX timer已支持的四类时钟及其余时钟缺口见[原程序结果](oscomp-ltp-analysis.md#posix-定时器原程序四类时钟完成版)。对应实际失败和
 已修复语义见[原程序结果](oscomp-official-delivery.md)。
