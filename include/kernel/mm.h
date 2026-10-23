@@ -253,6 +253,11 @@ enum kernel_mm_status kernel_mm_mprotect(
 int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
                     uint64_t length, uint32_t flags);
 
+/* Linux mremap flags; zero or negative errno, success writes the new address. */
+int kernel_mm_mremap(struct kernel_mm *, uint64_t old_address,
+    uint64_t old_length, uint64_t new_length, uint64_t flags,
+    uint64_t new_address, uint64_t *result);
+
 /*
  * Resolve one hardware user fault in the MM active on this hart.  access must
  * be exactly one of READ, WRITE, or EXECUTE.  NOT_MAPPED means the access is

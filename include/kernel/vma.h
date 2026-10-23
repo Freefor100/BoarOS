@@ -84,6 +84,17 @@ struct kernel_vma_edit {
     struct kernel_vma replacement;
 };
 
+struct kernel_vma_remap {
+    const struct kernel_vma_set *set;
+    uint64_t generation, start, end;
+    struct kernel_vma replacement;
+};
+/* The destination must be empty or start at source; commit cannot allocate. */
+enum kernel_vma_status kernel_vma_set_prepare_remap(struct kernel_vma_set *,
+    uint64_t start, uint64_t end, const struct kernel_vma *, struct kernel_vma_remap *);
+enum kernel_vma_status kernel_vma_set_commit_remap(struct kernel_vma_set *,
+    const struct kernel_vma_remap *);
+
 /*
  * These helpers are private to architecture MM backends.  A set borrows heap;
  * its owner must keep heap live through set destruction.

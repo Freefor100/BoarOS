@@ -288,3 +288,71 @@ static void disk_mm_case(struct kernel_page_cache *cache,struct kernel_heap *hea
     assert(!physical_page_release(pages,kernel.root_address));
     puts("PASS real ext4 MM: source domain, fork sharing, physical identity, owner return");
 }
+
+static struct kernel_page_cache_alias *remap_alias;
+static unsigned remap_capture_alias, remap_alias_ready, remap_alias_resume;
+enum kernel_page_cache_status __real_kernel_page_cache_alias_attach(
+    struct kernel_page_cache *,const struct kernel_vfs_file *,uint64_t,uint64_t,
+    struct kernel_page_cache_alias *,void *,uint64_t,int (*)(void *,uint64_t));
+enum kernel_page_cache_status __wrap_kernel_page_cache_alias_attach(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t index,uint64_t physical,
+    struct kernel_page_cache_alias *alias,void *owner,uint64_t address,int (*rearm)(void *,uint64_t))
+{
+    enum kernel_page_cache_status status=__real_kernel_page_cache_alias_attach(
+        cache,file,index,physical,alias,owner,address,rearm);
+    if (!status && remap_capture_alias) { remap_alias=alias; remap_capture_alias=0; }
+    return status;
+}
+static void *remap_old_alias(void *unused)
+{
+    (void)unused; cache_test_attach(1);
+    struct kernel_page_cache_alias *alias=remap_alias;
+    kernel_page_cache_alias_hold(alias);
+    uint64_t old_address=alias->virtual_address;
+    __atomic_store_n(&remap_alias_ready,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&remap_alias_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!alias->rearm(alias->owner,old_address));
+    kernel_page_cache_alias_put(alias);
+    return 0;
+}
+static void disk_remap_case(struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_vfs_mount *mount)
+{
+    struct arch_mmu_page_table kernel={0};
+    struct arch_mmu_user_space space={0}; struct kernel_mm mm={0};
+    assert(!riscv_sv39_page_table_init(&kernel,pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
+    assert(!arch_mmu_user_space_init(&space,pages,&kernel) && !kernel_mm_create(&mm,&space) && !kernel_mm_vma_enable(&mm,heap));
+    assert(!kernel_mm_context(&mm,&mm_test_context) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+    struct kernel_open_file_description *file=0; int error;
+    assert(!kernel_open_file_create_mode(heap,mount,"/remap-alias",0600,&file,&error) && !error);
+    file->open_flags=2;
+    assert(!kernel_vfs_ftruncate(&file->file,BOAROS_PAGE_SIZE));
+    struct kernel_open_file_description *owner=file; uint64_t out;
+    assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(&mm,&owner,
+        0x40000,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&out));
+    remap_capture_alias=1; remap_alias=0;
+    unsigned char byte=0x72; size_t done;
+    assert(!kernel_copy_to_user(&mm,0x40000,&byte,1,&done) && done==1 && remap_alias);
+    remap_alias_ready=remap_alias_resume=0;
+    pthread_t callback; assert(!pthread_create(&callback,0,remap_old_alias,0));
+    while (!__atomic_load_n(&remap_alias_ready,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_mm_mremap(&mm,0x40000,BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,3,0x80000000,&out));
+    assert(!kernel_mm_mmap_anonymous(&mm,0x40000,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&out));
+    assert(!kernel_copy_to_user(&mm,0x40000,&byte,1,&done) && done==1);
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(&mm,0x80000000,&mapping) && (mapping.permissions&KERNEL_MM_WRITE));
+    __atomic_store_n(&remap_alias_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(callback,0));
+    assert(!kernel_mm_lookup(&mm,0x80000000,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+    assert(!kernel_mm_lookup(&mm,0x40000,&mapping) && (mapping.permissions&KERNEL_MM_WRITE));
+    byte=0x93;
+    assert(!kernel_copy_to_user(&mm,0x80000000,&byte,1,&done) && done==1);
+    assert(!kernel_mm_msync(&mm,0x80000000,BOAROS_PAGE_SIZE,4));
+    byte=0; assert(!kernel_vfs_pread(&file->file,0,&byte,1,&done) && done==1 && byte==0x93);
+    mm_test_context=0;
+    assert(!kernel_mm_release(&mm) && !kernel_open_file_release(&file));
+    assert(!physical_page_release(pages,kernel.root_address));
+    puts("PASS mremap ext4: alias borrowed before move rearms current VA; replacement stays writable; post-move dirty byte persisted");
+}

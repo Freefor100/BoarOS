@@ -526,6 +526,8 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
             }
         } else kernel_mutex_lock(&record->operations,&operation.guard);
     }
+    /* 回调可能在mremap之前借出；gate内由resident owner读取当前地址。 */
+    address = page->address;
     struct kernel_vma vma;
     uint32_t permissions;
     if (record->stage!=KERNEL_MM_RECORD_LIVE || !kernel_page_cache_alias_active(&page->alias) ||
@@ -3378,41 +3380,48 @@ void kernel_mm_get_concurrency_state(const struct kernel_mm *mm,
     enum kernel_mm_status op_status = mm_operation_begin((mm_), &operation); \
     if (op_status != KERNEL_MM_STATUS_OK) return op_status
 
-/* SysV附件的段目录仍由CPU0维护。仅编辑实际覆盖附件的范围才进入服务；
- * 其页固定与缺页继续使用共同MM协议，不把匿名操作一并迁移。 */
-static enum kernel_mm_status mm_range_operation_begin(const struct kernel_mm *mm,
-    uint64_t address, uint64_t length, struct mm_operation *operation,
-    struct kernel_service_scope *service)
+#if BOAROS_USER_SMP
+/* Caller holds the MM gate; holes do not require visiting unrelated VMAs. */
+static int range_has_shm(struct kernel_mm_record *record, uint64_t address, uint64_t length)
+{
+    if (!length || length > UINT64_MAX - BOAROS_PAGE_MASK || !record->vmas) return 0;
+    uint64_t rounded = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    if (address >= ARCH_MMU_USER_LIMIT || rounded > ARCH_MMU_USER_LIMIT - address) return 0;
+    uint64_t end = address + rounded, cursor = address;
+    while (cursor < end) {
+        struct kernel_vma vma;
+        enum kernel_vma_status status = kernel_vma_set_lookup(record->vmas, cursor, &vma);
+        if (status == KERNEL_VMA_STATUS_NOT_FOUND)
+            status = kernel_vma_set_next(record->vmas, cursor, &vma);
+        if (status == KERNEL_VMA_STATUS_NOT_FOUND || (!status && vma.start >= end)) break;
+        if (status) __builtin_trap();
+        if (vma.shm_attachment) return 1;
+        cursor = vma.end;
+    }
+    return 0;
+}
+#endif
+
+/* SysV附件的段目录仍由CPU0维护。两个实际编辑区间分别检查，避免把
+ * mremap源尾和固定目标之间的无关附件也纳入执行位置判断。 */
+static enum kernel_mm_status mm_ranges_operation_begin(const struct kernel_mm *mm,
+    uint64_t address, uint64_t length, uint64_t second_address, uint64_t second_length,
+    struct mm_operation *operation, struct kernel_service_scope *service)
 {
     for (;;) {
         enum kernel_mm_status status = mm_operation_begin(mm, operation);
         if (status) return status;
 #if BOAROS_USER_SMP
         if (kernel_task_has_user_context(kernel_task_current()) &&
-            !kernel_scheduler_user_service_active() && length &&
-            length <= UINT64_MAX - BOAROS_PAGE_MASK) {
-            uint64_t rounded = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
-            uint64_t end = address + rounded, cursor = address;
-            if (end >= address && end <= ARCH_MMU_USER_LIMIT && operation->record->vmas) {
-                struct kernel_vma vma;
-                while (cursor < end) {
-                    enum kernel_vma_status vs = kernel_vma_set_lookup(operation->record->vmas, cursor, &vma);
-                    if (vs == KERNEL_VMA_STATUS_NOT_FOUND)
-                        vs = kernel_vma_set_next(operation->record->vmas, cursor, &vma);
-                    if (vs == KERNEL_VMA_STATUS_NOT_FOUND || (!vs && vma.start >= end)) break;
-                    if (vs) __builtin_trap();
-                    if (vma.shm_attachment) {
-                        mm_operation_end(operation);
-                        kernel_service_scope_begin(service);
-                        break;
-                    }
-                    cursor = vma.end;
-                }
-                if (!operation->guard.lock) continue;
-            }
+            !kernel_scheduler_user_service_active() &&
+            (range_has_shm(operation->record, address, length) ||
+             range_has_shm(operation->record, second_address, second_length))) {
+            mm_operation_end(operation);
+            kernel_service_scope_begin(service);
+            continue;
         }
 #else
-        (void)address; (void)length; (void)service;
+        (void)address; (void)length; (void)second_address; (void)second_length; (void)service;
 #endif
         return KERNEL_MM_STATUS_OK;
     }
@@ -3420,7 +3429,7 @@ static enum kernel_mm_status mm_range_operation_begin(const struct kernel_mm *mm
 #define MM_RANGE_OPERATION(mm_, address_, length_) \
     KERNEL_SERVICE_SCOPE_IF(mm_service, 0); \
     struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0}; \
-    enum kernel_mm_status op_status = mm_range_operation_begin((mm_), (address_), (length_), &operation, &mm_service); \
+    enum kernel_mm_status op_status = mm_ranges_operation_begin((mm_), (address_), (length_), 0, 0, &operation, &mm_service); \
     if (op_status != KERNEL_MM_STATUS_OK) return op_status
 
 /* 复制期间不能迁移或借用CPU0时，退休来源留在MM；真实用户返回前
@@ -3598,6 +3607,184 @@ static enum kernel_mm_status allocate_private_page(struct physical_page_allocato
         return KERNEL_MM_STATUS_PAGE_ACCESS;
     }
     return KERNEL_MM_STATUS_OK;
+}
+
+/* Reserve destination tables while all source leaves retain their owner. Empty
+ * published tables are reclaimed through the normal TLB retirement path on OOM. */
+static int prepare_remap_tables(struct kernel_mm_record *record,
+    uint64_t from, uint64_t length, uint64_t to)
+{
+    uint64_t cursor = from, address;
+    for (;;) {
+        unsigned missing;
+        {
+            KERNEL_RAW_SCOPE(guard, &record->metadata);
+            enum arch_mmu_status status = arch_mmu_user_next_owned(
+                &record->space, &cursor, from + length, &address);
+            if (status == ARCH_MMU_STATUS_NOT_MAPPED) return 0;
+            if (status || arch_mmu_user_leaf_missing(&record->space,
+                to + address - from, &missing)) __builtin_trap();
+        }
+        struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
+        int error = 0;
+        for (unsigned i = 0; i < 2; i++) if (missing & (1U << i)) {
+            void *table;
+            enum kernel_mm_status status = allocate_private_page(record->space.allocator,
+                &prepared.tables[i], &table);
+            if (status) { error = -KERNEL_ENOMEM; break; }
+            clear_page(table);
+        }
+        if (!error) {
+            KERNEL_RAW_SCOPE(guard, &record->metadata);
+            if (arch_mmu_user_prepare_move(&record->space, to + address - from, &prepared))
+                __builtin_trap();
+        }
+        for (unsigned i = 0; i < 2; i++) if (prepared.tables[i] != KERNEL_MM_NO_PAGE)
+            if (physical_page_release(record->space.allocator, prepared.tables[i])) __builtin_trap();
+        if (error) {
+            if (unmap_space_range(record, to, to + length)) __builtin_trap();
+            return error;
+        }
+    }
+}
+
+static void move_remap_leaves(struct kernel_mm_record *record,
+    uint64_t from, uint64_t length, uint64_t to, int executable)
+{
+    uint64_t cursor = from, address;
+    for (;;) {
+        KERNEL_RAW_SCOPE(guard, &record->metadata);
+        enum arch_mmu_status status = arch_mmu_user_next_owned(
+            &record->space, &cursor, from + length, &address);
+        if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
+        if (status || arch_mmu_user_move_leaf(&record->space, address, to + address - from))
+            __builtin_trap();
+        struct mm_file_resident *page = find_file_resident(record, address);
+        if (page) {
+            unindex_file_resident(record, page);
+            page->address = to + address - from;
+            publish_file_resident(record, page);
+        }
+    }
+    struct kernel_mm_retirement batch = {0};
+    uint32_t targets;
+    {
+        KERNEL_RAW_SCOPE(guard, &record->metadata);
+        targets = note_tlb_change_locked(record, &batch, executable);
+    }
+    /* 新旧VA不连续；先确认所有CPU都不再借用旧翻译，再回收源空表。 */
+    finish_tlb_change(record, &batch, targets, 0, UINT64_MAX, executable);
+    if (unmap_space_range(record, from, from + length)) __builtin_trap();
+}
+
+int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
+    uint64_t old_length, uint64_t new_length, uint64_t flags,
+    uint64_t new_address, uint64_t *result)
+{
+    KERNEL_NO_RECLAIM_IO;
+    uint64_t old_size = (old_length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    uint64_t new_size = (new_length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    if (!result || (flags & ~UINT64_C(7)) || (old_address & BOAROS_PAGE_MASK) ||
+        !new_size || new_size > ARCH_MMU_USER_LIMIT) return -KERNEL_EINVAL;
+    if (flags & 6U) {
+        if (new_address > ARCH_MMU_USER_LIMIT - new_size ||
+            (new_address & BOAROS_PAGE_MASK) || !(flags & 1U) ||
+            ((flags & 4U) && old_size != new_size)) return -KERNEL_EINVAL;
+        if (old_size && old_address < new_address + new_size &&
+            (old_address > UINT64_MAX - old_size || new_address < old_address + old_size))
+            return -KERNEL_EINVAL;
+    }
+    KERNEL_SERVICE_SCOPE_IF(service, 0);
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    uint64_t tail_length = new_size < old_size && old_address < ARCH_MMU_USER_LIMIT &&
+        old_size <= ARCH_MMU_USER_LIMIT - old_address ? old_size - new_size : 0;
+    enum kernel_mm_status status = mm_ranges_operation_begin(mm, new_address,
+        (flags & 2U) ? new_size : 0, tail_length ? old_address + new_size : 0,
+        tail_length, &operation, &service);
+    if (status) return status == KERNEL_MM_STATUS_CONFLICT ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
+    struct kernel_mm_record *record;
+    if (mutable_vma_record(mm, &record)) return -KERNEL_ENOMEM;
+    struct kernel_vma source;
+    if (old_address >= ARCH_MMU_USER_LIMIT ||
+        kernel_vma_set_lookup(record->vmas, old_address, &source)) return -KERNEL_EFAULT;
+    if (!old_size && source.kind != KERNEL_VMA_KIND_ANON_SHARED &&
+        source.kind != KERNEL_VMA_KIND_FILE_SHARED && source.kind != KERNEL_VMA_KIND_SYSV_SHM)
+        return -KERNEL_EINVAL;
+    uint64_t covered = new_size < old_size ? new_size : old_size;
+    if (((flags & 6U) || new_size > old_size) && covered > source.end - old_address) {
+        if ((flags & 6U) == 2U && new_size == old_size &&
+            old_size <= ARCH_MMU_USER_LIMIT - old_address) {
+            /* 多VMA等长批量搬移尚未实现；只在这条边界核验洞与合法未支持。 */
+            uint64_t cursor = source.end;
+            struct kernel_vma next;
+            while (cursor < old_address + old_size) {
+                if (kernel_vma_set_lookup(record->vmas, cursor, &next)) return -KERNEL_EFAULT;
+                cursor = next.end;
+            }
+            return -KERNEL_EOPNOTSUPP;
+        }
+        return -KERNEL_EFAULT;
+    }
+    if (flags & 4U) return -KERNEL_EOPNOTSUPP;
+    if (!old_size) return (flags & 1U) ? -KERNEL_EOPNOTSUPP : -KERNEL_ENOMEM;
+    if (!(flags & 2U) && new_size <= old_size) {
+        if (new_size < old_size) {
+            status = mm_munmap_impl(mm, old_address + new_size, old_size - new_size);
+            if (status) return status == KERNEL_MM_STATUS_INVALID_ARGUMENT ? -KERNEL_EINVAL : -KERNEL_ENOMEM;
+        }
+        *result = old_address;
+        return 0;
+    }
+    if (!(flags & 2U)) {
+        int overlaps = 1;
+        if (old_address <= ARCH_MMU_USER_LIMIT - new_size &&
+            old_address + old_size == source.end &&
+            kernel_vma_set_overlaps(record->vmas, source.end,
+                old_address + new_size, &overlaps)) __builtin_trap();
+        if (!overlaps) new_address = old_address;
+        else {
+            if (!(flags & 1U)) return -KERNEL_ENOMEM;
+            enum kernel_vma_status vs = kernel_vma_set_find_topdown_gap(record->vmas,
+                0, BOAROS_PAGE_SIZE, record->mmap_base, new_size, &new_address);
+            if (vs) return -KERNEL_ENOMEM;
+        }
+    }
+    if (source.role != KERNEL_VMA_ROLE_MMAP || source.kind == KERNEL_VMA_KIND_SYSV_SHM ||
+        source.kind == KERNEL_VMA_KIND_ELF_PRIVATE) return -KERNEL_EOPNOTSUPP;
+    uint64_t offset = source.kind == KERNEL_VMA_KIND_ANONYMOUS ? 0 :
+        source.backing_offset + old_address - source.start;
+    if (offset < source.backing_offset || offset > UINT64_MAX - new_size)
+        return -KERNEL_EINVAL;
+    if (flags & 2U) {
+        if (new_address < BOAROS_PAGE_SIZE) return -KERNEL_EPERM;
+        /* Linux先撤固定目标；后续准备失败不恢复被替换映射。 */
+        status = mm_munmap_impl(mm, new_address, new_size);
+        if (status) return -KERNEL_ENOMEM;
+        if (new_size < old_size) {
+            status = mm_munmap_impl(mm, old_address + new_size, old_size - new_size);
+            if (status) return -KERNEL_ENOMEM;
+            old_size = new_size;
+        }
+        if (kernel_vma_set_lookup(record->vmas, old_address, &source)) return -KERNEL_EFAULT;
+    }
+    struct kernel_vma replacement = source;
+    replacement.start = new_address;
+    replacement.end = new_address + new_size;
+    replacement.backing_offset = offset;
+    struct kernel_vma_remap edit;
+    if (kernel_vma_set_prepare_remap(record->vmas, old_address, old_address + old_size,
+        &replacement, &edit)) return -KERNEL_ENOMEM;
+    if (new_address != old_address) {
+        if (current_pins(mm)) return -KERNEL_EAGAIN;
+        close_pins(&operation, 0);
+        int error = prepare_remap_tables(record, old_address, old_size, new_address);
+        if (error) return error;
+        move_remap_leaves(record, old_address, old_size, new_address,
+            (source.permissions & KERNEL_MM_EXECUTE) != 0);
+    }
+    if (kernel_vma_set_commit_remap(record->vmas, &edit)) __builtin_trap();
+    *result = new_address;
+    return 0;
 }
 
 /* gate固定resident/alias，许可由页write状态仲裁；等待时结束全部对象保护。 */

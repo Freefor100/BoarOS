@@ -2973,6 +2973,21 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+#ifdef CACHE_MM_CASES
+        if (!strcmp(argv[2],"mremap")) {
+            image_fd=open(argv[1],O_RDWR); assert(image_fd>=0);
+            struct stat st; assert(!fstat(image_fd,&st));
+            struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+                .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+            struct kernel_vfs_mount mount={0};
+            assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
+            assert(!kernel_page_cache_start_worker(&cache));
+            disk_remap_case(&heap,&pages,&mount);
+            kernel_page_cache_stop_worker(&cache);
+            assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(&cache));
+            goto owners;
+        }
+#endif
         if (!strcmp(argv[2],"caller-metadata-owners")) {
             caller_metadata_owners(&cache,argv[1]);
             goto owners;

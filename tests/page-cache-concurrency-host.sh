@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|truncate|pressure|pressure-errors|fallocate|durable-progress|caller-metadata-owners) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure|pressure-errors|fallocate|durable-progress|caller-metadata-owners]' >&2; exit 2;; esac
+case "${1:-all}" in all|truncate|pressure|pressure-errors|fallocate|durable-progress|caller-metadata-owners|mremap) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|pressure|pressure-errors|fallocate|durable-progress|caller-metadata-owners|mremap]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -23,6 +23,13 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode,--wrap=kernel_vfs_node_find,--wrap=ext4_mount_setup_time_observer ${CACHE_HOST_LDFLAGS:-} \
         -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
+        if [ "${1:-all}" = mremap ]; then
+            image="$build_dir/mremap-$shift-$block.img"
+            truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"
+            timeout 20s "$build_dir/concurrency-$shift" "$image" mremap
+            e2fsck -fn "$image" > "$build_dir/fsck-mremap-$shift-$block.log" 2>&1
+            continue
+        fi
         if [ "${1:-all}" = caller-metadata-owners ] || [ "${1:-all}" = all ]; then
             image="$build_dir/caller-metadata-owners-$shift-$block.img"
             truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"

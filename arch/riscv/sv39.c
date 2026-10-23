@@ -1445,17 +1445,17 @@ enum riscv_sv39_status riscv_sv39_user_leaf_missing(struct riscv_sv39_user_space
     *mask = m ? 0 : 2;
     return RISCV_SV39_STATUS_OK;
 }
-enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_space *s,
-    uint64_t address, uint64_t physical, uint32_t permissions,
+static enum riscv_sv39_status install_prepared_leaf(struct riscv_sv39_user_space *s,
+    uint64_t address, uint64_t entry,
     struct kernel_mm_leaf_preparation *prepared)
 {
     unsigned missing;
-    if (!prepared || !valid_user_permissions(permissions) || (physical & BOAROS_PAGE_MASK))
+    if (!prepared)
         return RISCV_SV39_STATUS_INVALID;
     enum riscv_sv39_status status = riscv_sv39_user_leaf_missing(s, address, &missing);
     if (status != RISCV_SV39_STATUS_OK) return status;
     unsigned tables = ((missing & 1) != 0) + ((missing & 2) != 0);
-    if (s->table_pages > UINT32_MAX - tables || s->leaf_pages == UINT32_MAX)
+    if (s->table_pages > UINT32_MAX - tables)
         return RISCV_SV39_STATUS_STATE;
     uint64_t *root, *middle, *leaves;
     status = resolve_runtime_table(s->allocator, s->root_address, &root);
@@ -1472,11 +1472,8 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_
     status = resolve_runtime_table(s->allocator, leaf_address, &leaves);
     if (status != RISCV_SV39_STATUS_OK) return status;
     if (leaves[l]) return RISCV_SV39_STATUS_CONFLICT;
-    void *owner;
-    if (physical_page_map_owned(s->allocator, physical, &owner) != PHYSICAL_PAGE_STATUS_OK)
-        return RISCV_SV39_STATUS_STATE;
-    /* 候选树先填好再发布父链接；全部可能失败的解析已结束。 */
-    __atomic_store_n(&leaves[l], user_leaf_entry(physical, permissions), __ATOMIC_RELEASE);
+    /* 搬移准备传零，只发布空表；普通fault仍在发布父链接前填好叶。 */
+    __atomic_store_n(&leaves[l], entry, __ATOMIC_RELEASE);
     if (missing & 2) {
         __atomic_store_n(&middle[m], table_entry(leaf_address), __ATOMIC_RELEASE);
         prepared->tables[1] = KERNEL_MM_NO_PAGE;
@@ -1485,7 +1482,46 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_
         __atomic_store_n(&root[r], table_entry(middle_address), __ATOMIC_RELEASE);
         prepared->tables[0] = KERNEL_MM_NO_PAGE;
     }
-    s->table_pages += tables; s->leaf_pages++; resident_peak(s);
+    s->table_pages += tables;
+    return RISCV_SV39_STATUS_OK;
+}
+enum riscv_sv39_status riscv_sv39_user_prepare_move(struct riscv_sv39_user_space *s,
+    uint64_t address, struct kernel_mm_leaf_preparation *prepared)
+{
+    return install_prepared_leaf(s, address, 0, prepared);
+}
+enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_space *s,
+    uint64_t address, uint64_t physical, uint32_t permissions,
+    struct kernel_mm_leaf_preparation *prepared)
+{
+    if (!s || !valid_user_permissions(permissions) || (physical & BOAROS_PAGE_MASK))
+        return RISCV_SV39_STATUS_INVALID;
+    void *owner;
+    if (s->leaf_pages == UINT32_MAX ||
+        physical_page_map_owned(s->allocator, physical, &owner) != PHYSICAL_PAGE_STATUS_OK)
+        return RISCV_SV39_STATUS_STATE;
+    enum riscv_sv39_status status = install_prepared_leaf(s, address,
+        user_leaf_entry(physical, permissions), prepared);
+    if (status) return status;
+    s->leaf_pages++; resident_peak(s);
+    return RISCV_SV39_STATUS_OK;
+}
+enum riscv_sv39_status riscv_sv39_user_move_leaf(struct riscv_sv39_user_space *s,
+    uint64_t from, uint64_t to)
+{
+    uint64_t *source, *target = 0;
+    if (((from | to) & BOAROS_PAGE_MASK) || from == to)
+        return RISCV_SV39_STATUS_INVALID;
+    enum riscv_sv39_status status = resolve_existing_user_leaf(s, from, &source, 0);
+    if (status) return status;
+    status = resolve_existing_user_leaf(s, to, &target, 0);
+    if (status != RISCV_SV39_STATUS_NOT_MAPPED)
+        return status ? status : RISCV_SV39_STATUS_CONFLICT;
+    if (!target) return RISCV_SV39_STATUS_STATE;
+    if (!valid_user_leaf_entry(*source) && !valid_protected_entry(*source))
+        return RISCV_SV39_STATUS_NOT_MAPPED;
+    uint64_t entry = __atomic_exchange_n(source, 0, __ATOMIC_ACQ_REL);
+    __atomic_store_n(target, entry, __ATOMIC_RELEASE);
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_cow_snapshot(struct riscv_sv39_user_space *s,
