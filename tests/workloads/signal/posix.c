@@ -212,12 +212,13 @@ static void callbacks(void)
     CHECK(!timer_settime(timer,0,&in,0));CHECK(read(handler_pipe[0],&byte,1)==1&&byte=='T'&&!handler_bad);
     CHECK(!timer_delete(timer));CHECK(!close(handler_pipe[0])&&!close(handler_pipe[1]));puts("POSIX CASE handler-libc-thread OK");
 }
-static void burn_cpu(uint64_t duration)
+static void burn_clock(int clock,uint64_t duration)
 {
-    uint64_t until=clock_ns(CLOCK_THREAD_CPUTIME_ID)+duration,value=1;
+    uint64_t until=clock_ns(clock)+duration,value=1;
     do{for(unsigned i=0;i<20000;i++){value=(value<<3)^(value>>7)^17;__asm__ volatile("":"+r"(value));}}
-    while(clock_ns(CLOCK_THREAD_CPUTIME_ID)<until);
+    while(clock_ns(clock)<until);
 }
+static void burn_cpu(uint64_t duration){burn_clock(CLOCK_THREAD_CPUTIME_ID,duration);}
 static void cpu_clocks(void)
 {
     int sig=SIGRTMIN+8;sigset_t set,old;sigemptyset(&set);sigaddset(&set,sig);CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
@@ -229,7 +230,7 @@ static void cpu_clocks(void)
         int armed=set_timer(id,0,&in,0);CHECK(!armed);
         if(!armed) {
             deadline_passed();CHECK(!get_timer(id,&out)&&(out.it_value.tv_sec||out.it_value.tv_nsec>40000000));
-            burn_cpu(90000000);siginfo_t info;struct timespec zero={0};
+            burn_clock(clocks[i],90000000);siginfo_t info;struct timespec zero={0};
             CHECK(sigtimedwait(&set,&info,&zero)==sig&&info.si_code==SI_TIMER&&info.si_timerid==id&&info.si_value.sival_int==100+(int)i);
             CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec);
         }
@@ -263,6 +264,27 @@ static void cpu_target_exit(void)
     CHECK(!get_timer(id,&out)&&!out.it_value.tv_sec&&!out.it_value.tv_nsec&&!out.it_interval.tv_nsec);
     CHECK(error(set_timer(id,0,&in,0),ESRCH)&&!remove_timer(id));CHECK(!close(cpu_ready[0])&&!close(cpu_go[1]));
     puts("POSIX CASE cpu-target-exit OK");
+}
+static void native_output_fault(void)
+{
+    int sig=SIGRTMIN+11;sigset_t set,old;sigemptyset(&set);sigaddset(&set,sig);CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
+    const uint64_t payload=UINT64_C(0x1122334455667788);
+    struct native_event event={.notify=0,.signal=sig,.value=payload};
+    /* The output overlaps the already imported notification input. */
+    CHECK(!create(1,&event,(int *)(void *)&event.value));int id=(int)(uint32_t)event.value;
+    struct itimerspec in=setting(clock_ns(1)-1000,0);CHECK(!set_timer(id,1,&in,0));
+    siginfo_t info;CHECK(sigwaitinfo(&set,&info)==sig&&(uintptr_t)info.si_value.sival_ptr==payload);
+    CHECK(!set_timer(id,1,&in,0));deadline_passed();struct timespec zero={0};
+    CHECK(error(sigtimedwait(&set,(void *)UINTPTR_MAX,&zero),EFAULT));
+    CHECK(error(sigtimedwait(&set,&info,&zero),EAGAIN));
+    int fd=signalfd(-1,&set,SFD_NONBLOCK);CHECK(fd>=0&&!set_timer(id,1,&in,0));deadline_passed();
+    /* An invalid mapped page avoids compiler object-size diagnostics. */
+    void *bad=mmap(0,4096,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(bad!=MAP_FAILED);
+    CHECK(error(read(fd,bad,128),EFAULT));CHECK(error(sigtimedwait(&set,&info,&zero),EAGAIN));
+    in=setting(60000000000ULL,0);CHECK(!set_timer(id,0,&in,&in)&&!in.it_value.tv_sec&&!in.it_value.tv_nsec);
+    CHECK(!get_timer(id,&in)&&in.it_value.tv_sec>=59);
+    CHECK(!remove_timer(id)&&!close(fd)&&!munmap(bad,4096)&&!sigprocmask(SIG_SETMASK,&old,0));
+    puts("POSIX CASE native-output-fault OK");
 }
 static void pending_oneshot(void)
 {
@@ -369,6 +391,6 @@ int main(int argc,char **argv)
     setvbuf(stdout,0,_IONBF,0);signal(SIGALRM,timeout_exit);alarm(20);
     struct native_event none={.notify=SIGEV_NONE};int entry=-1;
     CHECK(!create(1,&none,&entry));if(entry<0)return 1;CHECK(!remove_timer(entry));
-    observe_start();objects();faults_quota();lifecycle();wall();queued_notifications();periodic();stale_and_ignored();exec_pending();cpu_clocks();cpu_target_exit();callbacks();pending_oneshot();timer_group_controls();parallel_timers();observe_end();
+    observe_start();objects();faults_quota();lifecycle();wall();queued_notifications();periodic();stale_and_ignored();exec_pending();cpu_clocks();cpu_target_exit();callbacks();native_output_fault();pending_oneshot();timer_group_controls();parallel_timers();observe_end();
     printf("POSIX END failures=%u\n",failures);return failures?1:0;
 }
