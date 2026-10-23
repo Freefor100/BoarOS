@@ -175,6 +175,12 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
     void (*before_detach)(void *, uint64_t, uint64_t), void *);
 enum riscv_sv39_status riscv_sv39_user_leaf_missing(
     struct riscv_sv39_user_space *, uint64_t, unsigned *);
+/* Install only empty destination tables; move transfers the exact leaf owner.
+ * Both run under MM metadata protection; caller synchronizes before reclaim. */
+enum riscv_sv39_status riscv_sv39_user_prepare_move(
+    struct riscv_sv39_user_space *, uint64_t, struct kernel_mm_leaf_preparation *);
+enum riscv_sv39_status riscv_sv39_user_move_leaf(
+    struct riscv_sv39_user_space *, uint64_t from, uint64_t to);
 enum riscv_sv39_status riscv_sv39_user_map_prepared_page(
     struct riscv_sv39_user_space *, uint64_t, uint64_t, uint32_t,
     struct kernel_mm_leaf_preparation *);

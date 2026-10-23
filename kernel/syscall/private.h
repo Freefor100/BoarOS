@@ -249,6 +249,11 @@ enum kernel_syscall_status syscall_handle_munmap(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_mremap(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_mprotect(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

@@ -7,11 +7,11 @@
 | 文件 | 当前职责 |
 |---|---|
 | `include/kernel/vma.h`、`mm/vma.c` | VMA 描述符、排序集合、查找/选址以及准备—提交式区间编辑 |
-| `include/kernel/mm.h`、`arch/riscv/mm.c` | 匿名/文件私有/文件共享 `mmap`、`munmap`、`mprotect`、`msync`、`brk` 和缺页解析 |
+| `include/kernel/mm.h`、`mm/mm.c` | 匿名/文件私有/文件共享 `mmap`、`mremap`、`munmap`、`mprotect`、`msync`、`brk` 和缺页解析 |
 | `arch/riscv/elf_image.c`、`arch/riscv/mm.c` | 登记 source-backed ELF、栈 reserve、随机 mmap ceiling 与初始 heap 布局 |
 | `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 区间语义、失败原子性、fork、缺页与 1/64/1024 VMA 查找基线 |
 
-一个 VMA 用半开区间 `[start, end)`、R/W/X 权限、kind、role、fault policy 和可选 backing 表示一段逻辑有效的用户地址。PTE 只表示其中已经驻留的 4 KiB 页；没有 PTE 不等于没有 VMA。`ELF_PRIVATE/ELF` 用不可变 ELF source 和 `backing_offset` 描述专用按需装载，`DEMAND_ZERO` 用于栈、heap 和私有匿名 mmap，`ANON_SHARED` 用共享匿名对象与页偏移描述跨 fork 的后备页；`FILE_PRIVATE` 与 `FILE_SHARED` 都用 OFD backing 和文件偏移，所有 VMA 另记 `maximum_permissions`，与当前 R/W/X 分开；共享文件只读 fd 和 `SHM_RDONLY` 附件不保留 WRITE 上限。guard 和被 `munmap` 的洞不属于任何 VMA。
+一个 VMA 用半开区间 `[start, end)`、R/W/X 权限、kind、role、fault policy 和可选 backing 表示一段逻辑有效的用户地址。PTE 只表示其中已经驻留的体系结构页（RV64 为 4 KiB，LA64 为 16 KiB）；没有 PTE 不等于没有 VMA。`ELF_PRIVATE/ELF` 用不可变 ELF source 和 `backing_offset` 描述专用按需装载，`DEMAND_ZERO` 用于栈、heap 和私有匿名 mmap，`ANON_SHARED` 用共享匿名对象与页偏移描述跨 fork 的后备页；`FILE_PRIVATE` 与 `FILE_SHARED` 都用 OFD backing 和文件偏移，所有 VMA 另记 `maximum_permissions`，与当前 R/W/X 分开；共享文件只读 fd 和 `SHM_RDONLY` 附件不保留 WRITE 上限。guard 和被 `munmap` 的洞不属于任何 VMA。
 
 当前生产 MM 入口除静态登记/查询外还包括：
 
@@ -64,7 +64,7 @@ page table commit: 修改 PTE、刷新 TLB，然后完成物理页释放
 VMA commit: 不再分配，按 generation 验证 prepared edit 后拆分/删除/改权/合并
 ```
 
-`prepare` 不改变逻辑集合；相同集合发生任何成功编辑后，旧 edit 因 generation 不匹配而返回 `STATE`。`munmap` 允许范围包含洞，且纯洞删除不需要扩容；`mprotect` 要求整个范围由一个或多个相邻 VMA 无洞覆盖，否则在修改 PTE 前返回 `NOT_MAPPED`。`mprotect` 还先逐段检查权限上限，超限在修改 PTE 前返回 `ACCESS`（用户态 `EACCES`）；降权后仍可恢复上限内的权限，split/fork 保留上限。这保证 metadata OOM 不会发生在硬件映射已经改变之后。当前单 hart、关中断路径使 PTE 与 VMA 提交不被并发观察；SMP 时必须用 MM 写锁和远端 TLB shootdown 扩展同一不变量。
+`prepare` 不改变逻辑集合；相同集合发生任何成功编辑后，旧 edit 因 generation 不匹配而返回 `STATE`。`munmap` 允许范围包含洞，且纯洞删除不需要扩容；`mprotect` 要求整个范围由一个或多个相邻 VMA 无洞覆盖，否则在修改 PTE 前返回 `NOT_MAPPED`。`mprotect` 还先逐段检查权限上限，超限在修改 PTE 前返回 `ACCESS`（用户态 `EACCES`）；降权后仍可恢复上限内的权限，split/fork 保留上限。这保证 metadata OOM 不会发生在硬件映射已经改变之后。MM operation gate 串行化 VMA 与页表编辑，metadata raw 保护实际 PTE/resident/pin 发布，旧页和页表在活动 CPU 完成失效后回收。`kernel_vma_set_prepare_remap()` 为源拆分和目标插入一次预留容量，`commit_remap()` 在页表迁移后不再分配；完整搬移语义与资源规则见 [MM mremap](kernel-mm.md#mremap-区间调整与搬移)。
 
 ## `brk`、fork 与回收
 

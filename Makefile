@@ -2338,6 +2338,10 @@ test-mm-concurrency-host:
 test-futex-host:
 	sh tests/futex-host.sh
 
+.PHONY: test-mm-remap-host
+test-mm-remap-host:
+	sh tests/mm-remap-host.sh
+
 test-mm-shared-concurrency-host:
 	@mkdir -p build/host/mm
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \

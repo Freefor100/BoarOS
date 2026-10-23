@@ -226,7 +226,11 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#if defined(ABI_RESOURCE_LIMITS_ONLY)
+#if defined(ABI_MREMAP_ONLY)
+    abi_mremap_cases();
+#elif defined(ABI_PROC_ONLY)
+    abi_proc_cases();
+#elif defined(ABI_RESOURCE_LIMITS_ONLY)
     abi_core_limit_cases();
     abi_capability_cases();
     abi_fsize_cases();

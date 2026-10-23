@@ -73,6 +73,10 @@ void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
 void arch_mmu_flush_all(void);
 enum arch_mmu_status arch_mmu_user_leaf_missing(
     struct arch_mmu_user_space *, uint64_t, unsigned *);
+enum arch_mmu_status arch_mmu_user_prepare_move(
+    struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf_preparation *);
+enum arch_mmu_status arch_mmu_user_move_leaf(
+    struct arch_mmu_user_space *, uint64_t from, uint64_t to);
 enum arch_mmu_status arch_mmu_user_map_prepared_page(
     struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t,
     struct kernel_mm_leaf_preparation *);

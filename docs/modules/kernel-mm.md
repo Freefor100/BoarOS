@@ -170,6 +170,18 @@ MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在�
 
 `kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
+## `mremap` 区间调整与搬移
+
+`kernel_mm_mremap()` 返回零或负 Linux errno，成功才写入新地址。普通 mmap 建立的私有/共享匿名及普通文件映射支持缩小、原地扩大、`MREMAP_MAYMOVE` 自动选址和 `MREMAP_FIXED|MREMAP_MAYMOVE` 固定搬移；源可以是单个 VMA 的子范围。非固定缩小沿用 munmap 尾部语义，等长不移动直接保留地址；原地扩大要求旧范围结束于源 VMA 末端，新增区间无映射。新增页继续按原后备缺页，不预分配整段数据内存。
+
+入口在 MM gate 下分别检查固定目标和实际缩小旧尾；任一区间含 SysV 附件时先结束 operation、转入 CPU0 服务再重取 gate 并重查，避免远端关闭附件目录引用，也不把两区间之间的无关映射纳入迁移判断。搬移在共同 MM gate 下准备 VMA 两端拆分及插入容量，关闭新用户页 pin 并排空已有 pin，再按驻留页预留目标页表。两架构后端转移原始叶 PTE，保留物理引用、COW、`PROT_NONE` 和访问权限，数据页不复制，RSS 不变；同一次 raw 修改迁移文件 resident 的地址哈希与链表登记。整个区间的叶转移后同步活动 CPU 的新旧翻译，确认完成再通过普通退休协议回收源空表；VMA 提交无需分配。准备阶段 OOM 归还未发布候选，已经发布的空目标表也经失效确认后回收，源叶仍保留。
+
+VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名对象本身是无固定长度的稀疏页索引，扩大不更换对象，fork 两侧扩大到同一对象偏移仍看到同一页。文件来源 OFD、node–MM 登记和缓存 alias 在搬移期间继续由原 owner 持有；缓存回调取得 MM gate 后读取 resident 的当前地址，因此搬移前已借出的旧地址回调仍保护新地址。截断回调同样在取得 gate 后按当前 VMA/offset 处理 EOF，旧地址被其他映射复用不改变新映射。
+
+参数校验顺序依据固定的 [`mm/mremap.c`](../../references/linux/mm/mremap.c)。固定目标先撤销，随后页表准备失败不会恢复该目标；固定缩小也可先撤源尾部，接口不承诺整次失败无副作用。合法的 `MREMAP_DONTUNMAP`、`old_size=0` 共享复制、特殊映射搬移，以及跨多个连续 VMA 的等长固定搬移返回 `EOPNOTSUPP`；私有映射零旧长度、缺失 MAYMOVE、重叠固定区间等仍先返回对应参数错误。跨 VMA 扩大及包含洞的跨 VMA 搬移返回 `EFAULT`。
+
+`sh tests/mm-remap-host.sh` 检查物理身份、COW/保护页、子范围、共享对象、文件偏移/EOF、准备 OOM、pin 排空及延迟 TLB 确认后的 owner 归还；文件截断用明确握手覆盖回调等待期间的再次搬移和旧 VA 复用。`CACHE_HOST_BLOCKS=4096 sh tests/mm-disk-concurrency-host.sh mremap` 使用真实 ext4 与页缓存检查搬移前借出的 alias 回调、搬移后写入和同步，以及资源归还。宿主 MM 用 RV64/4 KiB 后端；LA64/16 KiB 使用真实用户差分验证，不能由修改宿主页大小宏替代。
+
 ## 硬件用户缺页解析
 
 `kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。

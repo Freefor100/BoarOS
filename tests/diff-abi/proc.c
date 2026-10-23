@@ -8,9 +8,9 @@ extern long abi_clone_entry(long flags, void *stack, int *tid,
 static unsigned char proc_thread_stack[16384] __attribute__((aligned(16)));
 static volatile int proc_thread_tid;
 static volatile int proc_thread_ready;
-static volatile int proc_thread_release;
 struct proc_exec_result {
     long pid, tid, status_result, threads, exe_result;
+    long stale_thread, held_leader, held_task;
     char exe[64];
 };
 
@@ -137,12 +137,87 @@ static long proc_status_fields(const char *path, char *state, long *threads)
     return result;
 }
 
+static unsigned proc_path_number(char *path, unsigned used, long number)
+{
+    char reverse[24]; unsigned count = 0;
+    do { reverse[count++] = '0' + number % 10; number /= 10; } while (number);
+    while (count) path[used++] = reverse[--count];
+    path[used] = 0;
+    return used;
+}
+
+static void proc_task_path(char *path, long pid, long tid, const char *file)
+{
+    proc_child_path(path, pid);
+    unsigned used = 0; while (path[used]) used++;
+    const char task[] = "/task/";
+    for (unsigned i = 0; i < sizeof(task) - 1; i++) path[used++] = task[i];
+    used = proc_path_number(path, used, tid);
+    if (file) { path[used++] = '/'; while (*file) path[used++] = *file++; }
+    path[used] = 0;
+}
+
+static long proc_read_path(const char *path, char *data, unsigned size)
+{
+    long fd = abi_open(path, 0);
+    if (fd < 0) return fd;
+    long result = SC3(63, fd, data, size);
+    abi_require(SC1(57, fd) == 0);
+    return result;
+}
+
+static unsigned long memory_field(const char *, long, const char *);
+static int proc_text_has(const char *text, long length, const char *wanted)
+{
+    for (long i = 0; i < length; i++) {
+        unsigned j = 0;
+        while (wanted[j] && i + j < length && text[i + j] == wanted[j]) j++;
+        if (!wanted[j]) return 1;
+    }
+    return 0;
+}
+
+static long proc_stat_number(const char *text, long length, unsigned field)
+{
+    long at = 0;
+    for (long i = 0; i < length; i++) if (text[i] == ')') at = i + 2;
+    if (!at) return -999;
+    unsigned current = 3;
+    while (at < length && current < field) {
+        while (at < length && text[at] != ' ') at++;
+        while (at < length && text[at] == ' ') at++;
+        current++;
+    }
+    int negative = at < length && text[at] == '-';
+    if (negative) at++;
+    long value = 0;
+    while (at < length && text[at] >= '0' && text[at] <= '9')
+        value = value * 10 + text[at++] - '0';
+    return negative ? -value : value;
+}
+
+static int proc_thread_pipe[2];
+static volatile int proc_thread_self_ok;
+
 static void proc_live_thread(void *unused)
 {
     (void)unused;
+    unsigned long mask = (1UL << 9) | (1UL << 11);
+    int priority = 1;
+    abi_require(SC4(135, 0, &mask, 0, 8) == 0);
+    abi_require(SC3(119, 0, 2, &priority) == 0);
+    char expected[80], target[80];
+    unsigned used = proc_path_number(expected, 0, SC0(172));
+    const char task[] = "/task/";
+    for (unsigned i = 0; i < sizeof(task) - 1; i++) expected[used++] = task[i];
+    used = proc_path_number(expected, used, SC0(178));
+    long n = SC4(78, -100, "/proc-probe/thread-self", target, sizeof(target));
+    int same = n == used;
+    for (unsigned i = 0; same && i < used; i++) if (target[i] != expected[i]) same = 0;
+    proc_thread_self_ok = same;
     __atomic_store_n(&proc_thread_ready, 1, __ATOMIC_RELEASE);
-    while (!__atomic_load_n(&proc_thread_release, __ATOMIC_ACQUIRE))
-        SC0(124);
+    char byte;
+    abi_require(SC3(63, proc_thread_pipe[0], &byte, 1) == 1);
 }
 
 static void proc_group_thread(void *argument)
@@ -159,6 +234,12 @@ void abi_proc_exec_probe(void)
     char state = 0;
     result.pid = SC0(172);
     result.tid = SC0(178);
+    char text[2048], digits[24];
+    result.stale_thread = SC3(63, 300, text, sizeof(text)) == -3 ? 0 : -1;
+    result.held_leader = proc_status_fd_fields(301, &state, &result.threads);
+    proc_path_number(digits, 0, result.tid);
+    result.held_task = proc_directory_has(302, digits) ? 0 : -1;
+    SC1(57, 300); abi_require(SC1(57, 301) == 0); SC1(57, 302);
     result.status_result = proc_status_fields("/proc-probe/self/status",
                                               &state, &result.threads);
     result.exe_result = SC4(78, -100, "/proc-probe/self/exe",
@@ -173,6 +254,14 @@ void abi_proc_exec_probe(void)
 static void proc_exec_thread(void *unused)
 {
     (void)unused;
+    char path[96];
+    proc_task_path(path, SC0(172), SC0(178), "status");
+    long fd = abi_open(path, 0);
+    if (fd >= 0) { abi_require(SC3(24, fd, 300, 0) == 300); abi_require(SC1(57, fd) == 0); }
+    fd = abi_open("/proc-probe/self/status", 0);
+    abi_require(fd >= 0 && SC3(24, fd, 301, 0) == 301 && SC1(57, fd) == 0);
+    fd = abi_open("/proc-probe/self/task", 65536);
+    if (fd >= 0) { abi_require(SC3(24, fd, 302, 0) == 302); abi_require(SC1(57, fd) == 0); }
     const char *argv[] = {"/init", "proc-exec-probe", 0};
     const char *env[] = {0};
     SC3(221, argv[0], argv, env);
@@ -200,6 +289,9 @@ static void proc_nonleader_exec_cases(void)
     abi_require(SC1(57, fd) == 0);
     abi_record("proc.nonleader-exec-pid", result.pid == child ? 0 : -1,
                result.tid == child ? 0 : -1, -1, 0, 0, 0);
+    abi_record("proc.nonleader-exec-old-thread", result.stale_thread, -1, -1, 0, 0, 0);
+    abi_record("proc.nonleader-exec-held-leader", result.held_leader, -1, -1, 0, 0, 0);
+    abi_record("proc.nonleader-exec-held-task", result.held_task, -1, -1, 0, 0, 0);
     abi_record("proc.nonleader-exec-status", result.status_result,
                result.threads, -1, 0, 0, 0);
     abi_record("proc.nonleader-exec-exe", result.exe_result, -1, -1, 0,
@@ -209,9 +301,11 @@ static void proc_nonleader_exec_cases(void)
 
 static void proc_thread_cases(void)
 {
+    unsigned long shared_mask = 1UL << 11, saved_mask;
+    abi_require(SC4(135, 0, &shared_mask, &saved_mask, 8) == 0);
+    abi_require(SC2(59, proc_thread_pipe, 0) == 0);
     proc_thread_tid = 73;
     proc_thread_ready = 0;
-    proc_thread_release = 0;
     long member = abi_clone_entry(PROC_CLONE_THREAD | PROC_CHILD_SETTID |
                                   PROC_CHILD_CLEARTID,
                                   proc_thread_stack + sizeof(proc_thread_stack),
@@ -225,7 +319,52 @@ static void proc_thread_cases(void)
     long result = proc_status_fields("/proc-probe/self/status", &state,
                                      &threads);
     abi_record("proc.thread-live", result, threads, -1, 0, 0, 0);
-    proc_thread_release = 1;
+    abi_record("proc.thread-self", proc_thread_self_ok ? 0 : -1, -1, -1, 0, 0, 0);
+    char thread_path[96], text[2048], digits[24];
+    proc_task_path(thread_path, SC0(172), member, "status");
+    long held_thread = abi_open(thread_path, 0);
+    proc_task_path(thread_path, SC0(172), member, 0);
+    long held_thread_dir = abi_open(thread_path, 65536);
+    proc_task_path(thread_path, SC0(172), member, "status");
+    abi_require(SC3(131, SC0(172), member, 10) == 0);
+    abi_require(SC2(129, SC0(172), 12) == 0);
+    long thread_result = -2;
+    for (unsigned attempt = 0; attempt < 10000U; attempt++) {
+        thread_result = proc_status_fields(thread_path, &state, &threads);
+        if (thread_result || state == 'S') break;
+        SC0(124);
+    }
+    abi_record("proc.thread-status-sleep", thread_result, threads, -1, 0,
+               &state, thread_result ? 0 : 1);
+    long status_length = proc_read_path(thread_path, text, sizeof(text));
+    int fields_ok = status_length > 0 &&
+        memory_field(text, status_length, "Pid:") == (unsigned long)member &&
+        memory_field(text, status_length, "Tgid:") == (unsigned long)SC0(172) &&
+        proc_text_has(text, status_length, "SigPnd:\t0000000000000200\n") &&
+        proc_text_has(text, status_length, "ShdPnd:\t0000000000000800\n") &&
+        proc_text_has(text, status_length, "SigBlk:\t0000000000000a00\n");
+    abi_record("proc.thread-status-fields", fields_ok ? 0 : -1, -1, -1, 0, 0, 0);
+    unsigned char signal_info[128];
+    long zero_timeout[2] = {0, 0};
+    abi_require(SC4(137, &shared_mask, signal_info, zero_timeout, 8) == 12);
+    abi_require(SC4(135, 2, &saved_mask, 0, 8) == 0);
+    proc_task_path(thread_path, SC0(172), member, "stat");
+    long got = proc_read_path(thread_path, text, sizeof(text));
+    int stat_ok = got > 0 && proc_text_has(text, got, ") S ") &&
+        proc_stat_number(text, got, 18) == -2 &&
+        proc_stat_number(text, got, 20) == 2 &&
+        proc_stat_number(text, got, 35) != 0 &&
+        proc_stat_number(text, got, 38) == -1 &&
+        proc_stat_number(text, got, 40) == 1 &&
+        proc_stat_number(text, got, 41) == 2;
+    unsigned ndigits = proc_path_number(digits, 0, member);
+    for (unsigned i = 0; stat_ok && i < ndigits; i++) if (text[i] != digits[i]) stat_ok = 0;
+    abi_record("proc.thread-stat", stat_ok ? 0 : -1, -1, -1, 0, 0, 0);
+    long directory = abi_open("/proc-probe/self/task", 65536);
+    abi_record("proc.task-enumerate-live", proc_directory_has(directory, digits) ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    if (directory >= 0) abi_require(SC1(57, directory) == 0);
+    abi_require(SC3(64, proc_thread_pipe[1], "x", 1) == 1);
     for (unsigned attempt = 0; proc_thread_tid && attempt < 10000U;
          attempt++) SC0(124);
     abi_require(!proc_thread_tid);
@@ -238,6 +377,61 @@ static void proc_thread_cases(void)
     }
     abi_require(threads==1);
     abi_record("proc.thread-after-exit", result, threads, -1, 0, 0, 0);
+    long stale = held_thread >= 0 ? SC3(63, held_thread, text, sizeof(text)) : -9;
+    abi_record("proc.thread-held-exited", stale == -3 && held_thread >= 0 ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    volatile int replacement_control[2] = {0, 0};
+    proc_thread_tid = 73;
+    long replacement_tid = abi_clone_entry(PROC_CLONE_THREAD | PROC_CHILD_SETTID |
+        PROC_CHILD_CLEARTID, proc_thread_stack + sizeof(proc_thread_stack),
+        (int *)&proc_thread_tid, proc_group_thread, (void *)replacement_control);
+    abi_require(replacement_tid > 0);
+    static char replacement_note[96] = "proc thread old=";
+    unsigned note_length = proc_path_number(replacement_note, 16U, member);
+    const char new_label[] = " replacement=";
+    for (unsigned i = 0; i < sizeof(new_label) - 1U; i++)
+        replacement_note[note_length++] = new_label[i];
+    note_length = proc_path_number(replacement_note, note_length, replacement_tid);
+    replacement_note[note_length++] = '\n';
+    abi_require(SC3(64, 2, replacement_note, note_length) == note_length);
+    while (!__atomic_load_n(&replacement_control[0], __ATOMIC_ACQUIRE)) SC0(124);
+    stale = held_thread >= 0 ? SC3(63, held_thread, text, sizeof(text)) : -9;
+    long old_lookup = held_thread_dir >= 0 ? SC4(56, held_thread_dir, "status", 0, 0) : -9;
+    static char errno_note[96] = "proc thread stale=";
+    unsigned errno_length = 18U;
+    if (stale < 0) errno_note[errno_length++] = '-';
+    errno_length = proc_path_number(errno_note, errno_length, stale < 0 ? -stale : stale);
+    const char lookup_label[] = " lookup=";
+    for (unsigned i = 0; i < sizeof(lookup_label) - 1U; i++)
+        errno_note[errno_length++] = lookup_label[i];
+    if (old_lookup < 0) errno_note[errno_length++] = '-';
+    errno_length = proc_path_number(errno_note, errno_length,
+                                   old_lookup < 0 ? -old_lookup : old_lookup);
+    errno_note[errno_length++] = '\n';
+    abi_require(SC3(64, 2, errno_note, errno_length) == errno_length);
+    abi_record("proc.thread-old-after-replacement", stale == -3 && old_lookup == -2 ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    if (old_lookup >= 0) abi_require(SC1(57, old_lookup) == 0);
+    proc_task_path(thread_path, SC0(172), replacement_tid, "status");
+    long replacement_length = proc_read_path(thread_path, text, sizeof(text));
+    abi_record("proc.thread-replacement-status", replacement_length > 0 &&
+        memory_field(text, replacement_length, "Pid:") == (unsigned long)replacement_tid ? 0 : -1,
+        -1, -1, 0, 0, 0);
+    __atomic_store_n(&replacement_control[1], 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&proc_thread_tid, __ATOMIC_ACQUIRE)) SC0(124);
+    for (unsigned attempt = 0; attempt < 10000U; attempt++) {
+        abi_require(!proc_status_fields("/proc-probe/self/status", &state, &threads));
+        if (threads == 1) break;
+        SC0(124);
+    }
+    abi_require(threads == 1);
+    if (held_thread >= 0) abi_require(SC1(57, held_thread) == 0);
+    if (held_thread_dir >= 0) abi_require(SC1(57, held_thread_dir) == 0);
+    directory = abi_open("/proc-probe/self/task", 65536);
+    abi_record("proc.task-enumerate-exited", directory >= 0 && !proc_directory_has(directory, digits) ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    if (directory >= 0) abi_require(SC1(57, directory) == 0);
+    abi_require(SC1(57, proc_thread_pipe[0]) == 0 && SC1(57, proc_thread_pipe[1]) == 0);
 
     volatile int *control = (void *)CALL(222, 0, ABI_PAGE_SIZE, 3, 0x21, -1, 0);
     abi_require((long)control > 0);
@@ -257,6 +451,7 @@ static void proc_thread_cases(void)
                                    (int *)&control[3], proc_group_thread,
                                    (void *)control);
         abi_require(tid > 0);
+        __atomic_store_n(&control[5], (int)tid, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&control[4], __ATOMIC_ACQUIRE)) SC0(124);
         abi_exit(0);
     }
@@ -291,6 +486,25 @@ static void proc_thread_cases(void)
     result = proc_status_fields(path, &state, &threads);
     abi_record("proc.group-leader-status", result, threads, -1, 0,
                &state, 1);
+    char member_path[96], member_digits[24], member_text[2048];
+    proc_task_path(member_path, child, control[5], "status");
+    long member_result = proc_read_path(member_path, member_text, sizeof(member_text));
+    abi_record("proc.group-member-status", member_result > 0 ? 0 : member_result,
+               -1, -1, 0, 0, 0);
+    proc_child_path(member_path, child);
+    unsigned used = 0; while (member_path[used]) used++;
+    const char task_suffix[] = "/task";
+    for (unsigned i = 0; i < sizeof(task_suffix); i++) member_path[used + i] = task_suffix[i];
+    long members = abi_open(member_path, 65536);
+    proc_path_number(member_digits, 0, control[5]);
+    abi_record("proc.group-member-enumerate", proc_directory_has(members, member_digits) ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    if (members >= 0) abi_require(SC1(57, members) == 0);
+    proc_task_path(member_path, SC0(172), control[5], "status");
+    member_result = abi_open(member_path, 0);
+    abi_record("proc.thread-wrong-group", member_result < 0 ? member_result : 0,
+               -1, -1, 0, 0, 0);
+    if (member_result >= 0) abi_require(SC1(57, member_result) == 0);
     const char exe_suffix[] = "/exe";
     for (unsigned i = 0; i < sizeof(exe_suffix); i++)
         path[path_length + i] = exe_suffix[i];
