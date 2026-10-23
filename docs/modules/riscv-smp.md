@@ -60,6 +60,8 @@ make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bi
 
 COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4 前台文件与目录元数据在发起 CPU 执行；日志、设备配置、网络协议和其他文件系统命名空间沿各自 CPU0 范围执行。分配器通知和同步干净回收可就地执行。LA 仍为单核。
 
+futex 的等待、唤醒、比较重排与复合唤醒在发起 CPU 执行。MM 准备统一取得等待键与用户字 pin，桶操作锁序列化登记和迁移，调度短锁只处理单个等待节点；退出清理与远端唤醒沿同一协议。具体行为见[调度模块](kernel-scheduler.md#等待与-futex)。
+
 socket 普通收发在实际发起 CPU 完成队列预约、用户复制、发送额度接纳与等待。TCP COPY、UDP pbuf 准备/发送仍交给已有 CPU0 worker；请求及 pin 由调用者保留到结果发布。控制与最终销毁继续在 CPU0，远端 epoll 通知持有真实等待游标借用。具体状态和停止规则见[网络模块](kernel-network.md#发起-cpu-与等待寿命)。
 
 ## 启动与本地状态

@@ -459,6 +459,7 @@ ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
 LDFLAGS += -Wl,--wrap=kernel_pipe_readv,--wrap=kernel_pipe_writev,--wrap=kernel_open_file_poll,--wrap=kernel_event_fd_io,--wrap=syscall_handle_timerfd,--wrap=kernel_timer_fd_expire
 LDFLAGS += -Wl,--wrap=kernel_signal_queue_info,--wrap=kernel_signal_wait_take,--wrap=kernel_signal_fd_take,--wrap=kernel_signal_fd_poll,--wrap=signal_pending_prepare,--wrap=kernel_signal_release_table
+LDFLAGS += -Wl,--wrap=kernel_mm_prepare_futex
 LDFLAGS += -Wl,--wrap=syscall_handle_posix_timer,--wrap=posix_timer_record_complete,--wrap=kernel_posix_timer_expire,--wrap=scheduler_cpu_timer_expire
 LDFLAGS += -Wl,--wrap=kernel_signal_stack_prepare,--wrap=riscv_signal_restore_current
 LDFLAGS += -Wl,--wrap=kernel_socket_reserve_read,--wrap=kernel_socket_stream_reserve,--wrap=kernel_socket_write_datagram,--wrap=kernel_socket_write_unix,--wrap=kernel_socket_wait_ready,--wrap=kernel_socket_service_owned,--wrap=kernel_copy_from_user,--wrap=kernel_wait_cursor_wake,--wrap=kernel_wait_backend_quiesce
