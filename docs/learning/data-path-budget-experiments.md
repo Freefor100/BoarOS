@@ -2,6 +2,27 @@
 
 各日期节的“当前”“最终”和“本轮”均指该节固定内核与工作负载；最新机制见模块文档，各轮性能结论不跨版本转移。
 
+## 实时信号与signalfd原程序短例（2026-10-23）
+
+通用队列、载荷、SIGPENDING额度、发送接口和signalfd已从main单向合入。机制见[信号模块](../modules/kernel-signal.md)，固定27次性能对照、同一SMP内核的1/2/4核加速比及剩余负加速集中见[CPU成本文档](cpu-accounting-cost.md#实时信号队列与signalfd成本2026-10-23)。
+
+固定官方容器断网构建，沿原QEMU设备参数运行；RV与LA并行，每个架构内依次执行glibc和musl。只选择signalfd01、signalfd4_01、signalfd4_02、rt_sigqueueinfo01的原始ELF，参数、libc、judge、内部时限、跳过表及现有单程序监督保持原值。16次程序全部退出0，无超时、准备失败或未进入的主体步骤；累计24个细项TPASS。
+
+每格依次为“成功细项；原judge得分；程序耗时ms”。
+
+| 原程序 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| signalfd01 | 2通过；0/0；83 | 2通过；0/0；41 | 2通过；0/0；83 | 2通过；0/0；42 |
+| signalfd4_01 | 1通过；0/0；70 | 1通过；0/0；42 | 1通过；0/0；64 | 1通过；0/0；63 |
+| signalfd4_02 | 1通过；0/0；42 | 1通过；0/0；41 | 1通过；0/0；43 | 1通过；0/0；42 |
+| rt_sigqueueinfo01 | 2通过；2/2；105 | 2通过；2/2；63 | 2通过；2/2；88 | 2通过；2/2；63 |
+
+signalfd01的两项分别检查创建和重新设置接收掩码；signalfd4_01检查CLOEXEC，signalfd4_02检查NONBLOCK，四种组合均成功。这三个程序只逐行打印TPASS，没有`Summary:`汇总；原judge仅从汇总读取passed，因而各记0/0。rt_sigqueueinfo01输出Summary，两项分别确认收到正确的信号与数据、发送调用成功，每种组合2/2，四组合合计8/8。功能成功数和judge计分范围在上表分开保留，索引见[测例问题](oscomp-test-issues.md#原脚本调用与判分差异)。
+
+四个程序耗时之和，RV glibc/musl为300/187ms，LA为278/210ms；它们是各程序内部监督的总耗时之和，启动、准备及组间调度另计。rt_sigqueueinfo01提示缺少oom_score_adj，只跳过其OOM倾向调节，两个主体步骤均执行完成。
+
+原程序没有覆盖的FIFO竞争、额度、fork/exec、故障消费和跨核生命周期由通用短例检查。正常退出后，两根盘及两张第二盘的工具ext4/VFAT/scratch ext4共8个对象只读检查均为0；启动种子槽已擦除。默认交付内核已恢复并与同次默认构建逐字节一致。原日志、细项、judge、内核和QEMU身份保留在`build/sigqueue/original/`，运行副本检查后清理。
+
 ## sigaltstack原程序短例（2026-10-22）
 
 每线程备用栈、SA_ONSTACK、AUTODISARM与两架构sigreturn恢复已从main单向合入。实际机制和通用验证见[信号模块](../modules/kernel-signal.md#每线程备用栈)；固定18次普通路径及启用成本对照统一见[CPU成本文档](cpu-accounting-cost.md#备用信号栈普通路径与启用成本2026-10-22)。该批保留UP普通信号+3.80%、四核getpid+3.27%的超线项。
