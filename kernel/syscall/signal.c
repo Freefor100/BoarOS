@@ -215,7 +215,6 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct { int64_t seconds, nanoseconds; } timeout;
     uint8_t user_info[128];
     struct kernel_signal_wait_info taken;

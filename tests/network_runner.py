@@ -96,14 +96,13 @@ def run_smp(args):
     expected=[f'SOCKET-SMP CASE {name} OK' for name in ('ipv4-tcp','ipv6-tcp','ipv4-udp','ipv6-udp','unix-stream','unix-dgram','blocking-close-reuse-cancel','fault-empty-trunc-timeout-sendfile','shared-readers-writers','remote-epoll-oneshot-nested')]+['SOCKET-SMP END 10']
     pipe=args.workload=='pipe';event=args.workload=='event';altstack=args.workload=='altstack'
     queued=args.workload=='queued'
-    if queued and args.observe:raise ValueError('queued observation profile is not configured')
     if altstack:expected=[f'ALTSTACK CASE {name} OK' for name in ('abi','frames','bad-stacks','lifecycle','threads')]+['ALTSTACK CASE copy-races SKIP','ALTSTACK END 6']
     if event:expected=[f'EVENT CASE {name} OK' for name in ('counter-flags-limit','vectors-fault-alias','timer-clocks-periodic','timer-fault-commit','eventfd-direct','eventfd-epoll','timerfd-remote','lifecycle-close-reuse-signal-exec')]+['EVENT END 8']
     if pipe:expected=[f'PIPE CASE {name} OK' for name in ('stream-one','stream-four','ppoll-four','pselect-four','epoll-four','close-reuse-eof-signal','vectors-fault-fifo-sendfile-mixed-poll','epoll-modes-fault-rearm')]+['PIPE END 8']
     try:
         for cpus in args.cpus or [4]:
             for memory in args.memory or ['512M']:
-                if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED END failures=0']
+                if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]
                 folder=output/f'{cpus}cpu-{memory}';folder.mkdir()
                 fixture=harness.fixture(folder,program)
                 if args.dynamic:
@@ -114,7 +113,7 @@ def run_smp(args):
                     disk=folder/(target+'.img');shutil.copyfile(fixture,disk)
                     if target=='boaros' and args.observe:
                         marker=folder/'socket-observer';marker.write_text('private correctness observations\n')
-                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
+                        batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('queued-observer' if queued else 'altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
                         harness.run_logged(['debugfs','-w','-f',str(batch),str(disk)],folder/'observer-install.log')
                     raw,record,_=boot_user('qemu-system-riscv64',args.firmware,str(kernel.resolve()),disk,memory,cpus,folder,target=='linux')
                     lines=[line[line.index('SOCKET-SMP '):] for line in raw.replace('\r','').splitlines() if 'SOCKET-SMP ' in line]
@@ -124,9 +123,10 @@ def run_smp(args):
                     if altstack:
                         lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('ALTSTACK CASE ') or line.startswith('ALTSTACK END ')]
                         expected[-2]='ALTSTACK CASE copy-races '+('OK' if target=='boaros' and args.observe and cpus>1 else 'SKIP')
+                    if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     passed=lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -148,6 +148,11 @@ def run_smp(args):
                         observations=[[int(v,16) for v in row] for row in re.findall(r'ALTSTACK caller cpu=(0x[0-9a-f]+) frames=(0x[0-9a-f]+) returns=(0x[0-9a-f]+)',raw)]
                         active=[row for row in observations if row[0]<cpus]
                         passed=passed and len(active)==cpus and {row[0] for row in active}==set(range(cpus)) and all(all(row[1:]) for row in active) and all(not any(row[1:]) for row in observations if row[0]>=cpus)
+                    if target=='boaros' and args.observe and queued:
+                        observations=[[int(v,16) for v in row] for row in re.findall(r'QUEUED caller cpu=(0x[0-9a-f]+) waits=(0x[0-9a-f]+) reads=(0x[0-9a-f]+) queries=(0x[0-9a-f]+)',raw)]
+                        active=[row for row in observations if row[0]<cpus]
+                        passed=passed and len(active)==cpus and all(all(row[1:]) for row in active)
+                        passed=passed and 'QUEUED source-holds=0x1 prepared-holds=0x1' in raw
                     row=dict(target=target,cpus=cpus,memory=memory,passed=passed,observations=observations,**record);report['runs'].append(row)
                     print(target,cpus,memory,'PASS' if passed else 'FAIL',output,flush=True)
                     if not passed:raise RuntimeError('socket SMP stream or owner cleanup failed: '+str(folder))

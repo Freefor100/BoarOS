@@ -24,15 +24,14 @@ static struct kernel_signal_pending_state *state(struct kernel_task *t,int share
 static uint64_t *bits(struct kernel_task *t,int shared)
 { return shared ? &t->group_pending : &t->signal_pending; }
 
-void signal_pending_prepare(struct kernel_task *t,int shared,
+void signal_pending_prepare(struct kernel_task *t,int shared,struct kernel_heap *heap,
     const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
 {
     if(info->signal<32 && !supplied)return;
-    int needs_index;struct kernel_heap *heap;
+    int needs_index;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if(t->proc_exiting)return;
-        needs_index=!state(t,shared)->queue;heap=t->files.heap;
+        needs_index=!state(t,shared)->queue;
     }
     if(!heap)return;
     if(needs_index && !kernel_heap_allocate_zeroed(heap,1,sizeof(*p->index),(void **)&p->index))

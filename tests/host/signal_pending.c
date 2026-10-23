@@ -29,7 +29,7 @@ static int post(struct kernel_task *t,int shared,unsigned sig,int code,uint64_t 
 {
     struct signal_pending_prepared p={0};
     struct kernel_signal_wait_info info={.signal=sig,.code=code,.sender=42,.value=value};
-    signal_pending_prepare(t,shared,&info,supplied,&p);int result;
+    signal_pending_prepare(t,shared,&heap,&info,supplied,&p);int result;
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);result=signal_pending_post_locked(t,shared,&info,supplied,&p);}
     signal_pending_finish(&p);return result<0?result:0;
 }
@@ -46,12 +46,12 @@ static void *produce(void *arg)
     struct sender *s=arg;
     struct signal_pending_prepared p={0};
     struct kernel_signal_wait_info info={.signal=36,.code=-1,.sender=s->index,.value=1};
-    signal_pending_prepare(s->task,0,&info,1,&p);
+    signal_pending_prepare(s->task,0,&heap,&info,1,&p);
     int r=pthread_barrier_wait(&ready);assert(!r || r==PTHREAD_BARRIER_SERIAL_THREAD);
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(s->task,0,&info,1,&p));}
     signal_pending_finish(&p);
     for(unsigned i=2;i<=32;i++) {
-        info.value=i;signal_pending_prepare(s->task,0,&info,1,&p);
+        info.value=i;signal_pending_prepare(s->task,0,&heap,&info,1,&p);
         {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(s->task,0,&info,1,&p));}
         signal_pending_finish(&p);
     }

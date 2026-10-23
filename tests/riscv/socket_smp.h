@@ -2,7 +2,7 @@
 #include <kernel/socket.h>
 #include <kernel/task_state.h>
 static uint64_t socket_calls[4],socket_copies[4],socket_pins[4],socket_waits[4],socket_protocol_calls;
-static uint64_t socket_holds[3];
+static uint64_t socket_holds[4];
 static struct kernel_wait_node *socket_held_node;
 static void relinquish(void);
 static void socket_hold(unsigned mode)
@@ -87,9 +87,11 @@ void __wrap_kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
     }
     __real_kernel_wait_cursor_wake(cursor,all);
 }
+static void queued_source_quiesce(void);
 void __real_kernel_wait_backend_quiesce(void);
 void __wrap_kernel_wait_backend_quiesce(void)
 {
+    queued_source_quiesce();
     kernel_pid_t tid=0;
     if(control && composition_load(&control->socket_mode)==3 &&
        !kernel_task_tid(kernel_task_current(),&tid) && (uint64_t)tid==composition_load(&control->socket_waiter_tid)) {

@@ -64,6 +64,7 @@ static void check_at(int valid,unsigned line)
 #include <kernel/syscall.h>
 #include "event_smp.h"
 #include "altstack_smp.h"
+#include "queued_smp.h"
 static void relinquish(void);
 size_t __real_kernel_tty_service_output(struct kernel_tty *,size_t);
 size_t __wrap_kernel_tty_service_output(struct kernel_tty *tty,size_t budget)
@@ -381,6 +382,7 @@ void riscv_user_composition_report(void)
     pipe_observe_report();
     event_observe_report();
     altstack_observe_report();
+    queued_observe_report();
     virt_uart_puts("BoarOS: COMPOSITION clock claims=");virt_uart_put_hex(clock_claims);
     virt_uart_puts(" active=");virt_uart_put_hex(clock_active);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: COMPOSITION wait claims=");virt_uart_put_hex(wait_claims);

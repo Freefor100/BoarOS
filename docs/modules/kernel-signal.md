@@ -28,13 +28,13 @@ SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait
 
 pending位图是就绪摘要。普通标准信号继续在任务原有字段保存首条来源；实时信号及完整用户载荷使用按需分配的记录。每个线程和线程组各有一个按信号编号分槽的FIFO索引，出队不遍历其他信号的记录；handler、sigtimedwait和signalfd共用一次出队和128字节siginfo快照。同类标准信号合并，同类实时信号按FIFO；线程pending先于共享pending，每个集合按固定Linux的同步信号优先规则选择。
 
-候选记录及索引在锁外分配，位图、记录和额度在调度短锁内共同发布。消费或批量清除在保护内摘链、扣除计费，锁外释放；空索引随所属线程／线程组退出归还。组长交接在同一保护内移动共享索引和计费状态。fork的child无待决记录，exec保留有效pending；忽略动作、stop/continue取消和退出均使用共同清除路径。
+候选记录及索引在锁外分配，位图、记录和额度在调度短锁内共同发布。消费或批量清除在保护内摘链、扣除计费，锁外释放；默认终止和停止动作也先完成已摘记录的释放，再进入生命周期切换；空索引随所属线程／线程组退出归还。组长交接在同一保护内移动共享索引和计费状态。fork的child无待决记录，exec保留有效pending；忽略动作、stop/continue取消和退出均使用共同清除路径。
 
 `RLIMIT_SIGPENDING(11)`默认软／硬额度4096，同组共享、fork复制、exec保留。当前固定真实UID0，使用量汇总该UID的全部信息记录；接纳按目标软额度判断，`/proc/<pid>/status`的`SigQ`展示使用量／额度。下调额度保留已有消息。实时排队发送额度不足返回EAGAIN；普通kill保留至少一个待决位，并按Linux允许丢失附带信息。标准信号合并不重复计费。`make test-signal-pending-host`在4/16KiB页检查FIFO、跨组额度、候选竞争、分配失败、交接和最终归还。
 
-`rt_sigqueueinfo(138)`和`rt_tgsigqueueinfo(240)`沿现有CPU0目标解析流程发送，保留完整si_code、来源与64位sigval。目标借用覆盖准备和提交，锁内重新核对接收者与当前组容器；有效僵尸身份接受信号但不新增记录。额度耗尽时实时sigqueue和tgkill返回EAGAIN，普通kill保留待决事件。用户输入按固定Linux先导入48字节有效区；已知布局不读取未使用的80字节，未知布局检查扩展全零，否则E2BIG。输入EFAULT先于后续目标和来源检查。
+`rt_sigqueueinfo(138)`和`rt_tgsigqueueinfo(240)`沿现有CPU0目标解析流程发送，保留完整si_code、来源与64位sigval。发送者持有实际PID身份，候选分配后按同一身份重新取得当前组容器及存活接收者，覆盖主线程退出和非组长exec；非组长TID也可作为进程定向发送目标。候选由存活接收者的root堆分配，组容器只持有队列，退出的组长仍可保存存活组的待决记录；有效僵尸身份接受信号但不新增记录。额度耗尽时实时sigqueue和tgkill返回EAGAIN，普通kill保留待决事件。用户输入按固定Linux先导入48字节有效区；已知布局不读取未使用的80字节，未知布局检查扩展全零，否则E2BIG。输入EFAULT先于后续目标和来源检查。
 
-handler与sigtimedwait取得同一规范记录，用户输出在消费之后发生；SIGCHLD退出信息另带真实组CPU用量，单位为100Hz用户时钟tick。标准内联时间数据放任务尾部，不改变原有热字段位置。内核编号32～64均支持；libc预留编号由raw syscall短例覆盖。
+handler与sigtimedwait取得同一规范记录，用户输出在消费之后发生；SIGCHLD退出信息另带真实组CPU用量，STOP/CONT携带被报告线程的CPU用量；快照包含尚未归入累计字段的执行片段，单位为100Hz用户时钟tick。标准内联时间数据放任务尾部，不改变原有热字段位置。内核编号32～64均支持；libc预留编号由raw syscall短例覆盖。
 
 ## signalfd与等待源
 
@@ -66,7 +66,7 @@ RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及�
 
 `SA_ONSTACK`首次从登记区顶端构帧；已在备用栈上的嵌套处理从当前SP继续向下。两架构按实际对齐后的整数、FP/SIMD帧检查范围，再通过共同uaccess复制；不可写、未映射或空间耗尽终止用户线程组并报告SIGSEGV。`uc_stack`保存交付前的原始登记状态，与查询时计算的`SS_ONSTACK`含义不同。完整构帧成功后，`SS_AUTODISARM`停用原配置，处理函数可以重新设置。sigreturn完整导入`uc_stack`和其他恢复输入后，按恢复后的SP应用登记；字段不可读为坏帧，可读设置产生的EINVAL、ENOMEM、EPERM按固定Linux的`restore_altstack`忽略。恢复后寄存器、mask及浮点状态继续沿原路径处理。
 
-rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR，SA_RESTART也保留这一返回。实时信号位明确返回 ENOTSUP，因为现有位图不能保存其队列语义。
+rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR，SA_RESTART也保留这一返回。实时信号使用相同的FIFO待决记录。
 
 RISC-V 交付 frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
 
@@ -107,7 +107,7 @@ RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节fr
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
-标准信号使用线程组与线程位图 pending，发布和消费共用调度保护；signalfd尚未接入。libc内部信号与其他实时信号共用线程定向队列。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
+标准信号使用线程组与线程位图pending；实时记录、signalfd消费、发布与计费共用调度保护。libc内部信号与其他实时信号共用线程定向队列。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
 
 ## 同步故障
 
