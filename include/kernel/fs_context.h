@@ -12,6 +12,7 @@ struct kernel_mm;
 struct kernel_fs_context_record;
 struct kernel_vfs_mount;
 struct kernel_vfs_path;
+struct kernel_task;
 
 enum kernel_fs_context_status {
     KERNEL_FS_CONTEXT_STATUS_OK = 0,
@@ -19,6 +20,7 @@ enum kernel_fs_context_status {
     KERNEL_FS_CONTEXT_STATUS_NO_MEMORY,
     KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED,
     KERNEL_FS_CONTEXT_STATUS_STATE,
+    KERNEL_FS_CONTEXT_STATUS_BUSY,
 };
 
 enum kernel_fs_context_state {
@@ -102,5 +104,8 @@ enum kernel_fs_context_status kernel_fs_context_resolve_user_path(
 
 enum kernel_fs_context_status kernel_fs_context_release(
     struct kernel_fs_context *fs);
+/* 返回组外共享状态；安全共享时登记 exec 以阻止新的 CLONE_FS。 */
+int kernel_fs_context_exec_begin(const struct kernel_fs_context *, struct kernel_task *);
+void kernel_fs_context_exec_end(const struct kernel_fs_context *);
 
 #endif

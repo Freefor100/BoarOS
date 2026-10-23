@@ -393,4 +393,11 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
+struct kernel_vfs_exec_metadata {
+    uint32_t mode, uid, gid;
+    uint8_t filecap[24];
+    size_t filecap_size;
+    int filecap_present, nosuid, readable;
+};
+
 #endif

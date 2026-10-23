@@ -11,6 +11,9 @@ int kernel_task_affinity_set(struct kernel_task *, int32_t, uint64_t);
 struct kernel_mm;
 struct kernel_files;
 struct kernel_fs_context;
+struct kernel_fs_context_record;
+/* 调用者持 FS 状态保护；返回组内实际持有该 FS 的线程数。 */
+unsigned kernel_task_fs_group_users(struct kernel_task *, const struct kernel_fs_context_record *);
 struct kernel_socket_read_request;
 struct kernel_socket_write_request;
 struct kernel_epoll_wait_request;

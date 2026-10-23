@@ -239,6 +239,10 @@ struct kernel_task {
     uint64_t signal_child_times[2], group_child_times[2];
     struct kernel_posix_timer_registry *posix_timers;
     struct kernel_cpu_timer_index cpu_timer_index[2];
+    const struct kernel_credentials *credentials;
+    const struct kernel_credentials *credentials_override;
+    uint32_t no_new_privs;
+    struct kernel_exec_security *exec_security;
 } __attribute__((aligned(16)));
 
 #endif

@@ -357,6 +357,7 @@ COMMON_C_SOURCES := \
 	kernel/elf64.c \
 	kernel/elf64_source.c \
 	kernel/exec.c \
+	kernel/exec_credentials.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
 	kernel/read_source.c \
@@ -391,6 +392,8 @@ COMMON_C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
+	kernel/credentials.c \
+	kernel/syscall/credentials.c \
 	kernel/syscall/capability.c \
 	kernel/syscall/random.c \
 	kernel/syscall/log.c \

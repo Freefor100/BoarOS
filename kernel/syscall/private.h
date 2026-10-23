@@ -3,6 +3,12 @@
 
 #include <kernel/syscall.h>
 
+enum kernel_syscall_status syscall_handle_credentials(struct kernel_task *,
+    const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_capset(struct kernel_task *,
+    const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_prctl(struct kernel_task *,
+    const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_capget(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded);
 
