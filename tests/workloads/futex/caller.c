@@ -193,6 +193,71 @@ static void robust(void)
     expect("robust-unlock", pthread_mutex_unlock(&robust_mutex), 0);
     expect("robust-destroy", pthread_mutex_destroy(&robust_mutex), 0); passed("robust");
 }
+static pthread_mutex_t condition_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t condition = PTHREAD_COND_INITIALIZER, readiness = PTHREAD_COND_INITIALIZER;
+static unsigned condition_ready, condition_go;
+static void *condition_waiter(void *argument)
+{
+    pin((unsigned)(uintptr_t)argument % cpus);
+    expect("condition-lock", pthread_mutex_lock(&condition_lock), 0);
+    condition_ready++; expect("condition-ready", pthread_cond_signal(&readiness), 0);
+    while (!condition_go) expect("condition-wait", pthread_cond_wait(&condition, &condition_lock), 0);
+    expect("condition-unlock", pthread_mutex_unlock(&condition_lock), 0); return 0;
+}
+static void unlock_condition(void *unused)
+{ (void)unused; expect("cancel-cleanup", pthread_mutex_unlock(&condition_lock), 0); }
+static void *cancel_waiter(void *unused)
+{
+    (void)unused; pin(0); expect("cancel-lock", pthread_mutex_lock(&condition_lock), 0);
+    pthread_cleanup_push(unlock_condition, 0);
+    condition_ready = 1; expect("cancel-ready", pthread_cond_signal(&readiness), 0);
+    for (;;) expect("cancel-wait", pthread_cond_wait(&condition, &condition_lock), 0);
+    pthread_cleanup_pop(1); return 0;
+}
+static void conditions_and_cancel(void)
+{
+    pthread_t threads[4];
+    for (unsigned i = 0; i < 4; i++) expect("condition-create", pthread_create(&threads[i], 0, condition_waiter, (void *)(uintptr_t)i), 0);
+    expect("condition-main-lock", pthread_mutex_lock(&condition_lock), 0);
+    while (condition_ready != 4) expect("condition-main-wait", pthread_cond_wait(&readiness, &condition_lock), 0);
+    condition_go = 1; expect("condition-broadcast", pthread_cond_broadcast(&condition), 0);
+    expect("condition-main-unlock", pthread_mutex_unlock(&condition_lock), 0);
+    for (unsigned i = 0; i < 4; i++) expect("condition-join", pthread_join(threads[i], 0), 0);
+    condition_ready = 0;
+    pthread_t thread; expect("cancel-create", pthread_create(&thread, 0, cancel_waiter, 0), 0);
+    expect("cancel-main-lock", pthread_mutex_lock(&condition_lock), 0);
+    while (!condition_ready) expect("cancel-main-wait", pthread_cond_wait(&readiness, &condition_lock), 0);
+    expect("cancel-request", pthread_cancel(thread), 0);
+    expect("cancel-main-unlock", pthread_mutex_unlock(&condition_lock), 0);
+    void *result = 0; expect("cancel-join", pthread_join(thread, &result), 0);
+    expect("cancel-result", result == PTHREAD_CANCELED, 1);
+    expect("cancel-mutex-returned", pthread_mutex_trylock(&condition_lock), 0);
+    expect("cancel-final-unlock", pthread_mutex_unlock(&condition_lock), 0);
+    expect("condition-destroy", pthread_cond_destroy(&condition), 0);
+    expect("readiness-destroy", pthread_cond_destroy(&readiness), 0);
+    expect("condition-lock-destroy", pthread_mutex_destroy(&condition_lock), 0);
+}
+static volatile sig_atomic_t interrupted;
+static void interrupt_wait(int signal) { interrupted = signal; }
+static void *timed_waiter(void *argument)
+{
+    long *result = argument; struct timespec timeout = {2, 0}; pin(0);
+    *result = futex(words, 128, 0, (uintptr_t)&timeout, 0, 0); return 0;
+}
+static void timeout_and_signal(void)
+{
+    struct sigaction action = {.sa_handler = interrupt_wait, .sa_flags = SA_RESTART}, old;
+    sigemptyset(&action.sa_mask); expect("timed-action", sigaction(SIGUSR1, &action, &old), 0);
+    words[0] = 0; long result = -99; pthread_t thread;
+    expect("timed-create", pthread_create(&thread, 0, timed_waiter, &result), 0); queued(words, 1);
+    expect("timed-signal", pthread_kill(thread, SIGUSR1), 0); expect("timed-join", pthread_join(thread, 0), 0);
+    expect("timed-eintr", result, -EINTR); expect("timed-handler", interrupted, SIGUSR1);
+    expect("timed-restore", sigaction(SIGUSR1, &old, 0), 0);
+    struct timespec expired = {0, 0};
+    expect("wait-timeout", futex(words, 128, 0, (uintptr_t)&expired, 0, 0), -ETIMEDOUT);
+    expect("bitset-timeout", futex(words, 9 | 128, 0, (uintptr_t)&expired, 0, 1), -ETIMEDOUT);
+    expect("bitset-zero", futex(words, 9 | 128, 0, (uintptr_t)&expired, 0, 0), -EINVAL);
+}
 static struct composition_control *observer;
 static int observer_fd;
 static void observe_start(void)
@@ -244,7 +309,8 @@ int main(void)
     expect("cpu-count", cpus > 0, 1); pin(cpus - 1);
     printf("FUTEX CALLER CPUS %u\n", cpus);
     observe_start(); abi(); atomics(); comparisons(); requeues(1); requeues(256);
-    wake_counts(0); wake_counts(-1); wake_both(); shared(); robust(); caller_cpus(); observe_end();
+    wake_counts(0); wake_counts(-1); wake_both(); shared(); robust();
+    conditions_and_cancel(); timeout_and_signal(); caller_cpus(); observe_end();
     expect("case-count", cases, 28);
     printf("FUTEX CALLER PASS cases=%u\n", cases); return 0;
 }
