@@ -106,7 +106,7 @@ def run_smp(args):
     try:
         for cpus in args.cpus or [4]:
             for memory in args.memory or ['512M']:
-                if posix:expected=['POSIX CASE objects OK','POSIX CASE faults-quota OK','POSIX CASE lifecycle OK','POSIX END failures=0']
+                if posix:expected=['POSIX CASE objects OK','POSIX CASE faults-quota OK','POSIX CASE lifecycle OK','POSIX CASE wall OK','POSIX CASE shared-standard-signal OK','POSIX CASE periodic-overrun OK','POSIX CASE stale-ignore-forged OK','POSIX CASE exec-pending OK','POSIX CASE handler-libc-thread OK','POSIX END failures=0']
                 if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]
                 folder=output/f'{cpus}cpu-{memory}';folder.mkdir()
                 fixture=harness.fixture(folder,program)

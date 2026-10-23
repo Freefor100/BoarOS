@@ -22,13 +22,25 @@ enum physical_page_status physical_page_release(struct physical_page_allocator *
 { (void)allocator;(void)address;abort(); }
 
 void user_stop_case(struct kernel_task *task) { signal_stop_member(task,SIGNAL_STOP); }
+/* Standard-signal scheduler fixture: PID storage is static, while the
+ * production group cursor and task borrows remain real. No queued payloads. */
+static struct kernel_pid group_identity;
+static struct kernel_pid_member group_member;
+struct kernel_pid *process_identity(const struct kernel_task *task,enum kernel_pid_role role)
+{ assert(role==KERNEL_PID_TGID);assert(task->group_leader==group_member.task);return &group_identity; }
+void kernel_pid_get(struct kernel_pid *id){assert(id==&group_identity);id->references++;}
+void kernel_task_identity_put(struct kernel_pid *id)
+{ KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(id==&group_identity&&id->references>1);id->references--; }
 static struct kernel_task *signal_waiter;
 static struct kernel_task *signal_receiver;
 static struct kernel_task finishing_waiter;
 static struct kernel_signal_table actions;
 void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *waiter)
 {
+    group_member=(struct kernel_pid_member){.task=receiver,.role=KERNEL_PID_TGID};
+    group_identity=(struct kernel_pid){.number=receiver->tid,.references=1};group_identity.members[KERNEL_PID_TGID]=&group_member;
     actions=(struct kernel_signal_table){.magic=KERNEL_SIGNAL_TABLE_MAGIC,.references=2};
+    kernel_wait_queue_init(&actions.signalfd_waiters);
     actions.actions[9]=(struct kernel_signal_action){.handler=0x1000,.mask=signal_mask(12)};
     actions.actions[11]=(struct kernel_signal_action){.handler=0x2000};
     receiver->magic=waiter->magic=KERNEL_THREAD_MAGIC;
@@ -57,7 +69,7 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
         waiter->wait.phase=KERNEL_WAIT_COMMITTED;waiter->wait.generation++;
         kernel_wait_backend_commit(waiter,0,1);
     }
-    assert(!signal_send_one(receiver,12,7,1,0,0));
+    assert(!kernel_signal_send(receiver,12,7));
     assert(waiter->wait.phase==KERNEL_WAIT_COMMITTED);
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);receiver->proc_exiting=1; }
     kernel_signal_task_exit(receiver);

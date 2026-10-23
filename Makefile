@@ -2364,6 +2364,13 @@ test-scheduler-handoff-host: test-scheduler-stack-slots-host
 		build/host/scheduler-handoff-$$shift; \
 	done
 
+.PHONY: test-posix-timer-host
+test-posix-timer-host:
+	@mkdir -p build/host/posix-timer
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/posix_timer.c kernel/sched/posix_timer.c kernel/signal_pending.c kernel/raw_lock.c tests/host/cpu_context.c -o build/host/posix-timer/owner-$$shift; \
+	build/host/posix-timer/owner-$$shift; done
+
 .PHONY: test-signal-pending-host
 test-signal-pending-host:
 	@mkdir -p build/host/signal-pending

@@ -593,6 +593,7 @@ enum kernel_syscall_status syscall_handle_posix_timer(struct kernel_task *caller
     } else if(request->number==109)error=kernel_posix_timer_overrun(caller,id);
     else if(request->number==111)error=kernel_posix_timer_delete(caller,id);
     else {
+        if(!request->arguments[2]){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
         struct kernel_posix_itimerspec input,output;
         if(posix_copy(mm,&input,request->arguments[2],sizeof(input),0,&error)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

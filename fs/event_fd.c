@@ -1,4 +1,6 @@
 #include "open_file_internal.h"
+#include <kernel/avl.h>
+#include <stddef.h>
 #include "files/private.h"
 #include "uaccess_iov_internal.h"
 #include <kernel/event_fd.h>
@@ -34,14 +36,13 @@ static struct kernel_event_fd *event_of(struct kernel_open_file_description *fil
 
 struct kernel_timer_fd {
     struct kernel_event_fd event;
-    struct kernel_timer_fd *left,*right;
-    uint64_t expires,interval,tick;
+    struct kernel_avl_node deadline;
+    uint64_t expires,interval;
     uint32_t clock,flags,notifications;
     uint8_t indexed,expired;
-    int8_t height;
 };
 static struct kernel_raw_lock timer_lock={.rank=KERNEL_RAW_RANK_OBJECT,.initialized=KERNEL_RAW_INITIALIZED};
-static struct kernel_timer_fd *timer_root;
+static struct kernel_avl_node *timer_root;
 uint64_t kernel_timer_fd_next;
 static int is_timer(const struct kernel_event_fd *event)
 { return event->file.kind==KERNEL_OPEN_FILE_KIND_TIMERFD; }
@@ -49,123 +50,23 @@ static struct kernel_raw_lock *event_lock(struct kernel_event_fd *event)
 { return is_timer(event)?&timer_lock:&event->lock; }
 static uint64_t timer_now(const struct kernel_timer_fd *timer)
 { return timer->clock==0?kernel_time_realtime_ns():kernel_time_monotonic_ns(); }
-static int height(const struct kernel_timer_fd *task)
-{
-    return task ? task->height : 0;
-}
-
-static void timer_update(struct kernel_timer_fd *task)
-{
-    int left = height(task->left);
-    int right = height(task->right);
-    task->height = (int8_t)(1 + (left > right ? left : right));
-}
-
-static struct kernel_timer_fd *timer_rotate_left(struct kernel_timer_fd *root)
-{
-    struct kernel_timer_fd *next = root->right;
-    root->right = next->left;
-    next->left = root;
-    timer_update(root);
-    timer_update(next);
-    return next;
-}
-
-static struct kernel_timer_fd *timer_rotate_right(struct kernel_timer_fd *root)
-{
-    struct kernel_timer_fd *next = root->left;
-    root->left = next->right;
-    next->right = root;
-    timer_update(root);
-    timer_update(next);
-    return next;
-}
-
-static struct kernel_timer_fd *timer_balance(struct kernel_timer_fd *root)
-{
-    timer_update(root);
-    if (height(root->left) -
-            height(root->right) > 1) {
-        if (height(root->left->left) <
-            height(root->left->right))
-            root->left = timer_rotate_left(root->left);
-        return timer_rotate_right(root);
-    }
-    if (height(root->right) -
-            height(root->left) > 1) {
-        if (height(root->right->right) <
-            height(root->right->left))
-            root->right = timer_rotate_right(root->right);
-        return timer_rotate_left(root);
-    }
-    return root;
-}
-
-static int timer_before(const struct kernel_timer_fd *a,const struct kernel_timer_fd *b)
-{ return a->tick<b->tick || (a->tick==b->tick && (uintptr_t)a<(uintptr_t)b); }
-
-static struct kernel_timer_fd *timer_insert_node(struct kernel_timer_fd *root,
-                                                struct kernel_timer_fd *task)
-{
-    if (root == 0) return task;
-    if (timer_before(task, root))
-        root->left = timer_insert_node(root->left, task);
-    else
-        root->right = timer_insert_node(root->right, task);
-    return timer_balance(root);
-}
-
-static struct kernel_timer_fd *timer_extract_min(struct kernel_timer_fd *root,
-                                                struct kernel_timer_fd **minimum)
-{
-    if (root->left == 0) {
-        *minimum = root;
-        return root->right;
-    }
-    root->left = timer_extract_min(root->left, minimum);
-    return timer_balance(root);
-}
-
-static struct kernel_timer_fd *timer_remove_node(struct kernel_timer_fd *root,
-                                                const struct kernel_timer_fd *task)
-{
-    if (root == 0) __builtin_trap();
-    if (root != task) {
-        if (timer_before(task, root))
-            root->left =
-                timer_remove_node(root->left, task);
-        else
-            root->right =
-                timer_remove_node(root->right, task);
-        return timer_balance(root);
-    }
-    if (root->left == 0) return root->right;
-    if (root->right == 0) return root->left;
-    struct kernel_timer_fd *next;
-    struct kernel_timer_fd *right = timer_extract_min(root->right, &next);
-    next->left = root->left;
-    next->right = right;
-    return timer_balance(next);
-}
-
 static void timer_remove(struct kernel_timer_fd *timer)
 {
     if (!timer->indexed) return;
-    timer_root=timer_remove_node(timer_root,timer);
-    timer->left=timer->right=0;timer->height=0;timer->indexed=0;
+    timer_root=kernel_avl_remove_node(timer_root,&timer->deadline);
+    timer->deadline=(struct kernel_avl_node){0};timer->indexed=0;
 }
 static struct kernel_timer_fd *timer_first(void)
 {
-    struct kernel_timer_fd *first=timer_root;
-    while(first&&first->left) first=first->left;
-    return first;
+    struct kernel_avl_node *node=kernel_avl_first(timer_root);
+    return node?(void *)((char *)node- offsetof(struct kernel_timer_fd,deadline)):0;
 }
 static void timer_publish(void)
 {
     struct kernel_timer_fd *first=timer_first();
     /* Scheduler reads this summary under its own lock; it never enters the
      * timer index while holding the wait domain. */
-    __atomic_store_n(&kernel_timer_fd_next,first?first->tick:0,__ATOMIC_RELEASE);
+    __atomic_store_n(&kernel_timer_fd_next,first?first->deadline.key:0,__ATOMIC_RELEASE);
 }
 static void timer_changed(void)
 {
@@ -180,11 +81,11 @@ static void timer_insert(struct kernel_timer_fd *timer)
 {
     uint64_t mono=timer->expires;
     if (!timer->clock) { uint64_t offset=kernel_time_boot_realtime_offset();mono=mono<=offset?0:mono-offset; }
-    enum kernel_time_status status=kernel_time_deadline_from_monotonic(mono,&timer->tick);
-    if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) timer->tick=arch_time_read()+1;
+    enum kernel_time_status status=kernel_time_deadline_from_monotonic(mono,&timer->deadline.key);
+    if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) timer->deadline.key=arch_time_read()+1;
     else if (status) __builtin_trap();
-    timer->left=timer->right=0;timer->height=1;timer->indexed=1;
-    timer_root=timer_insert_node(timer_root,timer);
+    timer->deadline.left=timer->deadline.right=0;timer->deadline.height=1;timer->indexed=1;
+    timer_root=kernel_avl_insert_node(timer_root,&timer->deadline);
 }
 static void timer_forward(struct kernel_timer_fd *timer)
 {
@@ -203,7 +104,7 @@ void kernel_timer_fd_expire(uint64_t now)
         {
             KERNEL_RAW_SCOPE(guard,&timer_lock);
             timer=timer_first();
-            if (!timer || (int64_t)(now-timer->tick)<0) break;
+            if (!timer || (int64_t)(now-timer->deadline.key)<0) break;
             timer_remove(timer);timer->expired=1;timer->event.count++;
             notify=kernel_wait_cursor_prepare(&timer->event.waiters,&cursor);
             if (notify) timer->notifications++;

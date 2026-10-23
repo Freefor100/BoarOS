@@ -71,6 +71,9 @@ struct kernel_scheduler {
     enum kernel_scheduler_status fatal_status;
     struct kernel_stack_statistics stack_statistics;
 };
+struct signal_queue_record;
+int signal_timer_post_locked(struct kernel_pid *,int,struct signal_queue_record *,struct kernel_wait_cursor *,struct kernel_task **);
+int signal_timer_disposition_ignored_locked(struct kernel_pid *,int,unsigned);
 struct scheduler_cpu_clock {
     struct kernel_pid *identity;
     uint32_t kind, thread;
