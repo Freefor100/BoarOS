@@ -75,20 +75,22 @@ static struct futex_bucket *futex_bucket(const struct kernel_futex_key *key)
     uint64_t hash = (key->identity >> 4U) ^ key->identity ^
                     (key->offset >> 2U) ^ (key->offset >> 12U) ^ key->kind;
     unsigned index = hash & (FUTEX_BUCKETS - 1U);
-    struct futex_bucket *bucket = &buckets[index];
-    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      if (!bucket->waiters.initialized) {
-          kernel_wait_queue_init(&bucket->waiters);
-          kernel_mutex_init(&bucket->operation, 26, index + 1U);
-      } }
-    return bucket;
+    return &buckets[index];
 }
 
 static void futex_lock_buckets(const struct kernel_futex_key *keys,
-    unsigned count, struct kernel_lock_guard *guards)
+    unsigned count, struct futex_bucket **resolved, struct kernel_lock_guard *guards)
 {
-    struct futex_bucket *first = futex_bucket(&keys[0]);
-    struct futex_bucket *second = count == 2 ? futex_bucket(&keys[1]) : first;
+    struct futex_bucket *first = resolved[0] = futex_bucket(&keys[0]);
+    struct futex_bucket *second = resolved[1] = count == 2 ? futex_bucket(&keys[1]) : first;
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+      for (unsigned i = 0; i < count; i++) {
+          struct futex_bucket *bucket = resolved[i];
+          if (!bucket->waiters.initialized) {
+              kernel_wait_queue_init(&bucket->waiters);
+              kernel_mutex_init(&bucket->operation, 26, (uintptr_t)(bucket - buckets) + 1U);
+          }
+      } }
     if (first > second) {
         struct futex_bucket *swap = first; first = second; second = swap;
     }
@@ -106,10 +108,11 @@ static void futex_unlock_buckets(struct kernel_lock_guard *guards)
  * moved个源后备引用由caller在解桶锁、归还用户pin之后释放。 */
 static int64_t futex_wake(const struct kernel_futex_key *source,
     uint32_t count, uint32_t requeue, const struct kernel_futex_key *target,
-    uint32_t bitset, uint32_t *moved_count)
+    uint32_t bitset, uint32_t *moved_count, struct futex_bucket *bucket,
+    struct futex_bucket *target_bucket)
 {
-    struct kernel_wait_queue *queue = &futex_bucket(source)->waiters;
-    struct kernel_wait_queue *destination = target ? &futex_bucket(target)->waiters : 0;
+    struct kernel_wait_queue *queue = &bucket->waiters;
+    struct kernel_wait_queue *destination = target_bucket ? &target_bucket->waiters : 0;
     struct kernel_wait_cursor cursor;
     uint32_t woken = 0, moved = 0;
     kernel_wait_cursor_begin(queue, &cursor);
@@ -194,6 +197,7 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     struct kernel_futex_key key;
     struct kernel_mm_user_pin pin = {0};
     struct kernel_lock_guard guards[2] = {0};
+    struct futex_bucket *resolved[2];
     uint64_t deadline = 0;
     int expired = 0;
     if (has_timeout) {
@@ -207,7 +211,7 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     int64_t result = futex_prepare(task, &address, 1, operation, 0,
                                     KERNEL_MM_READ, &key, &pin, status);
     if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
-    futex_lock_buckets(&key, 1, guards);
+    futex_lock_buckets(&key, 1, resolved, guards);
     uint32_t *word = (uint32_t *)((unsigned char *)pin.page + (address & BOAROS_PAGE_MASK));
     uint32_t actual = __atomic_load_n(word, __ATOMIC_ACQUIRE);
     if (actual != value || expired) {
@@ -219,7 +223,7 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     task->futex_key = key;
     task->futex_bitset = bitset;
     struct kernel_wait_token token;
-    *status = kernel_wait_prepare(&futex_bucket(&key)->waiters, deadline, 1, &token);
+    *status = kernel_wait_prepare(&resolved[0]->waiters, deadline, 1, &token);
     /* token登记后不再取得任何可睡眠锁；先放桶锁再归还pin，MM编辑可排空它。 */
     futex_unlock_buckets(guards);
     kernel_mm_unpin_user_page(&pin);
@@ -315,6 +319,7 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         struct kernel_futex_key keys[2];
         struct kernel_mm_user_pin pin = {0};
         struct kernel_lock_guard guards[2] = {0};
+        struct futex_bucket *resolved[2];
         uint32_t pin_access = command == 4U ? KERNEL_MM_READ :
                               command == 5U ? KERNEL_MM_WRITE : 0;
         /* private key不访问映射；未知op先报ENOSYS，不用无关fault覆盖它。 */
@@ -324,7 +329,7 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         result = futex_prepare(task, addresses, count, operation, pin_index,
                                 pin_access, keys, &pin, status);
         if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
-        futex_lock_buckets(keys, count, guards);
+        futex_lock_buckets(keys, count, resolved, guards);
         uint32_t moved = 0;
         uint32_t *word = pin_access ? (uint32_t *)((unsigned char *)pin.page +
                                      (addresses[pin_index] & BOAROS_PAGE_MASK)) : 0;
@@ -336,13 +341,15 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
             if (comparison < 0) result = comparison;
             else {
                 result = futex_wake(&keys[0], futex_wake_count(value), 0, 0,
-                                    FUTEX_BITSET_MATCH_ANY, 0);
+                                    FUTEX_BITSET_MATCH_ANY, 0, resolved[0], 0);
                 if (comparison) result += futex_wake(&keys[1],
-                    futex_wake_count(second_count), 0, 0, FUTEX_BITSET_MATCH_ANY, 0);
+                    futex_wake_count(second_count), 0, 0, FUTEX_BITSET_MATCH_ANY, 0,
+                    resolved[1], 0);
             }
         } else result = futex_wake(&keys[0], requeue ? value : futex_wake_count(value),
             requeue ? second_count : 0, requeue ? &keys[1] : 0,
-            command == FUTEX_WAKE_BITSET ? bitset : FUTEX_BITSET_MATCH_ANY, &moved);
+            command == FUTEX_WAKE_BITSET ? bitset : FUTEX_BITSET_MATCH_ANY, &moved,
+            resolved[0], requeue ? resolved[1] : 0);
         futex_unlock_buckets(guards);
         if (pin_access) kernel_mm_unpin_user_page(&pin);
         while (moved--) {
@@ -389,12 +396,13 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
 {
     struct kernel_futex_key key;
     struct kernel_lock_guard guards[2] = {0};
+    struct futex_bucket *resolved[2];
     enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
     if ((address & 3U) || kernel_user_range_check(address, sizeof(uint32_t)) !=
         KERNEL_UACCESS_STATUS_OK || futex_prepare(task, &address, 1, 0, 0, 0,
             &key, 0, &status) || status != KERNEL_SCHEDULER_STATUS_OK) return;
-    futex_lock_buckets(&key, 1, guards);
-    (void)futex_wake(&key, 1, 0, 0, FUTEX_BITSET_MATCH_ANY, 0);
+    futex_lock_buckets(&key, 1, resolved, guards);
+    (void)futex_wake(&key, 1, 0, 0, FUTEX_BITSET_MATCH_ANY, 0, resolved[0], 0);
     futex_unlock_buckets(guards);
     futex_key_release(&key);
 }
