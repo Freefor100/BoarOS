@@ -121,9 +121,13 @@ static void reserved_numbers(void)
 #include "queued_control.h"
 int main(int argc,char **argv)
 {
+    if(argc>1&&!strcmp(argv[1],"--queued-tid-exec"))return queued_tid_exec_check(argc,argv);
     if(argc>1&&!strcmp(argv[1],"--queued-exec"))return queued_exec_check(argc,argv);
     setvbuf(stdout,0,_IONBF,0);alarm(15);
-    FILE *performance=fopen("/queued-performance","r");if(performance){unsigned cpus;CHECK(fscanf(performance,"%u",&cpus)==1&&!fclose(performance));queue_perf=1;alarm(120);queued_threads();CHECK(queue_cpus==cpus);printf("QUEUED-PERF END failures=%u\n",failures);return failures?1:0;}
+    FILE *performance=fopen("/queued-performance","r");if(performance){unsigned cpus;CHECK(fscanf(performance,"%u",&cpus)==1);
+        int extra=fscanf(performance,"%u %u",&queue_perf_mode,&queue_perf_rounds);CHECK(extra==EOF||(extra==2&&queue_perf_mode<3&&queue_perf_rounds>0&&queue_perf_rounds<=1024));CHECK(!fclose(performance));
+        queue_diagnostics=!access("/queued-diagnostics",F_OK);if(queue_diagnostics){CHECK(!mkdir("/proc",0555)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);}
+        queue_perf=1;alarm(120);queued_threads();CHECK(queue_cpus==cpus);printf("QUEUED-PERF END failures=%u\n",failures);return failures?1:0;}
     FILE *selection=fopen("/queued-select","r");if(selection){char name[16]={0};fscanf(selection,"%15s",name);fclose(selection);
         if(!strcmp(name,"fatal"))queued_fatal();else if(!strcmp(name,"times"))queued_child_times();else if(!strcmp(name,"life"))queued_lifecycle();else CHECK(0);
         printf("QUEUED END failures=%u\n",failures);return failures?1:0;}

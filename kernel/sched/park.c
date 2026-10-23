@@ -185,6 +185,7 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *token, uint32_t re
         if (record->on_cpu) record->ready_pending = 1;
         else kernel_wait_backend_ready(token->task);
     }
+    COST_ADD(WAIT_NOTIFICATIONS,1);
     record->reason = reason;
     record->phase = KERNEL_WAIT_NOTIFIED;
     return 1;
@@ -263,6 +264,7 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
                 }
                 record->nodes = node->token_next;
                 node->generation = 0;
+                node->event_mask = 0;
                 node->token_next = 0;
             }
             if (!record->nodes && !record->borrows) {
@@ -288,8 +290,13 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
         kernel_wait_backend_ready(task);
     }
 }
-int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
-    int direct_notification)
+static int event_accepts(const struct kernel_wait_node *node,uint64_t event,struct kernel_task *recipient)
+{
+    if(!event || !node->event_mask)return 1;
+    return (*node->event_mask & event) && (!node->task || !recipient || node->task==recipient);
+}
+static int cursor_prepare_locked(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
+    int direct_notification,uint64_t event,struct kernel_task *recipient)
 {
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || queue->borrows == UINT32_MAX)
         __builtin_trap();
@@ -300,17 +307,21 @@ int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *queue, struct ke
     if (direct_notification && queue->registrations == 1 && !queue->head->callback) {
         struct kernel_wait_node *node = queue->head;
         if (node->queue != queue || node->borrow_owner != queue) __builtin_trap();
-        if (node->task && node->generation) {
+        if (node->task && node->generation && event_accepts(node,event,recipient)) {
             struct kernel_wait_token token = {node->task, node->generation};
             kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN);
         }
         return 0;
     }
     queue->borrows++;
-    *cursor = (struct kernel_wait_cursor){queue, queue->head, queue->sequence};
+    *cursor = (struct kernel_wait_cursor){.queue=queue,.node=queue->head,.sequence=queue->sequence,.event=event,.recipient=recipient};
     if (cursor->node) borrow(cursor->node);
     return 1;
 }
+int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor,int direct)
+{ return cursor_prepare_locked(queue,cursor,direct,0,0); }
+int kernel_wait_cursor_prepare_event_locked(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor,uint64_t event,struct kernel_task *recipient)
+{ return cursor_prepare_locked(queue,cursor,1,event,recipient); }
 static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
                         int direct_notification)
 {
@@ -401,7 +412,7 @@ static void cursor_wake_reason(struct kernel_wait_cursor *cursor, int all, uint3
         int notified = 0;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (node->queue == cursor->queue) {
+            if (node->queue == cursor->queue && event_accepts(node,cursor->event,cursor->recipient)) {
                 callback = node->callback;
                 if (!callback && node->task && node->generation) {
                     struct kernel_wait_token token = {node->task, node->generation};

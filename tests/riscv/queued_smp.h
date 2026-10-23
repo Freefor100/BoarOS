@@ -1,6 +1,6 @@
 #include "../../kernel/signal_pending.h"
 #include <kernel/signal_fd.h>
-static uint64_t queued_waits[4],queued_reads[4],queued_queries[4],queued_source_holds;
+static uint64_t queued_waits[4],queued_reads[4],queued_queries[4],queued_source_holds,queued_sends[4],queued_send_mismatch;
 static struct kernel_task *queued_releasing;
 enum kernel_signal_status __real_kernel_signal_wait_take(struct kernel_task *,struct kernel_signal_wait_info *);
 enum kernel_signal_status __wrap_kernel_signal_wait_take(struct kernel_task *task,struct kernel_signal_wait_info *info)
@@ -49,12 +49,25 @@ static void queued_source_quiesce(void)
         if(!composition_load(&control->socket_waited)){queued_source_holds++;composition_store(&control->socket_waited,1);}
     }
 }
+int __real_kernel_signal_queue_info(int32_t,int32_t,int,const struct kernel_signal_wait_info *);
+int __wrap_kernel_signal_queue_info(int32_t group,int32_t pid,int thread,const struct kernel_signal_wait_info *info)
+{
+    uint64_t affinity=0;struct kernel_task *caller=kernel_task_current();
+    if(control&&info->signal>=32&&info->signal<=64&&caller&&kernel_task_has_user_context(caller)&&
+        !kernel_task_affinity_get(caller,0,&affinity)&&affinity&&!(affinity&(affinity-1))) {
+        unsigned cpu=kernel_cpu_current()->logical_id;
+        __atomic_fetch_add(&queued_sends[cpu],1,__ATOMIC_RELAXED);
+        if(affinity!=(UINT64_C(1)<<cpu))__atomic_fetch_add(&queued_send_mismatch,1,__ATOMIC_RELAXED);
+    }
+    return __real_kernel_signal_queue_info(group,pid,thread,info);
+}
 static void queued_observe_report(void)
 {
     for(unsigned cpu=0;cpu<BOAROS_MAX_CPUS;cpu++) {
         virt_uart_puts("BoarOS: QUEUED caller cpu=");virt_uart_put_hex(cpu);
         virt_uart_puts(" waits=");virt_uart_put_hex(queued_waits[cpu]);virt_uart_puts(" reads=");virt_uart_put_hex(queued_reads[cpu]);
-        virt_uart_puts(" queries=");virt_uart_put_hex(queued_queries[cpu]);virt_uart_puts("\n");
+        virt_uart_puts(" queries=");virt_uart_put_hex(queued_queries[cpu]);virt_uart_puts(" sends=");virt_uart_put_hex(queued_sends[cpu]);virt_uart_puts("\n");
     }
+    virt_uart_puts("BoarOS: QUEUED send-mismatch=");virt_uart_put_hex(queued_send_mismatch);virt_uart_puts("\n");
     virt_uart_puts("BoarOS: QUEUED source-holds=");virt_uart_put_hex(queued_source_holds);virt_uart_puts(" prepared-holds=");virt_uart_put_hex(socket_holds[3]);virt_uart_puts("\n");
 }

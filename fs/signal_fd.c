@@ -81,6 +81,8 @@ enum kernel_files_status kernel_files_signalfd(struct kernel_files *files,struct
     if(status){if(kernel_open_file_release(&owner))__builtin_trap();return status;}
     reservation.files=0;*result=slot;return 0;
 }
+const uint64_t *kernel_signal_fd_mask(struct kernel_open_file_description *file)
+{ return file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD?&((struct kernel_signal_fd *)file)->mask:0; }
 uint32_t kernel_signal_fd_poll(struct kernel_open_file_description *file,struct kernel_wait_queue **queue)
 {
     struct kernel_task *task=kernel_task_current();

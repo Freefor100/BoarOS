@@ -214,6 +214,7 @@ static void enter_user_service(void)
 
 void kernel_scheduler_enter_user_service(void)
 {
+    COST_SCOPE(cost,SERVICE_ENTER);
 #if BOAROS_USER_SMP
     enter_user_service();
 #endif
@@ -221,6 +222,7 @@ void kernel_scheduler_enter_user_service(void)
 
 void kernel_scheduler_leave_user_service(void)
 {
+    COST_SCOPE(cost,SERVICE_RETURN);
 #if BOAROS_USER_SMP
     uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = kernel_cpu_current()->current;

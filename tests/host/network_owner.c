@@ -55,8 +55,8 @@ uint64_t kernel_cost_clock(void) {return 0;}
 struct kernel_cost_tag kernel_cost_capture(void) {return (struct kernel_cost_tag){0};}
 struct kernel_cost_scope kernel_cost_enter(enum kernel_cost_metric metric) {return (struct kernel_cost_scope){.metric=metric};}
 void kernel_cost_leave(struct kernel_cost_scope *scope) {(void)scope;}
-void kernel_cost_raw_lock(struct kernel_cost_tag tag,uint64_t wait,uint64_t hold)
-{(void)tag;(void)wait;(void)hold;}
+void kernel_cost_raw_lock(struct kernel_cost_tag tag,unsigned rank,uint64_t wait,uint64_t hold)
+{(void)tag;(void)rank;(void)wait;(void)hold;}
 
 void kernel_cost_add(enum kernel_cost_metric metric,uint64_t value)
 { if (metric==COST_NETWORK_SERVICE_CALLS) protocol_services+=(unsigned)value; }

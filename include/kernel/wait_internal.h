@@ -25,7 +25,10 @@ struct kernel_wait_cursor {
     struct kernel_wait_queue *queue;
     struct kernel_wait_node *node;
     uint64_t sequence;
+    uint64_t event;
+    struct kernel_task *recipient;
 };
+int kernel_wait_cursor_prepare_event_locked(struct kernel_wait_queue *,struct kernel_wait_cursor *,uint64_t,struct kernel_task *);
 int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *, struct kernel_wait_cursor *, int);
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *, int);
 int kernel_wait_cursor_prepare(struct kernel_wait_queue *, struct kernel_wait_cursor *);

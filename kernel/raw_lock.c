@@ -62,6 +62,7 @@ void kernel_raw_lock_release(struct kernel_raw_guard *guard)
         cpu->preempt_depth != guard->previous_depth + 1U ||
         __atomic_load_n(&guard->lock->word, __ATOMIC_RELAXED) != 1U) __builtin_trap();
 #if BOAROS_COST_DIAGNOSTICS
+    unsigned rank=guard->lock->rank;
     uint64_t hold = guard->cost.epoch ? kernel_cost_clock() - guard->hold_start : 0;
 #endif
     cpu->raw_locks = guard->previous;
@@ -80,6 +81,6 @@ void kernel_raw_lock_release(struct kernel_raw_guard *guard)
 #endif
     arch_interrupt_restore(guard->interrupts);
 #if BOAROS_COST_DIAGNOSTICS
-    if (guard->cost.epoch) kernel_cost_raw_lock(guard->cost, guard->wait_ticks, hold);
+    if (guard->cost.epoch) kernel_cost_raw_lock(guard->cost, rank, guard->wait_ticks, hold);
 #endif
 }

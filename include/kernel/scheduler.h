@@ -183,6 +183,9 @@ struct kernel_wait_node {
     struct kernel_wait_queue *borrow_owner;
     uint64_t generation, sequence;
     uint32_t references;
+    /* Optional source interest, protected by wait domain. The registration
+     * owner keeps this mask storage alive through all cursor borrows. */
+    const uint64_t *event_mask;
 };
 
 /* 单CPU业务条件仍由调用者的IRQ纪律保护；短调度锁仅保护登记/通知。

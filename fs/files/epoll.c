@@ -12,6 +12,7 @@
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
+#include <kernel/signal_fd.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/files.h>
@@ -66,6 +67,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = node->context;
     struct kernel_epoll *epoll = item->epoll;
+    if(item->target_file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD)COST_ADD(SIGNAL_FD_CALLBACKS,1);
     if (reason==KERNEL_WAIT_POLL_FREE) {
         /* The callback owns a cursor borrow. Detach without waiting for
          * itself; DEL/close still drains this borrow before freeing item. */
@@ -561,6 +563,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item->events = events;
         item->data = data;
         kernel_wait_node_init_callback(&item->wait_node, kernel_epoll_wait_callback, item);
+        item->wait_node.event_mask=kernel_signal_fd_mask(target_file);
         kernel_preempt_disable();
         int error = 0;
         if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)

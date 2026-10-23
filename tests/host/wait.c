@@ -534,6 +534,33 @@ static void pollfree_lifetime(void)
     assert(!pthread_barrier_destroy(&retiring_entered)&&!pthread_barrier_destroy(&retiring_leave));
     puts("wait: POLLFREE detaches callbacks and retains source through prior cursors passed");
 }
+static unsigned event_calls[2];
+static void event_callback(struct kernel_wait_node *node,uint32_t reason)
+{ assert(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+static void event_filtering(void)
+{
+    struct kernel_wait_queue queue;kernel_wait_queue_init(&queue);
+    struct kernel_task actors[3]={0};struct kernel_wait_token tokens[3];uint64_t masks[2]={1,2};
+    for(unsigned i=0;i<3;i++) {
+        kernel_wait_record_init(&actors[i].wait);actors[i].wait.on_cpu=1;kernel_wait_node_init(&actors[i].node,&actors[i]);
+        selected_task=&actors[i];assert(!kernel_wait_prepare(&queue,0,0,&tokens[i]));actors[i].node.event_mask=&masks[i==1];
+    }
+    selected_task=0;struct kernel_wait_node callbacks[2];
+    for(unsigned i=0;i<2;i++){kernel_wait_node_init_callback(&callbacks[i],event_callback,&event_calls[i]);callbacks[i].event_mask=&masks[i];kernel_wait_queue_add(&queue,&callbacks[i]);}
+    struct kernel_wait_cursor cursor={0};
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(kernel_wait_cursor_prepare_event_locked(&queue,&cursor,1,&actors[0]));}
+    kernel_wait_cursor_wake(&cursor,1);
+    assert(actors[0].wait.phase==KERNEL_WAIT_NOTIFIED && actors[1].wait.phase==KERNEL_WAIT_PREPARED && actors[2].wait.phase==KERNEL_WAIT_PREPARED);
+    assert(event_calls[0]==1&&!event_calls[1]);
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(kernel_wait_cursor_prepare_event_locked(&queue,&cursor,1,0));}
+    kernel_wait_cursor_wake(&cursor,1);assert(actors[2].wait.phase==KERNEL_WAIT_NOTIFIED&&actors[1].wait.phase==KERNEL_WAIT_PREPARED);
+    /* A mask replacement wakes the whole source, independent of old interest. */
+    masks[0]=masks[1]=0;assert(!kernel_wait_queue_wake_all(&queue));assert(actors[1].wait.phase==KERNEL_WAIT_NOTIFIED);
+    for(unsigned i=0;i<3;i++){selected_task=&actors[i];assert(!kernel_wait_finish(&tokens[i]));assert(!actors[i].node.event_mask);}
+    selected_task=0;for(unsigned i=0;i<2;i++)assert(!kernel_wait_node_remove_sync(&callbacks[i]));
+    assert(!kernel_wait_queue_close(&queue)&&!kernel_wait_queue_destroy(&queue));
+    puts("wait: directed event filters, shared callbacks and mask-change broadcast passed");
+}
 int main(void)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
@@ -553,6 +580,7 @@ int main(void)
     callback_lifetime();
     close_lifetime();
     pollfree_lifetime();
+    event_filtering();
     committed_segments();
     task_segments();
     notification_sequences();

@@ -17,6 +17,8 @@ static uintptr_t epoll_test_irq_save(void);
 #include EPOLL_SOURCE
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL epoll line %d: %s\n",__LINE__,#x); exit(1); } } while (0)
+const uint64_t *kernel_signal_fd_mask(struct kernel_open_file_description *file)
+{ CHECK(file->kind!=KERNEL_OPEN_FILE_KIND_SIGNALFD);return 0; }
 static struct kernel_heap heap;
 static struct kernel_files files;
 static struct kernel_open_file_description epfile, targets[2];
