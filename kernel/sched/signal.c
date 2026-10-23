@@ -1,6 +1,7 @@
 #include <arch/task.h>
 #include "private.h"
 #include "../signal_pending.h"
+#include <kernel/posix_timer.h>
 
 #include <kernel/errno.h>
 #include <kernel/irq.h>
@@ -820,6 +821,7 @@ void kernel_signal_wait_end(struct kernel_task *task)
 
 void kernel_signal_reset_on_exec(struct kernel_task *task)
 {
+    kernel_posix_timers_exec(task);
     kernel_signal_stack_reset(task);
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_signal_table *table = signal_table_of(task);

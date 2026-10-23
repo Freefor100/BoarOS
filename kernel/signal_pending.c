@@ -24,10 +24,14 @@ static struct kernel_signal_pending_state *state(struct kernel_task *t,int share
 static uint64_t *bits(struct kernel_task *t,int shared)
 { return shared ? &t->group_pending : &t->signal_pending; }
 
-void signal_pending_prepare(struct kernel_task *t,int shared,struct kernel_heap *heap,
-    const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
+void signal_pending_prepare_record(struct kernel_heap *heap,struct signal_pending_prepared *p)
 {
-    if(info->signal<32 && !supplied)return;
+    if(heap && !kernel_heap_allocate_zeroed(heap,1,sizeof(*p->record),(void **)&p->record))
+        p->record->heap=heap;
+}
+void signal_pending_prepare_index(struct kernel_task *t,int shared,struct kernel_heap *heap,
+    struct signal_pending_prepared *p)
+{
     int needs_index;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -36,9 +40,22 @@ void signal_pending_prepare(struct kernel_task *t,int shared,struct kernel_heap 
     if(!heap)return;
     if(needs_index && !kernel_heap_allocate_zeroed(heap,1,sizeof(*p->index),(void **)&p->index))
         p->index->heap=heap;
-    if(!kernel_heap_allocate_zeroed(heap,1,sizeof(*p->record),(void **)&p->record))
-        p->record->heap=heap;
 }
+void signal_pending_prepare(struct kernel_task *t,int shared,struct kernel_heap *heap,
+    const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
+{
+    if(info->signal<32 && !supplied)return;
+    signal_pending_prepare_index(t,shared,heap,p);
+    signal_pending_prepare_record(heap,p);
+}
+int signal_pending_reserve_locked(const struct kernel_task *task)
+{
+    if(root_pending>=task->group_leader->sigpending_limit.current)return -KERNEL_EAGAIN;
+    if(root_pending==UINT64_MAX)__builtin_trap();
+    root_pending++;return 0;
+}
+void signal_pending_unreserve_locked(void)
+{if(!root_pending)__builtin_trap();root_pending--;}
 
 int signal_pending_post_locked(struct kernel_task *t,int shared,
     const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)

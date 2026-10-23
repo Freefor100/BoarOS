@@ -7,6 +7,10 @@ struct signal_pending_prepared {
     struct kernel_signal_queue *index;
     struct signal_queue_record *record, *retired;
 };
+void signal_pending_prepare_index(struct kernel_task *,int,struct kernel_heap *,struct signal_pending_prepared *);
+void signal_pending_prepare_record(struct kernel_heap *,struct signal_pending_prepared *);
+int signal_pending_reserve_locked(const struct kernel_task *);
+void signal_pending_unreserve_locked(void);
 void signal_pending_prepare(struct kernel_task *, int shared, struct kernel_heap *,
     const struct kernel_signal_wait_info *, int supplied, struct signal_pending_prepared *);
 /* 0 publishes an event, 1 coalesces an existing standard signal, <0 errno. */

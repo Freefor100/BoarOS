@@ -367,6 +367,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/cpu_clock.c \
+	kernel/sched/posix_timer.c \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
 	kernel/sched/exec.c \

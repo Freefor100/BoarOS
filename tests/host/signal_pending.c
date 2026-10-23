@@ -87,5 +87,12 @@ int main(void)
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);b.group_pending=a.group_pending;kernel_signal_pending_adopt_locked(&b,&a);}
     kernel_signal_pending_cleanup(&a);assert(count()==1);assert(take(&b,1,36).value==7 && !count());
     assert(!post(&b,0,37,-1,9,1));kernel_signal_pending_cleanup(&b);assert(!count() && !live);
+    b.sigpending_limit.current=1;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_reserve_locked(&b));}
+    assert(count()==1&&post(&a,0,36,-1,1,1)==0);
+    assert(count()==2&&post(&b,0,36,-1,1,1)==-KERNEL_EAGAIN);
+    assert(take(&a,0,36).value==1&&count()==1);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(signal_pending_reserve_locked(&b)==-KERNEL_EAGAIN);signal_pending_unreserve_locked();}
+    kernel_signal_pending_cleanup(&a);assert(!count()&&!live);
     puts("signal pending FIFO/quota/abort/merge/lifetime passed");return 0;
 }

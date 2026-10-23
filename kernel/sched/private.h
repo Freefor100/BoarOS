@@ -71,6 +71,12 @@ struct kernel_scheduler {
     enum kernel_scheduler_status fatal_status;
     struct kernel_stack_statistics stack_statistics;
 };
+struct scheduler_cpu_clock {
+    struct kernel_pid *identity;
+    uint32_t kind, thread;
+};
+int scheduler_cpu_clock_resolve(struct kernel_task *,int32_t,int,struct scheduler_cpu_clock *);
+int scheduler_cpu_clock_sample(const struct scheduler_cpu_clock *,struct kernel_task_usage *);
 
 extern struct kernel_scheduler scheduler;
 /* 已持调度域；变更资格不修改用户请求affinity，也不结束执行owner。 */

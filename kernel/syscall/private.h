@@ -9,6 +9,8 @@ enum kernel_syscall_status syscall_handle_capget(struct kernel_task *caller,
 enum kernel_syscall_status syscall_handle_fallocate(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_posix_timer(struct kernel_task *,
+    const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded);
 

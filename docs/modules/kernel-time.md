@@ -43,7 +43,7 @@ syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME
 
 `make test-syscall-riscv` 覆盖换算、coarse 初始化一致性、无 timer 时的稳定读数、延迟采样与 10ms 分辨率；`tests/diff-abi/coarse.c` 覆盖真实 U-mode timer 推进、查询错误和拒绝 coarse sleep。固定 Linux 必须启用 `CONFIG_POSIX_TIMERS` 才能对照 raw coarse syscall；Linux HZ=250 的 4ms 与 BoarOS HZ=100 的 10ms 分辨率按各自真实周期验证，不要求裸值相等。`make test-userland-riscv` 用 musl 验证真实 trap→expire→wake 闭环和 RTC 墙钟。
 
-当前限制：无 NTP/阶跃调整、CPU-time sleep 或 POSIX timer_create 系列；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
+当前限制：无 NTP/阶跃调整、CPU-time sleep；POSIX 定时器的期限推进见下节；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
 检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、
@@ -106,3 +106,11 @@ OFD/fork/exec/错误指针和原 BusyBox hwclock/dmesg/df；两项清日志测�
 首次到期只记一次并通知。周期在read/gettime中按原绝对期限累计漏过次数、前移和重装，保留周期相位，避免短周期造成密集IRQ。settime完整导入输入后交换设置，输出旧值EFAULT不撤销新设置。timerfd read消费计数后复制，部分输出返回实际完成前缀，区别于eventfd的EFAULT返回。
 
 末次关闭从索引摘除对象后，等待已经取得的到期通知借用和等待游标结束，再归还对象。dup/fork共享设置和计数。BOOTTIME、ALARM时钟仍在能力目录；CANCEL_ON_SET接受并保存，当前墙钟只在启动初始化，运行时调钟的取消通知随调钟接口增加。
+
+## POSIX 定时器对象
+
+RV64/LA64使用107～111号入口和原生64字节sigevent、32字节itimerspec布局；用户态timer ID为32位，libc的timer_t由库自行封装。线程组按需持有64桶注册表，单调分配非负ID，回绕时检查冲突。注册表与共享disposition分开，线程退出不撤销组定时器；fork/vfork不继承，成功exec和最终组清理释放对象，失败exec保留。
+
+创建为每只定时器预留通知记录和SIGPENDING额度，SIGEV_NONE同样计费。需要通知时先准备真实目标的pending索引。创建候选在ID输出成功后才发布，用户输出故障归还候选与额度；其他线程查询尚未发布的ID返回EINVAL。普通信号仍在消费时归还额度，预留额度由定时器对象持有。对象和PID身份的最后归还在状态保护外释放内存。
+
+四类时钟的目标解析复用CPU clock查询机制；CPU时钟持有具体PID身份，锁外采样后核对角色仍指向相同对象。对象查询、getoverrun和删除已接入；期限设置在当前对象阶段返回EOPNOTSUPP，后续期限机制将接管该入口。
