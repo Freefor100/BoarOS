@@ -7,20 +7,24 @@ struct signal_queue_record {
     struct signal_queue_record *next;
     struct kernel_heap *heap;
     struct kernel_posix_timer *timer;
+    struct kernel_uid_account *account;
 };
 struct kernel_heap;
 struct signal_pending_prepared {
     struct kernel_signal_queue *index;
     struct signal_queue_record *record, *retired, *completed;
+    struct kernel_uid_account *retired_accounts[2];
 };
 void signal_pending_prepare_index(struct kernel_task *,int,struct kernel_heap *,struct signal_pending_prepared *);
 void signal_pending_prepare_record(struct kernel_heap *,struct signal_pending_prepared *);
-int signal_pending_reserve_locked(const struct kernel_task *);
-void signal_pending_unreserve_locked(void);
-void signal_pending_prepare(struct kernel_task *, int shared, struct kernel_heap *,
+int signal_pending_reserve_locked(const struct kernel_task *,struct kernel_uid_account **);
+void signal_pending_unreserve_locked(struct kernel_uid_account *);
+/* 队列 owner 与计账目标可不同：进程信号存入组队列，按原目标 TID 计费。 */
+void signal_pending_prepare(struct kernel_task *, int shared, const struct kernel_task *charge_target, struct kernel_heap *,
     const struct kernel_signal_wait_info *, int supplied, struct signal_pending_prepared *);
 /* 0 publishes an event, 1 coalesces an existing standard signal, <0 errno. */
-int signal_pending_post_locked(struct kernel_task *, int shared,
+int signal_pending_needs_record_locked(struct kernel_task *,int,const struct kernel_task *charge_target,const struct kernel_signal_wait_info *,int supplied);
+int signal_pending_post_locked(struct kernel_task *, int shared, const struct kernel_task *charge_target,
     const struct kernel_signal_wait_info *, int supplied, struct signal_pending_prepared *);
 void signal_pending_take_locked(struct kernel_task *, int shared, unsigned,
     struct kernel_signal_wait_info *, struct signal_pending_prepared *);

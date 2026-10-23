@@ -9,6 +9,7 @@ struct kernel_task;
 struct kernel_open_file_description;
 struct kernel_heap;
 struct kernel_vfs_stat;
+struct kernel_credentials;
 
 enum kernel_proc_path_kind {
     KERNEL_PROC_PATH_EXE = 1,
@@ -41,12 +42,17 @@ struct kernel_proc_process_snapshot {
     uint64_t signal_queued, signal_queue_limit;
     uint32_t threads;
     uint32_t wait_channel_flag;
+    uint32_t no_new_privs;
     int32_t scheduling_priority;
     uint32_t rt_priority;
     uint32_t scheduling_policy;
     char state;
     char comm[16];
+    const struct kernel_credentials *credentials; /* snapshot caller releases */
 };
+
+int kernel_proc_same_group(kernel_pid_t,uint64_t,int thread);
+int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint32_t *uid,uint32_t *gid);
 
 /* Identity changes on PID reuse; zero asks for the current allocation. */
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);

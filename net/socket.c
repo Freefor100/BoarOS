@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/socket.h>
 #include "../fs/uaccess_iov_internal.h"
 #include "socket_state.h"
@@ -959,10 +960,13 @@ int kernel_socket_bind(struct kernel_socket *socket,
     struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     ip_addr_t local;
     if (socket->domain != KERNEL_SOCKET_DOMAIN_INET) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
-    if ((socket->udp != 0 && socket->udp->local_port != 0) ||
-        (socket->tcp != 0 && socket->tcp->local_port != 0)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     int result = address_import(socket, address, &local, 1);
     if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
+    int low_port_denied=address->port && address->port<1024 &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_BIND_SERVICE);
+    if(socket->family==KERNEL_SOCKET_AF_INET6 && low_port_denied) {
+        kernel_socket_protocol_leave(&scope);return -KERNEL_EACCES;
+    }
     if (!ip_addr_isany(&local) &&
         !(IP_IS_V4(&local) ? ip4_addr_isloopback(ip_2_ip4(&local)) : ip6_addr_isloopback(ip_2_ip6(&local)))) {
         int found = 0;
@@ -971,6 +975,11 @@ int kernel_socket_bind(struct kernel_socket *socket,
         if (!found) { kernel_socket_protocol_leave(&scope); return -KERNEL_EADDRNOTAVAIL; }
     }
 
+    if(low_port_denied) {
+        kernel_socket_protocol_leave(&scope);return -KERNEL_EACCES;
+    }
+    if ((socket->udp != 0 && socket->udp->local_port != 0) ||
+        (socket->tcp != 0 && socket->tcp->local_port != 0)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     result = port_conflict(socket, &local, address->port, 0);
     if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
     err_t error = socket->type == SOCKET_DGRAM

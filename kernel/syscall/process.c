@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 
@@ -8,6 +9,8 @@
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
+#include <kernel/wait_internal.h>
+#include <kernel/task_state.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -63,6 +66,16 @@ enum kernel_syscall_status syscall_handle_prlimit64(
         decoded->value = -KERNEL_ESRCH;
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        const struct kernel_credentials *from=kernel_credentials_task_locked(caller),
+            *to=kernel_credentials_task_locked(target);
+        if(caller!=target && !kernel_credentials_capable(from,KERNEL_CAP_SYS_RESOURCE) &&
+            !(from->uid==to->uid && from->uid==to->euid && from->uid==to->suid &&
+              from->gid==to->gid && from->gid==to->egid && from->gid==to->sgid)) {
+            decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
+        }
+    }
     if (resource >= 16U) {
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -87,9 +100,9 @@ enum kernel_syscall_status syscall_handle_prlimit64(
             decoded->value = -KERNEL_EINVAL;
             return KERNEL_SYSCALL_STATUS_OK;
         }
-        /* All current user tasks run with root credentials. The hard cap
-         * bounds what this kernel can actually enforce. */
-        if (replacement.maximum > capacity) {
+        if (replacement.maximum > capacity ||
+            (replacement.maximum>before.maximum &&
+             !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_RESOURCE))) {
             decoded->value = -KERNEL_EPERM;
             return KERNEL_SYSCALL_STATUS_OK;
         }
@@ -170,7 +183,13 @@ enum kernel_syscall_status syscall_handle_get_robust_list(
     }
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    head = kernel_futex_get_robust_list(target);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(!kernel_credentials_may_access_locked(caller,target,0)) {
+            decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
+        }
+        head = kernel_futex_get_robust_list(target);
+    }
     access = kernel_copy_to_user(mm, request->arguments[2], &length,
                                  sizeof(length), &copied);
     if (access == KERNEL_UACCESS_STATUS_FAULT ||

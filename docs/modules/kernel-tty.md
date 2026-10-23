@@ -17,7 +17,7 @@ fork 继承 ctty，线程 clone 共享，setsid 清除本线程组关联，普�
 exec 转移 leader 的既有 ctty 引用。PID 号码退出后可由真实 SID/PGID owner 继续保留。
 
 会话 leader 可在非 O_NOCTTY 的可读 ttyS0 open 自动取得 ctty，或经 TIOCSCTTY
-取得；当前不可变 root 用户模型对应 CAP_SYS_ADMIN 的 steal 路线。TIOCNOTTY 对
+取得；steal 要求调用者实际具备 CAP_SYS_ADMIN。TIOCNOTTY 对
 leader 清除整个会话关联并向前台 PGID 发 HUP/CONT，对普通线程组只撤销自身关联。
 leader 最后成员退出的 serial hangup 向 session leader 发 HUP/CONT，并向前台组发 HUP；
 既有实例的 generation 随 hangup 失效，后来的新 session 不会复活旧 OFD。普通 close

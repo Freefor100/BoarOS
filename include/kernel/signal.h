@@ -60,13 +60,15 @@ struct kernel_wait_queue *kernel_signal_fd_source(struct kernel_task *);
 uint64_t kernel_signal_fd_pending_locked(struct kernel_task *,uint64_t);
 int kernel_signal_fd_take(struct kernel_task *,const uint64_t *,struct kernel_signal_wait_info *,int);
 struct kernel_signal_queue;
+struct kernel_uid_account;
 struct kernel_signal_pending_state {
     struct kernel_signal_queue *queue;
     uint64_t inline_charged;
+    struct kernel_uid_account *inline_account;
 };
 void kernel_signal_pending_cleanup(struct kernel_task *);
 void kernel_signal_pending_adopt_locked(struct kernel_task *, struct kernel_task *);
-uint64_t kernel_signal_pending_count_locked(void);
+uint64_t kernel_signal_pending_count_locked(const struct kernel_task *);
 
 #define KERNEL_SIGNAL_COUNT 64U
 #define KERNEL_SIGNAL_DFL UINT64_C(0)
@@ -101,6 +103,7 @@ enum kernel_signal_status {
     KERNEL_SIGNAL_STATUS_INVALID_STATE,
     KERNEL_SIGNAL_STATUS_NO_MEMORY,
     KERNEL_SIGNAL_STATUS_QUEUE_FULL,
+    KERNEL_SIGNAL_STATUS_PERMISSION,
 };
 
 enum kernel_signal_select_result {
@@ -260,12 +263,12 @@ void kernel_signal_notify_child_stop(struct kernel_task *child,
 /* Resolves kill(2) targets: pid > 0 selects the process, 0 the caller's
  * process group, < -1 the group -pid, and -1 every live process except
  * the caller and the init task.  Returns the number of targets found. */
-uint32_t kernel_signal_resolve_targets(struct kernel_task *caller,
+int64_t kernel_signal_resolve_targets(struct kernel_task *caller,
                                        int64_t pid);
 
 /* Sends to every target of the same resolution; returns how many were
  * delivered or marked pending. */
-uint32_t kernel_signal_send_targets(struct kernel_task *caller,
+int64_t kernel_signal_send_targets(struct kernel_task *caller,
                                     int64_t pid,
                                     uint32_t sig,
                                     kernel_pid_t sender_tid);

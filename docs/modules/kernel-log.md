@@ -18,8 +18,7 @@ RV64 syscall116接入`kernel/syscall/log.c`。0/1沿Linux保持打开/关闭控�
 READ_CLEAR的失败边界不会把尚未处理的新记录清掉。NULL/负长度为EINVAL，长度零和fault
 顺序按固定Linux核对。
 
-权限策略集中在log层：未具备特权只允许READ_ALL/SIZE_BUFFER。当前任务身份仍是不可变root，
-syscall传入该真实模型的特权值；这没有新增凭据体系或多用户隔离。控制级别默认7、最小1，
+权限策略集中在log层：未具备特权只允许READ_ALL/SIZE_BUFFER。syscall 从调用者实际凭据检查固定 Linux 的 CAP_SYSLOG；权限检查先于输出地址和长度处理。控制级别默认7、最小1，
 CONSOLE_OFF保存旧级别，CONSOLE_ON恢复，LEVEL隐式重启控制台过滤。
 
 依据：`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`，

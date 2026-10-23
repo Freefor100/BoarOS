@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "block_file_internal.h"
 #include "open_file_internal.h"
 #include "uaccess_iov_internal.h"
@@ -163,10 +164,13 @@ int64_t kernel_block_file_ioctl(struct kernel_files *files, struct kernel_open_f
     case 0x1268: integer = device->logical_block_size; break; /* BLKSSZGET */
     case 0x125e: integer = kernel_block_read_only(device); break; /* BLKROGET */
     case 0x80081270: integer = __atomic_load_n(&device->soft_block_size, __ATOMIC_ACQUIRE); break;
-    case 0x125d: /* BLKROSET; BoarOS currently has one privileged user identity. */
+    case 0x125d: /* BLKROSET */
+        if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EACCES;
         if (transfer(mm, argument, &integer, sizeof(integer), 1)) return -KERNEL_EFAULT;
         return kernel_block_set_read_only(device, integer != 0);
     case 0x40081271: { /* BLKBSZSET changes the shared software size. */
+        if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EACCES;
+        if(!argument)return -KERNEL_EINVAL;
         if (transfer(mm, argument, &integer, sizeof(integer), 1)) return -KERNEL_EFAULT;
         if (integer < 512 || integer > BOAROS_PAGE_SIZE || (integer & (integer - 1)) ||
             integer < device->logical_block_size) return -KERNEL_EINVAL;
@@ -179,6 +183,7 @@ int64_t kernel_block_file_ioctl(struct kernel_files *files, struct kernel_open_f
         return error;
     }
     case 0x1261: { /* BLKFLSBUF: drain the mounted holder before raw flush. */
+        if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EACCES;
         int error = kernel_vfs_sync_block_device(device);
         return error ? error : kernel_block_file_sync(file);
     }

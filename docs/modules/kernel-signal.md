@@ -22,7 +22,7 @@
 
 默认动作包括忽略、继续、停止、终止和core动作；当前提供CORE限额状态，core文件写出仍列为缺口，wait状态反映实际是否产生转储。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
 
-SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。
+SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。用户发送（含 signal=0）按调用者 real/effective UID 与目标 real/saved UID、CAP_KILL 判断；同线程组以及同 session 的 SIGCONT 保留对应许可。进程组内至少一个目标获准即成功，只有存在目标且全部无权限时返回 EPERM。内核产生的 TTY、故障和定时器事件沿其原有来源递送。
 
 ## 待决记录与计费
 
@@ -30,7 +30,7 @@ pending位图是就绪摘要。普通标准信号继续在任务原有字段保�
 
 候选记录及索引在锁外分配，位图、记录和额度在调度短锁内共同发布。消费或批量清除在保护内摘链、扣除计费，锁外释放；默认终止和停止动作也先完成已摘记录的释放，再进入生命周期切换；空索引随所属线程／线程组退出归还。组长交接在同一保护内移动共享索引和计费状态。fork的child无待决记录，exec保留有效pending；忽略动作、stop/continue取消和退出均使用共同清除路径。
 
-`RLIMIT_SIGPENDING(11)`默认软／硬额度4096，同组共享、fork复制、exec保留。当前固定真实UID0，使用量汇总该UID的全部信息记录；接纳按目标软额度判断，`/proc/<pid>/status`的`SigQ`展示使用量／额度。下调额度保留已有消息。实时排队发送额度不足返回EAGAIN；普通kill保留至少一个待决位，并按Linux允许丢失附带信息。标准信号合并不重复计费。`make test-signal-pending-host`在4/16KiB页检查FIFO、跨组额度、候选竞争、分配失败、交接和最终归还。
+`RLIMIT_SIGPENDING(11)`默认软／硬额度4096，同组共享、fork复制、exec保留。使用量按接收目标的真实 UID 汇总，接纳按目标线程组的软额度判断，`/proc/<pid>/status`的`SigQ`展示使用量／额度。下调额度保留已有消息。实时排队发送额度不足返回EAGAIN；普通kill保留至少一个待决位，并按Linux允许丢失附带信息。标准信号合并不重复计费。每条队列记录及原生定时器预留持有接纳账户；内联标准信号共用一个账户引用。线程改 UID 后，旧事件继续向原账户归还额度，新账户事件在必要时使用已有队列记录；非零来源 UID 也由记录保存。没有记录存储时的普通 kill 沿 Linux 退化为不含来源的待决位。`make test-signal-pending-host`在4/16KiB页检查FIFO、跨组额度、候选竞争、分配失败、改 UID 后的账户归还、交接和最终归还。
 
 `rt_sigqueueinfo(138)`和`rt_tgsigqueueinfo(240)`对内核编号32～64的实时信号在发起CPU导入siginfo、解析目标并排队；标准信号和进程控制继续在CPU0执行。两条发送接口保留完整si_code、来源与64位sigval。进程定向发送持有实际PID身份，候选分配后按同一身份重新取得当前组容器及存活接收者；线程定向发送在目标查找保护内取得任务存储借用和TID代次，接纳前重新核对代次，覆盖候选分配期间的退出与非组长exec。线程路径只比较代次，避免为不跨解锁访问的PID对象增加引用；非组长TID也可作为进程定向发送目标。候选由存活接收者的root堆分配，组容器只持有队列，退出的组长仍可保存存活组的待决记录；有效僵尸身份接受信号但不新增记录。额度耗尽时实时sigqueue和tgkill返回EAGAIN，普通kill保留待决事件。用户输入按固定Linux先导入48字节有效区；已知布局不读取未使用的80字节，未知布局检查扩展全零，否则E2BIG。输入EFAULT先于后续目标和来源检查。
 

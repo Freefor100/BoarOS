@@ -19,6 +19,7 @@ static pthread_barrier_t action_barrier;
 static struct kernel_signal_table actions;
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
+struct kernel_task *kernel_task_current(void) { return active->current; }
 void scheduler_task_get_locked(struct kernel_task *task)
 { assert(active->raw_locks && task->accounted); task->storage_borrows++; }
 void scheduler_task_put(struct kernel_task *task)
@@ -73,7 +74,7 @@ int scheduler_task_descends_from(struct kernel_task *task, const struct kernel_t
     }
     return result;
 }
-uint64_t kernel_signal_pending_count_locked(void) { assert(active->raw_locks); return 0; }
+uint64_t kernel_signal_pending_count_locked(const struct kernel_task *t) { (void)t;assert(active->raw_locks); return 0; }
 struct kernel_tty *kernel_task_controlling_tty(const struct kernel_task *task)
 {
     (void)task;
@@ -92,14 +93,22 @@ void scheduler_usage_snapshot(const struct kernel_task *task, int thread, struct
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(const struct kernel_mm *mm, struct kernel_mm_proc_memory *result)
 { (void)mm; (void)result; abort(); }
 
+enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t s,void **out)
+{(void)h;*out=malloc(s);return *out?0:KERNEL_HEAP_STATUS_EMPTY;}
+enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t s,void **out)
+{(void)h;*out=calloc(n,s);return *out?0:KERNEL_HEAP_STATUS_EMPTY;}
+void kernel_heap_release(struct kernel_heap *h,void *p){(void)h;free(p);}
 static void setup(void)
 {
+    for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     scheduler = (struct kernel_scheduler){0};
     memset(tasks, 0, sizeof(tasks)); memset(ids, 0, sizeof(ids));
     assert(kernel_pid_allocator_init(&scheduler.pid_allocator, bitmap, 128) == KERNEL_PID_STATUS_OK);
     scheduler.identities = (struct kernel_pid_registry){.numbers = &scheduler.pid_allocator, .next_generation = 1};
     for (unsigned i = 0; i < 6; i++) {
         struct kernel_task *task = &tasks[i];
+        task->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1);
+        assert(task->exec_security);
         assert(kernel_pid_publish(&scheduler.identities, &ids[i]) == KERNEL_PID_STATUS_OK);
         task->arch.user_mode = task->accounted = task->tid_owned = 1;
         task->tid = ids[i].number; task->state = KERNEL_THREAD_STATE_READY;
@@ -181,6 +190,7 @@ static void snapshot_case(void)
     reset_actions = 1; assert(!pthread_create(&remote, 0, remote_reset, 0));
     struct kernel_proc_process_snapshot result;
     assert(!kernel_proc_process_snapshot(2, ids[1].generation, &result));
+    kernel_credentials_put(result.credentials);result.credentials=0;
     assert(!pthread_join(remote, 0)); assert(!pthread_barrier_destroy(&action_barrier));
     printf("snapshot before remote reset: ignored=%llx caught=%llx\n",
         (unsigned long long)result.signal_ignored, (unsigned long long)result.signal_caught); fflush(stdout);
@@ -188,11 +198,36 @@ static void snapshot_case(void)
     assert(result.signal_pending == (UINT64_C(1) << 63)); borrows_returned();
     puts("PASS proc signal snapshot retains metadata captured before remote action reset");
 }
+static void access_case(void)
+{
+    setup();
+    struct kernel_credentials from=*kernel_credentials_initial(),to=from;
+    from.uid=from.euid=from.suid=from.fsuid=1000;from.gid=from.egid=from.sgid=from.fsgid=1000;
+    from.effective=from.permitted=0;to=from;
+    tasks[0].credentials=&from;tasks[1].credentials=&to;
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     assert(kernel_credentials_may_access_locked(&tasks[0],&tasks[1],1));
+     kernel_exec_security_set_dumpable(tasks[1].exec_security,0);assert(!kernel_credentials_may_access_locked(&tasks[0],&tasks[1],1));
+     kernel_exec_security_set_dumpable(tasks[1].exec_security,1);to.suid=1001;assert(!kernel_credentials_may_access_locked(&tasks[0],&tasks[1],1));
+     to.suid=1000;to.permitted=1;assert(!kernel_credentials_may_access_locked(&tasks[0],&tasks[1],1));
+     from.permitted=1;assert(kernel_credentials_may_access_locked(&tasks[0],&tasks[1],0));
+     assert(!kernel_credentials_may_access_locked(&tasks[0],&tasks[1],1));
+     from.effective=UINT64_C(1)<<KERNEL_CAP_SYS_PTRACE;kernel_exec_security_set_dumpable(tasks[1].exec_security,0);
+     assert(kernel_credentials_may_access_locked(&tasks[0],&tasks[1],1));
+     from.effective=0;assert(kernel_credentials_may_access_locked(&tasks[0],&tasks[0],1));}
+    kernel_exec_security_set_dumpable(tasks[1].exec_security,1);to.permitted=0;
+    struct proc_access access={0};assert(!proc_access_begin(&tasks[1],&access));
+    struct kernel_credentials changed=to;tasks[1].credentials=&changed;
+    assert(proc_access_check(&access)==-KERNEL_EACCES);proc_access_release(&access);
+    tasks[0].credentials=tasks[1].credentials=kernel_credentials_initial();
+    puts("PASS proc credentials, dumpable, capability subset and resource-generation recheck");
+}
 int main(int argc, char **argv)
 {
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
-    else lookup_cases();
+    else {lookup_cases();access_case();}
+    for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     return 0;
 }

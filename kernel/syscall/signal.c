@@ -425,7 +425,7 @@ enum kernel_syscall_status syscall_handle_signal_send(
     }
     if (kind == LINUX_SYSCALL_KILL && sig == 0U) {
         sent = kernel_signal_resolve_targets(caller, pid);
-        decoded->value = sent == 0U ? -KERNEL_ESRCH : 0;
+        decoded->value = sent < 0 ? sent : sent == 0U ? -KERNEL_ESRCH : 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     task_status = kernel_task_tgid(caller, &sender_pid);

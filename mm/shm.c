@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/shm.h>
 #include <kernel/heap.h>
 #include <kernel/physical_page.h>
@@ -23,6 +24,21 @@ struct kernel_shm_table {
 };
 
 static struct kernel_shm_table shm_table;
+
+static int shm_permission(const struct kernel_shm_segment *seg,unsigned requested)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    unsigned mode=seg->mode;
+    if(cred->euid==seg->uid || cred->euid==seg->cuid)mode>>=6;
+    else if(kernel_credentials_in_group(cred,seg->gid) || kernel_credentials_in_group(cred,seg->cgid))mode>>=3;
+    return (requested&~mode&7U) && !kernel_credentials_capable(cred,KERNEL_CAP_IPC_OWNER)?-KERNEL_EACCES:0;
+}
+static int shm_owner(const struct kernel_shm_segment *seg)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    return cred->euid==seg->uid || cred->euid==seg->cuid ||
+        kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN);
+}
 
 static int64_t current_time_seconds(void)
 {
@@ -121,6 +137,10 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
                     arch_interrupt_restore(irq);
                     return -KERNEL_EINVAL;
                 }
+                unsigned access=(unsigned)shmflg&0777;
+                access=(access|(access>>3)|(access>>6))&7;
+                int permission=shm_permission(seg,access);
+                if(permission){arch_interrupt_restore(irq);return permission;}
                 *out_shmid = seg->shmid;
                 arch_interrupt_restore(irq);
                 return 0;
@@ -176,10 +196,9 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     new_seg->cpid = caller_pid;
     new_seg->lpid = 0;
     new_seg->mode = (uint32_t)(shmflg & 0777);
-    new_seg->uid = 0;
-    new_seg->gid = 0;
-    new_seg->cuid = 0;
-    new_seg->cgid = 0;
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    new_seg->uid = new_seg->cuid = cred->euid;
+    new_seg->gid = new_seg->cgid = cred->egid;
     new_seg->marked_for_deletion = 0;
     new_seg->active = 1;
 
@@ -214,6 +233,10 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
         return -KERNEL_EIDRM;
     }
 
+    unsigned requested=(shmflg&KERNEL_SHM_RDONLY)?4U:6U;
+    if(shmflg&KERNEL_SHM_EXEC)requested|=1;
+    int permission=shm_permission(seg,requested);
+    if(permission){arch_interrupt_restore(irq);return permission;}
     uint32_t permissions = KERNEL_MM_READ;
     if ((shmflg & KERNEL_SHM_RDONLY) == 0) {
         permissions |= KERNEL_MM_WRITE;
@@ -373,7 +396,19 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     if (out_result == 0) {
         return -KERNEL_EFAULT;
     }
+    if(cmd<0 || shmid<0)return -KERNEL_EINVAL;
     int pure_cmd = cmd & ~KERNEL_IPC_64;
+    struct kernel_shmid64_ds replacement;
+    if(pure_cmd==KERNEL_IPC_SET) {
+        if(mm) {
+            size_t copied=0;
+            if(kernel_copy_from_user(mm,&replacement,user_buf,sizeof(replacement),&copied)!=KERNEL_UACCESS_STATUS_OK ||
+                copied!=sizeof(replacement))return -KERNEL_EFAULT;
+        } else {
+            if(!user_buf)return -KERNEL_EFAULT;
+            replacement=*(const struct kernel_shmid64_ds *)(uintptr_t)user_buf;
+        }
+    }
 
     uintptr_t irq = arch_interrupt_save();
     if (!shm_table.initialized) {
@@ -418,6 +453,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
 
     switch (pure_cmd) {
     case KERNEL_IPC_RMID: {
+        if(!shm_owner(seg)){arch_interrupt_restore(irq);return -KERNEL_EPERM;}
         if (seg->nattch == 0U && seg->attachments == 0U) {
             kernel_shm_destroy_segment_locked(seg);
         } else {
@@ -429,6 +465,8 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         return 0;
     }
     case KERNEL_IPC_STAT: {
+        int permission=shm_permission(seg,4);
+        if(permission){arch_interrupt_restore(irq);return permission;}
         struct kernel_shmid64_ds ds = {0};
         ds.shm_perm.key = seg->key;
         ds.shm_perm.uid = seg->uid;
@@ -464,22 +502,10 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
             arch_interrupt_restore(irq);
             return -KERNEL_EIDRM;
         }
-        struct kernel_shmid64_ds ds;
-        arch_interrupt_restore(irq);
-        if (mm != 0) {
-            size_t copied = 0;
-            if (kernel_copy_from_user(mm, &ds, user_buf, sizeof(ds), &copied) !=
-                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(ds)) {
-                return -KERNEL_EFAULT;
-            }
-        } else {
-            if (user_buf == 0) return -KERNEL_EFAULT;
-            ds = *(const struct kernel_shmid64_ds *)(uintptr_t)user_buf;
-        }
-        irq = arch_interrupt_save();
-        if (!seg->active || seg->shmid != shmid) {
-            arch_interrupt_restore(irq);
-            return -KERNEL_EINVAL;
+        const struct kernel_shmid64_ds ds=replacement;
+        if(!shm_owner(seg)){arch_interrupt_restore(irq);return -KERNEL_EPERM;}
+        if(ds.shm_perm.uid==UINT32_MAX || ds.shm_perm.gid==UINT32_MAX) {
+            arch_interrupt_restore(irq);return -KERNEL_EINVAL;
         }
         seg->mode = (uint32_t)(ds.shm_perm.mode & 0777);
         seg->uid = ds.shm_perm.uid;

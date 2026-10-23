@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/loop.h>
 #include <kernel/block.h>
 #include <kernel/errno.h>
@@ -381,8 +382,10 @@ static int64_t loop_ioctl(struct kernel_block_device *device,struct kernel_files
     }
     if (command==0x4c06 || command==0x4c08 || command==0x4c09) return -KERNEL_EOPNOTSUPP;
     struct kernel_loop_info64 info={0};
+    if ((command==0x4c02 || command==0x4c04 || command==0x4c07) &&
+        !((*owner)->open_flags&3U) &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
     if (command==0x4c02 || command==0x4c04) {
-        if (!((*owner)->open_flags&3U)) return -KERNEL_EBADF;
         int error;
         if (command==0x4c02) {
             struct kernel_loop_info old;

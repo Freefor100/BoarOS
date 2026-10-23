@@ -2,6 +2,7 @@
 #include "../../kernel/sched/private.h"
 #include "../../kernel/signal_pending.h"
 #include <kernel/posix_timer.h>
+#include <kernel/credentials.h>
 #include <kernel/time.h>
 #include <kernel/errno.h>
 #include <assert.h>
@@ -62,7 +63,7 @@ int signal_timer_post_locked(struct kernel_pid *p,int thread,struct signal_queue
 {assert(p==&pid);(void)cursor;*wake=0;if(ignored)return 2;signal_pending_post_timer_locked(&task,!thread,record);return 1;}
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all){(void)cursor;(void)all;abort();}
 enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *t){(void)t;abort();}
-static uint64_t count(void){KERNEL_RAW_SCOPE(g,&kernel_wait_domain);return kernel_signal_pending_count_locked();}
+static uint64_t count(void){KERNEL_RAW_SCOPE(g,&kernel_wait_domain);return kernel_signal_pending_count_locked(&task);}
 static void init(void)
 {
     task=(struct kernel_task){0};task.group_leader=&task;task.group_members=1;task.files.heap=&heap;
@@ -94,7 +95,7 @@ static void reservation_and_mixed(void)
 {
     init();int a=create_timer(10),b=create_timer(10);assert(count()==2);
     struct signal_pending_prepared p={0};struct kernel_signal_wait_info info={.signal=10,.code=0,.sender=42};
-    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&info,0,&p));}
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&task,&info,0,&p));}
     signal_pending_finish(&p);assert(count()==3);
     task.sigpending_limit.current=0;allocation_fail=1;unsigned allocations=allocation_calls;
     arm(a,now_ns+100,0);arm(b,now_ns+200,0);expire(now_ns+200);
@@ -131,11 +132,11 @@ static void clear_batch_and_exec(void)
     for(unsigned i=0;i<32;i++)assert(!kernel_posix_timer_delete(&task,ids[i]));
     finish();
     init();int id=create_timer(36);struct kernel_signal_wait_info info={.signal=36,.code=-1,.value=7};
-    signal_pending_prepare(&task,1,&heap,&info,1,&p);
-    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&info,1,&p));}
+    signal_pending_prepare(&task,1,&task,&heap,&info,1,&p);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&task,&info,1,&p));}
     signal_pending_finish(&p);info.code=-2;
-    signal_pending_prepare(&task,1,&heap,&info,1,&p);
-    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&info,1,&p));}
+    signal_pending_prepare(&task,1,&task,&heap,&info,1,&p);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&task,&info,1,&p));}
     signal_pending_finish(&p);arm(id,now_ns+100,0);expire(now_ns+100);assert(count()==3);
     kernel_posix_timers_exec(&task);signal_pending_flush_timers(&task);assert(count()==1);
     info=take(36);assert(info.signal==36&&info.code==-1&&info.value==7);finish();
@@ -190,8 +191,21 @@ static void cpu_thresholds(void)
     }
     finish();
 }
+static void changed_uid_reservation(void)
+{
+    init();int id=create_timer(36);
+    struct kernel_credentials user=*kernel_credentials_initial();
+    user.uid=1000;user.account=kernel_uid_account_get(&heap,user.uid);assert(user.account);
+    task.credentials=&user;
+    assert(!count() && kernel_credentials_initial()->account->pending==1);
+    arm(id,now_ns+100,0);expire(now_ns+100);
+    assert(take(36).signal==36 && !count() && kernel_credentials_initial()->account->pending==1);
+    assert(!kernel_posix_timer_delete(&task,id));
+    assert(!kernel_credentials_initial()->account->pending);
+    task.credentials=kernel_credentials_initial();kernel_uid_account_put(user.account);finish();
+}
 int main(void)
 {
-    reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();
+    reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase and completion/delete owner passed");return 0;
 }
