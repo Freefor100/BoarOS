@@ -24,8 +24,9 @@
 #include "../exec_internal.h"
 #include "private.h"
 
-struct kernel_scheduler scheduler;
-static struct kernel_cpu boot_cpu;
+/* 链接器将CPU控制、调度锁和调度器前缀集中在一页，减少普通入口触达的静态页。 */
+struct kernel_scheduler scheduler __attribute__((section(".bss.scheduler.state")));
+static struct kernel_cpu boot_cpu __attribute__((section(".bss.scheduler.cpu")));
 static struct kernel_task bootstrap_task;
 static uintptr_t current_sp(void);
 #if BOAROS_MAX_CPUS > 1

@@ -238,11 +238,6 @@ static enum kernel_syscall_status syscall_handle_sysinfo(struct kernel_task *cal
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-#if defined(__riscv)
-/* 受控对齐恢复了 RISC-V QEMU 性能，保持分发表目标与共同返回在同一页。
- * nochain 下仍有布局差值，收益不能全部归因于直接 TB 串接。 */
-__attribute__((aligned(4096)))
-#endif
 enum kernel_syscall_status kernel_syscall_dispatch(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

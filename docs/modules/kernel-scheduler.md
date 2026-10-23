@@ -27,6 +27,8 @@ USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务�
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
+`boot_cpu`、`kernel_wait_domain` 和调度器首个 cacheline 按此顺序放在现有 BSS 首页，CPU 本地状态与共享锁各自按 64 字节隔开。对象及其所有权保持独立，普通陷入、身份查询与返回准备因此只需触达一个静态调度控制页。链接布局检查保护同页与隔离要求；它减少必要的 TLB 工作集，不保证任意动态页和链接地址都没有冲突。
+
 等待登记、阻塞提交、期限索引、运行记账、策略更新、队列校验和runnable发布使用统一rank40短锁；heap10→physical20、
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 同一 API 按 CPU 数编译：UP 关闭中断、保持抢占嵌套并使用编译器屏障，SMP 另以 acquire/release 原子操作互斥。
