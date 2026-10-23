@@ -2522,6 +2522,10 @@ build/riscv/credential-cost: tests/workloads/cost/credentials.c tests/accounting
 	@mkdir -p $(@D)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
 
+build/riscv/signal-futex-cost: tests/workloads/cost/signal-futex.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
+	@mkdir -p $(@D)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
 test-sched-concurrency-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency

@@ -3,6 +3,7 @@
 #include <grp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,10 +70,45 @@ static void fork_exec(void)
     char *const argv[]={(char *)self,"--exec-probe",0};
     execv(self,argv);check(0,"exec");
 }
+static int departed_tid;
+static _Thread_local volatile sig_atomic_t self_seen,self_bad;
+static void self_handler(int sig,siginfo_t *info,void *context)
+{
+    (void)context;
+    if(sig!=SIGUSR1 || info->si_code!=SI_TKILL || info->si_uid!=1000)self_bad=1;
+    self_seen++;
+}
+static void *after_leader(void *unused)
+{
+    (void)unused;pin(cpus-1);
+    for(;;) {
+        int value=__atomic_load_n(&departed_tid,__ATOMIC_ACQUIRE);
+        if(!value)break;
+        long result=syscall(SYS_futex,&departed_tid,0,value,0,0,0);
+        check(!result || errno==EAGAIN || errno==EINTR,"leader-clear-wait");
+    }
+    check(!syscall(SYS_setresuid,1000,1000,1000),"self-signal-drop-uid");
+    pid_t group=getpid(),tid=(pid_t)syscall(SYS_gettid);
+    for(unsigned i=0;i<32;i++) {
+        check(!syscall(SYS_tgkill,group,tid,SIGUSR1),"self-signal-after-leader");
+        check((unsigned)self_seen==i+1 && !self_bad,"self-signal-info");
+    }
+    _exit(0);
+}
+static void leader_exit(void)
+{
+    struct sigaction action={.sa_sigaction=self_handler,.sa_flags=SA_SIGINFO};
+    sigemptyset(&action.sa_mask);check(!sigaction(SIGUSR1,&action,0),"self-signal-action");
+    departed_tid=(int)syscall(SYS_gettid);
+    check(syscall(SYS_set_tid_address,&departed_tid)==departed_tid,"leader-clear-register");
+    pthread_t thread;check(!pthread_create(&thread,0,after_leader,0),"leader-child-thread");
+    /* The worker observes the actual exit's clear_child_tid, not a ready flag. */
+    syscall(SYS_exit,0);check(0,"leader-exit-returned");
+}
 static void run(const char *name,int mode)
 {
     fflush(stdout);pid_t pid=fork();check(pid>=0,"fork");
-    if(!pid){if(mode<2)threads(mode==0);else fork_exec();_exit(0);}
+    if(!pid){if(mode<2)threads(mode==0);else if(mode==2)fork_exec();else leader_exit();_exit(0);}
     int status=0;check(waitpid(pid,&status,0)==pid,"waitpid");
     check(WIFEXITED(status)&&WEXITSTATUS(status)==0,name);
     printf("CREDENTIAL CASE %s PASS\n",name);fflush(stdout);
@@ -91,6 +127,6 @@ int main(int argc,char **argv)
         for(unsigned i=0;i<4;i++)if(CPU_ISSET(i,&available))cpus=i+1;}
     check(cpus>=1&&cpus<=4,"cpu-count");
     printf("CREDENTIAL online=%u\n",cpus);fflush(stdout);
-    run("raw-thread-local",0);run("libc-all-threads",1);run("fork-exec-inherit",2);
-    puts("CREDENTIAL END 3");return 0;
+    run("raw-thread-local",0);run("libc-all-threads",1);run("fork-exec-inherit",2);run("self-signal-after-leader-exit",3);
+    puts("CREDENTIAL END 4");return 0;
 }
