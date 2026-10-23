@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/posix_timer.h>
 #include "private.h"
 #include <kernel/event_fd.h>
@@ -639,6 +640,14 @@ static struct kernel_task *sched_target(struct kernel_task *caller, int32_t pid)
     return task && task->accounted && task->arch.user_mode && task->tid_owned ? task : 0;
 }
 
+static int sched_owner_locked(const struct kernel_task *caller,const struct kernel_task *target)
+{
+    const struct kernel_credentials *from=kernel_credentials_task_locked(caller),
+        *to=kernel_credentials_task_locked(target);
+    return from->euid==to->uid || from->euid==to->euid ||
+        kernel_credentials_capable(from,KERNEL_CAP_SYS_NICE);
+}
+
 int kernel_task_affinity_get(struct kernel_task *caller, int32_t pid, uint64_t *mask)
 {
     if (pid < 0) return -KERNEL_ESRCH;
@@ -659,6 +668,7 @@ int kernel_task_affinity_set(struct kernel_task *caller, int32_t pid, uint64_t m
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *task = sched_target(caller, pid);
     if (!task) return -KERNEL_ESRCH;
+    if(!sched_owner_locked(caller,task))return -KERNEL_EPERM;
     uint32_t available = 1;
 #if BOAROS_USER_SMP
     available = online_user_mask_locked();
@@ -711,6 +721,13 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
             }
             struct kernel_sched_policy updated = task->scheduling;
             result = kernel_sched_policy_set(&updated, policy, priority, keep_policy);
+            if (!result && !kernel_credentials_capable(kernel_credentials_task_locked(caller),KERNEL_CAP_SYS_NICE)) {
+                if(!sched_owner_locked(caller,task) ||
+                    updated.priority>task->scheduling.priority ||
+                    (updated.priority && updated.policy!=task->scheduling.policy) ||
+                    (task->scheduling.policy==5 && updated.policy!=5) ||
+                    (task->scheduling.reset_on_fork && !updated.reset_on_fork))result=-KERNEL_EPERM;
+            }
             if (!result) {
                 int old_priority = task->scheduling.priority;
                 int move = updated.priority != old_priority;

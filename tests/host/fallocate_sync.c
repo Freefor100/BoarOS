@@ -112,7 +112,7 @@ static void residual_orphan_shutdown(struct kernel_heap *heap,struct kernel_heap
     /* An accepted outer shrink legitimately leaves persisted orphan work;
      * no VFS node or external file owner remains to describe that work. */
     assert(!ext4_transaction_begin(residual_adapter->mount_point));
-    assert(!ext4_ftruncate(&file,4096));
+    assert(!ext4_ftruncate(&file,4096, UINT32_MAX));
     assert(!ext4_transaction_end(residual_adapter->mount_point) && !ext4_fclose(&file));
     shutdown_entered=1;
     assert(!kernel_vfs_unmount(&mount)); residual_adapter=NULL;

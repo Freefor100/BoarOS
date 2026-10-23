@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 
@@ -17,6 +18,7 @@
 #include <string.h>
 
 #define LINUX_MS_RDONLY UINT64_C(1)
+#define LINUX_MS_NOSUID UINT64_C(2)
 #define LINUX_MS_SILENT UINT64_C(32768)
 
 static int import_string(struct kernel_mm *mm, char *buffer, size_t capacity,
@@ -36,23 +38,21 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     uint64_t flags = request->arguments[3];
-    char type[64], options[256] = {0};
+    char type[64]={0}, options[256] = {0};
     char *target = 0;
     struct kernel_vfs_path *covered = 0;
     struct kernel_vfs_mount *mounted = 0;
     int result;
     uint64_t source_device = 0;
 
-    if (flags & ~(LINUX_MS_RDONLY | LINUX_MS_SILENT)) return -KERNEL_ENOTSUP;
-    if (request->arguments[2] == 0U || request->arguments[1] == 0U)
-        return -KERNEL_EFAULT;
-    result = import_string(mm, type, sizeof(type), request->arguments[2]);
-    if (result) return result;
+    if (request->arguments[2]) {
+        result = import_string(mm, type, sizeof(type), request->arguments[2]);
+        if (result) return result;
+    }
     int tmpfs = !strcmp(type, "tmpfs");
     int ext4 = !strcmp(type, "ext4");
     int disk = ext4 || !strcmp(type, "vfat");
     int devpts = !strcmp(type, "devpts");
-    if (!tmpfs && !disk && !devpts && strcmp(type, "proc")) return -KERNEL_ENODEV;
     enum kernel_heap_status allocation = kernel_heap_allocate(fs->heap,
         2U * KERNEL_FS_PATH_MAX, (void **)&target);
     if (allocation != KERNEL_HEAP_STATUS_OK)
@@ -62,24 +62,11 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         result = import_string(mm, source_name, KERNEL_FS_PATH_MAX,
                                request->arguments[0]);
         if (result) goto Finish;
-        if (disk) {
-            struct kernel_vfs_path *source = 0;
-            struct kernel_vfs_stat stat;
-            result = kernel_vfs_path_resolve(fs_paths.cwd,
-                fs_paths.root, source_name, 1, &source);
-            if (!result) result = kernel_vfs_path_stat(source, &stat);
-            if (!result && (stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFBLK)
-                result = -KERNEL_ENOTBLK;
-            if (!result) source_device = stat.rdev;
-            if (source && kernel_vfs_path_release(&source)) __builtin_trap();
-            if (result) goto Finish;
-        }
-    } else if (disk) { result = -KERNEL_EINVAL; goto Finish; }
+    }
     if (request->arguments[4]) {
         result = import_string(mm, options, sizeof(options),
                                request->arguments[4]);
         if (result) goto Finish;
-        if (!tmpfs && !devpts && options[0]) { result = -KERNEL_ENOTSUP; goto Finish; }
     }
     result = import_string(mm, target, KERNEL_FS_PATH_MAX,
                            request->arguments[1]);
@@ -87,6 +74,20 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     result = kernel_vfs_path_resolve(fs_paths.cwd,
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
+    if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_SILENT)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(!tmpfs && !disk && !devpts && strcmp(type,"proc")) {result=-KERNEL_ENODEV;goto Finish;}
+    if(!tmpfs && !devpts && options[0]) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(disk) {
+        if(!request->arguments[0]) {result=-KERNEL_EINVAL;goto Finish;}
+        struct kernel_vfs_path *source=0;struct kernel_vfs_stat source_stat;
+        result=kernel_vfs_path_resolve(fs_paths.cwd,fs_paths.root,source_name,1,&source);
+        if(!result)result=kernel_vfs_path_stat(source,&source_stat);
+        if(!result && (source_stat.mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFBLK)result=-KERNEL_ENOTBLK;
+        if(!result)source_device=source_stat.rdev;
+        if(source && kernel_vfs_path_release(&source))__builtin_trap();
+        if(result)goto Finish;
+    }
     struct kernel_vfs_stat stat;
     result = kernel_vfs_path_stat(covered, &stat);
     if (result) goto Finish;
@@ -99,6 +100,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
            : tmpfs ? kernel_tmpfs_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
                    : kernel_procfs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted);
     if (result) goto Finish;
+    mounted->nosuid=!!(flags&LINUX_MS_NOSUID);
     result = kernel_vfs_mount_attach(mounted, covered);
     if (result) {
         int cleanup = kernel_vfs_unmount(mounted);
@@ -130,6 +132,7 @@ static int unmount_filesystem(struct kernel_mm *mm,
     result = kernel_vfs_path_resolve(fs_paths.cwd,
              fs_paths.root, target, 1, &root);
     if (result) goto Finish;
+    if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
     struct kernel_vfs_mount *mount = kernel_vfs_path_mount(root);
     if (mount->root_path != root) {
         result = -KERNEL_EINVAL;

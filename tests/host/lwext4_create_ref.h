@@ -104,8 +104,8 @@ static bool create_ref_clock(struct ext4_timestamp *now)
 static void create_ref_test(struct ext4_fs *fs)
 {
     ext4_file parent;
-    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "create-ref-parent", 0042770, 0, NULL, &parent, NULL) == EOK);
-    CHECK(ext4_file_set_owner(&parent, UINT32_MAX, 17) == EOK);
+    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "create-ref-parent", 0042770, 0, NULL, &parent, NULL,0,0) == EOK);
+    CHECK(ext4_file_set_owner(&parent, UINT32_MAX, 17, UINT32_MAX) == EOK);
     CHECK(ext4_file_set_mode(&parent, 02770) == EOK);
     create_ref_seconds = 810;
     CHECK(ext4_mount_setup_clock("/", create_ref_clock) == EOK);
@@ -129,7 +129,7 @@ static void create_ref_test(struct ext4_fs *fs)
         uint32_t created_at = create_ref_seconds + 1;
         create_ref_begin(cases[i].name);
         CHECK(ext4_create_child("/", parent.inode, cases[i].name, cases[i].mode,
-            cases[i].device, cases[i].target, &file, &initial) == EOK);
+            cases[i].device, cases[i].target, &file, &initial,0,17) == EOK);
         create_ref_check(1);
         CHECK(file.inode == create_ref.inodes[0] && file.mp && !file.fpos);
         struct ext4_inode inode;
@@ -163,7 +163,7 @@ static void create_ref_test(struct ext4_fs *fs)
         CHECK(ext4_fclose(&file) == EOK);
         file = (ext4_file){0};
         CHECK(ext4_create_child("/", parent.inode, cases[i].name, cases[i].mode,
-            cases[i].device, cases[i].target, &file, &initial) == EEXIST && !file.mp);
+            cases[i].device, cases[i].target, &file, &initial,0,17) == EEXIST && !file.mp);
     }
     /* The raw library also creates intermediate directories. Each newly
      * allocated reference must become the next parent rather than be reopened. */
@@ -181,7 +181,7 @@ static void create_ref_test(struct ext4_fs *fs)
         create_ref_begin(name);
         create_ref.fail_after_alloc = !stage; create_ref.fail_after_link = stage;
         CHECK(ext4_create_child("/", parent.inode, name, stage ? 0120777 : 0100640,
-            0, stage ? long_target : NULL, &file, &initial) == ENOMEM);
+            0, stage ? long_target : NULL, &file, &initial,0,17) == ENOMEM);
         create_ref_check(1); fail_allocation = 0;
         CHECK(!file.mp && !fs->active_operations && !ext4_current_operation(fs));
         uint32_t found, mode;
@@ -194,7 +194,7 @@ static void create_ref_test(struct ext4_fs *fs)
     struct ext4_inode provisional;
     CHECK(ext4_transaction_begin("/") == EOK);
     CHECK(ext4_create_child("/", parent.inode, "create-initial-abort", 0100640,
-        0, NULL, NULL, &provisional) == EOK);
+        0, NULL, NULL, &provisional,0,17) == EOK);
     CHECK(ext4_inode_get_gid(&provisional) == 17 &&
         ext4_inode_get_mode(&fs->sb, &provisional) == 0100640);
     CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
@@ -210,14 +210,14 @@ static void create_ref_test(struct ext4_fs *fs)
 static void unlink_ref_test(struct ext4_fs *fs)
 {
     ext4_file parent;
-    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "unlink-ref-parent", 0040750, 0, NULL, &parent, NULL) == EOK);
+    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "unlink-ref-parent", 0040750, 0, NULL, &parent, NULL,0,0) == EOK);
     unsigned cases = fs->jbd_journal ? 4 : 2;
     for (unsigned i = 0; i < cases; i++) {
         char name[32], path[96];
         snprintf(name, sizeof(name), "victim-%u", i);
         snprintf(path, sizeof(path), "/unlink-ref-parent/%s", name);
         ext4_file file;
-        CHECK(ext4_create_child("/", parent.inode, name, 0100640, 0, NULL, &file, NULL) == EOK);
+        CHECK(ext4_create_child("/", parent.inode, name, 0100640, 0, NULL, &file, NULL,0,0) == EOK);
         size_t written;
         CHECK(ext4_fwrite(&file, "old", 3, &written) == EOK && written == 3);
         bool outer = i >= 2;
@@ -243,10 +243,10 @@ static void unlink_ref_test(struct ext4_fs *fs)
         CHECK(ext4_fclose(&file) == EOK && ext4_orphan_free("/", inode) == EOK);
     }
     ext4_file dir;
-    CHECK(ext4_create_child("/", parent.inode, "directory", 0040750, 0, NULL, &dir, NULL) == EOK);
+    CHECK(ext4_create_child("/", parent.inode, "directory", 0040750, 0, NULL, &dir, NULL,0,0) == EOK);
     uint32_t inode = 0, found, mode; bool orphan = false;
     CHECK(ext4_unlink_child("/", parent.inode, "directory", false, &inode, &orphan) == EISDIR);
-    CHECK(ext4_create_child("/", dir.inode, "member", 0100600, 0, NULL, NULL, NULL) == EOK);
+    CHECK(ext4_create_child("/", dir.inode, "member", 0100600, 0, NULL, NULL, NULL,0,0) == EOK);
     CHECK(ext4_unlink_child("/", parent.inode, "directory", true, &inode, &orphan) == ENOTEMPTY);
     CHECK(ext4_funlink_dentry("/unlink-ref-parent/directory/member", &inode, &orphan) == EOK && orphan);
     CHECK(ext4_orphan_free("/", inode) == EOK);
@@ -255,7 +255,7 @@ static void unlink_ref_test(struct ext4_fs *fs)
     CHECK(ext4_lookup_child("/", parent.inode, "directory", 9, &found, &mode) == ENOENT);
     if (fs->jbd_journal) {
         ext4_file victim;
-        CHECK(ext4_create_child("/", parent.inode, "oom-victim", 0100640, 0, NULL, &victim, NULL) == EOK);
+        CHECK(ext4_create_child("/", parent.inode, "oom-victim", 0100640, 0, NULL, &victim, NULL,0,0) == EOK);
         unsigned attempts = 0;
         for (unsigned point = 0; point <= attempts; point++) {
             CHECK(ext4_transaction_begin("/") == EOK);

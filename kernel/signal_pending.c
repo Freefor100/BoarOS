@@ -1,5 +1,6 @@
 #include "signal_pending.h"
 #include <kernel/task_state.h>
+#include <kernel/credentials.h>
 #include <kernel/heap.h>
 #include <kernel/errno.h>
 #include <kernel/wait_internal.h>
@@ -11,10 +12,18 @@ struct kernel_signal_queue {
     uint64_t inline_pending,native_count;
     struct { struct signal_queue_record *head,*tail; uint64_t count; } slots[64];
 };
-/* All current credentials have real UID0. The scheduler domain protects
- * this aggregate together with pending publication and withdrawal. */
-static uint64_t root_pending;
-uint64_t kernel_signal_pending_count_locked(void) { return root_pending; }
+uint64_t kernel_signal_pending_count_locked(const struct kernel_task *task)
+{ return kernel_credentials_task_locked(task)->account->pending; }
+static void uncharge(struct kernel_uid_account *account,uint64_t count)
+{ if(!account || account->pending<count)__builtin_trap();account->pending-=count; }
+static void retire_inline_account(struct kernel_signal_pending_state *s,struct signal_pending_prepared *p)
+{
+    if(s->inline_charged || !s->inline_account)return;
+    for(unsigned i=0;i<2;i++)if(!p->retired_accounts[i]) {
+        p->retired_accounts[i]=s->inline_account;s->inline_account=0;return;
+    }
+    __builtin_trap();
+}
 static struct kernel_signal_pending_state *state(struct kernel_task *t,int shared)
 { return shared ? &t->group_queue : &t->signal_queue; }
 static uint64_t *bits(struct kernel_task *t,int shared)
@@ -42,21 +51,26 @@ void signal_pending_prepare_index(struct kernel_task *t,int shared,struct kernel
         else if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
     }
 }
-void signal_pending_prepare(struct kernel_task *t,int shared,struct kernel_heap *heap,
+void signal_pending_prepare(struct kernel_task *t,int shared,const struct kernel_task *charge_target,struct kernel_heap *heap,
     const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
 {
-    if(info->signal<32 && !supplied)return;
+    if(info->signal<32 && !supplied && !info->uid) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_signal_pending_state *s=state(t,shared);
+        if(!s->inline_account || s->inline_account==kernel_credentials_task_locked(charge_target)->account)return;
+    }
     signal_pending_prepare_index(t,shared,heap,p);
     signal_pending_prepare_record(heap,p);
 }
-int signal_pending_reserve_locked(const struct kernel_task *task)
+int signal_pending_reserve_locked(const struct kernel_task *task,struct kernel_uid_account **owner)
 {
-    if(root_pending>=task->group_leader->sigpending_limit.current)return -KERNEL_EAGAIN;
-    if(root_pending==UINT64_MAX)__builtin_trap();
-    root_pending++;return 0;
+    struct kernel_uid_account *account=kernel_credentials_task_locked(task)->account;
+    if(account->pending>=task->group_leader->sigpending_limit.current)return -KERNEL_EAGAIN;
+    if(account->pending==UINT64_MAX)__builtin_trap();
+    account->pending++;*owner=kernel_uid_account_get_locked(account);return 0;
 }
-void signal_pending_unreserve_locked(void)
-{if(!root_pending)__builtin_trap();root_pending--;}
+void signal_pending_unreserve_locked(struct kernel_uid_account *account)
+{ uncharge(account,1); }
 
 void signal_pending_install_index_locked(struct kernel_task *task,int shared,struct signal_pending_prepared *p)
 {
@@ -72,7 +86,14 @@ void signal_pending_post_timer_locked(struct kernel_task *t,int shared,struct si
     q->slots[slot].tail=record;q->slots[slot].count++;q->native_count++;
     *bits(t,shared)|=UINT64_C(1)<<slot;
 }
-int signal_pending_post_locked(struct kernel_task *t,int shared,
+int signal_pending_needs_record_locked(struct kernel_task *t,int shared,const struct kernel_task *charge_target,
+    const struct kernel_signal_wait_info *info,int supplied)
+{
+    struct kernel_signal_pending_state *s=state(t,shared);
+    return info->signal>=32 || supplied || info->uid ||
+        (s->inline_account && s->inline_account!=kernel_credentials_task_locked(charge_target)->account);
+}
+int signal_pending_post_locked(struct kernel_task *t,int shared,const struct kernel_task *charge_target,
     const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
 {
     unsigned sig=info->signal;uint64_t bit=UINT64_C(1)<<(sig-1);
@@ -80,23 +101,28 @@ int signal_pending_post_locked(struct kernel_task *t,int shared,
     uint64_t *pending=bits(t,shared);
     if(sig<32 && (*pending&bit))return 1;
     int override=sig<32 && info->code>=0;
-    int quota=override || root_pending<t->group_leader->sigpending_limit.current;
-    int wants_record=sig>=32 || supplied;
+    struct kernel_uid_account *account=kernel_credentials_task_locked(charge_target)->account;
+    int quota=override || account->pending<t->group_leader->sigpending_limit.current;
+    int wants_record=signal_pending_needs_record_locked(t,shared,charge_target,info,supplied);
     int available=quota && (!wants_record || (p->record && (s->queue || p->index)));
     if(!available && sig>=32 && info->code!=0 && !(info->code==128 && !supplied))
         return -KERNEL_EAGAIN;
     if(!available&&(*pending&bit))return 1;
     if(available) {
-        if(root_pending==UINT64_MAX)__builtin_trap();
-        root_pending++;
+        if(account->pending==UINT64_MAX)__builtin_trap();
+        account->pending++;
         if(wants_record) {
             signal_pending_install_index_locked(t,shared,p);
             struct signal_queue_record *record=p->record;p->record=0;record->info=*info;
+            record->account=kernel_uid_account_get_locked(account);
             unsigned slot=sig-1;
             if(s->queue->slots[slot].tail)s->queue->slots[slot].tail->next=record;
             else s->queue->slots[slot].head=record;
             s->queue->slots[slot].tail=record;s->queue->slots[slot].count++;
-        } else s->inline_charged|=bit;
+        } else {
+            if(!s->inline_account)s->inline_account=kernel_uid_account_get_locked(account);
+            s->inline_charged|=bit;
+        }
     }
     if((!available||!wants_record)&&s->queue)s->queue->inline_pending|=bit;
     if(!(*pending&bit)) {
@@ -128,8 +154,7 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
             if(!s->queue->native_count)__builtin_trap();
             s->queue->native_count--;posix_timer_record_take_locked(record,out,p);
         } else {
-            if(!root_pending)__builtin_trap();
-            root_pending--;
+            uncharge(record->account,1);
             record->next=p->retired;p->retired=record;
         }
         if(s->queue->slots[sig-1].head)return;
@@ -145,8 +170,8 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
             out->user_time=times[0];out->system_time=times[1];
         }
         if(s->inline_charged&bit) {
-            if(!root_pending)__builtin_trap();
-            root_pending--;s->inline_charged&=~bit;
+            uncharge(s->inline_account,1);s->inline_charged&=~bit;
+            retire_inline_account(s,p);
         }
     }
     if(!s->queue||!s->queue->slots[sig-1].head)*bits(t,shared)&=~bit;
@@ -159,24 +184,19 @@ static int clear_locked(struct kernel_task *t,int shared,uint64_t mask,
     uint64_t charged=s->inline_charged&mask;
     uint64_t count=0;
     while(charged){charged&=charged-1;count++;}
-    if(root_pending<count)__builtin_trap();
-    root_pending-=count;s->inline_charged&=~mask;
+    if(count)uncharge(s->inline_account,count);
+    s->inline_charged&=~mask;retire_inline_account(s,p);
     if(s->queue)s->queue->inline_pending&=~mask;
     unsigned budget=16;
     if(s->queue)for(unsigned i=0;i<64;i++)if(mask&(UINT64_C(1)<<i)) {
-        if(!s->queue->native_count) {
-            if(root_pending<s->queue->slots[i].count)__builtin_trap();
-            root_pending-=s->queue->slots[i].count;
-            if(s->queue->slots[i].head){s->queue->slots[i].tail->next=p->retired;p->retired=s->queue->slots[i].head;}
-            memset(&s->queue->slots[i],0,sizeof(s->queue->slots[i]));
-        } else while(s->queue->slots[i].head) {
+        while(s->queue->slots[i].head) {
             if(!budget)return 1;
             budget--;
             struct signal_queue_record *r=s->queue->slots[i].head;
             s->queue->slots[i].head=r->next;s->queue->slots[i].count--;
             if(!s->queue->slots[i].head)s->queue->slots[i].tail=0;
             if(r->timer){s->queue->native_count--;posix_timer_record_clear_locked(r,ignored,p);}
-            else {if(!root_pending)__builtin_trap();root_pending--;r->next=p->retired;p->retired=r;}
+            else {uncharge(r->account,1);r->next=p->retired;p->retired=r;}
         }
         *bits(t,shared)&=~(UINT64_C(1)<<i);
     }
@@ -193,9 +213,10 @@ void signal_pending_finish(struct signal_pending_prepared *p)
     if(p->record){p->record->next=p->retired;p->retired=p->record;}
     while(p->retired) {
         struct signal_queue_record *r=p->retired;p->retired=r->next;
-        if(r->timer)posix_timer_record_free(r);else kernel_heap_release(r->heap,r);
+        if(r->timer)posix_timer_record_free(r);else {if(r->account)kernel_uid_account_put(r->account);kernel_heap_release(r->heap,r);}
     }
     if(p->index)kernel_heap_release(p->index->heap,p->index);
+    for(unsigned i=0;i<2;i++)if(p->retired_accounts[i])kernel_uid_account_put(p->retired_accounts[i]);
     *p=(struct signal_pending_prepared){0};
 }
 void signal_pending_flush_timers(struct kernel_task *task)
@@ -214,7 +235,7 @@ void signal_pending_flush_timers(struct kernel_task *task)
                     if(r->info.code!=-2){tail=r;link=&r->next;continue;}
                     *link=r->next;q->slots[i].count--;
                     if(r->timer){q->native_count--;posix_timer_record_clear_locked(r,0,&p);}
-                    else {if(!root_pending)__builtin_trap();root_pending--;r->next=p.retired;p.retired=r;}
+                    else {uncharge(r->account,1);r->next=p.retired;p.retired=r;}
                 }
                 q->slots[i].tail=tail;
                 if(!q->slots[i].head&&!(q->inline_pending&(UINT64_C(1)<<i)))*bits(owner,shared)&=~(UINT64_C(1)<<i);

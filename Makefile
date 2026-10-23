@@ -362,6 +362,7 @@ COMMON_C_SOURCES := \
 	kernel/elf64.c \
 	kernel/elf64_source.c \
 	kernel/exec.c \
+	kernel/exec_credentials.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
 	kernel/read_source.c \
@@ -396,6 +397,8 @@ COMMON_C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
+	kernel/credentials.c \
+	kernel/syscall/credentials.c \
 	kernel/syscall/capability.c \
 	kernel/syscall/random.c \
 	kernel/syscall/log.c \
@@ -2479,14 +2482,14 @@ test-scheduler-handoff-host: test-scheduler-stack-slots-host
 test-posix-timer-host:
 	@mkdir -p build/host/posix-timer
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/posix_timer.c kernel/sched/posix_timer.c kernel/signal_pending.c kernel/raw_lock.c tests/host/cpu_context.c -o build/host/posix-timer/owner-$$shift; \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/host/posix_timer.c kernel/credentials.c kernel/sched/posix_timer.c kernel/signal_pending.c kernel/raw_lock.c tests/host/cpu_context.c -o build/host/posix-timer/owner-$$shift; \
 	build/host/posix-timer/owner-$$shift; done
 
 .PHONY: test-signal-pending-host
 test-signal-pending-host:
 	@mkdir -p build/host/signal-pending
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_MAX_CPUS=2 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/signal_pending.c kernel/signal_pending.c kernel/raw_lock.c tests/host/cpu_context.c -o build/host/signal-pending/cases-$$shift; \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_MAX_CPUS=2 -Itests/host/random -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/host/signal_pending.c kernel/credentials.c kernel/signal_pending.c kernel/raw_lock.c tests/host/cpu_context.c -o build/host/signal-pending/cases-$$shift; \
 	build/host/signal-pending/cases-$$shift; done
 
 .PHONY: test-signal-stack-host
@@ -2508,10 +2511,14 @@ test-task-request-cleanup-host:
 test-proc-index-host:
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/proc_index.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -Wl,--gc-sections -o build/host/proc-index-$$shift; \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/proc_index.c kernel/credentials.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -Wl,--gc-sections -o build/host/proc-index-$$shift; \
 	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; done
 
 build/riscv/io-proc-cost: tests/workloads/cost/io-proc.c $(MUSL_STAMP)
+	@mkdir -p $(@D)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
+build/riscv/credential-cost: tests/workloads/cost/credentials.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
 	@mkdir -p $(@D)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
 

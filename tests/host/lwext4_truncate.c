@@ -184,7 +184,7 @@ static void deep_prepare(struct ext4_fs *fs)
     CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
     CHECK(ext4_file_sync_metadata(&file) == EOK);
     /* Removing complete leaves also modifies their non-root index parent. */
-    int truncated = ext4_ftruncate(&file, deep_target(fs));
+    int truncated = ext4_ftruncate(&file, deep_target(fs), UINT32_MAX);
     if (truncated) fprintf(stderr, "deep extent truncate returned %d\n", truncated);
     CHECK(truncated == EOK);
     CHECK(ext4_file_sync_metadata(&file) == EOK && ext4_fclose(&file) == EOK);
@@ -209,7 +209,7 @@ static void deep_check(struct ext4_fs *fs)
         offset += read;
     }
     free(bytes);
-    CHECK(ext4_ftruncate(&file, 0) == EOK && ext4_file_sync_metadata(&file) == EOK);
+    CHECK(ext4_ftruncate(&file, 0, UINT32_MAX) == EOK && ext4_file_sync_metadata(&file) == EOK);
     CHECK(ext4_fsize(&file) == 0 && ext4_fclose(&file) == EOK);
 }
 

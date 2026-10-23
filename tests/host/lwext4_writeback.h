@@ -24,7 +24,7 @@ static int check_bitmap_failure(struct host_image *image,
     }
     if (ext4_cache_flush("/") || ext4_fseek(&file, 0, SEEK_SET) ||
         ext4_fwrite(&file, "data", 4, &count) || count != 4 ||
-        ext4_ftruncate(&file, 0) || ext4_fclose(&file) ||
+        ext4_ftruncate(&file, 0, UINT32_MAX) || ext4_fclose(&file) ||
         ext4_fremove("/wb-bitmap")) return 1;
     /* The runner's e2fsck verifies no unowned bit or count remains. */
     return 0;

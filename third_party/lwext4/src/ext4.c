@@ -2053,7 +2053,7 @@ Unlock:
     return r;
 }
 
-static int ext4_file_set_owner_once(ext4_file *file, uint32_t uid, uint32_t gid)
+static int ext4_file_set_owner_once(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t privilege_mode)
 {
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     struct ext4_mountpoint *mp = file->mp;
@@ -2067,8 +2067,8 @@ static int ext4_file_set_owner_once(ext4_file *file, uint32_t uid, uint32_t gid)
     if (r == EOK) {
         uint32_t mode = ext4_inode_get_mode(ext4_fs_super(&mp->fs), ref.inode);
         if ((mode & 0170000U) != 0040000U) {
-            mode &= ~04000U;
-            if (mode & 0010U) mode &= ~02000U;
+            if (privilege_mode!=UINT32_MAX) mode=privilege_mode;
+            else {mode &= ~04000U;if (mode & 0010U) mode &= ~02000U;}
             /* 同一 undo 边界删除文件 capability，失败不能留下半次 chown。 */
             r = ext4_xattr_remove(&ref, 6, "capability", 10);
             if (r == ENODATA) r = EOK;
@@ -2090,20 +2090,67 @@ Unlock:
     return r;
 }
 
-struct ext4_owner_change { ext4_file *file;uint32_t uid,gid; };
+struct ext4_owner_change { ext4_file *file;uint32_t uid,gid,mode; };
 static int ext4_apply_owner(void *context)
 {
     struct ext4_owner_change *request=context;
-    return ext4_file_set_owner_once(request->file,request->uid,request->gid);
+    return ext4_file_set_owner_once(request->file,request->uid,request->gid,request->mode);
 }
-int ext4_file_set_owner(ext4_file *file,uint32_t uid,uint32_t gid)
+int ext4_file_set_owner(ext4_file *file,uint32_t uid,uint32_t gid, uint32_t privilege_mode)
 {
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     struct ext4_mountpoint *mp=file->mp;
-    struct ext4_owner_change request={file,uid,gid};
+    struct ext4_owner_change request={file,uid,gid,privilege_mode};
     EXT4_MP_LOCK(mp);
     int result=ext4_metadata_execute_locked(mp,ext4_apply_owner,&request);
     ext4_file_completed(file,result, false);
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
+int ext4_file_capability(ext4_file *file,void *data,size_t capacity,size_t *size)
+{
+    if (!file || !file->mp || !size) return EINVAL;
+    struct ext4_mountpoint *mp=file->mp;
+    EXT4_MP_LOCK(mp);
+    struct ext4_inode_ref ref;
+    int result=ext4_fs_get_inode_ref(&mp->fs,file->inode,&ref);
+    if (!result) {
+        result=ext4_xattr_get(&ref,6,"capability",10,data,capacity,size);
+        result=ext4_result(result,ext4_fs_put_inode_ref(&ref));
+    }
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+struct ext4_privilege_change { ext4_file *file; uint32_t mode; };
+static int ext4_remove_privileges(void *context)
+{
+    struct ext4_privilege_change *change=context;
+    struct ext4_mountpoint *mp=change->file->mp;
+    int result=ext4_trans_start(mp);
+    if (result) return result;
+    struct ext4_inode_ref ref;
+    result=ext4_fs_get_inode_ref(&mp->fs,change->file->inode,&ref);
+    if (!result) {
+        result=ext4_xattr_remove(&ref,6,"capability",10);
+        if (result==ENODATA) result=EOK;
+        if (!result) {
+            ext4_inode_set_mode(ext4_fs_super(&mp->fs),ref.inode,change->mode);
+            ref.dirty=true;
+            ext4_touch_inode(mp,&ref,EXT4_TIME_CTIME,change->file->time_owner);
+        }
+        result=ext4_result(result,ext4_fs_put_inode_ref(&ref));
+    }
+    return ext4_trans_finish(mp,result);
+}
+int ext4_file_remove_privileges(ext4_file *file,uint32_t mode)
+{
+    if (!file || !file->mp) return EINVAL;
+    struct ext4_privilege_change change={file,mode};
+    struct ext4_mountpoint *mp=file->mp;
+    EXT4_MP_LOCK(mp);
+    int result=ext4_metadata_execute_locked(mp,ext4_remove_privileges,&change);
+    ext4_file_completed(file,result,false);
     EXT4_MP_UNLOCK(mp);
     return result;
 }
@@ -3571,7 +3618,7 @@ static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
 	return ext4_zero_fblock_range(ref, fblock, offset, length);
 }
 
-static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
+static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privilege_mode)
 {
 	struct ext4_inode_ref ref;
 	struct ext4_sblock *sb = ext4_fs_super(&file->mp->fs);
@@ -3596,10 +3643,13 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
         if (r == EOK) r = ext4_orphan_mark_truncate(&ref,true);
 		if (r != EOK) goto Finish;
 	}
-	/* 固定 root 保留 set-ID；capability 与大小修改共用操作 undo。 */
+	/* 发起者给出的 set-ID 结果与 capability、大小共用操作 undo。 */
 	r = ext4_xattr_remove(&ref, 6, "capability", 10);
 	if (r == ENODATA) r = EOK;
 	if (r != EOK) goto Finish;
+    if (privilege_mode!=UINT32_MAX) {
+        ext4_inode_set_mode(sb,ref.inode,privilege_mode);ref.dirty=true;
+    }
 	if (old_size < size) {
 		r = ext4_zero_allocated_eof_tail(&ref, old_size, size);
 		if (r == EOK) {
@@ -3626,7 +3676,7 @@ Finish:
 	return r;
 }
 
-int ext4_ftruncate(ext4_file *f, uint64_t size)
+int ext4_ftruncate(ext4_file *f, uint64_t size, uint32_t privilege_mode)
 {
 	int r;
 	uint64_t saved_size, saved_pos;
@@ -3651,7 +3701,7 @@ Retry:
 	}
 	saved_size = f->fsize;
 	saved_pos = f->fpos;
-	r = ext4_ftruncate_no_lock(f, size);
+	r = ext4_ftruncate_no_lock(f, size, privilege_mode);
 	r = ext4_trans_finish(f->mp, r);
 	if (ext4_file_rolled_back(f, r)) {
 		f->fsize = saved_size;
@@ -3828,7 +3878,7 @@ Retry:
 }
 
 int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
-                   uint64_t length, bool *changed)
+                   uint64_t length, bool *changed, uint32_t privilege_mode)
 {
     ext4_assert(file && file->mp && changed);
     *changed = false;
@@ -3873,6 +3923,9 @@ Retry:
     r = ext4_xattr_remove(&ref, 6, "capability", 10);
     if (r == ENODATA) r = EOK;
     if (r != EOK) goto Put;
+    if (privilege_mode!=UINT32_MAX) {
+        ext4_inode_set_mode(sb,ref.inode,privilege_mode);ref.dirty=true;
+    }
     if ((mode & EXT4_FALLOC_PUNCH_HOLE) && offset >= size) goto Touch;
     if (mode & EXT4_FALLOC_PUNCH_HOLE) {
         uint64_t eof_block = (size + block_size - 1) / block_size * block_size;
@@ -5299,7 +5352,7 @@ static int ext4_fsymlink_set(ext4_file *f, const void *buf, uint32_t size)
     int r = ext4_fs_get_inode_ref(&f->mp->fs, f->inode, &ref);
     if (r != EOK) return r;
     if (size > ext4_sb_get_block_size(ext4_fs_super(&f->mp->fs))) r = EINVAL;
-    else r = ext4_ftruncate_no_lock(f, 0);
+    else r = ext4_ftruncate_no_lock(f, 0, UINT32_MAX);
     if (!r) r = ext4_symlink_inode_set(&ref, buf, size);
 
     if (!r) {
@@ -5464,7 +5517,7 @@ Finish:
  * boundary. Initial attributes belong to caller scratch until acceptance. */
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
-    struct ext4_inode *initial)
+    struct ext4_inode *initial,uint32_t uid,uint32_t gid)
 {
     struct ext4_mountpoint *mp = ext4_get_mount(mount);
     if (!mp) return ENOENT;
@@ -5483,6 +5536,8 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
             type, NULL, NULL, &ref, NULL);
         if (result == EOK) {
             ext4_inode_set_mode_initial(&ref, mode);
+            ext4_inode_set_uid(ref.inode,uid);
+            ext4_inode_set_gid(ref.inode,gid);
             if (type == EXT4_DE_SYMLINK) {
                 size_t length = strlen(target);
                 if (length > ext4_sb_get_block_size(ext4_fs_super(&mp->fs))) result = EINVAL;
@@ -6038,7 +6093,7 @@ int ext4_chrdev_open_file(ext4_file *file, const char *path)
 }
 
 int ext4_fopen_inode(ext4_file *file, const char *mount_point,
-                     uint32_t inode_number)
+                     uint32_t inode_number, struct ext4_inode *initial)
 {
     struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
     struct ext4_inode_ref ref;
@@ -6057,6 +6112,12 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
         file->time_owner = NULL;
         file->fsize = ext4_inode_get_size(ext4_fs_super(&mp->fs), ref.inode);
         file->fmax = ext4_inode_max_size(&mp->fs, ref.inode);
+        if (initial) {
+            size_t bytes=ext4_get16(ext4_fs_super(&mp->fs),inode_size);
+            if (bytes>sizeof(*initial)) bytes=sizeof(*initial);
+            memcpy(initial,ref.inode,bytes);
+            memset((uint8_t *)initial+bytes,0,sizeof(*initial)-bytes);
+        }
         result = ext4_fs_put_inode_ref(&ref);
     }
     EXT4_MP_UNLOCK(mp);
@@ -6115,7 +6176,7 @@ int ext4_readlink_inode(const char *mount_point, uint32_t inode_number,
     int result;
 
     if (!mp || !buffer || !bytes_read) return EINVAL;
-    result = ext4_fopen_inode(&file, mount_point, inode_number);
+    result = ext4_fopen_inode(&file, mount_point, inode_number, NULL);
     if (result != EOK) return result;
     EXT4_MP_LOCK(mp);
     result = ext4_fread(&file, buffer, capacity, bytes_read);

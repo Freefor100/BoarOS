@@ -1,6 +1,7 @@
 #include "devpts_internal.h"
 #include <arch/context.h>
 #include <kernel/errno.h>
+#include <kernel/credentials.h>
 #include <kernel/page.h>
 #include <kernel/time.h>
 #include <string.h>
@@ -119,8 +120,8 @@ static int options(struct devpts_mount *m, const char *input)
             (negative && v)) return -KERNEL_EINVAL;
         if (mode) m->slave_mode = v & 07777U;
         else if (ptmxmode) m->ptmx.stat.mode = KERNEL_VFS_S_IFCHR | (v & 07777U);
-        else if (key == 3U && !memcmp(p, "uid", key) && v != UINT32_MAX) m->uid = v;
-        else if (key == 3U && !memcmp(p, "gid", key) && v != UINT32_MAX) m->gid = v;
+        else if (key == 3U && !memcmp(p, "uid", key) && v != UINT32_MAX) { m->uid = v; m->uid_set=1; }
+        else if (key == 3U && !memcmp(p, "gid", key) && v != UINT32_MAX) { m->gid = v; m->gid_set=1; }
         else if (max && v <= DEVPTS_OPTION_MAX) m->max = v;
         else return -KERNEL_EINVAL;
         p = *end ? end + 1 : end;
@@ -187,7 +188,8 @@ int kernel_devpts_publish(struct kernel_vfs_mount *mount, void *pair,
         e->binding = pair; e->published = e->reserved = 1;
         e->stat = (struct kernel_vfs_stat){.dev = mount->id,
             .ino = m->next_inode++, .mode = KERNEL_VFS_S_IFCHR | m->slave_mode,
-            .uid = m->uid, .gid = m->gid, .nlink = 1,
+            .uid = m->uid_set ? m->uid : kernel_credentials_current()->fsuid,
+            .gid = m->gid_set ? m->gid : kernel_credentials_current()->fsgid, .nlink = 1,
             .rdev = UINT64_C(0x8800) + index, .blksize = DEVPTS_BLOCK_SIZE,
             .atime = time, .mtime = time, .ctime = time};
         m->reserved_numbers |= UINT64_C(1) << index;
@@ -355,7 +357,7 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path,
     result = allocate(m, sizeof(*node), (void **)&node);
     if (result) { kernel_devpts_entry_release(&e); return result; }
     irq = arch_interrupt_save();
-    node->inode = e->stat.ino; node->mode = e->stat.mode;
+    node->inode = e->stat.ino; node->mode = e->stat.mode; node->uid=e->stat.uid; node->gid=e->stat.gid;
     node->backend_data = e;
     if (!e->published) node->unlinked = 1;
     arch_interrupt_restore(irq);
@@ -432,6 +434,7 @@ static int set_mode(struct kernel_vfs_file *file, uint32_t mode)
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chmod_allowed(n->uid,n->gid,&mode); if (allowed) return allowed;
     struct kernel_vfs_timespec time = timestamp();
     uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = n->backend_data;
@@ -446,12 +449,14 @@ static int set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid)
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chown_allowed(n->uid,n->gid,n->mode,uid,gid); if (allowed) return allowed;
     struct kernel_vfs_timespec time = timestamp();
     uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = n->backend_data;
     if (uid != UINT32_MAX) e->stat.uid = uid;
     if (gid != UINT32_MAX) e->stat.gid = gid;
-    e->stat.mode = kernel_vfs_chown_mode(e->stat.mode);
+    e->stat.mode = kernel_vfs_chown_mode(e->stat.mode,n->gid,e->stat.gid);
+    n->uid=e->stat.uid; n->gid=e->stat.gid;
     n->mode = file->mode = e->stat.mode; e->stat.ctime = time;
     arch_interrupt_restore(irq);
     return 0;
@@ -469,6 +474,7 @@ static int set_times(struct kernel_vfs_file *file, const struct kernel_vfs_times
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_inode_times_allowed(n,times); if (allowed) return allowed;
     struct kernel_vfs_timespec time = timestamp();
     uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = n->backend_data;

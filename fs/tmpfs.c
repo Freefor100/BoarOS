@@ -1,5 +1,6 @@
 #include "vfs_objects.h"
 #include <kernel/tmpfs.h>
+#include <kernel/credentials.h>
 #include <kernel/memory_object.h>
 #include <kernel/physical_page.h>
 #include <kernel/page.h>
@@ -176,11 +177,8 @@ static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *
     if (r) return r;
     r = allocate(m, sizeof(*i), (void **)&i);
     if (r) { dispose(m, e); return r; }
+    kernel_vfs_creation_identity(parent->mode,parent->gid,&mode,&i->uid,&i->gid);
     i->mode = mode; i->parent = parent->number;
-    if (parent->mode & 02000U) {
-        i->gid = parent->gid;
-        if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->mode |= 02000U;
-    }
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->size = 2 * TMPFS_DIRENT_SIZE;
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         if (kernel_memory_object_create(m->instance.heap, m->instance.heap->page_allocator,
@@ -254,7 +252,7 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t
     if (r || !i) return r ? r : -KERNEL_ENOENT;
     struct kernel_vfs_node *n = 0;
     r = allocate(m, sizeof(*n), (void **)&n); if (r) return r;
-    n->inode = i->number; n->mode = i->mode; n->size = i->size; n->max_size = INT64_MAX;
+    n->inode = i->number; n->mode = i->mode; n->uid=i->uid; n->gid=i->gid; n->size = i->size; n->max_size = INT64_MAX;
     n->backend_data = i; n->memory = i->memory; i->handles++;
     return kernel_vfs_publish_node(mount, n, file, 0);
 }
@@ -425,6 +423,7 @@ static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint6
 static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actual,int *changed)
 {
     struct tmp_inode *i=ti(n); kernel_memory_object_truncate(i->memory,size);
+    i->mode=n->mode=kernel_vfs_write_mode(n->mode,n->gid);
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->size=size; i->ctime=i->mtime=time; *actual=size; *changed=1; return 0;
@@ -467,6 +466,7 @@ static int set_times(struct kernel_vfs_file *f,const struct kernel_vfs_timespec 
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_inode_times_allowed(n,t); if (allowed) return allowed;
     struct tmp_inode *i = ti(n); struct kernel_vfs_timespec time = now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     if (!t || t[0].nanoseconds != KERNEL_VFS_UTIME_OMIT)
@@ -482,6 +482,7 @@ static int set_mode(struct kernel_vfs_file *f,uint32_t mode)
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chmod_allowed(n->uid,n->gid,&mode); if (allowed) return allowed;
     struct tmp_inode *i = ti(n);
     i->mode = (i->mode & KERNEL_VFS_S_IFMT) | (mode & 07777);
     n->mode = f->mode = i->mode;
@@ -496,11 +497,12 @@ static int set_owner(struct kernel_vfs_file *f, uint32_t uid, uint32_t gid)
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chown_allowed(n->uid,n->gid,n->mode,uid,gid); if (allowed) return allowed;
     struct tmp_inode *i = ti(n);
     if (uid != UINT32_MAX) i->uid = uid;
     if (gid != UINT32_MAX) i->gid = gid;
-    i->mode = kernel_vfs_chown_mode(i->mode);
-    n->mode = f->mode = i->mode;
+    i->mode = kernel_vfs_chown_mode(i->mode,n->gid,i->gid);
+    n->mode = f->mode = i->mode; n->uid=i->uid; n->gid=i->gid;
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->ctime = time;
@@ -518,6 +520,11 @@ static void accessed(struct kernel_vfs_file *f)
     if (time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
         (t.seconds >= i->atime.seconds && (uint64_t)t.seconds - (uint64_t)i->atime.seconds >= 86400))
         i->atime=t;
+}
+static int killpriv(struct kernel_vfs_node *n,uint32_t mode)
+{
+    if (n->mode!=mode) {ti(n)->mode=n->mode=mode;ti(n)->ctime=now();}
+    return 0;
 }
 static int modified(struct kernel_vfs_file *f,uint64_t offset,int append)
 {
@@ -570,7 +577,7 @@ static void initialize_ops(void)
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
-    o->accessed=accessed; o->modified=modified; o->writeback_allowed=no_writeback;
+    o->accessed=accessed; o->modified=modified; o->killpriv=killpriv; o->writeback_allowed=no_writeback;
     o->flush=error; o->unmount=unmount;
 }
 static int number(const char *p,size_t n,unsigned base,uint64_t *value)
@@ -658,6 +665,7 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     struct tmp_inode *i=0; r=allocate(m,sizeof(*i),(void **)&i);
     if(r) {dispose(m,m);return r;}
     i->number=i->parent=1; i->mode=KERNEL_VFS_S_IFDIR|mode; i->links=2;
+    i->uid=kernel_credentials_current()->fsuid;i->gid=kernel_credentials_current()->fsgid;
     i->size=2 * TMPFS_DIRENT_SIZE;
     i->atime=i->mtime=i->ctime=now();
     if (RB_INSERT(tmp_inode_tree, &m->inodes, i)) __builtin_trap();

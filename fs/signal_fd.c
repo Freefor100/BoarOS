@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "open_file_internal.h"
 #include "files/private.h"
 #include "uaccess_iov_internal.h"
@@ -70,6 +71,7 @@ enum kernel_files_status kernel_files_signalfd(struct kernel_files *files,struct
     if(allocation==KERNEL_HEAP_STATUS_EMPTY){*result=-KERNEL_ENOMEM;return 0;}
     if(allocation)__builtin_trap();
     signal->file.heap=files->heap;signal->file.references=1;signal->file.kind=KERNEL_OPEN_FILE_KIND_SIGNALFD;
+    signal->file.credentials=kernel_credentials_get(kernel_credentials_current());
     signal->file.open_flags=2|(flags&04000U);signal->mask=mask;
     kernel_mutex_init(&signal->file.offset_lock,10,(uintptr_t)signal);
     struct kernel_open_file_description *owner=&signal->file;

@@ -21,6 +21,22 @@ static size_t live_allocations;
 static int allocation_budget = -1, start_error, stop_error;
 static uint64_t clock_ns;
 
+/* This isolated backend fixture uses fully privileged root. Variable identity
+ * and actual DAC decisions are exercised through real VFS in fallocate.c. */
+const struct kernel_credentials *kernel_credentials_current(void)
+{
+    static const struct kernel_credentials root={.effective=KERNEL_CAP_VALID_MASK};
+    return &root;
+}
+int kernel_vfs_chmod_allowed(uint32_t uid,uint32_t gid,uint32_t *mode)
+{ (void)uid;(void)gid;(void)mode;return 0; }
+int kernel_vfs_chown_allowed(uint32_t old_uid,uint32_t old_gid,uint32_t mode,uint32_t uid,uint32_t gid)
+{ (void)old_uid;(void)old_gid;(void)mode;(void)uid;(void)gid;return 0; }
+uint32_t kernel_vfs_chown_mode(uint32_t mode,uint32_t old_gid,uint32_t new_gid)
+{ (void)old_gid;(void)new_gid;assert(!(mode&06000));return mode; }
+int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *node,const struct kernel_vfs_timespec times[2])
+{ (void)node;(void)times;return 0; }
+
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap,
     size_t count, size_t size, void **owner)
 {
@@ -76,10 +92,25 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *m, struct kernel_vfs_node *
     (void)creating;
     struct kernel_vfs_instance *i = m->private_data;
     n->instance = i; n->mount = m; n->references = n->open_files = 1;
+    kernel_mutex_init(&n->write_operation,15,(uintptr_t)n);
     n->next = i->nodes; i->nodes = n; i->external_files++;
     *f = (struct kernel_vfs_file){.private_data = n, .mount = m,
         .mode = n->mode, .state = VFS_FILE_STATE_LIVE};
     return 0;
+}
+static int qualified_set_mode(struct kernel_vfs_file *file,uint32_t mode)
+{
+    struct kernel_vfs_node *node=file->private_data;
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_mutex_lock(&node->write_operation,&operation);
+    return node->instance->ops->set_mode(file,mode);
+}
+static int qualified_set_owner(struct kernel_vfs_file *file,uint32_t uid,uint32_t gid)
+{
+    struct kernel_vfs_node *node=file->private_data;
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_mutex_lock(&node->write_operation,&operation);
+    return node->instance->ops->set_owner(file,uid,gid);
 }
 static void close_file(struct kernel_vfs_file *f)
 {
@@ -174,8 +205,8 @@ static void stable_identity_and_metadata(struct kernel_heap *heap)
     uint64_t old_ino = find(m, "0");
     struct kernel_vfs_file saved = {0}; open_id(m, old_ino, &saved);
     struct kernel_vfs_instance *i = m->private_data;
-    assert(!i->ops->set_mode(&saved, 0670));
-    assert(!i->ops->set_owner(&saved, 31, 41));
+    assert(!qualified_set_mode(&saved, 0670));
+    assert(!qualified_set_owner(&saved, 31, 41));
     struct kernel_vfs_timespec ts[2] = {{7, 8}, {9, 10}};
     assert(!i->ops->set_times(&saved, ts));
     kernel_devpts_unpublish(old);
@@ -264,8 +295,8 @@ static void readonly_and_root_owner(struct kernel_heap *heap)
     assert(!kernel_devpts_publish(m, &pair, &entry));
     struct kernel_vfs_file slave = {0}; open_id(m, find(m, "0"), &slave);
     struct kernel_vfs_instance *i = m->private_data;
-    assert(i->ops->set_mode(&slave, 0666) == -KERNEL_EROFS);
-    assert(i->ops->set_owner(&slave, 10, 20) == -KERNEL_EROFS);
+    assert(qualified_set_mode(&slave, 0666) == -KERNEL_EROFS);
+    assert(qualified_set_owner(&slave, 10, 20) == -KERNEL_EROFS);
     assert(i->ops->set_times(&slave, 0) == -KERNEL_EROFS);
     struct kernel_vfs_stat st;
     assert(!i->ops->stat(&slave, &st) && st.mode == (KERNEL_VFS_S_IFCHR | 0600));

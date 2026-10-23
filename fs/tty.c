@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "char_device_internal.h"
 #include "files/private.h"
 #include "open_file_internal.h"
@@ -822,9 +823,8 @@ static int acquire_ctty(struct kernel_tty *tty, struct kernel_task *caller, int 
     if (current)
         return -KERNEL_EPERM;
     if (tty->session) {
-        if (!steal)
+        if (!steal || !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))
             return -KERNEL_EPERM;
-        /* Current uid model is immutable root; steal is CAP_SYS_ADMIN-equivalent. */
         kernel_task_tty_clear_session(tty, tty->session);
         drop_session(tty);
     }

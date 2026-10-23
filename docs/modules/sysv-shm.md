@@ -33,6 +33,8 @@
 4. **`IPC_STAT` 与 `SHM_DEST` 标志**：
    - 当段已被 `IPC_RMID` 标记删除但仍有附加时，`shmctl(..., IPC_STAT, ...)` 仍可成功查询，并在 `shm_perm.mode` 中反映 `SHM_DEST`（01000）标志位，符合 Linux 原生行为。
 
+创建时保存调用者 effective UID/GID 到 owner 和 creator 字段。按 key 查找、shmat 和 IPC_STAT 分别检查所需读写/执行位，CAP_IPC_OWNER 允许越过访问位；IPC_SET/RMID 要求 owner、creator 或 CAP_SYS_ADMIN。IPC_SET 先完整导入用户结构，再检查对象及管理权限，成功后更新 owner/group/mode；数字 UID/GID 采用初始用户命名空间的有效值。
+
 ## VMA 与架构集成
 
 命名 key 查找先检查已存在段、`CREAT|EXCL` 冲突及请求大小是否超过原段；`size=0` 可查找已有段。缺失 key 且无 `CREAT` 返回 `ENOENT`；只有新建段才检查 `SHMMIN/SHMMAX`。固定 ABI 依据为本地 `references/linux/ipc/shm.c` 的 `newseg`/`shm_more_checks` 与 `references/linux/ipc/util.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。

@@ -49,7 +49,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/4.15.0/#1 BoarOS/riscv64/(none)`；release 用于通过旧 glibc 的启动版本检查，不代表 BoarOS 已实现 Linux 4.15 的全部接口，机器名由架构构建配置提供。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
-- `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回当前不可变 root 身份的 0；调用无参数，忽略残留寄存器。fork/线程 clone/exec 不改变该身份。凭据变更、补充组与完整权限检查尚未实现，不能把此结果扩展成多用户支持；引入可变凭据时须统一替换查询和现有 root 权限假设。
+- `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回调用线程当前真实／有效 UID/GID；调用无参数，忽略残留寄存器。`setregid/setgid/setreuid/setuid/setresuid/getresuid/setresgid/getresgid/setfsuid/setfsgid` 对应 143～152；`getgroups/setgroups` 为 158/159。raw 设置只影响调用线程，libc 负责全线程协调，凭据共享与发布见[用户凭据](kernel-scheduler.md#用户凭据)。
 - `gettid` 编号为 178，返回调用任务自己的 TID。
 - `brk` 编号为 214，通过调用任务的 mutable MM borrow 调整精确 program break。raw syscall 成功返回请求值；参数 0 查询当前值；越过 ELF heap 起点/栈 guard、VMA 冲突或 metadata OOM 时返回原 break，不使用负 errno。跨页增长登记 demand-zero heap，缩小撤销越界页；libc 把 raw 返回再包装成自己的 0/-1 接口，不属于内核 ABI。
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按架构页大小对齐（RV 4 KiB、LA 16 KiB）；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
@@ -61,8 +61,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `waitid` 编号为 95，支持 `P_ALL/P_PID/P_PGID`，`WEXITED/WSTOPPED/WCONTINUED/WNOHANG/WNOWAIT` 及 `__WNOTHREAD/__WCLONE/__WALL` 标志。`P_PIDFD` 校验负数并对其余值返回 `EBADF`，pidfd 对象待实现。waitid/wait4 在调用开始时持有 PID/进程组 identity，阻塞期间 setpgid 或数字重用不改变等待目标。事件先于用户态复制消费（WNOWAIT 保持事件未消费并保留 zombie）；退出事件支持 NULL infop，EFAULT 不回滚已消费事件。有事件时先输出 rusage，再输出 siginfo 六个定义字段；EINVAL、ECHILD、中断和无事件也写六个零字段，保留 siginfo padding 与其余字段，rusage 保持原值。siginfo 复制失败以 EFAULT 覆盖原错误。wait claim 与任务借用覆盖输出过程，归还 claim 时唤醒排队的父线程。
 - `getrusage(165)` 支持 SELF、THREAD、CHILDREN，字段、单位和退出归并见[资源记账](kernel-accounting.md)。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（事件消费与回收先行，子进程不可再次 wait）。
-- `capget(90)` 支持Linux版本1/2/3及版本协商。当前固定root凭据的effective/permitted覆盖固定Linux的有效capability位，inheritable为零；这些位表示权限，接口是否实现仍由各syscall报告。查询接受自身、有效TID、存活组长及未回收进程zombie，已退出普通线程返回ESRCH。版本字段回写、NULL data、目标检查及部分输出fault的顺序与Linux一致；capset和可变凭据另行实现。
-- `prlimit64(261)`支持NOFILE、STACK、CORE、FSIZE。限额由线程组共享，fork复制，exec和组长替换保留；pid0选择自身，正pid选择可查询任务所属组，包含未回收zombie。新值先导入，设置及旧值快照完成后输出旧值；输出EFAULT保留已提交的新值。软值不得超过硬值，NOFILE/STACK仍受1024个fd/8MiB栈容量约束。CORE默认0/无限，FSIZE默认无限/无限；其他有效resource返回ENOTSUP，未知resource返回EINVAL。
+- `capget(90)/capset(91)` 支持 Linux 版本1/2/3与版本协商，查询实际 E/P/I 状态；capget 可查询自身、有效 TID 和未回收 zombie，capset 只修改调用线程。设置保持 E⊆P，P 相对旧 P 只能缩减；I 受旧 I/P、bounding 和 CAP_SETPCAP 规则约束，ambient 随 P/I 缩减。版本1设置清除高32位，高于固定 CAP_LAST_CAP 的输入位按 Linux 屏蔽。
+- `prctl(167)` 支持 capability bounding 查询／删除、KEEP_CAPS、securebits、ambient、NO_NEW_PRIVS 和 GET/SET_DUMPABLE。bounding 删除保留现有 E/P/I，锁定的 securebits 不能解锁；NNP 只能置1且不替换凭据对象。dumpable 修改共享 MM 的状态，设置只接受0或1。
+- `prlimit64(261)`支持NOFILE、STACK、CORE、FSIZE和SIGPENDING。限额由线程组共享，fork复制，exec和组长替换保留；pid0选择自身，正pid选择可查询任务所属组，包含未回收zombie。新值先导入，设置及旧值快照完成后输出旧值；输出EFAULT保留已提交的新值。软值不得超过硬值，NOFILE/STACK仍受1024个fd/8MiB栈容量约束。CORE默认0/无限，FSIZE默认无限/无限；其他有效resource返回ENOTSUP，未知resource返回EINVAL。
 - CORE当前提供状态管理，core文件写出另列能力缺口；wait状态仅在实际生成转储后才含core位。FSIZE在用户文件操作接纳处执行，短写、SIGXFSZ和后台写回边界见[文件接口](kernel-files.md#描述符-writewritev-与文件修改)。
 - `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
@@ -79,12 +80,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 `make test-selected-abi-riscv test-selected-abi-loongarch` 对本节的定位向量、错误顺序、时间输出、信号及嵌套 epoll 等边界运行同 ELF Linux 差分。`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
 
-身份查询依据本地 `references/linux/kernel/sys.c` 的四个 `SYSCALL_DEFINE0` 和
-`references/linux/include/uapi/asm-generic/unistd.h`，commit
-`f4cdf7ca9a1fdcca413157df19753f388a5a224e`。BoarOS 已有 root 假设见
-`kernel/syscall/process.c:syscall_handle_prlimit64`；查询没有新增对象或引用 owner，
-也没有改变凭据。`test-syscall-riscv` 保护四项返回与忽略参数，
-`test-diff-abi-riscv` 保护真实 U-mode 查询及 fork/exec 继承。
+身份和能力接口依据仓库固定的 `references/linux/kernel/sys.c`、`kernel/groups.c`、`kernel/capability.c` 与 `security/commoncap.c`，版本由 `references/sources.tsv` 统一维护。`tests/diff-abi/credentials.c` 的独立子进程记录检查身份转换、组列表、capset/prctl、错误顺序和用户输出前缀；真实 musl/glibc 全线程 setxid 由 `tests/workloads/credentials/threads.c` 检查。
 
 `mknodat(33)` 已接入普通文件、字符／块节点和 FIFO；块节点按真实 `st_rdev` 打开块设备 OFD，FIFO 使用管道后端。具体接口见[文件模块](kernel-files.md#节点创建)。
 

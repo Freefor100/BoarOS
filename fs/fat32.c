@@ -1041,6 +1041,7 @@ static int set_times(struct kernel_vfs_file *file, const struct kernel_vfs_times
     struct fat_mount *m = fm(node->instance);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     if (node->instance->read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_inode_times_allowed(node,times); if (allowed) return allowed;
     int r = fat_error(node->instance); if (r) return r;
     struct fat_inode *i = fi(node); struct kernel_vfs_timespec time = now();
     if (!times || times[0].nanoseconds != KERNEL_VFS_UTIME_OMIT)
@@ -1057,6 +1058,7 @@ static int set_mode(struct kernel_vfs_file *file, uint32_t mode)
     struct fat_mount *m = fm(node->instance);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     if (m->instance.read_only) return -KERNEL_EROFS;
+    int allowed=kernel_vfs_chmod_allowed(node->uid,node->gid,&mode); if (allowed) return allowed;
     int r = fat_error(node->instance); if (r) return r;
     struct fat_inode *i = fi(node);
     /* FAT's persistent permission is the read-only attribute. */
@@ -1066,7 +1068,9 @@ static int set_mode(struct kernel_vfs_file *file, uint32_t mode)
 }
 static int set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid)
 {
-    (void)file;
+    struct kernel_vfs_node *node=file->private_data;
+    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,1);
+    int allowed=kernel_vfs_chown_allowed(node->uid,node->gid,node->mode,uid,gid);if (allowed) return allowed;
     return (uid == 0 || uid == UINT32_MAX) && (gid == 0 || gid == UINT32_MAX) ? 0 : -KERNEL_EPERM;
 }
 static int flush_locked(struct fat_mount *m)

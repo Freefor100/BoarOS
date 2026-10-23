@@ -10,6 +10,11 @@
 
 struct kernel_heap;
 struct kernel_task;
+struct kernel_credentials;
+struct kernel_vfs_exec_metadata;
+int kernel_exec_credentials_prepare(struct kernel_credentials *,
+    const struct kernel_credentials *, const struct kernel_vfs_exec_metadata *,
+    unsigned unsafe_fs, unsigned no_new_privs, unsigned *secureexec, unsigned *dumpable);
 
 enum kernel_exec_transaction_state {
     KERNEL_EXEC_TRANSACTION_PREPARING = 1,
@@ -38,6 +43,10 @@ struct kernel_exec_transaction {
     struct kernel_exec_image image;
     struct kernel_mm retired_mm;
     enum kernel_exec_transaction_state state;
+    struct kernel_credentials *credentials;
+    struct kernel_exec_security *exec_security;
+    const struct kernel_fs_context *exec_fs;
+    unsigned unsafe_fs, secureexec, dumpable;
 };
 
 enum kernel_exec_status kernel_exec_transaction_cleanup(

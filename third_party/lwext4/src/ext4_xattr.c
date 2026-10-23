@@ -1046,9 +1046,10 @@ out:
  * @param name_index Name-index
  * @param name Name of the EA entry to be queried
  * @param name_len Length of name in bytes
- * @param buf Output buffer to hold content
+ * @param buf Output buffer for the complete value; NULL queries its length.
  * @param buf_len Output buffer's length
  * @param data_len The length of data of the EA entry found
+ * A supplied buffer that is too small returns ERANGE without a partial copy.
  *
  * @return Error code
  */
@@ -1082,12 +1083,9 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 	if (!ibody_finder.s.not_found) {
 		value_len = to_le32(ibody_finder.s.here->e_value_size);
 		value_offs = to_le32(ibody_finder.s.here->e_value_offs);
-		if (buf_len && buf) {
-			void *data_loc =
-			    (char *)ibody_finder.s.base + value_offs;
-			memcpy(buf, data_loc,
-			       (buf_len < value_len) ? buf_len : value_len);
-		}
+        if (buf && value_len > buf_len) ret = ERANGE;
+        else if (buf && value_len)
+            memcpy(buf, (char *)ibody_finder.s.base + value_offs, value_len);
 	} else {
 		struct ext4_block block;
 
@@ -1118,12 +1116,9 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 
 		value_len = to_le32(block_finder.s.here->e_value_size);
 		value_offs = to_le32(block_finder.s.here->e_value_offs);
-		if (buf_len && buf) {
-			void *data_loc =
-			    (char *)block_finder.s.base + value_offs;
-			memcpy(buf, data_loc,
-			       (buf_len < value_len) ? buf_len : value_len);
-		}
+        if (buf && value_len > buf_len) ret = ERANGE;
+        else if (buf && value_len)
+            memcpy(buf, (char *)block_finder.s.base + value_offs, value_len);
 
 		/*
 		 * Free the xattr block buffer returned by

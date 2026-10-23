@@ -459,12 +459,12 @@ void kernel_futex_release_mm(struct kernel_task *task)
 
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)
 {
-    task->robust_list_head = head;
+    __atomic_store_n(&task->robust_list_head,head,__ATOMIC_RELAXED);
 }
 
 uint64_t kernel_futex_get_robust_list(const struct kernel_task *task)
 {
-    return task->robust_list_head;
+    return __atomic_load_n(&task->robust_list_head,__ATOMIC_RELAXED);
 }
 
 static int robust_read_u64(struct kernel_mm *mm, uint64_t address,
@@ -526,12 +526,11 @@ static int robust_release_word(struct kernel_task *task, uint64_t entry,
 
 void kernel_futex_release_robust(struct kernel_task *task, int32_t owner_tid)
 {
-    uint64_t head = task->robust_list_head;
+    uint64_t head = __atomic_exchange_n(&task->robust_list_head,0U,__ATOMIC_RELAXED);
     uint64_t next, pending, offset_bits;
     uint64_t entry, pending_entry;
     uint32_t limit = ROBUST_LIST_LIMIT;
 
-    task->robust_list_head = 0U;
     if (head == 0U || task->mm.state != KERNEL_MM_LIVE ||
         kernel_user_range_check(head, 3U * sizeof(uint64_t)) !=
             KERNEL_UACCESS_STATUS_OK)

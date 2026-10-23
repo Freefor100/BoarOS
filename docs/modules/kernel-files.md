@@ -85,7 +85,7 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `kernel_files_openat()` 接收用户路径、dirfd、flags 和 mode，普通 Linux 结果通过 `linux_result` 返回，内核对象损坏或清理所有权异常则使用 `kernel_files_status` 报告。路径先复制到一张 4096 字节临时堆缓冲区：找不到 NUL 返回 `-ENAMETOOLONG`，不可读用户页返回 `-EFAULT`，空路径返回 `-ENOENT`。
 
-绝对路径忽略 dirfd，从 root 对象开始；相对路径从 cwd 或目录 fd 持有的目录项开始。无效 fd 返回 `-EBADF`，非目录 fd 返回 `-ENOTDIR`。VFS 在 mount 内逐分量处理 `.`、`..`、相对/绝对符号链接目标、尾斜杠和最多 40 次链接展开；open/exec/stat 跟随最终链接，`O_NOFOLLOW` 只在最终分量为链接时返回 `-ELOOP`，`O_CREAT|O_EXCL` 对它返回 `-EEXIST`。`symlinkat/readlinkat` 和 `AT_SYMLINK_NOFOLLOW` 访问链接本身；创建和删除仅解析父路径。当前仍没有 mount namespace 或逐分量权限检查。
+绝对路径忽略 dirfd，从 root 对象开始；相对路径从 cwd 或目录 fd 持有的目录项开始。无效 fd 返回 `-EBADF`，非目录 fd 返回 `-ENOTDIR`。VFS 在 mount 内逐分量处理 `.`、`..`、相对/绝对符号链接目标、尾斜杠和最多 40 次链接展开；open/exec/stat 跟随最终链接，`O_NOFOLLOW` 只在最终分量为链接时返回 `-ELOOP`，`O_CREAT|O_EXCL` 对它返回 `-EEXIST`。`symlinkat/readlinkat` 和 `AT_SYMLINK_NOFOLLOW` 访问链接本身；创建和删除仅解析父路径。逐分量搜索、最终访问与父目录修改执行实际凭据检查；mount namespace 仍未实现。
 
 支持普通文件与目录的打开，以及新建文件，严格遵循 Linux 解析与权限控制流：
 - 标志支持：`O_RDONLY`、`O_WRONLY`、`O_RDWR`、`O_CREAT`、`O_EXCL`、`O_TRUNC`、`O_APPEND`、`O_NONBLOCK`、`O_LARGEFILE`、`O_CLOEXEC`、`O_DIRECTORY` 和 `O_NOFOLLOW`。regular file 与 directory 接受并在 OFD status flags 中保留 `O_NONBLOCK`，`F_GETFL/F_SETFL` 可观察和切换该位；普通文件 I/O 不因此伪造 pipe 风格的 `EAGAIN`。
@@ -240,7 +240,7 @@ console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续
 `fs/namei.c::__getname_maybe_null`与`fs/stat.c::vfs_fstatat`，同ELF差分入口是
 `tests/diff-abi/path_only.c`；文件fixture另检查空路径不产生路径容量的分配。
 
-`faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份对非目录对象的执行请求保留“至少一个执行位”约束；普通文件或目录的写请求检查解析后的最终挂载，只读时返回 `EROFS`，权限错误先于只读错误；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+`faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。access 使用真实 UID/GID、补充组与对应 capability，普通操作使用 fsuid/fsgid。非目录执行的 DAC override 仍要求至少一个执行位；普通文件或目录的写请求检查最终挂载，只读时返回 `EROFS`，权限错误先于只读错误。ACL 与 mount `noexec` 仍未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 `kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；即使容量为零也先判断是否存在下一条记录：存在但放不下返回 `-EINVAL`，EOF 返回零。容量不足不消费该项 cookie；用户 fault 在已完整发出的记录上返回前缀计数。
 
@@ -289,14 +289,12 @@ unlink/rename及同名重建不会替换句柄身份。execveat、openat2仍未�
 不要求写访问模式，只读挂载返回`EROFS`。用户路径只复制一次且在存储锁外进行；
 fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原inode。
 
-所有权修改更新ctime、保留atime/mtime；非目录清除S_ISUID，带组执行位时
-清除S_ISGID，目录保留set-ID位。ext4还在同一操作事务内删除`security.capability`，
+所有权修改要求 CAP_CHOWN，或由所有者保持 UID 并把 GID 改为已所属组；修改更新 ctime、保留 atime/mtime。非目录清除 S_ISUID；带组执行位或调用者不属于原组且没有 CAP_FSETID 时清除 S_ISGID，目录保留 set-ID。ext4还在同一操作事务内删除`security.capability`，
 失败回滚UID/GID、mode、ctime与属性。setgid目录创建的节点继承父GID，子目录
 另继承setgid位。命名FIFO走VFS inode，匿名pipe走共享pipe元数据；没有真实后端
-的其他合成对象不返回空成功。当前进程仍是不可变root，本接口不提供setuid、账户、
-完整权限检查或文件capability执行语义。
+的其他合成对象保留各自属性接口行为。文件 DAC、创建所属身份及执行属性快照见[VFS/ext4](vfs-ext4.md)。
 
-`utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；权限仍限于当前不可变 root 模型。
+`utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；显式时间要求所有者或 CAP_FOWNER，全部使用当前时间也允许具有写访问权限的调用者。
 
 `statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；没有文件系统 mount 的 pipe/匿名 epoll/初始 console 返回 `ENOTSUP`，不伪装成根盘。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。
 

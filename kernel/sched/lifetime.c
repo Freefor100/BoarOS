@@ -1,4 +1,5 @@
 #include "private.h"
+#include <kernel/credentials.h>
 
 static void domain_owned(void)
 {
@@ -204,6 +205,10 @@ void scheduler_task_collect(void)
 #endif
         }
         /* No rank40 lock may be held while the allocator consumes the page. */
+        kernel_credentials_put(task->credentials);
+        task->credentials = 0;
+        kernel_exec_security_put(task->exec_security);
+        task->exec_security = 0;
         (void)physical_page_release(scheduler.allocator, task->physical_address);
         completed = 1;
     }

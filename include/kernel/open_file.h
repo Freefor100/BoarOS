@@ -12,6 +12,9 @@ struct kernel_vfs_mount;
 struct kernel_vfs_node;
 struct kernel_vfs_stat;
 struct kernel_socket;
+struct kernel_credentials;
+/* OFD owner 覆盖打开时的不可变凭据。 */
+const struct kernel_credentials *kernel_open_file_credentials(const struct kernel_open_file_description *);
 
 /* acquire needs an existing owner; atomic references cannot revive raw pointers.
  * A controlled CPU1 memory-file fault only drops nonlast refs: CPU0 retains a

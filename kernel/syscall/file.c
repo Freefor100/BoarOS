@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -1016,6 +1017,7 @@ static int64_t interface_request_ioctl(struct kernel_mm *mm, uint32_t command,
         copied != sizeof(interface))
         return -KERNEL_EFAULT;
     interface.name[sizeof(interface.name) - 1U] = 0;
+    if(command==0x8914 && !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_ADMIN))return -KERNEL_EPERM;
     if (command == 0x8910) {
         result = kernel_socket_interface_index((uint32_t)interface.data.value,
                                                &snapshot);

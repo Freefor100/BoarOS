@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "private.h"
 #include "../../fs/files/private.h"
 
@@ -12,6 +13,52 @@
 #include <kernel/tty_task.h>
 #include <kernel/vfs.h>
 #include <string.h>
+
+int kernel_credentials_may_access_locked(const struct kernel_task *caller,const struct kernel_task *target,int fscreds)
+{
+    if(!target)return 0;
+    if(!caller || caller->group_leader==target->group_leader)return 1;
+    /* access() 的真实ID快照覆盖整个路径解析；跨proc链接也使用
+     * 同一个调用者视图。目标仍读取其发布凭据，不继承访问者override。 */
+    const struct kernel_credentials *from=caller==kernel_task_current()?
+        kernel_credentials_current():kernel_credentials_task_locked(caller),
+        *to=kernel_credentials_task_locked(target);
+    if(kernel_credentials_capable(from,KERNEL_CAP_SYS_PTRACE))return 1;
+    uint32_t uid=fscreds?from->fsuid:from->uid,gid=fscreds?from->fsgid:from->gid;
+    uint64_t caps=fscreds?from->effective:from->permitted;
+    return uid==to->uid && uid==to->euid && uid==to->suid &&
+        gid==to->gid && gid==to->egid && gid==to->sgid &&
+        kernel_exec_security_dumpable(target->exec_security)==1 && !(to->permitted&~caps);
+}
+struct proc_access {
+    struct kernel_task *task;
+    const struct kernel_credentials *credentials;
+    struct kernel_mm_record *mm;
+    struct kernel_exec_security *security;
+};
+static void proc_access_release(struct proc_access *access)
+{ if(access->credentials)kernel_credentials_put(access->credentials); kernel_exec_security_put(access->security); }
+static int proc_access_begin(struct kernel_task *task,struct proc_access *access)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if(!task)return -KERNEL_ENOENT;
+    if(!kernel_credentials_may_access_locked(kernel_task_current(),task,1))return -KERNEL_EACCES;
+    *access=(struct proc_access){task,kernel_credentials_get(kernel_credentials_task_locked(task)),task->mm.record,
+        kernel_exec_security_get(task->exec_security)};
+    return 0;
+}
+static int proc_access_check(struct proc_access *access)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *task=access->task;
+    return task && task->mm.record==access->mm && task->exec_security==access->security &&
+        kernel_credentials_task_locked(task)==access->credentials &&
+        kernel_credentials_may_access_locked(kernel_task_current(),task,1)?0:-KERNEL_EACCES;
+}
+#define PROC_ACCESS(task) \
+    struct proc_access access __attribute__((cleanup(proc_access_release)))={0}; \
+    int access_error=proc_access_begin(task,&access); \
+    if(access_error)return access_error
 
 void kernel_proc_task_update_comm(struct kernel_task *task)
 {
@@ -185,6 +232,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
     if (leader->retirement || !leader->accounted) return -KERNEL_ENOENT;
     threads = leader->group_members;
     *result = (struct kernel_proc_process_snapshot){
+        .credentials=kernel_credentials_get(kernel_credentials_task_locked(task)),
         .pid = task->tid,
         .tgid = leader->tid,
         .ppid = leader->parent && leader->parent->group_leader
@@ -205,9 +253,10 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         .signal_pending = task->signal_pending,
         .signal_shared_pending = leader->group_pending,
         .signal_blocked = task->signal_blocked,
-        .signal_queued=kernel_signal_pending_count_locked(),
+        .signal_queued=kernel_signal_pending_count_locked(task),
         .signal_queue_limit=leader->sigpending_limit.current,
         .threads = threads,
+        .no_new_privs=task->no_new_privs,
         .scheduling_priority = task->scheduling.priority
             ? -(task->scheduling.priority + 1) : 20,
         .rt_priority = (uint32_t)task->scheduling.priority,
@@ -247,6 +296,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         struct kernel_mm_proc_memory memory;
         if (kernel_mm_proc_memory_snapshot(&task->mm, &memory) !=
             KERNEL_MM_STATUS_OK) {
+                kernel_credentials_put(result->credentials);result->credentials=0;
                 return -KERNEL_EIO;
         }
         result->virtual_bytes = memory.virtual_bytes;
@@ -276,6 +326,26 @@ int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
     return task ? proc_task_snapshot(task, identity, 1, result) : -KERNEL_ESRCH;
 }
 
+int kernel_proc_same_group(kernel_pid_t pid,uint64_t identity,int thread)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *caller=kernel_task_current();
+    struct kernel_task *task=process_find_identity(pid,thread?KERNEL_PID_TID:KERNEL_PID_TGID);
+    struct kernel_pid *id=task?process_identity(task,thread?KERNEL_PID_TID:KERNEL_PID_TGID):0;
+    return id && id->generation==identity && caller && caller->group_leader==task->group_leader;
+}
+
+int kernel_proc_inode_owner(kernel_pid_t pid,uint64_t identity,int thread,uint32_t mode,uint32_t *uid,uint32_t *gid)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *task=process_find_identity(pid,thread?KERNEL_PID_TID:KERNEL_PID_TGID);
+    struct kernel_pid *id=task?process_identity(task,thread?KERNEL_PID_TID:KERNEL_PID_TGID):0;
+    if(!id || id->generation!=identity || !task->accounted || task->retirement)return -KERNEL_ENOENT;
+    const struct kernel_credentials *cred=kernel_credentials_task_locked(task);
+    int dumpable=mode==(KERNEL_VFS_S_IFDIR|0555U) || kernel_exec_security_dumpable(task->exec_security)==1;
+    *uid=dumpable?cred->euid:0;*gid=dumpable?cred->egid:0;return 0;
+}
+
 int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
                                      enum kernel_proc_path_kind kind, int fd,
                                      struct kernel_vfs_path **owner)
@@ -285,6 +355,7 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     if (!task) {
         return -KERNEL_ENOENT;
     }
@@ -305,6 +376,10 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
             }
         }
     }
+    if(!result && proc_access_check(&access)) {
+        if(*owner && kernel_vfs_path_release(owner))__builtin_trap();
+        return -KERNEL_EACCES;
+    }
     return result;
 }
 
@@ -315,10 +390,11 @@ int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     int result = task && kernel_files_is_live(&task->files)
         ? kernel_files_next_open_fd(&task->files, after, fd)
         : -KERNEL_ENOENT;
-    return result;
+    return result?result:proc_access_check(&access);
 }
 
 int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
@@ -328,10 +404,12 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
+    if(proc_access_check(&access))return -KERNEL_EACCES;
     if (file) {
         if (kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_EPOLL) {
             *readable = 1;
@@ -351,10 +429,12 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
+    if(proc_access_check(&access))return -KERNEL_EACCES;
     struct kernel_vfs_path *path = file ? kernel_open_file_path(file) : 0;
     int result = -KERNEL_ENOENT;
     if (path && !kernel_vfs_path_acquire(path)) {
@@ -372,10 +452,12 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
+    if(proc_access_check(&access))return -KERNEL_EACCES;
     int result = file ? -KERNEL_ENOTSUP : -KERNEL_ENOENT;
     if (file && !kernel_open_file_path(file)) {
         snapshot->kind = (uint8_t)kernel_open_file_kind(file);
@@ -392,10 +474,12 @@ int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
+    if(proc_access_check(&access))return -KERNEL_EACCES;
     /* 伪对象的元数据快照不分配也不等待；解锁后不再访问 OFD。 */
     int result = file ? kernel_open_file_pseudo_stat(file, stat)
                       : -KERNEL_ENOENT;
@@ -412,10 +496,12 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     struct kernel_open_file_pipe_pin pin = {0};
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    PROC_ACCESS(task);
     KERNEL_FILES_PIN_SCOPE(fd_guard);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_hold_fd(&task->files, fd, &fd_guard) : 0;
+    if(proc_access_check(&access))return -KERNEL_EACCES;
     int result = file ? -KERNEL_ENXIO : -KERNEL_ENOENT;
     /* 解锁后 fd 可关闭；先钉住 pipe endpoint 再分配新 OFD。 */
     if (file && kernel_open_file_path(file)) result = -KERNEL_ENOTSUP;

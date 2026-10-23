@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/log.h>
@@ -23,10 +24,13 @@ enum kernel_syscall_status syscall_handle_syslog(
     KERNEL_SERVICE_SCOPE(service);
     int action = (int)request->arguments[0], length = (int)request->arguments[2];
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    /* All current tasks have the immutable root identity. The policy itself
-     * is centralized in the log layer for a future credential owner. */
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    int privileged=kernel_credentials_capable(cred,KERNEL_CAP_SYSLOG);
+    if(!privileged && action!=3 && action!=10) {
+        decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (action < 2 || action > 4 || length < 0 || !request->arguments[1]) {
-        decoded->value = kernel_log_action(action, length, 1, NULL, NULL, NULL);
+        decoded->value = kernel_log_action(action, length, privileged, NULL, NULL, NULL);
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (kernel_user_range_check(request->arguments[1], (size_t)length) != KERNEL_UACCESS_STATUS_OK) {
@@ -42,7 +46,7 @@ enum kernel_syscall_status syscall_handle_syslog(
     if (kernel_heap_allocate(fs->heap, KERNEL_LOG_RECORD_MAX, (void **)&scratch) != KERNEL_HEAP_STATUS_OK) {
         decoded->value = -KERNEL_ENOMEM; return KERNEL_SYSCALL_STATUS_OK;
     }
-    decoded->value = kernel_log_action(action, length, 1, copy_log, &target, scratch);
+    decoded->value = kernel_log_action(action, length, privileged, copy_log, &target, scratch);
     kernel_heap_release(fs->heap, scratch);
     if (decoded->value == -KERNEL_EINTR) {
         kernel_signal_note_syscall_restart(caller); decoded->value = -KERNEL_ERESTARTSYS;

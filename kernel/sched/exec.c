@@ -3,6 +3,7 @@
 #include "private.h"
 
 #include <kernel/exec.h>
+#include <kernel/credentials.h>
 #include <kernel/futex.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -116,15 +117,33 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
      * a non-leader exec adopted the group leader's identity. */
     kernel_futex_release_robust(thread, old_tid);
     kernel_futex_release_mm(thread);
+    /* 身份/MM 发布前撤下 CLOEXEC 槽；保留清理 owner 处理后端释放失败。 */
+    files_status = kernel_files_close_on_exec(&thread->files);
+    if (files_status != KERNEL_FILES_STATUS_OK &&
+        files_status != KERNEL_FILES_STATUS_CLEANUP_REQUIRED)
+        kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,UINT64_C(0x45584543),files_status);
     if (kernel_mm_activate(&transaction->image.mm, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
-        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+        kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,UINT64_C(0x45584543),KERNEL_MM_STATUS_ADDRESS_SPACE);
     }
     scheduler_usage_save_mm(thread);
-    transaction->retired_mm = thread->mm;
-    thread->mm = transaction->image.mm;
-    kernel_mm_add_user(&thread->mm);
+    kernel_mm_add_user(&transaction->image.mm);
+    const struct kernel_credentials *previous;
+    struct kernel_exec_security *previous_security;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        transaction->retired_mm = thread->mm;
+        thread->mm = transaction->image.mm;
+        previous=thread->credentials;
+        thread->credentials=transaction->credentials;
+        transaction->credentials=0;
+        previous_security=thread->exec_security;
+        thread->exec_security=transaction->exec_security;
+        transaction->exec_security=0;
+        finish_mm_move(&transaction->image.mm);
+    }
+    kernel_credentials_put(previous);
+    kernel_exec_security_put(previous_security);
     kernel_proc_task_update_comm(thread);
-    finish_mm_move(&transaction->image.mm);
     arch_thread_set_mm(&thread->arch, new_context);
     arch_process_prepare_exec(thread,
                           transaction->image.entry,
@@ -133,13 +152,6 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     kernel_signal_reset_on_exec(thread);
     transaction->state = KERNEL_EXEC_TRANSACTION_COMMITTED_CLEANUP;
 
-    files_status = kernel_files_close_on_exec(&thread->files);
-    if (files_status != KERNEL_FILES_STATUS_OK &&
-        files_status != KERNEL_FILES_STATUS_CLEANUP_REQUIRED) {
-        kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
-                                UINT64_C(0x45584543),
-                                files_status);
-    }
     exec_status = kernel_exec_transaction_cleanup(transaction);
     if (exec_status == KERNEL_EXEC_STATUS_OK) {
         (void)kernel_task_exec_finish(thread, transaction);

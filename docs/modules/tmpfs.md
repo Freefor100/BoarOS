@@ -28,11 +28,12 @@ PTE、fork及pin不重复收费。驻留数/statfs使用值读取，不承诺跨
 末页尾部。私有 COW 仍属于 MM；文件尾页清零不改写独立私有副本。
 关闭或删除一个名字不会释放仍被打开、映射或执行的 inode。
 
-mode、UID/GID和时间属于inode；`fchown/fchownat`在node独占锁下更新真实
-所有权与ctime，硬链接和已unlink的fd仍观察同一对象。`UINT32_MAX`保留字段；
-非目录的set-ID清除遵循固定root契约。setgid父目录使新节点继承GID、子目录
-继承setgid位，进程UID仍为root。这不是凭据变更或完整权限检查。只读挂载
-拒绝元数据修改；tmpfs所有权与内容同样不跨重启持久保存。
+mode、UID/GID和时间属于inode，硬链接和已unlink的fd仍观察同一对象。
+`fchown/fchownat`检查实际调用者身份；`UINT32_MAX`保留字段。非目录先按旧
+所属组决定set-ID清除，产生模式变更时再按新所属组过滤SGID；目录保留set-ID。
+创建在目录发布时设置fsuid/fsgid，SGID父目录决定新节点的GID及子目录SGID。
+属性与写入的互斥顺序沿用[共同VFS规则](vfs-ext4.md#文件节点与页缓存)。
+只读挂载拒绝元数据修改；tmpfs所有权与内容同样不跨重启持久保存。
 
 驻留内存后备页计入 Shmem，并包含于 Cached；无 swap 时不可驱逐，不计入
 MemAvailable 的文件回收估算，也不进入磁盘 Dirty/Writeback。短符号链接使用
@@ -56,7 +57,7 @@ D 为当前目录的项数。读取一个目录不会扫描其他目录。目录
 设备节点可由 mknod 创建字符或块设备类型，inode 保留真实 `rdev`；它们不分配文件数据对象和数据页，stat 的大小与块数为 0。打开时由通用设备路径按 `rdev` 分派。
 
 支持 `size`、`nr_blocks`、`nr_inodes`、`mode`；默认页数和 inode 数分别为受管
-页数的一半，默认根模式 01777。零取消相应显式限额。数字按固定 Linux
+页数的一半，默认根模式 01777，根目录所属身份取创建者 fsuid/fsgid。零取消相应显式限额。数字按固定 Linux
 memparse 的 base 0、K/M/G/T/P/E、溢出和百分比规则解析，重复参数以后项为准；
 不支持的选项明确失败。大数行为以固定版本为准，不将容量限额当作物理内存保证。
 
@@ -66,7 +67,7 @@ ENOSPC，真实内存分配失败为 ENOMEM，已写部分仍返回进展。映�
 fsync/fdatasync/msync 完成内存文件契约，不提交磁盘 I/O，也不承诺重启后数据保留。
 
 只读和忙卸载沿通用 VFS 契约。尚无 remount、bind、move、lazy/force unmount、
-ACL、xattr、swap、SysV 信号量/消息队列、共享文件 futex 或完整权限模型；
+ACL、xattr、swap、SysV 信号量/消息队列；
 SysV 共享内存已由共用内存后备对象实现。挂载扩展的剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 
 ## 验证入口

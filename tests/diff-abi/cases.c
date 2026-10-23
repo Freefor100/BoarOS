@@ -226,7 +226,11 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#if defined(ABI_MREMAP_ONLY)
+#if defined(ABI_CREDENTIAL_CONSUMERS_ONLY)
+    abi_credential_consumer_cases();
+#elif defined(ABI_CREDENTIALS_ONLY)
+    abi_credentials_cases();
+#elif defined(ABI_MREMAP_ONLY)
     abi_mremap_cases();
 #elif defined(ABI_PROC_ONLY)
     abi_proc_cases();

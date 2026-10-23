@@ -1,4 +1,5 @@
 #include "vfs_objects.h"
+#include <kernel/credentials.h>
 
 #include <arch/context.h>
 #include <kernel/errno.h>
@@ -371,14 +372,35 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
 #endif
     node->inode = inode;
     node->mode = mode;
+    if(inode>=(UINT64_C(1)<<30U)) {
+        int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
+            proc_inode_kind(inode)>=PROC_TID_DIR_KIND,mode,&node->uid,&node->gid);
+        if(error){kernel_heap_release(instance->heap,node);return error;}
+    }
     return kernel_vfs_publish_node(mount, node, file, 0);
+}
+
+static int proc_permission(struct kernel_vfs_node *node,const struct kernel_credentials *cred,unsigned mask)
+{
+    uint32_t uid=0,gid=0;
+    if(node->inode>=(UINT64_C(1)<<30U)) {
+        int result=kernel_proc_inode_owner(proc_inode_pid(node->inode),proc_inode_identity(node->inode),
+            proc_inode_kind(node->inode)>=PROC_TID_DIR_KIND,node->mode,&uid,&gid);
+        if(result)return result;
+    }
+    int result=kernel_vfs_dac_permission(node->mode,uid,gid,mask,cred);
+    /* 降权使proc FD目录属主回到root，调用线程仍可查询本组FD。
+     * 链接访问还会核对实际对象，不改变stat展示的真实属主。 */
+    if(result==-KERNEL_EACCES && proc_inode_kind(node->inode)==PROC_PID_FD_DIR_KIND &&
+        kernel_proc_same_group(proc_inode_pid(node->inode),proc_inode_identity(node->inode),0))return 0;
+    return result;
 }
 
 static int proc_stat(const struct kernel_vfs_file *file,
                      struct kernel_vfs_stat *stat)
 {
     uint64_t inode = kernel_vfs_file_inode(file);
-    uint32_t mode = file->mode;
+    uint32_t mode = file->mode,uid=0,gid=0;
     if (inode >= (UINT64_C(1) << 30U)) {
         uint64_t identity;
         if (proc_inode_identity_current(inode, &identity) ||
@@ -396,7 +418,13 @@ static int proc_stat(const struct kernel_vfs_file *file,
                 (readable ? 0500U : 0U) | (writable ? 0300U : 0U);
         }
     }
+    if(inode>=(UINT64_C(1)<<30U)) {
+        int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
+            proc_inode_kind(inode)>=PROC_TID_DIR_KIND,mode,&uid,&gid);
+        if(error)return error;
+    }
     *stat = (struct kernel_vfs_stat){
+        .uid=uid,.gid=gid,
         .dev = file->mount->id,
         .ino = inode,
         .mode = mode,
@@ -879,7 +907,7 @@ struct proc_mount_entry {
     struct kernel_vfs_path *mount_root;
     const char *source;
     uint8_t is_proc, is_tmpfs, is_devpts;
-    uint8_t read_only;
+    uint8_t read_only,nosuid;
 };
 
 static struct kernel_vfs_mount *next_mount(struct kernel_vfs_mount *mount,
@@ -977,6 +1005,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             entries[captured].is_proc = kernel_procfs_is_mount(it);
             entries[captured].is_tmpfs = kernel_tmpfs_is_mount(it);
             entries[captured].is_devpts = kernel_devpts_is_mount(it);
+            entries[captured].nosuid=it->nosuid;
             entries[captured].read_only =
                 ((struct kernel_vfs_instance *)it->private_data)->read_only;
             captured++;
@@ -1015,7 +1044,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         const char *kind = entries[i].is_proc ? "proc" :
                            entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "ext4";
         size_t needed = 4U * strlen(source) + 1U + 4U * strlen(path_text) +
-                        1U + strlen(kind) + 9U;
+                        1U + strlen(kind) + 16U;
         if (needed > capacity - used) { result = -KERNEL_EOVERFLOW; goto Finish; }
         size_t part;
         used += append_escaped(data + used, source);
@@ -1025,10 +1054,11 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         part = strlen(kind);
         memcpy(data + used, kind, part);
         used += part;
-        const char *suffix = entries[i].read_only ? " ro 0 0\n" :
-                                                    " rw 0 0\n";
-        memcpy(data + used, suffix, 8U);
-        used += 8U;
+        const char *suffix=entries[i].nosuid?
+            (entries[i].read_only?" ro,nosuid 0 0\n":" rw,nosuid 0 0\n"):
+            (entries[i].read_only?" ro 0 0\n":" rw 0 0\n");
+        size_t suffix_length=strlen(suffix);
+        memcpy(data+used,suffix,suffix_length);used+=suffix_length;
     }
     data[used] = '\0';
     *buffer = data;
@@ -1053,6 +1083,9 @@ static size_t append_number_line(char *buffer, const char *label,
     return used + suffix;
 }
 
+static void proc_credential_release(const struct kernel_credentials **cred)
+{ kernel_credentials_put(*cred); }
+
 static int proc_process_snapshot(struct kernel_vfs_node *node,
                                  struct kernel_heap *heap,
                                  char **buffer, size_t *length)
@@ -1064,8 +1097,10 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
         kernel_proc_process_snapshot(proc_inode_pid(node->inode),
         proc_inode_identity(node->inode), &process);
     if (result) return result;
+    const struct kernel_credentials *cred __attribute__((cleanup(proc_credential_release)))=process.credentials;
+    size_t capacity=1536U+(cred->groups?(size_t)cred->groups->count*11U:0U);
     char *data = 0;
-    enum kernel_heap_status allocation = kernel_heap_allocate(heap, 1024U,
+    enum kernel_heap_status allocation = kernel_heap_allocate(heap, capacity,
                                                               (void **)&data);
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
@@ -1167,12 +1202,24 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                 data[used++] = "0123456789abcdef"[(masks[i] >> ((digit - 1U) * 4U)) & 15U];
             data[used++] = '\n';
         }
-        static const char identity[] =
-            "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
-        memcpy(data + used, identity, sizeof(identity) - 1U);
-        used += sizeof(identity) - 1U;
+        const uint32_t ids[8]={cred->uid,cred->euid,cred->suid,cred->fsuid,
+            cred->gid,cred->egid,cred->sgid,cred->fsgid};
+        for(unsigned i=0;i<8;i++)used+=append_number_line(data+used,
+            i==0?"Uid:\t":i==4?"Gid:\t":"",ids[i],i%4==3?"\n":"\t");
+        memcpy(data+used,"Groups:\t",8);used+=8;
+        if(cred->groups)for(unsigned i=0;i<cred->groups->count;i++)
+            used+=append_number_line(data+used,"",cred->groups->ids[i]," ");
+        data[used++]='\n';
+        const char *cap_names[]={"CapInh:\t","CapPrm:\t","CapEff:\t","CapBnd:\t","CapAmb:\t"};
+        const uint64_t caps[]={cred->inheritable,cred->permitted,cred->effective,cred->bounding,cred->ambient};
+        for(unsigned i=0;i<5;i++) {
+            size_t label=strlen(cap_names[i]);memcpy(data+used,cap_names[i],label);used+=label;
+            for(unsigned d=16;d;d--)data[used++]="0123456789abcdef"[(caps[i]>>((d-1)*4))&15];
+            data[used++]='\n';
+        }
+        used+=append_number_line(data+used,"NoNewPrivs:\t",process.no_new_privs,"\n");
     }
-    if (used >= 1024U) __builtin_trap();
+    if (used >= capacity) __builtin_trap();
     data[used] = '\0';
     *buffer = data;
     *length = used;
@@ -1315,6 +1362,7 @@ static void initialize_backend(void)
     ops->close_node = proc_close_node;
     ops->open = proc_open;
     ops->stat = proc_stat;
+    ops->permission=proc_permission;
     ops->statfs = proc_statfs;
     ops->dir_entry = proc_dir_entry;
     ops->snapshot = proc_snapshot;
@@ -1342,6 +1390,7 @@ int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
                       (uintptr_t)&proc->instance);
     kernel_raw_lock_init(&proc->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     proc->mount.id = kernel_vfs_allocate_mount_id();
+    proc->mount.nosuid=!!(flags&2U);
     proc->mount.private_data = &proc->instance;
     proc->mount.state = VFS_MOUNT_STATE_LIVE;
     *owner = &proc->mount;

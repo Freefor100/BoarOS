@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "char_device_internal.h"
 
 #include <arch/context.h>
@@ -139,7 +140,7 @@ static int random_ioctl(void *instance, struct kernel_task *caller, struct kerne
     case 0x40085203U: { /* RNDADDENTROPY: native Linux rand_pool_info. */
         int entropy_count, length;
         size_t copied = 0;
-        /* Credentials are currently fixed to root, including CAP_SYS_ADMIN. */
+        if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
         if (kernel_copy_from_user(mm, &entropy_count, argument, sizeof(entropy_count), &copied) !=
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(entropy_count))
             return -KERNEL_EFAULT;

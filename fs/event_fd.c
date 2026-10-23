@@ -1,3 +1,4 @@
+#include <kernel/credentials.h>
 #include "open_file_internal.h"
 #include <kernel/avl.h>
 #include <stddef.h>
@@ -143,6 +144,7 @@ static int allocate_event(struct kernel_files *files,size_t size,uint32_t kind,u
     if (status==KERNEL_HEAP_STATUS_EMPTY) return -KERNEL_ENOMEM;
     if (status) __builtin_trap();
     event->file.heap=files->heap;event->file.references=1;event->file.kind=kind;
+    event->file.credentials=kernel_credentials_get(kernel_credentials_current());
     event->file.open_flags=2U|(flags&EVENT_NONBLOCK);
     kernel_mutex_init(&event->file.offset_lock,10,(uintptr_t)event);
     kernel_raw_lock_init(&event->lock,KERNEL_RAW_RANK_OBJECT);kernel_wait_queue_init(&event->waiters);

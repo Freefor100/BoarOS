@@ -1,4 +1,5 @@
 #include <kernel/posix_timer.h>
+#include <kernel/credentials.h>
 #include <arch/task.h>
 #include <arch/context.h>
 #include <kernel/errno.h>
@@ -801,6 +802,14 @@ enum kernel_scheduler_status arch_process_clone_current(
     }
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     child->magic = KERNEL_THREAD_MAGIC;
+    kernel_credentials_put(child->credentials);
+    /* f_cred 身份用于空路径 linkat；普通 fork 与 Linux 一样产生独立
+     * credential 对象，补充组和 UID 账户仍共享真实引用。 */
+    child->credentials = thread_clone ? kernel_credentials_get(parent->credentials) :
+        kernel_credentials_clone(parent->files.heap,parent->credentials);
+    if (!child->credentials)
+        return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    child->no_new_privs=parent->no_new_privs;
     child->arch.user_mode = 1U;
 #if BOAROS_USER_SMP
     child->cpu_mask = parent->cpu_mask;
@@ -833,6 +842,11 @@ enum kernel_scheduler_status arch_process_clone_current(
                               ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE
                               : KERNEL_SCHEDULER_STATUS_INVALID_STATE)));
     }
+    /* dumpable 随实际共享的映像变化，任务退出释放 MM 后仍保留该引用。 */
+    child->exec_security=(vfork || thread_clone)?kernel_exec_security_get(parent->exec_security):
+        kernel_exec_security_create(parent->files.heap,kernel_exec_security_dumpable(parent->exec_security));
+    if(!child->exec_security)
+        return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     if (parent->files.state != KERNEL_FILES_EMPTY) {
         files_status = thread_clone
             ? kernel_files_acquire(&child->files, &parent->files)
@@ -859,6 +873,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                     ? -KERNEL_ENOMEM : -KERNEL_EAGAIN,
                 linux_result,
                 fs_status == KERNEL_FS_CONTEXT_STATUS_NO_MEMORY ||
+                        fs_status == KERNEL_FS_CONTEXT_STATUS_BUSY ||
                         fs_status ==
                             KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED
                     ? KERNEL_SCHEDULER_STATUS_OK
@@ -1437,6 +1452,7 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
     }
 
     int32_t cause = 0, status_code = 0, child_pid = 0;
+    uint32_t child_uid = 0;
     struct kernel_task_usage usage = {0};
     struct kernel_linux_rusage rusage;
     if (child) {
@@ -1446,6 +1462,7 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             child_pid = child->tid;
+            child_uid = kernel_credentials_task_locked(child)->uid;
             ws = child->wait_status;
             if (event == 2 && !(options & LINUX_WNOWAIT)) child->stop_notified = 1;
             if (event == 3 && !(options & LINUX_WNOWAIT)) child->continue_notified = 0;
@@ -1468,7 +1485,7 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
     /* Linux在EINVAL/ECHILD/被信号中断时也输出六个零字段；复制错误覆盖原errno。
      * 有事件时先复制rusage，再复制siginfo；已消费事件不因EFAULT回滚。 */
     return report_waitid_event(parent, child ? 17 : 0, cause,
-        child_pid, 0, status_code, rusage_address, infop_address,
+        child_pid, child_uid, status_code, rusage_address, infop_address,
         child ? &rusage : 0, linux_result);
 }
 
@@ -2321,6 +2338,18 @@ static enum kernel_task_status task_tgid_locked(
 
 enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_pid_t *tgid)
 {
+    if (!task || !tgid) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    /* 当前执行者持有自己的组成员资格。组长退出仍保留身份，非组长
+     * exec 必须等本线程停止后才能转移它；读取自身 TGID 不需全局锁。
+     * 远端查询仍在调度域取得一致快照。 */
+    if (task==arch_current_thread_get() && task->arch.user_mode) {
+        const struct kernel_task *leader=task->group_leader;
+        if (task->magic!=KERNEL_THREAD_MAGIC || !task->tid_owned || !leader ||
+            leader->magic!=KERNEL_THREAD_MAGIC || !leader->tid_owned || leader->tid<=0)
+            return KERNEL_TASK_STATUS_STATE;
+        *tgid=leader->tid;
+        return KERNEL_TASK_STATUS_OK;
+    }
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return task_tgid_locked(task, tgid);
 }
@@ -2597,4 +2626,37 @@ enum kernel_task_status kernel_task_socket_write_clear(
     if (!task || !request || task->socket_write_request != request) return KERNEL_TASK_STATUS_STATE;
     task->socket_write_request = 0;
     return KERNEL_TASK_STATUS_OK;
+}
+
+/* 调用者持有调度域；共享执行安全状态与凭据在同一可观察边界更新。 */
+void kernel_credentials_changed_locked(struct kernel_task *task,
+    const struct kernel_credentials *old, const struct kernel_credentials *replacement)
+{
+    if (task->exec_security &&
+        (old->euid != replacement->euid || old->egid != replacement->egid ||
+         old->fsuid != replacement->fsuid || old->fsgid != replacement->fsgid ||
+         (replacement->permitted & ~old->permitted)))
+        kernel_exec_security_set_dumpable(task->exec_security, 0);
+}
+int kernel_credentials_dumpable_get(struct kernel_task *task)
+{
+    return (int)kernel_exec_security_dumpable(task->exec_security);
+}
+void kernel_credentials_dumpable_set(struct kernel_task *task, unsigned value)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    kernel_exec_security_set_dumpable(task->exec_security, value);
+}
+
+unsigned kernel_task_fs_group_users(struct kernel_task *task,
+    const struct kernel_fs_context_record *record)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    unsigned count = 0;
+    struct kernel_task *member = task;
+    do {
+        count += member->fs.state == KERNEL_FS_CONTEXT_LIVE && member->fs.record == record;
+        member = member->group_next;
+    } while (member && member != task);
+    return count;
 }

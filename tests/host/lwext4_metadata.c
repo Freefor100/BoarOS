@@ -195,7 +195,7 @@ static void group_bounds(struct ext4_fs *fs)
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
     CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
     ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
-    CHECK(ext4_ftruncate(&f,0)==EOK && ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_ftruncate(&f,0, UINT32_MAX)==EOK && ext4_journal_group_drain("/")==EOK);
     struct ext4_journal_progress before, small, large;
     CHECK(ext4_journal_group_progress("/",&before)==EOK);
     unsigned char bytes[4096]; size_t count;
@@ -1464,7 +1464,7 @@ static void group_space(struct ext4_fs *fs)
     CHECK(ext4_file_sync_metadata(&fill)==EOK && fill.fsize>65536);
     CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb)<32);
     write_interleave=space_during_checkpoint;
-    CHECK(ext4_ftruncate(&fill,fill.fsize-65536)==EOK);
+    CHECK(ext4_ftruncate(&fill,fill.fsize-65536, UINT32_MAX)==EOK);
     CHECK(space_waited==1 && space_interleaved==1 && !write_interleave);
     CHECK(ext4_fpwrite(&space_other,0,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
     CHECK(ext4_file_sync_metadata(&space_other)==EOK);
@@ -1551,9 +1551,9 @@ static void group_namespace(struct ext4_fs *fs, bool unlink_files)
     uint64_t writes=disk.writes,flushes=disk.flushes;
     namespace_hold=true;
     if (!unlink_files) {
-        CHECK(ext4_ftruncate(&f,f.fsize)==EOK);
-        CHECK(ext4_ftruncate(&f,4096)==EOK);
-        CHECK(ext4_ftruncate(&f,0)==EOK);
+        CHECK(ext4_ftruncate(&f,f.fsize, UINT32_MAX)==EOK);
+        CHECK(ext4_ftruncate(&f,4096, UINT32_MAX)==EOK);
+        CHECK(ext4_ftruncate(&f,0, UINT32_MAX)==EOK);
         CHECK(ext4_fclose(&f)==EOK);
         CHECK(ext4_fopen(&f,"/namespace-new","w+")==EOK);
         CHECK(f.fsize==0 && ext4_fclose(&f)==EOK);
@@ -1847,10 +1847,10 @@ static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool trunc
         CHECK(ext4_fclose(&second)==EOK && ext4_fremove("/owner-other")==EOK);
         return;
     }
-    CHECK(ext4_transaction_begin("/")==EOK && (truncating?ext4_ftruncate(&first,first.fsize):ext4_file_set_owner(&first,70001,80002))==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK && (truncating?ext4_ftruncate(&first,first.fsize, UINT32_MAX):ext4_file_set_owner(&first,70001,80002, UINT32_MAX))==EOK);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&first,&changed)==EOK && !memcmp(&changed,&initial,sizeof(initial)));
-    CHECK((truncating?ext4_ftruncate(&first,first.fsize):ext4_file_set_owner(&first,70001,80002))==EOK);
+    CHECK((truncating?ext4_ftruncate(&first,first.fsize, UINT32_MAX):ext4_file_set_owner(&first,70001,80002, UINT32_MAX))==EOK);
     CHECK(ext4_fraw_inode_fill(&first,&changed)==EOK && ext4_inode_get_file_acl(&changed,&fs->sb)!=shared);
     if (truncating) CHECK((ext4_inode_get_mode(&fs->sb,&changed)&07777)==06755);
     uint64_t expected=ext4_inode_get_blocks_count(&fs->sb,&initial);
@@ -1870,7 +1870,7 @@ static void owner_test(struct ext4_fs *fs, bool readonly)
     CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     uint64_t writes=disk.writes;
     if(readonly) {
-        CHECK(ext4_file_set_owner(&f,70001,80002)==EROFS);
+        CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EROFS);
         CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && disk.writes==writes);
         CHECK(ext4_fclose(&f)==EOK);return;
     }
@@ -1880,25 +1880,25 @@ static void owner_test(struct ext4_fs *fs, bool readonly)
     uint32_t value[5];
     CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     CHECK(ext4_transaction_begin("/")==EOK);
-    CHECK(ext4_file_set_owner(&f,70001,80002)==EOK);
+    CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EOK);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
     int restored_capability=ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length);
     if (restored_capability || length!=sizeof(cap) || memcmp(value,cap,sizeof(cap)))
         fprintf(stderr,"capability after abort: error=%d length=%zu value=%x,%x,%x,%x,%x\n",restored_capability,length,value[0],value[1],value[2],value[3],value[4]);
     CHECK(restored_capability==EOK && length==sizeof(cap) && !memcmp(value,cap,sizeof(cap)));
-    CHECK(ext4_file_set_owner(&f,70001,80002)==EOK);
+    CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002 && (ext4_inode_get_mode(&fs->sb,&after)&07777)==0755);
     CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==ENODATA);
     CHECK(ext4_file_set_mode(&f,06640)==EOK);
-    CHECK(ext4_file_set_owner(&f,UINT32_MAX,UINT32_MAX)==EOK);
+    CHECK(ext4_file_set_owner(&f,UINT32_MAX,UINT32_MAX, UINT32_MAX)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002 && (ext4_inode_get_mode(&fs->sb,&after)&07777)==02640);
     CHECK(ext4_file_sync_metadata(&f)==EOK && ext4_fclose(&f)==EOK);
     ext4_file unlinked; uint32_t inode; bool orphan;
     CHECK(ext4_fopen(&unlinked,"/owner-unlinked","w+")==EOK);
     CHECK(ext4_funlink_dentry("/owner-unlinked",&inode,&orphan)==EOK && orphan);
-    CHECK(ext4_file_set_owner(&unlinked,123,456)==EOK);
+    CHECK(ext4_file_set_owner(&unlinked,123,456, UINT32_MAX)==EOK);
     CHECK(ext4_fraw_inode_fill(&unlinked,&after)==EOK && ext4_inode_get_uid(&after)==123 && ext4_inode_get_gid(&after)==456 && !ext4_inode_get_links_cnt(&after));
     CHECK(ext4_fclose(&unlinked)==EOK && ext4_orphan_free("/",inode)==EOK);
 }
@@ -1922,12 +1922,12 @@ static void stats_test(struct ext4_fs *fs,uint64_t expected)
     if(fs->read_only)return;
     before=s;ext4_file f;CHECK(ext4_fopen(&f,"/allocated","w+")==EOK);
     CHECK(ext4_mount_point_stats("/",&after)==EOK && after.free_inodes_count+1==before.free_inodes_count);
-    CHECK(ext4_ftruncate(&f,UINT64_C(10000000))==EOK);
+    CHECK(ext4_ftruncate(&f,UINT64_C(10000000), UINT32_MAX)==EOK);
     CHECK(ext4_mount_point_stats("/",&after)==EOK && after.free_blocks_count==before.free_blocks_count);
     char bytes[4096]={0};size_t count;CHECK(ext4_fseek(&f,65536,SEEK_SET)==EOK);CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
     CHECK(ext4_mount_point_stats("/",&after)==EOK && after.free_blocks_count<before.free_blocks_count);
     CHECK(after.overhead_blocks==before.overhead_blocks);
-    CHECK(ext4_ftruncate(&f,0)==EOK);CHECK(ext4_mount_point_stats("/",&after)==EOK && after.free_blocks_count==before.free_blocks_count);
+    CHECK(ext4_ftruncate(&f,0, UINT32_MAX)==EOK);CHECK(ext4_mount_point_stats("/",&after)==EOK && after.free_blocks_count==before.free_blocks_count);
     CHECK(ext4_fclose(&f)==EOK);CHECK(ext4_fremove("/allocated")==EOK);
     CHECK(ext4_mount_point_stats("/",&after)==EOK && after.free_blocks_count==before.free_blocks_count && after.free_inodes_count==before.free_inodes_count);
 }
@@ -1981,7 +1981,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
     allocations=0;if(oom)fail_allocation=point;
     if(!strncmp(mode,"write-",6))disk.fail_write=disk.writes+1;
     if(!strncmp(mode,"flush-",6))disk.fail_flush=disk.flushes+1;
-    int r=stats_op?ext4_mount_point_stats("/",&stats):owner_op?ext4_file_set_owner(&f,70001,80002):ext4_file_set_times(&f,7,t);
+    int r=stats_op?ext4_mount_point_stats("/",&stats):owner_op?ext4_file_set_owner(&f,70001,80002, UINT32_MAX):ext4_file_set_times(&f,7,t);
     unsigned attempts=allocations;fail_allocation=0;fail_read=0;
     disk.fail_write=disk.fail_flush=0;
     if(oom || !strcmp(mode,"read-stats")) {
@@ -1993,7 +1993,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
         if(stats_op)CHECK(ext4_mount_point_stats("/",&stats)==EOK && stats.overhead_blocks==expected);
         else if(owner_op) {
             if(r!=EOK) { uint32_t cap[5];size_t length;CHECK(ext4_getxattr("/file","security.capability",19,cap,sizeof(cap),&length)==EOK && length==sizeof(cap)); }
-            CHECK(ext4_file_set_owner(&f,70001,80002)==EOK);
+            CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EOK);
             CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002);
         }
         else { CHECK(ext4_file_set_times(&f,7,t)==EOK);expect_time(&f,0,t[0],ext4_get16(&fs->sb,inode_size)>128); }
@@ -2043,7 +2043,7 @@ static void extent_lookup_checksums(struct ext4_blockdev *dev)
     CHECK(ext4_transaction_begin("/")==EOK);
     for (unsigned i=0;i<6;i++) {
         bool changed=false;
-        CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,(uint64_t)i*2*block,block,&changed)==EOK);
+        CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,(uint64_t)i*2*block,block,&changed, UINT32_MAX)==EOK);
         CHECK(changed);
     }
     struct ext4_inode_ref ref;
@@ -2597,7 +2597,7 @@ static int extent_prepend(struct ext4_fs *fs, bool grouped, bool tree)
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
     CHECK(left && right==left+1);
     /* 先归还右侧 extent 前的物理块，再补逻辑左洞，确定进入 prepend 合并。 */
-    CHECK(ext4_ftruncate(&pad,0)==EOK);
+    CHECK(ext4_ftruncate(&pad,0, UINT32_MAX)==EOK);
     CHECK(ext4_fclose(&pad)==EOK);
     if(grouped)CHECK(ext4_journal_group_drain("/")==EOK);
     CHECK(ext4_fseek(&file,0,SEEK_SET)==EOK);
@@ -2613,7 +2613,7 @@ static int extent_prepend(struct ext4_fs *fs, bool grouped, bool tree)
         failed=1;break;
     }
     if(tree) {
-        int result=ext4_ftruncate(&file,0);
+        int result=ext4_ftruncate(&file,0, UINT32_MAX);
         if(result!=EOK) {
             fprintf(stderr,"prepend truncate failed: %d\n",result);
             failed=1;
@@ -2817,7 +2817,7 @@ static void handle_stale_test(struct ext4_fs *fs)
     CHECK(ext4_fopen(&first,"/handle-stale","w+")==EOK);
     CHECK(ext4_fwrite(&first,"old",3,&written)==EOK && written==3);
     CHECK(ext4_fopen(&second,"/handle-stale","r+")==EOK && second.fsize==3);
-    CHECK(ext4_ftruncate(&second,1)==EOK && first.fsize==3 && second.fsize==1);
+    CHECK(ext4_ftruncate(&second,1, UINT32_MAX)==EOK && first.fsize==3 && second.fsize==1);
     CHECK(ext4_fpwrite(&first,0,"N",1,&written)==EOK && written==1 && first.fsize==1);
     struct ext4_inode inode;
     CHECK(ext4_fraw_inode_fill(&first,&inode)==EOK && ext4_inode_get_size(&fs->sb,&inode)==1);

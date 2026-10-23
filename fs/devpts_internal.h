@@ -22,7 +22,7 @@ struct devpts_mount {
     void *pty_private;
     uint64_t reserved_numbers, next_inode;
     uint32_t uid, gid, slave_mode, max;
-    uint8_t worker_started;
+    uint8_t worker_started, uid_set, gid_set;
 };
 
 /* PTY owns its worker/list; devpts owns the containing VFS mount lifetime. */

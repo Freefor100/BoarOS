@@ -69,6 +69,8 @@ void abi_hardlink_cases(void);
 void abi_signal_wait_cases(void);
 void abi_limit_cases(void);
 void abi_capability_cases(void);
+void abi_credentials_cases(void);
+void abi_credential_consumer_cases(void);
 void abi_fsize_cases(void);
 void abi_fsize_exec_probe(void) __attribute__((noreturn));
 void abi_core_limit_cases(void);

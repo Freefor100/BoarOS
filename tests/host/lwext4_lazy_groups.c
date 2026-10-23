@@ -23,7 +23,7 @@ static void lazy_data(struct ext4_fs *fs)
     ext4_file file; CHECK(ext4_fopen(&file,"/lazy-data","w+")==EOK);
     uint64_t bytes=((uint64_t)free0+free1+8)*fs->bdev->lg_bsize;
     bool changed;
-    int result=ext4_fallocate(&file,0,0,bytes,&changed);
+    int result=ext4_fallocate(&file,0,0,bytes,&changed, UINT32_MAX);
     fprintf(stderr,"lazy data reservation: result=%d bytes=%llu budget=%zu failures=%llu\n",result,
         (unsigned long long)bytes,fs->jbd_journal?jbd_memory_limit(fs->jbd_journal):0,
         (unsigned long long)(fs->jbd_journal?jbd_memory_budget_failures(fs->jbd_journal):0));

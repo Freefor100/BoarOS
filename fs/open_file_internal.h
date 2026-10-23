@@ -45,6 +45,7 @@ struct kernel_open_file_description {
     char *generated_data;
     size_t generated_length;
     uint8_t generated_ready;
+    const struct kernel_credentials *credentials;
 };
 /* 已有OFD owner下的私有域验证，不为未映射普通文件分配映射登记状态。 */
 enum kernel_open_file_status kernel_open_file_check_io_domain(

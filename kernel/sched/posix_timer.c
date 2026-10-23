@@ -1,6 +1,7 @@
 #include "private.h"
 #include "../signal_pending.h"
 #include <kernel/posix_timer.h>
+#include <kernel/credentials.h>
 #include <kernel/errno.h>
 #include <kernel/avl.h>
 #include <kernel/time.h>
@@ -23,6 +24,7 @@ struct kernel_posix_timer {
     struct kernel_posix_timer *hash_next;
     struct kernel_posix_timer_registry *owner;
     struct kernel_heap *heap;
+    struct kernel_uid_account *account;
     struct kernel_pid *recipient;
     struct scheduler_cpu_clock cpu;
     struct signal_pending_prepared notification;
@@ -178,7 +180,7 @@ static int timer_put_locked(struct kernel_posix_timer *t)
 {
     if(!t->references)__builtin_trap();
     if(--t->references)return 0;
-    if(t->charged){signal_pending_unreserve_locked();t->charged=0;}
+    if(t->charged){signal_pending_unreserve_locked(t->account);t->charged=0;}
     return 1;
 }
 static void timer_free(struct kernel_posix_timer *t)
@@ -188,6 +190,7 @@ static void timer_free(struct kernel_posix_timer *t)
     signal_pending_finish(&t->notification);
     if(t->recipient)kernel_task_identity_put(t->recipient);
     if(t->cpu.identity)kernel_task_identity_put(t->cpu.identity);
+    if(t->account)kernel_uid_account_put(t->account);
     kernel_heap_release(t->heap,t);
     if(r)registry_put(r);
 }
@@ -315,7 +318,7 @@ int kernel_posix_timer_prepare(struct kernel_task *caller,int32_t clock,
         int target_exited=t->event.notify==4&&target->proc_exiting;
         if(t->event.notify==4&&(!t->recipient->members[KERNEL_PID_TID]||t->recipient->members[KERNEL_PID_TID]->task!=target))error=-KERNEL_EINVAL;
         else if(!t->notification.record || (t->event.notify!=1&&!target_exited&&!pending->queue&&!t->notification.index))error=-KERNEL_EAGAIN;
-        else error=signal_pending_reserve_locked(caller);
+        else error=signal_pending_reserve_locked(caller,&t->account);
         if(!error) {
             t->charged=1;t->notification.record->timer=t;
             if(t->event.notify!=1&&!target_exited&&!pending->queue)signal_pending_install_index_locked(target,t->event.notify!=4,&t->notification);

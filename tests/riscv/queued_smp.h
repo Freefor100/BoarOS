@@ -22,10 +22,10 @@ uint32_t __wrap_kernel_signal_fd_poll(struct kernel_open_file_description *file,
     int cpu=pipe_observe_cpu(1);if(cpu>=0)__atomic_fetch_add(&queued_queries[cpu],1,__ATOMIC_RELAXED);
     return __real_kernel_signal_fd_poll(file,queue);
 }
-void __real_signal_pending_prepare(struct kernel_task *,int,struct kernel_heap *,const struct kernel_signal_wait_info *,int,struct signal_pending_prepared *);
-void __wrap_signal_pending_prepare(struct kernel_task *task,int shared,struct kernel_heap *heap,const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
+void __real_signal_pending_prepare(struct kernel_task *,int,const struct kernel_task *,struct kernel_heap *,const struct kernel_signal_wait_info *,int,struct signal_pending_prepared *);
+void __wrap_signal_pending_prepare(struct kernel_task *task,int shared,const struct kernel_task *charge_target,struct kernel_heap *heap,const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
 {
-    __real_signal_pending_prepare(task,shared,heap,info,supplied,p);
+    __real_signal_pending_prepare(task,shared,charge_target,heap,info,supplied,p);
     if(p->record)socket_hold(4);
 }
 enum kernel_signal_status __real_kernel_signal_release_table(struct kernel_task *);
