@@ -82,6 +82,7 @@ void kernel_cpu_boot_initialize(uint64_t hardware_id)
     bootstrap_task.cpu = &boot_cpu;
     arch_current_thread_set(&bootstrap_task);
     kernel_wait_domain_init();
+    kernel_futex_init();
 }
 void kernel_cpu_boot_rebind(void)
 {

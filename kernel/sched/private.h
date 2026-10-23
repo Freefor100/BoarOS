@@ -87,6 +87,8 @@ unsigned signal_cpu_timer_check_locked(struct kernel_task *,const struct kernel_
 void signal_cpu_timer_notify(struct kernel_task *,unsigned);
 
 extern struct kernel_scheduler scheduler;
+/* Boot-only initialization before secondary/task publication. */
+void kernel_futex_init(void);
 /* 已持调度域；变更资格不修改用户请求affinity，也不结束执行owner。 */
 void scheduler_user_service_set_locked(struct kernel_task *, int);
 void scheduler_user_request_locked(struct kernel_task *);

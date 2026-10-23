@@ -1038,6 +1038,7 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
+    kernel_futex_init();
     struct physical_page_allocator pages={0},backend_pages={0};
     struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
