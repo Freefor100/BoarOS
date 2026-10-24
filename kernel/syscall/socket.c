@@ -487,7 +487,7 @@ enum kernel_syscall_status syscall_handle_bind(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-static enum kernel_files_status socket_message(
+static __attribute__((noinline)) enum kernel_files_status socket_message(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description **file,
     const struct kernel_syscall_request *request, int64_t *result)

@@ -1414,7 +1414,7 @@ static int tcp_write_user_batch(struct kernel_mm *mm,
     return result;
 }
 
-static enum kernel_files_status tcp_write_request(
+static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
@@ -1506,6 +1506,53 @@ static enum kernel_files_status tcp_write_request(
     return status;
 }
 
+static __attribute__((noinline)) enum kernel_files_status non_socket_write_request(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count,
+    uint64_t count, int positioned, uint64_t requested_offset,
+    int64_t *linux_result, const struct kernel_lock_guard *borrowed)
+{
+    const enum kernel_open_file_kind kind=kernel_open_file_kind(description);
+    KERNEL_LOCK_SCOPE(offset_guard);
+    if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
+         kind == KERNEL_OPEN_FILE_KIND_REGULAR) || kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
+        if (!regular_borrows_offset(description,borrowed))
+            kernel_mutex_lock(&description->offset_lock, &offset_guard);
+    }
+    KERNEL_LOCK_SCOPE(operation_guard);
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR)
+        kernel_vfs_file_write_lock(&description->file, &operation_guard);
+    enum kernel_files_status status;
+    if (kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
+        status=regular_write_request(files,mm,description,iov,iov_count,count,
+            positioned,requested_offset,linux_result);
+    } else {
+        unsigned char small[KERNEL_FILES_WRITE_STAGING];
+        unsigned char *staging = small;
+        size_t capacity = sizeof(small);
+        status=buffered_write_request(files,mm,description,iov,iov_count,count,
+            positioned,requested_offset,linux_result,staging,capacity);
+    }
+    if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
+    if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
+        kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
+        (kernel_open_file_flags(description) & KERNEL_FILES_O_DSYNC) != 0U) {
+        int datasync = (kernel_open_file_flags(description) & KERNEL_FILES_O_SYNC) !=
+                        KERNEL_FILES_O_SYNC;
+        if (operation_guard.lock) kernel_lock_release(&operation_guard);
+        int64_t sync_result = 0;
+        const struct kernel_lock_guard *borrow = offset_guard.lock ? &offset_guard : borrowed;
+        enum kernel_files_status synced = sync_pinned(description, datasync, &sync_result, borrow);
+        if (synced) return synced;
+        int error = (int)sync_result;
+        /* generic_write_sync returns the error after accepted bytes have
+         * advanced the OFD offset, including a prefix before usercopy fault. */
+        if (error != 0) *linux_result = error;
+    }
+    return status;
+}
+
 static enum kernel_files_status write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1547,42 +1594,8 @@ static enum kernel_files_status write_request(
         if (status==KERNEL_FILES_STATUS_OK) COST_IO_ADD(2,*linux_result>0?(uint64_t)*linux_result:0);
         return status;
     }
-    KERNEL_LOCK_SCOPE(offset_guard);
-    if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
-         kind == KERNEL_OPEN_FILE_KIND_REGULAR) || kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
-        if (!regular_borrows_offset(description,borrowed))
-            kernel_mutex_lock(&description->offset_lock, &offset_guard);
-    }
-    KERNEL_LOCK_SCOPE(operation_guard);
-    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR)
-        kernel_vfs_file_write_lock(&description->file, &operation_guard);
-    enum kernel_files_status status;
-    if (kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
-        status=regular_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result);
-    } else {
-        unsigned char small[KERNEL_FILES_WRITE_STAGING];
-        unsigned char *staging = small;
-        size_t capacity = sizeof(small);
-        status=buffered_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result,staging,capacity);
-    }
-    if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
-    if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
-        kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
-        (kernel_open_file_flags(description) & KERNEL_FILES_O_DSYNC) != 0U) {
-        int datasync = (kernel_open_file_flags(description) & KERNEL_FILES_O_SYNC) !=
-                        KERNEL_FILES_O_SYNC;
-        if (operation_guard.lock) kernel_lock_release(&operation_guard);
-        int64_t sync_result = 0;
-        const struct kernel_lock_guard *borrow = offset_guard.lock ? &offset_guard : borrowed;
-        enum kernel_files_status synced = sync_pinned(description, datasync, &sync_result, borrow);
-        if (synced) return synced;
-        int error = (int)sync_result;
-        /* generic_write_sync returns the error after accepted bytes have
-         * advanced the OFD offset, including a prefix before usercopy fault. */
-        if (error != 0) *linux_result = error;
-    }
+    enum kernel_files_status status=non_socket_write_request(files,mm,description,
+        iov,iov_count,count,positioned,requested_offset,linux_result,borrowed);
     return status;
 }
 

@@ -3851,7 +3851,9 @@ static int fault_inode_lock(struct mm_operation *operation, struct kernel_vfs_no
     return 0;
 }
 
-static enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
+/* File-map preparation is independent of ELF/anonymous faults. Keep its
+ * retirement and COW storage off the nested ELF-read stack. */
+static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
     uint64_t address, uint32_t access)
 {
     KERNEL_NO_RECLAIM_IO;
@@ -4077,7 +4079,7 @@ finish:
     mm_operation_end(operation);
     return status;
 }
-static enum kernel_mm_status memory_fault(struct mm_operation *operation,
+static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_operation *operation,
     uint64_t address, uint32_t access)
 {
     struct kernel_mm_record *record = operation->record;
