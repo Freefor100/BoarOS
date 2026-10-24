@@ -26,6 +26,8 @@ static _Thread_local int abandon_import;
 static int abandon_park;
 static _Thread_local int abandon_export;
 static _Thread_local int pause_export;
+static _Thread_local uint64_t output_fault_at;
+static _Thread_local struct kernel_uaccess_write_cursor *active_output;
 static _Thread_local int wake_on_park = -1;
 static _Thread_local int use_permission;
 static _Thread_local int pause_before_park, pause_notify;
@@ -168,9 +170,24 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m, uint64_t d, 
     }
     if (abandon_export)
         pthread_exit(0);
-    if (d < 4096)
+    if (d < 4096 || d == output_fault_at)
         return KERNEL_UACCESS_STATUS_FAULT;
     return kernel_copy_from_user(m, (void *)(uintptr_t)d, (uintptr_t)s, n, c);
+}
+/* This seam checks cursor completion and shares the existing usercopy fault
+ * boundary. It does not model physical page pinning or its performance. */
+enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
+    struct kernel_mm *m, struct kernel_uaccess_write_cursor *cursor,
+    uint64_t destination, const void *source, size_t size, size_t *copied)
+{
+    assert(!active_output || active_output == cursor);
+    active_output = cursor;
+    return kernel_copy_to_user(m, destination, source, size, copied);
+}
+void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *cursor)
+{
+    assert(active_output == cursor);
+    active_output = 0;
 }
 void kernel_pid_get(struct kernel_pid *p)
 {
@@ -297,7 +314,10 @@ static int64_t send(int q, struct packet *p, uint64_t n, int flags)
 }
 static int64_t recv(int q, void *p, uint64_t n, int64_t type, int flags)
 {
-    return kernel_msg_receive(cpu.current, &cpu.current->mm, q, (uintptr_t)p, n, type, flags);
+    int64_t result = kernel_msg_receive(cpu.current, &cpu.current->mm, q, (uintptr_t)p, n, type,
+                                       flags);
+    assert(!active_output);
+    return result;
 }
 static struct kernel_msqid64_ds statq(int q)
 {
@@ -369,6 +389,18 @@ static void copy_and_faults(void)
     assert(kernel_msg_send(cpu.current, &cpu.current->mm, -1, 1, 8193, 0) == -KERNEL_EFAULT);
     assert(send(-1, &p, 1, 0) == -KERNEL_EINVAL);
     assert(recv(q, (void *)1, 8192, 0, 0) == -KERNEL_EFAULT && !statq(q).msg_qnum);
+    for (unsigned copy = 0; copy < 2; copy++) {
+        assert(!send(q, &p, 7, 0));
+        o.type = -1;
+        o.data[0] = 99;
+        output_fault_at = (uintptr_t)o.data;
+        assert(recv(q, &o, 7, 0, copy ? KERNEL_MSG_COPY | KERNEL_IPC_NOWAIT : 0) ==
+               -KERNEL_EFAULT);
+        output_fault_at = 0;
+        assert(o.type == 8 && o.data[0] == 99 && statq(q).msg_qnum == copy);
+        if (copy)
+            assert(!recv(q, &o, 0, 0, KERNEL_MSG_NOERROR));
+    }
     struct kernel_msginfo i;
     assert(ctl(0, KERNEL_MSG_INFO, &i) >= 0 && i.msgpool == 1 && !i.msgmap && !i.msgtql);
     assert(ctl(q, KERNEL_IPC_STAT | KERNEL_IPC_64, &o) == -KERNEL_EINVAL);

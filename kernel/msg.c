@@ -8,6 +8,7 @@
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/wait_internal.h>
+#include "../mm/uaccess_internal.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -586,13 +587,18 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
     if (!result) {
         struct msg_message *m = r->message;
         uint64_t n = size < m->size ? size : m->size;
+        struct kernel_uaccess_write_cursor output = {0};
         /* A queued reference or detached ownership protects these immutable
-         * bytes across faulting usercopy; EFAULT still consumes normal receives. */
-        if (kernel_copy_to_user(mm, msgp, &m->type, sizeof(m->type), &copied) ||
-            (n && kernel_copy_to_user(mm, msgp + 8, m->data, (size_t)n, &copied)))
+         * bytes across faulting usercopy; EFAULT still consumes normal receives.
+         * 两段分别校验范围，保留正文失败前已写入的类型；同页复用 pin。 */
+        if (kernel_uaccess_write_cursor_copy(mm, &output, msgp, &m->type,
+                                            sizeof(m->type), &copied) ||
+            (n && kernel_uaccess_write_cursor_copy(mm, &output, msgp + 8, m->data,
+                                                  (size_t)n, &copied)))
             result = -KERNEL_EFAULT;
         else
             result = (int64_t)n;
+        kernel_uaccess_write_cursor_finish(&output);
     }
 done:
     request_finish(r);
