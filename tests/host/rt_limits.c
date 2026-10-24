@@ -94,17 +94,24 @@ static void tick_accounting(void)
 }
 static void departures(void)
 {
-    for(unsigned state=0;state<3;state++){
+    for(unsigned state=0;state<5;state++){
         setup();CHECK(!kernel_sched_policy_set(&task.scheduling,1,10,0));task.rttime_ticks=7;task.rttime_stamp=50;
         task.resource_flags=KERNEL_RESOURCE_NPROC_CHARGED|KERNEL_RESOURCE_RTTIME_DUE;
         struct kernel_wait_token token;
         {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);CHECK(!kernel_wait_prepare_locked(0,0,1,&token));}
         if(state==0){CHECK(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));CHECK(task.rttime_ticks==7);}
-        else {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);task.wait.phase=KERNEL_WAIT_COMMITTED;task.state=KERNEL_THREAD_STATE_BLOCKED;if(state==1)CHECK(kernel_wait_notify_locked(&token,KERNEL_WAIT_WOKEN));}
+        else if(state<3){KERNEL_RAW_SCOPE(g,&kernel_wait_domain);task.wait.phase=KERNEL_WAIT_COMMITTED;task.state=KERNEL_THREAD_STATE_BLOCKED;if(state==1)CHECK(kernel_wait_notify_locked(&token,KERNEL_WAIT_WOKEN));}
+        else {
+            CHECK(!kernel_wait_finish(&token));
+            task.state=KERNEL_THREAD_STATE_STOPPED;
+            /* SIGCONT can arrive while the stopped owner is still on CPU. */
+            if(state==4){task.state=KERNEL_THREAD_STATE_READY;task.wait.ready_pending=1;}
+        }
         {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);struct kernel_task *next=scheduler_select_next_locked(active,&task,0);CHECK(next==active->idle);}
-        CHECK(task.rttime_ticks==(state==2?0U:7U));CHECK(task.rttime_stamp==50);
-        CHECK(!!(task.resource_flags&KERNEL_RESOURCE_RTTIME_DUE)==(state!=2));CHECK(task.resource_flags&KERNEL_RESOURCE_NPROC_CHARGED);
+        int reset=state==2||state==3;
+        CHECK(task.rttime_ticks==(reset?0U:7U));CHECK(task.rttime_stamp==50);
+        CHECK(!!(task.resource_flags&KERNEL_RESOURCE_RTTIME_DUE)==!reset);CHECK(task.resource_flags&KERNEL_RESOURCE_NPROC_CHARGED);
     }
-    puts("RT HOST phases: PREPARED, COMMITTED/early notify retain; actual BLOCKED departure resets");
+    puts("RT HOST phases: early wait/continue retain; actual BLOCKED/STOPPED departure resets");
 }
 int main(void){permission();tick_accounting();departures();printf("RT HOST checks=%u failed=%u\n",checks,failed);return !!failed;}

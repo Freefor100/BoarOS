@@ -138,7 +138,7 @@ RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、�
 
 RTTIME对每线程连续RT执行计量。各CPU的timer tick仅在当前用户线程运行FIFO/RR且软限额有限时推进watchdog；同一全局tick跨核只计一次。超过按100Hz向上取整的软／硬阈值后，线程进入现有CPU timer活动索引，由CPU0检查并向线程组发送SIGXCPU，软限额增加1,000,000us，或在硬限额到达时发送SIGKILL。仅有RTTIME待检查的条目不采样完整CPU clock；普通trap不新增watchdog锁或采样。
 
-连续计数在调度器确定任务带着BLOCKED状态离开CPU时清零。PREPARED通知、COMMITTED后在切换前收到通知、抢占、yield、迁移、CPU0服务及RT带宽节流都保留计数；这些交接不会被解释为完成一次阻塞。直接host检查以手动tick覆盖跨CPU去重、软硬阈值及三种等待交错，真实消费者通过父子握手确认阻塞后继续执行。
+连续计数在调度器确定任务带着BLOCKED或STOPPED状态离开CPU时清零。PREPARED通知、COMMITTED后在切换前收到通知、停止后在切离前收到SIGCONT，以及抢占、yield、迁移、CPU0服务和RT带宽节流都保留计数；此时状态已经或仍为READY，未完成一次睡眠/停止。直接host检查以手动tick覆盖跨CPU去重、软硬阈值及三种等待交错，真实消费者通过父子握手确认阻塞后继续执行。
 
 `make test-sched-concurrency-host`直接执行生产策略/选择/等待交接，在2/4线程握手中验证唯一执行owner、旧栈交接及IRQ恢复；保护CPU独立记账和公开策略入口的同域修改。该证据不替代客户机多核。
 

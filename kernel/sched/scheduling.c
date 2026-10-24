@@ -435,9 +435,10 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
         cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
     if (!next) next = cpu->idle;
     if (next == previous) return 0;
-    /* COMMITTED 后提前通知已把状态改回 READY；只有确实带着 BLOCKED
-     * 离开 CPU 的等待才中断连续 RT 执行，迁移和节流沿 READY 交接。 */
-    if (previous->state == KERNEL_THREAD_STATE_BLOCKED) {
+    /* 等待通知或 SIGCONT 可在切离前把状态改回 READY。只有确实
+     * 带着睡眠/停止状态离开 CPU 才结束连续 RT；迁移和节流仍是 READY。 */
+    if (previous->state == KERNEL_THREAD_STATE_BLOCKED ||
+        previous->state == KERNEL_THREAD_STATE_STOPPED) {
         previous->rttime_ticks = 0;
         if (__atomic_fetch_and(&previous->resource_flags,
                 ~KERNEL_RESOURCE_RTTIME_DUE,__ATOMIC_RELAXED) & KERNEL_RESOURCE_RTTIME_DUE)

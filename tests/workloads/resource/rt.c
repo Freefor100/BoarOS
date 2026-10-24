@@ -88,9 +88,34 @@ static void blocking(void)
     if(!child){close(request[0]);close(reply[1]);prepare_rt(40000,80000);for(unsigned i=0;i<6;i++){uint64_t until=stamp(CLOCK_THREAD_CPUTIME_ID)+15000000;while(stamp(CLOCK_THREAD_CPUTIME_ID)<until)__asm__ volatile("" ::: "memory");CHECK(!signals&&write(request[1],"r",1)==1);char c;CHECK(read(reply[0],&c,1)==1);}policy(SCHED_OTHER,0);CHECK(!signals);_exit(0);}
     close(request[1]);close(reply[0]);for(unsigned i=0;i<6;i++){char c;CHECK(read(request[0],&c,1)==1);wait_blocked(child);CHECK(write(reply[1],"d",1)==1);}wait_ok(child);close(request[0]);close(reply[1]);pass("rttime-real-block-resets-budget");
 }
+static void stop_continue(void)
+{
+    uint64_t saved=0;
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(saved),&saved)>0&&saved);
+    uint64_t one=saved&(~saved+1);
+    CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(one),&one));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){
+        prepare_rt(40000,80000);
+        for(unsigned i=0;i<6;i++){
+            uint64_t until=stamp(CLOCK_THREAD_CPUTIME_ID)+15000000;
+            while(stamp(CLOCK_THREAD_CPUTIME_ID)<until)__asm__ volatile("" ::: "memory");
+            CHECK(!signals&&!kill(getpid(),SIGSTOP));
+        }
+        policy(SCHED_OTHER,0);CHECK(!signals);_exit(0);
+    }
+    for(unsigned i=0;i<6;i++){
+        int status;CHECK(waitpid(child,&status,WUNTRACED)==child&&WIFSTOPPED(status)&&WSTOPSIG(status)==SIGSTOP);
+        /* Both tasks use the same CPU: the parent cannot observe the stop
+         * and send CONT before the child has actually left execution. */
+        CHECK(!kill(child,SIGCONT));
+    }
+    wait_ok(child);CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(saved),&saved));
+    pass("rttime-stop-continue-resets-budget");
+}
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);alarm(15);mkdir("/proc",0755);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);
-    puts("RT BEGIN");state();unprivileged();reset_fork();target_limit();soft();hard(0);hard(1);blocking();
+    puts("RT BEGIN");state();unprivileged();reset_fork();target_limit();soft();hard(0);hard(1);blocking();stop_continue();
     printf("RT END cases=%u\n",cases);alarm(0);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }
