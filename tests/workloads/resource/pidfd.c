@@ -63,7 +63,10 @@ static void fdinfo(int fd,int expected)
     char *p=strstr(text,"Pid:\t"),*ns=strstr(text,"NSpid:\t");
     CHECK(p && strtol(p+5,0,10)==expected);
     if(ns)CHECK(strtol(ns+7,0,10)==expected); /* Linux omits it without CONFIG_PID_NS. */
-    CHECK(strstr(text,"pos:\t0\n") && strstr(text,"flags:\t") && strstr(text,"mnt_id:\t") && strstr(text,"ino:\t"));
+    char *flags=strstr(text,"flags:\t");int status=fcntl(fd,F_GETFL),descriptor=fcntl(fd,F_GETFD);
+    CHECK(status>=0 && descriptor>=0 && flags && strtoul(flags+7,0,8)==
+        ((unsigned)status|((descriptor&FD_CLOEXEC)?O_CLOEXEC:0)));
+    CHECK(strstr(text,"pos:\t0\n") && strstr(text,"mnt_id:\t") && strstr(text,"ino:\t"));
 }
 static void abi(void)
 {
@@ -147,6 +150,7 @@ static void leader_exit(int file)
     }
     close(reports[1]);close(gate[0]);int tid;CHECK(read(reports[0],&tid,sizeof(tid))==sizeof(tid));close(reports[0]);
     int process=(int)OPEN(child,0),thread=(int)OPEN(tid,THREAD|O_NONBLOCK);CHECK(process>=0 && thread>=0);
+    CHECK((fcntl(thread,F_GETFL)&(THREAD|O_NONBLOCK))==(THREAD|O_NONBLOCK));fdinfo(thread,tid);
     ERROR(OPEN(tid,0),ENOENT);
     char path[64],text[256];snprintf(path,sizeof(path),"/proc/%d/stat",child);uint64_t end=now()+UINT64_C(5000000000);
     for(;;) {
