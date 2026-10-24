@@ -123,7 +123,7 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 
 ## UNIX 控制消息与 FD 所有权
 
-UNIX STREAM/DGRAM 的 sendmsg/recvmsg 接受 SCM_RIGHTS、SCM_CREDENTIALS；SO_PASSCRED控制消息凭据输出。原生64位 cmsghdr 为16字节、8字节对齐，ucred 为12字节，每次最多传253个FD。发送控制区完整复制后按记录解析；FD表查询取得真实OFD，包含O_PATH。发送者关闭原FD或复用编号后，排队消息仍持有原对象；接收者共享其offset、状态标志和打开权利，新FD的CLOEXEC由MSG_CMSG_CLOEXEC决定。
+INET与UNIX共用MSG_PEEK接收预约，重复查询保留原报文与接收窗口。UNIX STREAM/DGRAM 的 sendmsg/recvmsg 接受 SCM_RIGHTS、SCM_CREDENTIALS；SO_PASSCRED控制消息凭据输出。原生64位 cmsghdr 为16字节、8字节对齐，ucred 为12字节，每次最多传253个FD。发送控制区完整复制后按记录解析；FD表查询取得真实OFD，包含O_PATH。发送者关闭原FD或复用编号后，排队消息仍持有原对象；接收者共享其offset、状态标志和打开权利，新FD的CLOEXEC由MSG_CMSG_CLOEXEC决定。
 
 自动消息凭据捕获发送时TGID与真实UID/GID，普通write/writev/send/sendto也使用这一规则。显式凭据依据调用者real/effective/saved身份及CAP_SETUID、CAP_SETGID、CAP_SYS_ADMIN检查。排队消息保留PID身份引用与数字UID/GID；发送者退出或改身份不改变已有消息。SO_PEERCRED继续使用连接时的有效身份快照。PASSCRED还参与listener选项继承、尚未accept的child凭据捕获及未命名发送端自动绑定。
 

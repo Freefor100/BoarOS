@@ -39,6 +39,10 @@ static void addresses(void)
     CHECK(address.sin6_family == AF_INET6 && address.sin6_port != 0);
     CHECK(sendto(udp, "v6", 2, 0, (void *)&address, sizeof(address)) == 2);
     char data[8]; struct sockaddr_in6 peer; length=sizeof(peer);
+    struct iovec peek_iov={data,1};
+    struct msghdr peek_msg={.msg_iov=&peek_iov,.msg_iovlen=1};
+    CHECK(recvmsg(udp,&peek_msg,MSG_PEEK)==1 && data[0]=='v' && (peek_msg.msg_flags&MSG_TRUNC));
+    CHECK(recvfrom(udp,data,1,MSG_PEEK|MSG_TRUNC,0,0)==2 && data[0]=='v');
     CHECK(recvfrom(udp, data, sizeof(data), 0, (void *)&peer, &length) == 2);
     CHECK(!memcmp(data, "v6", 2) && peer.sin6_family == AF_INET6 && peer.sin6_port == address.sin6_port);
     CHECK(close(udp) == 0);
@@ -55,7 +59,9 @@ static void addresses(void)
         length=sizeof(peer); int accepted=accept(listener, (void *)&peer, &length); CHECK(accepted>=0);
         CHECK(length==sizeof(peer) && peer.sin6_family==AF_INET6);
         CHECK(mapped?IN6_IS_ADDR_V4MAPPED(&peer.sin6_addr):IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
-        CHECK(write(client, "stream", 6)==6 && read(accepted, data, sizeof(data))==6 && !memcmp(data,"stream",6));
+        CHECK(write(client, "stream", 6)==6);
+        CHECK(recv(accepted,data,2,MSG_PEEK)==2 && !memcmp(data,"st",2));
+        CHECK(read(accepted, data, sizeof(data))==6 && !memcmp(data,"stream",6));
         CHECK(close(client)==0 && close(accepted)==0 && close(listener)==0);
     }
     puts("NETWORK PASS addresses: IPv6 UDP/TCP and mapped IPv4 dual-stack accept");
