@@ -490,6 +490,15 @@ enum kernel_files_status kernel_files_socket_accept(
     void *context,
     int64_t *linux_result);
 
+/* fd_flags accepts only Linux FD_CLOEXEC (1). Copy one int32 FD before sharing
+ * the acquired OFD; success consumes owner. Failure preserves owner and cancels
+ * only this reservation, leaving any previously received descriptors installed.
+ * A non-NULL call registers the reservation for task-exit cleanup. */
+struct kernel_socket_call;
+int kernel_files_receive_fd(struct kernel_files *files, struct kernel_mm *mm,
+    uint64_t user_fd, unsigned fd_flags,
+    struct kernel_open_file_description **owner, struct kernel_socket_call *call);
+
 /* Success returns an owned OFD reference independent of the fd slot. */
 enum kernel_files_status kernel_files_pin(
     struct kernel_files *files,
