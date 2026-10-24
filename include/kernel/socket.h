@@ -9,6 +9,7 @@
 struct kernel_uaccess_iovec;
 struct kernel_uaccess_iov_cursor;
 struct kernel_socket_address;
+struct kernel_socket_name;
 struct kernel_heap;
 struct kernel_mm;
 struct kernel_socket;
@@ -48,12 +49,14 @@ struct kernel_socket_write_request {
     void *protocol_address;
     uint64_t payload_size;
     uint8_t operation, queued;
+    struct kernel_socket *unix_destination;
     struct kernel_wait_token completion;
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t queued_ticks, executing_ticks, completed_ticks;
 #endif
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
+int kernel_socket_is_unix(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
@@ -89,16 +92,29 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 #define KERNEL_SOCKET_DOMAIN_INET 0U
 #define KERNEL_SOCKET_DOMAIN_UNIX 1U
 
+#define KERNEL_SOCKET_AF_UNIX 1U
 #define KERNEL_SOCKET_AF_INET 2U
 #define KERNEL_SOCKET_AF_INET6 10U
 
 /* 地址字节为网络序，端口为宿主序；Linux 布局只在 syscall 边界出现。 */
 struct kernel_socket_address {
-    uint8_t bytes[16];
-    uint32_t scope;
     uint16_t family;
-    uint16_t port;
+    union { uint16_t port, unix_length; };
+    uint32_t scope;
+    union {
+        uint8_t bytes[16];
+        struct {
+            const unsigned char *unix_path;
+            struct kernel_socket_name *unix_owner;
+        };
+    };
 };
+_Static_assert(sizeof(struct kernel_socket_address) == 24, "socket address view");
+/* Imported names borrow syscall storage. Exported names own unix_owner until
+ * address_release; packet snapshots retain their own immutable source name. */
+void kernel_socket_address_release(struct kernel_socket_address *address);
+struct kernel_socket_peercred { int32_t pid; uint32_t uid, gid; };
+int kernel_socket_peercred(struct kernel_socket *, struct kernel_socket_peercred *);
 int kernel_socket_create(struct kernel_heap *heap, int family, int type,
                          struct kernel_socket **owner);
 int kernel_socket_pair(struct kernel_heap *heap, int type,
