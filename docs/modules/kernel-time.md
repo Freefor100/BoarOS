@@ -39,11 +39,13 @@ CLOCK_REALTIME 的墙钟完全取决于启动时的 RTC 探测。goldfish RTC �
 
 syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者为 UTC 的两个零值。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
-睡眠时钟校验独立于可读时钟：`clock_nanosleep(115)` 的 coarse 时钟及 CLOCK_THREAD_CPUTIME_ID 返回 `-EOPNOTSUPP`，在读取用户 timespec 前拒绝；不把它们接入 sleep deadline 换算。其余既有 `CLOCK_REALTIME` / `CLOCK_MONOTONIC` 睡眠和 `nanosleep(101)` 保持不变。
+`clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
+
+CPU 睡眠对象由调用线程持有，期限检查和取消在共同调度保护内交接；到期直接完成等待，强制退出先摘除期限，再释放请求。目标退出只摘除其期限，不将退出当成到期；后续信号中断取消睡眠。相对睡眠中断报告剩余量，绝对睡眠不改 remaining；相对睡眠重启保留原 CPU 到期期限，绝对睡眠经 stop/continue 后重新读取用户请求。普通墙钟睡眠沿原期限路径。
 
 `make test-syscall-riscv` 覆盖换算、coarse 初始化一致性、无 timer 时的稳定读数、延迟采样与 10ms 分辨率；`tests/diff-abi/coarse.c` 覆盖真实 U-mode timer 推进、查询错误和拒绝 coarse sleep。固定 Linux 必须启用 `CONFIG_POSIX_TIMERS` 才能对照 raw coarse syscall；Linux HZ=250 的 4ms 与 BoarOS HZ=100 的 10ms 分辨率按各自真实周期验证，不要求裸值相等。`make test-userland-riscv` 用 musl 验证真实 trap→expire→wake 闭环和 RTC 墙钟。
 
-当前限制：无 NTP/阶跃调整、CPU-time sleep；POSIX 定时器的期限推进见下节；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
+当前限制：无 NTP/阶跃调整；POSIX 定时器的期限推进见下节；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
 检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、
@@ -78,11 +80,17 @@ exec 后的交付和最终物理页/堆回收。
 
 `ITIMER_VIRTUAL`累计全组用户执行时间，发送SIGVTALRM；`ITIMER_PROF`累计用户与内核执行时间，发送SIGPROF。两者使用[共同CPU记账](kernel-accounting.md)，含退出成员和各CPU尚未结算的执行片段，睡眠及IRQ不计入。状态由组身份持有，设置线程退出后继续；fork清零，exec保留，非组长exec迁移，最后成员清理时摘除活动索引。REAL、VIRTUAL、PROF相互独立。
 
-CPU0在既有timer路径只遍历启用了CPU定时器的目标；进程目标与POSIX CPU定时器共用一次组用量快照，并在短调度域内按各CPU的真实`accounting_owner`判断该组是否正在执行。整组睡眠时保留CPU阈值；恢复执行后再检查，避免微秒周期的历史欠账按墙钟继续产生信号。用量快照在调度域外按现有成员借用与CPU发布序列取得。未启用时，系统调用进出与CPU本地记账保持原路径；空索引只在原timer处理处检查。
+CPU0在既有timer路径只遍历具有活动CPU期限或有限CPU限额的目标；进程目标与POSIX CPU定时器共用一次组用量快照，并在短调度域内按各CPU的真实`accounting_owner`判断该组是否正在执行。整组睡眠时保留CPU阈值；恢复执行后再检查，避免微秒周期的历史欠账按墙钟继续产生信号。用量快照在调度域外按现有成员借用与CPU发布序列取得。未启用时，系统调用进出与CPU本地记账保持原路径；空索引只在原timer处理处检查。
 
 按固定Linux的`kernel/time/itimer.c`与`posix-cpu-timers.c`，首次到期额外加一个实际100Hz记账tick；每次到期的周期阈值增加原interval，标准信号按pending位合并。CPU定时器停用时保留interval查询值，过期尚待处理时返回一个tick的剩余量。输出旧值EFAULT保留已安装的新值。CPU0处理时机和IRQ延迟决定实际递送时刻。
 
 `make test-itimer-abi-riscv test-itimer-abi-loongarch TEST_MEMORIES="512M 1G"`检查三类独立性、部分失败、睡眠、微秒周期、信号合并、真实handler及默认终止、设置者/组长退出和exec迁移。`make test-itimer-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin`另验证真实两核：各线程分别不足180ms，合计超过阈值时进程定时器触发，同时保留单核对照。
+
+### CPU 执行限额
+
+`RLIMIT_CPU` 默认软、硬限额均无限，按全组累计用户加内核时间（PROF）执行。组内共享，fork 复制限额但从子进程自己的 CPU 用量开始，exec 保留；非组长 exec 随组身份转移。软限额到达时递送 SIGXCPU，并将软值提高一秒；硬限额先于软限额判断，到达后以 SIGKILL 终止全组。下调限额保留已用时间，在下一次 CPU 检查时处理。
+
+有限软值加入现有进程 CPU 活动索引，与 itimer、POSIX timer 共用一次组用量采样。停用所有 CPU 期限且限额恢复无限后摘除；普通 syscall 进出不增加限额采样。实际递送精度受原 timer 周期、IRQ 延迟和执行调度影响。`tests/network_runner.py --workload cpu` 用同 ELF 对照 Linux，覆盖限额、线程/exec、CPU 睡眠及 getcpu。
 
 ## LA LS7A RTC
 

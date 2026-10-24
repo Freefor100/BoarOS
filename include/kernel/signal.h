@@ -147,6 +147,7 @@ enum kernel_signal_restart kernel_signal_restart_decide(
     struct kernel_task *task, int has_handler, uint64_t flags);
 void kernel_signal_clear_syscall_restart(struct kernel_task *task);
 int kernel_signal_nanosleep_restart(const struct kernel_task *task,
+                                    int32_t *clock_id,
                                     uint64_t *deadline,
                                     uint64_t *remaining_address);
 int kernel_signal_futex_timed_restart(const struct kernel_task *task,
@@ -170,8 +171,10 @@ void kernel_signal_restore_temporary_mask(
  * handling; the generic form keeps the original trap arguments. */
 void kernel_signal_note_syscall_restart(struct kernel_task *task);
 
-/* Records a relative nanosleep restart using its absolute deadline. */
+/* Records a nanosleep restart: wall deadlines use architecture ticks,
+ * CPU clock deadlines use the selected CPU clock in nanoseconds. */
 void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
+                                          int32_t clock_id, int absolute,
                                           uint64_t deadline,
                                           uint64_t remaining_address);
 

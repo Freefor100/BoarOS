@@ -119,6 +119,32 @@ static struct msg_queue *queue_lookup(int32_t id, int by_slot)
         q = 0;
     return q;
 }
+static void queue_descriptor(const struct msg_queue *q, struct kernel_msqid64_ds *d)
+{
+    *d = (struct kernel_msqid64_ds){
+        .msg_perm = q->permission, .msg_stime = q->stime, .msg_rtime = q->rtime,
+        .msg_ctime = q->ctime, .msg_cbytes = q->bytes, .msg_qnum = q->count,
+        .msg_qbytes = q->limit, .msg_lspid = q->spid ? q->spid->number : 0,
+        .msg_lrpid = q->rpid ? q->rpid->number : 0,
+    };
+}
+int kernel_msg_proc_next(uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
+{
+    KERNEL_RAW_SCOPE(index, &msg_table.lock);
+    struct kernel_avl_node *node = *cursor
+        ? kernel_avl_after(msg_table.slots, (uint64_t)*cursor - 1U)
+        : kernel_avl_first(msg_table.slots);
+    if (!node) return 0;
+    struct msg_queue *q = slot_queue(node);
+    KERNEL_RAW_SCOPE(state, &q->lock);
+    /* Discovery owns the queue until index protection is released. RMID takes
+     * the same index→object order, so this row needs no temporary owner. */
+    if (q->removed) __builtin_trap();
+    *cursor = (uint32_t)node->key + 1U;
+    *id = q->id;
+    queue_descriptor(q, row);
+    return 1;
+}
 static int permission(const struct msg_queue *q, const struct kernel_credentials *c,
                       unsigned requested)
 {
@@ -719,15 +745,7 @@ int64_t kernel_msg_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
             }
         } else if (cmd != KERNEL_MSG_STAT_ANY && (result = permission(q, c, 4))) {
         } else {
-            d.msg_perm = q->permission;
-            d.msg_stime = q->stime;
-            d.msg_rtime = q->rtime;
-            d.msg_ctime = q->ctime;
-            d.msg_cbytes = q->bytes;
-            d.msg_qnum = q->count;
-            d.msg_qbytes = q->limit;
-            d.msg_lspid = q->spid ? q->spid->number : 0;
-            d.msg_lrpid = q->rpid ? q->rpid->number : 0;
+            queue_descriptor(q, &d);
             result = cmd == KERNEL_IPC_STAT ? 0 : q->id;
         }
     }

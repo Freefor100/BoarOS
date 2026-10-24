@@ -17,6 +17,9 @@
 #include <kernel/tick.h>
 #include <kernel/time.h>
 #include <kernel/socket.h>
+#include <kernel/shm.h>
+#include <kernel/sem.h>
+#include <kernel/msg.h>
 #include <kernel/vfs.h>
 
 #include <stdint.h>
@@ -37,6 +40,10 @@
 #define PROC_MEMORY_STATS_INODE UINT64_C(13)
 #define PROC_PID_MAX_INODE UINT64_C(14)
 #define PROC_THREAD_SELF_INODE UINT64_C(15)
+#define PROC_SYSVIPC_INODE UINT64_C(16)
+#define PROC_SYSVIPC_SHM_INODE UINT64_C(17)
+#define PROC_SYSVIPC_SEM_INODE UINT64_C(18)
+#define PROC_SYSVIPC_MSG_INODE UINT64_C(19)
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -169,6 +176,15 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
                        uint64_t *inode, uint32_t *mode)
 {
     (void)instance;
+    if (parent == PROC_SYSVIPC_INODE) {
+        if (length != 3U) return -KERNEL_ENOENT;
+        if (!memcmp(name, "shm", 3U)) *inode = PROC_SYSVIPC_SHM_INODE;
+        else if (!memcmp(name, "sem", 3U)) *inode = PROC_SYSVIPC_SEM_INODE;
+        else if (!memcmp(name, "msg", 3U)) *inode = PROC_SYSVIPC_MSG_INODE;
+        else return -KERNEL_ENOENT;
+        *mode = KERNEL_VFS_S_IFREG | 0444U;
+        return 0;
+    }
     if (parent == PROC_SYS_INODE) {
         if (length != 6U || memcmp(name, "kernel", 6U)) return -KERNEL_ENOENT;
         *inode = PROC_KERNEL_INODE;
@@ -268,6 +284,11 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         return 0;
     }
 #endif
+    if (length == 7U && !memcmp(name, "sysvipc", length)) {
+        *inode = PROC_SYSVIPC_INODE;
+        *mode = KERNEL_VFS_S_IFDIR | 0555U;
+        return 0;
+    }
     if (length == 3U && !memcmp(name, "sys", length)) {
         *inode = PROC_SYS_INODE;
         *mode = KERNEL_VFS_S_IFDIR | 0555U;
@@ -327,6 +348,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
          inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
          inode != PROC_RT_RUNTIME_INODE && inode != PROC_PID_MAX_INODE &&
+         inode != PROC_SYSVIPC_INODE && inode != PROC_SYSVIPC_SHM_INODE &&
+         inode != PROC_SYSVIPC_SEM_INODE && inode != PROC_SYSVIPC_MSG_INODE &&
 #if BOAROS_COST_DIAGNOSTICS
          inode != PROC_COST_INODE && inode != PROC_COST_CONTROL_INODE &&
          inode != PROC_NETWORK_STATS_INODE && inode != PROC_MEMORY_STATS_INODE &&
@@ -345,7 +368,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_TID_STAT_KIND &&
           proc_inode_kind(inode) != PROC_TID_STATUS_KIND &&
           proc_inode_kind(inode) != PROC_PID_MAPS_KIND)) ||
-        (inode == PROC_ROOT_INODE &&
+        ((inode == PROC_ROOT_INODE || inode == PROC_SYSVIPC_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
         ((inode == PROC_SELF_INODE || inode == PROC_THREAD_SELF_INODE || inode == PROC_MOUNTS_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK) ||
@@ -353,7 +376,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_kind_mode(proc_inode_kind(inode)) & KERNEL_VFS_S_IFMT)) ||
         ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE ||
-          inode == PROC_PID_MAX_INODE) &&
+          inode == PROC_PID_MAX_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
+          inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
         return -KERNEL_EINVAL;
     if (inode >= (UINT64_C(1) << 30U)) {
@@ -464,6 +488,18 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     /* EOF 不推进 cookie；有效项必须以正值返回。 */
     *next_position = position;
     uint64_t directory = kernel_vfs_file_inode(file);
+    if (directory == PROC_SYSVIPC_INODE) {
+        static const char *const entries[] = {".", "..", "shm", "sem", "msg"};
+        if (position >= sizeof(entries) / sizeof(entries[0])) return 0;
+        size_t length = strlen(entries[position]) + 1U;
+        if (name_size < length) return -KERNEL_ERANGE;
+        memcpy(name, entries[position], length);
+        *next_position = position + 1U;
+        *inode = position == 0 ? directory : position == 1 ? PROC_ROOT_INODE :
+            PROC_SYSVIPC_SHM_INODE + position - 2U;
+        *type = position < 2U ? 4U : 8U;
+        return 1;
+    }
     if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
         if (position > (directory == PROC_SYS_INODE ? 2U : 4U)) return 0;
         const char *entry = position == 0 ? "." : position == 1 ? ".." :
@@ -592,25 +628,26 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     else if (position == 5U) entry_name = "mounts";
     else if (position == 6U) entry_name = "sys";
     else if (position == 7U) entry_name = "thread-self";
+    else if (position == 8U) entry_name = "sysvipc";
 #if BOAROS_COST_DIAGNOSTICS
-    else if (position == 8U) entry_name = "boaros_cost";
-    else if (position == 9U) entry_name = "boaros_cost_control";
-    else if (position == 10U) entry_name = "boaros_net_stats";
-    else if (position == 11U) entry_name = "boaros_mem_stats";
-    else if (position >= 12U) {
+    else if (position == 9U) entry_name = "boaros_cost";
+    else if (position == 10U) entry_name = "boaros_cost_control";
+    else if (position == 11U) entry_name = "boaros_net_stats";
+    else if (position == 12U) entry_name = "boaros_mem_stats";
+    else if (position >= 13U) {
         position -= 4U;
 #else
-    else if (position >= 8U) {
+    else if (position >= 9U) {
 #endif
         kernel_pid_t pid;
         uint64_t identity;
-        if (position - 8U >= INT32_MAX ||
-            kernel_proc_next_process((kernel_pid_t)(position - 8U),
+        if (position - 9U >= INT32_MAX ||
+            kernel_proc_next_process((kernel_pid_t)(position - 9U),
                                       &pid, &identity)) return 0;
         size_t length = decimal(name, (uint32_t)pid);
         if (name_size <= length) return -KERNEL_ERANGE;
         name[length] = '\0';
-        *next_position = 8U + (uint32_t)pid;
+        *next_position = 9U + (uint32_t)pid;
 #if BOAROS_COST_DIAGNOSTICS
         *next_position += 4U;
 #endif
@@ -628,15 +665,16 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
              position == 5U ? PROC_MOUNTS_INODE :
              position == 6U ? PROC_SYS_INODE :
              position == 7U ? PROC_THREAD_SELF_INODE :
+             position == 8U ? PROC_SYSVIPC_INODE :
 #if BOAROS_COST_DIAGNOSTICS
-             position == 8U ? PROC_COST_INODE :
-             position == 9U ? PROC_COST_CONTROL_INODE :
-             position == 10U ? PROC_NETWORK_STATS_INODE :
-             position == 11U ? PROC_MEMORY_STATS_INODE :
+             position == 9U ? PROC_COST_INODE :
+             position == 10U ? PROC_COST_CONTROL_INODE :
+             position == 11U ? PROC_NETWORK_STATS_INODE :
+             position == 12U ? PROC_MEMORY_STATS_INODE :
 #endif
              PROC_ROOT_INODE;
     *type = position == 4U || position == 5U || position == 7U ? 10U :
-            position >= 2U && position != 6U ? 8U : 4U;
+            position >= 2U && position != 6U && position != 8U ? 8U : 4U;
     return 1;
 }
 
@@ -1336,9 +1374,127 @@ Finish:
     return error;
 }
 
+static size_t proc_ipc_column(char *text, uint64_t value, unsigned width,
+                              unsigned base, unsigned spaces, int negative)
+{
+    char digits[24];
+    unsigned count = 0;
+    do { digits[count++] = (char)('0' + value % base); value /= base; } while (value);
+    size_t used = 0;
+    while (spaces--) text[used++] = ' ';
+    for (unsigned n = count + (unsigned)negative; n < width; n++) text[used++] = ' ';
+    if (negative) text[used++] = '-';
+    while (count) text[used++] = digits[--count];
+    return used;
+}
+
+static size_t proc_ipc_row(uint64_t inode, uint32_t *cursor, char *line)
+{
+    union {
+        struct kernel_msqid64_ds msg;
+        struct kernel_semid64_ds sem;
+        struct kernel_shmid64_ds shm;
+    } row = {0};
+    int32_t id;
+    uint64_t rss = 0;
+    int found = inode == PROC_SYSVIPC_MSG_INODE ? kernel_msg_proc_next(cursor, &id, &row.msg) :
+        inode == PROC_SYSVIPC_SEM_INODE ? kernel_sem_proc_next(cursor, &id, &row.sem) :
+        kernel_shm_proc_next(cursor, &id, &row.shm, &rss);
+    if (!found) return 0;
+    const struct kernel_ipc64_perm *permission = inode == PROC_SYSVIPC_MSG_INODE
+        ? &row.msg.msg_perm : inode == PROC_SYSVIPC_SEM_INODE ? &row.sem.sem_perm : &row.shm.shm_perm;
+    size_t used = 0;
+#define IPC_COLUMN(value, width, base, spaces) \
+    (used += proc_ipc_column(line + used, (uint64_t)(value), width, base, spaces, 0))
+    int64_t key = permission->key;
+    used += proc_ipc_column(line, (uint64_t)(key < 0 ? -key : key), 10, 10, 0, key < 0);
+    IPC_COLUMN((uint32_t)id, 10, 10, 1);
+    IPC_COLUMN(permission->mode, 4, 8, 2);
+    if (inode == PROC_SYSVIPC_MSG_INODE) {
+        IPC_COLUMN(row.msg.msg_cbytes, 10, 10, 2);
+        IPC_COLUMN(row.msg.msg_qnum, 10, 10, 1);
+        IPC_COLUMN((uint32_t)row.msg.msg_lspid, 5, 10, 1);
+        IPC_COLUMN((uint32_t)row.msg.msg_lrpid, 5, 10, 1);
+    } else if (inode == PROC_SYSVIPC_SEM_INODE) {
+        IPC_COLUMN(row.sem.sem_nsems, 10, 10, 1);
+    } else {
+        IPC_COLUMN(row.shm.shm_segsz, 21, 10, 1);
+        IPC_COLUMN((uint32_t)row.shm.shm_cpid, 5, 10, 1);
+        IPC_COLUMN((uint32_t)row.shm.shm_lpid, 5, 10, 1);
+        IPC_COLUMN(row.shm.shm_nattch, 5, 10, 2);
+    }
+    IPC_COLUMN(permission->uid, 5, 10, 1);
+    IPC_COLUMN(permission->gid, 5, 10, 1);
+    IPC_COLUMN(permission->cuid, 5, 10, 1);
+    IPC_COLUMN(permission->cgid, 5, 10, 1);
+    if (inode == PROC_SYSVIPC_MSG_INODE) {
+        IPC_COLUMN(row.msg.msg_stime, 10, 10, 1);
+        IPC_COLUMN(row.msg.msg_rtime, 10, 10, 1);
+        IPC_COLUMN(row.msg.msg_ctime, 10, 10, 1);
+    } else if (inode == PROC_SYSVIPC_SEM_INODE) {
+        IPC_COLUMN(row.sem.sem_otime, 10, 10, 1);
+        IPC_COLUMN(row.sem.sem_ctime, 10, 10, 1);
+    } else {
+        IPC_COLUMN(row.shm.shm_atime, 10, 10, 1);
+        IPC_COLUMN(row.shm.shm_dtime, 10, 10, 1);
+        IPC_COLUMN(row.shm.shm_ctime, 10, 10, 1);
+        IPC_COLUMN(rss, 21, 10, 1);
+        IPC_COLUMN(0, 21, 10, 1); /* The shared-memory object has no swap backing. */
+    }
+#undef IPC_COLUMN
+    line[used++] = '\n';
+    /* Native 64-bit fields, including maximal UID/time/RSS values, fit 384B. */
+    if (used >= 384U) __builtin_trap();
+    return used;
+}
+
+static int proc_sysvipc_snapshot(uint64_t inode, struct kernel_heap *heap,
+                                  char **buffer, size_t *length)
+{
+    const char *header = inode == PROC_SYSVIPC_MSG_INODE
+        ? "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n"
+        : inode == PROC_SYSVIPC_SEM_INODE
+        ? "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n"
+        : "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+    size_t capacity = BOAROS_PAGE_SIZE, used = strlen(header);
+    char *data = 0;
+    enum kernel_heap_status status = kernel_heap_allocate(heap, capacity, (void **)&data);
+    if (status != KERNEL_HEAP_STATUS_OK)
+        return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    memcpy(data, header, used);
+    uint32_t cursor = 0;
+    char line[384];
+    size_t part;
+    /* Each iterator copies one row while its actual state is protected. Text
+     * allocation and formatting hold no IPC lock or object reference. */
+    while ((part = proc_ipc_row(inode, &cursor, line))) {
+        if (used + part + 1U > capacity) {
+            char *replacement = 0;
+            status = kernel_heap_allocate(heap, capacity * 2U, (void **)&replacement);
+            if (status != KERNEL_HEAP_STATUS_OK) {
+                kernel_heap_release(heap, data);
+                return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+            }
+            memcpy(replacement, data, used);
+            kernel_heap_release(heap, data);
+            data = replacement;
+            capacity *= 2U;
+        }
+        memcpy(data + used, line, part);
+        used += part;
+    }
+    data[used] = 0;
+    *buffer = data;
+    *length = used;
+    return 0;
+}
+
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
+    if (node->inode == PROC_SYSVIPC_SHM_INODE || node->inode == PROC_SYSVIPC_SEM_INODE ||
+        node->inode == PROC_SYSVIPC_MSG_INODE)
+        return proc_sysvipc_snapshot(node->inode, heap, buffer, length);
     if (proc_inode_kind(node->inode) == PROC_PID_MAPS_KIND)
         return proc_maps_snapshot(node, heap, buffer, length);
 #if BOAROS_COST_DIAGNOSTICS

@@ -137,6 +137,8 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 确定性 host 测试 `tests/host/sched_{policy,runqueue,syscall}_test.c` 覆盖预算、排队、ABI 和随机队列模型。`tests/diff-abi/sched_policy.c` 的 23 条同 ELF Linux 对照覆盖参数及真实 FIFO/yield/更高优先级抢占/RR轮转；`sched_stat.c` 另有5条策略stat和STOPPED/zombie wchan对照。`tests/sched-bandwidth-riscv.sh` 使用真实 FIFO 忙循环验证耗尽、OTHER 进展、周期恢复、同值写不补预算和 -1 切换保留消费；500us/250us 场景先等待新 coarse tick，再检查8ms以内被抢占并报告实际超出量。RR 在高优先级任务运行60ms后仍只剩约40ms，能检出错误重装100ms的实现。两个先阻塞后赋RR策略的子进程由同一pipe write唤醒，在100ms quota/300ms period下验证同时到期仍把CPU交给同级peer；旧队首重排已由该测试复现失败。该测试直接调用 SYS_sched_setscheduler，固定 musl 的同名包装函数是 ENOSYS 存根。测试用 guest monotonic 计时，不由 QEMU 墙钟速度推断调度正确性。
 
+`getcpu(168)` 在调用者执行位置返回实际逻辑 CPU，单 NUMA 节点编号为0；两个可选输出独立复制，后一个 fault 保留已完成前缀，第三个缓存参数按 Linux 忽略。
+
 ## 身份与资源
 
 ### 用户凭据
@@ -196,7 +198,7 @@ PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cl
 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引用对数字的owner。
 
 
-每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_NOFILE`/`RLIMIT_STACK`/`RLIMIT_CORE`/`RLIMIT_FSIZE`/`RLIMIT_SIGPENDING`/`RLIMIT_AS`/`RLIMIT_DATA`。这些限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
+每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_CPU`/`RLIMIT_NOFILE`/`RLIMIT_STACK`/`RLIMIT_CORE`/`RLIMIT_FSIZE`/`RLIMIT_SIGPENDING`/`RLIMIT_AS`/`RLIMIT_DATA`。这些限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
 普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 

@@ -64,6 +64,8 @@ struct kernel_syscall_restart_state {
         struct {
             uint64_t deadline;
             uint64_t remaining_address;
+            int32_t clock_id;
+            uint32_t absolute;
         } nanosleep;
         struct {
             uint64_t address;
@@ -251,6 +253,8 @@ struct kernel_task {
     struct kernel_sem_request *sem_request;
     struct kernel_rlimit64 as_limit, data_limit;
     struct kernel_msg_request *msg_request;
+    struct kernel_rlimit64 cpu_limit;
+    struct kernel_posix_cpu_sleep *cpu_sleep;
 } __attribute__((aligned(16)));
 
 #endif

@@ -210,6 +210,7 @@ void kernel_signal_note_syscall_restart(struct kernel_task *task)
 }
 
 void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
+                                          int32_t clock_id, int absolute,
                                           uint64_t deadline,
                                           uint64_t remaining_address)
 {
@@ -218,6 +219,8 @@ void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
         task->syscall_restart = (struct kernel_syscall_restart_state){
             .kind = KERNEL_SYSCALL_RESTART_NANOSLEEP,
             .value.nanosleep = {
+                .clock_id = clock_id,
+                .absolute = absolute,
                 .deadline = deadline,
                 .remaining_address = remaining_address,
             },
@@ -1333,6 +1336,16 @@ unsigned signal_cpu_timer_check_locked(struct kernel_task *leader,const struct k
         leader->cpu_timers[i].expires=interval?timer_add(expires,interval):0;
         fired|=1U<<i;
     }
+    uint64_t soft=leader->cpu_limit.current,hard=leader->cpu_limit.maximum;
+    if(soft!=KERNEL_RLIM_INFINITY) {
+        /* RLIMIT_CPU和itimers共用本次整组PROF样本；硬限制先于软信号。 */
+        if(hard!=KERNEL_RLIM_INFINITY && samples[1]>=hard*UINT64_C(1000000000))
+            return 8U;
+        if(samples[1]>=soft*UINT64_C(1000000000)) {
+            __atomic_store_n(&leader->cpu_limit.current,soft+1,__ATOMIC_RELAXED);
+            fired|=4U;
+        }
+    }
     scheduler_cpu_timer_update_locked(leader,0);
     return fired;
 }
@@ -1341,8 +1354,10 @@ void signal_cpu_timer_notify(struct kernel_task *leader,unsigned fired)
     if(!fired)return;
     SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(leader));
     if(!representative)return;
+    if(fired&8U){signal_timer_notify(leader,9U);return;}
     for(unsigned i=0;i<2;i++)if((fired&(1U<<i))&&
         signal_send_one(leader,26U+i,0,1,128,0,0,0)!=KERNEL_SIGNAL_STATUS_OK)__builtin_trap();
+    if((fired&4U)&&signal_send_one(leader,24U,0,1,128,0,0,0)!=KERNEL_SIGNAL_STATUS_OK)__builtin_trap();
 }
 void kernel_signal_timer_expire(void)
 {
@@ -1573,12 +1588,14 @@ void kernel_signal_clear_syscall_restart(struct kernel_task *task)
 }
 
 int kernel_signal_nanosleep_restart(const struct kernel_task *task,
+                                    int32_t *clock_id,
                                     uint64_t *deadline,
                                     uint64_t *remaining_address)
 {
     if (task->syscall_restart.kind != KERNEL_SYSCALL_RESTART_NANOSLEEP) {
         return 0;
     }
+    *clock_id = task->syscall_restart.value.nanosleep.clock_id;
     *deadline = task->syscall_restart.value.nanosleep.deadline;
     *remaining_address =
         task->syscall_restart.value.nanosleep.remaining_address;
@@ -1609,6 +1626,11 @@ enum kernel_signal_restart kernel_signal_restart_decide(
 
     if (kind == KERNEL_SYSCALL_RESTART_NONE) {
         return KERNEL_SIGNAL_RESTART_NONE;
+    }
+    if (!has_handler && kind == KERNEL_SYSCALL_RESTART_NANOSLEEP &&
+        task->syscall_restart.value.nanosleep.absolute) {
+        kernel_signal_clear_syscall_restart(task);
+        return KERNEL_SIGNAL_RESTART_RETRY;
     }
     if (!has_handler &&
         (kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||

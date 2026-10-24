@@ -39,4 +39,7 @@ int64_t kernel_msg_receive(struct kernel_task *, struct kernel_mm *, int32_t id,
 /* The caller owns this stopped task or is the task. Scheduler wait disposal
  * drains notification borrows before reclaiming task storage. */
 void kernel_msg_abort(struct kernel_task *);
+/* Slot cursor starts at zero. Copy one live row under index/object protection;
+ * the returned descriptor owns no queue, PID, message or wait references. */
+int kernel_msg_proc_next(uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row);
 #endif

@@ -848,6 +848,25 @@ static void quota(void)
     clean();
     puts("PASS published 32000 queue quota and INFO counters return to zero");
 }
+static void proc_rows(void)
+{
+    int first = make(), second = make();
+    struct packet p = {.type = 9, .data = "proc"};
+    assert(!send(first, &p, 4, KERNEL_IPC_NOWAIT));
+    rm(second);
+    unsigned before = allocations;
+    uint32_t cursor = 0; int32_t id; struct kernel_msqid64_ds row;
+    assert(kernel_msg_proc_next(&cursor, &id, &row) && id == first);
+    assert(row.msg_perm.uid == cred.euid && row.msg_perm.gid == cred.egid &&
+        row.msg_perm.mode == 0600 && row.msg_cbytes == 4 && row.msg_qnum == 1 &&
+        row.msg_lspid == pid[0].number && row.msg_stime == 1);
+    assert(before == allocations && !kernel_msg_proc_next(&cursor, &id, &row));
+    rm(first);
+    assert(row.msg_cbytes == 4 && row.msg_qnum == 1); /* A row owns no live queue data. */
+    cursor = 0; assert(!kernel_msg_proc_next(&cursor, &id, &row));
+    clean();
+    puts("PASS proc queue rows use real metadata, skip removed slots and retain no owners");
+}
 int main(void)
 {
     kernel_wait_domain_init();
@@ -872,6 +891,7 @@ int main(void)
     nonleader_receive_pid();
     completion_ownership();
     quota();
+    proc_rows();
     clean();
     puts("MSG CORE HOST PASS");
     return 0;

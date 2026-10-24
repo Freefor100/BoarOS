@@ -482,6 +482,22 @@ static void import_order(void)
     assert(!allocations);
     puts("PASS timeout/count/vector/ID validation order and unbound import owner cleanup");
 }
+static void proc_rows(void)
+{
+    int first = make(3), second = make(1);
+    rm(second);
+    unsigned before = allocations;
+    uint32_t cursor = 0; int32_t id; struct kernel_semid64_ds row;
+    assert(kernel_sem_proc_next(&cursor, &id, &row) && id == first);
+    assert(row.sem_perm.uid == cred.euid && row.sem_perm.gid == cred.egid &&
+        row.sem_perm.mode == 0600 && row.sem_nsems == 3 && row.sem_ctime == 1);
+    assert(before == allocations && !kernel_sem_proc_next(&cursor, &id, &row));
+    rm(first);
+    assert(row.sem_nsems == 3);
+    cursor = 0; assert(!kernel_sem_proc_next(&cursor, &id, &row));
+    assert(!allocations);
+    puts("PASS proc semaphore rows use real metadata, skip removed slots and retain no owners");
+}
 int main(void)
 {
     kernel_wait_domain_init();
@@ -503,6 +519,7 @@ int main(void)
     undo_boundaries_and_thread_pid();
     limits_and_reuse();
     forced_exit();
+    proc_rows();
     for (unsigned i = 0; i < 4; i++)
         assert(pid[i].references == 1);
     assert(!sem_table.sets && !sem_table.members && !allocations);

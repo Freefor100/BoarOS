@@ -1,4 +1,5 @@
 #include <kernel/scheduler.h>
+#include <kernel/cpu.h>
 #include "private.h"
 #include <kernel/errno.h>
 #include <kernel/sched_policy.h>
@@ -29,6 +30,18 @@ enum kernel_syscall_status syscall_handle_sched(
     struct kernel_sched_policy state;
     int result;
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if (nr==168) {
+        unsigned cpu=0,node=0;
+#if BOAROS_MAX_CPUS > 1
+        cpu=kernel_cpu_current()->logical_id;
+#endif
+        /* Linux尝试两份输出；CPU输出失败仍保留有效node输出。 */
+        int error=0;
+        if(request->arguments[0])error|=sched_copy(caller,request->arguments[0],&cpu,sizeof(cpu),1);
+        if(request->arguments[1])error|=sched_copy(caller,request->arguments[1],&node,sizeof(node),1);
+        decoded->value=error ? -KERNEL_EFAULT : 0;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (nr==125 || nr==126) {
         int policy=(int)request->arguments[0];
         decoded->value = policy==0 || policy==3 || policy==5 || policy==6 || policy==7 ? 0 :

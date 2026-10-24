@@ -37,4 +37,4 @@ python3 tests/network_runner.py --workload sysv_msg --only boaros --cpus 4 --mem
 
 `tests/workloads/network/sysv_msg.c` 检查 libc 与原生系统调用、选择顺序、零长度容量、控制布局与命令、完整 `MSG_COPY`、输入输出错误、进程间交换、信号及每个允许 CPU 上的实际调用。数字 UID/GID 1001 的子进程通过管道握手，分别检查 0600 拒绝、0666 允许收发、管理操作仍拒绝及 `MSG_STAT_ANY` 的权限例外，不依赖用户数据库。Linux 对照与 BoarOS 运行结果由 runner 分别记录。
 
-当前不提供 IPC namespace、运行时 sysctl 和 `/proc/sysvipc/msg`。消息队列使用 `msgctl` 的索引枚举和统计接口。
+`/proc/sysvipc/msg` 提供当前队列的真实元数据列表，沿 `msgctl` 共用的描述符生成函数取得队列状态；读取所有权和重读规则见 [procfs 模块](procfs.md)。`msgctl` 继续提供索引枚举和统计接口。当前不提供 IPC namespace 和运行时 IPC sysctl。

@@ -1,10 +1,14 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`stat/status` 的首批真实字段和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录中除 `stat/status` 外的文件、Linux 全量进程字段、`fdinfo` 与无路径 console 的链接尚未接入；不能把这批入口当作完整 procfs。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录中除 `stat/status` 外的文件、Linux 全量进程字段、`fdinfo` 与无路径 console 的链接尚未接入；不能把这批入口当作完整 procfs。
 
 `mount(2)` 接受类型 `proc`、普通挂载、`MS_RDONLY` 与 `MS_SILENT`；源字符串只作用户地址验证，不选择设备。用户态负责创建挂载点。其他挂载模式显式拒绝。`umount2(2)` 只接受 flags 0，要求名称解析到 proc 实例根且无 cwd、文件、子挂载或其他路径引用。挂载实例持有根及覆盖路径，失败创建或发布不会改变原树；成功卸载先摘树、释放根，最后销毁无 I/O 的 proc 实例。PID 1 及后代全部退出后，根盘清理由最深子挂载开始迭代拆除 proc，不依赖用户态逐个卸载。当前所有任务共享一棵挂载树。
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空读取形成快照，短读、readv 和 pread 使用它，seek 到零后释放并在下一次读取重新取值，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
+
+`/proc/sysvipc` 下的 `shm`、`sem`、`msg` 为 0444 的生成式文件，列名、列顺序及数值格式沿固定 Linux 的 `ipc/{shm,sem,msg}.c`：key 使用有符号十进制，权限使用八进制，ID、归属、时间和计数来自真实对象。元数据列表对普通用户可读，与 `IPC_STAT` 的对象访问权限分别处理。共享内存还报告实际后备对象的 resident 字节；当前没有 swap 后备，swap 列为零。已标记 `IPC_RMID` 但仍有附加的共享段继续出现，权限列带 `SHM_DEST`，最后附加和临时 owner 归还后才消失。
+
+sem/msg 按 slot 索引逐行遍历，在索引和对应对象的短锁内复制描述符；删除操作使用相同锁序，因此取行时对象及 PID 元数据有效。SHM 管理继续由 CPU0 执行，沿其已有本地中断保护复制段状态与 resident 计数。格式化、快照缓冲扩容和用户复制在这些保护外完成，文本没有 IPC 对象借用。并发创建或删除期间，各行分别取一致状态，整张表不占用全程全局锁。BoarOS 的完整文本沿上述共同生成文件规则保存到 rewind；Linux 的 seq_file 可以分批生成，跨 read 的并发删除不保证与该整份文本相同。`tests/host/proc_sysvipc.c` 检查目录 cookie、格式、空表及分配失败归还；`tests/workloads/ipc/proc_sysvipc.c` 用三类真实对象检查字段、数字用户读取、稳定对象的短读拼接、延迟删除及删除后 rewind。
 
 `/proc/sys/kernel/pid_max`只读提供实际PID分配器的排他上界（最大可分配PID加1）；该值随分配器配置取得，查询此数值对应的TID返回ESRCH。它与已有实时预算控制同处`/proc/sys/kernel`，沿生成式文件快照读取，不提供运行时改写接口。`/proc/<pid>/status`的VmSwap在当前无swap机制下为0。
 

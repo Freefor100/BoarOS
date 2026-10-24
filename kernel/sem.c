@@ -102,6 +102,26 @@ static struct sem_set *set_lookup(int32_t id, int by_slot)
     else set = 0;
     return set;
 }
+static void set_descriptor(const struct sem_set *set, struct kernel_semid64_ds *d)
+{
+    *d = (struct kernel_semid64_ds){.sem_perm = set->permission,
+        .sem_otime = set->otime, .sem_ctime = set->ctime, .sem_nsems = set->nsems};
+}
+int kernel_sem_proc_next(uint32_t *cursor, int32_t *id, struct kernel_semid64_ds *row)
+{
+    KERNEL_RAW_SCOPE(index, &sem_table.lock);
+    struct kernel_avl_node *node = *cursor
+        ? kernel_avl_after(sem_table.slots, (uint64_t)*cursor - 1U)
+        : kernel_avl_first(sem_table.slots);
+    if (!node) return 0;
+    struct sem_set *set = slot_set(node);
+    KERNEL_RAW_SCOPE(state, &set->lock);
+    if (set->removed) __builtin_trap();
+    *cursor = (uint32_t)node->key + 1U;
+    *id = set->id;
+    set_descriptor(set, row);
+    return 1;
+}
 static int permission(const struct sem_set *set, const struct kernel_credentials *cred,
     unsigned requested)
 {
@@ -655,10 +675,7 @@ int64_t kernel_sem_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
         if (cmd != KERNEL_SEM_STAT_ANY && (result = permission(set, cred,
             cmd == KERNEL_SEM_SETVAL || cmd == KERNEL_SEM_SETALL ? 2 : 4))) goto unlock;
         if (cmd == KERNEL_IPC_STAT || cmd == KERNEL_SEM_STAT || cmd == KERNEL_SEM_STAT_ANY) {
-            descriptor.sem_perm = set->permission;
-            descriptor.sem_otime = set->otime;
-            descriptor.sem_ctime = set->ctime;
-            descriptor.sem_nsems = set->nsems;
+            set_descriptor(set, &descriptor);
             result = cmd == KERNEL_IPC_STAT ? 0 : set->id;
             goto unlock;
         }

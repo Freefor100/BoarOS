@@ -53,4 +53,6 @@ int kernel_sem_clone(struct kernel_task *parent, struct kernel_task *child, int 
  * separately drains notification borrows before reclaiming the task storage. */
 void kernel_sem_abort(struct kernel_task *);
 void kernel_sem_exit(struct kernel_task *);
+/* Slot cursor starts at zero; the copied row holds no set/undo/PID owners. */
+int kernel_sem_proc_next(uint32_t *cursor, int32_t *id, struct kernel_semid64_ds *row);
 #endif
