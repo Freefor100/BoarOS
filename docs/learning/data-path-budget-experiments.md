@@ -2519,7 +2519,7 @@ DGRAM工作线程总CPU时间为325.34/436.04/858.97ms，p95为0.557/0.467/0.461
 
 复用原`socket.elf`及命名接口性能ELF，三批内各自的ELF和模板摘要完全一致。STREAM合计16MiB、每逻辑块64KiB；DGRAM为4096组64字节请求／响应；路径建连1024次。墙钟包含内容检查及双方完成，创建／清理在窗口外；延迟是逻辑块或请求往返耗时。QEMU11.1.2、相同显式OpenSBI、1GiB、seed123，COST和锁诊断关闭，版本串行运行。
 
-本轮在启动前用GDB停于`kernel_main`物理入口，以`a0`、`mhartid`和`boot_cpu`识别启动hart，再按内核的“启动hart为逻辑CPU0，其余hart升序”映射到宿主独立P核0/2/4/6；QEMU主线程和I/O固定CPU8。删除断点、`disconnect`并经QMP确认暂停后才继续，GDB不进入计时窗口。三批均保存实际逻辑CPU映射，亲和性已恢复。
+本轮在启动前用GDB停于`kernel_main`物理入口，以`a0`、`mhartid`和`boot_cpu`识别启动hart，再按内核的“启动hart为逻辑CPU0，其余hart升序”映射到宿主独立P核0/2/4/6；QEMU主线程和I/O固定CPU8。删除断点、`disconnect`并经QMP确认暂停后才继续，GDB不进入计时窗口。三批均保存实际逻辑CPU映射，亲和性已恢复。后续复核确认：QEMU自身的上述绑定成立，但保护脚本当时处于PID1为`codex`的sandbox PID视图，只枚举到2个任务，未把真实宿主的普通桌面负载移出测量核。历史记录也没有有效频率和IRQ增量，因而下表约9%～31%的旧核漂移无法再分摊给频率、抢占或中断；不能将这次保护视为宿主负载已隔离。真实宿主校准见下一节。
 
 | 工作阶段（北京时间） | 启动数 | 记录内容 |
 |---|---:|---|
@@ -2569,7 +2569,7 @@ DGRAM工作线程总CPU时间为325.34/436.04/858.97ms，p95为0.557/0.467/0.461
 | SMP四核／UDP四对 | 0.663／1.026／3.145 | 0.654／1.058／5.410 |
 | SMP四核／UNIX DGRAM四对 | 0.220／0.437／0.825 | 0.201／0.434／0.891 |
 
-最终短批整次启动根堆峰值，UP前版／最终／control均2036KiB；SMP四核为1588／2036／1588KiB。SMP最终较前版高448KiB，作为整次启动资源峰值观察保留，本批没有量化其来源。进程累计RSS高水位各版均为TCP单连接276KiB、其余窗口712KiB；它们与整次启动堆峰值分开统计。
+最终短批整次启动根堆峰值，UP前版／最终／control均2036KiB；SMP四核为1588／2036／1588KiB。该批未保存逐对象快照；后续诊断重现两种峰，分别对应21／28个同时存活的64KiB UNIX STREAM包，其余占用相同，详见后面的堆对象分解。进程累计RSS高水位各版均为TCP单连接276KiB、其余窗口712KiB；它们与整次启动堆峰值分开统计。
 
 ### 最终同一SMP内核的命名接口与正确性
 
@@ -2590,3 +2590,46 @@ LA命名七组短例及最终网络契约短例均实测通过、owner归还完�
 通用实现与绑核工具于12:22进入main并单向合入兼容分支，固定官方容器离线`make all`成功。兼容分支默认交付内核另以1核／512MiB实测原RV glibc与LA musl命名短例，各7/7组，heap-live与fsck均为0；RV实际最小空闲栈1600字节，LA未输出task-stack统计。这两次是默认交付物的功能检查，独立于上面的30次性能启动。
 
 三批逐窗口及身份分别保留于`build/socket-perf-next-20261024/{performance,isolation-performance,final-performance}/rows.json`与各自`identity.json`；计时最终核身份以`final-repaired/identity.json`为准，兼容默认交付物短例见`compat-short/result.json`。确定性交错、输出顺序反例、GDB暂停清理、原glibc、RV四核命名／最终网络及LA记录均在同一目录的对应子目录，历史批次未覆盖。
+
+## 宿主校准、消息占用与空等待通知（2026-10-24，12:40～13:11）
+
+UP对照旧核为接收语义修复完成版（10月24日11:22），SMP旧核为上轮socket优化完成版（10月24日12:22）；最终版于13:11计时、13:17提交。本轮修正了宿主保护的执行范围，查清STREAM消息的实际页占用，并在最终版省去空等待队列的全局锁操作。最终原UP负载的六项变化均未超过+3%；命名DGRAM四核从旧核240.433降至203.168ms，两核从220.543降至197.953ms。四核仍比两核慢2.63%，共享MM和等待状态的扩展成本继续保留。
+
+### 堆对象分解，12:40～12:44
+
+`root-heap-peak-pages`累计每个非空slab的整页和大块分配的buddy页，不等于进程RSS或有效载荷字节数。AF_UNIX默认发送额度为212992B；旧STREAM每包载荷32768B，加72B包头后实际申请32840B，buddy向上分配65536B。修正后按完整包限制32KiB，载荷32696B、请求与backing均为32768B。
+
+四次临时诊断使用相同原ELF／镜像，峰快照在原heap锁内取得，记录调用者、请求大小和对象存活区间；诊断内核不进入正式计时。每格的包数是峰时仍持有backing的大包数，包含尚未完成接收归还的消息。
+
+| 构建／实际客核 | 峰时STREAM大包 | 每包请求／backing B | slab／其它大块 KiB | 总峰 KiB |
+|---|---:|---:|---:|---:|
+| 接收语义修复版（11:22）／4核 | 21 | 32840／65536 | 68／176 | 1588 |
+| 上轮socket优化版（12:22）／4核 | 21 | 32840／65536 | 68／176 | 1588 |
+| 上轮socket优化版（12:22）／1核 | 28 | 32840／65536 | 68／176 | 2036 |
+| 32KiB包候选／4核 | 27 | 32768／32768 | 72／176 | 1112 |
+
+1588与2036KiB的差额正好是7个额外同时存活的64KiB包，其余61页相同；历史那次SMP4的具体调度次序没有保留。四次峰对象后来全部归还，每次large分配／释放均为1197／1197，PID1退出时heap-live为0、fsck为0。候选多出的1页属于256B slab类。该1112KiB是临时诊断样本；最终普通构建的原UP峰为2036→1144KiB，命名四核为旧1824→最终1264KiB，按各自完整启动记录，不用诊断峰替代普通峰。逐对象记录见[heap汇总](/home/leo/BoarOS/build/socket-host-dgram-20261024/heap/summary.json)。
+
+### 真实宿主校准，12:48
+
+保护脚本改在PID1为`systemd`的真实宿主视图运行，三个正式批次分别枚举1066／1077／1100个任务，将普通同UID任务移到CPU9～15。带capability的`systemd`、`kwin_wayland`共44个线程返回EPERM，保持原掩码并记录其CPU活动；这部分仍可能在测量核执行。vCPU按内核逻辑CPU顺序固定到独立P核2／4／6／0，QEMU主线程和I/O固定CPU8，测量期间停止构建和其它测试，各批结束后恢复亲和性。
+
+固定频率helper受sudo口令限制未能执行，宿主频率策略保持原值。每次保存CPU／IRQ／softirq增量、温度、限温计数、QEMU线程CPU时间及100ms间隔的硬件cycles与task-clock。最终CSV按总cycles除以总task-clock计算，UP约4.41GHz、两核4.36GHz、四核4.14GHz；每次core/package限温计数与累计限温时间增量均为0。这里记录的是实际运行频率，不能把两核与四核当作等频比较。
+
+[host-control-2](/home/leo/BoarOS/build/socket-host-dgram-20261024/host-control-2/rows.json)先预热旧核1次，再跑相同旧核3次；六窗口spread为0.60%～2.23%，spread按最大值／最小值−1计算。这些记录支持本轮比较条件，未追溯解释上轮缺少宿主观测的漂移。
+
+### 首轮候选与锁诊断，12:50～13:00
+
+[verified-performance首10次](/home/leo/BoarOS/build/socket-host-dgram-20261024/verified-performance/rows.json)包含UP旧／候选／候选／旧，以及命名接口1／2／4核各一对。候选把DGRAM摘队、发送计费归还和源名引用释放合并到同一次端点状态提交，实际销毁留在锁外，并使用上述32KiB STREAM包。它尚未解决DGRAM四核：旧核240.433→候选245.872ms，线程累计CPU时间778.922→789.641ms；两核候选为212.240ms。
+
+随后仅执行DGRAM性能窗口，2／4核各一次临时raw诊断，按真实地址单列`socket_state_lock`，保留guard／lock布局。四核raw等待合计253.716ms，MM15、socket状态锁、SCHED40分别占36.87%／33.96%／24.76%，heap仅1.38%；前三项等待为93.542／86.150／62.823ms。MM15保护同一进程共享的`kernel_mm_record.metadata`，uaccess pin／unpin在其中取得和归还物理页引用；SCHED40对应全局`kernel_wait_domain`。持有时间含嵌套保护，不能直接相加；时钟读取和私有计数也有观测开销，这些数值用于定位等待对象，不是正式速度结果。完整分项见[raw诊断汇总](/home/leo/BoarOS/build/socket-host-dgram-20261024/raw-diag/summary.json)。
+
+最终针对空通知复用已有`registrations`：`kernel_wait_cursor_prepare`读取为零时直接返回，非空仍进入wait-domain重核并取得游标借用。调用者持有活队列，等待者在业务锁内登记，或登记后重新检查业务条件；file-mapping／page-cache原有锁外登记数查询同步改为原子读取。空队列因此省去全局等待锁，已有回调借用、非空唤醒和队列关闭规则继续生效。
+
+### 最终短批与正确性，13:11
+
+[final-performance最后6次](/home/leo/BoarOS/build/socket-host-dgram-20261024/final-performance/rows.json)为UP的旧／最终／最终／旧，再加最终命名两核、四核各一次。UP用两次均值比较，TCP单／四连接为−0.89%／−1.50%，STREAM单／四连接为+1.54%／+2.06%，UDP为+0.26%，DGRAM为−4.17%；旧核control最大spread为1.21%。SMP旧核沿用12:50首轮的匹配记录，最终两核DGRAM为197.953ms（−10.24%）、四核203.168ms（−15.50%）；线程累计CPU时间分别为380.287／697.166ms，较旧核下降8.80%／10.50%。最终四核仍慢于两核，不能据此宣称扩展性问题全部解决。
+
+六次均完成固定内容、次数、实际客核映射、PID1退出、heap归还和fsck检查。最终构建另通过宿主45项socket定向用例、wait检查及受影响的eventfd／futex／epoll短例；原RV glibc七组、RV四核命名七组、网络十组及LA命名短例通过。最终RV实测最小空闲内核栈依次为1664／1336／2408B；LA没有该累计高水位输出。功能记录见[final-glibc](/home/leo/BoarOS/build/socket-host-dgram-20261024/final-glibc/result.json)、[final-rv4-named](/home/leo/BoarOS/build/socket-host-dgram-20261024/final-rv4-named/result.json)、[final-rv4-network](/home/leo/BoarOS/build/socket-host-dgram-20261024/final-rv4-network/result.json)和[final-la-named](/home/leo/BoarOS/build/socket-host-dgram-20261024/final-la-named/result.json)；正式内核身份集中在[final/identity.json](/home/leo/BoarOS/build/socket-host-dgram-20261024/final/identity.json)，各阶段原始记录保留于同一实验目录。
+
+通用修复已单向合入兼容分支，固定官方容器离线默认`make all`通过；该交付内核以原RV glibc与LA musl再测命名七组，各7/7、heap-live为0、fsck为0。兼容RV实测最小空闲栈1792B，记录见[compat-short](/home/leo/BoarOS/build/socket-host-dgram-20261024/compat-short/result.json)。
