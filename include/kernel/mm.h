@@ -98,7 +98,8 @@ enum kernel_mm_status kernel_mm_pin_user_page(
     struct kernel_mm_user_pin *);
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 
-/* Success creates another independently owned reference to the same MM. */
+/* Source owner and handle remain stable through this non-sleeping acquire.
+ * Success creates another independently owned reference to the same MM. */
 enum kernel_mm_status kernel_mm_acquire(
     struct kernel_mm *destination,
     const struct kernel_mm *source);
@@ -180,6 +181,12 @@ enum kernel_mm_status kernel_mm_prepare_futex(
 /* Unique for the lifetime of the kernel, including after MM page reuse. */
 enum kernel_mm_status kernel_mm_futex_id(
     const struct kernel_mm *mm, uint64_t *identity);
+
+struct kernel_memory_limits;
+/* Initial main ELF byte boundaries are independent of later VMA edits. */
+enum kernel_mm_status kernel_mm_set_data_layout(struct kernel_mm *, uint64_t, uint64_t);
+enum kernel_mm_status kernel_mm_check_memory_limits(const struct kernel_mm *,
+    const struct kernel_memory_limits *);
 
 /* Initializes the exact Linux program break for a newly loaded image. */
 enum kernel_mm_status kernel_mm_brk_initialize(
@@ -287,4 +294,15 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 /* MM句柄owner覆盖此无等待快照；保护页仍占用RSS，高水位跨unmap保留。 */
 uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm);
+struct kernel_mm_proc_map {
+    uint64_t start, end, offset;
+    uint32_t permissions;
+    enum kernel_vma_role role;
+    unsigned shared;
+    struct kernel_open_file_description *file;
+};
+/* Caller owns row storage and each nonnull file reference on success. */
+enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *,
+    struct kernel_heap *, struct kernel_mm_proc_map **rows, uint32_t *count);
+
 #endif

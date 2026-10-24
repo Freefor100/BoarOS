@@ -72,7 +72,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `shmget`/`shmctl`/`shmat`/`shmdt` 编号为 194/195/196/197，构成 System V 共享内存族。支持 `IPC_PRIVATE` 与命名 key，`IPC_STAT`/`IPC_SET`/`IPC_RMID` 控制命令，延迟释放与末引用清理，以及多进程跨地址附加；详见 [SysV 共享内存模块](sysv-shm.md)。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
-当前 `brk`/mmap 还没有 `RLIMIT_DATA`、VMA 数量上限、内存承诺或 overcommit accounting；`MAP_NORESERVE` 因而与普通匿名映射等价。成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。
+`brk`/mmap 已执行 AS/DATA 限制，当前仍没有 VMA 数量上限、内存承诺或 overcommit accounting；`MAP_NORESERVE` 因而与普通匿名映射等价。成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。
 
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。普通 clone 已覆盖独立父子进程，线程 clone 子集共享 MM、files、fs context 和信号 disposition；完整线程组与共享资源矩阵仍有限。接口语义和内部字段已经分离，内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 

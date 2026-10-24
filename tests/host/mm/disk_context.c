@@ -81,7 +81,10 @@ uint64_t kernel_time_realtime_ns(void)
 }
 void kernel_console_putc(char c) { fputc(c, stderr); }
 #ifndef FILE_IO_CASES
-uint64_t kernel_task_current_stack_limit(void) { return 0; }
+__attribute__((weak)) uint64_t kernel_task_current_stack_limit(void) { return UINT64_MAX; }
+#include <kernel/rlimit.h>
+__attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memory_limits *out)
+{ *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #endif
 static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort(); }
 #define EXCLUDED(name) void name(void) { excluded(); }

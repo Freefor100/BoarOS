@@ -14,7 +14,8 @@ static struct kernel_task tasks[6];
 static struct kernel_pid ids[7];
 static uint64_t bitmap[2];
 static unsigned all_steps, ancestry_steps;
-static int invalidate_ancestry, reset_actions;
+static int invalidate_ancestry, reset_actions, replace_mm;
+static unsigned maps_mm_refs, maps_file_refs, maps_calls;
 static pthread_barrier_t action_barrier;
 static struct kernel_signal_table actions;
 void *sync_test_cpu(void) { return active; }
@@ -78,6 +79,10 @@ uint64_t kernel_signal_pending_count_locked(const struct kernel_task *t) { (void
 struct kernel_tty *kernel_task_controlling_tty(const struct kernel_task *task)
 {
     (void)task;
+    if (replace_mm) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        tasks[1].mm.record = (void *)(uintptr_t)2; replace_mm = 0;
+    }
     if (reset_actions) {
         reset_actions = 0;
         /* The remote reset commits after the metadata capture, before formatting. */
@@ -91,7 +96,11 @@ int32_t kernel_tty_foreground(const struct kernel_tty *tty) { (void)tty; return 
 void scheduler_usage_snapshot(const struct kernel_task *task, int thread, struct kernel_task_usage *usage)
 { (void)task; (void)thread; *usage = (struct kernel_task_usage){0}; }
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(const struct kernel_mm *mm, struct kernel_mm_proc_memory *result)
-{ (void)mm; (void)result; abort(); }
+{
+    assert(!active->raw_locks && maps_mm_refs && mm->record == (void *)(uintptr_t)1);
+    *result = (struct kernel_mm_proc_memory){.virtual_bytes = 123456, .resident_pages = 7};
+    return 0;
+}
 
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t s,void **out)
 {(void)h;*out=malloc(s);return *out?0:KERNEL_HEAP_STATUS_EMPTY;}
@@ -222,12 +231,112 @@ static void access_case(void)
     tasks[0].credentials=tasks[1].credentials=kernel_credentials_initial();
     puts("PASS proc credentials, dumpable, capability subset and resource-generation recheck");
 }
+/* The MM/OFD fixtures expose capture timing; production proc code owns access checks. */
+static int maps_change;
+static pthread_barrier_t maps_barrier;
+static struct kernel_credentials maps_from, maps_to, maps_changed;
+enum kernel_mm_status kernel_mm_acquire(struct kernel_mm *out, const struct kernel_mm *source)
+{
+    assert(active->raw_locks && source->state == KERNEL_MM_LIVE);
+    *out = *source; maps_mm_refs++; return 0;
+}
+enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
+{
+    assert(!active->raw_locks && maps_mm_refs && mm->record == (void *)(uintptr_t)1);
+    maps_mm_refs--; mm->state = KERNEL_MM_RELEASED; return 0;
+}
+enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **file)
+{
+    assert(!active->raw_locks && maps_file_refs && (uintptr_t)*file == 3);
+    maps_file_refs--; *file = 0; return 0;
+}
+enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *mm,
+    struct kernel_heap *heap, struct kernel_mm_proc_map **rows, uint32_t *count)
+{
+    assert(!active->raw_locks && maps_mm_refs && mm->record == (void *)(uintptr_t)1);
+    maps_calls++;
+    assert(!kernel_heap_allocate_zeroed(heap, 1, sizeof(**rows), (void **)rows));
+    (*rows)[0] = (struct kernel_mm_proc_map){.start = 4096, .end = 8192,
+        .file = (void *)(uintptr_t)3}; *count = 1; maps_file_refs++;
+    pthread_barrier_wait(&maps_barrier); pthread_barrier_wait(&maps_barrier);
+    return 0;
+}
+static void *maps_remote_change(void *unused)
+{
+    (void)unused; active = &cpus[1];
+    struct kernel_exec_security *replacement = maps_change == 4 ?
+        kernel_exec_security_create(&scheduler.identity_heap, 1) : 0;
+    pthread_barrier_wait(&maps_barrier);
+    struct kernel_exec_security *old = 0;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (maps_change == 1) tasks[1].mm.record = (void *)(uintptr_t)2;
+        if (maps_change == 2) tasks[1].credentials = &maps_changed;
+        if (maps_change == 3) kernel_exec_security_set_dumpable(tasks[1].exec_security, 0);
+        if (maps_change == 4) { old = tasks[1].exec_security; tasks[1].exec_security = replacement; }
+        if (maps_change == 5) ids[1].generation++;
+        if (maps_change == 6) tasks[1].proc_exiting = 1;
+    }
+    kernel_exec_security_put(old);
+    pthread_barrier_wait(&maps_barrier);
+    return 0;
+}
+static void maps_access_cases(void)
+{
+    for (maps_change = 0; maps_change <= 6; maps_change++) {
+        setup(); active->current = &tasks[0];
+        maps_from = *kernel_credentials_initial();
+        maps_from.uid = maps_from.euid = maps_from.suid = maps_from.fsuid = 1000;
+        maps_from.gid = maps_from.egid = maps_from.sgid = maps_from.fsgid = 1000;
+        maps_from.effective = maps_from.permitted = 0;
+        maps_to = maps_changed = maps_from;
+        tasks[0].credentials = &maps_from; tasks[1].credentials = &maps_to;
+        tasks[1].mm = (struct kernel_mm){.record = (void *)(uintptr_t)1, .state = KERNEL_MM_LIVE};
+        struct kernel_mm_proc_map *rows = 0; uint32_t count = 0;
+        unsigned before = maps_calls;
+        kernel_exec_security_set_dumpable(tasks[1].exec_security, 0);
+        assert(kernel_proc_maps_snapshot(2, ids[1].generation, &scheduler.identity_heap,
+            &rows, &count) == -KERNEL_EACCES);
+        assert(maps_calls == before && !rows && !maps_mm_refs && !maps_file_refs);
+        kernel_exec_security_set_dumpable(tasks[1].exec_security, 1);
+        assert(!pthread_barrier_init(&maps_barrier, 0, 2));
+        pthread_t remote; assert(!pthread_create(&remote, 0, maps_remote_change, 0));
+        int result = kernel_proc_maps_snapshot(2, ids[1].generation,
+            &scheduler.identity_heap, &rows, &count);
+        assert(!pthread_join(remote, 0)); assert(!pthread_barrier_destroy(&maps_barrier));
+        if (!maps_change) {
+            assert(!result && count == 1 && rows && maps_file_refs == 1);
+            assert(!kernel_open_file_release(&rows[0].file)); kernel_heap_release(&scheduler.identity_heap, rows);
+        } else {
+            assert(result == (maps_change >= 5 ? -KERNEL_ENOENT : -KERNEL_EACCES));
+            assert(!rows && !count);
+        }
+        assert(!maps_mm_refs && !maps_file_refs); borrows_returned();
+        tasks[0].credentials = tasks[1].credentials = kernel_credentials_initial();
+        active->current = 0;
+    }
+    puts("PASS proc maps same-capture MM owner; deny dumpability, changed MM/credentials/security/dumpable/PID generation/exit; returned task/MM/OFD owners");
+}
+
+static void memory_owner_case(void)
+{
+    setup();
+    tasks[1].mm = (struct kernel_mm){.record = (void *)(uintptr_t)1, .state = KERNEL_MM_LIVE};
+    replace_mm = 1;
+    struct kernel_proc_process_snapshot snapshot;
+    assert(!kernel_proc_process_snapshot(2, ids[1].generation, &snapshot));
+    assert(snapshot.virtual_bytes == 123456 && snapshot.resident_pages == 7);
+    assert(tasks[1].mm.record == (void *)(uintptr_t)2 && !maps_mm_refs);
+    kernel_credentials_put(snapshot.credentials); borrows_returned();
+    puts("PASS proc VmSize/VmRSS use captured MM owner across target MM replacement");
+}
+
 int main(int argc, char **argv)
 {
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
-    else {lookup_cases();access_case();}
+    else {lookup_cases();access_case();maps_access_cases();memory_owner_case();}
     for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     return 0;
 }

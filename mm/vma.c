@@ -16,6 +16,7 @@ struct kernel_vma_set {
     uint32_t capacity;
     uint64_t generation;
     uint64_t total_bytes;
+    uint64_t data_bytes;
 };
 
 static int set_valid(const struct kernel_vma_set *set)
@@ -39,16 +40,32 @@ uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set)
     return set->total_bytes;
 }
 
+int kernel_vma_is_data(const struct kernel_vma *vma)
+{
+    return (vma->permissions & 2U) && vma->role != KERNEL_VMA_ROLE_STACK &&
+        (vma->kind == KERNEL_VMA_KIND_ANONYMOUS ||
+         vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
+         vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE);
+}
+
+uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set)
+{
+    if (!set_valid(set)) __builtin_trap();
+    return set->data_bytes;
+}
+
 static void recount_bytes(struct kernel_vma_set *set)
 {
-    uint64_t total = 0U;
+    uint64_t total = 0U, data = 0U;
     for (uint32_t i = 0U; i < set->count; i++) {
         COST_ADD(VMA_RECOUNT, 1);
         uint64_t length = set->entries[i].end - set->entries[i].start;
         if (length > UINT64_MAX - total) __builtin_trap();
         total += length;
+        if (kernel_vma_is_data(&set->entries[i])) data += length;
     }
     set->total_bytes = total;
+    set->data_bytes = data;
 }
 
 static int vma_valid(const struct kernel_vma *vma)
@@ -398,6 +415,7 @@ enum kernel_vma_status kernel_vma_set_clone(
         }
         working->count = source->count;
         working->total_bytes = source->total_bytes;
+        working->data_bytes = source->data_bytes;
         *destination = working;
         return KERNEL_VMA_STATUS_OK;
     }
@@ -422,6 +440,7 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
         working->count = 0U;
         working->capacity = 0U;
         working->total_bytes = 0U;
+        working->data_bytes = 0U;
     }
     kernel_heap_release(working->heap, working);
     *set = 0;

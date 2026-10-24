@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_EXEC_IMAGE_H
 
 #include <kernel/mm.h>
+#include <kernel/rlimit.h>
 #include <kernel/elf64_source.h>
 #include <kernel/read_source.h>
 
@@ -22,6 +23,8 @@ struct kernel_exec_image_request {
     struct kernel_elf64_source *interpreter_source;
     uint64_t stack_limit;
     uint32_t stack_limit_valid;
+    struct kernel_memory_limits memory_limits;
+    uint32_t memory_limits_valid;
     struct kernel_exec_string executable;
     const struct kernel_exec_string *arguments;
     size_t argument_count;

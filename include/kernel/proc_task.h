@@ -10,6 +10,7 @@ struct kernel_open_file_description;
 struct kernel_heap;
 struct kernel_vfs_stat;
 struct kernel_credentials;
+struct kernel_mm_proc_map;
 
 enum kernel_proc_path_kind {
     KERNEL_PROC_PATH_EXE = 1,
@@ -74,6 +75,9 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
 int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
                                      enum kernel_proc_path_kind kind, int fd,
                                      struct kernel_vfs_path **owner);
+/* Rows own real backing OFD references; caller releases them and heap storage. */
+int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
+    struct kernel_heap *heap, struct kernel_mm_proc_map **rows, uint32_t *count);
 int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
                          int after, int *fd);
 int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,

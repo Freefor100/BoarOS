@@ -168,7 +168,11 @@ MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在�
 
 `kernel_mm_proc_memory_snapshot()` 无分配读取 VMA 集合在成功编辑时更新的覆盖字节数，以及 Sv39 有效/受保护页计数，供 proc 的 VmSize/VmRSS 使用。受保护页仍拥有物理页，故计入驻留；未发生缺页的虚拟映射只计入 VmSize。数值是瞬时 MM 统计，不把页缓存全局占用误计为该进程 RSS。
 
-`kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
+`kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 在 MM gate 内按 VMA 顺序检查权限和资源限制，以局部 DATA 用量投影判定可成功的前缀；预留边界拆分后一次修改该前缀的已有 PTE、提交 metadata 并完成 TLB 同步。遇洞、权限或限额失败保留成功前缀，末段拆分 OOM 仍提交此前前缀。同权限段无需修改。长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
+
+AS/DATA 限额属于当前调用者的线程组，MM 只保存 VMA 用量；`CLONE_VM` 的独立线程组共享用量但分别受自身限制约束。VMA 原有统计遍历同时维护总虚拟字节与私有可写、非栈的 DATA 字节；拆分、保护、替换、搬移和 fork 使用同一统计来源。mmap、shmat、brk、mremap、mprotect 和栈增长均在已有 MM 操作锁内检查并修改用量。降低限制保留当前映射，后续增长检查当前限额；DATA 软限制为零时，映射扩张采用硬限制，brk 的精确字节检查仍使用零软限制。
+
+`brk` 先检查主 ELF 的 `end_data-start_data` 加 `requested-start_brk`，包括同页调整，再对新增页检查 AS/DATA。`MAP_FIXED` 以全部覆盖字节抵扣扩张量，在撤映射前检查限额；mremap 扩张同样先检查限额，因此此类失败保留固定目标。mprotect 使用固定 Linux 的新旧属性检查，并逐段保留成功前缀。初始栈和 exec 的限制检查见 [用户 ELF](user-elf.md)。
 
 ## `mremap` 区间调整与搬移
 
@@ -239,7 +243,7 @@ make test-riscv
 
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
 
-已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用策略处理私有/共享匿名、ELF、SysV 及 tmpfs/ext4 映射；SysV attachment 和未并行化后端的实际业务仍在 CPU0 边界处理。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享映射的 futex 身份与引用由 MM 一并解析，具体规则见[调度模块](kernel-scheduler.md#等待与-futex)。
+已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用策略处理私有/共享匿名、ELF、SysV 及 tmpfs/ext4 映射；SysV attachment 和未并行化后端的实际业务仍在 CPU0 边界处理。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈 VMA 随实际向下增长更新，VmSize 不计尚未扩展的最大栈窗口。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享映射的 futex 身份与引用由 MM 一并解析，具体规则见[调度模块](kernel-scheduler.md#等待与-futex)。
 
 ## 驻留文件映射与截断
 
