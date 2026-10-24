@@ -614,14 +614,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->child_usage = leader->child_usage;
         task->group_pending = leader->group_pending;
         task->group_child_info = leader->group_child_info;
-        task->nofile_limit = leader->nofile_limit;
-        task->stack_limit = leader->stack_limit;
-        task->core_limit = leader->core_limit;
-        task->fsize_limit = leader->fsize_limit;
-        task->sigpending_limit=leader->sigpending_limit;
-        task->as_limit = leader->as_limit;
-        task->data_limit = leader->data_limit;
-        task->cpu_limit = leader->cpu_limit;
+        if(task->limits!=leader->limits)__builtin_trap();
         kernel_signal_pending_adopt_locked(task,leader);
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
@@ -816,6 +809,10 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_credentials_clone(parent->files.heap,parent->credentials);
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    child->limits=thread_clone?kernel_resource_limits_get(parent->limits):
+        kernel_resource_limits_create(parent->limits->heap,parent->limits);
+    if(!child->limits)
+        return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     int sem_result=kernel_sem_clone(parent,child,(flags & UINT64_C(0x40000))!=0);
     if (sem_result)
         return finish_clone_failure(child,sem_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
@@ -908,14 +905,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->group_leader = child;
     child->group_members = 1U;
     child->fork_no_exec = 1U;
-    child->nofile_limit = parent->group_leader->nofile_limit;
-    child->stack_limit = parent->group_leader->stack_limit;
-    child->core_limit = parent->group_leader->core_limit;
-    child->fsize_limit = parent->group_leader->fsize_limit;
-    child->sigpending_limit=parent->group_leader->sigpending_limit;
-    child->as_limit = parent->group_leader->as_limit;
-    child->data_limit = parent->group_leader->data_limit;
-    child->cpu_limit = parent->group_leader->cpu_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -1000,7 +989,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                 parent->vfork_wait_child = child;
             }
             child->state = KERNEL_THREAD_STATE_READY;
-            if(!thread_clone && child->cpu_limit.current!=KERNEL_RLIM_INFINITY)
+            if(!thread_clone && child->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY)
                 scheduler_cpu_timer_update_locked(child,0);
             ready_enqueue_locked(child, 0);
         }
@@ -2392,17 +2381,7 @@ enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_
 
 static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint32_t resource)
 {
-    switch (resource) {
-    case KERNEL_RLIMIT_CPU: return &leader->cpu_limit;
-    case KERNEL_RLIMIT_NOFILE: return &leader->nofile_limit;
-    case KERNEL_RLIMIT_STACK: return &leader->stack_limit;
-    case KERNEL_RLIMIT_CORE: return &leader->core_limit;
-    case KERNEL_RLIMIT_FSIZE: return &leader->fsize_limit;
-    case KERNEL_RLIMIT_SIGPENDING: return &leader->sigpending_limit;
-    case KERNEL_RLIMIT_AS: return &leader->as_limit;
-    case KERNEL_RLIMIT_DATA: return &leader->data_limit;
-    default: return NULL;
-    }
+    return resource<KERNEL_RLIMIT_COUNT ? &leader->limits->values[resource] : 0;
 }
 
 enum kernel_task_status kernel_task_get_rlimit(
@@ -2433,10 +2412,7 @@ enum kernel_task_status kernel_task_set_rlimit(
          limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
         (resource == KERNEL_RLIMIT_STACK &&
          limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
-        (resource != KERNEL_RLIMIT_CPU && resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
-         resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE &&
-         resource != KERNEL_RLIMIT_SIGPENDING && resource != KERNEL_RLIMIT_AS &&
-         resource != KERNEL_RLIMIT_DATA))
+        resource >= KERNEL_RLIMIT_COUNT)
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -2458,7 +2434,7 @@ uint64_t kernel_task_current_fsize_limit(void)
     struct kernel_task *task = kernel_task_current();
     if (!kernel_task_has_user_context(task)) return KERNEL_RLIM_INFINITY;
     /* 当前执行owner保持组身份；限额接纳只读软值，不取得整组快照锁。 */
-    return __atomic_load_n(&task->group_leader->fsize_limit.current, __ATOMIC_RELAXED);
+    return __atomic_load_n(&task->limits->values[KERNEL_RLIMIT_FSIZE].current, __ATOMIC_RELAXED);
 }
 
 enum kernel_task_status kernel_task_memory_limits(
@@ -2470,8 +2446,8 @@ enum kernel_task_status kernel_task_memory_limits(
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
         return KERNEL_TASK_STATUS_STATE;
     const struct kernel_task *leader = task->group_leader;
-    *limits = (struct kernel_memory_limits){leader->as_limit.current,
-        leader->data_limit.current, leader->data_limit.maximum};
+    *limits = (struct kernel_memory_limits){leader->limits->values[KERNEL_RLIMIT_AS].current,
+        leader->limits->values[KERNEL_RLIMIT_DATA].current, leader->limits->values[KERNEL_RLIMIT_DATA].maximum};
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2483,21 +2459,16 @@ void kernel_task_current_memory_limits(struct kernel_memory_limits *limits)
     if (!kernel_task_has_user_context(task)) return;
     /* 当前执行者保活组身份；接纳与Linux rlimit读取一样按字段取值。 */
     const struct kernel_task *leader = task->group_leader;
-    limits->address_space = __atomic_load_n(&leader->as_limit.current, __ATOMIC_RELAXED);
-    limits->data_soft = __atomic_load_n(&leader->data_limit.current, __ATOMIC_RELAXED);
-    limits->data_hard = __atomic_load_n(&leader->data_limit.maximum, __ATOMIC_RELAXED);
+    limits->address_space = __atomic_load_n(&leader->limits->values[KERNEL_RLIMIT_AS].current, __ATOMIC_RELAXED);
+    limits->data_soft = __atomic_load_n(&leader->limits->values[KERNEL_RLIMIT_DATA].current, __ATOMIC_RELAXED);
+    limits->data_hard = __atomic_load_n(&leader->limits->values[KERNEL_RLIMIT_DATA].maximum, __ATOMIC_RELAXED);
 }
 
 uint64_t kernel_task_current_stack_limit(void)
 {
     struct kernel_task *task = kernel_task_current();
-    struct kernel_rlimit64 limit;
-
-    if (task == 0 || task->arch.user_mode != 1U)
-        return KERNEL_RLIMIT_STACK_CAP;
-    if (kernel_task_get_rlimit(task, KERNEL_RLIMIT_STACK, &limit) !=
-        KERNEL_TASK_STATUS_OK) __builtin_trap();
-    return limit.current;
+    if (!kernel_task_has_user_context(task)) return KERNEL_RLIMIT_STACK_CAP;
+    return __atomic_load_n(&task->limits->values[KERNEL_RLIMIT_STACK].current,__ATOMIC_RELAXED);
 }
 
 enum kernel_task_status kernel_task_ppid(
@@ -2636,7 +2607,7 @@ enum kernel_task_status kernel_task_files_borrow(
     }
     *files = &task->files;
     task->files.nofile_limit =
-        (uint32_t)__atomic_load_n(&task->group_leader->nofile_limit.current, __ATOMIC_RELAXED);
+        (uint32_t)__atomic_load_n(&task->limits->values[KERNEL_RLIMIT_NOFILE].current, __ATOMIC_RELAXED);
     return KERNEL_TASK_STATUS_OK;
 }
 

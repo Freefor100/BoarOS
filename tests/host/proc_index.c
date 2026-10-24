@@ -11,6 +11,7 @@ _Thread_local uintptr_t sync_test_irq;
 static struct kernel_cpu cpus[2];
 static _Thread_local struct kernel_cpu *active;
 static struct kernel_task tasks[6];
+static struct kernel_resource_limits limits[6];
 static struct kernel_pid ids[7];
 static uint64_t bitmap[2];
 static unsigned all_steps, ancestry_steps;
@@ -116,6 +117,8 @@ static void setup(void)
     scheduler.identities = (struct kernel_pid_registry){.numbers = &scheduler.pid_allocator, .next_generation = 1};
     for (unsigned i = 0; i < 6; i++) {
         struct kernel_task *task = &tasks[i];
+        task->limits=&limits[i];
+        limits[i].values[KERNEL_RLIMIT_RSS].current=UINT64_MAX;
         task->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1);
         assert(task->exec_security);
         assert(kernel_pid_publish(&scheduler.identities, &ids[i]) == KERNEL_PID_STATUS_OK);
@@ -129,6 +132,7 @@ static void setup(void)
     }
     /* Task 3 is a member of task 2; task 4 is outside init's ancestry. */
     kernel_pid_detach(&tasks[2].identities[KERNEL_PID_TGID]);
+    tasks[2].limits=tasks[1].limits;
     tasks[2].group_leader = &tasks[1]; tasks[2].parent = 0;
     tasks[1].group_next = tasks[1].group_previous = &tasks[2];
     tasks[2].group_next = tasks[2].group_previous = &tasks[1];

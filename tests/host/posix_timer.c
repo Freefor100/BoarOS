@@ -78,11 +78,13 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
 {assert(token->task==&task&&!kernel_cpu_current()->raw_locks&&!task.cpu_sleep);*token=(struct kernel_wait_token){0};return 0;}
 static uint64_t count(void){KERNEL_RAW_SCOPE(g,&kernel_wait_domain);return kernel_signal_pending_count_locked(&task);}
+static struct kernel_resource_limits limits;
 static void init(void)
 {
     task=(struct kernel_task){0};task.group_leader=&task;task.group_members=1;task.files.heap=&heap;
-    task.cpu_limit=(struct kernel_rlimit64){KERNEL_RLIM_INFINITY,KERNEL_RLIM_INFINITY};
-    task.sigpending_limit=(struct kernel_rlimit64){4096,4096};task.tid=1;
+    task.limits=&limits;
+    limits.values[KERNEL_RLIMIT_CPU]=(struct kernel_rlimit64){KERNEL_RLIM_INFINITY,KERNEL_RLIM_INFINITY};
+    task.limits->values[KERNEL_RLIMIT_SIGPENDING]=(struct kernel_rlimit64){4096,4096};task.tid=1;
     pid=(struct kernel_pid){.number=1,.references=1,.generation=1};
     for(unsigned r=0;r<2;r++){members[r]=(struct kernel_pid_member){.identity=&pid,.role=r,.task=&task};pid.members[r]=&members[r];}
     ignored=allocation_fail=cpu_samples=0;cpu_user=cpu_kernel=0;now_ns=1000000000;
@@ -112,7 +114,7 @@ static void reservation_and_mixed(void)
     struct signal_pending_prepared p={0};struct kernel_signal_wait_info info={.signal=10,.code=0,.sender=42};
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&task,&info,0,&p));}
     signal_pending_finish(&p);assert(count()==3);
-    task.sigpending_limit.current=0;allocation_fail=1;unsigned allocations=allocation_calls;
+    task.limits->values[KERNEL_RLIMIT_SIGPENDING].current=0;allocation_fail=1;unsigned allocations=allocation_calls;
     arm(a,now_ns+100,0);arm(b,now_ns+200,0);expire(now_ns+200);
     assert(allocation_calls==allocations);allocation_fail=0;
     assert(take(10).sender==42&&count()==2);

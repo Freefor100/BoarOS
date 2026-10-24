@@ -38,6 +38,7 @@ struct kernel_proc_process_snapshot {
     uint64_t child_major_faults;
     uint64_t virtual_bytes;
     uint64_t resident_pages;
+    uint64_t rss_limit;
     uint64_t start_code, end_code, start_stack;
     uint64_t signal_pending, signal_shared_pending, signal_blocked, signal_ignored, signal_caught;
     uint64_t signal_queued, signal_queue_limit;

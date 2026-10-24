@@ -1336,13 +1336,13 @@ unsigned signal_cpu_timer_check_locked(struct kernel_task *leader,const struct k
         leader->cpu_timers[i].expires=interval?timer_add(expires,interval):0;
         fired|=1U<<i;
     }
-    uint64_t soft=leader->cpu_limit.current,hard=leader->cpu_limit.maximum;
+    uint64_t soft=leader->limits->values[KERNEL_RLIMIT_CPU].current,hard=leader->limits->values[KERNEL_RLIMIT_CPU].maximum;
     if(soft!=KERNEL_RLIM_INFINITY) {
         /* RLIMIT_CPU和itimers共用本次整组PROF样本；硬限制先于软信号。 */
         if(hard!=KERNEL_RLIM_INFINITY && samples[1]>=hard*UINT64_C(1000000000))
             return 8U;
         if(samples[1]>=soft*UINT64_C(1000000000)) {
-            __atomic_store_n(&leader->cpu_limit.current,soft+1,__ATOMIC_RELAXED);
+            __atomic_store_n(&leader->limits->values[KERNEL_RLIMIT_CPU].current,soft+1,__ATOMIC_RELAXED);
             fired|=4U;
         }
     }

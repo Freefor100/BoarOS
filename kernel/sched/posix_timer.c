@@ -62,7 +62,7 @@ void scheduler_cpu_timer_update_locked(struct kernel_task *task,unsigned thread)
     struct kernel_cpu_timer_index *index=&task->cpu_timer_index[thread];
     int active=index->timers[0]||index->timers[1]||index->timers[2]||
         (!thread&&(task->cpu_timers[0].expires||task->cpu_timers[1].expires||
-                   task->cpu_limit.current!=KERNEL_RLIM_INFINITY));
+                   task->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY));
     active=active&&cpu_target_live(task,thread);
     struct kernel_pid *identity=active?process_identity(task,thread?KERNEL_PID_TID:KERNEL_PID_TGID):0;
     uint64_t key=identity?identity->generation*2+thread:0;

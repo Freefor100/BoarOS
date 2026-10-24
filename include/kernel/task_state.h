@@ -201,8 +201,9 @@ struct kernel_task {
     uint32_t fork_no_exec;
     uint32_t session_leader;
     uint32_t group_stopped;
-    struct kernel_rlimit64 nofile_limit;
-    struct kernel_rlimit64 stack_limit;
+    struct kernel_resource_limits *limits;
+    uint64_t rttime_ticks, rttime_stamp;
+    uint32_t resource_flags;
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
@@ -236,11 +237,8 @@ struct kernel_task {
 #endif
     /* 稀用的进程CPU定时器状态置尾，保持普通信号返回路径的原有字段布局。 */
     struct { uint64_t expires, interval; } cpu_timers[2];
-    struct kernel_rlimit64 core_limit;
-    struct kernel_rlimit64 fsize_limit;
     struct kernel_signal_stack signal_stack;
     struct kernel_signal_pending_state signal_queue, group_queue;
-    struct kernel_rlimit64 sigpending_limit;
     uint64_t signal_child_times[2], group_child_times[2];
     struct kernel_posix_timer_registry *posix_timers;
     struct kernel_cpu_timer_index cpu_timer_index[2];
@@ -251,9 +249,7 @@ struct kernel_task {
     struct kernel_socket_call *socket_call;
     struct kernel_sem_undo *sem_undo;
     struct kernel_sem_request *sem_request;
-    struct kernel_rlimit64 as_limit, data_limit;
     struct kernel_msg_request *msg_request;
-    struct kernel_rlimit64 cpu_limit;
     struct kernel_posix_cpu_sleep *cpu_sleep;
 } __attribute__((aligned(16)));
 

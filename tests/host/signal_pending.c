@@ -29,8 +29,10 @@ void posix_timer_record_clear_locked(struct signal_queue_record *r,int ignored,s
 {(void)r;(void)ignored;(void)p;abort();}
 void posix_timer_record_complete(struct signal_queue_record *r){(void)r;abort();}
 void posix_timer_record_free(struct signal_queue_record *r){(void)r;abort();}
+static struct kernel_resource_limits limits[2];
+static unsigned next_limits;
 static void init(struct kernel_task *t)
-{*t=(struct kernel_task){0};t->group_leader=t;t->group_members=1;t->files.heap=&heap;t->sigpending_limit=(struct kernel_rlimit64){4096,4096};}
+{*t=(struct kernel_task){0};t->group_leader=t;t->group_members=1;t->files.heap=&heap;assert(next_limits<2);t->limits=&limits[next_limits++];t->limits->values[KERNEL_RLIMIT_SIGPENDING]=(struct kernel_rlimit64){4096,4096};}
 static uint64_t count(void)
 {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);return kernel_credentials_initial()->account->pending;}
 static int post_to(struct kernel_task *t,int shared,const struct kernel_task *target,unsigned sig,int code,uint64_t value,int supplied)
@@ -76,18 +78,18 @@ int main(void)
     struct kernel_signal_wait_info expected={.signal=10,.sender=42};
     struct kernel_signal_wait_info info=take(&a,0,10);
     assert(!memcmp(&info,&expected,sizeof(info)) && !count());
-    a.sigpending_limit.current=2;
+    a.limits->values[KERNEL_RLIMIT_SIGPENDING].current=2;
     assert(!post(&a,1,36,-1,UINT64_C(0x1234567887654321),1));
     assert(!post(&a,1,36,-1,2,1));
-    b.sigpending_limit.current=2;
+    b.limits->values[KERNEL_RLIMIT_SIGPENDING].current=2;
     assert(post(&b,0,36,-1,3,1)==-KERNEL_EAGAIN && count()==2);
-    a.sigpending_limit.current=0;
+    a.limits->values[KERNEL_RLIMIT_SIGPENDING].current=0;
     assert(take(&a,1,36).value==UINT64_C(0x1234567887654321));
     assert(take(&a,1,36).value==2 && !count());
     assert(!post(&a,0,10,-6,0,0));
     info=take(&a,0,10);assert(!info.code && !info.sender && !count());
     assert(!post(&a,0,10,0,0,0) && count()==1);assert(take(&a,0,10).sender==42 && !count());
-    a.sigpending_limit.current=4096;fail=1;
+    a.limits->values[KERNEL_RLIMIT_SIGPENDING].current=4096;fail=1;
     assert(post(&b,0,36,-1,3,1)==-KERNEL_EAGAIN && !count());
     assert(!post(&b,0,36,0,0,0));info=take(&b,0,36);assert(!info.sender && !count());fail=0;
     assert(!pthread_barrier_init(&ready,0,2));pthread_t workers[2];struct sender senders[2]={{&a,1},{&a,2}};
@@ -106,7 +108,7 @@ int main(void)
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);b.group_pending=a.group_pending;kernel_signal_pending_adopt_locked(&b,&a);}
     kernel_signal_pending_cleanup(&a);assert(count()==1);assert(take(&b,1,36).value==7 && !count());
     assert(!post(&b,0,37,-1,9,1));kernel_signal_pending_cleanup(&b);assert(!count() && !live);
-    b.sigpending_limit.current=1;
+    b.limits->values[KERNEL_RLIMIT_SIGPENDING].current=1;
     struct kernel_uid_account *reservation=0;
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_reserve_locked(&b,&reservation));}
     assert(count()==1&&post(&a,0,36,-1,1,1)==0);
@@ -133,7 +135,7 @@ int main(void)
     assert(take(&a,1,10).sender==42&&!count()&&user.account->pending==1);
     b.credentials=kernel_credentials_initial();
     assert(take(&a,1,12).sender==42&&!user.account->pending);
-    b.credentials=&user;a.sigpending_limit.current=1;
+    b.credentials=&user;a.limits->values[KERNEL_RLIMIT_SIGPENDING].current=1;
     assert(!post_to(&a,1,&b,36,-1,13,1)&&!count()&&user.account->pending==1);
     assert(post_to(&a,1,&b,36,-1,14,1)==-KERNEL_EAGAIN);
     assert(!post_to(&a,1,&a,36,-1,15,1)&&count()==1);

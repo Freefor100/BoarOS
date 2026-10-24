@@ -65,7 +65,7 @@ void signal_pending_prepare(struct kernel_task *t,int shared,const struct kernel
 int signal_pending_reserve_locked(const struct kernel_task *task,struct kernel_uid_account **owner)
 {
     struct kernel_uid_account *account=kernel_credentials_task_locked(task)->account;
-    if(account->pending>=task->group_leader->sigpending_limit.current)return -KERNEL_EAGAIN;
+    if(account->pending>=task->limits->values[KERNEL_RLIMIT_SIGPENDING].current)return -KERNEL_EAGAIN;
     if(account->pending==UINT64_MAX)__builtin_trap();
     account->pending++;*owner=kernel_uid_account_get_locked(account);return 0;
 }
@@ -102,7 +102,7 @@ int signal_pending_post_locked(struct kernel_task *t,int shared,const struct ker
     if(sig<32 && (*pending&bit))return 1;
     int override=sig<32 && info->code>=0;
     struct kernel_uid_account *account=kernel_credentials_task_locked(charge_target)->account;
-    int quota=override || account->pending<t->group_leader->sigpending_limit.current;
+    int quota=override || account->pending<t->group_leader->limits->values[KERNEL_RLIMIT_SIGPENDING].current;
     int wants_record=signal_pending_needs_record_locked(t,shared,charge_target,info,supplied);
     int available=quota && (!wants_record || (p->record && (s->queue || p->index)));
     if(!available && sig>=32 && info->code!=0 && !(info->code==128 && !supplied))

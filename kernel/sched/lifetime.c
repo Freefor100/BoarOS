@@ -205,6 +205,8 @@ void scheduler_task_collect(void)
 #endif
         }
         /* No rank40 lock may be held while the allocator consumes the page. */
+        kernel_resource_limits_put(task->limits);
+        task->limits = 0;
         kernel_credentials_put(task->credentials);
         task->credentials = 0;
         kernel_exec_security_put(task->exec_security);

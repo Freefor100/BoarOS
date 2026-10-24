@@ -151,6 +151,8 @@ static void selected_payloads(struct kernel_task *task,struct kernel_signal_tabl
 void signal_owner_cases(unsigned *lock_calls)
 {
     struct kernel_task leader = {0}, member = {0};
+    struct kernel_resource_limits limits={0};
+    leader.limits=member.limits=&limits;
     leader.magic = member.magic = KERNEL_THREAD_MAGIC;
     leader.arch.user_mode = member.arch.user_mode = 1;
     leader.state = member.state = KERNEL_THREAD_STATE_READY;
