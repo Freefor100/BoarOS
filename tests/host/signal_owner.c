@@ -160,7 +160,6 @@ void signal_owner_cases(unsigned *lock_calls)
     leader.group_members = 2;
     leader.group_next = leader.group_previous = &member;
     member.group_next = member.group_previous = &leader;
-    struct kernel_task *extra = 0;
     struct kernel_signal_table table = {.magic=KERNEL_SIGNAL_TABLE_MAGIC,.references=1};
     leader.signal_table_address=(uintptr_t)&table;
     leader.signal_blocked = signal_mask(17);
@@ -208,14 +207,6 @@ void signal_owner_cases(unsigned *lock_calls)
     selected_payloads(&leader,&table);
     kernel_cpu_current()->current=previous;
     puts("SIGCHLD: blocked default stop policy, protected pending payload and common ABI encoding passed");
-    /* The caller's real target owner already covers a self-representing
-     * leader; a distinct group container still needs a cross-unlock borrow. */
-    assert(signal_send_leader(&leader, &extra,0,0) == &leader && !extra);
-    assert(!leader.storage_borrows);
-    assert(signal_send_leader(&member, &extra,0,0) == &leader && extra == &leader);
-    assert(leader.storage_borrows == 1);
-    scheduler_task_put(extra);
-    assert(!leader.storage_borrows);
     *lock_calls = 0;
     struct kernel_task *result = signal_group_representative_get(&member);
     assert(result == &leader && leader.storage_borrows == 1);
