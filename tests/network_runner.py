@@ -192,7 +192,7 @@ def sysv_sem_output(raw,cpus):
 MSG_CASES=('native64-libc-raw','key-generation-exclusive','fifo-equal-except-negative-long-min',
     'e2big-preserves-noerror-consumes','byte-and-zero-message-count-capacity',
     'stat-info-index-native-command','copy-ordinal-errors-and-no-mutation',
-    'send-import-copy-prepare-receive-consumed-fault','fork-blocking-bidirectional-content',
+    'send-import-copy-prepare-receive-consumed-fault','numeric-uid-permissions-and-stat-any','fork-blocking-bidirectional-content',
     'signal-no-restart','actual-caller-cpus')
 def sysv_msg_output(raw,cpus):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('SYSV-MSG ')]
@@ -200,7 +200,7 @@ def sysv_msg_output(raw,cpus):
     for name in MSG_CASES:
         if name=='actual-caller-cpus':expected += [f'SYSV-MSG CPU index={cpu} affinity={cpu} send=1 receive=1 PASS' for cpu in range(cpus)]
         expected.append(f'SYSV-MSG CASE {name} PASS')
-    return lines==expected+['SYSV-MSG RESOURCE queues=0 messages=0 bytes=0','SYSV-MSG END 11']
+    return lines==expected+['SYSV-MSG RESOURCE queues=0 messages=0 bytes=0','SYSV-MSG END 12']
 
 MEMORY_CASES=('as-map','as-fixed','data-private','data-zero','data-fixed','protect-prefix',
     'protect-hole','remap-growth','remap-fixed','brk-same-page','shm-as','stack-initial',
@@ -352,7 +352,9 @@ def run_smp(args):
                     if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_seqpacket:passed=unix_seqpacket_output(raw,args.performance,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if sysv_msg:passed=sysv_msg_output(raw,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
-                    if memory_workload:passed=memory_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if memory_workload:
+                        online=[int(v) for v in re.findall(r'^BoarOS: SMP online logical=(\d+) hart=0x[0-9a-f]+\r?$',raw,re.M)]
+                        passed=memory_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0) and online==list(range(1,cpus)))
                     if sysv_sem:passed=sysv_sem_output(raw,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None

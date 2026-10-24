@@ -35,6 +35,6 @@ python3 tests/network_runner.py --workload sysv_msg --only boaros --cpus 4 --mem
 
 宿主用真实消息队列、raw lock 和等待代码，在 4/16KiB 页配置下运行 ASan/UBSan。明确的线程握手检查容量等待、两个接收者之间的 `E2BIG` 继续交付、权限变化、删除、通知、消息导入快照、强制弃栈，以及输出期间删除时的消息引用；分配失败检查请求和正文归还，配额检查全部 32000 个队列。每组结束检查消息数、字节数、队列数、任务请求、等待借用、PID 引用和分配数全部归还。
 
-`tests/workloads/network/sysv_msg.c` 检查 libc 与原生系统调用、选择顺序、零长度容量、控制布局与命令、完整 `MSG_COPY`、输入输出错误、进程间交换、信号及每个允许 CPU 上的实际调用。Linux 对照与 BoarOS 运行结果由 runner 分别记录。
+`tests/workloads/network/sysv_msg.c` 检查 libc 与原生系统调用、选择顺序、零长度容量、控制布局与命令、完整 `MSG_COPY`、输入输出错误、进程间交换、信号及每个允许 CPU 上的实际调用。数字 UID/GID 1001 的子进程通过管道握手，分别检查 0600 拒绝、0666 允许收发、管理操作仍拒绝及 `MSG_STAT_ANY` 的权限例外，不依赖用户数据库。Linux 对照与 BoarOS 运行结果由 runner 分别记录。
 
 当前不提供 IPC namespace、运行时 sysctl 和 `/proc/sysvipc/msg`。消息队列使用 `msgctl` 的索引枚举和统计接口。

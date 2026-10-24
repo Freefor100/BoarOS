@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <grp.h>
 #include <limits.h>
 #include <sched.h>
 #include <signal.h>
@@ -247,6 +248,63 @@ static void childwait(pid_t p)
     int s;
     CHECK(waitpid(p, &s, 0) == p && WIFEXITED(s) && !WEXITSTATUS(s));
 }
+static void numeric_permissions(void)
+{
+    CHECK(getuid() == 0 && geteuid() == 0);
+    int q = queue(), index = -1;
+    struct msqid_ds d = statq(q), entry;
+    struct msginfo info;
+    int hi = msgctl(0, IPC_INFO, (void *)&info);
+    CHECK(hi >= 0);
+    for (int i = 0; i <= hi; i++)
+        if (msgctl(i, MSG_STAT_ANY, &entry) == q) {
+            index = i;
+            break;
+        }
+    CHECK(index >= 0 && d.msg_perm.uid == 0);
+    int ready[2], proceed[2];
+    CHECK(!pipe(ready) && !pipe(proceed));
+    pid_t p = fork();
+    CHECK(p >= 0);
+    if (!p) {
+        CHECK(!close(ready[0]) && !close(proceed[1]));
+        CHECK(!setgroups(0, 0) && !setgid(1001) && !setuid(1001));
+        CHECK(getuid() == 1001 && geteuid() == 1001 && getgid() == 1001 &&
+              getegid() == 1001);
+        struct message m = {.type = 101, .text = "numeric-user"};
+        ERROR(msgsnd(q, &m, 12, IPC_NOWAIT), EACCES);
+        ERROR(msgrcv(q, &m, sizeof(m.text), 0, IPC_NOWAIT), EACCES);
+        ERROR(msgctl(q, IPC_STAT, &entry), EACCES);
+        ERROR(msgctl(q, IPC_SET, &d), EPERM);
+        ERROR(msgctl(q, IPC_RMID, 0), EPERM);
+        CHECK(msgctl(index, MSG_STAT_ANY, &entry) == q && entry.msg_perm.uid == 0 &&
+              (entry.msg_perm.mode & 0777) == 0600);
+        char token = 'r';
+        CHECK(write(ready[1], &token, 1) == 1);
+        CHECK(read(proceed[0], &token, 1) == 1 && token == 'p');
+        sendmsg(q, 101, "numeric-user");
+        recvmsg(q, 0, IPC_NOWAIT, 101, "numeric-user");
+        CHECK(!msgctl(q, IPC_STAT, &entry) && entry.msg_perm.uid == 0 &&
+              (entry.msg_perm.mode & 0777) == 0666);
+        ERROR(msgctl(q, IPC_SET, &d), EPERM);
+        ERROR(msgctl(q, IPC_RMID, 0), EPERM);
+        CHECK(!close(ready[1]) && !close(proceed[0]));
+        _exit(0);
+    }
+    CHECK(!close(ready[1]) && !close(proceed[0]));
+    char token;
+    CHECK(read(ready[0], &token, 1) == 1 && token == 'r');
+    CHECK(!statq(q).msg_qnum);
+    d.msg_perm.mode = 0666;
+    CHECK(!msgctl(q, IPC_SET, &d));
+    token = 'p';
+    CHECK(write(proceed[1], &token, 1) == 1);
+    CHECK(!close(ready[0]) && !close(proceed[1]));
+    childwait(p);
+    CHECK(!statq(q).msg_qnum);
+    removeq(q);
+    pass("numeric-uid-permissions-and-stat-any");
+}
 static void process_exchange(void)
 {
     int q = queue();
@@ -322,6 +380,7 @@ int main(void)
     metadata();
     copying();
     faults();
+    numeric_permissions();
     process_exchange();
     signal_wait();
     caller_cpus();
