@@ -52,6 +52,8 @@ uint64_t kernel_wait_backend_time(void);
 void kernel_wait_backend_commit(struct kernel_task *, uint64_t, int);
 void kernel_wait_backend_notify(struct kernel_task *, uint32_t);
 void kernel_wait_backend_ready(struct kernel_task *);
+/* Success returns on this task's CPU after notification and scheduler handoff.
+ * Its NOTIFIED reason is stable until the current owner finishes the token. */
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *);
 void kernel_wait_backend_quiesce(void);
 #endif
