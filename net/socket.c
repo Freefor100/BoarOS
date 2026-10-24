@@ -1932,6 +1932,37 @@ static int unix_reserve_packet(struct kernel_socket_write_request *request,uint3
         if(result)return result;
     }
 }
+/* Publication has no user access. Keep its state guard off the stack while
+ * a payload copy may recurse through an ELF/page-cache/block read fault. */
+static __attribute__((noinline)) int unix_publish_packet(
+    struct kernel_socket_write_request *request,uint32_t count)
+{
+    struct socket_packet *packet=request->packet;
+    int result;
+    SOCKET_STATE(endpoint);
+    struct kernel_socket *peer=request->unix_destination;
+    if(!peer || peer->destroying || request->socket->write_closed || peer->read_closed) {
+        result=request->socket->type==SOCKET_DGRAM && peer && peer->destroying?-KERNEL_ECONNREFUSED:-KERNEL_EPIPE;
+    } else if(request->socket->type==SOCKET_DGRAM && peer->peer && peer->peer!=request->socket) {
+        result=-KERNEL_EPERM;
+    } else {
+        uint32_t charge=request->reserved;
+        if(!charge || request->socket->tx_reserved<charge)__builtin_trap();
+        request->socket->tx_reserved-=charge;request->reserved=0;
+        if(request->socket->type==SOCKET_DGRAM) {
+            if(!peer->unix_reserved)__builtin_trap();
+            peer->unix_reserved--;peer->unix_queued++;
+            if(request->socket->unix_name)unix_export_locked(request->socket->unix_name,&packet->address);
+        }
+        unix_publish_owner(request->socket,packet,charge);
+        if(peer->packets_tail)peer->packets_tail->next=packet;else peer->packets_head=packet;
+        peer->packets_tail=packet;
+        uint32_t payload=count ? (uint32_t)count : 1U;
+        if(peer->rx_bytes>UINT32_MAX-payload)__builtin_trap();
+        peer->rx_bytes+=payload;request->packet=0;wake_socket(peer);result=(int)count;
+    }
+    return result;}
+
 static int socket_write_packet_source(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
     uint64_t count, uint32_t flags,
@@ -2013,29 +2044,8 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
     if(request.socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
         result=protocol_request(&request,SOCKET_PROTOCOL_UDP_SEND);goto out;
     }
-    SOCKET_STATE(endpoint);
-    struct kernel_socket *peer=request.unix_destination;
-    if(!peer || peer->destroying || request.socket->write_closed || peer->read_closed) {
-        result=request.socket->type==SOCKET_DGRAM && peer && peer->destroying?-KERNEL_ECONNREFUSED:-KERNEL_EPIPE;
-    } else if(request.socket->type==SOCKET_DGRAM && peer->peer && peer->peer!=request.socket) {
-        result=-KERNEL_EPERM;
-    } else {
-        uint32_t charge=request.reserved;
-        if(!charge || request.socket->tx_reserved<charge)__builtin_trap();
-        request.socket->tx_reserved-=charge;request.reserved=0;
-        if(request.socket->type==SOCKET_DGRAM) {
-            if(!peer->unix_reserved)__builtin_trap();
-            peer->unix_reserved--;peer->unix_queued++;
-            if(request.socket->unix_name)unix_export_locked(request.socket->unix_name,&packet->address);
-        }
-        unix_publish_owner(request.socket,packet,charge);
-        if(peer->packets_tail)peer->packets_tail->next=packet;else peer->packets_head=packet;
-        peer->packets_tail=packet;
-        uint32_t payload=count ? (uint32_t)count : 1U;
-        if(peer->rx_bytes>UINT32_MAX-payload)__builtin_trap();
-        peer->rx_bytes+=payload;request.packet=0;wake_socket(peer);result=(int)count;
-    }
-    socket_state_release(&endpoint);
+    result=unix_publish_packet(&request,(uint32_t)count);
+
 out:
     clear_write_request(&request);
     *pin_owner = request.pin;

@@ -23,6 +23,10 @@
 #include <time.h>
 #include <unistd.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"UNIX-NAMED FAIL line=%d %s errno=%d\n",__LINE__,#x,errno); _exit(1); } } while (0)
+/* Separate file pages keep this check deterministic: the syscall first reads
+ * each page when it copies the first byte, including with 16-KiB guest pages. */
+_Alignas(16384) static const unsigned char cold_elf_send[16384] = {0x6b};
+_Alignas(16384) static unsigned char cold_elf_receive[16384] = {0x3a};
 #define OFFSET offsetof(struct sockaddr_un,sun_path)
 static unsigned cpu_ids[4],cpus;
 struct address { struct sockaddr_un un; socklen_t len; };
@@ -101,12 +105,23 @@ static void credentials_dac(void)
     }
     puts("UNIX-NAMED CASE credentials-snapshots-dac PASS");
 }
+/* Isolated initialized ELF pages enter the kernel without a user pre-touch. */
+static const unsigned char cold_send[16384] __attribute__((aligned(16384)))={0x6b};
+static unsigned char cold_receive[16384] __attribute__((aligned(16384)))={0x45};
 static void faults(void)
 {
+    int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+    CHECK(send(pair[0],cold_send,1,MSG_NOSIGNAL)==1);
+    CHECK(recv(pair[1],cold_receive,1,0)==1 && cold_receive[0]==0x6b);
+    CHECK(!close(pair[0]) && !close(pair[1]));
     size_t page=(size_t)sysconf(_SC_PAGESIZE);void *bad=mmap(0,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(bad!=MAP_FAILED);
     struct address a=path("fault");int fd=socket_at(SOCK_DGRAM,0);CHECK(bind(fd,bad,a.len)==-1 && errno==EFAULT);struct stat st;CHECK(lstat("fault",&st)==-1 && errno==ENOENT);CHECK(!bind(fd,(void *)&a.un,a.len));
     int sender=socket_at(SOCK_DGRAM,0);CHECK(sendto(sender,bad,1,0,(void *)&a.un,a.len)==-1 && errno==EFAULT);char byte;CHECK(recv(fd,&byte,1,MSG_DONTWAIT)==-1 && errno==EAGAIN);
     CHECK(connect(sender,bad,a.len)==-1 && errno==EFAULT);CHECK(send(sender,"x",1,MSG_NOSIGNAL)==-1 && errno==ENOTCONN);
+    int cold[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,cold));
+    CHECK(send(cold[0],cold_elf_send,1,MSG_NOSIGNAL)==1);
+    CHECK(recv(cold[1],cold_elf_receive,1,0)==1 && cold_elf_receive[0]==0x6b);
+    CHECK(!close(cold[0]) && !close(cold[1]));
     CHECK(!close(sender) && !close(fd) && !unlink("fault") && !munmap(bad,page));puts("UNIX-NAMED CASE fault-no-sideeffects PASS");
 }
 static void wait_sleep(uint64_t *tid)
