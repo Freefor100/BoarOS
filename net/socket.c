@@ -618,7 +618,10 @@ static void unix_space_notify(struct kernel_wait_node *node,uint32_t reason)
 }
 static void unix_watch_peer_locked(struct kernel_socket *socket)
 {
-    if(socket->type==SOCKET_DGRAM && socket->peer) {
+    /* Reciprocal/self connections are exempt from the destination queue limit.
+     * Their sender-budget changes already notify the owning endpoint. */
+    if(socket->type==SOCKET_DGRAM && socket->peer && socket->peer!=socket &&
+       socket->peer->peer!=socket) {
         kernel_wait_node_init_callback(&socket->unix_space,unix_space_notify,socket);
         kernel_wait_queue_add(&socket->peer->wait,&socket->unix_space);
     }
@@ -1331,9 +1334,17 @@ static int unix_connect(struct kernel_socket *socket,const struct kernel_socket_
         }
         if(result) {unix_put(target);return result;}
         unix_unwatch_peer(socket);
+        /* Becoming reciprocal removes the target's former queue-space
+         * subscription. Control owns topology; finish old callback borrows
+         * outside the endpoint lock before publishing the new relation. */
+        if(target && target!=socket && target->peer==socket)unix_unwatch_peer(target);
         SOCKET_STATE(state);
         struct kernel_socket *old=unix_take_peer_locked(socket);
         if(target) {unix_link_peer_locked(socket,target);unix_watch_peer_locked(socket);target->connected=1;}
+        int notify_old=old && old!=target && old!=socket && old->peer==socket;
+        int notify_target=target && target!=socket && target->peer==socket;
+        if(notify_old)unix_watch_peer_locked(old);
+        if(notify_target)target->unix_space_wait=0;
         struct socket_packet *discard=NULL;
         if(old && old!=target) {
             if(socket->read_request) {
@@ -1344,11 +1355,17 @@ static int unix_connect(struct kernel_socket *socket,const struct kernel_socket_
                 discard=socket->packets_head;socket->packets_head=socket->packets_tail=NULL;
                 socket->rx_bytes=socket->unix_queued=0;
             }
-            if(discard && !old->destroying && old->peer==socket) {old->pending_error=-KERNEL_ECONNRESET;wake_socket(old);}
+            if(discard && !old->destroying && old->peer==socket)old->pending_error=-KERNEL_ECONNRESET;
         }
         socket->connected=target!=NULL;socket->peer_closed=0;socket->pending_error=0;
         wake_socket(socket);
         socket_state_release(&state);
+        /* Each notification guard holds at most two queues. The peer refs
+         * above survive this separate delivery of changed queue eligibility. */
+        { SOCKET_STATE(changed);
+          if(notify_old && !old->destroying)wake_socket(old);
+          if(notify_target && !target->destroying)wake_socket(target);
+        }
         while(discard) {struct socket_packet *next=discard->next;unix_uncharge(discard);kernel_heap_release(socket->heap,discard);discard=next;}
         unix_put(old);unix_put(target);return 0;
     }
@@ -1574,6 +1591,8 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
 /* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
 static int socket_receive_empty(const struct kernel_socket *socket, int nonblocking)
 {
+    if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX && socket->type == SOCKET_STREAM &&
+        !socket->connected) return -KERNEL_EINVAL;
     if (socket->pending_error) return socket->pending_error;
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && network_stopping) return -KERNEL_EIO;
     if (socket->type == SOCKET_DGRAM && socket->read_closed && nonblocking)
@@ -1616,7 +1635,10 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
         __builtin_trap();
     socket_state_acquire(&old_status);
     if(socket->domain==KERNEL_SOCKET_DOMAIN_INET && network_stopping)return -KERNEL_EIO;
-    if (socket->listening) { socket_state_release(&old_status); return -KERNEL_ENOTCONN; }
+    if (socket->listening) {
+        socket_state_release(&old_status);
+        return socket->domain==KERNEL_SOCKET_DOMAIN_UNIX?-KERNEL_EINVAL:-KERNEL_ENOTCONN;
+    }
     if (socket->read_request != 0) {
         socket_state_release(&old_status);
         return -KERNEL_EAGAIN;
@@ -1774,7 +1796,7 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         if(!socket->unix_queued)__builtin_trap();
         socket->unix_queued--;
     }
-    if (charge && socket->peer) wake_socket(socket->peer);
+    if(charge && socket->type==SOCKET_STREAM && socket->peer)wake_socket(socket->peer);
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
         if (socket->receive_credit > UINT32_MAX - bytes) __builtin_trap();
         if (!request->datagram) socket->receive_credit += bytes;
