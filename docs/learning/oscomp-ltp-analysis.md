@@ -670,3 +670,18 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 本子集合计62条 TPASS、4条 TBROK，无超时；原 judge 合计**4分**，全部来自 `recvmsg02` 的4/4个Summary分项；四次 `sendmsg01` 各为0分。这与八次程序是否正常完成分别记录。两架构 PID 1 均正常退出、heap-live=0，根盘及第二盘分区合计八项检查均为0。原始串口、judge、内核／QEMU／输入身份和磁盘结果集中保存在 `build/unix-scm-20261024/original-final-stage/original/`；该定向结果不更新整套 LTP 总分。
 
 空路径与空图整理后的默认交付内核另经短消费者核对：原RV glibc命名UNIX ELF为7/7组，RV glibc及LA musl控制消息消费者各23/23组；最终heap-live和磁盘检查均为0。RV两项栈余量分别1584／1264字节。该检查使用固定官方容器默认 `make all` 的内核，原LTP得分仍对应上表的17:16版本；功能身份见`build/unix-scm-20261024/optimized/{compat-default-delivery.json,compat-short,compat-control,compat-la-control}/`。
+
+## UNIX SEQPACKET 接入后的 socket 原程序结果
+
+2026年10月24日，UNIX SEQPACKET 实现接入后，在固定官方容器和原 QEMU 参数下定向执行原 `socket01`、`socketpair01`，保留原 ELF、空参数和原 judge。下表来自 `build/unix-seqpacket-20261024/original/results.json`；耗时为程序执行段，不含客机启动和磁盘检查。
+
+| 配置 | socket01 得分 | 退出码 | 耗时（毫秒） | socketpair01 得分 | 退出码 | 耗时（毫秒） |
+|---|---:|---:|---:|---:|---:|---:|
+| RV / glibc | 9/9 | 0 | 147 | 6/10 | 1 | 73 |
+| RV / musl | 9/9 | 0 | 86 | 6/10 | 1 | 63 |
+| LA / glibc | 9/9 | 0 | 115 | 6/10 | 1 | 64 |
+| LA / musl | 9/9 | 0 | 63 | 6/10 | 1 | 65 |
+
+四配置合计60条 TPASS、16条 TFAIL，无 TBROK、TCONF 或超时。`socketpair01` 每次失败均为四项错误分类：一项期望 EAFNOSUPPORT(97)、三项期望 EPROTONOSUPPORT(93)，实际均为 EOPNOTSUPP(95)。这是内核已有的非 UNIX family 检查顺序缺口，不能归为测试环境问题；源码依据及其与本轮实跑的区别见[统一问题记录](oscomp-test-issues.md#socketpair01非-unix-family-在创建检查前返回-eopnotsupp)。
+
+两架构的 PID 1 均以0退出、heap-live=0，根盘及第二盘分区共八项磁盘检查均为0，记录在同目录 `disk-checks.json`；原始串口、原 judge、输入与内核身份一并保留。该子集只记录上述原程序实际检查，不更新整套 LTP 总分。另行通过的29组 SEQ 用户入口、固定 Linux 差分和各 CPU 完成标记用于补充 SEQ 记录与控制消息行为，不能据此声称这两个原 LTP 程序覆盖了 SEQPACKET。

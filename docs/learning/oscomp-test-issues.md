@@ -123,6 +123,16 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 | RV 原 musl 的浮点 ABI 标注 | 原测例标注double-float ABI，原libc标注soft-float；设置`LTP_TIMEOUT_MUL=0.1`时观察到异常巨大时限。 | 信号等待的正式复核沿用未设置该变量的默认30秒；该原输入差异独立于EINTR重试，保留在定向运行记录。 |
 | libc-test 的部分共同失败 | 固定 Linux 上同一原 ELF 也失败，例如缺 UTF-8 locale、glibc 的 ERE 扩展与原断言预期不同。 | 逐项 Linux/BoarOS 输出见[对照附件](oscomp-libctest-original-failures.tsv)及[具体触发条件](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
 
+## 内核语义与错误分类
+
+### socketpair01：非 UNIX family 在创建检查前返回 EOPNOTSUPP
+
+原 `socketpair01` 的四个架构/libc组合均有四项得到 EOPNOTSUPP(95)，而断言分别要求一次 EAFNOSUPPORT(97)、三次 EPROTONOSUPPORT(93)。这是内核错误分类缺口，得分、退出码和耗时见[本轮原程序结果](oscomp-ltp-analysis.md#unix-seqpacket-接入后的-socket-原程序结果)，不按环境或发布程序问题处理。
+
+当前 `kernel/syscall/socket.c` 的 socketpair 入口在基本范围检查后，对 `family != AF_UNIX` 直接返回95，跳过对应地址族创建 socket 时的 family/protocol 判断。固定 `references/linux/net/socket.c` 的 `__sys_socketpair` 则先调用 `sock_create` 创建 socket，再调用该协议的 `ops->socketpair`；地址族或协议创建不成立时，创建阶段的错误先返回，尚未到不支持配对操作的检查。创建阶段错误与不支持配对操作属于不同的失败阶段，不能把所有非 UNIX 请求归为 EOPNOTSUPP。
+
+main 基线 `f0943f2` 已有相同的 `family != AF_UNIX` 提前返回95，当前实现保留了该分支。因此源码证明这是本轮 SEQPACKET 之前已有的行为；本轮只有当前核的原程序实跑，没有用旧核重跑 `socketpair01`。保留原 ELF、原断言和原 judge 的实际失败，后续应在内核区分创建阶段错误与配对操作错误。
+
 ## fs_fill：评测预算取舍
 
 `fs_fill` 的两个细项已经通过，相关磁盘检查正常。它以三名 writer 分别执行向量和
