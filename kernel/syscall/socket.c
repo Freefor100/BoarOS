@@ -540,7 +540,8 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     } else {
         uint32_t message_size = 0;
         status = kernel_files_socket_iov_io(files, mm, file, iov, snapshot.count,
-            count, flags | KERNEL_SOCKET_IO_MESSAGE, writing, &address, &message_size, result);
+            count, flags | KERNEL_SOCKET_IO_MESSAGE, writing,
+            !writing && header.name ? &address : 0, &message_size, result);
         if (status != KERNEL_FILES_STATUS_OK || writing || *result < 0) goto out;
         header.flags = message_size > count ? KERNEL_SOCKET_MSG_TRUNC : 0;
         if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) *result = message_size;
@@ -662,7 +663,8 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         const struct kernel_uaccess_iovec iov = {request->arguments[1],range_size};
         uint32_t message_size = 0;
         if (kernel_files_socket_iov_io(files,mm,&file,&iov,1,iov.length,
-                flags | KERNEL_SOCKET_IO_MESSAGE,0,&peer_address,&message_size,&result) != KERNEL_FILES_STATUS_OK)
+                flags | KERNEL_SOCKET_IO_MESSAGE,0,
+                request->arguments[4] ? &peer_address : 0,&message_size,&result) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (result >= 0) {
             if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) result = message_size;

@@ -7,7 +7,11 @@
 #include <kernel/random.h>
 #include <kernel/raw_lock.h>
 #include <kernel/wait_internal.h>
+#include "lwip/tcp.h"
+static err_t copy_capacity_tcp_write(struct tcp_pcb *,const void *,u16_t,u8_t);
+#define tcp_write copy_capacity_tcp_write
 #include "../../net/socket.c"
+#undef tcp_write
 #include "../../net/ethernet.c"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
@@ -369,8 +373,19 @@ static int write_buffer(struct kernel_socket *socket, const void *data, uint32_t
     return result;
 }
 
+static struct kernel_socket_write_request *copy_capacity_output_request;
+static unsigned copy_capacity_outputs;
 static err_t physical_output(struct netif *interface, struct pbuf *packet, const ip4_addr_t *destination)
-{ (void)destination; return link_output(interface, packet); }
+{
+    (void)destination;
+    if(copy_capacity_output_request) {
+        CHECK(!kernel_cpu_current()->raw_locks && caller_owns_protocol());
+        CHECK(copy_capacity_output_request->reserved==3);
+        CHECK(copy_capacity_output_request->socket->tx_reserved>=copy_capacity_output_request->reserved);
+        copy_capacity_outputs++;
+    }
+    return link_output(interface, packet);
+}
 static err_t physical_init(struct netif *interface)
 { interface->name[0] = 't'; interface->name[1] = 'e'; interface->mtu = 1500; interface->output = physical_output; return ERR_OK; }
 
@@ -418,6 +433,92 @@ static void nodelay_pending(unsigned blocked)
     printf("PASS NODELAY pending output and %s without ACK or timer progress\n", blocked ? "NIC capacity retry" : "immediate transmission");
 }
 
+static struct {
+    struct kernel_socket *socket;
+    struct kernel_socket_write_request *request;
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    unsigned stage,returned,writes;
+    uint32_t available;
+} copy_capacity_interleave={.lock=PTHREAD_MUTEX_INITIALIZER,.changed=PTHREAD_COND_INITIALIZER};
+
+/* The observer forwards to real lwIP, then lets another CPU reserve while the
+ * accepted prefix is already in the PCB and the complete batch is still held. */
+static err_t copy_capacity_tcp_write(struct tcp_pcb *pcb,const void *bytes,u16_t size,u8_t flags)
+{
+    CHECK(!kernel_cpu_current()->raw_locks && caller_owns_protocol());
+    err_t result=tcp_write(pcb,bytes,size,flags);
+    if(copy_capacity_interleave.socket && pcb==copy_capacity_interleave.socket->tcp && result==ERR_OK) {
+        CHECK(copy_capacity_interleave.request->reserved==3);
+        unsigned written=++copy_capacity_interleave.writes;
+        if(written==1 || written==3) {
+            CHECK(!pthread_mutex_lock(&copy_capacity_interleave.lock));
+            unsigned stage=written==1?1:2;copy_capacity_interleave.stage=stage;
+            CHECK(!pthread_cond_broadcast(&copy_capacity_interleave.changed));
+            while(copy_capacity_interleave.returned!=stage)
+                CHECK(!pthread_cond_wait(&copy_capacity_interleave.changed,&copy_capacity_interleave.lock));
+            CHECK(!pthread_mutex_unlock(&copy_capacity_interleave.lock));
+        }
+    }
+    return result;
+}
+static void *copy_capacity_reserver(void *unused)
+{
+    (void)unused;kernel_cpu_current()->logical_id=1;
+    struct kernel_open_file_description *owner=(void *)copy_capacity_interleave.socket;
+    struct kernel_socket_write_request other={0};
+    kernel_socket_stream_begin(&other,&owner);
+    for(unsigned stage=1;stage<=2;stage++) {
+        CHECK(!pthread_mutex_lock(&copy_capacity_interleave.lock));
+        while(copy_capacity_interleave.stage!=stage)
+            CHECK(!pthread_cond_wait(&copy_capacity_interleave.changed,&copy_capacity_interleave.lock));
+        CHECK(!pthread_mutex_unlock(&copy_capacity_interleave.lock));
+        if(stage==1) {
+            CHECK(kernel_socket_stream_reserve(&other,copy_capacity_interleave.available,0)==(int)copy_capacity_interleave.available);
+        }
+        CHECK(!(kernel_socket_poll(copy_capacity_interleave.socket,NULL)&KERNEL_POLLOUT));
+        {SOCKET_STATE(state);CHECK(!tcp_admission_capacity_locked(copy_capacity_interleave.socket));}
+        if(stage==2) {
+            kernel_socket_stream_cancel(&other);
+            CHECK(kernel_socket_stream_reserve(&other,copy_capacity_interleave.available,0)==(int)copy_capacity_interleave.available);
+            CHECK(!(kernel_socket_poll(copy_capacity_interleave.socket,NULL)&KERNEL_POLLOUT));
+            kernel_socket_stream_finish(&other);
+            CHECK(owner==(void *)copy_capacity_interleave.socket);
+        }
+        CHECK(!pthread_mutex_lock(&copy_capacity_interleave.lock));copy_capacity_interleave.returned=stage;
+        CHECK(!pthread_cond_broadcast(&copy_capacity_interleave.changed) && !pthread_mutex_unlock(&copy_capacity_interleave.lock));
+    }
+    return NULL;
+}
+static void copy_capacity_batch(struct kernel_socket_write_request *request)
+{
+    CHECK(kernel_socket_stream_reserve(request,3,0)==3);
+    unsigned before=state_acquires;
+    CHECK(kernel_socket_stream_commit(request,"bcd",3,KERNEL_SOCKET_IO_MORE)==3);
+    unsigned single=state_acquires-before;
+    const struct kernel_socket_write_segment segments[]={{"b",1},{"c",1},{"d",1}};
+    CHECK(kernel_socket_stream_reserve(request,3,0)==3);before=state_acquires;
+    CHECK(kernel_socket_stream_commitv(request,segments,3,KERNEL_SOCKET_IO_MORE)==3);
+    printf("TCP capacity locks: single=%u split=%u\n",single,state_acquires-before);
+    CHECK(state_acquires-before==single);
+
+    struct kernel_open_file_description *held_owner=(void *)request->socket;
+    struct kernel_socket_write_request held={0};
+    kernel_socket_stream_begin(&held,&held_owner);CHECK(kernel_socket_stream_reserve(&held,1,0)==1);
+    CHECK(kernel_socket_stream_reserve(request,3,0)==3);
+    copy_capacity_interleave.socket=request->socket;copy_capacity_interleave.request=request;
+    {SOCKET_STATE(state);copy_capacity_interleave.available=tcp_admission_capacity_locked(request->socket);}
+    CHECK(copy_capacity_interleave.available);
+    uint32_t budget=request->socket->tx_budget;
+    pthread_t thread;CHECK(!pthread_create(&thread,NULL,copy_capacity_reserver,NULL));
+    CHECK(kernel_socket_stream_commitv(request,segments,3,KERNEL_SOCKET_IO_MORE)==3);
+    CHECK(!pthread_join(thread,NULL));
+    CHECK(copy_capacity_interleave.writes==3 && request->socket->tx_reserved==1);
+    CHECK(request->socket->tx_budget==budget-3 && !request->reserved);
+    copy_capacity_interleave.socket=NULL;copy_capacity_interleave.request=NULL;
+    kernel_socket_stream_finish(&held);CHECK(held_owner==(void *)request->socket && !request->socket->tx_reserved);
+}
+
 static void copy_capacity(unsigned eligible, unsigned gather)
 {
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
@@ -445,6 +546,7 @@ static void copy_capacity(unsigned eligible, unsigned gather)
         struct kernel_open_file_description *owner=(void *)socket;
         struct kernel_socket_write_request request={0};
         kernel_socket_stream_begin(&request,&owner);
+        if(gather==1)copy_capacity_batch(&request);
         unsigned prefix=gather==2?2:5;
         CHECK(kernel_socket_stream_reserve(&request,prefix,0)==(int)prefix);
         CHECK(kernel_socket_stream_commit(&request,"owner",prefix,KERNEL_SOCKET_IO_MORE)==(int)prefix);
@@ -452,7 +554,9 @@ static void copy_capacity(unsigned eligible, unsigned gather)
         CHECK(!work_pending_snapshot());
         if (gather==2) {
             CHECK(kernel_socket_stream_reserve(&request,3,0)==3);
+            copy_capacity_output_request=&request;
             CHECK(kernel_socket_stream_commit(&request,"ner",3,0)==3);
+            copy_capacity_output_request=NULL;CHECK(copy_capacity_outputs==1);
             CHECK(copy_attempts==1 && protocol_services==1);
         }
         if (gather==4) {
@@ -1632,10 +1736,44 @@ static void unix_space_topology(void)
     puts("PASS UNIX space notification: reciprocal traffic skips callbacks; disconnect restores queue-space wake, reciprocal reconnect wakes existing writer");
 }
 
+static void unix_write_completion_notifications(void)
+{
+    kernel_socket_network_initialize();
+    for(int type=SOCKET_STREAM;type<=SOCKET_DGRAM;type++) {
+        struct kernel_socket *sender=NULL,*receiver=NULL;
+        CHECK(!kernel_socket_pair(&test_heap,type,&sender,&receiver));
+        unsigned notifications=0;
+        struct kernel_wait_node observer={0};
+        kernel_wait_node_init_callback(&observer,count_space_wakeup,&notifications);
+        kernel_wait_queue_add(&sender->wait,&observer);
+        CHECK(write_buffer(sender,"credit",6,0)==6);
+        CHECK(!notifications);
+        struct kernel_socket_address source=read_named_packet(receiver,"credit");
+        kernel_socket_address_release(&source);
+        CHECK(notifications && !sender->unix_memory && !sender->unix_packets);
+        unsigned before=notifications;
+        user_remaining=0;
+        const struct kernel_uaccess_iovec iov={(uintptr_t)"fault",5};
+        struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+        struct kernel_open_file_description *pin=(void *)sender;
+        int fault=0;
+        int result=type==SOCKET_DGRAM
+            ?kernel_socket_write_datagram(&pin,NULL,&iov,1,5,0,NULL)
+            :kernel_socket_write_unix(&pin,NULL,&cursor,5,0,&fault);
+        CHECK(result==-KERNEL_EFAULT && pin==(void *)sender);
+        user_remaining=SIZE_MAX;
+        CHECK(notifications>before && !sender->tx_reserved && !receiver->rx_bytes);
+        CHECK(kernel_wait_node_remove_sync(&observer)==KERNEL_SCHEDULER_STATUS_OK);
+        kernel_socket_destroy(sender);kernel_socket_destroy(receiver);CHECK(!heap_live);
+    }
+    puts("PASS UNIX write completion: no unchanged-state notification, packet credit and failed-copy cancellation still wake sender");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "unix-stream-state")) unix_stream_receive_state();
+    if (!strcmp(argv[1], "unix-write-notify")) unix_write_completion_notifications();
+    else if (!strcmp(argv[1], "unix-stream-state")) unix_stream_receive_state();
     else if (!strcmp(argv[1], "unix-space-topology")) unix_space_topology();
     else if (!strcmp(argv[1], "unix-dgram-shutdown")) unix_datagram_read_shutdown();
     else if (!strcmp(argv[1], "unix-dgram-reconnect")) unix_datagram_reconnect_receive();
