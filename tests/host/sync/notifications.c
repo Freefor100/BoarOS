@@ -24,6 +24,13 @@ __attribute__((weak)) void kernel_cpu_notify(struct kernel_cpu *cpu, unsigned ev
 #include <kernel/posix_timer.h>
 #include "../../../kernel/signal_pending.h"
 #include <stdlib.h>
+#include <kernel/pidfd.h>
+/* Fixtures without pidfd OFDs have no observer notifications. The pidfd owner
+ * fixture links its real implementation and controls callbacks directly. */
+__attribute__((weak)) struct kernel_pid *kernel_pidfd_exit_identity(struct kernel_task *task)
+{ (void)task; return 0; }
+__attribute__((weak)) void kernel_pidfd_notification_end(struct kernel_pid **id)
+{ assert(!*id); }
 /* Scheduler/ordinary-signal fixtures publish no POSIX objects. Native timer
  * ownership has its own fixture linked with the actual timer implementation. */
 __attribute__((weak)) uint64_t kernel_posix_timer_deadline(void) { return 0; }

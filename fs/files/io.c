@@ -379,6 +379,9 @@ static enum kernel_files_status read_pinned(
         return status;
     }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
+        *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+    }
     if (kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) {
         *linux_result=kernel_signal_fd_read(description,mm,iov,iov_count,count);
         if (*linux_result<0) KERNEL_FILES_NOTE(files,read_failures,1);
@@ -667,8 +670,10 @@ static enum kernel_files_status readv_request(
         return KERNEL_FILES_STATUS_OK;
     }
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD);
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PIDFD) {
+        *linux_result = positioned && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PIDFD
+            ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
@@ -766,6 +771,9 @@ static enum kernel_files_status pread_iov_pinned(
     uint64_t request;
     uint64_t file_size;
 
+    if(kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PIDFD) {
+        *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_ESPIPE;
@@ -1567,6 +1575,9 @@ static enum kernel_files_status write_request(
     if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
         count, 1, positioned, requested_offset, linux_result);
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
+        *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+    }
     if ((kind==KERNEL_OPEN_FILE_KIND_EVENTFD || kind==KERNEL_OPEN_FILE_KIND_TIMERFD)) {
         *linux_result=kernel_event_fd_io(description,mm,iov,iov_count,count,1);
         return KERNEL_FILES_STATUS_OK;
@@ -1666,6 +1677,7 @@ enum kernel_files_status kernel_files_write(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        description->kind==KERNEL_OPEN_FILE_KIND_PIDFD ||
         description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD || description->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) {
         *linux_result = -KERNEL_EINVAL;
         account_write(files, *linux_result);
@@ -1722,7 +1734,9 @@ enum kernel_files_status kernel_files_pwrite(
         return KERNEL_FILES_STATUS_OK;
     }
     kind = kernel_open_file_kind(description);
-    if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
+    if (kind == KERNEL_OPEN_FILE_KIND_PIDFD)
+        *linux_result = -KERNEL_EINVAL;
+    else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
         kind == KERNEL_OPEN_FILE_KIND_EVENTFD || kind == KERNEL_OPEN_FILE_KIND_TIMERFD || kind == KERNEL_OPEN_FILE_KIND_SIGNALFD ||
         kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
         kind == KERNEL_OPEN_FILE_KIND_PIPE ||
@@ -1781,8 +1795,10 @@ static enum kernel_files_status writev_request(
     }
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        description->kind==KERNEL_OPEN_FILE_KIND_PIDFD ||
         description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD || description->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) {
-        *linux_result = positioned ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
+        *linux_result = positioned && description->kind!=KERNEL_OPEN_FILE_KIND_PIDFD
+            ? -KERNEL_ESPIPE : -KERNEL_EINVAL;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
@@ -1939,6 +1955,10 @@ enum kernel_files_status kernel_files_lseek(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
+    if(description->kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
+        *linux_result=-KERNEL_ESPIPE;
+        return release_io_description(files,&description,KERNEL_FILES_STATUS_OK);
+    }
     if (whence > 4U) {
         *linux_result = -KERNEL_EINVAL;
         return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);

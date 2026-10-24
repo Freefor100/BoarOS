@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/pidfd.h>
 #include "open_file_internal.h"
 #include "block_file_internal.h"
 #include "record_lock.h"
@@ -493,6 +494,8 @@ int kernel_open_file_pseudo_stat(
         return kernel_pipe_stat(file->pipe, stat);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
         mode = KERNEL_VFS_S_IFSOCK | 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_PIDFD)
+        mode = 0700U; /* pidfs getattr deliberately masks S_IFMT. */
     else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD))
         mode = 0600U;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
@@ -506,6 +509,7 @@ int kernel_open_file_pseudo_stat(
         .size = kernel_open_file_size(file),
         .blksize = BOAROS_PAGE_SIZE,
     };
+    if(file->kind==KERNEL_OPEN_FILE_KIND_PIDFD)stat->ino=kernel_pidfd_inode(file);
     if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET && file->credentials) {
         stat->uid=file->credentials->fsuid;
         stat->gid=file->credentials->fsgid;
@@ -569,6 +573,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_PIDFD:
+        return KERNEL_OPEN_FILE_KIND_PIDFD;
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
         return KERNEL_OPEN_FILE_KIND_SIGNALFD;
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
@@ -613,6 +619,7 @@ int kernel_open_file_supports_epoll(
         return 0;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
@@ -710,6 +717,8 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             if (file->file.private_data && kernel_vfs_close(&file->file))
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
+        } else if (file->kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
+            kernel_pidfd_close(file);file->vfs_closed=1;
         } else if ((file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)) {
             if (file->kind!=KERNEL_OPEN_FILE_KIND_SIGNALFD) kernel_event_fd_close(file);
             file->vfs_closed=1;
@@ -862,7 +871,8 @@ uint32_t kernel_open_file_flags(
 {
     /* 创建/终端取得/fd标志不是OFD状态；F_GETFL结果可直接用于F_SETFL。 */
     const uint32_t open_only = 0100U | 0200U | 0400U | 01000U | 02000000U;
-    return open_file_live(file) ? __atomic_load_n(&file->open_flags, __ATOMIC_RELAXED) & ~open_only : 0U;
+    return open_file_live(file) ? __atomic_load_n(&file->open_flags, __ATOMIC_RELAXED) &
+        ~(file->kind==KERNEL_OPEN_FILE_KIND_PIDFD?(open_only&~0200U):open_only) : 0U;
 }
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
 {
@@ -895,6 +905,7 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_SOCKET:
+    case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
@@ -1204,6 +1215,8 @@ uint32_t kernel_open_file_poll(
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_poll_requires_cpu0(file));
     if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_PIDFD:
+        return kernel_pidfd_poll(file,out_queue);
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
         return kernel_signal_fd_poll(file,out_queue);
     case KERNEL_OPEN_FILE_KIND_TIMERFD:

@@ -2,6 +2,7 @@
 
 #include <kernel/cost.h>
 #include <kernel/errno.h>
+#include <kernel/pidfd.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
@@ -328,6 +329,14 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 434U || request->number==438U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=request->number==434U?
+            kernel_pidfd_open(caller,(int32_t)request->arguments[0],(uint32_t)request->arguments[1]):
+            kernel_pidfd_getfd(caller,(int32_t)request->arguments[0],(int32_t)request->arguments[1],
+                (uint32_t)request->arguments[2]);
+    } else if(request->number==424U) {
+        if(syscall_handle_pidfd_signal(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 74U) {
         if(syscall_handle_signalfd(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number>=107U && request->number<=111U) {

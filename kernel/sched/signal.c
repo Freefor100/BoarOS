@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/pidfd.h>
 #include <arch/task.h>
 #include "private.h"
 #include "../signal_pending.h"
@@ -1115,7 +1116,7 @@ static enum kernel_signal_status signal_send_one(
             identity=process_identity(leader,KERNEL_PID_TGID);
             if(!identity)return KERNEL_SIGNAL_STATUS_INVALID_STATE;
             kernel_pid_get(identity);
-        } else if(sig>=32 || queued) {
+        } else if(sig>=32 || queued || thread_generation) {
             struct kernel_pid *id=process_identity(target,KERNEL_PID_TID);
             if(!id || (thread_generation && thread_generation!=id->generation))
                 return KERNEL_SIGNAL_STATUS_INVALID_STATE;
@@ -1457,6 +1458,80 @@ int64_t kernel_signal_send_targets(struct kernel_task *caller, int64_t pid,
                                     uint32_t sig, kernel_pid_t sender_tid)
 {
     return signal_target_identities(caller, pid, sig, sender_tid, 1);
+}
+
+static int64_t signal_identity_target(struct kernel_pid *id,unsigned role,
+    struct kernel_task *selected,uint32_t sig,const struct kernel_signal_wait_info *supplied)
+{
+    SCHEDULER_TASK_BORROW(target,0);
+    struct kernel_task *caller=kernel_task_current();
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(selected) {
+            if(selected->retirement || process_identity(selected,KERNEL_PID_PGID)!=id ||
+                !selected->identities[KERNEL_PID_TGID].identity)return -KERNEL_ESRCH;
+            target=selected;
+        } else {
+            /* A THREAD pidfd still names its actual TID when the caller
+             * selects group-directed delivery. Scope changes queue choice,
+             * not the retained identity's lookup role. */
+            struct kernel_pid_member *member=id->members[KERNEL_PID_TID];
+            if(!member)return -KERNEL_ESRCH;
+            target=member->task;
+        }
+        scheduler_task_get_locked(target);
+        if(!signal_permitted_locked(caller,target,sig))return -KERNEL_EPERM;
+        if(!sig)return 0;
+        if(role==KERNEL_PID_TID &&
+            (target->proc_exiting || !signal_dispatchable_locked(target)))return 0;
+    }
+    int process=role!=KERNEL_PID_TID;
+    if(process) {
+        SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(target));
+        if(!representative)return 0; /* A zombie accepts without queueing. */
+    }
+    struct kernel_signal_wait_info info;
+    if(supplied)info=*supplied;
+    else info=(struct kernel_signal_wait_info){.signal=sig,
+        .sender=(uint32_t)(process?caller->group_leader->tid:caller->tid),
+        .uid=kernel_credentials_current()->uid,.code=process?0:-6};
+    enum kernel_signal_status status=signal_send_one(target,sig,(kernel_pid_t)info.sender,
+        process,info.code,&info,supplied!=0,process?0:id->generation);
+    if(!process && status==KERNEL_SIGNAL_STATUS_INVALID_STATE) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(id->members[KERNEL_PID_TID] && id->members[KERNEL_PID_TID]->task==target &&
+            (target->proc_exiting || !signal_dispatchable_locked(target))) {
+            /* Exit can win during unlocked signal preparation. The retained
+             * TID still exists, so Linux accepts and drops the notification. */
+            return signal_permitted_locked(caller,target,sig)?0:-KERNEL_EPERM;
+        }
+    }
+    return status==KERNEL_SIGNAL_STATUS_OK?0:status==KERNEL_SIGNAL_STATUS_PERMISSION?-KERNEL_EPERM:
+        status==KERNEL_SIGNAL_STATUS_QUEUE_FULL?-KERNEL_EAGAIN:-KERNEL_ESRCH;
+}
+int64_t kernel_signal_send_identity(struct kernel_pid *id,unsigned scope,
+    uint32_t sig,const struct kernel_signal_wait_info *info)
+{
+    if(sig>KERNEL_SIGNAL_COUNT)return -KERNEL_EINVAL;
+    if(scope<2)return signal_identity_target(id,scope?KERNEL_PID_TGID:KERNEL_PID_TID,0,sig,info);
+    int delivered=0,denied=0;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while(cursor.task) {
+        int selected;
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            selected=!cursor.task->retirement && cursor.task->identities[KERNEL_PID_TGID].identity &&
+                process_identity(cursor.task,KERNEL_PID_PGID)==id;
+        }
+        if(selected) {
+            int64_t result=signal_identity_target(id,KERNEL_PID_PGID,cursor.task,sig,info);
+            if(!result)delivered=1;
+            else if(result==-KERNEL_EPERM)denied=1;
+        }
+        scheduler_task_cursor_next(&cursor);
+    }
+    return delivered?0:denied?-KERNEL_EPERM:-KERNEL_ESRCH;
 }
 
 int64_t kernel_signal_send_thread(struct kernel_task *caller,

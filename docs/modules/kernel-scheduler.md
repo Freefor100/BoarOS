@@ -188,6 +188,18 @@ locked变体仅供已持调度域的短操作使用。借用不固定MM、文件
 父子链在实际插入、移除和收养当前节点时检查相邻连接与首尾 owner，不在退出或 reparent 前扫描整条链。`children_epoch` 继续供 wait 选择在成员变化后重查。组遍历持有实际成员的存储引用，成员代次变化时重新从组长开始；proc 调度/身份值受域保护，MM/TTY 内容仍按单 CPU 业务契约读取。
 
 join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
+
+### pidfd
+
+RV64/LA64 提供 pidfd_open(434)、pidfd_send_signal(424) 和 pidfd_getfd(438)。pidfd OFD 持有真实 PID 身份存储；dup、fork 和 UNIX FD 传递沿共同 OFD 引用规则。open 接受 PIDFD_NONBLOCK、PIDFD_THREAD，新 FD 设置 CLOEXEC；普通 open 要求 TGID 角色，THREAD 则保留实际 TID。身份代次作为同一目标 pidfd 的 inode 标识，fstat 沿固定 Linux pidfs getattr 输出 0700 并去掉文件类型位。数据 read/write 及定位读写返回 EINVAL，lseek 返回 ESPIPE。
+
+有 pidfd 的身份才分配共享观察源，按身份指针索引；PID 对象保持 64 字节。poll/epoll 在发起 CPU 查询状态和登记既有等待源；组长提前退出仍等待最后线程，使退出真正可等待后才发布可读，wait/reap 撤下 TID 后同时报告 HUP。reap、wait 消费及非组长 exec 在修改角色前取得原 TID 存储 owner；状态修改完成后，由同一执行者在返回前锁外通知，再归还该 owner。等待游标和观察源引用覆盖通知及最后关闭的交错，不增加 worker 或待通知协议。
+
+waitid(P_PIDFD) 持有实际身份选择子进程，编号复用不改变目标。NONBLOCK pidfd 的子进程尚无所需事件时返回 EAGAIN；显式 WNOHANG 则成功返回空信息。getfd 按实际 TID 查找，检查 REALCREDS、dumpable 和 capability 子集，取得真实 OFD 后重新核对目标 MM、凭据、执行安全对象及文件表。CPU0 控制路径在授权快照、FD raw/OFD acquire 和安全复核期间短暂禁止抢占，避免 timer 切换到同核 exec/exit；FD 锁在调度域之外取得。随后恢复抢占，只保留所需 OFD。接收 FD 设置 CLOEXEC，offset、状态标志和打开权利继续共享；真实清理失败把 owner 留给已有 FD cleanup 路径。
+
+发送默认采用 pidfd 的线程／线程组属性，支持单一的 THREAD、THREAD_GROUP、PROCESS_GROUP scope 标志及 SELF_THREAD/SELF_THREAD_GROUP 特殊值。可选 siginfo 沿共同导入和 pending 机制处理；目标在导入前解析并持有真实身份，不在用户缺页后按复用的 FD 或 PID 重新选目标。用户载荷来源、零信号探测及权限沿固定 Linux。pidfd 专用 namespace/info ioctl 和 CLONE_PIDFD 扩展另行接入。
+
+sh tests/host/pidfd.sh 检查最后角色撤号、64 字节分配类、旧身份引用、通知早于登记／休眠，以及回调期间最后关闭与存储归还；直接用户消费者为 tests/workloads/resource/pidfd.c，核对真实进程／线程退出、getfd、权限、信号和 proc 字段。
 wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
 退出队头仍有事件/等待/执行owner时，reaper返回BUSY；cleanup等待真实归还通知，不将待归还借用当作可立即回收的工作。
 PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cleanup；空索引不能代替页基线。

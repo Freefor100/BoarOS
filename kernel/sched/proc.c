@@ -8,6 +8,8 @@
 #include <kernel/files.h>
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
+#include <kernel/pidfd.h>
+#include "../../fs/open_file_internal.h"
 #include <kernel/fs_context.h>
 #include <kernel/task.h>
 #include <kernel/tty_task.h>
@@ -489,6 +491,47 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         result = 0;
     }
     return result;
+}
+
+int kernel_proc_fdinfo_access(kernel_pid_t pid,uint64_t identity)
+{
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task,find_resource_owner(pid,identity));
+    PROC_ACCESS(task);
+    return proc_access_check(&access);
+}
+int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
+    struct kernel_proc_fdinfo *snapshot)
+{
+    if(pid<=0 || !identity || fd<0 || !snapshot)return -KERNEL_EINVAL;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task,find_resource_owner(pid,identity));
+    PROC_ACCESS(task);
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file=task && kernel_files_is_live(&task->files)?
+        kernel_files_hold_fd(&task->files,fd,&pin):0;
+    if(!file)return -KERNEL_ENOENT;
+    uint32_t fd_flags;
+    {
+        KERNEL_FILES_SCOPE(guard,&task->files);
+        if((uint64_t)fd>=task->files.record->statistics.capacity ||
+            task->files.record->slots[fd].description!=file)return -KERNEL_ENOENT;
+        fd_flags=task->files.record->slots[fd].flags;
+    }
+    struct kernel_vfs_stat stat={0};
+    int error=kernel_open_file_path(file)?kernel_vfs_fstat(&file->file,&stat):
+        kernel_open_file_pseudo_stat(file,&stat);
+    if(error)return error;
+    /* fdinfo is an instantaneous metadata read. It may name its own OFD, so
+     * taking the target offset mutex would recursively lock the read owner. */
+    uint64_t position=__atomic_load_n(&file->offset,__ATOMIC_RELAXED);
+    if(proc_access_check(&access))return -KERNEL_EACCES;
+    *snapshot=(struct kernel_proc_fdinfo){.position=position,
+        .flags=kernel_open_file_flags(file)|((fd_flags&KERNEL_FILES_FD_CLOEXEC)?02000000U:0),
+        .mount_id=file->file.mount?file->file.mount->id:0,.inode=stat.ino,
+        .pidfd=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD,
+        .pid=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD?kernel_pidfd_number(file):0};
+    return 0;
 }
 
 int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,

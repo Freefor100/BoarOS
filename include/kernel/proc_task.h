@@ -89,6 +89,13 @@ struct kernel_proc_fd_pseudo {
     uint64_t object_identity;
     uint8_t kind;
 };
+struct kernel_proc_fdinfo {
+    uint64_t position, flags, mount_id, inode;
+    int32_t pid;
+    uint8_t pidfd;
+};
+int kernel_proc_fdinfo_snapshot(kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);
+int kernel_proc_fdinfo_access(kernel_pid_t,uint64_t);
 int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
                                    int fd,
                                    struct kernel_proc_fd_pseudo *snapshot);

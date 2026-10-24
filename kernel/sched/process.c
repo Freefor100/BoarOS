@@ -16,6 +16,7 @@
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
+#include <kernel/pidfd.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
 #include <kernel/socket_call.h>
@@ -652,7 +653,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
             if (++task->group_epoch == 0) __builtin_trap();
             process_group_initialize(task);
         }
-        kernel_task_identity_put(old_identity);
+        kernel_pidfd_notification_end(&old_identity);
         (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
     }
     {
@@ -1038,7 +1039,7 @@ static int wait_child_matches(const struct kernel_task *child, int32_t which,
 {
     if (which == LINUX_P_ALL) return 1;
     return target && process_identity(child,
-        which == LINUX_P_PID ? KERNEL_PID_TID : KERNEL_PID_PGID) == target;
+        (which == LINUX_P_PID || which == LINUX_P_PIDFD) ? KERNEL_PID_TID : KERNEL_PID_PGID) == target;
 }
 
 static enum kernel_scheduler_status retire_waited_zombie(
@@ -1046,6 +1047,8 @@ static enum kernel_scheduler_status retire_waited_zombie(
     struct kernel_task *child,
     const struct kernel_task_usage *usage)
 {
+    struct kernel_pid *exit_identity __attribute__((cleanup(kernel_pidfd_notification_end))) =
+        kernel_pidfd_exit_identity(child);
     kernel_pid_t pid = child->tid;
 
     if (child->state != KERNEL_THREAD_STATE_ZOMBIE ||
@@ -1443,7 +1446,7 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
         if (upid < 0) *linux_result = -KERNEL_EINVAL;
         break;
     case LINUX_P_PIDFD:
-        *linux_result = upid < 0 ? -KERNEL_EINVAL : -KERNEL_EBADF;
+        if(upid<0)*linux_result=-KERNEL_EINVAL;
         break;
     default: *linux_result = -KERNEL_EINVAL; break;
     }
@@ -1452,12 +1455,20 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
     SCHEDULER_TASK_BORROW(child, 0);
     struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = 0;
     uint32_t event = 0;
+    int pidfd_nonblock=0;
     enum kernel_scheduler_status status;
     if (!*linux_result) {
-        target = wait_target_get(parent, which, upid);
-        status = wait_for_child(parent, which, target, options, &child, &event, linux_result);
-        claim = child;
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        if(which==LINUX_P_PIDFD)
+            *linux_result=kernel_pidfd_wait_target(&parent->files,(int32_t)upid,&target,&pidfd_nonblock);
+        else target = wait_target_get(parent, which, upid);
+        if(!*linux_result) {
+            status = wait_for_child(parent, which, target,
+                options|(pidfd_nonblock?LINUX_WNOHANG:0), &child, &event, linux_result);
+            claim = child;
+            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+            if(!child && !*linux_result && pidfd_nonblock && !(options&LINUX_WNOHANG))
+                *linux_result=-KERNEL_EAGAIN;
+        }
     }
 
     int32_t cause = 0, status_code = 0, child_pid = 0;
@@ -1682,6 +1693,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         thread->publish_completion > 1U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    struct kernel_pid *exit_identity __attribute__((cleanup(kernel_pidfd_notification_end))) =
+        kernel_pidfd_exit_identity(thread);
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     cleanup_task_io_requests(thread);

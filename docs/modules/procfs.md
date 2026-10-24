@@ -1,6 +1,6 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录中除 `stat/status` 外的文件、Linux 全量进程字段、`fdinfo` 与无路径 console 的链接尚未接入；不能把这批入口当作完整 procfs。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录中除 `stat/status` 外的文件、Linux 全量进程字段与无路径 console 的链接尚未接入；不能把这批入口当作完整 procfs。
 
 `mount(2)` 接受类型 `proc`、普通挂载、`MS_RDONLY` 与 `MS_SILENT`；源字符串只作用户地址验证，不选择设备。用户态负责创建挂载点。其他挂载模式显式拒绝。`umount2(2)` 只接受 flags 0，要求名称解析到 proc 实例根且无 cwd、文件、子挂载或其他路径引用。挂载实例持有根及覆盖路径，失败创建或发布不会改变原树；成功卸载先摘树、释放根，最后销毁无 I/O 的 proc 实例。PID 1 及后代全部退出后，根盘清理由最深子挂载开始迭代拆除 proc，不依赖用户态逐个卸载。当前所有任务共享一棵挂载树。
 
@@ -55,3 +55,5 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 关闭 COST 不增加该峰值字段或更新代码。`meminfo` 继续只表示当前时点状态。
 
 上述 heap 指打开该 proc OFD 所属的 heap，本轮为 root heap；网卡 final 行稍后记录的 root-heap-peak 还可能包含 COST 文本格式化和结果文件持久化，不能把不同采样时点当成同一峰值。静态 lwIP 协议堆/pool 数组在内核映像中，另由 ELF 符号预算记录，不能因 managed 峰值相近就宣称候选内存成本相同。完整 scope 与诊断扰动见[数据路径报告](../learning/data-path-budget-experiments.md)。
+
+进程 fdinfo 目录按同一 FD 表枚举并输出 position、flags、mount ID 和 inode。目录及条目同时检查 FSCREDS 进程访问权限和文件 DAC；读取期间持有目标实际 OFD，再复核目标身份与执行安全状态。pidfd 增加 Pid/NSpid，单命名空间中两者相同，目标 TID 已撤下后均为 -1；固定 Linux 的 NSpid 输出还取决于 CONFIG_PID_NS。pidfd 的 FD 链接展示 anon_inode:[pidfd]，getfd 传递实际 OFD，proc 路径重新打开仍返回 ENXIO。文本沿共同生成文件规则，rewind 后重新取值。

@@ -371,6 +371,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/posix_timer.c \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
+	kernel/sched/pidfd.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -1832,7 +1833,10 @@ test-multi-disk-io-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
 		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64)
 
-.PHONY: test-pid-object-host test-random-host
+.PHONY: test-pid-object-host test-pidfd-host test-random-host
+test-pidfd-host:
+	sh tests/host/pidfd.sh
+
 test-pid-object-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
