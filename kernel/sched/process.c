@@ -11,6 +11,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/msg.h>
 #include <kernel/tick.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -1621,6 +1622,7 @@ static void reap_claim_end(struct kernel_task **task)
 /* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
 static void cleanup_task_io_requests(struct kernel_task *thread)
 {
+    kernel_msg_abort(thread);
     kernel_sem_abort(thread);
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);

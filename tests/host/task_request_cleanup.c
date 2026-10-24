@@ -23,13 +23,19 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
 { assert(request == owner.socket_read_request); consumed(4); owner.socket_read_request = 0; }
 void kernel_tty_abort_request(struct kernel_tty_request *request)
 { assert(request == owner.tty_request); consumed(8); owner.tty_request = 0; }
+void kernel_sem_abort(struct kernel_task *task)
+{ assert(task == &owner); if (task->sem_request) { consumed(32); task->sem_request = 0; } }
+void kernel_socket_call_abort(struct kernel_socket_call *call)
+{ assert(call == owner.socket_call); consumed(64); owner.socket_call = 0; }
+void kernel_msg_abort(struct kernel_task *task)
+{ assert(task == &owner); if (task->msg_request) { consumed(128); task->msg_request = 0; } }
 enum physical_page_status physical_page_release(struct physical_page_allocator *allocator,
                                                 uint64_t address)
 { (void)allocator; (void)address; __builtin_trap(); }
 
 int main(void)
 {
-    for (expected = 0; expected < 32; expected++) {
+    for (expected = 0; expected < 256; expected++) {
         owner = (struct kernel_task){0};
         scratch = (struct kernel_task_io_buffer){0};
         seen = 0;
@@ -37,6 +43,9 @@ int main(void)
         if (expected & 2) owner.socket_write_request = (void *)(uintptr_t)2;
         if (expected & 4) owner.socket_read_request = (void *)(uintptr_t)3;
         if (expected & 8) owner.tty_request = (void *)(uintptr_t)4;
+        if (expected & 32) owner.sem_request = (void *)(uintptr_t)7;
+        if (expected & 64) owner.socket_call = (void *)(uintptr_t)8;
+        if (expected & 128) owner.msg_request = (void *)(uintptr_t)9;
         if (expected & 16) {
             owner.io_scratch_data = (void *)(uintptr_t)5;
             owner.io_scratch_physical_address = 4096;
@@ -46,13 +55,14 @@ int main(void)
             owner.io_buffer = &scratch;
         }
         cleanup_task_io_requests(&owner);
-        assert(seen == (expected & 15U));
+        assert(seen == (expected & ~16U));
         assert(!owner.epoll_wait_request && !owner.socket_write_request &&
-               !owner.socket_read_request && !owner.tty_request && !owner.io_buffer);
+               !owner.socket_read_request && !owner.tty_request && !owner.io_buffer &&
+               !owner.sem_request && !owner.socket_call && !owner.msg_request);
         assert(!scratch.allocator);
         cleanup_task_io_requests(&owner);
-        assert(seen == (expected & 15U));
+        assert(seen == (expected & ~16U));
     }
-    puts("PASS task request cleanup: 32 handle sets, scratch lifetime, retry");
+    puts("PASS task request cleanup: 256 handle sets, scratch lifetime, retry");
     return 0;
 }
