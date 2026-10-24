@@ -29,6 +29,7 @@ struct model_socket_file {
     uint32_t references;
 };
 static struct model_socket_file *model_socket_files;
+static unsigned regular_rights_no_graph;
 static struct {
     pthread_mutex_t lock;
     pthread_cond_t changed;
@@ -358,7 +359,7 @@ static struct kernel_open_file_description *model_socket_file_create(struct kern
 struct kernel_socket *kernel_open_file_socket(struct kernel_open_file_description *f)
 { struct model_socket_file *file=model_socket_file(f);return file?file->socket:(struct kernel_socket *)(uintptr_t)f; }
 uint32_t kernel_open_file_references(const struct kernel_open_file_description *description)
-{ struct model_socket_file *file=model_socket_file(description);CHECK(file);return __atomic_load_n(&file->references,__ATOMIC_ACQUIRE); }
+{ CHECK(!regular_rights_no_graph);struct model_socket_file *file=model_socket_file(description);CHECK(file);return __atomic_load_n(&file->references,__ATOMIC_ACQUIRE); }
 enum kernel_open_file_status kernel_open_file_acquire(struct kernel_open_file_description *f)
 {
     struct model_socket_file *file=model_socket_file(f);
@@ -390,10 +391,11 @@ enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_de
           if(fail)return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
       }
       *f=NULL;uint32_t before=__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL);CHECK(before);
-      kernel_socket_rights_changed();
+      if(file->socket)kernel_socket_rights_changed();
       if(before==1) {
           struct model_socket_file **link=&model_socket_files;while(*link!=file) { CHECK(*link);link=&(*link)->next; }*link=file->next;
-          kernel_socket_destroy(file->socket);free(file);
+          if(file->socket)kernel_socket_destroy(file->socket);
+          free(file);
       }
       return KERNEL_OPEN_FILE_STATUS_OK;
   }
@@ -1940,7 +1942,7 @@ static void model_put(struct kernel_open_file_description **file)
 { CHECK(kernel_open_file_release(file)==KERNEL_OPEN_FILE_STATUS_OK && !*file); }
 static void model_no_control_owners(void)
 {
-    CHECK(!heap_live && !model_socket_files && !unix_sockets && !rights_controls && !rights_retired && !rights_releasing &&
+    CHECK(!heap_live && !model_socket_files && !unix_sockets && !rights_controls && !rights_retired && !rights_releasing && !rights_unix_inflight &&
         !model_uid_account.unix_inflight && model_uid_account.references==1 && model_pid.references==1);
 }
 struct root_cycle_gate {
@@ -1956,9 +1958,54 @@ static void *root_cycle_releaser(void *argument)
     CHECK(!pthread_mutex_lock(&gate->lock));gate->phase=3;
     CHECK(!pthread_cond_broadcast(&gate->changed) && !pthread_mutex_unlock(&gate->lock));return NULL;
 }
+static void unix_regular_right_owners(void)
+{
+    struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];
+    model_owned_pair(file,socket);
+    /* A NULL socket is an ordinary OFD boundary object, with the same actual
+     * reference and cleanup ownership as the socket-backed model objects. */
+    struct kernel_open_file_description *regular=model_socket_file_create(NULL);
+    struct model_socket_file *held=model_socket_file(regular);
+    model_send_right(file[0],regular);model_put(&regular);
+    struct kernel_socket_control *control=socket[1]->rights_head;
+    unsigned retained=heap_live;
+    CHECK(control && rights_controls==control && control->receiver==socket[1] &&
+        !rights_unix_inflight && !rights_active && !rights_dirty && held->references==1 &&
+        model_uid_account.unix_inflight==1 && model_uid_account.references==2 && model_pid.references==2);
+    regular_rights_no_graph=1;
+    kernel_socket_rights_service();
+    CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
+    regular_rights_no_graph=0;
+    CHECK(heap_live==retained && held->references==1 && socket[1]->rights_head==control &&
+        socket[1]->packets_head->data[0]=='G' && !rights_unix_inflight && !rights_dirty);
+    model_put(&file[0]);model_put(&file[1]);
+    CHECK(!kernel_socket_rights_drain());model_no_control_owners();
+
+    model_owned_pair(file,socket);regular=model_socket_file_create(NULL);
+    held=model_socket_file(regular);model_send_right(file[0],regular);model_put(&regular);
+    control_release_probe.target=held;control_release_probe.fail=1;control_release_probe.attempts=0;
+    struct kernel_open_file_description *pin=file[1];struct kernel_socket_read_request read={0};
+    CHECK(kernel_socket_reserve_read(socket[1],NULL,&read,&pin,1,0,NULL)==1);
+    char byte=0;kernel_socket_copy_read(&read,0,&byte,1);CHECK(byte=='G');
+    CHECK(kernel_socket_finish_read(&read,0)==1 && pin==file[1]);
+    CHECK(rights_retired && !rights_controls && !rights_unix_inflight && rights_active &&
+        held->references==1 && model_uid_account.references==2 && model_pid.references==2 &&
+        !model_uid_account.unix_inflight && control_release_probe.attempts==1);
+    retained=heap_live;regular_rights_no_graph=1;
+    CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
+    CHECK(heap_live==retained && held->references==1 && control_release_probe.attempts==2);
+    control_release_probe.fail=0;
+    CHECK(!kernel_socket_rights_drain() && control_release_probe.attempts==3);
+    regular_rights_no_graph=0;control_release_probe.target=NULL;
+    CHECK(!rights_retired && !rights_releasing && !rights_active &&
+        model_uid_account.references==1 && model_pid.references==1);
+    model_put(&file[0]);model_put(&file[1]);model_no_control_owners();
+    puts("PASS UNIX ordinary FD rights: UID/queue owners retained without graph visits, drain stays busy for queued owners, close and retry-only cleanup return all owners without marking live sockets");
+}
 static void unix_control_owners(void)
 {
     kernel_socket_network_initialize();
+    unix_regular_right_owners();
     for(unsigned round=0;round<16;round++) {
         struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];model_owned_pair(file,socket);
         model_send_right(file[0],file[1]);CHECK(model_uid_account.unix_inflight==1 && model_pid.references==2);
