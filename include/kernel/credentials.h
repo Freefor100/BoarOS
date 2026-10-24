@@ -38,7 +38,7 @@ struct kernel_uid_account {
     struct kernel_uid_account *next;
     struct kernel_heap *heap;
     uint64_t references, pending;
-    uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by rights mutex. */
+    uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by socket state lock. */
     uint32_t uid;
 };
 struct kernel_credential_groups {

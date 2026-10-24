@@ -482,6 +482,7 @@ enum kernel_files_status kernel_files_socketpair_create(
     struct kernel_mm *mm,
     int type,
     uint32_t flags,
+    int creation_error,
     uint64_t user_sv,
     int64_t *linux_result);
 

@@ -268,6 +268,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number>=190U && request->number<=193U) {
+        if (syscall_handle_sem(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_SHMGET) {
         if (syscall_handle_shmget(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

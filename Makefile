@@ -396,6 +396,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/socket.c \
 	kernel/syscall/socket_control.c \
 	kernel/syscall/shm.c \
+	kernel/syscall/sem.c \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
@@ -415,6 +416,7 @@ COMMON_C_SOURCES := \
 	mm/vma.c \
 	mm/memory_object.c \
 	mm/shm.c \
+	kernel/sem.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)

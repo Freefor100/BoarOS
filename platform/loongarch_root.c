@@ -14,6 +14,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/open_file.h>
 #include <kernel/shm.h>
+#include <kernel/sem.h>
 #include <kernel/errno.h>
 #include <kernel/virtio_pci_block.h>
 #include <kernel/virtio_pci_rng.h>
@@ -284,6 +285,7 @@ int la_root_boot(struct physical_page_allocator *allocator)
     table.allocator=allocator;table.state=ARCH_MMU_STATE_ACTIVE;
     if(kernel_heap_init(&root.heap,allocator,la_virt_physical_address)!=KERNEL_HEAP_STATUS_OK ||
        kernel_exec_image_bind(allocator,&table) || kernel_shm_init(&root.heap,allocator)!=KERNEL_SHM_STATUS_OK ||
+       kernel_sem_init(&root.heap) ||
        !la_virt_irq_initialize()) la_virt_fatal("root environment");
     root.baseline=physical_page_available(allocator);
     if(kernel_thread_create(cleanup_worker,0)!=KERNEL_SCHEDULER_STATUS_OK) {

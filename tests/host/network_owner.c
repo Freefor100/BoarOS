@@ -23,13 +23,15 @@ static struct kernel_pid_allocator model_pid_numbers;
 static struct kernel_pid_registry model_pid_registry={.numbers=&model_pid_numbers,.next_generation=1};
 static struct kernel_pid model_pid;
 static struct kernel_uid_account model_uid_account={.references=1};
+static struct kernel_credentials model_credentials={.effective=KERNEL_CAP_VALID_MASK,.account=&model_uid_account};
 struct model_socket_file {
     struct model_socket_file *next;
     struct kernel_socket *socket;
     uint32_t references;
 };
 static struct model_socket_file *model_socket_files;
-static unsigned regular_rights_no_graph;
+static unsigned regular_rights_no_graph, ordinary_control_no_graph, graph_acquisitions;
+static uint64_t model_nofile_limit=KERNEL_RLIMIT_NOFILE_CAP;
 static struct {
     pthread_mutex_t lock;
     pthread_cond_t changed;
@@ -162,6 +164,9 @@ static unsigned handoff_bytes;
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
     CHECK(!guard->lock);
+    if(lock==&rights_mutex.lock) {
+        CHECK(!ordinary_control_no_graph);__atomic_fetch_add(&graph_acquisitions,1,__ATOMIC_RELAXED);
+    }
     if(competing && lock==&protocol_mutex.lock) {
         CHECK(!pthread_mutex_lock(&handshake)); waiter_registered=1;
         CHECK(!pthread_cond_signal(&handshake_changed)); CHECK(!pthread_mutex_unlock(&handshake));
@@ -192,8 +197,7 @@ struct kernel_io_context *kernel_io_context_current(void) { return &test_context
 struct kernel_task *kernel_task_current(void) { return remote_task; }
 const struct kernel_credentials *kernel_credentials_current(void)
 {
-    static const struct kernel_credentials root = {.effective=KERNEL_CAP_VALID_MASK,.account=&model_uid_account};
-    return &root;
+    return &model_credentials;
 }
 /* The host boundary has one published process identity and one UID account.
  * Ancillary snapshots borrow them with the same reference ownership as tasks. */
@@ -226,7 +230,7 @@ enum kernel_task_status kernel_task_get_rlimit(const struct kernel_task *task,ui
 {
     if(task!=kernel_task_current() || resource!=KERNEL_RLIMIT_NOFILE || !limit)
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
-    *limit=(struct kernel_rlimit64){.current=KERNEL_RLIMIT_NOFILE_CAP,.maximum=KERNEL_RLIMIT_NOFILE_CAP};
+    *limit=(struct kernel_rlimit64){.current=model_nofile_limit,.maximum=KERNEL_RLIMIT_NOFILE_CAP};
     return KERNEL_TASK_STATUS_OK;
 }
 int kernel_credentials_capable(const struct kernel_credentials *credentials, unsigned capability)
@@ -1979,7 +1983,7 @@ static void model_put(struct kernel_open_file_description **file)
 { CHECK(kernel_open_file_release(file)==KERNEL_OPEN_FILE_STATUS_OK && !*file); }
 static void model_no_control_owners(void)
 {
-    CHECK(!heap_live && !model_socket_files && !unix_sockets && !rights_controls && !rights_retired && !rights_releasing && !rights_unix_inflight &&
+    CHECK(!heap_live && !model_socket_files && !unix_sockets && !rights_retired && !rights_releasing && !rights_unix_inflight && !rights_queued &&
         !model_uid_account.unix_inflight && model_uid_account.references==1 && model_pid.references==1);
 }
 struct root_cycle_gate {
@@ -1995,6 +1999,10 @@ static void *root_cycle_releaser(void *argument)
     CHECK(!pthread_mutex_lock(&gate->lock));gate->phase=3;
     CHECK(!pthread_cond_broadcast(&gate->changed) && !pthread_mutex_unlock(&gate->lock));return NULL;
 }
+static void *control_owner_releaser(void *argument)
+{
+    kernel_socket_control_release(argument);return NULL;
+}
 static void unix_regular_right_owners(void)
 {
     struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];
@@ -2003,29 +2011,32 @@ static void unix_regular_right_owners(void)
      * reference and cleanup ownership as the socket-backed model objects. */
     struct kernel_open_file_description *regular=model_socket_file_create(NULL);
     struct model_socket_file *held=model_socket_file(regular);
+    ordinary_control_no_graph=1;
     model_send_right(file[0],regular);model_put(&regular);
-    struct kernel_socket_control *control=socket[1]->rights_head;
+    struct kernel_socket_control *control=socket[1]->packets_head->control;
     unsigned retained=heap_live;
-    CHECK(control && rights_controls==control && control->receiver==socket[1] &&
+    CHECK(control && !socket[1]->rights_head && !control->receiver && rights_queued==1 &&
         !rights_unix_inflight && !rights_active && !rights_dirty && held->references==1 &&
         model_uid_account.unix_inflight==1 && model_uid_account.references==2 && model_pid.references==2);
     regular_rights_no_graph=1;
     kernel_socket_rights_service();
     CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
     regular_rights_no_graph=0;
-    CHECK(heap_live==retained && held->references==1 && socket[1]->rights_head==control &&
+    CHECK(heap_live==retained && held->references==1 && socket[1]->packets_head->control==control &&
         socket[1]->packets_head->data[0]=='G' && !rights_unix_inflight && !rights_dirty);
+    ordinary_control_no_graph=0;
     model_put(&file[0]);model_put(&file[1]);
     CHECK(!kernel_socket_rights_drain());model_no_control_owners();
 
     model_owned_pair(file,socket);regular=model_socket_file_create(NULL);
-    held=model_socket_file(regular);model_send_right(file[0],regular);model_put(&regular);
+    held=model_socket_file(regular);ordinary_control_no_graph=1;
+    model_send_right(file[0],regular);model_put(&regular);
     control_release_probe.target=held;control_release_probe.fail=1;control_release_probe.attempts=0;
     struct kernel_open_file_description *pin=file[1];struct kernel_socket_read_request read={0};
     CHECK(kernel_socket_reserve_read(socket[1],NULL,&read,&pin,1,0,NULL)==1);
     char byte=0;kernel_socket_copy_read(&read,0,&byte,1);CHECK(byte=='G');
     CHECK(kernel_socket_finish_read(&read,0)==1 && pin==file[1]);
-    CHECK(rights_retired && !rights_controls && !rights_unix_inflight && rights_active &&
+    CHECK(rights_retired && !rights_queued && !rights_unix_inflight && rights_active &&
         held->references==1 && model_uid_account.references==2 && model_pid.references==2 &&
         !model_uid_account.unix_inflight && control_release_probe.attempts==1);
     retained=heap_live;regular_rights_no_graph=1;
@@ -2036,17 +2047,103 @@ static void unix_regular_right_owners(void)
     regular_rights_no_graph=0;control_release_probe.target=NULL;
     CHECK(!rights_retired && !rights_releasing && !rights_active &&
         model_uid_account.references==1 && model_pid.references==1);
+    ordinary_control_no_graph=0;
     model_put(&file[0]);model_put(&file[1]);model_no_control_owners();
-    puts("PASS UNIX ordinary FD rights: UID/queue owners retained without graph visits, drain stays busy for queued owners, close and retry-only cleanup return all owners without marking live sockets");
+    model_owned_pair(file,socket);regular=model_socket_file_create(NULL);
+    held=model_socket_file(regular);model_send_right(file[0],regular);model_put(&regular);
+    struct kernel_socket_message received={0};pin=file[1];read=(struct kernel_socket_read_request){0};
+    CHECK(kernel_socket_reserve_read(socket[1],NULL,&read,&pin,1,0,&received)==1);
+    CHECK(kernel_socket_finish_read(&read,0)==1 && received.control && !rights_queued);
+    model_put(&file[0]);model_put(&file[1]);
+    control_release_probe.target=held;control_release_probe.attempts=0;
+    control_release_probe.pause=1;control_release_probe.entered=control_release_probe.resume=0;
+    ordinary_control_no_graph=1;
+    pthread_t thread;CHECK(!pthread_create(&thread,NULL,control_owner_releaser,&received.control));
+    CHECK(!pthread_mutex_lock(&control_release_probe.lock));
+    while(!control_release_probe.entered)
+        CHECK(!pthread_cond_wait(&control_release_probe.changed,&control_release_probe.lock));
+    CHECK(!received.control && !rights_queued && !rights_retired && rights_releasing &&
+        control_release_probe.attempts==1 && held->references==1);
+    CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
+    control_release_probe.resume=1;CHECK(!pthread_cond_broadcast(&control_release_probe.changed));
+    CHECK(!pthread_mutex_unlock(&control_release_probe.lock) && !pthread_join(thread,NULL));
+    control_release_probe.target=NULL;control_release_probe.pause=0;ordinary_control_no_graph=0;
+    CHECK(!kernel_socket_rights_drain());model_no_control_owners();
+    puts("PASS UNIX ordinary FD rights: publish/reserve/consume/release/retry never acquire graph mutex; UID and queued owners keep drain busy; close and failed final put return all owners");
+}
+static void unix_right_quota(void)
+{
+    struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];model_owned_pair(file,socket);
+    struct kernel_open_file_description *regular=model_socket_file_create(NULL);
+    model_nofile_limit=1;model_credentials.effective=0;ordinary_control_no_graph=1;
+    model_send_right(file[0],regular);model_send_right(file[0],regular);
+    CHECK(model_uid_account.unix_inflight==2 && rights_queued==2);
+    struct kernel_socket_message rejected={0};
+    CHECK(!kernel_socket_control_allocate(&test_heap,1,&rejected.control));
+    CHECK(kernel_open_file_acquire(regular)==KERNEL_OPEN_FILE_STATUS_OK);
+    rejected.control->files[0]=regular;rejected.control->count=1;
+    char byte='Q';struct kernel_uaccess_iovec iov={(uintptr_t)&byte,1};
+    struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};struct kernel_open_file_description *pin=file[0];
+    CHECK(kernel_socket_write_unix(&pin,NULL,&cursor,1,KERNEL_SOCKET_MSG_DONTWAIT,NULL,&rejected)==-KERNEL_ETOOMANYREFS);
+    CHECK(rejected.control && !rejected.control->inflight && rights_queued==2 &&
+        model_uid_account.unix_inflight==2 && !socket[0]->tx_reserved && !socket[0]->active_writes);
+    kernel_socket_control_release(&rejected.control);kernel_socket_control_release(&rejected.credentials);
+    CHECK(kernel_open_file_references(regular)==3);
+    ordinary_control_no_graph=0;model_nofile_limit=KERNEL_RLIMIT_NOFILE_CAP;model_credentials.effective=KERNEL_CAP_VALID_MASK;
+    model_put(&regular);model_put(&file[0]);model_put(&file[1]);model_no_control_owners();
+    puts("PASS UNIX ordinary rights quota: count equal to limit accepts one more descriptor; strictly greater returns ETOOMANYREFS, retains rejected control and releases reservation without changing queued charge");
+}
+static void unix_mixed_right_owners(void)
+{
+    for(unsigned cycle=0;cycle<2;cycle++) {
+        struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];
+        model_owned_pair(file,socket);
+        struct kernel_open_file_description *regular=model_socket_file_create(NULL);
+        struct kernel_socket_message sent={0};
+        CHECK(!kernel_socket_control_allocate(&test_heap,2,&sent.control));
+        CHECK(kernel_open_file_acquire(regular)==KERNEL_OPEN_FILE_STATUS_OK);
+        CHECK(kernel_open_file_acquire(file[1])==KERNEL_OPEN_FILE_STATUS_OK);
+        sent.control->files[0]=regular;sent.control->files[1]=file[1];sent.control->count=2;
+        char byte='M';struct kernel_uaccess_iovec iov={(uintptr_t)&byte,1};
+        struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+        struct kernel_open_file_description *pin=file[0];
+        unsigned before=graph_acquisitions;
+        CHECK(kernel_socket_write_unix(&pin,NULL,&cursor,1,KERNEL_SOCKET_MSG_DONTWAIT,NULL,&sent)==1);
+        CHECK(graph_acquisitions>before && !sent.control);
+        kernel_socket_control_release(&sent.credentials);
+        CHECK(rights_queued==1 && rights_unix_inflight==1 && model_uid_account.unix_inflight==2 &&
+            socket[1]->rights_head && socket[1]->rights_head->unix_count==1);
+        if(cycle) {
+            /* A second ordinary packet is retained by the same unreachable
+             * receiver, although only the mixed control is on the graph. */
+            ordinary_control_no_graph=1;model_send_right(file[0],regular);ordinary_control_no_graph=0;
+            CHECK(rights_queued==2 && model_uid_account.unix_inflight==3);
+        } else for(unsigned peek=0;peek<2;peek++) {
+            struct kernel_socket_message received={.flags=peek?0:KERNEL_SOCKET_MSG_PEEK};
+            struct kernel_socket_read_request read={0};pin=file[1];before=graph_acquisitions;
+            CHECK(kernel_socket_reserve_read(socket[1],NULL,&read,&pin,1,0,&received)==1);
+            CHECK(read.rights && graph_acquisitions>before);before=graph_acquisitions;
+            CHECK(kernel_socket_finish_read(&read,0)==1 && graph_acquisitions>before);
+            CHECK(received.control && received.control->count==2 &&
+                received.control->files[0]==regular && received.control->files[1]==file[1]);
+            CHECK(model_uid_account.unix_inflight==(peek?0:2));
+            kernel_socket_control_release(&received.control);
+        }
+        model_put(&regular);model_put(&file[0]);model_put(&file[1]);
+        kernel_socket_rights_service();model_no_control_owners();
+    }
+    puts("PASS UNIX mixed rights: publication and PEEK/consume acquire graph mutex, both OFDs survive; unreachable mixed cycle also destroys ordinary-only packet and returns every owner");
 }
 static void unix_control_owners(void)
 {
     kernel_socket_network_initialize();
     unix_regular_right_owners();
+    unix_right_quota();
+    unix_mixed_right_owners();
     for(unsigned round=0;round<16;round++) {
         struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];model_owned_pair(file,socket);
         model_send_right(file[0],file[1]);CHECK(model_uid_account.unix_inflight==1 && model_pid.references==2);
-        model_put(&file[0]);model_put(&file[1]);CHECK(heap_live && model_socket_files && rights_controls);
+        model_put(&file[0]);model_put(&file[1]);CHECK(heap_live && model_socket_files && rights_queued);
         kernel_socket_rights_service();model_no_control_owners();
     }
     puts("PASS UNIX SCM self cycles: 16 queued rights/credential snapshots collected, socket/OFD/PID/UID/heap owners restored");
@@ -2113,12 +2210,12 @@ static void unix_control_cleanup_failure(void)
     unsigned retained=heap_live;
     control_release_probe.fail=1;
     kernel_socket_rights_service();
-    CHECK(control_release_probe.attempts==1 && rights_retired==control && !rights_controls &&
-        !rights_releasing && !control->inflight && !control->previous && !control->receiver_previous &&
+    CHECK(control_release_probe.attempts==1 && rights_retired==control && !rights_queued &&
+        !rights_releasing && !control->inflight && !control->receiver_previous &&
         control->files[0]==file && kernel_open_file_references(file)==1 && heap_live==retained &&
         !model_uid_account.unix_inflight && model_uid_account.references==2 && model_pid.references==2);
     CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
-    CHECK(control_release_probe.attempts==2 && rights_retired==control && !rights_controls &&
+    CHECK(control_release_probe.attempts==2 && rights_retired==control && !rights_queued &&
         !rights_releasing && control->files[0]==file && kernel_open_file_references(file)==1 &&
         heap_live==retained && model_uid_account.references==2 && model_pid.references==2);
     control_release_probe.fail=0;
@@ -2136,12 +2233,12 @@ static void unix_control_cleanup_failure(void)
         CHECK(!pthread_cond_wait(&control_release_probe.changed,&control_release_probe.lock));
     /* The worker has detached the graph and is stopped at the actual last
      * put. Empty linked lists alone are insufficient to permit shutdown. */
-    CHECK(!rights_controls && !rights_retired && rights_releasing &&
+    CHECK(!rights_queued && !rights_retired && rights_releasing &&
         control_release_probe.attempts==1 && heap_live==retained && control->files[0]==file &&
         kernel_open_file_references(file)==1 && model_uid_account.references==2 && model_pid.references==2 &&
         !model_uid_account.unix_inflight);
     CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
-    CHECK(!rights_controls && !rights_retired && rights_releasing &&
+    CHECK(!rights_queued && !rights_retired && rights_releasing &&
         control_release_probe.attempts==1 && heap_live==retained);
     control_release_probe.resume=1;
     CHECK(!pthread_cond_broadcast(&control_release_probe.changed));
@@ -2265,6 +2362,7 @@ static void unix_seqpacket_control(void)
     for(unsigned i=0;i<2;i++)file[i]=model_socket_file_create(socket[i]);
     CHECK(!kernel_socket_set_option(socket[1],KERNEL_SOCKET_PASSCRED,1));
     struct kernel_open_file_description *regular=model_socket_file_create(NULL);
+    ordinary_control_no_graph=1;
     model_send_right(file[0],regular);
     unsigned references=kernel_open_file_references(regular);
     struct kernel_socket_message failed={.flags=KERNEL_SOCKET_MSG_PEEK};
@@ -2283,6 +2381,7 @@ static void unix_seqpacket_control(void)
         kernel_socket_control_release(&message.control);
     }
     CHECK(kernel_open_file_references(regular)==1 && !model_uid_account.unix_inflight);
+    ordinary_control_no_graph=0;
     model_put(&regular);model_put(&file[0]);model_put(&file[1]);model_no_control_owners();
     for(unsigned round=0;round<4;round++) {
         socket[0]=socket[1]=NULL;CHECK(!kernel_socket_pair(&test_heap,SOCKET_SEQPACKET,&socket[0],&socket[1]));

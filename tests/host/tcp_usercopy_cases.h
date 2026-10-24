@@ -543,7 +543,7 @@ static void tcp_nonblock_io(struct kernel_files *handle,int writing,int vector,i
         assert(!kernel_files_pin(handle,fd,&owner,&result) && !result && owner);
         const struct kernel_uaccess_iovec iov[]={{buffer,3},{buffer+3,5}};
         assert(!kernel_files_socket_iov_io(handle,&mm,&owner,iov,2,8,KERNEL_SOCKET_MSG_DONTWAIT,
-            writing,NULL,NULL,&result));
+            writing,NULL,NULL,&result,NULL));
         assert(!kernel_open_file_release(&owner));
     } else if(vector) {
         assert(!(writing?kernel_files_writev(handle,&mm,fd,iov_address,2,&result):

@@ -465,15 +465,16 @@ static void wake_socket(struct kernel_socket *socket)
         tcp_publish_capacity_locked(socket);
     socket_state_notify(&socket->wait);
 }
-/* Queue graph mutations share one sleepable lock. No OFD final put or user
- * access occurs in this domain: either can enter a filesystem or CPU0. */
+/* UNIX reference edges share one sleepable lock. Packet ownership, UID quota
+ * and cleanup owners use socket state, including controls without graph edges.
+ * No OFD final put or user access occurs in either lock domain. */
 static struct kernel_mutex rights_mutex;
 static unsigned rights_initialized, rights_dirty, rights_active, rights_retry_pending;
 static unsigned rights_releasing;
-static uint64_t rights_unix_inflight;
+static uint64_t rights_unix_inflight, rights_queued;
 static uint32_t rights_retry_ms;
 static struct kernel_socket *unix_sockets;
-static struct kernel_socket_control *rights_controls, *rights_retired;
+static struct kernel_socket_control *rights_retired;
 static void rights_acquire(struct kernel_lock_guard *guard)
 {
     { SOCKET_STATE(state);
@@ -482,9 +483,10 @@ static void rights_acquire(struct kernel_lock_guard *guard)
 }
 static void rights_activity_update(void)
 {
+    SOCKET_STATE(state);
     unsigned active=rights_unix_inflight!=0 || rights_retired!=NULL || rights_releasing;
     __atomic_store_n(&rights_active,active!=0,__ATOMIC_RELEASE);
-    if(!active) {SOCKET_STATE(state);rights_dirty=0;}
+    if(!active)rights_dirty=0;
 }
 void kernel_socket_rights_changed(void)
 {
@@ -522,66 +524,65 @@ static void control_free(struct kernel_socket_control *control)
 void kernel_socket_control_release(struct kernel_socket_control **owner)
 {
     struct kernel_socket_control *control=*owner;if(!control)return;
-    if(control->inflight || control->previous)__builtin_trap();
-    if(!control->count) {*owner=NULL;control_free(control);return;}
+    if(control->inflight || control->receiver_previous)__builtin_trap();
+    unsigned first=0;
+    while(first<control->count && !control->files[first])first++;
+    if(first==control->count) {*owner=NULL;control_free(control);return;}
     /* The last put may sleep outside the graph lock. Shutdown must still see
      * that real cleanup owner until it is freed or returned to the retry list. */
-    {KERNEL_LOCK_SCOPE(guard);rights_acquire(&guard);
+    {SOCKET_STATE(state);
      if(rights_releasing==UINT32_MAX)__builtin_trap();
      rights_releasing++;rights_activity_update();}
     *owner=NULL;
     int pending=control_release_files(control);
     if(!pending)control_free(control);
-    KERNEL_LOCK_SCOPE(guard);rights_acquire(&guard);
+    SOCKET_STATE(state);
     if(!rights_releasing)__builtin_trap();
     rights_releasing--;
     if(pending) {
         control->next=rights_retired;rights_retired=control;
-        SOCKET_STATE(state);rights_retry_pending=1;rights_retry_ms=sys_now()+SOCKET_WRITE_RETRY_MS;socket_work_ready_locked();
+        rights_retry_pending=1;rights_retry_ms=sys_now()+SOCKET_WRITE_RETRY_MS;socket_work_ready_locked();
     }
     rights_activity_update();
 }
 static void control_unqueue(struct kernel_socket_control *control)
 {
     if(!control || !control->inflight)return;
-    if(!control->previous || *control->previous!=control || !control->account ||
-        control->account->unix_inflight<control->count)__builtin_trap();
-    *control->previous=control->next;
-    if(control->next)control->next->previous=control->previous;
-    control->next=NULL;control->previous=NULL;control->inflight=0;
+    SOCKET_STATE(state);
+    if(!control->account || control->account->unix_inflight<control->count || !rights_queued)__builtin_trap();
+    control->account->unix_inflight-=control->count;rights_queued--;control->inflight=0;
+    if(!control->unix_count)return;
     if(!control->receiver_previous || *control->receiver_previous!=control)__builtin_trap();
     *control->receiver_previous=control->receiver_next;
     if(control->receiver_next)control->receiver_next->receiver_previous=control->receiver_previous;
     control->receiver_next=NULL;control->receiver_previous=NULL;control->receiver=NULL;control->packet=NULL;
-    control->account->unix_inflight-=control->count;
-    unsigned unix_count=0;
     for(unsigned i=0;i<control->count;i++) {
         struct kernel_socket *socket=kernel_open_file_socket(control->files[i]);
         if(!kernel_socket_is_unix(socket))continue;
         if(!socket->gc_inflight)__builtin_trap();
-        socket->gc_inflight--;unix_count++;
+        socket->gc_inflight--;
     }
-    if(rights_unix_inflight<unix_count)__builtin_trap();
-    __atomic_store_n(&rights_unix_inflight,rights_unix_inflight-unix_count,__ATOMIC_RELEASE);
+    if(rights_unix_inflight<control->unix_count)__builtin_trap();
+    __atomic_store_n(&rights_unix_inflight,rights_unix_inflight-control->unix_count,__ATOMIC_RELEASE);
     rights_activity_update();kernel_socket_rights_changed();
 }
 static void control_queue(struct kernel_socket_control *control,struct kernel_socket *receiver,struct socket_packet *packet)
 {
     if(!control || !control->count)return;
-    if(control->inflight || !control->account)__builtin_trap();
-    control->inflight=1;control->receiver=receiver;control->packet=packet;
+    socket_state_owner();
+    if(control->inflight || !control->account || rights_queued==UINT64_MAX ||
+        control->account->unix_inflight>UINT64_MAX-control->count)__builtin_trap();
+    control->inflight=1;rights_queued++;control->account->unix_inflight+=control->count;
+    if(!control->unix_count)return;
+    control->receiver=receiver;control->packet=packet;
     control->receiver_next=receiver->rights_head;control->receiver_previous=&receiver->rights_head;
     if(receiver->rights_head)receiver->rights_head->receiver_previous=&control->receiver_next;
     receiver->rights_head=control;
-    control->next=rights_controls;control->previous=&rights_controls;
-    if(rights_controls)rights_controls->previous=&control->next;
-    rights_controls=control;control->account->unix_inflight+=control->count;
-    unsigned unix_count=0;
     for(unsigned i=0;i<control->count;i++) {
         struct kernel_socket *socket=kernel_open_file_socket(control->files[i]);
-        if(kernel_socket_is_unix(socket)) {socket->gc_inflight++;unix_count++;}
+        if(kernel_socket_is_unix(socket))socket->gc_inflight++;
     }
-    __atomic_store_n(&rights_unix_inflight,rights_unix_inflight+unix_count,__ATOMIC_RELEASE);
+    __atomic_store_n(&rights_unix_inflight,rights_unix_inflight+control->unix_count,__ATOMIC_RELEASE);
     rights_activity_update();kernel_socket_rights_changed();
 }
 static int control_clone(struct kernel_socket_control *source,struct kernel_socket_control **owner,int rights)
@@ -616,6 +617,9 @@ static int control_prepare(struct kernel_socket *socket,int credentials,
         int error=kernel_task_socket_identity(0,&control->pid);if(error)return error;
         control->uid=cred->uid;control->gid=cred->gid;control->has_credentials=1;
     }
+    control->unix_count=0;
+    for(unsigned i=0;i<control->count;i++)
+        if(kernel_socket_is_unix(kernel_open_file_socket(control->files[i])))control->unix_count++;
     if(control->count && !control->account) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         control->account=kernel_uid_account_get_locked(cred->account);
@@ -640,15 +644,26 @@ void kernel_socket_rights_service(void)
 {
     if(!__atomic_load_n(&rights_active,__ATOMIC_ACQUIRE))return;
     struct kernel_socket_control *discard=NULL,*retired=NULL;
-    KERNEL_LOCK_SCOPE(guard);rights_acquire(&guard);
+    KERNEL_LOCK_SCOPE(guard);
     int collect;
+    unsigned releasing;
+retry_graph:
     {SOCKET_STATE(state);
+     if(rights_dirty && rights_unix_inflight && !guard.lock) {
+         socket_state_release(&state);rights_acquire(&guard);goto retry_graph;
+     }
      int retry=rights_retry_pending && (int32_t)(sys_now()-rights_retry_ms)>=0;
      collect=rights_dirty && rights_unix_inflight!=0;
      rights_dirty=0;
      if(!collect && !retry)return;
-     if(retry) {retired=rights_retired;rights_retired=NULL;rights_retry_pending=0;} }
-    /* 普通FD仍有队列owner和UID额度，但没有UNIX引用边就无需标图。 */
+     if(retry) {
+         retired=rights_retired;rights_retired=NULL;rights_retry_pending=0;
+     }
+     /* drain也用短锁：摘链前先登记整批owner，不能出现空链假成功。 */
+     releasing=collect || retired!=NULL;
+     if(releasing) {if(rights_releasing==UINT32_MAX)__builtin_trap();rights_releasing++;}
+    }
+    /* 图链只保存含UNIX引用的控制对象；普通FD由报文队列保持所有权。 */
     if(collect) {
         struct kernel_socket *work=NULL;
         for(struct kernel_socket *s=unix_sockets;s;s=s->gc_next)s->gc_mark=0;
@@ -681,30 +696,26 @@ void kernel_socket_rights_service(void)
                 control_unqueue(control);control->next=discard;discard=control;
             }
     }
-    unsigned releasing=discard!=NULL || retired!=NULL;
-    if(releasing) {if(rights_releasing==UINT32_MAX)__builtin_trap();rights_releasing++;}
     rights_activity_update();
-    kernel_lock_release(&guard);
+    kernel_lock_scope_release(&guard);
     while(discard) {struct kernel_socket_control *next=discard->next;discard->next=NULL;kernel_socket_control_release(&discard);discard=next;}
     while(retired) {struct kernel_socket_control *next=retired->next;retired->next=NULL;kernel_socket_control_release(&retired);retired=next;}
     if(releasing) {
-        rights_acquire(&guard);
-        if(!rights_releasing)__builtin_trap();
-        rights_releasing--;rights_activity_update();
+        SOCKET_STATE(state);
+        if(rights_releasing<releasing)__builtin_trap();
+        rights_releasing-=releasing;rights_activity_update();
     }
 }
 
 int kernel_socket_rights_drain(void)
 {
-    KERNEL_LOCK_SCOPE(guard);rights_acquire(&guard);
-    if(!rights_controls && !rights_retired)return rights_releasing?-KERNEL_EBUSY:0;
     {SOCKET_STATE(state);
+     if(!rights_queued && !rights_retired)return rights_releasing?-KERNEL_EBUSY:0;
      rights_dirty=rights_unix_inflight!=0;
      if(rights_retired) {rights_retry_pending=1;rights_retry_ms=sys_now();}}
-    kernel_lock_release(&guard);
     kernel_socket_rights_service();
-    rights_acquire(&guard);
-    return rights_controls || rights_retired || rights_releasing?-KERNEL_EBUSY:0;
+    SOCKET_STATE(state);
+    return rights_queued || rights_retired || rights_releasing?-KERNEL_EBUSY:0;
 }
 
 /* UNIX names are immutable; input views borrow the syscall snapshot, while
@@ -1444,7 +1455,7 @@ static void unix_destroy(struct kernel_socket *socket)
         *link=socket->unix_hash_next;socket->unix_hash_next=NULL;
     }
     socket_state_release(&state);
-    while(socket->rights_head)control_unqueue(socket->rights_head);
+    for(struct socket_packet *p=socket->packets_head;p;p=p->next)control_unqueue(p->control);
     unix_unwatch_peer(socket);
     SOCKET_STATE(own);
     struct kernel_socket *peer=unix_take_peer_locked(socket);
@@ -1965,7 +1976,7 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
 {
     struct socket_packet *packet;
     uint32_t length = 0;
-    /* acquire只检查lock并随后填满guard；无rights不清零未使用的锁记录。 */
+    /* acquire只检查lock并随后填满guard；无UNIX图边不清零未使用的锁记录。 */
     struct kernel_lock_guard gc __attribute__((cleanup(kernel_lock_scope_release)));gc.lock=0;
     struct socket_state_guard old_status __attribute__((cleanup(socket_state_release)))={0};
     if (request == 0 || request->socket != 0 ||
@@ -2018,7 +2029,7 @@ retry:
         }
     }
     struct kernel_socket_control *source=control_packet->control;
-    unsigned rights=source && source->count;
+    unsigned rights=source && source->unix_count;
     if(rights && !gc.lock) {
         socket_state_release(&old_status);rights_acquire(&gc);goto retry;
     }
@@ -2400,10 +2411,9 @@ static __attribute__((noinline)) int unix_publish_packet(
     struct socket_packet *packet=request->packet;
     struct kernel_lock_guard gc __attribute__((cleanup(kernel_lock_scope_release)));gc.lock=0;
     int result=0;
-    if(*control && (*control)->count) {
-        rights_acquire(&gc);result=control_limit(*control);if(result)return result;
-    }
+    if(*control && (*control)->unix_count)rights_acquire(&gc);
     SOCKET_STATE(endpoint);
+    result=control_limit(*control);if(result)return result;
     struct kernel_socket *peer=request->unix_destination;
     if(!peer || peer->destroying || request->socket->write_closed || peer->read_closed) {
         result=request->socket->type==SOCKET_DGRAM && peer && peer->destroying?-KERNEL_ECONNREFUSED:-KERNEL_EPIPE;

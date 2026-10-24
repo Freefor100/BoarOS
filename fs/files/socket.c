@@ -193,6 +193,7 @@ enum kernel_files_status kernel_files_socketpair_create(
     struct kernel_mm *mm,
     int type,
     uint32_t flags,
+    int creation_error,
     uint64_t user_sv,
     int64_t *linux_result)
 {
@@ -214,8 +215,29 @@ enum kernel_files_status kernel_files_socketpair_create(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    if (kernel_user_range_check(user_sv, sizeof(pair)) != KERNEL_UACCESS_STATUS_OK) {
-        *linux_result = -KERNEL_EFAULT;
+    /* Linux reserves both descriptors and writes their numbers before the
+     * protocol's create method runs. A later error leaves the output prefix
+     * visible, while reservations are always returned without installing FDs. */
+    status = kernel_files_find_two_free_fds(files, &fd0, &fd1, &find_result);
+    if (status != KERNEL_FILES_STATUS_OK) return status;
+    if (find_result) {
+        *linux_result = find_result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    struct kernel_files_fd_reservation first __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd0};
+    struct kernel_files_fd_reservation second __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd1};
+    pair[0] = (int32_t)fd0;
+    pair[1] = (int32_t)fd1;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (kernel_copy_to_user(mm, user_sv + i * sizeof(pair[0]), &pair[i],
+                sizeof(pair[0]), &copied) != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(pair[0])) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    }
+    if (creation_error) {
+        *linux_result = creation_error;
         return KERNEL_FILES_STATUS_OK;
     }
 
@@ -244,26 +266,6 @@ enum kernel_files_status kernel_files_socketpair_create(
         *linux_result = open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
                             ? -KERNEL_ENOMEM
                             : -KERNEL_EIO;
-        return KERNEL_FILES_STATUS_OK;
-    }
-
-    status = kernel_files_find_two_free_fds(files, &fd0, &fd1, &find_result);
-    if (status != KERNEL_FILES_STATUS_OK || find_result != 0) {
-        (void)kernel_files_release_uninstalled_description(files, &ofd1);
-        (void)kernel_files_release_uninstalled_description(files, &ofd0);
-        *linux_result = find_result != 0 ? find_result : -KERNEL_EMFILE;
-        return KERNEL_FILES_STATUS_OK;
-    }
-
-    struct kernel_files_fd_reservation first __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd0};
-    struct kernel_files_fd_reservation second __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd1};
-    pair[0] = (int32_t)fd0;
-    pair[1] = (int32_t)fd1;
-    if (kernel_copy_to_user(mm, user_sv, pair, sizeof(pair), &copied) != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(pair)) {
-        (void)kernel_files_release_uninstalled_description(files, &ofd1);
-        (void)kernel_files_release_uninstalled_description(files, &ofd0);
-        *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
 

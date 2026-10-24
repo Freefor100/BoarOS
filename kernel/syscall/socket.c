@@ -322,6 +322,45 @@ static int wait_ready(struct kernel_open_file_description *file,
     return kernel_socket_wait_ready(kernel_open_file_socket(file), event, target, flags);
 }
 
+static int socket_creation_error(int family, int type, int protocol)
+{
+    if (((type & ~LINUX_SOCK_TYPE_MASK) &
+         ~(LINUX_SOCK_CLOEXEC | LINUX_SOCK_NONBLOCK)) != 0) {
+        return -KERNEL_EINVAL;
+    }
+    int base_type = type & LINUX_SOCK_TYPE_MASK;
+    if (family < 0 || family >= LINUX_AF_MAX) {
+        return -KERNEL_EAFNOSUPPORT;
+    }
+    if (base_type >= LINUX_SOCK_MAX) {
+        return -KERNEL_EINVAL;
+    }
+    if (family != LINUX_AF_UNIX && family != LINUX_AF_INET && family != LINUX_AF_INET6) {
+        return -KERNEL_EAFNOSUPPORT;
+    }
+    if (family == LINUX_AF_UNIX) {
+        if (protocol != 0 && protocol != LINUX_AF_UNIX) {
+            return -KERNEL_EPROTONOSUPPORT;
+        }
+    } else if (protocol < 0 || protocol >= LINUX_IPPROTO_MAX) {
+        return -KERNEL_EINVAL;
+    }
+    if (family != LINUX_AF_UNIX && base_type == LINUX_SOCK_RAW && protocol == 0) {
+        return -KERNEL_EPROTONOSUPPORT;
+    }
+    if (family != LINUX_AF_UNIX && ((base_type == LINUX_SOCK_STREAM &&
+         protocol != 0 && protocol != LINUX_IPPROTO_TCP) ||
+        (base_type == LINUX_SOCK_DGRAM &&
+         protocol != 0 && protocol != LINUX_IPPROTO_UDP))) {
+        return -KERNEL_EPROTONOSUPPORT;
+    }
+    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM &&
+        !(family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET)) {
+        return -KERNEL_ESOCKTNOSUPPORT;
+    }
+    return 0;
+}
+
 enum kernel_syscall_status syscall_handle_socket(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -334,49 +373,12 @@ enum kernel_syscall_status syscall_handle_socket(
     int base_type;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    if (((type & ~LINUX_SOCK_TYPE_MASK) &
-         ~(LINUX_SOCK_CLOEXEC | LINUX_SOCK_NONBLOCK)) != 0) {
-        decoded->value = -KERNEL_EINVAL;
+    int error = socket_creation_error(family, type, protocol);
+    if (error) {
+        decoded->value = error;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     base_type = type & LINUX_SOCK_TYPE_MASK;
-    if (family < 0 || family >= LINUX_AF_MAX) {
-        decoded->value = -KERNEL_EAFNOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (base_type >= LINUX_SOCK_MAX) {
-        decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (family != LINUX_AF_UNIX && family != LINUX_AF_INET && family != LINUX_AF_INET6) {
-        decoded->value = -KERNEL_EAFNOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (family == LINUX_AF_UNIX) {
-        if (protocol != 0 && protocol != LINUX_AF_UNIX) {
-            decoded->value = -KERNEL_EPROTONOSUPPORT;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
-    } else if (protocol < 0 || protocol >= LINUX_IPPROTO_MAX) {
-        decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (family != LINUX_AF_UNIX && base_type == LINUX_SOCK_RAW && protocol == 0) {
-        decoded->value = -KERNEL_EPROTONOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (family != LINUX_AF_UNIX && ((base_type == LINUX_SOCK_STREAM &&
-         protocol != 0 && protocol != LINUX_IPPROTO_TCP) ||
-        (base_type == LINUX_SOCK_DGRAM &&
-         protocol != 0 && protocol != LINUX_IPPROTO_UDP))) {
-        decoded->value = -KERNEL_EPROTONOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM &&
-        !(family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET)) {
-        decoded->value = -KERNEL_ESOCKTNOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
     struct kernel_files *files;
     enum kernel_task_status task_status =
         kernel_task_files_borrow(caller, &files);
@@ -411,32 +413,9 @@ enum kernel_syscall_status syscall_handle_socketpair(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     base_type = type & LINUX_SOCK_TYPE_MASK;
-    if (family < 0 || family >= LINUX_AF_MAX) {
-        decoded->value = -KERNEL_EAFNOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (base_type >= LINUX_SOCK_MAX) {
-        decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (family != LINUX_AF_UNIX) {
-        decoded->value = -KERNEL_EOPNOTSUPP;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (protocol != 0 && protocol != LINUX_AF_UNIX) {
-        decoded->value = -KERNEL_EPROTONOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM &&
-        !(family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET)) {
-        decoded->value = -KERNEL_ESOCKTNOSUPPORT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (kernel_user_range_check(user_sv, sizeof(int32_t) * 2) !=
-        KERNEL_UACCESS_STATUS_OK) {
-        decoded->value = -KERNEL_EFAULT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
+    int creation_error = socket_creation_error(family, type, protocol);
+    if (!creation_error && family != LINUX_AF_UNIX)
+        creation_error = -KERNEL_EOPNOTSUPP;
     struct kernel_files *files;
     struct kernel_mm *mm;
     enum kernel_task_status task_status =
@@ -448,7 +427,7 @@ enum kernel_syscall_status syscall_handle_socketpair(
     if (task_status != KERNEL_TASK_STATUS_OK ||
         kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK ||
         kernel_files_socketpair_create(files, mm, base_type,
-                                       (uint32_t)type, user_sv,
+                                       (uint32_t)type, creation_error, user_sv,
                                        &decoded->value) !=
             KERNEL_FILES_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

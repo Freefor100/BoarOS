@@ -14,8 +14,9 @@ struct kernel_socket_control {
     struct kernel_pid *pid;
     struct kernel_uid_account *account;
     uint32_t uid, gid, count, capacity;
+    uint32_t unix_count; /* Prepared graph edges; ordinary rights stay packet-owned. */
     unsigned has_credentials, inflight;
-    struct kernel_socket_control *next, **previous;
+    struct kernel_socket_control *next; /* Detached cleanup/retry owner. */
     struct kernel_socket_control *receiver_next, **receiver_previous;
     struct kernel_socket *receiver;
     void *packet;

@@ -428,7 +428,7 @@ static void receive_reservation_probe(void *argument)
             riscv_kernel_mm_satp(&sync_mm,&sync_satp)==KERNEL_MM_STATUS_OK &&
             kernel_files_create(&operation_files,&heap)==KERNEL_FILES_STATUS_OK,275);
         uint64_t address; size_t copied; int64_t result; check(kernel_mm_mmap_anonymous(&sync_mm,OP_USER,4096,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address)==KERNEL_MM_STATUS_OK &&
-            kernel_files_socketpair_create(&operation_files,&sync_mm,2,0,OP_USER,&result)==KERNEL_FILES_STATUS_OK && result==0 &&
+            kernel_files_socketpair_create(&operation_files,&sync_mm,2,0,0,OP_USER,&result)==KERNEL_FILES_STATUS_OK && result==0 &&
             kernel_copy_from_user(&sync_mm,receive_pair,OP_USER,sizeof(receive_pair),&copied)==KERNEL_UACCESS_STATUS_OK &&
             kernel_copy_to_user(&sync_mm,OP_USER+512,"xyz",3,&copied)==KERNEL_UACCESS_STATUS_OK,276);
         check(kernel_files_write(&operation_files,&sync_mm,receive_pair[0],OP_USER+512,3,&result)==KERNEL_FILES_STATUS_OK && result==3,277);
