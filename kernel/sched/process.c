@@ -595,6 +595,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
             old_identity = process_identity(task, KERNEL_PID_TID);
             kernel_pid_get(old_identity);
             identity_adopt(task, leader);
+            /* 身份转移即释放旧容器的线程配额，存储回收可继续延后。 */
+            kernel_nproc_release_locked(leader);
             task->proc_start_ticks = leader->proc_start_ticks;
             task->parent = leader->parent;
             task->previous_sibling = leader->previous_sibling;
@@ -645,8 +647,6 @@ enum kernel_scheduler_status process_group_exec_current(void)
             leader->group_leader = 0;
             leader->group_members = 0;
             leader->state = KERNEL_THREAD_STATE_EXITED;
-            /* 身份已由新执行者接管，旧容器的存储清理不能继续占NPROC。 */
-            kernel_nproc_release_locked(leader);
             exited_append_locked(leader);
             task->group_members = 1;
             if (++task->group_epoch == 0) __builtin_trap();
@@ -1747,6 +1747,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             struct kernel_task_usage departed;
             scheduler_usage_thread_locked(thread, &departed);
             scheduler_usage_add(&leader->dead_usage, &departed);
+            /* 与退出线程从组目录移除处在同一可观察边界。 */
+            kernel_nproc_release_locked(thread);
             thread->group_previous->group_next = thread->group_next;
             thread->group_next->group_previous = thread->group_previous;
             if (!leader->group_members || ++leader->group_epoch == 0) __builtin_trap();
@@ -1805,6 +1807,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         }
         if (thread->tid_owned) {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            kernel_nproc_release_locked(thread);
             process_identity_release_locked(thread);
             if (scheduler.init_task == thread) scheduler.init_task = 0;
             thread->group_leader = 0;

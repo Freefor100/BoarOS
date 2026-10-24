@@ -71,14 +71,10 @@ void kernel_proc_task_update_comm(struct kernel_task *task)
 
 static int proc_visible(const struct kernel_task *task)
 {
-    if (!task || !task->arch.user_mode || !task->tid_owned ||
-        !task->group_leader || !task->group_leader->tid_owned ||
-        task->group_leader->tid <= 0 ||
-        task->state == KERNEL_THREAD_STATE_GROUP_DEAD) return 0;
-    if (task->state != KERNEL_THREAD_STATE_EXITED) return 1;
-    /* 子进程在清理期间仍占有 PID；wait 回收前不能暂时丢失数字目录。 */
-    return task == task->group_leader && task->group_members == 1U &&
-           task->parent != 0;
+    /* EXITED/GROUP_DEAD仍拥有已发布身份；真实reap才撤数字目录。 */
+    return task && task->arch.user_mode && task->tid_owned &&
+        task->group_leader && task->group_leader->tid_owned &&
+        task->group_leader->tid > 0 && process_identity(task,KERNEL_PID_TGID);
 }
 
 uint32_t kernel_proc_pid_max(void)
@@ -90,27 +86,8 @@ uint32_t kernel_proc_pid_max(void)
 
 static int proc_group_visible(struct kernel_task *leader)
 {
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (!leader->accounted || leader->retirement) return 0;
-        if (proc_visible(leader)) return 1;
-    }
-    /* An EXITED/GROUP_DEAD leader remains visible through a live member.
-     * The storage borrow crosses segments; each role/state check stays locked. */
-    int visible = 0;
-    struct scheduler_group_cursor cursor;
-    scheduler_group_cursor_begin(leader, &cursor);
-    while (cursor.task) {
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            struct kernel_task *member = cursor.task;
-            visible = member->accounted && member->group_leader == leader && proc_visible(member);
-        }
-        if (visible) break;
-        scheduler_group_cursor_next(&cursor);
-    }
-    scheduler_group_cursor_end(&cursor);
-    return visible;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return leader->accounted && !leader->retirement && proc_visible(leader);
 }
 
 static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
@@ -148,21 +125,13 @@ static struct kernel_task *find_resource_owner(kernel_pid_t pid,
 }
 
 
-static int proc_thread_visible(const struct kernel_task *task)
-{
-    /* 组长先退出时仍保有TID，直到整组回收或exec转移身份。 */
-    return proc_visible(task) || (task && task == task->group_leader &&
-        task->arch.user_mode && task->tid_owned && task->accounted &&
-        task->group_members > 1U);
-}
-
 static struct kernel_task *find_thread(kernel_pid_t tid, uint64_t identity)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
     struct kernel_pid *id = process_identity(task, KERNEL_PID_TID);
     if (!task || !id || id->generation != identity || !task->accounted ||
-        task->retirement || !proc_thread_visible(task)) return 0;
+        task->retirement || !proc_visible(task)) return 0;
     scheduler_task_get_locked(task);
     return task;
 }
@@ -174,7 +143,7 @@ int kernel_proc_thread_identity(kernel_pid_t tgid, uint64_t group_identity,
         return -KERNEL_EINVAL;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
-    if (!task || !task->accounted || task->retirement || !proc_thread_visible(task) ||
+    if (!task || !task->accounted || task->retirement || !proc_visible(task) ||
         (tgid && (process_identity_number(task, KERNEL_PID_TGID) != tgid ||
                   process_identity_generation(task) != group_identity)))
         return -KERNEL_ENOENT;
@@ -189,7 +158,7 @@ int kernel_proc_thread_group(kernel_pid_t tid, uint64_t identity,
     struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
     struct kernel_pid *id = process_identity(task, KERNEL_PID_TID);
     if (!task || !id || id->generation != identity || !task->accounted ||
-        task->retirement || !proc_thread_visible(task)) return -KERNEL_ENOENT;
+        task->retirement || !proc_visible(task)) return -KERNEL_ENOENT;
     *tgid = process_identity_number(task, KERNEL_PID_TGID);
     *group_identity = process_identity_generation(task);
     return 0;
@@ -215,7 +184,7 @@ int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t group_identity,
         struct kernel_task *task = id->members[KERNEL_PID_TID]
             ? id->members[KERNEL_PID_TID]->task : 0;
         if (task && task->accounted && !task->retirement &&
-            task->group_leader == leader && proc_thread_visible(task)) {
+            task->group_leader == leader && proc_visible(task)) {
             *tid = id->number; *identity = id->generation;
             return 0;
         }

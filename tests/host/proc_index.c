@@ -174,7 +174,16 @@ static void lookup_cases(void)
     assert(!kernel_proc_process_identity(2, &token));
     assert(!kernel_proc_next_thread(2, ids[1].generation, 0, &pid, &token) && pid == 2);
     tasks[2].state = KERNEL_THREAD_STATE_EXITED;
-    assert(kernel_proc_process_identity(2, &token) == -KERNEL_ENOENT);
+    /* 停止执行并不撤PID/TID；真实reap前仍可观察退出线程和线程组。 */
+    assert(!kernel_proc_thread_identity(2, ids[1].generation, 3, &token));
+    assert(!kernel_proc_process_identity(2, &token));
+    assert(!kernel_proc_next_thread(2, ids[1].generation, 2, &pid, &token) && pid == 3);
+    tasks[2].retirement=1;
+    assert(kernel_proc_thread_identity(2, ids[1].generation, 3, &token)==-KERNEL_ENOENT);
+    tasks[2].retirement=0;
+    tasks[2].group_leader=&tasks[2];
+    assert(kernel_proc_thread_identity(0,0,3,&token)==-KERNEL_ENOENT);
+    tasks[2].group_leader=&tasks[1];
     tasks[1].state = KERNEL_THREAD_STATE_EXITED; tasks[1].group_members = 1;
     assert(!kernel_proc_process_identity(2, &token));
     tasks[1].state = KERNEL_THREAD_STATE_READY;
