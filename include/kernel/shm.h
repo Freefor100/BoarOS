@@ -4,16 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Linux SysV IPC Flags & Commands */
-#define KERNEL_IPC_CREAT  00001000
-#define KERNEL_IPC_EXCL   00002000
-#define KERNEL_IPC_NOWAIT 00004000
-#define KERNEL_IPC_RMID   0
-#define KERNEL_IPC_SET    1
-#define KERNEL_IPC_STAT   2
-#define KERNEL_IPC_INFO   3
-#define KERNEL_IPC_64     0x0100
-#define KERNEL_IPC_PRIVATE ((int32_t)0)
+#include <kernel/ipc.h>
 
 #define KERNEL_SHM_RDONLY 010000
 #define KERNEL_SHM_RND    020000
@@ -29,19 +20,6 @@
 #define KERNEL_SHMMNI 128U
 #define KERNEL_SHMMAX (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
 #define KERNEL_SHMALL (KERNEL_SHMMAX >> 12)
-
-struct kernel_ipc64_perm {
-    int32_t key;
-    uint32_t uid;
-    uint32_t gid;
-    uint32_t cuid;
-    uint32_t cgid;
-    uint32_t mode;
-    uint16_t seq;
-    uint16_t __pad2;
-    uint64_t __unused1;
-    uint64_t __unused2;
-};
 
 struct kernel_shmid64_ds {
     struct kernel_ipc64_perm shm_perm;
@@ -68,7 +46,6 @@ struct kernel_shminfo64 {
     uint64_t __unused4;
 };
 
-_Static_assert(sizeof(struct kernel_ipc64_perm) == 48, "ipc64_perm layout");
 _Static_assert(sizeof(struct kernel_shmid64_ds) == 112, "shmid64_ds layout");
 
 struct kernel_memory_object;

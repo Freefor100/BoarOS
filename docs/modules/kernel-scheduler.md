@@ -220,7 +220,7 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
 `make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 
-RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持普通 SIGCHLD fork/vfork（均可额外指定 CLONE_FS 共享 cwd/root，或指定 CHILD_SETTID/CHILD_CLEARTID 管理子进程私有 MM 中的 TID），以及共享 VM/FS/FILES/SIGHAND/THREAD 的线程组合和 SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID/SYSVSEM/DETACHED 兼容位。非法依赖返回 EINVAL，尚未闭环的合法资源组合返回 ENOTSUP。SYSVSEM 位不代表已经支持 SysV semaphore。
+RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持普通 SIGCHLD fork/vfork（可指定CLONE_FS共享cwd/root、CHILD_SETTID/CHILD_CLEARTID管理子进程TID，或CLONE_SYSVSEM共享独立撤销组），以及共享VM/FS/FILES/SIGHAND/THREAD的线程组合和SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID/SYSVSEM/DETACHED标志。CLONE_SYSVSEM具有实际引用与最后共享者退出补偿，机制见[SysV信号量](sysv-sem.md)。非法依赖及NEWIPC与SYSVSEM冲突返回EINVAL，其他尚未支持的合法资源组合返回ENOTSUP。
 
 子线程继承完整 FP、整数现场和 mask；a0 为 0，PC 越过 ecall，非零 child_stack 替换 sp，SETTLS 设置 tp。CHILD_SETTID 在子任务首次返回用户态前、子 MM 激活后写入，因此可正常处理 COW 和缺页；PARENT_SETTID 仍在父任务发布 clone 时写入。SETTID 用户存储失败不回滚已经创建的任务，与固定 Linux clone 路径一致。所有内核分配失败都在发布前回滚；若回滚触及真实 VFS/block I/O owner，则由所属文件或 mount 记录，物理页和堆释放不另建重试状态；不会发布半构造子进程。
 

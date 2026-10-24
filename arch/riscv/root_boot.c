@@ -15,6 +15,7 @@
 #include <kernel/procfs.h>
 #include <kernel/loop.h>
 #include <kernel/shm.h>
+#include <kernel/sem.h>
 #include <kernel/errno.h>
 
 #include <stddef.h>
@@ -292,6 +293,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
     if (kernel_shm_init(&root->heap, allocator) != KERNEL_SHM_STATUS_OK) {
         return RISCV_ROOT_BOOT_STATUS_HEAP;
     }
+    if (kernel_sem_init(&root->heap)) return RISCV_ROOT_BOOT_STATUS_HEAP;
     if (riscv_exec_init(allocator, kernel_table) !=
         RISCV_EXEC_STATUS_OK) {
         return RISCV_ROOT_BOOT_STATUS_INIT;

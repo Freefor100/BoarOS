@@ -35,6 +35,8 @@ struct kernel_cpu_timer_index {
 
 struct kernel_exec_transaction;
 struct kernel_memory_object;
+struct kernel_sem_undo;
+struct kernel_sem_request;
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,
@@ -244,6 +246,8 @@ struct kernel_task {
     uint32_t no_new_privs;
     struct kernel_exec_security *exec_security;
     struct kernel_socket_call *socket_call;
+    struct kernel_sem_undo *sem_undo;
+    struct kernel_sem_request *sem_request;
 } __attribute__((aligned(16)));
 
 #endif

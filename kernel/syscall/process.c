@@ -244,7 +244,8 @@ enum kernel_syscall_status syscall_handle_execve(
  * clone(220) accepts the process forms: fork with an optional custom
  * child stack, and vfork (CLONE_VM|CLONE_VFORK) which shares the parent
  * address space and suspends the parent until the child execs or exits.
- * Both process forms may share the fs context with CLONE_FS.
+ * Both process forms may share the fs context with CLONE_FS and the
+ * independent semaphore undo group with CLONE_SYSVSEM.
  * The thread form shares MM/files/fs/dispositions with its group and
  * accepts the TLS and TID lifecycle flags. Other resource-sharing forms
  * require their own complete lifecycle before they can be enabled.
@@ -262,7 +263,8 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((flags & ~LINUX_CLONE_KNOWN_FLAGS) != 0U ||
         ((flags & UINT64_C(0x10000)) && !(flags & UINT64_C(0x800))) ||
-        ((flags & UINT64_C(0x800)) && !(flags & LINUX_CLONE_VM))) {
+        ((flags & UINT64_C(0x800)) && !(flags & LINUX_CLONE_VM)) ||
+        ((flags & UINT64_C(0x08000000)) && (flags & UINT64_C(0x40000)))) {
         decoded->value = -KERNEL_EINVAL;
         return;
     }
@@ -278,7 +280,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_FS |
+    uint64_t process_flags = flags & ~(LINUX_CLONE_FS | UINT64_C(0x40000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != LINUX_SIGCHLD &&
         process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK)) {

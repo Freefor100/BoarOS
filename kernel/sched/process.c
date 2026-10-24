@@ -18,6 +18,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
 #include <kernel/socket_call.h>
+#include <kernel/sem.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -665,6 +666,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
 static int release_clone_resources(struct kernel_task *thread)
 {
     int cleanup_failed = 0;
+    kernel_sem_exit(thread);
 
     if (kernel_signal_release_table(thread) !=
         KERNEL_SIGNAL_STATUS_OK) {
@@ -810,6 +812,9 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_credentials_clone(parent->files.heap,parent->credentials);
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    int sem_result=kernel_sem_clone(parent,child,(flags & UINT64_C(0x40000))!=0);
+    if (sem_result)
+        return finish_clone_failure(child,sem_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->no_new_privs=parent->no_new_privs;
     child->arch.user_mode = 1U;
 #if BOAROS_USER_SMP
@@ -1612,6 +1617,7 @@ static void reap_claim_end(struct kernel_task **task)
 /* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
 static void cleanup_task_io_requests(struct kernel_task *thread)
 {
+    kernel_sem_abort(thread);
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
@@ -1674,6 +1680,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     cleanup_task_io_requests(thread);
+    kernel_sem_exit(thread);
     kernel_posix_timers_exit(thread);
     kernel_signal_pending_cleanup(thread);
     status = release_task_stack(thread);
@@ -2189,6 +2196,8 @@ static void kernel_thread_finish(
         current->proc_exiting = 1;
         if (!current->group_exiting) current->completion = *completion;
     }
+    /* Undo is visible before publishing exit or waking a child-TID joiner. */
+    if (current->arch.user_mode) kernel_sem_exit(current);
     if (current->arch.user_mode) kernel_signal_task_exit(current);
     /* proc readers must see departure before clear_child_tid wakes a joiner. */
 #if BOAROS_COST_DIAGNOSTICS

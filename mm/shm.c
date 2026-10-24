@@ -27,17 +27,12 @@ static struct kernel_shm_table shm_table;
 
 static int shm_permission(const struct kernel_shm_segment *seg,unsigned requested)
 {
-    const struct kernel_credentials *cred=kernel_credentials_current();
-    unsigned mode=seg->mode;
-    if(cred->euid==seg->uid || cred->euid==seg->cuid)mode>>=6;
-    else if(kernel_credentials_in_group(cred,seg->gid) || kernel_credentials_in_group(cred,seg->cgid))mode>>=3;
-    return (requested&~mode&7U) && !kernel_credentials_capable(cred,KERNEL_CAP_IPC_OWNER)?-KERNEL_EACCES:0;
+    return kernel_ipc_permission(kernel_credentials_current(),seg->mode,
+        seg->uid,seg->gid,seg->cuid,seg->cgid,requested);
 }
 static int shm_owner(const struct kernel_shm_segment *seg)
 {
-    const struct kernel_credentials *cred=kernel_credentials_current();
-    return cred->euid==seg->uid || cred->euid==seg->cuid ||
-        kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN);
+    return kernel_ipc_owner(kernel_credentials_current(),seg->uid,seg->cuid);
 }
 
 static int64_t current_time_seconds(void)

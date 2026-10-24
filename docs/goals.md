@@ -42,7 +42,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 |---|---|---|
 | 信号、线程与事件 | PI futex与futex_waitv；扩展 clone；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
 | 用户内存 | mremap 的 DONTUNMAP、零长度共享复制、多VMA批量及特殊映射搬移；按操作区分的 madvise、mlock/MAP_LOCKED、/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射已支持缩小、扩大及地址搬移，沿共同pin与TLB回收规则 |
-| 进程查询与 IPC | pidfd 对象及 waitid(P_PIDFD)、SysV 消息队列及信号量；preadv2/pwritev2 的扩展标志 | getrusage、waitid(P_ALL/P_PID/P_PGID)、wait4、times、SysV 共享内存及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
+| 进程查询与 IPC | pidfd 对象及 waitid(P_PIDFD)、SysV 消息队列；preadv2/pwritev2 的扩展标志 | getrusage、waitid(P_ALL/P_PID/P_PGID)、wait4、times、SysV 共享内存和信号量及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
 | 凭据与限制 | 用户命名空间、用户态 xattr 修改、登录认证与用户数据库管理；AS/DATA/CPU 等限额及 core 文件写出 | [进程凭据](modules/kernel-scheduler.md)、[执行](modules/kernel-exec.md)、[文件接口](modules/kernel-files.md)；线程 UID/GID/补充组、capability、DAC、set-ID/filecap 执行及按真实 UID 的 SIGPENDING 计账已接入；NOFILE/STACK/CORE/FSIZE 保持现有范围 |
 | 网络与系统接口 | 外部 IPv6 与运行时网络配置；CPU定位查询getcpu、CPU-time sleep、POSIX定时器的BOOTTIME/ALARM/TAI与运行时调钟、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；UNIX STREAM/DGRAM/SEQPACKET、FD传递与消息凭据已提供；REAL/VIRTUAL/PROF间隔定时器及四类时钟的POSIX定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
