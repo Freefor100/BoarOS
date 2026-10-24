@@ -433,7 +433,7 @@ enum kernel_open_file_status kernel_open_file_create_socket(
 {
     struct kernel_open_file_description *file = 0;
     enum kernel_heap_status heap_status;
-    if (heap == 0 || socket == 0 || owner == 0 || *owner != 0)
+    if (heap == 0 || owner == 0 || *owner != 0)
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
     heap_status = kernel_heap_allocate_zeroed(heap, 1U, sizeof(*file),
                                               (void **)&file);
@@ -455,6 +455,16 @@ enum kernel_open_file_status kernel_open_file_create_socket(
     file->credentials = kernel_credentials_get(kernel_credentials_current());
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+void kernel_open_file_take_socket(struct kernel_open_file_description *file,
+    struct kernel_socket **owner)
+{
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_SOCKET ||
+        file->socket || file->references != 1U || !owner || !*owner)
+        __builtin_trap();
+    file->socket = *owner;
+    *owner = 0;
 }
 
 uint64_t kernel_open_file_pseudo_identity(
@@ -713,7 +723,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             }
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
-            kernel_socket_destroy(file->socket);
+            if (file->socket) kernel_socket_destroy(file->socket);
             file->socket = 0;
             file->vfs_closed = 1U;
         } else if (kernel_vfs_close(&file->file) != 0) {

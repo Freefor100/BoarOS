@@ -102,9 +102,13 @@ enum kernel_open_file_status kernel_open_file_create_console(
     struct kernel_heap *heap,
     struct kernel_open_file_description **owner);
 
+/* socket可为空以在accept等待/出队前创建真实OFD；此时只能由调用者
+ * 持有，take_socket接管child后才能发布到FD表。失败按普通release归还。 */
 enum kernel_open_file_status kernel_open_file_create_socket(
     struct kernel_heap *heap, struct kernel_socket *socket,
     uint32_t flags, struct kernel_open_file_description **owner);
+void kernel_open_file_take_socket(struct kernel_open_file_description *file,
+    struct kernel_socket **owner);
 
 struct kernel_socket *kernel_open_file_socket(
     struct kernel_open_file_description *file);
