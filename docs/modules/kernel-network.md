@@ -89,6 +89,9 @@ UNIX 名称单独分配、发布后不可修改。地址接口用带长度的借
 STREAM connect 创建待接纳子端点并发布到 listener 队列，accept 转移子端点所有权；backlog 满时使用固定发送期限等待。DGRAM 可以逐次指定目的地址，或保存默认对端；接收端按连接关系过滤发送者。多对一队列采用固定 Linux `max_dgram_qlen=10` 的边界和互连例外，连同在途预约计算接纳资格。等待登记与条件检查处于同一短保护；connected DGRAM 的空间通知绑定实际对端，回调在锁外向本 socket 等待者传播。重连或断连清除未被读取预约借用的旧消息，活动读取保持原数据及其计费。
 
 `SO_PEERCRED` 返回 Linux 指定时点的 PID、有效 UID/GID 快照：socketpair 在创建时捕获，STREAM listener 在 listen 时捕获，连接建立后分别使用监听者与连接发起者的记录。后续身份变更保持既有快照。accept4 的 NONBLOCK/CLOEXEC 只设置新 FD；接纳先预留 FD、检查并等待监听状态，地址输出成功后才安装 FD，失败由未发布对象归还资源。
+
+当前还有两项错误路径需要修正。未连接的 UNIX STREAM 接收返回 EAGAIN，监听端接收返回 ENOTCONN；固定 Linux 对这两种状态均返回 EINVAL，阻塞调用也立即结束。accept/accept4 在取走待接纳连接后才分配 OFD，分配失败会销毁该连接；Linux 在协议接纳前准备 file，分配失败保留连接。地址输出 EFAULT 则发生在接纳之后，消费连接符合 Linux。两种失败发生的位置和副作用应分别处理。
+
 UNIX stream 普通写先预留发送者容量，在协议临界区外把用户 iovec 直接填入最终队列载荷，再检查对端状态并发布。packet 头和内联载荷只分配一次；复制 fault 只发布成功前缀，首字节 fault 不发布。对端在复制期间关闭时归还预留与未发布 packet，保留真实 EPIPE/ECONNRESET。接收直接从该载荷复制到用户，因此普通 stream 不再经过读写中转页。
 
 AF_UNIX按发送者内存限制等待，SO_RCVBUF仍可设置/查询但不能给对端发送者提供
@@ -117,6 +120,8 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖 CPU0 的实际 COPY 接纳。排队请求使用自己的等待 token，端点锁内登记、发布 result/queued 并定向通知；锁外 park/finish。ACK 和发送额度变化只通知 socket 就绪等待者，避免尚未完成 COPY 的请求被反复唤醒。请求入工作集合只登记待服务，STREAM 的 IO_MORE、窗口耗尽及明确 FLUSH 决定何时输出。服务先处理此前捕获的 OUTPUT，再接纳新 COPY，保留新前缀的合批资格；纯 tcp_write 成功不产生生命周期回收工作，真实输入和关闭仍负责安排回收。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。调用者只在完成状态发布之后归还请求、pin 和 OFD。单核及 CPU0 空闲协议资格保留直接调用。
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
+
+用户复制可以触发文件页的冷缺页，调用链继续进入 ELF 源读取、页缓存、ext4 和块设备等待；这些调用共同使用当前任务的 8 KiB 内核栈。UNIX 载荷复制与复制后的 packet 发布使用独立栈帧，TCP pin 工作区与普通文件暂存路径也分别构帧；MM 的映射文件缺页与 ELF 缺页分开，避免无关工作区同时占栈。检查栈余量需要实际触发冷页并等待任务退出后的高水位报告，单个函数的静态帧大小不足以说明整条调用链安全。
 
 epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[文件接口](kernel-files.md#epoll-事件通知子系统)。独立状态锁维护候选、控制代次、ONESHOT 和扫描引用；目标就绪查询、用户复制、上层通知及等待游标排空在锁外执行。端点通知取得现有队列/节点借用后释放端点锁，因此远端回调与 DEL、MOD、关闭可以交错，实际回调归还前存储保持有效。
 
