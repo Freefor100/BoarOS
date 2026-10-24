@@ -6,7 +6,10 @@
 
 enum { MM_MSG_COUNT=4096, MM_MSG_SMALL=65536, MM_MSG_LARGE=131072 };
 static uint64_t mm_msg_samples[MM_MSG_COUNT];
-static unsigned mm_msg_host,mm_msg_metrics;
+static unsigned mm_msg_metrics;
+#ifndef MM_MSG_EMBEDDED
+static unsigned mm_msg_host;
+#endif
 
 static void mm_msg_old(unsigned cpus)
 {
@@ -20,7 +23,10 @@ static void mm_msg_report(const char *name,unsigned count,uint64_t bytes,
 {
     struct rusage usage;CHECK(!getrusage(RUSAGE_SELF,&usage));
     qsort(mm_msg_samples,count,sizeof(*mm_msg_samples),queue_compare);
-    CHECK(elapsed && mm_msg_samples[count/2] && cpu && usage.ru_maxrss>0);
+    /* Linux batches RSS accounting; a short, small workload can report zero. */
+    if(!elapsed || !mm_msg_samples[count/2] || !cpu || usage.ru_maxrss<0)
+        dprintf(2,"MMMSG invalid metric name=%s count=%u elapsed=%llu median=%llu cpu=%llu rss=%ld\n",name,count,(unsigned long long)elapsed,(unsigned long long)mm_msg_samples[count/2],(unsigned long long)cpu,usage.ru_maxrss);
+    CHECK(elapsed && mm_msg_samples[count/2] && cpu && usage.ru_maxrss>=0);
     printf("MMMSG-PERF name=%s count=%u bytes=%llu ns=%llu p50=%llu p95=%llu max=%llu cpu_ns=%llu rss_kib=%ld ops_per_sec=%llu\n",
         name,count,(unsigned long long)bytes,(unsigned long long)elapsed,
         (unsigned long long)mm_msg_samples[count/2],(unsigned long long)mm_msg_samples[count*95/100],
@@ -78,6 +84,7 @@ static void mm_msg_memory(void)
     }
 }
 
+#ifndef MM_MSG_EMBEDDED
 struct mm_msg_packet {long type;unsigned char body[4096];};
 struct mm_msg_exchange {
     pthread_barrier_t gate;
@@ -181,3 +188,5 @@ int main(int argc,char **argv)
     if(messages)mm_msg_messages(cpus);
     printf("MMMSG-PERF END %u\n",mm_msg_metrics);return 0;
 }
+
+#endif
