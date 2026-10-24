@@ -63,6 +63,12 @@ struct kernel_socket_write_request {
 #endif
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
+/* Message boundaries and stream signal policy are independent of connection state. */
+int kernel_socket_preserves_messages(const struct kernel_socket *socket);
+int kernel_socket_is_stream(const struct kernel_socket *socket);
+int kernel_socket_is_seqpacket(const struct kernel_socket *socket);
+/* Linux SEQPACKET checks pending error/connection before SCM interpretation. */
+int kernel_socket_prepare_send(struct kernel_socket *socket);
 int kernel_socket_is_unix(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
@@ -118,7 +124,7 @@ struct kernel_socket_address {
 };
 _Static_assert(sizeof(struct kernel_socket_address) == 24, "socket address view");
 /* Imported names borrow syscall storage. Exported names own unix_owner until
- * address_release; packet snapshots retain their own immutable source name. */
+ * address_release; queued UNIX messages retain their sending endpoint. */
 void kernel_socket_address_release(struct kernel_socket_address *address);
 struct kernel_socket_peercred { int32_t pid; uint32_t uid, gid; };
 int kernel_socket_peercred(struct kernel_socket *, struct kernel_socket_peercred *);

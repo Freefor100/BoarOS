@@ -135,6 +135,18 @@ struct kernel_socket {
     unsigned gc_mark, passcred;
 };
 
+/* Connection lifetime and record boundaries are independent properties. */
+static int socket_connection_oriented(const struct kernel_socket *socket)
+{ return socket->type == SOCKET_STREAM; }
+int kernel_socket_preserves_messages(const struct kernel_socket *socket)
+{ return socket && socket->type == SOCKET_DGRAM; }
+int kernel_socket_is_stream(const struct kernel_socket *socket)
+{ return socket && socket->type == SOCKET_STREAM; }
+int kernel_socket_is_seqpacket(const struct kernel_socket *socket)
+{ (void)socket; return 0; }
+int kernel_socket_prepare_send(struct kernel_socket *socket)
+{ (void)socket; return 0; }
+
 static void address_export(const struct kernel_socket *socket,
                            const ip_addr_t *ip, uint16_t port,
                            struct kernel_socket_address *address)
@@ -1418,7 +1430,7 @@ static void unix_destroy(struct kernel_socket *socket)
     unix_unwatch_peer(socket);
     SOCKET_STATE(own);
     struct kernel_socket *peer=unix_take_peer_locked(socket);
-    if(peer && socket->type==SOCKET_STREAM && socket->packets_head)peer->pending_error=-KERNEL_ECONNRESET;
+    if(peer && socket_connection_oriented(socket) && socket->packets_head)peer->pending_error=-KERNEL_ECONNRESET;
     if(peer && !peer->destroying)wake_socket(peer);
     socket_state_release(&own);unix_put(peer);
     for(;;) {
@@ -1431,7 +1443,7 @@ static void unix_destroy(struct kernel_socket *socket)
         struct kernel_socket *target=unix_take_peer_locked(sender);
         if(target!=socket)__builtin_trap();
         sender->peer_closed=1;
-        if(socket->type==SOCKET_STREAM) {
+        if(socket_connection_oriented(socket)) {
             if(sender->unix_peer_name)__builtin_trap();
             sender->unix_peer_name=name;unix_name_get_locked(name);
             if(socket->packets_head)sender->pending_error=-KERNEL_ECONNRESET;
@@ -1612,7 +1624,7 @@ int kernel_socket_getpeer(struct kernel_socket *socket,struct kernel_socket_addr
     SOCKET_STATE(state);
     if(!socket->connected)return -KERNEL_ENOTCONN;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
-        if(!socket->peer && socket->type!=SOCKET_STREAM)return -KERNEL_ENOTCONN;
+        if(!socket->peer && !socket_connection_oriented(socket))return -KERNEL_ENOTCONN;
         unix_export_locked(socket->peer?socket->peer->unix_name:socket->unix_peer_name,address);
     } else *address=socket->saved_peer;
     return 0;
@@ -1673,7 +1685,7 @@ static int unix_connect(struct kernel_socket *socket,const struct kernel_socket_
     }
     int result=unix_address_validate(address,0);if(result)return result;
     struct kernel_socket *child=NULL;
-    result=kernel_socket_create(socket->heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&child);
+    result=kernel_socket_create(socket->heap,KERNEL_SOCKET_AF_UNIX,socket->type,&child);
     if(result)return result;
     struct socket_pending *entry=NULL;
     enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*entry),(void **)&entry);
@@ -1717,7 +1729,7 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         struct kernel_socket_peercred cred=unix_current_cred();
         SOCKET_STATE(state);
-        if(socket->type!=SOCKET_STREAM)return -KERNEL_EOPNOTSUPP;
+        if(!socket_connection_oriented(socket))return -KERNEL_EOPNOTSUPP;
         if(!socket->unix_name || socket->connected)return -KERNEL_EINVAL;
         socket->listening=1;socket->unix_backlog=(unsigned)backlog>4096U?4096U:(unsigned)backlog;
         socket->peercred=cred;wake_socket(socket);return 0;
@@ -1725,7 +1737,7 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
     struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     err_t error = ERR_OK;
     struct tcp_pcb *replacement;
-    if (socket->type != SOCKET_STREAM) { kernel_socket_protocol_leave(&scope); return -KERNEL_EOPNOTSUPP; }
+    if (!socket_connection_oriented(socket)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EOPNOTSUPP; }
     if (socket->tcp == 0) { kernel_socket_protocol_leave(&scope); return -KERNEL_ENOTCONN; }
     if (socket->listening) { kernel_socket_protocol_leave(&scope); return 0; }
     int conflict = port_conflict(socket, local_ip(socket), local_port(socket), 1);
@@ -1850,7 +1862,7 @@ int kernel_socket_accept(struct kernel_socket *socket,
 int kernel_socket_accept_check(const struct kernel_socket *socket)
 {
     struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
-    if (socket->type != SOCKET_STREAM) { kernel_socket_protocol_leave(&scope); return -KERNEL_EOPNOTSUPP; }
+    if (!socket_connection_oriented(socket)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EOPNOTSUPP; }
     int result = socket->listening ? 0 : -KERNEL_EINVAL;
     kernel_socket_protocol_leave(&scope);
     return result;
@@ -1904,7 +1916,7 @@ static int socket_receive_empty(const struct kernel_socket *socket, int nonblock
     if (socket->type == SOCKET_DGRAM && socket->read_closed && nonblocking)
         return -KERNEL_EAGAIN;
     if (socket->read_closed ||
-        (socket->type == SOCKET_STREAM && socket->peer_closed))
+        (socket_connection_oriented(socket) && socket->peer_closed))
         return 0;
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && socket->type == SOCKET_STREAM &&
         !socket->connected && !socket->connecting)
@@ -1950,14 +1962,14 @@ retry:
     }
     if (socket->read_request != 0) {
         if(message && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM && socket->connected)
-            message->stream_cookie=KERNEL_SOCKET_STREAM_COOKIE_EMPTY;
+            message->receive_state=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY;
         socket_state_release(&old_status);
         return -KERNEL_EAGAIN;
     }
     packet = socket->packets_head;
     if (packet == 0) {
         if(message && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM && socket->connected)
-            message->stream_cookie=KERNEL_SOCKET_STREAM_COOKIE_EMPTY;
+            message->receive_state=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY;
         int result = socket_receive_empty(socket, nonblocking);
         if (socket->pending_error) socket->pending_error = 0;
         socket_state_release(&old_status);
@@ -1969,7 +1981,7 @@ retry:
         return 0;
     }
     if (capacity > (uint32_t)__INT_MAX__) capacity = __INT_MAX__;
-    uint32_t available = socket->type == SOCKET_DGRAM ? packet_available(packet) : socket->rx_bytes;
+    uint32_t available = kernel_socket_preserves_messages(socket) ? packet_available(packet) : socket->rx_bytes;
     struct socket_packet *control_packet=packet;
     uint32_t control_offset=0;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM) {
@@ -1995,13 +2007,13 @@ retry:
     request->peek_control=NULL;
     request->message=message;
     if(message && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM)
-        message->stream_cookie=KERNEL_SOCKET_STREAM_COOKIE_PACKET;
+        message->receive_state=KERNEL_SOCKET_RECEIVE_RECORD;
     request->socket = socket;
     request->task = task;
     request->packet = packet;
     request->bytes = length;
     request->completed_bytes = 0;
-    request->datagram = socket->type == SOCKET_DGRAM;
+    request->datagram = kernel_socket_preserves_messages(socket);
     request->pin = *pin_owner;
     request->pin_owner = pin_owner;
     *pin_owner = 0;
@@ -2120,8 +2132,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     struct kernel_socket_message *message=request->message;
     int unix_stream=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && !request->datagram;
     int zero_stream=unix_stream && !request->bytes && !user_fault;
-    if(message && unix_stream)message->stream_cookie=user_fault?
-        KERNEL_SOCKET_STREAM_COOKIE_FAULT:KERNEL_SOCKET_STREAM_COOKIE_PACKET;
+    if(message && unix_stream)message->receive_state=user_fault?
+        KERNEL_SOCKET_RECEIVE_STREAM_FAULT:KERNEL_SOCKET_RECEIVE_RECORD;
     int peek=message && (message->flags&KERNEL_SOCKET_MSG_PEEK);
     struct kernel_socket_control *received=request->peek_control,*discard_control=NULL;
     request->peek_control=NULL;
@@ -2840,7 +2852,7 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         SOCKET_STATE(state);int result=socket->connected?0:-KERNEL_ENOTCONN;
         if(how!=1)socket->read_closed=1;
-        if(how!=0) {socket->write_closed=1;if(socket->peer && socket->type==SOCKET_STREAM)socket->peer->peer_closed=1;}
+        if(how!=0) {socket->write_closed=1;if(socket->peer && socket_connection_oriented(socket))socket->peer->peer_closed=1;}
         wake_socket(socket);if(socket->peer)wake_socket(socket->peer);return result;
     }
     struct kernel_socket_protocol_scope protocol;kernel_socket_protocol_enter(&protocol);
@@ -2850,7 +2862,7 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
     if(how!=1)socket->read_closed=1;
     if(close_tx) {
         socket->write_closed=1;
-        if(socket->peer && socket->type==SOCKET_STREAM)socket->peer->peer_closed=1;
+        if(socket->peer && socket_connection_oriented(socket))socket->peer->peer_closed=1;
     }
     wake_socket(socket);if(socket->peer)wake_socket(socket->peer);
     socket_state_release(&state);

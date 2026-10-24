@@ -526,7 +526,13 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     if (status || *result) goto out;
     if (writing && header.control_length) {
         if (!unix_socket) { *result=-KERNEL_EOPNOTSUPP; goto out; }
-        *result=kernel_socket_control_import(&call,mm,header.control,header.control_length);
+        *result=kernel_socket_control_copy(&call,mm,header.control,header.control_length);
+        if (*result) goto out;
+    }
+    if (writing) {
+        *result=kernel_socket_prepare_send(socket);
+        if (*result) goto out;
+        *result=kernel_socket_control_parse(&call,header.control_length);
         if (*result) goto out;
     }
     if (writing && header.name && header.name_length) {
@@ -536,7 +542,7 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     }
     uint64_t count=snapshot.total;
     uint32_t message_size=0;
-    if (writing && kernel_socket_is_datagram(socket)) {
+    if (writing && kernel_socket_preserves_messages(socket)) {
         if (kernel_open_file_flags(*file)&LINUX_SOCK_NONBLOCK) flags|=KERNEL_SOCKET_MSG_DONTWAIT;
         *result=kernel_socket_write_datagram(file,mm,snapshot.view,snapshot.count,count,flags,destination,&call.message);
     } else {
@@ -546,10 +552,10 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     }
     if (status || writing) goto out;
     if (*result==-KERNEL_EINTR || *result==-KERNEL_ERESTARTSYS) goto out;
-    if (*result<0 && call.message.stream_cookie!=KERNEL_SOCKET_STREAM_COOKIE_EMPTY &&
-        call.message.stream_cookie!=KERNEL_SOCKET_STREAM_COOKIE_FAULT) goto out;
+    if (*result<0 && call.message.receive_state!=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY &&
+        call.message.receive_state!=KERNEL_SOCKET_RECEIVE_STREAM_FAULT) goto out;
     header.flags=(flags&UINT32_C(0x40000000)) | (message_size>count?KERNEL_SOCKET_MSG_TRUNC:0);
-    if ((flags&KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) *result=message_size;
+    if ((flags&KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_preserves_messages(socket)) *result=message_size;
     uint64_t control_used=0;
     if (unix_socket) {
         int passcred=0;
@@ -560,8 +566,8 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     }
     if (*result<0) goto out;
     header.control_length=control_used;
-    if (header.name && (!kernel_socket_is_datagram(socket) || address.family)) {
-        if (!kernel_socket_is_datagram(socket)) {
+    if (header.name && (!kernel_socket_preserves_messages(socket) || address.family)) {
+        if (!kernel_socket_preserves_messages(socket)) {
             int error=kernel_socket_getpeer(socket,&address);
             if (error) { *result=error; goto out; }
         }
@@ -657,7 +663,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
             if (result != 0) break;
             destination = &address;
         }
-        if (kernel_socket_is_datagram(socket)) {
+        if (kernel_socket_preserves_messages(socket)) {
             const struct kernel_uaccess_iovec iov = {request->arguments[1], range_size};
             if (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
             result = kernel_socket_write_datagram(&file, mm, &iov, 1, iov.length, flags, destination, NULL);
@@ -678,8 +684,8 @@ enum kernel_syscall_status syscall_handle_socket_operation(
                 (flags & KERNEL_SOCKET_MSG_PEEK)?&data_call.message:NULL) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (result >= 0) {
-            if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) result = message_size;
-            if (!kernel_socket_is_datagram(socket) && request->arguments[4] != 0) {
+            if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_preserves_messages(socket)) result = message_size;
+            if (!kernel_socket_preserves_messages(socket) && request->arguments[4] != 0) {
                 int peer_result = kernel_socket_getpeer(socket, &peer_address);
                 if (peer_result != 0) result = peer_result;
             }

@@ -21,17 +21,18 @@ struct kernel_socket_control {
     void *packet;
     struct kernel_open_file_description *files[];
 };
-enum kernel_socket_stream_cookie {
-    KERNEL_SOCKET_STREAM_COOKIE_NONE,
-    KERNEL_SOCKET_STREAM_COOKIE_EMPTY,
-    KERNEL_SOCKET_STREAM_COOKIE_PACKET,
-    KERNEL_SOCKET_STREAM_COOKIE_FAULT,
+enum kernel_socket_receive_state {
+    KERNEL_SOCKET_RECEIVE_NONE,
+    KERNEL_SOCKET_RECEIVE_STREAM_EMPTY,
+    KERNEL_SOCKET_RECEIVE_RECORD,
+    KERNEL_SOCKET_RECEIVE_STREAM_FAULT,
+    KERNEL_SOCKET_RECEIVE_EOF,
 };
 struct kernel_socket_message {
     struct kernel_socket_control *control;
     struct kernel_socket_control *credentials; /* send snapshot retained across stream fragments */
     uint32_t flags;
-    enum kernel_socket_stream_cookie stream_cookie;
+    enum kernel_socket_receive_state receive_state;
 };
 int kernel_socket_control_allocate(struct kernel_heap *, uint32_t capacity,
     struct kernel_socket_control **owner);

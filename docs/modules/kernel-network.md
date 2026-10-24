@@ -121,6 +121,8 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 固定依据为`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
 `net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。每消息控制数据见下节，SEQPACKET保留为后续功能。命名连接和 socketpair 共用上述跨核状态与队列保护。
 
+连接建立、消息边界和SIGPIPE分别按实际类型判断；共同文件I/O依据消息边界选择整包接纳，发送信号仅使用STREAM规则。接收结果区分取得报文、STREAM空状态和复制故障，控制区字节导入与SCM语义解析分别处理，使协议错误能够按其规定顺序返回。
+
 ## UNIX 控制消息与 FD 所有权
 
 INET与UNIX共用MSG_PEEK接收预约，重复查询保留原报文与接收窗口。UNIX STREAM/DGRAM 的 sendmsg/recvmsg 接受 SCM_RIGHTS、SCM_CREDENTIALS；SO_PASSCRED控制消息凭据输出。原生64位 cmsghdr 为16字节、8字节对齐，ucred 为12字节，每次最多传253个FD。发送控制区完整复制后按记录解析；FD表查询取得真实OFD，包含O_PATH。发送者关闭原FD或复用编号后，排队消息仍持有原对象；接收者共享其offset、状态标志和打开权利，新FD的CLOEXEC由MSG_CMSG_CLOEXEC决定。
