@@ -647,3 +647,26 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 当前兼容分支默认 GCC13 内核又以原 RV glibc ELF 和显式触发冷页的 musl ELF 分别复核，均7/7组通过、最小空闲栈1600字节、heap-live=0，e2fsck正常。最终通用 GCC16 内核的冷页 musl 用例为1488字节，已有四核用例为1144字节，均超过1024字节检查线。分别保留于 `build/unix-named-20261024/recheck-official-kernel/`、`recheck-final-up/`、`repair-correctness-smp4/`；兼容内核通过将同一 ELF 安装到其配置的 PID1 可执行路径验证，未执行整套评测。原程序得分仍对应上表注明的内核阶段。后续已修复未连接／监听 UNIX STREAM 的 EINVAL，以及 accept 在等待／出队前准备真实 OFD；当前行为与所有权见[网络模块](../modules/kernel-network.md)。
 
 10月24日11:22提交的语义与通知修正版已合入兼容分支，固定官方容器离线 `make all` 生成默认两架构交付物。本地QEMU短例使用这些默认内核，将原RV glibc ELF和本轮RV／LA musl消费者分别安装到配置的PID1可执行路径，三项均7/7组通过，资源归还及e2fsck正常；RV两项最小栈余量均1600字节。它们验证通用内核路径，原六项LTP得分保留上表的原阶段归属。accept内存不足由真实OFD分配EMPTY宿主反例补齐，4/16KiB页检查连接保留、重试双向通信和FD/OFD／凭据／heap归还；原记录在`build/unix-notify-20261024/accept/`、`compat-short/`。性能及仍待查的SMP TCP观察见[本轮成本记录](data-path-budget-experiments.md#unix-接收语义accept-分配与-dgram-通知整理)。
+
+## UNIX 控制消息与 INET PEEK 原程序结果
+
+2026年10月24日，SCM_RIGHTS、SCM_CREDENTIALS 与通用 INET PEEK 修复合入兼容分支后，固定官方容器按原 QEMU 参数定向执行 `sendmsg01`、`recvmsg02`。RV、LA 各启动一次，每台依次运行原 glibc、musl ELF，保留空参数、原 judge 和单项300秒监督。以下八次执行取自最终 `original-final-stage/original/results.json`，已核对两架构串口和四份原 judge 输出；耗时是程序执行段，不含启动和磁盘检查。
+
+| 配置 | 原程序 | 原始输出 | 退出码 | 原 judge 得分／分母 | 耗时（毫秒） |
+|---|---|---|---:|---:|---:|
+| RV / glibc | sendmsg01 | 15 TPASS | 0 | 0/0 | 177 |
+| RV / musl | sendmsg01 | 14 TPASS；SIGSEGV 后2 TBROK | 2 | 0/0 | 130 |
+| LA / glibc | sendmsg01 | 15 TPASS | 0 | 0/0 | 165 |
+| LA / musl | sendmsg01 | 14 TPASS；SIGSEGV 后2 TBROK | 2 | 0/0 | 98 |
+| RV / glibc | recvmsg02 | 1 TPASS | 0 | 1/1 | 90 |
+| RV / musl | recvmsg02 | 1 TPASS | 0 | 1/1 | 62 |
+| LA / glibc | recvmsg02 | 1 TPASS | 0 | 1/1 | 66 |
+| LA / musl | recvmsg02 | 1 TPASS | 0 | 1/1 | 65 |
+
+`sendmsg01` 的四配置均通过 `rights passing` 分项。glibc 还通过最后的非法控制指针检查；musl 在该项收到 SIGSEGV。旧输出的计分规则见[统一判分问题](oscomp-test-issues.md#原脚本调用与判分差异)，musl 包装器的指令顺序及同一原RV ELF／原libc在固定Linux上的相同中止结果见[运行库问题](oscomp-test-issues.md#运行库和原盘依赖)。功能结论按实际分项判断：glibc正常完成，musl只完成前14项。
+
+原 `recvmsg02` 使用 INET UDP 的 `MSG_PEEK`，因此只开放 UNIX PEEK 的入口仍会返回 EOPNOTSUPP。本次通用修复让 recvmsg／recvfrom 的标志检查接受 INET PEEK，并沿接收请求保留队列内容和接收额度；后续普通接收再消费数据。四配置现在均输出 `recvmsg(..., MSG_PEEK) works fine`，各得1分。这四分验证原程序的 UDP PEEK 行为，UNIX 控制消息的 FD、凭据与回收机制另见[网络模块](../modules/kernel-network.md#unix-控制消息与-fd-所有权)。
+
+本子集合计62条 TPASS、4条 TBROK，无超时；原 judge 合计**4分**，全部来自 `recvmsg02` 的4/4个Summary分项；四次 `sendmsg01` 各为0分。这与八次程序是否正常完成分别记录。两架构 PID 1 均正常退出、heap-live=0，根盘及第二盘分区合计八项检查均为0。原始串口、judge、内核／QEMU／输入身份和磁盘结果集中保存在 `build/unix-scm-20261024/original-final-stage/original/`；该定向结果不更新整套 LTP 总分。
+
+空路径与空图整理后的默认交付内核另经短消费者核对：原RV glibc命名UNIX ELF为7/7组，RV glibc及LA musl控制消息消费者各23/23组；最终heap-live和磁盘检查均为0。RV两项栈余量分别1584／1264字节。该检查使用固定官方容器默认 `make all` 的内核，原LTP得分仍对应上表的17:16版本；功能身份见`build/unix-scm-20261024/optimized/{compat-default-delivery.json,compat-short,compat-control,compat-la-control}/`。
