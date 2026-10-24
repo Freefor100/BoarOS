@@ -32,12 +32,12 @@ enum kernel_capability {
 #define KERNEL_SECBIT_KEEP_CAPS_LOCKED UINT32_C(32)
 #define KERNEL_SECBIT_NO_CAP_AMBIENT_RAISE UINT32_C(64)
 
-/* references 与 pending 均由 kernel_wait_domain 保护。待决记录单独持有账户，
+/* references、pending 和 processes 均由 kernel_wait_domain 保护。待决记录单独持有账户，
  * 因而线程改 UID 后仍向接纳该记录的账户归还额度。 */
 struct kernel_uid_account {
     struct kernel_uid_account *next;
     struct kernel_heap *heap;
-    uint64_t references, pending;
+    uint64_t references, pending, processes;
     uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by socket state lock. */
     uint32_t uid;
 };

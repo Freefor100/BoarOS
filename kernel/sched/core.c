@@ -1265,6 +1265,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
         status=release_task_storage(thread,KERNEL_SCHEDULER_STATUS_NO_MEMORY);
         goto restore_interrupts;
     }
+    if(kernel_nproc_acquire(thread,0))__builtin_trap();
     thread->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1U);
     if(!thread->exec_security){
         status=release_task_storage(thread,KERNEL_SCHEDULER_STATUS_NO_MEMORY);

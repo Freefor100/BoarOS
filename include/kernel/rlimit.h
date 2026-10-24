@@ -45,6 +45,16 @@ struct kernel_resource_limits *kernel_resource_limits_create(struct kernel_heap 
 struct kernel_resource_limits *kernel_resource_limits_get(struct kernel_resource_limits *);
 void kernel_resource_limits_put(struct kernel_resource_limits *);
 
+struct kernel_task;
+struct kernel_credentials;
+/* Admission reserves a real-UID thread charge before copying MM/files. */
+int kernel_nproc_acquire(struct kernel_task *, struct kernel_task *parent);
+/* Logical release, independent of any remaining task storage borrow. */
+void kernel_nproc_release_locked(struct kernel_task *);
+void kernel_nproc_credentials_changed_locked(struct kernel_task *,
+    const struct kernel_credentials *, const struct kernel_credentials *);
+int kernel_nproc_exec(struct kernel_task *);
+
 /* Usage belongs to the MM; these are the initiating thread group's limits. */
 struct kernel_memory_limits {
     uint64_t address_space, data_soft, data_hard;

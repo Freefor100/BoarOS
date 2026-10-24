@@ -645,6 +645,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
             leader->group_leader = 0;
             leader->group_members = 0;
             leader->state = KERNEL_THREAD_STATE_EXITED;
+            /* 身份已由新执行者接管，旧容器的存储清理不能继续占NPROC。 */
+            kernel_nproc_release_locked(leader);
             exited_append_locked(leader);
             task->group_members = 1;
             if (++task->group_epoch == 0) __builtin_trap();
@@ -716,6 +718,7 @@ static enum kernel_scheduler_status finish_clone_failure(
     int cleanup_failed;
     enum kernel_scheduler_status stack_status;
 
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_nproc_release_locked(thread); }
     /* No failed construction has published a parent completion channel. */
     thread->vfork_parent = 0;
     thread->vfork_child = 0U;
@@ -809,6 +812,8 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_credentials_clone(parent->files.heap,parent->credentials);
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    int admitted=kernel_nproc_acquire(child,parent);
+    if(admitted)return finish_clone_failure(child,admitted,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->limits=thread_clone?kernel_resource_limits_get(parent->limits):
         kernel_resource_limits_create(parent->limits->heap,parent->limits);
     if(!child->limits)
@@ -2458,10 +2463,10 @@ void kernel_task_current_memory_limits(struct kernel_memory_limits *limits)
         KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
     if (!kernel_task_has_user_context(task)) return;
     /* 当前执行者保活组身份；接纳与Linux rlimit读取一样按字段取值。 */
-    const struct kernel_task *leader = task->group_leader;
-    limits->address_space = __atomic_load_n(&leader->limits->values[KERNEL_RLIMIT_AS].current, __ATOMIC_RELAXED);
-    limits->data_soft = __atomic_load_n(&leader->limits->values[KERNEL_RLIMIT_DATA].current, __ATOMIC_RELAXED);
-    limits->data_hard = __atomic_load_n(&leader->limits->values[KERNEL_RLIMIT_DATA].maximum, __ATOMIC_RELAXED);
+    const struct kernel_resource_limits *record=task->limits;
+    limits->address_space = __atomic_load_n(&record->values[KERNEL_RLIMIT_AS].current, __ATOMIC_RELAXED);
+    limits->data_soft = __atomic_load_n(&record->values[KERNEL_RLIMIT_DATA].current, __ATOMIC_RELAXED);
+    limits->data_hard = __atomic_load_n(&record->values[KERNEL_RLIMIT_DATA].maximum, __ATOMIC_RELAXED);
 }
 
 uint64_t kernel_task_current_stack_limit(void)
@@ -2676,6 +2681,7 @@ enum kernel_task_status kernel_task_socket_write_clear(
 void kernel_credentials_changed_locked(struct kernel_task *task,
     const struct kernel_credentials *old, const struct kernel_credentials *replacement)
 {
+    kernel_nproc_credentials_changed_locked(task,old,replacement);
     if (task->exec_security &&
         (old->euid != replacement->euid || old->egid != replacement->egid ||
          old->fsuid != replacement->fsuid || old->fsgid != replacement->fsgid ||
