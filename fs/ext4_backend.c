@@ -2008,7 +2008,9 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->instance=&adapter->instance;
     node->backend_data = &((struct lwext4_node *)node)->file;
     struct ext4_inode initial;
-    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=KERNEL_VFS_S_IFREG};
+    uint32_t type=mode & KERNEL_VFS_S_IFMT;
+    if (!type) type=KERNEL_VFS_S_IFREG;
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=type};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any

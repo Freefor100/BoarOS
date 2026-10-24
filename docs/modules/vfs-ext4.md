@@ -735,9 +735,16 @@ VFS 的错误发布和共享 OFD 错误游标消费另由实例任务短锁保�
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 
-`kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件、字符/块设备及FIFO
+`kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件、字符/块设备、FIFO 及 socket
 创建与 mode 设置放在同一个 lwext4 写事务内。失败回滚由原 mount/日志 owner 处理；
 该入口不实现 devfs，不增加新的设备后端。只读根返回 EROFS，创建不占用进程 fd。
+`kernel_vfs_socket_bind_at` 复用创建返回活 inode 的路径，在父目录修改资格内同时创建
+S_IFSOCK 节点并取得独立路径引用，不在创建后重新按名称查找。创建使用调用者已应用
+umask 的 mode，并沿用 fsuid/fsgid、父目录 SGID、DAC 与只读检查；ext4 创建仍要求
+journal，tmpfs 使用相同的 VFS 身份规则。持有的 mount/inode 引用覆盖重命名、硬链接
+和最后 unlink，直到 socket 归还该路径。`kernel_vfs_socket_lookup_at` 跟随符号链接，
+按当前调用者检查目标写权限，再要求 S_IFSOCK；非 socket 返回 ECONNREFUSED。
+普通 open socket 路径返回 ENXIO，O_PATH 仍可持有其元数据身份。
 
 ## 后台写回与水位回收
 
