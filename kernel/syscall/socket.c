@@ -501,7 +501,7 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     int writing=request->number==211, unix_socket=kernel_socket_is_unix(socket);
     uint32_t flags=(uint32_t)request->arguments[2];
     uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | (writing?KERNEL_SOCKET_MSG_NOSIGNAL:
-        KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|(unix_socket?KERNEL_SOCKET_MSG_PEEK:0));
+        KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|KERNEL_SOCKET_MSG_PEEK);
     enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
     size_t copied=0;
     struct kernel_socket_address address={0};
@@ -669,7 +669,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     case 207: { /* recvfrom / recv */
         uint32_t flags = (uint32_t)request->arguments[3];
         data_call.message.flags=flags;
-        if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | (kernel_socket_is_unix(socket)?KERNEL_SOCKET_MSG_PEEK:0))) { result = -KERNEL_EOPNOTSUPP; break; }
+        if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK)) { result = -KERNEL_EOPNOTSUPP; break; }
         const struct kernel_uaccess_iovec iov = {request->arguments[1],range_size};
         uint32_t message_size = 0;
         if (kernel_files_socket_iov_io(files,mm,&file,&iov,1,iov.length,
