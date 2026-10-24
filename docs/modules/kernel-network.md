@@ -78,12 +78,15 @@ socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释
 关闭工作尚未服务时验证容量回收及 timer 到期均清空借用；同时检查非 socket
 raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所有权用例。
 
-支持`AF_UNIX`的STREAM/DGRAM socketpair及CLOEXEC/NONBLOCK，双OFD/双fd原子
-发布，失败不残留。endpoint只借用peer；queued packet持有发送者计费引用，即使
-发送者最后OFD已关闭，也要等接收、丢弃或接收端销毁后归还。关闭先摘除peer和
-可观察身份；仍持有packet的发送者只保留不可再发送的计费owner，最后引用释放
-实际堆对象，不建立无owner的清理重试。
+`AF_UNIX` 提供 STREAM/DGRAM 的普通 socket、socketpair、文件路径名和抽象名称。创建、绑定、连接、监听、accept/accept4、配置及最后关闭由 CPU0 执行；载荷复制、接纳、读预约和等待保留在发起 CPU。socketpair 的双 OFD/FD 原子发布，失败归还未发布对象。
 
+UNIX 名称单独分配、发布后不可修改。地址接口用带长度的借用视图，与原 INET 地址保持同样的24字节；导出地址和 DGRAM 消息各自持有名称引用。抽象名称按 socket 类型、完整长度和原始字节索引，允许内部零字节；family-only bind 查找未占用的自动名称。文件路径绑定持有真实 VFS 路径，索引以文件系统实例和 inode 区分对象；bind 在同一次目录创建中取得节点，复用 DAC、umask 和 SGID 继承。改名、硬链接和 unlink 不改变连接身份。关闭留下路径节点，最后一个节点引用结束后才回收已 unlink 的 inode。
+
+逻辑关闭与端点存储寿命分别处理。命名索引发布活端点，查找在端点短保护内取得引用；连接、在途目的地址及排队 packet 的发送计费各持有实际端点存储。关闭先撤名，按 incoming 链摘除真实连接和对端空间通知，排空接纳队列，等待通知借用归还；最后一个存储使用者释放 heap。STREAM 对端关闭后保留其末次名称，accept/getpeername 及已排队数据的地址输出继续有效。普通 I/O 不持有对端 OFD，所以对端最后关闭仍立即产生 EOF/EPIPE 等状态。
+
+STREAM connect 创建待接纳子端点并发布到 listener 队列，accept 转移子端点所有权；backlog 满时使用固定发送期限等待。DGRAM 可以逐次指定目的地址，或保存默认对端；接收端按连接关系过滤发送者。多对一队列采用固定 Linux `max_dgram_qlen=10` 的边界和互连例外，连同在途预约计算接纳资格。等待登记与条件检查处于同一短保护；connected DGRAM 的空间通知绑定实际对端，回调在锁外向本 socket 等待者传播。重连或断连清除未被读取预约借用的旧消息，活动读取保持原数据及其计费。
+
+`SO_PEERCRED` 返回 Linux 指定时点的 PID、有效 UID/GID 快照：socketpair 在创建时捕获，STREAM listener 在 listen 时捕获，连接建立后分别使用监听者与连接发起者的记录。后续身份变更保持既有快照。accept4 的 NONBLOCK/CLOEXEC 只设置新 FD；接纳先预留 FD、检查并等待监听状态，地址输出成功后才安装 FD，失败由未发布对象归还资源。
 UNIX stream 普通写先预留发送者容量，在协议临界区外把用户 iovec 直接填入最终队列载荷，再检查对端状态并发布。packet 头和内联载荷只分配一次；复制 fault 只发布成功前缀，首字节 fault 不发布。对端在复制期间关闭时归还预留与未发布 packet，保留真实 EPIPE/ECONNRESET。接收直接从该载荷复制到用户，因此普通 stream 不再经过读写中转页。
 
 AF_UNIX按发送者内存限制等待，SO_RCVBUF仍可设置/查询但不能给对端发送者提供
@@ -105,8 +108,7 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 与poll/recv均按各类型处理，不把datagram peer关闭变成stream EOF。
 
 固定依据为`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
-`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。命名AF_UNIX、SCM_RIGHTS、
-凭据/ancillary仍待实现。socketpair 收发共用上述跨核状态与队列保护。
+`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。SCM_RIGHTS、SCM_CREDENTIALS 等每消息控制数据与 SEQPACKET 仍列后续功能。命名连接和 socketpair 共用上述跨核状态与队列保护。
 
 ## 发起 CPU 与等待寿命
 
@@ -217,7 +219,7 @@ socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept
 TCP MSG_TRUNC、UDP自动端口释放，IRQ仅通知由独立heap包装器检查。
 
 结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
-该段是此前loopback验收；现已接入VirtIO-net，仍没有命名AF_UNIX、SCM_RIGHTS或TCP_INFO，相关应用字段不作为已验证统计。
+该段是此前loopback验收；现已接入VirtIO-net；命名 AF_UNIX 的当前机制见上文，SCM_RIGHTS 和 TCP_INFO 仍待实现，相关应用字段按实际验证范围解释。
 
 ## 接收状态纠错（2026-10-02）
 

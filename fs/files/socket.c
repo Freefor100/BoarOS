@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/open_file.h>
 #include <kernel/socket.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 
 #include <stdint.h>
@@ -14,7 +15,9 @@
 
 static enum kernel_files_status install_socket(
     struct kernel_files *files, struct kernel_socket *socket,
-    uint32_t fd, uint32_t flags, int64_t *linux_result)
+    uint32_t fd, uint32_t flags,
+    int (*copy_peer)(void *context, const struct kernel_socket_address *address),
+    void *context, int64_t *linux_result)
 {
     struct kernel_open_file_description *ofd = 0;
     enum kernel_open_file_status status =
@@ -29,6 +32,21 @@ static enum kernel_files_status install_socket(
         kernel_socket_destroy(socket);
         return KERNEL_FILES_STATUS_STATE;
     }
+    if (copy_peer) {
+        struct kernel_socket_address peer_address
+            __attribute__((cleanup(kernel_socket_address_release))) = {0};
+        int result = kernel_socket_getpeer(socket, &peer_address);
+        if (!result) result = copy_peer(context, &peer_address);
+        if (result != 0) {
+            if (kernel_files_release_uninstalled_description(files, &ofd) !=
+                    KERNEL_FILES_STATUS_OK)
+                __builtin_trap();
+            *linux_result = result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    }
+    /* The OFD must exist before touching user output, and publication must wait
+     * for copyout so failure never closes a descriptor another task reused. */
     if (kernel_files_install_new_owned_at(files, fd,
         (flags & LINUX_SOCK_CLOEXEC) != 0U ? KERNEL_FILES_FD_CLOEXEC : 0U,
         &ofd) != KERNEL_FILES_STATUS_OK) {
@@ -64,14 +82,16 @@ enum kernel_files_status kernel_files_socket_create(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    status=install_socket(files,socket,fd,flags,linux_result);
+    status=install_socket(files,socket,fd,flags,0,0,linux_result);
     if (!status && *linux_result>=0) reservation.files=0;
     return status;
 }
 
 enum kernel_files_status kernel_files_socket_accept(
     struct kernel_files *files, struct kernel_open_file_description *listener,
-    uint32_t flags, struct kernel_socket_address *peer_address,
+    uint32_t flags,
+    int (*copy_peer)(void *context, const struct kernel_socket_address *address),
+    void *context,
     int64_t *linux_result)
 {
     KERNEL_SERVICE_SCOPE(service);
@@ -80,8 +100,7 @@ enum kernel_files_status kernel_files_socket_accept(
     int find_result = 0;
     int result;
     enum kernel_files_status status;
-    if (!kernel_files_is_live(files) || listener == 0 ||
-        peer_address == 0 || linux_result == 0)
+    if (!kernel_files_is_live(files) || listener == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     status = kernel_files_find_free_fd(files, &fd, &find_result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
@@ -90,18 +109,31 @@ enum kernel_files_status kernel_files_socket_accept(
         return KERNEL_FILES_STATUS_OK;
     }
     struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd};
-    result = kernel_socket_accept(kernel_open_file_socket(listener), &accepted);
+    struct kernel_socket *socket = kernel_open_file_socket(listener);
+    result = kernel_socket_accept_check(socket);
+    uint32_t wait_flags = kernel_open_file_flags(listener) & LINUX_SOCK_NONBLOCK
+        ? KERNEL_SOCKET_MSG_DONTWAIT : 0;
+    uint64_t target = 0;
+    if (!result) {
+        uint64_t timeout = kernel_socket_receive_timeout(socket);
+        if (timeout) {
+            uint64_t now = kernel_time_monotonic_ns();
+            target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+        }
+        for (;;) {
+            result = kernel_socket_wait_ready(socket, KERNEL_POLLIN, target, wait_flags);
+            if (result) break;
+            result = kernel_socket_accept(socket, &accepted);
+            if (result != -KERNEL_EAGAIN || wait_flags) break;
+            /* Another acceptor may consume readiness; keep this call's deadline. */
+            if (target && kernel_time_monotonic_ns() >= target) break;
+        }
+    }
     if (result != 0) {
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_socket_getpeer(accepted, peer_address);
-    if (result != 0) {
-        kernel_socket_destroy(accepted);
-        *linux_result = result;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    status=install_socket(files,accepted,fd,flags,linux_result);
+    status=install_socket(files,accepted,fd,flags,copy_peer,context,linux_result);
     if (!status && *linux_result>=0) reservation.files=0;
     return status;
 }

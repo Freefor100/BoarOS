@@ -36,6 +36,19 @@ def mremap_output(raw,cpus):
             not any(line.startswith('MREMAP FAIL') for line in lines))
 
 
+def unix_named_output(raw,performance):
+    lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('UNIX-NAMED ')]
+    if not performance:
+        names=('stream-names-accept4-shutdown','inode-rename-hardlink-unlink','dgram-reconnect-unspec-source-autobind','credentials-snapshots-dac','fault-no-sideeffects','queue-space-poll-epoll-backlog','many-senders-source-order')
+        return lines==[*(f'UNIX-NAMED CASE {name} PASS' for name in names),'UNIX-NAMED END 7']
+    metrics=re.findall(r'^UNIX-NAMED PERF name=(\S+) bytes=(\d+) count=(\d+) wall_ns=(\d+) bytes_per_sec=(\d+) ops_per_sec=(\d+) p50_ns=(\d+) p95_ns=(\d+) max_ns=(\d+) thread_cpu_ns=(\d+) rss_kib=(\d+)$',raw.replace('\r',''),re.M)
+    expected=[('pathname-stream-four',16777216,256),('abstract-dgram-four',524288,4096),('pathname-stream-connections',0,1024)]
+    return len(lines)==4 and lines[-1]=='UNIX-NAMED PERF END 3' and len(metrics)==3 and all(
+        (row[0],int(row[1]),int(row[2]))==want and int(row[3])>0 and int(row[5])>0 and
+        0<int(row[6])<=int(row[7])<=int(row[8]) and int(row[9])>0 and int(row[10])>=0
+        for row,want in zip(metrics,expected))
+
+
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -48,7 +61,8 @@ def run_loongarch(args):
     from guest import run_guest
     from root import disk,execute
     from reference import archive
-    work=Path(tempfile.mkdtemp(prefix='network-run.',dir=ROOT/'build/loongarch'))
+    work=args.output or Path(tempfile.mkdtemp(prefix='network-run.',dir=ROOT/'build/loongarch'))
+    if args.output:work.mkdir(parents=True,exist_ok=False)
     program=work/'init'
     environment=os.environ.copy();environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     compiler=ROOT/'build/loongarch/musl-root/bin/musl-gcc'
@@ -83,6 +97,7 @@ def run_loongarch(args):
             if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
             if args.workload=='futex':
                 lines,expected=futex_lines(raw,1);passed=passed and lines==expected
+            if args.workload=='unix_named':passed=not code and unix_named_output(raw,False) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if args.workload=='mremap':passed=not code and mremap_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
                 'owner_baseline_checked':platform=='boaros'}
@@ -118,6 +133,7 @@ def run_smp(args):
     (output/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     expected=[f'SOCKET-SMP CASE {name} OK' for name in ('ipv4-tcp','ipv6-tcp','ipv4-udp','ipv6-udp','unix-stream','unix-dgram','blocking-close-reuse-cancel','fault-empty-trunc-timeout-sendfile','shared-readers-writers','remote-epoll-oneshot-nested')]+['SOCKET-SMP END 10']
     pipe=args.workload=='pipe';event=args.workload=='event';altstack=args.workload=='altstack'
+    unix_named=args.workload=='unix_named'
     mremap=args.workload=='mremap'
     futex=args.workload=='futex'
     posix=args.workload=='posix'
@@ -132,6 +148,10 @@ def run_smp(args):
                 if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]
                 folder=output/f'{cpus}cpu-{memory}';folder.mkdir()
                 fixture=harness.fixture(folder,program)
+                if args.performance:
+                    marker=folder/'performance';marker.write_text('fixed named AF_UNIX performance workload\n')
+                    batch=folder/'performance.debugfs';batch.write_text(f'write "{marker.resolve()}" /performance\n')
+                    harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'performance-install.log')
                 if args.dynamic:
                     loader=ROOT/'build/riscv/musl-root/lib/libc.so'
                     batch=folder/'loader.debugfs';batch.write_text(f'mkdir /lib\nwrite "{loader}" /lib/ld-musl-riscv64.so.1\nset_inode_field /lib/ld-musl-riscv64.so.1 mode 0100755\n')
@@ -154,9 +174,10 @@ def run_smp(args):
                     if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -206,18 +227,21 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--kernel',type=Path)
     parser.add_argument('--cpus',action='append',type=int,choices=(1,2,4))
+    parser.add_argument('--performance',action='store_true',help='run fixed named AF_UNIX traffic via /performance')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--observe',action='store_true')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--firmware',default='default')
     args=parser.parse_args()
-    if args.workload in ('smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
+    if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
+    if args.performance and args.workload!='unix_named':parser.error('--performance requires --workload unix_named')
+    if args.workload in ('unix_named','smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)

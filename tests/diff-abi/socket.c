@@ -12,6 +12,7 @@
 #define LINUX_IPPROTO_UDP 17
 #define LINUX_SOL_SOCKET 1
 #define LINUX_SO_RCVTIMEO 20
+#define LINUX_SO_PEERCRED 17
 #define LINUX_F_GETFD 1
 #define LINUX_F_GETFL 3
 #define LINUX_F_SETFL 4
@@ -73,6 +74,121 @@ static void close_socket(long fd)
 {
     if (fd >= 0)
         abi_require(SC1(57, fd) == 0);
+}
+
+static void unix_named_abi_cases(void)
+{
+    long stream = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0);
+    record("socket.unix.stream-create", socket_result(stream));
+    long dgram = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_DGRAM, LINUX_AF_UNIX);
+    record("socket.unix.dgram-protocol-one", socket_result(dgram));
+    close_socket(dgram);
+    record("socket.unix.bad-protocol", SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM, -1));
+    record("socket.unix.type-protocol-order", SC3(198, LINUX_AF_UNIX, 0, 999));
+    record("socket.unix.bad-type", SC3(198, LINUX_AF_UNIX, 0, 0));
+    record("socket.accept4.bad-fd-flags", SC4(242, -1, 0, 0, 1));
+    record("socket.accept4.file-flags-order", SC4(242, 1, 0, 0, 1));
+    record("socket.accept4.file", SC4(242, 1, 0, 0, 0));
+
+    struct { int32_t pid; uint32_t uid, gid; } credentials = {0};
+    int32_t length = sizeof(credentials);
+    long result = stream < 0 ? stream :
+        SC5(209, stream, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, &credentials, &length);
+    record("socket.unix.peercred-unconnected", result == 0 &&
+        length == sizeof(credentials) && credentials.pid == 0 &&
+        credentials.uid == UINT32_MAX && credentials.gid == UINT32_MAX);
+    close_socket(stream);
+
+    int pair[2] = {-1, -1};
+    result = SC4(199, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0, pair);
+    abi_require(result == 0);
+    length = sizeof(credentials);
+    result = SC5(209, pair[0], LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, &credentials, &length);
+    record("socket.unix.peercred-pair", result == 0 && length == sizeof(credentials) &&
+        credentials.pid == SC0(172) && credentials.uid == SC0(174) && credentials.gid == SC0(176));
+    unsigned char short_credentials[sizeof(credentials)];
+    __builtin_memset(short_credentials, 0xa5, sizeof(short_credentials));
+    length = 2;
+    result = SC5(209, pair[0], LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, short_credentials, &length);
+    record("socket.unix.peercred-short", result == 0 && length == 2 &&
+        short_credentials[0] == ((unsigned char *)&credentials)[0] &&
+        short_credentials[1] == ((unsigned char *)&credentials)[1] && short_credentials[2] == 0xa5);
+    length = 0;
+    result = SC5(209, pair[0], LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0, &length);
+    record("socket.unix.peercred-zero", result == 0 && length == 0);
+    length = sizeof(credentials);
+    result = SC5(209, pair[0], LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0, &length);
+    abi_record("socket.unix.peercred-fault", result, length, -1, 0, 0, 0);
+    length = -1;
+    record("socket.unix.peercred-negative", SC5(209, pair[0], LINUX_SOL_SOCKET,
+                                                LINUX_SO_PEERCRED, 0, &length));
+    close_socket(pair[0]);
+    close_socket(pair[1]);
+
+    /* The kernel chooses the name; only its public layout is compared. */
+    struct { uint16_t family; unsigned char path[109]; } address = {.family = LINUX_AF_UNIX};
+    long listener = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK, 0);
+    long bound = listener < 0 ? listener : SC3(200, listener, &address, 2);
+    record("socket.unix.autobind", bound);
+    length = sizeof(address);
+    result = bound < 0 ? bound : SC3(204, listener, &address, &length);
+    record("socket.unix.autobind-name", result == 0 && length == 8 &&
+        address.family == LINUX_AF_UNIX && address.path[0] == 0);
+    long listening = bound < 0 ? bound : SC2(201, listener, 2);
+    record("socket.unix.listen", listening);
+    long invalid_state = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK, 0);
+    struct { uint64_t current, maximum; } old_limit, exhausted_limit;
+    abi_require(SC4(261, 0, 7, 0, &old_limit) == 0);
+    exhausted_limit = old_limit;
+    exhausted_limit.current = 0;
+    abi_require(SC4(261, 0, 7, &exhausted_limit, 0) == 0);
+    record("socket.accept4.emfile-empty", listening < 0 ? listening :
+        SC4(242, listener, 0, 0, 0));
+    record("socket.accept4.emfile-invalid-state", invalid_state < 0 ? invalid_state :
+        SC4(242, invalid_state, 0, 0, 0));
+    abi_require(SC4(261, 0, 7, &old_limit, 0) == 0);
+    close_socket(invalid_state);
+    record("socket.accept4.listener-nonblock", listening < 0 ? listening :
+        SC4(242, listener, 0, 0, 0));
+    long client = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0);
+    long connected = client < 0 ? client :
+        (listening < 0 ? listening : SC3(203, client, &address, length));
+    record("socket.unix.connect", connected);
+    record("socket.accept4.unix-invalid-flags", connected < 0 ? connected :
+        SC4(242, listener, 0, 0, 1));
+    long accepted = connected < 0 ? connected : SC4(242, listener, 0, 0,
+        LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+    record("socket.accept4.unix-create", socket_result(accepted));
+    long fd_flags = accepted < 0 ? accepted : SC3(25, accepted, LINUX_F_GETFD, 0);
+    long file_flags = accepted < 0 ? accepted : SC3(25, accepted, LINUX_F_GETFL, 0);
+    record("socket.accept4.unix-flags", fd_flags == LINUX_FD_CLOEXEC &&
+        file_flags >= 0 && (file_flags & LINUX_SOCK_NONBLOCK));
+    close_socket(accepted);
+    close_socket(client);
+    client = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0);
+    connected = client < 0 ? client :
+        (listening < 0 ? listening : SC3(203, client, &address, length));
+    accepted = connected < 0 ? connected : SC4(242, listener, 0, 0, 0);
+    fd_flags = accepted < 0 ? accepted : SC3(25, accepted, LINUX_F_GETFD, 0);
+    file_flags = accepted < 0 ? accepted : SC3(25, accepted, LINUX_F_GETFL, 0);
+    record("socket.accept4.unix-no-inherit", fd_flags == 0 &&
+        file_flags >= 0 && !(file_flags & LINUX_SOCK_NONBLOCK));
+    close_socket(accepted);
+    close_socket(client);
+    client = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0);
+    connected = client < 0 ? client :
+        (listening < 0 ? listening : SC3(203, client, &address, length));
+    long free_fd = connected < 0 ? connected : SC3(25, listener, 0, 0);
+    close_socket(free_fd);
+    int32_t fault_length = sizeof(address);
+    result = connected < 0 ? connected : SC4(242, listener, 1, &fault_length, 0);
+    abi_record("socket.accept4.unix-address-fault", result, fault_length, -1, 0, 0, 0);
+    if (result >= 0) close_socket(result);
+    long replacement = SC3(198, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0);
+    record("socket.accept4.unix-fault-fd-reuse", replacement >= 0 && replacement == free_fd);
+    close_socket(replacement);
+    close_socket(client);
+    close_socket(listener);
 }
 
 static long enable_loopback(long fd)
@@ -930,4 +1046,5 @@ void abi_socket_cases(void)
     network_application_cases();
     fresh_tcp_cases();
     unix_shutdown_cases();
+    unix_named_abi_cases();
 }

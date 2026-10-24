@@ -88,6 +88,7 @@
 #define LINUX_SYSCALL_BIND 200U
 #define LINUX_SYSCALL_LISTEN 201U
 #define LINUX_SYSCALL_ACCEPT 202U
+#define LINUX_SYSCALL_ACCEPT4 242U
 #define LINUX_SYSCALL_CONNECT 203U
 #define LINUX_SYSCALL_GETSOCKNAME 204U
 #define LINUX_SYSCALL_GETPEERNAME 205U
@@ -304,6 +305,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_LISTEN ||
                request->number == LINUX_SYSCALL_ACCEPT ||
+               request->number == LINUX_SYSCALL_ACCEPT4 ||
                request->number == LINUX_SYSCALL_CONNECT ||
                request->number == LINUX_SYSCALL_GETSOCKNAME ||
                request->number == LINUX_SYSCALL_GETPEERNAME ||
