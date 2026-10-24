@@ -11,6 +11,10 @@ static int stat_error, allocation_fail;
 static int fdinfo_pid = 42;
 static struct kernel_heap heap;
 static struct kernel_fs_context fs;
+static struct kernel_pid retained_pid;
+static unsigned pid_puts;
+void kernel_task_identity_put(struct kernel_pid *id)
+{assert(id==&retained_pid);pid_puts++;}
 
 struct kernel_task *kernel_task_current(void) { return 0; }
 enum kernel_task_status kernel_task_fs_context_borrow(const struct kernel_task *t,
@@ -140,6 +144,16 @@ int main(void)
     assert(strstr(text,"Pid:\t-1\nNSpid:\t-1\n"));kernel_heap_release(&heap,text);
     allocation_fail=1;text=0;assert(proc_fdinfo_snapshot(&node,&heap,&text,&length)==-KERNEL_ENOMEM);
     assert(!text && !allocations);
+    struct kernel_vfs_instance proc_instance={.ops=&proc_backend};
+    struct kernel_vfs_mount proc_mount={.private_data=&proc_instance};
+    struct kernel_vfs_node pid_node={.inode=proc_pid_inode(42,17,PROC_PID_DIR_KIND),.backend_data=&retained_pid};
+    struct kernel_vfs_file pid_directory={.mount=&proc_mount,.private_data=&pid_node};
+    assert(kernel_procfs_process_identity(&pid_directory)==&retained_pid);
+    pid_node.inode=proc_pid_inode(42,17,PROC_TID_DIR_KIND);
+    assert(!kernel_procfs_process_identity(&pid_directory));
+    pid_node.inode=PROC_ROOT_INODE;assert(!kernel_procfs_process_identity(&pid_directory));
+    pid_node.inode=proc_pid_inode(42,17,PROC_PID_DIR_KIND);
+    assert(!proc_close_node(&pid_node) && !pid_node.backend_data && pid_puts==1);
     puts("PASS proc pidfd fdinfo emits both Pid/NSpid, retained-dead -1, flags and allocation ownership");
     puts("PASS proc maps directory/type, Linux fields, real backing identity/path, labels, permissions, escaping and failure owner release");
     return 0;
