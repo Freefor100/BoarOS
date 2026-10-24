@@ -97,6 +97,70 @@ def unix_control_output(raw,performance,cpus):
             for row,want in zip(metrics,expected)))
 
 
+def unix_seqpacket_owners(raw,arch):
+    if not PROFILES[arch].root_success(raw,0):return False
+    if arch=='loongarch':return 'LA root owners released; pages=' in raw and ' heap-live=0' in raw
+    stacks=re.findall(r'BoarOS: task stacks released=(0x[0-9a-f]+) min-free=(0x[0-9a-f]+) max-used=(0x[0-9a-f]+)',raw)
+    return len(stacks)==1 and int(stacks[0][0],16)>0 and int(stacks[0][1],16)>=1024 and int(stacks[0][2],16)>0
+
+
+def unix_seqpacket_output(raw,performance,cpus):
+    lines=[line for line in raw.replace('\r','').splitlines() if any(prefix in line for prefix in ('UNIXSEQ ','UNIX-CONTROL '))]
+    if not lines or any(not line.startswith(('UNIXSEQ ','UNIX-CONTROL ')) for line in lines):return False
+    resource=re.fullmatch(r'UNIXSEQ RESOURCE fd_before=(\d+) fd_after=(\d+)',lines[-1])
+    if not resource or resource[1]!=resource[2]:return False
+    if performance:
+        metrics=[re.fullmatch(r'UNIXSEQ PERF name=seqpacket-(none|passcred|rights) type=seqpacket mode=(none|passcred|rights) pairs=4 rounds_per_pair=1024 count=4096 bytes=524288 cpus=(1|2|4) wall_ns=(\d+) thread_cpu_ns=(\d+) p50_ns=(\d+) p95_ns=(\d+) max_ns=(\d+) ops_per_sec=(\d+)',line) for line in lines[:-2]]
+        return (len(lines)==5 and lines[-2]=='UNIXSEQ PERF END 3' and len(metrics)==3 and
+            all(row and row[1]==row[2]==mode and int(row[3])==cpus and int(row[4])>0 and int(row[5])>0 and
+                0<int(row[6])<=int(row[7])<=int(row[8]) and int(row[9])>0
+                for row,mode in zip(metrics,('none','passcred','rights'))))
+    focus=('socketpair-type-flags-path-abstract-autobind-peercred',
+        'unconnected-listener-flags-more-eor-waitall-sendto',
+        'record-peek-trunc-empty-zero-read-recv-eof-controls',
+        'vectored-content-fault-atomic-send-consumed-receive-size-limit',
+        'raw-header-iov-control-import-before-state-reset-and-fd-interpretation',
+        'final-msghdr-fault-payload-consumed-installed-right-survives',
+        'source-current-name-after-send-latebind-and-sender-close',
+        'shutdown-drain-halfclose-reset-empty-child-no-sigpipe',
+        'nonblock-backlog-accept-invalid-flags-address-fault-consumes-child',
+        'poll-epoll-level-edge-oneshot-blocked-wake-eof')
+    expected=[]
+    for name in focus:
+        if name=='shutdown-drain-halfclose-reset-empty-child-no-sigpipe':expected.append('UNIXSEQ ACTION sigpipe send=0 write=0 sendfile=0 total=0')
+        if name=='poll-epoll-level-edge-oneshot-blocked-wake-eof':expected += [f'UNIXSEQ CPU index={cpu} affinity={cpu} rights=1 PASS' for cpu in range(cpus)]
+        expected.append(f'UNIXSEQ CASE {name} PASS')
+    control=('rights-file-pipe-socket-eventfd-opath-shared-state-cloexec',
+        'send-retains-file-after-close-and-fd-reuse','control-none-small-multiple-records-truncation',
+        'credentials-partial-control-and-rights-truncation','bad-fd-and-253-254-rights-limit',
+        'receive-full-fd-table-payload-and-partial-rights',
+        'inflight-nofile-eight-ninth-allowed-tenth-rejected-drain-uid-account',
+        'exit-group-blocked-sendmsg-releases-unpublished-rights','peek-duplicates-and-plain-read-discards-rights',
+        'credentials-real-ids-peer-snapshot-explicit-permissions','fault-send-control-no-enqueue',
+        'libc-sendmsg-control-fault-observation','null-control-nonzero-capacity-discards-rights',
+        'null-name-skips-readonly-namelen-output','fault-receive-control-returns-payload-ctrunc',
+        'fault-partial-control-installs-first-fd','fault-dgram-payload-consumes-and-drops-rights',
+        'malformed-and-empty-rights-control','concurrent-transfer-source-close-with-cycle-churn')
+    libc=[line for line in lines if line.startswith('UNIX-CONTROL ACTION libc-sendmsg-inaccessible-control ')]
+    if len(libc)!=1 or libc[0] not in ('UNIX-CONTROL ACTION libc-sendmsg-inaccessible-control outcome=sigsegv',
+        'UNIX-CONTROL ACTION libc-sendmsg-inaccessible-control outcome=efault'):return False
+    actions={
+        'inflight-nofile-eight-ninth-allowed-tenth-rejected-drain-uid-account':'UNIX-CONTROL ACTION inflight-quota-numeric-uid-rotation executed=1',
+        'exit-group-blocked-sendmsg-releases-unpublished-rights':'UNIX-CONTROL ACTION exit-group-pending-control sleeping_sender=1 original_pipe_writer_closed=1 eof_after_wait=1',
+        'credentials-real-ids-peer-snapshot-explicit-permissions':'UNIX-CONTROL ACTION credentials-distinct-real-effective-ids executed=1',
+        'libc-sendmsg-control-fault-observation':libc[0]}
+    for name in control:
+        if name in actions:expected.append(actions[name])
+        expected.append(f'UNIX-CONTROL CASE {name} PASS')
+    expected += ['UNIX-CONTROL ACTION gc-concurrent-churn queues=32 closed_user_fds=64',
+        'UNIX-CONTROL ACTION gc-self-cycle queues=32 closed_user_fds=64',
+        'UNIX-CONTROL ACTION gc-mutual-cycle queues=64 closed_user_fds=128',
+        'UNIX-CONTROL ACTION gc-external-root retained_message_read=1 closed_user_fds=4',
+        'UNIX-CONTROL ACTION gc-unaccepted-child queued_children=16 closed_user_fds=32',
+        'UNIXSEQ END focus=10 control=19']
+    return lines[:-1]==expected
+
+
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -129,7 +193,7 @@ def run_loongarch(args):
         if args.only and args.only!=platform:continue
         for memory in args.memory or ('512M','1G'):
             case=work/f'{platform}-{memory}';case.mkdir()
-            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control') else disk(case,program)
+            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket') else disk(case,program)
             kernel=profile.linux_kernel() if platform=='linux' else args.kernel or ROOT/profile.kernel
             snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
             command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
@@ -147,6 +211,7 @@ def run_loongarch(args):
                 lines,expected=futex_lines(raw,1);passed=passed and lines==expected
             if args.workload=='unix_named':passed=not code and unix_named_output(raw,False) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if args.workload=='unix_control':passed=not code and unix_control_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+            if args.workload=='unix_seqpacket':passed=not code and unix_seqpacket_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
             if args.workload=='mremap':passed=not code and mremap_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
                 'owner_baseline_checked':platform=='boaros'}
@@ -184,6 +249,7 @@ def run_smp(args):
     pipe=args.workload=='pipe';event=args.workload=='event';altstack=args.workload=='altstack'
     unix_named=args.workload=='unix_named'
     unix_control=args.workload=='unix_control'
+    unix_seqpacket=args.workload=='unix_seqpacket'
     mremap=args.workload=='mremap'
     futex=args.workload=='futex'
     posix=args.workload=='posix'
@@ -226,9 +292,10 @@ def run_smp(args):
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if unix_seqpacket:passed=unix_seqpacket_output(raw,args.performance,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -278,7 +345,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -291,8 +358,8 @@ def main(default_arch="riscv"):
     parser.add_argument('--firmware',default='default')
     args=parser.parse_args()
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
-    if args.performance and args.workload not in ('unix_named','unix_control'):parser.error('--performance requires --workload unix_named or unix_control')
-    if args.workload in ('unix_named','unix_control','smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
+    if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
+    if args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)

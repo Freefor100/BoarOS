@@ -176,6 +176,7 @@ void kernel_socket_control_export(struct kernel_socket_call *call,struct kernel_
     uint32_t missing=call->message.receive_state==KERNEL_SOCKET_RECEIVE_STREAM_EMPTY?0U:65534U;
     struct kernel_socket_control defaults={.uid=missing,.gid=missing,.has_credentials=1};
     *used=0;
+    if (call->message.receive_state==KERNEL_SOCKET_RECEIVE_EOF) return;
     if (!control) { if (!passcred) return; control=&defaults; }
     if (!address) {
         if (passcred || (control->count && call->message.receive_state!=KERNEL_SOCKET_RECEIVE_STREAM_FAULT))

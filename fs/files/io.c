@@ -456,7 +456,8 @@ static enum kernel_files_status read_pinned(
             }
             if (received < 0 || read_request.socket == 0) break;
             int datagram = read_request.datagram;
-            if (datagram) kernel_socket_read_info(&read_request, peer, message_size);
+            if (datagram || (peer && kernel_socket_is_unix(read_request.socket)))
+                kernel_socket_read_info(&read_request, peer, datagram ? message_size : 0);
             int fault = !discard && kernel_socket_read_user(&read_request, mm, &cursor);
             KERNEL_FILES_NOTE(files, read_chunks, 1);
             total += kernel_socket_finish_read(&read_request, fault);

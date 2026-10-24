@@ -62,13 +62,13 @@ struct kernel_socket_write_request {
     uint64_t queued_ticks, executing_ticks, completed_ticks;
 #endif
 };
-int kernel_socket_is_datagram(const struct kernel_socket *socket);
 /* Message boundaries and stream signal policy are independent of connection state. */
 int kernel_socket_preserves_messages(const struct kernel_socket *socket);
 int kernel_socket_is_stream(const struct kernel_socket *socket);
 int kernel_socket_is_seqpacket(const struct kernel_socket *socket);
 /* Linux SEQPACKET checks pending error/connection before SCM interpretation. */
 int kernel_socket_prepare_send(struct kernel_socket *socket);
+int kernel_socket_prepare_receive(struct kernel_socket *socket);
 int kernel_socket_is_unix(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
@@ -170,6 +170,9 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
 #define KERNEL_SOCKET_MSG_DONTWAIT 0x40U
 #define KERNEL_SOCKET_MSG_NOSIGNAL 0x4000U
 #define KERNEL_SOCKET_MSG_TRUNC 0x20U
+#define KERNEL_SOCKET_MSG_EOR 0x80U
+#define KERNEL_SOCKET_MSG_MORE 0x8000U
+#define KERNEL_SOCKET_MSG_WAITALL 0x100U
 #define KERNEL_SOCKET_IO_MESSAGE 0x80000000U
 #define KERNEL_SOCKET_IO_MORE 0x40000000U
 int kernel_socket_shutdown(struct kernel_socket *socket, int how);
