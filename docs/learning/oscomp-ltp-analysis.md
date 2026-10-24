@@ -641,3 +641,5 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 `accept4_01` 在四个架构/libc组合中各有8/9项通过。唯一 TCONF 是该程序附加探测的旧 `socketcall(SYS_ACCEPT4)`：RV64/LA64 没有 `socketcall` ABI。程序本身直接调用 `accept4` 和 libc `accept4` 的标志组合均通过；这四项 TCONF 不对应 BoarOS 行为失败。其它五项全部满分。RV、LA 的根盘及第二盘分区合计八项检查均通过，外层1小时监督未触发，默认交付文件恢复成功。冷页发送导致的RV内核栈溢出已在10:31引用合并候选上用原RV glibc ELF再次复测：同一 ELF 的7/7组通过，PID 1正常退出、heap-live=0、最小空闲内核栈1488字节，e2fsck返回0；调用链和修复见[网络模块](../modules/kernel-network.md#发起-cpu-与等待寿命)。
 
 原始每项 TPASS/TCONF、judge、毫秒、kernel/init/ELF/QEMU身份和磁盘检查保存在 `build/unix-named-20261024/original/`。这份汇总以人读的得分和细项为主，原始串口日志留在结果目录。
+
+10:36 有一次尝试用最终兼容内核刷新这六项；当时生成的默认 init 不再含临时驱动要查找的组列表锚点，客体先进入正常评测组。发现后在 LTP 前停止，未产生新的分数，也没有纳入上表；原因和日志位置见[测例问题](oscomp-test-issues.md#原脚本调用与判分差异)。

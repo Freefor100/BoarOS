@@ -80,6 +80,7 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 
 | 项目 | 具体问题与影响 | 当前处理 |
 |---|---|---|
+| 六项 socket LTP 的临时复核入口 | 10月24日更新默认 init 后，临时驱动仍通过查找 `\ngroups=${BOAROS_EVAL_GROUPS` 来截断启动脚本；当前生成物没有这个锚点，过滤代码被追加在完整默认组列表之后。两架构因此先进入 basic、busybox、cyclictest、iozone，未到 LTP。 | 立即停止两个客体；该尝试没有 LTP 结果、得分或超时记录，临时运行盘已删除。此前10:21使用有效 LTP-only init 的六项原程序结果仍是有效结果。今后以 `tests/oscomp/prepare.py --groups ltp` 生成 LTP-only init，并在启动前验证实际 `BOAROS_EVAL_GROUPS` 和测试枚举。记录见 `build/unix-named-20261024/original-refinement/aborted.json`。 |
 | iozone 向量 I/O | 原命令 `./iozone -t 4 -i 11 -i 12 -r 1k -s 1m` 请求 pwritev/preadv，发布二进制却报 `Selected test not available on the version`，随后输出默认 initial writers/rewriters。 | 保留原命令；分析按实际输出判断。该次运行只证明默认写入路径完成，向量能力由独立 ABI 和原 preadv/pwritev 测例验证。 |
 | libc-test 脚本 | `run-static.sh`、`run-dynamic.sh` 没有 shebang；原 LA musl BusyBox 在固定 Linux 也拒绝直接执行，后面的程序尚未开始。 | 临时外层脚本用该 libc 自己的 BusyBox `sh` 显式解释这两行；内层列表和参数原样执行。 |
 | BusyBox 的 `kill 10` | judge 的固定清单要求此标签，发布 `busybox_cmd.txt` 实际执行 `sh -c 'sleep 5' & ./busybox kill $!`，成功标签按整行输出。judge 另补的 `kill 10` 因无对应标签得零。 | 保留原脚本和 judge；**54/55** 的差额按标签错位解释，后台 PID 的实际 kill 单列。 |
