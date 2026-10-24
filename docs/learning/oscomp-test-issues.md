@@ -154,5 +154,5 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 控制台原因取自对应条目的reason；原judge对跳过项记零。
 
 当前内核能力与后续实现方向仍由 [goals](../goals.md) 和各模块维护。例如
-O_DIRECT、普通命名AF_UNIX socket、CPU-time sleep等缺口按内核能力处理；POSIX timer已支持的四类时钟及其余时钟缺口见[原程序结果](oscomp-ltp-analysis.md#posix-定时器原程序四类时钟完成版)。对应实际失败和
+O_DIRECT、CPU-time sleep等缺口按内核能力处理；POSIX timer已支持的四类时钟及其余时钟缺口见[原程序结果](oscomp-ltp-analysis.md#posix-定时器原程序四类时钟完成版)。对应实际失败和
 已修复语义见[原程序结果](oscomp-official-delivery.md)。
