@@ -63,10 +63,25 @@ int signal_timer_post_locked(struct kernel_pid *p,int thread,struct signal_queue
 {assert(p==&pid);(void)cursor;*wake=0;if(ignored)return 2;signal_pending_post_timer_locked(&task,!thread,record);return 1;}
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all){(void)cursor;(void)all;abort();}
 enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *t){(void)t;abort();}
+static unsigned sleep_mode,sleep_notified;
+enum kernel_scheduler_status kernel_wait_prepare_locked(struct kernel_wait_queue *q,uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+{assert(!q&&!deadline&&interruptible&&kernel_cpu_current()->raw_locks);*token=(struct kernel_wait_token){&task,1};return 0;}
+int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
+{assert(token->task==&task&&reason==KERNEL_WAIT_WOKEN&&kernel_cpu_current()->raw_locks);sleep_notified++;return 1;}
+enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *token,enum kernel_wait_wake_reason *reason)
+{
+    assert(token->task==&task&&!kernel_cpu_current()->raw_locks&&task.cpu_sleep);
+    if(!sleep_mode){cpu_user=500;scheduler_cpu_timer_expire();assert(sleep_notified==1);*reason=KERNEL_WAIT_WOKEN;}
+    else *reason=KERNEL_WAIT_SIGNALLED;
+    return 0;
+}
+enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
+{assert(token->task==&task&&!kernel_cpu_current()->raw_locks&&!task.cpu_sleep);*token=(struct kernel_wait_token){0};return 0;}
 static uint64_t count(void){KERNEL_RAW_SCOPE(g,&kernel_wait_domain);return kernel_signal_pending_count_locked(&task);}
 static void init(void)
 {
     task=(struct kernel_task){0};task.group_leader=&task;task.group_members=1;task.files.heap=&heap;
+    task.cpu_limit=(struct kernel_rlimit64){KERNEL_RLIM_INFINITY,KERNEL_RLIM_INFINITY};
     task.sigpending_limit=(struct kernel_rlimit64){4096,4096};task.tid=1;
     pid=(struct kernel_pid){.number=1,.references=1,.generation=1};
     for(unsigned r=0;r<2;r++){members[r]=(struct kernel_pid_member){.identity=&pid,.role=r,.task=&task};pid.members[r]=&members[r];}
@@ -204,8 +219,22 @@ static void changed_uid_reservation(void)
     assert(!kernel_credentials_initial()->account->pending);
     task.credentials=kernel_credentials_initial();kernel_uid_account_put(user.account);finish();
 }
+static void cpu_sleep_owner(void)
+{
+    init();uint64_t deadline,remaining;unsigned charges=count();
+    sleep_mode=sleep_notified=0;
+    assert(!kernel_posix_cpu_sleep(&task,2,0,100,&deadline,&remaining));
+    assert(deadline==100&&!remaining&&!task.cpu_sleep&&!task.cpu_timer_index[0].indexed&&count()==charges);
+    cpu_user=100;sleep_mode=1;
+    assert(kernel_posix_cpu_sleep(&task,2,1,800,&deadline,&remaining)==-KERNEL_ERESTARTSYS);
+    assert(deadline==800&&remaining==700&&!task.cpu_sleep&&!task.cpu_timer_index[0].indexed&&count()==charges);
+    allocation_fail=1;
+    assert(kernel_posix_cpu_sleep(&task,2,1,800,&deadline,&remaining)==-KERNEL_ENOMEM);
+    allocation_fail=0;finish();
+}
 int main(void)
 {
+    cpu_sleep_owner();
     reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase and completion/delete owner passed");return 0;
 }

@@ -286,13 +286,33 @@ enum kernel_syscall_status syscall_handle_times(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static enum kernel_syscall_status syscall_cpu_sleep(struct kernel_task *caller,
+    int32_t clock,int absolute,int original_absolute,uint64_t value,uint64_t remaining_address,
+    struct kernel_syscall_result *decoded)
+{
+    uint64_t deadline=0,remaining=0;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value=kernel_posix_cpu_sleep(caller,clock,absolute,value,&deadline,&remaining);
+    if(decoded->value!=-KERNEL_ERESTARTSYS)return KERNEL_SYSCALL_STATUS_OK;
+    if(remaining_address) {
+        struct kernel_mm *mm;size_t copied=0;
+        struct linux_timespec result={remaining/1000000000,remaining%1000000000};
+        if(kernel_task_mm_borrow_mutable(caller,&mm))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        enum kernel_uaccess_status status=kernel_copy_to_user(mm,remaining_address,&result,sizeof(result),&copied);
+        if(status==KERNEL_UACCESS_STATUS_FAULT){decoded->value=-KERNEL_EFAULT;return KERNEL_SYSCALL_STATUS_OK;}
+        if(status||copied!=sizeof(result))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    kernel_signal_note_nanosleep_restart(caller,clock,original_absolute,deadline,remaining_address);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_restart_syscall(
     struct kernel_task *caller,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     enum kernel_scheduler_status sleep_status;
+    int32_t clock_id;
     uint64_t deadline;
     uint64_t remaining_address;
     uint64_t futex_address;
@@ -318,11 +338,17 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
             kernel_signal_clear_syscall_restart(caller);
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (!kernel_signal_nanosleep_restart(caller, &deadline,
+    if (!kernel_signal_nanosleep_restart(caller, &clock_id, &deadline,
                                          &remaining_address)) {
         decoded->value = -KERNEL_ENOSYS;
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    if(clock_id==2||clock_id<0) {
+        enum kernel_syscall_status status=syscall_cpu_sleep(caller,clock_id,1,0,deadline,remaining_address,decoded);
+        if(decoded->value!=-KERNEL_ERESTARTSYS)kernel_signal_clear_syscall_restart(caller);
+        return status;
+    }
+    KERNEL_SERVICE_SCOPE(service);
     if (deadline == 0U ||
         (int64_t)(arch_time_read() - deadline) >= 0) {
         kernel_signal_clear_syscall_restart(caller);
@@ -395,7 +421,8 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     uint64_t remaining_address,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
+    int cpu_clock=clock_id==2U||(int32_t)clock_id<0;
+    KERNEL_SERVICE_SCOPE_IF(service,!cpu_clock);
     struct kernel_mm *mm;
     struct linux_timespec request_spec;
     enum kernel_task_status task_status;
@@ -414,12 +441,12 @@ enum kernel_syscall_status syscall_handle_sleep_for(
         decoded->value = -KERNEL_EOPNOTSUPP;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (clock_id != LINUX_CLOCK_REALTIME && clock_id != LINUX_CLOCK_MONOTONIC) {
+    if (!cpu_clock && clock_id != LINUX_CLOCK_REALTIME && clock_id != LINUX_CLOCK_MONOTONIC) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if ((flags & ~LINUX_TIMER_ABSTIME) != 0U) {
+    if (!cpu_clock && (flags & ~LINUX_TIMER_ABSTIME) != 0U) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -457,6 +484,9 @@ enum kernel_syscall_status syscall_handle_sleep_for(
 
         duration_ns = requested > INT64_MAX ? INT64_MAX : (uint64_t)requested;
     }
+    if(cpu_clock)return syscall_cpu_sleep(caller,(int32_t)clock_id,
+        (flags&LINUX_TIMER_ABSTIME)!=0,(flags&LINUX_TIMER_ABSTIME)!=0,duration_ns,
+        (flags&LINUX_TIMER_ABSTIME)?0:remaining_address,decoded);
     if ((flags & LINUX_TIMER_ABSTIME) != 0U) {
         target_monotonic_ns = clock_id == LINUX_CLOCK_REALTIME
                                   ? duration_ns -
@@ -527,6 +557,8 @@ enum kernel_syscall_status syscall_handle_sleep_for(
 
     if (wake_reason == KERNEL_WAIT_SIGNALLED) {
         kernel_signal_note_nanosleep_restart(caller,
+                                             LINUX_CLOCK_MONOTONIC,
+                                             (flags&LINUX_TIMER_ABSTIME)!=0,
                                              deadline,
                                              (flags & LINUX_TIMER_ABSTIME) != 0U
                                                  ? 0U : remaining_address);

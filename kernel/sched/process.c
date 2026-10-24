@@ -621,6 +621,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->sigpending_limit=leader->sigpending_limit;
         task->as_limit = leader->as_limit;
         task->data_limit = leader->data_limit;
+        task->cpu_limit = leader->cpu_limit;
         kernel_signal_pending_adopt_locked(task,leader);
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
@@ -914,6 +915,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->sigpending_limit=parent->group_leader->sigpending_limit;
     child->as_limit = parent->group_leader->as_limit;
     child->data_limit = parent->group_leader->data_limit;
+    child->cpu_limit = parent->group_leader->cpu_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -998,6 +1000,8 @@ enum kernel_scheduler_status arch_process_clone_current(
                 parent->vfork_wait_child = child;
             }
             child->state = KERNEL_THREAD_STATE_READY;
+            if(!thread_clone && child->cpu_limit.current!=KERNEL_RLIM_INFINITY)
+                scheduler_cpu_timer_update_locked(child,0);
             ready_enqueue_locked(child, 0);
         }
     }
@@ -1622,6 +1626,7 @@ static void reap_claim_end(struct kernel_task **task)
 /* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
 static void cleanup_task_io_requests(struct kernel_task *thread)
 {
+    kernel_posix_cpu_sleep_abort(thread);
     kernel_msg_abort(thread);
     kernel_sem_abort(thread);
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
@@ -2388,6 +2393,7 @@ enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_
 static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint32_t resource)
 {
     switch (resource) {
+    case KERNEL_RLIMIT_CPU: return &leader->cpu_limit;
     case KERNEL_RLIMIT_NOFILE: return &leader->nofile_limit;
     case KERNEL_RLIMIT_STACK: return &leader->stack_limit;
     case KERNEL_RLIMIT_CORE: return &leader->core_limit;
@@ -2427,17 +2433,23 @@ enum kernel_task_status kernel_task_set_rlimit(
          limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
         (resource == KERNEL_RLIMIT_STACK &&
          limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
-        (resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
+        (resource != KERNEL_RLIMIT_CPU && resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
          resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE &&
          resource != KERNEL_RLIMIT_SIGPENDING && resource != KERNEL_RLIMIT_AS &&
          resource != KERNEL_RLIMIT_DATA))
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
-        return KERNEL_TASK_STATUS_STATE;
-    struct kernel_rlimit64 *slot = task_limit_slot(task->group_leader, resource);
-    __atomic_store_n(&slot->current, limit->current, __ATOMIC_RELAXED);
-    __atomic_store_n(&slot->maximum, limit->maximum, __ATOMIC_RELAXED);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
+            return KERNEL_TASK_STATUS_STATE;
+        struct kernel_rlimit64 *slot = task_limit_slot(task->group_leader, resource);
+        if(!slot)__builtin_trap();
+        __atomic_store_n(&slot->current, limit->current, __ATOMIC_RELAXED);
+        __atomic_store_n(&slot->maximum, limit->maximum, __ATOMIC_RELAXED);
+        if(resource==KERNEL_RLIMIT_CPU)
+            scheduler_cpu_timer_update_locked(task->group_leader,0);
+    }
+    if(resource==KERNEL_RLIMIT_CPU)kernel_posix_timer_changed();
     return KERNEL_TASK_STATUS_OK;
 }
 

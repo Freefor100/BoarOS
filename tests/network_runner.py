@@ -17,7 +17,7 @@ import harness
 from arch_profiles import PROFILES
 
 def workload_source(name):
-    return ROOT / ({'memory':'tests/workloads/resource/memory.c','mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
+    return ROOT / ({'cpu':'tests/workloads/resource/cpu.c','memory':'tests/workloads/resource/memory.c','mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
 
 def futex_lines(raw,cpus):
     names=['abi','atomics']+[f'compare-{cmp}-old-{value}' for cmp in range(6) for value in (-1,0,1)]+['requeue-near','requeue-offset','wake-zero','wake-negative','wake-both','shared','robust']
@@ -202,6 +202,14 @@ def sysv_msg_output(raw,cpus):
         expected.append(f'SYSV-MSG CASE {name} PASS')
     return lines==expected+['SYSV-MSG RESOURCE queues=0 messages=0 bytes=0','SYSV-MSG END 12']
 
+CPU_CASES=('getcpu-prefix-local','limit-default-set-fork','limit-soft-signal-and-update',
+    'limit-hard-kill','cpu-sleep-abi','cpu-sleep-process-and-other-thread','limit-thread-and-exec','cpu-sleep-interrupt-and-output-fault','cpu-sleep-target-exit-and-caller-kill','absolute-sleep-stop-reloads-request')
+def cpu_output(raw,cpus):
+    lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('CPU ')]
+    expected=['CPU BEGIN',*[f'CPU EXEC index={i} PASS' for i in range(cpus)],
+        *(f'CPU CASE {name} PASS' for name in CPU_CASES),'CPU END cases=10']
+    return lines==expected
+
 MEMORY_CASES=('as-map','as-fixed','data-private','data-zero','data-fixed','protect-prefix',
     'protect-hole','remap-growth','remap-fixed','brk-same-page','shm-as','stack-initial',
     'stack-as','stack-soft','file-shm-data','caller-limits','shared-admission','limit-abi','limit-thread-fork',
@@ -244,7 +252,7 @@ def run_loongarch(args):
         if args.only and args.only!=platform:continue
         for memory in args.memory or ('512M','1G'):
             case=work/f'{platform}-{memory}';case.mkdir()
-            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory') else disk(case,program)
+            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu') else disk(case,program)
             kernel=profile.linux_kernel() if platform=='linux' else args.kernel or ROOT/profile.kernel
             snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
             command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
@@ -264,6 +272,7 @@ def run_loongarch(args):
             if args.workload=='unix_control':passed=not code and unix_control_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if args.workload=='unix_seqpacket':passed=not code and unix_seqpacket_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
             if args.workload=='sysv_msg':passed=not code and sysv_msg_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
+            if args.workload=='cpu':passed=not code and cpu_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if args.workload=='memory':passed=not code and memory_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if args.workload=='sysv_sem':passed=not code and sysv_sem_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
             if args.workload=='mremap':passed=not code and mremap_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -307,7 +316,7 @@ def run_smp(args):
     unix_control=args.workload=='unix_control'
     unix_seqpacket=args.workload=='unix_seqpacket'
     sysv_sem=args.workload=='sysv_sem'
-    sysv_msg=args.workload=='sysv_msg';memory_workload=args.workload=='memory'
+    sysv_msg=args.workload=='sysv_msg';memory_workload=args.workload=='memory';cpu_workload=args.workload=='cpu'
     mremap=args.workload=='mremap'
     futex=args.workload=='futex'
     posix=args.workload=='posix'
@@ -355,10 +364,11 @@ def run_smp(args):
                     if memory_workload:
                         online=[int(v) for v in re.findall(r'^BoarOS: SMP online logical=(\d+) hart=0x[0-9a-f]+\r?$',raw,re.M)]
                         passed=memory_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0) and online==list(range(1,cpus)))
+                    if cpu_workload:passed=cpu_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if sysv_sem:passed=sysv_sem_output(raw,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -408,7 +418,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -422,7 +432,7 @@ def main(default_arch="riscv"):
     args=parser.parse_args()
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
     if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory') and args.arch=='riscv':return run_smp(args)
+    if args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)

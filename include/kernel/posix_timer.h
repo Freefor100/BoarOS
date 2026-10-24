@@ -22,9 +22,12 @@ int kernel_posix_timer_set(struct kernel_task *,int32_t,int,
 int kernel_posix_timer_delete(struct kernel_task *,int32_t);
 uint64_t kernel_posix_timer_deadline(void);
 void kernel_posix_timer_expire(uint64_t);
+void kernel_posix_timer_changed(void);
 void kernel_posix_timer_unignore(struct kernel_task *,unsigned);
 void kernel_posix_timers_exec(struct kernel_task *);
 void kernel_posix_timers_exit(struct kernel_task *);
+int kernel_posix_cpu_sleep(struct kernel_task *,int32_t,int,uint64_t,uint64_t *,uint64_t *);
+void kernel_posix_cpu_sleep_abort(struct kernel_task *);
 void kernel_posix_cpu_target_exit(struct kernel_task *);
 void kernel_posix_timers_adopt_locked(struct kernel_task *,struct kernel_task *);
 #endif

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#define KERNEL_RLIMIT_CPU 0U
 #define KERNEL_RLIMIT_STACK 3U
 #define KERNEL_RLIMIT_FSIZE 1U
 #define KERNEL_RLIMIT_DATA 2U

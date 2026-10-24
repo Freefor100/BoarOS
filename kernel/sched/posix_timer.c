@@ -40,6 +40,13 @@ struct kernel_posix_timer {
     uint32_t indexed,armed,queued,busy,deferred,parked;
 
 };
+/* Only user-visible timers have a registry owner. Internal CPU sleeps share
+ * the deadline tree, but retain their own waiter and no signal reservation. */
+struct kernel_posix_cpu_sleep {
+    struct kernel_posix_timer timer;
+    struct kernel_wait_token token;
+    int completed;
+};
 static struct kernel_avl_node *wall_root,*cpu_root;
 static uint32_t cpu_active;
 static int cpu_target_live(struct kernel_task *task,unsigned thread)
@@ -54,7 +61,8 @@ void scheduler_cpu_timer_update_locked(struct kernel_task *task,unsigned thread)
 {
     struct kernel_cpu_timer_index *index=&task->cpu_timer_index[thread];
     int active=index->timers[0]||index->timers[1]||index->timers[2]||
-        (!thread&&(task->cpu_timers[0].expires||task->cpu_timers[1].expires));
+        (!thread&&(task->cpu_timers[0].expires||task->cpu_timers[1].expires||
+                   task->cpu_limit.current!=KERNEL_RLIM_INFINITY));
     active=active&&cpu_target_live(task,thread);
     struct kernel_pid *identity=active?process_identity(task,thread?KERNEL_PID_TID:KERNEL_PID_TGID):0;
     uint64_t key=identity?identity->generation*2+thread:0;
@@ -69,7 +77,7 @@ void scheduler_cpu_timer_update_locked(struct kernel_task *task,unsigned thread)
 }
 
 static uint64_t wall_next;
-static void timer_changed(void)
+void kernel_posix_timer_changed(void)
 {
 #if BOAROS_MAX_CPUS > 1
     if(kernel_cpu_current()->logical_id){kernel_cpu_notify(riscv_smp_cpu(0),RISCV_IPI_DEADLINE);return;}
@@ -245,7 +253,7 @@ void posix_timer_record_complete(struct signal_queue_record *record)
     }
     if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
     if(wake){signal_timer_notify(wake,(unsigned)t->event.signal);scheduler_task_put(wake);}
-    timer_changed();if(free_it)timer_free(t);
+    kernel_posix_timer_changed();if(free_it)timer_free(t);
 }
 static struct kernel_posix_timer *timer_get(struct kernel_task *caller,int32_t id)
 {
@@ -343,7 +351,7 @@ int kernel_posix_timer_delete(struct kernel_task *caller,int32_t id)
     int removed=0;
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);if(t->valid){unhash_locked(t);removed=1;}}
     if(removed)timer_put(t);
-    timer_put(t);timer_changed();return removed?0:-KERNEL_EINVAL;
+    timer_put(t);kernel_posix_timer_changed();return removed?0:-KERNEL_EINVAL;
 }
 /* CPU snapshots acquire the scheduler domain internally. The setting and
  * identity role are checked again before publishing a sampled result. */
@@ -402,7 +410,7 @@ int kernel_posix_timer_set(struct kernel_task *caller,int32_t id,int flags,
         else if(t->event.notify!=1||t->cpu.identity)t->expires=0;
         break;
     }
-    timer_put(t);timer_changed();return error;
+    timer_put(t);kernel_posix_timer_changed();return error;
 }
 static void notify(struct kernel_wait_cursor *cursor,struct kernel_task *wake,unsigned sig)
 {
@@ -443,6 +451,12 @@ void scheduler_cpu_timer_expire(void)
                     if(node&&node->key<=sample){timer=(void *)((char *)node- offsetof(struct kernel_posix_timer,deadline));break;}
                 }
                 if(!timer)break;
+                if(!timer->owner) {
+                    struct kernel_posix_cpu_sleep *sleep=(void *)timer;
+                    deactivate_locked(timer);sleep->completed=1;
+                    kernel_wait_notify_locked(&sleep->token,KERNEL_WAIT_WOKEN);
+                    continue;
+                }
                 timer->references++;deactivate_locked(timer);queue_locked(timer,&cursor,&wake);
             }
             notify(&cursor,wake,(unsigned)timer->event.signal);timer_put(timer);
@@ -512,7 +526,7 @@ void kernel_posix_timers_exec(struct kernel_task *task)
         if(!t)break;
         timer_put(t);
     }
-    registry_put(r);timer_changed();
+    registry_put(r);kernel_posix_timer_changed();
 }
 void kernel_posix_timers_exit(struct kernel_task *task)
 {
@@ -536,4 +550,74 @@ void kernel_posix_timers_adopt_locked(struct kernel_task *to,struct kernel_task 
             t->cpu_index=next;node=node->right;}
     }
     scheduler_cpu_timer_update_locked(to,0);
+}
+
+/* The caller owns the wait object until its task is no longer executable.
+ * Expiry only accesses it under the same domain used by cancellation. */
+void kernel_posix_cpu_sleep_abort(struct kernel_task *task)
+{
+    struct kernel_posix_cpu_sleep *sleep;
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        sleep=task->cpu_sleep;
+        if(!sleep)return;
+        task->cpu_sleep=0;deactivate_locked(&sleep->timer);
+    }
+    timer_put(&sleep->timer);
+}
+int kernel_posix_cpu_sleep(struct kernel_task *caller,int32_t clock,int absolute,
+    uint64_t value,uint64_t *deadline,uint64_t *remaining)
+{
+    struct scheduler_cpu_clock target={0};
+    int error=scheduler_cpu_clock_resolve(caller,clock,1,&target);
+    if(error)return error;
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        if(target.thread&&target.identity==process_identity(caller,KERNEL_PID_TID))error=-KERNEL_EINVAL;
+    }
+    struct kernel_task_usage usage;
+    if(!error)error=scheduler_cpu_clock_sample(&target,&usage);
+    if(error){kernel_task_identity_put(target.identity);return error;}
+    uint64_t now=usage.user_ns+(target.kind==1?0:usage.kernel_ns);
+    *deadline=absolute?value:add_time(now,value);*remaining=0;
+    if(*deadline<=now){kernel_task_identity_put(target.identity);return 0;}
+    struct kernel_posix_cpu_sleep *sleep=0;
+    enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(caller->files.heap,1,sizeof(*sleep),(void **)&sleep);
+    if(allocation==KERNEL_HEAP_STATUS_EMPTY){kernel_task_identity_put(target.identity);return -KERNEL_ENOMEM;}
+    if(allocation)__builtin_trap();
+    sleep->timer=(struct kernel_posix_timer){.heap=caller->files.heap,.references=1,
+        .cpu=target,.clock=clock,.expires=*deadline};
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        if(!cpu_target_locked(&target))error=-KERNEL_ESRCH;
+        else {
+            if(caller->cpu_sleep)__builtin_trap();
+            if(kernel_wait_prepare_locked(0,0,1,&sleep->token))__builtin_trap();
+            caller->cpu_sleep=sleep;arm_locked(&sleep->timer);
+        }
+    }
+    if(error){timer_put(&sleep->timer);return error;}
+    kernel_posix_timer_changed();
+    enum kernel_wait_wake_reason reason;
+    if(kernel_wait_park(&sleep->token,&reason))__builtin_trap();
+    int completed;
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        completed=sleep->completed;deactivate_locked(&sleep->timer);caller->cpu_sleep=0;
+    }
+    if(kernel_wait_finish(&sleep->token))__builtin_trap();
+    if(!completed) {
+        /* A dead target detaches its deadline without completing the wait.
+         * Linux retains the original request when cancellation cannot sample
+         * that identity; a signal still interrupts, rather than reporting expiry. */
+        *remaining=value;
+        int alive;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);alive=cpu_target_locked(&target)!=0;}
+        if(alive&&!scheduler_cpu_clock_sample(&target,&usage)) {
+            now=usage.user_ns+(target.kind==1?0:usage.kernel_ns);
+            *remaining=*deadline>now?*deadline-now:0;
+        }
+        error=*remaining?-KERNEL_ERESTARTSYS:0;
+    }
+    timer_put(&sleep->timer);return error;
 }
