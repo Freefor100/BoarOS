@@ -119,7 +119,21 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 与poll/recv均按各类型处理，不把datagram peer关闭变成stream EOF。
 
 固定依据为`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
-`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。SCM_RIGHTS、SCM_CREDENTIALS 等每消息控制数据与 SEQPACKET 仍列后续功能。命名连接和 socketpair 共用上述跨核状态与队列保护。
+`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。每消息控制数据见下节，SEQPACKET保留为后续功能。命名连接和 socketpair 共用上述跨核状态与队列保护。
+
+## UNIX 控制消息与 FD 所有权
+
+UNIX STREAM/DGRAM 的 sendmsg/recvmsg 接受 SCM_RIGHTS、SCM_CREDENTIALS；SO_PASSCRED控制消息凭据输出。原生64位 cmsghdr 为16字节、8字节对齐，ucred 为12字节，每次最多传253个FD。发送控制区完整复制后按记录解析；FD表查询取得真实OFD，包含O_PATH。发送者关闭原FD或复用编号后，排队消息仍持有原对象；接收者共享其offset、状态标志和打开权利，新FD的CLOEXEC由MSG_CMSG_CLOEXEC决定。
+
+自动消息凭据捕获发送时TGID与真实UID/GID，普通write/writev/send/sendto也使用这一规则。显式凭据依据调用者real/effective/saved身份及CAP_SETUID、CAP_SETGID、CAP_SYS_ADMIN检查。排队消息保留PID身份引用与数字UID/GID；发送者退出或改身份不改变已有消息。SO_PEERCRED继续使用连接时的有效身份快照。PASSCRED还参与listener选项继承、尚未accept的child凭据捕获及未命名发送端自动绑定。
+
+STREAM在首个成功接纳片段转移rights，第一次recv消费分离控制记录（含零长度recv；普通read(0)仍直接返回）；读批次在rights或不同凭据的边界停止，剩余数据保留应有的凭据。普通read/recv消费并丢弃控制引用。MSG_PEEK保留原消息，每次为接收者复制新的OFD引用。DGRAM空包仍可携带控制数据；载荷fault的整包消费和STREAM完成前缀分别遵循各自规则。STREAM载荷fault仍输出已捕获凭据并保留应有的错误，rights留在未成功消费的包上；EOF或EAGAIN的空cookie与选到无凭据旧包分别使用零身份和overflow身份，信号中断保留原控制区。
+
+接收逐项预留FD、复制编号、安装OFD。FD表满或控制容量不足时保留已交付前缀，设置MSG_CTRUNC，并释放剩余引用。控制输出故障与最终msghdr故障的返回值、副作用按固定Linux处理，已安装FD保留。调用期请求登记socket pin、地址名、向量快照、控制对象及FD预留；强制退出先结束端点借用，再释放这些所有者，无须原C栈继续返回。普通发送的自动凭据由已登记write request持有。
+
+所有排队FD按发送时真实UID账户计入inflight，消费后归还原账户。附加前按Linux已有计数与RLIMIT_NOFILE判断ETOOMANYREFS，CAP_SYS_RESOURCE/CAP_SYS_ADMIN可豁免。UNIX socket之间传递FD会形成环：独立rights图记录排队引用，外部根来自OFD总引用减去inflight；未accept的child由listener保持可达。图的可睡眠资格按UNIX控制资格→rights资格→端点短锁取得；普通无rights数据沿原端点保护执行。非递归标记遍历独立控制链，短取端点锁摘除不可达控制记录，归还资格后才执行最后put。
+
+CPU0已有网络执行者推进收集和退休清理。最后关闭暂时失败时，退休对象继续持有原OFD并沿已有期限重试；停止网络前后主动drain，图、退休链或锁外释放仍在途时返回EBUSY并保留owner。原生布局、解析及完成前缀依据仓库固定Linux的net/core/scm.c、net/unix/af_unix.c和fs/file.c。直接消费者为tests/workloads/network/unix_control.c，宿主所有权与失败交错由network_owner的unix-control-owner、unix-control-cleanup用例检查。
 
 ## 发起 CPU 与等待寿命
 
@@ -236,7 +250,7 @@ socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept
 TCP MSG_TRUNC、UDP自动端口释放，IRQ仅通知由独立heap包装器检查。
 
 结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
-该段是此前loopback验收；现已接入VirtIO-net；命名 AF_UNIX 的当前机制见上文，SCM_RIGHTS 和 TCP_INFO 仍待实现，相关应用字段按实际验证范围解释。
+该段是此前loopback验收；现已接入VirtIO-net；命名 AF_UNIX 的当前机制见上文，TCP_INFO 仍待实现，相关应用字段按实际验证范围解释。
 
 ## 接收状态纠错（2026-10-02）
 

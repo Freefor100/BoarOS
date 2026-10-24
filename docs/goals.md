@@ -45,7 +45,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 进程查询与 IPC | pidfd 对象及 waitid(P_PIDFD)、SysV 消息队列及信号量；preadv2/pwritev2 的扩展标志 | getrusage、waitid(P_ALL/P_PID/P_PGID)、wait4、times、SysV 共享内存及 preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
 | 凭据与限制 | 用户命名空间、用户态 xattr 修改、登录认证与用户数据库管理；AS/DATA/CPU 等限额及 core 文件写出 | [进程凭据](modules/kernel-scheduler.md)、[执行](modules/kernel-exec.md)、[文件接口](modules/kernel-files.md)；线程 UID/GID/补充组、capability、DAC、set-ID/filecap 执行及按真实 UID 的 SIGPENDING 计账已接入；NOFILE/STACK/CORE/FSIZE 保持现有范围 |
-| 网络与系统接口 | AF_UNIX 的 SCM_RIGHTS/SCM_CREDENTIALS 与 SEQPACKET（STREAM/DGRAM 命名连接、SO_PEERCRED、accept4 已提供）；外部 IPv6 与运行时网络配置；CPU定位查询getcpu、CPU-time sleep、POSIX定时器的BOOTTIME/ALARM/TAI与运行时调钟、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；REAL/VIRTUAL/PROF间隔定时器及四类时钟的POSIX定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
+| 网络与系统接口 | AF_UNIX 的 SEQPACKET（STREAM/DGRAM 命名连接、SCM_RIGHTS/SCM_CREDENTIALS、SO_PASSCRED/SO_PEERCRED、accept4 已提供）；外部 IPv6 与运行时网络配置；CPU定位查询getcpu、CPU-time sleep、POSIX定时器的BOOTTIME/ALARM/TAI与运行时调钟、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；REAL/VIRTUAL/PROF间隔定时器及四类时钟的POSIX定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 
 ### P1h 虚拟文件系统与多挂载

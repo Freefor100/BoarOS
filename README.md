@@ -11,20 +11,20 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 
 默认生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
 两侧共用 MM、调度、VFS、设备和用户程序策略，架构实现在构建期绑定。
-RV 两核调度支持受控内核任务和独立 `kernel-rv-user-smp` 的真实用户执行。普通与受控 MM、页缓存、FD/OFD 共用保护与引用规则；匿名缺页、驻留用户复制及普通文件缓存读写在发起 CPU 完成。ext4 冷读和 mmap 冷缺页在发起 CPU 装入、解析映射并提交块请求，保留 128 KiB SG；回写、同步的元数据准备和后端最终释放仍由 CPU0 执行，持久化等待由原调用者执行。命名空间、进程生命周期、设备和网络在实际业务入口串行，不再迁移整次通用 syscall。执行边界与验证见[RV 两核](docs/modules/riscv-smp.md#真实用户态与cpu0业务交接)。
+RV支持独立构建的真实1～4核用户执行。匿名缺页、用户复制、ext4读取、文件空间修改及目录操作在发起CPU完成；同挂载不同目录和文件可并行准备私有修改，日志发布、checkpoint与后台写回由CPU0推进。socket与管道收发、poll/pselect、epoll等待及futex也在发起CPU执行，协议和控制操作保留实际CPU0边界。默认生产与LA继续单核；执行位置与对象保护见[RV多核](docs/modules/riscv-smp.md#真实用户态与cpu0业务交接)。
 
 2026-10-14 的原程序记录包含 2/1 CPU、512 MiB/1 GiB 四个 USER_SMP profile，各 229 项通过；这是当时实现的结果。本轮普通对象并发、调用 CPU 执行位置及 SQLite 独立重启结果记录在对应[模块说明](docs/modules/riscv-smp.md#用户态原程序与压力组合)。
 
 | 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
-| 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX；独立 RV 受控两核配置 | 设备、网络及命名空间的并行内核业务尚未开放，RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[两核边界](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
+| 内存与 CPU | buddy/slab、VMA、按需页、共享映射、COW、mremap；RV真实1～4核，RV F/D、LA FPU/LSX/LASX | RV V、LA多核及扩展内存操作见[开发路线](docs/goals.md)；[MM](docs/modules/kernel-mm.md)、[RV多核](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
-| 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；private/共享匿名/共享文件/SysV futex、robust-list、标准信号和同步 fault | 默认用户任务限CPU0，独立 RV 用户 SMP 仅在需要串行的业务范围进入 CPU0；无 PI futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
-| 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename；受控RV共享FD/匿名pipe两核 | 普通文件数据访问可就地执行，socket/epoll/FIFO 业务仍在 CPU0；无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
+| 进程与同步 | fork/vfork/pthread、exec/wait/退出；OTHER/FIFO/RR、deadline；robust及比较重排/复合唤醒futex、实时信号队列、备用信号栈、CPU/POSIX定时器 | PI futex与futex_waitv保留后续；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
+| 文件与事件 | FD/OFD、向量/定位I/O、pipe/FIFO、poll/select/epoll、eventfd/timerfd/signalfd、记录锁、link/rename；可变身份、DAC、set-ID/filecap | 挂载和扩展接口边界见[开发路线](docs/goals.md)；[文件接口](docs/modules/kernel-files.md) |
 | 文件系统与挂载 | ext4、FAT32/VFAT、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount、只读与普通忙卸载 | 挂载扩展见[开发路线](docs/goals.md)；[VFS](docs/modules/vfs-ext4.md)、[VFAT](docs/modules/fat32.md)、[tmpfs](docs/modules/tmpfs.md) |
 | 存储 | VirtIO 批量 I/O、flush/reset；MBR 主分区、用户态块设备、真实文件后备 loop；页缓存、压力回收、ext4 日志及空间预留／打洞 | RV MMIO、LA modern PCI；[块设备与 loop](docs/modules/riscv-virtio-block.md)、[文件系统与缓存](docs/modules/vfs-ext4.md) |
-| 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
-| 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK/CORE/FSIZE、capget查询 | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
+| 网络 | IPv4/IPv6 loopback、TCP/UDP、命名UNIX STREAM/DGRAM、FD传递与消息凭据、accept4；VirtIO-net及宿主双向TCP/HTTP | SEQPACKET、外部IPv6及运行时配置保留后续；DNS/TLS还需对应用户态依赖；[网络](docs/modules/kernel-network.md) |
+| 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、BusyBox终端消费者；日志、RNG、RTC、资源限制、可变UID/GID/补充组及capability | 其他行规程、完整modem控制及更多资源限额见[开发路线](docs/goals.md)；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
 2026-10-14 本地默认单核组合复核：RV/LA在512MiB、1GiB下的BoarOS各完成 **229 项原程序**；RV 1GiB和LA双RAM的同ELF联合对照全部通过。RV 512MiB固定Linux原BusyBox脚本的`du`动态`/proc`遍历失败，该组保留`reference-not-pass`，BoarOS该组成功；此前LA参考失败也保留原证据，详见[程序基线](docs/learning/user-program-inventory.md)。
 两侧各 **1400 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
@@ -79,7 +79,7 @@ make test-stack-usage test-stack-usage-la
 
 ## 开发方向与文档
 
-当前主线继续推进设备、网络和命名空间的并行内核业务，再按实际需要扩展 RV 核数与 LA 多核；具体未完成能力与依赖维护在[开发路线](docs/goals.md)。普通文件缓存、匿名缺页、用户 pin 与系统压力通知已经使用共同对象规则，不再保留 IRQ-only 缓存、MM/FD 并发启用开关和 resident-only read 支路。ext4 元数据写、日志、设备配置及进程生命周期仍在实际 CPU0 操作边界执行，默认生产与 LA 继续单 CPU。
+当前工作围绕实际应用补齐功能与权限语义，改善共享状态的多核扩展性，并推进LA多核。具体缺口维护在[开发路线](docs/goals.md)；各子系统的调用CPU与CPU0执行边界见对应模块。
 共享调度域的[成本核对](docs/learning/cost-baseline.md#共享调度域的匹配时间)保留既有开销和短窗口未决结果；
 短窗口归因已停止，不再作为两核规划的前置门槛。既有3%测量协议保留，未决不记为通过。
 FS-Off候选仍在实验分支，未进入main；宿主同步测试与单核验收不代表整个内核已具备SMP安全性。

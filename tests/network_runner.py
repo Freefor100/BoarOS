@@ -49,6 +49,54 @@ def unix_named_output(raw,performance):
         for row,want in zip(metrics,expected))
 
 
+def unix_control_output(raw,performance,cpus):
+    lines=[line for line in raw.replace('\r','').splitlines() if 'UNIX-CONTROL ' in line]
+    if not lines or any(not line.startswith('UNIX-CONTROL ') for line in lines):return False
+    resource=re.fullmatch(r'UNIX-CONTROL RESOURCE fd_before=(\d+) fd_after=(\d+)',lines[-1])
+    if not resource or resource[1]!=resource[2]:return False
+    if not performance:
+        names=('rights-file-pipe-socket-eventfd-opath-shared-state-cloexec',
+            'send-retains-file-after-close-and-fd-reuse','control-none-small-multiple-records-truncation',
+            'credentials-partial-control-and-rights-truncation','bad-fd-and-253-254-rights-limit',
+            'receive-full-fd-table-payload-and-partial-rights',
+            'inflight-nofile-eight-ninth-allowed-tenth-rejected-drain-uid-account',
+            'exit-group-blocked-sendmsg-releases-unpublished-rights','peek-duplicates-and-plain-read-discards-rights',
+            'stream-rights-and-credential-boundaries','stream-zero-peek-read-fault-null-cookie-old-packet',
+            'empty-datagram-delivers-rights-and-credentials',
+            'credentials-real-ids-peer-snapshot-explicit-permissions','passcred-option-autobind-listener-inheritance',
+            'fault-send-control-no-enqueue','libc-sendmsg-control-fault-observation',
+            'null-control-nonzero-capacity-discards-rights','null-name-skips-readonly-namelen-output',
+            'fault-receive-control-returns-payload-ctrunc',
+            'fault-partial-control-installs-first-fd','fault-dgram-payload-consumes-and-drops-rights',
+            'malformed-and-empty-rights-control','concurrent-transfer-source-close-with-cycle-churn')
+        libc=[line for line in lines if line.startswith('UNIX-CONTROL ACTION libc-sendmsg-inaccessible-control ')]
+        if len(libc)!=1 or libc[0] not in ('UNIX-CONTROL ACTION libc-sendmsg-inaccessible-control outcome=sigsegv',
+            'UNIX-CONTROL ACTION libc-sendmsg-inaccessible-control outcome=efault'):return False
+        actions={
+            'inflight-nofile-eight-ninth-allowed-tenth-rejected-drain-uid-account':'UNIX-CONTROL ACTION inflight-quota-numeric-uid-rotation executed=1',
+            'exit-group-blocked-sendmsg-releases-unpublished-rights':'UNIX-CONTROL ACTION exit-group-pending-control sleeping_sender=1 original_pipe_writer_closed=1 eof_after_wait=1',
+            'stream-zero-peek-read-fault-null-cookie-old-packet':'UNIX-CONTROL ACTION stream-null-cookie pid=0 uid=0 gid=0',
+            'credentials-real-ids-peer-snapshot-explicit-permissions':'UNIX-CONTROL ACTION credentials-distinct-real-effective-ids executed=1',
+            'libc-sendmsg-control-fault-observation':libc[0]}
+        expected=[]
+        for name in names:
+            if name in actions:expected.append(actions[name])
+            expected.append(f'UNIX-CONTROL CASE {name} PASS')
+        expected += ['UNIX-CONTROL ACTION gc-concurrent-churn queues=32 closed_user_fds=64',
+            'UNIX-CONTROL ACTION gc-self-cycle queues=32 closed_user_fds=64',
+            'UNIX-CONTROL ACTION gc-mutual-cycle queues=64 closed_user_fds=128',
+            'UNIX-CONTROL ACTION gc-external-root retained_message_read=1 closed_user_fds=4',
+            'UNIX-CONTROL ACTION gc-unaccepted-child queued_children=16 closed_user_fds=32',
+            'UNIX-CONTROL END 23']
+        return lines[:-1]==expected
+    metrics=[re.fullmatch(r'UNIX-CONTROL PERF name=(stream|dgram)-(none|passcred|rights) type=(stream|dgram) mode=(none|passcred|rights) pairs=4 rounds_per_pair=1024 count=4096 bytes=524288 cpus=(1|2|4) wall_ns=(\d+) thread_cpu_ns=(\d+) p50_ns=(\d+) p95_ns=(\d+) max_ns=(\d+) ops_per_sec=(\d+)',line) for line in lines[:-2]]
+    expected=[(kind,mode) for kind in ('stream','dgram') for mode in ('none','passcred','rights')]
+    return (len(lines)==8 and lines[-2]=='UNIX-CONTROL PERF END 6' and len(metrics)==6 and
+        all(row and (row[1],row[2])==want and (row[3],row[4])==want and int(row[5])==cpus and
+            int(row[6])>0 and int(row[7])>0 and 0<int(row[8])<=int(row[9])<=int(row[10]) and int(row[11])>0
+            for row,want in zip(metrics,expected)))
+
+
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -81,7 +129,7 @@ def run_loongarch(args):
         if args.only and args.only!=platform:continue
         for memory in args.memory or ('512M','1G'):
             case=work/f'{platform}-{memory}';case.mkdir()
-            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap') else disk(case,program)
+            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control') else disk(case,program)
             kernel=profile.linux_kernel() if platform=='linux' else args.kernel or ROOT/profile.kernel
             snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
             command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
@@ -98,6 +146,7 @@ def run_loongarch(args):
             if args.workload=='futex':
                 lines,expected=futex_lines(raw,1);passed=passed and lines==expected
             if args.workload=='unix_named':passed=not code and unix_named_output(raw,False) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+            if args.workload=='unix_control':passed=not code and unix_control_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             if args.workload=='mremap':passed=not code and mremap_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
             row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
                 'owner_baseline_checked':platform=='boaros'}
@@ -134,6 +183,7 @@ def run_smp(args):
     expected=[f'SOCKET-SMP CASE {name} OK' for name in ('ipv4-tcp','ipv6-tcp','ipv4-udp','ipv6-udp','unix-stream','unix-dgram','blocking-close-reuse-cancel','fault-empty-trunc-timeout-sendfile','shared-readers-writers','remote-epoll-oneshot-nested')]+['SOCKET-SMP END 10']
     pipe=args.workload=='pipe';event=args.workload=='event';altstack=args.workload=='altstack'
     unix_named=args.workload=='unix_named'
+    unix_control=args.workload=='unix_control'
     mremap=args.workload=='mremap'
     futex=args.workload=='futex'
     posix=args.workload=='posix'
@@ -175,9 +225,10 @@ def run_smp(args):
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named:
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control:
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -227,21 +278,21 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--kernel',type=Path)
     parser.add_argument('--cpus',action='append',type=int,choices=(1,2,4))
-    parser.add_argument('--performance',action='store_true',help='run fixed named AF_UNIX traffic via /performance')
+    parser.add_argument('--performance',action='store_true',help='run fixed AF_UNIX traffic via /performance')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--observe',action='store_true')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--firmware',default='default')
     args=parser.parse_args()
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
-    if args.performance and args.workload!='unix_named':parser.error('--performance requires --workload unix_named')
-    if args.workload in ('unix_named','smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
+    if args.performance and args.workload not in ('unix_named','unix_control'):parser.error('--performance requires --workload unix_named or unix_control')
+    if args.workload in ('unix_named','unix_control','smp','pipe','event','altstack','queued','posix','futex','mremap') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)
