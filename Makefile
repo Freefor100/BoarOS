@@ -394,6 +394,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
 	kernel/syscall/socket.c \
+	kernel/syscall/socket_control.c \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \

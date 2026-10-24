@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/open_file.h>
 #include <kernel/socket.h>
+#include <kernel/socket_call.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
@@ -12,6 +13,40 @@
 #define LINUX_SOCK_NONBLOCK 00004000U
 #define LINUX_SOCK_CLOEXEC 02000000U
 #define LINUX_O_RDWR 2U
+
+int kernel_files_receive_fd(struct kernel_files *files, struct kernel_mm *mm,
+    uint64_t user_fd, unsigned fd_flags,
+    struct kernel_open_file_description **owner, struct kernel_socket_call *call)
+{
+    if (!kernel_files_is_live(files) || !mm || !owner || !*owner ||
+        (fd_flags & ~KERNEL_FILES_FD_CLOEXEC)) return -KERNEL_EINVAL;
+    uint32_t fd;
+    int result;
+    if (kernel_files_find_free_fd(files, &fd, &result) != KERNEL_FILES_STATUS_OK)
+        __builtin_trap();
+    if (result) return result;
+    struct kernel_files_fd_reservation reservation
+        __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
+    if (call) {
+        if (call->fd_reserved || call->files != files) __builtin_trap();
+        call->reserved_fd = fd;
+        call->fd_reserved = 1;
+    }
+    int32_t number = (int32_t)fd;
+    size_t copied = 0;
+    if (kernel_copy_to_user(mm, user_fd, &number, sizeof(number), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(number)) {
+        kernel_files_cancel_reservation(&reservation);
+        if (call) call->fd_reserved = 0;
+        return -KERNEL_EFAULT;
+    }
+    /* copyout may fault or sleep while the reservation and OFD owner stay held. */
+    if (kernel_files_install_shared_acquired_at(files, fd, fd_flags, owner) !=
+            KERNEL_FILES_STATUS_OK) __builtin_trap();
+    reservation.files = 0;
+    if (call) call->fd_reserved = 0;
+    return 0;
+}
 
 static enum kernel_files_status install_socket(
     struct kernel_files *files, struct kernel_open_file_description **ofd,
@@ -135,7 +170,7 @@ enum kernel_files_status kernel_files_socket_accept(
     for (;;) {
         result = kernel_socket_wait_ready(socket, KERNEL_POLLIN, target, wait_flags);
         if (result) break;
-        result = kernel_socket_accept(socket, &accepted);
+        result = kernel_socket_accept(socket, &accepted, ofd);
         if (result != -KERNEL_EAGAIN || wait_flags) break;
         /* Another acceptor may consume readiness; keep this call's deadline. */
         if (target && kernel_time_monotonic_ns() >= target) break;

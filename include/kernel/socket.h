@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+struct kernel_socket_message;
+struct kernel_socket_control;
 struct kernel_uaccess_iovec;
 struct kernel_uaccess_iov_cursor;
 struct kernel_socket_address;
@@ -25,6 +27,9 @@ struct kernel_socket_read_request {
     void *packet;
     uint32_t bytes, completed_bytes;
     int datagram;
+    struct kernel_socket_message *message;
+    void *peek_control;
+    unsigned rights;
     struct kernel_open_file_description *pin;
     struct kernel_open_file_description **pin_owner;
 };
@@ -39,6 +44,8 @@ struct kernel_socket_write_request {
     uint32_t reserved;
     uint8_t progressed;
     void *protocol_payload;
+    /* Automatic PASSCRED follows the registered request across user faults. */
+    struct kernel_socket_control *automatic_control;
     struct kernel_socket *socket;
     struct kernel_task *task;
     void *packet;
@@ -61,10 +68,10 @@ int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t f
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
     size_t iov_count, uint64_t count, uint32_t flags,
-    const struct kernel_socket_address *destination);
+    const struct kernel_socket_address *destination, struct kernel_socket_message *message);
 int kernel_socket_write_unix(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
-    uint64_t count, uint32_t flags, int *user_fault);
+    uint64_t count, uint32_t flags, int *user_fault, struct kernel_socket_message *message);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
 int kernel_socket_is_tcp(const struct kernel_socket *socket);
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
@@ -132,7 +139,7 @@ int kernel_socket_connect(struct kernel_socket *socket,
                           const struct kernel_socket_address *address, int nonblocking);
 int kernel_socket_connection_result(struct kernel_socket *socket);
 int kernel_socket_accept(struct kernel_socket *socket,
-                         struct kernel_socket **owner);
+                         struct kernel_socket **owner, struct kernel_open_file_description *file);
 int kernel_socket_accept_check(const struct kernel_socket *socket);
 int kernel_socket_write_packet_buffer(struct kernel_open_file_description **pin_owner,
     const void *buffer, uint64_t count, uint32_t flags);
@@ -141,7 +148,7 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
-                              uint32_t capacity, int nonblocking);
+                              uint32_t capacity, int nonblocking, struct kernel_socket_message *message);
 void kernel_socket_read_info(const struct kernel_socket_read_request *request,
                              struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
@@ -153,6 +160,7 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request,
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
 int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
     uint64_t target_ns, uint32_t flags);
+#define KERNEL_SOCKET_MSG_PEEK 0x2U
 #define KERNEL_SOCKET_MSG_DONTWAIT 0x40U
 #define KERNEL_SOCKET_MSG_NOSIGNAL 0x4000U
 #define KERNEL_SOCKET_MSG_TRUNC 0x20U
@@ -164,6 +172,7 @@ enum kernel_socket_option {
     KERNEL_SOCKET_REUSEADDR, KERNEL_SOCKET_KEEPALIVE,
     KERNEL_SOCKET_SNDBUF, KERNEL_SOCKET_RCVBUF,
     KERNEL_SOCKET_TYPE, KERNEL_SOCKET_ERROR, KERNEL_SOCKET_ACCEPTCONN,
+    KERNEL_SOCKET_PASSCRED,
     KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
 };
 int kernel_socket_set_option(struct kernel_socket *socket,

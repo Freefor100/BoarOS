@@ -34,7 +34,7 @@ static void exchange_packet(struct kernel_files *from,struct kernel_files *to,
     assert(!kernel_files_pin(to,0,&pin,&result) && !result);
     struct kernel_socket_read_request request={0};
     assert(kernel_socket_reserve_read(kernel_open_file_socket(pin),kernel_task_current(),
-        &request,&pin,length,1)==(int)length);
+        &request,&pin,length,1, NULL)==(int)length);
     char actual[32]={0};
     assert(length<sizeof(actual));
     kernel_socket_copy_read(&request,0,actual,length);

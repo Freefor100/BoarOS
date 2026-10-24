@@ -1,4 +1,6 @@
 #include "private.h"
+#include <kernel/errno.h>
+#include <kernel/socket_task.h>
 
 static void identity_domain_owned(void)
 {
@@ -136,4 +138,18 @@ void kernel_task_identity_put(struct kernel_pid *id)
         kernel_pid_put(id);
     }
     process_identity_collect();
+}
+
+int kernel_task_socket_identity(int32_t pid, struct kernel_pid **owner)
+{
+    if (!owner) return -KERNEL_EINVAL;
+    *owner = 0;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid *identity = pid == 0
+        ? process_identity(kernel_task_current(), KERNEL_PID_TGID)
+        : kernel_pid_find(&scheduler.identities, pid);
+    if (!identity) return -KERNEL_ESRCH;
+    kernel_pid_get(identity);
+    *owner = identity;
+    return 0;
 }

@@ -16,6 +16,7 @@ struct kernel_fs_context_record;
 unsigned kernel_task_fs_group_users(struct kernel_task *, const struct kernel_fs_context_record *);
 struct kernel_socket_read_request;
 struct kernel_socket_write_request;
+struct kernel_socket_call;
 struct kernel_epoll_wait_request;
 
 struct physical_page_allocator;
@@ -58,6 +59,8 @@ enum kernel_task_status kernel_task_socket_read_register(
     struct kernel_task *task, struct kernel_socket_read_request *request);
 enum kernel_task_status kernel_task_socket_read_clear(
     struct kernel_task *task, struct kernel_socket_read_request *request);
+enum kernel_task_status kernel_task_socket_call_register(struct kernel_task *, struct kernel_socket_call *);
+enum kernel_task_status kernel_task_socket_call_clear(struct kernel_task *, struct kernel_socket_call *);
 
 enum kernel_task_status kernel_task_io_buffer_acquire(
     struct kernel_task_io_buffer *buffer, struct physical_page_allocator *allocator);

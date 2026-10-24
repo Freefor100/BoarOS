@@ -15,6 +15,7 @@
 #include <kernel/signal_fd.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
+#include <kernel/socket_control.h>
 #include <kernel/task.h>
 #include <kernel/page_cache.h>
 #include <kernel/file_mapping.h>
@@ -448,6 +449,7 @@ enum kernel_open_file_status kernel_open_file_create_socket(
     file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
     file->open_flags = flags;
     file->socket = socket;
+    if (socket) kernel_socket_attach_file(socket, file);
     uintptr_t irq = arch_interrupt_save();
     if (!next_socket_proc_identity) __builtin_trap();
     file->proc_identity = next_socket_proc_identity++;
@@ -464,6 +466,7 @@ void kernel_open_file_take_socket(struct kernel_open_file_description *file,
         file->socket || file->references != 1U || !owner || !*owner)
         __builtin_trap();
     file->socket = *owner;
+    kernel_socket_attach_file(*owner, file);
     *owner = 0;
 }
 
@@ -745,6 +748,7 @@ enum kernel_open_file_status kernel_open_file_release(
     struct kernel_open_file_description *file=*owner;
     if (!file->heap) return KERNEL_OPEN_FILE_STATUS_STATE;
     uint32_t references=__atomic_load_n(&file->references,__ATOMIC_ACQUIRE);
+    int unix_file=file->kind==KERNEL_OPEN_FILE_KIND_SOCKET && kernel_socket_is_unix(file->socket);
     int local=0;
     for (;;) {
         if (references==UINT32_MAX) return KERNEL_OPEN_FILE_STATUS_STATE;
@@ -780,7 +784,11 @@ enum kernel_open_file_status kernel_open_file_release(
         if (__atomic_compare_exchange_n(&file->references,&references,references-1,
             1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
     }
-    if (references>1) { *owner=NULL; return KERNEL_OPEN_FILE_STATUS_OK; }
+    if (references>1) {
+        *owner=NULL;
+        if (unix_file) kernel_socket_rights_changed();
+        return KERNEL_OPEN_FILE_STATUS_OK;
+    }
     return finish_close(owner,references==1,local);
 }
 
@@ -789,6 +797,9 @@ static int open_file_live(const struct kernel_open_file_description *file)
     return file != 0 && file->heap != 0 && __atomic_load_n(&file->references, __ATOMIC_ACQUIRE) != 0U &&
            !file->vfs_closed;
 }
+
+uint32_t kernel_open_file_references(const struct kernel_open_file_description *file)
+{ return __atomic_load_n(&file->references,__ATOMIC_ACQUIRE); }
 
 struct kernel_vfs_node *kernel_open_file_node(
     const struct kernel_open_file_description *description)

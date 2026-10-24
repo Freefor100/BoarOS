@@ -13,10 +13,28 @@ static err_t copy_capacity_tcp_write(struct tcp_pcb *,const void *,u16_t,u8_t);
 #include "../../net/socket.c"
 #undef tcp_write
 #include "../../net/ethernet.c"
+#include "../../kernel/pid.c"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
 struct kernel_raw_lock kernel_wait_domain={.rank=KERNEL_RAW_RANK_SCHEDULER,.initialized=KERNEL_RAW_INITIALIZED};
 static struct kernel_heap test_heap;
+static uint64_t model_pid_bitmap[KERNEL_PID_BITMAP_WORDS(1024)];
+static struct kernel_pid_allocator model_pid_numbers;
+static struct kernel_pid_registry model_pid_registry={.numbers=&model_pid_numbers,.next_generation=1};
+static struct kernel_pid model_pid;
+static struct kernel_uid_account model_uid_account={.references=1};
+struct model_socket_file {
+    struct model_socket_file *next;
+    struct kernel_socket *socket;
+    uint32_t references;
+};
+static struct model_socket_file *model_socket_files;
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    struct model_socket_file *target;
+    unsigned fail, pause, entered, resume, attempts;
+} control_release_probe={.lock=PTHREAD_MUTEX_INITIALIZER,.changed=PTHREAD_COND_INITIALIZER};
 static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
@@ -127,6 +145,14 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 { *lock=(struct kernel_rwlock){.rank=rank,.key=key}; }
 static pthread_mutex_t model_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t model_rights_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t model_unix_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t *model_lock(struct kernel_rwlock *lock)
+{
+    if(lock==&protocol_mutex.lock)return &model_mutex;
+    if(lock==&rights_mutex.lock)return &model_rights_mutex;
+    CHECK(lock==&unix_control.lock);return &model_unix_mutex;
+}
 static pthread_mutex_t handshake=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t handshake_changed=PTHREAD_COND_INITIALIZER;
 static unsigned competing, waiter_registered, acquired;
@@ -135,26 +161,29 @@ static unsigned handoff_bytes;
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
     CHECK(!guard->lock);
-    if(competing) {
+    if(competing && lock==&protocol_mutex.lock) {
         CHECK(!pthread_mutex_lock(&handshake)); waiter_registered=1;
         CHECK(!pthread_cond_signal(&handshake_changed)); CHECK(!pthread_mutex_unlock(&handshake));
     }
-    CHECK(!pthread_mutex_lock(&model_mutex)); CHECK(!lock->writer);
-    lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context}; acquired++;
+    CHECK(!pthread_mutex_lock(model_lock(lock))); CHECK(!lock->writer);
+    lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context};
+    if(lock==&protocol_mutex.lock)acquired++;
 }
 int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
     CHECK(!guard->lock);
-    if (pthread_mutex_trylock(&model_mutex)) return 0;
+    if (pthread_mutex_trylock(model_lock(lock))) return 0;
     CHECK(!lock->writer);
-    lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context}; acquired++;
+    lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context};
+    if(lock==&protocol_mutex.lock)acquired++;
     return 1;
 }
 void kernel_lock_release(struct kernel_lock_guard *guard)
 {
     CHECK(guard->lock && guard->owner==&test_context && guard->lock->writer==&test_context);
-    if (handoff_peer) { CHECK(handoff_peer->rx_bytes == handoff_bytes); handoff_peer=NULL; }
-    guard->lock->writer=0; guard->lock=0; CHECK(!pthread_mutex_unlock(&model_mutex));
+    if (handoff_peer && guard->lock==&protocol_mutex.lock) { CHECK(handoff_peer->rx_bytes == handoff_bytes); handoff_peer=NULL; }
+    pthread_mutex_t *mutex=model_lock(guard->lock);
+    guard->lock->writer=0; guard->lock=0; CHECK(!pthread_mutex_unlock(mutex));
 }
 static int work_pending_snapshot(void)
 { struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope); int result=kernel_socket_work_pending(); kernel_socket_protocol_leave(&scope); return result; }
@@ -162,8 +191,42 @@ struct kernel_io_context *kernel_io_context_current(void) { return &test_context
 struct kernel_task *kernel_task_current(void) { return remote_task; }
 const struct kernel_credentials *kernel_credentials_current(void)
 {
-    static const struct kernel_credentials root = {.effective=KERNEL_CAP_VALID_MASK};
+    static const struct kernel_credentials root = {.effective=KERNEL_CAP_VALID_MASK,.account=&model_uid_account};
     return &root;
+}
+/* The host boundary has one published process identity and one UID account.
+ * Ancillary snapshots borrow them with the same reference ownership as tasks. */
+int kernel_task_socket_identity(int32_t pid,struct kernel_pid **owner)
+{
+    if(!owner)return -KERNEL_EINVAL;
+    *owner=NULL;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_pid *identity=kernel_pid_find(&model_pid_registry,pid?pid:model_pid.number);
+    if(!identity)return -KERNEL_ESRCH;
+    kernel_pid_get(identity);*owner=identity;return 0;
+}
+void kernel_task_identity_put(struct kernel_pid *identity)
+{
+    CHECK(identity==&model_pid && identity->references>1);
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_pid_put(identity);
+}
+struct kernel_uid_account *kernel_uid_account_get_locked(struct kernel_uid_account *account)
+{
+    CHECK(account==&model_uid_account && account->references && account->references<UINT64_MAX);
+    account->references++;return account;
+}
+void kernel_uid_account_put(struct kernel_uid_account *account)
+{
+    CHECK(account==&model_uid_account);
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);CHECK(account->references>1);account->references--;
+}
+enum kernel_task_status kernel_task_get_rlimit(const struct kernel_task *task,uint32_t resource,
+    struct kernel_rlimit64 *limit)
+{
+    if(task!=kernel_task_current() || resource!=KERNEL_RLIMIT_NOFILE || !limit)
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    *limit=(struct kernel_rlimit64){.current=KERNEL_RLIMIT_NOFILE_CAP,.maximum=KERNEL_RLIMIT_NOFILE_CAP};
+    return KERNEL_TASK_STATUS_OK;
 }
 int kernel_credentials_capable(const struct kernel_credentials *credentials, unsigned capability)
 { return capability <= KERNEL_CAP_LAST_CAP && (credentials->effective & (UINT64_C(1)<<capability)) != 0; }
@@ -221,7 +284,7 @@ enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_nod
 /* Abstract endpoint cases must never fabricate a pathname identity. Real VFS
  * socket inode lookup, permissions and unlink are checked by the VFS suite. */
 enum kernel_task_status kernel_task_tgid(const struct kernel_task *task,kernel_pid_t *pid)
-{ CHECK(task);*pid=101;return KERNEL_TASK_STATUS_OK; }
+{ CHECK(task);*pid=model_pid.number;return KERNEL_TASK_STATUS_OK; }
 enum kernel_task_status kernel_task_fs_context_borrow(const struct kernel_task *task,
     const struct kernel_fs_context **fs)
 { (void)task;*fs=NULL;return KERNEL_TASK_STATUS_INVALID_ARGUMENT; }
@@ -280,12 +343,60 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     return 0;
 }
 
+static struct model_socket_file *model_socket_file(const struct kernel_open_file_description *file)
+{
+    for(struct model_socket_file *entry=model_socket_files;entry;entry=entry->next)
+        if((const void *)entry==(const void *)file)return entry;
+    return NULL;
+}
+static struct kernel_open_file_description *model_socket_file_create(struct kernel_socket *socket)
+{
+    struct model_socket_file *file=calloc(1,sizeof(*file));CHECK(file);
+    file->socket=socket;file->references=1;file->next=model_socket_files;model_socket_files=file;
+    kernel_socket_attach_file(socket,(void *)file);return (void *)file;
+}
 struct kernel_socket *kernel_open_file_socket(struct kernel_open_file_description *f)
-{ return (struct kernel_socket *)(uintptr_t)f; }
+{ struct model_socket_file *file=model_socket_file(f);return file?file->socket:(struct kernel_socket *)(uintptr_t)f; }
+uint32_t kernel_open_file_references(const struct kernel_open_file_description *description)
+{ struct model_socket_file *file=model_socket_file(description);CHECK(file);return __atomic_load_n(&file->references,__ATOMIC_ACQUIRE); }
 enum kernel_open_file_status kernel_open_file_acquire(struct kernel_open_file_description *f)
-{CHECK(remote_testing && f==(void *)remote_socket);stop_borrows++;return KERNEL_OPEN_FILE_STATUS_OK;}
+{
+    struct model_socket_file *file=model_socket_file(f);
+    if(file) { uint32_t before=__atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED);CHECK(before && before<UINT32_MAX);return KERNEL_OPEN_FILE_STATUS_OK; }
+    CHECK(remote_testing && f==(void *)remote_socket);stop_borrows++;return KERNEL_OPEN_FILE_STATUS_OK;
+}
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **f)
 { CHECK(f && *f);
+  struct model_socket_file *file=model_socket_file(*f);
+  if(file) {
+      if(file==control_release_probe.target) {
+          CHECK(__atomic_load_n(&file->references,__ATOMIC_ACQUIRE)==1);
+          CHECK(!kernel_cpu_current()->raw_locks);
+          /* The production control owner must drop its graph mutex before
+           * backend cleanup, including the injected failing last put. */
+          CHECK(!pthread_mutex_trylock(&model_rights_mutex));
+          CHECK(!pthread_mutex_unlock(&model_rights_mutex));
+          CHECK(!pthread_mutex_lock(&control_release_probe.lock));
+          control_release_probe.attempts++;
+          if(control_release_probe.pause) {
+              control_release_probe.entered=1;
+              CHECK(!pthread_cond_broadcast(&control_release_probe.changed));
+              while(!control_release_probe.resume)
+                  CHECK(!pthread_cond_wait(&control_release_probe.changed,&control_release_probe.lock));
+          }
+          unsigned fail=control_release_probe.fail;
+          CHECK(!pthread_mutex_unlock(&control_release_probe.lock));
+          /* A failed cleanup retains this exact owner and its reference. */
+          if(fail)return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+      }
+      *f=NULL;uint32_t before=__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL);CHECK(before);
+      kernel_socket_rights_changed();
+      if(before==1) {
+          struct model_socket_file **link=&model_socket_files;while(*link!=file) { CHECK(*link);link=&(*link)->next; }*link=file->next;
+          kernel_socket_destroy(file->socket);free(file);
+      }
+      return KERNEL_OPEN_FILE_STATUS_OK;
+  }
   if(stop_borrows && *f==(void *)remote_socket)stop_borrows--;
   else {CHECK(allow_ofd_release);--allow_ofd_release;}
   *f=0;return KERNEL_OPEN_FILE_STATUS_OK; }
@@ -612,11 +723,11 @@ static void udp_final_payload(void)
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,5},{(uintptr_t)second,4}};
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=23001,.bytes={127,0,0,1}};
     unsigned before=heap_allocations;
-    CHECK(kernel_socket_write_datagram(&owner,(void *)socket,iov,2,9,0,&address)==9);
+    CHECK(kernel_socket_write_datagram(&owner,(void *)socket,iov,2,9,0,&address, NULL)==9);
     CHECK(owner==(void *)socket && heap_allocations==before);
     uint32_t memory=lwip_stats.mem.used;
     user_remaining=6;
-    CHECK(kernel_socket_write_datagram(&owner,(void *)socket,iov,2,9,0,&address)==-KERNEL_EFAULT);
+    CHECK(kernel_socket_write_datagram(&owner,(void *)socket,iov,2,9,0,&address, NULL)==-KERNEL_EFAULT);
     CHECK(owner==(void *)socket && lwip_stats.mem.used==memory && !socket->tx_reserved);
     user_remaining=SIZE_MAX;
     kernel_socket_destroy(socket);
@@ -634,17 +745,17 @@ static void unix_final_payload(void)
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
     unsigned before=heap_allocations;
     shutdown_during_copy=receiver;
-    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==9);
+    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0, NULL)==9);
     CHECK(!shutdown_during_copy && sender->peer_closed && !receiver->read_closed &&
         owner==(void *)sender && heap_allocations==before+1 && receiver->rx_bytes==9);
     CHECK(!memcmp(receiver->packets_head->data,"alphabeta",9) && !sender->tx_reserved);
     uint64_t charged=sender->unix_memory;
     cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};user_remaining=6;
-    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==6);
+    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0, NULL)==6);
     CHECK(receiver->packets_tail->length==6 && !memcmp(receiver->packets_tail->data,"alphab",6));
     CHECK(sender->unix_memory>charged && !sender->tx_reserved);user_remaining=SIZE_MAX;
     cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};close_during_copy=receiver;
-    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0)==-KERNEL_EPIPE);
+    CHECK(kernel_socket_write_unix(&owner,(void *)sender,&cursor,9,KERNEL_SOCKET_MSG_DONTWAIT,0, NULL)==-KERNEL_EPIPE);
     CHECK(!close_during_copy && owner==(void *)sender && heap_live==1 &&
         !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets && sender->pending_error==-KERNEL_ECONNRESET);
     kernel_socket_destroy(sender);
@@ -669,12 +780,12 @@ static void unix_stream_packet_boundary(void)
         struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
         struct kernel_open_file_description *pin=(void *)sender;
         unsigned before=heap_allocations;
-        int result=kernel_socket_write_unix(&pin,NULL,&cursor,sizeof(source),KERNEL_SOCKET_MSG_DONTWAIT,NULL);
+        int result=kernel_socket_write_unix(&pin,NULL,&cursor,sizeof(source),KERNEL_SOCKET_MSG_DONTWAIT,NULL, NULL);
         CHECK(result==(int)payload_limit && pin==(void *)sender && heap_allocations==before+1);
         CHECK(heap_last_allocation_size==packet_limit && sender->unix_memory==packet_limit &&
             sender->unix_packets==1 && !sender->tx_reserved && receiver->rx_bytes==payload_limit);
         struct kernel_socket_read_request read={0};pin=(void *)receiver;
-        CHECK(kernel_socket_reserve_read(receiver,NULL,&read,&pin,sizeof(received),1)==result && !pin);
+        CHECK(kernel_socket_reserve_read(receiver,NULL,&read,&pin,sizeof(received),1, NULL)==result && !pin);
         kernel_socket_copy_read(&read,0,received,payload_limit);
         CHECK(!memcmp(received,source,payload_limit));
         CHECK(kernel_socket_finish_read(&read,0)==payload_limit && pin==(void *)receiver &&
@@ -695,13 +806,13 @@ static void receive_payload(void)
     char first[2]={0},second[7]={0};
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,2},{(uintptr_t)second,7}};
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
-    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0)==9);
+    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0, NULL)==9);
     user_remaining=6;
     CHECK(kernel_socket_read_user(&request,(void *)receiver,&cursor)==-KERNEL_EFAULT);
     kernel_socket_finish_read(&request,1);
     CHECK(receiver->rx_bytes==9 && owner==(void *)receiver);
     cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};user_remaining=SIZE_MAX;
-    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0)==9);
+    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0, NULL)==9);
     CHECK(!kernel_socket_read_user(&request,(void *)receiver,&cursor));
     kernel_socket_finish_read(&request,0);
     CHECK(!memcmp(first,"al",2) && !memcmp(second,"phabeta",7) && !receiver->rx_bytes);
@@ -714,7 +825,7 @@ static void receive_payload(void)
     ip_addr_t peer;IP_ADDR4(&peer,127,0,0,1);
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);udp_received(receiver,receiver->udp,head,&peer,23001);kernel_socket_protocol_leave(&irq);
     owner=(void *)receiver;cursor=(struct kernel_uaccess_iov_cursor){iov,2,0,0};
-    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0)==9);
+    CHECK(kernel_socket_reserve_read(receiver,0,&request,&owner,9,0, NULL)==9);
     user_remaining=6;
     CHECK(kernel_socket_read_user(&request,(void *)receiver,&cursor)==-KERNEL_EFAULT);
     kernel_socket_finish_read(&request,1);user_remaining=SIZE_MAX;
@@ -734,7 +845,7 @@ static void connected_pair(struct kernel_socket **listener, struct kernel_socket
     CHECK(result == 0 || result == -KERNEL_EINPROGRESS);
     for (unsigned i = 0; i < 8 && !(*client)->connected; ++i)
         (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8, 8, 0});
-    CHECK((*client)->connected && kernel_socket_accept(*listener, server) == 0);
+    CHECK((*client)->connected && kernel_socket_accept(*listener, server, NULL) == 0);
 }
 
 static struct tcp_pcb *close_to_timewait(struct kernel_socket *client, struct kernel_socket *server)
@@ -824,7 +935,7 @@ static void unix_destroy_interleaving(void)
     CHECK(write_buffer(receiver,"back",4,0)==4);
     struct kernel_open_file_description *owner=(void *)receiver;
     struct kernel_socket_read_request read={0};
-    CHECK(kernel_socket_reserve_read(receiver,0,&read,&owner,4,0)==4 && !owner);
+    CHECK(kernel_socket_reserve_read(receiver,0,&read,&owner,4,0, NULL)==4 && !owner);
     char bytes[4];
     kernel_socket_copy_read(&read,0,bytes,sizeof(bytes));
     CHECK(!memcmp(bytes,"sent",sizeof(bytes)) && heap_live==before+4);
@@ -1041,7 +1152,7 @@ static void protocol_transaction(void)
     int connected=kernel_socket_connect(client,&address,0);
     CHECK(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<4;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    CHECK(!kernel_socket_accept(listener,&server));
+    CHECK(!kernel_socket_accept(listener,&server, NULL));
     struct kernel_open_file_description *pin=(void *)client;
     struct kernel_socket_write_request write={0};
     kernel_socket_stream_begin(&write,&pin);
@@ -1057,7 +1168,7 @@ static void protocol_transaction(void)
     struct kernel_open_file_description *reader=(void *)server;
     struct kernel_socket_read_request read={0};
     locks=acquired;services=protocol_services;
-    CHECK(kernel_socket_reserve_read(server,NULL,&read,&reader,1,0)==1);
+    CHECK(kernel_socket_reserve_read(server,NULL,&read,&reader,1,0, NULL)==1);
     CHECK(acquired==locks && protocol_services==services);
     kernel_socket_finish_read(&read,0);
     CHECK(acquired==locks && protocol_services==services);
@@ -1089,7 +1200,7 @@ static void receive_prefix(void)
     struct kernel_open_file_description *pin=(void *)receiver;
     struct kernel_socket_read_request request={0};
     unsigned locks=acquired;
-    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,10,0)==10);
+    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,10,0, NULL)==10);
     char a[2]={0},b[8]={0};
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)a,2},{(uintptr_t)b,8}};
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
@@ -1097,20 +1208,20 @@ static void receive_prefix(void)
     CHECK(acquired==locks && !memcmp(a,"ab",2) && !memcmp(b,"cdefghij",8));
     kernel_socket_finish_read(&request,0);
     CHECK(acquired==locks && receiver->rx_bytes==2);
-    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0)==2);
+    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0, NULL)==2);
     struct kernel_open_file_description *other=(void *)receiver;
     struct kernel_socket_read_request second={0};
-    CHECK(kernel_socket_reserve_read(receiver,NULL,&second,&other,32,1)==-KERNEL_EAGAIN && !second.socket);
+    CHECK(kernel_socket_reserve_read(receiver,NULL,&second,&other,32,1, NULL)==-KERNEL_EAGAIN && !second.socket);
     CHECK(write_buffer(sender,"late",4,0)==4);
     kernel_socket_destroy(sender);sender=NULL;
     char tail[8]={0};kernel_socket_copy_read(&request,0,tail,2);
     CHECK(!memcmp(tail,"kl",2));kernel_socket_finish_read(&request,0);
     CHECK(receiver->rx_bytes==4 && receiver->peer_closed);
-    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0)==4);
+    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0, NULL)==4);
     allow_ofd_release=1;kernel_socket_abort_read(&request);
     CHECK(!request.socket && !allow_ofd_release && receiver->rx_bytes==4 && !receiver->read_request);
     pin=(void *)receiver;
-    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0)==4);
+    CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,32,0, NULL)==4);
     kernel_socket_copy_read(&request,1,tail,3);CHECK(!memcmp(tail,"ate",3));
     kernel_socket_finish_read(&request,0);CHECK(!receiver->rx_bytes);
     kernel_socket_destroy(receiver);
@@ -1140,14 +1251,14 @@ static void receive_packet_chains(void)
     struct kernel_socket_read_request request={0};
     char a[3]={0},b[9]={0};struct kernel_uaccess_iovec iov[]={{(uintptr_t)a,3},{(uintptr_t)b,9}};
     struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
-    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,12,0)==12);
+    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,12,0, NULL)==12);
     user_remaining=7;
     CHECK(kernel_socket_read_user(&request,(void *)server,&cursor)==-KERNEL_EFAULT);
     CHECK(request.completed_bytes==4 && kernel_socket_finish_read(&request,1)==4 && server->rx_bytes==8);
     user_remaining=SIZE_MAX;
     char remaining[8]={0};struct kernel_uaccess_iovec tail_iov={(uintptr_t)remaining,8};
     cursor=(struct kernel_uaccess_iov_cursor){&tail_iov,1,0,0};
-    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,8,0)==8);
+    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,8,0, NULL)==8);
     CHECK(!kernel_socket_read_user(&request,(void *)server,&cursor));
     CHECK(kernel_socket_finish_read(&request,0)==8 && !memcmp(remaining,"efghijkl",8) && !server->rx_bytes);
     kernel_socket_protocol_enter(&scope);
@@ -1185,7 +1296,7 @@ static void endpoint_ownership(void)
         struct kernel_open_file_description *pin=(void *)socket;
         struct kernel_socket_read_request read={0};
         CHECK(kernel_socket_receive_ready(socket) && (kernel_socket_poll(socket,NULL)&KERNEL_POLLIN));
-        CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,4,0)==4);
+        CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,4,0, NULL)==4);
         kernel_socket_copy_read(&read,0,out,4);
         CHECK(kernel_socket_finish_read(&read,0)==4 && !memcmp(out,bytes,4));
         CHECK(acquired==locks && retired_payloads==returned && socket->retired_head && !socket->packets_head);
@@ -1299,7 +1410,7 @@ static void *remote_writer(void *argument)
         kernel_socket_stream_finish(&request);
     } else {
         const struct kernel_uaccess_iovec iov={(uintptr_t)"r",1};
-        int result=kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,1,0,NULL);
+        int result=kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,1,0,NULL, NULL);
         CHECK(result==(remote_mode==2?-KERNEL_EFAULT:remote_mode==3?-KERNEL_EIO:1));
     }
     CHECK(pin==(void *)socket && !remote_write);remote_task=NULL;
@@ -1435,7 +1546,7 @@ static void *reserve_concurrently(void *argument)
 {
     struct reservation_attempt *a=argument;reservation_actor=a->actor;
     a->pin=(void *)a->socket;
-    a->result=kernel_socket_reserve_read(a->socket,(void *)a,&a->read,&a->pin,4,0);
+    a->result=kernel_socket_reserve_read(a->socket,(void *)a,&a->read,&a->pin,4,0, NULL);
     return NULL;
 }
 static void concurrent_reservation(void)
@@ -1480,7 +1591,7 @@ static struct kernel_socket_address read_named_packet(struct kernel_socket *sock
     struct kernel_socket_read_request read={0};
     unsigned length=(unsigned)strlen(expected);char bytes[16]={0};
     CHECK(length<=sizeof(bytes));
-    CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,sizeof(bytes),1)==(int)length && !pin);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,sizeof(bytes),1, NULL)==(int)length && !pin);
     struct kernel_socket_address address={0};uint32_t actual=0;
     kernel_socket_read_info(&read,&address,&actual);CHECK(actual==length);
     kernel_socket_copy_read(&read,0,bytes,length);CHECK(!memcmp(bytes,expected,length));
@@ -1520,7 +1631,7 @@ static void unix_named_stream(void)
     CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
     CHECK(!kernel_socket_connect(client,&address,1) && listener->pending_live==1);
     CHECK(kernel_socket_poll(listener,NULL)&KERNEL_POLLIN);
-    CHECK(!kernel_socket_accept(listener,&accepted) && !listener->pending_live);
+    CHECK(!kernel_socket_accept(listener,&accepted, NULL) && !listener->pending_live);
     CHECK(client->peer==accepted && accepted->peer==client && client->unix_references==2 && accepted->unix_references==2);
     struct kernel_socket_address peer={0};CHECK(!kernel_socket_getpeer(client,&peer));
     expect_unix_name(&peer,name,sizeof(name));kernel_socket_address_release(&peer);
@@ -1536,7 +1647,7 @@ static void unix_named_stream(void)
     client=NULL;accepted=NULL;
     CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
     CHECK(!kernel_socket_connect(client,&address,1));kernel_socket_destroy(client);
-    CHECK(!kernel_socket_accept(listener,&accepted) && accepted->peer_closed && !accepted->peer);
+    CHECK(!kernel_socket_accept(listener,&accepted, NULL) && accepted->peer_closed && !accepted->peer);
     CHECK(kernel_socket_receive_ready(accepted));kernel_socket_destroy(accepted);
     client=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
     CHECK(!kernel_socket_connect(client,&address,1));kernel_socket_destroy(listener);
@@ -1589,12 +1700,12 @@ static void unix_named_datagram(void)
     CHECK(!kernel_socket_connect(sender,&two,1) && sender->unix_references==1 && b->unix_references==2);
     char bytes[]="held";struct kernel_uaccess_iovec iov={(uintptr_t)bytes,4};
     struct kernel_open_file_description *pin=(void *)sender;close_during_copy=b;
-    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,4,KERNEL_SOCKET_MSG_DONTWAIT,NULL)==-KERNEL_ECONNREFUSED);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,4,KERNEL_SOCKET_MSG_DONTWAIT,NULL, NULL)==-KERNEL_ECONNREFUSED);
     CHECK(!close_during_copy && !sender->peer && sender->peer_closed && sender->unix_references==1 &&
         !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets && !sender->unix_space.queue);
     b=named_unix_socket(SOCKET_DGRAM,second,sizeof(second));
     close_during_copy=b;pin=(void *)sender;
-    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,4,KERNEL_SOCKET_MSG_DONTWAIT,&two)==-KERNEL_ECONNREFUSED);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,4,KERNEL_SOCKET_MSG_DONTWAIT,&two, NULL)==-KERNEL_ECONNREFUSED);
     CHECK(!close_during_copy && pin==(void *)sender && !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets);
     kernel_socket_destroy(a);kernel_socket_destroy(sender);CHECK(!heap_live);
     puts("PASS UNIX named datagram: one-way and self connections, reconnect, queue-space callback, sender-close packet billing/name retention, connected/sendto destination close during user copy");
@@ -1607,14 +1718,14 @@ static void unix_stream_peer_after_close(unsigned queued)
     struct kernel_socket *listener=named_unix_socket(SOCKET_STREAM,name,sizeof(name));
     struct kernel_socket *client=named_unix_socket(SOCKET_STREAM,client_name,sizeof(client_name)),*child=NULL;
     CHECK(!kernel_socket_listen(listener,1));CHECK(!kernel_socket_connect(client,&destination,1));
-    if(!queued)CHECK(!kernel_socket_accept(listener,&child));
+    if(!queued)CHECK(!kernel_socket_accept(listener,&child, NULL));
     unix_close_name_probe.target=client;unix_close_name_probe.peer=client->peer;
     unix_close_name_probe.bytes=client_name;unix_close_name_probe.length=sizeof(client_name);
     unix_close_name_probe.observed=0;
     kernel_socket_destroy(client);
     CHECK(unix_close_name_probe.observed==1 && !unix_close_name_probe.target);
     unix_close_name_probe.peer=NULL;unix_close_name_probe.bytes=NULL;
-    if(queued)CHECK(!kernel_socket_accept(listener,&child));
+    if(queued)CHECK(!kernel_socket_accept(listener,&child, NULL));
     CHECK(!kernel_socket_getpeer(child,&peer));expect_unix_name(&peer,client_name,sizeof(client_name));
     kernel_socket_address_release(&peer);kernel_socket_destroy(child);kernel_socket_destroy(listener);CHECK(!heap_live);
     printf("PASS UNIX %s stream preserves bound peer name during and after peer close\n",queued?"queued":"accepted");
@@ -1658,13 +1769,13 @@ static void unix_datagram_read_shutdown(void)
     CHECK(write_buffer(sender,"x",1,KERNEL_SOCKET_MSG_DONTWAIT)==-KERNEL_EPIPE);
     struct kernel_open_file_description *pin=(void *)sender;char bytes[]="x";
     struct kernel_uaccess_iovec iov={(uintptr_t)bytes,1};
-    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&address)==-KERNEL_EPIPE);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&address, NULL)==-KERNEL_EPIPE);
     CHECK(!target->rx_bytes && !target->unix_reserved && !sender->unix_packets && !sender->tx_reserved);
     kernel_socket_destroy(target);kernel_socket_destroy(sender);CHECK(!heap_live);
     target=named_unix_socket(SOCKET_DGRAM,name,sizeof(name));sender=NULL;
     CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&sender));
     CHECK(!kernel_socket_connect(sender,&address,1));pin=(void *)sender;read_shutdown_during_copy=target;
-    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,NULL)==-KERNEL_EPIPE);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,NULL, NULL)==-KERNEL_EPIPE);
     CHECK(!read_shutdown_during_copy && pin==(void *)sender && !sender->tx_reserved && !sender->unix_packets &&
         !target->unix_reserved && !target->rx_bytes);
     kernel_socket_destroy(target);kernel_socket_destroy(sender);CHECK(!heap_live);
@@ -1686,7 +1797,7 @@ static void unix_datagram_reconnect_receive(void)
     CHECK(!kernel_socket_connect(a,&ba,1));
     CHECK(write_buffer(b,"head",4,0)==4 && write_buffer(b,"tail",4,0)==4);
     struct kernel_open_file_description *pin=(void *)a;struct kernel_socket_read_request read={0};
-    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,2,1)==2 && !pin);
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,2,1, NULL)==2 && !pin);
     CHECK(!kernel_socket_connect(a,&ca,1));
     CHECK(a->packets_head==read.packet && a->packets_tail==read.packet && !a->packets_head->next &&
         a->unix_queued==1 && a->rx_bytes==4 && b->unix_packets==1 && b->unix_memory==unix_charge(4));
@@ -1713,19 +1824,19 @@ static void unix_stream_receive_state(void)
     struct kernel_socket_read_request request={0};
     for(int nonblocking=0;nonblocking<2;nonblocking++) {
         CHECK(kernel_socket_receive_ready(socket));
-        CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,nonblocking)==-KERNEL_EINVAL);
+        CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,nonblocking, NULL)==-KERNEL_EINVAL);
         CHECK(!request.socket && pin==(void *)socket);
     }
     const unsigned char name[]={0,'r','e','c','v','-','s','t','a','t','e'};
     struct kernel_socket_address address=abstract_address(name,sizeof(name));
     CHECK(!kernel_socket_bind(socket,&address) && !kernel_socket_listen(socket,1));
-    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,1)==-KERNEL_EINVAL);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,1, NULL)==-KERNEL_EINVAL);
     kernel_socket_destroy(socket);
     struct kernel_socket *a=NULL,*b=NULL;
     CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&a,&b));
     kernel_socket_destroy(b);pin=(void *)a;
     CHECK(kernel_socket_receive_ready(a));
-    CHECK(!kernel_socket_reserve_read(a,NULL,&request,&pin,1,0));
+    CHECK(!kernel_socket_reserve_read(a,NULL,&request,&pin,1,0, NULL));
     kernel_socket_destroy(a);CHECK(!heap_live);
     puts("PASS UNIX stream receive state: unconnected/listener EINVAL before waiting, established peer close remains EOF");
 }
@@ -1749,7 +1860,7 @@ static void unix_space_topology(void)
     char byte='q';struct kernel_uaccess_iovec iov={(uintptr_t)&byte,1};
     for(unsigned i=0;i<11;i++) {
         struct kernel_open_file_description *pin=(void *)c;
-        CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&ba)==1);
+        CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&ba, NULL)==1);
     }
     CHECK(!(kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
     unsigned notifications=0;struct kernel_wait_node watcher={0};
@@ -1757,7 +1868,7 @@ static void unix_space_topology(void)
     source=read_named_packet(b,"q");kernel_socket_address_release(&source);
     CHECK(notifications && (kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
     struct kernel_open_file_description *pin=(void *)c;
-    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&ba)==1);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&ba, NULL)==1);
     CHECK(!(kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
     before=notifications;
     CHECK(!kernel_socket_connect(b,&aa,1));
@@ -1792,8 +1903,8 @@ static void unix_write_completion_notifications(void)
         struct kernel_open_file_description *pin=(void *)sender;
         int fault=0;
         int result=type==SOCKET_DGRAM
-            ?kernel_socket_write_datagram(&pin,NULL,&iov,1,5,0,NULL)
-            :kernel_socket_write_unix(&pin,NULL,&cursor,5,0,&fault);
+            ?kernel_socket_write_datagram(&pin,NULL,&iov,1,5,0,NULL, NULL)
+            :kernel_socket_write_unix(&pin,NULL,&cursor,5,0,&fault, NULL);
         CHECK(result==-KERNEL_EFAULT && pin==(void *)sender);
         user_remaining=SIZE_MAX;
         CHECK(notifications>before && !sender->tx_reserved && !receiver->rx_bytes);
@@ -1803,10 +1914,169 @@ static void unix_write_completion_notifications(void)
     puts("PASS UNIX write completion: no unchanged-state notification, packet credit and failed-copy cancellation still wake sender");
 }
 
+/* These OFD boundary objects have real reference counts and final socket puts;
+ * the graph walk, queue ownership, PID snapshots and packet disposal are production. */
+static void model_send_right(struct kernel_open_file_description *sender,
+    struct kernel_open_file_description *right)
+{
+    struct kernel_socket_message message={0};
+    CHECK(!kernel_socket_control_allocate(&test_heap,1,&message.control));
+    CHECK(kernel_open_file_acquire(right)==KERNEL_OPEN_FILE_STATUS_OK);
+    message.control->files[0]=right;message.control->count=1;
+    char byte='G';struct kernel_uaccess_iovec iov={(uintptr_t)&byte,1};
+    struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+    struct kernel_open_file_description *pin=sender;
+    CHECK(kernel_socket_write_unix(&pin,NULL,&cursor,1,KERNEL_SOCKET_MSG_DONTWAIT,NULL,&message)==1 && pin==sender && !message.control);
+    kernel_socket_control_release(&message.credentials);
+}
+static void model_owned_pair(struct kernel_open_file_description *files[2],struct kernel_socket *sockets[2])
+{
+    sockets[0]=sockets[1]=NULL;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_DGRAM,&sockets[0],&sockets[1]));
+    for(unsigned side=0;side<2;side++)files[side]=model_socket_file_create(sockets[side]);
+    CHECK(!kernel_socket_set_option(sockets[1],KERNEL_SOCKET_PASSCRED,1));
+}
+static void model_put(struct kernel_open_file_description **file)
+{ CHECK(kernel_open_file_release(file)==KERNEL_OPEN_FILE_STATUS_OK && !*file); }
+static void model_no_control_owners(void)
+{
+    CHECK(!heap_live && !model_socket_files && !unix_sockets && !rights_controls && !rights_retired && !rights_releasing &&
+        !model_uid_account.unix_inflight && model_uid_account.references==1 && model_pid.references==1);
+}
+struct root_cycle_gate {
+    pthread_mutex_t lock;pthread_cond_t changed;unsigned phase;
+    struct kernel_open_file_description *owner;
+};
+static void *root_cycle_releaser(void *argument)
+{
+    struct root_cycle_gate *gate=argument;CHECK(!pthread_mutex_lock(&gate->lock));
+    gate->phase=1;CHECK(!pthread_cond_broadcast(&gate->changed));
+    while(gate->phase!=2)CHECK(!pthread_cond_wait(&gate->changed,&gate->lock));
+    CHECK(!pthread_mutex_unlock(&gate->lock));model_put(&gate->owner);
+    CHECK(!pthread_mutex_lock(&gate->lock));gate->phase=3;
+    CHECK(!pthread_cond_broadcast(&gate->changed) && !pthread_mutex_unlock(&gate->lock));return NULL;
+}
+static void unix_control_owners(void)
+{
+    kernel_socket_network_initialize();
+    for(unsigned round=0;round<16;round++) {
+        struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];model_owned_pair(file,socket);
+        model_send_right(file[0],file[1]);CHECK(model_uid_account.unix_inflight==1 && model_pid.references==2);
+        model_put(&file[0]);model_put(&file[1]);CHECK(heap_live && model_socket_files && rights_controls);
+        kernel_socket_rights_service();model_no_control_owners();
+    }
+    puts("PASS UNIX SCM self cycles: 16 queued rights/credential snapshots collected, socket/OFD/PID/UID/heap owners restored");
+    for(unsigned round=0;round<16;round++) {
+        struct kernel_open_file_description *a[2],*b[2];struct kernel_socket *sa[2],*sb[2];model_owned_pair(a,sa);model_owned_pair(b,sb);
+        model_send_right(a[0],b[1]);model_send_right(b[0],a[1]);CHECK(model_uid_account.unix_inflight==2);
+        model_put(&a[0]);model_put(&a[1]);model_put(&b[0]);model_put(&b[1]);
+        kernel_socket_rights_service();model_no_control_owners();
+    }
+    puts("PASS UNIX SCM mutual cycles: 16 reciprocal graphs collected, all queue and final owners restored");
+    struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];model_owned_pair(file,socket);
+    model_send_right(file[0],file[1]);model_put(&file[0]);
+    struct root_cycle_gate gate={.lock=PTHREAD_MUTEX_INITIALIZER,.changed=PTHREAD_COND_INITIALIZER,.owner=file[1]};file[1]=NULL;
+    pthread_t thread;CHECK(!pthread_create(&thread,NULL,root_cycle_releaser,&gate));
+    CHECK(!pthread_mutex_lock(&gate.lock));while(gate.phase!=1)CHECK(!pthread_cond_wait(&gate.changed,&gate.lock));
+    unsigned retained=heap_live;kernel_socket_rights_service();
+    CHECK(heap_live==retained && model_uid_account.unix_inflight==1 && socket[1]->packets_head &&
+        socket[1]->packets_head->data[0]=='G' && kernel_open_file_references(gate.owner)==2);
+    gate.phase=2;CHECK(!pthread_cond_broadcast(&gate.changed));
+    while(gate.phase!=3)CHECK(!pthread_cond_wait(&gate.changed,&gate.lock));
+    CHECK(!gate.owner);
+    CHECK(!pthread_mutex_unlock(&gate.lock) && !pthread_join(thread,NULL));
+    kernel_socket_rights_service();model_no_control_owners();
+    CHECK(!pthread_cond_destroy(&gate.changed) && !pthread_mutex_destroy(&gate.lock));
+    puts("PASS UNIX SCM external root: handshake retains queued content during collection, remote final external put enables collection");
+    const unsigned char name[]={0,'g','c','-','p','e','n','d','i','n','g'};
+    struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_UNIX,.unix_path=name,.unix_length=sizeof(name)};
+    struct kernel_socket *listener=NULL,*client=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&listener) &&
+        !kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,1));
+    struct kernel_open_file_description *listener_file=model_socket_file_create(listener);
+    CHECK(!kernel_socket_set_option(listener,KERNEL_SOCKET_PASSCRED,1));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client) && !kernel_socket_connect(client,&address,1));
+    struct kernel_open_file_description *client_file=model_socket_file_create(client);
+    model_send_right(client_file,client_file);model_put(&client_file);retained=heap_live;
+    kernel_socket_rights_service();CHECK(heap_live==retained && listener->pending_head && listener->pending_head->child->rights_head && model_uid_account.unix_inflight==1);
+    model_put(&listener_file);kernel_socket_rights_service();model_no_control_owners();
+    puts("PASS UNIX SCM unaccepted child: listener root retains queued child rights, closing listener returns all socket/OFD/PID/UID/heap owners");
+}
+
+static struct kernel_socket_control *model_unreachable_self_right(void)
+{
+    struct kernel_open_file_description *file[2];struct kernel_socket *socket[2];
+    model_owned_pair(file,socket);model_send_right(file[0],file[1]);
+    struct kernel_socket_control *control=socket[1]->rights_head;
+    CHECK(control && control->count==1 && control->files[0]==file[1] &&
+        control->pid==&model_pid && control->account==&model_uid_account);
+    struct model_socket_file *target=model_socket_file(file[1]);CHECK(target);
+    model_put(&file[0]);model_put(&file[1]);
+    CHECK(kernel_open_file_references(control->files[0])==1 &&
+        model_uid_account.unix_inflight==1 && model_uid_account.references==2 && model_pid.references==2);
+    control_release_probe.target=target;
+    return control;
+}
+static void *control_gc_releaser(void *unused)
+{
+    (void)unused;kernel_socket_rights_service();return NULL;
+}
+static void unix_control_cleanup_failure(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket_control *control=model_unreachable_self_right();
+    struct kernel_open_file_description *file=control->files[0];
+    unsigned retained=heap_live;
+    control_release_probe.fail=1;
+    kernel_socket_rights_service();
+    CHECK(control_release_probe.attempts==1 && rights_retired==control && !rights_controls &&
+        !rights_releasing && !control->inflight && !control->previous && !control->receiver_previous &&
+        control->files[0]==file && kernel_open_file_references(file)==1 && heap_live==retained &&
+        !model_uid_account.unix_inflight && model_uid_account.references==2 && model_pid.references==2);
+    CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
+    CHECK(control_release_probe.attempts==2 && rights_retired==control && !rights_controls &&
+        !rights_releasing && control->files[0]==file && kernel_open_file_references(file)==1 &&
+        heap_live==retained && model_uid_account.references==2 && model_pid.references==2);
+    control_release_probe.fail=0;
+    CHECK(!kernel_socket_rights_drain() && control_release_probe.attempts==3);
+    control_release_probe.target=NULL;
+    model_no_control_owners();
+    CHECK(!rights_retry_pending && !rights_active);
+    puts("PASS UNIX SCM cleanup failure: two injected last-put failures retain exact OFD/control/PID/UID/heap owners; immediate drain retry returns EBUSY, recovery returns every owner");
+
+    control_release_probe.attempts=0;control_release_probe.pause=1;
+    control=model_unreachable_self_right();file=control->files[0];retained=heap_live;
+    pthread_t thread;CHECK(!pthread_create(&thread,NULL,control_gc_releaser,NULL));
+    CHECK(!pthread_mutex_lock(&control_release_probe.lock));
+    while(!control_release_probe.entered)
+        CHECK(!pthread_cond_wait(&control_release_probe.changed,&control_release_probe.lock));
+    /* The worker has detached the graph and is stopped at the actual last
+     * put. Empty linked lists alone are insufficient to permit shutdown. */
+    CHECK(!rights_controls && !rights_retired && rights_releasing &&
+        control_release_probe.attempts==1 && heap_live==retained && control->files[0]==file &&
+        kernel_open_file_references(file)==1 && model_uid_account.references==2 && model_pid.references==2 &&
+        !model_uid_account.unix_inflight);
+    CHECK(kernel_socket_rights_drain()==-KERNEL_EBUSY);
+    CHECK(!rights_controls && !rights_retired && rights_releasing &&
+        control_release_probe.attempts==1 && heap_live==retained);
+    control_release_probe.resume=1;
+    CHECK(!pthread_cond_broadcast(&control_release_probe.changed));
+    CHECK(!pthread_mutex_unlock(&control_release_probe.lock) && !pthread_join(thread,NULL));
+    control_release_probe.target=NULL;control_release_probe.pause=0;
+    CHECK(!kernel_socket_rights_drain() && control_release_probe.attempts==1);
+    model_no_control_owners();
+    CHECK(!rights_retry_pending && !rights_active);
+    puts("PASS UNIX SCM cleanup interleave: condition-variable handshake pauses lock-free last put, concurrent drain rejects empty-list false success, completed put returns all owners");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "unix-write-notify")) unix_write_completion_notifications();
+    CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
+    CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
+    if (!strcmp(argv[1], "unix-control-cleanup")) unix_control_cleanup_failure();
+    else if (!strcmp(argv[1], "unix-control-owner")) unix_control_owners();
+    else if (!strcmp(argv[1], "unix-write-notify")) unix_write_completion_notifications();
     else if (!strcmp(argv[1], "unix-stream-state")) unix_stream_receive_state();
     else if (!strcmp(argv[1], "unix-space-topology")) unix_space_topology();
     else if (!strcmp(argv[1], "unix-dgram-shutdown")) unix_datagram_read_shutdown();
@@ -1856,5 +2126,7 @@ int main(int argc, char **argv)
     CHECK(!heap_live && !tcp_active_pcbs && !tcp_tw_pcbs && !tcp_listen_pcbs.pcbs);
     CHECK(!lwip_stats.memp[MEMP_TCP_PCB]->used && !lwip_stats.memp[MEMP_TCP_PCB_LISTEN]->used &&
           !lwip_stats.memp[MEMP_TCP_SEG]->used && !lwip_stats.mem.used);
+    CHECK(model_pid.references==1 && model_uid_account.references==1 && !model_uid_account.unix_inflight);
+    kernel_pid_put(&model_pid);CHECK(kernel_pid_take_retired(&model_pid_registry)==&model_pid && !model_pid_numbers.allocated);
     return 0;
 }

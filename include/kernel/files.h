@@ -266,6 +266,7 @@ enum kernel_files_status kernel_files_pipe2(
 
 struct kernel_uaccess_iovec;
 struct kernel_socket_address;
+struct kernel_socket_message;
 /* Descriptors are an immutable, numerically validated request view. Page
  * permissions and faults are checked when payload is actually copied/pinned. */
 enum kernel_files_status kernel_files_socket_iov_io(
@@ -273,7 +274,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
     struct kernel_open_file_description **owner,
     const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
     uint32_t flags, int writing, struct kernel_socket_address *peer,
-    uint32_t *message_size, int64_t *linux_result);
+    uint32_t *message_size, int64_t *linux_result, struct kernel_socket_message *);
 enum kernel_files_status kernel_files_socket_io(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description **owner, uint64_t user_buffer,
@@ -471,6 +472,7 @@ enum kernel_files_status kernel_files_close(
     int64_t *linux_result);
 
 struct kernel_socket_address;
+struct kernel_socket_message;
 enum kernel_files_status kernel_files_socket_create(
     struct kernel_files *files, int family, int type, uint32_t flags,
     int64_t *linux_result);
@@ -489,6 +491,15 @@ enum kernel_files_status kernel_files_socket_accept(
     int (*copy_peer)(void *context, const struct kernel_socket_address *address),
     void *context,
     int64_t *linux_result);
+
+/* fd_flags accepts only Linux FD_CLOEXEC (1). Copy one int32 FD before sharing
+ * the acquired OFD; success consumes owner. Failure preserves owner and cancels
+ * only this reservation, leaving any previously received descriptors installed.
+ * A non-NULL call registers the reservation for task-exit cleanup. */
+struct kernel_socket_call;
+int kernel_files_receive_fd(struct kernel_files *files, struct kernel_mm *mm,
+    uint64_t user_fd, unsigned fd_flags,
+    struct kernel_open_file_description **owner, struct kernel_socket_call *call);
 
 /* Success returns an owned OFD reference independent of the fd slot. */
 enum kernel_files_status kernel_files_pin(

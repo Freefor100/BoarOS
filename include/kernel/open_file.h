@@ -8,6 +8,7 @@
 
 struct kernel_heap;
 struct kernel_open_file_description;
+uint32_t kernel_open_file_references(const struct kernel_open_file_description *);
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
 struct kernel_vfs_stat;

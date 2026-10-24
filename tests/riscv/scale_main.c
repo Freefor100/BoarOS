@@ -264,7 +264,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
           kernel_socket_getname(server_socket, &address) == 0 &&
           kernel_socket_listen(server_socket, 1) == 0 &&
           (remote.port = address.port, kernel_socket_connect(client_socket, &remote, 0)) == 0 &&
-          kernel_socket_accept(server_socket, &accepted) == 0, 31);
+          kernel_socket_accept(server_socket, &accepted, NULL) == 0, 31);
     struct kernel_socket *idle[16] = {0};
     for (unsigned i = 0; i < 16; i++)
         check(kernel_socket_create(files->heap, KERNEL_SOCKET_AF_INET, 1, &idle[i]) == 0, 222);
@@ -310,7 +310,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
         /* 此启动夹具没有网络worker；读取不再隐式执行协议，显式推进实际待办。 */
         (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,4,2});
         struct kernel_socket_read_request request={0};
-        int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0);
+        int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0, NULL);
         check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
     }
     (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,4,2});
@@ -357,7 +357,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     } while (service.runnable);
     struct kernel_socket_read_request budget_read = {0};
     char budget_bytes[5];
-    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 5, 0) == 5, 227);
+    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 5, 0, NULL) == 5, 227);
     kernel_socket_copy_read(&budget_read, 0, budget_bytes, 5);
     check(!memcmp(budget_bytes, "batch", 5), 228);
     kernel_socket_finish_read(&budget_read, 0);
@@ -382,7 +382,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     kernel_socket_protocol_leave(&core);
     check(kernel_socket_write_buffer(client_socket, "pool", 4, 0) == 4, 233);
     budget_read = (struct kernel_socket_read_request){0};
-    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 4, 0) == 4, 234);
+    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 4, 0, NULL) == 4, 234);
     kernel_socket_copy_read(&budget_read, 0, budget_bytes, 4);
     check(!memcmp(budget_bytes, "pool", 4), 235);
     kernel_socket_finish_read(&budget_read, 0);
@@ -396,7 +396,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     timer_probe=0;check(timer_heap_calls==0,204);
     (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8, 8, 1});
     struct kernel_socket_read_request request={0};
-    check(kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0)==5,205);
+    check(kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0, NULL)==5,205);
     char retry[5];kernel_socket_copy_read(&request,0,retry,5);check(!memcmp(retry,"retry",5),206);
     kernel_socket_finish_read(&request,0);
     check(kernel_open_file_release(&reader)==KERNEL_OPEN_FILE_STATUS_OK,207);
@@ -417,7 +417,7 @@ static void udp_read_without_buffer(struct kernel_files *files, struct kernel_mm
     check(kernel_socket_bind(socket, &address) == 0 && kernel_socket_getname(socket, &address) == 0, 37);
     address.bytes[0] = 127; address.bytes[3] = 1;
     struct kernel_uaccess_iovec iov = {BUFFER, 8192};
-    check(kernel_socket_write_datagram(&pin, mm, &iov, 1, 8192, 0, &address) == 8192, 37);
+    check(kernel_socket_write_datagram(&pin, mm, &iov, 1, 8192, 0, &address, NULL) == 8192, 37);
     fail_page = 1;
     check(kernel_files_read(files, mm, fd, BUFFER, 8192, &result) == KERNEL_FILES_STATUS_OK &&
           result == 8192 && fail_page == 1, 38);
