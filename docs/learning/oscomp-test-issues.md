@@ -125,13 +125,19 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 
 ## 内核语义与错误分类
 
-### socketpair01：非 UNIX family 在创建检查前返回 EOPNOTSUPP
+### socketpair01：创建阶段错误分类（已修复）
 
-原 `socketpair01` 的四个架构/libc组合均有四项得到 EOPNOTSUPP(95)，而断言分别要求一次 EAFNOSUPPORT(97)、三次 EPROTONOSUPPORT(93)。这是内核错误分类缺口，得分、退出码和耗时见[本轮原程序结果](oscomp-ltp-analysis.md#unix-seqpacket-接入后的-socket-原程序结果)，不按环境或发布程序问题处理。
+此前四个架构/libc组合的原 `socketpair01` 均为6/10、退出1：一项期望 EAFNOSUPPORT(97)、三项期望 EPROTONOSUPPORT(93)，实际均为 EOPNOTSUPP(95)。这是当时内核的错误分类缺口，[上轮得分、耗时和原始结果](oscomp-ltp-analysis.md#unix-seqpacket-接入后的-socket-原程序结果)继续保留。main 基线 `f0943f2` 已有相同的非 UNIX family 提前返回行为，源码说明它早于 SEQPACKET 接入；该历史运行没有另用旧核重跑。
 
-当前 `kernel/syscall/socket.c` 的 socketpair 入口在基本范围检查后，对 `family != AF_UNIX` 直接返回95，跳过对应地址族创建 socket 时的 family/protocol 判断。固定 `references/linux/net/socket.c` 的 `__sys_socketpair` 则先调用 `sock_create` 创建 socket，再调用该协议的 `ops->socketpair`；地址族或协议创建不成立时，创建阶段的错误先返回，尚未到不支持配对操作的检查。创建阶段错误与不支持配对操作属于不同的失败阶段，不能把所有非 UNIX 请求归为 EOPNOTSUPP。
+当前 `kernel/syscall/socket.c` 已让 socket 和 socketpair 共用 family/type/protocol 创建校验，区分创建失败与不支持配对操作。固定 `references/linux/net/socket.c` 的 `__sys_socketpair` 先预留两个 FD、逐个写入用户输出，再创建 socket，最后调用协议的 `ops->socketpair`；当前文件表事务采用这一顺序，失败时归还预留 FD，并保留已经写入用户空间的输出前缀。不能创建的地址族或协议保留对应创建错误，能够创建而不支持配对的 INET TCP/UDP 请求仍返回 EOPNOTSUPP。
 
-main 基线 `f0943f2` 已有相同的 `family != AF_UNIX` 提前返回95，当前实现保留了该分支。因此源码证明这是本轮 SEQPACKET 之前已有的行为；本轮只有当前核的原程序实跑，没有用旧核重跑 `socketpair01`。保留原 ELF、原断言和原 judge 的实际失败，后续应在内核区分创建阶段错误与配对操作错误。
+修复后保留同一批原 ELF、原断言和原 judge，四配置均为10/10、退出0，无 TFAIL、TBROK、TCONF 或超时，见[本轮分项得分与耗时](oscomp-ltp-analysis.md#sysv-信号量与-socketpair-错误分类修复后的原程序结果)。
+
+### semctl03：libc 变体主动跳过两项 EFAULT
+
+原 `semctl03` 在四配置均为6/8、退出0、两条 TCONF。固定源码的测试表把 GETALL、IPC_SET 的非法 union 参数列为 EFAULT；`verify_semctl()` 遇到 `tc->error == EFAULT && tv->semctl == libc_semctl` 时直接输出 `EFAULT is skipped for libc variant` 并返回，不执行该分项的 semctl 调用。libc 和原始 syscall 两种变体合计八项，因此 libc 变体的这两项记 TCONF，其余六项实际通过。
+
+依据：[固定 semctl03 源码](https://github.com/oscomp/testsuits-for-oskernel/blob/8b58dd16d26d30f7c74d48d5832d870d3051b703/ltp-full-20240524/testcases/kernel/syscalls/ipc/semctl/semctl03.c)。本轮原输出与原 judge 的6/8继续保留，见[分项结果](oscomp-ltp-analysis.md#sysv-信号量与-socketpair-错误分类修复后的原程序结果)；这两项跳过由程序的上述条件直接触发，不据此推断环境或内核缺口，也不把独立故障检查的通过数补入原程序分数。
 
 ## fs_fill：评测预算取舍
 

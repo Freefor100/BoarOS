@@ -682,6 +682,43 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 | LA / glibc | 9/9 | 0 | 115 | 6/10 | 1 | 64 |
 | LA / musl | 9/9 | 0 | 63 | 6/10 | 1 | 65 |
 
-四配置合计60条 TPASS、16条 TFAIL，无 TBROK、TCONF 或超时。`socketpair01` 每次失败均为四项错误分类：一项期望 EAFNOSUPPORT(97)、三项期望 EPROTONOSUPPORT(93)，实际均为 EOPNOTSUPP(95)。这是内核已有的非 UNIX family 检查顺序缺口，不能归为测试环境问题；源码依据及其与本轮实跑的区别见[统一问题记录](oscomp-test-issues.md#socketpair01非-unix-family-在创建检查前返回-eopnotsupp)。
+四配置合计60条 TPASS、16条 TFAIL，无 TBROK、TCONF 或超时。`socketpair01` 每次失败均为四项错误分类：一项期望 EAFNOSUPPORT(97)、三项期望 EPROTONOSUPPORT(93)，实际均为 EOPNOTSUPP(95)。这是当时内核已有的非 UNIX family 检查顺序缺口；本轮已修复，源码依据见[统一问题记录](oscomp-test-issues.md#socketpair01创建阶段错误分类已修复)，修复后原程序四配置均为10/10，见[本轮结果](#sysv-信号量与-socketpair-错误分类修复后的原程序结果)。
 
 两架构的 PID 1 均以0退出、heap-live=0，根盘及第二盘分区共八项磁盘检查均为0，记录在同目录 `disk-checks.json`；原始串口、原 judge、输入与内核身份一并保留。该子集只记录上述原程序实际检查，不更新整套 LTP 总分。另行通过的29组 SEQ 用户入口、固定 Linux 差分和各 CPU 完成标记用于补充 SEQ 记录与控制消息行为，不能据此声称这两个原 LTP 程序覆盖了 SEQPACKET。
+
+## SysV 信号量与 socketpair 错误分类修复后的原程序结果
+
+2026年10月24日，SysV 信号量和 socketpair 创建错误分类修复后，按固定官方容器、原 QEMU 参数、原 ELF、空参数和原 judge，定向执行下表六个原程序。数据来自 `build/sysv-sem-fd-20261024/original/results.json`；耗时为各程序执行段，不含启动及磁盘检查。
+
+| 配置 | 原程序 | 原 judge 得分／分母 | 耗时（毫秒） | 退出码 | TCONF |
+|---|---|---:|---:|---:|---:|
+| RV / glibc | semget01 | 3/3 | 195 | 0 | 0 |
+| RV / glibc | semctl07 | 16/16 | 89 | 0 | 0 |
+| RV / glibc | semctl03 | 6/8 | 69 | 0 | 2 |
+| RV / glibc | semop01 | 4/4 | 64 | 0 | 0 |
+| RV / glibc | semop03 | 8/8 | 107 | 0 | 0 |
+| RV / glibc | socketpair01 | 10/10 | 62 | 0 | 0 |
+| RV / musl | semget01 | 3/3 | 82 | 0 | 0 |
+| RV / musl | semctl07 | 16/16 | 42 | 0 | 0 |
+| RV / musl | semctl03 | 6/8 | 42 | 0 | 2 |
+| RV / musl | semop01 | 4/4 | 63 | 0 | 0 |
+| RV / musl | semop03 | 8/8 | 83 | 0 | 0 |
+| RV / musl | socketpair01 | 10/10 | 63 | 0 | 0 |
+| LA / glibc | semget01 | 3/3 | 138 | 0 | 0 |
+| LA / glibc | semctl07 | 16/16 | 66 | 0 | 0 |
+| LA / glibc | semctl03 | 6/8 | 65 | 0 | 2 |
+| LA / glibc | semop01 | 4/4 | 84 | 0 | 0 |
+| LA / glibc | semop03 | 8/8 | 106 | 0 | 0 |
+| LA / glibc | socketpair01 | 10/10 | 65 | 0 | 0 |
+| LA / musl | semget01 | 3/3 | 63 | 0 | 0 |
+| LA / musl | semctl07 | 16/16 | 63 | 0 | 0 |
+| LA / musl | semctl03 | 6/8 | 65 | 0 | 2 |
+| LA / musl | semop01 | 4/4 | 42 | 0 | 0 |
+| LA / musl | semop03 | 8/8 | 83 | 0 | 0 |
+| LA / musl | socketpair01 | 10/10 | 42 | 0 | 0 |
+
+四配置各为 **47/49**，合计188/196；24次程序均退出0，无 TFAIL、TBROK 或超时。每配置的两项差额均来自 `semctl03` 原程序自行报告的 TCONF：libc 变体主动跳过 GETALL、IPC_SET 的 EFAULT 分项，原输出均为 `EFAULT is skipped for libc variant`。该程序仍按原 judge 记6/8，触发条件和固定源码见[统一问题记录](oscomp-test-issues.md#semctl03libc-变体主动跳过两项-efault)。
+
+`socketpair01` 本轮四配置均为10/10、退出0；此前的6/10和退出1仍保留在[上轮结果](#unix-seqpacket-接入后的-socket-原程序结果)。创建阶段现在保留 EAFNOSUPPORT、EPROTONOSUPPORT 等错误，只有能够创建而不支持配对的请求返回 EOPNOTSUPP。
+
+两架构 PID 1 均正常退出，heap-live=0；根盘及第二盘分区共八项磁盘检查均为0，记录在同目录 `disk-checks.json`。原 ELF 身份、运行内核、QEMU、原 judge 和串口输出也保存在该目录。本节仅记录六个原程序的实际分数，不更新整套 LTP 总分；独立数字身份和34组消费者／故障检查的结果属于补充行为检查，不计入上表分数。
