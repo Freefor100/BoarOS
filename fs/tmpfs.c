@@ -266,7 +266,10 @@ static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const c
                    struct kernel_vfs_file *file)
 {
     struct tmp_mount *m = tm(mount->private_data); struct tmp_entry *e;
-    int r = create_child(m, parent_inode, path, KERNEL_VFS_S_IFREG | (mode & 07777), 0, &e);
+    uint32_t type=mode & KERNEL_VFS_S_IFMT;
+    if (!type) type=KERNEL_VFS_S_IFREG;
+    if (type!=KERNEL_VFS_S_IFREG && type!=KERNEL_VFS_S_IFSOCK) return -KERNEL_ENOTSUP;
+    int r = create_child(m, parent_inode, path, type | (mode & 07777), 0, &e);
     if (r) return r;
     struct tmp_inode *i = e->inode;
     r = open_inode(mount, 0, i->number, i->mode, file);
@@ -283,7 +286,8 @@ static int mknod_node(struct kernel_vfs_instance *instance, uint64_t parent_inod
     uint32_t type, uint32_t mode, uint32_t device)
 {
     if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO &&
-        type != KERNEL_VFS_S_IFCHR && type != KERNEL_VFS_S_IFBLK) return -KERNEL_ENOTSUP;
+        type != KERNEL_VFS_S_IFCHR && type != KERNEL_VFS_S_IFBLK &&
+        type != KERNEL_VFS_S_IFSOCK) return -KERNEL_ENOTSUP;
     struct tmp_entry *created = 0;
     int result = create_child(tm(instance), parent_inode, path, type | (mode & 07777), 0, &created);
     if (!result && (type == KERNEL_VFS_S_IFCHR || type == KERNEL_VFS_S_IFBLK))

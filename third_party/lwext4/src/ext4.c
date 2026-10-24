@@ -5525,7 +5525,8 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     unsigned kind = mode & 0170000U;
     int type = kind == 0100000U ? EXT4_DE_REG_FILE : kind == 0040000U ? EXT4_DE_DIR :
         kind == 0120000U ? EXT4_DE_SYMLINK : kind == 0010000U ? EXT4_DE_FIFO :
-        kind == 0020000U ? EXT4_DE_CHRDEV : kind == 0060000U ? EXT4_DE_BLKDEV : EXT4_DE_UNKNOWN;
+        kind == 0020000U ? EXT4_DE_CHRDEV : kind == 0060000U ? EXT4_DE_BLKDEV :
+        kind == 0140000U ? EXT4_DE_SOCK : EXT4_DE_UNKNOWN;
     if (type == EXT4_DE_UNKNOWN || (type == EXT4_DE_SYMLINK && !target)) return EINVAL;
     EXT4_MP_LOCK(mp);
     ext4_file file = {0};

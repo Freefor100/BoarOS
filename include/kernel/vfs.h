@@ -193,6 +193,14 @@ int kernel_vfs_create_at(struct kernel_vfs_path *start,
 int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *path,
                         uint32_t mode, uint32_t device);
+/* Bind creates and retains one socket inode under the parent namespace lock.
+ * mode already includes the caller's umask. Lookup follows symlinks and checks
+ * target write permission; both results own a normal path reference. */
+int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *path, uint32_t mode,
+    struct kernel_vfs_path **owner);
+int kernel_vfs_socket_lookup_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *path, struct kernel_vfs_path **owner);
 int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *path,
                         uint32_t mode);

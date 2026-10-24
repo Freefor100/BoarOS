@@ -41,6 +41,7 @@ int __wrap_ext4_xattr_remove(struct ext4_inode_ref *ref,uint8_t index,const char
 static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
 static unsigned metadata_probe,metadata_open_calls;
 static unsigned credential_create_pause,credential_create_entered,credential_create_resume,credential_chmod_done;
+static unsigned socket_create_pause,socket_create_entered,socket_create_resume,socket_replace_done;
 static const char *metadata_failed_step;
 int __real_ext4_transaction_begin(const char *);
 int __wrap_ext4_transaction_begin(const char *mount)
@@ -51,6 +52,10 @@ int __wrap_ext4_fopen2(ext4_file *file,const char *path,int flags)
 int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *,uint32_t uid,uint32_t gid);
 int __wrap_ext4_create_child(const char *mp,uint32_t parent,const char *name,uint32_t mode,uint32_t device,const char *target,ext4_file *file,struct ext4_inode *initial,uint32_t uid,uint32_t gid)
 {
+    if (socket_create_pause && !strcmp(name,"socket-race")) {
+        __atomic_store_n(&socket_create_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&socket_create_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
     if (credential_create_pause && !strcmp(name,"accepted")) {
         __atomic_store_n(&credential_create_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&credential_create_resume,__ATOMIC_ACQUIRE)) sched_yield();
@@ -1290,6 +1295,8 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
     puts("PASS credentials VFS: numeric owner/group, mode=000 creation, DAC/O_PATH/sticky/SGID, retained FD rights, set-ID clearing and inode filecap snapshot");
 }
 
+#include "vfs_socket_path.h"
+
 int main(int argc,char **argv)
 {
     assert(argc==3); setvbuf(stdout,NULL,_IONBF,0); cache_test_attach(0);
@@ -1308,6 +1315,7 @@ int main(int argc,char **argv)
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
         !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
+    if (!strcmp(argv[2],"vfs-socket")) {vfs_socket_paths(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-race")) {credential_namespace_race(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-chown")) {credential_chown_groups(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-write-race")) {credential_write_attributes(&heap,&pages,&mount);goto mounted_done;}
@@ -1352,6 +1360,7 @@ mounted_done:
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache) && !close(image_fd));
     struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file unsupported={0};
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
+    if (!strcmp(argv[2],"vfs-socket")) vfs_socket_paths(memory);
     if (!strcmp(argv[2],"vfs-credentials")) credential_vfs_cases(memory);
     if (!strcmp(argv[2],"credential-chown")) credential_chown_groups(memory);
     if (!strcmp(argv[2],"credential-write-race")) credential_write_attributes(&heap,&pages,memory);

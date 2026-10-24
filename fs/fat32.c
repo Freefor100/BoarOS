@@ -721,6 +721,8 @@ static int create_child(struct fat_mount *m, uint64_t parent_inode, const char *
 }
 static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode, struct kernel_vfs_file *file)
 {
+    if ((mode & KERNEL_VFS_S_IFMT) && (mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)
+        return -KERNEL_ENOTSUP;
     struct fat_mount *m = fm(mount->private_data); uint64_t id;
     {
         KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);

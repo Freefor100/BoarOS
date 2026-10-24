@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
-cases = ('notify-stop', 'stop-wait', 'remote-udp-stop', 'remote-copy-stop', 'remote-udp', 'remote-udp-fault', 'remote-protocol', 'remote-batch', 'remote-batch-ack', 'remote-turn', 'concurrent-reservation', 'endpoint-owner', 'protocol-owner', 'protocol-transaction', 'receive-prefix', 'receive-chains', 'nodelay', 'minshall', 'nodelay-capacity', 'tcp-batch', 'pool-release-owner', 'tcp-batch-last', 'tcp-batch-abort', 'tcp-batch-error', 'unix-payload', 'receive-payload', 'udp-payload', 'copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls','unix-sender','loopback-work')
+cases = ('unix-dgram-shutdown', 'unix-dgram-reconnect', 'unix-listener-lookup-close', 'unix-names', 'unix-peer-queued', 'unix-peer-accepted', 'unix-autobind-collision', 'notify-stop', 'stop-wait', 'remote-udp-stop', 'remote-copy-stop', 'remote-udp', 'remote-udp-fault', 'remote-protocol', 'remote-batch', 'remote-batch-ack', 'remote-turn', 'concurrent-reservation', 'endpoint-owner', 'protocol-owner', 'protocol-transaction', 'receive-prefix', 'receive-chains', 'nodelay', 'minshall', 'nodelay-capacity', 'tcp-batch', 'pool-release-owner', 'tcp-batch-last', 'tcp-batch-abort', 'tcp-batch-error', 'unix-payload', 'receive-payload', 'udp-payload', 'copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls','unix-sender','loopback-work')
 parser.add_argument('--case', choices=(*cases, 'all'), default='all')
 parser.add_argument('--sanitize', action='store_true')
 args = parser.parse_args()

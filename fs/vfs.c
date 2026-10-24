@@ -1222,6 +1222,8 @@ static int path_open_locked(struct kernel_vfs_path *path,
                          struct kernel_vfs_file *file)
 {
     if (!path || !file || file->path) return -KERNEL_EINVAL;
+    if ((path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFSOCK)
+        return -KERNEL_ENXIO;
     int result = kernel_vfs_path_acquire(path);
     if (result) return result;
     result = vfs_open_inode_raw(path->file.mount,
@@ -1241,7 +1243,8 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,struct kernel_vfs_file *fi
 }
 
 static int create_at_parent(struct kernel_vfs_path **owner, const char *name,
-                             uint32_t mode, struct kernel_vfs_file *file)
+                             uint32_t mode, struct kernel_vfs_file *file,
+                             struct kernel_vfs_path **path_owner)
 {
     struct kernel_vfs_path *parent=*owner,*child=NULL;
     struct kernel_vfs_mount *mount=parent->file.mount;
@@ -1259,16 +1262,20 @@ static int create_at_parent(struct kernel_vfs_path **owner, const char *name,
     child->heap=parent->heap;child->parent=parent;*owner=NULL;
     child->references=1U;child->name=child->initial_name;
     memcpy(child->name,name,strlen(name)+1U);
-    int result=vfs_create_raw(mount,kernel_vfs_path_inode(parent),name,mode,file);
+    struct kernel_vfs_file *created=file?file:&child->file;
+    int result=vfs_create_raw(mount,kernel_vfs_path_inode(parent),name,mode,created);
     if (!result) {
-        struct kernel_vfs_node *node=file->private_data;
-        child->file=*file;
-        __atomic_fetch_add(&node->references,1,__ATOMIC_RELAXED);
-        node->open_files++;
-        __atomic_fetch_add(&instance->external_files,1,__ATOMIC_RELAXED);
+        if (file) {
+            struct kernel_vfs_node *node=file->private_data;
+            child->file=*file;
+            __atomic_fetch_add(&node->references,1,__ATOMIC_RELAXED);
+            node->open_files++;
+            __atomic_fetch_add(&instance->external_files,1,__ATOMIC_RELAXED);
+        }
         result=register_path(&child);
-        if (result) { if (kernel_vfs_close(file)) __builtin_trap(); }
-        else file->path=child;
+        if (result) { if (file && kernel_vfs_close(file)) __builtin_trap(); }
+        else if (file) file->path=child;
+        else *path_owner=child;
     } else {
         if (kernel_vfs_path_release(&child->parent)) __builtin_trap();
         release_path(child->heap,(char *)child);
@@ -1323,7 +1330,8 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         } else {
             if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else {
-                result=create_at_parent(&resolved,missing,request->mode,file);
+                result=create_at_parent(&resolved,missing,
+                    KERNEL_VFS_S_IFREG|(request->mode&07777U),file,NULL);
                 if (!result && created) *created=1;
             }
         }
@@ -2192,10 +2200,8 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
         return -KERNEL_EINVAL;
     uint32_t type = mode & KERNEL_VFS_S_IFMT;
     if (type == KERNEL_VFS_S_IFDIR) return -KERNEL_EPERM;
-    if (type == KERNEL_VFS_S_IFSOCK)
-        return -KERNEL_ENOTSUP;
     if (type != 0 && type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFCHR &&
-        type != KERNEL_VFS_S_IFBLK && type != KERNEL_VFS_S_IFIFO)
+        type != KERNEL_VFS_S_IFBLK && type != KERNEL_VFS_S_IFIFO && type != KERNEL_VFS_S_IFSOCK)
         return -KERNEL_EINVAL;
     if (!type) type = KERNEL_VFS_S_IFREG;
     VFS_PATH_WALK(walk,start,root);
@@ -2216,6 +2222,38 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
                      : instance->ops->mknod(instance, kernel_vfs_path_inode(path), name, type, mode, device);
     }
     (void)kernel_vfs_path_release(&path);
+    return result;
+}
+
+int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *input, uint32_t mode,
+    struct kernel_vfs_path **owner)
+{
+    if (!start || !root || !input || !owner || *owner ||
+        !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
+    VFS_PATH_WALK(walk,start,root);
+    struct kernel_vfs_path *parent=NULL;
+    char name[256]={0};
+    int result=mutation_path(start,root,input,0,1,0,2,&parent,name,&walk);
+    if (!result) {
+        if (!name[0]) result=-KERNEL_EEXIST;
+        else result=create_at_parent(&parent,name,KERNEL_VFS_S_IFSOCK|(mode&07777U),NULL,owner);
+    }
+    if (parent && kernel_vfs_path_release(&parent)) __builtin_trap();
+    return result;
+}
+
+int kernel_vfs_socket_lookup_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *input, struct kernel_vfs_path **owner)
+{
+    if (!owner || *owner) return -KERNEL_EINVAL;
+    struct kernel_vfs_path *path=NULL;
+    int result=kernel_vfs_path_resolve(start,root,input,1,&path);
+    if (!result) result=kernel_vfs_path_permission(path,KERNEL_VFS_MAY_WRITE);
+    if (!result && (kernel_vfs_path_mode(path)&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFSOCK)
+        result=-KERNEL_ECONNREFUSED;
+    if (!result) *owner=path;
+    else if (path && kernel_vfs_path_release(&path)) __builtin_trap();
     return result;
 }
 
