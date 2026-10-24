@@ -9,7 +9,7 @@ RV64和LA64接入原生Linux的semget(190)、semctl(191)、semtimedop(192)、sem
 
 semctl支持IPC_SET/STAT/RMID、GETVAL/SETVAL、GETALL/SETALL、GETPID、GETNCNT/GETZCNT、IPC_INFO、SEM_INFO和SEM_STAT/ANY。IPC权限使用effective身份、补充组、creator/owner和CAP_IPC_OWNER/CAP_SYS_ADMIN，与共享内存共用规则。固定ABI和检查顺序依据references/linux/ipc/sem.c及对应UAPI；64位nsops寄存器按Linux的unsigned int参数截断。
 
-默认上限为32000个集合、每集合32000项、总计1024000000项，每次最多500个操作。计数范围0～32767，撤销调整范围-32768～32767。对象和数组按需分配，INFO返回真实限额和当前使用量。集合在IPC_RMID前持续存在，程序退出不会自动删除一个普通集合。
+默认上限为32000个集合、每集合32000项、总计1024000000项，每次最多500个操作。计数范围0～32767，撤销调整范围-32768～32767。集合、成员和撤销数组按需分配；32000槽的16位代次表使用静态64000字节。INFO返回真实限额和当前使用量。集合在IPC_RMID前持续存在，程序退出不会自动删除一个普通集合。
 
 ## 对象、等待与撤销
 

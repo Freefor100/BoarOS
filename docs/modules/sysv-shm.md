@@ -6,7 +6,8 @@
 
 | 文件 | 职责 |
 |---|---|
-| `include/kernel/shm.h` | Linux UAPI 数据结构（`struct ipc64_perm`, `struct shmid64_ds`）、常数、内核段结构与接口声明 |
+| `include/kernel/ipc.h` | 与信号量共用的 `ipc64_perm`、IPC常数及身份/权限规则 |
+| `include/kernel/shm.h` | `shmid64_ds` 等SHM原生布局、常数、内核段结构与接口声明 |
 | `mm/shm.c` | 全局段表、`IPC_PRIVATE` 与命名 key 映射、代次 sequence、延迟销毁（`IPC_RMID`）与 `nattch` 引用计数 |
 | `kernel/syscall/shm.c` | 系统调用参数解码、用户指针有效性校验与 Linux ABI 返回值映射 |
 | `include/kernel/vma.h`、`mm/vma.c` | `KERNEL_VMA_KIND_SYSV_SHM` VMA 描述符定义与不合并（no-merge）约束 |
