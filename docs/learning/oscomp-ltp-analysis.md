@@ -747,3 +747,20 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 两架构均正常退出、heap-live=0；RV原程序运行最少空闲内核栈2352字节，高于1024字节要求。根盘及第二盘p1/ext4、p2/VFAT、p3/ext4共八个对象的只读一致性检查全部返回0。运行后恢复默认单核交付内核，已检查的运行盘清理，输入模板、ELF、原输出、judge和身份记录保留。
 
 成本见[统一CPU成本报告](cpu-accounting-cost.md#asdata-内存限制与-sysv-消息队列成本)：首批固定12次，另做一次定向整理及两次UP核对。mprotect仍比基线慢5.43%（相邻旧核control比较为4.04%），末次futex往返慢3.65%于相邻control，继续保留；消息队列同一首批SMP内核的两核加速比为1.315×/1.393×，四核为1.061×/1.275×（64B/4096B）。SMP数字对应末次MM小改前的测量内核，版本范围在成本报告中分开列出。
+
+## 资源限制查询：CPU执行限额接入后（2026-10-25）
+
+固定官方容器断网完成默认make all，沿原双盘QEMU命令仅选择原`getrlimit01`，两架构并行启动，各自依次运行glibc/musl；原ELF、参数、judge与内部时限保持原样。CPU执行限额的实际终止行为由共同CPU短例另行核对，原程序这里只查询16项资源。
+
+| 架构／libc | 通过／失败 | 原judge得分 | 程序耗时 | 退出／超时 |
+|---|---:|---:|---:|---|
+| rv-glibc | 8／8 | 8／16 | 170 ms | 1／否 |
+| rv-musl | 8／8 | 8／16 | 88 ms | 1／否 |
+| la-glibc | 8／8 | 8／16 | 131 ms | 1／否 |
+| la-musl | 8／8 | 8／16 | 83 ms | 1／否 |
+
+CPU项现在通过；仍失败的8项是RSS、NPROC、MEMLOCK、LOCKS、MSGQUEUE、NICE、RTPRIO、RTTIME的限额查询，均由当前prlimit资源集合返回EOPNOTSUPP。它们属于尚未接入的内核接口状态，按实际结果记分。程序已进入全部16项查询；本次没有用户数据库、libc等待或准备失败，也没有超时。
+
+相关共同消费者的CPU类10项、IPC查询5项覆盖RV UP静态、双核动态1GiB、四核静态512MiB及LA；两架构静态glibc与固定Linux同ELF对照通过。CPU类包含SIGXCPU/硬限额SIGKILL、线程与exec继承、CPU时钟睡眠及stop/continue恢复。IPC查询包含数字UID降权、真实队列/信号量字段、SHM RSS和命名段RMID后的key与存活关系。机制见[时钟](../modules/kernel-time.md)与[procfs](../modules/procfs.md)，普通路径8次性能小批见[CPU成本](cpu-accounting-cost.md)。
+
+两架构正常收尾，root及第二盘3个分区共8对象检查通过；交付内核恢复默认单核配置，跳过表与监督设置沿用现状。运行身份、原judge细项及日志位于`build/cpu-limit-sleep-ipc-20261025/original/`；检查完成的运行盘已清理，保留ELF、输入模板与必要日志。
