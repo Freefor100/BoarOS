@@ -3047,67 +3047,11 @@ static enum kernel_mm_status mm_mprotect_impl(struct kernel_mm *mm,
         address > ARCH_MMU_USER_LIMIT - aligned_length) return KERNEL_MM_STATUS_NO_MEMORY;
     enum kernel_mm_status status = mutable_vma_record(mm, &record);
     if (status) return status;
-    struct kernel_memory_limits limits;
-    int have_limits = 0;
-    uint64_t end = address + aligned_length;
-    uint64_t total = kernel_vma_set_total_bytes(record->vmas);
-    uint64_t data = kernel_vma_set_data_bytes(record->vmas);
-    uint64_t change_start = end, change_end = address, last_start = address;
-    int last_partial = 0;
     struct kernel_vma_edit edit;
-    while (address < end) {
-        struct kernel_vma old, changed;
-        if (kernel_vma_set_lookup(record->vmas, address, &old)) {
-            status = KERNEL_MM_STATUS_NO_MEMORY;
-            break;
-        }
-        uint64_t finish = old.end < end ? old.end : end;
-        if (normalized & ~old.maximum_permissions) {
-            status = KERNEL_MM_STATUS_ACCESS;
-            break;
-        }
-        if (old.permissions == normalized) { address = finish; continue; }
-        changed = old;
-        changed.permissions = normalized;
-        uint64_t bytes = finish - address;
-        if (kernel_vma_is_data(&changed) && !kernel_vma_is_data(&old)) {
-            if (!have_limits) {
-                kernel_task_current_memory_limits(&limits);
-                have_limits = 1;
-            }
-            if (!may_expand_usage(total, data, &changed, bytes, &limits) &&
-                may_expand_usage(total, data, &old, bytes, &limits)) {
-                status = KERNEL_MM_STATUS_NO_MEMORY;
-                break;
-            }
-        }
-        if (change_start == end) {
-            /* 首段的拆分失败必须发生在任何可见权限修改之前。 */
-            enum kernel_vma_status prepared = kernel_vma_set_prepare_protect(
-                record->vmas, address, finish, normalized, &edit);
-            if (prepared) { status = status_from_vma(prepared); break; }
-            change_start = address;
-        }
-        if (kernel_vma_is_data(&old)) data -= bytes;
-        if (kernel_vma_is_data(&changed)) data += bytes;
-        change_end = finish;
-        last_start = address;
-        last_partial = finish < old.end;
-        address = finish;
-    }
-    if (change_start == end) return status;
-    if (edit.end != change_end) {
-        enum kernel_vma_status prepared = kernel_vma_set_prepare_protect(
-            record->vmas, change_start, change_end, normalized, &edit);
-        if (prepared == KERNEL_VMA_STATUS_NO_MEMORY && last_partial && last_start > change_start) {
-            /* 只有末端还可能需要新split；OOM仍提交它之前已接纳的前缀。 */
-            status = KERNEL_MM_STATUS_NO_MEMORY;
-            prepared = kernel_vma_set_prepare_protect(record->vmas,
-                change_start, last_start, normalized, &edit);
-        }
-        if (prepared) return status_from_vma(prepared);
-    }
-    /* gate内按原VMA次序投影DATA用量；成功前缀只合并、重算和完成TLB一次。 */
+    status = status_from_vma(kernel_vma_set_prepare_mprotect(record->vmas,
+        address, address + aligned_length, normalized, &edit));
+    if (!edit.set) return status;
+    /* VMA已按顺序接纳并预留前缀，页表和TLB仍只提交一次。 */
     enum kernel_mm_status committed = protect_vma_range(record, &edit);
     return committed ? committed : status;
 }

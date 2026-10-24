@@ -169,6 +169,13 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
     uint32_t permissions,
     struct kernel_vma_edit *edit);
 
+/* Linux mprotect admission in VMA order, using the initiating task's limits.
+ * edit->set is nonnull iff a changed prefix was reserved, even on failure.
+ * The caller holds the MM edit gate and commits that prefix before returning. */
+enum kernel_vma_status kernel_vma_set_prepare_mprotect(
+    struct kernel_vma_set *set, uint64_t start, uint64_t end,
+    uint32_t permissions, struct kernel_vma_edit *edit);
+
 /* No allocation is performed; a stale or foreign edit returns STATE. */
 enum kernel_vma_status kernel_vma_set_commit_edit(
     struct kernel_vma_set *set,
