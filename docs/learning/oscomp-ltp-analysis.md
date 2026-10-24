@@ -748,19 +748,29 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 
 成本见[统一CPU成本报告](cpu-accounting-cost.md#asdata-内存限制与-sysv-消息队列成本)：首批固定12次，另做一次定向整理及两次UP核对。mprotect仍比基线慢5.43%（相邻旧核control比较为4.04%），末次futex往返慢3.65%于相邻control，继续保留；消息队列同一首批SMP内核的两核加速比为1.315×/1.393×，四核为1.061×/1.275×（64B/4096B）。SMP数字对应末次MM小改前的测量内核，版本范围在成本报告中分开列出。
 
-## 资源限制查询：CPU执行限额接入后（2026-10-25）
+## 资源限额与 pidfd 原程序（2026-10-25）
 
-固定官方容器断网完成默认make all，沿原双盘QEMU命令仅选择原`getrlimit01`，两架构并行启动，各自依次运行glibc/musl；原ELF、参数、judge与内部时限保持原样。CPU执行限额的实际终止行为由共同CPU短例另行核对，原程序这里只查询16项资源。
+本节更新此前CPU完成版的查询结果：`getrlimit01`由8/16变为16/16。16项限额都有真实的组共享状态；本轮另外执行NPROC、RTPRIO和RTTIME。MEMLOCK、NICE和MSGQUEUE的后端功能边界见[能力目录](../goals.md)。
 
-| 架构／libc | 通过／失败 | 原judge得分 | 程序耗时 | 退出／超时 |
-|---|---:|---:|---:|---|
-| rv-glibc | 8／8 | 8／16 | 170 ms | 1／否 |
-| rv-musl | 8／8 | 8／16 | 88 ms | 1／否 |
-| la-glibc | 8／8 | 8／16 | 131 ms | 1／否 |
-| la-musl | 8／8 | 8／16 | 83 ms | 1／否 |
+固定官方容器断网构建，沿原双盘QEMU参数运行下列8个原程序，两架构并行、各自顺序执行两种libc。保留原ELF、参数、judge及内部时限。首批发现旧proc目录句柄入口缺失，修正后只复核`pidfd_send_signal01`；下表该行采用复核值，其余行保留首批结果。耗时单位ms，每行四配置同分。
 
-CPU项现在通过；仍失败的8项是RSS、NPROC、MEMLOCK、LOCKS、MSGQUEUE、NICE、RTPRIO、RTTIME的限额查询，均由当前prlimit资源集合返回EOPNOTSUPP。它们属于尚未接入的内核接口状态，按实际结果记分。程序已进入全部16项查询；本次没有用户数据库、libc等待或准备失败，也没有超时。
+| 原程序 | 原judge得分 | RV glibc | RV musl | LA glibc | LA musl | 结果与到达位置 |
+|---|---:|---:|---:|---:|---:|---|
+| getrlimit01 | 16/16 | 147 | 62 | 134 | 63 | 通过 |
+| getrlimit02 | 2/2 | 70 | 42 | 63 | 63 | 通过 |
+| pidfd_open01 | 1/1 | 63 | 42 | 69 | 44 | 通过 |
+| pidfd_open02 | 3/3 | 43 | 42 | 64 | 43 | 通过 |
+| pidfd_send_signal01 | 2/2 | 193 | 124 | 180 | 112 | 通过 |
+| pidfd_send_signal02 | 0/1 | 84 | 63 | 83 | 63 | nobody缺失，准备TBROK |
+| pidfd_getfd01 | 0/1 | 63 | 62 | 70 | 65 | kcmp缺失，准备TCONF |
+| pidfd_getfd02 | 0/1 | 64 | 41 | 69 | 62 | nobody缺失，准备TBROK |
 
-相关共同消费者的CPU类10项、IPC查询5项覆盖RV UP静态、双核动态1GiB、四核静态512MiB及LA；两架构静态glibc与固定Linux同ELF对照通过。CPU类包含SIGXCPU/硬限额SIGKILL、线程与exec继承、CPU时钟睡眠及stop/continue恢复。IPC查询包含数字UID降权、真实队列/信号量字段、SHM RSS和命名段RMID后的key与存活关系。机制见[时钟](../modules/kernel-time.md)与[procfs](../modules/procfs.md)，普通路径8次性能小批见[CPU成本](cpu-accounting-cost.md)。
+各配置合计 **24/27**，四配置共 **96/108**。上表逐程序耗时合计分别727、478、732、515ms；它们组合了首批和定向复核，未当作同一次启动的墙钟时间。全部程序均无超时。
 
-两架构正常收尾，root及第二盘3个分区共8对象检查通过；交付内核恢复默认单核配置，跳过表与监督设置沿用现状。运行身份、原judge细项及日志位于`build/cpu-limit-sleep-ipc-20261025/original/`；检查完成的运行盘已清理，保留ELF、输入模板与必要日志。
+`pidfd_send_signal01`实际打开`/proc/self`目录，随后通过该FD发送SI_QUEUE信号。首轮EBADF来自内核只接受独立pidfd对象；现已接入Linux支持的进程目录句柄，目录保留原PID身份，关闭后归还，编号复用不会改投新任务。修复后的两条TPASS分别检查实际收到的信号/数据，以及发送返回结果，四配置均2/2。
+
+两项准备失败来自输入盘的`nobody`数据库缺失：`pidfd_send_signal02.c:78`和`pidfd_getfd02.c:52`均在getpwnam阶段结束，尚未进入其权限主体。`pidfd_getfd01`则在比较助手调用`kcmp(272)`时得到ENOSYS，记TCONF；这是独立内核功能缺口。分类集中维护于[测例问题文档](oscomp-test-issues.md)。
+
+直接消费者用数字UID检查降权、跨进程REALCREDS权限和已有FD权利；共享offset、CLOEXEC及真实fstat/pread内容检查通过。NPROC8项、RT9项、pidfd6项覆盖RV UP静态/双核动态1GiB/四核静态512MiB及LA；两架构glibc同ELF与固定Linux对照通过。末次proc目录扩展另核对RV UP/四核、LA，以及两架构glibc同ELF，覆盖O_PATH/错误目录、旧句柄、信号载荷和退出后的行为。
+
+首批与定向复核均正常收尾，根盘及第二盘p1/ext4、p2/VFAT、p3/ext4八个对象的一致性检查全部返回0；默认单核交付内核已恢复。原始ELF身份、细项、judge及内核/QEMU身份位于`build/rlimits-pidfd-20261025/original/`和`original-send01/`，直接消费者记录在同轮目录。成本统一见[CPU成本报告](cpu-accounting-cost.md)。
