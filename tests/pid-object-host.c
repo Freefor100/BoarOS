@@ -38,7 +38,7 @@ static void encoding_boundaries(void)
         }
         id.references = 1;
         kernel_pid_put(&id);
-        assert(id.generation == generations[i] && id.published == 2 && !numbers.allocated);
+        assert(id.generation == generations[i] && id.published == 3 && !numbers.allocated);
         assert(kernel_pid_take_retired(&registry) == &id);
         assert(id.generation == generations[i] && !id.published && !id.references);
     }

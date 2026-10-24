@@ -72,12 +72,6 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
             kernel_pid_attach(&task->identities[KERNEL_PID_TID], id, KERNEL_PID_TID, task);
             if (!thread_clone) {
                 kernel_pid_attach(&task->identities[KERNEL_PID_TGID], id, KERNEL_PID_TGID, task);
-                task->prepared_group = parent ? process_identity(parent, KERNEL_PID_PGID) : id;
-                task->prepared_session = parent ? process_identity(parent, KERNEL_PID_SID) : id;
-                if (parent) {
-                    kernel_pid_get(task->prepared_group);
-                    kernel_pid_get(task->prepared_session);
-                }
             }
             kernel_pid_put(id);
             process_identity_sync_locked(task);
@@ -85,6 +79,7 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
     }
     if (status != KERNEL_PID_STATUS_OK)
         kernel_heap_release(&scheduler.identity_heap, id);
+    (void)parent; /* Group/session roles are joined at actual publication. */
     return status;
 }
 
@@ -93,15 +88,12 @@ void process_identity_commit_locked(struct kernel_task *task)
     identity_domain_owned();
     struct kernel_pid *id = task->identities[KERNEL_PID_TID].identity;
     if (!id) return; /* Kernel tasks have no PID identity. */
-    if (task->prepared_group) {
-        kernel_pid_attach(&task->identities[KERNEL_PID_PGID], task->prepared_group,
-                          KERNEL_PID_PGID, task);
-        if (task->prepared_group != id) kernel_pid_put(task->prepared_group);
-        task->prepared_group = 0;
-        kernel_pid_attach(&task->identities[KERNEL_PID_SID], task->prepared_session,
-                          KERNEL_PID_SID, task);
-        if (task->prepared_session != id) kernel_pid_put(task->prepared_session);
-        task->prepared_session = 0;
+    if (task->group_leader == task) {
+        struct kernel_task *parent = task->parent;
+        kernel_pid_attach(&task->identities[KERNEL_PID_PGID],
+            parent ? process_identity(parent,KERNEL_PID_PGID) : id,KERNEL_PID_PGID,task);
+        kernel_pid_attach(&task->identities[KERNEL_PID_SID],
+            parent ? process_identity(parent,KERNEL_PID_SID) : id,KERNEL_PID_SID,task);
     }
     if (kernel_pid_publish_reserved(id) != KERNEL_PID_STATUS_OK) __builtin_trap();
 }
@@ -109,12 +101,6 @@ void process_identity_commit_locked(struct kernel_task *task)
 void process_identity_release_locked(struct kernel_task *task)
 {
     identity_domain_owned();
-    if (task->prepared_group) {
-        struct kernel_pid *id = task->identities[KERNEL_PID_TID].identity;
-        if (task->prepared_group != id) kernel_pid_put(task->prepared_group);
-        if (task->prepared_session != id) kernel_pid_put(task->prepared_session);
-        task->prepared_group = task->prepared_session = 0;
-    }
     for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
         if (task->identities[role].identity) kernel_pid_detach(&task->identities[role]);
     if (task->child_creator) {

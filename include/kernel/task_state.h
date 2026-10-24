@@ -118,7 +118,6 @@ struct kernel_task {
     /* Domain-protected storage borrows; they do not pin MM/files/business state.
      * Retirement 1 stops discovery, 2 finishes resources, 3 owns disposal. */
     uint32_t storage_borrows, retirement;
-    struct kernel_pid *prepared_group, *prepared_session;
     struct kernel_sched_policy scheduling;
     struct kernel_sched_node ready_node;
 #if BOAROS_MAX_CPUS > 1
