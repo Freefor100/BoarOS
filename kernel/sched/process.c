@@ -2437,7 +2437,7 @@ enum kernel_task_status kernel_task_set_rlimit(
         return KERNEL_TASK_STATUS_STATE;
     struct kernel_rlimit64 *slot = task_limit_slot(task->group_leader, resource);
     __atomic_store_n(&slot->current, limit->current, __ATOMIC_RELAXED);
-    slot->maximum = limit->maximum;
+    __atomic_store_n(&slot->maximum, limit->maximum, __ATOMIC_RELAXED);
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2468,9 +2468,12 @@ void kernel_task_current_memory_limits(struct kernel_memory_limits *limits)
     struct kernel_task *task = kernel_task_current();
     *limits = (struct kernel_memory_limits){KERNEL_RLIM_INFINITY,
         KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
-    if (kernel_task_has_user_context(task) &&
-        kernel_task_memory_limits(task, limits) != KERNEL_TASK_STATUS_OK)
-        __builtin_trap();
+    if (!kernel_task_has_user_context(task)) return;
+    /* 当前执行者保活组身份；接纳与Linux rlimit读取一样按字段取值。 */
+    const struct kernel_task *leader = task->group_leader;
+    limits->address_space = __atomic_load_n(&leader->as_limit.current, __ATOMIC_RELAXED);
+    limits->data_soft = __atomic_load_n(&leader->data_limit.current, __ATOMIC_RELAXED);
+    limits->data_hard = __atomic_load_n(&leader->data_limit.maximum, __ATOMIC_RELAXED);
 }
 
 uint64_t kernel_task_current_stack_limit(void)

@@ -3048,7 +3048,7 @@ static enum kernel_mm_status mm_mprotect_impl(struct kernel_mm *mm,
     enum kernel_mm_status status = mutable_vma_record(mm, &record);
     if (status) return status;
     struct kernel_memory_limits limits;
-    kernel_task_current_memory_limits(&limits);
+    int have_limits = 0;
     uint64_t end = address + aligned_length;
     uint64_t total = kernel_vma_set_total_bytes(record->vmas);
     uint64_t data = kernel_vma_set_data_bytes(record->vmas);
@@ -3070,11 +3070,16 @@ static enum kernel_mm_status mm_mprotect_impl(struct kernel_mm *mm,
         changed = old;
         changed.permissions = normalized;
         uint64_t bytes = finish - address;
-        if ((normalized & KERNEL_MM_WRITE) &&
-            !may_expand_usage(total, data, &changed, bytes, &limits) &&
-            may_expand_usage(total, data, &old, bytes, &limits)) {
-            status = KERNEL_MM_STATUS_NO_MEMORY;
-            break;
+        if (kernel_vma_is_data(&changed) && !kernel_vma_is_data(&old)) {
+            if (!have_limits) {
+                kernel_task_current_memory_limits(&limits);
+                have_limits = 1;
+            }
+            if (!may_expand_usage(total, data, &changed, bytes, &limits) &&
+                may_expand_usage(total, data, &old, bytes, &limits)) {
+                status = KERNEL_MM_STATUS_NO_MEMORY;
+                break;
+            }
         }
         if (change_start == end) {
             /* 首段的拆分失败必须发生在任何可见权限修改之前。 */
