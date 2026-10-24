@@ -622,6 +622,15 @@ int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
     }
 }
 
+int kernel_proc_process_identity_acquire(kernel_pid_t pid,uint64_t generation,
+    struct kernel_pid **owner)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_pid *id=kernel_pid_find(&scheduler.identities,pid);
+    if(!id || id->generation!=generation || !id->members[KERNEL_PID_TGID])return -KERNEL_ENOENT;
+    kernel_pid_get(id);*owner=id;return 0;
+}
+
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity)
 {
     if (pid <= 0 || !identity) return -KERNEL_EINVAL;

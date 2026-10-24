@@ -16,6 +16,7 @@
 #include <kernel/task.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
+#include <kernel/tty_task.h>
 #include <kernel/socket.h>
 #include <kernel/shm.h>
 #include <kernel/sem.h>
@@ -337,7 +338,10 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
 
 static int proc_close_node(struct kernel_vfs_node *node)
 {
-    (void)node;
+    if(node->backend_data) {
+        kernel_task_identity_put(node->backend_data);
+        node->backend_data=0;
+    }
     return 0;
 }
 
@@ -416,6 +420,13 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
             proc_kind_is_thread(proc_inode_kind(inode)),mode,&node->uid,&node->gid);
         if(error){kernel_heap_release(instance->heap,node);return error;}
+        if(proc_inode_kind(inode)==PROC_PID_DIR_KIND) {
+            struct kernel_pid *owner=0;
+            error=kernel_proc_process_identity_acquire(proc_inode_pid(inode),
+                proc_inode_identity(inode),&owner);
+            if(error){kernel_heap_release(instance->heap,node);return error;}
+            node->backend_data=owner;
+        }
     }
     return kernel_vfs_publish_node(mount, node, file, 0);
 }
@@ -1718,6 +1729,14 @@ int kernel_procfs_is_mount(const struct kernel_vfs_mount *mount)
     return mount && mount->private_data &&
            ((struct kernel_vfs_instance *)mount->private_data)->ops ==
                &proc_backend;
+}
+
+struct kernel_pid *kernel_procfs_process_identity(const struct kernel_vfs_file *file)
+{
+    if(!file || !kernel_procfs_is_mount(file->mount))return 0;
+    const struct kernel_vfs_node *node=file->private_data;
+    return node && node->inode>=(UINT64_C(1)<<30U) &&
+        proc_inode_kind(node->inode)==PROC_PID_DIR_KIND?node->backend_data:0;
 }
 
 int kernel_procfs_unmount_children(struct kernel_vfs_mount *root)

@@ -1,6 +1,7 @@
 #include "private.h"
 #include <kernel/pidfd.h>
 #include <kernel/credentials.h>
+#include <kernel/procfs.h>
 #include <kernel/errno.h>
 #include <kernel/socket_task.h>
 #include <kernel/tty_task.h>
@@ -208,9 +209,14 @@ int kernel_pidfd_signal_target(struct kernel_task *caller,int32_t fd,uint32_t fl
     } else {
         KERNEL_FILES_PIN_SCOPE(pin);
         struct kernel_open_file_description *file=kernel_files_hold_fd(&caller->files,fd,&pin);
-        if(!file || file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD)return -KERNEL_EBADF;
-        scope=!!(file->open_flags&PIDFD_THREAD)?0:1;
-        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);id=((struct pidfd_file *)file)->observer->identity;kernel_pid_get(id);}
+        if(!file)return -KERNEL_EBADF;
+        if(file->kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
+            scope=!!(file->open_flags&PIDFD_THREAD)?0:1;
+            id=((struct pidfd_file *)file)->observer->identity;
+        } else if(file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY)
+            id=kernel_procfs_process_identity(&file->file);
+        if(!id)return -KERNEL_EBADF;
+        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_pid_get(id);}
     }
     if(flags)scope=flags==1?0:flags==2?1:2;
     *owner=id;*selected_scope=scope;return 0;

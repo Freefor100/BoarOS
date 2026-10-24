@@ -30,6 +30,27 @@ static unsigned cases;
 static void pass(const char *s){cases++;printf("PIDFD CASE %s PASS\n",s);}
 static void token(int fd,char value){CHECK(write(fd,&value,1)==1);}
 static void expect(int fd,char value){char b;CHECK(read(fd,&b,1)==1 && b==value);}
+static volatile sig_atomic_t proc_payload;
+static void proc_handler(int sig,siginfo_t *info,void *context)
+{if(sig==SIGUSR1 && info && context && info->si_code==SI_QUEUE)proc_payload=info->si_value.sival_int;}
+static void proc_directory_signal(void)
+{
+    int fd=open("/proc/self",O_RDONLY|O_DIRECTORY|O_CLOEXEC);CHECK(fd>=0);
+    struct sigaction action={.sa_sigaction=proc_handler,.sa_flags=SA_SIGINFO},old;
+    CHECK(!sigemptyset(&action.sa_mask) && !sigaction(SIGUSR1,&action,&old));
+    siginfo_t input={.si_signo=SIGUSR1,.si_code=SI_QUEUE};
+    input.si_pid=getpid();input.si_uid=getuid();input.si_value.sival_int=777;
+    CHECK(!SEND(fd,SIGUSR1,&input,0) && proc_payload==777);
+    ERROR(GETFD(fd,0,0),EBADF);
+    siginfo_t output;ERROR(waitid(P_PIDFD,fd,&output,WEXITED|WNOHANG),EBADF);
+    CHECK(!sigaction(SIGUSR1,&old,0) && !close(fd));
+    const char *invalid[]={"/proc","/proc/self/stat","/proc/thread-self"};
+    for(unsigned i=0;i<sizeof(invalid)/sizeof(*invalid);i++) {
+        fd=open(invalid[i],O_RDONLY);CHECK(fd>=0);ERROR(SEND(fd,0,0,0),EBADF);CHECK(!close(fd));
+    }
+    fd=open("/proc/self",O_PATH|O_DIRECTORY);CHECK(fd>=0);
+    ERROR(SEND(fd,0,0,0),EBADF);CHECK(!close(fd));
+}
 static uint64_t now(void){struct timespec t;CHECK(!clock_gettime(CLOCK_MONOTONIC,&t));return (uint64_t)t.tv_sec*1000000000U+t.tv_nsec;}
 static unsigned ready(int fd)
 {struct pollfd p={fd,POLLIN,0};CHECK(poll(&p,1,0)>=0);return (unsigned)p.revents;}
@@ -63,7 +84,7 @@ static void abi(void)
     ERROR(pread(fd,&byte,1,0),EINVAL);ERROR(lseek(fd,0,SEEK_SET),ESPIPE);
     ERROR(syscall(SYS_pwrite64,fd,UINTPTR_MAX,1,0),EINVAL);
     ERROR(GETFD(fd,INT32_MAX,0),EBADF);
-    CHECK(!close(fd) && !close(again));pass("abi-self-stat-fdinfo");
+    CHECK(!close(fd) && !close(again));proc_directory_signal();pass("abi-self-stat-fdinfo");
 }
 static void lifecycle(int file)
 {
@@ -96,9 +117,12 @@ static void zombie(void)
     pid_t child=fork();CHECK(child>=0);if(!child)_exit(9);
     siginfo_t info;CHECK(!waitid(P_PID,child,&info,WEXITED|WNOWAIT) && info.si_pid==child);
     int fd=(int)OPEN(child,0);CHECK(fd>=0 && (ready(fd)&POLLIN));CHECK(!SEND(fd,0,0,0));
+    char path[64];snprintf(path,sizeof(path),"/proc/%d",child);
+    int directory=open(path,O_DIRECTORY);CHECK(directory>=0 && !SEND(directory,SIGUSR1,0,0));
     int thread=(int)OPEN(child,THREAD);CHECK(thread>=0 && !SEND(thread,SIGUSR1,0,0));
     join(child,9);CHECK(ready(fd)&POLLHUP);fdinfo(fd,-1);CHECK(!close(fd));
     ERROR(SEND(thread,SIGUSR1,0,0),ESRCH);CHECK(!close(thread));
+    ERROR(SEND(directory,SIGUSR1,0,0),ESRCH);CHECK(!close(directory));
     pass("open-zombie-and-retained-detached-identity");
 }
 struct worker {int ready,gate;};

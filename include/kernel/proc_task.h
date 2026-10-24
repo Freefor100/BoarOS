@@ -58,6 +58,10 @@ int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint3
 
 /* Identity changes on PID reuse; zero asks for the current allocation. */
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
+/* Retain the already resolved proc process inode's identity, not a later
+ * numeric lookup. The node releases this owner after its final reference. */
+int kernel_proc_process_identity_acquire(kernel_pid_t pid,uint64_t identity,
+    struct kernel_pid **owner);
 /* Exclusive upper bound of the live PID/TID allocator. */
 uint32_t kernel_proc_pid_max(void);
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
