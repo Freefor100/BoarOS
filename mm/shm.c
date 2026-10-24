@@ -25,6 +25,35 @@ struct kernel_shm_table {
 
 static struct kernel_shm_table shm_table;
 
+static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_shmid64_ds *ds)
+{
+    *ds = (struct kernel_shmid64_ds){
+        .shm_perm = {.key = seg->key, .uid = seg->uid, .gid = seg->gid,
+            .cuid = seg->cuid, .cgid = seg->cgid,
+            .mode = seg->mode | (seg->marked_for_deletion ? SHM_DEST : 0U), .seq = seg->seq},
+        .shm_segsz = seg->size, .shm_atime = seg->atime, .shm_dtime = seg->dtime,
+        .shm_ctime = seg->ctime, .shm_cpid = seg->cpid, .shm_lpid = seg->lpid,
+        .shm_nattch = seg->nattch,
+    };
+}
+
+int kernel_shm_proc_next(uint32_t *cursor, int32_t *id,
+                         struct kernel_shmid64_ds *row, uint64_t *rss)
+{
+    uintptr_t irq = arch_interrupt_save();
+    while (*cursor < KERNEL_SHMMNI) {
+        const struct kernel_shm_segment *seg = &shm_table.segments[(*cursor)++];
+        if (!seg->active) continue;
+        *id = seg->shmid;
+        shm_descriptor(seg, row);
+        *rss = kernel_memory_object_resident_pages(seg->memory) * BOAROS_PAGE_SIZE;
+        arch_interrupt_restore(irq);
+        return 1;
+    }
+    arch_interrupt_restore(irq);
+    return 0;
+}
+
 static int shm_permission(const struct kernel_shm_segment *seg,unsigned requested)
 {
     return kernel_ipc_permission(kernel_credentials_current(),seg->mode,
@@ -453,6 +482,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
             kernel_shm_destroy_segment_locked(seg);
         } else {
             seg->marked_for_deletion = 1;
+            seg->key = KERNEL_IPC_PRIVATE;
             seg->ctime = current_time_seconds();
         }
         *out_result = 0;
@@ -462,21 +492,8 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     case KERNEL_IPC_STAT: {
         int permission=shm_permission(seg,4);
         if(permission){arch_interrupt_restore(irq);return permission;}
-        struct kernel_shmid64_ds ds = {0};
-        ds.shm_perm.key = seg->key;
-        ds.shm_perm.uid = seg->uid;
-        ds.shm_perm.gid = seg->gid;
-        ds.shm_perm.cuid = seg->cuid;
-        ds.shm_perm.cgid = seg->cgid;
-        ds.shm_perm.mode = seg->mode | (seg->marked_for_deletion ? SHM_DEST : 0U);
-        ds.shm_perm.seq = seg->seq;
-        ds.shm_segsz = seg->size;
-        ds.shm_atime = seg->atime;
-        ds.shm_dtime = seg->dtime;
-        ds.shm_ctime = seg->ctime;
-        ds.shm_cpid = seg->cpid;
-        ds.shm_lpid = seg->lpid;
-        ds.shm_nattch = seg->nattch;
+        struct kernel_shmid64_ds ds;
+        shm_descriptor(seg, &ds);
         arch_interrupt_restore(irq);
 
         if (mm != 0) {

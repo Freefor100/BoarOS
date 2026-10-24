@@ -23,7 +23,7 @@ SEM_UNDO在独立共享组中按集合保存反向调整。任务各持一份组
 
 SETVAL清除所有组对该项的调整，SETALL清除该集合全部调整；RMID摘除关联并归还记录。集合保护、组成员保护和实际引用共同覆盖RMID与最后共享者退出的交错。线程的TGID从实际进程组身份取得，清理者使用被退出任务的身份。
 
-当前未提供IPC namespace、消息队列、运行时sysctl、/proc/sysvipc和unshare扩展。
+`/proc/sysvipc/sem` 与 `semctl` 共用真实集合描述符，按 slot 输出当前集合及操作、修改时间；读取所有权和重读规则见 [procfs 模块](procfs.md)。消息队列由独立的 [SysV 消息模块](sysv-msg.md) 提供。当前未提供 IPC namespace、运行时 IPC sysctl 和 unshare 扩展。
 
 ## 聚焦验证与应用
 

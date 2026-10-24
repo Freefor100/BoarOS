@@ -129,4 +129,9 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner);
 void kernel_shm_attachment_open(struct kernel_shm_attachment *attachment);
 void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment);
 
+/* CPU0 namespace caller, as with shmget/shmctl. Includes attached RMID segments;
+ * rss is resident bytes, copied while the segment's memory owner is stable. */
+int kernel_shm_proc_next(uint32_t *cursor, int32_t *id,
+                         struct kernel_shmid64_ds *row, uint64_t *rss);
+
 #endif /* BOAROS_KERNEL_SHM_H */

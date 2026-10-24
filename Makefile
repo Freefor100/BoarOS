@@ -2412,6 +2412,13 @@ test-task-request-cleanup-host:
 	build/host/task-request-cleanup-$$shift; done
 
 .PHONY: test-proc-index-host
+.PHONY: test-proc-sysvipc-host
+test-proc-sysvipc-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$$shift -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include tests/host/proc_sysvipc.c -Wl,--gc-sections -o build/host/proc-sysvipc-$$shift; \
+	build/host/proc-sysvipc-$$shift; done
+
 .PHONY: test-proc-maps-host
 test-proc-maps-host:
 	@mkdir -p build/host
