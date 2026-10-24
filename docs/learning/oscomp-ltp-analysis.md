@@ -621,3 +621,23 @@ ftest01/ftest05 的 TPASS 和 native 退出 0 是本次功能修复结果；它�
 set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两架构musl/glibc消费者覆盖原始syscall的线程独立性、libc全线程setxid、fork／exec、SGID和sticky目录、已有FD权利、降权后信号／proc／IPC访问、nosuid／NNP／ambient／bounding及动态装载的AT_SECURE。原11项程序的得分只表示上面实际运行的分项。普通路径新增成本和仍超3%检查线的UP普通信号、futex统一见[CPU成本文档](cpu-accounting-cost.md#可变凭据与权限执行普通路径成本)。
 
 原始输出、逐程序分项、原judge输出和内核／QEMU／输入身份保存在`build/credentials-20261023/original/`。八个对象检查通过后，四张运行盘已清理，记录见该目录的`image-cleanup.json`；ELF、日志、内核身份与构建缓存保留。正式文档在此维护得分、耗时与归因，临时目录保存可复查的原始材料。
+
+## 命名 AF_UNIX 与 accept4 原程序结果
+
+2026年10月24日，main 的命名 AF_UNIX、`SO_PEERCRED` 与 `accept4(242)` 实现合入兼容分支后，在官方固定容器和原 QEMU 命令下，仅运行原 `socket01`、`socket02`、`bind01`、`getsockname01`、`getpeername01`、`accept4_01`。RV、LA 各启动一次，分别在同一客机内按原顺序执行 glibc、musl；保留原 ELF、空参数、judge 和单项300秒监督。六项原程序分数对应10:18冷页栈修复版；10:31引用整理后的同一RV glibc ELF、RV unix_sender及RV4 unix_named短例另行通过。
+
+每格“得分”为两个 libc 的原 judge 分数合计；耗时按 glibc/musl 顺序，以毫秒计。
+
+| 原程序 | RV 得分 | LA 得分 | RV 耗时 | LA 耗时 | 原始断言情况 |
+|---|---:|---:|---:|---:|---|
+| socket01 | 18/18 | 18/18 | 146/82 | 113/85 | 36 TPASS |
+| socket02 | 8/8 | 8/8 | 88/42 | 63/64 | 16 TPASS |
+| bind01 | 14/14 | 14/14 | 62/63 | 105/66 | 28 TPASS |
+| getsockname01 | 12/12 | 12/12 | 64/42 | 85/64 | 24 TPASS |
+| getpeername01 | 14/14 | 14/14 | 62/63 | 84/43 | 28 TPASS |
+| accept4_01 | 16/18 | 16/18 | 85/66 | 86/67 | 32 TPASS；4 TCONF |
+| **合计** | **82/84** | **82/84** | **507/358** | **536/389** | **164 TPASS；4 TCONF；无 TFAIL/TBROK/超时** |
+
+`accept4_01` 在四个架构/libc组合中各有8/9项通过。唯一 TCONF 是该程序附加探测的旧 `socketcall(SYS_ACCEPT4)`：RV64/LA64 没有 `socketcall` ABI。程序本身直接调用 `accept4` 和 libc `accept4` 的标志组合均通过；这四项 TCONF 不对应 BoarOS 行为失败。其它五项全部满分。RV、LA 的根盘及第二盘分区合计八项检查均通过，外层1小时监督未触发，默认交付文件恢复成功。冷页发送导致的RV内核栈溢出已在10:31引用合并候选上用原RV glibc ELF再次复测：同一 ELF 的7/7组通过，PID 1正常退出、heap-live=0、最小空闲内核栈1488字节，e2fsck返回0；调用链和修复见[网络模块](../modules/kernel-network.md#发起-cpu-与等待寿命)。
+
+原始每项 TPASS/TCONF、judge、毫秒、kernel/init/ELF/QEMU身份和磁盘检查保存在 `build/unix-named-20261024/original/`。这份汇总以人读的得分和细项为主，原始串口日志留在结果目录。
