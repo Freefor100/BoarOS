@@ -16,6 +16,13 @@ static struct kernel_open_file_description *slots[256];
 static pthread_barrier_t callback_enter,callback_leave;
 static struct kernel_wait_queue *paused;
 static unsigned released;
+static struct kernel_credentials credentials;
+static unsigned credential_references;
+const struct kernel_credentials *kernel_credentials_current(void){return &credentials;}
+const struct kernel_credentials *kernel_credentials_get(const struct kernel_credentials *c)
+{assert(c==&credentials);credential_references++;return c;}
+void kernel_credentials_put(const struct kernel_credentials *c)
+{assert(c==&credentials&&credential_references);credential_references--;}
 static void barrier(pthread_barrier_t *b){int r=pthread_barrier_wait(b);assert(!r||r==PTHREAD_BARRIER_SERIAL_THREAD);}
 void kernel_cpu_flush_notifications(void){assert(!kernel_cpu_current()->outbound);}
 void kernel_cpu_notify(struct kernel_cpu *c,unsigned e){(void)c;(void)e;arms++;}
@@ -37,7 +44,7 @@ void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *r){(voi
 enum kernel_files_status kernel_files_install_new_owned_at(struct kernel_files *f,uint32_t fd,uint32_t flags,struct kernel_open_file_description **o){(void)f;(void)flags;slots[fd]=*o;*o=0;return 0;}
 struct kernel_open_file_description *kernel_files_hold_fd(struct kernel_files *f,int64_t fd,struct kernel_files_pin_guard *g){(void)f;g->description=fd>=0&&fd<256?slots[fd]:0;return g->description;}
 void kernel_files_pin_guard_release(struct kernel_files_pin_guard *g){g->description=0;}
-enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **o){kernel_event_fd_close(*o);kernel_heap_release((*o)->heap,*o);*o=0;return 0;}
+enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **o){kernel_event_fd_close(*o);kernel_credentials_put((*o)->credentials);kernel_heap_release((*o)->heap,*o);*o=0;return 0;}
 void kernel_wait_queue_init(struct kernel_wait_queue *q){memset(q,0,sizeof(*q));q->initialized=1;}
 int kernel_wait_cursor_prepare(struct kernel_wait_queue *q,struct kernel_wait_cursor *c){c->queue=q;__atomic_fetch_add(&q->borrows,1,__ATOMIC_RELAXED);return 1;}
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *c,int all){assert(!kernel_cpu_current()->raw_locks&&all);if(c->queue==paused){barrier(&callback_enter);barrier(&callback_leave);}__atomic_fetch_sub(&c->queue->borrows,1,__ATOMIC_RELAXED);notifications++;}
@@ -68,11 +75,12 @@ static void counters(void)
  assert(kernel_event_fd_io(&e->file,0,&iov,1,8,0)==-KERNEL_EFAULT&&!e->count);
  copy_limit=SIZE_MAX;struct kernel_open_file_description *o=&e->file;assert(!kernel_open_file_release(&o));puts("PASS event counter registration/fault");
 }
-static int check_tree(struct kernel_timer_fd *t,uint64_t *last,unsigned *count)
+static int check_tree(struct kernel_avl_node *t,uint64_t *last,unsigned *count)
 {
  if(!t)return 0;
- int l=check_tree(t->left,last,count);assert(!*count||*last<=t->tick);*last=t->tick;(*count)++;
- int r=check_tree(t->right,last,count);assert(abs(l-r)<=1&&t->height==1+(l>r?l:r)&&t->indexed);return t->height;
+ struct kernel_timer_fd *timer=(void *)((char *)t- offsetof(struct kernel_timer_fd,deadline));
+ int l=check_tree(t->left,last,count);assert(!*count||*last<=t->key);*last=t->key;(*count)++;
+ int r=check_tree(t->right,last,count);assert(abs(l-r)<=1&&t->height==1+(l>r?l:r)&&timer->indexed);return t->height;
 }
 static void index_cases(void)
 {
@@ -96,4 +104,4 @@ static void lifecycle(void)
  assert(!pthread_join(expire,0)&&!pthread_join(close,0)&&released);paused=0;
  pthread_barrier_destroy(&callback_enter);pthread_barrier_destroy(&callback_leave);puts("PASS timer expiry borrow versus final close");
 }
-int main(void){counters();index_cases();lifecycle();assert(!allocations&&!timer_root&&!prepared);printf("EVENT HOST PASS page=%lu\n",BOAROS_PAGE_SIZE);return 0;}
+int main(void){counters();index_cases();lifecycle();assert(!allocations&&!timer_root&&!prepared&&!credential_references);printf("EVENT HOST PASS page=%lu\n",BOAROS_PAGE_SIZE);return 0;}

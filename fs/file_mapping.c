@@ -62,7 +62,7 @@ void kernel_file_mapping_destroy(struct kernel_vfs_node *node)
     struct kernel_file_mapping_state *s = state(node);
     if (!s) return;
     if (!kernel_file_mapping_empty(node) || s->closing ||
-        s->changed.registrations || s->changed.borrows) __builtin_trap();
+        __atomic_load_n(&s->changed.registrations,__ATOMIC_ACQUIRE) || s->changed.borrows) __builtin_trap();
     node->mapping_state = 0;
     kernel_heap_release(node->instance->heap, s);
 }
@@ -84,7 +84,7 @@ static void changed(struct kernel_file_mapping_state *s)
      * 已有登记或借用时必须真的完成通知。 */
     if (status != KERNEL_SCHEDULER_STATUS_OK &&
         !(status == KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED &&
-          !s->changed.registrations && !s->changed.borrows))
+          !__atomic_load_n(&s->changed.registrations,__ATOMIC_ACQUIRE) && !s->changed.borrows))
         __builtin_trap();
     arch_interrupt_restore(irq);
 }

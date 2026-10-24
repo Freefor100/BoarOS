@@ -195,7 +195,10 @@ struct kernel_wait_queue {
     struct kernel_wait_node *head;
     struct kernel_wait_node *tail;
     uint64_t sequence;
-    uint32_t closed, registrations, borrows;
+    uint32_t closed;
+    /* wait-domain内修改并release发布；通知方可acquire读零跳过空队列。 */
+    uint32_t registrations;
+    uint32_t borrows;
 };
 
 void kernel_wait_node_init(struct kernel_wait_node *node,

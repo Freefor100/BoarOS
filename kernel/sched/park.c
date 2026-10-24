@@ -22,7 +22,8 @@ void kernel_wait_node_init_callback(struct kernel_wait_node *node,
 static void queue_shape(const struct kernel_wait_queue *queue)
 {
     if (queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || queue->closed > 1 ||
-        (!!queue->head != !!queue->tail) || (!!queue->registrations != !!queue->head) ||
+        (!!queue->head != !!queue->tail) ||
+        (!!__atomic_load_n(&queue->registrations,__ATOMIC_RELAXED) != !!queue->head) ||
         (queue->head && queue->head->previous) || (queue->tail && queue->tail->next))
         __builtin_trap();
 }
@@ -70,8 +71,9 @@ static void put(struct kernel_wait_node *node)
 void kernel_wait_node_add_locked(struct kernel_wait_queue *queue, struct kernel_wait_node *node)
 {
     if (queue) queue_shape(queue);
+    uint32_t registrations=queue?__atomic_load_n(&queue->registrations,__ATOMIC_RELAXED):0;
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || queue->closed ||
-        !node || node->queue || node->borrow_owner || queue->registrations == UINT32_MAX ||
+        !node || node->queue || node->borrow_owner || registrations == UINT32_MAX ||
         queue->sequence == UINT64_MAX) __builtin_trap();
     node->sequence = ++queue->sequence;
     node->queue = node->borrow_owner = queue;
@@ -80,14 +82,15 @@ void kernel_wait_node_add_locked(struct kernel_wait_queue *queue, struct kernel_
     if (queue->tail) queue->tail->next = node;
     else queue->head = node;
     queue->tail = node;
-    queue->registrations++;
+    __atomic_store_n(&queue->registrations,registrations+1,__ATOMIC_RELEASE);
 }
 void kernel_wait_node_remove_locked(struct kernel_wait_node *node)
 {
     if (!node || !node->queue) return;
     struct kernel_wait_queue *queue = node->queue;
     queue_shape(queue);
-    if (queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || !queue->registrations ||
+    uint32_t registrations=__atomic_load_n(&queue->registrations,__ATOMIC_RELAXED);
+    if (queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || !registrations ||
         (node->previous ? node->previous->next != node : queue->head != node) ||
         (node->next ? node->next->previous != node : queue->tail != node)) __builtin_trap();
     if (node->references && node->next) {
@@ -98,10 +101,10 @@ void kernel_wait_node_remove_locked(struct kernel_wait_node *node)
     else queue->head = node->next;
     if (node->next) node->next->previous = node->previous;
     else queue->tail = node->previous;
-    queue->registrations--;
     node->queue = 0;
     node->previous = node->next = 0;
     if (!node->references) node->borrow_owner = 0;
+    __atomic_store_n(&queue->registrations,registrations-1,__ATOMIC_RELEASE);
 }
 void kernel_wait_queue_remove(struct kernel_wait_node *node)
 { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); kernel_wait_node_remove_locked(node); }
@@ -304,7 +307,7 @@ static int cursor_prepare_locked(struct kernel_wait_queue *queue, struct kernel_
     /* 空通知在同一锁内完成判断，不建立无需跨解锁使用的游标借用。 */
     if (direct_notification && !queue->head) return 0;
     /* 唯一任务节点的通知全在raw内，不跨解锁借用；回调仍走游标寿命。 */
-    if (direct_notification && queue->registrations == 1 && !queue->head->callback) {
+    if (direct_notification && __atomic_load_n(&queue->registrations,__ATOMIC_RELAXED) == 1 && !queue->head->callback) {
         struct kernel_wait_node *node = queue->head;
         if (node->queue != queue || node->borrow_owner != queue) __builtin_trap();
         if (node->task && node->generation && event_accepts(node,event,recipient)) {
@@ -329,7 +332,13 @@ static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_curs
     return kernel_wait_cursor_prepare_locked(queue, cursor, direct_notification);
 }
 int kernel_wait_cursor_prepare(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
-{ return cursor_begin(queue, cursor, 1); }
+{
+    if(!queue || queue->initialized!=KERNEL_WAIT_QUEUE_INITIALIZED)__builtin_trap();
+    /* 调用者持有活队列；登记在业务锁内完成，或登记后重新查询业务状态。
+     * 空通知只读真实登记数，非空仍在wait-domain内复核并取得游标借用。 */
+    if(!__atomic_load_n(&queue->registrations,__ATOMIC_ACQUIRE))return 0;
+    return cursor_begin(queue, cursor, 1);
+}
 void kernel_wait_cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
 { (void)cursor_begin(queue, cursor, 0); }
 void kernel_wait_cursor_advance(struct kernel_wait_cursor *cursor)
@@ -482,7 +491,7 @@ enum kernel_scheduler_status kernel_wait_queue_destroy(struct kernel_wait_queue 
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (!queue->closed) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     queue_shape(queue);
-    if (queue->registrations || queue->borrows) return KERNEL_SCHEDULER_STATUS_BUSY;
+    if (__atomic_load_n(&queue->registrations,__ATOMIC_RELAXED) || queue->borrows) return KERNEL_SCHEDULER_STATUS_BUSY;
     *queue = (struct kernel_wait_queue){0};
     return KERNEL_SCHEDULER_STATUS_OK;
 }
