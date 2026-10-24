@@ -248,6 +248,7 @@ struct kernel_task {
     struct kernel_socket_call *socket_call;
     struct kernel_sem_undo *sem_undo;
     struct kernel_sem_request *sem_request;
+    struct kernel_rlimit64 as_limit, data_limit;
 } __attribute__((aligned(16)));
 
 #endif

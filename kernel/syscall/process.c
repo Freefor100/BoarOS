@@ -82,7 +82,8 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     }
     if (resource != KERNEL_RLIMIT_NOFILE &&
         resource != KERNEL_RLIMIT_STACK && resource != KERNEL_RLIMIT_CORE &&
-        resource != KERNEL_RLIMIT_FSIZE && resource != KERNEL_RLIMIT_SIGPENDING) {
+        resource != KERNEL_RLIMIT_FSIZE && resource != KERNEL_RLIMIT_SIGPENDING &&
+        resource != KERNEL_RLIMIT_AS && resource != KERNEL_RLIMIT_DATA) {
         decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
     }
