@@ -2,6 +2,8 @@
 #define BOAROS_KERNEL_SYSCALL_PRIVATE_H
 
 #include <kernel/syscall.h>
+enum kernel_syscall_status syscall_handle_msg(struct kernel_task *,
+    const struct kernel_syscall_request *, struct kernel_syscall_result *);
 
 enum kernel_syscall_status syscall_handle_credentials(struct kernel_task *,
     const struct kernel_syscall_request *, struct kernel_syscall_result *);

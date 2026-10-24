@@ -794,6 +794,10 @@ enum kernel_exec_status kernel_execve_prepare(
             return finish_prepare_state(task, transaction);
         image_request.stack_limit = stack_limit.current;
         image_request.stack_limit_valid = 1U;
+        if (kernel_task_memory_limits(task, &image_request.memory_limits) !=
+            KERNEL_TASK_STATUS_OK)
+            return finish_prepare_state(task, transaction);
+        image_request.memory_limits_valid = 1U;
     }
     image_request.executable.bytes = transaction->original_path;
     image_request.executable.length = filename_length;

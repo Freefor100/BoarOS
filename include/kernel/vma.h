@@ -5,11 +5,14 @@
 
 struct kernel_heap;
 struct kernel_vma_set;
+struct kernel_vma;
 struct kernel_shm_attachment;
 #define KERNEL_VMA_ALL_PERMISSIONS UINT32_C(7)
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set);
 /* Sum of currently mapped virtual bytes; updated with each committed edit. */
 uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set);
+uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
+int kernel_vma_is_data(const struct kernel_vma *vma);
 
 enum kernel_vma_edit_kind {
     KERNEL_VMA_EDIT_REMOVE = 0,

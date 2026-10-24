@@ -787,7 +787,8 @@ enum kernel_scheduler_status release_task_storage(
 {
     if (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
         thread->wait.phase != KERNEL_WAIT_FINISHED) __builtin_trap();
-    if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo) __builtin_trap();
+    if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo ||
+        thread->msg_request) __builtin_trap();
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);
@@ -1305,6 +1306,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->core_limit = (struct kernel_rlimit64){0, KERNEL_RLIM_INFINITY};
     thread->fsize_limit = (struct kernel_rlimit64){KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
     thread->sigpending_limit=(struct kernel_rlimit64){KERNEL_RLIMIT_SIGPENDING_DEFAULT,KERNEL_RLIMIT_SIGPENDING_DEFAULT};
+    thread->as_limit = thread->data_limit =
+        (struct kernel_rlimit64){KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
     process_group_initialize(thread);
     thread->completion.tid = tid;
     thread->completion.tgid = tid;

@@ -13,6 +13,7 @@
 
 #define KERNEL_ELF_STACK_RESERVE UINT64_C(0x800000)
 #define KERNEL_ELF_STACK_GUARD BOAROS_PAGE_SIZE
+#define KERNEL_ELF_STACK_EXPAND UINT64_C(131072)
 #define KERNEL_ELF_STACK_HEADROOM UINT64_C(0x10000)
 #define KERNEL_ELF_STACK_IMAGE_LIMIT KERNEL_EXEC_STRING_LIMIT
 #define KERNEL_ELF_MMAP_GAP UINT64_C(0x8000000)
@@ -41,6 +42,7 @@ struct kernel_elf_layout {
     uint64_t vdso;
     uint64_t stack_pointer;
     uint64_t committed_stack_base;
+    uint64_t initial_stack_base;
     uint64_t string_address;
     uint64_t executable_address;
     uint64_t random_address;
@@ -459,6 +461,10 @@ static enum kernel_elf_image_status prepare_stack_layout(
         KERNEL_ELF_STACK_IMAGE_LIMIT) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
+    /* VMA预留遵循参数页加128KiB；64KiB物理预映射独立计算。 */
+    layout->initial_stack_base = align_down_page(layout->stack_pointer) - KERNEL_ELF_STACK_EXPAND;
+    if (layout->initial_stack_base < layout->stack_soft_base)
+        layout->initial_stack_base = layout->stack_soft_base;
     layout->committed_stack_base =
         align_down_page(layout->stack_pointer - KERNEL_ELF_STACK_HEADROOM);
     if (layout->committed_stack_base < layout->stack_soft_base) {
@@ -1059,7 +1065,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
     if (mm_status == KERNEL_MM_STATUS_OK) {
         mm_status = kernel_mm_vma_insert_anon(
             &image->mm,
-            layout.stack_base,
+            layout.initial_stack_base,
             layout.stack_top,
             layout.stack_permissions,
             KERNEL_VMA_ROLE_STACK,
@@ -1098,6 +1104,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
     }
     if (mm_status == KERNEL_MM_STATUS_OK) {
         uint64_t start_code = UINT64_MAX, end_code = 0U;
+        uint64_t start_data = 0U, end_data = 0U;
         uint16_t count = kernel_elf64_source_program_header_count(
             request->executable_source);
         /* 固定主 ELF 的文件字节边界；解释器和后续 mprotect 不改初始布局。 */
@@ -1105,21 +1112,29 @@ enum kernel_elf_image_status kernel_elf_image_build(
             const struct kernel_elf64_program_header *segment =
                 kernel_elf64_source_program_header(request->executable_source,
                                                    index);
-            if (segment->type != KERNEL_ELF64_PROGRAM_LOAD ||
-                !(segment->flags & KERNEL_ELF64_FLAG_EXECUTE)) continue;
+            if (segment->type != KERNEL_ELF64_PROGRAM_LOAD) continue;
             uint64_t start = segment->virtual_address + layout.main_bias;
             uint64_t end = start + segment->file_size;
-            if (start < start_code) start_code = start;
-            if (end > end_code) end_code = end;
+            if (start > start_data) start_data = start;
+            if (end > end_data) end_data = end;
+            if (segment->flags & KERNEL_ELF64_FLAG_EXECUTE) {
+                if (start < start_code) start_code = start;
+                if (end > end_code) end_code = end;
+            }
         }
         mm_status = kernel_mm_set_exec_layout(&image->mm,
             start_code == UINT64_MAX ? 0U : start_code, end_code,
             layout.stack_pointer);
+        if (mm_status == KERNEL_MM_STATUS_OK)
+            mm_status = kernel_mm_set_data_layout(&image->mm, start_data, end_data);
     }
+    if (mm_status == KERNEL_MM_STATUS_OK && request->memory_limits_valid)
+        mm_status = kernel_mm_check_memory_limits(&image->mm, &request->memory_limits);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         status = cleanup_space(&image->mm, &space);
         return status == KERNEL_ELF_IMAGE_STATUS_OK
-                   ? KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE
+                   ? (mm_status == KERNEL_MM_STATUS_NO_MEMORY ? KERNEL_ELF_IMAGE_STATUS_NO_MEMORY
+                                                            : KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE)
                    : status;
     }
     image->entry = (uintptr_t)(layout.has_interpreter

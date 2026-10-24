@@ -13,7 +13,10 @@ uint64_t kernel_time_realtime_ns(void)
 }
 void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_file_unavailable(void) { fputs("excluded disk/device/process business reached\n", stderr); abort(); }
-uint64_t kernel_task_current_stack_limit(void) { return 0; }
+__attribute__((weak)) uint64_t kernel_task_current_stack_limit(void) { return UINT64_MAX; }
+#include <kernel/rlimit.h>
+__attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memory_limits *out)
+{ *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #define EXCLUDED(name) void name(void) { mm_file_unavailable(); }
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)

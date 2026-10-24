@@ -41,6 +41,7 @@
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
 #define PROC_TID_STATUS_KIND 13U
+#define PROC_PID_MAPS_KIND 14U
 #define PROC_PID_DIR_KIND 1U
 #define PROC_PID_EXE_KIND 2U
 #define PROC_PID_CWD_KIND 3U
@@ -107,9 +108,14 @@ static uint32_t proc_kind_mode(uint8_t kind)
     return KERNEL_VFS_S_IFREG | 0444U;
 }
 
+static int proc_kind_is_thread(uint8_t kind)
+{
+    return kind >= PROC_TID_DIR_KIND && kind <= PROC_TID_STATUS_KIND;
+}
+
 static int proc_inode_identity_current(uint64_t inode, uint64_t *identity)
 {
-    return proc_inode_kind(inode) >= PROC_TID_DIR_KIND
+    return proc_kind_is_thread(proc_inode_kind(inode))
         ? kernel_proc_thread_identity(0, 0, proc_inode_pid(inode), identity)
         : kernel_proc_process_identity(proc_inode_pid(inode), identity);
 }
@@ -237,6 +243,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             kind = PROC_PID_STAT_KIND;
         else if (length == 6U && !memcmp(name, "status", length))
             kind = PROC_PID_STATUS_KIND;
+        else if (length == 4U && !memcmp(name, "maps", length))
+            kind = PROC_PID_MAPS_KIND;
         else if (length == 4U && !memcmp(name, "task", length))
             kind = PROC_TASK_DIR_KIND;
         else if (length == 2U && !memcmp(name, "fd", length))
@@ -335,7 +343,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_TASK_DIR_KIND &&
           proc_inode_kind(inode) != PROC_TID_DIR_KIND &&
           proc_inode_kind(inode) != PROC_TID_STAT_KIND &&
-          proc_inode_kind(inode) != PROC_TID_STATUS_KIND)) ||
+          proc_inode_kind(inode) != PROC_TID_STATUS_KIND &&
+          proc_inode_kind(inode) != PROC_PID_MAPS_KIND)) ||
         (inode == PROC_ROOT_INODE &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
         ((inode == PROC_SELF_INODE || inode == PROC_THREAD_SELF_INODE || inode == PROC_MOUNTS_INODE) &&
@@ -374,7 +383,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     node->mode = mode;
     if(inode>=(UINT64_C(1)<<30U)) {
         int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
-            proc_inode_kind(inode)>=PROC_TID_DIR_KIND,mode,&node->uid,&node->gid);
+            proc_kind_is_thread(proc_inode_kind(inode)),mode,&node->uid,&node->gid);
         if(error){kernel_heap_release(instance->heap,node);return error;}
     }
     return kernel_vfs_publish_node(mount, node, file, 0);
@@ -385,7 +394,7 @@ static int proc_permission(struct kernel_vfs_node *node,const struct kernel_cred
     uint32_t uid=0,gid=0;
     if(node->inode>=(UINT64_C(1)<<30U)) {
         int result=kernel_proc_inode_owner(proc_inode_pid(node->inode),proc_inode_identity(node->inode),
-            proc_inode_kind(node->inode)>=PROC_TID_DIR_KIND,node->mode,&uid,&gid);
+            proc_kind_is_thread(proc_inode_kind(node->inode)),node->mode,&uid,&gid);
         if(result)return result;
     }
     int result=kernel_vfs_dac_permission(node->mode,uid,gid,mask,cred);
@@ -420,7 +429,7 @@ static int proc_stat(const struct kernel_vfs_file *file,
     }
     if(inode>=(UINT64_C(1)<<30U)) {
         int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
-            proc_inode_kind(inode)>=PROC_TID_DIR_KIND,mode,&uid,&gid);
+            proc_kind_is_thread(proc_inode_kind(inode)),mode,&uid,&gid);
         if(error)return error;
     }
     *stat = (struct kernel_vfs_stat){
@@ -546,7 +555,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             *type = 4U;
             return 1;
         }
-        if (position > 9U) return 0;
+        if (position > 10U) return 0;
         const char *entry = position == 0U ? "." :
                             position == 1U ? ".." :
                             position == 2U ? "exe" :
@@ -554,7 +563,8 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                             position == 4U ? "root" :
                             position == 5U ? "mounts" :
                             position == 6U ? "stat" :
-                            position == 7U ? "status" : position == 8U ? "fd" : "task";
+                            position == 7U ? "status" : position == 8U ? "fd" :
+                            position == 9U ? "task" : "maps";
         if (name_size < strlen(entry) + 1U) return -KERNEL_ERANGE;
         strcpy(name, entry);
         *next_position = position + 1U;
@@ -567,8 +577,9 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                      position == 5U ? PROC_PID_MOUNTS_KIND :
                      position == 6U ? PROC_PID_STAT_KIND :
                      position == 7U ? PROC_PID_STATUS_KIND :
-                     position == 8U ? PROC_PID_FD_DIR_KIND : PROC_TASK_DIR_KIND);
-        *type = position < 2U || position >= 8U ? 4U :
+                     position == 8U ? PROC_PID_FD_DIR_KIND :
+                     position == 9U ? PROC_TASK_DIR_KIND : PROC_PID_MAPS_KIND);
+        *type = position < 2U || position == 8U || position == 9U ? 4U :
                 position >= 5U ? 8U : 10U;
         return 1;
     }
@@ -1091,7 +1102,7 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                                  char **buffer, size_t *length)
 {
     struct kernel_proc_process_snapshot process;
-    int thread = proc_inode_kind(node->inode) >= PROC_TID_DIR_KIND;
+    int thread = proc_kind_is_thread(proc_inode_kind(node->inode));
     int result = thread ? kernel_proc_thread_snapshot(proc_inode_pid(node->inode),
         proc_inode_identity(node->inode), &process) :
         kernel_proc_process_snapshot(proc_inode_pid(node->inode),
@@ -1226,9 +1237,110 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
     return 0;
 }
 
+static size_t proc_hex(char *text, uint64_t value, unsigned width)
+{
+    unsigned digits = 1;
+    for (uint64_t rest = value >> 4; rest; rest >>= 4) digits++;
+    if (digits < width) digits = width;
+    for (unsigned i = 0; i < digits; i++)
+        text[i] = "0123456789abcdef"[(value >> ((digits - i - 1U) * 4U)) & 15U];
+    return digits;
+}
+
+static int proc_maps_snapshot(struct kernel_vfs_node *node,
+    struct kernel_heap *heap, char **buffer, size_t *length)
+{
+    struct kernel_mm_proc_map *rows = 0;
+    uint32_t count = 0;
+    int error = kernel_proc_maps_snapshot(proc_inode_pid(node->inode),
+        proc_inode_identity(node->inode), heap, &rows, &count);
+    if (error) return error;
+    char *data = 0, *path_text = 0;
+    size_t capacity = (size_t)count * 80U + 1U, used = 0;
+    enum kernel_heap_status allocation = kernel_heap_allocate(heap, capacity, (void **)&data);
+    if (allocation) { error = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO; goto Finish; }
+    if (count) {
+        allocation = kernel_heap_allocate(heap, KERNEL_FS_PATH_MAX, (void **)&path_text);
+        if (allocation) { error = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO; goto Finish; }
+    }
+    const struct kernel_fs_context *fs = 0;
+    if (count && kernel_task_fs_context_borrow(kernel_task_current(), &fs)) {
+        error = -KERNEL_ENOENT; goto Finish;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        struct kernel_mm_proc_map *row = &rows[i];
+        struct kernel_vfs_stat stat = {0};
+        const char *name = "";
+        if (row->file) {
+            const struct kernel_vfs_file *file = kernel_open_file_vfs_borrow(row->file);
+            struct kernel_vfs_path *path = kernel_open_file_path(row->file);
+            if (!file || !path) { error = -KERNEL_EIO; goto Finish; }
+            error = kernel_vfs_fstat(file, &stat);
+            if (error) goto Finish;
+            /* OFD引用固定真实后备，路径格式化不占有MM gate。 */
+            {
+                KERNEL_FS_PATHS(paths, fs);
+                error = kernel_vfs_path_link_string(path, paths.root, path_text, KERNEL_FS_PATH_MAX);
+            }
+            if (error) goto Finish;
+            name = path_text;
+        } else if (row->role == KERNEL_VMA_ROLE_HEAP) name = "[heap]";
+        else if (row->role == KERNEL_VMA_ROLE_STACK) name = "[stack]";
+        else if (row->role == KERNEL_VMA_ROLE_VDSO) name = "[vdso]";
+        char header[128];
+        size_t part = proc_hex(header, row->start, 8);
+        header[part++] = '-'; part += proc_hex(header + part, row->end, 8);
+        header[part++] = ' ';
+        header[part++] = row->permissions & KERNEL_MM_READ ? 'r' : '-';
+        header[part++] = row->permissions & KERNEL_MM_WRITE ? 'w' : '-';
+        header[part++] = row->permissions & KERNEL_MM_EXECUTE ? 'x' : '-';
+        header[part++] = row->shared ? 's' : 'p';
+        header[part++] = ' '; part += proc_hex(header + part, row->offset, 8);
+        header[part++] = ' ';
+        uint32_t major = ((stat.dev >> 8) & 0xfff) | ((stat.dev >> 32) & 0xfffff000);
+        uint32_t minor = (stat.dev & 0xff) | ((stat.dev >> 12) & 0xffffff00);
+        part += proc_hex(header + part, major, 2);
+        header[part++] = ':'; part += proc_hex(header + part, minor, 2);
+        header[part++] = ' '; part += decimal(header + part, stat.ino);
+        header[part++] = ' ';
+        if (*name) while (part < 73U) header[part++] = ' ';
+        size_t name_length = strlen(name), escaped = name_length;
+        for (size_t j = 0; j < name_length; j++) if (name[j] == '\n') escaped += 3U;
+        size_t needed = used + part + escaped + 2U;
+        if (needed > capacity) {
+            size_t grown = capacity;
+            while (grown < needed) {
+                if (grown > SIZE_MAX / 2U) { error = -KERNEL_EOVERFLOW; goto Finish; }
+                grown *= 2U;
+            }
+            char *replacement = 0;
+            allocation = kernel_heap_allocate(heap, grown, (void **)&replacement);
+            if (allocation) { error = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO; goto Finish; }
+            memcpy(replacement, data, used); kernel_heap_release(heap, data);
+            data = replacement; capacity = grown;
+        }
+        memcpy(data + used, header, part); used += part;
+        for (size_t j = 0; j < name_length; j++) {
+            if (name[j] == '\n') { memcpy(data + used, "\\012", 4); used += 4; }
+            else data[used++] = name[j];
+        }
+        data[used++] = '\n';
+    }
+    data[used] = 0; *buffer = data; *length = used; data = 0;
+Finish:
+    if (path_text) kernel_heap_release(heap, path_text);
+    if (data) kernel_heap_release(heap, data);
+    for (uint32_t i = 0; i < count; i++)
+        if (rows[i].file && kernel_open_file_release(&rows[i].file)) __builtin_trap();
+    if (rows) kernel_heap_release(heap, rows);
+    return error;
+}
+
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
+    if (proc_inode_kind(node->inode) == PROC_PID_MAPS_KIND)
+        return proc_maps_snapshot(node, heap, buffer, length);
 #if BOAROS_COST_DIAGNOSTICS
     if (node->inode == PROC_MEMORY_STATS_INODE) {
         struct kernel_heap_statistics hs;

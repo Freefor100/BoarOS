@@ -97,6 +97,9 @@ enum kernel_task_status kernel_task_set_rlimit(
 uint64_t kernel_task_current_stack_limit(void);
 /* Snapshot at the original user request; internal kernel I/O has no file limit. */
 uint64_t kernel_task_current_fsize_limit(void);
+enum kernel_task_status kernel_task_memory_limits(
+    const struct kernel_task *, struct kernel_memory_limits *);
+void kernel_task_current_memory_limits(struct kernel_memory_limits *);
 
 enum kernel_task_status kernel_task_ppid(
     const struct kernel_task *task,

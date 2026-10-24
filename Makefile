@@ -397,6 +397,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/socket_control.c \
 	kernel/syscall/shm.c \
 	kernel/syscall/sem.c \
+	kernel/syscall/msg.c \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
@@ -417,6 +418,7 @@ COMMON_C_SOURCES := \
 	mm/memory_object.c \
 	mm/shm.c \
 	kernel/sem.c \
+	kernel/msg.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)
@@ -2511,6 +2513,13 @@ test-task-request-cleanup-host:
 	build/host/task-request-cleanup-$$shift; done
 
 .PHONY: test-proc-index-host
+.PHONY: test-proc-maps-host
+test-proc-maps-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$$shift -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include tests/host/proc_maps.c -Wl,--gc-sections -o build/host/proc-maps-$$shift; \
+	build/host/proc-maps-$$shift; done
+
 test-proc-index-host:
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
@@ -2526,6 +2535,10 @@ build/riscv/credential-cost: tests/workloads/cost/credentials.c tests/accounting
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
 
 build/riscv/signal-futex-cost: tests/workloads/cost/signal-futex.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
+	@mkdir -p $(@D)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
+build/riscv/mm-msg-cost: tests/workloads/cost/mm-msg.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
 	@mkdir -p $(@D)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
 

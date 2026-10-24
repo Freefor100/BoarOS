@@ -222,15 +222,23 @@ int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t group_identity,
     }
 }
 
+static void proc_mm_release(struct kernel_mm *mm)
+{
+    if (mm->state == KERNEL_MM_LIVE && kernel_mm_release(mm)) __builtin_trap();
+}
+
 static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
     int thread, struct kernel_proc_process_snapshot *result)
 {
     struct kernel_task *leader = task->group_leader;
+    struct kernel_mm mm __attribute__((cleanup(proc_mm_release))) = {0};
     uint32_t threads = 0;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (leader->retirement || !leader->accounted) return -KERNEL_ENOENT;
     threads = leader->group_members;
+    if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE &&
+        kernel_mm_acquire(&mm, &task->mm)) return -KERNEL_EIO;
     *result = (struct kernel_proc_process_snapshot){
         .credentials=kernel_credentials_get(kernel_credentials_task_locked(task)),
         .pid = task->tid,
@@ -292,9 +300,9 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         result->child_user_ticks = leader->child_usage.user_ns / 10000000U;
         result->child_kernel_ticks = leader->child_usage.kernel_ns / 10000000U;
     }
-    if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE) {
+    if (mm.state == KERNEL_MM_LIVE) {
         struct kernel_mm_proc_memory memory;
-        if (kernel_mm_proc_memory_snapshot(&task->mm, &memory) !=
+        if (kernel_mm_proc_memory_snapshot(&mm, &memory) !=
             KERNEL_MM_STATUS_OK) {
                 kernel_credentials_put(result->credentials);result->credentials=0;
                 return -KERNEL_EIO;
@@ -324,6 +332,52 @@ int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_thread(tid, identity));
     return task ? proc_task_snapshot(task, identity, 1, result) : -KERNEL_ESRCH;
+}
+
+int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
+    struct kernel_heap *heap, struct kernel_mm_proc_map **rows, uint32_t *count)
+{
+    if (pid <= 0 || !identity || !heap || !rows || *rows || !count)
+        return -KERNEL_EINVAL;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    if (!task) return -KERNEL_ENOENT;
+    struct proc_access access __attribute__((cleanup(proc_access_release))) = {0};
+    struct kernel_mm mm = {0};
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!task->accounted || task->retirement || task->proc_exiting ||
+            process_find_identity(pid, KERNEL_PID_TGID) != task ||
+            process_identity_generation(task) != identity) return -KERNEL_ENOENT;
+        if (!kernel_credentials_may_access_locked(kernel_task_current(), task, 1))
+            return -KERNEL_EACCES;
+        if (task->mm.state != KERNEL_MM_LIVE) { *count = 0; return 0; }
+        /* 凭据与实际MM owner在同一wait域捕获；exec不能在两者之间换映像。 */
+        if (kernel_mm_acquire(&mm, &task->mm)) return -KERNEL_EIO;
+        access = (struct proc_access){ task,
+            kernel_credentials_get(kernel_credentials_task_locked(task)), mm.record,
+            kernel_exec_security_get(task->exec_security) };
+    }
+    enum kernel_mm_status status = kernel_mm_proc_maps_snapshot(&mm, heap, rows, count);
+    int error = status == KERNEL_MM_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
+                status ? -KERNEL_EIO : 0;
+    if (!error) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!task->accounted || task->retirement || task->proc_exiting ||
+            process_find_identity(pid, KERNEL_PID_TGID) != task ||
+            process_identity_generation(task) != identity) error = -KERNEL_ENOENT;
+        else if (task->mm.record != access.mm || task->exec_security != access.security ||
+            kernel_credentials_task_locked(task) != access.credentials ||
+            !kernel_credentials_may_access_locked(kernel_task_current(), task, 1))
+            error = -KERNEL_EACCES;
+    }
+    if (kernel_mm_release(&mm)) __builtin_trap();
+    if (error && *rows) {
+        for (uint32_t i = 0; i < *count; i++)
+            if ((*rows)[i].file && kernel_open_file_release(&(*rows)[i].file)) __builtin_trap();
+        kernel_heap_release(heap, *rows); *rows = 0; *count = 0;
+    }
+    return error;
 }
 
 int kernel_proc_same_group(kernel_pid_t pid,uint64_t identity,int thread)

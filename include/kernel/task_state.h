@@ -37,6 +37,7 @@ struct kernel_exec_transaction;
 struct kernel_memory_object;
 struct kernel_sem_undo;
 struct kernel_sem_request;
+struct kernel_msg_request;
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,
@@ -248,6 +249,8 @@ struct kernel_task {
     struct kernel_socket_call *socket_call;
     struct kernel_sem_undo *sem_undo;
     struct kernel_sem_request *sem_request;
+    struct kernel_rlimit64 as_limit, data_limit;
+    struct kernel_msg_request *msg_request;
 } __attribute__((aligned(16)));
 
 #endif

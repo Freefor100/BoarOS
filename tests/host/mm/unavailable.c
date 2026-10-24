@@ -3,7 +3,10 @@
 #include <stdint.h>
 struct kernel_task;
 void mm_test_unavailable(void);
-uint64_t kernel_task_current_stack_limit(void) { return 0; }
+__attribute__((weak)) uint64_t kernel_task_current_stack_limit(void) { return UINT64_MAX; }
+#include <kernel/rlimit.h>
+__attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memory_limits *out)
+{ *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #define EXCLUDED(name) void name(void) { mm_test_unavailable(); }
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)

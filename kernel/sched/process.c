@@ -11,6 +11,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/msg.h>
 #include <kernel/tick.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -618,6 +619,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->core_limit = leader->core_limit;
         task->fsize_limit = leader->fsize_limit;
         task->sigpending_limit=leader->sigpending_limit;
+        task->as_limit = leader->as_limit;
+        task->data_limit = leader->data_limit;
         kernel_signal_pending_adopt_locked(task,leader);
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
@@ -909,6 +912,8 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->core_limit = parent->group_leader->core_limit;
     child->fsize_limit = parent->group_leader->fsize_limit;
     child->sigpending_limit=parent->group_leader->sigpending_limit;
+    child->as_limit = parent->group_leader->as_limit;
+    child->data_limit = parent->group_leader->data_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -1617,6 +1622,7 @@ static void reap_claim_end(struct kernel_task **task)
 /* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
 static void cleanup_task_io_requests(struct kernel_task *thread)
 {
+    kernel_msg_abort(thread);
     kernel_sem_abort(thread);
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
@@ -2387,6 +2393,8 @@ static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint3
     case KERNEL_RLIMIT_CORE: return &leader->core_limit;
     case KERNEL_RLIMIT_FSIZE: return &leader->fsize_limit;
     case KERNEL_RLIMIT_SIGPENDING: return &leader->sigpending_limit;
+    case KERNEL_RLIMIT_AS: return &leader->as_limit;
+    case KERNEL_RLIMIT_DATA: return &leader->data_limit;
     default: return NULL;
     }
 }
@@ -2421,7 +2429,8 @@ enum kernel_task_status kernel_task_set_rlimit(
          limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
         (resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
          resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE &&
-         resource != KERNEL_RLIMIT_SIGPENDING))
+         resource != KERNEL_RLIMIT_SIGPENDING && resource != KERNEL_RLIMIT_AS &&
+         resource != KERNEL_RLIMIT_DATA))
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
@@ -2438,6 +2447,30 @@ uint64_t kernel_task_current_fsize_limit(void)
     if (!kernel_task_has_user_context(task)) return KERNEL_RLIM_INFINITY;
     /* 当前执行owner保持组身份；限额接纳只读软值，不取得整组快照锁。 */
     return __atomic_load_n(&task->group_leader->fsize_limit.current, __ATOMIC_RELAXED);
+}
+
+enum kernel_task_status kernel_task_memory_limits(
+    const struct kernel_task *task, struct kernel_memory_limits *limits)
+{
+    kernel_pid_t tgid;
+    if (!limits) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_TASK_STATUS_STATE;
+    const struct kernel_task *leader = task->group_leader;
+    *limits = (struct kernel_memory_limits){leader->as_limit.current,
+        leader->data_limit.current, leader->data_limit.maximum};
+    return KERNEL_TASK_STATUS_OK;
+}
+
+void kernel_task_current_memory_limits(struct kernel_memory_limits *limits)
+{
+    struct kernel_task *task = kernel_task_current();
+    *limits = (struct kernel_memory_limits){KERNEL_RLIM_INFINITY,
+        KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
+    if (kernel_task_has_user_context(task) &&
+        kernel_task_memory_limits(task, limits) != KERNEL_TASK_STATUS_OK)
+        __builtin_trap();
 }
 
 uint64_t kernel_task_current_stack_limit(void)
