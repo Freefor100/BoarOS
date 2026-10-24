@@ -74,11 +74,18 @@ int main(void)
     uint64_t generation = owner->generation;
     process_identity_release(&thread);
     struct kernel_pid *after_exit = NULL;
-    /* find_get_pid still resolves a published identity retained by an owner. */
-    assert(!kernel_task_socket_identity(number, &after_exit) && after_exit == owner &&
-        after_exit->generation == generation && !after_exit->members[KERNEL_PID_TID]);
-    kernel_task_identity_put(after_exit); kernel_task_identity_put(owner); owner = NULL;
-    assert(kernel_task_socket_identity(number, &owner) == -KERNEL_ESRCH && !owner);
+    assert(kernel_task_socket_identity(number, &after_exit) == -KERNEL_ESRCH && !after_exit);
+    assert(owner->generation == generation && !owner->members[KERNEL_PID_TID] && owner->published == 2);
+    struct kernel_task replacement = {0};
+    scheduler.pid_allocator.cursor = (uint32_t)number - 1U;
+    publish(&replacement, NULL, 0);
+    assert(replacement.tid == number);
+    assert(!kernel_task_socket_identity(number, &after_exit) && after_exit != owner &&
+        after_exit->generation != generation);
+    kernel_task_identity_put(owner); owner = NULL;
+    assert(after_exit->members[KERNEL_PID_TID]->task == &replacement);
+    kernel_task_identity_put(after_exit); after_exit = NULL;
+    process_identity_release(&replacement);
     cpus[0].current = NULL;
     assert(kernel_task_socket_identity(0, &owner) == -KERNEL_ESRCH && !owner);
     process_identity_release(&leader); process_identity_release(&remote);
