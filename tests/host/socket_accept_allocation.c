@@ -172,14 +172,14 @@ static void socket_creation_case(struct kernel_heap *heap,struct kernel_credenti
     for(unsigned failure=1;failure<=2;failure++) {
         kernel_heap_get_statistics(heap,&before);
         accept_ofd_failure=failure;accept_ofd_allocations=0;
-        assert(!kernel_files_socketpair_create(&handle,&mm,1,0,address,&result) &&
+        assert(!kernel_files_socketpair_create(&handle,&mm,1,0,0,address,&result) &&
             result==-KERNEL_ENOMEM && accept_ofd_allocations==failure);
         accept_ofd_failure=0;expect_no_accept_fd(&handle);
         kernel_heap_get_statistics(heap,&after);
         assert(after.live_allocations==before.live_allocations && credential->references==references);
     }
     assert(!kernel_files_socketpair_create(&handle,&mm,1,
-        KERNEL_FILES_O_NONBLOCK|KERNEL_FILES_O_CLOEXEC,address,&result) && !result);
+        KERNEL_FILES_O_NONBLOCK|KERNEL_FILES_O_CLOEXEC,0,address,&result) && !result);
     int32_t pair[2]={-1,-1};size_t copied;
     assert(!kernel_copy_from_user(&mm,pair,address,sizeof(pair),&copied) && copied==sizeof(pair) &&
         pair[0]==0 && pair[1]==1 && credential->references==references+2);

@@ -119,7 +119,7 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 与poll/recv均按各类型处理，不把datagram peer关闭变成stream EOF。
 
 固定依据为`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
-`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。每消息控制数据见下节。命名连接和 socketpair 共用上述跨核状态与队列保护。
+`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。每消息控制数据见下节。命名连接和 socketpair 共用上述跨核状态与队列保护。socketpair先预留两个FD并逐项输出编号，再执行共同的family/type/protocol创建校验及配对支持判断；创建失败保留已输出的编号前缀并归还预留，实际FD仅在成功后发布。
 
 SEQPACKET按连接管理与整条记录收发：监听、connect和accept与STREAM共用，实际SO_TYPE及子端点保持类型5；一次发送发布一条完整记录，短接收截断并消费该记录，MSG_TRUNC可返回原长度。MSG_EOR和MSG_MORE发送标志接受后忽略，MSG_WAITALL接收仍停在一条记录，返回标志不添加MSG_EOR。SEQPACKET未连接或监听时接收返回ENOTCONN，EPIPE不发送SIGPIPE。
 
