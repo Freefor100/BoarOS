@@ -170,7 +170,7 @@ MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在�
 
 `kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 在 MM gate 内按 VMA 顺序检查权限和资源限制，以局部 DATA 用量投影判定可成功的前缀；预留边界拆分后一次修改该前缀的已有 PTE、提交 metadata 并完成 TLB 同步。遇洞、权限或限额失败保留成功前缀，末段拆分 OOM 仍提交此前前缀。同权限段无需修改。长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
-AS/DATA 限额属于当前调用者的线程组，MM 只保存 VMA 用量；`CLONE_VM` 的独立线程组共享用量但分别受自身限制约束。VMA 原有统计遍历同时维护总虚拟字节与私有可写、非栈的 DATA 字节；拆分、保护、替换、搬移和 fork 使用同一统计来源。mmap、shmat、brk、mremap、mprotect 和栈增长均在已有 MM 操作锁内检查并修改用量。降低限制保留当前映射，后续增长检查当前限额；DATA 软限制为零时，映射扩张采用硬限制，brk 的精确字节检查仍使用零软限制。
+AS/DATA 限额属于当前调用者的线程组，MM 只保存 VMA 用量；`CLONE_VM` 的独立线程组共享用量但分别受自身限制约束。VMA 原有统计遍历同时维护总虚拟字节与私有可写、非栈的 DATA 字节；拆分、保护、替换、搬移和 fork 使用同一统计来源。mmap、shmat、brk、mremap、mprotect 和栈增长均在已有 MM 操作锁内检查并修改用量。当前执行者保持组身份存活，接纳按字段原子读取限额；跨任务查询及候选 exec 仍在调度保护内取得快照。mprotect 仅在原非 DATA 区间变为 DATA 时读取并检查限额，降低权限和同分类修改沿原接纳规则处理。降低限制保留当前映射，后续增长检查当前限额；DATA 软限制为零时，映射扩张采用硬限制，brk 的精确字节检查仍使用零软限制。
 
 `brk` 先检查主 ELF 的 `end_data-start_data` 加 `requested-start_brk`，包括同页调整，再对新增页检查 AS/DATA。`MAP_FIXED` 以全部覆盖字节抵扣扩张量，在撤映射前检查限额；mremap 扩张同样先检查限额，因此此类失败保留固定目标。mprotect 使用固定 Linux 的新旧属性检查，并逐段保留成功前缀。初始栈和 exec 的限制检查见 [用户 ELF](user-elf.md)。
 

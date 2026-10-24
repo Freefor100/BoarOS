@@ -16,7 +16,8 @@ static struct kernel_mm mm;
 static uint64_t stack_limit=UINT64_MAX;
 uint64_t kernel_task_current_stack_limit(void) { return stack_limit; }
 static struct kernel_memory_limits limits={UINT64_MAX,UINT64_MAX,UINT64_MAX};
-void kernel_task_current_memory_limits(struct kernel_memory_limits *out) { *out=limits; }
+static unsigned limit_reads;
+void kernel_task_current_memory_limits(struct kernel_memory_limits *out) { limit_reads++; *out=limits; }
 void kernel_console_putc(char c) { fputc(c,stderr); }
 void mm_test_unavailable(void) { abort(); }
 void mm_test_fence(uint64_t v,int instructions) { (void)v; (void)instructions; }
@@ -53,6 +54,15 @@ int main(void)
         CHECK(!kernel_mm_acquire(&held, &mm));
     }
     CHECK(!kernel_mm_release(&held));
+    assert(!map(BASE,P,RW,0));
+    unsigned reads_before=limit_reads;
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,KERNEL_MM_READ));
+    CHECK(limit_reads==reads_before);
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,KERNEL_MM_READ));
+    CHECK(limit_reads==reads_before);
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,RW));
+    CHECK(limit_reads==reads_before+1);
+    assert(!kernel_mm_munmap(&mm,BASE,P));
     limits.address_space=P;
     CHECK(map(BASE,2*P,KERNEL_MM_READ,0)==KERNEL_MM_STATUS_NO_MEMORY);
     assert(!kernel_mm_munmap(&mm,BASE,2*P));
