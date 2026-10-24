@@ -23,7 +23,8 @@ struct kernel_socket_call {
 int kernel_socket_call_begin(struct kernel_socket_call *, struct kernel_files *, struct kernel_open_file_description **);
 void kernel_socket_call_end(struct kernel_socket_call *);
 void kernel_socket_call_abort(struct kernel_socket_call *);
-int kernel_socket_control_import(struct kernel_socket_call *, struct kernel_mm *, uint64_t, uint64_t);
+int kernel_socket_control_copy(struct kernel_socket_call *, struct kernel_mm *, uint64_t, uint64_t);
+int kernel_socket_control_parse(struct kernel_socket_call *, uint64_t);
 void kernel_socket_control_export(struct kernel_socket_call *, struct kernel_mm *,
     uint64_t, uint64_t, uint32_t, int, uint64_t *, uint32_t *);
 #endif

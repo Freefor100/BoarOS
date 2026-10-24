@@ -25,6 +25,7 @@
 #define LINUX_AF_MAX 46
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
+#define LINUX_SOCK_SEQPACKET 5
 #define LINUX_SOCK_RAW 3
 #define LINUX_SOCK_MAX 11
 #define LINUX_SOCK_TYPE_MASK 0xf
@@ -371,7 +372,8 @@ enum kernel_syscall_status syscall_handle_socket(
         decoded->value = -KERNEL_EPROTONOSUPPORT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM) {
+    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM &&
+        !(family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET)) {
         decoded->value = -KERNEL_ESOCKTNOSUPPORT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -425,7 +427,8 @@ enum kernel_syscall_status syscall_handle_socketpair(
         decoded->value = -KERNEL_EPROTONOSUPPORT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM) {
+    if (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_DGRAM &&
+        !(family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET)) {
         decoded->value = -KERNEL_ESOCKTNOSUPPORT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -489,19 +492,36 @@ enum kernel_syscall_status syscall_handle_bind(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-static __attribute__((noinline)) enum kernel_files_status socket_message(
-    struct kernel_files *files, struct kernel_mm *mm,
-    struct kernel_open_file_description **file,
-    const struct kernel_syscall_request *request, int64_t *result)
+enum kernel_syscall_status syscall_handle_socket_message(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
 {
+    /* 消息调用直接持有自己的资源；不再跨载荷缺页保留标量/控制调用的栈帧。 */
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    struct kernel_open_file_description *description=0;
+    struct kernel_open_file_description **file=&description;
+    int64_t value=0, *result=&value;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if (borrow_socket(caller,(int32_t)request->arguments[0],&files,file,0,result)!=KERNEL_SYSCALL_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if (*result) {
+        decoded->value=*result;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     struct linux_msghdr header;
     struct kernel_uaccess_iov_snapshot snapshot={0};
     struct kernel_socket_call call={0};
     struct kernel_socket *socket=kernel_open_file_socket(*file);
     int writing=request->number==211, unix_socket=kernel_socket_is_unix(socket);
+    int seqpacket=kernel_socket_is_seqpacket(socket);
     uint32_t flags=(uint32_t)request->arguments[2];
     uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | (writing?KERNEL_SOCKET_MSG_NOSIGNAL:
         KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|KERNEL_SOCKET_MSG_PEEK);
+    if (seqpacket)
+        allowed |= writing?(KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE):KERNEL_SOCKET_MSG_WAITALL;
     enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
     size_t copied=0;
     struct kernel_socket_address address={0};
@@ -510,7 +530,7 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     call.iov_snapshot=&snapshot;
     *result=-KERNEL_EFAULT;
     if (kernel_copy_from_user(mm,&header,request->arguments[1],sizeof(header),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(header)) goto out;
-    if (flags&~allowed) { *result=-KERNEL_EOPNOTSUPP; goto out; }
+    if ((flags&~allowed) && !seqpacket) { *result=-KERNEL_EOPNOTSUPP; goto out; }
     if (!header.name) header.name_length=0;
     if (header.name_length<0) { *result=-KERNEL_EINVAL; goto out; }
     if (header.name_length>LINUX_SOCKADDR_STORAGE_SIZE) header.name_length=LINUX_SOCKADDR_STORAGE_SIZE;
@@ -526,17 +546,30 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     if (status || *result) goto out;
     if (writing && header.control_length) {
         if (!unix_socket) { *result=-KERNEL_EOPNOTSUPP; goto out; }
-        *result=kernel_socket_control_import(&call,mm,header.control,header.control_length);
+        *result=kernel_socket_control_copy(&call,mm,header.control,header.control_length);
         if (*result) goto out;
     }
-    if (writing && header.name && header.name_length) {
+    if (writing) {
+        *result=kernel_socket_prepare_send(socket);
+        if (*result) goto out;
+        *result=kernel_socket_control_parse(&call,header.control_length);
+        if (*result) goto out;
+    }
+    if (flags&~allowed) {
+        if (!writing) {
+            *result=kernel_socket_prepare_receive(socket);
+            if (*result) goto out;
+        }
+        *result=-KERNEL_EOPNOTSUPP;goto out;
+    }
+    if (writing && header.name && header.name_length && !seqpacket) {
         *result=parse_address(&name_snapshot,header.name_length,unix_socket,&address);
         if (*result) goto out;
         destination=&address;
     }
     uint64_t count=snapshot.total;
     uint32_t message_size=0;
-    if (writing && kernel_socket_is_datagram(socket)) {
+    if (writing && kernel_socket_preserves_messages(socket)) {
         if (kernel_open_file_flags(*file)&LINUX_SOCK_NONBLOCK) flags|=KERNEL_SOCKET_MSG_DONTWAIT;
         *result=kernel_socket_write_datagram(file,mm,snapshot.view,snapshot.count,count,flags,destination,&call.message);
     } else {
@@ -546,10 +579,10 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     }
     if (status || writing) goto out;
     if (*result==-KERNEL_EINTR || *result==-KERNEL_ERESTARTSYS) goto out;
-    if (*result<0 && call.message.stream_cookie!=KERNEL_SOCKET_STREAM_COOKIE_EMPTY &&
-        call.message.stream_cookie!=KERNEL_SOCKET_STREAM_COOKIE_FAULT) goto out;
+    if (*result<0 && call.message.receive_state!=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY &&
+        call.message.receive_state!=KERNEL_SOCKET_RECEIVE_STREAM_FAULT) goto out;
     header.flags=(flags&UINT32_C(0x40000000)) | (message_size>count?KERNEL_SOCKET_MSG_TRUNC:0);
-    if ((flags&KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) *result=message_size;
+    if ((flags&KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_preserves_messages(socket)) *result=message_size;
     uint64_t control_used=0;
     if (unix_socket) {
         int passcred=0;
@@ -560,20 +593,31 @@ static __attribute__((noinline)) enum kernel_files_status socket_message(
     }
     if (*result<0) goto out;
     header.control_length=control_used;
-    if (header.name && (!kernel_socket_is_datagram(socket) || address.family)) {
-        if (!kernel_socket_is_datagram(socket)) {
+    if (header.name) {
+        if (!unix_socket && !kernel_socket_preserves_messages(socket)) {
             int error=kernel_socket_getpeer(socket,&address);
             if (error) { *result=error; goto out; }
         }
-        int error=copy_address_out(mm,header.name,request->arguments[1]+offsetof(struct linux_msghdr,name_length),&address);
-        if (error) { *result=error; goto out; }
+        if (address.family) {
+            int error=copy_address_out(mm,header.name,request->arguments[1]+offsetof(struct linux_msghdr,name_length),&address);
+            if (error) { *result=error; goto out; }
+        } else {
+            header.name_length=0;
+            if (kernel_copy_to_user(mm,request->arguments[1]+offsetof(struct linux_msghdr,name_length),
+                    &header.name_length,sizeof(header.name_length),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(header.name_length)) {
+                *result=-KERNEL_EFAULT; goto out;
+            }
+        }
     }
     /* Linux publishes name, flags, then controllen after protocol consumption. */
     if (kernel_copy_to_user(mm,request->arguments[1]+offsetof(struct linux_msghdr,flags),&header.flags,sizeof(header.flags),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(header.flags) ||
         kernel_copy_to_user(mm,request->arguments[1]+offsetof(struct linux_msghdr,control_length),&header.control_length,sizeof(header.control_length),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(header.control_length)) *result=-KERNEL_EFAULT;
 out:
     kernel_socket_call_end(&call);
-    return status;
+    if (release_socket(file)!=KERNEL_SYSCALL_STATUS_OK || status!=KERNEL_FILES_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->value=*result;
+    return KERNEL_SYSCALL_STATUS_OK;
 }
 
 enum kernel_syscall_status syscall_handle_socket_operation(
@@ -582,7 +626,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     struct kernel_syscall_result *decoded)
 {
     int op = (int)request->number;
-    KERNEL_SERVICE_SCOPE_IF(service, op != 206 && op != 207 && op != 211 && op != 212);
+    KERNEL_SERVICE_SCOPE_IF(service, op != 206 && op != 207);
     struct kernel_files *files;
     struct kernel_open_file_description *file = 0;
     struct kernel_socket *socket;
@@ -649,15 +693,26 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         break;
     case 206: { /* sendto / send */
         uint32_t flags = (uint32_t)request->arguments[3];
-        if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL)) { result = -KERNEL_EOPNOTSUPP; break; }
+        uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL;
+        if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE;
+        if ((flags & ~allowed) && !kernel_socket_is_seqpacket(socket)) { result = -KERNEL_EOPNOTSUPP; break; }
         const struct kernel_socket_address *destination = 0;
         if (request->arguments[4] != 0) {
-            result = copy_address_in(mm, request->arguments[4], request->arguments[5],
-                                     &snapshot, kernel_socket_is_unix(socket), &address);
+            if (kernel_socket_is_seqpacket(socket)) {
+                result=copy_address_snapshot(mm,request->arguments[4],request->arguments[5],&snapshot);
+            } else {
+                result = copy_address_in(mm, request->arguments[4], request->arguments[5],
+                                         &snapshot, kernel_socket_is_unix(socket), &address);
+                destination = &address;
+            }
             if (result != 0) break;
-            destination = &address;
         }
-        if (kernel_socket_is_datagram(socket)) {
+        if (flags & ~allowed) {
+            result=kernel_socket_prepare_send(socket);
+            if (!result) result=-KERNEL_EOPNOTSUPP;
+            break;
+        }
+        if (kernel_socket_preserves_messages(socket)) {
             const struct kernel_uaccess_iovec iov = {request->arguments[1], range_size};
             if (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
             result = kernel_socket_write_datagram(&file, mm, &iov, 1, iov.length, flags, destination, NULL);
@@ -669,7 +724,13 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     case 207: { /* recvfrom / recv */
         uint32_t flags = (uint32_t)request->arguments[3];
         data_call.message.flags=flags;
-        if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK)) { result = -KERNEL_EOPNOTSUPP; break; }
+        uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK;
+        if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
+        if (flags & ~allowed) {
+            result=kernel_socket_prepare_receive(socket);
+            if (!result) result=-KERNEL_EOPNOTSUPP;
+            break;
+        }
         const struct kernel_uaccess_iovec iov = {request->arguments[1],range_size};
         uint32_t message_size = 0;
         if (kernel_files_socket_iov_io(files,mm,&file,&iov,1,iov.length,
@@ -678,26 +739,27 @@ enum kernel_syscall_status syscall_handle_socket_operation(
                 (flags & KERNEL_SOCKET_MSG_PEEK)?&data_call.message:NULL) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (result >= 0) {
-            if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) result = message_size;
-            if (!kernel_socket_is_datagram(socket) && request->arguments[4] != 0) {
+            if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_preserves_messages(socket)) result = message_size;
+            if (!kernel_socket_is_unix(socket) && !kernel_socket_preserves_messages(socket) && request->arguments[4] != 0) {
                 int peer_result = kernel_socket_getpeer(socket, &peer_address);
                 if (peer_result != 0) result = peer_result;
             }
         }
         if (result >= 0 && request->arguments[4] != 0) {
-            int address_result = copy_address_out(mm, request->arguments[4], request->arguments[5], &peer_address);
-            if (address_result != 0) result = address_result;
+            if (peer_address.family) {
+                int address_result = copy_address_out(mm, request->arguments[4], request->arguments[5], &peer_address);
+                if (address_result != 0) result = address_result;
+            } else {
+                uint32_t no_address=0;size_t copied=0;
+                if (kernel_copy_to_user(mm,request->arguments[5],&no_address,sizeof(no_address),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(no_address))
+                    result=-KERNEL_EFAULT;
+            }
         }
         break;
     }
     case 208: /* setsockopt */
     case 209: /* getsockopt */
         result = sockopt(socket, mm, request, op == 209);
-        break;
-    case 211: /* sendmsg */
-    case 212: /* recvmsg */
-        if (socket_message(files, mm, &file, request, &result) != KERNEL_FILES_STATUS_OK)
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         break;
     case 210: /* shutdown */
         result = kernel_socket_shutdown(socket, (int32_t)request->arguments[1]);

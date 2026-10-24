@@ -456,7 +456,8 @@ static enum kernel_files_status read_pinned(
             }
             if (received < 0 || read_request.socket == 0) break;
             int datagram = read_request.datagram;
-            if (datagram) kernel_socket_read_info(&read_request, peer, message_size);
+            if (datagram || (peer && kernel_socket_is_unix(read_request.socket)))
+                kernel_socket_read_info(&read_request, peer, datagram ? message_size : 0);
             int fault = !discard && kernel_socket_read_user(&read_request, mm, &cursor);
             KERNEL_FILES_NOTE(files, read_chunks, 1);
             total += kernel_socket_finish_read(&read_request, fault);
@@ -935,7 +936,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
             if (waited != 0) { result = waited; break; }
         }
         if (tcp) kernel_socket_stream_finish(&request);
-        else if (result == -KERNEL_EPIPE && !kernel_socket_is_datagram(socket) &&
+        else if (result == -KERNEL_EPIPE && kernel_socket_is_stream(socket) &&
                  !(socket_flags & KERNEL_SOCKET_MSG_NOSIGNAL))
             (void)kernel_signal_send_task(kernel_task_current(), 13U, 0);
         return result;
@@ -1012,7 +1013,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (count) kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file);
     if (count == 0U || start >= kernel_open_file_size(input)) return 0;
-    int datagram=kernel_socket_is_datagram(kernel_open_file_socket(output));
+    int datagram=kernel_socket_preserves_messages(kernel_open_file_socket(output));
     int direct=output->kind==KERNEL_OPEN_FILE_KIND_PIPE ||
         (output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram);
     struct kernel_task_io_buffer source_buffer = {0};
@@ -1346,7 +1347,8 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
                 kernel_signal_clear_syscall_restart(kernel_task_current());
         }
         if (result<0) {
-            if (!total && result==-KERNEL_EPIPE && !(flags&KERNEL_SOCKET_MSG_NOSIGNAL))
+            if (!total && result==-KERNEL_EPIPE && kernel_socket_is_stream(kernel_open_file_socket(borrowed)) &&
+                !(flags&KERNEL_SOCKET_MSG_NOSIGNAL))
                 (void)kernel_signal_send_task(kernel_task_current(),13U,0);
             *linux_result=total?(int64_t)total:result;
             return KERNEL_FILES_STATUS_OK;
@@ -1576,10 +1578,10 @@ static enum kernel_files_status write_request(
     KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     COST_SCOPE(write_cost, OPERATION_TICKS);
     COST_IO_SCOPE(io_cost,
-        kernel_socket_is_datagram(kernel_open_file_socket(description)) ? 2 :
+        kernel_socket_preserves_messages(kernel_open_file_socket(description)) ? 2 :
         kind == KERNEL_OPEN_FILE_KIND_REGULAR ? 0 : kind == KERNEL_OPEN_FILE_KIND_SOCKET ? 1 : 3);
     COST_IO_ADD(0, 1); COST_IO_ADD(1, count);
-    if (kernel_socket_is_datagram(kernel_open_file_socket(description))) {
+    if (kernel_socket_preserves_messages(kernel_open_file_socket(description))) {
         *linux_result = kernel_socket_write_datagram(&description, mm, iov,
             iov_count, count, socket_flags, 0, socket_message);
         COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);

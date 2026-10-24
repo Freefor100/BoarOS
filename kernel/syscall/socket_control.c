@@ -93,7 +93,7 @@ static int set_credentials(struct kernel_socket_control *control, const struct c
     return 0;
 }
 
-int kernel_socket_control_import(struct kernel_socket_call *call, struct kernel_mm *mm,
+int kernel_socket_control_copy(struct kernel_socket_call *call, struct kernel_mm *mm,
     uint64_t address, uint64_t length)
 {
     if (!length) return 0;
@@ -103,6 +103,13 @@ int kernel_socket_control_import(struct kernel_socket_call *call, struct kernel_
     size_t copied=0;
     if (kernel_copy_from_user(mm,call->import,address,(size_t)length,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=length)
         return -KERNEL_EFAULT;
+    return 0;
+}
+
+int kernel_socket_control_parse(struct kernel_socket_call *call,uint64_t length)
+{
+    if (!length) return 0;
+    if (!call->import) __builtin_trap();
     /* Size planning does not report parse errors: the actual pass preserves
      * the ordering of header, FD lookup and credential checks. */
     uint32_t capacity=0;
@@ -166,12 +173,13 @@ void kernel_socket_control_export(struct kernel_socket_call *call,struct kernel_
     uint64_t address,uint64_t capacity,uint32_t flags,int passcred,uint64_t *used,uint32_t *output_flags)
 {
     struct kernel_socket_control *control=call->message.control;
-    uint32_t missing=call->message.stream_cookie==KERNEL_SOCKET_STREAM_COOKIE_EMPTY?0U:65534U;
+    uint32_t missing=call->message.receive_state==KERNEL_SOCKET_RECEIVE_STREAM_EMPTY?0U:65534U;
     struct kernel_socket_control defaults={.uid=missing,.gid=missing,.has_credentials=1};
     *used=0;
+    if (call->message.receive_state==KERNEL_SOCKET_RECEIVE_EOF) return;
     if (!control) { if (!passcred) return; control=&defaults; }
     if (!address) {
-        if (passcred || (control->count && call->message.stream_cookie!=KERNEL_SOCKET_STREAM_COOKIE_FAULT))
+        if (passcred || (control->count && call->message.receive_state!=KERNEL_SOCKET_RECEIVE_STREAM_FAULT))
             *output_flags|=MSG_CTRUNC;
         return;
     }
@@ -190,7 +198,7 @@ void kernel_socket_control_export(struct kernel_socket_call *call,struct kernel_
             *used=advance;address+=advance;capacity-=advance;
         }
     }
-    if (call->message.stream_cookie==KERNEL_SOCKET_STREAM_COOKIE_FAULT) return;
+    if (call->message.receive_state==KERNEL_SOCKET_RECEIVE_STREAM_FAULT) return;
     if (control->count) {
         uint64_t fitting=capacity>sizeof(struct control_header)?(capacity-sizeof(struct control_header))/4U:0;
         uint32_t maximum=fitting>control->count?control->count:(uint32_t)fitting;

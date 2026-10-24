@@ -80,7 +80,7 @@ socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释
 关闭工作尚未服务时验证容量回收及 timer 到期均清空借用；同时检查非 socket
 raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所有权用例。
 
-`AF_UNIX` 提供 STREAM/DGRAM 的普通 socket、socketpair、文件路径名和抽象名称。创建、绑定、连接、监听、accept/accept4、配置及最后关闭由 CPU0 执行；载荷复制、接纳、读预约和等待保留在发起 CPU。socketpair 的双 OFD/FD 原子发布，失败归还未发布对象。
+`AF_UNIX` 提供 STREAM/DGRAM/SEQPACKET 的普通 socket、socketpair、文件路径名和抽象名称。创建、绑定、连接、监听、accept/accept4、配置及最后关闭由 CPU0 执行；载荷复制、接纳、读预约和等待保留在发起 CPU。socketpair 的双 OFD/FD 原子发布，失败归还未发布对象。
 
 UNIX 名称单独分配、发布后不可修改。地址接口用带长度的借用视图，与原 INET 地址保持同样的24字节；导出地址和 DGRAM 消息各自持有名称引用。抽象名称按 socket 类型、完整长度和原始字节索引，允许内部零字节；family-only bind 查找未占用的自动名称。文件路径绑定持有真实 VFS 路径，索引以文件系统实例和 inode 区分对象；bind 在同一次目录创建中取得节点，复用 DAC、umask 和 SGID 继承。改名、硬链接和 unlink 不改变连接身份。关闭留下路径节点，最后一个节点引用结束后才回收已 unlink 的 inode。
 
@@ -110,7 +110,7 @@ POLLOUT使用当前发送者内存的四分之一门限，实际write仍独立�
 请求登记，载荷复制在锁外进行。DGRAM在分配和usercopy前完成内存预留，复制完成后才移动整包owner；
 fault/OOM/取消先释放取得的内存，再归还预留与OFD pin，不发布前缀。截断读取或
 接收fault丢弃整条datagram并归还其全部计费；DGRAM出队时在同一保护内归还
-sender额度与源地址引用，实际名称、端点和packet存储在锁外释放，释放后仍推进
+sender额度，实际名称、端点和packet存储在锁外释放，释放后仍推进
 共享heap的INET接收容量等待。sender关闭后仍可读其queued内容。
 等待者被发送缓存增大、packet最后释放或peer状态变化唤醒，重新核对状态。
 STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带未读内容
@@ -119,11 +119,21 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 与poll/recv均按各类型处理，不把datagram peer关闭变成stream EOF。
 
 固定依据为`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
-`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。每消息控制数据见下节，SEQPACKET保留为后续功能。命名连接和 socketpair 共用上述跨核状态与队列保护。
+`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。每消息控制数据见下节。命名连接和 socketpair 共用上述跨核状态与队列保护。
+
+SEQPACKET按连接管理与整条记录收发：监听、connect和accept与STREAM共用，实际SO_TYPE及子端点保持类型5；一次发送发布一条完整记录，短接收截断并消费该记录，MSG_TRUNC可返回原长度。MSG_EOR和MSG_MORE发送标志接受后忽略，MSG_WAITALL接收仍停在一条记录，返回标志不添加MSG_EOR。SEQPACKET未连接或监听时接收返回ENOTCONN，EPIPE不发送SIGPIPE。
+
+空记录与EOF独立：空记录可交付SCM_RIGHTS和凭据；SEQPACKET无记录EOF返回零且控制区长度为零。STREAM保留自身空cookie规则。头、iovec及控制区字节先导入，随后按协议检查待决错误和连接，再解析SCM；不支持的SEQ标志在协议规定位置拒绝，输入故障与错误消费顺序和固定Linux一致。
+
+UNIX报文持有发送端存储；接收时从该端点取得当前名称引用，所以发送后bind和发送端关闭后仍可返回正确来源。逻辑关闭摘除名称索引，名称对象随真实存储使用者释放；用户地址输出在端点锁外完成。带地址输出的UNIX STREAM和记录型接收共用此路径。STREAM/SEQ未接纳子连接由listener保活，listener关闭时即使子队列为空，也向client发布一次ECONNRESET；已接纳子端点归其真实OFD所有。
+
+UNIX合法shutdown对未连接、监听和已连接对象均返回0，修改规定的本端／对端关闭状态；非法how在修改前返回EINVAL。STREAM/SEQ的就绪位由监听、队列、shutdown和待决错误共同决定；缺少peer本身不生成POLLERR。
+
+连接建立、消息边界和SIGPIPE分别按实际类型判断；共同文件I/O依据消息边界选择整包接纳，发送信号仅使用STREAM规则。接收结果区分取得报文、STREAM空状态、复制故障与SEQPACKET EOF，控制区字节导入与SCM语义解析分别处理，使协议错误能够按其规定顺序返回。
 
 ## UNIX 控制消息与 FD 所有权
 
-INET与UNIX共用MSG_PEEK接收预约，重复查询保留原报文与接收窗口。UNIX STREAM/DGRAM 的 sendmsg/recvmsg 接受 SCM_RIGHTS、SCM_CREDENTIALS；SO_PASSCRED控制消息凭据输出。原生64位 cmsghdr 为16字节、8字节对齐，ucred 为12字节，每次最多传253个FD。发送控制区完整复制后按记录解析；FD表查询取得真实OFD，包含O_PATH。发送者关闭原FD或复用编号后，排队消息仍持有原对象；接收者共享其offset、状态标志和打开权利，新FD的CLOEXEC由MSG_CMSG_CLOEXEC决定。
+INET与UNIX共用MSG_PEEK接收预约，重复查询保留原报文与接收窗口。UNIX STREAM/DGRAM/SEQPACKET 的 sendmsg/recvmsg 接受 SCM_RIGHTS、SCM_CREDENTIALS；SO_PASSCRED控制消息凭据输出。原生64位 cmsghdr 为16字节、8字节对齐，ucred 为12字节，每次最多传253个FD。发送控制区完整复制后按记录解析；FD表查询取得真实OFD，包含O_PATH。发送者关闭原FD或复用编号后，排队消息仍持有原对象；接收者共享其offset、状态标志和打开权利，新FD的CLOEXEC由MSG_CMSG_CLOEXEC决定。
 
 自动消息凭据捕获发送时TGID与真实UID/GID，普通write/writev/send/sendto也使用这一规则。显式凭据依据调用者real/effective/saved身份及CAP_SETUID、CAP_SETGID、CAP_SYS_ADMIN检查。排队消息保留PID身份引用与数字UID/GID；发送者退出或改身份不改变已有消息。SO_PEERCRED继续使用连接时的有效身份快照。PASSCRED还参与listener选项继承、尚未accept的child凭据捕获及未命名发送端自动绑定。
 
@@ -141,7 +151,7 @@ TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖 CPU0 的实际 
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
 
-用户复制可以触发文件页的冷缺页，调用链继续进入 ELF 源读取、页缓存、ext4 和块设备等待；这些调用共同使用当前任务的 8 KiB 内核栈。UNIX 载荷复制与复制后的 packet 发布使用独立栈帧，TCP pin 工作区与普通文件暂存路径也分别构帧；MM 的映射文件缺页与 ELF 缺页分开，避免无关工作区同时占栈。检查栈余量需要实际触发冷页并等待任务退出后的高水位报告，单个函数的静态帧大小不足以说明整条调用链安全。
+用户复制可以触发文件页的冷缺页，调用链继续进入 ELF 源读取、页缓存、ext4 和块设备等待；这些调用共同使用当前任务的 8 KiB 内核栈。sendmsg/recvmsg直接进入消息处理入口，不跨载荷缺页保留标量及控制调用的栈帧；发送预检复用已经持有的端点保护。UNIX 载荷复制与复制后的 packet 发布使用独立栈帧，TCP pin 工作区与普通文件暂存路径也分别构帧；MM 的映射文件缺页与 ELF 缺页分开，避免无关工作区同时占栈。检查栈余量需要实际触发冷页并等待任务退出后的高水位报告，单个函数的静态帧大小不足以说明整条调用链安全。
 
 epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[文件接口](kernel-files.md#epoll-事件通知子系统)。独立状态锁维护候选、控制代次、ONESHOT 和扫描引用；目标就绪查询、用户复制、上层通知及等待游标排空在锁外执行。端点通知取得现有队列/节点借用后释放端点锁，因此远端回调与 DEL、MOD、关闭可以交错，实际回调归还前存储保持有效。
 
@@ -378,8 +388,10 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 平台随后销毁device/transport。LA真实PCI与无NIC双侧结果见[net模块](riscv-virtio-net.md)。
 
 2026-10-07新增`--workload unix_sender`保护>64KiB单消息、sndbuf-32边界、有限零
-消息、坏用户页、sender关闭后读取、关闭peer的两次错误及STREAM/DGRAM信号区别。
+消息、坏用户页、sender关闭后读取、关闭peer的两次错误及各类型信号规则。
 LA的budget/sendfile/unix_sender均在Linux/BoarOS两种RAM检查实际退出和根基线；
 内部owner另由`tests/host/network_owner.py --case unix-sender --sanitize`验证两种
 关闭顺序，真实RV scale覆盖预留后的两处OOM、截断、接收fault及对端回收，pthread
 覆盖真实等待/取消。完整双架构/程序回归继续按整个LA能力计划收口。
+
+`tests/workloads/network/unix_seqpacket.c`复用共同控制消息检查，另覆盖命名连接、记录边界、空记录/EOF、实际用户入口的来源名称、错误顺序、shutdown及等待。宿主network_owner中的SEQ记录、预约、SCM、pending child和shutdown专项检查真实引用与额度归还。

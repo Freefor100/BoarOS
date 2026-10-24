@@ -35,6 +35,10 @@ enum kernel_syscall_status syscall_handle_bind(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_socket_message(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_socket_operation(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

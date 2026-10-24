@@ -303,6 +303,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_SENDMSG ||
+               request->number == LINUX_SYSCALL_RECVMSG) {
+        if (syscall_handle_socket_message(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_LISTEN ||
                request->number == LINUX_SYSCALL_ACCEPT ||
                request->number == LINUX_SYSCALL_ACCEPT4 ||
@@ -313,9 +318,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_RECVFROM ||
                request->number == LINUX_SYSCALL_SETSOCKOPT ||
                request->number == LINUX_SYSCALL_GETSOCKOPT ||
-               request->number == LINUX_SYSCALL_SHUTDOWN ||
-               request->number == LINUX_SYSCALL_SENDMSG ||
-               request->number == LINUX_SYSCALL_RECVMSG) {
+               request->number == LINUX_SYSCALL_SHUTDOWN) {
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

@@ -25,6 +25,13 @@
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"UNIX-CONTROL FAIL line=%d %s errno=%d\n",__LINE__,#x,errno); _exit(1); } } while (0)
+/* The SEQPACKET consumer runs the same ancillary ABI with its record type. */
+#ifndef UNIX_CONTROL_MESSAGE_TYPE
+#define UNIX_CONTROL_MESSAGE_TYPE SOCK_DGRAM
+#define UNIX_CONTROL_FIRST_TYPE SOCK_STREAM
+#define UNIX_CONTROL_LAST_TYPE SOCK_DGRAM
+#define UNIX_CONTROL_LISTENER_TYPE SOCK_STREAM
+#endif
 #define MAX_RIGHTS 253
 #define CONTROL_SIZE (CMSG_SPACE(MAX_RIGHTS*sizeof(int))+CMSG_SPACE(sizeof(struct ucred)))
 union control { struct cmsghdr alignment; unsigned char bytes[CONTROL_SIZE]; };
@@ -33,7 +40,7 @@ static unsigned cpu_ids[4],cpus,case_count;
 static char workdir[80];
 
 static void passed(const char *name) { ++case_count;printf("UNIX-CONTROL CASE %s PASS\n",name); }
-static void pair_at(int type,int p[2]) { CHECK(!socketpair(AF_UNIX,type,0,p)); }
+static void pair_at(int type,int p[2]) { if(type==SOCK_DGRAM)type=UNIX_CONTROL_MESSAGE_TYPE;CHECK(!socketpair(AF_UNIX,type,0,p)); }
 static void close_pair(int p[2]) { CHECK(!close(p[0]) && !close(p[1])); }
 static void wait_child(pid_t pid) { int status;CHECK(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status)); }
 static void barrier(pthread_barrier_t *b) { int r=pthread_barrier_wait(b);CHECK(!r || r==PTHREAD_BARRIER_SERIAL_THREAD); }
@@ -99,7 +106,7 @@ static void empty_queue(int fd) { char c;CHECK(recv(fd,&c,1,MSG_DONTWAIT)==-1 &&
 
 static void rights_objects(void)
 {
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2],pipefd[2],other[2];pair_at(type,p);CHECK(!pipe(pipefd));pair_at(SOCK_STREAM,other);
         int file=data_file(),event=eventfd(7,EFD_CLOEXEC),path=open(".",O_PATH|O_DIRECTORY|O_CLOEXEC);CHECK(event>=0 && path>=0);
         int fds[]={file,pipefd[0],other[0],event,path};CHECK(!fcntl(file,F_SETFD,FD_CLOEXEC));
@@ -122,7 +129,7 @@ static void rights_objects(void)
 }
 static void source_lifetime(void)
 {
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);int source=data_file(),number=source;
         CHECK(send_control(p[0],"L",1,&source,1,0,0)==1 && !close(source));int replacement=open("/dev/null",O_RDONLY);CHECK(replacement==number);
         struct received r=receive_control(p[1],1,CONTROL_SIZE,0);char c;CHECK(r.size==1 && r.nfds==1 && read(r.fds[0],&c,1)==1 && c=='0');
@@ -133,7 +140,7 @@ static void source_lifetime(void)
 static void control_capacity(void)
 {
     const size_t capacities[]={0,sizeof(struct cmsghdr)-1,CMSG_LEN(0),CMSG_LEN(sizeof(int)),CMSG_SPACE(sizeof(int)),CMSG_SPACE(3*sizeof(int))};
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++)for(unsigned j=0;j<sizeof(capacities)/sizeof(*capacities);j++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++)for(unsigned j=0;j<sizeof(capacities)/sizeof(*capacities);j++) {
         int p[2];pair_at(type,p);int file=data_file(),fds[]={file,file,file};CHECK(send_control(p[0],"T",1,fds,3,0,0)==1);
         struct received r=receive_control(p[1],1,capacities[j],0);unsigned expected=capacities[j]<CMSG_LEN(0)?0:(unsigned)((capacities[j]-CMSG_LEN(0))/sizeof(int));if(expected>3)expected=3;
         CHECK(r.size==1 && r.data[0]=='T' && r.nfds==expected && !!(r.flags&MSG_CTRUNC)==(expected<3));
@@ -147,7 +154,7 @@ static void control_capacity(void)
 }
 static void rights_limits(void)
 {
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);int file=data_file(),fds[254];for(unsigned i=0;i<254;i++)fds[i]=file;
         int invalid=-1;CHECK(send_control(p[0],"B",1,&invalid,1,0,0)==-1 && errno==EBADF);empty_queue(p[1]);
         CHECK(send_control(p[0],"B",1,fds,254,0,0)==-1 && errno==EINVAL);empty_queue(p[1]);
@@ -159,7 +166,7 @@ static void rights_limits(void)
 static void credentials_capacity(void)
 {
     const size_t capacities[]={0,sizeof(struct cmsghdr)-1,CMSG_LEN(0),CMSG_LEN(sizeof(pid_t)),CMSG_LEN(2*sizeof(int)),CMSG_LEN(sizeof(struct ucred)),CMSG_SPACE(sizeof(struct ucred)),CMSG_SPACE(sizeof(struct ucred))+CMSG_LEN(sizeof(int)),CMSG_SPACE(sizeof(struct ucred))+CMSG_SPACE(3*sizeof(int))};
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++)for(unsigned j=0;j<sizeof(capacities)/sizeof(*capacities);j++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++)for(unsigned j=0;j<sizeof(capacities)/sizeof(*capacities);j++) {
         int p[2];pair_at(type,p);passcred(p[1],1);int file=data_file(),fds[]={file,file,file};CHECK(send_control(p[0],"C",1,fds,3,0,0)==1);
         size_t capacity=capacities[j];struct received r=receive_control(p[1],1,capacity,0);CHECK(r.size==1 && r.data[0]=='C');
         if(capacity<CMSG_LEN(0))CHECK(!r.ncreds);
@@ -183,7 +190,7 @@ static void table_full_child(unsigned type,unsigned slots)
     CHECK(!close(file));close_pair(p);_exit(0);
 }
 static void full_table(void)
-{ for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++)for(unsigned slots=0;slots<=1;slots++) { pid_t child=fork();CHECK(child>=0);if(!child)table_full_child(type,slots);wait_child(child); }passed("receive-full-fd-table-payload-and-partial-rights"); }
+{ for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++)for(unsigned slots=0;slots<=1;slots++) { pid_t child=fork();CHECK(child>=0);if(!child)table_full_child(type,slots);wait_child(child); }passed("receive-full-fd-table-payload-and-partial-rights"); }
 static void token_write(int fd,char token) { CHECK(write(fd,&token,1)==1); }
 static void token_read(int fd,char expected) { char token;CHECK(read(fd,&token,1)==1 && token==expected); }
 static void clear_capabilities(void)
@@ -280,7 +287,7 @@ static void exit_group_control_owner(void)
 }
 static void peek_and_read(void)
 {
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);int file=data_file();CHECK(send_control(p[0],"P",1,&file,1,0,0)==1);
         struct received a=receive_control(p[1],1,CONTROL_SIZE,MSG_PEEK),b=receive_control(p[1],1,CONTROL_SIZE,MSG_PEEK),c=receive_control(p[1],1,CONTROL_SIZE,0);
         CHECK(a.size==1 && b.size==1 && c.size==1 && a.nfds==1 && b.nfds==1 && c.nfds==1 && a.fds[0]!=b.fds[0] && b.fds[0]!=c.fds[0] && a.fds[0]!=c.fds[0]);
@@ -356,7 +363,7 @@ static void empty_dgram(void)
 }
 static void credentials_identity(void)
 {
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);passcred(p[1],1);pid_t original=getpid();uid_t uid=getuid();gid_t gid=getgid();
         pid_t child=fork();CHECK(child>=0);if(!child) {
             int numeric_ids=!geteuid();
@@ -401,7 +408,7 @@ static void credentials_options(void)
 static void fault_send_control(void)
 {
     size_t page=(size_t)sysconf(_SC_PAGESIZE);void *bad=mmap(0,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(bad!=MAP_FAILED);
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);char byte='F';struct iovec iov={&byte,1};struct msghdr m={.msg_iov=&iov,.msg_iovlen=1,.msg_control=bad,.msg_controllen=CMSG_SPACE(sizeof(int))};
         /* musl sendmsg copies control in userspace before entering the kernel. */
         CHECK(syscall(SYS_sendmsg,p[0],&m,0)==-1 && errno==EFAULT);empty_queue(p[1]);close_pair(p);
@@ -423,7 +430,7 @@ static void libc_control_fault(void)
 }
 static void null_control(void)
 {
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2],pipefd[2];pair_at(type,p);CHECK(!pipe2(pipefd,O_NONBLOCK));
         CHECK(send_control(p[0],"N",1,&pipefd[1],1,0,0)==1 && !close(pipefd[1]));
         char byte=0;struct iovec iov={&byte,1};struct msghdr m={.msg_iov=&iov,.msg_iovlen=1,.msg_control=NULL,.msg_controllen=CONTROL_SIZE};
@@ -435,7 +442,7 @@ static void null_control(void)
 static void null_name_readonly(void)
 {
     size_t page=(size_t)sysconf(_SC_PAGESIZE);unsigned char *memory=mmap(0,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(memory!=MAP_FAILED);
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);CHECK(send(p[0],"N",1,0)==1);char byte=0;struct iovec iov={&byte,1};
         CHECK(!mprotect(memory,page,PROT_READ|PROT_WRITE));
         struct msghdr *message=(void *)(memory+page-16);*message=(struct msghdr){.msg_name=NULL,.msg_namelen=(socklen_t)-1,.msg_iov=&iov,.msg_iovlen=1};
@@ -450,7 +457,7 @@ static void null_name_readonly(void)
 static void fault_receive_control(void)
 {
     size_t page=(size_t)sysconf(_SC_PAGESIZE);void *bad=mmap(0,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(bad!=MAP_FAILED);
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2],pipefd[2];pair_at(type,p);CHECK(!pipe2(pipefd,O_NONBLOCK));CHECK(send_control(p[0],"F",1,&pipefd[1],1,0,0)==1 && !close(pipefd[1]));
         char byte=0;struct iovec iov={&byte,1};struct msghdr m={.msg_iov=&iov,.msg_iovlen=1,.msg_control=bad,.msg_controllen=CMSG_SPACE(sizeof(int))};
         CHECK(recvmsg(p[1],&m,0)==1 && byte=='F' && (m.msg_flags&MSG_CTRUNC) && m.msg_controllen==0);
@@ -461,7 +468,7 @@ static void fault_receive_control(void)
 static void fault_receive_partial(void)
 {
     size_t page=(size_t)sysconf(_SC_PAGESIZE);unsigned char *memory=mmap(0,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(memory!=MAP_FAILED && !mprotect(memory+page,page,PROT_NONE));
-    for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+    for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++) {
         int p[2];pair_at(type,p);int file=data_file(),fds[]={file,file};CHECK(send_control(p[0],"P",1,fds,2,0,0)==1);
         unsigned char *control=memory+page-CMSG_LEN(sizeof(int));char byte=0;struct iovec iov={&byte,1};
         struct msghdr m={.msg_iov=&iov,.msg_iovlen=1,.msg_control=control,.msg_controllen=CMSG_SPACE(2*sizeof(int))};
@@ -505,7 +512,7 @@ static void gc_actions(void)
     struct received r=receive_control(root,1,CONTROL_SIZE,0);CHECK(r.size==1 && r.data[0]=='R' && r.nfds==1);struct stat a,b;CHECK(!fstat(root,&a) && !fstat(r.fds[0],&b) && a.st_dev==b.st_dev && a.st_ino==b.st_ino);release_received(&r);CHECK(!close(root));
     printf("UNIX-CONTROL ACTION gc-external-root retained_message_read=1 closed_user_fds=4\n");
     for(unsigned i=0;i<16;i++) {
-        socklen_t length;struct sockaddr_un name=address("control-unaccepted",&length);int listener=socket(AF_UNIX,SOCK_STREAM,0),client=socket(AF_UNIX,SOCK_STREAM,0);CHECK(listener>=0 && client>=0);
+        socklen_t length;struct sockaddr_un name=address("control-unaccepted",&length);int listener=socket(AF_UNIX,UNIX_CONTROL_LISTENER_TYPE,0),client=socket(AF_UNIX,UNIX_CONTROL_LISTENER_TYPE,0);CHECK(listener>=0 && client>=0);
         CHECK(!bind(listener,(void *)&name,length) && !listen(listener,1) && !connect(client,(void *)&name,length));
         CHECK(send_control(client,"U",1,&client,1,0,0)==1 && !close(client) && !close(listener));
     }
@@ -627,7 +634,7 @@ int main(int argc,char **argv)
     if(getpid()==1) { CHECK(!mkdir("/proc",0555) || errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0) || errno==EBUSY); }
     CHECK(!mkdir("/tmp",0777) || errno==EEXIST);strcpy(workdir,"/tmp/unix-control-XXXXXX");CHECK(mkdtemp(workdir) && !chdir(workdir));
     unsigned before=fd_count();
-    if((argc==2 && !strcmp(argv[1],"--perf")) || (argc==1 && access("/performance",F_OK)==0)) { for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++)for(unsigned mode=0;mode<3;mode++)performance(type,mode);puts("UNIX-CONTROL PERF END 6"); }
+    if((argc==2 && !strcmp(argv[1],"--perf")) || (argc==1 && access("/performance",F_OK)==0)) { for(unsigned type=UNIX_CONTROL_FIRST_TYPE;type<=UNIX_CONTROL_LAST_TYPE;type++)for(unsigned mode=0;mode<3;mode++)performance(type,mode);puts("UNIX-CONTROL PERF END 6"); }
     else {
         const char *only=0;if(argc==3 && !strcmp(argv[1],"--case"))only=argv[2];else CHECK(argc==1 || (argc==2 && !strcmp(argv[1],"--correctness")));
         int matched=0;for(unsigned i=0;i<sizeof(cases)/sizeof(*cases);i++)if(!only || !strcmp(only,cases[i].name)) { cases[i].run();matched=1; }CHECK(matched);

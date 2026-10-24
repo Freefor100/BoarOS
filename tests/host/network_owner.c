@@ -39,7 +39,7 @@ static struct {
 static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
-static unsigned heap_allocations,protocol_services,allow_ofd_release;
+static unsigned heap_allocations,protocol_services,allow_ofd_release,heap_fail_after;
 static size_t heap_last_allocation_size;
 static unsigned space_callbacks;
 static _Thread_local unsigned reservation_actor,state_acquires;
@@ -234,7 +234,7 @@ int kernel_credentials_capable(const struct kernel_credentials *credentials, uns
 enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task, uint32_t signal, kernel_pid_t sender)
 { (void)task; (void)signal; (void)sender; abort(); }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
-{ CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
+{ CHECK(heap == &test_heap); if(heap_fail_after && !--heap_fail_after) { *out=NULL;return KERNEL_HEAP_STATUS_EMPTY; } *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
 void kernel_heap_release(struct kernel_heap *heap, void *allocation)
@@ -1757,6 +1757,43 @@ static void unix_listener_lookup_close(void)
     kernel_socket_destroy(client);CHECK(!heap_live);
     puts("PASS UNIX stream listener close after lookup reference prevents connection and releases child, queue entry and target");
 }
+static void unix_shutdown_states(void)
+{
+    kernel_socket_network_initialize();
+    const int types[]={SOCKET_STREAM,SOCKET_DGRAM,SOCKET_SEQPACKET};
+    const unsigned char name[]={0,'s','h','u','t','-','s','t','a','t','e'};
+    const uint32_t mask=KERNEL_POLLIN|KERNEL_POLLRDNORM|KERNEL_POLLRDHUP|
+        KERNEL_POLLHUP|KERNEL_POLLOUT|KERNEL_POLLERR;
+    for(unsigned t=0;t<3;t++)for(unsigned listener=0;listener<2;listener++) {
+        if(listener && types[t]==SOCKET_DGRAM)continue;
+        for(int how=-1;how<=3;how++) {
+            struct kernel_socket *socket=NULL;
+            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,types[t],&socket));
+            if(listener) {
+                struct kernel_socket_address address=abstract_address(name,sizeof(name));
+                CHECK(!kernel_socket_bind(socket,&address) && !kernel_socket_listen(socket,1));
+            }
+            uint32_t initial=listener?0:KERNEL_POLLOUT;
+            if(!listener && types[t]!=SOCKET_DGRAM)initial|=KERNEL_POLLHUP;
+            CHECK((kernel_socket_poll(socket,NULL)&mask)==initial);
+            int valid=how>=0 && how<=2;
+            CHECK(kernel_socket_shutdown(socket,how)==(valid?0:-KERNEL_EINVAL));
+            unsigned read_closed=valid && how!=1,write_closed=valid && how!=0;
+            CHECK(socket->read_closed==read_closed && socket->write_closed==write_closed);
+            CHECK(!socket->connected && socket->listening==listener && !socket->peer && !socket->pending_error);
+            uint32_t expected=initial;
+            if(read_closed)expected|=KERNEL_POLLIN|KERNEL_POLLRDNORM|KERNEL_POLLRDHUP;
+            if(read_closed && write_closed)expected|=KERNEL_POLLHUP;
+            CHECK((kernel_socket_poll(socket,NULL)&mask)==expected);
+            /* Valid shutdown is idempotent; invalid how cannot alter state. */
+            CHECK(kernel_socket_shutdown(socket,how)==(valid?0:-KERNEL_EINVAL));
+            CHECK(socket->read_closed==read_closed && socket->write_closed==write_closed);
+            CHECK((kernel_socket_poll(socket,NULL)&mask)==expected);
+            kernel_socket_destroy(socket);CHECK(!heap_live);
+        }
+    }
+    puts("PASS UNIX shutdown states: STREAM/DGRAM/SEQ new and STREAM/SEQ listeners, 15 valid and 10 invalid how cases, idempotence, state and poll, complete storage return");
+}
 static void unix_datagram_read_shutdown(void)
 {
     kernel_socket_network_initialize();
@@ -1764,7 +1801,7 @@ static void unix_datagram_read_shutdown(void)
     struct kernel_socket_address address=abstract_address(name,sizeof(name));
     struct kernel_socket *target=NULL,*sender=NULL;
     CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&target));
-    CHECK(kernel_socket_shutdown(target,0)==-KERNEL_ENOTCONN && target->read_closed);
+    CHECK(!kernel_socket_shutdown(target,0) && target->read_closed);
     CHECK(!kernel_socket_bind(target,&address));
     CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&sender));
     CHECK(!kernel_socket_connect(sender,&address,1));
@@ -2116,16 +2153,227 @@ static void unix_control_cleanup_failure(void)
     puts("PASS UNIX SCM cleanup interleave: condition-variable handshake pauses lock-free last put, concurrent drain rejects empty-list false success, completed put returns all owners");
 }
 
+static void unix_seqpacket_records(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *a=NULL,*b=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_SEQPACKET,&a));
+    CHECK(kernel_socket_prepare_send(a)==-KERNEL_ENOTCONN);
+    struct kernel_open_file_description *pin=(void *)a;struct kernel_socket_read_request read={0};
+    struct kernel_socket_message message={0};
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,4,1,&message)==-KERNEL_ENOTCONN);
+    CHECK((kernel_socket_poll(a,NULL)&(KERNEL_POLLHUP|KERNEL_POLLOUT|KERNEL_POLLERR))==(KERNEL_POLLHUP|KERNEL_POLLOUT));
+    const unsigned char listener_name[]={0,'s','e','q','-','s','t','a','t','e'};
+    struct kernel_socket_address listen_address=abstract_address(listener_name,sizeof(listener_name));
+    CHECK(!kernel_socket_bind(a,&listen_address) && !kernel_socket_listen(a,1));
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,4,1,&message)==-KERNEL_ENOTCONN);
+    CHECK(!(kernel_socket_poll(a,NULL)&(KERNEL_POLLHUP|KERNEL_POLLOUT|KERNEL_POLLERR)));
+    kernel_socket_destroy(a);a=NULL;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_SEQPACKET,&a,&b));
+    CHECK(write_buffer(a,"first",5,0)==5 && write_buffer(a,"tail",4,0)==4 && write_buffer(a,"",0,0)==0);
+    uint64_t billed=a->unix_memory;unsigned live=heap_live;
+    for(unsigned repeat=0;repeat<2;repeat++) {
+        pin=(void *)b;message=(struct kernel_socket_message){.flags=KERNEL_SOCKET_MSG_PEEK};
+        CHECK(kernel_socket_reserve_read(b,NULL,&read,&pin,2,1,&message)==2);
+        uint32_t size=0;kernel_socket_read_info(&read,NULL,&size);CHECK(size==5);
+        char bytes[2];kernel_socket_copy_read(&read,0,bytes,2);CHECK(!memcmp(bytes,"fi",2));
+        CHECK(kernel_socket_finish_read(&read,0)==2 && message.receive_state==KERNEL_SOCKET_RECEIVE_RECORD);
+        CHECK(a->unix_memory==billed && heap_live==live && b->unix_queued==3);
+    }
+    message=(struct kernel_socket_message){0};pin=(void *)b;
+    CHECK(kernel_socket_reserve_read(b,NULL,&read,&pin,2,1,&message)==2);
+    CHECK(kernel_socket_finish_read(&read,0)==2 && b->unix_queued==2);
+    struct kernel_socket_address source=read_named_packet(b,"tail");kernel_socket_address_release(&source);
+    pin=(void *)b;message=(struct kernel_socket_message){0};
+    CHECK(!kernel_socket_reserve_read(b,NULL,&read,&pin,8,1,&message) && read.socket==b);
+    CHECK(message.receive_state==KERNEL_SOCKET_RECEIVE_RECORD && !kernel_socket_finish_read(&read,0));
+    CHECK(!b->rx_bytes && !a->unix_packets && !a->unix_memory);
+    char bytes[]="fault";struct kernel_uaccess_iovec iov={(uintptr_t)bytes,5};
+    pin=(void *)a;user_remaining=2;
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,5,0,NULL,NULL)==-KERNEL_EFAULT);
+    user_remaining=SIZE_MAX;CHECK(!a->active_writes && !a->tx_reserved && !b->unix_reserved && !b->packets_head);
+    CHECK(write_buffer(a,"fault",5,0)==5);pin=(void *)b;message=(struct kernel_socket_message){0};
+    CHECK(kernel_socket_reserve_read(b,NULL,&read,&pin,5,1,&message)==5);
+    user_remaining=2;struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+    CHECK(kernel_socket_read_user(&read,NULL,&cursor)==-KERNEL_EFAULT);
+    CHECK(!kernel_socket_finish_read(&read,1));user_remaining=SIZE_MAX;
+    CHECK(!b->rx_bytes && !a->unix_packets && !a->unix_memory);
+    heap_fail_after=1;CHECK(write_buffer(a,"x",1,0)==-KERNEL_ENOMEM);CHECK(!heap_fail_after);
+    CHECK(!a->active_writes && !a->tx_reserved && !b->unix_reserved && !b->packets_head);
+    kernel_socket_destroy(a);pin=(void *)b;message=(struct kernel_socket_message){0};
+    CHECK(!kernel_socket_reserve_read(b,NULL,&read,&pin,8,1,&message) && !read.socket);
+    CHECK(message.receive_state==KERNEL_SOCKET_RECEIVE_EOF);
+    CHECK((kernel_socket_poll(b,NULL)&(KERNEL_POLLHUP|KERNEL_POLLRDHUP|KERNEL_POLLERR))==(KERNEL_POLLHUP|KERNEL_POLLRDHUP));
+    CHECK(write_buffer(b,"x",1,0)==-KERNEL_EPIPE);
+    kernel_socket_destroy(b);CHECK(!heap_live);
+    a=b=NULL;CHECK(!kernel_socket_pair(&test_heap,SOCKET_SEQPACKET,&a,&b));
+    CHECK(!kernel_socket_shutdown(a,1));
+    CHECK((kernel_socket_poll(b,NULL)&(KERNEL_POLLIN|KERNEL_POLLRDHUP|KERNEL_POLLHUP))==(KERNEL_POLLIN|KERNEL_POLLRDHUP));
+    pin=(void *)b;message=(struct kernel_socket_message){0};
+    CHECK(!kernel_socket_reserve_read(b,NULL,&read,&pin,1,1,&message) && message.receive_state==KERNEL_SOCKET_RECEIVE_EOF);
+    CHECK(write_buffer(b,"reply",5,0)==5);
+    source=read_named_packet(a,"reply");kernel_socket_address_release(&source);
+    CHECK(!kernel_socket_shutdown(a,0) && write_buffer(b,"x",1,0)==-KERNEL_EPIPE);
+    CHECK(kernel_socket_poll(b,NULL)&KERNEL_POLLHUP);
+    kernel_socket_destroy(a);kernel_socket_destroy(b);CHECK(!heap_live);
+    puts("PASS UNIX SEQ record: initial ENOTCONN/poll, two PEEKs, truncation, zero record/EOF, send/receive fault and allocation failure return request/credit/storage");
+}
+static void unix_late_source(void)
+{
+    kernel_socket_network_initialize();
+    const unsigned char name[]={0,'l','a','t','e'};
+    const int types[]={SOCKET_DGRAM,SOCKET_SEQPACKET,SOCKET_STREAM};
+    for(unsigned t=0;t<3;t++) {
+        struct kernel_socket *a=NULL,*b=NULL;CHECK(!kernel_socket_pair(&test_heap,types[t],&a,&b));
+        CHECK(write_buffer(a,"early",5,0)==5);
+        struct kernel_socket_address address=abstract_address(name,sizeof(name));
+        CHECK(!kernel_socket_bind(a,&address));kernel_socket_destroy(a);
+        struct kernel_socket *replacement=named_unix_socket(types[t],name,sizeof(name));
+        struct kernel_socket_address source=read_named_packet(b,"early");
+        expect_unix_name(&source,name,sizeof(name));CHECK(source.unix_owner!=replacement->unix_name);
+        kernel_socket_address_release(&source);kernel_socket_destroy(b);kernel_socket_destroy(replacement);CHECK(!heap_live);
+    }
+    puts("PASS UNIX source name: send before bind, close and rebind before receive retain original current name for DGRAM/SEQ/STREAM");
+}
+static void unix_pending_reset(void)
+{
+    kernel_socket_network_initialize();
+    const int types[]={SOCKET_STREAM,SOCKET_SEQPACKET};
+    const unsigned char name[]={0,'p','e','n','d','i','n','g'};
+    struct kernel_socket_address address=abstract_address(name,sizeof(name));
+    for(unsigned t=0;t<2;t++) {
+        struct kernel_socket *listener=named_unix_socket(types[t],name,sizeof(name)),*client=NULL;
+        CHECK(!kernel_socket_listen(listener,0));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,types[t],&client));
+        CHECK(!kernel_socket_connect(client,&address,1));
+        CHECK(listener->pending_head->child->type==types[t]);
+        CHECK(!listener->pending_head->child->packets_head);
+        kernel_socket_destroy(listener);
+        CHECK(kernel_socket_poll(client,NULL)&KERNEL_POLLERR);
+        CHECK(kernel_socket_unix_wait_error(client)==-KERNEL_ECONNRESET);
+        CHECK(!kernel_socket_unix_wait_error(client));
+        CHECK(write_buffer(client,"x",1,0)==-KERNEL_EPIPE);
+        kernel_socket_destroy(client);CHECK(!heap_live);
+    }
+    puts("PASS UNIX empty pending child: listener close resets STREAM/SEQ client without needing queued payload, all objects returned");
+}
+static void unix_seqpacket_control(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *socket[2]={0};struct kernel_open_file_description *file[2];
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_SEQPACKET,&socket[0],&socket[1]));
+    for(unsigned i=0;i<2;i++)file[i]=model_socket_file_create(socket[i]);
+    CHECK(!kernel_socket_set_option(socket[1],KERNEL_SOCKET_PASSCRED,1));
+    struct kernel_open_file_description *regular=model_socket_file_create(NULL);
+    model_send_right(file[0],regular);
+    unsigned references=kernel_open_file_references(regular);
+    struct kernel_socket_message failed={.flags=KERNEL_SOCKET_MSG_PEEK};
+    struct kernel_socket_read_request failed_read={0};struct kernel_open_file_description *failed_pin=file[1];
+    heap_fail_after=1;
+    CHECK(kernel_socket_reserve_read(socket[1],NULL,&failed_read,&failed_pin,1,1,&failed)==-KERNEL_ENOMEM);
+    CHECK(!heap_fail_after && !failed_read.socket && failed_pin==file[1] && !socket[1]->read_request);
+    CHECK(kernel_open_file_references(regular)==references && model_uid_account.unix_inflight==1);
+    for(unsigned peek=0;peek<3;peek++) {
+        struct kernel_socket_message message={.flags=peek<2?KERNEL_SOCKET_MSG_PEEK:0};
+        struct kernel_socket_read_request read={0};struct kernel_open_file_description *pin=file[1];
+        CHECK(kernel_socket_reserve_read(socket[1],NULL,&read,&pin,1,1,&message)==1);
+        CHECK(kernel_socket_finish_read(&read,0)==1 && message.control && message.control->count==1);
+        CHECK(message.control->files[0]==regular && message.control->has_credentials);
+        CHECK(kernel_open_file_references(regular)==references+(peek<2));
+        kernel_socket_control_release(&message.control);
+    }
+    CHECK(kernel_open_file_references(regular)==1 && !model_uid_account.unix_inflight);
+    model_put(&regular);model_put(&file[0]);model_put(&file[1]);model_no_control_owners();
+    for(unsigned round=0;round<4;round++) {
+        socket[0]=socket[1]=NULL;CHECK(!kernel_socket_pair(&test_heap,SOCKET_SEQPACKET,&socket[0],&socket[1]));
+        for(unsigned i=0;i<2;i++)file[i]=model_socket_file_create(socket[i]);
+        CHECK(!kernel_socket_set_option(socket[1],KERNEL_SOCKET_PASSCRED,1));
+        model_send_right(file[0],file[1]);model_put(&file[0]);
+        struct root_cycle_gate gate={.lock=PTHREAD_MUTEX_INITIALIZER,.changed=PTHREAD_COND_INITIALIZER,.owner=file[1]};file[1]=NULL;
+        pthread_t thread;CHECK(!pthread_create(&thread,NULL,root_cycle_releaser,&gate));
+        CHECK(!pthread_mutex_lock(&gate.lock));while(gate.phase!=1)CHECK(!pthread_cond_wait(&gate.changed,&gate.lock));
+        unsigned live=heap_live;kernel_socket_rights_service();CHECK(heap_live==live && socket[1]->rights_head);
+        gate.phase=2;CHECK(!pthread_cond_broadcast(&gate.changed));
+        while(gate.phase!=3)CHECK(!pthread_cond_wait(&gate.changed,&gate.lock));
+        CHECK(!pthread_mutex_unlock(&gate.lock) && !pthread_join(thread,NULL));
+        kernel_socket_rights_service();model_no_control_owners();
+        CHECK(!pthread_cond_destroy(&gate.changed) && !pthread_mutex_destroy(&gate.lock));
+    }
+    puts("PASS UNIX SEQ SCM: repeated PEEK duplicates real OFD references, consume returns UID/PID owners; remote final-root handshake enables GC in four rounds");
+}
+static void unix_seqpacket_reservation(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *sender=NULL,*receiver=NULL;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_SEQPACKET,&sender,&receiver));
+    CHECK(write_buffer(sender,"head",4,0)==4 && write_buffer(sender,"tail",4,0)==4);
+    struct reservation_attempt attempts[2]={{.socket=receiver,.actor=1},{.socket=receiver,.actor=2}};
+    pthread_t threads[2];CHECK(!pthread_create(&threads[0],NULL,reserve_concurrently,&attempts[0]));
+    CHECK(!pthread_mutex_lock(&reservation_gate));
+    while(!reservation_first)CHECK(!pthread_cond_wait(&reservation_changed,&reservation_gate));
+    CHECK(!pthread_mutex_unlock(&reservation_gate));
+    CHECK(!pthread_create(&threads[1],NULL,reserve_concurrently,&attempts[1]));
+    CHECK(!pthread_mutex_lock(&reservation_gate));
+    while(!reservation_second)CHECK(!pthread_cond_wait(&reservation_changed,&reservation_gate));
+    reservation_release=1;CHECK(!pthread_cond_broadcast(&reservation_changed));
+    CHECK(!pthread_mutex_unlock(&reservation_gate));
+    CHECK(!pthread_join(threads[0],NULL) && !pthread_join(threads[1],NULL));
+    CHECK(attempts[0].result==4 && attempts[1].result==-KERNEL_EAGAIN);
+    CHECK(!attempts[0].pin && attempts[1].pin==(void *)receiver);
+    kernel_socket_destroy(sender);
+    CHECK(sender->destroying==2 && sender->unix_packets==2);
+    char bytes[4];kernel_socket_copy_read(&attempts[0].read,0,bytes,4);CHECK(!memcmp(bytes,"head",4));
+    CHECK(kernel_socket_finish_read(&attempts[0].read,0)==4 && attempts[0].pin==(void *)receiver);
+    CHECK(sender->unix_packets==1 && !receiver->read_request && receiver->unix_queued==1);
+    struct kernel_socket_address source=read_named_packet(receiver,"tail");kernel_socket_address_release(&source);
+    kernel_socket_destroy(receiver);CHECK(!heap_live);
+    puts("PASS UNIX SEQ concurrent receive: handshake selects one head owner, loser retains pin, sender close preserves reserved and trailing records until exact credit/storage return");
+}
+static void unix_seqpacket_pending_control(void)
+{
+    kernel_socket_network_initialize();
+    const unsigned char name[]={0,'s','e','q','-','g','c'};
+    struct kernel_socket_address address=abstract_address(name,sizeof(name));
+    for(unsigned accept=0;accept<2;accept++) {
+        struct kernel_socket *listener=named_unix_socket(SOCKET_SEQPACKET,name,sizeof(name)),*client=NULL,*child=NULL;
+        struct kernel_open_file_description *listener_file=model_socket_file_create(listener);
+        CHECK(!kernel_socket_listen(listener,1) && !kernel_socket_set_option(listener,KERNEL_SOCKET_PASSCRED,1));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_SEQPACKET,&client));
+        CHECK(!kernel_socket_connect(client,&address,1));
+        struct kernel_open_file_description *client_file=model_socket_file_create(client);
+        model_send_right(client_file,client_file);model_put(&client_file);
+        unsigned live=heap_live;kernel_socket_rights_service();
+        CHECK(heap_live==live && listener->pending_head->child->rights_head && model_uid_account.unix_inflight==1);
+        if(accept) {
+            struct kernel_open_file_description *accepted=model_socket_file_create(NULL);
+            CHECK(!kernel_socket_accept(listener,&child,accepted));model_socket_file(accepted)->socket=child;
+            CHECK(child->gc_file==accepted && !child->listener);
+            model_put(&listener_file);live=heap_live;kernel_socket_rights_service();
+            CHECK(heap_live==live && child->rights_head && model_uid_account.unix_inflight==1);
+            model_put(&accepted);
+        } else model_put(&listener_file);
+        kernel_socket_rights_service();model_no_control_owners();
+    }
+    puts("PASS UNIX SEQ pending SCM: listener roots unaccepted rights, accept transfers root to OFD, final close returns socket/OFD/PID/UID/heap owners");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
-    if (!strcmp(argv[1], "unix-control-cleanup")) unix_control_cleanup_failure();
+    if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
+    else if (!strcmp(argv[1], "unix-seq-control")) unix_seqpacket_control();
+    else if (!strcmp(argv[1], "unix-seq-reservation")) unix_seqpacket_reservation();
+    else if (!strcmp(argv[1], "unix-seq-pending-control")) unix_seqpacket_pending_control();
+    else if (!strcmp(argv[1], "unix-late-source")) unix_late_source();
+    else if (!strcmp(argv[1], "unix-pending-reset")) unix_pending_reset();
+    else if (!strcmp(argv[1], "unix-control-cleanup")) unix_control_cleanup_failure();
     else if (!strcmp(argv[1], "unix-control-owner")) unix_control_owners();
     else if (!strcmp(argv[1], "unix-write-notify")) unix_write_completion_notifications();
     else if (!strcmp(argv[1], "unix-stream-state")) unix_stream_receive_state();
     else if (!strcmp(argv[1], "unix-space-topology")) unix_space_topology();
+    else if (!strcmp(argv[1], "unix-shutdown-state")) unix_shutdown_states();
     else if (!strcmp(argv[1], "unix-dgram-shutdown")) unix_datagram_read_shutdown();
     else if (!strcmp(argv[1], "unix-dgram-reconnect")) unix_datagram_reconnect_receive();
     else if (!strcmp(argv[1], "unix-listener-lookup-close")) unix_listener_lookup_close();
