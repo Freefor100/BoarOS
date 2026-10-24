@@ -105,6 +105,8 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 
 fixture runner 的 `--host-vcpu-cpus 0,2 --host-io-cpu 4` 通过QMP暂停启动，核对真实vCPU线程、设置并读回亲和性后恢复；主线程及已有I/O线程留在I/O核，后续块I/O worker沿QEMU主线程创建规则继承。`--qemu-seed` 写入匹配身份；同一比较组使用同一ELF、工作量、输入和完成条件，before/control内核逐字节一致。正式耗时使用关闭诊断的内核，观测版本单独解释锁与日志经过时间。原格式记录按整行、字段集合和唯一性解析，尾随垃圾、重复字段或损坏的额外记录直接报错。
 
+QMP 的 cpu-index 标识虚拟硬件 CPU，BoarOS 的逻辑 CPU0 则是 OpenSBI 选出的 boot hart。需要比较 CPU0 协议等固定职责时，`pin_qemu_threads` 可同时接收 RV 内核 ELF 和 GDB socket：在物理 kernel_main 入口核对 mhartid、a0 和 boot_cpu，删除断点并断开调试器，确认客机保持暂停，再按逻辑 CPU 顺序绑定宿主核后续跑。该入口早于 secondary 和用户任务启动。GDB 或映射校验失败时，QMP 停止并确认暂停后传播错误，调用者负责终止 QEMU。未提供这两个参数的调用沿用物理 CPU 顺序。
+
 C2 按 rank 10/15/20/21/30/31/32/35/40/other 记录尝试、取得、阻塞、唤醒、重阻塞、取消及等待/持有直方图。
 资格等待包含 grant 前实际发生的诊断工作，按观察到的经过时间解释。
 等待止于 metadata 资格中实际授予 writer/readers 的时刻，持有由该 grant 开始、
