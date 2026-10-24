@@ -245,7 +245,7 @@ static void cache_wake(struct kernel_wait_queue *queue)
     KERNEL_IRQ_SCOPE(irq);
     enum kernel_scheduler_status status = kernel_wait_queue_wake_all(queue);
     if (status && !(status == KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED &&
-        !queue->registrations && !queue->borrows)) __builtin_trap();
+        !__atomic_load_n(&queue->registrations,__ATOMIC_ACQUIRE) && !queue->borrows)) __builtin_trap();
 }
 
 /* A pool outlives the cache while a journal/DMA borrower still owns a

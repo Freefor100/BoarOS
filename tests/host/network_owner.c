@@ -21,6 +21,7 @@ static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
 static unsigned heap_allocations,protocol_services,allow_ofd_release;
+static size_t heap_last_allocation_size;
 static unsigned space_callbacks;
 static _Thread_local unsigned reservation_actor,state_acquires;
 static struct kernel_socket *lookup_close_target;
@@ -169,7 +170,7 @@ int kernel_credentials_capable(const struct kernel_credentials *credentials, uns
 enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task, uint32_t signal, kernel_pid_t sender)
 { (void)task; (void)signal; (void)sender; abort(); }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
-{ CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
+{ CHECK(heap == &test_heap); *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
 void kernel_heap_release(struct kernel_heap *heap, void *allocation)
@@ -648,6 +649,39 @@ static void unix_final_payload(void)
         !sender->tx_reserved && !sender->unix_memory && !sender->unix_packets && sender->pending_error==-KERNEL_ECONNRESET);
     kernel_socket_destroy(sender);
     puts("PASS UNIX final queue payload: half-close before/during send, gather fill, fault prefix and peer-close reservation rollback");
+}
+
+static void unix_stream_packet_boundary(void)
+{
+    kernel_socket_network_initialize();
+    static unsigned char source[32768],received[32768];
+    for(unsigned i=0;i<sizeof(source);i++)source[i]=(unsigned char)(i*19U+7U);
+    struct kernel_socket *sender=NULL,*receiver=NULL;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&sender,&receiver));
+    const int sendbuf[]={106496,0,4<<20};
+    for(unsigned i=0;i<sizeof(sendbuf)/sizeof(sendbuf[0]);i++) {
+        CHECK(!kernel_socket_set_option(sender,KERNEL_SOCKET_SNDBUF,sendbuf[i]));
+        uint32_t packet_limit=sender->tx_limit/2U;
+        if(packet_limit>32768U)packet_limit=32768U;
+        uint32_t payload_limit=packet_limit-(uint32_t)sizeof(struct socket_packet);
+        const struct kernel_uaccess_iovec iov[]={{(uintptr_t)source,4093},
+            {(uintptr_t)source+4093,sizeof(source)-4093}};
+        struct kernel_uaccess_iov_cursor cursor={iov,2,0,0};
+        struct kernel_open_file_description *pin=(void *)sender;
+        unsigned before=heap_allocations;
+        int result=kernel_socket_write_unix(&pin,NULL,&cursor,sizeof(source),KERNEL_SOCKET_MSG_DONTWAIT,NULL);
+        CHECK(result==(int)payload_limit && pin==(void *)sender && heap_allocations==before+1);
+        CHECK(heap_last_allocation_size==packet_limit && sender->unix_memory==packet_limit &&
+            sender->unix_packets==1 && !sender->tx_reserved && receiver->rx_bytes==payload_limit);
+        struct kernel_socket_read_request read={0};pin=(void *)receiver;
+        CHECK(kernel_socket_reserve_read(receiver,NULL,&read,&pin,sizeof(received),1)==result && !pin);
+        kernel_socket_copy_read(&read,0,received,payload_limit);
+        CHECK(!memcmp(received,source,payload_limit));
+        CHECK(kernel_socket_finish_read(&read,0)==payload_limit && pin==(void *)receiver &&
+            !sender->unix_memory && !sender->unix_packets && !sender->tx_reserved && !receiver->rx_bytes);
+    }
+    kernel_socket_destroy(sender);kernel_socket_destroy(receiver);CHECK(!heap_live);
+    puts("PASS UNIX stream packet boundary: metadata fits half-sndbuf/32KiB allocation, gather prefix content and sender accounting returned");
 }
 
 static void receive_payload(void)
@@ -1802,6 +1836,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "minshall")) minshall_send();
     else if (!strcmp(argv[1], "nodelay-capacity")) nodelay_pending(1);
     else if (!strcmp(argv[1], "unix-payload")) unix_final_payload();
+    else if (!strcmp(argv[1], "unix-packet-boundary")) unix_stream_packet_boundary();
     else if (!strcmp(argv[1], "receive-payload")) receive_payload();
     else if (!strcmp(argv[1], "udp-payload")) udp_final_payload();
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();

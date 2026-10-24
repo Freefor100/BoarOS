@@ -35,6 +35,13 @@ static _Thread_local int segment_parking;
 static pthread_barrier_t segment_committed, segment_woken;
 static struct kernel_task *segment_tasks;
 static unsigned segment_count, segment_notified;
+static _Thread_local unsigned forbid_wait_lock;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    assert(!(forbid_wait_lock && lock==&kernel_wait_domain));
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
@@ -181,7 +188,9 @@ static void *wake_worker(void *argument)
 {
     (void)argument;
     initialize(7);
-    assert(kernel_wait_queue_wake_all(&callbacks) == KERNEL_SCHEDULER_STATUS_OK);
+    struct kernel_wait_cursor cursor={0};
+    assert(kernel_wait_cursor_prepare(&callbacks,&cursor));
+    kernel_wait_cursor_wake(&cursor,1);
     return 0;
 }
 static void callback_lifetime(void)
@@ -199,6 +208,11 @@ static void callback_lifetime(void)
     barrier(&callback_entered);
     /* Detach a whole successor chain while the first callback owns the cursor. */
     for (unsigned i = 0; i < 64; i++) kernel_wait_queue_remove(&nodes[i]);
+    struct kernel_wait_cursor empty={0};
+    forbid_wait_lock=1;
+    assert(!kernel_wait_cursor_prepare(&callbacks,&empty) && !empty.queue);
+    forbid_wait_lock=0;
+    assert(callbacks.borrows);
     assert(kernel_wait_queue_close(&callbacks) == KERNEL_SCHEDULER_STATUS_OK);
     assert(kernel_wait_queue_destroy(&callbacks) == KERNEL_SCHEDULER_STATUS_BUSY);
     barrier(&callback_release);
@@ -235,6 +249,54 @@ static void close_lifetime(void)
     assert(kernel_wait_queue_destroy(&closing) == KERNEL_SCHEDULER_STATUS_OK);
     assert(!pthread_barrier_destroy(&close_entered) && !pthread_barrier_destroy(&close_released));
 }
+static struct kernel_wait_queue published_queue;
+static pthread_barrier_t publish_entered,publish_completed;
+static unsigned empty_notification;
+static void *published_notification_worker(void *unused)
+{
+    (void)unused;initialize(11);
+    if(empty_notification) {
+        barrier(&publish_entered);
+        struct kernel_wait_cursor cursor={0};
+        forbid_wait_lock=1;
+        assert(!kernel_wait_cursor_prepare(&published_queue,&cursor) && !cursor.queue);
+        forbid_wait_lock=0;
+        barrier(&publish_completed);
+    } else {
+        struct kernel_wait_token token={0};
+        assert(!kernel_wait_prepare(&published_queue,0,0,&token));
+        barrier(&publish_entered);barrier(&publish_completed);
+        enum kernel_wait_wake_reason reason;
+        assert(!kernel_wait_park(&token,&reason) && reason==KERNEL_WAIT_WOKEN);
+        assert(!task.blocked && !kernel_wait_finish(&token));
+    }
+    return 0;
+}
+static void published_notifications(void)
+{
+    for(unsigned empty=0;empty<2;empty++) {
+        empty_notification=empty;kernel_wait_queue_init(&published_queue);
+        assert(!pthread_barrier_init(&publish_entered,0,2));
+        assert(!pthread_barrier_init(&publish_completed,0,2));
+        pthread_t worker;assert(!pthread_create(&worker,0,published_notification_worker,0));
+        if(empty) {
+            /* 无登记的通知不能等待另一CPU持有的全局调度锁。 */
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            barrier(&publish_entered);barrier(&publish_completed);
+        } else {
+            barrier(&publish_entered);
+            assert(__atomic_load_n(&published_queue.registrations,__ATOMIC_ACQUIRE)==1);
+            struct kernel_wait_cursor cursor={0};
+            assert(!kernel_wait_cursor_prepare(&published_queue,&cursor) && !cursor.queue);
+            barrier(&publish_completed);
+        }
+        assert(!pthread_join(worker,0));
+        assert(!published_queue.registrations && !published_queue.borrows);
+        assert(!kernel_wait_queue_close(&published_queue) && !kernel_wait_queue_destroy(&published_queue));
+        assert(!pthread_barrier_destroy(&publish_entered) && !pthread_barrier_destroy(&publish_completed));
+    }
+    puts("wait: published registrations notify before park; empty notification completes while another CPU owns wait domain");
+}
 static void early_and_multi(void)
 {
     struct kernel_wait_queue queues[2];
@@ -266,7 +328,8 @@ static void early_and_multi(void)
     kernel_wait_cursor_advance(&cursor);
     assert(!cursor.node);
     kernel_wait_cursor_end(&cursor);
-    assert(kernel_wait_node_move(&task.node, &queues[1]) == KERNEL_SCHEDULER_STATUS_OK);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(kernel_wait_node_move_locked(&task.node, &queues[1]) == KERNEL_SCHEDULER_STATUS_OK); }
     assert(task.node.queue == &queues[1]);
     kernel_wait_task_unpin(&task);
     assert(kernel_wait_queue_wake_one(&queues[1]) == KERNEL_SCHEDULER_STATUS_OK);
@@ -566,6 +629,7 @@ int main(void)
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
     initialize(0);
     kernel_wait_domain_init();
+    published_notifications();
     owner_failures();
     early_and_multi();
     finish_many();

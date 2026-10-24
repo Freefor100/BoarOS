@@ -101,13 +101,17 @@ credit。SO_SNDBUF按Linux倍增、下限与4MiB设置上限；固定双侧默�
 新packet可在当前内存低于sndbuf时分配一次，计费包含实际请求的payload及本地
 packet元数据；内部不复制Linux私有skb布局，不能比较偶然的成功发送次数。
 POLLOUT使用当前发送者内存的四分之一门限，实际write仍独立检查完整状态和
-内存资格；poll不预留内存。STREAM按sndbuf/2-64及有界片段发送，部分读取不
-提前返还该packet的内存。DGRAM消息上限为sndbuf-32，一次write/writev形成
+内存资格；poll不预留内存。STREAM把完整packet限制为min(sndbuf/2,32KiB)，载荷扣除实际包头，
+避免包头使整块申请跨过buddy边界。部分读取不提前返还该packet的内存。DGRAM消息上限为sndbuf-32，一次write/writev形成
 一条消息；零消息仍占有真实metadata，队列有限。
 
-DGRAM在分配和usercopy前登记发送请求及内存预留，复制完成后才移动整包owner；
+连接UNIX发送在同一次端点保护内检查状态、登记请求、借用对端并预留额度；
+需要等待时沿原等待协议释放实际外层保护并重试。复制完成后同次发布消息并撤销
+请求登记，载荷复制在锁外进行。DGRAM在分配和usercopy前完成内存预留，复制完成后才移动整包owner；
 fault/OOM/取消先释放取得的内存，再归还预留与OFD pin，不发布前缀。截断读取或
-接收fault丢弃整条datagram并归还其全部计费；sender关闭后仍可读其queued内容。
+接收fault丢弃整条datagram并归还其全部计费；DGRAM出队时在同一保护内归还
+sender额度与源地址引用，实际名称、端点和packet存储在锁外释放，释放后仍推进
+共享heap的INET接收容量等待。sender关闭后仍可读其queued内容。
 等待者被发送缓存增大、packet最后释放或peer状态变化唤醒，重新核对状态。
 STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带未读内容
 关闭时可交付一次ECONNRESET。DGRAM关闭peer后的首次send为ECONNREFUSED，
@@ -133,7 +137,7 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 
 `tests/socket-accept-allocation-host.sh` 在真实 OFD 分配处注入 EMPTY，检查连接保留、重试双向通信及 FD、凭据和堆页归还；另覆盖等待失败和地址输出失败的不同副作用。`tests/host/network_owner.py --case unix-space-topology` 检查互连流量不触发空间回调、断连恢复单向订阅及重连唤醒；`unix_named` 用户程序通过实际 epoll 等待与队列空间释放核对跨核通知。
 
-`unix-write-notify` 直接检查成功发送不产生无状态变化的本端通知，同时检查消息消费和复制取消仍通知发送者。`tcp-batch` 在真实 tcp_write 的 COPY 之间握手，让另一 CPU 预约剩余额度，检查整批接纳期间额度保持保守且最终归还；相同数据分段不会增加端点保护次数。
+`unix-packet-boundary` 覆盖默认、最小和最大SNDBUF的完整分配大小、向量前缀及计费归还。`unix-write-notify` 直接检查成功发送不产生无状态变化的本端通知，同时检查消息消费和复制取消仍通知发送者。`tcp-batch` 在真实 tcp_write 的 COPY 之间握手，让另一 CPU 预约剩余额度，检查整批接纳期间额度保持保守且最终归还；相同数据分段不会增加端点保护次数。
 
 ```sh
 make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host
