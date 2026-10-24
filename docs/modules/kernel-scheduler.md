@@ -131,7 +131,14 @@ IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡
 缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
 后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
 
-sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、用户任务跨核执行、cgroup 配额或 deadline scheduler；独立 RV 两核仅接纳受控内核任务。
+sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～4核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
+
+
+RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
+
+RTTIME对每线程连续RT执行计量。各CPU的timer tick仅在当前用户线程运行FIFO/RR且软限额有限时推进watchdog；同一全局tick跨核只计一次。超过按100Hz向上取整的软／硬阈值后，线程进入现有CPU timer活动索引，由CPU0检查并向线程组发送SIGXCPU，软限额增加1,000,000us，或在硬限额到达时发送SIGKILL。仅有RTTIME待检查的条目不采样完整CPU clock；普通trap不新增watchdog锁或采样。
+
+连续计数在调度器确定任务带着BLOCKED状态离开CPU时清零。PREPARED通知、COMMITTED后在切换前收到通知、抢占、yield、迁移、CPU0服务及RT带宽节流都保留计数；这些交接不会被解释为完成一次阻塞。直接host检查以手动tick覆盖跨CPU去重、软硬阈值及三种等待交错，真实消费者通过父子握手确认阻塞后继续执行。
 
 `make test-sched-concurrency-host`直接执行生产策略/选择/等待交接，在2/4线程握手中验证唯一执行owner、旧栈交接及IRQ恢复；保护CPU独立记账和公开策略入口的同域修改。该证据不替代客户机多核。
 

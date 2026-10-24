@@ -1880,7 +1880,7 @@ test-sched-policy-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -Iinclude \
 		-Wl,--gc-sections -Wl,--wrap=kernel_task_sched_get -Wl,--wrap=kernel_task_sched_set \
 		tests/host/sched_syscall_test.c kernel/syscall/sched.c kernel/sched/policy.c \
-		kernel/sched/scheduling.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c -o build/host/sched-syscall
+		kernel/sched/scheduling.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c -o build/host/sched-syscall
 	build/host/sched-syscall
 
 .PHONY: test-multi-disk-rt-riscv
@@ -2700,3 +2700,7 @@ test-event-fd-host:
 		-fsanitize=address,undefined tests/host/event_fd.c kernel/raw_lock.c tests/host/cpu_context.c \
 		-o build/host/event-fd/cases-$$shift; \
 	build/host/event-fd/cases-$$shift; done
+
+.PHONY: test-rt-limits-host
+test-rt-limits-host:
+	sh tests/rt-limits-host.sh

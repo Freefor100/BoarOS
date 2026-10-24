@@ -5,6 +5,7 @@
 #include <arch/timer.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
+#include <kernel/tick.h>
 
 static int is_rt(const struct kernel_task *task)
 {
@@ -434,6 +435,14 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
         cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
     if (!next) next = cpu->idle;
     if (next == previous) return 0;
+    /* COMMITTED 后提前通知已把状态改回 READY；只有确实带着 BLOCKED
+     * 离开 CPU 的等待才中断连续 RT 执行，迁移和节流沿 READY 交接。 */
+    if (previous->state == KERNEL_THREAD_STATE_BLOCKED) {
+        previous->rttime_ticks = 0;
+        if (__atomic_fetch_and(&previous->resource_flags,
+                ~KERNEL_RESOURCE_RTTIME_DUE,__ATOMIC_RELAXED) & KERNEL_RESOURCE_RTTIME_DUE)
+            scheduler_cpu_timer_update_locked(previous,1);
+    }
 #if BOAROS_USER_SMP
     if (previous->state==KERNEL_THREAD_STATE_EXITED) {
         scheduler_user_reservation_release_locked(previous);
@@ -722,9 +731,12 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
             struct kernel_sched_policy updated = task->scheduling;
             result = kernel_sched_policy_set(&updated, policy, priority, keep_policy);
             if (!result && !kernel_credentials_capable(kernel_credentials_task_locked(caller),KERNEL_CAP_SYS_NICE)) {
+                uint64_t rtprio=task->limits->values[KERNEL_RLIMIT_RTPRIO].current;
                 if(!sched_owner_locked(caller,task) ||
-                    updated.priority>task->scheduling.priority ||
-                    (updated.priority && updated.policy!=task->scheduling.policy) ||
+                    (updated.priority &&
+                     ((updated.policy!=task->scheduling.policy && !rtprio) ||
+                      (updated.priority>task->scheduling.priority &&
+                       (uint64_t)updated.priority>rtprio))) ||
                     (task->scheduling.policy==5 && updated.policy!=5) ||
                     (task->scheduling.reset_on_fork && !updated.reset_on_fork))result=-KERNEL_EPERM;
             }
@@ -811,4 +823,46 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
     if (!result) scheduler_rearm_timer();
     arch_interrupt_restore(irq);
     return result;
+}
+
+/* Linux 的 RT watchdog 每个全局 tick 至多记一次；跨核迁移不会把
+ * 同一 tick 变成两份预算，普通 trap 与未启用限制的任务不进入索引。 */
+void scheduler_rt_watchdog_locked(struct kernel_task *task,uint64_t stamp)
+{
+    if (!task || !task->arch.user_mode || !task->scheduling.priority || !task->limits) return;
+    const struct kernel_rlimit64 *limit=&task->limits->values[KERNEL_RLIMIT_RTTIME];
+    uint64_t soft=limit->current,hard=limit->maximum;
+    if (soft==KERNEL_RLIM_INFINITY) return;
+    if (task->rttime_stamp!=stamp) {
+        if (task->rttime_ticks!=UINT64_MAX) task->rttime_ticks++;
+        task->rttime_stamp=stamp;
+    }
+    uint64_t usec_per_tick=UINT64_C(1000000)/KERNEL_TICKS_PER_SECOND;
+    uint64_t earliest=soft<hard?soft:hard;
+    uint64_t threshold=earliest/usec_per_tick+(earliest%usec_per_tick!=0);
+    if (task->rttime_ticks>threshold &&
+        !(__atomic_fetch_or(&task->resource_flags,KERNEL_RESOURCE_RTTIME_DUE,
+                            __ATOMIC_RELAXED)&KERNEL_RESOURCE_RTTIME_DUE))
+        scheduler_cpu_timer_update_locked(task,1);
+}
+
+unsigned scheduler_rt_limit_check_locked(struct kernel_task *task)
+{
+    if (!(__atomic_fetch_and(&task->resource_flags,~KERNEL_RESOURCE_RTTIME_DUE,
+                            __ATOMIC_RELAXED)&KERNEL_RESOURCE_RTTIME_DUE)) return 0;
+    struct kernel_rlimit64 *limit=&task->limits->values[KERNEL_RLIMIT_RTTIME];
+    uint64_t soft=limit->current,hard=limit->maximum;
+    unsigned fired=0;
+    if (soft!=KERNEL_RLIM_INFINITY) {
+        uint64_t usec_per_tick=UINT64_C(1000000)/KERNEL_TICKS_PER_SECOND;
+        uint64_t ticks=task->rttime_ticks;
+        uint64_t usec=ticks>UINT64_MAX/usec_per_tick?UINT64_MAX:ticks*usec_per_tick;
+        if (hard!=KERNEL_RLIM_INFINITY && usec>=hard) fired=8U;
+        else if (usec>=soft) {
+            __atomic_store_n(&limit->current,soft+UINT64_C(1000000),__ATOMIC_RELAXED);
+            fired=4U;
+        }
+    }
+    scheduler_cpu_timer_update_locked(task,1);
+    return fired;
 }

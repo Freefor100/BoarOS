@@ -61,6 +61,7 @@ void scheduler_cpu_timer_update_locked(struct kernel_task *task,unsigned thread)
 {
     struct kernel_cpu_timer_index *index=&task->cpu_timer_index[thread];
     int active=index->timers[0]||index->timers[1]||index->timers[2]||
+        (thread&&(__atomic_load_n(&task->resource_flags,__ATOMIC_RELAXED)&KERNEL_RESOURCE_RTTIME_DUE))||
         (!thread&&(task->cpu_timers[0].expires||task->cpu_timers[1].expires||
                    task->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY));
     active=active&&cpu_target_live(task,thread);
@@ -424,7 +425,7 @@ void scheduler_cpu_timer_expire(void)
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);struct kernel_avl_node *node=kernel_avl_last(cpu_root);if(!node)return;maximum=node->key;}
     for(;;) {
         struct scheduler_cpu_clock clock={0};SCHEDULER_TASK_BORROW(target,0);
-        struct kernel_cpu_timer_index *index;
+        struct kernel_cpu_timer_index *index;int sample_clock;
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);struct kernel_avl_node *node=kernel_avl_after(cpu_root,last);
             if(!node||node->key>maximum)break;
@@ -432,12 +433,15 @@ void scheduler_cpu_timer_expire(void)
             target=index->task;scheduler_task_get_locked(target);
             clock=(struct scheduler_cpu_clock){.identity=process_identity(target,index->thread?KERNEL_PID_TID:KERNEL_PID_TGID),.thread=index->thread};
             kernel_pid_get(clock.identity);
+            sample_clock=!index->thread||index->timers[0]||index->timers[1]||index->timers[2];
         }
-        struct kernel_task_usage usage;int error=scheduler_cpu_clock_sample(&clock,&usage);unsigned fired=0;
+        struct kernel_task_usage usage={0};
+        int error=sample_clock?scheduler_cpu_clock_sample(&clock,&usage):0;unsigned fired=0;
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-            if(!error&&index->indexed&&index->node.key==last&&cpu_target_locked(&clock)==target&&!clock.thread)
-                fired=signal_cpu_timer_check_locked(target,&usage);
+            if(!error&&index->indexed&&index->node.key==last&&cpu_target_locked(&clock)==target)
+                fired=clock.thread?scheduler_rt_limit_check_locked(target):
+                    signal_cpu_timer_check_locked(target,&usage);
         }
         signal_cpu_timer_notify(target,fired);
         for(;;) {

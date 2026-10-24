@@ -1462,7 +1462,8 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
         current->magic != KERNEL_THREAD_MAGIC) {
         return;
     }
-    (void)from_user; /* 用户/内核用量由执行边界结算，tick只保留idle与负载采样。 */
+    scheduler_rt_watchdog_locked(current,kernel_tick_count());
+    (void)from_user; /* 用户/内核CPU时间仍由执行边界结算。 */
 }
 
 uint64_t kernel_scheduler_idle_ticks(void)

@@ -83,6 +83,8 @@ int scheduler_cpu_clock_resolve(struct kernel_task *,int32_t,int,struct schedule
 int scheduler_cpu_clock_sample(const struct scheduler_cpu_clock *,struct kernel_task_usage *);
 void scheduler_cpu_timer_update_locked(struct kernel_task *,unsigned);
 void scheduler_cpu_timer_expire(void);
+void scheduler_rt_watchdog_locked(struct kernel_task *,uint64_t stamp);
+unsigned scheduler_rt_limit_check_locked(struct kernel_task *);
 unsigned signal_cpu_timer_check_locked(struct kernel_task *,const struct kernel_task_usage *);
 void signal_cpu_timer_notify(struct kernel_task *,unsigned);
 

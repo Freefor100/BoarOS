@@ -55,6 +55,16 @@ int scheduler_cpu_clock_sample(const struct scheduler_cpu_clock *c,struct kernel
  *u=(struct kernel_task_usage){.user_ns=cpu_user,.kernel_ns=cpu_kernel};return 0;}
 unsigned signal_cpu_timer_check_locked(struct kernel_task *t,const struct kernel_task_usage *u)
 {assert(t==&task&&u->user_ns==cpu_user&&kernel_cpu_current()->raw_locks);return 0;}
+static unsigned rt_checks;
+unsigned scheduler_rt_limit_check_locked(struct kernel_task *t)
+{
+    assert(t==&task&&kernel_cpu_current()->raw_locks);
+    if(t->resource_flags&KERNEL_RESOURCE_RTTIME_DUE){
+        rt_checks++;t->resource_flags&=~KERNEL_RESOURCE_RTTIME_DUE;
+        scheduler_cpu_timer_update_locked(t,1);
+    }
+    return 0;
+}
 void signal_cpu_timer_notify(struct kernel_task *t,unsigned fired){assert(t==&task&&!fired);}
 void signal_timer_notify(struct kernel_task *t,unsigned sig){(void)t;(void)sig;abort();}
 int signal_timer_disposition_ignored_locked(struct kernel_pid *p,int thread,unsigned sig)
@@ -234,9 +244,20 @@ static void cpu_sleep_owner(void)
     assert(kernel_posix_cpu_sleep(&task,2,1,800,&deadline,&remaining)==-KERNEL_ENOMEM);
     allocation_fail=0;finish();
 }
+static void rttime_index_only(void)
+{
+    init();unsigned sampled=cpu_samples;rt_checks=0;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+     task.resource_flags|=KERNEL_RESOURCE_RTTIME_DUE;
+     scheduler_cpu_timer_update_locked(&task,1);}
+    assert(task.cpu_timer_index[1].indexed);
+    scheduler_cpu_timer_expire();
+    assert(rt_checks==1&&cpu_samples==sampled&&!task.cpu_timer_index[1].indexed);
+    assert(!task.storage_borrows&&pid.references==1);finish();
+}
 int main(void)
 {
-    cpu_sleep_owner();
+    rttime_index_only();cpu_sleep_owner();
     reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase and completion/delete owner passed");return 0;
 }
