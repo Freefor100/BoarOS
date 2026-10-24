@@ -376,6 +376,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/posix_timer.c \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
+	kernel/sched/pidfd.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -401,6 +402,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
+	kernel/rlimit.c \
 	kernel/syscall/credentials.c \
 	kernel/syscall/capability.c \
 	kernel/syscall/random.c \
@@ -1897,7 +1899,10 @@ test-multi-disk-io-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
 		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64)
 
-.PHONY: test-pid-object-host test-random-host
+.PHONY: test-pid-object-host test-pidfd-host test-random-host
+test-pidfd-host:
+	sh tests/host/pidfd.sh
+
 test-pid-object-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
@@ -1945,7 +1950,7 @@ test-sched-policy-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -Iinclude \
 		-Wl,--gc-sections -Wl,--wrap=kernel_task_sched_get -Wl,--wrap=kernel_task_sched_set \
 		tests/host/sched_syscall_test.c kernel/syscall/sched.c kernel/sched/policy.c \
-		kernel/sched/scheduling.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c -o build/host/sched-syscall
+		kernel/sched/scheduling.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c -o build/host/sched-syscall
 	build/host/sched-syscall
 
 .PHONY: test-multi-disk-rt-riscv
@@ -2479,7 +2484,7 @@ test-scheduler-stack-slots-host:
 test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
 		build/host/scheduler-handoff-$$shift; \
 	done
 
@@ -2549,9 +2554,13 @@ build/riscv/mm-msg-cost: tests/workloads/cost/mm-msg.c tests/accounting/posix.c 
 	@mkdir -p $(@D)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
 
+build/riscv/rlimits-pidfd-cost: tests/workloads/cost/rlimits-pidfd.c tests/workloads/cost/mm-msg.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
+	@mkdir -p $(@D)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
 	build/host/sched-concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
 	build/host/process-child-links
@@ -2568,13 +2577,13 @@ run-user-smp-riscv: kernel-rv-user-smp
 .PHONY: test-socket-protocol-host
 test-socket-protocol-host:
 	@mkdir -p $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 	$(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 
 test-user-smp-host:
 	@mkdir -p build/host/mm
 	$(MAKE) test-service-scope-host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_detach_range,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
@@ -2800,3 +2809,7 @@ test-event-fd-host:
 		-fsanitize=address,undefined tests/host/event_fd.c kernel/raw_lock.c tests/host/cpu_context.c \
 		-o build/host/event-fd/cases-$$shift; \
 	build/host/event-fd/cases-$$shift; done
+
+.PHONY: test-rt-limits-host
+test-rt-limits-host:
+	sh tests/rt-limits-host.sh

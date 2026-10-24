@@ -11,6 +11,7 @@ _Thread_local uintptr_t sync_test_irq;
 static struct kernel_cpu cpus[2];
 static _Thread_local struct kernel_cpu *active;
 static struct kernel_task tasks[6];
+static struct kernel_resource_limits limits[6];
 static struct kernel_pid ids[7];
 static uint64_t bitmap[2];
 static unsigned all_steps, ancestry_steps;
@@ -116,6 +117,8 @@ static void setup(void)
     scheduler.identities = (struct kernel_pid_registry){.numbers = &scheduler.pid_allocator, .next_generation = 1};
     for (unsigned i = 0; i < 6; i++) {
         struct kernel_task *task = &tasks[i];
+        task->limits=&limits[i];
+        limits[i].values[KERNEL_RLIMIT_RSS].current=UINT64_MAX;
         task->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1);
         assert(task->exec_security);
         assert(kernel_pid_publish(&scheduler.identities, &ids[i]) == KERNEL_PID_STATUS_OK);
@@ -129,6 +132,7 @@ static void setup(void)
     }
     /* Task 3 is a member of task 2; task 4 is outside init's ancestry. */
     kernel_pid_detach(&tasks[2].identities[KERNEL_PID_TGID]);
+    tasks[2].limits=tasks[1].limits;
     tasks[2].group_leader = &tasks[1]; tasks[2].parent = 0;
     tasks[1].group_next = tasks[1].group_previous = &tasks[2];
     tasks[2].group_next = tasks[2].group_previous = &tasks[1];
@@ -170,7 +174,16 @@ static void lookup_cases(void)
     assert(!kernel_proc_process_identity(2, &token));
     assert(!kernel_proc_next_thread(2, ids[1].generation, 0, &pid, &token) && pid == 2);
     tasks[2].state = KERNEL_THREAD_STATE_EXITED;
-    assert(kernel_proc_process_identity(2, &token) == -KERNEL_ENOENT);
+    /* 停止执行并不撤PID/TID；真实reap前仍可观察退出线程和线程组。 */
+    assert(!kernel_proc_thread_identity(2, ids[1].generation, 3, &token));
+    assert(!kernel_proc_process_identity(2, &token));
+    assert(!kernel_proc_next_thread(2, ids[1].generation, 2, &pid, &token) && pid == 3);
+    tasks[2].retirement=1;
+    assert(kernel_proc_thread_identity(2, ids[1].generation, 3, &token)==-KERNEL_ENOENT);
+    tasks[2].retirement=0;
+    tasks[2].group_leader=&tasks[2];
+    assert(kernel_proc_thread_identity(0,0,3,&token)==-KERNEL_ENOENT);
+    tasks[2].group_leader=&tasks[1];
     tasks[1].state = KERNEL_THREAD_STATE_EXITED; tasks[1].group_members = 1;
     assert(!kernel_proc_process_identity(2, &token));
     tasks[1].state = KERNEL_THREAD_STATE_READY;

@@ -61,9 +61,9 @@ struct kernel_pid {
     kernel_pid_t number;
     uint32_t references;
     /* 状态与代次共用一字，保持64字节slab；引用仍为完整32位。
-     * 状态变更受identity域保护；3是损坏编码，不是可恢复状态。 */
+     * 状态变更受identity域保护；数字与存储寿命分别结束。 */
     uint64_t generation : 62;
-    uint64_t published : 2; /* 0 private/reserved, 1 indexed, 2 retired */
+    uint64_t published : 2; /* 0 reserved, 1 indexed, 2 detached, 3 retired */
     struct kernel_pid_registry *registry;
     struct kernel_pid *hash_next;
     struct kernel_pid_member *members[KERNEL_PID_ROLES];
@@ -72,7 +72,8 @@ _Static_assert(KERNEL_PID_GENERATION_MAX <= (UINT64_MAX >> 2U),
                "legal PID generations must fit beside the state bits");
 /* reserve owns a number and generation but is invisible to find. Roles may
  * be prepared while private; publish_reserved commits the lookup identity.
- * Final put retires either state and leaves heap disposal to the caller. */
+ * Last-role detach removes the lookup/number while references retain storage.
+ * Final put retires storage and leaves heap disposal to the caller. */
 enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
                                          struct kernel_pid *prepared);
 enum kernel_pid_status kernel_pid_publish_reserved(struct kernel_pid *prepared);

@@ -16,6 +16,7 @@
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
+#include <kernel/pidfd.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
 #include <kernel/socket_call.h>
@@ -595,6 +596,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
             old_identity = process_identity(task, KERNEL_PID_TID);
             kernel_pid_get(old_identity);
             identity_adopt(task, leader);
+            /* 身份转移即释放旧容器的线程配额，存储回收可继续延后。 */
+            kernel_nproc_release_locked(leader);
             task->proc_start_ticks = leader->proc_start_ticks;
             task->parent = leader->parent;
             task->previous_sibling = leader->previous_sibling;
@@ -614,14 +617,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->child_usage = leader->child_usage;
         task->group_pending = leader->group_pending;
         task->group_child_info = leader->group_child_info;
-        task->nofile_limit = leader->nofile_limit;
-        task->stack_limit = leader->stack_limit;
-        task->core_limit = leader->core_limit;
-        task->fsize_limit = leader->fsize_limit;
-        task->sigpending_limit=leader->sigpending_limit;
-        task->as_limit = leader->as_limit;
-        task->data_limit = leader->data_limit;
-        task->cpu_limit = leader->cpu_limit;
+        if(task->limits!=leader->limits)__builtin_trap();
         kernel_signal_pending_adopt_locked(task,leader);
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
@@ -657,7 +653,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
             if (++task->group_epoch == 0) __builtin_trap();
             process_group_initialize(task);
         }
-        kernel_task_identity_put(old_identity);
+        kernel_pidfd_notification_end(&old_identity);
         (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
     }
     {
@@ -723,6 +719,7 @@ static enum kernel_scheduler_status finish_clone_failure(
     int cleanup_failed;
     enum kernel_scheduler_status stack_status;
 
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_nproc_release_locked(thread); }
     /* No failed construction has published a parent completion channel. */
     thread->vfork_parent = 0;
     thread->vfork_child = 0U;
@@ -816,6 +813,12 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_credentials_clone(parent->files.heap,parent->credentials);
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    int admitted=kernel_nproc_acquire(child,parent);
+    if(admitted)return finish_clone_failure(child,admitted,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    child->limits=thread_clone?kernel_resource_limits_get(parent->limits):
+        kernel_resource_limits_create(parent->limits->heap,parent->limits);
+    if(!child->limits)
+        return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     int sem_result=kernel_sem_clone(parent,child,(flags & UINT64_C(0x40000))!=0);
     if (sem_result)
         return finish_clone_failure(child,sem_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
@@ -908,14 +911,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->group_leader = child;
     child->group_members = 1U;
     child->fork_no_exec = 1U;
-    child->nofile_limit = parent->group_leader->nofile_limit;
-    child->stack_limit = parent->group_leader->stack_limit;
-    child->core_limit = parent->group_leader->core_limit;
-    child->fsize_limit = parent->group_leader->fsize_limit;
-    child->sigpending_limit=parent->group_leader->sigpending_limit;
-    child->as_limit = parent->group_leader->as_limit;
-    child->data_limit = parent->group_leader->data_limit;
-    child->cpu_limit = parent->group_leader->cpu_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -1000,7 +995,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                 parent->vfork_wait_child = child;
             }
             child->state = KERNEL_THREAD_STATE_READY;
-            if(!thread_clone && child->cpu_limit.current!=KERNEL_RLIM_INFINITY)
+            if(!thread_clone && child->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY)
                 scheduler_cpu_timer_update_locked(child,0);
             ready_enqueue_locked(child, 0);
         }
@@ -1044,7 +1039,7 @@ static int wait_child_matches(const struct kernel_task *child, int32_t which,
 {
     if (which == LINUX_P_ALL) return 1;
     return target && process_identity(child,
-        which == LINUX_P_PID ? KERNEL_PID_TID : KERNEL_PID_PGID) == target;
+        (which == LINUX_P_PID || which == LINUX_P_PIDFD) ? KERNEL_PID_TID : KERNEL_PID_PGID) == target;
 }
 
 static enum kernel_scheduler_status retire_waited_zombie(
@@ -1052,6 +1047,8 @@ static enum kernel_scheduler_status retire_waited_zombie(
     struct kernel_task *child,
     const struct kernel_task_usage *usage)
 {
+    struct kernel_pid *exit_identity __attribute__((cleanup(kernel_pidfd_notification_end))) =
+        kernel_pidfd_exit_identity(child);
     kernel_pid_t pid = child->tid;
 
     if (child->state != KERNEL_THREAD_STATE_ZOMBIE ||
@@ -1449,7 +1446,7 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
         if (upid < 0) *linux_result = -KERNEL_EINVAL;
         break;
     case LINUX_P_PIDFD:
-        *linux_result = upid < 0 ? -KERNEL_EINVAL : -KERNEL_EBADF;
+        if(upid<0)*linux_result=-KERNEL_EINVAL;
         break;
     default: *linux_result = -KERNEL_EINVAL; break;
     }
@@ -1458,12 +1455,20 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
     SCHEDULER_TASK_BORROW(child, 0);
     struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = 0;
     uint32_t event = 0;
+    int pidfd_nonblock=0;
     enum kernel_scheduler_status status;
     if (!*linux_result) {
-        target = wait_target_get(parent, which, upid);
-        status = wait_for_child(parent, which, target, options, &child, &event, linux_result);
-        claim = child;
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        if(which==LINUX_P_PIDFD)
+            *linux_result=kernel_pidfd_wait_target(&parent->files,(int32_t)upid,&target,&pidfd_nonblock);
+        else target = wait_target_get(parent, which, upid);
+        if(!*linux_result) {
+            status = wait_for_child(parent, which, target,
+                options|(pidfd_nonblock?LINUX_WNOHANG:0), &child, &event, linux_result);
+            claim = child;
+            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+            if(!child && !*linux_result && pidfd_nonblock && !(options&LINUX_WNOHANG))
+                *linux_result=-KERNEL_EAGAIN;
+        }
     }
 
     int32_t cause = 0, status_code = 0, child_pid = 0;
@@ -1688,6 +1693,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         thread->publish_completion > 1U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    struct kernel_pid *exit_identity __attribute__((cleanup(kernel_pidfd_notification_end))) =
+        kernel_pidfd_exit_identity(thread);
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     cleanup_task_io_requests(thread);
@@ -1753,6 +1760,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             struct kernel_task_usage departed;
             scheduler_usage_thread_locked(thread, &departed);
             scheduler_usage_add(&leader->dead_usage, &departed);
+            /* 与退出线程从组目录移除处在同一可观察边界。 */
+            kernel_nproc_release_locked(thread);
             thread->group_previous->group_next = thread->group_next;
             thread->group_next->group_previous = thread->group_previous;
             if (!leader->group_members || ++leader->group_epoch == 0) __builtin_trap();
@@ -1811,6 +1820,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         }
         if (thread->tid_owned) {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            kernel_nproc_release_locked(thread);
             process_identity_release_locked(thread);
             if (scheduler.init_task == thread) scheduler.init_task = 0;
             thread->group_leader = 0;
@@ -2392,17 +2402,7 @@ enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_
 
 static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint32_t resource)
 {
-    switch (resource) {
-    case KERNEL_RLIMIT_CPU: return &leader->cpu_limit;
-    case KERNEL_RLIMIT_NOFILE: return &leader->nofile_limit;
-    case KERNEL_RLIMIT_STACK: return &leader->stack_limit;
-    case KERNEL_RLIMIT_CORE: return &leader->core_limit;
-    case KERNEL_RLIMIT_FSIZE: return &leader->fsize_limit;
-    case KERNEL_RLIMIT_SIGPENDING: return &leader->sigpending_limit;
-    case KERNEL_RLIMIT_AS: return &leader->as_limit;
-    case KERNEL_RLIMIT_DATA: return &leader->data_limit;
-    default: return NULL;
-    }
+    return resource<KERNEL_RLIMIT_COUNT ? &leader->limits->values[resource] : 0;
 }
 
 enum kernel_task_status kernel_task_get_rlimit(
@@ -2433,10 +2433,7 @@ enum kernel_task_status kernel_task_set_rlimit(
          limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
         (resource == KERNEL_RLIMIT_STACK &&
          limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
-        (resource != KERNEL_RLIMIT_CPU && resource != KERNEL_RLIMIT_NOFILE && resource != KERNEL_RLIMIT_STACK &&
-         resource != KERNEL_RLIMIT_CORE && resource != KERNEL_RLIMIT_FSIZE &&
-         resource != KERNEL_RLIMIT_SIGPENDING && resource != KERNEL_RLIMIT_AS &&
-         resource != KERNEL_RLIMIT_DATA))
+        resource >= KERNEL_RLIMIT_COUNT)
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -2458,7 +2455,7 @@ uint64_t kernel_task_current_fsize_limit(void)
     struct kernel_task *task = kernel_task_current();
     if (!kernel_task_has_user_context(task)) return KERNEL_RLIM_INFINITY;
     /* 当前执行owner保持组身份；限额接纳只读软值，不取得整组快照锁。 */
-    return __atomic_load_n(&task->group_leader->fsize_limit.current, __ATOMIC_RELAXED);
+    return __atomic_load_n(&task->limits->values[KERNEL_RLIMIT_FSIZE].current, __ATOMIC_RELAXED);
 }
 
 enum kernel_task_status kernel_task_memory_limits(
@@ -2470,8 +2467,8 @@ enum kernel_task_status kernel_task_memory_limits(
     if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
         return KERNEL_TASK_STATUS_STATE;
     const struct kernel_task *leader = task->group_leader;
-    *limits = (struct kernel_memory_limits){leader->as_limit.current,
-        leader->data_limit.current, leader->data_limit.maximum};
+    *limits = (struct kernel_memory_limits){leader->limits->values[KERNEL_RLIMIT_AS].current,
+        leader->limits->values[KERNEL_RLIMIT_DATA].current, leader->limits->values[KERNEL_RLIMIT_DATA].maximum};
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2482,22 +2479,17 @@ void kernel_task_current_memory_limits(struct kernel_memory_limits *limits)
         KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
     if (!kernel_task_has_user_context(task)) return;
     /* 当前执行者保活组身份；接纳与Linux rlimit读取一样按字段取值。 */
-    const struct kernel_task *leader = task->group_leader;
-    limits->address_space = __atomic_load_n(&leader->as_limit.current, __ATOMIC_RELAXED);
-    limits->data_soft = __atomic_load_n(&leader->data_limit.current, __ATOMIC_RELAXED);
-    limits->data_hard = __atomic_load_n(&leader->data_limit.maximum, __ATOMIC_RELAXED);
+    const struct kernel_resource_limits *record=task->limits;
+    limits->address_space = __atomic_load_n(&record->values[KERNEL_RLIMIT_AS].current, __ATOMIC_RELAXED);
+    limits->data_soft = __atomic_load_n(&record->values[KERNEL_RLIMIT_DATA].current, __ATOMIC_RELAXED);
+    limits->data_hard = __atomic_load_n(&record->values[KERNEL_RLIMIT_DATA].maximum, __ATOMIC_RELAXED);
 }
 
 uint64_t kernel_task_current_stack_limit(void)
 {
     struct kernel_task *task = kernel_task_current();
-    struct kernel_rlimit64 limit;
-
-    if (task == 0 || task->arch.user_mode != 1U)
-        return KERNEL_RLIMIT_STACK_CAP;
-    if (kernel_task_get_rlimit(task, KERNEL_RLIMIT_STACK, &limit) !=
-        KERNEL_TASK_STATUS_OK) __builtin_trap();
-    return limit.current;
+    if (!kernel_task_has_user_context(task)) return KERNEL_RLIMIT_STACK_CAP;
+    return __atomic_load_n(&task->limits->values[KERNEL_RLIMIT_STACK].current,__ATOMIC_RELAXED);
 }
 
 enum kernel_task_status kernel_task_ppid(
@@ -2636,7 +2628,7 @@ enum kernel_task_status kernel_task_files_borrow(
     }
     *files = &task->files;
     task->files.nofile_limit =
-        (uint32_t)__atomic_load_n(&task->group_leader->nofile_limit.current, __ATOMIC_RELAXED);
+        (uint32_t)__atomic_load_n(&task->limits->values[KERNEL_RLIMIT_NOFILE].current, __ATOMIC_RELAXED);
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -2705,6 +2697,7 @@ enum kernel_task_status kernel_task_socket_write_clear(
 void kernel_credentials_changed_locked(struct kernel_task *task,
     const struct kernel_credentials *old, const struct kernel_credentials *replacement)
 {
+    kernel_nproc_credentials_changed_locked(task,old,replacement);
     if (task->exec_security &&
         (old->euid != replacement->euid || old->egid != replacement->egid ||
          old->fsuid != replacement->fsuid || old->fsgid != replacement->fsgid ||

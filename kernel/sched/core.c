@@ -1260,6 +1260,12 @@ enum kernel_scheduler_status kernel_user_thread_create(
     kernel_wait_queue_init(&thread->child_exit_queue);
     kernel_wait_queue_init(&thread->vfork_done_queue);
 
+    thread->limits=kernel_resource_limits_create(&scheduler.identity_heap,0);
+    if(!thread->limits){
+        status=release_task_storage(thread,KERNEL_SCHEDULER_STATUS_NO_MEMORY);
+        goto restore_interrupts;
+    }
+    if(kernel_nproc_acquire(thread,0))__builtin_trap();
     thread->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1U);
     if(!thread->exec_security){
         status=release_task_storage(thread,KERNEL_SCHEDULER_STATUS_NO_MEMORY);
@@ -1299,16 +1305,6 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->wait_status = 0U;
     thread->group_leader = thread;
     thread->group_members = 1U;
-    thread->nofile_limit = (struct kernel_rlimit64){
-        KERNEL_RLIMIT_NOFILE_CAP, KERNEL_RLIMIT_NOFILE_CAP};
-    thread->stack_limit = (struct kernel_rlimit64){
-        KERNEL_RLIMIT_STACK_CAP, KERNEL_RLIMIT_STACK_CAP};
-    thread->core_limit = (struct kernel_rlimit64){0, KERNEL_RLIM_INFINITY};
-    thread->fsize_limit = (struct kernel_rlimit64){KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
-    thread->sigpending_limit=(struct kernel_rlimit64){KERNEL_RLIMIT_SIGPENDING_DEFAULT,KERNEL_RLIMIT_SIGPENDING_DEFAULT};
-    thread->as_limit = thread->data_limit =
-        (struct kernel_rlimit64){KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
-    thread->cpu_limit = (struct kernel_rlimit64){KERNEL_RLIM_INFINITY, KERNEL_RLIM_INFINITY};
     process_group_initialize(thread);
     thread->completion.tid = tid;
     thread->completion.tgid = tid;
@@ -1467,7 +1463,8 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
         current->magic != KERNEL_THREAD_MAGIC) {
         return;
     }
-    (void)from_user; /* 用户/内核用量由执行边界结算，tick只保留idle与负载采样。 */
+    scheduler_rt_watchdog_locked(current,kernel_tick_count());
+    (void)from_user; /* 用户/内核CPU时间仍由执行边界结算。 */
 }
 
 uint64_t kernel_scheduler_idle_ticks(void)

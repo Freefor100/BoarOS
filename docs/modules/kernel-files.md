@@ -54,7 +54,7 @@ host模型只提供线程/架构上下文及未开放消费者的abort；task定
 宿主窄反例强制在 guard 归还前关闭槽 owner，并验证路径交接与最终归还；sendfile 来源占独立片段，不并入可合并的 user-write 尾片段。
 
 
-描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。`RLIMIT_NOFILE` 的组级软限制约束新 fd 的编号；open、pipe、dup 和 `F_DUPFD*` 均通过该上限，降低限制不关闭已有 fd，也不阻止继续使用它们。限额保存在组长而非共享 fd 表中：即使不同组通过 `CLONE_FILES` 共用槽位，也各按自己的限额分配；每次 syscall 借用文件表时更新任务句柄的限额。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
+描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。`RLIMIT_NOFILE` 的组级软限制约束新 fd 的编号；open、pipe、dup 和 `F_DUPFD*` 均通过该上限，降低限制不关闭已有 fd，也不阻止继续使用它们。限额保存在组内共享的资源记录中，fd 表只维护槽位：即使不同组通过 `CLONE_FILES` 共用槽位，也各按自己的限额分配；每次 syscall 借用文件表时更新任务句柄的限额。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
 normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `table.c` 的统一 fd 安装原语。新建 OFD 与调用者已 acquire 的共享 OFD 使用两个显式入口；两者都只消费传入 ownership，不暗中改变引用计数，并统一提交槽位、open/CLOEXEC 统计和 `next_fd`。表满或安装前失败不提交这些状态。
 

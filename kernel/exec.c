@@ -637,6 +637,8 @@ enum kernel_exec_status kernel_execve_prepare(
     if (access_status != KERNEL_UACCESS_STATUS_OK) {
         return finish_prepare_state(task, transaction);
     }
+    int nproc=kernel_nproc_exec(task);
+    if(nproc)return finish_prepare_failure(task,transaction,nproc,linux_result);
     transaction->unsafe_fs=kernel_fs_context_exec_begin(fs,task);
     if (!transaction->unsafe_fs) transaction->exec_fs=fs;
     KERNEL_FS_PATHS(fs_paths, fs);

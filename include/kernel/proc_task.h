@@ -38,6 +38,7 @@ struct kernel_proc_process_snapshot {
     uint64_t child_major_faults;
     uint64_t virtual_bytes;
     uint64_t resident_pages;
+    uint64_t rss_limit;
     uint64_t start_code, end_code, start_stack;
     uint64_t signal_pending, signal_shared_pending, signal_blocked, signal_ignored, signal_caught;
     uint64_t signal_queued, signal_queue_limit;
@@ -88,6 +89,13 @@ struct kernel_proc_fd_pseudo {
     uint64_t object_identity;
     uint8_t kind;
 };
+struct kernel_proc_fdinfo {
+    uint64_t position, flags, mount_id, inode;
+    int32_t pid;
+    uint8_t pidfd;
+};
+int kernel_proc_fdinfo_snapshot(kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);
+int kernel_proc_fdinfo_access(kernel_pid_t,uint64_t);
 int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
                                    int fd,
                                    struct kernel_proc_fd_pseudo *snapshot);

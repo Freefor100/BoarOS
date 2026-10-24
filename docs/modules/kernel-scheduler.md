@@ -131,7 +131,14 @@ IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡
 缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
 后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
 
-sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、用户任务跨核执行、cgroup 配额或 deadline scheduler；独立 RV 两核仅接纳受控内核任务。
+sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～4核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
+
+
+RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
+
+RTTIME对每线程连续RT执行计量。各CPU的timer tick仅在当前用户线程运行FIFO/RR且软限额有限时推进watchdog；同一全局tick跨核只计一次。超过按100Hz向上取整的软／硬阈值后，线程进入现有CPU timer活动索引，由CPU0检查并向线程组发送SIGXCPU，软限额增加1,000,000us，或在硬限额到达时发送SIGKILL。仅有RTTIME待检查的条目不采样完整CPU clock；普通trap不新增watchdog锁或采样。
+
+连续计数在调度器确定任务带着BLOCKED或STOPPED状态离开CPU时清零。PREPARED通知、COMMITTED后在切换前收到通知、停止后在切离前收到SIGCONT，以及抢占、yield、迁移、CPU0服务和RT带宽节流都保留计数；此时状态已经或仍为READY，未完成一次睡眠/停止。直接host检查以手动tick覆盖跨CPU去重、软硬阈值及三种等待交错，真实消费者通过父子握手确认阻塞后继续执行。
 
 `make test-sched-concurrency-host`直接执行生产策略/选择/等待交接，在2/4线程握手中验证唯一执行owner、旧栈交接及IRQ恢复；保护CPU独立记账和公开策略入口的同域修改。该证据不替代客户机多核。
 
@@ -151,20 +158,23 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 当前线程直接借用自己的稳定对象；跨线程查询在调度锁内取得引用后于锁外复制或格式化。退出后任务凭据保留至任务索引、等待者和存储借用全部归还的最终 collect 阶段。同步 I/O worker 显式借用原调用者凭据，计账任务与权限对象分别维护。
 
+`RLIMIT_NPROC` 复用凭据的真实 UID 账户，计数对象是用户线程；内核 worker 不计入。clone 在复制凭据后、复制 MM/FD 前原子接纳，构造失败立即归还。真实 UID 0、有效 CAP_SYS_RESOURCE 或 CAP_SYS_ADMIN 可以越过调用者软限制，仍计入账户使用量。僵尸到 wait/reap 时才减数；普通退出线程在实际 reap 移出组目录的同一调度域边界归还计数，其他任务在撤销身份时归还。EXITED/GROUP_DEAD 只是执行状态，不提前隐藏仍发布的 proc 身份。后续 proc/pid 等存储借用不延长配额占用。非组长 exec 在转移身份的同一调度域边界归还旧组长容器的计数。
+
+真实 UID 改变在同一调度域内将一个线程从旧账户转入新账户，凭据引用保持账户存活。按固定 Linux 的顺序，转账前目标账户已有数量严格大于调用者 NPROC 软限制且目标非 root 时，标记延后失败，setuid 本身仍成功；随后 exec 重新检查当前账户，仍超限才返回 EAGAIN，降至限制内则清除标记。通过 fork 接纳检查也清除此标记。有效/文件系统 UID 改变不转移 NPROC 使用量。
+
 `RLIMIT_SIGPENDING` 的使用量归真实 UID 账户，普通记录和 POSIX timer 预留记录保持接纳时的账户引用。线程改 UID 影响后续接纳，旧记录消费和删除仍归还原账户；队列细节见[信号模块](kernel-signal.md)。dumpable 由任务持有的执行安全对象保存，共享 MM 的线程与 vfork 共享它；普通 fork 复制状态，exec 替换，最终任务回收才释放。身份变化先更新共享状态再替换凭据；exec 的新 MM、候选凭据与执行安全状态一起发布，见[映像替换](kernel-exec.md)。
 
 ### PID 身份
 
 TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的代次、引用计数和四类成员链只有一份真实身份。每个线程挂接 TID；线程组代表挂接 TGID、PGID、SID，其他线程通过代表取得组身份。`tid` 仅为对象编号的派生缓存，由身份事务维护，并由调度校验检查一致性。fork 继承父进程的 PGID/SID 对象；线程 clone 只新增 TID。`__WNOTHREAD` 的创建者关系持有 TID 对象引用，退出、收养和非组长 exec 转移关系，不按可能复用的整数判等。
 
-编号仅在全部角色成员和临时引用都释放后归还 bitmap。对象仍有引用不表示 TID 对应线程仍可收信号；线程 lookup、组 lookup 和 proc 可见性分别检查其角色及生命周期。组长先退出保留身份容器，直到最后线程退出或非组长 exec 原子接管四类成员。zombie 在 wait/reap 前保留进程身份；旧 proc 节点用同一对象的代次防止编号复用后命中新进程。
+全部 TID/TGID/PGID/SID 角色消失时撤下编号索引并归还 bitmap；pidfd、排队消息、定时器等引用只保留身份存储。新进程可以取得相同编号，但其代次和对象与旧引用分别保持。对象仍有引用不表示 TID 对应线程仍可收信号；线程 lookup、组 lookup 和 proc 可见性分别检查其角色及生命周期。组长先退出保留身份容器，直到最后线程退出或非组长 exec 原子接管四类成员。zombie 在 wait/reap 前保留进程身份；旧 proc 节点用同一对象的代次防止编号复用后命中新进程。
 
 对象存储来自调度器私有slab heap。准备分配可以睡眠；reserve仅占用数字/代次，不进入查找桶。
-TID与私有TGID先构造，父进程的PGID/SID在准备期间持实际引用，自己的身份由既有角色owner覆盖。
-最终发布在同一调度域中挂接角色、进入任务索引及runnable；失败归还私有保留项，不发布半成品。
-最后PID引用只摘编号索引并登记退休，heap释放在锁外执行。
+TID 与私有 TGID 先构造。最终发布在同一调度域中读取实际父进程的 PGID/SID 并挂接角色、进入任务索引及 runnable；准备期间不以临时引用阻止已消失进程组撤号。失败归还私有保留项，不发布半成品。
+最后 PID 引用登记存储退休，heap 释放在锁外执行；已经撤号的对象不再次归还编号。
 PID记录为64字节，状态与代次共用一字；合法代次仍为proc身份的34位范围，引用保持32位。
-状态0/1/2为私有/已发布/退休，3为损坏。所有状态修改仍在调度域；真实PID引用覆盖已发布代次读取，
+状态 0/1/2/3 分别为私有预留、已发布、已撤号及存储退休。已撤号对象可以继续取得存活存储引用，但不再挂接角色或重新发布；退休对象禁止 get。所有状态修改仍在调度域；真实 PID 引用覆盖代次读取，
 任务存储借用不能替代PID引用或锁内快照。`test-pid-object-host`覆盖编码边界、非法引用/状态，
 以及4/16KiB下32/128个实际PID的单页slab预算和最终页/堆归还。
 
@@ -178,6 +188,18 @@ locked变体仅供已持调度域的短操作使用。借用不固定MM、文件
 父子链在实际插入、移除和收养当前节点时检查相邻连接与首尾 owner，不在退出或 reparent 前扫描整条链。`children_epoch` 继续供 wait 选择在成员变化后重查。组遍历持有实际成员的存储引用，成员代次变化时重新从组长开始；proc 调度/身份值受域保护，MM/TTY 内容仍按单 CPU 业务契约读取。
 
 join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
+
+### pidfd
+
+RV64/LA64 提供 pidfd_open(434)、pidfd_send_signal(424) 和 pidfd_getfd(438)。pidfd OFD 持有真实 PID 身份存储；dup、fork 和 UNIX FD 传递沿共同 OFD 引用规则。open 接受 PIDFD_NONBLOCK、PIDFD_THREAD，新 FD 设置 CLOEXEC；普通 open 要求 TGID 角色，THREAD 则保留实际 TID。身份代次作为同一目标 pidfd 的 inode 标识，fstat 沿固定 Linux pidfs getattr 输出 0700 并去掉文件类型位。数据 read/write 及定位读写返回 EINVAL，lseek 返回 ESPIPE。
+
+有 pidfd 的身份才分配共享观察源，按身份指针索引；PID 对象保持 64 字节。poll/epoll 在发起 CPU 查询状态和登记既有等待源；组长提前退出仍等待最后线程，使退出真正可等待后才发布可读，wait/reap 撤下 TID 后同时报告 HUP。reap、wait 消费及非组长 exec 在修改角色前取得原 TID 存储 owner；状态修改完成后，由同一执行者在返回前锁外通知，再归还该 owner。等待游标和观察源引用覆盖通知及最后关闭的交错，不增加 worker 或待通知协议。
+
+waitid(P_PIDFD) 持有实际身份选择子进程，编号复用不改变目标。NONBLOCK pidfd 的子进程尚无所需事件时返回 EAGAIN；显式 WNOHANG 则成功返回空信息。getfd 按实际 TID 查找，检查 REALCREDS、dumpable 和 capability 子集，取得真实 OFD 后重新核对目标 MM、凭据、执行安全对象及文件表。CPU0 控制路径在授权快照、FD raw/OFD acquire 和安全复核期间短暂禁止抢占，避免 timer 切换到同核 exec/exit；FD 锁在调度域之外取得。随后恢复抢占，只保留所需 OFD。接收 FD 设置 CLOEXEC，offset、状态标志和打开权利继续共享；真实清理失败把 owner 留给已有 FD cleanup 路径。
+
+发送默认采用 pidfd 的线程／线程组属性，支持单一的 THREAD、THREAD_GROUP、PROCESS_GROUP scope 标志及 SELF_THREAD/SELF_THREAD_GROUP 特殊值。可选 siginfo 沿共同导入和 pending 机制处理；目标在导入前解析并持有真实身份，不在用户缺页后按复用的 FD 或 PID 重新选目标。用户载荷来源、零信号探测及权限沿固定 Linux。pidfd 专用 namespace/info ioctl 和 CLONE_PIDFD 扩展另行接入。
+
+sh tests/host/pidfd.sh 检查最后角色撤号、64 字节分配类、旧身份引用、通知早于登记／休眠，以及回调期间最后关闭与存储归还；直接用户消费者为 tests/workloads/resource/pidfd.c，核对真实进程／线程退出、getfd、权限、信号和 proc 字段。
 wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
 退出队头仍有事件/等待/执行owner时，reaper返回BUSY；cleanup等待真实归还通知，不将待归还借用当作可立即回收的工作。
 PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cleanup；空索引不能代替页基线。
@@ -198,7 +220,7 @@ PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cl
 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引用对数字的owner。
 
 
-每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_CPU`/`RLIMIT_NOFILE`/`RLIMIT_STACK`/`RLIMIT_CORE`/`RLIMIT_FSIZE`/`RLIMIT_SIGPENDING`/`RLIMIT_AS`/`RLIMIT_DATA`。这些限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
+每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及进程资源限制。每个用户任务持有一个含 Linux 16 项限额的 `kernel_resource_limits` 引用；组内线程共享记录，普通 fork 在调度域下复制取值，exec 和非组长 exec 保留该记录。最后任务存储引用回收时在锁外释放，内核 worker 不分配限额记录。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
 普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 

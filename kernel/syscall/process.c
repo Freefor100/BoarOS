@@ -76,15 +76,8 @@ enum kernel_syscall_status syscall_handle_prlimit64(
             decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
         }
     }
-    if (resource >= 16U) {
+    if (resource >= KERNEL_RLIMIT_COUNT) {
         decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (resource != KERNEL_RLIMIT_CPU && resource != KERNEL_RLIMIT_NOFILE &&
-        resource != KERNEL_RLIMIT_STACK && resource != KERNEL_RLIMIT_CORE &&
-        resource != KERNEL_RLIMIT_FSIZE && resource != KERNEL_RLIMIT_SIGPENDING &&
-        resource != KERNEL_RLIMIT_AS && resource != KERNEL_RLIMIT_DATA) {
-        decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     enum kernel_task_status task_status = kernel_task_get_rlimit(target, resource, &before);

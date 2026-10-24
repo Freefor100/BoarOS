@@ -120,6 +120,7 @@ void scheduler_task_unlink_locked(struct kernel_task *task)
 {
     domain_owned();
     if (task->retirement) __builtin_trap();
+    kernel_nproc_release_locked(task);
     if (task->accounted) {
         if (task->all_previous && task->all_previous->all_next != task) __builtin_trap();
         if (task->all_next && task->all_next->all_previous != task) __builtin_trap();
@@ -205,6 +206,8 @@ void scheduler_task_collect(void)
 #endif
         }
         /* No rank40 lock may be held while the allocator consumes the page. */
+        kernel_resource_limits_put(task->limits);
+        task->limits = 0;
         kernel_credentials_put(task->credentials);
         task->credentials = 0;
         kernel_exec_security_put(task->exec_security);

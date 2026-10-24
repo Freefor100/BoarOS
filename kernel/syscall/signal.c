@@ -5,6 +5,8 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/signal_fd.h>
+#include <kernel/pidfd.h>
+#include <kernel/tty_task.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
@@ -361,6 +363,42 @@ static int known_signal_info(unsigned sig,int code)
     return (unsigned)code<=limit;
 }
 
+static int import_signal_info(struct kernel_mm *mm,uint64_t address,
+    unsigned layout_signal,struct kernel_signal_wait_info *info)
+{
+    enum kernel_uaccess_status copied=signal_copy_from_user(mm,address,info,48);
+    if(copied!=KERNEL_UACCESS_STATUS_OK)return -KERNEL_EFAULT;
+    if(!known_signal_info(layout_signal,info->code)) {
+        uint8_t expansion[80];
+        if(address>UINT64_MAX-48)return -KERNEL_EFAULT;
+        copied=signal_copy_from_user(mm,address+48,expansion,sizeof(expansion));
+        if(copied!=KERNEL_UACCESS_STATUS_OK)return -KERNEL_EFAULT;
+        for(unsigned i=0;i<sizeof(expansion);i++)if(expansion[i])return -KERNEL_E2BIG;
+    }
+    return 0;
+}
+
+enum kernel_syscall_status syscall_handle_pidfd_signal(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    uint32_t flags=(uint32_t)request->arguments[3],sig=(uint32_t)request->arguments[1];
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    struct kernel_pid *target __attribute__((cleanup(kernel_task_identity_end)))=0;
+    unsigned scope;
+    int error=kernel_pidfd_signal_target(caller,(int32_t)request->arguments[0],flags,&target,&scope);
+    if(error){decoded->value=error;return 0;}
+    struct kernel_signal_wait_info info={0};
+    if(request->arguments[2]) {
+        struct kernel_mm *mm;
+        if(kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        error=import_signal_info(mm,request->arguments[2],sig,&info);
+        if(error){decoded->value=error;return 0;}
+    }
+    decoded->value=kernel_pidfd_send(caller,target,scope,sig,request->arguments[2]?&info:0);
+    return 0;
+}
+
 enum kernel_syscall_status syscall_handle_sigqueueinfo(struct kernel_task *caller,
     const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
 {
@@ -378,18 +416,9 @@ enum kernel_syscall_status syscall_handle_sigqueueinfo(struct kernel_task *calle
     if(kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     /* Linux imports its 48-byte kernel siginfo, then checks the expansion
      * only for unknown layouts. Known input need not expose unused bytes. */
-    enum kernel_uaccess_status copied=signal_copy_from_user(mm,address,&info,48);
-    if(copied!=KERNEL_UACCESS_STATUS_OK)return signal_copy_error(copied,decoded);
+    int imported=import_signal_info(mm,address,sig,&info);
+    if(imported){decoded->value=imported;return 0;}
     info.signal=sig;
-    if(!known_signal_info(sig,info.code)) {
-        uint8_t expansion[80];
-        if(address>UINT64_MAX-48){decoded->value=-KERNEL_EFAULT;return KERNEL_SYSCALL_STATUS_OK;}
-        copied=signal_copy_from_user(mm,address+48,expansion,sizeof(expansion));
-        if(copied!=KERNEL_UACCESS_STATUS_OK)return signal_copy_error(copied,decoded);
-        for(unsigned i=0;i<sizeof(expansion);i++)if(expansion[i]) {
-            decoded->value=-KERNEL_E2BIG;return KERNEL_SYSCALL_STATUS_OK;
-        }
-    }
     if(thread && (group<=0 || pid<=0)){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
     kernel_pid_t self;
     if(kernel_task_tid(caller,&self)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

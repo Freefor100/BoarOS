@@ -8,6 +8,7 @@ static struct kernel_mm_proc_map fixture[6];
 static struct kernel_vfs_file backing;
 static unsigned references, allocations;
 static int stat_error, allocation_fail;
+static int fdinfo_pid = 42;
 static struct kernel_heap heap;
 static struct kernel_fs_context fs;
 
@@ -68,6 +69,14 @@ int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity, int after, int *fd)
 { (void)pid; (void)identity; (void)after; (void)fd; abort(); }
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid, uint64_t *identity)
 { (void)after; (void)pid; (void)identity; abort(); }
+int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
+    struct kernel_proc_fdinfo *info)
+{
+    assert(pid==42 && identity==17 && fd==9);
+    *info=(struct kernel_proc_fdinfo){.position=99,.flags=02000002,.mount_id=12,
+        .inode=7,.pidfd=1,.pid=fdinfo_pid};
+    return 0;
+}
 
 int main(void)
 {
@@ -92,7 +101,9 @@ int main(void)
     char name[32]; uint8_t type;
     assert(proc_dir_entry(&dir, 10, &next, &inode, &type, name, sizeof(name)) == 1);
     assert(!strcmp(name, "maps") && next == 11 && inode == node.inode && type == 8);
-    assert(!proc_dir_entry(&dir, next, &next, &inode, &type, name, sizeof(name)));
+    assert(proc_dir_entry(&dir, next, &next, &inode, &type, name, sizeof(name))==1);
+    assert(!strcmp(name,"fdinfo") && type==4);
+    assert(!proc_dir_entry(&dir,next,&next,&inode,&type,name,sizeof(name)));
     char *text = 0; size_t length = 0;
     assert(!proc_maps_snapshot(&node, &heap, &text, &length));
     assert(strlen(text) == length && !references && allocations == 1);
@@ -120,6 +131,16 @@ int main(void)
     allocation_fail = 0; stat_error = -KERNEL_EIO; text = 0;
     assert(proc_maps_snapshot(&node, &heap, &text, &length) == -KERNEL_EIO);
     assert(!text && !references && !allocations);
+    stat_error=0;allocation_fail=0;
+    node.inode=proc_pid_inode_fd(42,17,PROC_PID_FDINFO_KIND,9);
+    text=0;assert(!proc_fdinfo_snapshot(&node,&heap,&text,&length));
+    assert(strstr(text,"pos:\t99\n") && strstr(text,"flags:\t02000002\n") &&
+        strstr(text,"Pid:\t42\nNSpid:\t42\n"));kernel_heap_release(&heap,text);
+    fdinfo_pid=-1;text=0;assert(!proc_fdinfo_snapshot(&node,&heap,&text,&length));
+    assert(strstr(text,"Pid:\t-1\nNSpid:\t-1\n"));kernel_heap_release(&heap,text);
+    allocation_fail=1;text=0;assert(proc_fdinfo_snapshot(&node,&heap,&text,&length)==-KERNEL_ENOMEM);
+    assert(!text && !allocations);
+    puts("PASS proc pidfd fdinfo emits both Pid/NSpid, retained-dead -1, flags and allocation ownership");
     puts("PASS proc maps directory/type, Linux fields, real backing identity/path, labels, permissions, escaping and failure owner release");
     return 0;
 }

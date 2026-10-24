@@ -201,27 +201,35 @@ enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
 
 void kernel_pid_get(struct kernel_pid *identity)
 {
-    if (!identity || !identity->registry || identity->published > 1 || !identity->references ||
+    if (!identity || !identity->registry || identity->published > 2 || !identity->references ||
         identity->references == UINT32_MAX) __builtin_trap();
     identity->references++;
 }
 
-void kernel_pid_put(struct kernel_pid *identity)
+static void detach_number(struct kernel_pid *identity)
 {
-    if (!identity || !identity->registry || identity->published > 1 || !identity->references) __builtin_trap();
-    if (--identity->references) return;
-    for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
-        if (identity->members[role]) __builtin_trap();
     struct kernel_pid_registry *registry = identity->registry;
-    if (identity->published) {
+    if (identity->published == 1) {
         struct kernel_pid **link = &registry->buckets[(uint32_t)identity->number % KERNEL_PID_BUCKETS];
         while (*link && *link != identity) link = &(*link)->hash_next;
         if (!*link) __builtin_trap();
         *link = identity->hash_next;
-    } else if (identity->hash_next) __builtin_trap();
-    identity->published = 2; /* Retired storage is still owned by the registry. */
+    } else if (identity->published || identity->hash_next) __builtin_trap();
     if (kernel_pid_release(registry->numbers, identity->number) != KERNEL_PID_STATUS_OK)
         __builtin_trap();
+    identity->hash_next = 0;
+    identity->published = 2;
+}
+
+void kernel_pid_put(struct kernel_pid *identity)
+{
+    if (!identity || !identity->registry || identity->published > 2 || !identity->references) __builtin_trap();
+    if (--identity->references) return;
+    for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
+        if (identity->members[role]) __builtin_trap();
+    struct kernel_pid_registry *registry = identity->registry;
+    if (identity->published != 2) detach_number(identity);
+    identity->published = 3;
     identity->registry = 0;
     identity->hash_next = registry->retired;
     registry->retired = identity;
@@ -231,7 +239,8 @@ void kernel_pid_attach(struct kernel_pid_member *member,
                        struct kernel_pid *identity, enum kernel_pid_role role,
                        void *task)
 {
-    if (!member || member->identity || !task || (unsigned)role >= KERNEL_PID_ROLES)
+    if (!member || member->identity || !task || (unsigned)role >= KERNEL_PID_ROLES ||
+        !identity || identity->published > 1)
         __builtin_trap();
     kernel_pid_get(identity);
     member->identity = identity;
@@ -253,6 +262,11 @@ void kernel_pid_detach(struct kernel_pid_member *member)
     member->identity = 0;
     member->task = 0;
     member->next = member->previous = 0;
+    if (identity->published == 1) {
+        unsigned role = 0;
+        while (role < KERNEL_PID_ROLES && !identity->members[role]) role++;
+        if (role == KERNEL_PID_ROLES) detach_number(identity);
+    }
     kernel_pid_put(identity);
 }
 
@@ -277,7 +291,7 @@ struct kernel_pid *kernel_pid_take_retired(struct kernel_pid_registry *registry)
     if (retired) {
         registry->retired = retired->hash_next;
         retired->hash_next = 0;
-        if (retired->published != 2) __builtin_trap();
+        if (retired->published != 3) __builtin_trap();
         retired->published = 0;
     }
     return retired;
