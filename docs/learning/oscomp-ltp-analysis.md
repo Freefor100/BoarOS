@@ -644,4 +644,6 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 
 10:36 的额外复跑在 LTP 前停止，没有新分数。复核确认，临时包装生成选择性 init 后漏掉了按该配置重建内核，实际启动的仍是默认交付内核；原先关于组列表锚点失效的归因有误。具体原因见[测例问题](oscomp-test-issues.md#原脚本调用与判分差异)。
 
-当前兼容分支默认 GCC13 内核又以原 RV glibc ELF 和显式触发冷页的 musl ELF 分别复核，均7/7组通过、最小空闲栈1600字节、heap-live=0，e2fsck正常。最终通用 GCC16 内核的冷页 musl 用例为1488字节，已有四核用例为1144字节，均超过1024字节检查线。分别保留于 `build/unix-named-20261024/recheck-official-kernel/`、`recheck-final-up/`、`repair-correctness-smp4/`；兼容内核通过将同一 ELF 安装到其配置的 PID1 可执行路径验证，未执行整套评测。原程序得分仍对应上表注明的内核阶段。复核另发现未连接／监听 UNIX STREAM 接收错误及 accept 的 OFD 分配顺序问题，当前行为与 Linux 差异统一见[网络模块](../modules/kernel-network.md)。
+当前兼容分支默认 GCC13 内核又以原 RV glibc ELF 和显式触发冷页的 musl ELF 分别复核，均7/7组通过、最小空闲栈1600字节、heap-live=0，e2fsck正常。最终通用 GCC16 内核的冷页 musl 用例为1488字节，已有四核用例为1144字节，均超过1024字节检查线。分别保留于 `build/unix-named-20261024/recheck-official-kernel/`、`recheck-final-up/`、`repair-correctness-smp4/`；兼容内核通过将同一 ELF 安装到其配置的 PID1 可执行路径验证，未执行整套评测。原程序得分仍对应上表注明的内核阶段。后续已修复未连接／监听 UNIX STREAM 的 EINVAL，以及 accept 在等待／出队前准备真实 OFD；当前行为与所有权见[网络模块](../modules/kernel-network.md)。
+
+10月24日11:22提交的语义与通知修正版已合入兼容分支，固定官方容器离线 `make all` 生成默认两架构交付物。本地QEMU短例使用这些默认内核，将原RV glibc ELF和本轮RV／LA musl消费者分别安装到配置的PID1可执行路径，三项均7/7组通过，资源归还及e2fsck正常；RV两项最小栈余量均1600字节。它们验证通用内核路径，原六项LTP得分保留上表的原阶段归属。accept内存不足由真实OFD分配EMPTY宿主反例补齐，4/16KiB页检查连接保留、重试双向通信和FD/OFD／凭据／heap归还；原记录在`build/unix-notify-20261024/accept/`、`compat-short/`。性能及仍待查的SMP TCP观察见[本轮成本记录](data-path-budget-experiments.md#unix-接收语义accept-分配与-dgram-通知整理)。
