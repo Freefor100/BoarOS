@@ -30,12 +30,12 @@ static void socket_observe_copy(size_t bytes,int pin)
     unsigned cpu=socket_issuing_cpu();
     __atomic_fetch_add(pin?&socket_pins[cpu]:&socket_copies[cpu],pin?1:bytes,__ATOMIC_RELAXED);
 }
-int __real_kernel_socket_reserve_read(struct kernel_socket *,struct kernel_task *,struct kernel_socket_read_request *,struct kernel_open_file_description **,uint32_t,int);
+int __real_kernel_socket_reserve_read(struct kernel_socket *,struct kernel_task *,struct kernel_socket_read_request *,struct kernel_open_file_description **,uint32_t,int,struct kernel_socket_message *);
 int __wrap_kernel_socket_reserve_read(struct kernel_socket *socket,struct kernel_task *task,
-    struct kernel_socket_read_request *request,struct kernel_open_file_description **pin,uint32_t size,int nonblocking)
+    struct kernel_socket_read_request *request,struct kernel_open_file_description **pin,uint32_t size,int nonblocking,struct kernel_socket_message *message)
 {
     __atomic_fetch_add(&socket_calls[socket_issuing_cpu()],1,__ATOMIC_RELAXED);
-    int result=__real_kernel_socket_reserve_read(socket,task,request,pin,size,nonblocking);
+    int result=__real_kernel_socket_reserve_read(socket,task,request,pin,size,nonblocking,message);
     if(request->socket)socket_hold(1);
     return result;
 }
@@ -45,17 +45,17 @@ int __wrap_kernel_socket_stream_reserve(struct kernel_socket_write_request *requ
     __atomic_fetch_add(&socket_calls[socket_issuing_cpu()],1,__ATOMIC_RELAXED);
     return __real_kernel_socket_stream_reserve(request,size,flags);
 }
-int __real_kernel_socket_write_datagram(struct kernel_open_file_description **,struct kernel_mm *,const struct kernel_uaccess_iovec *,size_t,uint64_t,uint32_t,const struct kernel_socket_address *);
-int __wrap_kernel_socket_write_datagram(struct kernel_open_file_description **pin,struct kernel_mm *mm,const struct kernel_uaccess_iovec *iov,size_t count,uint64_t bytes,uint32_t flags,const struct kernel_socket_address *destination)
+int __real_kernel_socket_write_datagram(struct kernel_open_file_description **,struct kernel_mm *,const struct kernel_uaccess_iovec *,size_t,uint64_t,uint32_t,const struct kernel_socket_address *,struct kernel_socket_message *);
+int __wrap_kernel_socket_write_datagram(struct kernel_open_file_description **pin,struct kernel_mm *mm,const struct kernel_uaccess_iovec *iov,size_t count,uint64_t bytes,uint32_t flags,const struct kernel_socket_address *destination,struct kernel_socket_message *message)
 {
     __atomic_fetch_add(&socket_calls[socket_issuing_cpu()],1,__ATOMIC_RELAXED);
-    return __real_kernel_socket_write_datagram(pin,mm,iov,count,bytes,flags,destination);
+    return __real_kernel_socket_write_datagram(pin,mm,iov,count,bytes,flags,destination,message);
 }
-int __real_kernel_socket_write_unix(struct kernel_open_file_description **,struct kernel_mm *,struct kernel_uaccess_iov_cursor *,uint64_t,uint32_t,int *);
-int __wrap_kernel_socket_write_unix(struct kernel_open_file_description **pin,struct kernel_mm *mm,struct kernel_uaccess_iov_cursor *cursor,uint64_t bytes,uint32_t flags,int *fault)
+int __real_kernel_socket_write_unix(struct kernel_open_file_description **,struct kernel_mm *,struct kernel_uaccess_iov_cursor *,uint64_t,uint32_t,int *,struct kernel_socket_message *);
+int __wrap_kernel_socket_write_unix(struct kernel_open_file_description **pin,struct kernel_mm *mm,struct kernel_uaccess_iov_cursor *cursor,uint64_t bytes,uint32_t flags,int *fault,struct kernel_socket_message *message)
 {
     __atomic_fetch_add(&socket_calls[socket_issuing_cpu()],1,__ATOMIC_RELAXED);
-    return __real_kernel_socket_write_unix(pin,mm,cursor,bytes,flags,fault);
+    return __real_kernel_socket_write_unix(pin,mm,cursor,bytes,flags,fault,message);
 }
 int __real_kernel_socket_wait_ready(struct kernel_socket *,uint32_t,uint64_t,uint32_t);
 int __wrap_kernel_socket_wait_ready(struct kernel_socket *socket,uint32_t events,uint64_t target,uint32_t flags)

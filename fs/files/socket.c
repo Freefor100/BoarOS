@@ -170,7 +170,7 @@ enum kernel_files_status kernel_files_socket_accept(
     for (;;) {
         result = kernel_socket_wait_ready(socket, KERNEL_POLLIN, target, wait_flags);
         if (result) break;
-        result = kernel_socket_accept(socket, &accepted);
+        result = kernel_socket_accept(socket, &accepted, ofd);
         if (result != -KERNEL_EAGAIN || wait_flags) break;
         /* Another acceptor may consume readiness; keep this call's deadline. */
         if (target && kernel_time_monotonic_ns() >= target) break;

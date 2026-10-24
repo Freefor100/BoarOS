@@ -243,6 +243,7 @@ struct kernel_task {
     const struct kernel_credentials *credentials_override;
     uint32_t no_new_privs;
     struct kernel_exec_security *exec_security;
+    struct kernel_socket_call *socket_call;
 } __attribute__((aligned(16)));
 
 #endif

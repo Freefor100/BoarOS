@@ -21,6 +21,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/socket.h>
+#include <kernel/socket_control.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
@@ -359,7 +360,7 @@ static enum kernel_files_status read_pinned(
     size_t iov_count,
     uint64_t count, int scalar,
     int64_t *linux_result, uint32_t socket_flags,
-    struct kernel_socket_address *peer, uint32_t *message_size)
+    struct kernel_socket_address *peer, uint32_t *message_size, struct kernel_socket_message *socket_message)
 {
     struct kernel_open_file_description *description = *description_owner;
     if (description->block) {
@@ -413,6 +414,7 @@ static enum kernel_files_status read_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        if ((socket_flags & KERNEL_SOCKET_MSG_PEEK) && !socket_message) __builtin_trap();
         struct kernel_socket_read_request read_request = {0};
         int received = 0;
         uint64_t target = 0;
@@ -436,7 +438,7 @@ static enum kernel_files_status read_pinned(
                 kernel_open_file_socket(description), kernel_task_current(),
                 &read_request, description_owner,
                 remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
-                socket_flags & KERNEL_SOCKET_MSG_DONTWAIT);
+                socket_flags & KERNEL_SOCKET_MSG_DONTWAIT, socket_message);
             if (received == -KERNEL_EAGAIN && total == 0U && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
                 /* ready后数据仍可能被另一reader取走，本次调用只取得一次预算。 */
                 if (!timeout_captured) {
@@ -628,7 +630,7 @@ enum kernel_files_status kernel_files_read(
         return release_io_description(files,&description,KERNEL_FILES_STATUS_OK);
     }
     status = read_pinned(files, mm, &description, &iov, 1U, count, 1,
-                         linux_result, 0U, 0, 0);
+                         linux_result, 0U, 0, 0, NULL);
     return release_io_description(files, &description, status);
 }
 
@@ -706,7 +708,7 @@ static enum kernel_files_status readv_request(
         else KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
     } else status = read_pinned(files, mm, &description,
                          snapshot.view, snapshot.count,
-                         snapshot.total, 0, linux_result, 0U, 0, 0);
+                         snapshot.total, 0, linux_result, 0U, 0, 0, NULL);
     dispatched = 1;
 out:
     kernel_uaccess_iov_cleanup(&snapshot,files->heap);
@@ -815,7 +817,7 @@ static enum kernel_files_status pread_iov_pinned(
     }
     if (description->device && description->device->positioned) {
         return read_pinned(files, mm, description_owner, iov, iov_count, count, 0,
-                           linux_result, 0U, 0, 0);
+                           linux_result, 0U, 0, 0, NULL);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
         kernel_open_file_read_begin(description, (uint64_t)offset);
@@ -1321,7 +1323,7 @@ static enum kernel_files_status buffered_write_request(
 static enum kernel_files_status unix_write_request(struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
-    uint32_t flags, int64_t *linux_result)
+    uint32_t flags, int64_t *linux_result, struct kernel_socket_message *socket_message)
 {
     struct kernel_open_file_description *borrowed=description;
     struct kernel_socket *socket=kernel_open_file_socket(description);
@@ -1334,7 +1336,7 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
     do {
         int fault=0;
         int result=kernel_socket_write_unix(&description,mm,&cursor,count-total,
-            flags|KERNEL_SOCKET_MSG_DONTWAIT,&fault);
+            flags|KERNEL_SOCKET_MSG_DONTWAIT,&fault, socket_message);
         if (result==-KERNEL_EAGAIN && !(flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
             uint64_t now=target?kernel_time_monotonic_ns():0;
             result=target && now>=target?-KERNEL_EAGAIN:kernel_socket_wait_ready(kernel_open_file_socket(borrowed),
@@ -1558,7 +1560,7 @@ static enum kernel_files_status write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed)
+    int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed, struct kernel_socket_message *socket_message)
 {
     if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
         count, 1, positioned, requested_offset, linux_result);
@@ -1579,7 +1581,7 @@ static enum kernel_files_status write_request(
     COST_IO_ADD(0, 1); COST_IO_ADD(1, count);
     if (kernel_socket_is_datagram(kernel_open_file_socket(description))) {
         *linux_result = kernel_socket_write_datagram(&description, mm, iov,
-            iov_count, count, socket_flags, 0);
+            iov_count, count, socket_flags, 0, socket_message);
         COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1590,7 +1592,7 @@ static enum kernel_files_status write_request(
         return status;
     }
     if (kind==KERNEL_OPEN_FILE_KIND_SOCKET) {
-        enum kernel_files_status status=unix_write_request(files,mm,description,iov,iov_count,count,socket_flags,linux_result);
+        enum kernel_files_status status=unix_write_request(files,mm,description,iov,iov_count,count,socket_flags,linux_result, socket_message);
         if (status==KERNEL_FILES_STATUS_OK) COST_IO_ADD(2,*linux_result>0?(uint64_t)*linux_result:0);
         return status;
     }
@@ -1604,7 +1606,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
     struct kernel_open_file_description **owner,
     const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
     uint32_t flags, int writing, struct kernel_socket_address *peer,
-    uint32_t *message_size, int64_t *linux_result)
+    uint32_t *message_size, int64_t *linux_result, struct kernel_socket_message *socket_message)
 {
     if (!kernel_files_is_live(files) || mm == 0 || owner == 0 || *owner == 0 ||
         kernel_open_file_socket(*owner) == 0 || linux_result == 0)
@@ -1612,7 +1614,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (writing) {
         KERNEL_FILES_NOTE(files, write_calls, 1);
-        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags,NULL);
+        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags,NULL, socket_message);
         if (status == KERNEL_FILES_STATUS_OK) {
             if (*linux_result >= 0) KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
             else KERNEL_FILES_NOTE(files, write_failures, 1);
@@ -1620,7 +1622,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
         return status;
     }
     KERNEL_FILES_NOTE(files, read_calls, 1);
-    return read_pinned(files, mm, owner, iov, iov_count, count, 0, linux_result, flags, peer, message_size);
+    return read_pinned(files, mm, owner, iov, iov_count, count, 0, linux_result, flags, peer, message_size, socket_message);
 }
 enum kernel_files_status kernel_files_socket_io(
     struct kernel_files *files, struct kernel_mm *mm,
@@ -1628,7 +1630,7 @@ enum kernel_files_status kernel_files_socket_io(
     uint64_t count, uint32_t flags, int writing, int64_t *linux_result)
 {
     const struct kernel_uaccess_iovec iov = {user_buffer, count};
-    return kernel_files_socket_iov_io(files, mm, owner, &iov, 1, count, flags, writing, 0, 0, linux_result);
+    return kernel_files_socket_iov_io(files, mm, owner, &iov, 1, count, flags, writing, 0, 0, linux_result, NULL);
 }
 
 static void account_write(struct kernel_files *files, int64_t result)
@@ -1690,7 +1692,7 @@ enum kernel_files_status kernel_files_write(
             kernel_task_current(), files, &description, 0, mm, &iov, 1U,
             count, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, &iov, 1U, count,
-                           0, 0U, linux_result, 0U,NULL);
+                           0, 0U, linux_result, 0U,NULL, NULL);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
@@ -1748,7 +1750,7 @@ enum kernel_files_status kernel_files_pwrite(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     iov.length = count;
     status = write_request(files, mm, description, &iov, 1U, count,
-                           1, (uint64_t)offset, linux_result, 0U,NULL);
+                           1, (uint64_t)offset, linux_result, 0U,NULL, NULL);
     if (status == KERNEL_FILES_STATUS_OK) account_write(files, *linux_result);
     return release_io_description(files, &description, status);
 }
@@ -1810,7 +1812,7 @@ static enum kernel_files_status writev_request(
             &snapshot.allocation, mm, snapshot.view, snapshot.count,
             snapshot.total, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, snapshot.view, snapshot.count, snapshot.total,
-                           positioned, (uint64_t)offset, linux_result, 0U,NULL);
+                           positioned, (uint64_t)offset, linux_result, 0U,NULL, NULL);
 out:
     kernel_uaccess_iov_cleanup(&snapshot,files->heap);
     if (status == KERNEL_FILES_STATUS_OK) {

@@ -504,7 +504,7 @@ static void stream_copy_probe(void)
         struct kernel_socket_address local = {.family = KERNEL_SOCKET_AF_INET}, remote = {.family = KERNEL_SOCKET_AF_INET, .bytes = {127,0,0,1}};
         check(kernel_socket_bind(listening, &local) == 0 && kernel_socket_getname(listening, &local) == 0 &&
             kernel_socket_listen(listening, 2) == 0 && (remote.port = local.port, kernel_socket_connect(socket, &remote, 0)) == 0 &&
-            kernel_socket_accept(listening, &accepted) == 0 &&
+            kernel_socket_accept(listening, &accepted, NULL) == 0 &&
             kernel_open_file_create_socket(&heap, accepted, 0, &reader) == KERNEL_OPEN_FILE_STATUS_OK, 318);
         struct kernel_thread_join writer = {0};
         check(kernel_thread_create_joinable(stream_copy_owner, 0, &writer) == KERNEL_SCHEDULER_STATUS_OK, 319);
@@ -519,7 +519,7 @@ static void stream_copy_probe(void)
         kernel_thread_join(&writer);
         if (!send_copy_mode) {
             struct kernel_socket_read_request request = {0}; char data[3];
-            check(kernel_socket_reserve_read(accepted, kernel_task_current(), &request, &reader, 3, 1) == 3, 327);
+            check(kernel_socket_reserve_read(accepted, kernel_task_current(), &request, &reader, 3, 1, NULL) == 3, 327);
             kernel_socket_copy_read(&request, 0, data, 3); check(!memcmp(data, "pin", 3), 328); kernel_socket_finish_read(&request, 0);
         } else if (send_copy_mode == 2) {
             struct kernel_socket_write_request request = {0}; kernel_socket_stream_begin(&request, &client);

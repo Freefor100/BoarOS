@@ -1,5 +1,6 @@
 #include <kernel/network.h>
 #include <kernel/socket.h>
+#include <kernel/socket_control.h>
 #include <kernel/errno.h>
 #include <kernel/cost.h>
 #include <kernel/console.h>
@@ -167,6 +168,7 @@ static void timer_worker(void *context)
 {
     struct kernel_network *n = context;
     while (!stopping(n)) {
+        kernel_socket_rights_service();
         uintptr_t irq = arch_interrupt_save();
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
         struct kernel_socket_service_result service = kernel_socket_service_owned(&scope,
@@ -227,6 +229,7 @@ static void worker(void *context)
     struct kernel_network *n = context;
     struct virtio_net_device *d = n->device;
     while (!stopping(n)) {
+        kernel_socket_rights_service();
         unsigned handled = 0;
         int failed = virtio_net_service(d);
         release_completed(n);
@@ -290,6 +293,8 @@ int kernel_network_stop(struct kernel_network **owner)
 {
     if (!owner || !*owner) return 0;
     struct kernel_network *n = *owner;
+    int rights=kernel_socket_rights_drain();
+    if (rights) return rights;
     uintptr_t irq = arch_interrupt_save();
     int first_stop = !n->stopping;
     if (n->device) n->device->stopping = 1;
@@ -302,6 +307,8 @@ int kernel_network_stop(struct kernel_network **owner)
     n->stopping=1;(void)kernel_wait_queue_wake_all(progress(n));
     arch_interrupt_restore(stopped_irq);
     if (n->worker.task) kernel_thread_join(&n->worker);
+    rights=kernel_socket_rights_drain();
+    if (rights) {arch_interrupt_restore(irq);return rights;}
     if (n->device && virtio_net_quiesce(n->device)) { arch_interrupt_restore(irq); return -KERNEL_EIO; }
     if (n->attached) {
         struct kernel_socket_protocol_scope core; kernel_socket_protocol_enter(&core);

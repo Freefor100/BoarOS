@@ -17,6 +17,7 @@
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
+#include <kernel/socket_call.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -1614,6 +1615,7 @@ static void cleanup_task_io_requests(struct kernel_task *thread)
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
+    if (thread->socket_call) kernel_socket_call_abort(thread->socket_call);
     if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
 }
@@ -2028,6 +2030,20 @@ enum kernel_task_status kernel_task_epoll_clear(
     if (!task || !request || task->epoll_wait_request != request)
         return KERNEL_TASK_STATUS_STATE;
     task->epoll_wait_request = previous;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_socket_call_register(struct kernel_task *task, struct kernel_socket_call *call)
+{
+    if (!task || task != kernel_task_current() || !call || task->socket_call)
+        return KERNEL_TASK_STATUS_STATE;
+    task->socket_call = call;
+    return KERNEL_TASK_STATUS_OK;
+}
+enum kernel_task_status kernel_task_socket_call_clear(struct kernel_task *task, struct kernel_socket_call *call)
+{
+    if (!task || !call || task->socket_call != call) return KERNEL_TASK_STATUS_STATE;
+    task->socket_call = 0;
     return KERNEL_TASK_STATUS_OK;
 }
 

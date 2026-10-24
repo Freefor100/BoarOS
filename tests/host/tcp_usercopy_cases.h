@@ -87,9 +87,9 @@ static void tcp_nonblock_attempt(void)
     __atomic_store_n(&tcp_nonblock_attempted,1,__ATOMIC_RELEASE);
     while(!__atomic_load_n(&tcp_nonblock_changed,__ATOMIC_ACQUIRE)) sched_yield();
 }
-int __real_kernel_socket_reserve_read(struct kernel_socket *,struct kernel_task *,struct kernel_socket_read_request *,struct kernel_open_file_description **,uint32_t,int);
+int __real_kernel_socket_reserve_read(struct kernel_socket *,struct kernel_task *,struct kernel_socket_read_request *,struct kernel_open_file_description **,uint32_t,int,struct kernel_socket_message *);
 int __wrap_kernel_socket_reserve_read(struct kernel_socket *socket,struct kernel_task *task,
-    struct kernel_socket_read_request *request,struct kernel_open_file_description **owner,uint32_t capacity,int nonblock)
+    struct kernel_socket_read_request *request,struct kernel_open_file_description **owner,uint32_t capacity,int nonblock,struct kernel_socket_message *message)
 {
     tcp_nonblock_attempt();
     if(unix_deadline_active && ++unix_deadline_reservations>1) {
@@ -99,7 +99,7 @@ int __wrap_kernel_socket_reserve_read(struct kernel_socket *socket,struct kernel
         while(__atomic_load_n(&unix_deadline_stolen,__ATOMIC_ACQUIRE)<round) sched_yield();
         unix_deadline_now=round==1?1010:1021;
     }
-    return __real_kernel_socket_reserve_read(socket,task,request,owner,capacity,nonblock);
+    return __real_kernel_socket_reserve_read(socket,task,request,owner,capacity,nonblock,message);
 }
 int __real_kernel_socket_stream_reserve(struct kernel_socket_write_request *,uint32_t,uint32_t);
 int __wrap_kernel_socket_stream_reserve(struct kernel_socket_write_request *request,uint32_t size,uint32_t flags)
@@ -112,10 +112,10 @@ int __wrap_kernel_socket_stream_reserve(struct kernel_socket_write_request *requ
     }
     return result;
 }
-int __real_kernel_socket_write_unix(struct kernel_open_file_description **,struct kernel_mm *,struct kernel_uaccess_iov_cursor *,uint64_t,uint32_t,int *);
+int __real_kernel_socket_write_unix(struct kernel_open_file_description **,struct kernel_mm *,struct kernel_uaccess_iov_cursor *,uint64_t,uint32_t,int *,struct kernel_socket_message *);
 int __wrap_kernel_socket_write_unix(struct kernel_open_file_description **owner,struct kernel_mm *space,
-    struct kernel_uaccess_iov_cursor *cursor,uint64_t count,uint32_t flags,int *fault)
-{ tcp_nonblock_attempt();return __real_kernel_socket_write_unix(owner,space,cursor,count,flags,fault); }
+    struct kernel_uaccess_iov_cursor *cursor,uint64_t count,uint32_t flags,int *fault,struct kernel_socket_message *message)
+{ tcp_nonblock_attempt();return __real_kernel_socket_write_unix(owner,space,cursor,count,flags,fault,message); }
 static int tcp_protocol_held(void)
 {
     for(struct kernel_lock_guard *g=kernel_io_context_current()->locks;g;g=g->previous)
@@ -244,7 +244,7 @@ static void tcp_wait_owner_case(struct kernel_heap *heap,int writing)
     int connected=kernel_socket_connect(client,&address,0);
     assert(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    assert(!kernel_socket_accept(listener,&server) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+    assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     struct kernel_files handle={0};assert(!kernel_files_create(&handle,heap));
     struct kernel_open_file_description *out=0,*in=0;
     assert(!kernel_open_file_create_socket(heap,client,2,&out));
@@ -388,7 +388,7 @@ static void tcp_read_batch_case(struct kernel_heap *heap)
     assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
     int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    assert(!kernel_socket_accept(listener,&server) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+    assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     struct kernel_files handle={0};assert(!kernel_files_create(&handle,heap));
     struct kernel_open_file_description *out=0,*in=0;
     assert(!kernel_open_file_create_socket(heap,client,2,&out));
@@ -569,7 +569,7 @@ static void tcp_nonblock_timeout_case(struct kernel_heap *heap,int unix_socket)
         assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
         int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
         for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-        assert(!kernel_socket_accept(listener,&server) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+        assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     }
     kernel_socket_set_receive_timeout(server,2000000000ULL);kernel_socket_set_send_timeout(client,2000000000ULL);
     struct kernel_files handle={0};assert(!kernel_files_create(&handle,heap));
@@ -628,7 +628,7 @@ static void tcp_usercopy_case(struct kernel_heap *heap)
     int connected=kernel_socket_connect(client,&address,0);
     assert(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    assert(!kernel_socket_accept(listener,&server));
+    assert(!kernel_socket_accept(listener,&server, NULL));
     assert(!kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     struct kernel_files handle={0};assert(!kernel_files_create(&handle,heap));
     struct kernel_open_file_description *out=0,*in=0;
@@ -805,7 +805,7 @@ static void tcp_write_batch_case(struct kernel_heap *heap)
             !kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
         int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
         for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-        assert(!kernel_socket_accept(listener,&server) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+        assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
         struct kernel_files handle={0};struct kernel_open_file_description *out=NULL,*in=NULL,*owner=NULL;
         assert(!kernel_files_create(&handle,heap) && !kernel_open_file_create_socket(heap,client,2,&out) &&
             !kernel_open_file_create_socket(heap,server,2|KERNEL_FILES_O_NONBLOCK,&in) &&

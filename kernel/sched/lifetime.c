@@ -295,7 +295,7 @@ enum kernel_scheduler_status scheduler_join_claim_locked(struct kernel_thread_jo
     enum kernel_scheduler_status status = scheduler_task_claim_exit_locked(task);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     if (task->arch.user_mode || task->io_context.locks ||
-        task->io_context.backend_depth || task->io_buffer) __builtin_trap();
+        task->io_context.backend_depth || task->io_buffer || task->socket_call) __builtin_trap();
     exited_remove_locked(task);
     join->task = 0;
     task->join = 0;
