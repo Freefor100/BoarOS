@@ -459,13 +459,18 @@ static void unix_get_locked(struct kernel_socket *socket)
     if(!socket->unix_references || socket->unix_references==UINT32_MAX)__builtin_trap();
     socket->unix_references++;
 }
+static int unix_put_locked(struct kernel_socket *socket)
+{
+    if(!socket->unix_references)__builtin_trap();
+    int release=!--socket->unix_references;
+    if(release && (socket->destroying!=2 || socket->unix_packets || socket->unix_memory || socket->unix_path || socket->unix_name))__builtin_trap();
+    return release;
+}
 static void unix_put(struct kernel_socket *socket)
 {
     if(!socket)return;
     SOCKET_STATE(state);
-    if(!socket->unix_references)__builtin_trap();
-    int release=!--socket->unix_references;
-    if(release && (socket->destroying!=2 || socket->unix_packets || socket->unix_memory || socket->unix_path || socket->unix_name))__builtin_trap();
+    int release=unix_put_locked(socket);
     socket_state_release(&state);
     if(release)kernel_heap_release(socket->heap,socket);
 }
@@ -649,7 +654,7 @@ static uint64_t unix_deadline(struct kernel_socket *socket)
     }
     return deadline;
 }
-/* Packet accounting owns sender storage after the last user close. */
+/* A nonempty sender packet set holds one storage reference until its last packet leaves. */
 static void unix_uncharge(struct socket_packet *packet)
 {
     struct kernel_socket *sender=packet->unix_sender;
@@ -659,9 +664,10 @@ static void unix_uncharge(struct socket_packet *packet)
     if(!sender->unix_packets || sender->unix_memory<packet->send_charge)__builtin_trap();
     sender->unix_memory-=packet->send_charge;sender->unix_packets--;
     packet->unix_sender=0;
+    int release=!sender->unix_packets && unix_put_locked(sender);
     if(!sender->destroying)wake_socket(sender);
     socket_state_release(&irq);
-    unix_put(sender);
+    if(release)kernel_heap_release(sender->heap,sender);
 }
 static uint32_t unix_charge(uint32_t size)
 { return (uint32_t)sizeof(struct socket_packet)+size; }
@@ -669,7 +675,9 @@ static void unix_publish_owner(struct kernel_socket *sender,struct socket_packet
 {
     if(packet->unix_sender || sender->unix_packets==UINT32_MAX || sender->unix_memory>UINT64_MAX-charge)__builtin_trap();
     packet->unix_sender=sender;packet->send_charge=charge;
-    sender->unix_packets++;sender->unix_memory+=charge;unix_get_locked(sender);
+    /* Per-packet bytes stay charged individually; the shared reference covers their owner set. */
+    if(!sender->unix_packets)unix_get_locked(sender);
+    sender->unix_packets++;sender->unix_memory+=charge;
 }
 static int unix_writable(const struct kernel_socket *sender)
 { return sender->unix_memory+sender->tx_reserved<=sender->tx_limit/4U; }
@@ -1828,7 +1836,7 @@ enum socket_protocol_operation { SOCKET_PROTOCOL_STREAM, SOCKET_PROTOCOL_UDP_PRE
 static int protocol_request(struct kernel_socket_write_request *,enum socket_protocol_operation);
 
 static void socket_write_begin(struct kernel_socket_write_request *request,
-    struct kernel_open_file_description **pin_owner)
+    struct kernel_open_file_description **pin_owner,int hold_unix_peer)
 {
     *request=(struct kernel_socket_write_request){.socket=kernel_open_file_socket(*pin_owner),
         .task=kernel_task_current(),.pin=*pin_owner,.pin_owner=pin_owner};
@@ -1839,6 +1847,11 @@ static void socket_write_begin(struct kernel_socket_write_request *request,
     request->active_next=socket->active_writes;request->active_previous=&socket->active_writes;
     if(request->active_next)request->active_next->active_previous=&request->active_next;
     socket->active_writes=request;
+    /* Close can detach the peer edge; borrow its storage in this same publication lock. */
+    if(hold_unix_peer && socket->peer) {
+        request->unix_destination=socket->peer;
+        unix_get_locked(request->unix_destination);
+    }
 }
 static void socket_write_end(struct kernel_socket_write_request *request)
 {
@@ -1848,7 +1861,13 @@ static void socket_write_end(struct kernel_socket_write_request *request)
     if(request->active_next)request->active_next->active_previous=request->active_previous;
     request->active_next=0;request->active_previous=0;
     if(request->task && kernel_task_socket_write_clear(request->task,request)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+    struct kernel_socket *destination=request->unix_destination;
+    request->unix_destination=NULL;
+    int release=destination && unix_put_locked(destination);
     wake_socket(request->socket);
+    struct kernel_heap *heap=release?destination->heap:NULL;
+    socket_state_release(&state);
+    if(release)kernel_heap_release(heap,destination);
 }
 static void tcp_flush_output(struct kernel_socket *socket);
 static int tcp_write_buffer_locked(struct kernel_socket *socket,
@@ -1878,8 +1897,6 @@ static void clear_write_request(struct kernel_socket_write_request *request)
     if(request->progressed & SOCKET_WRITE_DEFERRED)
         (void)protocol_request(request,SOCKET_PROTOCOL_FLUSH);
     socket_write_end(request);
-    struct kernel_socket *destination=request->unix_destination;request->unix_destination=NULL;
-    unix_put(destination);
 }
 void kernel_socket_abort_write(struct kernel_socket_write_request *request)
 {
@@ -1989,15 +2006,18 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
             if(socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)return -KERNEL_EDESTADDRREQ;
         }
     }
-    struct kernel_socket_write_request request={0};socket_write_begin(&request,pin_owner);
+    int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
+        !(destination && socket->type==SOCKET_DGRAM);
+    struct kernel_socket_write_request request={0};
+    socket_write_begin(&request,pin_owner,hold_unix_peer);
     int result = -KERNEL_ENOMEM;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         if(destination && socket->type==SOCKET_DGRAM) {
             result=unix_lookup(socket,destination,&request.unix_destination);if(result)goto out;
         } else {
-            SOCKET_STATE(state);
-            if(!socket->peer) {result=unix_peer_failure(socket);goto out;}
-            request.unix_destination=socket->peer;unix_get_locked(request.unix_destination);
+            if(!request.unix_destination) {
+                SOCKET_STATE(state);result=unix_peer_failure(socket);goto out;
+            }
         }
     }
     if(request.socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
@@ -2174,7 +2194,7 @@ void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner)
 {
     if (!request || !pin_owner || !kernel_socket_is_tcp(kernel_open_file_socket(*pin_owner))) __builtin_trap();
-    socket_write_begin(request,pin_owner);
+    socket_write_begin(request,pin_owner,0);
 }
 int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     uint32_t size, uint32_t flags)
