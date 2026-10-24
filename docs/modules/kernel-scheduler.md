@@ -53,7 +53,7 @@ SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有
 摘除AVL，再发布完成原因；finish收完节点及借用后才清空record，futex requeue直接迁移节点。
 
 任务的on_cpu与CPU切换前驱共同保护旧栈：阻塞提交后的提前wake只记录ready_pending，
-park自行保存IRQ并保持关闭跨过切换交接，返回时恢复原状态；
+park自行保存IRQ并保持关闭跨过切换交接，返回时恢复原状态；恢复后的执行者已经取得本任务CPU，NOTIFIED原因到它执行finish前保持不变，读取结果不再重复取得调度保护。finish仍在保护内拆除登记并等待真实借用归还。
 新栈的`kernel_scheduler_switch_finish`才发布旧任务或允许回收。恢复已有上下文的C切换尾部、
 首次kernel/user trampoline及退出切换经过同一完成点；无切换的普通异常返回不重复查询。
 调度请求用原子exchange消费，完成点不清除后来请求。

@@ -1,6 +1,8 @@
 #include <kernel/cost.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
+#include <kernel/rlimit.h>
+#include <kernel/task.h>
 #include <kernel/vma.h>
 #include <kernel/shm.h>
 
@@ -40,12 +42,17 @@ uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set)
     return set->total_bytes;
 }
 
-int kernel_vma_is_data(const struct kernel_vma *vma)
+static int private_data_mapping(const struct kernel_vma *vma)
 {
-    return (vma->permissions & 2U) && vma->role != KERNEL_VMA_ROLE_STACK &&
+    return vma->role != KERNEL_VMA_ROLE_STACK &&
         (vma->kind == KERNEL_VMA_KIND_ANONYMOUS ||
          vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
          vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE);
+}
+
+int kernel_vma_is_data(const struct kernel_vma *vma)
+{
+    return (vma->permissions & 2U) && private_data_mapping(vma);
 }
 
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set)
@@ -733,6 +740,73 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
         .permissions = permissions,
         .kind = KERNEL_VMA_EDIT_PROTECT,
     };
+    return KERNEL_VMA_STATUS_OK;
+}
+
+enum kernel_vma_status kernel_vma_set_prepare_mprotect(
+    struct kernel_vma_set *set, uint64_t start, uint64_t end,
+    uint32_t permissions, struct kernel_vma_edit *edit)
+{
+    COST_SCOPE(cost_prepare, VMA_PREPARE_TICKS);
+    if (!edit) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    edit->set = 0;
+    if (!set_valid(set) || start >= end)
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    uint32_t index = lower_bound(set, start);
+    if (index && set->entries[index - 1].end > start) index--;
+    uint32_t first_split = 0;
+    uint64_t data = set->data_bytes;
+    struct kernel_memory_limits limits;
+    int have_limits = 0;
+    while (start < end) {
+        if (index == set->count || set->entries[index].start > start ||
+            set->entries[index].end <= start)
+            return KERNEL_VMA_STATUS_NO_MEMORY;
+        const struct kernel_vma *vma = &set->entries[index++];
+        COST_ADD(VMA_COVERAGE, 1);
+        COST_ADD(VMA_PERMISSION, 1);
+        uint64_t finish = vma->end < end ? vma->end : end;
+        if (permissions & ~vma->maximum_permissions)
+            return KERNEL_VMA_STATUS_ACCESS;
+        if (vma->permissions == permissions) { start = finish; continue; }
+        uint64_t bytes = finish - start;
+        if (((vma->permissions ^ permissions) & 2U) && private_data_mapping(vma)) {
+            if (permissions & 2U) {
+                if (!have_limits) {
+                    kernel_task_current_memory_limits(&limits);
+                    have_limits = 1;
+                }
+                uint64_t limit = limits.data_soft ? limits.data_soft : limits.data_hard;
+                /* 新旧属性都拒绝AS扩张时，Linux仍允许这次权限转换。 */
+                if (set->total_bytes <= limits.address_space &&
+                    bytes <= limits.address_space - set->total_bytes &&
+                    (data > limit || bytes > limit - data))
+                    return KERNEL_VMA_STATUS_NO_MEMORY;
+                data += bytes;
+            } else data -= bytes;
+        }
+        uint32_t end_split = finish < vma->end;
+        if (!edit->set) {
+            if (set->generation == UINT64_MAX) return KERNEL_VMA_STATUS_STATE;
+            first_split = start > vma->start;
+        }
+        if (!edit->set || end_split) {
+            uint32_t extra = first_split + end_split;
+            if (set->count > UINT32_MAX - extra) return KERNEL_VMA_STATUS_NO_MEMORY;
+            /* 扩容可移动数组；此后不再借用vma。失败保留已预留的前缀。 */
+            enum kernel_vma_status status = reserve_entries(set, set->count + extra);
+            if (status) return status;
+        }
+        if (!edit->set) {
+            *edit = (struct kernel_vma_edit){
+                .set = set, .generation = set->generation,
+                .start = start, .permissions = permissions,
+                .kind = KERNEL_VMA_EDIT_PROTECT,
+            };
+        }
+        edit->end = finish;
+        start = finish;
+    }
     return KERNEL_VMA_STATUS_OK;
 }
 

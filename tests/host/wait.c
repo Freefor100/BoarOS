@@ -127,6 +127,9 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
     assert(t->ready_node.queued && !t->wait.on_cpu);
     kernel_sched_dequeue(&runnable, &t->ready_node);
     t->wait.on_cpu = 1;
+    /* The resumed owner already has the completed result; only finish needs
+     * to return to the shared domain to detach its remaining registrations. */
+    forbid_wait_lock = 1;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 void kernel_wait_backend_quiesce(void) { sched_yield(); }
@@ -154,6 +157,7 @@ static void arbitration(unsigned count)
     switching = 1;
     enum kernel_wait_wake_reason reason;
     assert(kernel_wait_park(&shared_token, &reason) == KERNEL_SCHEDULER_STATUS_OK);
+    forbid_wait_lock = 0;
     switching = 0;
     for (unsigned i = 0; i < count; i++) assert(!pthread_join(workers[i], 0));
     assert(reason <= KERNEL_WAIT_SIGNALLED);

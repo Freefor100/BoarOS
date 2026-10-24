@@ -26,9 +26,56 @@ static _Thread_local int abandon_import;
 static int abandon_park;
 static _Thread_local int abandon_export;
 static _Thread_local int pause_export;
+static _Thread_local uint64_t output_fault_at;
+static _Thread_local struct kernel_uaccess_write_cursor *active_output;
 static _Thread_local int wake_on_park = -1;
 static _Thread_local int use_permission;
+static _Thread_local int pause_before_park, pause_notify;
+static _Thread_local struct kernel_task *aborting;
 static struct kernel_credentials nobody = {.euid = 40, .egid = 50};
+static void hold_at_boundary(void)
+{
+    unsigned bit = 1U << (unsigned)(cpu.current - task);
+    assert(!pthread_mutex_lock(&handshake_lock));
+    entered |= bit;
+    assert(!pthread_cond_broadcast(&handshake_cond));
+    while (!(released & bit))
+        assert(!pthread_cond_wait(&handshake_cond, &handshake_lock));
+    assert(!pthread_mutex_unlock(&handshake_lock));
+}
+enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_token *,
+                                                    enum kernel_wait_wake_reason *);
+enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,
+                                                    enum kernel_wait_wake_reason *reason)
+{
+    if (pause_before_park) {
+        pause_before_park = 0;
+        hold_at_boundary();
+    }
+    return __real_kernel_wait_park(token, reason);
+}
+enum kernel_scheduler_status __real_kernel_wait_notify(const struct kernel_wait_token *,
+                                                      enum kernel_wait_wake_reason);
+enum kernel_scheduler_status __wrap_kernel_wait_notify(const struct kernel_wait_token *token,
+                                                      enum kernel_wait_wake_reason reason)
+{
+    if (pause_notify) {
+        pause_notify = 0;
+        hold_at_boundary();
+    }
+    return __real_kernel_wait_notify(token, reason);
+}
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{
+    if (aborting && aborting->msg_request && lock == &aborting->msg_request->queue->lock) {
+        assert(!pthread_mutex_lock(&handshake_lock));
+        entered |= 1U << (unsigned)(cpu.current - task);
+        assert(!pthread_cond_broadcast(&handshake_cond));
+        assert(!pthread_mutex_unlock(&handshake_lock));
+    }
+    __real_kernel_raw_lock_acquire(lock, guard);
+}
 void *sync_test_cpu(void)
 {
     return &cpu;
@@ -123,9 +170,24 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m, uint64_t d, 
     }
     if (abandon_export)
         pthread_exit(0);
-    if (d < 4096)
+    if (d < 4096 || d == output_fault_at)
         return KERNEL_UACCESS_STATUS_FAULT;
     return kernel_copy_from_user(m, (void *)(uintptr_t)d, (uintptr_t)s, n, c);
+}
+/* This seam checks cursor completion and shares the existing usercopy fault
+ * boundary. It does not model physical page pinning or its performance. */
+enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
+    struct kernel_mm *m, struct kernel_uaccess_write_cursor *cursor,
+    uint64_t destination, const void *source, size_t size, size_t *copied)
+{
+    assert(!active_output || active_output == cursor);
+    active_output = cursor;
+    return kernel_copy_to_user(m, destination, source, size, copied);
+}
+void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *cursor)
+{
+    assert(active_output == cursor);
+    active_output = 0;
 }
 void kernel_pid_get(struct kernel_pid *p)
 {
@@ -252,7 +314,10 @@ static int64_t send(int q, struct packet *p, uint64_t n, int flags)
 }
 static int64_t recv(int q, void *p, uint64_t n, int64_t type, int flags)
 {
-    return kernel_msg_receive(cpu.current, &cpu.current->mm, q, (uintptr_t)p, n, type, flags);
+    int64_t result = kernel_msg_receive(cpu.current, &cpu.current->mm, q, (uintptr_t)p, n, type,
+                                       flags);
+    assert(!active_output);
+    return result;
 }
 static struct kernel_msqid64_ds statq(int q)
 {
@@ -324,6 +389,18 @@ static void copy_and_faults(void)
     assert(kernel_msg_send(cpu.current, &cpu.current->mm, -1, 1, 8193, 0) == -KERNEL_EFAULT);
     assert(send(-1, &p, 1, 0) == -KERNEL_EINVAL);
     assert(recv(q, (void *)1, 8192, 0, 0) == -KERNEL_EFAULT && !statq(q).msg_qnum);
+    for (unsigned copy = 0; copy < 2; copy++) {
+        assert(!send(q, &p, 7, 0));
+        o.type = -1;
+        o.data[0] = 99;
+        output_fault_at = (uintptr_t)o.data;
+        assert(recv(q, &o, 7, 0, copy ? KERNEL_MSG_COPY | KERNEL_IPC_NOWAIT : 0) ==
+               -KERNEL_EFAULT);
+        output_fault_at = 0;
+        assert(o.type == 8 && o.data[0] == 99 && statq(q).msg_qnum == copy);
+        if (copy)
+            assert(!recv(q, &o, 0, 0, KERNEL_MSG_NOERROR));
+    }
     struct kernel_msginfo i;
     assert(ctl(0, KERNEL_MSG_INFO, &i) >= 0 && i.msgpool == 1 && !i.msgmap && !i.msgtql);
     assert(ctl(q, KERNEL_IPC_STAT | KERNEL_IPC_64, &o) == -KERNEL_EINVAL);
@@ -333,7 +410,7 @@ static void copy_and_faults(void)
 }
 struct wait_case {
     unsigned task;
-    int id, sending, flags, permission, export_pause;
+    int id, sending, flags, permission, export_pause, before_park, notify_pause;
     uint64_t size;
     int64_t type, result;
     struct packet packet;
@@ -345,6 +422,8 @@ static void *waiter(void *ptr)
     block_handshake = 1;
     use_permission = w->permission;
     pause_export = w->export_pause;
+    pause_before_park = w->before_park;
+    pause_notify = w->notify_pause;
     w->result = w->sending ? send(w->id, &w->packet, w->size, w->flags)
                            : recv(w->id, &w->packet, w->size, w->type, w->flags);
     return 0;
@@ -696,6 +775,63 @@ static void nonleader_receive_pid(void)
     clean();
     puts("PASS nonleader blocked direct receive records TID while queued receive records TGID");
 }
+static void *remote_abort(void *target)
+{
+    current(3);
+    aborting = target;
+    kernel_msg_abort(aborting);
+    return 0;
+}
+static void completion_ownership(void)
+{
+    int q = make();
+    struct packet p = {.type = 1, .data = "before-park"};
+    struct wait_case w = {.task = 1, .id = q, .size = 11, .before_park = 1};
+    pthread_t t = start(&w);
+    assert(!send(q, &p, 11, 0));
+    end(t, &w, 11);
+    assert(!memcmp(w.packet.data, "before-park", 11));
+    limit(q, 0);
+    w = (struct wait_case){.task = 1, .id = q, .sending = 1, .size = 0,
+                           .before_park = 1, .packet = {.type = 1}};
+    t = start(&w);
+    limit(q, 1);
+    rm(q);
+    end(t, &w, -KERNEL_EIDRM);
+    clean();
+
+    q = make();
+    /* Stop the receiver's syscall stack before abort. Its request stays on the
+     * queue, as it does between scheduler teardown and resource cleanup. */
+    abandon_park = 1;
+    w = (struct wait_case){.task = 1, .id = q, .size = 8};
+    t = start(&w);
+    assert(!pthread_mutex_lock(&handshake_lock));
+    released |= 2;
+    assert(!pthread_cond_broadcast(&handshake_cond));
+    assert(!pthread_mutex_unlock(&handshake_lock));
+    assert(!pthread_join(t, 0));
+    abandon_park = 0;
+    assert(task[1].msg_request && task[1].msg_request->queued);
+    struct wait_case sender = {.task = 2, .id = q, .sending = 1, .size = 8,
+                               .notify_pause = 1, .packet = {.type = 1}};
+    pthread_t sending = start(&sender);
+    assert(!pthread_mutex_lock(&handshake_lock));
+    entered &= ~8U;
+    assert(!pthread_mutex_unlock(&handshake_lock));
+    pthread_t aborter;
+    assert(!pthread_create(&aborter, 0, remote_abort, &task[1]));
+    assert(!pthread_mutex_lock(&handshake_lock));
+    while (!(entered & 8))
+        assert(!pthread_cond_wait(&handshake_cond, &handshake_lock));
+    assert(!pthread_mutex_unlock(&handshake_lock));
+    end(sending, &sender, 0);
+    assert(!pthread_join(aborter, 0));
+    assert(!task[1].msg_request && !statq(q).msg_qnum);
+    rm(q);
+    clean();
+    puts("PASS completion before park and remote abort during completed-request notification");
+}
 static void quota(void)
 {
     int *ids = calloc(KERNEL_MSGMNI, sizeof(*ids));
@@ -719,6 +855,7 @@ int main(void)
     for (unsigned i = 0; i < 4; i++) {
         pid[i].number = (int)i + 10;
         pid[i].references = 1;
+        task[i].tid = pid[i].number;
         task[i].identities[KERNEL_PID_TGID].identity = &pid[i];
         task[i].identities[KERNEL_PID_TID].identity = &pid[i];
         task[i].group_leader = &task[i];
@@ -733,6 +870,7 @@ int main(void)
     copy_remove_race();
     namespace_and_pid();
     nonleader_receive_pid();
+    completion_ownership();
     quota();
     clean();
     puts("MSG CORE HOST PASS");

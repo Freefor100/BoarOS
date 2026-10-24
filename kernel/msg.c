@@ -8,6 +8,7 @@
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/wait_internal.h>
+#include "../mm/uaccess_internal.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -37,11 +38,11 @@ struct msg_queue {
 struct kernel_msg_request {
     struct msg_queue *queue;
     struct kernel_task *task;
-    struct kernel_pid *pid;
+    struct kernel_pid *displaced_pid;
     struct msg_message *message, *copy;
-    struct kernel_msg_request *previous, *next, *wake_next;
+    struct kernel_msg_request *previous, *next;
     struct kernel_wait_token token;
-    uint32_t references, sending, queued;
+    uint32_t sending, queued;
     int result, flags;
     int64_t type;
     uint64_t size;
@@ -128,43 +129,26 @@ static int owner(const struct msg_queue *q, const struct kernel_credentials *c)
 {
     return kernel_ipc_owner(c, q->permission.uid, q->permission.cuid);
 }
-static struct kernel_pid *task_pid_get(struct kernel_task *task)
+static struct kernel_pid *pid_set(struct kernel_pid **target, struct kernel_task *task, int direct)
 {
-    KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
-    struct kernel_task *leader = task->group_leader ? task->group_leader : task;
-    struct kernel_pid *pid = leader->identities[KERNEL_PID_TGID].identity;
-    if (pid)
-        kernel_pid_get(pid);
-    return pid;
-}
-/* Caller holds the PID domain; retirement is collected by a later identity
- * put outside queue protection, so replacing metadata never frees under raw. */
-static void pid_set_locked(struct kernel_pid **target, struct kernel_pid *pid)
-{
-    if (!pid)
-        __builtin_trap();
-    if (*target == pid)
-        return;
-    kernel_pid_get(pid);
-    if (*target)
-        kernel_pid_put(*target);
-    *target = pid;
-}
-static void pid_set(struct kernel_pid **target, struct kernel_pid *pid)
-{
-    KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
-    pid_set_locked(target, pid);
-}
-static void receive_pid_set(struct msg_queue *q, struct kernel_task *task, int direct)
-{
-    KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
     /* Linux pipelined_send records a sleeping receiver's TID; dequeue records
-     * the executing receiver's TGID. Queue ownership keeps the waiting task
-     * alive until abort can remove its request under the same queue lock. */
+     * the executing receiver's TGID. Executing tasks retain their group, and
+     * abort must acquire this queue lock before releasing a waiting task. */
     struct kernel_task *identity_task = direct || !task->group_leader ? task : task->group_leader;
+    /* 队列的身份引用保留该数字，不能被其他身份复用；同一发送者或
+     * 接收者继续操作时不必重复进入全局 PID 域。 */
+    if (*target && (*target)->number == identity_task->tid)
+        return 0;
+    KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
     struct kernel_pid *pid =
         identity_task->identities[direct ? KERNEL_PID_TID : KERNEL_PID_TGID].identity;
-    pid_set_locked(&q->rpid, pid);
+    if (!pid)
+        __builtin_trap();
+    kernel_pid_get(pid);
+    struct kernel_pid *old = *target;
+    *target = pid;
+    /* 将原队列引用交给请求，结束调用或弃栈时再在 raw 外归还。 */
+    return old;
 }
 static struct msg_message *message_create(uint64_t size)
 {
@@ -280,20 +264,17 @@ static struct kernel_msg_request *request_create(struct kernel_task *task, int s
         return 0;
     r->task = task;
     r->sending = (uint32_t)sending;
-    r->references = 1;
     if (task->msg_request)
         __builtin_trap();
     task->msg_request = r;
     return r;
 }
-static void request_put(struct kernel_msg_request *r)
+static void request_release(struct kernel_msg_request *r)
 {
-    if (__atomic_sub_fetch(&r->references, 1, __ATOMIC_ACQ_REL))
-        return;
     if (r->queued)
         __builtin_trap();
-    if (r->pid)
-        kernel_task_identity_put(r->pid);
+    if (r->displaced_pid)
+        kernel_task_identity_put(r->displaced_pid);
     message_put(r->message);
     message_put(r->copy);
     if (r->queue)
@@ -305,7 +286,7 @@ static void request_finish(struct kernel_msg_request *r)
     if (r->task->msg_request != r)
         __builtin_trap();
     r->task->msg_request = 0;
-    request_put(r);
+    request_release(r);
 }
 static void request_remove(struct kernel_msg_request *r)
 {
@@ -325,37 +306,26 @@ static void request_remove(struct kernel_msg_request *r)
     r->previous = r->next = 0;
     r->queued = 0;
 }
-static void request_complete(struct kernel_msg_request *r, int result,
-                             struct kernel_msg_request **wake)
+static void request_complete(struct kernel_msg_request *r, int result)
 {
     request_remove(r);
     r->result = result;
-    kernel_wait_task_pin(r->task);
-    __atomic_fetch_add(&r->references, 1, __ATOMIC_RELAXED);
-    r->wake_next = *wake;
-    *wake = r;
-}
-static void wake_requests(struct kernel_msg_request *wake)
-{
-    while (wake) {
-        struct kernel_msg_request *r = wake;
-        wake = r->wake_next;
-        kernel_wait_notify(&r->token, KERNEL_WAIT_WOKEN);
-        kernel_wait_task_unpin(r->task);
-        request_put(r);
-    }
+    /* 结果读取和 abort 都要先取队列锁，通知返回前请求与任务仍有效。
+     * notify 只更新调度状态；远端 IPI 在最外层 raw 解锁后提交。 */
+    if (kernel_wait_notify(&r->token, KERNEL_WAIT_WOKEN))
+        __builtin_trap();
 }
 static int fits(struct msg_queue *q, uint64_t size)
 {
     return q->bytes <= q->limit && size <= q->limit - q->bytes && q->count < q->limit;
 }
-static void wake_senders(struct msg_queue *q, struct kernel_msg_request **wake)
+static void wake_senders(struct msg_queue *q)
 {
     struct kernel_msg_request *r = q->send_head;
     while (r) {
         struct kernel_msg_request *next = r->next;
         if (fits(q, r->size))
-            request_complete(r, 1, wake);
+            request_complete(r, 1);
         r = next;
     }
 }
@@ -375,8 +345,6 @@ static void request_prepare(struct kernel_msg_request *r)
     *tail = r;
     r->queued = 1;
 }
-/* A completion owns both the request and the task until notification ends.
- * Finish a token copy so another CPU never observes a rewritten token. */
 static int request_wait(struct kernel_msg_request *r)
 {
     enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
@@ -462,24 +430,24 @@ static void message_detach(struct msg_queue *q, struct msg_message *m)
     __atomic_fetch_sub(&msg_table.messages, 1, __ATOMIC_RELAXED);
     __atomic_fetch_sub(&msg_table.bytes, m->size, __ATOMIC_RELAXED);
 }
-static void message_publish(struct kernel_msg_request *sender, struct kernel_msg_request **wake)
+static void message_publish(struct kernel_msg_request *sender)
 {
     struct msg_queue *q = sender->queue;
     struct msg_message *m = sender->message;
     q->stime = msg_now();
-    pid_set(&q->spid, sender->pid);
+    sender->displaced_pid = pid_set(&q->spid, sender->task, 0);
     struct kernel_msg_request *r = q->recv_head;
     while (r) {
         struct kernel_msg_request *next = r->next;
         if (matches(m, r->type, r->flags)) {
             if (r->size < m->size && !(r->flags & KERNEL_MSG_NOERROR))
-                request_complete(r, -KERNEL_E2BIG, wake);
+                request_complete(r, -KERNEL_E2BIG);
             else {
                 r->message = m;
                 sender->message = 0;
                 q->rtime = msg_now();
-                receive_pid_set(q, r->task, 1);
-                request_complete(r, 0, wake);
+                r->displaced_pid = pid_set(&q->rpid, r->task, 1);
+                request_complete(r, 0);
                 return;
             }
         }
@@ -515,20 +483,19 @@ int64_t kernel_msg_send(struct kernel_task *task, struct kernel_mm *mm, int32_t 
     r->queue = queue_lookup(id, 0);
     if (!r->queue)
         goto done;
-    r->pid = task_pid_get(task);
-    if (!r->pid) {
+    struct kernel_task *leader = task->group_leader ? task->group_leader : task;
+    if (!leader->tid) {
         result = -KERNEL_ESRCH;
         goto done;
     }
     for (;;) {
-        struct kernel_msg_request *wake = 0;
         {
             KERNEL_RAW_SCOPE(g, &r->queue->lock);
             if (r->queue->removed)
                 result = -KERNEL_EIDRM;
             else if ((result = permission(r->queue, kernel_credentials_current(), 2))) {
             } else if (fits(r->queue, size)) {
-                message_publish(r, &wake);
+                message_publish(r);
                 result = 0;
             } else if (flags & KERNEL_IPC_NOWAIT)
                 result = -KERNEL_EAGAIN;
@@ -537,7 +504,6 @@ int64_t kernel_msg_send(struct kernel_task *task, struct kernel_mm *mm, int32_t 
                 result = 1;
             }
         }
-        wake_requests(wake);
         if (result != 1)
             break;
         result = request_wait(r);
@@ -579,7 +545,6 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
     if (!r->queue)
         goto done;
     for (;;) {
-        struct kernel_msg_request *wake = 0;
         {
             KERNEL_RAW_SCOPE(g, &r->queue->lock);
             struct msg_queue *q = r->queue;
@@ -599,8 +564,8 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
                         else {
                             message_detach(q, m);
                             q->rtime = msg_now();
-                            receive_pid_set(q, task, 0);
-                            wake_senders(q, &wake);
+                            r->displaced_pid = pid_set(&q->rpid, task, 0);
+                            wake_senders(q);
                         }
                         r->message = m;
                         result = 0;
@@ -613,7 +578,6 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
                 }
             }
         }
-        wake_requests(wake);
         if (result != 1)
             break;
         result = request_wait(r);
@@ -623,13 +587,18 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
     if (!result) {
         struct msg_message *m = r->message;
         uint64_t n = size < m->size ? size : m->size;
+        struct kernel_uaccess_write_cursor output = {0};
         /* A queued reference or detached ownership protects these immutable
-         * bytes across faulting usercopy; EFAULT still consumes normal receives. */
-        if (kernel_copy_to_user(mm, msgp, &m->type, sizeof(m->type), &copied) ||
-            (n && kernel_copy_to_user(mm, msgp + 8, m->data, (size_t)n, &copied)))
+         * bytes across faulting usercopy; EFAULT still consumes normal receives.
+         * 两段分别校验范围，保留正文失败前已写入的类型；同页复用 pin。 */
+        if (kernel_uaccess_write_cursor_copy(mm, &output, msgp, &m->type,
+                                            sizeof(m->type), &copied) ||
+            (n && kernel_uaccess_write_cursor_copy(mm, &output, msgp + 8, m->data,
+                                                  (size_t)n, &copied)))
             result = -KERNEL_EFAULT;
         else
             result = (int64_t)n;
+        kernel_uaccess_write_cursor_finish(&output);
     }
 done:
     request_finish(r);
@@ -638,7 +607,6 @@ done:
 static int queue_remove(struct msg_queue *q, const struct kernel_credentials *c)
 {
     struct msg_message *messages;
-    struct kernel_msg_request *wake = 0;
     {
         KERNEL_RAW_SCOPE(index_guard, &msg_table.lock);
         KERNEL_RAW_SCOPE(queue_guard, &q->lock);
@@ -653,16 +621,15 @@ static int queue_remove(struct msg_queue *q, const struct kernel_credentials *c)
         msg_table.queues--;
         msg_table.sequence[q->slot_node.key]++;
         while (q->send_head)
-            request_complete(q->send_head, -KERNEL_EIDRM, &wake);
+            request_complete(q->send_head, -KERNEL_EIDRM);
         while (q->recv_head)
-            request_complete(q->recv_head, -KERNEL_EIDRM, &wake);
+            request_complete(q->recv_head, -KERNEL_EIDRM);
         messages = q->head;
         q->head = q->tail = 0;
         __atomic_fetch_sub(&msg_table.messages, q->count, __ATOMIC_RELAXED);
         __atomic_fetch_sub(&msg_table.bytes, q->bytes, __ATOMIC_RELAXED);
         q->count = q->bytes = 0;
     }
-    wake_requests(wake);
     while (messages) {
         struct msg_message *m = messages;
         messages = m->next;
@@ -721,7 +688,6 @@ int64_t kernel_msg_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
         return -KERNEL_EINVAL;
     const struct kernel_credentials *c = kernel_credentials_current();
     int64_t result = 0;
-    struct kernel_msg_request *wake = 0;
     if (cmd == KERNEL_IPC_RMID) {
         result = queue_remove(q, c);
         queue_put(q);
@@ -748,8 +714,8 @@ int64_t kernel_msg_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
                 q->limit = (uint64_t)(int64_t)(int32_t)d.msg_qbytes;
                 q->ctime = msg_now();
                 while (q->recv_head)
-                    request_complete(q->recv_head, 1, &wake);
-                wake_senders(q, &wake);
+                    request_complete(q->recv_head, 1);
+                wake_senders(q);
             }
         } else if (cmd != KERNEL_MSG_STAT_ANY && (result = permission(q, c, 4))) {
         } else {
@@ -765,7 +731,6 @@ int64_t kernel_msg_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
             result = cmd == KERNEL_IPC_STAT ? 0 : q->id;
         }
     }
-    wake_requests(wake);
     queue_put(q);
     if (result >= 0 && cmd != KERNEL_IPC_SET &&
         kernel_copy_to_user(mm, arg, &d, sizeof(d), &copied))
@@ -782,5 +747,5 @@ void kernel_msg_abort(struct kernel_task *task)
         request_remove(r);
     }
     task->msg_request = 0;
-    request_put(r);
+    request_release(r);
 }

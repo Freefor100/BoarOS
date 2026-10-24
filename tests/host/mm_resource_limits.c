@@ -63,6 +63,23 @@ int main(void)
     CHECK(!kernel_mm_mprotect(&mm,BASE,P,RW));
     CHECK(limit_reads==reads_before+1);
     assert(!kernel_mm_munmap(&mm,BASE,P));
+    assert(!map(BASE,P,KERNEL_MM_READ,KERNEL_MM_MAP_SHARED));
+    reads_before=limit_reads;
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,RW));
+    CHECK(limit_reads==reads_before);
+    assert(!kernel_mm_munmap(&mm,BASE,P));
+    /* Linux compares admission with both old and new flags, including AS. */
+    assert(!map(BASE,2*P,KERNEL_MM_READ,0));
+    limits.address_space=4*P; limits.data_soft=0; limits.data_hard=P;
+    CHECK(kernel_mm_mprotect(&mm,BASE,2*P,RW)==KERNEL_MM_STATUS_NO_MEMORY);
+    limits.address_space=3*P;
+    CHECK(!kernel_mm_mprotect(&mm,BASE,2*P,RW));
+    limits.address_space=limits.data_soft=limits.data_hard=UINT64_MAX;
+    assert(!kernel_mm_mprotect(&mm,BASE,2*P,KERNEL_MM_READ));
+    limits.address_space=P; limits.data_soft=1;
+    CHECK(!kernel_mm_mprotect(&mm,BASE,2*P,RW));
+    limits.address_space=limits.data_soft=UINT64_MAX;
+    assert(!kernel_mm_munmap(&mm,BASE,2*P));
     limits.address_space=P;
     CHECK(map(BASE,2*P,KERNEL_MM_READ,0)==KERNEL_MM_STATUS_NO_MEMORY);
     assert(!kernel_mm_munmap(&mm,BASE,2*P));

@@ -226,7 +226,8 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
     }
     enum kernel_scheduler_status status = kernel_wait_backend_switch(token->task);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    /* 调度交接已把CPU交还当前owner。NOTIFIED结果到本owner的finish前
+     * 保持不变；IRQ仍关闭，无需为读取完成原因再次取得共享调度保护。 */
     struct kernel_wait_record *record = kernel_wait_record_of(token->task);
     if (record->phase != KERNEL_WAIT_NOTIFIED || !record->on_cpu) __builtin_trap();
     *reason = record->reason;
