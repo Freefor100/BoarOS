@@ -430,14 +430,25 @@ static struct kernel_socket *unix_names[64];
 static uint32_t unix_autoname;
 static void unix_name_get_locked(struct kernel_socket_name *name)
 { if(name) { if(!name->references || name->references==UINT32_MAX)__builtin_trap();name->references++; } }
+static int unix_name_put_locked(struct kernel_socket_name *name)
+{
+    if(!name)return 0;
+    if(!name->references)__builtin_trap();
+    return !--name->references;
+}
+static void unix_name_free(struct kernel_socket_name *name)
+{
+    if(!name)return;
+    if(name->path && kernel_vfs_path_release(&name->path))__builtin_trap();
+    kernel_heap_release(name->heap,name);
+}
 static void unix_name_put(struct kernel_socket_name *name)
 {
     if(!name)return;
     SOCKET_STATE(state);
-    if(!name->references)__builtin_trap();
-    int release=!--name->references;
+    int release=unix_name_put_locked(name);
     socket_state_release(&state);
-    if(release) {if(name->path && kernel_vfs_path_release(&name->path))__builtin_trap();kernel_heap_release(name->heap,name);}
+    if(release)unix_name_free(name);
 }
 void kernel_socket_address_release(struct kernel_socket_address *address)
 {
@@ -658,19 +669,31 @@ static uint64_t unix_deadline(struct kernel_socket *socket)
     return deadline;
 }
 /* A nonempty sender packet set holds one storage reference until its last packet leaves. */
-static void unix_uncharge(struct socket_packet *packet)
+static struct kernel_socket *unix_uncharge_locked(struct socket_packet *packet,
+    struct kernel_socket_name **released_name)
 {
+    struct kernel_socket_name *name=packet->address.family==KERNEL_SOCKET_AF_UNIX?packet->address.unix_owner:NULL;
+    *released_name=unix_name_put_locked(name)?name:NULL;
+    packet->address=(struct kernel_socket_address){0};
     struct kernel_socket *sender=packet->unix_sender;
-    kernel_socket_address_release(&packet->address);
-    if(!sender)return;
-    SOCKET_STATE(irq);
+    if(!sender)return NULL;
     if(!sender->unix_packets || sender->unix_memory<packet->send_charge)__builtin_trap();
     sender->unix_memory-=packet->send_charge;sender->unix_packets--;
     packet->unix_sender=0;
     int release=!sender->unix_packets && unix_put_locked(sender);
     if(!sender->destroying)wake_socket(sender);
+    return release?sender:NULL;
+}
+static void unix_uncharge(struct socket_packet *packet)
+{
+    if(!packet->unix_sender &&
+       (packet->address.family!=KERNEL_SOCKET_AF_UNIX || !packet->address.unix_owner))return;
+    struct kernel_socket_name *name;
+    SOCKET_STATE(irq);
+    struct kernel_socket *sender=unix_uncharge_locked(packet,&name);
     socket_state_release(&irq);
-    if(release)kernel_heap_release(sender->heap,sender);
+    unix_name_free(name);
+    if(sender)kernel_heap_release(sender->heap,sender);
 }
 static uint32_t unix_charge(uint32_t size)
 { return (uint32_t)sizeof(struct socket_packet)+size; }
@@ -1764,6 +1787,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     uint32_t bytes = user_fault && !request->datagram ? request->completed_bytes : request->bytes;
     uint32_t remaining = bytes, charge = bytes;
     struct socket_packet *retired = 0, *tail = 0;
+    struct kernel_socket *released_sender = NULL;
+    struct kernel_socket_name *released_name = NULL;
     if (request->datagram) {
         charge = packet_available(socket->packets_head);
         if (!charge) charge = 1;
@@ -1795,6 +1820,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if(request->datagram && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         if(!socket->unix_queued)__builtin_trap();
         socket->unix_queued--;
+        /* 单个报文出队与其发送额度/源名引用一起提交；对象实际销毁仍在锁外。 */
+        released_sender=unix_uncharge_locked(retired,&released_name);
     }
     if(charge && socket->type==SOCKET_STREAM && socket->peer)wake_socket(socket->peer);
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
@@ -1818,6 +1845,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     wake_socket(socket);
     uint32_t delivered = user_fault && request->datagram ? 0 : bytes;
     socket_state_release(&scope);
+    unix_name_free(released_name);
+    if(released_sender)kernel_heap_release(released_sender->heap,released_sender);
     int freed = retired != 0;
     while (retired) {
         struct socket_packet *next = retired->next;
@@ -1999,6 +2028,8 @@ static __attribute__((noinline)) int unix_publish_packet(
         uint32_t payload=count ? (uint32_t)count : 1U;
         if(peer->rx_bytes>UINT32_MAX-payload)__builtin_trap();
         peer->rx_bytes+=payload;request->packet=0;wake_socket(peer);result=(int)count;
+        /* 发布已经归还全部reservation；同一次提交撤销request和peer借用。 */
+        socket_write_end(request);
     }
     return result;}
 
@@ -2010,6 +2041,10 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
 {
     if (user_fault) *user_fault=0;
     struct kernel_socket *socket = kernel_open_file_socket(*pin_owner);
+    struct kernel_socket_write_request request={0};
+    int result=0;
+    int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
+        !(destination && socket->type==SOCKET_DGRAM);
     {
         SOCKET_STATE(preflight);
         if(socket->type==SOCKET_STREAM) {
@@ -2017,7 +2052,9 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
             int error=(!socket->peer || socket->write_closed || socket->peer->read_closed)?unix_peer_failure(socket):0;
             if(error)return error;
             if(!count)return 0;
-            uint32_t limit=socket->tx_limit/2U-64U;if(limit>32768U)limit=32768U;
+            /* 连同实际packet头限制分配，避免载荷只差数个字节却占双倍buddy块。 */
+            uint32_t limit=socket->tx_limit/2U;if(limit>32768U)limit=32768U;
+            limit-=(uint32_t)sizeof(struct socket_packet);
             if(count>limit)count=limit;
         } else {
             if(kernel_buffer && socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination &&
@@ -2027,26 +2064,17 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
             if(socket->write_closed)return -KERNEL_EPIPE;
             if(socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)return -KERNEL_EDESTADDRREQ;
         }
-    }
-    int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
-        !(destination && socket->type==SOCKET_DGRAM);
-    struct kernel_socket_write_request request={0};
-    socket_write_begin(&request,pin_owner,hold_unix_peer);
-    int result = -KERNEL_ENOMEM;
-    if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
-        if(destination && socket->type==SOCKET_DGRAM) {
-            result=unix_lookup(socket,destination,&request.unix_destination);if(result)goto out;
-        } else {
-            if(!request.unix_destination) {
-                SOCKET_STATE(state);result=unix_peer_failure(socket);goto out;
-            }
+        /* 连接发送的检查、peer借用与额度预留需要同一份状态快照。 */
+        socket_write_begin(&request,pin_owner,hold_unix_peer);
+        if(hold_unix_peer) {
+            result=request.unix_destination?unix_reserve_packet(&request,(uint32_t)count,flags):unix_peer_failure(socket);
         }
     }
-    if(request.socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
+    if(result)goto out;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && !hold_unix_peer) {
+        result=unix_lookup(socket,destination,&request.unix_destination);if(result)goto out;
         result=unix_reserve_packet(&request,(uint32_t)count,flags);
-        if(result) {
-            clear_write_request(&request);*pin_owner=request.pin;return result;
-        }
+        if(result)goto out;
     }
     result=-KERNEL_ENOMEM;
     struct socket_packet *packet = 0;
@@ -2087,6 +2115,10 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
         result=protocol_request(&request,SOCKET_PROTOCOL_UDP_SEND);goto out;
     }
     result=unix_publish_packet(&request,(uint32_t)count);
+    if(result>=0) {
+        *pin_owner=request.pin;
+        return result;
+    }
 
 out:
     clear_write_request(&request);
