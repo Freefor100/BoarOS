@@ -34,6 +34,8 @@ TCP 发送先在端点保护内预约额度，复用任务 scratch 保存最多�
 
 socket 在最终 OFD 释放时取得协议资格，先摘除弱引用工作链并解除 PCB 回调。跨用户复制和待执行请求持有实际 OFD/pin，因此 worker 借用的对象不会被提前销毁。队列只在从无工作变为有工作时通知 worker；容量、接收归还、loopback 与期限使用各自的原有通知来源。
 
+TCP 的一批 COPY 保持完整发送预约，协议 owner 在批末一次发布实际 PCB 额度并归还预约；批内已复制的字节仍包含在预约中，远端接纳无法重复使用。队列满、ERR_MEM、成功前缀及末批输出分别按实际结果处理；需要输出时，先在锁外执行 tcp_output，再发布容量并归还本批预约。逐页片段不再重复发布相同容量。UNIX 成功发送后的请求摘除不改变就绪状态，通知由消息发布、额度归还、取消及对端变化产生；INET 停止仍等待活动请求摘除并接收对应通知。recvfrom/recvmsg 仅在用户请求源地址时取得临时名称引用，消息长度和截断消费独立处理。
+
 `netif_loop_output()` 在成功发布完整回环包队列后调用可选的
 `LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，经端口进入 `protocol_work_ready()`，设置软件
 待处理状态；从无包变为有包时请求 worker 唤醒，已有待处理包时合并通知。每次轮询结束按真实剩余队列更新状态，包含同批产生又被消费的 ACK。该回调不消费包或重入 raw API。分配/复制失败不
@@ -130,6 +132,8 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 静态/动态 musl 的原生并发短例复用 `tests/network_runner.py --workload smp`。私有 `USER_SMP_COMPOSITION=1` 内核配合 `--observe` 检查每个发起 CPU 的预约、复制、pin 与等待；三项握手分别暂停真实接收预约、发送页 pin 和 epoll 通知借用，核对追加/最后关闭、mprotect 和 DEL 的实际等待及资源归还。正式性能内核关闭这些观察。
 
 `tests/socket-accept-allocation-host.sh` 在真实 OFD 分配处注入 EMPTY，检查连接保留、重试双向通信及 FD、凭据和堆页归还；另覆盖等待失败和地址输出失败的不同副作用。`tests/host/network_owner.py --case unix-space-topology` 检查互连流量不触发空间回调、断连恢复单向订阅及重连唤醒；`unix_named` 用户程序通过实际 epoll 等待与队列空间释放核对跨核通知。
+
+`unix-write-notify` 直接检查成功发送不产生无状态变化的本端通知，同时检查消息消费和复制取消仍通知发送者。`tcp-batch` 在真实 tcp_write 的 COPY 之间握手，让另一 CPU 预约剩余额度，检查整批接纳期间额度保持保守且最终归还；相同数据分段不会增加端点保护次数。
 
 ```sh
 make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host

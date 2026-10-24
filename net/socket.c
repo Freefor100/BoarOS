@@ -1886,14 +1886,14 @@ static void socket_write_end(struct kernel_socket_write_request *request)
     struct kernel_socket *destination=request->unix_destination;
     request->unix_destination=NULL;
     int release=destination && unix_put_locked(destination);
-    wake_socket(request->socket);
+    /* UNIX readiness changes at packet publication, credit return or cancel;
+     * the OFD pin keeps final close behind this request's removal. */
+    if(request->socket->domain==KERNEL_SOCKET_DOMAIN_INET)wake_socket(request->socket);
     struct kernel_heap *heap=release?destination->heap:NULL;
     socket_state_release(&state);
     if(release)kernel_heap_release(heap,destination);
 }
 static void tcp_flush_output(struct kernel_socket *socket);
-static int tcp_write_buffer_locked(struct kernel_socket *socket,
-    const void *buffer, uint32_t size, uint32_t flags, uint32_t reserved);
 
 static void free_write_packet(struct kernel_socket_write_request *request)
 {
@@ -2264,32 +2264,66 @@ static int stream_commit_owned(struct kernel_socket_write_request *request,
     const struct kernel_socket_write_segment *segments, unsigned count, uint32_t flags)
 {
     if (!count || !request->reserved) __builtin_trap();
-    uint32_t total = 0;
-    int result = tcp_write_state(request->socket, flags, !request->progressed, request->task);
+    struct kernel_socket *socket = request->socket;
+    uint32_t total = 0, available = 0;
+    int result, flush = 0;
+    { SOCKET_STATE(endpoint);
+      result = tcp_write_state(socket, flags, !request->progressed, request->task);
+      if (socket->tx_reserved < request->reserved) __builtin_trap();
+      uint32_t others = socket->tx_reserved - request->reserved;
+      uint32_t budget = result ? 0 : tcp_protocol_budget(socket);
+      available = budget > others ? budget - others : 0;
+    }
+    /* 整份reservation一直覆盖本批已COPY和未COPY的前缀，旧published预算
+     * 因而不会被远端重复接纳；批内不再逐页预扣或发布同一份PCB容量。 */
     for (unsigned i = 0; !result && i < count; i++) {
         uint32_t size = segments[i].size;
         if (!size || size > request->reserved - total) __builtin_trap();
-        int accepted = tcp_write_buffer_locked(request->socket, segments[i].data,
-            size, flags | (i + 1 < count ? KERNEL_SOCKET_IO_MORE : 0), request->reserved);
-        if (accepted > 0) {
-            total += (uint32_t)accepted;
-            if ((uint32_t)accepted < size) break;
-        } else result = accepted;
+        uint32_t length = available - total;
+        if (tcp_sndqueuelen(socket->tcp) >= TCP_SND_QUEUELEN) length = 0;
+        if (length > size) length = size;
+        if (length > UINT16_MAX) length = UINT16_MAX;
+        if (!length) { result = -KERNEL_EAGAIN; flush = 1; break; }
+        socket_statistics.tcp_write_calls++;
+        err_t error = tcp_write(socket->tcp, segments[i].data, (u16_t)length,
+            TCP_WRITE_FLAG_COPY | (((flags & KERNEL_SOCKET_IO_MORE) || i + 1 < count) ? TCP_WRITE_FLAG_MORE : 0));
+        if (error == ERR_OK) {
+            socket_statistics.tcp_written_bytes += length;
+            write_retry_disarm(socket);
+            total += length;
+            if (length < size) break;
+        } else if (error == ERR_MEM) {
+            /* 全局segment/pbuf不足仍隐藏POLLOUT，等待真实归还或协议timer。 */
+            write_retry_arm(socket);
+            socket_pool_wait(socket);
+            result = -KERNEL_EAGAIN; flush = 1;
+        } else result = lwip_error(error);
     }
     if (total) result = (int)total;
     SOCKET_STATE(endpoint);
-    tcp_publish_capacity_locked(request->socket);
-    stream_release_reservation(request, 0);
+    if (socket->tx_reserved < request->reserved) __builtin_trap();
+    uint32_t others = socket->tx_reserved - request->reserved;
+    uint32_t budget = tcp_protocol_budget(socket);
     if (result > 0) {
+        uint32_t remaining = budget > others ? budget - others : 0;
         request->progressed = SOCKET_WRITE_ACCEPTED |
-            (((flags & KERNEL_SOCKET_IO_MORE) && tcp_admission_capacity_locked(request->socket))
-                ? SOCKET_WRITE_DEFERRED : 0U);
+            (((flags & KERNEL_SOCKET_IO_MORE) && remaining) ? SOCKET_WRITE_DEFERRED : 0U);
+        if (!(flags & KERNEL_SOCKET_IO_MORE) || !remaining) flush = 1;
     }
-    socket_state_release(&endpoint);
     if (result == -KERNEL_EAGAIN) {
-        tcp_flush_output(request->socket);
+        flush = 1;
         request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
     }
+    if (flush) {
+        /* 先产生输出/loopback工作，再公开本批归还的额度；协议调用不能持raw。 */
+        socket_state_release(&endpoint);
+        tcp_flush_output(socket);
+        socket_state_acquire(&endpoint);
+        budget = tcp_protocol_budget(socket);
+    }
+    socket->tx_budget = budget;
+    stream_release_reservation(request, 0);
+    socket_state_release(&endpoint);
     if (result == -KERNEL_EAGAIN) COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
     return result;
 }
@@ -2382,46 +2416,6 @@ int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
 {
     const struct kernel_socket_write_segment segment = {buffer, size};
     return kernel_socket_stream_commitv(request, &segment, 1, flags);
-}
-
-static int tcp_write_buffer_locked(struct kernel_socket *socket,
-    const void *buffer, uint32_t size, uint32_t flags, uint32_t reserved)
-{
-    uint32_t length;
-    err_t error;
-    SOCKET_STATE(endpoint);
-    uint32_t budget = tcp_protocol_budget(socket);
-    if (socket->tx_reserved < reserved) __builtin_trap();
-    uint32_t others = socket->tx_reserved - reserved;
-    length = budget > others ? budget - others : 0;
-    if (length > size) length = size;
-    if (length > UINT16_MAX) length = UINT16_MAX;
-    /* Core may be preempted inside tcp_write. Keep those bytes unavailable to
-     * endpoint-only admission until the real PCB result is published. */
-    socket->tx_budget = budget - length;
-    socket_state_release(&endpoint);
-    if (!length) return -KERNEL_EAGAIN;
-    socket_statistics.tcp_write_calls++;
-    error = tcp_write(socket->tcp, buffer, (u16_t)length, TCP_WRITE_FLAG_COPY |
-        ((flags & KERNEL_SOCKET_IO_MORE) ? TCP_WRITE_FLAG_MORE : 0));
-    if (error == ERR_OK) {
-        socket_statistics.tcp_written_bytes += length;
-        write_retry_disarm(socket);
-        /* tcp_write owns the copied bytes even if immediate output defers. */
-        /* 单次gather请求先填接纳窗口；末批、窗口满或finish退出时再发送。 */
-        if (!(flags & KERNEL_SOCKET_IO_MORE) || tcp_protocol_budget(socket) <= others)
-            tcp_flush_output(socket);
-    } else if (error == ERR_MEM) {
-        /* The global segment/pbuf pool can be full even while sndbuf remains.
-         * Hide POLLOUT until an ACK or a bounded protocol-timer retry. */
-        write_retry_arm(socket);
-        socket_pool_wait(socket);
-        tcp_flush_output(socket);
-    }
-    {SOCKET_STATE(state);tcp_publish_capacity_locked(socket);}
-    return error == ERR_OK ? (int)length
-                           : error == ERR_MEM ? -KERNEL_EAGAIN
-                                              : lwip_error(error);
 }
 
 int kernel_socket_shutdown(struct kernel_socket *socket,int how)
