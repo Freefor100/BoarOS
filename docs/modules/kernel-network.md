@@ -86,11 +86,11 @@ UNIX 名称单独分配、发布后不可修改。地址接口用带长度的借
 
 发送请求登记与对端存储借用共用一次端点状态锁，结束时摘除请求并归还该借用。发送者的排队消息逐条记录实际内存计费；只要该发送者还有未消费消息，就由一个端点存储引用保活，最后一条消息出队或被丢弃时再释放，避免让 packet 的 sender 指针越过发送端关闭而悬空。
 
-STREAM connect 创建待接纳子端点并发布到 listener 队列，accept 转移子端点所有权；backlog 满时使用固定发送期限等待。DGRAM 可以逐次指定目的地址，或保存默认对端；接收端按连接关系过滤发送者。多对一队列采用固定 Linux `max_dgram_qlen=10` 的边界和互连例外，连同在途预约计算接纳资格。等待登记与条件检查处于同一短保护；connected DGRAM 的空间通知绑定实际对端，回调在锁外向本 socket 等待者传播。重连或断连清除未被读取预约借用的旧消息，活动读取保持原数据及其计费。
+STREAM connect 创建待接纳子端点并发布到 listener 队列，accept 转移子端点所有权；backlog 满时使用固定发送期限等待。DGRAM 可以逐次指定目的地址，或保存默认对端；接收端按连接关系过滤发送者。多对一队列采用固定 Linux `max_dgram_qlen=10` 的边界和互连例外，连同在途预约计算接纳资格。等待登记与条件检查处于同一短保护；只有受目标队列上限约束的单向连接订阅对端空间通知，双向互连和自连接不登记该回调。connect 在现有控制互斥下处理两端订阅变化：短锁外排空旧通知借用，发布连接后恢复变成单向的旧边，并通知就绪条件改变的端点。回调在锁外向实际等待者传播。DGRAM 消息消费后归还真实 sender 的计费并通知；STREAM 保留读完成时的原有对端通知。重连或断连清除未被读取预约借用的旧消息，活动读取保持原数据及其计费。
 
-`SO_PEERCRED` 返回 Linux 指定时点的 PID、有效 UID/GID 快照：socketpair 在创建时捕获，STREAM listener 在 listen 时捕获，连接建立后分别使用监听者与连接发起者的记录。后续身份变更保持既有快照。accept4 的 NONBLOCK/CLOEXEC 只设置新 FD；接纳先预留 FD、检查并等待监听状态，地址输出成功后才安装 FD，失败由未发布对象归还资源。
+`SO_PEERCRED` 返回 Linux 指定时点的 PID、有效 UID/GID 快照：socketpair 在创建时捕获，STREAM listener 在 listen 时捕获，连接建立后分别使用监听者与连接发起者的记录。后续身份变更保持既有快照。accept4 的 NONBLOCK/CLOEXEC 只设置新 FD；接纳先预留 FD并准备持有打开凭据的真实 OFD，再等待并取走连接。分配失败保留待接纳连接；等待失败归还尚未接管端点的 OFD。成功后 OFD 接管 child，地址输出成功才安装 FD；输出 EFAULT 消费连接并释放未发布对象，符合 Linux。
 
-当前还有两项错误路径需要修正。未连接的 UNIX STREAM 接收返回 EAGAIN，监听端接收返回 ENOTCONN；固定 Linux 对这两种状态均返回 EINVAL，阻塞调用也立即结束。accept/accept4 在取走待接纳连接后才分配 OFD，分配失败会销毁该连接；Linux 在协议接纳前准备 file，分配失败保留连接。地址输出 EFAULT 则发生在接纳之后，消费连接符合 Linux。两种失败发生的位置和副作用应分别处理。
+未连接或正在监听的 UNIX STREAM 接收返回 EINVAL，阻塞调用立即结束；已建立连接的对端关闭仍按排队数据和 EOF 处理。read、向量读取和 recv 系列共用接收状态与预约路径。
 
 UNIX stream 普通写先预留发送者容量，在协议临界区外把用户 iovec 直接填入最终队列载荷，再检查对端状态并发布。packet 头和内联载荷只分配一次；复制 fault 只发布成功前缀，首字节 fault 不发布。对端在复制期间关闭时归还预留与未发布 packet，保留真实 EPIPE/ECONNRESET。接收直接从该载荷复制到用户，因此普通 stream 不再经过读写中转页。
 
@@ -128,6 +128,8 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 ## 验证
 
 静态/动态 musl 的原生并发短例复用 `tests/network_runner.py --workload smp`。私有 `USER_SMP_COMPOSITION=1` 内核配合 `--observe` 检查每个发起 CPU 的预约、复制、pin 与等待；三项握手分别暂停真实接收预约、发送页 pin 和 epoll 通知借用，核对追加/最后关闭、mprotect 和 DEL 的实际等待及资源归还。正式性能内核关闭这些观察。
+
+`tests/socket-accept-allocation-host.sh` 在真实 OFD 分配处注入 EMPTY，检查连接保留、重试双向通信及 FD、凭据和堆页归还；另覆盖等待失败和地址输出失败的不同副作用。`tests/host/network_owner.py --case unix-space-topology` 检查互连流量不触发空间回调、断连恢复单向订阅及重连唤醒；`unix_named` 用户程序通过实际 epoll 等待与队列空间释放核对跨核通知。
 
 ```sh
 make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host

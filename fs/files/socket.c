@@ -14,31 +14,20 @@
 #define LINUX_O_RDWR 2U
 
 static enum kernel_files_status install_socket(
-    struct kernel_files *files, struct kernel_socket *socket,
+    struct kernel_files *files, struct kernel_open_file_description **ofd,
     uint32_t fd, uint32_t flags,
     int (*copy_peer)(void *context, const struct kernel_socket_address *address),
     void *context, int64_t *linux_result)
 {
-    struct kernel_open_file_description *ofd = 0;
-    enum kernel_open_file_status status =
-        kernel_open_file_create_socket(files->heap, socket,
-            LINUX_O_RDWR | (flags & LINUX_SOCK_NONBLOCK), &ofd);
-    if (status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY) {
-        kernel_socket_destroy(socket);
-        *linux_result = -KERNEL_ENOMEM;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (status != KERNEL_OPEN_FILE_STATUS_OK) {
-        kernel_socket_destroy(socket);
-        return KERNEL_FILES_STATUS_STATE;
-    }
+    struct kernel_socket *socket = kernel_open_file_socket(*ofd);
+    if (!socket) __builtin_trap();
     if (copy_peer) {
         struct kernel_socket_address peer_address
             __attribute__((cleanup(kernel_socket_address_release))) = {0};
         int result = kernel_socket_getpeer(socket, &peer_address);
         if (!result) result = copy_peer(context, &peer_address);
         if (result != 0) {
-            if (kernel_files_release_uninstalled_description(files, &ofd) !=
+            if (kernel_files_release_uninstalled_description(files, ofd) !=
                     KERNEL_FILES_STATUS_OK)
                 __builtin_trap();
             *linux_result = result;
@@ -49,8 +38,8 @@ static enum kernel_files_status install_socket(
      * for copyout so failure never closes a descriptor another task reused. */
     if (kernel_files_install_new_owned_at(files, fd,
         (flags & LINUX_SOCK_CLOEXEC) != 0U ? KERNEL_FILES_FD_CLOEXEC : 0U,
-        &ofd) != KERNEL_FILES_STATUS_OK) {
-        if (kernel_open_file_release(&ofd) != KERNEL_OPEN_FILE_STATUS_OK)
+        ofd) != KERNEL_FILES_STATUS_OK) {
+        if (kernel_open_file_release(ofd) != KERNEL_OPEN_FILE_STATUS_OK)
             __builtin_trap();
         return KERNEL_FILES_STATUS_STATE;
     }
@@ -82,7 +71,17 @@ enum kernel_files_status kernel_files_socket_create(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    status=install_socket(files,socket,fd,flags,0,0,linux_result);
+    struct kernel_open_file_description *ofd = 0;
+    enum kernel_open_file_status open_status = kernel_open_file_create_socket(
+        files->heap, socket, LINUX_O_RDWR | (flags & LINUX_SOCK_NONBLOCK), &ofd);
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+        kernel_socket_destroy(socket);
+        if (open_status != KERNEL_OPEN_FILE_STATUS_NO_MEMORY)
+            return KERNEL_FILES_STATUS_STATE;
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status=install_socket(files,&ofd,fd,flags,0,0,linux_result);
     if (!status && *linux_result>=0) reservation.files=0;
     return status;
 }
@@ -111,29 +110,45 @@ enum kernel_files_status kernel_files_socket_accept(
     struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd};
     struct kernel_socket *socket = kernel_open_file_socket(listener);
     result = kernel_socket_accept_check(socket);
-    uint32_t wait_flags = kernel_open_file_flags(listener) & LINUX_SOCK_NONBLOCK
-        ? KERNEL_SOCKET_MSG_DONTWAIT : 0;
-    uint64_t target = 0;
-    if (!result) {
-        uint64_t timeout = kernel_socket_receive_timeout(socket);
-        if (timeout) {
-            uint64_t now = kernel_time_monotonic_ns();
-            target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
-        }
-        for (;;) {
-            result = kernel_socket_wait_ready(socket, KERNEL_POLLIN, target, wait_flags);
-            if (result) break;
-            result = kernel_socket_accept(socket, &accepted);
-            if (result != -KERNEL_EAGAIN || wait_flags) break;
-            /* Another acceptor may consume readiness; keep this call's deadline. */
-            if (target && kernel_time_monotonic_ns() >= target) break;
-        }
-    }
-    if (result != 0) {
+    if (result) {
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    status=install_socket(files,accepted,fd,flags,copy_peer,context,linux_result);
+    /* accept出队会转移并消耗pending child，之后不能再因OFD分配失败丢连接。 */
+    struct kernel_open_file_description *ofd = 0;
+    enum kernel_open_file_status open_status = kernel_open_file_create_socket(
+        files->heap, 0, LINUX_O_RDWR | (flags & LINUX_SOCK_NONBLOCK), &ofd);
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+        if (open_status != KERNEL_OPEN_FILE_STATUS_NO_MEMORY)
+            return KERNEL_FILES_STATUS_STATE;
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    uint32_t wait_flags = kernel_open_file_flags(listener) & LINUX_SOCK_NONBLOCK
+        ? KERNEL_SOCKET_MSG_DONTWAIT : 0;
+    uint64_t target = 0;
+    uint64_t timeout = kernel_socket_receive_timeout(socket);
+    if (timeout) {
+        uint64_t now = kernel_time_monotonic_ns();
+        target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+    }
+    for (;;) {
+        result = kernel_socket_wait_ready(socket, KERNEL_POLLIN, target, wait_flags);
+        if (result) break;
+        result = kernel_socket_accept(socket, &accepted);
+        if (result != -KERNEL_EAGAIN || wait_flags) break;
+        /* Another acceptor may consume readiness; keep this call's deadline. */
+        if (target && kernel_time_monotonic_ns() >= target) break;
+    }
+    if (result != 0) {
+        if (kernel_files_release_uninstalled_description(files, &ofd) !=
+                KERNEL_FILES_STATUS_OK)
+            __builtin_trap();
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    kernel_open_file_take_socket(ofd, &accepted);
+    status=install_socket(files,&ofd,fd,flags,copy_peer,context,linux_result);
     if (!status && *linux_result>=0) reservation.files=0;
     return status;
 }

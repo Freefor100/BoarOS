@@ -17,6 +17,7 @@ static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
 static unsigned heap_allocations,protocol_services,allow_ofd_release;
+static unsigned space_callbacks;
 static _Thread_local unsigned reservation_actor,state_acquires;
 static struct kernel_socket *lookup_close_target;
 static unsigned lookup_close_done;
@@ -105,7 +106,9 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
         while(node) {
             struct kernel_wait_node *next=node->next;
             if(next)next->references++;
-            CHECK(node->callback);node->callback(node,KERNEL_WAIT_WOKEN);
+            CHECK(node->callback);
+            if(node->callback==unix_space_notify)space_callbacks++;
+            node->callback(node,KERNEL_WAIT_WOKEN);
             CHECK(node->references);node->references--;node=next;
         }
     }
@@ -1299,7 +1302,7 @@ static void *reserve_concurrently(void *argument)
 }
 static void concurrent_reservation(void)
 {
-    struct kernel_socket socket={.heap=&test_heap,.type=SOCKET_STREAM,.domain=KERNEL_SOCKET_DOMAIN_UNIX,.rx_bytes=4};
+    struct kernel_socket socket={.heap=&test_heap,.type=SOCKET_STREAM,.domain=KERNEL_SOCKET_DOMAIN_UNIX,.connected=1,.rx_bytes=4};
     struct socket_packet packet={.length=4};socket.packets_head=socket.packets_tail=&packet;
     kernel_wait_queue_init(&socket.wait);
     struct reservation_attempt attempts[2]={{.socket=&socket,.actor=1},{.socket=&socket,.actor=2}};
@@ -1563,10 +1566,78 @@ static void unix_named_endpoints(void)
     unix_abstract_names();unix_named_stream();unix_named_datagram();
 }
 
+static void unix_stream_receive_state(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&socket));
+    struct kernel_open_file_description *pin=(void *)socket;
+    struct kernel_socket_read_request request={0};
+    for(int nonblocking=0;nonblocking<2;nonblocking++) {
+        CHECK(kernel_socket_receive_ready(socket));
+        CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,nonblocking)==-KERNEL_EINVAL);
+        CHECK(!request.socket && pin==(void *)socket);
+    }
+    const unsigned char name[]={0,'r','e','c','v','-','s','t','a','t','e'};
+    struct kernel_socket_address address=abstract_address(name,sizeof(name));
+    CHECK(!kernel_socket_bind(socket,&address) && !kernel_socket_listen(socket,1));
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,1)==-KERNEL_EINVAL);
+    kernel_socket_destroy(socket);
+    struct kernel_socket *a=NULL,*b=NULL;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&a,&b));
+    kernel_socket_destroy(b);pin=(void *)a;
+    CHECK(kernel_socket_receive_ready(a));
+    CHECK(!kernel_socket_reserve_read(a,NULL,&request,&pin,1,0));
+    kernel_socket_destroy(a);CHECK(!heap_live);
+    puts("PASS UNIX stream receive state: unconnected/listener EINVAL before waiting, established peer close remains EOF");
+}
+
+static void count_space_wakeup(struct kernel_wait_node *node,uint32_t reason)
+{ CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+
+static void unix_space_topology(void)
+{
+    kernel_socket_network_initialize();
+    const unsigned char an[]={0,'n','o','t','i','f','y','-','a'},bn[]={0,'n','o','t','i','f','y','-','b'};
+    struct kernel_socket_address aa=abstract_address(an,sizeof(an)),ba=abstract_address(bn,sizeof(bn)),disconnect={0};
+    struct kernel_socket *a=named_unix_socket(SOCKET_DGRAM,an,sizeof(an)),*b=named_unix_socket(SOCKET_DGRAM,bn,sizeof(bn)),*c=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&c));
+    CHECK(!kernel_socket_connect(a,&ba,1) && !kernel_socket_connect(b,&aa,1));
+    unsigned before=space_callbacks;
+    CHECK(write_buffer(a,"pair",4,0)==4);
+    struct kernel_socket_address source=read_named_packet(b,"pair");kernel_socket_address_release(&source);
+    CHECK(space_callbacks==before);
+    CHECK(!kernel_socket_connect(b,&disconnect,1));
+    char byte='q';struct kernel_uaccess_iovec iov={(uintptr_t)&byte,1};
+    for(unsigned i=0;i<11;i++) {
+        struct kernel_open_file_description *pin=(void *)c;
+        CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&ba)==1);
+    }
+    CHECK(!(kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
+    unsigned notifications=0;struct kernel_wait_node watcher={0};
+    kernel_wait_node_init_callback(&watcher,count_space_wakeup,&notifications);kernel_wait_queue_add(&a->wait,&watcher);
+    source=read_named_packet(b,"q");kernel_socket_address_release(&source);
+    CHECK(notifications && (kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
+    struct kernel_open_file_description *pin=(void *)c;
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,&ba)==1);
+    CHECK(!(kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
+    before=notifications;
+    CHECK(!kernel_socket_connect(b,&aa,1));
+    CHECK(notifications>before && (kernel_socket_poll(a,NULL)&KERNEL_POLLOUT));
+    CHECK(kernel_wait_node_remove_sync(&watcher)==KERNEL_SCHEDULER_STATUS_OK);
+    before=space_callbacks;
+    for(unsigned i=0;i<11;i++) {source=read_named_packet(b,"q");kernel_socket_address_release(&source);}
+    CHECK(space_callbacks==before);
+    kernel_socket_destroy(a);kernel_socket_destroy(b);kernel_socket_destroy(c);CHECK(!heap_live);
+    puts("PASS UNIX space notification: reciprocal traffic skips callbacks; disconnect restores queue-space wake, reciprocal reconnect wakes existing writer");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "unix-dgram-shutdown")) unix_datagram_read_shutdown();
+    if (!strcmp(argv[1], "unix-stream-state")) unix_stream_receive_state();
+    else if (!strcmp(argv[1], "unix-space-topology")) unix_space_topology();
+    else if (!strcmp(argv[1], "unix-dgram-shutdown")) unix_datagram_read_shutdown();
     else if (!strcmp(argv[1], "unix-dgram-reconnect")) unix_datagram_reconnect_receive();
     else if (!strcmp(argv[1], "unix-listener-lookup-close")) unix_listener_lookup_close();
     else if (!strcmp(argv[1], "unix-peer-queued")) unix_stream_peer_after_close(1);

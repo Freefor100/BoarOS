@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -110,6 +111,15 @@ static const unsigned char cold_send[16384] __attribute__((aligned(16384)))={0x6
 static unsigned char cold_receive[16384] __attribute__((aligned(16384)))={0x45};
 static void faults(void)
 {
+    int unconnected=socket_at(SOCK_STREAM,0);char state_byte=0;
+    CHECK(recv(unconnected,&state_byte,1,0)==-1 && errno==EINVAL);
+    struct iovec state_iov={&state_byte,1};
+    CHECK(readv(unconnected,&state_iov,1)==-1 && errno==EINVAL);
+    struct address state_name=abstract("receive-state",0);
+    CHECK(!bind(unconnected,(void *)&state_name.un,state_name.len) && !listen(unconnected,1));
+    struct msghdr state_message={.msg_iov=&state_iov,.msg_iovlen=1};
+    CHECK(recvmsg(unconnected,&state_message,MSG_DONTWAIT)==-1 && errno==EINVAL);
+    CHECK(!close(unconnected));
     int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
     CHECK(send(pair[0],cold_send,1,MSG_NOSIGNAL)==1);
     CHECK(recv(pair[1],cold_receive,1,0)==1 && cold_receive[0]==0x6b);
@@ -163,6 +173,30 @@ static void queue_notifications(void)
         CHECK(!pthread_join(thread,0));CHECK(send(sender,&byte,1,0)==1 && recv(receiver,&byte,1,0)==1);
         CHECK(!pthread_barrier_destroy(&gate));if(ep)CHECK(!close(eventfd));CHECK(!close(sender) && !close(receiver));
     }
+    /* Leave a reciprocal pair, wait on another sender's full destination, then
+     * become reciprocal again while a writer is asleep. Neither transition
+     * may lose the sender's poll/epoll notification. */
+    struct address ta=abstract("topology-a",1),tb=abstract("topology-b",2);
+    int left=socket_at(SOCK_DGRAM|SOCK_NONBLOCK,&ta),right=socket_at(SOCK_DGRAM|SOCK_NONBLOCK,&tb),third=socket_at(SOCK_DGRAM|SOCK_NONBLOCK,0);
+    connect_to(left,&tb);connect_to(right,&ta);struct sockaddr unspec={.sa_family=AF_UNSPEC};
+    CHECK(!connect(right,&unspec,sizeof(unspec)));
+    char q='q';unsigned filled=0;
+    while(sendto(third,&q,1,0,(void *)&tb.un,tb.len)==1)CHECK(++filled<65536);
+    CHECK(errno==EAGAIN && filled);
+    int topology_ep=epoll_create1(0);CHECK(topology_ep>=0);struct epoll_event topology_event={.events=EPOLLOUT};
+    CHECK(!epoll_ctl(topology_ep,EPOLL_CTL_ADD,left,&topology_event) && epoll_wait(topology_ep,&topology_event,1,0)==0);
+    pthread_barrier_t topology_gate;CHECK(!pthread_barrier_init(&topology_gate,0,2));
+    struct wake topology_wait={.fd=left,.mode=1,.ep=topology_ep,.gate=&topology_gate};pthread_t topology_thread;
+    CHECK(!pthread_create(&topology_thread,0,wait_ready,&topology_wait));barrier(&topology_gate);wait_sleep(&topology_wait.tid);
+    CHECK(recv(right,&q,1,0)==1 && q=='q' && !pthread_join(topology_thread,0));
+    CHECK(sendto(third,&q,1,0,(void *)&tb.un,tb.len)==1 && epoll_wait(topology_ep,&topology_event,1,0)==0);
+    topology_wait.tid=0;CHECK(!pthread_create(&topology_thread,0,wait_ready,&topology_wait));barrier(&topology_gate);wait_sleep(&topology_wait.tid);
+    connect_to(right,&ta);
+    /* Linux does not notify the opposite endpoint solely on this connect;
+     * drain a queued message to provide the space event on both kernels. */
+    CHECK(recv(right,&q,1,0)==1 && q=='q' && !pthread_join(topology_thread,0));
+    for(unsigned i=1;i<filled;i++)CHECK(recv(right,&q,1,0)==1 && q=='q');
+    CHECK(!pthread_barrier_destroy(&topology_gate) && !close(topology_ep) && !close(third) && !close(left) && !close(right));
     struct address a=abstract("backlog",3);int listener=socket_at(SOCK_STREAM|SOCK_NONBLOCK,&a);CHECK(!listen(listener,1));int clients[64];unsigned count=0;
     for(;;) { int fd=socket_at(SOCK_STREAM|SOCK_NONBLOCK,0);if(!connect(fd,(void *)&a.un,a.len)) { CHECK(count<64);clients[count++]=fd;continue; }CHECK(errno==EAGAIN && count>0);CHECK(!close(fd));break; }
     struct pending pending={.fd=socket_at(SOCK_STREAM,0),.address=a};pthread_t connector;CHECK(!pthread_create(&connector,0,pending_connect,&pending));wait_sleep(&pending.tid);
