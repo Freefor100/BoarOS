@@ -39,6 +39,7 @@ struct kernel_uid_account {
     struct kernel_heap *heap;
     uint64_t references, pending, processes;
     uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by socket state lock. */
+    uint64_t shm_locked_pages; /* SHM_LOCK quota, protected by kernel_wait_domain. */
     uint32_t uid;
 };
 struct kernel_credential_groups {
@@ -81,6 +82,10 @@ struct kernel_uid_account *kernel_uid_account_get_locked(struct kernel_uid_accou
 struct kernel_uid_account *kernel_uid_account_put_locked(struct kernel_uid_account *);
 void kernel_uid_account_release(struct kernel_uid_account *);
 void kernel_uid_account_put(struct kernel_uid_account *);
+/* A successful charge owns one account reference until SHM_UNLOCK/destruction.
+ * The limit is the current caller's MEMLOCK page allowance, independent of MM. */
+int kernel_uid_account_shm_lock(struct kernel_uid_account *,uint64_t pages,uint64_t limit);
+void kernel_uid_account_shm_unlock(struct kernel_uid_account *,uint64_t pages);
 
 struct kernel_credential_groups *kernel_credential_groups_allocate(struct kernel_heap *,uint32_t count);
 void kernel_credential_groups_put(struct kernel_credential_groups *);
