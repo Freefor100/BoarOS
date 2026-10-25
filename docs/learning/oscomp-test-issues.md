@@ -123,6 +123,7 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 | `kcmp03` 的clone前置能力 | 四分项依次请求独立CLONE_VM、CLONE_FS、CLONE_IO、CLONE_SYSVSEM。当前独立CLONE_VM在clone阶段返回EOPNOTSUPP，CLONE_IO返回EINVAL，均在`kcmp03.c:81`结束该分项。 | 这是现有clone组合/IO对象的内核范围；四配置均2/4，FS及SYSVSEM比较PASS，VM/IO分项未进入kcmp。独立VM与IO扩展继续保留为能力缺口。 |
 | 自有差分使用的LA musl vfork | 固定musl1.2.5的`src/process/vfork.c`在LA无专属汇编的配置中执行`clone(SIGCHLD,0)`；反汇编为a7=220、a0=17，实际采用独立MM。 | 直接消费者使用独立子栈及显式`CLONE_VM|CLONE_VFORK|SIGCHLD`验证共享关系，固定Linux与BoarOS均10/10；两种libc运行同一源码。线程撤号另等PIDFD_THREAD的HUP再检查ESRCH，覆盖pthread_join完成后TID仍短暂存在的Linux交错。原LTP结果按其实际clone输入另列。 |
 | `eventfd01/02` 的Kconfig输入 | 原ELF请求`CONFIG_EVENTFD`，LTP在解析Linux `.config`时TBROK，退出2；当前启动环境没有该配置文件。 | 四配置均未进入主体，原judge为0/0。eventfd接口差分及原eventfd2测例通过；逐程序得分/耗时见[eventfd与timerfd结果](data-path-budget-experiments.md#eventfd与timerfd2026-10-22)。 |
+| `futex_waitv01/02/03` 的内核版本检查 | 四配置均在 `tst_test.c:913` 因要求Linux版本至少5.16而TCONF、退出32；BoarOS的uname release是`0.1.0-boaros-dev`。 | waitv入口已实现，但这批原程序未调用它，原judge各0/0、0分。保留原ELF、参数和版本身份；直接同ELF检查覆盖实际入口、队列、超时及退出。详见[本批结果](oscomp-ltp-analysis.md#futex多地址等待与pi重排原程序结果2026-10-25)。 |
 | `getdents01` 的四种入口 | 旧 getdents syscall 在两种架构上无入口，部分 libc 也没有导出相应 wrapper；这些分项记 TCONF。 | 四配置共七条 TCONF；有效 getdents64 分项通过。对应分项、得分和时间见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)。 |
 | RV 原 musl 的浮点 ABI 标注 | 原测例标注double-float ABI，原libc标注soft-float；设置`LTP_TIMEOUT_MUL=0.1`时观察到异常巨大时限。 | 信号等待的正式复核沿用未设置该变量的默认30秒；该原输入差异独立于EINTR重试，保留在定向运行记录。 |
 | libc-test 的部分共同失败 | 固定 Linux 上同一原 ELF 也失败，例如缺 UTF-8 locale、glibc 的 ERE 扩展与原断言预期不同。 | 逐项 Linux/BoarOS 输出见[对照附件](oscomp-libctest-original-failures.tsv)及[具体触发条件](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
@@ -174,4 +175,4 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 
 ## 原盘futex覆盖范围
 
-2026-10-25核对RV/LA、glibc/musl四份发布目录：均有普通WAIT/WAKE、CMP_REQUEUE、BITSET和waitv程序，没有独立的LOCK_PI／UNLOCK_PI测例。因此原`futex_wait01/wake01/cmp_requeue01`的17/17用于普通路径回归；新增PI mutex的功能依据来自两架构直接程序、libc的PTHREAD_PRIO_INHERIT消费者及固定Linux差分。原ELF与判分保持原样，结果见[本批futex结果](oscomp-ltp-analysis.md#pi-mutex接入后的原futex短例2026-10-25)。waitv入口继续列在内核能力目录中。
+2026-10-25核对RV/LA、glibc/musl四份发布目录：均有普通WAIT/WAKE、CMP_REQUEUE、BITSET和waitv程序，没有独立的LOCK_PI／UNLOCK_PI测例。因此原`futex_wait01/wake01/cmp_requeue01`的17/17用于普通路径回归；新增PI mutex的功能依据来自两架构直接程序、libc的PTHREAD_PRIO_INHERIT消费者及固定Linux差分。原ELF与判分保持原样，结果见[本批futex结果](oscomp-ltp-analysis.md#pi-mutex接入后的原futex短例2026-10-25)。该批未实现的waitv已在后续多地址等待阶段接入，原程序的版本检查结果见上表。

@@ -896,6 +896,23 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 | futex_wake01 | 6/6 | 72 | 65 | 64 | 42 |
 | futex_cmp_requeue01 | 7/7 | 4547 | 2662 | 4483 | 2998 |
 
-原程序检查普通futex在PI接入后的行为。盘内没有独立PI mutex测例，PI加锁／继承／owner退出由固定Linux同ELF及两种libc直接消费者检查，覆盖范围见[PI成本与验证](cpu-accounting-cost.md#pi-mutex-与普通路径成本2026-10-25)。当前PI条件变量重排和futex_waitv仍为后续能力，原盘的waitv程序未列入本次运行。
+原程序检查普通futex在PI接入后的行为。盘内没有独立PI mutex测例，PI加锁／继承／owner退出由固定Linux同ELF及两种libc直接消费者检查，覆盖范围见[PI成本与验证](cpu-accounting-cost.md#pi-mutex-与普通路径成本2026-10-25)。当时PI条件变量重排和futex_waitv尚未接入，原盘的waitv程序未列入该批运行；后续结果见下节。
 
 八个根盘／分区fsck均正常，两架构最终heap-live=0，默认交付内核按保存SHA恢复，原有交付文档修改保持原字节。细项、输入身份、原始serial和每程序计时在`build/pi-futex-20261025/original/`，正常运行盘已清理。
+
+## futex多地址等待与PI重排原程序结果：2026-10-25
+
+以下为22:49定向修正合入后的最终交付核复核。固定官方容器、原QEMU双盘参数，两架构并行；每架构依次运行原glibc和musl程序，保留参数、judge和内部时限。
+
+| 原程序 | 四配置共同结果／得分 | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms |
+|---|---|---:|---:|---:|---:|
+| futex_waitv01 | 版本准备TCONF，退出32；0/0、0分 | 83 | 42 | 64 | 21 |
+| futex_waitv02 | 版本准备TCONF，退出32；0/0、0分 | 43 | 41 | 42 | 21 |
+| futex_waitv03 | 版本准备TCONF，退出32；0/0、0分 | 41 | 21 | 42 | 21 |
+| futex_wait01 | 4项通过、退出0；4/4 | 95 | 64 | 94 | 44 |
+| futex_wake01 | 6项通过、退出0；6/6 | 63 | 42 | 64 | 43 |
+| futex_cmp_requeue01 | 7项通过、退出0；7/7 | 4648 | 2621 | 4387 | 3092 |
+
+普通三项每配置17/17、合计68/68。三个waitv程序均未进入主体：LTP先检查uname版本，当前release为BoarOS自身版本，详细分类统一维护于[测例问题](oscomp-test-issues.md)。本批没有超时，原程序0/0不计入新能力的通过数。waitv与PI重排的实际行为由固定Linux同ELF、两架构两种libc及RV双/四核直接消费者验证，机制与验证范围见[调度模块](../modules/kernel-scheduler.md#多地址等待)。
+
+两架构正常结束且heap-live=0；根盘及第二盘三个分区共八对象检查返回0，默认交付内核按保存SHA恢复。完整细项、原输入与ELF身份、每程序计时及磁盘检查在`build/futex-waitv-20261025/original-final/`；首次机制批次保留在同级`original/`。性能分别维护于[CPU成本](cpu-accounting-cost.md)。
