@@ -94,6 +94,7 @@ struct kernel_signal_table {
     uint32_t references;
     struct kernel_signal_action actions[KERNEL_SIGNAL_COUNT];
     struct kernel_wait_queue signalfd_waiters;
+    uint64_t identity;
 };
 
 enum kernel_user_return_work {
@@ -250,7 +251,8 @@ struct kernel_task {
     struct kernel_sem_request *sem_request;
     struct kernel_msg_request *msg_request;
     struct kernel_posix_cpu_sleep *cpu_sleep;
-    /* 远端只在查找真实OFD期间借files；退出先撤下访问资格再等待。 */
+    /* 远端资源比较/FD读取的短访问；退出先发布离开，再等待原句柄读者。
+     * FD槽由各表raw保护，FS发布由VFS状态保护，其余身份由调度域保护。 */
     struct kernel_raw_lock files_access;
 } __attribute__((aligned(16)));
 

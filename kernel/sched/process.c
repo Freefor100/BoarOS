@@ -1876,19 +1876,12 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
 static enum kernel_scheduler_status cleanup_user_task_resources(
     struct kernel_task *thread)
 {
-    enum kernel_signal_status signal_status;
     enum kernel_mm_status mm_status;
     enum kernel_exec_status exec_status;
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
     cleanup_task_io_requests(thread);
-
-    signal_status = thread->group_leader == thread && thread->group_members > 1U
-        ? KERNEL_SIGNAL_STATUS_OK : kernel_signal_release_table(thread);
-    if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
 
     if (thread->exec_transaction != 0) {
         struct kernel_exec_transaction *transaction =
@@ -2193,8 +2186,8 @@ static void process_begin_exit(struct kernel_task *current,
         current->proc_exiting = 1;
         if (!current->group_exiting) current->completion = *completion;
     }
-    /* 新读者在调度域拒绝退出任务；存量读者结束真实FD pin后，原任务
-     * 才能释放表存储。等待不持调度域，后端清理仍保留原files owner。 */
+    /* 退出状态先于资源释放发布；kcmp把已离开的资源视为NULL，getfd
+     * 拒绝新访问。存量读者结束后原owner才释放句柄，后端清理在锁外。 */
     KERNEL_RAW_SCOPE(files, &current->files_access);
 }
 

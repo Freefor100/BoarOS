@@ -239,8 +239,10 @@ int kernel_sem_clone(struct kernel_task *parent, struct kernel_task *child, int 
     child->sem_request = 0;
     if (!shared) return 0;
     if (!parent->sem_undo) {
-        parent->sem_undo = undo_create();
-        if (!parent->sem_undo) return -KERNEL_ENOMEM;
+        struct kernel_sem_undo *created=undo_create();
+        if (!created) return -KERNEL_ENOMEM;
+        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        parent->sem_undo=created;
     }
     struct kernel_sem_undo *group = parent->sem_undo;
     KERNEL_RAW_SCOPE(guard, &group->lock);
@@ -271,8 +273,10 @@ static int request_undo(struct kernel_sem_request *request)
 {
     struct kernel_task *task = request->task;
     if (!task->sem_undo) {
-        task->sem_undo = undo_create();
-        if (!task->sem_undo) return -KERNEL_ENOMEM;
+        struct kernel_sem_undo *created=undo_create();
+        if (!created) return -KERNEL_ENOMEM;
+        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        task->sem_undo=created;
     }
     struct kernel_sem_undo *group = task->sem_undo;
     struct sem_set *set = request->set;
@@ -755,9 +759,13 @@ void kernel_sem_abort(struct kernel_task *task)
 void kernel_sem_exit(struct kernel_task *task)
 {
     kernel_sem_abort(task);
-    struct kernel_sem_undo *group = task->sem_undo;
+    struct kernel_sem_undo *group;
+    {
+        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        group=task->sem_undo;
+        task->sem_undo=0;
+    }
     if (!group) return;
-    task->sem_undo = 0;
     {
         KERNEL_RAW_SCOPE(guard, &group->lock);
         if (!group->owners) __builtin_trap();

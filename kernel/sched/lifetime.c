@@ -205,7 +205,10 @@ void scheduler_task_collect(void)
             completed_controlled = task->controlled == 2;
 #endif
         }
-        /* No rank40 lock may be held while the allocator consumes the page. */
+        /* Discovery and all storage borrows have ended. Like Linux sighand,
+         * dispositions retain their identity through zombie/reap, then leave
+         * with the container; queue quiescence and page disposal stay outside raw. */
+        if (kernel_signal_release_table(task)) __builtin_trap();
         kernel_resource_limits_put(task->limits);
         task->limits = 0;
         kernel_credentials_put(task->credentials);
