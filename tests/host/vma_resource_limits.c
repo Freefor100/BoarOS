@@ -40,7 +40,15 @@ int main(void)
     assert(!kernel_vma_set_prepare_protect(set,2*P,3*P,3,&edit)&&!kernel_vma_set_commit_edit(set,&edit));usage(set,5,3);
     assert(!kernel_vma_set_prepare_protect(set,P,2*P,1,&edit)&&!kernel_vma_set_commit_edit(set,&edit));usage(set,5,2);
     assert(!kernel_vma_set_prepare_replace(set,5*P,6*P,0,&edit)&&!kernel_vma_set_commit_edit(set,&edit));usage(set,4,1);
+    assert(!kernel_vma_set_prepare_lock(set,P,3*P,3,&edit)&&!kernel_vma_set_commit_edit(set,&edit));
+    assert(kernel_vma_set_locked_bytes(set)==2*P);
+    assert(kernel_vma_set_locked_range(set,2*P,4*P)==P);
+    assert(!kernel_vma_set_prepare_protect(set,P,2*P,1,&edit)&&!kernel_vma_set_commit_edit(set,&edit));
+    assert(kernel_vma_set_locked_bytes(set)==2*P);usage(set,4,1);
     assert(!kernel_vma_set_clone(set,&copy));usage(copy,4,1);
+    kernel_vma_set_clear_locks(copy);assert(!kernel_vma_set_locked_bytes(copy));
+    assert(kernel_vma_set_locked_bytes(set)==2*P);
+    assert(!kernel_vma_set_prepare_protect(set,P,2*P,1,&edit)&&!kernel_vma_set_commit_edit(set,&edit));
     assert(!kernel_vma_set_prepare_protect(copy,2*P,3*P,1,&edit)&&!kernel_vma_set_commit_edit(copy,&edit));usage(copy,4,0);usage(set,4,1);
     assert(!kernel_vma_set_destroy(&copy)&&!kernel_vma_set_destroy(&set));
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
