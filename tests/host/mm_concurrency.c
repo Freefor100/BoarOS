@@ -30,11 +30,21 @@ static unsigned capture_mask, prepare_entered[4], prepare_release;
 static unsigned fail_next_access;
 static uint64_t fail_access_address = KERNEL_MM_NO_PAGE;
 static uint64_t race_address;
+static uint64_t parallel_address[4];
+static unsigned population_capture, population_entered, population_release;
+static uint64_t population_start;
 static enum kernel_uaccess_status race_status[4];
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *pages, uint64_t *physical)
 {
     unsigned id = kernel_cpu_current()->hardware_id;
+    struct kernel_lock_guard *held = kernel_io_context_current()->locks;
+    if (pages == &allocator && id == 1 && held && held->lock->rank == 25 && !held->write &&
+        __atomic_exchange_n(&population_capture, 0, __ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&population_entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&population_release, __ATOMIC_ACQUIRE)) sched_yield();
+    }
     if (pages == &allocator && id < 4 && !kernel_io_context_current()->locks &&
         (__atomic_fetch_and(&capture_mask, ~(1U << id), __ATOMIC_ACQ_REL) & (1U << id))) {
         assert(!kernel_cpu_current()->raw_locks);
@@ -61,7 +71,13 @@ void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
 void mm_test_fence(uint64_t v, int instructions)
 {
-    (void)v; assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!instructions && population_start && kernel_cpu_current()->hardware_id == 1 &&
+        v == population_start + 16 * BOAROS_PAGE_SIZE) {
+        struct kernel_mm_mapping first;
+        assert(!kernel_mm_lookup(&mm[1], population_start, &first));
+        assert(!(first.permissions & KERNEL_MM_WRITE)); /* queued writer ran between bounded batches */
+    }
     if (!instructions && kernel_cpu_current()->hardware_id == 1 &&
         __atomic_load_n(&hold_fence, __ATOMIC_ACQUIRE)) {
         assert(!kernel_cpu_current()->raw_locks);
@@ -335,6 +351,143 @@ static void fault_candidates(void)
     assert(!kernel_mm_munmap(&mm[0], race_address, BOAROS_PAGE_SIZE));
     puts("MM simultaneous faults, stale candidates and second-table OOM return actual owners");
 }
+/* A publisher waiting for its real fence must not serialize faults at other VAs. */
+static void *parallel_fault(void *argument)
+{
+    unsigned id = (unsigned)(uintptr_t)argument;
+    mm_test_attach(id); mm_test_context = context;
+    assert(!kernel_mm_resolve_user_fault(&mm[id], parallel_address[id], KERNEL_MM_WRITE));
+    __atomic_store_n(&done[id], 1, __ATOMIC_RELEASE);
+    return 0;
+}
+static void parallel_publication(void)
+{
+    uint64_t mapped;
+    uint64_t start = UINT64_C(0x80000000);
+    assert(!kernel_mm_mmap_anonymous(&mm[0], start, 2 * BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &mapped));
+    parallel_address[1] = start; parallel_address[2] = start + BOAROS_PAGE_SIZE;
+    for (unsigned cow = 0; cow < 2; cow++) {
+        struct kernel_mm_mapping old_first = {0}, old_second = {0};
+        if (cow) {
+            assert(!kernel_mm_fork(&child, &mm[0]));
+            assert(!kernel_mm_lookup(&child, start, &old_first));
+            assert(!kernel_mm_lookup(&child, start + BOAROS_PAGE_SIZE, &old_second));
+        }
+        done[1] = done[2] = fence_entered = fence_release = 0;
+        hold_fence = 1;
+        pthread_t one, two;
+        assert(!pthread_create(&one, 0, parallel_fault, (void *)(uintptr_t)1));
+        while (!__atomic_load_n(&fence_entered, __ATOMIC_ACQUIRE)) sched_yield();
+        park_before[2] = mm_test_parked(2);
+        assert(!pthread_create(&two, 0, parallel_fault, (void *)(uintptr_t)2));
+        while (!__atomic_load_n(&done[2], __ATOMIC_ACQUIRE) && mm_test_parked(2) == park_before[2]) sched_yield();
+        assert(__atomic_load_n(&done[2], __ATOMIC_ACQUIRE) && "independent fault blocked behind another publisher's fence");
+        assert(!__atomic_load_n(&done[1], __ATOMIC_ACQUIRE));
+        struct kernel_mm_mapping first, second;
+        assert(!kernel_mm_lookup(&mm[0], start, &first));
+        assert(!kernel_mm_lookup(&mm[0], start + BOAROS_PAGE_SIZE, &second));
+        assert(first.physical_address != second.physical_address);
+        if (cow) {
+            uint32_t references;
+            assert(first.physical_address != old_first.physical_address &&
+                second.physical_address != old_second.physical_address);
+            assert(!physical_page_reference_count(&allocator, old_first.physical_address, &references) && references == 3);
+            assert(!physical_page_reference_count(&allocator, old_second.physical_address, &references) && references == 1);
+            struct kernel_mm_concurrency_state state;
+            kernel_mm_get_concurrency_state(&mm[0], &state);
+            assert(state.pending_retirement == 1); /* peer completion cannot return this publisher's old owners */
+        }
+        __atomic_store_n(&fence_release, 1, __ATOMIC_RELEASE);
+        assert(!pthread_join(one, 0) && !pthread_join(two, 0));
+        hold_fence = 0;
+        if (cow) { assert(!kernel_mm_release(&child)); child = (struct kernel_mm){0}; }
+    }
+    assert(!kernel_mm_munmap(&mm[0], start, 2 * BOAROS_PAGE_SIZE));
+    struct kernel_mm_concurrency_state state;
+    kernel_mm_get_concurrency_state(&mm[0], &state);
+    assert(!state.pins && !state.write_pins && !state.pending_retirement);
+    puts("MM distinct-address anonymous/COW publication progresses with independent delayed-fence owners");
+}
+static void *populate_parallel(void *unused)
+{
+    (void)unused; mm_test_attach(1); mm_test_context = context;
+    assert(!kernel_mm_mlock(&mm[1], population_start, 32 * BOAROS_PAGE_SIZE, 0));
+    __atomic_store_n(&done[1], 1, __ATOMIC_RELEASE);
+    return 0;
+}
+static void *population_edit(void *unused)
+{
+    (void)unused; mm_test_attach(3); mm_test_context = context;
+    assert(!kernel_mm_mprotect(&mm[3], population_start, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    __atomic_store_n(&done[3], 1, __ATOMIC_RELEASE);
+    return 0;
+}
+static void population_batches(void)
+{
+    uint64_t mapped;
+    population_start = UINT64_C(0xa0000000);
+    assert(!kernel_mm_mmap_anonymous(&mm[0], population_start, 33 * BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &mapped));
+    parallel_address[2] = population_start + 32 * BOAROS_PAGE_SIZE;
+    population_capture = 1; population_entered = population_release = 0;
+    done[1] = done[2] = done[3] = 0;
+    pthread_t population, fault, editor;
+    assert(!pthread_create(&population, 0, populate_parallel, 0));
+    while (!__atomic_load_n(&population_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    park_before[2] = mm_test_parked(2);
+    assert(!pthread_create(&fault, 0, parallel_fault, (void *)(uintptr_t)2));
+    while (!__atomic_load_n(&done[2], __ATOMIC_ACQUIRE) && mm_test_parked(2) == park_before[2]) sched_yield();
+    assert(__atomic_load_n(&done[2], __ATOMIC_ACQUIRE));
+    park_before[3] = mm_test_parked(3);
+    assert(!pthread_create(&editor, 0, population_edit, 0));
+    await_registration(3);
+    __atomic_store_n(&population_release, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(population, 0) && !pthread_join(fault, 0) && !pthread_join(editor, 0));
+    assert(done[1] && done[2] && done[3]);
+    for (unsigned i = 0; i < 33; i++) {
+        struct kernel_mm_mapping mapping;
+        assert(!kernel_mm_lookup(&mm[0], population_start + i * BOAROS_PAGE_SIZE, &mapping));
+    }
+    assert(!kernel_mm_munmap(&mm[0], population_start, 33 * BOAROS_PAGE_SIZE));
+    population_start = 0;
+    puts("MM shared population preparation and bounded writer admission verified");
+}
+struct pressure_case { uint64_t pages[4096]; unsigned count, locked, progressed; };
+static uint64_t pressure_reclaim(void *context, uint64_t target)
+{ (void)context; (void)target; return 0; }
+static void pressure_progress(void *context)
+{
+    struct pressure_case *pressure = context;
+    /* Same admission rule as page-cache dirty-pressure waiting: never wait
+     * for an owner which may require this caller's MM qualification. */
+    if (kernel_io_context_current()->locks) { pressure->locked++; return; }
+    assert(pressure->count);
+    assert(!physical_page_release(&allocator, pressure->pages[--pressure->count]));
+    pressure->progressed++;
+}
+static void population_pressure(void)
+{
+    uint64_t start = UINT64_C(0xc0000000), mapped;
+    assert(!kernel_mm_mmap_anonymous(&mm[0], start, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &mapped));
+    uint64_t baseline = physical_page_available(&allocator);
+    struct pressure_case pressure = {0};
+    while (physical_page_available(&allocator)) {
+        assert(pressure.count < 4096);
+        assert(!physical_page_allocate(&allocator, &pressure.pages[pressure.count++]));
+    }
+    struct physical_page_reclaim_hooks hooks = {
+        .reclaim = pressure_reclaim, .wait = pressure_progress, .context = &pressure};
+    assert(!physical_page_allocator_set_reclaimer(&allocator, &hooks));
+    assert(!kernel_mm_mlock(&mm[0], start, BOAROS_PAGE_SIZE, 0));
+    assert(pressure.locked && pressure.progressed);
+    assert(!physical_page_allocator_clear_reclaimer(&allocator));
+    while (pressure.count) assert(!physical_page_release(&allocator, pressure.pages[--pressure.count]));
+    assert(!kernel_mm_munmap(&mm[0], start, BOAROS_PAGE_SIZE));
+    assert(physical_page_available(&allocator) == baseline);
+    puts("MM population exhausts allocator then permits unlocked pressure progress and returns owners");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -409,6 +562,9 @@ int main(void)
     assert(kernel_mm_resolve_user_fault(&mm[0], unavailable_address, KERNEL_MM_WRITE) == KERNEL_MM_STATUS_PAGE_ACCESS);
     assert(physical_page_available(&allocator) == before_access);
     assert(!kernel_mm_munmap(&mm[0], unavailable_address, BOAROS_PAGE_SIZE));
+    parallel_publication();
+    population_batches();
+    population_pressure();
     self_pin_fault();
     fault_candidates();
     fork_cow();
