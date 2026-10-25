@@ -13,7 +13,8 @@ static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
 static struct kernel_mm mm;
-static uint64_t stack_limit=UINT64_MAX;
+static uint64_t stack_limit=UINT64_MAX, memlock_limit=UINT64_MAX;
+uint64_t kernel_task_current_memlock_limit(void) { return memlock_limit; }
 uint64_t kernel_task_current_stack_limit(void) { return stack_limit; }
 static struct kernel_memory_limits limits={UINT64_MAX,UINT64_MAX,UINT64_MAX};
 static unsigned limit_reads;
@@ -26,7 +27,10 @@ static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1
 #define P BOAROS_PAGE_SIZE
 #define RW (KERNEL_MM_READ|KERNEL_MM_WRITE)
 #define BASE UINT64_C(0x400000)
-static unsigned fail_resize;
+static unsigned fail_resize, fail_page;
+enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
+{ return fail_page ? PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out); }
 enum kernel_heap_status __real_kernel_heap_resize(struct kernel_heap *,void *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *h,void *old,size_t size,void **out)
 { return fail_resize ? KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_resize(h,old,size,out); }
@@ -207,6 +211,37 @@ int main(void)
     assert(!kernel_mm_vma_lookup(&mm,BASE+(fragments-1)*2*P,&vma));CHECK(vma.permissions==RW);
     fail_resize=0;
     assert(!kernel_mm_munmap(&mm,BASE,fragments*2*P));
+    /* Locked usage belongs to this MM; the initiating actor supplies admission. */
+    assert(!map(BASE,4*P,RW,0));
+    CHECK(!kernel_mm_mlock(&mm,BASE,P,0));
+    fail_page=1;CHECK(kernel_mm_mlock(&mm,BASE+P,P,0)==-KERNEL_EAGAIN);fail_page=0;
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,0));
+    CHECK(!kernel_mm_munlockall(&mm));
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,RW));
+    memlock_limit=2*P;
+    CHECK(!kernel_mm_mlock(&mm,BASE+1,P,1));
+    struct kernel_mm_proc_memory memory;
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==2*P);
+    CHECK(kernel_mm_mlock(&mm,BASE+2*P,P,1)==-KERNEL_ENOMEM);
+    uint64_t moved=0;
+    CHECK(kernel_mm_mremap(&mm,BASE,2*P,3*P,1,0,&moved)==-KERNEL_EAGAIN);
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,0));
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&vma.lock_flags==3);
+    CHECK(!kernel_mm_munlock(&mm,BASE,4*P));
+    CHECK(!kernel_mm_mlockall(&mm,6));
+    CHECK(map(BASE,4*P,RW,KERNEL_MM_MAP_LOCKED)==KERNEL_MM_STATUS_LOCK_LIMIT);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&!vma.lock_flags);
+    CHECK(!kernel_mm_munlockall(&mm));
+    assert(!kernel_mm_munmap(&mm,BASE+P,P));
+    CHECK(kernel_mm_mlock(&mm,BASE,4*P,1)==-KERNEL_ENOMEM);
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==0);
+    memlock_limit=UINT64_MAX;
+    CHECK(kernel_mm_mlock(&mm,BASE,4*P,1)==-KERNEL_ENOMEM);
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==P);
+    CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_munmap(&mm,BASE,4*P));
+    memlock_limit=0;CHECK(kernel_mm_mlock(&mm,0,0,0)==-KERNEL_EPERM);
+    CHECK(map(BASE,P,RW,KERNEL_MM_MAP_LOCKED)==KERNEL_MM_STATUS_LOCK_PERMISSION);
+    memlock_limit=UINT64_MAX;
     mm_test_context=0; assert(!kernel_mm_release(&mm));
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     CHECK(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);

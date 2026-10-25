@@ -170,3 +170,5 @@ __attribute__((weak)) void riscv_smp_sync_user(uint32_t targets, uint64_t addres
     if (instructions) mm_test_fence(0, 1);
 }
 #endif
+
+__attribute__((weak)) uint64_t kernel_task_current_memlock_limit(void) { return UINT64_MAX; }

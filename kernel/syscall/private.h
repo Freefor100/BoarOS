@@ -252,6 +252,8 @@ enum kernel_syscall_status syscall_handle_mmap(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_mlock(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_mincore(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_msync(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

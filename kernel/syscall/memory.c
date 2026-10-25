@@ -6,6 +6,7 @@
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
+#include <kernel/uaccess.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -33,7 +34,7 @@
     (LINUX_MAP_TYPE_MASK | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS |       \
      LINUX_MAP_DENYWRITE | LINUX_MAP_EXECUTABLE | LINUX_MAP_NORESERVE |  \
      LINUX_MAP_POPULATE | LINUX_MAP_STACK |                               \
-     LINUX_MAP_FIXED_NOREPLACE | LINUX_MAP_LEGACY_EXTRA)
+     LINUX_MAP_FIXED_NOREPLACE | LINUX_MAP_LEGACY_EXTRA | LINUX_MAP_LOCKED)
 #define LINUX_MAP_NORESERVE UINT64_C(0x4000)
 #define LINUX_MAP_STACK UINT64_C(0x20000)
 
@@ -74,6 +75,8 @@ static uint32_t mm_permissions_from_linux(uint64_t protections)
 
 static int64_t mmap_error(enum kernel_mm_status status)
 {
+    if (status == KERNEL_MM_STATUS_LOCK_PERMISSION) return -KERNEL_EPERM;
+    if (status == KERNEL_MM_STATUS_LOCK_LIMIT) return -KERNEL_EAGAIN;
     if (status == KERNEL_MM_STATUS_NO_MEMORY) {
         return -KERNEL_ENOMEM;
     }
@@ -124,7 +127,7 @@ enum kernel_syscall_status syscall_handle_mmap(
         type_error = -KERNEL_EINVAL;
     else if (!request->arguments[1])
         type_error = -KERNEL_EINVAL;
-    else if (!type_error && (flags & (LINUX_MAP_GROWSDOWN | LINUX_MAP_LOCKED)))
+    else if (!type_error && (flags & LINUX_MAP_GROWSDOWN))
         type_error = -KERNEL_EOPNOTSUPP;
     /* Legacy mmap ignores extension flags; SHARED_VALIDATE rejects them. */
     if (mapping_type == LINUX_MAP_SHARED_VALIDATE)
@@ -134,6 +137,7 @@ enum kernel_syscall_status syscall_handle_mmap(
     } else if ((flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) {
         mm_flags = KERNEL_MM_MAP_FIXED_NOREPLACE;
     }
+    if (flags & LINUX_MAP_LOCKED) mm_flags |= KERNEL_MM_MAP_LOCKED;
     if ((flags & LINUX_MAP_TYPE_MASK) == LINUX_MAP_SHARED)
         mm_flags |= KERNEL_MM_MAP_SHARED;
     if (kernel_task_mm_borrow_mutable(caller, &mm) !=
@@ -227,7 +231,8 @@ enum kernel_syscall_status syscall_handle_mmap(
     if (status != KERNEL_MM_STATUS_OK &&
         status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
         status != KERNEL_MM_STATUS_NO_MEMORY &&
-        status != KERNEL_MM_STATUS_CONFLICT) {
+        status != KERNEL_MM_STATUS_CONFLICT &&
+        status != KERNEL_MM_STATUS_LOCK_LIMIT && status != KERNEL_MM_STATUS_LOCK_PERMISSION) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->value = status == KERNEL_MM_STATUS_OK
@@ -337,3 +342,23 @@ enum kernel_syscall_status syscall_handle_msync(
         request->arguments[1], (uint32_t)request->arguments[2]);
     return KERNEL_SYSCALL_STATUS_OK;
 }
+
+enum kernel_syscall_status syscall_handle_mlock(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    uint64_t address = request->arguments[0], length = request->arguments[1];
+    switch (request->number) {
+    case 228: decoded->value = kernel_mm_mlock(mm, address, length, 0); break;
+    case 284: decoded->value = kernel_mm_mlock(mm, address, length, (uint32_t)request->arguments[2]); break;
+    case 229: decoded->value = kernel_mm_munlock(mm, address, length); break;
+    case 230: decoded->value = kernel_mm_mlockall(mm, (uint32_t)address); break;
+    case 231: decoded->value = kernel_mm_munlockall(mm); break;
+    default: return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+

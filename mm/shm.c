@@ -278,6 +278,8 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
         if (status == KERNEL_MM_STATUS_CONFLICT) {
             return -KERNEL_EINVAL;
         }
+        if (status == KERNEL_MM_STATUS_LOCK_LIMIT) return -KERNEL_EAGAIN;
+        if (status == KERNEL_MM_STATUS_LOCK_PERMISSION) return -KERNEL_EPERM;
         if (status == KERNEL_MM_STATUS_NO_MEMORY) {
             return -KERNEL_ENOMEM;
         }
