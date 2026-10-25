@@ -115,7 +115,7 @@ static int normal_waiter(struct futex_bucket *bucket,const struct kernel_futex_k
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
             struct kernel_wait_node *node=cursor.node;
             if(node->queue==&bucket->waiters && node->task &&
-               node->task->wait.phase!=KERNEL_WAIT_NOTIFIED && futex_key_equal(&node->task->futex_key,key))found=1;
+               !futex_entry(node)->woken && futex_key_equal(&futex_entry(node)->key,key))found=1;
         }
         if(found)break;
         kernel_wait_cursor_advance(&cursor);

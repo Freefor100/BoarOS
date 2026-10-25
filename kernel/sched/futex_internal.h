@@ -16,6 +16,22 @@
 #define FUTEX_TID_MASK UINT32_C(0x3fffffff)
 #define ROBUST_LIST_LIMIT 2048U
 
+enum futex_entry_kind { FUTEX_ENTRY_WAIT, FUTEX_ENTRY_VECTOR, FUTEX_ENTRY_REQUEUE_PI };
+struct kernel_futex_entry {
+    struct kernel_wait_node node;
+    struct kernel_futex_key key;
+    uint32_t bitset, kind, index, woken;
+    struct kernel_futex_pi_request *pi;
+};
+struct kernel_futex_request {
+    struct kernel_task *task;
+    struct kernel_futex_entry *entries;
+    struct kernel_heap *heap;
+    struct kernel_wait_token token;
+    unsigned count;
+};
+static inline struct kernel_futex_entry *futex_entry(struct kernel_wait_node *node)
+{ return (struct kernel_futex_entry *)node; }
 struct futex_bucket {
     struct kernel_mutex operation;
     struct kernel_wait_queue waiters;
@@ -114,6 +130,7 @@ struct kernel_futex_pi_request {
     uint64_t address, order;
     uint32_t operation, queued, granted;
 };
+void kernel_futex_request_release(struct kernel_futex_request *);
 int64_t kernel_futex_pi(struct kernel_task *,uint64_t,uint32_t,uint64_t,
     enum kernel_scheduler_status *);
 int futex_pi_conflict_locked(struct futex_bucket *,const struct kernel_futex_key *);

@@ -1,5 +1,5 @@
 /* futex/MM/park/sleeping locks use production code; only CPU switching is hosted. */
-#include "../../kernel/sched/private.h"
+#include "../../kernel/sched/futex_internal.h"
 #include <kernel/mm_backend.h>
 #include <kernel/time.h>
 #include <kernel/errno.h>
@@ -116,6 +116,13 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare_locked(struct kernel_wai
     if(interruptible)futex_queue=queue;
     return result;
 }
+enum kernel_scheduler_status __real_kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_node_bind_locked(struct kernel_wait_queue *queue,struct kernel_wait_node *node,const struct kernel_wait_token *token)
+{
+    enum kernel_scheduler_status result=__real_kernel_wait_node_bind_locked(queue,node,token);
+    if(token->task->futex_request)futex_queue=queue;
+    return result;
+}
 enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(struct kernel_memory_object *, uint64_t, uint64_t *, int *);
 enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(struct kernel_memory_object *object,
     uint64_t index, uint64_t *page, int *created)
@@ -161,7 +168,7 @@ static void attach(unsigned id)
 static void detach(void)
 {
     struct kernel_task *task = kernel_wait_current_task();
-    assert(!task->wait.borrows && !task->wait.nodes && !task->futex_key.identity);
+    assert(!task->wait.borrows && !task->wait.nodes && !task->futex_request);
     assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
     assert(!kernel_mm_release(&task->mm));
     mm_test_bind(0);
@@ -240,20 +247,21 @@ static void notification_batch(void)
     sync_test_irq = 0;
 }
 static struct kernel_task synthetic[17];
+static struct kernel_futex_entry synthetic_entries[17];
 static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     for (unsigned i = 0; i < count; i++) {
         struct kernel_task *task = &synthetic[i];
         *task = (struct kernel_task){0};
-        task->futex_key = *key; task->futex_bitset = 1;
+        synthetic_entries[i]=(struct kernel_futex_entry){.key=*key,.bitset=1};
         task->wait.generation = 1000 + i;
         task->wait.phase = KERNEL_WAIT_PREPARED;
         task->wait.on_cpu = 1;
-        kernel_wait_node_init(&task->default_wait_node, task);
-        task->default_wait_node.generation = task->wait.generation;
-        task->wait.nodes = &task->default_wait_node;
-        kernel_wait_node_add_locked(futex_queue, &task->default_wait_node);
+        kernel_wait_node_init(&synthetic_entries[i].node, task);
+        synthetic_entries[i].node.generation = task->wait.generation;
+        task->wait.nodes = &synthetic_entries[i].node;
+        kernel_wait_node_add_locked(futex_queue, &synthetic_entries[i].node);
     }
 }
 static void synthetic_remove(unsigned count)
@@ -261,9 +269,9 @@ static void synthetic_remove(unsigned count)
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     for (unsigned i = 0; i < count; i++) {
         struct kernel_task *task = &synthetic[i];
-        kernel_wait_node_remove_locked(&task->default_wait_node);
-        assert(!task->wait.borrows && !task->default_wait_node.references &&
-            !task->default_wait_node.borrow_owner);
+        kernel_wait_node_remove_locked(&synthetic_entries[i].node);
+        assert(!task->wait.borrows && !synthetic_entries[i].node.references &&
+            !synthetic_entries[i].node.borrow_owner);
         *task = (struct kernel_task){0};
     }
     assert(!futex_queue->head && !futex_queue->registrations && !futex_queue->borrows);
@@ -281,8 +289,8 @@ static void wake_batches(void)
     synthetic_add(3, &key);
     /* One collision and one masked waiter remain PREPARED; the matched real
      * COMMITTED node is removed in notify, so iteration must save its successor. */
-    synthetic[0].futex_key.offset += 1024;
-    synthetic[1].futex_bitset = 2;
+    synthetic_entries[0].key.offset += 1024;
+    synthetic_entries[1].bitset = 2;
     fast_notification = 1;
     notification_probe = 1; notification_sends = notification_seen = 0;
     futex_test_notification_target(1)->events = 0;
@@ -306,6 +314,13 @@ static void wake_batches(void)
     for (unsigned i = 0; i < 17; i++)
         assert(synthetic[i].wait.phase == KERNEL_WAIT_NOTIFIED);
     synthetic_remove(17);
+    /* Timeout notification does not dequeue a still-running waiter. A real
+     * wake before unqueue must consume this entry and report its wake count. */
+    synthetic_add(1, &key);
+    synthetic[0].wait.phase = KERNEL_WAIT_NOTIFIED;
+    synthetic[0].wait.reason = KERNEL_WAIT_TIMEOUT;
+    assert(measured_wake(source, 1) == 1);
+    synthetic_remove(1);
 }
 static void operations(void)
 {

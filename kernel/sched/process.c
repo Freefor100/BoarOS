@@ -1637,6 +1637,7 @@ static void reap_claim_end(struct kernel_task **task)
 static void cleanup_task_io_requests(struct kernel_task *thread)
 {
     if(thread->pi_request)kernel_futex_pi_abort(thread);
+    kernel_futex_abort(thread);
     kernel_posix_cpu_sleep_abort(thread);
     kernel_msg_abort(thread);
     kernel_sem_abort(thread);
