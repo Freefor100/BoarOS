@@ -1458,7 +1458,10 @@ static void finish_tlb_change(struct kernel_mm_record *record,
     struct kernel_mm_retirement *batch, uint32_t targets, uint64_t address,
     uint64_t size, int instructions)
 {
-    arch_mmu_sync_user(targets, address, size, instructions);
+    {
+        COST_SCOPE(sync_cost, MM_SYNC_TICKS);
+        arch_mmu_sync_user(targets, address, size, instructions);
+    }
     for (unsigned i = 0; i < batch->count; i++)
         if (physical_page_release(record->space.allocator, batch->pages[i]) !=
             PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
@@ -3746,6 +3749,7 @@ enum kernel_mm_status kernel_mm_vma_lookup(const struct kernel_mm *mm,
 static enum kernel_mm_status allocate_private_page(struct physical_page_allocator *allocator,
     uint64_t *address, void **pointer)
 {
+    COST_SCOPE(allocate_cost, MM_PAGE_ALLOC_TICKS);
     enum physical_page_status status = physical_page_allocate(allocator, address);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY) return KERNEL_MM_STATUS_NO_MEMORY;
     if (status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
@@ -4008,16 +4012,14 @@ static int fault_inode_lock(struct mm_operation *operation, struct kernel_vfs_no
 /* File-map preparation is independent of ELF/anonymous faults. Keep its
  * retirement and COW storage off the nested ELF-read stack. */
 static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct mm_operation *operation,
-    uint64_t address, uint32_t access)
+    uint64_t address, uint32_t access, const struct kernel_vma *current)
 {
     KERNEL_NO_RECLAIM_IO;
     struct kernel_mm_record *record = operation->record;
     struct physical_page_allocator *allocator = record->space.allocator;
-    struct kernel_vma vma;
+    struct kernel_vma vma = *current;
     if (!access || (access & (access - 1)) || (access & ~KERNEL_VMA_ALL_PERMISSIONS))
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
-    if (kernel_vma_set_lookup(record->vmas, address, &vma) != KERNEL_VMA_STATUS_OK)
-        return KERNEL_MM_STATUS_NOT_MAPPED;
     if (!(vma.permissions & access)) return KERNEL_MM_STATUS_ACCESS;
     address &= ~BOAROS_PAGE_MASK;
     if (vma.backing_offset > UINT64_MAX - (address - vma.start))
@@ -4234,7 +4236,7 @@ finish:
     return status;
 }
 static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_operation *operation,
-    uint64_t address, uint32_t access)
+    uint64_t address, uint32_t access, const struct kernel_vma *current)
 {
     struct kernel_mm_record *record = operation->record;
     struct physical_page_allocator *allocator = record->space.allocator;
@@ -4244,7 +4246,8 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
     if (address < BOAROS_PAGE_SIZE || address >= ARCH_MMU_USER_LIMIT)
         return KERNEL_MM_STATUS_NOT_MAPPED;
     if (!record->vmas) return KERNEL_MM_STATUS_NOT_MAPPED;
-    enum kernel_vma_status vs = kernel_vma_set_lookup(record->vmas, address, &vma);
+    enum kernel_vma_status vs = current ? KERNEL_VMA_STATUS_OK : KERNEL_VMA_STATUS_NOT_FOUND;
+    if (current) vma = *current;
     if (vs == KERNEL_VMA_STATUS_NOT_FOUND) {
         uint64_t page = address & ~BOAROS_PAGE_MASK;
         if (kernel_vma_set_next(record->vmas, page, &vma) ||
@@ -4450,24 +4453,40 @@ memory_tables_changed:
     if (cookie) physical_page_release(allocator, old);
     return status;
 }
+/* The caller owns the MM gate and the VMA snapshot. Both ordinary faults and
+ * locked population enter here; backing work drops/rechecks that same gate. */
+static enum kernel_mm_status prepared_fault(struct mm_operation *operation,
+    uint64_t address, uint32_t access, const struct kernel_vma *vma)
+{
+    return vma && (vma->kind == KERNEL_VMA_KIND_FILE_SHARED ||
+                   vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE) ?
+        mapped_file_fault(operation, address, access, vma) :
+        memory_fault(operation, address, access, vma);
+}
+static void fault_retry(struct kernel_mm_record *record, uint64_t address)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    { KERNEL_RAW_SCOPE(guard, &record->metadata); record->fault_retries++; }
+#else
+    (void)record;
+#endif
+#if BOAROS_USER_SMP_COMPOSITION
+    riscv_user_composition_fault_retry(address, 1);
+#else
+    (void)address;
+#endif
+}
 static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     uint64_t address, uint32_t access)
 {
     for (;;) {
         MM_OPERATION(mm);
         struct kernel_vma vma;
-        int file = operation.record->vmas &&
-            !kernel_vma_set_lookup(operation.record->vmas, address, &vma) &&
-            (vma.kind == KERNEL_VMA_KIND_FILE_SHARED || vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE);
-        enum kernel_mm_status status = file ? mapped_file_fault(&operation, address, access) :
-            memory_fault(&operation, address, access);
+        int found = operation.record->vmas &&
+            !kernel_vma_set_lookup(operation.record->vmas, address, &vma);
+        enum kernel_mm_status status = prepared_fault(&operation, address, access, found ? &vma : 0);
         if (status != KERNEL_MM_STATUS_CONFLICT || current_pins(mm)) return status;
-#if BOAROS_COST_DIAGNOSTICS
-        { KERNEL_RAW_SCOPE(guard, &operation.record->metadata); operation.record->fault_retries++; }
-#endif
-#if BOAROS_USER_SMP_COMPOSITION
-        riscv_user_composition_fault_retry(address, 1);
-#endif
+        fault_retry(operation.record, address);
         /* loser归还全部私有候选，下一轮重取VMA/PTE，不把旧许可带过睡眠。 */
     }
 }
@@ -4573,22 +4592,25 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
     }
 }
 
-/* One successful resolution contributes one fault, whichever backing path won.
- * Only the caller's own user MM is charged; retries and failures contribute none. */
-enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
-    uint64_t address, uint32_t access)
+/* A resolution is charged only to the executing task's own MM. Population
+ * uses the same actor and completion rule as a user trap, including retries. */
+static struct kernel_task *fault_actor(struct kernel_mm *mm)
 {
     struct kernel_task *task = kernel_task_current();
     const struct kernel_mm *task_mm = 0;
     if (!mm || !task || !kernel_task_has_user_context(task) ||
-        kernel_task_mm_borrow(task, &task_mm) !=
-                     KERNEL_TASK_STATUS_OK ||
-        task_mm->record != mm->record) task = 0;
+        kernel_task_mm_borrow(task, &task_mm) != KERNEL_TASK_STATUS_OK ||
+        task_mm->record != mm->record) return 0;
+    return task;
+}
+enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
+    uint64_t address, uint32_t access)
+{
+    struct kernel_task *task = fault_actor(mm);
     uint64_t block_reads = task ? kernel_task_read_bytes(task) : 0U;
     enum kernel_mm_status status = resolve_user_fault(mm, address, access);
     if (status == KERNEL_MM_STATUS_OK && task)
-        kernel_task_account_fault(task,
-            kernel_task_read_bytes(task) != block_reads);
+        kernel_task_account_fault(task, kernel_task_read_bytes(task) != block_reads);
     return status;
 }
 
@@ -4728,27 +4750,34 @@ static int lock_range(struct kernel_mm_record *record, uint64_t start, uint64_t 
 
 static int populate_locked(struct kernel_mm *mm, uint64_t start, uint64_t end)
 {
+    struct kernel_task *task = fault_actor(mm);
+    uint64_t block_reads = task ? kernel_task_read_bytes(task) : 0U;
     while (start < end) {
-        uint32_t access = 0;
-        {
-            struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
-            if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
-            struct kernel_vma vma;
-            if (kernel_vma_set_lookup(operation.record->vmas, start, &vma)) return -KERNEL_ENOMEM;
-            if (vma.lock_flags != KERNEL_VMA_LOCKED) {
-                start = vma.end < end ? vma.end : end;
-                continue;
-            }
-            if (!(vma.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
-                return -KERNEL_ENOMEM;
-            access = (vma.permissions & KERNEL_MM_WRITE) &&
-                (vma.kind == KERNEL_VMA_KIND_ANONYMOUS || vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
-                 vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) ? KERNEL_MM_WRITE :
-                (vma.permissions & KERNEL_MM_READ) ? KERNEL_MM_READ : KERNEL_MM_EXECUTE;
+        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+        if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(operation.record->vmas, start, &vma)) return -KERNEL_ENOMEM;
+        if (vma.lock_flags != KERNEL_VMA_LOCKED) {
+            start = vma.end < end ? vma.end : end;
+            block_reads = task ? kernel_task_read_bytes(task) : 0U;
+            continue;
         }
-        enum kernel_mm_status status = kernel_mm_resolve_user_fault(mm, start, access);
+        if (!(vma.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
+            return -KERNEL_ENOMEM;
+        uint32_t access = (vma.permissions & KERNEL_MM_WRITE) &&
+            (vma.kind == KERNEL_VMA_KIND_ANONYMOUS || vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
+             vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) ? KERNEL_MM_WRITE :
+            (vma.permissions & KERNEL_MM_READ) ? KERNEL_MM_READ : KERNEL_MM_EXECUTE;
+        enum kernel_mm_status status = prepared_fault(&operation, start, access, &vma);
+        mm_operation_end(&operation);
+        if (status == KERNEL_MM_STATUS_CONFLICT && !current_pins(mm)) {
+            fault_retry(operation.record, start);
+            continue;
+        }
         if (status) return status == KERNEL_MM_STATUS_NO_MEMORY ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
+        if (task) kernel_task_account_fault(task, kernel_task_read_bytes(task) != block_reads);
         start += BOAROS_PAGE_SIZE;
+        block_reads = task ? kernel_task_read_bytes(task) : 0U;
     }
     return 0;
 }
