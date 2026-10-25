@@ -436,9 +436,10 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
     if (!next) next = cpu->idle;
     if (next == previous) return 0;
     /* 等待通知或 SIGCONT 可在切离前把状态改回 READY。只有确实
-     * 带着睡眠/停止状态离开 CPU 才结束连续 RT；迁移和节流仍是 READY。 */
-    if (previous->state == KERNEL_THREAD_STATE_BLOCKED ||
-        previous->state == KERNEL_THREAD_STATE_STOPPED) {
+     * 带着睡眠/停止状态离开 CPU 才结束连续 RT；迁移和节流仍是 READY。
+     * DUE 只在计数非零后发布；按历史计数判断，退出 RT 或取消限额后也要清理。 */
+    if ((previous->state == KERNEL_THREAD_STATE_BLOCKED ||
+         previous->state == KERNEL_THREAD_STATE_STOPPED) && previous->rttime_ticks) {
         previous->rttime_ticks = 0;
         if (__atomic_fetch_and(&previous->resource_flags,
                 ~KERNEL_RESOURCE_RTTIME_DUE,__ATOMIC_RELAXED) & KERNEL_RESOURCE_RTTIME_DUE)

@@ -27,6 +27,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 空调用者、空请求或空输出返回 `KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT`；依赖任务资源的调用无法取得有效身份、LIVE MM 或一致的文件资源，以及 uaccess 报告内核状态损坏时，也返回该状态并由 Trap 边界视为 fatal。失败时不修改输出。有效请求均返回 `KERNEL_SYSCALL_STATUS_OK`，包括负 Linux errno；具体语义由结果动作表达。
 
+172–178 的进程、线程和 UID/GID 标量查询在公共参数检查与成本入口之后直接分发，复用原身份及凭据读取，完成后发布结果。其他调用继续使用业务分发表；这组查询不再经过两段通用表路由。
+
 ## 当前 ABI 与验证
 
 当前采用 Linux RISC-V 系统调用编号和错误值：

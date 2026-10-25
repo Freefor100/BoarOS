@@ -305,12 +305,6 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       size_t size,
                       size_t *bytes_written);
 
-int kernel_vfs_append(struct kernel_vfs_file *file,
-                      const void *buffer,
-                      size_t size,
-                      uint64_t *written_offset,
-                      size_t *bytes_written);
-
 struct kernel_uaccess_iovec;
 struct kernel_vfs_user_write_result {
     uint64_t end_offset;

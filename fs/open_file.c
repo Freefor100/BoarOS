@@ -673,7 +673,8 @@ static int close_is_local(const struct kernel_open_file_description *file)
         !file->record_locks && !file->generated_ready) return 1;
     /* 无观察者的匿名端点由最后OFD owner就地结束，通知和等待借用
      * 沿管道短保护归还；有epoll登记或FIFO节点时继续走所属清理路径。 */
-    if ((file->kind==KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind==KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) && !file->ep_items) return 1;
+    if ((file->kind==KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind==KERNEL_OPEN_FILE_KIND_TIMERFD ||
+         file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD || file->kind==KERNEL_OPEN_FILE_KIND_PIDFD) && !file->ep_items) return 1;
     return file->kind==KERNEL_OPEN_FILE_KIND_PIPE && file->pipe && !file->pipe->fifo_node &&
         !file->file.private_data && !file->ep_items && !file->device_opened &&
         !file->record_locks && !file->generated_ready;

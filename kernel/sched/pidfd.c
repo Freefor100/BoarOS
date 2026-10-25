@@ -99,7 +99,6 @@ static int install(struct kernel_files *files,struct kernel_open_file_descriptio
 }
 int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t flags)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if(flags & ~(PIDFD_THREAD|PIDFD_NONBLOCK))return -KERNEL_EINVAL;
     if(number<=0)return -KERNEL_EINVAL;
     struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=0;
@@ -110,17 +109,19 @@ int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t fla
         kernel_pid_get(id);
         if(!(flags&PIDFD_THREAD) && !id->members[KERNEL_PID_TGID])return -KERNEL_ENOENT;
     }
+    struct kernel_files *files;
+    if(kernel_task_files_borrow(caller,&files)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
     uint32_t slot;int fd_error=0;
-    enum kernel_files_status reserved=kernel_files_find_free_fd(&caller->files,&slot,&fd_error);
+    enum kernel_files_status reserved=kernel_files_find_free_fd(files,&slot,&fd_error);
     if(reserved) {
         if(reserved!=KERNEL_FILES_STATUS_NO_MEMORY)__builtin_trap();
         return -KERNEL_ENOMEM;
     }
     if(fd_error)return fd_error;
     KERNEL_FILES_RESERVATION_SCOPE(reservation);
-    reservation=(struct kernel_files_fd_reservation){&caller->files,slot};
+    reservation=(struct kernel_files_fd_reservation){files,slot};
     struct pidfd_file *file=0; struct pidfd_observer *candidate=0;
-    struct kernel_heap *heap=caller->files.heap;
+    struct kernel_heap *heap=files->heap;
     enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(heap,1,sizeof(*file),(void **)&file);
     if(allocated) {
         if(allocated!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
@@ -154,7 +155,7 @@ int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t fla
     file->file.credentials=kernel_credentials_get(kernel_credentials_current());
     kernel_mutex_init(&file->file.offset_lock,10,(uintptr_t)file);
     struct kernel_open_file_description *owner=&file->file;
-    if(kernel_files_install_new_owned_at(&caller->files,slot,KERNEL_FILES_FD_CLOEXEC,&owner))
+    if(kernel_files_install_new_owned_at(files,slot,KERNEL_FILES_FD_CLOEXEC,&owner))
         __builtin_trap();
     reservation.files=0;
     return slot;
@@ -233,27 +234,30 @@ int64_t kernel_pidfd_send(struct kernel_task *caller,struct kernel_pid *id,unsig
 }
 int64_t kernel_pidfd_getfd(struct kernel_task *caller,int32_t fd,int32_t targetfd,uint32_t flags)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if(flags)return -KERNEL_EINVAL;
     struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=0;
     int unused=0,error=kernel_pidfd_wait_target(&caller->files,fd,&id,&unused);
     if(error)return error;
     SCHEDULER_TASK_BORROW(target,0);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_pid_member *member=id->members[KERNEL_PID_TID];
+        if(!member)return -KERNEL_ESRCH;
+        target=member->task;scheduler_task_get_locked(target);
+    }
     const struct kernel_credentials *credentials=0;
     struct kernel_exec_security *security=0; struct kernel_mm_record *mm=0;
     struct kernel_files_record *files_record=0;
     struct kernel_open_file_description *owner=0;int64_t result=0;
-    /* CPU0 owns exec/exit control, but a timer can switch to another CPU0
-     * task. Keep the target handle stable through pin and the security recheck;
-     * the FD lock is taken after dropping the higher-ranked wait domain. */
-    kernel_preempt_disable();
     {
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        struct kernel_pid_member *member=id->members[KERNEL_PID_TID];
-        if(!member)result=-KERNEL_ESRCH;
-        else {
-            target=member->task;scheduler_task_get_locked(target);
-            if(!kernel_credentials_may_access_locked(caller,target,0))result=-KERNEL_EPERM;
+        /* task借用只保容器；files_access保原任务的真实表句柄和存储。
+         * FD锁仍在调度域外取得，临时读者不增加整表cleanup owner。 */
+        KERNEL_RAW_SCOPE(access,&target->files_access);
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_pid_member *member=id->members[KERNEL_PID_TID];
+            if(!member || member->task!=target)result=-KERNEL_ESRCH;
+            else if(!kernel_credentials_may_access_locked(caller,target,0))result=-KERNEL_EPERM;
             else if(target->proc_exiting || !kernel_files_is_live(&target->files))result=-KERNEL_ESRCH;
             else {
                 credentials=kernel_credentials_get(kernel_credentials_task_locked(target));
@@ -261,19 +265,24 @@ int64_t kernel_pidfd_getfd(struct kernel_task *caller,int32_t fd,int32_t targetf
                 files_record=target->files.record;
             }
         }
+        if(!result) {
+            enum kernel_files_status status=kernel_files_pin(&target->files,targetfd,&owner,&result);
+            if(status)__builtin_trap();
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_pid_member *member=id->members[KERNEL_PID_TID];
+            if(target->mm.record!=mm || target->exec_security!=security ||
+                kernel_credentials_task_locked(target)!=credentials ||
+                !kernel_credentials_may_access_locked(caller,target,0))result=-KERNEL_EPERM;
+            else if(!member || member->task!=target || target->proc_exiting ||
+                target->files.record!=files_record)result=-KERNEL_ESRCH;
+        }
     }
-    if(!result) {
-        enum kernel_files_status status=kernel_files_pin(&target->files,targetfd,&owner,&result);
-        if(status)__builtin_trap();
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if(target->mm.record!=mm || target->exec_security!=security ||
-            kernel_credentials_task_locked(target)!=credentials ||
-            !kernel_credentials_may_access_locked(caller,target,0))result=-KERNEL_EPERM;
-        else if(target->proc_exiting || target->files.record!=files_record)result=-KERNEL_ESRCH;
-    }
-    kernel_preempt_enable();
     kernel_credentials_put(credentials);kernel_exec_security_put(security);
-    if(!result)result=install(&caller->files,&owner);
+    if(!result) {
+        struct kernel_files *files;
+        if(kernel_task_files_borrow(caller,&files)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+        result=install(files,&owner);
+    }
     if(owner) {
         enum kernel_open_file_status released=kernel_open_file_release(&owner);
         if(released==KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED)kernel_files_queue_description(&caller->files,owner);

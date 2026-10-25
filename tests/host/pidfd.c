@@ -47,14 +47,15 @@ void kernel_files_pin_guard_release(struct kernel_files_pin_guard *guard){assert
 uint32_t kernel_open_file_flags(const struct kernel_open_file_description *f){return f->open_flags;}
 enum kernel_files_status kernel_files_pin(struct kernel_files *files,int64_t fd,struct kernel_open_file_description **owner,int64_t *result)
 {
-    assert(files==&subject.files && fd==7 && !cpu.raw_locks && cpu.preempt_depth==1);
-    /* This is the timer-preemption window between the two wait-domain locks.
-     * A CPU0 exec/exit must remain unable to replace the target FD handle. */
+    assert(files==&subject.files && fd==7 && cpu.raw_locks &&
+        cpu.raw_locks->lock==&subject.files_access && cpu.preempt_depth==1);
     pinned++;*result=pin_error;
     if(!pin_error)*owner=&transferred;
     if(replace_files)files->record=(void *)(uintptr_t)0x3456;
     return KERNEL_FILES_STATUS_OK;
 }
+enum kernel_task_status kernel_task_files_borrow(struct kernel_task *task,struct kernel_files **files)
+{assert(task==&waiter && !cpu.raw_locks && !cpu.preempt_depth);*files=&task->files;return KERNEL_TASK_STATUS_OK;}
 enum kernel_files_status kernel_files_find_free_fd(struct kernel_files *files,uint32_t *fd,int *error)
 {assert(files==&waiter.files && !cpu.preempt_depth);*fd=10;*error=0;return KERNEL_FILES_STATUS_OK;}
 enum kernel_files_status kernel_files_install_shared_acquired_at(struct kernel_files *files,uint32_t fd,uint32_t flags,struct kernel_open_file_description **owner)
@@ -94,6 +95,7 @@ static void *notify(void *arg){notify_identity(arg);return 0;}
 int main(void)
 {
     kernel_wait_domain_init();kernel_wait_record_init(&waiter.wait);waiter.wait.on_cpu=1;
+    kernel_raw_lock_init(&subject.files_access,KERNEL_RAW_RANK_TASK_FILES);
     kernel_wait_node_init(&waiter.default_wait_node,&waiter);
     uint64_t bitmap[1];struct kernel_pid_allocator numbers={0};
     struct kernel_pid_registry registry={.numbers=&numbers,.next_generation=1};

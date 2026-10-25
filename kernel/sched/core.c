@@ -620,6 +620,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     thread = metadata;
     thread->cpu = kernel_cpu_current();
     kernel_wait_record_init(&thread->wait);
+    kernel_raw_lock_init(&thread->files_access, KERNEL_RAW_RANK_TASK_FILES);
     kernel_wait_node_init(&thread->default_wait_node, thread);
     thread->physical_address = metadata_address;
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
@@ -1463,7 +1464,8 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
         current->magic != KERNEL_THREAD_MAGIC) {
         return;
     }
-    scheduler_rt_watchdog_locked(current,kernel_tick_count());
+    if (current->scheduling.priority)
+        scheduler_rt_watchdog_locked(current,kernel_tick_count());
     (void)from_user; /* 用户/内核CPU时间仍由执行边界结算。 */
 }
 

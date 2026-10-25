@@ -1631,22 +1631,16 @@ int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *limit,
     return 0;
 }
 
-static int vfs_write_source(struct kernel_vfs_file *file,uint64_t offset,
+/* 写入口持有整次请求的rank15；内部来源循环只借用同一个owner。 */
+static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
     struct kernel_vfs_write_source *source,size_t size,
     struct kernel_vfs_size_limit *limit,size_t *bytes_written)
 {
-    struct kernel_vfs_node *node;
+    struct kernel_vfs_node *node=file->private_data;
     size_t written = 0U;
     int result;
 
-    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
-        file->private_data == 0 || bytes_written == 0) {
-        return -KERNEL_EINVAL;
-    }
-    node = file->private_data;
     *bytes_written=0;
-    KERNEL_LOCK_SCOPE(operation_guard);
-    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1693,9 +1687,14 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
     const void *buffer,size_t size,size_t *bytes_written)
 {
     if ((!buffer && size) || !bytes_written) return -KERNEL_EINVAL;
+    *bytes_written=0;
+    if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data)
+        return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(file,&operation);
     struct kernel_vfs_write_source source={.data=buffer};
     size_t written=0;
-    int error=vfs_write_source(file,offset,&source,size,NULL,&written);
+    int error=vfs_write_source_locked(file,offset,&source,size,NULL,&written);
     *bytes_written=written;
     return written?0:error;
 }
@@ -1718,61 +1717,11 @@ int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
         result->end_offset=offset;
     }
     struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0}};
-    int error=vfs_write_source(file,offset,&source,count,limit,&result->written);
+    int error=vfs_write_source_locked(file,offset,&source,count,limit,&result->written);
     result->end_offset=offset+result->written;
     result->access=source.access;
     result->chunks=source.chunks;
     return error;
-}
-
-int kernel_vfs_append(struct kernel_vfs_file *file,
-                      const void *buffer,
-                      size_t size,
-                      uint64_t *written_offset,
-                      size_t *bytes_written)
-{
-    struct kernel_vfs_node *node;
-    uint64_t offset;
-    size_t written = 0U;
-    int result;
-
-    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
-        file->private_data == 0 || (buffer == 0 && size != 0U) ||
-        bytes_written == 0) {
-        return -KERNEL_EINVAL;
-    }
-    node = file->private_data;
-    KERNEL_LOCK_SCOPE(operation_guard);
-    kernel_vfs_file_write_lock(file, &operation_guard);
-    KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 1);
-    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
-        return -KERNEL_EINVAL;
-    }
-    if (node->instance == 0 || node->instance->read_only) {
-        return -KERNEL_EROFS;
-    }
-    offset = node->size;
-    if (size == 0U) {
-        if (written_offset != 0) {
-            *written_offset = offset;
-        }
-        *bytes_written = 0U;
-        return 0;
-    }
-    kernel_lock_release(&node_guard);
-    result = kernel_vfs_pwrite(file, offset, buffer, size, &written);
-    if (written_offset != 0) {
-        *written_offset = offset + (uint64_t)written;
-    }
-    *bytes_written = written;
-    if (written > size) {
-        return -KERNEL_EIO;
-    }
-    if (result != 0 && written == 0U) {
-        return result;
-    }
-    return 0;
 }
 
 int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
@@ -3274,7 +3223,7 @@ void kernel_vfs_file_write_lock(struct kernel_vfs_file *file, struct kernel_lock
 {
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) __builtin_trap();
     struct kernel_vfs_node *node = file->private_data;
-    /* writev 外层已持有门闩，内部 pwrite/append 不递归取得同一锁。 */
+    /* 内部调用可以借用已有owner，不能递归取得同一锁。 */
     if (kernel_lock_held(&node->write_operation.lock, 1)) return;
     kernel_mutex_lock(&node->write_operation, guard);
 }

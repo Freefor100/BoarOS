@@ -377,7 +377,7 @@ AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记�
 共享；同 OFD 的 dup/fork 共享规则不变。tmpfs read/readv/pread 用无分配空洞读路径，
 只有 mmap 缺页或实际写入才消耗后备页配额。
 
-普通文件整次 write/writev/pwrite 在用户 iovec 与页面片段循环外取得 inode 写操作锁（rank 15），数据接纳结束后先释放，再执行同步写收尾；非定位写先取得共享 OFD offset 锁（rank 10），位置资格覆盖整次调用。truncate 与直接 VFS pwrite/append 走同一写操作锁，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-file-io-concurrency-host` 检查同 inode 未驻留映射来源、双向重叠和旧 EOF 尾部来源，`make test-userland-riscv` 补真实系统调用。
+普通文件整次 write/writev/pwrite 由 VFS 写入口在用户页面片段循环外取得 inode 写操作锁（rank 15），内部写入核心借用同一个 owner；追加写的取 EOF 与数据接纳都在此锁内完成。数据接纳结束后先释放，再执行同步写收尾；非定位写先取得共享 OFD offset 锁（rank 10），位置资格覆盖整次调用。truncate 与直接 VFS pwrite 走同一写操作锁，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-file-io-concurrency-host` 检查同 inode 未驻留映射来源、双向重叠和旧 EOF 尾部来源，`make test-userland-riscv` 补真实系统调用。
 
 成本诊断版本记录真实请求、接受量、用户复制及仍有实际使用者的暂存容量；普通文件写入的暂存量为零。短写及同步尾部错误沿原语义处理；接口与单位见[成本观测](kernel-cost.md)。
 

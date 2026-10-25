@@ -57,8 +57,27 @@ struct kernel_files_record {
     struct kernel_raw_lock metadata_lock;
     uint8_t retired;
 };
+#if BOAROS_COST_DIAGNOSTICS
+/* 同级对象锁很多；单列实际 FD 表争用，复用 raw guard 的计时。 */
+static inline void kernel_files_scope_release(struct kernel_raw_guard *guard)
+{
+    if (!guard->lock) return;
+    struct kernel_cost_tag tag=guard->cost;
+    uint64_t wait=guard->wait_ticks;
+    uint64_t hold=tag.epoch ? kernel_cost_clock()-guard->hold_start : 0;
+    kernel_raw_lock_release(guard);
+    if (tag.epoch) {
+        kernel_cost_add_tag(tag,COST_FD_TABLE_WAIT,wait);
+        kernel_cost_add_tag(tag,COST_FD_TABLE_HOLD,hold);
+    }
+}
+#define KERNEL_FILES_SCOPE(name, files) \
+    struct kernel_raw_guard name __attribute__((cleanup(kernel_files_scope_release))) = {0}; \
+    kernel_raw_lock_acquire(&(files)->record->metadata_lock,&name)
+#else
 #define KERNEL_FILES_SCOPE(name, files) \
     KERNEL_RAW_SCOPE(name, &(files)->record->metadata_lock)
+#endif
 #define KERNEL_FILES_NOTE(files, field, value) \
     __atomic_fetch_add(&(files)->record->statistics.field, (uint64_t)(value), __ATOMIC_RELAXED)
 int kernel_files_fd_matches(struct kernel_files *, int64_t,

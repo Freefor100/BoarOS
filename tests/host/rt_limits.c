@@ -16,14 +16,14 @@ static struct kernel_task task,peer,idles[2];
 static struct kernel_credentials caller_cred,target_cred;
 static struct kernel_resource_limits limits;
 static uint64_t now,stamp;
-static unsigned checks,failed,index_updates;
+static unsigned checks,failed,index_updates,resource_updates,tick_reads;
 #define CHECK(x) do {checks++;if(!(x)){fprintf(stderr,"RT HOST FAIL line=%d %s\n",__LINE__,#x);failed++;}} while(0)
 void *sync_test_cpu(void){return active;}
 void *sync_test_current_task(void){return active->current;}
 void sync_test_current_task_set(void *p){active->current=p;}
 uint64_t kernel_time_monotonic_ns(void){return now;}
 uint64_t riscv_time_read(void){return now;}
-uint64_t kernel_tick_count(void){return stamp;}
+uint64_t kernel_tick_count(void){tick_reads++;return stamp;}
 uint32_t kernel_time_is_initialized(void){return 1;}
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *out){*out=ns;return 0;}
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t v){(void)v;return RISCV_TIMER_STATUS_NOT_STARTED;}
@@ -53,7 +53,7 @@ static void setup(void)
     task.cpu=&cpus[0];task.group_leader=&task;task.group_members=1;task.magic=KERNEL_THREAD_MAGIC;task.tid=1;task.tid_owned=1;task.arch.user_mode=1;task.accounted=1;task.state=KERNEL_THREAD_STATE_RUNNING;task.wait.on_cpu=1;task.limits=&limits;task.cpu_mask=3;
     peer=task;peer.tid=2;peer.group_leader=&peer;peer.wait.on_cpu=0;peer.state=KERNEL_THREAD_STATE_READY;
     caller_cred=(struct kernel_credentials){.uid=1001,.euid=1001};target_cred=caller_cred;task.credentials=&caller_cred;peer.credentials=&target_cred;
-    now=stamp=0;index_updates=0;
+    now=stamp=0;index_updates=resource_updates=tick_reads=0;
 }
 static void permission(void)
 {
@@ -74,8 +74,10 @@ static void tick_accounting(void)
 {
     setup();limits.values[KERNEL_RLIMIT_RTTIME]=(struct kernel_rlimit64){30000,80000};
     stamp=10;kernel_scheduler_charge_ticks(1,1);CHECK(!task.rttime_ticks&&!index_updates);
+    CHECK(!tick_reads);
     CHECK(!kernel_sched_policy_set(&task.scheduling,1,10,0));
     kernel_scheduler_charge_ticks(1,1);CHECK(task.rttime_ticks==1&&task.rttime_stamp==10&&!index_updates);
+    CHECK(tick_reads==1);
     kernel_scheduler_charge_ticks(1,0);CHECK(task.rttime_ticks==1);
     active=&cpus[1];cpus[0].current=&idles[0];cpus[1].current=&task;task.cpu=active;
     kernel_scheduler_charge_ticks(1,1);CHECK(task.rttime_ticks==1);
@@ -114,4 +116,52 @@ static void departures(void)
     }
     puts("RT HOST phases: early wait/continue retain; actual BLOCKED/STOPPED departure resets");
 }
-int main(void){permission();tick_accounting();departures();printf("RT HOST checks=%u failed=%u\n",checks,failed);return !!failed;}
+static void uncharged_departures(void)
+{
+    for(unsigned rt=0;rt<2;rt++)for(unsigned stopped=0;stopped<2;stopped++) {
+        setup();
+        if(rt)CHECK(!kernel_sched_policy_set(&task.scheduling,1,10,0));
+        task.resource_flags=KERNEL_RESOURCE_NPROC_CHARGED;
+        task.state=stopped?KERNEL_THREAD_STATE_STOPPED:KERNEL_THREAD_STATE_BLOCKED;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);CHECK(scheduler_select_next_locked(active,&task,0)==active->idle);}
+        CHECK(!task.rttime_ticks&&!index_updates);
+        CHECK(task.resource_flags==KERNEL_RESOURCE_NPROC_CHARGED);
+        CHECK(!resource_updates);
+    }
+    puts("RT HOST uncharged: OTHER and unlimited RT departures leave resource flags untouched");
+}
+static void historical_departures(void)
+{
+    for(unsigned unlimited=0;unlimited<2;unlimited++)for(unsigned stopped=0;stopped<2;stopped++) {
+        setup();limits.values[KERNEL_RLIMIT_RTTIME]=(struct kernel_rlimit64){30000,80000};
+        task.resource_flags=KERNEL_RESOURCE_NPROC_CHARGED;
+        CHECK(!kernel_task_sched_set(&task,0,1,10,0));
+        for(stamp=1;stamp<=4;stamp++)kernel_scheduler_charge_ticks(1,1);
+        CHECK(task.rttime_ticks==4&&task.rttime_stamp==4);
+        CHECK((task.resource_flags&KERNEL_RESOURCE_RTTIME_DUE)&&task.cpu_timer_index[1].indexed);
+        if(unlimited) {
+            KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+            limits.values[KERNEL_RLIMIT_RTTIME]=(struct kernel_rlimit64){KERNEL_RLIM_INFINITY,KERNEL_RLIM_INFINITY};
+        } else CHECK(!kernel_task_sched_set(&task,0,0,0,0));
+        kernel_scheduler_charge_ticks(1,1);
+        CHECK(task.rttime_ticks==4);
+        task.state=stopped?KERNEL_THREAD_STATE_STOPPED:KERNEL_THREAD_STATE_BLOCKED;
+        unsigned previous_updates=index_updates;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);CHECK(scheduler_select_next_locked(active,&task,0)==active->idle);}
+        CHECK(!task.rttime_ticks&&task.rttime_stamp==4);
+        CHECK(task.resource_flags==KERNEL_RESOURCE_NPROC_CHARGED);
+        CHECK(!task.cpu_timer_index[1].indexed&&index_updates==previous_updates+1);
+    }
+    puts("RT HOST history: RT to OTHER and finite to infinity still reset on real departure");
+}
+int main(void){permission();tick_accounting();departures();uncharged_departures();historical_departures();printf("RT HOST checks=%u failed=%u\n",checks,failed);return !!failed;}
+
+/* Observe the real scheduler's atomic updates without changing their effect. */
+static uint32_t resource_fetch_and(uint32_t *word,uint32_t mask,int order)
+{
+    if(word==&task.resource_flags)resource_updates++;
+    return __atomic_fetch_and(word,mask,order);
+}
+#define __atomic_fetch_and resource_fetch_and
+#include "../../kernel/sched/scheduling.c"
+#undef __atomic_fetch_and
