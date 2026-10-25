@@ -126,7 +126,7 @@ $(LA_BUILD)/fatal-%.o: tests/loongarch/fatal.c $(LA_BUILD)/generated/lock-config
 $(LA_BUILD)/kernel-fatal-%: $(LA_BUILD)/fatal-%.o $(LA_TEST_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $< -lgcc
 .PHONY: test-loongarch-fatal
-test-loongarch-fatal: $(LA_BUILD)/kernel-fatal-1 $(LA_BUILD)/kernel-fatal-2 $(LA_BUILD)/kernel-fatal-3
+test-loongarch-fatal: $(addprefix $(LA_BUILD)/kernel-fatal-,1 2 3 4 5)
 	python3 -B tests/loongarch/fatal.py --qemu $(QEMU_LOONGARCH64)
 ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
 test-loongarch-fatal: prepare-la-tools

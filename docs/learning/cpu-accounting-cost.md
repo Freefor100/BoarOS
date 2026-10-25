@@ -1902,4 +1902,4 @@ vCPU绑定独立宿主P核CPU0/2/4/6，主线程/I/O在CPU8，正式计时串行
 
 挂载短例前10组通过后，PTY从端读写及卸载触发旧核异常。内核worker从未拥有用户资源限额；通用退出清理进入POSIX timer索引更新时，旧实现先读取`task->limits->values[RLIMIT_CPU]`，再判断目标是否仍存活，因而解引用NULL+16。将存活判断移到表达式最前，仍沿原逻辑撤下索引，保留有存活组成员的进程时钟。宿主直接反例红→绿，原生timer owner测试在4/16KiB通过；最终12组客机消费者覆盖RV UP/2/4核和RV/LA两种libc。
 
-旧LA内核的一次GDB现场同时确认limits=NULL、user_mode=0、proc_exiting=1、group_members=0；首个异常为load fault（code1/badv0x10），SP仍位于有效栈区间。随后故障输出再次取得已经持有的kernel_wait_domain，触发break0，形成原日志反复出现的code12；该首错并非栈溢出。worker退出根因已修，LA异常输出重入等待锁仍作为独立鲁棒性缺口保留。旧核/首错日志在`stage3/pty-first-fault-la/`，两架构原失败与最终结果分别在`stage3/contracts/`和`contracts-final/`。
+旧LA内核的一次GDB现场同时确认limits=NULL、user_mode=0、proc_exiting=1、group_members=0；首个异常为load fault（code1/badv0x10），SP仍位于有效栈区间。随后故障输出再次取得已经持有的kernel_wait_domain，触发break0，形成原日志反复出现的code12；该首错并非栈溢出。worker退出根因已修；随后LA异常输出也已改为在首个前缀前切换紧急UART，见[LA异常输出机制](../modules/loongarch-boot.md)。旧核/首错日志在`stage3/pty-first-fault-la/`，两架构原失败与最终结果分别在`stage3/contracts/`和`contracts-final/`。
