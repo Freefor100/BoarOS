@@ -16,7 +16,28 @@
 
 mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM raw 内查询已有页面归属，包含 PROT_NONE 页面；没有 PTE 时查询内存对象或已完成装入的文件缓存。一次最多处理 16 页，任务 I/O 工作区保存结果，用户输出在 MM 保护外完成。文件来源借用覆盖锁外权限和缓存查询，恢复 MM 资格后核对 VMA 代次；截断、解除映射和最终关闭沿原来源退休协议等待借用结束。文件所有者、CAP_FOWNER 或有当前写权限的调用者可见真实状态，其余调用者按 Linux 获得全 1；匿名映射直接返回真实状态。VMA 空洞返回 ENOMEM，之前完整输出的前缀保留。
 
-直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/mm-resource-limits-host.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。SHM_LOCK 和通用 MAP_GROWSDOWN 仍在后续范围。
+直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/mm-resource-limits-host.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。通用 MAP_GROWSDOWN 仍在后续范围。
+
+
+## madvise 与共享段锁定
+
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
+
+DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。当前 VDSO 缺少特殊缺页重装路径，DONTNEED 对它返回 EINVAL；Linux VDSO 可重装，这一差异保留为缺口。
+
+WILLNEED 使用已有文件缓存装入过程，单次建议至多准备16个数据页，不安装用户 PTE、不改变OFD offset。文件/ELF来源借用覆盖锁外I/O，最后一个映射或原FD关闭后，来源在建议结束时归还。返回0表示接纳建议；装入失败采用 Linux 忽略 fadvise 返回值的规则，实际读取/缺页继续处理其实际I/O结果。无swap时私有匿名、纯BSS和无文件身份的ELF来源返回EBADF，共享内存没有swap-in工作。
+
+SHM_LOCK/UNLOCK 在既有CPU0共享内存控制路径执行。段保存首次LOCK时调用者真实UID的账户引用，按段尺寸向上取整的页数计费，以当前调用者MEMLOCK软限额接纳，CAP_IPC_LOCK豁免。无该capability时，euid须为owner或creator；LOCK零限额返回EPERM，超额返回ENOMEM。权限与零限额检查先于重复LOCK判断；重复操作沿用已有计费。IPC_SET保留锁定状态，IPC_STAT和`/proc/sysvipc/shm`显示SHM_LOCKED。
+
+LOCK保留按需装页，当前memory_object已经持有已驻留页。UID或owner改变后，UNLOCK或RMID后的最后attachment销毁向原账户归还。共享段的UID额度与普通mlock的MM虚拟字节、VmLck分别统计。
+
+直接消费者为`tests/workloads/resource/madvise.c`、`shm_lock.c`，宿主入口为`tests/mm-resource-limits-host.sh`、`tests/shm-lock-host.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
+
+```sh
+python3 tests/loongarch/prepare.py --component linux --profile platform-noswap
+```
+
+原`platform`参考缓存继续供其他消费者使用，配置和镜像身份分别检查。
 
 ## 范围与入口
 

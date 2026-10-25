@@ -30,7 +30,8 @@ static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_s
     *ds = (struct kernel_shmid64_ds){
         .shm_perm = {.key = seg->key, .uid = seg->uid, .gid = seg->gid,
             .cuid = seg->cuid, .cgid = seg->cgid,
-            .mode = seg->mode | (seg->marked_for_deletion ? SHM_DEST : 0U), .seq = seg->seq},
+            .mode = seg->mode | (seg->marked_for_deletion ? SHM_DEST : 0U) |
+                (seg->lock_account ? KERNEL_SHM_LOCKED : 0U), .seq = seg->seq},
         .shm_segsz = seg->size, .shm_atime = seg->atime, .shm_dtime = seg->dtime,
         .shm_ctime = seg->ctime, .shm_cpid = seg->cpid, .shm_lpid = seg->lpid,
         .shm_nattch = seg->nattch,
@@ -82,11 +83,21 @@ static int32_t current_tgid(struct kernel_task *caller)
     return 0;
 }
 
+static void shm_unlock(struct kernel_shm_segment *seg)
+{
+    if(!seg->lock_account)return;
+    /* chown 和锁定者改 UID 都不转移已经接纳的额度。 */
+    struct kernel_uid_account *account=seg->lock_account;
+    seg->lock_account=0;
+    kernel_uid_account_shm_unlock(account,seg->aligned_size>>BOAROS_PAGE_SHIFT);
+}
+
 static void kernel_shm_destroy_segment_locked(struct kernel_shm_segment *seg)
 {
     if (!seg->active) {
         return;
     }
+    shm_unlock(seg);
     if (seg->memory != 0) {
         kernel_memory_object_release(&seg->memory);
         seg->memory = 0;
@@ -212,6 +223,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     new_seg->size = size;
     new_seg->aligned_size = aligned_size;
     new_seg->memory = mem;
+    new_seg->lock_account = 0;
     new_seg->nattch = 0;
     new_seg->attachments = 0;
     new_seg->atime = 0;
@@ -478,6 +490,28 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     }
 
     switch (pure_cmd) {
+    case KERNEL_SHM_LOCK:
+    case KERNEL_SHM_UNLOCK: {
+        const struct kernel_credentials *cred=kernel_credentials_current();
+        /* Linux 在重复操作前仍检查 owner 和 LOCK 的零软限额。 */
+        if(!kernel_credentials_capable(cred,KERNEL_CAP_IPC_LOCK) &&
+            (cred->euid!=seg->uid && cred->euid!=seg->cuid)) {
+            arch_interrupt_restore(irq);return -KERNEL_EPERM;
+        }
+        if(pure_cmd==KERNEL_SHM_LOCK) {
+            uint64_t limit=kernel_task_current_memlock_limit();
+            if(!limit){arch_interrupt_restore(irq);return -KERNEL_EPERM;}
+            if(!seg->lock_account) {
+                int status=kernel_uid_account_shm_lock(cred->account,
+                    seg->aligned_size>>BOAROS_PAGE_SHIFT,limit>>BOAROS_PAGE_SHIFT);
+                if(status){arch_interrupt_restore(irq);return status;}
+                /* memory_object 已持有实际驻留页；LOCK 不触页，也不逐页加 pin。 */
+                seg->lock_account=cred->account;
+            }
+        } else shm_unlock(seg);
+        *out_result=0;
+        arch_interrupt_restore(irq);return 0;
+    }
     case KERNEL_IPC_RMID: {
         if(!shm_owner(seg)){arch_interrupt_restore(irq);return -KERNEL_EPERM;}
         if (seg->nattch == 0U && seg->attachments == 0U) {

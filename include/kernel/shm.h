@@ -11,6 +11,8 @@
 #define KERNEL_SHM_REMAP  040000
 #define KERNEL_SHM_EXEC   0100000
 
+#define KERNEL_SHM_LOCKED 02000
+
 #define KERNEL_SHM_LOCK   11
 #define KERNEL_SHM_UNLOCK 12
 #define KERNEL_SHM_STAT   13
@@ -49,6 +51,7 @@ struct kernel_shminfo64 {
 _Static_assert(sizeof(struct kernel_shmid64_ds) == 112, "shmid64_ds layout");
 
 struct kernel_memory_object;
+struct kernel_uid_account;
 
 struct kernel_shm_segment {
     int32_t shmid;
@@ -57,6 +60,7 @@ struct kernel_shm_segment {
     uint64_t size;
     uint64_t aligned_size;
     struct kernel_memory_object *memory;
+    struct kernel_uid_account *lock_account;
     uint64_t nattch;
     uint32_t attachments;
     int64_t atime;

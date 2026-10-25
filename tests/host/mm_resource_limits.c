@@ -62,6 +62,31 @@ int main(void)
         CHECK(!kernel_mm_acquire(&held, &mm));
     }
     CHECK(!kernel_mm_release(&held));
+    /* Discard PTEs without changing VMA identity, protection or AS/DATA usage. */
+    assert(!map(BASE,3*P,RW,0));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+2*P,KERNEL_MM_WRITE));
+    struct kernel_mm_mapping discarded;
+    assert(!kernel_mm_lookup(&mm,BASE,&discarded));
+    *(unsigned char *)(uintptr_t)discarded.physical_address=0x63;
+    struct kernel_mm_proc_memory before_advice,after_advice;
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&before_advice));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,4));
+    CHECK(kernel_mm_lookup(&mm,BASE,&discarded)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&after_advice)&&
+        after_advice.virtual_bytes==before_advice.virtual_bytes&&
+        after_advice.resident_pages+1==before_advice.resident_pages);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    assert(!kernel_mm_lookup(&mm,BASE,&discarded));
+    CHECK(!*(unsigned char *)(uintptr_t)discarded.physical_address);
+    CHECK(!kernel_mm_munmap(&mm,BASE+P,P));
+    CHECK(kernel_mm_madvise(&mm,BASE,3*P,4)==-KERNEL_ENOMEM);
+    CHECK(kernel_mm_lookup(&mm,BASE,&discarded)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(kernel_mm_lookup(&mm,BASE+2*P,&discarded)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_madvise(&mm,UINT64_MAX&~BOAROS_PAGE_MASK,0,4));
+    CHECK(kernel_mm_madvise(&mm,BASE,0,99)==-KERNEL_EINVAL);
+    CHECK(kernel_mm_madvise(&mm,BASE,1,3)==-KERNEL_EBADF);
+    CHECK(!kernel_mm_munmap(&mm,BASE,3*P));
     assert(!map(BASE,P,RW,0));
     unsigned reads_before=limit_reads;
     CHECK(!kernel_mm_mprotect(&mm,BASE,P,KERNEL_MM_READ));

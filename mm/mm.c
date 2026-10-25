@@ -4799,6 +4799,100 @@ static int lock_interval(uint64_t address, uint64_t length, uint64_t *start, uin
     return 0;
 }
 
+/* WILLNEED is cache advice, not a demand fault: it never installs a PTE. The
+ * existing source borrow covers unlocked file I/O and concurrent last unmap. */
+static int advise_file(struct mm_operation *operation, const struct kernel_vma *vma,
+    uint64_t address, uint64_t *end, unsigned *budget)
+{
+    struct kernel_mm_record *record = operation->record;
+    struct kernel_open_file_description *file = 0;
+    _Atomic uint32_t *borrow = 0;
+    uint64_t offset = vma->backing_offset + address - vma->start;
+    if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS) return -KERNEL_EBADF;
+    if (vma->kind == KERNEL_VMA_KIND_ANON_SHARED || vma->kind == KERNEL_VMA_KIND_SYSV_SHM)
+        return 0; /* shmem has no swap-in work in this kernel. */
+    if (vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE || vma->kind == KERNEL_VMA_KIND_FILE_SHARED) {
+        file = vma->backing;
+        struct kernel_mm_file_source *source = find_file_source(record, file);
+        if (!source) __builtin_trap();
+        borrow = &source->operations;
+    } else if (vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
+        struct kernel_elf64_source *source = vma->backing;
+        file = kernel_elf64_source_file(source);
+        if (!file) return -KERNEL_EBADF;
+        for (uint32_t i = 0; i < kernel_elf64_source_run_count(source); i++) {
+            const struct kernel_elf64_source_run *run = kernel_elf64_source_run_at(source, i);
+            if (offset < run->start || offset >= run->end) continue;
+            uint64_t limit = address + run->end - offset;
+            if (*end > limit) *end = limit;
+            if (run->kind == KERNEL_ELF64_SOURCE_RUN_ZERO) return -KERNEL_EBADF;
+            if (run->kind != KERNEL_ELF64_SOURCE_RUN_FILE) return 0;
+            offset = run->file_offset + offset - run->start;
+            break;
+        }
+        struct kernel_mm_elf_source *owner = find_elf_source(record, source);
+        if (!owner) __builtin_trap();
+        borrow = &owner->faults;
+    } else return -KERNEL_EINVAL;
+    if (!*budget || kernel_open_file_memory_backed(file)) return 0;
+    if (*borrow == UINT32_MAX || ++*borrow == 0) __builtin_trap();
+    const struct kernel_mm *mm = operation->mm;
+    uint64_t length = *end - address;
+    mm_operation_end(operation);
+    for (uint64_t done = 0; done < length && *budget; done += BOAROS_PAGE_SIZE) {
+        struct kernel_open_file_page_preparation prepared = {0};
+        (*budget)--;
+        if (kernel_open_file_prepare_mapping_page(file, (offset + done) >> BOAROS_PAGE_SHIFT, &prepared))
+            break;
+        kernel_open_file_finish_mapping_page(file, &prepared, 0);
+    }
+    if (!__atomic_fetch_sub(borrow, 1, __ATOMIC_RELEASE)) __builtin_trap();
+    if (mm_operation_begin(mm, operation)) return -KERNEL_EAGAIN;
+    (void)drain_file_sources(record, 1);
+    (void)drain_elf_sources(record, 1);
+    /* Linux accepts the hint even if fadvise/page-in cannot complete it. The
+     * remaining range is still validated, without a residency guarantee. */
+    return 0;
+}
+
+int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, int32_t advice)
+{
+    if (advice < KERNEL_MM_ADVICE_NORMAL || advice > KERNEL_MM_ADVICE_DONTNEED || (address & BOAROS_PAGE_MASK) ||
+        length > UINT64_MAX - BOAROS_PAGE_MASK) return -KERNEL_EINVAL;
+    uint64_t rounded = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    if (rounded > UINT64_MAX - address) return -KERNEL_EINVAL;
+    if (!length) return 0;
+    uint64_t end = address + rounded;
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+    struct kernel_mm_record *record = operation.record;
+    int hole = 0;
+    unsigned budget = 16;
+    while (address < end) {
+        struct kernel_vma vma;
+        enum kernel_vma_status status = kernel_vma_set_lookup(record->vmas, address, &vma);
+        if (status == KERNEL_VMA_STATUS_NOT_FOUND) {
+            hole = 1;
+            status = kernel_vma_set_next(record->vmas, address, &vma);
+            if (status == KERNEL_VMA_STATUS_NOT_FOUND || vma.start >= end) break;
+            address = vma.start;
+        }
+        if (status) __builtin_trap();
+        uint64_t finish = vma.end < end ? vma.end : end;
+        int error = 0;
+        if (advice == KERNEL_MM_ADVICE_DONTNEED) {
+            if (vma.lock_flags || vma.role == KERNEL_VMA_ROLE_VDSO) return -KERNEL_EINVAL;
+            if (unmap_space_range(record, address, finish)) __builtin_trap();
+        } else if (advice == KERNEL_MM_ADVICE_WILLNEED)
+            error = advise_file(&operation, &vma, address, &finish, &budget);
+        /* NORMAL/RANDOM/SEQUENTIAL are advisory: keep the existing global
+         * cache policy, validate the complete mapped range, and store no hint. */
+        if (error) return error;
+        address = finish;
+    }
+    return hole ? -KERNEL_ENOMEM : 0;
+}
+
 int kernel_mm_mlock(struct kernel_mm *mm, uint64_t address, uint64_t length, uint32_t flags)
 {
     if (flags & ~1U) return -KERNEL_EINVAL;
