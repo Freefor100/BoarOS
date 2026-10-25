@@ -774,3 +774,25 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 直接消费者用数字UID检查降权、跨进程REALCREDS权限和已有FD权利；共享offset、CLOEXEC及真实fstat/pread内容检查通过。NPROC8项、RT9项、pidfd6项覆盖RV UP静态/双核动态1GiB/四核静态512MiB及LA；两架构glibc同ELF与固定Linux对照通过。末次proc目录扩展另核对RV UP/四核、LA，以及两架构glibc同ELF，覆盖O_PATH/错误目录、旧句柄、信号载荷和退出后的行为。
 
 首批与定向复核均正常收尾，根盘及第二盘p1/ext4、p2/VFAT、p3/ext4八个对象的一致性检查全部返回0；默认单核交付内核已恢复。原始ELF身份、细项、judge及内核/QEMU身份位于`build/rlimits-pidfd-20261025/original/`和`original-send01/`，直接消费者记录在同轮目录。成本统一见[CPU成本报告](cpu-accounting-cost.md)。
+
+## 锁页与mincore原程序结果
+
+2026-10-25，锁页实现合入兼容分支后，在固定官方离线容器和原QEMU设备参数下，RV/LA并行运行九项原ELF，两种libc。原参数、程序内部时限和judge均保留；只选择本批外层枚举。
+
+| 原程序 | 实际细项结果，四配置相同 | 每配置原judge | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms |
+|---|---|---:|---:|---:|---:|---:|
+| `mlock01` | 1 B、1 KiB、1 MiB、10 MiB四个范围通过 | 4/4 | 210 | 134 | 155 | 75 |
+| `mlock02` | 缺少nobody，未进入错误返回主体 | 0/1 | 86 | 42 | 63 | 45 |
+| `mlock201` | 立即/ONFAULT的8个锁定与驻留检查通过 | 8/8 | 71 | 63 | 69 | 42 |
+| `mlock202` | 缺少nobody，未进入权限/错误主体 | 0/1 | 42 | 44 | 63 | 46 |
+| `mlockall01` | CURRENT、FUTURE、组合三项TPASS | 0/0 | 83 | 63 | 42 | 43 |
+| `munlock01` | 四个范围通过 | 4/4 | 125 | 129 | 69 | 64 |
+| `munlockall01` | 解锁及再次锁定两项通过 | 2/2 | 83 | 44 | 62 | 44 |
+| `mincore01` | 未对齐地址项PASS；10 MiB栈限额准备被拒绝，余项中止 | 0/0 | 45 | 42 | 87 | 44 |
+| `mincore02` | 查询成功和4页驻留检查通过 | 2/2 | 63 | 63 | 82 | 63 |
+
+**每配置20/22，四配置合计80/88**。mlockall01的三项功能检查通过，原judge因没有Summary记0/0；mincore01同样为0/0，但实际准备被内核栈容量限制阻断，二者状态分别保留。输入和准备问题见[统一测例问题文档](oscomp-test-issues.md#运行库和原盘依赖)。
+
+36次程序执行中24次退出0，12次在准备阶段退出2，无TFAIL或超时。数字身份、MEMLOCK额度/豁免、EFAULT/ENOMEM、ONFAULT、MAP_LOCKED、COW、fork/exec与共享MM等由同ELF直接程序独立验证。直接程序通过不替换原程序的失分和未进入步骤。
+
+两架构正常退出后检查root、工具ext4、VFAT和scratch ext4，共八个对象，检查均为0；RV最终heap-live=0，LA最终owner和heap检查正常。默认交付内核已恢复，兼容分支原有交付文档修改保持原样。原始逐项输出、ELF身份、judge、程序总耗时和磁盘检查保存在`build/memlock-20261025/original/`；完整用户可读性能结果见[CPU成本记录](cpu-accounting-cost.md#锁页memlock与mincore2026-10-25)。
