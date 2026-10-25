@@ -840,6 +840,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
+    kernel_kcmp_initialize();
     scheduler.all_tasks = 0;
     scheduler.load_ticks = 0;
     for (unsigned i = 0; i < 3; i++) scheduler.loads[i] = 0;

@@ -189,6 +189,14 @@ locked变体仅供已持调度域的短操作使用。借用不固定MM、文件
 
 join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
 
+### kcmp
+
+RV64/LA64 的 kcmp(272) 在发起 CPU 比较 FILE、VM、FILES、FS、SIGHAND 和 SYSVSEM；同对象返回 0，不同对象返回可用于排序的 1/2。启动时从已有随机源取得每类置换键，以异或和奇数乘法隐藏内核地址顺序。查找按实际 PID/TID 取得任务存储借用，先检查双方 REALCREDS、dumpable 和 capability 子集，再判断 type 和 FD；PID 已回收返回 ESRCH，有身份的僵尸仍可比较。IO/EPOLL_TFD 返回 EOPNOTSUPP，非法 type 返回 EINVAL，FILE 的 ulong 索引按 Linux 原生 unsigned int 宽度截断。
+
+每任务 files_access 的短访问同时覆盖远端资源比较：两目标按地址排序，同目标只取一次；FS 在 VFS 状态保护内读取，其余身份在调度域内读取。FILE 再按地址排序取得真实文件表的槽锁，在调度域重新核对双方 PID/TID 和权限后直接比较槽持有的 OFD，dup/fork 保持相等，重新 open 同 inode 则不同。查询无需创建整表或 OFD 临时 owner，也不触发最后 close 或后端工作。退出先发布 proc_exiting，再在调度域外等待短访问结束，由原 owner 释放资源；僵尸 VM/FILES/FS/SYSVSEM 比较空资源，SIGHAND 寿命见[信号状态](kernel-signal.md#状态与生命周期)。SEM_UNDO 尚未建立时按真实 NULL 比较，CLONE_SYSVSEM 在子任务发布前建立并共享撤销组。
+
+`sh tests/host/kcmp.sh` 检查锁序、真实 OFD 槽、懒分配身份、权限复核和退出等待；`tests/workloads/resource/kcmp.c` 用管道握手覆盖 fork、CLONE_FS、pthread、vfork、SEM_UNDO 最后共享者、真实/文件系统凭据差异、非组长 exec、僵尸与 PID 回收。clone 支持组合仍按本模块原范围。
+
 ### pidfd
 
 RV64/LA64 提供 pidfd_open(434)、pidfd_send_signal(424) 和 pidfd_getfd(438)。 send_signal 同时接受按旧 Linux ABI 打开的 proc 进程目录；该节点持有解析时的真实 PID 引用，退出或编号复用后不会指向新进程。proc 根、task/TID 目录、普通文件及 O_PATH 不参与此转换，getfd 和 waitid 仍要求实际 pidfd。pidfd OFD 持有真实 PID 身份存储；dup、fork 和 UNIX FD 传递沿共同 OFD 引用规则。open 接受 PIDFD_NONBLOCK、PIDFD_THREAD，新 FD 设置 CLOEXEC；普通 open 要求 TGID 角色，THREAD 则保留实际 TID。身份代次作为同一目标 pidfd 的 inode 标识，fstat 沿固定 Linux pidfs getattr 输出 0700 并去掉文件类型位。数据 read/write 及定位读写返回 EINVAL，lseek 返回 ESPIPE。
