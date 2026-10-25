@@ -1447,7 +1447,7 @@ struct mm_operation {
 #if BOAROS_MAX_CPUS > 1
     unsigned shared, populate;
     uint64_t sync_start, sync_end;
-    uint32_t sync_targets, sync_nonleaf;
+    uint32_t sync_targets;
 #endif
 };
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
@@ -1496,12 +1496,11 @@ static void mm_operation_release(struct mm_operation *operation)
         if (!operation->guard.lock || operation->guard.write || !operation->populate) __builtin_trap();
         {
             COST_SCOPE(sync_cost, MM_SYNC_TICKS);
-            arch_mmu_sync_user(operation->sync_targets,
-                operation->sync_nonleaf ? 0 : operation->sync_start,
-                operation->sync_nonleaf ? UINT64_MAX : operation->sync_end - operation->sync_start, 0);
+            arch_mmu_sync_user(operation->sync_targets, operation->sync_start,
+                operation->sync_end - operation->sync_start, 0);
         }
         operation->sync_start = operation->sync_end = 0;
-        operation->sync_targets = operation->sync_nonleaf = 0;
+        operation->sync_targets = 0;
     }
 #endif
     mm_gate_release(operation->record, &operation->guard);
@@ -4409,7 +4408,7 @@ lookup:
 #if BOAROS_MAX_CPUS > 1
             if (operation->shared && !operation->populate && vma.kind == KERNEL_VMA_KIND_ANONYMOUS &&
                 !(vma.permissions & KERNEL_MM_EXECUTE)) {
-                /* 同MM预装者可能尚未确认新叶及非叶；真实故障者先清本地walk
+                /* 同MM预装者可能尚未确认新叶；真实故障者先清本地walk
                  * cache即可重试，不替另一owner提前完成远端批次。 */
                 kernel_raw_lock_release(&guard);
                 arch_mmu_flush_all();
@@ -4558,13 +4557,12 @@ memory_tables_changed:
         int nonleaf = missing && ((missing & 1U && prepared.tables[0] == KERNEL_MM_NO_PAGE) ||
             (missing & 2U && prepared.tables[1] == KERNEL_MM_NO_PAGE));
 #if BOAROS_MAX_CPUS > 1
-        if (operation->populate && operation->shared && !cookie &&
+        if (operation->populate && operation->shared && !cookie && !nonleaf &&
             vma.kind == KERNEL_VMA_KIND_ANONYMOUS && !(vma.permissions & KERNEL_MM_EXECUTE)) {
             if (batch.count || !operation->guard.lock) __builtin_trap();
             if (!operation->sync_end || address < operation->sync_start) operation->sync_start = address;
             if (address + BOAROS_PAGE_SIZE > operation->sync_end) operation->sync_end = address + BOAROS_PAGE_SIZE;
             operation->sync_targets |= targets;
-            operation->sync_nonleaf |= nonleaf;
         } else
 #endif
             finish_tlb_change(record, &batch, targets, nonleaf ? 0 : address,
