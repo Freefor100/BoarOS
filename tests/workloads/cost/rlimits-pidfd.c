@@ -28,6 +28,7 @@ static void resource_file(void)
     CHECK(!close(fd)&&!unlink("/resource-cost/data")&&!rmdir("/resource-cost"));
     mm_msg_report("file-positioned-rw-4k",4096,UINT64_C(4096)*8192,elapsed,cpu);
 }
+#ifndef RESOURCE_COST_EMBEDDED
 struct resource_handles {
     pthread_barrier_t gate;
     unsigned cpus,mode;
@@ -102,3 +103,5 @@ int main(void)
     printf("RESOURCE-PERF END %u\n",mm_msg_metrics);
     if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }
+
+#endif
