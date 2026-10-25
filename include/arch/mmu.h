@@ -44,6 +44,9 @@
 #define arch_mmu_user_next_owned riscv_sv39_user_next_owned
 #define arch_mmu_user_mark_cow_page riscv_sv39_user_mark_cow_page
 #define arch_mmu_user_space_fork_prepare riscv_sv39_user_space_fork_prepare
+#define ARCH_MMU_FORK_PRIVATE RISCV_SV39_FORK_PRIVATE
+#define ARCH_MMU_FORK_SHARED RISCV_SV39_FORK_SHARED
+#define ARCH_MMU_FORK_SKIP RISCV_SV39_FORK_SKIP
 #define ARCH_MMU_EXECUTE RISCV_SV39_EXECUTE
 #define ARCH_MMU_PAGE_SIZE RISCV_SV39_PAGE_SIZE_4K
 #define ARCH_MMU_READ RISCV_SV39_READ

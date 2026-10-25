@@ -135,12 +135,94 @@ static void remote(void)
     for(unsigned i=0;i<cpus;i++){CHECK(!pthread_join(threads[i],0)&&p[i]==i+1);}
     CHECK(!pthread_barrier_destroy(&barrier)&&!munmap(p,page));pass("remote-tlb-refault-shared-mm");
 }
+static void fork_absent(void)
+{
+    unsigned char *p=area(4,MAP_PRIVATE);memset(p,61,4*page);
+    CHECK(!madvise(p+page,2*page,MADV_DONTFORK));
+    pid_t c=fork();CHECK(c>=0);
+    if(!c){unsigned char v;ERROR(mincore(p+page,page,&v),ENOMEM);ERROR(mincore(p+2*page,page,&v),ENOMEM);CHECK(p[0]==61&&p[3*page]==61);_exit(0);}joined(c);
+    CHECK(p[page]==61&&p[2*page]==61&&!madvise(p+page,2*page,MADV_DOFORK));
+    c=fork();CHECK(c>=0);if(!c){CHECK(p[page]==61&&p[2*page]==61);p[page]=99;_exit(0);}joined(c);
+    CHECK(p[page]==61&&!munmap(p,4*page));pass("dontfork-partial-dofork-cow");
+}
+static void fork_wipe(void)
+{
+    unsigned char *p=area(3,MAP_PRIVATE);memset(p,74,3*page);
+    CHECK(!madvise(p+page,page,MADV_WIPEONFORK));
+    pid_t c=fork();CHECK(c>=0);
+    if(!c){CHECK(p[0]==74&&!p[page]&&p[2*page]==74);p[page]=81;
+        pid_t g=fork();CHECK(g>=0);if(!g){CHECK(!p[page]);_exit(0);}joined(g);
+        CHECK(p[page]==81&&!madvise(p+page,page,MADV_KEEPONFORK));
+        g=fork();CHECK(g>=0);if(!g){CHECK(p[page]==81);_exit(0);}joined(g);_exit(0);}joined(c);
+    CHECK(p[page]==74&&!madvise(p+page,page,MADV_DONTFORK));
+    c=fork();CHECK(c>=0);if(!c){unsigned char v;ERROR(mincore(p+page,page,&v),ENOMEM);_exit(0);}joined(c);
+    CHECK(!madvise(p+page,page,MADV_DOFORK));
+    c=fork();CHECK(c>=0);if(!c){CHECK(!p[page]);_exit(0);}joined(c);
+    CHECK(p[page]==74&&!munmap(p,3*page));pass("wipe-child-grandchild-and-keep");
+}
+static void fork_backing(void)
+{
+    unsigned char *p=area(1,MAP_SHARED);p[0]=23;
+    ERROR(madvise(p,page,MADV_WIPEONFORK),EINVAL);CHECK(!madvise(p,page,MADV_KEEPONFORK));
+    CHECK(!madvise(p,page,MADV_DONTFORK));pid_t c=fork();CHECK(c>=0);
+    if(!c){unsigned char v;ERROR(mincore(p,page,&v),ENOMEM);_exit(0);}joined(c);
+    CHECK(p[0]==23&&!munmap(p,page));
+    int id=shmget(IPC_PRIVATE,page,IPC_CREAT|0600);CHECK(id>=0);p=shmat(id,0,0);CHECK(p!=(void*)-1);
+    CHECK(!madvise(p,page,MADV_DONTFORK));c=fork();CHECK(c>=0);
+    if(!c){struct shmid_ds ds;unsigned char v;ERROR(mincore(p,page,&v),ENOMEM);CHECK(!shmctl(id,IPC_STAT,&ds)&&ds.shm_nattch==1);_exit(0);}joined(c);
+    CHECK(!shmdt(p)&&!shmctl(id,IPC_RMID,0));pass("dontfork-shared-and-shm-attachment");
+}
+static void fork_file(const char *path,const char *name)
+{
+    int fd=open(path,O_CREAT|O_TRUNC|O_RDWR,0600);CHECK(fd>=0&&!ftruncate(fd,2*page));
+    unsigned char *p=mmap(0,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);CHECK(p!=MAP_FAILED);p[0]=35;p[page]=47;
+    ERROR(madvise(p,page,MADV_WIPEONFORK),EINVAL);CHECK(!madvise(p,page,MADV_DONTFORK)&&!close(fd)&&!unlink(path));
+    pid_t c=fork();CHECK(c>=0);if(!c){unsigned char v;ERROR(mincore(p,page,&v),ENOMEM);CHECK(p[page]==47);p[page]=91;_exit(0);}joined(c);
+    CHECK(p[0]==35&&p[page]==47&&!munmap(p,2*page));pass(name);
+}
+static void fork_hole_remap(void)
+{
+    unsigned char *p=area(3,MAP_PRIVATE);p[0]=5;p[2*page]=9;CHECK(!munmap(p+page,page));
+    ERROR(madvise(p,3*page,MADV_DONTFORK),ENOMEM);pid_t c=fork();CHECK(c>=0);
+    if(!c){unsigned char v;ERROR(mincore(p,page,&v),ENOMEM);ERROR(mincore(p+2*page,page,&v),ENOMEM);_exit(0);}joined(c);
+    CHECK(!munmap(p,3*page));p=area(1,MAP_PRIVATE);p[0]=18;CHECK(!madvise(p,page,MADV_WIPEONFORK));
+    p=mremap(p,page,2*page,MREMAP_MAYMOVE);CHECK(p!=MAP_FAILED);c=fork();CHECK(c>=0);
+    if(!c){CHECK(!p[0]&&!p[page]);_exit(0);}joined(c);CHECK(p[0]==18&&!munmap(p,2*page));pass("fork-policy-hole-prefix-and-remap");
+}
+static void fork_bss(void)
+{
+    bss[page]=93;CHECK(!madvise(bss+page,page,MADV_WIPEONFORK));pid_t c=fork();CHECK(c>=0);
+    if(!c){CHECK(!bss[page]);_exit(0);}joined(c);CHECK(bss[page]==93&&!madvise(bss+page,page,MADV_KEEPONFORK));
+    pass("wipe-pure-bss-zero-source");
+}
+struct fork_remote {unsigned char *p;unsigned cpu;atomic_uint ready,go;};
+static void *fork_writer(void *opaque)
+{
+    struct fork_remote *w=opaque;cpu_set_t set;CPU_ZERO(&set);CPU_SET(w->cpu,&set);
+    CHECK(!sched_setaffinity(0,sizeof(set),&set));CHECK(w->p[0]==31&&w->p[page]==63);
+    atomic_store(&w->ready,1);while(!atomic_load(&w->go))sched_yield();
+    w->p[0]=41;w->p[page]=71;return 0;
+}
+static void fork_remote(void)
+{
+    unsigned char *p=area(2,MAP_PRIVATE);p[0]=31;p[page]=63;CHECK(!madvise(p+page,page,MADV_WIPEONFORK));
+    cpu_set_t set;CHECK(!sched_getaffinity(0,sizeof(set),&set));unsigned cpu=0;
+    for(unsigned i=0;i<4;i++)if(CPU_ISSET(i,&set))cpu=i;
+    struct fork_remote w={.p=p,.cpu=cpu};pthread_t thread;int done[2];CHECK(!pipe(done));
+    CHECK(!pthread_create(&thread,0,fork_writer,&w));while(!atomic_load(&w.ready))sched_yield();
+    pid_t c=fork();CHECK(c>=0);if(!c){expect(done[0]);CHECK(p[0]==31&&!p[page]);_exit(0);}
+    atomic_store(&w.go,1);CHECK(!pthread_join(thread,0));token(done[1]);joined(c);
+    CHECK(p[0]==41&&p[page]==71&&!close(done[0])&&!close(done[1])&&!munmap(p,2*page));
+    pass("fork-remote-parent-cow-and-wipe");
+}
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);page=(size_t)sysconf(_SC_PAGESIZE);CHECK(page==4096||page==16384);
     CHECK(!mkdir("/tmp",0755)||errno==EEXIST);CHECK(!mount("tmpfs","/tmp","tmpfs",0,0));
     abi();anonymous();cow();shared();file_case("/tmp/madvise","tmpfs-private-shared-data");
     file_case("/madvise","ext4-private-shared-data");locked();hole();willneed();remote();
+    fork_absent();fork_wipe();fork_backing();fork_file("/tmp/fork-policy","dontfork-tmpfs-private-owner");
+    fork_file("/fork-policy","dontfork-ext4-private-owner");fork_hole_remap();fork_bss();fork_remote();
     CHECK(!umount("/tmp"));printf("MADVISE END %u\n",cases);
     if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }

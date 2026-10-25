@@ -553,7 +553,10 @@ static enum arch_mmu_status fork_tree(struct arch_mmu_user_space *to,struct arch
             enum arch_mmu_status status=fork_tree(to,from,p[i],level-1,v,shared,context,commit);
             if (status!=ARCH_MMU_STATUS_OK) return status;
         } else {
-            uint64_t leaf=p[i]; int cow=!shared || !shared(context,v);
+            uint64_t leaf=p[i]; int action=shared ? shared(context,v) : ARCH_MMU_FORK_PRIVATE;
+            if (action==ARCH_MMU_FORK_SKIP) continue;
+            if (action!=ARCH_MMU_FORK_PRIVATE && action!=ARCH_MMU_FORK_SHARED) return ARCH_MMU_STATUS_STATE;
+            int cow=action==ARCH_MMU_FORK_PRIVATE;
             if (commit) {
                 if (cow && !(leaf&PTE_COW)) { p[i]=(leaf|PTE_COW)&~PTE_DIRTY; from->cow_pages++; }
                 arch_mmu_flush_address(v); continue;

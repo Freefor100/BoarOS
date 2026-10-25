@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define SHM_DEST 01000
 
@@ -454,34 +455,67 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         return -KERNEL_EINVAL;
     }
 
-    if (pure_cmd == KERNEL_IPC_INFO) {
-        struct kernel_shminfo64 info = {
-            .shmmax = KERNEL_SHMMAX,
-            .shmmin = KERNEL_SHMMIN,
-            .shmmni = KERNEL_SHMMNI,
-            .shmseg = KERNEL_SHMMNI,
-            .shmall = KERNEL_SHMALL,
-        };
+    if (pure_cmd == KERNEL_IPC_INFO || pure_cmd == KERNEL_SHM_INFO ||
+        pure_cmd == KERNEL_IPC_STAT || pure_cmd == KERNEL_SHM_STAT ||
+        pure_cmd == KERNEL_SHM_STAT_ANY) {
+        union {
+            struct kernel_shminfo64 limits;
+            struct kernel_shm_info usage;
+            struct kernel_shmid64_ds descriptor;
+        } snapshot = {0};
+        size_t size;
+        int64_t result = 0;
+        if (pure_cmd == KERNEL_IPC_INFO || pure_cmd == KERNEL_SHM_INFO) {
+            /* CPU0 段表保护覆盖槽身份和 memory owner；驻留页数由对象原子读取。 */
+            for (uint32_t i = 0; i < KERNEL_SHMMNI; i++) {
+                const struct kernel_shm_segment *seg = &shm_table.segments[i];
+                if (!seg->active) continue;
+                result = i;
+                if (pure_cmd == KERNEL_SHM_INFO) {
+                    snapshot.usage.used_ids++;
+                    snapshot.usage.shm_tot += seg->aligned_size >> BOAROS_PAGE_SHIFT;
+                    snapshot.usage.shm_rss += kernel_memory_object_resident_pages(seg->memory);
+                }
+            }
+            if (pure_cmd == KERNEL_IPC_INFO) {
+                snapshot.limits = (struct kernel_shminfo64){
+                    .shmmax = KERNEL_SHMMAX, .shmmin = KERNEL_SHMMIN,
+                    .shmmni = KERNEL_SHMMNI, .shmseg = KERNEL_SHMMNI,
+                    .shmall = KERNEL_SHMALL,
+                };
+                size = sizeof(snapshot.limits);
+            } else {
+                size = sizeof(snapshot.usage);
+            }
+        } else {
+            struct kernel_shm_segment *seg = &shm_table.segments[(uint32_t)shmid % KERNEL_SHMMNI];
+            /* SHM_STAT* 按槽枚举并返回当前完整 ID；IPC_STAT 还校验代次。 */
+            if (!seg->active || (pure_cmd == KERNEL_IPC_STAT && seg->shmid != shmid)) {
+                arch_interrupt_restore(irq);
+                return -KERNEL_EINVAL;
+            }
+            if (pure_cmd != KERNEL_SHM_STAT_ANY) {
+                int permission = shm_permission(seg, 4);
+                if (permission) { arch_interrupt_restore(irq); return permission; }
+            }
+            shm_descriptor(seg, &snapshot.descriptor);
+            size = sizeof(snapshot.descriptor);
+            if (pure_cmd != KERNEL_IPC_STAT) result = seg->shmid;
+        }
         arch_interrupt_restore(irq);
 
         if (mm != 0) {
             size_t copied = 0;
-            if (kernel_copy_to_user(mm, user_buf, &info, sizeof(info), &copied) !=
-                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(info)) {
-                return -KERNEL_EFAULT;
-            }
+            if (kernel_copy_to_user(mm, user_buf, &snapshot, size, &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != size) return -KERNEL_EFAULT;
         } else {
-            if (user_buf == 0) return -KERNEL_EFAULT;
-            *(struct kernel_shminfo64 *)(uintptr_t)user_buf = info;
+            if (!user_buf) return -KERNEL_EFAULT;
+            memcpy((void *)(uintptr_t)user_buf, &snapshot, size);
         }
-        *out_result = (int64_t)KERNEL_SHMMNI;
+        *out_result = result;
         return 0;
     }
 
-    if (shmid < 0) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_EINVAL;
-    }
     uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
     struct kernel_shm_segment *seg = &shm_table.segments[slot_idx];
     if (!seg->active || seg->shmid != shmid) {
@@ -523,26 +557,6 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         }
         *out_result = 0;
         arch_interrupt_restore(irq);
-        return 0;
-    }
-    case KERNEL_IPC_STAT: {
-        int permission=shm_permission(seg,4);
-        if(permission){arch_interrupt_restore(irq);return permission;}
-        struct kernel_shmid64_ds ds;
-        shm_descriptor(seg, &ds);
-        arch_interrupt_restore(irq);
-
-        if (mm != 0) {
-            size_t copied = 0;
-            if (kernel_copy_to_user(mm, user_buf, &ds, sizeof(ds), &copied) !=
-                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(ds)) {
-                return -KERNEL_EFAULT;
-            }
-        } else {
-            if (user_buf == 0) return -KERNEL_EFAULT;
-            *(struct kernel_shmid64_ds *)(uintptr_t)user_buf = ds;
-        }
-        *out_result = 0;
         return 0;
     }
     case KERNEL_IPC_SET: {

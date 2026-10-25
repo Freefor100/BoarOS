@@ -16,6 +16,10 @@ uint64_t kernel_vma_set_locked_range(const struct kernel_vma_set *, uint64_t, ui
 void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_LOCKED 1U
 #define KERNEL_VMA_LOCK_ONFAULT 2U
+#define KERNEL_VMA_LOCK_MASK 3U
+#define KERNEL_VMA_DONTFORK 4U
+#define KERNEL_VMA_WIPEONFORK 8U
+#define KERNEL_VMA_ALL_FLAGS 15U
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
 int kernel_vma_is_data(const struct kernel_vma *vma);
 
@@ -23,7 +27,7 @@ enum kernel_vma_edit_kind {
     KERNEL_VMA_EDIT_REMOVE = 0,
     KERNEL_VMA_EDIT_REPLACE,
     KERNEL_VMA_EDIT_PROTECT,
-    KERNEL_VMA_EDIT_LOCK,
+    KERNEL_VMA_EDIT_FLAGS,
 };
 
 enum kernel_vma_status {
@@ -74,7 +78,7 @@ struct kernel_vma {
     enum kernel_vma_kind kind;
     enum kernel_vma_role role;
     enum kernel_vma_fault_policy fault_policy;
-    uint32_t lock_flags;
+    uint32_t flags;
     void *backing;
     struct kernel_shm_attachment *shm_attachment;
 };
@@ -90,7 +94,7 @@ struct kernel_vma_edit {
     uint64_t start;
     uint64_t end;
     uint32_t permissions;
-    uint32_t lock_flags;
+    uint32_t flags, flags_mask;
     enum kernel_vma_edit_kind kind;
     struct kernel_vma replacement;
 };
@@ -114,7 +118,7 @@ enum kernel_vma_status kernel_vma_set_create(
     struct kernel_heap *heap,
     struct kernel_vma_set **set);
 
-enum kernel_vma_status kernel_vma_set_clone(
+enum kernel_vma_status kernel_vma_set_fork(
     const struct kernel_vma_set *source,
     struct kernel_vma_set **destination);
 
@@ -184,8 +188,8 @@ enum kernel_vma_status kernel_vma_set_prepare_mprotect(
     struct kernel_vma_set *set, uint64_t start, uint64_t end,
     uint32_t permissions, struct kernel_vma_edit *edit);
 
-enum kernel_vma_status kernel_vma_set_prepare_lock(struct kernel_vma_set *,
-    uint64_t start, uint64_t end, uint32_t flags, struct kernel_vma_edit *);
+enum kernel_vma_status kernel_vma_set_prepare_flags(struct kernel_vma_set *,
+    uint64_t start, uint64_t end, uint32_t mask, uint32_t flags, struct kernel_vma_edit *);
 
 /* No allocation is performed; a stale or foreign edit returns STATE. */
 enum kernel_vma_status kernel_vma_set_commit_edit(
