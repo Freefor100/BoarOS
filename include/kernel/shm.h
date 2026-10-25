@@ -17,6 +17,7 @@
 #define KERNEL_SHM_UNLOCK 12
 #define KERNEL_SHM_STAT   13
 #define KERNEL_SHM_INFO   14
+#define KERNEL_SHM_STAT_ANY 15
 
 #define KERNEL_SHMMIN 1ULL
 #define KERNEL_SHMMNI 128U
@@ -48,7 +49,20 @@ struct kernel_shminfo64 {
     uint64_t __unused4;
 };
 
+struct kernel_shm_info {
+    int32_t used_ids;
+    uint32_t __pad;
+    uint64_t shm_tot;
+    uint64_t shm_rss;
+    uint64_t shm_swp;
+    uint64_t swap_attempts;
+    uint64_t swap_successes;
+};
+
 _Static_assert(sizeof(struct kernel_shmid64_ds) == 112, "shmid64_ds layout");
+_Static_assert(sizeof(struct kernel_shminfo64) == 72, "shminfo64 layout");
+_Static_assert(sizeof(struct kernel_shm_info) == 48 &&
+    offsetof(struct kernel_shm_info, shm_tot) == 8, "shm_info layout");
 
 struct kernel_memory_object;
 struct kernel_uid_account;
