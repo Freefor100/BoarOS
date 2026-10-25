@@ -872,3 +872,16 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 | mincore02 | 2/2 | 100 | 63 | 108 | 64 |
 
 立即装入/ONFAULT及驻留检查均进入原主体并通过。两架构最终heap-live=0；根盘、工具ext4、VFAT、scratch ext4八对象检查均为0，默认交付恢复并按保存SHA核对。记录在`build/staged-mm-mount-20261025/stage2/original/`。共享MM混合映射/锁页循环仍有多核负加速，功能通过与性能目标分别记录于[CPU成本](cpu-accounting-cost.md#共享mm并行准备与挂载属性阶段2026-10-25)。
+
+## NOEXEC/NODEV原程序检查：2026-10-25
+
+第三阶段在固定官方容器和原QEMU双盘入口仅运行`mount01/mount03`，RV/LA并行，两种libc保留原ELF、参数、judge及内部时限。四配置结果一致：`mount01` 2/2，`mount03` 0/1，每配置2/3，合计8/12，无超时。
+
+| 原程序 | 每配置得分 | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms | 实际到达位置 |
+|---|---:|---:|---:|---:|---:|---|
+| mount01 | 2/2 | 7691 | 7733 | 6323 | 6027 | 真实格式化scratch、挂载与挂载表检查PASS，退出0。 |
+| mount03 | 0/1 | 7576 | 7599 | 6030 | 6174 | getpwnam(nobody)报ENOENT，准备TBROK退出2，尚未进入挂载属性分项。 |
+
+上述耗时包含真实mke2fs与准备/清理。mount03的原盘用户数据库问题已并入[统一问题表](oscomp-test-issues.md)，未补造原输入账户；NOEXEC/NODEV实际拒绝、解释器、设备别名、旧FD、映射最大权限及卸载由12组同ELF Linux差分直接验证，两架构两种libc和RV2/4核通过。原mount03还覆盖remount和atime扩展，保留为后续能力范围，未以本批直接短例宣称它完整通过。
+
+两架构PID1正常结束，最终heap-live=0；根盘及第二盘三个分区共八对象检查为0，默认交付内核按保存SHA恢复。实际输入身份、细项、耗时和磁盘检查位于`build/staged-mm-mount-20261025/stage3/original/`，性能与PTY退出修复见[本阶段成本记录](cpu-accounting-cost.md#挂载属性最终单核对照)。
