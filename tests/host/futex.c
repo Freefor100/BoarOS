@@ -97,7 +97,6 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     uint64_t deadline, int interruptible, struct kernel_wait_token *token)
 {
     enum kernel_scheduler_status result = __real_kernel_wait_prepare(queue, deadline, interruptible, token);
-    if (interruptible) futex_queue = queue;
     if (kernel_cpu_current()->hardware_id == 1 && !interruptible &&
         __atomic_load_n(&admission_arm, __ATOMIC_ACQUIRE)) {
         assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
@@ -108,6 +107,13 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
         assert(result == KERNEL_SCHEDULER_STATUS_OK && queue->registrations && token->generation);
         __atomic_store_n(&bucket_waiter, 1, __ATOMIC_RELEASE);
     }
+    return result;
+}
+enum kernel_scheduler_status __real_kernel_wait_prepare_locked(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_prepare_locked(struct kernel_wait_queue *queue,uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+{
+    enum kernel_scheduler_status result=__real_kernel_wait_prepare_locked(queue,deadline,interruptible,token);
+    if(interruptible)futex_queue=queue;
     return result;
 }
 enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(struct kernel_memory_object *, uint64_t, uint64_t *, int *);

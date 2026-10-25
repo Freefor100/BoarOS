@@ -266,7 +266,7 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑 gate；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。private WAIT、CMP_REQUEUE 和 WAKE_OP 沿共同用户 pin 协议，在 metadata raw 内检查当前 PTE、访问许可并取得实际页引用；新许可关闭时先等待开放，缺页或 COW 先调用 resolver，再重新取得 pin。共享 key 需要 operation gate 固定整组映射视图，再由 metadata raw 检查当前 PTE 并取得页许可；所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
 
-每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。桶表在 boot CPU 初始化 wait_domain 后、任务和 secondary 发布前一次初始化。每次操作只解析一组桶指针，比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字并登记 token，通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配。WAKE 在至多 16 个登记的短链上，只取得一次 wait_domain，完成 key/bitset 匹配和通知；队列只包含任务节点，节点使用始终在保护内，因而无需锁外游标借用。COMMITTED 通知会摘除节点，扫描在通知前保存后继；PREPARED 通知保留登记，重复扫描跳过已经通知的记录。长链与 requeue 沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
+每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。桶表在 boot CPU 初始化 wait_domain 后、任务和 secondary 发布前一次初始化。每次操作只解析一组桶指针，比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字，并在等待短保护内直接登记 token；任务、桶和栈token已由该调用取得，无需再次经过公共登记包装的参数检查。通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配。WAKE 在至多 16 个登记的短链上，只取得一次 wait_domain，完成 key/bitset 匹配和通知；队列只包含任务节点，节点使用始终在保护内，因而无需锁外游标借用。COMMITTED 通知会摘除节点，扫描在通知前保存后继；PREPARED 通知保留登记，重复扫描跳过已经通知的记录。长链与 requeue 沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
 
 SMP下，WAKE/WAKE_OP及退出唤醒在取得全部桶资格后，借用当前调用栈上的通知批次。READY和目标CPU事件位立即发布；实际IPI目标暂存于该批次，全部桶锁归还后才合并发送，避免发送者在持桶期间等待固件。批次保存并恢复原IRQ及抢占深度，期间保持CPU固定且不允许阻塞；撤销CPU上的栈指针后再发送。原始raw释放路径不增加分支，UP编译为空操作。共享key最终释放与用户pin归还在批次结束后执行。
 
@@ -286,11 +286,13 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未竞争时只原子修改用户字，不常驻分配锁对象，保留 libc 的用户态快速解锁。竞争时，在原桶内发布按真实 key 标识的状态；每个在途调用持有状态引用，状态持有 owner 的任务存储借用及共享 key 的后备引用。调用栈保存等待请求；用户页 pin 只覆盖比较／更新，睡眠前归还，持有者退出后的用户字修复重新取得 pin。
 
-等待者按实际优先级、同优先级的登记顺序排列，链式传播在调度保护内更新 owner 的实际优先级和队列位置。基础调度策略、权限和查询值保持独立；fork 继承基础值。等待者撤销、优先级更新、解锁和退出都重新计算受影响链；新等待操作按固定 Linux 的 1024 层检查上限排除环；逐步追加可以形成更长的既有无环链，优先级更新沿实际链完整传播，成本为链长。内部可睡眠锁仍按原 FIFO 契约运行，PI 作用于这里的用户互斥锁。
+等待者按实际优先级、同优先级的登记顺序排列，链式传播在调度保护内更新 owner 的实际优先级和队列位置。实际优先级和基础值未变时直接结束传播，不重复采样CPU记账；FIFO/RR等策略变更仍在原策略下结算。基础调度策略、权限和查询值保持独立；fork 继承基础值。等待者撤销、优先级更新、解锁和退出都重新计算受影响链；新等待操作按固定 Linux 的 1024 层检查上限排除环；逐步追加可以形成更长的既有无环链，优先级更新沿实际链完整传播，成本为链长。内部可睡眠锁仍按原 FIFO 契约运行，PI 作用于这里的用户互斥锁。
 
-正常解锁先原子发布下一个 TID，再转交内核 owner、通知等待者。超时／信号先通知原 token，等待线程与解锁方在同一保护内竞争最终移除／授予；已授予时返回取得锁。LOCK_PI 使用绝对 REALTIME，LOCK_PI2 默认绝对 MONOTONIC、可带 REALTIME 标志；信号处理后按原绝对期限无条件重启，不依赖 SA_RESTART。
+正常解锁先原子发布下一个 TID，再转交内核 owner、通知等待者。IPI沿普通futex的通知批次，在桶锁释放后发送；请求注销与其状态引用归还在同一调度保护内发布，未发布候选由原调用直接释放。SMP队首若观察到owner正在远端CPU执行，可在释放桶及页pin后等待最多50µs，并受原deadline和本核调度请求约束；锁外只读取本请求的原子grant，不继续访问旧owner。轮询不改变优先级/FIFO选择，真正交接仍由原handoff和等待token完成；未取得交接再按原路径睡眠。超时／信号先通知原 token，等待线程与解锁方在同一保护内竞争最终移除／授予；已授予时返回取得锁。LOCK_PI 使用绝对 REALTIME，LOCK_PI2 默认绝对 MONOTONIC、可带 REALTIME 标志；信号处理后按原绝对期限无条件重启，不依赖 SA_RESTART。
 
 退出与 exec 在旧 MM 释放前发布清理状态，先走 robust 用户链，再依次交接真实 PI owner；新的竞争者通过现有组等待源等待清理完成。退出持有者交接时，获准线程修复 OWNER_DIED 和自己的 TID；地址失效返回 EFAULT；只要还有等待者，仍存活的获准线程继续是内核 owner，随后通过实际退出流程交接。所有最后引用和堆存储在短保护外释放。普通 WAKE／REQUEUE 源遇到活动 PI 状态返回 EINVAL；PI 接纳也检查同 key 的普通等待者。
+
+公共`kernel_wait_prepare`以256字节对齐，最终RV布局检查要求它完整位于一个代码页；这个124字节路径曾因跨页使每次调用多执行一个QEMU翻译块。实际调用者直接使用已持有保护的接口时沿`kernel_wait_prepare_locked`。
 
 `make test-pi-priority-host` 检查 4/16 KiB 下实际队列、CPU0 服务资格、RT 节流及链式传播；`tests/workloads/futex/pi.c` 检查原始字、libc robust mutex、超时／信号、优先级倒置、环、共享别名及退出修复故障。`tests/network_runner.py --workload pi` 复用两架构 Linux 对照，`--libc glibc` 使用现有目标静态工具链。
 

@@ -10,6 +10,7 @@ _Static_assert(sizeof(struct kernel_signal_wait_info)==128,"native siginfo_t");
 struct kernel_signal_queue {
     struct kernel_heap *heap;
     uint64_t inline_pending,native_count;
+    struct signal_queue_record *spare;
     struct { struct signal_queue_record *head,*tail; uint64_t count; } slots[64];
 };
 uint64_t kernel_signal_pending_count_locked(const struct kernel_task *task)
@@ -31,20 +32,23 @@ static uint64_t *bits(struct kernel_task *t,int shared)
 
 void signal_pending_prepare_record(struct kernel_heap *heap,struct signal_pending_prepared *p)
 {
-    if(!heap)return;
+    if(!heap || p->record)return;
     enum kernel_heap_status status=kernel_heap_allocate_zeroed(heap,1,sizeof(*p->record),(void **)&p->record);
     if(!status)p->record->heap=heap;
     else if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
 }
-void signal_pending_prepare_index(struct kernel_task *t,int shared,struct kernel_heap *heap,
+void signal_pending_prepare_queue(struct kernel_task *t,int shared,struct kernel_heap *heap,
     struct signal_pending_prepared *p)
 {
+    if(!heap)return;
     int needs_index;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        needs_index=!state(t,shared)->queue;
+        struct kernel_signal_queue *q=state(t,shared)->queue;
+        needs_index=!q;
+        /* 取出后归本次发送所有；目标退出可直接释放其队列，不借用旧队列地址。 */
+        if(q && !p->record){p->record=q->spare;q->spare=0;}
     }
-    if(!heap)return;
     if(needs_index){
         enum kernel_heap_status status=kernel_heap_allocate_zeroed(heap,1,sizeof(*p->index),(void **)&p->index);
         if(!status)p->index->heap=heap;
@@ -59,7 +63,7 @@ void signal_pending_prepare(struct kernel_task *t,int shared,const struct kernel
         struct kernel_signal_pending_state *s=state(t,shared);
         if(!s->inline_account || s->inline_account==kernel_credentials_task_locked(charge_target)->account)return;
     }
-    signal_pending_prepare_index(t,shared,heap,p);
+    signal_pending_prepare_queue(t,shared,heap,p);
     signal_pending_prepare_record(heap,p);
 }
 int signal_pending_reserve_locked(const struct kernel_task *task,struct kernel_uid_account **owner)
@@ -155,7 +159,12 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
             s->queue->native_count--;posix_timer_record_take_locked(record,out,p);
         } else {
             uncharge(record->account,1);
-            record->next=p->retired;p->retired=record;
+            unsigned slot=0;while(slot<2 && p->retired_accounts[slot])slot++;
+            if(!s->queue->spare && slot<2) {
+                /* 额度和UID引用立即归还；队列只留一个无载荷owner的独立缓冲。 */
+                p->retired_accounts[slot]=record->account;record->account=0;
+                record->next=0;s->queue->spare=record;
+            } else {record->next=p->retired;p->retired=record;}
         }
         if(s->queue->slots[sig-1].head)return;
     } else {
@@ -257,7 +266,11 @@ void kernel_signal_pending_cleanup(struct kernel_task *t)
         signal_pending_finish(&p);if(!more)break;
     }
     signal_pending_finish(&p);
-    for(unsigned i=0;i<2;i++)if(indexes[i])kernel_heap_release(indexes[i]->heap,indexes[i]);
+    for(unsigned i=0;i<2;i++)if(indexes[i]) {
+        struct signal_queue_record *spare=indexes[i]->spare;
+        if(spare){if(spare->account || spare->timer || spare->next)__builtin_trap();kernel_heap_release(spare->heap,spare);}
+        kernel_heap_release(indexes[i]->heap,indexes[i]);
+    }
 }
 void kernel_signal_pending_adopt_locked(struct kernel_task *to,struct kernel_task *from)
 {

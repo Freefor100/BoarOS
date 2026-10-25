@@ -173,7 +173,11 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     task->futex_key = key;
     task->futex_bitset = bitset;
     struct kernel_wait_token token;
-    *status = kernel_wait_prepare(&resolved[0]->waiters, deadline, 1, &token);
+    {
+        /* 当前任务、桶和token已由本调用取得；直接在等待保护内登记。 */
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        *status = kernel_wait_prepare_locked(&resolved[0]->waiters, deadline, 1, &token);
+    }
     /* token登记后不再取得任何可睡眠锁；先放桶锁再归还pin，MM编辑可排空它。 */
     futex_unlock_buckets(guards);
     kernel_mm_unpin_user_page(&pin);
