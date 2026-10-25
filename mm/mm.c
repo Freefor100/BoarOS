@@ -2717,13 +2717,15 @@ static enum kernel_mm_status validate_file_mapping(
     KERNEL_NO_RECLAIM_IO;
     struct mm_file_mapping_plan plan;
 
-    return prepare_file_mapping(mm,
+    enum kernel_mm_status status=prepare_file_mapping(mm,
                                 hint,
                                 length,
                                 file_offset,
                                 permissions,
                                 flags,
                                 &plan);
+    /* Linux先检查锁页接纳，再检查FD权限；提交仍重新核对当前额度。 */
+    return status ? status : admit_mapping_lock(plan.record,plan.start,plan.end,flags);
 }
 
 static enum kernel_mm_status commit_file_mapping(

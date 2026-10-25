@@ -7,9 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -203,6 +205,15 @@ static void mapping_cases(void)
 }
 static void mapping_errors(void)
 {
+    int ep=epoll_create1(EPOLL_CLOEXEC);CHECK(ep>=0);errno=0;
+    CHECK(mmap(0,page,PROT_READ,MAP_PRIVATE,ep,0)==MAP_FAILED&&errno==ENODEV);errno=0;
+    CHECK(mmap(0,page,PROT_WRITE,MAP_SHARED,ep,0)==MAP_FAILED&&errno==ENODEV);
+    CHECK((fcntl(ep,F_GETFL)&O_ACCMODE)==O_RDWR&&!close(ep));
+    int ends[2];CHECK(!pipe(ends));errno=0;
+    CHECK(mmap(0,page,PROT_READ,MAP_PRIVATE,ends[0],0)==MAP_FAILED&&errno==ENODEV);errno=0;
+    CHECK(mmap(0,page,PROT_READ,MAP_PRIVATE,ends[1],0)==MAP_FAILED&&errno==EACCES);errno=0;
+    CHECK(mmap(0,page,PROT_WRITE,MAP_SHARED,ends[0],0)==MAP_FAILED&&errno==EACCES);
+    CHECK(!close(ends[0])&&!close(ends[1]));
     int fd=open("/ma/deny/data",O_WRONLY),path=open("/ma/deny/data",O_PATH);CHECK(fd>=0&&path>=0);
     errno=0;CHECK(mmap(0,page,PROT_EXEC,MAP_PRIVATE,fd,0)==MAP_FAILED&&errno==EACCES);
     errno=0;CHECK(mmap(0,page,PROT_EXEC,MAP_PRIVATE,path,0)==MAP_FAILED&&errno==EBADF);
@@ -210,7 +221,19 @@ static void mapping_errors(void)
     CHECK(!close(fd)&&!close(path));fd=open("/ma/deny/data",O_RDONLY);CHECK(fd>=0);
     errno=0;CHECK(mmap(0,page,PROT_WRITE|PROT_EXEC,MAP_SHARED,fd,0)==MAP_FAILED&&errno==EACCES);
     errno=0;CHECK(mmap(0,0,PROT_EXEC,MAP_PRIVATE,fd,0)==MAP_FAILED&&errno==EINVAL);
-    errno=0;CHECK(mmap(0,page,PROT_EXEC,MAP_PRIVATE,fd,1)==MAP_FAILED&&errno==EINVAL);CHECK(!close(fd));
+    errno=0;CHECK(mmap(0,page,PROT_EXEC,MAP_PRIVATE,fd,1)==MAP_FAILED&&errno==EINVAL);
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){
+        struct rlimit limit={1,1};CHECK(!setrlimit(RLIMIT_MEMLOCK,&limit)&&!setgid(1234)&&!setuid(1234));
+        unsigned char *p=mmap(0,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(p!=MAP_FAILED);p[0]=91;
+        errno=0;CHECK(mmap(0,page,PROT_EXEC,MAP_PRIVATE|MAP_LOCKED,fd,0)==MAP_FAILED&&errno==EAGAIN);errno=0;
+        CHECK(mmap(p,page,PROT_EXEC,MAP_PRIVATE|MAP_LOCKED|MAP_FIXED,fd,0)==MAP_FAILED&&errno==EAGAIN&&p[0]==91);errno=0;
+        CHECK(mmap(p,page,PROT_EXEC,MAP_PRIVATE|MAP_LOCKED|MAP_FIXED_NOREPLACE,fd,0)==MAP_FAILED&&errno==EEXIST);errno=0;
+        CHECK(mmap(0,page,PROT_WRITE|PROT_EXEC,MAP_SHARED|MAP_LOCKED,fd,0)==MAP_FAILED&&errno==EAGAIN);errno=0;
+        CHECK(mmap(0,page,PROT_EXEC,MAP_PRIVATE|MAP_LOCKED,-1,0)==MAP_FAILED&&errno==EBADF);
+        CHECK(!munmap(p,page));_exit(0);
+    }
+    joined(child,0);CHECK(!close(fd));
     const char *paths[]={"/ma/proc/self/status","/ma/deny"};
     for(unsigned i=0;i<sizeof(paths)/sizeof(paths[0]);i++){
         fd=open(paths[i],O_RDONLY);CHECK(fd>=0);errno=0;

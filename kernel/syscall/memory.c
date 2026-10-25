@@ -194,11 +194,12 @@ enum kernel_syscall_status syscall_handle_mmap(
             }
         } else {
             const struct kernel_vfs_file *source=kernel_open_file_vfs_borrow(file);
-            /* FD权限先于NOEXEC；有路径但不可映射的对象也先报告执行限制。 */
+            /* mmap检查打开模式；epoll等对象没有read操作并不表示OFD无读权限。 */
+            uint32_t access_mode=kernel_open_file_flags(file)&3U;
             int error=0;
-            if (!kernel_open_file_readable(file) ||
+            if ((access_mode!=0U && access_mode!=2U) ||
                 ((flags & LINUX_MAP_TYPE_MASK)==LINUX_MAP_SHARED &&
-                 (protections & LINUX_PROT_WRITE) && !kernel_open_file_writable(file)))
+                 (protections & LINUX_PROT_WRITE) && access_mode!=1U && access_mode!=2U))
                 error=-KERNEL_EACCES;
             else if ((protections & LINUX_PROT_EXEC) && source->mount && source->mount->noexec)
                 error=-KERNEL_EPERM;
