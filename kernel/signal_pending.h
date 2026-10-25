@@ -15,7 +15,8 @@ struct signal_pending_prepared {
     struct signal_queue_record *record, *retired, *completed;
     struct kernel_uid_account *retired_accounts[2];
 };
-void signal_pending_prepare_index(struct kernel_task *,int,struct kernel_heap *,struct signal_pending_prepared *);
+/* 从现有队列取独立空闲记录，再在锁外补备缺少的索引；不借用队列存储。 */
+void signal_pending_prepare_queue(struct kernel_task *,int,struct kernel_heap *,struct signal_pending_prepared *);
 void signal_pending_prepare_record(struct kernel_heap *,struct signal_pending_prepared *);
 int signal_pending_reserve_locked(const struct kernel_task *,struct kernel_uid_account **);
 void signal_pending_unreserve_locked(struct kernel_uid_account *);

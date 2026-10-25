@@ -12,12 +12,13 @@
 #include <string.h>
 _Thread_local uintptr_t network_host_irq=RISCV_SSTATUS_SIE;
 struct kernel_raw_lock kernel_wait_domain={.rank=KERNEL_RAW_RANK_SCHEDULER,.initialized=KERNEL_RAW_INITIALIZED};
-static unsigned live,fail;
+static unsigned live,fail,allocations;
 static struct kernel_heap heap;
 void kernel_cpu_flush_notifications(void){assert(!kernel_cpu_current()->outbound);}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
 {
     assert(h==&heap && !kernel_cpu_current()->raw_locks);
+    __atomic_fetch_add(&allocations,1,__ATOMIC_RELAXED);
     if(__atomic_load_n(&fail,__ATOMIC_RELAXED))return KERNEL_HEAP_STATUS_EMPTY;
     *out=calloc(n,size);assert(*out);__atomic_fetch_add(&live,1,__ATOMIC_RELAXED);return 0;
 }
@@ -146,5 +147,16 @@ int main(void)
     kernel_signal_pending_cleanup(&a);assert(!user.account->pending);
     kernel_uid_account_put(user.account);
     assert(!count()&&!live);
+    assert(!post(&a,0,36,-1,21,1));assert(take(&a,0,36).value==21&&!count());
+    unsigned warmed=allocations;fail=1;
+    assert(!post(&a,0,37,-1,22,1) && "consumed queue storage must be reused without another heap allocation");
+    assert(take(&a,0,37).value==22 && !count() && allocations==warmed);
+    fail=0;
+    struct signal_pending_prepared detached={0};
+    struct kernel_signal_wait_info incoming={.signal=36,.code=-1,.value=23};
+    signal_pending_prepare(&a,0,&a,&heap,&incoming,1,&detached);
+    assert(detached.record && allocations==warmed);
+    kernel_signal_pending_cleanup(&a);assert(!count()&&live==1);
+    signal_pending_finish(&detached);assert(!live);
     puts("signal pending FIFO/quota/abort/merge/lifetime and distinct-target UID ownership passed");return 0;
 }

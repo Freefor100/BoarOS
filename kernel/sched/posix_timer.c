@@ -321,7 +321,7 @@ int kernel_posix_timer_prepare(struct kernel_task *caller,int32_t clock,
     if(candidate)kernel_heap_release(heap,candidate);
     if(error){timer_put(t);return error;}
     signal_pending_prepare_record(heap,&t->notification);
-    if(t->event.notify!=1)signal_pending_prepare_index(target,t->event.notify!=4,heap,&t->notification);
+    if(t->event.notify!=1)signal_pending_prepare_queue(target,t->event.notify!=4,heap,&t->notification);
     {
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         struct kernel_signal_pending_state *pending=t->event.notify==4?&target->signal_queue:&target->group_queue;
