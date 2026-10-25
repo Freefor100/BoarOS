@@ -28,9 +28,6 @@ static struct kernel_heap heap;
 static struct arch_mmu_page_table kernel;
 static uint64_t memlock_limit=UINT64_MAX;
 uint64_t kernel_task_current_memlock_limit(void) { return memlock_limit; }
-void kernel_pidfd_close(void *file) { (void)file; __builtin_trap(); }
-int kernel_socket_is_unix(const void *socket) { (void)socket; __builtin_trap(); }
-void kernel_socket_rights_changed(void) { __builtin_trap(); }
 static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1; }
 void mm_test_fence(uint64_t address,int instructions) { (void)address;(void)instructions; }

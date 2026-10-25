@@ -12,7 +12,7 @@
 
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
-| 共享 MM 与子系统 | SysV/其他外部后备的并行内核修改；非 ext4 后端、socket/epoll/FIFO、设备/DMA 与退出的未覆盖消费者组合 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
+| 共享 MM 与子系统 | 同MM的VMA编辑、文件/ELF装页仍使用独占资格，共享MM混合映射/锁页循环的等待交接与多核负加速；非ext4后端、设备/DMA与退出的未覆盖消费者组合 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
 | 组合与 LA 多核 | 四核更广应用及尚未覆盖的故障/消费者组合；LA CPU 启动/IPI/TLB/状态保存 | 架构结果独立验收，保留单核对照；正确性成立后再衡量并行收益 |
 
 ### P6b 锁、等待与中断规则
@@ -56,10 +56,11 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 |---|---|
 | proc 线程信息 | task 子目录中的 fd、exe、cwd 等资源入口及其他按需字段；task 枚举、线程 stat/status 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
 | bind/rbind、move、传播与 mount namespace | 挂载边/实例/路径/OFD/MM 的引用及摘树关系，跨任务可见性与退出回收 |
-| remount 与其他属性 | 根挂载只读重配置；NOEXEC/NODEV、atime/同步等属性的实际执行点，已打开对象与脏数据的失败交接 |
+| remount 与其他属性 | 根挂载只读重配置；atime/同步等属性的实际执行点，重配置时已打开对象与脏数据的失败交接 |
 | umount2 扩展 | MNT_DETACH/FORCE/EXPIRE/UMOUNT_NOFOLLOW 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 
-当前新 mount 接受 `MS_RDONLY/MS_NOSUID/MS_SILENT`，umount2 仅接受 flags=0，绝对根卸载返回 EINVAL。
+当前新 mount 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`，umount2 仅接受 flags=0，绝对根卸载返回 EINVAL。
+NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限制新的设备路径打开和块设备挂载源，已打开对象保留原权利。
 基础与扩展边界见 [VFS](modules/vfs-ext4.md)及[挂载学习记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
 
 ## 已知成本与未关闭现场
