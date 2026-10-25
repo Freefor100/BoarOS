@@ -215,6 +215,12 @@ struct kernel_task {
     struct kernel_signal_child_info group_child_info;
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
+    /* 等待owner替换旧单地址futex字段，保留后续信号/文件热字段位置。 */
+    struct kernel_futex_request *futex_request;
+    struct kernel_futex_pi_state *pi_owned;
+    struct kernel_futex_pi_request *pi_request;
+    uint32_t pi_base_priority, futex_exit_state;
+    struct kernel_sem_request *sem_request;
     struct kernel_signal_fault signal_fault;
     uint64_t signal_pending;
     uint64_t signal_blocked;
@@ -250,17 +256,11 @@ struct kernel_task {
     struct kernel_exec_security *exec_security;
     struct kernel_socket_call *socket_call;
     struct kernel_sem_undo *sem_undo;
-    struct kernel_sem_request *sem_request;
     struct kernel_msg_request *msg_request;
     struct kernel_posix_cpu_sleep *cpu_sleep;
     /* 远端资源比较/FD读取的短访问；退出先发布离开，再等待原句柄读者。
      * FD槽由各表raw保护，FS发布由VFS状态保护，其余身份由调度域保护。 */
     struct kernel_raw_lock files_access;
-    /* 调度热字段继续保存实际优先级；仅继承期间保存基础值+1。 */
-    uint32_t pi_base_priority, futex_exit_state;
-    struct kernel_futex_pi_state *pi_owned;
-    struct kernel_futex_pi_request *pi_request;
-    struct kernel_futex_request *futex_request;
 } __attribute__((aligned(16)));
 
 #endif

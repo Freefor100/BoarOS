@@ -669,6 +669,15 @@ static void waitv_cases(void)
     assert(call(fresh,1|128,1,0,0,0)==1);
     assert(!pthread_join(worker,0)&&race.result==1);
     assert(!kernel_mm_munmap(&mm,fresh,BOAROS_PAGE_SIZE));
+    assert(!kernel_mm_mmap_anonymous(&mm,0x180000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&fresh));put(fresh,0);
+    items[0]=(struct vector_user){.value=7,.address=source,.flags=130};
+    items[1]=(struct vector_user){.value=0,.address=fresh,.flags=2};vector_set(items,2);
+    race=(struct vector_actor){.count=2,.result=-99};before=mm_test_parked(1);
+    assert(!pthread_create(&worker,0,vector_waiter,&race));queued(1,before);
+    assert(call(fresh,1,1,0,0,0)==1);
+    assert(!pthread_join(worker,0)&&race.result==1);
+    assert(!kernel_mm_munmap(&mm,fresh,BOAROS_PAGE_SIZE));
     put(source,0);put(target,0);
     puts("waitv ABI, full-key precedence, duplicate wake count, vector requeue and128 owners PASS");
 }

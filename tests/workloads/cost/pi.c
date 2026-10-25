@@ -1,7 +1,9 @@
 /* Existing clocks, affinity and barriers; fixed work for PI mutex consumers. */
+#ifndef COST_PI_EMBEDDED
 #define main existing_timer_cost_main
 #include "../../accounting/posix.c"
 #undef main
+#endif
 struct pi_cost_lock {pthread_mutex_t mutex;uint64_t value,check;};
 struct pi_cost_work {
     pthread_barrier_t gate;
@@ -23,9 +25,8 @@ static void *pi_cost_run(void *opaque)
     }
     w->cpu[id]=queue_clock(CLOCK_THREAD_CPUTIME_ID)-cpu;queue_gate(&w->gate);return 0;
 }
-int main(void)
+static void pi_perf(unsigned cpus)
 {
-    setvbuf(stdout,0,_IONBF,0);uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)>0);unsigned cpus=__builtin_popcountll(mask);CHECK(cpus==1||cpus==2||cpus==4);
     for(unsigned shared=0;shared<2;shared++){
         struct pi_cost_work *w=calloc(1,sizeof(*w));CHECK(w);w->cpus=cpus;w->shared=shared;
         for(unsigned i=0;i<32768;i+=512)((volatile uint64_t *)w->samples)[i]=0;
@@ -42,5 +43,12 @@ int main(void)
         printf("PI-PERF name=%s cpus=%u count=32768 ns=%llu p50=%llu p95=%llu max=%llu cpu_ns=%llu rss_kib=%ld check=%llu\n",shared?"mutex1":"mutex4",cpus,(unsigned long long)elapsed,(unsigned long long)w->samples[16384],(unsigned long long)w->samples[31129],(unsigned long long)w->samples[32767],(unsigned long long)cpu,usage.ru_maxrss,(unsigned long long)check);
         CHECK(!pthread_barrier_destroy(&w->gate));free(w);
     }
-    puts("PI-PERF END 2");return 0;
+    puts("PI-PERF END 2");
 }
+#ifndef COST_PI_EMBEDDED
+int main(void)
+{
+    setvbuf(stdout,0,_IONBF,0);uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)>0);
+    unsigned cpus=__builtin_popcountll(mask);CHECK(cpus==1||cpus==2||cpus==4);pi_perf(cpus);return 0;
+}
+#endif

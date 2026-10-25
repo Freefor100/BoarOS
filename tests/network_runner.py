@@ -239,7 +239,7 @@ def memlock_output(raw):
 
 def futex_vector_output(raw):
     lines=[line for line in raw.splitlines() if line.startswith('FUTEX-VECTOR')]
-    return lines==[*(f'FUTEX-VECTOR CASE {name} PASS' for name in ('abi-deadline-precedence','duplicates-requeue-caller-cpus','shared-fork-forced-exit','signal-and-restart','pi-requeue-abi','pi-proxy-broadcast-priority-shared','pi-mismatched-wake-requeue','pi-phase-signal-timeout','pi-access-fault-owner-waiter-exit','pi-error-completed-prefix')),'FUTEX-VECTOR END 10']
+    return lines==[*(f'FUTEX-VECTOR CASE {name} PASS' for name in ('abi-deadline-precedence','duplicates-requeue-caller-cpus','shared-fork-forced-exit','signal-and-restart','pi-requeue-abi','pi-proxy-broadcast-priority-shared','pi-mismatched-wake-requeue','pi-phase-signal-timeout','pi-access-fault-owner-waiter-exit','pi-error-completed-prefix','file-alias-unmap-unlink')),'FUTEX-VECTOR END 11']
 
 def pi_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('PI ')]
