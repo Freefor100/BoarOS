@@ -2183,6 +2183,21 @@ static void kernel_thread_finish(
     const struct kernel_thread_completion *completion)
     __attribute__((noreturn));
 
+static void process_begin_exit(struct kernel_task *current,
+    const struct kernel_thread_completion *completion)
+{
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (current->wait.phase != KERNEL_WAIT_FINISHED || current->wait.nodes || current->wait.borrows)
+            __builtin_trap();
+        current->proc_exiting = 1;
+        if (!current->group_exiting) current->completion = *completion;
+    }
+    /* 新读者在调度域拒绝退出任务；存量读者结束真实FD pin后，原任务
+     * 才能释放表存储。等待不持调度域，后端清理仍保留原files owner。 */
+    KERNEL_RAW_SCOPE(files, &current->files_access);
+}
+
 static void kernel_thread_finish(
     const struct kernel_thread_completion *completion)
 {
@@ -2210,13 +2225,7 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (current->wait.phase != KERNEL_WAIT_FINISHED || current->wait.nodes || current->wait.borrows)
-            __builtin_trap();
-        current->proc_exiting = 1;
-        if (!current->group_exiting) current->completion = *completion;
-    }
+    process_begin_exit(current, completion);
     /* Undo is visible before publishing exit or waking a child-TID joiner. */
     if (current->arch.user_mode) kernel_sem_exit(current);
     if (current->arch.user_mode) kernel_signal_task_exit(current);

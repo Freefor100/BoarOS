@@ -620,6 +620,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     thread = metadata;
     thread->cpu = kernel_cpu_current();
     kernel_wait_record_init(&thread->wait);
+    kernel_raw_lock_init(&thread->files_access, KERNEL_RAW_RANK_TASK_FILES);
     kernel_wait_node_init(&thread->default_wait_node, thread);
     thread->physical_address = metadata_address;
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;

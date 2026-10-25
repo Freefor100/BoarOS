@@ -195,11 +195,11 @@ RV64/LA64 提供 pidfd_open(434)、pidfd_send_signal(424) 和 pidfd_getfd(438)�
 
 有 pidfd 的身份才分配共享观察源，按身份指针索引；PID 对象保持 64 字节。poll/epoll 在发起 CPU 查询状态和登记既有等待源；组长提前退出仍等待最后线程，使退出真正可等待后才发布可读，wait/reap 撤下 TID 后同时报告 HUP。reap、wait 消费及非组长 exec 在修改角色前取得原 TID 存储 owner；状态修改完成后，由同一执行者在返回前锁外通知，再归还该 owner。等待游标和观察源引用覆盖通知及最后关闭的交错，不增加 worker 或待通知协议。
 
-waitid(P_PIDFD) 持有实际身份选择子进程，编号复用不改变目标。NONBLOCK pidfd 的子进程尚无所需事件时返回 EAGAIN；显式 WNOHANG 则成功返回空信息。getfd 按实际 TID 查找，检查 REALCREDS、dumpable 和 capability 子集，取得真实 OFD 后重新核对目标 MM、凭据、执行安全对象及文件表。CPU0 控制路径在授权快照、FD raw/OFD acquire 和安全复核期间短暂禁止抢占，避免 timer 切换到同核 exec/exit；FD 锁在调度域之外取得。随后恢复抢占，只保留所需 OFD。接收 FD 设置 CLOEXEC，offset、状态标志和打开权利继续共享；真实清理失败把 owner 留给已有 FD cleanup 路径。
+waitid(P_PIDFD) 持有实际身份选择子进程，编号复用不改变目标。NONBLOCK pidfd 的子进程尚无所需事件时返回 EAGAIN；显式 WNOHANG 则成功返回空信息。open 和 getfd 在发起 CPU 执行；分配 FD 前读取调用者当前 NOFILE 软限制。getfd 按实际 TID 查找，检查 REALCREDS、dumpable 和 capability 子集，取得真实 OFD 后重新核对目标身份、MM、凭据、执行安全对象及文件表。任务存储借用覆盖目标查找；每任务的 files_access 短保护覆盖授权快照、真实 FD pin 和安全复核，FD 锁在调度域之外取得。退出先在调度域发布 proc_exiting，再在域外等待这份短保护结束，随后才允许原 files owner 释放表存储；临时读者不持有整表清理引用。接收 FD 设置 CLOEXEC，offset、状态标志和打开权利继续共享；失败时 OFD 清理仍由调用者既有 FD cleanup 路径保留 owner。无 epoll 登记的 pidfd 最后关闭在发起 CPU 完成，有登记时沿原控制路径处理通知。
 
 发送默认采用 pidfd 的线程／线程组属性，支持单一的 THREAD、THREAD_GROUP、PROCESS_GROUP scope 标志及 SELF_THREAD/SELF_THREAD_GROUP 特殊值。可选 siginfo 沿共同导入和 pending 机制处理；目标在导入前解析并持有真实身份，不在用户缺页后按复用的 FD 或 PID 重新选目标。用户载荷来源、零信号探测及权限沿固定 Linux。pidfd 专用 namespace/info ioctl 和 CLONE_PIDFD 扩展另行接入。
 
-sh tests/host/pidfd.sh 检查最后角色撤号、64 字节分配类、旧身份引用、通知早于登记／休眠，以及回调期间最后关闭与存储归还；直接用户消费者为 tests/workloads/resource/pidfd.c，核对真实进程／线程退出、getfd、权限、信号和 proc 字段。
+sh tests/host/pidfd.sh 检查最后角色撤号、64 字节分配类、旧身份引用、通知早于登记／休眠，以及回调期间最后关闭与存储归还。真实 FD 表用例在授权与 pin 之间握手触发退出，检查表存储保留至短访问结束、NOFILE 错误顺序及失败 OFD owner；OFD 用例检查本地 poll、最后关闭及 epoll 通知路径。直接用户消费者为 tests/workloads/resource/pidfd.c，核对真实进程／线程退出、getfd、权限、信号和 proc 字段。
 wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
 退出队头仍有事件/等待/执行owner时，reaper返回BUSY；cleanup等待真实归还通知，不将待归还借用当作可立即回收的工作。
 PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cleanup；空索引不能代替页基线。

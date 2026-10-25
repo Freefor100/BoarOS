@@ -250,6 +250,8 @@ struct kernel_task {
     struct kernel_sem_request *sem_request;
     struct kernel_msg_request *msg_request;
     struct kernel_posix_cpu_sleep *cpu_sleep;
+    /* 远端只在查找真实OFD期间借files；退出先撤下访问资格再等待。 */
+    struct kernel_raw_lock files_access;
 } __attribute__((aligned(16)));
 
 #endif
