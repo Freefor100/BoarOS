@@ -255,9 +255,17 @@ static void rttime_index_only(void)
     assert(rt_checks==1&&cpu_samples==sampled&&!task.cpu_timer_index[1].indexed);
     assert(!task.storage_borrows&&pid.references==1);finish();
 }
+static void retired_kernel_worker(void)
+{
+    /* Kernel workers have no userspace limit owner, including at collection. */
+    struct kernel_task worker={.proc_exiting=1};
+    kernel_posix_timers_exit(&worker);
+    assert(!worker.cpu_timer_index[0].indexed && !worker.cpu_timer_index[1].indexed);
+    assert(!worker.limits && !live);
+}
 int main(void)
 {
-    rttime_index_only();cpu_sleep_owner();
+    retired_kernel_worker();rttime_index_only();cpu_sleep_owner();
     reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase and completion/delete owner passed");return 0;
 }

@@ -421,7 +421,7 @@ enum kernel_open_file_status kernel_open_file_create_epoll(
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_EPOLL;
     file->epoll = epoll;
-    file->open_flags = flags;
+    file->open_flags = 2U | flags;
     file->vfs_closed = 0U;
     epoll->file = file;
     file->credentials = kernel_credentials_get(kernel_credentials_current());

@@ -37,8 +37,10 @@ EXCLUDED(kernel_task_mm_borrow)
 #endif
 EXCLUDED(kernel_task_read_bytes)
 EXCLUDED(kernel_task_account_fault)
+#ifndef MM_TEST_EPOLL
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)
+#endif
 EXCLUDED(kernel_socket_destroy)
 EXCLUDED(kernel_socket_is_unix)
 EXCLUDED(kernel_socket_rights_changed)

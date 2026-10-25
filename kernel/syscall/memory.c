@@ -7,6 +7,7 @@
 #include <kernel/page.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
+#include <kernel/vfs.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -179,16 +180,6 @@ enum kernel_syscall_status syscall_handle_mmap(
             decoded->value = type_error;
             return KERNEL_SYSCALL_STATUS_OK;
         }
-        if (kernel_open_file_kind(file) !=
-            KERNEL_OPEN_FILE_KIND_REGULAR) {
-            /* Only regular files have an inode page-cache mapping. */
-            if (kernel_open_file_release(&file) !=
-                KERNEL_OPEN_FILE_STATUS_OK) {
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            }
-            decoded->value = -KERNEL_ENODEV;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
         status = kernel_mm_validate_file_private_mapping(
             mm,
             request->arguments[0],
@@ -201,17 +192,25 @@ enum kernel_syscall_status syscall_handle_mmap(
                 KERNEL_OPEN_FILE_STATUS_OK) {
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             }
-        } else if (!kernel_open_file_readable(file) ||
-                   ((flags & LINUX_MAP_TYPE_MASK) == LINUX_MAP_SHARED &&
-                    (protections & LINUX_PROT_WRITE) != 0U &&
-                    !kernel_open_file_writable(file))) {
-            if (kernel_open_file_release(&file) !=
-                KERNEL_OPEN_FILE_STATUS_OK) {
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            }
-            decoded->value = -KERNEL_EACCES;
-            return KERNEL_SYSCALL_STATUS_OK;
         } else {
+            const struct kernel_vfs_file *source=kernel_open_file_vfs_borrow(file);
+            /* mmap检查打开模式；epoll等对象没有read操作并不表示OFD无读权限。 */
+            uint32_t access_mode=kernel_open_file_flags(file)&3U;
+            int error=0;
+            if ((access_mode!=0U && access_mode!=2U) ||
+                ((flags & LINUX_MAP_TYPE_MASK)==LINUX_MAP_SHARED &&
+                 (protections & LINUX_PROT_WRITE) && access_mode!=1U && access_mode!=2U))
+                error=-KERNEL_EACCES;
+            else if ((protections & LINUX_PROT_EXEC) && source->mount && source->mount->noexec)
+                error=-KERNEL_EPERM;
+            else if (kernel_open_file_kind(file)!=KERNEL_OPEN_FILE_KIND_REGULAR)
+                error=-KERNEL_ENODEV;
+            if (error) {
+                if (kernel_open_file_release(&file)!=KERNEL_OPEN_FILE_STATUS_OK)
+                    return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+                decoded->value=error;
+                return KERNEL_SYSCALL_STATUS_OK;
+            }
             status = kernel_mm_mmap_file_private(
                 mm,
                 &file,

@@ -17,7 +17,7 @@ RV64、QEMU virt、单 hart；共用挂载/syscall 路径现也由 LA 的完整 
 `fs/namespace.c` 分别处理 remount、bind、move 和传播；`include/uapi/linux/mount.h`
 定义各自 flags。`ksys_umount` 先校验允许的 flags，再按 `UMOUNT_NOFOLLOW` 决定
 路径跟随；`do_umount` 的 expiry、lazy detach 和后端 force 是不同操作。
-BoarOS 当前只接受 `MS_RDONLY/MS_SILENT`，所有非零 umount flags 返回 `ENOTSUP`。
+当前支持的普通挂载属性与卸载范围统一见 [VFS 模块](../modules/vfs-ext4.md)。
 扩展仍未实现，非法 flags 与坏指针/路径的错误优先级也须随相应能力独立核对。
 绝对根挂载另有边界：固定 Linux 的 `do_umount` 在未请求 lazy detach 时进入
 `do_umount_root` 尝试只读重配置；BoarOS 的根挂载没有 parent/covered 边，
