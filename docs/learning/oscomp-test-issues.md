@@ -165,9 +165,9 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 
 | 项目 | 实际问题 | 当前状态／依据 |
 |---|---|---|
-| `madvise01`的扩展建议 | 五种基础操作通过；其余15种建议返回EINVAL，原程序记TCONF。 | 四配置各5/20。REMOVE、fork/dump策略、KSM/大页、FREE、COLD/PAGEOUT等为真实功能缺口；详见[本批结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。 |
+| `madvise01`的扩展建议 | 五种基础操作及DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK通过；其余11种建议返回EINVAL，原程序记TCONF。 | 四配置各9/20。REMOVE、dump策略、KSM/大页、FREE、COLD/PAGEOUT等为真实功能缺口；详见[本批结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。 |
 | `madvise02`的WILLNEED/EBADF项 | 固定源码`tcases_filter()`因历史swap-prefetch变更主动将该条标为skip，与这次实际syscall结果无关。 | 四配置12/13。另有FREE、KSM、WIPEONFORK等负向输入得到EINVAL；这些TPASS仅验证该输入的错误，不表示正向操作已实现。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/madvise/madvise02.c)。 |
 | 自有WILLNEED对照的swap配置 | 固定Linux在CONFIG_SWAP=n时对普通匿名/纯BSS的WILLNEED返回EBADF；LA原platform参考为SWAP=y，RV及BoarOS无swap，首次LA对照因此结果不同。 | madvise消费者使用独立`platform-noswap`的16 KiB LA参考缓存，保留原platform。不是替换官方libc/ELF，也不改变原测例判分。真实文件缓存装入、无PTE与最后unmap/close握手另有直接检查。 |
-| `shmctl01`的枚举前置查询 | 在`get_shm_idx_from_id()`先调用SHM_INFO(14)得到EINVAL；尚未进入随后SHM_STAT及attach/fork主体。 | 四配置准备TBROK，各0/1。当前SHM_INFO、SHM_STAT/ANY为内核查询缺口，独立于已实现的LOCK/UNLOCK。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/shmctl/shmctl01.c)。 |
+| `shmctl01`的枚举前置查询 | 原先在`get_shm_idx_from_id()`的SHM_INFO(14)返回EINVAL；INFO/STAT/ANY和最高槽返回值已接入。 | 第一阶段四配置均进入主体并12/12通过；包含20个子进程的附加、解除和fork统计。STAT_ANY及槽复用另由直接消费者验证，见[本阶段结果](oscomp-ltp-analysis.md#fork策略与shm查询原程序结果2026-10-25)。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/shmctl/shmctl01.c)。 |
 
 `shmctl02`的nobody输入问题统一列于前面的运行库和原盘依赖表。普通映射DONTNEED、私有COW与共享后备内容由直接程序验证；当前VDSO DONTNEED返回EINVAL，Linux特殊映射可重装，这是仍保留的内核兼容缺口。

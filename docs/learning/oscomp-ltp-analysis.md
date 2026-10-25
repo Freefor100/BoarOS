@@ -844,3 +844,20 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 两架构PID1均正常结束、最终heap-live=0；RV本批最少空闲内核栈2320字节。整次启动RV/LA约8.401/6.566秒，双架构并行。根盘、工具ext4、VFAT、scratch ext4共八个对象检查均返回0。默认交付内核恢复后与启动前保存副本SHA相同，原有交付文档修改保持原样。内核和输入、原ELF、judge身份、逐条输出、耗时及磁盘检查记录在`build/madvise-shm-20261025/original/`；运行盘检查后删除。一次合入前的准备因合入命令失败在运行原程序前终止，准备记录保留于`prepared-before-merge/`，不计入上述结果。
 
 12次固定性能对照、已补齐的上一轮最终SMP基线、control波动及共享MM未达项统一见[CPU成本](cpu-accounting-cost.md#madvise与shm_lock2026-10-25)。
+
+## Fork策略与SHM查询原程序结果：2026-10-25
+
+第一阶段在固定官方容器、原双盘QEMU命令下并行运行RV/LA，保留两种libc原ELF、参数、judge和内部时限。仅执行本轮相关四程序，全部无超时。
+
+| 原程序 | 每配置原judge | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms | 实际结果 |
+|---|---:|---:|---:|---:|---:|---|
+| madvise01 | 9/20 | 191 | 90 | 175 | 110 | 新增DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK四项PASS，共9项；11项扩展TCONF。 |
+| madvise02 | 12/13 | 139 | 97 | 226 | 182 | 12项负向检查PASS；原WILLNEED/EBADF分项仍由测例主动跳过。 |
+| shmctl01 | 12/12 | 177 | 133 | 192 | 140 | 已越过SHM_INFO/SHM_STAT准备，12项状态、fork附加/解除附加统计全部PASS。 |
+| shmctl02 | 0/1 | 63 | 43 | 63 | 42 | 仍在getpwnam(nobody)准备TBROK，未进入权限主体。 |
+
+每配置**33/46**，四配置合计**132/184**，相较基础madvise/SHM_LOCK批次每配置增加16个通过细项。分母由35变为46，是shmctl01从一个准备失败计数进入12个实际分项，原judge保留其原计数规则。16次程序执行中12次退出0，4次nobody准备退出2，未出现TFAIL或超时。
+
+`shmctl01`实际核对IPC_STAT和SHM_STAT一致、创建者/最后操作者和时间/权限字段，并在20个子进程attach、detach和fork继承前后比较nattch。这里的12/12来自原程序主体；自有SHM查询另覆盖STAT_ANY权限、槽复用/代次、真实驻留页、RMID延迟归还及用户复制EFAULT。fork策略同ELF直接消费者检查实际子地址空洞、子/孙进程清零、父内容和COW、tmpfs/ext4来源、SHM附件、纯BSS及远端父写入。
+
+两架构正常退出、最终heap-live=0，根盘和第二盘三分区共八对象检查均为0；默认交付已恢复并按保存SHA核对，原交付文档本地修改保持原样。细项、身份、judge与耗时见`build/staged-mm-mount-20261025/stage1/original/`，性能和共享MM下一阶段基线见[CPU成本](cpu-accounting-cost.md#fork策略与shm查询2026-10-25)。当前输入问题统一维护在[测例问题](oscomp-test-issues.md)。
