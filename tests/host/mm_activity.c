@@ -333,7 +333,8 @@ int main(void)
     assert(!kernel_mm_activate(&mm, kernel_context));
     assert(flushes == before_flush && instruction_sync == before_instructions);
     before_flush=flushes; before_instructions=instruction_sync;
-    assert(!kernel_mm_mprotect(&mm, 0x40000, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    /* Earlier modifier already made this read-only; exercise a real PTE change. */
+    assert(!kernel_mm_mprotect(&mm, 0x40000, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
     assert(flushes==before_flush+1 && instruction_sync==before_instructions);
     before_flush = flushes; before_instructions = instruction_sync;
     assert(!kernel_mm_activate(&mm, kernel_context));
