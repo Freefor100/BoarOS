@@ -11,7 +11,7 @@
 | `mm/shm.c` | 全局段表、`IPC_PRIVATE` 与命名 key 映射、代次 sequence、延迟销毁（`IPC_RMID`）与 `nattch` 引用计数 |
 | `kernel/syscall/shm.c` | 系统调用参数解码、用户指针有效性校验与 Linux ABI 返回值映射 |
 | `include/kernel/vma.h`、`mm/vma.c` | `KERNEL_VMA_KIND_SYSV_SHM` VMA 描述符定义与不合并（no-merge）约束 |
-| `include/kernel/mm.h`、`arch/riscv/mm.c` | `kernel_mm_shmat`/`kernel_mm_shmdt`、Sv39 共享按需缺页、fork 继承及 munmap/release 清理钩子 |
+| `include/kernel/mm.h`、`mm/mm.c` | `kernel_mm_shmat`/`kernel_mm_shmdt`、Sv39 共享按需缺页、fork 继承及 munmap/release 清理钩子 |
 | `tests/riscv/scale_main.c` | 裸机内核规模测试中的 SysV SHM 生命周期与多附加验证 |
 | `tests/diff-abi/shm.c` | 针对固定 Linux 参考内核的双侧差分 ABI 测试 |
 | `tests/userland/sysv_shm.h` | 真实 musl 用户态多进程 fork 与读写一致性验证 |
@@ -38,16 +38,24 @@
 
 `/proc/sysvipc/shm` 与 `IPC_STAT` 共用段描述符，并从实际 memory object 读取 resident 页数，按客机页尺寸换算为字节；当前没有 swap 后备。仍被附加持有的 RMID 段保留列表项及 `SHM_DEST`，最后释放后撤下。列表读取与其他 IPC 列表的共同规则见 [procfs 模块](procfs.md)。
 
+## 限额、用量与槽查询
+
+IPC_INFO 输出当前配置，SHM_INFO 输出真实活跃段数、按客机页尺寸取整的总页数和后备对象已驻留页数；两者返回最高活跃槽位，空表返回0。当前无swap，交换页数和交换尝试/成功次数均为0。已RMID但仍有附件的段继续计入，最后使用者释放后从统计撤下。
+
+IPC_STAT 按完整ID检查槽和代次；SHM_STAT/SHM_STAT_ANY按槽索引取得当前对象，返回带当前代次的完整ID。STAT执行访问位与CAP_IPC_OWNER检查，STAT_ANY按Linux提供与`/proc/sysvipc/shm`相同的枚举可见性。段表在既有CPU0控制位置受保护，查询先取得有界结构快照，用户复制在保护外完成；复制期间原段删除不会改变这次快照，短复制保留实际输出并返回EFAULT。
+
+SHM_LOCK/UNLOCK的真实UID账户、MEMLOCK和延迟归还见[MM模块](kernel-mm.md#madvise-与共享段锁定)。查询直接消费者为`tests/workloads/resource/shm_query.c`，宿主4/16 KiB页检查与锁定回归共用`tests/shm-lock-host.sh`。
+
 ## VMA 与架构集成
 
 命名 key 查找先检查已存在段、`CREAT|EXCL` 冲突及请求大小是否超过原段；`size=0` 可查找已有段。缺失 key 且无 `CREAT` 返回 `ENOENT`；只有新建段才检查 `SHMMIN/SHMMAX`。固定 ABI 依据为本地 `references/linux/ipc/shm.c` 的 `newseg`/`shm_more_checks` 与 `references/linux/ipc/util.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 - VMA 使用 `KERNEL_VMA_KIND_SYSV_SHM` 与 `KERNEL_VMA_FAULT_ANON_SHARED`。
 - `mm/vma.c` 的 `can_merge()` 显式禁止合并 SysV SHM VMA，确保各附加段的边界、起始地址与生命周期独立。
-- `mm/vma.c` 在成功插入、split、clone、remove/replace 和 destroy 时统一调用 attachment open/close；prepare 不改变引用，commit 不再分配。`nattch` 是已提交 VMA 片段数，不是每进程或每次 `shmat` 固定计一。临时 attachment owner 保住槽身份但不增加 `nattch`，所有权错误触发 fatal。
-- `shmdt` 从原始附加地址查找稳定 attachment，即使首段已撤销也能移除全部剩余片段；不会移除洞内被匿名、文件或其他 SHM 附加替换的新映射。fork 的 VMA clone 自动增引用，后续 fork OOM 经统一 destroy 回滚。
+- `mm/vma.c` 在成功插入、split、fork、remove/replace 和 destroy 时统一调用 attachment open/close；prepare 不改变引用，commit 不再分配。`nattch` 是已提交 VMA 片段数，不是每进程或每次 `shmat` 固定计一。临时 attachment owner 保住槽身份但不增加 `nattch`，所有权错误触发 fatal。
+- `shmdt` 从原始附加地址查找稳定 attachment，即使首段已撤销也能移除全部剩余片段；不会移除洞内被匿名、文件或其他 SHM 附加替换的新映射。fork 只为继承的 VMA 增引用，DONTFORK 片段不进入子 MM；后续 fork OOM 经统一 destroy 回滚。
 - `SHM_RDONLY` 的 VMA 上限为 RX，禁止经 `mprotect` 提升 WRITE；当前权限与上限分开，允许先降到 NONE 再恢复 READ。分裂和 fork 保留该限制。
-- `shared_anon_leaf()` 将 `KERNEL_VMA_KIND_SYSV_SHM` 视作共享叶子页表项，`kernel_mm_fork()` 克隆页表时共享 PTE 而不作写保护。
+- 页表 fork 的 SHARED 决定保留 SysV 共享叶的写权限；DONTFORK 对应 SKIP，既不创建子叶，也不对父叶施加 COW。
 
 ## 验证与回归
 

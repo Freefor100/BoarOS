@@ -1,6 +1,10 @@
 #ifndef BOAROS_ARCH_RISCV_SV39_H
 #define BOAROS_ARCH_RISCV_SV39_H
 
+#define RISCV_SV39_FORK_PRIVATE 0
+#define RISCV_SV39_FORK_SHARED 1
+#define RISCV_SV39_FORK_SKIP 2
+
 #include <kernel/physical_page.h>
 #include <kernel/mm_retire.h>
 #include <kernel/mm_prepare.h>
@@ -227,8 +231,9 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
     uint64_t *satp);
 
 /*
- * Build child tables that share owned user pages. shared_leaf identifies
- * pages whose writes must remain shared; all other pages use copy-on-write.
+ * Build child tables from owned user pages. fork_leaf returns PRIVATE for
+ * copy-on-write, SHARED for unchanged sharing, or SKIP to omit the leaf.
+ * Skipped and shared parent pages keep their original permissions.
  * The destination borrows the same kernel root entries as source. Parent
  * private leaves are committed to COW only after child construction;
  * after initialization, failure may leave destination as a LIVE owner for
@@ -237,7 +242,7 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source,
-    int (*shared_leaf)(void *context, uint64_t virtual_address),
+    int (*fork_leaf)(void *context, uint64_t virtual_address),
     void *context);
 
 /* Resolves only a present COW leaf; other mappings return NOT_MAPPED. */

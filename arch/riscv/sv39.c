@@ -2359,7 +2359,7 @@ static enum riscv_sv39_status share_user_leaf(
 
 static enum riscv_sv39_status commit_parent_cow(
     struct riscv_sv39_user_space *source,
-    int (*shared_leaf)(void *context, uint64_t virtual_address),
+    int (*fork_leaf)(void *context, uint64_t virtual_address),
     void *context)
 {
     uint64_t *root;
@@ -2411,8 +2411,8 @@ static enum riscv_sv39_status commit_parent_cow(
                     ((uint64_t)level0_index << BOAROS_PAGE_SHIFT);
 
                 if (entry == 0U) continue;
-                if (shared_leaf != 0 &&
-                    shared_leaf(context, virtual_address) != 0)
+                if (fork_leaf != 0 &&
+                    fork_leaf(context, virtual_address) != 0)
                     continue;
 
                 if (valid_user_leaf_entry(entry) &&
@@ -2437,7 +2437,7 @@ static enum riscv_sv39_status commit_parent_cow(
 enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source,
-    int (*shared_leaf)(void *context, uint64_t virtual_address),
+    int (*fork_leaf)(void *context, uint64_t virtual_address),
     void *context)
 {
     uint64_t *root;
@@ -2512,12 +2512,15 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
                                   ((uint64_t)level1_index << 21U) |
                                   ((uint64_t)level0_index <<
                                    BOAROS_PAGE_SHIFT);
+                int action = fork_leaf ? fork_leaf(context, virtual_address) : RISCV_SV39_FORK_PRIVATE;
+                if (action == RISCV_SV39_FORK_SKIP) continue;
+                if (action != RISCV_SV39_FORK_PRIVATE && action != RISCV_SV39_FORK_SHARED)
+                    return RISCV_SV39_STATUS_STATE;
                 status = share_user_leaf(destination,
                                          source,
                                          virtual_address,
                                          level0[level0_index],
-                                         shared_leaf != 0 &&
-                                         shared_leaf(context, virtual_address));
+                                         action == RISCV_SV39_FORK_SHARED);
                 if (status != RISCV_SV39_STATUS_OK) {
                     return status;
                 }
@@ -2529,11 +2532,11 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
 
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination, struct riscv_sv39_user_space *source,
-    int (*shared_leaf)(void *, uint64_t), void *context)
+    int (*fork_leaf)(void *, uint64_t), void *context)
 {
     enum riscv_sv39_status status = riscv_sv39_user_space_fork_prepare(
-        destination, source, shared_leaf, context);
-    return status == RISCV_SV39_STATUS_OK ? commit_parent_cow(source, shared_leaf, context) : status;
+        destination, source, fork_leaf, context);
+    return status == RISCV_SV39_STATUS_OK ? commit_parent_cow(source, fork_leaf, context) : status;
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_move(

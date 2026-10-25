@@ -28,13 +28,13 @@ static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1
 #define P BOAROS_PAGE_SIZE
 #define RW (KERNEL_MM_READ|KERNEL_MM_WRITE)
 #define BASE UINT64_C(0x400000)
-static unsigned fail_resize, fail_page, mm_gate_acquisitions;
+static unsigned fail_resize, fail_page, fail_page_after, mm_gate_acquisitions;
 void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 { if(lock->rank==25)mm_gate_acquisitions++;__real_kernel_rwlock_write(lock,guard); }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
-{ return fail_page ? PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out); }
+{ return fail_page || (fail_page_after && !--fail_page_after) ? PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out); }
 enum kernel_heap_status __real_kernel_heap_resize(struct kernel_heap *,void *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *h,void *old,size_t size,void **out)
 { return fail_resize ? KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_resize(h,old,size,out); }
@@ -62,6 +62,40 @@ int main(void)
         CHECK(!kernel_mm_acquire(&held, &mm));
     }
     CHECK(!kernel_mm_release(&held));
+    /* Fork policy controls actual child leaves and refs, not just a VMA flag. */
+    assert(!map(BASE,4*P,RW,0));
+    struct kernel_mm_mapping fork_page, original_page;
+    for(unsigned i=0;i<4;i++) {
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+        assert(!kernel_mm_lookup(&mm,BASE+i*P,&fork_page));
+        *(unsigned char *)(uintptr_t)fork_page.physical_address=(unsigned char)(60+i);
+    }
+    CHECK(!kernel_mm_madvise(&mm,BASE+P,P,10));
+    CHECK(!kernel_mm_madvise(&mm,BASE+2*P,P,18));
+    /* Other flag operations preserve fork policy and its data. */
+    CHECK(!kernel_mm_mlock(&mm,BASE,4*P,0));
+    CHECK(!kernel_mm_munlockall(&mm));
+    CHECK(!kernel_mm_lookup(&mm,BASE,&original_page));
+    struct kernel_mm child={0};
+    for(unsigned failure=1;failure<=3;failure++) {
+        fail_page_after=failure;CHECK(kernel_mm_fork(&child,&mm)==KERNEL_MM_STATUS_NO_MEMORY);fail_page_after=0;
+        CHECK(child.state==KERNEL_MM_EMPTY);
+        CHECK(!kernel_mm_lookup(&mm,BASE,&fork_page)&&fork_page.permissions==original_page.permissions&&
+              fork_page.physical_address==original_page.physical_address);
+    }
+    CHECK(!kernel_mm_fork(&child,&mm));
+    struct kernel_vma inherited;
+    CHECK(kernel_mm_vma_lookup(&child,BASE+P,&inherited)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(kernel_mm_lookup(&child,BASE+P,&fork_page)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_vma_lookup(&child,BASE+2*P,&inherited)&&
+        (inherited.flags&KERNEL_VMA_WIPEONFORK)&&!(inherited.flags&KERNEL_VMA_LOCK_MASK));
+    CHECK(kernel_mm_lookup(&child,BASE+2*P,&fork_page)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_resolve_user_fault(&child,BASE+2*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_lookup(&child,BASE+2*P,&fork_page)&&!*(unsigned char *)(uintptr_t)fork_page.physical_address);
+    CHECK(!kernel_mm_lookup(&mm,BASE+2*P,&fork_page)&&*(unsigned char *)(uintptr_t)fork_page.physical_address==62);
+    CHECK(!kernel_mm_lookup(&child,BASE,&fork_page)&&fork_page.physical_address==original_page.physical_address);
+    CHECK(!kernel_mm_release(&child));
+    CHECK(!kernel_mm_munmap(&mm,BASE,4*P));
     /* Discard PTEs without changing VMA identity, protection or AS/DATA usage. */
     assert(!map(BASE,3*P,RW,0));
     CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
@@ -259,11 +293,11 @@ int main(void)
     uint64_t moved=0;
     CHECK(kernel_mm_mremap(&mm,BASE,2*P,3*P,1,0,&moved)==-KERNEL_EAGAIN);
     CHECK(!kernel_mm_mprotect(&mm,BASE,P,0));
-    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&vma.lock_flags==3);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&vma.flags==3);
     CHECK(!kernel_mm_munlock(&mm,BASE,4*P));
     CHECK(!kernel_mm_mlockall(&mm,6));
     CHECK(map(BASE,4*P,RW,KERNEL_MM_MAP_LOCKED)==KERNEL_MM_STATUS_LOCK_LIMIT);
-    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&!vma.lock_flags);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&!vma.flags);
     CHECK(!kernel_mm_munlockall(&mm));
     assert(!kernel_mm_munmap(&mm,BASE+P,P));
     CHECK(kernel_mm_mlock(&mm,BASE,4*P,1)==-KERNEL_ENOMEM);

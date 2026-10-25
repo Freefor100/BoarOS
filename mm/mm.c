@@ -901,7 +901,7 @@ static enum kernel_mm_status clone_elf_sources(
         enum kernel_heap_status heap_status;
 
         if (source->source == 0 ||
-            kernel_vma_set_backing_in_use(source_record->vmas,
+            kernel_vma_set_backing_in_use(destination_record->vmas,
                                           source->source,
                                           &in_use) != KERNEL_VMA_STATUS_OK) {
             return KERNEL_MM_STATUS_STATE;
@@ -946,7 +946,7 @@ static enum kernel_mm_status clone_file_sources(
         if (source->file == 0) {
             continue;
         }
-        if (kernel_vma_set_backing_in_use(source_record->vmas,
+        if (kernel_vma_set_backing_in_use(destination_record->vmas,
                                           source->file,
                                           &in_use) !=
             KERNEL_VMA_STATUS_OK) {
@@ -1010,6 +1010,10 @@ static enum kernel_mm_status clone_shared_anon(
          source != 0; source = source->next) {
         struct kernel_mm_shared_anon *copy;
         enum kernel_heap_status status;
+        int used = 0;
+        if (kernel_vma_set_backing_in_use(destination_record->vmas, source->object, &used))
+            __builtin_trap();
+        if (!used) continue;
 
         status = kernel_heap_allocate_zeroed(destination_record->vma_heap,
                                               1U, sizeof(*copy),
@@ -1051,7 +1055,7 @@ static enum kernel_mm_status mutable_vma_record(
     struct kernel_mm *mm,
     struct kernel_mm_record **record);
 
-static int shared_anon_leaf(void *context, uint64_t virtual_address)
+static int fork_leaf_action(void *context, uint64_t virtual_address)
 {
     const struct kernel_vma_set *vmas = context;
     struct kernel_vma vma;
@@ -1060,9 +1064,10 @@ static int shared_anon_leaf(void *context, uint64_t virtual_address)
 
     if (status == KERNEL_VMA_STATUS_NOT_FOUND) return 0;
     if (status != KERNEL_VMA_STATUS_OK) __builtin_trap();
+    if (vma.flags & (KERNEL_VMA_DONTFORK | KERNEL_VMA_WIPEONFORK)) return ARCH_MMU_FORK_SKIP;
     return vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
            vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
-           vma.kind == KERNEL_VMA_KIND_SYSV_SHM;
+           vma.kind == KERNEL_VMA_KIND_SYSV_SHM ? ARCH_MMU_FORK_SHARED : ARCH_MMU_FORK_PRIVATE;
 }
 
 struct fork_file_guards {
@@ -1090,12 +1095,12 @@ static void sift_file_nodes(struct kernel_vfs_node **nodes,size_t root,size_t co
     }
 }
 static enum kernel_mm_status fork_file_guards_begin(struct kernel_mm_record *record,
-    struct fork_file_guards *owner)
+    struct kernel_mm_record *child, struct fork_file_guards *owner)
 {
-    if (!record->file_mappings) return KERNEL_MM_STATUS_OK;
+    if (!child->file_mappings) return KERNEL_MM_STATUS_OK;
     if (!kernel_lock_held(&record->operations.lock,1)) __builtin_trap();
     size_t count=0, bytes=sizeof(*owner->nodes)+sizeof(*owner->guards);
-    for (struct mm_file_mapping *m=record->file_mappings; m; m=m->next) {
+    for (struct mm_file_mapping *m=child->file_mappings; m; m=m->next) {
         if (++count > SIZE_MAX/bytes) return KERNEL_MM_STATUS_NO_MEMORY;
     }
     enum kernel_heap_status hs=kernel_heap_allocate_zeroed(record->vma_heap,count,bytes,(void **)&owner->nodes);
@@ -1104,7 +1109,7 @@ static enum kernel_mm_status fork_file_guards_begin(struct kernel_mm_record *rec
     owner->heap=record->vma_heap; owner->count=count;
     owner->guards=(void *)(owner->nodes+count);
     size_t index=0;
-    for (struct mm_file_mapping *m=record->file_mappings; m; m=m->next)
+    for (struct mm_file_mapping *m=child->file_mappings; m; m=m->next)
         owner->nodes[index++]=m->registration.node;
     /* MM gate固定来源和inode寿命；只借用，不增加一层对象引用。
      * 地址锁序用O(F log F)私有排序，避免源文件数平方的准备成本。 */
@@ -1187,7 +1192,7 @@ static enum kernel_mm_status mm_fork_impl(
      * intentionally the final fallible construction step.
      */
     if (source_record->vmas != 0) {
-        status = status_from_vma(kernel_vma_set_clone(
+        status = status_from_vma(kernel_vma_set_fork(
             source_record->vmas,
             &destination_record->vmas));
         if (status != KERNEL_MM_STATUS_OK) {
@@ -1210,7 +1215,6 @@ static enum kernel_mm_status mm_fork_impl(
                        : status;
         }
     }
-    if (destination_record->vmas) kernel_vma_set_clear_locks(destination_record->vmas);
     status = clone_shared_anon(source_record, destination_record);
     if (status == KERNEL_MM_STATUS_OK)
         status = clone_file_sources(source_record, destination_record);
@@ -1241,10 +1245,16 @@ static enum kernel_mm_status mm_fork_impl(
             destination_record->file_mappings = prepared;
         }
     }
+    uint32_t inherited_residents = 0;
+    for (struct mm_file_resident *page = source_record->file_residents; page; page = page->next)
+        if (!source_record->vmas || fork_leaf_action(source_record->vmas,page->address) != ARCH_MMU_FORK_SKIP)
+            inherited_residents++;
     if (status == KERNEL_MM_STATUS_OK)
-        status = reserve_file_residents(destination_record, source_record->resident_count);
+        status = reserve_file_residents(destination_record, inherited_residents);
     for (struct mm_file_resident *page = source_record->file_residents;
          page != 0 && status == KERNEL_MM_STATUS_OK; page = page->next) {
+        if (source_record->vmas && fork_leaf_action(source_record->vmas, page->address) == ARCH_MMU_FORK_SKIP)
+            continue;
         struct mm_file_resident *copy;
         enum kernel_heap_status hs = kernel_heap_allocate_zeroed(
             destination_record->vma_heap, 1U, sizeof(*copy), (void **)&copy);
@@ -1283,7 +1293,7 @@ static enum kernel_mm_status mm_fork_impl(
         return status;
     }
 
-    status=fork_file_guards_begin(source_record,&files);
+    status=fork_file_guards_begin(source_record,destination_record,&files);
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage=KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator=source->allocator;
@@ -1296,14 +1306,14 @@ static enum kernel_mm_status mm_fork_impl(
         return status;
     }
     backend_status = arch_mmu_user_space_fork_prepare(&destination_record->space,
-        &source_record->space, source_record->vmas ? shared_anon_leaf : 0, source_record->vmas);
+        &source_record->space, source_record->vmas ? fork_leaf_action : 0, source_record->vmas);
     if (backend_status == ARCH_MMU_STATUS_OK) {
         uint64_t cursor = 0, address;
         /* child尚未发布，遍历私有树不持MM raw；每次只提交一个父叶。 */
         while ((backend_status = arch_mmu_user_next_owned(&destination_record->space,
             &cursor, ARCH_MMU_USER_LIMIT, &address)) == ARCH_MMU_STATUS_OK) {
             /* 按VMA语义分类，不能把合法shared/protected页当作私有COW。 */
-            if (source_record->vmas && shared_anon_leaf(source_record->vmas, address)) continue;
+            if (source_record->vmas && fork_leaf_action(source_record->vmas, address) != ARCH_MMU_FORK_PRIVATE) continue;
             KERNEL_RAW_SCOPE(guard, &source_record->metadata);
             if (arch_mmu_user_mark_cow_page(&source_record->space, address) !=
                 ARCH_MMU_STATUS_OK) __builtin_trap();
@@ -2444,7 +2454,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     vma = (struct kernel_vma){
         .start = start,
         .end = end,
-        .lock_flags = mapping_lock_flags(record, flags),
+        .flags = mapping_lock_flags(record, flags),
         .backing_offset = 0U,
         .permissions = normalized,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
@@ -2698,7 +2708,7 @@ static enum kernel_mm_status commit_file_mapping(
     vma = (struct kernel_vma){
         .start = plan.start,
         .end = plan.end,
-        .lock_flags = mapping_lock_flags(record, flags),
+        .flags = mapping_lock_flags(record, flags),
         .backing_offset = file_offset,
         .permissions = plan.permissions,
         .kind = (flags & KERNEL_MM_MAP_SHARED) != 0U
@@ -2934,7 +2944,7 @@ enum kernel_mm_status kernel_mm_shmat(
         .permissions = normalized,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
             ((flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
-        .lock_flags = record->future_lock_flags,
+        .flags = record->future_lock_flags,
         .kind = KERNEL_VMA_KIND_SYSV_SHM,
         .role = KERNEL_VMA_ROLE_SYSV_SHM,
         .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
@@ -3167,7 +3177,7 @@ static enum kernel_mm_status mm_brk_impl(
                 .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                 .kind = KERNEL_VMA_KIND_ANONYMOUS,
                 .role = KERNEL_VMA_ROLE_HEAP,
-                .lock_flags = record->future_lock_flags,
+                .flags = record->future_lock_flags,
                 .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,
                 .backing = 0,
             });
@@ -3888,7 +3898,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     }
     if (new_size > old_size && !may_expand_current(record, &source, new_size - old_size))
         return -KERNEL_ENOMEM;
-    if (new_size > old_size && source.lock_flags && !may_lock_memory(record, new_size - old_size))
+    if (new_size > old_size && (source.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, new_size - old_size))
         return -KERNEL_EAGAIN;
     if (!(flags & 2U)) {
         int overlaps = 1;
@@ -3940,7 +3950,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     if (kernel_vma_set_commit_remap(record->vmas, &edit)) __builtin_trap();
     *result = new_address;
     mm_operation_end(&operation);
-    if (new_size > old_size && source.lock_flags == KERNEL_VMA_LOCKED)
+    if (new_size > old_size && (source.flags & KERNEL_VMA_LOCK_MASK) == KERNEL_VMA_LOCKED)
         (void)populate_locked(mm, new_address + old_size, new_address + new_size);
     return 0;
 }
@@ -4257,7 +4267,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
             record->stack_top - page > KERNEL_RLIMIT_STACK_CAP ||
             record->stack_top - page > kernel_task_current_stack_limit() ||
             !may_expand_current(record, &vma, vma.start - page) ||
-            (vma.lock_flags && !may_lock_memory(record, vma.start - page)))
+            ((vma.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, vma.start - page)))
             return KERNEL_MM_STATUS_NOT_MAPPED;
         int overlaps;
         /* 保持栈前的一页guard；下一VMA检索也阻止跨越已有映射。 */
@@ -4742,9 +4752,9 @@ static int lock_range(struct kernel_mm_record *record, uint64_t start, uint64_t 
         struct kernel_vma vma;
         if (kernel_vma_set_lookup(record->vmas, start, &vma)) return -KERNEL_ENOMEM;
         uint64_t finish = vma.end < end ? vma.end : end;
-        if (vma.role != KERNEL_VMA_ROLE_VDSO && vma.lock_flags != flags) {
+        if (vma.role != KERNEL_VMA_ROLE_VDSO && (vma.flags & KERNEL_VMA_LOCK_MASK) != flags) {
             struct kernel_vma_edit edit;
-            if (kernel_vma_set_prepare_lock(record->vmas, start, finish, flags, &edit)) return -KERNEL_ENOMEM;
+            if (kernel_vma_set_prepare_flags(record->vmas, start, finish, KERNEL_VMA_LOCK_MASK, flags, &edit)) return -KERNEL_ENOMEM;
             if (kernel_vma_set_commit_edit(record->vmas, &edit)) __builtin_trap();
         }
         start = finish;
@@ -4761,7 +4771,7 @@ static int populate_locked(struct kernel_mm *mm, uint64_t start, uint64_t end)
         if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
         struct kernel_vma vma;
         if (kernel_vma_set_lookup(operation.record->vmas, start, &vma)) return -KERNEL_ENOMEM;
-        if (vma.lock_flags != KERNEL_VMA_LOCKED) {
+        if ((vma.flags & KERNEL_VMA_LOCK_MASK) != KERNEL_VMA_LOCKED) {
             start = vma.end < end ? vma.end : end;
             block_reads = task ? kernel_task_read_bytes(task) : 0U;
             continue;
@@ -4855,10 +4865,46 @@ static int advise_file(struct mm_operation *operation, const struct kernel_vma *
     return 0;
 }
 
+static int advise_fork(struct kernel_mm_record *record, const struct kernel_vma *vma,
+    uint64_t address, uint64_t *end, int32_t advice)
+{
+    if (advice == KERNEL_MM_ADVICE_DOFORK && vma->role == KERNEL_VMA_ROLE_VDSO)
+        return -KERNEL_EINVAL;
+    if (advice == KERNEL_MM_ADVICE_WIPEONFORK) {
+        if (vma->role == KERNEL_VMA_ROLE_VDSO) return -KERNEL_EINVAL;
+        if (vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
+            /* ELF BSS has the same anonymous zero source as Linux. Keep the
+             * source recipe, but fork must not borrow the parent's pages. */
+            struct kernel_elf64_source *source = vma->backing;
+            uint64_t offset = vma->backing_offset + address - vma->start;
+            const struct kernel_elf64_source_run *run = 0;
+            for (uint32_t i = 0; i < kernel_elf64_source_run_count(source); i++) {
+                const struct kernel_elf64_source_run *candidate = kernel_elf64_source_run_at(source, i);
+                if (candidate->start <= offset && offset < candidate->end) { run = candidate; break; }
+            }
+            if (!run) __builtin_trap();
+            if (run->kind != KERNEL_ELF64_SOURCE_RUN_ZERO) return -KERNEL_EINVAL;
+            uint64_t finish = address + run->end - offset;
+            if (*end > finish) *end = finish;
+        } else if (vma->kind != KERNEL_VMA_KIND_ANONYMOUS) return -KERNEL_EINVAL;
+    }
+    uint32_t mask = advice == KERNEL_MM_ADVICE_DONTFORK || advice == KERNEL_MM_ADVICE_DOFORK ?
+        KERNEL_VMA_DONTFORK : KERNEL_VMA_WIPEONFORK;
+    uint32_t value = advice == KERNEL_MM_ADVICE_DONTFORK || advice == KERNEL_MM_ADVICE_WIPEONFORK ? mask : 0;
+    if ((vma->flags & mask) == value) return 0;
+    struct kernel_vma_edit edit;
+    enum kernel_vma_status status = kernel_vma_set_prepare_flags(record->vmas,address,*end,mask,value,&edit);
+    if (status == KERNEL_VMA_STATUS_NO_MEMORY) return -KERNEL_EAGAIN;
+    if (status || kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
+    return 0;
+}
+
 int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, int32_t advice)
 {
-    if (advice < KERNEL_MM_ADVICE_NORMAL || advice > KERNEL_MM_ADVICE_DONTNEED || (address & BOAROS_PAGE_MASK) ||
-        length > UINT64_MAX - BOAROS_PAGE_MASK) return -KERNEL_EINVAL;
+    int fork_policy = advice == KERNEL_MM_ADVICE_DONTFORK || advice == KERNEL_MM_ADVICE_DOFORK ||
+        advice == KERNEL_MM_ADVICE_WIPEONFORK || advice == KERNEL_MM_ADVICE_KEEPONFORK;
+    if ((!fork_policy && (advice < KERNEL_MM_ADVICE_NORMAL || advice > KERNEL_MM_ADVICE_DONTNEED)) ||
+        (address & BOAROS_PAGE_MASK) || length > UINT64_MAX - BOAROS_PAGE_MASK) return -KERNEL_EINVAL;
     uint64_t rounded = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
     if (rounded > UINT64_MAX - address) return -KERNEL_EINVAL;
     if (!length) return 0;
@@ -4881,10 +4927,11 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
         uint64_t finish = vma.end < end ? vma.end : end;
         int error = 0;
         if (advice == KERNEL_MM_ADVICE_DONTNEED) {
-            if (vma.lock_flags || vma.role == KERNEL_VMA_ROLE_VDSO) return -KERNEL_EINVAL;
+            if ((vma.flags & KERNEL_VMA_LOCKED) || vma.role == KERNEL_VMA_ROLE_VDSO) return -KERNEL_EINVAL;
             if (unmap_space_range(record, address, finish)) __builtin_trap();
         } else if (advice == KERNEL_MM_ADVICE_WILLNEED)
             error = advise_file(&operation, &vma, address, &finish, &budget);
+        else if (fork_policy) error = advise_fork(record, &vma, address, &finish, advice);
         /* NORMAL/RANDOM/SEQUENTIAL are advisory: keep the existing global
          * cache policy, validate the complete mapped range, and store no hint. */
         if (error) return error;
