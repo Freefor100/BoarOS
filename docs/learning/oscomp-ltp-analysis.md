@@ -796,3 +796,24 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 36次程序执行中24次退出0，12次在准备阶段退出2，无TFAIL或超时。数字身份、MEMLOCK额度/豁免、EFAULT/ENOMEM、ONFAULT、MAP_LOCKED、COW、fork/exec与共享MM等由同ELF直接程序独立验证。直接程序通过不替换原程序的失分和未进入步骤。
 
 两架构正常退出后检查root、工具ext4、VFAT和scratch ext4，共八个对象，检查均为0；RV最终heap-live=0，LA最终owner和heap检查正常。默认交付内核已恢复，兼容分支原有交付文档修改保持原样。原始逐项输出、ELF身份、judge、程序总耗时和磁盘检查保存在`build/memlock-20261025/original/`；完整用户可读性能结果见[CPU成本记录](cpu-accounting-cost.md#锁页memlock与mincore2026-10-25)。
+
+## 共享MM锁页与kcmp原程序结果：2026-10-25
+
+固定官方容器、原QEMU设备参数，RV/LA并行运行；两种libc继续使用原ELF、参数、judge及内部时限。默认单核、共享跳过表和监督参数保持当前设置。每配置六程序得分 **24/26**，合计 **96/104**；无超时。通用实现及成本见[共享MM与kcmp成本](cpu-accounting-cost.md#共享mm预装整理与kcmp2026-10-25)。
+
+每行分数在四配置相同；时间为程序自身总耗时ms，包含其准备和清理。
+
+| 原程序 | 每配置分数 | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms | 结果与位置 |
+|---|---:|---:|---:|---:|---:|---|
+| kcmp01 | 5/5 | 171 | 84 | 185 | 86 | 五项比较PASS。 |
+| kcmp02 | 6/6 | 111 | 64 | 70 | 64 | ESRCH、四项EINVAL和EBADF，共六项PASS。 |
+| kcmp03 | 2/4 | 63 | 63 | 67 | 63 | FS、SYSVSEM两项PASS；独立CLONE_VM在clone阶段EOPNOTSUPP，CLONE_IO在clone阶段EINVAL，各一项TFAIL。 |
+| pidfd_getfd01 | 1/1 | 64 | 62 | 66 | 65 | 共享OFD比较助手已进入并通过，原先的kcmp/ENOSYS准备阻塞已解除。 |
+| mlock201 | 8/8 | 85 | 66 | 84 | 65 | 8项PASS；立即装入与ONFAULT驻留数量均符合断言。 |
+| mincore02 | 2/2 | 64 | 62 | 63 | 63 | 2项PASS；4页驻留及锁定后查询通过。 |
+
+`kcmp03`的四个分项按原顺序分别为独立CLONE_VM、CLONE_FS、CLONE_IO、CLONE_SYSVSEM；后两类比较中IO本轮范围外，实际运行更早停在clone入口。这里保留真实内核能力缺口，没有将其归为输入故障。六类kcmp的对象身份、真实凭据、退出/exec和僵尸查询另由十项同ELF直接消费者验证。
+
+正常退出后，两架构根盘、工具ext4、VFAT及scratch ext4共八对象检查均为0。RV/LA整次启动约8.399/7.100秒，PID1状态0，最终heap-live=0；默认交付内核已恢复并按保存的SHA逐字节核对。运行副本清理后保留输入/ELF/内核身份、逐条输出、judge结果和必要日志于`build/mm-kcmp-20261025/original/`。
+
+原盘程序问题及当前处理统一维护在[测例问题](oscomp-test-issues.md)，包括kcmp03的clone范围和自有LA musl消费者的vfork入口差异。
