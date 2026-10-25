@@ -33,12 +33,36 @@ static uint64_t race_address;
 static uint64_t parallel_address[4];
 static unsigned population_capture, population_entered, population_release;
 static uint64_t population_start;
+static uint64_t batch_test_start;
+static unsigned batch_test_mode, batch_test_prefix, batch_test_syncs, batch_test_full, batch_test_local, batch_test_instructions;
+static void *batch_visible_fault(void *unused);
 static enum kernel_uaccess_status race_status[4];
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *pages, uint64_t *physical)
 {
     unsigned id = kernel_cpu_current()->hardware_id;
     struct kernel_lock_guard *held = kernel_io_context_current()->locks;
+    int fail_batch_access = 0;
+    if (pages == &allocator && batch_test_start && id == 0) {
+        struct kernel_mm_mapping first;
+        if (held && !held->write && !batch_test_prefix &&
+            !kernel_mm_lookup(&mm[0], batch_test_start, &first)) {
+            batch_test_prefix = 1;
+            assert(batch_test_syncs == (batch_test_mode == 4 ? 1U : 0U));
+            if (!batch_test_mode) {
+                done[2] = 0;
+                pthread_t peer;
+                assert(!pthread_create(&peer, 0, batch_visible_fault, 0));
+                assert(!pthread_join(peer, 0));
+                assert(done[2] && batch_test_local && !batch_test_syncs);
+            }
+            if (batch_test_mode == 1 || batch_test_mode == 2) return PHYSICAL_PAGE_STATUS_EMPTY;
+            fail_batch_access = batch_test_mode == 3;
+        } else if (!held && batch_test_prefix && (batch_test_mode == 1 || batch_test_mode == 2)) {
+            assert(batch_test_syncs == 1); /* prefix confirmed before pressure retry can wait */
+            if (batch_test_mode == 2) return PHYSICAL_PAGE_STATUS_EMPTY;
+        }
+    }
     if (pages == &allocator && id == 1 && held && held->lock->rank == 25 && !held->write &&
         __atomic_exchange_n(&population_capture, 0, __ATOMIC_ACQ_REL)) {
         assert(!kernel_cpu_current()->raw_locks);
@@ -52,6 +76,8 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
         while (!__atomic_load_n(&prepare_release, __ATOMIC_ACQUIRE)) sched_yield();
     }
     enum physical_page_status status = __real_physical_page_allocate(pages, physical);
+    if (status == PHYSICAL_PAGE_STATUS_OK && fail_batch_access)
+        __atomic_store_n(&fail_access_address, *physical, __ATOMIC_RELEASE);
     if (status == PHYSICAL_PAGE_STATUS_OK && pages == &allocator && !kernel_io_context_current()->locks &&
         __atomic_exchange_n(&fail_next_access, 0, __ATOMIC_ACQ_REL))
         __atomic_store_n(&fail_access_address, *physical, __ATOMIC_RELEASE);
@@ -71,19 +97,33 @@ void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
 void mm_test_fence(uint64_t v, int instructions)
 {
+    (void)v;
     assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (!instructions && population_start && kernel_cpu_current()->hardware_id == 1 &&
-        v == population_start + 16 * BOAROS_PAGE_SIZE) {
-        struct kernel_mm_mapping first;
-        assert(!kernel_mm_lookup(&mm[1], population_start, &first));
-        assert(!(first.permissions & KERNEL_MM_WRITE)); /* queued writer ran between bounded batches */
-    }
+    if (!instructions && batch_test_start && kernel_cpu_current()->hardware_id == 2)
+        batch_test_local++;
     if (!instructions && kernel_cpu_current()->hardware_id == 1 &&
         __atomic_load_n(&hold_fence, __ATOMIC_ACQUIRE)) {
         assert(!kernel_cpu_current()->raw_locks);
         __atomic_store_n(&fence_entered, 1, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&fence_release, __ATOMIC_ACQUIRE)) sched_yield();
     }
+}
+void riscv_smp_sync_user(uint32_t targets, uint64_t start, uint64_t length, int instructions)
+{
+    assert(!(targets & ~1U));
+    if (batch_test_start && kernel_cpu_current()->hardware_id == 0) {
+        batch_test_syncs++;
+        batch_test_instructions += instructions != 0;
+        if (!start && length == UINT64_MAX) batch_test_full++;
+    }
+    if (population_start && kernel_cpu_current()->hardware_id == 1 &&
+        start == population_start + 16 * BOAROS_PAGE_SIZE) {
+        struct kernel_mm_mapping first;
+        assert(!kernel_mm_lookup(&mm[1], population_start, &first));
+        assert(!(first.permissions & KERNEL_MM_WRITE));
+    }
+    mm_test_fence(length == BOAROS_PAGE_SIZE ? start : UINT64_MAX, 0);
+    if (instructions) mm_test_fence(0, 1);
 }
 static void *downgrade(void *unused)
 {
@@ -488,6 +528,38 @@ static void population_pressure(void)
     assert(physical_page_available(&allocator) == baseline);
     puts("MM population exhausts allocator then permits unlocked pressure progress and returns owners");
 }
+static void *batch_visible_fault(void *unused)
+{
+    (void)unused; mm_test_attach(2); mm_test_context = context;
+    assert(!kernel_mm_resolve_user_fault(&mm[2], batch_test_start, KERNEL_MM_WRITE));
+    __atomic_store_n(&done[2], 1, __ATOMIC_RELEASE);
+    return 0;
+}
+static void population_confirmation(void)
+{
+    for (unsigned mode = 0; mode < 5; mode++) {
+        uint64_t start = UINT64_C(0x100000000) + (uint64_t)mode * UINT64_C(0x40000000), mapped;
+        uint32_t permissions = KERNEL_MM_READ | (mode == 4 ? KERNEL_MM_EXECUTE : KERNEL_MM_WRITE);
+        assert(!kernel_mm_mmap_anonymous(&mm[0], start, 2 * BOAROS_PAGE_SIZE,
+            permissions, KERNEL_MM_MAP_FIXED, &mapped));
+        uint64_t baseline = physical_page_available(&allocator);
+        batch_test_start = start; batch_test_mode = mode;
+        batch_test_prefix = batch_test_syncs = batch_test_full = batch_test_local = batch_test_instructions = 0;
+        int status = kernel_mm_mlock(&mm[0], start, 2 * BOAROS_PAGE_SIZE, 0);
+        assert(status == (mode == 2 ? -KERNEL_EAGAIN : mode == 3 ? -KERNEL_ENOMEM : 0));
+        assert(batch_test_prefix && batch_test_full == 1);
+        assert(batch_test_instructions == (mode == 4 ? 2U : 0U));
+        assert(batch_test_syncs == (mode == 1 || mode == 4 ? 2U : 1U));
+        struct kernel_mm_mapping mapping;
+        assert(!kernel_mm_lookup(&mm[0], start, &mapping));
+        assert(kernel_mm_lookup(&mm[0], start + BOAROS_PAGE_SIZE, &mapping) ==
+            (mode == 2 || mode == 3 ? KERNEL_MM_STATUS_NOT_MAPPED : KERNEL_MM_STATUS_OK));
+        batch_test_start = 0;
+        assert(!kernel_mm_munmap(&mm[0], start, 2 * BOAROS_PAGE_SIZE));
+        assert(physical_page_available(&allocator) == baseline);
+    }
+    puts("MM new-page batch confirms before release/OOM/error; ordinary peer catches up and executable leaves sync immediately");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -562,6 +634,7 @@ int main(void)
     assert(kernel_mm_resolve_user_fault(&mm[0], unavailable_address, KERNEL_MM_WRITE) == KERNEL_MM_STATUS_PAGE_ACCESS);
     assert(physical_page_available(&allocator) == before_access);
     assert(!kernel_mm_munmap(&mm[0], unavailable_address, BOAROS_PAGE_SIZE));
+    population_confirmation();
     parallel_publication();
     population_batches();
     population_pressure();
