@@ -1,7 +1,7 @@
 /* The old completed work is shared verbatim with the resource-limit workload. */
-#define main resource_embedded_main
+#define RESOURCE_COST_EMBEDDED 1
 #include "rlimits-pidfd.c"
-#undef main
+#include <sys/mount.h>
 #ifndef MLOCK_ONFAULT
 #define MLOCK_ONFAULT 1
 #endif
@@ -62,7 +62,7 @@ int main(void)
 {
     unsigned mode,cpus;setvbuf(stdout,0,_IONBF,0);FILE *config=fopen("/account-resource","r");
     CHECK(config&&fscanf(config,"%u %u",&mode,&cpus)==2&&!fclose(config)&&mode<=1&&(cpus==1||cpus==2||cpus==4));queue_pin(0);
-    if(mode)memlock_new(cpus);else {mm_msg_old(cpus);mm_msg_memory();resource_file();}
+    if(mode){CHECK(!mkdir("/proc",0755)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0));memlock_new(cpus);}else {mm_msg_old(cpus);mm_msg_memory();resource_file();}
     printf("MEMLOCK-PERF END %u\n",mm_msg_metrics);
     if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }

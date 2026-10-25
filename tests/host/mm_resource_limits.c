@@ -245,7 +245,16 @@ int main(void)
     CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_munmap(&mm,BASE,4*P));
     memlock_limit=0;CHECK(kernel_mm_mlock(&mm,0,0,0)==-KERNEL_EPERM);
     CHECK(map(BASE,P,RW,KERNEL_MM_MAP_LOCKED)==KERNEL_MM_STATUS_LOCK_PERMISSION);
-    memlock_limit=UINT64_MAX;
+    memlock_limit=P;CHECK(!kernel_mm_mlockall(&mm,6));
+    CHECK(!kernel_mm_brk(&mm,0x10000+P,&result)&&result==0x10000+P);
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==P);
+    CHECK(!kernel_mm_brk(&mm,0x10000+2*P,&result)&&result==0x10000+P);
+    CHECK(!kernel_mm_brk(&mm,0x10000,&result)&&!kernel_mm_munlockall(&mm));
+    memlock_limit=4*P;CHECK(!kernel_mm_mlock(&mm,top-4*P,4*P,1));
+    CHECK(kernel_mm_resolve_user_fault(&mm,top-5*P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    memlock_limit=5*P;CHECK(!kernel_mm_resolve_user_fault(&mm,top-5*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==5*P);
+    CHECK(!kernel_mm_munlockall(&mm));memlock_limit=UINT64_MAX;
     mm_test_context=0; assert(!kernel_mm_release(&mm));
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     CHECK(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);
