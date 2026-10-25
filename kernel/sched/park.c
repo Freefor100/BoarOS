@@ -400,9 +400,7 @@ enum kernel_scheduler_status kernel_wait_node_move_locked(struct kernel_wait_nod
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     struct kernel_wait_token token = {node->task, node->generation};
     if (queue->closed) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    if (!node->queue || !matches(&token) ||
-        kernel_wait_record_of(node->task)->phase == KERNEL_WAIT_NOTIFIED)
-        return KERNEL_SCHEDULER_STATUS_EMPTY;
+    if (!node->queue || !matches(&token)) return KERNEL_SCHEDULER_STATUS_EMPTY;
     /* 调用者先归还游标node借用，另借task覆盖重查与移动；不把旧队列的
      * retired_next/borrow_owner带进新队列，也不拆开可见的登记位置。 */
     if (node->references || node->retired_next) __builtin_trap();

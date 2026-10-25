@@ -76,7 +76,7 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=entry->expected)result=-KERNEL_EAGAIN;
             else {
                 KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-                if(kernel_wait_node_bind_locked(&bucket->waiters,&entry->node,&request.token))__builtin_trap();
+                futex_bind_entry_locked(&bucket->waiters,entry,&request.token);
             }
             kernel_lock_release(&guard);kernel_mm_unpin_user_page(&pin);
             if(result || consumed(&request)>=0)break;

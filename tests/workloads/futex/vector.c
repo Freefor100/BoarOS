@@ -84,9 +84,22 @@ static void vector_signal(void)
     CHECK(syscall(SYS_futex,&word,1|128,1,0,0,0)==1);vector_join(t,&j);CHECK(j.result==0);
     puts("FUTEX-VECTOR CASE signal-and-restart PASS");
 }
+static void requeue_abi(void)
+{
+    uint32_t source=0,target=0;
+    ERROR(syscall(SYS_futex,&source,12|128,0,0,&target,0),EINVAL);
+    CHECK(syscall(SYS_futex,&source,12|128,1,0,&target,0)==0);
+    ERROR(syscall(SYS_futex,&source,12|128,1,0,(void *)0,0),EFAULT);
+    ERROR(syscall(SYS_futex,&source,12|128,1,0,(void *)0,1),EAGAIN);
+    ERROR(syscall(SYS_futex,&source,12|128,1,0,&source,0),EINVAL);
+    ERROR(syscall(SYS_futex,&source,11|128,1,0,&target,0),EAGAIN);
+    struct timespec past={0};ERROR(syscall(SYS_futex,&source,11|128,0,&past,&target,0),ETIMEDOUT);
+    puts("FUTEX-VECTOR CASE pi-requeue-abi PASS");
+}
+#include "requeue_cases.h"
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);alarm(20);mkdir("/proc",0755);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);
-    vector_abi();vector_wakes();vector_shared_exit();vector_signal();
-    puts("FUTEX-VECTOR END 4");alarm(0);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
+    vector_abi();vector_wakes();vector_shared_exit();vector_signal();requeue_abi();requeue_handoffs();requeue_mixed();requeue_signal_timeout();requeue_faults_and_exit();requeue_partial();
+    puts("FUTEX-VECTOR END 10");alarm(0);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }

@@ -343,6 +343,12 @@ static void wake_batches(void)
     synthetic[0].wait.reason = KERNEL_WAIT_TIMEOUT;
     assert(measured_wake(source, 1) == 1);
     synthetic_remove(1);
+    synthetic_add(1,&key);
+    synthetic[0].wait.phase=KERNEL_WAIT_NOTIFIED;
+    synthetic[0].wait.reason=KERNEL_WAIT_TIMEOUT;
+    assert(call(source,3|128,0,1,target,0)==1);
+    assert(call(target,1|128,1,0,0,0)==1);
+    synthetic_remove(1);
 }
 static void operations(void)
 {
@@ -574,6 +580,20 @@ static void shared_wake(void)
     assert(!pthread_join(worker, 0) && w.result == 0);
     assert(!futex_queue->borrows && !futex_queue->registrations);
 }
+static void partial_requeue_backing(void)
+{
+    put(source,0);put(cold_target,0);
+    struct waiter w={.id=1,.bitset=1,.address=source,.result=-99,.operation=9};
+    unsigned before=mm_test_parked(1);pthread_t thread;
+    assert(!pthread_create(&thread,0,waiter,&w));queued(1,before);
+    struct kernel_futex_key key;
+    assert(!kernel_mm_prepare_futex(&mm,&source,1,1,0,0,&key,0));
+    synthetic_add(1,&key);synthetic_entries[0].kind=FUTEX_ENTRY_REQUEUE_PI;
+    assert(call(source,3,0,2,cold_target,0)==-KERNEL_EINVAL);
+    synthetic_remove(1);futex_key_release(&key);
+    assert(call(cold_target,1,1,0,0,0)==1);
+    assert(!pthread_join(thread,0)&&w.result==0);
+}
 extern int64_t kernel_futex_waitv(struct kernel_task *,uint64_t,unsigned,unsigned,uint64_t,int,
     enum kernel_scheduler_status *);
 static int64_t vector_call(uint64_t address,unsigned count,unsigned flags,uint64_t timeout,int clock)
@@ -679,7 +699,7 @@ int main(void)
     notification_batch();
     wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
     requeue(target); requeue(source + 1024); comparisons();
-    opposite(target); opposite(source + 1024); coherent_remap(); shared_wake();
+    opposite(target); opposite(source + 1024); coherent_remap(); shared_wake();partial_requeue_backing();
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
@@ -692,3 +712,8 @@ int futex_pi_conflict_locked(struct futex_bucket *bucket,const struct kernel_fut
 { (void)bucket;(void)key;abort(); }
 int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t operation,uint64_t timeout,enum kernel_scheduler_status *status)
 { (void)task;(void)address;(void)operation;(void)timeout;(void)status;abort(); }
+
+int64_t kernel_futex_wait_requeue_pi(struct kernel_task *t,uint64_t a,uint32_t o,uint32_t v,uint64_t d,uint64_t b,enum kernel_scheduler_status *s)
+{(void)t;(void)a;(void)o;(void)v;(void)d;(void)b;(void)s;abort();}
+int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *t,uint64_t a,uint32_t o,uint32_t w,uint32_t n,uint64_t b,uint32_t v,enum kernel_scheduler_status *s)
+{(void)t;(void)a;(void)o;(void)w;(void)n;(void)b;(void)v;(void)s;abort();}

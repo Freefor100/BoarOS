@@ -2718,3 +2718,7 @@ test-rt-limits-host:
 .PHONY: test-pi-priority-host
 test-pi-priority-host:
 	sh tests/pi-priority-host.sh
+
+.PHONY: test-pi-exit-host
+test-pi-exit-host:
+	sh tests/pi-exit-host.sh
