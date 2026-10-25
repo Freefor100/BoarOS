@@ -72,6 +72,16 @@ static void vector_shared_exit(void)
     }
     CHECK(!munmap(words,4096));puts("FUTEX-VECTOR CASE shared-fork-forced-exit PASS");
 }
+static void vector_file_alias(void)
+{
+    size_t page=(size_t)sysconf(_SC_PAGESIZE);int fd=open("/waitv-backing",O_CREAT|O_EXCL|O_RDWR,0600);CHECK(fd>=0&&!ftruncate(fd,page));
+    uint32_t *a=mmap(0,page,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0),*b=mmap(0,page,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    CHECK(a!=MAP_FAILED&&b!=MAP_FAILED);*a=7;CHECK(*b==7);
+    struct waitv_item v[2]={item(a,7,0),item(b,7,0)};struct vector_job j={.v=v,.count=2};pthread_t t=vector_start(&j);
+    CHECK(!munmap(a,page)&&!unlink("/waitv-backing")&&!close(fd));
+    long n=syscall(SYS_futex,b,1,2,0,0,0);CHECK(n>=1&&n<=2);vector_join(t,&j);CHECK(j.result==0||j.result==1);
+    CHECK(*b==7&&!munmap(b,page));puts("FUTEX-VECTOR CASE file-alias-unmap-unlink PASS");
+}
 static void vector_signal(void)
 {
     uint32_t word=0;struct waitv_item v=item(&word,0,1);
@@ -100,6 +110,6 @@ static void requeue_abi(void)
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);alarm(20);mkdir("/proc",0755);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);
-    vector_abi();vector_wakes();vector_shared_exit();vector_signal();requeue_abi();requeue_handoffs();requeue_mixed();requeue_signal_timeout();requeue_faults_and_exit();requeue_partial();
-    puts("FUTEX-VECTOR END 10");alarm(0);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
+    vector_abi();vector_wakes();vector_shared_exit();vector_signal();requeue_abi();requeue_handoffs();requeue_mixed();requeue_signal_timeout();requeue_faults_and_exit();requeue_partial();vector_file_alias();
+    puts("FUTEX-VECTOR END 11");alarm(0);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }
