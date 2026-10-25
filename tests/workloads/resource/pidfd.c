@@ -30,6 +30,15 @@ static unsigned cases;
 static void pass(const char *s){cases++;printf("PIDFD CASE %s PASS\n",s);}
 static void token(int fd,char value){CHECK(write(fd,&value,1)==1);}
 static void expect(int fd,char value){char b;CHECK(read(fd,&b,1)==1 && b==value);}
+static void identity_queries(uid_t uid,gid_t gid)
+{
+    const unsigned numbers[]={SYS_getuid,SYS_geteuid,SYS_getgid,SYS_getegid};
+    for(unsigned i=0;i<4;i++)
+        CHECK(syscall(numbers[i],UINT64_MAX,UINT64_MAX,UINT64_MAX,
+            UINT64_MAX,UINT64_MAX,UINT64_MAX)==(long)(i<2?uid:gid));
+    CHECK(syscall(SYS_getpid,UINT64_MAX)==getpid());
+    CHECK(syscall(SYS_gettid,UINT64_MAX)==getpid());
+}
 static volatile sig_atomic_t proc_payload;
 static void proc_handler(int sig,siginfo_t *info,void *context)
 {if(sig==SIGUSR1 && info && context && info->si_code==SI_QUEUE)proc_payload=info->si_value.sival_int;}
@@ -70,6 +79,7 @@ static void fdinfo(int fd,int expected)
 }
 static void abi(void)
 {
+    identity_queries(0,0);
     ERROR(OPEN(0,0),EINVAL);ERROR(OPEN(-1,0),EINVAL);
     ERROR(OPEN(getpid(),1),EINVAL);ERROR(OPEN(0,1),EINVAL);
     ERROR(SEND(-1,0,0,3),EINVAL);ERROR(SEND(-1,0,0,0),EBADF);
@@ -186,6 +196,7 @@ static void permissions(int file)
     pid_t parent=getpid(),child=fork();CHECK(child>=0);
     if(!child) {
         CHECK(!setgroups(0,0) && !setgid(1001) && !setuid(1001));
+        identity_queries(1001,1001);CHECK(getppid()==parent);
         int target=(int)OPEN(parent,0);CHECK(target>=0);
         ERROR(GETFD(target,file,0),EPERM);ERROR(SEND(target,0,0,0),EPERM);
         int own=(int)OPEN(getpid(),0);CHECK(own>=0);
