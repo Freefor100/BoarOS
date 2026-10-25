@@ -1464,7 +1464,8 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
         current->magic != KERNEL_THREAD_MAGIC) {
         return;
     }
-    scheduler_rt_watchdog_locked(current,kernel_tick_count());
+    if (current->scheduling.priority)
+        scheduler_rt_watchdog_locked(current,kernel_tick_count());
     (void)from_user; /* 用户/内核CPU时间仍由执行边界结算。 */
 }
 
