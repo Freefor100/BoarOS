@@ -373,6 +373,15 @@ static struct kernel_signal_table *signal_table_of(
     return table;
 }
 
+uint64_t kernel_signal_identity_locked(const struct kernel_task *task)
+{
+    const struct kernel_signal_table *table=signal_table_of(task);
+    if (table) return table->identity;
+    const struct kernel_pid *id=process_identity(task,KERNEL_PID_TID);
+    if (!id) __builtin_trap();
+    return id->generation;
+}
+
 static const struct kernel_signal_action *signal_action_of(
     const struct kernel_task *task,
     uint32_t sig)
@@ -418,6 +427,7 @@ static enum kernel_signal_status signal_alloc_table(
     kernel_wait_queue_init(&table->signalfd_waiters);
     /* 远端发送者在同一保护下取得已完整初始化的信号状态。 */
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+      table->identity=kernel_signal_identity_locked(task);
       task->signal_table_address = (uintptr_t)page; }
     return KERNEL_SIGNAL_STATUS_OK;
 }
@@ -429,18 +439,15 @@ enum kernel_signal_status kernel_signal_release_table(
     uint64_t physical_address;
     void *page;
 
-    if (task == 0 || task->signal_table_address == 0U) {
-        return KERNEL_SIGNAL_STATUS_OK;
-    }
-    page = (void *)task->signal_table_address;
-    table = signal_table_of(task);
-    if (table == 0 || table->references == 0U) {
-        return KERNEL_SIGNAL_STATUS_INVALID_STATE;
-    }
-    if (table->references > 1U) {
-        table->references--;
-        task->signal_table_address = 0U;
-        return KERNEL_SIGNAL_STATUS_OK;
+    if (!task) return KERNEL_SIGNAL_STATUS_OK;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (!task->signal_table_address) return KERNEL_SIGNAL_STATUS_OK;
+        page=(void *)task->signal_table_address;
+        table=signal_table_of(task);
+        if (!table || !table->references) return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+        task->signal_table_address=0;
+        if (--table->references) return KERNEL_SIGNAL_STATUS_OK;
     }
     if (arch_direct_map_va_to_pa((uintptr_t)page,
                                   BOAROS_PAGE_SIZE,
@@ -586,6 +593,7 @@ enum kernel_signal_status kernel_signal_fork(
         child_table->magic=KERNEL_SIGNAL_TABLE_MAGIC;
         memcpy(child_table->actions,parent_table->actions,sizeof(child_table->actions));
     }
+    child_table->identity=process_identity(child,KERNEL_PID_TID)->generation;
     child_table->references = 1U;
     kernel_wait_queue_init(&child_table->signalfd_waiters);
     child->signal_table_address = (uintptr_t)child_table;

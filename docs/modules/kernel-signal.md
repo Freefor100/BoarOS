@@ -14,7 +14,7 @@
 
 ## 状态与生命周期
 
-每个线程使用 64 位 pending/blocked 位图，位 `sig-1` 对应信号；组长另持进程定向 pending。重复标准信号合并并保留首个 sender，handler 由一个未屏蔽成员执行。disposition 表按需分配一页并在组内引用共享；fork 复制当时的表和调用线程 mask，清空 child pending。exec 收拢组后重置自定义 handler，保留忽略 disposition、mask 和仍有效 pending。SIGKILL/SIGSTOP 不能捕获、忽略或阻塞。
+每个线程使用 64 位 pending/blocked 位图，位 `sig-1` 对应信号；组长另持进程定向 pending。重复标准信号合并并保留首个 sender，handler 由一个未屏蔽成员执行。disposition 表按需分配一页并在组内引用共享；fork 复制当时的表和调用线程 mask，清空 child pending。未分配表的独立任务以出生 PID 代次表示 SIGHAND 身份，分配后在表尾继承该值，线程共享沿用同一身份；两个空表指针不代表共享。信号表引用保留到任务身份已撤下且存储借用结束，因而僵尸仍保留 SIGHAND 身份；最终 collector 在锁外完成等待源关闭与页面归还。exec 收拢组后重置自定义 handler，保留忽略 disposition、mask 和仍有效 pending。SIGKILL/SIGSTOP 不能捕获、忽略或阻塞。
 
 `SA_RESETHAND` 在交付时只将处理动作恢复为默认值，保留已登记的 action flags 和 mask，后续 rt_sigaction 查询仍可观察这些设置。
 

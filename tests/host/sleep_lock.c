@@ -390,8 +390,14 @@ static void queued_spin_owner_case(enum spin_owner_case kind,unsigned expire,uin
         assert(!pthread_create(&prior,NULL,worker,(void *)(uintptr_t)1));queued(1);
     }
     assert(!pthread_create(&thread,NULL,spin_budget_waiter,NULL));queued(kind==SPIN_NOT_HEAD?2:1);
-    while(!__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE))sched_yield();
-    __atomic_store_n(&spin_clock_resume,1,__ATOMIC_RELEASE);
+    if(kind==SPIN_NOT_HEAD) {
+        while(!__atomic_load_n(&parked[0],__ATOMIC_ACQUIRE) &&
+              !__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE))sched_yield();
+        assert(parked[0] && !spin_clock_entered);
+    } else {
+        while(!__atomic_load_n(&spin_clock_entered,__ATOMIC_ACQUIRE))sched_yield();
+        __atomic_store_n(&spin_clock_resume,1,__ATOMIC_RELEASE);
+    }
     if(spin_long_expected) {
         while(!__atomic_load_n(&spin_long_seen,__ATOMIC_ACQUIRE) &&
               !__atomic_load_n(&parked[0],__ATOMIC_ACQUIRE))sched_yield();
@@ -455,7 +461,7 @@ int main(void)
             queued_spin_owner_case(kind,0,irq);
         queued_spin_owner_case(SPIN_REMOTE_RUNNING,1,irq);
     }
-    puts("sleep lock: only FIFO head behind a remote running writer receives extended budget; blocked/ready/same-CPU/readers/queued predecessors retain base; extended wait expires and all owners return");
+    puts("sleep lock: queued writers park without spinning; FIFO head behind a remote running writer receives extended budget; blocked/ready/same-CPU/readers retain base; all owners return");
     puts("sleep lock: queued grant avoids park/MM switch; 50us expiry and real single-CPU inventory retain sleeping path; IRQ, final notifier borrow and owners preserved");
     puts("sleep lock: deterministic FIFO writer boundary, reserved grants and 1/8/32 waiters passed");
 }

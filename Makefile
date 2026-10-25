@@ -377,6 +377,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
 	kernel/sched/pidfd.c \
+	kernel/sched/kcmp.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \

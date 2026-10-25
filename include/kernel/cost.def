@@ -307,3 +307,9 @@ X(SCHED_IPI_SENDS, sched_ipi_sends, count, 0)
 X(SCHED_IPI_TICKS, sched_ipi_ticks, ticks, 0)
 X(FD_TABLE_WAIT, fd_table_wait, ticks, 0)
 X(FD_TABLE_HOLD, fd_table_hold, ticks, 0)
+
+/* Bounded shared-MM prefault investigation; compiled out of production. */
+X(MM_PAGE_ALLOC_TICKS, mm_page_alloc_ticks, ticks, 0)
+X(MM_SYNC_TICKS, mm_sync_ticks, ticks, 0)
+X(LOCK_SPIN_TICKS, lock_spin_ticks, ticks, 0)
+X(LOCK_GRANT_RUN_TICKS, lock_grant_run_ticks, ticks, 1)

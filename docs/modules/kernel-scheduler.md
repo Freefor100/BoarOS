@@ -82,7 +82,7 @@ finish每段最多摘16个登记，未借用的小批登记可在同一保护下
 未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束、pending摘除及重新取得对象raw，覆盖通知者的最后访问。
 FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
 已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。
-实际在线至少两CPU时，已登记的争用者在锁外恢复入口IRQ状态，短时间轮询自己的release/acquire资格标记。基础上限为50µs；仅FIFO队首且独占writer对应另一在线CPU的RUNNING/on_cpu任务时，上限为1ms。CPU/current只用于当时的预算提示，锁外不保留或解引用该任务；任务随后阻塞或切换仍受同一个绝对截止约束。到界沿原park路径等待，提前通知直接完成；单次取得只使用一次预算。默认UP构建消去此路径，SMP内核仅启动一CPU时也直接park。
+排在其他等待者之后的写者直接 park：下一次释放不会给它资格，因此不扫描运行 CPU，也不主动自旋。其余已登记争用者在实际在线至少两 CPU 时，在锁外恢复入口 IRQ 状态，短时间轮询自己的 release/acquire 资格标记。基础上限为50µs；仅FIFO队首且独占writer对应另一在线CPU的RUNNING/on_cpu任务时，上限为1ms。CPU/current只用于当时的预算提示，锁外不保留或解引用该任务；任务随后阻塞或切换仍受同一个绝对截止约束。到界沿原park路径等待，提前通知直接完成；单次取得只使用一次预算。默认UP构建消去此路径，SMP内核仅启动一CPU时也直接park。
 通知不等于资格：额外唤醒只更新等待token，不重排FIFO；旧登记结束与重取对象raw之间也允许授资格。guard的rank/key和任务owner
 保持原契约；等待仍不可中断，没有新增timed/interruptible API。
 
@@ -188,6 +188,14 @@ locked变体仅供已持调度域的短操作使用。借用不固定MM、文件
 父子链在实际插入、移除和收养当前节点时检查相邻连接与首尾 owner，不在退出或 reparent 前扫描整条链。`children_epoch` 继续供 wait 选择在成员变化后重查。组遍历持有实际成员的存储引用，成员代次变化时重新从组长开始；proc 调度/身份值受域保护，MM/TTY 内容仍按单 CPU 业务契约读取。
 
 join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
+
+### kcmp
+
+RV64/LA64 的 kcmp(272) 在发起 CPU 比较 FILE、VM、FILES、FS、SIGHAND 和 SYSVSEM；同对象返回 0，不同对象返回可用于排序的 1/2。启动时从已有随机源取得每类置换键，以异或和奇数乘法隐藏内核地址顺序。查找按实际 PID/TID 取得任务存储借用，先检查双方 REALCREDS、dumpable 和 capability 子集，再判断 type 和 FD；PID 已回收返回 ESRCH，有身份的僵尸仍可比较。IO/EPOLL_TFD 返回 EOPNOTSUPP，非法 type 返回 EINVAL，FILE 的 ulong 索引按 Linux 原生 unsigned int 宽度截断。
+
+每任务 files_access 的短访问同时覆盖远端资源比较：两目标按地址排序，同目标只取一次；FS 在 VFS 状态保护内读取，其余身份在调度域内读取。FILE 再按地址排序取得真实文件表的槽锁，在调度域重新核对双方 PID/TID 和权限后直接比较槽持有的 OFD，dup/fork 保持相等，重新 open 同 inode 则不同。查询无需创建整表或 OFD 临时 owner，也不触发最后 close 或后端工作。退出先发布 proc_exiting，再在调度域外等待短访问结束，由原 owner 释放资源；僵尸 VM/FILES/FS/SYSVSEM 比较空资源，SIGHAND 寿命见[信号状态](kernel-signal.md#状态与生命周期)。SEM_UNDO 尚未建立时按真实 NULL 比较，CLONE_SYSVSEM 在子任务发布前建立并共享撤销组。
+
+`sh tests/host/kcmp.sh` 检查锁序、真实 OFD 槽、懒分配身份、权限复核和退出等待；`tests/workloads/resource/kcmp.c` 用管道握手覆盖 fork、CLONE_FS、pthread、vfork、SEM_UNDO 最后共享者、真实/文件系统凭据差异、非组长 exec、僵尸与 PID 回收。clone 支持组合仍按本模块原范围。
 
 ### pidfd
 

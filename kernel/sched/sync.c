@@ -42,6 +42,9 @@ static __attribute__((noinline)) void register_waiter(struct kernel_rwlock *lock
 #if BOAROS_MAX_CPUS > 1
 static uint64_t queued_spin_budget(struct kernel_rwlock *lock,struct kernel_lock_waiter *waiter)
 {
+    /* A later writer cannot use the next grant. Park immediately instead of
+     * burning its CPU and taking the scheduler lock to inspect an owner. */
+    if (waiter->write && lock->pending_head != waiter) return 0;
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     unsigned online=0;
     unsigned local=kernel_cpu_current()->logical_id;
@@ -79,6 +82,7 @@ static __attribute__((noinline)) uint64_t acquire_waiter(struct kernel_rwlock *l
         kernel_raw_lock_release(metadata);
 #if BOAROS_MAX_CPUS > 1
         if(spin) {
+            COST_SCOPE(spin_cost, LOCK_SPIN_TICKS);
             uint64_t budget=spin;
             spin=0;
             /* The FIFO waiter remains registered and owns its stack. Restore
@@ -116,6 +120,7 @@ static __attribute__((noinline)) uint64_t acquire_waiter(struct kernel_rwlock *l
     /* 资格授予同时摘pending；局部waiter不得逃出慢路径的存活区间。 */
     if (lock->pending_head == &waiter || lock->pending_tail == &waiter) __builtin_trap();
 #if BOAROS_COST_DIAGNOSTICS
+    COST_SAMPLE(LOCK_GRANT_RUN_TICKS, kernel_cost_clock() - waiter.grant_ticks);
     return waiter.grant_ticks;
 #else
     return 0;

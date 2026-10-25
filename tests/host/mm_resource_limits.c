@@ -2,6 +2,7 @@
 #include <kernel/rlimit.h>
 #include <kernel/heap.h>
 #include <kernel/cpu.h>
+#include <kernel/sync.h>
 #include <kernel/vma.h>
 #include <kernel/errno.h>
 #include <assert.h>
@@ -27,7 +28,10 @@ static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1
 #define P BOAROS_PAGE_SIZE
 #define RW (KERNEL_MM_READ|KERNEL_MM_WRITE)
 #define BASE UINT64_C(0x400000)
-static unsigned fail_resize, fail_page;
+static unsigned fail_resize, fail_page, mm_gate_acquisitions;
+void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
+{ if(lock->rank==25)mm_gate_acquisitions++;__real_kernel_rwlock_write(lock,guard); }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
 { return fail_page ? PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out); }
@@ -245,6 +249,11 @@ int main(void)
     CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_munmap(&mm,BASE,4*P));
     memlock_limit=0;CHECK(kernel_mm_mlock(&mm,0,0,0)==-KERNEL_EPERM);
     CHECK(map(BASE,P,RW,KERNEL_MM_MAP_LOCKED)==KERNEL_MM_STATUS_LOCK_PERMISSION);
+    memlock_limit=UINT64_MAX;
+    CHECK(!map(BASE,2*P,RW,0)&&!kernel_mm_mlock(&mm,BASE,2*P,0));
+    mm_gate_acquisitions=0;CHECK(!kernel_mm_mlock(&mm,BASE,2*P,0));
+    CHECK(mm_gate_acquisitions==3); /* admission + one current-VMA/fault step per page */
+    CHECK(!kernel_mm_munmap(&mm,BASE,2*P));
     memlock_limit=P;CHECK(!kernel_mm_mlockall(&mm,6));
     CHECK(!kernel_mm_brk(&mm,0x10000+P,&result)&&result==0x10000+P);
     CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==P);

@@ -3,6 +3,7 @@
 #include <kernel/cost.h>
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
+#include <kernel/kcmp.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
@@ -361,6 +362,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 272U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_kcmp(caller,(int32_t)request->arguments[0],
+            (int32_t)request->arguments[1],(int32_t)request->arguments[2],
+            request->arguments[3],request->arguments[4]);
     } else if (request->number == 434U || request->number==438U) {
         decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value=request->number==434U?

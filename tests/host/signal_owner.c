@@ -23,6 +23,8 @@
 #undef physical_page_allocate
 #undef physical_page_resolve
 #include <stdlib.h>
+enum riscv_direct_map_status riscv_direct_map_va_to_pa(uint64_t va,uint64_t size,uint64_t *pa)
+{ (void)va;(void)size;(void)pa;abort(); }
 void signal_owner_unexpected_group_exit(struct kernel_task *task,enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
 { (void)task;(void)reason;(void)status;(void)detail;abort(); }
 void signal_owner_unexpected_exit(enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
