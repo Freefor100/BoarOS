@@ -362,3 +362,33 @@ enum kernel_syscall_status syscall_handle_mlock(struct kernel_task *caller,
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_mincore(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    uint64_t address = request->arguments[0], length = request->arguments[1], destination = request->arguments[2];
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = -KERNEL_EINVAL;
+    if (address & BOAROS_PAGE_MASK) return KERNEL_SYSCALL_STATUS_OK;
+    decoded->value = -KERNEL_ENOMEM;
+    if (kernel_user_range_check(address, length) || length > UINT64_MAX - BOAROS_PAGE_MASK) return KERNEL_SYSCALL_STATUS_OK;
+    uint64_t pages = (length + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+    decoded->value = -KERNEL_EFAULT;
+    if (kernel_user_range_check(destination, pages)) return KERNEL_SYSCALL_STATUS_OK;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    struct kernel_task_io_buffer workspace = {0};
+    if (pages && kernel_task_io_buffer_acquire(&workspace, mm->allocator) != KERNEL_TASK_STATUS_OK) {
+        decoded->value = -KERNEL_EAGAIN; return KERNEL_SYSCALL_STATUS_OK;
+    }
+    decoded->value = 0;
+    while (pages) {
+        unsigned batch = pages > 16 ? 16 : (unsigned)pages, completed = 0;
+        int error = kernel_mm_mincore(mm, address, batch, workspace.data, &completed);
+        size_t copied = 0;
+        if (completed && kernel_copy_to_user(mm, destination, workspace.data, completed, &copied)) error = -KERNEL_EFAULT;
+        if (error) { decoded->value = error; break; }
+        address += (uint64_t)batch * BOAROS_PAGE_SIZE; destination += batch; pages -= batch;
+    }
+    if (workspace.allocator) kernel_task_io_buffer_release(&workspace);
+    return KERNEL_SYSCALL_STATUS_OK;
+}

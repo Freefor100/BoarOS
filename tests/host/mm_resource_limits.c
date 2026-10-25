@@ -213,9 +213,13 @@ int main(void)
     assert(!kernel_mm_munmap(&mm,BASE,fragments*2*P));
     /* Locked usage belongs to this MM; the initiating actor supplies admission. */
     assert(!map(BASE,4*P,RW,0));
+    unsigned char residency[4]={0xaa,0xaa,0xaa,0xaa};unsigned completed=0;
+    CHECK(!kernel_mm_mincore(&mm,BASE,4,residency,&completed)&&completed==4&&!residency[0]&&!residency[3]);
     CHECK(!kernel_mm_mlock(&mm,BASE,P,0));
     fail_page=1;CHECK(kernel_mm_mlock(&mm,BASE+P,P,0)==-KERNEL_EAGAIN);fail_page=0;
+    CHECK(!kernel_mm_mincore(&mm,BASE,4,residency,&completed)&&residency[0]==1&&!residency[1]);
     CHECK(!kernel_mm_mprotect(&mm,BASE,P,0));
+    CHECK(!kernel_mm_mincore(&mm,BASE,1,residency,&completed)&&residency[0]==1);
     CHECK(!kernel_mm_munlockall(&mm));
     CHECK(!kernel_mm_mprotect(&mm,BASE,P,RW));
     memlock_limit=2*P;

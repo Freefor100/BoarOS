@@ -141,6 +141,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
 
 /* A successful lookup also returns an owned physical-page reference. */
 /* 只借用当前已完成页；装入、resize或截断中的条目返回BUSY。 */
+int kernel_page_cache_resident(struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t index);
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,

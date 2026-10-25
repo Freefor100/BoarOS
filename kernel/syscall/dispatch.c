@@ -764,6 +764,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if ((request->number >= 228U && request->number <= 231U) || request->number == 284U) {
         if (syscall_handle_mlock(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 232U) {
+        if (syscall_handle_mincore(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_MSYNC) {
         if (syscall_handle_msync(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

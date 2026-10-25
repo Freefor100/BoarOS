@@ -28,6 +28,9 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
+EXCLUDED(kernel_elf64_source_file)
+EXCLUDED(kernel_elf64_source_run_count)
+EXCLUDED(kernel_elf64_source_run_at)
 #endif
 #if BOAROS_MAX_CPUS == 1
 EXCLUDED(kernel_task_mm_borrow)

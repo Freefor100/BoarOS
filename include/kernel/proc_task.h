@@ -36,7 +36,7 @@ struct kernel_proc_process_snapshot {
     uint64_t major_faults;
     uint64_t child_minor_faults;
     uint64_t child_major_faults;
-    uint64_t virtual_bytes;
+    uint64_t virtual_bytes, locked_bytes;
     uint64_t resident_pages;
     uint64_t rss_limit;
     uint64_t start_code, end_code, start_stack;

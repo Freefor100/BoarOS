@@ -41,10 +41,10 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
 | 信号、线程与事件 | PI futex与futex_waitv；扩展 clone；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
-| 用户内存 | mremap 的 DONTUNMAP、零长度共享复制、多VMA批量及特殊映射搬移；按操作区分的 madvise、mlock/MAP_LOCKED、/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射已支持缩小、扩大及地址搬移，沿共同pin与TLB回收规则 |
+| 用户内存 | mremap 的 DONTUNMAP、零长度共享复制、多VMA批量及特殊映射搬移；按操作区分的 madvise、SHM_LOCK、/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射已支持缩小、扩大及地址搬移，沿共同pin与TLB回收规则 |
 | 进程查询与 IPC | pidfd 的扩展 ioctl、clone 创建 pidfd、kcmp、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2 的扩展标志 | getrusage、pidfd_open/send_signal/getfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
-| 凭据与限制 | 用户命名空间、用户态 xattr 修改、登录认证与用户数据库管理；MEMLOCK 的锁页执行、NICE 的优先级接口与公平调度权重、POSIX mqueue 及 MSGQUEUE 计费、core 文件写出 | [进程凭据](modules/kernel-scheduler.md)、[执行](modules/kernel-exec.md)、[内存](modules/kernel-mm.md)、[文件接口](modules/kernel-files.md)；16项资源限额均可查询、设置和继承；NPROC按真实UID计线程，RTPRIO约束调度授权，RTTIME限制连续RT执行，RSS/LOCKS沿Linux保留记录；AS/DATA、CPU、NOFILE/STACK/CORE/FSIZE保持各自范围；线程 UID/GID/补充组、capability、DAC、set-ID/filecap 执行及按真实 UID 的 SIGPENDING 计账已接入 |
+| 凭据与限制 | 用户命名空间、用户态 xattr 修改、登录认证与用户数据库管理；NICE 的优先级接口与公平调度权重、POSIX mqueue 及 MSGQUEUE 计费、core 文件写出 | [进程凭据](modules/kernel-scheduler.md)、[执行](modules/kernel-exec.md)、[内存](modules/kernel-mm.md)、[文件接口](modules/kernel-files.md)；16项资源限额均可查询、设置和继承；NPROC按真实UID计线程，RTPRIO约束调度授权，RTTIME限制连续RT执行，RSS/LOCKS沿Linux保留记录；AS/DATA、MEMLOCK锁页、CPU、NOFILE/STACK/CORE/FSIZE保持各自范围；线程 UID/GID/补充组、capability、DAC、set-ID/filecap 执行及按真实 UID 的 SIGPENDING 计账已接入 |
 | 网络与系统接口 | 外部 IPv6 与运行时网络配置；POSIX定时器的BOOTTIME/ALARM/TAI与运行时调钟、pipe 容量、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；UNIX STREAM/DGRAM/SEQPACKET、FD传递与消息凭据已提供；REAL/VIRTUAL/PROF间隔定时器及四类时钟的POSIX定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 

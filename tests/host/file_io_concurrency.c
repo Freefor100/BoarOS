@@ -54,6 +54,7 @@ static struct kernel_files files;
 static struct kernel_fs_context fs;
 static struct kernel_open_file_description *control;
 static int image;
+static unsigned fail_memlock_read,memlock_reads;
 static uint64_t context;
 static uint64_t shared_mapping;
 static struct kernel_files views[4];
@@ -510,6 +511,8 @@ static enum kernel_block_status read_image(void *unused,uint64_t offset,void *da
         __atomic_store_n(&access_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_access,__ATOMIC_ACQUIRE)) sched_yield();
     }
+    __atomic_fetch_add(&memlock_reads,1,__ATOMIC_RELAXED);
+    if (fail_memlock_read) return KERNEL_BLOCK_STATUS_IO;
     return pread(image,data,size,offset)==(ssize_t)size?KERNEL_BLOCK_STATUS_OK:KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status write_image(void *unused,uint64_t offset,const void *data,size_t size)
@@ -924,6 +927,55 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     puts(cache?"PASS cross-CPU ext4 file I/O, shared offset, positioned prefix and CPU0 final owner":
         "PASS cross-CPU tmpfs file I/O, shared offset, positioned prefix and CPU0 final owner");
 }
+static unsigned mincore_pause,mincore_entered,mincore_continue;
+static uint64_t mincore_address;
+int __real_kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *);
+int __wrap_kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
+{
+    if (__atomic_exchange_n(&mincore_pause,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&mincore_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&mincore_continue,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return __real_kernel_vfs_file_mincore_allowed(file);
+}
+static void *mincore_last_source(void *unused)
+{
+    (void)unused;mm_test_attach(1);mm_test_activate_task();mm_test_bind(&mm);
+    unsigned char value;unsigned completed;
+    assert(kernel_mm_mincore(&mm,mincore_address,1,&value,&completed)==-KERNEL_ENOMEM&&!completed);
+    mm_test_finish();return 0;
+}
+static void memlock_file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,struct kernel_page_cache *cache)
+{
+    struct kernel_open_file_description *file=0;int error;size_t done;
+    assert(!kernel_open_file_create_mode(heap,mount,"/lock-fault",0600,&file,&error)&&!error);
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x51,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&done)&&done==sizeof(bytes));
+    uint64_t observed=0;assert(!kernel_vfs_sync(&file->file,0,&observed));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_open_file_node(file)));
+    struct kernel_open_file_description *source=file;assert(!kernel_open_file_acquire(source));
+    uint64_t address;assert(!kernel_mm_mmap_file_private(&mm,&source,0x500000,BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ,KERNEL_MM_MAP_FIXED_NOREPLACE,&address)&&!source);
+    unsigned char resident=0xaa;unsigned completed=0,before=memlock_reads;
+    assert(!kernel_mm_mincore(&mm,address,1,&resident,&completed)&&completed==1&&!resident&&memlock_reads==before);
+    fail_memlock_read=1;assert(kernel_mm_mlock(&mm,address,BOAROS_PAGE_SIZE,0)==-KERNEL_ENOMEM);fail_memlock_read=0;
+    struct kernel_mm_proc_memory memory;assert(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==BOAROS_PAGE_SIZE);
+    assert(!kernel_mm_mincore(&mm,address,1,&resident,&completed)&&!resident);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_open_file_node(file)));
+    assert(!kernel_mm_mlock(&mm,address,BOAROS_PAGE_SIZE,0));
+    assert(!kernel_mm_mincore(&mm,address,1,&resident,&completed)&&resident);
+    struct kernel_vfs_node *node=kernel_open_file_node(file);assert(!kernel_vfs_node_acquire(node));
+    mincore_address=address;mincore_entered=mincore_continue=0;mincore_pause=1;
+    pthread_t reader;assert(!pthread_create(&reader,0,mincore_last_source,0));
+    while (!__atomic_load_n(&mincore_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    struct kernel_open_file_description *borrowed=file;
+    assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE)&&!kernel_open_file_release(&file));
+    assert(node->open_files&&borrowed->references==1);
+    __atomic_store_n(&mincore_continue,1,__ATOMIC_RELEASE);assert(!pthread_join(reader,0));
+    assert(!node->open_files&&!kernel_vfs_node_release(&node));
+    assert(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&!memory.locked_bytes);
+    puts("PASS mlock file I/O failure keeps policy; mincore no I/O; last-source borrow drained after unmap");
+}
 static void initialize(struct physical_page_allocator *pages,struct kernel_heap *heap,void *pool,size_t size)
 {
     struct boot_memory_layout layout={.usable_count=1,.usable={{(uintptr_t)pool,size}}};
@@ -1206,6 +1258,7 @@ int main(int argc,char **argv)
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
+    memlock_file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);
     offset_handoff_case(&heap,&mount,&cache);
     sync_offset_case(&heap,&mount,&cache,0);

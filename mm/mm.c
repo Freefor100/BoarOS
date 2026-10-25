@@ -4837,3 +4837,85 @@ int kernel_mm_munlockall(struct kernel_mm *mm)
     return 0;
 }
 
+int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
+    unsigned char *output, unsigned *completed)
+{
+    *completed = 0;
+    if (!count || count > 16 || (address & BOAROS_PAGE_MASK)) return -KERNEL_EINVAL;
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+    struct kernel_mm_record *record = operation.record;
+    for (unsigned i = 0; i < count;) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(record->vmas, address, &vma)) return -KERNEL_ENOMEM;
+        uint64_t generation = kernel_vma_set_generation(record->vmas);
+        uint64_t offset = vma.backing_offset + address - vma.start;
+        struct kernel_open_file_description *file = 0;
+        struct kernel_memory_object *object = 0;
+        _Atomic uint32_t *borrow = 0;
+        if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE || vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
+            file = vma.backing;
+            struct kernel_mm_file_source *source = find_file_source(record, file);
+            if (!source) __builtin_trap();
+            borrow = &source->operations;
+        } else if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
+            struct kernel_elf64_source *source = vma.backing;
+            file = kernel_elf64_source_file(source);
+            for (uint32_t j = 0; j < kernel_elf64_source_run_count(source); j++) {
+                const struct kernel_elf64_source_run *run = kernel_elf64_source_run_at(source, j);
+                if (offset >= run->start && offset < run->end) {
+                    if (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE) offset = run->file_offset + offset - run->start;
+                    else file = 0;
+                    break;
+                }
+            }
+            if (file) {
+                struct kernel_mm_elf_source *owner = find_elf_source(record, source);
+                if (!owner) __builtin_trap();
+                borrow = &owner->faults;
+            }
+        } else if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED || vma.kind == KERNEL_VMA_KIND_SYSV_SHM)
+            object = vma.backing;
+        int present;
+        {
+            uint64_t cursor = address, found;
+            KERNEL_RAW_SCOPE(guard, &record->metadata);
+            enum arch_mmu_status status = arch_mmu_user_next_owned(&record->space, &cursor,
+                address + BOAROS_PAGE_SIZE, &found);
+            if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+            present = status == ARCH_MMU_STATUS_OK;
+        }
+        if (file || object) {
+            if (borrow && (*borrow == UINT32_MAX || ++*borrow == 0)) __builtin_trap();
+            if (object && kernel_memory_object_acquire(object)) __builtin_trap();
+            /* inode mutation can invalidate this MM: retain the actual source,
+             * end the MM gate before taking inode/cache/object qualifications. */
+            mm_operation_end(&operation);
+            if (file && !kernel_vfs_file_mincore_allowed(kernel_open_file_vfs_borrow(file))) present = 1;
+            else if (!present) {
+                struct kernel_memory_object *backing = object ? object : kernel_vfs_file_memory(kernel_open_file_vfs_borrow(file));
+                if (backing) {
+                    uint64_t physical;
+                    enum kernel_memory_object_status status = kernel_memory_object_find_page(backing, offset >> BOAROS_PAGE_SHIFT, &physical);
+                    if (!status) {
+                        present = 1;
+                        if (physical_page_release(mm->allocator, physical)) __builtin_trap();
+                    } else if (status != KERNEL_MEMORY_OBJECT_NOT_FOUND) __builtin_trap();
+                } else present = kernel_page_cache_resident(kernel_open_file_page_cache(file),
+                    kernel_open_file_vfs_borrow(file), offset >> BOAROS_PAGE_SHIFT);
+            }
+            if (object) kernel_memory_object_release(&object);
+            if (borrow && !__atomic_fetch_sub(borrow, 1, __ATOMIC_RELEASE)) __builtin_trap();
+            if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+            if (borrow) {
+                (void)drain_file_sources(record, 1);
+                (void)drain_elf_sources(record, 1);
+            }
+            if (generation != kernel_vma_set_generation(record->vmas)) continue;
+        }
+        output[i] = (unsigned char)present;
+        *completed = ++i;
+        address += BOAROS_PAGE_SIZE;
+    }
+    return 0;
+}
