@@ -750,6 +750,8 @@ static enum kernel_files_status pread_iov_pinned(
     int64_t *linux_result)
 {
     struct kernel_open_file_description *description = *description_owner;
+    /* pin覆盖本次请求；kind只在OFD发布前设置。 */
+    const enum kernel_open_file_kind kind = description->kind;
     if (description->block) {
         if (offset < 0) { *linux_result = -KERNEL_EINVAL; return KERNEL_FILES_STATUS_OK; }
         if (scalar && kernel_open_file_readable(description) &&
@@ -766,21 +768,21 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE && kind != KERNEL_OPEN_FILE_KIND_EVENTFD && kind != KERNEL_OPEN_FILE_KIND_TIMERFD && kind != KERNEL_OPEN_FILE_KIND_SIGNALFD);
     uint64_t position;
     uint64_t request;
     uint64_t file_size;
 
-    if(kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PIDFD) {
+    if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+    if (kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
-    if ((kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
-         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) &&
+    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR ||
+         kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
         !kernel_open_file_readable(description)) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EBADF;
@@ -791,16 +793,16 @@ static enum kernel_files_status pread_iov_pinned(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) ==
+    if (kind ==
             KERNEL_OPEN_FILE_KIND_DIRECTORY) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
     if ((description->device && !description->device->positioned) ||
-        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SIGNALFD) ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        (kind == KERNEL_OPEN_FILE_KIND_EVENTFD || kind == KERNEL_OPEN_FILE_KIND_TIMERFD || kind == KERNEL_OPEN_FILE_KIND_SIGNALFD) ||
+        kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+        kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         KERNEL_FILES_NOTE(files, read_failures, 1);
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
@@ -815,7 +817,7 @@ static enum kernel_files_status pread_iov_pinned(
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) {
+    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
         KERNEL_LOCK_SCOPE(offset_guard);
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
         struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
@@ -828,7 +830,7 @@ static enum kernel_files_status pread_iov_pinned(
         return read_pinned(files, mm, description_owner, iov, iov_count, count, 0,
                            linux_result, 0U, 0, 0, NULL);
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
         kernel_open_file_read_begin(description, (uint64_t)offset);
         kernel_vfs_file_accessed(&description->file);
     }
@@ -885,18 +887,19 @@ static int description_writable(
     if (description == 0) {
         return 0;
     }
+    const enum kernel_open_file_kind kind = description->kind;
     access_mode = kernel_open_file_flags(description) & 3U;
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_BLOCK) {
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR ||
+        kind == KERNEL_OPEN_FILE_KIND_BLOCK) {
         return access_mode == 1U || access_mode == 2U;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
+    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED)
         return access_mode == 1U || access_mode == 2U;
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+    if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
         return access_mode != 0U;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ||
-        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SIGNALFD)) {
+    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
+        (kind == KERNEL_OPEN_FILE_KIND_EVENTFD || kind == KERNEL_OPEN_FILE_KIND_TIMERFD || kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)) {
         return access_mode == 2U;
     }
     if (description->device) {
@@ -1525,16 +1528,13 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result, const struct kernel_lock_guard *borrowed)
 {
-    const enum kernel_open_file_kind kind=kernel_open_file_kind(description);
+    const enum kernel_open_file_kind kind=description->kind;
     KERNEL_LOCK_SCOPE(offset_guard);
     if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
          kind == KERNEL_OPEN_FILE_KIND_REGULAR) || kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
         if (!regular_borrows_offset(description,borrowed))
             kernel_mutex_lock(&description->offset_lock, &offset_guard);
     }
-    KERNEL_LOCK_SCOPE(operation_guard);
-    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR)
-        kernel_vfs_file_write_lock(&description->file, &operation_guard);
     enum kernel_files_status status;
     if (kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
         status=regular_write_request(files,mm,description,iov,iov_count,count,
@@ -1552,7 +1552,6 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
         (kernel_open_file_flags(description) & KERNEL_FILES_O_DSYNC) != 0U) {
         int datasync = (kernel_open_file_flags(description) & KERNEL_FILES_O_SYNC) !=
                         KERNEL_FILES_O_SYNC;
-        if (operation_guard.lock) kernel_lock_release(&operation_guard);
         int64_t sync_result = 0;
         const struct kernel_lock_guard *borrow = offset_guard.lock ? &offset_guard : borrowed;
         enum kernel_files_status synced = sync_pinned(description, datasync, &sync_result, borrow);
@@ -1574,7 +1573,7 @@ static enum kernel_files_status write_request(
 {
     if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
         count, 1, positioned, requested_offset, linux_result);
-    const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    const enum kernel_open_file_kind kind = description->kind;
     if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
@@ -1733,7 +1732,7 @@ enum kernel_files_status kernel_files_pwrite(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    kind = kernel_open_file_kind(description);
+    kind = description->kind;
     if (kind == KERNEL_OPEN_FILE_KIND_PIDFD)
         *linux_result = -KERNEL_EINVAL;
     else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||

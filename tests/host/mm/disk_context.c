@@ -89,6 +89,8 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort(); }
 #define EXCLUDED(name) void name(void) { excluded(); }
 EXCLUDED(kernel_event_fd_close)
+EXCLUDED(kernel_pidfd_close)
+EXCLUDED(kernel_pidfd_inode)
 #if !defined(FILE_IO_CASES) && !defined(CACHE_MM_CASES)
 /* 此缓存fixture仅接纳内核来源；MM/uaccess组合由CACHE_MM_CASES链接真实实现。 */
 enum kernel_uaccess_status kernel_uaccess_pin_user_page(struct kernel_mm *mm,
@@ -124,6 +126,8 @@ EXCLUDED(kernel_epoll_destroy)
 #endif
 #ifndef FILE_IO_CASES
 EXCLUDED(kernel_socket_destroy)
+EXCLUDED(kernel_socket_is_unix)
+EXCLUDED(kernel_socket_rights_changed)
 #endif
 #ifndef FILES_PIPE_CASES
 EXCLUDED(kernel_pipe_release_endpoint)

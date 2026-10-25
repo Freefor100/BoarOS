@@ -134,10 +134,19 @@ enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,siz
 }
 static struct kernel_rwlock *namespace_observed_lock;
 static unsigned namespace_lock_acquisitions;
+static _Thread_local const struct kernel_rwlock *write_sequence_lock;
+static _Thread_local unsigned write_sequence_queries,write_sequence_acquisitions;
+int __real_kernel_lock_held(const struct kernel_rwlock *,int);
+int __wrap_kernel_lock_held(const struct kernel_rwlock *lock,int write)
+{
+    if (lock==write_sequence_lock) write_sequence_queries++;
+    return __real_kernel_lock_held(lock,write);
+}
 void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 {
     if (lock==namespace_observed_lock) namespace_lock_acquisitions++;
+    if (lock==write_sequence_lock) write_sequence_acquisitions++;
 #ifdef TCP_IO_CASES
     tcp_wait_locking(lock);
 #endif
@@ -1034,6 +1043,47 @@ static void vector_boundaries(struct kernel_heap *heap,struct kernel_vfs_mount *
     puts("PASS vector boundaries: 8/9/1024/1025, allocation counts/OOM, descriptor fault, illegal clipped tail, signed-length ordering and partial data");
 }
 
+static void write_sequence_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};
+    struct kernel_open_file_description *file=NULL;
+    int error;int64_t result;size_t copied,written;
+    assert(!kernel_files_create(&local,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,"/write-sequence",0600,&file,&error) && !error);
+    file->open_flags=2;
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    struct kernel_open_file_description *slot=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&slot));
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    const struct kernel_uaccess_iovec iov[]={{0x100000,4},{0x100004,4}};
+    assert(!kernel_copy_to_user(&mm,0x100000,"sequence",8,&copied) && copied==8);
+    assert(!kernel_copy_to_user(&mm,0x200000,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+    for (unsigned append=0;append<2;append++) for (unsigned mode=0;mode<4;mode++) {
+        assert(!kernel_files_ftruncate(&local,0,0,&result) && !result);
+        assert(!kernel_vfs_pwrite(&file->file,0,"seed",4,&written) && written==4);
+        assert(!kernel_files_lseek(&local,0,2,0,&result) && result==2);
+        kernel_open_file_set_status_flags(file,append?KERNEL_FILES_O_APPEND:0);
+        write_sequence_queries=write_sequence_acquisitions=0;
+        write_sequence_lock=&node->write_operation.lock;
+        enum kernel_files_status status=mode==0?kernel_files_write(&local,&mm,0,0x100000,8,&result):
+            mode==1?kernel_files_pwrite(&local,&mm,0,0x100000,8,1,&result):
+            mode==2?kernel_files_writev(&local,&mm,0,0x200000,2,&result):
+                    kernel_files_pwritev(&local,&mm,0,0x200000,2,1,&result);
+        write_sequence_lock=NULL;
+        assert(!status && result==8 && write_sequence_queries==1 && write_sequence_acquisitions==1);
+        size_t offset=append?4:(mode&1)?1:2;
+        unsigned char expected[12]="seed",actual[12]={0};
+        memcpy(expected+offset,"sequence",8);
+        assert(kernel_open_file_size(file)==offset+8 && file->offset==((mode&1)?2:offset+8));
+        assert(!kernel_open_file_pread(file,0,actual,sizeof(actual),&copied) && copied==offset+8 &&
+            !memcmp(expected,actual,copied));
+        assert(file->references==1 && !kernel_io_context_current()->locks &&
+            !kernel_io_context_current()->user_pins && !kernel_io_context_current()->cache_writes);
+    }
+    assert(!kernel_files_release(&local));
+    puts("PASS scalar/vector write and pwrite: one write-sequence owner, append EOF, positioned offset and returned resources");
+}
+
 static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     assert(!kernel_vfs_mkdir(mount,"/empty-directory",0700));
@@ -1126,6 +1176,7 @@ int main(int argc,char **argv)
     namespace_publication_case(&heap,memory);
     directory_eof(&heap,memory);
     vector_boundaries(&heap,memory);
+    write_sequence_case(&heap,memory);
     raw_block_case(&heap,memory);
 #ifdef LOOP_IO_CASES
     loop_case(&heap,memory);
