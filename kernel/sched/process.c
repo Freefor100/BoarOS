@@ -905,7 +905,12 @@ enum kernel_scheduler_status arch_process_clone_current(
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
     tid = child->tid;
-    kernel_sched_policy_fork(&child->scheduling, &parent->scheduling);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_sched_policy inherited=parent->scheduling;
+        inherited.priority=(int)scheduler_base_priority(parent);
+        kernel_sched_policy_fork(&child->scheduling,&inherited);
+    }
     child->proc_start_ticks = kernel_tick_count();
     memcpy(child->comm, parent->comm, sizeof(child->comm));
     child->group_leader = child;
@@ -1631,6 +1636,7 @@ static void reap_claim_end(struct kernel_task **task)
 /* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
 static void cleanup_task_io_requests(struct kernel_task *thread)
 {
+    if(thread->pi_request)kernel_futex_pi_abort(thread);
     kernel_posix_cpu_sleep_abort(thread);
     kernel_msg_abort(thread);
     kernel_sem_abort(thread);

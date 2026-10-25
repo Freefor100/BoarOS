@@ -17,6 +17,7 @@
 void la_trap_entry(void);
 void la_kernel_stack_overflow(uint64_t sp)
 {
+    kernel_console_emergency_begin();
     la_virt_puts("LA exhausted kernel SP=");la_virt_hex(sp);la_virt_puts("\n");
     la_virt_fatal("kernel stack guard");
 }
@@ -150,6 +151,8 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         else fault(4,128,0); /* Linux LA do_ri/disabled ISA 的 SI_KERNEL 来源。 */
         return;
     }
+    /* 首错可能发生在日志/等待保护内；寄存器前缀也必须直接写UART。 */
+    kernel_console_emergency_begin();
     la_virt_puts("trap code=");la_virt_hex(code);la_virt_puts(" pc=");la_virt_hex(frame->era);la_virt_puts(" badv=");la_virt_hex(frame->badv);
     /* 故障PC可能是合并的fatal分支；RA定位实际违反契约的调用点。 */
     la_virt_puts(" ra=");la_virt_hex(frame->regs[1]);

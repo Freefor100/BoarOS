@@ -38,6 +38,7 @@ int64_t kernel_futex_restart_timed(
 /* Drop one live MM user; clear/wake the TID only while another user remains. */
 void kernel_futex_release_mm(struct kernel_task *task);
 void kernel_futex_release_robust(struct kernel_task *task, int32_t owner_tid);
+void kernel_futex_pi_abort(struct kernel_task *task);
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head);
 uint64_t kernel_futex_get_robust_list(const struct kernel_task *task);
 

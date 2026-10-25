@@ -1,5 +1,6 @@
 #include <arch/mmu.h>
 #include <platform/loongarch_virt.h>
+#include <kernel/wait_internal.h>
 
 void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
 {
@@ -13,7 +14,7 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
     la_virt_puts("LA fatal fixture duplicate release\n");
     (void)physical_page_release(allocator,page);
     (void)physical_page_release(allocator,page);
-#else
+#elif LA_FATAL_CASE == 3
     struct arch_mmu_page_table kernel={.allocator=allocator,.state=ARCH_MMU_STATE_ACTIVE};
     struct arch_mmu_user_space space={0};
     struct arch_mmu_mapping mapping;
@@ -23,6 +24,15 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
     /* 非对齐目录地址违反硬件页表和物理 owner 契约，必须 fail-stop。 */
     ((uint64_t *)la_virt_page_access(space.root_address))[0]=page+1;
     (void)arch_mmu_user_lookup(&space,0,&mapping);
+#else
+    la_virt_puts("LA fatal fixture held wait domain\n");
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+#if LA_FATAL_CASE == 4
+    __asm__ volatile("ld.d $t0, $zero, 16" ::: "memory");
+#else
+    extern void la_kernel_stack_overflow(uint64_t);
+    la_kernel_stack_overflow(0x1234);
+#endif
 #endif
     la_virt_puts("LA fatal fixture unexpectedly returned\n");
     la_virt_shutdown();

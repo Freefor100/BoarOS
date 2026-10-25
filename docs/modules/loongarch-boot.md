@@ -6,6 +6,11 @@
 `platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
 默认 `all` 和 RV 测试入口保持原路径。
 
+不可恢复的内核异常和栈溢出入口在输出任何寄存器或前缀前切换紧急控制台，
+直接轮询UART，绕过日志发布、TTY和等待通知。这样首错即使发生在调度域保护内，
+诊断也不会重入该锁。`test-loongarch-fatal`用真实持锁load fault及栈故障报告检查
+首条原因完整、没有二次断点，再保留既有allocator/页表owner的fatal检查。
+
 ```sh
 make kernel-la                 # 普通 LP64S 内核，需要 PCI 根盘
 make kernel-la-contract        # 独立启动/MMU/heap/内嵌用户 ELF 契约

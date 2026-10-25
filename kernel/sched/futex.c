@@ -10,99 +10,17 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
-#define FUTEX_BUCKETS 256U
-#define FUTEX_PRIVATE 128U
-#define FUTEX_CLOCK_REALTIME 256U
-#define FUTEX_WAIT_BITSET 9U
-#define FUTEX_WAKE_BITSET 10U
-#define FUTEX_BITSET_MATCH_ANY UINT32_MAX
-#define FUTEX_WAITERS UINT32_C(0x80000000)
-#define FUTEX_OWNER_DIED UINT32_C(0x40000000)
-#define FUTEX_TID_MASK UINT32_C(0x3fffffff)
-#define ROBUST_LIST_LIMIT 2048U
+#include "futex_internal.h"
 
-struct futex_bucket {
-    struct kernel_mutex operation;
-    struct kernel_wait_queue waiters;
-};
-static struct futex_bucket buckets[FUTEX_BUCKETS];
+struct futex_bucket futex_buckets[FUTEX_BUCKETS];
 
 /* 桶表在任务与secondary发布前初始化，热路径只取得实际桶资格。 */
 void kernel_futex_init(void)
 {
     for (unsigned i = 0; i < FUTEX_BUCKETS; i++) {
-        kernel_wait_queue_init(&buckets[i].waiters);
-        kernel_mutex_init(&buckets[i].operation, 26, (uintptr_t)i + 1U);
+        kernel_wait_queue_init(&futex_buckets[i].waiters);
+        kernel_mutex_init(&futex_buckets[i].operation, 26, (uintptr_t)i + 1U);
     }
-}
-
-static void futex_key_release(struct kernel_futex_key *key)
-{
-    if (key->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY)
-        kernel_memory_object_release(&key->shared_object);
-    else if (key->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
-             kernel_vfs_node_release(&key->file_node)) __builtin_trap();
-    *key = (struct kernel_futex_key){0};
-}
-
-static void futex_key_hold(const struct kernel_futex_key *key)
-{
-    if (key->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY &&
-        kernel_memory_object_acquire(key->shared_object)) __builtin_trap();
-    if (key->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
-        kernel_vfs_node_acquire(key->file_node)) __builtin_trap();
-}
-
-static int64_t futex_prepare(struct kernel_task *task,
-    const uint64_t *addresses, unsigned count, uint32_t operation,
-    unsigned pin_index, uint32_t access, struct kernel_futex_key *keys,
-    struct kernel_mm_user_pin *pin, enum kernel_scheduler_status *status)
-{
-    enum kernel_mm_status result = kernel_mm_prepare_futex(&task->mm,
-        addresses, count, (operation & FUTEX_PRIVATE) == 0, pin_index,
-        access, keys, pin);
-    if (result == KERNEL_MM_STATUS_INVALID_ARGUMENT) return -KERNEL_EINVAL;
-    if (result == KERNEL_MM_STATUS_NO_MEMORY) return -KERNEL_ENOMEM;
-    if (result == KERNEL_MM_STATUS_NOT_MAPPED ||
-        result == KERNEL_MM_STATUS_ACCESS ||
-        result == KERNEL_MM_STATUS_ADDRESS_SPACE ||
-        result == KERNEL_MM_STATUS_BUS_FAULT) return -KERNEL_EFAULT;
-    if (result != KERNEL_MM_STATUS_OK)
-        *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    return 0;
-}
-
-static int futex_key_equal(const struct kernel_futex_key *left,
-                           const struct kernel_futex_key *right)
-{
-    return left->kind == right->kind &&
-           left->identity == right->identity && left->offset == right->offset;
-}
-
-static struct futex_bucket *futex_bucket(const struct kernel_futex_key *key)
-{
-    uint64_t hash = (key->identity >> 4U) ^ key->identity ^
-                    (key->offset >> 2U) ^ (key->offset >> 12U) ^ key->kind;
-    unsigned index = hash & (FUTEX_BUCKETS - 1U);
-    return &buckets[index];
-}
-
-static void futex_lock_buckets(const struct kernel_futex_key *keys,
-    unsigned count, struct futex_bucket **resolved, struct kernel_lock_guard *guards)
-{
-    struct futex_bucket *first = resolved[0] = futex_bucket(&keys[0]);
-    struct futex_bucket *second = resolved[1] = count == 2 ? futex_bucket(&keys[1]) : first;
-    if (first > second) {
-        struct futex_bucket *swap = first; first = second; second = swap;
-    }
-    kernel_mutex_lock(&first->operation, &guards[0]);
-    if (first != second) kernel_mutex_lock(&second->operation, &guards[1]);
-}
-
-static void futex_unlock_buckets(struct kernel_lock_guard *guards)
-{
-    if (guards[1].lock) kernel_lock_release(&guards[1]);
-    kernel_lock_release(&guards[0]);
 }
 
 static int futex_waiter_matches(struct kernel_wait_node *node,
@@ -124,6 +42,10 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
     struct kernel_wait_queue *destination = target_bucket ? &target_bucket->waiters : 0;
     struct kernel_wait_cursor cursor;
     uint32_t woken = 0, moved = 0;
+    if (__atomic_load_n(&bucket->pi_states,__ATOMIC_RELAXED)) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (futex_pi_conflict_locked(bucket,source))return -KERNEL_EINVAL;
+    }
     if (!target_bucket) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         /* Futex只登记任务节点，没有必须锁外执行的callback。短链的节点
@@ -290,6 +212,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
+    if (command==6U || command==7U || command==8U || command==13U)
+        return kernel_futex_pi(task,address,operation,timeout_or_count,status);
     if (command != 0U && command != 1U && command != 3U &&
         command != 4U && command != 5U &&
         command != FUTEX_WAIT_BITSET && command != FUTEX_WAKE_BITSET)
@@ -524,7 +448,7 @@ static int robust_release_word(struct kernel_task *task, uint64_t entry,
     return 0;
 }
 
-void kernel_futex_release_robust(struct kernel_task *task, int32_t owner_tid)
+static void robust_words(struct kernel_task *task, int32_t owner_tid)
 {
     uint64_t head = __atomic_exchange_n(&task->robust_list_head,0U,__ATOMIC_RELAXED);
     uint64_t next, pending, offset_bits;
@@ -547,14 +471,26 @@ void kernel_futex_release_robust(struct kernel_task *task, int32_t owner_tid)
 
         /* Read the next link before a word update can wake another thread. */
         if (!robust_read_u64(&task->mm, current, &next)) return;
-        if (current != pending_entry && (entry & 1U) == 0U &&
-            !robust_release_word(task, current, (int64_t)offset_bits,
-                                 (uint32_t)owner_tid, 0))
-            return;
+        if (current != pending_entry) {
+            if (entry & 1U) {
+                uint64_t address;
+                if (!robust_word_address(current,(int64_t)offset_bits,&address) ||
+                    !kernel_futex_pi_robust(task,address,(uint32_t)owner_tid))return;
+            } else if (!robust_release_word(task,current,(int64_t)offset_bits,(uint32_t)owner_tid,0))return;
+        }
         entry = next;
     }
-    if (pending_entry != 0U && (pending & 1U) == 0U)
-        (void)robust_release_word(task, pending_entry,
-                                  (int64_t)offset_bits,
-                                  (uint32_t)owner_tid, 1);
+    if (pending_entry != 0U) {
+        if(pending&1U) {
+            uint64_t address;
+            if(robust_word_address(pending_entry,(int64_t)offset_bits,&address))
+                (void)kernel_futex_pi_robust(task,address,(uint32_t)owner_tid);
+        } else (void)robust_release_word(task,pending_entry,(int64_t)offset_bits,(uint32_t)owner_tid,1);
+    }
+}
+void kernel_futex_release_robust(struct kernel_task *task,int32_t owner_tid)
+{
+    kernel_futex_pi_cleanup_begin(task);
+    robust_words(task,owner_tid);
+    kernel_futex_pi_cleanup_end(task);
 }

@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV用户两核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
+本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV用户1～4核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -17,7 +17,7 @@
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
 | `kernel/sched/park.c`、`wait.c` | 代次等待、借用游标、blocked/期限索引及完成仲裁 |
-| `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE/CMP_REQUEUE/WAKE_OP、robust-list 退出清理、clear-child-tid 唤醒 |
+| `kernel/sched/futex.c`、`futex_pi.c` | 256 桶普通 futex、PI mutex 及优先级传播、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
 | `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
@@ -130,6 +130,8 @@ ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 
 IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡眠服务前结束；
 缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
 后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
+
+任务的`scheduling.priority`保存实际运行优先级，既有就绪/每核资格/CPU0服务与来源保留队列按这个值排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列并请求目标CPU调度；实际优先级未变时保留FIFO位置。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
 
 sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～4核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
 
@@ -278,7 +280,19 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 退出清理在原 MM 与原 TID 有效时同步完成，早于 clear-child-tid 和资源释放。成功的非组长 exec 在身份接管前保存旧 TID，切换到新页表前、旧 MM 仍激活时清理；可返回的 exec 失败不清理旧链。遍历最多 2048 项，下一链接先于字更新读取；pending 项不会因已在链上而处理两次。owner 等于退出 TID 时通过可处理缺页/COW 的 32 位原子比较交换保留 WAITERS 并置 OWNER_DIED，必要时唤醒一个 waiter；pending 的非 owner 解锁窗口按 Linux 规则补唤醒。坏地址、错位、超长链和内存不足只结束该次尽力清理，不把用户错误升级为内核 fatal 或保留无 owner 的重试状态。
 
-带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名、SysV 和共享文件映射使用上述后备 key，可跨 MM、不同 VA、独立打开和硬链接唤醒或 requeue。私有映射仍使用 MM key。PI 标记项不按普通 robust 字更新；PI 和 futex2 仍未实现。futex 入口在调用者 CPU 执行，文件或缺页后端需要的 CPU0 业务交接由对应 MM/文件层负责。
+带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名、SysV 和共享文件映射使用上述后备 key，可跨 MM、不同 VA、独立打开和硬链接唤醒或 requeue。私有映射仍使用 MM key。PI 标记项更新 OWNER_DIED，实际 PI owner 随后由其持锁列表交接；futex2 尚未接入。futex 入口在调用者 CPU 执行，文件或缺页后端需要的 CPU0 业务交接由对应 MM/文件层负责。
+
+### PI mutex
+
+RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未竞争时只原子修改用户字，不常驻分配锁对象，保留 libc 的用户态快速解锁。竞争时，在原桶内发布按真实 key 标识的状态；每个在途调用持有状态引用，状态持有 owner 的任务存储借用及共享 key 的后备引用。调用栈保存等待请求；用户页 pin 只覆盖比较／更新，睡眠前归还，持有者退出后的用户字修复重新取得 pin。
+
+等待者按实际优先级、同优先级的登记顺序排列，链式传播在调度保护内更新 owner 的实际优先级和队列位置。基础调度策略、权限和查询值保持独立；fork 继承基础值。等待者撤销、优先级更新、解锁和退出都重新计算受影响链；新等待操作按固定 Linux 的 1024 层检查上限排除环；逐步追加可以形成更长的既有无环链，优先级更新沿实际链完整传播，成本为链长。内部可睡眠锁仍按原 FIFO 契约运行，PI 作用于这里的用户互斥锁。
+
+正常解锁先原子发布下一个 TID，再转交内核 owner、通知等待者。超时／信号先通知原 token，等待线程与解锁方在同一保护内竞争最终移除／授予；已授予时返回取得锁。LOCK_PI 使用绝对 REALTIME，LOCK_PI2 默认绝对 MONOTONIC、可带 REALTIME 标志；信号处理后按原绝对期限无条件重启，不依赖 SA_RESTART。
+
+退出与 exec 在旧 MM 释放前发布清理状态，先走 robust 用户链，再依次交接真实 PI owner；新的竞争者通过现有组等待源等待清理完成。退出持有者交接时，获准线程修复 OWNER_DIED 和自己的 TID；地址失效返回 EFAULT；只要还有等待者，仍存活的获准线程继续是内核 owner，随后通过实际退出流程交接。所有最后引用和堆存储在短保护外释放。普通 WAKE／REQUEUE 源遇到活动 PI 状态返回 EINVAL；PI 接纳也检查同 key 的普通等待者。
+
+`make test-pi-priority-host` 检查 4/16 KiB 下实际队列、CPU0 服务资格、RT 节流及链式传播；`tests/workloads/futex/pi.c` 检查原始字、libc robust mutex、超时／信号、优先级倒置、环、共享别名及退出修复故障。`tests/network_runner.py --workload pi` 复用两架构 Linux 对照，`--libc glibc` 使用现有目标静态工具链。
 
 ## 退出与 exec
 
@@ -334,7 +348,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI futex和clone3继续后续安排。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI 条件变量重排、futex_waitv和clone3继续后续安排。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

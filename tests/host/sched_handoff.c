@@ -14,6 +14,11 @@ static unsigned char peer_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNE
 static unsigned char running_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNEL_STACK_BYTES)));
 static unsigned lock_calls, cpu_queries;
 static uint64_t timer_request;
+/* This scheduler-only fixture creates neither event FDs nor dispositions. */
+uint64_t kernel_timer_fd_next;
+enum kernel_signal_status kernel_signal_release_table(struct kernel_task *task)
+{ (void)task;__builtin_trap(); }
+
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {

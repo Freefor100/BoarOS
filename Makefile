@@ -389,6 +389,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/park.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
+	kernel/sched/futex_pi.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
 	kernel/syscall/mount.c \
@@ -2477,7 +2478,7 @@ test-pipe-concurrency-host:
 test-scheduler-stack-slots-host:
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
-		cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/kernel_stack_slots.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c -Wl,--gc-sections -o build/host/kernel-stack-slots-$$shift; \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/kernel_stack_slots.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c -Wl,--gc-sections -o build/host/kernel-stack-slots-$$shift; \
 		build/host/kernel-stack-slots-$$shift; \
 	done
 
@@ -2485,7 +2486,7 @@ test-scheduler-stack-slots-host:
 test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
 		build/host/scheduler-handoff-$$shift; \
 	done
 
@@ -2814,3 +2815,7 @@ test-event-fd-host:
 .PHONY: test-rt-limits-host
 test-rt-limits-host:
 	sh tests/rt-limits-host.sh
+
+.PHONY: test-pi-priority-host
+test-pi-priority-host:
+	sh tests/pi-priority-host.sh
