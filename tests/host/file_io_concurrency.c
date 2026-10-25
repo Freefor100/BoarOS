@@ -90,12 +90,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
 #ifdef TCP_IO_CASES
     if (!status) tcp_wait_prepared(queue,deadline);
 #endif
-    if (!status && futex_role==1 && kernel_task_current()->futex_bitset) {
-        assert(!kernel_cpu_current()->raw_locks);
-        __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
-        while (!__atomic_load_n(&futex_edit_ready,__ATOMIC_ACQUIRE)) sched_yield();
-    } else if (!status && futex_role==2) {
-        /* 实际MM编辑已关闭新pin，并准备等待旧片段归还。 */
+    if (!status && futex_role==2) {
         __atomic_store_n(&futex_edit_ready,1,__ATOMIC_RELEASE);
     }
     return status;
@@ -169,6 +164,12 @@ void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 #ifdef TCP_IO_CASES
     int batch=tcp_batch_unpinning(pin);
 #endif
+    if(futex_role==1 && kernel_task_current()->futex_request &&
+       kernel_task_current()->wait.phase==KERNEL_WAIT_PREPARED) {
+        assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
+        __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&futex_edit_ready,__ATOMIC_ACQUIRE))sched_yield();
+    }
     __real_kernel_mm_unpin_user_page(pin);
 #ifdef TCP_IO_CASES
     if(batch) tcp_batch_unpinned(pin);
@@ -183,7 +184,7 @@ static void *futex_waiter(void *unused)
     uintptr_t irq=arch_interrupt_save();enum kernel_scheduler_status status;
     assert(!kernel_futex(kernel_task_current(),FUTEX_ADDRESS,128,1,0,0,0,&status) && !status);
     arch_interrupt_restore(irq);
-    assert(!kernel_task_current()->futex_bitset && kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    assert(!kernel_task_current()->futex_request && kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
     mm_test_finish();return NULL;
 }
 static void *futex_editor(void *unused)
@@ -233,9 +234,7 @@ static void robust_futex_owners_returned(void)
 {
     struct kernel_task *task=kernel_task_current();
     struct kernel_wait_node *node=&task->default_wait_node;
-    assert(!task->robust_list_head && !task->futex_bitset &&
-        !task->futex_key.identity && !task->futex_key.offset && !task->futex_key.shared_object &&
-        task->futex_key.kind==KERNEL_FUTEX_KEY_PRIVATE);
+    assert(!task->robust_list_head && !task->futex_request);
     /* wait_finish清除token绑定；record.generation自身仍保留历史代号。 */
     assert(task->wait.phase==KERNEL_WAIT_FINISHED && task->wait.on_cpu &&
         !task->wait.nodes && !task->wait.borrows && !task->wait.deadline &&

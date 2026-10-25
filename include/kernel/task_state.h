@@ -40,6 +40,7 @@ struct kernel_sem_request;
 struct kernel_msg_request;
 struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
+struct kernel_futex_request;
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,
@@ -214,8 +215,6 @@ struct kernel_task {
     struct kernel_signal_child_info group_child_info;
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
-    struct kernel_futex_key futex_key;
-    uint32_t futex_bitset;
     struct kernel_signal_fault signal_fault;
     uint64_t signal_pending;
     uint64_t signal_blocked;
@@ -261,6 +260,7 @@ struct kernel_task {
     uint32_t pi_base_priority, futex_exit_state;
     struct kernel_futex_pi_state *pi_owned;
     struct kernel_futex_pi_request *pi_request;
+    struct kernel_futex_request *futex_request;
 } __attribute__((aligned(16)));
 
 #endif

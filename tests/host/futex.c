@@ -1,5 +1,5 @@
 /* futex/MM/park/sleeping locks use production code; only CPU switching is hosted. */
-#include "../../kernel/sched/private.h"
+#include "../../kernel/sched/futex_internal.h"
 #include <kernel/mm_backend.h>
 #include <kernel/time.h>
 #include <kernel/errno.h>
@@ -18,6 +18,7 @@ void mm_test_bind(struct kernel_mm *);
 unsigned mm_test_parked(unsigned);
 static unsigned char pool[8 * 1024 * 1024] __attribute__((aligned(16384)));
 static struct kernel_mm mm;
+static struct kernel_heap *test_heap;
 static uint64_t context;
 static const uint64_t source = 0x40000, target = 0x41000;
 static unsigned opposite_arm, bucket_entered, bucket_waiter;
@@ -68,6 +69,25 @@ void __wrap_kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason
     }
 }
 
+static unsigned vector_pause,vector_paused,vector_resume,vector_fail_alloc;
+void __real_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
+void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{
+    __real_kernel_mm_unpin_user_page(pin);
+    struct kernel_task *task=kernel_task_current();
+    if(kernel_cpu_current()->hardware_id==1 && task->futex_request &&
+       task->futex_request->token.generation && __atomic_exchange_n(&vector_pause,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
+        __atomic_store_n(&vector_paused,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&vector_resume,__ATOMIC_ACQUIRE))sched_yield();
+    }
+}
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,size_t n,size_t size,void **out)
+{
+    if(vector_fail_alloc){vector_fail_alloc=0;return KERNEL_HEAP_STATUS_EMPTY;}
+    return __real_kernel_heap_allocate_zeroed(heap,n,size,out);
+}
 static const uint64_t cold_target = 0x80000;
 static struct kernel_memory_object *cold_object;
 void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
@@ -116,6 +136,13 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare_locked(struct kernel_wai
     if(interruptible)futex_queue=queue;
     return result;
 }
+enum kernel_scheduler_status __real_kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
+enum kernel_scheduler_status __wrap_kernel_wait_node_bind_locked(struct kernel_wait_queue *queue,struct kernel_wait_node *node,const struct kernel_wait_token *token)
+{
+    enum kernel_scheduler_status result=__real_kernel_wait_node_bind_locked(queue,node,token);
+    if(token->task->futex_request)futex_queue=queue;
+    return result;
+}
 enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(struct kernel_memory_object *, uint64_t, uint64_t *, int *);
 enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(struct kernel_memory_object *object,
     uint64_t index, uint64_t *page, int *created)
@@ -147,6 +174,7 @@ uint64_t kernel_time_boot_realtime_offset(void) { return 0; }
 void kernel_signal_note_futex_timed_restart(struct kernel_task *task, uint64_t address,
     uint32_t operation, uint32_t value, uint64_t deadline, uint32_t bitset)
 { (void)task; (void)address; (void)operation; (void)value; (void)deadline; (void)bitset; abort(); }
+void kernel_signal_note_syscall_restart(struct kernel_task *task) { (void)task; }
 static void attach(unsigned id)
 {
     mm_test_attach(id);
@@ -155,13 +183,14 @@ static void attach(unsigned id)
     mm_test_bind(&task->mm);
     kernel_cpu_current()->current = task;
     task->cpu = kernel_cpu_current();
+    task->files.heap=test_heap;
     mm_test_context = context;
     sync_test_irq = 0;
 }
 static void detach(void)
 {
     struct kernel_task *task = kernel_wait_current_task();
-    assert(!task->wait.borrows && !task->wait.nodes && !task->futex_key.identity);
+    assert(!task->wait.borrows && !task->wait.nodes && !task->futex_request);
     assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
     assert(!kernel_mm_release(&task->mm));
     mm_test_bind(0);
@@ -240,20 +269,21 @@ static void notification_batch(void)
     sync_test_irq = 0;
 }
 static struct kernel_task synthetic[17];
+static struct kernel_futex_entry synthetic_entries[17];
 static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     for (unsigned i = 0; i < count; i++) {
         struct kernel_task *task = &synthetic[i];
         *task = (struct kernel_task){0};
-        task->futex_key = *key; task->futex_bitset = 1;
+        synthetic_entries[i]=(struct kernel_futex_entry){.key=*key,.bitset=1};
         task->wait.generation = 1000 + i;
         task->wait.phase = KERNEL_WAIT_PREPARED;
         task->wait.on_cpu = 1;
-        kernel_wait_node_init(&task->default_wait_node, task);
-        task->default_wait_node.generation = task->wait.generation;
-        task->wait.nodes = &task->default_wait_node;
-        kernel_wait_node_add_locked(futex_queue, &task->default_wait_node);
+        kernel_wait_node_init(&synthetic_entries[i].node, task);
+        synthetic_entries[i].node.generation = task->wait.generation;
+        task->wait.nodes = &synthetic_entries[i].node;
+        kernel_wait_node_add_locked(futex_queue, &synthetic_entries[i].node);
     }
 }
 static void synthetic_remove(unsigned count)
@@ -261,9 +291,9 @@ static void synthetic_remove(unsigned count)
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     for (unsigned i = 0; i < count; i++) {
         struct kernel_task *task = &synthetic[i];
-        kernel_wait_node_remove_locked(&task->default_wait_node);
-        assert(!task->wait.borrows && !task->default_wait_node.references &&
-            !task->default_wait_node.borrow_owner);
+        kernel_wait_node_remove_locked(&synthetic_entries[i].node);
+        assert(!task->wait.borrows && !synthetic_entries[i].node.references &&
+            !synthetic_entries[i].node.borrow_owner);
         *task = (struct kernel_task){0};
     }
     assert(!futex_queue->head && !futex_queue->registrations && !futex_queue->borrows);
@@ -281,8 +311,8 @@ static void wake_batches(void)
     synthetic_add(3, &key);
     /* One collision and one masked waiter remain PREPARED; the matched real
      * COMMITTED node is removed in notify, so iteration must save its successor. */
-    synthetic[0].futex_key.offset += 1024;
-    synthetic[1].futex_bitset = 2;
+    synthetic_entries[0].key.offset += 1024;
+    synthetic_entries[1].bitset = 2;
     fast_notification = 1;
     notification_probe = 1; notification_sends = notification_seen = 0;
     futex_test_notification_target(1)->events = 0;
@@ -306,6 +336,19 @@ static void wake_batches(void)
     for (unsigned i = 0; i < 17; i++)
         assert(synthetic[i].wait.phase == KERNEL_WAIT_NOTIFIED);
     synthetic_remove(17);
+    /* Timeout notification does not dequeue a still-running waiter. A real
+     * wake before unqueue must consume this entry and report its wake count. */
+    synthetic_add(1, &key);
+    synthetic[0].wait.phase = KERNEL_WAIT_NOTIFIED;
+    synthetic[0].wait.reason = KERNEL_WAIT_TIMEOUT;
+    assert(measured_wake(source, 1) == 1);
+    synthetic_remove(1);
+    synthetic_add(1,&key);
+    synthetic[0].wait.phase=KERNEL_WAIT_NOTIFIED;
+    synthetic[0].wait.reason=KERNEL_WAIT_TIMEOUT;
+    assert(call(source,3|128,0,1,target,0)==1);
+    assert(call(target,1|128,1,0,0,0)==1);
+    synthetic_remove(1);
 }
 static void operations(void)
 {
@@ -537,6 +580,98 @@ static void shared_wake(void)
     assert(!pthread_join(worker, 0) && w.result == 0);
     assert(!futex_queue->borrows && !futex_queue->registrations);
 }
+static void partial_requeue_backing(void)
+{
+    put(source,0);put(cold_target,0);
+    struct waiter w={.id=1,.bitset=1,.address=source,.result=-99,.operation=9};
+    unsigned before=mm_test_parked(1);pthread_t thread;
+    assert(!pthread_create(&thread,0,waiter,&w));queued(1,before);
+    struct kernel_futex_key key;
+    assert(!kernel_mm_prepare_futex(&mm,&source,1,1,0,0,&key,0));
+    synthetic_add(1,&key);synthetic_entries[0].kind=FUTEX_ENTRY_REQUEUE_PI;
+    assert(call(source,3,0,2,cold_target,0)==-KERNEL_EINVAL);
+    synthetic_remove(1);futex_key_release(&key);
+    assert(call(cold_target,1,1,0,0,0)==1);
+    assert(!pthread_join(thread,0)&&w.result==0);
+}
+extern int64_t kernel_futex_waitv(struct kernel_task *,uint64_t,unsigned,unsigned,uint64_t,int,
+    enum kernel_scheduler_status *);
+static int64_t vector_call(uint64_t address,unsigned count,unsigned flags,uint64_t timeout,int clock)
+{
+    enum kernel_scheduler_status status=KERNEL_SCHEDULER_STATUS_OK;
+    int64_t r=kernel_futex_waitv(kernel_task_current(),address,count,flags,timeout,clock,&status);
+    assert(!status);return r;
+}
+struct vector_user {uint64_t value,address;uint32_t flags,reserved;};
+static const uint64_t vector_address=0x40400;
+static void vector_set(struct vector_user *items,unsigned n)
+{size_t copied;assert(!kernel_copy_to_user(&mm,vector_address,items,n*sizeof(*items),&copied)&&copied==n*sizeof(*items));}
+struct vector_actor {unsigned count;int64_t result;};
+static void *vector_waiter(void *arg)
+{
+    struct vector_actor *v=arg;attach(1);v->result=vector_call(vector_address,v->count,0,0,999);detach();return 0;
+}
+static void waitv_cases(void)
+{
+    assert(vector_call(source,0,0,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(source,129,0,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(0,1,0,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(source,1,1,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(8,1,0,0,0)==-KERNEL_EFAULT);
+    struct vector_user items[128];
+    put(source,7);put(target,7);
+    for(unsigned i=0;i<128;i++)items[i]=(struct vector_user){.value=8,.address=source,.flags=130};
+    vector_set(items,128);
+    assert(vector_call(vector_address,1,0,0,999)==-KERNEL_EAGAIN);
+    assert(vector_call(vector_address,128,0,0,999)==-KERNEL_EAGAIN);
+    items[1].address=source+1;vector_set(items,2);
+    assert(vector_call(vector_address,2,0,0,1)==-KERNEL_EINVAL);
+    items[1].address=8;items[1].flags=2;vector_set(items,2);
+    assert(vector_call(vector_address,2,0,0,1)==-KERNEL_EFAULT);
+    items[0].value=UINT64_C(1)<<32;vector_set(items,1);
+    assert(vector_call(vector_address,1,0,0,1)==-KERNEL_EINVAL);
+    items[0].value=7;items[0].flags=134;vector_set(items,1);
+    assert(vector_call(vector_address,1,0,0,1)==-KERNEL_EOPNOTSUPP);
+    for(unsigned round=0;round<3;round++) {
+        unsigned n=round==2?128:8;
+        for(unsigned i=0;i<n;i++)items[i]=(struct vector_user){.value=7,.address=source,.flags=130};
+        vector_set(items,n);struct vector_actor v={.count=n,.result=-99};
+        unsigned before=mm_test_parked(1);pthread_t thread;
+        assert(!pthread_create(&thread,0,vector_waiter,&v));queued(1,before);
+        if(round==1) {
+            assert(call(source,4|128,0,n,target,7)==n);
+            assert(call(source,1|128,n,0,0,0)==0);
+            assert(call(target,1|128,n,0,0,0)==n);
+        } else {
+            int64_t n_wake=call(source,1|128,n,0,0,0);
+            assert(n_wake>=1 && n_wake<=n);
+            if(n==8)assert(n_wake==8);
+        }
+        assert(!pthread_join(thread,0)&&v.result>=0&&v.result<n);
+    }
+    items[0]=(struct vector_user){.value=7,.address=source,.flags=130};
+    items[1]=(struct vector_user){.value=8,.address=target,.flags=130};
+    vector_set(items,2);
+    vector_pause=1;vector_paused=vector_resume=0;
+    struct vector_actor race={.count=2,.result=-99};pthread_t worker;
+    assert(!pthread_create(&worker,0,vector_waiter,&race));
+    while(!__atomic_load_n(&vector_paused,__ATOMIC_ACQUIRE))sched_yield();
+    assert(call(source,1|128,1,0,0,0)==1);
+    __atomic_store_n(&vector_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(worker,0)&&race.result==0);
+    vector_fail_alloc=1;
+    assert(vector_call(vector_address,2,0,0,1)==-KERNEL_ENOMEM && !kernel_task_current()->futex_request);
+    uint64_t fresh;
+    assert(!kernel_mm_mmap_anonymous(&mm,0x180000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&fresh));
+    items[1]=(struct vector_user){.value=0,.address=fresh,.flags=130};vector_set(items,2);
+    race=(struct vector_actor){.count=2,.result=-99};unsigned before=mm_test_parked(1);
+    assert(!pthread_create(&worker,0,vector_waiter,&race));queued(1,before);
+    assert(call(fresh,1|128,1,0,0,0)==1);
+    assert(!pthread_join(worker,0)&&race.result==1);
+    assert(!kernel_mm_munmap(&mm,fresh,BOAROS_PAGE_SIZE));
+    put(source,0);put(target,0);
+    puts("waitv ABI, full-key precedence, duplicate wake count, vector requeue and128 owners PASS");
+}
 int main(void)
 {
     struct physical_page_allocator allocator = {0};
@@ -558,11 +693,13 @@ int main(void)
     assert(!kernel_mm_brk_initialize(&mm, 0x10000, 0x20000));
     assert(!kernel_mm_context(&mm, &context)); mm_test_context = context;
     assert(!kernel_mm_mmap_anonymous(&mm, source, 2 * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
+    test_heap=&heap;
     attach(0);
+    waitv_cases();
     notification_batch();
     wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
     requeue(target); requeue(source + 1024); comparisons();
-    opposite(target); opposite(source + 1024); coherent_remap(); shared_wake();
+    opposite(target); opposite(source + 1024); coherent_remap(); shared_wake();partial_requeue_backing();
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
@@ -575,3 +712,8 @@ int futex_pi_conflict_locked(struct futex_bucket *bucket,const struct kernel_fut
 { (void)bucket;(void)key;abort(); }
 int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t operation,uint64_t timeout,enum kernel_scheduler_status *status)
 { (void)task;(void)address;(void)operation;(void)timeout;(void)status;abort(); }
+
+int64_t kernel_futex_wait_requeue_pi(struct kernel_task *t,uint64_t a,uint32_t o,uint32_t v,uint64_t d,uint64_t b,enum kernel_scheduler_status *s)
+{(void)t;(void)a;(void)o;(void)v;(void)d;(void)b;(void)s;abort();}
+int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *t,uint64_t a,uint32_t o,uint32_t w,uint32_t n,uint64_t b,uint32_t v,enum kernel_scheduler_status *s)
+{(void)t;(void)a;(void)o;(void)w;(void)n;(void)b;(void)v;(void)s;abort();}

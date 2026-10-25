@@ -388,7 +388,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/wait.c \
 	kernel/sched/park.c \
 	kernel/sched/sync.c \
-	kernel/sched/futex.c \
+	kernel/sched/futex.c kernel/sched/futex_waitv.c \
 	kernel/sched/futex_pi.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
@@ -2819,3 +2819,7 @@ test-rt-limits-host:
 .PHONY: test-pi-priority-host
 test-pi-priority-host:
 	sh tests/pi-priority-host.sh
+
+.PHONY: test-pi-exit-host
+test-pi-exit-host:
+	sh tests/pi-exit-host.sh

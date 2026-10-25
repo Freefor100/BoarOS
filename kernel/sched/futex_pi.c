@@ -115,7 +115,7 @@ static int normal_waiter(struct futex_bucket *bucket,const struct kernel_futex_k
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
             struct kernel_wait_node *node=cursor.node;
             if(node->queue==&bucket->waiters && node->task &&
-               node->task->wait.phase!=KERNEL_WAIT_NOTIFIED && futex_key_equal(&node->task->futex_key,key))found=1;
+               !futex_entry(node)->woken && futex_key_equal(&futex_entry(node)->key,key))found=1;
         }
         if(found)break;
         kernel_wait_cursor_advance(&cursor);
@@ -137,6 +137,7 @@ static int cycle(struct kernel_task *owner,struct kernel_task *waiter)
 static void release_preparation(struct kernel_futex_pi_request *request)
 {
     if(request->pin.mm)kernel_mm_unpin_user_page(&request->pin);
+    if(request->source_pin.mm)kernel_mm_unpin_user_page(&request->source_pin);
     futex_key_release(&request->key);
 }
 static struct kernel_task *handoff(struct kernel_futex_pi_state *state,int fixup)
@@ -157,6 +158,13 @@ static struct kernel_task *handoff(struct kernel_futex_pi_state *state,int fixup
 static void request_finish(struct kernel_futex_pi_request *request,int abandoned)
 {
     struct kernel_task *old=0,*retired_owner=0;int release=0;
+    KERNEL_LOCK_SCOPE(departure);
+    struct kernel_cpu_notification_batch notifications;
+    int departing=abandoned && request->granted && request->state;
+    if(departing) {
+        kernel_mutex_lock(&request->state->bucket->operation,&departure);
+        kernel_cpu_notification_batch_begin(&notifications);
+    }
     {
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         if(request->queued) {
@@ -170,6 +178,7 @@ static void request_finish(struct kernel_futex_pi_request *request,int abandoned
         /* 注销栈请求与归还它的状态引用一次发布，不重复进调度域。 */
         if(request->state)release=state_drop_locked(request->state,&retired_owner);
     }
+    if(departing){kernel_lock_release(&departure);kernel_cpu_notification_batch_end(&notifications);}
     release_preparation(request);
     if(request->exiting){scheduler_task_put(request->exiting);request->exiting=0;}
     if(old)scheduler_task_put(old);
@@ -228,6 +237,79 @@ static int wait_exiting_owner(struct kernel_futex_pi_request *request)
     scheduler_task_put(owner);request->exiting=0;
     return 0;
 }
+enum pi_action { AGAIN,ALLOCATE,EXITING,WAITING,FINISHED };
+static struct kernel_futex_pi_state *state_attach(struct kernel_futex_pi_request *request,
+    struct futex_bucket *bucket,struct kernel_task *owner,uint32_t tid)
+{
+    struct kernel_futex_pi_state *state=request->candidate;
+    request->candidate=0;request->state=state;
+    state->key=request->key;request->key=(struct kernel_futex_key){0};
+    state->bucket=bucket;state->hash_next=bucket->pi_states;
+    __atomic_store_n(&bucket->pi_states,state,__ATOMIC_RELEASE);
+    state->attached=1;state->word_tid=tid;
+    (void)owner_set(state,owner);return state;
+}
+/* 普通LOCK与代理重排共用用户字/owner接纳，实际受益线程是request->task。 */
+static enum pi_action claim_locked(struct kernel_futex_pi_request *request,
+    struct futex_bucket *bucket,uint32_t *word,int mixed,int try_only,int force_state,int *result)
+{
+    struct kernel_task *task=request->task;
+    uint32_t value=__atomic_load_n(word,__ATOMIC_ACQUIRE),tid=(uint32_t)task->tid;
+    struct kernel_futex_pi_state *state=state_find(bucket,&request->key);
+    if((value&FUTEX_TID_MASK)==tid)*result=-KERNEL_EDEADLK;
+    else if(mixed)*result=-KERNEL_EINVAL;
+    else if(state) {
+        uint32_t owner=value&FUTEX_TID_MASK;
+        if(!state->owner || (owner!=state->word_tid &&
+           !((state->needs_fixup || state->owner->futex_exit_state==1) && !owner && (value&FUTEX_OWNER_DIED))))*result=-KERNEL_EINVAL;
+        else if(try_only)*result=-KERNEL_EAGAIN;
+        else if(cycle(state->owner,task))*result=-KERNEL_EDEADLK;
+        else if(!__atomic_compare_exchange_n(word,&value,value|FUTEX_WAITERS,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return AGAIN;
+        else {state_get(state);request->state=state;return WAITING;}
+    } else if(!(value&FUTEX_TID_MASK)) {
+        if(force_state && !request->candidate)return ALLOCATE;
+        uint32_t next=(value&FUTEX_OWNER_DIED)|tid|(force_state?FUTEX_WAITERS:0);
+        if(!__atomic_compare_exchange_n(word,&value,next,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return AGAIN;
+        if(force_state)(void)state_attach(request,bucket,task,tid);
+    } else {
+        uint32_t desired=value|FUTEX_WAITERS;
+        if(!__atomic_compare_exchange_n(word,&value,desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return AGAIN;
+        struct kernel_task *owner=scheduler_task_lookup_locked((int32_t)(value&FUTEX_TID_MASK),KERNEL_PID_TID,0);
+        request->exiting=owner;
+        if(!owner || owner->futex_exit_state==2) {
+            if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=desired)return AGAIN;
+            *result=-KERNEL_ESRCH;
+        } else if(!owner->arch.user_mode)*result=-KERNEL_EPERM;
+        else if(owner->proc_exiting || owner->futex_exit_state==1)return EXITING;
+        else if(try_only)*result=-KERNEL_EAGAIN;
+        else if(cycle(owner,task))*result=-KERNEL_EDEADLK;
+        else if(!request->candidate)return ALLOCATE;
+        else {(void)state_attach(request,bucket,owner,value&FUTEX_TID_MASK);return WAITING;}
+    }
+    return FINISHED;
+}
+static int allocate_state(struct kernel_futex_pi_request *request)
+{
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(request->task->files.heap,1,
+        sizeof(*request->candidate),(void **)&request->candidate);
+    if(status)return status==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
+    request->candidate->heap=request->task->files.heap;request->candidate->references=1;return 0;
+}
+static int pi_deadline(struct kernel_task *task,uint64_t timeout,int realtime,
+    uint64_t *deadline,int *expired)
+{
+    if(!timeout)return 0;
+    struct {int64_t seconds,nanoseconds;} ts;size_t copied;
+    if(kernel_copy_from_user(&task->mm,&ts,timeout,sizeof(ts),&copied) || copied!=sizeof(ts))return -KERNEL_EFAULT;
+    if(ts.seconds<0 || ts.nanoseconds<0 || ts.nanoseconds>=1000000000)return -KERNEL_EINVAL;
+    __uint128_t wide=(__uint128_t)(uint64_t)ts.seconds*1000000000+(uint64_t)ts.nanoseconds;
+    uint64_t ns=wide>INT64_MAX?INT64_MAX:(uint64_t)wide;
+    if(realtime){uint64_t offset=kernel_time_boot_realtime_offset();ns=ns<=offset?0:ns-offset;}
+    enum kernel_time_status converted=kernel_time_deadline_from_monotonic(ns,deadline);
+    if(converted==KERNEL_TIME_STATUS_DEADLINE_PASSED)*expired=1;
+    else if(converted!=KERNEL_TIME_STATUS_OK)__builtin_trap();
+    return 0;
+}
 static int pi_unlock(struct kernel_futex_pi_request *request,enum kernel_scheduler_status *status)
 {
     uint32_t value;size_t copied;
@@ -269,17 +351,8 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
     unsigned command=operation&~(FUTEX_PRIVATE|FUTEX_CLOCK_REALTIME);
     uint64_t deadline=0;int expired=0;
     if(timeout && (command==6 || command==13)) {
-        struct {int64_t seconds,nanoseconds;} ts;size_t copied;
-        if(kernel_copy_from_user(&task->mm,&ts,timeout,sizeof(ts),&copied) || copied!=sizeof(ts))return -KERNEL_EFAULT;
-        if(ts.seconds<0 || ts.nanoseconds<0 || ts.nanoseconds>=1000000000)return -KERNEL_EINVAL;
-        __uint128_t wide=(__uint128_t)(uint64_t)ts.seconds*1000000000+(uint64_t)ts.nanoseconds;
-        uint64_t ns=wide>INT64_MAX?INT64_MAX:(uint64_t)wide;
-        if(command==6 || (operation&FUTEX_CLOCK_REALTIME)) {
-            uint64_t offset=kernel_time_boot_realtime_offset();ns=ns<=offset?0:ns-offset;
-        }
-        enum kernel_time_status converted=kernel_time_deadline_from_monotonic(ns,&deadline);
-        if(converted==KERNEL_TIME_STATUS_DEADLINE_PASSED)expired=1;
-        else if(converted!=KERNEL_TIME_STATUS_OK)__builtin_trap();
+        int error=pi_deadline(task,timeout,command==6 || (operation&FUTEX_CLOCK_REALTIME),&deadline,&expired);
+        if(error)return error;
     }
     if((operation&FUTEX_CLOCK_REALTIME) && command!=13)return -KERNEL_ENOSYS;
     struct kernel_futex_pi_request request={.task=task,.address=address,.operation=operation};
@@ -293,7 +366,7 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
         do {result=pi_unlock(&request,status);} while(result==-KERNEL_EAGAIN);
         request_finish(&request,0);return result;
     }
-    enum { AGAIN,ALLOCATE,EXITING,WAITING,FINISHED } action;
+    enum pi_action action;
     unsigned retries=0;
     for(;;) {
         result=prepare_word(&request,status);
@@ -309,47 +382,7 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
 #endif
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-            uint32_t *word=request_word(&request),value=__atomic_load_n(word,__ATOMIC_ACQUIRE);
-            uint32_t tid=(uint32_t)task->tid;
-            struct kernel_futex_pi_state *state=state_find(bucket,&request.key);
-            if((value&FUTEX_TID_MASK)==tid)result=-KERNEL_EDEADLK;
-            else if(mixed)result=-KERNEL_EINVAL;
-            else if(state) {
-                uint32_t owner=value&FUTEX_TID_MASK;
-                if(!state->owner || (owner!=state->word_tid &&
-                    !((state->needs_fixup || state->owner->futex_exit_state==1) &&
-                      !owner && (value&FUTEX_OWNER_DIED))))result=-KERNEL_EINVAL;
-                else if(command==8)result=-KERNEL_EAGAIN;
-                else if(cycle(state->owner,task))result=-KERNEL_EDEADLK;
-                else if(!__atomic_compare_exchange_n(word,&value,value|FUTEX_WAITERS,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))action=AGAIN;
-                else {state_get(state);request.state=state;action=WAITING;}
-            } else if(!(value&FUTEX_TID_MASK)) {
-                uint32_t next=(value&FUTEX_OWNER_DIED)|tid;
-                if(!__atomic_compare_exchange_n(word,&value,next,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))action=AGAIN;
-            } else {
-                uint32_t desired=value|FUTEX_WAITERS;
-                if(!__atomic_compare_exchange_n(word,&value,desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))action=AGAIN;
-                else {
-                    struct kernel_task *owner=scheduler_task_lookup_locked((int32_t)(value&FUTEX_TID_MASK),KERNEL_PID_TID,0);
-                    request.exiting=owner;
-                    if(!owner || owner->futex_exit_state==2) {
-                        if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=desired)action=AGAIN;
-                        else result=-KERNEL_ESRCH;
-                    } else if(!owner->arch.user_mode)result=-KERNEL_EPERM;
-                    else if(owner->proc_exiting || owner->futex_exit_state==1)action=EXITING;
-                    else if(command==8)result=-KERNEL_EAGAIN;
-                    else if(cycle(owner,task))result=-KERNEL_EDEADLK;
-                    else if(!request.candidate)action=ALLOCATE;
-                    else {
-                        state=request.candidate;request.candidate=0;request.state=state;
-                        state->key=request.key;request.key=(struct kernel_futex_key){0};
-                        state->bucket=bucket;state->hash_next=bucket->pi_states;
-                        __atomic_store_n(&bucket->pi_states,state,__ATOMIC_RELEASE);
-                        state->attached=1;state->word_tid=value&FUTEX_TID_MASK;
-                        (void)owner_set(state,owner);action=WAITING;
-                    }
-                }
-            }
+            action=claim_locked(&request,bucket,request_word(&request),mixed,command==8,0,&result);
             if(action==WAITING) {
                 if(waiter_order==UINT64_MAX)__builtin_trap();
                 request.order=++waiter_order;
@@ -371,9 +404,7 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
         if(action!=EXITING && request.exiting) {scheduler_task_put(request.exiting);request.exiting=0;}
         if(action==FINISHED)break;
         if(action==ALLOCATE) {
-            enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(task->files.heap,1,sizeof(*request.candidate),(void **)&request.candidate);
-            if(allocated) {result=allocated==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;break;}
-            request.candidate->heap=task->files.heap;request.candidate->references=1;
+            result=allocate_state(&request);if(result)break;
         } else if(action==EXITING)wait_exiting_owner(&request);
         else if(action==WAITING) {
 #if BOAROS_MAX_CPUS > 1
@@ -418,6 +449,203 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
     return result;
 }
 
+/* requeue_stage: 1在条件队列，2已交给PI队列，3正在完成。 */
+int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
+    uint32_t operation,uint32_t value,uint64_t timeout,uint64_t target,
+    enum kernel_scheduler_status *status)
+{
+    uint64_t deadline=0;int expired=0;
+    int result=pi_deadline(task,timeout,operation&FUTEX_CLOCK_REALTIME,&deadline,&expired);
+    if(result)return result;
+    if(address==target)return -KERNEL_EINVAL;
+    struct kernel_futex_pi_request pi_request={.task=task,.address=target,.operation=operation,.requeue_stage=1};
+    struct kernel_futex_entry entry={.node={.task=task},.kind=FUTEX_ENTRY_REQUEUE_PI,.bitset=UINT32_MAX,.pi=&pi_request};
+    struct kernel_futex_request request={.task=task,.entries=&entry,.count=1};
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+     if(task->pi_request || task->futex_request)__builtin_trap();
+     task->pi_request=&pi_request;task->futex_request=&request;}
+    result=futex_prepare(task,&target,1,operation,0,(operation&FUTEX_PRIVATE)?0:KERNEL_MM_WRITE,
+        &pi_request.key,&pi_request.pin,status);
+    if(result || *status)goto out;
+    if(pi_request.pin.mm)kernel_mm_unpin_user_page(&pi_request.pin);
+    result=futex_prepare(task,&address,1,operation,0,KERNEL_MM_READ,&entry.key,&pi_request.source_pin,status);
+    if(result || *status)goto out;
+    if(futex_key_equal(&entry.key,&pi_request.key)){result=-KERNEL_EINVAL;goto out;}
+    struct futex_bucket *bucket=futex_bucket(&entry.key);
+    {
+        KERNEL_LOCK_SCOPE(g);kernel_mutex_lock(&bucket->operation,&g);
+        uint32_t *word=(void *)((unsigned char *)pi_request.source_pin.page+(address&BOAROS_PAGE_MASK));
+        if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=value){result=-KERNEL_EAGAIN;goto out;}
+        KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
+        if(kernel_wait_prepare_locked(0,deadline,1,&pi_request.token))__builtin_trap();
+        futex_bind_entry_locked(&bucket->waiters,&entry,&pi_request.token);
+        if(expired)(void)kernel_wait_notify_locked(&pi_request.token,KERNEL_WAIT_TIMEOUT);
+    }
+    kernel_mm_unpin_user_page(&pi_request.source_pin);
+    enum kernel_wait_wake_reason reason;
+    *status=kernel_wait_park(&pi_request.token,&reason);
+    unsigned stage;
+    {
+        KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
+        stage=pi_request.requeue_stage;pi_request.requeue_stage=3;
+        kernel_wait_node_remove_locked(&entry.node);
+        if(pi_request.queued) {
+            waiter_remove(&pi_request);
+            kernel_futex_pi_recalculate_locked(pi_request.state->owner,-1);
+        }
+    }
+    if(kernel_wait_finish(&pi_request.token))__builtin_trap();
+    if(*status)goto out;
+    /* 到期、信号与授予竞争同一状态；真实owner已经交接时完成修复。 */
+    if(pi_request.granted==2) {
+        release_preparation(&pi_request);
+        do {result=fixup_dead_owner(&pi_request,status);}while(result==-KERNEL_EAGAIN && !*status);
+    } else if(pi_request.granted)result=0;
+    else if(reason==KERNEL_WAIT_TIMEOUT)result=-KERNEL_ETIMEDOUT;
+    else if(reason==KERNEL_WAIT_SIGNALLED && stage==1) {
+        kernel_signal_note_syscall_restart(task);task->syscall_restart.kind=KERNEL_SYSCALL_RESTART_NOINTR;
+        result=-KERNEL_ERESTARTSYS;
+    } else result=-KERNEL_EAGAIN;
+out:
+    request_finish(&pi_request,0);
+    kernel_futex_request_release(&request);
+    return result;
+}
+
+static int prepare_requeue_words(struct kernel_futex_pi_request *call,
+    struct kernel_futex_entry *entries,uint64_t address,int target_ready,
+    enum kernel_scheduler_status *status)
+{
+    for(;;) {
+        uint64_t addresses[2]={address,call->address};struct kernel_futex_key keys[2]={0};
+        int result=futex_prepare(call->task,addresses,2,call->operation,target_ready?1:0,
+            target_ready?(uint32_t)target_ready:KERNEL_MM_READ,keys,
+            target_ready?&call->pin:&call->source_pin,status);
+        if(result || *status)return result;
+        entries[0].key=keys[0];entries[1].key=keys[1];
+        if(!target_ready)return 0;
+        enum kernel_mm_status prepared=kernel_mm_try_futex_pin(&call->task->mm,address,
+            !(call->operation&FUTEX_PRIVATE),KERNEL_MM_READ,&keys[0],&call->source_pin);
+        if(!prepared)return 0;
+        release_preparation(call);futex_key_release(&entries[0].key);futex_key_release(&entries[1].key);
+        if(prepared!=KERNEL_MM_STATUS_CONFLICT){*status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;return 0;}
+        /* 两页均需访问时，任何缺页/等待先归还已取得的目标pin。 */
+        result=futex_prepare(call->task,&address,1,call->operation,0,KERNEL_MM_READ,
+            &entries[0].key,&call->source_pin,status);
+        release_preparation(call);futex_key_release(&entries[0].key);
+        if(result || *status)return result;
+    }
+}
+int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
+    uint32_t operation,uint32_t wake_count,uint32_t move_count,uint64_t target,uint32_t expected,
+    enum kernel_scheduler_status *status)
+{
+    if(operation&FUTEX_CLOCK_REALTIME)return -KERNEL_ENOSYS;
+    if(wake_count!=1 || (int32_t)move_count<0 || address==target)return -KERNEL_EINVAL;
+    struct kernel_futex_pi_request call={.task=task,.address=target,.operation=operation};
+    struct kernel_futex_entry entries[2]={0};
+    struct kernel_futex_request owner={.task=task,.entries=entries,.count=2};
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+     if(task->pi_request || task->futex_request)__builtin_trap();
+     task->pi_request=&call;task->futex_request=&owner;}
+    int target_ready=(operation&FUTEX_PRIVATE)?0:KERNEL_MM_WRITE;
+    int result=allocate_state(&call);if(result)goto out;
+    for(;;) {
+        result=prepare_requeue_words(&call,entries,address,target_ready,status);
+        if(result || *status)break;
+        struct kernel_futex_key keys[2]={entries[0].key,entries[1].key};
+        if(futex_key_equal(&keys[0],&keys[1])){result=-KERNEL_EINVAL;break;}
+        struct futex_bucket *buckets[2];struct kernel_lock_guard guards[2]={0};
+        futex_lock_buckets(keys,2,buckets,guards);
+        struct kernel_cpu_notification_batch notifications;
+        kernel_cpu_notification_batch_begin(&notifications);
+        uint32_t *source=(void *)((unsigned char *)call.source_pin.page+(address&BOAROS_PAGE_MASK));
+        int retry=0,prepare_target=0;unsigned moved=0;
+        struct kernel_wait_cursor cursor={0};
+        if(__atomic_load_n(source,__ATOMIC_ACQUIRE)!=expected){result=-KERNEL_EAGAIN;goto unlock;}
+        /* Linux在寻找首个源等待者之前读取目标字；空源队列也检查目标可读。 */
+        if(!call.pin.mm) {
+            enum kernel_mm_status access=kernel_mm_try_futex_pin(&task->mm,target,
+                0,KERNEL_MM_READ,&keys[1],&call.pin);
+            if(access) {
+                if(access!=KERNEL_MM_STATUS_CONFLICT)*status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                else {retry=1;prepare_target=KERNEL_MM_READ;}
+                goto unlock;
+            }
+        }
+        (void)__atomic_load_n(request_word(&call),__ATOMIC_ACQUIRE);
+        int target_mixed=normal_waiter(buckets[1],&keys[1]);
+        kernel_wait_cursor_begin(&buckets[0]->waiters,&cursor);
+        while(cursor.node && (uint64_t)moved<1+(uint64_t)move_count) {
+            struct kernel_wait_node *node=cursor.node;
+            struct kernel_futex_entry *entry=futex_entry(node);
+            int selected=0;
+            {
+                KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+                if(node->queue==&buckets[0]->waiters && futex_key_equal(&entry->key,&keys[0])) {
+                    if(entry->kind!=FUTEX_ENTRY_REQUEUE_PI || !entry->pi ||
+                       !futex_key_equal(&entry->pi->key,&keys[1]))result=-KERNEL_EINVAL;
+                    else if(entry->pi->requeue_stage==1)selected=1;
+                }
+            }
+            if(result)break;
+            if(selected) {
+                if(!(call.pin.access&KERNEL_MM_WRITE)) {
+                    kernel_mm_unpin_user_page(&call.pin);
+                    if(!(operation&FUTEX_PRIVATE))__builtin_trap();
+                    enum kernel_mm_status prepared=kernel_mm_try_futex_pin(&task->mm,target,
+                        !(operation&FUTEX_PRIVATE),KERNEL_MM_WRITE,&keys[1],&call.pin);
+                    if(prepared) {
+                        if(prepared!=KERNEL_MM_STATUS_CONFLICT)*status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                        else {prepare_target=KERNEL_MM_WRITE;retry=1;}
+                        break;
+                    }
+                }
+                KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+                /* 游标保活source entry；超时线程可能已摘队，发布前复核。 */
+                if(node->queue==&buckets[0]->waiters && entry->pi->requeue_stage==1) {
+                    struct kernel_futex_pi_request *request=entry->pi;
+                    request->candidate=call.candidate;call.candidate=0;
+                    enum pi_action action=claim_locked(request,buckets[1],request_word(&call),
+                        target_mixed,0,move_count!=0,&result);
+                    call.candidate=request->candidate;request->candidate=0;
+                    if(request->exiting) {
+                        if(call.exiting)__builtin_trap();
+                        call.exiting=request->exiting;request->exiting=0;
+                    }
+                    if(action==ALLOCATE)__builtin_trap();
+                    if(action==AGAIN || action==EXITING){retry=1;break;}
+                    if(result)break;
+                    if(request->state && !call.state){call.state=request->state;state_get(call.state);}
+                    kernel_wait_node_remove_locked(node);request->requeue_stage=2;
+                    if(action==WAITING) {
+                        if(waiter_order==UINT64_MAX)__builtin_trap();
+                        request->order=++waiter_order;
+                        waiter_insert(request);kernel_futex_pi_recalculate_locked(request->state->owner,-1);
+                    } else {
+                        __atomic_store_n(&request->granted,1,__ATOMIC_RELEASE);
+                        (void)kernel_wait_notify_locked(&request->token,KERNEL_WAIT_WOKEN);
+                    }
+                    moved++;
+                }
+            }
+            kernel_wait_cursor_advance(&cursor);
+        }
+        kernel_wait_cursor_end(&cursor);
+unlock:
+        futex_unlock_buckets(guards);kernel_cpu_notification_batch_end(&notifications);
+        release_preparation(&call);
+        futex_key_release(&entries[0].key);futex_key_release(&entries[1].key);
+        if(result || *status)break;
+        if(!retry){result=(int)moved;break;}
+        if(moved){result=-KERNEL_EAGAIN;break;}
+        if(call.exiting)wait_exiting_owner(&call);
+        if(prepare_target)target_ready=prepare_target;
+    }
+out:
+    request_finish(&call,0);kernel_futex_request_release(&owner);return result;
+}
+
 void kernel_futex_pi_cleanup_begin(struct kernel_task *task)
 {
     KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
@@ -427,12 +655,19 @@ void kernel_futex_pi_cleanup_begin(struct kernel_task *task)
 void kernel_futex_pi_cleanup_end(struct kernel_task *task)
 {
     for(;;) {
-        struct kernel_futex_pi_state *state;struct kernel_task *old;
+        struct kernel_futex_pi_state *state;struct kernel_task *old=0;
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
             state=task->pi_owned;if(!state)break;
-            state_get(state);old=handoff(state,1);
+            state_get(state);
         }
+        /* 重排发布持有目标桶；退出先等待它结束，保留后续等待者的PI状态。 */
+        KERNEL_LOCK_SCOPE(operation);kernel_mutex_lock(&state->bucket->operation,&operation);
+        struct kernel_cpu_notification_batch notifications;
+        kernel_cpu_notification_batch_begin(&notifications);
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+         if(state->owner==task)old=handoff(state,1);}
+        kernel_lock_release(&operation);kernel_cpu_notification_batch_end(&notifications);
         if(old)scheduler_task_put(old);
         state_put(state);
     }

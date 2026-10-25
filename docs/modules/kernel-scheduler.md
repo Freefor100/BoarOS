@@ -266,7 +266,9 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑 gate；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。private WAIT、CMP_REQUEUE 和 WAKE_OP 沿共同用户 pin 协议，在 metadata raw 内检查当前 PTE、访问许可并取得实际页引用；新许可关闭时先等待开放，缺页或 COW 先调用 resolver，再重新取得 pin。共享 key 需要 operation gate 固定整组映射视图，再由 metadata raw 检查当前 PTE 并取得页许可；所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
 
-每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。桶表在 boot CPU 初始化 wait_domain 后、任务和 secondary 发布前一次初始化。每次操作只解析一组桶指针，比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字，并在等待短保护内直接登记 token；任务、桶和栈token已由该调用取得，无需再次经过公共登记包装的参数检查。通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配。WAKE 在至多 16 个登记的短链上，只取得一次 wait_domain，完成 key/bitset 匹配和通知；队列只包含任务节点，节点使用始终在保护内，因而无需锁外游标借用。COMMITTED 通知会摘除节点，扫描在通知前保存后继；PREPARED 通知保留登记，重复扫描跳过已经通知的记录。长链与 requeue 沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，遇到已经通知的 waiter 不再迁移。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
+等待键、bitset及消费状态归每个futex等待项，普通WAIT使用栈上单项；任务仅保存当前请求的清理owner。请求及后备引用在token结束、节点借用排空后归还，强制退出沿共同I/O清理在释放旧栈前完成。
+
+每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。桶表在 boot CPU 初始化 wait_domain 后、任务和 secondary 发布前一次初始化。每次操作只解析一组桶指针，比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字，并在等待短保护内直接登记 token；任务、桶和栈token已由该调用取得，无需再次经过公共登记包装的参数检查。通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配。WAKE 在至多 16 个登记的短链上，只取得一次 wait_domain，完成 key/bitset 匹配和通知；队列只包含任务节点，节点使用始终在保护内，因而无需锁外游标借用。真实WAKE在同一短保护内标记并摘除相应等待项，扫描先保存后继。等待项的消费独立于任务token通知：超时或信号已通知但调用者尚未出队时，真实WAKE仍计数并优先完成该项。长链与 requeue 沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，已经出队的项不再迁移；仅收到超时/信号通知且仍排队的项保留迁移与真实唤醒资格。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
 
 SMP下，WAKE/WAKE_OP及退出唤醒在取得全部桶资格后，借用当前调用栈上的通知批次。READY和目标CPU事件位立即发布；实际IPI目标暂存于该批次，全部桶锁归还后才合并发送，避免发送者在持桶期间等待固件。批次保存并恢复原IRQ及抢占深度，期间保持CPU固定且不允许阻塞；撤销CPU上的栈指针后再发送。原始raw释放路径不增加分支，UP编译为空操作。共享key最终释放与用户pin归还在批次结束后执行。
 
@@ -282,7 +284,17 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名、SysV 和共享文件映射使用上述后备 key，可跨 MM、不同 VA、独立打开和硬链接唤醒或 requeue。私有映射仍使用 MM key。PI 标记项更新 OWNER_DIED，实际 PI owner 随后由其持锁列表交接；futex2 尚未接入。futex 入口在调用者 CPU 执行，文件或缺页后端需要的 CPU0 业务交接由对应 MM/文件层负责。
 
+### 多地址等待
+
+`futex_waitv(449)`导入1～128项24字节描述符，每项是32位期望值、地址、PRIVATE/shared标志及零reserved。返回实际被唤醒项的原始索引；重复地址保留独立排队与WAKE计数，普通REQUEUE移动各项而保留索引。NUMA/MPOL扩展为EOPNOTSUPP，其他非法字段为EINVAL。期限是MONOTONIC或REALTIME绝对时间，没有timeout时忽略clockid。
+
+数组和请求归本次调用，任务只保留强制退出清理owner。先取得所有key，再比较任一值；因此后项key错误先于前项值不符。登记阶段以非阻塞MM资格重查key与实际pin，逐项比较并绑定同一token。一次只持有一个页pin和一个桶；缺页、pin许可关闭或桶竞争时，放桶、归还pin并结束所有登记后再等待或装页。全部节点借用排空后读取实际唤醒项，它优先于已经通知的超时/信号；没有真实唤醒时按原绝对期限及重启规则处理。私人WAKE和普通单项等待沿各自原路径执行。
+
 ### PI mutex
+
+`WAIT_REQUEUE_PI(11)`将等待者登记在条件字，`CMP_REQUEUE_PI(12)`比较源值并把它交给指定PI锁；源和目标使用不同实际key，nr_wake固定为1。成功返回时等待线程已取得目标锁。源队列按登记时基础实时优先级、同优先级FIFO排列，目标队列沿现有继承优先级规则处理。普通WAKE或普通REQUEUE遇到PI条件等待项返回EINVAL，已完成的前缀保留，旧source引用仍按实际迁移数归还。
+
+源等待、目标PI等待、已授予与完成由同一请求保存，复用现有token和owner引用。源阶段信号走NOINTR重启；目标阶段尚未获锁时返回EAGAIN；已授予优先完成用户字修复。共享目标key先取得写访问；私有源比较成功后，即使空队列也检查目标可读，真正代理取得才要求可写。准备缺页或等待时先释放桶和所有pin，重取后复核。退出与已授予请求的致命取消取得目标桶资格再复核owner，避免在重排发布中途摘除仍需接纳后续等待者的状态。
 
 RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未竞争时只原子修改用户字，不常驻分配锁对象，保留 libc 的用户态快速解锁。竞争时，在原桶内发布按真实 key 标识的状态；每个在途调用持有状态引用，状态持有 owner 的任务存储借用及共享 key 的后备引用。调用栈保存等待请求；用户页 pin 只覆盖比较／更新，睡眠前归还，持有者退出后的用户字修复重新取得 pin。
 
@@ -350,7 +362,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI 条件变量重排、futex_waitv和clone3继续后续安排。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展及clone3继续后续安排。LoongArch沿单核执行，已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

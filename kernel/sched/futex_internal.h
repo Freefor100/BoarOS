@@ -16,6 +16,24 @@
 #define FUTEX_TID_MASK UINT32_C(0x3fffffff)
 #define ROBUST_LIST_LIMIT 2048U
 
+enum futex_entry_kind { FUTEX_ENTRY_WAIT, FUTEX_ENTRY_VECTOR, FUTEX_ENTRY_REQUEUE_PI };
+struct kernel_futex_entry {
+    struct kernel_wait_node node;
+    struct kernel_futex_key key;
+    uint32_t bitset, kind, index, woken, priority;
+    struct kernel_futex_pi_request *pi;
+    uint64_t address;
+    uint32_t expected, operation;
+};
+struct kernel_futex_request {
+    struct kernel_task *task;
+    struct kernel_futex_entry *entries;
+    struct kernel_heap *heap;
+    struct kernel_wait_token token;
+    unsigned count;
+};
+static inline struct kernel_futex_entry *futex_entry(struct kernel_wait_node *node)
+{ return (struct kernel_futex_entry *)node; }
 struct futex_bucket {
     struct kernel_mutex operation;
     struct kernel_wait_queue waiters;
@@ -109,15 +127,19 @@ struct kernel_futex_pi_request {
     struct kernel_futex_pi_state *state, *candidate;
     struct kernel_task *exiting;
     struct kernel_futex_key key;
-    struct kernel_mm_user_pin pin;
+    struct kernel_mm_user_pin pin, source_pin;
     struct kernel_wait_token token;
     uint64_t address, order;
-    uint32_t operation, queued, granted;
+    uint32_t operation, queued, granted, requeue_stage;
 };
+void futex_bind_entry_locked(struct kernel_wait_queue *,struct kernel_futex_entry *,const struct kernel_wait_token *);
+void kernel_futex_request_release(struct kernel_futex_request *);
 int64_t kernel_futex_pi(struct kernel_task *,uint64_t,uint32_t,uint64_t,
     enum kernel_scheduler_status *);
 int futex_pi_conflict_locked(struct futex_bucket *,const struct kernel_futex_key *);
 void kernel_futex_pi_abort(struct kernel_task *);
+int64_t kernel_futex_wait_requeue_pi(struct kernel_task *,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,enum kernel_scheduler_status *);
+int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *,uint64_t,uint32_t,uint32_t,uint32_t,uint64_t,uint32_t,enum kernel_scheduler_status *);
 void kernel_futex_pi_cleanup_begin(struct kernel_task *);
 void kernel_futex_pi_cleanup_end(struct kernel_task *);
 int kernel_futex_pi_robust(struct kernel_task *,uint64_t,uint32_t);

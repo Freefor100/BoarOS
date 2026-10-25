@@ -9,6 +9,7 @@
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
+#include <kernel/heap.h>
 
 #include "futex_internal.h"
 
@@ -27,9 +28,47 @@ static int futex_waiter_matches(struct kernel_wait_node *node,
     struct kernel_wait_queue *queue, const struct kernel_futex_key *key)
 {
     return node->task && node->queue == queue &&
-        futex_key_equal(&node->task->futex_key, key) &&
-        kernel_wait_record_of(node->task)->phase != KERNEL_WAIT_NOTIFIED;
+        futex_key_equal(&futex_entry(node)->key, key) && !futex_entry(node)->woken;
 }
+
+void futex_bind_entry_locked(struct kernel_wait_queue *queue,struct kernel_futex_entry *entry,
+    const struct kernel_wait_token *token)
+{
+    entry->priority=scheduler_base_priority(token->task);
+    if(kernel_wait_node_bind_locked(queue,&entry->node,token))__builtin_trap();
+    if(!entry->priority)return;
+    /* 与Linux futex桶一致：登记时的基础RT优先级，其余线程按FIFO。 */
+    struct kernel_wait_node *at=queue->head,*node=&entry->node;
+    while(at!=node && futex_entry(at)->priority>=entry->priority)at=at->next;
+    if(at==node)return;
+    queue->tail=node->previous;
+    if(node->previous)node->previous->next=0;
+    node->previous=at->previous;node->next=at;
+    if(at->previous)at->previous->next=node;else queue->head=node;
+    at->previous=node;
+}
+/* 每个排队项独立消费；超时/信号通知不等于调用者已经摘除该项。 */
+static int futex_wake_entry_locked(struct kernel_wait_node *node)
+{
+    struct kernel_futex_entry *entry=futex_entry(node);
+    if(entry->kind==FUTEX_ENTRY_REQUEUE_PI)return -KERNEL_EINVAL;
+    __atomic_store_n(&entry->woken,1,__ATOMIC_RELEASE);
+    kernel_wait_node_remove_locked(node);
+    struct kernel_wait_token token={node->task,node->generation};
+    (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_WOKEN);
+    return 1;
+}
+void kernel_futex_request_release(struct kernel_futex_request *request)
+{
+    if(request->task->wait.phase!=KERNEL_WAIT_FINISHED)__builtin_trap();
+    { KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+      if(request->task->futex_request!=request)__builtin_trap();
+      request->task->futex_request=0; }
+    for(unsigned i=0;i<request->count;i++)futex_key_release(&request->entries[i].key);
+    if(request->heap)kernel_heap_release(request->heap,request->entries);
+}
+void kernel_futex_abort(struct kernel_task *task)
+{ if(task->futex_request)kernel_futex_request_release(task->futex_request); }
 
 /* 桶操作锁跨扫描保留比较/登记/迁移的次序，raw内扫描有界。
  * moved个源后备引用由caller在解桶锁、归还用户pin之后释放。 */
@@ -42,6 +81,7 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
     struct kernel_wait_queue *destination = target_bucket ? &target_bucket->waiters : 0;
     struct kernel_wait_cursor cursor;
     uint32_t woken = 0, moved = 0;
+    int error=0;
     if (__atomic_load_n(&bucket->pi_states,__ATOMIC_RELAXED)) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if (futex_pi_conflict_locked(bucket,source))return -KERNEL_EINVAL;
@@ -56,9 +96,10 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
                 /* COMMITTED通知会摘除当前节点，先保存仍受保护的后继。 */
                 struct kernel_wait_node *next = node->next;
                 if (futex_waiter_matches(node, queue, source) &&
-                    (node->task->futex_bitset & bitset)) {
-                    struct kernel_wait_token token = {node->task, node->generation};
-                    if (kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN)) woken++;
+                    (futex_entry(node)->bitset & bitset)) {
+                    int result=futex_wake_entry_locked(node);
+                    if(result<0)return result;
+                    woken++;
                 }
                 node = next;
             }
@@ -74,10 +115,16 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             if (futex_waiter_matches(node, queue, source)) {
-                if (woken < count && (task->futex_bitset & bitset)) {
-                    struct kernel_wait_token token = {task, node->generation};
-                    if (kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN)) woken++;
-                } else move = moved < requeue;
+                if (woken < count && (futex_entry(node)->bitset & bitset)) {
+                    int result=futex_wake_entry_locked(node);
+                    if(result<0) { error=result;goto finished; }
+                    woken++;
+                } else if(moved<requeue) {
+                    if(futex_entry(node)->kind==FUTEX_ENTRY_REQUEUE_PI) {
+                        error=-KERNEL_EINVAL;goto finished;
+                    }
+                    move=1;
+                }
             }
         }
         if (move) {
@@ -87,12 +134,12 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
             kernel_wait_cursor_advance(&cursor);
             {
                 KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-                if (node->queue == queue && futex_key_equal(&task->futex_key, source)) {
+                if (node->queue == queue && futex_key_equal(&futex_entry(node)->key, source)) {
                     enum kernel_scheduler_status result =
                         kernel_wait_node_move_locked(node, destination);
                     if (result == KERNEL_SCHEDULER_STATUS_OK) {
                         futex_key_hold(target);
-                        task->futex_key = *target;
+                        futex_entry(node)->key = *target;
                         moved++;
                     } else if (result != KERNEL_SCHEDULER_STATUS_EMPTY) __builtin_trap();
                 }
@@ -102,9 +149,10 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         }
         kernel_wait_cursor_advance(&cursor);
     }
+finished:
     kernel_wait_cursor_end(&cursor);
     if (moved_count) *moved_count = moved;
-    return (int64_t)woken + moved;
+    return error?error:(int64_t)woken + moved;
 }
 
 static uint32_t futex_wake_count(uint32_t count)
@@ -170,26 +218,29 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
         futex_key_release(&key);
         return actual != value ? -KERNEL_EAGAIN : -KERNEL_ETIMEDOUT;
     }
-    task->futex_key = key;
-    task->futex_bitset = bitset;
-    struct kernel_wait_token token;
+    struct kernel_futex_entry entry={.node={.task=task},.key=key,.bitset=bitset};
+    struct kernel_futex_request request={.task=task,.entries=&entry,.count=1};
     {
         /* 当前任务、桶和token已由本调用取得；直接在等待保护内登记。 */
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        *status = kernel_wait_prepare_locked(&resolved[0]->waiters, deadline, 1, &token);
+        if(task->futex_request)__builtin_trap();
+        task->futex_request=&request;
+        *status = kernel_wait_prepare_locked(0, deadline, 1, &request.token);
+        if(!*status)futex_bind_entry_locked(&resolved[0]->waiters,&entry,&request.token);
     }
     /* token登记后不再取得任何可睡眠锁；先放桶锁再归还pin，MM编辑可排空它。 */
     futex_unlock_buckets(guards);
     kernel_mm_unpin_user_page(&pin);
     if (*status != KERNEL_SCHEDULER_STATUS_OK) {
-        futex_key_release(&task->futex_key); task->futex_bitset = 0;
+        kernel_futex_request_release(&request);
         return 0;
     }
     enum kernel_wait_wake_reason reason;
-    *status = kernel_wait_park(&token, &reason);
-    if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    futex_key_release(&task->futex_key); task->futex_bitset = 0;
-    if (*status != KERNEL_SCHEDULER_STATUS_OK) return 0;
+    *status = kernel_wait_park(&request.token, &reason);
+    if (kernel_wait_finish(&request.token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    int woken=entry.woken;
+    kernel_futex_request_release(&request);
+    if (*status != KERNEL_SCHEDULER_STATUS_OK || woken) return 0;
     if (reason == KERNEL_WAIT_TIMEOUT) return -KERNEL_ETIMEDOUT;
     if (reason == KERNEL_WAIT_SIGNALLED) {
         if (has_timeout) kernel_signal_note_futex_timed_restart(task, address,
@@ -216,6 +267,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
+    if(command==11U)return kernel_futex_wait_requeue_pi(task,address,operation,value,timeout_or_count,address2,status);
+    if(command==12U)return kernel_futex_cmp_requeue_pi(task,address,operation,value,(uint32_t)timeout_or_count,address2,bitset,status);
     if (command==6U || command==7U || command==8U || command==13U)
         return kernel_futex_pi(task,address,operation,timeout_or_count,status);
     if (command != 0U && command != 1U && command != 3U &&
@@ -300,9 +353,11 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
             else {
                 result = futex_wake(&keys[0], futex_wake_count(value), 0, 0,
                                     FUTEX_BITSET_MATCH_ANY, 0, resolved[0], 0);
-                if (comparison) result += futex_wake(&keys[1],
-                    futex_wake_count(second_count), 0, 0, FUTEX_BITSET_MATCH_ANY, 0,
-                    resolved[1], 0);
+                if (result>=0 && comparison) {
+                    int64_t second=futex_wake(&keys[1],futex_wake_count(second_count),
+                        0,0,FUTEX_BITSET_MATCH_ANY,0,resolved[1],0);
+                    result=second<0?second:result+second;
+                }
             }
         } else result = futex_wake(&keys[0], requeue ? value : futex_wake_count(value),
             requeue ? second_count : 0, requeue ? &keys[1] : 0,

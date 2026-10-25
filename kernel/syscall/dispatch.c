@@ -632,6 +632,13 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                              : KERNEL_SYSCALL_ACTION_EXIT;
         decoded.value = (int64_t)(request->arguments[0] &
                                   LINUX_EXIT_STATUS_MASK);
+    } else if (request->number == 449U) {
+        enum kernel_scheduler_status futex_status;
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_futex_waitv(caller,request->arguments[0],
+            (uint32_t)request->arguments[1],(uint32_t)request->arguments[2],
+            request->arguments[3],(int32_t)request->arguments[4],&futex_status);
+        if(futex_status)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 98U) {
         enum kernel_scheduler_status futex_status;
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;

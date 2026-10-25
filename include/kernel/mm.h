@@ -199,6 +199,10 @@ enum kernel_mm_status kernel_mm_prepare_futex(
     unsigned pin_index, uint32_t access, struct kernel_futex_key *keys,
     struct kernel_mm_user_pin *pin);
 
+/* 已保留key的登记阶段只尝试当前映射/pin；CONFLICT要求先结束token再准备。 */
+enum kernel_mm_status kernel_mm_try_futex_pin(struct kernel_mm *,uint64_t,int,uint32_t,
+    const struct kernel_futex_key *,struct kernel_mm_user_pin *);
+
 /* Unique for the lifetime of the kernel, including after MM page reuse. */
 enum kernel_mm_status kernel_mm_futex_id(
     const struct kernel_mm *mm, uint64_t *identity);
