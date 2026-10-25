@@ -263,6 +263,18 @@ static void fault_retains_owner(void)
     CHECK(!close(hold.done[0])&&!close(hold.done[1])&&!close(hold.release[0])&&!close(hold.release[1])&&!munmap(a,4096)&&!munmap(b,4096));
     puts("PI CASE fixup-fault-retains-live-owner PASS");
 }
+
+static void killed_waiter(void)
+{
+    uint32_t *word=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);CHECK(word!=MAP_FAILED&&!pi(word,6,0));
+    int ready[2];CHECK(!pipe(ready));pid_t child=fork();CHECK(child>=0);
+    if(!child){policy(SCHED_FIFO,60);byte_send(ready[1]);CHECK(!pi(word,6,0));_exit(2);}
+    byte_read(ready[0]);char state;uint64_t end=stamp()+2000000000;
+    while(task_field((pid_t)syscall(SYS_gettid),18,&state)!=-61){CHECK(stamp()<end);sched_yield();}
+    CHECK(!kill(child,SIGKILL));int st;CHECK(waitpid(child,&st,0)==child&&WIFSIGNALED(st)&&WTERMSIG(st)==SIGKILL);
+    CHECK(task_field((pid_t)syscall(SYS_gettid),18,&state)>=0&&!pi(word,7,0)&&!*word);
+    CHECK(!close(ready[0])&&!close(ready[1])&&!munmap(word,4096));puts("PI CASE killed-waiter-withdraws-donation PASS");
+}
 static void waiter_order(void)
 {
     uint32_t word=0;unsigned counter=0;CHECK(!pi(&word,6|PRIVATE,0));struct contender c[3];pthread_t t[3];
@@ -288,8 +300,8 @@ static void local_cpus(void)
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);alarm(15);mkdir("/proc",0755);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);
-    raw_owner();raw_errors();contention();timeouts_and_signal();shared_fork();libc_robust();queued_owner_exit();inversion();chain_cycle();mixed();shared_alias();fault_retains_owner();waiter_order();local_cpus();
-    puts("PI END 14");alarm(0);
+    raw_owner();raw_errors();contention();timeouts_and_signal();shared_fork();libc_robust();queued_owner_exit();inversion();chain_cycle();mixed();shared_alias();fault_retains_owner();killed_waiter();waiter_order();local_cpus();
+    puts("PI END 15");alarm(0);
     if(getpid()==1){sync();reboot(RB_POWER_OFF);}
     return 0;
 }
