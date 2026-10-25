@@ -171,3 +171,7 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 | `shmctl01`的枚举前置查询 | 原先在`get_shm_idx_from_id()`的SHM_INFO(14)返回EINVAL；INFO/STAT/ANY和最高槽返回值已接入。 | 第一阶段四配置均进入主体并12/12通过；包含20个子进程的附加、解除和fork统计。STAT_ANY及槽复用另由直接消费者验证，见[本阶段结果](oscomp-ltp-analysis.md#fork策略与shm查询原程序结果2026-10-25)。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/shmctl/shmctl01.c)。 |
 
 `shmctl02`的nobody输入问题统一列于前面的运行库和原盘依赖表。普通映射DONTNEED、私有COW与共享后备内容由直接程序验证；当前VDSO DONTNEED返回EINVAL，Linux特殊映射可重装，这是仍保留的内核兼容缺口。
+
+## 原盘futex覆盖范围
+
+2026-10-25核对RV/LA、glibc/musl四份发布目录：均有普通WAIT/WAKE、CMP_REQUEUE、BITSET和waitv程序，没有独立的LOCK_PI／UNLOCK_PI测例。因此原`futex_wait01/wake01/cmp_requeue01`的17/17用于普通路径回归；新增PI mutex的功能依据来自两架构直接程序、libc的PTHREAD_PRIO_INHERIT消费者及固定Linux差分。原ELF与判分保持原样，结果见[本批futex结果](oscomp-ltp-analysis.md#pi-mutex接入后的原futex短例2026-10-25)。waitv入口继续列在内核能力目录中。

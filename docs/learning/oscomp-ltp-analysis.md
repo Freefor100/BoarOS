@@ -885,3 +885,17 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 上述耗时包含真实mke2fs与准备/清理。mount03的原盘用户数据库问题已并入[统一问题表](oscomp-test-issues.md)，未补造原输入账户；NOEXEC/NODEV实际拒绝、解释器、设备别名、旧FD、映射最大权限及卸载由12组同ELF Linux差分直接验证，两架构两种libc和RV2/4核通过。原mount03还覆盖remount和atime扩展，保留为后续能力范围，未以本批直接短例宣称它完整通过。
 
 两架构PID1正常结束，最终heap-live=0；根盘及第二盘三个分区共八对象检查为0，默认交付内核按保存SHA恢复。实际输入身份、细项、耗时和磁盘检查位于`build/staged-mm-mount-20261025/stage3/original/`，性能与PTY退出修复见[本阶段成本记录](cpu-accounting-cost.md#挂载属性最终单核对照)。
+
+## PI mutex接入后的原futex短例：2026-10-25
+
+使用固定官方容器、原QEMU双盘参数，仅运行下列三项；两架构并行、glibc/musl分别使用原ELF、参数与judge。四配置均进入主体，退出0，无准备失败和超时；每配置17/17，合计68/68。
+
+| 原程序 | 每配置得分／通过细项 | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms |
+|---|---:|---:|---:|---:|---:|
+| futex_wait01 | 4/4 | 153 | 62 | 133 | 66 |
+| futex_wake01 | 6/6 | 72 | 65 | 64 | 42 |
+| futex_cmp_requeue01 | 7/7 | 4547 | 2662 | 4483 | 2998 |
+
+原程序检查普通futex在PI接入后的行为。盘内没有独立PI mutex测例，PI加锁／继承／owner退出由固定Linux同ELF及两种libc直接消费者检查，覆盖范围见[PI成本与验证](cpu-accounting-cost.md#pi-mutex-与普通路径成本2026-10-25)。当前PI条件变量重排和futex_waitv仍为后续能力，原盘的waitv程序未列入本次运行。
+
+八个根盘／分区fsck均正常，两架构最终heap-live=0，默认交付内核按保存SHA恢复，原有交付文档修改保持原字节。细项、输入身份、原始serial和每程序计时在`build/pi-futex-20261025/original/`，正常运行盘已清理。
