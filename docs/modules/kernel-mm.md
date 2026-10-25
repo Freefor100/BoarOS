@@ -10,7 +10,7 @@
 
 接纳使用实际调用线程组的 MEMLOCK 软限额，按架构页取整，`CAP_IPC_LOCK` 豁免。锁定重叠范围只计一次；下调限额保留已有范围。mmap（含固定替换）、brk、新增栈范围、mremap 扩大和 SysV attach 在修改前检查额度。mmap 按 Linux 将本次完整长度加入旧锁定用量后检查，额度拒绝保留固定替换的旧映射；brk 拒绝返回旧 break，锁定映射的 mremap 扩大超限返回 EAGAIN。mprotect 保留策略。
 
-立即锁定先提交 VMA 属性，再释放 MM 修改资格，复用匿名、COW 和文件缺页路径逐页预装。每页在同一次 MM 资格内检查当前锁定策略、选择访问类型并向共同缺页过程交接 VMA 快照，不再释放后重复取得资格和查找。分配、COW 复制和文件 I/O 仍在锁外完成，恢复后重新核对 VMA 代次及来源；冲突时重新检查该页策略。PROT_NONE 范围保留属性而不装入，普通 mlock 返回 ENOMEM，ONFAULT 登记成功；纯执行权限范围沿执行缺页路径装入。普通 mlock 预装缺页失败转为 ENOMEM，物理内存不足转为 EAGAIN，已提交属性和已驻留前缀保留；mmap 和 mlockall 的预装按 Linux 采用尽力完成规则。`MCL_FUTURE` 的重复设置替换未来策略，munlockall 同时清除当前和未来策略。
+立即锁定先提交 VMA 属性，再释放 MM 修改资格，复用匿名、COW 和文件缺页路径逐页预装。每页在同一次 MM 资格内检查当前锁定策略、选择访问类型并分派到既有缺页后端，不再释放后重复取得资格。普通用户缺页保留原调用过程。分配、COW 复制和文件 I/O 仍在锁外完成，恢复后重新核对 VMA 代次及来源；冲突时重新检查该页策略。PROT_NONE 范围保留属性而不装入，普通 mlock 返回 ENOMEM，ONFAULT 登记成功；纯执行权限范围沿执行缺页路径装入。普通 mlock 预装缺页失败转为 ENOMEM，物理内存不足转为 EAGAIN，已提交属性和已驻留前缀保留；mmap 和 mlockall 的预装按 Linux 采用尽力完成规则。`MCL_FUTURE` 的重复设置替换未来策略，munlockall 同时清除当前和未来策略。
 
 当前没有 swap；PTE 已持有真实物理引用，文件映射的 cache alias 也参与回收判断，因此锁页复用现有持有关系。munlock 解除策略和计费，显式 unmap、文件截断和打洞继续执行原失效及回收协议。fork 创建的新 MM 清除锁定属性和未来策略；CLONE_VM/vfork 共享原 MM；成功 exec 使用新 MM，失败 exec 保留原状态。
 
