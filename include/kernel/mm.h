@@ -162,6 +162,14 @@ enum kernel_mm_status kernel_mm_set_exec_layout(
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot);
 
+enum kernel_mm_advice {
+    KERNEL_MM_ADVICE_NORMAL = 0,
+    KERNEL_MM_ADVICE_RANDOM = 1,
+    KERNEL_MM_ADVICE_SEQUENTIAL = 2,
+    KERNEL_MM_ADVICE_WILLNEED = 3,
+    KERNEL_MM_ADVICE_DONTNEED = 4,
+};
+int kernel_mm_madvise(struct kernel_mm *, uint64_t, uint64_t, int32_t advice);
 int kernel_mm_mlock(struct kernel_mm *, uint64_t, uint64_t, uint32_t flags);
 int kernel_mm_munlock(struct kernel_mm *, uint64_t, uint64_t);
 int kernel_mm_mlockall(struct kernel_mm *, uint32_t flags);

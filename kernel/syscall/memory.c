@@ -343,6 +343,18 @@ enum kernel_syscall_status syscall_handle_msync(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_madvise(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_mm_madvise(mm, request->arguments[0], request->arguments[1],
+        (int32_t)request->arguments[2]);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_mlock(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {

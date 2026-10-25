@@ -945,6 +945,46 @@ static void *mincore_last_source(void *unused)
     assert(kernel_mm_mincore(&mm,mincore_address,1,&value,&completed)==-KERNEL_ENOMEM&&!completed);
     mm_test_finish();return 0;
 }
+static uint64_t advise_address;
+static void *advise_last_source(void *unused)
+{
+    (void)unused;mm_test_attach(1);mm_test_activate_task();mm_test_bind(&mm);
+    assert(!kernel_mm_madvise(&mm,advise_address,BOAROS_PAGE_SIZE,3));
+    mm_test_finish();return 0;
+}
+static void madvise_file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,struct kernel_page_cache *cache)
+{
+    struct kernel_open_file_description *file=0;int error;size_t done;
+    assert(!kernel_open_file_create_mode(heap,mount,"/advise-fault",0600,&file,&error)&&!error);
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x43,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&done)&&done==sizeof(bytes));
+    uint64_t observed=0;assert(!kernel_vfs_sync(&file->file,0,&observed));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_open_file_node(file)));
+    struct kernel_open_file_description *source=file;assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x500000,BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ,KERNEL_MM_MAP_FIXED_NOREPLACE,&advise_address)&&!source);
+    struct kernel_mm_mapping pte;
+    fail_memlock_read=1;assert(!kernel_mm_madvise(&mm,advise_address,BOAROS_PAGE_SIZE,3));fail_memlock_read=0;
+    assert(kernel_mm_lookup(&mm,advise_address,&pte)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_madvise(&mm,advise_address,BOAROS_PAGE_SIZE,3));
+    assert(kernel_mm_lookup(&mm,advise_address,&pte)==KERNEL_MM_STATUS_NOT_MAPPED);
+    unsigned char resident=0;unsigned completed=0;
+    assert(!kernel_mm_mincore(&mm,advise_address,1,&resident,&completed)&&resident&&completed==1);
+    assert(!kernel_mm_resolve_user_fault(&mm,advise_address,KERNEL_MM_READ));
+    assert(!kernel_mm_madvise(&mm,advise_address,BOAROS_PAGE_SIZE,4));
+    assert(kernel_mm_lookup(&mm,advise_address,&pte)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_open_file_node(file)));
+    struct kernel_vfs_node *node=kernel_open_file_node(file);assert(!kernel_vfs_node_acquire(node));
+    access_entered=resume_access=0;__atomic_store_n(&pause_access,1,__ATOMIC_RELEASE);
+    pthread_t reader;assert(!pthread_create(&reader,0,advise_last_source,0));
+    while(!__atomic_load_n(&access_entered,__ATOMIC_ACQUIRE))sched_yield();
+    struct kernel_open_file_description *borrowed=file;
+    assert(!kernel_mm_munmap(&mm,advise_address,BOAROS_PAGE_SIZE)&&!kernel_open_file_release(&file));
+    assert(node->open_files&&borrowed->references==1);
+    __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);assert(!pthread_join(reader,0));
+    assert(!node->open_files&&!kernel_vfs_node_release(&node));
+    puts("PASS madvise warms cache without PTE; advice I/O failure and last-unmap source owners returned");
+}
 static void memlock_file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,struct kernel_page_cache *cache)
 {
     struct kernel_open_file_description *file=0;int error;size_t done;
@@ -1258,6 +1298,7 @@ int main(int argc,char **argv)
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
+    madvise_file_case(&heap,&mount,&cache);
     memlock_file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);
     offset_handoff_case(&heap,&mount,&cache);

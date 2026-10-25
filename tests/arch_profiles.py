@@ -23,13 +23,16 @@ class ArchitectureProfile:
     def boot(self,qemu,kernel,memory):
         command=[qemu,'-machine','virt','-smp','1','-m',memory,'-kernel',str(kernel),'-nographic','-no-reboot']
         return command+(['-cpu','la464','-global','ls7a_rtc.toy-enabled=on'] if self.name=='loongarch' else ['-bios','default'])
-    def linux_kernel(self):
+    def linux_kernel(self, *, noswap=False):
         if self.name=='loongarch':
-            image=ROOT/'build/linux-la-platform/vmlinux'
+            image=ROOT/('build/linux-la-platform-noswap/vmlinux' if noswap else 'build/linux-la-platform/vmlinux')
             identity=json.loads((image.parent/'boaros-identity.json').read_text())
             revision=next(row.split('\t')[4] for row in (ROOT/'references/sources.tsv').read_text().splitlines() if row.startswith('snapshot\tlinux\t'))
             actual=subprocess.check_output(['git','-C',str(ROOT/'references/linux'),'rev-parse','HEAD'],text=True).strip()
             configuration=image.parent/'.config'
+            if noswap and ('# CONFIG_SWAP is not set' not in configuration.read_text() or
+                identity.get('profile')!='la64-16kb-3level-virt-platform-noswap-v1'):
+                raise RuntimeError('LA reference Linux no-swap profile mismatch')
             if identity['revision']!=revision or actual!=revision or 'CONFIG_16KB_3LEVEL=y' not in configuration.read_text():
                 raise RuntimeError('LA reference Linux revision/page configuration mismatch')
             if hashlib.sha256(configuration.read_bytes()).hexdigest()!=identity.get('configuration_sha256') or hashlib.sha256(image.read_bytes()).hexdigest()!=identity.get('image_sha256'):

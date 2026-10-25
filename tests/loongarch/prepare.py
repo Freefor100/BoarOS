@@ -52,12 +52,14 @@ def prepare(args):
     source, revision = fixed_repository('qemu' if args.component == 'tools' else 'linux')
     profile=getattr(args,'profile','core')
     directory = ROOT / 'build' / ('qemu-la' if args.component == 'tools' else
+        'linux-la-platform-noswap' if profile=='platform-noswap' else
         'linux-la-platform' if profile=='platform' else 'linux-la')
     directory.mkdir(parents=True, exist_ok=True)
     stamp = directory / 'boaros-identity.json'
     compiler = compiler_identity('cc' if args.component == 'tools' else args.cross + 'gcc')
     identity = {'revision': revision, 'compiler': compiler, 'profile':
                 QEMU_OPTIONS if args.component == 'tools' else
+                'la64-16kb-3level-virt-platform-noswap-v1' if profile=='platform-noswap' else
                 'la64-16kb-3level-virt-platform-v1' if profile=='platform' else 'la64-16kb-3level-initramfs-v1'}
     recorded = json.loads(stamp.read_text()) if stamp.exists() else None
     if recorded and {key: value for key, value in recorded.items()
@@ -90,16 +92,20 @@ def prepare(args):
                             '-e', 'BLK_DEV_INITRD', '-e', 'RD_GZIP', '-e', 'DEVTMPFS',
                             '-e', 'BINFMT_ELF', '-d', '4KB_3LEVEL', '-d', '4KB_4LEVEL',
                             '-e', '16KB_3LEVEL'], check=True)
-            if profile=='platform':
+            if profile in ('platform','platform-noswap'):
                 subprocess.run([str(source/'scripts/config'),'--file',str(configuration),
                     '-e','HW_RANDOM_VIRTIO','-e','VIRTIO_NET','-e','NET_FAILOVER','-e','FAILOVER',
                     '-e','RTC_DRV_LOONGSON'],check=True)
+            if profile=='platform-noswap':
+                subprocess.run([str(source/'scripts/config'),'--file',str(configuration),'-d','SWAP'],check=True)
             subprocess.run([*command, 'olddefconfig'], check=True)
         if 'CONFIG_16KB_3LEVEL=y' not in (directory / '.config').read_text():
             raise SystemExit('Linux LA cache no longer uses 16 KiB, three levels')
-        if profile=='platform' and any('CONFIG_'+symbol+'=y' not in configuration.read_text()
+        if profile in ('platform','platform-noswap') and any('CONFIG_'+symbol+'=y' not in configuration.read_text()
             for symbol in ('HW_RANDOM_VIRTIO','VIRTIO_NET','NET_FAILOVER','FAILOVER','RTC_DRV_LOONGSON')):
             raise SystemExit('Linux LA platform cache lacks builtin devices')
+        if profile=='platform-noswap' and '# CONFIG_SWAP is not set' not in configuration.read_text():
+            raise SystemExit('Linux LA no-swap cache enables swap')
         subprocess.run([*command, f'-j{args.jobs}', 'vmlinux'], check=True)
         identity['configuration_sha256'] = hashlib.sha256(configuration.read_bytes()).hexdigest()
     identity['image_sha256']=hashlib.sha256((directory/('qemu-system-loongarch64' if args.component=='tools' else 'vmlinux')).read_bytes()).hexdigest()
@@ -111,6 +117,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--component', choices=('tools', 'linux'), required=True)
     parser.add_argument('--cross', default='loongarch64-unknown-linux-gnu-')
-    parser.add_argument('--profile',choices=('core','platform'),default='core')
+    parser.add_argument('--profile',choices=('core','platform','platform-noswap'),default='core')
     parser.add_argument('--jobs', type=int, default=min(os.cpu_count() or 1, 12))
     prepare(parser.parse_args())
