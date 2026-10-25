@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -87,16 +88,25 @@ static void fork_lazy(int fd)
     CHECK(compare(getpid(),c,SIGHAND_OBJECT,0,0)==before);
     token(to[1],'x');joined(c);CHECK(!close(to[1])&&!close(from[0]));pass("fork-empty-sighand-lazy-identity");
 }
+struct vfork_query_arguments {pid_t parent;int fd;};
+static int vfork_compare(void *argument)
+{
+    const struct vfork_query_arguments *query=argument;
+    pid_t me=(pid_t)syscall(SYS_getpid);int failed=0;
+    failed|=compare(query->parent,me,VM_OBJECT,0,0)!=0;
+    failed|=compare(query->parent,me,FILE_OBJECT,query->fd,query->fd)!=0;
+    for(int type=FILES_OBJECT;type<=SIGHAND_OBJECT;type++){
+        long r=compare(query->parent,me,type,0,0);failed|=r!=1&&r!=2;}
+    return failed;
+}
 static void vfork_query(int fd)
 {
-    pid_t parent=getpid(),c=vfork();CHECK(c>=0);
-    if(!c){pid_t me=(pid_t)syscall(SYS_getpid);int failed=0;
-        failed|=compare(parent,me,VM_OBJECT,0,0)!=0;
-        failed|=compare(parent,me,FILE_OBJECT,fd,fd)!=0;
-        for(int type=FILES_OBJECT;type<=SIGHAND_OBJECT;type++){
-            long r=compare(parent,me,type,0,0);failed|=r!=1&&r!=2;}
-        _exit(failed);}
-    joined(c);pass("vfork-shared-vm-independent-tables");
+    char *stack=malloc(65536);CHECK(stack);
+    struct vfork_query_arguments query={getpid(),fd};
+    /* Request the kernel sharing flags explicitly: musl ports without a vfork
+     * assembly entry use fork semantics. C comparisons need a separate stack. */
+    pid_t c=clone(vfork_compare,stack+65536,CLONE_VM|CLONE_VFORK|SIGCHLD,&query);
+    CHECK(c>=0);joined(c);free(stack);pass("vfork-shared-vm-independent-tables");
 }
 struct child_gate {int ready,go;};
 static int clone_wait(void *argument)
@@ -118,7 +128,12 @@ static void thread_objects(int fd)
     CHECK(!pthread_create(&thread,0,thread_wait,&gate));pid_t tid;CHECK(read(from[0],&tid,sizeof(tid))==sizeof(tid));
     CHECK(!compare(getpid(),tid,FILE_OBJECT,fd,fd));
     for(int type=VM_OBJECT;type<=SEM_OBJECT;type++)if(type!=IO_OBJECT)CHECK(!compare(getpid(),tid,type,0,0));
-    token(to[1],'x');CHECK(!pthread_join(thread,0));ERROR(compare(getpid(),tid,VM_OBJECT,0,0),ESRCH);
+    int observer=(int)syscall(434,tid,0200U);CHECK(observer>=0);
+    token(to[1],'x');CHECK(!pthread_join(thread,0));
+    /* join observes CHILD_CLEARTID before Linux necessarily removes the TID. */
+    struct pollfd departed={observer,POLLHUP,0};
+    CHECK(poll(&departed,1,5000)==1&&(departed.revents&POLLHUP));
+    ERROR(compare(getpid(),tid,VM_OBJECT,0,0),ESRCH);CHECK(!close(observer));
     CHECK(!close(to[0])&&!close(to[1])&&!close(from[0])&&!close(from[1]));pass("pthread-shared-resources-tid-retirement");
 }
 static void semaphore_undo(void)
