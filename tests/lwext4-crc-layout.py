@@ -11,7 +11,7 @@ parser.add_argument('--scheduler-only', action='store_true',
 args = parser.parse_args()
 symbols = subprocess.check_output([args.nm, '-S', '--defined-only', args.kernel], text=True)
 if not args.scheduler_only:
-    for name, alignment in [('crc32c', 2048), ('put_buffer', 1024), ('memcpy', 1024), ('memmove', 2048)]:
+    for name, alignment in [('crc32c', 2048), ('put_buffer', 1024), ('memcpy', 1024), ('memmove', 2048), ('kernel_wait_prepare', 256)]:
         matches = [line.split() for line in symbols.splitlines() if line.split()[-1:] == [name]]
         if len(matches) != 1:
             raise SystemExit(f'expected one {name} function')

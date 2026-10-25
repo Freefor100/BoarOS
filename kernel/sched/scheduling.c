@@ -748,15 +748,16 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
     struct kernel_cpu *caller=kernel_cpu_current();
     if(!caller->raw_locks || caller->raw_locks->lock!=&kernel_wait_domain ||
        !task || base>99 || inherited>99)__builtin_trap();
-    if(task->wait.on_cpu) {
-        if(!task->cpu)__builtin_trap();
-        /* 旧栈的on_cpu借用可晚于current的交接；此时不再按旧策略计时。 */
-        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
-    }
     unsigned priority=base>inherited?base:inherited;
     unsigned saved=priority>base?base+1U:0;
     int old=task->scheduling.priority,move=priority!=(unsigned)old;
     int changed_boost=!!saved!=!!task->pi_base_priority;
+    if(!move && saved==task->pi_base_priority)return;
+    /* 未改变实际执行优先级时，owner交接不产生新的CPU记账边界。 */
+    if(move && task->wait.on_cpu) {
+        if(!task->cpu)__builtin_trap();
+        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
+    }
     int queued=task->ready_node.queued;
     if(move && queued)ready_remove_locked(task);
 #if BOAROS_USER_SMP
@@ -812,6 +813,10 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
                     (task->scheduling.reset_on_fork && !updated.reset_on_fork))result=-KERNEL_EPERM;
             }
             if (!result) {
+                if(updated.policy!=task->scheduling.policy && task->wait.on_cpu) {
+                    if(!task->cpu)__builtin_trap();
+                    if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
+                }
                 if(task->pi_owned || task->pi_request)
                     kernel_futex_pi_recalculate_locked(task,updated.priority);
                 else scheduler_pi_priority_locked(task,(unsigned)updated.priority,0);

@@ -168,7 +168,9 @@ enum kernel_scheduler_status kernel_wait_prepare_locked(struct kernel_wait_queue
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
-enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue,
+/* 高频登记包装保持在一个代码页；跨页会使QEMU每次返回多走TB查找。 */
+enum kernel_scheduler_status __attribute__((aligned(256)))
+kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
     if (!token || (interruptible != 0 && interruptible != 1) ||

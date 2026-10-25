@@ -11,11 +11,12 @@ struct kernel_scheduler scheduler;
 static struct kernel_cpu cpus[4];
 static struct kernel_task idle[4], tasks[4];
 static uint64_t now=100;
+static unsigned clock_samples;
 extern void scheduler_pi_priority_locked(struct kernel_task *,unsigned,unsigned) __attribute__((weak));
 void *sync_test_cpu(void){return &cpus[0];}
 void *sync_test_current_task(void){return cpus[0].current;}
 void sync_test_current_task_set(void *task){cpus[0].current=task;}
-uint64_t kernel_time_monotonic_ns(void){return now;}
+uint64_t kernel_time_monotonic_ns(void){clock_samples++;return now;}
 uint32_t kernel_time_is_initialized(void){return 1;}
 uint64_t riscv_time_read(void){return now;}
 uint64_t kernel_time_ticks_to_ns(uint64_t n){return n;}
@@ -54,6 +55,18 @@ static void ready_and_running(void)
     cpus[1].need_resched=0;
     scheduler_pi_priority_locked(&tasks[0],10,85);
     assert(tasks[0].scheduling.priority==85 && cpus[1].need_resched);
+}
+static void unchanged_owner_priority(void)
+{
+    setup();KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+    tasks[0].state=KERNEL_THREAD_STATE_RUNNING;tasks[0].wait.on_cpu=1;
+    cpus[0].current=&tasks[0];unsigned before=clock_samples;
+    scheduler_pi_priority_locked(&tasks[0],10,0);
+    assert(clock_samples==before && "unchanged PI priority needlessly resamples CPU accounting");
+    scheduler_pi_priority_locked(&tasks[0],10,70);
+    assert(clock_samples==before+1 && tasks[0].scheduling.priority==70);
+    scheduler_pi_priority_locked(&tasks[0],10,70);
+    assert(clock_samples==before+1);
 }
 static void service_and_bandwidth(void)
 {
@@ -146,6 +159,6 @@ static void long_existing_chain(void)
 int main(void)
 {
     assert(scheduler_pi_priority_locked && "PI effective-priority publication is missing");
-    ready_and_running();service_and_bandwidth();equal_priority_order();donation_chain();long_existing_chain();
+    ready_and_running();unchanged_owner_priority();service_and_bandwidth();equal_priority_order();donation_chain();long_existing_chain();
     puts("PI priority: ready/running, four eligibilities, service reservation, throttling, FIFO and donation chain passed");
 }
