@@ -99,6 +99,7 @@ uint64_t kernel_task_current_stack_limit(void);
 uint64_t kernel_task_current_fsize_limit(void);
 enum kernel_task_status kernel_task_memory_limits(
     const struct kernel_task *, struct kernel_memory_limits *);
+uint64_t kernel_task_current_memlock_limit(void);
 void kernel_task_current_memory_limits(struct kernel_memory_limits *);
 
 enum kernel_task_status kernel_task_ppid(

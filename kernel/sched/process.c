@@ -2494,6 +2494,14 @@ void kernel_task_current_memory_limits(struct kernel_memory_limits *limits)
     limits->data_hard = __atomic_load_n(&record->values[KERNEL_RLIMIT_DATA].maximum, __ATOMIC_RELAXED);
 }
 
+uint64_t kernel_task_current_memlock_limit(void)
+{
+    struct kernel_task *task = kernel_task_current();
+    if (!kernel_task_has_user_context(task) ||
+        kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_IPC_LOCK)) return KERNEL_RLIM_INFINITY;
+    return __atomic_load_n(&task->limits->values[KERNEL_RLIMIT_MEMLOCK].current, __ATOMIC_RELAXED);
+}
+
 uint64_t kernel_task_current_stack_limit(void)
 {
     struct kernel_task *task = kernel_task_current();

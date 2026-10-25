@@ -59,6 +59,18 @@ static int inode_permission(struct kernel_vfs_node *node, unsigned access)
     return node->instance->ops->permission ? node->instance->ops->permission(node,cred,access) :
         kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
 }
+int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    const struct kernel_credentials *cred = kernel_credentials_current();
+    KERNEL_LOCK_SCOPE(io);
+    kernel_vfs_node_lock(node, &io, 0);
+    if (cred->fsuid == node->uid || kernel_credentials_capable(cred, KERNEL_CAP_FOWNER)) return 1;
+    if (node->instance->read_only) return 0;
+    return !(node->instance->ops->permission ? node->instance->ops->permission(node, cred, 2U) :
+        kernel_vfs_dac_permission(node->mode, node->uid, node->gid, 2U, cred));
+}
+
 int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access)
 {
     if (!path || !path->file.private_data) return -KERNEL_EINVAL;

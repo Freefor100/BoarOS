@@ -280,6 +280,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
                 return -KERNEL_EIO;
         }
         result->virtual_bytes = memory.virtual_bytes;
+        result->locked_bytes = memory.locked_bytes;
         result->resident_pages = memory.resident_pages;
         result->start_code = memory.start_code;
         result->end_code = memory.end_code;

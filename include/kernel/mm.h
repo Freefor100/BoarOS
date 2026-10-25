@@ -24,6 +24,7 @@ struct kernel_futex_key;
 #define KERNEL_MM_MAP_FIXED (UINT32_C(1) << 0U)
 #define KERNEL_MM_MAP_FIXED_NOREPLACE (UINT32_C(1) << 1U)
 #define KERNEL_MM_MAP_SHARED (UINT32_C(1) << 2U)
+#define KERNEL_MM_MAP_LOCKED (UINT32_C(1) << 3U)
 
 enum kernel_mm_status {
     KERNEL_MM_STATUS_OK = 0,
@@ -37,6 +38,8 @@ enum kernel_mm_status {
     KERNEL_MM_STATUS_CONFLICT,
     KERNEL_MM_STATUS_BUS_FAULT,
     KERNEL_MM_STATUS_ACCESS,
+    KERNEL_MM_STATUS_LOCK_LIMIT,
+    KERNEL_MM_STATUS_LOCK_PERMISSION,
 };
 
 enum kernel_mm_state {
@@ -149,6 +152,7 @@ enum kernel_mm_status kernel_mm_executable_path_acquire(
 
 struct kernel_mm_proc_memory {
     uint64_t virtual_bytes;
+    uint64_t locked_bytes;
     uint64_t resident_pages;
     uint64_t start_code, end_code, start_stack;
 };
@@ -157,6 +161,13 @@ enum kernel_mm_status kernel_mm_set_exec_layout(
     uint64_t start_stack);
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot);
+
+int kernel_mm_mlock(struct kernel_mm *, uint64_t, uint64_t, uint32_t flags);
+int kernel_mm_munlock(struct kernel_mm *, uint64_t, uint64_t);
+int kernel_mm_mlockall(struct kernel_mm *, uint32_t flags);
+int kernel_mm_munlockall(struct kernel_mm *);
+/* At most 16 pages; no page is faulted in. The completed prefix is returned. */
+int kernel_mm_mincore(struct kernel_mm *, uint64_t, unsigned, unsigned char *, unsigned *);
 
 /* Returns NOT_MAPPED for a valid address outside all VMAs. */
 enum kernel_mm_status kernel_mm_vma_lookup(

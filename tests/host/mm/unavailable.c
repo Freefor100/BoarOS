@@ -68,3 +68,10 @@ EXCLUDED(kernel_page_cache_alias_put)
 EXCLUDED(kernel_page_cache_retry_alias)
 
 EXCLUDED(kernel_page_cache_prepare_mapping_write)
+
+EXCLUDED(kernel_elf64_source_file)
+EXCLUDED(kernel_elf64_source_run_count)
+EXCLUDED(kernel_elf64_source_run_at)
+EXCLUDED(kernel_vfs_file_mincore_allowed)
+EXCLUDED(kernel_vfs_file_memory)
+EXCLUDED(kernel_page_cache_resident)

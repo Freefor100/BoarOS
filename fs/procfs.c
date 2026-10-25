@@ -1262,6 +1262,7 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                                    process.threads, "\n");
         used += append_number_line(data + used, "VmSize:\t",
                                    process.virtual_bytes / 1024U, " kB\n");
+        used += append_number_line(data + used, "VmLck:\t", process.locked_bytes / 1024U, " kB\n");
         used += append_number_line(data + used, "VmRSS:\t",
                                    process.resident_pages *
                                       (BOAROS_PAGE_SIZE / 1024U), " kB\n");

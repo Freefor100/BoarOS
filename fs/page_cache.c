@@ -1378,6 +1378,15 @@ static int read_entry_ready(struct kernel_page_cache_entry *entry)
         (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED));
 }
 
+int kernel_page_cache_resident(struct kernel_page_cache *cache,
+    const struct kernel_vfs_file *file, uint64_t index)
+{
+    CACHE_SCOPE(guard, cache);
+    struct kernel_page_cache_entry *entry;
+    return !lookup_entry(cache, file, index, &entry) && !entry->retired &&
+        entry_load_status(entry) == KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t index, uint64_t *address, size_t *valid)

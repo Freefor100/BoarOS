@@ -2,7 +2,21 @@
 
 本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
-普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用同一修改协议：operation gate 串行映射编辑及缺页提交，MM raw 保护 PTE、resident 索引和 pin 许可。匿名、COW、ELF 与文件缺页按真实后备类型准备候选，在锁外完成分配和 I/O，恢复保护后重查映射再发布；不再按对象资格选择两套 mapper。匿名缺页和驻留用户复制可在发起 CPU 完成，普通文件冷页仍由既有 CPU0 缓存 worker 装入。非叶变更同步全范围，退休页在本地与远端 TLB 确认后才归还。实际执行边界见[RV 两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用同一修改协议：operation gate 串行映射编辑及缺页提交，MM raw 保护 PTE、resident 索引和 pin 许可。匿名、COW、ELF 与文件缺页按真实后备类型准备候选，在锁外完成分配和 I/O，恢复保护后重查映射再发布；不再按对象资格选择两套 mapper。匿名缺页和驻留用户复制可在发起 CPU 完成，ext4 普通文件冷页在发起 CPU 完成缓存装入与请求提交，日志和后台写回由 CPU0 推进。非叶变更同步全范围，退休页在本地与远端 TLB 确认后才归还。实际执行边界见[RV 两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+
+## 锁页、MEMLOCK 与驻留查询
+
+`mlock`、`mlock2`、`munlock`、`mlockall`、`munlockall` 和 `MAP_LOCKED` 使用同一份 VMA 属性。`LOCKED` 表示锁定范围，`ONFAULT` 表示保留按需装入；MM 保存未来映射策略。VMA 分裂、合并、替换、搬移和删除同时维护锁定虚拟字节数，合并必须具有相同锁定策略。`/proc/<pid>/status` 的 `VmLck` 包含尚未触页的 ONFAULT 范围。
+
+接纳使用实际调用线程组的 MEMLOCK 软限额，按架构页取整，`CAP_IPC_LOCK` 豁免。锁定重叠范围只计一次；下调限额保留已有范围。mmap（含固定替换）、brk、新增栈范围、mremap 扩大和 SysV attach 在修改前检查额度。mmap 按 Linux 将本次完整长度加入旧锁定用量后检查，额度拒绝保留固定替换的旧映射；brk 拒绝返回旧 break，锁定映射的 mremap 扩大超限返回 EAGAIN。mprotect 保留策略。
+
+立即锁定先提交 VMA 属性，再释放 MM 修改资格，复用匿名、COW 和文件缺页路径逐页预装。每页重新检查当前 VMA；PROT_NONE 范围保留属性而不装入，普通 mlock 返回 ENOMEM，ONFAULT 登记成功；纯执行权限范围沿执行缺页路径装入。普通 mlock 预装缺页失败转为 ENOMEM，物理内存不足转为 EAGAIN，已提交属性和已驻留前缀保留；mmap 和 mlockall 的预装按 Linux 采用尽力完成规则。`MCL_FUTURE` 的重复设置替换未来策略，munlockall 同时清除当前和未来策略。
+
+当前没有 swap；PTE 已持有真实物理引用，文件映射的 cache alias 也参与回收判断，因此锁页复用现有持有关系。munlock 解除策略和计费，显式 unmap、文件截断和打洞继续执行原失效及回收协议。fork 创建的新 MM 清除锁定属性和未来策略；CLONE_VM/vfork 共享原 MM；成功 exec 使用新 MM，失败 exec 保留原状态。
+
+mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM raw 内查询已有页面归属，包含 PROT_NONE 页面；没有 PTE 时查询内存对象或已完成装入的文件缓存。一次最多处理 16 页，任务 I/O 工作区保存结果，用户输出在 MM 保护外完成。文件来源借用覆盖锁外权限和缓存查询，恢复 MM 资格后核对 VMA 代次；截断、解除映射和最终关闭沿原来源退休协议等待借用结束。文件所有者、CAP_FOWNER 或有当前写权限的调用者可见真实状态，其余调用者按 Linux 获得全 1；匿名映射直接返回真实状态。VMA 空洞返回 ENOMEM，之前完整输出的前缀保留。
+
+直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/mm-resource-limits-host.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。SHM_LOCK 和通用 MAP_GROWSDOWN 仍在后续范围。
 
 ## 范围与入口
 

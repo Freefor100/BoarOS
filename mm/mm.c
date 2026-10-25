@@ -134,6 +134,7 @@ struct kernel_mm_record {
     struct kernel_mm_elf_source *elf_sources;
     _Atomic(struct kernel_mm_elf_source *) retired_elf_sources;
     struct kernel_open_file_description *executable_file;
+    uint32_t future_lock_flags;
 };
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
@@ -1209,6 +1210,7 @@ static enum kernel_mm_status mm_fork_impl(
                        : status;
         }
     }
+    if (destination_record->vmas) kernel_vma_set_clear_locks(destination_record->vmas);
     status = clone_shared_anon(source_record, destination_record);
     if (status == KERNEL_MM_STATUS_OK)
         status = clone_file_sources(source_record, destination_record);
@@ -1963,6 +1965,7 @@ enum kernel_mm_status kernel_mm_proc_memory_snapshot(
         .end_code = record->end_code,
         .start_stack = record->start_stack,
         .virtual_bytes = kernel_vma_set_total_bytes(record->vmas),
+        .locked_bytes = kernel_vma_set_locked_bytes(record->vmas),
         .resident_pages = (uint64_t)record->space.leaf_pages +
                           record->space.protected_pages,
     };
@@ -2299,6 +2302,30 @@ static int may_map_memory(const struct kernel_mm_record *record,
     return may_expand_current(record, &vma, end - start - covered);
 }
 
+static int may_lock_memory(const struct kernel_mm_record *record, uint64_t growth)
+{
+    uint64_t limit = kernel_task_current_memlock_limit();
+    uint64_t used = kernel_vma_set_locked_bytes(record->vmas);
+    return used <= limit && growth <= limit - used;
+}
+
+static uint32_t mapping_lock_flags(const struct kernel_mm_record *record, uint32_t flags)
+{
+    return (flags & KERNEL_MM_MAP_LOCKED) ? KERNEL_VMA_LOCKED | record->future_lock_flags : record->future_lock_flags;
+}
+
+static enum kernel_mm_status admit_mapping_lock(const struct kernel_mm_record *record,
+    uint64_t start, uint64_t end, uint32_t flags)
+{
+    if (!mapping_lock_flags(record, flags)) return KERNEL_MM_STATUS_OK;
+    uint64_t limit = kernel_task_current_memlock_limit();
+    if (!limit && (flags & KERNEL_MM_MAP_LOCKED)) return KERNEL_MM_STATUS_LOCK_PERMISSION;
+    uint64_t used = kernel_vma_set_locked_bytes(record->vmas);
+    return used <= limit && end - start <= limit - used ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_LOCK_LIMIT;
+}
+
+static int populate_locked(struct kernel_mm *, uint64_t, uint64_t);
+
 static enum kernel_mm_status mm_mmap_anonymous_impl(
     struct kernel_mm *mm,
     uint64_t hint,
@@ -2325,7 +2352,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
         !normalize_user_permissions(permissions, &normalized) ||
         (flags & ~(KERNEL_MM_MAP_FIXED |
                    KERNEL_MM_MAP_FIXED_NOREPLACE |
-                   KERNEL_MM_MAP_SHARED)) != 0U ||
+                   KERNEL_MM_MAP_SHARED | KERNEL_MM_MAP_LOCKED)) != 0U ||
         (flags & (KERNEL_MM_MAP_FIXED |
                   KERNEL_MM_MAP_FIXED_NOREPLACE)) ==
             (KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_FIXED_NOREPLACE)) {
@@ -2389,6 +2416,8 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     end = start + aligned_length;
     if (!may_map_memory(record, start, end, normalized, flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED))
         return KERNEL_MM_STATUS_NO_MEMORY;
+    status = admit_mapping_lock(record, start, end, flags);
+    if (status) return status;
     if ((flags & KERNEL_MM_MAP_SHARED) != 0U) {
         enum kernel_memory_object_status shared_status =
             kernel_memory_object_create(record->vma_heap, mm->allocator,
@@ -2412,6 +2441,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     vma = (struct kernel_vma){
         .start = start,
         .end = end,
+        .lock_flags = mapping_lock_flags(record, flags),
         .backing_offset = 0U,
         .permissions = normalized,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
@@ -2530,7 +2560,7 @@ static enum kernel_mm_status prepare_file_mapping(
         !normalize_user_permissions(permissions, &normalized) ||
         (flags & ~(KERNEL_MM_MAP_FIXED |
                    KERNEL_MM_MAP_FIXED_NOREPLACE |
-                   KERNEL_MM_MAP_SHARED)) != 0U ||
+                   KERNEL_MM_MAP_SHARED | KERNEL_MM_MAP_LOCKED)) != 0U ||
         (flags & (KERNEL_MM_MAP_FIXED |
                   KERNEL_MM_MAP_FIXED_NOREPLACE)) ==
                  (KERNEL_MM_MAP_FIXED |
@@ -2643,6 +2673,8 @@ static enum kernel_mm_status commit_file_mapping(
     record = plan.record;
     if (!may_map_memory(record, plan.start, plan.end, plan.permissions,
                         flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED)) return KERNEL_MM_STATUS_NO_MEMORY;
+    status = admit_mapping_lock(record, plan.start, plan.end, flags);
+    if (status) return status;
     existing = find_file_source(record, *file);
     if (existing == 0) {
         heap_status = kernel_heap_allocate_zeroed(record->vma_heap,
@@ -2663,6 +2695,7 @@ static enum kernel_mm_status commit_file_mapping(
     vma = (struct kernel_vma){
         .start = plan.start,
         .end = plan.end,
+        .lock_flags = mapping_lock_flags(record, flags),
         .backing_offset = file_offset,
         .permissions = plan.permissions,
         .kind = (flags & KERNEL_MM_MAP_SHARED) != 0U
@@ -2858,6 +2891,8 @@ enum kernel_mm_status kernel_mm_shmat(
     }
     end = start + aligned_length;
     if (!may_map_memory(record, start, end, normalized, 1, flags & KERNEL_SHM_REMAP)) return KERNEL_MM_STATUS_NO_MEMORY;
+    status = admit_mapping_lock(record, start, end, (flags & KERNEL_SHM_REMAP) ? KERNEL_MM_MAP_FIXED : 0);
+    if (status) return status;
     if (kernel_shm_attachment_create(segment, start, end, &attachment) !=
             KERNEL_SHM_STATUS_OK) return KERNEL_MM_STATUS_NO_MEMORY;
 
@@ -2896,6 +2931,7 @@ enum kernel_mm_status kernel_mm_shmat(
         .permissions = normalized,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
             ((flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
+        .lock_flags = record->future_lock_flags,
         .kind = KERNEL_VMA_KIND_SYSV_SHM,
         .role = KERNEL_VMA_ROLE_SYSV_SHM,
         .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
@@ -2917,6 +2953,9 @@ enum kernel_mm_status kernel_mm_shmat(
                 kernel_heap_release(record->vma_heap, shared_entry);
             }
         }
+        uint32_t policy = record->future_lock_flags;
+        mm_operation_end(&operation);
+        if (!status && policy == KERNEL_VMA_LOCKED) (void)populate_locked(mm, start, end);
         return status;
     }
 
@@ -2957,6 +2996,9 @@ enum kernel_mm_status kernel_mm_shmat(
     (void)drain_file_sources(record, 1);
     (void)drain_elf_sources(record, 1);
     *out_address = start;
+    uint32_t policy = record->future_lock_flags;
+    mm_operation_end(&operation);
+    if (policy == KERNEL_VMA_LOCKED) (void)populate_locked(mm, start, end);
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -3107,7 +3149,8 @@ static enum kernel_mm_status mm_brk_impl(
     if (new_page_end > old_page_end) {
         const struct kernel_vma data = {.permissions = KERNEL_MM_WRITE,
             .kind = KERNEL_VMA_KIND_ANONYMOUS};
-        if (!may_expand_memory(record, &data, new_page_end - old_page_end, &limits)) {
+        if (!may_expand_memory(record, &data, new_page_end - old_page_end, &limits) ||
+            (record->future_lock_flags && !may_lock_memory(record, new_page_end - old_page_end))) {
             *result = old_brk;
             return KERNEL_MM_STATUS_OK;
         }
@@ -3121,6 +3164,7 @@ static enum kernel_mm_status mm_brk_impl(
                 .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                 .kind = KERNEL_VMA_KIND_ANONYMOUS,
                 .role = KERNEL_VMA_ROLE_HEAP,
+                .lock_flags = record->future_lock_flags,
                 .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,
                 .backing = 0,
             });
@@ -3559,6 +3603,10 @@ enum kernel_mm_status kernel_mm_mmap_file_private(struct kernel_mm *mm,
             if (generation != kernel_vma_set_generation(operation.record->vmas)) continue;
         }
         status=commit_file_mapping(file,offset,flags,address,&plan,&inode);
+        if (inode.lock) kernel_lock_release(&inode);
+        uint32_t policy = mapping_lock_flags(operation.record, flags);
+        mm_operation_end(&operation);
+        if (!status && policy == KERNEL_VMA_LOCKED) (void)populate_locked(mm, *address, *address + ((length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK));
         return status;
     }
 }
@@ -3642,7 +3690,12 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
     uint64_t hint, uint64_t length, uint32_t permissions, uint32_t flags, uint64_t *address)
 {
     MM_RANGE_OPERATION(mm, hint, (flags & KERNEL_MM_MAP_FIXED) ? length : 0);
-    return mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address);
+    enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address);
+    uint32_t policy = mapping_lock_flags(operation.record, flags);
+    mm_operation_end(&operation);
+    if (!result && policy == KERNEL_VMA_LOCKED)
+        (void)populate_locked(mm, *address, *address + ((length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK));
+    return result;
 }
 enum kernel_mm_status kernel_mm_munmap(struct kernel_mm *mm, uint64_t address, uint64_t length)
 {
@@ -3675,7 +3728,13 @@ enum kernel_mm_status kernel_mm_brk(struct kernel_mm *mm, uint64_t requested, ui
 {
     if (!mm || !result) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     MM_OPERATION(mm);
-    return mm_brk_impl(mm, requested, result);
+    uint64_t old_end = (operation.record->current_brk + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    enum kernel_mm_status status = mm_brk_impl(mm, requested, result);
+    uint64_t end = (*result + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    uint32_t policy = operation.record->future_lock_flags;
+    mm_operation_end(&operation);
+    if (!status && end > old_end && policy == KERNEL_VMA_LOCKED) (void)populate_locked(mm, old_end, end);
+    return status;
 }
 enum kernel_mm_status kernel_mm_vma_lookup(const struct kernel_mm *mm,
     uint64_t address, struct kernel_vma *vma)
@@ -3825,6 +3884,8 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     }
     if (new_size > old_size && !may_expand_current(record, &source, new_size - old_size))
         return -KERNEL_ENOMEM;
+    if (new_size > old_size && source.lock_flags && !may_lock_memory(record, new_size - old_size))
+        return -KERNEL_EAGAIN;
     if (!(flags & 2U)) {
         int overlaps = 1;
         if (old_address <= ARCH_MMU_USER_LIMIT - new_size &&
@@ -3874,6 +3935,9 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     }
     if (kernel_vma_set_commit_remap(record->vmas, &edit)) __builtin_trap();
     *result = new_address;
+    mm_operation_end(&operation);
+    if (new_size > old_size && source.lock_flags == KERNEL_VMA_LOCKED)
+        (void)populate_locked(mm, new_address + old_size, new_address + new_size);
     return 0;
 }
 
@@ -4188,7 +4252,8 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
             !record->stack_top || record->stack_top < page ||
             record->stack_top - page > KERNEL_RLIMIT_STACK_CAP ||
             record->stack_top - page > kernel_task_current_stack_limit() ||
-            !may_expand_current(record, &vma, vma.start - page))
+            !may_expand_current(record, &vma, vma.start - page) ||
+            (vma.lock_flags && !may_lock_memory(record, vma.start - page)))
             return KERNEL_MM_STATUS_NOT_MAPPED;
         int overlaps;
         /* 保持栈前的一页guard；下一VMA检索也阻止跨越已有映射。 */
@@ -4641,4 +4706,216 @@ enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *mm,
     }
     if (data) kernel_heap_release(heap, data);
     return status;
+}
+
+/* VMA policy commits under the existing MM edit gate. Population is a separate
+ * operation: file I/O and COW may sleep and must revalidate each current VMA. */
+static int lock_range(struct kernel_mm_record *record, uint64_t start, uint64_t end, uint32_t flags)
+{
+    while (start < end) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(record->vmas, start, &vma)) return -KERNEL_ENOMEM;
+        uint64_t finish = vma.end < end ? vma.end : end;
+        if (vma.role != KERNEL_VMA_ROLE_VDSO && vma.lock_flags != flags) {
+            struct kernel_vma_edit edit;
+            if (kernel_vma_set_prepare_lock(record->vmas, start, finish, flags, &edit)) return -KERNEL_ENOMEM;
+            if (kernel_vma_set_commit_edit(record->vmas, &edit)) __builtin_trap();
+        }
+        start = finish;
+    }
+    return 0;
+}
+
+static int populate_locked(struct kernel_mm *mm, uint64_t start, uint64_t end)
+{
+    while (start < end) {
+        uint32_t access = 0;
+        {
+            struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+            if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+            struct kernel_vma vma;
+            if (kernel_vma_set_lookup(operation.record->vmas, start, &vma)) return -KERNEL_ENOMEM;
+            if (vma.lock_flags != KERNEL_VMA_LOCKED) {
+                start = vma.end < end ? vma.end : end;
+                continue;
+            }
+            if (!(vma.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
+                return -KERNEL_ENOMEM;
+            access = (vma.permissions & KERNEL_MM_WRITE) &&
+                (vma.kind == KERNEL_VMA_KIND_ANONYMOUS || vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
+                 vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) ? KERNEL_MM_WRITE :
+                (vma.permissions & KERNEL_MM_READ) ? KERNEL_MM_READ : KERNEL_MM_EXECUTE;
+        }
+        enum kernel_mm_status status = kernel_mm_resolve_user_fault(mm, start, access);
+        if (status) return status == KERNEL_MM_STATUS_NO_MEMORY ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
+        start += BOAROS_PAGE_SIZE;
+    }
+    return 0;
+}
+
+static int lock_interval(uint64_t address, uint64_t length, uint64_t *start, uint64_t *end)
+{
+    if (length > UINT64_MAX - address ||
+        length + (address & BOAROS_PAGE_MASK) > UINT64_MAX - BOAROS_PAGE_MASK) return -KERNEL_EINVAL;
+    *start = address & ~BOAROS_PAGE_MASK;
+    uint64_t rounded = (length + (address & BOAROS_PAGE_MASK) + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    if (rounded > UINT64_MAX - *start) return -KERNEL_EINVAL;
+    *end = *start + rounded;
+    return 0;
+}
+
+int kernel_mm_mlock(struct kernel_mm *mm, uint64_t address, uint64_t length, uint32_t flags)
+{
+    if (flags & ~1U) return -KERNEL_EINVAL;
+    uint64_t limit = kernel_task_current_memlock_limit(), start, end;
+    if (!limit) return -KERNEL_EPERM;
+    int error = lock_interval(address, length, &start, &end);
+    if (error) return error;
+    {
+        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+        if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+        uint64_t used = kernel_vma_set_locked_bytes(operation.record->vmas);
+        uint64_t old = kernel_vma_set_locked_range(operation.record->vmas, start, end);
+        if (used > limit || end - start - old > limit - used) return -KERNEL_ENOMEM;
+        error = lock_range(operation.record, start, end, KERNEL_VMA_LOCKED | (flags ? KERNEL_VMA_LOCK_ONFAULT : 0));
+    }
+    return error || flags ? error : populate_locked(mm, start, end);
+}
+
+int kernel_mm_munlock(struct kernel_mm *mm, uint64_t address, uint64_t length)
+{
+    uint64_t start, end;
+    int error = lock_interval(address, length, &start, &end);
+    if (error) return error;
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+    return lock_range(operation.record, start, end, 0);
+}
+
+int kernel_mm_mlockall(struct kernel_mm *mm, uint32_t flags)
+{
+    if (!flags || (flags & ~7U) || !(flags & 3U)) return -KERNEL_EINVAL;
+    uint64_t limit = kernel_task_current_memlock_limit();
+    if (!limit) return -KERNEL_EPERM;
+    {
+        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+        if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+        struct kernel_mm_record *record = operation.record;
+        if ((flags & 1U) && kernel_vma_set_total_bytes(record->vmas) > limit) return -KERNEL_ENOMEM;
+        uint32_t policy = KERNEL_VMA_LOCKED | ((flags & 4U) ? KERNEL_VMA_LOCK_ONFAULT : 0);
+        record->future_lock_flags = (flags & 2U) ? policy : 0;
+        if (!(flags & 1U)) return 0;
+        uint64_t cursor = 0;
+        struct kernel_vma vma;
+        while (!kernel_vma_set_next(record->vmas, cursor, &vma)) {
+            (void)lock_range(record, vma.start, vma.end, policy);
+            cursor = vma.end;
+        }
+    }
+    if (!(flags & 4U)) {
+        uint64_t cursor = 0;
+        for (;;) {
+            struct kernel_vma vma;
+            {
+                struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+            if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+                if (kernel_vma_set_next(operation.record->vmas, cursor, &vma)) break;
+            }
+            (void)populate_locked(mm, vma.start, vma.end);
+            cursor = vma.end;
+        }
+    }
+    return 0;
+}
+
+int kernel_mm_munlockall(struct kernel_mm *mm)
+{
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+    operation.record->future_lock_flags = 0;
+    kernel_vma_set_clear_locks(operation.record->vmas);
+    return 0;
+}
+
+int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
+    unsigned char *output, unsigned *completed)
+{
+    *completed = 0;
+    if (!count || count > 16 || (address & BOAROS_PAGE_MASK)) return -KERNEL_EINVAL;
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+    struct kernel_mm_record *record = operation.record;
+    for (unsigned i = 0; i < count;) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(record->vmas, address, &vma)) return -KERNEL_ENOMEM;
+        uint64_t generation = kernel_vma_set_generation(record->vmas);
+        uint64_t offset = vma.backing_offset + address - vma.start;
+        struct kernel_open_file_description *file = 0;
+        struct kernel_memory_object *object = 0;
+        _Atomic uint32_t *borrow = 0;
+        if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE || vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
+            file = vma.backing;
+            struct kernel_mm_file_source *source = find_file_source(record, file);
+            if (!source) __builtin_trap();
+            borrow = &source->operations;
+        } else if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
+            struct kernel_elf64_source *source = vma.backing;
+            file = kernel_elf64_source_file(source);
+            for (uint32_t j = 0; j < kernel_elf64_source_run_count(source); j++) {
+                const struct kernel_elf64_source_run *run = kernel_elf64_source_run_at(source, j);
+                if (offset >= run->start && offset < run->end) {
+                    if (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE) offset = run->file_offset + offset - run->start;
+                    else file = 0;
+                    break;
+                }
+            }
+            if (file) {
+                struct kernel_mm_elf_source *owner = find_elf_source(record, source);
+                if (!owner) __builtin_trap();
+                borrow = &owner->faults;
+            }
+        } else if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED || vma.kind == KERNEL_VMA_KIND_SYSV_SHM)
+            object = vma.backing;
+        int present;
+        {
+            uint64_t cursor = address, found;
+            KERNEL_RAW_SCOPE(guard, &record->metadata);
+            enum arch_mmu_status status = arch_mmu_user_next_owned(&record->space, &cursor,
+                address + BOAROS_PAGE_SIZE, &found);
+            if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+            present = status == ARCH_MMU_STATUS_OK;
+        }
+        if (file || object) {
+            if (borrow && (*borrow == UINT32_MAX || ++*borrow == 0)) __builtin_trap();
+            if (object && kernel_memory_object_acquire(object)) __builtin_trap();
+            /* inode mutation can invalidate this MM: retain the actual source,
+             * end the MM gate before taking inode/cache/object qualifications. */
+            mm_operation_end(&operation);
+            if (file && !kernel_vfs_file_mincore_allowed(kernel_open_file_vfs_borrow(file))) present = 1;
+            else if (!present) {
+                struct kernel_memory_object *backing = object ? object : kernel_vfs_file_memory(kernel_open_file_vfs_borrow(file));
+                if (backing) {
+                    uint64_t physical;
+                    enum kernel_memory_object_status status = kernel_memory_object_find_page(backing, offset >> BOAROS_PAGE_SHIFT, &physical);
+                    if (!status) {
+                        present = 1;
+                        if (physical_page_release(mm->allocator, physical)) __builtin_trap();
+                    } else if (status != KERNEL_MEMORY_OBJECT_NOT_FOUND) __builtin_trap();
+                } else present = kernel_page_cache_resident(kernel_open_file_page_cache(file),
+                    kernel_open_file_vfs_borrow(file), offset >> BOAROS_PAGE_SHIFT);
+            }
+            if (object) kernel_memory_object_release(&object);
+            if (borrow && !__atomic_fetch_sub(borrow, 1, __ATOMIC_RELEASE)) __builtin_trap();
+            if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+            if (borrow) {
+                (void)drain_file_sources(record, 1);
+                (void)drain_elf_sources(record, 1);
+            }
+            if (generation != kernel_vma_set_generation(record->vmas)) continue;
+        }
+        output[i] = (unsigned char)present;
+        *completed = ++i;
+        address += BOAROS_PAGE_SIZE;
+    }
+    return 0;
 }

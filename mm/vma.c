@@ -18,7 +18,7 @@ struct kernel_vma_set {
     uint32_t capacity;
     uint64_t generation;
     uint64_t total_bytes;
-    uint64_t data_bytes;
+    uint64_t data_bytes, locked_bytes;
 };
 
 static int set_valid(const struct kernel_vma_set *set)
@@ -63,16 +63,49 @@ uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set)
 
 static void recount_bytes(struct kernel_vma_set *set)
 {
-    uint64_t total = 0U, data = 0U;
+    uint64_t total = 0U, data = 0U, locked = 0U;
     for (uint32_t i = 0U; i < set->count; i++) {
         COST_ADD(VMA_RECOUNT, 1);
         uint64_t length = set->entries[i].end - set->entries[i].start;
         if (length > UINT64_MAX - total) __builtin_trap();
         total += length;
+        if (set->entries[i].lock_flags & KERNEL_VMA_LOCKED) locked += length;
         if (kernel_vma_is_data(&set->entries[i])) data += length;
     }
     set->total_bytes = total;
     set->data_bytes = data;
+    set->locked_bytes = locked;
+}
+
+uint64_t kernel_vma_set_locked_bytes(const struct kernel_vma_set *set)
+{
+    if (!set_valid(set)) __builtin_trap();
+    return set->locked_bytes;
+}
+
+uint64_t kernel_vma_set_locked_range(const struct kernel_vma_set *set, uint64_t start, uint64_t end)
+{
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < set->count; i++) {
+        const struct kernel_vma *v = &set->entries[i];
+        if (v->start >= end) break;
+        if (v->end <= start || !(v->lock_flags & KERNEL_VMA_LOCKED)) continue;
+        uint64_t a = v->start > start ? v->start : start;
+        uint64_t b = v->end < end ? v->end : end;
+        bytes += b - a;
+    }
+    return bytes;
+}
+
+static void merge_all(struct kernel_vma_set *set);
+
+void kernel_vma_set_clear_locks(struct kernel_vma_set *set)
+{
+    if (!set_valid(set)) __builtin_trap();
+    for (uint32_t i = 0; i < set->count; i++) set->entries[i].lock_flags = 0;
+    set->locked_bytes = 0;
+    merge_all(set);
+    set->generation++;
 }
 
 static int vma_valid(const struct kernel_vma *vma)
@@ -86,6 +119,7 @@ static int vma_valid(const struct kernel_vma *vma)
         vma->fault_policy > KERNEL_VMA_FAULT_FILE_SHARED) {
         return 0;
     }
+    if ((vma->lock_flags & ~3U) || vma->lock_flags == 2U) return 0;
     if ((vma->maximum_permissions & ~KERNEL_VMA_ALL_PERMISSIONS) ||
         (vma->permissions & KERNEL_VMA_ALL_PERMISSIONS & ~vma->maximum_permissions))
         return 0;
@@ -139,6 +173,7 @@ static int can_merge(const struct kernel_vma *left,
         left->permissions != right->permissions ||
         left->kind != right->kind || left->role != right->role ||
         left->fault_policy != right->fault_policy ||
+        left->lock_flags != right->lock_flags ||
         left->backing != right->backing ||
         left->shm_attachment != right->shm_attachment ||
         left->maximum_permissions != right->maximum_permissions) {
@@ -810,6 +845,20 @@ enum kernel_vma_status kernel_vma_set_prepare_mprotect(
     return KERNEL_VMA_STATUS_OK;
 }
 
+enum kernel_vma_status kernel_vma_set_prepare_lock(struct kernel_vma_set *set,
+    uint64_t start, uint64_t end, uint32_t flags, struct kernel_vma_edit *edit)
+{
+    if (!set_valid(set) || start >= end || !edit || (flags & ~3U) || flags == 2U)
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    if (!range_is_covered(set, start, end)) return KERNEL_VMA_STATUS_NOT_FOUND;
+    if (set->generation == UINT64_MAX) return KERNEL_VMA_STATUS_STATE;
+    enum kernel_vma_status status = reserve_edit_capacity(set, start, end, 0);
+    if (status) return status;
+    *edit = (struct kernel_vma_edit){ .set = set, .generation = set->generation,
+        .start = start, .end = end, .kind = KERNEL_VMA_EDIT_LOCK, .lock_flags = flags };
+    return KERNEL_VMA_STATUS_OK;
+}
+
 enum kernel_vma_status kernel_vma_set_commit_edit(
     struct kernel_vma_set *set,
     const struct kernel_vma_edit *edit)
@@ -824,7 +873,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
         edit->generation != set->generation ||
         edit->start >= edit->end ||
         edit->kind < KERNEL_VMA_EDIT_REMOVE ||
-        edit->kind > KERNEL_VMA_EDIT_PROTECT) {
+        edit->kind > KERNEL_VMA_EDIT_LOCK) {
         return KERNEL_VMA_STATUS_STATE;
     }
     if (edit->kind == KERNEL_VMA_EDIT_REPLACE &&
@@ -843,10 +892,12 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
     }
     first = lower_bound(set, edit->start);
     last = lower_bound(set, edit->end);
-    if (edit->kind == KERNEL_VMA_EDIT_PROTECT) {
+    if (edit->kind == KERNEL_VMA_EDIT_PROTECT || edit->kind == KERNEL_VMA_EDIT_LOCK) {
         for (index = first; index < last; index++) {
             COST_ADD(VMA_EDITED, 1);
-            set->entries[index].permissions = edit->permissions;
+            if (edit->kind == KERNEL_VMA_EDIT_PROTECT)
+                set->entries[index].permissions = edit->permissions;
+            else set->entries[index].lock_flags = edit->lock_flags;
         }
     } else {
         for (index = first; index < last; index++)
