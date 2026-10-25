@@ -383,7 +383,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/wait.c \
 	kernel/sched/park.c \
 	kernel/sched/sync.c \
-	kernel/sched/futex.c \
+	kernel/sched/futex.c kernel/sched/futex_waitv.c \
 	kernel/sched/futex_pi.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \

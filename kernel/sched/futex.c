@@ -36,7 +36,7 @@ static int futex_wake_entry_locked(struct kernel_wait_node *node)
 {
     struct kernel_futex_entry *entry=futex_entry(node);
     if(entry->kind==FUTEX_ENTRY_REQUEUE_PI)return -KERNEL_EINVAL;
-    entry->woken=1;
+    __atomic_store_n(&entry->woken,1,__ATOMIC_RELEASE);
     kernel_wait_node_remove_locked(node);
     struct kernel_wait_token token={node->task,node->generation};
     (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_WOKEN);

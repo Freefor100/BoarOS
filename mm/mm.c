@@ -4624,6 +4624,36 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     }
 }
 
+enum kernel_mm_status kernel_mm_try_futex_pin(struct kernel_mm *mm,uint64_t address,
+    int shared,uint32_t access,const struct kernel_futex_key *key,struct kernel_mm_user_pin *pin)
+{
+    struct kernel_mm_record *record;
+    enum kernel_mm_status status=resolve_record(mm,&record);
+    if(status)return status;
+    KERNEL_LOCK_SCOPE(gate);
+    if(shared && !kernel_rwlock_try_read(&record->operations,&gate))return KERNEL_MM_STATUS_CONFLICT;
+    if(shared) {
+        struct kernel_vma vma;
+        if(!record->vmas || kernel_vma_set_lookup(record->vmas,address,&vma))return KERNEL_MM_STATUS_CONFLICT;
+        struct kernel_futex_key actual={.identity=record->futex_id,.offset=address};
+        if(vma.kind==KERNEL_VMA_KIND_FILE_SHARED) {
+            actual.kind=KERNEL_FUTEX_KEY_SHARED_FILE;
+            actual.identity=(uintptr_t)kernel_open_file_node(vma.backing);
+        } else if(vma.kind==KERNEL_VMA_KIND_ANON_SHARED || vma.kind==KERNEL_VMA_KIND_SYSV_SHM) {
+            actual.kind=KERNEL_FUTEX_KEY_SHARED_MEMORY;actual.identity=(uintptr_t)vma.backing;
+        }
+        if(actual.kind!=KERNEL_FUTEX_KEY_PRIVATE)actual.offset=vma.backing_offset+address-vma.start;
+        if(actual.kind!=key->kind || actual.identity!=key->identity || actual.offset!=key->offset)
+            return KERNEL_MM_STATUS_CONFLICT;
+    }
+    KERNEL_RAW_SCOPE(raw,&record->metadata);
+    if(record->access_closed==1 || (record->access_closed==2 && (access&KERNEL_MM_WRITE)))
+        return KERNEL_MM_STATUS_CONFLICT;
+    status=pin_mapping(mm,record,address,access,pin,access==KERNEL_MM_WRITE);
+    return status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ?
+        KERNEL_MM_STATUS_CONFLICT:status;
+}
+
 enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
     const uint64_t *addresses, unsigned count, int shared, unsigned pin_index,
     uint32_t access, struct kernel_futex_key *keys, struct kernel_mm_user_pin *pin)

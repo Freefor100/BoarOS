@@ -18,6 +18,7 @@ void mm_test_bind(struct kernel_mm *);
 unsigned mm_test_parked(unsigned);
 static unsigned char pool[8 * 1024 * 1024] __attribute__((aligned(16384)));
 static struct kernel_mm mm;
+static struct kernel_heap *test_heap;
 static uint64_t context;
 static const uint64_t source = 0x40000, target = 0x41000;
 static unsigned opposite_arm, bucket_entered, bucket_waiter;
@@ -68,6 +69,25 @@ void __wrap_kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason
     }
 }
 
+static unsigned vector_pause,vector_paused,vector_resume,vector_fail_alloc;
+void __real_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
+void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{
+    __real_kernel_mm_unpin_user_page(pin);
+    struct kernel_task *task=kernel_task_current();
+    if(kernel_cpu_current()->hardware_id==1 && task->futex_request &&
+       task->futex_request->token.generation && __atomic_exchange_n(&vector_pause,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
+        __atomic_store_n(&vector_paused,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&vector_resume,__ATOMIC_ACQUIRE))sched_yield();
+    }
+}
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,size_t n,size_t size,void **out)
+{
+    if(vector_fail_alloc){vector_fail_alloc=0;return KERNEL_HEAP_STATUS_EMPTY;}
+    return __real_kernel_heap_allocate_zeroed(heap,n,size,out);
+}
 static const uint64_t cold_target = 0x80000;
 static struct kernel_memory_object *cold_object;
 void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
@@ -154,6 +174,7 @@ uint64_t kernel_time_boot_realtime_offset(void) { return 0; }
 void kernel_signal_note_futex_timed_restart(struct kernel_task *task, uint64_t address,
     uint32_t operation, uint32_t value, uint64_t deadline, uint32_t bitset)
 { (void)task; (void)address; (void)operation; (void)value; (void)deadline; (void)bitset; abort(); }
+void kernel_signal_note_syscall_restart(struct kernel_task *task) { (void)task; }
 static void attach(unsigned id)
 {
     mm_test_attach(id);
@@ -162,6 +183,7 @@ static void attach(unsigned id)
     mm_test_bind(&task->mm);
     kernel_cpu_current()->current = task;
     task->cpu = kernel_cpu_current();
+    task->files.heap=test_heap;
     mm_test_context = context;
     sync_test_irq = 0;
 }
@@ -552,6 +574,84 @@ static void shared_wake(void)
     assert(!pthread_join(worker, 0) && w.result == 0);
     assert(!futex_queue->borrows && !futex_queue->registrations);
 }
+extern int64_t kernel_futex_waitv(struct kernel_task *,uint64_t,unsigned,unsigned,uint64_t,int,
+    enum kernel_scheduler_status *);
+static int64_t vector_call(uint64_t address,unsigned count,unsigned flags,uint64_t timeout,int clock)
+{
+    enum kernel_scheduler_status status=KERNEL_SCHEDULER_STATUS_OK;
+    int64_t r=kernel_futex_waitv(kernel_task_current(),address,count,flags,timeout,clock,&status);
+    assert(!status);return r;
+}
+struct vector_user {uint64_t value,address;uint32_t flags,reserved;};
+static const uint64_t vector_address=0x40400;
+static void vector_set(struct vector_user *items,unsigned n)
+{size_t copied;assert(!kernel_copy_to_user(&mm,vector_address,items,n*sizeof(*items),&copied)&&copied==n*sizeof(*items));}
+struct vector_actor {unsigned count;int64_t result;};
+static void *vector_waiter(void *arg)
+{
+    struct vector_actor *v=arg;attach(1);v->result=vector_call(vector_address,v->count,0,0,999);detach();return 0;
+}
+static void waitv_cases(void)
+{
+    assert(vector_call(source,0,0,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(source,129,0,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(0,1,0,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(source,1,1,0,0)==-KERNEL_EINVAL);
+    assert(vector_call(8,1,0,0,0)==-KERNEL_EFAULT);
+    struct vector_user items[128];
+    put(source,7);put(target,7);
+    for(unsigned i=0;i<128;i++)items[i]=(struct vector_user){.value=8,.address=source,.flags=130};
+    vector_set(items,128);
+    assert(vector_call(vector_address,1,0,0,999)==-KERNEL_EAGAIN);
+    assert(vector_call(vector_address,128,0,0,999)==-KERNEL_EAGAIN);
+    items[1].address=source+1;vector_set(items,2);
+    assert(vector_call(vector_address,2,0,0,1)==-KERNEL_EINVAL);
+    items[1].address=8;items[1].flags=2;vector_set(items,2);
+    assert(vector_call(vector_address,2,0,0,1)==-KERNEL_EFAULT);
+    items[0].value=UINT64_C(1)<<32;vector_set(items,1);
+    assert(vector_call(vector_address,1,0,0,1)==-KERNEL_EINVAL);
+    items[0].value=7;items[0].flags=134;vector_set(items,1);
+    assert(vector_call(vector_address,1,0,0,1)==-KERNEL_EOPNOTSUPP);
+    for(unsigned round=0;round<3;round++) {
+        unsigned n=round==2?128:8;
+        for(unsigned i=0;i<n;i++)items[i]=(struct vector_user){.value=7,.address=source,.flags=130};
+        vector_set(items,n);struct vector_actor v={.count=n,.result=-99};
+        unsigned before=mm_test_parked(1);pthread_t thread;
+        assert(!pthread_create(&thread,0,vector_waiter,&v));queued(1,before);
+        if(round==1) {
+            assert(call(source,4|128,0,n,target,7)==n);
+            assert(call(source,1|128,n,0,0,0)==0);
+            assert(call(target,1|128,n,0,0,0)==n);
+        } else {
+            int64_t n_wake=call(source,1|128,n,0,0,0);
+            assert(n_wake>=1 && n_wake<=n);
+            if(n==8)assert(n_wake==8);
+        }
+        assert(!pthread_join(thread,0)&&v.result>=0&&v.result<n);
+    }
+    items[0]=(struct vector_user){.value=7,.address=source,.flags=130};
+    items[1]=(struct vector_user){.value=8,.address=target,.flags=130};
+    vector_set(items,2);
+    vector_pause=1;vector_paused=vector_resume=0;
+    struct vector_actor race={.count=2,.result=-99};pthread_t worker;
+    assert(!pthread_create(&worker,0,vector_waiter,&race));
+    while(!__atomic_load_n(&vector_paused,__ATOMIC_ACQUIRE))sched_yield();
+    assert(call(source,1|128,1,0,0,0)==1);
+    __atomic_store_n(&vector_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(worker,0)&&race.result==0);
+    vector_fail_alloc=1;
+    assert(vector_call(vector_address,2,0,0,1)==-KERNEL_ENOMEM && !kernel_task_current()->futex_request);
+    uint64_t fresh;
+    assert(!kernel_mm_mmap_anonymous(&mm,0x180000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&fresh));
+    items[1]=(struct vector_user){.value=0,.address=fresh,.flags=130};vector_set(items,2);
+    race=(struct vector_actor){.count=2,.result=-99};unsigned before=mm_test_parked(1);
+    assert(!pthread_create(&worker,0,vector_waiter,&race));queued(1,before);
+    assert(call(fresh,1|128,1,0,0,0)==1);
+    assert(!pthread_join(worker,0)&&race.result==1);
+    assert(!kernel_mm_munmap(&mm,fresh,BOAROS_PAGE_SIZE));
+    put(source,0);put(target,0);
+    puts("waitv ABI, full-key precedence, duplicate wake count, vector requeue and128 owners PASS");
+}
 int main(void)
 {
     struct physical_page_allocator allocator = {0};
@@ -573,7 +673,9 @@ int main(void)
     assert(!kernel_mm_brk_initialize(&mm, 0x10000, 0x20000));
     assert(!kernel_mm_context(&mm, &context)); mm_test_context = context;
     assert(!kernel_mm_mmap_anonymous(&mm, source, 2 * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
+    test_heap=&heap;
     attach(0);
+    waitv_cases();
     notification_batch();
     wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
     requeue(target); requeue(source + 1024); comparisons();

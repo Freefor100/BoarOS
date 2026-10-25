@@ -22,6 +22,8 @@ struct kernel_futex_entry {
     struct kernel_futex_key key;
     uint32_t bitset, kind, index, woken;
     struct kernel_futex_pi_request *pi;
+    uint64_t address;
+    uint32_t expected, operation;
 };
 struct kernel_futex_request {
     struct kernel_task *task;

@@ -284,6 +284,12 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名、SysV 和共享文件映射使用上述后备 key，可跨 MM、不同 VA、独立打开和硬链接唤醒或 requeue。私有映射仍使用 MM key。PI 标记项更新 OWNER_DIED，实际 PI owner 随后由其持锁列表交接；futex2 尚未接入。futex 入口在调用者 CPU 执行，文件或缺页后端需要的 CPU0 业务交接由对应 MM/文件层负责。
 
+### 多地址等待
+
+`futex_waitv(449)`导入1～128项24字节描述符，每项是32位期望值、地址、PRIVATE/shared标志及零reserved。返回实际被唤醒项的原始索引；重复地址保留独立排队与WAKE计数，普通REQUEUE移动各项而保留索引。NUMA/MPOL扩展为EOPNOTSUPP，其他非法字段为EINVAL。期限是MONOTONIC或REALTIME绝对时间，没有timeout时忽略clockid。
+
+数组和请求归本次调用，任务只保留强制退出清理owner。先取得所有key，再比较任一值；因此后项key错误先于前项值不符。登记阶段以非阻塞MM资格重查key与实际pin，逐项比较并绑定同一token。一次只持有一个页pin和一个桶；缺页、pin许可关闭或桶竞争时，放桶、归还pin并结束所有登记后再等待或装页。全部节点借用排空后读取实际唤醒项，它优先于已经通知的超时/信号；没有真实唤醒时按原绝对期限及重启规则处理。私人WAKE和普通单项等待沿各自原路径执行。
+
 ### PI mutex
 
 RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未竞争时只原子修改用户字，不常驻分配锁对象，保留 libc 的用户态快速解锁。竞争时，在原桶内发布按真实 key 标识的状态；每个在途调用持有状态引用，状态持有 owner 的任务存储借用及共享 key 的后备引用。调用栈保存等待请求；用户页 pin 只覆盖比较／更新，睡眠前归还，持有者退出后的用户字修复重新取得 pin。
