@@ -6,7 +6,7 @@
 
 ## 近期方向
 
-架构主线是SMP正确性；受控RV映射域已包含匿名、私有tmpfs及在发起CPU冷装入的ext4。真实RV用户可在1～4核执行，按业务入口交接仍需CPU0的操作，229项原程序及有限压力/生命周期组合已有本地两核与单核退化验证；ext4 冷读已具备 inode/mount 读资格、共享缓存短锁及块完成保护；已打开ext4文件的空间修改和同步准备也在发起CPU执行；目录与路径元数据也已在发起 CPU 执行，共享路径和 FS 上下文由跨核保护维护。实际启动多个 CPU 的可写 journal ext4 挂载使用逐目录资格，不同目录和文件的私有修改可同时准备，rename 仍由挂载拓扑互斥协调；四核短例覆盖线程/进程、共享 MM、信号/CPU 定时器和 ext4 并发；socket 收发的预约、用户复制与等待已在发起 CPU 执行，lwIP 与控制操作保留 CPU0；普通用户管道、poll/pselect和epoll等待也在发起CPU执行，eventfd和MONOTONIC/REALTIME timerfd已接入调用者读写、就绪查询和等待，signalfd读取当前调用线程的待决队列；futex的WAIT/WAKE、比较重排与复合唤醒在发起CPU执行，等待键与用户字由同一次MM准备取得，后续推进LA多核。
+架构主线是SMP正确性；受控RV映射域已包含匿名、私有tmpfs及在发起CPU冷装入的ext4。真实RV用户可在1～4核执行，按业务入口交接仍需CPU0的操作，229项原程序及有限压力/生命周期组合已有本地两核与单核退化验证；ext4 冷读已具备 inode/mount 读资格、共享缓存短锁及块完成保护；已打开ext4文件的空间修改和同步准备也在发起CPU执行；目录与路径元数据也已在发起 CPU 执行，共享路径和 FS 上下文由跨核保护维护。实际启动多个 CPU 的可写 journal ext4 挂载使用逐目录资格，不同目录和文件的私有修改可同时准备，rename 仍由挂载拓扑互斥协调；四核短例覆盖线程/进程、共享 MM、信号/CPU 定时器和 ext4 并发；socket 收发的预约、用户复制与等待已在发起 CPU 执行，lwIP 与控制操作保留 CPU0；普通用户管道、poll/pselect和epoll等待也在发起CPU执行，eventfd和MONOTONIC/REALTIME timerfd已接入调用者读写、就绪查询和等待，signalfd读取当前调用线程的待决队列；futex的WAIT/WAKE、比较重排与复合唤醒在发起CPU执行，等待键与用户字由同一次MM准备取得；PI mutex 的锁定、解锁、超时、链式优先级继承及 robust 退出已接入，后续推进LA多核。
 维持现有调度策略、全局运行队列和串行 lwIP 核心，先证明并发正确，再依据锁等待与 CPU 分布决定并行优化。
 默认生产仍为单 CPU；普通与受控对象共用保护与引用规则，普通文件缓存读写、用户复制与匿名缺页在发起 CPU 执行。ext4 冷读在发起 CPU 解析映射并提交块请求；其他磁盘后端冷读与后端释放复用既有 CPU0 worker，范围写回按窗口续批，fsync捕获固定持久化目标后由原调用者等待，完成者在共享短保护下处理错误观察并直接通知结果。系统分配器通知和干净页回收可由远端调用，脏数据仍由 worker 写回。网络端点队列使用跨核短锁，普通 socket 收发在调用 CPU 执行；lwIP、控制操作与最后销毁仍在 CPU0。epoll 远端通知有独立状态保护，控制和最终销毁保持CPU0，等待在发起CPU。
 
@@ -40,7 +40,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
-| 信号、线程与事件 | PI futex与futex_waitv；扩展 clone；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
+| 信号、线程与事件 | PI 条件变量重排与futex_waitv；扩展 clone；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
 | 用户内存 | mremap 的 DONTUNMAP、零长度共享复制、多VMA批量及特殊映射搬移；madvise 的 FREE/REMOVE、dump策略、回收/预装等扩展，VDSO 的 DONTNEED 重装；/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射已支持缩小、扩大及地址搬移；madvise五种基础操作及四种fork策略、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则 |
 | 进程查询与 IPC | pidfd 的扩展 ioctl、clone 创建 pidfd、kcmp 的 IO／EPOLL_TFD、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2 的扩展标志 | getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/SYSVSEM、pidfd_open/send_signal/getfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |

@@ -239,7 +239,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         .no_new_privs=task->no_new_privs,
         .scheduling_priority = task->scheduling.priority
             ? -(task->scheduling.priority + 1) : 20,
-        .rt_priority = (uint32_t)task->scheduling.priority,
+        .rt_priority = scheduler_base_priority(task),
         .scheduling_policy = (uint32_t)task->scheduling.policy,
     };
     result->wait_channel_flag = (thread || threads < 2U) &&

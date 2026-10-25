@@ -1723,6 +1723,8 @@ enum kernel_signal_restart kernel_signal_restart_decide(
     /* Handler syscalls must not inherit an outer restart block. The
      * interrupted register snapshot itself carries a generic retry. */
     kernel_signal_clear_syscall_restart(task);
+    if (kind == KERNEL_SYSCALL_RESTART_NOINTR)
+        return KERNEL_SIGNAL_RESTART_RETRY;
     if (has_handler && (kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||
                          kind == KERNEL_SYSCALL_RESTART_FUTEX_TIMED ||
                          (flags & LINUX_SA_RESTART) == 0U)) {

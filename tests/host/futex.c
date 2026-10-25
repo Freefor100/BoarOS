@@ -562,3 +562,10 @@ int main(void)
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
     puts("futex native operations, gate-independent private keys/pins, bounded one-lock wake/collisions, post-bucket IPI/IRQ ownership, admission/COW, requeue/bitset, coherent remap and owners PASS");
 }
+
+/* 此fixture验证普通等待键、重排与MM交接；PI对象由独立优先级及客机用例验证。 */
+struct futex_bucket;
+int futex_pi_conflict_locked(struct futex_bucket *bucket,const struct kernel_futex_key *key)
+{ (void)bucket;(void)key;abort(); }
+int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t operation,uint64_t timeout,enum kernel_scheduler_status *status)
+{ (void)task;(void)address;(void)operation;(void)timeout;(void)status;abort(); }

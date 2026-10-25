@@ -99,6 +99,10 @@ void scheduler_user_request_locked(struct kernel_task *);
 void scheduler_signal_request_locked(struct kernel_task *);
 /* 同一调度域内结束逻辑实时资格；不结束任务执行或存储owner。 */
 void scheduler_user_reservation_release_locked(struct kernel_task *);
+static inline unsigned scheduler_base_priority(const struct kernel_task *task)
+{ return task->pi_base_priority ? task->pi_base_priority-1U : (unsigned)task->scheduling.priority; }
+void scheduler_pi_priority_locked(struct kernel_task *,unsigned base,unsigned inherited);
+void kernel_futex_pi_recalculate_locked(struct kernel_task *,int base);
 static inline enum kernel_scheduler_status scheduler_failure(void)
 { return __atomic_load_n(&scheduler.fatal_status, __ATOMIC_RELAXED); }
 

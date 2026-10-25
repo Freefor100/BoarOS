@@ -55,3 +55,10 @@ __attribute__((weak)) void scheduler_cpu_timer_update_locked(struct kernel_task 
 __attribute__((weak)) void scheduler_cpu_timer_expire(void) {}
 __attribute__((weak)) void kernel_posix_cpu_target_exit(struct kernel_task *t)
 { assert(!t->cpu_timer_index[0].indexed&&!t->cpu_timer_index[1].indexed); }
+
+/* Ordinary scheduler fixtures publish no PI owner or blocked request. */
+__attribute__((weak)) void kernel_futex_pi_recalculate_locked(struct kernel_task *task,int base)
+{ (void)base;assert(!task->pi_owned && !task->pi_request);abort(); }
+
+__attribute__((weak)) void kernel_futex_pi_abort(struct kernel_task *task)
+{ assert(!task->pi_request);abort(); }

@@ -9,6 +9,7 @@ struct kernel_sched_node {
 struct kernel_sched_runqueue {
     struct kernel_sched_node *first, *last;
     struct kernel_sched_node *heads[100], *tails[100];
+    unsigned boosted;
 };
 void kernel_sched_enqueue(struct kernel_sched_runqueue *queue,
     struct kernel_sched_node *node, void *owner, unsigned priority, int at_head);
