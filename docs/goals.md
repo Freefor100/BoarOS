@@ -75,6 +75,7 @@ NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限
 | 文件后端执行与剩余串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；ext4 冷读和 mmap 冷页在调用 CPU 装入；已打开文件的空间修改与 journal 接纳在发起 CPU；ext4 目录、路径元数据与普通最终关闭在发起 CPU；多执行者 journal ext4 的不同目录/文件可并行准备，接纳和拓扑变更保留各自必要的互斥；mount 管理、日志和后台写回继续在 CPU0，当前固定版本的匹配性能另行核对 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
 | 网络端点与原生构建成本 | 端点队列与预约由跨核短锁保护，收发的用户复制和等待在调用 CPU；协议请求交给既有 CPU0 执行者，普通用户管道与poll/epoll等待在调用CPU，控制与关联清理仍有CPU0边界。默认预算、同步/排空及Lua工程的剩余成本按对应负载检查 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
+| LA内核异常输出 | 持有调度域短锁时发生异常，常规输出通知会重入同锁；PTY worker空限额访问的首错已修，异常输出应独立整理为不依赖等待/调度锁的路径 | [首错与后续异常](learning/cpu-accounting-cost.md#pty卸载发现的退出清理错误) |
 | 未归因现场 | 历史Virtqueue/页释放fatal/偶发取消、RV块统计case47及固定Linux LA终端等待，保留各自首个阶段与缺失证据；同类修复和重跑不关闭原事件 | [事故边界](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)、[程序证据](learning/user-program-inventory.md)、[块诊断](modules/riscv-virtio-block.md) |
 
 这些条目不是新执行计划；已有修复的过程与反例留在对应模块/learning，不重复列入待做。
