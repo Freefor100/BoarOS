@@ -2784,7 +2784,8 @@ static enum kernel_mm_status commit_file_mapping(
         .backing = *file,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
             (((flags & KERNEL_MM_MAP_SHARED) == 0U || kernel_open_file_writable(*file))
-                 ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE),
+                 ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE) &
+            (kernel_open_file_vfs_borrow(*file)->mount->noexec ? ~KERNEL_MM_EXECUTE : KERNEL_VMA_ALL_PERMISSIONS),
     };
     if ((flags & KERNEL_MM_MAP_FIXED) == 0U) {
         status = status_from_vma(kernel_vma_set_insert(record->vmas,

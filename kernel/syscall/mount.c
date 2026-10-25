@@ -19,6 +19,8 @@
 
 #define LINUX_MS_RDONLY UINT64_C(1)
 #define LINUX_MS_NOSUID UINT64_C(2)
+#define LINUX_MS_NODEV UINT64_C(4)
+#define LINUX_MS_NOEXEC UINT64_C(8)
 #define LINUX_MS_SILENT UINT64_C(32768)
 
 static int import_string(struct kernel_mm *mm, char *buffer, size_t capacity,
@@ -75,7 +77,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
-    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_SILENT)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT)) {result=-KERNEL_ENOTSUP;goto Finish;}
     if(!tmpfs && !disk && !devpts && strcmp(type,"proc")) {result=-KERNEL_ENODEV;goto Finish;}
     if(!tmpfs && !devpts && options[0]) {result=-KERNEL_ENOTSUP;goto Finish;}
     if(disk) {
@@ -84,6 +86,8 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         result=kernel_vfs_path_resolve(fs_paths.cwd,fs_paths.root,source_name,1,&source);
         if(!result)result=kernel_vfs_path_stat(source,&source_stat);
         if(!result && (source_stat.mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFBLK)result=-KERNEL_ENOTBLK;
+        /* 同一设备号可以从不同挂载命名；使用已解析源路径的属性。 */
+        if(!result && kernel_vfs_path_mount(source)->nodev)result=-KERNEL_EACCES;
         if(!result)source_device=source_stat.rdev;
         if(source && kernel_vfs_path_release(&source))__builtin_trap();
         if(result)goto Finish;
@@ -101,6 +105,8 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
                    : kernel_procfs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted);
     if (result) goto Finish;
     mounted->nosuid=!!(flags&LINUX_MS_NOSUID);
+    mounted->nodev=!!(flags&LINUX_MS_NODEV);
+    mounted->noexec=!!(flags&LINUX_MS_NOEXEC);
     result = kernel_vfs_mount_attach(mounted, covered);
     if (result) {
         int cleanup = kernel_vfs_unmount(mounted);

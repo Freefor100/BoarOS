@@ -96,11 +96,9 @@ ext4 目录并行检查。`tests/namespace-parallel-host.sh` 检查共享身份�
 检查实际块组资格及单方 abort 后的引用数。runner 支持 4/16 KiB 页及通过
 `FILE_IO_HOST_BLOCK_SIZE` 选择 1/4 KiB 文件系统块，每张正常卸载镜像随后运行 e2fsck。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
-已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通挂载、`MS_RDONLY`、`MS_NOSUID`、`MS_SILENT`、同点覆盖、cwd 忙引用与
-卸载恢复均有真实 U-mode 验证。`kernel/syscall/mount.c` 当前接受上述 mount
-flags 和 flags=0 的 `umount2`；其他 flags 返回 `ENOTSUP`。bind/rbind、remount、
-move、传播、noexec/nodev 等其他挂载属性，以及 lazy/force/expire/nofollow
-卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
+已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通新挂载接受 `MS_RDONLY`、`MS_NOSUID`、`MS_NODEV`、`MS_NOEXEC`、`MS_SILENT`，支持同点覆盖与忙引用检查。`umount2` 只接受 flags=0；其他挂载或卸载 flags 返回 `ENOTSUP`。bind/rbind、remount、move、传播，以及 lazy/force/expire/nofollow 卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
+
+`NOEXEC/NODEV` 在新 mount 发布前设置，存活期间不变。VFS 以符号链接、proc FD 链接和子挂载解析后的实际 mount 判断资格：NOEXEC 使主程序、脚本与 ELF 解释器的执行打开返回 `EACCES`；NODEV 使字符/块设备普通打开返回 `EACCES`，也拒绝把该挂载内的块设备节点作为磁盘挂载源。普通数据读写、目录搜索、stat、具备权限的 mknod 和 O_PATH 不受这两项限制。旧 FD 和相对 dirfd 保持原路径身份；覆盖挂载不会改写它们的 mount。已有 PTY 主端的 `TIOCGPTPEER` 直接取得稳定从端路径，保持该 FD 已有能力。文件映射的执行限制见[MM 模块](kernel-mm.md#匿名与文件映射)，access 的 X_OK 规则见[文件资源模块](kernel-files.md)。
 普通卸载当前针对非根挂载；绝对根挂载没有 parent/covered 边，用户态
 `umount2("/", 0)` 返回 `EINVAL`。固定 Linux 对该情形尝试只读重配置，
 这条根挂载路径须随 remount 独立实现，内核关机的根盘收口不代替它。

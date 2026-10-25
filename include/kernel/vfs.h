@@ -53,7 +53,8 @@ struct kernel_vfs_mount {
     const char *source_name; /* Borrowed from the mount owner. */
     /* Optional owner release, invoked only after backend teardown succeeds. */
     void (*release_owner)(struct kernel_vfs_mount *mount);
-    uint8_t nosuid;
+    /* 新挂载在树发布前设置，存活期间不变；文件路径借用实际挂载。 */
+    uint8_t nosuid, nodev, noexec;
 };
 
 /* Attachment transfers owned root/covered-path references to the tree.

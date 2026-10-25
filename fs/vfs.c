@@ -1334,6 +1334,11 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                 (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) result=-KERNEL_EISDIR;
             else if ((flags & KERNEL_VFS_OPEN_EXECUTABLE) &&
                 (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) result=-KERNEL_EACCES;
+            else if (resolved->file.mount->nodev &&
+                ((resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFCHR ||
+                 (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)) result=-KERNEL_EACCES;
+            else if ((flags & KERNEL_VFS_OPEN_EXECUTABLE) && resolved->file.mount->noexec)
+                result=-KERNEL_EACCES;
             else {
                 result=inode_permission(resolved->file.private_data,request->access |
                     ((flags & KERNEL_VFS_OPEN_EXECUTABLE) ? KERNEL_VFS_MAY_EXEC : 0));
@@ -2120,6 +2125,10 @@ int kernel_vfs_access_check(const struct kernel_vfs_stat *stat,
                              const struct kernel_vfs_mount *mount, unsigned mode)
 {
     if (mode & ~7U) return -KERNEL_EINVAL;
+    /* 目录的执行位用于搜索；NOEXEC只限制普通文件的执行请求。 */
+    if ((mode & KERNEL_VFS_MAY_EXEC) &&
+        (stat->mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG && mount && mount->noexec)
+        return -KERNEL_EACCES;
     int result=kernel_vfs_dac_permission(stat->mode,stat->uid,stat->gid,mode,
                                         kernel_credentials_current());
     if (result) return result;
@@ -3271,7 +3280,11 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
     struct kernel_vfs_instance *instance = mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
     int result=instance->ops->statfs(mount, stat);
-    if (!result && mount->nosuid) stat->flags |= 2U;
+    if (!result) {
+        if (mount->nosuid) stat->flags |= 2U;
+        if (mount->nodev) stat->flags |= 4U;
+        if (mount->noexec) stat->flags |= 8U;
+    }
     return result;
 }
 
