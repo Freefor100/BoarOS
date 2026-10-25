@@ -817,3 +817,30 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 正常退出后，两架构根盘、工具ext4、VFAT及scratch ext4共八对象检查均为0。RV/LA整次启动约8.399/7.100秒，PID1状态0，最终heap-live=0；默认交付内核已恢复并按保存的SHA逐字节核对。运行副本清理后保留输入/ELF/内核身份、逐条输出、judge结果和必要日志于`build/mm-kcmp-20261025/original/`。
 
 原盘程序问题及当前处理统一维护在[测例问题](oscomp-test-issues.md)，包括kcmp03的clone范围和自有LA musl消费者的vfork入口差异。
+
+## madvise与SHM锁定原程序结果：2026-10-25
+
+本轮交付五种madvise基础操作与SHM_LOCK/UNLOCK。固定官方容器断网构建，RV/LA沿原双盘QEMU命令并行运行以下四个原程序；保留两种libc的原ELF、参数、judge和内部时限。默认单核、跳过表及监督设置沿用现状。
+
+每行四配置细项和得分一致，耗时为程序自身准备、主体和清理的总ms。
+
+| 原程序 | 每配置原judge | RV glibc | RV musl | LA glibc | LA musl | 结果与到达位置 |
+|---|---:|---:|---:|---:|---:|---|
+| madvise01 | 5/20 | 194 | 109 | 176 | 105 | 五种基础操作PASS；其余15种扩展操作TCONF，退出0。 |
+| madvise02 | 12/13 | 144 | 116 | 199 | 180 | 12项错误检查PASS；匿名WILLNEED/EBADF项由原测例主动跳过，退出0。 |
+| shmctl01 | 0/1 | 61 | 44 | 67 | 42 | 准备阶段SHM_INFO(14)返回EINVAL，TBROK退出2；尚未进入attach/fork统计主体。 |
+| shmctl02 | 0/1 | 64 | 42 | 62 | 43 | getpwnam(nobody)缺失，准备TBROK退出2；尚未进入LOCK/UNLOCK权限检查。 |
+
+每配置得分**17/35**，四配置合计**68/140**。16次程序执行中8次退出0、8次准备TBROK，无TFAIL、无超时。分母保留原judge对TCONF及准备失败的计数。
+
+`madvise01`五条TPASS分别为NORMAL/RANDOM/SEQUENTIAL/WILLNEED/DONTNEED；15条TCONF为REMOVE、DONTFORK/DOFORK、HWPOISON、MERGEABLE/UNMERGEABLE、HUGEPAGE/NOHUGEPAGE、DONTDUMP/DODUMP、FREE、WIPEONFORK/KEEPONFORK、COLD、PAGEOUT，均为当前扩展能力缺口。NORMAL/RANDOM/SEQUENTIAL是建议，当前接受并检查范围，继续使用既有缓存策略；真实丢弃/COW、文件缓存装入及TLB生命周期由直接程序验证。
+
+`madvise02`含两项NORMAL/EINVAL、REMOVE/EINVAL、已锁范围DONTNEED/EINVAL、MERGEABLE与UNMERGEABLE/EINVAL、NORMAL与WILLNEED空洞/ENOMEM、FREE/EINVAL及三项WIPEONFORK/EINVAL，共12项。FREE、KSM和fork策略的负向输入恰好得到EINVAL，不代表这些操作的正向功能已实现。原源码`tcases_filter()`因历史swap-prefetch变化无条件跳过预期EBADF的WILLNEED项，故该条TCONF不是本次接口缺失；同ELF直接消费者另按无swap的固定Linux验证匿名及纯BSS返回EBADF。
+
+`shmctl01`在`get_shm_idx_from_id()`首先调用SHM_INFO查询最大槽位，原日志`shmctl(...,14,...)`在235行失败；这一步之后才会枚举SHM_STAT。当前缺少SHM_INFO、SHM_STAT/ANY，归为内核查询能力缺口。`shmctl02.c:113`缺少nobody，归为原盘用户数据库输入问题。实际SHM锁定由8项直接消费者覆盖：真实UID、owner/creator与CAP_IPC_LOCK、页取整和同UID累计、零额度及重复LOCK顺序、变更UID/owner后仍向原账户归还、RMID延迟到最后detach及MM锁页额度独立。
+
+通用madvise 10项及SHM锁定8项，在RV UP静态、双核动态/1 GiB、四核静态/512 MiB、RV/LA两种libc与固定Linux同ELF通过。LA匿名WILLNEED参考使用独立no-swap构建，保留原默认swap参考缓存；VDSO DONTNEED及其他扩展建议仍在能力目录。输入、负向用例和参考配置的解释集中于[统一测例问题](oscomp-test-issues.md)。
+
+两架构PID1均正常结束、最终heap-live=0；RV本批最少空闲内核栈2320字节。整次启动RV/LA约8.401/6.566秒，双架构并行。根盘、工具ext4、VFAT、scratch ext4共八个对象检查均返回0。默认交付内核恢复后与启动前保存副本SHA相同，原有交付文档修改保持原样。内核和输入、原ELF、judge身份、逐条输出、耗时及磁盘检查记录在`build/madvise-shm-20261025/original/`；运行盘检查后删除。一次合入前的准备因合入命令失败在运行原程序前终止，准备记录保留于`prepared-before-merge/`，不计入上述结果。
+
+12次固定性能对照、已补齐的上一轮最终SMP基线、control波动及共享MM未达项统一见[CPU成本](cpu-accounting-cost.md#madvise与shm_lock2026-10-25)。
