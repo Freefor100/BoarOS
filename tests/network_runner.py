@@ -239,7 +239,7 @@ def memlock_output(raw):
 
 def pi_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('PI ')]
-    return lines==[*(f'PI CASE {name} PASS' for name in ('raw-owner-and-trylock','raw-clock-errors','contention-donation-revoke','timeout-and-noninterruptible-restart','shared-fork-handoff','libc-robust-recovery','queued-owner-exit','priority-inversion-scheduling','chain-donation-cycle','mixed-normal-pi-waiters','shared-alias-owner-fault','repriority-order-fork-base','caller-cpu-affinity')),'PI END 13']
+    return lines==[*(f'PI CASE {name} PASS' for name in ('raw-owner-and-trylock','raw-clock-errors','contention-donation-revoke','timeout-and-noninterruptible-restart','shared-fork-handoff','libc-robust-recovery','queued-owner-exit','priority-inversion-scheduling','chain-donation-cycle','mixed-normal-pi-waiters','shared-alias-owner-fault','fixup-fault-retains-live-owner','repriority-order-fork-base','caller-cpu-affinity')),'PI END 14']
 
 MOUNT_ATTR_CASES=('new-mount-flags-statfs-mounts', 'exec-script-format-writer-order', 'elf-interpreter-final-mount', 'symlinks-and-child-use-final-mount', 'access-directory-empty-fd-and-privilege', 'nodev-special-types-path-only-and-aliases', 'nodev-block-mount-source-and-type-order', 'mmap-noexec-mprotect-fork-remap-and-fixed-content', 'mmap-fd-rights-validation-and-no-mmap-order', 'overmount-proc-dirfd-and-prior-fd-rights', 'prior-pty-master-peer-path-and-io','mapping-owner-survives-close-and-fork-until-release')
 def mount_attributes_output(raw):

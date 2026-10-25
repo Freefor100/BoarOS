@@ -286,11 +286,11 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未竞争时只原子修改用户字，不常驻分配锁对象，保留 libc 的用户态快速解锁。竞争时，在原桶内发布按真实 key 标识的状态；每个在途调用持有状态引用，状态持有 owner 的任务存储借用及共享 key 的后备引用。调用栈保存等待请求；用户页 pin 只覆盖比较／更新，睡眠前归还，持有者退出后的用户字修复重新取得 pin。
 
-等待者按实际优先级、同优先级的登记顺序排列，链式传播在调度保护内更新 owner 的实际优先级和队列位置。基础调度策略、权限和查询值保持独立；fork 继承基础值。等待者撤销、优先级更新、解锁和退出都重新计算受影响链；检测环并采用固定 Linux 的 1024 层上限。内部可睡眠锁仍按原 FIFO 契约运行，PI 作用于这里的用户互斥锁。
+等待者按实际优先级、同优先级的登记顺序排列，链式传播在调度保护内更新 owner 的实际优先级和队列位置。基础调度策略、权限和查询值保持独立；fork 继承基础值。等待者撤销、优先级更新、解锁和退出都重新计算受影响链；新等待操作按固定 Linux 的 1024 层检查上限排除环；逐步追加可以形成更长的既有无环链，优先级更新沿实际链完整传播，成本为链长。内部可睡眠锁仍按原 FIFO 契约运行，PI 作用于这里的用户互斥锁。
 
 正常解锁先原子发布下一个 TID，再转交内核 owner、通知等待者。超时／信号先通知原 token，等待线程与解锁方在同一保护内竞争最终移除／授予；已授予时返回取得锁。LOCK_PI 使用绝对 REALTIME，LOCK_PI2 默认绝对 MONOTONIC、可带 REALTIME 标志；信号处理后按原绝对期限无条件重启，不依赖 SA_RESTART。
 
-退出与 exec 在旧 MM 释放前发布清理状态，先走 robust 用户链，再依次交接真实 PI owner；新的竞争者通过现有组等待源等待清理完成。退出持有者交接时，获准线程修复 OWNER_DIED 和自己的 TID；地址失效返回 EFAULT并归还其 owner。所有最后引用和堆存储在短保护外释放。普通 WAKE／REQUEUE 源遇到活动 PI 状态返回 EINVAL；PI 接纳也检查同 key 的普通等待者。
+退出与 exec 在旧 MM 释放前发布清理状态，先走 robust 用户链，再依次交接真实 PI owner；新的竞争者通过现有组等待源等待清理完成。退出持有者交接时，获准线程修复 OWNER_DIED 和自己的 TID；地址失效返回 EFAULT；只要还有等待者，仍存活的获准线程继续是内核 owner，随后通过实际退出流程交接。所有最后引用和堆存储在短保护外释放。普通 WAKE／REQUEUE 源遇到活动 PI 状态返回 EINVAL；PI 接纳也检查同 key 的普通等待者。
 
 `make test-pi-priority-host` 检查 4/16 KiB 下实际队列、CPU0 服务资格、RT 节流及链式传播；`tests/workloads/futex/pi.c` 检查原始字、libc robust mutex、超时／信号、优先级倒置、环、共享别名及退出修复故障。`tests/network_runner.py --workload pi` 复用两架构 Linux 对照，`--libc glibc` 使用现有目标静态工具链。
 

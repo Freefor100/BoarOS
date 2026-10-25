@@ -3,6 +3,7 @@
 #include <kernel/time.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 _Thread_local uintptr_t sync_test_irq;
@@ -118,9 +119,33 @@ static void donation_chain(void)
     kernel_futex_pi_recalculate_locked(&tasks[2],30);
     assert(tasks[0].scheduling.priority==90 && !tasks[0].pi_base_priority);
 }
+static void long_existing_chain(void)
+{
+    enum { count=1040 };
+    setup();
+    struct kernel_task *t=calloc(count,sizeof(*t));
+    struct kernel_futex_pi_state *state=calloc(count-1,sizeof(*state));
+    struct kernel_futex_pi_request *request=calloc(count-1,sizeof(*request));
+    assert(t && state && request);
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        /* 每次在末端追加仅有一层owner；既有图长度不是单次环检查的上限。 */
+        for(unsigned i=0;i<count;i++)t[i].cpu=&cpus[0];
+        for(unsigned i=0;i<count-1;i++) {
+            state[i].owner=&t[i+1];state[i].head=state[i].tail=&request[i];
+            request[i]=(struct kernel_futex_pi_request){.task=&t[i],.state=&state[i],.queued=1,.order=i+1};
+            t[i].pi_request=&request[i];t[i+1].pi_owned=&state[i];
+        }
+        kernel_futex_pi_recalculate_locked(&t[0],80);
+        for(unsigned i=0;i<count;i++)assert(t[i].scheduling.priority==80);
+        kernel_futex_pi_recalculate_locked(&t[0],0);
+        for(unsigned i=0;i<count;i++)assert(!t[i].scheduling.priority && !t[i].pi_base_priority);
+    }
+    free(request);free(state);free(t);
+}
 int main(void)
 {
     assert(scheduler_pi_priority_locked && "PI effective-priority publication is missing");
-    ready_and_running();service_and_bandwidth();equal_priority_order();donation_chain();
+    ready_and_running();service_and_bandwidth();equal_priority_order();donation_chain();long_existing_chain();
     puts("PI priority: ready/running, four eligibilities, service reservation, throttling, FIFO and donation chain passed");
 }

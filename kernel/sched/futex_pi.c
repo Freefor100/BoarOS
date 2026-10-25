@@ -28,9 +28,8 @@ static void waiter_insert(struct kernel_futex_pi_request *request)
 }
 void kernel_futex_pi_recalculate_locked(struct kernel_task *task,int base)
 {
-    unsigned depth=0;
+    /* 新边已排除环；逐个末端追加可产生长于单次查环上限的既有链。 */
     while(task) {
-        if(++depth>PI_CHAIN_LIMIT+1)__builtin_trap();
         unsigned inherited=0;
         for(struct kernel_futex_pi_state *p=task->pi_owned;p;p=p->owner_next)
             if(p->head && (unsigned)p->head->task->scheduling.priority>inherited)
@@ -280,7 +279,7 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
     int result=0;
     if(command==7) {
         do {result=pi_unlock(&request,status);} while(result==-KERNEL_EAGAIN);
-        request_finish(&request,result!=0 || *status);return result;
+        request_finish(&request,0);return result;
     }
     enum { AGAIN,ALLOCATE,EXITING,WAITING,FINISHED } action;
     unsigned retries=0;
@@ -374,7 +373,8 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
             if(kernel_scheduler_yield_current())__builtin_trap();
         }
     }
-    request_finish(&request,result!=0 || *status);
+    /* 用户字修复EFAULT不等于线程退出；其他等待者仍借用这个真实owner。 */
+    request_finish(&request,0);
     return result;
 }
 

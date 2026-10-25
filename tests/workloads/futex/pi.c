@@ -158,9 +158,9 @@ static void libc_robust(void)
     puts("PI CASE libc-robust-recovery PASS");
 }
 
-struct dying {uint32_t word;uint32_t *target;int ready[2],release[2];pid_t tid;};
+struct dying {uint32_t word;uint32_t *target;int shared;int ready[2],release[2];pid_t tid;};
 static void *dying_owner(void *p)
-{struct dying *d=p;d->tid=(pid_t)syscall(SYS_gettid);CHECK(!pi(d->target?d->target:&d->word,6|PRIVATE,0));byte_send(d->ready[1]);byte_read(d->release[0]);return 0;}
+{struct dying *d=p;d->tid=(pid_t)syscall(SYS_gettid);CHECK(!pi(d->target?d->target:&d->word,6|(d->shared?0:PRIVATE),0));byte_send(d->ready[1]);byte_read(d->release[0]);return 0;}
 static void *dead_waiter(void *p)
 {struct contender *c=p;c->tid=(pid_t)syscall(SYS_gettid);byte_send(c->ready[1]);CHECK(!pi(c->word,6|PRIVATE,0));CHECK((*c->word&OWNER_DIED)!=0);CHECK(!pi(c->word,7|PRIVATE,0));return 0;}
 static void queued_owner_exit(void)
@@ -244,6 +244,25 @@ static void shared_alias(void)
     puts("PI CASE shared-alias-owner-fault PASS");
 }
 
+
+struct fault_hold {struct contender c;int done[2],release[2];};
+static void *held_fault(void *p)
+{struct fault_hold *f=p;contend(&f->c);byte_send(f->done[1]);byte_read(f->release[0]);return 0;}
+static void fault_retains_owner(void)
+{
+    char name[]="/pi-fault-XXXXXX";int fd=mkstemp(name);CHECK(fd>=0&&!unlink(name)&&!ftruncate(fd,4096));
+    uint32_t *a=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0),*b=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);CHECK(a!=MAP_FAILED&&b!=MAP_FAILED&&!close(fd));
+    struct dying owner={.target=a,.shared=1};CHECK(!pipe(owner.ready)&&!pipe(owner.release));pthread_t o,f;
+    CHECK(!pthread_create(&o,0,dying_owner,&owner));byte_read(owner.ready[0]);
+    struct fault_hold hold={.c={.word=b,.op=13,.priority=60}};CHECK(!pipe(hold.c.ready)&&!pipe(hold.done)&&!pipe(hold.release));
+    CHECK(!pthread_create(&f,0,held_fault,&hold));byte_read(hold.c.ready[0]);blocked(hold.c.tid);
+    struct contender next={.word=a,.op=13,.priority=30,.deadline=after(CLOCK_MONOTONIC,200000000)};pthread_t n=start(&next);blocked(next.tid);
+    CHECK(!mprotect(b,4096,PROT_NONE));byte_send(owner.release[1]);CHECK(!pthread_join(o,0));byte_read(hold.done[0]);CHECK(hold.c.result==-1&&hold.c.error==EFAULT);
+    joined(n,&next);CHECK(next.result==-1&&next.error==ETIMEDOUT);byte_send(hold.release[1]);joined(f,&hold.c);
+    CHECK(!close(owner.ready[0])&&!close(owner.ready[1])&&!close(owner.release[0])&&!close(owner.release[1]));
+    CHECK(!close(hold.done[0])&&!close(hold.done[1])&&!close(hold.release[0])&&!close(hold.release[1])&&!munmap(a,4096)&&!munmap(b,4096));
+    puts("PI CASE fixup-fault-retains-live-owner PASS");
+}
 static void waiter_order(void)
 {
     uint32_t word=0;unsigned counter=0;CHECK(!pi(&word,6|PRIVATE,0));struct contender c[3];pthread_t t[3];
@@ -269,8 +288,8 @@ static void local_cpus(void)
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);alarm(15);mkdir("/proc",0755);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);
-    raw_owner();raw_errors();contention();timeouts_and_signal();shared_fork();libc_robust();queued_owner_exit();inversion();chain_cycle();mixed();shared_alias();waiter_order();local_cpus();
-    puts("PI END 13");alarm(0);
+    raw_owner();raw_errors();contention();timeouts_and_signal();shared_fork();libc_robust();queued_owner_exit();inversion();chain_cycle();mixed();shared_alias();fault_retains_owner();waiter_order();local_cpus();
+    puts("PI END 14");alarm(0);
     if(getpid()==1){sync();reboot(RB_POWER_OFF);}
     return 0;
 }
