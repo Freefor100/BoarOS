@@ -113,11 +113,12 @@ static void vectors(const char *root)
 int main(int argc,char **argv)
 {
     setvbuf(stdout,NULL,_IONBF,0);int host=argc>1&&!strcmp(argv[1],"--host");
+    int vectors_only=argc>1&&!strcmp(argv[1],"--vectors-only");
     cpu_set_t mask;CPU_ZERO(&mask);CHECK(!sched_getaffinity(0,sizeof(mask),&mask));unsigned first=0;while(first<CPU_SETSIZE&&!CPU_ISSET(first,&mask))first++;CHECK(first<CPU_SETSIZE);CPU_ZERO(&mask);CPU_SET(first,&mask);CHECK(!sched_setaffinity(0,sizeof(mask),&mask));
     char root[128];snprintf(root,sizeof(root),host?"/dev/shm/boaros-ioproc-%d":"/ioproc-%d",getpid());CHECK(!mkdir(root,0700));if(!host)CHECK(!mount("none",root,"tmpfs",0,NULL));
-    int own_proc=access("/proc/self/task",F_OK)!=0;
+    int own_proc=!vectors_only && access("/proc/self/task",F_OK)!=0;
     if(own_proc) {CHECK(!mkdir("/proc",0755)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,NULL));}
     printf("IOPROC BEGIN affinity=%u\n",first);
-    for(unsigned t=8;t<=64;t*=8)for(unsigned p=0;p<=64;p+=64)proc_window(t,p);
-    vectors(root);if(own_proc)CHECK(!umount("/proc"));if(!host)CHECK(!umount(root));CHECK(!rmdir(root));CHECK(metrics==16);puts("IOPROC END 16");return 0;
+    if (!vectors_only) for(unsigned t=8;t<=64;t*=8)for(unsigned p=0;p<=64;p+=64)proc_window(t,p);
+    vectors(root);if(own_proc)CHECK(!umount("/proc"));if(!host)CHECK(!umount(root));CHECK(!rmdir(root));CHECK(metrics==(vectors_only?8U:16U));printf("IOPROC END %u\n",metrics);return 0;
 }
