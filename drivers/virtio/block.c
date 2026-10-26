@@ -682,9 +682,9 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     kernel_cost_add_tag(r->cost_tag, metric, 1);
     kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 6), device->queue.inflight + 1);
     unsigned phase = kernel_cost_current()->operation >> 4;
-    if (!flushing && type == VIRTIO_BLOCK_REQUEST_OUT && phase >= 1 && phase <= 4) {
+    if (r->cost_device < 2 && !flushing && type == VIRTIO_BLOCK_REQUEST_OUT && phase >= 1 && phase <= 4) {
         kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(COST_DEVICE0_DATA_WRITE + r->cost_device * 4 + phase - 1), data_length);
-    } else if (type == VIRTIO_BLOCK_REQUEST_IN && phase >= 5 && phase <= 7) {
+    } else if (r->cost_device < 2 && type == VIRTIO_BLOCK_REQUEST_IN && phase >= 5 && phase <= 7) {
         kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(COST_DEVICE0_FILE_READ + r->cost_device * 3 + phase - 5), data_length);
     } else kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + (flushing ? 3 : type == VIRTIO_BLOCK_REQUEST_IN ? 4 : 5)), flushing ? 1 : data_length);
 #else

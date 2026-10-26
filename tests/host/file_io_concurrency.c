@@ -44,11 +44,25 @@ enum kernel_page_cache_status __wrap_kernel_open_file_lookup_page(struct kernel_
 }
 static uint64_t direct_read_target;
 static unsigned direct_read_pin_seen;
+static unsigned watch_write_source, write_source_pins;
+static struct kernel_vfs_node *watch_sparse_node;
+static size_t sparse_spans,sparse_source_bytes;
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
+{
+    if (node==watch_sparse_node) {
+        sparse_spans+=count;
+        for (size_t i=0;i<count;i++) sparse_source_bytes+=spans[i].source_size;
+    }
+    return __real_kernel_vfs_node_writeback(node,spans,count);
+}
 static unsigned direct_inode_held,direct_inode_release;
 enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *space,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     enum kernel_uaccess_status status=__real_kernel_uaccess_pin_user_page(space,address,access,pin);
+    if (watch_write_source && !status && access==KERNEL_MM_READ &&
+        (address&~BOAROS_PAGE_MASK)==0x100000) write_source_pins++;
     if (!status && direct_read_target==address && kernel_cpu_current()->logical_id==1)
         __atomic_store_n(&direct_read_pin_seen,1,__ATOMIC_RELEASE);
     return status;
@@ -1328,6 +1342,78 @@ static void write_sequence_case(struct kernel_heap *heap,struct kernel_vfs_mount
     puts("PASS scalar/vector write and pwrite: one write-sequence owner, append EOF, positioned offset and returned resources");
 }
 
+static void write_page_fragments(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};
+    struct kernel_open_file_description *file=NULL;
+    int error;int64_t result;size_t copied,written;
+    unsigned char source[BOAROS_PAGE_SIZE],expected[BOAROS_PAGE_SIZE],actual[BOAROS_PAGE_SIZE];
+    struct kernel_uaccess_iovec iov[64];
+    size_t fragment=BOAROS_PAGE_SIZE/64;
+    for (size_t i=0;i<sizeof(source);i++) source[i]=(unsigned char)(i*13+i/fragment);
+    for (unsigned i=0;i<64;i++) {
+        size_t at=((i*17)%64)*fragment;
+        iov[i]=(struct kernel_uaccess_iovec){0x100000+at,fragment};
+        memcpy(expected+i*fragment,source+at,fragment);
+    }
+    assert(!kernel_copy_to_user(&mm,0x100000,source,sizeof(source),&copied) && copied==sizeof(source));
+    assert(!kernel_copy_to_user(&mm,0x200000,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+    assert(!kernel_files_create(&local,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,"/write-page-fragments",0600,&file,&error) && !error);
+    file->open_flags=2;assert(!kernel_vfs_file_acquire_write(&file->file));
+    assert(!kernel_vfs_pwrite(&file->file,0,source,sizeof(source),&written) && written==sizeof(source));
+    struct kernel_open_file_description *owned=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&owned));
+    for (unsigned append=0;append<2;append++) {
+        if (append) assert(!kernel_files_ftruncate(&local,0,0,&result) && !result);
+        kernel_open_file_set_status_flags(file,append?KERNEL_FILES_O_APPEND:0);
+        assert(!kernel_files_lseek(&local,0,0,0,&result) && !result);
+        write_source_pins=0;watch_write_source=1;
+        assert(!kernel_files_writev(&local,&mm,0,0x200000,64,&result) && result==BOAROS_PAGE_SIZE);
+        watch_write_source=0;
+        assert(write_source_pins==1 && "same source page must stay pinned across its iovec fragments");
+        assert(!kernel_open_file_pread(file,0,actual,sizeof(actual),&copied) && copied==sizeof(actual));
+        assert(!memcmp(actual,expected,sizeof(actual)) && file->offset==BOAROS_PAGE_SIZE);
+        assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins &&
+            !kernel_io_context_current()->cache_writes);
+    }
+    assert(!kernel_files_release(&local));
+    puts("PASS writev target page: 64 shuffled fragments, one source pin, overwrite/append content and owners");
+}
+
+static void sparse_writeback_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_open_file_description *file=NULL;int error;size_t done;
+    assert(!kernel_open_file_create_mode(heap,mount,"/sparse-writeback",0600,&file,&error) && !error);
+    file->open_flags=2;assert(!kernel_vfs_file_acquire_write(&file->file));
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    size_t block=node->instance->writeback_block_size;
+    if (BOAROS_PAGE_SIZE<4*block) {assert(!kernel_open_file_release(&file));return;}
+    unsigned char bytes[BOAROS_PAGE_SIZE],actual[BOAROS_PAGE_SIZE];memset(bytes,0x59,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t observed=kernel_vfs_error_sequence(&file->file);
+    assert(!kernel_vfs_sync(&file->file,0,&observed));
+    bytes[13]=0x61;bytes[BOAROS_PAGE_SIZE-block+13]=0x62;
+    assert(!kernel_vfs_pwrite(&file->file,13,&bytes[13],1,&done) && done==1);
+    assert(!kernel_vfs_pwrite(&file->file,BOAROS_PAGE_SIZE-block+13,&bytes[BOAROS_PAGE_SIZE-block+13],1,&done) && done==1);
+    sparse_spans=sparse_source_bytes=0;watch_sparse_node=node;
+    assert(!kernel_vfs_sync(&file->file,0,&observed));
+    watch_sparse_node=NULL;
+#if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
+    assert(sparse_spans==2 && sparse_source_bytes==2*block && "sparse writeback must omit untouched middle filesystem blocks");
+#else
+    assert(sparse_spans==1 && sparse_source_bytes==BOAROS_PAGE_SIZE);
+#endif
+    assert(!kernel_open_file_pread(file,0,actual,sizeof(actual),&done) && done==sizeof(actual));
+    assert(!memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_open_file_release(&file));
+#if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
+    puts("PASS sparse writeback: separate first/last blocks, preserved clean middle, exact stable coverage and owners");
+#else
+    puts("PASS sparse writeback: continuous-range mode preserves clean middle and returns owners");
+#endif
+}
+
 static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     assert(!kernel_vfs_mkdir(mount,"/empty-directory",0700));
@@ -1450,6 +1536,8 @@ int main(int argc,char **argv)
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
+    write_page_fragments(&heap,&mount);
+    sparse_writeback_case(&heap,&mount);
     madvise_file_case(&heap,&mount,&cache);
     memlock_file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);
