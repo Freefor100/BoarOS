@@ -137,5 +137,8 @@ struct kernel_vfs_sync_request {
 void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *, int result);
 int kernel_vfs_sync_borrowing(struct kernel_vfs_file *, int data_only,
     uint64_t *observed_error, const struct kernel_lock_guard *borrowed);
+int kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *, uint64_t start,
+    uint64_t end, int data_only, uint64_t *observed_error,
+    const struct kernel_lock_guard *borrowed);
 
 #endif

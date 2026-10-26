@@ -212,6 +212,163 @@ static void grouped_remove(struct ext4_blockdev *dev)
     }
 }
 
+static uint64_t sync_goal_now(void *unused) { (void)unused; return 0; }
+
+static unsigned sync_goal_failures;
+static void expect_sync_goal(ext4_file *file, bool data, uint64_t expected,
+                             const char *reason)
+{
+    uint64_t target;
+    CHECK(ext4_file_sync_metadata_prepare(file, data, &target) == EOK);
+    if (target != expected) {
+        fprintf(stderr, "FAIL sync goal %s: expected %llu, got %llu\n", reason,
+            (unsigned long long)expected, (unsigned long long)target);
+        sync_goal_failures++;
+    }
+}
+
+static void sync_goals(struct ext4_blockdev *dev)
+{
+    struct ext4_journal_runtime runtime = {.now_ns = sync_goal_now};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    ext4_file file, other, reopened;
+    ext4_dir parent;
+    size_t count;
+    CHECK(ext4_fopen(&file, "/file", "w+") == EOK);
+    CHECK(ext4_fopen(&other, "/other", "w+") == EOK);
+    CHECK(ext4_dir_open(&parent, "/") == EOK);
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    CHECK(ext4_file_set_mode(&other, 0640) == EOK);
+    expect_sync_goal(&file, false, 0, "unrelated file metadata");
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_fopen(&file, "/file", "r+") == EOK);
+    expect_sync_goal(&file, false, 0, "reopen unrelated file");
+    CHECK(ext4_fclose(&file) == EOK && ext4_fopen(&file, "/file", "a+") == EOK);
+    expect_sync_goal(&file, true, 0, "O_CREAT existing file has no data change");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    bool changed;
+    CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,0,dev->lg_bsize,&changed,UINT32_MAX)==EOK &&
+        ext4_journal_group_drain("/")==EOK && ext4_file_set_mode(&other,0601)==EOK);
+    CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,0,dev->lg_bsize,&changed,UINT32_MAX)==EOK);
+    expect_sync_goal(&file,true,0,"empty data operation excludes unrelated accepted group");
+    CHECK(ext4_journal_group_drain("/")==EOK);
+
+    CHECK(ext4_file_set_mode(&file, 0644) == EOK);
+    uint64_t accepted = dev->fs->jbd_journal->accepted_sequence;
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_fopen(&file, "/file", "r+") == EOK);
+    expect_sync_goal(&file, false, accepted, "reopen own metadata");
+    expect_sync_goal(&file, true, 0, "mode is not data dependency");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_file_set_mode(&file, 0600) == EOK);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(ext4_file_set_mode(&other, 0600) == EOK);
+    expect_sync_goal(&file, false, 0, "aborted metadata");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+
+    CHECK(ext4_fopen(&reopened, "/new", "w+") == EOK);
+    accepted = dev->fs->jbd_journal->accepted_sequence;
+    expect_sync_goal(&parent.f, false, accepted, "create parent");
+    CHECK(ext4_fclose(&reopened) == EOK);
+    CHECK(ext4_fopen(&reopened, "/new", "r+") == EOK);
+    expect_sync_goal(&reopened, true, accepted, "create child across close");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+
+    CHECK(ext4_link_child("/", reopened.inode, parent.f.inode, "hard", 4) == EOK);
+    accepted = dev->fs->jbd_journal->accepted_sequence;
+    expect_sync_goal(&parent.f, false, accepted, "link parent");
+    expect_sync_goal(&reopened, false, accepted, "link child");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    struct ext4_rename_result renamed;
+    CHECK(ext4_rename_child("/", parent.f.inode, "hard", 4, parent.f.inode,
+                            "renamed", 7, 0, &renamed) == EOK);
+    accepted = dev->fs->jbd_journal->accepted_sequence;
+    expect_sync_goal(&parent.f, false, accepted, "rename parent");
+    expect_sync_goal(&reopened, false, accepted, "rename child");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    uint32_t removed; bool orphan;
+    CHECK(ext4_unlink_child("/", parent.f.inode, "renamed", false,
+                           &removed, &orphan) == EOK && !orphan);
+    accepted = dev->fs->jbd_journal->accepted_sequence;
+    expect_sync_goal(&parent.f, false, accepted, "unlink parent");
+    expect_sync_goal(&reopened, false, accepted, "unlink child");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_fwrite(&reopened, payload, sizeof(payload), &count) == EOK && count == sizeof(payload));
+    CHECK(ext4_transaction_end("/") == EOK);
+    accepted = dev->fs->jbd_journal->accepted_sequence;
+    CHECK(ext4_fclose(&reopened) == EOK);
+    CHECK(ext4_fopen(&reopened, "/new", "r+") == EOK);
+    expect_sync_goal(&reopened, true, accepted, "nested data across close");
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    expect_sync_goal(&reopened, false, 0, "already durable");
+    ext4_dir left,right;ext4_file moving,victim;
+    CHECK(ext4_dir_mk("/left")==EOK && ext4_dir_mk("/right")==EOK &&
+        ext4_dir_open(&left,"/left")==EOK && ext4_dir_open(&right,"/right")==EOK &&
+        ext4_fopen(&moving,"/left/source","w+")==EOK &&
+        ext4_fopen(&victim,"/right/victim","w+")==EOK && ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_rename_child("/",left.f.inode,"source",6,right.f.inode,"victim",6,0,&renamed)==EOK);
+    accepted=dev->fs->jbd_journal->accepted_sequence;
+    expect_sync_goal(&left.f,false,accepted,"cross rename old parent");
+    expect_sync_goal(&right.f,false,accepted,"cross rename new parent");
+    expect_sync_goal(&moving,false,accepted,"cross rename source");
+    expect_sync_goal(&victim,false,accepted,"cross rename replaced inode");
+    CHECK(ext4_journal_group_drain("/")==EOK && ext4_transaction_begin("/")==EOK);
+    CHECK(ext4_rename_child("/",right.f.inode,"victim",6,left.f.inode,"source",6,0,&renamed)==EOK);
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    expect_sync_goal(&left.f,false,0,"aborted rename old parent");
+    expect_sync_goal(&right.f,false,0,"aborted rename new parent");
+    expect_sync_goal(&moving,false,0,"aborted rename source");
+    uint32_t orphaned=victim.inode;
+    CHECK(ext4_fclose(&victim)==EOK && ext4_orphan_free("/",orphaned)==EOK &&
+        ext4_fclose(&moving)==EOK && ext4_dir_close(&left)==EOK && ext4_dir_close(&right)==EOK &&
+        ext4_journal_group_drain("/")==EOK);
+    struct jbd_memory_stats held_before,held_after,returned;
+    jbd_memory_snapshot(dev->fs->jbd_journal->memory,&returned);
+    size_t active_before=returned.used-returned.cached;
+    CHECK(ext4_transaction_begin("/")==EOK);
+    jbd_memory_snapshot(dev->fs->jbd_journal->memory,&held_before);
+    CHECK(ext4_operation_record_inode(dev->fs,file.inode,true)==EOK);
+    jbd_memory_snapshot(dev->fs->jbd_journal->memory,&held_after);
+    if (held_after.used-held_after.cached<=held_before.used-held_before.cached) {
+        fputs("FAIL inode sync candidate is absent from active journal metadata accounting\n",stderr);
+        sync_goal_failures++;
+    }
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    jbd_memory_snapshot(dev->fs->jbd_journal->memory,&returned);
+    CHECK(returned.used-returned.cached==active_before);
+    jbd_memory_set_cache_disabled(dev->fs->jbd_journal,true);
+    jbd_trim_cache(dev->fs->jbd_journal,0);
+    allocations=0;
+    CHECK(ext4_file_set_mode(&file,0640)==EOK);
+    unsigned mode_allocations=allocations;
+    CHECK(mode_allocations && ext4_journal_group_drain("/")==EOK);
+    unsigned rejected=0;
+    for (unsigned point=1;point<=mode_allocations;point++) {
+        struct ext4_inode before,after;
+        CHECK(ext4_fraw_inode_fill(&file,&before)==EOK);
+        allocations=0;fail_allocation=point;
+        int result=ext4_file_set_mode(&file,0600);
+        fail_allocation=0;
+        if (result) {
+            CHECK(result==ENOMEM && !dev->fs->jbd_journal->error);
+            CHECK(ext4_fraw_inode_fill(&file,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
+            expect_sync_goal(&file,false,0,"allocation failure discards private inode target");
+            rejected++;
+        }
+        CHECK(ext4_journal_group_drain("/")==EOK);
+    }
+    CHECK(rejected);
+    jbd_memory_set_cache_disabled(dev->fs->jbd_journal,false);
+    CHECK(ext4_fclose(&reopened) == EOK && ext4_fclose(&file) == EOK &&
+          ext4_fclose(&other) == EOK && ext4_dir_close(&parent) == EOK);
+    CHECK(!sync_goal_failures);
+    printf("PASS inode sync goals: unrelated work excluded; close/reopen, abort, data/full and namespace dependencies retained; %u allocation failures rolled back\n",rejected);
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc >= 3);
@@ -277,6 +434,11 @@ int main(int argc, char **argv)
     CHECK(ext4_mount_setup_locks("/", &storage_locks) == EOK);
     CHECK(ext4_journal_start("/") == EOK);
     event = 0;
+    if (!strcmp(argv[2], "sync-goals")) {
+        sync_goals(&dev);
+        CHECK(ext4_umount("/") == EOK);
+        return 0;
+    }
     if (!strcmp(argv[2], "owner-check")) {
         CHECK(ext4_transaction_begin("/") == EOK);
         {

@@ -3174,8 +3174,8 @@ static void vfs_sync_prepare(void *argument)
         kernel_vfs_sync_complete(request, 0);
 }
 
-static int vfs_sync_range_mode(struct kernel_vfs_file *file,
-    uint64_t start, uint64_t end, uint64_t *observed_error, int data_only,
+int kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *file,
+    uint64_t start, uint64_t end, int data_only, uint64_t *observed_error,
     const struct kernel_lock_guard *borrowed)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
@@ -3207,11 +3207,11 @@ int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
 
 int kernel_vfs_sync_borrowing(struct kernel_vfs_file *file, int datasync,
     uint64_t *observed_error, const struct kernel_lock_guard *borrowed)
-{ return vfs_sync_range_mode(file, 0U, UINT64_MAX, observed_error, datasync, borrowed); }
+{ return kernel_vfs_sync_range_borrowing(file, 0U, UINT64_MAX, datasync, observed_error, borrowed); }
 
 int kernel_vfs_sync_range(struct kernel_vfs_file *file, uint64_t start,
     uint64_t end, uint64_t *observed_error)
-{ return vfs_sync_range_mode(file, start, end, observed_error, 0, NULL); }
+{ return kernel_vfs_sync_range_borrowing(file, start, end, 0, observed_error, NULL); }
 
 const struct kernel_vfs_mount *kernel_vfs_node_mount(
     const struct kernel_vfs_node *node)

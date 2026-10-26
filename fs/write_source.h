@@ -26,6 +26,26 @@ static inline size_t kernel_vfs_write_source_span(
     return kernel_uaccess_iov_span(&source->user, limit, &address);
 }
 
+/* 同一真实用户页内可含不连续iovec；先确定该pin能覆盖的逻辑前缀，
+ * 目标页只准备一次，复制仍逐片段进行以保留共享映射别名的次序。 */
+static inline size_t kernel_vfs_write_source_page_span(
+    struct kernel_vfs_write_source *source,size_t limit,size_t *first)
+{
+    if (!source->mm) { *first=limit;return limit; }
+    uint64_t address;
+    *first=kernel_uaccess_iov_span(&source->user,limit,&address);
+    if (!*first || *first==limit) return *first;
+    uint64_t page=address&~BOAROS_PAGE_MASK;
+    struct kernel_uaccess_iov_cursor cursor=source->user;
+    size_t count=*first;cursor.offset+=*first;
+    while (count<limit) {
+        size_t part=kernel_uaccess_iov_span(&cursor,limit-count,&address);
+        if (!part || (address&~BOAROS_PAGE_MASK)!=page) break;
+        count+=part;cursor.offset+=part;
+    }
+    return count;
+}
+
 static inline void kernel_vfs_write_source_use_pin(
     struct kernel_vfs_write_source *source, const struct kernel_mm_user_pin *pin)
 {

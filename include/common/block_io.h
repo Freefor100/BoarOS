@@ -5,6 +5,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Immutable byte ranges borrowed by synchronous block providers until all
+ * published DMA completes. Filesystem planners own the descriptor storage. */
+struct kernel_block_span {
+    uint64_t offset;
+    const void *buffer;
+    size_t size;
+};
+
 /* Physical byte ranges borrowed until synchronous completion. The block
  * provider sets its status; an adapter translates it for its own caller. */
 struct block_read_span {

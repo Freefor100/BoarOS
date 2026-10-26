@@ -44,11 +44,25 @@ enum kernel_page_cache_status __wrap_kernel_open_file_lookup_page(struct kernel_
 }
 static uint64_t direct_read_target;
 static unsigned direct_read_pin_seen;
+static unsigned watch_write_source, write_source_pins;
+static struct kernel_vfs_node *watch_sparse_node;
+static size_t sparse_spans,sparse_source_bytes;
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
+{
+    if (node==watch_sparse_node) {
+        sparse_spans+=count;
+        for (size_t i=0;i<count;i++) sparse_source_bytes+=spans[i].source_size;
+    }
+    return __real_kernel_vfs_node_writeback(node,spans,count);
+}
 static unsigned direct_inode_held,direct_inode_release;
 enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *space,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     enum kernel_uaccess_status status=__real_kernel_uaccess_pin_user_page(space,address,access,pin);
+    if (watch_write_source && !status && access==KERNEL_MM_READ &&
+        (address&~BOAROS_PAGE_MASK)==0x100000) write_source_pins++;
     if (!status && direct_read_target==address && kernel_cpu_current()->logical_id==1)
         __atomic_store_n(&direct_read_pin_seen,1,__ATOMIC_RELEASE);
     return status;
@@ -706,6 +720,15 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
 }
 /* 独立同步不占文件位置或整次执行者；两个请求仍共享一个错误游标。 */
 static unsigned sync_pause,sync_entered,sync_resume,sync_progress;
+static struct kernel_vfs_file *write_sync_file;
+static uint64_t write_sync_start,write_sync_end;
+static int write_sync_data,write_sync_calls,write_sync_fail;
+static void observe_write_sync(struct kernel_vfs_file *file,uint64_t start,uint64_t end,int data_only)
+{
+    if (file!=write_sync_file) return;
+    write_sync_start=start;write_sync_end=end;write_sync_data=data_only;write_sync_calls++;
+    if (write_sync_fail) kernel_vfs_record_writeback_error(kernel_vfs_file_node(file),-KERNEL_EIO);
+}
 static void pause_sync_call(struct kernel_vfs_file *file)
 {
     if (control && kernel_vfs_file_node(file)==kernel_open_file_node(control) &&
@@ -720,8 +743,17 @@ int __real_kernel_vfs_sync_borrowing(struct kernel_vfs_file *,int,uint64_t *,con
 int __wrap_kernel_vfs_sync_borrowing(struct kernel_vfs_file *file,int data_only,uint64_t *observed,
     const struct kernel_lock_guard *borrowed)
 {
+    observe_write_sync(file,0,UINT64_MAX,data_only);
     pause_sync_call(file);
     return __real_kernel_vfs_sync_borrowing(file,data_only,observed,borrowed);
+}
+int __real_kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *,uint64_t,uint64_t,int,
+    uint64_t *,const struct kernel_lock_guard *);
+int __wrap_kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *file,uint64_t start,uint64_t end,
+    int data_only,uint64_t *observed,const struct kernel_lock_guard *borrowed)
+{
+    observe_write_sync(file,start,end,data_only);
+    return __real_kernel_vfs_sync_range_borrowing(file,start,end,data_only,observed,borrowed);
 }
 int __real_kernel_vfs_sync_range(struct kernel_vfs_file *,uint64_t,uint64_t,uint64_t *);
 int __wrap_kernel_vfs_sync_range(struct kernel_vfs_file *file,uint64_t start,uint64_t end,uint64_t *observed)
@@ -753,9 +785,55 @@ static void *sync_position_progress(void *argument)
     __atomic_store_n(&sync_progress,1,__ATOMIC_RELEASE);
     mm_test_finish();return NULL;
 }
+static void synchronous_write_ranges(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};struct kernel_open_file_description *file=NULL;
+    int error;int64_t result;size_t copied,written;
+    assert(!kernel_files_create(&local,heap) &&
+        !kernel_open_file_create_mode(heap,mount,"/sync-prefix",0600,&file,&error) && !error);
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    struct kernel_open_file_description *slot=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&slot));
+    uint64_t source=0x100000+2*BOAROS_PAGE_SIZE-4;
+    assert(!kernel_copy_to_user(&mm,source,"sync",4,&copied) && copied==4);
+    for (unsigned full=0;full<2;full++) for (unsigned append=0;append<2;append++)
+    for (unsigned mode=0;mode<4;mode++) for (unsigned fault=0;fault<2;fault++) {
+        file->open_flags=2;
+        assert(!kernel_files_ftruncate(&local,0,0,&result) && !result &&
+            !kernel_vfs_pwrite(&file->file,0,"seed!",5,&written) && written==5 &&
+            !kernel_files_lseek(&local,0,2,0,&result) && result==2);
+        file->open_flags=2|(full?KERNEL_FILES_O_SYNC:KERNEL_FILES_O_DSYNC)|
+            (append?KERNEL_FILES_O_APPEND:0);
+        struct kernel_uaccess_iovec iov[]={{source,4},{fault?source+4:source,4}};
+        assert(!kernel_copy_to_user(&mm,0x200000,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+        write_sync_calls=0;write_sync_file=&file->file;
+        write_sync_fail=full && append && mode==3 && fault;
+        enum kernel_files_status status=mode==0?kernel_files_write(&local,&mm,0,source,fault?8:4,&result):
+            mode==1?kernel_files_pwrite(&local,&mm,0,source,fault?8:4,1,&result):
+            mode==2?kernel_files_writev(&local,&mm,0,0x200000,2,&result):
+                    kernel_files_pwritev(&local,&mm,0,0x200000,2,1,&result);
+        write_sync_file=NULL;
+        size_t start=append?5:(mode&1)?1:2;
+        size_t count=fault || mode<2?4:8;
+        assert(!status && result==(write_sync_fail?-KERNEL_EIO:(int64_t)count));
+        if (write_sync_calls!=1 || write_sync_start!=start || write_sync_end!=start+count || write_sync_data!=(int)!full)
+            fprintf(stderr,"FAIL sync accepted prefix: append=%u mode=%u fault=%u full=%u got=[%llu,%llu) data=%d\n",
+                append,mode,fault,full,(unsigned long long)write_sync_start,
+                (unsigned long long)write_sync_end,write_sync_data);
+        assert(write_sync_calls==1 && write_sync_start==start && write_sync_end==start+count && write_sync_data==(int)!full);
+        assert(file->offset==((mode&1)?2:start+count));
+        unsigned char actual[8];
+        assert(!kernel_open_file_pread(file,start,actual,count,&copied) && copied==count &&
+            !memcmp(actual,count==8?"syncsync":"sync",count));
+    }
+    write_sync_fail=0;
+    assert(!kernel_files_release(&local));
+    puts("PASS O_SYNC/O_DSYNC accepted ranges: scalar/vector, append/pwrite, EFAULT prefix and failed sync preserve content/offset");
+}
 static void sync_offset_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_page_cache *cache,int range_first)
 {
+    if (!range_first) synchronous_write_ranges(heap,mount);
     int error;size_t done;uint64_t observed=0;int64_t result;
     files=(struct kernel_files){0};assert(!kernel_files_create(&files,heap));
     assert(!kernel_open_file_create_mode(heap,mount,range_first?"/range-position":"/sync-position",0600,&control,&error) && !error);
@@ -1264,6 +1342,78 @@ static void write_sequence_case(struct kernel_heap *heap,struct kernel_vfs_mount
     puts("PASS scalar/vector write and pwrite: one write-sequence owner, append EOF, positioned offset and returned resources");
 }
 
+static void write_page_fragments(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};
+    struct kernel_open_file_description *file=NULL;
+    int error;int64_t result;size_t copied,written;
+    unsigned char source[BOAROS_PAGE_SIZE],expected[BOAROS_PAGE_SIZE],actual[BOAROS_PAGE_SIZE];
+    struct kernel_uaccess_iovec iov[64];
+    size_t fragment=BOAROS_PAGE_SIZE/64;
+    for (size_t i=0;i<sizeof(source);i++) source[i]=(unsigned char)(i*13+i/fragment);
+    for (unsigned i=0;i<64;i++) {
+        size_t at=((i*17)%64)*fragment;
+        iov[i]=(struct kernel_uaccess_iovec){0x100000+at,fragment};
+        memcpy(expected+i*fragment,source+at,fragment);
+    }
+    assert(!kernel_copy_to_user(&mm,0x100000,source,sizeof(source),&copied) && copied==sizeof(source));
+    assert(!kernel_copy_to_user(&mm,0x200000,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+    assert(!kernel_files_create(&local,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,"/write-page-fragments",0600,&file,&error) && !error);
+    file->open_flags=2;assert(!kernel_vfs_file_acquire_write(&file->file));
+    assert(!kernel_vfs_pwrite(&file->file,0,source,sizeof(source),&written) && written==sizeof(source));
+    struct kernel_open_file_description *owned=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&owned));
+    for (unsigned append=0;append<2;append++) {
+        if (append) assert(!kernel_files_ftruncate(&local,0,0,&result) && !result);
+        kernel_open_file_set_status_flags(file,append?KERNEL_FILES_O_APPEND:0);
+        assert(!kernel_files_lseek(&local,0,0,0,&result) && !result);
+        write_source_pins=0;watch_write_source=1;
+        assert(!kernel_files_writev(&local,&mm,0,0x200000,64,&result) && result==BOAROS_PAGE_SIZE);
+        watch_write_source=0;
+        assert(write_source_pins==1 && "same source page must stay pinned across its iovec fragments");
+        assert(!kernel_open_file_pread(file,0,actual,sizeof(actual),&copied) && copied==sizeof(actual));
+        assert(!memcmp(actual,expected,sizeof(actual)) && file->offset==BOAROS_PAGE_SIZE);
+        assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins &&
+            !kernel_io_context_current()->cache_writes);
+    }
+    assert(!kernel_files_release(&local));
+    puts("PASS writev target page: 64 shuffled fragments, one source pin, overwrite/append content and owners");
+}
+
+static void sparse_writeback_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_open_file_description *file=NULL;int error;size_t done;
+    assert(!kernel_open_file_create_mode(heap,mount,"/sparse-writeback",0600,&file,&error) && !error);
+    file->open_flags=2;assert(!kernel_vfs_file_acquire_write(&file->file));
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    size_t block=node->instance->writeback_block_size;
+    if (BOAROS_PAGE_SIZE<4*block) {assert(!kernel_open_file_release(&file));return;}
+    unsigned char bytes[BOAROS_PAGE_SIZE],actual[BOAROS_PAGE_SIZE];memset(bytes,0x59,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t observed=kernel_vfs_error_sequence(&file->file);
+    assert(!kernel_vfs_sync(&file->file,0,&observed));
+    bytes[13]=0x61;bytes[BOAROS_PAGE_SIZE-block+13]=0x62;
+    assert(!kernel_vfs_pwrite(&file->file,13,&bytes[13],1,&done) && done==1);
+    assert(!kernel_vfs_pwrite(&file->file,BOAROS_PAGE_SIZE-block+13,&bytes[BOAROS_PAGE_SIZE-block+13],1,&done) && done==1);
+    sparse_spans=sparse_source_bytes=0;watch_sparse_node=node;
+    assert(!kernel_vfs_sync(&file->file,0,&observed));
+    watch_sparse_node=NULL;
+#if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
+    assert(sparse_spans==2 && sparse_source_bytes==2*block && "sparse writeback must omit untouched middle filesystem blocks");
+#else
+    assert(sparse_spans==1 && sparse_source_bytes==BOAROS_PAGE_SIZE);
+#endif
+    assert(!kernel_open_file_pread(file,0,actual,sizeof(actual),&done) && done==sizeof(actual));
+    assert(!memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_open_file_release(&file));
+#if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
+    puts("PASS sparse writeback: separate first/last blocks, preserved clean middle, exact stable coverage and owners");
+#else
+    puts("PASS sparse writeback: continuous-range mode preserves clean middle and returns owners");
+#endif
+}
+
 static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     assert(!kernel_vfs_mkdir(mount,"/empty-directory",0700));
@@ -1386,6 +1536,8 @@ int main(int argc,char **argv)
     worker_lock_close_case(&heap,&mount,&cache);
     sendfile_pipe_case(&heap,&mount);
     file_case(&heap,&mount,&cache);
+    write_page_fragments(&heap,&mount);
+    sparse_writeback_case(&heap,&mount);
     madvise_file_case(&heap,&mount,&cache);
     memlock_file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);

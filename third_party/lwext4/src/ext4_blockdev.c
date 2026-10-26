@@ -462,38 +462,44 @@ int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 }
 
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
-	const struct ext4_block_span *spans, unsigned count)
+	struct kernel_block_span *spans, unsigned count)
 {
 	if (!bdev || !bdev->bdif || count > EXT4_BLOCK_BATCH_MAX ||
 	    (count && !spans) || !bdev->bdif->ph_bsize || !bdev->lg_bsize ||
-	    bdev->lg_bsize % bdev->bdif->ph_bsize) return EINVAL;
-	struct ext4_block_span physical[EXT4_BLOCK_BATCH_MAX];
-	uint32_t ratio = bdev->lg_bsize / bdev->bdif->ph_bsize;
+	    bdev->lg_bsize % bdev->bdif->ph_bsize ||
+	    bdev->part_offset % bdev->bdif->ph_bsize) return EINVAL;
 	for (unsigned i = 0; i < count; i++) {
-		if (!spans[i].data || !spans[i].count || spans[i].block > bdev->lg_bcnt ||
-		    spans[i].count > bdev->lg_bcnt - spans[i].block ||
-		    spans[i].count > UINT32_MAX / ratio ||
-		    spans[i].block > (UINT64_MAX - bdev->part_offset) / bdev->lg_bsize)
+		if (!spans[i].buffer || !spans[i].size ||
+		    spans[i].offset % bdev->lg_bsize || spans[i].size % bdev->lg_bsize ||
+		    spans[i].offset / bdev->lg_bsize > bdev->lg_bcnt ||
+		    spans[i].size / bdev->lg_bsize > bdev->lg_bcnt - spans[i].offset / bdev->lg_bsize ||
+		    spans[i].offset > bdev->part_size || spans[i].size > bdev->part_size - spans[i].offset ||
+		    spans[i].size / bdev->bdif->ph_bsize > UINT32_MAX ||
+		    spans[i].offset > UINT64_MAX - bdev->part_offset ||
+		    spans[i].size > UINT64_MAX - bdev->part_offset - spans[i].offset)
 			return EINVAL;
 		for (unsigned j = 0; j < i; j++)
-			if (spans[i].block < spans[j].block + spans[j].count &&
-			    spans[j].block < spans[i].block + spans[i].count) return EINVAL;
-		physical[i] = (struct ext4_block_span){spans[i].data,
-			(spans[i].block * bdev->lg_bsize + bdev->part_offset) / bdev->bdif->ph_bsize,
-			spans[i].count * ratio};
+			if (spans[i].offset < spans[j].offset + spans[j].size &&
+			    spans[j].offset < spans[i].offset + spans[i].size) return EINVAL;
 	}
 	if (!count) return EOK;
 	if (!bdev->bdif->bwrite_batch) {
 		for (unsigned i = 0; i < count; i++) {
-			int r = ext4_bdif_bwrite(bdev, physical[i].data, physical[i].block, physical[i].count);
+			int r = ext4_bdif_bwrite(bdev, spans[i].buffer,
+				(spans[i].offset + bdev->part_offset) / bdev->bdif->ph_bsize,
+				spans[i].size / bdev->bdif->ph_bsize);
 			if (r != EOK) return r;
 		}
 		return EOK;
 	}
+	/* Caller planning storage stays borrowed through DMA drain. Restore its
+	 * filesystem-relative offsets before cache updates and failed-map cleanup. */
+	for (unsigned i = 0; i < count; i++) spans[i].offset += bdev->part_offset;
 	ext4_bdif_lock(bdev);
-	int r = bdev->bdif->bwrite_batch(bdev, physical, count);
+	int r = bdev->bdif->bwrite_batch(bdev, spans, count);
 	__atomic_fetch_add(&bdev->bdif->bwrite_ctr,count,__ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
+	for (unsigned i = 0; i < count; i++) spans[i].offset -= bdev->part_offset;
 	return r;
 }
 

@@ -91,7 +91,7 @@ static int block_write(struct ext4_blockdev *device,
                        uint64_t block,
                        uint32_t count);
 static int block_write_batch(struct ext4_blockdev *device,
-                            const struct ext4_block_span *spans, unsigned count);
+                            const struct kernel_block_span *spans, unsigned count);
 static int block_close(struct ext4_blockdev *device);
 static int block_flush(struct ext4_blockdev *device);
 static int release_mount_storage(struct kernel_vfs_mount *mount);
@@ -774,24 +774,11 @@ static int block_close(struct ext4_blockdev *device)
 }
 
 static int block_write_batch(struct ext4_blockdev *device,
-                            const struct ext4_block_span *spans, unsigned count)
+                            const struct kernel_block_span *spans, unsigned count)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_span single = {0}, *physical = &single;
-    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
-            count * sizeof(*physical), (void **)&physical)) return ENOMEM;
-    for (unsigned i = 0; i < count; i++) {
-        if (spans[i].block > UINT64_MAX / device->bdif->ph_bsize ||
-            (uint64_t)spans[i].count * device->bdif->ph_bsize > SIZE_MAX) {
-            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
-            return EINVAL;
-        }
-        physical[i] = (struct kernel_block_span){spans[i].block * device->bdif->ph_bsize,
-            spans[i].data, (size_t)spans[i].count * device->bdif->ph_bsize};
-    }
-    enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
-    if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
+    enum kernel_block_status status = kernel_block_write_batch(adapter->block, spans, count);
     switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
@@ -1250,7 +1237,9 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
     boaros_lwext4_state_read_lock(&adapter->backend_lock);
     int changed = journal_publish_locked(adapter);
     boaros_lwext4_state_unlock(&adapter->backend_lock);
-    journal_request_flags(adapter, 1, kind == EXT4_JOURNAL_WAIT_CHECKPOINT, 1);
+    /* lwext4 已登记固定 seal/checkpoint target。晚到的等待者只推动
+     * 这个目标，不能 force 封闭目标之后接纳的无关 running group。 */
+    journal_request_flags(adapter, 1, kind == EXT4_JOURNAL_WAIT_CHECKPOINT, 0);
     unsigned depth = boaros_lwext4_pause();
     if (changed) complete_sync_waiters(adapter);
     int result;
@@ -2558,11 +2547,18 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
+static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
+    struct jbd_journal *journal = adapter->device.fs->jbd_journal;
+    return journal && journal->grouped ?
+        lwext4_error(ext4_journal_group_drain(adapter->mount_point)) : 0;
+}
 static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_only,
     struct kernel_vfs_sync_request *request)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
-    int result = writeback_times(node, true);
+    int result = data_only ? EOK : writeback_times(node, true);
     if (result == EOK)
         result = ext4_file_sync_metadata_prepare(lwext4_node_file(node), data_only != 0,
                                                  &request->target);
@@ -2593,11 +2589,8 @@ static int ext4_backend_sync_filesystem(struct kernel_vfs_instance *instance,
     int result = writeback_mount_times(adapter, true);
     /* Timestamp failures have already been published on the affected inode. */
     if (result != EOK) return lwext4_error(result);
-    result = ext4_file_sync_metadata_mode(lwext4_node_file(root), false);
-    if (result == EOK && !adapter->device.fs->jbd_journal) {
-        result = ext4_cache_flush(adapter->mount_point);
-        if (result == EOK) result = block_flush(&adapter->device);
-    }
+    result = ext4_filesystem_sync_metadata(adapter->mount_point);
+    if (result == EOK && !adapter->device.fs->jbd_journal) result = block_flush(&adapter->device);
     if (result != EOK) kernel_vfs_record_writeback_error(root, lwext4_error(result));
     return lwext4_error(result);
 }
@@ -2667,6 +2660,7 @@ static void initialize_backend(void)
     ops->block_device = ext4_backend_block_device;
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;
+    ops->writeback_reclaim = ext4_backend_writeback_reclaim;
     ops->sync_prepare = ext4_backend_sync_prepare;
     ops->sync_filesystem = ext4_backend_sync_filesystem;
     ops->flush = ext4_backend_flush;

@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|truncate|indexed-reclaim|pressure-domains|dirty-age|progress-owners|pressure|pressure-errors|fallocate|durable-progress|caller-metadata-owners|mremap) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|indexed-reclaim|pressure-domains|dirty-age|progress-owners|pressure|pressure-errors|fallocate|durable-progress|caller-metadata-owners|mremap]' >&2; exit 2;; esac
+case "${1:-all}" in all|truncate|indexed-reclaim|pressure-domains|dirty-age|progress-owners|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|mremap) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|truncate|indexed-reclaim|pressure-domains|dirty-age|progress-owners|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|mremap]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -21,7 +21,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         -Wl,--gc-sections,--wrap=kernel_time_monotonic_ns,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_allocate,--wrap=kernel_vfs_node_writeback,--wrap=ext4_fpwrite_batch,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page \
         -Wl,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write,--wrap=kernel_wait_prepare,--wrap=kernel_wait_park,--wrap=kernel_wait_queue_destroy,--wrap=physical_page_acquire,--wrap=physical_page_release,--wrap=physical_page_available,--wrap=kernel_vfs_sync_complete \
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode,--wrap=kernel_vfs_node_find,--wrap=ext4_mount_setup_time_observer ${CACHE_HOST_LDFLAGS:-} \
-        -o "$build_dir/concurrency-$shift"
+        -Wl,--wrap=ext4_filesystem_sync_metadata -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
         if [ "${1:-all}" = indexed-reclaim ]; then
             image="$build_dir/indexed-reclaim-$shift-$block.img"
@@ -63,10 +63,10 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
             e2fsck -fn "$image" > "$build_dir/fsck-caller-metadata-owners-$shift-$block.log" 2>&1
             if [ "${1:-all}" = caller-metadata-owners ]; then continue; fi
         fi
-        if [ "${1:-all}" = durable-progress ]; then
+        if [ "${1:-all}" = durable-progress ] || [ "${1:-all}" = datasync-times ] || [ "${1:-all}" = durable-fixed-target ]; then
             image="$build_dir/durable-progress-$shift-$block.img"
             truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"
-            timeout 15s "$build_dir/concurrency-$shift" "$image" durable-progress
+            timeout 15s "$build_dir/concurrency-$shift" "$image" "$1"
             e2fsck -fn "$image" > "$build_dir/fsck-durable-progress-$shift-$block.log" 2>&1
             continue
         fi

@@ -668,7 +668,11 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
             (unsigned long long)checkpoint,(unsigned long long)journal->checkpoint_sequence);
         assert(!result);
         assert(jbd_memory_budget_failures(journal)>before && journal->checkpoint_sequence>checkpoint);
-        if (operation==8) assert(owner->sync_sequence==journal->accepted_sequence);
+        if (operation==8) {
+            uint64_t target;
+            assert(!ext4_file_sync_metadata_prepare(owner,false,&target) &&
+                target==(journal->accepted_sequence>journal->durable_sequence?journal->accepted_sequence:0));
+        }
         jbd_memory_set_limit(journal,4*1024*1024);assert(!ext4_journal_group_drain(adapter->mount_point));
         struct kernel_vfs_stat stat;
         if (!operation) assert(!kernel_vfs_fstat(&file,&stat) && (stat.mode&0777)==0640 && !kernel_vfs_close(&file));

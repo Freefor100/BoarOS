@@ -122,15 +122,15 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 { return ext4_trans_block_get_range(bdev,b,lba,0,bdev->lg_bsize); }
 
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
-    const struct ext4_block_span *spans, unsigned count)
+    struct kernel_block_span *spans, unsigned count)
 {
     int r = ext4_blocks_set_batch(bdev, spans, count);
     if (r) return r;
-    for (unsigned i = 0; i < count; i++) for (uint32_t j = 0; j < spans[i].count; j++) {
+    for (unsigned i = 0; i < count; i++) for (uint32_t j = 0; j < spans[i].size / bdev->lg_bsize; j++) {
         struct ext4_block cached = EXT4_BLOCK_ZERO();
-        struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].block + j, NULL);
+        struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].offset / bdev->lg_bsize + j, NULL);
         if (!old) continue;
-        memcpy(cached.data, (const uint8_t *)spans[i].data + (size_t)j * bdev->lg_bsize, bdev->lg_bsize);
+        memcpy(cached.data, (const uint8_t *)spans[i].buffer + (size_t)j * bdev->lg_bsize, bdev->lg_bsize);
         ext4_bcache_set_flag(old, BC_UPTODATE);
         ext4_bcache_clear_dirty(old);
         bdev->cache_write_back++;
@@ -153,7 +153,7 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	 * writes. The VFS supplies stable sources and writes directly instead. */
 	if (source && source->retain) {
         if (!offset && length == bdev->lg_bsize && data) {
-            struct ext4_block_span span = {data, lba, 1};
+            struct kernel_block_span span = {lba * bdev->lg_bsize, data, bdev->lg_bsize};
             return ext4_trans_write_data_batch(bdev, &span, 1);
         }
 		struct ext4_block cached = EXT4_BLOCK_ZERO();

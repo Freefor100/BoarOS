@@ -682,9 +682,9 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     kernel_cost_add_tag(r->cost_tag, metric, 1);
     kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 6), device->queue.inflight + 1);
     unsigned phase = kernel_cost_current()->operation >> 4;
-    if (!flushing && type == VIRTIO_BLOCK_REQUEST_OUT && phase >= 1 && phase <= 4) {
+    if (r->cost_device < 2 && !flushing && type == VIRTIO_BLOCK_REQUEST_OUT && phase >= 1 && phase <= 4) {
         kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(COST_DEVICE0_DATA_WRITE + r->cost_device * 4 + phase - 1), data_length);
-    } else if (type == VIRTIO_BLOCK_REQUEST_IN && phase >= 5 && phase <= 7) {
+    } else if (r->cost_device < 2 && type == VIRTIO_BLOCK_REQUEST_IN && phase >= 5 && phase <= 7) {
         kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(COST_DEVICE0_FILE_READ + r->cost_device * 3 + phase - 5), data_length);
     } else kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + (flushing ? 3 : type == VIRTIO_BLOCK_REQUEST_IN ? 4 : 5)), flushing ? 1 : data_length);
 #else
@@ -1015,15 +1015,15 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
             members |= UINT32_C(1) << next;
             total += length; offset += length;
             if (candidate->copied < candidate->remaining) continue;
-            if (phase) {
+            if (phase || writes) {
                 next = candidate->next_ready;
-                if (next == count || parts[next].offset != offset) break;
+                if (next >= count || parts[next].offset != offset ||
+                    !parts[next].remaining || parts[next].copied || parts[next].request) break;
                 continue;
             }
             for (next = 0; next < count; next++) {
                 if (!parts[next].remaining || parts[next].copied || parts[next].request ||
                     parts[next].offset != offset) continue;
-                if (writes && earlier_sector_pending(writes, parts, next)) continue;
                 break;
             }
             if (next == count) break;
@@ -1047,7 +1047,7 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
         segments, segments_count, bounce);
 }
 
-static void phase_ready_insert(struct batch_transfer *parts, uint8_t *head, unsigned index)
+static void batch_ready_insert(struct batch_transfer *parts, uint8_t *head, unsigned index)
 {
     while (*head != KERNEL_BLOCK_BATCH_MAX && parts[*head].offset < parts[index].offset)
         head = &parts[*head].next_ready;
@@ -1072,12 +1072,23 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
     struct kernel_io_context *owner = kernel_io_context_current();
     struct kernel_block_span phase_span = {0};
     uint8_t ready_head = KERNEL_BLOCK_BATCH_MAX;
+    uint8_t write_tail = KERNEL_BLOCK_BATCH_MAX;
     uint32_t ready_mask = 0;
     bytes_zero(parts, count * sizeof(*parts));
     for (size_t i = 0; !next && i < count; i++) {
         parts[i].offset = writes ? writes[i].offset : reads[i].offset;
         parts[i].buffer = writes ? (unsigned char *)writes[i].buffer : reads[i].buffer;
         parts[i].remaining = writes ? writes[i].size : reads[i].size;
+        /* Disjoint writes keep this disk order while their prefixes advance.
+         * Build it once in the reserved workspace, rather than rediscovering
+         * each adjacent SG member from the start of the input vector. */
+        if (writes && parts[i].remaining) {
+            parts[i].next_ready = KERNEL_BLOCK_BATCH_MAX;
+            if (write_tail == KERNEL_BLOCK_BATCH_MAX) ready_head = i;
+            else if (parts[write_tail].offset < parts[i].offset) parts[write_tail].next_ready = i;
+            else { batch_ready_insert(parts, &ready_head, i); continue; }
+            write_tail = i;
+        }
     }
     enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
     uint32_t completed_reads = 0;
@@ -1147,7 +1158,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
             for (unsigned i = 0; i < count; i++)
                 if (parts[i].remaining && !parts[i].copied && !parts[i].request &&
                     !(ready_mask & (UINT32_C(1) << i))) {
-                    phase_ready_insert(parts, &ready_head, i);
+                    batch_ready_insert(parts, &ready_head, i);
                     ready_mask |= UINT32_C(1) << i;
                 }
         }

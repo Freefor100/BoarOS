@@ -17,9 +17,9 @@ io = importlib.util.module_from_spec(spec); spec.loader.exec_module(io)
 class Profiles(unittest.TestCase):
     def test_matrix_and_defaults(self):
         rows = io.profiles('all')
-        self.assertEqual(len(rows), 30)
-        self.assertEqual([r['name'] for r in rows if r['production_default']], ['ra0-wb32'])
-        for bad in ('ra16-wb1', 'ra1-wb0', 'ra3-wb3'):
+        self.assertEqual(len(rows), 42)
+        self.assertEqual([r['name'] for r in rows if r['production_default']], ['ra16-wb32'])
+        for bad in ('ra64-wb1', 'ra1-wb0', 'ra3-wb3'):
             with self.assertRaises(ValueError): io.profile(bad)
 
     def test_no_fake_cold_tmpfs(self):
@@ -208,6 +208,84 @@ class Workload(unittest.TestCase):
             with self.assertRaises(RuntimeError): io.validate(text.replace('complete=1', 'complete=0', 1), case)
             altered = text.replace('id=1 sequence=0 ', 'id=9 sequence=0 ', 1)
             with self.assertRaises(RuntimeError): io.validate(altered, case)
+
+    def exercise_policy(self, name):
+        case=io.parse_case(name)
+        with tempfile.TemporaryDirectory(dir=self.work) as directory:
+            work=Path(directory);io.seed(work/'data',case);config=work/'config'
+            config.write_text('{backend} {operation} {completion} {files} {bytes} {request} 120\n'.format(**case))
+            result=subprocess.run([str(self.program),str(config),str(work/'data')],capture_output=True,text=True,timeout=125)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            text=Path(str(config)+'.results').read_text();parsed=io.validate(text,case)
+            for prefix in ('POLICY_FILE','POLICY_SAMPLE','AFFINITY','RESOURCE'):
+                damaged=''.join(line for line in text.splitlines(keepends=True) if not line.startswith('IO '+prefix+' '))
+                with self.assertRaises(RuntimeError):io.validate(damaged,case)
+            with self.assertRaises(RuntimeError):io.validate(text.replace('complete=1','complete=0',1),case)
+            if case['operation'] in ('periodic-sync','active-mixed'):
+                damaged=''.join(line for line in text.splitlines(keepends=True) if not line.startswith('IO POLICY_ROUND '))
+                with self.assertRaises(RuntimeError):io.validate(damaged,case)
+            return parsed
+
+    def test_target_page_vectors(self):
+        for count in (1,4,64):
+            for temperature in ('hot','cold'):
+                for layout in ('same','split'):
+                    with self.subTest(count=count,temperature=temperature,layout=layout):
+                        result=self.exercise_policy(f'ext4:writev-{count}-{temperature}-{layout}:fsync:1:16M:4K')
+                        self.assertEqual(result['latencies']['write']['samples'],4096)
+
+    def test_synchronous_write_modes(self):
+        for completion in ('osync','odsync','fsync16','fdatasync16'):
+            result=self.exercise_policy(f'ext4:sync-write:{completion}:1:4M:4K')
+            self.assertEqual(result['latencies']['write']['samples'],1024)
+            self.assertEqual(result['metrics']['sync_calls'],64 if completion.endswith('16') else 0)
+
+    def test_hot_and_sparse_fixed_updates(self):
+        result=self.exercise_policy('ext4:hot-write:fsync:1:16M:4K')
+        self.assertEqual((result['metrics']['bytes'],result['metrics']['distinct_bytes']),(16*1048576,1048576))
+        result=self.exercise_policy('ext4:sparse-write:fsync:1:4M:1K')
+        self.assertEqual((result['metrics']['bytes'],result['metrics']['distinct_bytes']),(32*1048576,2*1048576))
+
+    def test_four_writer_ready_fsync_done(self):
+        result=self.exercise_policy('ext4:periodic-sync:fsync:4:1M:4K')
+        self.assertEqual((result['metrics']['bytes'],result['metrics']['sync_calls'],len(result['rounds'])),(4*1048576,64,64))
+
+    def test_true_mixed_writer_and_readers(self):
+        result=self.exercise_policy('ext4:active-mixed:fsync:4:16M:4K')
+        self.assertEqual(result['metrics']['writer_bytes'],16*1048576)
+        self.assertEqual(result['latencies']['read']['samples'],2048)
+        self.assertEqual(result['latencies']['open']['samples'],256)
+        self.assertEqual(result['latencies']['close']['samples'],256)
+        self.assertEqual(result['metrics']['sync_calls'],17)
+
+    def test_shared_mmap_and_matching_pwrite_work(self):
+        for operation in ('mmap-write','pwrite-pair'):
+            result=self.exercise_policy(f'ext4:{operation}:fsync:2:4M:1K')
+            self.assertEqual(result['metrics']['bytes'],16*1048576)
+            self.assertEqual(result['latencies']['write']['samples'],16384)
+
+    def test_complete_six_second_schedules(self):
+        for operation,size in (('age-burst','4M'),('age-hot','16M')):
+            result=self.exercise_policy(f'ext4:{operation}:fsync:1:{size}:4K')
+            self.assertGreaterEqual(result['metrics']['scheduled_window_ns'],6000000000)
+            self.assertGreater(result['metrics']['final_sync_ns'],0)
+
+    def test_one_gib_stream_and_input_limits(self):
+        result=self.exercise_policy('ext4:stream-write:fsync:1:1G:64K')
+        self.assertEqual(result['metrics']['bytes'],1073741824)
+        self.assertEqual(len(result['progress']),64)
+        for bad in ('ext4:stream-write:fsync:1:16M:64K','ext4:stream-write:cache:1:1G:64K',
+                    'ext4:sync-write:fsync:1:4M:4K','ext4:writev-65-hot-same:fsync:1:16M:4K'):
+            with self.assertRaises(ValueError):io.parse_case(bad)
+
+    def test_two_paths_on_one_backing_device_are_rejected(self):
+        case=io.parse_case('ext4:domain-busy:fsync:2:512M:64K')
+        with tempfile.TemporaryDirectory(dir=self.work) as directory:
+            work=Path(directory);io.seed(work/'data',case);io.seed(work/'second',case);config=work/'config'
+            config.write_text('{backend} {operation} {completion} {files} {bytes} {request} 120\n'.format(**case))
+            result=subprocess.run([str(self.program),str(config),str(work/'data'),str(work/'second')],capture_output=True,text=True,timeout=5)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('st_dev',result.stderr)
 
     def test_mixed_latency_percentile_and_absent_overlap(self):
         self.assertEqual(io.latency_metrics([]), dict(samples=0, p50_ns=None, p95_ns=None, p99_ns=None, maximum_ns=None))

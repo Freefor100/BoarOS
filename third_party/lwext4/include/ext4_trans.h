@@ -76,10 +76,10 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
     struct ext4_block *b, uint64_t lba, uint32_t offset, uint32_t length);
 
-struct ext4_block_span;
+struct kernel_block_span;
 /* Synchronous non-journal stable blocks; explicit bcache borrows remain coherent. */
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
-    const struct ext4_block_span *spans, unsigned count);
+    struct kernel_block_span *spans, unsigned count);
 
 struct file_data_source;
 /* A private replacement version makes abort discard-only. Full blocks can

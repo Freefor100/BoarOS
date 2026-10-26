@@ -78,6 +78,8 @@ struct ext4_fs {
 	const struct ext4_lock *os_locks;
     uint64_t reserved_blocks;
     uint32_t reserved_inodes;
+    struct ext4_inode_goal_tree inode_goals;
+    struct ext4_inode_goal_queue pending_inode_goals;
 };
 
 /* Keep the port dispatch at its actual caller; the port owns qualification. */
@@ -135,7 +137,10 @@ void ext4_operation_discard_super_state_held(struct ext4_operation *operation);
 void ext4_operation_memory_denied(struct ext4_fs *fs);
 /* Prepare/publish are memory-only phases owned by the caller's STATE. */
 void ext4_operation_publish_super(struct ext4_operation *operation);
-void ext4_operation_completed(struct ext4_operation *operation, uint64_t sequence, uint32_t tid);
+void ext4_operation_completed(struct ext4_operation *operation, uint64_t sequence);
+int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data);
+void ext4_operation_discard_inode_goals(struct ext4_operation *operation);
+void ext4_fs_retire_inode_goals(struct ext4_fs *fs, uint64_t durable);
 int ext4_operation_prepare_super(struct ext4_operation *operation, struct ext4_sblock *merged);
 int ext4_operation_require_resource(struct ext4_fs *fs, enum ext4_resource_kind kind, uint32_t key);
 int ext4_operation_claim_inode(struct ext4_fs *fs, uint32_t inode);

@@ -944,32 +944,76 @@ static void group_checkpoint_pressure(struct ext4_fs *fs)
 }
 static struct owned_file_page direct_pages[32];
 static unsigned direct_batches, direct_fail_batch;
-static int direct_write_batch(struct ext4_blockdev *bdev,const struct ext4_block_span *spans,unsigned count)
+static unsigned direct_boundary_calls;
+static int direct_boundary_result;
+static int direct_boundary_batch(struct ext4_blockdev *bdev,
+    const struct kernel_block_span *spans, unsigned count)
+{
+    CHECK(count==2 && spans[0].offset==bdev->part_offset+bdev->lg_bsize &&
+        spans[1].offset==bdev->part_offset+4*bdev->lg_bsize &&
+        spans[0].size==bdev->lg_bsize && spans[1].size==2*bdev->lg_bsize);
+    direct_boundary_calls++;
+    return direct_boundary_result;
+}
+static int direct_boundary_single(struct ext4_blockdev *bdev, const void *data,
+    uint64_t block, uint32_t count)
+{
+    CHECK(data && direct_boundary_calls<2);
+    CHECK(block==(bdev->part_offset+(direct_boundary_calls?4:1)*bdev->lg_bsize)/512 &&
+        count==(direct_boundary_calls?2:1)*bdev->lg_bsize/512);
+    return ++direct_boundary_calls==2 ? EIO : EOK;
+}
+static void direct_batch_boundaries(struct ext4_blockdev *source)
+{
+    struct ext4_blockdev_iface iface=*source->bdif;
+    struct ext4_blockdev bdev=*source;
+    bdev.bdif=&iface;bdev.part_offset=7*512;
+    iface.bwrite_batch=direct_boundary_batch;
+    unsigned char data[8192];
+    struct kernel_block_span spans[2]={{bdev.lg_bsize,data,bdev.lg_bsize},{4*bdev.lg_bsize,data,2*bdev.lg_bsize}}, saved[2];
+    memcpy(saved,spans,sizeof(saved));direct_boundary_calls=0;direct_boundary_result=EIO;
+    CHECK(ext4_blocks_set_batch(&bdev,spans,2)==EIO && direct_boundary_calls==1);
+    CHECK(!memcmp(spans,saved,sizeof(spans)));
+    direct_boundary_result=EOK;
+    CHECK(ext4_blocks_set_batch(&bdev,spans,2)==EOK && direct_boundary_calls==2);
+    CHECK(!memcmp(spans,saved,sizeof(spans)));
+    spans[1].offset=bdev.lg_bcnt*bdev.lg_bsize;
+    memcpy(saved,spans,sizeof(saved));
+    CHECK(ext4_blocks_set_batch(&bdev,spans,2)==EINVAL && direct_boundary_calls==2);
+    CHECK(!memcmp(spans,saved,sizeof(spans)));
+    spans[1].offset=bdev.lg_bsize;
+    CHECK(ext4_blocks_set_batch(&bdev,spans,2)==EINVAL && direct_boundary_calls==2);
+    spans[1].offset=4*bdev.lg_bsize;memcpy(saved,spans,sizeof(saved));
+    iface.bwrite_batch=NULL;iface.bwrite=direct_boundary_single;direct_boundary_calls=0;
+    CHECK(ext4_blocks_set_batch(&bdev,spans,2)==EIO && direct_boundary_calls==2);
+    CHECK(!memcmp(spans,saved,sizeof(spans)));
+}
+static int direct_write_batch(struct ext4_blockdev *bdev,const struct kernel_block_span *spans,unsigned count)
 {
     bool payload = false;
     size_t bytes=0;
     for (unsigned i=0;i<count;i++) {
-        uintptr_t p=(uintptr_t)spans[i].data;
+        uintptr_t p=(uintptr_t)spans[i].buffer;
         bool matched=false;
         for (unsigned j=0;j<32;j++) {
             uintptr_t base=(uintptr_t)direct_pages[j].bytes;
             if (base && p>=base && p-base<8192) {
-                CHECK((size_t)spans[i].count*512<=8192-(p-base));
+                CHECK(spans[i].size<=8192-(p-base));
                 matched=true; break;
             }
         }
-        CHECK(matched); payload=true; bytes+=(size_t)spans[i].count*512;
+        CHECK(matched); payload=true; bytes+=spans[i].size;
     }
     CHECK(payload && bytes<=131072);
     if (++direct_batches==direct_fail_batch) return EIO;
     for (unsigned i=0;i<count;i++) {
-        int r=dev_write(bdev,spans[i].data,spans[i].block,spans[i].count);
+        int r=dev_write(bdev,spans[i].buffer,spans[i].offset/512,spans[i].size/512);
         if (r) return r;
     }
     return EOK;
 }
 static struct ext4_inode *direct_cleanup_leaf;
-static int direct_full_leaf_write_batch(struct ext4_blockdev *bdev,const struct ext4_block_span *spans,unsigned count)
+static int direct_full_leaf_write_batch(struct ext4_blockdev *bdev,const struct kernel_block_span *spans,unsigned count)
 {
     int r=direct_write_batch(bdev,spans,count);
     if(r) {
@@ -985,6 +1029,7 @@ static int direct_full_leaf_write_batch(struct ext4_blockdev *bdev,const struct 
 static void direct_data_batch(struct ext4_fs *fs,bool fail)
 {
     CHECK(!fs->jbd_journal);
+    direct_batch_boundaries(fs->bdev);
     ext4_file file; CHECK(ext4_fopen(&file,"/file","r+")==EOK);
     struct ext4_inode_ref inode; ext4_fsblk_t physical;
     CHECK(ext4_fs_get_inode_ref(fs,file.inode,&inode)==EOK);
@@ -1770,7 +1815,7 @@ static void times_test(struct ext4_fs *fs, bool readonly)
     if (readonly) { CHECK(ext4_file_set_times(&f,7,t)==EROFS);CHECK(ext4_file_set_mode(&f,0751)==EROFS);CHECK(disk.writes==writes);CHECK(ext4_fclose(&f)==EOK);return; }
     CHECK(ext4_file_set_times(&f,7,t)==EOK);
     for(unsigned i=0;i<3;i++)expect_time(&f,i,t[i],extended);
-    CHECK(f.sync_tid==fs->jbd_journal->committed_id && f.sync_tid);
+    CHECK(fs->jbd_journal->committed_id);
     CHECK(ext4_file_sync_metadata(&f)==EOK);
     t[0]=(struct ext4_timestamp){12345,42};t[1].nanoseconds=UINT32_MAX;t[2]=(struct ext4_timestamp){1700000001,23};
     CHECK(ext4_file_set_times(&f,5,t)==EOK);
@@ -1780,10 +1825,10 @@ static void times_test(struct ext4_fs *fs, bool readonly)
         for(unsigned i=0;i<3;i++)t[i]=(struct ext4_timestamp){seconds[n],123456789};
         CHECK(ext4_file_set_times(&f,7,t)==EOK);for(unsigned i=0;i<3;i++)expect_time(&f,i,t[i],extended);
     }
-    CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);uint32_t tid=f.sync_tid;
+    CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);uint32_t tid=fs->jbd_journal->committed_id;
     CHECK(ext4_transaction_begin("/")==EOK);t[0]=(struct ext4_timestamp){9000,7};
     CHECK(ext4_file_set_times(&f,1,t)==EOK);CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
-    CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && f.sync_tid==tid);
+    CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && fs->jbd_journal->committed_id==tid);
     CHECK(ext4_transaction_begin("/")==EOK);CHECK(ext4_file_set_times(&f,1,t)==EOK);
     CHECK(ext4_file_set_times(&f,8,t)==EINVAL);CHECK(ext4_transaction_end("/")==EINVAL);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
@@ -1971,7 +2016,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
         CHECK(ext4_setxattr("/file","security.capability",19,cap,sizeof(cap))==EOK);
         CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     }
-    uint32_t tid=f.sync_tid;
+    uint32_t tid=fs->jbd_journal?fs->jbd_journal->committed_id:0;
     struct ext4_mount_stats untouched,stats;memset(&stats,0xa5,sizeof(stats));untouched=stats;
     struct ext4_timestamp t[3]={{1234,1},{5678,2},{9012,3}};
     bool stats_op=strstr(mode,"stats")!=NULL;
@@ -1987,7 +2032,8 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
     if(oom || !strcmp(mode,"read-stats")) {
         if(r!=EOK) {
             CHECK(r==(oom?ENOMEM:EIO));CHECK(!fs->jbd_journal || fs->jbd_journal->error==EOK);
-            CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && f.sync_tid==tid);
+            CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) &&
+                (!fs->jbd_journal || fs->jbd_journal->committed_id==tid));
             if(stats_op)CHECK(!memcmp(&untouched,&stats,sizeof(stats)));
         } else CHECK(oom && !point);
         if(stats_op)CHECK(ext4_mount_point_stats("/",&stats)==EOK && stats.overhead_blocks==expected);
@@ -2002,7 +2048,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
         return;
     }
     CHECK(r==EIO && fs->jbd_journal->error==EIO);
-    CHECK(ext4_file_set_times(&f,7,t)==EIO && f.sync_tid==tid);
+    CHECK(ext4_file_set_times(&f,7,t)==EIO && fs->jbd_journal->committed_id==tid);
     CHECK(ext4_mount_point_stats("/",&stats)==EIO && !memcmp(&untouched,&stats,sizeof(stats)));
     CHECK(ext4_umount("/")==EIO && fs->bdev->fs==fs);
     CHECK(fault_block_crash(&disk)==0);
@@ -2795,12 +2841,16 @@ static void handle_return_test(struct ext4_fs *fs)
     CHECK(ext4_journal_group_commit("/",true)==EOK);
     size_t written;
     CHECK(ext4_fpwrite(&file,8192,"B",1,&written)==EOK && written==1);
-    uint64_t size=file.fsize,sequence=file.sync_sequence,data=file.data_sequence;
-    uint32_t tid=file.sync_tid;
+    uint64_t size=file.fsize,sequence,data;
+    CHECK(ext4_file_sync_metadata_prepare(&file,false,&sequence)==EOK &&
+          ext4_file_sync_metadata_prepare(&file,true,&data)==EOK);
     CHECK(size==8193 && sequence>1 && data==sequence);
     __atomic_store_n(&handle_return_resume,1,__ATOMIC_RELEASE);
     CHECK(!pthread_join(first,NULL));
-    CHECK(file.fsize==size && file.sync_sequence==sequence && file.data_sequence==data && file.sync_tid==tid);
+    uint64_t later_sequence,later_data;
+    CHECK(ext4_file_sync_metadata_prepare(&file,false,&later_sequence)==EOK &&
+          ext4_file_sync_metadata_prepare(&file,true,&later_data)==EOK);
+    CHECK(file.fsize==size && later_sequence==sequence && later_data==data);
     struct ext4_inode inode;
     CHECK(ext4_fraw_inode_fill(&file,&inode)==EOK && ext4_inode_get_size(&fs->sb,&inode)==size);
     unsigned char byte;size_t read;

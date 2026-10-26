@@ -362,6 +362,9 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	int r;
 	struct ext4_fs *fs = parent->fs;
 	struct ext4_sblock *sb = &parent->fs->sb;
+	r = ext4_operation_record_inode(fs, parent->index, true);
+	if (!r) r = ext4_operation_record_inode(fs, child->index, false);
+	if (r) return r;
 
 #if CONFIG_DIR_INDEX_ENABLE
 	/* Index adding (if allowed) */
@@ -542,6 +545,8 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 int ext4_dir_remove_found(struct ext4_inode_ref *parent,
                          struct ext4_dir_search_result *result)
 {
+	int recorded = ext4_operation_record_inode(parent->fs, parent->index, true);
+	if (recorded) return recorded;
 	/* Invalidate entry */
 	ext4_dir_en_set_inode(result->dentry, 0);
 
