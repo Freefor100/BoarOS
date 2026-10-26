@@ -753,7 +753,7 @@ static void sparse_cache_growth(struct kernel_page_cache *cache,struct kernel_vf
     uint64_t end=2*BOAROS_PAGE_SIZE+3; size_t count;
     assert(!kernel_vfs_pwrite(&file,end,"end",3,&count) && count==3);
     unsigned char bytes[80]; memset(bytes,0xcc,sizeof(bytes));
-    assert(!kernel_vfs_pread(&file,end-45,bytes,sizeof(bytes),&count) && count==48);
+    assert(!kernel_vfs_pread(&file,end-45,bytes,sizeof(bytes),&count, NULL) && count==48);
     for (unsigned i=0;i<45;i++) assert(!bytes[i]);
     assert(!memcmp(bytes+45,"end",3));
     uint64_t address; size_t valid;
@@ -1342,7 +1342,7 @@ static void foreground_window_truncate(struct kernel_page_cache *cache,struct ke
     uint64_t observed=kernel_vfs_error_sequence(file);assert(!kernel_vfs_sync(file,0,&observed));
     unsigned char actual;assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),0,&actual,1,&done) && done==1 && actual==0x94);
     assert(!kernel_vfs_ftruncate(file,(uint64_t)COUNT*BOAROS_PAGE_SIZE));
-    assert(!kernel_vfs_pread(file,(uint64_t)(COUNT-1)*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && !actual);
+    assert(!kernel_vfs_pread(file,(uint64_t)(COUNT-1)*BOAROS_PAGE_SIZE,&actual,1,&done, NULL) && done==1 && !actual);
     kernel_page_cache_get_concurrency_state(cache,&state);assert(!state.entry_borrows);
     puts("PASS foreground window truncate: held old completion, new dirty generation, unselected tail retirement and zero regrowth");
 }
@@ -1661,7 +1661,7 @@ static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs
     uint64_t error=kernel_vfs_error_sequence(&file);
     assert(!kernel_vfs_sync(&file,0,&error));
     unsigned char actual[BOAROS_PAGE_SIZE];size_t read;
-    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read, NULL) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
     assert(!kernel_vfs_close(&file));
     puts("PASS overwrite/append: three metadata locks, three inode phases, no redundant physical refs; one window admission and one final pressure notification, sync/readback verified");
 }
@@ -2283,7 +2283,7 @@ static void executor_range_fairness(struct kernel_page_cache *cache,
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&writer)));
     for (unsigned i=0;i<COUNT;i++) {
         unsigned char actual;
-        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && actual==0x49);
+        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done, NULL) && done==1 && actual==0x49);
     }
     assert(!kernel_vfs_close(&writer) && !kernel_vfs_close(&reader));
     if (prefix_error)
@@ -2333,7 +2333,7 @@ static void executor_range_stop(struct kernel_page_cache *cache,struct kernel_vf
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&writer)));
     for (unsigned i=0;i<COUNT;i++) {
         unsigned char actual;
-        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && actual==0x6a);
+        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done, NULL) && done==1 && actual==0x6a);
     }
     assert(!kernel_vfs_close(&writer));
     puts("PASS CPU0 range stop: in-flight window ends before stop, continuation cancelled, dirty suffix retained and restart persists it without leaked request owners");
@@ -2509,7 +2509,7 @@ static void ordinary_reclaim_borrow(struct kernel_heap *heap,struct physical_pag
     for(size_t i=0;i<count;i++)assert(!physical_page_release(pages,held[i]));
     free(held);
     unsigned char actual[BOAROS_PAGE_SIZE];
-    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done, NULL) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
     assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
     puts("PASS ordinary pressure writeback: parked foreground keeps entry alive after the last physical pin; contents and owners returned");
@@ -2580,7 +2580,7 @@ static void executor_durable_progress(struct kernel_heap *heap,
     }
     wait_progress(&executor_fairness.close_completed,1);
     unsigned char hot;
-    assert(!kernel_vfs_pread(&writer,0,&hot,1,&done) && done==1 && hot==0x36);
+    assert(!kernel_vfs_pread(&writer,0,&hot,1,&done, NULL) && done==1 && hot==0x36);
     assert(!__atomic_load_n(&executor_fairness.read_completed,__ATOMIC_ACQUIRE) &&
         !__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE) && !pthread_join(close_thread,NULL));
     __atomic_store_n(&durable_wait.resume_flush,1,__ATOMIC_RELEASE);
@@ -2601,7 +2601,7 @@ static void executor_durable_progress(struct kernel_heap *heap,
     instance->ops=backend;
     assert(!kernel_page_cache_invalidate_node(&cache,kernel_vfs_file_node(&writer)));
     unsigned char actual[BOAROS_PAGE_SIZE];
-    assert(!kernel_vfs_pread(&writer,0,actual,sizeof(actual),&done) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(actual)));
+    assert(!kernel_vfs_pread(&writer,0,actual,sizeof(actual),&done, NULL) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(actual)));
     shared_error_cursor(&writer);
     assert(!kernel_vfs_close(&writer) && !kernel_vfs_close(&reader) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
@@ -2625,7 +2625,7 @@ static void executor_durable_fault(struct kernel_heap *heap,
     if (recover) {
         for (unsigned i=0;i<3;i++) {
             assert(!kernel_vfs_open(&mount,names[i],&files[i]));
-            assert(!kernel_vfs_pread(&files[i],0,actual,sizeof(actual),&done) && done==sizeof(actual));
+            assert(!kernel_vfs_pread(&files[i],0,actual,sizeof(actual),&done, NULL) && done==sizeof(actual));
             /* 失败fsync不承诺新版本持久化；已成功fsync的文件必须完整保留。 */
             unsigned char allowed=actual[0];
             assert(i?allowed==0x21 || allowed==0x42:allowed==0x23);
@@ -2747,7 +2747,7 @@ static void truncate_writeback_publication(struct kernel_page_cache *cache, cons
         assert(kernel_vfs_node_size(node)==retained);
         assert(!kernel_vfs_ftruncate(&file,sizeof(bytes)));
         memset(bytes,0xcc,sizeof(bytes));
-        assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done, NULL) && done==sizeof(bytes));
         for (size_t i=0;i<sizeof(bytes);i++) {
             unsigned char expected=i<retained ? 0x53 : 0;
             if (bytes[i]!=expected) fprintf(stderr,"truncate scenario %u resurrected byte at %zu: 0x%x != 0x%x\n",
@@ -2806,7 +2806,7 @@ static void pressure_error_isolation(struct kernel_page_cache *cache,const char 
     assert(!test.error && test.written==4 && !write_error);
     assert(!kernel_vfs_error_sequence(&healthy) && kernel_vfs_error_sequence(&failed));
     assert(!kernel_vfs_sync(&healthy,0,&observed));
-    char actual[4];assert(!kernel_vfs_pread(&healthy,0,actual,4,&done) && done==4 && !memcmp(actual,"new!",4));
+    char actual[4];assert(!kernel_vfs_pread(&healthy,0,actual,4,&done, NULL) && done==4 && !memcmp(actual,"new!",4));
     observed=0;
     assert(kernel_vfs_sync(&failed,0,&observed)==(injected==3?-KERNEL_ENOSPC:-KERNEL_EIO));
     assert(!kernel_vfs_sync(&failed,0,&observed));
@@ -2887,7 +2887,7 @@ static void write_pressure_case(struct kernel_page_cache *cache,const char *path
         unsigned char actual[BOAROS_PAGE_SIZE];
         for (size_t offset=0;offset<length;offset+=sizeof(actual)) {
             size_t done;
-            assert(!kernel_vfs_pread(&file,offset,actual,sizeof(actual),&done) &&
+            assert(!kernel_vfs_pread(&file,offset,actual,sizeof(actual),&done, NULL) &&
                 done==sizeof(actual) && !memcmp(actual,bytes+offset,done));
         }
     }
@@ -3038,7 +3038,7 @@ static void *domain_fast_writer(void *argument)
     cache_test_attach(9);struct kernel_vfs_file *file=argument;size_t done;
     unsigned char value=0x39;
     assert(!kernel_vfs_pwrite(file,BOAROS_PAGE_SIZE,&value,1,&done) && done==1);
-    value=0;assert(!kernel_vfs_pread(file,BOAROS_PAGE_SIZE,&value,1,&done) && done==1 && value==0x39);
+    value=0;assert(!kernel_vfs_pread(file,BOAROS_PAGE_SIZE,&value,1,&done, NULL) && done==1 && value==0x39);
     return NULL;
 }
 static void writeback_domains(struct kernel_page_cache *cache,const char *path)
@@ -3214,7 +3214,7 @@ static void progress_writeback_owners(struct kernel_page_cache *cache,const char
         for(unsigned i=0;i<2;i++) {
             uint64_t observed=kernel_vfs_error_sequence(&files[i]);assert(!kernel_vfs_sync(&files[i],0,&observed));
             assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&files[i])));
-            memset(bytes,0,sizeof(bytes));assert(!kernel_vfs_pread(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+            memset(bytes,0,sizeof(bytes));assert(!kernel_vfs_pread(&files[i],0,bytes,sizeof(bytes),&done, NULL) && done==sizeof(bytes));
             for(size_t j=0;j<sizeof(bytes);j++)assert(bytes[j]==0x61+i);
             assert(!kernel_vfs_close(&files[i]));
         }

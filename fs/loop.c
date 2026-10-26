@@ -230,6 +230,12 @@ static void loop_worker(void *argument)
         io->background_reclaim=1;
         int result=backing_io(loop,request);
         io->background_reclaim=progress;
+        /* Admission may bypass its own upstream debt; completion must still
+         * wake the backing worker when a raw loop writer crosses its share. */
+        if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_REGULAR &&
+            (request->operation==LOOP_WRITE || request->operation==LOOP_WRITE_BATCH ||
+             request->operation==LOOP_WRITE_PHASE))
+            kernel_page_cache_notify_pressure(kernel_open_file_page_cache(loop->backing));
         {
             KERNEL_RAW_SCOPE(guard,&loop->metadata);
             request->result=result;request->done=1;wake(&request->changed);

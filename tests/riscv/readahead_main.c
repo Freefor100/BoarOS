@@ -70,6 +70,26 @@ static void wait_prefetch(uint64_t completed_before, unsigned loaded)
     while(stats.readahead_completed==completed_before && riscv_time_read()<deadline);
     check(stats.readahead_completed==completed_before+1 && stats.current_pages==loaded,110);
 }
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES >= 4
+static void large_demand_windows(struct kernel_open_file_description *file)
+{
+    /* A request that already spans the prediction cap must not enqueue a
+     * second, smaller load stream. Contents and the real queue are checked. */
+    static unsigned char batch[BOAROS_PAGE_CACHE_READAHEAD_PAGES*4096];
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file->file);
+    check(!kernel_open_file_seek(file,0),117);kernel_page_cache_stop_worker(&cache);
+    check(!kernel_page_cache_invalidate_node(&cache,node) && !kernel_page_cache_start_worker(&cache),118);
+    struct kernel_page_cache_statistics before,after;kernel_page_cache_get_statistics(&cache,&before);
+    for(unsigned call=0;call<2;call++) {
+        size_t copied=0;
+        check(!kernel_open_file_pread(file,call*sizeof(batch),batch,sizeof(batch),&copied) && copied==sizeof(batch),119);
+        for(unsigned i=0;i<sizeof(batch);i++)check(batch[i]==call*BOAROS_PAGE_CACHE_READAHEAD_PAGES+i/4096+1,120);
+    }
+    kernel_page_cache_get_statistics(&cache,&after);
+    check(after.readahead_queued==before.readahead_queued,121);
+    virt_uart_puts("readahead: complete demand windows skip speculative publication\n");
+}
+#endif
 static void adaptive_windows(struct kernel_open_file_description *file)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(&file->file);
@@ -89,6 +109,11 @@ static void adaptive_windows(struct kernel_open_file_description *file)
         end+=pages;wait_prefetch(before.readahead_completed,end);
         check(file->readahead_pages==pages && file->readahead_end==end,113);
     }
+    check(!kernel_open_file_seek(file,0),122);
+    kernel_page_cache_get_statistics(&cache,&before);
+    for(unsigned page=0;page<end;page++)read_page(file,page);
+    kernel_page_cache_get_statistics(&cache,&after);
+    check(after.readahead_queued==before.readahead_queued,123);
     kernel_page_cache_get_statistics(&cache,&before);
     struct kernel_page_cache_prediction hot=kernel_page_cache_readahead(&cache,node,2,INITIAL_READAHEAD_PAGES,0);
     kernel_page_cache_get_statistics(&cache,&after);
@@ -216,14 +241,16 @@ static void exercise(void *unused)
     struct kernel_open_file_description *file=NULL;int error;
     check(kernel_vfs_start_journal_worker(&mount)==0,15);
     check(kernel_open_file_create(&heap,&mount,"/data",&file,&error)==KERNEL_OPEN_FILE_STATUS_OK && !error,10);
-    read_page(file,0);read_page(file,1);
-    check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK && kernel_page_cache_start_worker(&cache)==0,11);
+    read_page(file,0);
+    size_t warmed=0;
+    check(!kernel_vfs_pread(&file->file,4096,data,sizeof(data),&warmed,NULL) && warmed==sizeof(data),11);
+    check(!kernel_page_cache_start_worker(&cache),11);
 #if BOAROS_TEST_READAHEAD_HELD
     virt_uart_puts("readahead: ready\n");
     while(!virt_uart_rx_ready())yield();
     check(virt_uart_getc()=='g',50);
 #endif
-    read_page(file,0);read_page(file,1);
+    read_page(file,1);
 #if BOAROS_TEST_READAHEAD_HELD
     check(kernel_thread_create_joinable(held_demand,file,&demand_join)==KERNEL_SCHEDULER_STATUS_OK &&
         kernel_thread_create_joinable(held_observer,NULL,&observer_join)==KERNEL_SCHEDULER_STATUS_OK,57);
@@ -248,14 +275,18 @@ static void exercise(void *unused)
         check(physical_page_release(&allocator,address)==PHYSICAL_PAGE_STATUS_OK,34);
     }
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES && !BOAROS_TEST_READAHEAD_HELD
+ #if BOAROS_PAGE_CACHE_READAHEAD_PAGES >= 4
+    large_demand_windows(file);
+ #endif
     adaptive_windows(file);
 #endif
     /* Queued work must not survive seek, a nonsequential read or the last close. */
     unsigned baseline=2+INITIAL_READAHEAD_PAGES;
     for(unsigned mode=0;mode<3;mode++) {
         check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,40);
-        read_page(file,INITIAL_READAHEAD_PAGES);
-        read_page(file,INITIAL_READAHEAD_PAGES+1);
+        read_page(file,32+4*mode);
+        read_page(file,33+4*mode);
+        baseline+=2;
         if(mode==0)check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,41);
         if(mode==1)read_page(file,0);
         if(mode==2)check(kernel_open_file_release(&file)==KERNEL_OPEN_FILE_STATUS_OK && !file,42);
@@ -268,7 +299,7 @@ static void exercise(void *unused)
     /* A cold discontinuity sleeps; cancel the old queued prediction before that wait. */
     struct kernel_page_cache_statistics discontinuity;
     check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,77);
-    read_page(file,INITIAL_READAHEAD_PAGES);read_page(file,INITIAL_READAHEAD_PAGES+1);
+    read_page(file,44);read_page(file,45);
     kernel_page_cache_get_statistics(&cache,&discontinuity);
     read_page(file,50);
     for(unsigned i=0;i<5;i++)yield();
@@ -277,20 +308,20 @@ static void exercise(void *unused)
     /* A failed speculative page is discarded; other pages and writeback errors stay independent. */
     check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,60);
     struct kernel_page_cache_statistics before;kernel_page_cache_get_statistics(&cache,&before);
+    read_page(file,8);read_page(file,9);
     fail_prefetch=1;
-    read_page(file,INITIAL_READAHEAD_PAGES);read_page(file,INITIAL_READAHEAD_PAGES+1);
     deadline=riscv_time_read()+timebase*2;
     do {yield();kernel_page_cache_get_statistics(&cache,&stats);}
     while(stats.readahead_failed==before.readahead_failed && riscv_time_read()<deadline);
     check(stats.readahead_failed==before.readahead_failed+1 && !fail_prefetch,61);
     uint64_t address;size_t valid;
-    check(kernel_open_file_lookup_page(file,2+INITIAL_READAHEAD_PAGES,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND,62);
-    read_page(file,2+INITIAL_READAHEAD_PAGES);
+    check(kernel_open_file_lookup_page(file,10,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND,62);
+    read_page(file,10);
     uint64_t observed=0;check(kernel_vfs_sync(&file->file,1,&observed)==0,63);
     /* Low-water cancellation may evict old clean pages, but cannot start this queued read. */
     check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,64);
-    read_page(file,2*INITIAL_READAHEAD_PAGES);
-    read_page(file,2*INITIAL_READAHEAD_PAGES+1);
+    read_page(file,14);
+    read_page(file,15);
     kernel_page_cache_get_statistics(&cache,&before);
     KERNEL_LOCK_SCOPE(pressure_inode);
     kernel_vfs_node_lock(kernel_vfs_file_node(&file->file), &pressure_inode, 1);
@@ -307,9 +338,9 @@ static void exercise(void *unused)
     for(size_t i=0;i<held;i++)check(physical_page_release(&allocator,held_pages[i])==PHYSICAL_PAGE_STATUS_OK,67);
     truncate_with_queued_read(file);
     /* Truncate cancels an unpublished prediction before exposing the new EOF. */
-    for(unsigned i=0;i<2;i++) {check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,68);read_page(file,20+i);}
-    check(kernel_open_file_seek(file,0)==KERNEL_OPEN_FILE_STATUS_OK,69);
-    read_page(file,20);read_page(file,21);
+    check(!kernel_open_file_seek(file,0),68);read_page(file,20);
+    check(!kernel_vfs_pread(&file->file,21*4096,data,sizeof(data),&warmed,NULL) && warmed==sizeof(data),69);
+    read_page(file,21);
     kernel_page_cache_get_statistics(&cache,&before);
     check(kernel_vfs_ftruncate(&file->file,8192)==0,70);
     for(unsigned i=0;i<5;i++)yield();

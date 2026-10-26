@@ -161,14 +161,14 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     unsigned char value = 0x73;
     check(kernel_vfs_pwrite(&file, 17, &value, 1, &count) == 0 && count == 1, 255);
     cache_io_probe = 0;
-    check(cache_reads == 1 && kernel_vfs_pread(&file, 0, output, 4096, &count) == 0 && count == 4096, 256);
+    check(cache_reads == 1 && kernel_vfs_pread(&file, 0, output, 4096, &count, NULL) == 0 && count == 4096, 256);
     bytes[17] = value; check(!memcmp(bytes, output, 4096), 257);
     check(kernel_vfs_sync(&file, 0, &observed) == 0, 258);
     /* 保留整个inode的干净页，再只改一个字节；选区不能遍历其余页。 */
     struct kernel_page_cache_statistics before, after;
     kernel_page_cache_get_statistics(cache, &before);
     for (unsigned i = 1; i < pages; i++)
-        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 259);
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count, NULL) == 0 && count == 4096, 259);
     kernel_page_cache_get_statistics(cache, &after);
     check(after.current_pages >= before.current_pages + pages - 1, 274);
     check(kernel_vfs_pwrite(&file, 3 * 4096 + 19, &value, 1, &count) == 0 && count == 1, 260);
@@ -221,11 +221,11 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
           kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 270);
     for (unsigned i = 0; i < 3; i++) {
-        check(kernel_vfs_pread(&file, (uint64_t)indices[i] * 4096, output, 4096, &count) == 0 && count == 4096, 271);
+        check(kernel_vfs_pread(&file, (uint64_t)indices[i] * 4096, output, 4096, &count, NULL) == 0 && count == 4096, 271);
         for (unsigned j = 0; j < 4096; j++) check(output[j] == ((j == 29 || (indices[i] == 3 && j == 19)) ? value : 0), 272);
     }
     for (unsigned i = 64; i < 80; i++) {
-        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 282);
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count, NULL) == 0 && count == 4096, 282);
         for (unsigned j = 0; j < 4096; j++) check(output[j] == (j == 37 ? value : 0), 283);
     }
     /* 连续全脏范围按候选窗口交接；独立 wrapper 验证未退回逐页入口。 */
@@ -241,7 +241,7 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
     check(kernel_vfs_sync(&file, 1, &observed) == 0 &&
           kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 287);
     for (unsigned i = 32; i < 40; i++)
-        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, sizeof(output), &count) == 0 &&
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, sizeof(output), &count, NULL) == 0 &&
               count == sizeof(output) && !memcmp(bytes, output, sizeof(bytes)), 288);
     check(kernel_vfs_unlink(mount, "/cache-cost") == 0 && kernel_vfs_close(&file) == 0, 273);
     number("cache retained pages tested: ", pages);
@@ -858,7 +858,7 @@ static void growth_cost(struct kernel_vfs_mount *mount, struct kernel_page_cache
             check(stats.current_pages >= size / 4096, 217);
             for (uint64_t offset = 0; offset < size; offset += 4096) {
                 size_t read = 0;
-                check(kernel_vfs_pread(&file, offset, payload, sizeof(payload), &read) == 0 && read == sizeof(payload) &&
+                check(kernel_vfs_pread(&file, offset, payload, sizeof(payload), &read, NULL) == 0 && read == sizeof(payload) &&
                       !memcmp(payload, growth_payload, sizeof(payload)), 218);
             }
         }

@@ -344,8 +344,8 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 
 扩展现有 iovec cursor 提供页内有界 span。先验证参数的数值范围及连接状态，再取得接纳量，
 最后才解析用户 payload；预先无容量不解析用户页。标量及向量pin有界来源页并直接 COPY 到协议，
-载荷不经过scratch；无论接纳成功或 ERR_MEM，提交返回即归还 pin，等待后重取未接纳输入。
-多iovec复用任务scratch保存页引用及片段描述，阻塞后重取预算并按已接纳位置继续准备。
+一个页大小前缀内不超过四段不连续来源时，载荷直接进入协议；提交返回后归还 pin，等待后重新取得未接纳输入。超过四段时使用已有 scratch 合并这个前缀，避免将小片段拆成多次 CPU0 请求；部分接纳后保留尚未提交的 scratch 尾部，继续按原预算机制提交。
+多 iovec 的直接路径复用任务工作区保存页引用及片段描述，阻塞后按已接纳位置继续准备。
 两种输入都由 `tcp_write(COPY)` 持有 ACK 前的版本，非阻塞返回已接受前缀，
 未接受用户内容不跨系统调用持有。
 `FILE_IO_HOST_TCP=1 sh tests/file-io-concurrency-host.sh` 将生产 TCP/lwIP、MM 和 syscall I/O

@@ -318,7 +318,7 @@ static void rename_inode_case(struct lwext4_mount_adapter *adapter,struct kernel
         assert(after.ino==before.ino && after.nlink==1 && after.size==8 &&
                (after.mode&0777U)==(abort?0600U:0640U) &&
                after.mtime.seconds==before.mtime.seconds && after.mtime.nanoseconds==before.mtime.nanoseconds);
-        char bytes[8];assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done) &&
+        char bytes[8];assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done, NULL) &&
             done==8 && !memcmp(bytes,"original",8));
         struct kernel_vfs_path *found=NULL;
         assert(kernel_vfs_path_lookup(root,"rename31-source",15,&found)==-KERNEL_ENOENT && !found);

@@ -114,7 +114,7 @@ static void expect_bytes(struct kernel_vfs_file *file,const unsigned char *expec
     unsigned char actual[BOAROS_PAGE_SIZE];
     for (size_t offset=0;offset<length;) {
         size_t chunk=length-offset<sizeof(actual)?length-offset:sizeof(actual),done;
-        assert(!kernel_vfs_pread(file,offset,actual,chunk,&done) && done==chunk);
+        assert(!kernel_vfs_pread(file,offset,actual,chunk,&done, NULL) && done==chunk);
         if (memcmp(actual,expected+offset,chunk)) {
             for (size_t i=0;i<chunk;i++) if (actual[i]!=expected[offset+i]) {
                 fprintf(stderr,"byte %zu: %x != %x\n",offset+i,actual[i],expected[offset+i]); break;

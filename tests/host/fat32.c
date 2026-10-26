@@ -51,7 +51,7 @@ static void contents(struct kernel_vfs_file *file, uint64_t at, const void *expe
 {
     unsigned char actual[32768]; size_t done;
     assert(n <= sizeof(actual));
-    assert(!kernel_vfs_pread(file, at, actual, n, &done) && done == n && !memcmp(actual, expected, n));
+    assert(!kernel_vfs_pread(file, at, actual, n, &done, NULL) && done == n && !memcmp(actual, expected, n));
 }
 static void *remote_contents(void *argument)
 {

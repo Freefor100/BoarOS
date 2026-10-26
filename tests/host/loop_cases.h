@@ -99,6 +99,32 @@ static int loop_backing_image(struct kernel_files *local,struct kernel_fs_contex
     assert(!kernel_vfs_pwrite(&file->file,0,bytes,st.st_size,&done) && done==(size_t)st.st_size);
     assert(!kernel_open_file_release(&file));free(bytes);return fd;
 }
+static void loop_dirty_notification(struct kernel_page_cache *cache,
+    struct kernel_vfs_mount *mount,struct kernel_block_device *device,const char *image)
+{
+    assert(!kernel_block_flush(device));
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_page_cache_start_worker(cache));
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_writeback_statistics state;
+    kernel_writeback_domain_snapshot(&instance->writeback,&state);
+    assert(!state.dirty_bytes);
+    size_t bytes=((state.high_bytes+BOAROS_PAGE_SIZE-1)&~BOAROS_PAGE_MASK)+2*BOAROS_PAGE_SIZE;
+    unsigned char *data=malloc(bytes);assert(data);
+    int source=open(image,O_RDONLY);assert(source>=0);
+    assert(read(source,data,bytes)==(ssize_t)bytes && !close(source));
+    assert(!kernel_block_write_at(device,0,data,bytes));free(data);
+    struct timespec now;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
+    time_t deadline=now.tv_sec+3;
+    do {
+        kernel_writeback_domain_snapshot(&instance->writeback,&state);
+        if(state.dirty_bytes<=state.low_bytes)break;
+        sched_yield();assert(!clock_gettime(CLOCK_MONOTONIC,&now));
+    } while(now.tv_sec<deadline);
+    assert(state.dirty_bytes<=state.low_bytes);
+    assert(!kernel_block_flush(device));
+    puts("PASS raw loop write wakes backing dirty-pressure worker without caller fsync");
+}
 static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_files *local,struct kernel_fs_context *local_fs)
 {
@@ -153,6 +179,7 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     int second=loop_test_open(local,local_fs,"/loop1",2);assert(second>=0);
     assert(!loop_test_ioctl(local,second,0x4c00,backing));loop_test_close(local,backing);
     device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(1));assert(device);
+    loop_dirty_notification(&caches[0],&children[0],device,inner_path);
     assert(!kernel_page_cache_init(&caches[1],heap,heap->page_allocator));
     int inner_result=kernel_vfs_mount_ext4(&children[1],device,heap,&caches[1],0);
     if (inner_result) fprintf(stderr,"inner loop mount error=%d available=%llu\n",inner_result,
@@ -173,7 +200,7 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     struct kernel_page_cache_concurrency_state before_read,after_read;
     kernel_page_cache_get_concurrency_state(&caches[1],&before_read);
     mm_test_attach(1);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
-    char actual[19];assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done) &&
+    char actual[19];assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done, NULL) &&
         done==sizeof(actual) && !memcmp(actual,"nested-loop-durable",sizeof(actual)));
     assert(kernel_cpu_current()->logical_id==1);
     kernel_page_cache_get_concurrency_state(&caches[1],&after_read);
@@ -202,7 +229,7 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     uint64_t size=kernel_vfs_file_size(&saved);
     for (uint64_t offset=0;offset<size;offset+=done) {
         size_t chunk=size-offset<65536?(size_t)(size-offset):65536;
-        assert(!kernel_vfs_pread(&saved,offset,buffer,chunk,&done) && done==chunk);
+        assert(!kernel_vfs_pread(&saved,offset,buffer,chunk,&done, NULL) && done==chunk);
         assert(write(destination,buffer,done)==(ssize_t)done);
     }
     free(buffer);assert(!fsync(destination) && !close(destination) && !kernel_vfs_close(&saved));

@@ -340,6 +340,8 @@ static enum kernel_files_status disk_read(
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     while (total < request && !done) {
+        uint64_t batch_start=position;
+        int cache_miss=0;
         size_t start = position & BOAROS_PAGE_MASK;
         size_t count = (start + request - total + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
         if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
@@ -371,7 +373,9 @@ static enum kernel_files_status disk_read(
             if (copied > chunk || (advance && kernel_open_file_advance(description, copied))) {
                 status = KERNEL_FILES_STATUS_STATE; done = 1; break;
             }
-            kernel_open_file_read_progress(description, position, copied);
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            if (copied && part->cache_miss) cache_miss=1;
+#endif
             total += copied; position += copied;
             if (access == KERNEL_UACCESS_STATUS_FAULT) {
                 error = -KERNEL_EFAULT; done = 1; break;
@@ -382,6 +386,8 @@ static enum kernel_files_status disk_read(
             if (part->valid_bytes < BOAROS_PAGE_SIZE) { done = 1; break; }
             start = 0;
         }
+        /* 预测以整个需求批次的成功前缀为单位，避免将大读误作逐页小读。 */
+        kernel_open_file_read_progress(description,batch_start,(size_t)(position-batch_start),cache_miss);
         /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
         kernel_uaccess_write_cursor_finish(&user_copy);
         for (size_t i = 0; i < count; i++) if (!pages[i].status)
@@ -1100,9 +1106,18 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             size_t offset=position&BOAROS_PAGE_MASK,valid;
             kernel_open_file_read_begin(input,position);
             int memory=kernel_open_file_memory_backed(input);
-            enum kernel_page_cache_status loaded=memory
-                ?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid)
-                :kernel_open_file_get_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid);
+            int cache_miss=0;
+            enum kernel_page_cache_status loaded;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            if (!memory) {
+                struct kernel_page_cache_read_page page;
+                loaded=kernel_page_cache_get_batch(kernel_open_file_page_cache(input),&input->file,
+                    position>>BOAROS_PAGE_SHIFT,&page,1);
+                if (!loaded) {physical=page.physical_address;valid=page.valid_bytes;cache_miss=page.cache_miss;}
+            } else
+#endif
+                loaded=memory?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid):
+                    kernel_open_file_get_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid);
             if (loaded==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND && memory) {
                 uint64_t size=kernel_open_file_size(input);
                 if (position>=size) break;
@@ -1128,7 +1143,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
                     error=loaded==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
                 break;
             }
-            kernel_open_file_read_progress(input,position,available);
+            kernel_open_file_read_progress(input,position,available,cache_miss);
         } else {
             /* 文件目标保留分离的读写版本，允许同inode及重叠区间复制。 */
             error=kernel_open_file_pread(input,start+total,staging,wanted,&available);
@@ -1572,7 +1587,8 @@ static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
         if (!result || (size_t)result>chunk) { status=KERNEL_FILES_STATUS_STATE;break; }
         if (compact) consumed+=(size_t)result;
         KERNEL_FILES_NOTE(files,write_chunks,1);
-        COST_ADD(COPY_FROM_USER,result);COST_IO_ADD(3,result);
+        /* Compact copying was already charged by the common uaccess helper. */
+        if (!compact) {COST_ADD(COPY_FROM_USER,result);COST_IO_ADD(3,result);}
         total+=(uint64_t)result;*linux_result=(int64_t)total;
         if (fault || ((size_t)result<chunk && (flags&KERNEL_SOCKET_MSG_DONTWAIT))) break;
     } while (total<count);

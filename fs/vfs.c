@@ -1522,7 +1522,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,
                      size_t size,
-                     size_t *bytes_read)
+                     size_t *bytes_read, int *cache_miss)
 {
     if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
         file->private_data == 0 || bytes_read == 0 ||
@@ -1534,6 +1534,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     kernel_vfs_node_lock(node, &node_guard, 0);
     struct kernel_page_cache *cache = node->instance->page_cache;
     *bytes_read = 0;
+    if (cache_miss) *cache_miss=0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
     if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
     if (node_guard.lock) kernel_lock_release(&node_guard);
@@ -1573,6 +1574,9 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
             size_t copied = valid - start;
             if (copied > size - *bytes_read) copied = size - *bytes_read;
             memcpy((unsigned char *)buffer + *bytes_read, (unsigned char *)page + start, copied);
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            if (copied && cache_miss && pages[i].cache_miss) *cache_miss=1;
+#endif
             *bytes_read += copied; offset += copied; start = 0;
         }
         for (size_t i = 0; i < count; i++) if (!pages[i].status)
@@ -1962,7 +1966,7 @@ static int vfs_source_read_at(void *context,
                                   offset,
                                   buffer,
                                   size,
-                                  &bytes_read);
+                                  &bytes_read, NULL);
 
     if (result != 0) {
         return result;

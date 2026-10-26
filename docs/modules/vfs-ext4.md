@@ -361,7 +361,7 @@ extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存；后台写回按阈值和压力触发，顺序预读有独立候选实现，默认关闭。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存；后台写回按阈值和压力触发，顺序小读在实际冷缺失后启动有界预读，大批读取和纯热读跳过预测。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -1092,15 +1092,17 @@ checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-dee
 构造深层稀疏树，验证 1/4 KiB 文件系统部分截断、跨进程重启读回、截零和 e2fsck。
 
 
-## 有界顺序预读候选
+## 按需求装入反馈的有界顺序预读
 
-`BOAROS_PAGE_CACHE_READAHEAD_PAGES` 默认 0，配置上限为 128 KiB 对应的架构页数；
-候选测试覆盖 0/1/2/4/8/16 页；只有非零配置才创建每缓存实例的独立预读 worker。
+`BOAROS_PAGE_CACHE_READAHEAD_PAGES` 默认对应 64 KiB（RV 16 页、LA 4 页），设为 0 可关闭，配置上限为 128 KiB 对应的架构页数；
+窗口测试覆盖 0/1/2/4/8/16 页；只有非零配置才创建每缓存实例的独立预读 worker。
+首次读取实际遇到缺页或正在装入的页，才启动顺序预测；已终止预测后的纯热读跳过预测保护与队列查询。缓存将这项观察随实际成功页面返回，VFS 和用户复制层只合并已完成前缀，不为预测再查一次缓存。
 顺序流从 16 KiB 开始，读取跨过已接受的预测范围后窗口翻倍，直到配置上限；
 若上限小于 16 KiB，直接使用上限。OFD 保存成功读取末端、预测末端、当前窗口和取消 cookie；
 这些候选字段置于对象尾部。read/pread/
 sendfile 在首次可能睡眠的 accessed、后端或 usercopy 之前执行 read_begin，立即取消
 不连续预测，read_progress 只登记成功前缀。两个连续片段在页边界完成后可申请下一窗口。
+用户读取按整个需求批次更新一次，批次达到配置上限且至少 16 KiB 时停止预测，直接复用需求批读。这样不会把一次大读的逐页复制误判为连续的小读。
 缓存返回实际接纳的范围；旧批次仍在装入时，不把尚未接纳的新请求算入预测。
 整个范围已经驻留时只确认覆盖范围，跳过队列发布和 worker 唤醒。
 seek、非顺序读、最后关闭、截断/失效、低水位和停止取消未接纳工作，并重置窗口。

@@ -301,7 +301,7 @@ static void whole_write_probe(void *argument)
         check(size == (operation_mode == 2 ? 0U : operation_mode == 0 ? 20480U : 8192U), 258);
         for (uint64_t offset = 0; offset < size; offset += 4096) {
             size_t read;
-            check(kernel_vfs_pread(&observed, offset, payload, 4096, &read) == 0 && read == 4096, 259);
+            check(kernel_vfs_pread(&observed, offset, payload, 4096, &read, NULL) == 0 && read == 4096, 259);
             unsigned char expected = operation_mode == 0 && offset < 12288 ? 'A' : 'B';
             for (unsigned i = 0; i < 4096; i++) check(payload[i] == expected, 260);
         }
@@ -681,7 +681,7 @@ static void progress_worker(void *argument)
     check(physical_page_release(&allocator, address) == PHYSICAL_PAGE_STATUS_OK, 36);
     unsigned char cached[64];
     size_t copied;
-    check(kernel_vfs_pread(&file, 17, cached, sizeof(cached), &copied) == 0 &&
+    check(kernel_vfs_pread(&file, 17, cached, sizeof(cached), &copied, NULL) == 0 &&
           copied == sizeof(cached) && !memcmp(cached, payload + 17, copied) && !cold_done, 78);
     /* Pending termination must not detach an internal DMA wait. The normal
      * return-to-user path handles the pending request after stack unwind. */
@@ -1250,7 +1250,7 @@ static void background_writeback_probe(void *unused)
           worker_stats.worker_written == writes_before_stop + stop_pages, 124);
     (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
     size_t count;
-    check(kernel_vfs_pread(&target, (uint64_t)(pages - 1) * 4096, payload, sizeof(payload), &count) == 0 &&
+    check(kernel_vfs_pread(&target, (uint64_t)(pages - 1) * 4096, payload, sizeof(payload), &count, NULL) == 0 &&
           count == sizeof(payload) && payload[0] == (pages - 1) % 251 + 1 && payload[4095] == payload[0], 96);
     check(kernel_vfs_close(&target) == 0, 97);
     cache_instances_probe();

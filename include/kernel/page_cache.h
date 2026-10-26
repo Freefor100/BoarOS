@@ -18,7 +18,7 @@
 #endif
 
 #ifndef BOAROS_PAGE_CACHE_READAHEAD_PAGES
-#define BOAROS_PAGE_CACHE_READAHEAD_PAGES 0
+#define BOAROS_PAGE_CACHE_READAHEAD_PAGES (65536U / BOAROS_PAGE_SIZE)
 #endif
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES < 0 || BOAROS_PAGE_CACHE_READAHEAD_PAGES > (131072U / BOAROS_PAGE_SIZE)
 #error "BOAROS_PAGE_CACHE_READAHEAD_PAGES must fit the 128 KiB window"
@@ -160,6 +160,9 @@ struct kernel_page_cache_read_page {
     uint64_t physical_address;
     size_t valid_bytes;
     enum kernel_page_cache_status status;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    unsigned cache_miss; /* Demand observed an absent or loading page. */
+#endif
 };
 /* 只装入本次请求覆盖的连续页。每项独立返回；只有OK项拥有物理页引用，
  * 调用者须归还全部成功项，包括首个错误之后的项。返回值是首个非OK状态。
@@ -188,6 +191,8 @@ enum kernel_page_cache_status kernel_page_cache_alias_attach(
 void kernel_page_cache_alias_hold(struct kernel_page_cache_alias *);
 void kernel_page_cache_alias_put(struct kernel_page_cache_alias *);
 void kernel_page_cache_retry_alias(struct kernel_page_cache_alias *);
+/* Recheck thresholds after a progress-only caller releases backing locks. */
+void kernel_page_cache_notify_pressure(struct kernel_page_cache *cache);
 enum kernel_page_cache_status kernel_page_cache_request_writeback(struct kernel_page_cache *);
 struct kernel_page_cache_resize { struct kernel_page_cache_entry *entry; uint64_t old_size; };
 /* CPU0、文件操作门owner；prepare不持inode I/O，finish在关闭代次下收敛实际尺寸。

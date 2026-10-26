@@ -38,7 +38,7 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
         cookie=file->readahead_cookie;
-        file->readahead_cookie=0;file->read_sequential=0;
+        file->readahead_cookie=0;__atomic_store_n(&file->read_sequential,0,__ATOMIC_RELAXED);
         file->readahead_end=0;file->readahead_pages=0;
     }
     if (cookie) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cookie);
@@ -50,23 +50,30 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
 {
-    if (!open_file_live(file)) return;
+    if (!file || !__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED) || !open_file_live(file)) return;
     uint64_t cancel=0;
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
         if (file->read_sequential && file->read_end != offset) {
             cancel=file->readahead_cookie;
-            file->readahead_cookie=0;file->read_sequential=0;
+            file->readahead_cookie=0;__atomic_store_n(&file->read_sequential,0,__ATOMIC_RELAXED);
             file->readahead_end=0;file->readahead_pages=0;
         }
     }
     if (cancel) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cancel);
 }
 void kernel_open_file_read_progress(struct kernel_open_file_description *file,
-    uint64_t offset,size_t count)
+    uint64_t offset,size_t count,int cache_miss)
 {
-    if (!count || !open_file_live(file) || file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR ||
+    if (!count || !file || (!cache_miss && !__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED))) return;
+    if (!open_file_live(file) || file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_memory_backed(file) || kernel_vfs_file_generated(&file->file)) return;
+    /* A demand batch already as large as the prediction window needs no
+     * competing speculative stream. Tiny configured windows still train on
+     * page reads; the useful demand batching threshold starts at 16 KiB. */
+    const size_t demand_window=BOAROS_PAGE_CACHE_READAHEAD_PAGES*BOAROS_PAGE_SIZE<16384U?
+        16384U:BOAROS_PAGE_CACHE_READAHEAD_PAGES*BOAROS_PAGE_SIZE;
+    if (count>=demand_window) {reset_read_prediction(file);return;}
     if (offset>UINT64_MAX-count) __builtin_trap();
     const unsigned initial=BOAROS_PAGE_CACHE_READAHEAD_PAGES<16384U/BOAROS_PAGE_SIZE?
         BOAROS_PAGE_CACHE_READAHEAD_PAGES:16384U/BOAROS_PAGE_SIZE;
@@ -78,7 +85,7 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         if (!sequential) {
             cancel=file->readahead_cookie;file->readahead_cookie=0;file->readahead_end=0;file->readahead_pages=initial;
         }
-        file->read_end=end;file->read_sequential=1;
+        file->read_end=end;__atomic_store_n(&file->read_sequential,1,__ATOMIC_RELAXED);
         previous_end=file->readahead_end;cookie=file->readahead_cookie;
         queue=sequential && !(end&BOAROS_PAGE_MASK) && (end>>BOAROS_PAGE_SHIFT)>=previous_end;
         pages=file->readahead_pages?file->readahead_pages:initial;
@@ -1187,8 +1194,9 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
     if (!open_file_live(file)) return -KERNEL_EINVAL;
     if (bytes_read) *bytes_read = 0;
     if (size) kernel_open_file_read_begin(file, offset);
-    int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read);
-    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read);
+    int cache_miss=0;
+    int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read, &cache_miss);
+    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read, cache_miss);
     return result;
 }
 

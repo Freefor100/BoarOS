@@ -527,7 +527,6 @@ static void entry_return(struct kernel_page_cache_entry *entry)
 }
 
 static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel_vfs_node *node);
-static void pressure_notify(void *context);
 static void group_notify(void *context);
 static void pressure_wait(void *context);
 static size_t entry_valid_bytes(const struct kernel_page_cache_entry *entry);
@@ -1456,7 +1455,7 @@ void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias)
         if (!end) __builtin_trap();
         dirty_mark(entry,0,end);
     }
-    pressure_notify(cache);
+    kernel_page_cache_notify_pressure(cache);
 }
 #define CACHE_WRITES_CLOSED (UINT64_C(1)<<63)
 #define CACHE_WRITES_MASK (CACHE_WRITES_CLOSED | UINT32_MAX)
@@ -2199,6 +2198,9 @@ static int read_cached_batch(struct cache_read_batch_request *request)
             struct kernel_page_cache_entry *entry;
             enum kernel_page_cache_status status=lookup_entry(cache,request->file,request->first+i,&entry);
             if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) {
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+                page->cache_miss=1;
+#endif
                 pending=1;
                 if (remote<0) remote=remote_cache_client();
                 if (!remote) break;
@@ -2207,6 +2209,9 @@ static int read_cached_batch(struct cache_read_batch_request *request)
             if (status) __builtin_trap();
             if (!read_entry_ready(entry)) {
                 if ((__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) { retry=1; break; }
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+                page->cache_miss=1;
+#endif
                 pending=1;
                 if (remote<0) remote=remote_cache_client();
                 if (!remote) break;
@@ -2302,7 +2307,12 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
         (count && (!pages || first > UINT64_MAX >> BOAROS_PAGE_SHIFT ||
             count - 1 > (UINT64_MAX >> BOAROS_PAGE_SHIFT) - first)))
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    for (size_t i = 0; i < count; i++) pages[i].status = KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+    for (size_t i=0;i<count;i++) {
+        pages[i].status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+        pages[i].cache_miss=0;
+#endif
+    }
     if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
     struct cache_read_batch_request request = {cache, file, first, pages, count};
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
@@ -2578,7 +2588,7 @@ int kernel_page_cache_write_source(struct kernel_page_cache *cache,
     if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
     int result=write_cached_source(cache,file,offset,source,size,written);
     /* 按实际接纳的范围发布一次脏工作，部分成功后出错也必须通知。 */
-    if (*written) pressure_notify(cache);
+    if (*written) kernel_page_cache_notify_pressure(cache);
     return result;
 }
 
@@ -3252,9 +3262,8 @@ static void group_notify(void *context)
     }
 }
 
-static void pressure_notify(void *context)
+void kernel_page_cache_notify_pressure(struct kernel_page_cache *cache)
 {
-    struct kernel_page_cache *cache=context;
     if (cache_live(cache) && cache->record->group) group_notify(cache->record->group);
 }
 enum kernel_page_cache_status kernel_page_cache_request_writeback(struct kernel_page_cache *cache)
@@ -3514,7 +3523,7 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     }
     { CACHE_SCOPE(publish, cache); r->readahead_started = 1; }
 #endif
-    pressure_notify(cache);
+    kernel_page_cache_notify_pressure(cache);
     return 0;
 }
 
