@@ -29,6 +29,9 @@ static void results(const char *path)
 int main(void)
 {
     setvbuf(stdout,NULL,_IONBF,0);
+    if (!access("/storage-transfer.sh",R_OK)) {
+        execl("/busybox","busybox","sh","/storage-transfer.sh",(char *)NULL);CHECK(0);
+    }
     CHECK(!mkdir("/proc",0555) || errno==EEXIST);
     CHECK(!mount("proc","/proc","proc",0,NULL) || errno==EBUSY);
     configuration("/performance","");
