@@ -6,6 +6,7 @@
 #include <kernel/errno.h>
 #include <kernel/time.h>
 #include "../../fs/vfs_objects.h"
+#include "../../kernel/sched/private.h"
 #include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -15,13 +16,16 @@
 #include <sys/stat.h>
 
 void mm_test_attach(unsigned);
+struct kernel_scheduler scheduler = {.initialized=KERNEL_SCHEDULER_INITIALIZED};
 static unsigned char pool[32 * 1024 * 1024] __attribute__((aligned(16384)));
 static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static int fd, write_fail; static unsigned writes,watch_remote_read,remote_reads;
+static size_t largest_read, largest_write;
 static enum kernel_block_status rd(void *ctx, uint64_t at, void *p, size_t n)
 {
     (void)ctx;
+    if (largest_read < n) largest_read = n;
     if (watch_remote_read) {
         assert(!kernel_cpu_current()->logical_id);
         __atomic_fetch_add(&remote_reads,1,__ATOMIC_RELAXED);
@@ -29,7 +33,11 @@ static enum kernel_block_status rd(void *ctx, uint64_t at, void *p, size_t n)
     return pread(fd,p,n,at)==(ssize_t)n?0:KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status wr(void *ctx, uint64_t at, const void *p, size_t n)
-{ (void)ctx; writes++; return !write_fail && pwrite(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO; }
+{
+    (void)ctx; writes++;
+    if (largest_write < n) largest_write = n;
+    return !write_fail && pwrite(fd, p, n, at) == (ssize_t)n ? 0 : KERNEL_BLOCK_STATUS_IO;
+}
 static enum kernel_block_status fl(void *ctx)
 { (void)ctx; return fsync(fd) ? KERNEL_BLOCK_STATUS_IO : 0; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t target, uint64_t *deadline)
@@ -43,7 +51,7 @@ static void contents(struct kernel_vfs_file *file, uint64_t at, const void *expe
 {
     unsigned char actual[32768]; size_t done;
     assert(n <= sizeof(actual));
-    assert(!kernel_vfs_pread(file, at, actual, n, &done) && done == n && !memcmp(actual, expected, n));
+    assert(!kernel_vfs_pread(file, at, actual, n, &done, NULL) && done == n && !memcmp(actual, expected, n));
 }
 static void *remote_contents(void *argument)
 {
@@ -53,6 +61,32 @@ static void *remote_contents(void *argument)
     contents(argument,0,zeros,sizeof(zeros));
     assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
     return NULL;
+}
+static void contiguous_transfers(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_file file={0};
+    unsigned char data[32768], byte=0;
+    size_t done;
+    memset(data,0x31,sizeof(data));
+    assert(!kernel_vfs_create(mount,"/batch.bin",0600,&file));
+    assert(!kernel_vfs_pwrite(&file,0,data,sizeof(data),&done) && done==sizeof(data));
+    sync_file(&file);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    const struct kernel_vfs_backend *ops=node->instance->ops;
+    /* Keep a partial sector in the backend cache, then overwrite a larger
+     * range containing it. The next partial read must see the new bytes. */
+    assert(!ops->pread(node,1553,&byte,1,&done) && done==1 && byte==0x31);
+    memset(data,0x72,sizeof(data));
+    largest_write=0;
+    assert(!kernel_vfs_pwrite(&file,0,data,sizeof(data),&done) && done==sizeof(data));
+    sync_file(&file);
+    assert(largest_write>=4096);
+    assert(!ops->pread(node,1553,&byte,1,&done) && done==1 && byte==0x72);
+    assert(!kernel_page_cache_invalidate_node(node->instance->page_cache,node));
+    largest_read=0; contents(&file,0,data,sizeof(data));
+    assert(largest_read>=4096);
+    assert(!kernel_vfs_unlink(mount,"/batch.bin") && !kernel_vfs_close(&file));
+    puts("PASS FAT contiguous I/O: multi-sector requests, preserved content and invalidated partial-sector cache");
 }
 static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
 {
@@ -201,6 +235,7 @@ int main(int argc, char **argv)
         return 0;
     }
     struct kernel_vfs_path *root=0; assert(!kernel_vfs_path_root(&mount, &heap, &root));
+    contiguous_transfers(&mount);
     assert(!kernel_vfs_mkdir(&mount, "/目录", 0777));
     assert(kernel_vfs_open(&mount,"/STALE.TXT",&same)==-KERNEL_ENOENT);
     assert(!kernel_vfs_create(&mount, "/目录/Long Unicode 文件😀.txt", 0666, &file));

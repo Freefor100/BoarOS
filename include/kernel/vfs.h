@@ -294,11 +294,13 @@ void kernel_vfs_file_accessed(struct kernel_vfs_file *file);
 int kernel_vfs_file_modified(struct kernel_vfs_file *file,
                               uint64_t offset, int append);
 
+/* Optional cache_miss reports absent/loading pages in the copied prefix;
+ * it does not claim that this reader submitted physical I/O. */
 int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,
                      size_t size,
-                     size_t *bytes_read);
+                     size_t *bytes_read, int *cache_miss);
 
 int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       uint64_t offset,

@@ -829,7 +829,7 @@ static void prepare_mm(void)
     int opened=kernel_open_file_create(&heap,file_mount,"/controlled",&file_controller,&error);
     if (!opened && !error) {
         char content[sizeof(disk_persist)]; size_t count;
-        require(!kernel_vfs_pread(&file_controller->file,0,content,sizeof(content),&count) &&
+        require(!kernel_vfs_pread(&file_controller->file,0,content,sizeof(content),&count, NULL) &&
             count==sizeof(content) && !memcmp(content,disk_persist,sizeof(content)),"disk-independent-restart-content");
         virt_uart_puts("BoarOS: disk MM independent restart durable content passed\n");
     } else require(!kernel_open_file_create_mode(&heap,file_mount,"/controlled",0600,&file_controller,&error) && !error,

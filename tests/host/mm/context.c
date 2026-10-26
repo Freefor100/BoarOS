@@ -23,6 +23,13 @@ static _Thread_local int force_task;
 struct kernel_scheduler scheduler={.initialized=KERNEL_SCHEDULER_INITIALIZED};
 void *sync_test_current_task(void) { return cpu.current; }
 void mm_test_activate_task(void) { force_task=1; cpu.current=&actor.task; }
+void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigned inherited)
+{
+    /* Hosted file actors have no PI edges or RT priority. Real futex exit
+     * still recalculates the empty donation set; an actual PI use is an error. */
+    assert(task==&actor.task && !base && !inherited && !task->scheduling.priority &&
+           !task->pi_owned && !task->pi_request);
+}
 void mm_test_finish(void)
 {
     struct kernel_io_context *current=kernel_io_context_current();
@@ -92,6 +99,8 @@ void mm_test_attach(unsigned id)
     force_task=0;
     actor.task.magic=KERNEL_THREAD_MAGIC; actor.task.state=KERNEL_THREAD_STATE_RUNNING;
     actor.task.cpu=&cpu;
+    actor.task.tid=(kernel_pid_t)id+1;actor.task.tid_owned=1;
+    actor.task.group_leader=&actor.task;actor.task.group_members=1;
 #endif
 #if BOAROS_MAX_CPUS > 1
     bound_mm = 0;

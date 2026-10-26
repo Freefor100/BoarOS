@@ -51,6 +51,24 @@ static void live_references(void)
     assert(!kernel_block_get(0x700));
 }
 
+static void pressure_parents(void)
+{
+    struct kernel_block_device disk={.read=read_data,.logical_block_size=512},
+        outer={.read=read_data,.logical_block_size=512,.virtual_backing=1},
+        inner={.read=read_data,.logical_block_size=512,.virtual_backing=1};
+    assert(!kernel_block_register(&disk,0x800) && !kernel_block_register(&outer,0x801) &&
+        !kernel_block_register(&inner,0x802));
+    assert(!kernel_block_pressure_device(&outer));
+    kernel_block_set_pressure_parent(&outer,&disk);kernel_block_set_pressure_parent(&inner,&outer);
+    struct kernel_block_device *held=kernel_block_pressure_device(&inner);assert(held==&disk);
+    assert(disk.references==2 && outer.references==1 && !inner.references);
+    kernel_block_set_pressure_parent(&inner,0);kernel_block_set_pressure_parent(&outer,0);
+    assert(!outer.references && disk.references==1 && !kernel_block_pressure_device(&inner));
+    assert(kernel_block_unregister(&disk)==-KERNEL_EBUSY);
+    kernel_block_put(held);assert(!disk.references);
+    assert(!kernel_block_unregister(&inner) && !kernel_block_unregister(&outer) && !kernel_block_unregister(&disk));
+}
+
 int main(void)
 {
     struct kernel_block_device first = {.read = read_data, .logical_block_size = 512};
@@ -83,6 +101,7 @@ int main(void)
     assert(kernel_block_claim(&fixture, &owner_a) == 0);
     kernel_block_release_claim(&fixture, &owner_a);
     live_references();
+    pressure_parents();
     puts("block registry identity, exclusive claim and owner release tests passed");
     return 0;
 }

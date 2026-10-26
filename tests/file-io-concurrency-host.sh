@@ -37,13 +37,13 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         -Ithird_party/lwext4/include -Itests/host/mm -Itests/host/sync -idirafter net/lwip_port/include \
         -idirafter third_party/lwip/src/include -idirafter include \
         ${FILE_IO_HOST_TEST_SOURCE:-tests/host/file_io_concurrency.c} tests/host/file_io_excluded.c tests/host/mm/context.c tests/host/mm/disk_context.c \
-        kernel/cpu.c kernel/raw_lock.c kernel/credentials.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/sched/futex.c "$build_dir/process-$shift.o" \
+        kernel/cpu.c kernel/raw_lock.c kernel/credentials.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/sched/futex.c kernel/sched/futex_pi.c "$build_dir/process-$shift.o" \
         kernel/physical_page.c mm/heap.c mm/memory_object.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         fs/files/table.c fs/files/io.c fs/files/locks.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c fs/open_file.c fs/block_file.c fs/loop.c fs/disk_mount.c \
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c \
         fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c kernel/block.c net/socket.c \
         third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
-        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=ext4_fraw_inode_fill,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_lock_held,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user \
+        ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=ext4_fraw_inode_fill,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_lock_held,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user,--wrap=kernel_task_io_buffer_acquire,--wrap=kernel_uaccess_pin_user_page,--wrap=kernel_open_file_lookup_page \
         -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
     mkfs.ext4 -q -F -b "${FILE_IO_HOST_BLOCK_SIZE:-4096}" ${FILE_IO_HOST_MKFS_ARGS:-} "$build_dir/image-$shift.img"

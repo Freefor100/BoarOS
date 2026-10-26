@@ -138,17 +138,45 @@ static void concurrent_reservation(unsigned size)
     assert(stats.used==charge && !stats.reserved && stats.peak==charge && stats.budget_failures==1);
     jbd_image_free(task.image);jbd_memory_stop(&journal);assert(!live);
 }
+struct external_account { size_t active; unsigned references; };
+static void account_retain(void *context) { ((struct external_account *)context)->references++; }
+static void account_release(void *context)
+{ struct external_account *a=context;assert(a->references>1);a->references--; }
+static void account_change(void *context,size_t bytes,bool acquiring)
+{
+    struct external_account *a=context;
+    if (acquiring) {assert(a->active<=SIZE_MAX-bytes);a->active+=bytes;}
+    else {assert(a->active>=bytes);a->active-=bytes;}
+}
 static void borrowed_source_outlives_stop(unsigned size)
 {
     struct jbd_journal journal;start(&journal,size,1024*1024);
+    struct external_account account={.references=1};
+    struct jbd_memory_account methods={&account,account_retain,account_release,account_change};
+    jbd_memory_set_account(journal.memory,&methods);
+    jbd_memory_set_grouped(&journal,true);
+    struct jbd_image *image=jbd_image_alloc(&journal);assert(image);
+    size_t image_bytes=jbd_image_charge(&journal);assert(account.active==image_bytes);
+    jbd_image_free(image);assert(!account.active && jbd_memory_cached(&journal)==image_bytes);
+    struct jbd_image *reused=jbd_image_alloc(&journal);assert(reused==image && account.active==image_bytes);
+    struct ext4_block_payload *reader=&reused->payload;ext4_block_payload_get(reader);
+    jbd_image_free(reused);assert(account.active==image_bytes && !jbd_memory_cached(&journal));
+    ext4_block_payload_put(reader);assert(!account.active && jbd_memory_cached(&journal)==image_bytes);
+    jbd_trim_cache(&journal,0);assert(!account.active && !jbd_memory_used(&journal));
     struct jbd_memory *owner=journal.memory;jbd_memory_get(owner);
     void *control=jbd_alloc(&journal,32),*source=ext4_user_malloc(size);assert(control && source);
-    assert(jbd_memory_charge(&journal,size));size_t held=jbd_memory_used(&journal);
+    /* The external payload already has an allocation owner. Journal retention
+     * counts against its quota but must not charge that allocation twice. */
+    account_change(&account,size,true);size_t held=account.active;
+    assert(jbd_memory_borrow(&journal,size));
+    assert(account.active==held && account.references==2);
     jbd_memory_stop(&journal);struct jbd_memory_stats stats;jbd_memory_snapshot(owner,&stats);
-    assert(stats.used==held && held>size);
-    ext4_user_free(source);jbd_memory_owner_uncharge(owner,size);jbd_free(control);
-    jbd_memory_snapshot(owner,&stats);assert(!stats.used && !stats.reserved);
-    jbd_memory_put(owner);assert(!live);
+    assert(stats.used==held && stats.borrowed==size && held>size && account.active==held);
+    ext4_user_free(source);account_change(&account,size,false);jbd_memory_release_borrow(owner,size);
+    assert(account.active==held-size);
+    jbd_free(control);jbd_memory_snapshot(owner,&stats);
+    assert(!stats.used && !stats.reserved && !stats.borrowed && !account.active);
+    jbd_memory_put(owner);assert(!live && account.references==1);
 }
 struct pooled_task { struct jbd_journal *journal;pthread_barrier_t *start; };
 static void meet(pthread_barrier_t *barrier)

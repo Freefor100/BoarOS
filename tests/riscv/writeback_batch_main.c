@@ -110,7 +110,7 @@ static void read_pages(struct kernel_vfs_file *file, unsigned count)
     for (unsigned page = 0; page < count; page++) {
         size_t read;
         memset(bytes, (int)(page % 251 + 1), sizeof(bytes));
-        check(kernel_vfs_pread(file, (uint64_t)page * 4096, actual, sizeof(actual), &read) == 0 && read == sizeof(actual) && !memcmp(bytes, actual, sizeof(bytes)), 21);
+        check(kernel_vfs_pread(file, (uint64_t)page * 4096, actual, sizeof(actual), &read, NULL) == 0 && read == sizeof(actual) && !memcmp(bytes, actual, sizeof(bytes)), 21);
     }
 }
 static void range_cases(struct kernel_vfs_file *file)
@@ -152,7 +152,7 @@ static void range_cases(struct kernel_vfs_file *file)
           kernel_page_cache_invalidate_node(&cache,kernel_vfs_file_node(file))==KERNEL_PAGE_CACHE_STATUS_OK,363);
     for (unsigned page=0;page<9;page++) {
         size_t read;
-        check(kernel_vfs_pread(file,page*4096,actual,sizeof(actual),&read)==0 && read==sizeof(actual),364);
+        check(kernel_vfs_pread(file,page*4096,actual,sizeof(actual),&read, NULL)==0 && read==sizeof(actual),364);
         for (unsigned i=0;i<4096;i++) {
             unsigned char expected=page==0 || page==4 || page==8 ? 0x8e :
                 page<3 && i==17 ? value : page+1;
@@ -183,7 +183,7 @@ static void range_cases(struct kernel_vfs_file *file)
           kernel_page_cache_invalidate_node(&cache, kernel_vfs_file_node(file)) == KERNEL_PAGE_CACHE_STATUS_OK, 46);
     for (unsigned page = 0; page < 4; page++) {
         size_t read;
-        check(kernel_vfs_pread(file, page * 4096, actual, sizeof(actual), &read) == 0 && read == sizeof(actual), 47);
+        check(kernel_vfs_pread(file, page * 4096, actual, sizeof(actual), &read, NULL) == 0 && read == sizeof(actual), 47);
         for (unsigned i = 0; i < 4096; i++) {
             unsigned offset = page * 4096 + i;
             check(actual[i] == (offset >= 17 && offset < 3 * 4096 + 46 ? 0x6b : page + 1), 48);
@@ -264,7 +264,7 @@ static void redirty_case(struct kernel_vfs_file *file)
           kernel_page_cache_invalidate_node(&cache, kernel_vfs_file_node(file)) == KERNEL_PAGE_CACHE_STATUS_OK, 81);
     for (unsigned i = 0; i < TEST_PAGES; i++) {
         size_t read;
-        check(kernel_vfs_pread(file, i * 4096, actual, sizeof(actual), &read) == 0 && read == sizeof(actual), 82);
+        check(kernel_vfs_pread(file, i * 4096, actual, sizeof(actual), &read, NULL) == 0 && read == sizeof(actual), 82);
         memset(bytes, i < BOAROS_PAGE_CACHE_WRITEBACK_PAGES ? (int)(0xa0 + i) : (int)(i + 1), sizeof(bytes));
         check(!memcmp(actual, bytes, sizeof(bytes)), 83);
     }

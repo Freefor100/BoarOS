@@ -19,10 +19,6 @@ struct kernel_open_file_description {
      * 不能先进入executor后等待此锁，否则会阻挡持锁读者的cache miss。 */
     struct kernel_mutex offset_lock;
     uint64_t offset;
-#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
-    uint64_t read_end, readahead_cookie;
-    uint8_t read_sequential;
-#endif
     uint64_t observed_writeback_error;
     uint64_t observed_mount_error;
     uint64_t proc_identity;
@@ -46,6 +42,11 @@ struct kernel_open_file_description {
     size_t generated_length;
     uint8_t generated_ready;
     const struct kernel_credentials *credentials;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    uint64_t read_end,readahead_cookie,readahead_end; /* Last field is a page boundary. */
+    unsigned readahead_pages;
+    uint8_t read_sequential;
+#endif
 };
 /* 已有OFD owner下的私有域验证，不为未映射普通文件分配映射登记状态。 */
 enum kernel_open_file_status kernel_open_file_check_io_domain(

@@ -200,12 +200,12 @@ enum kernel_open_file_status kernel_open_file_seek(
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset);
 void kernel_open_file_read_progress(struct kernel_open_file_description *file,
-    uint64_t offset, size_t count);
+    uint64_t offset, size_t count, int cache_miss);
 #else
 static inline void kernel_open_file_read_begin(struct kernel_open_file_description *file,
     uint64_t offset) { (void)file; (void)offset; }
 static inline void kernel_open_file_read_progress(struct kernel_open_file_description *file,
-    uint64_t offset, size_t count) { (void)file; (void)offset; (void)count; }
+    uint64_t offset, size_t count, int cache_miss) { (void)file; (void)offset; (void)count; (void)cache_miss; }
 #endif
 
 int kernel_open_file_memory_backed(struct kernel_open_file_description *file);

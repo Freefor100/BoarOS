@@ -30,6 +30,7 @@
 static struct composition_control *control;
 static int control_fd=-1;
 static unsigned cpus;
+static unsigned performance_style;
 static void command(unsigned action,uint64_t tid)
 {
     uint64_t next=composition_load(&control->request)+1;
@@ -77,7 +78,20 @@ static ssize_t transfer(int fd,void *bytes,size_t size,int writing,unsigned styl
 }
 static void exact(int fd,void *bytes,size_t size,int writing,unsigned style)
 {
-    size_t done=0;while(done<size) { ssize_t n=transfer(fd,(char *)bytes+done,size-done,writing,style);if(n<0 && errno==EINTR)continue;CHECK(n>0 && (size_t)n<=size-done);done+=(size_t)n; }
+    size_t done=0;while(done<size) {
+        ssize_t n;
+        if (writing && style==4) {
+            struct iovec pieces[64];unsigned count=0;size_t at=done;
+            while (at<size && count<64) {
+                size_t length=64-at%64;if(length>size-at)length=size-at;
+                pieces[count++]=(struct iovec){(char *)bytes+(at/64)*128+at%64,length};at+=length;
+            }
+            n=writev(fd,pieces,(int)count);
+        } else n=transfer(fd,(char *)bytes+done,size-done,writing,style);
+        if(n<0 && errno==EINTR)continue;
+        CHECK(n>0 && (size_t)n<=size-done);
+        done+=(size_t)n;
+    }
 }
 struct channel { int fd[2],dgram,performance;unsigned id,rounds,pairs;pthread_barrier_t *gate;uint64_t start[2],end[2],samples[1024]; };
 struct actor { struct channel *channel;unsigned side; };
@@ -85,11 +99,13 @@ static void *traffic(void *arg)
 {
     struct actor *actor=arg;struct channel *c=actor->channel;unsigned side=actor->side;
     pin((c->id+side)%cpus);
-    size_t block=c->performance && !c->dgram?65536:64;
-    unsigned char *bytes=malloc(block);CHECK(bytes);memset(bytes,(int)(0x30+c->id),block);
+    size_t block=c->performance && !c->dgram?(performance_style==4?4096:65536):64;
+    size_t storage=performance_style==4 && !side?block*2:block;
+    unsigned char *bytes=malloc(storage);CHECK(bytes);memset(bytes,(int)(0x30+c->id),storage);
+    if(performance_style==4 && !side) for(size_t at=64;at<storage;at+=128)memset(bytes+at,0xee,64);
     barrier(c->gate);c->start[side]=ns();
     for(unsigned i=0;i<c->rounds;i++) {
-        unsigned style=c->performance?0:i%4;uint64_t start=ns();
+        unsigned style=c->performance?performance_style:i%4;uint64_t start=ns();
         if(c->dgram) {
             if(!side) { CHECK(transfer(c->fd[0],bytes,block,1,style)==(ssize_t)block);memset(bytes,0,block);CHECK(transfer(c->fd[0],bytes,block,0,style)==(ssize_t)block); }
             else { memset(bytes,0,block);CHECK(transfer(c->fd[1],bytes,block,0,style)==(ssize_t)block);for(size_t j=0;j<block;j++)CHECK(bytes[j]==0x30+c->id);CHECK(transfer(c->fd[1],bytes,block,1,style)==(ssize_t)block); }
@@ -105,7 +121,8 @@ static void group(const char *name,int domain,int type,unsigned pairs,int perfor
 {
     struct channel channels[4]={0};struct actor actors[8];pthread_t threads[8];pthread_barrier_t gate;
     CHECK(!pthread_barrier_init(&gate,0,pairs*2));
-    unsigned rounds=performance?(type==SOCK_DGRAM?1024:256/pairs):16;
+    unsigned rounds=performance?(type==SOCK_DGRAM?1024:(performance_style==4?4096:256)/pairs):16;
+    CHECK(rounds<=1024);
     for(unsigned i=0;i<pairs;i++) { struct channel *c=&channels[i];endpoints(c->fd,domain,type);c->id=i;c->dgram=type==SOCK_DGRAM;c->performance=performance;c->pairs=pairs;c->rounds=rounds;c->gate=&gate; }
     for(unsigned i=0;i<pairs*2;i++) { actors[i]=(struct actor){&channels[i/2],i%2};CHECK(!pthread_create(&threads[i],0,traffic,&actors[i])); }
     for(unsigned i=0;i<pairs*2;i++)CHECK(!pthread_join(threads[i],0));
@@ -252,15 +269,24 @@ static void controlled_lifetimes(void)
     composition_store(&control->socket_release,1);CHECK(!pthread_join(actor,0) && !pthread_join(waiter,0));CHECK(epoll_wait(ep,&event,1,0)==0);CHECK(!close(ep) && !close(fds[0]) && !close(fds[1]));
     composition_store(&control->socket_mode,0);puts("SOCKET-CONTROL callback-borrow-del-close OK");
 }
-int main(void)
+int main(int argc,char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);signal(SIGPIPE,SIG_IGN);
     uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)==sizeof(mask));cpus=(unsigned)__builtin_popcountll(mask);CHECK(cpus>=1 && cpus<=4);pin(0);
     if(getpid()==1) { CHECK(!mkdir("/proc",0555) || errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0) || errno==EBUSY); }
     int fd=socket(AF_INET,SOCK_DGRAM,0);CHECK(fd>=0);struct ifreq interface={.ifr_name="lo"};CHECK(!ioctl(fd,SIOCGIFFLAGS,&interface));interface.ifr_flags|=IFF_UP;CHECK(!ioctl(fd,SIOCSIFFLAGS,&interface));CHECK(!close(fd));
     observe_start();
+    int vector_performance=argc>1 && !strcmp(argv[1],"--vector-perf");
+    int scatter_performance=argc>1 && !strcmp(argv[1],"--scatter-perf");
     int performance=access("/performance",F_OK)==0;
-    if(performance) {
+    if(scatter_performance) {
+        performance_style=4;
+        group("tcp-scatter-four",AF_INET,SOCK_STREAM,4,1);puts("SOCKET-SCATTER END 1");
+    } else if(vector_performance) {
+        performance_style=1;
+        group("tcp-vector-one",AF_INET,SOCK_STREAM,1,1);group("tcp-vector-four",AF_INET,SOCK_STREAM,4,1);
+        puts("SOCKET-VECTOR END 2");
+    } else if(performance) {
         group("tcp-one",AF_INET,SOCK_STREAM,1,1);group("tcp-four",AF_INET,SOCK_STREAM,4,1);
         group("unix-stream-one",AF_UNIX,SOCK_STREAM,1,1);group("unix-stream-four",AF_UNIX,SOCK_STREAM,4,1);
         group("udp-four",AF_INET,SOCK_DGRAM,4,1);group("unix-dgram-four",AF_UNIX,SOCK_DGRAM,4,1);puts("SOCKET-PERF END 6");
@@ -269,5 +295,5 @@ int main(void)
         lifecycle();faults_and_sendfile();shared_endpoints();epoll_notifications();controlled_lifetimes();puts("SOCKET-SMP END 10");
     }
     if(control) { command(COMPOSITION_STOP,0);CHECK(!munmap(control,4096) && !close(control_fd) && !unlink("/dev/shm/smp-control")); }
-    sync();(void)reboot(RB_POWER_OFF);return 0;
+    sync();if(getpid()==1)(void)reboot(RB_POWER_OFF);return 0;
 }

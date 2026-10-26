@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_PAGE_CACHE_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <kernel/page.h>
 
@@ -12,8 +13,12 @@
 #error "BOAROS_PAGE_CACHE_WRITEBACK_PAGES must fit the 128 KiB window"
 #endif
 
+#ifndef BOAROS_PAGE_CACHE_DIRTY_AGE
+#define BOAROS_PAGE_CACHE_DIRTY_AGE 0
+#endif
+
 #ifndef BOAROS_PAGE_CACHE_READAHEAD_PAGES
-#define BOAROS_PAGE_CACHE_READAHEAD_PAGES 0
+#define BOAROS_PAGE_CACHE_READAHEAD_PAGES (65536U / BOAROS_PAGE_SIZE)
 #endif
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES < 0 || BOAROS_PAGE_CACHE_READAHEAD_PAGES > (131072U / BOAROS_PAGE_SIZE)
 #error "BOAROS_PAGE_CACHE_READAHEAD_PAGES must fit the 128 KiB window"
@@ -71,6 +76,9 @@ struct kernel_page_cache_statistics {
     uint64_t worker_scanned, worker_written, worker_failed, worker_batches;
     uint64_t readahead_queued, readahead_cancelled, readahead_loaded, readahead_failed;
     uint64_t readahead_batches, readahead_peak_pages;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    uint64_t readahead_completed;
+#endif
 };
 
 struct kernel_page_cache {
@@ -79,6 +87,27 @@ struct kernel_page_cache {
     struct kernel_page_cache_record *record;
     enum kernel_page_cache_state state;
 };
+
+struct kernel_block_device;
+struct kernel_writeback_domain;
+/* Embedded in a live mount. Read-only owners retain the cache without taking
+ * a dirty-memory share. A cache may serve multiple registrations/devices. */
+struct kernel_writeback_owner {
+    struct kernel_writeback_domain *domain;
+    struct kernel_page_cache *cache;
+    struct kernel_writeback_owner *next;
+};
+int kernel_page_cache_bind_writeback(struct kernel_page_cache *,struct kernel_block_device *,
+    int writable,struct kernel_writeback_owner *);
+void kernel_page_cache_unbind_writeback(struct kernel_writeback_owner *);
+void kernel_writeback_domain_get(void *);
+void kernel_writeback_domain_put(void *);
+void kernel_writeback_domain_memory(void *,size_t,bool acquiring);
+struct kernel_writeback_statistics {
+    uint64_t device,dirty_bytes,version_bytes,metadata_bytes,high_bytes,low_bytes;
+    unsigned physical;
+};
+void kernel_writeback_domain_snapshot(const struct kernel_writeback_owner *,struct kernel_writeback_statistics *);
 
 /* 一个 allocator 可注册多个独立缓存。统计/水位全局汇总，worker 与快照页各自拥有。
  * 元数据统一由对象mutex保护；实例、等待者和回调归还引用后释放聚合owner。 */
@@ -131,6 +160,9 @@ struct kernel_page_cache_read_page {
     uint64_t physical_address;
     size_t valid_bytes;
     enum kernel_page_cache_status status;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    unsigned cache_miss; /* Demand observed an absent or loading page. */
+#endif
 };
 /* 只装入本次请求覆盖的连续页。每项独立返回；只有OK项拥有物理页引用，
  * 调用者须归还全部成功项，包括首个错误之后的项。返回值是首个非OK状态。
@@ -159,6 +191,8 @@ enum kernel_page_cache_status kernel_page_cache_alias_attach(
 void kernel_page_cache_alias_hold(struct kernel_page_cache_alias *);
 void kernel_page_cache_alias_put(struct kernel_page_cache_alias *);
 void kernel_page_cache_retry_alias(struct kernel_page_cache_alias *);
+/* Recheck thresholds after a progress-only caller releases backing locks. */
+void kernel_page_cache_notify_pressure(struct kernel_page_cache *cache);
 enum kernel_page_cache_status kernel_page_cache_request_writeback(struct kernel_page_cache *);
 struct kernel_page_cache_resize { struct kernel_page_cache_entry *entry; uint64_t old_size; };
 /* CPU0、文件操作门owner；prepare不持inode I/O，finish在关闭代次下收敛实际尺寸。
@@ -218,8 +252,11 @@ void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 /* A queue slot pins only the inode. The opaque cookie cancels unsubmitted
  * work; a published read retains its owners through completion/reset. */
-uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t first, uint64_t cookie);
+struct kernel_page_cache_prediction { uint64_t cookie,end; };
+/* end is the acknowledged page boundary (including already resident pages),
+ * not a promise that an active request has loaded its complete range. */
+struct kernel_page_cache_prediction kernel_page_cache_readahead(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t first,unsigned pages,uint64_t cookie);
 void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie);
 #endif
 

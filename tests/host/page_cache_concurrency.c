@@ -13,6 +13,7 @@
 #include "../../fs/ext4_backend.h"
 #include <ext4_fs.h>
 #include <ext4_journal.h>
+#include <ext4_journal_memory.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +49,14 @@ static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out)
 { *out = (uintptr_t)p; return 1; }
 static int image_fd;
+static unsigned age_observing,age_waits,age_empty_wait;
+static _Thread_local unsigned progress_writeback_caller;
+static unsigned progress_writeback_waiting;
+static uint64_t age_clock_offset,age_deadlines[2];
+static struct kernel_wait_token age_tokens[2];
+uint64_t __real_kernel_time_monotonic_ns(void);
+uint64_t __wrap_kernel_time_monotonic_ns(void)
+{ return __real_kernel_time_monotonic_ns()+__atomic_load_n(&age_clock_offset,__ATOMIC_RELAXED); }
 static unsigned source_reads, pause_read, pause_after_read, read_entered, resume_read,source_first_cpu;
 static unsigned expanded_done;
 static void wait_progress(const unsigned *,unsigned);
@@ -314,6 +323,14 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
         while (!__atomic_load_n(&load_registration_resume, __ATOMIC_ACQUIRE)) sched_yield();
     }
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && progress_writeback_caller && queue) __atomic_store_n(&progress_writeback_waiting,1,__ATOMIC_RELEASE);
+    if (!status && age_observing && kernel_page_cache_is_executor(current_cache)) {
+        if (deadline) {
+            unsigned index=age_waits;assert(index<2);
+            age_tokens[index]=*token;age_deadlines[index]=deadline;
+            __atomic_store_n(&age_waits,index+1,__ATOMIC_RELEASE);
+        } else if (age_waits) __atomic_store_n(&age_empty_wait,1,__ATOMIC_RELEASE);
+    }
     if (!status && queue == __atomic_load_n(&durable_wait.queue, __ATOMIC_ACQUIRE) &&
         __atomic_exchange_n(&durable_before_park.hold, 0, __ATOMIC_ACQ_REL)) hold_durable_wait = 1;
     if (delaying) { assert(!status); delayed_load_token = *token; }
@@ -736,7 +753,7 @@ static void sparse_cache_growth(struct kernel_page_cache *cache,struct kernel_vf
     uint64_t end=2*BOAROS_PAGE_SIZE+3; size_t count;
     assert(!kernel_vfs_pwrite(&file,end,"end",3,&count) && count==3);
     unsigned char bytes[80]; memset(bytes,0xcc,sizeof(bytes));
-    assert(!kernel_vfs_pread(&file,end-45,bytes,sizeof(bytes),&count) && count==48);
+    assert(!kernel_vfs_pread(&file,end-45,bytes,sizeof(bytes),&count, NULL) && count==48);
     for (unsigned i=0;i<45;i++) assert(!bytes[i]);
     assert(!memcmp(bytes+45,"end",3));
     uint64_t address; size_t valid;
@@ -1325,7 +1342,7 @@ static void foreground_window_truncate(struct kernel_page_cache *cache,struct ke
     uint64_t observed=kernel_vfs_error_sequence(file);assert(!kernel_vfs_sync(file,0,&observed));
     unsigned char actual;assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(file),0,&actual,1,&done) && done==1 && actual==0x94);
     assert(!kernel_vfs_ftruncate(file,(uint64_t)COUNT*BOAROS_PAGE_SIZE));
-    assert(!kernel_vfs_pread(file,(uint64_t)(COUNT-1)*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && !actual);
+    assert(!kernel_vfs_pread(file,(uint64_t)(COUNT-1)*BOAROS_PAGE_SIZE,&actual,1,&done, NULL) && done==1 && !actual);
     kernel_page_cache_get_concurrency_state(cache,&state);assert(!state.entry_borrows);
     puts("PASS foreground window truncate: held old completion, new dirty generation, unselected tail retirement and zero regrowth");
 }
@@ -1644,7 +1661,7 @@ static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs
     uint64_t error=kernel_vfs_error_sequence(&file);
     assert(!kernel_vfs_sync(&file,0,&error));
     unsigned char actual[BOAROS_PAGE_SIZE];size_t read;
-    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read, NULL) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
     assert(!kernel_vfs_close(&file));
     puts("PASS overwrite/append: three metadata locks, three inode phases, no redundant physical refs; one window admission and one final pressure notification, sync/readback verified");
 }
@@ -2266,7 +2283,7 @@ static void executor_range_fairness(struct kernel_page_cache *cache,
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&writer)));
     for (unsigned i=0;i<COUNT;i++) {
         unsigned char actual;
-        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && actual==0x49);
+        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done, NULL) && done==1 && actual==0x49);
     }
     assert(!kernel_vfs_close(&writer) && !kernel_vfs_close(&reader));
     if (prefix_error)
@@ -2316,7 +2333,7 @@ static void executor_range_stop(struct kernel_page_cache *cache,struct kernel_vf
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&writer)));
     for (unsigned i=0;i<COUNT;i++) {
         unsigned char actual;
-        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done) && done==1 && actual==0x6a);
+        assert(!kernel_vfs_pread(&writer,(uint64_t)i*BOAROS_PAGE_SIZE,&actual,1,&done, NULL) && done==1 && actual==0x6a);
     }
     assert(!kernel_vfs_close(&writer));
     puts("PASS CPU0 range stop: in-flight window ends before stop, continuation cancelled, dirty suffix retained and restart persists it without leaked request owners");
@@ -2492,7 +2509,7 @@ static void ordinary_reclaim_borrow(struct kernel_heap *heap,struct physical_pag
     for(size_t i=0;i<count;i++)assert(!physical_page_release(pages,held[i]));
     free(held);
     unsigned char actual[BOAROS_PAGE_SIZE];
-    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done, NULL) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
     assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
     puts("PASS ordinary pressure writeback: parked foreground keeps entry alive after the last physical pin; contents and owners returned");
@@ -2552,18 +2569,18 @@ static void executor_durable_progress(struct kernel_heap *heap,
     assert(!kernel_vfs_pwrite(&writer,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     assert(!pthread_create(&reading,NULL,executor_cold_client,&reader));
     assert(!pthread_create(&close_thread,NULL,executor_close_client,&closing));
-    /* The real physical I/O mutex covers the held flush. A cold disk read
+    /* FLUSH retains exclusive transfer ownership through completion. A cold disk read
      * waits there, while cached data and CPU0 close work remain independent. */
     for (;;) {
         unsigned waiting;
-        { KERNEL_RAW_SCOPE(guard,&disk.io_lock.lock.metadata);
-          waiting=disk.io_lock.lock.pending_head!=NULL; }
+        { KERNEL_RAW_SCOPE(guard,&disk.transfer_lock.metadata);
+          waiting=disk.transfer_lock.pending_head!=NULL; }
         if (waiting) break;
         sched_yield();
     }
     wait_progress(&executor_fairness.close_completed,1);
     unsigned char hot;
-    assert(!kernel_vfs_pread(&writer,0,&hot,1,&done) && done==1 && hot==0x36);
+    assert(!kernel_vfs_pread(&writer,0,&hot,1,&done, NULL) && done==1 && hot==0x36);
     assert(!__atomic_load_n(&executor_fairness.read_completed,__ATOMIC_ACQUIRE) &&
         !__atomic_load_n(&sync.done,__ATOMIC_ACQUIRE) && !pthread_join(close_thread,NULL));
     __atomic_store_n(&durable_wait.resume_flush,1,__ATOMIC_RELEASE);
@@ -2584,7 +2601,7 @@ static void executor_durable_progress(struct kernel_heap *heap,
     instance->ops=backend;
     assert(!kernel_page_cache_invalidate_node(&cache,kernel_vfs_file_node(&writer)));
     unsigned char actual[BOAROS_PAGE_SIZE];
-    assert(!kernel_vfs_pread(&writer,0,actual,sizeof(actual),&done) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(actual)));
+    assert(!kernel_vfs_pread(&writer,0,actual,sizeof(actual),&done, NULL) && done==sizeof(actual) && !memcmp(actual,bytes,sizeof(actual)));
     shared_error_cursor(&writer);
     assert(!kernel_vfs_close(&writer) && !kernel_vfs_close(&reader) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
@@ -2608,7 +2625,7 @@ static void executor_durable_fault(struct kernel_heap *heap,
     if (recover) {
         for (unsigned i=0;i<3;i++) {
             assert(!kernel_vfs_open(&mount,names[i],&files[i]));
-            assert(!kernel_vfs_pread(&files[i],0,actual,sizeof(actual),&done) && done==sizeof(actual));
+            assert(!kernel_vfs_pread(&files[i],0,actual,sizeof(actual),&done, NULL) && done==sizeof(actual));
             /* 失败fsync不承诺新版本持久化；已成功fsync的文件必须完整保留。 */
             unsigned char allowed=actual[0];
             assert(i?allowed==0x21 || allowed==0x42:allowed==0x23);
@@ -2730,7 +2747,7 @@ static void truncate_writeback_publication(struct kernel_page_cache *cache, cons
         assert(kernel_vfs_node_size(node)==retained);
         assert(!kernel_vfs_ftruncate(&file,sizeof(bytes)));
         memset(bytes,0xcc,sizeof(bytes));
-        assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        assert(!kernel_vfs_pread(&file,0,bytes,sizeof(bytes),&done, NULL) && done==sizeof(bytes));
         for (size_t i=0;i<sizeof(bytes);i++) {
             unsigned char expected=i<retained ? 0x53 : 0;
             if (bytes[i]!=expected) fprintf(stderr,"truncate scenario %u resurrected byte at %zu: 0x%x != 0x%x\n",
@@ -2789,7 +2806,7 @@ static void pressure_error_isolation(struct kernel_page_cache *cache,const char 
     assert(!test.error && test.written==4 && !write_error);
     assert(!kernel_vfs_error_sequence(&healthy) && kernel_vfs_error_sequence(&failed));
     assert(!kernel_vfs_sync(&healthy,0,&observed));
-    char actual[4];assert(!kernel_vfs_pread(&healthy,0,actual,4,&done) && done==4 && !memcmp(actual,"new!",4));
+    char actual[4];assert(!kernel_vfs_pread(&healthy,0,actual,4,&done, NULL) && done==4 && !memcmp(actual,"new!",4));
     observed=0;
     assert(kernel_vfs_sync(&failed,0,&observed)==(injected==3?-KERNEL_ENOSPC:-KERNEL_EIO));
     assert(!kernel_vfs_sync(&failed,0,&observed));
@@ -2870,7 +2887,7 @@ static void write_pressure_case(struct kernel_page_cache *cache,const char *path
         unsigned char actual[BOAROS_PAGE_SIZE];
         for (size_t offset=0;offset<length;offset+=sizeof(actual)) {
             size_t done;
-            assert(!kernel_vfs_pread(&file,offset,actual,sizeof(actual),&done) &&
+            assert(!kernel_vfs_pread(&file,offset,actual,sizeof(actual),&done, NULL) &&
                 done==sizeof(actual) && !memcmp(actual,bytes+offset,done));
         }
     }
@@ -2888,6 +2905,43 @@ static void *close_during_timestamp(void *unused)
     assert(!kernel_vfs_close(timestamp_owner.closing));
     __atomic_store_n(&timestamp_owner.close_done,1,__ATOMIC_RELEASE);
     return NULL;
+}
+static void indexed_reclaim(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);
+    struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    assert(!kernel_vfs_create(&mount,"/reclaim-window",0600,&file));
+    assert(!kernel_vfs_ftruncate(&file,129U*BOAROS_PAGE_SIZE));
+    (void)kernel_page_cache_reclaim(cache,UINT64_MAX);
+    uint64_t held[129];size_t valid;
+    for (unsigned i=0;i<129;i++) assert(!kernel_page_cache_get(cache,&file,i,&held[i],&valid));
+    assert(!physical_page_release(cache->allocator,held[128]));
+    assert(kernel_page_cache_reclaim(cache,1)==1);
+    uint64_t address;
+    assert(kernel_page_cache_lookup(cache,&file,128,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    assert(!physical_page_release(cache->allocator,held[100]));
+    assert(kernel_page_cache_reclaim(cache,1)==1);
+    assert(kernel_page_cache_lookup(cache,&file,100,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    {
+        KERNEL_LOCK_SCOPE(writer);kernel_vfs_node_lock(node,&writer,1);
+        kernel_page_cache_invalidate_range(cache,node,99U*BOAROS_PAGE_SIZE,100U*BOAROS_PAGE_SIZE);
+    }
+    assert(kernel_page_cache_lookup(cache,&file,99,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    assert(!physical_page_release(cache->allocator,held[99]));
+    /* Touch the successor of a removed scan position before the next round. */
+    assert(!kernel_page_cache_get(cache,&file,98,&address,&valid));
+    assert(!physical_page_release(cache->allocator,address));
+    for (unsigned i=0;i<128;i++) if (i!=99 && i!=100)
+        assert(!physical_page_release(cache->allocator,held[i]));
+    assert(kernel_page_cache_reclaim(cache,UINT64_MAX)==126 && !node->cache_pages);
+    assert(!kernel_vfs_unlink(&mount,"/reclaim-window") && !kernel_vfs_close(&file));
+    assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
+    puts("PASS indexed range/reclaim:128 pinned predecessors, later clean victim, removed/touched scan position and all owners returned");
 }
 static void caller_metadata_owners(struct kernel_page_cache *cache, const char *path)
 {
@@ -2943,6 +2997,232 @@ static void caller_metadata_owners(struct kernel_page_cache *cache, const char *
     puts("PASS caller metadata ownership: handle timestamps and deferred CPU0 final close");
 }
 
+struct domain_disk { int fd; unsigned armed,entered,resume,fail_flush; };
+static enum kernel_block_status domain_read(void *context,uint64_t offset,void *bytes,size_t size)
+{
+    struct domain_disk *disk=context;
+    return pread(disk->fd,bytes,size,offset)==(ssize_t)size?0:KERNEL_BLOCK_STATUS_IO;
+}
+static enum kernel_block_status domain_write(void *context,uint64_t offset,const void *bytes,size_t size)
+{
+    struct domain_disk *disk=context;
+    if (__atomic_exchange_n(&disk->armed,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&disk->entered,1,__ATOMIC_RELEASE);
+        wait_progress(&disk->resume,1);
+    }
+    return pwrite(disk->fd,bytes,size,offset)==(ssize_t)size?0:KERNEL_BLOCK_STATUS_IO;
+}
+static enum kernel_block_status domain_flush(void *context)
+{ struct domain_disk *disk=context;
+  if (__atomic_exchange_n(&disk->fail_flush,0,__ATOMIC_ACQ_REL)) return KERNEL_BLOCK_STATUS_IO;
+  return fsync(disk->fd)?KERNEL_BLOCK_STATUS_IO:0; }
+static void writeback_start_failure(struct kernel_page_cache *cache,const char *path)
+{
+    struct domain_disk storage={.fd=open(path,O_RDWR),.fail_flush=1};assert(storage.fd>=0);
+    struct stat st;assert(!fstat(storage.fd,&st));
+    struct kernel_block_device disk={.context=&storage,.read=domain_read,.write=domain_write,
+        .flush=domain_flush,.logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0)==-KERNEL_EIO && mount.private_data);
+    struct lwext4_mount_adapter *adapter=mount.private_data;
+    struct kernel_writeback_statistics pressure;kernel_writeback_domain_snapshot(&adapter->instance.writeback,&pressure);
+    struct jbd_memory_stats journal;jbd_memory_snapshot(adapter->device.fs->jbd_journal->memory,&journal);
+    assert(pressure.metadata_bytes && pressure.metadata_bytes==journal.used-journal.cached-journal.borrowed &&
+        disk.references==2 && kernel_page_cache_destroy(cache)==KERNEL_PAGE_CACHE_STATUS_STATE &&
+        kernel_vfs_unmount(&mount)==-KERNEL_EIO && mount.private_data);
+    assert(!close(storage.fd));
+    puts("PASS failed journal-start FLUSH retains mount, cache, physical pressure owner and actual allocated metadata");
+}
+static void *domain_fast_writer(void *argument)
+{
+    cache_test_attach(9);struct kernel_vfs_file *file=argument;size_t done;
+    unsigned char value=0x39;
+    assert(!kernel_vfs_pwrite(file,BOAROS_PAGE_SIZE,&value,1,&done) && done==1);
+    value=0;assert(!kernel_vfs_pread(file,BOAROS_PAGE_SIZE,&value,1,&done, NULL) && done==1 && value==0x39);
+    return NULL;
+}
+static void writeback_domains(struct kernel_page_cache *cache,const char *path)
+{
+    struct kernel_heap *heap_for_domains=cache->heap;
+    struct physical_page_allocator *pages_for_domains=cache->allocator;
+    char other[1024];assert(snprintf(other,sizeof(other),"%s-other",path)<(int)sizeof(other));
+    struct domain_disk storage[2]={{.fd=open(path,O_RDWR)},{.fd=open(other,O_RDWR)}};
+    struct kernel_block_device disks[2]={0};struct kernel_vfs_mount mounts[2]={0};
+    struct kernel_vfs_file files[2]={0};struct kernel_writeback_statistics stats[2],before;
+    for (unsigned i=0;i<2;i++) {
+        assert(storage[i].fd>=0);struct stat st;assert(!fstat(storage[i].fd,&st));
+        disks[i]=(struct kernel_block_device){.context=&storage[i],.read=domain_read,.write=domain_write,
+            .flush=domain_flush,.logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+        assert(!kernel_block_register(&disks[i],KERNEL_BLOCK_DEVICE_NUMBER(i)));
+        assert(!kernel_vfs_mount_ext4(&mounts[i],&disks[i],&backend_heap,cache,0));
+        assert(!kernel_vfs_create(&mounts[i],"/pressure-domain",0600,&files[i]));
+    }
+    struct kernel_vfs_instance *fast=mounts[0].private_data,*slow=mounts[1].private_data;
+    assert(fast->writeback.domain!=slow->writeback.domain);
+    kernel_writeback_domain_snapshot(&fast->writeback,&stats[0]);
+    kernel_writeback_domain_snapshot(&slow->writeback,&stats[1]);
+    assert(stats[0].physical && stats[1].physical && stats[0].device!=stats[1].device &&
+        stats[0].high_bytes==stats[1].high_bytes);
+    struct kernel_writeback_owner alias={0};
+    assert(!kernel_page_cache_bind_writeback(cache,&disks[0],1,&alias) && alias.domain==fast->writeback.domain);
+    kernel_writeback_domain_snapshot(&alias,&before);assert(before.high_bytes==stats[0].high_bytes);
+    kernel_page_cache_unbind_writeback(&alias);
+    struct kernel_block_device read_only_device={.read=domain_read,.context=&storage[0],
+        .logical_block_size=512,.capacity_bytes=disks[0].capacity_bytes};
+    struct kernel_writeback_owner read_only_owner={0};
+    assert(!kernel_block_register(&read_only_device,KERNEL_BLOCK_DEVICE_NUMBER(2)));
+    assert(!kernel_page_cache_bind_writeback(cache,&read_only_device,0,&read_only_owner) && !read_only_owner.domain);
+    kernel_writeback_domain_snapshot(&fast->writeback,&before);assert(before.high_bytes==stats[0].high_bytes);
+    kernel_page_cache_unbind_writeback(&read_only_owner);assert(!kernel_block_unregister(&read_only_device));
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x72,sizeof(bytes));size_t done;
+    assert(!kernel_vfs_pwrite(&files[0],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    kernel_writeback_domain_snapshot(&fast->writeback,&before);
+    assert(before.dirty_bytes==BOAROS_PAGE_SIZE && !before.version_bytes);
+    struct retained_version retained={0};retain_version=&retained;
+    uint64_t observed=kernel_vfs_error_sequence(&files[0]);assert(!kernel_vfs_sync(&files[0],0,&observed));retain_version=NULL;
+    kernel_writeback_domain_snapshot(&fast->writeback,&before);
+    assert(!before.dirty_bytes && before.version_bytes==retained.source.bytes);
+    retained.source.retain(retained.source.context);
+    kernel_writeback_domain_snapshot(&fast->writeback,&stats[0]);assert(stats[0].version_bytes==before.version_bytes);
+    retained.source.release(retained.source.context);
+    kernel_writeback_domain_snapshot(&fast->writeback,&stats[0]);assert(stats[0].version_bytes==retained.source.bytes);
+    struct jbd_memory_stats journal;struct lwext4_mount_adapter *adapter=(void *)fast;
+    jbd_memory_snapshot(adapter->device.fs->jbd_journal->memory,&journal);
+    assert(stats[0].metadata_bytes==journal.used-journal.cached-journal.borrowed);
+    size_t pages=(2*stats[1].high_bytes)/BOAROS_PAGE_SIZE+4;
+    for (size_t i=0;i<pages;i++)
+        assert(!kernel_vfs_pwrite(&files[1],i*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    storage[1].armed=1;current_cache=cache;assert(!kernel_page_cache_start_worker(cache));
+    wait_progress(&storage[1].entered,1);
+    /* One cache intentionally serves both disks. Its worker is in slow I/O;
+     * a fast-domain write must not join that worker's admission queue. */
+    pthread_t fast_writer;assert(!pthread_create(&fast_writer,NULL,domain_fast_writer,&files[0]));
+    assert(!pthread_join(fast_writer,NULL) && !storage[1].resume);
+    assert(kernel_page_cache_destroy(cache)==KERNEL_PAGE_CACHE_STATUS_STATE);
+    __atomic_store_n(&storage[1].resume,1,__ATOMIC_RELEASE);
+    for (unsigned i=0;i<2;i++) {
+        observed=kernel_vfs_error_sequence(&files[i]);assert(!kernel_vfs_sync(&files[i],0,&observed));
+        kernel_writeback_domain_snapshot(i?&slow->writeback:&fast->writeback,&stats[i]);
+        assert(!stats[i].dirty_bytes && stats[i].version_bytes==(i?0:retained.source.bytes));
+        assert(!kernel_vfs_close(&files[i]));
+    }
+    kernel_page_cache_stop_worker(cache);
+    struct kernel_writeback_domain *held_domain=fast->writeback.domain;
+    assert(!kernel_vfs_unmount(&mounts[0]) && disks[0].references==1 &&
+        kernel_block_unregister(&disks[0])==-KERNEL_EBUSY);
+    assert(!kernel_vfs_unmount(&mounts[1]) && !disks[1].references && !kernel_block_unregister(&disks[1]));
+    assert(!kernel_page_cache_destroy(cache) && *retained.data==0x72);
+    struct kernel_page_cache replacement={0};struct kernel_writeback_owner joined={0};
+    assert(!kernel_page_cache_init(&replacement,heap_for_domains,pages_for_domains));
+    assert(!kernel_page_cache_bind_writeback(&replacement,&disks[0],1,&joined) && joined.domain==held_domain);
+    kernel_writeback_domain_snapshot(&joined,&before);assert(before.version_bytes==retained.source.bytes);
+    retained.source.release(retained.source.context);kernel_writeback_domain_snapshot(&joined,&before);
+    assert(!before.version_bytes);
+    kernel_page_cache_unbind_writeback(&joined);
+    assert(!kernel_block_claim(&disks[0],&read_only_owner) &&
+        !kernel_page_cache_bind_writeback(&replacement,&disks[0],0,&read_only_owner));
+    assert(kernel_page_cache_destroy(&replacement)==KERNEL_PAGE_CACHE_STATUS_STATE);
+    kernel_page_cache_unbind_writeback(&read_only_owner);kernel_block_release_claim(&disks[0],&read_only_owner);
+    assert(!kernel_page_cache_destroy(&replacement));
+    assert(!disks[0].references && !kernel_block_unregister(&disks[0]));
+    for(unsigned i=0;i<2;i++)assert(!close(storage[i].fd));
+    current_cache=NULL;
+    puts("PASS physical writeback domains: shared-cache slow/fast isolation, shared-device quota, stable source single charge, journal ownership and final references");
+}
+
+static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
+{
+    assert(BOAROS_PAGE_CACHE_DIRTY_AGE);
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0) && !kernel_vfs_create(&mount,"/aged",0600,&file));
+    for (unsigned failure=0;failure<2;failure++) {
+        age_waits=age_empty_wait=0;age_clock_offset=0;age_observing=1;current_cache=cache;
+        unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,(int)(0x60+failure),sizeof(bytes));size_t done;
+        uint64_t start=kernel_time_monotonic_ns();
+        assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        uint64_t observed=kernel_vfs_error_sequence(&file);
+        assert(!kernel_page_cache_start_worker(cache));wait_progress(&age_waits,1);
+        assert(age_deadlines[0]>=start+UINT64_C(5000000000));
+        assert(kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count==1);
+        write_error=failure;
+        __atomic_store_n(&age_clock_offset,UINT64_C(5000000001),__ATOMIC_RELAXED);
+        assert(!kernel_wait_notify(&age_tokens[0],KERNEL_WAIT_TIMEOUT));
+        if (failure) {
+            wait_progress(&age_waits,2);
+            assert(!write_error && age_deadlines[1]>age_deadlines[0]+UINT64_C(5000000000) &&
+                kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count==1 &&
+                kernel_vfs_error_sequence(&file)==observed+1);
+            __atomic_store_n(&age_clock_offset,UINT64_C(10000000002),__ATOMIC_RELAXED);
+            assert(!kernel_wait_notify(&age_tokens[1],KERNEL_WAIT_TIMEOUT));
+        }
+        wait_progress(&age_empty_wait,1);kernel_page_cache_stop_worker(cache);
+        age_observing=0;age_clock_offset=0;
+        assert(!kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count);
+        unsigned char actual;assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(&file),0,&actual,1,&done) && done==1 && actual==bytes[0]);
+        assert(kernel_vfs_sync(&file,0,&observed)==(failure?-KERNEL_EIO:0));
+        assert(!kernel_vfs_sync(&file,0,&observed));
+    }
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
+    current_cache=NULL;
+    puts("PASS dirty-age deadline: five-second registration, controlled expiry, bounded error retry, idle wait and owners");
+}
+
+struct progress_sync_request { struct kernel_vfs_file *file; int result; unsigned done; };
+static void *progress_sync_client(void *argument)
+{
+    cache_test_attach(9);kernel_cpu_current()->logical_id=0;
+    /* A distinct loop/progress task on CPU0 bypasses the cache execution queue. */
+    struct progress_sync_request *request=argument;
+    struct kernel_io_context *io=kernel_io_context_current();assert(!io->background_reclaim);
+    io->background_reclaim=1;progress_writeback_caller=1;
+    uint64_t observed=kernel_vfs_error_sequence(request->file);
+    request->result=kernel_vfs_sync(request->file,0,&observed);
+    progress_writeback_caller=0;io->background_reclaim=0;
+    __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);return NULL;
+}
+static void progress_writeback_owners(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));current_cache=cache;
+    for(unsigned distinct=0;distinct<2;distinct++) {
+        struct kernel_vfs_file files[2]={{0}};unsigned char bytes[BOAROS_PAGE_SIZE];size_t done;
+        for(unsigned i=0;i<2;i++) {
+            char name[32];snprintf(name,sizeof(name),"/progress-%u-%u",distinct,i);
+            assert(!kernel_vfs_create(&mount,name,0600,&files[i]));memset(bytes,(int)(0x61+i),sizeof(bytes));
+            assert(!kernel_vfs_pwrite(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        }
+        write_entered=resume_write=progress_writeback_waiting=0;pause_write=1;
+        assert(!kernel_page_cache_start_worker(cache) && !kernel_page_cache_request_writeback(cache));
+        wait_progress(&write_entered,1);
+        struct progress_sync_request request={.file=&files[distinct]};pthread_t caller;
+        assert(!pthread_create(&caller,NULL,progress_sync_client,&request));
+        if(!distinct) {
+            while(!__atomic_load_n(&progress_writeback_waiting,__ATOMIC_ACQUIRE) &&
+                !__atomic_load_n(&request.done,__ATOMIC_ACQUIRE))sched_yield();
+            if (request.done)fprintf(stderr,"progress caller prematurely returned %d from active writeback\n",request.result);
+            assert(progress_writeback_waiting && !request.done);
+            __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+        }
+        assert(!pthread_join(caller,NULL) && !request.result);
+        if(distinct)__atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+        kernel_page_cache_stop_worker(cache);
+        for(unsigned i=0;i<2;i++) {
+            uint64_t observed=kernel_vfs_error_sequence(&files[i]);assert(!kernel_vfs_sync(&files[i],0,&observed));
+            assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&files[i])));
+            memset(bytes,0,sizeof(bytes));assert(!kernel_vfs_pread(&files[i],0,bytes,sizeof(bytes),&done, NULL) && done==sizeof(bytes));
+            for(size_t j=0;j<sizeof(bytes);j++)assert(bytes[j]==0x61+i);
+            assert(!kernel_vfs_close(&files[i]));
+        }
+    }
+    assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS progress I/O keeps its own writeback workspace and waits for busy entries; worker versions, exact disk contents and owners survive");
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
@@ -2973,6 +3253,14 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"domain-start-failure")) {writeback_start_failure(&cache,argv[1]);return 0;}
+        if (!strcmp(argv[2],"progress-owners")) {progress_writeback_owners(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"dirty-age")) {dirty_age_case(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"pressure-domains")) {writeback_domains(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"indexed-reclaim")) {
+            indexed_reclaim(&cache,argv[1]);
+            goto owners;
+        }
 #ifdef CACHE_MM_CASES
         if (!strcmp(argv[2],"mremap")) {
             image_fd=open(argv[1],O_RDWR); assert(image_fd>=0);

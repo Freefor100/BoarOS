@@ -34,6 +34,31 @@ void mm_test_bind_files(struct kernel_files *);
 void mm_test_finish(void);
 void mm_test_activate_task(void);
 extern _Thread_local uint64_t mm_test_context;
+static unsigned watch_memory_staging,memory_staging_calls;
+static unsigned memory_lookup_calls;
+enum kernel_page_cache_status __real_kernel_open_file_lookup_page(struct kernel_open_file_description *,uint64_t,uint64_t *,size_t *);
+enum kernel_page_cache_status __wrap_kernel_open_file_lookup_page(struct kernel_open_file_description *file,uint64_t index,uint64_t *page,size_t *valid)
+{
+    if (watch_memory_staging) memory_lookup_calls++;
+    return __real_kernel_open_file_lookup_page(file,index,page,valid);
+}
+static uint64_t direct_read_target;
+static unsigned direct_read_pin_seen;
+static unsigned direct_inode_held,direct_inode_release;
+enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *space,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    enum kernel_uaccess_status status=__real_kernel_uaccess_pin_user_page(space,address,access,pin);
+    if (!status && direct_read_target==address && kernel_cpu_current()->logical_id==1)
+        __atomic_store_n(&direct_read_pin_seen,1,__ATOMIC_RELEASE);
+    return status;
+}
+enum kernel_task_status __real_kernel_task_io_buffer_acquire(struct kernel_task_io_buffer *,struct physical_page_allocator *);
+enum kernel_task_status __wrap_kernel_task_io_buffer_acquire(struct kernel_task_io_buffer *buffer,struct physical_page_allocator *allocator)
+{
+    if (watch_memory_staging) memory_staging_calls++;
+    return __real_kernel_task_io_buffer_acquire(buffer,allocator);
+}
 #if !defined(TCP_IO_CASES) && !defined(LOOP_IO_CASES) && !defined(FALLOCATE_SYNC_CASES)
 enum kernel_time_status __wrap_kernel_time_deadline_from_monotonic(uint64_t target,uint64_t *deadline)
 {
@@ -574,15 +599,9 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     assert(!kernel_files_close(&files,0,&result) && !result && controls[0]->references==2);
     assert(!kernel_files_dup3(&files,1,0,0,&result) && result==0);
     assert(!pthread_create(&pending,0,crossing_read,&queued));
-    struct kernel_block_device *device=kernel_vfs_file_block_device(&controls[1]->file);
-    assert(device);
-    for (;;) {
-        unsigned waiting;
-        { KERNEL_RAW_SCOPE(guard,&device->io_lock.lock.metadata);
-          waiting=device->io_lock.lock.pending_head!=NULL; }
-        if (waiting) break;
-        sched_yield();
-    }
+    /* Independent cold reads now share transfer qualification. The replacement
+     * completes while the original OFD remains borrowed by the paused reader. */
+    assert(!pthread_join(pending,0) && !queued.status && queued.result==8 && !memcmp(queued.bytes,"replaced",8));
     struct kernel_page_cache_concurrency_state state;
     kernel_page_cache_get_concurrency_state(cache,&state);
     assert(!state.running && !state.pending && !pthread_create(&stopper,0,stop_requests,cache));
@@ -590,7 +609,6 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     assert(controls[0]->references==2);
     __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);
     assert(!pthread_join(active,0) && !first.status && !memcmp(first.bytes,"original",8));
-    assert(!pthread_join(pending,0) && !queued.status && queued.result==8 && !memcmp(queued.bytes,"replaced",8));
     kernel_page_cache_get_concurrency_state(cache,&state);
     assert(!state.pending && !state.running && !state.entry_borrows && state.executions_queued==state.executions_completed);
     mm_test_attach(0); mm_test_activate_task(); assert(!kernel_files_release(&files));
@@ -868,6 +886,45 @@ static void *read_and_write(void *unused)
     assert(!kernel_files_close(&files,1,&result) && !result);
     mm_test_finish(); return 0;
 }
+static void *direct_read_actor(void *result)
+{
+    bind(1);kernel_cpu_current()->logical_id=1;
+    assert(!kernel_files_pread(&files,&mm,0,direct_read_target,8,0,result));
+    mm_test_finish();return NULL;
+}
+static void *direct_inode_actor(void *unused)
+{
+    (void)unused;bind(2);
+    KERNEL_LOCK_SCOPE(writer);kernel_vfs_node_lock(kernel_open_file_node(control),&writer,1);
+    __atomic_store_n(&direct_inode_held,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&direct_inode_release,__ATOMIC_ACQUIRE)) sched_yield();
+    kernel_lock_release(&writer);mm_test_finish();return NULL;
+}
+static void direct_read_alias(void)
+{
+    uint64_t address;size_t copied;int64_t result;
+    struct kernel_open_file_description *source=control;
+    assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x600000,BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED_NOREPLACE,&address) && !source);
+    assert(!kernel_copy_to_user(&mm,address,"original",8,&copied));
+    assert(!kernel_files_pread(&files,&mm,0,address+2,6,0,&result) && result==6);
+    char bytes[8];assert(!kernel_copy_from_user(&mm,bytes,address,8,&copied) && !memcmp(bytes,"ororigin",8));
+    assert(!kernel_copy_to_user(&mm,address,"original",8,&copied));
+    direct_read_target=address;direct_read_pin_seen=direct_inode_held=direct_inode_release=0;
+    pthread_t writer;assert(!pthread_create(&writer,NULL,direct_inode_actor,NULL));
+    while (!__atomic_load_n(&direct_inode_held,__ATOMIC_ACQUIRE)) sched_yield();
+    pthread_t reader;assert(!pthread_create(&reader,NULL,direct_read_actor,&result));
+    while (!__atomic_load_n(&direct_read_pin_seen,__ATOMIC_ACQUIRE)) sched_yield();
+    /* An independent MM editor removes permission while the inode writer is
+     * paused. The reader must return its pin before waiting for that writer. */
+    assert(!kernel_mm_mprotect(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+    __atomic_store_n(&direct_inode_release,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(writer,NULL) && !pthread_join(reader,NULL) && result==-KERNEL_EFAULT);
+    direct_read_target=0;
+    assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE));
+    puts("PASS tmpfs direct read: shared-page overlap and inode-writer/MM-pin handshake");
+}
 static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_page_cache *cache)
 {
@@ -902,6 +959,38 @@ static void file_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_open_file_description *slot=control;
     assert(!kernel_open_file_acquire(slot) && !kernel_files_install_new_owned_at(&files,0,0,&slot));
     assert(!kernel_files_check_task_domain(&files,&mm));
+    if (!cache) {
+        int64_t read_result;char bytes[8];size_t copied;
+        assert(!kernel_copy_to_user(&mm,0x200000,"--------",8,&copied));
+        watch_memory_staging=1;memory_staging_calls=0;
+        assert(!kernel_files_pread(&files,&mm,0,0x200000,8,0,&read_result) && read_result==8);
+        watch_memory_staging=0;
+        assert(!kernel_copy_from_user(&mm,bytes,0x200000,8,&copied) && !memcmp(bytes,"original",8));
+        assert(!memory_staging_calls);
+        puts("PASS tmpfs read uses source pages directly without a payload staging page");
+        assert(!kernel_vfs_ftruncate(&control->file,512));
+        struct kernel_uaccess_iovec parts[64];
+        for (unsigned i=0;i<64;i++) parts[i]=(struct kernel_uaccess_iovec){0x200000+8*i,8};
+        assert(!kernel_copy_to_user(&mm,0x100200,parts,sizeof(parts),&copied));
+        watch_memory_staging=1;memory_lookup_calls=0;
+        assert(!kernel_files_preadv(&files,&mm,0,0x100200,64,0,&read_result) && read_result==512);
+        watch_memory_staging=0;assert(memory_lookup_calls==1);
+        assert(!kernel_copy_from_user(&mm,bytes,0x200000,8,&copied) && !memcmp(bytes,"original",8));
+        for (unsigned at=8;at<512;at+=8) {
+            assert(!kernel_copy_from_user(&mm,bytes,0x200000+at,8,&copied));
+            for (unsigned j=0;j<8;j++) assert(!bytes[j]);
+        }
+        assert(!kernel_vfs_ftruncate(&control->file,3U*BOAROS_PAGE_SIZE));
+        uint64_t before=physical_page_available(mm.allocator);
+        assert(!kernel_files_pread(&files,&mm,0,0x200000,BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,&read_result) && read_result==BOAROS_PAGE_SIZE);
+        assert(physical_page_available(mm.allocator)==before);
+        for (size_t at=0;at<BOAROS_PAGE_SIZE;at+=sizeof(bytes)) {
+            assert(!kernel_copy_from_user(&mm,bytes,0x200000+at,sizeof(bytes),&copied));
+            for (size_t i=0;i<sizeof(bytes);i++) assert(!bytes[i]);
+        }
+        assert(!kernel_vfs_ftruncate(&control->file,8));
+        direct_read_alias();
+    }
     pthread_t actor; assert(!pthread_create(&actor,0,read_and_write,0) && !pthread_join(actor,0));
     mm_test_attach(0); mm_test_activate_task();
     assert(!kernel_files_release(&files));

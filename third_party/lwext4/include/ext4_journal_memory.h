@@ -9,8 +9,17 @@ struct jbd_journal;
 struct jbd_memory;
 struct jbd_image;
 struct ext4_buf;
+/* Allocation accounting is independent of the journal's retention quota.
+ * The callback is bounded/nonblocking; its retained owner can outlive stop. */
+struct jbd_memory_account {
+    void *context;
+    void (*retain)(void *);
+    void (*release)(void *);
+    void (*change)(void *,size_t,bool acquiring);
+};
+void jbd_memory_set_account(struct jbd_memory *,const struct jbd_memory_account *);
 struct jbd_memory_stats {
-    size_t used, peak, limit, cached, reserved;
+    size_t used, peak, limit, cached, reserved, borrowed;
     uint64_t budget_failures;
 };
 
@@ -32,10 +41,11 @@ void jbd_memory_set_grouped(struct jbd_journal *, bool);
 void jbd_memory_set_cache_disabled(struct jbd_journal *, bool);
 unsigned jbd_memory_cached_images(const struct jbd_journal *);
 
-/* Charge reserves capacity atomically, including concurrent preparation.
- * Used bytes remain charged through cache/reader/DMA ownership and disposal. */
-bool jbd_memory_charge(struct jbd_journal *, size_t);
-void jbd_memory_uncharge(struct jbd_journal *, size_t);
+/* A retained external allocation consumes journal quota, but its original
+ * owner accounts its storage. Used includes this borrowed quota and idle cache;
+ * allocation callbacks report only locally owned active storage. */
+bool jbd_memory_borrow(struct jbd_journal *, size_t);
+void jbd_memory_release_borrow(struct jbd_memory *, size_t);
 void jbd_memory_owner_uncharge(struct jbd_memory *, size_t);
 bool jbd_memory_pin_home(struct jbd_journal *, struct ext4_buf *);
 void jbd_memory_unpin_home(struct jbd_journal *, struct ext4_buf *);

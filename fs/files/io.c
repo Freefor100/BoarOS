@@ -212,27 +212,68 @@ static enum kernel_files_status memory_read(
     struct kernel_uaccess_iov_cursor *cursor, uint64_t count,
     uint64_t offset, int advance, int64_t *linux_result)
 {
-    struct kernel_task_io_buffer buffer = {0};
+    struct kernel_uaccess_write_cursor output = {0};
+    struct kernel_vfs_node *node = kernel_open_file_node(description);
     uint64_t total = 0;
     int error = 0;
     if (offset >= kernel_open_file_size(description)) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
-    if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
-        *linux_result = -KERNEL_ENOMEM; KERNEL_FILES_NOTE(files, read_failures, 1);
-        return KERNEL_FILES_STATUS_OK;
-    }
     while (total < count) {
-        size_t chunk = count - total > BOAROS_PAGE_SIZE ? BOAROS_PAGE_SIZE : (size_t)(count - total);
-        size_t available = 0, copied = 0;
-        error = kernel_open_file_pread(description, offset + total, buffer.data, chunk, &available);
-        if (error || !available) break;
-        enum kernel_uaccess_status status = kernel_copy_to_user_iov(mm, cursor, buffer.data, available, &copied);
-        if (advance && kernel_open_file_advance(description, copied) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
-        total += copied;
-        KERNEL_FILES_NOTE(files, read_chunks, 1);
-        if (status == KERNEL_UACCESS_STATUS_FAULT) { error = -KERNEL_EFAULT; break; }
-        if (status != KERNEL_UACCESS_STATUS_OK || copied != available) __builtin_trap();
+        uint64_t destination;
+        size_t chunk=kernel_uaccess_iov_span(cursor,(size_t)(count-total),&destination);
+        if (!chunk) __builtin_trap();
+        uint64_t destination_page=destination & ~(uint64_t)BOAROS_PAGE_MASK;
+        if (!output.pin.registration || output.virtual_page!=destination_page) {
+            kernel_uaccess_write_cursor_finish(&output);
+            enum kernel_uaccess_status status=kernel_uaccess_pin_user_page(mm,destination,KERNEL_MM_WRITE,&output.pin);
+            if (status==KERNEL_UACCESS_STATUS_FAULT) { error=-KERNEL_EFAULT;break; }
+            if (status) __builtin_trap();
+            output.virtual_page=destination_page;
+        }
+        KERNEL_LOCK_SCOPE(source);
+        if (!kernel_vfs_node_try_read(node,&source)) {
+            /* Truncate can own this inode while draining a destination pin
+             * through an mmap alias. Return the pin before waiting for it. */
+            kernel_uaccess_write_cursor_finish(&output);
+            kernel_vfs_node_lock(node,&source,0);
+            continue;
+        }
+        uint64_t position=offset+total,size=kernel_open_file_size(description);
+        if (position>=size) break;
+        size_t within=position & BOAROS_PAGE_MASK;
+        size_t available=BOAROS_PAGE_SIZE-within;
+        if (available>size-position) available=(size_t)(size-position);
+        if (available>count-total) available=(size_t)(count-total);
+        uint64_t physical=0;size_t valid=0;
+        enum kernel_page_cache_status found=kernel_open_file_lookup_page(description,
+            position>>BOAROS_PAGE_SHIFT,&physical,&valid);
+        void *page=NULL;
+        if (!found) {
+            if (within>=valid || available>valid-within || physical_page_map_owned(mm->allocator,physical,&page))
+                __builtin_trap();
+        } else if (found!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND)
+            error=found==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
+        size_t copied=0;
+        while (!error && copied<available) {
+            chunk=kernel_uaccess_iov_span(cursor,available-copied,&destination);
+            if (!chunk) __builtin_trap();
+            /* Both page borrows stay valid across same-page iovec pieces.
+             * End the source qualification before preparing a new user page. */
+            if ((destination & ~(uint64_t)BOAROS_PAGE_MASK)!=output.virtual_page) break;
+            void *target=(unsigned char *)output.pin.page+(destination&BOAROS_PAGE_MASK);
+            if (page) memmove(target,(unsigned char *)page+within+copied,chunk);
+            else memset(target,0,chunk);
+            COST_ADD(COPY_TO_USER,chunk);
+            cursor->offset+=chunk;copied+=chunk;
+            KERNEL_FILES_NOTE(files,read_chunks,1);
+        }
+        kernel_lock_release(&source);
+        if (physical && physical_page_release(mm->allocator,physical)) __builtin_trap();
+        if (error) break;
+        if (!copied) __builtin_trap();
+        if (advance && kernel_open_file_advance(description,copied) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+        total+=copied;
     }
-    kernel_task_io_buffer_release(&buffer);
+    kernel_uaccess_write_cursor_finish(&output);
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
     KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = total ? (int64_t)total : error;
@@ -299,6 +340,8 @@ static enum kernel_files_status disk_read(
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     while (total < request && !done) {
+        uint64_t batch_start=position;
+        int cache_miss=0;
         size_t start = position & BOAROS_PAGE_MASK;
         size_t count = (start + request - total + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
         if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
@@ -330,7 +373,9 @@ static enum kernel_files_status disk_read(
             if (copied > chunk || (advance && kernel_open_file_advance(description, copied))) {
                 status = KERNEL_FILES_STATUS_STATE; done = 1; break;
             }
-            kernel_open_file_read_progress(description, position, copied);
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            if (copied && part->cache_miss) cache_miss=1;
+#endif
             total += copied; position += copied;
             if (access == KERNEL_UACCESS_STATUS_FAULT) {
                 error = -KERNEL_EFAULT; done = 1; break;
@@ -341,6 +386,8 @@ static enum kernel_files_status disk_read(
             if (part->valid_bytes < BOAROS_PAGE_SIZE) { done = 1; break; }
             start = 0;
         }
+        /* 预测以整个需求批次的成功前缀为单位，避免将大读误作逐页小读。 */
+        kernel_open_file_read_progress(description,batch_start,(size_t)(position-batch_start),cache_miss);
         /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
         kernel_uaccess_write_cursor_finish(&user_copy);
         for (size_t i = 0; i < count; i++) if (!pages[i].status)
@@ -1059,9 +1106,18 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             size_t offset=position&BOAROS_PAGE_MASK,valid;
             kernel_open_file_read_begin(input,position);
             int memory=kernel_open_file_memory_backed(input);
-            enum kernel_page_cache_status loaded=memory
-                ?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid)
-                :kernel_open_file_get_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid);
+            int cache_miss=0;
+            enum kernel_page_cache_status loaded;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            if (!memory) {
+                struct kernel_page_cache_read_page page;
+                loaded=kernel_page_cache_get_batch(kernel_open_file_page_cache(input),&input->file,
+                    position>>BOAROS_PAGE_SHIFT,&page,1);
+                if (!loaded) {physical=page.physical_address;valid=page.valid_bytes;cache_miss=page.cache_miss;}
+            } else
+#endif
+                loaded=memory?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid):
+                    kernel_open_file_get_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid);
             if (loaded==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND && memory) {
                 uint64_t size=kernel_open_file_size(input);
                 if (position>=size) break;
@@ -1087,7 +1143,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
                     error=loaded==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
                 break;
             }
-            kernel_open_file_read_progress(input,position,available);
+            kernel_open_file_read_progress(input,position,available,cache_miss);
         } else {
             /* 文件目标保留分离的读写版本，允许同inode及重叠区间复制。 */
             error=kernel_open_file_pread(input,start+total,staging,wanted,&available);
@@ -1375,147 +1431,167 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
 /* The existing task scratch holds page references, not another payload copy. */
 struct tcp_user_batch {
     struct kernel_mm_user_pin pins[4];
+    uint64_t pages[4];
     struct kernel_socket_write_segment segments[4];
 };
 _Static_assert(sizeof(struct tcp_user_batch) <= BOAROS_PAGE_SIZE, "TCP pin workspace");
 
 static int tcp_write_user_batch(struct kernel_mm *mm,
     struct kernel_socket_write_request *request, struct kernel_task_io_buffer *workspace,
-    uint64_t address, uint32_t size, uint32_t flags, int *fault)
+    struct kernel_uaccess_iov_cursor *cursor,uint32_t size,uint32_t flags,int *fault)
 {
-    if (!workspace->allocator && kernel_task_io_buffer_acquire(workspace, mm->allocator) != KERNEL_TASK_STATUS_OK)
+    if (!workspace->allocator && kernel_task_io_buffer_acquire(workspace,mm->allocator)!=KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
-    struct tcp_user_batch *batch = workspace->data;
-    unsigned count = 0;
-    uint32_t prepared = 0;
-    int result = 0;
-    while (prepared < size) {
-        if (kernel_user_range_check(address + prepared, 1) != KERNEL_UACCESS_STATUS_OK) {
-            *fault = 1;
-            if (!prepared) result = -KERNEL_EFAULT;
-            break;
+    struct tcp_user_batch *batch=workspace->data;
+    struct kernel_uaccess_iov_cursor gather=*cursor;
+    unsigned pins=0,segments=0;
+    uint32_t prepared=0;
+    int result=0;
+    while (prepared<size) {
+        uint64_t address;
+        size_t length=kernel_uaccess_iov_span(&gather,size-prepared,&address);
+        if (!length) __builtin_trap();
+        uint64_t page=address & ~(uint64_t)BOAROS_PAGE_MASK;
+        unsigned index=0;
+        while (index<pins && batch->pages[index]!=page) index++;
+        if (index==pins) {
+            if (pins==4 || segments==4) break;
+            struct kernel_mm_user_pin *pin=&batch->pins[pins];
+            *pin=(struct kernel_mm_user_pin){0};
+            enum kernel_uaccess_status access;
+            if (!pins) access=kernel_uaccess_pin_user_page(mm,address,KERNEL_MM_READ,pin);
+            else {
+                /* An editor can be draining earlier pins. Submit their prefix
+                 * before faulting or waiting for the next mapping. */
+                COST_ADD(USER_RESOLUTIONS,1);COST_IO_ADD(4,1);
+                enum kernel_mm_status status=kernel_mm_pin_user_page(mm,address,KERNEL_MM_READ,pin);
+                if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ||
+                    status==KERNEL_MM_STATUS_CONFLICT || status==KERNEL_MM_STATUS_ADDRESS_SPACE ||
+                    status==KERNEL_MM_STATUS_BUS_FAULT || status==KERNEL_MM_STATUS_NO_MEMORY) break;
+                if (status) __builtin_trap();
+                access=KERNEL_UACCESS_STATUS_OK;
+            }
+            if (access) {
+                if (access!=KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
+                *fault=1;if (!prepared) result=-KERNEL_EFAULT;break;
+            }
+            batch->pages[pins++]=page;
         }
-        struct kernel_mm_user_pin *pin = &batch->pins[count];
-        *pin = (struct kernel_mm_user_pin){0};
-        enum kernel_uaccess_status access;
-        if (!count) access = kernel_uaccess_pin_user_page(mm, address, KERNEL_MM_READ, pin);
+        const void *data=(const unsigned char *)batch->pins[index].page+(address&BOAROS_PAGE_MASK);
+        struct kernel_socket_write_segment *last=segments?&batch->segments[segments-1]:NULL;
+        uintptr_t page_address=(uintptr_t)batch->pins[index].page;
+        /* Adjacent iovecs in one pinned page share a protocol fragment too. */
+        if (last && (uintptr_t)last->data>=page_address &&
+            (uintptr_t)last->data-page_address<BOAROS_PAGE_SIZE &&
+            (const unsigned char *)last->data+last->size==data) last->size+=(uint32_t)length;
         else {
-            /* A mapping editor may be draining our earlier pins. Never fault
-             * or wait for its gate with that debt: submit the resident prefix. */
-            COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
-            enum kernel_mm_status status = kernel_mm_pin_user_page(mm, address + prepared, KERNEL_MM_READ, pin);
-            if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS ||
-                status == KERNEL_MM_STATUS_CONFLICT || status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
-                status == KERNEL_MM_STATUS_BUS_FAULT || status == KERNEL_MM_STATUS_NO_MEMORY) break;
-            if (status != KERNEL_MM_STATUS_OK) __builtin_trap();
-            access = KERNEL_UACCESS_STATUS_OK;
+            if (segments==4) break;
+            batch->segments[segments++]=(struct kernel_socket_write_segment){data,(uint32_t)length};
         }
-        if (access != KERNEL_UACCESS_STATUS_OK) {
-            if (access != KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
-            *fault = 1;
-            if (!prepared) result = -KERNEL_EFAULT;
-            break;
-        }
-        uint32_t offset = (uint32_t)((address + prepared) & BOAROS_PAGE_MASK);
-        uint32_t length = BOAROS_PAGE_SIZE - offset;
-        if (length > size - prepared) length = size - prepared;
-        batch->segments[count++] = (struct kernel_socket_write_segment){(const unsigned char *)pin->page + offset, length};
-        prepared += length;
+        prepared+=(uint32_t)length;gather.offset+=length;
     }
-    /* All page preparation precedes protocol ownership. Only this bounded
-     * accepted batch pins user pages; EAGAIN returns them before socket wait. */
-    if (prepared) result = kernel_socket_stream_commitv(request, batch->segments, count, flags);
-    while (count) kernel_mm_unpin_user_page(&batch->pins[--count]);
+    if (prepared) result=kernel_socket_stream_commitv(request,batch->segments,segments,
+        flags|((!*fault && prepared<size)?KERNEL_SOCKET_IO_MORE:0));
+    while (pins) kernel_mm_unpin_user_page(&batch->pins[--pins]);
+    /* The protocol may accept only part of the prepared vector. Descriptor
+     * preparation never advances the caller's completed prefix. */
+    if (result>0) {
+        unsigned left=(unsigned)result;
+        if (left>prepared) __builtin_trap();
+        while (left) {
+            uint64_t address;size_t length=kernel_uaccess_iov_span(cursor,left,&address);
+            if (!length) __builtin_trap();
+            cursor->offset+=length;left-=(unsigned)length;
+        }
+    }
     return result;
 }
 
-static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
-    struct kernel_files *files, struct kernel_mm *mm,
-    struct kernel_open_file_description *description,
-    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
-    uint32_t flags, int64_t *linux_result)
+/* Coalesce only when one page would need more protocol fragments than the
+ * direct workspace can retain. A contiguous vector keeps the pinned path. */
+static int tcp_fragmented_prefix(struct kernel_uaccess_iov_cursor cursor,uint64_t remaining)
 {
-    struct kernel_open_file_description *borrowed = description;
-    struct kernel_socket *socket = kernel_open_file_socket(description);
-    struct kernel_socket_write_request request = {0};
-    struct kernel_task_io_buffer buffer = {0};
-    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
-    enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
-    uint64_t total = 0, target = 0, timeout = (flags & KERNEL_SOCKET_MSG_DONTWAIT) ? 0 : kernel_socket_send_timeout(socket);
-    size_t staged = 0, consumed = 0;
-    int fault = 0;
-    const int direct = iov_count == 1;
-    if (timeout) {
-        uint64_t now = kernel_time_monotonic_ns();
-        target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+    if (cursor.count-cursor.index<=4) return 0;
+    size_t limit=remaining<BOAROS_PAGE_SIZE?(size_t)remaining:BOAROS_PAGE_SIZE;
+    uint64_t end=0;unsigned runs=0;
+    while (limit) {
+        uint64_t address;size_t length=kernel_uaccess_iov_span(&cursor,limit,&address);
+        if (!length) __builtin_trap();
+        if ((!runs || address!=end) && ++runs>4) return 1;
+        end=address+length;cursor.offset+=length;limit-=length;
     }
-    kernel_socket_stream_begin(&request, &description);
+    return 0;
+}
+
+static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
+    struct kernel_files *files,struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,
+    uint32_t flags,int64_t *linux_result)
+{
+    struct kernel_open_file_description *borrowed=description;
+    struct kernel_socket *socket=kernel_open_file_socket(description);
+    struct kernel_socket_write_request request={0};
+    struct kernel_task_io_buffer buffer={0};
+    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
+    enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
+    uint64_t total=0,target=0,timeout=(flags&KERNEL_SOCKET_MSG_DONTWAIT)?0:kernel_socket_send_timeout(socket);
+    int fault=0;
+    size_t staged=0,consumed=0;
+    if (timeout) {
+        uint64_t now=kernel_time_monotonic_ns();
+        target=UINT64_MAX-now<timeout?UINT64_MAX:now+timeout;
+    }
+    kernel_socket_stream_begin(&request,&description);
     do {
-        size_t chunk = staged - consumed;
+        int compact=staged>consumed || tcp_fragmented_prefix(cursor,count-total);
+        size_t chunk=staged-consumed;
         if (!chunk && count) {
-            chunk=count-total<BOAROS_PAGE_SIZE?(size_t)(count-total):BOAROS_PAGE_SIZE;
+            uint64_t address;
+            if (!kernel_uaccess_iov_span(&cursor,1,&address)) __builtin_trap();
+            size_t limit=compact?BOAROS_PAGE_SIZE:4*BOAROS_PAGE_SIZE-(address&BOAROS_PAGE_MASK);
+            chunk=count-total<limit?(size_t)(count-total):limit;
         }
-        uint64_t address = 0;
-        if (direct && count) {
-            address = iov[0].base + cursor.offset;
-            size_t limit = 4 * BOAROS_PAGE_SIZE - (address & BOAROS_PAGE_MASK);
-            chunk = count - total < limit ? (size_t)(count - total) : limit;
-        }
-        int result = kernel_socket_stream_reserve(&request, (uint32_t)chunk, flags);
-        size_t copied_now = 0;
-        if (result >= 0) {
-            if (!count) { *linux_result = 0; break; }
-            if (!result || (size_t)result > chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
-            chunk = (size_t)result;
-            if (direct) {
-                result = tcp_write_user_batch(mm, &request, &buffer, address, (uint32_t)chunk,
-                    flags | ((total + chunk < count) ? KERNEL_SOCKET_IO_MORE : 0), &fault);
-            } else {
-                if (staged == consumed) {
-                    if (!buffer.allocator) {
-                        if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
-                            *linux_result = total ? (int64_t)total : -KERNEL_ENOMEM; break;
-                        }
-                        COST_IO_ADD(5, BOAROS_PAGE_SIZE);
+        int result=kernel_socket_stream_reserve(&request,(uint32_t)chunk,flags);
+        if (result>=0) {
+            if (!count) { *linux_result=0;break; }
+            if (!result || (size_t)result>chunk) { status=KERNEL_FILES_STATUS_STATE;break; }
+            chunk=(size_t)result;
+            if (!compact) result=tcp_write_user_batch(mm,&request,&buffer,&cursor,(uint32_t)chunk,
+                flags|((total+chunk<count)?KERNEL_SOCKET_IO_MORE:0),&fault);
+            else {
+                if (staged==consumed) {
+                    if (!buffer.allocator && kernel_task_io_buffer_acquire(&buffer,mm->allocator)!=KERNEL_TASK_STATUS_OK) {
+                        *linux_result=total?(int64_t)total:-KERNEL_ENOMEM;break;
                     }
-                    KERNEL_FILES_NOTE(files, write_chunks, 1);
-                    enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
-                        buffer.data, chunk, &copied_now);
-                    if ((access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT) ||
-                        copied_now > chunk || (access == KERNEL_UACCESS_STATUS_OK && copied_now != chunk)) {
-                        status = KERNEL_FILES_STATUS_STATE; break;
-                    }
-                    fault = access == KERNEL_UACCESS_STATUS_FAULT;
-                    if (!copied_now) { *linux_result = total ? (int64_t)total : -KERNEL_EFAULT; break; }
-                    staged = copied_now; consumed = 0; chunk = copied_now;
+                    size_t copied=0;
+                    enum kernel_uaccess_status access=kernel_copy_from_user_iov(mm,&cursor,buffer.data,chunk,&copied);
+                    if ((access!=KERNEL_UACCESS_STATUS_OK && access!=KERNEL_UACCESS_STATUS_FAULT) ||
+                        copied>chunk || (!access && copied!=chunk)) {status=KERNEL_FILES_STATUS_STATE;break;}
+                    fault=access==KERNEL_UACCESS_STATUS_FAULT;
+                    if (!copied) {*linux_result=total?(int64_t)total:-KERNEL_EFAULT;break;}
+                    staged=copied;consumed=0;chunk=copied;
                 }
-                result = kernel_socket_stream_commit(&request,
-                    (const unsigned char *)buffer.data + consumed, (uint32_t)chunk,
-                    flags|((!fault && total+chunk<count)?KERNEL_SOCKET_IO_MORE:0));
+                result=kernel_socket_stream_commit(&request,(const unsigned char *)buffer.data+consumed,
+                    (uint32_t)chunk,flags|((!fault && total+chunk<count)?KERNEL_SOCKET_IO_MORE:0));
             }
         }
-        if (result == -KERNEL_EAGAIN && !(flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
-            if (!total) COST_ADD(STREAM_COPY_BLOCKED_BYTES, copied_now);
-            uint64_t now = target ? kernel_time_monotonic_ns() : 0;
-            result = target && now >= target ? -KERNEL_EAGAIN : kernel_socket_wait_ready(kernel_open_file_socket(borrowed),
-                KERNEL_POLLOUT, target, flags);
-            if (!result) continue; /* gather保留暂存尾部；单iov重新pin未接纳的来源。 */
-            if (total && result == -KERNEL_ERESTARTSYS)
-                kernel_signal_clear_syscall_restart(kernel_task_current());
+        if (result==-KERNEL_EAGAIN && !(flags&KERNEL_SOCKET_MSG_DONTWAIT)) {
+            uint64_t now=target?kernel_time_monotonic_ns():0;
+            result=target && now>=target?-KERNEL_EAGAIN:kernel_socket_wait_ready(
+                kernel_open_file_socket(borrowed),KERNEL_POLLOUT,target,flags);
+            if (!result) continue;
+            if (total && result==-KERNEL_ERESTARTSYS) kernel_signal_clear_syscall_restart(kernel_task_current());
         }
-        if (result < 0) { *linux_result = total ? (int64_t)total : result; break; }
-        if (!result || (size_t)result > (direct ? chunk : staged - consumed)) {
-            status = KERNEL_FILES_STATUS_STATE; break;
-        }
-        if (direct) {
-            cursor.offset += (size_t)result;
-            KERNEL_FILES_NOTE(files, write_chunks, 1);
-            COST_ADD(COPY_FROM_USER, result); COST_IO_ADD(3, result);
-        } else consumed += (size_t)result;
-        total += (uint64_t)result;
-        *linux_result = (int64_t)total;
-        if (fault || ((direct ? (size_t)result < chunk : consumed < staged) && (flags & KERNEL_SOCKET_MSG_DONTWAIT))) break;
-    } while (total < count);
+        if (result<0) { *linux_result=total?(int64_t)total:result;break; }
+        if (!result || (size_t)result>chunk) { status=KERNEL_FILES_STATUS_STATE;break; }
+        if (compact) consumed+=(size_t)result;
+        KERNEL_FILES_NOTE(files,write_chunks,1);
+        /* Compact copying was already charged by the common uaccess helper. */
+        if (!compact) {COST_ADD(COPY_FROM_USER,result);COST_IO_ADD(3,result);}
+        total+=(uint64_t)result;*linux_result=(int64_t)total;
+        if (fault || ((size_t)result<chunk && (flags&KERNEL_SOCKET_MSG_DONTWAIT))) break;
+    } while (total<count);
     kernel_socket_stream_finish(&request);
     if (buffer.allocator) kernel_task_io_buffer_release(&buffer);
     return status;

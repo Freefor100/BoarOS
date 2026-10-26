@@ -807,9 +807,9 @@ static void run_rename_path_regression(struct kernel_vfs_mount *mount,
         moved.path != source.path ||
         !kernel_vfs_files_share_node(&moved, &source) ||
         kernel_vfs_files_share_node(&moved, &target) ||
-        kernel_vfs_pread(&target, 0, data, sizeof(data), &count) || count != 3 ||
+        kernel_vfs_pread(&target, 0, data, sizeof(data), &count, NULL) || count != 3 ||
         memcmp(data, "old", 3) ||
-        kernel_vfs_pread(&moved, 0, data, sizeof(data), &count) || count != 3 ||
+        kernel_vfs_pread(&moved, 0, data, sizeof(data), &count, NULL) || count != 3 ||
         memcmp(data, "new", 3) ||
         kernel_vfs_path_string(target.path, root, name, sizeof(name)) !=
             -KERNEL_ENOENT ||
@@ -917,14 +917,14 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_pwrite(&second, 0, "second", 6, &count) || count != 6 ||
         kernel_vfs_open(mount, "/wb-first", &alias) ||
         kernel_vfs_fstat(&alias, &stat) || stat.size != 5 ||
-        kernel_vfs_pread(&alias, 0, result, sizeof(result), &count) ||
+        kernel_vfs_pread(&alias, 0, result, sizeof(result), &count, NULL) ||
         count != 5 || !bytes_equal((unsigned char *)result, "first", 5))
         fail_vfs(70, 0, -1);
     if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first), NULL) || ext4_fsize(&raw) != 0 ||
         ext4_fclose(&raw)) fail_vfs(71, 0, -1);
     struct kernel_vfs_file clean = {0};
     if (kernel_vfs_open(mount, "/init", &clean) ||
-        kernel_vfs_pread(&clean, 0, result, 1, &count) || count != 1 ||
+        kernel_vfs_pread(&clean, 0, result, 1, &count, NULL) || count != 1 ||
         kernel_vfs_close(&clean)) fail_vfs(76, 0, -1);
     /* Reclaim at a live lwext4 allocation boundary may release clean pages,
      * but cannot reenter the backend through dirty VFS pages. */
@@ -1260,7 +1260,7 @@ static void run_vfs_test(const void *dtb)
                               file.size,
                               buffer,
                               sizeof(buffer),
-                              &read_count);
+                              &read_count, NULL);
     if (result != 0 || read_count != 0U) {
         fail_vfs(9U, 0, result);
     }

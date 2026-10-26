@@ -21,6 +21,63 @@ static int loop_test_ioctl(struct kernel_files *local,int fd,uint64_t command,ui
 }
 static void loop_test_close(struct kernel_files *local,int fd)
 { int64_t result;assert(!kernel_files_close(local,fd,&result) && !result); }
+static int loop_phase_span(const void *end,const void **cursor,struct kernel_block_span *out)
+{
+    const struct kernel_block_span *span=*cursor;
+    if (span==end) return 0;
+    *out=*span;*cursor=span+1;return 1;
+}
+static void loop_batch_case(void)
+{
+    struct kernel_block_device *device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(0));
+    assert(device && device->read_batch && device->write_batch && device->write_phase);
+    unsigned char source[2048],actual[2048];
+    for (size_t i=0;i<sizeof(source);i++) source[i]=(unsigned char)(i*13+29);
+    struct kernel_block_span spans[]={
+        {4096,source,512},{4608,source+512,512},{8192,source+1024,1024}};
+    assert(!kernel_block_write_batch(device,spans,3));
+    struct block_read_span reads[]={
+        {.offset=8192,.buffer=actual+1024,.size=1024},
+        {.offset=4096,.buffer=actual,.size=512},
+        {.offset=4608,.buffer=actual+512,.size=512}};
+    assert(!kernel_block_read_batch(device,reads,3,NULL));
+    for (unsigned i=0;i<3;i++) assert(!reads[i].status && reads[i].completed==reads[i].size);
+    assert(!memcmp(source,actual,sizeof(source)));
+    memset(source,0x8d,sizeof(source));
+    assert(!kernel_block_write_phase(device,loop_phase_span,spans+3,spans));
+    assert(!kernel_block_flush(device));memset(actual,0,sizeof(actual));
+    assert(!kernel_block_read_batch(device,reads,3,NULL) && !memcmp(source,actual,sizeof(source)));
+    kernel_block_put(device);
+    puts("PASS loop batch/phase: scattered targets and completed prefixes survive original FD close/unlink");
+}
+static void loop_batch_short_backing(struct kernel_vfs_mount *mount,
+    struct kernel_files *local,struct kernel_fs_context *local_fs)
+{
+    int backing=loop_test_open(local,local_fs,"/batch-short",0102|2);
+    int64_t result;
+    assert(backing>=0 && !kernel_files_ftruncate(local,backing,4096,&result) && !result);
+    int loop=loop_test_open(local,local_fs,"/loop0",2);assert(loop>=0);
+    assert(!loop_test_ioctl(local,loop,0x4c00,backing));
+    /* Capacity remains at its binding snapshot; the real file now ends in
+     * the second requested range. Later independent spans must still run. */
+    assert(!kernel_files_ftruncate(local,backing,768,&result) && !result);
+    struct kernel_block_device *device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(0));
+    unsigned char data[1536];memset(data,0x9a,sizeof(data));
+    struct block_read_span spans[]={
+        {.offset=0,.buffer=data,.size=512},
+        {.offset=512,.buffer=data+512,.size=512},
+        {.offset=0,.buffer=data+1024,.size=512}};
+    assert(kernel_block_read_batch(device,spans,3,NULL)==KERNEL_BLOCK_STATUS_IO);
+    assert(!spans[0].status && spans[0].completed==512 &&
+           spans[1].status==KERNEL_BLOCK_STATUS_IO && spans[1].completed==256 &&
+           !spans[2].status && spans[2].completed==512);
+    for (unsigned i=0;i<sizeof(data);i++) assert(data[i]==(i>=768 && i<1024?0x9a:0));
+    kernel_block_put(device);
+    assert(!loop_test_ioctl(local,loop,0x4c01,0));loop_test_close(local,loop);
+    assert(kernel_loop_release_unused()>=0);loop_test_close(local,backing);
+    assert(!kernel_vfs_unlink(mount,"/batch-short"));
+    puts("PASS loop batch short backing: exact copied prefix, untouched suffix, later span and owner return");
+}
 static int loop_backing_image(struct kernel_files *local,struct kernel_fs_context *local_fs,
     const char *path,const char *image_path)
 {
@@ -41,6 +98,32 @@ static int loop_backing_image(struct kernel_files *local,struct kernel_fs_contex
     assert(!kernel_files_pin_data(local,fd,&file,&result) && !result);
     assert(!kernel_vfs_pwrite(&file->file,0,bytes,st.st_size,&done) && done==(size_t)st.st_size);
     assert(!kernel_open_file_release(&file));free(bytes);return fd;
+}
+static void loop_dirty_notification(struct kernel_page_cache *cache,
+    struct kernel_vfs_mount *mount,struct kernel_block_device *device,const char *image)
+{
+    assert(!kernel_block_flush(device));
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_page_cache_start_worker(cache));
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_writeback_statistics state;
+    kernel_writeback_domain_snapshot(&instance->writeback,&state);
+    assert(!state.dirty_bytes);
+    size_t bytes=((state.high_bytes+BOAROS_PAGE_SIZE-1)&~BOAROS_PAGE_MASK)+2*BOAROS_PAGE_SIZE;
+    unsigned char *data=malloc(bytes);assert(data);
+    int source=open(image,O_RDONLY);assert(source>=0);
+    assert(read(source,data,bytes)==(ssize_t)bytes && !close(source));
+    assert(!kernel_block_write_at(device,0,data,bytes));free(data);
+    struct timespec now;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
+    time_t deadline=now.tv_sec+3;
+    do {
+        kernel_writeback_domain_snapshot(&instance->writeback,&state);
+        if(state.dirty_bytes<=state.low_bytes)break;
+        sched_yield();assert(!clock_gettime(CLOCK_MONOTONIC,&now));
+    } while(now.tv_sec<deadline);
+    assert(state.dirty_bytes<=state.low_bytes);
+    assert(!kernel_block_flush(device));
+    puts("PASS raw loop write wakes backing dirty-pressure worker without caller fsync");
 }
 static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_files *local,struct kernel_fs_context *local_fs)
@@ -96,10 +179,19 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     int second=loop_test_open(local,local_fs,"/loop1",2);assert(second>=0);
     assert(!loop_test_ioctl(local,second,0x4c00,backing));loop_test_close(local,backing);
     device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(1));assert(device);
+    loop_dirty_notification(&caches[0],&children[0],device,inner_path);
     assert(!kernel_page_cache_init(&caches[1],heap,heap->page_allocator));
-    assert(!kernel_vfs_mount_ext4(&children[1],device,heap,&caches[1],0));kernel_block_put(device);
+    int inner_result=kernel_vfs_mount_ext4(&children[1],device,heap,&caches[1],0);
+    if (inner_result) fprintf(stderr,"inner loop mount error=%d available=%llu\n",inner_result,
+        (unsigned long long)physical_page_available(heap->page_allocator));
+    assert(!inner_result);kernel_block_put(device);
     assert(!kernel_page_cache_start_worker(&caches[1]));
     assert(!kernel_vfs_start_journal_worker(&children[1]));
+    struct kernel_vfs_instance *first_instance=children[0].private_data,*second_instance=children[1].private_data;
+    assert(first_instance->writeback.domain==second_instance->writeback.domain);
+    struct kernel_writeback_statistics pressure;
+    kernel_writeback_domain_snapshot(&first_instance->writeback,&pressure);assert(!pressure.physical);
+
     struct kernel_vfs_file file={0};size_t done;uint64_t observed=0;
     assert(!kernel_vfs_create(&children[1],"/payload",0600,&file));
     assert(!kernel_vfs_pwrite(&file,0,"nested-loop-durable",19,&done) && done==19);
@@ -108,7 +200,7 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     struct kernel_page_cache_concurrency_state before_read,after_read;
     kernel_page_cache_get_concurrency_state(&caches[1],&before_read);
     mm_test_attach(1);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
-    char actual[19];assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done) &&
+    char actual[19];assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&done, NULL) &&
         done==sizeof(actual) && !memcmp(actual,"nested-loop-durable",sizeof(actual)));
     assert(kernel_cpu_current()->logical_id==1);
     kernel_page_cache_get_concurrency_state(&caches[1],&after_read);
@@ -137,7 +229,7 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     uint64_t size=kernel_vfs_file_size(&saved);
     for (uint64_t offset=0;offset<size;offset+=done) {
         size_t chunk=size-offset<65536?(size_t)(size-offset):65536;
-        assert(!kernel_vfs_pread(&saved,offset,buffer,chunk,&done) && done==chunk);
+        assert(!kernel_vfs_pread(&saved,offset,buffer,chunk,&done, NULL) && done==chunk);
         assert(write(destination,buffer,done)==(ssize_t)done);
     }
     free(buffer);assert(!fsync(destination) && !close(destination) && !kernel_vfs_close(&saved));
@@ -265,6 +357,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     assert(!loop_test_ioctl(&local,loop,0x4c00,backing));
     /* Binding must retain the real OFD after both namespace and fd owners go. */
     loop_test_close(&local,backing);assert(!kernel_vfs_unlink(mount,"/loop-backing"));
+    loop_batch_case();
     size_t copied;assert(!kernel_copy_to_user(&mm,0x200200,"loop-data",9,&copied));
     assert(!kernel_files_pwrite(&local,&mm,loop,0x200200,9,509,&result) && result==9);
     assert(!kernel_files_sync(&local,loop,0,&result) && !result);
@@ -304,6 +397,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     loop_test_close(&local,unbound);loop_test_close(&local,loop);
     loop_readonly_case(&local,&local_fs);
     loop_partial_sector_case(mount,&local,&local_fs);
+    loop_batch_short_backing(mount,&local,&local_fs);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c80,12)==12);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c81,12)==0);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c82,0)==0);

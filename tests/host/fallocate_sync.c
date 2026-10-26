@@ -122,7 +122,7 @@ static void residual_orphan_shutdown(struct kernel_heap *heap,struct kernel_heap
     struct kernel_vfs_file restored={0}; struct kernel_vfs_stat stat;
     assert(!kernel_vfs_open(&mount,"/residual-shrink",&restored) && !kernel_vfs_fstat(&restored,&stat));
     assert(stat.size==4096 && stat.blocks==8);
-    assert(!kernel_vfs_pread(&restored,0,bytes,4096,&done) && done==4096);
+    assert(!kernel_vfs_pread(&restored,0,bytes,4096,&done, NULL) && done==4096);
     for (size_t i=0;i<done;i++) assert(bytes[i]==0x4d);
     assert(!kernel_vfs_close(&restored) && !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
     puts("PASS residual orphan shutdown: cleanup accepted and checkpointed with live workers; final stop, remount, prefix and block return");

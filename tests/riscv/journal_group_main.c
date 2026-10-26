@@ -170,7 +170,7 @@ static void exercise_nojournal_times(struct lwext4_mount_adapter *adapter)
     struct kernel_vfs_stat expected, observed;
     size_t count=0;
     check(kernel_vfs_open(&mount,"/background-atime",&file)==0 &&
-        kernel_vfs_pread(&file,0,actual,1,&count)==0 && count==1 && actual[0]=='R',65);
+        kernel_vfs_pread(&file,0,actual,1,&count, NULL)==0 && count==1 && actual[0]=='R',65);
     struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
     uint32_t inode=node->inode;
     uint32_t block_size=ext4_sb_get_block_size(adapter->superblock);
@@ -276,7 +276,7 @@ static void exercise(void *argument)
     kernel_thread_join(&reader);
     for(unsigned page=0;page<128;page++) {
         memset(bytes,(int)(page+1),sizeof(bytes));
-        check(kernel_vfs_pread(&file,(uint64_t)page*sizeof(bytes),actual,sizeof(actual),&count)==0 && count==sizeof(actual) && !memcmp(bytes,actual,sizeof(bytes)),25);
+        check(kernel_vfs_pread(&file,(uint64_t)page*sizeof(bytes),actual,sizeof(actual),&count, NULL)==0 && count==sizeof(actual) && !memcmp(bytes,actual,sizeof(bytes)),25);
     }
     const struct kernel_vfs_timespec old_times[2]={{1,0},{1,0}};
     check(kernel_vfs_file_set_times(&file,old_times)==0,46);

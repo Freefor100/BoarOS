@@ -30,7 +30,7 @@ IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的
 
 读预约持有 OFD 和固定队列前缀，用户复制在保护外完成。finish 在 IRQ 开启时找到消费边界，短临界区一次摘下前缀，并把原 packet 与接收窗口额度转交已有 worker。worker 在协议保护内归还 pbuf 和 `tcp_recved`；最后关闭也排空这些实际引用。RX loan 因此一直保留到 pbuf 最后归还，不能在用户复制完成前复用 DMA 缓冲。AF_UNIX 载荷在端点临界区外释放；关闭清理结束后才把发送者的末次释放权交给剩余 packet。
 
-TCP 发送先在端点保护内预约额度，复用任务 scratch 保存最多四页的 pin 与片段描述，不暂存载荷。首个页可缺页；后续只接纳已驻留页，遇到缺页、撤权或关闭许可就提交已固定前缀，归还全部 pin 后继续。一次协议资格处理整个批次。远端调用或 CPU0 协议忙时，同一个栈请求进入 socket 的现有工作集合，由已有 worker 执行 COPY；调用者等到实际接纳或错误完成后才归还 pin。没有每页一次的 FIFO mutex 交接，也没有新增执行线程。发送预约在 COPY 完成前保留，其他发送者不能重复占用同一额度；worker 将异步错误和 SIGPIPE 交付给原调用者。同一请求队列还承载 UDP 的真实 pbuf 准备、发送、归还及 TCP 延迟输出；载荷由调用者直接填入最终对象。实际写请求在端点活动链中保持到全部协议阶段完成，停止时先拒绝新接纳，向包括空队列读者在内的 INET 等待者发布 EIO 并通知，借用实际 OFD 等待活动读写归还。worker 通知在端点锁内取得真实 progress 队列游标，锁外只投递该游标；撤下通知入口后排空已捕获的队列借用，再停止原 worker，通知不再保存网络对象的裸 context。设备在途 DMA 仍由原 quiesce／loan 协议确认。
+TCP 发送先在端点保护内预约额度，连续输入复用任务 scratch 保存最多四页的 pin 与片段描述。若一页输入含超过四段不连续地址，复用该页合并载荷，减少远端协议请求；部分接纳时保留尚未提交的暂存前缀。首个页可缺页；后续只接纳已驻留页，遇到缺页、撤权或关闭许可就提交已固定前缀，归还全部 pin 后继续。一次协议资格处理整个批次。远端调用或 CPU0 协议忙时，同一个栈请求进入 socket 的现有工作集合，由已有 worker 执行 COPY；调用者等到实际接纳或错误完成后才归还 pin。没有每页一次的 FIFO mutex 交接，也没有新增执行线程。发送预约在 COPY 完成前保留，其他发送者不能重复占用同一额度；worker 将异步错误和 SIGPIPE 交付给原调用者。同一请求队列还承载 UDP 的真实 pbuf 准备、发送、归还及 TCP 延迟输出；载荷由调用者直接填入最终对象。实际写请求在端点活动链中保持到全部协议阶段完成，停止时先拒绝新接纳，向包括空队列读者在内的 INET 等待者发布 EIO 并通知，借用实际 OFD 等待活动读写归还。worker 通知在端点锁内取得真实 progress 队列游标，锁外只投递该游标；撤下通知入口后排空已捕获的队列借用，再停止原 worker，通知不再保存网络对象的裸 context。设备在途 DMA 仍由原 quiesce／loan 协议确认。
 
 socket 在最终 OFD 释放时取得协议资格，先摘除弱引用工作链并解除 PCB 回调。跨用户复制和待执行请求持有实际 OFD/pin，因此 worker 借用的对象不会被提前销毁。队列只在从无工作变为有工作时通知 worker；容量、接收归还、loopback 与期限使用各自的原有通知来源。
 
@@ -47,7 +47,7 @@ TCP 的一批 COPY 保持完整发送预约，协议 owner 在批末一次发布
 
 普通 socket read/readv 使用“预留当前队列前缀→锁外复制→一次提交/取消”。STREAM 预留把当前可读 packet 的总字节数截到用户容量，队首借用与固定字节数限定本次稳定版本；成功提交后本次读调用返回该前缀，后来追加的数据与排在前缀之后的协议错误留给下次调用。请求直接遍历 packet/pbuf 链写入用户 iovec，复用现有用户页写游标，换页及退出前归还 pin，不增加接收中转页。预留与提交只修改端点状态，不取得协议资格；取消仍由请求归还 OFD pin。跨包复制故障只提交此前完整复制成功的 packet 前缀并返回短读，故障 packet 保留；UDP 仍只预留一个数据报、按用户容量截断，复制故障仍丢弃该数据报。零长度数据报也完成 reservation，TCP EOF 没有 reservation。
 
-TCP 单 iovec 发送在容量接纳后、raw 保护外准备最多四个用户页，批量片段直接交给 `tcp_write(COPY)`，实际接纳或错误完成后归还 pin；协议持有 ACK 前的复制版本。ERR_MEM 后先 unpin 再等待，重试重新读取尚未接纳的来源，允许其他用户线程修改或替换映射。多 iovec 发送仍跨用户页与 iovec gather 到一个原生页，避免每个小 iovec 独立调用协议。这个 scratch 页由任务持有并在调用间复用，分配失败返回 ENOMEM；正常返回解除请求登记，页保留至任务最终存储释放，强制退出先取消实际请求／释放其 OFD pin，再解除登记，最后释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。请求末批、容量阻塞点和退出时集中推动 tcp_output，每次接纳批次只在一个边界执行有界协议服务。已接纳前缀后的异步错误留给下一次调用观察。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数；用户页解析尝试由诊断构建的 `COST_USER_RESOLUTIONS` 记录，普通构建不为此维护全局原子计数。直接 pin 的 TCP 数据不经过 uaccess 复制函数，搬运字节由 `copy_from_user` 和 `stream_copy` 记录；`uaccess_copy_ticks/bytes` 仍只覆盖显式复制路径。计数没有新增用户 ABI。
+TCP标量和向量发送均在容量接纳后准备有界页引用与片段，输入组织及部分接纳规则统一见[文件I/O](kernel-files.md#请求暂存与成本)。协议继续持有ACK前的COPY版本，ERR_MEM后先归还pin再等待。描述符scratch页由任务持有并在调用间复用，分配失败返回 ENOMEM；正常返回解除请求登记，页保留至任务最终存储释放，强制退出先取消实际请求／释放其 OFD pin，再解除登记，最后释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。请求末批、容量阻塞点和退出时集中推动 tcp_output，每次接纳批次只在一个边界执行有界协议服务。已接纳前缀后的异步错误留给下一次调用观察。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数；用户页解析尝试由诊断构建的 `COST_USER_RESOLUTIONS` 记录，普通构建不为此维护全局原子计数。直接 pin 的 TCP 数据不经过 uaccess 复制函数，搬运字节由 `copy_from_user` 和 `stream_copy` 记录；`uaccess_copy_ticks/bytes` 仍只覆盖显式复制路径。计数没有新增用户 ABI。
 
 INET UDP 发送请求直接持有最终 PBUF_RAM，用户 iovec 填入该载荷后交给协议发送，不再分配临时 socket_packet 和第二份数据区。用户复制在协议临界区外执行；复制失败、正常完成或强制退出都由同一请求释放尚未转交的 pbuf。
 
@@ -285,13 +285,13 @@ sender并从proc确认子任务已阻塞，检查接收缓存变更不解锁、�
 peer关闭的类型对应错误、SIGKILL和内容守恒。相同ELF双侧运行，不按具体packet
 个数推断内核布局；旧接收配额成本契约由用户明确选择的Linux发送者模型替换。
 
-多 iovec 流发送的 gather 页持有有效内容和已发送游标，EAGAIN 后继续消费暂存尾部；
-单 iovec 只 pin 当前页至 COPY 返回，等待后重新读取未接受输入。
+标量及多iovec的TCP流发送共用有界页pin批次，正式游标只推进实际COPY接纳量；
+EAGAIN前归还pin，等待后重新准备未接纳输入，具体复制规则见[文件I/O](kernel-files.md)。
 非阻塞/fault/信号/期限仍返回已接受前缀；用户页不借用到 ACK。
 预算fixture的COST窗口独立核对全阻塞和部分发送各1000字节只有1000字节stream usercopy，
 旧全阻塞实现为2000字节。`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
 游标不跨系统调用保留内容。原iperf使用非阻塞socket，短写/EAGAIN后再次write仍可能
-重复暂存未接受字节；三次关闭观测的单TCP仅改善0.4%/2.2%，不宣称解决主要吞吐差距。
+重新处理未接纳输入；此前三次关闭观测的单TCP仅改善0.4%/2.2%，不宣称解决主要吞吐差距。
 结果、前台复制放大与代价见[本轮网络结果](../learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。
 
 实际阻塞接收等待使用`kernel_socket_receive_ready`，活动reservation始终未就绪；
@@ -343,9 +343,9 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 用户复制可缺页睡眠，不持 raw 资格；取消、fault、错误、返回和任务退出均归还未提交预算。
 
 扩展现有 iovec cursor 提供页内有界 span。先验证参数的数值范围及连接状态，再取得接纳量，
-最后才解析用户 payload；预先无容量不解析用户页。单 iovec pin 当前页并直接 COPY 到协议，
-不再经过 scratch；无论接纳成功或 ERR_MEM，提交返回即归还 pin，等待后重取未接纳输入。
-多 iovec 取得任务 scratch 汇集片段，阻塞后重取预算并继续提交暂存后缀。
+最后才解析用户 payload；预先无容量不解析用户页。标量及向量pin有界来源页并直接 COPY 到协议，
+一个页大小前缀内不超过四段不连续来源时，载荷直接进入协议；提交返回后归还 pin，等待后重新取得未接纳输入。超过四段时使用已有 scratch 合并这个前缀，避免将小片段拆成多次 CPU0 请求；部分接纳后保留尚未提交的 scratch 尾部，继续按原预算机制提交。
+多 iovec 的直接路径复用任务工作区保存页引用及片段描述，阻塞后按已接纳位置继续准备。
 两种输入都由 `tcp_write(COPY)` 持有 ACK 前的版本，非阻塞返回已接受前缀，
 未接受用户内容不跨系统调用持有。
 `FILE_IO_HOST_TCP=1 sh tests/file-io-concurrency-host.sh` 将生产 TCP/lwIP、MM 和 syscall I/O

@@ -18,8 +18,7 @@ static struct kernel_rwlock *expected_lock;
 static _Thread_local unsigned peer;
 void block_model_before_lock(struct kernel_rwlock *lock)
 {
-    if (!peer) return;
-    assert(lock == expected_lock);
+    if (!peer || lock!=expected_lock) return;
     assert(!pthread_mutex_lock(&handshake));
     writer_waiting = 1; pthread_cond_broadcast(&changed);
     assert(!pthread_mutex_unlock(&handshake));
@@ -131,7 +130,7 @@ static void *whole_thread(void *arg)
 }
 static void serialized_io(struct kernel_block_device *d, struct kernel_block_device *p)
 {
-    pause_read=1; expected_lock=&d->io_lock.lock;
+    pause_read=1; expected_lock=&d->transfer_lock;
     pthread_t rmw,whole; assert(!pthread_create(&rmw,0,rmw_thread,p));
     assert(!pthread_mutex_lock(&handshake));
     while(!read_paused) assert(!pthread_cond_wait(&changed,&handshake));

@@ -350,7 +350,7 @@ static void disk_remap_case(struct kernel_heap *heap,
     byte=0x93;
     assert(!kernel_copy_to_user(&mm,0x80000000,&byte,1,&done) && done==1);
     assert(!kernel_mm_msync(&mm,0x80000000,BOAROS_PAGE_SIZE,4));
-    byte=0; assert(!kernel_vfs_pread(&file->file,0,&byte,1,&done) && done==1 && byte==0x93);
+    byte=0; assert(!kernel_vfs_pread(&file->file,0,&byte,1,&done, NULL) && done==1 && byte==0x93);
     mm_test_context=0;
     assert(!kernel_mm_release(&mm) && !kernel_open_file_release(&file));
     assert(!physical_page_release(pages,kernel.root_address));

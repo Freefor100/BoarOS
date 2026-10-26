@@ -15,7 +15,7 @@ static unsigned allocations;
 static unsigned releases;
 static uint64_t clock_value;
 static uint64_t complete_at;
-static _Thread_local struct kernel_io_context caller;
+#define caller (*kernel_io_context_current())
 static _Thread_local struct kernel_cpu block_cpu = {.initialized=KERNEL_CPU_INITIALIZED};
 void *allocator_host_cpu_get(void) { return &block_cpu; }
 static unsigned probe_wake, wake_paused, wake_release, acquire_attempted, waiter_finished, early_finish;
@@ -72,7 +72,7 @@ enum virtio_status __wrap_virtio_split_take(struct virtio_split_queue *queue, st
     }
     return __real_virtio_split_take(queue,completion);
 }
-static unsigned phase_hold, phase_held_head, phase_crossed_window;
+static unsigned phase_hold, phase_held_head, phase_later_completed;
 static unsigned char *phase_held_status;
 static void (*underlying_write)(void *, enum virtio_register, uint32_t);
 static void sg_device_step(void);
@@ -135,7 +135,7 @@ static void sg_device_step(void)
         uint32_t type; uint64_t sector;
         memcpy(&type, header, 4); memcpy(&sector, header + 8, 8);
         assert(type == 0 || type == 1 || type == 4);
-        if (phase_hold && sector>=64) phase_crossed_window=1;
+        if (phase_hold && sector>=32) phase_later_completed=1;
         uint64_t offset = sector * 512;
         unsigned bytes = 0;
         int error = sector == sg_fail_sector;
@@ -177,7 +177,7 @@ static void sg_device_step(void)
             reported != UINT32_MAX ? reported : error || type != 0 ? 1 : bytes + 1};
         if (reported != UINT32_MAX) sg_used_length = UINT32_MAX;
     }
-    if (phase_hold && phase_crossed_window && phase_held_status) {
+    if (phase_hold && phase_later_completed && phase_held_status) {
         *phase_held_status=0;
         done[batch_pushed++ % size]=(struct wire_completion){phase_held_head,1};
         phase_held_status=NULL;
@@ -299,7 +299,6 @@ void virt_uart_put_hex(unsigned long value)
     snprintf(text, sizeof(text), "0x%lx", value);
     virt_uart_puts(text);
 }
-struct kernel_io_context *kernel_io_context_current(void) { return &caller; }
 void kernel_console_putc(char c) { virt_uart_putc(c); }
 int kernel_scheduler_can_sleep(void) { return 1; }
 int riscv_plic_in_interrupt(void) { return 0; }
@@ -919,7 +918,7 @@ static void write_phase_case(unsigned version, int failing)
     fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
     notifications=first_notify_heads=sg_max_segments=park_calls=0;
     sg_fail_sector=failing?64:UINT32_MAX; diagnostic_length=0;
-    phase_hold=1; phase_crossed_window=0; phase_held_status=NULL;
+    phase_hold=1; phase_later_completed=0; phase_held_status=NULL;
     assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     device.irq_source=1; wait_irq_device=&device;
     struct phase_entry entries[80];
@@ -934,14 +933,14 @@ static void write_phase_case(unsigned version, int failing)
     entries[79].span.offset=79*1024;
     enum kernel_block_status result=kernel_block_write_phase(&device.block,phase_next,0,entries);
     assert(result==(failing?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK));
-    assert(phase_crossed_window && !phase_held_status);
+    assert(phase_later_completed && !phase_held_status);
     assert(first_notify_heads==8 && device.statistics.max_inflight==8);
     assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
     if (!failing) for (unsigned i=0;i<80;i++) for (unsigned j=0;j<512;j++)
         assert(sg_disk[i*1024+j]==(unsigned char)(i+3));
     else assert(device.statistics.requests<80);
     phase_hold=0; device.irq_source=0; wait_irq_device=NULL;
-    printf("PASS journal phase transport=%u error=%d: 80 spans, later window enters while first DMA held, error drains owners\n",version,failing);
+    printf("PASS journal phase transport=%u error=%d: 80 spans, later requests complete while first DMA held, error drains owners\n",version,failing);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
 static void large_phase_case(unsigned version)
@@ -959,11 +958,11 @@ static void large_phase_case(unsigned version)
     for (unsigned i=0;i<512*1024;i++) bytes[i]=(unsigned char)(i*13+i/512);
     struct phase_entry entry={{0,bytes,512*1024},NULL};
     assert(kernel_block_write_phase(&device.block,phase_next,0,&entry)==KERNEL_BLOCK_STATUS_OK);
-    assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==4);
-    assert(device.statistics.max_inflight==4 && !memcmp(bytes,sg_disk,512*1024));
+    assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==1);
+    assert(device.statistics.max_inflight==1 && !memcmp(bytes,sg_disk,512*1024));
     struct kernel_block_span public_span={0,bytes,512*1024};
     assert(kernel_block_write_batch(&device.block,&public_span,1)==KERNEL_BLOCK_STATUS_OK);
-    assert(device.statistics.requests==8 && sg_max_bytes==128*1024);
+    assert(device.statistics.requests==8 && sg_max_bytes==128*1024 && device.statistics.max_inflight==1);
     unsigned before=ack_calls;
     for (unsigned i=0;i<32;i++) collect_for_test(&device);
     assert(ack_calls==before);
@@ -971,7 +970,7 @@ static void large_phase_case(unsigned version)
     assert(ack_calls==before+1); /* A real IRQ is acknowledged even with no used entry. */
     assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
     device.irq_source=0; wait_irq_device=NULL;
-    printf("PASS large journal phase transport=%u: one 512KiB owner, four concurrent 128KiB requests, quiet poll and IRQ ack\n",version);
+    printf("PASS large journal phase transport=%u: one 512KiB phase owner, four drained128KiB windows; single public span retains its request, quiet poll and IRQ ack\n",version);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
 static void late_harvest_case(unsigned version)

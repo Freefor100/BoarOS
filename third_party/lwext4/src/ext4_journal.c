@@ -1911,7 +1911,7 @@ static void jbd_source_put(struct jbd_source *source)
 {
     if (__atomic_sub_fetch(&source->references, 1, __ATOMIC_ACQ_REL)) return;
     source->owner.release(source->owner.context);
-    jbd_memory_owner_uncharge(source->memory, source->owner.bytes);
+    jbd_memory_release_borrow(source->memory, source->owner.bytes);
     jbd_free(source);
 }
 void jbd_journal_release_borrow(struct jbd_data_borrow *borrow)
@@ -1942,9 +1942,9 @@ static int jbd_source_borrow(struct jbd_journal *journal,
         if (__atomic_fetch_add(&source->references, 1, __ATOMIC_ACQ_REL) == UINT32_MAX) __builtin_trap();
 	} else {
 		size_t control = jbd_allocation_charge(sizeof(*source));
-        if (owner->bytes > SIZE_MAX - control || !jbd_memory_charge(journal, owner->bytes)) return ENOMEM;
+        if (owner->bytes > SIZE_MAX - control || !jbd_memory_borrow(journal, owner->bytes)) return ENOMEM;
         source = jbd_alloc(journal, sizeof(*source));
-        if (!source) { jbd_memory_uncharge(journal, owner->bytes); return ENOMEM; }
+        if (!source) { jbd_memory_release_borrow(journal->memory, owner->bytes); return ENOMEM; }
 		source->owner = *owner;
         source->blocks = 1;
         source->references = 1;
