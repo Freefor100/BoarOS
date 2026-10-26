@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_PAGE_CACHE_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <kernel/page.h>
 
@@ -10,6 +11,10 @@
 #endif
 #if BOAROS_PAGE_CACHE_WRITEBACK_PAGES < 1 || BOAROS_PAGE_CACHE_WRITEBACK_PAGES > (131072U / BOAROS_PAGE_SIZE)
 #error "BOAROS_PAGE_CACHE_WRITEBACK_PAGES must fit the 128 KiB window"
+#endif
+
+#ifndef BOAROS_PAGE_CACHE_DIRTY_AGE
+#define BOAROS_PAGE_CACHE_DIRTY_AGE 0
 #endif
 
 #ifndef BOAROS_PAGE_CACHE_READAHEAD_PAGES
@@ -79,6 +84,27 @@ struct kernel_page_cache {
     struct kernel_page_cache_record *record;
     enum kernel_page_cache_state state;
 };
+
+struct kernel_block_device;
+struct kernel_writeback_domain;
+/* Embedded in a live mount. Read-only owners retain the cache without taking
+ * a dirty-memory share. A cache may serve multiple registrations/devices. */
+struct kernel_writeback_owner {
+    struct kernel_writeback_domain *domain;
+    struct kernel_page_cache *cache;
+    struct kernel_writeback_owner *next;
+};
+int kernel_page_cache_bind_writeback(struct kernel_page_cache *,struct kernel_block_device *,
+    int writable,struct kernel_writeback_owner *);
+void kernel_page_cache_unbind_writeback(struct kernel_writeback_owner *);
+void kernel_writeback_domain_get(void *);
+void kernel_writeback_domain_put(void *);
+void kernel_writeback_domain_memory(void *,size_t,bool acquiring);
+struct kernel_writeback_statistics {
+    uint64_t device,dirty_bytes,version_bytes,metadata_bytes,high_bytes,low_bytes;
+    unsigned physical;
+};
+void kernel_writeback_domain_snapshot(const struct kernel_writeback_owner *,struct kernel_writeback_statistics *);
 
 /* 一个 allocator 可注册多个独立缓存。统计/水位全局汇总，worker 与快照页各自拥有。
  * 元数据统一由对象mutex保护；实例、等待者和回调归还引用后释放聚合owner。 */

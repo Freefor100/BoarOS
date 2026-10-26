@@ -154,9 +154,17 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     assert(!loop_test_ioctl(local,second,0x4c00,backing));loop_test_close(local,backing);
     device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(1));assert(device);
     assert(!kernel_page_cache_init(&caches[1],heap,heap->page_allocator));
-    assert(!kernel_vfs_mount_ext4(&children[1],device,heap,&caches[1],0));kernel_block_put(device);
+    int inner_result=kernel_vfs_mount_ext4(&children[1],device,heap,&caches[1],0);
+    if (inner_result) fprintf(stderr,"inner loop mount error=%d available=%llu\n",inner_result,
+        (unsigned long long)physical_page_available(heap->page_allocator));
+    assert(!inner_result);kernel_block_put(device);
     assert(!kernel_page_cache_start_worker(&caches[1]));
     assert(!kernel_vfs_start_journal_worker(&children[1]));
+    struct kernel_vfs_instance *first_instance=children[0].private_data,*second_instance=children[1].private_data;
+    assert(first_instance->writeback.domain==second_instance->writeback.domain);
+    struct kernel_writeback_statistics pressure;
+    kernel_writeback_domain_snapshot(&first_instance->writeback,&pressure);assert(!pressure.physical);
+
     struct kernel_vfs_file file={0};size_t done;uint64_t observed=0;
     assert(!kernel_vfs_create(&children[1],"/payload",0600,&file));
     assert(!kernel_vfs_pwrite(&file,0,"nested-loop-durable",19,&done) && done==19);

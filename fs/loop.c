@@ -171,6 +171,7 @@ static int detach_backing(struct loop_device *loop)
     if (!error) {
         KERNEL_LOCK_SCOPE(control);
         kernel_mutex_lock(&loop_control,&control);
+        kernel_block_set_pressure_parent(&loop->block,NULL);
         loop->parent=NULL;
         memset(&loop->info,0,sizeof(loop->info));
         __atomic_store_n(&loop->block.capacity_bytes,0,__ATOMIC_RELEASE);
@@ -222,7 +223,13 @@ static void loop_worker(void *argument)
         }
         /* 调用者持续借用buffer并等待完成；此独立栈不继承上层文件系统锁。
          * 因而在loop上的ext4调用块层时，不倒序取得后备文件的VFS锁。 */
+        struct kernel_io_context *io=kernel_io_context_current();
+        unsigned progress=io->background_reclaim;
+        /* This advances already accepted upper I/O. Throttling it against the
+         * same backing domain would make it wait for its own upper versions. */
+        io->background_reclaim=1;
         int result=backing_io(loop,request);
+        io->background_reclaim=progress;
         {
             KERNEL_RAW_SCOPE(guard,&loop->metadata);
             request->result=result;request->done=1;wake(&request->changed);
@@ -317,7 +324,7 @@ static void setup_loop(struct loop_device *loop,uint32_t number,struct kernel_he
     loop->block=(struct kernel_block_device){.context=loop,.read=read_loop,.write=write_loop,
         .read_batch=read_loop_batch,.write_batch=write_loop_batch,.write_phase=write_loop_phase,
         .flush=flush_loop,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK,
-        .open=open_loop,.owners_changed=owners_changed,.ioctl=loop_ioctl};
+        .open=open_loop,.owners_changed=owners_changed,.ioctl=loop_ioctl,.virtual_backing=1};
 }
 int kernel_loop_initialize(struct kernel_heap *heap)
 {
@@ -415,8 +422,10 @@ static int configure_loop(struct loop_device *loop,struct kernel_files *files,in
             __atomic_store_n(&loop->block.read_only,!!(loop->info.flags&KERNEL_LOOP_READ_ONLY),__ATOMIC_RELEASE);
             loop->state=LOOP_BOUND;loop->worker_done=0;loop->detach_error=0;
             }
+            kernel_block_set_pressure_parent(&loop->block,parent);
             enum kernel_scheduler_status status=kernel_thread_create_joinable(loop_worker,loop,&loop->worker);
             if (status) {
+                kernel_block_set_pressure_parent(&loop->block,NULL);
                 KERNEL_RAW_SCOPE(guard,&loop->metadata);
                 loop->backing=NULL;loop->parent=NULL;loop->state=LOOP_UNBOUND;loop->worker_done=1;
                 __atomic_store_n(&loop->block.capacity_bytes,0,__ATOMIC_RELEASE);

@@ -1184,6 +1184,7 @@ static int unmount(struct kernel_vfs_mount *mount)
     struct fat_mount *m = fm(mount->private_data);
     int r = prepare_unmount(mount); if (r) return r;
     if (m->instance.external_files || m->instance.nodes || mount->root_path) return -KERNEL_EBUSY;
+    kernel_page_cache_unbind_writeback(&m->instance.writeback);
     kernel_block_release_claim(m->block, mount);
     struct fat_inode *i;
     while ((i = RB_MIN(fat_id_tree, &m->inodes))) {
@@ -1306,6 +1307,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     kernel_mutex_init(&m->instance.namespace_lock, 20, (uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->instance.writeback_block_size = bps;
+    r=kernel_page_cache_bind_writeback(cache,block,!read_only,&m->instance.writeback);if (r) goto invalid;
     mount->private_data = &m->instance; mount->id = kernel_vfs_allocate_mount_id(); mount->state = VFS_MOUNT_STATE_CLEANUP;
     if (!read_only) {
         r = fat_set(m, 1, state & ~0x08000000U);
@@ -1315,6 +1317,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     mount->state = VFS_MOUNT_STATE_LIVE;
     return 0;
 invalid:
+    kernel_page_cache_unbind_writeback(&m->instance.writeback);
     while (!RB_EMPTY(&m->inodes)) {
         struct fat_inode *i = RB_MIN(fat_id_tree, &m->inodes); RB_REMOVE(fat_id_tree, &m->inodes, i); dispose(m, i);
     }

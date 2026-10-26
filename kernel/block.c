@@ -67,6 +67,32 @@ void kernel_block_put(struct kernel_block_device *device)
     registry_unlock(irq);
     finish_notification(device, notify);
 }
+void kernel_block_set_pressure_parent(struct kernel_block_device *device,struct kernel_block_device *parent)
+{
+    if (!device || !device->virtual_backing || device->parent) __builtin_trap();
+    if (parent) parent=physical(parent);
+    uintptr_t irq=registry_lock();
+    struct kernel_block_device *old=device->pressure_parent;
+    if (parent) {
+        if (parent==device || parent->references==UINT32_MAX) __builtin_trap();
+        prepare_locked(parent);parent->references++;
+    }
+    device->pressure_parent=parent;
+    registry_unlock(irq);
+    if (old) kernel_block_put(old);
+}
+struct kernel_block_device *kernel_block_pressure_device(struct kernel_block_device *device)
+{
+    if (!device) __builtin_trap();
+    uintptr_t irq=registry_lock();
+    struct kernel_block_device *target=physical(device);
+    while (target && target->virtual_backing) target=target->pressure_parent;
+    if (target) {
+        if (target->references==UINT32_MAX) __builtin_trap();
+        prepare_locked(target);target->references++;
+    }
+    registry_unlock(irq);return target;
+}
 static void block_request_put(struct kernel_block_device **device)
 { kernel_block_put(*device); }
 #define BLOCK_REQUEST(device) \

@@ -24,6 +24,7 @@
 #include <ext4_inode.h>
 #include <ext4_fs.h>
 #include <ext4_journal.h>
+#include <ext4_journal_memory.h>
 #include <ext4_orphan.h>
 #include <ext4_misc.h>
 #include <ext4_super.h>
@@ -340,7 +341,16 @@ static int prepare_journal_mount(struct lwext4_mount_adapter *adapter)
             result = ext4_journal_stop(adapter->mount_point);
         if (result == EOK) result = ext4_recover(adapter->mount_point);
         if (result == EOK) result = ext4_orphan_validate(fs);
-        if (result == EOK) result = ext4_journal_start(adapter->mount_point);
+        if (result == EOK) {
+            result = ext4_journal_start(adapter->mount_point);
+            /* A failed start may retain recovery storage. Its physical owner
+             * exists before the first I/O and stays charged through cleanup. */
+            if (fs->jbd_journal && fs->jbd_journal->memory) {
+                struct jbd_memory_account account={adapter->instance.writeback.domain,
+                    kernel_writeback_domain_get,kernel_writeback_domain_put,kernel_writeback_domain_memory};
+                jbd_memory_set_account(fs->jbd_journal->memory,&account);
+            }
+        }
     }
     if (result == EOK) result = ext4_orphan_recover(adapter->mount_point);
     if (result == EOK)
@@ -938,6 +948,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
         adapter->heap_bound = 0U;
     }
 
+    kernel_page_cache_unbind_writeback(&adapter->instance.writeback);
     if (adapter->block_claimed) kernel_block_release_claim(adapter->block, mount);
     kernel_heap_release(heap, adapter);
     mount->private_data = 0;
@@ -1453,6 +1464,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     result = kernel_block_claim(block, mount);
     if (result) { (void)cleanup_mount(mount); return result; }
     adapter->block_claimed = 1U;
+    read_only = read_only || kernel_block_read_only(block);
+    result=kernel_page_cache_bind_writeback(page_cache,block,!read_only,&adapter->instance.writeback);
+    if (result) {(void)cleanup_mount(mount);return result;}
     /* Claim excludes loop reconfiguration before allocating its sector buffer. */
     const uint32_t sector = block->logical_block_size;
     if (sector < 512 || sector > BOAROS_PAGE_SIZE || (sector & (sector - 1))) {
@@ -1497,7 +1511,6 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     adapter->registered = 1U;
-    read_only = read_only || kernel_block_read_only(block);
     adapter->instance.read_only = (uint8_t)(read_only != 0 ? 1U : 0U);
     result = ext4_mount(adapter->device_name, adapter->mount_point, read_only != 0);
     if (result != EOK) {

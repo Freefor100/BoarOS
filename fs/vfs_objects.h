@@ -34,6 +34,7 @@ struct kernel_vfs_instance {
     struct kernel_vfs_path *path_index;
     size_t retiring_nodes; /* Removed from weak index; close/free still owns instance. */
     uint8_t namespace_parallel; /* Enabled only after this mount's metadata owners are ready. */
+    struct kernel_writeback_owner writeback;
 };
 
 struct kernel_vfs_node {

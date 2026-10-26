@@ -61,6 +61,8 @@ struct kernel_io_context {
     unsigned allocation_depth;
     uint32_t reclaim_depth;
     unsigned backend_depth;
+    /* Accepted progress I/O avoids admission recursion; this is not a
+     * cache-worker identity or permission to reuse its workspace. */
     unsigned background_reclaim;
     int backend_read;
     struct kernel_lock_guard backend_guard;

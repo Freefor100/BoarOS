@@ -97,6 +97,8 @@ struct kernel_block_device {
     uint64_t device_number;
     uint32_t registered;
     struct kernel_rwlock transfer_lock;
+    struct kernel_block_device *pressure_parent;
+    uint8_t virtual_backing;
 };
 
 /* Linux new_encode_dev(252, disk_index * 16); primary partitions add 1..4. */
@@ -118,6 +120,13 @@ struct kernel_block_device *kernel_block_lookup(uint64_t number);
 struct kernel_block_device *kernel_block_get(uint64_t number);
 void kernel_block_get_device(struct kernel_block_device *device);
 void kernel_block_put(struct kernel_block_device *device);
+/* Virtual bindings retain their actual parent independently of I/O locking.
+ * Configuration ownership excludes rebinding; publication uses the registry
+ * protection. A NULL parent on a virtual device denotes memory backing. */
+void kernel_block_set_pressure_parent(struct kernel_block_device *,struct kernel_block_device *);
+/* Return a retained physical pressure target, or NULL for memory backing. */
+struct kernel_block_device *kernel_block_pressure_device(struct kernel_block_device *);
+
 int kernel_block_open(struct kernel_block_device *, const void *owner, uint32_t flags);
 void kernel_block_close(struct kernel_block_device *, const void *owner, uint32_t flags);
 int kernel_block_claimed(struct kernel_block_device *);
