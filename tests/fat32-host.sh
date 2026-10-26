@@ -9,7 +9,7 @@ for shift in ${FAT_HOST_SHIFTS:-12 14}; do
         -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_MAX_CPUS=2 \
         -Ithird_party/lwext4/include -Itests/host/mm -Itests/host/sync -idirafter include \
         tests/host/fat32.c tests/host/mm/context.c tests/host/mm/disk_context.c \
-        kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/physical_page.c \
+        kernel/cpu.c kernel/raw_lock.c kernel/credentials.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/physical_page.c \
         mm/heap.c mm/memory_object.c fs/vfs.c fs/fat32.c fs/file_mapping.c fs/record_lock.c fs/page_cache.c \
         kernel/block.c -Wl,--gc-sections -o "$build_dir/test-$shift"
     for cluster in ${FAT_HOST_CLUSTERS:-1 8}; do

@@ -101,6 +101,7 @@ static int sector_write(struct fat_mount *m, uint64_t at, const void *buffer)
     if (r || (at == m->sector_at && buffer != m->sector)) m->sector_at = UINT64_MAX;
     return r;
 }
+#define FAT_TRANSFER_BYTES 131072U
 static int bytes(struct fat_mount *m, uint64_t at, void *buffer, size_t size, int write)
 {
     while (size) {
@@ -118,7 +119,16 @@ static int bytes(struct fat_mount *m, uint64_t at, void *buffer, size_t size, in
                 memcpy(m->sector + start, buffer, n);
                 r = sector_write(m, base, m->sector);
             } else memcpy(buffer, m->sector + start, n);
-        } else r = write ? sector_write(m, base, buffer) : sector_read(m, base, buffer);
+        } else {
+            n = size & ~((size_t)m->sector_size - 1);
+            if (n > FAT_TRANSFER_BYTES) n = FAT_TRANSFER_BYTES;
+            r = fail(m, block_error(write ? kernel_block_write_at(m->block, at, buffer, n)
+                                          : kernel_block_read_at(m->block, at, buffer, n)));
+            /* A run can overwrite the cached sector in its middle. Drop the
+             * old image even on error: the device may have written a prefix. */
+            if (write && m->sector_at >= at && m->sector_at - at < n)
+                m->sector_at = UINT64_MAX;
+        }
         if (r) return r;
         at += n; buffer = (uint8_t *)buffer + n; size -= n;
     }
@@ -250,9 +260,24 @@ static int chain_bytes(struct fat_mount *m, struct fat_inode *i, uint64_t at,
         if (r) return r;
         size_t in = at % m->cluster_size, n = m->cluster_size - in;
         if (n > count - *done) n = count - *done;
+        if (n > FAT_TRANSFER_BYTES) n = FAT_TRANSFER_BYTES;
+        uint32_t last = c;
+        int mapping_error = 0;
+        while (n < count - *done && n < FAT_TRANSFER_BYTES &&
+               (in + n) % m->cluster_size == 0) {
+            uint32_t next;
+            mapping_error = cluster_index(m, i, (at + n) / m->cluster_size, &next);
+            if (mapping_error || next != last + 1) break;
+            size_t take = m->cluster_size;
+            if (take > count - *done - n) take = count - *done - n;
+            if (take > FAT_TRANSFER_BYTES - n) take = FAT_TRANSFER_BYTES - n;
+            n += take; last = next;
+        }
         r = bytes(m, cluster_at(m, c) + in, (uint8_t *)buffer + *done, n, write);
         if (r) return r;
         at += n; *done += n;
+        /* A corrupt next link does not erase the already validated prefix. */
+        if (mapping_error) return mapping_error;
     }
     return 0;
 }
