@@ -1095,11 +1095,15 @@ checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-dee
 ## 有界顺序预读候选
 
 `BOAROS_PAGE_CACHE_READAHEAD_PAGES` 默认 0，配置上限为 128 KiB 对应的架构页数；
-现有候选测试使用 0/1/2/4/8。只有非零配置才创建每缓存实例的独立预读 worker。
-OFD 保存成功读取的末端和取消 cookie；read/pread/
+候选测试覆盖 0/1/2/4/8/16 页；只有非零配置才创建每缓存实例的独立预读 worker。
+顺序流从 16 KiB 开始，读取跨过已接受的预测范围后窗口翻倍，直到配置上限；
+若上限小于 16 KiB，直接使用上限。OFD 保存成功读取末端、预测末端、当前窗口和取消 cookie；
+这些候选字段置于对象尾部。read/pread/
 sendfile 在首次可能睡眠的 accessed、后端或 usercopy 之前执行 read_begin，立即取消
 不连续预测，read_progress 只登记成功前缀。两个连续片段在页边界完成后可申请下一窗口。
-seek、非顺序读、最后关闭、截断/失效、低水位和停止取消未接纳工作。
+缓存返回实际接纳的范围；旧批次仍在装入时，不把尚未接纳的新请求算入预测。
+整个范围已经驻留时只确认覆盖范围，跳过队列发布和 worker 唤醒。
+seek、非顺序读、最后关闭、截断/失效、低水位和停止取消未接纳工作，并重置窗口。
 
 队列固定八个 job，只持 inode pin；一实例同时处理一个配置窗口内的批次。worker 取得
 inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在的页或加载由
@@ -1112,11 +1116,11 @@ inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在
 已接纳批次，最后释放实例；截断/失效的 inode write gate 与加载互斥。每个批次完成后
 重新开放中断并让出，队列满或内存不足只放弃推测，不制造需求读错误。
 
-`make test-readahead-riscv` 覆盖全部窗口及 1/4 KiB ext4，验证实际缓存内容、窗口上限、
+`make test-readahead-riscv` 覆盖配置窗口及 1/4 KiB ext4，验证实际缓存内容、窗口上限、
 seek/非顺序/关闭、冷不连续读、单页错误隔离、低水位、截断、unlink 和回收。
 `python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy`
 及 modern 模式使用 NBD 暂扣所有窗口 READ，再保留最后一个；需求读取者和 stop/join
-调用者均须保持等待，响应后才归还 owner。用户态组合、恢复与发布性能另行验收。
+调用者均须保持等待，响应后才归还 owner。`--pages 16` 额外检查 16→32→64 KiB 的实际装入、完整归还后的推进和热范围跳过排队。
 
 
 SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁盘并确认退出零，

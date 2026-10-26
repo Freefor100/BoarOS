@@ -9,7 +9,7 @@ import selectors
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--pages', nargs='+', type=int, choices=(0, 1, 2, 4, 8), default=(0, 1, 2, 4, 8))
+parser.add_argument('--pages', nargs='+', type=int, choices=(0, 1, 2, 4, 8, 16), default=(0, 1, 2, 4, 8))
 parser.add_argument('--block-size', nargs='+', type=int, choices=(1024, 4096), default=(1024, 4096))
 parser.add_argument('--transport', choices=('legacy','modern'), default='modern')
 parser.add_argument('--qemu', default='qemu-system-riscv64')
@@ -60,7 +60,7 @@ def held_run(command, disk, work, pages):
                         fields=dict(item.split(b'=') for item in line.split())
                         if int(fields[b'command'],0)!=0: raise RuntimeError('unexpected held command '+line.decode())
                         held.append(int(fields[b'held'],0))
-                        if len(held)>1 or int(fields[b'size'],0)!=pages*4096:
+                        if len(held)>1 or int(fields[b'size'],0)!=min(pages,4)*4096:
                             raise RuntimeError('prefetch did not submit the contiguous window as one SG request')
                     elif label=='guest' and line==b'readahead: pending': consumer=True
                     elif label=='guest' and line==b'readahead: held-owner':

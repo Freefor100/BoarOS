@@ -76,6 +76,9 @@ struct kernel_page_cache_statistics {
     uint64_t worker_scanned, worker_written, worker_failed, worker_batches;
     uint64_t readahead_queued, readahead_cancelled, readahead_loaded, readahead_failed;
     uint64_t readahead_batches, readahead_peak_pages;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    uint64_t readahead_completed;
+#endif
 };
 
 struct kernel_page_cache {
@@ -244,8 +247,11 @@ void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 /* A queue slot pins only the inode. The opaque cookie cancels unsubmitted
  * work; a published read retains its owners through completion/reset. */
-uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t first, uint64_t cookie);
+struct kernel_page_cache_prediction { uint64_t cookie,end; };
+/* end is the acknowledged page boundary (including already resident pages),
+ * not a promise that an active request has loaded its complete range. */
+struct kernel_page_cache_prediction kernel_page_cache_readahead(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t first,unsigned pages,uint64_t cookie);
 void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie);
 #endif
 

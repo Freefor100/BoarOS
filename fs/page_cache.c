@@ -128,6 +128,7 @@ void kernel_writeback_domain_memory(void *context,size_t bytes,bool acquiring)
 struct readahead_job {
     struct kernel_vfs_node *node;
     uint64_t cookie, first;
+    unsigned pages;
     int active, cancelled;
 };
 #endif
@@ -1760,36 +1761,48 @@ void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_
     if (r->readahead_started) cache_wake(&r->readahead_work);
 }
 
-uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t first, uint64_t cookie)
+struct kernel_page_cache_prediction kernel_page_cache_readahead(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t first,unsigned pages,uint64_t cookie)
 {
-    if (!cache_live(cache) || !node || first > UINT64_MAX >> BOAROS_PAGE_SHIFT) return 0;
-    CACHE_SCOPE(publish, cache);
-    struct kernel_page_cache_record *r = cache->record;
-    if (!r->readahead_started || r->stopping || physical_page_available(cache->allocator) <= r->low ||
-        (first << BOAROS_PAGE_SHIFT) >= kernel_vfs_node_size(node)) {
-        for (unsigned i = 0; i < 8; i++)
-            if (cookie && r->readahead_jobs[i].node && r->readahead_jobs[i].cookie == cookie)
-                r->readahead_jobs[i].cancelled = 1;
+    const struct kernel_page_cache_prediction none={0};
+    if (!pages || pages>BOAROS_PAGE_CACHE_READAHEAD_PAGES) __builtin_trap();
+    if (!cache_live(cache) || !node || first>UINT64_MAX>>BOAROS_PAGE_SHIFT) return none;
+    CACHE_SCOPE(publish,cache);
+    struct kernel_page_cache_record *r=cache->record;
+    uint64_t size=kernel_vfs_node_size(node);
+    if (!r->readahead_started || r->stopping || physical_page_available(cache->allocator)<=r->low ||
+        (first<<BOAROS_PAGE_SHIFT)>=size) {
+        for (unsigned i=0;i<8;i++)
+            if (cookie && r->readahead_jobs[i].node && r->readahead_jobs[i].cookie==cookie)
+                r->readahead_jobs[i].cancelled=1;
         if (r->readahead_started) cache_wake(&r->readahead_work);
-        return 0;
+        return none;
     }
-    struct readahead_job *available = NULL;
-    for (unsigned i = 0; i < 8; i++) {
-        struct readahead_job *job = &r->readahead_jobs[i];
-        if (!job->node) { if (!available) available = job; continue; }
-        if (cookie && job->cookie == cookie && job->node == node && !job->cancelled) {
-            if (!job->active) job->first = first;
-            return cookie;
+    uint64_t remaining=((size-1)>>BOAROS_PAGE_SHIFT)+1-first;
+    if (pages>remaining) pages=(unsigned)remaining;
+    struct readahead_job *available=NULL;
+    for (unsigned i=0;i<8;i++) {
+        struct readahead_job *job=&r->readahead_jobs[i];
+        if (!job->node) {if (!available) available=job;continue;}
+        if (cookie && job->cookie==cookie && job->node==node && !job->cancelled) {
+            if (!job->active) {job->first=first;job->pages=pages;}
+            return (struct kernel_page_cache_prediction){cookie,job->first+job->pages};
         }
     }
-    if (!available) return 0;
+    /* Hot scans acknowledge resident coverage without waking a worker that
+     * would repeat the same lookups. Publication still rechecks cold entries. */
+    unsigned resident=0;
+    for (;resident<pages;resident++) {
+        int found;size_t bucket=find_bucket(r,node,first+resident,&found);
+        if (!found || entry_loading(r->buckets[bucket]) || r->buckets[bucket]->retired) break;
+    }
+    if (resident==pages) return (struct kernel_page_cache_prediction){0,first+pages};
+    if (!available) return none;
     if (kernel_vfs_node_acquire(node)) __builtin_trap();
     if (!++r->readahead_cookie) __builtin_trap();
-    *available = (struct readahead_job){.node = node, .first = first, .cookie = r->readahead_cookie};
-    r->statistics.readahead_queued++;
-    cache_wake(&r->readahead_work);
-    return available->cookie;
+    *available=(struct readahead_job){.node=node,.first=first,.pages=pages,.cookie=r->readahead_cookie};
+    r->statistics.readahead_queued++;cache_wake(&r->readahead_work);
+    return (struct kernel_page_cache_prediction){available->cookie,first+pages};
 }
 
 static int readahead_cancelled(struct kernel_page_cache *cache, struct readahead_job *job)
@@ -1816,7 +1829,7 @@ static void readahead_load(struct kernel_page_cache *cache, struct readahead_job
     struct file_read_span *spans = lease->read.spans;
     unsigned candidates = 0, count = 0;
     /* 候选尚未发布，分配和扩容不持cache保护，也不产生等待环。 */
-    for (unsigned i = 0; i < BOAROS_PAGE_CACHE_READAHEAD_PAGES; i++) {
+    for (unsigned i = 0; i < plan->pages; i++) {
         if (readahead_cancelled(cache, job)) break;
         uint64_t index = plan->first + i;
         if (index > UINT64_MAX >> BOAROS_PAGE_SHIFT ||
@@ -1920,7 +1933,8 @@ static void readahead_worker(void *argument)
             *next = (struct readahead_job){0};
         }
         if (kernel_vfs_node_release(&plan.node)) __builtin_trap();
-        /* 一批最多八页；只在完整后端调用返回后让出，不截断内部 I/O。 */
+        { CACHE_SCOPE(finished,cache);r->statistics.readahead_completed++; }
+        /* Only yield after the bounded request and its node borrow finish. */
         arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK); (void)arch_interrupt_save();
         if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
