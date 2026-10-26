@@ -17,7 +17,8 @@ struct jbd_memory {
     /* Home pinning acquires cache metadata (rank 30) before this short lock. */
     struct kernel_raw_lock metadata;
     uint32_t references, block_size;
-    size_t used, peak, limit, cached, reserved;
+    size_t used, peak, limit, cached, reserved, borrowed;
+    struct jbd_memory_account account;
     uint64_t budget_failures;
     struct jbd_image *image_cache;
     void *allocation_cache[JBD_ALLOCATION_CACHE_BUCKETS];
@@ -57,9 +58,29 @@ static bool dereference_locked(struct jbd_memory *memory)
 {
     if (!memory->references) __builtin_trap();
     if (--memory->references) return false;
-    if (memory->used || memory->reserved || memory->cached || memory->image_cache) __builtin_trap();
+    if (memory->used || memory->reserved || memory->cached || memory->borrowed || memory->image_cache) __builtin_trap();
     for (unsigned i=0;i<JBD_ALLOCATION_CACHE_BUCKETS;i++) if (memory->allocation_cache[i]) __builtin_trap();
     return true;
+}
+static void account_change(struct jbd_memory *memory,size_t bytes,bool acquiring)
+{
+    if (bytes && memory->account.context)
+        memory->account.change(memory->account.context,bytes,acquiring);
+}
+static void destroy_memory(struct jbd_memory *memory)
+{
+    if (memory->account.context) memory->account.release(memory->account.context);
+    ext4_free(memory);
+}
+void jbd_memory_set_account(struct jbd_memory *memory,const struct jbd_memory_account *account)
+{
+    if (!account || !account->context || !account->retain || !account->release || !account->change) __builtin_trap();
+    account->retain(account->context);
+    KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+    if (memory->account.context || memory->closing || memory->used<memory->cached ||
+        memory->used-memory->cached<memory->borrowed) __builtin_trap();
+    memory->account=*account;
+    account_change(memory,memory->used-memory->cached-memory->borrowed,true);
 }
 void jbd_memory_get(struct jbd_memory *memory)
 { KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);reference_locked(memory); }
@@ -67,7 +88,7 @@ void jbd_memory_put(struct jbd_memory *memory)
 {
     bool destroy;
     { KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);destroy=dereference_locked(memory); }
-    if (destroy) ext4_free(memory);
+    if (destroy) destroy_memory(memory);
 }
 int jbd_memory_start(struct jbd_journal *journal,uint32_t block_size)
 {
@@ -82,7 +103,7 @@ void jbd_memory_snapshot(struct jbd_memory *memory,struct jbd_memory_stats *stat
 {
     KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
     *stats=(struct jbd_memory_stats){.used=memory->used,.peak=memory->peak,.limit=memory->limit,
-        .cached=memory->cached,.reserved=memory->reserved,.budget_failures=memory->budget_failures};
+        .cached=memory->cached,.reserved=memory->reserved,.borrowed=memory->borrowed,.budget_failures=memory->budget_failures};
 }
 static struct jbd_memory_stats journal_stats(const struct jbd_journal *journal)
 {
@@ -120,6 +141,7 @@ static void charge_locked(struct jbd_memory *memory,size_t bytes)
 {
     if (!room_locked(memory,bytes)) __builtin_trap();
     memory->used+=bytes;if (memory->peak<memory->used) memory->peak=memory->used;
+    account_change(memory,bytes,true);
 }
 static void reserve_locked(struct jbd_memory *memory,size_t bytes)
 {
@@ -134,24 +156,33 @@ static void finish_reservation(struct jbd_memory *memory,size_t bytes,bool commi
     if (committed) {
         if (memory->used>SIZE_MAX-bytes) __builtin_trap();
         memory->used+=bytes;
+        account_change(memory,bytes,true);
         if (memory->peak<memory->used) memory->peak=memory->used;
     }
 }
-void jbd_memory_owner_uncharge(struct jbd_memory *memory,size_t bytes)
+static void uncharge(struct jbd_memory *memory,size_t bytes,bool idle)
 {
     KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
     if (memory->used<bytes) __builtin_trap();
     memory->used-=bytes;
+    if (idle) {if (memory->cached<bytes) __builtin_trap();memory->cached-=bytes;}
+    else account_change(memory,bytes,false);
 }
-void jbd_memory_uncharge(struct jbd_journal *journal,size_t bytes)
-{ jbd_memory_owner_uncharge(journal->memory,bytes); }
+void jbd_memory_owner_uncharge(struct jbd_memory *memory,size_t bytes)
+{ uncharge(memory,bytes,false); }
+void jbd_memory_release_borrow(struct jbd_memory *memory,size_t bytes)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+    if (memory->used<bytes || memory->borrowed<bytes) __builtin_trap();
+    memory->used-=bytes;memory->borrowed-=bytes;
+}
 static void budget_failure(struct jbd_journal *journal)
 {
     struct jbd_memory *memory=journal->memory;
     { KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);memory->budget_failures++; }
     if (journal->jbd_fs) ext4_operation_memory_denied(journal->jbd_fs->inode_ref.fs);
 }
-static void free_allocation(union jbd_allocation *allocation)
+static void free_allocation(union jbd_allocation *allocation,bool idle)
 {
     struct jbd_memory *memory=allocation->owner.memory;size_t charge=allocation->owner.bytes;
     /* The allocation reference keeps the owner valid across the actual free.
@@ -162,9 +193,11 @@ static void free_allocation(union jbd_allocation *allocation)
         KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
         if (memory->used<charge) __builtin_trap();
         memory->used-=charge;
+        if (idle) {if (memory->cached<charge) __builtin_trap();memory->cached-=charge;}
+        else account_change(memory,charge,false);
         destroy=dereference_locked(memory);
     }
-    if (destroy) ext4_free(memory);
+    if (destroy) destroy_memory(memory);
 }
 static void trim_owner(struct jbd_memory *memory,size_t target)
 {
@@ -174,19 +207,20 @@ static void trim_owner(struct jbd_memory *memory,size_t target)
         if (memory->cached<=target) return;
         images=memory->image_cache;memory->image_cache=NULL;
         memcpy(allocations,memory->allocation_cache,sizeof(allocations));
-        memset(memory->allocation_cache,0,sizeof(memory->allocation_cache));memory->cached=0;
+        memset(memory->allocation_cache,0,sizeof(memory->allocation_cache));
+        /* Detached idle objects stay classified as idle until actual free. */
     }
     /* Detach one bounded cache snapshot. Concurrent returns can populate the
      * new cache without making this reclaim loop chase fresh producers. */
     while (images) {
         struct jbd_image *next=images->next;
         if (images->active) __builtin_trap();
-        ext4_free(images->data);jbd_memory_owner_uncharge(memory,memory->block_size);
-        free_allocation((union jbd_allocation *)images-1);images=next;
+        ext4_free(images->data);uncharge(memory,memory->block_size,true);
+        free_allocation((union jbd_allocation *)images-1,true);images=next;
     }
     for (unsigned i=0;i<JBD_ALLOCATION_CACHE_BUCKETS;i++) while (allocations[i]) {
         void *pointer=allocations[i];allocations[i]=*(void **)pointer;
-        free_allocation((union jbd_allocation *)pointer-1);
+        free_allocation((union jbd_allocation *)pointer-1,true);
     }
 }
 void jbd_trim_cache(struct jbd_journal *journal,size_t target)
@@ -207,11 +241,18 @@ bool jbd_budget_room(struct jbd_journal *journal,size_t bytes)
     }
     budget_failure(journal);return false;
 }
-bool jbd_memory_charge(struct jbd_journal *journal,size_t bytes)
+bool jbd_memory_borrow(struct jbd_journal *journal,size_t bytes)
 {
     struct jbd_memory *memory=journal->memory;
     for (unsigned attempt=0;attempt<2;attempt++) {
-        { KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);if (!memory->closing && room_locked(memory,bytes)) {charge_locked(memory,bytes);return true;} }
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+            if (!memory->closing && room_locked(memory,bytes)) {
+                memory->used+=bytes;memory->borrowed+=bytes;
+                if (memory->peak<memory->used) memory->peak=memory->used;
+                return true;
+            }
+        }
         if (!attempt) trim_owner(memory,0);
     }
     budget_failure(journal);return false;
@@ -231,7 +272,7 @@ static void *allocate_extra(struct jbd_journal *journal,size_t bytes,size_t extr
                 if (index>=0 && memory->allocation_cache[index] && room_locked(memory,extra)) {
                     cached=memory->allocation_cache[index];memory->allocation_cache[index]=*(void **)cached;
                     if (memory->cached<charge) __builtin_trap();
-                    memory->cached-=charge;
+                    memory->cached-=charge;account_change(memory,charge,true);
                     reserve_locked(memory,extra);
                 } else if (room_locked(memory,charge+extra)) {
                     reserve_locked(memory,charge+extra);reference_locked(memory);fresh=true;
@@ -261,10 +302,10 @@ void jbd_free(void *pointer)
         if (!memory->closing && memory->grouped && !memory->cache_disabled && index>=0 &&
             charge<=limit && memory->cached<=limit-charge) {
             *(void **)pointer=memory->allocation_cache[index];memory->allocation_cache[index]=pointer;
-            memory->cached+=charge;return;
+            memory->cached+=charge;account_change(memory,charge,false);return;
         }
     }
-    free_allocation(allocation);
+    free_allocation(allocation,false);
 }
 void *jbd_journal_alloc(struct jbd_journal *journal,size_t bytes) { return jbd_alloc(journal,bytes); }
 void jbd_journal_free(void *pointer) { jbd_free(pointer); }
@@ -281,7 +322,8 @@ static void payload_release(struct ext4_block_payload *payload)
         size_t charge=memory->block_size+((union jbd_allocation *)image-1)->owner.bytes;
         if (!memory->closing && memory->grouped && !memory->cache_disabled &&
             charge<=limit && memory->cached<=limit-charge) {
-            image->next=memory->image_cache;memory->image_cache=image;memory->cached+=charge;return;
+            image->next=memory->image_cache;memory->image_cache=image;memory->cached+=charge;
+            account_change(memory,charge,false);return;
         }
     }
     ext4_free(image->data);jbd_memory_owner_uncharge(memory,memory->block_size);jbd_free(image);
@@ -296,7 +338,7 @@ struct jbd_image *jbd_image_alloc(struct jbd_journal *journal)
             memory->image_cache=image->next;
             size_t charge=memory->block_size+((union jbd_allocation *)image-1)->owner.bytes;
             if (image->active || memory->cached<charge) __builtin_trap();
-            memory->cached-=charge;
+            memory->cached-=charge;account_change(memory,charge,true);
         }
     }
     if (!image) {
