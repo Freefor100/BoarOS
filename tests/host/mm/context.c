@@ -99,6 +99,8 @@ void mm_test_attach(unsigned id)
     force_task=0;
     actor.task.magic=KERNEL_THREAD_MAGIC; actor.task.state=KERNEL_THREAD_STATE_RUNNING;
     actor.task.cpu=&cpu;
+    actor.task.tid=(kernel_pid_t)id+1;actor.task.tid_owned=1;
+    actor.task.group_leader=&actor.task;actor.task.group_members=1;
 #endif
 #if BOAROS_MAX_CPUS > 1
     bound_mm = 0;

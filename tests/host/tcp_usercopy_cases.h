@@ -281,6 +281,10 @@ static void tcp_wait_owner_case(struct kernel_heap *heap,int writing)
     int64_t result;
     if(writing) assert(!kernel_files_read(&handle,&mm,1,0x201000,8,&result) && result==8);
     char actual[8];assert(!kernel_copy_from_user(&mm,actual,0x201000,8,&copied) && copied==8);
+    /* INET receive completion leaves packet/pbuf retirement and receive
+     * credit to the real protocol executor, including a CPU0 caller. */
+    for (unsigned i=0;i<8;i++)
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     assert(!memcmp(actual,"wakeonce",8) && physical_page_available(mm.allocator)==before);
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     for(struct tcp_pcb *pcb=tcp_active_pcbs,*next;pcb;pcb=next) {
@@ -605,7 +609,6 @@ static void tcp_nonblock_timeout_case(struct kernel_heap *heap,int unix_socket)
 }
 static enum kernel_files_status tcp_writer_status;
 static int64_t tcp_writer_bytes;
-static uint64_t tcp_writer_available;
 static void *tcp_user_writer(void *argument)
 {
     struct kernel_files *handle=argument;
@@ -613,7 +616,8 @@ static void *tcp_user_writer(void *argument)
     tcp_writer_status=kernel_files_write(handle,&mm,0,0x200000,8,&tcp_writer_bytes);
     assert(!kernel_task_current()->io_buffer && kernel_task_current()->io_scratch_data &&
         !kernel_io_context_current()->user_pins);
-    tcp_writer_available=physical_page_available(mm.allocator);
+    uint32_t references;
+    assert(!physical_page_reference_count(mm.allocator,kernel_task_current()->io_scratch_physical_address,&references) && references==1);
     mm_test_finish();return 0;
 }
 static void tcp_write_batch_case(struct kernel_heap *heap);
@@ -666,7 +670,9 @@ static void tcp_usercopy_case(struct kernel_heap *heap)
     assert(!memcmp(actual,"newvalue",8));
     assert(!kernel_files_read(&handle,&mm,1,0x201000,1,&result) && result==-KERNEL_EAGAIN);
     assert(!kernel_mm_mprotect(&mm,0x200000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
-    assert(tcp_writer_available+1==before && physical_page_available(mm.allocator)==before);
+    for (unsigned i=0;i<8;i++)
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    assert(physical_page_available(mm.allocator)==before);
     uint64_t tail=0x200000+4U*BOAROS_PAGE_SIZE-4U;
     assert(!kernel_copy_to_user(&mm,tail,"tail",4,&copied) && copied==4);
     assert(!kernel_files_write(&handle,&mm,0,tail,8,&result) && result==4);
@@ -713,12 +719,16 @@ int __wrap_kernel_socket_stream_commitv(struct kernel_socket_write_request *requ
     const struct kernel_socket_write_segment *segments,unsigned count,uint32_t flags)
 {
     if(!tcp_write_observing) return __real_kernel_socket_stream_commitv(request,segments,count,flags);
-    assert(!tcp_protocol_held() && count==tcp_write_held && count && tcp_write_commits<4);
+    assert(!tcp_protocol_held() && tcp_write_held && count && tcp_write_commits<4);
     uint32_t bytes=0;
     for(unsigned i=0;i<count;i++) {
-        const unsigned char *page=tcp_write_pins[i]->page,*data=segments[i].data;
-        assert(data>=page && data<page+BOAROS_PAGE_SIZE && segments[i].size &&
-            segments[i].size<=(uint32_t)(page+BOAROS_PAGE_SIZE-data));
+        uintptr_t data=(uintptr_t)segments[i].data;int owned=0;
+        for (unsigned j=0;j<tcp_write_held;j++) {
+            uintptr_t page=(uintptr_t)tcp_write_pins[j]->page;
+            if (data>=page && data-page<BOAROS_PAGE_SIZE && segments[i].size &&
+                segments[i].size<=BOAROS_PAGE_SIZE-(data-page)) owned=1;
+        }
+        assert(owned);
         bytes+=segments[i].size;
     }
     tcp_write_commit_bytes[tcp_write_commits]=bytes;
@@ -727,7 +737,7 @@ int __wrap_kernel_socket_stream_commitv(struct kernel_socket_write_request *requ
     int result=__real_kernel_socket_stream_commitv(request,segments,count,flags);
     assert(!request->segments && !request->next && request->pin && request->task==kernel_task_current());
     /* COPY and result publication finish before the caller returns any physical pin. */
-    for(unsigned i=0;i<count;i++) assert(tcp_write_pins[i]->registration==tcp_write_pins[i]);
+    for(unsigned i=0;i<tcp_write_held;i++) assert(tcp_write_pins[i]->registration==tcp_write_pins[i]);
     return result;
 }
 static void *tcp_write_revoke(void *unused)
@@ -867,6 +877,48 @@ static void tcp_write_batch_case(struct kernel_heap *heap)
             assert(!kernel_files_read(&handle,&mm,1,0x200080,sizeof(expected),&result) && result==sizeof(expected));
             assert(!kernel_copy_from_user(&mm,actual,0x200080,sizeof(actual),&copied) &&
                 copied==sizeof(actual) && !memcmp(actual,expected,sizeof(actual)));
+            struct kernel_uaccess_iovec vector[]={
+                {source,13},{source+13,18},{source+31,20},{source+51,45}};
+            assert(!kernel_copy_to_user(&mm,0x100200,vector,sizeof(vector),&copied));
+            tcp_write_commits=tcp_write_pin_count=tcp_write_unpin_count=0;
+            tcp_write_observing=1;
+            assert(!kernel_files_writev(&handle,&mm,0,0x100200,4,&result) && result==sizeof(expected));
+            tcp_write_observing=0;
+            assert(!tcp_write_held && tcp_write_pin_count==tcp_write_unpin_count &&
+                tcp_write_pin_count==3 && tcp_write_commits==1 && tcp_write_commit_segments[0]==2);
+            assert(!kernel_files_read(&handle,&mm,1,0x200080,sizeof(actual),&result) && result==sizeof(actual));
+            assert(!kernel_copy_from_user(&mm,actual,0x200080,sizeof(actual),&copied) &&
+                !memcmp(actual,expected,sizeof(actual)));
+            puts("PASS TCP writev directly borrows two source pages across four iovecs, one import pin and one commit");
+            struct kernel_uaccess_iovec scattered[]={
+                {source+2,3},{source+9,3},{source+1,4},{source+20,4}};
+            unsigned char wanted[14];
+            memcpy(wanted,expected+2,3);memcpy(wanted+3,expected+9,3);
+            memcpy(wanted+6,expected+1,4);memcpy(wanted+10,expected+20,4);
+            assert(!kernel_copy_to_user(&mm,0x100200,scattered,sizeof(scattered),&copied));
+            tcp_write_commits=tcp_write_pin_count=tcp_write_unpin_count=0;
+            tcp_write_observing=1;
+            assert(!kernel_files_writev(&handle,&mm,0,0x100200,4,&result) && result==14);
+            tcp_write_observing=0;
+            assert(!tcp_write_held && tcp_write_pin_count==2 && tcp_write_unpin_count==2 &&
+                tcp_write_commits==1 && tcp_write_commit_segments[0]==4);
+            assert(!kernel_files_read(&handle,&mm,1,0x200080,14,&result) && result==14);
+            assert(!kernel_copy_from_user(&mm,actual,0x200080,14,&copied) && !memcmp(actual,wanted,14));
+            puts("PASS TCP scattered writev retains one source-page pin across four protocol fragments");
+            struct kernel_uaccess_iovec fragments[16];unsigned char packed[16];
+            for(unsigned i=0;i<16;i++) {fragments[i]=(struct kernel_uaccess_iovec){source+i,1};packed[i]=expected[i];}
+            /* Reverse alternating pairs: sixteen independent fragments in one page. */
+            for(unsigned i=0;i<16;i+=2) {fragments[i].base++;fragments[i+1].base--;packed[i]=expected[i+1];packed[i+1]=expected[i];}
+            assert(!kernel_copy_to_user(&mm,0x100200,fragments,sizeof(fragments),&copied));
+            kernel_socket_get_statistics(&before_write);
+            assert(!kernel_files_writev(&handle,&mm,0,0x100200,16,&result) && result==16);
+            kernel_socket_get_statistics(&after_write);
+            assert(after_write.tcp_write_calls-before_write.tcp_write_calls==1);
+            assert(!kernel_files_read(&handle,&mm,1,0x200080,16,&result) && result==16);
+            assert(!kernel_copy_from_user(&mm,actual,0x200080,16,&copied) && !memcmp(actual,packed,16));
+            assert(!kernel_task_current()->socket_write_request && !kernel_task_current()->io_buffer &&
+                !kernel_io_context_current()->user_pins);
+            puts("PASS fragmented TCP vector coalesces one page into one protocol COPY with exact payload and released owners");
         }
         struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);
         assert(!state.pins && !state.write_pins && !state.pending_retirement);
