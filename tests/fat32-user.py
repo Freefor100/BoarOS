@@ -39,6 +39,9 @@ def main():
     parser.add_argument('--kernel', type=Path)
     parser.add_argument('--qemu')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--storage-cost', action='store_true', help='prepare loop backing and validate the fixed storage-path workload')
+    parser.add_argument('--prepare-only', action='store_true', help='save preboot images for matched kernel comparisons')
+    parser.add_argument('--cpus', type=int, choices=(1, 2, 4), default=1)
     args = parser.parse_args()
     profile = PROFILES[args.arch]
     kernel = (args.kernel or ROOT / profile.kernel).resolve()
@@ -51,12 +54,18 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     root, disk, partition = [output / name for name in ('root.img', 'disk.img', 'partition2.img')]
     with root.open('wb') as stream:
-        stream.truncate(32 * MIB)
+        stream.truncate((128 if args.storage_cost else 32) * MIB)
     execute(['mkfs.ext4', '-q', '-F', '-b', '4096', '-O', '^metadata_csum,^64bit,^orphan_file', root],
             output / 'mkfs-root.log')
     execute(['debugfs', '-w', '-R', f'write {program} /init', root], output / 'install-init.log')
     execute(['debugfs', '-w', '-R', 'set_inode_field /init mode 0100755', root],
             output / 'chmod-init.log')
+    if args.storage_cost:
+        loop_image = output / 'loop-template.img'
+        with loop_image.open('wb') as stream:
+            stream.truncate(16 * MIB)
+        execute(['mkfs.ext4', '-q', '-F', '-b', '4096', loop_image], output / 'mkfs-loop.log')
+        execute(['debugfs', '-w', '-R', f'write {loop_image} /loop.img', root], output / 'install-loop.log')
     with partition.open('wb') as stream:
         stream.truncate(64 * MIB)
     execute(['mkfs.fat', '-F', '32', '-S', '512', '-s', '1', partition], output / 'mkfs-fat.log')
@@ -73,7 +82,7 @@ def main():
     command = [qemu]
     if args.arch == 'riscv':
         command += ['-machine', 'virt', '-bios', 'default']
-    command += ['-kernel', str(kernel), '-m', '1G', '-smp', '1', '-nographic', '-no-reboot',
+    command += ['-kernel', str(kernel), '-m', '1G', '-smp', str(args.cpus), '-nographic', '-no-reboot',
                 '-net', 'none']
     for index, image in enumerate((root, disk)):
         command += ['-drive', f'file={image},if=none,format=raw,id=x{index}', '-device',
@@ -83,9 +92,13 @@ def main():
                 'program': str(program), 'program_sha256': digest(program),
                 'qemu': qemu, 'qemu_sha256': digest(qemu),
                 'qemu_version': subprocess.check_output([qemu, '--version'], text=True).splitlines()[0],
-                'command': command}
+                'command': command, 'storage_cost': args.storage_cost,
+                'root_image_sha256': digest(root), 'second_image_sha256': digest(disk)}
     identity_path = output / 'identity.json'
     identity_path.write_text(json.dumps(identity, indent=2) + '\n')
+    if args.prepare_only:
+        print(f'Prepared immutable comparison input: {output}')
+        return
     try:
         code, text = run_guest(command, 120)
     except subprocess.TimeoutExpired as error:
@@ -93,7 +106,8 @@ def main():
         raise
     (output / 'serial.log').write_text(text)
     identity['qemu_returncode'] = code
-    identity['guest_passed'] = (code == 0 and 'BoarOS: FAT32 user syscall checks ok' in text.splitlines() and
+    marker = 'STORAGE PASS windows=12' if args.storage_cost else 'BoarOS: FAT32 user syscall checks ok'
+    identity['guest_passed'] = (code == 0 and marker in text.splitlines() and
                               profile.root_success(text, 0) and
                               re.search(r'heap-live=(?:0x0|0)(?:[;\s]|$)', text) is not None and
                               'fat32 failure' not in text)
@@ -106,6 +120,11 @@ def main():
         source.seek(MIB)
         shutil.copyfileobj(source, target)
     execute(['fsck.fat', '-vn', partition], output / 'fat.fsck.log')
+    if args.storage_cost:
+        loop_result = output / 'loop-result.img'
+        execute(['debugfs', '-R', f'dump /loop.img {loop_result}', root], output / 'extract-loop.log')
+        execute(['e2fsck', '-fn', loop_result], output / 'loop.fsck.log')
+        identity['loop_fsck_passed'] = True
     identity['root_fsck_passed'] = identity['fat_fsck_passed'] = True
     identity_path.write_text(json.dumps(identity, indent=2) + '\n')
     print(f'PASS FAT32 {args.arch}: user syscalls, PID 1/heap release, ext4 and FAT fsck; {output}')
