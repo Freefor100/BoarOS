@@ -70,8 +70,6 @@ struct kernel_io_context {
     struct ext4_fs *ext4_last_fs;
     unsigned ext4_last_aborted;
     unsigned ext4_last_log_reservation_failed, ext4_last_memory_reservation_failed;
-    uint64_t ext4_last_sequence;
-    uint32_t ext4_last_tid;
     void *backend_domain;
     unsigned backend_state_depth;
     /* 默认UP可借用同domain的实际backend写guard；此时state guard为空。

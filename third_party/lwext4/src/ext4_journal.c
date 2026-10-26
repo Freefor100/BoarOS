@@ -2535,6 +2535,7 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
 	}
 	ext4_orphan_trans_finish_state_held(trans, abort);
 	ext4_operation_discard_super_state_held(&trans->operation);
+	ext4_operation_discard_inode_goals(&trans->operation);
 	jbd_free(trans);
 }
 
@@ -2793,7 +2794,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		if (rc != EOK) goto Finish;
         {
         JBD_STATE_SCOPE(journal);
-        ext4_operation_completed(&trans->operation, journal->accepted_sequence, journal->committed_id);
+        ext4_operation_completed(&trans->operation, journal->accepted_sequence);
         jbd_journal_free_trans_state_held(journal, trans, false);
         }
 		return rc;
@@ -2806,7 +2807,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
     ext4_orphan_trans_finish_state_held(trans, false);
     ext4_operation_publish_super(&trans->operation);
     journal->committed_id = trans->trans_id;
-    ext4_operation_completed(&trans->operation, journal->accepted_sequence, trans->trans_id);
+    ext4_operation_completed(&trans->operation, journal->accepted_sequence);
     journal->alloc_trans_id++;
     }
 
@@ -2998,7 +2999,9 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	if (operation->error) return operation->error;
 	struct jbd_data *data, *next_data;
 	if (TAILQ_EMPTY(&operation->buf_queue) && TAILQ_EMPTY(&operation->data_queue) && RB_EMPTY(&operation->revoke_root)) {
-		ext4_operation_completed(&operation->operation, journal->accepted_sequence, journal->committed_id);
+		/* An empty operation owns no accepted version. Its candidates must
+		 * not inherit an unrelated inode's current running group. */
+		ext4_operation_completed(&operation->operation, 0);
 		jbd_journal_free_trans_state_held(journal, operation, false);
 		return EOK;
 	}
@@ -3029,7 +3032,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
     ext4_operation_publish_super(&operation->operation);
 	ext4_orphan_trans_finish_state_held(operation, false);
 	ext4_operation_completed(&operation->operation,
-		running ? running->sequence : journal->accepted_sequence + 1, journal->committed_id);
+		running ? running->sequence : journal->accepted_sequence + 1);
 	jbd_quarantine_accept(journal, operation, running ? running : operation);
 	if (!running) {
 		running = operation;
@@ -3285,6 +3288,7 @@ int jbd_journal_retire_stage(struct jbd_journal *journal,
 		/* commit 屏障成功即形成恢复依据；home owner 继续归 checkpoint 队列。 */
 		journal->committed_id = trans->trans_id;
 		journal->durable_sequence = trans->sequence;
+		ext4_fs_retire_inode_goals(journal->jbd_fs->inode_ref.fs, journal->durable_sequence);
 		journal->committing = NULL;
 		jbd_release_prepared(trans);
 		/* ordered data 已到 home 持久边界，checkpoint 只再写 metadata。 */

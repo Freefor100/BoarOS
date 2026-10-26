@@ -83,6 +83,8 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	fs->jbd_journal = NULL;
 	fs->jbd_fs = NULL;
 	fs->orphan_index = NULL;
+	RB_INIT(&fs->inode_goals);
+	TAILQ_INIT(&fs->pending_inode_goals);
 	fs->super_replay_required = false;
 	fs->journaled_session = false;
 
@@ -912,17 +914,21 @@ int ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
 
 int ext4_fs_put_inode_ref(struct ext4_inode_ref *ref)
 {
+	int result = EOK;
 	/* Check if reference modified */
 	if (ref->dirty) {
+		result = ext4_operation_record_inode(ref->fs, ref->index, false);
 		/* Mark block dirty for writing changes to physical device */
 		ext4_fs_set_inode_checksum(ref);
-		ext4_trans_set_block_dirty_range(&ref->block,
+		int dirty = ext4_trans_set_block_dirty_range(&ref->block,
             (uint32_t)((uint8_t *)ref->inode - ref->block.data),
             ext4_get16(ext4_fs_super(ref->fs), inode_size));
+		if (!result) result = dirty;
 	}
 
 	/* Put back block, that contains i-node */
-	return ext4_block_set(ref->fs->bdev, &ref->block);
+	int cleanup = ext4_block_set(ref->fs->bdev, &ref->block);
+	return result ? result : cleanup;
 }
 
 void ext4_fs_inode_blocks_init(struct ext4_fs *fs,
@@ -997,6 +1003,7 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 		return rc;
 	}
 	rc = ext4_operation_claim_inode(fs, index);
+	if (!rc) rc = ext4_operation_record_inode(fs, index, true);
 	if (rc != EOK) {
 		ext4_fs_put_inode_ref(inode_ref);
 		ext4_ialloc_free_inode(fs, index, is_dir);

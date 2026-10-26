@@ -146,10 +146,6 @@ typedef struct ext4_file {
 	/**@brief   Actual file position.*/
 	uint64_t fpos;
 
-	/* Last completed journal dependency in this mounted session. */
-	uint32_t sync_tid;
-	uint64_t sync_sequence;
-	uint64_t data_sequence;
 	void *time_owner; /* Adapter-owned live inode; valid for this handle lifetime. */
 } ext4_file;
 
@@ -217,6 +213,8 @@ int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 /* Flush non-grouped metadata synchronously, or capture and request one fixed
  * grouped-journal durable target without waiting for it. Zero means complete. */
 int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *target);
+/* Snapshot and persist all accepted groups of this mount. */
+int ext4_filesystem_sync_metadata(const char *mount_point);
 
 /*****************************DIRECTORY DESCRIPTOR***************************/
 

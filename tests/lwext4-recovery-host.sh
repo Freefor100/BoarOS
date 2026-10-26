@@ -16,6 +16,9 @@ for blocksize in 1024 4096; do
     mkfs.ext4 -q -F -b "$blocksize" "$work/base.img"
     cp "$work/base.img" "$work/owner.img"
     timeout 30 "$work/probe" "$work/owner.img" owner-check
+    cp "$work/base.img" "$work/sync-goals.img"
+    timeout 30 "$work/probe" "$work/sync-goals.img" sync-goals
+    e2fsck -fn "$work/sync-goals.img" > "$work/fsck-sync-goals.log" 2>&1 || { cat "$work/fsck-sync-goals.log"; exit 1; }
     cp "$work/base.img" "$work/regrow.img"
     timeout 30 "$work/probe" "$work/regrow.img" shrink-regrow
     e2fsck -fn "$work/regrow.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }

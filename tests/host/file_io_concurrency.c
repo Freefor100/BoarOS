@@ -706,6 +706,15 @@ static void offset_handoff_case(struct kernel_heap *heap,struct kernel_vfs_mount
 }
 /* 独立同步不占文件位置或整次执行者；两个请求仍共享一个错误游标。 */
 static unsigned sync_pause,sync_entered,sync_resume,sync_progress;
+static struct kernel_vfs_file *write_sync_file;
+static uint64_t write_sync_start,write_sync_end;
+static int write_sync_data,write_sync_calls,write_sync_fail;
+static void observe_write_sync(struct kernel_vfs_file *file,uint64_t start,uint64_t end,int data_only)
+{
+    if (file!=write_sync_file) return;
+    write_sync_start=start;write_sync_end=end;write_sync_data=data_only;write_sync_calls++;
+    if (write_sync_fail) kernel_vfs_record_writeback_error(kernel_vfs_file_node(file),-KERNEL_EIO);
+}
 static void pause_sync_call(struct kernel_vfs_file *file)
 {
     if (control && kernel_vfs_file_node(file)==kernel_open_file_node(control) &&
@@ -720,8 +729,17 @@ int __real_kernel_vfs_sync_borrowing(struct kernel_vfs_file *,int,uint64_t *,con
 int __wrap_kernel_vfs_sync_borrowing(struct kernel_vfs_file *file,int data_only,uint64_t *observed,
     const struct kernel_lock_guard *borrowed)
 {
+    observe_write_sync(file,0,UINT64_MAX,data_only);
     pause_sync_call(file);
     return __real_kernel_vfs_sync_borrowing(file,data_only,observed,borrowed);
+}
+int __real_kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *,uint64_t,uint64_t,int,
+    uint64_t *,const struct kernel_lock_guard *);
+int __wrap_kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *file,uint64_t start,uint64_t end,
+    int data_only,uint64_t *observed,const struct kernel_lock_guard *borrowed)
+{
+    observe_write_sync(file,start,end,data_only);
+    return __real_kernel_vfs_sync_range_borrowing(file,start,end,data_only,observed,borrowed);
 }
 int __real_kernel_vfs_sync_range(struct kernel_vfs_file *,uint64_t,uint64_t,uint64_t *);
 int __wrap_kernel_vfs_sync_range(struct kernel_vfs_file *file,uint64_t start,uint64_t end,uint64_t *observed)
@@ -753,9 +771,55 @@ static void *sync_position_progress(void *argument)
     __atomic_store_n(&sync_progress,1,__ATOMIC_RELEASE);
     mm_test_finish();return NULL;
 }
+static void synchronous_write_ranges(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};struct kernel_open_file_description *file=NULL;
+    int error;int64_t result;size_t copied,written;
+    assert(!kernel_files_create(&local,heap) &&
+        !kernel_open_file_create_mode(heap,mount,"/sync-prefix",0600,&file,&error) && !error);
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    struct kernel_open_file_description *slot=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&slot));
+    uint64_t source=0x100000+2*BOAROS_PAGE_SIZE-4;
+    assert(!kernel_copy_to_user(&mm,source,"sync",4,&copied) && copied==4);
+    for (unsigned full=0;full<2;full++) for (unsigned append=0;append<2;append++)
+    for (unsigned mode=0;mode<4;mode++) for (unsigned fault=0;fault<2;fault++) {
+        file->open_flags=2;
+        assert(!kernel_files_ftruncate(&local,0,0,&result) && !result &&
+            !kernel_vfs_pwrite(&file->file,0,"seed!",5,&written) && written==5 &&
+            !kernel_files_lseek(&local,0,2,0,&result) && result==2);
+        file->open_flags=2|(full?KERNEL_FILES_O_SYNC:KERNEL_FILES_O_DSYNC)|
+            (append?KERNEL_FILES_O_APPEND:0);
+        struct kernel_uaccess_iovec iov[]={{source,4},{fault?source+4:source,4}};
+        assert(!kernel_copy_to_user(&mm,0x200000,iov,sizeof(iov),&copied) && copied==sizeof(iov));
+        write_sync_calls=0;write_sync_file=&file->file;
+        write_sync_fail=full && append && mode==3 && fault;
+        enum kernel_files_status status=mode==0?kernel_files_write(&local,&mm,0,source,fault?8:4,&result):
+            mode==1?kernel_files_pwrite(&local,&mm,0,source,fault?8:4,1,&result):
+            mode==2?kernel_files_writev(&local,&mm,0,0x200000,2,&result):
+                    kernel_files_pwritev(&local,&mm,0,0x200000,2,1,&result);
+        write_sync_file=NULL;
+        size_t start=append?5:(mode&1)?1:2;
+        size_t count=fault || mode<2?4:8;
+        assert(!status && result==(write_sync_fail?-KERNEL_EIO:(int64_t)count));
+        if (write_sync_calls!=1 || write_sync_start!=start || write_sync_end!=start+count || write_sync_data!=(int)!full)
+            fprintf(stderr,"FAIL sync accepted prefix: append=%u mode=%u fault=%u full=%u got=[%llu,%llu) data=%d\n",
+                append,mode,fault,full,(unsigned long long)write_sync_start,
+                (unsigned long long)write_sync_end,write_sync_data);
+        assert(write_sync_calls==1 && write_sync_start==start && write_sync_end==start+count && write_sync_data==(int)!full);
+        assert(file->offset==((mode&1)?2:start+count));
+        unsigned char actual[8];
+        assert(!kernel_open_file_pread(file,start,actual,count,&copied) && copied==count &&
+            !memcmp(actual,count==8?"syncsync":"sync",count));
+    }
+    write_sync_fail=0;
+    assert(!kernel_files_release(&local));
+    puts("PASS O_SYNC/O_DSYNC accepted ranges: scalar/vector, append/pwrite, EFAULT prefix and failed sync preserve content/offset");
+}
 static void sync_offset_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_page_cache *cache,int range_first)
 {
+    if (!range_first) synchronous_write_ranges(heap,mount);
     int error;size_t done;uint64_t observed=0;int64_t result;
     files=(struct kernel_files){0};assert(!kernel_files_create(&files,heap));
     assert(!kernel_open_file_create_mode(heap,mount,range_first?"/range-position":"/sync-position",0600,&control,&error) && !error);

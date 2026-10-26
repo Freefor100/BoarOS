@@ -7,6 +7,9 @@
 
 struct ext4_fs;
 struct jbd_trans;
+struct ext4_inode_goal;
+RB_HEAD(ext4_inode_goal_tree, ext4_inode_goal);
+TAILQ_HEAD(ext4_inode_goal_queue, ext4_inode_goal);
 enum ext4_resource_kind {
     EXT4_RESOURCE_INODE,
     EXT4_RESOURCE_ORPHAN,
@@ -29,6 +32,7 @@ struct ext4_operation {
     } super_publish;
     struct ext4_writeback_scope scope;
     void *staged_times;
+    struct ext4_inode_goal_tree inode_goals;
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_scope prepare_cost;
 #endif

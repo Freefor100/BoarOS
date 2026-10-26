@@ -1285,7 +1285,8 @@ static enum kernel_files_status regular_write_request(
     struct kernel_files *files,struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov,size_t iov_count,
-    uint64_t count,int positioned,uint64_t requested_offset,int64_t *linux_result)
+    uint64_t count,int positioned,uint64_t requested_offset,int64_t *linux_result,
+    uint64_t *accepted_end)
 {
     if (!count) { *linux_result=0; return KERNEL_FILES_STATUS_OK; }
     int append=(kernel_open_file_flags(description)&KERNEL_FILES_O_APPEND)!=0;
@@ -1299,6 +1300,7 @@ static enum kernel_files_status regular_write_request(
          completed.access!=KERNEL_UACCESS_STATUS_FAULT) || completed.written>count)
         return KERNEL_FILES_STATUS_STATE;
     KERNEL_FILES_NOTE(files,write_chunks,completed.chunks);
+    if (completed.written) *accepted_end=completed.end_offset;
     if (completed.written && !positioned) description->offset=completed.end_offset;
     if (error || completed.access==KERNEL_UACCESS_STATUS_FAULT) {
         if (completed.written) KERNEL_FILES_NOTE(files,write_failures,1);
@@ -1612,9 +1614,10 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
             kernel_mutex_lock(&description->offset_lock, &offset_guard);
     }
     enum kernel_files_status status;
+    uint64_t accepted_end=0;
     if (kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
         status=regular_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result);
+            positioned,requested_offset,linux_result,&accepted_end);
     } else {
         unsigned char small[KERNEL_FILES_WRITE_STAGING];
         unsigned char *staging = small;
@@ -1628,11 +1631,10 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
         (kernel_open_file_flags(description) & KERNEL_FILES_O_DSYNC) != 0U) {
         int datasync = (kernel_open_file_flags(description) & KERNEL_FILES_O_SYNC) !=
                         KERNEL_FILES_O_SYNC;
-        int64_t sync_result = 0;
         const struct kernel_lock_guard *borrow = offset_guard.lock ? &offset_guard : borrowed;
-        enum kernel_files_status synced = sync_pinned(description, datasync, &sync_result, borrow);
-        if (synced) return synced;
-        int error = (int)sync_result;
+        int error = kernel_vfs_sync_range_borrowing(&description->file,
+            accepted_end-(uint64_t)*linux_result,accepted_end,datasync,
+            &description->observed_writeback_error,borrow);
         /* generic_write_sync returns the error after accepted bytes have
          * advanced the OFD offset, including a prefix before usercopy fault. */
         if (error != 0) *linux_result = error;

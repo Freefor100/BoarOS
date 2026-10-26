@@ -69,6 +69,10 @@ static int source_fault_error;
 static unsigned write_error;
 static ext4_file *metadata_fault_file;
 static unsigned timestamp_fault, metadata_sync_fault;
+static ext4_file *times_sync_file;
+static unsigned times_sync_calls;
+static _Thread_local unsigned fixed_target_client;
+static unsigned fixed_target_waiting;
 static struct kernel_page_cache *current_cache;
 static struct kernel_vfs_instance *metadata_owner_instance;
 struct kernel_vfs_node *__real_kernel_vfs_node_find(struct kernel_vfs_instance *, uint64_t);
@@ -323,6 +327,8 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
         while (!__atomic_load_n(&load_registration_resume, __ATOMIC_ACQUIRE)) sched_yield();
     }
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && fixed_target_client && journal_wait_owner && queue==&journal_wait_owner->journal_progress)
+        __atomic_store_n(&fixed_target_waiting,1,__ATOMIC_RELEASE);
     if (!status && progress_writeback_caller && queue) __atomic_store_n(&progress_writeback_waiting,1,__ATOMIC_RELEASE);
     if (!status && age_observing && kernel_page_cache_is_executor(current_cache)) {
         if (deadline) {
@@ -371,11 +377,21 @@ int __real_ext4_fpwrite_batch(ext4_file *,struct file_write_span *,unsigned);
 int __real_ext4_file_writeback_times(ext4_file *,bool);
 int __wrap_ext4_file_writeback_times(ext4_file *file,bool wait)
 {
+    if (file==times_sync_file) times_sync_calls++;
     if (file==metadata_fault_file && timestamp_fault) {
         timestamp_fault=0;
         return KERNEL_EIO;
     }
     return __real_ext4_file_writeback_times(file,wait);
+}
+int __real_ext4_filesystem_sync_metadata(const char *);
+int __wrap_ext4_filesystem_sync_metadata(const char *mount)
+{
+    if (metadata_fault_file && metadata_sync_fault) {
+        metadata_sync_fault=0;
+        return KERNEL_EIO;
+    }
+    return __real_ext4_filesystem_sync_metadata(mount);
 }
 int __real_ext4_file_sync_metadata_mode(ext4_file *,bool);
 int __wrap_ext4_file_sync_metadata_mode(ext4_file *file,bool data_only)
@@ -3223,6 +3239,8 @@ static void progress_writeback_owners(struct kernel_page_cache *cache,const char
     puts("PASS progress I/O keeps its own writeback workspace and waits for busy entries; worker versions, exact disk contents and owners survive");
 }
 
+#include "sync_goal_cases.h"
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
@@ -3299,6 +3317,12 @@ int main(int argc, char **argv)
             goto owners;
         }
         assert(!kernel_page_cache_destroy(&cache));
+        if (!strcmp(argv[2],"datasync-times")) {
+            datasync_times(&heap,&pages,argv[1]);goto owners;
+        }
+        if (!strcmp(argv[2],"durable-fixed-target")) {
+            durable_fixed_target(&heap,&pages,argv[1]);goto owners;
+        }
         if (!strcmp(argv[2],"durable-progress")) {
             executor_durable_progress(&heap,&pages,argv[1]);
             goto owners;

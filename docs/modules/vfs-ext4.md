@@ -143,7 +143,7 @@ extent 树在读取节点时校验当前字节；实际修改通过 `ext4_ext_di
 `ext4_file_set_mode()` 不用 pathname，因此 fd 已 unlink 时仍可修改原 inode，
 挂载只读或已有日志错误先返回真实错误。活 node 的 mode 缓存同步更新，
 exec 权限检查可立即观察修改。该接口沿用现有
-`ext4_file_set_times()` 的事务、sync_tid 和错误所有权边界。
+`ext4_file_set_times()` 的事务、inode 同步目标和错误所有权边界。
 
 `kernel_vfs_file_set_owner()`复用活inode handle和后端独占锁；路径形式另持
 namespace锁，fd形式无需重新查路径。`ext4_file_set_owner()`将UID/GID、mode、
@@ -604,9 +604,21 @@ guest 测试不变。每份 4 GiB 工作镜像因此实际占用约 4 GiB，空�
 规模准备采用稀疏零页，另独立验证第 0 页已存在且已同步的真实旧内容被完整覆盖。
 重建 `make test-scale-riscv test-cache-growth-riscv`；这是成本界验证，吞吐结果另行测量。
 
-`kernel_vfs_sync_range()` 分批交接数据，捕获 full 同步序号后由调用者等待；
-`kernel_vfs_sync()` 按 datasync 选择 full/data，journal 提交线程负责屏障。
-元数据随修改提交，频繁小写与逐次同步的事务/flush 放大尚需单独计量。
+`kernel_vfs_sync_range()` 分批交接目标范围的数据，再固定该 inode 的 full 同步目标；
+普通文件的 `kernel_vfs_sync()` 按 datasync 选择 full/data。同步写传入实际接纳前缀，
+包括 append 的实际位置；fdatasync 不为独立待写时间戳另开事务，数据回写仍可在原事务中
+携带时间戳。目录同步选择 full，`syncfs` 则固定整个挂载当前已接纳的目标。
+
+lwext4 在操作的私有事务内登记实际修改的 inode 候选，成功接纳时发布到挂载持有的
+inode 目标树；abort 丢弃候选。目录项的增删和替换同时登记父目录与涉及的 inode，
+不依赖时钟是否可用或 inode 表是否顺带变脏。data 目标覆盖数据、大小及映射修改，
+full 还覆盖其余文件元数据。关闭重开从同一目标树取得尚未持久化的依赖，完成后的
+记录按 durable 序号退休；候选和已发布记录复用 journal 控制内存的额度、活动计费与
+归还规则。不把后来无关文件的挂载目标赋给当前文件，空事务也不发布新的 inode 依赖。
+
+同一日志组仍整体提交，journal 提交线程保留原有屏障。目标等待者复用现有封组目标与
+进度等待，不因旧目标晚到而强制封闭后续无关组；已完成目标直接返回。频繁小写与逐次
+同步的事务和 flush 放大仍需按相同工作量计量。
 
 | 串行边界 | 当前必要契约与限制 |
 |---|---|

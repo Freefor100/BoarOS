@@ -1770,7 +1770,7 @@ static void times_test(struct ext4_fs *fs, bool readonly)
     if (readonly) { CHECK(ext4_file_set_times(&f,7,t)==EROFS);CHECK(ext4_file_set_mode(&f,0751)==EROFS);CHECK(disk.writes==writes);CHECK(ext4_fclose(&f)==EOK);return; }
     CHECK(ext4_file_set_times(&f,7,t)==EOK);
     for(unsigned i=0;i<3;i++)expect_time(&f,i,t[i],extended);
-    CHECK(f.sync_tid==fs->jbd_journal->committed_id && f.sync_tid);
+    CHECK(fs->jbd_journal->committed_id);
     CHECK(ext4_file_sync_metadata(&f)==EOK);
     t[0]=(struct ext4_timestamp){12345,42};t[1].nanoseconds=UINT32_MAX;t[2]=(struct ext4_timestamp){1700000001,23};
     CHECK(ext4_file_set_times(&f,5,t)==EOK);
@@ -1780,10 +1780,10 @@ static void times_test(struct ext4_fs *fs, bool readonly)
         for(unsigned i=0;i<3;i++)t[i]=(struct ext4_timestamp){seconds[n],123456789};
         CHECK(ext4_file_set_times(&f,7,t)==EOK);for(unsigned i=0;i<3;i++)expect_time(&f,i,t[i],extended);
     }
-    CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);uint32_t tid=f.sync_tid;
+    CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);uint32_t tid=fs->jbd_journal->committed_id;
     CHECK(ext4_transaction_begin("/")==EOK);t[0]=(struct ext4_timestamp){9000,7};
     CHECK(ext4_file_set_times(&f,1,t)==EOK);CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
-    CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && f.sync_tid==tid);
+    CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && fs->jbd_journal->committed_id==tid);
     CHECK(ext4_transaction_begin("/")==EOK);CHECK(ext4_file_set_times(&f,1,t)==EOK);
     CHECK(ext4_file_set_times(&f,8,t)==EINVAL);CHECK(ext4_transaction_end("/")==EINVAL);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
@@ -1971,7 +1971,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
         CHECK(ext4_setxattr("/file","security.capability",19,cap,sizeof(cap))==EOK);
         CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     }
-    uint32_t tid=f.sync_tid;
+    uint32_t tid=fs->jbd_journal?fs->jbd_journal->committed_id:0;
     struct ext4_mount_stats untouched,stats;memset(&stats,0xa5,sizeof(stats));untouched=stats;
     struct ext4_timestamp t[3]={{1234,1},{5678,2},{9012,3}};
     bool stats_op=strstr(mode,"stats")!=NULL;
@@ -1987,7 +1987,8 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
     if(oom || !strcmp(mode,"read-stats")) {
         if(r!=EOK) {
             CHECK(r==(oom?ENOMEM:EIO));CHECK(!fs->jbd_journal || fs->jbd_journal->error==EOK);
-            CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) && f.sync_tid==tid);
+            CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)) &&
+                (!fs->jbd_journal || fs->jbd_journal->committed_id==tid));
             if(stats_op)CHECK(!memcmp(&untouched,&stats,sizeof(stats)));
         } else CHECK(oom && !point);
         if(stats_op)CHECK(ext4_mount_point_stats("/",&stats)==EOK && stats.overhead_blocks==expected);
@@ -2002,7 +2003,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
         return;
     }
     CHECK(r==EIO && fs->jbd_journal->error==EIO);
-    CHECK(ext4_file_set_times(&f,7,t)==EIO && f.sync_tid==tid);
+    CHECK(ext4_file_set_times(&f,7,t)==EIO && fs->jbd_journal->committed_id==tid);
     CHECK(ext4_mount_point_stats("/",&stats)==EIO && !memcmp(&untouched,&stats,sizeof(stats)));
     CHECK(ext4_umount("/")==EIO && fs->bdev->fs==fs);
     CHECK(fault_block_crash(&disk)==0);
@@ -2795,12 +2796,16 @@ static void handle_return_test(struct ext4_fs *fs)
     CHECK(ext4_journal_group_commit("/",true)==EOK);
     size_t written;
     CHECK(ext4_fpwrite(&file,8192,"B",1,&written)==EOK && written==1);
-    uint64_t size=file.fsize,sequence=file.sync_sequence,data=file.data_sequence;
-    uint32_t tid=file.sync_tid;
+    uint64_t size=file.fsize,sequence,data;
+    CHECK(ext4_file_sync_metadata_prepare(&file,false,&sequence)==EOK &&
+          ext4_file_sync_metadata_prepare(&file,true,&data)==EOK);
     CHECK(size==8193 && sequence>1 && data==sequence);
     __atomic_store_n(&handle_return_resume,1,__ATOMIC_RELEASE);
     CHECK(!pthread_join(first,NULL));
-    CHECK(file.fsize==size && file.sync_sequence==sequence && file.data_sequence==data && file.sync_tid==tid);
+    uint64_t later_sequence,later_data;
+    CHECK(ext4_file_sync_metadata_prepare(&file,false,&later_sequence)==EOK &&
+          ext4_file_sync_metadata_prepare(&file,true,&later_data)==EOK);
+    CHECK(file.fsize==size && later_sequence==sequence && later_data==data);
     struct ext4_inode inode;
     CHECK(ext4_fraw_inode_fill(&file,&inode)==EOK && ext4_inode_get_size(&fs->sb,&inode)==size);
     unsigned char byte;size_t read;

@@ -44,7 +44,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c kernel/block.c net/socket.c \
         third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
         ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--gc-sections,--wrap=ext4_fraw_inode_fill,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_lock_held,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user,--wrap=kernel_task_io_buffer_acquire,--wrap=kernel_uaccess_pin_user_page,--wrap=kernel_open_file_lookup_page \
-        -o "$build_dir/concurrency-$shift"
+        -Wl,--wrap=kernel_vfs_sync_range_borrowing -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
     mkfs.ext4 -q -F -b "${FILE_IO_HOST_BLOCK_SIZE:-4096}" ${FILE_IO_HOST_MKFS_ARGS:-} "$build_dir/image-$shift.img"
     timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift.img"
