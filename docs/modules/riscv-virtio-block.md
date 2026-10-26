@@ -67,6 +67,13 @@ VirtIO 将发布、通知、等待和收割分开。同一 batch 将磁盘连续
 
 ## 用户态块设备
 
+文件后备loop为每个绑定保留独立worker，避免上层文件系统持锁时在同一调用栈
+取得后备文件锁。标量、批量及journal阶段请求均由原调用者持有至完成；一批描述符
+只交接一次，worker经过真实后备OFD访问VFS／页缓存。批量读逐项保存完成字节与
+错误，短后备文件不阻止后续独立范围读取；写入在首个错误后停止。结果随同步返回
+交付，调用者的提前完成回调不转移到worker执行。原FD关闭或文件unlink不改变绑定，
+flush仍同步实际后备对象，解绑与自动清理沿设备使用者和在途请求归还后推进。
+
 块设备节点按真实 `st_rdev` 查找登记设备，普通打开建立独立的 block OFD，保留设备节点路径与设备引用，不进入普通文件页缓存。read/write/readv/writev 支持非扇区对齐的字节范围；pread/pwrite 不修改共享偏移，dup/fork 别名共同持有同一偏移和设备打开引用。读取容量末尾返回 0，跨末尾写返回可容纳的前缀，末尾开始的非空写返回 ENOSPC；lseek 仅允许设备容量以内的位置。普通打开可以与挂载或独占打开并存，`O_EXCL` 与挂载 claim 竞争同一个独占 owner。设备、挂载、OFD 和请求引用全部释放后才能注销。
 
 块节点打开先按调用者 fs IDs 和节点权限判断，已打开 OFD 保留原读写权利。`BLKROSET`、`BLKBSZSET`、`BLKFLSBUF` 在读取用户参数之前检查当前调用者的 CAP_SYS_ADMIN，缺少时按固定 Linux 返回 EACCES。loop 的 SET_STATUS/SET_STATUS64/SET_CAPACITY 则允许“原 OFD 有写打开权利”或 CAP_SYS_ADMIN；两者都没有时为 EPERM。绑定、解绑和 control 操作继续按具体设备打开及操作规则处理。

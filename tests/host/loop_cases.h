@@ -21,6 +21,63 @@ static int loop_test_ioctl(struct kernel_files *local,int fd,uint64_t command,ui
 }
 static void loop_test_close(struct kernel_files *local,int fd)
 { int64_t result;assert(!kernel_files_close(local,fd,&result) && !result); }
+static int loop_phase_span(const void *end,const void **cursor,struct kernel_block_span *out)
+{
+    const struct kernel_block_span *span=*cursor;
+    if (span==end) return 0;
+    *out=*span;*cursor=span+1;return 1;
+}
+static void loop_batch_case(void)
+{
+    struct kernel_block_device *device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(0));
+    assert(device && device->read_batch && device->write_batch && device->write_phase);
+    unsigned char source[2048],actual[2048];
+    for (size_t i=0;i<sizeof(source);i++) source[i]=(unsigned char)(i*13+29);
+    struct kernel_block_span spans[]={
+        {4096,source,512},{4608,source+512,512},{8192,source+1024,1024}};
+    assert(!kernel_block_write_batch(device,spans,3));
+    struct block_read_span reads[]={
+        {.offset=8192,.buffer=actual+1024,.size=1024},
+        {.offset=4096,.buffer=actual,.size=512},
+        {.offset=4608,.buffer=actual+512,.size=512}};
+    assert(!kernel_block_read_batch(device,reads,3,NULL));
+    for (unsigned i=0;i<3;i++) assert(!reads[i].status && reads[i].completed==reads[i].size);
+    assert(!memcmp(source,actual,sizeof(source)));
+    memset(source,0x8d,sizeof(source));
+    assert(!kernel_block_write_phase(device,loop_phase_span,spans+3,spans));
+    assert(!kernel_block_flush(device));memset(actual,0,sizeof(actual));
+    assert(!kernel_block_read_batch(device,reads,3,NULL) && !memcmp(source,actual,sizeof(source)));
+    kernel_block_put(device);
+    puts("PASS loop batch/phase: scattered targets and completed prefixes survive original FD close/unlink");
+}
+static void loop_batch_short_backing(struct kernel_vfs_mount *mount,
+    struct kernel_files *local,struct kernel_fs_context *local_fs)
+{
+    int backing=loop_test_open(local,local_fs,"/batch-short",0102|2);
+    int64_t result;
+    assert(backing>=0 && !kernel_files_ftruncate(local,backing,4096,&result) && !result);
+    int loop=loop_test_open(local,local_fs,"/loop0",2);assert(loop>=0);
+    assert(!loop_test_ioctl(local,loop,0x4c00,backing));
+    /* Capacity remains at its binding snapshot; the real file now ends in
+     * the second requested range. Later independent spans must still run. */
+    assert(!kernel_files_ftruncate(local,backing,768,&result) && !result);
+    struct kernel_block_device *device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(0));
+    unsigned char data[1536];memset(data,0x9a,sizeof(data));
+    struct block_read_span spans[]={
+        {.offset=0,.buffer=data,.size=512},
+        {.offset=512,.buffer=data+512,.size=512},
+        {.offset=0,.buffer=data+1024,.size=512}};
+    assert(kernel_block_read_batch(device,spans,3,NULL)==KERNEL_BLOCK_STATUS_IO);
+    assert(!spans[0].status && spans[0].completed==512 &&
+           spans[1].status==KERNEL_BLOCK_STATUS_IO && spans[1].completed==256 &&
+           !spans[2].status && spans[2].completed==512);
+    for (unsigned i=0;i<sizeof(data);i++) assert(data[i]==(i>=768 && i<1024?0x9a:0));
+    kernel_block_put(device);
+    assert(!loop_test_ioctl(local,loop,0x4c01,0));loop_test_close(local,loop);
+    assert(kernel_loop_release_unused()>=0);loop_test_close(local,backing);
+    assert(!kernel_vfs_unlink(mount,"/batch-short"));
+    puts("PASS loop batch short backing: exact copied prefix, untouched suffix, later span and owner return");
+}
 static int loop_backing_image(struct kernel_files *local,struct kernel_fs_context *local_fs,
     const char *path,const char *image_path)
 {
@@ -265,6 +322,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     assert(!loop_test_ioctl(&local,loop,0x4c00,backing));
     /* Binding must retain the real OFD after both namespace and fd owners go. */
     loop_test_close(&local,backing);assert(!kernel_vfs_unlink(mount,"/loop-backing"));
+    loop_batch_case();
     size_t copied;assert(!kernel_copy_to_user(&mm,0x200200,"loop-data",9,&copied));
     assert(!kernel_files_pwrite(&local,&mm,loop,0x200200,9,509,&result) && result==9);
     assert(!kernel_files_sync(&local,loop,0,&result) && !result);
@@ -304,6 +362,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     loop_test_close(&local,unbound);loop_test_close(&local,loop);
     loop_readonly_case(&local,&local_fs);
     loop_partial_sector_case(mount,&local,&local_fs);
+    loop_batch_short_backing(mount,&local,&local_fs);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c80,12)==12);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c81,12)==0);
     assert(kernel_loop_control_device.ioctl(NULL,NULL,&local,NULL,&mm,0x4c82,0)==0);

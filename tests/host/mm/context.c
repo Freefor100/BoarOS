@@ -23,6 +23,13 @@ static _Thread_local int force_task;
 struct kernel_scheduler scheduler={.initialized=KERNEL_SCHEDULER_INITIALIZED};
 void *sync_test_current_task(void) { return cpu.current; }
 void mm_test_activate_task(void) { force_task=1; cpu.current=&actor.task; }
+void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigned inherited)
+{
+    /* Hosted file actors have no PI edges or RT priority. Real futex exit
+     * still recalculates the empty donation set; an actual PI use is an error. */
+    assert(task==&actor.task && !base && !inherited && !task->scheduling.priority &&
+           !task->pi_owned && !task->pi_request);
+}
 void mm_test_finish(void)
 {
     struct kernel_io_context *current=kernel_io_context_current();

@@ -17,13 +17,18 @@
 #define LOOP_DEFAULT_COUNT 8U
 #define LOOP_MAX_NUMBER ((1U<<20)-1)
 enum loop_state { LOOP_UNBOUND, LOOP_BOUND, LOOP_RUNDOWN, LOOP_DETACHING, LOOP_FAILED };
-enum loop_operation { LOOP_READ, LOOP_WRITE, LOOP_FLUSH };
+enum loop_operation { LOOP_READ, LOOP_WRITE, LOOP_FLUSH, LOOP_READ_BATCH,
+    LOOP_WRITE_BATCH, LOOP_WRITE_PHASE };
 struct loop_request {
     struct loop_request *next;
     enum loop_operation operation;
     uint64_t offset;
     void *buffer;
     size_t size;
+    union {
+        struct { struct block_read_span *reads; const struct kernel_block_span *writes; size_t count; } batch;
+        struct { kernel_block_phase_next_fn next; const void *context, *first; } phase;
+    };
     int result, done;
     struct kernel_wait_queue changed;
 };
@@ -99,22 +104,60 @@ static int backing_sync(struct loop_device *loop)
         return kernel_block_file_sync(loop->backing);
     return kernel_vfs_sync(&loop->backing->file,0,&loop->backing->observed_writeback_error);
 }
+static enum kernel_block_status block_status(int error)
+{
+    return !error?KERNEL_BLOCK_STATUS_OK:error==-KERNEL_ENOMEM?KERNEL_BLOCK_STATUS_NO_MEMORY:
+        error==-KERNEL_EROFS?KERNEL_BLOCK_STATUS_READ_ONLY:KERNEL_BLOCK_STATUS_IO;
+}
+static int backing_transfer(struct loop_device *loop,int writing,uint64_t position,
+    void *buffer,size_t size,size_t *done)
+{
+    *done=0;
+    uint64_t offset=loop->info.offset+position;
+    int error;
+    if (!writing)
+        error=kernel_open_file_pread(loop->backing,offset,buffer,size,done);
+    else if (loop->info.flags&KERNEL_LOOP_READ_ONLY) return -KERNEL_EROFS;
+    else if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK)
+        error=kernel_block_file_pwrite(loop->backing,offset,buffer,size,done);
+    else {
+        error=kernel_vfs_file_modified(&loop->backing->file,offset,0);
+        if (!error) error=kernel_vfs_pwrite(&loop->backing->file,offset,buffer,size,done);
+    }
+    return error?error:*done==size?0:-KERNEL_EIO;
+}
 static int backing_io(struct loop_device *loop,struct loop_request *request)
 {
     if (request->operation==LOOP_FLUSH) return backing_sync(loop);
-    size_t done=0;
-    uint64_t offset=loop->info.offset+request->offset;
-    int error;
-    if (request->operation==LOOP_READ)
-        error=kernel_open_file_pread(loop->backing,offset,request->buffer,request->size,&done);
-    else if (loop->info.flags&KERNEL_LOOP_READ_ONLY) return -KERNEL_EROFS;
-    else if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK)
-        error=kernel_block_file_pwrite(loop->backing,offset,request->buffer,request->size,&done);
-    else {
-        error=kernel_vfs_file_modified(&loop->backing->file,offset,0);
-        if (!error) error=kernel_vfs_pwrite(&loop->backing->file,offset,request->buffer,request->size,&done);
+    size_t done;
+    if (request->operation==LOOP_READ || request->operation==LOOP_WRITE)
+        return backing_transfer(loop,request->operation==LOOP_WRITE,request->offset,
+            request->buffer,request->size,&done);
+    int result=0;
+    if (request->operation==LOOP_READ_BATCH) {
+        for (size_t i=0;i<request->batch.count;i++) {
+            struct block_read_span *span=&request->batch.reads[i];
+            int error=span->size?backing_transfer(loop,0,span->offset,span->buffer,
+                span->size,&span->completed):0;
+            if (!span->size) span->completed=0;
+            span->status=block_status(error);
+            if (!result) result=error;
+        }
+    } else if (request->operation==LOOP_WRITE_BATCH) {
+        for (size_t i=0;i<request->batch.count && !result;i++) {
+            const struct kernel_block_span *span=&request->batch.writes[i];
+            if (span->size) result=backing_transfer(loop,1,span->offset,
+                (void *)span->buffer,span->size,&done);
+        }
+    } else {
+        if (request->operation!=LOOP_WRITE_PHASE) __builtin_trap();
+        const void *cursor=request->phase.first;
+        struct kernel_block_span span;
+        while (!result && request->phase.next(request->phase.context,&cursor,&span))
+            if (span.size) result=backing_transfer(loop,1,span.offset,
+                (void *)span.buffer,span.size,&done);
     }
-    return error?error:done==request->size?0:-KERNEL_EIO;
+    return result;
 }
 static int detach_backing(struct loop_device *loop)
 {
@@ -186,37 +229,36 @@ static void loop_worker(void *argument)
         }
     }
 }
-static int submit(struct loop_device *loop,enum loop_operation operation,
-    uint64_t offset,void *buffer,size_t size)
+static int submit_request(struct loop_device *loop,struct loop_request *request)
 {
-    struct loop_request request={.operation=operation,.offset=offset,.buffer=buffer,.size=size};
-    kernel_wait_queue_init(&request.changed);
+    kernel_wait_queue_init(&request->changed);
     {
         KERNEL_RAW_SCOPE(guard,&loop->metadata);
         if (loop->state!=LOOP_BOUND) {
             int error=loop->state==LOOP_UNBOUND || loop->state==LOOP_RUNDOWN?-KERNEL_ENXIO:-KERNEL_EIO;
-            if (kernel_wait_queue_close(&request.changed) || kernel_wait_queue_destroy(&request.changed)) __builtin_trap();
+            if (kernel_wait_queue_close(&request->changed) || kernel_wait_queue_destroy(&request->changed)) __builtin_trap();
             return error;
         }
-        *loop->tail=&request;loop->tail=&request.next;wake(&loop->work);
+        *loop->tail=request;loop->tail=&request->next;wake(&loop->work);
     }
     for (;;) {
         struct kernel_wait_token token={0};
         {
             KERNEL_RAW_SCOPE(guard,&loop->metadata);
-            if (request.done) break;
-            if (kernel_wait_prepare(&request.changed,0,0,&token)) __builtin_trap();
+            if (request->done) break;
+            if (kernel_wait_prepare(&request->changed,0,0,&token)) __builtin_trap();
         }
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    if (kernel_wait_queue_close(&request.changed) || kernel_wait_queue_destroy(&request.changed)) __builtin_trap();
-    return request.result;
+    if (kernel_wait_queue_close(&request->changed) || kernel_wait_queue_destroy(&request->changed)) __builtin_trap();
+    return request->result;
 }
-static enum kernel_block_status block_status(int error)
+static int submit(struct loop_device *loop,enum loop_operation operation,
+    uint64_t offset,void *buffer,size_t size)
 {
-    return !error?KERNEL_BLOCK_STATUS_OK:error==-KERNEL_ENOMEM?KERNEL_BLOCK_STATUS_NO_MEMORY:
-        error==-KERNEL_EROFS?KERNEL_BLOCK_STATUS_READ_ONLY:KERNEL_BLOCK_STATUS_IO;
+    struct loop_request request={.operation=operation,.offset=offset,.buffer=buffer,.size=size};
+    return submit_request(loop,&request);
 }
 static enum kernel_block_status read_loop(void *context,uint64_t offset,void *buffer,size_t size)
 { return block_status(submit(context,LOOP_READ,offset,buffer,size)); }
@@ -224,6 +266,30 @@ static enum kernel_block_status write_loop(void *context,uint64_t offset,const v
 { return block_status(submit(context,LOOP_WRITE,offset,(void *)buffer,size)); }
 static enum kernel_block_status flush_loop(void *context)
 { return block_status(submit(context,LOOP_FLUSH,0,NULL,0)); }
+static enum kernel_block_status read_loop_batch(void *context,struct block_read_span *spans,
+    size_t count,const struct block_read_completion *completion)
+{
+    /* One worker borrows the entire vector. Synchronous return publishes all
+     * results; callbacks belonging to the caller are not run on its worker. */
+    (void)completion;
+    struct loop_request request={.operation=LOOP_READ_BATCH,.batch={.reads=spans,.count=count}};
+    int error=submit_request(context,&request);
+    if (!request.done) for (size_t i=0;i<count;i++) {
+        spans[i].completed=0;spans[i].status=block_status(error);
+    }
+    return block_status(error);
+}
+static enum kernel_block_status write_loop_batch(void *context,const struct kernel_block_span *spans,size_t count)
+{
+    struct loop_request request={.operation=LOOP_WRITE_BATCH,.batch={.writes=spans,.count=count}};
+    return block_status(submit_request(context,&request));
+}
+static enum kernel_block_status write_loop_phase(void *context,kernel_block_phase_next_fn next,
+    const void *next_context,const void *first)
+{
+    struct loop_request request={.operation=LOOP_WRITE_PHASE,.phase={next,next_context,first}};
+    return block_status(submit_request(context,&request));
+}
 static int open_loop(struct kernel_block_device *device,uint32_t flags)
 {
     (void)flags;struct loop_device *loop=device->context;
@@ -249,6 +315,7 @@ static void setup_loop(struct loop_device *loop,uint32_t number,struct kernel_he
     kernel_raw_lock_init(&loop->metadata,KERNEL_RAW_RANK_OBJECT);
     kernel_wait_queue_init(&loop->work);kernel_wait_queue_init(&loop->changed);
     loop->block=(struct kernel_block_device){.context=loop,.read=read_loop,.write=write_loop,
+        .read_batch=read_loop_batch,.write_batch=write_loop_batch,.write_phase=write_loop_phase,
         .flush=flush_loop,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK,
         .open=open_loop,.owners_changed=owners_changed,.ioctl=loop_ioctl};
 }
