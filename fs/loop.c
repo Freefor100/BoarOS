@@ -397,7 +397,8 @@ static int configure_loop(struct loop_device *loop,struct kernel_files *files,in
         }
         if (!error) {
             reap_worker(loop);
-            KERNEL_LOCK_SCOPE(io);kernel_mutex_lock(&loop->block.io_lock,&io);
+            KERNEL_LOCK_SCOPE(io);kernel_rwlock_write(&loop->block.phase_barrier,&io);
+            KERNEL_LOCK_SCOPE(io_transfer);kernel_rwlock_write(&loop->block.transfer_lock,&io_transfer);
             {
             KERNEL_RAW_SCOPE(guard,&loop->metadata);
             memset(&loop->info,0,sizeof(loop->info));
@@ -462,7 +463,8 @@ static int64_t loop_ioctl(struct kernel_block_device *device,struct kernel_files
         if (error) return error;
     }
     KERNEL_LOCK_SCOPE(control);kernel_mutex_lock(&loop_control,&control);
-    KERNEL_LOCK_SCOPE(io);kernel_mutex_lock(&device->io_lock,&io);
+    KERNEL_LOCK_SCOPE(io);kernel_rwlock_write(&device->phase_barrier,&io);
+    KERNEL_LOCK_SCOPE(io_transfer);kernel_rwlock_write(&device->transfer_lock,&io_transfer);
     if (loop->state==LOOP_UNBOUND || loop->state==LOOP_RUNDOWN) return -KERNEL_ENXIO;
     if (loop->state!=LOOP_BOUND) return -KERNEL_EIO;
     if (command==0x4c01) {
@@ -477,7 +479,7 @@ static int64_t loop_ioctl(struct kernel_block_device *device,struct kernel_files
     }
     if (command==0x4c05) {
         info=loop->info;
-        kernel_lock_release(&io);kernel_lock_release(&control);
+        kernel_lock_release(&io_transfer);kernel_lock_release(&io);kernel_lock_release(&control);
         return argument?transfer(mm,argument,&info,sizeof(info),0):-KERNEL_EINVAL;
     }
     if (command==0x4c03) {
@@ -487,7 +489,7 @@ static int64_t loop_ioctl(struct kernel_block_device *device,struct kernel_files
         memcpy(old.name,loop->info.file_name,sizeof(old.name));
         int error=(uint64_t)(int64_t)old.offset!=loop->info.offset ||
             old.device!=loop->info.device || old.rdevice!=loop->info.rdevice?-KERNEL_EOVERFLOW:0;
-        kernel_lock_release(&io);kernel_lock_release(&control);
+        kernel_lock_release(&io_transfer);kernel_lock_release(&io);kernel_lock_release(&control);
         return error?error:argument?transfer(mm,argument,&old,sizeof(old),0):-KERNEL_EINVAL;
     }
     if (command==0x4c02 || command==0x4c04 || command==0x4c07) {

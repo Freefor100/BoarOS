@@ -2552,12 +2552,12 @@ static void executor_durable_progress(struct kernel_heap *heap,
     assert(!kernel_vfs_pwrite(&writer,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     assert(!pthread_create(&reading,NULL,executor_cold_client,&reader));
     assert(!pthread_create(&close_thread,NULL,executor_close_client,&closing));
-    /* The real physical I/O mutex covers the held flush. A cold disk read
+    /* FLUSH retains exclusive transfer ownership through completion. A cold disk read
      * waits there, while cached data and CPU0 close work remain independent. */
     for (;;) {
         unsigned waiting;
-        { KERNEL_RAW_SCOPE(guard,&disk.io_lock.lock.metadata);
-          waiting=disk.io_lock.lock.pending_head!=NULL; }
+        { KERNEL_RAW_SCOPE(guard,&disk.transfer_lock.metadata);
+          waiting=disk.transfer_lock.pending_head!=NULL; }
         if (waiting) break;
         sched_yield();
     }

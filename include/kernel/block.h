@@ -88,7 +88,7 @@ struct kernel_block_device {
     void (*owners_changed)(struct kernel_block_device *);
     int64_t (*ioctl)(struct kernel_block_device *, struct kernel_files *,
         struct kernel_open_file_description **, struct kernel_mm *, uint64_t, uint64_t);
-    struct kernel_mutex io_lock;
+    struct kernel_rwlock phase_barrier;
     uint32_t io_initialized, references, open_count, notifications;
     uint32_t read_only, soft_block_size;
 
@@ -96,6 +96,7 @@ struct kernel_block_device {
     const void *claim_owner;
     uint64_t device_number;
     uint32_t registered;
+    struct kernel_rwlock transfer_lock;
 };
 
 /* Linux new_encode_dev(252, disk_index * 16); primary partitions add 1..4. */
@@ -126,8 +127,11 @@ void kernel_block_set_capacity(struct kernel_block_device *, uint64_t bytes);
 int kernel_block_set_read_only(struct kernel_block_device *, int read_only);
 int kernel_block_read_only(const struct kernel_block_device *);
 /* Task I/O and flush may execute on any CPU. Device references and the physical
- * parent io_lock cover completion; configuration and teardown retain their owners.
- * Byte I/O holds that lock across each sector read/modify/write. scratch must
+ * parent transfer lock cover completion. Flush/configuration take the phase
+ * barrier first, then exclusive transfer ownership to include both long phases
+ * and ordinary operations.
+ * Reads share the transfer lock; writes retain exclusive transfer ownership.
+ * Byte I/O retains it across each sector read/modify/write. scratch must
  * hold one logical sector and remains borrowed until the request returns.
  * completed always reports the prefix confirmed by successful callbacks,
  * including before a later error. A failing callback supplies no finer progress;
@@ -168,7 +172,9 @@ enum kernel_block_status kernel_block_write_batch(
 
 /* Internal journal phase: preflight the entire restartable producer before
  * publishing I/O. Payloads and producer nodes remain stable until return,
- * including on errors. Unlike write_batch, disjointness is established by the
+ * including on errors. Transfer ownership is returned between drained windows
+ * of at most 32 spans/128 KiB; flush/configuration wait for the entire call.
+ * Unlike write_batch, disjointness is established by the
  * journal's block ownership/indexes; this interface validates alignment,
  * capacity and RAM bounds. A missing callback writes in producer order. */
 enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,

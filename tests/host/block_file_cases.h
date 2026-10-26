@@ -9,7 +9,7 @@ struct raw_test_disk {
 static enum kernel_block_status raw_test_read(void *context, uint64_t offset, void *buffer, size_t size)
 {
     struct raw_test_disk *disk = context;
-    assert(!(offset % 512) && !(size % 512)); disk->reads++;
+    assert(!(offset % 512) && !(size % 512)); __atomic_fetch_add(&disk->reads,1,__ATOMIC_RELAXED);
     if (disk->fail_read && (!disk->fail_read_at || disk->reads == disk->fail_read_at))
         return disk->fail_read;
     memcpy(buffer, disk->bytes + offset, size);
@@ -69,8 +69,8 @@ static void raw_write_serialization(struct kernel_block_device *device, struct r
          * contention from thread creation or a ready message. */
         int waiting = 0;
         while (!waiting && !__atomic_load_n(&raw_aligned_done, __ATOMIC_ACQUIRE)) {
-            KERNEL_RAW_SCOPE(guard, &device->io_lock.lock.metadata);
-            waiting = device->io_lock.lock.pending_head != 0;
+            KERNEL_RAW_SCOPE(guard, &device->transfer_lock.metadata);
+            waiting = device->transfer_lock.pending_head != 0;
         }
         assert(waiting && !__atomic_load_n(&raw_aligned_done, __ATOMIC_ACQUIRE));
         __atomic_store_n(&raw_resume_read, 1, __ATOMIC_RELEASE);
@@ -80,6 +80,98 @@ static void raw_write_serialization(struct kernel_block_device *device, struct r
     }
     mm_test_finish(); mm_test_attach(0); mm_test_activate_task();
     puts("PASS raw sector RMW vs scalar/batch/journal-phase writes: actual mutex waiter, complete data and request owners");
+}
+static void *raw_reader_actor(void *argument)
+{
+    struct raw_race_call *call=argument;mm_test_attach(call->mode);
+    unsigned char bytes[512];
+    assert(!kernel_block_read_at(call->device,0,bytes,sizeof(bytes)));
+    for (unsigned i=0;i<sizeof(bytes);i++)assert(bytes[i]==0x6a);
+    if (call->mode==2)__atomic_store_n(&raw_aligned_done,1,__ATOMIC_RELEASE);
+    mm_test_finish();return 0;
+}
+static void *raw_flush_actor(void *argument)
+{
+    mm_test_attach(3);assert(!kernel_block_flush(argument));mm_test_finish();return 0;
+}
+static void raw_parallel_readers(struct kernel_block_device *device,struct raw_test_disk *disk)
+{
+    memset(disk->bytes,0x6a,sizeof(disk->bytes));
+    raw_pause_read=1;raw_read_copied=raw_resume_read=raw_aligned_done=0;
+    struct raw_race_call calls[2]={{device,1},{device,2}};pthread_t readers[2],flush;
+    assert(!pthread_create(&readers[0],0,raw_reader_actor,&calls[0]));
+    while (!__atomic_load_n(&raw_read_copied,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_create(&readers[1],0,raw_reader_actor,&calls[1]));
+    while (!__atomic_load_n(&raw_aligned_done,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_join(readers[1],0));
+    unsigned before=disk->flushes;
+    assert(!pthread_create(&flush,0,raw_flush_actor,device));
+    int waiting=0;
+    while (!waiting) {
+        KERNEL_RAW_SCOPE(guard,&device->transfer_lock.metadata);
+        waiting=device->transfer_lock.pending_head!=0;
+    }
+    assert(disk->flushes==before && device->references==2);
+    __atomic_store_n(&raw_resume_read,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(readers[0],0) && !pthread_join(flush,0));
+    assert(disk->flushes==before+1 && !device->references);
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    puts("PASS independent raw readers overlap; FLUSH remains actually queued until the last reader releases its request");
+}
+static unsigned char phase_source[256*1024],phase_disk[256*1024];
+static unsigned phase_entered,phase_resume,phase_read_done,phase_flush_done,phase_calls;
+static enum kernel_block_status phase_read(void *context,uint64_t offset,void *bytes,size_t size)
+{
+    (void)context;assert(offset+size<=sizeof(phase_disk));memcpy(bytes,phase_disk+offset,size);
+    __atomic_store_n(&phase_read_done,1,__ATOMIC_RELEASE);return 0;
+}
+static enum kernel_block_status phase_flush(void *context)
+{
+    (void)context;assert(phase_calls==2 && !memcmp(phase_source,phase_disk,sizeof(phase_disk)));
+    __atomic_store_n(&phase_flush_done,1,__ATOMIC_RELEASE);return 0;
+}
+static enum kernel_block_status phase_write_window(void *context,kernel_block_phase_next_fn next,
+    const void *owner,const void *cursor)
+{
+    (void)context;struct kernel_block_span span;size_t size=0;
+    while (next(owner,&cursor,&span)) {memcpy(phase_disk+span.offset,span.buffer,span.size);size+=span.size;}
+    assert(size==128*1024);phase_calls++;
+    if (phase_calls==1) {
+        __atomic_store_n(&phase_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&phase_resume,__ATOMIC_ACQUIRE))sched_yield();
+    } else assert(__atomic_load_n(&phase_read_done,__ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&phase_flush_done,__ATOMIC_ACQUIRE));
+    return 0;
+}
+static void *phase_writer_actor(void *argument)
+{
+    mm_test_attach(1);struct kernel_block_span span={0,phase_source,sizeof(phase_source)};
+    assert(!kernel_block_write_phase(argument,raw_phase_next,0,&span));mm_test_finish();return 0;
+}
+static void *phase_reader_actor(void *argument)
+{
+    mm_test_attach(2);unsigned char bytes[512];assert(!kernel_block_read_at(argument,0,bytes,sizeof(bytes)));
+    assert(!memcmp(bytes,phase_source,sizeof(bytes)));mm_test_finish();return 0;
+}
+static void raw_phase_fairness(void)
+{
+    struct kernel_block_device device={.read=phase_read,.write_phase=phase_write_window,
+        .flush=phase_flush,.logical_block_size=512,.capacity_bytes=sizeof(phase_disk)};
+    memset(phase_source,0x97,sizeof(phase_source));memset(phase_disk,0,sizeof(phase_disk));
+    phase_entered=phase_resume=phase_read_done=phase_flush_done=phase_calls=0;
+    pthread_t writer,reader,flusher;assert(!pthread_create(&writer,0,phase_writer_actor,&device));
+    while (!__atomic_load_n(&phase_entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!pthread_create(&reader,0,phase_reader_actor,&device));
+    int waiting=0;
+    while (!waiting) {KERNEL_RAW_SCOPE(guard,&device.transfer_lock.metadata);waiting=device.transfer_lock.pending_head!=0;}
+    assert(!pthread_create(&flusher,0,raw_flush_actor,&device));waiting=0;
+    while (!waiting) {KERNEL_RAW_SCOPE(guard,&device.phase_barrier.metadata);waiting=device.phase_barrier.pending_head!=0;}
+    assert(!phase_read_done && !phase_flush_done);
+    __atomic_store_n(&phase_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(writer,0) && !pthread_join(reader,0) && !pthread_join(flusher,0));
+    assert(phase_read_done && phase_flush_done && !device.references);
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    puts("PASS phase reader enters between drained128KiB windows; queued FLUSH waits for the entire producer and all owners return");
 }
 static void raw_kernel_prefix_case(struct kernel_open_file_description *file, struct raw_test_disk *disk,
     struct kernel_files *local)
@@ -151,6 +243,8 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     const uint64_t number = KERNEL_BLOCK_DEVICE_NUMBER(100);
     assert(!kernel_block_register(&device, number));
     raw_write_serialization(&device, &disk);
+    raw_parallel_readers(&device,&disk);
+    raw_phase_fairness();
     memset(disk.bytes, 0x3c, sizeof(disk.bytes));
     struct kernel_fs_context local_fs = {0}; struct kernel_files local = {0}, child = {0};
     assert(!kernel_fs_context_create(&local_fs, mount, heap) && !kernel_files_create(&local, heap));

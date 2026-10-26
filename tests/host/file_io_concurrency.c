@@ -599,15 +599,9 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     assert(!kernel_files_close(&files,0,&result) && !result && controls[0]->references==2);
     assert(!kernel_files_dup3(&files,1,0,0,&result) && result==0);
     assert(!pthread_create(&pending,0,crossing_read,&queued));
-    struct kernel_block_device *device=kernel_vfs_file_block_device(&controls[1]->file);
-    assert(device);
-    for (;;) {
-        unsigned waiting;
-        { KERNEL_RAW_SCOPE(guard,&device->io_lock.lock.metadata);
-          waiting=device->io_lock.lock.pending_head!=NULL; }
-        if (waiting) break;
-        sched_yield();
-    }
+    /* Independent cold reads now share transfer qualification. The replacement
+     * completes while the original OFD remains borrowed by the paused reader. */
+    assert(!pthread_join(pending,0) && !queued.status && queued.result==8 && !memcmp(queued.bytes,"replaced",8));
     struct kernel_page_cache_concurrency_state state;
     kernel_page_cache_get_concurrency_state(cache,&state);
     assert(!state.running && !state.pending && !pthread_create(&stopper,0,stop_requests,cache));
@@ -615,7 +609,6 @@ static void crossing_case(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     assert(controls[0]->references==2);
     __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);
     assert(!pthread_join(active,0) && !first.status && !memcmp(first.bytes,"original",8));
-    assert(!pthread_join(pending,0) && !queued.status && queued.result==8 && !memcmp(queued.bytes,"replaced",8));
     kernel_page_cache_get_concurrency_state(cache,&state);
     assert(!state.pending && !state.running && !state.entry_borrows && state.executions_queued==state.executions_completed);
     mm_test_attach(0); mm_test_activate_task(); assert(!kernel_files_release(&files));
