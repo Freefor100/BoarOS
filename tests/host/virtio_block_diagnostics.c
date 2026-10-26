@@ -805,7 +805,8 @@ static void sg_batch_case(unsigned version, unsigned queue_size, int writing, in
     struct block_read_span reads[8]; struct kernel_block_span writes[8];
     for (unsigned j = 0; j < sizeof(sg_disk); j++) sg_disk[j] = (unsigned char)(j * 7 + j / 512 + 3);
     for (unsigned i = 0; i < 8; i++) {
-        unsigned offset = i * (sparse ? 4096 : 512);
+        unsigned order = sparse == 2 ? (i % 2 ? 8 - (i + 1) / 2 : i / 2) : i;
+        unsigned offset = order * (sparse == 1 ? 4096 : 512);
         memset(batch_output[i], 0xa5, 4096);
         if (writing) for (unsigned j = 0; j < 512; j++) batch_output[i][j] = (unsigned char)(i + j * 13);
         reads[i] = (struct block_read_span){offset, batch_output[i], 512, 0, 0};
@@ -816,19 +817,21 @@ static void sg_batch_case(unsigned version, unsigned queue_size, int writing, in
     assert(result == (failing ? KERNEL_BLOCK_STATUS_IO : KERNEL_BLOCK_STATUS_OK));
     if (queue_size == 32) {
         assert(notifications == 1);
-        assert(first_notify_heads == (sparse ? 8U : 1U));
-        assert(device.statistics.requests == (sparse ? 8U : 1U));
-        assert(sg_max_segments == (sparse ? 1U : 8U));
+        assert(first_notify_heads == (sparse == 1 ? 8U : 1U));
+        assert(device.statistics.requests == (sparse == 1 ? 8U : 1U));
+        assert(sg_max_segments == (sparse == 1 ? 1U : 8U));
     } else {
         assert(sg_max_segments == queue_size - 2);
-        assert(device.statistics.requests == (queue_size == 4 ? 4U : 2U));
+        if (sparse != 2) assert(device.statistics.requests == (queue_size == 4 ? 4U : 2U));
+        else assert(device.statistics.requests >= 8U / (queue_size - 2) && device.statistics.requests <= 8);
     }
     assert(!park_calls && !device.statistics.sleeps && !device.statistics.timeouts);
     for (unsigned i = 0; i < 8; i++) {
         if (!writing) assert(reads[i].status == (failing ? KERNEL_BLOCK_STATUS_IO : KERNEL_BLOCK_STATUS_OK) &&
             reads[i].completed == (failing ? 0U : 512U));
         for (unsigned j = 0; j < 512; j++) {
-            unsigned offset = i * (sparse ? 4096 : 512) + j;
+            unsigned order = sparse == 2 ? (i % 2 ? 8 - (i + 1) / 2 : i / 2) : i;
+            unsigned offset = order * (sparse == 1 ? 4096 : 512) + j;
             if (!failing) assert(writing ? sg_disk[offset] == (unsigned char)(i + j * 13) :
                 batch_output[i][j] == (unsigned char)(offset * 7 + offset / 512 + 3));
             assert(batch_output[i][512 + j] == 0xa5);
@@ -1321,9 +1324,11 @@ int main(int argc, char **argv)
             fragmented_descriptors_case(version);
             for (int writing = 0; writing <= 1; writing++) {
                 sg_batch_case(version, 32, writing, 0, 0);
+                sg_batch_case(version, 32, writing, 2, 0);
                 sg_batch_case(version, 32, writing, 1, 0);
                 sg_batch_case(version, 32, writing, 0, 1);
                 sg_batch_case(version, 4, writing, 0, 0);
+                sg_batch_case(version, 4, writing, 2, 0);
                 sg_batch_case(version, 8, writing, 0, 0);
             }
         }

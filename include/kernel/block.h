@@ -46,12 +46,6 @@ typedef enum kernel_block_status (*kernel_block_write_fn)(
 
 #define KERNEL_BLOCK_BATCH_MAX 32U
 
-struct kernel_block_span {
-    uint64_t offset;
-    const void *buffer;
-    size_t size;
-};
-
 typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
     void *context, struct block_read_span *spans, size_t count,
     const struct block_read_completion *completion);

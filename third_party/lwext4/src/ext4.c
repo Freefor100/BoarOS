@@ -4524,7 +4524,7 @@ Failed:
 /* Non-journal writes borrow caller versions until synchronous DMA completes;
  * mapping ahead does not yet publish logical completion or inode size. */
 struct ext4_direct_write_batch {
-    struct ext4_block_span blocks[EXT4_BLOCK_BATCH_MAX];
+    struct kernel_block_span blocks[EXT4_BLOCK_BATCH_MAX];
     struct {
         struct file_write_span *span;
         uint64_t offset;
@@ -4567,9 +4567,9 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
         } else if (batch->logical[i].allocated) {
             /* The mapped-ahead suffix is gone; now remove queued blocks from
              * the end while preserving the device error as the operation error. */
-            for (uint32_t j = batch->blocks[i].count; j > 0; j--) {
+            for (uint32_t j = batch->blocks[i].size / block_size; j > 0; j--) {
                 int cleanup = ext4_fs_release_inode_dblk_idx(ref,
-                    batch->logical[i].offset / block_size + j - 1, batch->blocks[i].block + j - 1);
+                    batch->logical[i].offset / block_size + j - 1, batch->blocks[i].offset / block_size + j - 1);
                 if (!r) r = cleanup;
             }
         }
@@ -4725,18 +4725,18 @@ Retry:
                 unsigned n = direct->count;
                 bool merge = n && direct->logical[n-1].span == span &&
                     direct->logical[n-1].allocated == allocated &&
-                    direct->blocks[n-1].block + direct->blocks[n-1].count == physical &&
-                    (const uint8_t *)direct->blocks[n-1].data + (size_t)direct->blocks[n-1].count * block_size == input;
-                bool overlap = n && physical >= direct->blocks[n-1].block &&
-                    physical - direct->blocks[n-1].block < direct->blocks[n-1].count;
+                    direct->blocks[n-1].offset + direct->blocks[n-1].size == physical * block_size &&
+                    (const uint8_t *)direct->blocks[n-1].buffer + direct->blocks[n-1].size == input;
+                bool overlap = n && physical * block_size >= direct->blocks[n-1].offset &&
+                    physical * block_size - direct->blocks[n-1].offset < direct->blocks[n-1].size;
                 if ((!merge && n == EXT4_BLOCK_BATCH_MAX) || overlap || direct->bytes + block_size > 131072) {
                     r = ext4_direct_write_flush(&ref, file, direct, &range, range_next); n = 0; merge = false;
                 }
                 if (!r && merge) {
-                    direct->blocks[n-1].count++;
+                    direct->blocks[n-1].size += block_size;
                     direct->logical[n-1].length += length;
                 } else if (!r) {
-                    direct->blocks[n] = (struct ext4_block_span){input, physical, 1};
+                    direct->blocks[n] = (struct kernel_block_span){physical * block_size, input, block_size};
                     direct->logical[n].span = span; direct->logical[n].offset = file->fpos;
                     direct->logical[n].length = length; direct->logical[n].allocated = allocated;
                     direct->count++;

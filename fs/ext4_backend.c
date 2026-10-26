@@ -91,7 +91,7 @@ static int block_write(struct ext4_blockdev *device,
                        uint64_t block,
                        uint32_t count);
 static int block_write_batch(struct ext4_blockdev *device,
-                            const struct ext4_block_span *spans, unsigned count);
+                            const struct kernel_block_span *spans, unsigned count);
 static int block_close(struct ext4_blockdev *device);
 static int block_flush(struct ext4_blockdev *device);
 static int release_mount_storage(struct kernel_vfs_mount *mount);
@@ -774,24 +774,11 @@ static int block_close(struct ext4_blockdev *device)
 }
 
 static int block_write_batch(struct ext4_blockdev *device,
-                            const struct ext4_block_span *spans, unsigned count)
+                            const struct kernel_block_span *spans, unsigned count)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    struct kernel_block_span single = {0}, *physical = &single;
-    if (count > 1 && kernel_heap_allocate(adapter->instance.heap,
-            count * sizeof(*physical), (void **)&physical)) return ENOMEM;
-    for (unsigned i = 0; i < count; i++) {
-        if (spans[i].block > UINT64_MAX / device->bdif->ph_bsize ||
-            (uint64_t)spans[i].count * device->bdif->ph_bsize > SIZE_MAX) {
-            if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
-            return EINVAL;
-        }
-        physical[i] = (struct kernel_block_span){spans[i].block * device->bdif->ph_bsize,
-            spans[i].data, (size_t)spans[i].count * device->bdif->ph_bsize};
-    }
-    enum kernel_block_status status = kernel_block_write_batch(adapter->block, physical, count);
-    if (count > 1) kernel_heap_release(adapter->instance.heap, physical);
+    enum kernel_block_status status = kernel_block_write_batch(adapter->block, spans, count);
     switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
