@@ -130,7 +130,7 @@ struct kernel_page_cache_record {
     uint64_t readahead_cookie;
     int readahead_started;
 #endif
-
+    struct kernel_page_cache_entry *reclaim_cursor;
 };
 
 static int dirty_compare(struct kernel_page_cache_entry *a,struct kernel_page_cache_entry *b)
@@ -561,6 +561,7 @@ static int reserve_buckets(struct kernel_page_cache *cache,size_t count)
 static void lru_remove(struct kernel_page_cache_record *record,
                        struct kernel_page_cache_entry *entry)
 {
+    if (record->reclaim_cursor==entry) record->reclaim_cursor=entry->lru_previous;
     if (entry->lru_previous != 0) {
         entry->lru_previous->lru_next = entry->lru_next;
     } else {
@@ -2900,17 +2901,27 @@ void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
     uint64_t first = start >> BOAROS_PAGE_SHIFT, last = (end - 1) >> BOAROS_PAGE_SHIFT;
     {
         CACHE_SCOPE(guard,cache);
-        struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
-        while (entry) {
-            struct kernel_page_cache_entry *next = entry->node_next;
-            if (entry->page_index >= first && entry->page_index <= last) {
-                /* A prepared old snapshot waits for inode read protection. It
-                 * observes retirement before capture and cannot restore a hole. */
+        if (last-first<32) {
+            /* A small hole uses the existing page index, independent of how
+             * many unrelated pages of this inode remain cached. */
+            for (uint64_t index=first;index<=last;index++) {
+                int found;size_t bucket=find_bucket(cache->record,node,index,&found);
+                if (!found) continue;
+                struct kernel_page_cache_entry *entry=cache->record->buckets[bucket];
                 if (entry->dirty_end) __builtin_trap();
-                remove_entry(cache,entry);
-                cache_wake(&entry->ready);
+                remove_entry(cache,entry);cache_wake(&entry->ready);
             }
-            entry = next;
+        } else {
+            struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
+            while (entry) {
+                struct kernel_page_cache_entry *next = entry->node_next;
+                if (entry->page_index >= first && entry->page_index <= last) {
+                    /* A queued snapshot observes retirement before capture. */
+                    if (entry->dirty_end) __builtin_trap();
+                    remove_entry(cache,entry);cache_wake(&entry->ready);
+                }
+                entry = next;
+            }
         }
     }
     uint64_t released = 0;
@@ -2922,35 +2933,49 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
     if (!cache_live(cache) || !target_pages) return 0;
     uint64_t released=version_pool_reclaim(cache->record->versions,target_pages);
     if (released>=target_pages) return released;
-    struct kernel_page_cache_entry *retired=NULL;
+    struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+    if (held && held->lock->rank>=cache->record->metadata.lock.rank) return released;
+    struct kernel_page_cache_record *r=cache->record;
+    uint64_t scanned=0,limit;
     {
-        KERNEL_LOCK_SCOPE(guard);
-        struct kernel_lock_guard *held=kernel_io_context_current()->locks;
-        if (held && held->lock->rank>=cache->record->metadata.lock.rank) return released;
-        kernel_mutex_lock(&cache->record->metadata,&guard);
-        struct kernel_page_cache_record *r=cache->record;
-        r->statistics.reclaim_calls++;
-        struct kernel_page_cache_entry *entry=r->lru_tail;
-        uint64_t selected=0,scanned=0,limit=r->occupied;
-        while (entry && released+selected<target_pages && scanned++<limit) {
-            struct kernel_page_cache_entry *previous=entry->lru_previous;
-            uint32_t references;
-            if (!entry->dirty_end && !entry_loading(entry) && !entry->writeback && !entry->users &&
-                !entry->aliases && !__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE) &&
-                !physical_page_reference_count(cache->allocator,entry->physical_address,&references) && references==1) {
-                entry_borrow(entry);remove_entry(cache,entry);
-                /* node_next is no longer indexed; the borrowed retired entry owns this link. */
-                entry->node_next=retired;retired=entry;selected++;
-            }
-            entry=previous;
-        }
-    }
-    while (retired) {
-        struct kernel_page_cache_entry *entry=retired;retired=entry->node_next;
-        physical_page_release(cache->allocator,entry->physical_address);released++;
         CACHE_SCOPE(guard,cache);
-        entry->physical_address=0;entry->page_references_owned=0;entry->node_next=NULL;
-        entry_return(entry);
+        r->statistics.reclaim_calls++;
+        limit=r->occupied;
+    }
+    while (scanned<limit && released<target_pages) {
+        struct kernel_page_cache_entry *retired=NULL;
+        uint64_t selected=0;
+        {
+            CACHE_SCOPE(guard,cache);
+            if (!r->reclaim_cursor) r->reclaim_cursor=r->lru_tail;
+            unsigned window=0;
+            while (r->reclaim_cursor && released+selected<target_pages && scanned<limit && window<64) {
+                struct kernel_page_cache_entry *entry=r->reclaim_cursor;
+                r->reclaim_cursor=entry->lru_previous;scanned++;window++;
+                uint32_t references;
+                if (!entry->dirty_end && !entry_loading(entry) && !entry->writeback && !entry->users &&
+                    !entry->aliases && !__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE) &&
+                    !physical_page_reference_count(cache->allocator,entry->physical_address,&references) && references==1) {
+                    entry_borrow(entry);remove_entry(cache,entry);
+                    entry->node_next=retired;retired=entry;selected++;
+                }
+            }
+            if (!window) break;
+        }
+        /* Physical owners remain borrowed while the cache lock is absent.
+         * A lock window is bounded; allocation still scans a complete round. */
+        for (struct kernel_page_cache_entry *entry=retired;entry;entry=entry->node_next) {
+            if (physical_page_release(cache->allocator,entry->physical_address)) __builtin_trap();
+            released++;
+        }
+        if (retired) {
+            CACHE_SCOPE(guard,cache);
+            while (retired) {
+                struct kernel_page_cache_entry *entry=retired;retired=entry->node_next;
+                entry->physical_address=0;entry->page_references_owned=0;entry->node_next=NULL;
+                entry_return(entry);
+            }
+        }
     }
     { CACHE_SCOPE(guard,cache);
       cache->record->statistics.pages_reclaimed+=released;

@@ -2889,6 +2889,43 @@ static void *close_during_timestamp(void *unused)
     __atomic_store_n(&timestamp_owner.close_done,1,__ATOMIC_RELEASE);
     return NULL;
 }
+static void indexed_reclaim(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);
+    struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    assert(!kernel_vfs_create(&mount,"/reclaim-window",0600,&file));
+    assert(!kernel_vfs_ftruncate(&file,129U*BOAROS_PAGE_SIZE));
+    (void)kernel_page_cache_reclaim(cache,UINT64_MAX);
+    uint64_t held[129];size_t valid;
+    for (unsigned i=0;i<129;i++) assert(!kernel_page_cache_get(cache,&file,i,&held[i],&valid));
+    assert(!physical_page_release(cache->allocator,held[128]));
+    assert(kernel_page_cache_reclaim(cache,1)==1);
+    uint64_t address;
+    assert(kernel_page_cache_lookup(cache,&file,128,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    assert(!physical_page_release(cache->allocator,held[100]));
+    assert(kernel_page_cache_reclaim(cache,1)==1);
+    assert(kernel_page_cache_lookup(cache,&file,100,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    {
+        KERNEL_LOCK_SCOPE(writer);kernel_vfs_node_lock(node,&writer,1);
+        kernel_page_cache_invalidate_range(cache,node,99U*BOAROS_PAGE_SIZE,100U*BOAROS_PAGE_SIZE);
+    }
+    assert(kernel_page_cache_lookup(cache,&file,99,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    assert(!physical_page_release(cache->allocator,held[99]));
+    /* Touch the successor of a removed scan position before the next round. */
+    assert(!kernel_page_cache_get(cache,&file,98,&address,&valid));
+    assert(!physical_page_release(cache->allocator,address));
+    for (unsigned i=0;i<128;i++) if (i!=99 && i!=100)
+        assert(!physical_page_release(cache->allocator,held[i]));
+    assert(kernel_page_cache_reclaim(cache,UINT64_MAX)==126 && !node->cache_pages);
+    assert(!kernel_vfs_unlink(&mount,"/reclaim-window") && !kernel_vfs_close(&file));
+    assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
+    puts("PASS indexed range/reclaim:128 pinned predecessors, later clean victim, removed/touched scan position and all owners returned");
+}
 static void caller_metadata_owners(struct kernel_page_cache *cache, const char *path)
 {
     image_fd=open(path,O_RDWR); assert(image_fd>=0);
@@ -2973,6 +3010,10 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"indexed-reclaim")) {
+            indexed_reclaim(&cache,argv[1]);
+            goto owners;
+        }
 #ifdef CACHE_MM_CASES
         if (!strcmp(argv[2],"mremap")) {
             image_fd=open(argv[1],O_RDWR); assert(image_fd>=0);
