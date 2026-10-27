@@ -536,6 +536,10 @@ static bool ext4_xattr_is_block_valid(struct ext4_inode_ref *inode_ref,
 	 */
 	if (header->h_blocks != to_le32(1))
 		return false;
+	if (ext4_sb_feature_ro_com(&inode_ref->fs->sb,EXT4_FRO_COM_METADATA_CSUM) &&
+	    to_le32(header->h_checksum)!=ext4_xattr_block_checksum(inode_ref,block->lb_id,header)) {
+		return false;
+	}
 
 	/*
 	 * Check if those entries are maliciously corrupted to inflict harm
@@ -757,50 +761,34 @@ static int ext4_xattr_block_find_entry(struct ext4_inode_ref *inode_ref,
  * 	   If the IO operation or the buffer validation failed,
  * 	   return other value.
  */
-static int ext4_xattr_ibody_find_entry(struct ext4_inode_ref *inode_ref,
-				       struct ext4_xattr_finder *finder)
+/* Check bounds before even reading the header. A zero magic is an unused
+ * inline area; malformed nonzero contents must remain a visible I/O error. */
+static int ext4_xattr_ibody(struct ext4_inode_ref *ref,struct ext4_xattr_ibody_header **header)
 {
-	struct ext4_fs *fs = inode_ref->fs;
-	struct ext4_xattr_ibody_header *iheader;
-	size_t extra_isize =
-	    ext4_inode_get_extra_isize(&fs->sb, inode_ref->inode);
-	size_t inode_size = ext4_get16(&fs->sb, inode_size);
-
-	/* Initialize the caller-given finder */
-	finder->inode_ref = inode_ref;
-	memset(&finder->s, 0, sizeof(finder->s));
-
-	/*
-	 * If there is no extra inode space
-	 * set ext4_xattr_ibody_finder::s::not_found to true and return EOK
-	 */
-	if (!extra_isize) {
-		finder->s.not_found = true;
-		return EOK;
-	}
-	/* 扩展 inode 不必带 inline xattr；零 magic 是未初始化的属性区。 */
-	size_t offset = EXT4_GOOD_OLD_INODE_SIZE + extra_isize;
-	if ((extra_isize & 3U) || offset > inode_size) return EIO;
-	if (inode_size - offset < sizeof(*iheader) + sizeof(uint32_t)) {
-		finder->s.not_found = true;
-		return EOK;
-	}
-	iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
-	if (!iheader->h_magic) {
-		finder->s.not_found = true;
-		return EOK;
-	}
-
-	/* Check the validity of the buffer */
-	if (!ext4_xattr_is_ibody_valid(inode_ref))
-		return EIO;
-
-	iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
-	finder->s.base = EXT4_XATTR_IFIRST(iheader);
-	finder->s.end = (char *)inode_ref->inode + inode_size;
-	finder->s.first = EXT4_XATTR_IFIRST(iheader);
-	ext4_xattr_find_entry(&finder->i, &finder->s);
-	return EOK;
+    size_t extra=ext4_inode_get_extra_isize(&ref->fs->sb,ref->inode);
+    size_t size=ext4_get16(&ref->fs->sb,inode_size),offset=EXT4_GOOD_OLD_INODE_SIZE+extra;
+    *header=NULL;
+    if (!extra) return EOK;
+    if ((extra & 3U) || offset>size) return EIO;
+    if (size-offset<sizeof(**header)+sizeof(uint32_t)) return EOK;
+    struct ext4_xattr_ibody_header *candidate=EXT4_XATTR_IHDR(&ref->fs->sb,ref->inode);
+    if (!candidate->h_magic) return EOK;
+    if (!ext4_xattr_is_ibody_valid(ref)) return EIO;
+    *header=candidate;
+    return EOK;
+}
+static int ext4_xattr_ibody_find_entry(struct ext4_inode_ref *inode_ref,
+    struct ext4_xattr_finder *finder)
+{
+    struct ext4_xattr_ibody_header *header;
+    finder->inode_ref=inode_ref;memset(&finder->s,0,sizeof(finder->s));
+    int result=ext4_xattr_ibody(inode_ref,&header);
+    if (result) return result;
+    if (!header) {finder->s.not_found=true;return EOK;}
+    finder->s.base=finder->s.first=EXT4_XATTR_IFIRST(header);
+    finder->s.end=(char *)inode_ref->inode+ext4_get16(&inode_ref->fs->sb,inode_size);
+    ext4_xattr_find_entry(&finder->i,&finder->s);
+    return EOK;
 }
 
 /**
@@ -914,8 +902,6 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 	size_t buf_len = 0;
 	struct ext4_fs *fs = inode_ref->fs;
 	struct ext4_xattr_ibody_header *iheader;
-	size_t extra_isize =
-	    ext4_inode_get_extra_isize(&fs->sb, inode_ref->inode);
 	struct ext4_block block;
 	bool block_loaded = false;
 	ext4_fsblk_t xattr_block = 0;
@@ -927,8 +913,9 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 	 * If there is extra inode space and the xattr buffer in the
 	 * inode is valid.
 	 */
-	if (extra_isize && ext4_xattr_is_ibody_valid(inode_ref)) {
-		iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
+    ret=ext4_xattr_ibody(inode_ref,&iheader);
+    if (ret) goto out;
+	if (iheader) {
 		entry = EXT4_XATTR_IFIRST(iheader);
 
 		/*
@@ -942,7 +929,9 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 		 */
 		for (; !EXT4_XATTR_IS_LAST_ENTRY(entry);
 		     entry = EXT4_XATTR_NEXT(entry)) {
-			size_t name_len = entry->e_name_len;
+            size_t name_len=entry->e_name_len;
+            size_t align=_Alignof(struct ext4_xattr_list_entry);
+            size_t stride=(sizeof(struct ext4_xattr_list_entry)+name_len+1+align-1) & ~(align-1);
 			if (list) {
 				list->name_index = entry->e_name_index;
 				list->name_len = name_len;
@@ -954,17 +943,13 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 					list_prev->next = list;
 
 				list_prev = list;
-				list = (struct ext4_xattr_list_entry
-					    *)(list->name + name_len + 1);
+				list = (struct ext4_xattr_list_entry *)((char *)list+stride);
 			}
 
 			/*
 			 * Size calculation by pointer arithmetics.
 			 */
-			buf_len +=
-			    (char *)((struct ext4_xattr_list_entry *)0 + 1) +
-			    name_len + 1 -
-			    (char *)(struct ext4_xattr_list_entry *)0;
+			buf_len += stride;
 		}
 	}
 
@@ -1002,7 +987,9 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 		 */
 		for (; !EXT4_XATTR_IS_LAST_ENTRY(entry);
 		     entry = EXT4_XATTR_NEXT(entry)) {
-			size_t name_len = entry->e_name_len;
+            size_t name_len=entry->e_name_len;
+            size_t align=_Alignof(struct ext4_xattr_list_entry);
+            size_t stride=(sizeof(struct ext4_xattr_list_entry)+name_len+1+align-1) & ~(align-1);
 			if (list) {
 				list->name_index = entry->e_name_index;
 				list->name_len = name_len;
@@ -1014,17 +1001,13 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 					list_prev->next = list;
 
 				list_prev = list;
-				list = (struct ext4_xattr_list_entry
-					    *)(list->name + name_len + 1);
+				list = (struct ext4_xattr_list_entry *)((char *)list+stride);
 			}
 
 			/*
 			 * Size calculation by pointer arithmetics.
 			 */
-			buf_len +=
-			    (char *)((struct ext4_xattr_list_entry *)0 + 1) +
-			    name_len + 1 -
-			    (char *)(struct ext4_xattr_list_entry *)0;
+			buf_len += stride;
 		}
 	}
 	if (list_prev)
@@ -1033,8 +1016,7 @@ out:
 	if (ret == EOK && list_len)
 		*list_len = buf_len;
 
-	if (block_loaded)
-		ext4_block_set(fs->bdev, &block);
+    if (block_loaded) {int release=ext4_block_set(fs->bdev,&block);if (!ret) ret=release;}
 
 	return ret;
 }

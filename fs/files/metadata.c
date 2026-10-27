@@ -309,3 +309,73 @@ enum kernel_files_status kernel_files_fstatfs(
     if (!file) { *linux_result = -KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
     return copy_statfs(mm, file->file.mount, user_buffer, linux_result);
 }
+
+/* Input values are imported before resolving the target, as in Linux. The
+ * owned inode/FD then covers allocation, backend access and output faults. */
+enum kernel_files_status kernel_files_xattr(struct kernel_files *files,
+    const struct kernel_fs_context *fs,struct kernel_mm *mm,
+    const struct kernel_files_xattr_request *request,int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !mm || !request || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    enum kernel_xattr_operation op=request->operation;
+    if (op>KERNEL_XATTR_REMOVE) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    int result=0;size_t length=0,size=0,copied=0;char name[KERNEL_XATTR_NAME_MAX+1];void *value=NULL;
+    KERNEL_FILES_PIN_SCOPE(pin);KERNEL_FILES_PATH_SCOPE(path);
+    struct kernel_open_file_description *description=NULL;
+    if (op==KERNEL_XATTR_SET && (request->flags & ~3U)) {result=-KERNEL_EINVAL;goto Done;}
+    if (op!=KERNEL_XATTR_LIST) {
+        enum kernel_uaccess_status access=kernel_copy_string_from_user(mm,name,request->name,sizeof(name),&length);
+        if (access==KERNEL_UACCESS_STATUS_FAULT) {result=-KERNEL_EFAULT;goto Done;}
+        if (access==KERNEL_UACCESS_STATUS_TOO_LONG) {result=-KERNEL_ERANGE;goto Done;}
+        if (access!=KERNEL_UACCESS_STATUS_OK) goto State;
+        if (!name[0]) {result=-KERNEL_ERANGE;goto Done;}
+    }
+    if (op==KERNEL_XATTR_SET) {
+        if (request->size>KERNEL_XATTR_SIZE_MAX) {result=-KERNEL_E2BIG;goto Done;}
+        size=request->size;
+        if (size) {
+            enum kernel_heap_status status=kernel_heap_allocate(files->heap,size,&value);
+            if (status!=KERNEL_HEAP_STATUS_OK) {
+                if (status!=KERNEL_HEAP_STATUS_EMPTY) goto State;
+                result=-KERNEL_ENOMEM;goto Done;
+            }
+            enum kernel_uaccess_status access=kernel_copy_from_user(mm,value,request->value,size,&copied);
+            if (access==KERNEL_UACCESS_STATUS_FAULT) {result=-KERNEL_EFAULT;goto Done;}
+            if (access!=KERNEL_UACCESS_STATUS_OK || copied!=size) goto State;
+        }
+    }
+    if (request->by_fd) {
+        description=kernel_files_hold_fd(files,request->fd,&pin);
+        if (!description || kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PATH) {result=-KERNEL_EBADF;goto Done;}
+    } else {
+        enum kernel_files_status status=copy_metadata_path(files,fs,mm,KERNEL_FS_AT_FDCWD,
+            request->path,request->nofollow ? KERNEL_FILES_AT_SYMLINK_NOFOLLOW : 0,&path,&result);
+        if (status!=KERNEL_FILES_STATUS_OK) {kernel_files_release_allocation(files,value);return status;}
+        if (result) goto Done;
+    }
+    if (op==KERNEL_XATTR_GET || op==KERNEL_XATTR_LIST) {
+        size=request->size>KERNEL_XATTR_SIZE_MAX ? KERNEL_XATTR_SIZE_MAX : request->size;
+        if (size) {
+            enum kernel_heap_status status=kernel_heap_allocate(files->heap,size,&value);
+            if (status!=KERNEL_HEAP_STATUS_OK) {
+                if (status!=KERNEL_HEAP_STATUS_EMPTY) goto State;
+                result=-KERNEL_ENOMEM;goto Done;
+            }
+        }
+    }
+    if (description && !description->file.private_data)
+        result=op==KERNEL_XATTR_LIST ? 0 : -KERNEL_EOPNOTSUPP;
+    else result=description ? kernel_vfs_file_xattr(&description->file,op,name,value,size,request->flags) :
+                              kernel_vfs_path_xattr(path,op,name,value,size,request->flags);
+    if ((op==KERNEL_XATTR_GET || op==KERNEL_XATTR_LIST) && result>0 && size) {
+        enum kernel_uaccess_status access=kernel_copy_to_user(mm,request->value,value,(size_t)result,&copied);
+        if (access==KERNEL_UACCESS_STATUS_FAULT) result=-KERNEL_EFAULT;
+        else if (access!=KERNEL_UACCESS_STATUS_OK || copied!=(size_t)result) goto State;
+    } else if (result==-KERNEL_ERANGE && size==KERNEL_XATTR_SIZE_MAX) result=-KERNEL_E2BIG;
+Done:
+    kernel_files_release_allocation(files,value);*linux_result=result;
+    return KERNEL_FILES_STATUS_OK;
+State:
+    kernel_files_release_allocation(files,value);return KERNEL_FILES_STATUS_STATE;
+}

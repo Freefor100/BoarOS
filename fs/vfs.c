@@ -165,6 +165,92 @@ int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,struct kernel_vfs_exec
         ? node->instance->ops->exec_metadata(node,out) : 0;
 }
 
+static int xattr_permission(struct kernel_vfs_node *node, const char *name, int write)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if (!strncmp(name,"user.",5)) {
+        uint32_t type=node->mode & KERNEL_VFS_S_IFMT;
+        if (type!=KERNEL_VFS_S_IFREG && type!=KERNEL_VFS_S_IFDIR && type!=KERNEL_VFS_S_IFSOCK)
+            return write ? -KERNEL_EPERM : -KERNEL_ENODATA;
+        if (write && type==KERNEL_VFS_S_IFDIR && (node->mode & 01000U) &&
+            cred->fsuid!=node->uid && !kernel_credentials_capable(cred,KERNEL_CAP_FOWNER))
+            return -KERNEL_EPERM;
+        int result=node->instance->ops->permission ? node->instance->ops->permission(node,cred,write?2U:4U) :
+            kernel_vfs_dac_permission(node->mode,node->uid,node->gid,write?2U:4U,cred);
+        return result ? result : name[5] ? 0 : -KERNEL_EINVAL;
+    }
+    if (!strncmp(name,"trusted.",8)) {
+        if (!kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN)) return write ? -KERNEL_EPERM : -KERNEL_ENODATA;
+        return name[8] ? 0 : -KERNEL_EINVAL;
+    }
+    if (!strncmp(name,"security.",9)) {
+        if (write && !kernel_credentials_capable(cred,!strcmp(name,"security.capability") ? KERNEL_CAP_SETFCAP : KERNEL_CAP_SYS_ADMIN))
+            return -KERNEL_EPERM;
+        return name[9] ? 0 : -KERNEL_EINVAL;
+    }
+    return -KERNEL_EOPNOTSUPP;
+}
+static int capability_header(const void *value, size_t size, uint32_t *magic)
+{
+    if (size!=20 && size!=24) return -KERNEL_EINVAL;
+    memcpy(magic,value,4);
+    uint32_t revision=size==20 ? 0x02000000U : 0x03000000U;
+    return (*magic & ~1U)==revision ? 0 : -KERNEL_EINVAL;
+}
+int kernel_vfs_file_xattr(struct kernel_vfs_file *file, enum kernel_xattr_operation op,
+    const char *name, void *value, size_t size, uint32_t flags)
+{
+    KERNEL_SERVICE_SCOPE_IF(service,file && kernel_vfs_namespace_requires_cpu0(file->mount));
+    if (!file || !file->private_data || !file->mount || op>KERNEL_XATTR_REMOVE) return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node=file->private_data;
+    struct kernel_vfs_instance *instance=node->instance;
+    int write=op==KERNEL_XATTR_SET || op==KERNEL_XATTR_REMOVE;
+    KERNEL_LOCK_SCOPE(operation);
+    if (write) kernel_vfs_file_write_lock(file,&operation);
+    KERNEL_LOCK_SCOPE(inode);
+    kernel_vfs_node_lock(node,&inode,write);
+    if (instance->quiescing) return -KERNEL_EIO;
+    if (write && instance->read_only) return -KERNEL_EROFS;
+    int cap=op!=KERNEL_XATTR_LIST && !strcmp(name,"security.capability");
+    uint32_t magic=0;
+    /* Linux validates a nonempty filecap header before checking CAP_SETFCAP. */
+    if (cap && op==KERNEL_XATTR_SET && size) {
+        int result=capability_header(value,size,&magic);if (result) return result;
+        if (!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SETFCAP)) return -KERNEL_EPERM;
+        if (size==24) {
+            uint32_t root;memcpy(&root,(char *)value+20,4);
+            if (root==UINT32_MAX) return -KERNEL_EINVAL;
+        }
+    }
+    if (write && node->metadata_immutable) return -KERNEL_EPERM;
+    if (op!=KERNEL_XATTR_LIST) {
+        int result=xattr_permission(node,name,write && !(cap && op==KERNEL_XATTR_SET));
+        if (result) return result;
+    }
+    if (!instance->ops->xattr) return op==KERNEL_XATTR_LIST ? 0 : -KERNEL_EOPNOTSUPP;
+    if (op==KERNEL_XATTR_LIST) flags=kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN) ? KERNEL_XATTR_LIST_TRUSTED : 0;
+    if (cap && op==KERNEL_XATTR_GET) {
+        unsigned char raw[24];
+        int result=instance->ops->xattr(node,op,name,raw,sizeof(raw),0);
+        if (result<0) return result==-KERNEL_ERANGE ? -KERNEL_EINVAL : result;
+        if (capability_header(raw,(size_t)result,&magic)) return -KERNEL_EINVAL;
+        if (result==24) {
+            uint32_t root;memcpy(&root,raw+20,4);
+            if (root==UINT32_MAX) return -KERNEL_EOVERFLOW;
+            if (!root) {magic=0x02000000U|(magic & 1U);memcpy(raw,&magic,4);result=20;}
+        }
+        if (size && size<(size_t)result) return -KERNEL_ERANGE;
+        if (size) memcpy(value,raw,(size_t)result);
+        return result;
+    }
+    return instance->ops->xattr(node,op,name,value,size,flags);
+}
+int kernel_vfs_path_xattr(struct kernel_vfs_path *path, enum kernel_xattr_operation op,
+    const char *name, void *value, size_t size, uint32_t flags)
+{
+    return path ? kernel_vfs_file_xattr(&path->file,op,name,value,size,flags) : -KERNEL_EINVAL;
+}
+
 static int vfs_open_raw(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,

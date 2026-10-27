@@ -255,7 +255,7 @@ lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入�
 
 ## lwext4 配置和生命周期
 
-内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供exec读取及写入／chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。用户xattr修改和ACL syscall另列能力缺口。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
+内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用按实际inode执行的xattr操作供用户属性、exec及清除文件特权使用；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。用户属性入口见[共同文件接口](kernel-files.md#扩展属性)，ACL另列能力缺口。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
 
 事务接口 `ext4_transaction_begin/end/abort` 按实际任务的 `kernel_io_context` 查找当前文件系统的操作上下文。同任务、同挂载的嵌套修改共用这份上下文，前台任务及后台 worker 各自持有操作；挂载维护活动操作数。前台 file/path 引用覆盖事务控制分配至接纳或撤销，挂载管理排空这些使用者后停止日志。上下文在 journal transaction 中提供存储，无 journal 时由最外层操作单独持有。内部 `serial_writer` 查询核对实际 backend 写 guard、当前 owner 和串行锁 writer；不根据 CPU 数推断资格。私有访问持有自己的 after 镜像，原值默认借用第一份已接纳 payload；后来初始化的记录需要不同原值时，才准备独立 before 镜像。修改结束先去除未修改视图，再在一次挂载状态保护内借用实际修改集合的 LBA 索引并预留日志环额度；缺少的索引候选在保护外分配。索引借用覆盖准备至接纳或撤销，payload 独立覆盖实际读者。checkpoint 可在准备前退休旧索引；准备后有借用的空记录保留，接纳先关联新事务，最后借用归还且已无 dirty/checkpoint 使用者时释放。superblock 的计数和 orphan 变化按具体字段合并，其他同块字节检查版本冲突。
 
@@ -356,7 +356,7 @@ extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移
 
 执行文件持有 exec lease 后，在同一 inode 资格内取得 mode/owner、挂载 nosuid 和可读性，filecap 通过已打开 inode 的 security.capability 读取，支持内部/外部 EA。主 ELF 的属性参与执行凭据计算，PT_INTERP 仅检查可读性；nosuid 挂载跳过 filecap 读取。读取返回真实 EA 错误；属性超过 24 字节读取缓冲时返回 ERANGE，已读入但长度不符合对应 revision 的记录由执行凭据解析返回 EINVAL。
 
-写入在限额和文件最大位置检查后、用户复制前删除 filecap 并按 CAP_FSETID 与所属组清除 set-ID；后续 EFAULT 可以保留这项副作用。已确认没有 filecap 的活 inode 复用该事实，避免每次写入重读 EA；当前用户态没有 xattr 修改入口。截断把清特权和大小修改放在同一事务，拒绝 FSIZE 后保留原属性。ext4 fallocate 按固定 Linux 先接受 file_modified，再判断 FSIZE 和空间分配，因此后续限额/空间失败保留已清除的特权。每次属性事务失败仍回滚自己的模式、EA 和校验数据。共享 mmap 按文件系统既有 page_mkwrite 规则处理，不额外清 set-ID。
+写入在限额和文件最大位置检查后、用户复制前删除 filecap 并按 CAP_FSETID 与所属组清除 set-ID；后续 EFAULT 可以保留这项副作用。已确认没有 filecap 的活 inode 复用该事实，避免每次写入重读 EA；成功设置capability后，在同一inode写资格内撤销“属性不存在”的缓存；成功删除后发布缺失，失败保留原缓存。截断把清特权和大小修改放在同一事务，拒绝 FSIZE 后保留原属性。ext4 fallocate 按固定 Linux 先接受 file_modified，再判断 FSIZE 和空间分配，因此后续限额/空间失败保留已清除的特权。每次属性事务失败仍回滚自己的模式、EA 和校验数据。共享 mmap 按文件系统既有 page_mkwrite 规则处理，不额外清 set-ID。
 
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。根 mount 保存稳定的内部 ID 1 作为 `dev`，不表达物理设备 major/minor。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
 目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
@@ -1186,3 +1186,8 @@ supervisor先卸载根盘。两种profile都检查真实子程序状态，不能
 原RV `test-sqlite-rollback-riscv`、WAL/NBD及完整DELETE/WAL恢复矩阵保留。共用TTY
 输出CRLF后，NBD shell parser只把CRLF还原为LF，保留原字节与全部NBD请求；不删
 任意CR，不改变SQLite程序或放宽退出/WRITE/FLUSH/真实数据库门禁。
+
+用户扩展属性的后端操作持有VFS inode读／写资格。ext4_file_getxattr/listxattr直接借用
+已打开inode；set/remove通过既有metadata执行入口开始私有操作，修改内部／外部EA、
+ctime和校验数据，失败执行原有回滚及资源归还。未保留另一套完整路径重查接口。
+列表仅输出已接入的名称空间，trusted条目的可见性由共同权限层传入。

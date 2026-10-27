@@ -1,5 +1,6 @@
 /* Exercise each online executor with the same user-visible operations. */
 #include <sys/time.h>
+#include <sys/resource.h>
 static _Thread_local unsigned many_signals;
 static atomic_uint many_virtual, many_prof;
 struct many_cpu_work {
@@ -32,7 +33,19 @@ static void *many_cpu_worker(void *argument)
     uint64_t before=many_thread_time(),value=1;
     CHECK(!user_smp_register_probe(1) && many_signals==2);
     for(unsigned i=0;i<5000000;i++) {value=(value<<3)^(value>>7)^17;__asm__ volatile("" : "+r"(value));}
-    w->checksum=value;w->cpu_ns=many_thread_time()-before;CHECK(w->cpu_ns && tls_value==73);
+    w->checksum=value;
+    /* ITIMER_VIRTUAL counts user time only. Its first 10ms expiry includes
+     * Linux's extra tick; a fixed instruction count can finish before 20ms. */
+    struct rusage usage;struct timespec wall;
+    CHECK(!clock_gettime(CLOCK_MONOTONIC,&wall));
+    uint64_t deadline=(uint64_t)wall.tv_sec*1000000000U+wall.tv_nsec+5000000000U;
+    for (;;) {
+        CHECK(!getrusage(RUSAGE_THREAD,&usage));
+        if ((uint64_t)usage.ru_utime.tv_sec*1000000U+usage.ru_utime.tv_usec>=30000U) break;
+        for (unsigned i=0;i<100000;i++) {value=(value<<3)^(value>>7)^17;__asm__ volatile("" : "+r"(value));}
+        CHECK(!clock_gettime(CLOCK_MONOTONIC,&wall) && (uint64_t)wall.tv_sec*1000000000U+wall.tv_nsec<deadline);
+    }
+    w->cpu_ns=many_thread_time()-before;CHECK(w->cpu_ns && tls_value==73);
     /* All threads enter the same initially absent shared page. */
     w->shared[w->cpu*64]=(unsigned char)(71+w->cpu);
     unsigned char *private=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);

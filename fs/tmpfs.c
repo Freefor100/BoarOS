@@ -15,6 +15,11 @@
 
 RB_HEAD(tmp_name_tree, tmp_entry);
 RB_HEAD(tmp_cookie_tree, tmp_entry);
+struct tmp_xattr {
+    struct tmp_xattr *next;
+    size_t name_size,value_size;
+    char bytes[];
+};
 struct tmp_inode {
     RB_ENTRY(tmp_inode) index;
     struct tmp_name_tree names;
@@ -24,6 +29,7 @@ struct tmp_inode {
     struct kernel_memory_object *memory;
     char *target;
     struct kernel_vfs_timespec atime, mtime, ctime;
+    struct tmp_xattr *xattrs, *capability;
 };
 struct tmp_entry {
     RB_ENTRY(tmp_entry) name_index;
@@ -104,6 +110,68 @@ static struct tmp_entry *entry(struct tmp_inode *parent, const char *name, size_
     }
     return 0;
 }
+static void remove_attribute(struct tmp_mount *m,struct tmp_inode *i,struct tmp_xattr *attr)
+{
+    struct tmp_xattr **link=&i->xattrs;
+    while (*link!=attr) {if (!*link) __builtin_trap();link=&(*link)->next;}
+    *link=attr->next;
+    if (i->capability==attr) i->capability=NULL;
+    dispose(m,attr);
+}
+static int xattr_inode(struct kernel_vfs_node *n,enum kernel_xattr_operation op,
+    const char *name,void *value,size_t size,uint32_t flags)
+{
+    struct tmp_inode *i=ti(n);struct tmp_mount *m=tm(n->instance);
+    if (op==KERNEL_XATTR_LIST) {
+        size_t length=0;
+        for (struct tmp_xattr *a=i->xattrs;a;a=a->next) {
+            if (!(flags & KERNEL_XATTR_LIST_TRUSTED) && !strncmp(a->bytes,"trusted.",8)) continue;
+            length+=a->name_size;
+        }
+        if (size && size<length) return -KERNEL_ERANGE;
+        char *out=value;
+        if (size) for (struct tmp_xattr *a=i->xattrs;a;a=a->next) {
+            if (!(flags & KERNEL_XATTR_LIST_TRUSTED) && !strncmp(a->bytes,"trusted.",8)) continue;
+            memcpy(out,a->bytes,a->name_size);out+=a->name_size;
+        }
+        return (int)length;
+    }
+    struct tmp_xattr *a=i->xattrs;
+    while (a && strcmp(a->bytes,name)) a=a->next;
+    if (op==KERNEL_XATTR_GET) {
+        if (!a) return -KERNEL_ENODATA;
+        if (size && size<a->value_size) return -KERNEL_ERANGE;
+        if (size && a->value_size) memcpy(value,a->bytes+a->name_size,a->value_size);
+        return (int)a->value_size;
+    }
+    if (op==KERNEL_XATTR_SET) {
+        if (a && (flags & KERNEL_XATTR_CREATE)) return -KERNEL_EEXIST;
+        if (!a && (flags & KERNEL_XATTR_REPLACE)) return -KERNEL_ENODATA;
+        size_t namesize=strlen(name)+1;struct tmp_xattr *candidate;
+        int result=allocate(m,sizeof(*candidate)+namesize+size,(void **)&candidate);
+        if (result) return result;
+        candidate->name_size=namesize;candidate->value_size=size;
+        memcpy(candidate->bytes,name,namesize);
+        if (size) memcpy(candidate->bytes+namesize,value,size);
+        if (a) remove_attribute(m,i,a);
+        candidate->next=i->xattrs;i->xattrs=candidate;
+        if (!strcmp(name,"security.capability")) i->capability=candidate;
+    } else {
+        if (!a) return -KERNEL_ENODATA;
+        remove_attribute(m,i,a);
+    }
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);i->ctime=time;
+    return 0;
+}
+static int exec_metadata(struct kernel_vfs_node *n,struct kernel_vfs_exec_metadata *out)
+{
+    struct tmp_xattr *a=ti(n)->capability;
+    if (!a) return 0;
+    if (a->value_size>sizeof(out->filecap)) return -KERNEL_EINVAL;
+    memcpy(out->filecap,a->bytes+a->name_size,a->value_size);
+    out->filecap_size=a->value_size;out->filecap_present=1;return 0;
+}
 static void collect_inode(struct tmp_mount *m, struct tmp_inode *i)
 {
     if (i->links || i->handles) return;
@@ -112,6 +180,7 @@ static void collect_inode(struct tmp_mount *m, struct tmp_inode *i)
     m->inode_count--;
     if (!i->memory) dispose(m, i->target);
     if (i->memory) kernel_memory_object_release(&i->memory);
+    while (i->xattrs) remove_attribute(m,i,i->xattrs);
     dispose(m, i);
 }
 static int resolve(struct tmp_mount *m, const char *path, struct tmp_inode **out)
@@ -427,6 +496,7 @@ static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint6
 static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actual,int *changed)
 {
     struct tmp_inode *i=ti(n); kernel_memory_object_truncate(i->memory,size);
+    if (i->capability) remove_attribute(tm(n->instance),i,i->capability);
     i->mode=n->mode=kernel_vfs_write_mode(n->mode,n->gid);
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
@@ -505,6 +575,8 @@ static int set_owner(struct kernel_vfs_file *f, uint32_t uid, uint32_t gid)
     struct tmp_inode *i = ti(n);
     if (uid != UINT32_MAX) i->uid = uid;
     if (gid != UINT32_MAX) i->gid = gid;
+    if (i->capability && (i->mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR)
+        remove_attribute(tm(n->instance),i,i->capability);
     i->mode = kernel_vfs_chown_mode(i->mode,n->gid,i->gid);
     n->mode = f->mode = i->mode; n->uid=i->uid; n->gid=i->gid;
     struct kernel_vfs_timespec time=now();
@@ -527,7 +599,13 @@ static void accessed(struct kernel_vfs_file *f)
 }
 static int killpriv(struct kernel_vfs_node *n,uint32_t mode)
 {
-    if (n->mode!=mode) {ti(n)->mode=n->mode=mode;ti(n)->ctime=now();}
+    struct tmp_inode *i=ti(n);
+    if (n->mode!=mode || i->capability) {
+        if (i->capability) remove_attribute(tm(n->instance),i,i->capability);
+        i->mode=n->mode=mode;
+        struct kernel_vfs_timespec time=now();
+        KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);i->ctime=time;
+    }
     return 0;
 }
 static int modified(struct kernel_vfs_file *f,uint64_t offset,int append)
@@ -582,7 +660,7 @@ static void initialize_ops(void)
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->killpriv=killpriv; o->writeback_allowed=no_writeback;
-    o->flush=error; o->unmount=unmount;
+    o->flush=error; o->unmount=unmount; o->xattr=xattr_inode; o->exec_metadata=exec_metadata;
 }
 static int number(const char *p,size_t n,unsigned base,uint64_t *value)
 {

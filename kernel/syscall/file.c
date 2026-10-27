@@ -1587,3 +1587,33 @@ enum kernel_syscall_status syscall_handle_statfs(
     decoded->value = value;
     return KERNEL_SYSCALL_STATUS_OK;
 }
+
+enum kernel_syscall_status syscall_handle_xattr(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    unsigned index=(unsigned)request->number-5U,variant=index%3U;
+    struct kernel_files_xattr_request operation={.operation=index/3U,.by_fd=variant==2U,.nofollow=variant==1U,
+        .fd=(int32_t)request->arguments[0],.path=request->arguments[0]};
+    if (operation.operation==KERNEL_XATTR_LIST) {
+        operation.value=request->arguments[1];operation.size=request->arguments[2];
+    } else {
+        operation.name=request->arguments[1];
+        if (operation.operation!=KERNEL_XATTR_REMOVE) {
+            operation.value=request->arguments[2];operation.size=request->arguments[3];
+            if (operation.operation==KERNEL_XATTR_SET) operation.flags=(uint32_t)request->arguments[4];
+        }
+    }
+    struct kernel_files *files;struct kernel_mm *mm;const struct kernel_fs_context *fs=NULL;
+    enum kernel_task_status status=kernel_task_files_borrow(caller,&files);
+    if (status==KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;decoded->value=-KERNEL_EBADF;return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (status!=KERNEL_TASK_STATUS_OK || kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK ||
+        (!operation.by_fd && kernel_task_fs_context_borrow(caller,&fs)!=KERNEL_TASK_STATUS_OK))
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    int64_t result;
+    if (kernel_files_xattr(files,fs,mm,&operation,&result)!=KERNEL_FILES_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;decoded->value=result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}

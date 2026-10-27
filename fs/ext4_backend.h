@@ -64,7 +64,7 @@ struct lwext4_node {
     uint8_t write_completion;
 
     struct ext4_delalloc delalloc;
-    uint8_t capability_absent; /* No user xattr writer exists; cleared only by offline remount. */
+    uint8_t capability_absent; /* Inode writer updates this after capability set/remove and killpriv. */
 };
 _Static_assert(offsetof(struct lwext4_mount_adapter, instance) == 0,
                "mount private_data begins with its VFS instance");

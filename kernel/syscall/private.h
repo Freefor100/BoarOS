@@ -441,4 +441,6 @@ enum kernel_syscall_status syscall_handle_syslog(
 
 enum kernel_syscall_status syscall_handle_getrusage(struct kernel_task *,
     const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_xattr(struct kernel_task *,
+    const struct kernel_syscall_request *,struct kernel_syscall_result *);
 #endif

@@ -294,6 +294,30 @@ fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原ino
 另继承setgid位。命名FIFO走VFS inode，匿名pipe走共享pipe元数据；没有真实后端
 的其他合成对象保留各自属性接口行为。文件 DAC、创建所属身份及执行属性快照见[VFS/ext4](vfs-ext4.md)。
 
+### 扩展属性
+
+`set/lset/fsetxattr`、`get/lget/fgetxattr`、`list/llist/flistxattr`和
+`remove/lremove/fremovexattr`使用两架构共同的syscall 5～16。路径接口只解析一次，
+FD接口持有实际OFD并操作同一inode，改名或unlink后仍可使用。O_PATH的FD接口返回EBADF。
+输入值先完整导入，输出在后端资格释放后复制；输入故障保留原属性，输出故障保留实际复制前缀。
+名称最多255字节，值与列表输出缓冲区最多64KiB；零长度列表查询返回实际所需容量。
+ext4还受inode内部及单个外部EA块的实际容量约束。
+CREATE／REPLACE检查与修改处于同一inode写资格，失败保留原值。
+
+共同权限层使用当前fsuid/fsgid和capability：`user.*`检查对象读写权限及sticky目录所有者；
+`trusted.*`只向CAP_SYS_ADMIN调用者公开，列表先过滤再检查容量；`security.capability`
+按固定Linux的格式及CAP_SETFCAP规则设置，其余`security.*`修改要求CAP_SYS_ADMIN。
+只读挂载拒绝修改。ACL及其他`system.*`处理、匿名socketfs专属属性仍列后续。
+缺少属性后端的对象查询列表为空，其他操作返回该对象支持范围对应的错误。
+
+filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，其他有效rootid保留；
+原盘revision 1仍沿既有exec解析范围处理。空filecap的设置和无效值查询分别沿Linux规则，
+不把空值当成删除。tmpfs和ext4均把成功设置的原始属性交给exec；普通写入和chown等
+继续按原接口规则清除特权。实际存储与事务、缓存失效见[VFS与ext4](vfs-ext4.md)。
+
+短例入口为`sh tests/xattr-host.sh`和`tests/xattr.py`，使用同一ELF对照固定Linux。
+
+
 `utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；显式时间要求所有者或 CAP_FOWNER，全部使用当前时间也允许具有写访问权限的调用者。
 
 `statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；没有文件系统 mount 的 pipe/匿名 epoll/初始 console 返回 `ENOTSUP`，不伪装成根盘。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。

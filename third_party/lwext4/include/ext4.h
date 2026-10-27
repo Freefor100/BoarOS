@@ -772,48 +772,11 @@ int ext4_mknod(const char *path, int filetype, uint32_t dev);
  * @return  Standard error code.*/
 int ext4_readlink(const char *path, char *buf, size_t bufsize, size_t *rcnt);
 
-/**@brief Set extended attribute.
- *
- * @param path      Path to file/directory
- * @param name      Name of the entry to add.
- * @param name_len  Length of @name in bytes.
- * @param data      Data of the entry to add.
- * @param data_size Size of data to add.
- *
- * @return  Standard error code.*/
-int ext4_setxattr(const char *path, const char *name, size_t name_len,
-		  const void *data, size_t data_size);
-
-/**@brief Get extended attribute.
- *
- * @param path      Path to file/directory.
- * @param name      Name of the entry to get.
- * @param name_len  Length of @name in bytes.
- * @param buf      Data of the entry to get.
- * @param buf_size Size of data to get.
- *
- * @return  Standard error code.*/
-int ext4_getxattr(const char *path, const char *name, size_t name_len,
-		  void *buf, size_t buf_size, size_t *data_size);
-
-/**@brief List extended attributes.
- *
- * @param path     Path to file/directory.
- * @param list     List to hold the name of entries.
- * @param size     Size of @list in bytes.
- * @param ret_size Used bytes of @list.
- *
- * @return  Standard error code.*/
-int ext4_listxattr(const char *path, char *list, size_t size, size_t *ret_size);
-
-/**@brief Remove extended attribute.
- *
- * @param path     Path to file/directory.
- * @param name     Name of the entry to remove.
- * @param name_len Length of @name in bytes.
- *
- * @return  Standard error code.*/
-int ext4_removexattr(const char *path, const char *name, size_t name_len);
+/* Actual opened inode; mutations use the existing rollback/reclaim boundary. */
+int ext4_file_setxattr(ext4_file *,const char *,size_t,const void *,size_t,unsigned);
+int ext4_file_getxattr(ext4_file *,const char *,size_t,void *,size_t,size_t *);
+int ext4_file_listxattr(ext4_file *,char *,size_t,size_t *,bool);
+int ext4_file_removexattr(ext4_file *,const char *,size_t);
 
 
 /*********************************DIRECTORY OPERATION***********************/
