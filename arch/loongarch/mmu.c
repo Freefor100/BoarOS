@@ -1,6 +1,7 @@
 #include <arch/mmu.h>
 #include <arch/context.h>
 #include <arch/task.h>
+#include <arch/loongarch/smp.h>
 #include <platform/loongarch_virt.h>
 #include <string.h>
 #define ENTRIES (BOAROS_PAGE_SIZE/8)
@@ -28,10 +29,14 @@ void arch_mmu_flush_all(void) { flush_all(); }
 void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
     int instructions)
 {
+#if BOAROS_MAX_CPUS > 1
+    la_smp_sync_user(targets,address,size,instructions);
+#else
     if (targets & ~UINT32_C(1)) la_virt_fatal("unsupported MM CPU target");
     if (size == BOAROS_PAGE_SIZE) arch_mmu_flush_address(address);
     else flush_all();
     if (instructions) arch_mmu_sync_instructions();
+#endif
 }
 uint64_t arch_mmu_current_context(void)
 { uint64_t v; __asm__ volatile("csrrd %0, 0x19" : "=r"(v)); return v; }
@@ -111,6 +116,16 @@ static enum arch_mmu_status kernel_slot(struct physical_page_allocator *a,uint64
     uint64_t leaf=table(&kernel_window,root)[(v>>25)&(ENTRIES-1)];
     *slot=&table(&kernel_window,leaf)[(v>>14)&(ENTRIES-1)];return ARCH_MMU_STATUS_OK;
 }
+#if BOAROS_MAX_CPUS > 1
+void la_mmu_secondary_initialize(void)
+{
+    la_mmu_initialize();
+    uint64_t root=kernel_window.root_address;
+    if(!root)la_virt_fatal("secondary kernel page tables");
+    __asm__ volatile("csrwr %0,0x1a" : "+r"(root) :: "memory");
+    flush_all();
+}
+#endif
 enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *a,uint64_t v,uint64_t p)
 {
     uint64_t *slot;void *bytes;
@@ -119,7 +134,13 @@ enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *
     if((p&BOAROS_PAGE_MASK) || p>PTE_ADDRESS || physical_page_map_owned(a,p,&bytes)!=PHYSICAL_PAGE_STATUS_OK)return ARCH_MMU_STATUS_INVALID;
     if(*slot)return ARCH_MMU_STATUS_CONFLICT;
     *slot=p|PTE_PRESENT|PTE_VALID|PTE_DIRTY|PTE_WRITE|PTE_NX|0x10;
-    __asm__ volatile("dbar 0":::"memory");arch_mmu_flush_address(v);return ARCH_MMU_STATUS_OK;
+    __asm__ volatile("dbar 0":::"memory");
+#if BOAROS_MAX_CPUS > 1
+    la_smp_sync_kernel(v,BOAROS_PAGE_SIZE);
+#else
+    arch_mmu_flush_address(v);
+#endif
+    return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator *a,uint64_t v)
 {
@@ -127,7 +148,13 @@ enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator
     enum arch_mmu_status status=kernel_slot(a,v,&slot);
     if(status!=ARCH_MMU_STATUS_OK)return status;
     *slot=0;
-    __asm__ volatile("dbar 0":::"memory");arch_mmu_flush_address(v);return ARCH_MMU_STATUS_OK;
+    __asm__ volatile("dbar 0":::"memory");
+#if BOAROS_MAX_CPUS > 1
+    la_smp_sync_kernel(v,BOAROS_PAGE_SIZE);
+#else
+    arch_mmu_flush_address(v);
+#endif
+    return ARCH_MMU_STATUS_OK;
 }
 static uint64_t encode(uint64_t physical, uint32_t permissions, int cow)
 {

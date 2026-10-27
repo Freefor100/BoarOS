@@ -331,52 +331,54 @@ def run_loongarch(args):
     qemu=os.environ.get('QEMU_LOONGARCH64',profile.qemu)
     for platform in ('linux','boaros'):
         if args.only and args.only!=platform:continue
-        for memory in args.memory or ('512M','1G'):
-            case=work/f'{platform}-{memory}';case.mkdir()
-            image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','pi','futex_vector') else disk(case,program)
-            kernel=profile.linux_kernel(noswap=args.workload=='madvise') if platform=='linux' else args.kernel or ROOT/profile.kernel
-            snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
-            command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
-                '-device',profile.block('modern'),'-net','none']
-            if args.platform_config=='official':
-                command=command[:-2]+['-device','virtio-net-pci,netdev=net,addr=5,disable-legacy=on','-netdev','user,id=net','-rtc','base=utc']
-            if platform=='linux':command+=['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3']
-            try:code,raw=run_guest(command,120)
-            except subprocess.TimeoutExpired as error:code=-1;raw=error.output
-            (case/'console.log').write_text(raw)
-            passed=not code and ('FUTEX CALLER PASS cases=28' if args.workload=='futex' else 'POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
-                'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
-            if args.workload=='futex':
-                lines,expected=futex_lines(raw,1);passed=passed and lines==expected
-            if args.workload=='unix_named':passed=not code and unix_named_output(raw,False) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='unix_control':passed=not code and unix_control_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='unix_seqpacket':passed=not code and unix_seqpacket_output(raw,False,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
-            if args.workload=='sysv_msg':passed=not code and sysv_msg_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
-            if args.workload=='nproc':passed=not code and nproc_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='futex_vector':passed=not code and futex_vector_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='pi':passed=not code and pi_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='mount_attributes':passed=not code and mount_attributes_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='shm_query':passed=not code and shm_query_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='shm_lock':passed=not code and shm_lock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='madvise':passed=not code and madvise_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='kcmp':passed=not code and kcmp_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='memlock':passed=not code and memlock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='pidfd':passed=not code and pidfd_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='rt':passed=not code and rt_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='ipc_proc':passed=not code and ipc_proc_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='cpu':passed=not code and cpu_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='memory':passed=not code and memory_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            if args.workload=='sysv_sem':passed=not code and sysv_sem_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
-            if args.workload=='mremap':passed=not code and mremap_output(raw,1) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-            row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
-                'owner_baseline_checked':platform=='boaros'}
-            metadata['runs'][f'{platform}-{memory}']=row
-            (work/'result.json').write_text(json.dumps(metadata,indent=2)+'\n')
-            print(platform,memory,'PASS' if passed else 'FAIL',work,flush=True)
-            if not passed:print('\n'.join(raw.splitlines()[-20:]));return 1
-            with (case/'fsck.log').open('w') as log:subprocess.run(['e2fsck','-fn',str(image)],stdout=log,stderr=subprocess.STDOUT,check=True)
-            image.unlink();snapshot.unlink()
+        for cpus in args.cpus or (1,):
+            for memory in args.memory or ('512M','1G'):
+                case=work/(f'{platform}-{memory}'+(f'-{cpus}cpu' if args.cpus else ''));case.mkdir()
+                image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','pi','futex_vector') else disk(case,program)
+                kernel=profile.linux_kernel(noswap=args.workload=='madvise') if platform=='linux' else args.kernel or ROOT/profile.kernel
+                snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
+                command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
+                    '-device',profile.block('modern'),'-net','none']
+                command[command.index('-smp')+1]=str(cpus)
+                if args.platform_config=='official':
+                    command=command[:-2]+['-device','virtio-net-pci,netdev=net,addr=5,disable-legacy=on','-netdev','user,id=net','-rtc','base=utc']
+                if platform=='linux':command+=['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3']
+                try:code,raw=run_guest(command,120)
+                except subprocess.TimeoutExpired as error:code=-1;raw=error.output
+                (case/'console.log').write_text(raw)
+                passed=not code and ('FUTEX CALLER PASS cases=28' if args.workload=='futex' else 'POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
+                    'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
+                if args.workload=='futex':
+                    lines,expected=futex_lines(raw,cpus);passed=passed and lines==expected
+                if args.workload=='unix_named':passed=not code and unix_named_output(raw,False) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='unix_control':passed=not code and unix_control_output(raw,False,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='unix_seqpacket':passed=not code and unix_seqpacket_output(raw,False,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
+                if args.workload=='sysv_msg':passed=not code and sysv_msg_output(raw,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
+                if args.workload=='nproc':passed=not code and nproc_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='futex_vector':passed=not code and futex_vector_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='pi':passed=not code and pi_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='mount_attributes':passed=not code and mount_attributes_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='shm_query':passed=not code and shm_query_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='shm_lock':passed=not code and shm_lock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='madvise':passed=not code and madvise_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='kcmp':passed=not code and kcmp_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='memlock':passed=not code and memlock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='pidfd':passed=not code and pidfd_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='rt':passed=not code and rt_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='ipc_proc':passed=not code and ipc_proc_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='cpu':passed=not code and cpu_output(raw,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='memory':passed=not code and memory_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='sysv_sem':passed=not code and sysv_sem_output(raw,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else unix_seqpacket_owners(raw,'loongarch'))
+                if args.workload=='mremap':passed=not code and mremap_output(raw,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                row={'passed':passed,'qemu_returncode':code,'kernel_sha256':digest(snapshot),'command':command,
+                    'owner_baseline_checked':platform=='boaros'}
+                metadata['runs'][case.name]=row
+                (work/'result.json').write_text(json.dumps(metadata,indent=2)+'\n')
+                print(platform,memory,'PASS' if passed else 'FAIL',work,flush=True)
+                if not passed:print('\n'.join(raw.splitlines()[-20:]));return 1
+                with (case/'fsck.log').open('w') as log:subprocess.run(['e2fsck','-fn',str(image)],stdout=log,stderr=subprocess.STDOUT,check=True)
+                image.unlink();snapshot.unlink()
     return 0
 
 def run_smp(args):

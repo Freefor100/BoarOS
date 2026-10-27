@@ -21,7 +21,7 @@ RV支持独立构建的真实1～4核用户执行。匿名缺页、用户复制�
 
 | 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
-| 内存与 CPU | buddy/slab、VMA、按需页、共享映射、COW、mremap；RV真实1～4核，RV F/D、LA FPU/LSX/LASX | RV V、LA多核及扩展内存操作见[开发路线](docs/goals.md)；[MM](docs/modules/kernel-mm.md)、[RV多核](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
+| 内存与 CPU | buddy/slab、VMA、按需页、共享映射、COW、mremap；RV真实1～4核、LA真实1/2核，RV F/D、LA FPU/LSX/LASX | RV V、LA四核及扩展内存操作见[开发路线](docs/goals.md)；[MM](docs/modules/kernel-mm.md)、[RV多核](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
 | 进程与同步 | fork/vfork/pthread、exec/wait/退出；OTHER/FIFO/RR、deadline；robust及比较重排/复合唤醒futex、SysV信号量及SEM_UNDO、消息队列、实时信号队列、备用信号栈、CPU/POSIX定时器 | PI futex与futex_waitv保留后续；[调度](docs/modules/kernel-scheduler.md)、[信号量](docs/modules/sysv-sem.md)、[消息队列](docs/modules/sysv-msg.md)、[信号](docs/modules/kernel-signal.md) |
 | 文件与事件 | FD/OFD、向量/定位I/O、pipe/FIFO、poll/select/epoll、eventfd/timerfd/signalfd、记录锁、link/rename；可变身份、DAC、set-ID/filecap、tmpfs/ext4 xattr | 挂载和扩展接口边界见[开发路线](docs/goals.md)；[文件接口](docs/modules/kernel-files.md) |

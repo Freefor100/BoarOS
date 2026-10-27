@@ -13,6 +13,7 @@
 #include <kernel/console.h>
 #include <kernel/uaccess.h>
 #include <platform/loongarch_pci.h>
+#include <arch/loongarch/smp.h>
 #include <string.h>
 void la_trap_entry(void);
 void la_kernel_stack_overflow(uint64_t sp)
@@ -46,6 +47,9 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
 {
     uint64_t code=(frame->estat>>16)&63;
     int user=(frame->prmd&3)==3;
+#if BOAROS_USER_SMP
+    if(user){kernel_cpu_current()->user_traps++;if(!code)kernel_cpu_current()->user_local_interrupts++;}
+#endif
     struct kernel_cpu_account_scope accounting __attribute__((cleanup(kernel_cpu_account_trap_end)));
     kernel_cpu_account_trap_begin(&accounting,user,!code);
     if(!user && code>=1 && code<=7 && frame->badv>=ARCH_KERNEL_STACK_WINDOW_BASE &&
@@ -58,11 +62,21 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         /* ESTAT 包含被 mask 的外设；timer trap 不能顺便分发未启用的来源。 */
         pending=frame->estat&enabled&0x1fff;
     }
+#if BOAROS_MAX_CPUS > 1
+    if(!code && (pending&(1U<<12)))la_smp_handle_ipi();
+#endif
     int external_handled=!code && (pending&4);
     if(external_handled) la_virt_irq_dispatch();
     if (!code && (pending&(UINT64_C(1)<<11))) {
         uint64_t elapsed;
         if (la_timer_interrupt(&elapsed)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("timer interrupt");
+#if BOAROS_MAX_CPUS > 1
+        la_smp_timer_seen();
+        if(kernel_cpu_current()->logical_id) {
+            if(kernel_scheduler_on_tick(elapsed)!=KERNEL_SCHEDULER_STATUS_OK)la_virt_fatal("AP scheduler");
+            return;
+        }
+#endif
         if (elapsed) { kernel_tick_advance(elapsed); kernel_time_update_coarse(); kernel_scheduler_charge_ticks(elapsed,user); }
         if (kernel_scheduler_expire_deadlines(arch_time_read())!=KERNEL_SCHEDULER_STATUS_OK)
             la_virt_fatal("timer deadlines");
@@ -73,6 +87,9 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         return;
     }
     if(external_handled) return;
+#if BOAROS_MAX_CPUS > 1
+    if(!code && (pending&(1U<<12)))return;
+#endif
     if(user && (code==15 || code==16 || code==17)) {
         if(!la_fpu_first_use(code==15 ? 1 : code==16 ? 2 : 4))fault(4,1,frame->era);
         return;
@@ -162,8 +179,17 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
 void la_trap_return_prepare(struct arch_trap_frame *frame)
 {
     if ((frame->prmd&3)==3) {
-        kernel_task_prepare_user_return();
-        la_signal_prepare_user_return(frame);
+#if BOAROS_USER_SMP
+        do {
+            if(kernel_task_prepare_user_return()) {
+                la_signal_prepare_user_return(frame);
+                if(kernel_scheduler_user_service_active())kernel_scheduler_leave_user_service();
+            }
+        } while(kernel_scheduler_user_return_pending());
+        kernel_cpu_current()->user_returns++;
+#else
+        kernel_task_prepare_user_return();la_signal_prepare_user_return(frame);
+#endif
         kernel_cpu_account_user_return();
     }
     else kernel_scheduler_prepare_idle_return();

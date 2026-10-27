@@ -9,6 +9,25 @@
 #ifndef LA_STACK_CASE
 #define LA_STACK_CASE 0
 #endif
+#if BOAROS_MAX_CPUS > 1 && LA_STACK_CASE == 4
+static unsigned guard_ready,guard_entered;
+static uintptr_t guard_sp[2];
+void __real_la_kernel_stack_overflow(uint64_t);
+void __wrap_la_kernel_stack_overflow(uint64_t old_sp)
+{
+    unsigned cpu=kernel_cpu_current()->logical_id;
+    guard_sp[cpu]=arch_current_stack();
+    __atomic_fetch_or(&guard_entered,1U<<cpu,__ATOMIC_RELEASE);
+    uint64_t end=arch_time_read()+(uint64_t)la_timer_frequency()*5;
+    while(__atomic_load_n(&guard_entered,__ATOMIC_ACQUIRE)!=3)
+        if((int64_t)(arch_time_read()-end)>=0)la_virt_fatal("guard rendezvous");
+    if(cpu)for(;;)arch_cpu_wait();
+    if((guard_sp[0]>>14)==(guard_sp[1]>>14))la_virt_fatal("shared emergency stack");
+    la_virt_puts("LA SMP emergency stacks distinct PASS cpu0=");la_virt_hex(guard_sp[0]);
+    la_virt_puts(" cpu1=");la_virt_hex(guard_sp[1]);la_virt_puts("\n");
+    __real_la_kernel_stack_overflow(old_sp);
+}
+#endif
 static void probe(void *unused)
 {
     (void)unused;
@@ -17,6 +36,13 @@ static void probe(void *unused)
        task->stack_high>=ARCH_KERNEL_STACK_WINDOW_BASE+ARCH_KERNEL_STACK_WINDOW_SIZE)
         la_virt_fatal("kernel stack window inactive");
     uintptr_t bottom=task->stack_low-16;
+#if BOAROS_MAX_CPUS > 1 && LA_STACK_CASE == 4
+    __atomic_fetch_or(&guard_ready,1U<<kernel_cpu_current()->logical_id,__ATOMIC_RELEASE);
+    while(__atomic_load_n(&guard_ready,__ATOMIC_ACQUIRE)!=3){}
+    uintptr_t exhausted=bottom+128;
+    __asm__ volatile("move $sp,%0;break 0"::"r"(exhausted):"memory");
+    __builtin_unreachable();
+#endif
     if(LA_STACK_CASE==0) {
         la_virt_puts("LA actual guard write ready\n");
         *(volatile uint64_t *)(bottom-8)=1;
@@ -45,7 +71,13 @@ static void probe(void *unused)
 }
 void __wrap_la_boot_tasks(struct physical_page_allocator *a)
 {
+#if BOAROS_MAX_CPUS > 1 && LA_STACK_CASE == 4
+    static struct kernel_thread_join joins[2];
+    for(unsigned i=0;i<2;i++)if(kernel_thread_create_joinable_mask(probe,a,&joins[i],1U<<i)!=KERNEL_SCHEDULER_STATUS_OK)
+        la_virt_fatal("parallel guard create");
+#else
     if(kernel_thread_create(probe,a)!=KERNEL_SCHEDULER_STATUS_OK)la_virt_fatal("guard create");
+#endif
     if(la_timer_start(la_timer_frequency(),100)!=ARCH_TIMER_STATUS_OK)la_virt_fatal("guard timer");
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
     for(;;)__asm__ volatile("idle 0");

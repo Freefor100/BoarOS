@@ -1,10 +1,48 @@
 # LoongArch QEMU 启动与根盘
 
-当前验收范围为 QEMU virt、LA464、单核、LA64、16 KiB/三级页表，
-整数/FPU/LSX/LASX状态与本轮指定用户程序、平台矩阵；完整Harness/原生开发另行验收。
+当前验收范围为 QEMU virt、LA464、LA64、16 KiB/三级页表，默认单核，可选真实双核；
+覆盖整数/FPU/LSX/LASX状态与代表性用户程序；更广应用及客体原生开发另行验收。
 入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
 `platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
 默认 `all` 和 RV 测试入口保持原路径。
+
+## 双核执行
+
+`make LA_SMP=1 kernel-la`使用独立的`build/loongarch-smp2/`对象和内核，容量为两核，
+可实际启动一核或双核。普通`kernel-la`及官方默认参数保留单核。
+DTB的CPU列表在启动其他CPU前校验，启动CPU为逻辑CPU0，其余ID排序；超容量和非法拓扑
+在发布启动数据前拒绝。平台范围仍为QEMU virt；实板另行验收。
+
+CPU0通过IOCSR mailbox设置secondary物理入口，再发送启动IPI。secondary不清BSS，先配置
+DMW并进入高地址，取得自己常驻的idle、CPU记录和16KiB启动栈，再设置每核异常、MMU与timer。
+两核共用永久内核栈页表根，各自持有PGDH；timer的周期期限与调度期限归实际CPU。
+CPU1完成本地timer和IPI握手后发布ONLINE，CPU0随后进入根盘与普通用户启动。
+固件入口及IOCSR布局对照固定QEMU的`hw/loongarch/boot.c`和固定Linux的
+`arch/loongarch/kernel/smp.c`，版本统一由`references/sources.tsv`维护。
+
+调度队列、任务唯一执行者、CPU0服务资格沿共同实现。用户执行、信号构帧／恢复、共享MM、
+普通文件、管道及事件对象复用各自已经具备的跨核保护。设备外部中断、网络协议与控制、
+日志和后台写回继续由CPU0推进；CPU1只启用自己的timer和IPI。全局tick、粗粒度时间与
+期限扫描由CPU0推进。共同等待、POSIX timer和timerfd通过`arch/smp.h`选择实际架构的
+CPU0通知，不再直接调用RV接口。
+
+每个发起CPU持有一份同步TLB请求，包含地址、范围、指令同步要求和请求／完成代次。
+发起者禁止本地中断以固定执行CPU，在发布PTE后发送IPI；接收方失效TLB并按需要执行IBAR，
+最后发布完成代次。等待者同时处理已到达的远端请求，即使自己的确认已经先到，也在返回前
+处理对端请求；这覆盖两核均屏蔽中断并相互等待的交错。硬件IPI清除完成后才消费软件事件，
+后续通知由新事件或pending中断保留。页和页表沿共同MM退休集合持有，远端确认后才释放。
+内核栈槽的发布／撤销同样同步全部在线CPU。
+
+停止先检查CPU1已无用户、就绪资格及活动MM，发送STOP后等待它关中断、停timer并发布
+STOPPED，再清理根盘对象。停驻循环继续占用镜像常驻的AP栈、idle和CPU记录，不把它们
+当作可复用内存。启动、握手、TLB或停止确认失败输出目标CPU和阶段，并保持可能仍被使用的
+资源。两核各有独立的16KiB紧急故障栈；同时发生guard错误时不共用报错现场。
+
+短例使用`tests/workloads/smp/loongarch.c`，复用既有整数/FPU/SIMD寄存器探针。
+`tests/loongarch/smp.py`固定内核和ELF快照，覆盖实际CPU、信号、共享MM撤权／替换／解除映射、
+futex、CPU定时器、ext4并发及fork/COW/exec；同一程序可在固定Linux双核运行。
+`LA_SMP_TEST=1`仅在独立测试内核中强制双向TLB交错；2～5分别注入attach、握手、TLB及停止
+确认失败。`make LA_SMP=1 test-smp-guard-loongarch`直接触发两核guard错误并核对紧急栈分离。
 
 不可恢复的内核异常和栈溢出入口在输出任何寄存器或前缀前切换紧急控制台，
 直接轮询UART，绕过日志发布、TTY和等待通知。这样首错即使发生在调度域保护内，
@@ -80,7 +118,7 @@ LA syscall 从 a7/a0–a5 解码，返回 a0 并恢复 ERA+4。未知 syscall �
 坏复制指针返回 EFAULT；权限/未映射故障和访问内核地址按实际用户故障处理。
 合法缺页 OOM 使用 RESOURCE/NO_MEMORY 退出，不能误报为用户地址非法。
 rt_sigaction/rt_sigreturn 已接入共用信号策略和 LA 整数帧；布局、故障与重启契约见
-[信号模块](kernel-signal.md)。FPU/LSX/LASX扩展帧已接入，见[LA浮点/SIMD](loongarch-fpu.md)；sigaltstack未支持。
+[信号模块](kernel-signal.md)。FPU/LSX/LASX扩展帧和备用信号栈已接入，见[LA浮点/SIMD](loongarch-fpu.md)与信号模块。
 
 2026-10-06 在 512 MiB 和 1 GiB 下完成：
 

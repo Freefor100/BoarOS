@@ -14,6 +14,13 @@ static inline uint64_t arch_time_read(void)
 #else
 uint64_t arch_time_read(void);
 #endif
+#if defined(__loongarch__)
+static inline uint64_t arch_time_read_ordered(void)
+{
+    __asm__ volatile("dbar 0" ::: "memory");
+    return arch_time_read();
+}
+#endif
 uint32_t la_timer_frequency(void);
 enum arch_timer_status la_timer_start(uint32_t, uint32_t);
 enum arch_timer_status la_timer_interrupt(uint64_t *);
