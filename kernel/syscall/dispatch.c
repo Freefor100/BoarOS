@@ -377,6 +377,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if(syscall_handle_pidfd_signal(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 74U) {
         if(syscall_handle_signalfd(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number>=5U && request->number<=16U) {
+        if (syscall_handle_xattr(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number>=107U && request->number<=111U) {
         if(syscall_handle_posix_timer(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

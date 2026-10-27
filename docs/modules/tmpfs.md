@@ -67,8 +67,12 @@ ENOSPC，真实内存分配失败为 ENOMEM，已写部分仍返回进展。映�
 fsync/fdatasync/msync 完成内存文件契约，不提交磁盘 I/O，也不承诺重启后数据保留。
 
 只读和忙卸载沿通用 VFS 契约。尚无 remount、bind、move、lazy/force unmount、
-ACL、xattr、swap、SysV 信号量/消息队列；
-SysV 共享内存已由共用内存后备对象实现。挂载扩展的剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
+ACL和swap。SysV IPC由共同IPC模块提供。挂载扩展的剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
+
+扩展属性归inode所有，使用不可变的名称／值记录，在inode资格内替换、删除和查询；
+打开对象及硬链接保留它们，最后一个链接和使用者结束后释放。capability记录另有实际指针，
+普通写入无属性时只作空判断；设置、chown和截断按共同文件权限规则维护它。
+名称空间、Linux ABI和filecap查询格式见[共同文件接口](kernel-files.md#扩展属性)。
 
 ## 验证入口
 

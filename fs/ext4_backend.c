@@ -1895,6 +1895,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     if (path) result=ext4_fraw_inode_fill(lwext4_node_file(node),&initial);
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
+    node->metadata_immutable=!!(ext4_inode_get_flags(&initial) & (EXT4_INODE_FLAG_IMMUTABLE | EXT4_INODE_FLAG_APPEND));
     if (!result) initialize_times(node,adapter,&initial);
     if(!result)result=retain_node_inode(node);
     if (result) {
@@ -2031,6 +2032,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
+    node->metadata_immutable=!!(ext4_inode_get_flags(&initial) & (EXT4_INODE_FLAG_IMMUTABLE | EXT4_INODE_FLAG_APPEND));
     initialize_times(node, adapter, &initial);
     ((struct lwext4_node *)node)->capability_absent=1;
     return kernel_vfs_publish_node(mount, node, file, 1);
@@ -2069,6 +2071,24 @@ static int ext4_backend_exec_metadata(struct kernel_vfs_node *node,struct kernel
     if (result) return lwext4_error(result);
     out->filecap_size=size;out->filecap_present=1;
     return 0;
+}
+static int ext4_backend_xattr(struct kernel_vfs_node *node,enum kernel_xattr_operation op,
+    const char *name,void *value,size_t size,uint32_t flags)
+{
+    ext4_file *file=lwext4_node_file(node);size_t count=0;int result;
+    switch (op) {
+    case KERNEL_XATTR_SET: result=ext4_file_setxattr(file,name,strlen(name),value,size,flags);break;
+    case KERNEL_XATTR_GET: result=ext4_file_getxattr(file,name,strlen(name),value,size,&count);break;
+    case KERNEL_XATTR_LIST: result=ext4_file_listxattr(file,value,size,&count,flags & KERNEL_XATTR_LIST_TRUSTED);break;
+    case KERNEL_XATTR_REMOVE: result=ext4_file_removexattr(file,name,strlen(name));break;
+    default: __builtin_trap();
+    }
+    if (result) return lwext4_error(result);
+    if (op==KERNEL_XATTR_SET || op==KERNEL_XATTR_REMOVE) {
+        if (!strcmp(name,"security.capability")) ((struct lwext4_node *)node)->capability_absent=op==KERNEL_XATTR_REMOVE;
+        return 0;
+    }
+    return (int)count;
 }
 static int ext4_backend_killpriv(struct kernel_vfs_node *node,uint32_t mode)
 {
@@ -2698,6 +2718,7 @@ static void initialize_backend(void)
     ops->set_mode = ext4_backend_set_mode;
     ops->set_owner = ext4_backend_set_owner;
     ops->exec_metadata=ext4_backend_exec_metadata;
+    ops->xattr=ext4_backend_xattr;
     ops->killpriv=ext4_backend_killpriv;
     ops->open = ext4_backend_open;
     ops->create = ext4_backend_create;

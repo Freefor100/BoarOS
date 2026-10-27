@@ -1,5 +1,6 @@
 #ifndef BOAROS_KERNEL_FILES_H
 #define BOAROS_KERNEL_FILES_H
+#include <kernel/xattr.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -578,4 +579,13 @@ enum kernel_files_status kernel_files_epoll_pwait(
     size_t sigsetsize,
     int64_t *linux_result);
 
+struct kernel_files_xattr_request {
+    enum kernel_xattr_operation operation;
+    uint8_t by_fd,nofollow;
+    int64_t fd;
+    uint64_t path,name,value,size;
+    uint32_t flags;
+};
+enum kernel_files_status kernel_files_xattr(struct kernel_files *,const struct kernel_fs_context *,
+    struct kernel_mm *,const struct kernel_files_xattr_request *,int64_t *);
 #endif

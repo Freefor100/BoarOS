@@ -72,6 +72,7 @@ struct kernel_vfs_node {
     /* Directory entries use a separate qualification from file data I/O. */
     struct kernel_rwlock namespace_lock;
     uint32_t uid, gid;
+    uint8_t metadata_immutable; /* Immutable/append-only inode flags, read with DAC fields. */
 };
 
 struct kernel_vfs_path {
@@ -223,6 +224,9 @@ struct kernel_vfs_backend {
     void (*memory_written)(struct kernel_vfs_node *node, uint64_t end);
     int (*writeback)(struct kernel_vfs_node *node,
         struct file_write_span *spans, size_t count);
+    /* Caller owns inode io_lock; positive result is the returned byte count. */
+    int (*xattr)(struct kernel_vfs_node *, enum kernel_xattr_operation,
+        const char *, void *, size_t, uint32_t);
 };
 /* Called under the same inode writer as the corresponding metadata update. */
 

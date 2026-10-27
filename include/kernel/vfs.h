@@ -1,5 +1,6 @@
 #ifndef BOAROS_KERNEL_VFS_H
 #define BOAROS_KERNEL_VFS_H
+#include <kernel/xattr.h>
 
 #include <kernel/block.h>
 #include <kernel/heap.h>
@@ -414,4 +415,8 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
+int kernel_vfs_file_xattr(struct kernel_vfs_file *, enum kernel_xattr_operation,
+    const char *, void *, size_t, uint32_t);
+int kernel_vfs_path_xattr(struct kernel_vfs_path *, enum kernel_xattr_operation,
+    const char *, void *, size_t, uint32_t);
 #endif
