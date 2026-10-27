@@ -21,14 +21,27 @@ def main():
     p.add_argument('--kernel',type=Path,required=True);p.add_argument('--program',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True);p.add_argument('--cpus',type=int,choices=(1,2),default=2)
     p.add_argument('--performance',action='store_true');p.add_argument('--host-vcpus');p.add_argument('--host-io',type=int,default=8);p.add_argument('--perf-stat',action='store_true')
-    p.add_argument('--loader',type=Path);p.add_argument('--system',choices=('boaros','linux'),default='boaros');p.add_argument('--expect-failure');p.add_argument('--memory',default='512M');a=p.parse_args();out=a.output.resolve();out.mkdir()
+    p.add_argument('--loader',type=Path);p.add_argument('--system',choices=('boaros','linux'),default='boaros');p.add_argument('--expect-failure');p.add_argument('--memory',default='512M');a=p.parse_args()
+    interpreter=None;loader_hash=None
+    if a.loader:
+        headers=subprocess.run(['readelf','-lW',str(a.program)],check=True,capture_output=True,text=True,env={**os.environ,'LC_ALL':'C'}).stdout
+        match=re.search(r'\[Requesting program interpreter: ([^\]]+)\]',headers)
+        interpreter=match.group(1) if match else None
+        if interpreter!='/lib/ld-musl-loongarch64.so.1':p.error('--loader requires an ELF using /lib/ld-musl-loongarch64.so.1')
+        if not a.loader.is_file():p.error('--loader must be an existing musl interpreter')
+    out=a.output.resolve();out.mkdir()
     program=out/'program';kernel=out/'kernel'
     shutil.copyfile(a.program.resolve(),program);shutil.copyfile(a.kernel.resolve(),kernel)
     program_hash=harness.digest(program);kernel_hash=harness.digest(kernel)
     disk=harness.fixture(out,program);profile=PROFILES['loongarch']
     if a.loader:
-        batch=out/'loader.debugfs';batch.write_text(f'mkdir /lib\nwrite "{a.loader.resolve()}" /lib/ld-musl-loongarch64.so.1\nset_inode_field /lib/ld-musl-loongarch64.so.1 mode 0100755\n')
+        loader=out/'loader';shutil.copyfile(a.loader.resolve(),loader);loader_hash=harness.digest(loader)
+        batch=out/'loader.debugfs';batch.write_text(f'mkdir /lib\nwrite "{loader}" /lib/ld-musl-loongarch64.so.1\nset_inode_field /lib/ld-musl-loongarch64.so.1 mode 0100755\n')
         harness.run_logged(['debugfs','-w','-f',str(batch),str(disk)],out/'loader.log')
+        installed=out/'installed-loader'
+        harness.run_logged(['debugfs','-R',f'dump /lib/ld-musl-loongarch64.so.1 {installed}',str(disk)],out/'loader-check.log')
+        if harness.digest(installed)!=loader_hash:raise ValueError('installed musl interpreter differs from the snapshot')
+        installed.unlink()
     if a.performance:
         config=out/'cost-config';config.write_text(str(a.cpus))
         stack=out/'stack-config';stack.write_text(f'{a.cpus} 1')
@@ -79,6 +92,6 @@ def main():
     if passed and not a.expect_failure:
         with (out/'fsck.log').open('w') as log:passed=subprocess.run(['e2fsck','-fn',disk],stdout=log,stderr=subprocess.STDOUT).returncode==0
         if passed:disk.unlink()
-    (out/'result.json').write_text(json.dumps({'passed':passed,'metrics':metrics,'affinity':affinity,'host_topology':host_cpu_topology(selection+[a.host_io]) if selection else None,'command':command,'returncode':code,'rows':rows,'expected_failure':a.expect_failure,'kernel_sha256':kernel_hash,'elf_sha256':program_hash},indent=2)+'\n')
+    (out/'result.json').write_text(json.dumps({'passed':passed,'metrics':metrics,'affinity':affinity,'host_topology':host_cpu_topology(selection+[a.host_io]) if selection else None,'command':command,'returncode':code,'rows':rows,'expected_failure':a.expect_failure,'kernel_sha256':kernel_hash,'elf_sha256':program_hash,'interpreter':interpreter,'loader_sha256':loader_hash},indent=2)+'\n')
     print('\n'.join(rows));return 0 if passed else 1
 if __name__=='__main__':raise SystemExit(main())
