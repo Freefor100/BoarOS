@@ -3996,25 +3996,27 @@ void ext4_file_finish_reservation(ext4_file *file,void *ticket,uint64_t accepted
     while (ticket) {
         struct ext4_delalloc_change *change=ticket;ticket=change->next;
         uint64_t last=accepted_end>change->start?(accepted_end+block-1)/block:change->start/block;
-        {
+        /* The adapter holds this inode's I/O writer, excluding mapping
+         * acceptance and writeback of its reservation tree. Finishing a fully
+         * accepted range changes no global allocation or retirement state. */
+        struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,change->key);
+        uint64_t base=(uint64_t)change->key*64;
+        unsigned kept=last<=base?0:last-base<64?last-base:64;
+        if (!chunk || !chunk->borrowers)__builtin_trap();
+        if (!change->committed)chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
+        if (!--chunk->borrowers &&
+            (!chunk->mask || (chunk->mask&~chunk->accepted))) {
             EXT4_STATE_SCOPE(state,fs);
-            struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,change->key);
-            uint64_t base=(uint64_t)change->key*64;
-            unsigned kept=last<=base?0:last-base<64?last-base:64;
-            if (!chunk || !chunk->borrowers)__builtin_trap();
-            if (!change->committed)chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
-            if (!--chunk->borrowers) {
-                /* Another source or mapping can have accepted the same block.
-                 * Only the last preparation releases still-unaccepted bits. */
-                uint64_t unused=chunk->mask&~chunk->accepted;
-                unsigned count=delalloc_count(unused);
-                chunk->mask&=~unused;
-                file->delalloc->blocks-=count;fs->delayed_blocks-=count;
-                if (!chunk->mask) {
-                    RB_REMOVE(ext4_delalloc_tree,&file->delalloc->tree,chunk);
-                    chunk->next=__atomic_load_n(&file->delalloc->retired,__ATOMIC_RELAXED);
-                    __atomic_store_n(&file->delalloc->retired,chunk,__ATOMIC_RELAXED);
-                }
+            /* Another source or mapping can have accepted the same block.
+             * Only the last preparation releases still-unaccepted bits. */
+            uint64_t unused=chunk->mask&~chunk->accepted;
+            unsigned count=delalloc_count(unused);
+            chunk->mask&=~unused;
+            file->delalloc->blocks-=count;fs->delayed_blocks-=count;
+            if (!chunk->mask) {
+                RB_REMOVE(ext4_delalloc_tree,&file->delalloc->tree,chunk);
+                chunk->next=__atomic_load_n(&file->delalloc->retired,__ATOMIC_RELAXED);
+                __atomic_store_n(&file->delalloc->retired,chunk,__ATOMIC_RELAXED);
             }
         }
         ext4_free(change);

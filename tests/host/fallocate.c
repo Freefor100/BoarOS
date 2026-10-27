@@ -415,6 +415,15 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
         assert(fs->delayed_blocks==baseline+1);
         ext4_file_release_reservations(raw,0);
         assert(fs->delayed_blocks==baseline);
+        assert(!ext4_file_reserve_write(raw,0,block,&ready,&a));
+        struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+        reservation_state_lock=adapter->locks.state_lock;reservation_state_calls=0;
+        adapter->locks.state_lock=count_reservation_state_lock;
+        ext4_file_finish_reservation(raw,a,block);
+        adapter->locks.state_lock=reservation_state_lock;
+        assert(!reservation_state_calls && fs->delayed_blocks==baseline+1);
+        ext4_file_release_reservations(raw,0);
+        assert(fs->delayed_blocks==baseline);
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a));
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&b));
         ext4_file_finish_reservation(raw,a,0);
@@ -710,11 +719,10 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
         !kernel_vfs_mkdir(mount,"/budget-empty",0700));
     assert(!create_file(mount,"/budget-left/source",0600,&source) && !create_file(mount,"/budget-right/victim",0600,&victim) &&
         !create_file(mount,"/budget-unlink",0600,&removed) && !kernel_vfs_open(mount,"/budget-empty",&directory));
-    char owner_path[96];snprintf(owner_path,sizeof(owner_path),"%sbudget-left/source",adapter->mount_point);
     unsigned char padding[48]={1};uint32_t capability[5]={0x02000000,1,0,0,0};
-    assert(!ext4_setxattr(owner_path,"user.padding",12,padding,sizeof(padding)) &&
-        !ext4_setxattr(owner_path,"security.capability",19,capability,sizeof(capability)));
     struct ext4_inode owner_inode;ext4_file *owner=lwext4_node_file(kernel_vfs_file_node(&source));
+    assert(!ext4_file_setxattr(owner,"user.padding",12,padding,sizeof(padding),0) &&
+        !ext4_file_setxattr(owner,"security.capability",19,capability,sizeof(capability),0));
     assert(!ext4_fraw_inode_fill(owner,&owner_inode) && ext4_inode_get_file_acl(&owner_inode,&adapter->device.fs->sb));
     uint64_t observed=0;
     assert(!kernel_vfs_pwrite(&source,0,"S",1,&done) && done==1 && !kernel_vfs_sync(&source,0,&observed));observed=0;
@@ -769,8 +777,7 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
         if (operation==7) assert(!kernel_vfs_fstat(&directory,&stat) && !stat.nlink);
         if (operation==8) {
             assert(!ext4_fraw_inode_fill(owner,&owner_inode) && ext4_inode_get_uid(&owner_inode)==12345 && ext4_inode_get_gid(&owner_inode)==23456);
-            snprintf(owner_path,sizeof(owner_path),"%sbudget-right/victim",adapter->mount_point);
-            size_t size;assert(ext4_getxattr(owner_path,"security.capability",19,capability,sizeof(capability),&size)==ENODATA);
+            size_t size;assert(ext4_file_getxattr(owner,"security.capability",19,capability,sizeof(capability),&size)==ENODATA);
         }
     }
     assert(!kernel_vfs_path_release(&root) && !kernel_vfs_close(&source) && !kernel_vfs_close(&victim) && !kernel_vfs_close(&removed) && !kernel_vfs_close(&directory));
@@ -1366,12 +1373,11 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
         struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
         char name[100];snprintf(name,sizeof(name),"%sidentities/capability",adapter->mount_point);
         ext4_file raw={0};
-        assert(!ext4_fopen(&raw,name,"w+") && !ext4_file_set_mode(&raw,0755) && !ext4_fclose(&raw));
+        assert(!ext4_fopen(&raw,name,"w+") && !ext4_file_set_mode(&raw,0755));
         uint32_t cap[6]={0x02000001,1,0,0,0,0};
         unsigned char padding[48]={1};
-        assert(!ext4_setxattr(name,"user.padding",12,padding,sizeof(padding)));
-        assert(!ext4_setxattr(name,"security.capability",19,cap,20));
-        assert(!ext4_fopen(&raw,name,"r+"));
+        assert(!ext4_file_setxattr(&raw,"user.padding",12,padding,sizeof(padding),0));
+        assert(!ext4_file_setxattr(&raw,"security.capability",19,cap,20,0));
         struct ext4_inode initial,after;
         assert(!ext4_fraw_inode_fill(&raw,&initial) && ext4_inode_get_file_acl(&initial,&adapter->device.fs->sb));
         assert(!ext4_transaction_begin(adapter->mount_point));
