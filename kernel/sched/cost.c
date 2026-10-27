@@ -3,7 +3,15 @@
 #if BOAROS_COST_DIAGNOSTICS
 #include <kernel/errno.h>
 #include <kernel/time.h>
+#include <arch/timer.h>
 #include <string.h>
+#if defined(BOAROS_ARCH_LOONGARCH)
+uint64_t kernel_cost_clock(void) { return arch_time_read(); }
+uint64_t kernel_cost_irq_save(void)
+{ return !!(arch_interrupt_save() & ARCH_INTERRUPT_ENABLE_MASK); }
+void kernel_cost_irq_restore(uint64_t enabled)
+{ arch_interrupt_restore(enabled ? ARCH_INTERRUPT_ENABLE_MASK : 0); }
+#else
 uint64_t kernel_cost_clock(void) { uint64_t t; __asm__ volatile("rdtime %0" : "=r"(t)); return t; }
 uint64_t kernel_cost_irq_save(void)
 {
@@ -12,6 +20,7 @@ uint64_t kernel_cost_irq_save(void)
 }
 void kernel_cost_irq_restore(uint64_t enabled)
 { if (enabled) __asm__ volatile("csrsi sstatus, 2" ::: "memory"); }
+#endif
 struct kernel_cost_cpu *kernel_cost_cpu_current(void)
 { return &kernel_cpu_current()->cost; }
 static struct kernel_task *executing_task(void)

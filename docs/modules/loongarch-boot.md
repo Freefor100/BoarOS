@@ -46,6 +46,11 @@ futex、CPU定时器、ext4并发及fork/COW/exec；同一程序可在固定Linu
 `LA_SMP_TEST=1`仅在独立测试内核中强制双向TLB交错；2～5分别注入attach、握手、TLB及停止
 确认失败。`make LA_SMP=1 test-smp-guard-loongarch`直接触发两核guard错误并核对紧急栈分离。
 
+`COST_DIAGNOSTICS=1 LA_BUILD=build/cost/loongarch-smp2`可复用共同成本观察器，
+记录服务交接、共享锁及唤醒至运行。rank40为挂载状态，rank45为页缓存状态。
+诊断的trap边界位于C入口及返回准备；完整物理入口／出口的IRQ关闭时长另行核对，
+这些诊断值不与关闭诊断的正式耗时混用。
+
 不可恢复的内核异常和栈溢出入口在输出任何寄存器或前缀前切换紧急控制台，
 直接轮询UART，绕过日志发布、TTY和等待通知。这样首错即使发生在调度域保护内，
 诊断也不会重入该锁。`test-loongarch-fatal`用真实持锁load fault及栈故障报告检查

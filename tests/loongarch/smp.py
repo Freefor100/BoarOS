@@ -70,7 +70,7 @@ def main():
                 if not selection:raise ValueError('--perf-stat needs --host-vcpus')
                 tids=','.join(str(row['tid']) for row in affinity['vcpus'])
                 with (out/'perf-stderr.log').open('w') as error:
-                    perf=subprocess.Popen(['perf','stat','-x,','-I','100','-e','cpu_core/cycles/u,cpu_core/instructions/u,task-clock:u,context-switches:u,cpu-migrations:u','-t',tids,'-o',str(out/'perf.csv')],stdout=subprocess.DEVNULL,stderr=error,preexec_fn=lambda:os.sched_setaffinity(0,{14}))
+                    perf=subprocess.Popen(['perf','stat','-x,','-I','100','-e','cpu_core/cycles/u,cpu_core/instructions/u,task-clock,context-switches,cpu-migrations','-t',tids,'-o',str(out/'perf.csv')],stdout=subprocess.DEVNULL,stderr=error,preexec_fn=lambda:os.sched_setaffinity(0,{14}))
             process.wait(timeout=60);code=process.returncode
         except subprocess.TimeoutExpired:
             process.kill();process.wait();code=-1

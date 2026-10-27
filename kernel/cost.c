@@ -66,7 +66,8 @@ static struct kernel_cost_cpu *cpu_states[BOAROS_MAX_CPUS];
 static const enum kernel_cost_metric lock_metrics[]={
     COST_LOCK10_ATTEMPTS,COST_LOCK15_ATTEMPTS,COST_LOCK20_ATTEMPTS,
     COST_LOCK30_ATTEMPTS,COST_LOCK40_ATTEMPTS,COST_LOCKOTHER_ATTEMPTS,
-    COST_LOCK21_ATTEMPTS,COST_LOCK31_ATTEMPTS,COST_LOCK32_ATTEMPTS,COST_LOCK35_ATTEMPTS
+    COST_LOCK21_ATTEMPTS,COST_LOCK31_ATTEMPTS,COST_LOCK32_ATTEMPTS,COST_LOCK35_ATTEMPTS,
+    COST_LOCK45_ATTEMPTS
 };
 enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(name_offsets) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + sizeof(timebase) + sizeof(aggregate_lock) + sizeof(cpu_states) + sizeof(lock_metrics) + BOAROS_MAX_CPUS * (sizeof(struct kernel_cost_cpu) + KERNEL_COST_CPU_SERVICE_BYTES) };
 _Static_assert(cost_storage <= 96 * 1024, "cost aggregate budget");
@@ -468,7 +469,7 @@ unsigned kernel_cost_rank(unsigned rank)
 {
     return rank == 10 ? 0 : rank == 15 ? 1 : rank == 20 ? 2 :
            rank == 30 ? 3 : rank == 40 ? 4 : rank == 21 ? 6 :
-           rank == 31 ? 7 : rank == 32 ? 8 : rank == 35 ? 9 : 5;
+           rank == 31 ? 7 : rank == 32 ? 8 : rank == 35 ? 9 : rank == 45 ? 10 : 5;
 }
 enum kernel_cost_metric kernel_cost_lock_metric(unsigned rank)
 {

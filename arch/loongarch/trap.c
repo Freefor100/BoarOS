@@ -12,6 +12,7 @@
 #include <kernel/signal.h>
 #include <kernel/console.h>
 #include <kernel/uaccess.h>
+#include <kernel/cost.h>
 #include <platform/loongarch_pci.h>
 #include <arch/loongarch/smp.h>
 #include <string.h>
@@ -45,6 +46,9 @@ static int read_instruction(struct kernel_mm *mm,uint64_t pc,uint32_t *instructi
 }
 void la_trap_dispatch(struct arch_trap_frame *frame)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_irq_disabled(kernel_cost_clock());
+#endif
     uint64_t code=(frame->estat>>16)&63;
     int user=(frame->prmd&3)==3;
 #if BOAROS_USER_SMP
@@ -191,6 +195,9 @@ void la_trap_return_prepare(struct arch_trap_frame *frame)
         kernel_task_prepare_user_return();la_signal_prepare_user_return(frame);
 #endif
         kernel_cpu_account_user_return();
+#if BOAROS_COST_DIAGNOSTICS
+        kernel_cost_user_return();
+#endif
     }
     else kernel_scheduler_prepare_idle_return();
 }
