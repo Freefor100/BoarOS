@@ -41,6 +41,8 @@ STOPPED，再清理根盘对象。停驻循环继续占用镜像常驻的AP栈�
 短例使用`tests/workloads/smp/loongarch.c`，复用既有整数/FPU/SIMD寄存器探针。
 `tests/loongarch/smp.py`固定内核和ELF快照，覆盖实际CPU、信号、共享MM撤权／替换／解除映射、
 futex、CPU定时器、ext4并发及fork/COW/exec；同一程序可在固定Linux双核运行。
+动态musl使用既有`dynamic-dp-v2`工具链；`--loader`要求ELF包含实际的musl解释器入口，
+快照解释器并核对盘内文件内容，拒绝把静态程序当作动态验证。
 `LA_SMP_TEST=1`仅在独立测试内核中强制双向TLB交错；2～5分别注入attach、握手、TLB及停止
 确认失败。`make LA_SMP=1 test-smp-guard-loongarch`直接触发两核guard错误并核对紧急栈分离。
 
