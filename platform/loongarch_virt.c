@@ -7,6 +7,7 @@
 #include <kernel/random.h>
 #include <kernel/log.h>
 #include <platform/loongarch_pci.h>
+#include <arch/loongarch/smp.h>
 
 /* QEMU v11.1.0 virt.h: ns16550 and ACPI GED, accessed uncached. */
 static volatile unsigned char *const uart = (void *)(LA_UNCACHED_BASE + 0x1fe001e0);
@@ -80,6 +81,9 @@ int la_virt_boot_memory(uint64_t systab, uint64_t kernel_start, uint64_t kernel_
     struct dtb_boot_info info;
     if (!fdt || fdt >= 0x10000000 || dtb_read_boot_info(la_virt_page_access(fdt), &info) != DTB_STATUS_OK)
         return 0;
+#if BOAROS_MAX_CPUS > 1
+    la_smp_discover(la_virt_page_access(fdt));
+#endif
     *layout = (struct boot_memory_layout){0};
     struct dtb_memory_range reservations[DTB_MAX_RESERVED_RANGES + 3];
     unsigned count = info.reserved_count;

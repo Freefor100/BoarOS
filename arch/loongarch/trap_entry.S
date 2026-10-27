@@ -1,4 +1,6 @@
 #include <arch/loongarch/task.h>
+#include <arch/loongarch/context.h>
+#include <kernel/cpu_config.h>
     .text
     .align 6
     .globl la_trap_entry
@@ -134,6 +136,20 @@ la_user_thread_trampoline:
 .Lguard_overflow:
     move $a0, $sp
     la.abs $sp, la_guard_stack_end
+#if BOAROS_MAX_CPUS > 1
+    /* No C call or use of the exhausted stack while selecting a CPU stack.
+     * The secondary idle and CPU record are permanent launch owners. */
+    la.abs $t0, la_secondary_thread
+    ld.d $t0, $t0, 0
+    beqz $t0, .Lguard_selected
+    ld.d $t0, $t0, ARCH_TASK_CPU_OFFSET
+    ld.d $t0, $t0, 0
+    csrrd $t1, 0x20
+    andi $t1, $t1, 0x3ff
+    bne $t0, $t1, .Lguard_selected
+    la.abs $sp, la_ap_guard_stack_end
+.Lguard_selected:
+#endif
     bl la_kernel_stack_overflow
     break 0
     .bss
@@ -141,3 +157,7 @@ la_user_thread_trampoline:
 la_guard_stack:
     .space 16384
 la_guard_stack_end:
+#if BOAROS_MAX_CPUS > 1
+    .space 16384
+la_ap_guard_stack_end:
+#endif

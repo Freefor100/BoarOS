@@ -1,7 +1,12 @@
 #include <arch/timer.h>
 #include <arch/context.h>
 #include <kernel/cpu.h>
+#if BOAROS_MAX_CPUS > 1
+#define period (kernel_cpu_current()->timer.period)
+#define tick_deadline (kernel_cpu_current()->timer.next_deadline)
+#else
 static uint64_t period, tick_deadline;
+#endif
 uint32_t la_timer_frequency(void)
 {
     uint64_t base, ratio, index=4;

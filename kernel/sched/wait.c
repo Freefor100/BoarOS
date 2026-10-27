@@ -5,7 +5,7 @@
 #include <kernel/socket.h>
 #include <kernel/event_fd.h>
 #if BOAROS_MAX_CPUS > 1
-#include <arch/riscv/smp.h>
+#include <arch/smp.h>
 #endif
 
 #include "private.h"
@@ -242,7 +242,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
         deadline_index_insert(task);
 #if BOAROS_MAX_CPUS > 1
         if (kernel_cpu_current()->logical_id)
-            kernel_cpu_notify(riscv_smp_cpu(0), RISCV_IPI_DEADLINE);
+            kernel_cpu_notify(arch_smp_cpu(0), ARCH_IPI_DEADLINE);
 #endif
     }
 #if BOAROS_COST_DIAGNOSTICS

@@ -3,17 +3,41 @@ export PATH := $(abspath build/tools/loongarch/bin):$(PATH)
 endif
 LA_CROSS_COMPILE ?= loongarch64-unknown-linux-gnu-
 QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
+LA_SMP ?= 0
+LA_SMP_TEST ?= 0
+ifneq ($(filter $(LA_SMP_TEST),0 1 2 3 4 5),$(LA_SMP_TEST))
+$(error LA_SMP_TEST must be 0..5)
+endif
+ifneq ($(LA_SMP_TEST),0)
+ifneq ($(LA_SMP),1)
+$(error LA_SMP_TEST requires LA_SMP=1)
+endif
+endif
+ifneq ($(filter $(LA_SMP),0 1),$(LA_SMP))
+$(error LA_SMP must be 0 or 1)
+endif
+ifeq ($(LA_SMP),1)
+ifeq ($(LA_SMP_TEST),0)
+LA_BUILD ?= build/loongarch-smp2
+else
+LA_BUILD ?= build/loongarch-smp2-test$(LA_SMP_TEST)
+endif
+KERNEL_LA ?= $(LA_BUILD)/kernel-la
+LA_CPU_CAPACITY := 2
+else
 LA_BUILD ?= build/loongarch
 KERNEL_LA ?= kernel-la
+LA_CPU_CAPACITY := 1
+endif
 LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS := -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
-LA_CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
+LA_CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_MAX_CPUS=$(LA_CPU_CAPACITY) -DBOAROS_USER_SMP=$(LA_SMP) -DBOAROS_LA_SMP_TEST=$(LA_SMP_TEST) -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
 LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
 LA_C_SOURCES := $(COMMON_C_SOURCES) \
-    arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
+    arch/loongarch/main.c arch/loongarch/smp.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
     platform/loongarch_pci.c platform/loongarch_root.c platform/loongarch_rtc.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c drivers/virtio/pci_net.c kernel/pci.c
-LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
+LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/secondary.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S
 LA_OBJECTS = $(patsubst %.c,$(LA_BUILD)/%.o,$(LA_C_SOURCES)) $(patsubst %.S,$(LA_BUILD)/%.o,$(LA_ASM_SOURCES))
 # 普通产物不携带测试入口、内嵌用户ELF或故障包装；契约只替换两个启动对象。
@@ -100,6 +124,13 @@ $(LA_BUILD)/stack-guard-%.o: tests/loongarch/stack_guard.c $(LA_BUILD)/generated
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_STACK_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-stack-guard-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/stack-guard-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/stack-guard-$*.o -lgcc
+ifeq ($(LA_SMP),1)
+$(LA_BUILD)/kernel-smp-guard: $(LA_OBJECTS) $(LA_BUILD)/stack-guard-4.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=la_boot_tasks,--wrap=la_kernel_stack_overflow -o $@ $(LA_OBJECTS) $(LA_BUILD)/stack-guard-4.o -lgcc
+.PHONY: test-smp-guard-loongarch
+test-smp-guard-loongarch: $(LA_BUILD)/kernel-smp-guard prepare-la-tools
+	python3 -B tests/loongarch/stack_guard.py --smp
+endif
 .PHONY: test-stack-guard-loongarch
 test-stack-guard-loongarch: $(foreach case,0 1 2 3,$(LA_BUILD)/kernel-stack-guard-$(case)) prepare-la-tools
 	python3 -B tests/loongarch/stack_guard.py

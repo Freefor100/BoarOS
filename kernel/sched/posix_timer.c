@@ -7,7 +7,7 @@
 #include <kernel/time.h>
 #include <arch/timer.h>
 #if BOAROS_MAX_CPUS > 1
-#include <arch/riscv/smp.h>
+#include <arch/smp.h>
 #endif
 #include <string.h>
 
@@ -82,7 +82,7 @@ static uint64_t wall_next;
 void kernel_posix_timer_changed(void)
 {
 #if BOAROS_MAX_CPUS > 1
-    if(kernel_cpu_current()->logical_id){kernel_cpu_notify(riscv_smp_cpu(0),RISCV_IPI_DEADLINE);return;}
+    if(kernel_cpu_current()->logical_id){kernel_cpu_notify(arch_smp_cpu(0),ARCH_IPI_DEADLINE);return;}
 #endif
     kernel_scheduler_deadline_changed();
 }

@@ -14,7 +14,7 @@
 #include <kernel/time.h>
 #include <arch/timer.h>
 #if BOAROS_MAX_CPUS > 1
-#include <arch/riscv/smp.h>
+#include <arch/smp.h>
 #endif
 
 #define EVENT_SEMAPHORE 1U
@@ -73,7 +73,7 @@ static void timer_changed(void)
 {
 #if BOAROS_MAX_CPUS > 1
     if (kernel_cpu_current()->logical_id) {
-        kernel_cpu_notify(riscv_smp_cpu(0),RISCV_IPI_DEADLINE);return;
+        kernel_cpu_notify(arch_smp_cpu(0),ARCH_IPI_DEADLINE);return;
     }
 #endif
     kernel_scheduler_deadline_changed();

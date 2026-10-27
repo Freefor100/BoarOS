@@ -1,3 +1,4 @@
+#include <arch/loongarch/smp.h>
 #include "init-config.h"
 #include <platform/loongarch_virt.h>
 #include <platform/loongarch_pci.h>
@@ -160,6 +161,9 @@ static void cleanup_worker(void *unused)
     (void)unused; (void)arch_interrupt_save(); kernel_scheduler_register_cleanup();
     int boot_error=start_root();
     if(boot_error) {
+#if BOAROS_MAX_CPUS > 1
+        la_smp_stop();
+#endif
         la_virt_puts("LA root boot errno=");la_virt_hex((uint64_t)(int64_t)boot_error);la_virt_puts("\n");
         for(unsigned attempt=0;attempt<3;attempt++) {
             int cleanup=release_root();if(!cleanup) la_virt_shutdown();
@@ -181,10 +185,17 @@ static void cleanup_worker(void *unused)
         int pending=reaped && kernel_scheduler_stop_users();
         arch_interrupt_restore(irq);
         if(reaped && !pending) {
+#if BOAROS_MAX_CPUS > 1
+            la_smp_stop();
+#endif
             int error=release_root();
             if(!error) {
                 la_virt_puts("LA PID 1 exited reason=");la_virt_hex(init.reason);
-                la_virt_puts(" status=");la_virt_hex(init.status);la_virt_puts("\n");la_virt_shutdown();
+                la_virt_puts(" status=");la_virt_hex(init.status);la_virt_puts("\n");
+#if BOAROS_MAX_CPUS > 1
+                la_smp_report();
+#endif
+                la_virt_shutdown();
             }
             la_virt_puts("LA root cleanup errno=");la_virt_hex((uint64_t)(int64_t)error);la_virt_puts("\n");
             if(++cleanup_attempts==3) {
@@ -292,6 +303,9 @@ int la_root_boot(struct physical_page_allocator *allocator)
     root.baseline=physical_page_available(allocator);
     if(kernel_thread_create(cleanup_worker,0)!=KERNEL_SCHEDULER_STATUS_OK) {
         la_virt_puts("LA root boot errno=0xfffffffffffffff4\n");
+#if BOAROS_MAX_CPUS > 1
+        la_smp_stop();
+#endif
         if(release_root()) la_virt_fatal("root initial ownership");
         la_virt_shutdown();
     }
@@ -299,7 +313,13 @@ int la_root_boot(struct physical_page_allocator *allocator)
     root.baseline=physical_page_available(allocator);
     if(la_timer_start(la_timer_frequency(),100)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("root timer");
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
-    for(;;) arch_cpu_wait();
+    for(;;) {
+#if BOAROS_MAX_CPUS > 1
+        la_smp_idle();
+#else
+        arch_cpu_wait();
+#endif
+    }
 }
 #if BOAROS_LA_CONTRACT
 void la_user_contract(struct physical_page_allocator *);

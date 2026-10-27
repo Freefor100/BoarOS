@@ -7,6 +7,7 @@
 #include <platform/loongarch_rtc.h>
 #include <kernel/scheduler.h>
 #include <kernel/cpu.h>
+#include <arch/loongarch/smp.h>
 void la_trap_initialize(void);
 void la_boot_tasks(struct physical_page_allocator *);
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
@@ -60,6 +61,9 @@ void la_kernel_main(uint64_t systab)
     if(!rtc){la_virt_hex(realtime);la_virt_puts("\n");}
     if (kernel_time_init(la_timer_frequency(),realtime)!=KERNEL_TIME_STATUS_OK ||
         kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("scheduler init");
+#if BOAROS_MAX_CPUS > 1
+    la_smp_start(la_timer_frequency());
+#endif
     la_boot_tasks(&allocator);
     la_virt_shutdown();
 }
