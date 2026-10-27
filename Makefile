@@ -1660,9 +1660,12 @@ test-lwip-host: build/host/lwip-port
 HOST_CPU_SOURCES := kernel/cpu.c kernel/raw_lock.c tests/host/cpu_context.c
 
 test-allocator-release-host:
-	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c -o build/host/allocator-release
-	build/host/allocator-release
+	@mkdir -p build/host
+	@for shift in 12 14; do \
+		cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -Iinclude \
+			tests/host/allocator_release.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c -o build/host/allocator-release-$$shift && \
+		build/host/allocator-release-$$shift || exit; \
+	done
 
 .PHONY: test-allocator-cost-host
 test-allocator-cost-host:

@@ -30,7 +30,7 @@ void kernel_console_putc(char character)
     assert(write(STDOUT_FILENO, &character, 1U) == 1);
 }
 
-#define TEST_SLAB_BITMAP_WORDS 4U
+#define TEST_SLAB_BITMAP_WORDS (((BOAROS_PAGE_SIZE >> KERNEL_HEAP_MIN_CLASS_SHIFT)+63U)/64U)
 #define TEST_PAGE_STATE_FREE_HEAD 3U
 
 /* These mirrors are used only to inject corruption into the metadata paths
@@ -186,8 +186,9 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
         struct test_slab_header *slab;
 
         assert(kernel_heap_allocate(&heap, 32, &other) == 0);
-        slab = (struct test_slab_header *)heap.partial_slabs[1];
-        assert(slab != 0 && slab->free_count > 0U);
+        slab = (void *)((uintptr_t)object & ~BOAROS_PAGE_MASK);
+        assert(slab->heap==&heap && slab->class_index<KERNEL_HEAP_SIZE_CLASS_COUNT &&
+            heap.partial_slabs[slab->class_index]==slab && slab->free_count>0);
         slab->free_count++;
         kernel_heap_release(&heap, object);
         break;
