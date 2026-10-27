@@ -3057,6 +3057,13 @@ static void *domain_fast_writer(void *argument)
     value=0;assert(!kernel_vfs_pread(file,BOAROS_PAGE_SIZE,&value,1,&done, NULL) && done==1 && value==0x39);
     return NULL;
 }
+static void *domain_quota_writer(void *argument)
+{
+    cache_test_attach(10);progress_writeback_caller=1;
+    struct kernel_vfs_file *file=argument;size_t done;
+    assert(!kernel_vfs_pwrite(file,0,"quota",5,&done) && done==5);
+    progress_writeback_caller=0;return NULL;
+}
 static void writeback_domains(struct kernel_page_cache *cache,const char *path)
 {
     struct kernel_heap *heap_for_domains=cache->heap;
@@ -3074,6 +3081,8 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
         assert(!kernel_vfs_create(&mounts[i],"/pressure-domain",0600,&files[i]));
     }
     struct kernel_vfs_instance *fast=mounts[0].private_data,*slow=mounts[1].private_data;
+    struct kernel_vfs_file quota_file={0};
+    assert(!kernel_vfs_create(&mounts[1],"/quota-admission",0600,&quota_file));
     assert(fast->writeback.domain!=slow->writeback.domain);
     kernel_writeback_domain_snapshot(&fast->writeback,&stats[0]);
     kernel_writeback_domain_snapshot(&slow->writeback,&stats[1]);
@@ -3114,8 +3123,20 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
      * a fast-domain write must not join that worker's admission queue. */
     pthread_t fast_writer;assert(!pthread_create(&fast_writer,NULL,domain_fast_writer,&files[0]));
     assert(!pthread_join(fast_writer,NULL) && !storage[1].resume);
+    /* A quota-bound writer joins the background round already in progress.
+     * It must not insert a competing single-window request behind paused I/O. */
+    struct kernel_page_cache_concurrency_state queued_before,queued_after;
+    kernel_page_cache_get_concurrency_state(cache,&queued_before);
+    progress_writeback_waiting=0;pthread_t quota_writer;
+    assert(!pthread_create(&quota_writer,NULL,domain_quota_writer,&quota_file));
+    wait_progress(&progress_writeback_waiting,1);
+    kernel_page_cache_get_concurrency_state(cache,&queued_after);
+    assert(queued_before.executions_queued==queued_after.executions_queued);
     assert(kernel_page_cache_destroy(cache)==KERNEL_PAGE_CACHE_STATUS_STATE);
     __atomic_store_n(&storage[1].resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(quota_writer,NULL));
+    observed=kernel_vfs_error_sequence(&quota_file);
+    assert(!kernel_vfs_sync(&quota_file,0,&observed) && !kernel_vfs_close(&quota_file));
     for (unsigned i=0;i<2;i++) {
         observed=kernel_vfs_error_sequence(&files[i]);assert(!kernel_vfs_sync(&files[i],0,&observed));
         kernel_writeback_domain_snapshot(i?&slow->writeback:&fast->writeback,&stats[i]);
