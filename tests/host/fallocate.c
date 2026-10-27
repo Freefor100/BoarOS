@@ -38,6 +38,14 @@ int __wrap_ext4_xattr_remove(struct ext4_inode_ref *ref,uint8_t index,const char
     }
     return __real_ext4_xattr_remove(ref,index,name,length);
 }
+static unsigned fail_delayed_allocation;
+int __real_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,bool,struct ext4_inode_block_range *);
+int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t first,uint32_t count,bool create,struct ext4_inode_block_range *range)
+{
+    int r=__real_ext4_fs_get_inode_dblk_range(ref,first,count,create,range);
+    if (!r && create && fail_delayed_allocation) {fail_delayed_allocation=0;return ENOMEM;}
+    return r;
+}
 static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
 static unsigned metadata_probe,metadata_open_calls;
 static unsigned credential_create_pause,credential_create_entered,credential_create_resume,credential_chmod_done;
@@ -382,6 +390,67 @@ static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_v
     assert(!kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&victim));
     puts("PASS private free/reuse abort: retained allocation owners protect original initialized contents");
 }
+static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_file file={0};
+    assert(!create_file(mount,"/delayed",0600,&file));
+    struct ext4_fs *fs=lwext4_instance(mount->private_data)->device.fs;
+    size_t block=kernel_vfs_file_node(&file)->instance->writeback_block_size;
+    uint64_t baseline=fs->delayed_blocks;
+    /* Two real preparations may share a block before either source commits.
+     * Cancelling one source must preserve its peer's accepted or live range. */
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        ext4_file *raw=lwext4_node_file(kernel_vfs_file_node(&file));
+        void *a=NULL,*b=NULL;size_t ready;
+        assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a) && ready==2*block);
+        assert(!ext4_file_reserve_write(raw,block,block,&ready,&b) && ready==block && b);
+        ext4_file_finish_reservation(raw,b,2*block);
+        ext4_file_finish_reservation(raw,a,0);
+        assert(fs->delayed_blocks==baseline+1);
+        ext4_file_release_reservations(raw,0);
+        assert(fs->delayed_blocks==baseline);
+        assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a));
+        assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&b));
+        ext4_file_finish_reservation(raw,a,0);
+        assert(fs->delayed_blocks==baseline+2);
+        ext4_file_finish_reservation(raw,b,0);
+        assert(fs->delayed_blocks==baseline);
+        assert(!ext4_file_reserve_write(raw,0,block,&ready,&a));
+        ext4_file_accept_reservation(raw,a,block);
+        ext4_file_release_reservations(raw,0);
+        assert(!ext4_file_reserve_write(raw,0,block,&ready,&b));
+        ext4_file_finish_reservation(raw,a,block);
+        ext4_file_finish_reservation(raw,b,0);
+        assert(fs->delayed_blocks==baseline);
+    }
+    unsigned char bytes[16*1024];memset(bytes,0x53,sizeof(bytes));size_t done;
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    /* 可见数据归页缓存；此时磁盘映射仍应为空。 */
+    struct ext4_inode_block_range hole=mapped(&file,0);
+    fprintf(stderr,"delalloc before sync physical=%llu allocated=%llu\n",
+        (unsigned long long)hole.block,(unsigned long long)allocated(&file));
+    assert(!hole.block && fs->delayed_blocks==baseline+sizeof(bytes)/block);
+    expect_bytes(&file,bytes,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&file,block,bytes,block,&done) && done==block);
+    assert(fs->delayed_blocks==baseline+sizeof(bytes)/block);
+    fail_delayed_allocation=1;
+    assert(kernel_page_cache_writeback(cache,kernel_vfs_file_node(&file))==-KERNEL_ENOMEM && !fail_delayed_allocation);
+    assert(!mapped(&file,0).block && fs->delayed_blocks==baseline+sizeof(bytes)/block);
+    uint64_t observed=0;
+    assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_ENOMEM);
+    assert(!kernel_vfs_sync(&file,0,&observed) && fs->delayed_blocks==baseline);
+    assert(mapped(&file,0).block);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    expect_bytes(&file,bytes,sizeof(bytes));
+    assert(!kernel_vfs_ftruncate(&file,0));
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    assert(!kernel_vfs_ftruncate(&file,0));
+    assert(!mapped(&file,0).block && fs->delayed_blocks==baseline);
+    assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_close(&file));
+    puts("PASS delayed allocation: cache visibility, no physical allocation before sync, batched conversion and truncate");
+}
+
 struct admission_fill {
     struct kernel_vfs_file files[2];
     size_t acknowledged[2];
@@ -821,8 +890,8 @@ static void unlink_during_writeback(struct kernel_page_cache *cache,struct kerne
 #ifdef CACHE_MM_CASES
 static unsigned prepare_pause,prepare_entered,prepare_resume;
 static int replaced_prepare_error;
-int __real_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *,struct kernel_vfs_node *,uint64_t);
-int __wrap_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,uint64_t index)
+int __real_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *,struct kernel_vfs_node *,uint64_t,struct kernel_page_cache_reservation *);
+int __wrap_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,uint64_t index,struct kernel_page_cache_reservation *reservation)
 {
     int held=__atomic_exchange_n(&prepare_pause,0,__ATOMIC_ACQ_REL);
     if (held) {
@@ -830,7 +899,7 @@ int __wrap_kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cac
         __atomic_store_n(&prepare_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&prepare_resume,__ATOMIC_ACQUIRE)) sched_yield();
     }
-    int error=__real_kernel_page_cache_prepare_mapping_write(cache,node,index);
+    int error=__real_kernel_page_cache_prepare_mapping_write(cache,node,index,reservation);
     if (held) replaced_prepare_error=error;
     return error;
 }
@@ -864,7 +933,13 @@ static void admission_fault(struct kernel_page_cache *cache,struct kernel_heap *
         struct kernel_vfs_user_write_result result;
         assert(!kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,0,0,NULL,&result));
         assert(result.access==KERNEL_UACCESS_STATUS_FAULT && !result.written && !result.end_offset);
-        struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && (legacy?!stat.blocks:stat.blocks>0));
+        struct kernel_vfs_stat stat;assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && (!legacy && lwext4_instance(mount->private_data)->device.fs->jbd_journal ? !stat.blocks : (legacy?!stat.blocks:stat.blocks>0)));
+        if (!legacy) {
+            assert(!kernel_vfs_ftruncate(&file,3*BOAROS_PAGE_SIZE));
+            assert(!kernel_vfs_write_user(&file,&mm,&source,1,BOAROS_PAGE_SIZE,1,123,NULL,&result));
+            assert(result.access==KERNEL_UACCESS_STATUS_FAULT && !result.written);
+            assert(!((struct lwext4_node *)kernel_vfs_file_node(&file))->delalloc.blocks);
+        }
         uint64_t observed=0;assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_error_sequence(&file));
         assert(!kernel_vfs_close(&file));
     }
@@ -938,7 +1013,8 @@ static void admission_mmap(struct kernel_page_cache *cache,struct kernel_heap *h
     assert(!kernel_copy_to_user(&mm,private,&byte,1,&done) && done==1 && disk_read(&mm,private)==byte && !disk_read(&mm,shared));
     uint64_t observed=0;assert(!kernel_vfs_sync(&file->file,0,&observed));
     if (partial) {
-        assert(mapped(&file->file,0).block && mapped(&file->file,0).unwritten);
+        if (lwext4_instance(mount->private_data)->device.fs->jbd_journal) assert(!mapped(&file->file,0).block);
+        else assert(mapped(&file->file,0).block && mapped(&file->file,0).unwritten);
         assert(!kernel_vfs_pwrite(&file->file,0,"!",1,&done) && done==1 && !kernel_vfs_sync(&file->file,0,&observed));
         assert(disk_read(&mm,shared)=='!' && disk_read(&mm,private)==byte);
     }
@@ -955,6 +1031,23 @@ static void admission_mmap(struct kernel_page_cache *cache,struct kernel_heap *h
     fprintf(stderr,"replaced shared mapping: old prepare=%d access=%u done=%zu\n",
         replaced_prepare_error,fault.result,fault.done);
     assert(replaced_prepare_error==-KERNEL_ENOSPC && !fault.result && fault.done==1 && disk_read(&mm,shared)==0xa7);
+    /* A successful reservation can also lose the VMA race. The old file
+     * stays open, so cancellation must return space before final close. */
+    assert(!kernel_vfs_ftruncate(&filler,0) && !kernel_vfs_ftruncate(&spare,0));
+    source=file;assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,shared,BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&replacement));
+    assert(disk_read(&mm,shared)==(partial?'!':0));
+    struct ext4_fs *fs=lwext4_instance(mount->private_data)->device.fs;
+    uint64_t reserved_before=fs->delayed_blocks;
+    prepare_pause=1;prepare_entered=prepare_resume=0;replaced_prepare_error=-1;
+    fault=(struct replaced_fault){.mm=&mm,.address=shared};
+    assert(!pthread_create(&writer,NULL,replace_fault_actor,&fault));wait_progress(&prepare_entered,1);
+    assert(!kernel_mm_mmap_anonymous(&mm,shared,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&replacement));
+    __atomic_store_n(&prepare_resume,1,__ATOMIC_RELEASE);assert(!pthread_join(writer,NULL));
+    assert(!replaced_prepare_error && !fault.result && fault.done==1);
+    assert(fs->delayed_blocks==reserved_before);
     kernel_page_cache_stop_worker(cache);
     mm_test_bind(NULL);mm_test_context=0;
     assert(!kernel_mm_release(&mm) && !kernel_open_file_release(&file) && !physical_page_release(pages,kernel.root_address));
@@ -1319,6 +1412,7 @@ int main(int argc,char **argv)
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
         !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
+    if (!strcmp(argv[2],"delalloc")) {delayed_allocation(&cache,&mount);goto mounted_done;}
     if (!strcmp(argv[2],"vfs-socket")) {vfs_socket_paths(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-race")) {credential_namespace_race(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-chown")) {credential_chown_groups(&mount);goto mounted_done;}

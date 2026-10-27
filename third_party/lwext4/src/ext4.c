@@ -119,6 +119,80 @@ static inline void ext4_state_end(struct ext4_state_guard *guard)
 #define EXT4_STATE_READ_SCOPE(name, fs) struct ext4_state_guard name \
     __attribute__((cleanup(ext4_state_end))) = ext4_state_read_begin(fs)
 
+struct ext4_delalloc_chunk {
+    RB_ENTRY(ext4_delalloc_chunk) index;
+    struct ext4_delalloc_chunk *next;
+    uint32_t key;
+    uint64_t mask, accepted;
+    uint32_t borrowers;
+};
+struct ext4_delalloc_change {
+    struct ext4_delalloc_change *next;
+    uint32_t key;
+    bool committed;
+    uint64_t mask, start;
+};
+static int delalloc_compare(struct ext4_delalloc_chunk *a, struct ext4_delalloc_chunk *b)
+{ return a->key < b->key ? -1 : a->key != b->key; }
+RB_GENERATE_STATIC(ext4_delalloc_tree, ext4_delalloc_chunk, index, delalloc_compare)
+static uint64_t delalloc_mask(unsigned first, unsigned count)
+{ return count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << first; }
+static unsigned delalloc_count(uint64_t mask)
+{ unsigned n=0;for (;mask;mask&=mask-1)n++;return n; }
+static struct ext4_delalloc_chunk *delalloc_find(struct ext4_delalloc *da, uint32_t key)
+{
+    struct ext4_delalloc_chunk find={.key=key};
+    return RB_FIND(ext4_delalloc_tree,&da->tree,&find);
+}
+/* STATE owns the reservation index and aggregate counters. Empty nodes retire
+ * here; the actual free is outside STATE and all transaction publication. */
+static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t last,bool clear)
+{
+    if (first>=last) return 0;
+    struct ext4_delalloc_chunk find={.key=first>>6};
+    struct ext4_delalloc_chunk *chunk=RB_NFIND(ext4_delalloc_tree,&da->tree,&find);
+    uint64_t count=0;
+    while (chunk && (uint64_t)chunk->key*64<last) {
+        struct ext4_delalloc_chunk *next=RB_NEXT(ext4_delalloc_tree,&da->tree,chunk);
+        uint64_t base=(uint64_t)chunk->key*64;
+        unsigned begin=first>base?first-base:0,end=last-base<64?last-base:64;
+        uint64_t mask=chunk->mask&delalloc_mask(begin,end-begin);
+        count+=delalloc_count(mask);
+        if (clear) {
+            chunk->mask&=~mask;chunk->accepted&=~mask;
+            if (!chunk->mask && !chunk->borrowers) {
+                RB_REMOVE(ext4_delalloc_tree,&da->tree,chunk);
+                chunk->next=da->retired;da->retired=chunk;
+            }
+        }
+        chunk=next;
+    }
+    if (clear) { if (count>da->blocks)__builtin_trap();da->blocks-=count; }
+    return count;
+}
+static uint64_t delalloc_spans(struct ext4_operation *operation,bool clear)
+{
+    uint64_t total=0,last=0;
+    size_t block=operation->fs->bdev->lg_bsize;
+    for (unsigned i=0;i<operation->delalloc_span_count;i++) {
+        struct file_write_span *span=&operation->delalloc_spans[i];
+        if (!span->size) continue;
+        uint64_t first=span->offset/block,end=(span->offset+span->size+block-1)/block;
+        if (first<last)first=last;
+        total+=delalloc_range(operation->delalloc,first,end,clear);last=end;
+    }
+    return total;
+}
+static void delalloc_publish(struct ext4_operation *operation)
+{
+    if (!operation->delalloc) return;
+    uint64_t count=delalloc_spans(operation,true);
+    if (count!=operation->delalloc_credit || operation->delalloc_used>count)__builtin_trap();
+    uint64_t unused=count-operation->delalloc_used;
+    if (unused>operation->fs->delayed_blocks)__builtin_trap();
+    operation->fs->delayed_blocks-=unused;
+}
+
 struct ext4_inode_goal {
     RB_ENTRY(ext4_inode_goal) index;
     TAILQ_ENTRY(ext4_inode_goal) pending;
@@ -205,10 +279,11 @@ void ext4_operation_completed(struct ext4_operation *operation, uint64_t sequenc
 
 uint64_t ext4_fs_available_blocks(struct ext4_fs *fs)
 {
+    struct ext4_operation *operation=ext4_current_operation(fs);
     EXT4_STATE_READ_SCOPE(state, fs);
-    uint64_t count = ext4_sb_get_free_blocks_cnt(&fs->sb);
-    if (fs->reserved_blocks > count) __builtin_trap();
-    return count - fs->reserved_blocks;
+    uint64_t count=ext4_sb_get_free_blocks_cnt(&fs->sb),reserved=fs->reserved_blocks+fs->delayed_blocks;
+    if (reserved>count)__builtin_trap();
+    return count-reserved+(operation?operation->delalloc_credit-operation->delalloc_used:0);
 }
 
 uint32_t ext4_fs_available_inodes(struct ext4_fs *fs)
@@ -219,34 +294,27 @@ uint32_t ext4_fs_available_inodes(struct ext4_fs *fs)
     return count - fs->reserved_inodes;
 }
 
-int ext4_fs_reserve_blocks(struct ext4_fs *fs, uint32_t count)
+static uint32_t reserve_block_range(struct ext4_fs *fs,uint32_t count,bool exact)
 {
-    if (!fs->jbd_journal) return EOK;
-    struct ext4_operation *operation = ext4_current_operation(fs);
-    if (!operation) __builtin_trap();
-    EXT4_STATE_SCOPE(state, fs);
-    uint64_t available = ext4_sb_get_free_blocks_cnt(&fs->sb);
-    if (fs->reserved_blocks > available) __builtin_trap();
-    if (count > available - fs->reserved_blocks) return ENOSPC;
-    fs->reserved_blocks += count;
-    operation->reserved_blocks += count;
-    return EOK;
-}
-
-uint32_t ext4_fs_reserve_block_range(struct ext4_fs *fs, uint32_t count)
-{
-    if (!fs->jbd_journal) return count;
-    struct ext4_operation *operation = ext4_current_operation(fs);
-    if (!operation) __builtin_trap();
-    EXT4_STATE_SCOPE(state, fs);
-    uint64_t available = ext4_sb_get_free_blocks_cnt(&fs->sb);
-    if (fs->reserved_blocks > available) __builtin_trap();
-    available -= fs->reserved_blocks;
-    if (count > available) count = available;
-    fs->reserved_blocks += count;
-    operation->reserved_blocks += count;
+    if (!fs->jbd_journal)return count;
+    struct ext4_operation *operation=ext4_current_operation(fs);
+    if (!operation)__builtin_trap();
+    EXT4_STATE_SCOPE(state,fs);
+    uint64_t available=ext4_sb_get_free_blocks_cnt(&fs->sb),reserved=fs->reserved_blocks+fs->delayed_blocks;
+    if (reserved>available)__builtin_trap();
+    uint64_t credit=operation->delalloc_credit-operation->delalloc_used;
+    available=available-reserved+credit;
+    if (count>available) {if(exact)return 0;count=available;}
+    uint64_t used=count<credit?count:credit;
+    if (used>fs->delayed_blocks)__builtin_trap();
+    fs->delayed_blocks-=used;operation->delalloc_used+=used;
+    fs->reserved_blocks+=count;operation->reserved_blocks+=count;
     return count;
 }
+int ext4_fs_reserve_blocks(struct ext4_fs *fs,uint32_t count)
+{ return reserve_block_range(fs,count,true)==count?EOK:ENOSPC; }
+uint32_t ext4_fs_reserve_block_range(struct ext4_fs *fs,uint32_t count)
+{ return reserve_block_range(fs,count,false); }
 
 int ext4_fs_reserve_inodes(struct ext4_fs *fs, uint32_t count)
 {
@@ -356,6 +424,8 @@ void ext4_operation_discard_super_state_held(struct ext4_operation *operation)
     struct ext4_fs *fs = operation->fs;
     if (operation->reserved_blocks > fs->reserved_blocks || operation->reserved_inodes > fs->reserved_inodes)
         __builtin_trap();
+    if (!operation->published) fs->delayed_blocks+=operation->delalloc_used;
+    operation->delalloc_used=0;
     fs->reserved_blocks -= operation->reserved_blocks;
     fs->reserved_inodes -= operation->reserved_inodes;
     operation->reserved_blocks = 0;
@@ -374,6 +444,7 @@ void ext4_operation_publish_super(struct ext4_operation *operation)
         ext4_set32(accepted, last_orphan, operation->super_publish.orphan_head);
         accepted->checksum = operation->super_publish.checksum;
     }
+    delalloc_publish(operation);
     operation->published = true;
     ext4_operation_discard_super_state_held(operation);
 }
@@ -1307,8 +1378,8 @@ static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	if (journal->quarantined_blocks) {
 		uint64_t blocks = ext4_sb_get_free_blocks_cnt(&mp->fs.sb);
-		if (mp->fs.reserved_blocks > blocks) __builtin_trap();
-		if (blocks - mp->fs.reserved_blocks <= journal->quarantined_blocks + 32) return true;
+		if (mp->fs.reserved_blocks + mp->fs.delayed_blocks > blocks) __builtin_trap();
+		if (blocks - mp->fs.reserved_blocks - mp->fs.delayed_blocks <= journal->quarantined_blocks + 32) return true;
 	}
 	if (journal->quarantined_inodes) {
 		uint32_t inodes = ext4_get32(&mp->fs.sb, free_inodes_count);
@@ -1882,6 +1953,8 @@ int ext4_mount_point_stats(const char *mount_point,
     struct ext4_sblock *sb = &mp->fs.sb;
     ext4_fs_state_lock(&mp->fs);
     uint64_t free_blocks = ext4_sb_get_free_blocks_cnt(sb);
+    if (mp->fs.delayed_blocks > free_blocks) __builtin_trap();
+    free_blocks -= mp->fs.delayed_blocks;
     uint32_t free_inodes = ext4_get32(sb, free_inodes_count);
     uint64_t overhead = mp->overhead_blocks;
     if (!result && mp->fs.jbd_journal) result = jbd_journal_error(mp->fs.jbd_journal);
@@ -3794,6 +3867,151 @@ static int ext4_zero_file_range(struct ext4_inode_ref *ref,
     return EOK;
 }
 
+void ext4_file_drain_reservations(ext4_file *file)
+{
+    if (!file->delalloc)return;
+    struct ext4_delalloc_chunk *retired;
+    { EXT4_STATE_SCOPE(state,&file->mp->fs);
+      retired=file->delalloc->retired;file->delalloc->retired=NULL; }
+    while (retired) {struct ext4_delalloc_chunk *next=retired->next;ext4_free(retired);retired=next;}
+}
+void ext4_file_release_reservations(ext4_file *file,uint64_t size)
+{
+    if (!file->delalloc)return;
+    struct ext4_fs *fs=&file->mp->fs;size_t block=fs->bdev->lg_bsize;
+    { EXT4_STATE_SCOPE(state,fs);
+      uint64_t count=delalloc_range(file->delalloc,(size+block-1)/block,UINT64_C(1)<<32,true);
+      if (count>fs->delayed_blocks)__builtin_trap();
+      fs->delayed_blocks-=count; }
+    ext4_file_drain_reservations(file);
+}
+
+int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,void **ticket)
+{
+    *ready=0;*ticket=NULL;
+    if (!file->delalloc || !file->mp->fs.jbd_journal)return ENOTSUP;
+    if (file->mp->fs.read_only)return EROFS;
+    if (offset>file->fmax || length>file->fmax-offset)return EFBIG;
+    EXT4_MP_LOCK(file->mp);
+    struct ext4_fs *fs=&file->mp->fs;
+    struct ext4_inode_ref ref;
+    int r=ext4_fs_get_inode_ref_read(fs,file->inode,&ref);
+    if (r) {EXT4_MP_UNLOCK(file->mp);return r;}
+    if (!ext4_inode_has_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS)) {
+        ext4_fs_put_inode_ref(&ref);EXT4_MP_UNLOCK(file->mp);return ENOTSUP;
+    }
+    size_t block=fs->bdev->lg_bsize;
+    while (!r && *ready<length) {
+        uint64_t position=offset+*ready,logical=position/block;
+        uint32_t key=logical>>6;unsigned bit=logical&63;
+        size_t rest=length-*ready;
+        unsigned maximum=(rest+position%block+block-1)/block;
+        if (maximum>64-bit)maximum=64-bit;
+        uint64_t want=delalloc_mask(bit,maximum),pending;
+        bool missing_chunk;
+        { EXT4_STATE_READ_SCOPE(state,fs);
+          struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,key);
+          pending=chunk?chunk->mask&want:0;missing_chunk=!chunk; }
+        struct ext4_inode_block_range range={0};
+        if (pending==want)range.count=maximum;
+        else r=ext4_extent_get_range(&ref,logical,maximum,false,&range);
+        if (r)break;
+        if (!range.count) {r=EIO;break;}
+        if (range.count>maximum)range.count=maximum;
+        if (!range.block) {
+            struct ext4_delalloc_change *change=ext4_calloc(1,sizeof(*change));
+            struct ext4_delalloc_chunk *candidate=missing_chunk?ext4_calloc(1,sizeof(*candidate)):NULL;
+            if (!change || (missing_chunk && !candidate)) {ext4_free(change);ext4_free(candidate);r=ENOMEM;break;}
+            if (candidate)candidate->key=key;
+            change->key=key;change->start=offset;
+            {
+                EXT4_STATE_SCOPE(state,fs);
+                struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,key);
+                uint64_t mask=delalloc_mask(bit,range.count),missing=mask&~(chunk?chunk->mask:0);
+                uint64_t free=ext4_sb_get_free_blocks_cnt(&fs->sb),reserved=fs->reserved_blocks+fs->delayed_blocks;
+                if (reserved>free)__builtin_trap();
+                uint64_t available=free-reserved;
+                unsigned n=0;
+                for (;n<range.count;n++) {
+                    uint64_t one=UINT64_C(1)<<(bit+n);
+                    if (!(missing&one))continue;
+                    if (!available)break;
+                    available--;
+                }
+                range.count=n;
+                uint64_t admitted=delalloc_mask(bit,range.count);
+                uint64_t added=admitted&missing;
+                if (range.count) {
+                    if (!chunk) {
+                        if (!candidate)__builtin_trap();
+                        chunk=candidate;candidate=NULL;RB_INSERT(ext4_delalloc_tree,&file->delalloc->tree,chunk);
+                    }
+                    chunk->mask|=added;
+                    if (chunk->borrowers==UINT32_MAX)__builtin_trap();
+                    chunk->borrowers++;change->mask=admitted;
+                    unsigned count=delalloc_count(added);
+                    fs->delayed_blocks+=count;file->delalloc->blocks+=count;
+                }
+            }
+            ext4_free(candidate);
+            if (change->mask) {change->next=*ticket;*ticket=change;}else ext4_free(change);
+            if (!range.count) {r=ENOSPC;break;}
+        }
+        size_t bytes=(size_t)range.count*block-position%block;
+        if (bytes>rest)bytes=rest;
+        *ready+=bytes;
+    }
+    int put=ext4_fs_put_inode_ref(&ref);if(!r)r=put;
+    EXT4_MP_UNLOCK(file->mp);
+    return r;
+}
+void ext4_file_accept_reservation(ext4_file *file,void *ticket,uint64_t accepted_end)
+{
+    struct ext4_fs *fs=&file->mp->fs;
+    size_t block=fs->bdev->lg_bsize;
+    EXT4_STATE_SCOPE(state,fs);
+    for (struct ext4_delalloc_change *change=ticket;change;change=change->next) {
+        struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,change->key);
+        if (!chunk || !chunk->borrowers)__builtin_trap();
+        uint64_t last=accepted_end>change->start?(accepted_end+block-1)/block:change->start/block;
+        uint64_t base=(uint64_t)change->key*64;
+        unsigned kept=last<=base?0:last-base<64?last-base:64;
+        chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
+        change->committed=true;
+    }
+}
+void ext4_file_finish_reservation(ext4_file *file,void *ticket,uint64_t accepted_end)
+{
+    struct ext4_fs *fs=&file->mp->fs;
+    size_t block=fs->bdev->lg_bsize;
+    while (ticket) {
+        struct ext4_delalloc_change *change=ticket;ticket=change->next;
+        uint64_t last=accepted_end>change->start?(accepted_end+block-1)/block:change->start/block;
+        {
+            EXT4_STATE_SCOPE(state,fs);
+            struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,change->key);
+            uint64_t base=(uint64_t)change->key*64;
+            unsigned kept=last<=base?0:last-base<64?last-base:64;
+            if (!chunk || !chunk->borrowers)__builtin_trap();
+            if (!change->committed)chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
+            if (!--chunk->borrowers) {
+                /* Another source or mapping can have accepted the same block.
+                 * Only the last preparation releases still-unaccepted bits. */
+                uint64_t unused=chunk->mask&~chunk->accepted;
+                unsigned count=delalloc_count(unused);
+                chunk->mask&=~unused;
+                file->delalloc->blocks-=count;fs->delayed_blocks-=count;
+                if (!chunk->mask) {
+                    RB_REMOVE(ext4_delalloc_tree,&file->delalloc->tree,chunk);
+                    chunk->next=file->delalloc->retired;file->delalloc->retired=chunk;
+                }
+            }
+        }
+        ext4_free(change);
+    }
+    ext4_file_drain_reservations(file);
+}
+
 int ext4_file_prepare_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,bool *complete)
 {
     ext4_assert(file && file->mp && ready && complete);
@@ -4658,6 +4876,15 @@ Retry:
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
 	if (r) { r = ext4_file_data_finish(file, r); goto Completed; }
 	saved_size = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
+    if (file->delalloc && journal && file->delalloc->blocks) {
+        /* Adapter writeback commits its own operation before returning spans. */
+        if (!outer)__builtin_trap();
+        struct ext4_operation *operation=ext4_current_operation(fs);
+        EXT4_STATE_SCOPE(state,fs);
+        if (operation->delalloc)__builtin_trap();
+        operation->delalloc=file->delalloc;operation->delalloc_spans=spans;
+        operation->delalloc_span_count=count;operation->delalloc_credit=delalloc_spans(operation,false);
+    }
     struct ext4_direct_write_batch *direct = NULL;
     if (!journal && blocks > 1 && source_count) {
         direct = ext4_calloc(1, sizeof(*direct));
@@ -4818,6 +5045,7 @@ int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned 
         initial_size = file->fsize;
     }
     int r = ext4_write_spans(&local, spans, count);
+    ext4_file_drain_reservations(file);
     {
         EXT4_STATE_SCOPE(state, &file->mp->fs);
         /* Positioned data writes only extend EOF. Shrink/space operations hold

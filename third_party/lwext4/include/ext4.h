@@ -127,6 +127,15 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 
 /********************************FILE DESCRIPTOR*****************************/
 
+struct ext4_delalloc_chunk;
+struct ext4_delalloc_change;
+RB_HEAD(ext4_delalloc_tree, ext4_delalloc_chunk);
+struct ext4_delalloc {
+    struct ext4_delalloc_tree tree;
+    struct ext4_delalloc_chunk *retired;
+    uint64_t blocks;
+};
+
 /**@brief   File descriptor. */
 typedef struct ext4_file {
 
@@ -149,6 +158,7 @@ typedef struct ext4_file {
 	uint64_t fpos;
 
 	void *time_owner; /* Adapter-owned live inode; valid for this handle lifetime. */
+    struct ext4_delalloc *delalloc; /* Shared by positioned handle copies. */
 } ext4_file;
 
 /* BoarOS adapter: optional realtime source and live-inode timestamp updates.
@@ -546,6 +556,12 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
 int ext4_file_prepare_write(ext4_file *file, uint64_t offset, size_t length,
                             size_t *ready, bool *complete);
 int ext4_file_complete_write(ext4_file *file);
+int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, void **ticket);
+void ext4_file_accept_reservation(ext4_file *, void *ticket, uint64_t accepted_end);
+void ext4_file_finish_reservation(ext4_file *, void *ticket, uint64_t accepted_end);
+void ext4_file_release_reservations(ext4_file *, uint64_t size);
+void ext4_file_drain_reservations(ext4_file *);
+
 
 /**@brief   Read data from file.
  *

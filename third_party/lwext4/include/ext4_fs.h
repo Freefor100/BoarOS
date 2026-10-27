@@ -77,6 +77,7 @@ struct ext4_fs {
 	uint32_t active_operations;
 	const struct ext4_lock *os_locks;
     uint64_t reserved_blocks;
+    uint64_t delayed_blocks;
     uint32_t reserved_inodes;
     struct ext4_inode_goal_tree inode_goals;
     struct ext4_inode_goal_queue pending_inode_goals;

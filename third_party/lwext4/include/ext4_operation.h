@@ -24,6 +24,11 @@ struct ext4_operation {
     int64_t block_delta, inode_delta;
     uint64_t reserved_blocks;
     uint32_t reserved_inodes;
+    struct ext4_delalloc *delalloc;
+    struct file_write_span *delalloc_spans;
+    unsigned delalloc_span_count;
+    uint64_t delalloc_credit, delalloc_used;
+
     uint32_t ro_flags_add;
     uint32_t orphan_base, orphan_head;
     struct {
