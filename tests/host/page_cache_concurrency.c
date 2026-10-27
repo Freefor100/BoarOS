@@ -1612,8 +1612,10 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
     kernel_page_cache_get_concurrency_state(cache, &state);
     observe_cache_metadata = 0;
     assert(cache_metadata_lock);
+    const unsigned sizes[]={1,8,KERNEL_PAGE_CACHE_READ_BATCH_MAX};
     for (unsigned remote = 0; remote < 2; remote++) for (unsigned warm = 0; warm < 2; warm++)
-        for (unsigned count = 1; count <= 8; count *= 8) {
+        for (unsigned test=0;test<(KERNEL_PAGE_CACHE_READ_BATCH_MAX==8?2U:3U);test++) {
+            unsigned count=sizes[test];
             assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
             kernel_page_cache_get_concurrency_state(cache,&state);
             if(state.index_capacity-state.index_capacity/4-state.index_live-state.index_tombstones<count) {
@@ -2388,7 +2390,7 @@ static void executor_range_cases(struct kernel_page_cache *cache,const char *pat
     current_cache=NULL;
 }
 static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
-    struct physical_page_allocator *pages, const char *path, unsigned actors)
+    struct physical_page_allocator *pages, const char *path, unsigned actors,int focused)
 {
     (void)heap;
     image_fd = open(path, O_RDWR); assert(image_fd >= 0);
@@ -2405,8 +2407,17 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     assert(!kernel_vfs_pwrite(&file, BOAROS_PAGE_SIZE, bytes, sizeof(bytes), &done) && done == sizeof(bytes));
     uint64_t error = 0; assert(!kernel_vfs_sync(&file, 0, &error));
     assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)));
-    assert(!kernel_page_cache_start_worker(cache));
     current_cache = cache; current_file = &file;
+    if (focused) {
+        expanded_index_case(cache,&file,pages);
+        assert(!kernel_page_cache_start_worker(cache));
+        demand_operation_cases(cache,&file);
+        kernel_page_cache_stop_worker(cache);
+        demand_cases(cache,&file,actors);
+        assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !close(image_fd));
+        return;
+    }
+    assert(!kernel_page_cache_start_worker(cache));
 #ifndef CACHE_MM_CASES
     pause_candidate=1;candidate_entered=candidate_resume=0;
     pthread_t allocating;
@@ -2416,9 +2427,9 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
         "unpublished cold candidate must retain its cache owner");
     __atomic_store_n(&candidate_resume,1,__ATOMIC_RELEASE);
     assert(!pthread_join(allocating,NULL) && !physical_page_release(pages,received[1]));
-    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)) &&
-        !kernel_page_cache_start_worker(cache));
-    puts("PASS unpublished cold read: destroy retains cache through private preparation");
+    /* A mounted cache rejects destroy before stopping its existing worker. */
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    puts("PASS mounted cache rejects destroy during private cold preparation; original worker remains usable");
 #endif
     source_reads = read_entered = resume_read = 0; pause_read = 1;
     pthread_t threads[4];
@@ -3314,6 +3325,10 @@ int main(int argc, char **argv)
     if (argc==3) {
         if (!strcmp(argv[2],"domain-start-failure")) {writeback_start_failure(&cache,argv[1]);return 0;}
         if (!strcmp(argv[2],"progress-owners")) {progress_writeback_owners(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"read-batch")) {
+            cold_case(&cache,&heap,&pages,argv[1],4,1);
+            destroy_version_case(&cache);goto owners;
+        }
         if (!strcmp(argv[2],"version-pool")) {version_pool_cases(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"dirty-age")) {dirty_age_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"pressure-domains")) {writeback_domains(&cache,argv[1]);goto owners;}
@@ -3378,8 +3393,8 @@ int main(int argc, char **argv)
         goto owners;
     }
     if (argc == 2) {
-        cold_case(&cache, &heap, &pages, argv[1], 2);
-        cold_case(&cache, &heap, &pages, argv[1], 4);
+        cold_case(&cache, &heap, &pages, argv[1], 2,0);
+        cold_case(&cache, &heap, &pages, argv[1], 4,0);
     }
     execution_case(&cache);
     destroy_version_case(&cache);
