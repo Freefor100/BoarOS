@@ -316,13 +316,14 @@ static void cache_wake(struct kernel_wait_queue *queue)
 
 /* A pool outlives the cache while a journal/DMA borrower still owns a
  * version. Idle entries have no borrowers; their page and object move together. */
-#define CACHE_VERSION_IDLE_MAX (262144U / BOAROS_PAGE_SIZE)
+#define CACHE_VERSION_IDLE_MIN (262144U / BOAROS_PAGE_SIZE)
+#define CACHE_VERSION_IDLE_MAX (4194304U / BOAROS_PAGE_SIZE)
 struct version_pool {
     struct kernel_raw_lock lock;
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
     struct cache_version *idle;
-    size_t idle_count, reserve;
+    size_t idle_count, reserve, idle_limit;
     unsigned references, closed, stopping;
     struct kernel_wait_queue ready;
 };
@@ -354,7 +355,12 @@ static struct version_pool *version_pool_new(struct kernel_heap *heap,
 {
     struct version_pool *pool;
     if (kernel_heap_allocate(heap,sizeof(*pool),(void **)&pool)) return NULL;
-    *pool=(struct version_pool){.heap=heap,.allocator=allocator,.references=1};
+    size_t limit=physical_page_total(allocator)/32;
+    if (limit<CACHE_VERSION_IDLE_MIN) limit=CACHE_VERSION_IDLE_MIN;
+    if (limit>CACHE_VERSION_IDLE_MAX) limit=CACHE_VERSION_IDLE_MAX;
+    /* 不预分配；保留实际归还的一组存储，避免checkpoint后立即重新分配。
+     * 空闲页仍由压力回收优先释放，小内存保持原有最小容量。 */
+    *pool=(struct version_pool){.heap=heap,.allocator=allocator,.references=1,.idle_limit=limit};
     kernel_raw_lock_init(&pool->lock,KERNEL_RAW_RANK_OBJECT);
     kernel_wait_queue_init(&pool->ready);
     return pool;
@@ -408,7 +414,7 @@ static void version_release(void *owner)
     struct version_pool *pool=version->pool;
     {
         KERNEL_RAW_SCOPE(guard,&pool->lock);
-        if (!pool->closed && pool->idle_count<CACHE_VERSION_IDLE_MAX) {
+        if (!pool->closed && pool->idle_count<pool->idle_limit) {
             version->next=pool->idle; pool->idle=version; pool->idle_count++;
             cache_wake(&pool->ready);
             return;
@@ -420,21 +426,28 @@ static void version_release(void *owner)
  * lower-ranked allocator locks and therefore always happen after unlocking. */
 static uint64_t version_pool_reclaim(struct version_pool *pool,uint64_t target)
 {
-    struct cache_version *retired=NULL;
-    uint64_t count=0;
-    {
-        KERNEL_RAW_SCOPE(guard,&pool->lock);
-        while (pool->idle && pool->idle_count>pool->reserve && count<target) {
-            struct cache_version *version=pool->idle;
-            pool->idle=version->next; pool->idle_count--;
-            version->next=retired; retired=version; count++;
+    uint64_t released=0;
+    while (released<target) {
+        struct cache_version *retired=NULL;
+        unsigned count=0;
+        {
+            KERNEL_RAW_SCOPE(guard,&pool->lock);
+            /* 池可以容纳多批版本；扩大保留量不扩大一次关中断摘链。 */
+            while (pool->idle && pool->idle_count>pool->reserve &&
+                   count<64 && count<target-released) {
+                struct cache_version *version=pool->idle;
+                pool->idle=version->next; pool->idle_count--;
+                version->next=retired; retired=version; count++;
+            }
         }
+        if (!count) break;
+        while (retired) {
+            struct cache_version *version=retired;retired=version->next;
+            version_dispose(version);
+        }
+        released+=count;
     }
-    while (retired) {
-        struct cache_version *version=retired;retired=version->next;
-        version_dispose(version);
-    }
-    return count;
+    return released;
 }
 static void version_pool_close(struct version_pool *pool)
 {

@@ -1102,23 +1102,26 @@ static void retain_generation(struct kernel_vfs_file *file,unsigned char byte,st
 }
 static void version_capacity_case(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
 {
-    enum { CAPACITY=262144U/BOAROS_PAGE_SIZE, COUNT=CAPACITY+3 };
-    struct retained_version versions[COUNT];memset(versions,0,sizeof(versions));
-    uint64_t addresses[COUNT];
-    for(unsigned i=0;i<COUNT;i++) {
+    size_t capacity=physical_page_total(cache->allocator)/32;
+    if(capacity<262144U/BOAROS_PAGE_SIZE)capacity=262144U/BOAROS_PAGE_SIZE;
+    if(capacity>4194304U/BOAROS_PAGE_SIZE)capacity=4194304U/BOAROS_PAGE_SIZE;
+    const size_t count=capacity+3;
+    struct retained_version versions[count];memset(versions,0,sizeof(versions));
+    uint64_t addresses[count];
+    for(unsigned i=0;i<count;i++) {
         retain_generation(file,0x20+i,&versions[i]);
         addresses[i]=(uintptr_t)versions[i].data&~BOAROS_PAGE_MASK;
-        for(unsigned j=0;j<i;j++)assert(addresses[i]!=addresses[j] && *versions[j].data==0x20+j);
+        for(unsigned j=0;j<i;j++)assert(addresses[i]!=addresses[j] && *versions[j].data==(unsigned char)(0x20+j));
     }
     uint64_t pinned;size_t valid;
     assert(!kernel_page_cache_get(cache,file,0,&pinned,&valid));
     size_t released=0;version_releases=&released;
-    tracked_version_pages=addresses;tracked_version_count=COUNT;
-    for(unsigned i=0;i<COUNT;i++)versions[i].source.release(versions[i].source.context);
-    assert(released==COUNT-CAPACITY);
+    tracked_version_pages=addresses;tracked_version_count=count;
+    for(unsigned i=0;i<count;i++)versions[i].source.release(versions[i].source.context);
+    assert(released==count-capacity);
     assert(!kernel_page_cache_start_worker(cache));
-    unsigned excess=CAPACITY-BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
-    assert(kernel_page_cache_reclaim(cache,excess)==excess && released==COUNT-BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
+    unsigned excess=capacity-BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    assert(kernel_page_cache_reclaim(cache,excess)==excess && released==count-BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
     rejected_background_allocations=0;__atomic_store_n(&reject_background_allocations,1,__ATOMIC_RELEASE);
     unsigned char byte=0xd1;size_t done;
     assert(!kernel_vfs_pwrite(file,17,&byte,1,&done) && done==1);
@@ -1128,11 +1131,11 @@ static void version_capacity_case(struct kernel_page_cache *cache,struct kernel_
     assert(!__atomic_load_n(&rejected_background_allocations,__ATOMIC_ACQUIRE));
     __atomic_store_n(&reject_background_allocations,0,__ATOMIC_RELEASE);
     kernel_page_cache_stop_worker(cache);
-    assert(kernel_page_cache_reclaim(cache,BOAROS_PAGE_CACHE_WRITEBACK_PAGES)==BOAROS_PAGE_CACHE_WRITEBACK_PAGES && released==COUNT);
+    assert(kernel_page_cache_reclaim(cache,BOAROS_PAGE_CACHE_WRITEBACK_PAGES)==BOAROS_PAGE_CACHE_WRITEBACK_PAGES && released==count);
     version_releases=NULL;tracked_version_pages=NULL;tracked_version_count=0;
     assert(!physical_page_release(cache->allocator,pinned));
-    printf("PASS version pool capacity: idle=%u pages <=256KiB, pressure frees surplus before cache pages, %u-page reserve writes with allocations rejected\n",
-        CAPACITY,(unsigned)BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
+    printf("PASS version pool capacity: idle=%zu pages scaled to RAM and <=4MiB, pressure frees surplus before cache pages, %u-page reserve writes with allocations rejected\n",
+        capacity,(unsigned)BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
 }
 static void version_oom_case(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
 {
@@ -1307,6 +1310,23 @@ static void destroy_version_case(struct kernel_page_cache *cache)
     after_destroy_version.source.release(after_destroy_version.source.context);
     after_destroy_version=(struct retained_version){0};
     puts("PASS version pool destroy: closed idle drain overlaps last retained release, no cache pointer borrowed by late owner");
+}
+static void version_pool_cases(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));current_cache=cache;
+    assert(!kernel_vfs_create(&mount,"/version-pool",0600,&file));
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x61,sizeof(bytes));size_t done;uint64_t observed=0;
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes) &&
+        !kernel_vfs_sync(&file,0,&observed));
+    version_reuse_case(cache,&file);version_capacity_case(cache,&file);version_oom_case(cache,&file);
+    version_prefix_cycle(cache,&file);version_empty_cycle(cache,&file);
+    retain_after_cache_close(cache,&file);
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !close(image_fd));
+    destroy_version_case(cache);current_cache=NULL;
 }
 static unsigned window_truncate_started,window_truncate_done;
 static void *truncate_writeback_window(void *file)
@@ -3294,6 +3314,7 @@ int main(int argc, char **argv)
     if (argc==3) {
         if (!strcmp(argv[2],"domain-start-failure")) {writeback_start_failure(&cache,argv[1]);return 0;}
         if (!strcmp(argv[2],"progress-owners")) {progress_writeback_owners(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"version-pool")) {version_pool_cases(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"dirty-age")) {dirty_age_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"pressure-domains")) {writeback_domains(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"indexed-reclaim")) {
