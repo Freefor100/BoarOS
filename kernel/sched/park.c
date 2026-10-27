@@ -464,7 +464,7 @@ static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int al
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     struct kernel_wait_cursor cursor;
-    if (cursor_begin(queue, &cursor, 1)) kernel_wait_cursor_wake(&cursor, all);
+    if (kernel_wait_cursor_prepare(queue, &cursor)) kernel_wait_cursor_wake(&cursor, all);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 enum kernel_scheduler_status kernel_wait_queue_wake_one(struct kernel_wait_queue *queue) { return wake(queue, 0); }
