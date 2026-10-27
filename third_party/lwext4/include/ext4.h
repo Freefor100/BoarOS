@@ -115,8 +115,9 @@ int ext4_journal_group_service(const char *mount_point, bool force);
 int ext4_journal_group_commit(const char *mount_point, bool force);
 int ext4_journal_group_checkpoint(const char *mount_point);
 int ext4_journal_group_drain(const char *mount_point);
-/* Admission waits only for the oldest reclaimable group, not all accepted work. */
-int ext4_journal_group_reclaim(const char *mount_point);
+/* Quota pressure reuses closed groups; memory pressure may end a running
+ * group. Explicit drain still waits for all work accepted at its entry. */
+int ext4_journal_group_reclaim(const char *mount_point, bool memory_pressure);
 struct ext4_journal_progress {
 	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
 	size_t memory_used, memory_peak;
@@ -556,6 +557,7 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
 int ext4_file_prepare_write(ext4_file *file, uint64_t offset, size_t length,
                             size_t *ready, bool *complete);
 int ext4_file_complete_write(ext4_file *file);
+/* Adapter owns the live inode I/O writer; global accounting still uses STATE. */
 int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, void **ticket);
 void ext4_file_accept_reservation(ext4_file *, void *ticket, uint64_t accepted_end);
 void ext4_file_finish_reservation(ext4_file *, void *ticket, uint64_t accepted_end);

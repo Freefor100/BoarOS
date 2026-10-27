@@ -390,6 +390,11 @@ static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_v
     assert(!kernel_vfs_close(&filler) && !kernel_vfs_close(&last) && !kernel_vfs_close(&victim));
     puts("PASS private free/reuse abort: retained allocation owners protect original initialized contents");
 }
+static void (*reservation_state_lock)(void *);
+static unsigned reservation_state_calls;
+static void count_reservation_state_lock(void *context)
+{ reservation_state_calls++;reservation_state_lock(context); }
+
 static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_file file={0};
@@ -441,6 +446,12 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_ENOMEM);
     assert(!kernel_vfs_sync(&file,0,&observed) && fs->delayed_blocks==baseline);
     assert(mapped(&file,0).block);
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    reservation_state_lock=adapter->locks.state_lock;reservation_state_calls=0;
+    adapter->locks.state_lock=count_reservation_state_lock;
+    ext4_file_drain_reservations(lwext4_node_file(kernel_vfs_file_node(&file)));
+    adapter->locks.state_lock=reservation_state_lock;
+    assert(!reservation_state_calls && "empty reservation cleanup must not enter mount state");
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
     expect_bytes(&file,bytes,sizeof(bytes));
     assert(!kernel_vfs_ftruncate(&file,0));

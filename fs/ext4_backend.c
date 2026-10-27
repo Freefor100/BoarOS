@@ -2568,12 +2568,12 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
-static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance)
+static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance, int memory_pressure)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
     struct jbd_journal *journal = adapter->device.fs->jbd_journal;
     return journal && journal->grouped ?
-        lwext4_error(ext4_journal_group_reclaim(adapter->mount_point)) : 0;
+        lwext4_error(ext4_journal_group_reclaim(adapter->mount_point,memory_pressure != 0)) : 0;
 }
 static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_only,
     struct kernel_vfs_sync_request *request)

@@ -30,7 +30,7 @@ static void *fixed_target_sync_client(void *argument)
 {
     struct fixed_target_sync *sync=argument;cache_test_attach(6);
     fixed_target_client=1;
-    sync->result=sync->reclaim ? sync->reclaim->instance.ops->writeback_reclaim(&sync->reclaim->instance) : ext4_file_sync_metadata_mode(sync->file,true);
+    sync->result=sync->reclaim ? sync->reclaim->instance.ops->writeback_reclaim(&sync->reclaim->instance,0) : ext4_file_sync_metadata_mode(sync->file,true);
     fixed_target_client=0;return NULL;
 }
 static void durable_fixed_target(struct kernel_heap *heap,struct physical_page_allocator *pages,const char *path)
@@ -80,6 +80,17 @@ static void durable_fixed_target(struct kernel_heap *heap,struct physical_page_a
     durable_wait=(__typeof__(durable_wait)){0};
     assert(!kernel_vfs_sync_mount(&mount,&observed) &&
         !ext4_journal_group_progress(adapter->mount_point,&progress) && progress.durable==progress.accepted);
+    assert(!ext4_journal_group_drain(adapter->mount_point));
+    /* Ordinary quota progress may wait for an existing closed group; it
+     * must leave a healthy running group available for more accepted writes. */
+    assert(!kernel_vfs_file_set_mode(&other,0601));
+    assert(!ext4_journal_group_progress(adapter->mount_point,&progress) && progress.accepted>progress.sealed);
+    uint64_t sealed=progress.sealed;
+    assert(!adapter->instance.ops->writeback_reclaim(&adapter->instance,0));
+    assert(!ext4_journal_group_progress(adapter->mount_point,&progress) && progress.sealed==sealed);
+    assert(!adapter->instance.ops->writeback_reclaim(&adapter->instance,1));
+    assert(!ext4_journal_group_progress(adapter->mount_point,&progress) && progress.checkpoint==progress.accepted);
+    assert(!kernel_vfs_sync_mount(&mount,&observed));
     kernel_page_cache_stop_worker(&cache);
     assert(!kernel_vfs_close(&writer) && !kernel_vfs_close(&other) && !kernel_vfs_unmount(&mount) &&
         !kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;journal_wait_owner=NULL;

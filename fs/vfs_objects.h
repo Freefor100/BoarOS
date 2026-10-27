@@ -153,7 +153,7 @@ struct kernel_vfs_backend {
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
     /* Caller has returned source/entry and inode qualifications before waiting. */
-    int (*writeback_reclaim)(struct kernel_vfs_instance *instance);
+    int (*writeback_reclaim)(struct kernel_vfs_instance *instance, int memory_pressure);
     /* Returns after capturing/registering a fixed target. The backend completes
      * request once durable or failed, without borrowing a CPU0 executor stack.
      * NULL denotes a memory-only backend without persistent metadata. */
