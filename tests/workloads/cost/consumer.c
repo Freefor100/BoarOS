@@ -10,6 +10,7 @@
 #define COST_READERS_EMBED 1
 #include "readers.c"
 static unsigned command_selection=65535;
+static char **iozone_arguments;
 static unsigned long long nanoseconds(void)
 { struct timespec t; CHECK(clock_gettime(CLOCK_MONOTONIC,&t)==0);return (unsigned long long)t.tv_sec*1000000000ULL+t.tv_nsec; }
 static void drain_directory(void)
@@ -57,7 +58,7 @@ static void command(unsigned libc, unsigned index)
         char *automatic[]={"./iozone","-a","-r","1k","-s","4m",0};
         char *threads[]={"./iozone","-t","4","-i",(char *)groups[index?index-1:0][0],"-i",(char *)groups[index?index-1:0][1],"-r","1k","-s","1m",0};
         setenv("LD_LIBRARY_PATH",libc?"/glibc/lib":"/musl/lib",1);
-        execv("./iozone",index?threads:automatic);dprintf(2,"COST EXEC ERROR %s %d\n",name,errno);_exit(127);
+        execv("./iozone",iozone_arguments?iozone_arguments:index?threads:automatic);dprintf(2,"COST EXEC ERROR %s %d\n",name,errno);_exit(127);
     }
     char c;CHECK(read(ready[0],&c,1)==1);printf("COST COMMAND BEGIN %s\n",name);fflush(stdout);cost_begin();CHECK(write(gate[1],"g",1)==1);
     unsigned long long start=(unsigned long long)window_start.tv_sec*1000000000ULL+window_start.tv_nsec;
@@ -96,8 +97,28 @@ int main(void)
     CHECK(symlink("/musl/lib/libc.so","/lib/ld-musl-riscv64-sf.so.1")==0 || errno==EEXIST);
     CHECK(symlink("/glibc/lib/ld-linux-riscv64-lp64d.so.1","/lib/ld-linux-riscv64-lp64d.so.1")==0 || errno==EEXIST);
     setenv("LD_LIBRARY_PATH","/glibc/lib",1);
-    for(unsigned libc=0;libc<2;libc++)for(unsigned group=0;group<8;group++)
-        if(command_selection&(1U<<(libc*8+group)))command(libc,group);
+    FILE *matrix=fopen("/cost-consumer-iozone-cases","r");
+    if(matrix){
+        char label[32],size[16],record[16];unsigned flush,libcs;
+        int fields;
+        while((fields=fscanf(matrix,"%31s %15s %15s %u %u",label,size,record,&flush,&libcs))==5){
+            CHECK(flush<=1 && libcs && libcs<=3);
+            char *automatic[]={"./iozone","-a","-r",record,"-s",size,NULL};
+            char *writes[]={"./iozone","-i","0","-i","2","-r",record,"-s",size,"-e",NULL};
+            iozone_arguments=flush?writes:automatic;
+            for(unsigned libc=0;libc<2;libc++){
+                if(!(libcs&(1U<<libc)))continue;
+                printf("IOZONE CASE_BEGIN %s %s\n",label,libc?"glibc":"musl");
+                command(libc,0);
+                printf("IOZONE CASE_END %s %s\n",label,libc?"glibc":"musl");
+            }
+        }
+        CHECK(fields==EOF && fclose(matrix)==0);iozone_arguments=NULL;
+    }else{
+        CHECK(errno==ENOENT);
+        for(unsigned libc=0;libc<2;libc++)for(unsigned group=0;group<8;group++)
+            if(command_selection&(1U<<(libc*8+group)))command(libc,group);
+    }
     if(probe)sync_probes();
     if(access("/cost-consumer-readers",F_OK)==0)cost_readers();
     puts("COST PASS consumer");fflush(NULL);if(access("/cost-linux",F_OK)==0)reboot(RB_POWER_OFF);return 0;
