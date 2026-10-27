@@ -264,6 +264,8 @@ static void *published_notification_worker(void *unused)
         struct kernel_wait_cursor cursor={0};
         forbid_wait_lock=1;
         assert(!kernel_wait_cursor_prepare(&published_queue,&cursor) && !cursor.queue);
+        assert(!kernel_wait_queue_wake_one(&published_queue));
+        assert(!kernel_wait_queue_wake_all(&published_queue));
         forbid_wait_lock=0;
         barrier(&publish_completed);
     } else {

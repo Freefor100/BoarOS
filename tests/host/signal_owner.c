@@ -118,7 +118,7 @@ static void selected_payloads(struct kernel_task *task,struct kernel_signal_tabl
     assert(!memcmp(&delivery.info,&expected,sizeof(expected)) && !task->signal_fault.signal);
 
     struct signal_pending_prepared p={0};
-    signal_pending_prepare_index(task,1,&queue_heap,&p);
+    signal_pending_prepare_queue(task,1,&queue_heap,&p);
     assert(p.index && queue_allocations==1);
     native_record=(struct signal_queue_record){.info={.signal=10,.code=-2,.sender=7,.value=UINT64_C(0x1234567887654321)},
         .timer=(struct kernel_posix_timer *)&native_record};

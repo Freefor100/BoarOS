@@ -94,5 +94,6 @@ int main(void)
     assert(kernel_cost_read(0,COST_IRQ_OFF_TICKS,&count)==0 && count==42);
     assert(kernel_cost_rank(21)==6 && kernel_cost_rank(31)==7 && kernel_cost_rank(32)==8 && kernel_cost_rank(35)==9);
     assert(kernel_cost_lock_metric(kernel_cost_rank(35))==COST_LOCK35_ATTEMPTS);
+    assert(kernel_cost_rank(45)==10 && kernel_cost_lock_metric(10)==COST_LOCK45_ATTEMPTS);
     puts("cost SMP: recursive IRQ observer, exact concurrent totals, owner boundaries, inflight close, migration and per-CPU IRQ passed");
 }

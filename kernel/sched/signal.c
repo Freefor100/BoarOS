@@ -1256,7 +1256,7 @@ int signal_timer_post_locked(struct kernel_pid *id,int thread,struct signal_queu
     struct kernel_task *actual=timer_receiver_locked(id,thread,record->info.signal,wake);
     if(!actual){*wake=0;return 0;}
     unsigned sig=record->info.signal;
-    int control=sig==SIGNAL_KILL||sig==SIGNAL_CONTINUE||(sig>=SIGNAL_STOP&&sig<=22U);
+    int control=kernel_signal_controls_group(sig);
     int ignored=signal_ignored_unblocked(*wake,sig);
     /* Group effects apply even when CONT has no pending handler. Keep the
      * actual identity's storage until the unlocked group traversal ends. */
@@ -1558,9 +1558,18 @@ int64_t kernel_signal_send_thread(struct kernel_task *caller,
      * lookup still takes a storage borrow and validates the requested group. */
     if(caller==kernel_task_current() && caller->tid==tid)target=caller;
     else target=borrow=kernel_signal_find_by_tid(tid);
-    if (!signal_dispatchable(target) || target->group_leader == 0 ||
-        (tgid != 0 && target->group_leader->tid != tgid)) {
-        return 0U;
+    uint64_t generation=0;
+    if (target==caller && caller==kernel_task_current()) {
+        /* Execution owns its current TID and group until the syscall ends. */
+        if (!signal_dispatchable(target) || !target->group_leader ||
+            (tgid && target->group_leader->tid!=tgid)) return 0;
+    } else {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (!signal_dispatchable_locked(target) || !target->group_leader ||
+            (tgid && target->group_leader->tid!=tgid)) return 0;
+        struct kernel_pid *identity=process_identity(target,KERNEL_PID_TID);
+        if (!identity) return 0;
+        generation=identity->generation;
     }
     if (sig == 0U) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -1568,7 +1577,9 @@ int64_t kernel_signal_send_thread(struct kernel_task *caller,
     }
     /* 实际发送由 signal_send_one 在分配前授权、发布时复核；探测信号
      * 没有该后续步骤，只有它需要在此单独检查。 */
-    enum kernel_signal_status status=kernel_signal_send_task(target,sig,sender_tid);
+    /* A remote exec can replace the TID while unlocked preparation sleeps.
+     * Publish only to the original identity retained by this lookup. */
+    enum kernel_signal_status status=signal_send_one(target,sig,sender_tid,0,-6,0,0,generation);
     if(status==KERNEL_SIGNAL_STATUS_PERMISSION)return -KERNEL_EPERM;
     if(status==KERNEL_SIGNAL_STATUS_QUEUE_FULL)return -KERNEL_EAGAIN;
     if(status!=KERNEL_SIGNAL_STATUS_OK)return 0;

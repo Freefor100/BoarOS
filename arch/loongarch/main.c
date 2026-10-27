@@ -7,6 +7,7 @@
 #include <platform/loongarch_rtc.h>
 #include <kernel/scheduler.h>
 #include <kernel/cpu.h>
+#include <kernel/cost.h>
 #include <arch/loongarch/smp.h>
 void la_trap_initialize(void);
 void la_boot_tasks(struct physical_page_allocator *);
@@ -56,6 +57,9 @@ void la_kernel_main(uint64_t systab)
     la_stack_window_contract(&allocator);
 #endif
     uint64_t realtime=0;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_set_timebase(la_timer_frequency());
+#endif
     int rtc=la_virt_rtc_initialize(&realtime);
     la_virt_puts(rtc ? "LA RTC unavailable; realtime uses boot-relative epoch\n" : "LA RTC UTC seconds resolution=1 boot-ns=");
     if(!rtc){la_virt_hex(realtime);la_virt_puts("\n");}

@@ -7,6 +7,11 @@
 
 struct kernel_task;
 
+/* These sends immediately change group stop/continue or exit state. Ordinary
+ * pending publication uses the shared scheduler protection on any CPU. */
+static inline int kernel_signal_controls_group(unsigned sig)
+{ return sig == 9U || (sig >= 18U && sig <= 22U); }
+
 #define LINUX_SS_ONSTACK 1U
 #define LINUX_SS_DISABLE 2U
 #define LINUX_SS_AUTODISARM UINT32_C(0x80000000)
