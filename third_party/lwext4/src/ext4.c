@@ -1609,7 +1609,7 @@ int ext4_journal_group_checkpoint(const char *mount_point)
 	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT);
 }
 
-int ext4_journal_group_drain(const char *mount_point)
+static int ext4_journal_wait_checkpoint(const char *mount_point, bool drain)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENOENT;
@@ -1620,13 +1620,19 @@ int ext4_journal_group_drain(const char *mount_point)
 	{
 	EXT4_STATE_SCOPE(state, &mp->fs);
 	r = !journal || !journal->grouped ? EINVAL : jbd_journal_error(journal);
-	target = journal && journal->checkpoint_sequence < journal->accepted_sequence ? journal->accepted_sequence : 0;
+	target = !r ? (drain ? journal->accepted_sequence : jbd_journal_reclaim_target(journal)) : 0;
+    if (journal && target <= journal->checkpoint_sequence) target = 0;
 	}
 	if (r == EOK && target)
 		r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
 	EXT4_MP_UNLOCK(mp);
 	return r;
 }
+
+int ext4_journal_group_drain(const char *mount_point)
+{ return ext4_journal_wait_checkpoint(mount_point,true); }
+int ext4_journal_group_reclaim(const char *mount_point)
+{ return ext4_journal_wait_checkpoint(mount_point,false); }
 
 int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress)
 {

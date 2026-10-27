@@ -115,6 +115,8 @@ int ext4_journal_group_service(const char *mount_point, bool force);
 int ext4_journal_group_commit(const char *mount_point, bool force);
 int ext4_journal_group_checkpoint(const char *mount_point);
 int ext4_journal_group_drain(const char *mount_point);
+/* Admission waits only for the oldest reclaimable group, not all accepted work. */
+int ext4_journal_group_reclaim(const char *mount_point);
 struct ext4_journal_progress {
 	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
 	size_t memory_used, memory_peak;

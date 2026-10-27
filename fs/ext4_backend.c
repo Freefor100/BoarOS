@@ -2552,7 +2552,7 @@ static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance)
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
     struct jbd_journal *journal = adapter->device.fs->jbd_journal;
     return journal && journal->grouped ?
-        lwext4_error(ext4_journal_group_drain(adapter->mount_point)) : 0;
+        lwext4_error(ext4_journal_group_reclaim(adapter->mount_point)) : 0;
 }
 static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_only,
     struct kernel_vfs_sync_request *request)
