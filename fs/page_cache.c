@@ -3077,6 +3077,29 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
     for (struct kernel_lock_guard *guard=io->locks;guard;guard=guard->previous)
         if (guard->lock->rank>15) return 0;
     if (available<r->high) (void)kernel_page_cache_reclaim(cache,r->high-available);
+    if (!kernel_page_cache_is_executor(cache) &&
+        physical_page_available(cache->allocator)>=r->high && node_pressure(node,r,0)) {
+        /* 普通额度先让后台推进。逐次write插入小请求会打断后台，
+         * 而dirty变成version并未归还额度，于是下一次write又重复排队。
+         * 额度恢复即可继续；一轮后仍不足才走下方有界推进和错误处理。 */
+        uint64_t round=0;
+        int joined=0;
+        for (;;) {
+            struct kernel_wait_token token={0};
+            {
+                CACHE_SCOPE(guard,cache);
+                if (!r->started || r->stopping || !node_pressure(node,r,0) ||
+                    (joined && r->completed!=round)) break;
+                if (kernel_wait_prepare(&r->progress,0,0,&token)) __builtin_trap();
+                if (!joined) {
+                    joined=1;round=r->completed;r->requested=1;cache_wake(&r->work);
+                }
+            }
+            enum kernel_wait_wake_reason reason;
+            if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
+        }
+        if (physical_page_available(cache->allocator)>r->low && !node_pressure(node,r,0)) return 0;
+    }
     struct write_admission_request request={.cache=cache,.node=node};
     /* 这里只借用缓存owner与调用栈；worker不取得调用者的OFD/写操作锁。
      * 保留整次write互斥，仍允许独立worker取得inode后推进一批写回。 */
@@ -3510,6 +3533,8 @@ static void cache_background(struct kernel_page_cache *cache)
                 CACHE_SCOPE(guard,cache);
                 if (!result) r->statistics.worker_written+=used;
                 else if (result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM) r->statistics.worker_failed+=used;
+                /* checkpoint可能在本批归还版本额度；无需等整个低水位轮次。 */
+                if (!node_pressure(batch[0]->node,r,0)) cache_wake(&r->progress);
                 for (size_t i=0;i<count;i++) entry_return(batch[i]);
             }
             reclaim_window_memory(cache);
