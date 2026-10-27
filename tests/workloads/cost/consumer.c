@@ -99,13 +99,14 @@ int main(void)
     setenv("LD_LIBRARY_PATH","/glibc/lib",1);
     FILE *matrix=fopen("/cost-consumer-iozone-cases","r");
     if(matrix){
-        char label[32],size[16],record[16];unsigned flush,libcs;
+        char label[32],size[16],record[16];unsigned mode,libcs;
         int fields;
-        while((fields=fscanf(matrix,"%31s %15s %15s %u %u",label,size,record,&flush,&libcs))==5){
-            CHECK(flush<=1 && libcs && libcs<=3);
+        while((fields=fscanf(matrix,"%31s %15s %15s %u %u",label,size,record,&mode,&libcs))==5){
+            CHECK(mode<=2 && libcs && libcs<=3);
             char *automatic[]={"./iozone","-a","-r",record,"-s",size,NULL};
             char *writes[]={"./iozone","-i","0","-i","2","-r",record,"-s",size,"-e",NULL};
-            iozone_arguments=flush?writes:automatic;
+            char *read_write[]={"./iozone","-i","0","-i","1","-i","2","-r",record,"-s",size,"-e",NULL};
+            iozone_arguments=mode==2?read_write:mode?writes:automatic;
             for(unsigned libc=0;libc<2;libc++){
                 if(!(libcs&(1U<<libc)))continue;
                 printf("IOZONE CASE_BEGIN %s %s\n",label,libc?"glibc":"musl");

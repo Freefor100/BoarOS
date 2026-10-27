@@ -73,6 +73,7 @@ NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限
 | 项目 | 已有事实与剩余问题 | 证据 |
 |---|---|---|
 | allocator 与批量 MM 成本 | 森林13.6%–22.4%、raw互斥6.0%–7.3%、等待交接的默认匿名新增2.5%–4.0%分别测量；后台提交/退出交错与批量MM的IRQ尾延迟仍有成本 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间)、[等待交接](learning/cost-baseline.md#等待交接的匹配时间) |
+| 普通文件逐页管理与stdio成本 | 同规格原版iozone仍有RV／LA吞吐差距；小记录stdio的描述符导入、多目的区用户借用及库内复制分别产生开销。物理引用合批候选未通过单核性能检查，当前保留逐页引用实现 | [读取机制](modules/vfs-ext4.md#缓存版本内的批量读)；对照结果由兼容分支现有数据路径报告维护 |
 | 共享调度域短窗口 | 4KiB复制唤醒与32等待者OFD的正式成本仍未决，归因已停止；保留数据，不追加诊断，不作为RV两核规划前置项 | [匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
 | 文件后端执行与剩余串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；ext4 冷读和 mmap 冷页在调用 CPU 装入；已打开文件的空间修改与 journal 接纳在发起 CPU；ext4 目录、路径元数据与普通最终关闭在发起 CPU；多执行者 journal ext4 的不同目录/文件可并行准备，接纳和拓扑变更保留各自必要的互斥；mount 管理、日志和后台写回继续在 CPU0，当前固定版本的匹配性能另行核对 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
