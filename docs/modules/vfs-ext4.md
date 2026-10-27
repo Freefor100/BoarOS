@@ -358,6 +358,13 @@ extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移
 
 写入在限额和文件最大位置检查后、用户复制前删除 filecap 并按 CAP_FSETID 与所属组清除 set-ID；后续 EFAULT 可以保留这项副作用。已确认没有 filecap 的活 inode 复用该事实，避免每次写入重读 EA；成功设置capability后，在同一inode写资格内撤销“属性不存在”的缓存；成功删除后发布缺失，失败保留原缓存。截断把清特权和大小修改放在同一事务，拒绝 FSIZE 后保留原属性。ext4 fallocate 按固定 Linux 先接受 file_modified，再判断 FSIZE 和空间分配，因此后续限额/空间失败保留已清除的特权。每次属性事务失败仍回滚自己的模式、EA 和校验数据。共享 mmap 按文件系统既有 page_mkwrite 规则处理，不额外清 set-ID。
 
+用户扩展属性的后端操作持有VFS inode读／写资格。ext4_file_getxattr/listxattr直接借用
+已打开inode；set/remove通过既有metadata执行入口开始私有操作，修改内部／外部EA、
+ctime和校验数据，失败执行原有回滚及资源归还。未保留另一套完整路径重查接口。
+列表仅输出已接入的名称空间，trusted条目的可见性由共同权限层传入。
+inode的immutable/append-only状态随模式与归属一并初始化，扩展属性修改检查该状态。
+inline EA在读取magic前检查范围；外部EA读取校验checksum，临时列表记录保持原生对齐。
+
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。根 mount 保存稳定的内部 ID 1 作为 `dev`，不表达物理设备 major/minor。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
 目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
 - `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_unlink_child` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
@@ -1186,8 +1193,3 @@ supervisor先卸载根盘。两种profile都检查真实子程序状态，不能
 原RV `test-sqlite-rollback-riscv`、WAL/NBD及完整DELETE/WAL恢复矩阵保留。共用TTY
 输出CRLF后，NBD shell parser只把CRLF还原为LF，保留原字节与全部NBD请求；不删
 任意CR，不改变SQLite程序或放宽退出/WRITE/FLUSH/真实数据库门禁。
-
-用户扩展属性的后端操作持有VFS inode读／写资格。ext4_file_getxattr/listxattr直接借用
-已打开inode；set/remove通过既有metadata执行入口开始私有操作，修改内部／外部EA、
-ctime和校验数据，失败执行原有回滚及资源归还。未保留另一套完整路径重查接口。
-列表仅输出已接入的名称空间，trusted条目的可见性由共同权限层传入。
