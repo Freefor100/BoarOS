@@ -5,6 +5,9 @@
 [兼容模块](../modules/oscomp-compat.md)。
 发布程序、调用方式、版本预期与判分差异集中见[评测问题](oscomp-test-issues.md)。
 
+当前已集成2026年10月27日的tmpfs/ext4用户扩展属性、filecap工具入口和SMP功能短例修正，
+具体范围见[扩展属性验证](#用户扩展属性与filecap工具-2026-10-27)。
+
 当前已集成2026年10月23日的共同I/O、proc索引、最终对象access检查与网络协议CPU0资格修复。机制、两架构短例及12次正式／4次补充成本结果见[共同成本记录](cpu-accounting-cost.md)中的“共同 I/O、proc 索引与协议执行资格整理”。proc枚举的重复全任务扫描已经消除；UP signalfd回退的原因仍待定位，向量I/O暂未显示明确吞吐收益。
 
 集成后默认`make all`生成`kernel-rv`、`kernel-la`、`disk.img`及`disk-la.img`；两张第二盘均为2304MiB，工具／VFAT／scratch三分区布局保持既定值，六个分区的e2fsck或fsck.fat均返回0，两架构具有独立的新启动种子。原评测输入、默认单核、跳过表及监督配置沿用现状；原程序得分继续按各次实际运行记录读取。
@@ -830,3 +833,52 @@ make all
 
 以上是主线集成的聚焦验证，未重新执行3600秒官方容器、完整ABI或229项原程序；
 2130仍是先前冻结提交的正式联合成绩，不属于本次集成树。
+
+## 用户扩展属性与filecap工具 2026-10-27
+
+main的通用实现提供两架构12个xattr入口。路径与FD使用实际inode，支持user、trusted和security
+属性；ext4沿既有私有事务提交和回滚，tmpfs将属性保留到inode最后使用者退出。
+用户设置的security.capability用于实际exec，设置后撤销“属性不存在”的快速判断，普通写入再按
+原规则清除特权。当前机制统一见[文件接口](../modules/kernel-files.md#扩展属性)。
+
+独立消费者在ext4、tmpfs各检查七组：完整ABI/标志/空值/长名称/链接/删除后FD；当前身份DAC和
+trusted过滤；filecap格式/投影/清除/缓存失效；所有在线CPU的替换与读取；跨页输入输出故障；
+用户写入filecap后降权exec及AT_SECURE；原getfattr/setfattr/getcap/setcap工具。
+这是本轮功能消费者结果，比赛原程序的得分继续在[原程序分析](oscomp-ltp-analysis.md)维护。
+
+| 配置 | 结果 | 正常结束后的磁盘检查 |
+|---|---:|---:|
+| RV单核，静态musl，512MiB | 14/14 | e2fsck -fn=0 |
+| RV双核，动态musl，1GiB | 14/14 | e2fsck -fn=0 |
+| RV四核，静态musl，512MiB | 14/14 | e2fsck -fn=0 |
+| RV单核，静态glibc，512MiB | 14/14 | e2fsck -fn=0 |
+| LA单核，静态musl与glibc，512MiB | 各14/14 | 均e2fsck -fn=0 |
+| 固定Linux RV，同一musl ELF | 14/14 | e2fsck -fn=0 |
+
+合入兼容分支后，RV、LA的glibc程序连同原工具再次各通过14组，并完成磁盘检查。
+Linux参考配置启用TMPFS_XATTR后执行相同程序；首次缺少该配置时，tmpfs返回EOPNOTSUPP。
+RV并发写线程显式固定到各在线CPU并核对getcpu；最小空闲内核栈1848字节，退出heap-live均归零。
+宿主覆盖4/16KiB页、1/4KiB文件系统块：tmpfs候选分配ENOMEM、ext4修改后注入EIO均保留原属性，
+卸载后页与堆对象归还。额外短反例检查immutable/append-only限制、损坏inline EA、外部EA checksum、
+列表项对齐，以及超过64KiB列表的零长度容量查询。首次inline损坏反例错误返回成功；修正后返回EIO。
+
+原工具固定attr 2.5.2、libcap 2.76，官方来源及SHA256统一在references/sources.tsv。
+兼容分支的`tests/prepare-xattr-tools.py`使用已有目标musl编译器、UAPI及本地归档，断网构建
+静态getfattr/setfattr/getcap/setcap；产物经ELF检查确认目标架构、静态链接及LA的16KiB对齐。
+本地LA musl工具使用LP64S，glibc消费者使用LP64D；官方p1工具保留原有LP64D要求。它们装入独立验证盘的
+/xattr-tools，默认官方第二盘布局、输入和策略沿现状。构建示例（路径采用现有缓存）：
+
+```sh
+python3 tests/prepare-xattr-tools.py --arch riscv \
+  --archives /path/to/archives \
+  --compiler build/riscv/musl-root/bin/musl-gcc \
+  --uapi build/tools/riscv/usr/riscv64-linux-gnu/include \
+  --output build/xattr-tools/riscv
+```
+
+原一核SMP功能短例的VIRTUAL断言也已定位：10ms请求首次加一个10ms tick，需要20ms用户CPU，
+原worker仅16.997ms，查询仍剩2.626ms。文件I/O主要增加系统CPU，固定指令数并未保证到期。
+短例现以30ms实际用户CPU为完成条件，保留原信号断言；一核、四核均13/13，内核定时器未改。
+
+输入、ELF/内核身份、逐组输出、宿主故障记录和fsck在`build/xattr-20261027/`；验证后的运行盘
+统一清理，缓存、工具ELF和必要日志保留。ACL、匿名socketfs专属属性继续列在能力目录。

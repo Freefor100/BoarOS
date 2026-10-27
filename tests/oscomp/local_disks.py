@@ -43,14 +43,16 @@ def copy_disk_image(source, destination):
     sync(destination)
 
 
-def verify_target(path, arch):
+def verify_target(path, arch, *, float_abis=None):
     data = Path(path).read_bytes()
     if (len(data) < 64 or data[:7] != b'\x7fELF\x02\x01\x01' or
             struct.unpack_from('<HH', data, 16) != (2, INPUTS['architectures'][arch]['elf_machine'])):
         raise RuntimeError('tool is not target ELF64 EXEC: ' + str(path))
     flags = struct.unpack_from('<I', data, 48)[0]
-    if (flags & 6 != 4) if arch == 'riscv' else (flags & 7 != 3):
-        raise RuntimeError('tool must use LP64D: ' + str(path))
+    actual_abi=flags & (6 if arch=='riscv' else 7)
+    expected=float_abis if float_abis is not None else ((4,) if arch=='riscv' else (3,))
+    if actual_abi not in expected:
+        raise RuntimeError('tool has an unexpected floating-point ABI: ' + str(path))
     offset, size, count = struct.unpack_from('<Q', data, 32)[0], *struct.unpack_from('<HH', data, 54)
     if size < 56 or not count or offset + size * count > len(data):
         raise RuntimeError('invalid ELF program headers: ' + str(path))

@@ -47,6 +47,10 @@ class LocalDiskTests(unittest.TestCase):
                 for offset, value in ((16, 3), (18, 62), (48, 0), (64, 2), (64, 3)):
                     image = elf(machine); image[offset] = value; path.write_bytes(image)
                     with self.assertRaises(RuntimeError): disks.verify_target(path, arch)
+            image=elf(258);struct.pack_into('<I',image,48,1);path.write_bytes(image)
+            with self.assertRaises(RuntimeError):disks.verify_target(path,'loongarch')
+            disks.verify_target(path,'loongarch',float_abis=(1,3))
+            with self.assertRaises(RuntimeError):disks.verify_target(path,'riscv',float_abis=(1,3))
             image = elf(258); struct.pack_into('<Q', image, 112, 4096); path.write_bytes(image)
             with self.assertRaisesRegex(RuntimeError, '16 KiB'): disks.verify_target(path, 'loongarch')
 
