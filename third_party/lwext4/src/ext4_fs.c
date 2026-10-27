@@ -79,6 +79,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	fs->bdev = bdev;
 	fs->active_operations = 0;
 	fs->reserved_blocks = 0;
+    fs->delayed_blocks = 0;
 	fs->reserved_inodes = 0;
 	fs->jbd_journal = NULL;
 	fs->jbd_fs = NULL;

@@ -2415,6 +2415,7 @@ struct prepare_space {
     uint64_t offset;
     size_t length,ready;
     int mapping,error,complete;
+    void *reservation;
 };
 static void prepare_space(void *argument)
 {
@@ -2428,12 +2429,22 @@ static void prepare_space(void *argument)
     }
     request->error=node->instance->ops->error(node->instance);
     if (!request->error) {
-        if (node->instance->ops->prepare_write)
+        if (node->instance->ops->reserve_write)
+            request->error=node->instance->ops->reserve_write(node,request->offset,length,&request->ready,&request->complete,&request->reservation);
+        else if (node->instance->ops->prepare_write)
             request->error=node->instance->ops->prepare_write(node,request->offset,length,&request->ready,&request->complete);
         else request->ready=length;
     }
     if (request->ready>length || (!request->error && request->ready!=length)) __builtin_trap();
     if (request->mapping && request->ready!=length && !request->error) __builtin_trap();
+}
+static void finish_space(void *argument)
+{
+    struct prepare_space *request=argument;
+    struct kernel_vfs_node *node=request->node;
+    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,1);
+    node->instance->ops->finish_reservation(node,request->reservation,request->offset);
+    request->reservation=NULL;
 }
 static void complete_space(void *argument)
 {
@@ -2459,25 +2470,34 @@ static int prepare_space_request(struct kernel_page_cache *cache,struct prepare_
     } else execute(request);
     return request->error;
 }
-int kernel_page_cache_prepare_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
-    uint64_t offset,size_t length,size_t *ready,int *complete)
-{
-    struct prepare_space request={.node=node,.offset=offset,.length=length};
-    int error=prepare_space_request(cache,&request,prepare_space);
-    *ready=request.ready;
-    *complete=request.complete;
-    return error;
-}
 int kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
-    uint64_t index)
+    uint64_t index,struct kernel_page_cache_reservation *reservation)
 {
     struct prepare_space request={.node=node,.offset=index<<BOAROS_PAGE_SHIFT,
         .length=BOAROS_PAGE_SIZE,.mapping=1};
-    return prepare_space_request(cache,&request,prepare_space);
+    int result=prepare_space_request(cache,&request,prepare_space);
+    if (result && request.reservation) prepare_space_request(cache,&request,finish_space);
+    if (!result) *reservation=(struct kernel_page_cache_reservation){request.reservation,request.offset,request.offset+request.ready};
+    return result;
+}
+void kernel_page_cache_accept_mapping_write(struct kernel_vfs_node *node,
+    struct kernel_page_cache_reservation *reservation)
+{
+    if (reservation->ticket)
+        node->instance->ops->accept_reservation(node,reservation->ticket,reservation->end);
+}
+void kernel_page_cache_finish_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
+    struct kernel_page_cache_reservation *reservation,int accepted)
+{
+    if (!reservation->ticket)return;
+    struct prepare_space request={.node=node,.reservation=reservation->ticket,
+        .offset=accepted?reservation->end:reservation->offset};
+    prepare_space_request(cache,&request,finish_space);
+    *reservation=(struct kernel_page_cache_reservation){0};
 }
 
 static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_file *file,
-    uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written,int *complete)
+    uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written,int *complete,struct prepare_space *reservation)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     *written=0;
@@ -2485,13 +2505,19 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
     int space_error=0;
     while (*written<size) {
         if (!ready) {
+            if (reservation->reservation) {
+                reservation->offset=offset;
+                prepare_space_request(cache,reservation,finish_space);
+            }
             if (space_error) return space_error;
             int error=write_admission(cache,node);
             if (error) return error;
             size_t length=BOAROS_PAGE_CACHE_WRITEBACK_PAGES*BOAROS_PAGE_SIZE-(offset&BOAROS_PAGE_MASK);
             if (length>size-*written) length=size-*written;
             int needed=0;
-            space_error=kernel_page_cache_prepare_write(cache,node,offset,length,&ready,&needed);
+            *reservation=(struct prepare_space){.node=node,.offset=offset,.length=length};
+            space_error=prepare_space_request(cache,reservation,prepare_space);
+            ready=reservation->ready;needed=reservation->complete;
             *complete|=needed;
             if (!ready) return space_error;
         }
@@ -2616,7 +2642,12 @@ static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs
     uint64_t offset,struct kernel_vfs_write_source *source,size_t size,size_t *written)
 {
     int complete=0;
-    int error=copy_cached_source(cache,file,offset,source,size,written,&complete);
+    struct prepare_space reservation={0};
+    int error=copy_cached_source(cache,file,offset,source,size,written,&complete,&reservation);
+    if (reservation.reservation) {
+        reservation.offset=offset+*written;
+        prepare_space_request(cache,&reservation,finish_space);
+    }
     if (complete) {
         struct prepare_space request={.node=kernel_vfs_file_node(file)};
         int result=prepare_space_request(cache,&request,complete_space);

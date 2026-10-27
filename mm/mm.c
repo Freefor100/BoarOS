@@ -4051,17 +4051,20 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
      * truncate 与后端预算等待都需要这些对象继续推进。返回后重查身份。 */
     if (inode->lock) kernel_lock_release(inode);
     mm_operation_release(operation);
-    int error=kernel_page_cache_prepare_mapping_write(kernel_open_file_page_cache(file),node,offset>>BOAROS_PAGE_SHIFT);
+    struct kernel_page_cache *cache=kernel_open_file_page_cache(file);
+    struct kernel_page_cache_reservation reservation={0};
+    int error=kernel_page_cache_prepare_mapping_write(cache,node,offset>>BOAROS_PAGE_SHIFT,&reservation);
+    enum kernel_mm_status status;
     enum kernel_mm_status locked=mm_operation_lock(operation);
-    if (locked) return locked;
+    if (locked) {status=locked;goto finish;}
     if (generation!=kernel_vma_set_generation(record->vmas) || !fault_inode_lock(operation,node,inode))
-        return KERNEL_MM_STATUS_CONFLICT;
+        {status=KERNEL_MM_STATUS_CONFLICT;goto finish;}
     if (kernel_file_mapping_epoch(node,&latest) || latest!=epoch || offset>=kernel_open_file_size(file))
-        return KERNEL_MM_STATUS_CONFLICT;
-    if (error) return error==-KERNEL_ENOMEM?KERNEL_MM_STATUS_NO_MEMORY:
-        error==-KERNEL_EBUSY?KERNEL_MM_STATUS_CONFLICT:KERNEL_MM_STATUS_BUS_FAULT;
+        {status=KERNEL_MM_STATUS_CONFLICT;goto finish;}
+    if (error) {status=error==-KERNEL_ENOMEM?KERNEL_MM_STATUS_NO_MEMORY:
+        error==-KERNEL_EBUSY?KERNEL_MM_STATUS_CONFLICT:KERNEL_MM_STATUS_BUS_FAULT;goto finish;}
     struct mm_file_resident *resident=find_file_resident(record,address);
-    if (!resident || !kernel_page_cache_alias_active(&resident->alias)) return KERNEL_MM_STATUS_CONFLICT;
+    if (!resident || !kernel_page_cache_alias_active(&resident->alias)) {status=KERNEL_MM_STATUS_CONFLICT;goto finish;}
     struct kernel_page_cache_write_borrow permit={0};
     enum kernel_page_cache_status admitted=kernel_page_cache_alias_write_begin(&resident->alias,&permit);
     if (admitted==KERNEL_PAGE_CACHE_STATUS_BUSY) {
@@ -4072,10 +4075,13 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
             uint64_t index=(vma->backing_offset+address-vma->start)>>BOAROS_PAGE_SHIFT;
             (void)kernel_page_cache_wait_writable(kernel_open_file_page_cache(file),kernel_open_file_vfs_borrow(file),index,physical);
         }
-        return KERNEL_MM_STATUS_CONFLICT;
+        {status=KERNEL_MM_STATUS_CONFLICT;goto finish;}
     }
     if (admitted) __builtin_trap();
     kernel_page_cache_alias_mark_dirty(&resident->alias);
+    /* Commit this generation before releasing the inode: a later truncate
+     * and regrowth must not be accepted by this old fault's delayed finish. */
+    kernel_page_cache_accept_mapping_write(node,&reservation);
     struct kernel_mm_retirement batch={0}; uint32_t targets;
     {
         KERNEL_RAW_SCOPE(guard,&record->metadata);
@@ -4085,7 +4091,14 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
     }
     finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,0);
     kernel_page_cache_write_end(&permit);
-    return KERNEL_MM_STATUS_OK;
+    status=KERNEL_MM_STATUS_OK;
+finish:
+    if (reservation.ticket) {
+        if (inode->lock) kernel_lock_release(inode);
+        if (operation->guard.lock) mm_operation_release(operation);
+        kernel_page_cache_finish_mapping_write(cache,node,&reservation,status==KERNEL_MM_STATUS_OK);
+    }
+    return status;
 }
 
 /* inode等待可能与另一个映射编辑交错；不能带着gate阻止它完成。

@@ -25,12 +25,12 @@ static void datasync_times(struct kernel_heap *heap,struct physical_page_allocat
     puts("PASS fdatasync leaves independent pending timestamps for fsync; no extra timestamp transaction");
 }
 
-struct fixed_target_sync { ext4_file *file;int result; };
+struct fixed_target_sync { ext4_file *file;struct lwext4_mount_adapter *reclaim;int result; };
 static void *fixed_target_sync_client(void *argument)
 {
     struct fixed_target_sync *sync=argument;cache_test_attach(6);
     fixed_target_client=1;
-    sync->result=ext4_file_sync_metadata_mode(sync->file,true);
+    sync->result=sync->reclaim ? sync->reclaim->instance.ops->writeback_reclaim(&sync->reclaim->instance) : ext4_file_sync_metadata_mode(sync->file,true);
     fixed_target_client=0;return NULL;
 }
 static void durable_fixed_target(struct kernel_heap *heap,struct physical_page_allocator *pages,const char *path)
@@ -65,7 +65,17 @@ static void durable_fixed_target(struct kernel_heap *heap,struct physical_page_a
     wait_progress(&fixed_target_waiting,1);
     { KERNEL_TASK_LOCK_SCOPE(guard,&adapter->journal_control);
       assert(!adapter->journal_force && "old fixed target must not force the later unrelated running group"); }
+    /* Admission needs one real retirement, not a drain of the unrelated
+     * accepted group created after the blocked DMA began. */
+    fixed_target_waiting=0;
+    struct fixed_target_sync reclaim={.reclaim=adapter};pthread_t reclaiming;
+    assert(!pthread_create(&reclaiming,NULL,fixed_target_sync_client,&reclaim));
+    wait_progress(&fixed_target_waiting,1);
+    ext4_fs_state_read_lock(adapter->device.fs);
+    assert(adapter->device.fs->jbd_journal->seal_target<=progress.sealed);
+    ext4_fs_state_unlock(adapter->device.fs);
     __atomic_store_n(&durable_wait.resume_flush,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reclaiming,NULL) && !reclaim.result);
     assert(!pthread_join(first,NULL) && !syncing.result && !pthread_join(late,NULL) && !target.result);
     durable_wait=(__typeof__(durable_wait)){0};
     assert(!kernel_vfs_sync_mount(&mount,&observed) &&

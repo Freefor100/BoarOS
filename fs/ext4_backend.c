@@ -631,6 +631,7 @@ static void initialize_times(struct kernel_vfs_node *base,
 {
     struct lwext4_node *node = (struct lwext4_node *)base;
     lwext4_node_file(base)->time_owner = base;
+    lwext4_node_file(base)->delalloc = &node->delalloc;
     node->noatime = ext4_inode_has_flag(inode, EXT4_INODE_FLAG_NOATIME);
     size_t offsets[3] = {offsetof(struct ext4_inode, atime_extra),
         offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
@@ -1804,6 +1805,7 @@ static int retain_node_inode(struct kernel_vfs_node *node)
 static int close_node_file(struct kernel_vfs_node *node)
 {
     ext4_file *file=lwext4_node_file(node);
+    if (file->mp) ext4_file_release_reservations(file,0);
     int result=file->mp?ext4_fclose(file):EOK;
     /* Failed close remains owned by the existing cleanup node. */
 #if BOAROS_MAX_CPUS > 1
@@ -2131,6 +2133,12 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
               node->inode, &inode, stat);
     if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         stat->size = node->size;
+        /* Linux reports reserved delayed data in st_blocks while its physical
+         * mappings and on-disk inode still wait for writeback. */
+        struct ext4_fs *fs=lwext4_instance(node->instance)->device.fs;
+        ext4_fs_state_read_lock(fs);
+        stat->blocks+=((struct lwext4_node *)node)->delalloc.blocks*(stat->blksize/512);
+        ext4_fs_state_unlock(fs);
         struct ext4_timestamp times[3];
         (void)ext4_backend_pending_times((struct kernel_vfs_node *)node, times);
         stat->atime = (struct kernel_vfs_timespec){times[0].seconds, times[0].nanoseconds};
@@ -2505,6 +2513,7 @@ static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, ui
     int result = ext4_ftruncate(lwext4_node_file(node), size, kernel_vfs_write_mode(node->mode,node->gid));
     *actual = ext4_fsize(lwext4_node_file(node));
     *changed = result == EOK || before != *actual;
+    if (*changed) ext4_file_release_reservations(lwext4_node_file(node),*actual);
     if (*changed) {node->mode=kernel_vfs_write_mode(node->mode,node->gid);((struct lwext4_node *)node)->capability_absent=1;}
     return lwext4_error(result);
 }
@@ -2528,6 +2537,18 @@ static int ext4_backend_prepare_write(struct kernel_vfs_node *node,uint64_t offs
     *complete=needed;
     return lwext4_error(result);
 }
+static int ext4_backend_reserve_write(struct kernel_vfs_node *node,uint64_t offset,
+    size_t length,size_t *ready,int *complete,void **ticket)
+{
+    *complete=0;
+    int result=ext4_file_reserve_write(lwext4_node_file(node),offset,length,ready,ticket);
+    if (result==ENOTSUP)return ext4_backend_prepare_write(node,offset,length,ready,complete);
+    return lwext4_error(result);
+}
+static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t end)
+{ ext4_file_accept_reservation(lwext4_node_file(node),ticket,end); }
+static void ext4_backend_finish_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t end)
+{ ext4_file_finish_reservation(lwext4_node_file(node),ticket,end); }
 static int ext4_backend_complete_write(struct kernel_vfs_node *node)
 {
     /* Legacy 指针没有 unwritten 状态。已接纳数据先交给后端，再按持久
@@ -2552,7 +2573,7 @@ static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance)
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
     struct jbd_journal *journal = adapter->device.fs->jbd_journal;
     return journal && journal->grouped ?
-        lwext4_error(ext4_journal_group_drain(adapter->mount_point)) : 0;
+        lwext4_error(ext4_journal_group_reclaim(adapter->mount_point)) : 0;
 }
 static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_only,
     struct kernel_vfs_sync_request *request)
@@ -2655,7 +2676,9 @@ static void initialize_backend(void)
     ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;
     ops->fallocate = ext4_backend_fallocate;
-    ops->prepare_write = ext4_backend_prepare_write;
+    ops->reserve_write = ext4_backend_reserve_write;
+    ops->finish_reservation = ext4_backend_finish_reservation;
+    ops->accept_reservation = ext4_backend_accept_reservation;
     ops->complete_write = ext4_backend_complete_write;
     ops->block_device = ext4_backend_block_device;
     ops->close_node = ext4_backend_close_node;

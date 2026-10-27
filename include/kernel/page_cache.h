@@ -218,15 +218,18 @@ void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias);
  * drain不持MM gate、inode I/O或raw，不能由当前在途回调等待自己。 */
 void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias);
 void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias);
-/* Locks only the inode during backend space preparation; callers hold no
- * inode/data pin across this call. Ordinary failures do not publish wb errors.
- * ready remains usable on a later allocation failure; complete requires the
- * backend completion after copying ends, even when the source faults. */
-int kernel_page_cache_prepare_write(struct kernel_page_cache *,struct kernel_vfs_node *,
-    uint64_t offset,size_t length,size_t *ready,int *complete);
-/* Shared write faults require all valid EOF bytes of this page to be backed. */
+/* Shared write faults reserve every valid EOF block before writable PTE
+ * publication. An incomplete reservation is returned without granting writes. */
+struct kernel_page_cache_reservation { void *ticket;uint64_t offset,end; };
 int kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *,struct kernel_vfs_node *,
-    uint64_t page_index);
+    uint64_t page_index,struct kernel_page_cache_reservation *);
+/* Actual dirty publication holds the inode qualification; accept only marks
+ * the borrowed range, without freeing or doing I/O. Finish later drops it. */
+void kernel_page_cache_accept_mapping_write(struct kernel_vfs_node *,
+    struct kernel_page_cache_reservation *);
+/* Finish outside MM/inode qualifications, after actual writable publication. */
+void kernel_page_cache_finish_mapping_write(struct kernel_page_cache *,struct kernel_vfs_node *,
+    struct kernel_page_cache_reservation *,int accepted);
 struct kernel_io_context;
 /* 最终地址初始化，不能复制或跨任务归还；存活至end，覆盖entry及数据页。 */
 struct kernel_page_cache_write_borrow {
