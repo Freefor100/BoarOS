@@ -3084,11 +3084,14 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
         if (run_request(cache,write_admission_window,&request,1,NULL)) request.result=-KERNEL_EIO;
     } else write_admission_window(&request);
 #if BOAROS_PAGE_CACHE_BACKGROUND_PERCENT < 100
-    /* 一批接纳可能只把dirty变成version；等固定日志目标归还真实占用，
-     * 此时来源pin、entry和inode资格都已归还，进度执行者不进入此等待。 */
+    /* quota先等已有提交归还版本；健康running组继续合并。物理余量低于
+     * 回收目标线时允许结束running组，避免空等不可回收的版本。
+     * 来源pin、entry和inode资格已归还，进度执行者不进入此等待。 */
     struct kernel_vfs_node *progress=request.progress?request.progress:node;
-    if (!request.result && node_pressure(node,r,0) && progress->instance->ops->writeback_reclaim) {
-        int error=progress->instance->ops->writeback_reclaim(progress->instance);
+    available=physical_page_available(cache->allocator);
+    int memory_pressure=available<r->high;
+    if (!request.result && (memory_pressure || node_pressure(node,r,0)) && progress->instance->ops->writeback_reclaim) {
+        int error=progress->instance->ops->writeback_reclaim(progress->instance,memory_pressure);
         /* 共享物理额度不把另一挂载的日志错误转嫁给本次调用者。 */
         if (progress->instance==node->instance) request.result=error;
     }

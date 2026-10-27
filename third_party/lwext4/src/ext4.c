@@ -162,7 +162,8 @@ static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t 
             chunk->mask&=~mask;chunk->accepted&=~mask;
             if (!chunk->mask && !chunk->borrowers) {
                 RB_REMOVE(ext4_delalloc_tree,&da->tree,chunk);
-                chunk->next=da->retired;da->retired=chunk;
+                chunk->next=__atomic_load_n(&da->retired,__ATOMIC_RELAXED);
+                __atomic_store_n(&da->retired,chunk,__ATOMIC_RELAXED);
             }
         }
         chunk=next;
@@ -1680,7 +1681,7 @@ int ext4_journal_group_checkpoint(const char *mount_point)
 	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT);
 }
 
-static int ext4_journal_wait_checkpoint(const char *mount_point, bool drain)
+static int ext4_journal_wait_checkpoint(const char *mount_point, bool drain, bool memory_pressure)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENOENT;
@@ -1693,6 +1694,11 @@ static int ext4_journal_wait_checkpoint(const char *mount_point, bool drain)
 	r = !journal || !journal->grouped ? EINVAL : jbd_journal_error(journal);
 	target = !r ? (drain ? journal->accepted_sequence : jbd_journal_reclaim_target(journal)) : 0;
     if (journal && target <= journal->checkpoint_sequence) target = 0;
+    /* Moving dirty data into a stable version does not require a durability
+     * barrier. Let a healthy running group fill; real memory/journal budget
+     * pressure and normal age/size limits can still advance it. */
+    if (!r && !drain && !memory_pressure && journal->running &&
+        target == journal->running->sequence && !ext4_group_due(mp,false)) target=0;
 	}
 	if (r == EOK && target)
 		r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
@@ -1701,9 +1707,9 @@ static int ext4_journal_wait_checkpoint(const char *mount_point, bool drain)
 }
 
 int ext4_journal_group_drain(const char *mount_point)
-{ return ext4_journal_wait_checkpoint(mount_point,true); }
-int ext4_journal_group_reclaim(const char *mount_point)
-{ return ext4_journal_wait_checkpoint(mount_point,false); }
+{ return ext4_journal_wait_checkpoint(mount_point,true,true); }
+int ext4_journal_group_reclaim(const char *mount_point,bool memory_pressure)
+{ return ext4_journal_wait_checkpoint(mount_point,false,memory_pressure); }
 
 int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress)
 {
@@ -3869,10 +3875,12 @@ static int ext4_zero_file_range(struct ext4_inode_ref *ref,
 
 void ext4_file_drain_reservations(ext4_file *file)
 {
-    if (!file->delalloc)return;
+    /* Empty overwrite batches have no retired reservation storage. The hint
+     * never borrows a node: a nonempty list is still taken under STATE. */
+    if (!file->delalloc || !__atomic_load_n(&file->delalloc->retired,__ATOMIC_RELAXED))return;
     struct ext4_delalloc_chunk *retired;
     { EXT4_STATE_SCOPE(state,&file->mp->fs);
-      retired=file->delalloc->retired;file->delalloc->retired=NULL; }
+      retired=__atomic_exchange_n(&file->delalloc->retired,NULL,__ATOMIC_RELAXED); }
     while (retired) {struct ext4_delalloc_chunk *next=retired->next;ext4_free(retired);retired=next;}
 }
 void ext4_file_release_reservations(ext4_file *file,uint64_t size)
@@ -3909,9 +3917,10 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
         if (maximum>64-bit)maximum=64-bit;
         uint64_t want=delalloc_mask(bit,maximum),pending;
         bool missing_chunk;
-        { EXT4_STATE_READ_SCOPE(state,fs);
-          struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,key);
-          pending=chunk?chunk->mask&want:0;missing_chunk=!chunk; }
+        /* The adapter already holds this inode's I/O writer throughout
+         * preparation. Other inodes cannot change its reservation index. */
+        struct ext4_delalloc_chunk *existing=delalloc_find(file->delalloc,key);
+        pending=existing?existing->mask&want:0;missing_chunk=!existing;
         struct ext4_inode_block_range range={0};
         if (pending==want)range.count=maximum;
         else r=ext4_extent_get_range(&ref,logical,maximum,false,&range);
@@ -4003,7 +4012,8 @@ void ext4_file_finish_reservation(ext4_file *file,void *ticket,uint64_t accepted
                 file->delalloc->blocks-=count;fs->delayed_blocks-=count;
                 if (!chunk->mask) {
                     RB_REMOVE(ext4_delalloc_tree,&file->delalloc->tree,chunk);
-                    chunk->next=file->delalloc->retired;file->delalloc->retired=chunk;
+                    chunk->next=__atomic_load_n(&file->delalloc->retired,__ATOMIC_RELAXED);
+                    __atomic_store_n(&file->delalloc->retired,chunk,__ATOMIC_RELAXED);
                 }
             }
         }
