@@ -446,11 +446,14 @@ static int request_prepare(struct kernel_mqueue_request *r)
     if(r->deadline==UINT64_MAX)return -KERNEL_ETIMEDOUT;
     if(r->deadline && (int64_t)(kernel_wait_backend_time()-r->deadline)>=0)return -KERNEL_ETIMEDOUT;
     if(kernel_signal_has_pending(r->task)||kernel_signal_termination_requested(r->task))return -KERNEL_ERESTARTSYS;
-    if(kernel_wait_prepare(0,r->deadline,1,&r->token))__builtin_trap();
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        if(kernel_wait_prepare_locked(0,r->deadline,1,&r->token))__builtin_trap();
+        r->wait_priority=r->task->scheduling.priority;
+    }
     struct kernel_mqueue *q=r->queue;
     struct kernel_mqueue_request **head=r->sending?&q->send_head:&q->recv_head;
     struct kernel_mqueue_request **tail=r->sending?&q->send_tail:&q->recv_tail;
-    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);r->wait_priority=r->task->scheduling.priority;}
     struct kernel_mqueue_request *next=*head;
     while(next&&next->wait_priority>=r->wait_priority)next=next->next;
     r->next=next;r->previous=next?next->previous:*tail;
@@ -513,9 +516,10 @@ static void message_dequeue(struct kernel_mqueue_request *r)
     }
     q->count--;q->bytes-=r->message->size;
 }
-static void message_publish(struct kernel_mqueue_request *sender,struct mq_notification *notification)
+static int message_publish(struct kernel_mqueue_request *sender,struct mq_notification *notification)
 {
     struct kernel_mqueue *q=sender->queue;
+    int enqueued=!q->recv_head;
     if(q->recv_head){
         struct kernel_mqueue_request *receiver=q->recv_head;
         receiver->message=sender->message;sender->message=0;request_complete(receiver);
@@ -524,6 +528,7 @@ static void message_publish(struct kernel_mqueue_request *sender,struct mq_notif
         message_enqueue(sender);
     }
     q->mtime=q->ctime=mq_now();
+    return enqueued;
 }
 int64_t kernel_mqueue_send(struct kernel_task *task,struct kernel_mm *mm,int64_t fd,
     uint64_t data,uint64_t size,uint32_t priority,uint64_t abstime)
@@ -541,7 +546,12 @@ int64_t kernel_mqueue_send(struct kernel_task *task,struct kernel_mm *mm,int64_t
       { KERNEL_RAW_SCOPE(g,&r->queue->lock);
         if(r->queue->count<r->queue->maxmsg){
             if(!r->queue->recv_head&&!r->priority&&!priority_find(r->queue,priority))error=2;
-            else{message_publish(r,&r->outgoing);notify=kernel_wait_cursor_prepare(&r->queue->waiters,&cursor);error=0;}
+            else{
+                /* Direct delivery wakes its receiver; queue readiness is unchanged. */
+                if(message_publish(r,&r->outgoing))
+                    notify=kernel_wait_cursor_prepare(&r->queue->waiters,&cursor);
+                error=0;
+            }
         }else if(__atomic_load_n(&r->file->open_flags,__ATOMIC_RELAXED)&MQ_NONBLOCK)error=-KERNEL_EAGAIN;
         else if(!r->priority)error=2;
         else error=request_prepare(r);
@@ -574,9 +584,9 @@ int64_t kernel_mqueue_receive(struct kernel_task *task,struct kernel_mm *mm,int6
           if(r->queue->send_head){
               struct kernel_mqueue_request *sender=r->queue->send_head;
               message_enqueue(sender);request_complete(sender);
-          }
+          }else notify=kernel_wait_cursor_prepare(&r->queue->waiters,&cursor);
           r->queue->atime=r->queue->ctime=mq_now();
-          notify=kernel_wait_cursor_prepare(&r->queue->waiters,&cursor);error=0;
+          error=0;
       }else if(__atomic_load_n(&r->file->open_flags,__ATOMIC_RELAXED)&MQ_NONBLOCK)error=-KERNEL_EAGAIN;
       else error=request_prepare(r);
     }

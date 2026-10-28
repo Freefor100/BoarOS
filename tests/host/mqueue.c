@@ -202,20 +202,28 @@ static void *run_worker(void *data)
 }
 static void await_waiter(void)
 {while(!(__atomic_load_n(&waiting,__ATOMIC_ACQUIRE)&2U))sched_yield();}
+static unsigned queue_callbacks;
+static void queue_changed(struct kernel_wait_node *node,uint32_t reason)
+{(void)node;(void)reason;queue_callbacks++;}
 static void handoff_and_timeout(void)
 {
     struct kernel_mqueue *q=make("handoff",1,32);int fd=descriptor(q,2);pthread_t thread;
+    struct kernel_wait_node poll_node;queue_callbacks=0;
+    kernel_wait_node_init_callback(&poll_node,queue_changed,0);
+    kernel_wait_queue_add(&q->waiters,&poll_node);
     struct worker w={.fd=fd};waiting=0;assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();
     assert(!notifyq(fd,0,36,44));assert(!sendq(fd,"direct",7,1));assert(!pthread_join(thread,0));
     assert(w.result==7&&!strcmp(w.text,"direct")&&signal_count==1&&q->notification.owner);
-    assert(!sendq(fd,"fill",5,0));assert(signal_count==2);
+    assert(queue_callbacks==0);
+    assert(!sendq(fd,"fill",5,0));assert(signal_count==2&&queue_callbacks==1);
     w=(struct worker){.fd=fd,.send=1,.text="replacement"};waiting=0;
     assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();char out[32];
-    assert(recvq(fd,out,32,0)==5&&!strcmp(out,"fill"));assert(!pthread_join(thread,0));assert(!w.result);
+    assert(recvq(fd,out,32,0)==5&&!strcmp(out,"fill"));assert(!pthread_join(thread,0));assert(!w.result&&queue_callbacks==1);
     assert(recvq(fd,out,32,0)==12&&!strcmp(out,"replacement"));
     struct{int64_t sec,nsec;} expired={0,0};
     assert(kernel_mqueue_receive(cpu.current,&cpu.current->mm,fd,(uintptr_t)out,32,0,(uintptr_t)&expired)==-KERNEL_ETIMEDOUT);
     forced_reason=KERNEL_WAIT_SIGNALLED;assert(recvq(fd,out,32,0)==-KERNEL_ERESTARTSYS);forced_reason=-1;
+    assert(!kernel_wait_node_remove_sync(&poll_node));
     closefd(fd);removeq(q);
 }
 static void fault_and_quota(void)

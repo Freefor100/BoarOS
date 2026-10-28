@@ -260,6 +260,12 @@ RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整
 
 vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。父线程和具体子进程保持双向完成关联；子进程释放共享 MM 引用后一次性完成等待。普通信号不解除等待。组退出/exec 的致命取消先断开双向关联，再唤醒父线程；子进程自己的 MM 引用仍有效，之后完成也不能访问已释放父任务。
 
+跨核软件事件发布与硬件IPI发送分开：发送者以release原子操作合入事件位，
+同类事件已经待处理时复用现有通知；接收者以原子交换取走事件后，新发布重新请求IPI。
+发送者关闭本地中断，实际IPI由当前raw保护退出或既有通知批次结束时发出，
+因此合并保留已经排队的发送者或接收者负责推进，不改变任务READY与执行者交接。
+RV与LA使用同一事件位发布原语，各自保留硬件确认及IPI发送。
+
 ## 等待与 futex
 
 所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务同时进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。

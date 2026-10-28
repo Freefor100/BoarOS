@@ -127,12 +127,15 @@ void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
     struct kernel_cpu *source = kernel_cpu_current();
     if (!cpu_count && target == source) { arch_interrupt_restore(irq); return; }
     if (!target || target->logical_id >= cpu_count) __builtin_trap();
-    __atomic_fetch_or(&target->events, events, __ATOMIC_RELEASE);
+    int fresh=kernel_cpu_publish_events(target,events);
     if (target != source) {
         COST_ADD(SCHED_IPI_REQUESTS, 1);
-        unsigned bit = 1U << target->logical_id;
-        if (source->notification_batch) source->notification_batch->targets |= bit;
-        else source->outbound |= bit;
+        if(!fresh) {COST_ADD(SCHED_IPI_COALESCED,1);}
+        else {
+            unsigned bit = 1U << target->logical_id;
+            if (source->notification_batch) source->notification_batch->targets |= bit;
+            else source->outbound |= bit;
+        }
     }
     if (!source->raw_locks && source->outbound) kernel_cpu_flush_notifications();
     arch_interrupt_restore(irq);

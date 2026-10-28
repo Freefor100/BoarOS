@@ -75,3 +75,6 @@ EXCLUDED(kernel_elf64_source_run_at)
 EXCLUDED(kernel_vfs_file_mincore_allowed)
 EXCLUDED(kernel_vfs_file_memory)
 EXCLUDED(kernel_page_cache_resident)
+
+EXCLUDED(kernel_page_cache_accept_mapping_write)
+EXCLUDED(kernel_page_cache_finish_mapping_write)
