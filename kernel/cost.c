@@ -34,10 +34,10 @@ _Static_assert(sizeof(names) <= UINT16_MAX, "cost name offsets");
 static const char *metric_name(unsigned metric)
 { return (const char *)&names + name_offsets[metric]; }
 enum cost_unit { UNIT_bytes, UNIT_count, UNIT_entries, UNIT_operations,
-    UNIT_pages, UNIT_requests, UNIT_tasks, UNIT_ticks };
+    UNIT_pages, UNIT_requests, UNIT_tasks, UNIT_ticks, UNIT_ns };
 /* 单位文字共享，新增只读快照不挤占聚合预算；输出 schema 不变。 */
 static const char unit_names[][11] = {
-    "bytes","count","entries","operations","pages","requests","tasks","ticks"
+    "bytes","count","entries","operations","pages","requests","tasks","ticks","ns"
 };
 static const unsigned char units[] = {
 #define X(id, name, unit, hist) UNIT_##unit,

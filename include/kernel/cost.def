@@ -322,3 +322,6 @@ X(LOCK45_REBLOCKS, lock45_reblocks, count, 0)
 X(LOCK45_WAIT_TICKS, lock45_wait_ticks, ticks, 1)
 X(LOCK45_HOLD_TICKS, lock45_hold_ticks, ticks, 1)
 X(LOCK45_CANCELLED, lock45_cancelled, count, 0)
+/* Existing observed cache requests, once for each actual CPU0 window. */
+X(CACHE_QUEUE_NS, cache_queue_ns, ns, 1)
+X(CACHE_EXECUTE_NS, cache_execute_ns, ns, 1)
