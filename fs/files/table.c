@@ -982,6 +982,13 @@ enum kernel_files_status kernel_files_fcntl(
         return dup_from(files, fd, (uint32_t)argument,
             command==KERNEL_FILES_F_DUPFD_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, result);
     }
+    if(command==1031U || command==1032U) {
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+        if(!file || file->kind!=KERNEL_OPEN_FILE_KIND_PIPE) {*result=-KERNEL_EBADF;return 0;}
+        *result=kernel_pipe_capacity(file->pipe,(int)command,argument);
+        return 0;
+    }
     KERNEL_FILES_SCOPE(guard, files);
     struct kernel_open_file_description *source=lookup_locked(files, fd);
     if (!source) { *result=-KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }

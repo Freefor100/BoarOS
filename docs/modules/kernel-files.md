@@ -106,15 +106,19 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 普通用户的匿名管道、已打开FIFO读写及普通文件到管道的sendfile在发起CPU执行，复用下述片段、读写资格和端点短保护。没有附加观察者的匿名管道末OFD在调用者结束端点并通知；存在epoll登记或FIFO inode时仍沿CPU0完成关联清理。pipe2创建和FIFO路径打开沿原CPU0执行位置。
 
-`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享16个片段槽；各槽在写入时按需取得一张独立目标页，不要求连续物理区间。空 pipe 只分配对象元数据，最大数据容量仍为16个目标页（RV64KiB、LA256KiB）。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
+`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享一个片段环。默认容量为16个目标页（RV64KiB、LA256KiB），对象内保留16个槽描述符；更大的环另外分配描述符数组。各槽在写入时才取得一张独立目标页，不要求连续物理区间；扩容不预分配数据页，空 pipe 只占对象和必要的环元数据。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
-读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
+读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写由writer复制资格和完整片段发布保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
 
-每个已发布的 pipe 片段拥有一张独立页，完全消费后立即归还。尚未发布的写入页也先归槽所有，复制 fault 时撤销并释放，最后端点销毁会回收全部剩余槽页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。16 个槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
+每个已发布的 pipe 片段拥有一张独立页，完全消费后立即归还。尚未发布的写入页也先归槽所有，复制 fault 时撤销并释放，最后端点销毁会回收全部剩余槽页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。当前容量的槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
 
 用户复制可能因文件映射缺页而睡眠，关中断不能单独保护复制期间的片段。读者、写者各有 rank15 可睡眠复制锁，同向请求保留顺序；不同头、尾页可以同时复制。writer 避开正在复制的读槽，不把新字节并入该页；已取得尾页合并资格的 writer 则先完成复制、发布或 fault 撤销，reader 才能消费或释放这张页。reader 仅在这种同页冲突时按 read→write 的 key 顺序等待 writer，writer 不反向取得 read。当前槽标记只覆盖复制，成功和 fault 都先撤标记再释放资格；空读/满写的 interruptible wait 在标记建立前登记并释放复制锁。用户复制缺页的等待返回 C 调用，信号由返回路径处理，不会遗弃仍有资格的槽标记。
 
-锁顺序为 OFD offset（10）→ pipe 复制（15）→ 缺页所需 inode/backend（20/40），OFD pin 覆盖全部等待与复制。`make test-pipe-concurrency-host` 在4KiB、16KiB目标页下以握手暂扣尾写入，检查独立头读取仍能完成，以及同页合并时 reader 必须等待 writer；同时核对空对象、单页按需分配、消费归还、合并 fault 与最终所有权。`make test-io-sleep-riscv` 保留真实调度下的复制睡眠和多写者内容检查。
+`F_GETPIPE_SZ` 返回当前容量；`F_SETPIPE_SZ` 在64位目标上也只消费参数的低32位，按目标页向上取整为二次幂，最少一页，超过2GiB的参数返回 `EINVAL`。容量属于共享pipe，读写两端、dup/fork和FIFO的已打开OFD看到相同结果。缩容按已占用片段数判断，槽装不下时返回 `EBUSY`，不能仅按有效字节数判断。调整容量先在锁外准备候选元数据，再按read→write取得两个复制资格，等待已有读、写和尾页合并完成；按现有环顺序迁移描述符，保留页、偏移、长度和合并属性，只在短metadata保护内发布指针和索引，锁外释放旧数组并通知writer。
+
+容量页数记在创建者真实UID的账户上，与pipe的可改权属和当前调用者UID分开。固定默认软限额为16384个目标页、硬限额为0（不限制）；超过软限额的新pipe降为两页，非特权扩容会返回 `EPERM`。`CAP_SYS_RESOURCE` 或 `CAP_SYS_ADMIN` 可越过UID软硬限额，只有 `CAP_SYS_RESOURCE` 可越过非特权单pipe的1MiB容量上限；缩容不因现有额度超限而拒绝。创建、扩缩容、失败撤销和最终销毁更新账户，普通数据读写不访问账户锁；创建后传递OFD或改变UID仍向原账户归还额度。
+
+锁顺序为 OFD offset（10）→ pipe 复制（15）→ 缺页所需 inode/backend（20/40），OFD pin 覆盖全部等待与复制。`make test-pipe-concurrency-host` 在4KiB、16KiB目标页下以握手暂扣尾写入，检查独立头读取仍能完成，以及同页合并时 reader 必须等待 writer；同时核对空对象、单页按需分配、消费归还、合并 fault 与最终所有权；容量用例检查环回和尾槽合并、槽占用缩容拒绝、复制中调整容量、扩容唤醒满管道writer、元数据分配失败撤销，以及真实UID额度、能力区别与最终归还。`make test-io-sleep-riscv` 保留真实调度下的复制睡眠和多写者内容检查。
 
 匿名pipe的mode与创建时间由共享pipe对象持有，fchmod更新权限和ctime并保留FIFO类型；fstat与proc跟随查询报告稳定inode身份及同一元数据，两端、dup/fork和proc重开一致。数据读写不改变匿名pipe时间。`make test-fifo-riscv`的同ELF反例在旧内核以ENOTSUP失败，在固定Linux和修复后通过；raw ABI另保护改权及坏输出指针。
 
@@ -181,7 +185,7 @@ make test-files-partial-write-riscv
 上限、stream 短输出、datagram 边界和整包预算、pipe EINTR/EPIPE/SIGKILL，另有
 动态填满 pipe 后的来源组合回归。模块复用真实 FLUSH 错误，检查八种同步批次
 失败副作用；宿主、固定 RV64 Linux 与 BoarOS 证据见网络学习记录。输入特殊
-设备/proc 的 splice 能力、splice/copy_file_range 与 F_GETPIPE_SZ 尚未交付。
+设备/proc 的 splice 能力及 splice/copy_file_range 仍待扩展；管道容量已支持 F_GETPIPE_SZ/F_SETPIPE_SZ。
 
 ## 目录与文件系统操作
 
@@ -497,17 +501,6 @@ LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 li
 的 `fs/stat.c`、`include/uapi/linux/stat.h`，以及固定 musl1.2.5 归档的
 `src/stat/fstatat.c` 和 `arch/loongarch64/bits/syscall.h.in`。
 
-
-## pipe 容量与目标页（2026-10-07）
-
-LA差分的无阻塞反例证明：原代码分配order4的16个目标页，却把capacity固定为
-64KiB，LA只使用其中四页；16页循环的既有共用案例因此提前EAGAIN或阻塞。
-capacity现在由16×目标页大小导出，匹配原有16槽/16页owner和固定Linux正常默认容量，
-没有新增物理分配。PIPE_BUF的4096字节原子写语义保持，文件块和用户传输长度也不改。
-`tests/workloads/pipe_geometry.c` 用真实nonblocking写满、EAGAIN、部分读取后环回、
-每页内容及关闭验证；同一LA ELF在Linux/BoarOS512MiB/1GiB均通过，
-BoarOS退出回到根页/堆/任务栈/BAR基线。入口为`make test-pipe-loongarch`，
-RV继续由files/userland的pipe、FIFO、poll、取消和引用测试保护。
 
 普通文件的标量 read/write/pread/pwrite 在限长前检查原始数值范围，空范围允许 NULL 和用户地址上界，拒绝高于上界的地址；通用零长度 uaccess 不改变。
 数值拒绝发生在复制、偏移及文件时间修改之前。socket sendto/recvfrom 则沿 Linux import_ubuf 先限长再检查，实际 iovec 使用同一限长值。

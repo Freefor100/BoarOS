@@ -10,7 +10,7 @@ extern struct kernel_raw_lock kernel_wait_domain;
 #define PIPE_TARGET UINT64_C(0x400000)
 static uint64_t pipe_context;
 static unsigned char pipe_payload[16*16384+4096];
-static unsigned pause_park,park_ready,resume_park,pause_copy,copy_ready,resume_copy;
+static unsigned pause_park,park_ready,resume_park,pause_copy,copy_ready,resume_copy,pause_read_copy;
 static struct kernel_wait_queue *expected_queue;
 static struct kernel_wait_token observed_token;
 static struct kernel_vfs_mount *buffer_mount;
@@ -37,6 +37,18 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm,voi
         assert(kernel_io_context_current()->locks && "selected fragment lacks copy ownership");
         __atomic_store_n(&copy_ready,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_copy,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return status;
+}
+enum kernel_uaccess_status __real_kernel_copy_to_user(struct kernel_mm *,uint64_t,const void *,size_t,size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,uint64_t address,const void *in,size_t size,size_t *done)
+{
+    assert(!kernel_cpu_current()->raw_locks && "pipe copied user memory under raw lock");
+    enum kernel_uaccess_status status=__real_kernel_copy_to_user(mm,address,in,size,done);
+    if(kernel_cpu_current()->hardware_id==1 && __atomic_exchange_n(&pause_read_copy,0,__ATOMIC_ACQ_REL)) {
+        assert(kernel_io_context_current()->locks);
+        __atomic_store_n(&copy_ready,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&resume_copy,__ATOMIC_ACQUIRE))sched_yield();
     }
     return status;
 }
@@ -86,11 +98,11 @@ static void pipe_boundary_cases(struct kernel_heap *heap)
         pipe_bind(0,0); struct kernel_pipe *pipe=pipe_table(heap); mm_test_bind_files(&files);
         unsigned writing=mode==2 || mode==3;
         struct pipe_actor actor={.write=writing,.fd=writing?1:0,.address=writing?PIPE_SOURCE:PIPE_TARGET,
-            .count=mode==3?KERNEL_PIPE_CAPACITY+1:1};
+            .count=mode==3?KERNEL_PIPE_DEFAULT_CAPACITY+1:1};
         if (mode==2) {
             struct kernel_pipe_result fill;
             KERNEL_IRQ_SCOPE(irq);
-            assert(!kernel_pipe_write_buffer(pipe,pipe_payload,KERNEL_PIPE_CAPACITY,1,&fill) && fill.bytes==KERNEL_PIPE_CAPACITY);
+            assert(!kernel_pipe_write_buffer(pipe,pipe_payload,KERNEL_PIPE_DEFAULT_CAPACITY,1,&fill) && fill.bytes==KERNEL_PIPE_DEFAULT_CAPACITY);
         }
         pause_park=1; expected_queue=actor.write?&pipe->write_queue:&pipe->read_queue;
         pthread_t thread; start_actor(&actor,&thread);
@@ -123,7 +135,7 @@ static void pipe_boundary_cases(struct kernel_heap *heap)
             assert(actor.bytes==1 && !kernel_copy_from_user(&domain_mm,&byte,PIPE_TARGET,1,&done) && done==1 && byte==pipe_payload[0]);
         } else if (mode==1) assert(!actor.bytes);
         else if (mode==2) assert(actor.bytes==1 && !actor.broken);
-        else if (mode==3) assert(actor.bytes==KERNEL_PIPE_CAPACITY && actor.broken);
+        else if (mode==3) assert(actor.bytes==KERNEL_PIPE_DEFAULT_CAPACITY && actor.broken);
         else assert(actor.bytes==-KERNEL_ERESTARTSYS && !actor.broken && !signal_calls);
         assert(!kernel_files_release(&files));
     }
@@ -382,6 +394,7 @@ static void user_pipe_last_close(struct kernel_heap *heap)
     puts("PASS ordinary user last pipe close on CPU1: endpoint notification and final owner returned locally");
 }
 
+#include "pipe_capacity_cases.h"
 static void pipe_cases(struct kernel_heap *heap)
 {
     uint64_t address;
@@ -389,7 +402,9 @@ static void pipe_cases(struct kernel_heap *heap)
     assert(!kernel_mm_mmap_anonymous(&domain_mm,PIPE_SOURCE,17*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&domain_mm,PIPE_TARGET,17*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     memset(pipe_payload,0x71,sizeof(pipe_payload)); size_t done;
-    assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_CAPACITY+1,&done) && done==KERNEL_PIPE_CAPACITY+1);
+    assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_DEFAULT_CAPACITY+1,&done) && done==KERNEL_PIPE_DEFAULT_CAPACITY+1);
+    pipe_capacity_case(heap);pipe_capacity_merge_case(heap);pipe_capacity_copy_case(heap);
+    pipe_capacity_wake_case(heap);pipe_capacity_quota_case(heap);
     pipe_page_ownership_case(heap);pipe_copy_overlap_case(heap);pipe_merge_copy_case(heap);
     pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);user_pipe_last_close(heap);
     pipe_packet_case(heap,2); pipe_packet_case(heap,4);

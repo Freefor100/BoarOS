@@ -22,6 +22,17 @@
 #include <string.h>
 
 #define PIPE_META(name, pipe) KERNEL_RAW_SCOPE(name, &(pipe)->metadata_lock)
+#define PIPE_MAX_UNPRIVILEGED_BYTES UINT32_C(1048576)
+#define PIPE_USER_PAGES_SOFT UINT64_C(16384)
+#define PIPE_USER_PAGES_HARD UINT64_C(0)
+
+static int pipe_unprivileged(const struct kernel_credentials *cred)
+{
+    return !kernel_credentials_capable(cred,KERNEL_CAP_SYS_RESOURCE) &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN);
+}
+static int pipe_over_hard_limit(uint64_t pages)
+{ return PIPE_USER_PAGES_HARD && pages>PIPE_USER_PAGES_HARD; }
 
 static uint64_t next_pipe_proc_identity = 1U;
 
@@ -95,7 +106,11 @@ static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
         if (pipe->fifo_node->fifo_pipe != pipe) __builtin_trap();
         pipe->fifo_node->fifo_pipe = 0;
     }
-    for (unsigned i=0;i<16;i++) if (pipe->pages[i]) pipe_release_page(pipe,pipe->pages[i]);
+    for (uint32_t i=0;i<pipe->ring_size;i++)
+        if (pipe->buffers[i].page) pipe_release_page(pipe,pipe->buffers[i].page);
+    if (pipe->buffers!=pipe->inline_buffers) kernel_heap_release(pipe->heap,pipe->buffers);
+    (void)kernel_uid_account_pipe_pages(pipe->account,pipe->ring_size,0);
+    kernel_uid_account_put(pipe->account);
     kernel_heap_release(pipe->heap, pipe);
     return KERNEL_PIPE_STATUS_OK;
 }
@@ -126,8 +141,26 @@ enum kernel_pipe_status kernel_pipe_create(
     const struct kernel_credentials *cred = kernel_credentials_current();
     pipe->uid = cred->fsuid;
     pipe->gid = cred->fsgid;
+    pipe->buffers=pipe->inline_buffers;
+    pipe->ring_size=KERNEL_PIPE_INLINE_SLOTS;
+    if ((uint64_t)pipe->ring_size*BOAROS_PAGE_SIZE>PIPE_MAX_UNPRIVILEGED_BYTES &&
+        !kernel_credentials_capable(cred,KERNEL_CAP_SYS_RESOURCE))
+        pipe->ring_size=PIPE_MAX_UNPRIVILEGED_BYTES/BOAROS_PAGE_SIZE;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      pipe->account=kernel_uid_account_get_locked(cred->account); }
+    uint64_t pages=kernel_uid_account_pipe_pages(pipe->account,0,pipe->ring_size);
+    if (pages>PIPE_USER_PAGES_SOFT && pipe_unprivileged(cred)) {
+        pages=kernel_uid_account_pipe_pages(pipe->account,pipe->ring_size,2);
+        pipe->ring_size=2;
+    }
+    if (pipe_over_hard_limit(pages) && pipe_unprivileged(cred)) {
+        (void)kernel_uid_account_pipe_pages(pipe->account,pipe->ring_size,0);
+        kernel_uid_account_put(pipe->account);
+        kernel_heap_release(heap,pipe);
+        return KERNEL_PIPE_STATUS_NO_MEMORY;
+    }
     pipe->atime = pipe->mtime = pipe->ctime = pipe_now();
-    pipe->read_slot=pipe->merge_slot=16;
+    pipe->read_slot=pipe->merge_slot=KERNEL_PIPE_NO_SLOT;
     kernel_wait_queue_init(&pipe->read_queue);
     kernel_wait_queue_init(&pipe->write_queue);
     kernel_wait_queue_init(&pipe->both_queue);
@@ -154,6 +187,84 @@ static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
         if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
             __builtin_trap();
     }
+}
+
+int64_t kernel_pipe_capacity(struct kernel_pipe *pipe,int command,uint64_t argument)
+{
+    if (!pipe) return -KERNEL_EBADF;
+    if (command==1032) {
+        PIPE_META(guard,pipe);
+        return (int64_t)((uint64_t)pipe->ring_size*BOAROS_PAGE_SIZE);
+    }
+    if (command!=1031) return -KERNEL_EINVAL;
+    /* Linux在64位目标上也只消费unsigned int参数。 */
+    uint32_t size=(uint32_t)argument;
+    if (size>(UINT32_C(1)<<31)) return -KERNEL_EINVAL;
+    uint32_t rounded=BOAROS_PAGE_SIZE;
+    while (rounded<size) rounded<<=1;
+    uint32_t nr=rounded/BOAROS_PAGE_SIZE;
+    if (rounded>PIPE_MAX_UNPRIVILEGED_BYTES &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_RESOURCE)) {
+        /* 此快照可直接拒绝越限扩容；通过者仍在复制资格内复核容量。 */
+        PIPE_META(guard,pipe);
+        if (nr>pipe->ring_size) return -KERNEL_EPERM;
+    }
+    struct kernel_pipe_buffer local[KERNEL_PIPE_INLINE_SLOTS]={0};
+    struct kernel_pipe_buffer *candidate=local,*retired=0;
+    enum kernel_heap_status allocated=KERNEL_HEAP_STATUS_OK;
+    /* 分配可回收并睡眠，不能占用复制资格；返回错误仍先判断权限和额度。 */
+    if (nr>KERNEL_PIPE_INLINE_SLOTS) {
+        candidate=0;
+        allocated=kernel_heap_allocate_zeroed(pipe->heap,nr,sizeof(*candidate),(void **)&candidate);
+        if (allocated && allocated!=KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+    }
+    uintptr_t irq=arch_interrupt_save();
+    int64_t result;
+    int changed=0;
+    {
+        KERNEL_LOCK_SCOPE(reader);kernel_mutex_lock(&pipe->read_lock,&reader);
+        KERNEL_LOCK_SCOPE(writer);kernel_mutex_lock(&pipe->write_lock,&writer);
+        uint32_t old=pipe->ring_size;
+        const struct kernel_credentials *cred=kernel_credentials_current();
+        do {
+            if (nr>old && rounded>PIPE_MAX_UNPRIVILEGED_BYTES &&
+                !kernel_credentials_capable(cred,KERNEL_CAP_SYS_RESOURCE)) {
+                result=-KERNEL_EPERM;break;
+            }
+            uint64_t pages=kernel_uid_account_pipe_pages(pipe->account,old,nr);
+            if (nr>old && (pages>PIPE_USER_PAGES_SOFT || pipe_over_hard_limit(pages)) &&
+                pipe_unprivileged(cred)) result=-KERNEL_EPERM;
+            else if (allocated) result=-KERNEL_ENOMEM;
+            else if (nr<pipe->slots) result=-KERNEL_EBUSY;
+            else {
+                if (pipe->read_slot!=KERNEL_PIPE_NO_SLOT || pipe->merge_slot!=KERNEL_PIPE_NO_SLOT)
+                    __builtin_trap();
+                /* 两个复制资格排除全部片段借用者；poll只观察后面的短状态发布。 */
+                for (uint32_t i=0;i<pipe->slots;i++)
+                    candidate[i]=pipe->buffers[(pipe->head+i)&(old-1U)];
+                struct kernel_pipe_buffer *published=candidate;
+                if (nr<=KERNEL_PIPE_INLINE_SLOTS) {
+                    memcpy(pipe->inline_buffers,local,sizeof(local));
+                    published=pipe->inline_buffers;
+                }
+                { PIPE_META(guard,pipe);
+                  if (pipe->buffers!=pipe->inline_buffers) retired=pipe->buffers;
+                  pipe->buffers=published;
+                  pipe->ring_size=nr;
+                  pipe->head=0;
+                  pipe->tail=pipe->slots&(nr-1U); }
+                if (published==candidate) candidate=0;
+                result=(int64_t)((uint64_t)nr*BOAROS_PAGE_SIZE);
+                changed=1;break;
+            }
+            (void)kernel_uid_account_pipe_pages(pipe->account,nr,old);
+        } while (0);
+    }
+    if (retired) kernel_heap_release(pipe->heap,retired);
+    if (candidate && candidate!=local) kernel_heap_release(pipe->heap,candidate);
+    if (changed) pipe_notify(pipe,0,1);
+    arch_interrupt_restore(irq);
+    return result;
 }
 int kernel_pipe_check_task_domain(struct kernel_pipe *pipe)
 {
@@ -299,25 +410,22 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap,struct kernel_vfs_node *node,
     return result;
 }
 
-static uint16_t next_slot(uint16_t slot)
-{
-    return (uint16_t)((slot + 1U) %
-                      (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
-}
+static uint32_t next_slot(const struct kernel_pipe *pipe,uint32_t slot)
+{ return (slot+1U)&(pipe->ring_size-1U); }
 
 static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count)
 {
-    uint16_t slot = pipe->head;
+    uint32_t slot = pipe->head;
     void *page=0;
     if (pipe->merge_slot==slot) __builtin_trap();
-    pipe->page_offset[slot] += (uint16_t)count;
-    pipe->page_length[slot] -= (uint16_t)count;
+    pipe->buffers[slot].offset += (uint16_t)count;
+    pipe->buffers[slot].length -= (uint16_t)count;
     pipe->bytes -= count;
-    if (pipe->page_length[slot] == 0U) {
-        page=pipe->pages[slot];pipe->pages[slot]=0;
-        pipe->page_offset[slot] = 0U;
-        pipe->can_merge &= (uint16_t)~(1U << slot);
-        pipe->head = next_slot(slot);
+    if (pipe->buffers[slot].length == 0U) {
+        page=pipe->buffers[slot].page;pipe->buffers[slot].page=0;
+        pipe->buffers[slot].offset = 0U;
+        pipe->buffers[slot].can_merge=0;
+        pipe->head = next_slot(pipe,slot);
         pipe->slots--;
     }
     return page;
@@ -325,15 +433,13 @@ static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count)
 
 static uint16_t pipe_tail_space(const struct kernel_pipe *pipe)
 {
-    uint16_t last;
+    uint32_t last;
 
     if (pipe->slots == 0U) return 0U;
-    last = (uint16_t)((pipe->tail +
-                       KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE - 1U) %
-                      (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
-    if (pipe->read_slot==last || !(pipe->can_merge & (1U << last))) return 0U;
-    return (uint16_t)(BOAROS_PAGE_SIZE - pipe->page_offset[last] -
-                      pipe->page_length[last]);
+    last = (pipe->tail+pipe->ring_size-1U)&(pipe->ring_size-1U);
+    if (pipe->read_slot==last || !pipe->buffers[last].can_merge) return 0U;
+    return (uint16_t)(BOAROS_PAGE_SIZE - pipe->buffers[last].offset -
+                      pipe->buffers[last].length);
 }
 
 /* 已在对象raw保护内登记；释放复制资格后park，finish覆盖所有返回路径。 */
@@ -383,7 +489,7 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     uint64_t committed=0; int fault=0;
     while (committed<requested) {
-        uint16_t slot,offset; size_t chunk;
+        uint32_t slot; uint16_t offset; size_t chunk;
         for (;;) {
             PIPE_META(guard,pipe);
             if (pipe->merge_slot==pipe->head) {
@@ -391,23 +497,23 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
                 KERNEL_LOCK_SCOPE(writer);kernel_mutex_lock(&pipe->write_lock,&writer);
                 continue;
             }
-            slot=pipe->head; offset=pipe->page_offset[slot];
-            if (!pipe->slots || !pipe->page_length[slot]) __builtin_trap();
+            slot=pipe->head; offset=pipe->buffers[slot].offset;
+            if (!pipe->slots || !pipe->buffers[slot].length) __builtin_trap();
             uint64_t length=requested-committed;
-            chunk=length<pipe->page_length[slot] ? (size_t)length : pipe->page_length[slot];
+            chunk=length<pipe->buffers[slot].length ? (size_t)length : pipe->buffers[slot].length;
             pipe->read_slot=slot;
             break;
         }
         size_t done=0;
         enum kernel_uaccess_status access=kernel_copy_to_user_iov(mm,&cursor,
-            pipe->pages[slot]+offset,chunk,&done);
+            pipe->buffers[slot].page+offset,chunk,&done);
         if (access || done!=chunk) {
-            { PIPE_META(guard,pipe); pipe->read_slot=16; }
+            { PIPE_META(guard,pipe); pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
             if (access!=KERNEL_UACCESS_STATUS_FAULT) { kernel_lock_scope_release(&copy); arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
             fault=1; break;
         }
         void *page;
-        { PIPE_META(guard,pipe);pipe->read_slot=16;page=pipe_consume(pipe,chunk); }
+        { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT;page=pipe_consume(pipe,chunk); }
         if (page) pipe_release_page(pipe,page);
         committed+=chunk;
     }
@@ -431,7 +537,7 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
     uint64_t total=0; uint16_t remainder=buffer ? 0 : (uint16_t)(count & BOAROS_PAGE_MASK);
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     while (total<count) {
-        uint16_t slot,offset; size_t chunk; int merging,wait=0;
+        uint32_t slot; uint16_t offset; size_t chunk; int merging,wait=0;
         struct kernel_wait_token token={0}; enum kernel_scheduler_status status=KERNEL_SCHEDULER_STATUS_OK;
         {
             PIPE_META(guard,pipe);
@@ -443,7 +549,7 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                 return KERNEL_PIPE_STATUS_OK;
             }
             merging=!total && remainder && pipe->slots && pipe_tail_space(pipe)>=remainder;
-            if (!merging && pipe->slots==16) {
+            if (!merging && pipe->slots==pipe->ring_size) {
                 if (flags & KERNEL_PIPE_NONBLOCK) {
                     result->bytes=total ? (int64_t)total : -KERNEL_EAGAIN;
                     kernel_raw_scope_release(&guard);
@@ -451,11 +557,11 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                     return KERNEL_PIPE_STATUS_OK;
                 }
                 status=kernel_wait_prepare(&pipe->write_queue,0,1,&token);
-                if (pipe->slots!=16 || !pipe->readers) __builtin_trap();
+                if (pipe->slots!=pipe->ring_size || !pipe->readers) __builtin_trap();
                 wait=1; slot=offset=0; chunk=0;
             } else {
-                slot=merging ? (uint16_t)((pipe->tail+15)%16) : pipe->tail;
-                offset=merging ? (uint16_t)(pipe->page_offset[slot]+pipe->page_length[slot]) : 0;
+                slot=merging ? (pipe->tail+pipe->ring_size-1U)&(pipe->ring_size-1U) : pipe->tail;
+                offset=merging ? (uint16_t)(pipe->buffers[slot].offset+pipe->buffers[slot].length) : 0;
                 uint64_t rest=count-total;
                 chunk=merging ? remainder : rest<BOAROS_PAGE_SIZE ? (size_t)rest : BOAROS_PAGE_SIZE;
                 if (merging) pipe->merge_slot=slot;
@@ -472,7 +578,7 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
             }
             kernel_mutex_lock(&pipe->write_lock,&copy); continue;
         }
-        if (!pipe->pages[slot]) {
+        if (!pipe->buffers[slot].page) {
             uint64_t physical;void *page;
             enum physical_page_status allocated=physical_page_allocate(pipe->allocator,&physical);
             if (allocated==PHYSICAL_PAGE_STATUS_EMPTY) {
@@ -482,18 +588,18 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
             }
             if (allocated || physical_page_resolve(pipe->allocator,physical,&page)) __builtin_trap();
             /* 槽先拥有尚未发布的页；用户fault或最后端点释放都能找到它。 */
-            { PIPE_META(guard,pipe);pipe->pages[slot]=page; }
+            { PIPE_META(guard,pipe);pipe->buffers[slot].page=page; }
         }
-        unsigned char *destination=pipe->pages[slot]+offset;
+        unsigned char *destination=pipe->buffers[slot].page+offset;
         size_t done=0; enum kernel_uaccess_status access=KERNEL_UACCESS_STATUS_OK;
         if (buffer) { memcpy(destination,buffer+total,chunk); done=chunk; }
         else access=kernel_copy_from_user_iov(mm,&cursor,destination,chunk,&done);
         if (access || done!=chunk) {
             void *page=0;
             { PIPE_META(guard,pipe);
-              pipe->merge_slot=16;
+              pipe->merge_slot=KERNEL_PIPE_NO_SLOT;
               if (!merging) {
-                  page=pipe->pages[slot];pipe->pages[slot]=0;
+                  page=pipe->buffers[slot].page;pipe->buffers[slot].page=0;
               }
             }
             if (page) pipe_release_page(pipe,page);
@@ -505,13 +611,13 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
         {
             PIPE_META(guard,pipe);
             if (!merging) {
-                pipe->page_offset[slot]=pipe->page_length[slot]=0;
-                if (!buffer) pipe->can_merge |= (uint16_t)(1U<<slot);
-                else pipe->can_merge &= (uint16_t)~(1U<<slot);
-                pipe->tail=next_slot(slot); pipe->slots++;
+                pipe->buffers[slot].offset=pipe->buffers[slot].length=0;
+                if (!buffer) pipe->buffers[slot].can_merge=1;
+                else pipe->buffers[slot].can_merge=0;
+                pipe->tail=next_slot(pipe,slot); pipe->slots++;
             }
-            pipe->page_length[slot]+=(uint16_t)chunk; pipe->bytes+=chunk;
-            pipe->merge_slot=16;
+            pipe->buffers[slot].length+=(uint16_t)chunk; pipe->bytes+=chunk;
+            pipe->merge_slot=KERNEL_PIPE_NO_SLOT;
         }
         total+=chunk;
         pipe_notify(pipe,1,0);
@@ -562,7 +668,7 @@ uint32_t kernel_pipe_poll(
         if (pipe->readers == 0U) {
             events |= KERNEL_POLLERR;
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
-        } else if (pipe->slots < KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE) {
+        } else if (pipe->slots < pipe->ring_size) {
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         }
     }
