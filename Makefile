@@ -1753,6 +1753,10 @@ include tests/diff-abi/Makefile.inc
 test-fat32-host:
 	sh tests/fat32-host.sh
 
+.PHONY: test-remount-host
+test-remount-host:
+	sh tests/remount-host.sh
+
 FAT32_USER_RV := $(BUILD_DIR)/tests/user/fat32-rv
 $(FAT32_USER_RV): tests/userland/fat32.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
@@ -2655,6 +2659,9 @@ kernel-rv-smp:
 run-smp-riscv: kernel-rv-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp$(SMP_BUILD_SUFFIX)/kernel-rv
 test-smp-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=4 -Itests/host/sync -idirafter include tests/host/cpu_events.c -o build/host/cpu-events
+	build/host/cpu-events
 	python3 -B tests/host/smp_dtb_test.py
 	python3 -B tests/smp/mm_contract_test.py
 	@mkdir -p build/host

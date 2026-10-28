@@ -54,16 +54,16 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 ### P1h 虚拟文件系统与多挂载
 
-基础 proc/tmpfs/devpts/ext4/vfat 挂载、覆盖、只读与普通忙卸载已存在；这里保留扩展缺口。
+基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、RO/RW 重配置与普通忙卸载已存在；这里保留扩展缺口。
 
 | 扩展 | 尚缺语义 |
 |---|---|
 | proc 线程信息 | task 子目录中的 fd、exe、cwd 等资源入口及其他按需字段；task 枚举、线程 stat/status 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
 | bind/rbind、move、传播与 mount namespace | 挂载边/实例/路径/OFD/MM 的引用及摘树关系，跨任务可见性与退出回收 |
-| remount 与其他属性 | 根挂载只读重配置；atime/同步等属性的实际执行点，重配置时已打开对象与脏数据的失败交接 |
+| 挂载属性扩展 | atime 策略、同步及其他尚未支持的属性与重配置选项 |
 | umount2 扩展 | MNT_DETACH/FORCE/EXPIRE/UMOUNT_NOFOLLOW 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 
-当前新 mount 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`，umount2 仅接受 flags=0，绝对根卸载返回 EINVAL。
+当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`，umount2 仅接受 flags=0；进程根挂载卸载沿同一路径尝试转为 RO。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。
 NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限制新的设备路径打开和块设备挂载源，已打开对象保留原权利。
 基础与扩展边界见 [VFS](modules/vfs-ext4.md)及[挂载学习记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
 

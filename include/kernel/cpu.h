@@ -119,6 +119,16 @@ static inline void kernel_cpu_notification_batch_end(struct kernel_cpu_notificat
 { (void)batch; }
 static inline void kernel_assert_service_context(void) {}
 #endif
+#if BOAROS_MAX_CPUS > 1
+/* The sender masks local interrupts until its queued IPI is sent. Once an event
+ * is pending, that sender or the receiver already owns its progress; another
+ * publisher needs an interrupt only for bits the receiver has since consumed. */
+static inline int kernel_cpu_publish_events(struct kernel_cpu *cpu,unsigned events)
+{
+    unsigned previous=__atomic_fetch_or(&cpu->events,events,__ATOMIC_RELEASE);
+    return (previous&events)!=events;
+}
+#endif
 static inline void kernel_cpu_request_schedule(struct kernel_cpu *cpu)
 {
     __atomic_store_n(&cpu->need_resched, 1U, __ATOMIC_RELEASE);

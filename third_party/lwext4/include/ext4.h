@@ -293,6 +293,8 @@ int ext4_mount(const char *dev_name,
  *
  * @return  Standard error code */
 int ext4_umount(const char *mount_point);
+/* Reconfigure the live backend without invalidating any ext4_file handle. */
+int ext4_remount(const char *mount_point, bool read_only);
 
 /**@brief   Starts journaling. Journaling start/stop functions are transparent
  *          and might be used on filesystems without journaling support.

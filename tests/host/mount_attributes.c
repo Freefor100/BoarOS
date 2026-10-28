@@ -8,6 +8,9 @@
 #include "../../kernel/syscall/private.h"
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
+#include "../../fs/vfs_objects.h"
+#include <pthread.h>
+#include <sched.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -143,6 +146,102 @@ static void admission(struct kernel_open_file_description **controller,int locki
     assert(!kernel_files_release(&files));
     mm_test_context=0;assert(!kernel_mm_release(&mm));
 }
+static int conversion_error(struct kernel_vfs_mount *mount,int read_only)
+{ (void)mount;(void)read_only;return -KERNEL_EIO; }
+static void reconfiguration(struct kernel_vfs_mount *mount,struct kernel_open_file_description *file)
+{
+    struct kernel_vfs_path *root=0;
+    assert(!kernel_vfs_path_root(mount,&heap,&root));
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    assert(kernel_vfs_remount(root,1,NULL)==-KERNEL_EBUSY);
+    assert(!kernel_vfs_mount_is_readonly(mount)&&mount->nodev&&mount->noexec);
+    /* The same lifetime owner is retained by any dup/fork/mapping. */
+    assert(!kernel_open_file_acquire(file));
+    struct kernel_open_file_description *alias=file;
+    assert(!kernel_open_file_release(&alias));
+    assert(kernel_vfs_remount(root,1,NULL)==-KERNEL_EBUSY);
+    /* Close the only writer before using read-only and metadata operations. */
+    assert(!kernel_open_file_release(&file));
+    assert(!kernel_vfs_remount(root,1|2,NULL));
+    assert(kernel_vfs_mount_is_readonly(mount)&&mount->nosuid&&!mount->nodev&&!mount->noexec);
+    struct kernel_vfs_file denied={0};
+    assert(kernel_vfs_create(mount,"/denied",0600,&denied)==-KERNEL_EROFS);
+    struct kernel_vfs_file read_only={0};struct kernel_vfs_stat before,after;
+    assert(!kernel_vfs_open(mount,"/file",&read_only) && !kernel_vfs_fstat(&read_only,&before));
+    kernel_vfs_file_accessed(&read_only);
+    assert(!kernel_vfs_fstat(&read_only,&after));
+    assert(before.atime.seconds==after.atime.seconds && before.atime.nanoseconds==after.atime.nanoseconds);
+    assert(!kernel_vfs_close(&read_only));
+    assert(!kernel_vfs_remount(root,0,NULL));
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_vfs_backend failed=*instance->ops;const struct kernel_vfs_backend *original=instance->ops;
+    failed.remount=conversion_error;instance->ops=&failed;
+    assert(kernel_vfs_remount(root,1|2|4|8,NULL)==-KERNEL_EIO);
+    assert(!instance->read_only&&!mount->nosuid&&!mount->nodev&&!mount->noexec);
+    instance->ops=original;
+    assert(!kernel_vfs_create(mount,"/after-failure",0600,&denied));
+    assert(!kernel_vfs_close(&denied));
+    assert(!kernel_vfs_path_release(&root));
+}
+static struct kernel_vfs_file *racing_file;
+static unsigned remount_entered;
+extern unsigned mm_test_parked(unsigned);
+static int pause_conversion(struct kernel_vfs_mount *mount,int read_only)
+{
+    (void)mount;assert(read_only);
+    __atomic_store_n(&remount_entered,1,__ATOMIC_RELEASE);
+    while (!mm_test_parked(1)) sched_yield();
+    return 0;
+}
+static void *new_writer(void *unused)
+{
+    (void)unused;mm_test_attach(1);
+    while (!__atomic_load_n(&remount_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(kernel_vfs_file_acquire_write(racing_file)==-KERNEL_EROFS);
+    assert(!racing_file->write_lease);
+    return NULL;
+}
+static void reconfiguration_race(struct kernel_vfs_mount *mount,struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_vfs_backend paused=*instance->ops;const struct kernel_vfs_backend *original=instance->ops;
+    paused.remount=pause_conversion;instance->ops=&paused;racing_file=file;
+    struct kernel_vfs_path *root=0;assert(!kernel_vfs_path_root(mount,&heap,&root));
+    pthread_t actor;assert(!pthread_create(&actor,NULL,new_writer,NULL));
+    assert(!kernel_vfs_remount(root,1,NULL));
+    assert(!pthread_join(actor,NULL));instance->ops=original;
+    assert(!kernel_vfs_remount(root,0,NULL));
+    assert(!kernel_vfs_path_release(&root));
+}
+static unsigned sync_entered,sync_calls;
+static int pause_filesystem_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
+{
+    (void)instance;(void)root;
+    if (__atomic_fetch_add(&sync_calls,1,__ATOMIC_RELAXED)) return 0;
+    __atomic_store_n(&sync_entered,1,__ATOMIC_RELEASE);
+    while (!mm_test_parked(0)) sched_yield();
+    return 0;
+}
+static void *mount_sync(void *argument)
+{
+    mm_test_attach(1);
+    assert(!kernel_vfs_sync_mount(argument,NULL));
+    return NULL;
+}
+static void reconfiguration_sync(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_vfs_backend paused=*instance->ops;const struct kernel_vfs_backend *original=instance->ops;
+    paused.sync_filesystem=pause_filesystem_sync;instance->ops=&paused;
+    struct kernel_vfs_path *root=0;assert(!kernel_vfs_path_root(mount,&heap,&root));
+    pthread_t actor;assert(!pthread_create(&actor,NULL,mount_sync,mount));
+    while (!__atomic_load_n(&sync_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_vfs_remount(root,1,NULL));
+    assert(!pthread_join(actor,NULL) && sync_calls==2);
+    instance->ops=original;
+    assert(!kernel_vfs_remount(root,0,NULL));
+    assert(!kernel_vfs_path_release(&root));
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);mm_test_attach(0);
@@ -155,7 +254,10 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"execute"))execute(mount);
+    if(!strcmp(argv[1],"remount")){reconfiguration(mount,file);file=0;}
+    else if(!strcmp(argv[1],"remount-race"))reconfiguration_race(mount,&file->file);
+    else if(!strcmp(argv[1],"remount-sync"))reconfiguration_sync(mount);
+    else if(!strcmp(argv[1],"execute"))execute(mount);
     else if(!strcmp(argv[1],"devices"))devices(mount);
     else if(!strcmp(argv[1],"mapping"))mapping(mount,&file);
     else {assert(!strcmp(argv[1],"admission")||!strcmp(argv[1],"locking"));admission(&file,!strcmp(argv[1],"locking"));}

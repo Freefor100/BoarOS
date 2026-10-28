@@ -249,56 +249,12 @@ static enum kernel_syscall_status syscall_handle_sysinfo(struct kernel_task *cal
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-enum kernel_syscall_status kernel_syscall_dispatch(
+static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
-    kernel_pid_t id;
-    enum kernel_task_status task_status;
-
-    if (caller == 0 || request == 0 || result == 0) {
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-
-#if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_syscall(request->number, (int64_t)request->arguments[0]);
-    COST_SCOPE(syscall_cost, OPERATION_TICKS);
-    COST_ADD(OPERATIONS, 1);
-#endif
-    /* 身份查询只读取调用线程的现有身份，直接完成这组标量调用，
-     * 避免经过业务分发表后再次分发。权限/身份读取仍由原操作负责。 */
-    if (request->number >= LINUX_SYSCALL_GETPID &&
-        request->number <= LINUX_SYSCALL_GETTID) {
-        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
-        switch (request->number) {
-        case LINUX_SYSCALL_GETPID:
-            task_status = kernel_task_tgid(caller, &id);
-            if (task_status != KERNEL_TASK_STATUS_OK)
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            decoded.value = id;
-            break;
-        case LINUX_SYSCALL_GETPPID:
-            task_status = kernel_task_ppid(caller, &id);
-            if (task_status != KERNEL_TASK_STATUS_OK)
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            decoded.value = id;
-            break;
-        case LINUX_SYSCALL_GETTID:
-            task_status = kernel_task_tid(caller, &id);
-            if (task_status != KERNEL_TASK_STATUS_OK)
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            decoded.value = id;
-            break;
-        default:
-            if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            break;
-        }
-        *result = decoded;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
     if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -867,4 +823,58 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
     *result = decoded;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+/* Keep scalar identity queries out of the large operation frame/jump table. */
+enum kernel_syscall_status kernel_syscall_dispatch(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *result)
+{
+    struct kernel_syscall_result decoded;
+    kernel_pid_t id;
+    enum kernel_task_status task_status;
+
+    if (caller == 0 || request == 0 || result == 0) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_syscall(request->number, (int64_t)request->arguments[0]);
+    COST_SCOPE(syscall_cost, OPERATION_TICKS);
+    COST_ADD(OPERATIONS, 1);
+#endif
+    /* 身份查询只读取调用线程的现有身份，直接完成这组标量调用，
+     * 避免经过业务分发表后再次分发。权限/身份读取仍由原操作负责。 */
+    if (request->number >= LINUX_SYSCALL_GETPID &&
+        request->number <= LINUX_SYSCALL_GETTID) {
+        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
+        switch (request->number) {
+        case LINUX_SYSCALL_GETPID:
+            task_status = kernel_task_tgid(caller, &id);
+            if (task_status != KERNEL_TASK_STATUS_OK)
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            decoded.value = id;
+            break;
+        case LINUX_SYSCALL_GETPPID:
+            task_status = kernel_task_ppid(caller, &id);
+            if (task_status != KERNEL_TASK_STATUS_OK)
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            decoded.value = id;
+            break;
+        case LINUX_SYSCALL_GETTID:
+            task_status = kernel_task_tid(caller, &id);
+            if (task_status != KERNEL_TASK_STATUS_OK)
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            decoded.value = id;
+            break;
+        default:
+            if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        *result = decoded;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    return dispatch_operation(caller,request,result);
 }

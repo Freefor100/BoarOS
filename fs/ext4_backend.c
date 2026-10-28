@@ -1274,6 +1274,13 @@ static void journal_worker(void *context)
             stopping = adapter->journal_stopping;
         }
         if (stopping) break;
+        KERNEL_LOCK_SCOPE(service);
+        kernel_rwlock_read(&adapter->journal_service,&service);
+        if (adapter->device.fs->read_only || mount_error(adapter)) {
+            kernel_lock_release(&service);
+            journal_idle(adapter, 0, 0);
+            continue;
+        }
         int metadata = EOK;
         uint64_t times_due = time_deadline(adapter);
         if (times_due && kernel_time_monotonic_ns() >= times_due)
@@ -1291,6 +1298,7 @@ static void journal_worker(void *context)
         if (!result && times_due && (!due || times_due < due)) due = times_due;
         if (!result && (progress.commit_ready || (due &&
             kernel_time_deadline_from_monotonic(due, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
+        kernel_lock_release(&service);
         journal_idle(adapter, 0, deadline);
     }
     kernel_io_context_current()->background_reclaim = 0;
@@ -1310,6 +1318,13 @@ static void journal_checkpoint_worker(void *context)
             stopping = adapter->journal_stopping;
         }
         if (stopping) break;
+        KERNEL_LOCK_SCOPE(service);
+        kernel_rwlock_read(&adapter->journal_service,&service);
+        if (adapter->device.fs->read_only || mount_error(adapter)) {
+            kernel_lock_release(&service);
+            journal_idle(adapter, 1, 0);
+            continue;
+        }
         struct ext4_journal_progress progress;
         if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
         if (!progress.checkpoint_pending) pending_deadline = 0;
@@ -1327,20 +1342,17 @@ static void journal_checkpoint_worker(void *context)
         if (!result && pending_deadline &&
             kernel_time_deadline_from_monotonic(pending_deadline, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED)
             continue;
+        kernel_lock_release(&service);
         journal_idle(adapter, 1, deadline);
     }
     kernel_io_context_current()->background_reclaim = 0;
 }
 
-int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
+static int start_journal_workers(struct kernel_vfs_mount *mount)
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct lwext4_mount_adapter *adapter = mount->private_data;
     if (adapter->instance.backend_data != adapter || !adapter->mounted) return -KERNEL_EINVAL;
-    if (adapter->instance.read_only) return 0;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    kernel_vfs_namespace_lock(mount,&namespace_guard);
-    if (adapter->journal_started) return -KERNEL_EBUSY;
     /* The same mount worker also owns timestamp-only writeback on writable
      * filesystems without JBD; dirty inode pins need a consumer there too. */
     if (adapter->device.fs->jbd_journal) {
@@ -1351,11 +1363,11 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
         if (result != EOK) return lwext4_error(result);
     }
     enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
-    if (adapter->device.fs->jbd_journal) {
+    if (!adapter->journal_started && adapter->device.fs->jbd_journal) {
         status = kernel_thread_create_joinable(journal_checkpoint_worker, adapter, &adapter->checkpoint_worker);
         if (status == KERNEL_SCHEDULER_STATUS_OK) adapter->checkpoint_started = 1;
     }
-    if (status == KERNEL_SCHEDULER_STATUS_OK)
+    if (!adapter->journal_started && status == KERNEL_SCHEDULER_STATUS_OK)
         status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         if (adapter->checkpoint_started) {
@@ -1367,7 +1379,7 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
         return status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 #if BOAROS_MAX_CPUS > 1
-    if(adapter->device.fs->jbd_journal && adapter->locks.resource_acquire) {
+    if(adapter->device.fs->jbd_journal && adapter->locks.resource_acquire && !adapter->backend_lock.parallel) {
         boaros_lwext4_enable_parallel(&adapter->backend_lock,adapter->device.fs);
         __atomic_store_n(&adapter->instance.namespace_parallel,1,__ATOMIC_RELEASE);
     }
@@ -1380,6 +1392,88 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
     journal_wake(&adapter->journal_work);
     journal_wake(&adapter->checkpoint_work);
     return 0;
+}
+
+int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
+{
+    if (!mount || !mount->private_data) return -KERNEL_EINVAL;
+    struct lwext4_mount_adapter *adapter=mount->private_data;
+    if (adapter->instance.read_only) return 0;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(mount,&namespace_guard);
+    if (adapter->journal_started) return -KERNEL_EBUSY;
+    return start_journal_workers(mount);
+}
+
+static int ext4_backend_remount(struct kernel_vfs_mount *mount, int read_only)
+{
+    struct lwext4_mount_adapter *adapter=mount->private_data;
+    struct ext4_fs *fs=adapter->device.fs;
+    int result=mount_error(adapter);
+    if (result) return lwext4_error(result);
+    /* Workers must still be able to service a sync before this exclusive
+     * qualification. After drain they cannot retain a journal being replaced. */
+    if (read_only && fs->jbd_journal) {
+        result=ext4_journal_group_drain(adapter->mount_point);
+        if (result) return lwext4_error(result);
+    }
+    KERNEL_LOCK_SCOPE(service);
+    kernel_rwlock_write(&adapter->journal_service,&service);
+    {
+        KERNEL_TASK_LOCK_SCOPE(control,&adapter->journal_control);
+        if (adapter->sync_waiters) return -KERNEL_EBUSY;
+    }
+    if (read_only) {
+        result=ext4_remount(adapter->mount_point,true);
+        if (!result) {
+            kernel_page_cache_unbind_writeback(&adapter->instance.writeback);
+            if (kernel_page_cache_bind_writeback(adapter->instance.page_cache,adapter->block,0,
+                &adapter->instance.writeback)) __builtin_trap();
+        }
+    } else {
+        kernel_page_cache_unbind_writeback(&adapter->instance.writeback);
+        int bound=kernel_page_cache_bind_writeback(adapter->instance.page_cache,adapter->block,1,
+            &adapter->instance.writeback);
+        if (bound) {
+            if (kernel_page_cache_bind_writeback(adapter->instance.page_cache,adapter->block,0,
+                &adapter->instance.writeback)) __builtin_trap();
+            return bound;
+        }
+        result=ext4_remount(adapter->mount_point,false);
+        if (fs->jbd_journal && fs->jbd_journal->memory) {
+            struct jbd_memory_account account={adapter->instance.writeback.domain,
+                kernel_writeback_domain_get,kernel_writeback_domain_put,kernel_writeback_domain_memory};
+            jbd_memory_set_account(fs->jbd_journal->memory,&account);
+        }
+        if (!result) {
+            KERNEL_TASK_LOCK_SCOPE(control,&adapter->journal_control);
+            if (adapter->sync_waiters) __builtin_trap();
+            adapter->published_sealed=adapter->published_durable=adapter->published_checkpoint=0;
+        }
+        if (!result) {
+            int started=start_journal_workers(mount);
+            if (started) {
+                int rollback=ext4_remount(adapter->mount_point,true);
+                if (rollback) result=rollback;
+                else {
+                    kernel_page_cache_unbind_writeback(&adapter->instance.writeback);
+                    if (kernel_page_cache_bind_writeback(adapter->instance.page_cache,adapter->block,0,
+                        &adapter->instance.writeback)) __builtin_trap();
+                    return started;
+                }
+            }
+        }
+        if (result) {
+            kernel_page_cache_unbind_writeback(&adapter->instance.writeback);
+            if (kernel_page_cache_bind_writeback(adapter->instance.page_cache,adapter->block,0,
+                &adapter->instance.writeback)) __builtin_trap();
+        }
+    }
+    if (result==EIO || result==EUCLEAN)
+        __atomic_store_n(&adapter->mount_error,result,__ATOMIC_RELEASE);
+    journal_wake(&adapter->journal_work);
+    journal_wake(&adapter->checkpoint_work);
+    return lwext4_error(result);
 }
 
 static int cleanup_mount(struct kernel_vfs_mount *mount)
@@ -1426,6 +1520,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     boaros_lwext4_lock_init(&adapter->locks, &adapter->backend_lock, heap);
     adapter->locks.unlock = backend_unlock;
     kernel_raw_lock_init(&adapter->journal_control, KERNEL_RAW_RANK_OBJECT);
+    kernel_rwlock_init(&adapter->journal_service,22,(uintptr_t)adapter);
     /* Progress publication also runs during synchronous journal service,
      * before background workers exist. Queues belong to the mount lifetime. */
     kernel_wait_queue_init(&adapter->journal_work);
@@ -1440,6 +1535,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
         adapter->next_adapter = adapters;
         adapters = adapter;
     }
+    kernel_rwlock_init(&adapter->instance.reconfiguration, 19, (uintptr_t)&adapter->instance);
     kernel_mutex_init(&adapter->instance.namespace_lock, 20, (uintptr_t)adapter);
     kernel_raw_lock_init(&adapter->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     initialize_backend();
@@ -2713,6 +2809,7 @@ static void initialize_backend(void)
     ops->link = ext4_backend_link;
     ops->unmount = ext4_backend_unmount;
     ops->prepare_unmount = ext4_backend_prepare_unmount;
+    ops->remount = ext4_backend_remount;
     ops->statfs = ext4_backend_statfs;
     ops->set_times = ext4_backend_set_times;
     ops->set_mode = ext4_backend_set_mode;

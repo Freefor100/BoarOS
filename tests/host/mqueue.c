@@ -23,6 +23,14 @@ static _Thread_local int forced_reason=-1,abandon_copy,abandon_cookie,abandon_wa
 static _Thread_local int fail_at=-1;
 static _Thread_local unsigned allocation_calls;
 static uint64_t output_fault;
+static pthread_barrier_t abandoned,abandon_release;
+static void abandon_pause(void) __attribute__((noreturn));
+static void abandon_pause(void)
+{
+    int n=pthread_barrier_wait(&abandoned);assert(!n||n==PTHREAD_BARRIER_SERIAL_THREAD);
+    n=pthread_barrier_wait(&abandon_release);assert(!n||n==PTHREAD_BARRIER_SERIAL_THREAD);
+    pthread_exit(0);
+}
 void *sync_test_cpu(void){return &cpu;}
 void *sync_test_current_task(void){return cpu.current;}
 struct kernel_task *kernel_task_current(void){return cpu.current;}
@@ -58,7 +66,7 @@ void kernel_rwlock_init(struct kernel_rwlock *lock,uint32_t rank,uintptr_t key)
 enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *dest,uint64_t source,size_t size,size_t *copied)
 {
     (void)mm;assert(!cpu.raw_locks);
-    if(abandon_copy)pthread_exit(0);
+    if(abandon_copy)abandon_pause();
     if(source<4096)return KERNEL_UACCESS_STATUS_FAULT;
     memcpy(dest,(void *)(uintptr_t)source,size);*copied=size;return 0;
 }
@@ -105,7 +113,7 @@ void kernel_exec_security_put(struct kernel_exec_security *s){(void)s;}
 void kernel_signal_mqueue_notify(struct kernel_pid *id,struct kernel_exec_security *exec,int signo,uint64_t value,int32_t sender,uint32_t uid)
 {(void)id;(void)exec;assert(sender>0&&uid==10);signal_count++;signal_number=signo;signal_value=value;}
 int kernel_socket_mqueue_cookie_prepare(struct kernel_task *task,int64_t fd,const unsigned char cookie[32],struct kernel_netlink_cookie **out)
-{(void)task;assert(fd==9&&cookie[0]==42);*out=(void *)(uintptr_t)1;if(abandon_cookie)pthread_exit(0);return 0;}
+{(void)task;assert(fd==9&&cookie[0]==42);*out=(void *)(uintptr_t)1;if(abandon_cookie)abandon_pause();return 0;}
 void kernel_socket_mqueue_cookie_send(struct kernel_netlink_cookie **owner,unsigned reason)
 {assert(*owner);*owner=0;cookie_count++;cookie_reason=(int)reason;}
 void kernel_socket_mqueue_cookie_cancel(struct kernel_netlink_cookie **owner){if(*owner)cookie_cancelled++;*owner=0;}
@@ -127,7 +135,7 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
     __atomic_fetch_or(&waiting,1U<<(unsigned)(t-tasks),__ATOMIC_RELEASE);
     if(abandon_wait){
         struct kernel_wait_token token={t,t->wait.generation};
-        assert(!kernel_wait_notify(&token,KERNEL_WAIT_SIGNALLED));assert(!kernel_wait_finish(&token));pthread_exit(0);
+        assert(!kernel_wait_notify(&token,KERNEL_WAIT_SIGNALLED));assert(!kernel_wait_finish(&token));abandon_pause();
     }
     if(forced_reason>=0){struct kernel_wait_token token={t,t->wait.generation};assert(!kernel_wait_notify(&token,(unsigned)forced_reason));}
     for(;;){
@@ -202,20 +210,28 @@ static void *run_worker(void *data)
 }
 static void await_waiter(void)
 {while(!(__atomic_load_n(&waiting,__ATOMIC_ACQUIRE)&2U))sched_yield();}
+static unsigned queue_callbacks;
+static void queue_changed(struct kernel_wait_node *node,uint32_t reason)
+{(void)node;(void)reason;queue_callbacks++;}
 static void handoff_and_timeout(void)
 {
     struct kernel_mqueue *q=make("handoff",1,32);int fd=descriptor(q,2);pthread_t thread;
+    struct kernel_wait_node poll_node;queue_callbacks=0;
+    kernel_wait_node_init_callback(&poll_node,queue_changed,0);
+    kernel_wait_queue_add(&q->waiters,&poll_node);
     struct worker w={.fd=fd};waiting=0;assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();
     assert(!notifyq(fd,0,36,44));assert(!sendq(fd,"direct",7,1));assert(!pthread_join(thread,0));
     assert(w.result==7&&!strcmp(w.text,"direct")&&signal_count==1&&q->notification.owner);
-    assert(!sendq(fd,"fill",5,0));assert(signal_count==2);
+    assert(queue_callbacks==0);
+    assert(!sendq(fd,"fill",5,0));assert(signal_count==2&&queue_callbacks==1);
     w=(struct worker){.fd=fd,.send=1,.text="replacement"};waiting=0;
     assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();char out[32];
-    assert(recvq(fd,out,32,0)==5&&!strcmp(out,"fill"));assert(!pthread_join(thread,0));assert(!w.result);
+    assert(recvq(fd,out,32,0)==5&&!strcmp(out,"fill"));assert(!pthread_join(thread,0));assert(!w.result&&queue_callbacks==1);
     assert(recvq(fd,out,32,0)==12&&!strcmp(out,"replacement"));
     struct{int64_t sec,nsec;} expired={0,0};
     assert(kernel_mqueue_receive(cpu.current,&cpu.current->mm,fd,(uintptr_t)out,32,0,(uintptr_t)&expired)==-KERNEL_ETIMEDOUT);
     forced_reason=KERNEL_WAIT_SIGNALLED;assert(recvq(fd,out,32,0)==-KERNEL_ERESTARTSYS);forced_reason=-1;
+    assert(!kernel_wait_node_remove_sync(&poll_node));
     closefd(fd);removeq(q);
 }
 static void fault_and_quota(void)
@@ -257,11 +273,20 @@ static void abandoned_owners_and_allocations(void)
     struct kernel_mqueue *q=make("abort",1,32);int fd=descriptor(q,2);unsigned before=allocations;
     pthread_t thread;
     for(int operation=0;operation<3;operation++){
-        int op[2]={fd,operation};assert(!pthread_create(&thread,0,abandon_operation,op));assert(!pthread_join(thread,0));
+        int op[2]={fd,operation};
+        assert(!pthread_barrier_init(&abandoned,0,2)&&!pthread_barrier_init(&abandon_release,0,2));
+        assert(!pthread_create(&thread,0,abandon_operation,op));
+        int n=pthread_barrier_wait(&abandoned);assert(!n||n==PTHREAD_BARRIER_SERIAL_THREAD);
+        /* The kernel cleans requests before releasing the stopped task stack. */
         assert(tasks[1].mqueue_request);kernel_mqueue_abort(&tasks[1]);
+        n=pthread_barrier_wait(&abandon_release);assert(!n||n==PTHREAD_BARRIER_SERIAL_THREAD);
+        assert(!pthread_join(thread,0));pthread_barrier_destroy(&abandoned);pthread_barrier_destroy(&abandon_release);
         assert(allocations==before&&!q->send_head&&!q->recv_head&&fds[fd]->references==1);
     }
     assert(cookie_cancelled==1);
+    unsigned calls=allocation_calls;
+    assert(!kernel_mqueue_getsetattr(cpu.current,&cpu.current->mm,fd,0,0));
+    assert(allocation_calls==calls);
     unsigned char cookie[32]={42};assert(notifyq(-1,2,9,(uintptr_t)cookie)==-KERNEL_EBADF&&cookie_cancelled==2);
     for(int n=0;n<4;n++){
         allocation_calls=0;fail_at=n;int64_t result=sendq(fd,"allocation",11,0);fail_at=-1;

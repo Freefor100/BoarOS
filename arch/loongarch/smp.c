@@ -56,11 +56,15 @@ void kernel_cpu_notify(struct kernel_cpu *target,unsigned events)
 {
     uintptr_t irq=arch_interrupt_save();struct kernel_cpu *source=kernel_cpu_current();
     if (!target) __builtin_trap();
-    __atomic_fetch_or(&target->events,events,__ATOMIC_RELEASE);
+    int fresh=kernel_cpu_publish_events(target,events);
     if (target!=source) {
-        unsigned bit=1U<<target->logical_id;
-        if(source->notification_batch)source->notification_batch->targets|=bit;
-        else source->outbound|=bit;
+        COST_ADD(SCHED_IPI_REQUESTS,1);
+        if(!fresh) {COST_ADD(SCHED_IPI_COALESCED,1);}
+        else {
+            unsigned bit=1U<<target->logical_id;
+            if(source->notification_batch)source->notification_batch->targets|=bit;
+            else source->outbound|=bit;
+        }
     }
     if (!source->raw_locks && source->outbound)kernel_cpu_flush_notifications();
     arch_interrupt_restore(irq);

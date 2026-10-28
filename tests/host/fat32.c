@@ -263,6 +263,10 @@ int main(int argc, char **argv)
     assert(!kernel_vfs_rmdir(&mount, "/目录"));
     names(&mount,root);
     metadata(&mount,&heap);
+    assert(!kernel_vfs_remount(root,1|2|4|8,NULL));
+    assert(kernel_vfs_create(&mount,"/denied",0600,&file)==-KERNEL_EROFS);
+    assert(!kernel_vfs_remount(root,0,NULL));
+    puts("PASS FAT RW/RO/RW clean-bit and writeback owner transitions");
     disk_full(&mount);
     assert(!kernel_vfs_path_release(&root));
     assert(!kernel_vfs_unmount(&mount));
@@ -270,6 +274,10 @@ int main(int argc, char **argv)
     struct kernel_page_cache read_cache={0};
     assert(!kernel_page_cache_init(&read_cache,&heap,&pages));
     assert(!kernel_vfs_mount_fat32(&mount,&block,&heap,&read_cache,1));
+    assert(!kernel_vfs_path_root(&mount,&heap,&root));
+    assert(!kernel_block_set_read_only(&block,1));
+    assert(kernel_vfs_remount(root,0,NULL)==-KERNEL_EACCES && kernel_vfs_mount_is_readonly(&mount));
+    assert(!kernel_block_set_read_only(&block,0));
     assert(!kernel_vfs_open(&mount,"/REUSED.BIN",&file));
     assert(!kernel_page_cache_start_worker(&read_cache));
     struct kernel_page_cache_concurrency_state before_read,after_read;
@@ -285,7 +293,12 @@ int main(int argc, char **argv)
     puts("PASS FAT caller CPU1 retains CPU0 backend policy: actual device reads, content and owners");
     contents(&file,0,zero,17001);
     assert(kernel_vfs_pwrite(&file,0,data,1,&done)==-KERNEL_EROFS && !done);
+    assert(!kernel_vfs_remount(root,0,NULL));
+    assert(!kernel_vfs_pwrite(&file,0,zero,1,&done)&&done==1);
+    assert(!kernel_vfs_remount(root,1,NULL));
     assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS FAT initially RO device refusal, writable reconfiguration and RO restoration");
     assert(!kernel_vfs_open(&mount,"/times",&file));
     struct kernel_vfs_stat saved; assert(!kernel_vfs_fstat(&file,&saved));
     assert(saved.mtime.seconds==(persisted_mtime.seconds&~INT64_C(1)));

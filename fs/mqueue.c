@@ -73,7 +73,7 @@ static int statfs(struct kernel_vfs_mount *mount,struct kernel_vfs_statfs *stat)
 {
     struct mq_mount *m=(void *)mount;
     *stat=(struct kernel_vfs_statfs){.type=0x19800202U,.block_size=BOAROS_PAGE_SIZE,
-        .fsid=0x19800202U,.name_length=255,.flags=m->flags&1U};return 0;
+        .fsid=0x19800202U,.name_length=255,.flags=m->instance.read_only?1U:0U};return 0;
 }
 static int permission(struct kernel_vfs_node *node,const struct kernel_credentials *c,unsigned access)
 {
@@ -155,6 +155,7 @@ int kernel_mqueue_fs_create(struct kernel_heap *heap,uint64_t flags,struct kerne
     if(s)return s==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
     initialize_ops();m->flags=flags;m->instance.heap=heap;m->instance.ops=&mq_ops;
     m->instance.backend_data=m;m->instance.read_only=!!(flags&1U);
+    kernel_rwlock_init(&m->instance.reconfiguration, 19, (uintptr_t)&m->instance);
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock,KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance;m->mount.id=kernel_vfs_allocate_mount_id();
