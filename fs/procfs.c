@@ -501,7 +501,7 @@ static int proc_statfs(struct kernel_vfs_mount *mount,
         .block_size = BOAROS_PAGE_SIZE,
         .fsid = mount->id,
         .name_length = 255U,
-        .flags = proc->flags & 1U,
+        .flags = proc->instance.read_only ? 1U : 0U,
     };
     return 0;
 }
@@ -1736,6 +1736,7 @@ int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
     proc->instance.ops = &proc_backend;
     proc->instance.heap = heap;
     proc->instance.read_only = (flags & 1U) != 0U;
+    kernel_rwlock_init(&proc->instance.reconfiguration, 19, (uintptr_t)&proc->instance);
     kernel_mutex_init(&proc->instance.namespace_lock, 20U,
                       (uintptr_t)&proc->instance);
     kernel_raw_lock_init(&proc->instance.error_lock, KERNEL_RAW_RANK_OBJECT);

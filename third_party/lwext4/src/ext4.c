@@ -1164,6 +1164,51 @@ int ext4_umount(const char *mount_point)
 	return result;
 }
 
+int ext4_remount(const char *mount_point, bool read_only)
+{
+    struct ext4_mountpoint *mp=ext4_get_mount(mount_point);
+    if (!mp) return ENOENT;
+    EXT4_MP_LOCK(mp);
+    int result=EOK;
+    struct ext4_fs *fs=&mp->fs;
+    if (fs->active_operations) { result=EBUSY; goto Finish; }
+    if (fs->read_only==read_only) goto Finish;
+    if (read_only) {
+        /* journal_stop checkpoints and flushes the clean superblock before
+         * releasing the session. No fallible teardown follows publication. */
+        result=ext4_block_cache_flush(fs->bdev);
+        if (!result) result=ext4_journal_stop(mount_point);
+        if (!result && !ext4_sb_feature_com(&fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
+            struct ext4_sblock clean=fs->sb;
+            ext4_set16(&clean,state,EXT4_SUPERBLOCK_STATE_VALID_FS);
+            result=ext4_sb_write(fs->bdev,&clean);
+            if (!result) result=ext4_blockdev_flush(fs->bdev);
+            if (!result) fs->sb=clean;
+        }
+        if (!result) fs->read_only=true;
+    } else {
+        bool required_read_only=false;
+        result=ext4_fs_check_features(fs,&required_read_only);
+        if (!result && required_read_only) result=EROFS;
+        if (result) goto Finish;
+        fs->read_only=false;
+        if (ext4_sb_feature_com(&fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
+            result=ext4_orphan_validate(fs);
+            if (!result) result=ext4_journal_start(mount_point);
+        } else {
+            struct ext4_sblock dirty=fs->sb;
+            ext4_set16(&dirty,state,ext4_get16(&dirty,state)&~EXT4_SUPERBLOCK_STATE_VALID_FS);
+            result=ext4_sb_write(fs->bdev,&dirty);
+            if (!result) result=ext4_blockdev_flush(fs->bdev);
+            if (!result) fs->sb=dirty;
+        }
+        if (result) fs->read_only=true;
+    }
+Finish:
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
 static struct ext4_mountpoint *ext4_get_mount(const char *path)
 {
 	KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock);

@@ -1136,6 +1136,32 @@ static void sync_prepare(struct kernel_vfs_node *node, int data_only, struct ker
     if (!r) r = flush_locked(m);
     kernel_vfs_sync_complete(request, r);
 }
+static int remount(struct kernel_vfs_mount *mount, int read_only)
+{
+    struct fat_mount *m=fm(mount->private_data);
+    KERNEL_LOCK_SCOPE(metadata);
+    kernel_mutex_lock(&m->metadata,&metadata);
+    int r=fat_error(&m->instance);
+    if (r) return r;
+    if (!read_only) {
+        kernel_page_cache_unbind_writeback(&m->instance.writeback);
+        r=kernel_page_cache_bind_writeback(m->instance.page_cache,m->block,1,&m->instance.writeback);
+        if (r) {
+            if (kernel_page_cache_bind_writeback(m->instance.page_cache,m->block,0,&m->instance.writeback)) __builtin_trap();
+            return r;
+        }
+    }
+    uint32_t state;
+    r=fat_get(m,1,&state);
+    if (!r) r=fat_set(m,1,read_only ? state|0x08000000U : state&~0x08000000U);
+    if (!r) r=fail(m,block_error(kernel_block_flush(m->block)));
+    if ((read_only && !r) || (!read_only && r)) {
+        kernel_page_cache_unbind_writeback(&m->instance.writeback);
+        if (kernel_page_cache_bind_writeback(m->instance.page_cache,m->block,0,&m->instance.writeback)) __builtin_trap();
+    }
+    return r;
+}
+
 static int prepare_unmount(struct kernel_vfs_mount *mount)
 {
     struct fat_mount *m = fm(mount->private_data);
@@ -1216,7 +1242,7 @@ static const struct kernel_vfs_backend fat_ops = {
     .writeback_allowed = writeback_allowed, .stat = stat_inode, .statfs = statfs,
     .accessed = accessed, .modified = modified, .set_times = set_times, .set_mode = set_mode, .set_owner = set_owner,
     .flush = flush, .sync_prepare = sync_prepare, .sync_filesystem = sync_filesystem,
-    .prepare_unmount = prepare_unmount, .unmount = unmount,
+    .prepare_unmount = prepare_unmount, .remount = remount, .unmount = unmount,
 };
 
 int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_device *block,
@@ -1304,6 +1330,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     if (RB_INSERT(fat_id_tree, &m->inodes, root_inode)) __builtin_trap();
     r = measure(m, root_inode); if (r) goto invalid;
     kernel_mutex_init(&m->metadata, 40, (uintptr_t)m);
+    kernel_rwlock_init(&m->instance.reconfiguration, 19, (uintptr_t)&m->instance);
     kernel_mutex_init(&m->instance.namespace_lock, 20, (uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->instance.writeback_block_size = bps;

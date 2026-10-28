@@ -96,13 +96,17 @@ ext4 目录并行检查。`tests/namespace-parallel-host.sh` 检查共享身份�
 检查实际块组资格及单方 abort 后的引用数。runner 支持 4/16 KiB 页及通过
 `FILE_IO_HOST_BLOCK_SIZE` 选择 1/4 KiB 文件系统块，每张正常卸载镜像随后运行 e2fsck。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
-已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通新挂载接受 `MS_RDONLY`、`MS_NOSUID`、`MS_NODEV`、`MS_NOEXEC`、`MS_SILENT`，支持同点覆盖与忙引用检查。`umount2` 只接受 flags=0；其他挂载或卸载 flags 返回 `ENOTSUP`。bind/rbind、remount、move、传播，以及 lazy/force/expire/nofollow 卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
+已接入 proc、tmpfs、devpts、mqueue 和块设备节点识别的 ext4/vfat。磁盘挂载按请求类型选择后端及其 worker，FAT32/VFAT 的名称、簇链与同步机制见[对应模块](fat32.md)。普通新挂载接受 `MS_RDONLY`、`MS_NOSUID`、`MS_NODEV`、`MS_NOEXEC`、`MS_SILENT`，支持同点覆盖与忙引用检查。`MS_REMOUNT` 以已解析的挂载根为目标，更新这组属性并保留实例、路径、inode 和已打开对象；非挂载根返回 `EINVAL`，非空重配置选项及其他挂载 flags 返回 `ENOTSUP`。source/type 的内容不参与重配置，但非空用户指针仍按普通 mount 导入并检查。bind/rbind、move、传播，以及 lazy/force/expire/nofollow 卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 
-`NOEXEC/NODEV` 在新 mount 发布前设置，存活期间不变。VFS 以符号链接、proc FD 链接和子挂载解析后的实际 mount 判断资格：NOEXEC 使主程序、脚本与 ELF 解释器的执行打开返回 `EACCES`；NODEV 使字符/块设备普通打开返回 `EACCES`，也拒绝把该挂载内的块设备节点作为磁盘挂载源。普通数据读写、目录搜索、stat、具备权限的 mknod 和 O_PATH 不受这两项限制。旧 FD 和相对 dirfd 保持原路径身份；覆盖挂载不会改写它们的 mount。已有 PTY 主端的 `TIOCGPTPEER` 直接取得稳定从端路径，保持该 FD 已有能力。文件映射的执行限制见[MM 模块](kernel-mm.md#匿名与文件映射)，access 的 X_OK 规则见[文件资源模块](kernel-files.md)。
-普通卸载当前针对非根挂载；绝对根挂载没有 parent/covered 边，用户态
-`umount2("/", 0)` 返回 `EINVAL`。固定 Linux 对该情形尝试只读重配置，
-这条根挂载路径须随 remount 独立实现，内核关机的根盘收口不代替它。
+重配置独占实例的 rank19 资格；命名空间修改、没有可写 OFD 的属性操作、新写入者登记和挂载同步借用共享资格，目录锁集合替换时保留该资格。已有可写 OFD 通过 `write_openers` 阻止转为 RO，内核借用读句柄进行数据修改时临时取得同一写租约，不把重配置锁带入 CPU0 空间准备或页缓存调度。dup、fork 和文件映射持有同一个 OFD，关闭原 fd 不会提前结束写租约。仍存活的已删除 inode、待清理节点和正在退休的节点同样使 RO 转换返回 `EBUSY`。检查通过后先同步全部数据和元数据，后端转换成功才共同发布只读状态和挂载属性；失败保留原属性。VFS 的访问时间 hook 在 RO 状态下不执行。
+
+ext4 转 RO 前排空至 checkpoint，再独占 journal 服务资格，暂停存活的 commit/checkpoint 线程并结束日志会话；转 RW 时先登记可写回资源域，再启动新会话并恢复既有线程，初始 RO 挂载则首次创建线程。新会话的组序号重新开始；挂载同步保留共享重配置资格到目标等待结束，inode fsync 的目标捕获与登记也在共享资格内，未消费的等待者阻止替换日志。启动失败时归还可回滚的线程和写回登记；保留的失败日志内存继续持有原资源域引用并计费。只读特性等干净拒绝不使原挂载永久报错，不确定 I/O 或损坏继续由错误挂载持有。FAT 转换在元数据保护内更新 clean 标志并执行设备 flush，随后才改变写回登记和通用只读状态。
+
+`NOEXEC/NODEV` 在新 mount 发布前设置，或在 remount 成功后更新。VFS 以符号链接、proc FD 链接和子挂载解析后的实际 mount 判断资格：NOEXEC 使主程序、脚本与 ELF 解释器的执行打开返回 `EACCES`；NODEV 使字符/块设备普通打开返回 `EACCES`，也拒绝把该挂载内的块设备节点作为磁盘挂载源。普通数据读写、目录搜索、stat、具备权限的 mknod 和 O_PATH 不受这两项限制。旧 FD 和相对 dirfd 保持原路径身份；覆盖挂载不会改写它们的 mount。已有 PTY 主端的 `TIOCGPTPEER` 直接取得稳定从端路径，保持该 FD 已有能力。文件映射的执行限制见[MM 模块](kernel-mm.md#匿名与文件映射)，access 的 X_OK 规则见[文件资源模块](kernel-files.md)。
+`umount2` 只接受 flags=0。非根挂载按普通卸载处理；没有 parent/covered 边的进程根挂载沿固定 Linux 行为尝试转为 RO，保留其余挂载属性和挂载树，仍受写入者及脏数据同步检查约束。
 卸载先检查忙引用并标记 quiescing，阻止新操作，排空页缓存和在途 I/O。遗留的持久 orphan 意图在 journal worker 仍存活时恢复；恢复可能接受新日志组，因此先完成最终 checkpoint drain，再停止 journal worker 和卸载 lwext4。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。`FALLOCATE_SYNC_RESIDUAL=1 sh tests/fallocate-sync-host.sh` 检查已关闭外层截断留下的恢复工作、worker 生命周期、重挂载内容与块归还。
+
+`make test-remount-host` 在 4/16 KiB 页下检查真实 tmpfs、ext4、FAT 转换、新写入者和挂载同步交错、初始 RO、线程分配失败重试、RO 特性拒绝、真实 flush EIO 及保留资源；正常磁盘镜像随后由对应 fsck 检查。`tests/network_runner.py --workload remount` 用同一原生 ELF 检查用户态属性、共享映射与 fork 后的最终 OFD、已删除读者和根挂载转换，支持 RV/LA 的 BoarOS 与固定 Linux 对照。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
@@ -235,7 +239,7 @@ lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入�
 
 ## 挂载范围与全局同步
 
-`kernel_vfs_sync_mount()`先取得根路径owner，按注册时增减的节点计数准备快照容量，
+`kernel_vfs_sync_mount()`在 CPU0 执行范围内借用共享重配置资格，再取得根路径owner，按注册时增减的节点计数准备快照容量，
 再在短发布保护区遍历一次并引用全部活节点；容量不足时先重新准备，不能漏掉新增节点。
 节点在取得inode锁和睡眠前已被钉住，调用结束统一归还。逐个交接普通文件页缓存后，
 后端捕获挂载durable目标一次；并发新修改不不断推进该目标。journal保留ordered-data、

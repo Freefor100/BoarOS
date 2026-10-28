@@ -18,6 +18,7 @@ struct kernel_vfs_instance {
     const struct kernel_vfs_backend *ops;
     void *backend_data;
     struct kernel_mutex namespace_lock;
+    struct kernel_rwlock reconfiguration; /* Namespace mutation/new writer versus live remount. */
     struct kernel_heap *heap;
     struct kernel_page_cache *page_cache;
     size_t writeback_block_size; /* Zero means no block alignment requirement. */
@@ -174,6 +175,7 @@ struct kernel_vfs_backend {
         uint64_t old_parent, const char *old_name, uint64_t new_parent,
         const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result);
     /* Failure keeps the attached root and backend owner reachable for retry. */
+    int (*remount)(struct kernel_vfs_mount *mount, int read_only);
     int (*prepare_unmount)(struct kernel_vfs_mount *mount);
     int (*unmount)(struct kernel_vfs_mount *mount);
     int (*statfs)(struct kernel_vfs_mount *mount,

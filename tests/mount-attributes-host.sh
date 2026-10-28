@@ -13,7 +13,7 @@ for shift in 12 14; do
         kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
         kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
         -Wl,--gc-sections -o "$build_dir/check-$shift"
-    for group in execute devices mapping admission locking; do
+    for group in execute devices mapping admission locking remount remount-race remount-sync; do
         timeout 30s "$build_dir/check-$shift" "$group"
     done
 done

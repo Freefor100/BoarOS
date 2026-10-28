@@ -1687,6 +1687,10 @@ include tests/diff-abi/Makefile.inc
 test-fat32-host:
 	sh tests/fat32-host.sh
 
+.PHONY: test-remount-host
+test-remount-host:
+	sh tests/remount-host.sh
+
 FAT32_USER_RV := $(BUILD_DIR)/tests/user/fat32-rv
 $(FAT32_USER_RV): tests/userland/fat32.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)

@@ -75,3 +75,7 @@ EXCLUDED(kernel_page_cache_run_cpu0)
 EXCLUDED(kernel_page_cache_prepare_mapping_write)
 /* This MM fixture never constructs eventfds; an accidental close is a failure. */
 void kernel_event_fd_close(void *context) { (void)context; mm_file_unavailable(); }
+EXCLUDED(kernel_page_cache_cancel_readahead)
+EXCLUDED(kernel_page_cache_accept_mapping_write)
+EXCLUDED(kernel_page_cache_finish_mapping_write)
+EXCLUDED(kernel_page_cache_writeback)

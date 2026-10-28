@@ -54,14 +54,15 @@ struct kernel_vfs_mount {
     const char *source_name; /* Borrowed from the mount owner. */
     /* Optional owner release, invoked only after backend teardown succeeds. */
     void (*release_owner)(struct kernel_vfs_mount *mount);
-    /* 新挂载在树发布前设置，存活期间不变；文件路径借用实际挂载。 */
-    uint8_t nosuid, nodev, noexec;
+    /* 路径借用实际挂载；重配置成功后在状态锁内发布。 */
+    uint8_t nosuid, nodev, noexec, silent;
 };
 
 /* Attachment transfers owned root/covered-path references to the tree.
  * Detach accepts the single caller-owned root used to name the mount. */
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path *covered);
+int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char *options);
 int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
     const struct kernel_vfs_path *named_root);
 int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
