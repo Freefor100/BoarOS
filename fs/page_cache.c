@@ -3655,6 +3655,8 @@ static void page_cache_worker(void *argument)
                 r->queue_ns+=queued; r->execute_ns+=elapsed;
                 if (queued>r->max_queue_ns) r->max_queue_ns=queued;
                 if (elapsed>r->max_execute_ns) r->max_execute_ns=elapsed;
+                COST_SAMPLE(CACHE_QUEUE_NS,queued);
+                COST_SAMPLE(CACHE_EXECUTE_NS,elapsed);
             }
             if (!stopping && !r->stopping && request->finished && !*request->finished) {
                 /* 同一请求只推进一个窗口；续批排到现有队尾，不唤醒caller重提。 */
