@@ -919,19 +919,19 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 
 ## POSIX消息队列与管道容量原程序结果（2026-10-28）
 
-通用实现为10月28日14:48～14:50的POSIX MQ、libc通知和管道容量完成版，随后单向合入兼容分支。固定官方容器离线构建并使用其QEMU 10.0.2、原启动设备参数；RV与LA并行，各一次启动中运行原glibc/musl的七项MQ和原BusyBox脚本。只选择LTP外层枚举；保留原ELF、参数、libc、judge及程序时限。默认单核、1 GiB、第二盘布局与启动种子沿用兼容配置。输入及内核身份保存在`build/mqueue-pipe-20261028/original/original-input-identity.json`和`probe-run.json`。
+POSIX MQ、libc通知和管道容量于10月28日14:48～14:50完成；16:25的共同等待、栈请求、基础remount和分发整理合入后，以相同输入重新执行本节短例。当前表格更新为后一次回归，首次输出保留于`build/mqueue-pipe-20261028/original/`。固定官方容器离线构建并使用其QEMU 10.0.2、原启动设备参数；RV与LA并行，各一次启动中运行原glibc/musl的七项MQ和原BusyBox脚本。只选择LTP外层枚举；保留原ELF、参数、libc、judge及程序时限。默认单核、1 GiB、第二盘布局与启动种子沿用兼容配置。输入及内核身份保存在`build/wait-remount-20261028/original/original-input-identity.json`和`probe-run.json`。
 
 四种组合每种得80/84分，合计320/336；全部程序均未超时。表中分数四配置相同，耗时为程序自身从进入到退出的总时间，单位ms。
 
 | 程序 | 每配置原judge分数 | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms | 实际到达位置 |
 |---|---:|---:|---:|---:|---:|---|
-| mq_open01 | 0/3 | 130 | 82 | 151 | 63 | setup：getpwnam(nobody)返回ENOENT，未进入MQ断言 |
-| mq_unlink01 | 0/1 | 87 | 41 | 65 | 42 | setup：getpwnam(nobody)返回ENOENT，未进入MQ断言 |
-| mq_timedsend01 | 34/34 | 212 | 209 | 210 | 189 | 34条TPASS，退出0，无TFAIL/TBROK |
-| mq_timedreceive01 | 30/30 | 207 | 185 | 186 | 186 | 30条TPASS，退出0，无TFAIL/TBROK |
-| mq_notify01 | 7/7 | 89 | 63 | 65 | 66 | 7条TPASS，退出0，无TFAIL/TBROK |
-| mq_notify02 | 2/2 | 42 | 42 | 64 | 43 | 2条TPASS，退出0，无TFAIL/TBROK |
-| mq_notify03 | 7/7 | 64 | 42 | 64 | 44 | 7条TPASS，退出0，无TFAIL/TBROK |
+| mq_open01 | 0/3 | 145 | 82 | 131 | 62 | setup：getpwnam(nobody)返回ENOENT，未进入MQ断言 |
+| mq_unlink01 | 0/1 | 62 | 62 | 64 | 42 | setup：getpwnam(nobody)返回ENOENT，未进入MQ断言 |
+| mq_timedsend01 | 34/34 | 232 | 205 | 207 | 189 | 34条TPASS，退出0，无TFAIL/TBROK |
+| mq_timedreceive01 | 30/30 | 187 | 185 | 186 | 186 | 30条TPASS，退出0，无TFAIL/TBROK |
+| mq_notify01 | 7/7 | 83 | 65 | 86 | 63 | 7条TPASS，退出0，无TFAIL/TBROK |
+| mq_notify02 | 2/2 | 63 | 42 | 62 | 43 | 2条TPASS，退出0，无TFAIL/TBROK |
+| mq_notify03 | 7/7 | 63 | 42 | 65 | 43 | 7条TPASS，退出0，无TFAIL/TBROK |
 
 `mq_open01`在缺少nobody的准备错误之后，又由LTP报告cleanup阶段SIGSEGV，退出状态6；源码中尚未赋值的qname为NULL，cleanup仍调用mq_unlink(qname)，两种libc会在syscall前读取名称。该清理路径与日志吻合，本次未采集fault PC。`mq_unlink01`退出2。二者原分数保留为0/3、0/1。原盘用户数据库问题统一见[测例问题](oscomp-test-issues.md#运行库和原盘依赖)；MQ创建、权限、unlink重建和引用寿命由数字身份的直接消费者与固定Linux同ELF验证。没有通过修改原账户输入取得替代分数。
 
