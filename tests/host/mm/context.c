@@ -181,3 +181,36 @@ __attribute__((weak)) void riscv_smp_sync_user(uint32_t targets, uint64_t addres
 #endif
 
 __attribute__((weak)) uint64_t kernel_task_current_memlock_limit(void) { return UINT64_MAX; }
+
+/* These fixtures exercise non-MQ consumers. Full MQ fixtures link strong
+ * production definitions; an unexpected MQ operation remains a hard failure. */
+#include <kernel/mqueue.h>
+__attribute__((weak)) void kernel_mqueue_close_fd(struct kernel_open_file_description *f,struct kernel_task *t)
+{ (void)f;(void)t;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_close(struct kernel_open_file_description *f)
+{ (void)f;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_fs_is_mount(const struct kernel_vfs_mount *m)
+{ (void)m;return 0; }
+__attribute__((weak)) int kernel_mqueue_fs_open(struct kernel_heap *h,struct kernel_vfs_file *f,uint32_t flags,struct kernel_open_file_description **o)
+{ (void)h;(void)f;(void)flags;(void)o;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_stat(struct kernel_open_file_description *f,struct kernel_vfs_stat *s)
+{ (void)f;(void)s;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_set_mode(struct kernel_open_file_description *f,uint32_t m)
+{ (void)f;(void)m;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_set_owner(struct kernel_open_file_description *f,uint32_t u,uint32_t g)
+{ (void)f;(void)u;(void)g;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_name(struct kernel_open_file_description *f,char *b,size_t n)
+{ (void)f;(void)b;(void)n;__builtin_trap(); }
+__attribute__((weak)) int kernel_mqueue_read(struct kernel_open_file_description *f,uint64_t o,void *b,size_t n,size_t *done)
+{ (void)f;(void)o;(void)b;(void)n;(void)done;__builtin_trap(); }
+__attribute__((weak)) uint32_t kernel_mqueue_poll(struct kernel_open_file_description *f,uint32_t e,struct kernel_wait_queue **q)
+{ (void)f;(void)e;(void)q;__builtin_trap(); }
+__attribute__((weak)) void kernel_mqueue_abort(struct kernel_task *t)
+{ if(t && t->mqueue_request)__builtin_trap(); }
+
+struct kernel_linux_statfs;
+__attribute__((weak)) int kernel_mqueue_statfs(struct kernel_open_file_description *f,struct kernel_linux_statfs *s)
+{ (void)f;(void)s;__builtin_trap(); }
+
+__attribute__((weak)) int kernel_mqueue_set_times(struct kernel_open_file_description *f,const struct kernel_vfs_timespec *t)
+{ (void)f;(void)t;__builtin_trap(); }

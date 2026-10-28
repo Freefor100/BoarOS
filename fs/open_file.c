@@ -13,6 +13,7 @@
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/event_fd.h>
+#include <kernel/mqueue.h>
 #include <kernel/signal_fd.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
@@ -499,6 +500,11 @@ uint64_t kernel_open_file_pseudo_identity(
         return kernel_pipe_proc_identity(file->pipe);
     if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
         return file->proc_identity;
+    if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        struct kernel_vfs_stat stat;
+        if(kernel_mqueue_stat((struct kernel_open_file_description *)file,&stat))__builtin_trap();
+        return stat.ino;
+    }
     return 0U;
 }
 
@@ -510,6 +516,8 @@ int kernel_open_file_pseudo_stat(
         return -KERNEL_ENOTSUP;
     uint32_t mode;
     uint64_t rdev = 0U;
+    if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)
+        return kernel_mqueue_stat((struct kernel_open_file_description *)file,stat);
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
         return kernel_pipe_stat(file->pipe, stat);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
@@ -593,6 +601,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_MQUEUE:
+        return KERNEL_OPEN_FILE_KIND_MQUEUE;
     case KERNEL_OPEN_FILE_KIND_PIDFD:
         return KERNEL_OPEN_FILE_KIND_PIDFD;
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
@@ -639,6 +649,7 @@ int kernel_open_file_supports_epoll(
         return 0;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
@@ -686,6 +697,7 @@ static void close_cpu0(void *argument)
 
 static int close_is_local(const struct kernel_open_file_description *file)
 {
+    if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)return 1;
     if (file->vfs_closed) return 1;
     if (file->file.mount && !kernel_vfs_namespace_requires_cpu0(file->file.mount) &&
         (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR || file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ||
@@ -738,6 +750,9 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             if (file->file.private_data && kernel_vfs_close(&file->file))
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
+        } else if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+            if(kernel_mqueue_close(file))return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+            file->vfs_closed=1;
         } else if (file->kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
             kernel_pidfd_close(file);file->vfs_closed=1;
         } else if ((file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)) {
@@ -842,6 +857,7 @@ struct kernel_vfs_node *kernel_open_file_node(
 uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file)
 {
+    if(open_file_live(file)&&file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)return 80;
     if (open_file_live(file) && file->block)
         return __atomic_load_n(&file->block->capacity_bytes, __ATOMIC_ACQUIRE);
     if (open_file_live(file) && file->kind == KERNEL_OPEN_FILE_KIND_GENERATED)
@@ -878,6 +894,11 @@ uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file)) return 0U;
+    if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        struct kernel_vfs_stat stat;
+        if(kernel_mqueue_stat((struct kernel_open_file_description *)file,&stat))__builtin_trap();
+        return stat.mode;
+    }
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data) {
         KERNEL_RAW_SCOPE(guard,&file->pipe->metadata_lock);
         return file->pipe->mode;
@@ -915,6 +936,7 @@ int kernel_open_file_readable(
     access_mode = kernel_open_file_flags(file) & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
@@ -1237,6 +1259,8 @@ uint32_t kernel_open_file_poll(
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_poll_requires_cpu0(file));
     if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_MQUEUE:
+        return kernel_mqueue_poll(file,requested_events,out_queue);
     case KERNEL_OPEN_FILE_KIND_PIDFD:
         return kernel_pidfd_poll(file,out_queue);
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:

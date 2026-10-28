@@ -9,6 +9,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include <kernel/task.h>
+#include <kernel/mqueue.h>
 
 #include <string.h>
 
@@ -123,6 +124,7 @@ enum kernel_files_status kernel_files_utimensat(
         if (flags) result = -KERNEL_EINVAL;
         else if (!(file = kernel_files_hold_fd(files, dirfd, &pin_guard))) result = -KERNEL_EBADF;
         else if (file->kind == KERNEL_OPEN_FILE_KIND_PATH) result = -KERNEL_EBADF;
+        else if (file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE) result=kernel_mqueue_set_times(file,user_times?times:0);
         else if (!file->file.private_data) result = -KERNEL_ENOTSUP;
         else result = kernel_vfs_file_set_times(&file->file, user_times ? times : 0);
     } else {
@@ -151,6 +153,7 @@ enum kernel_files_status kernel_files_fchmod(
         kernel_files_hold_fd(files, fd, &pin_guard);
     KERNEL_SERVICE_SCOPE_IF(service, description && description->kind == KERNEL_OPEN_FILE_KIND_PIPE);
     if (!description || description->kind == KERNEL_OPEN_FILE_KIND_PATH) *linux_result = -KERNEL_EBADF;
+    else if(description->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)*linux_result=kernel_mqueue_set_mode(description,mode);
     else if (description->kind == KERNEL_OPEN_FILE_KIND_PIPE && !description->file.private_data)
         *linux_result = kernel_pipe_set_mode(description->pipe, mode);
     else if (!description->file.private_data) *linux_result = -KERNEL_ENOTSUP;
@@ -186,6 +189,7 @@ enum kernel_files_status kernel_files_fchown(
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
     KERNEL_SERVICE_SCOPE_IF(service, file && file->kind == KERNEL_OPEN_FILE_KIND_PIPE);
     if (!file || file->kind == KERNEL_OPEN_FILE_KIND_PATH) *linux_result = -KERNEL_EBADF;
+    else if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)*linux_result=kernel_mqueue_set_owner(file,uid,gid);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
         *linux_result = kernel_pipe_set_owner(file->pipe, uid, gid);
     else if (!file->file.private_data) *linux_result = -KERNEL_ENOTSUP;
@@ -307,6 +311,13 @@ enum kernel_files_status kernel_files_fstatfs(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
     if (!file) { *linux_result = -KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
+    if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        struct kernel_linux_statfs stat;
+        int error=kernel_mqueue_statfs(file,&stat);if(error){*linux_result=error;return KERNEL_FILES_STATUS_OK;}
+        size_t copied;
+        *linux_result=kernel_copy_to_user(mm,user_buffer,&stat,sizeof(stat),&copied)?-KERNEL_EFAULT:0;
+        return KERNEL_FILES_STATUS_OK;
+    }
     return copy_statfs(mm, file->file.mount, user_buffer, linux_result);
 }
 

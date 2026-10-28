@@ -1,6 +1,7 @@
 #include <kernel/credentials.h>
 #include <kernel/scheduler.h>
 #include "private.h"
+#include <kernel/mqueue.h>
 
 #include <kernel/errno.h>
 #include <kernel/fs_context.h>
@@ -55,6 +56,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     int ext4 = !strcmp(type, "ext4");
     int disk = ext4 || !strcmp(type, "vfat");
     int devpts = !strcmp(type, "devpts");
+    int mqueue = !strcmp(type, "mqueue");
     enum kernel_heap_status allocation = kernel_heap_allocate(fs->heap,
         2U * KERNEL_FS_PATH_MAX, (void **)&target);
     if (allocation != KERNEL_HEAP_STATUS_OK)
@@ -78,7 +80,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
     if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT)) {result=-KERNEL_ENOTSUP;goto Finish;}
-    if(!tmpfs && !disk && !devpts && strcmp(type,"proc")) {result=-KERNEL_ENODEV;goto Finish;}
+    if(!tmpfs && !disk && !devpts && !mqueue && strcmp(type,"proc")) {result=-KERNEL_ENODEV;goto Finish;}
     if(!tmpfs && !devpts && options[0]) {result=-KERNEL_ENOTSUP;goto Finish;}
     if(disk) {
         if(!request->arguments[0]) {result=-KERNEL_EINVAL;goto Finish;}
@@ -101,6 +103,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     }
     result = disk ? kernel_vfs_disk_create(fs->heap, source_device, flags & LINUX_MS_RDONLY, source_name, type, &mounted)
            : devpts ? kernel_devpts_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
+           : mqueue ? kernel_mqueue_fs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted)
            : tmpfs ? kernel_tmpfs_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
                    : kernel_procfs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted);
     if (result) goto Finish;

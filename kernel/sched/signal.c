@@ -1242,6 +1242,61 @@ static struct kernel_task *timer_receiver_locked(struct kernel_pid *id,int threa
     if(thread&&actual&&signal_wants_signal_locked(actual,sig))*wake=actual;
     return actual;
 }
+/* 消息通知已经按队列权限登记；这里核对真实组与exec映像，不再次套用kill权限。 */
+void kernel_signal_mqueue_notify(struct kernel_pid *identity,struct kernel_exec_security *security,
+    int signo,uint64_t value,int32_t sender,uint32_t uid)
+{
+    if(!identity || signo<1 || signo>64)return;
+    unsigned sig=(unsigned)signo;
+    struct kernel_signal_wait_info info={.signal=sig,.code=-3,.sender=(uint32_t)sender,.uid=uid,.value=value};
+    struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
+    int prepared=0;
+    for(;;) {
+        SCHEDULER_TASK_BORROW(group,0);
+        SCHEDULER_TASK_BORROW(actual,0);
+        SCHEDULER_TASK_BORROW(wake,0);
+        struct kernel_heap *heap;
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_task *unused=0;
+            actual=timer_receiver_locked(identity,0,sig,&unused);
+            if(!actual || actual->exec_security!=security) {actual=0;return;}
+            group=actual->group_leader;
+            scheduler_task_get_locked(actual);scheduler_task_get_locked(group);
+            heap=actual->files.heap;
+        }
+        signal_prepare_group(actual,sig);
+        if(sig==SIGNAL_KILL) {
+            process_group_request_exit(actual,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return;
+        }
+        if(!prepared) {signal_pending_prepare(group,1,actual,heap,&info,1,&p);prepared=1;}
+        struct kernel_wait_cursor cursor={0};
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            if(!identity->members[KERNEL_PID_TGID] ||
+               identity->members[KERNEL_PID_TGID]->task!=group)return;
+            if(actual->proc_exiting || !signal_dispatchable_locked(actual) || actual->group_leader!=group)continue;
+            if(actual->exec_security!=security)return;
+            struct kernel_task *candidate=0;
+            (void)timer_receiver_locked(identity,0,sig,&candidate);
+            if(signal_ignored_unblocked(candidate,sig))return;
+            int posted=signal_pending_post_locked(group,1,actual,&info,1,&p);
+            if(posted)return;
+            struct kernel_signal_table *table=signal_table_of(actual);
+            if(table)(void)kernel_wait_cursor_prepare_event_locked(&table->signalfd_waiters,&cursor,signal_mask(sig),0);
+            if(candidate) {
+                scheduler_task_get_locked(candidate);wake=candidate;
+#if BOAROS_USER_SMP
+                scheduler_signal_request_locked(wake);
+#endif
+            }
+        }
+        if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
+        if(wake && wake!=kernel_task_current())(void)kernel_scheduler_wake_signal(wake);
+        return;
+    }
+}
+
 int signal_timer_disposition_ignored_locked(struct kernel_pid *id,int thread,unsigned sig)
 {
     struct kernel_task *wake=0,*actual=timer_receiver_locked(id,thread,sig,&wake);

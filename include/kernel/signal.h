@@ -6,6 +6,9 @@
 #include <stdint.h>
 
 struct kernel_task;
+struct kernel_exec_security;
+void kernel_signal_mqueue_notify(struct kernel_pid *,struct kernel_exec_security *,int,
+    uint64_t value,int32_t sender,uint32_t uid);
 
 /* These sends immediately change group stop/continue or exit state. Ordinary
  * pending publication uses the shared scheduler protection on any CPU. */

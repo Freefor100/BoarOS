@@ -38,6 +38,7 @@ struct kernel_memory_object;
 struct kernel_sem_undo;
 struct kernel_sem_request;
 struct kernel_msg_request;
+struct kernel_mqueue_request;
 struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
 struct kernel_futex_request;
@@ -261,6 +262,7 @@ struct kernel_task {
     /* 远端资源比较/FD读取的短访问；退出先发布离开，再等待原句柄读者。
      * FD槽由各表raw保护，FS发布由VFS状态保护，其余身份由调度域保护。 */
     struct kernel_raw_lock files_access;
+    struct kernel_mqueue_request *mqueue_request;
 } __attribute__((aligned(16)));
 
 #endif

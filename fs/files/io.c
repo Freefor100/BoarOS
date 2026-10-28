@@ -12,6 +12,7 @@
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/event_fd.h>
+#include <kernel/mqueue.h>
 #include <kernel/signal_fd.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -161,6 +162,24 @@ static enum kernel_files_status control_read(
 
 /* The backend builds a stable OFD snapshot before any user copy. A fault
  * advances only bytes copied, and seeking to zero starts a new snapshot. */
+static enum kernel_files_status mqueue_read_text(struct kernel_files *files,struct kernel_mm *mm,
+    struct kernel_open_file_description *file,const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,uint64_t count,uint64_t offset,int advance,int scalar,int64_t *result)
+{
+    if(!kernel_open_file_readable(file)){*result=-KERNEL_EBADF;return KERNEL_FILES_STATUS_OK;}
+    if(scalar&&(kernel_user_range_check(iov[0].base,(size_t)count)||scalar_empty_range_fault(iov[0].base,count))){
+        *result=-KERNEL_EFAULT;return KERNEL_FILES_STATUS_OK;
+    }
+    char buffer[128];size_t n=0,copied=0;
+    int error=kernel_mqueue_read(file,offset,buffer,count>sizeof(buffer)?sizeof(buffer):(size_t)count,&n);
+    if(error){*result=error;return KERNEL_FILES_STATUS_OK;}
+    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
+    enum kernel_uaccess_status access=kernel_copy_to_user_iov(mm,&cursor,buffer,n,&copied);
+    if(advance&&kernel_open_file_advance(file,copied))return KERNEL_FILES_STATUS_STATE;
+    *result=copied?(int64_t)copied:access?-KERNEL_EFAULT:0;
+    if(access)KERNEL_FILES_NOTE(files,read_failures,1);
+    KERNEL_FILES_NOTE(files,bytes_read,copied);return KERNEL_FILES_STATUS_OK;
+}
 static enum kernel_files_status generated_read(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -426,6 +445,11 @@ static enum kernel_files_status read_pinned(
         return status;
     }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        KERNEL_LOCK_SCOPE(guard);kernel_mutex_lock(&description->offset_lock,&guard);
+        return mqueue_read_text(files,mm,description,iov,iov_count,count,
+            kernel_open_file_offset(description),1,scalar,linux_result);
+    }
     if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
@@ -716,7 +740,7 @@ static enum kernel_files_status readv_request(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
         kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result = positioned && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PIDFD
@@ -799,6 +823,10 @@ static enum kernel_files_status pread_iov_pinned(
     struct kernel_open_file_description *description = *description_owner;
     /* pin覆盖本次请求；kind只在OFD发布前设置。 */
     const enum kernel_open_file_kind kind = description->kind;
+    if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        if(offset<0){*linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;}
+        return mqueue_read_text(files,mm,description,iov,iov_count,count,(uint64_t)offset,0,scalar,linux_result);
+    }
     if (description->block) {
         if (offset < 0) { *linux_result = -KERNEL_EINVAL; return KERNEL_FILES_STATUS_OK; }
         if (scalar && kernel_open_file_readable(description) &&
@@ -815,7 +843,7 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE && kind != KERNEL_OPEN_FILE_KIND_EVENTFD && kind != KERNEL_OPEN_FILE_KIND_TIMERFD && kind != KERNEL_OPEN_FILE_KIND_SIGNALFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE && kind != KERNEL_OPEN_FILE_KIND_EVENTFD && kind != KERNEL_OPEN_FILE_KIND_TIMERFD && kind != KERNEL_OPEN_FILE_KIND_SIGNALFD && kind != KERNEL_OPEN_FILE_KIND_MQUEUE);
     uint64_t position;
     uint64_t request;
     uint64_t file_size;
@@ -1652,6 +1680,10 @@ static enum kernel_files_status write_request(
     if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
         count, 1, positioned, requested_offset, linux_result);
     const enum kernel_open_file_kind kind = description->kind;
+    if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        *linux_result=kernel_open_file_writable(description)?-KERNEL_EINVAL:-KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
@@ -1753,6 +1785,11 @@ enum kernel_files_status kernel_files_write(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
+    if(description->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        *linux_result=kernel_open_file_writable(description)?-KERNEL_EINVAL:-KERNEL_EBADF;
+        account_write(files,*linux_result);
+        return release_io_description(files,&description,KERNEL_FILES_STATUS_OK);
+    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
         description->kind==KERNEL_OPEN_FILE_KIND_PIDFD ||
         description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD || description->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) {
@@ -1811,7 +1848,9 @@ enum kernel_files_status kernel_files_pwrite(
         return KERNEL_FILES_STATUS_OK;
     }
     kind = description->kind;
-    if (kind == KERNEL_OPEN_FILE_KIND_PIDFD)
+    if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE)
+        *linux_result=kernel_open_file_writable(description)?-KERNEL_EINVAL:-KERNEL_EBADF;
+    else if (kind == KERNEL_OPEN_FILE_KIND_PIDFD)
         *linux_result = -KERNEL_EINVAL;
     else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
         kind == KERNEL_OPEN_FILE_KIND_EVENTFD || kind == KERNEL_OPEN_FILE_KIND_TIMERFD || kind == KERNEL_OPEN_FILE_KIND_SIGNALFD ||
@@ -1870,7 +1909,12 @@ static enum kernel_files_status writev_request(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD);
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
+    if(description->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+        *linux_result=kernel_open_file_writable(description)?-KERNEL_EINVAL:-KERNEL_EBADF;
+        account_write(files,*linux_result);
+        return release_io_description(files,&description,KERNEL_FILES_STATUS_OK);
+    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
         description->kind==KERNEL_OPEN_FILE_KIND_PIDFD ||
         description->kind==KERNEL_OPEN_FILE_KIND_TIMERFD || description->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) {

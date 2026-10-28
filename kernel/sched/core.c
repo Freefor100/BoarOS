@@ -709,7 +709,7 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
     /* join、自动reaper及构造回滚共用可信清理点；不能只在join归还MM。 */
     if (thread && thread->bound_mm_context && thread->mm.state == KERNEL_MM_LIVE) {
         if (thread->files.state==KERNEL_FILES_LIVE &&
-            kernel_files_release(&thread->files)!=KERNEL_FILES_STATUS_OK) __builtin_trap();
+            kernel_files_release_for_task(&thread->files,thread)!=KERNEL_FILES_STATUS_OK) __builtin_trap();
         if (kernel_mm_release(&thread->mm) != KERNEL_MM_STATUS_OK) __builtin_trap();
         thread->bound_mm_context = 0;
     }
@@ -789,7 +789,7 @@ enum kernel_scheduler_status release_task_storage(
     if (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
         thread->wait.phase != KERNEL_WAIT_FINISHED) __builtin_trap();
     if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo ||
-        thread->msg_request) __builtin_trap();
+        thread->msg_request || thread->mqueue_request) __builtin_trap();
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);

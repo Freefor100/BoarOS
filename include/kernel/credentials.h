@@ -41,6 +41,7 @@ struct kernel_uid_account {
     uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by socket state lock. */
     uint64_t shm_locked_pages; /* SHM_LOCK quota, protected by kernel_wait_domain. */
     uint32_t uid;
+    uint64_t mqueue_bytes, pipe_pages; /* 创建者账户；仅创建、调整及最终释放计量。 */
 };
 struct kernel_credential_groups {
     struct kernel_heap *heap;
@@ -82,6 +83,11 @@ struct kernel_uid_account *kernel_uid_account_get_locked(struct kernel_uid_accou
 struct kernel_uid_account *kernel_uid_account_put_locked(struct kernel_uid_account *);
 void kernel_uid_account_release(struct kernel_uid_account *);
 void kernel_uid_account_put(struct kernel_uid_account *);
+/* A successful queue charge owns one account reference until uncharge. */
+int kernel_uid_account_mqueue_charge(struct kernel_uid_account *,uint64_t bytes,uint64_t limit);
+void kernel_uid_account_mqueue_uncharge(struct kernel_uid_account *,uint64_t bytes);
+/* Pipe already owns its creator account; returns usage after this delta. */
+uint64_t kernel_uid_account_pipe_pages(struct kernel_uid_account *,uint64_t old_pages,uint64_t new_pages);
 /* A successful charge owns one account reference until SHM_UNLOCK/destruction.
  * The limit is the current caller's MEMLOCK page allowance, independent of MM. */
 int kernel_uid_account_shm_lock(struct kernel_uid_account *,uint64_t pages,uint64_t limit);

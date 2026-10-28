@@ -1843,7 +1843,7 @@ static void unix_datagram_reconnect_receive(void)
     CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,2,1, NULL)==2 && !pin);
     CHECK(!kernel_socket_connect(a,&ca,1));
     CHECK(a->packets_head==read.packet && a->packets_tail==read.packet && !a->packets_head->next &&
-        a->unix_queued==1 && a->rx_bytes==4 && b->unix_packets==1 && b->unix_memory==unix_charge(4));
+        a->unix_queued==1 && a->rx_bytes==4 && b->unix_packets==1 && b->unix_memory==packet_charge(4));
     char bytes[2];kernel_socket_copy_read(&read,0,bytes,2);CHECK(!memcmp(bytes,"he",2));
     CHECK(kernel_socket_finish_read(&read,0)==2 && pin==(void *)a);
     CHECK(!a->rx_bytes && !a->unix_queued && !b->unix_packets && !b->unix_memory);

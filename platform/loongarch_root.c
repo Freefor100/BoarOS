@@ -17,6 +17,7 @@
 #include <kernel/shm.h>
 #include <kernel/sem.h>
 #include <kernel/msg.h>
+#include <kernel/mqueue.h>
 #include <kernel/errno.h>
 #include <kernel/virtio_pci_block.h>
 #include <kernel/virtio_pci_rng.h>
@@ -101,6 +102,8 @@ static int release_root(void)
         la_virt_puts(" console-dropped=");la_virt_hex(root.uart_statistics.console_dropped);la_virt_puts("\n");
     }
     /* TTY已排空并停止，设备统计不会插进用户最后一次write。 */
+    int mq_error=kernel_mqueue_shutdown();
+    if(mq_error && mq_error!=-KERNEL_EBUSY)return mq_error;
     int had_network=root.network!=0;
     int network_error=kernel_network_stop(&root.network);
     if(network_error)return network_error;
@@ -132,6 +135,7 @@ static int release_root(void)
         if(!error) error=kernel_vfs_unmount(&root.mount);
         if(error) return error;
     }
+    int mq_final=kernel_mqueue_shutdown();if(mq_final)return mq_final;
     if((root.cache.state==KERNEL_PAGE_CACHE_LIVE || root.cache.state==KERNEL_PAGE_CACHE_CLEANUP) &&
        kernel_page_cache_destroy(&root.cache)!=KERNEL_PAGE_CACHE_STATUS_OK) return -KERNEL_EIO;
     while(root.count) {
@@ -299,6 +303,7 @@ int la_root_boot(struct physical_page_allocator *allocator)
        kernel_exec_image_bind(allocator,&table) || kernel_shm_init(&root.heap,allocator)!=KERNEL_SHM_STATUS_OK ||
        kernel_sem_init(&root.heap) ||
        kernel_msg_init(&root.heap) ||
+       kernel_mqueue_init(&root.heap) ||
        !la_virt_irq_initialize()) la_virt_fatal("root environment");
     root.baseline=physical_page_available(allocator);
     if(kernel_thread_create(cleanup_worker,0)!=KERNEL_SCHEDULER_STATUS_OK) {

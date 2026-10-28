@@ -18,6 +18,15 @@ struct kernel_socket;
 struct kernel_wait_queue;
 struct kernel_task;
 struct kernel_open_file_description;
+struct kernel_netlink_cookie;
+
+/* mq_notify imports the 32-byte userspace cookie before preparing. Preparation
+ * may wait for receiver memory; successful ownership survives the socket FD.
+ * Send/cancel consume the owner outside the message-queue state lock. */
+int kernel_socket_mqueue_cookie_prepare(struct kernel_task *, int64_t fd,
+    const unsigned char cookie[32], struct kernel_netlink_cookie **owner);
+void kernel_socket_mqueue_cookie_send(struct kernel_netlink_cookie **owner, unsigned reason);
+void kernel_socket_mqueue_cookie_cancel(struct kernel_netlink_cookie **owner);
 
 /* Stack-live syscall reservation, registered on its task for forced-exit
  * cleanup before the task's OFD pin is released. */
@@ -70,6 +79,7 @@ int kernel_socket_is_seqpacket(const struct kernel_socket *socket);
 int kernel_socket_prepare_send(struct kernel_socket *socket);
 int kernel_socket_prepare_receive(struct kernel_socket *socket);
 int kernel_socket_is_unix(const struct kernel_socket *socket);
+int kernel_socket_is_netlink(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
@@ -104,10 +114,12 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 
 #define KERNEL_SOCKET_DOMAIN_INET 0U
 #define KERNEL_SOCKET_DOMAIN_UNIX 1U
+#define KERNEL_SOCKET_DOMAIN_NETLINK 2U
 
 #define KERNEL_SOCKET_AF_UNIX 1U
 #define KERNEL_SOCKET_AF_INET 2U
 #define KERNEL_SOCKET_AF_INET6 10U
+#define KERNEL_SOCKET_AF_NETLINK 16U
 
 /* 地址字节为网络序，端口为宿主序；Linux 布局只在 syscall 边界出现。 */
 struct kernel_socket_address {

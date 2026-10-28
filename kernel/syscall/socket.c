@@ -22,6 +22,7 @@
 #define LINUX_AF_UNIX 1
 #define LINUX_AF_INET 2
 #define LINUX_AF_INET6 10
+#define LINUX_AF_NETLINK 16
 #define LINUX_AF_MAX 46
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
@@ -158,6 +159,10 @@ static int parse_address(const union linux_sockaddr_storage *snapshot,
         __builtin_memcpy(address->bytes, snapshot->v6.address, 16);
         address->scope = snapshot->v6.scope;
         address->port = network_port(snapshot->v6.port);
+    } else if (family == LINUX_AF_NETLINK) {
+        if(length<12)return -KERNEL_EINVAL;
+        __builtin_memcpy(&address->scope,snapshot->bytes+4,4);
+        __builtin_memcpy(address->bytes,snapshot->bytes+8,4);
     } else if (family != 0 && !unix_socket) return -KERNEL_EAFNOSUPPORT;
     return 0;
 }
@@ -186,6 +191,11 @@ static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
         if (address->unix_length)
             __builtin_memcpy(local.bytes + sizeof(uint16_t),
                              address->unix_path, address->unix_length);
+    } else if (address->family == LINUX_AF_NETLINK) {
+        local.v4.family=LINUX_AF_NETLINK;
+        __builtin_memcpy(local.bytes+4,&address->scope,4);
+        __builtin_memcpy(local.bytes+8,address->bytes,4);
+        size=12;
     } else if (address->family == LINUX_AF_INET6) {
         local.v6.family = LINUX_AF_INET6;
         local.v6.port = network_port(address->port);
@@ -335,8 +345,12 @@ static int socket_creation_error(int family, int type, int protocol)
     if (base_type >= LINUX_SOCK_MAX) {
         return -KERNEL_EINVAL;
     }
-    if (family != LINUX_AF_UNIX && family != LINUX_AF_INET && family != LINUX_AF_INET6) {
+    if (family != LINUX_AF_UNIX && family != LINUX_AF_INET && family != LINUX_AF_INET6 && family != LINUX_AF_NETLINK) {
         return -KERNEL_EAFNOSUPPORT;
+    }
+    if(family==LINUX_AF_NETLINK) {
+        if(base_type!=LINUX_SOCK_RAW && base_type!=LINUX_SOCK_DGRAM)return -KERNEL_ESOCKTNOSUPPORT;
+        return protocol==0?0:-KERNEL_EPROTONOSUPPORT;
     }
     if (family == LINUX_AF_UNIX) {
         if (protocol != 0 && protocol != LINUX_AF_UNIX) {
@@ -501,6 +515,8 @@ enum kernel_syscall_status syscall_handle_socket_message(
         KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|KERNEL_SOCKET_MSG_PEEK);
     if (seqpacket)
         allowed |= writing?(KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE):KERNEL_SOCKET_MSG_WAITALL;
+    if(!writing && kernel_socket_is_netlink(socket))
+        allowed|=KERNEL_SOCKET_MSG_WAITALL|KERNEL_SOCKET_MSG_NOSIGNAL;
     enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
     size_t copied=0;
     struct kernel_socket_address address={0};
@@ -705,6 +721,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         data_call.message.flags=flags;
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK;
         if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
+        if (kernel_socket_is_netlink(socket))allowed|=KERNEL_SOCKET_MSG_WAITALL|KERNEL_SOCKET_MSG_NOSIGNAL;
         if (flags & ~allowed) {
             result=kernel_socket_prepare_receive(socket);
             if (!result) result=-KERNEL_EOPNOTSUPP;

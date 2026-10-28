@@ -64,7 +64,8 @@ core stop 遇到 CPU lease、RX loan 或未归还 TX owner 返回 EBUSY，reset 
 
 `SIOCGIFFLAGS/SIOCSIFFLAGS` 查询并控制 UP/DOWN；`SIOCGIFADDR/NETMASK/HWADDR/MTU/INDEX/NAME/CONF`
 输出实际接口快照，RV64 ifreq/ifconf 为 40/16 字节。快照不借用 netif 给用户复制；
-copy fault 不延长设备生命。地址、掩码、MTU setter、路由配置及 netlink 尚未实现。
+copy fault 不延长设备生命。地址、掩码、MTU setter、路由配置及普通 NETLINK_ROUTE
+消息尚未实现；AF_NETLINK 的消息队列通知接收见[网络端点模块](kernel-network.md)。
 loopback 的协议 MTU=0 表示无 L2 限制，其公开逻辑 MTU 为 Linux 的 65536。
 
 ## 验证与固定资料

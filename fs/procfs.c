@@ -6,6 +6,7 @@
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
 #include <kernel/open_file.h>
+#include <kernel/mqueue.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/procfs.h>
@@ -752,6 +753,10 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 proc_inode_identity(node->inode), proc_inode_fd(node->inode),
                 &pseudo);
             if (result) return result;
+            if(pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+                size_t n=strlen(pseudo.name);if(n>size)n=size;
+                memcpy(buffer,pseudo.name,n);*count=n;return 0;
+            }
             const char *prefix;
             size_t prefix_length;
             uint64_t identity = pseudo.object_identity;
@@ -808,10 +813,22 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
     }
     {
     KERNEL_FS_PATHS(paths, fs);
+    int mq_deleted=0;
+    if(kernel_mqueue_fs_is_mount(kernel_vfs_path_mount(path))){
+        struct kernel_vfs_stat stat;
+        if(!kernel_vfs_path_stat(path,&stat))mq_deleted=!stat.nlink;
+    }
     result = kernel_vfs_path_link_string(path, paths.root,
                                          text, KERNEL_FS_PATH_MAX);
     if (!result) {
         size_t length = strlen(text);
+        /* A shared mqueue name may be removed through a different mount or
+         * mq_unlink, independently of this mount-local cached path edge. */
+        if(mq_deleted&&(length<10||strcmp(text+length-10," (deleted)"))){
+            if(length+11>KERNEL_FS_PATH_MAX)result=-KERNEL_ENAMETOOLONG;
+            else{memcpy(text+length," (deleted)",11);length+=10;}
+        }
+        if(result){kernel_heap_release(node->instance->heap,text);goto Finish;}
         if (length > size) length = size;
         memcpy(buffer, text, length);
         *count = length;
@@ -843,7 +860,7 @@ static int proc_follow_link(struct kernel_vfs_node *node,
             &pseudo);
         if (result) return result;
         /* 无路径的管道由OFD重新打开；其展示文本不参与路径创建。 */
-        return pseudo.kind == KERNEL_OPEN_FILE_KIND_PIPE
+        return pseudo.kind == KERNEL_OPEN_FILE_KIND_PIPE || pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE
             ? -KERNEL_ENOENT : -KERNEL_ENXIO;
     }
     if (!path_kind) return -KERNEL_ENOTSUP;

@@ -73,7 +73,7 @@ struct kernel_uid_account *kernel_uid_account_put_locked(struct kernel_uid_accou
     if(!a->heap)return 0;
     if(!a->references)__builtin_trap();
     if(--a->references)return 0;
-    if(!a->heap||a->pending||a->processes||a->shm_locked_pages)__builtin_trap();
+    if(!a->heap||a->pending||a->processes||a->shm_locked_pages||a->mqueue_bytes||a->pipe_pages)__builtin_trap();
     struct kernel_uid_account **p=&accounts[a->uid%ACCOUNT_BUCKETS];
     while(*p&&*p!=a)p=&(*p)->next;
     if(!*p)__builtin_trap();
@@ -107,6 +107,31 @@ void kernel_uid_account_shm_unlock(struct kernel_uid_account *account,uint64_t p
         account=kernel_uid_account_put_locked(account);
     }
     kernel_uid_account_release(account);
+}
+int kernel_uid_account_mqueue_charge(struct kernel_uid_account *account,uint64_t bytes,uint64_t limit)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if(!account || !account->references)__builtin_trap();
+    if(bytes>limit || account->mqueue_bytes>limit-bytes)return -KERNEL_EMFILE;
+    kernel_uid_account_get_locked(account);account->mqueue_bytes+=bytes;
+    return 0;
+}
+void kernel_uid_account_mqueue_uncharge(struct kernel_uid_account *account,uint64_t bytes)
+{
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(!account || account->mqueue_bytes<bytes)__builtin_trap();
+        account->mqueue_bytes-=bytes;account=kernel_uid_account_put_locked(account);
+    }
+    kernel_uid_account_release(account);
+}
+uint64_t kernel_uid_account_pipe_pages(struct kernel_uid_account *account,uint64_t old_pages,uint64_t new_pages)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if(!account || !account->references || account->pipe_pages<old_pages ||
+        new_pages>UINT64_MAX-(account->pipe_pages-old_pages))__builtin_trap();
+    account->pipe_pages=account->pipe_pages-old_pages+new_pages;
+    return account->pipe_pages;
 }
 struct kernel_uid_account *kernel_uid_account_get(struct kernel_heap *heap,uint32_t uid)
 {
