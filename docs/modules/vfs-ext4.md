@@ -392,12 +392,15 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 
 ## 当前成本边界
 
-增长与缩小通过 `kernel_page_cache_resize_prepare/finish` 管理非对齐 EOF 尾页，缩小另由 `kernel_page_cache_truncate` 退休整页。
-增长只查询旧 EOF 的非对齐尾页，清零新暴露字节并重新保护别名，再发布长度；
+截断和空洞扩展通过 `kernel_page_cache_resize_prepare/finish` 管理非对齐 EOF 尾页，缩小另由 `kernel_page_cache_truncate` 退休整页。
+普通写入从旧 EOF 或其前方开始时，实际复制覆盖全部新字节，复用普通页写借用；
+它不关闭尾页、不重新保护 mmap 别名，也不等待同页范围外的 mmap 写借用。
+从旧 EOF 后开始的写入只关闭旧 EOF 的非对齐尾页，清零旧 EOF 至本次写入起点的空洞，再发布长度；
 页对齐或同长度不访问 inode 页链，也不排空历史 cleanup。真正缩小仍在撤映射后
 处理越界页、尾页脏范围和 owner。该优化不改变私有 COW 副本，哈希探测与尾页
 实际别名工作单独计量。`make test-cache-growth-riscv` 在 COST 构建检查
 1/4/16/64 MiB × 1/4/64 KiB 写入的增长访问界及全文件内容，见[规模成本](../learning/single-hart-scale.md)。
+`sh tests/page-cache-concurrency-host.sh append-snapshot` 检查同页 mmap 写借用期间的连续追加及覆盖越过 EOF、保留旧稳定版本、新尺寸、再次同步后的内容和最终资源归还。
 
 截断后端修改映射后，VFS 保持同一次 inode 写保护，发布实际 EOF、退休越界缓存页并完成尾页处理；不能先解锁再更新缓存，否则排队的写回仍会按旧 EOF 重建已删除的映射，扩展时读出旧内容。后端部分修改后报错时，也先发布实际尺寸与退休整页，再释放保护重取对应尾页资格；无变化失败保留原脏数据。`sh tests/page-cache-concurrency-host.sh truncate` 用明确握手让旧尾页写回排在后端截断之后，检查截零、部分截断及部分修改后 EIO 的前缀保留、扩展补零、资源归还和 `e2fsck -fn`，覆盖 4/16 KiB 页和 1/4 KiB 文件系统块。
 

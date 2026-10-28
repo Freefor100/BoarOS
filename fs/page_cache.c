@@ -2564,13 +2564,15 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
             }
             return 0;
         }
-        if (offset+count>old_size) {
-            int error=kernel_page_cache_resize_prepare(cache,node,old_size,offset+count,&resize);
+        /* 连续写覆盖全部新字节，普通写借用已隔离稳定快照；只有空洞需要
+         * 关闭旧EOF页并撤销别名写权限，清零旧EOF到本次起点之间的范围。 */
+        if (offset>old_size) {
+            int error=kernel_page_cache_resize_prepare(cache,node,old_size,offset,&resize);
             if (error==-KERNEL_EBUSY && source->mm) {
                 /* 有MM编辑正在排空本次读pin：先归还，再等待别名撤权。
                  * 之后只重取现有pin；若映射已变，开放目标后再做真正缺页。 */
                 kernel_mm_unpin_user_page(&pin);
-                error=kernel_page_cache_resize_prepare(cache,node,old_size,offset+count,&resize);
+                error=kernel_page_cache_resize_prepare(cache,node,old_size,offset,&resize);
                 if (!error) {
                     uint64_t user=source->user.iov[source->user.index].base+source->user.offset;
                     enum kernel_mm_status pinned=kernel_mm_pin_user_page(source->mm,user,KERNEL_MM_READ,&pin);

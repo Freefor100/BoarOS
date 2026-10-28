@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|read-batch|truncate|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|mremap) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|read-batch|truncate|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|mremap]' >&2; exit 2;; esac
+case "${1:-all}" in all|read-batch|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|mremap) ;; *) echo 'usage: page-cache-concurrency-host.sh [all|read-batch|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|mremap]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -30,7 +30,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
             e2fsck -fn "$image" > "$build_dir/fsck-indexed-reclaim-$shift-$block.log" 2>&1
             continue
         fi
-        if [ "${1:-all}" = read-batch ] || [ "${1:-all}" = dirty-age ] || [ "${1:-all}" = progress-owners ] || [ "${1:-all}" = version-pool ]; then
+        if [ "${1:-all}" = read-batch ] || [ "${1:-all}" = dirty-age ] || [ "${1:-all}" = progress-owners ] || [ "${1:-all}" = version-pool ] || [ "${1:-all}" = append-snapshot ]; then
             image="$build_dir/$1-$shift-$block.img"
             truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"
             timeout 20s "$build_dir/concurrency-$shift" "$image" "$1"
