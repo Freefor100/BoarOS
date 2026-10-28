@@ -378,21 +378,18 @@ static void request_release(struct kernel_mqueue_request *r)
     notification_finish(&r->outgoing,r->outgoing_reason,r->sender_tgid,r->sender_uid);
     message_free(r->message);mq_free(r->priority);
     if(r->file && kernel_open_file_release(&r->file))__builtin_trap();
-    mq_free(r);
 }
 static void request_finish(struct kernel_mqueue_request *r)
 {
     if(r->task->mqueue_request!=r)__builtin_trap();
     r->task->mqueue_request=0;request_release(r);
 }
-static struct kernel_mqueue_request *request_allocate(struct kernel_task *task,int sending,int *error)
+static void request_begin(struct kernel_task *task,int sending,struct kernel_mqueue_request *r)
 {
-    struct kernel_mqueue_request *r=mq_allocate(sizeof(*r));
-    if(!r){*error=-KERNEL_ENOMEM;return 0;}
-    r->task=task;r->sending=sending;
+    *r=(struct kernel_mqueue_request){.task=task,.sending=sending};
+    /* Exit aborts this request before releasing the stopped task's stack. */
     if(task->mqueue_request)__builtin_trap();
     task->mqueue_request=r;
-    return r;
 }
 static int request_pin(struct kernel_mqueue_request *r,int64_t fd)
 {
@@ -406,10 +403,9 @@ static int request_pin(struct kernel_mqueue_request *r,int64_t fd)
     r->queue=file_queue(r->file);return 0;
 }
 static struct kernel_mqueue_request *request_create(struct kernel_task *task,
-    int64_t fd,int sending,int *error)
+    int64_t fd,int sending,int *error,struct kernel_mqueue_request *r)
 {
-    struct kernel_mqueue_request *r=request_allocate(task,sending,error);
-    if(!r)return 0;
+    request_begin(task,sending,r);
     *error=request_pin(r,fd);
     if(*error){request_finish(r);return 0;}
     return r;
@@ -535,7 +531,8 @@ int64_t kernel_mqueue_send(struct kernel_task *task,struct kernel_mm *mm,int64_t
 {
     uint64_t deadline;int error=import_timeout(mm,abstime,&deadline);if(error)return error;
     if(priority>=MQ_PRIO_MAX)return -KERNEL_EINVAL;
-    struct kernel_mqueue_request *r=request_create(task,fd,1,&error);if(!r)return error;
+    struct kernel_mqueue_request storage;
+    struct kernel_mqueue_request *r=request_create(task,fd,1,&error,&storage);if(!r)return error;
     if((r->file->open_flags&3U)!=1&&(r->file->open_flags&3U)!=2){error=-KERNEL_EBADF;goto done;}
     if(size>r->queue->msgsize){error=-KERNEL_EMSGSIZE;goto done;}
     r->deadline=deadline;error=message_import(r,mm,data,size,priority);if(error)goto done;
@@ -573,7 +570,8 @@ int64_t kernel_mqueue_receive(struct kernel_task *task,struct kernel_mm *mm,int6
     uint64_t data,uint64_t size,uint64_t priority,uint64_t abstime)
 {
     uint64_t deadline;int error=import_timeout(mm,abstime,&deadline);if(error)return error;
-    struct kernel_mqueue_request *r=request_create(task,fd,0,&error);if(!r)return error;
+    struct kernel_mqueue_request storage;
+    struct kernel_mqueue_request *r=request_create(task,fd,0,&error,&storage);if(!r)return error;
     if((r->file->open_flags&3U)!=0&&(r->file->open_flags&3U)!=2){error=-KERNEL_EBADF;goto done;}
     if(size<r->queue->msgsize){error=-KERNEL_EMSGSIZE;goto done;}
     r->deadline=deadline;
@@ -616,8 +614,8 @@ int64_t kernel_mqueue_notify(struct kernel_task *task,struct kernel_mm *mm,int64
             if(kernel_copy_from_user(mm,cookie,event.value,sizeof(cookie),&copied))return -KERNEL_EFAULT;
         }
     }
-    int error;struct kernel_mqueue_request *r=request_allocate(task,0,&error);
-    if(!r)return error;
+    int error;struct kernel_mqueue_request storage,*r=&storage;
+    request_begin(task,0,r);
     if(address){
         r->pending.type=event.type;r->pending.signal=event.signo;r->pending.value=event.value;
         if(event.type==2){
@@ -666,7 +664,8 @@ int64_t kernel_mqueue_getsetattr(struct kernel_task *task,struct kernel_mm *mm,i
         if(kernel_copy_from_user(mm,&new_attr,new_address,sizeof(new_attr),&copied))return -KERNEL_EFAULT;
         if(new_attr.flags&~MQ_NONBLOCK)return -KERNEL_EINVAL;
     }
-    int error;struct kernel_mqueue_request *r=request_create(task,fd,0,&error);if(!r)return error;
+    int error;struct kernel_mqueue_request storage;
+    struct kernel_mqueue_request *r=request_create(task,fd,0,&error,&storage);if(!r)return error;
     {KERNEL_RAW_SCOPE(g,&r->queue->lock);
      old_attr.flags=__atomic_load_n(&r->file->open_flags,__ATOMIC_RELAXED)&MQ_NONBLOCK;
      old_attr.maxmsg=(int64_t)r->queue->maxmsg;old_attr.msgsize=(int64_t)r->queue->msgsize;old_attr.curmsgs=(int64_t)r->queue->count;
