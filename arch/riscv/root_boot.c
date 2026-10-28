@@ -17,6 +17,7 @@
 #include <kernel/shm.h>
 #include <kernel/sem.h>
 #include <kernel/msg.h>
+#include <kernel/mqueue.h>
 #include <kernel/errno.h>
 
 #include <stddef.h>
@@ -296,6 +297,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
     }
     if (kernel_sem_init(&root->heap)) return RISCV_ROOT_BOOT_STATUS_HEAP;
     if (kernel_msg_init(&root->heap)) return RISCV_ROOT_BOOT_STATUS_HEAP;
+    if (kernel_mqueue_init(&root->heap)) return RISCV_ROOT_BOOT_STATUS_HEAP;
     if (riscv_exec_init(allocator, kernel_table) !=
         RISCV_EXEC_STATUS_OK) {
         return RISCV_ROOT_BOOT_STATUS_INIT;
@@ -588,6 +590,11 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         root->finish_error = error;
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
+    error=kernel_mqueue_shutdown();
+    if(error && error!=-KERNEL_EBUSY) {
+        root->finish_failure=RISCV_ROOT_FINISH_UNMOUNT;root->finish_error=error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     int had_network = root->network != 0;
     error = stop_network(root);
     if (error) {
@@ -638,6 +645,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         root->finish_error = error;
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
+    error=kernel_mqueue_shutdown();
+    if(error) {root->finish_failure=RISCV_ROOT_FINISH_UNMOUNT;root->finish_error=error;return RISCV_ROOT_BOOT_STATUS_CLEANUP;}
     error = (int)kernel_page_cache_destroy(&root->page_cache);
     if (error != KERNEL_PAGE_CACHE_STATUS_OK) {
         root->finish_failure = RISCV_ROOT_FINISH_PAGE_CACHE;

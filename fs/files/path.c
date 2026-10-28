@@ -12,6 +12,7 @@
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
+#include <kernel/mqueue.h>
 #include <kernel/page.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -302,6 +303,13 @@ enum kernel_files_status kernel_files_openat(
      * before publishing this description or opening a device/FIFO. */
     if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) {
         description->kind = KERNEL_OPEN_FILE_KIND_DIRECTORY;
+    } else if(kernel_mqueue_fs_is_mount(description->file.mount)) {
+        struct kernel_open_file_description *mq=0;
+        int error=kernel_mqueue_fs_open(files->heap,&description->file,(uint32_t)flags,&mq);
+        if(!error)description->vfs_closed=1;
+        if(kernel_open_file_release(&description))__builtin_trap();
+        if(error){KERNEL_FILES_NOTE(files,open_failures,1);*linux_result=error;return KERNEL_FILES_STATUS_OK;}
+        description=mq;
     } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                KERNEL_VFS_S_IFREG) {
         uint64_t access_mode = flags & LINUX_O_ACCMODE;

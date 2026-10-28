@@ -12,6 +12,7 @@
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/msg.h>
+#include <kernel/mqueue.h>
 #include <kernel/tick.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -675,7 +676,7 @@ static int release_clone_resources(struct kernel_task *thread)
 
     if (thread->files.state == KERNEL_FILES_LIVE ||
         thread->files.state == KERNEL_FILES_CLEANUP) {
-        if (kernel_files_release(&thread->files) !=
+        if (kernel_files_release_for_task(&thread->files,thread) !=
             KERNEL_FILES_STATUS_OK) {
             cleanup_failed = 1;
         }
@@ -1639,6 +1640,7 @@ static void cleanup_task_io_requests(struct kernel_task *thread)
     if(thread->pi_request)kernel_futex_pi_abort(thread);
     kernel_futex_abort(thread);
     kernel_posix_cpu_sleep_abort(thread);
+    kernel_mqueue_abort(thread);
     kernel_msg_abort(thread);
     kernel_sem_abort(thread);
     if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
@@ -1910,7 +1912,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     }
     if (thread->files.state == KERNEL_FILES_LIVE ||
         thread->files.state == KERNEL_FILES_CLEANUP) {
-        files_status = kernel_files_release(&thread->files);
+        files_status = kernel_files_release_for_task(&thread->files,thread);
         if (files_status != KERNEL_FILES_STATUS_OK) {
             return files_status == KERNEL_FILES_STATUS_CLEANUP_REQUIRED
                        ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP

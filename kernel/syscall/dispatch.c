@@ -302,6 +302,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number>=180U && request->number<=185U) {
+        if (syscall_handle_mqueue(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number>=186U && request->number<=189U) {
         if (syscall_handle_msg(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

@@ -9,6 +9,7 @@
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
 #include <kernel/pidfd.h>
+#include <kernel/mqueue.h>
 #include "../../fs/open_file_internal.h"
 #include <kernel/fs_context.h>
 #include <kernel/task.h>
@@ -489,7 +490,8 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
     if (file && !kernel_open_file_path(file)) {
         snapshot->kind = (uint8_t)kernel_open_file_kind(file);
         snapshot->object_identity = kernel_open_file_pseudo_identity(file);
-        result = 0;
+        result = snapshot->kind==KERNEL_OPEN_FILE_KIND_MQUEUE
+            ?kernel_mqueue_name(file,snapshot->name,sizeof(snapshot->name)):0;
     }
     return result;
 }
@@ -573,6 +575,8 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     int result = file ? -KERNEL_ENXIO : -KERNEL_ENOENT;
     /* 解锁后 fd 可关闭；先钉住 pipe endpoint 再分配新 OFD。 */
     if (file && kernel_open_file_path(file)) result = -KERNEL_ENOTSUP;
+    else if(file && kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_MQUEUE)
+        return kernel_mqueue_reopen(file,heap,flags,owner);
     else if (file &&
              kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_PIPE)
         result = kernel_open_file_pipe_pin(file, flags, &pin);

@@ -14,6 +14,15 @@ struct kernel_heap;
 struct physical_page_allocator;
 struct kernel_mm;
 struct kernel_uaccess_iovec;
+struct kernel_uid_account;
+
+struct kernel_pipe_buffer {
+    unsigned char *page;
+    uint16_t offset, length;
+    uint8_t can_merge;
+};
+#define KERNEL_PIPE_INLINE_SLOTS 16U
+#define KERNEL_PIPE_NO_SLOT UINT32_MAX
 
 /* Shared pipe endpoint and ring ownership. */
 struct kernel_pipe {
@@ -23,13 +32,10 @@ struct kernel_pipe {
     uint32_t uid, gid;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct physical_page_allocator *allocator;
-    unsigned char *pages[16];
-    uint16_t head;
-    uint16_t tail;
-    uint16_t slots;
-    uint16_t page_offset[16];
-    uint16_t page_length[16];
-    uint16_t can_merge;
+    struct kernel_pipe_buffer *buffers;
+    struct kernel_pipe_buffer inline_buffers[KERNEL_PIPE_INLINE_SLOTS];
+    struct kernel_uid_account *account; /* 创建者真实UID；改权和传递OFD不转移额度。 */
+    uint32_t head, tail, slots, ring_size;
     uint64_t bytes;
     struct kernel_vfs_node *fifo_node; /* 弱关联；每个owner另持节点引用。 */
     uint32_t owners;
@@ -39,7 +45,7 @@ struct kernel_pipe {
     struct kernel_wait_queue read_queue;
     struct kernel_wait_queue write_queue;
     struct kernel_wait_queue both_queue;
-    uint16_t read_slot, merge_slot;
+    uint32_t read_slot, merge_slot;
     struct kernel_mutex read_lock, write_lock;
     struct kernel_raw_lock metadata_lock;
 };
@@ -48,8 +54,11 @@ struct kernel_pipe {
 #define KERNEL_PIPE_ENDPOINT_WRITE 2U
 #define KERNEL_PIPE_ENDPOINT_BOTH 3U
 #define KERNEL_PIPE_NONBLOCK UINT32_C(00004000)
-#define KERNEL_PIPE_CAPACITY (UINT64_C(16) * BOAROS_PAGE_SIZE)
+#define KERNEL_PIPE_DEFAULT_CAPACITY ((uint64_t)KERNEL_PIPE_INLINE_SLOTS * BOAROS_PAGE_SIZE)
 #define KERNEL_PIPE_ATOMIC_WRITE UINT64_C(4096)
+
+/* 调用者持有端点/OFD引用；resize可等待已有用户复制资格。 */
+int64_t kernel_pipe_capacity(struct kernel_pipe *,int command,uint64_t argument);
 
 enum kernel_pipe_status {
     KERNEL_PIPE_STATUS_OK = 0,

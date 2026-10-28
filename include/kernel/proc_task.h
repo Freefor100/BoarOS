@@ -92,6 +92,7 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
 struct kernel_proc_fd_pseudo {
     uint64_t object_identity;
     uint8_t kind;
+    char name[267]; /* mqueue hidden-root link, including optional deleted suffix. */
 };
 struct kernel_proc_fdinfo {
     uint64_t position, flags, mount_id, inode;

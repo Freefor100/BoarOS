@@ -36,12 +36,13 @@ def writable_root_path(record):
 
 
 class FrozenFixture:
-    def __init__(self, directory, case, elf_sha256):
-        if case not in ('allocator', 'latency', 'locking', 'scheduler', 'metadata'):
+    def __init__(self, directory, case, elf_sha256, configuration=None):
+        if case not in ('allocator', 'latency', 'locking', 'scheduler', 'metadata', 'ipc-fds'):
             raise ValueError('unsupported frozen fixture case')
         self.directory = Path(directory) / case
         self.case = case
         self.elf_sha256 = elf_sha256
+        self.configuration = configuration
         self.sha256 = None
 
     @staticmethod
@@ -57,6 +58,7 @@ class FrozenFixture:
             record = json.loads((self.directory / 'input.json').read_text())
             valid = (record['version'] == 1 and record['case'] == self.case and
                      record['elf_sha256'] == self.elf_sha256 and
+                     record.get('configuration') == self.configuration and
                      image.stat().st_size == record['bytes'] and
                      self.digest(image) == record['fixture_sha256'])
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -78,6 +80,8 @@ class FrozenFixture:
             shutil.copyfile(source, image)
             record = dict(version=1, case=self.case, elf_sha256=self.elf_sha256,
                           bytes=image.stat().st_size, fixture_sha256=self.digest(image))
+            if self.configuration is not None:
+                record['configuration'] = self.configuration
             manifest = staging / 'input.json'
             manifest.write_text(json.dumps(record, sort_keys=True) + '\n')
             image.chmod(0o444); manifest.chmod(0o444)

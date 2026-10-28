@@ -335,6 +335,7 @@ COMMON_C_SOURCES := \
 	fs/files/poll.c \
 	fs/files/epoll.c \
 	fs/event_fd.c \
+	fs/mqueue.c \
 	fs/signal_fd.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
@@ -401,6 +402,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/sem.c \
 	kernel/syscall/msg.c \
+	kernel/syscall/mqueue.c \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
@@ -423,6 +425,7 @@ COMMON_C_SOURCES := \
 	mm/shm.c \
 	kernel/sem.c \
 	kernel/msg.c \
+	kernel/mqueue.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)
@@ -2474,6 +2477,13 @@ test-ext4-node-resource-host:
 
 test-files-concurrency-host:
 	sh tests/files-concurrency-host.sh
+
+.PHONY: test-mqueue-host test-netlink-notify-host
+test-mqueue-host:
+	sh tests/host/mqueue.sh
+
+test-netlink-notify-host:
+	sh tests/netlink-notify-host.sh
 
 .PHONY: test-pipe-concurrency-host
 test-pipe-concurrency-host:

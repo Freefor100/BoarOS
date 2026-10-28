@@ -526,6 +526,8 @@ void kernel_files_get_statistics(
 
 enum kernel_files_status kernel_files_release(
     struct kernel_files *files);
+/* Reaper/construction rollback closes slots on behalf of this actual task. */
+enum kernel_files_status kernel_files_release_for_task(struct kernel_files *,struct kernel_task *);
 
 enum kernel_files_status kernel_files_drain_file_cleanup(
     struct kernel_files *files);

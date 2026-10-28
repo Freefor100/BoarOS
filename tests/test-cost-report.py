@@ -176,6 +176,21 @@ class CostFixtureTest(unittest.TestCase):
             root=Path(temporary);(root/'cache/latency').mkdir(parents=True)
             with self.assertRaises(ValueError):FrozenFixture(root/'cache','latency','elf').load()
 
+    def test_ipc_fixture_keeps_configuration_identity(self):
+        from cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'root.img';source.write_bytes(b'fixed IPC workload')
+            config={'arch':'riscv','cpus':4,'memory':'512M','mode':'all','profile':'formal'}
+            cache=FrozenFixture(root/'cache','ipc-fds','elf',configuration=config)
+            cache.publish(source)
+            self.assertEqual(cache.load().read_bytes(),b'fixed IPC workload')
+            for field,value in [('arch','loongarch'),('cpus',1),('memory','1G'),('mode','legacy'),('profile','smoke')]:
+                with self.assertRaises(ValueError):
+                    FrozenFixture(root/'cache','ipc-fds','elf',configuration={**config,field:value}).load()
+            self.assertEqual(source.read_bytes(),b'fixed IPC workload')
+
 class CostSeedTest(unittest.TestCase):
     def test_replica_inputs_pair_across_kernel_and_observation_modes(self):
         from cost_seed import replica_seed, seed_arguments

@@ -144,12 +144,26 @@ void kernel_vfs_creation_identity(uint32_t parent_mode,uint32_t parent_gid,
 static int directory_mutation_allowed(struct kernel_vfs_path *parent,struct kernel_vfs_path *target)
 {
     struct kernel_vfs_node *dir=parent->file.private_data;
-    /* Parent namespace qualification also excludes chmod/chown publication. */
-    int result=kernel_vfs_dac_permission(dir->mode,dir->uid,dir->gid,3U,kernel_credentials_current());
+    /* A backend permission callback can own metadata shared by several mount
+     * views. Its current state, rather than this node's cache, decides access.
+     * The operation already holds namespace/target qualifications; acquiring
+     * the parent I/O lock here would reverse the inode lock order. */
+    int result=dir->instance->ops->permission?dir->instance->ops->permission(dir,kernel_credentials_current(),3U):
+        kernel_vfs_dac_permission(dir->mode,dir->uid,dir->gid,3U,kernel_credentials_current());
     if (result || !target) return result;
     const struct kernel_credentials *cred=kernel_credentials_current();
     struct kernel_vfs_node *node=target->file.private_data;
-    if ((dir->mode & 01000U) && cred->fsuid!=dir->uid && cred->fsuid!=node->uid &&
+    uint32_t parent_mode=dir->mode,parent_uid=dir->uid,target_uid=node->uid;
+    struct kernel_vfs_stat stat;
+    if(dir->instance->ops->permission){
+        result=dir->instance->ops->stat(&parent->file,&stat);if(result)return result;
+        parent_mode=stat.mode;parent_uid=stat.uid;
+    }
+    if(node->instance->ops->permission){
+        result=node->instance->ops->stat(&target->file,&stat);if(result)return result;
+        target_uid=stat.uid;
+    }
+    if ((parent_mode & 01000U) && cred->fsuid!=parent_uid && cred->fsuid!=target_uid &&
         !kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return -KERNEL_EPERM;
     return 0;
 }

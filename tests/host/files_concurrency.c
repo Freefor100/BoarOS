@@ -221,7 +221,7 @@ static void regular_file_domain(struct kernel_heap *heap)
     puts("PASS regular FD domain, cross-CPU dup/close, CPU0 final backend owner");
 }
 static unsigned allocated[4][192], group_ready, group_release;
-static _Thread_local unsigned fail_growth;
+static _Thread_local unsigned fail_growth,fail_next_allocation;
 static unsigned maximum_copy, metadata_acquisitions;
 void *__real_memcpy(void *,const void *,size_t);
 void *__wrap_memcpy(void *dst,const void *src,size_t length)
@@ -246,6 +246,7 @@ enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,size_t count,size_t size,void **owner)
 {
     assert(!kernel_cpu_current()->raw_locks && "FD candidate allocation under raw protection");
+    if(fail_next_allocation) { fail_next_allocation=0;return KERNEL_HEAP_STATUS_EMPTY; }
     if (fail_growth && size==sizeof(struct kernel_file_slot) && count>32) {
         fail_growth=0; return KERNEL_HEAP_STATUS_EMPTY;
     }

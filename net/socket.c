@@ -11,6 +11,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
+#include <kernel/files.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
@@ -40,6 +41,8 @@
 #define SOCKET_DGRAM 2
 #define SOCKET_STREAM 1
 #define SOCKET_SEQPACKET 5
+#define SOCKET_RAW 3
+#define NETLINK_COOKIE_SIZE 32U
 #define UDP_MAX_PAYLOAD 65507U
 #define SOCKET_WRITE_RETRY_MS 250U
 
@@ -134,13 +137,26 @@ struct kernel_socket {
     struct kernel_socket *gc_next, *gc_work;
     uint32_t gc_inflight;
     unsigned gc_mark, passcred;
+    uint32_t netlink_references, netlink_memory;
+};
+
+/* Registration can outlive its FD. Its independent endpoint reference permits
+ * close to revoke the queue and wake quota waiters without waiting for a pin. */
+struct kernel_netlink_cookie {
+    struct kernel_heap *heap;
+    struct kernel_socket *socket;
+    struct kernel_open_file_description *pin;
+    struct socket_packet *packet;
+    struct kernel_wait_token token;
+    unsigned reserved;
 };
 
 /* Connection lifetime and record boundaries are independent properties. */
 static int socket_connection_oriented(const struct kernel_socket *socket)
 { return socket->type == SOCKET_STREAM || socket->type == SOCKET_SEQPACKET; }
 int kernel_socket_preserves_messages(const struct kernel_socket *socket)
-{ return socket && (socket->type == SOCKET_DGRAM || socket->type == SOCKET_SEQPACKET); }
+{ return socket && (socket->type == SOCKET_DGRAM || socket->type == SOCKET_SEQPACKET ||
+                    socket->domain == KERNEL_SOCKET_DOMAIN_NETLINK); }
 int kernel_socket_is_stream(const struct kernel_socket *socket)
 { return socket && socket->type == SOCKET_STREAM; }
 int kernel_socket_is_seqpacket(const struct kernel_socket *socket)
@@ -751,6 +767,8 @@ void kernel_socket_address_release(struct kernel_socket_address *address)
 }
 int kernel_socket_is_unix(const struct kernel_socket *socket)
 { return socket && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX; }
+int kernel_socket_is_netlink(const struct kernel_socket *socket)
+{ return socket && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK; }
 static void unix_export_locked(struct kernel_socket_name *name,struct kernel_socket_address *address)
 {
     *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_UNIX};
@@ -988,7 +1006,7 @@ static void unix_uncharge(struct socket_packet *packet)
     socket_state_release(&irq);
     if(sender)unix_storage_free(sender);
 }
-static uint32_t unix_charge(uint32_t size)
+static uint32_t packet_charge(uint32_t size)
 { return (uint32_t)sizeof(struct socket_packet)+size; }
 static void unix_publish_owner(struct kernel_socket *sender,struct socket_packet *packet,uint32_t charge)
 {
@@ -1349,8 +1367,11 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
 
     if (heap == 0 || owner == 0 || *owner != 0 ||
         (type != SOCKET_DGRAM && type != SOCKET_STREAM &&
+         !(type == SOCKET_RAW && family == KERNEL_SOCKET_AF_NETLINK) &&
          !(type == SOCKET_SEQPACKET && family == KERNEL_SOCKET_AF_UNIX)) ||
-        (family != KERNEL_SOCKET_AF_UNIX && family != KERNEL_SOCKET_AF_INET && family != KERNEL_SOCKET_AF_INET6)) {
+        (family == KERNEL_SOCKET_AF_NETLINK && type != SOCKET_RAW && type != SOCKET_DGRAM) ||
+        (family != KERNEL_SOCKET_AF_UNIX && family != KERNEL_SOCKET_AF_INET &&
+         family != KERNEL_SOCKET_AF_INET6 && family != KERNEL_SOCKET_AF_NETLINK)) {
         return -KERNEL_EINVAL;
     }
     enum kernel_heap_status status =
@@ -1361,6 +1382,13 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
     }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     if(family==KERNEL_SOCKET_AF_UNIX) {unix_initialize(socket,heap,type);*owner=socket;return 0;}
+    if(family==KERNEL_SOCKET_AF_NETLINK) {
+        socket->heap=heap;socket->type=(uint8_t)type;socket->family=(uint8_t)family;
+        socket->domain=KERNEL_SOCKET_DOMAIN_NETLINK;socket->netlink_references=1;
+        socket->rx_limit=socket->tx_limit=212992;
+        socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+        kernel_wait_queue_init(&socket->wait);*owner=socket;return 0;
+    }
     socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
     kernel_socket_protocol_enter(&old_status);
     kernel_socket_network_initialize();
@@ -1507,11 +1535,54 @@ static void unix_destroy(struct kernel_socket *socket)
     unix_put(socket);
 }
 
+static int netlink_put_locked(struct kernel_socket *socket)
+{
+    if(!socket->netlink_references)__builtin_trap();
+    int release=!--socket->netlink_references;
+    if(release && (!socket->destroying || socket->netlink_memory))__builtin_trap();
+    return release;
+}
+static void netlink_storage_free(struct kernel_socket *socket)
+{
+    uintptr_t interrupts=arch_interrupt_save();
+    for(;;) {
+        enum kernel_scheduler_status status=kernel_wait_queue_destroy(&socket->wait);
+        if(status==KERNEL_SCHEDULER_STATUS_OK)break;
+        if(status!=KERNEL_SCHEDULER_STATUS_BUSY)__builtin_trap();
+        kernel_wait_backend_quiesce();
+    }
+    arch_interrupt_restore(interrupts);
+    kernel_heap_release(socket->heap,socket);
+}
+static void netlink_destroy(struct kernel_socket *socket)
+{
+    SOCKET_STATE(state);
+    if(socket->destroying || socket->read_request || socket->active_writes)__builtin_trap();
+    socket->destroying=1;
+    struct socket_packet *packets=socket->packets_head;
+    /* Pending registrations keep their own charges and storage references. */
+    uint64_t queued_memory=(uint64_t)(socket->rx_bytes/NETLINK_COOKIE_SIZE)*packet_charge(NETLINK_COOKIE_SIZE);
+    if(socket->rx_bytes%NETLINK_COOKIE_SIZE || socket->netlink_memory<queued_memory)__builtin_trap();
+    socket->netlink_memory-=(uint32_t)queued_memory;
+    socket->packets_head=socket->packets_tail=NULL;socket->rx_bytes=0;
+    socket_state_release(&state);
+    while(packets) {
+        struct socket_packet *next=packets->next;
+        kernel_heap_release(socket->heap,packets);packets=next;
+    }
+    /* Retain the file's storage reference through all close callbacks. Queue
+     * storage is destroyed by the last real user, after its wait has ended. */
+    if(kernel_wait_queue_close(&socket->wait)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+    SOCKET_STATE(done);int release=netlink_put_locked(socket);socket_state_release(&done);
+    if(release)netlink_storage_free(socket);
+}
+
 void kernel_socket_destroy(struct kernel_socket *socket)
 {
     struct kernel_socket_protocol_scope old_status;
     if (socket == 0) __builtin_trap();
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {unix_destroy(socket);return;}
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {netlink_destroy(socket);return;}
     kernel_socket_protocol_enter(&old_status);
     SOCKET_STATE(state);
     if (socket->read_request != 0 || socket->tx_reserved || socket->writes_head || socket->active_writes) __builtin_trap();
@@ -1580,6 +1651,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
 int kernel_socket_bind(struct kernel_socket *socket,
                        const struct kernel_socket_address *address)
 {
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         KERNEL_LOCK_SCOPE(control);unix_control_acquire(&control);return unix_bind(socket,address);
     }
@@ -1624,6 +1696,10 @@ int kernel_socket_bind(struct kernel_socket *socket,
 int kernel_socket_getname(struct kernel_socket *socket,
                           struct kernel_socket_address *address)
 {
+    if(socket && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        if(!address)return -KERNEL_EINVAL;
+        *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_NETLINK};return 0;
+    }
     if(socket && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         SOCKET_STATE(state);unix_export_locked(socket->unix_name,address);return 0;
     }
@@ -1651,6 +1727,9 @@ int kernel_socket_getname(struct kernel_socket *socket,
 int kernel_socket_getpeer(struct kernel_socket *socket,struct kernel_socket_address *address)
 {
     if(!socket || !address)return -KERNEL_EINVAL;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_NETLINK};return 0;
+    }
     SOCKET_STATE(state);
     if(!socket->connected)return -KERNEL_ENOTCONN;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
@@ -1756,6 +1835,7 @@ static int unix_connect(struct kernel_socket *socket,const struct kernel_socket_
 
 int kernel_socket_listen(struct kernel_socket *socket, int backlog)
 {
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         struct kernel_socket_peercred cred=unix_current_cred();
         SOCKET_STATE(state);
@@ -1785,6 +1865,7 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
 int kernel_socket_connect(struct kernel_socket *socket,
                           const struct kernel_socket_address *address, int nonblocking)
 {
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX)return unix_connect(socket,address,nonblocking);
     ip_addr_t remote;
     err_t error;
@@ -1943,7 +2024,7 @@ static int socket_receive_empty(const struct kernel_socket *socket, int nonblock
         !socket->connected) return socket->type==SOCKET_SEQPACKET?-KERNEL_ENOTCONN:-KERNEL_EINVAL;
     if (socket->pending_error) return socket->pending_error;
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && network_stopping) return -KERNEL_EIO;
-    if (socket->type == SOCKET_DGRAM && socket->read_closed && nonblocking)
+    if (kernel_socket_preserves_messages(socket) && socket->read_closed && nonblocking)
         return -KERNEL_EAGAIN;
     if (socket->read_closed ||
         (socket_connection_oriented(socket) && socket->peer_closed))
@@ -2209,6 +2290,11 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if (partial) packet->consumed += partial;
     if (socket->rx_bytes < charge) __builtin_trap();
     socket->rx_bytes -= charge;
+    if(!peek && request->datagram && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        uint32_t memory=packet_charge(retired->length);
+        if(socket->netlink_memory<memory)__builtin_trap();
+        socket->netlink_memory-=memory;
+    }
     if(!peek && request->datagram && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         if(!socket->unix_queued)__builtin_trap();
         socket->unix_queued--;
@@ -2359,6 +2445,114 @@ void kernel_socket_abort_write(struct kernel_socket_write_request *request)
     request->pin = 0;
     if (kernel_open_file_release(&pin) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
 }
+
+static void netlink_cookie_finish(struct kernel_netlink_cookie **owner,unsigned reason)
+{
+    if(!owner || !*owner)return;
+    struct kernel_netlink_cookie *cookie=*owner;*owner=NULL;
+    if(cookie->token.task) {
+        if(cookie->token.task==kernel_wait_current_task()) {
+            if(kernel_wait_finish(&cookie->token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        } else {
+            /* Forced exit drains the task's token before aborting I/O. The
+             * reaper must not finish a token belonging to another task. */
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_wait_record *record=kernel_wait_record_of(cookie->token.task);
+            if(record->phase!=KERNEL_WAIT_FINISHED || record->nodes || record->borrows)__builtin_trap();
+            cookie->token=(struct kernel_wait_token){0};
+        }
+    }
+    if(cookie->pin && kernel_open_file_release(&cookie->pin)!=KERNEL_OPEN_FILE_STATUS_OK)__builtin_trap();
+    struct kernel_socket *socket=cookie->socket;
+    if(socket) {
+        SOCKET_STATE(state);
+        int publish=cookie->reserved && reason && !socket->destroying;
+        if(publish) {
+            cookie->packet->data[NETLINK_COOKIE_SIZE-1]=(unsigned char)reason;
+            packet_publish(socket,cookie->packet,NETLINK_COOKIE_SIZE);
+            cookie->packet=NULL;
+        } else if(cookie->reserved) {
+            uint32_t charge=packet_charge(NETLINK_COOKIE_SIZE);
+            if(socket->netlink_memory<charge)__builtin_trap();
+            socket->netlink_memory-=charge;
+            if(!socket->destroying)wake_socket(socket);
+        }
+        int release=netlink_put_locked(socket);
+        socket_state_release(&state);
+        if(cookie->packet)kernel_heap_release(socket->heap,cookie->packet);
+        if(release)netlink_storage_free(socket);
+    }
+    kernel_heap_release(cookie->heap,cookie);
+}
+int kernel_socket_mqueue_cookie_prepare(struct kernel_task *task,int64_t fd,
+    const unsigned char bytes[NETLINK_COOKIE_SIZE],struct kernel_netlink_cookie **owner)
+{
+    if(!owner || *owner || !bytes)__builtin_trap();
+    struct kernel_files *files=NULL;
+    enum kernel_task_status task_status=kernel_task_files_borrow(task,&files);
+    if(task_status==KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE)return -KERNEL_EBADF;
+    if(task_status!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+    for(;;) {
+        struct kernel_netlink_cookie *cookie=NULL;
+        enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(files->heap,1,sizeof(*cookie),(void **)&cookie);
+        if(allocated!=KERNEL_HEAP_STATUS_OK) {
+            if(allocated!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
+            return -KERNEL_ENOMEM;
+        }
+        cookie->heap=files->heap;*owner=cookie;
+        int64_t result;
+        if(kernel_files_pin(files,fd,&cookie->pin,&result)!=KERNEL_FILES_STATUS_OK)__builtin_trap();
+        if(result) {netlink_cookie_finish(owner,0);return (int)result;}
+        struct kernel_socket *socket=kernel_open_file_socket(cookie->pin);
+        if(!socket || socket->domain!=KERNEL_SOCKET_DOMAIN_NETLINK) {
+            result=socket?-KERNEL_EINVAL:-KERNEL_ENOTSOCK;
+            netlink_cookie_finish(owner,0);return (int)result;
+        }
+        {
+            SOCKET_STATE(state);
+            if(socket->netlink_references==UINT32_MAX)__builtin_trap();
+            socket->netlink_references++;cookie->socket=socket;
+        }
+        allocated=kernel_heap_allocate_zeroed(socket->heap,1,
+            sizeof(struct socket_packet)+NETLINK_COOKIE_SIZE,(void **)&cookie->packet);
+        if(allocated!=KERNEL_HEAP_STATUS_OK) {
+            if(allocated!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
+            netlink_cookie_finish(owner,0);return -KERNEL_ENOMEM;
+        }
+        cookie->packet->length=NETLINK_COOKIE_SIZE;
+        cookie->packet->address.family=KERNEL_SOCKET_AF_NETLINK;
+        __builtin_memcpy(cookie->packet->data,bytes,NETLINK_COOKIE_SIZE);
+        /* A quota wait must not keep the last OFD alive: close revokes the
+         * endpoint, while this cookie keeps only its storage alive. */
+        if(kernel_open_file_release(&cookie->pin)!=KERNEL_OPEN_FILE_STATUS_OK)__builtin_trap();
+        SOCKET_STATE(state);
+        if(socket->destroying) {
+            socket_state_release(&state);netlink_cookie_finish(owner,0);continue;
+        }
+        uint32_t charge=packet_charge(NETLINK_COOKIE_SIZE);
+        if(!socket->netlink_memory || (charge<=socket->rx_limit &&
+            socket->netlink_memory<=socket->rx_limit-charge)) {
+            socket->netlink_memory+=charge;cookie->reserved=1;return 0;
+        }
+        if(kernel_wait_prepare(&socket->wait,0,1,&cookie->token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        uintptr_t interrupts=socket_state_unlock_wait(&state);
+        enum kernel_wait_wake_reason reason=KERNEL_WAIT_WOKEN;
+        result=kernel_wait_park(&cookie->token,&reason)==KERNEL_SCHEDULER_STATUS_OK?0:-KERNEL_EIO;
+        if(kernel_wait_finish(&cookie->token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        arch_interrupt_restore(interrupts);
+        netlink_cookie_finish(owner,0);
+        if(result)return (int)result;
+        if(reason==KERNEL_WAIT_SIGNALLED)return -KERNEL_ERESTARTSYS;
+        /* Lookup again after wake: a closed or reused descriptor is observable. */
+    }
+}
+void kernel_socket_mqueue_cookie_send(struct kernel_netlink_cookie **owner,unsigned reason)
+{
+    if(reason!=1 && reason!=2)__builtin_trap();
+    netlink_cookie_finish(owner,reason);
+}
+void kernel_socket_mqueue_cookie_cancel(struct kernel_netlink_cookie **owner)
+{ netlink_cookie_finish(owner,0); }
 static int unix_peer_failure(struct kernel_socket *socket)
 {
     if(socket->write_closed)return -KERNEL_EPIPE;
@@ -2391,7 +2585,7 @@ static int unix_reserve_packet(struct kernel_socket_write_request *request,uint3
         if(sender->unix_memory+sender->tx_reserved>=sender->tx_limit)waiter=sender;
         else if(unix_queue_full(sender,peer))waiter=peer;
         if(!waiter) {
-            request->reserved=unix_charge(count);
+            request->reserved=packet_charge(count);
             if(sender->tx_reserved>UINT32_MAX-request->reserved)__builtin_trap();
             sender->tx_reserved+=request->reserved;
             if(kernel_socket_preserves_messages(sender))peer->unix_reserved++;
@@ -2452,6 +2646,7 @@ static int socket_write_packet_source(struct kernel_open_file_description **pin_
     struct kernel_socket_control **control=message?&message->control:&request.automatic_control;
     if (user_fault) *user_fault=0;
     struct kernel_socket *socket = kernel_open_file_socket(*pin_owner);
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     int result=0,credentials=0;
     int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
         !(destination && socket->type==SOCKET_DGRAM);
@@ -2878,6 +3073,7 @@ int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
 int kernel_socket_shutdown(struct kernel_socket *socket,int how)
 {
     if(how<0 || how>2)return -KERNEL_EINVAL;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         SOCKET_STATE(state);
         if(how!=1)socket->read_closed=1;
@@ -2911,7 +3107,10 @@ int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value)
 {
     if(option==KERNEL_SOCKET_PASSCRED) {SOCKET_STATE(state);socket->passcred=value!=0;return 0;}
-    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
+    struct socket_state_guard local __attribute__((cleanup(socket_state_release)))={0};
+    struct kernel_socket_protocol_scope saved;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)socket_state_acquire(&local);
+    else kernel_socket_protocol_enter(&saved);
     int result = 0;
     struct ip_pcb *pcb = socket->udp != 0 ? (struct ip_pcb *)socket->udp : (struct ip_pcb *)socket->tcp;
     switch (option) {
@@ -2928,7 +3127,7 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         uint32_t limit = (uint32_t)value;
         uint32_t minimum = option == KERNEL_SOCKET_SNDBUF ? 4608U : 2304U;
         /* UNIX按Linux倍增/下限和4MiB配置上限；INET保留现有协议预算。 */
-        uint32_t maximum=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX ? (4U<<20) : 32768U;
+        uint32_t maximum=socket->domain!=KERNEL_SOCKET_DOMAIN_INET ? (4U<<20) : 32768U;
         if(limit>maximum)limit=maximum;
         limit *= 2;
         if (limit < minimum) limit = minimum;
@@ -2963,7 +3162,7 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         break;
     default: result = -KERNEL_ENOPROTOOPT;
     }
-    kernel_socket_protocol_leave(&saved);
+    if(socket->domain!=KERNEL_SOCKET_DOMAIN_NETLINK)kernel_socket_protocol_leave(&saved);
     return result;
 }
 
@@ -2971,7 +3170,10 @@ int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value)
 {
     if(option==KERNEL_SOCKET_PASSCRED) {SOCKET_STATE(state);*value=socket->passcred;return 0;}
-    struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
+    struct socket_state_guard local __attribute__((cleanup(socket_state_release)))={0};
+    struct kernel_socket_protocol_scope saved;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)socket_state_acquire(&local);
+    else kernel_socket_protocol_enter(&saved);
     int result = 0;
     switch (option) {
     case KERNEL_SOCKET_REUSEADDR: *value = socket->reuseaddr; break;
@@ -3000,7 +3202,7 @@ int kernel_socket_get_option(struct kernel_socket *socket,
         break;
     default: result = -KERNEL_ENOPROTOOPT;
     }
-    kernel_socket_protocol_leave(&saved);
+    if(socket->domain!=KERNEL_SOCKET_DOMAIN_NETLINK)kernel_socket_protocol_leave(&saved);
     return result;
 }
 void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds)
@@ -3075,7 +3277,7 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
         return events;
     }
 
-    if (socket->type == SOCKET_DGRAM) {
+    if (kernel_socket_preserves_messages(socket)) {
         if ((socket->packets_head != 0 || socket->read_closed) && socket->read_request == 0)
             events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
         events |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;

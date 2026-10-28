@@ -3,6 +3,8 @@
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
 #include "../record_lock.h"
+#include <kernel/mqueue.h>
+#include <kernel/task.h>
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
 #include "../block_file_internal.h"
@@ -716,8 +718,11 @@ static struct kernel_open_file_description *detach_fd_locked(
 }
 static enum kernel_files_status release_detached(
     struct kernel_files *files, struct kernel_open_file_description *description,
-    int cleanup)
+    int cleanup, struct kernel_task *closing)
 {
+    /* FD摘除才撤通知；瞬时OFD借用的归还不会关闭登记。 */
+    if(description->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)
+        kernel_mqueue_close_fd(description,closing);
     struct kernel_vfs_node *node = kernel_open_file_node(description);
     int has_locks=node && __atomic_load_n(&files->record->record_locks,__ATOMIC_ACQUIRE);
     KERNEL_SERVICE_SCOPE_IF(service, has_locks);
@@ -952,7 +957,7 @@ enum kernel_files_status kernel_files_dup3(
         if (install_owned_locked(files, (uint32_t)newfd,
             flags & LINUX_O_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, &source)) __builtin_trap();
     }
-    if (replaced && release_detached(files, replaced, 0)) return KERNEL_FILES_STATUS_STATE;
+    if (replaced && release_detached(files, replaced, 0, kernel_task_current())) return KERNEL_FILES_STATUS_STATE;
     *result=newfd; return KERNEL_FILES_STATUS_OK;
 }
 enum kernel_files_status kernel_files_dup2(
@@ -976,6 +981,13 @@ enum kernel_files_status kernel_files_fcntl(
         }
         return dup_from(files, fd, (uint32_t)argument,
             command==KERNEL_FILES_F_DUPFD_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, result);
+    }
+    if(command==1031U || command==1032U) {
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+        if(!file || file->kind!=KERNEL_OPEN_FILE_KIND_PIPE) {*result=-KERNEL_EBADF;return 0;}
+        *result=kernel_pipe_capacity(file->pipe,(int)command,argument);
+        return 0;
     }
     KERNEL_FILES_SCOPE(guard, files);
     struct kernel_open_file_description *source=lookup_locked(files, fd);
@@ -1024,12 +1036,12 @@ enum kernel_files_status kernel_files_close(
         description = detach_fd_locked(files, (uint32_t)fd);
     }
     *linux_result = 0;
-    return release_detached(files, description, 1);
+    return release_detached(files, description, 1, kernel_task_current());
 }
 
 /* 一段最多16槽；取得的OFD owner覆盖锁外释放。 */
 static enum kernel_files_status detach_batch(struct kernel_files *files, uint32_t *cursor,
-    int cloexec)
+    int cloexec, struct kernel_task *closing)
 {
     struct kernel_open_file_description *batch[16]; unsigned count=0;
     {
@@ -1042,7 +1054,7 @@ static enum kernel_files_status detach_batch(struct kernel_files *files, uint32_
                 batch[count++]=detach_fd_locked(files, *cursor);
         }
     }
-    for (unsigned i=0; i<count; i++) if (release_detached(files, batch[i], 0)) __builtin_trap();
+    for (unsigned i=0; i<count; i++) if (release_detached(files, batch[i], 0, closing)) __builtin_trap();
     return KERNEL_FILES_STATUS_OK;
 }
 enum kernel_files_status kernel_files_close_on_exec(struct kernel_files *files)
@@ -1052,7 +1064,7 @@ enum kernel_files_status kernel_files_close_on_exec(struct kernel_files *files)
     uint32_t capacity;
     { KERNEL_FILES_SCOPE(guard, files); capacity=files->record->statistics.capacity; }
     uint32_t cursor=0;
-    while (cursor<capacity) detach_batch(files, &cursor, 1);
+    while (cursor<capacity) detach_batch(files, &cursor, 1, kernel_task_current());
     return kernel_files_drain_file_cleanup(files);
 }
 
@@ -1080,7 +1092,7 @@ void kernel_files_get_statistics(
     statistics->capacity=source->capacity;
 }
 
-enum kernel_files_status kernel_files_release(struct kernel_files *files)
+enum kernel_files_status kernel_files_release_for_task(struct kernel_files *files,struct kernel_task *closing)
 {
     if (!files) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if ((files->state!=KERNEL_FILES_LIVE && files->state!=KERNEL_FILES_CLEANUP) ||
@@ -1101,7 +1113,7 @@ enum kernel_files_status kernel_files_release(struct kernel_files *files)
         capacity=record->statistics.capacity;
     }
     uint32_t cursor=0;
-    while (cursor<capacity) detach_batch(files, &cursor, 0);
+    while (cursor<capacity) detach_batch(files, &cursor, 0, closing);
     enum kernel_files_status status=kernel_files_drain_file_cleanup(files);
     if (status) return status;
     kernel_heap_release(files->heap, files->record->slots);
@@ -1109,3 +1121,7 @@ enum kernel_files_status kernel_files_release(struct kernel_files *files)
     finish_files(files, KERNEL_FILES_RELEASED);
     return KERNEL_FILES_STATUS_OK;
 }
+
+/* Most callers close their own table; stopped-task teardown supplies its owner. */
+enum kernel_files_status kernel_files_release(struct kernel_files *files)
+{ return kernel_files_release_for_task(files,kernel_task_current()); }
