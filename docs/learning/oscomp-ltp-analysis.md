@@ -916,3 +916,25 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 普通三项每配置17/17、合计68/68。三个waitv程序均未进入主体：LTP先检查uname版本，当前release为BoarOS自身版本，详细分类统一维护于[测例问题](oscomp-test-issues.md)。本批没有超时，原程序0/0不计入新能力的通过数。waitv与PI重排的实际行为由固定Linux同ELF、两架构两种libc及RV双/四核直接消费者验证，机制与验证范围见[调度模块](../modules/kernel-scheduler.md#多地址等待)。
 
 两架构正常结束且heap-live=0；根盘及第二盘三个分区共八对象检查返回0，默认交付内核按保存SHA恢复。完整细项、原输入与ELF身份、每程序计时及磁盘检查在`build/futex-waitv-20261025/original-final/`；首次机制批次保留在同级`original/`。性能分别维护于[CPU成本](cpu-accounting-cost.md)。
+
+## POSIX消息队列与管道容量原程序结果（2026-10-28）
+
+通用实现为10月28日14:48～14:50的POSIX MQ、libc通知和管道容量完成版，随后单向合入兼容分支。固定官方容器离线构建并使用其QEMU 10.0.2、原启动设备参数；RV与LA并行，各一次启动中运行原glibc/musl的七项MQ和原BusyBox脚本。只选择LTP外层枚举；保留原ELF、参数、libc、judge及程序时限。默认单核、1 GiB、第二盘布局与启动种子沿用兼容配置。输入及内核身份保存在`build/mqueue-pipe-20261028/original/original-input-identity.json`和`probe-run.json`。
+
+四种组合每种得80/84分，合计320/336；全部程序均未超时。表中分数四配置相同，耗时为程序自身从进入到退出的总时间，单位ms。
+
+| 程序 | 每配置原judge分数 | RV glibc ms | RV musl ms | LA glibc ms | LA musl ms | 实际到达位置 |
+|---|---:|---:|---:|---:|---:|---|
+| mq_open01 | 0/3 | 130 | 82 | 151 | 63 | setup：getpwnam(nobody)返回ENOENT，未进入MQ断言 |
+| mq_unlink01 | 0/1 | 87 | 41 | 65 | 42 | setup：getpwnam(nobody)返回ENOENT，未进入MQ断言 |
+| mq_timedsend01 | 34/34 | 212 | 209 | 210 | 189 | 34条TPASS，退出0，无TFAIL/TBROK |
+| mq_timedreceive01 | 30/30 | 207 | 185 | 186 | 186 | 30条TPASS，退出0，无TFAIL/TBROK |
+| mq_notify01 | 7/7 | 89 | 63 | 65 | 66 | 7条TPASS，退出0，无TFAIL/TBROK |
+| mq_notify02 | 2/2 | 42 | 42 | 64 | 43 | 2条TPASS，退出0，无TFAIL/TBROK |
+| mq_notify03 | 7/7 | 64 | 42 | 64 | 44 | 7条TPASS，退出0，无TFAIL/TBROK |
+
+`mq_open01`在缺少nobody的准备错误之后，又由LTP报告cleanup阶段SIGSEGV，退出状态6；源码中尚未赋值的qname为NULL，cleanup仍调用mq_unlink(qname)，两种libc会在syscall前读取名称。该清理路径与日志吻合，本次未采集fault PC。`mq_unlink01`退出2。二者原分数保留为0/3、0/1。原盘用户数据库问题统一见[测例问题](oscomp-test-issues.md#运行库和原盘依赖)；MQ创建、权限、unlink重建和引用寿命由数字身份的直接消费者与固定Linux同ELF验证。没有通过修改原账户输入取得替代分数。
+
+原BusyBox四组合均54/55，`sort test.txt | ./busybox uniq`各1/1，原`cat busybox_cmd.txt | while read`完整消费命令；唯一缺分仍是原judge的`kill 10`标签与发布脚本实际命令不同，见统一问题文档。管道容量另由真实libc直接消费者检查环绕扩缩、FIFO、额度和失败副作用。
+
+八个文件系统对象（两架构根盘及p1/p2/p3）检查状态全部为0，启动种子槽检查已完成；检查后清除四张运行副本。恢复默认`make all`交付，最终两内核与运行前保存的默认内核逐字节一致；兼容分支原有`oscomp-official-delivery.md`修改SHA保持不变。源码机制见[POSIX消息队列](../modules/posix-mqueue.md)，性能和四核MQ慢于双核的剩余问题见[成本记录](cpu-accounting-cost.md#posix消息队列线程通知与管道容量2026-10-28)。
