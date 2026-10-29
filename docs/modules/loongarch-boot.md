@@ -164,6 +164,7 @@ QEMU 平台采用128个bus的ECAM、低PCI memory aperture、根bus现代端点�
 PCH-PIC→EXTIOI→CPU0/HWI0。资源 claim 有64个槽，耗尽明确失败；无桥、热插拔、
 纯legacy PCI传输、MSI-X 或实板验证；transitional身份的modern接口已接入。控制器为共享level pin在逐设备ISR之间保持mask，
 unmask重新采样intirr；trap只分发ESTAT与ECFG交集，同时处理已启用的timer。
+外部中断活动状态属于CPU0；CPU1执行块设备调用时不继承CPU0正在派发的中断上下文。
 
 ```sh
 make test-pci-host
