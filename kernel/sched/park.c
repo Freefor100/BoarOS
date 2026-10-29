@@ -40,32 +40,35 @@ static void borrow(struct kernel_wait_node *node)
         record->borrows++;
     }
 }
-/* 退休后继的引用链迭代归还，每段最多16项，不能递归消耗任务栈。 */
+/* 调用者持wait域；退休后继最多归还16项，剩余的借用由返回值持有。 */
+static struct kernel_wait_node *put_batch_locked(struct kernel_wait_node *node)
+{
+    for (unsigned count = 0; node && count < 16; count++) {
+        if (!node->references || !node->borrow_owner || !node->borrow_owner->borrows)
+            __builtin_trap();
+        node->references--;
+        node->borrow_owner->borrows--;
+        if (node->task) {
+            struct kernel_wait_record *record = kernel_wait_record_of(node->task);
+            if (!record->borrows) __builtin_trap();
+            record->borrows--;
+        }
+        struct kernel_wait_node *next = 0;
+        if (!node->references && !node->queue) {
+            next = node->retired_next;
+            node->retired_next = 0;
+            node->borrow_owner = 0;
+        }
+        node = next;
+    }
+    return node;
+}
+/* 退休链迭代归还，不能递归消耗任务栈。 */
 static void put(struct kernel_wait_node *node)
 {
     while (node) {
-        struct kernel_wait_node *next = 0;
-        {
-            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            for (unsigned count = 0; node && count < 16; count++) {
-                if (!node->references || !node->borrow_owner || !node->borrow_owner->borrows)
-                    __builtin_trap();
-                node->references--;
-                node->borrow_owner->borrows--;
-                if (node->task) {
-                    struct kernel_wait_record *record = kernel_wait_record_of(node->task);
-                    if (!record->borrows) __builtin_trap();
-                    record->borrows--;
-                }
-                next = 0;
-                if (!node->references && !node->queue) {
-                    next = node->retired_next;
-                    node->retired_next = 0;
-                    node->borrow_owner = 0;
-                }
-                node = next;
-            }
-        }
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        node = put_batch_locked(node);
     }
 }
 void kernel_wait_node_add_locked(struct kernel_wait_queue *queue, struct kernel_wait_node *node)
@@ -359,12 +362,25 @@ void kernel_wait_cursor_advance(struct kernel_wait_cursor *cursor)
         if (next && next->sequence <= cursor->sequence) borrow(next);
         else next = 0;
         cursor->node = next;
+        /* 前后节点的借用交接属于同一保护，不必解锁后重新取得。 */
+        old = put_batch_locked(old);
     }
     put(old);
 }
 void kernel_wait_cursor_end(struct kernel_wait_cursor *cursor)
 {
-    if (cursor->node) put(cursor->node);
+    struct kernel_wait_node *remaining;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        remaining = put_batch_locked(cursor->node);
+        if (!remaining) {
+            if (!cursor->queue || !cursor->queue->borrows) __builtin_trap();
+            cursor->queue->borrows--;
+            *cursor = (struct kernel_wait_cursor){0};
+            return;
+        }
+    }
+    put(remaining);
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (!cursor->queue || !cursor->queue->borrows) __builtin_trap();
     cursor->queue->borrows--;

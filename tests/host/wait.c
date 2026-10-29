@@ -36,6 +36,9 @@ static pthread_barrier_t segment_committed, segment_woken;
 static struct kernel_task *segment_tasks;
 static unsigned segment_count, segment_notified;
 static _Thread_local unsigned forbid_wait_lock;
+static _Thread_local unsigned pause_retired;
+static struct kernel_wait_node *retired_first;
+static pthread_barrier_t retired_paused, retired_resume;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
@@ -53,6 +56,9 @@ void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
     }
     int pause = pause_close && guard->lock == &kernel_wait_domain && closing.closed;
     if (pause) pause_close = 0;
+    int pause_batch = pause_retired && guard->lock == &kernel_wait_domain &&
+        retired_first && !retired_first->references;
+    if (pause_batch) pause_retired = 0;
     if (finish_queues && guard->lock == &kernel_wait_domain) {
         unsigned remaining = 0;
         for (unsigned i = 0; i < 33; i++) remaining += finish_queues[i].registrations;
@@ -60,6 +66,12 @@ void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
         finish_remaining = remaining;
     }
     __real_kernel_raw_lock_release(guard);
+    if (pause_batch) {
+        int result = pthread_barrier_wait(&retired_paused);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        result = pthread_barrier_wait(&retired_resume);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
     if (pause) {
         int result = pthread_barrier_wait(&close_entered);
         assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
@@ -228,6 +240,56 @@ static void callback_lifetime(void)
     assert(callback_calls == 1 && !callbacks.borrows && !callbacks.registrations);
     assert(kernel_wait_queue_destroy(&callbacks) == KERNEL_SCHEDULER_STATUS_OK);
     assert(!pthread_barrier_destroy(&callback_entered) && !pthread_barrier_destroy(&callback_release));
+}
+struct retired_cursor_case { struct kernel_wait_cursor cursor; int advance; };
+static void *finish_retired_cursor(void *argument)
+{
+    struct retired_cursor_case *test=argument;
+    initialize(12);pause_retired=1;
+    if (test->advance) {
+        kernel_wait_cursor_advance(&test->cursor);
+        assert(!test->cursor.node);
+    }
+    kernel_wait_cursor_end(&test->cursor);
+    return 0;
+}
+static void retired_cursor_batches(void)
+{
+    for (int advance=0;advance<2;advance++) {
+        struct kernel_wait_queue queue;
+        struct kernel_wait_node entries[64];
+        struct kernel_task owners[64]={0};
+        struct retired_cursor_case test={.advance=advance};
+        kernel_wait_queue_init(&queue);
+        for (unsigned i=0;i<64;i++) {
+            kernel_wait_node_init(&entries[i],&owners[i]);
+            kernel_wait_queue_add(&queue,&entries[i]);
+            if (advance && !i) kernel_wait_cursor_begin(&queue,&test.cursor);
+        }
+        if (!advance) kernel_wait_cursor_begin(&queue,&test.cursor);
+        for (unsigned i=0;i<64;i++) kernel_wait_queue_remove(&entries[i]);
+        assert(!kernel_wait_queue_close(&queue));
+        retired_first=&entries[0];
+        assert(!pthread_barrier_init(&retired_paused,0,2));
+        assert(!pthread_barrier_init(&retired_resume,0,2));
+        pthread_t worker;assert(!pthread_create(&worker,0,finish_retired_cursor,&test));
+        barrier(&retired_paused);
+        assert(kernel_wait_queue_destroy(&queue)==KERNEL_SCHEDULER_STATUS_BUSY);
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          assert(queue.borrows==49 && !queue.registrations);
+          for (unsigned i=0;i<64;i++) {
+              assert(entries[i].references==(i>=16));
+              assert(owners[i].wait.borrows==(i>=16));
+          }
+          if (advance) assert(!test.cursor.node); }
+        barrier(&retired_resume);assert(!pthread_join(worker,0));
+        for (unsigned i=0;i<64;i++)
+            assert(!entries[i].borrow_owner && !entries[i].references && !owners[i].wait.borrows);
+        assert(!queue.borrows && !kernel_wait_queue_destroy(&queue));
+        assert(!pthread_barrier_destroy(&retired_paused) && !pthread_barrier_destroy(&retired_resume));
+        retired_first=0;
+    }
+    puts("wait: retired cursor end and sequence boundary retain queue and task owners across bounded batches");
 }
 static void *close_worker(void *argument)
 {
@@ -648,6 +710,7 @@ int main(void)
     arbitration(2);
     arbitration(4);
     callback_lifetime();
+    retired_cursor_batches();
     close_lifetime();
     pollfree_lifetime();
     event_filtering();
