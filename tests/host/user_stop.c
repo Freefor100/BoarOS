@@ -18,6 +18,9 @@ enum kernel_scheduler_status user_signal_unexpected_park(struct kernel_task *tas
 void user_signal_unexpected_parent(struct kernel_task *task)
 { (void)task;assert(!"SIGCONT canceled the STOP during migration, so no stop notification may follow");abort(); }
 void scheduler_task_disposal_notify(void) { abort(); }
+/* 此模型不回收信号表页；若误入该路径，必须显式失败。 */
+enum riscv_direct_map_status riscv_direct_map_va_to_pa(uint64_t address,uint64_t size,uint64_t *physical)
+{ (void)address;(void)size;(void)physical;abort(); }
 enum physical_page_status physical_page_release(struct physical_page_allocator *allocator,uint64_t address)
 { (void)allocator;(void)address;abort(); }
 

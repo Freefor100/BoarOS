@@ -2,6 +2,7 @@
 #include <platform/loongarch_virt.h>
 #include <arch/context.h>
 #include <arch/bus.h>
+#include <kernel/cpu.h>
 
 /* Fixed QEMU v11.1 virt.h: ECAM 128 buses, low PCI memory aperture. */
 #define ECAM_BASE UINT64_C(0x20000000)
@@ -60,7 +61,18 @@ static volatile uint32_t *pic(unsigned offset)
 { return (void *)(uintptr_t)(LA_UNCACHED_BASE+0x10000000+offset); }
 static int initialized,dispatching;
 static struct { uint32_t source;void (*handle)(void *);void *owner; } handlers[32];
-int la_virt_irq_active(void) { return dispatching; }
+int la_virt_irq_active(void)
+{
+#if BOAROS_MAX_CPUS > 1
+    /* 外设只在CPU0派发；禁止迁移期间读取CPU0独占的派发状态。 */
+    uintptr_t irq=arch_interrupt_save();
+    int active=!kernel_cpu_current()->logical_id && dispatching;
+    arch_interrupt_restore(irq);
+    return active;
+#else
+    return dispatching;
+#endif
+}
 int la_virt_irq_initialize(void)
 {
     if(initialized) return 0;
