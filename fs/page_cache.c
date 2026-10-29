@@ -2652,23 +2652,23 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
         }
         kernel_vfs_node_lock(node,&io,1);
         int admitted=0,loading=0;
-        {
+        if (candidate) {
             CACHE_SCOPE(guard,cache);
-            if (candidate) {
-                int found; size_t bucket=find_bucket(cache->record,node,offset>>BOAROS_PAGE_SHIFT,&found);
-                if (found) {
-                    struct kernel_page_cache_entry *current=cache->record->buckets[bucket];
-                    if (entry_load_status(current) == KERNEL_PAGE_CACHE_STATUS_OK) entry=current;
-                } else if (cache->record->occupied+cache->record->tombstones+1 <=
-                    cache->record->capacity-cache->record->capacity/4) {
-                    entry=candidate; candidate=NULL;
-                    publish_entry(cache,entry,bucket); loading=1;
-                }
-                if (entry) {
-                    entry_borrow(entry); address=entry->physical_address;
-                }
+            int found; size_t bucket=find_bucket(cache->record,node,offset>>BOAROS_PAGE_SHIFT,&found);
+            if (found) {
+                struct kernel_page_cache_entry *current=cache->record->buckets[bucket];
+                if (entry_load_status(current) == KERNEL_PAGE_CACHE_STATUS_OK) entry=current;
+            } else if (cache->record->occupied+cache->record->tombstones+1 <=
+                cache->record->capacity-cache->record->capacity/4) {
+                entry=candidate; candidate=NULL;
+                publish_entry(cache,entry,bucket); loading=1;
+            }
+            if (entry) {
+                entry_borrow(entry); address=entry->physical_address;
             }
             if (entry) admitted=resize.entry==entry || writer_begin(entry,&writer);
+        } else if (entry) {
+            admitted=resize.entry==entry || writer_begin(entry,&writer);
         }
         if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
         if (!admitted) {
