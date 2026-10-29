@@ -2222,6 +2222,11 @@ static int ext4_backend_modified(struct kernel_vfs_file *file,
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
+    struct lwext4_node *ext = (struct lwext4_node *)node;
+    if ((ext->dirty_fields & (EXT4_TIME_MTIME | EXT4_TIME_CTIME)) == (EXT4_TIME_MTIME | EXT4_TIME_CTIME)) {
+        uint64_t coarse_sec = kernel_time_coarse_realtime_ns() / UINT64_C(1000000000);
+        if ((int64_t)coarse_sec <= ext->times[1].seconds) return 0;
+    }
     struct ext4_timestamp now;
     if (ext4_file_read_clock(lwext4_node_file(node), &now)) time_dirty((struct lwext4_node *)node,
                                       EXT4_TIME_MTIME | EXT4_TIME_CTIME, now);
