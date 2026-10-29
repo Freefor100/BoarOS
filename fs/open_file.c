@@ -40,7 +40,7 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
         cookie=file->readahead_cookie;
         file->readahead_cookie=0;__atomic_store_n(&file->read_sequential,0,__ATOMIC_RELAXED);
-        file->readahead_end=0;file->readahead_pages=0;
+        __atomic_store_n(&file->read_end,0,__ATOMIC_RELAXED);file->readahead_end=0;file->readahead_pages=0;
     }
     if (cookie) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cookie);
 #else
@@ -51,7 +51,8 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
 {
-    if (!file || !__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED) || !open_file_live(file)) return;
+    if (!file || !open_file_live(file) || !__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED)) return;
+    if (__atomic_load_n(&file->read_end,__ATOMIC_RELAXED)==offset) return;
     uint64_t cancel=0;
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
@@ -86,7 +87,8 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         if (!sequential) {
             cancel=file->readahead_cookie;file->readahead_cookie=0;file->readahead_end=0;file->readahead_pages=initial;
         }
-        file->read_end=end;__atomic_store_n(&file->read_sequential,1,__ATOMIC_RELAXED);
+        __atomic_store_n(&file->read_end,end,__ATOMIC_RELAXED);
+        __atomic_store_n(&file->read_sequential,1,__ATOMIC_RELAXED);
         previous_end=file->readahead_end;cookie=file->readahead_cookie;
         queue=sequential && !(end&BOAROS_PAGE_MASK) && (end>>BOAROS_PAGE_SHIFT)>=previous_end;
         pages=file->readahead_pages?file->readahead_pages:initial;
