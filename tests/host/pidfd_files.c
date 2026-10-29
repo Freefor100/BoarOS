@@ -27,6 +27,8 @@ static int pin_wait,at_pin,resume_pin,exit_reached,exit_finished;
 static int64_t getfd_result;
 static int pidfd;
 
+void kernel_mqueue_close_fd(struct kernel_open_file_description *file,struct kernel_task *task)
+{ (void)file;(void)task;assert(!"pidfd fixture does not own an mqueue"); }
 void *sync_test_cpu(void){return &cpu;}
 void *sync_test_current_task(void){return running;}
 void kernel_cpu_flush_notifications(void){assert(!cpu.outbound);}
