@@ -1010,7 +1010,13 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
             length &= ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
             uint64_t address;
             if (!length || !device->dma_address(candidate->buffer + candidate->copied, length, &address)) break;
-            segments[segments_count++] = (struct block_segment){address, (uint32_t)length};
+            if (segments_count &&
+                segments[segments_count - 1].address + segments[segments_count - 1].length == address &&
+                (uint64_t)segments[segments_count - 1].length + length <= device->max_segment_size) {
+                segments[segments_count - 1].length += (uint32_t)length;
+            } else {
+                segments[segments_count++] = (struct block_segment){address, (uint32_t)length};
+            }
             candidate->copied += length;
             members |= UINT32_C(1) << next;
             total += length; offset += length;
