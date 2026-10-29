@@ -274,8 +274,14 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
             while (!pending.size && !ended) ended=!next(context,&cursor,&pending);
             if (!pending.size) break;
             size_t length=pending.size<BLOCK_TRANSFER_BYTES-bytes?pending.size:BLOCK_TRANSFER_BYTES-bytes;
-            window.spans[window.count++]=(struct kernel_block_span){
-                device->start_bytes+pending.offset,pending.buffer,length};
+            if (window.count &&
+                window.spans[window.count-1].offset + window.spans[window.count-1].size == device->start_bytes + pending.offset &&
+                (const unsigned char *)window.spans[window.count-1].buffer + window.spans[window.count-1].size == (const unsigned char *)pending.buffer) {
+                window.spans[window.count-1].size += length;
+            } else {
+                window.spans[window.count++]=(struct kernel_block_span){
+                    device->start_bytes+pending.offset,pending.buffer,length};
+            }
             pending.offset+=length;pending.buffer=(const unsigned char *)pending.buffer+length;
             pending.size-=length;bytes+=length;
         }

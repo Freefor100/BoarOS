@@ -110,7 +110,7 @@ static void domain_shares_locked(struct page_cache_group *group)
     uint64_t high=0,low=0,count=group->domain_count;
     if (count) {
         uint64_t total=physical_page_total(group->allocator)*BOAROS_PAGE_SIZE;
-        high=total/5;low=total/10;
+        high=total/10;low=total/20;
         if (high<BOAROS_PAGE_SIZE) high=BOAROS_PAGE_SIZE;
         if (low<BOAROS_PAGE_SIZE) low=BOAROS_PAGE_SIZE;
     }
@@ -3764,8 +3764,8 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     uint64_t total = physical_page_total(cache->allocator);
     r->low = total / 50 ? total / 50 : 1;
     r->high = total / 25 > r->low ? total / 25 : r->low + 1;
-    r->dirty_low = total / 10 ? total / 10 : 1;
-    r->dirty_high = total / 5 > r->dirty_low ? total / 5 : r->dirty_low + 1;
+    r->dirty_low = total / 20 ? total / 20 : 1;
+    r->dirty_high = total / 10 > r->dirty_low ? total / 10 : r->dirty_low + 1;
     r->stopping = 0;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
     if (r->expired_writeback) {r->expired_writeback=0;r->dirty_deadline=r->dirty_pages?dirty_deadline():0;}
