@@ -55,7 +55,7 @@ static void queue_disposal_locked(struct kernel_task *task)
 {
     if (task->retirement != 2 || task->storage_borrows) return;
     if (task->wait.on_cpu || task->wait.borrows || task->wait.nodes ||
-        task->wait.phase != KERNEL_WAIT_FINISHED) __builtin_trap();
+        kernel_wait_record_phase(&task->wait) != KERNEL_WAIT_FINISHED) __builtin_trap();
     task->retirement = 3;
     task->retired_next = scheduler.retired_tasks;
     scheduler.retired_tasks = task;
@@ -156,7 +156,7 @@ void scheduler_task_retire_locked(struct kernel_task *task)
     domain_owned();
     if (task->retirement != 1 || !scheduler.retired_pending ||
         task->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
-        task->wait.on_cpu || task->wait.borrows || task->wait.nodes || task->wait.phase != KERNEL_WAIT_FINISHED)
+        task->wait.on_cpu || task->wait.borrows || task->wait.nodes || kernel_wait_record_phase(&task->wait) != KERNEL_WAIT_FINISHED)
         __builtin_trap();
     task->retirement = 2;
     queue_disposal_locked(task);

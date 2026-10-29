@@ -75,7 +75,7 @@ static void *boundary_worker(void *unused)
     assert(mode==4 ? lock.readers==1 && !lock.writer : lock.writer==&current.io_context);
     publish(&acquired);wait_flag(&release_go);kernel_lock_release(&guard);
     assert(!current.io_context.locks && !cpu.raw_locks && !cpu.preempt_depth && !current.cost.depth);
-    assert(current.wait.phase==KERNEL_WAIT_FINISHED);
+    assert(kernel_wait_record_phase(&current.wait)==KERNEL_WAIT_FINISHED);
     worker_depth=current.cost.depth;publish(&finished);wait_flag(&quit_worker);return NULL;
 }
 int main(int argc,char **argv)

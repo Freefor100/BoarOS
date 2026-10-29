@@ -60,7 +60,7 @@ static int futex_wake_entry_locked(struct kernel_wait_node *node)
 }
 void kernel_futex_request_release(struct kernel_futex_request *request)
 {
-    if(request->task->wait.phase!=KERNEL_WAIT_FINISHED)__builtin_trap();
+    if(kernel_wait_record_phase(&request->task->wait)!=KERNEL_WAIT_FINISHED)__builtin_trap();
     /* token和节点借用已经结束；此时由执行者或独占退出清理者拥有请求。 */
     if(request->task->futex_request!=request)__builtin_trap();
     request->task->futex_request=0;

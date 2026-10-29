@@ -139,7 +139,7 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - 单 hart OTHER 按周期 tick 轮转；FIFO/RR 使用 1–99 实时优先级，RR 片长 100ms；实际运行时间驱动全局 RT 配额与额外 timer deadline。
 - 普通内核/用户任务分别拥有私有 4 KiB 元数据页与 8 KiB 连续物理内核栈；用户任务持有可共享 MM 引用和独立 TID/线程组身份；boot context 成为永久 idle，继续使用静态 boot stack。
 - 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在可信栈上先释放已停止执行的任务栈，继续完成 MM/文件等清理；TID 与元数据按组关系和 wait 生命周期释放。
-- 队列临界区保存并关闭 SIE；interruptible wait 使用同一 blocked 链并由未阻塞 pending signal 返回 `SIGNALLED`，vfork 等资源生命周期等待保持不可中断。F/D 状态由 scheduler switch 的 FS Dirty 检查按需保存/恢复；不为尚未实现的 SMP 或 V 状态建立占位层，MM/身份/信号字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
+- 队列临界区保存并关闭 SIE；interruptible wait 由未阻塞 pending signal 返回 `SIGNALLED`，vfork 等资源生命周期等待保持不可中断。F/D 状态由 scheduler switch 的 FS Dirty 检查按需保存/恢复；MM/身份/信号字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
 
 这些选择形成完整、可测的内核线程闭环，同时把以后可能变化的策略、栈布局和 per-hart 组织留在模块内部。RISC-V context 机制可在 QEMU `virt` 与 VisionFive 2 复用；平台 timebase 仍由 DTB 决定。LoongArch 需要自己的 switch context、CSR/中断和 16 KiB 栈页实现，不能复用 RISC-V 汇编。
 
@@ -156,9 +156,9 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 
 ## 阻塞与唤醒（当前结论）
 
-- BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入其优先级队尾，被唤醒者从原调用点返回后必须重查条件。所有 BLOCKED 任务都在全局 blocked 链上，事件通道（wait_queue 令牌）与超时（deadline 刻度）是任务的字段而不是独立节点，唤醒按 FIFO 走链。
-- 单 hart 下，检查条件与登记阻塞之间若打开中断，事件可能提前发生并造成丢失唤醒。因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 入口天然关中断。当前已有用户线程；将来引入 SMP 时，还必须用锁和跨 hart 内存序保护同一条件与等待队列，单纯关闭本地中断不再足够。
-- 超时唤醒与事件唤醒共用一条 blocked 链：timer 处理器在抢占检查之前处理到期 deadline，使刚到期的任务能参与本次选取。通用等待 deadline 由按 (deadline, tid) 排序的索引组织，每次到期只弹出已到期者；最早睡眠期限与 RT 预算、RR 片尾共同参与 SBI 重装，短睡眠不再固定等待下一次 100 Hz tick。关中断、IRQ 延迟和更高优先级任务仍会延后实际运行，不能宣称硬上界。索引维护与成本边界见模块文档。
+- BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入其优先级队尾，被唤醒者从原调用点返回后必须重查条件。等待节点按事件队列登记，期限和完成原因由任务的等待记录保存。
+- 单 hart 下，检查条件与登记阻塞之间若打开中断，事件可能提前发生并造成丢失唤醒。因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 入口天然关中断。SMP 下同一条件与等待队列还要通过锁和跨 hart 内存序保护，单纯关闭本地中断不够。
+- timer 处理器在抢占检查之前处理到期 deadline，使刚到期的任务能参与本次选取。通用等待 deadline 由按 (deadline, tid) 排序的索引组织，每次到期只弹出已到期者；最早睡眠期限与 RT 预算、RR 片尾共同参与 SBI 重装，短睡眠不再固定等待下一次 100 Hz tick。关中断、IRQ 延迟和更高优先级任务仍会延后实际运行，不能宣称硬上界。索引维护与成本边界见模块文档。
 
 ## FP 状态为什么不塞进基础 Trap Frame
 

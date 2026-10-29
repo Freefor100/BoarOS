@@ -10,38 +10,7 @@
 
 #include "private.h"
 
-/* BLOCKED成员位于blocked链；等待节点保存事件队列，wait record保存期限。
- * 事件按队列FIFO通知；期限AVL只访问到期成员，不扫描整条blocked链。 */
-
-void blocked_append(struct kernel_task *thread)
-{
-    thread->blocked_previous = scheduler.blocked_tail;
-    thread->next = 0;
-    if (scheduler.blocked_tail == 0) {
-        scheduler.blocked_head = thread;
-    } else {
-        scheduler.blocked_tail->next = thread;
-    }
-    scheduler.blocked_tail = thread;
-}
-
-void blocked_unlink(struct kernel_task *thread)
-{
-    struct kernel_task *previous = thread->blocked_previous;
-    if (previous == 0) {
-        scheduler.blocked_head = thread->next;
-    } else {
-        previous->next = thread->next;
-    }
-    if (scheduler.blocked_tail == thread) {
-        scheduler.blocked_tail = previous;
-    }
-    if (thread->next != 0) {
-        thread->next->blocked_previous = previous;
-    }
-    thread->blocked_previous = 0;
-    thread->next = 0;
-}
+/* 事件由等待队列通知，有期限的等待另由AVL索引到期任务。 */
 
 /*
  * Tasks with a timeout enter an intrusive AVL keyed by (deadline, tid).
@@ -184,15 +153,13 @@ struct kernel_task *deadline_index_first(void)
     return task;
 }
 
-/* STOPPED tasks park on their own list so the blocked-list invariant
- * (state == BLOCKED) stays intact; SIGCONT/SIGKILL move them back to
- * the ready queue. */
+/* STOPPED tasks are indexed until SIGCONT/SIGKILL moves them to READY. */
 void stopped_append_locked(struct kernel_task *thread)
 {
 #if BOAROS_USER_SMP
     scheduler_user_reservation_release_locked(thread);
 #endif
-    thread->blocked_previous = scheduler.stopped_tail;
+    thread->stopped_previous = scheduler.stopped_tail;
     thread->next = 0;
     if (scheduler.stopped_tail == 0) {
         scheduler.stopped_head = thread;
@@ -204,15 +171,15 @@ void stopped_append_locked(struct kernel_task *thread)
 
 void stopped_unlink_locked(struct kernel_task *thread)
 {
-    struct kernel_task *previous = thread->blocked_previous;
+    struct kernel_task *previous = thread->stopped_previous;
     if (previous) previous->next = thread->next;
     else {
         if (scheduler.stopped_head != thread) __builtin_trap();
         scheduler.stopped_head = thread->next;
     }
-    if (thread->next) thread->next->blocked_previous = previous;
+    if (thread->next) thread->next->stopped_previous = previous;
     else scheduler.stopped_tail = previous;
-    thread->next = thread->blocked_previous = 0;
+    thread->next = thread->stopped_previous = 0;
 }
 void stopped_append(struct kernel_task *thread)
 { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); stopped_append_locked(thread); }
@@ -249,7 +216,6 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
     kernel_cost_block(&task->cost);
 #endif
     task->state = KERNEL_THREAD_STATE_BLOCKED;
-    blocked_append(task);
 }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 {
@@ -258,7 +224,6 @@ void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
     if (reason == KERNEL_WAIT_TIMEOUT && task->wait.deadline)
         kernel_cost_timeout(&task->cost, task->wait.deadline);
 #endif
-    blocked_unlink(task);
     deadline_index_remove(task);
     kernel_wait_node_remove_locked(&task->default_wait_node);
     (void)reason; /* 通知者在摘除期限索引后发布record.reason/phase。 */
@@ -275,7 +240,7 @@ void kernel_wait_backend_quiesce(void)
 }
 void scheduler_wake_task(struct kernel_task *task, uint32_t reason)
 {
-    struct kernel_wait_token token = { task, task->wait.generation };
+    struct kernel_wait_token token = { task, kernel_wait_record_generation(&task->wait) };
     (void)kernel_wait_notify(&token, reason);
 }
 
@@ -292,7 +257,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
             for (unsigned n = 0; n < 16; n++) {
                 struct kernel_task *task = deadline_index_first();
                 if (!task || (int64_t)(now - task->wait.deadline) < 0) { done = 1; break; }
-                struct kernel_wait_token token = {task, task->wait.generation};
+                struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
                 COST_ADD(DEADLINE_VISITS, 1);
                 if (!kernel_wait_notify_locked(&token, KERNEL_WAIT_TIMEOUT)) __builtin_trap();
             }
@@ -327,7 +292,7 @@ enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *ta
     if (!task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task->wait.interruptible) {
-        struct kernel_wait_token token = {task, task->wait.generation};
+        struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
         kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
     }
     return KERNEL_SCHEDULER_STATUS_OK;

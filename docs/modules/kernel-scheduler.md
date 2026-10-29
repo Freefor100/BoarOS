@@ -49,6 +49,9 @@ SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
 原因，旧代次与重复通知无效，任务页复用也不重用代次。多队列节点通过`kernel_wait_node_bind`共享token。
 代次耗尽返回INVALID_STATE且不发布新登记，重复等待和错误owner属于fatal。
+SMP 的代次、等待阶段和通知原因合在一个原子状态中。对尚未提交阻塞的 token，定向通知可直接完成
+PREPARED 到 NOTIFIED 的转换；park 在调度域内竞争提交 COMMITTED，若通知先完成就不切栈。
+已经提交的等待仍在调度域内摘期限、修改任务状态并发布 READY；这样旧栈和运行归属仍由调度器交接。
 事件队列只由实际等待节点保存，期限、原因和可中断性只由wait record保存。通知先按原期限
 摘除AVL，再发布完成原因；finish收完节点及借用后才清空record，futex requeue直接迁移节点。
 
@@ -268,7 +271,7 @@ RV与LA使用同一事件位发布原语，各自保留硬件确认及IPI发送�
 
 ## 等待与 futex
 
-所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务同时进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
+BLOCKED 状态由任务的等待记录维护；事件等待按实际等待队列登记和通知，不另维护全局阻塞任务链。队列 wake-one 取队首，wake-all 唤醒全部；摘除队列成员为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
 
 MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑 gate；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。private WAIT、CMP_REQUEUE 和 WAKE_OP 沿共同用户 pin 协议，在 metadata raw 内检查当前 PTE、访问许可并取得实际页引用；新许可关闭时先等待开放，缺页或 COW 先调用 resolver，再重新取得 pin。共享 key 需要 operation gate 固定整组映射视图，再由 metadata raw 检查当前 PTE 并取得页许可；所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
 

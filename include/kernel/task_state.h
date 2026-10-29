@@ -215,7 +215,7 @@ struct kernel_task {
     int16_t group_signal_code[KERNEL_SIGNAL_COUNT];
     struct kernel_signal_child_info group_child_info;
     struct kernel_wait_node default_wait_node;
-    struct kernel_task *blocked_previous;
+    struct kernel_task *stopped_previous;
     /* 等待owner替换旧单地址futex字段，保留后续信号/文件热字段位置。 */
     struct kernel_futex_request *futex_request;
     struct kernel_futex_pi_state *pi_owned;

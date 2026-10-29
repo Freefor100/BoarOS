@@ -269,19 +269,19 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
         if (abandon_park) {
             /* Model forced scheduler teardown: finish the stopped wait on its
              * executing CPU, then abandon the syscall stack without unwinding. */
-            struct kernel_wait_token token = {t, t->wait.generation};
+            struct kernel_wait_token token = {t, kernel_wait_record_generation(&t->wait)};
             kernel_wait_notify(&token, KERNEL_WAIT_SIGNALLED);
             assert(!kernel_wait_finish(&token));
             pthread_exit(0);
         }
     }
     if (wake_on_park >= 0) {
-        struct kernel_wait_token token = {t, t->wait.generation};
+        struct kernel_wait_token token = {t, kernel_wait_record_generation(&t->wait)};
         kernel_wait_notify(&token, wake_on_park);
     }
     {
         KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
-        assert(t->wait.phase == KERNEL_WAIT_NOTIFIED);
+        assert(kernel_wait_record_phase(&t->wait) == KERNEL_WAIT_NOTIFIED);
         t->wait.on_cpu = 1;
     }
     return 0;

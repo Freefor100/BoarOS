@@ -313,7 +313,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         task->vfork_wait_child = 0;
         task->vfork_waiting = 0;
         if (task->state == KERNEL_THREAD_STATE_BLOCKED && task->default_wait_node.queue == &task->vfork_done_queue) {
-            struct kernel_wait_token token = {task, task->wait.generation};
+            struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
             (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
         }
     }
@@ -324,7 +324,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         else ready_enqueue_locked(task, 0);
     }
     if (task->wait.interruptible) {
-        struct kernel_wait_token token = {task, task->wait.generation};
+        struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
         (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
     }
 }
@@ -2190,7 +2190,7 @@ static void process_begin_exit(struct kernel_task *current,
 {
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (current->wait.phase != KERNEL_WAIT_FINISHED || current->wait.nodes || current->wait.borrows)
+        if (kernel_wait_record_phase(&current->wait) != KERNEL_WAIT_FINISHED || current->wait.nodes || current->wait.borrows)
             __builtin_trap();
         current->proc_exiting = 1;
         if (!current->group_exiting) current->completion = *completion;

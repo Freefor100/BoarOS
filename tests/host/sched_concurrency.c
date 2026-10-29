@@ -96,7 +96,7 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task
     /* The real prepare/commit/finish path is linked here. Actual old/new stack
      * handoff has its separate host and guest tests; this shim supplies a wake. */
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_wait_token token = {task, task->wait.generation};
+    struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
     assert(kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN));
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -348,12 +348,12 @@ static void event_claim_handoff(void)
     active_cpu->current = waiter;
     struct kernel_wait_token parent_wait, cleanup_wait;
     assert(kernel_wait_prepare(&tasks[0].child_exit_queue, 0, 0, &parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
-    assert(waiter->wait.phase == KERNEL_WAIT_PREPARED && tasks[0].child_exit_queue.registrations == 1);
+    assert(kernel_wait_record_phase(&waiter->wait) == KERNEL_WAIT_PREPARED && tasks[0].child_exit_queue.registrations == 1);
     /* Empty and direct task notification stay within their protecting domain;
      * they must not create a cursor/storage borrow that survives the unlock. */
     group_lock_calls = 0;
     wake_waiting_parent(child);
-    assert(group_lock_calls <= 1 && waiter->wait.phase == KERNEL_WAIT_NOTIFIED);
+    assert(group_lock_calls <= 1 && kernel_wait_record_phase(&waiter->wait) == KERNEL_WAIT_NOTIFIED);
     assert(!tasks[0].storage_borrows && !tasks[0].child_exit_queue.borrows);
     assert(kernel_wait_finish(&parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
     group_lock_calls = 0;
@@ -373,7 +373,7 @@ static void event_claim_handoff(void)
     assert(kernel_wait_prepare(&scheduler.cleanup_queue, 0, 0, &cleanup_wait) == KERNEL_SCHEDULER_STATUS_OK);
     /* EFAULT releases only the claim; both actual registrations are notified. */
     scheduler_task_wait_claim_release(child);
-    assert(waiter->wait.phase == KERNEL_WAIT_NOTIFIED && idles[0].wait.phase == KERNEL_WAIT_NOTIFIED);
+    assert(kernel_wait_record_phase(&waiter->wait) == KERNEL_WAIT_NOTIFIED && kernel_wait_record_phase(&idles[0].wait) == KERNEL_WAIT_NOTIFIED);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         assert(scheduler_cleanup_ready_locked());

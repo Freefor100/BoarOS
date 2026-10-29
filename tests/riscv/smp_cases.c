@@ -1083,7 +1083,7 @@ void riscv_smp_test_poll(void)
     if (!__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       require(!scheduler.all_tasks && !scheduler.task_count && !scheduler.runqueue.first &&
-              !scheduler.blocked_head && !scheduler.deadline_root && !scheduler.exited_head &&
+              !scheduler.deadline_root && !scheduler.exited_head &&
               !scheduler.retired_pending && !scheduler.retired_tasks && !scheduler.controlled_owners &&
               !kernel_cpu_current()->switch_previous, "test-scheduler-owner-baseline"); }
     require(physical_page_available(allocator) == baseline, "test-page-baseline");

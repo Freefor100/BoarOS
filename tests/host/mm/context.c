@@ -153,7 +153,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
     __atomic_fetch_add(&parked[actor_id], 1, __ATOMIC_RELEASE);
 }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
-{ task->wait.reason = reason; task->state = KERNEL_THREAD_STATE_READY; }
+{ (void)reason; task->state = KERNEL_THREAD_STATE_READY; }
 void kernel_wait_backend_ready(struct kernel_task *task)
 {
     struct mm_test_actor *owner = (struct mm_test_actor *)task;

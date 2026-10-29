@@ -83,7 +83,7 @@ uint64_t kernel_wait_backend_time(void) { return 1; }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
 { (void)deadline; (void)interruptible; task->state = KERNEL_THREAD_STATE_BLOCKED; __atomic_fetch_add(&parked[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
-{ task->wait.reason = reason; task->state = KERNEL_THREAD_STATE_READY; }
+{ (void)reason; task->state = KERNEL_THREAD_STATE_READY; }
 void kernel_wait_backend_ready(struct kernel_task *task)
 { __atomic_store_n(&granted[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); __atomic_store_n(host_of(task)->dispatch, 1, __ATOMIC_RELEASE); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
@@ -98,7 +98,7 @@ void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_raw_guard *guard)
 {
     if(spin_mode==1 && raw==&lock.metadata && host_current.id==1 &&
-       current.wait.phase==KERNEL_WAIT_FINISHED && spin_clock_reads)
+       kernel_wait_record_phase(&current.wait)==KERNEL_WAIT_FINISHED && spin_clock_reads)
         __atomic_store_n(&spin_metadata_seen,1,__ATOMIC_RELEASE);
     if (segment_enabled && raw == &lock.metadata && lock.handoff_owner &&
         lock.readers == 16 && host_current.id == 2) {
@@ -109,7 +109,7 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_r
         result = pthread_barrier_wait(&segment_released);
         assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
     }
-    if (raw == &lock.metadata && host_current.id == 1 && current.wait.phase == KERNEL_WAIT_FINISHED &&
+    if (raw == &lock.metadata && host_current.id == 1 && kernel_wait_record_phase(&current.wait) == KERNEL_WAIT_FINISHED &&
         __atomic_load_n(&parked[0], __ATOMIC_ACQUIRE) == 1 &&
         __atomic_exchange_n(&finish_pause, 0, __ATOMIC_ACQ_REL)) {
         int result = pthread_barrier_wait(&finish_entered);
@@ -150,7 +150,7 @@ static void *worker(void *argument)
     if (id == 1) sync_test_irq = handoff_irq;
     kernel_lock_release(&guard);
     assert(sync_test_irq == (id == 1 ? handoff_irq : 1));
-    assert(!current.io_context.locks && current.wait.phase == KERNEL_WAIT_FINISHED);
+    assert(!current.io_context.locks && kernel_wait_record_phase(&current.wait) == KERNEL_WAIT_FINISHED);
     return 0;
 }
 static void queued(unsigned expected)
@@ -302,7 +302,7 @@ static void *spin_waiter(void *unused)
     sync_test_irq=spin_irq;
     struct kernel_lock_guard guard={0};kernel_rwlock_write(&lock,&guard);
     assert(sync_test_irq==spin_irq && guard.owner==&current.io_context && guard.write &&
-           current.wait.phase==KERNEL_WAIT_FINISHED && !cpu.raw_locks && !cpu.preempt_depth);
+           kernel_wait_record_phase(&current.wait)==KERNEL_WAIT_FINISHED && !cpu.raw_locks && !cpu.preempt_depth);
     assert(spin_mode==1?!parked[0]:parked[0]==1);
     __atomic_store_n(&entered[0],1,__ATOMIC_RELEASE);
     kernel_lock_release(&guard);
@@ -365,7 +365,7 @@ static void *spin_budget_waiter(void *unused)
     sync_test_irq=spin_irq;
     struct kernel_lock_guard guard={0};kernel_rwlock_write(&lock,&guard);
     assert(sync_test_irq==spin_irq && guard.owner==&current.io_context && guard.write &&
-           current.wait.phase==KERNEL_WAIT_FINISHED && !cpu.raw_locks && !cpu.preempt_depth &&
+           kernel_wait_record_phase(&current.wait)==KERNEL_WAIT_FINISHED && !cpu.raw_locks && !cpu.preempt_depth &&
            (spin_long_expected?!parked[0]:parked[0]==1));
     __atomic_store_n(&entered[0],1,__ATOMIC_RELEASE);kernel_lock_release(&guard);
     assert(sync_test_irq==spin_irq && !current.io_context.locks);return NULL;

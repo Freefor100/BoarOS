@@ -55,7 +55,7 @@ void __real_kernel_wait_backend_notify(struct kernel_task *, uint32_t);
 void __wrap_kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 {
     if (fast_notification) {
-        assert(task->wait.phase == KERNEL_WAIT_COMMITTED);
+        assert(kernel_wait_record_phase(&task->wait) == KERNEL_WAIT_COMMITTED);
         assert(!task->default_wait_node.references && !task->wait.borrows);
     }
     /* Production notification removes the default node before ready publication. */
@@ -277,11 +277,10 @@ static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
         struct kernel_task *task = &synthetic[i];
         *task = (struct kernel_task){0};
         synthetic_entries[i]=(struct kernel_futex_entry){.key=*key,.bitset=1};
-        task->wait.generation = 1000 + i;
-        task->wait.phase = KERNEL_WAIT_PREPARED;
+        kernel_wait_record_store(&task->wait,1000+i,KERNEL_WAIT_PREPARED,KERNEL_WAIT_WOKEN);
         task->wait.on_cpu = 1;
         kernel_wait_node_init(&synthetic_entries[i].node, task);
-        synthetic_entries[i].node.generation = task->wait.generation;
+        synthetic_entries[i].node.generation = kernel_wait_record_generation(&task->wait);
         task->wait.nodes = &synthetic_entries[i].node;
         kernel_wait_node_add_locked(futex_queue, &synthetic_entries[i].node);
     }
@@ -322,9 +321,9 @@ static void wake_batches(void)
         !kernel_cpu_current()->preempt_depth);
     notification_probe = 0;
     fast_notification = 0;
-    assert(synthetic[0].wait.phase == KERNEL_WAIT_PREPARED &&
-        synthetic[1].wait.phase == KERNEL_WAIT_PREPARED &&
-        synthetic[2].wait.phase == KERNEL_WAIT_NOTIFIED);
+    assert(kernel_wait_record_phase(&synthetic[0].wait) == KERNEL_WAIT_PREPARED &&
+        kernel_wait_record_phase(&synthetic[1].wait) == KERNEL_WAIT_PREPARED &&
+        kernel_wait_record_phase(&synthetic[2].wait) == KERNEL_WAIT_NOTIFIED);
     assert(!pthread_join(worker, 0) && w.result == 0);
     assert(measured_wake(source + 1024, 1) == 1 && domain_takes == 1);
     assert(measured_wake(source, 2) == 1 && domain_takes == 1);
@@ -334,18 +333,16 @@ static void wake_batches(void)
     synthetic_add(17, &key);
     assert(measured_wake(source, 1) == 17 && domain_takes > 1);
     for (unsigned i = 0; i < 17; i++)
-        assert(synthetic[i].wait.phase == KERNEL_WAIT_NOTIFIED);
+        assert(kernel_wait_record_phase(&synthetic[i].wait) == KERNEL_WAIT_NOTIFIED);
     synthetic_remove(17);
     /* Timeout notification does not dequeue a still-running waiter. A real
      * wake before unqueue must consume this entry and report its wake count. */
     synthetic_add(1, &key);
-    synthetic[0].wait.phase = KERNEL_WAIT_NOTIFIED;
-    synthetic[0].wait.reason = KERNEL_WAIT_TIMEOUT;
+    kernel_wait_record_store(&synthetic[0].wait,1000,KERNEL_WAIT_NOTIFIED,KERNEL_WAIT_TIMEOUT);
     assert(measured_wake(source, 1) == 1);
     synthetic_remove(1);
     synthetic_add(1,&key);
-    synthetic[0].wait.phase=KERNEL_WAIT_NOTIFIED;
-    synthetic[0].wait.reason=KERNEL_WAIT_TIMEOUT;
+    kernel_wait_record_store(&synthetic[0].wait,1000,KERNEL_WAIT_NOTIFIED,KERNEL_WAIT_TIMEOUT);
     assert(call(source,3|128,0,1,target,0)==1);
     assert(call(target,1|128,1,0,0,0)==1);
     synthetic_remove(1);

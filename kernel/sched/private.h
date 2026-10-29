@@ -62,8 +62,6 @@ struct kernel_scheduler {
     struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
-    struct kernel_task *blocked_head;
-    struct kernel_task *blocked_tail;
     struct kernel_task *deadline_root;
     struct kernel_task *stopped_head;
     struct kernel_task *stopped_tail;
@@ -197,8 +195,6 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 void ready_append(struct kernel_task *thread);
 int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
 void scheduler_forget_task(struct kernel_task *thread);
-void blocked_append(struct kernel_task *thread);
-void blocked_unlink(struct kernel_task *thread);
 void deadline_index_insert(struct kernel_task *task);
 void deadline_index_remove(struct kernel_task *task);
 struct kernel_task *deadline_index_first(void);

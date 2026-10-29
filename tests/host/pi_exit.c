@@ -46,14 +46,14 @@ int main(void)
     struct kernel_futex_pi_request waiter={.task=&next,.state=&state,.queued=1,.order=1};
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
      assert(state.attached&&state.owner==&owner&&bucket.pi_states==&state);
-     next.pi_request=&waiter;next.wait.generation=123;next.wait.phase=KERNEL_WAIT_PREPARED;
+     next.pi_request=&waiter;kernel_wait_record_store(&next.wait,123,KERNEL_WAIT_PREPARED,KERNEL_WAIT_WOKEN);
      waiter.token=(struct kernel_wait_token){&next,123};state.head=state.tail=&waiter;state.references++;}
     kernel_lock_release(&publisher);assert(!pthread_join(thread,0));
     assert(state.owner==&next&&state.attached&&!owner.pi_owned&&next.pi_owned==&state);
     assert(waiter.granted==2&&!waiter.queued&&!owner_refs&&next_refs==1&&state.references==2);
     kernel_futex_pi_cleanup_end(&next);
     assert(!bucket.pi_states&&!state.attached&&!state.owner&&!next_refs);
-    next.wait.phase=KERNEL_WAIT_FINISHED;kernel_futex_pi_abort(&next);
+    kernel_wait_record_store(&next.wait,123,KERNEL_WAIT_FINISHED,KERNEL_WAIT_WOKEN);kernel_futex_pi_abort(&next);
     assert(!next.pi_request&&state.references==1);
     puts("PI owner exit waits for actual bucket publisher; subsequent waiter receives owner and references balance PASS");
 }

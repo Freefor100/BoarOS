@@ -84,12 +84,12 @@ static void release_probe(void *unused)
 {
     (void)unused;
     (void)arch_interrupt_save();
-    check(cleanup_phase == 1 && scheduler.cleanup_task->wait.phase == KERNEL_WAIT_COMMITTED &&
+    check(cleanup_phase == 1 && kernel_wait_record_phase(&scheduler.cleanup_task->wait) == KERNEL_WAIT_COMMITTED &&
           !scheduler.cleanup_task->wait.on_cpu);
     cleanup_phase = 2;
     scheduler_task_wait_claim_release(held_task);
     check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
-    check(cleanup_phase == 3 && scheduler.cleanup_task->wait.phase == KERNEL_WAIT_COMMITTED &&
+    check(cleanup_phase == 3 && kernel_wait_record_phase(&scheduler.cleanup_task->wait) == KERNEL_WAIT_COMMITTED &&
           !scheduler.cleanup_task->wait.on_cpu);
     cleanup_phase = 4;
     scheduler_task_put(held_task);
