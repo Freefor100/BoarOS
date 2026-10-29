@@ -409,8 +409,7 @@ static enum kernel_files_status disk_read(
         kernel_open_file_read_progress(description,batch_start,(size_t)(position-batch_start),cache_miss);
         /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
         kernel_uaccess_write_cursor_finish(&user_copy);
-        for (size_t i = 0; i < count; i++) if (!pages[i].status)
-            if (physical_page_release(data_allocator, pages[i].physical_address)) __builtin_trap();
+        kernel_page_cache_put_batch(kernel_open_file_page_cache(description), pages, count);
     }
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
     KERNEL_FILES_NOTE(files, bytes_read, total);
@@ -1138,10 +1137,14 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             enum kernel_page_cache_status loaded;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
             if (!memory) {
-                struct kernel_page_cache_read_page page;
+                struct kernel_page_cache_read_page page = {0};
                 loaded=kernel_page_cache_get_batch(kernel_open_file_page_cache(input),&input->file,
                     position>>BOAROS_PAGE_SHIFT,&page,1);
-                if (!loaded) {physical=page.physical_address;valid=page.valid_bytes;cache_miss=page.cache_miss;}
+                if (!loaded) {
+                    physical=page.physical_address;valid=page.valid_bytes;cache_miss=page.cache_miss;
+                    if (physical_page_acquire(kernel_open_file_page_cache(input)->allocator, physical)) __builtin_trap();
+                    kernel_page_cache_put_batch(kernel_open_file_page_cache(input), &page, 1);
+                }
             } else
 #endif
                 loaded=memory?kernel_open_file_lookup_page(input,position>>BOAROS_PAGE_SHIFT,&physical,&valid):

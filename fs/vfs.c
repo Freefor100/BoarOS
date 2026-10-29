@@ -1724,8 +1724,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
 #endif
             *bytes_read += copied; offset += copied; start = 0;
         }
-        for (size_t i = 0; i < count; i++) if (!pages[i].status)
-            if (physical_page_release(cache->allocator, pages[i].physical_address)) __builtin_trap();
+        kernel_page_cache_put_batch(cache, pages, count);
         if (error) { result = error; break; }
     }
     if (pages != &single) kernel_heap_release(node->instance->heap, pages);
