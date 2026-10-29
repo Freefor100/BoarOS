@@ -194,7 +194,7 @@ void kernel_futex_pi_abort(struct kernel_task *task)
     struct kernel_futex_pi_request *request=task->pi_request;
     if(!request)return;
     /* process_begin_exit 已结束真实等待；旧栈仅剩未归还的操作owner。 */
-    if(task->wait.phase!=KERNEL_WAIT_FINISHED)__builtin_trap();
+    if(kernel_wait_record_phase(&task->wait)!=KERNEL_WAIT_FINISHED)__builtin_trap();
     request_finish(request,1);
 }
 static int prepare_word(struct kernel_futex_pi_request *request,enum kernel_scheduler_status *status)

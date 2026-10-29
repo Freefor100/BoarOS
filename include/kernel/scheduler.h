@@ -160,6 +160,8 @@ enum kernel_wait_wake_reason {
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
 
 struct kernel_wait_node;
+/* 通知方须在使用期间保有稳定的 token 和任务存储：对象锁或实际借用
+ * 覆盖共享请求；跨保护使用的通知方持有不可变副本。 */
 struct kernel_wait_token {
     struct kernel_task *task;
     uint64_t generation;

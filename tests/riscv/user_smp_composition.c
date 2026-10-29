@@ -333,7 +333,7 @@ static void run(void *unused)
                   struct kernel_task *task=process_find_identity((kernel_pid_t)control->target_tid,KERNEL_PID_TID);
                   check(task!=0);
                   struct kernel_wait_record *record=kernel_wait_record_of(task);
-                  parked=record->phase==KERNEL_WAIT_COMMITTED && !record->on_cpu;
+                  parked=kernel_wait_record_phase(record)==KERNEL_WAIT_COMMITTED && !record->on_cpu;
                 }
                 if(parked)break;
                 relinquish();
@@ -610,7 +610,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_to
         if (current_epoch && !kernel_task_tid(token->task,&tid)) {
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             struct kernel_wait_record *record=kernel_wait_record_of(token->task);
-            if (record->generation==token->generation && record->phase==KERNEL_WAIT_PREPARED) {
+            if (kernel_wait_record_generation(record)==token->generation && kernel_wait_record_phase(record)==KERNEL_WAIT_PREPARED) {
                 if (epoch!=current_epoch) { epoch=current_epoch;registered_mask=0; }
                 for (unsigned i=0;i<32;i++) if (tid>0 && composition_load(&control->participants[i])==(uint64_t)tid && !(registered_mask&(UINT64_C(1)<<i))) {
                     registered_mask|=UINT64_C(1)<<i;waits++;

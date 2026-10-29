@@ -134,13 +134,13 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
 {
     __atomic_fetch_or(&waiting,1U<<(unsigned)(t-tasks),__ATOMIC_RELEASE);
     if(abandon_wait){
-        struct kernel_wait_token token={t,t->wait.generation};
+        struct kernel_wait_token token={t,kernel_wait_record_generation(&t->wait)};
         assert(!kernel_wait_notify(&token,KERNEL_WAIT_SIGNALLED));assert(!kernel_wait_finish(&token));abandon_pause();
     }
-    if(forced_reason>=0){struct kernel_wait_token token={t,t->wait.generation};assert(!kernel_wait_notify(&token,(unsigned)forced_reason));}
+    if(forced_reason>=0){struct kernel_wait_token token={t,kernel_wait_record_generation(&t->wait)};assert(!kernel_wait_notify(&token,(unsigned)forced_reason));}
     for(;;){
         {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-         if(t->wait.phase==KERNEL_WAIT_NOTIFIED){t->wait.on_cpu=1;break;}}
+         if(kernel_wait_record_phase(&t->wait)==KERNEL_WAIT_NOTIFIED){t->wait.on_cpu=1;break;}}
         sched_yield();
     }
     return 0;

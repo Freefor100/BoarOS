@@ -126,7 +126,7 @@ static void tcp_wait_preparing(struct kernel_wait_queue *queue)
 {
     assert(!tcp_timeout_observe || !tcp_timeout_nonblock);
     if(tcp_wait_role==1 && tcp_wait_active && queue!=tcp_wait_queue &&
-        kernel_task_current()->wait.phase!=KERNEL_WAIT_FINISHED)
+        kernel_wait_record_phase(&kernel_task_current()->wait)!=KERNEL_WAIT_FINISHED)
         fputs("FAIL socket recheck tries a second wait token while its socket token is live\n",stderr);
 }
 static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
@@ -140,7 +140,7 @@ static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
         assert(!deadline && !kernel_task_current()->wait.interruptible && tcp_write_held==2 &&
             !tcp_protocol_held() && tcp_write_queued_request->task==kernel_task_current() &&
             tcp_write_queued_request->completion.task==kernel_task_current() &&
-            tcp_write_queued_request->completion.generation==kernel_task_current()->wait.generation);
+            tcp_write_queued_request->completion.generation==kernel_wait_record_generation(&kernel_task_current()->wait));
         __atomic_fetch_add(&tcp_write_queued_ready,1,__ATOMIC_RELEASE);
     }
     if(unix_deadline_active && queue==unix_deadline_queue) {
@@ -153,8 +153,8 @@ static void tcp_wait_prepared(struct kernel_wait_queue *queue,uint64_t deadline)
         unix_deadlines[unix_deadline_prepared++]=deadline;
     }
     if(tcp_wait_role!=1 || !tcp_wait_active || queue!=tcp_wait_queue) return;
-    assert(!tcp_wait_registered && kernel_task_current()->wait.phase==KERNEL_WAIT_PREPARED);
-    tcp_wait_generation=kernel_task_current()->wait.generation;
+    assert(!tcp_wait_registered && kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_PREPARED);
+    tcp_wait_generation=kernel_wait_record_generation(&kernel_task_current()->wait);
     assert(!tcp_protocol_held() && kernel_cpu_current()->raw_locks &&
         kernel_cpu_current()->raw_locks->lock->rank==KERNEL_RAW_RANK_OBJECT);
     __atomic_store_n(&tcp_wait_registered,1,__ATOMIC_RELEASE);
@@ -188,14 +188,14 @@ static void tcp_wait_finishing(const struct kernel_wait_token *token)
 static void tcp_wait_finished(void)
 {
     if(!tcp_finishing_socket) return;
-    assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED && !tcp_protocol_held());
+    assert(kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED && !tcp_protocol_held());
     tcp_wait_finish_count++;tcp_finishing_socket=0;
     __atomic_store_n(&tcp_wait_token_finished,1,__ATOMIC_RELEASE);
 }
 static void tcp_wait_locking(struct kernel_rwlock *lock)
 {
     if(tcp_wait_role!=1 || !tcp_wait_active || lock->rank!=25) return;
-    if(tcp_wait_registered) assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    if(tcp_wait_registered) assert(kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED);
     if(tcp_wait_finish_count) tcp_wait_relocked++;
 }
 static void *tcp_wait_caller(void *argument)
@@ -207,7 +207,7 @@ static void *tcp_wait_caller(void *argument)
         kernel_files_write(handle,&mm,0,0x200000,8,&tcp_wait_bytes):
         kernel_files_read(handle,&mm,1,0x201000,8,&tcp_wait_bytes);
     assert(tcp_wait_writing?tcp_timeout_sends>0:tcp_timeout_receives>0);tcp_timeout_observe=0;
-    assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    assert(kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED);
     __atomic_store_n(&tcp_wait_caller_done,1,__ATOMIC_RELEASE);
     tcp_wait_role=0;mm_test_finish();return NULL;
 }
@@ -492,7 +492,7 @@ static void unix_receive_deadline_case(struct kernel_heap *heap)
     unix_deadline_active=0;assert(!pthread_join(competitor,0));
     assert(result==-KERNEL_EAGAIN && unix_deadline_reservations==3 && unix_deadline_prepared==2);
     assert(unix_deadlines[0]==1020 && unix_deadlines[1]==1020 && unix_deadline_stolen==2);
-    assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED && !kernel_io_context_current()->user_pins);
+    assert(kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED && !kernel_io_context_current()->user_pins);
     assert(physical_page_available(mm.allocator)==before);
     assert(!kernel_files_release(&handle));
     puts("PASS UNIX read SO_RCVTIMEO: two actual park/wake cycles lose data to competing reader, one absolute deadline expires without a third wait");
@@ -521,7 +521,7 @@ static void unix_receive_error_prefix_case(struct kernel_heap *heap)
     }
     assert(!kernel_files_read(&handle,&mm,1,0x200080,8,&result) && !result);
     assert(!kernel_files_release(&handle));
-    assert(!kernel_io_context_current()->user_pins && kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    assert(!kernel_io_context_current()->user_pins && kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED);
     puts("PASS UNIX read completed prefix preserves pending ECONNRESET for the next call, followed by EOF and final owner release");
 }
 static void *tcp_nonblock_clear(void *unused)
@@ -560,7 +560,7 @@ static void tcp_nonblock_io(struct kernel_files *handle,int writing,int vector,i
             writing?"write":"read",vector,message,change,(long long)result,tcp_timeout_receives,tcp_timeout_sends);
     assert(result==-KERNEL_EAGAIN && !tcp_timeout_receives && !tcp_timeout_sends);
     if(change) {assert(!pthread_join(changer,0));assert(tcp_nonblock_attempted && tcp_nonblock_changed && !tcp_nonblock_change);}
-    assert(kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED && !kernel_io_context_current()->user_pins);
+    assert(kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED && !kernel_io_context_current()->user_pins);
 }
 static void tcp_nonblock_timeout_case(struct kernel_heap *heap,int unix_socket)
 {
@@ -779,8 +779,8 @@ static void *tcp_write_protocol_worker(void *unused)
     }
     struct kernel_wait_token token;
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-      assert(tcp_write_caller_task->wait.phase==KERNEL_WAIT_COMMITTED);
-      token=(struct kernel_wait_token){tcp_write_caller_task,tcp_write_caller_task->wait.generation}; }
+      assert(kernel_wait_record_phase(&tcp_write_caller_task->wait)==KERNEL_WAIT_COMMITTED);
+      token=(struct kernel_wait_token){tcp_write_caller_task,kernel_wait_record_generation(&tcp_write_caller_task->wait)}; }
     assert(mm_test_parked(0)==tcp_write_park_baseline+1 &&
         __atomic_load_n(&tcp_write_queued_ready,__ATOMIC_ACQUIRE)==1);
     /* 直接注入提前通知仍须重新检查真实完成状态，不提前归还来源页。 */

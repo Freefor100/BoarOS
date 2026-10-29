@@ -81,7 +81,7 @@ static void setup(void)
     scheduler.allocator=(void *)(uintptr_t)1;kernel_kcmp_initialize();
     for(unsigned i=0;i<2;i++){
         tasks[i].tid=10+(int)i;tasks[i].magic=KERNEL_THREAD_MAGIC;tasks[i].arch.user_mode=1;
-        tasks[i].wait.phase=KERNEL_WAIT_FINISHED;ids[i].generation=i+1;
+        kernel_wait_record_store(&tasks[i].wait,0,KERNEL_WAIT_FINISHED,KERNEL_WAIT_WOKEN);ids[i].generation=i+1;
         tasks[i].identities[KERNEL_PID_TID].identity=&ids[i];
         kernel_raw_lock_init(&tasks[i].files_access,KERNEL_RAW_RANK_TASK_FILES);
         kernel_raw_lock_init(&records[i].metadata_lock,KERNEL_RAW_RANK_OBJECT);

@@ -2458,7 +2458,7 @@ static void netlink_cookie_finish(struct kernel_netlink_cookie **owner,unsigned 
              * reaper must not finish a token belonging to another task. */
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             struct kernel_wait_record *record=kernel_wait_record_of(cookie->token.task);
-            if(record->phase!=KERNEL_WAIT_FINISHED || record->nodes || record->borrows)__builtin_trap();
+            if(kernel_wait_record_phase(record)!=KERNEL_WAIT_FINISHED || record->nodes || record->borrows)__builtin_trap();
             cookie->token=(struct kernel_wait_token){0};
         }
     }

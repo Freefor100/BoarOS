@@ -54,7 +54,8 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
     receiver->signal_blocked=receiver->signal_restore_mask=receiver->user_return_pending=0;
     receiver->signal_pending=0;receiver->group_pending=signal_mask(10)|signal_mask(12);
     waiter->signal_blocked=signal_mask(10);
-    waiter->wait=(struct kernel_wait_record){.phase=KERNEL_WAIT_COMMITTED,.generation=1,.interruptible=1};
+    waiter->wait=(struct kernel_wait_record){.interruptible=1};
+    kernel_wait_record_store(&waiter->wait,1,KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         kernel_wait_backend_commit(waiter,0,1);
@@ -62,21 +63,22 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
     signal_waiter=waiter;signal_receiver=receiver;
     struct kernel_signal_delivery delivery={0};
     assert(kernel_signal_select(receiver,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER && delivery.info.signal==10);
-    assert(waiter->wait.phase==KERNEL_WAIT_NOTIFIED && waiter->wait.reason==KERNEL_WAIT_SIGNALLED);
+    assert(kernel_wait_record_phase(&waiter->wait)==KERNEL_WAIT_NOTIFIED && kernel_wait_record_reason(&waiter->wait)==KERNEL_WAIT_SIGNALLED);
     assert(waiter->state==KERNEL_THREAD_STATE_READY && waiter->ready_node.queued);
     assert(!receiver->storage_borrows && !waiter->storage_borrows);
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         ready_remove_locked(waiter);
         receiver->group_pending=0;receiver->signal_blocked=0;
-        waiter->wait.phase=KERNEL_WAIT_COMMITTED;waiter->wait.generation++;
+        kernel_wait_record_store(&waiter->wait,kernel_wait_record_generation(&waiter->wait)+1,
+                                 KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
         kernel_wait_backend_commit(waiter,0,1);
     }
     assert(!kernel_signal_send(receiver,12,7));
-    assert(waiter->wait.phase==KERNEL_WAIT_COMMITTED);
+    assert(kernel_wait_record_phase(&waiter->wait)==KERNEL_WAIT_COMMITTED);
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);receiver->proc_exiting=1; }
     kernel_signal_task_exit(receiver);
-    assert(waiter->wait.phase==KERNEL_WAIT_NOTIFIED && waiter->wait.reason==KERNEL_WAIT_SIGNALLED);
+    assert(kernel_wait_record_phase(&waiter->wait)==KERNEL_WAIT_NOTIFIED && kernel_wait_record_reason(&waiter->wait)==KERNEL_WAIT_SIGNALLED);
     assert(waiter->state==KERNEL_THREAD_STATE_READY && waiter->ready_node.queued);
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
       assert(!signal_wants_signal_locked(receiver,12));receiver->proc_exiting=0; }
@@ -86,7 +88,7 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
     finishing_waiter=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.arch.user_mode=1,
         .state=KERNEL_THREAD_STATE_READY,.group_leader=receiver,
         .signal_table_address=(uintptr_t)&actions,.signal_blocked=signal_mask(12),
-        .signal_wait_mask=signal_mask(12),.wait.phase=KERNEL_WAIT_FINISHED};
+        .signal_wait_mask=signal_mask(12)};
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         ready_remove_locked(waiter);
@@ -94,14 +96,15 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
         receiver->group_members=3;receiver->group_next=&finishing_waiter;
         finishing_waiter.group_previous=receiver;finishing_waiter.group_next=waiter;
         waiter->group_previous=&finishing_waiter;
-        waiter->wait.phase=KERNEL_WAIT_COMMITTED;waiter->wait.generation++;
+        kernel_wait_record_store(&waiter->wait,kernel_wait_record_generation(&waiter->wait)+1,
+                                 KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
         kernel_wait_backend_commit(waiter,0,1);
     }
     signal_retarget_shared(receiver,signal_mask(12));
-    assert(waiter->wait.phase==KERNEL_WAIT_COMMITTED);
+    assert(kernel_wait_record_phase(&waiter->wait)==KERNEL_WAIT_COMMITTED);
     assert(finishing_waiter.user_return_pending & KERNEL_USER_RETURN_SIGNAL);
     kernel_signal_wait_end(&finishing_waiter);
-    assert(!finishing_waiter.signal_wait_mask && waiter->wait.phase==KERNEL_WAIT_NOTIFIED);
+    assert(!finishing_waiter.signal_wait_mask && kernel_wait_record_phase(&waiter->wait)==KERNEL_WAIT_NOTIFIED);
     assert(waiter->state==KERNEL_THREAD_STATE_READY && waiter->ready_node.queued);
     assert(!finishing_waiter.storage_borrows && !receiver->storage_borrows && !waiter->storage_borrows);
     {
@@ -145,7 +148,7 @@ enum kernel_scheduler_status __real_kernel_scheduler_wake_signal(struct kernel_t
 enum kernel_scheduler_status __wrap_kernel_scheduler_wake_signal(struct kernel_task *task)
 {
     assert(task==signal_waiter || task==&finishing_waiter ||
-           (task==signal_receiver && task->wait.phase==KERNEL_WAIT_FINISHED));
+           (task==signal_receiver && kernel_wait_record_phase(&task->wait)==KERNEL_WAIT_FINISHED));
     return __real_kernel_scheduler_wake_signal(task);
 }
 

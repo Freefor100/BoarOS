@@ -369,7 +369,7 @@ int main(void)
     pthread_t borrower; assert(!pthread_create(&borrower,0,end_service_borrow,0));
     assert(!kernel_wait_finish(&borrowed_token));
     assert(!pthread_join(borrower,0) && quiesce_calls==1 && !tasks[0].wait.borrows);
-    assert(!borrowed_token.task && tasks[0].wait.phase==KERNEL_WAIT_FINISHED);
+    assert(!borrowed_token.task && kernel_wait_record_phase(&tasks[0].wait)==KERNEL_WAIT_FINISHED);
     active=&cpus[0];
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
       setup_task(3,2,60); tasks[3].arch.user_mode=1; tasks[3].magic=KERNEL_THREAD_MAGIC; }
@@ -392,7 +392,7 @@ int main(void)
         kernel_wait_switch_finish_locked(previous);active->switch_previous=0;
     }
     user_signal_take_retargeted(&tasks[2]);
-    struct kernel_wait_token delivered={&tasks[2],tasks[2].wait.generation};
+    struct kernel_wait_token delivered={&tasks[2],kernel_wait_record_generation(&tasks[2].wait)};
     assert(!kernel_wait_finish(&delivered));
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -403,7 +403,9 @@ int main(void)
     active=&cpus[1];cancel_stop_on_handoff=1;
     user_signal_stop_selection(&tasks[3]);
     assert(!cancel_stop_on_handoff && active==&cpus[1] && active->current==&tasks[3]);
-    assert(!tasks[3].storage_borrows && !tasks[2].storage_borrows && !scheduler.blocked_head && !scheduler.stopped_head);
+    assert(!tasks[3].storage_borrows && !tasks[2].storage_borrows &&
+           kernel_wait_record_phase(&tasks[2].wait)==KERNEL_WAIT_FINISHED &&
+           kernel_wait_record_phase(&tasks[3].wait)==KERNEL_WAIT_FINISHED && !scheduler.stopped_head);
     puts("user SMP service eligibility and old-stack execution owner passed");
     return 0;
 }

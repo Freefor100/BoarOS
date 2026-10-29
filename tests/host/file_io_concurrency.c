@@ -204,7 +204,7 @@ void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
     int batch=tcp_batch_unpinning(pin);
 #endif
     if(futex_role==1 && kernel_task_current()->futex_request &&
-       kernel_task_current()->wait.phase==KERNEL_WAIT_PREPARED) {
+       kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_PREPARED) {
         assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
         __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
         while(!__atomic_load_n(&futex_edit_ready,__ATOMIC_ACQUIRE))sched_yield();
@@ -223,7 +223,7 @@ static void *futex_waiter(void *unused)
     uintptr_t irq=arch_interrupt_save();enum kernel_scheduler_status status;
     assert(!kernel_futex(kernel_task_current(),FUTEX_ADDRESS,128,1,0,0,0,&status) && !status);
     arch_interrupt_restore(irq);
-    assert(!kernel_task_current()->futex_request && kernel_task_current()->wait.phase==KERNEL_WAIT_FINISHED);
+    assert(!kernel_task_current()->futex_request && kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_FINISHED);
     mm_test_finish();return NULL;
 }
 static void *futex_editor(void *unused)
@@ -275,7 +275,7 @@ static void robust_futex_owners_returned(void)
     struct kernel_wait_node *node=&task->default_wait_node;
     assert(!task->robust_list_head && !task->futex_request);
     /* wait_finish清除token绑定；record.generation自身仍保留历史代号。 */
-    assert(task->wait.phase==KERNEL_WAIT_FINISHED && task->wait.on_cpu &&
+    assert(kernel_wait_record_phase(&task->wait)==KERNEL_WAIT_FINISHED && task->wait.on_cpu &&
         !task->wait.nodes && !task->wait.borrows && !task->wait.deadline &&
         !task->wait.interruptible && !task->wait.ready_pending &&
         !node->generation && !node->token_next && !node->queue &&
@@ -297,7 +297,7 @@ static void *robust_futex_waiter(void *opaque)
         result==(test->mode==ROBUST_FUTEX_BEFORE_WAIT?-KERNEL_EAGAIN:0));
     arch_interrupt_restore(irq);
     assert(mm_test_parked(1)==test->park_before+(test->mode!=ROBUST_FUTEX_BEFORE_WAIT));
-    assert((task->wait.generation!=0)==(test->mode!=ROBUST_FUTEX_BEFORE_WAIT));
+    assert((kernel_wait_record_generation(&task->wait)!=0)==(test->mode!=ROBUST_FUTEX_BEFORE_WAIT));
     robust_futex_owners_returned();mm_test_finish();return NULL;
 }
 static void *robust_futex_owner(void *opaque)

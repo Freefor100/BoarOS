@@ -416,21 +416,6 @@ enum kernel_scheduler_status validate_queues_locked(void)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
-    status = validate_queue_shape(scheduler.blocked_head,
-                                  scheduler.blocked_tail);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-    if (scheduler.blocked_head != 0) {
-        if (scheduler.blocked_head->magic != KERNEL_THREAD_MAGIC ||
-            scheduler.blocked_tail->magic != KERNEL_THREAD_MAGIC ||
-            scheduler.blocked_head->state != KERNEL_THREAD_STATE_BLOCKED ||
-            scheduler.blocked_tail->state != KERNEL_THREAD_STATE_BLOCKED ||
-            scheduler.blocked_head->idle != 0U ||
-            scheduler.blocked_tail->idle != 0U) {
-            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        }
-    }
     status = validate_queue_shape(scheduler.stopped_head,
                                   scheduler.stopped_tail);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
@@ -703,7 +688,7 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 {
     kernel_assert_service_context();
     if (thread && (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
-        thread->wait.phase != KERNEL_WAIT_FINISHED)) __builtin_trap();
+        kernel_wait_record_phase(&thread->wait) != KERNEL_WAIT_FINISHED)) __builtin_trap();
     if (thread && thread->io_context.user_pins) __builtin_trap();
 #if BOAROS_MAX_CPUS > 1
     /* join、自动reaper及构造回滚共用可信清理点；不能只在join归还MM。 */
@@ -787,7 +772,7 @@ enum kernel_scheduler_status release_task_storage(
     struct kernel_task *thread, enum kernel_scheduler_status original_status)
 {
     if (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
-        thread->wait.phase != KERNEL_WAIT_FINISHED) __builtin_trap();
+        kernel_wait_record_phase(&thread->wait) != KERNEL_WAIT_FINISHED) __builtin_trap();
     if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo ||
         thread->msg_request || thread->mqueue_request) __builtin_trap();
     enum kernel_scheduler_status status = release_task_stack(thread);
@@ -898,8 +883,6 @@ enum kernel_scheduler_status kernel_scheduler_init(
     (void)kernel_cpu_consume_schedule(kernel_cpu_current());
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
-    scheduler.blocked_head = 0;
-    scheduler.blocked_tail = 0;
     scheduler.deadline_root = 0;
     kernel_stack_slots_reset();
     scheduler.stopped_head = 0;
