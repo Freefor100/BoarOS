@@ -2425,7 +2425,7 @@ static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cach
 
 struct prepare_space {
     struct kernel_vfs_node *node;
-    uint64_t offset;
+    uint64_t offset,accepted_end;
     size_t length,ready;
     int mapping,error,complete;
     void *reservation;
@@ -2456,7 +2456,7 @@ static void finish_space(void *argument)
     struct prepare_space *request=argument;
     struct kernel_vfs_node *node=request->node;
     KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,1);
-    node->instance->ops->finish_reservation(node,request->reservation,request->offset);
+    node->instance->ops->finish_reservation(node,request->reservation,request->offset,request->accepted_end);
     request->reservation=NULL;
 }
 static void complete_space(void *argument)
@@ -2489,7 +2489,10 @@ int kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *cache,stru
     struct prepare_space request={.node=node,.offset=index<<BOAROS_PAGE_SHIFT,
         .length=BOAROS_PAGE_SIZE,.mapping=1};
     int result=prepare_space_request(cache,&request,prepare_space);
-    if (result && request.reservation) prepare_space_request(cache,&request,finish_space);
+    if (result && request.reservation) {
+        request.accepted_end=request.offset;
+        prepare_space_request(cache,&request,finish_space);
+    }
     if (!result) *reservation=(struct kernel_page_cache_reservation){request.reservation,request.offset,request.offset+request.ready};
     return result;
 }
@@ -2497,14 +2500,14 @@ void kernel_page_cache_accept_mapping_write(struct kernel_vfs_node *node,
     struct kernel_page_cache_reservation *reservation)
 {
     if (reservation->ticket)
-        node->instance->ops->accept_reservation(node,reservation->ticket,reservation->end);
+        node->instance->ops->accept_reservation(node,reservation->ticket,reservation->offset,reservation->end);
 }
 void kernel_page_cache_finish_mapping_write(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
     struct kernel_page_cache_reservation *reservation,int accepted)
 {
     if (!reservation->ticket)return;
-    struct prepare_space request={.node=node,.reservation=reservation->ticket,
-        .offset=accepted?reservation->end:reservation->offset};
+    struct prepare_space request={.node=node,.reservation=reservation->ticket,.offset=reservation->offset,
+        .accepted_end=accepted?reservation->end:reservation->offset};
     prepare_space_request(cache,&request,finish_space);
     *reservation=(struct kernel_page_cache_reservation){0};
 }
@@ -2519,7 +2522,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
     while (*written<size) {
         if (!ready) {
             if (reservation->reservation) {
-                reservation->offset=offset;
+                reservation->accepted_end=offset;
                 prepare_space_request(cache,reservation,finish_space);
             }
             if (space_error) return space_error;
@@ -2660,7 +2663,7 @@ static int write_cached_source(struct kernel_page_cache *cache,struct kernel_vfs
     struct prepare_space reservation={0};
     int error=copy_cached_source(cache,file,offset,source,size,written,&complete,&reservation);
     if (reservation.reservation) {
-        reservation.offset=offset+*written;
+        reservation.accepted_end=offset+*written;
         prepare_space_request(cache,&reservation,finish_space);
     }
     if (complete) {

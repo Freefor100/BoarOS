@@ -128,9 +128,10 @@ struct ext4_delalloc_chunk {
 };
 struct ext4_delalloc_change {
     struct ext4_delalloc_change *next;
-    uint32_t key;
+    /* borrowers使该节点在接纳、截断和写回之间保持存活。 */
+    struct ext4_delalloc_chunk *chunk;
+    uint64_t mask;
     bool committed;
-    uint64_t mask, start;
 };
 static int delalloc_compare(struct ext4_delalloc_chunk *a, struct ext4_delalloc_chunk *b)
 { return a->key < b->key ? -1 : a->key != b->key; }
@@ -3977,10 +3978,10 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
             struct ext4_delalloc_chunk *candidate=missing_chunk?ext4_calloc(1,sizeof(*candidate)):NULL;
             if (!change || (missing_chunk && !candidate)) {ext4_free(change);ext4_free(candidate);r=ENOMEM;break;}
             if (candidate)candidate->key=key;
-            change->key=key;change->start=offset;
             {
                 EXT4_STATE_SCOPE(state,fs);
-                struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,key);
+                /* inode写资格保持树不变；STATE负责额度及接纳位。 */
+                struct ext4_delalloc_chunk *chunk=existing;
                 uint64_t mask=delalloc_mask(bit,range.count),missing=mask&~(chunk?chunk->mask:0);
                 uint64_t free=ext4_sb_get_free_blocks_cnt(&fs->sb),reserved=fs->reserved_blocks+fs->delayed_blocks;
                 if (reserved>free)__builtin_trap();
@@ -4002,7 +4003,7 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
                     }
                     chunk->mask|=added;
                     if (chunk->borrowers==UINT32_MAX)__builtin_trap();
-                    chunk->borrowers++;change->mask=admitted;
+                    chunk->borrowers++;change->chunk=chunk;change->mask=admitted;
                     unsigned count=delalloc_count(added);
                     fs->delayed_blocks+=count;file->delalloc->blocks+=count;
                 }
@@ -4019,35 +4020,35 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
     EXT4_MP_UNLOCK(file->mp);
     return r;
 }
-void ext4_file_accept_reservation(ext4_file *file,void *ticket,uint64_t accepted_end)
+void ext4_file_accept_reservation(ext4_file *file,void *ticket,uint64_t start,uint64_t accepted_end)
 {
     struct ext4_fs *fs=&file->mp->fs;
     size_t block=fs->bdev->lg_bsize;
     EXT4_STATE_SCOPE(state,fs);
     for (struct ext4_delalloc_change *change=ticket;change;change=change->next) {
-        struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,change->key);
+        struct ext4_delalloc_chunk *chunk=change->chunk;
         if (!chunk || !chunk->borrowers)__builtin_trap();
-        uint64_t last=accepted_end>change->start?(accepted_end+block-1)/block:change->start/block;
-        uint64_t base=(uint64_t)change->key*64;
+        uint64_t last=accepted_end>start?(accepted_end+block-1)/block:start/block;
+        uint64_t base=(uint64_t)chunk->key*64;
         unsigned kept=last<=base?0:last-base<64?last-base:64;
         chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
         change->committed=true;
     }
 }
-void ext4_file_finish_reservation(ext4_file *file,void *ticket,uint64_t accepted_end)
+void ext4_file_finish_reservation(ext4_file *file,void *ticket,uint64_t start,uint64_t accepted_end)
 {
     struct ext4_fs *fs=&file->mp->fs;
     size_t block=fs->bdev->lg_bsize;
     while (ticket) {
         struct ext4_delalloc_change *change=ticket;ticket=change->next;
-        uint64_t last=accepted_end>change->start?(accepted_end+block-1)/block:change->start/block;
+        uint64_t last=accepted_end>start?(accepted_end+block-1)/block:start/block;
         /* The adapter holds this inode's I/O writer, excluding mapping
          * acceptance and writeback of its reservation tree. Finishing a fully
          * accepted range changes no global allocation or retirement state. */
-        struct ext4_delalloc_chunk *chunk=delalloc_find(file->delalloc,change->key);
-        uint64_t base=(uint64_t)change->key*64;
-        unsigned kept=last<=base?0:last-base<64?last-base:64;
+        struct ext4_delalloc_chunk *chunk=change->chunk;
         if (!chunk || !chunk->borrowers)__builtin_trap();
+        uint64_t base=(uint64_t)chunk->key*64;
+        unsigned kept=last<=base?0:last-base<64?last-base:64;
         if (!change->committed)chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
         if (!--chunk->borrowers &&
             (!chunk->mask || (chunk->mask&~chunk->accepted))) {

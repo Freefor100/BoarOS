@@ -43,7 +43,9 @@ int __real_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *,ext4_lblk_t,uint
 int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t first,uint32_t count,bool create,struct ext4_inode_block_range *range)
 {
     int r=__real_ext4_fs_get_inode_dblk_range(ref,first,count,create,range);
-    if (!r && create && fail_delayed_allocation) {fail_delayed_allocation=0;return ENOMEM;}
+    if (!r && create && fail_delayed_allocation) {
+        int error=fail_delayed_allocation;fail_delayed_allocation=0;return error;
+    }
     return r;
 }
 static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
@@ -410,8 +412,8 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
         void *a=NULL,*b=NULL;size_t ready;
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a) && ready==2*block);
         assert(!ext4_file_reserve_write(raw,block,block,&ready,&b) && ready==block && b);
-        ext4_file_finish_reservation(raw,b,2*block);
-        ext4_file_finish_reservation(raw,a,0);
+        ext4_file_finish_reservation(raw,b,block,2*block);
+        ext4_file_finish_reservation(raw,a,0,0);
         assert(fs->delayed_blocks==baseline+1);
         ext4_file_release_reservations(raw,0);
         assert(fs->delayed_blocks==baseline);
@@ -419,23 +421,36 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
         struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
         reservation_state_lock=adapter->locks.state_lock;reservation_state_calls=0;
         adapter->locks.state_lock=count_reservation_state_lock;
-        ext4_file_finish_reservation(raw,a,block);
+        ext4_file_finish_reservation(raw,a,0,block);
         adapter->locks.state_lock=reservation_state_lock;
         assert(!reservation_state_calls && fs->delayed_blocks==baseline+1);
         ext4_file_release_reservations(raw,0);
         assert(fs->delayed_blocks==baseline);
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a));
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&b));
-        ext4_file_finish_reservation(raw,a,0);
+        ext4_file_finish_reservation(raw,a,0,0);
         assert(fs->delayed_blocks==baseline+2);
-        ext4_file_finish_reservation(raw,b,0);
+        ext4_file_finish_reservation(raw,b,0,0);
         assert(fs->delayed_blocks==baseline);
         assert(!ext4_file_reserve_write(raw,0,block,&ready,&a));
-        ext4_file_accept_reservation(raw,a,block);
+        ext4_file_accept_reservation(raw,a,0,block);
         ext4_file_release_reservations(raw,0);
         assert(!ext4_file_reserve_write(raw,0,block,&ready,&b));
-        ext4_file_finish_reservation(raw,a,block);
-        ext4_file_finish_reservation(raw,b,0);
+        ext4_file_finish_reservation(raw,a,0,block);
+        ext4_file_finish_reservation(raw,b,0,0);
+        assert(fs->delayed_blocks==baseline);
+        /* 非对齐请求跨两个预留节点；空前缀不能接纳首块，部分前缀只保留覆盖块。 */
+        uint64_t start=63*block+block/2;
+        void *cross=NULL;
+        assert(!ext4_file_reserve_write(raw,start,2*block,&ready,&cross) && ready==2*block);
+        assert(fs->delayed_blocks==baseline+3);
+        ext4_file_finish_reservation(raw,cross,start,start);
+        assert(fs->delayed_blocks==baseline);
+        assert(!ext4_file_reserve_write(raw,start,2*block,&ready,&cross) && ready==2*block);
+        ext4_file_accept_reservation(raw,cross,start,start+block);
+        ext4_file_finish_reservation(raw,cross,start,start);
+        assert(fs->delayed_blocks==baseline+2);
+        ext4_file_release_reservations(raw,0);
         assert(fs->delayed_blocks==baseline);
     }
     unsigned char bytes[16*1024];memset(bytes,0x53,sizeof(bytes));size_t done;
@@ -448,7 +463,7 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     expect_bytes(&file,bytes,sizeof(bytes));
     assert(!kernel_vfs_pwrite(&file,block,bytes,block,&done) && done==block);
     assert(fs->delayed_blocks==baseline+sizeof(bytes)/block);
-    fail_delayed_allocation=1;
+    fail_delayed_allocation=ENOMEM;
     assert(kernel_page_cache_writeback(cache,kernel_vfs_file_node(&file))==-KERNEL_ENOMEM && !fail_delayed_allocation);
     assert(!mapped(&file,0).block && fs->delayed_blocks==baseline+sizeof(bytes)/block);
     uint64_t observed=0;
@@ -467,8 +482,19 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     assert(!kernel_vfs_ftruncate(&file,0));
     assert(!mapped(&file,0).block && fs->delayed_blocks==baseline);
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t error_before=kernel_vfs_error_sequence(&file);
+    fail_delayed_allocation=ENOSPC;
+    assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_ENOSPC && !fail_delayed_allocation);
+    assert(kernel_vfs_error_sequence(&file)==error_before+1 && observed==error_before+1);
+    assert(!mapped(&file,0).block && fs->delayed_blocks==baseline+sizeof(bytes)/block);
+    expect_bytes(&file,bytes,sizeof(bytes));
+    assert(!kernel_vfs_sync(&file,0,&observed) && fs->delayed_blocks==baseline);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    expect_bytes(&file,bytes,sizeof(bytes));
+    assert(!kernel_vfs_ftruncate(&file,0));
     assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_close(&file));
-    puts("PASS delayed allocation: cache visibility, no physical allocation before sync, batched conversion and truncate");
+    puts("PASS delayed allocation: cache visibility, failed writeback ownership, retry, batched conversion and truncate");
 }
 
 struct admission_fill {
@@ -525,26 +551,61 @@ static void admission_fill_disk(void *argument)
 static void admission_full(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,int legacy)
 {
     struct admission_fill fill={0};
+    struct kernel_vfs_file spare={0};
     assert(!create_file(mount,"/accepted-a",0600,&fill.files[0]) &&
-        !create_file(mount,"/accepted-b",0600,&fill.files[1]));
+        !create_file(mount,"/accepted-b",0600,&fill.files[1]) &&
+        !create_file(mount,"/sync-spare",0600,&spare));
     if (legacy) admission_legacy(mount,&fill.files[1]);
+    size_t block=kernel_vfs_file_node(&spare)->instance->writeback_block_size;
+    assert(!kernel_vfs_fallocate(&spare,0,0,64*block));
     assert(!kernel_page_cache_start_worker(cache) && !kernel_vfs_start_journal_worker(mount));
     assert(!kernel_page_cache_run_cpu0(cache,admission_fill_disk,&fill) && fill.error==-KERNEL_ENOSPC);
     for (unsigned which=0;which<2;which++) {
-        uint64_t observed=0; int synced=kernel_vfs_sync(&fill.files[which],0,&observed);
-        fprintf(stderr,"full admission inode=%u acknowledged=%zu fsync=%d\n",which,fill.acknowledged[which],synced);
-        assert(!synced && !kernel_vfs_error_sequence(&fill.files[which]));
+        size_t done;
+        assert(kernel_vfs_pwrite(&fill.files[which],fill.acknowledged[which],"!",1,&done)==-KERNEL_ENOSPC && !done);
+    }
+    uint64_t observed[2]={0};
+    int sync_result[2];unsigned reported=0;
+    for (unsigned which=0;which<2;which++) {
+        sync_result[which]=kernel_vfs_sync(&fill.files[which],0,&observed[which]);
+        fprintf(stderr,"full admission inode=%u acknowledged=%zu fsync=%d\n",which,fill.acknowledged[which],sync_result[which]);
         struct kernel_vfs_stat stat; assert(!kernel_vfs_fstat(&fill.files[which],&stat) && stat.size==fill.acknowledged[which]);
-        assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&fill.files[which])));
+        if (sync_result[which]==-KERNEL_ENOSPC) {
+            /* 后台worker可能在本次fsync消费错误后再次记录失败。 */
+            assert(observed[which] && observed[which]<=kernel_vfs_error_sequence(&fill.files[which]));
+            unsigned char sample[4096];size_t got=0;
+            assert(fill.acknowledged[which]>=sizeof(sample));
+            assert(!kernel_vfs_pread(&fill.files[which],fill.acknowledged[which]-sizeof(sample),
+                sample,sizeof(sample),&got,NULL) && got==sizeof(sample));
+            for (unsigned i=0;i<sizeof(sample);i++) assert(sample[i]==0x61+which);
+            reported++;
+        } else assert(!sync_result[which]);
+    }
+    int spare_status=kernel_vfs_ftruncate(&spare,0);
+    fprintf(stderr,"full admission release spare=%d\n",spare_status);
+    assert(!spare_status);
+    for (unsigned which=0;which<2;which++) {
+        if (sync_result[which]) {
+            for (unsigned retry=0;retry<4 && sync_result[which];retry++) {
+                sync_result[which]=kernel_vfs_sync(&fill.files[which],0,&observed[which]);
+                fprintf(stderr,"full admission retry=%u fsync=%d observed=%llu\n",
+                    retry,sync_result[which],(unsigned long long)observed[which]);
+                assert(!sync_result[which] || (sync_result[which]==-KERNEL_ENOSPC && observed[which] &&
+                    observed[which]<=kernel_vfs_error_sequence(&fill.files[which])));
+            }
+            assert(!sync_result[which]);
+        }
         unsigned char *expected=malloc(fill.acknowledged[which]);assert(expected);
         memset(expected,0x61+which,fill.acknowledged[which]);
+        assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&fill.files[which])));
         expect_bytes(&fill.files[which],expected,fill.acknowledged[which]); free(expected);
-        size_t done; assert(kernel_vfs_pwrite(&fill.files[which],fill.acknowledged[which],"!",1,&done)==-KERNEL_ENOSPC && !done);
-        assert(!kernel_vfs_pwrite(&fill.files[which],0,"+",1,&done) && done==1 && !kernel_vfs_sync(&fill.files[which],0,&observed));
+        size_t done;
+        assert(!kernel_vfs_pwrite(&fill.files[which],0,"+",1,&done) && done==1 && !kernel_vfs_sync(&fill.files[which],0,&observed[which]));
         assert(!kernel_vfs_close(&fill.files[which]));
     }
     kernel_page_cache_stop_worker(cache);
-    puts("PASS full admission: ENOSPC rejects unaccepted bytes; all prior inodes fsync/reload exact prefixes, overwrite and clean shutdown");
+    assert(!kernel_vfs_close(&spare));
+    printf("PASS full admission: rejected bytes, writeback_errors=%u, reloaded exact acknowledged prefixes\n",reported);
 }
 static struct kernel_rwlock *reclaim_held_lock;
 static unsigned reclaim_lock_ready,reclaim_lock_resume,reclaim_allocate_done,reclaim_backend_ready,reclaim_probe_start;

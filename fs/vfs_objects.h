@@ -147,9 +147,9 @@ struct kernel_vfs_backend {
     /* Delayed admission borrows prepared blocks until the actual copied
      * prefix is known; overlapping sources share acceptance and lifetime. */
     int (*reserve_write)(struct kernel_vfs_node *, uint64_t, size_t, size_t *, int *, void **);
-    void (*finish_reservation)(struct kernel_vfs_node *, void *, uint64_t accepted_end);
+    void (*finish_reservation)(struct kernel_vfs_node *, void *, uint64_t start, uint64_t accepted_end);
     /* Accept while inode qualification still protects this mapping generation. */
-    void (*accept_reservation)(struct kernel_vfs_node *, void *, uint64_t accepted_end);
+    void (*accept_reservation)(struct kernel_vfs_node *, void *, uint64_t start, uint64_t accepted_end);
 
     struct kernel_block_device *(*block_device)(struct kernel_vfs_instance *instance);
     int (*close_node)(struct kernel_vfs_node *node);

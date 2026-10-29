@@ -2661,10 +2661,10 @@ static int ext4_backend_reserve_write(struct kernel_vfs_node *node,uint64_t offs
     if (result==ENOTSUP)return ext4_backend_prepare_write(node,offset,length,ready,complete);
     return lwext4_error(result);
 }
-static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t end)
-{ ext4_file_accept_reservation(lwext4_node_file(node),ticket,end); }
-static void ext4_backend_finish_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t end)
-{ ext4_file_finish_reservation(lwext4_node_file(node),ticket,end); }
+static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t start,uint64_t end)
+{ ext4_file_accept_reservation(lwext4_node_file(node),ticket,start,end); }
+static void ext4_backend_finish_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t start,uint64_t end)
+{ ext4_file_finish_reservation(lwext4_node_file(node),ticket,start,end); }
 static int ext4_backend_complete_write(struct kernel_vfs_node *node)
 {
     /* Legacy 指针没有 unwritten 状态。已接纳数据先交给后端，再按持久
