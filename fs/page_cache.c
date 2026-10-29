@@ -1508,7 +1508,8 @@ void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias)
     kernel_page_cache_notify_pressure(cache);
 }
 #define CACHE_WRITES_CLOSED (UINT64_C(1)<<63)
-#define CACHE_WRITES_MASK (CACHE_WRITES_CLOSED | UINT32_MAX)
+#define CACHE_ENTRY_CLOSED  (UINT64_C(1)<<62)
+#define CACHE_WRITES_MASK (CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED | UINT32_MAX)
 static int writer_begin(struct kernel_page_cache_entry *entry,
     struct kernel_page_cache_write_borrow *borrow)
 {
@@ -1516,7 +1517,7 @@ static int writer_begin(struct kernel_page_cache_entry *entry,
     uint64_t state = __atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE);
     for (;;) {
         if (state & ~CACHE_WRITES_MASK || (uint32_t)state == UINT32_MAX) __builtin_trap();
-        if (state & CACHE_WRITES_CLOSED) return 0;
+        if (state & (CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED)) return 0;
         if (__atomic_compare_exchange_n(&entry->writes,&state,state+1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
     }
     struct kernel_io_context *owner = kernel_io_context_current();
@@ -1542,7 +1543,7 @@ static void writer_end_locked(struct kernel_page_cache_write_borrow *borrow)
     uint64_t state = __atomic_fetch_sub(&entry->writes,1,__ATOMIC_RELEASE);
     if (state & ~CACHE_WRITES_MASK || !(uint32_t)state) __builtin_trap();
     *link = borrow->next; *borrow = (struct kernel_page_cache_write_borrow){0};
-    if ((state & CACHE_WRITES_CLOSED) && (uint32_t)state == 1) cache_wake(&entry->ready);
+    if ((state & (CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED)) && (uint32_t)state == 1) cache_wake(&entry->ready);
     if ((uint32_t)state==1 && entry->retry_blocked) {
         entry->retry_blocked=0;
         if (entry->cache->record->started && !entry->cache->record->stopping) {
@@ -1572,9 +1573,9 @@ enum kernel_page_cache_status kernel_page_cache_wait_writable(
         struct kernel_wait_token token={0};
         {
             CACHE_SCOPE(guard,cache);
-            if (entry->retired || !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) break;
+            if (entry->retired || !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED))) break;
             if (kernel_wait_prepare(&entry->ready,0,0,&token)) __builtin_trap();
-            if (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
+            if (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED))) {
                 if (kernel_wait_finish(&token)) __builtin_trap();
                 break;
             }
@@ -1630,7 +1631,7 @@ static enum kernel_page_cache_status finish_read_page(
         {
             CACHE_SCOPE(guard, cache);
             status = entry_load_status(entry);
-            if (status != KERNEL_PAGE_CACHE_STATUS_BUSY && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
+            if (status != KERNEL_PAGE_CACHE_STATUS_BUSY && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_ENTRY_CLOSED)) {
                 if (!status) {
                     *entry_out = entry;
                     *address = entry->physical_address;
@@ -1644,7 +1645,7 @@ static enum kernel_page_cache_status finish_read_page(
                 break;
             }
             if (kernel_wait_prepare(&entry->ready, 0, 0, &token)) __builtin_trap();
-            park = entry_loading(entry) || (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED);
+            park = entry_loading(entry) || (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_ENTRY_CLOSED);
         }
         enum kernel_wait_wake_reason reason;
         if (park && kernel_wait_park(&token, &reason)) __builtin_trap();
@@ -1667,7 +1668,7 @@ static int read_cache_open(struct kernel_vfs_node *node)
 static int read_entry_ready(struct kernel_page_cache_entry *entry)
 {
     return entry_load_status(entry) == KERNEL_PAGE_CACHE_STATUS_OK && !entry->retired &&
-        (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED));
+        (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_ENTRY_CLOSED));
 }
 
 int kernel_page_cache_resident(struct kernel_page_cache *cache,
@@ -2312,7 +2313,7 @@ static int read_cached_batch(struct cache_read_batch_request *request)
             }
             if (status) __builtin_trap();
             if (!read_entry_ready(entry)) {
-                if ((__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) { retry=1; break; }
+                if ((__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_ENTRY_CLOSED)) { retry=1; break; }
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
                 page->cache_miss=1;
 #endif
@@ -3315,13 +3316,13 @@ int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kern
         int park;
         {
             CACHE_SCOPE(guard,cache);
-            if (!entry->writeback && !entry_loading(entry) && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
-                __atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED,__ATOMIC_ACQ_REL);
+            if (!entry->writeback && !entry_loading(entry) && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED))) {
+                __atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED,__ATOMIC_ACQ_REL);
                 aliases=entry->aliases;alias_borrow(aliases);break;
             }
             if (kernel_wait_prepare(&entry->ready,0,0,&wait)) __builtin_trap();
             park = entry->writeback || entry_loading(entry) ||
-                (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED);
+                (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED));
         }
         enum kernel_wait_wake_reason reason;
         if (park && kernel_wait_park(&wait,&reason)) __builtin_trap();
@@ -3330,7 +3331,7 @@ int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kern
     int result=rearm_aliases(entry,aliases);
     if (result) {
         CACHE_SCOPE(guard,cache);
-        __atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
+        __atomic_fetch_and(&entry->writes,~(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED),__ATOMIC_RELEASE);
         entry_return(entry); cache_wake(&entry->ready); return result;
     }
     for (;;) {
@@ -3374,7 +3375,7 @@ void kernel_page_cache_resize_finish(struct kernel_page_cache_resize *token,uint
     {
         CACHE_SCOPE(guard,cache);
         if (entry->retry_blocked) { entry->retry_blocked=0; cache->record->requested=1; cache_wake(&cache->record->work); }
-        if (__atomic_exchange_n(&entry->writes,0,__ATOMIC_RELEASE)!=CACHE_WRITES_CLOSED) __builtin_trap();
+        if (__atomic_exchange_n(&entry->writes,0,__ATOMIC_RELEASE)!=(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED)) __builtin_trap();
         entry_return(entry); cache_wake(&entry->ready);
     }
     *token=(struct kernel_page_cache_resize){0};
