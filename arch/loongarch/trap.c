@@ -1,10 +1,12 @@
 #include <kernel/accounting.h>
+#include <arch/context.h>
 #include <arch/task.h>
 #include <arch/timer.h>
 #include <arch/loongarch/signal.h>
 #include <arch/loongarch/fpu.h>
 #include <platform/loongarch_virt.h>
 #include <kernel/task.h>
+#include <kernel/cpu.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
 #include <kernel/syscall.h>
@@ -114,10 +116,14 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         la_virt_fatal("fault owner");
     }
     if (user && code==11) {
+        /* 用户陷入已切到所属内核栈且关闭中断；在此核对一次真实执行者。 */
+        struct kernel_task *caller=arch_current_thread_get();
+        if(!caller || frame->kernel_tp!=(uintptr_t)caller ||
+           kernel_cpu_current()->current!=caller)la_virt_fatal("syscall owner");
         struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
-        if (kernel_syscall_dispatch(kernel_task_current(),&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");
+        if (kernel_syscall_dispatch(caller,&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");
         switch (result.action) {
         case KERNEL_SYSCALL_ACTION_EXIT_GROUP: kernel_user_group_exit(KERNEL_THREAD_EXIT_SYSCALL,result.value,0);
         case KERNEL_SYSCALL_ACTION_EXIT: kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL,result.value,0);

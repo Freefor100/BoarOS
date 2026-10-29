@@ -1,5 +1,6 @@
 #include <kernel/accounting.h>
 #include <kernel/cost.h>
+#include <arch/context.h>
 #include <arch/riscv/smp.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/process.h>
@@ -8,6 +9,7 @@
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/console.h>
+#include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
@@ -242,6 +244,10 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     }
 
     if (from_user && frame->scause == RISCV_SCAUSE_USER_ECALL) {
+        /* 用户陷入已切到所属内核栈且关闭中断；在此核对一次真实执行者。 */
+        struct kernel_task *caller = arch_current_thread_get();
+        if (!caller || frame->kernel_tp != (uintptr_t)caller ||
+            kernel_cpu_current()->current != caller) riscv_trap_fatal(frame);
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .user_sp = frame->sp,
@@ -259,7 +265,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         kernel_cpu_current()->syscall_dispatches++;
 #endif
 
-        if (kernel_syscall_dispatch(kernel_task_current(),
+        if (kernel_syscall_dispatch(caller,
                                     &request,
                                     &result) !=
             KERNEL_SYSCALL_STATUS_OK) {

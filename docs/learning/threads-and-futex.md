@@ -24,11 +24,11 @@ futex 是“用户态原子变量 + 内核等待队列”，不是每次加锁�
 
 glibc 2.44 的 `pthread_join` 在 fixed source `nptl/pthread_join_common.c` 调用 `__futex_abstimed_wait_cancelable64`；`nptl/futex-internal.c` 以 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 发出 raw syscall，即使未传 timeout 也使用 bitset 命令。BoarOS 曾让 `pthread_create` 成功，却在 `pthread_join` 返 ENOSYS 后由 glibc 报 futex fatal。只让 `FUTEX_BITSET_MATCH_ANY` 伪装成普通 WAIT 会错误处理其他非零掩码、绝对截止时刻和 WAKE_BITSET；在既有 per-task futex key 模型内，等待者另存掩码、REQUEUE 保持掩码，WAKE_BITSET 仅按相交位唤醒。固定 Linux `kernel/futex/syscalls.c` 与 `waitwake.c` 是错误顺序、掩码和绝对时钟依据。当前 BoarOS 没有修改 realtime 的 syscall，启动偏移不变；未来支持调时时，已经阻塞的 realtime wait 不能继续依赖这一固定偏移假设。
 
-WAIT 必须闭合“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。当前BoarOS先建立token登记，再复查用户字；仲裁器保留park前通知。key解析、用户页和业务状态仍依赖单CPU IRQ纪律，未来共享MM的lookup/pin、比较与发布需要完整跨核协议；关本地中断不能替代它。
+WAIT 必须闭合“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。当前 BoarOS 在同一次 MM 准备中取得 key 与用户页 pin，持桶操作资格比较用户字并在调度保护内登记等待；释放桶与 pin 后再 park，park 前通知会保留。跨核保护与各对象寿命见[调度模块](../modules/kernel-scheduler.md#等待与-futex)。
 
 private waiter 使用单调分配且不复用的 MM 身份号和四字节对齐用户地址；共享映射按后备对象与字节偏移匹配。文件别名、独立打开和硬链接共用活 VFS node 身份，匿名共享与 SysV 使用内存对象。MM 在映射保护内取得后备引用，等待和 requeue 持有实际对象，不保留裸 backing。哈希命中后仍比较完整 key。具体身份与生命周期规则见[调度模块](../modules/kernel-scheduler.md#等待与-futex)。
 
-选择单调 MM 身份号，是因为 shared→private requeue 可以把等待者迁移到发起方的私有 key；发起方 MM 若随后释放，单用 MM record 页地址会在物理页复用后让旧等待者撞上新 MM。让等待者长期持有该 MM 会延长整个地址空间生命周期。64 位单调号在耗尽时拒绝创建新 MM，不回卷复用；共享匿名对象则由现有引用保护其地址身份。此取舍只针对单 hart 生命周期，并未建立跨核同步。
+选择单调 MM 身份号，是因为 shared→private requeue 可以把等待者迁移到发起方的私有 key；发起方 MM 若随后释放，单用 MM record 页地址会在物理页复用后让旧等待者撞上新 MM。让等待者长期持有该 MM 会延长整个地址空间生命周期。64 位单调号在耗尽时拒绝创建新 MM，不回卷复用；共享匿名对象则由现有引用保护其地址身份。
 
 真实 U-mode 探针先用 fork 的独立 MM 验证共享唤醒，再覆盖共享→私有 requeue、同一对象内不同偏移迁移及不同对象同 VA 的隔离。最后由辅助线程撤销等待方的映射，发起方也撤销最后映射；等待者直到超时才释放对象引用。固定 Linux 同一 ELF 的差分入口同时覆盖基础共享 futex 与 bitset 参数、时钟和掩码交错。共享文件和 SysV 的不同 VA 别名已由同 ELF 差分覆盖，另检查独立打开、硬链接、偏移/文件/private 隔离、取消和 robust owner 死亡。
 
@@ -38,7 +38,7 @@ REQUEUE 先唤醒指定数量，再将剩余指定数量移动到另一个 key�
 
 robust-list 的注册只保存用户地址，不能视作链内容可信或永久可访问。固定 Linux `kernel/futex/syscalls.c` 接受长度为 24 字节的 RV64 链头并允许注销；`kernel/futex/core.c` 在退出时限制遍历 2048 项，先读下一链接，再对 owner TID 匹配的 32 位字原子设置 `OWNER_DIED`，保留 `WAITERS` 并唤醒。`list_op_pending` 还覆盖解锁与唤醒之间死亡的窗口。`kernel/fork.c` 在普通退出及成功 exec 的 MM release 前调用 futex 清理。BoarOS 非组长 exec 会采用原组长 TID，因此清理时必须使用换号前保存的 TID。上述路径均依据本页末尾固定 Linux commit。
 
-musl 1.2.5 的普通 `pthread_exit` 自己遍历 robust mutex 并处理 owner 死亡，detached 线程还会在释放用户栈前注销链头；仅让 libc-test 的 `pthread_robust_detach` 通过不能证明内核清理。真实 U-mode 测试另用原始 `SYS_exit` 绕开 libc 退出清理，检验 owner-died、pending、唤醒、坏链、PI 标记和 fork COW。跨 MM 共享匿名 futex 的 key 已接入普通 WAIT/WAKE/REQUEUE；共享文件与 SysV 复用同一键解析；PI 协议仍未实现。
+musl 1.2.5 的普通 `pthread_exit` 自己遍历 robust mutex 并处理 owner 死亡，detached 线程还会在释放用户栈前注销链头；仅让 libc-test 的 `pthread_robust_detach` 通过不能证明内核清理。真实 U-mode 测试另用原始 `SYS_exit` 绕开 libc 退出清理，检验 owner-died、pending、唤醒、坏链、PI 标记和 fork COW。PI 标记的 owner 退出同样发布 `OWNER_DIED`，PI 等待者由退出流程中的 PI 状态交接；具体协议见[调度模块](../modules/kernel-scheduler.md#pi-mutex)。
 
 raw exit 与 `FUTEX_WAIT` 竞争时，退出先写入 `OWNER_DIED` 可使等待合法返回 `EAGAIN`；用户测试逐次检查返回值、最终字和线程退出，不要求若干次竞跑中至少出现一次睡眠。真正已阻塞后的 owner-death 与 pending-unlock 唤醒由 `tests/host/file_io_concurrency.c` 在生产 wait 提交计数增加后触发真实 robust cleanup，检查唤醒结果及 wait、key、pin 归还，不用延时猜测登记完成。
 

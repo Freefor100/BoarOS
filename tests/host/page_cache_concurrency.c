@@ -90,7 +90,7 @@ static unsigned metadata_closed_mask;
 static struct {
     struct kernel_vfs_node *target;
     struct kernel_vfs_file *closing;
-    unsigned entered, close_done;
+    unsigned entered, close_entered, close_done;
 } timestamp_owner;
 static void (*metadata_store)(void *,void *,uint32_t,unsigned,struct ext4_timestamp);
 static void observe_metadata_store(void *context, void *owner, uint32_t inode,
@@ -100,7 +100,8 @@ static void observe_metadata_store(void *context, void *owner, uint32_t inode,
         assert(kernel_cpu_current()->logical_id == 1 &&
             owner == lwext4_node_file(owner)->time_owner);
         __atomic_store_n(&timestamp_owner.entered,1,__ATOMIC_RELEASE);
-        wait_progress(&timestamp_owner.close_done,1);
+        /* close 进入后再发布时间戳；它可能要等当前截断释放后端状态。 */
+        wait_progress(&timestamp_owner.close_entered,1);
     }
     metadata_store(context,owner,inode,field,value);
 }
@@ -114,12 +115,15 @@ int __wrap_ext4_mount_setup_time_observer(const char *path,const struct ext4_tim
 }
 static int observe_metadata_close(struct kernel_vfs_node *node)
 {
-    assert(kernel_cpu_current()->logical_id == 0 && "final node close belongs to CPU0");
+    if (node == metadata_nodes[1])
+        assert(kernel_cpu_current()->logical_id == 0 && "retired node cleanup belongs to CPU0");
     for (unsigned i=0;i<3;i++) if (node==metadata_nodes[i]) {
         assert(!(metadata_closed_mask & (1U<<i)));
         metadata_closed_mask |= 1U<<i;
     }
     metadata_closed++;
+    if (node == metadata_nodes[2] && timestamp_owner.target)
+        __atomic_store_n(&timestamp_owner.close_entered,1,__ATOMIC_RELEASE);
     return metadata_close_node(node);
 }
 static struct lwext4_mount_adapter *journal_wait_owner;
@@ -3108,7 +3112,7 @@ static void caller_metadata_owners(struct kernel_page_cache *cache, const char *
     metadata_owner_instance=instance;
     assert(!kernel_vfs_ftruncate(&caller,2*BOAROS_PAGE_SIZE));
     assert(!pthread_join(closer,NULL));
-    assert(timestamp_owner.entered && timestamp_owner.close_done);
+    assert(timestamp_owner.entered && timestamp_owner.close_entered && timestamp_owner.close_done);
     timestamp_owner=(__typeof__(timestamp_owner)){0};
     metadata_owner_instance=NULL;
     cache_test_attach(0);
