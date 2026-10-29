@@ -201,7 +201,7 @@ FD 属性修改仍持有 VFS I/O 写资格，保护共享 handle 及缓存 mode�
 
 journal extent 普通文件采用延迟分配。每个活 inode 持有稀疏的逻辑块预留索引，每个结点用64位掩码表示64个文件系统块；不同描述符和 mmap 共用该状态。准备阶段的只读索引查找，以及结束准备时的本 inode 接纳位与借用计数更新，复用已有 inode I/O 写资格，与映射接纳、truncate和写回互斥。完整接纳的准备结束时不修改共享额度；释放未接纳块或将空索引结点移到退休链时才取得挂载状态保护。空退休链直接返回；有内容时仍在状态保护下摘链、锁外释放。已有 initialized／unwritten 映射直接复用，hole 只扣除挂载可用数据块额度，写入时保持磁盘位图和 extent 不变。同一未分配块的重复覆盖只预留一次。空间判断同时扣除未接纳操作的分配和已接纳脏数据的预留，其他文件、目录和 fallocate 无法重复使用这些额度。statfs 的可用空间扣除延迟预留，普通文件 st_blocks 包含预留的数据块，磁盘 inode 和物理映射仍在写回时更新。
 
-每次准备借用自己范围内的预留，包括其他来源已准备的部分；复制结束按实际成功前缀标记接纳，最后一个准备者归还时才释放尚未被任何来源接纳的位。输入故障、内存不足及 mmap 整页准备失败归还未使用部分，不撤销并发写入或映射已经使用的额度。来源首字节故障不会留下延迟预留，包括非块对齐偏移。准备和归还在 inode I/O 写资格内进行，用户 pin 与复制在该资格外；外层写操作互斥保持同次 write 的位置和权限。
+每次准备借用自己范围内的预留，包括其他来源已准备的部分；单据直接借用对应预留节点，请求持有共同起点，接纳和归还不再按块号重新查树。节点借用结束前，即使截断或写回清空其位也不能摘除。复制结束按实际成功前缀标记接纳，最后一个准备者归还时才释放尚未被任何来源接纳的位。输入故障、内存不足及 mmap 整页准备失败归还未使用部分，不撤销并发写入或映射已经使用的额度。来源首字节故障不会留下延迟预留，包括非块对齐偏移。准备和归还在 inode I/O 写资格内进行，用户 pin 与复制在该资格外；外层写操作互斥保持同次 write 的位置和权限。
 
 回写沿有序脏页形成最多128 KiB的稳定版本批次，连续逻辑范围由 extent 分配器成批选择物理块。实际操作先取得 inode 修改资格，再借用本批对应的预留额度；接纳时同时发布映射、位图、空间计数并撤下对应预留。abort 恢复被该操作借用的额度，脏页和原预留继续支持重试。普通分配阶段 ENOSPC 可以返回已预留的可复制前缀，未接纳部分不增长 EOF；真实回写 ENOSPC／EIO 通过既有错误游标报告并保留脏数据。与固定 Linux 的 ext4_da_reserve_space 相同，预留针对数据块，extent 元数据扩展在回写事务内申请，空间或 I/O 失败仍由同步接口报告。truncate 成功后归还实际 EOF 之外的预留；打洞和 fallocate 沿现有写回／范围互斥处理，最终 inode 关闭清理剩余未使用预留。无 journal 和 legacy 文件沿原有立即分配与完成清理协议。
 
@@ -211,7 +211,7 @@ legacy 间接指针格式没有 unwritten 状态，新分配块先清零。若�
 
 `FALLOCATE_HOST_CASES='admission-full admission-legacy admission-prefix admission-prefix-legacy admission-fault admission-mmap' FALLOCATE_HOST_IMAGE_SIZE=8M sh tests/fallocate-host.sh` 检查磁盘满前的接纳与准确短写、fsync 和失效后读回、来源 EFAULT、legacy 清理失败后的 truncate／unlink／仅关闭及卸载重试、真实写回错误，以及共享映射和 private COW。默认组合为 4/16 KiB 页、1/4 KiB 文件系统块和有／无 journal，共 48 个场景，每个场景检查资源归还及 e2fsck。
 
-`FALLOCATE_HOST_CASE=delalloc FALLOCATE_HOST_JOURNALS=journal sh tests/fallocate-host.sh` 检查缓存可见而磁盘仍为空、重复覆盖计费、批量转换、分配后 abort、同步重试和截断归还。
+`FALLOCATE_HOST_CASE=delalloc FALLOCATE_HOST_JOURNALS=journal sh tests/fallocate-host.sh` 检查缓存可见而磁盘仍为空、重复覆盖计费、跨节点部分接纳、批量转换、分配后 abort、映射准备后注入 ENOSPC 时事务回滚并保留数据与预留、随后同步重试，以及截断归还。
 
 截断只写回新 EOF 之前的脏范围，再调用后端；成功后按实际结果更新逻辑长度、通知 MM、丢弃越界页并清零尾页。后端失败且磁盘 size 未变时保留原逻辑长度与脏 owner，截零不需要保存待丢弃数据。删除仍打开的文件保留缓存；只有 orphan 最后一个打开/执行 owner 退出时，才丢弃已不再可观察的缓存并回收 inode。
 

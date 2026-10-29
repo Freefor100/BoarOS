@@ -561,10 +561,10 @@ int ext4_file_prepare_write(ext4_file *file, uint64_t offset, size_t length,
 int ext4_file_complete_write(ext4_file *file);
 /* Adapter owns the live inode I/O writer; global accounting still uses STATE. */
 int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, void **ticket);
-void ext4_file_accept_reservation(ext4_file *, void *ticket, uint64_t accepted_end);
+void ext4_file_accept_reservation(ext4_file *, void *ticket, uint64_t start, uint64_t accepted_end);
 /* Finishing holds the adapter inode I/O writer, excluding concurrent mapping
  * acceptance, truncation and writeback of the same reservation tree. */
-void ext4_file_finish_reservation(ext4_file *, void *ticket, uint64_t accepted_end);
+void ext4_file_finish_reservation(ext4_file *, void *ticket, uint64_t start, uint64_t accepted_end);
 void ext4_file_release_reservations(ext4_file *, uint64_t size);
 void ext4_file_drain_reservations(ext4_file *);
 
