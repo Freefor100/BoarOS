@@ -79,6 +79,7 @@ uint64_t kernel_time_realtime_ns(void)
     struct timespec t; if (clock_gettime(CLOCK_REALTIME, &t)) abort();
     return (uint64_t)t.tv_sec * 1000000000U + t.tv_nsec;
 }
+__attribute__((weak)) uint64_t kernel_time_coarse_realtime_ns(void) { return kernel_time_realtime_ns(); }
 void kernel_console_putc(char c) { fputc(c, stderr); }
 #ifndef FILE_IO_CASES
 __attribute__((weak)) uint64_t kernel_task_current_stack_limit(void) { return UINT64_MAX; }
