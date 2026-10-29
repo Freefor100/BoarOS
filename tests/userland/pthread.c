@@ -1245,11 +1245,11 @@ static int robust_raw_exit_case(int mode, int *wait_result)
     }
     if (probe->registration_error != 0)
         return 4;
+    /* PI 标记同样发布 OWNER_DIED；PI 等待者的交接由独立的退出路径处理。 */
     if (probe->entry.word !=
         (mode == ROBUST_PENDING_UNLOCK_WAKE ? 0U :
          mode == ROBUST_OTHER_OWNER ? UINT32_C(0x80000309) :
-         mode == ROBUST_BAD_HEAD || mode == ROBUST_PI_MARKER ||
-         mode == ROBUST_BAD_OFFSET ?
+         mode == ROBUST_BAD_HEAD || mode == ROBUST_BAD_OFFSET ?
              ((uint32_t)probe->tid | UINT32_C(0x80000000)) :
                      UINT32_C(0xc0000000)))
         return 5;
