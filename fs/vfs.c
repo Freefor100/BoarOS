@@ -1426,11 +1426,12 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     int exclusive=create && (flags & KERNEL_VFS_OPEN_EXCLUSIVE);
     int follow=!!(flags & KERNEL_VFS_OPEN_FOLLOW);
     int result;
-    VFS_PATH_WALK(walk,start,root);
-    walk.final_write=create;
     {
+        VFS_PATH_WALK(walk,start,root);
+        walk.final_write=create;
         struct kernel_vfs_path *resolved=NULL;
-        char missing[256]={0};
+        char missing[256];
+        missing[0]=0;
         result=resolve_object(start,root,path,strlen(path),follow,create,1,
             create?VFS_TRAILING_CREATE:VFS_TRAILING_FOLLOW,&resolved,missing,&walk);
         if (result) goto Complete;
@@ -1471,9 +1472,9 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
             }
         }
         if (resolved && kernel_vfs_path_release(&resolved)) __builtin_trap();
+Complete:;
     }
-Complete:
-    path_walk_release(&walk);
+    /* 路径资格在此结束，再取得可执行文件的写入排斥资格。 */
     return flags & KERNEL_VFS_OPEN_EXECUTABLE ? finish_executable_open(file,result) : result;
 }
 
