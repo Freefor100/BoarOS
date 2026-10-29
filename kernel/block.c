@@ -239,19 +239,32 @@ struct phase_window {
     struct kernel_block_span spans[KERNEL_BLOCK_BATCH_MAX];
     size_t count;
 };
-static int window_next(const void *context,const void **cursor,struct kernel_block_span *span)
+struct partition_phase_wrapper {
+    kernel_block_phase_next_fn next;
+    const void *next_context;
+    uint64_t start_bytes;
+};
+static int partition_phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
-    const struct phase_window *window=context;
-    const struct kernel_block_span *at=*cursor;
-    if (at==window->spans+window->count) return 0;
-    *span=*at;*cursor=at+1;return 1;
+    const struct partition_phase_wrapper *wrap = context;
+    int has_next = wrap->next(wrap->next_context, cursor, span);
+    if (has_next && wrap->start_bytes) {
+        span->offset += wrap->start_bytes;
+    }
+    return has_next;
 }
+
 /* The producer and full-call barrier remain borrowed across all windows. Only
  * the transfer qualifier is returned, after the driver's DMA has drained. */
 static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
     struct kernel_block_device *device,kernel_block_phase_next_fn next,const void *context,const void *cursor)
 {
     struct kernel_block_device *disk=physical(device);
+    if (disk->write_phase) {
+        struct partition_phase_wrapper wrap = {next, context, device->start_bytes};
+        KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
+        return disk->write_phase(disk->context, partition_phase_next, &wrap, cursor);
+    }
     struct phase_window window;
     struct kernel_block_span pending={0};
     int ended=0;
@@ -268,10 +281,7 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
         }
         if (!window.count) break;
         KERNEL_LOCK_SCOPE(transfer);kernel_rwlock_write(&disk->transfer_lock,&transfer);
-        if (disk->write_phase) {
-            enum kernel_block_status result=disk->write_phase(disk->context,window_next,&window,window.spans);
-            if (result) return result;
-        } else for (size_t i=0;i<window.count;i++) {
+        for (size_t i=0;i<window.count;i++) {
             const struct kernel_block_span *span=&window.spans[i];
             enum kernel_block_status result=disk->write(disk->context,span->offset,span->buffer,span->size);
             if (result) return result;

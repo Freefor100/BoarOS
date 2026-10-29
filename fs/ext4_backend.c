@@ -2145,6 +2145,11 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
     if (node->noatime) return;
+    if (time_compare(node->times[1], node->times[0]) < 0 &&
+        time_compare(node->times[2], node->times[0]) < 0) {
+        /* relatime快速路径：atime已严重新于mtime与ctime，热读无需重读时钟或争用时间戳锁 */
+        return;
+    }
     struct ext4_timestamp now;
     if (!ext4_file_read_clock(lwext4_node_file(base), &now)) return;
     struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);

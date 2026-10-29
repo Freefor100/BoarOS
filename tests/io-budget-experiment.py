@@ -98,7 +98,7 @@ def build(args):
                    f'KERNEL_RV={work / "kernel-rv"}', f'COST_DIAGNOSTICS={int(args.observe)}',
                    f'CFLAGS_EXTRA=-DBOAROS_PAGE_CACHE_READAHEAD_PAGES={row["readahead_pages"]} -DBOAROS_PAGE_CACHE_WRITEBACK_PAGES={row["writeback_pages"]}']
         effective = contracts.verify_macros(compiler['path'], ROOT, definitions(row), args.observe,
-                                            'kernel/page_cache.h', ['-Iinclude'])
+                                            'kernel/page_cache.h', ['-Iinclude', '-DBOAROS_PAGE_SHIFT=12'])
         core = contracts.build_identity('storage', row, definitions(row), args.observe, frozen_source, command, compiler, effective)
         executed = command if contracts.cache_matches(work, core, helpers.cross_prefix() + 'objcopy') else command + ['-B']
         with (work / 'build.log').open('w') as log:
