@@ -110,7 +110,7 @@ static void domain_shares_locked(struct page_cache_group *group)
     uint64_t high=0,low=0,count=group->domain_count;
     if (count) {
         uint64_t total=physical_page_total(group->allocator)*BOAROS_PAGE_SIZE;
-        high=total/10/count;low=total/20/count;
+        high=total/5;low=total/10;
         if (high<BOAROS_PAGE_SIZE) high=BOAROS_PAGE_SIZE;
         if (low<BOAROS_PAGE_SIZE) low=BOAROS_PAGE_SIZE;
     }
@@ -890,7 +890,7 @@ static void dirty_round_begin(struct kernel_page_cache_record *r)
 static int node_pressure(const struct kernel_vfs_node *node,struct kernel_page_cache_record *record,int low)
 {
     const struct kernel_writeback_domain *domain=node->instance->writeback.domain;
-    if (domain) return domain_bytes(domain)>=(domain_limit(domain,low));
+    if (domain && domain_bytes(domain)>=(domain_limit(domain,low))) return 1;
     return __atomic_load_n(&record->group->dirty,__ATOMIC_RELAXED)>=(low?record->dirty_low:record->dirty_high);
 }
 static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_cache_entry **batch,int all)
@@ -3764,8 +3764,8 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     uint64_t total = physical_page_total(cache->allocator);
     r->low = total / 50 ? total / 50 : 1;
     r->high = total / 25 > r->low ? total / 25 : r->low + 1;
-    r->dirty_low = total / 20 ? total / 20 : 1;
-    r->dirty_high = total / 10 > r->dirty_low ? total / 10 : r->dirty_low + 1;
+    r->dirty_low = total / 10 ? total / 10 : 1;
+    r->dirty_high = total / 5 > r->dirty_low ? total / 5 : r->dirty_low + 1;
     r->stopping = 0;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
     if (r->expired_writeback) {r->expired_writeback=0;r->dirty_deadline=r->dirty_pages?dirty_deadline():0;}
