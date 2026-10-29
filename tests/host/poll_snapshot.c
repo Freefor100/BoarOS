@@ -24,6 +24,8 @@ static int target_cpu0;
 int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *f)
 { CHECK(f==&target);return target_cpu0; }
 static enum kernel_open_file_kind target_kind;
+const uint64_t *kernel_signal_fd_mask(struct kernel_open_file_description *f)
+{ CHECK(f==&target && target_kind!=KERNEL_OPEN_FILE_KIND_SIGNALFD);return 0; }
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
 { CHECK(f==&target);return target_kind; }
 static uint64_t now_ns = 1000, wait_deadline;
