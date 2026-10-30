@@ -76,6 +76,12 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 
 当前沿用原输入和原judge计分。调整这一差异应落在测试调用方式或显式libc接口适配；原结果、运行身份与短回归见[CPU定时器与信号等待](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
 
+## I/O测量工具与调用口径
+
+- 四actor负载按实际在线CPU轮转绑定，并逐角色输出、核对affinity；旧工具最多选择两个CPU的结果不能用来证明四CPU扩展。宿主RV vCPU通过QMP/GDB按logical CPU映射，不能固定把QMP index0或hart0当CPU0。
+- `/proc`的挂载与卸载跟实际消费者配对：原版consumer的`cost_init()`挂载后由协调脚本卸载；纯native正式窗口不挂不卸；带`/observe`的data-path观察窗口主动挂载，结果读出后严格卸载。没有挂载时的EINVAL不能用`|| true`变成成功。
+- 原版iozone扩展命令的`-e`也把read末尾fsync计入read方法；auto与native纯冷热读分列。工具与参数说明见[本轮测量](data-path-budget-experiments.md#2026-10-30接纳等待稳定快照合批与物理扇区-rmw)，内核性能变化在实验文档记录。
+
 ## 原脚本调用与判分差异
 
 | 项目 | 具体问题与影响 | 当前处理 |

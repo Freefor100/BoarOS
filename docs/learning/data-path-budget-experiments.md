@@ -2,9 +2,92 @@
 
 各日期节的“当前”“最终”和“本轮”均指该节固定内核与工作负载；最新机制见模块文档，各轮性能结论不跨版本转移。
 
+## 2026-10-30：接纳等待、稳定快照合批与物理扇区 RMW
+
+本轮相对10月30日19:57版（`cf10c98d`）缩短了部分普通读取窗口，并按真实批次减少后台缓存索引资格；最终内核在共享 mmap 负载中有扩展，但基线只测了最大核数，无法据此声称本轮改善了扩展性。持续大文件写入仍稳定变慢，混合读尾延迟也有代价，本轮性能未全部达标，不能称为全面加速。生产改动为 `f594f7da` 的物理扇区 RMW 保护、`92ac3f2b` 的真实容量归还通知与锁外快照复制、`265b80a5` 的 prepared 批次捕获/发布；`a2e8bd8e` 只修正 COST 的 idle 分类。实现见[主线 VFS/ext4](/home/leo/BoarOS/docs/modules/vfs-ext4.md)与[VirtIO block](/home/leo/BoarOS/docs/modules/riscv-virtio-block.md)。
+
+### 分层职责与采用条件
+
+写入依次经过 syscall/VFS 接纳、page cache 稳定版本、ext4/JBD、通用 block 和 VirtIO。稳定版本由实际 journal/DMA 借用者保活，前台不能因为提交完成就提前复用；线程 READY、缓存业务排队和设备在途属于三个不同的等待位置。[Split-Level I/O Scheduling](https://research.cs.wisc.edu/wind/Publications/split-sosp15.pdf)将策略分在 syscall、cache、block 三层，适合用来检查职责，不能据此把所有等待都交给设备队列。
+
+1. **接纳与资源归还。** Windows [CcCanIWrite](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-cccaniwrite)／[CcDeferWrite](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ccdeferwrite)区分缓存复制前的接纳和延期处理；[OpenZFS 2.3](https://openzfs.github.io/openzfs-docs/man/v2.3/4/zfs.4.html)把 dirty-data 限流与下游释放联系起来。BoarOS 的 `copy_cached_source()` → `write_admission()` 也在取得来源 pin、entry 写借用和 inode 数据资格之前等待。本轮改为 allocator group 的共同 `progress` 队列，由稳定版本末次归还、日志活动存储释放通知；dirty 转成仍被借用的 version 不算容量已归还。配额、水位和日志预算没有放大。持续写结果说明：通知正确并不自动意味着管理和交接成本下降。
+2. **缓存索引与批次。** `writeback_run()` 已形成同一 inode 的 prepared 前缀；现在整批只捕获一次范围、generation、EOF，锁外复制到原稳定版本，再一次重开整批写资格。entry 借用固定存储，CLOSED/映射撤写排除写者，inode 读资格固定 EOF。早期逐页 capture/publish 反而增加索引资格，原候选保留；最终按批次合并后，三个 RV4 诊断窗口的后台 lock45 次数均下降，详见下文。复制字节没有省略。
+3. **日志持久化。** 原有 commit/checkpoint worker、稳定版本与错误传播继续负责数据、日志体、提交、checkpoint 的依赖。预算仍为物理内存的1/32、上限16 MiB；本轮只让活动存储真实归还及时通知接纳者，没有以少做 flush 换取速度。周期 sync、长写和专盘请求统计用于检查这层。
+4. **块请求与 RMW。** 设备类别和在途量可参考 OpenZFS 的 I/O classes；[Kyber](https://docs.kernel.org/block/kyber-iosched.html)则围绕读与同步写的目标延迟限流。BoarOS 已有 HIGH/NORMAL/LOW 和后台保留槽。本轮按父盘物理扇区与分区平移后的偏移判断 RMW：对齐 scalar/batch 写共享 transfer，部分扇区写独占，防止 raw、partition、byte RMW 交错丢更新。phase 写仍按128 KiB独占窗口排空，VirtIO phase仍为NORMAL、批读仍为HIGH；这些服务份额尚未改变。
+5. **CPU0业务队列。** ext4 普通读、文件元数据与命名空间已有 CALLER 路径；cache 请求、后台写回和部分服务仍争用 CPU0。现有 worker 每最多16次前景请求检查后台工作，写回窗口可以归还执行机会。本轮没有调整这一比例。active-mixed 每轮先形成1 MiB脏数据，再同时释放两个固定读角色、open/close和sync，16轮均用READY/GO/DONE握手；因此可观察真实排队，不能以一句ready打印声称重叠。
+6. **客机调度。** [FreeBSD调度资料](https://papers.freebsd.org/2021/eurobsdcon/mckusick-overview_scheduling_freebsd.files/mckusick-overview_scheduling_freebsd-slides.pdf)提供了CPU亲和、交互响应和运行队列的比较机制。BoarOS的deadline AVL 和常见就绪选取 `kernel_sched_pick()` 的O(1)路径已存在；本轮没有替换共享scheduler raw域、用户CPU保留或CPU0 service规则。下一步是否改调度，需要先确定任务在等哪一个owner、是否已经READY，再区分锁资格等待、授予后恢复与设备完成等待。mmap的rank15/30累计等待仍大于cache lock45；rank是类别而非单一锁对象，下一步需按真实实例、owner和调用链再拆分。
+7. **宿主执行。** QMP报告vCPU TID，RV另用GDB确认boot hart与logical CPU，再固定到宿主P核0/2/4/6；QEMU主线程/I/O固定CPU8。宿主`schedstat`说明vCPU是否实际获得CPU，不能当作客机某个worker的CPU。正式没有改变宿主电源策略或调度算法。
+
+### 固定工作量与正式结果
+
+正式 **15次启动、186个窗口、62张运行盘fsck全部通过**，客机正常退出、宿主亲和性恢复。RV/LA UP基线与最终各两次，共8次；同一最终SMP内核分别在RV 1/2/4、LA 1/2 CPU各跑一次，再补基线RV4、LA2，共7次。SMP始终四actor、固定总字节，不随CPU数增加工作量。每架构的新workload ELF在旧/新内核间冻结，原版iozone、两种libc与loader沿用原输入；正式关闭COST。输入、内核SHA、完整样本见[身份和全部指标](/home/leo/BoarOS/build/io-admission-20261030/formal-results.json)。
+
+UP包括原版4 MiB/1 KiB auto、16 MiB的4/64 KiB `-i 0 -i 1 -i 2 -e`，两种libc共六条；另跑native冷/热读、写接纳和末尾fsync、热点/稀疏写、周期sync、混合、mmap及独立2 GiB盘上的1 GiB持续写。SMP只跑四actor追加、周期sync、mixed、mmap及等工作量pwrite对照。下面均为完成时间变化，负值表示更快；接纳/data与含sync完成分开。
+
+| 观察维度 | RV 基线→最终 | LA 基线→最终 |
+|---|---|---|
+| 纯读 cold4 / cold64 / hot4 | −12.17% / −5.60% / −3.19% | +0.27% / −4.80% / −1.78% |
+| 追加4 KiB：接纳 / 含末尾sync | +1.80% / +3.64% | −1.41% / +26.13% |
+| 追加64 KiB：接纳 / 含末尾sync | +0.17% / −2.90% | −1.15% / +47.41% |
+| 覆盖4 KiB：接纳 / 含末尾sync | −2.54% / −2.26% | −1.92% / +12.37% |
+| UP周期sync / active-mixed | −3.01% / −0.67% | +4.80% / +0.83% |
+| UP热点 / 稀疏 / mmap | −4.57% / −2.19% / −1.96% | −1.91% / −2.22% / −2.03% |
+| 最大SMP mixed：总完成 / read p99 | RV4 −12.33% / **+30.24%** | LA2 +0.20% / −20.90% |
+| 1 GiB持续写：总完成 / actor CPU | **+6.13% / +2.24%** | **+7.88% / +4.42%** |
+| UP整boot root heap峰值，中位MiB | 35.73→35.97 | 10.07→10.03 |
+
+LA短写的大中位负面主要来自一次同步异常：追加4/64 KiB的final-1 fsync为191.6/168.1ms，final-2为67.4/63.2ms，接近基线；data接纳没有相应下降。随后独立反向复核的两项含同步时间为208.0→197.1、112.3→107.9ms，未复现该异常。原版含`-e`的read也包含fsync；同baseline原版程序自身漂移可达LA large-record glibc −16.62%、RV small glibc −11.06%，六条程序的完整时间不能直接当成纯读吞吐。
+
+调用尾延迟仍需承担：RV4 periodic总时间+6.45%、write p99 +16.86%；RV4 pwrite总时间+2.85%、write p99 +21.21%；LA2 mmap/pwrite总时间+4.18%/+9.44%，write p99 +7.70%/+38.31%。这些SMP比较每配置只有一次，保留为单次负面。各请求p95/p99/max、两轮原值及同步分段见[正式详细结果](/home/leo/BoarOS/build/io-admission-20261030/formal-details.md)；heap只表示整boot内核堆峰值，不是全部物理内存，也不与19:57较短工作组的峰值相除。
+
+### 原版iozone逐方法吞吐
+
+整条程序耗时不是各方法的吞吐变化。下表列正式两轮中位的逐方法变化，正值表示吞吐提高；auto未加`-e`。扩展命令16 MiB、4/64 KiB指定`-i 0 -i 1 -i 2 -e`，其read也含fsync，完整六方法另列。auto13项、扩展6项的两轮原始整数、MiB/s与中位数见[原版逐方法附件](/home/leo/BoarOS/build/io-admission-20261030/original-iozone-methods.md)及[原始字段](/home/leo/BoarOS/build/io-admission-20261030/original-iozone-methods.json)。缺少原四进程计分组，本轮不生成新的judge分数。
+
+| 架构/libc | auto read / reread | auto fread / frewrite | auto顺序write / random-write | 16M/4K -e write / rewrite / random-write | 16M/64K -e write / rewrite / random-write |
+|---|---:|---:|---:|---:|---:|
+| RV/musl | +4.12% / +4.40% | +2.36% / +1.40% | -1.33% / -0.31% | +5.94% / +7.10% / +5.19% | +3.59% / +12.79% / +11.10% |
+| RV/glibc | +2.53% / +3.01% | +2.14% / +0.67% | -3.32% / +0.92% | +5.66% / +8.04% / +8.22% | +9.48% / +7.59% / +22.50% |
+| LA/musl | -3.24% / -3.69% | -5.10% / -2.91% | -3.94% / -6.75% | -4.76% / -5.45% / -16.03% | -15.58% / -8.98% / -16.28% |
+| LA/glibc | -0.25% / -1.57% | -1.63% / -1.49% | +1.00% / -2.73% | -8.86% / -10.12% / -11.03% | -31.22% / -34.45% / -29.88% |
+
+LA auto frewrite 本轮为musl 63.31→61.47 MiB/s（-2.91%），glibc 71.46→70.39 MiB/s（-1.49%），两项中位仍为负面，幅度均不到3%；musl两轮方向不一致，glibc两轮均小幅下降。这属于相对本轮cf基线的独立比较；19:57相对更早基线的负面表保留，不将两次比较互相替代。
+
+
+### 同一最终SMP内核的扩展
+
+下表以本架构最终SMP内核在1 CPU的完成时间为1，数值是加速比；每配置单次，固定四actor和总字节。UP专用内核没有混入这个比例。
+
+| 固定负载 | RV 2 CPU | RV 4 CPU | LA 2 CPU |
+|---|---:|---:|---:|
+| 并行追加4 KiB | 1.163× | 0.405× | 0.581× |
+| 并行追加64 KiB | 1.182× | 0.311× | 1.239× |
+| 周期sync | 1.102× | 0.870× | 1.320× |
+| active-mixed | 1.096× | 0.900× | 1.129× |
+| mmap/pwrite共页混合 | 1.532× | 2.660× | 4.608× |
+| 同字节纯pwrite对照 | 0.865× | 0.655× | 1.073× |
+
+四核追加慢在基线已存在：RV4的parallel4/parallel64基线为286.993/284.519ms，最终为286.580/273.339ms，本轮分别−0.14%/−3.93%。因此不能把最终1→4的负加速归成本轮新增；基线只测了4CPU，其1→4比例不另推算。
+
+mmap扩展与纯pwrite变慢同时存在；LA的超线性值还包含资格和调度交错变化，不是纯CPU线性扩展证明。RV4混合总时间缩短而read p99上升，也说明总吞吐和交互等待需要分别判断。
+
+### 长写负面与CPU归因
+
+1 GiB持续写的正式总时间为RV 14.218→15.089s、LA 7.175→7.741s；最后256 MiB吞吐中位分别下降2.56%、8.27%。最后一次fsync未稳定增加，负面主要在持续写入阶段。额外两次LA最终→基线反向复核再次得到 **7118.43→7815.95ms（+9.80%）**、**143.85→131.01 MiB/s**，最后256 MiB为139.19→125.31 MiB/s。该对照独立保留，不重算正式中位；两次共36窗口、12盘fsck通过。[独立复核](/home/leo/BoarOS/build/io-admission-20261030/directed-results.md)
+
+正式LA stream专盘四次累计写字节均为1077428224、FLUSH均304、读字节均1073806848；write API由8690/8691变为8682，flush累计耗时基线1.732/1.690s、最终1.677/1.753s，近似。本次独立复核仅多24 KiB元数据写和2次flush，完整原值另列；盘累计还含验证读与unmount。现有结果没有持续写放大或更多屏障的证据。正式LA actor CPU中位+4.42%，复核+4.68%；需要继续查新增管理、通知和资格交接的调用量与CPU成本，不能把这份增加预先分给其中一项。
+
+COST只解释执行与等待，不进入正式吞吐。早期逐页候选、批次候选的旧`background.run_ticks`都混入secondary idle，**CPU含义无效**；原字段保留，不比较其CPU delta。`a2e8bd8e`在共同CPU初始化处统一设置idle分类后，RV4最终有效BG run为追加578ms、mixed2767ms、mmap1934ms。受控脚本中owner后代均为foreground、外层shell等待，普通内核worker的mask1将执行限制在CPU0，因此这些数值可归CPU0总体后台任务上下文，仍包括其上的IRQ，不能拆成page-cache/journal各worker的净CPU。 三个COST窗口的墙钟分别为 1.639 / 6.094 / 13.000 秒；这些CPU量对应诊断构建，不与前面的正式窗口耗时混算。
+
+同一有效mmap诊断的前台rank15 wait约8477ms、rank30 wait约11705ms、grant到恢复约7000ms，而cache lock45 wait约654ms；它们是多个actor累计且可重叠的elapsed。`cache_execute_ns`、日志阶段和`LOCK_GRANT_RUN_TICKS`均不是CPU。批次资格改动则有直接计数：基线→最终后台lock45 attempts为3266→2306、18613→14963、10564→7721。[有效COST字段、单位与来源](/home/leo/BoarOS/build/io-admission-20261030/cost-correct-summary.md)及[保留候选身份](/home/leo/BoarOS/build/io-admission-20261030/cost-stages.md)
+
+正式actor `getrusage`只计各进程的user+system；宿主CPU用QMP/GDB映射后每TID的`schedstat run_ns/ready_ns`，均另存[CPU来源](/home/leo/BoarOS/build/io-admission-20261030/formal-host-cpu.json)。宿主CPU0还运行前台actor0、worker和IRQ；整boot采样含初始化、验证和退出，不能按事后打印的IO WINDOW划成精确syscall边界。COST分类修正也改变诊断计数与读出，不把诊断runtime增减当作正式性能。
+
+测量到此停止。下一阶段应先解释持续压力下的管理/通知/交接成本，再沿mmap/pwrite的rank15/30类别找到真实锁实例、owner和调用链，判断哪些串行区需要调整；是否调整CPU0业务份额、设备优先级或客机调度，需要相应队列与READY等待支持，不能凭CPU忙闲替换整套调度。原19:57测量及更早judge分数保留在下面，均不由本轮小批覆盖。
+
 ## 2026-10-30：iozone 分项与 journal、读取改动
 
-当前19:57生产改动的读、写接纳、含同步吞吐、尾延迟与内存代价统一见[iozone分项分析](oscomp-iozone-analysis.md#当前结果10月30日1957-读取资格与-journal-资源等待)。该页分别保留原十次小批、LA反向顺序复核，以及截至17:16的256条原命令历史分数；新增小批不替换原judge评分。当前机制见[主线VFS/ext4模块](/home/leo/BoarOS/docs/modules/vfs-ext4.md)。
+19:57阶段改动的读、写接纳、含同步吞吐、尾延迟与内存代价统一见[iozone分项分析](oscomp-iozone-analysis.md#当前结果10月30日1957-读取资格与-journal-资源等待)。该页分别保留原十次小批、LA反向顺序复核，以及截至17:16的256条原命令历史分数；新增小批不替换原judge评分。当前机制见[主线VFS/ext4模块](/home/leo/BoarOS/docs/modules/vfs-ext4.md)。
 
 下节保留17:16时点的三版本小批原值，不代表19:57改动后的结果。
 
