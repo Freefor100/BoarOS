@@ -3324,17 +3324,53 @@ int jbd_journal_retire(struct jbd_journal *journal, int error)
 		JBD_JOURNAL_COMMIT : JBD_JOURNAL_CHECKPOINT, error);
 }
 
-uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal)
+bool jbd_journal_reclaim_goal(struct jbd_journal *journal, unsigned resources,
+    struct jbd_journal_reclaim *goal)
 {
     JBD_STATE_READ_SCOPE(journal);
-	struct jbd_trans *trans = TAILQ_FIRST(&journal->cp_queue);
-	if (!trans) trans = journal->committing;
-	if (!trans) trans = TAILQ_FIRST(&journal->sealed_queue);
-	if (!trans) trans = journal->running;
-	return trans ? trans->sequence : 0;
+    *goal = (struct jbd_journal_reclaim){0};
+    struct jbd_trans *trans;
+    if (resources == JBD_JOURNAL_MEMORY) {
+        /* cp_queue has already returned ordered records and source loans.
+         * Find the next actual release, even when older metadata awaits CP.
+         * Shared sources stay charged until their final block/reader returns;
+         * every selected commit still retires its own ordered records. */
+        trans = journal->committing;
+        if (trans && trans->ordered_count) goto Commit;
+        TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node)
+            if (trans->ordered_count) goto Commit;
+        trans = journal->running;
+        if (trans && trans->ordered_count) goto Commit;
+    }
+    if (resources & JBD_JOURNAL_REUSE) {
+        TAILQ_FOREACH(trans, &journal->cp_queue, trans_node)
+            if (!LIST_EMPTY(&trans->quarantine)) goto Checkpoint;
+        trans = journal->committing;
+        if (trans && !LIST_EMPTY(&trans->quarantine)) goto Checkpoint;
+        TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node)
+            if (!LIST_EMPTY(&trans->quarantine)) goto Checkpoint;
+        trans = journal->running;
+        if (!trans || LIST_EMPTY(&trans->quarantine)) return false;
+    } else {
+        trans = TAILQ_FIRST(&journal->cp_queue);
+        if (!trans) trans = journal->committing;
+        if (!trans) trans = TAILQ_FIRST(&journal->sealed_queue);
+        if (!trans) trans = journal->running;
+        if (!trans) return false;
+    }
+Checkpoint:
+    if (trans->sequence <= journal->checkpoint_sequence) __builtin_trap();
+    goal->sequence = trans->sequence;
+    goal->stage = JBD_JOURNAL_CHECKPOINT;
+    return true;
+Commit:
+    if (trans->sequence <= journal->durable_sequence) __builtin_trap();
+    goal->sequence = trans->sequence;
+    goal->stage = JBD_JOURNAL_COMMIT;
+    return true;
 }
 
-bool jbd_journal_operation_room(struct jbd_journal *journal, const struct jbd_trans *allocated,
+unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const struct jbd_trans *allocated,
     size_t payloads, size_t data_images,
 	const struct file_data_source *const *sources, unsigned count)
 {
@@ -3343,14 +3379,14 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, const struct jbd_tr
 	 * needs records and one charge per distinct owner, never a block image.
 	 * Allocators enforce the same hard budget for additional mapping changes. */
 	size_t images = 5;
-	if (data_images > SIZE_MAX - images) return false;
+	if (data_images > SIZE_MAX - images) return JBD_JOURNAL_MEMORY;
 	images += data_images;
 	size_t per_image = jbd_image_charge(journal) + 256;
 	size_t fixed = (allocated ? 0 : jbd_allocation_charge(sizeof(struct jbd_trans))) + 4 * 256;
-	if (images > (SIZE_MAX - fixed) / per_image) return false;
+	if (images > (SIZE_MAX - fixed) / per_image) return JBD_JOURNAL_MEMORY;
 	size_t minimum = images * per_image + fixed;
 	size_t record = jbd_allocation_charge(sizeof(struct jbd_data));
-	if (payloads > (SIZE_MAX - minimum) / record) return false;
+	if (payloads > (SIZE_MAX - minimum) / record) return JBD_JOURNAL_MEMORY;
 	minimum += payloads * record;
 	for (unsigned i = 0; i < count; i++) {
 		struct jbd_source key = { .owner.context = sources[i]->context };
@@ -3360,13 +3396,15 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, const struct jbd_tr
 		if (previous != i) continue;
 		size_t control = jbd_allocation_charge(sizeof(struct jbd_source));
 		if (sources[i]->bytes > SIZE_MAX - control ||
-		    sources[i]->bytes + control > SIZE_MAX - minimum) return false;
+		    sources[i]->bytes + control > SIZE_MAX - minimum) return JBD_JOURNAL_MEMORY;
 		minimum += sources[i]->bytes + control;
 	}
 	unsigned logs = 1 + jbd_log_images_needed(journal, 1, 0, true);
-	return jbd_budget_room(journal, minimum) &&
-		jbd_log_free_blocks(journal) >= journal->log_reserved &&
-		logs <= jbd_log_free_blocks(journal) - journal->log_reserved;
+    unsigned missing = jbd_budget_room(journal, minimum) ? 0 : JBD_JOURNAL_MEMORY;
+    unsigned available = jbd_log_free_blocks(journal);
+    if (journal->log_reserved > available) __builtin_trap();
+    if (logs > available - journal->log_reserved) missing |= JBD_JOURNAL_LOG;
+    return missing;
 }
 
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,

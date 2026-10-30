@@ -1357,7 +1357,7 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
      * filesystems without JBD; dirty inode pins need a consumer there too. */
     if (adapter->device.fs->jbd_journal) {
         uint64_t budget = physical_page_total(adapter->instance.page_cache->allocator) * BOAROS_PAGE_SIZE / 32;
-        if (budget > 4 * 1024 * 1024) budget = 4 * 1024 * 1024;
+        if (budget > 16 * 1024 * 1024) budget = 16 * 1024 * 1024;
         struct ext4_journal_runtime runtime = {adapter, journal_now, journal_request, journal_wait};
         int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
         if (result != EOK) return lwext4_error(result);

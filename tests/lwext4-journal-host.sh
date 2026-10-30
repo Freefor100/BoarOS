@@ -29,10 +29,16 @@ for block in 1024 4096; do
         timeout 30 "$work/probe" "$work/wire-owner.img" recover-crash "$expected"
         e2fsck -fn "$work/wire-owner.img" >/dev/null
     done
-    for action in record-prepare prepare-wire; do
+    for action in resource-wait resource-admission record-prepare prepare-wire; do
         cp "$work/group-base.img" "$work/$action.img"
         timeout 30 "$work/probe" "$work/$action.img" "$action"
         e2fsck -fn "$work/$action.img" >/dev/null
+    done
+    for fault in 1 2; do
+        cp "$work/group-base.img" "$work/resource-error.img"
+        timeout 30 "$work/probe" "$work/resource-error.img" resource-admission "$fault"
+        timeout 30 "$work/probe" "$work/resource-error.img" recover-crash 79
+        e2fsck -fn "$work/resource-error.img" >/dev/null
     done
     cp "$work/group-base.img" "$work/publication-owners.img"
     timeout 30 "$work/probe" "$work/publication-owners.img" publication-owners

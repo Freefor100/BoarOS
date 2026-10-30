@@ -115,8 +115,9 @@ int ext4_journal_group_service(const char *mount_point, bool force);
 int ext4_journal_group_commit(const char *mount_point, bool force);
 int ext4_journal_group_checkpoint(const char *mount_point);
 int ext4_journal_group_drain(const char *mount_point);
-/* Quota pressure reuses closed groups; memory pressure may end a running
- * group. Explicit drain still waits for all work accepted at its entry. */
+/* Reclaim waits for ordered-data retirement at commit, or checkpoint when
+ * only metadata/log owners remain. Memory pressure may end a running group;
+ * explicit drain checkpoints all work accepted at its entry. */
 int ext4_journal_group_reclaim(const char *mount_point, bool memory_pressure);
 struct ext4_journal_progress {
 	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
