@@ -2037,6 +2037,8 @@ test-cost-host: test-cost-match-host test-cost-diagnostic-host test-cost-boundar
 	build/cost/host/irq-test
 	cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/smp_test.c kernel/cost.c -o build/cost/host/smp-test
 	build/cost/host/smp-test
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 -Itests/host/sync -idirafter include tests/cost/idle_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c -Wl,--gc-sections -o build/cost/host/idle-test
+	build/cost/host/idle-test
 	cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/sync -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/raw_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c -o build/cost/host/raw-test
 	build/cost/host/raw-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test

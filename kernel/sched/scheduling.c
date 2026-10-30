@@ -331,6 +331,9 @@ void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
     cpu->idle = idle;
     idle->cpu = cpu;
     idle->idle = 1;
+#if BOAROS_COST_DIAGNOSTICS
+    idle->cost.wait_flags |= 128;
+#endif
     cpu->scheduler_next = scheduler.cpus;
     scheduler.cpus = cpu;
 }
