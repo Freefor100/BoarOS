@@ -6,7 +6,7 @@ build=${LOOP_HOST_BUILD:-build/host/loop}
 mkdir -p "$build"
 for block in ${LOOP_HOST_BLOCKS:-1024 4096}; do
     outer="$build/outer-$block.img"; inner="$build/inner-$block.img"
-    truncate -s 16M "$outer"; truncate -s 8M "$inner"
+    truncate -s 16M "$outer"; truncate -s 10M "$inner"
     mkfs.ext4 -q -F -b "$block" "$outer"
     mkfs.ext4 -q -F -b "$block" "$inner"
     for shift in ${LOOP_HOST_SHIFTS:-12 14}; do
