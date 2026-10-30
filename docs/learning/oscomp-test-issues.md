@@ -81,6 +81,7 @@ Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该�
 - 四actor负载按实际在线CPU轮转绑定，并逐角色输出、核对affinity；旧工具最多选择两个CPU的结果不能用来证明四CPU扩展。宿主RV vCPU通过QMP/GDB按logical CPU映射，不能固定把QMP index0或hart0当CPU0。
 - `/proc`的挂载与卸载跟实际消费者配对：原版consumer的`cost_init()`挂载后由协调脚本卸载；纯native正式窗口不挂不卸；带`/observe`的data-path观察窗口主动挂载，结果读出后严格卸载。没有挂载时的EINVAL不能用`|| true`变成成功。
 - 原版iozone扩展命令的`-e`也把read末尾fsync计入read方法；auto与native纯冷热读分列。工具与参数说明见[本轮测量](data-path-budget-experiments.md#2026-10-30接纳等待稳定快照合批与物理扇区-rmw)，内核性能变化在实验文档记录。
+- 10月31日单核IOzone短批的通用`cost_consumer`摘要沿用了自动项模板：`argv`仍写4 MiB/1 KiB自动项，`elf_sha256`也不是本次执行的原IOzone，`throughput_methods`为空。冻结的cases文件和每次原输出均为`./iozone -i 0 -i 1 -i 2 -r 64k -s 16m -e`，数值行确认16384/64和六项方法；封存输入盘SHA及从盘提取的两种原ELF校验通过。派生分析据实际命令、原数值列和真实ELF身份修正标签，原rows保留错误字段，未放宽程序成功或内容检查。该问题属于测量记录工具；候选的原程序吞吐下降仍作为内核性能负面，见[单核候选结果](data-path-budget-experiments.md#2026-10-31单核接纳通知候选未通过性能验收)。
 
 ## 原脚本调用与判分差异
 
