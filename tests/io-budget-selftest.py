@@ -166,8 +166,30 @@ class Workload(unittest.TestCase):
         self.assertEqual(result['metrics']['sync_calls'],2)
         self.assertEqual(result['latencies']['io']['samples'],512)
         for bad in ('tmpfs:parallel-append:fsync:2:1M:4K','ext4:parallel-append:cache:2:1M:4K',
-                    'ext4:parallel-append:fsync:4:1M:4K','ext4:append:fsync:2:1M:4K'):
+                    'ext4:append:fsync:2:1M:4K'):
             with self.assertRaises(ValueError):io.parse_case(bad)
+
+    def test_four_actors_use_every_available_cpu_with_fixed_work(self):
+        import os
+        available=sorted(os.sched_getaffinity(0))
+        for count in (1,2,4):
+            if len(available)<count: continue
+            cpus=available[:count]
+            cases=('ext4:parallel-append:fsync:4:1M:4K',
+                   'ext4:periodic-sync:fsync:4:1M:4K',
+                   'ext4:active-mixed:fsync:4:16M:4K',
+                   'ext4:mmap-write:fsync:4:4M:1K')
+            for name in cases:
+                with self.subTest(cpus=cpus,case=name), tempfile.TemporaryDirectory(dir=self.work) as directory:
+                    case=io.parse_case(name);work=Path(directory);io.seed(work/'data',case)
+                    config=work/'config';config.write_text('{backend} {operation} {completion} {files} {bytes} {request} 120\n'.format(**case))
+                    result=subprocess.run(['taskset','-c',','.join(map(str,cpus)),str(self.program),str(config),str(work/'data')],
+                                          capture_output=True,text=True,timeout=125)
+                    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                    parsed=io.validate(Path(str(config)+'.results').read_text(),case)
+                    self.assertEqual({v['role']:v['cpu'] for v in parsed['affinity']},{i:cpus[i%count] for i in range(4)})
+                    expected=24 if case['operation']=='active-mixed' else 16 if case['operation']=='mmap-write' else 4
+                    self.assertEqual(parsed['metrics']['bytes'],expected*1048576)
 
     def test_fixed_range_work_and_preserved_prefix(self):
         result=self.exercise('ext4:range-modify:fsync:1:1M:64K')

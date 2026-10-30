@@ -9,6 +9,15 @@
 static struct kernel_block_device *physical(struct kernel_block_device *device)
 { return device->parent ? device->parent : device; }
 
+static int write_needs_rmw(struct kernel_block_device *device,uint64_t offset,size_t size)
+{
+    uint32_t sector=physical(device)->logical_block_size;
+    /* 调用者持有 transfer 资格，保护 loop 可配置的物理扇区大小。
+     * 驱动按物理盘扇区做 RMW；分区自身的对齐不能代替平移后的对齐。
+     * 分开取余也让尚未通过范围检查的 offset 不会在相加时溢出。 */
+    return size && ((device->start_bytes%sector+offset%sector)%sector || size%sector);
+}
+
 static uint64_t capacity(const struct kernel_block_device *device)
 { return __atomic_load_n(&device->capacity_bytes, __ATOMIC_ACQUIRE); }
 /* Registry updates never sleep. IRQ masking also excludes same-hart preemption;
@@ -156,7 +165,11 @@ enum kernel_block_status kernel_block_write_at(
     }
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
-    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
+    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock,&transfer);
+    if (write_needs_rmw(device,offset,size)) {
+        kernel_lock_release(&transfer);
+        kernel_rwlock_write(&disk->transfer_lock,&transfer);
+    }
     const uint64_t limit = capacity(device);
     if (offset > limit ||
         (uint64_t)size > limit - offset) {
@@ -204,7 +217,14 @@ enum kernel_block_status kernel_block_write_batch_prio(
         return KERNEL_BLOCK_STATUS_INVALID;
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
-    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
+    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock,&transfer);
+    int rmw=0;
+    for (size_t i=0;i<count;i++)
+        if (write_needs_rmw(device,spans[i].offset,spans[i].size)) { rmw=1;break; }
+    if (rmw) {
+        kernel_lock_release(&transfer);
+        kernel_rwlock_write(&disk->transfer_lock,&transfer);
+    }
     const uint64_t limit = capacity(device);
     int nonempty = 0;
     for (size_t i = 0; i < count; i++) {

@@ -16,8 +16,10 @@ static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static unsigned pause_read, read_paused, writer_waiting, resume_read;
 static struct kernel_rwlock *expected_lock;
 static _Thread_local unsigned peer;
+static void rmw_before_lock(struct kernel_rwlock *lock);
 void block_model_before_lock(struct kernel_rwlock *lock)
 {
+    rmw_before_lock(lock);
     if (!peer || lock!=expected_lock) return;
     assert(!pthread_mutex_lock(&handshake));
     writer_waiting = 1; pthread_cond_broadcast(&changed);
@@ -145,6 +147,7 @@ static void serialized_io(struct kernel_block_device *d, struct kernel_block_dev
     for(unsigned i=0;i<512;i++) assert(disk[8*512+i]==0x42);
     assert(p->references==0 && d->references==2);
 }
+#include "block_rmw_cases.h"
 static void invalid_tables(void)
 {
     struct kernel_block_device d={.read=rd,.write=wr,.logical_block_size=512,.capacity_bytes=sizeof(disk)},p[4]={0};
@@ -218,5 +221,6 @@ int main(void)
     assert(!kernel_block_unregister(&p[0]) && !kernel_block_unregister(&p[2]));
     assert(!d.references && !kernel_block_unregister(&d));
     invalid_tables();
+    driver_rmw_cases();
     puts("block partitions: discovery, translated I/O, claims, read-only and lifetime passed");
 }

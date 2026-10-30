@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <errno.h>
 static _Thread_local struct kernel_io_context model_io;
 struct kernel_io_context *kernel_io_context_current(void) { return &model_io; }
 /* Production calls retain rank/owner nesting; pthread rwlocks implement the
@@ -31,6 +32,7 @@ static struct model_lock *lookup(struct kernel_rwlock *lock)
     assert(object);assert(!pthread_mutex_unlock(&registry));return object;
 }
 extern void block_model_before_lock(struct kernel_rwlock *) __attribute__((weak));
+extern void block_model_lock_waiting(struct kernel_rwlock *) __attribute__((weak));
 static void acquire(struct kernel_rwlock *lock,struct kernel_lock_guard *guard,int write)
 {
     assert(!guard->lock);
@@ -39,7 +41,12 @@ static void acquire(struct kernel_rwlock *lock,struct kernel_lock_guard *guard,i
         (previous->lock->rank==lock->rank && previous->lock->key<lock->key));
     if (block_model_before_lock)block_model_before_lock(lock);
     struct model_lock *object=lookup(lock);
-    assert(!(write?pthread_rwlock_wrlock(&object->lock):pthread_rwlock_rdlock(&object->lock)));
+    int result=write?pthread_rwlock_trywrlock(&object->lock):pthread_rwlock_tryrdlock(&object->lock);
+    if (result) {
+        assert(result==EBUSY);
+        if (block_model_lock_waiting)block_model_lock_waiting(lock);
+        assert(!(write?pthread_rwlock_wrlock(&object->lock):pthread_rwlock_rdlock(&object->lock)));
+    }
     *guard=(struct kernel_lock_guard){.lock=lock,.owner=&model_io,.previous=previous,.write=write};
     model_io.locks=guard;
 }

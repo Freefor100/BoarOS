@@ -50,6 +50,19 @@ static int page_address(const void *p, uint64_t *out)
 { *out = (uintptr_t)p; return 1; }
 static int image_fd;
 static unsigned age_observing,age_waits,age_empty_wait;
+static void wait_progress(const unsigned *,unsigned);
+static struct { const void *source; unsigned armed, entered, resume; } snapshot_copy;
+void *__real_memcpy(void *,const void *,size_t);
+void *__wrap_memcpy(void *destination,const void *source,size_t size)
+{
+    if (source==snapshot_copy.source && __atomic_exchange_n(&snapshot_copy.armed,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&snapshot_copy.entered,1,__ATOMIC_RELEASE);
+        wait_progress(&snapshot_copy.resume,1);
+    }
+    return __real_memcpy(destination,source,size);
+}
+static _Thread_local unsigned admission_client;
+static struct { unsigned before_registration, entered, resume, parked, done; int result; } admission_credit;
 static _Thread_local unsigned progress_writeback_caller;
 static unsigned progress_writeback_waiting;
 static uint64_t age_clock_offset,age_deadlines[2];
@@ -292,6 +305,10 @@ enum kernel_scheduler_status __real_kernel_wait_park(const struct kernel_wait_to
 enum kernel_scheduler_status __wrap_kernel_wait_park(const struct kernel_wait_token *token,
     enum kernel_wait_wake_reason *reason)
 {
+    if (admission_client) {
+        __atomic_store_n(&admission_credit.parked,1,__ATOMIC_RELEASE);
+        if (!admission_credit.before_registration) wait_progress(&admission_credit.resume,1);
+    }
     if (hold_durable_wait) {
         hold_durable_wait = 0;
         assert(!kernel_cpu_current()->raw_locks);
@@ -310,6 +327,8 @@ enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
+    if (admission_client && !__atomic_exchange_n(&admission_credit.entered,1,__ATOMIC_ACQ_REL) &&
+        admission_credit.before_registration) wait_progress(&admission_credit.resume,1);
     if (journal_wait_owner && (queue == &journal_wait_owner->journal_work ||
         queue == &journal_wait_owner->checkpoint_work || queue == &journal_wait_owner->journal_progress))
         assert(kernel_cpu_current()->raw_locks && "journal condition and registration need shared state protection");
@@ -814,6 +833,58 @@ static void partial_snapshot(struct kernel_page_cache *cache,struct kernel_vfs_f
     kernel_page_cache_alias_detach(&alias); kernel_page_cache_alias_drain(&alias);
     assert(!physical_page_release(pages,address));
     puts("PASS one-byte stable block: concurrent alias mutation preserves old borrowed bytes and next dirty generation");
+}
+
+static struct { struct kernel_page_cache *cache; struct kernel_vfs_file *file; uint64_t address; struct kernel_page_cache_alias *alias; unsigned done; } snapshot_writer;
+static void *snapshot_alias_writer(void *unused)
+{
+    (void)unused;cache_test_attach(8);
+    struct kernel_page_cache_write_borrow borrow={0};
+    assert(kernel_page_cache_alias_write_begin(snapshot_writer.alias,&borrow)==KERNEL_PAGE_CACHE_STATUS_BUSY);
+    assert(!kernel_page_cache_wait_writable(snapshot_writer.cache,snapshot_writer.file,0,snapshot_writer.address));
+    assert(!kernel_page_cache_alias_write_begin(snapshot_writer.alias,&borrow));
+    kernel_page_cache_alias_mark_dirty(snapshot_writer.alias);
+    kernel_page_cache_write_end(&borrow);
+    __atomic_store_n(&snapshot_writer.done,1,__ATOMIC_RELEASE);return NULL;
+}
+static void *snapshot_hot_reader(void *file)
+{
+    cache_test_attach(7);unsigned char byte;size_t done;
+    assert(!kernel_vfs_pread(file,0,&byte,1,&done,NULL) && done==1 && byte==0x71);
+    return NULL;
+}
+static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0},hot={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));current_cache=cache;
+    assert(!kernel_vfs_create(&mount,"/snapshot-copy",0600,&file) && !kernel_vfs_create(&mount,"/snapshot-hot",0600,&hot));
+    size_t done;unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x71,sizeof(bytes));
+    assert(!kernel_vfs_pwrite(&hot,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t observed=0;assert(!kernel_vfs_sync(&hot,0,&observed));
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t address;size_t valid;assert(!kernel_page_cache_get(cache,&file,0,&address,&valid));
+    struct kernel_page_cache_alias alias={0};assert(!kernel_page_cache_alias_attach(cache,&file,0,address,&alias,
+        kernel_vfs_file_node(&file),0x80000,rearm_alias));
+    snapshot_copy=(__typeof__(snapshot_copy)){.source=access_page(address),.armed=1};sync_done=0;
+    pthread_t sync,reader,writer;assert(!pthread_create(&sync,NULL,sync_file,&file));wait_progress(&snapshot_copy.entered,1);
+    snapshot_writer=(__typeof__(snapshot_writer)){.cache=cache,.file=&file,.address=address,.alias=&alias};unsigned parked=mm_test_parked(8);
+    assert(!pthread_create(&writer,NULL,snapshot_alias_writer,NULL));
+    while(mm_test_parked(8)==parked)sched_yield();
+    assert(!__atomic_load_n(&snapshot_writer.done,__ATOMIC_ACQUIRE));
+    /* The reader must finish while the snapshot itself is still stopped. */
+    assert(!pthread_create(&reader,NULL,snapshot_hot_reader,&hot));assert(!pthread_join(reader,NULL));
+    assert(!snapshot_copy.resume && !__atomic_load_n(&snapshot_writer.done,__ATOMIC_ACQUIRE) && !__atomic_load_n(&sync_done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&snapshot_copy.resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(sync,NULL) && !pthread_join(writer,NULL));snapshot_copy.source=NULL;
+    kernel_page_cache_alias_detach(&alias);kernel_page_cache_alias_drain(&alias);
+    assert(!physical_page_release(cache->allocator,address));
+    observed=kernel_vfs_error_sequence(&file);assert(!kernel_vfs_sync(&file,0,&observed));
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_close(&hot) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS snapshot copy: unrelated hot read finishes during copy, same-page mmap writer waits for reopening, owners returned");
 }
 
 struct append_snapshot_request {
@@ -3177,6 +3248,65 @@ static void *domain_quota_writer(void *argument)
     assert(!kernel_vfs_pwrite(file,0,"quota",5,&done) && done==5);
     progress_writeback_caller=0;return NULL;
 }
+static void *admission_credit_writer(void *file)
+{
+    cache_test_attach(10);admission_client=1;size_t done;
+    admission_credit.result=kernel_vfs_pwrite(file,0,"credit",6,&done);
+    assert(admission_credit.result || done==6);admission_client=0;
+    __atomic_store_n(&admission_credit.done,1,__ATOMIC_RELEASE);return NULL;
+}
+static void admission_credit_case(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file source={0},busy={0},target={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));current_cache=cache;
+    assert(!kernel_vfs_create(&mount,"/credit-source",0600,&source) && !kernel_vfs_create(&mount,"/credit-busy",0600,&busy) &&
+        !kernel_vfs_create(&mount,"/credit-target",0600,&target));
+    struct kernel_vfs_instance *instance=mount.private_data;struct kernel_writeback_statistics stats;
+    struct lwext4_mount_adapter *adapter=(void *)instance;
+    struct retained_version versions[1024]={0};size_t count=0,done;
+    for(unsigned metadata=0;metadata<2;metadata++) for(unsigned early=0;early<2;early++) {
+        void *allocation=NULL;
+        if(metadata) { kernel_writeback_domain_snapshot(&instance->writeback,&stats);
+            allocation=jbd_alloc(adapter->device.fs->jbd_journal,stats.high_bytes+65536);assert(allocation);
+        } else {
+            do {assert(count<1024);retain_generation(&source,0x61,&versions[count++]);
+                kernel_writeback_domain_snapshot(&instance->writeback,&stats);
+            } while(stats.version_bytes+stats.metadata_bytes<stats.high_bytes+65536);
+        }
+        assert(!kernel_vfs_pwrite(&busy,0,"busy",4,&done) && done==4);
+        write_entered=resume_write=0;pause_write=1;
+        assert(!kernel_page_cache_start_worker(cache) && !kernel_page_cache_request_writeback(cache));wait_progress(&write_entered,1);
+        admission_credit=(__typeof__(admission_credit)){.before_registration=early};pthread_t writer;
+        assert(!pthread_create(&writer,NULL,admission_credit_writer,&target));wait_progress(&admission_credit.entered,1);
+        if(!early)wait_progress(&admission_credit.parked,1);
+        if(metadata)jbd_free(allocation);
+        else {for(size_t i=0;i<count;i++)versions[i].source.release(versions[i].source.context);count=0;memset(versions,0,sizeof(versions));}
+        __atomic_store_n(&admission_credit.resume,1,__ATOMIC_RELEASE);
+        wait_progress(&admission_credit.done,1);assert(!admission_credit.result && !resume_write);
+        assert(!pthread_join(writer,NULL));__atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+        kernel_page_cache_stop_worker(cache);
+        uint64_t observed=kernel_vfs_error_sequence(&target);assert(!kernel_vfs_sync(&target,0,&observed));
+    }
+    kernel_writeback_domain_snapshot(&instance->writeback,&stats);
+    void *allocation=jbd_alloc(adapter->device.fs->jbd_journal,stats.high_bytes+65536);assert(allocation);
+    assert(!kernel_vfs_pwrite(&busy,0,"stop",4,&done) && done==4);
+    write_entered=resume_write=stop_done=0;pause_write=1;
+    assert(!kernel_page_cache_start_worker(cache) && !kernel_page_cache_request_writeback(cache));wait_progress(&write_entered,1);
+    admission_credit=(__typeof__(admission_credit)){0};pthread_t writer,stopper;
+    assert(!pthread_create(&writer,NULL,admission_credit_writer,&target));wait_progress(&admission_credit.parked,1);
+    __atomic_store_n(&admission_credit.resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_create(&stopper,NULL,stop_cache,NULL));wait_progress(&admission_credit.done,1);
+    assert(admission_credit.result==-KERNEL_EIO && !__atomic_load_n(&stop_done,__ATOMIC_ACQUIRE) && !resume_write);
+    assert(!pthread_join(writer,NULL));jbd_free(allocation);
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);assert(!pthread_join(stopper,NULL));
+    uint64_t observed=kernel_vfs_error_sequence(&busy);assert(!kernel_vfs_sync(&busy,0,&observed));
+    assert(!kernel_vfs_close(&source) && !kernel_vfs_close(&busy) && !kernel_vfs_close(&target) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS admission credit: retained stable versions and real journal metadata release before registration/park resume writer and stop exits waiting while worker stays in unrelated I/O");
+}
 static void writeback_domains(struct kernel_page_cache *cache,const char *path)
 {
     struct kernel_heap *heap_for_domains=cache->heap;
@@ -3405,6 +3535,8 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"snapshot-copy")) {snapshot_copy_case(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"admission-credit")) {admission_credit_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"append-snapshot")) {append_snapshot(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"domain-start-failure")) {writeback_start_failure(&cache,argv[1]);return 0;}
         if (!strcmp(argv[2],"progress-owners")) {progress_writeback_owners(&cache,argv[1]);goto owners;}
@@ -3420,7 +3552,7 @@ int main(int argc, char **argv)
             goto owners;
         }
 #ifdef CACHE_MM_CASES
-        if (!strcmp(argv[2],"mremap")) {
+        if (!strcmp(argv[2],"mremap") || !strcmp(argv[2],"shared-mmap")) {
             image_fd=open(argv[1],O_RDWR); assert(image_fd>=0);
             struct stat st; assert(!fstat(image_fd,&st));
             struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
@@ -3428,7 +3560,14 @@ int main(int argc, char **argv)
             struct kernel_vfs_mount mount={0};
             assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
             assert(!kernel_page_cache_start_worker(&cache));
-            disk_remap_case(&heap,&pages,&mount);
+            if (!strcmp(argv[2],"shared-mmap")) {
+                struct kernel_vfs_file file={0};unsigned char bytes[2*BOAROS_PAGE_SIZE];size_t done;
+                memset(bytes,0x73,sizeof(bytes));
+                assert(!kernel_vfs_create(&mount,"/shared-mmap",0600,&file));
+                assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+                assert(!kernel_vfs_close(&file));
+                disk_mm_case(&cache,&heap,&pages,&mount,"/shared-mmap");
+            } else disk_remap_case(&heap,&pages,&mount);
             kernel_page_cache_stop_worker(&cache);
             assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(&cache));
             goto owners;
