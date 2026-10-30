@@ -2594,6 +2594,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
     *written=0;
     size_t ready=0;
     int space_error=0;
+    struct kernel_vfs_write_view view={0};
     while (*written<size) {
         if (!ready) {
             if (reservation->reservation) {
@@ -2616,25 +2617,24 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
         size_t count=BOAROS_PAGE_SIZE-start;
         if (count>size-*written) count=size-*written;
         if (count>ready) count=ready;
-        size_t first_part;
-        count=kernel_vfs_write_source_page_span(source,count,&first_part);
-        if (!count) { source->access=KERNEL_UACCESS_STATUS_STATE; return 0; }
         KERNEL_LOCK_SCOPE(io);
         /* 外层文件写操作门固定逻辑尺寸，取得写入来源前不重复占用inode。 */
         uint64_t old_size=kernel_vfs_node_size(node);
         struct kernel_page_cache_resize resize={0};
         uint64_t address=0;
         struct kernel_page_cache_entry *entry=NULL,*candidate=NULL;
-        enum kernel_page_cache_status status=prepare_write_entry(cache,file,offset>>BOAROS_PAGE_SHIFT,
-            !start && count==BOAROS_PAGE_SIZE,&entry,&candidate,&address);
+        int whole=!start && count==BOAROS_PAGE_SIZE;
+        enum kernel_page_cache_status status;
+PrepareTarget:
+        status=prepare_write_entry(cache,file,offset>>BOAROS_PAGE_SHIFT,
+            whole,&entry,&candidate,&address);
         if (status) {
             kernel_page_cache_resize_finish(&resize,old_size);
             if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) continue;
             return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
         }
         struct kernel_page_cache_write_borrow writer={0};
-        struct kernel_mm_user_pin pin={0};
-        if (!kernel_vfs_write_source_pin(source,&pin)) {
+        if (!kernel_vfs_write_source_prepare(source,count,&view)) {
             if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
             kernel_page_cache_resize_finish(&resize,old_size);
             if (entry) {
@@ -2642,32 +2642,41 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
             }
             return 0;
         }
+        if (candidate && whole && view.size<count) {
+            /* 第二来源页尚不可用时仍须接纳真实前缀；私有完整覆盖候选
+             * 没有旧尾，先结束来源借用，再按部分覆盖装入旧内容或零页。 */
+            count=view.size;
+            kernel_vfs_write_source_finish(source,&view);
+            (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
+            candidate=NULL;whole=0;
+            goto PrepareTarget;
+        }
+        count=view.size;
         /* 连续写覆盖全部新字节，普通写借用已隔离稳定快照；只有空洞需要
          * 关闭旧EOF页并撤销别名写权限，清零旧EOF到本次起点之间的范围。 */
         if (offset>old_size) {
             int error=kernel_page_cache_resize_prepare(cache,node,old_size,offset,&resize);
             if (error==-KERNEL_EBUSY && source->mm) {
-                /* 有MM编辑正在排空本次读pin：先归还，再等待别名撤权。
-                 * 之后只重取现有pin；若映射已变，开放目标后再做真正缺页。 */
-                kernel_mm_unpin_user_page(&pin);
+                /* MM编辑可正在排空来源借用。无pin推进撤权后先结束EOF
+                 * 资格，再从共同入口重新取得来源，避免持关闭页去缺页。 */
+                kernel_vfs_write_source_finish(source,&view);
                 error=kernel_page_cache_resize_prepare(cache,node,old_size,offset,&resize);
-                if (!error) {
-                    uint64_t user=source->user.iov[source->user.index].base+source->user.offset;
-                    enum kernel_mm_status pinned=kernel_mm_pin_user_page(source->mm,user,KERNEL_MM_READ,&pin);
-                    if (pinned==KERNEL_MM_STATUS_OK) kernel_vfs_write_source_use_pin(source,&pin);
-                    else if (pinned!=KERNEL_MM_STATUS_NOT_MAPPED && pinned!=KERNEL_MM_STATUS_ACCESS)
-                        __builtin_trap();
+                kernel_page_cache_resize_finish(&resize,old_size);
+                if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
+                if (entry) {
+                    CACHE_SCOPE(guard,cache);entry_return(entry);
                 }
+                if (error) return error;
+                continue;
             }
-            if (error || (source->mm && !pin.registration)) {
-                if (pin.registration) kernel_mm_unpin_user_page(&pin);
+            if (error) {
+                kernel_vfs_write_source_finish(source,&view);
                 kernel_page_cache_resize_finish(&resize,old_size);
                 if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
                 if (entry) {
                     { CACHE_SCOPE(guard,cache); entry_return(entry); }
                 }
-                if (error) return error;
-                continue;
+                return error;
             }
         }
         kernel_vfs_node_lock(node,&io,1);
@@ -2694,7 +2703,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
         if (!admitted) {
             if (loading) __builtin_trap(); /* 新候选尚无其他写入者。 */
             kernel_lock_release(&io);
-            if (pin.registration) kernel_mm_unpin_user_page(&pin);
+            kernel_vfs_write_source_finish(source,&view);
             kernel_page_cache_resize_finish(&resize,old_size);
             if (entry) {
                 (void)kernel_page_cache_wait_writable(cache,file,offset>>BOAROS_PAGE_SHIFT,address);
@@ -2704,17 +2713,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
         }
         void *page;
         if (physical_page_map_owned(cache->allocator,address,&page)) __builtin_trap();
-        /* 首片段的地址已由pin准备；标量写不再重复查span或重建来源指针。 */
-        kernel_vfs_write_source_copy(source,(unsigned char *)page+start,first_part);
-        kernel_vfs_write_source_advance(source,first_part);
-        for (size_t copied=first_part;copied<count;) {
-            size_t part=kernel_vfs_write_source_span(source,count-copied);
-            if (!part) __builtin_trap();
-            if (source->mm) kernel_vfs_write_source_use_pin(source,&pin);
-            kernel_vfs_write_source_copy(source,(unsigned char *)page+start+copied,part);
-            kernel_vfs_write_source_advance(source,part);
-            copied+=part;
-        }
+        kernel_vfs_write_source_copy_view(source,(unsigned char *)page+start,&view);
         resize_apply(&resize,offset>old_size?offset:old_size);
         {
             CACHE_SCOPE(guard,cache);
@@ -2725,7 +2724,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
         }
         kernel_vfs_node_written(node,offset+count);
         kernel_lock_release(&io);
-        if (pin.registration) kernel_mm_unpin_user_page(&pin);
+        kernel_vfs_write_source_finish(source,&view);
         kernel_page_cache_resize_finish(&resize,old_size);
         offset+=count; *written+=count; ready-=count;
     }
@@ -3377,6 +3376,9 @@ int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kern
                 __atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED,__ATOMIC_ACQ_REL);
                 aliases=entry->aliases;alias_borrow(aliases);break;
             }
+            if (kernel_io_context_current()->user_pins) {
+                entry_return(entry);return -KERNEL_EBUSY;
+            }
             if (kernel_wait_prepare(&entry->ready,0,0,&wait)) __builtin_trap();
             park = entry->writeback || entry_loading(entry) ||
                 (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED));
@@ -3396,6 +3398,10 @@ int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kern
         {
             CACHE_SCOPE(guard,cache);
             if (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&UINT32_MAX)) break;
+            if (kernel_io_context_current()->user_pins) {
+                __atomic_fetch_and(&entry->writes,~(CACHE_WRITES_CLOSED | CACHE_ENTRY_CLOSED),__ATOMIC_RELEASE);
+                entry_return(entry);cache_wake(&entry->ready);return -KERNEL_EBUSY;
+            }
             if (kernel_wait_prepare(&entry->ready,0,0,&wait)) __builtin_trap();
         }
         enum kernel_wait_wake_reason reason;
