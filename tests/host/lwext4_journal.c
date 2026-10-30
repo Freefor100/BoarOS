@@ -117,6 +117,188 @@ static void close_normal_journal(struct ext4_blockdev *dev, struct jbd_journal *
     jbd_memory_put(memory);
 }
 
+struct resource_wait {
+    struct jbd_journal *journal;
+    enum ext4_journal_wait expected;
+    uint64_t target;
+    unsigned calls;
+};
+static uint64_t resource_now(void *context) { (void)context; return 0; }
+static int resource_wait(void *context, uint64_t target, enum ext4_journal_wait kind)
+{
+    struct resource_wait *wait = context;
+    struct jbd_journal *journal = wait->journal;
+    CHECK(kind == wait->expected && target == wait->target);
+    CHECK(kind == EXT4_JOURNAL_WAIT_CHECKPOINT ? target > journal->checkpoint_sequence :
+        target > journal->durable_sequence);
+    wait->calls++;
+    if (journal->running && journal->running->sequence <= target)
+        CHECK(jbd_journal_freeze(journal) == EOK);
+    while (journal->durable_sequence < target) {
+        if (!journal->committing)
+            CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+        int result = jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT,
+            jbd_journal_submit(journal));
+        if (result) return result;
+    }
+    if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) {
+        CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_CHECKPOINT) == JBD_JOURNAL_CHECKPOINT);
+        CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_CHECKPOINT,
+            jbd_journal_checkpoint(journal)) == EOK);
+    }
+    return EOK;
+}
+struct resource_source { unsigned references; void *data; };
+static void resource_retain(void *context) { ((struct resource_source *)context)->references++; }
+static void resource_release(void *context)
+{ CHECK(((struct resource_source *)context)->references); ((struct resource_source *)context)->references--; }
+static void resource_accept_data(struct jbd_journal *journal, ext4_fsblk_t home,
+    struct resource_source *source, bool quarantine)
+{
+    struct jbd_trans *operation;
+    struct file_data_source owner = {.context = source, .bytes = 64 * 1024,
+        .retain = resource_retain, .release = resource_release};
+    CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
+    CHECK(jbd_trans_write_data(operation, home, 0, source->data,
+        journal->block_size, false, &owner) == EOK);
+    if (quarantine) {
+        test_operation_bind(journal->jbd_fs->inode_ref.fs, operation);
+        CHECK(jbd_trans_quarantine(journal->jbd_fs->inode_ref.fs, home + 100, 1, false) == EOK);
+        test_operation_bind(journal->jbd_fs->inode_ref.fs, NULL);
+    }
+    CHECK(jbd_trans_prepare_operation(operation) == EOK);
+    CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
+}
+static void resource_reclaim(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    ext4_fsblk_t home)
+{
+    struct resource_wait wait = {.journal = journal};
+    struct ext4_journal_runtime runtime = {.context = &wait, .now_ns = resource_now,
+        .wait = resource_wait};
+    dev->fs->jbd_journal = journal;
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    jbd_memory_set_cache_disabled(journal, true);
+    /* An older durable owner cannot release the new ordered data loan. */
+    struct jbd_trans *old;
+    struct ext4_block block;
+    CHECK(jbd_journal_new_trans(journal, &old) == EOK);
+    CHECK(ext4_block_get(dev, &block, home + 1) == EOK);
+    CHECK(jbd_trans_get_write_access_range(old, &block, 0, 32) == EOK);
+    CHECK(jbd_trans_set_block_dirty_range(old, &block, 0, 32) == EOK);
+    CHECK(ext4_block_set(dev, &block) == EOK);
+    CHECK(jbd_trans_prepare_operation(old) == EOK && jbd_journal_accept(journal, old, 0) == EOK);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+    CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT, jbd_journal_submit(journal)) == EOK);
+    CHECK(journal->durable_sequence == 1 && !journal->checkpoint_sequence);
+    struct resource_source source = {.data = malloc(64 * 1024)};
+    CHECK(source.data && ext4_blocks_get_direct(dev, source.data, home, 1) == EOK);
+    resource_accept_data(journal, home, &source, false);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    resource_accept_data(journal, home, &source, true);
+    CHECK(source.references == 1);
+    struct jbd_journal_reclaim reuse;
+    CHECK(jbd_journal_reclaim_goal(journal, JBD_JOURNAL_REUSE, &reuse) &&
+        reuse.stage == JBD_JOURNAL_CHECKPOINT && reuse.sequence == 3);
+    /* An already selected commit owns the same loan while doing its I/O. */
+    CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+    wait.expected = EXT4_JOURNAL_WAIT_DURABLE; wait.target = 2;
+    CHECK(ext4_journal_group_reclaim("/", true) == EOK);
+    CHECK(wait.calls == 1 && source.references == 1 && !journal->checkpoint_sequence);
+    wait.target = 3;
+    CHECK(ext4_journal_group_reclaim("/", true) == EOK);
+    CHECK(wait.calls == 2 && source.references == 0 && !journal->checkpoint_sequence);
+    /* Metadata/log ownership remains until checkpoint, even after durable. */
+    wait.expected = EXT4_JOURNAL_WAIT_CHECKPOINT; wait.target = 1;
+    CHECK(ext4_journal_group_reclaim("/", true) == EOK);
+    CHECK(wait.calls == 3 && journal->checkpoint_sequence == 3);
+    CHECK(ext4_journal_group_reclaim("/", true) == EOK && wait.calls == 3);
+    free(source.data);
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS resource reclaim: durable data loans, shared source, older durable metadata, checkpoint retirement and no completed-target loop");
+}
+
+static void resource_admission(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    ext4_file *file, ext4_fsblk_t home, unsigned fault)
+{
+    struct resource_wait wait = {.journal = journal, .expected = EXT4_JOURNAL_WAIT_DURABLE, .target = 1};
+    struct ext4_journal_runtime runtime = {.context = &wait, .now_ns = resource_now,
+        .wait = resource_wait};
+    dev->fs->jbd_journal = journal;
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    jbd_memory_set_cache_disabled(journal, true);
+    struct resource_source old = {.data = calloc(1, 64 * 1024)}, next = {.data = calloc(1, 64 * 1024)};
+    CHECK(old.data && next.data && ext4_blocks_get_direct(dev, old.data, home, 1) == EOK);
+    memcpy(next.data, old.data, journal->block_size);
+    resource_accept_data(journal, home, &old, false);
+#ifdef TEST_JBD_CREDIT_PARALLEL
+    /* A real heap OOM must return its allocation error without waiting for
+     * unrelated retained memory or leaking the candidate transaction. */
+    size_t occupied = jbd_memory_used(journal);
+    credit_test = (__typeof__(credit_test)){.journal = journal, .paused = true, .fail_after = 1};
+    credit_actor = 1;
+    CHECK(ext4_transaction_begin("/") == ENOMEM);
+    credit_actor = 0; credit_test.journal = NULL;
+    CHECK(!wait.calls && jbd_memory_used(journal) == occupied && old.references == 1);
+#endif
+    struct file_data_source owner = {.context = &next, .bytes = 64 * 1024,
+        .retain = resource_retain, .release = resource_release};
+    struct file_write_span span = {.buffer = next.data, .size = 8, .source = owner,
+        .source_buffer = next.data, .source_size = journal->block_size};
+    size_t limit = jbd_memory_used(journal) + 16 * journal->block_size;
+    jbd_memory_set_limit(journal, limit);
+    const struct file_data_source *sources[] = {&owner};
+    CHECK(jbd_journal_operation_resources(journal, NULL, 1, 0, sources, 1) == JBD_JOURNAL_MEMORY);
+    if (fault == 1) disk.fail_write = disk.writes + 1;
+    if (fault == 2) disk.fail_flush = disk.flushes + 1;
+    int result = ext4_fpwrite_batch(file, &span, 1);
+    if (fault) {
+        CHECK(result == EIO && !span.written && journal->error == EIO && wait.calls == 1);
+        CHECK(old.references == 1 && !next.references && journal->failed_trans == journal->committing);
+        struct jbd_data_borrow borrow = {0};
+        CHECK(jbd_journal_borrow_data(dev->fs, home, &borrow) && borrow.data == old.data);
+        jbd_journal_release_borrow(&borrow);
+        free(next.data);
+        CHECK(fault_block_crash(&disk) == 0);
+        puts("PASS resource admission EIO: original accepted source retained and readable; rejected source/operation owns nothing");
+        return;
+    }
+    CHECK(result == EOK && span.written == 8);
+    CHECK(wait.calls == 1 && !old.references && next.references == 1 && !journal->checkpoint_sequence);
+    CHECK(jbd_memory_peak(journal) <= limit);
+    /* The actual log deficit must select checkpoint even with ordered data. */
+    struct jbd_trans *private;
+    jbd_memory_set_limit(journal, 4 * 1024 * 1024);
+    CHECK(jbd_journal_new_trans(journal, &private) == EOK);
+    uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
+    /* Use a short unused tail for this private reservation; restore the full
+     * ring before any further I/O. No synthetic occupied/log credit state. */
+    jbd_set32(&journal->jbd_fs->sb, maxlen, journal->first + 8);
+    unsigned capacity = 8;
+    uint32_t record = JBD_HAS_INCOMPAT_FEATURE(&journal->jbd_fs->sb, JBD_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
+    unsigned entries = (journal->block_size - sizeof(struct jbd_revoke_header)) / record;
+    /* Reserve enough packed revokes to leave fewer than the operation's three
+     * minimum log blocks. Private abort returns every credit and record. */
+    unsigned revokes = (capacity - 4) * entries;
+    for (unsigned i = 0; i < revokes; i++)
+        CHECK(jbd_trans_revoke_block(private, i) == EOK);
+    CHECK(jbd_trans_prepare_operation(private) == EOK);
+    CHECK(jbd_journal_operation_resources(journal, NULL, 0, 0, NULL, 0) & JBD_JOURNAL_LOG);
+    struct jbd_journal_reclaim goal;
+    CHECK(jbd_journal_reclaim_goal(journal, JBD_JOURNAL_LOG, &goal) &&
+        goal.stage == JBD_JOURNAL_CHECKPOINT && goal.sequence == 1);
+    jbd_journal_free_trans(journal, private, true);
+    jbd_set32(&journal->jbd_fs->sb, maxlen, maxlen);
+    CHECK(!(jbd_journal_operation_resources(journal, NULL, 0, 0, NULL, 0) & JBD_JOURNAL_LOG));
+    wait.expected = EXT4_JOURNAL_WAIT_CHECKPOINT; wait.target = journal->accepted_sequence;
+    CHECK(ext4_journal_group_drain("/") == EOK && !next.references);
+    free(old.data); free(next.data);
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS resource admission: real write spans wait only durable for quota; real log credits require checkpoint; abort returns credits and sources");
+}
+
 #ifdef TEST_JBD_CREDIT_PARALLEL
 static void prepared_wire(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
@@ -1163,6 +1345,14 @@ int main(int argc, char **argv)
     }
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
+    if (!strcmp(argv[2], "resource-admission")) {
+        resource_admission(&dev, &journal, &file, home, argc > 3 ? (unsigned)atoi(argv[3]) : 0);
+        return 0;
+    }
+    if (!strcmp(argv[2], "resource-wait")) {
+        resource_reclaim(&dev, &journal, home);
+        return 0;
+    }
 #ifdef TEST_JBD_CREDIT_PARALLEL
     if (!strcmp(argv[2], "wire-owner")) {
         unsigned fault = argc > 3 ? (unsigned)atoi(argv[3]) : 0;

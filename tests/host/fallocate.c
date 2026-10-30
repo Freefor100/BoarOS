@@ -733,11 +733,11 @@ static void metadata_limit(struct jbd_journal *journal,size_t block)
     struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
     ext4_fs_state_read_lock(fs);
     jbd_memory_set_limit(journal,jbd_memory_used(journal));
-    (void)jbd_journal_operation_room(journal,NULL,0,0,NULL,0);
+    (void)jbd_journal_operation_resources(journal,NULL,0,0,NULL,0);
     assert(!jbd_memory_cached(journal));
     size_t occupied=jbd_memory_used(journal),margin=block;
     do { jbd_memory_set_limit(journal,occupied+margin);margin+=block; }
-    while (!jbd_journal_operation_room(journal,NULL,0,0,NULL,0));
+    while (jbd_journal_operation_resources(journal,NULL,0,0,NULL,0));
     ext4_fs_state_unlock(fs);
 }
 static enum kernel_block_status (*metadata_original_read)(void *,uint64_t,void *,size_t);

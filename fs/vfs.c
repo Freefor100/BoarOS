@@ -29,17 +29,9 @@ struct kernel_raw_lock kernel_vfs_state_lock = {
     .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED
 };
 
-/* Existing writable OFDs exclude RO transitions themselves. Only operations
- * which can publish a new mutation without such an owner borrow this gate. */
-static void mutation_lock(struct kernel_vfs_mount *mount, struct kernel_lock_guard *guard)
-{
-    struct kernel_vfs_instance *instance=mount->private_data;
-    if (!kernel_lock_held(&instance->reconfiguration,0))
-        kernel_rwlock_read(&instance->reconfiguration,guard);
-}
-#define VFS_MUTATION_SCOPE(name, mount) KERNEL_LOCK_SCOPE(name); mutation_lock(mount,&name)
+#define VFS_MUTATION_SCOPE(name, mount) KERNEL_LOCK_SCOPE(name); kernel_vfs_mutation_lock(mount,&name)
 #define VFS_FILE_MUTATION_SCOPE(name, file) KERNEL_LOCK_SCOPE(name); \
-    if (!(file)->write_lease) mutation_lock((file)->mount,&name)
+    if (!(file)->write_lease) kernel_vfs_mutation_lock((file)->mount,&name)
 
 /* The live inode keeps the three DAC fields together. Callers retain the
  * namespace/inode qualification through mutations; reads take a small snapshot. */
@@ -234,7 +226,7 @@ int kernel_vfs_file_xattr(struct kernel_vfs_file *file, enum kernel_xattr_operat
     KERNEL_LOCK_SCOPE(operation);
     if (write) kernel_vfs_file_write_lock(file,&operation);
     KERNEL_LOCK_SCOPE(mutation);
-    if (write && !file->write_lease) mutation_lock(file->mount,&mutation);
+    if (write && !file->write_lease) kernel_vfs_mutation_lock(file->mount,&mutation);
     KERNEL_LOCK_SCOPE(inode);
     kernel_vfs_node_lock(node,&inode,write);
     if (instance->quiescing) return -KERNEL_EIO;
@@ -399,7 +391,7 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
 #if BOAROS_USER_SMP
     if (kernel_vfs_namespace_requires_cpu0(mount)) kernel_service_scope_begin(&walk->service);
 #endif
-    if (write) mutation_lock(mount,&walk->mutation);
+    if (write) kernel_vfs_mutation_lock(mount,&walk->mutation);
     namespace_node_lock(node,&walk->guard,write);
     walk->mount=mount;
     walk->directory=node;
@@ -2154,7 +2146,7 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
     }
     node = file->private_data;
     KERNEL_LOCK_SCOPE(mutation);
-    if (file->write_lease || node->unlinked) mutation_lock(file->mount,&mutation);
+    if (file->write_lease || node->unlinked) kernel_vfs_mutation_lock(file->mount,&mutation);
     if (file->path && kernel_vfs_path_release(&file->path) != 0)
         __builtin_trap();
     {
@@ -3600,7 +3592,6 @@ void kernel_vfs_file_accessed(struct kernel_vfs_file *file)
 {
     if (!file || !file->mount || !file->mount->private_data) return;
     struct kernel_vfs_instance *instance = file->mount->private_data;
-    VFS_FILE_MUTATION_SCOPE(mutation,file);
     if (!instance->read_only) instance->ops->accessed(file);
 }
 
@@ -3715,7 +3706,7 @@ int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
         return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->instance;
     KERNEL_LOCK_SCOPE(mutation);
-    if (write && !file->write_lease) mutation_lock(file->mount,&mutation);
+    if (write && !file->write_lease) kernel_vfs_mutation_lock(file->mount,&mutation);
     if (instance->quiescing) return -KERNEL_EIO;
     if (write && instance->read_only) return -KERNEL_EROFS;
     return instance->ops->control(node, write, offset, buffer, size, count);

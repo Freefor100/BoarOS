@@ -299,12 +299,25 @@ bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal);
 bool jbd_journal_select(struct jbd_journal *journal);
 int jbd_journal_retire(struct jbd_journal *journal, int error);
 int jbd_journal_checkpoint(struct jbd_journal *journal);
-/* Caller holds STATE. An allocated transaction already charges this journal's
- * budget; NULL includes the control storage still needed before attachment. */
-bool jbd_journal_operation_room(struct jbd_journal *journal, const struct jbd_trans *allocated,
+enum jbd_journal_resource {
+    JBD_JOURNAL_MEMORY = 1,
+    JBD_JOURNAL_LOG = 2,
+    JBD_JOURNAL_REUSE = 4,
+};
+struct jbd_journal_reclaim {
+    uint64_t sequence;
+    enum jbd_journal_stage stage;
+};
+/* Caller holds STATE. Report actual missing resources independently; an
+ * allocated transaction already charges its control storage to the budget. */
+unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const struct jbd_trans *allocated,
     size_t payloads, size_t data_images,
-	const struct file_data_source *const *sources, unsigned count);
-uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
+    const struct file_data_source *const *sources, unsigned count);
+/* Choose a still-owned resource release after its unreached retirement stage.
+ * Pure memory pressure may retire ordered data at commit; log and quarantine
+ * ownership always require checkpoint. Recheck resources after the wait. */
+bool jbd_journal_reclaim_goal(struct jbd_journal *, unsigned resources,
+    struct jbd_journal_reclaim *);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);
 /* The caller pins the bitmap and owns its block-group modification right.

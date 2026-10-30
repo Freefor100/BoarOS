@@ -1436,14 +1436,22 @@ static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
 	return false;
 }
 
-static int ext4_group_reclaim_goal(struct ext4_mountpoint *mp, bool reuse, uint64_t *target)
+static int ext4_group_reclaim_goal(struct ext4_mountpoint *mp, unsigned resources,
+    struct jbd_journal_reclaim *goal)
 {
     EXT4_STATE_READ_SCOPE(state, &mp->fs);
     struct jbd_journal *journal = mp->fs.jbd_journal;
     int error = jbd_journal_error(journal);
     if (error) return error;
-    *target = reuse ? journal->accepted_sequence : jbd_journal_reclaim_target(journal);
-    return *target && *target > journal->checkpoint_sequence ? EOK : ENOMEM;
+    return jbd_journal_reclaim_goal(journal, resources, goal) ? EOK :
+        (resources & JBD_JOURNAL_LOG ? ENOSPC : ENOMEM);
+}
+
+static int ext4_group_wait_reclaim(struct ext4_mountpoint *mp,
+    const struct jbd_journal_reclaim *goal)
+{
+    return ext4_group_wait(mp, goal->sequence, goal->stage == JBD_JOURNAL_COMMIT ?
+        EXT4_JOURNAL_WAIT_DURABLE : EXT4_JOURNAL_WAIT_CHECKPOINT);
 }
 
 __unused
@@ -1503,11 +1511,22 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
                 kind = EXT4_JOURNAL_WAIT_SEALED;
             }
         }
+        /* An allocator OOM is not a retention-quota denial. */
+        if (!result && allocation && allocation == ENOMEM && !budget_denied) result = allocation;
         if (!result && !target && journal->grouped) {
-            bool reuse = ext4_space_waits_checkpoint(mp);
-            if (reuse || !jbd_journal_operation_room(journal, trans, 0, 0, NULL, 0)) {
+            unsigned resources = jbd_journal_operation_resources(journal, trans, 0, 0, NULL, 0);
+            if (ext4_space_waits_checkpoint(mp)) resources |= JBD_JOURNAL_REUSE;
+            if (resources) {
                 if (!wait) result = EAGAIN;
-                else result = ext4_group_reclaim_goal(mp, reuse, &target);
+                else {
+                    struct jbd_journal_reclaim goal;
+                    result = ext4_group_reclaim_goal(mp, resources, &goal);
+                    if (!result) {
+                        target = goal.sequence;
+                        kind = goal.stage == JBD_JOURNAL_COMMIT ?
+                            EXT4_JOURNAL_WAIT_DURABLE : EXT4_JOURNAL_WAIT_CHECKPOINT;
+                    }
+                }
             }
         }
         if (!result && !target && allocation) {
@@ -1516,9 +1535,16 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
             if (journal->grouped && reclaimable && !jbd_journal_error(journal)) {
                 if (!wait) result = EAGAIN;
                 else {
-                    int reclaim = ext4_group_reclaim_goal(mp, false, &target);
+                    struct jbd_journal_reclaim goal;
+                    int reclaim = ext4_group_reclaim_goal(mp,
+                        allocation == ENOSPC ? JBD_JOURNAL_LOG : JBD_JOURNAL_MEMORY, &goal);
                     if (reclaim) result = reclaim == ENOMEM ? allocation : reclaim;
-                    else { result = EOK; retry_allocation = true; }
+                    else {
+                        target = goal.sequence;
+                        kind = goal.stage == JBD_JOURNAL_COMMIT ?
+                            EXT4_JOURNAL_WAIT_DURABLE : EXT4_JOURNAL_WAIT_CHECKPOINT;
+                        result = EOK; retry_allocation = true;
+                    }
                 }
             }
         }
@@ -1727,35 +1753,38 @@ int ext4_journal_group_checkpoint(const char *mount_point)
 	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT);
 }
 
-static int ext4_journal_wait_checkpoint(const char *mount_point, bool drain, bool memory_pressure)
+static int ext4_journal_wait_reclaim(const char *mount_point, bool drain, bool memory_pressure)
 {
-	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
-	if (!mp) return ENOENT;
-	EXT4_MP_LOCK(mp);
-	struct jbd_journal *journal = mp->fs.jbd_journal;
-	int r;
-	uint64_t target;
-	{
-	EXT4_STATE_SCOPE(state, &mp->fs);
-	r = !journal || !journal->grouped ? EINVAL : jbd_journal_error(journal);
-	target = !r ? (drain ? journal->accepted_sequence : jbd_journal_reclaim_target(journal)) : 0;
-    if (journal && target <= journal->checkpoint_sequence) target = 0;
-    /* Moving dirty data into a stable version does not require a durability
-     * barrier. Let a healthy running group fill; real memory/journal budget
-     * pressure and normal age/size limits can still advance it. */
-    if (!r && !drain && !memory_pressure && journal->running &&
-        target == journal->running->sequence && !ext4_group_due(mp,false)) target=0;
-	}
-	if (r == EOK && target)
-		r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
-	EXT4_MP_UNLOCK(mp);
-	return r;
+    struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+    if (!mp) return ENOENT;
+    EXT4_MP_LOCK(mp);
+    struct jbd_journal *journal = mp->fs.jbd_journal;
+    int r;
+    struct jbd_journal_reclaim goal = {0};
+    {
+    EXT4_STATE_SCOPE(state, &mp->fs);
+    r = !journal || !journal->grouped ? EINVAL : jbd_journal_error(journal);
+    if (!r) {
+        if (drain) {
+            if (journal->accepted_sequence > journal->checkpoint_sequence)
+                goal = (struct jbd_journal_reclaim){journal->accepted_sequence, JBD_JOURNAL_CHECKPOINT};
+        } else jbd_journal_reclaim_goal(journal, JBD_JOURNAL_MEMORY, &goal);
+        /* Keep the normal group deadline unless actual memory pressure needs
+         * the running owner's ordered-data loan returned now. */
+        if (!drain && !memory_pressure && journal->running &&
+            goal.sequence == journal->running->sequence && !ext4_group_due(mp, false))
+            goal.sequence = 0;
+    }
+    }
+    if (!r && goal.sequence) r = ext4_group_wait_reclaim(mp, &goal);
+    EXT4_MP_UNLOCK(mp);
+    return r;
 }
 
 int ext4_journal_group_drain(const char *mount_point)
-{ return ext4_journal_wait_checkpoint(mount_point,true,true); }
+{ return ext4_journal_wait_reclaim(mount_point,true,true); }
 int ext4_journal_group_reclaim(const char *mount_point,bool memory_pressure)
-{ return ext4_journal_wait_checkpoint(mount_point,false,memory_pressure); }
+{ return ext4_journal_wait_reclaim(mount_point,false,memory_pressure); }
 
 int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress)
 {
@@ -1928,8 +1957,9 @@ static bool ext4_operation_retry_reclaim(struct ext4_mountpoint *mp, int *result
         context->ext4_last_fs != &mp->fs ||
         !((*result == ENOSPC && context->ext4_last_log_reservation_failed) ||
           (*result == ENOMEM && context->ext4_last_memory_reservation_failed))) return false;
-    uint64_t target;
-    int reclaim = ext4_group_reclaim_goal(mp, false, &target);
+    struct jbd_journal_reclaim goal;
+    int reclaim = ext4_group_reclaim_goal(mp,
+        *result == ENOSPC ? JBD_JOURNAL_LOG : JBD_JOURNAL_MEMORY, &goal);
     if (reclaim) {
         if (reclaim != ENOMEM) *result = reclaim;
         return false;
@@ -1937,7 +1967,7 @@ static bool ext4_operation_retry_reclaim(struct ext4_mountpoint *mp, int *result
 #if BOAROS_COST_DIAGNOSTICS
     int retry_error=*result;
 #endif
-    *result = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
+    *result = ext4_group_wait_reclaim(mp, &goal);
     if (*result!=EOK) return false;
 #if BOAROS_COST_DIAGNOSTICS
     if (retry_error==ENOSPC) COST_ADD(JOURNAL_LOG_RETRIES,1);
@@ -4100,16 +4130,16 @@ int ext4_file_prepare_write(ext4_file *file,uint64_t offset,size_t length,size_t
 Retry:
             if (journal && journal->grouped && !ext4_operation_depth(&file->mp->fs)) {
                 for (;;) {
-                    bool room;
+                    struct jbd_journal_reclaim goal;
                     {
                     EXT4_STATE_READ_SCOPE(state, fs);
-                    room = jbd_journal_operation_room(journal, NULL, maximum, extent ? 0 : maximum, NULL, 0);
+                    unsigned resources = jbd_journal_operation_resources(journal, NULL,
+                        maximum, extent ? 0 : maximum, NULL, 0);
+                    if (!resources) break;
+                    r=ext4_group_reclaim_goal(file->mp,resources,&goal);
                     }
-                    if (room) break;
-                    uint64_t target;
-                    r=ext4_group_reclaim_goal(file->mp,false,&target);
                     if (r) break;
-                    r=ext4_group_wait(file->mp,target,EXT4_JOURNAL_WAIT_CHECKPOINT);
+                    r=ext4_group_wait_reclaim(file->mp,&goal);
                     if (r) break;
                 }
             }
@@ -4914,16 +4944,16 @@ Retry:
 	r = ext4_prepare_growth(file, write_end);
 	if (!r && journal && journal->grouped && outer) {
 		while (!r) {
-			bool room;
-			{
-			EXT4_STATE_READ_SCOPE(state, &file->mp->fs);
-			room = jbd_journal_operation_room(journal, NULL, blocks, data_images, sources, source_count);
-			}
-			if (room) break;
-			uint64_t target;
-			r = ext4_group_reclaim_goal(file->mp, false, &target);
-			if (r) break;
-			r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
+            struct jbd_journal_reclaim goal;
+            {
+            EXT4_STATE_READ_SCOPE(state, &file->mp->fs);
+            unsigned resources = jbd_journal_operation_resources(journal, NULL,
+                blocks, data_images, sources, source_count);
+            if (!resources) break;
+            r = ext4_group_reclaim_goal(file->mp, resources, &goal);
+            }
+            if (r) break;
+            r = ext4_group_wait_reclaim(file->mp, &goal);
 		}
 	}
 	if (!r) r = ext4_trans_start(file->mp);
