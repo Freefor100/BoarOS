@@ -864,11 +864,14 @@ static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
     size_t done;unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x71,sizeof(bytes));
     assert(!kernel_vfs_pwrite(&hot,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     uint64_t observed=0;assert(!kernel_vfs_sync(&hot,0,&observed));
-    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
-    uint64_t address;size_t valid;assert(!kernel_page_cache_get(cache,&file,0,&address,&valid));
+    const unsigned pages=BOAROS_PAGE_CACHE_WRITEBACK_PAGES>1?2:1;
+    for(unsigned i=0;i<pages;i++)
+        assert(!kernel_vfs_pwrite(&file,(uint64_t)i*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    uint64_t address,last;size_t valid;assert(!kernel_page_cache_get(cache,&file,0,&address,&valid));
+    assert(!kernel_page_cache_get(cache,&file,pages-1,&last,&valid));
     struct kernel_page_cache_alias alias={0};assert(!kernel_page_cache_alias_attach(cache,&file,0,address,&alias,
         kernel_vfs_file_node(&file),0x80000,rearm_alias));
-    snapshot_copy=(__typeof__(snapshot_copy)){.source=access_page(address),.armed=1};sync_done=0;
+    snapshot_copy=(__typeof__(snapshot_copy)){.source=access_page(last),.armed=1};sync_done=0;
     pthread_t sync,reader,writer;assert(!pthread_create(&sync,NULL,sync_file,&file));wait_progress(&snapshot_copy.entered,1);
     snapshot_writer=(__typeof__(snapshot_writer)){.cache=cache,.file=&file,.address=address,.alias=&alias};unsigned parked=mm_test_parked(8);
     assert(!pthread_create(&writer,NULL,snapshot_alias_writer,NULL));
@@ -880,11 +883,11 @@ static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
     __atomic_store_n(&snapshot_copy.resume,1,__ATOMIC_RELEASE);
     assert(!pthread_join(sync,NULL) && !pthread_join(writer,NULL));snapshot_copy.source=NULL;
     kernel_page_cache_alias_detach(&alias);kernel_page_cache_alias_drain(&alias);
-    assert(!physical_page_release(cache->allocator,address));
+    assert(!physical_page_release(cache->allocator,address) && !physical_page_release(cache->allocator,last));
     observed=kernel_vfs_error_sequence(&file);assert(!kernel_vfs_sync(&file,0,&observed));
     assert(!kernel_vfs_close(&file) && !kernel_vfs_close(&hot) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
-    puts("PASS snapshot copy: unrelated hot read finishes during copy, same-page mmap writer waits for reopening, owners returned");
+    puts("PASS snapshot batch: unrelated hot read finishes during second-page copy, first-page mmap writer waits for batch reopening, owners returned");
 }
 
 struct append_snapshot_request {

@@ -253,7 +253,8 @@ struct prepared_writeback {
     uint64_t blocks;
 #endif
     uint32_t begin,end;
-    uint32_t written;
+    /* 捕获／复制阶段使用valid；批发布后转为实际已提交字节。 */
+    union { uint32_t valid,written; };
     uint8_t closed;
 };
 struct writeback_storage {
@@ -2957,46 +2958,70 @@ static int next_writeback_span(struct kernel_page_cache_entry *entry,
     return 1;
 }
 static void capture_writeback(struct kernel_page_cache *cache,
-    struct kernel_page_cache_entry *entry,struct prepared_writeback *prepared,uint64_t limit)
+    struct kernel_page_cache_entry **entries,struct prepared_writeback *prepared,size_t count,uint64_t limit)
 {
-    void *page;
-    if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
-    size_t valid;
+    size_t first=0;
+    while (first<count && !prepared[first].version) first++;
+    if (first==count) return;
     {
-        CACHE_SCOPE(guard,cache);
-        prepared->begin=entry->dirty_begin;prepared->end=entry->dirty_end;
-        prepared->generation=entry->generation;
-        uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
-        valid=entry_valid_bytes(entry);
-        if (prepared->end>valid) prepared->end=valid;
-        if (limit>start && prepared->end>limit-start) prepared->end=(size_t)(limit-start);
-        if (entry->retired) prepared->begin=prepared->end=0;
-        if (prepared->end<prepared->begin) prepared->end=prepared->begin;
+        CACHE_SCOPE(capture,cache);
+        uint64_t size=kernel_vfs_node_size(entries[first]->node);
+        for (size_t i=first;i<count;i++) {
+            struct prepared_writeback *p=&prepared[i];
+            if (!p->version) continue;
+            struct kernel_page_cache_entry *entry=entries[i];
+            p->begin=entry->dirty_begin;p->end=entry->dirty_end;
+            p->generation=entry->generation;
+            uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
+            uint64_t remaining=start<size?size-start:0;
+            p->valid=remaining<BOAROS_PAGE_SIZE?(uint32_t)remaining:BOAROS_PAGE_SIZE;
+            if (p->end>p->valid) p->end=p->valid;
+            if (limit>start && p->end>limit-start) p->end=(uint32_t)(limit-start);
+            if (entry->retired) p->begin=p->end=0;
+            if (p->end<p->begin) p->end=p->begin;
 #if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
-        size_t block=dirty_block_size(entry);
-        if (block) prepared->blocks=entry->dirty_blocks&dirty_block_range(block,prepared->begin,prepared->end);
+            size_t block=dirty_block_size(entry);
+            if (block) p->blocks=entry->dirty_blocks&dirty_block_range(block,p->begin,p->end);
 #endif
+        }
     }
-    /* entry借用固定物理页；writes CLOSED及已撤销映射排除写者，
-     * inode读资格固定EOF并排除范围变化。复制不占用共享索引mutex。 */
-    size_t cursor=prepared->begin,begin,end;
-    size_t copy_block=writeback_block_size(entry);
-    unsigned char *stable=version_data(prepared->version);
-    while (next_writeback_range(entry,prepared,&cursor,&begin,&end)) {
-        size_t first=begin&~(copy_block-1),last=(end+copy_block-1)&~(copy_block-1);
-        size_t copy_end=last<valid?last:valid;
-        COST_ADD(SNAPSHOT_COPY,copy_end-first);COST_ADD(WRITEBACK_REQUESTED,end-begin);
-        memcpy(stable+first,(unsigned char *)page+first,copy_end-first);
-        memset(stable+copy_end,0,last-copy_end);
+    /* 本批entry借用固定存储；关闭的写资格及已撤销映射排除写者，
+     * 同一inode读资格固定EOF并排除范围变化。复制不占用共享索引mutex。 */
+    for (size_t i=first;i<count;i++) {
+        struct prepared_writeback *p=&prepared[i];
+        if (!p->version) continue;
+        struct kernel_page_cache_entry *entry=entries[i];
+        void *page;
+        if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
+        size_t cursor=p->begin,begin,end;
+        size_t copy_block=writeback_block_size(entry);
+        unsigned char *stable=version_data(p->version);
+        while (next_writeback_range(entry,p,&cursor,&begin,&end)) {
+            size_t first=begin&~(copy_block-1),last=(end+copy_block-1)&~(copy_block-1);
+            size_t copy_end=last<p->valid?last:p->valid;
+            COST_ADD(SNAPSHOT_COPY,copy_end-first);COST_ADD(WRITEBACK_REQUESTED,end-begin);
+            memcpy(stable+first,(unsigned char *)page+first,copy_end-first);
+            memset(stable+copy_end,0,last-copy_end);
+        }
+        p->written=0;
     }
-    CACHE_SCOPE(publish,cache);
-    if (prepared->closed) {
-        uint64_t previous=__atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
-        if (previous!=CACHE_WRITES_CLOSED) __builtin_trap();
-        cache_wake(&entry->ready);
+    {
+        CACHE_SCOPE(publish,cache);
+        for (size_t i=first;i<count;i++) {
+            struct prepared_writeback *p=&prepared[i];
+            if (!p->version) continue;
+            struct kernel_page_cache_entry *entry=entries[i];
+            if (!p->closed) __builtin_trap();
+            uint64_t previous=__atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
+            if (previous!=CACHE_WRITES_CLOSED) __builtin_trap();
+            entry->retry_blocked=0;p->closed=0;
+        }
     }
-    entry->retry_blocked=0;prepared->closed=0;
+    /* 整批资格已发布；选择时取得的借用覆盖锁外通知及后续提交。 */
+    for (size_t i=first;i<count;i++)
+        if (prepared[i].version) cache_wake(&entries[i]->ready);
 }
+
 static int submit_writeback_spans(struct kernel_vfs_node *node,struct file_write_span *spans,
     const uint8_t *owners,size_t count,struct prepared_writeback *prepared)
 {
@@ -3054,8 +3079,7 @@ static int writeback_run(struct kernel_page_cache *cache,
         int prepare_error=result;
         KERNEL_LOCK_SCOPE(io);
         if (done) kernel_vfs_node_lock(entries[first]->node,&io,0);
-        for (size_t i=0;i<done;i++)
-            if (prepared[i].version) capture_writeback(cache,entries[first+i],&prepared[i],limit);
+        capture_writeback(cache,entries+first,prepared,done,limit);
         int submitted=0;
         for (size_t i=0;i<done && !submitted;i++) {
             if (!prepared[i].version) continue;
