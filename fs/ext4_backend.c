@@ -2145,11 +2145,6 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
     if (node->noatime) return;
-    if (time_compare(node->times[1], node->times[0]) < 0 &&
-        time_compare(node->times[2], node->times[0]) < 0) {
-        /* relatime快速路径：atime已严重新于mtime与ctime，热读无需重读时钟或争用时间戳锁 */
-        return;
-    }
     struct ext4_timestamp now;
     if (!ext4_file_read_clock(lwext4_node_file(base), &now)) return;
     struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
@@ -2222,11 +2217,6 @@ static int ext4_backend_modified(struct kernel_vfs_file *file,
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
-    struct lwext4_node *ext = (struct lwext4_node *)node;
-    if ((ext->dirty_fields & (EXT4_TIME_MTIME | EXT4_TIME_CTIME)) == (EXT4_TIME_MTIME | EXT4_TIME_CTIME)) {
-        uint64_t coarse_sec = kernel_time_coarse_realtime_ns() / UINT64_C(1000000000);
-        if ((int64_t)coarse_sec <= ext->times[1].seconds) return 0;
-    }
     struct ext4_timestamp now;
     if (ext4_file_read_clock(lwext4_node_file(node), &now)) time_dirty((struct lwext4_node *)node,
                                       EXT4_TIME_MTIME | EXT4_TIME_CTIME, now);

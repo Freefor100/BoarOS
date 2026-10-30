@@ -867,6 +867,10 @@ test-ext4-backend-parallel-host:
 	sh tests/namespace-parallel-host.sh
 	sh tests/ext4-namespace-parallel-host.sh
 
+.PHONY: test-ext4-timestamps-host
+test-ext4-timestamps-host:
+	sh tests/ext4-timestamps-host.sh
+
 JOURNAL_GROUP_KERNEL := $(BUILD_DIR)/tests/kernel-journal-group-rv
 JOURNAL_GROUP_RUNTIME_OBJECTS := $(filter-out $(BUILD_DIR)/fs/ext4_backend.o,$(TEST_RUNTIME_OBJECTS)) $(BUILD_DIR)/tests/riscv/journal_group_backend.o
 $(BUILD_DIR)/tests/riscv/journal_group_main.o: CPPFLAGS += -Ifs/lwext4_config -Ithird_party/lwext4/include -DCONFIG_USE_DEFAULT_CFG=0
