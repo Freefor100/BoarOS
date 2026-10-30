@@ -126,10 +126,25 @@ static uint64_t background_limit(uint64_t high)
     return high/100*BOAROS_PAGE_CACHE_BACKGROUND_PERCENT+
         high%100*BOAROS_PAGE_CACHE_BACKGROUND_PERCENT/100;
 }
+static void cache_wake(struct kernel_wait_queue *queue);
+static void group_returned(struct page_cache_group *group)
+{
+    /* JBD可在STATE及计量raw锁下归还；共同owner只通知调度器，
+     * 不反向取得缓存mutex，也不在此等待。 */
+    struct kernel_wait_queue *progress=&group->progress;
+    /* 与登记后的复查配对，禁止额度归还及空队列查询互相越过。 */
+#if BOAROS_MAX_CPUS > 1
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#else
+    __asm__ volatile("" ::: "memory");
+#endif
+    if (__atomic_load_n(&progress->registrations,__ATOMIC_ACQUIRE)) cache_wake(progress);
+}
 void kernel_writeback_domain_memory(void *context,size_t bytes,bool acquiring)
 {
     struct kernel_writeback_domain *domain=context;
     domain_charge(&domain->metadata_bytes,bytes,acquiring);
+    if (bytes && !acquiring) group_returned(domain->group);
 }
 
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
@@ -170,7 +185,7 @@ struct kernel_page_cache_record {
     struct kernel_page_cache_dirty *dirty_head, *dirty_tail, *dirty_cursor;
     uint64_t dirty_remaining, dirty_scan_index;
     struct kernel_thread_join worker;
-    struct kernel_wait_queue work, progress;
+    struct kernel_wait_queue work;
     uint64_t low, high, dirty_high, dirty_low;
     uint64_t completed;
     _Atomic uint64_t requested;
@@ -400,15 +415,17 @@ static void version_retain(void *owner)
     unsigned old=__atomic_fetch_add(&version->references,1,__ATOMIC_ACQ_REL);
     if (!old || old==UINT32_MAX) __builtin_trap();
 }
-static void version_release(void *owner)
+static int version_return(void *owner,int notify)
 {
     struct cache_version *version=owner;
     unsigned old=__atomic_fetch_sub(&version->references,1,__ATOMIC_ACQ_REL);
     if (!old) __builtin_trap();
-    if (old!=1) return;
+    if (old!=1) return 0;
     struct kernel_writeback_domain *domain=version->domain;
+    int returned=domain!=NULL;
     if (domain) {
         version->domain=NULL;domain_charge(&domain->version_bytes,version_bytes(),0);
+        if (notify) group_returned(domain->group);
         kernel_writeback_domain_put(domain);
     }
     struct version_pool *pool=version->pool;
@@ -417,11 +434,13 @@ static void version_release(void *owner)
         if (!pool->closed && pool->idle_count<pool->idle_limit) {
             version->next=pool->idle; pool->idle=version; pool->idle_count++;
             cache_wake(&pool->ready);
-            return;
+            return returned;
         }
     }
     version_dispose(version);
+    return returned;
 }
+static void version_release(void *owner) { (void)version_return(owner,1); }
 /* Detach only idle owners under the raw lock. Physical/heap releases can take
  * lower-ranked allocator locks and therefore always happen after unlocking. */
 static uint64_t version_pool_reclaim(struct version_pool *pool,uint64_t target)
@@ -1231,7 +1250,6 @@ static enum kernel_page_cache_status cache_init(
     }
     record->capacity = PAGE_CACHE_INITIAL_CAPACITY;
     kernel_wait_queue_init(&record->work);
-    kernel_wait_queue_init(&record->progress);
     record->reads_tail=&record->reads_head;
     kernel_mutex_init(&record->metadata, 45, (uintptr_t)record);
     cache->heap = heap;
@@ -2943,19 +2961,24 @@ static void capture_writeback(struct kernel_page_cache *cache,
 {
     void *page;
     if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
-    CACHE_SCOPE(guard,cache);
-    prepared->begin=entry->dirty_begin;prepared->end=entry->dirty_end;
-    prepared->generation=entry->generation;
-    uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
-    size_t valid=entry_valid_bytes(entry);
-    if (prepared->end>valid) prepared->end=valid;
-    if (limit>start && prepared->end>limit-start) prepared->end=(size_t)(limit-start);
-    if (entry->retired) prepared->begin=prepared->end=0;
-    if (prepared->end<prepared->begin) prepared->end=prepared->begin;
+    size_t valid;
+    {
+        CACHE_SCOPE(guard,cache);
+        prepared->begin=entry->dirty_begin;prepared->end=entry->dirty_end;
+        prepared->generation=entry->generation;
+        uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
+        valid=entry_valid_bytes(entry);
+        if (prepared->end>valid) prepared->end=valid;
+        if (limit>start && prepared->end>limit-start) prepared->end=(size_t)(limit-start);
+        if (entry->retired) prepared->begin=prepared->end=0;
+        if (prepared->end<prepared->begin) prepared->end=prepared->begin;
 #if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
-    size_t block=dirty_block_size(entry);
-    if (block) prepared->blocks=entry->dirty_blocks&dirty_block_range(block,prepared->begin,prepared->end);
+        size_t block=dirty_block_size(entry);
+        if (block) prepared->blocks=entry->dirty_blocks&dirty_block_range(block,prepared->begin,prepared->end);
 #endif
+    }
+    /* entry借用固定物理页；writes CLOSED及已撤销映射排除写者，
+     * inode读资格固定EOF并排除范围变化。复制不占用共享索引mutex。 */
     size_t cursor=prepared->begin,begin,end;
     size_t copy_block=writeback_block_size(entry);
     unsigned char *stable=version_data(prepared->version);
@@ -2966,6 +2989,7 @@ static void capture_writeback(struct kernel_page_cache *cache,
         memcpy(stable+first,(unsigned char *)page+first,copy_end-first);
         memset(stable+copy_end,0,last-copy_end);
     }
+    CACHE_SCOPE(publish,cache);
     if (prepared->closed) {
         uint64_t previous=__atomic_fetch_and(&entry->writes,~CACHE_WRITES_CLOSED,__ATOMIC_RELEASE);
         if (previous!=CACHE_WRITES_CLOSED) __builtin_trap();
@@ -3060,8 +3084,10 @@ static int writeback_run(struct kernel_page_cache *cache,
             }
         }
         /* 完成状态和entry借用按批发布；稳定版本的实际归还仍在保护外。 */
+        int returned=0;
         for (size_t i=done;i>0;i--)
-            if (prepared[i-1].version) version_release(prepared[i-1].version);
+            if (prepared[i-1].version) returned|=version_return(prepared[i-1].version,0);
+        if (returned) group_returned(cache->record->group);
         /* Publish a prepared prefix before waiting for another stable owner.
          * This ends its entry qualifications, allowing a foreground writer
          * that borrowed the last version to finish and return that version. */
@@ -3153,24 +3179,31 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
     if (available<r->high) (void)kernel_page_cache_reclaim(cache,r->high-available);
     if (!kernel_page_cache_is_executor(cache) &&
         physical_page_available(cache->allocator)>=r->high && node_pressure(node,r,0)) {
-        /* 普通额度先让后台推进。逐次write插入小请求会打断后台，
-         * 而dirty变成version并未归还额度，于是下一次write又重复排队。
-         * 额度恢复即可继续；一轮后仍不足才走下方有界推进和错误处理。 */
+        /* 额度归还由跨cache的共同owner通知；dirty转为借出的版本不算归还。
+         * 后台轮次结束仍不足时保留原有界推进及错误处理。 */
         uint64_t round=0;
         int joined=0;
         for (;;) {
             struct kernel_wait_token token={0};
+            int park;
             {
                 CACHE_SCOPE(guard,cache);
                 if (!r->started || r->stopping || !node_pressure(node,r,0) ||
                     (joined && r->completed!=round)) break;
-                if (kernel_wait_prepare(&r->progress,0,0,&token)) __builtin_trap();
+                if (kernel_wait_prepare(&r->group->progress,0,0,&token)) __builtin_trap();
                 if (!joined) {
                     joined=1;round=r->completed;r->requested=1;cache_wake(&r->work);
                 }
+                /* release不取cache mutex；与归还侧的空队列查询排序后复查。 */
+#if BOAROS_MAX_CPUS > 1
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#else
+                __asm__ volatile("" ::: "memory");
+#endif
+                park=r->started && !r->stopping && node_pressure(node,r,0) && r->completed==round;
             }
             enum kernel_wait_wake_reason reason;
-            if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
+            if ((park && kernel_wait_park(&token,&reason)) || kernel_wait_finish(&token)) __builtin_trap();
         }
         if (physical_page_available(cache->allocator)>r->low && !node_pressure(node,r,0)) return 0;
     }
@@ -3607,8 +3640,6 @@ static void cache_background(struct kernel_page_cache *cache)
                 CACHE_SCOPE(guard,cache);
                 if (!result) r->statistics.worker_written+=used;
                 else if (result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM) r->statistics.worker_failed+=used;
-                /* checkpoint可能在本批归还版本额度；无需等整个低水位轮次。 */
-                if (!node_pressure(batch[0]->node,r,0)) cache_wake(&r->progress);
                 for (size_t i=0;i<count;i++) entry_return(batch[i]);
             }
             reclaim_window_memory(cache);
@@ -3635,7 +3666,7 @@ static void cache_background(struct kernel_page_cache *cache)
 #endif
         }
         if (!r->dirty_pages) r->force_writeback=0;
-        r->completed++; cache_wake(&r->progress);
+        r->completed++;
     }
     group_complete(r,physical_page_available(cache->allocator)>before);
 }
@@ -3798,6 +3829,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     if (!cache_live(cache) || !cache->record->started) return;
     struct kernel_page_cache_record *r = cache->record;
     { CACHE_SCOPE(stop, cache); r->stopping = 1; r->dirty_cursor=NULL; r->dirty_remaining=0; }
+    cache_wake(&r->group->progress);
     version_pool_stop(r->versions);
     {
         for (;;) {
@@ -3824,7 +3856,6 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     }
 #endif
     cache_wake(&r->work);
-    cache_wake(&r->progress);
     kernel_thread_join(&r->worker);
     version_pool_unreserve(r->versions);r->writeback_capacity=0;
     writeback_workspace_release(cache,r->writeback_workspace);
