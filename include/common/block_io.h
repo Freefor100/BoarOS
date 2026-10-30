@@ -5,6 +5,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Request Priority Tags for I/O Scheduling */
+enum kernel_block_priority {
+    KERNEL_BLOCK_PRIO_LOW = 0,       /* Background writeback, dirty flushes, journal checkpoint */
+    KERNEL_BLOCK_PRIO_NORMAL = 1,    /* Standard synchronous writes, userland I/O, fallbacks */
+    KERNEL_BLOCK_PRIO_HIGH = 2,      /* Foreground synchronous reads, page cache misses, readahead */
+};
+
 /* Immutable byte ranges borrowed by synchronous block providers until all
  * published DMA completes. Filesystem planners own the descriptor storage. */
 struct kernel_block_span {
