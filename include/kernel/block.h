@@ -53,6 +53,10 @@ typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
 typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
     void *context, const struct kernel_block_span *spans, size_t count);
 
+typedef enum kernel_block_status (*kernel_block_write_batch_prio_fn)(
+    void *context, const struct kernel_block_span *spans, size_t count,
+    enum kernel_block_priority priority);
+
 /* Restartable immutable producer for one journal I/O phase. context is stable
  * across independent cursor traversals. The owner has
  * already established disjoint disk ranges. Each span is sector aligned. */
@@ -69,6 +73,7 @@ struct kernel_block_device {
     kernel_block_read_fn read;
     kernel_block_write_fn write;
     kernel_block_write_batch_fn write_batch;
+    kernel_block_write_batch_prio_fn write_batch_prio;
     kernel_block_read_batch_fn read_batch;
     kernel_block_write_phase_fn write_phase;
     uint64_t capacity_bytes;
@@ -133,7 +138,8 @@ int kernel_block_read_only(const struct kernel_block_device *);
  * parent transfer lock cover completion. Flush/configuration take the phase
  * barrier first, then exclusive transfer ownership to include both long phases
  * and ordinary operations.
- * Reads share the transfer lock; writes retain exclusive transfer ownership.
+ * Reads and aligned writes share the transfer lock; exclusive transfer ownership
+ * is reserved for unaligned byte RMW, flush barriers and capacity/read-only changes.
  * Byte I/O retains it across each sector read/modify/write. scratch must
  * hold one logical sector and remains borrowed until the request returns.
  * completed always reports the prefix confirmed by successful callbacks,
@@ -172,6 +178,12 @@ enum kernel_block_status kernel_block_write_batch(
     struct kernel_block_device *device,
     const struct kernel_block_span *spans,
     size_t count);
+
+enum kernel_block_status kernel_block_write_batch_prio(
+    struct kernel_block_device *device,
+    const struct kernel_block_span *spans,
+    size_t count,
+    enum kernel_block_priority priority);
 
 /* Internal journal phase: preflight the entire restartable producer before
  * publishing I/O. Payloads and producer nodes remain stable until return,

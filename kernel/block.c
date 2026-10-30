@@ -156,7 +156,7 @@ enum kernel_block_status kernel_block_write_at(
     }
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
-    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
+    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
     const uint64_t limit = capacity(device);
     if (offset > limit ||
         (uint64_t)size > limit - offset) {
@@ -175,31 +175,36 @@ enum kernel_block_status kernel_block_write_at(
 
 /* 分区转换单独使用本次请求大小的临时向量；整盘与单页缺页读取
  * 不再承担最大批量的栈空间。调用barrier及request owner覆盖驱动完成。 */
-static __attribute__((noinline)) enum kernel_block_status partition_write_batch(
-    struct kernel_block_device *device, const struct kernel_block_span *spans, size_t count)
+static __attribute__((noinline)) enum kernel_block_status partition_write_batch_prio(
+    struct kernel_block_device *device, const struct kernel_block_span *spans, size_t count,
+    enum kernel_block_priority priority)
 {
     struct kernel_block_span translated[count];
     for (size_t i = 0; i < count; i++) {
         translated[i] = spans[i]; translated[i].offset += device->start_bytes;
     }
     struct kernel_block_device *disk = physical(device);
+    if (disk->write_batch_prio)
+        return disk->write_batch_prio(disk->context, translated, count, priority);
     return disk->write_batch(disk->context, translated, count);
 }
 
-enum kernel_block_status kernel_block_write_batch(
+enum kernel_block_status kernel_block_write_batch_prio(
     struct kernel_block_device *device,
     const struct kernel_block_span *spans,
-    size_t count)
+    size_t count,
+    enum kernel_block_priority priority)
 {
     if (!device || !device->logical_block_size)
         return KERNEL_BLOCK_STATUS_INVALID;
-    if (!physical(device)->write && !physical(device)->write_batch)
+    if (!physical(device)->write && !physical(device)->write_batch &&
+        !physical(device)->write_batch_prio)
         return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
         return KERNEL_BLOCK_STATUS_INVALID;
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
-    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
+    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
     const uint64_t limit = capacity(device);
     int nonempty = 0;
     for (size_t i = 0; i < count; i++) {
@@ -219,8 +224,11 @@ enum kernel_block_status kernel_block_write_batch(
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
+    if (disk->write_batch_prio)
+        return device->parent ? partition_write_batch_prio(device, spans, count, priority) :
+            disk->write_batch_prio(disk->context, spans, count, priority);
     if (disk->write_batch)
-        return device->parent ? partition_write_batch(device, spans, count) :
+        return device->parent ? partition_write_batch_prio(device, spans, count, priority) :
             disk->write_batch(disk->context, spans, count);
     for (size_t i = 0; i < count; i++) {
         if (!spans[i].size) continue;
@@ -231,6 +239,17 @@ enum kernel_block_status kernel_block_write_batch(
     return KERNEL_BLOCK_STATUS_OK;
 }
 
+enum kernel_block_status kernel_block_write_batch(
+    struct kernel_block_device *device,
+    const struct kernel_block_span *spans,
+    size_t count)
+{
+    struct kernel_io_context *io_ctx = kernel_io_context_current();
+    enum kernel_block_priority prio = (io_ctx && io_ctx->background_reclaim) ?
+        KERNEL_BLOCK_PRIO_LOW : KERNEL_BLOCK_PRIO_NORMAL;
+    return kernel_block_write_batch_prio(device, spans, count, prio);
+}
+
 static int memory_overlaps(uintptr_t a, size_t an, uintptr_t b, size_t bn)
 { return an && bn && (a < b ? b - a < an : a - b < bn); }
 
@@ -239,19 +258,14 @@ struct phase_window {
     struct kernel_block_span spans[KERNEL_BLOCK_BATCH_MAX];
     size_t count;
 };
-struct partition_phase_wrapper {
-    kernel_block_phase_next_fn next;
-    const void *next_context;
-    uint64_t start_bytes;
-};
-static int partition_phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
+static int window_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
-    const struct partition_phase_wrapper *wrap = context;
-    int has_next = wrap->next(wrap->next_context, cursor, span);
-    if (has_next && wrap->start_bytes) {
-        span->offset += wrap->start_bytes;
-    }
-    return has_next;
+    const struct phase_window *window = context;
+    const struct kernel_block_span *at = *cursor;
+    if (at == window->spans + window->count) return 0;
+    *span = *at;
+    *cursor = at + 1;
+    return 1;
 }
 
 /* The producer and full-call barrier remain borrowed across all windows. Only
@@ -260,11 +274,6 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
     struct kernel_block_device *device,kernel_block_phase_next_fn next,const void *context,const void *cursor)
 {
     struct kernel_block_device *disk=physical(device);
-    if (disk->write_phase) {
-        struct partition_phase_wrapper wrap = {next, context, device->start_bytes};
-        KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
-        return disk->write_phase(disk->context, partition_phase_next, &wrap, cursor);
-    }
     struct phase_window window;
     struct kernel_block_span pending={0};
     int ended=0;
@@ -287,7 +296,10 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
         }
         if (!window.count) break;
         KERNEL_LOCK_SCOPE(transfer);kernel_rwlock_write(&disk->transfer_lock,&transfer);
-        for (size_t i=0;i<window.count;i++) {
+        if (disk->write_phase) {
+            enum kernel_block_status result=disk->write_phase(disk->context,window_next,&window,window.spans);
+            if (result) return result;
+        } else for (size_t i=0;i<window.count;i++) {
             const struct kernel_block_span *span=&window.spans[i];
             enum kernel_block_status result=disk->write(disk->context,span->offset,span->buffer,span->size);
             if (result) return result;
@@ -584,7 +596,8 @@ int kernel_block_read_only(const struct kernel_block_device *device)
     const struct kernel_block_device *disk = device->parent ? device->parent : device;
     return __atomic_load_n(&device->read_only, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&disk->read_only, __ATOMIC_ACQUIRE) ||
-        (!disk->write && !disk->write_batch && !disk->write_phase);
+        (!disk->write && !disk->write_batch && !disk->write_batch_prio &&
+         !disk->write_phase);
 }
 int kernel_block_set_read_only(struct kernel_block_device *device, int read_only)
 {

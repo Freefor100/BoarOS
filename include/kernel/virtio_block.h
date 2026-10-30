@@ -67,7 +67,7 @@ struct virtio_block_device {
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t statistics_start, statistics_last;
 #endif
-    struct kernel_wait_queue admission, idle, slots, descriptors, workspaces;
+    struct kernel_wait_queue admission, idle, slots, slots_low, descriptors, workspaces;
     struct virtio_block_statistics statistics;
 };
 
