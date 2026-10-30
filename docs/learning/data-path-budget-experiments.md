@@ -2,6 +2,140 @@
 
 各日期节的“当前”“最终”和“本轮”均指该节固定内核与工作负载；最新机制见模块文档，各轮性能结论不跨版本转移。
 
+## 2026-10-31：单核 I/O 全链路研究
+
+当前生产源码为10月30日22:28交付版，10月31日00:18仅更正文档。本节重新核对实际调用者、固定 libc/IOzone 源码、已保留 ELF 和前批原始样本；没有启动新的客机或产生新的性能改善数字。通知候选仍未合入。以下区分源码确定的工作量、既有运行的分段时间和仍需测量的占比。
+
+### 数据路径与返回边界
+
+```mermaid
+flowchart LR
+    U["用户请求、iovec"] --> F["OFD 权利、位置和文件写操作资格"]
+    F --> R["读：页缓存需求批次"]
+    R --> M["缺页：ext4 映射与稳定版本查询"]
+    M --> B["块请求与 VirtIO DMA"]
+    B --> R
+    R --> C["缓存页直接复制到用户页"]
+    F --> A["写：接纳与延迟分配预留"]
+    A --> D["用户页复制到可变缓存页"]
+    D --> V["写回：稳定快照与真实块分配"]
+    V --> G["running／sealed 日志组"]
+    G --> P["数据和日志体、FLUSH、commit、FLUSH"]
+    P --> K["checkpoint、回收版本和日志空间"]
+```
+
+普通 write 在数据接纳后返回；fsync 将其目标范围接纳到后端，再等待固定 durable 目标。checkpoint 可以随后完成，不能把它当成每次 fsync 的必要等待。页缓存 entry 持有当前可变页；稳定版本由 journal、读者与 DMA 的真实借用者持有，最后借用结束才归还。具体机制见[主线 VFS/ext4](/home/leo/BoarOS/docs/modules/vfs-ext4.md:767)。
+
+| 层次 | 当前真实路径与粒度 | 确认的工作或限制 |
+|---|---|---|
+| 请求与权限 | [文件 I/O](/home/leo/BoarOS/fs/files/io.c:350)、[VFS 写接纳](/home/leo/BoarOS/fs/vfs.c:1861) | 普通读写维护 OFD offset，定位读写保持 offset；实际写权限、FSIZE、append 和时间戳继续在各自入口检查 |
+| 用户内存 | [用户复制 cursor](/home/leo/BoarOS/mm/uaccess.c:82)、[来源视图](/home/leo/BoarOS/fs/write_source.h:29) | 读可跨来源页复用同一目标用户页 pin；当前写循环被来源用户页边界截断 |
+| 缓存需求读取 | [disk_read](/home/leo/BoarOS/fs/files/io.c:350)→[get_batch](/home/leo/BoarOS/fs/page_cache.c:2249) | 每批最多128 KiB；热命中直接缓存页→用户页，不绕经内核载荷中转缓冲，也不进入 ext4 |
+| 冷读后端 | [ext4_fpread_batch](/home/leo/BoarOS/third_party/lwext4/src/ext4.c:4621) | 每批一次 inode ref，映射范围可跨输出页；普通完整冷页由 DMA 初始化，仅补 EOF 尾零；日志中的新版本另按真实借用复制 |
+| 空间准备 | [reserve_write](/home/leo/BoarOS/third_party/lwext4/src/ext4.c:3973) | 先取 inode ref，再检查预留索引和 extent；洞登记额度，写回才分配真实块。已有预留完全覆盖时仍承担前面的 inode 读取；独立空间准备复用候选尚未合入 |
+| 快照与写回 | [writeback_run](/home/leo/BoarOS/fs/page_cache.c:3047) | 同 inode、最多128 KiB；整批捕获状态，锁外复制，交给同一后端 span 数组；完整稳定块不再生成另一份普通数据 bcache/undo/after 副本 |
+| 日志和同步 | [commit](/home/leo/BoarOS/third_party/lwext4/src/ext4_journal.c:2583)、[checkpoint](/home/leo/BoarOS/third_party/lwext4/src/ext4_journal.c:3220) | commit 两道 FLUSH；checkpoint 最多合八组，并保留 home 与日志尾部的持久化顺序；fsync 不额外等待整个 checkpoint |
+| 块和设备 | [phase 窗口](/home/leo/BoarOS/kernel/block.c:293)→[VirtIO 批次](/home/leo/BoarOS/drivers/virtio/block.c:1104) | 驱动在本批内可持续补请求，但上层每128 KiB等 DMA 排空后才交下一窗；8槽不等于整个日志组有8窗在途 |
+| 单核调度 | [就绪入队](/home/leo/BoarOS/kernel/sched/scheduling.c:413)、[轮转](/home/leo/BoarOS/kernel/sched/scheduling.c:574) | 所有工作共用一个 CPU。相同 OTHER 优先级的唤醒通常不立刻抢占，随后由阻塞、yield或tick推进；后台每窗 yield，前景直接写回只开放 IRQ 安全点 |
+
+### 写入：来源页边界拆散了目标页操作
+
+[copy_cached_source](/home/leo/BoarOS/fs/page_cache.c:2615)先按目标文件页选择 count，随后又用来源用户页边界缩短 count。每个片段重新准备 entry、取得 inode 与页写资格、复制、标脏并归还 pin。当前 [whole 判断](/home/leo/BoarOS/fs/page_cache.c:2628)只看这个片段，无法识别整次请求将覆盖完整目标页。
+
+已用冻结 ELF 的符号地址核对，前批 native 的64 KiB用户 buffer 在 RV 的4 KiB页内偏移为0x6a0，在LA的16 KiB页内偏移为0x16a8；不是仅按 C 声明推测。目标文件偏移对齐时，源码推导为：
+
+| 每次64 KiB写 | RV／4 KiB页 | LA／16 KiB页 |
+|---|---:|---:|
+| 目标文件页数 | 16 | 4 |
+| 涉及的不同来源用户页 | 17 | 5 |
+| 实际来源 pin 和目标处理轮次 | **32** | **8** |
+| 同样写1 GiB的处理轮次 | **524288** | **131072** |
+
+用户源地址与文件页的错位影响接纳组织，后续稳定快照仍按文件系统块对齐提交。一个目标页分两轮处理。新追加页先整页清零再由两片填满，1 GiB追加在此路径累计多一次1 GiB清零；冷覆盖已有页则可能读入最终会被完整覆盖的旧内容；热覆盖也保留重复的目标资格与标脏。原版 IOzone 主缓冲区按默认1 MiB对齐，这个具体错位计数不应直接套给它的对齐大块写，也不能用来解释通知候选相对基线的全部下降。
+
+这一结构有真实失败边界：一个 pin 只授权一个来源页，第二页可能缺页、被撤权或遇到正在排空 pin 的 MM 编辑者。扩大 count／whole 而不准备完整来源，会越过借用范围或破坏短写后的旧尾部。[MM pin 规则](/home/leo/BoarOS/mm/mm.c:1721)与现有[TCP有界多页来源准备](/home/leo/BoarOS/fs/files/io.c:1495)提供了需要保留的具体约束。上述重复工作已由源码确定，减少多少应用耗时仍需针对该路径测量。
+
+### 读取：合法 stdio 请求形状与预读条件不匹配
+
+原盘库的身份与参考源码版本须分开：RV为musl 1.2.0、Ubuntu glibc 2.35，LA为musl 1.2.5、glibc 2.38。已从封存盘只读提取原IOzone、libc与loader并核对输入SHA；原ELF反汇编确认IOzone 3.506给setvbuf和fread传入同一R值，musl有效容量为R−8、使用两个readv向量，glibc的实际xsgetn分支在请求达到R容量时直接读到应用buffer。下述请求形状是原版二进制离线推导，不是本轮新增的运行时syscall跟踪。
+
+musl首次发 `readv(R−1,R−8)`，稳态发 `readv(8,R−8)`，每个R字节记录还在libc内复制约R−8字节；glibc对应 `read(R)`。固定IOzone源码见 `references/iozone/iozone3_506.tar`；musl 1.2.5归档的 `setvbuf.c:16`／`__stdio_read.c:6`、glibc 2.44参考归档的 `libio/fileops.c:1393`帮助解释同一机制，但后者不是原盘glibc的版本证明。来源和校验集中在[sources.tsv](/home/leo/BoarOS/references/sources.tsv:24)，原ELF身份及关键指令见[stdio核查](/home/leo/BoarOS/build/io-admission-single-20261030/stdio-provenance.md)。
+
+| 稳态请求 | RV来源文件页处理：musl／glibc | LA来源文件页处理：musl／glibc |
+|---|---:|---:|
+| 官方1 KiB记录 | 每四次5／4页 | 每十六次17／16页 |
+| 手动4 KiB记录 | 每次2／1页 | 每四次5／4页 |
+| 手动64 KiB记录 | 每次17／16页 | 每次5／4页 |
+
+[read_progress](/home/leo/BoarOS/fs/open_file.c:85)已经按字节末端检查顺序，却额外要求 end 恰好页对齐才排预读。musl的1 KiB流端点为 `n×1024+1015`，正常顺序消费期间不会满足；glibc有页边界触发机会。这是冷顺序流的策略缺口。auto fread 前面已运行同文件的其他方法，通常已热；其额外复制和请求管理须与漏预读分开解释。两种libc的64 KiB需求本来都触发现有大请求抑制，不能承诺靠预读改善该窗口。
+
+读 SG 另有较小的算法冗余：[publish_batch_part](/home/leo/BoarOS/drivers/virtio/block.c:1070)每次追加相邻读 span 都重扫整份 parts，连续批次邻接发现为O(n²)；写入和phase已有一次建立的顺序链。它增加CPU工作，当前尚无占比数据。
+
+### 测量含义：应用完成吞吐与内核工作不是同一个量
+
+前批 native 读取在计时窗口内逐字节检查pattern/checksum；单次read SAMPLE在检查之前结束。写入则每64 KiB生成一次pattern，再开始该次pwrite SAMPLE。下面直接重算既有22:28运行，不是新测量；原值和来源在[分段重算](/home/leo/BoarOS/build/io-admission-single-20261030/chain-research-derived.json)。
+
+| 16 MiB读取 | 整窗ms | read样本合计ms | 样本外ms |
+|---|---:|---:|---:|
+| RV冷读／热读 | 268.909／118.955 | 208.042／60.255 | 60.867／58.700 |
+| LA冷读／热读 | 168.213／86.628 | 119.717／40.084 | 48.496／46.544 |
+
+| 1 GiB写入 | 整窗ms | pwrite样本合计ms | 最后fsync样本ms | 数据循环中样本外ms |
+|---|---:|---:|---:|---:|
+| RV | 15445.363 | 13102.049 | 367.476 | 1975.759 |
+| LA | 8372.906 | 6317.855 | 245.837 | 1809.148 |
+
+样本外时间含生成／检查、循环、采样及其间调度；样本本身也含阻塞，均不是内核净CPU。native RV的4 KiB读buffer还跨两个用户页，而LA只触一个16 KiB页；原IOzone主buffer对齐。因此 native热读约180 MiB/s与IOzone大记录约2500 MiB/s不是同口径，不能相除得到内核倍率。旧报告的“纯读”仅表示不含末尾同步，不能再解释为排除了用户校验成本。native冷读指新挂载文件的首次客机数据读取，宿主缓存未清空。相同ELF、工作量和完成条件下的旧新版本对照仍表示应用完成性能；本节修正的是归因，保留原样本和原吞吐。
+
+### 波动已缩小到后端 FLUSH 与共享核心条件
+
+同一19:57内核、同字节输入的LA两次stream盘计数：
+
+| 项目 | 首次 | 反向复跑 |
+|---|---:|---:|
+| 应用完成时间 | 9.519 s | 7.426 s |
+| 专盘写字节 | 1077448704 | 1077448704 |
+| FLUSH次数 | 306 | 306 |
+| QMP累计FLUSH服务时间 | **3.665 s** | **1.920 s** |
+| QMP累计数据写服务时间 | 325.357 ms | 330.642 ms |
+
+显著差值落在相同数量FLUSH的后端等待，不是多写数据或多发FLUSH。QMP是整张工作盘整个启动累计，含验证和卸载，不能将1.745 s直接当作应用计时中的精确贡献。原版IOzone专盘也一样：六次写字节、848次写、68次FLUSH全同，最终候选的累计FLUSH等待367.679 ms，反向基线273.083 ms；不能据此将全部候选下降归给客机通知CPU开销。
+
+同时，vCPU固定CPU2，其同物理核的SMT线程CPU3在慢样本相关区间有约1.90 s非idle活动，快样本没有；vCPU自身READY等待仅4.896／6.412 ms，有效频率4.355／4.352 GHz基本一致。已有guard允许因权限未能迁移的systemd/kwin线程，记录没有逐进程归属，不能指认其中某个程序。宿主整盘NVMe等待方向相同，但其中包含其他用户。故当前可确认的是FLUSH后端等待和共享核心条件变化，不能把它统称为频率波动，也不能将全部差值确定归给某一个宿主任务。
+
+测量核与默认交付核的SHA差异另已核清：测量使用`config/init.json`的`/init`，默认交付内嵌OSComp runner、启动`/musl/busybox`。对RV194个／LA191个编译对象的text与规范化重定位检查，只有各自PID1启动对象不同；page cache、VFS、调度和设备对象一致。这个启动配置差异解释构建身份不相等，不能当作代码布局导致吞吐变化的证据。
+
+### 负载改变时，限制进度的层也会改变
+
+| 场景 | 当前已有行为与需要区分的成本 |
+|---|---|
+| 连续追加、大块写 | 已有延迟分配、128 KiB稳定批次；来源错位会拆目标页，组预算与FLUSH又限制持续推进 |
+| 同页反复小覆盖 | 脏缓存可以合并多次修改；后台过早取快照会减少合并机会，跨来源边界还会增加发布次数 |
+| 同页离散／稀疏覆盖 | 默认DIRTY_BLOCKS=0按min/max范围回写；LA16 KiB页中离散4 KiB修改可能夹带未修改块。已有位图选项能缩小范围，但可能增加离散请求 |
+| 每次同步写 | 目标范围先接纳，再等待固定durable序号；短组的屏障成本不能用普通write接纳吞吐代替 |
+| 多文件周期fsync | 已有running组合并、固定同步目标和最多八组checkpoint；需分别看封组原因、每组有效字节和等待目标 |
+| 读写混合 | 需求读、预测读、后台写和显式同步需要分享单核及设备；现有16次请求轮转和128 KiB排空边界影响服务时机 |
+| 超过内存的持续写 | 共同脏页、domain额度、JBD硬预算及日志环是不同资源；只有实际owner归还才结束对应等待 |
+| 小文件写后空闲 | 普通脏数据5 s到龄；无脏数据时的时间戳编码另有100 ms期限，不应合称一个周期写回策略 |
+| mmap与write共页 | 真实alias、写资格关闭和稳定版本共同保护快照；优化用户来源准备仍须尊重映射撤权、范围修改和私有COW |
+
+### 现行策略边界与参考机制
+
+本批均为512 MiB客机。page-cache domain高线约受管RAM/8、后台启动为该高线75%；JBD另受`min(16 MiB,RAM/32)`硬预算约束。16 MiB文件可能先在JBD预算处等待durable，根本没有进入共同page-cache接纳队列。现成COST已分别记录`JOURNAL_MEMORY_RETRIES`、`JOURNAL_WAIT_DURABLE`、`JOURNAL_WAIT_CHECKPOINT`及封组的age/bytes/target原因；不能仅因吞吐变慢就判断是哪一个预算。
+
+组事务按首脏100 ms、日志元数据256 KiB、同步目标或资源压力封组；数据页普通到龄为5 s。checkpoint可合最多八组，否则首待处理组最多等100 ms，后到组不延长期限。不同的字节粒度、时间阈值和等待目标会互相影响，需要看每组有效数据量与实际触发原因，而不是单独调大一个缓存。
+
+设备有HIGH/NORMAL/LOW标记，但当前HIGH与NORMAL共用正常槽的同一接纳规则，只有LOW有保留槽限制。预读与需求读都HIGH，journal phase固定NORMAL；普通background write_batch才根据后台上下文选LOW。因此已有标记尚未形成完整的前景／推测／持久化依赖服务份额。连续phase每128 KiB排空的上层边界还限制了驱动补发，虽有8槽，单个连续窗通常能合为一条SG；1 GiB纯数据至少8192条128 KiB请求。实际平均在途深度应读已有`inflight_ticks/busy_ticks`，不能从槽数或累计请求数反推。
+
+| 参考 | 相关机制 | 在BoarOS中的对应判断 |
+|---|---|---|
+| [Split-Level I/O Scheduling，SOSP 2015](https://research.cs.wisc.edu/wind/Publications/split-sosp15.pdf) | 在syscall、cache、block层分别掌握来源、命中和派发信息 | 应同时核对请求形状、缓存接纳、持久化依赖和设备服务，单改CPU调度或块队列都看不全 |
+| [OpenZFS 2.3](https://openzfs.github.io/openzfs-docs/man/v2.3/4/zfs.4.html)、[事务延迟说明](https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/ZFS%20Transaction%20Delay.html) | 下游并发随脏数据压力变化，随后才对接纳平滑限流，并计入已经等待的时间 | 先识别真正限制进度的owner、下游是否被充分供给，再判断接纳速率；当前不同预算不能合成一个水位 |
+| [Windows CcCanIWrite](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-cccaniwrite)、[CcDeferWrite](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ccdeferwrite) | 复制前检查请求与额度，在可接纳时通知实际请求 | BoarOS现有接纳先于来源pin的顺序有用途；候选增加的逐页通知检查并不是无条件收益 |
+| [固定Linux JBD2源码](/home/leo/BoarOS/references/linux/fs/jbd2/commit.c:153)与[日志格式说明](https://docs.kernel.org/filesystems/ext4/journal.html) | 提交记录之前先满足数据／日志持久化约束，结合实际设备能力 | BoarOS当前协商FLUSH，未实现FUA；减少屏障须另有等价持久化协议，不能直接删除两道FLUSH来报告加速 |
+
+这些参考用于比较职责与策略，不移植其默认参数或性能倍率。本轮研究确定了目标页与来源页混用、顺序流预读条件、读SG重复扫描及跨层窗口边界；其应用收益各有适用负载。原IOzone对齐大块写的下降、持续写波动和多核未达项继续按原记录保留。改造方案留在对话及忽略目录，本节只保存研究事实与计量含义。
+
 ## 2026-10-31：单核接纳通知候选未通过性能验收
 
 本次只做单核定向检查，共 **9次启动**：RV、LA的19:57基线、22:28交付版、首个候选各一次；LA候选→19:57基线反向复跑两次；最后再测一次撤下无关字段移动的LA候选。**候选没有合入，生产实现仍为10月30日22:28交付版。** 既有持续写、LA原版方法、混合尾延迟与多核负加速记录继续保留。
