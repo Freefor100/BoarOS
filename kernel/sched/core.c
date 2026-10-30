@@ -867,9 +867,6 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.boot_idle.completion.tgid = 0;
     scheduler.boot_idle.completion.status = 0U;
     scheduler.boot_idle.completion.detail = 0U;
-#if BOAROS_COST_DIAGNOSTICS
-    scheduler.boot_idle.cost.wait_flags = 128;
-#endif
     kernel_cpu_current()->current = &scheduler.boot_idle;
     scheduler.cleanup_task = 0;
     kernel_wait_queue_init(&scheduler.cleanup_queue);
