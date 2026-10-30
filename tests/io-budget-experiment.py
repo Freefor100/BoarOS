@@ -130,11 +130,13 @@ def policy_case(name, parts):
         'periodic-sync': ('4', '1M', '4K', ('fsync',)),
         'active-mixed': ('4', '16M', '4K', ('fsync',)),
         'age-burst': ('1', '4M', '4K', ('fsync',)),
-        'mmap-write': ('2', '4M', '1K', ('fsync',)),
-        'pwrite-pair': ('2', '4M', '1K', ('fsync',)),
+        'mmap-write': (files, '4M', '1K', ('fsync',)),
+        'pwrite-pair': (files, '4M', '1K', ('fsync',)),
         'domain-idle': ('2', '1G', '64K', ('fsync',)),
         'domain-busy': ('2', '512M', '64K', ('fsync',)),
     }[operation]
+    if operation in ('mmap-write','pwrite-pair') and files not in ('2','4'):
+        raise ValueError('shared mapping needs two or four actors: ' + name)
     if (files, size, request) != expected[:3] or completion not in expected[3] or operation == 'sparse-write' and request == '64K':
         raise ValueError('policy case must use its fixed work/completion: ' + name)
     amount = 1024 * 1048576 if size == '1G' else int(size[:-1]) * 1048576
@@ -158,8 +160,8 @@ def parse_case(name):
         raise ValueError('outside bounded file/request matrix ' + name)
     if files == '2' and operation != 'parallel-append':
         raise ValueError('two files select the paired append workload')
-    if operation == 'parallel-append' and (backend != 'ext4' or completion != 'fsync' or files != '2'):
-        raise ValueError('parallel-append requires ext4/fsync and two files')
+    if operation == 'parallel-append' and (backend != 'ext4' or completion != 'fsync' or files not in ('2', '4')):
+        raise ValueError('parallel-append requires ext4/fsync and two or four files')
     if operation == 'range-modify' and (backend != 'ext4' or completion != 'fsync' or files != '1'):
         raise ValueError('range-modify requires ext4/fsync and one file')
     if backend == 'tmpfs' and operation == 'cold-read':
@@ -172,7 +174,7 @@ def parse_case(name):
         raise ValueError('ext4 read must explicitly choose cold-read or hot-read')
     return dict(name=name, backend=backend, operation=operation, completion=completion,
                 files=int(files), bytes=int(size[:-1]) * 1048576, request=int(request[:-1]) * 1024,
-                schedule='four processes, writer dirtied before release, final fsync and two cold readers plus last-FD closes' if operation == 'mixed-read' else 'two fixed-affinity appenders, fixed bytes and final fsync each' if operation == 'parallel-append' else 'one task, fixed four range syscalls per iteration and final fsync' if operation == 'range-modify' else 'one task, one request per file per round',
+                schedule='four processes, writer dirtied before release, final fsync and two cold readers plus last-FD closes' if operation == 'mixed-read' else 'fixed-affinity appenders, fixed bytes and final fsync each' if operation == 'parallel-append' else 'one task, fixed four range syscalls per iteration and final fsync' if operation == 'range-modify' else 'one task, one request per file per round',
                 cache_scope='first guest data read of preloaded image' if operation in ('cold-read', 'mixed-read') else 'one complete verified preread' if operation == 'hot-read' else 'resident tmpfs setup' if backend == 'tmpfs' else 'no target-data preread',
                 persistence_scope='prepared dirty writer final fsync, separate reader/close intervals; not append throughput' if operation == 'mixed-read' else 'memory only' if backend == 'tmpfs' else 'explicit per-file sync syscall' if completion != 'cache' else 'cache completion; no durability claim for timed window')
 
@@ -311,7 +313,7 @@ def validate_policy(text, case):
         layout = records(text, 'POLICY_LAYOUT')
         if len(layout) != 1 or layout[0]['page_bytes'] not in (4096, 16384) or layout[0]['block_bytes'] != 1024:
             raise RuntimeError('missing shared mapping geometry')
-        expected, distinct = 16 * 1048576, 4 * 1048576 // layout[0]['page_bytes'] * 2048
+        expected, distinct = 16 * 1048576, 4 * 1048576 // layout[0]['page_bytes'] * case['files'] * 1024
     else:
         expected = case['bytes'] * case['files']
         distinct = 1048576 if operation in ('hot-write', 'age-hot') else expected
@@ -341,7 +343,7 @@ def validate_policy(text, case):
         identifier = row['id']
         own = [sample for sample in samples if sample['id'] == identifier]
         writes, reads = [v for v in own if v['kind']==1], [v for v in own if v['kind']==3]
-        write_bytes = (16*1048576 if identifier==0 else 0) if operation=='active-mixed' else 8*1048576 if operation in ('mmap-write','pwrite-pair') else (0 if operation=='domain-idle' and identifier else expected//(2 if operation=='domain-busy' else 1)) if operation in ('domain-idle','domain-busy') else expected//case['files']
+        write_bytes = (16*1048576 if identifier==0 else 0) if operation=='active-mixed' else 16*1048576//case['files'] if operation in ('mmap-write','pwrite-pair') else (0 if operation=='domain-idle' and identifier else expected//(2 if operation=='domain-busy' else 1)) if operation in ('domain-idle','domain-busy') else expected//case['files']
         if len(writes) != write_bytes//case['request'] or any(v['bytes'] != case['request'] for v in writes):
             raise RuntimeError('policy write count/request changed')
         expected_reads = 1024 if operation=='active-mixed' and identifier in (1,2) else 0
@@ -366,15 +368,27 @@ def validate_policy(text, case):
                     raise RuntimeError('periodic write/READY/fsync/DONE order violated')
             prior_done=max(v['done_ns'] for v in group)
     elif operation == 'active-mixed':
-        if len(rounds)!=1 or (rounds[0]['id'],rounds[0]['round'])!=(0,0):
-            raise RuntimeError('active mixed first MiB handshake missing')
-        ready=rounds[0]; writer=[v for v in samples if v['id']==0]
-        first_sync=next(v for v in writer if v['kind']==2)
-        first_writes=[v for v in writer if v['kind']==1][:256]
-        if not first_writes[-1]['end_ns'] <= ready['ready_ns'] <= ready['go_ns'] <= first_sync['start_ns'] <= first_sync['end_ns']==ready['done_ns']:
-            raise RuntimeError('mixed first MiB/sync release violated')
-        if any(row['start_ns']<ready['go_ns'] for row in rows if row['id']):
-            raise RuntimeError('mixed reader or closer started before release')
+        if len(rounds)!=64 or {(v['id'],v['round']) for v in rounds}!={(i,r) for i in range(4) for r in range(16)}:
+            raise RuntimeError('active mixed fixed-work READY/DONE rounds missing')
+        prior_done=window['start_ns']
+        for number in range(16):
+            group=[v for v in rounds if v['round']==number]
+            if len({v['go_ns'] for v in group})!=1 or max(v['ready_ns'] for v in group)>group[0]['go_ns']:
+                raise RuntimeError('mixed roles released before every actor READY')
+            for value in group:
+                own=[v for v in samples if v['id']==value['id']]
+                if value['id']==0:
+                    writes=[v for v in own if v['kind']==1][number*256:(number+1)*256]
+                    work=[v for v in own if v['kind']==2][number:number+1]
+                    if not prior_done<=writes[0]['start_ns']<=writes[-1]['end_ns']<=value['ready_ns']:
+                        raise RuntimeError('mixed writer did not prepare the fixed MiB before release')
+                else:
+                    kinds=(3,) if value['id']<3 else (4,5)
+                    count=64 if value['id']<3 else 32
+                    work=[v for v in own if v['kind'] in kinds][number*count:(number+1)*count]
+                if not prior_done<=value['ready_ns']<=value['go_ns']<=work[0]['start_ns']<=work[-1]['end_ns']<=value['done_ns']:
+                    raise RuntimeError('mixed READY/work/DONE order violated')
+            prior_done=max(v['done_ns'] for v in group)
     elif rounds:
         raise RuntimeError('unexpected policy barrier records')
     domains=records(text, 'POLICY_DOMAIN')

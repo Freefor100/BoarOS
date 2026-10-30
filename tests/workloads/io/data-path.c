@@ -29,20 +29,20 @@ static FILE *evidence;
 static char result_path[1024];
 static pid_t mixed_children[MAX_FILES];
 static unsigned mixed_child_count;
-static unsigned available_cpus[2],available_count;
+static unsigned available_cpus[CPU_SETSIZE],available_count;
 struct io_interval { uint64_t start,end; };
 
 static void choose_cpus(void)
 {
     cpu_set_t mask;CPU_ZERO(&mask);
     CHECK(sched_getaffinity(0,sizeof(mask),&mask)==0);
-    for (unsigned cpu=0;cpu<CPU_SETSIZE && available_count<2;cpu++)
+    for (unsigned cpu=0;cpu<CPU_SETSIZE;cpu++)
         if (CPU_ISSET(cpu,&mask)) available_cpus[available_count++]=cpu;
     CHECK(available_count);
 }
-static unsigned pin_cpu(unsigned secondary)
+static unsigned pin_cpu(unsigned role)
 {
-    unsigned cpu=available_cpus[secondary && available_count>1];
+    unsigned cpu=available_cpus[role % available_count];
     cpu_set_t mask,actual;CPU_ZERO(&mask);CPU_SET(cpu,&mask);
     CHECK(sched_setaffinity(0,sizeof(mask),&mask)==0 && sched_getaffinity(0,sizeof(actual),&actual)==0);
     CHECK(CPU_COUNT(&actual)==1 && CPU_ISSET(cpu,&actual));
@@ -199,7 +199,7 @@ static void mixed_child(const char *directory, unsigned id, int ready, int gate,
     /* 先触及记录页，样本写入自身的首次缺页不混进读取窗口。 */
     for (size_t offset = 0; offset < count * sizeof(*samples); offset += 4096)
         ((volatile unsigned char *)samples)[offset] = 0;
-    struct mixed_report report = {.id = id, .sample_count = count, .cpu=pin_cpu(id==1)};
+    struct mixed_report report = {.id = id, .sample_count = count, .cpu=pin_cpu(id)};
     int fd = mixed_open(directory, id, appending || !id ? O_RDWR | O_APPEND : O_RDONLY);
     CHECK(size_of(fd) == (appending || !id ? 0 : file_bytes));
     if (!appending && !id) {
@@ -458,7 +458,7 @@ static void policy_record(unsigned kind,uint64_t begin,uint64_t offset,uint64_t 
 }
 static void policy_begin(unsigned id)
 {
-    memset(&policy_actor,0,sizeof(policy_actor));policy_actor.id=id;policy_actor.cpu=pin_cpu(id==1);
+    memset(&policy_actor,0,sizeof(policy_actor));policy_actor.id=id;policy_actor.cpu=pin_cpu(id);
     policy_samples=calloc(POLICY_SAMPLES,sizeof(*policy_samples));CHECK(policy_samples);
     for(size_t i=0;i<POLICY_SAMPLES*sizeof(*policy_samples);i+=4096)((volatile char *)policy_samples)[i]=0;
 }
@@ -601,7 +601,7 @@ static void policy_child(const char *directory,const char *second,const char *op
     int fd=mixed_open(domain && id?second:directory,paired?0:id,active && id?O_RDONLY:O_RDWR);
     uint64_t length=paired?4*MIB:active?(id?4*MIB:0):domain?0:MIB;CHECK(size_of(fd)==length);
     size_t page=sysconf(_SC_PAGESIZE);unsigned char *mapping=NULL;
-    if(mapped && id==1){mapping=mmap(NULL,length,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);CHECK(mapping!=MAP_FAILED);}
+    if(mapped && id%2==1){mapping=mmap(NULL,length,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);CHECK(mapping!=MAP_FAILED);}
     if(active && id==3){CHECK(!close(fd));fd=-1;}
     policy_event_send(ready,id,0);policy_go(gate);policy_usage_reset();policy_actor.start=now();
     if(periodic){
@@ -612,28 +612,30 @@ static void policy_child(const char *directory,const char *second,const char *op
             policy_go(gate);
         }
     }else if(active){
-        if(!id){
-            for(uint64_t offset=0;offset<16*MIB;offset+=4096){
-                policy_pwrite(fd,0,offset,4096,1);
-                if((offset+4096)%MIB==0){
-                    if(offset+4096==MIB){policy_event_send(ready,id,0);policy_go(gate);}
-                    policy_sync(fd,1);
+        for(unsigned round=0;round<16;round++){
+            if(!id)for(unsigned i=0;i<256;i++)
+                policy_pwrite(fd,0,(uint64_t)round*MIB+i*4096,4096,1);
+            /* 每轮先形成一个MiB脏数据，再同时释放固定的读、close和sync工作。 */
+            policy_event_send(ready,id,round);policy_go(gate);
+            if(!id)policy_sync(fd,1);
+            else if(id<3){
+                for(unsigned i=0;i<64;i++){
+                    uint64_t offset=(uint64_t)round*(MIB/4)+i*4096,begin=now();
+                    exact(fd,4096,0,&policy_actor.calls);policy_record(3,begin,offset,4096);
+                    policy_actor.bytes+=4096;policy_actor.checksum+=check(id,offset,4096,0);
                 }
-            }
-            policy_sync(fd,0);
-        }else if(id<3){
-            for(uint64_t offset=0;offset<4*MIB;offset+=4096){uint64_t begin=now();exact(fd,4096,0,&policy_actor.calls);
-                policy_record(3,begin,offset,4096);policy_actor.bytes+=4096;policy_actor.checksum+=check(id,offset,4096,0);}
-            CHECK(read(fd,buffer,1)==0);
-        }else{
-            for(unsigned i=0;i<256;i++){
+            }else for(unsigned i=0;i<16;i++){
                 uint64_t begin=now();fd=mixed_open(directory,id,O_RDONLY);policy_record(5,begin,0,0);policy_actor.calls++;
                 begin=now();CHECK(!close(fd));policy_record(4,begin,0,0);policy_actor.calls++;
-            }fd=-1;
+            }
+            policy_event_send(ready,id,round);policy_go(gate);
         }
+        if(!id)policy_sync(fd,0);
+        else if(id<3)CHECK(read(fd,buffer,1)==0);
+        else fd=-1;
     }else if(paired){
         uint64_t slots=4*MIB/page;
-        for(uint64_t i=0;i<8*MIB/1024;i++){
+        for(uint64_t i=0;i<16*MIB/files/1024;i++){
             uint64_t offset=(i%slots)*page+id*1024;unsigned epoch=1+i/slots;
             if(mapping){fill(0,offset,1024,epoch);uint64_t begin=now();memcpy(mapping+offset,buffer,1024);
                 policy_record(1,begin,offset,1024);policy_actor.bytes+=1024;policy_actor.calls++;
@@ -661,7 +663,7 @@ static int policy_parallel(const char *directory,const char *second,const char *
     CHECK(!strcmp(completion,"fsync"));
     CHECK((periodic && files==4 && file_bytes==MIB && request_bytes==4096) ||
         (active && files==4 && file_bytes==16*MIB && request_bytes==4096) ||
-        (paired && files==2 && file_bytes==4*MIB && request_bytes==1024) ||
+        (paired && (files==2 || files==4) && file_bytes==4*MIB && request_bytes==1024) ||
         (domain && second && files==2 && request_bytes==65536 && file_bytes==(!strcmp(operation,"domain-busy")?512*MIB:1024*MIB)));
     struct stat domains[2];
     if(domain){CHECK(!stat(directory,&domains[0]) && !stat(second,&domains[1]) && domains[0].st_dev!=domains[1].st_dev);}
@@ -680,8 +682,8 @@ static int policy_parallel(const char *directory,const char *second,const char *
     for(unsigned id=0;id<files;id++)CHECK(!close(gates[id][0]) && !close(reports[id][1]));
     prepare=now()-prepare;start_observation();uint64_t start=now(),data_end=0;
     struct policy_round rounds[64];memset(rounds,0,sizeof(rounds));
-    for(unsigned id=0;id<(active?1:files);id++)policy_release(gates[id][1]);
-    if(periodic){
+    for(unsigned id=0;id<files;id++)policy_release(gates[id][1]);
+    if(periodic || active){
         for(unsigned round=0;round<16;round++){
             seen=0;
             for(unsigned i=0;i<files;i++){struct policy_event e;transfer(ready[0],&e,sizeof(e),0);CHECK(e.id<files && e.round==round && !(seen&(1U<<e.id)));seen|=1U<<e.id;
@@ -691,10 +693,6 @@ static int policy_parallel(const char *directory,const char *second,const char *
             for(unsigned i=0;i<files;i++){struct policy_event e;transfer(ready[0],&e,sizeof(e),0);CHECK(e.id<files && e.round==round && !(seen&(1U<<e.id)));seen|=1U<<e.id;rounds[round*files+e.id].done=e.when;}
             for(unsigned id=0;id<files;id++)policy_release(gates[id][1]);
         }
-    }else if(active){
-        struct policy_event e;transfer(ready[0],&e,sizeof(e),0);CHECK(!e.id);
-        rounds[0]=(struct policy_round){0,0,e.when,now(),0};
-        for(unsigned id=0;id<files;id++)policy_release(gates[id][1]);
     }else{
         seen=0;for(unsigned i=0;i<files;i++){struct policy_event e;transfer(ready[0],&e,sizeof(e),0);CHECK(e.id<files && !(seen&(1U<<e.id)));seen|=1U<<e.id;if(e.when>data_end)data_end=e.when;}
         for(unsigned id=0;id<files;id++)policy_release(gates[id][1]);
@@ -726,22 +724,17 @@ static int policy_parallel(const char *directory,const char *second,const char *
     }
     if(paired){
         int fd=mixed_open(directory,0,O_RDONLY);CHECK(size_of(fd)==4*MIB);uint64_t sum=0;
-        unsigned epoch=8*MIB/1024/(4*MIB/page);
+        unsigned epoch=16*MIB/files/1024/(4*MIB/page);
         for(uint64_t offset=0;offset<4*MIB;offset+=page){exact(fd,page,0,NULL);for(size_t j=0;j<page;j++){
-            CHECK(buffer[j]==pattern(0,offset+j,j<2048?epoch:0));sum+=buffer[j];}}
-        CHECK(read(fd,buffer,1)==0 && !close(fd));actors[0].checksum=sum;distinct=4*MIB/page*2048;
+            CHECK(buffer[j]==pattern(0,offset+j,j<files*1024?epoch:0));sum+=buffer[j];}}
+        CHECK(read(fd,buffer,1)==0 && !close(fd));actors[0].checksum=sum;distinct=4*MIB/page*files*1024;
         struct statfs fs;int geometry=mixed_open(directory,0,O_RDONLY);CHECK(!fstatfs(geometry,&fs) && !close(geometry));
         fprintf(evidence,"IO POLICY_LAYOUT page_bytes=%zu block_bytes=1024 filesystem_block_bytes=%llu\n",page,(unsigned long long)fs.f_bsize);
     }
     policy_window(start,data_end,end,bytes,distinct,prepare,sync_calls);
     for(unsigned id=0;id<files;id++)policy_print(&actors[id],samples[id]);
-    if(periodic)for(unsigned i=0;i<64;i++)fprintf(evidence,"IO POLICY_ROUND id=%u round=%u ready_ns=%llu go_ns=%llu done_ns=%llu\n",
+    if(periodic || active)for(unsigned i=0;i<64;i++)fprintf(evidence,"IO POLICY_ROUND id=%u round=%u ready_ns=%llu go_ns=%llu done_ns=%llu\n",
         rounds[i].id,rounds[i].round,(unsigned long long)rounds[i].ready,(unsigned long long)rounds[i].go,(unsigned long long)rounds[i].done);
-    if(active){
-        for(unsigned i=0;i<actors[0].count;i++)if(samples[0] && samples[0][i].kind==2){rounds[0].done=samples[0][i].end;break;}
-        fprintf(evidence,"IO POLICY_ROUND id=0 round=0 ready_ns=%llu go_ns=%llu done_ns=%llu\n",
-            (unsigned long long)rounds[0].ready,(unsigned long long)rounds[0].go,(unsigned long long)rounds[0].done);
-    }
     if(domain)for(unsigned id=0;id<2;id++)fprintf(evidence,"IO POLICY_DOMAIN id=%u device=%llu active=%u\n",id,(unsigned long long)domains[id].st_dev,id==0 || !strcmp(operation,"domain-busy"));
     for(unsigned id=0;id<files;id++)free(samples[id]);
     return policy_finish();
@@ -806,8 +799,8 @@ int main(int argc, char **argv)
     CHECK(n > 0 && (size_t)n < sizeof(result_path));
     const char *directory = argc > 2 ? argv[2] : memory ? "/memory" : "/data";
     choose_cpus();
-    unsigned cpu=pin_cpu(1);
-    if (mixed || parallel) { CHECK(!parallel || (!memory && files==2 && sync_mode==1)); return mixed_read(directory,parallel); }
+    unsigned cpu=pin_cpu(0);
+    if (mixed || parallel) { CHECK(!parallel || (!memory && (files==2 || files==4) && sync_mode==1)); return mixed_read(directory,parallel); }
     if (range) { CHECK(!memory && files==1 && sync_mode==1); return range_modify(directory,cpu); }
     if (memory && argc <= 2) CHECK(mount("tmpfs", directory, "tmpfs", 0, "size=384m") == 0);
     struct result results[MAX_FILES] = {{0}};
