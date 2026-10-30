@@ -195,6 +195,7 @@ struct kernel_vfs_backend {
         uint64_t parent_inode, const char *path,
         uint32_t mode,
         struct kernel_vfs_file *file);
+    /* The backend takes mutation qualification only when it publishes atime. */
     void (*accessed)(struct kernel_vfs_file *file);
     int (*modified)(struct kernel_vfs_file *file,
         uint64_t offset, int append);
@@ -233,6 +234,15 @@ struct kernel_vfs_backend {
 /* Called under the same inode writer as the corresponding metadata update. */
 
 
+/* Writable OFDs already exclude RO transitions. Other mutation publishers
+ * borrow this qualification after deciding that an update is needed. */
+static inline void kernel_vfs_mutation_lock(struct kernel_vfs_mount *mount,
+    struct kernel_lock_guard *guard)
+{
+    struct kernel_vfs_instance *instance=mount->private_data;
+    if (!kernel_lock_held(&instance->reconfiguration,0))
+        kernel_rwlock_read(&instance->reconfiguration,guard);
+}
 int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel_vfs_timespec [2]);
 void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
     uint32_t *mode, uint32_t *uid, uint32_t *gid);

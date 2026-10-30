@@ -2134,26 +2134,44 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
 
+static int time_access_needed(const struct lwext4_node *node, struct ext4_timestamp now)
+{
+    return time_compare(node->times[1], node->times[0]) >= 0 ||
+        time_compare(node->times[2], node->times[0]) >= 0 ||
+        now.seconds - node->times[0].seconds >= 86400;
+}
+
 static void ext4_backend_accessed(struct kernel_vfs_file *file)
 {
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return;
     struct kernel_vfs_node *base = file->private_data;
-    if (base->instance->read_only || mount_error(lwext4_instance(base->instance))) return;
+    struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
+    if (base->instance->read_only || mount_error(adapter)) return;
     if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
-        (void)ext4_file_touch(lwext4_node_file(base), EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
+        KERNEL_LOCK_SCOPE(mutation);
+        if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
+        if (!base->instance->read_only)
+            (void)ext4_file_touch(lwext4_node_file(base), EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
         return;
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
     if (node->noatime) return;
     struct ext4_timestamp now;
     if (!ext4_file_read_clock(lwext4_node_file(base), &now)) return;
-    struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
+    {
+        TIMESTAMP_SCOPE(times, adapter);
+        if (!time_access_needed(node, now)) return;
+    }
+    /* Suppressed relatime reads do not mutate the mount. Recheck after taking
+     * remount qualification: another reader may already have published atime. */
+    KERNEL_LOCK_SCOPE(mutation);
+    if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
+    if (base->instance->read_only || mount_error(adapter) ||
+        !ext4_file_read_clock(lwext4_node_file(base), &now)) return;
     int notify = 0;
     {
         TIMESTAMP_SCOPE(times, adapter);
-        if (time_compare(node->times[1], node->times[0]) >= 0 ||
-            time_compare(node->times[2], node->times[0]) >= 0 ||
-            now.seconds - node->times[0].seconds >= 86400)
+        if (time_access_needed(node, now))
             notify = time_dirty_locked(node, EXT4_TIME_ATIME, now);
     }
     time_notify(adapter, notify);

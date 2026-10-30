@@ -1032,18 +1032,31 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *stat
 }
 static int time_not_after(struct kernel_vfs_timespec a, struct kernel_vfs_timespec b)
 { return a.seconds < b.seconds || (a.seconds == b.seconds && a.nanoseconds <= b.nanoseconds); }
+static int access_time_needed(const struct fat_inode *i, struct kernel_vfs_timespec time)
+{
+    return time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
+        (time.seconds >= i->atime.seconds && (uint64_t)time.seconds - i->atime.seconds >= 86400);
+}
 static void accessed(struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = file->private_data;
     if (node->instance->read_only) return;
     struct fat_mount *m = fm(node->instance);
-    KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     struct fat_inode *i = fi(node); struct kernel_vfs_timespec time = now();
-    if (time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
-        (time.seconds >= i->atime.seconds && (uint64_t)time.seconds - i->atime.seconds >= 86400)) {
+    {
+        KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
+        if (!access_time_needed(i,time)) return;
+    }
+    KERNEL_LOCK_SCOPE(mutation);
+    if (!file->write_lease) kernel_vfs_mutation_lock(file->mount,&mutation);
+    if (node->instance->read_only) return;
+    time=now();
+    KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
+    if (access_time_needed(i,time)) {
         i->atime = time; i->times_dirty = 1;
     }
 }
+
 static int modified(struct kernel_vfs_file *file, uint64_t offset, int append)
 {
     (void)offset; (void)append;
