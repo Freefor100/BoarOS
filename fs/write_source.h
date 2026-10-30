@@ -26,26 +26,6 @@ static inline size_t kernel_vfs_write_source_span(
     return kernel_uaccess_iov_span(&source->user, limit, &address);
 }
 
-/* 同一真实用户页内可含不连续iovec；先确定该pin能覆盖的逻辑前缀，
- * 目标页只准备一次，复制仍逐片段进行以保留共享映射别名的次序。 */
-static inline size_t kernel_vfs_write_source_page_span(
-    struct kernel_vfs_write_source *source,size_t limit,size_t *first)
-{
-    if (!source->mm) { *first=limit;return limit; }
-    uint64_t address;
-    *first=kernel_uaccess_iov_span(&source->user,limit,&address);
-    if (!*first || *first==limit) return *first;
-    uint64_t page=address&~BOAROS_PAGE_MASK;
-    struct kernel_uaccess_iov_cursor cursor=source->user;
-    size_t count=*first;cursor.offset+=*first;
-    while (count<limit) {
-        size_t part=kernel_uaccess_iov_span(&cursor,limit-count,&address);
-        if (!part || (address&~BOAROS_PAGE_MASK)!=page) break;
-        count+=part;cursor.offset+=part;
-    }
-    return count;
-}
-
 static inline void kernel_vfs_write_source_use_pin(
     struct kernel_vfs_write_source *source, const struct kernel_mm_user_pin *pin)
 {
@@ -87,6 +67,77 @@ static inline void kernel_vfs_write_source_advance(
 {
     if (source->mm) { source->user.offset += size; source->data = 0; source->chunks++; }
     else source->data += size;
+}
+
+/* 连续来源填一个目标页至多涉及两个用户页。散布来源也只保留这份
+ * 有界前缀；pin固定在原地址，跨目标页或等待前归还，不保存载荷副本。 */
+struct kernel_vfs_write_view {
+    struct kernel_mm_user_pin pins[2];
+    uint64_t pages[2];
+    size_t size,first;
+    unsigned count;
+};
+
+static inline int kernel_vfs_write_source_prepare(struct kernel_vfs_write_source *source,
+    size_t limit,struct kernel_vfs_write_view *view)
+{
+    if (view->count) __builtin_trap();
+    view->size=0;view->first=kernel_vfs_write_source_span(source,limit);
+    if (!view->first) { source->access=KERNEL_UACCESS_STATUS_STATE;return 0; }
+    if (!source->mm) { view->size=limit;return 1; }
+    if (!kernel_vfs_write_source_pin(source,&view->pins[0])) return 0;
+    uint64_t address=source->user.iov[source->user.index].base+source->user.offset;
+    view->pages[0]=address&~BOAROS_PAGE_MASK;view->count=1;view->size=view->first;
+    if (view->size==limit) return 1;
+    struct kernel_uaccess_iov_cursor cursor=source->user;
+    cursor.offset+=view->first;
+    while (view->size<limit) {
+        size_t part=kernel_uaccess_iov_span(&cursor,limit-view->size,&address);
+        if (!part) __builtin_trap();
+        uint64_t page=address&~BOAROS_PAGE_MASK;
+        unsigned index=0;
+        while (index<view->count && view->pages[index]!=page) index++;
+        if (index==view->count) {
+            if (index==2) break;
+            /* MM编辑者可能正排空首pin；后续页只取得现成许可，
+             * 先提交已有前缀，下一轮无pin后再处理真正缺页。 */
+            COST_ADD(USER_RESOLUTIONS,1);COST_IO_ADD(4,1);
+            enum kernel_mm_status status=kernel_mm_pin_user_page(source->mm,address,
+                KERNEL_MM_READ,&view->pins[index]);
+            if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ||
+                status==KERNEL_MM_STATUS_CONFLICT || status==KERNEL_MM_STATUS_ADDRESS_SPACE ||
+                status==KERNEL_MM_STATUS_BUS_FAULT || status==KERNEL_MM_STATUS_NO_MEMORY) break;
+            if (status) __builtin_trap();
+            view->pages[index]=page;view->count++;
+        }
+        view->size+=part;cursor.offset+=part;
+    }
+    return 1;
+}
+
+static inline void kernel_vfs_write_source_copy_view(struct kernel_vfs_write_source *source,
+    void *destination,const struct kernel_vfs_write_view *view)
+{
+    kernel_vfs_write_source_copy(source,destination,view->first);
+    kernel_vfs_write_source_advance(source,view->first);
+    for (size_t copied=view->first;copied<view->size;) {
+        size_t part=kernel_vfs_write_source_span(source,view->size-copied);
+        if (!part) __builtin_trap();
+        uint64_t address=source->user.iov[source->user.index].base+source->user.offset;
+        unsigned index=0;
+        while (index<view->count && view->pages[index]!=(address&~BOAROS_PAGE_MASK)) index++;
+        if (index==view->count) __builtin_trap();
+        kernel_vfs_write_source_use_pin(source,&view->pins[index]);
+        kernel_vfs_write_source_copy(source,(unsigned char *)destination+copied,part);
+        kernel_vfs_write_source_advance(source,part);copied+=part;
+    }
+}
+
+static inline void kernel_vfs_write_source_finish(struct kernel_vfs_write_source *source,
+    struct kernel_vfs_write_view *view)
+{
+    while (view->count) kernel_mm_unpin_user_page(&view->pins[--view->count]);
+    if (source->mm) source->data=NULL;
 }
 
 int kernel_page_cache_write_source(struct kernel_page_cache *, struct kernel_vfs_file *,

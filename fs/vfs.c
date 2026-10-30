@@ -1741,12 +1741,11 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
 {
     struct physical_page_allocator *allocator=node->instance->heap->page_allocator;
     *written=0;
+    struct kernel_vfs_write_view view={0};
     while (*written<size) {
         size_t start=offset&BOAROS_PAGE_MASK;
         size_t count=BOAROS_PAGE_SIZE-start;
         if (count>size-*written) count=size-*written;
-        count=kernel_vfs_write_source_span(source,count);
-        if (!count) { source->access=KERNEL_UACCESS_STATUS_STATE; return 0; }
         KERNEL_LOCK_SCOPE(io);
         kernel_vfs_node_lock(node,&io,1);
         uint64_t address,index=offset>>BOAROS_PAGE_SHIFT; int created;
@@ -1756,21 +1755,20 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
         if (status==KERNEL_MEMORY_OBJECT_NO_MEMORY) return -KERNEL_ENOMEM;
         if (status) __builtin_trap();
         kernel_lock_release(&io);
-        struct kernel_mm_user_pin pin={0};
-        if (!kernel_vfs_write_source_pin(source,&pin)) {
+        if (!kernel_vfs_write_source_prepare(source,count,&view)) {
             kernel_memory_object_finish_page(node->memory,index,address,0);
             return 0;
         }
+        count=view.size;
         kernel_vfs_node_lock(node,&io,1);
         void *page;
         if (physical_page_resolve(allocator,address,&page)) __builtin_trap();
-        kernel_vfs_write_source_copy(source,(unsigned char *)page+start,count);
+        kernel_vfs_write_source_copy_view(source,(unsigned char *)page+start,&view);
         node->instance->ops->memory_written(node,offset+count);
         kernel_lock_release(&io);
-        if (pin.registration) kernel_mm_unpin_user_page(&pin);
+        kernel_vfs_write_source_finish(source,&view);
         kernel_memory_object_finish_page(node->memory,index,address,1);
         if (physical_page_release(allocator,address)) __builtin_trap();
-        kernel_vfs_write_source_advance(source,count);
         offset+=count; *written+=count;
     }
     return 0;
