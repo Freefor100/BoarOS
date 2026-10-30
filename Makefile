@@ -2377,9 +2377,12 @@ $(BUILD_DIR)/sync-%.d: ;
 test-file-io-concurrency-host:
 	sh tests/file-io-concurrency-host.sh
 
-.PHONY: test-write-target-host
+.PHONY: test-write-target-host test-readahead-host
 test-write-target-host:
 	sh tests/write-target-host.sh
+
+test-readahead-host:
+	sh tests/readahead-host.sh
 
 .PHONY: test-ext4-node-resource-host
 test-ext4-node-resource-host:

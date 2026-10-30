@@ -80,6 +80,7 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     const unsigned initial=BOAROS_PAGE_CACHE_READAHEAD_PAGES<16384U/BOAROS_PAGE_SIZE?
         BOAROS_PAGE_CACHE_READAHEAD_PAGES:16384U/BOAROS_PAGE_SIZE;
     uint64_t cancel=0,cookie=0,end=offset+count,previous_end=0;
+    uint64_t next_unread=(end>>BOAROS_PAGE_SHIFT)+!!(end&BOAROS_PAGE_MASK);
     unsigned pages=initial;int queue;
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
@@ -90,7 +91,9 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         __atomic_store_n(&file->read_end,end,__ATOMIC_RELAXED);
         __atomic_store_n(&file->read_sequential,1,__ATOMIC_RELAXED);
         previous_end=file->readahead_end;cookie=file->readahead_cookie;
-        queue=sequential && !(end&BOAROS_PAGE_MASK) && (end>>BOAROS_PAGE_SHIFT)>=previous_end;
+        /* 需求读已装入未对齐末端所在页；从下一整页预读，首个窗口仍须有实际跨页进展。 */
+        queue=sequential && next_unread>=previous_end &&
+            (previous_end || (end>>BOAROS_PAGE_SHIFT)>(offset>>BOAROS_PAGE_SHIFT));
         pages=file->readahead_pages?file->readahead_pages:initial;
         if (queue && previous_end && pages<BOAROS_PAGE_CACHE_READAHEAD_PAGES) {
             pages*=2;if (pages>BOAROS_PAGE_CACHE_READAHEAD_PAGES) pages=BOAROS_PAGE_CACHE_READAHEAD_PAGES;
@@ -100,7 +103,7 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     if (cancel) kernel_page_cache_cancel_readahead(cache,cancel);
     if (queue) {
         struct kernel_page_cache_prediction published=kernel_page_cache_readahead(cache,
-            kernel_vfs_file_node(&file->file),end>>BOAROS_PAGE_SHIFT,pages,cookie);
+            kernel_vfs_file_node(&file->file),next_unread,pages,cookie);
         int keep;
         {
             KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
