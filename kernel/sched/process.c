@@ -603,6 +603,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
             /* 身份转移即释放旧容器的线程配额，存储回收可继续延后。 */
             kernel_nproc_release_locked(leader);
             task->proc_start_ticks = leader->proc_start_ticks;
+            task->exit_signal = 17U;
             task->parent = leader->parent;
             task->previous_sibling = leader->previous_sibling;
             task->next_sibling = leader->next_sibling;
@@ -662,6 +663,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
     }
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        task->exit_signal = 17U;
         task->group_execing = 0;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -756,6 +758,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t parent_tid,
     uint64_t tls,
     uint64_t child_tid,
+    uint64_t pidfd_address,
     int64_t *linux_result)
 {
     KERNEL_SERVICE_SCOPE(service);
@@ -773,6 +776,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     enum kernel_pid_status pid_status;
     enum kernel_signal_status signal_status;
     enum kernel_scheduler_status status;
+    struct kernel_pidfd_prepared pidfd __attribute__((cleanup(kernel_pidfd_cancel_clone))) = {0};
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -918,6 +922,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->group_leader = child;
     child->group_members = 1U;
     child->fork_no_exec = 1U;
+    child->exit_signal = (uint8_t)(flags & UINT64_C(0xff));
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -960,6 +965,16 @@ enum kernel_scheduler_status arch_process_clone_current(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
 
+    if (flags & UINT64_C(0x1000)) {
+        int error=kernel_pidfd_prepare_clone(parent,process_identity(child,KERNEL_PID_TID),thread_clone,&pidfd);
+        if (!error) {
+            size_t copied;
+            if (kernel_copy_to_user(&parent->mm,pidfd_address,&pidfd.fd,sizeof(pidfd.fd),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(pidfd.fd))
+                error=-KERNEL_EFAULT;
+        }
+        if (error) return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    }
+
     /* Linux does not roll clone back when a SETTID user store faults. */
     {
         size_t copied;
@@ -978,11 +993,16 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (vfork) kernel_wait_queue_init(&parent->vfork_done_queue);
     int rejected;
     {
+        /* A CLONE_FILES child can inspect the descriptor as soon as queued.
+         * File-table rank precedes the scheduler rank. */
+        struct kernel_raw_guard files_guard __attribute__((cleanup(kernel_raw_scope_release)))={0};
+        if(pidfd.files) kernel_raw_lock_acquire(kernel_pidfd_clone_files_lock(&pidfd),&files_guard);
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         struct kernel_task *leader = parent->group_leader;
         rejected = parent->retirement || parent->terminate_requested ||
                    leader->group_exiting || leader->group_execing;
         if (!rejected) {
+            if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
             if (thread_clone) {
                 child->group_leader = leader;
                 child->group_members = 0;
@@ -1309,7 +1329,8 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
                     break;
                 }
                 if (!((options & LINUX___WNOTHREAD) && child->child_creator != process_identity(parent, KERNEL_PID_TID)) &&
-                    !((options & LINUX___WCLONE) && !(options & LINUX___WALL)) && wait_child_matches(child, which, target)) {
+                    ((options & LINUX___WALL) || ((child->exit_signal != 17U) == !!(options & LINUX___WCLONE))) &&
+                    wait_child_matches(child, which, target)) {
                     if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
                         if (options & LINUX_WEXITED) {
                             *matching = 1;
@@ -1807,7 +1828,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         /* Reparenting may append orphan zombies behind this tail. */
         if (thread->parent != 0) {
             kernel_signal_notify_child_exit(thread);
-            if (kernel_signal_child_autoreap(thread->parent)) {
+            if (thread->exit_signal == 17U && kernel_signal_child_autoreap(thread->parent)) {
                 child_remove(thread->parent, thread);
             }
         }
@@ -2176,6 +2197,7 @@ static enum kernel_scheduler_status reparent_children(struct kernel_task *parent
             child_remove_locked(parent, child);
             child_creator_change_locked(child, replacement);
             if (new_parent) child_append_locked(new_parent, child);
+            child->exit_signal = 17U;
             zombie = child->state == KERNEL_THREAD_STATE_ZOMBIE;
             if (zombie && !new_parent) {
                 child->state = KERNEL_THREAD_STATE_EXITED;

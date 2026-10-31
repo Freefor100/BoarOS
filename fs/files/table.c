@@ -430,7 +430,7 @@ enum kernel_files_status kernel_files_find_free_fd(
     return status;
 }
 
-static enum kernel_files_status install_owned_locked(
+enum kernel_files_status kernel_files_install_owned_locked(
     struct kernel_files *files,
     uint32_t fd,
     uint32_t fd_flags,
@@ -486,7 +486,7 @@ enum kernel_files_status kernel_files_install_new_owned_at(
 {
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     KERNEL_FILES_SCOPE(guard, files);
-    return install_owned_locked(files, fd, fd_flags, owner);
+    return kernel_files_install_owned_locked(files, fd, fd_flags, owner);
 }
 
 enum kernel_files_status kernel_files_install_shared_acquired_at(
@@ -497,7 +497,7 @@ enum kernel_files_status kernel_files_install_shared_acquired_at(
 {
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     KERNEL_FILES_SCOPE(guard, files);
-    return install_owned_locked(files, fd, fd_flags, owner);
+    return kernel_files_install_owned_locked(files, fd, fd_flags, owner);
 }
 
 enum kernel_files_status kernel_files_install_pair_reserved(
@@ -513,8 +513,8 @@ enum kernel_files_status kernel_files_install_pair_reserved(
     if (first->fd>=files->record->statistics.capacity || second->fd>=files->record->statistics.capacity ||
         files->record->slots[first->fd].flags!=KERNEL_FILES_FD_RESERVED ||
         files->record->slots[second->fd].flags!=KERNEL_FILES_FD_RESERVED) __builtin_trap();
-    if (install_owned_locked(files,first->fd,flags,a) ||
-        install_owned_locked(files,second->fd,flags,b)) __builtin_trap();
+    if (kernel_files_install_owned_locked(files,first->fd,flags,a) ||
+        kernel_files_install_owned_locked(files,second->fd,flags,b)) __builtin_trap();
     first->files=second->files=0;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -776,7 +776,7 @@ static enum kernel_files_status dup_from(struct kernel_files *files,
             uint32_t fd=find_empty_locked(files, minimum);
             if (fd < files->record->statistics.capacity && fd < files->nofile_limit) {
                 if (kernel_open_file_acquire(source)) __builtin_trap();
-                enum kernel_files_status status=install_owned_locked(files, fd, flags, &source);
+                enum kernel_files_status status=kernel_files_install_owned_locked(files, fd, flags, &source);
                 if (status) __builtin_trap();
                 *result=fd; return KERNEL_FILES_STATUS_OK;
             }
@@ -977,7 +977,7 @@ enum kernel_files_status kernel_files_dup3(
         }
         if (kernel_open_file_acquire(source)) __builtin_trap();
         replaced=detach_fd_locked(files, (uint32_t)newfd);
-        if (install_owned_locked(files, (uint32_t)newfd,
+        if (kernel_files_install_owned_locked(files, (uint32_t)newfd,
             flags & LINUX_O_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, &source)) __builtin_trap();
     }
     if (replaced && release_detached(files, replaced, 0, kernel_task_current())) return KERNEL_FILES_STATUS_STATE;

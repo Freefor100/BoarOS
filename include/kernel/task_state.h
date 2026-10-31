@@ -263,6 +263,7 @@ struct kernel_task {
      * FD槽由各表raw保护，FS发布由VFS状态保护，其余身份由调度域保护。 */
     struct kernel_raw_lock files_access;
     struct kernel_mqueue_request *mqueue_request;
+    uint8_t exit_signal;
 } __attribute__((aligned(16)));
 
 #endif

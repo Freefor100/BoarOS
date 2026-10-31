@@ -97,29 +97,19 @@ static int install(struct kernel_files *files,struct kernel_open_file_descriptio
     reservation.files=0;
     return (int)fd;
 }
-int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t flags)
+static int pidfd_prepare(struct kernel_task *caller, struct kernel_pid *id,
+                         uint32_t flags, struct kernel_pidfd_prepared *prepared)
 {
-    if(flags & ~(PIDFD_THREAD|PIDFD_NONBLOCK))return -KERNEL_EINVAL;
-    if(number<=0)return -KERNEL_EINVAL;
-    struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=0;
-    {
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        id=kernel_pid_find(&scheduler.identities,number);
-        if(!id || !id->members[KERNEL_PID_TID]) { id=0;return -KERNEL_ESRCH; }
-        kernel_pid_get(id);
-        if(!(flags&PIDFD_THREAD) && !id->members[KERNEL_PID_TGID])return -KERNEL_ENOENT;
-    }
     struct kernel_files *files;
-    if(kernel_task_files_borrow(caller,&files)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
-    uint32_t slot;int fd_error=0;
+    if (kernel_task_files_borrow(caller,&files)!=KERNEL_TASK_STATUS_OK) __builtin_trap();
+    uint32_t slot; int fd_error=0;
     enum kernel_files_status reserved=kernel_files_find_free_fd(files,&slot,&fd_error);
-    if(reserved) {
+    if (reserved) {
         if(reserved!=KERNEL_FILES_STATUS_NO_MEMORY)__builtin_trap();
         return -KERNEL_ENOMEM;
     }
     if(fd_error)return fd_error;
-    KERNEL_FILES_RESERVATION_SCOPE(reservation);
-    reservation=(struct kernel_files_fd_reservation){files,slot};
+    prepared->files=files;prepared->fd=slot;
     struct pidfd_file *file=0; struct pidfd_observer *candidate=0;
     struct kernel_heap *heap=files->heap;
     enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(heap,1,sizeof(*file),(void **)&file);
@@ -127,7 +117,6 @@ int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t fla
         if(allocated!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
         return -KERNEL_ENOMEM;
     }
-    /* Prepare before publication; no observer allocation occurs at exit. */
     allocated=kernel_heap_allocate_zeroed(heap,1,sizeof(*candidate),(void **)&candidate);
     if(allocated) {
         if(allocated!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
@@ -154,10 +143,52 @@ int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t fla
     file->file.open_flags=2U|flags;
     file->file.credentials=kernel_credentials_get(kernel_credentials_current());
     kernel_mutex_init(&file->file.offset_lock,10,(uintptr_t)file);
-    struct kernel_open_file_description *owner=&file->file;
-    if(kernel_files_install_new_owned_at(files,slot,KERNEL_FILES_FD_CLOEXEC,&owner))
+    prepared->file=&file->file;
+    return 0;
+}
+int kernel_pidfd_prepare_clone(struct kernel_task *caller, struct kernel_pid *id,
+                               int thread, struct kernel_pidfd_prepared *prepared)
+{ return pidfd_prepare(caller,id,thread?PIDFD_THREAD:0U,prepared); }
+void kernel_pidfd_cancel_clone(struct kernel_pidfd_prepared *prepared)
+{
+    if(prepared->file && kernel_open_file_release(&prepared->file)!=KERNEL_OPEN_FILE_STATUS_OK)
         __builtin_trap();
-    reservation.files=0;
+    if(prepared->files) {
+        struct kernel_files_fd_reservation reservation={prepared->files,prepared->fd};
+        kernel_files_cancel_reservation(&reservation);prepared->files=0;
+    }
+}
+void kernel_pidfd_install_clone(struct kernel_pidfd_prepared *prepared)
+{
+    if(kernel_files_install_new_owned_at(prepared->files,prepared->fd,KERNEL_FILES_FD_CLOEXEC,&prepared->file))
+        __builtin_trap();
+    prepared->files=0;
+}
+struct kernel_raw_lock *kernel_pidfd_clone_files_lock(struct kernel_pidfd_prepared *prepared)
+{ return &prepared->files->record->metadata_lock; }
+void kernel_pidfd_install_clone_locked(struct kernel_pidfd_prepared *prepared)
+{
+    if(kernel_files_install_owned_locked(prepared->files,prepared->fd,KERNEL_FILES_FD_CLOEXEC,&prepared->file))
+        __builtin_trap();
+    prepared->files=0;
+}
+int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t flags)
+{
+    if(flags & ~(PIDFD_THREAD|PIDFD_NONBLOCK))return -KERNEL_EINVAL;
+    if(number<=0)return -KERNEL_EINVAL;
+    struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=0;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        id=kernel_pid_find(&scheduler.identities,number);
+        if(!id || !id->members[KERNEL_PID_TID]) { id=0;return -KERNEL_ESRCH; }
+        kernel_pid_get(id);
+        if(!(flags&PIDFD_THREAD) && !id->members[KERNEL_PID_TGID])return -KERNEL_ENOENT;
+    }
+    struct kernel_pidfd_prepared prepared __attribute__((cleanup(kernel_pidfd_cancel_clone)))={0};
+    int error=pidfd_prepare(caller,id,flags,&prepared);
+    if(error)return error;
+    uint32_t slot=prepared.fd;
+    kernel_pidfd_install_clone(&prepared);
     return slot;
 }
 void kernel_pidfd_close(struct kernel_open_file_description *file)

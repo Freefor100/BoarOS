@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -18,11 +20,15 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"CLONE-RES FAIL line=%d errno=%d\n",__LINE__,errno); exit(1); } } while (0)
 /* musl's public clone wrapper rejects CLONE_THREAD; use the native ABI. */
 extern int test_thread_clone(int (*)(void *), void *, unsigned long, void *);
+extern long test_clone3_stack(void *,size_t);
 #if defined(__riscv)
 __asm__(".text\n.global test_thread_clone\ntest_thread_clone:\n"
         "addi a1,a1,-16\nsd a0,0(a1)\nsd a3,8(a1)\nmv a0,a2\n"
         "li a2,0\nli a3,0\nli a4,0\nli a7,220\necall\n"
         "bnez a0,1f\nld t0,0(sp)\nld a0,8(sp)\njalr t0\nli a7,93\necall\n1: ret\n");
+__asm__(".text\n.global test_clone3_stack\ntest_clone3_stack:\n"
+        "li a7,435\necall\nbnez a0,1f\nld t0,0(sp)\nld a0,8(sp)\n"
+        "jalr t0\nli a7,93\necall\n1: ret\n");
 #elif defined(__loongarch__)
 __asm__(".text\n.global test_thread_clone\ntest_thread_clone:\n"
         "addi.d $a1,$a1,-16\nst.d $a0,$a1,0\nst.d $a3,$a1,8\n"
@@ -30,6 +36,9 @@ __asm__(".text\n.global test_thread_clone\ntest_thread_clone:\n"
         "or $a4,$zero,$zero\nori $a7,$zero,220\nsyscall 0\n"
         "bnez $a0,1f\nld.d $t8,$sp,0\nld.d $a0,$sp,8\n"
         "jirl $ra,$t8,0\nori $a7,$zero,93\nsyscall 0\n1: jirl $zero,$ra,0\n");
+__asm__(".text\n.global test_clone3_stack\ntest_clone3_stack:\n"
+        "ori $a7,$zero,435\nsyscall 0\nbnez $a0,1f\nld.d $t8,$sp,0\n"
+        "ld.d $a0,$sp,8\njirl $ra,$t8,0\nori $a7,$zero,93\nsyscall 0\n1: jirl $zero,$ra,0\n");
 #else
 #error Unsupported clone ABI
 #endif
@@ -223,8 +232,152 @@ static void process_cases(void)
     owner_exec_case();
     thread_exec_case();
 }
+struct test_clone_args {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal;
+    uint64_t stack, stack_size, tls, set_tid, set_tid_size, cgroup;
+};
+static volatile int shared_pidfd_result;
+static int clone_tls_child(void *opaque)
+{
+    uintptr_t tls;
+#if defined(__riscv)
+    __asm__ volatile("mv %0,tp" : "=r"(tls));
+#else
+    __asm__ volatile("or %0,$tp,$zero" : "=r"(tls));
+#endif
+    return tls==(uintptr_t)opaque ? 48 : 97;
+}
+static int child_tid_child(void *opaque)
+{
+    return *(volatile int *)opaque==(int)syscall(SYS_gettid) ? 49 : 98;
+}
+static int shared_pidfd_child(void *opaque)
+{
+    int fd=*(volatile int *)opaque;
+    int result=fd>=0 && (fcntl(fd,F_GETFD)&FD_CLOEXEC) ? 45 : 96;
+    shared_pidfd_result=result;
+    return result;
+}
+static void clone3_case(void)
+{
+    struct test_clone_args args={.exit_signal=SIGCHLD};
+    errno=0; CHECK(syscall(435,&args,63)==-1 && errno==EINVAL);
+    errno=0; CHECK(syscall(435,(void *)1,sizeof(args))==-1 && errno==EFAULT);
+    args.stack_size=1;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args.stack_size=0;
+    struct { struct test_clone_args args; uint64_t extra; } extended={.args=args,.extra=1};
+    errno=0;CHECK(syscall(435,&extended,sizeof(extended))==-1 && errno==E2BIG);
+    size_t page=(size_t)sysconf(_SC_PAGESIZE);
+    char *mapping=mmap(0,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(mapping!=MAP_FAILED);mapping[page]=1;CHECK(!mprotect(mapping,page,PROT_NONE));
+    errno=0;CHECK(syscall(435,mapping+page-sizeof(args),sizeof(args)+1)==-1 && errno==E2BIG);
+    CHECK(!munmap(mapping,page*2));
+    args.flags=0x1000|0x100000;args.pidfd=args.parent_tid=(uintptr_t)&extended;
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args.flags=args.pidfd=args.parent_tid=0;
+    args.flags=0x400000;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args.flags=0x8000;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args.flags=0;
+    args.set_tid_size=1;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args.set_tid=1;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EFAULT);
+    args.set_tid=args.set_tid_size=0;args.flags=UINT64_C(0x200000000);args.cgroup=UINT64_MAX;
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args.flags=0;
+    pid_t child=(pid_t)syscall(435,&args,sizeof(args));
+    CHECK(child>=0);
+    if(!child) _exit(37);
+    int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==37);
+    args.cgroup=0;
+    args.exit_signal=0;
+    child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);
+    if(!child)_exit(38);
+    errno=0;CHECK(waitpid(child,&status,WNOHANG)==-1 && errno==ECHILD);
+    CHECK(waitpid(child,&status,(int)0x80000000U)==child && WIFEXITED(status) && WEXITSTATUS(status)==38);
+    int ready[2];CHECK(!pipe(ready));
+    child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);
+    if(!child) {
+        char fd[24];snprintf(fd,sizeof(fd),"%d",ready[1]);
+        char *argv[]={"clone-resources","--exec-signal",fd,0};execv("/proc/self/exe",argv);_exit(97);
+    }
+    CHECK(read_one(ready[0])=='X');
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==47);
+    CHECK(!close(ready[0])&&!close(ready[1]));
+    sigset_t set,old;sigemptyset(&set);sigaddset(&set,SIGUSR1);
+    CHECK(!sigprocmask(SIG_BLOCK,&set,&old));args.exit_signal=SIGUSR1;
+    child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);
+    if(!child)_exit(39);
+    siginfo_t info;CHECK(sigwaitinfo(&set,&info)==SIGUSR1 && info.si_pid==child &&
+        info.si_code==CLD_EXITED && info.si_status==39);
+    CHECK(waitpid(child,&status,(int)0x80000000U)==child && WIFEXITED(status) && WEXITSTATUS(status)==39);
+    CHECK(!sigprocmask(SIG_SETMASK,&old,0));
+}
+static void clone_pidfd_case(void)
+{
+    struct test_clone_args args={.flags=0x1000,.exit_signal=SIGCHLD,.pidfd=1};
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EFAULT);
+    errno=0;CHECK(waitpid(-1,0,WNOHANG)==-1 && errno==ECHILD);
+    pid_t probe=fork();CHECK(probe>=0);
+    if(!probe) {
+        struct rlimit limit={.rlim_cur=0,.rlim_max=0};
+        if(setrlimit(RLIMIT_NOFILE,&limit))_exit(90);
+        int value=-1;struct test_clone_args a={.flags=0x1000,.exit_signal=SIGCHLD,.pidfd=(uintptr_t)&value};
+        errno=0;_exit(syscall(435,&a,sizeof(a))==-1 && errno==EMFILE ? 0 : 91);
+    }
+    int probe_status;CHECK(waitpid(probe,&probe_status,0)==probe && WIFEXITED(probe_status) && !WEXITSTATUS(probe_status));
+    int fd=-1;args.pidfd=(uintptr_t)&fd;
+    pid_t child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);
+    if(!child)_exit(43);
+    CHECK(fd>=0 && (fcntl(fd,F_GETFD)&FD_CLOEXEC));
+    struct pollfd p={.fd=fd,.events=POLLIN};CHECK(poll(&p,1,5000)==1 && (p.revents&POLLIN));
+    siginfo_t info={0};CHECK(!waitid((idtype_t)3,(id_t)fd,&info,WEXITED));
+    CHECK(info.si_pid==child && info.si_status==43 && !close(fd));
+    fd=-1;child=(pid_t)syscall(SYS_clone,0x1000|SIGCHLD,0,&fd,0,0);
+    CHECK(child>=0);if(!child)_exit(44);
+    int status;CHECK(fd>=0 && waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==44);
+    CHECK(!close(fd));
+    errno=0;CHECK(syscall(SYS_clone,0x1000|0x100000|SIGCHLD,0,&fd,0,0)==-1 && errno==EINVAL);
+    errno=0;CHECK(syscall(SYS_clone,0x1000|0x400000|SIGCHLD,0,&fd,0,0)==-1 && errno==EINVAL);
+    int tid_out=-1;fd=-1;
+    args=(struct test_clone_args){.flags=0x1000|0x100000,.pidfd=(uintptr_t)&fd,
+        .parent_tid=(uintptr_t)&tid_out,.exit_signal=SIGCHLD};
+    child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);if(!child)_exit(46);
+    CHECK(tid_out==child && fd>=0 && waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==46);
+    CHECK(!close(fd));
+    char *stack=malloc(131072);CHECK(stack);
+    for(int i=0;i<32;i++) {
+        fd=-1;
+        uintptr_t *top=(uintptr_t *)(stack+131072-16);
+        top[0]=(uintptr_t)shared_pidfd_child;top[1]=(uintptr_t)&fd;
+        args=(struct test_clone_args){.flags=0x1000|CLONE_VM|CLONE_FILES,.pidfd=(uintptr_t)&fd,
+            .exit_signal=SIGCHLD,.stack=(uintptr_t)stack,.stack_size=131072-16};
+        child=(pid_t)test_clone3_stack(&args,sizeof(args));CHECK(child>0);
+        CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==45);
+        CHECK(!close(fd));
+    }
+    fd=-1;shared_pidfd_result=0;
+    uintptr_t *top=(uintptr_t *)(stack+131072-16);
+    top[0]=(uintptr_t)shared_pidfd_child;top[1]=(uintptr_t)&fd;
+    args=(struct test_clone_args){.flags=0x1000|CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD,
+        .pidfd=(uintptr_t)&fd,.stack=(uintptr_t)stack,.stack_size=131072-16};
+    pid_t tid=(pid_t)test_clone3_stack(&args,sizeof(args));CHECK(tid>0);
+    p=(struct pollfd){.fd=fd,.events=POLLIN};CHECK(poll(&p,1,5000)==1 && (p.revents&POLLIN));
+    CHECK(shared_pidfd_result==45);wait_tid(tid);CHECK(!close(fd));
+    top[0]=(uintptr_t)clone_tls_child;top[1]=(uintptr_t)stack;
+    args=(struct test_clone_args){.flags=0x80000,.exit_signal=SIGCHLD,
+        .stack=(uintptr_t)stack,.stack_size=131072-16,.tls=(uintptr_t)stack};
+    child=(pid_t)test_clone3_stack(&args,sizeof(args));CHECK(child>0);
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==48);
+    int child_tid=-1;top[0]=(uintptr_t)child_tid_child;top[1]=(uintptr_t)&child_tid;
+    args=(struct test_clone_args){.flags=CLONE_VM|0x1000000|0x200000,.exit_signal=SIGCHLD,
+        .stack=(uintptr_t)stack,.stack_size=131072-16,.child_tid=(uintptr_t)&child_tid};
+    child=(pid_t)test_clone3_stack(&args,sizeof(args));CHECK(child>0);
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==49 && child_tid==0);
+    free(stack);
+}
 int main(int argc,char **argv)
 {
+    if(argc==3 && !strcmp(argv[1],"--exec-signal"))
+        return write(atoi(argv[2]),"X",1)==1?47:1;
     if(argc==6 && !strcmp(argv[1],"--thread-exec")) {
         int report=atoi(argv[2]),clo=atoi(argv[3]),normal=atoi(argv[4]),removed=atoi(argv[5]);
         char cwd[512];errno=0;int a=fcntl(clo,F_GETFD),aerr=errno;
@@ -259,6 +412,8 @@ int main(int argc,char **argv)
     CHECK(!sched_setaffinity(0,sizeof(original),&original));
     puts("CLONE-RES CASE thread-files-fs PASS");
     process_cases();puts("CLONE-RES CASE process-vm-files-exec PASS");
+    clone3_case();puts("CLONE-RES CASE clone3 PASS");
+    clone_pidfd_case();puts("CLONE-RES CASE pidfd PASS");
     CHECK(!unlink("/clone-resource-file")&&!rmdir("/clone-resource-dir"));
-    puts("CLONE-RES END 2");return 0;
+    puts("CLONE-RES END 4");return 0;
 }

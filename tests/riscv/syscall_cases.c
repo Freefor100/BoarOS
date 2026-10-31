@@ -632,13 +632,13 @@ static unsigned long run_process_decode_cases(void)
     request.arguments[0] = 0x111U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
     request.arguments[0] = 18U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
     request.arguments[0] = UINT64_C(1) << 40U;

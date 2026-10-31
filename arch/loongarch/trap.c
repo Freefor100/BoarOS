@@ -133,7 +133,9 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         case KERNEL_SYSCALL_ACTION_CLONE:
             /* LA syscall ABI 的 child_tid/TLS 顺序与通用 clone 接口相反。 */
             if (arch_process_clone_current(frame,request.arguments[0],request.arguments[1],
-                request.arguments[2],request.arguments[4],request.arguments[3],&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
+                request.arguments[2],request.number==435U?request.arguments[3]:request.arguments[4],
+                request.number==435U?request.arguments[4]:request.arguments[3],
+                request.number==435U?request.arguments[5]:request.arguments[2],&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
                 la_virt_fatal("clone");
             break;
         case KERNEL_SYSCALL_ACTION_WAIT4:

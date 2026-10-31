@@ -41,6 +41,8 @@ enum kernel_files_status kernel_files_install_pair_reserved(
     struct kernel_files_fd_reservation *, struct kernel_files_fd_reservation *,
     uint32_t flags, struct kernel_open_file_description **,
     struct kernel_open_file_description **);
+enum kernel_files_status kernel_files_install_owned_locked(
+    struct kernel_files *, uint32_t, uint32_t, struct kernel_open_file_description **);
 
 struct kernel_file_slot {
     struct kernel_open_file_description *description;

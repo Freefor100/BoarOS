@@ -253,7 +253,7 @@ static enum kernel_syscall_status syscall_handle_sysinfo(struct kernel_task *cal
 
 static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_task *caller,
-    const struct kernel_syscall_request *request,
+    struct kernel_syscall_request *request,
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
@@ -764,7 +764,15 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
     } else if (request->number == LINUX_SYSCALL_CLONE) {
-        syscall_decode_clone(request, &decoded);
+        if ((request->arguments[0] & UINT64_C(0x101000)) == UINT64_C(0x101000)) {
+            decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
+            decoded.value = -KERNEL_EINVAL;
+        } else {
+            syscall_decode_clone(request, &decoded);
+        }
+    } else if (request->number == 435U) {
+        if (syscall_handle_clone3(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_WAIT4) {
         decoded.action = KERNEL_SYSCALL_ACTION_WAIT4;
         decoded.value = 0;
@@ -831,7 +839,7 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
 /* Keep scalar identity queries out of the large operation frame/jump table. */
 enum kernel_syscall_status kernel_syscall_dispatch(
     struct kernel_task *caller,
-    const struct kernel_syscall_request *request,
+    struct kernel_syscall_request *request,
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;

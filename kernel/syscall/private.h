@@ -299,6 +299,8 @@ enum kernel_syscall_status syscall_handle_execve(
 
 void syscall_decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *,
+    struct kernel_syscall_request *, struct kernel_syscall_result *);
 
 enum kernel_syscall_status syscall_handle_rt_sigaction(
     struct kernel_task *caller,
