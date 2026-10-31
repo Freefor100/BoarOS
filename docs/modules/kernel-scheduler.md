@@ -257,7 +257,7 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
 `make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 
-RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；指定 PID 数组、cgroup 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
+RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；指定 PID 数组、cgroup、CLONE_CLEAR_SIGHAND 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
 
 `ioprio_set/get` 支持按线程、进程组和真实 UID 设置或查询优先级；RT 设置检查 CAP_SYS_ADMIN/CAP_SYS_NICE。首次设置时按需分配块 I/O 优先级上下文；CLONE_IO 共享已经存在的对象，父线程没有对象时子线程也从空状态开始。普通 fork 对已设置的优先级生成独立副本，exec 保留执行线程的对象，退出与创建失败归还真实引用。KCMP_IO 比较该对象，包括两个空对象相等；它与每任务持锁和用户页借用的 `kernel_io_context` 分开。固定 Linux 的 `ioprio_set(USER, 0)` 按数值 UID 0 匹配，而 `get(USER, 0)` 查询调用者的真实 UID。当前块队列仍按需求 I/O 和后台回收类别服务，尚未按用户设置的 I/O 优先级调度请求。
 
