@@ -210,7 +210,7 @@ RV64/LA64 提供 pidfd_open(434)、pidfd_send_signal(424) 和 pidfd_getfd(438)�
 
 waitid(P_PIDFD) 持有实际身份选择子进程，编号复用不改变目标。NONBLOCK pidfd 的子进程尚无所需事件时返回 EAGAIN；显式 WNOHANG 则成功返回空信息。open 和 getfd 在发起 CPU 执行；分配 FD 前读取调用者当前 NOFILE 软限制。getfd 按实际 TID 查找，检查 REALCREDS、dumpable 和 capability 子集，取得真实 OFD 后重新核对目标身份、MM、凭据、执行安全对象及文件表。任务存储借用覆盖目标查找；每任务的 files_access 短保护覆盖授权快照、真实 FD pin 和安全复核，FD 锁在调度域之外取得。退出先在调度域发布 proc_exiting，再在域外等待这份短保护结束，随后才允许原 files owner 释放表存储；临时读者不持有整表清理引用。接收 FD 设置 CLOEXEC，offset、状态标志和打开权利继续共享；失败时 OFD 清理仍由调用者既有 FD cleanup 路径保留 owner。无 epoll 登记的 pidfd 最后关闭在发起 CPU 完成，有登记时沿原控制路径处理通知。
 
-发送默认采用 pidfd 的线程／线程组属性，支持单一的 THREAD、THREAD_GROUP、PROCESS_GROUP scope 标志及 SELF_THREAD/SELF_THREAD_GROUP 特殊值。可选 siginfo 沿共同导入和 pending 机制处理；目标在导入前解析并持有真实身份，不在用户缺页后按复用的 FD 或 PID 重新选目标。用户载荷来源、零信号探测及权限沿固定 Linux。pidfd 专用 namespace/info ioctl 和 CLONE_PIDFD 扩展另行接入。
+发送默认采用 pidfd 的线程／线程组属性，支持单一的 THREAD、THREAD_GROUP、PROCESS_GROUP scope 标志及 SELF_THREAD/SELF_THREAD_GROUP 特殊值。可选 siginfo 沿共同导入和 pending 机制处理；目标在导入前解析并持有真实身份，不在用户缺页后按复用的 FD 或 PID 重新选目标。用户载荷来源、零信号探测及权限沿固定 Linux。pidfd 专用 namespace/info ioctl 另行接入。
 
 sh tests/host/pidfd.sh 检查最后角色撤号、64 字节分配类、旧身份引用、通知早于登记／休眠，以及回调期间最后关闭与存储归还。真实 FD 表用例在授权与 pin 之间握手触发退出，检查表存储保留至短访问结束、NOFILE 错误顺序及失败 OFD owner；OFD 用例检查本地 poll、最后关闭及 epoll 通知路径。直接用户消费者为 tests/workloads/resource/pidfd.c，核对真实进程／线程退出、getfd、权限、信号和 proc 字段。
 wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
@@ -257,7 +257,9 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
 `make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 
-RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持 SIGCHLD 进程的 CLONE_VM、CLONE_FILES、CLONE_FS 组合，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。已有 CHILD_SETTID/CHILD_CLEARTID、线程 SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 规则继续适用。CLONE_SYSVSEM具有实际引用与最后共享者退出补偿，机制见[SysV信号量](sysv-sem.md)。非法依赖及NEWIPC与SYSVSEM冲突返回EINVAL，其他尚未支持的合法资源组合返回ENOTSUP。
+RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；指定 PID 数组、cgroup 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
+
+CLONE_PIDFD 在复制子任务文件表之后预留父进程 FD 和真实 PID 身份，输出用户地址失败时撤销预留并回收子任务。发布时先取得文件表保护，再在调度保护内安装 FD 并让子任务就绪，因此共享文件表的子任务启动时已能看到该 FD。pidfd 自带 CLOEXEC，线程 pidfd 指向实际 TID。进程可指定退出信号；0 表示不发送信号，非 SIGCHLD 子进程由 __WCLONE 或 __WALL 选择，成功 exec 后恢复 SIGCHLD。
 
 子线程继承完整 FP、整数现场和 mask；a0 为 0，PC 越过 ecall，非零 child_stack 替换 sp，SETTLS 设置 tp。CHILD_SETTID 在子任务首次返回用户态前、子 MM 激活后写入，因此可正常处理 COW 和缺页；PARENT_SETTID 仍在父任务发布 clone 时写入。SETTID 用户存储失败不回滚已经创建的任务，与固定 Linux clone 路径一致。所有内核分配失败都在发布前回滚；若回滚触及真实 VFS/block I/O owner，则由所属文件或 mount 记录，物理页和堆释放不另建重试状态；不会发布半构造子进程。
 
@@ -371,7 +373,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展及clone3继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1/2核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#双核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1/2核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#双核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

@@ -8,9 +8,9 @@ extern const unsigned char la_user_elf_start[],la_user_elf_end[];
 static int fail_after=-1, fault_armed;
 void la_fault_injection_set(int value) { fail_after=value; }
 void la_fault_injection_arm(void) { fault_armed=1; }
-enum kernel_syscall_status __real_kernel_syscall_dispatch(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status __real_kernel_syscall_dispatch(struct kernel_task *, struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status __wrap_kernel_syscall_dispatch(struct kernel_task *task,
-    const struct kernel_syscall_request *request,struct kernel_syscall_result *result)
+    struct kernel_syscall_request *request,struct kernel_syscall_result *result)
 {
     enum kernel_syscall_status status=__real_kernel_syscall_dispatch(task,request,result);
     if (fault_armed && request->number==222 && status==KERNEL_SYSCALL_STATUS_OK &&

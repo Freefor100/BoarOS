@@ -6,6 +6,7 @@
 #include <kernel/exec.h>
 #include <kernel/futex.h>
 #include <kernel/mm.h>
+#include <kernel/page.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -252,13 +253,14 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
 {
     uint64_t flags = request->arguments[0];
     const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x800) | UINT64_C(0x10000);
-    const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES |
+    const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x1000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) |
         UINT64_C(0x100000) | UINT64_C(0x200000) | UINT64_C(0x400000) |
         UINT64_C(0x1000000);
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((flags & ~LINUX_CLONE_KNOWN_FLAGS) != 0U ||
+        ((flags & UINT64_C(0x401000)) == UINT64_C(0x401000)) ||
         ((flags & UINT64_C(0x10000)) && !(flags & UINT64_C(0x800))) ||
         ((flags & UINT64_C(0x800)) && !(flags & LINUX_CLONE_VM)) ||
         ((flags & UINT64_C(0x08000000)) && (flags & UINT64_C(0x40000)))) {
@@ -271,19 +273,18 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         decoded->value = 0;
         return;
     }
-    if ((flags & LINUX_CLONE_SIGNAL_MASK) != LINUX_SIGCHLD &&
-        !(flags & UINT64_C(0x10000))) {
+    if ((flags & LINUX_CLONE_SIGNAL_MASK) > 64U) {
         decoded->value = -KERNEL_EINVAL;
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_FS | LINUX_CLONE_FILES |
-        UINT64_C(0x40000) | LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
-    if (process_flags != LINUX_SIGCHLD &&
-        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM) &&
-        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_SIGHAND) &&
-        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_CLONE_SIGHAND) &&
-        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK)) {
+    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x1000) |
+        UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
+        LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
+    if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&
+        process_flags != (LINUX_CLONE_VM | LINUX_CLONE_SIGHAND) &&
+        process_flags != (LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_CLONE_SIGHAND) &&
+        process_flags != (LINUX_CLONE_VM | LINUX_CLONE_VFORK)) {
         decoded->value = -KERNEL_ENOTSUP;
         return;
     }
@@ -291,6 +292,72 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
      * ignores the remaining arguments; musl's fork passes only two. */
     decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
     decoded->value = 0;
+}
+
+enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
+    struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct clone3_args {
+        uint64_t flags, pidfd, child_tid, parent_tid, exit_signal;
+        uint64_t stack, stack_size, tls, set_tid, set_tid_size, cgroup;
+    } args = {0};
+    const uint64_t address = request->arguments[0], size = request->arguments[1];
+    size_t copied;
+    struct kernel_mm *mm;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (size > BOAROS_PAGE_SIZE) { decoded->value = -KERNEL_E2BIG; return KERNEL_SYSCALL_STATUS_OK; }
+    if (size < 64U) { decoded->value = -KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK; }
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    size_t length = size < sizeof(args) ? (size_t)size : sizeof(args);
+    for (uint64_t offset=sizeof(args); offset<size;) {
+        unsigned char tail[64];
+        size_t count = size-offset < sizeof(tail) ? (size_t)(size-offset) : sizeof(tail);
+        if (address > UINT64_MAX-offset || kernel_copy_from_user(mm,tail,address+offset,count,&copied) != KERNEL_UACCESS_STATUS_OK || copied != count) {
+            decoded->value=-KERNEL_EFAULT; return KERNEL_SYSCALL_STATUS_OK;
+        }
+        for(size_t i=0;i<count;i++) if(tail[i]) { decoded->value=-KERNEL_E2BIG; return KERNEL_SYSCALL_STATUS_OK; }
+        offset+=count;
+    }
+    if (kernel_copy_from_user(mm, &args, address, length, &copied) != KERNEL_UACCESS_STATUS_OK || copied != length) {
+        decoded->value = -KERNEL_EFAULT; return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (args.set_tid_size > 32U || (!!args.set_tid != !!args.set_tid_size) ||
+        (args.exit_signal & ~UINT64_C(0xff)) ||
+        ((args.flags & UINT64_C(0x200000000)) && (size < sizeof(args) || args.cgroup > INT32_MAX))) {
+        decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (args.set_tid) {
+        uint32_t requested[32];
+        size_t count=(size_t)args.set_tid_size*sizeof(requested[0]);
+        if (kernel_copy_from_user(mm,requested,args.set_tid,count,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=count) {
+            decoded->value=-KERNEL_EFAULT; return KERNEL_SYSCALL_STATUS_OK;
+        }
+    }
+    if ((args.flags & UINT64_C(0xff)) || (args.flags & UINT64_C(0x400000)) ||
+        ((args.flags & UINT64_C(0x18000)) && args.exit_signal) ||
+        ((args.flags & UINT64_C(0x100000800)) == UINT64_C(0x100000800)) ||
+        ((args.stack == 0) != (args.stack_size == 0)) ||
+        (args.stack && kernel_user_range_check(args.stack,args.stack_size) != KERNEL_UACCESS_STATUS_OK)) {
+        decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if ((args.flags & UINT64_C(0x1000)) && (args.flags & UINT64_C(0x100000)) && args.pidfd==args.parent_tid) {
+        decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (args.set_tid || (args.flags & UINT64_C(0x200000000))) {
+        decoded->value=-KERNEL_EOPNOTSUPP; return KERNEL_SYSCALL_STATUS_OK;
+    }
+    struct kernel_syscall_request legacy={.arguments={args.flags|args.exit_signal}};
+    syscall_decode_clone(&legacy,decoded);
+    if (decoded->action == KERNEL_SYSCALL_ACTION_CLONE) {
+        request->arguments[0]=legacy.arguments[0];
+        request->arguments[1]=args.stack ? args.stack+args.stack_size : 0;
+        request->arguments[2]=args.parent_tid;
+        request->arguments[3]=args.tls;
+        request->arguments[4]=args.child_tid;
+        request->arguments[5]=args.pidfd;
+    }
+    return KERNEL_SYSCALL_STATUS_OK;
 }
 
 enum kernel_syscall_status syscall_handle_setpgid(struct kernel_task *caller,

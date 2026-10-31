@@ -58,5 +58,5 @@ struct riscv_fpu_state *riscv_process_fpu_borrow_current(void)
 { return arch_process_fpu_borrow_current(); }
 enum kernel_scheduler_status riscv_process_clone_current(
     const struct riscv_trap_frame *frame, uint64_t flags, uint64_t stack,
-    uint64_t parent_tid, uint64_t tls, uint64_t child_tid, int64_t *result)
-{ return arch_process_clone_current(frame, flags, stack, parent_tid, tls, child_tid, result); }
+    uint64_t parent_tid, uint64_t tls, uint64_t child_tid, uint64_t pidfd, int64_t *result)
+{ return arch_process_clone_current(frame, flags, stack, parent_tid, tls, child_tid, pidfd, result); }

@@ -298,6 +298,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                     request.arguments[2],
                     request.arguments[3],
                     request.arguments[4],
+                    request.number == 435U ? request.arguments[5] : request.arguments[2],
                     &result.value);
 
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {

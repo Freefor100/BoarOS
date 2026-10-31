@@ -911,10 +911,10 @@ static int signal_wants_sigchld_stop(const struct kernel_task *parent)
 }
 
 static void signal_send_child(struct kernel_task *parent, struct kernel_task *child,
-    int16_t code, int32_t status)
+    uint32_t signal, int16_t code, int32_t status)
 {
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(parent));
-    struct kernel_signal_wait_info info = {.signal=17,.sender=(uint32_t)child->tid,.code=code,.status=status};
+    struct kernel_signal_wait_info info = {.signal=signal,.sender=(uint32_t)child->tid,.code=code,.status=status};
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         info.uid=kernel_credentials_task_locked(child)->uid;
@@ -926,7 +926,9 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
         info.user_time/=UINT64_C(10000000);info.system_time/=UINT64_C(10000000);
     }
     if (representative)
-        (void)signal_send_one(parent, 17, child->tid, 1, code, &info, 0, 0);
+        /* The compact inline child payload belongs to SIGCHLD; other exit
+         * signals need the complete status and CPU-time record. */
+        (void)signal_send_one(parent, signal, child->tid, 1, code, &info, signal!=17U, 0);
 }
 
 void kernel_signal_notify_child_exit(struct kernel_task *child)
@@ -941,9 +943,10 @@ void kernel_signal_notify_child_exit(struct kernel_task *child)
         parent = child->parent;
         if (parent) scheduler_task_get_locked(parent);
     }
-    if (parent != 0 && kernel_signal_wants_sigchld(parent)) {
+    if (parent != 0 && child->exit_signal &&
+        (child->exit_signal != 17U || kernel_signal_wants_sigchld(parent))) {
         uint32_t status = child->wait_status;
-        signal_send_child(parent, child,
+        signal_send_child(parent, child, child->exit_signal,
             (status & 0x7fU) ? ((status & 0x80U) ? 3 : 2) : 1,
             (status & 0x7fU) ? (int32_t)(status & 0x7fU) : (int32_t)((status >> 8) & 0xffU));
     }
@@ -964,7 +967,7 @@ void kernel_signal_notify_child_stop(struct kernel_task *child,
         if (parent) scheduler_task_get_locked(parent);
     }
     if (parent != 0 && signal_wants_sigchld_stop(parent)) {
-        signal_send_child(parent, child, continued ? 6 : 5,
+        signal_send_child(parent, child, 17U, continued ? 6 : 5,
             continued ? SIGNAL_CONTINUE : (child->wait_status >> 8) & 0xffU);
     }
     wake_waiting_parent(child);
