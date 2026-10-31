@@ -56,6 +56,9 @@ struct kernel_proc_process_snapshot {
 int kernel_proc_same_group(kernel_pid_t,uint64_t,int thread);
 int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint32_t *uid,uint32_t *gid);
 
+/* Resource queries may address a thread rather than its group leader. */
+#define KERNEL_PROC_THREAD_TARGET (UINT64_C(1) << 63U)
+
 /* Identity changes on PID reuse; zero asks for the current allocation. */
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
 /* Retain the already resolved proc process inode's identity, not a later
@@ -69,6 +72,8 @@ int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
 /* A zero tgid skips membership filtering; nonzero also checks its generation. */
 int kernel_proc_thread_identity(kernel_pid_t tgid, uint64_t group_identity,
     kernel_pid_t tid, uint64_t *identity);
+/* The identity may outlive the thread's usable resource ownership. */
+int kernel_proc_thread_resources_live(kernel_pid_t tid, uint64_t identity);
 int kernel_proc_thread_group(kernel_pid_t tid, uint64_t identity,
     kernel_pid_t *tgid, uint64_t *group_identity);
 int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t group_identity,

@@ -722,7 +722,27 @@ enum kernel_vma_status kernel_vma_set_prepare_remap(struct kernel_vma_set *set,
     /* 源区间两次split及新目标插入均先预留；PTE迁移后没有分配失败点。 */
     enum kernel_vma_status status = reserve_entries(set, set->count + 3);
     if (status) return status;
-    *edit = (struct kernel_vma_remap){set, set->generation, start, end, *replacement};
+    *edit = (struct kernel_vma_remap){.set=set, .generation=set->generation,
+        .start=start, .end=end, .replacement=*replacement};
+    return KERNEL_VMA_STATUS_OK;
+}
+
+enum kernel_vma_status kernel_vma_set_prepare_duplicate(struct kernel_vma_set *set,
+    uint64_t start, uint64_t end, const struct kernel_vma *replacement,
+    int clear_source_lock, struct kernel_vma_remap *edit)
+{
+    if (!set_valid(set) || !edit || !replacement || !vma_valid(replacement) ||
+        start > end || (clear_source_lock && start == end) ||
+        set->generation > UINT64_MAX - 2) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    int overlaps;
+    if (kernel_vma_set_overlaps(set, replacement->start, replacement->end, &overlaps) || overlaps)
+        return KERNEL_VMA_STATUS_CONFLICT;
+    if (set->count > UINT32_MAX - 3) return KERNEL_VMA_STATUS_NO_MEMORY;
+    enum kernel_vma_status status = reserve_entries(set, set->count + 3);
+    if (status) return status;
+    *edit = (struct kernel_vma_remap){.set=set, .generation=set->generation,
+        .start=start, .end=end, .replacement=*replacement,
+        .retain_source=1, .clear_source_lock=clear_source_lock};
     return KERNEL_VMA_STATUS_OK;
 }
 
@@ -731,6 +751,16 @@ enum kernel_vma_status kernel_vma_set_commit_remap(struct kernel_vma_set *set,
 {
     if (!edit || edit->set != set || edit->generation != set->generation)
         return KERNEL_VMA_STATUS_STATE;
+    if (edit->retain_source) {
+        if (edit->clear_source_lock) {
+            struct kernel_vma_edit unlock;
+            if (kernel_vma_set_prepare_flags(set, edit->start, edit->end,
+                KERNEL_VMA_LOCK_MASK, 0, &unlock) || kernel_vma_set_commit_edit(set, &unlock))
+                __builtin_trap();
+        }
+        if (kernel_vma_set_insert(set, &edit->replacement)) __builtin_trap();
+        return KERNEL_VMA_STATUS_OK;
+    }
     struct kernel_vma_edit removal;
     if (kernel_vma_set_prepare_replace(set, edit->start, edit->end, 0, &removal) ||
         kernel_vma_set_commit_edit(set, &removal) ||

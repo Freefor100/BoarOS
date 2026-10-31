@@ -56,6 +56,39 @@ static void anonymous_cases(struct kernel_mm *parent)
     map(parent,a,3*p,0); write_byte(parent,a,11); write_byte(parent,a+p,22); write_byte(parent,a+2*p,33);
     map(parent,b,p,1); write_byte(parent,b,44);
     assert(kernel_mm_mremap(parent,b,0,p,0,0,&out)==-KERNEL_ENOMEM);
+    /* old_size=0 creates a second view of the same shared backing. */
+    assert(!kernel_mm_mremap(parent,b,0,p,1,0,&out) && out!=b);
+    assert(read_byte(parent,out)==44); write_byte(parent,out,45);
+    assert(read_byte(parent,b)==45); write_byte(parent,b,44);
+    assert(!kernel_mm_munmap(parent,out,p));
+    assert(!kernel_mm_mremap(parent,b,0,2*p,1,0,&out));
+    assert(read_byte(parent,out)==44);
+    assert(kernel_mm_resolve_user_fault(parent,out+p,KERNEL_MM_READ)==KERNEL_MM_STATUS_BUS_FAULT);
+    assert(!kernel_mm_munmap(parent,out,2*p));
+    map(parent,b-p,p,0); write_byte(parent,b-p,71);
+    assert(kernel_mm_mremap(parent,b,0,2*p,3,b-p,&out)==-KERNEL_EINVAL);
+    assert(read_byte(parent,b-p)==71 && read_byte(parent,b)==44);
+    assert(!kernel_mm_munmap(parent,b-p,p));
+    /* DONTUNMAP moves private pages but leaves a faultable old mapping. */
+    map(parent,0x500000,p,0); write_byte(parent,0x500000,83);
+    assert(kernel_mm_mremap(parent,0x500000,0,p,1,0,&out)==-KERNEL_EINVAL);
+    assert(kernel_mm_mremap(parent,0x500000,p,p,4,0,&out)==-KERNEL_EINVAL);
+    assert(kernel_mm_mremap(parent,0x500000,p,2*p,5,0,&out)==-KERNEL_EINVAL);
+    assert(kernel_mm_mremap(parent,0x500000,p,p,7,0x500000,&out)==-KERNEL_EINVAL);
+    assert(!kernel_mm_mremap(parent,0x500000,p,p,5,0,&out));
+    assert(out!=0x500000 && read_byte(parent,out)==83);
+    assert(read_byte(parent,0x500000)==0);
+    write_byte(parent,0x500000,84); assert(read_byte(parent,out)==83);
+    assert(!kernel_mm_munmap(parent,out,p));
+    map(parent,0x600000,3*p,0); write_byte(parent,0x600000+p,85);
+    assert(!kernel_mm_mlock(parent,0x600000,3*p,1));
+    assert(!kernel_mm_mremap(parent,0x600000+p,p,p,7,d+32*p,&out));
+    struct kernel_vma lock_vma;
+    assert(!kernel_mm_vma_lookup(parent,0x600000+p,&lock_vma) && !(lock_vma.flags & KERNEL_VMA_LOCK_MASK));
+    assert(!kernel_mm_vma_lookup(parent,0x600000,&lock_vma) && (lock_vma.flags & KERNEL_VMA_LOCKED));
+    assert(!kernel_mm_vma_lookup(parent,out,&lock_vma) && (lock_vma.flags & KERNEL_VMA_LOCKED));
+    assert(read_byte(parent,out)==85 && read_byte(parent,0x600000+p)==0);
+    assert(!kernel_mm_munmap(parent,0x600000,3*p) && !kernel_mm_munmap(parent,out,p));
     assert(!kernel_mm_fork(&child,parent) && !kernel_mm_context(&child,&child_root));
     assert(!kernel_mm_lookup(parent,a+p,&before));
     assert(!kernel_mm_mprotect(parent,a+p,p,0));
@@ -67,16 +100,18 @@ static void anonymous_cases(struct kernel_mm *parent)
     assert(!kernel_mm_lookup(parent,d,&after) && after.physical_address==before.physical_address);
     write_byte(parent,d,55); assert(read_byte(parent,a)==11 && read_byte(parent,a+2*p)==33);
     mm_test_context=child_root; assert(read_byte(&child,a+p)==22); mm_test_context=root;
-    /* Each fork grows its view of the same sparse anonymous object. */
+    /* Growing the VMA does not extend the original shared backing. */
     assert(!kernel_mm_mremap(parent,b,p,2*p,0,0,&out) && out==b);
     mm_test_context=child_root;
     assert(!kernel_mm_mremap(&child,b,p,2*p,0,0,&out) && out==b);
-    mm_test_context=root; write_byte(parent,b+p,66);
-    mm_test_context=child_root; assert(read_byte(&child,b+p)==66); mm_test_context=root;
-    assert(!kernel_mm_mremap(parent,b+p,p,2*p,3,d+4*p,&out));
-    assert(read_byte(parent,d+4*p)==66 && read_byte(parent,d+5*p)==0);
+    assert(kernel_mm_resolve_user_fault(&child,b+p,KERNEL_MM_READ)==KERNEL_MM_STATUS_BUS_FAULT);
+    mm_test_context=root;
+    assert(kernel_mm_resolve_user_fault(parent,b+p,KERNEL_MM_READ)==KERNEL_MM_STATUS_BUS_FAULT);
+    assert(!kernel_mm_mremap(parent,b,p,2*p,3,d+4*p,&out));
+    assert(read_byte(parent,d+4*p)==44);
+    assert(kernel_mm_resolve_user_fault(parent,d+5*p,KERNEL_MM_READ)==KERNEL_MM_STATUS_BUS_FAULT);
     write_byte(parent,d+4*p,77);
-    mm_test_context=child_root; assert(read_byte(&child,b+p)==77); mm_test_context=root;
+    mm_test_context=child_root; assert(read_byte(&child,b)==77); mm_test_context=root;
     assert(!kernel_mm_mremap(parent,d+4*p,2*p,p,0,0,&out) && out==d+4*p);
     assert(kernel_mm_vma_lookup(parent,d+5*p,&vma)==KERNEL_MM_STATUS_NOT_MAPPED);
     /* A blocked suffix requires MAYMOVE, and the source prefix survives. */
@@ -171,6 +206,14 @@ static void file_cases(struct kernel_mm *parent)
     assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(parent,&owner,a,3*p,p,RW,
         KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&out));
     write_byte(parent,a,17); write_byte(parent,a+p,27);
+    assert(!kernel_mm_mremap(parent,a+p,0,p,1,0,&out));
+    assert(read_byte(parent,out)==27); write_byte(parent,out,28);
+    assert(read_byte(parent,a+p)==28); write_byte(parent,a+p,27);
+    assert(!kernel_mm_munmap(parent,out,p));
+    assert(!kernel_mm_mremap(parent,a,p,p,5,0,&out));
+    assert(read_byte(parent,out)==17 && read_byte(parent,a)==17);
+    write_byte(parent,a,19); assert(read_byte(parent,out)==19);
+    write_byte(parent,a,17); assert(!kernel_mm_munmap(parent,out,p));
     owner=file;
     assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(parent,&owner,a+8*p,2*p,p,RW,
         KERNEL_MM_MAP_FIXED,&out));

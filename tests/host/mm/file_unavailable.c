@@ -21,6 +21,7 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
+EXCLUDED(kernel_shm_attachment_create)
 struct kernel_shm_attachment;
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 { if (owner && *owner) mm_file_unavailable(); }

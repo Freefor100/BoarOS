@@ -98,6 +98,7 @@ struct kernel_shm_attachment {
     struct kernel_shm_segment *segment;
     struct kernel_memory_object *memory;
     uint64_t start, end;
+    uint64_t file_identity;
     int32_t shmid;
     uint32_t references;
 };
@@ -139,6 +140,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
 
 enum kernel_shm_status kernel_shm_attachment_create(
     struct kernel_shm_segment *segment, uint64_t start, uint64_t end,
+    const struct kernel_shm_attachment *source,
     struct kernel_shm_attachment **owner);
 void kernel_shm_attachment_acquire(struct kernel_shm_attachment *attachment);
 /* Consumes the owner; accepts an empty slot for scoped cleanup. */

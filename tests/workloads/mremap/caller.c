@@ -13,6 +13,7 @@
 #include <sys/shm.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -171,6 +172,86 @@ static void sysv_case(void)
     CHECK(!shmctl(id,IPC_RMID,0)&&!munmap(region,4*page)&&!munmap(target,page));
     passed("sysv-shrink-ownership");
 }
+static void expect_bus(volatile unsigned char *p)
+{
+    pid_t child=fork(); CHECK(child>=0);
+    if(!child) { CHECK(signal(SIGBUS,SIG_DFL)!=SIG_ERR); unsigned char c=*p; (void)c; _exit(99); }
+    int status; CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFSIGNALED(status)&&WTERMSIG(status)==SIGBUS);
+}
+static void extended_case(void)
+{
+    pin(cpus-1);
+    unsigned char *shared=mmap(0,2*page,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    CHECK(shared!=MAP_FAILED); shared[0]=40; shared[page]=41;
+    errno=0; CHECK((void *)syscall(SYS_mremap,shared+page,0,2*page,
+        MREMAP_MAYMOVE|MREMAP_FIXED,shared)==MAP_FAILED && errno==EINVAL);
+    CHECK(shared[0]==40 && shared[page]==41);
+    unsigned char *alias=(void *)syscall(SYS_mremap,shared+page,0,2*page,MREMAP_MAYMOVE,0);
+    CHECK(alias!=MAP_FAILED && alias!=shared+page && alias[0]==41);
+    alias[0]=42; CHECK(shared[page]==42); shared[page]=43; CHECK(alias[0]==43);
+    expect_bus(alias+page);
+    CHECK(!munmap(alias,2*page)&&!munmap(shared,2*page));
+
+    unsigned char *old=mmap(0,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(old!=MAP_FAILED); old[page]=51;
+    CHECK(!mlock(old,3*page));
+    unsigned char *moved=(void *)syscall(SYS_mremap,old+page,page,page,
+        MREMAP_MAYMOVE|MREMAP_DONTUNMAP,0);
+    CHECK(moved!=MAP_FAILED && moved!=old+page && moved[0]==51);
+    CHECK(old[page]==0); old[page]=52; CHECK(moved[0]==51);
+    CHECK(!munmap(old,3*page)&&!munmap(moved,page));
+
+    int id=shmget(IPC_PRIVATE,2*page,IPC_CREAT|0600); CHECK(id>=0);
+    unsigned char *segment=shmat(id,0,0); CHECK(segment!=(void *)-1); segment[page]=63;
+    alias=(void *)syscall(SYS_mremap,segment+page,0,2*page,MREMAP_MAYMOVE,0);
+    CHECK(alias!=MAP_FAILED && alias[0]==63); alias[0]=64; CHECK(segment[page]==64);
+    expect_bus(alias+page);
+    errno=0; CHECK(shmdt(alias)==-1 && errno==EINVAL);
+    CHECK(!shmdt(alias-page)&&!shmdt(segment)&&!shmctl(id,IPC_RMID,0));
+
+    /* Linux permits shmdt(0) when target VA equals its backing offset. */
+    size_t offset=16*1024*1024;
+    void *slot=mmap((void *)offset,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+    CHECK(slot==(void *)offset);
+    id=shmget(IPC_PRIVATE,offset+2*page,IPC_CREAT|0600); CHECK(id>=0);
+    segment=shmat(id,0,0); CHECK(segment!=(void *)-1);
+    alias=(void *)syscall(SYS_mremap,segment+offset,0,page,MREMAP_MAYMOVE|MREMAP_FIXED,slot);
+    CHECK(alias==slot && !shmdt(0));
+    alias=(void *)syscall(SYS_mremap,segment+offset+page,0,page,MREMAP_MAYMOVE|MREMAP_FIXED,slot);
+    CHECK(alias==slot); errno=0; CHECK(shmdt(0)==-1 && errno==EINVAL);
+    CHECK(!munmap(alias,page)&&!shmdt(segment)&&!shmctl(id,IPC_RMID,0));
+
+    /* Cloned fragments of one shmat are detached together after rejoining. */
+    id=shmget(IPC_PRIVATE,3*page,IPC_CREAT|0600); CHECK(id>=0);
+    segment=shmat(id,0,0); CHECK(segment!=(void *)-1); segment[2*page]=91;
+    alias=(void *)syscall(SYS_mremap,segment+2*page,0,page,MREMAP_MAYMOVE,0);
+    CHECK(alias!=MAP_FAILED && alias[0]==91);
+    CHECK(!munmap(segment+2*page,page));
+    CHECK((void *)syscall(SYS_mremap,alias,0,page,MREMAP_MAYMOVE|MREMAP_FIXED,
+        segment+2*page)==segment+2*page);
+    struct shmid_ds info; CHECK(!shmdt(segment));
+    unsigned char resident;
+    errno=0; CHECK(mincore(segment+2*page,page,&resident)==-1 && errno==ENOMEM);
+    CHECK(!shmctl(id,IPC_STAT,&info)&&info.shm_nattch==1);
+    CHECK(!shmdt(alias-2*page)&&!shmctl(id,IPC_STAT,&info)&&!info.shm_nattch);
+    CHECK(!shmctl(id,IPC_RMID,0));
+
+    /* Independent shmat calls for the same segment use distinct file identities. */
+    id=shmget(IPC_PRIVATE,3*page,IPC_CREAT|0600); CHECK(id>=0);
+    segment=shmat(id,0,0); CHECK(segment!=(void *)-1);
+    unsigned char *other=shmat(id,0,0); CHECK(other!=(void *)-1);
+    CHECK(!munmap(segment+2*page,page));
+    CHECK((void *)syscall(SYS_mremap,other+2*page,0,page,MREMAP_MAYMOVE|MREMAP_FIXED,
+        segment+2*page)==segment+2*page);
+    CHECK(!shmdt(segment));
+    CHECK(!mincore(segment+2*page,page,&resident));
+    CHECK(!shmdt(segment));
+    errno=0; CHECK(mincore(segment+2*page,page,&resident)==-1 && errno==ENOMEM);
+    CHECK(!shmdt(other)&&!shmctl(id,IPC_STAT,&info)&&!info.shm_nattch);
+    CHECK(!shmctl(id,IPC_RMID,0));
+    passed("duplicate-and-dontunmap");
+}
 int main(int argc,char **argv)
 {
     setvbuf(stdout,0,_IONBF,0); CHECK(argc<=3);
@@ -180,11 +261,12 @@ int main(int argc,char **argv)
     if(argc>1) { char *end; unsigned long requested=strtoul(argv[1],&end,10); CHECK(!*end&&(requested==1||requested==2||requested==4)&&requested<=available); cpus=(unsigned)requested; }
     long size=sysconf(_SC_PAGESIZE); CHECK(size>0); page=(size_t)size;
     const char *which=argc>2?argv[2]:"all";
-    CHECK(!strcmp(which,"all")||!strcmp(which,"realloc")||!strcmp(which,"remote")||!strcmp(which,"file")||!strcmp(which,"sysv"));
+    CHECK(!strcmp(which,"all")||!strcmp(which,"realloc")||!strcmp(which,"remote")||!strcmp(which,"file")||!strcmp(which,"sysv")||!strcmp(which,"extended"));
     printf("MREMAP BEGIN cpus=%u page=%zu case=%s affinity_source=sched_getaffinity\n",cpus,page,which);
     if(!strcmp(which,"all")||!strcmp(which,"realloc"))realloc_case();
     if(!strcmp(which,"all")||!strcmp(which,"remote"))remote_case();
     if(!strcmp(which,"all")||!strcmp(which,"file"))file_case();
     if(!strcmp(which,"all")||!strcmp(which,"sysv"))sysv_case();
+    if(!strcmp(which,"all")||!strcmp(which,"extended"))extended_case();
     printf("MREMAP END %u\n",cases); return 0;
 }

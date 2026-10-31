@@ -9,6 +9,7 @@ static struct kernel_vfs_file backing;
 static unsigned references, allocations;
 static int stat_error, allocation_fail;
 static int fdinfo_pid = 42;
+static int thread_exiting;
 static struct kernel_heap heap;
 static struct kernel_fs_context fs;
 static struct kernel_pid retained_pid;
@@ -63,14 +64,17 @@ uint64_t kernel_vfs_file_inode(const struct kernel_vfs_file *file)
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity)
 { assert(pid == 42); *identity = 17; return 0; }
 int kernel_proc_thread_identity(kernel_pid_t group, uint64_t identity, kernel_pid_t tid, uint64_t *out)
-{ (void)group; (void)identity; (void)tid; (void)out; abort(); }
+{ assert(!group && !identity && tid == 43); *out = 18; return 0; }
+int kernel_proc_thread_resources_live(kernel_pid_t tid, uint64_t identity)
+{ assert(tid == 43 && identity == 18); return thread_exiting ? -KERNEL_ENOENT : 0; }
 int kernel_proc_thread_group(kernel_pid_t tid, uint64_t identity, kernel_pid_t *tgid, uint64_t *out)
 { (void)tid; (void)identity; (void)tgid; (void)out; abort(); }
 int kernel_proc_next_thread(kernel_pid_t tgid, uint64_t identity, kernel_pid_t after,
     kernel_pid_t *tid, uint64_t *out)
 { (void)tgid; (void)identity; (void)after; (void)tid; (void)out; abort(); }
 int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity, int after, int *fd)
-{ (void)pid; (void)identity; (void)after; (void)fd; abort(); }
+{ assert(pid == 43 && identity == (18 | KERNEL_PROC_THREAD_TARGET));
+  if (after < 1023) { *fd = 1023; return 0; } return -KERNEL_ENOENT; }
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid, uint64_t *identity)
 { (void)after; (void)pid; (void)identity; abort(); }
 int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
@@ -95,7 +99,7 @@ int main(void)
     fixture[4].shared = 1;
     fixture[5].file = (void *)(uintptr_t)1; fixture[5].offset = 0x12345000;
     struct kernel_vfs_node node = {.inode = proc_pid_inode(42, 17, PROC_PID_MAPS_KIND)};
-    assert(!proc_kind_is_thread(proc_inode_kind(node.inode)));
+    assert(!proc_inode_is_thread(node.inode));
     uint64_t identity; assert(!proc_inode_identity_current(node.inode, &identity) && identity == 17);
     uint64_t directory = proc_pid_inode(42, 17, PROC_PID_DIR_KIND), inode, next;
     uint32_t mode; assert(!proc_lookup(0, directory, "maps", 4, &inode, &mode));
@@ -108,6 +112,35 @@ int main(void)
     assert(proc_dir_entry(&dir, next, &next, &inode, &type, name, sizeof(name))==1);
     assert(!strcmp(name,"fdinfo") && type==4);
     assert(!proc_dir_entry(&dir,next,&next,&inode,&type,name,sizeof(name)));
+    uint64_t thread_dir = proc_pid_inode(43, 18, PROC_TID_DIR_KIND);
+    const char *thread_names[] = {"stat", "status", "exe", "cwd", "root", "maps", "fd", "fdinfo"};
+    struct kernel_vfs_node tnode = {.inode = thread_dir};
+    struct kernel_vfs_file tdir = {.private_data = &tnode};
+    for (unsigned i = 0; i < 8; i++) {
+        uint64_t found; uint32_t found_mode;
+        assert(!proc_lookup(0, thread_dir, thread_names[i], strlen(thread_names[i]), &found, &found_mode));
+        assert(proc_inode_is_thread(found) && proc_inode_pid(found) == 43 && proc_inode_identity(found) == 18);
+        assert(proc_dir_entry(&tdir, i + 2, &next, &inode, &type, name, sizeof(name)) == 1);
+        assert(!strcmp(name, thread_names[i]) && inode == found && next == i + 3);
+    }
+    /* TID identity can remain visible after resources begin exiting. */
+    thread_exiting = 1;
+    for (unsigned i = 2; i < 8; i++)
+        assert(proc_lookup(0, thread_dir, thread_names[i], strlen(thread_names[i]), &inode, &mode) == -KERNEL_ENOENT);
+    assert(!proc_lookup(0, thread_dir, "stat", 4, &inode, &mode));
+    thread_exiting = 0;
+    for (unsigned kind = PROC_PID_FD_DIR_KIND; kind <= PROC_PID_FDINFO_DIR_KIND; kind += 7) {
+        uint64_t fd_dir = proc_thread_resource_inode(43, 18, kind, 0);
+        struct kernel_vfs_node fdnode = {.inode = fd_dir};
+        struct kernel_vfs_file fddir = {.private_data = &fdnode};
+        assert(!proc_lookup(0, fd_dir, "1023", 4, &inode, &mode));
+        assert(proc_inode_is_thread(inode) && proc_inode_fd(inode) == 1023);
+        assert(proc_inode_kind(inode) == (kind == PROC_PID_FD_DIR_KIND ? PROC_PID_FD_LINK_KIND : PROC_PID_FDINFO_KIND));
+        assert(proc_dir_entry(&fddir, 2, &next, &inode, &type, name, sizeof(name)) == 1);
+        assert(!strcmp(name, "1023") && proc_inode_fd(inode) == 1023);
+        assert(proc_dir_entry(&fddir, 1, &next, &inode, &type, name, sizeof(name)) == 1);
+        assert(inode == thread_dir);
+    }
     char *text = 0; size_t length = 0;
     assert(!proc_maps_snapshot(&node, &heap, &text, &length));
     assert(strlen(text) == length && !references && allocations == 1);

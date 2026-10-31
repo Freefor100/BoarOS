@@ -20,6 +20,9 @@ struct kernel_memory_mapping {
 struct kernel_memory_budget { uint64_t limit, used; };
 /* limit/budget绑定仅在私有构造期设置；used由对象原子收费，读取用atomic load。 */
 void kernel_memory_object_set_budget(struct kernel_memory_object *, struct kernel_memory_budget *);
+/* 私有构造期确定共享匿名或 SysV 的后备长度，发布后不可改变。 */
+void kernel_memory_object_set_mapping_size(struct kernel_memory_object *, uint64_t);
+int kernel_memory_object_contains_offset(const struct kernel_memory_object *, uint64_t);
 
 enum kernel_memory_object_status {
     KERNEL_MEMORY_OBJECT_OK = 0,

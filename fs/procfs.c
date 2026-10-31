@@ -85,7 +85,21 @@ static uint64_t proc_pid_inode_fd(kernel_pid_t pid, uint64_t identity,
 static uint64_t proc_pid_inode(kernel_pid_t pid, uint64_t identity,
                                uint8_t kind)
 {
+    if (kind == PROC_TID_STAT_KIND || kind == PROC_TID_STATUS_KIND)
+        return proc_pid_inode_fd(pid, identity,
+            kind == PROC_TID_STAT_KIND ? PROC_PID_STAT_KIND : PROC_PID_STATUS_KIND, 1U);
     return proc_pid_inode_fd(pid, identity, kind, 0U);
+}
+
+/* Kinds 12 and 13 encode thread fd leaves; thread stat/status use an
+ * otherwise unused fd bit. This preserves all PID generation and fd bits. */
+static uint64_t proc_thread_resource_inode(kernel_pid_t pid, uint64_t identity,
+                                            uint8_t kind, uint16_t fd)
+{
+    if (kind == PROC_PID_FD_LINK_KIND || kind == PROC_PID_FDINFO_KIND)
+        return proc_pid_inode_fd(pid, identity,
+            kind == PROC_PID_FD_LINK_KIND ? 12U : 13U, fd);
+    return proc_pid_inode_fd(pid, identity, kind, 1U);
 }
 
 static kernel_pid_t proc_inode_pid(uint64_t inode)
@@ -100,7 +114,14 @@ static uint64_t proc_inode_identity(uint64_t inode)
 
 static uint8_t proc_inode_kind(uint64_t inode)
 {
-    return (uint8_t)((inode >> 26U) & UINT64_C(0x0f));
+    uint8_t kind = (uint8_t)((inode >> 26U) & UINT64_C(0x0f));
+    if (kind == 12U) return PROC_PID_FD_LINK_KIND;
+    if (kind == 13U) return PROC_PID_FDINFO_KIND;
+    if ((inode & (UINT64_C(1) << 16U)) && kind == PROC_PID_STAT_KIND)
+        return PROC_TID_STAT_KIND;
+    if ((inode & (UINT64_C(1) << 16U)) && kind == PROC_PID_STATUS_KIND)
+        return PROC_TID_STATUS_KIND;
+    return kind;
 }
 
 static uint16_t proc_inode_fd(uint64_t inode)
@@ -119,14 +140,26 @@ static uint32_t proc_kind_mode(uint8_t kind)
     return KERNEL_VFS_S_IFREG | 0444U;
 }
 
-static int proc_kind_is_thread(uint8_t kind)
+static int proc_inode_is_thread(uint64_t inode)
 {
-    return kind >= PROC_TID_DIR_KIND && kind <= PROC_TID_STATUS_KIND;
+    uint8_t raw = (uint8_t)((inode >> 26U) & 15U);
+    return raw == PROC_TID_DIR_KIND || raw == 12U || raw == 13U ||
+        ((inode & (UINT64_C(1) << 16U)) &&
+         (raw == PROC_PID_EXE_KIND || raw == PROC_PID_CWD_KIND ||
+          raw == PROC_PID_ROOT_KIND || raw == PROC_PID_MAPS_KIND ||
+          raw == PROC_PID_FD_DIR_KIND || raw == PROC_PID_FDINFO_DIR_KIND ||
+          raw == PROC_PID_STAT_KIND || raw == PROC_PID_STATUS_KIND));
+}
+
+static uint64_t proc_resource_identity(uint64_t inode)
+{
+    return proc_inode_identity(inode) |
+        (proc_inode_is_thread(inode) ? KERNEL_PROC_THREAD_TARGET : 0U);
 }
 
 static int proc_inode_identity_current(uint64_t inode, uint64_t *identity)
 {
-    return proc_kind_is_thread(proc_inode_kind(inode))
+    return proc_inode_is_thread(inode)
         ? kernel_proc_thread_identity(0, 0, proc_inode_pid(inode), identity)
         : kernel_proc_process_identity(proc_inode_pid(inode), identity);
 }
@@ -234,20 +267,32 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         if (parent_kind == PROC_TID_DIR_KIND) {
             uint8_t kind = length == 4U && !memcmp(name, "stat", length)
                 ? PROC_TID_STAT_KIND : length == 6U && !memcmp(name, "status", length)
-                ? PROC_TID_STATUS_KIND : 0;
+                ? PROC_TID_STATUS_KIND : length == 3U && !memcmp(name, "exe", length)
+                ? PROC_PID_EXE_KIND : length == 3U && !memcmp(name, "cwd", length)
+                ? PROC_PID_CWD_KIND : length == 4U && !memcmp(name, "root", length)
+                ? PROC_PID_ROOT_KIND : length == 4U && !memcmp(name, "maps", length)
+                ? PROC_PID_MAPS_KIND : length == 2U && !memcmp(name, "fd", length)
+                ? PROC_PID_FD_DIR_KIND : length == 6U && !memcmp(name, "fdinfo", length)
+                ? PROC_PID_FDINFO_DIR_KIND : 0;
             if (!kind) return -KERNEL_ENOENT;
-            *inode = proc_pid_inode(pid, identity, kind);
+            if (kind != PROC_TID_STAT_KIND && kind != PROC_TID_STATUS_KIND &&
+                kernel_proc_thread_resources_live(pid, identity))
+                return -KERNEL_ENOENT;
+            *inode = kind == PROC_TID_STAT_KIND || kind == PROC_TID_STATUS_KIND
+                ? proc_pid_inode(pid, identity, kind)
+                : proc_thread_resource_inode(pid, identity, kind, 0);
             *mode = proc_kind_mode(kind);
             return 0;
         }
         if (parent_kind == PROC_PID_FD_DIR_KIND || parent_kind==PROC_PID_FDINFO_DIR_KIND) {
             int requested, found;
             if (proc_parse_fd(name, length, &requested) ||
-                kernel_proc_next_fd(pid, identity, requested - 1, &found) ||
+                kernel_proc_next_fd(pid, proc_resource_identity(parent), requested - 1, &found) ||
                 found != requested) return -KERNEL_ENOENT;
-            *inode = proc_pid_inode_fd(pid, identity,
-                                        parent_kind==PROC_PID_FD_DIR_KIND?PROC_PID_FD_LINK_KIND:PROC_PID_FDINFO_KIND,
-                                        (uint16_t)requested);
+            uint8_t leaf = parent_kind == PROC_PID_FD_DIR_KIND ? PROC_PID_FD_LINK_KIND : PROC_PID_FDINFO_KIND;
+            *inode = proc_inode_is_thread(parent)
+                ? proc_thread_resource_inode(pid, identity, leaf, (uint16_t)requested)
+                : proc_pid_inode_fd(pid, identity, leaf, (uint16_t)requested);
             *mode = proc_kind_mode(parent_kind==PROC_PID_FD_DIR_KIND?PROC_PID_FD_LINK_KIND:PROC_PID_FDINFO_KIND);
             return 0;
         }
@@ -399,7 +444,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         if (proc_inode_kind(inode) == PROC_PID_FD_LINK_KIND || proc_inode_kind(inode)==PROC_PID_FDINFO_KIND) {
             int found;
             int fd = proc_inode_fd(inode);
-            if (kernel_proc_next_fd(proc_inode_pid(inode), identity,
+            if (kernel_proc_next_fd(proc_inode_pid(inode), proc_resource_identity(inode),
                                      fd - 1, &found) || found != fd)
                 return -KERNEL_ENOENT;
         }
@@ -419,7 +464,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     node->mode = mode;
     if(inode>=(UINT64_C(1)<<30U)) {
         int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
-            proc_kind_is_thread(proc_inode_kind(inode)),mode,&node->uid,&node->gid);
+            proc_inode_is_thread(inode),mode,&node->uid,&node->gid);
         if(error){kernel_heap_release(instance->heap,node);return error;}
         if(proc_inode_kind(inode)==PROC_PID_DIR_KIND) {
             struct kernel_pid *owner=0;
@@ -437,20 +482,20 @@ static int proc_permission(struct kernel_vfs_node *node,const struct kernel_cred
     if(node->inode>=(UINT64_C(1)<<30U) &&
         (proc_inode_kind(node->inode)==PROC_PID_FDINFO_DIR_KIND ||
          proc_inode_kind(node->inode)==PROC_PID_FDINFO_KIND)) {
-        int error=kernel_proc_fdinfo_access(proc_inode_pid(node->inode),proc_inode_identity(node->inode));
+        int error=kernel_proc_fdinfo_access(proc_inode_pid(node->inode),proc_resource_identity(node->inode));
         if(error)return error;
     }
     uint32_t uid=0,gid=0;
     if(node->inode>=(UINT64_C(1)<<30U)) {
         int result=kernel_proc_inode_owner(proc_inode_pid(node->inode),proc_inode_identity(node->inode),
-            proc_kind_is_thread(proc_inode_kind(node->inode)),node->mode,&uid,&gid);
+            proc_inode_is_thread(node->inode),node->mode,&uid,&gid);
         if(result)return result;
     }
     int result=kernel_vfs_dac_permission(node->mode,uid,gid,mask,cred);
     /* 降权使proc FD目录属主回到root，调用线程仍可查询本组FD。
      * 链接访问还会核对实际对象，不改变stat展示的真实属主。 */
     if(result==-KERNEL_EACCES && proc_inode_kind(node->inode)==PROC_PID_FD_DIR_KIND &&
-        kernel_proc_same_group(proc_inode_pid(node->inode),proc_inode_identity(node->inode),0))return 0;
+        kernel_proc_same_group(proc_inode_pid(node->inode),proc_inode_identity(node->inode),proc_inode_is_thread(node->inode)))return 0;
     return result;
 }
 
@@ -466,19 +511,19 @@ static int proc_stat(const struct kernel_vfs_file *file,
         if (proc_inode_kind(inode) == PROC_PID_FD_LINK_KIND) {
             int found;
             int fd = proc_inode_fd(inode);
-            if (kernel_proc_next_fd(proc_inode_pid(inode), identity,
+            if (kernel_proc_next_fd(proc_inode_pid(inode), proc_resource_identity(inode),
                                      fd - 1, &found) || found != fd)
                 return -KERNEL_ENOENT;
             int readable, writable;
             if (kernel_proc_fd_access_snapshot(proc_inode_pid(inode),
-                identity, fd, &readable, &writable)) return -KERNEL_ENOENT;
+                proc_resource_identity(inode), fd, &readable, &writable)) return -KERNEL_ENOENT;
             mode = KERNEL_VFS_S_IFLNK |
                 (readable ? 0500U : 0U) | (writable ? 0300U : 0U);
         }
     }
     if(inode>=(UINT64_C(1)<<30U)) {
         int error=kernel_proc_inode_owner(proc_inode_pid(inode),proc_inode_identity(inode),
-            proc_kind_is_thread(proc_inode_kind(inode)),mode,&uid,&gid);
+            proc_inode_is_thread(inode),mode,&uid,&gid);
         if(error)return error;
     }
     *stat = (struct kernel_vfs_stat){
@@ -546,6 +591,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     if (directory != PROC_ROOT_INODE &&
         proc_inode_kind(directory) != PROC_PID_DIR_KIND &&
         proc_inode_kind(directory) != PROC_PID_FD_DIR_KIND &&
+        proc_inode_kind(directory) != PROC_PID_FDINFO_DIR_KIND &&
         proc_inode_kind(directory) != PROC_TASK_DIR_KIND &&
         proc_inode_kind(directory) != PROC_TID_DIR_KIND)
         return -KERNEL_ENOTDIR;
@@ -569,13 +615,17 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                 *type = 4U;
                 return 1;
             }
-            if (position > 3U) return 0;
+            if (position > 9U) return 0;
             const char *entry = position == 0 ? "." : position == 1 ? ".." :
-                                position == 2 ? "stat" : "status";
+                position == 2 ? "stat" : position == 3 ? "status" :
+                position == 4 ? "exe" : position == 5 ? "cwd" :
+                position == 6 ? "root" : position == 7 ? "maps" :
+                position == 8 ? "fd" : "fdinfo";
             if (name_size <= strlen(entry)) return -KERNEL_ERANGE;
             strcpy(name, entry);
             *next_position = position + 1;
-            *type = position < 2 ? 4U : 8U;
+            *type = position < 2 || position >= 8 ? 4U :
+                    position >= 4 && position <= 6 ? 10U : 8U;
             if (!position) *inode = directory;
             else if (position == 1 && kind == PROC_TASK_DIR_KIND)
                 *inode = proc_pid_inode(proc_inode_pid(directory), identity, PROC_PID_DIR_KIND);
@@ -586,8 +636,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                     &tgid, &group_identity);
                 if (error) return error;
                 *inode = proc_pid_inode(tgid, group_identity, PROC_TASK_DIR_KIND);
-            } else *inode = proc_pid_inode(proc_inode_pid(directory), identity,
+            } else if (position < 4) *inode = proc_pid_inode(proc_inode_pid(directory), identity,
                 position == 2 ? PROC_TID_STAT_KIND : PROC_TID_STATUS_KIND);
+            else *inode = proc_thread_resource_inode(proc_inode_pid(directory), identity,
+                position == 4 ? PROC_PID_EXE_KIND : position == 5 ? PROC_PID_CWD_KIND :
+                position == 6 ? PROC_PID_ROOT_KIND : position == 7 ? PROC_PID_MAPS_KIND :
+                position == 8 ? PROC_PID_FD_DIR_KIND : PROC_PID_FDINFO_DIR_KIND, 0);
             return 1;
         }
         if (proc_inode_kind(directory) == PROC_PID_FD_DIR_KIND ||
@@ -595,16 +649,17 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             if (position >= 2U) {
                 if (position > 1025U) return 0;
                 int fd;
-                if (kernel_proc_next_fd(proc_inode_pid(directory), identity,
+                if (kernel_proc_next_fd(proc_inode_pid(directory), proc_resource_identity(directory),
                                          (int)position - 3, &fd))
                     return 0;
                 size_t length = decimal(name, (unsigned)fd);
                 if (name_size <= length) return -KERNEL_ERANGE;
                 name[length] = '\0';
                 *next_position = (uint64_t)fd + 3U;
-                *inode = proc_pid_inode_fd(proc_inode_pid(directory), identity,
-                    proc_inode_kind(directory)==PROC_PID_FD_DIR_KIND?PROC_PID_FD_LINK_KIND:PROC_PID_FDINFO_KIND,
-                    (uint16_t)fd);
+                uint8_t leaf = kind == PROC_PID_FD_DIR_KIND ? PROC_PID_FD_LINK_KIND : PROC_PID_FDINFO_KIND;
+                *inode = proc_inode_is_thread(directory)
+                    ? proc_thread_resource_inode(proc_inode_pid(directory), identity, leaf, (uint16_t)fd)
+                    : proc_pid_inode_fd(proc_inode_pid(directory), identity, leaf, (uint16_t)fd);
                 *type = proc_inode_kind(directory)==PROC_PID_FD_DIR_KIND?10U:8U;
                 return 1;
             }
@@ -614,7 +669,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             *next_position = position + 1U;
             *inode = position == 0U ? directory :
                 proc_pid_inode(proc_inode_pid(directory), identity,
-                               PROC_PID_DIR_KIND);
+                    proc_inode_is_thread(directory) ? PROC_TID_DIR_KIND : PROC_PID_DIR_KIND);
             *type = 4U;
             return 1;
         }
@@ -746,11 +801,11 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
     int result;
     if (kind == PROC_PID_FD_LINK_KIND) {
         result = kernel_proc_fd_path_acquire(proc_inode_pid(node->inode),
-            proc_inode_identity(node->inode), proc_inode_fd(node->inode), &path);
+            proc_resource_identity(node->inode), proc_inode_fd(node->inode), &path);
         if (result) {
             struct kernel_proc_fd_pseudo pseudo = {0};
             result = kernel_proc_fd_pseudo_snapshot(proc_inode_pid(node->inode),
-                proc_inode_identity(node->inode), proc_inode_fd(node->inode),
+                proc_resource_identity(node->inode), proc_inode_fd(node->inode),
                 &pseudo);
             if (result) return result;
             if(pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
@@ -795,7 +850,7 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
             return result;
         }
     } else result = kernel_proc_process_path_acquire(proc_inode_pid(node->inode),
-        proc_inode_identity(node->inode), path_kind, 0, &path);
+        proc_resource_identity(node->inode), path_kind, 0, &path);
     if (result) return result;
     const struct kernel_fs_context *fs = 0;
     if (kernel_task_fs_context_borrow(kernel_task_current(), &fs) !=
@@ -852,11 +907,11 @@ static int proc_follow_link(struct kernel_vfs_node *node,
         ? KERNEL_PROC_PATH_ROOT : 0;
     if (kind == PROC_PID_FD_LINK_KIND) {
         int result = kernel_proc_fd_path_acquire(proc_inode_pid(node->inode),
-            proc_inode_identity(node->inode), proc_inode_fd(node->inode), owner);
+            proc_resource_identity(node->inode), proc_inode_fd(node->inode), owner);
         if (!result) return 0;
         struct kernel_proc_fd_pseudo pseudo = {0};
         result = kernel_proc_fd_pseudo_snapshot(proc_inode_pid(node->inode),
-            proc_inode_identity(node->inode), proc_inode_fd(node->inode),
+            proc_resource_identity(node->inode), proc_inode_fd(node->inode),
             &pseudo);
         if (result) return result;
         /* 无路径的管道由OFD重新打开；其展示文本不参与路径创建。 */
@@ -865,7 +920,7 @@ static int proc_follow_link(struct kernel_vfs_node *node,
     }
     if (!path_kind) return -KERNEL_ENOTSUP;
     return kernel_proc_process_path_acquire(proc_inode_pid(node->inode),
-        proc_inode_identity(node->inode), path_kind, 0, owner);
+        proc_resource_identity(node->inode), path_kind, 0, owner);
 }
 
 static int proc_reopen_link(struct kernel_vfs_node *node,
@@ -875,7 +930,7 @@ static int proc_reopen_link(struct kernel_vfs_node *node,
     if (proc_inode_kind(node->inode) != PROC_PID_FD_LINK_KIND)
         return -KERNEL_ENOTSUP;
     return kernel_proc_fd_reopen_link(proc_inode_pid(node->inode),
-        proc_inode_identity(node->inode), proc_inode_fd(node->inode), heap,
+        proc_resource_identity(node->inode), proc_inode_fd(node->inode), heap,
         flags, owner);
 }
 
@@ -885,7 +940,7 @@ static int proc_stat_link(struct kernel_vfs_node *node,
     if (proc_inode_kind(node->inode) != PROC_PID_FD_LINK_KIND)
         return -KERNEL_ENOTSUP;
     return kernel_proc_fd_pseudo_stat(proc_inode_pid(node->inode),
-        proc_inode_identity(node->inode), proc_inode_fd(node->inode), stat);
+        proc_resource_identity(node->inode), proc_inode_fd(node->inode), stat);
 }
 
 static size_t decimal(char *buffer, uint64_t value)
@@ -1191,7 +1246,7 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                                  char **buffer, size_t *length)
 {
     struct kernel_proc_process_snapshot process;
-    int thread = proc_kind_is_thread(proc_inode_kind(node->inode));
+    int thread = proc_inode_is_thread(node->inode);
     int result = thread ? kernel_proc_thread_snapshot(proc_inode_pid(node->inode),
         proc_inode_identity(node->inode), &process) :
         kernel_proc_process_snapshot(proc_inode_pid(node->inode),
@@ -1343,7 +1398,7 @@ static int proc_maps_snapshot(struct kernel_vfs_node *node,
     struct kernel_mm_proc_map *rows = 0;
     uint32_t count = 0;
     int error = kernel_proc_maps_snapshot(proc_inode_pid(node->inode),
-        proc_inode_identity(node->inode), heap, &rows, &count);
+        proc_resource_identity(node->inode), heap, &rows, &count);
     if (error) return error;
     char *data = 0, *path_text = 0;
     size_t capacity = (size_t)count * 80U + 1U, used = 0;
@@ -1545,7 +1600,7 @@ static int proc_fdinfo_snapshot(struct kernel_vfs_node *node,struct kernel_heap 
     char **buffer,size_t *length)
 {
     struct kernel_proc_fdinfo info;
-    int error=kernel_proc_fdinfo_snapshot(proc_inode_pid(node->inode),proc_inode_identity(node->inode),
+    int error=kernel_proc_fdinfo_snapshot(proc_inode_pid(node->inode),proc_resource_identity(node->inode),
         proc_inode_fd(node->inode),&info);
     if(error)return error;
     char *data=0;
