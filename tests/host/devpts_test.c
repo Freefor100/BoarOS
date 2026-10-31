@@ -203,14 +203,14 @@ static void options_and_isolation(struct kernel_heap *heap)
     assert(kernel_devpts_file_entry(&slave) == eb && kernel_devpts_entry_binding(eb) == &binding_b);
     struct kernel_vfs_instance *mutations = b->private_data;
     assert(mutations->ops->mkdir && mutations->ops->unlink && mutations->ops->rmdir);
-    assert(mutations->ops->mkdir(b, 1, "new", 0755) == -KERNEL_EPERM);
+    assert(mutations->ops->mkdir(b, 1, "new", 0755,0) == -KERNEL_EPERM);
     assert(mutations->ops->unlink(b, 1, "0") == -KERNEL_EPERM);
     assert(mutations->ops->rmdir(b, 1, "new") == -KERNEL_EPERM);
     assert(mutations->ops->create && mutations->ops->symlink && mutations->ops->mknod);
     struct kernel_vfs_file denied = {0};
-    assert(mutations->ops->create(b, 1, "new", 0600, &denied) == -KERNEL_EACCES);
+    assert(mutations->ops->create(b, 1, "new", 0600, &denied,0) == -KERNEL_EACCES);
     assert(mutations->ops->symlink(mutations, 1, "0", "link") == -KERNEL_EPERM);
-    assert(mutations->ops->mknod(mutations, 1, "node", KERNEL_VFS_S_IFCHR, 0600, 0x103) == -KERNEL_EPERM);
+    assert(mutations->ops->mknod(mutations, 1, "node", KERNEL_VFS_S_IFCHR, 0600, 0x103,0) == -KERNEL_EPERM);
     assert(find(b, "0") == st.ino && kernel_devpts_entry_binding(eb) == &binding_b);
     close_file(&slave); close_file(&ptmx); close_file(&root);
     kernel_devpts_retire(ea); kernel_devpts_entry_release(&ea);

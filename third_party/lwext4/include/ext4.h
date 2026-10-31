@@ -782,6 +782,8 @@ int ext4_file_setxattr(ext4_file *,const char *,size_t,const void *,size_t,unsig
 int ext4_file_getxattr(ext4_file *,const char *,size_t,void *,size_t,size_t *);
 int ext4_file_listxattr(ext4_file *,char *,size_t,size_t *,bool);
 int ext4_file_removexattr(ext4_file *,const char *,size_t);
+/* Update an ACL attribute and its associated mode through one inode owner. */
+int ext4_file_set_acl(ext4_file *,uint8_t,const void *,size_t,bool,bool,uint32_t);
 
 
 /*********************************DIRECTORY OPERATION***********************/

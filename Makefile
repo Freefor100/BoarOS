@@ -402,6 +402,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/time.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
+	kernel/posix_acl.c \
 	kernel/rlimit.c \
 	kernel/syscall/credentials.c \
 	kernel/syscall/capability.c \
@@ -2207,14 +2208,14 @@ test-file-mapping-concurrency-host:
 	@set -e; for shift in 12 14; do \
 		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
-		tests/host/file_mapping_concurrency.c tests/host/mm/context.c fs/file_mapping.c fs/vfs.c \
+		tests/host/file_mapping_concurrency.c tests/host/mm/context.c fs/file_mapping.c fs/vfs.c kernel/posix_acl.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c \
 		-Wl,--gc-sections -o build/host/mm/file-mapping-$$shift; \
 		timeout 30s build/host/mm/file-mapping-$$shift || exit $$?; \
 		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/memory_file_source.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
-		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c \
+		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/memory_object.c \
 		-Wl,--gc-sections,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-source-$$shift; \
@@ -2307,7 +2308,7 @@ test-mm-file-concurrency-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_file.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
-		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c \
+		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_memory_object_prepare_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
@@ -2315,12 +2316,12 @@ test-mm-file-concurrency-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_file_single_wait.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
-		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c \
+		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_try_read -o build/host/mm/file-single-wait
 	timeout 30s build/host/mm/file-single-wait
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release -o build/host/mm/source-release
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release -o build/host/mm/source-release
 	timeout 30s build/host/mm/source-release
 
 .PHONY: test-allocator-concurrency-host
@@ -2398,6 +2399,21 @@ test-ext4-node-resource-host:
 	FILE_IO_HOST_TEST_SOURCE=tests/host/ext4_node_resource.c FILE_IO_HOST_TCP=0 \
 	FILE_IO_HOST_LDFLAGS='-Wl,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_release,--wrap=kernel_rwlock_init,--wrap=jbd_trans_set_block_dirty_range,--wrap=boaros_lwext4_inode_get,--wrap=ext4_metadata_execute,--wrap=ext4_fclose' \
 	sh tests/file-io-concurrency-host.sh
+
+.PHONY: test-ext4-acl-xattr-host
+test-ext4-acl-xattr-host:
+	FILE_IO_HOST_BUILD=$${FILE_IO_HOST_BUILD:-build/host/ext4-acl-xattr} \
+	FILE_IO_HOST_TEST_SOURCE=tests/host/ext4_acl_xattr.c FILE_IO_HOST_TCP=0 \
+	FILE_IO_HOST_LDFLAGS='-Wl,--wrap=ext4_balloc_alloc_block,--wrap=ext4_trans_block_get' \
+	sh tests/file-io-concurrency-host.sh
+	FILE_IO_HOST_BUILD=$${FILE_IO_HOST_BUILD:-build/host/ext4-acl-xattr} \
+	sh tests/ext4-acl-nojournal-host.sh
+
+.PHONY: test-posix-acl-host
+test-posix-acl-host:
+	@mkdir -p build/host
+	cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/host/posix_acl.c kernel/posix_acl.c -o build/host/posix-acl
+	build/host/posix-acl
 
 test-files-concurrency-host:
 	sh tests/files-concurrency-host.sh

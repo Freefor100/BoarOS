@@ -744,8 +744,9 @@ static int create_child(struct fat_mount *m, uint64_t parent_inode, const char *
     if (out) *out = i;
     return 0;
 }
-static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode, struct kernel_vfs_file *file)
+static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode, struct kernel_vfs_file *file,uint32_t umask)
 {
+    mode &= ~umask;
     if ((mode & KERNEL_VFS_S_IFMT) && (mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)
         return -KERNEL_ENOTSUP;
     struct fat_mount *m = fm(mount->private_data); uint64_t id;
@@ -758,8 +759,9 @@ static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const c
     }
     return open_inode(mount, 0, id, 0, file);
 }
-static int mkdir_inode(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode)
+static int mkdir_inode(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode,uint32_t umask)
 {
+    mode &= ~umask;
     struct fat_mount *m = fm(mount->private_data);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     int r = fat_error(&m->instance);

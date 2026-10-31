@@ -45,6 +45,9 @@ extern "C" {
 #include <ext4_types.h>
 #include <ext4_inode.h>
 
+#define EXT4_XATTR_INDEX_POSIX_ACL_ACCESS 2
+#define EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT 3
+
 struct ext4_xattr_info {
 	uint8_t name_index;
 	const char *name;

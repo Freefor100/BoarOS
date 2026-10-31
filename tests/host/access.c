@@ -92,14 +92,14 @@ int main(void)
     assert(!kernel_tmpfs_create(&heap, 0, "", &rw) &&
         !kernel_tmpfs_create(&heap, 0, "", &ro));
     assert(!kernel_vfs_path_root(rw, &heap, &root));
-    assert(!kernel_vfs_mkdir_at(root, root, "/ro", 0755));
-    assert(!kernel_vfs_mknod_at(root, root, "/rw-file", 0600, 0));
+    assert(!kernel_vfs_mkdir_at(root, root, "/ro", 0755,0));
+    assert(!kernel_vfs_mknod_at(root, root, "/rw-file", 0600, 0,0));
     assert(!kernel_vfs_symlink_at(root, root, "/rw-file", "/rw-link"));
-    assert(!kernel_vfs_mknod_at(root, root, "/fifo", KERNEL_VFS_S_IFIFO | 0600, 0));
+    assert(!kernel_vfs_mknod_at(root, root, "/fifo", KERNEL_VFS_S_IFIFO | 0600, 0,0));
     assert(!kernel_vfs_path_resolve(root, root, "/ro", 1, &covered));
     assert(!kernel_vfs_mount_attach(ro, covered));
     assert(!kernel_vfs_path_resolve(root, root, "/ro", 1, &readonly));
-    assert(!kernel_vfs_mknod_at(readonly, root, "regular", 0600, 0));
+    assert(!kernel_vfs_mknod_at(readonly, root, "regular", 0600, 0,0));
     assert(!kernel_vfs_symlink_at(readonly, root, "missing", "pathless"));
     struct kernel_vfs_instance *instance = ro->private_data;
     struct kernel_vfs_backend ops = *instance->ops;

@@ -1,6 +1,7 @@
 #include "vfs_objects.h"
 #include <kernel/tmpfs.h>
 #include <kernel/credentials.h>
+#include <kernel/posix_acl.h>
 #include <kernel/memory_object.h>
 #include <kernel/physical_page.h>
 #include <kernel/page.h>
@@ -29,7 +30,7 @@ struct tmp_inode {
     struct kernel_memory_object *memory;
     char *target;
     struct kernel_vfs_timespec atime, mtime, ctime;
-    struct tmp_xattr *xattrs, *capability;
+    struct tmp_xattr *xattrs, *capability, *access_acl, *default_acl;
 };
 struct tmp_entry {
     RB_ENTRY(tmp_entry) name_index;
@@ -116,6 +117,8 @@ static void remove_attribute(struct tmp_mount *m,struct tmp_inode *i,struct tmp_
     while (*link!=attr) {if (!*link) __builtin_trap();link=&(*link)->next;}
     *link=attr->next;
     if (i->capability==attr) i->capability=NULL;
+    if (i->access_acl==attr) i->access_acl=NULL;
+    if (i->default_acl==attr) i->default_acl=NULL;
     dispose(m,attr);
 }
 static int xattr_inode(struct kernel_vfs_node *n,enum kernel_xattr_operation op,
@@ -138,6 +141,8 @@ static int xattr_inode(struct kernel_vfs_node *n,enum kernel_xattr_operation op,
     }
     struct tmp_xattr *a=i->xattrs;
     while (a && strcmp(a->bytes,name)) a=a->next;
+    int acl=!strcmp(name,KERNEL_ACL_ACCESS) || !strcmp(name,KERNEL_ACL_DEFAULT);
+    int access_acl=!strcmp(name,KERNEL_ACL_ACCESS);
     if (op==KERNEL_XATTR_GET) {
         if (!a) return -KERNEL_ENODATA;
         if (size && size<a->value_size) return -KERNEL_ERANGE;
@@ -147,22 +152,49 @@ static int xattr_inode(struct kernel_vfs_node *n,enum kernel_xattr_operation op,
     if (op==KERNEL_XATTR_SET) {
         if (a && (flags & KERNEL_XATTR_CREATE)) return -KERNEL_EEXIST;
         if (!a && (flags & KERNEL_XATTR_REPLACE)) return -KERNEL_ENODATA;
+        uint32_t mode=i->mode;
+        int extended=access_acl ? kernel_acl_mode(value,size,&mode) : 1;
+        if (extended<0) return extended;
+        if (access_acl) {
+            int allowed=kernel_vfs_chmod_allowed(n->uid,n->gid,&mode);
+            if (allowed) return allowed;
+        }
+        if (!extended) {
+            if (a) remove_attribute(m,i,a);
+            i->mode=n->mode=mode;
+            struct kernel_vfs_timespec time=now();
+            KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);i->ctime=time;
+            return 0;
+        }
         size_t namesize=strlen(name)+1;struct tmp_xattr *candidate;
         int result=allocate(m,sizeof(*candidate)+namesize+size,(void **)&candidate);
         if (result) return result;
         candidate->name_size=namesize;candidate->value_size=size;
         memcpy(candidate->bytes,name,namesize);
         if (size) memcpy(candidate->bytes+namesize,value,size);
+        if (acl && kernel_acl_normalize(candidate->bytes+namesize,size)) __builtin_trap();
         if (a) remove_attribute(m,i,a);
         candidate->next=i->xattrs;i->xattrs=candidate;
         if (!strcmp(name,"security.capability")) i->capability=candidate;
+        if (access_acl) i->access_acl=candidate;
+        else if (acl) i->default_acl=candidate;
+        if (access_acl) i->mode=n->mode=mode;
     } else {
-        if (!a) return -KERNEL_ENODATA;
-        remove_attribute(m,i,a);
+        if (!a && !acl) return -KERNEL_ENODATA;
+        if (a) remove_attribute(m,i,a);
     }
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);i->ctime=time;
     return 0;
+}
+static int permission(struct kernel_vfs_node *n,const struct kernel_credentials *cred,unsigned access)
+{
+    if (cred->fsuid==n->uid || !(n->mode & 0070U))
+        return kernel_vfs_dac_permission(n->mode,n->uid,n->gid,access,cred);
+    struct tmp_xattr *a=ti(n)->access_acl;
+    return a ? kernel_acl_dac_permission(a->bytes+a->name_size,a->value_size,
+                         n->mode,n->uid,n->gid,cred,access) :
+        kernel_vfs_dac_permission(n->mode,n->uid,n->gid,access,cred);
 }
 static int exec_metadata(struct kernel_vfs_node *n,struct kernel_vfs_exec_metadata *out)
 {
@@ -229,7 +261,7 @@ static void remove_entry(struct tmp_mount *m, struct tmp_entry *e)
     dispose(m, e);
 }
 static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *path, uint32_t mode,
-                        const char *target, struct tmp_entry **out)
+                        const char *target, struct tmp_entry **out,uint32_t umask)
 {
     if (m->instance.read_only) return -KERNEL_EROFS;
     if (m->inode_limit && m->inode_count >= m->inode_limit) return -KERNEL_ENOSPC;
@@ -247,9 +279,31 @@ static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *
     r = allocate(m, sizeof(*i), (void **)&i);
     if (r) { dispose(m, e); return r; }
     kernel_vfs_creation_identity(parent->mode,parent->gid,&mode,&i->uid,&i->gid);
+    uint32_t type=mode & KERNEL_VFS_S_IFMT;
+    struct tmp_xattr *def=parent->default_acl;
+    if (type!=KERNEL_VFS_S_IFLNK && def) {
+        const char *names[2]={KERNEL_ACL_ACCESS,KERNEL_ACL_DEFAULT};
+        unsigned count=type==KERNEL_VFS_S_IFDIR ? 2U : 1U;
+        for (unsigned j=0;j<count && !r;j++) {
+            size_t namesize=strlen(names[j])+1;
+            struct tmp_xattr *candidate=NULL;
+            r=allocate(m,sizeof(*candidate)+namesize+def->value_size,(void **)&candidate);
+            if (r) break;
+            candidate->name_size=namesize;candidate->value_size=def->value_size;
+            memcpy(candidate->bytes,names[j],namesize);
+            memcpy(candidate->bytes+namesize,def->bytes+def->name_size,def->value_size);
+            int extended=j ? 1 : kernel_acl_create(candidate->bytes+namesize,def->value_size,&mode);
+            if (extended<0) {dispose(m,candidate);r=-KERNEL_EIO;break;}
+            if (extended) {
+                candidate->next=i->xattrs;i->xattrs=candidate;
+                if (j) i->default_acl=candidate;else i->access_acl=candidate;
+            }
+            else dispose(m,candidate);
+        }
+    } else if (type!=KERNEL_VFS_S_IFLNK) mode &= ~umask;
     i->mode = mode; i->parent = parent->number;
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->size = 2 * TMPFS_DIRENT_SIZE;
-    if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
+    if (!r && (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         if (kernel_memory_object_create(m->instance.heap, m->instance.heap->page_allocator,
                                         &i->memory) != KERNEL_MEMORY_OBJECT_OK) r = -KERNEL_ENOMEM;
         else kernel_memory_object_set_budget(i->memory, &m->pages);
@@ -282,6 +336,7 @@ static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *
         }
     }
     if (r || m->next_inode == UINT64_MAX) {
+        while (i->xattrs) remove_attribute(m,i,i->xattrs);
         if (!i->memory) dispose(m, i->target);
         if (i->memory) kernel_memory_object_release(&i->memory);
         dispose(m, i); dispose(m, e);
@@ -332,13 +387,13 @@ static int close_node(struct kernel_vfs_node *n)
     i->handles--; collect_inode(m, i); return 0;
 }
 static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode,
-                   struct kernel_vfs_file *file)
+                   struct kernel_vfs_file *file,uint32_t umask)
 {
     struct tmp_mount *m = tm(mount->private_data); struct tmp_entry *e;
     uint32_t type=mode & KERNEL_VFS_S_IFMT;
     if (!type) type=KERNEL_VFS_S_IFREG;
     if (type!=KERNEL_VFS_S_IFREG && type!=KERNEL_VFS_S_IFSOCK) return -KERNEL_ENOTSUP;
-    int r = create_child(m, parent_inode, path, type | (mode & 07777), 0, &e);
+    int r = create_child(m, parent_inode, path, type | (mode & 07777), 0, &e,umask);
     if (r) return r;
     struct tmp_inode *i = e->inode;
     r = open_inode(mount, 0, i->number, i->mode, file);
@@ -347,18 +402,18 @@ static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const c
     }
     return r;
 }
-static int mkdir(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode)
-{ return create_child(tm(mount->private_data), parent_inode, path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, 0); }
+static int mkdir(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode,uint32_t umask)
+{ return create_child(tm(mount->private_data), parent_inode, path, KERNEL_VFS_S_IFDIR | (mode & 07777), 0, 0,umask); }
 static int symlink(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path)
-{ return create_child(tm(instance), parent_inode, path, KERNEL_VFS_S_IFLNK | 0777, target, 0); }
+{ return create_child(tm(instance), parent_inode, path, KERNEL_VFS_S_IFLNK | 0777, target, 0,0); }
 static int mknod_node(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
-    uint32_t type, uint32_t mode, uint32_t device)
+    uint32_t type, uint32_t mode, uint32_t device,uint32_t umask)
 {
     if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO &&
         type != KERNEL_VFS_S_IFCHR && type != KERNEL_VFS_S_IFBLK &&
         type != KERNEL_VFS_S_IFSOCK) return -KERNEL_ENOTSUP;
     struct tmp_entry *created = 0;
-    int result = create_child(tm(instance), parent_inode, path, type | (mode & 07777), 0, &created);
+    int result = create_child(tm(instance), parent_inode, path, type | (mode & 07777), 0, &created,umask);
     if (!result && (type == KERNEL_VFS_S_IFCHR || type == KERNEL_VFS_S_IFBLK))
         created->inode->rdev = device;
     return result;
@@ -573,6 +628,11 @@ static int set_mode(struct kernel_vfs_file *f,uint32_t mode)
     if (n->instance->read_only) return -KERNEL_EROFS;
     int allowed=kernel_vfs_chmod_allowed(n->uid,n->gid,&mode); if (allowed) return allowed;
     struct tmp_inode *i = ti(n);
+    if (i->access_acl) {
+        struct tmp_xattr *a=i->access_acl;
+        int result=kernel_acl_chmod(a->bytes+a->name_size,a->value_size,mode);
+        if (result) return -KERNEL_EIO;
+    }
     i->mode = (i->mode & KERNEL_VFS_S_IFMT) | (mode & 07777);
     n->mode = f->mode = i->mode;
     struct kernel_vfs_timespec time=now();
@@ -689,6 +749,7 @@ static void initialize_ops(void)
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->killpriv=killpriv; o->writeback_allowed=no_writeback;
     o->flush=error; o->unmount=unmount; o->xattr=xattr_inode; o->exec_metadata=exec_metadata;
+    o->acl_permission=permission;
 }
 static int number(const char *p,size_t n,unsigned base,uint64_t *value)
 {

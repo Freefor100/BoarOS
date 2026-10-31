@@ -96,7 +96,7 @@ static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
     struct kernel_vfs_path *alias=0;
     assert(!kernel_vfs_path_resolve(root,root,"/FIRST/sub",1,&alias));
     assert(!kernel_vfs_rename_at(root,root,root,"/first/sub","/second/moved directory",0));
-    assert(!kernel_vfs_create_at(alias,root,"from-dir-fd",0666,&a) && !kernel_vfs_close(&a));
+    assert(!kernel_vfs_create_at(alias,root,"from-dir-fd",0666,&a,0) && !kernel_vfs_close(&a));
     assert(!kernel_vfs_unlink(mount,"/second/moved directory/from-dir-fd"));
     assert(!kernel_vfs_path_release(&alias));
     assert(kernel_vfs_rename_at(root,root,root,"/second","/second/moved directory/cycle",0)==-KERNEL_EINVAL);

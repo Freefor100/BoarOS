@@ -81,7 +81,7 @@ static void absent(struct kernel_vfs_mount *m, uint64_t parent, const char *name
     assert(ops(m)->lookup(instance(m), parent, name, strlen(name), &id, &mode) == -KERNEL_ENOENT);
 }
 static void regular(struct kernel_vfs_mount *m, uint64_t parent, const char *name)
-{ assert(!ops(m)->mknod(instance(m), parent, name, KERNEL_VFS_S_IFREG, 0600, 0)); }
+{ assert(!ops(m)->mknod(instance(m), parent, name, KERNEL_VFS_S_IFREG, 0600, 0,0)); }
 static struct kernel_vfs_stat stat_id(struct kernel_vfs_mount *m, uint64_t id)
 {
     struct kernel_vfs_file f = {0}; struct kernel_vfs_stat st;
@@ -110,7 +110,7 @@ static void mixed_directories(void)
     assert(!kernel_tmpfs_create(&heap, 0, "nr_inodes=0", &m));
     uint64_t dirs[DIRS], ids[DIRS][ENTRIES]; char path[64], name[32];
     for (unsigned d = 0; d < DIRS; d++) {
-        snprintf(path, sizeof(path), "/dir%02u", d); assert(!ops(m)->mkdir(m, 1, path + 1, 0755));
+        snprintf(path, sizeof(path), "/dir%02u", d); assert(!ops(m)->mkdir(m, 1, path + 1, 0755,0));
         dirs[d] = find(m, 1, path + 1, 0);
     }
     /* Interleave directories and permute lexical order, forcing both lookup
@@ -119,9 +119,9 @@ static void mixed_directories(void)
         unsigned key = (j * 73) % ENTRIES;
         snprintf(name, sizeof(name), "entry%03u%s", key, key & 1 ? "-tail" : "");
         snprintf(path, sizeof(path), "/dir%02u/%s", d, name);
-        if (key % 4 == 0) assert(!ops(m)->mkdir(m, dirs[d], name, 0700));
+        if (key % 4 == 0) assert(!ops(m)->mkdir(m, dirs[d], name, 0700,0));
         else if (key % 4 == 3) assert(!ops(m)->symlink(instance(m), dirs[d], "../target", name));
-        else assert(!ops(m)->mknod(instance(m), dirs[d], name, types[key % 4], 0600, 0));
+        else assert(!ops(m)->mknod(instance(m), dirs[d], name, types[key % 4], 0600, 0,0));
         uint32_t mode; ids[d][key] = find(m, dirs[d], name, &mode);
         assert((mode & KERNEL_VFS_S_IFMT) == types[key % 4]);
     }
@@ -171,7 +171,7 @@ static void mixed_directories(void)
 static void cookies_and_rename(void)
 {
     struct kernel_vfs_mount *m = 0; assert(!kernel_tmpfs_create(&heap, 0, 0, &m));
-    assert(!ops(m)->mkdir(m, 1, "left", 0755) && !ops(m)->mkdir(m, 1, "right", 0755));
+    assert(!ops(m)->mkdir(m, 1, "left", 0755,0) && !ops(m)->mkdir(m, 1, "right", 0755,0));
     uint64_t left = find(m, 1, "left", 0), right = find(m, 1, "right", 0);
     regular(m, left, "alpha"); regular(m, left, "beta"); regular(m, left, "gamma");
     uint64_t alpha = find(m, left, "alpha", 0), gamma = find(m, left, "gamma", 0);
@@ -196,14 +196,14 @@ static void cookies_and_rename(void)
     assert(result.changed && result.replaced_inode == alpha && result.replaced_last_link);
     struct kernel_vfs_stat st; assert(!ops(m)->stat(&saved, &st) && st.ino == alpha && !st.nlink);
     assert(find(m, left, "zeta", 0) == gamma); absent(m, right, "moved");
-    assert(!ops(m)->mkdir(m, left, "sub", 0755)); uint64_t sub = find(m, left, "sub", 0);
+    assert(!ops(m)->mkdir(m, left, "sub", 0755,0)); uint64_t sub = find(m, left, "sub", 0);
     result = (struct kernel_vfs_rename_result){0};
     assert(ops(m)->rename(instance(m), 1, "left", sub, "cycle", 0, &result) == -KERNEL_EINVAL);
     assert(!ops(m)->rename(instance(m), left, "sub", right, "sub", 0, &result));
     struct kernel_vfs_file child = {0}; open_id(m, sub, &child); uint64_t dotdot = 1;
     expect_entry(&child, &dotdot, "..", right); close_file(&child);
     assert(stat_id(m, left).nlink == 2 && stat_id(m, right).nlink == 3);
-    assert(!ops(m)->mkdir(m, right, "empty", 0755)); uint64_t replaced = find(m, right, "empty", 0);
+    assert(!ops(m)->mkdir(m, right, "empty", 0755,0)); uint64_t replaced = find(m, right, "empty", 0);
     result = (struct kernel_vfs_rename_result){0};
     assert(!ops(m)->rename(instance(m), right, "sub", right, "empty", 0, &result));
     assert(result.replaced_inode == replaced && result.replaced_last_link && find(m, right, "empty", 0) == sub);
@@ -221,7 +221,7 @@ static void rollback_and_budgets(void)
     for (unsigned phase = 1;; phase++) {
         kernel_heap_get_statistics(&heap, &before); struct kernel_vfs_file f = {0};
         fail_allocation = phase;
-        int status = ops(m)->create(m, 1, "failed", 0600, &f);
+        int status = ops(m)->create(m, 1, "failed", 0600, &f,0);
         if (!status) {
             fail_allocation = 0; close_file(&f); assert(!ops(m)->unlink(m, 1, "failed")); break;
         }
@@ -230,7 +230,7 @@ static void rollback_and_budgets(void)
         kernel_heap_get_statistics(&heap, &after); assert(after.live_allocations == before.live_allocations);
         assert(stat_id(m, 1).size == 40);
     }
-    struct kernel_vfs_file held = {0}; assert(!ops(m)->create(m, 1, "data", 0600, &held));
+    struct kernel_vfs_file held = {0}; assert(!ops(m)->create(m, 1, "data", 0600, &held,0));
     struct kernel_vfs_node *node = held.private_data;
     uint64_t address; int created;
     assert(!kernel_memory_object_get_page(node->memory, 0, &address, &created) && created);
@@ -275,7 +275,7 @@ static void cookie_exhaustion(void)
     struct kernel_vfs_rename_result result = {0};
     assert(ops(m)->rename(instance(m), 1, "old", 1, "destination", 0, &result) == -KERNEL_EOVERFLOW);
     assert(!result.changed && find(m, 1, "old", 0) == old && find(m, 1, "destination", 0) == destination);
-    assert(ops(m)->mknod(instance(m), 1, "new", KERNEL_VFS_S_IFREG, 0600, 0) == -KERNEL_EOVERFLOW);
+    assert(ops(m)->mknod(instance(m), 1, "new", KERNEL_VFS_S_IFREG, 0600, 0,0) == -KERNEL_EOVERFLOW);
     assert(ops(m)->link(instance(m), old, 1, "new") == -KERNEL_EOVERFLOW);
     assert(!ops(m)->unmount(m));
     puts("PASS tmpfs exhausted cookies reject create/link/rename without replacing names");
@@ -283,7 +283,7 @@ static void cookie_exhaustion(void)
 static void punch_boundaries(void)
 {
     struct kernel_vfs_mount *mount=0;assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=3",&mount));
-    struct kernel_vfs_file file={0};assert(!ops(mount)->create(mount,1,"punched",0600,&file));
+    struct kernel_vfs_file file={0};assert(!ops(mount)->create(mount,1,"punched",0600,&file,0));
     struct kernel_vfs_node *node=file.private_data;
     for(unsigned i=0;i<3;i++) {
         uint64_t page;int created;assert(!kernel_memory_object_get_page(node->memory,i,&page,&created)&&created);

@@ -308,12 +308,16 @@ FD接口持有实际OFD并操作同一inode，改名或unlink后仍可使用。O
 输入值先完整导入，输出在后端资格释放后复制；输入故障保留原属性，输出故障保留实际复制前缀。
 名称最多255字节，值与列表输出缓冲区最多64KiB；零长度列表查询返回实际所需容量。
 ext4还受inode内部及单个外部EA块的实际容量约束。
-CREATE／REPLACE检查与修改处于同一inode写资格，失败保留原值。
+普通属性的CREATE／REPLACE检查与修改处于同一inode写资格，失败保留原值。
 
 共同权限层使用当前fsuid/fsgid和capability：`user.*`检查对象读写权限及sticky目录所有者；
 `trusted.*`只向CAP_SYS_ADMIN调用者公开，列表先过滤再检查容量；`security.capability`
 按固定Linux的格式及CAP_SETFCAP规则设置，其余`security.*`修改要求CAP_SYS_ADMIN。
-只读挂载拒绝修改。ACL及其他`system.*`处理、匿名socketfs专属属性仍列后续。
+只读挂载拒绝修改。tmpfs和ext4支持`system.posix_acl_access`与
+`system.posix_acl_default`，按Linux ACL规则检查所有者、命名用户、所属组、掩码和其他用户；
+ACL修改要求文件所有者或CAP_FOWNER，默认ACL用于目录，ACL操作不采用CREATE／REPLACE语义。
+`chmod`同步更新访问ACL，新建对象按父目录默认ACL与请求mode确定权限；无默认ACL时才应用umask。
+其他`system.*`处理和匿名socketfs专属属性仍列后续。
 缺少属性后端的对象查询列表为空，其他操作返回该对象支持范围对应的错误。
 
 filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，其他有效rootid保留；
@@ -321,7 +325,9 @@ filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，�
 不把空值当成删除。tmpfs和ext4均把成功设置的原始属性交给exec；普通写入和chown等
 继续按原接口规则清除特权。实际存储与事务、缓存失效见[VFS与ext4](vfs-ext4.md)。
 
-短例入口为`sh tests/xattr-host.sh`和`tests/xattr.py`，使用同一ELF对照固定Linux。
+短例入口为`sh tests/xattr-host.sh`、`make test-posix-acl-host`、
+`make test-ext4-acl-xattr-host`和`python3 tests/network_runner.py --workload acl`；
+客机程序使用同一ELF对照固定Linux。
 
 
 `utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；显式时间要求所有者或 CAP_FOWNER，全部使用当前时间也允许具有写访问权限的调用者。
@@ -392,7 +398,8 @@ make test-riscv
 
 ## 节点创建
 
-`mknodat(33)` 复用 dirfd/cwd/root 路径快照，应用进程 umask 后调用 VFS。
+`mknodat(33)` 复用 dirfd/cwd/root 路径快照，将请求权限和 umask 交给 VFS；
+创建后端根据父目录默认 ACL 决定使用哪一者。
 当前交付普通文件（类型 0 或 S_IFREG）、字符设备（S_IFCHR）与块设备节点（S_IFBLK）；目录返回 EPERM，
 非法类型EINVAL；FIFO节点与传输已接入，socket节点仍返回ENOTSUP。块节点按 st_rdev 查找实际块设备，支持裸设备 OFD 与独占挂载；未知设备返回 ENXIO。设备号取 Linux
 32 位编码；任意字符设备号可存储，打开时既有 null/zero/console/random/urandom 及RTC后端可用，

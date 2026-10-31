@@ -54,7 +54,7 @@ int main(int argc, char **argv)
     struct kernel_vfs_file file = {0};
     const struct kernel_vfs_open_request request = {.flags = KERNEL_VFS_OPEN_FOLLOW};
     if (argc == 3) assert(!kernel_vfs_open_at(root, root, "timestamp", &request, &file, NULL));
-    else assert(!kernel_vfs_create_at(root, root, "timestamp", 0600, &file));
+    else assert(!kernel_vfs_create_at(root, root, "timestamp", 0600, &file,0));
     uint64_t observed_error = kernel_vfs_error_sequence(&file);
     const struct kernel_vfs_timespec explicit[2] = {{2000000100, 20}, {1999999900, 30}};
     assert(!kernel_vfs_file_set_times(&file, explicit));

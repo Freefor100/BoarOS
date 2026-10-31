@@ -296,7 +296,7 @@ static void rename_inode_case(struct lwext4_mount_adapter *adapter,struct kernel
 {
     for(unsigned abort=0;abort<2;abort++) {
         struct kernel_vfs_file file={0};size_t done;
-        assert(!kernel_vfs_create_at(root,root,"rename31-source",0600,&file));
+        assert(!kernel_vfs_create_at(root,root,"rename31-source",0600,&file,0));
         assert(!kernel_vfs_pwrite(&file,0,"original",8,&done) && done==8 &&
                !ext4_journal_group_drain(adapter->mount_point));
         struct kernel_vfs_stat before,after;
@@ -341,7 +341,7 @@ static void *namespace_reuse_loop(void *argument)
     for(unsigned round=1;round<=32;round++) {
         while(__atomic_load_n(&namespace_loop_gate,__ATOMIC_ACQUIRE)<round*2-1)sched_yield();
         struct kernel_vfs_file file={0};
-        assert(!kernel_vfs_create_at(actor->parent,actor->root,"looped",0600,&file) && !kernel_vfs_close(&file));
+        assert(!kernel_vfs_create_at(actor->parent,actor->root,"looped",0600,&file,0) && !kernel_vfs_close(&file));
         __atomic_store_n(&actor->progress,round*2-1,__ATOMIC_RELEASE);
         while(__atomic_load_n(&namespace_loop_gate,__ATOMIC_ACQUIRE)<round*2)sched_yield();
         assert(!kernel_vfs_unlink_at(actor->parent,actor->root,"looped",0));
@@ -415,7 +415,7 @@ int main(int argc,char **argv)
     char names[65][32];
     for(unsigned i=0;i<=groups;i++) {
         snprintf(names[i],sizeof(names[i]),"parallel-%u",i);
-        assert(!kernel_vfs_mkdir_at(root,root,names[i],0700));
+        assert(!kernel_vfs_mkdir_at(root,root,names[i],0700,0));
         assert(!kernel_vfs_path_lookup(root,names[i],strlen(names[i]),&directories[i]));count++;
         unsigned group=(kernel_vfs_path_inode(directories[i])-1)/per_group;
         if(first[group]!=UINT32_MAX && same[0]==UINT32_MAX) {same[0]=first[group];same[1]=i;}
@@ -442,8 +442,8 @@ int main(int argc,char **argv)
     orphan_snapshot_case(adapter,directories[same[0]],directories[same[1]],root);
     namespace_reuse_loop_case(adapter,directories[different[0]],directories[different[1]],root);
     struct kernel_vfs_file packed[2]={{0},{0}};
-    assert(!kernel_vfs_create_at(directories[0],root,"packed-a",0600,&packed[0]) &&
-           !kernel_vfs_create_at(directories[0],root,"packed-b",0600,&packed[1]));
+    assert(!kernel_vfs_create_at(directories[0],root,"packed-a",0600,&packed[0],0) &&
+           !kernel_vfs_create_at(directories[0],root,"packed-b",0600,&packed[1],0));
     uint64_t lbas[2];uint32_t offsets[2];
     for(unsigned i=0;i<2;i++)inode_location(adapter,kernel_vfs_file_inode(&packed[i]),&lbas[i],&offsets[i]);
     assert(lbas[0]==lbas[1] && offsets[0]!=offsets[1]);

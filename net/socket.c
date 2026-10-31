@@ -847,7 +847,7 @@ static int unix_path_resolve(const unsigned char *name,int create,struct kernel_
     struct kernel_task *task=kernel_task_current();
     if(!task || kernel_task_fs_context_borrow(task,&fs)!=KERNEL_TASK_STATUS_OK)return -KERNEL_ENOENT;
     KERNEL_FS_PATHS(paths,fs);
-    return create?kernel_vfs_socket_bind_at(paths.cwd,paths.root,(const char *)name,0777U & ~paths.umask,owner):
+    return create?kernel_vfs_socket_bind_at(paths.cwd,paths.root,(const char *)name,0777U,owner,paths.umask):
         kernel_vfs_socket_lookup_at(paths.cwd,paths.root,(const char *)name,owner);
 }
 static int unix_address_validate(const struct kernel_socket_address *address,int binding)

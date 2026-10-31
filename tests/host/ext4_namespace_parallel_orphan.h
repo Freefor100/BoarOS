@@ -7,7 +7,7 @@ static void orphan_normal_order_case(struct lwext4_mount_adapter *adapter,
     unsigned total=0;
     for(unsigned mapped=0;mapped<2;mapped++) {
         struct kernel_vfs_file file={0};
-        assert(!kernel_vfs_create_at(parent,root,"orphan-order",0600,&file) &&
+        assert(!kernel_vfs_create_at(parent,root,"orphan-order",0600,&file,0) &&
                !kernel_vfs_file_acquire_write(&file));
         uint32_t inode=kernel_vfs_file_inode(&file);
         if(mapped) {
@@ -83,7 +83,7 @@ static void *orphan_snapshot_modify(void *argument)
     struct orphan_snapshot_actor *actor=argument;
     mm_test_attach(actor->actor+9);mm_test_activate_task();kernel_cpu_current()->logical_id=actor->actor;
     orphan_snapshot_current=actor;
-    actor->result=actor->actor?kernel_vfs_create_at(actor->parent,actor->root,"after-gdt",0600,&actor->created):
+    actor->result=actor->actor?kernel_vfs_create_at(actor->parent,actor->root,"after-gdt",0600,&actor->created,0):
         kernel_vfs_unlink_at(actor->parent,actor->root,"orphan-victim",0);
     orphan_snapshot_current=NULL;
     __atomic_store_n(&actor->done,1,__ATOMIC_RELEASE);
@@ -94,7 +94,7 @@ static void orphan_snapshot_case(struct lwext4_mount_adapter *adapter,
 {
     struct ext4_fs *fs=adapter->device.fs;
     struct kernel_vfs_file file={0};
-    assert(!kernel_vfs_create_at(first,root,"orphan-victim",0600,&file));
+    assert(!kernel_vfs_create_at(first,root,"orphan-victim",0600,&file,0));
     unsigned per_group=ext4_get32(&fs->sb,inodes_per_group);
     uint32_t group=(kernel_vfs_file_inode(&file)-1)/per_group;
     assert(group==(kernel_vfs_path_inode(second)-1)/per_group && !kernel_vfs_close(&file));

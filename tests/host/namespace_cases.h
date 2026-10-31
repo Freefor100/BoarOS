@@ -79,7 +79,7 @@ static void *namespace_stat_thread(void *argument)
         const struct kernel_vfs_timespec times[2]={{1234,0},{2345,0}};
         assert(!kernel_vfs_file_set_times(request->file,times));
     } else if(request->writer) {
-        if(request->directory)assert(!kernel_vfs_mkdir_at(request->directory,request->directory,"child",0700));
+        if(request->directory)assert(!kernel_vfs_mkdir_at(request->directory,request->directory,"child",0700,0));
         else assert(!kernel_vfs_ftruncate(request->file,1));
         __atomic_store_n(&namespace_stat_written,1,__ATOMIC_RELEASE);
     } else {
@@ -118,7 +118,7 @@ static void namespace_directory_stat_qualification_case(struct kernel_heap *heap
     if (!((struct kernel_vfs_instance *)mount->private_data)->namespace_parallel) return;
     struct kernel_vfs_path *root=NULL,*directory=NULL;
     assert(!kernel_vfs_path_root(mount,heap,&root) &&
-           !kernel_vfs_mkdir_at(root,root,"namespace-directory-stat",0700) &&
+           !kernel_vfs_mkdir_at(root,root,"namespace-directory-stat",0700,0) &&
            !kernel_vfs_path_lookup(root,"namespace-directory-stat",24,&directory));
     for(unsigned setter=0;setter<3;setter++) {
         namespace_stat_node=directory->file.private_data;
@@ -765,7 +765,7 @@ static void namespace_walk_qualification_case(struct kernel_heap *heap,
     struct kernel_vfs_instance *instance=mount->private_data;
     unsigned ordinary_qualifications=instance->namespace_parallel?0:1;
     assert(!kernel_vfs_path_root(mount,heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-walk",0700));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-walk",0700,0));
     namespace_observed_lock=&instance->namespace_lock.lock;
     namespace_lock_acquisitions=0;
     assert(!kernel_vfs_open_at(root,root,"/namespace-walk/file",&request,&file,NULL));
@@ -794,7 +794,7 @@ static void namespace_walk_workspace_case(struct kernel_heap *heap,
 {
     struct kernel_vfs_path *root=NULL;struct kernel_vfs_file file={0};struct kernel_vfs_stat stat;
     assert(!kernel_vfs_path_root(mount,heap,&root));
-    assert(!kernel_vfs_create_at(root,root,"/namespace-workspace",0600,&file));
+    assert(!kernel_vfs_create_at(root,root,"/namespace-workspace",0600,&file,0));
     uint64_t inode=kernel_vfs_file_inode(&file);assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_symlink_at(root,root,"namespace-workspace","/namespace-expansion-a"));
     assert(!kernel_vfs_symlink_at(root,root,"namespace-expansion-a","/namespace-expansion-b"));
@@ -918,9 +918,9 @@ static void namespace_parent_snapshot_case(struct kernel_heap *heap,
     struct kernel_vfs_path *root=NULL,*child=NULL,*parent;
     struct kernel_vfs_file file={0};struct kernel_vfs_stat stat;
     assert(!kernel_vfs_path_root(mount,heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-old-parent",0700));
-    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-new-parent",0700));
-    assert(!kernel_vfs_create_at(root,root,"/namespace-old-parent/child",0600,&file));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-old-parent",0700,0));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-new-parent",0700,0));
+    assert(!kernel_vfs_create_at(root,root,"/namespace-old-parent/child",0600,&file,0));
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_path_resolve(root,root,"/namespace-old-parent/child",1,&child));
     parent=NULL;assert(!kernel_vfs_path_parent_pin(child,&parent)&&parent);
@@ -948,19 +948,19 @@ static void namespace_parent_case(struct kernel_heap *heap,
     struct kernel_vfs_path *root=NULL,*parent=NULL,*child=NULL;
     struct kernel_vfs_file file={0};struct kernel_vfs_stat stat;
     assert(!kernel_vfs_path_root(mount,heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-parent",02770));
+    assert(!kernel_vfs_mkdir_at(root,root,"/namespace-parent",02770,0));
     assert(!kernel_vfs_path_lookup(root,"namespace-parent",16,&parent));
     assert(kernel_vfs_unlink_at(root,root,"namespace-parent/.",0)==-KERNEL_EISDIR);
     assert(!kernel_vfs_rename_at(root,root,root,"/namespace-parent","/namespace-renamed",0));
     char basename[12];
     assert(!kernel_vfs_path_copy_name(parent,basename,sizeof(basename)) && !strcmp(basename,"namespace-r"));
     namespace_create_raw_reads=0;namespace_create_initial_watch=1;
-    assert(!kernel_vfs_create_at(parent,root,"data",0640,&file));
+    assert(!kernel_vfs_create_at(parent,root,"data",0640,&file,0));
     namespace_create_initial_watch=0;
     printf("create initial attributes: raw inode rereads=%u\n",namespace_create_raw_reads);
     assert(!namespace_create_raw_reads);
     assert(!kernel_vfs_close(&file));
-    assert(!kernel_vfs_mkdir_at(parent,root,"nested",0750));
+    assert(!kernel_vfs_mkdir_at(parent,root,"nested",0750,0));
     assert(!kernel_vfs_stat_at(parent,root,"nested",1,&stat) && (stat.mode&02000));
     assert(!kernel_vfs_symlink_at(parent,root,"data","alias"));
     char text[16];size_t count;
@@ -968,7 +968,7 @@ static void namespace_parent_case(struct kernel_heap *heap,
         count==4 && !memcmp(text,"data",4));
     assert(!kernel_vfs_path_lookup(parent,"data",4,&child));
     assert(!kernel_vfs_link_at(child,parent,root,"hard"));
-    assert(!kernel_vfs_mknod_at(parent,root,"fifo",KERNEL_VFS_S_IFIFO|0600,0));
+    assert(!kernel_vfs_mknod_at(parent,root,"fifo",KERNEL_VFS_S_IFIFO|0600,0,0));
     assert(!kernel_vfs_unlink_at(parent,root,"data",0));
     assert(!kernel_vfs_path_stat(child,&stat) && stat.nlink==1);
     assert(!kernel_vfs_path_release(&child));
@@ -981,7 +981,7 @@ static void namespace_parent_case(struct kernel_heap *heap,
     assert(!ext4_dir_entry_next_status(&iterator,&entry,&offset) && offset==UINT64_MAX && iterator.f.fsize>0);
     assert(!kernel_vfs_unlink_at(parent,root,"nested",1));
     assert(!kernel_vfs_unlink_at(root,root,"/namespace-renamed",1));
-    assert(kernel_vfs_create_at(parent,root,"gone",0600,&file)==-KERNEL_ENOENT);
+    assert(kernel_vfs_create_at(parent,root,"gone",0600,&file,0)==-KERNEL_ENOENT);
     assert(!kernel_vfs_path_release(&parent) && !kernel_vfs_path_release(&root));
     puts("PASS parent inode namespace: renamed dirfd, setgid, link/symlink/fifo, deletion and dead directory");
 }
@@ -1054,8 +1054,8 @@ static void namespace_publication_case(struct kernel_heap *heap,struct kernel_vf
     struct kernel_vfs_mount *child=NULL;
     struct kernel_fs_context fs={0};struct kernel_vfs_path *root=NULL,*covered=NULL,*renamed=NULL;
     assert(!kernel_vfs_path_root(mount,heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"publication-mount",0700) &&
-           !kernel_vfs_mkdir_at(root,root,"publication-a",0700));
+    assert(!kernel_vfs_mkdir_at(root,root,"publication-mount",0700,0) &&
+           !kernel_vfs_mkdir_at(root,root,"publication-a",0700,0));
     assert(!kernel_vfs_path_lookup(root,"publication-mount",17,&covered) &&
            !kernel_vfs_path_lookup(root,"publication-a",13,&renamed));
     assert(!kernel_fs_context_create(&fs,mount,heap) &&

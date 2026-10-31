@@ -241,7 +241,7 @@ enum kernel_files_status kernel_files_openat(
         return KERNEL_FILES_STATUS_OK;
     }
     struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW,
-        .mode=(uint32_t)(mode & ~fs_paths.umask)};
+        .mode=(uint32_t)mode,.umask=fs_paths.umask};
     if (!(flags & LINUX_O_PATH)) {
         request.access=(flags & 3U)==0 ? 4U : (flags & 3U)==1 ? 2U : 6U;
         if (flags & LINUX_O_TRUNC) request.access |= 2U;
@@ -851,18 +851,15 @@ enum kernel_files_status kernel_files_faccessat(
         return KERNEL_FILES_STATUS_OK;
     }
     if (!length && (flags & KERNEL_FILES_AT_EMPTY_PATH)) {
-        struct kernel_vfs_stat stat;
-        const struct kernel_vfs_mount *mount;
         if (dirfd == KERNEL_FS_AT_FDCWD) {
-            result=kernel_vfs_path_stat(fs_paths.cwd,&stat);
-            mount=kernel_vfs_path_mount(fs_paths.cwd);
+            result=kernel_vfs_access_at(fs_paths.cwd,fs_paths.root,".",(unsigned)mode,1);
         } else {
             struct kernel_open_file_description *file=
                 kernel_files_hold_fd(files,dirfd,&pin_guard);
+            struct kernel_vfs_stat stat;
             result=file ? stat_description(&stat,file) : -KERNEL_EBADF;
-            mount=file ? file->file.mount : NULL;
+            if (!result) result=kernel_vfs_file_access_check(&file->file,&stat,(unsigned)mode);
         }
-        if (!result) result=kernel_vfs_access_check(&stat,mount,(unsigned)mode);
     } else {
         result = kernel_files_path_start(files, &fs_paths, dirfd, path, &start);
         if (!result) result = kernel_vfs_access_at(start,
@@ -922,8 +919,7 @@ enum kernel_files_status kernel_files_mkdirat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_vfs_mkdir_at(start, fs_paths.root, path,
-                                 mode & ~kernel_fs_context_umask(fs));
+    result = kernel_vfs_mkdir_at(start,fs_paths.root,path,mode,kernel_fs_context_umask(fs));
     kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
@@ -978,8 +974,7 @@ enum kernel_files_status kernel_files_mknodat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_vfs_mknod_at(start, fs_paths.root, path,
-                                 mode & ~kernel_fs_context_umask(fs), device);
+    result = kernel_vfs_mknod_at(start,fs_paths.root,path,mode,device,kernel_fs_context_umask(fs));
     kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;

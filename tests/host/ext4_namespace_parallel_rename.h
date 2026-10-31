@@ -2,10 +2,10 @@
 static void rename_order_case(struct lwext4_mount_adapter *adapter,struct kernel_vfs_path *root)
 {
     struct kernel_vfs_file source={0},victim={0};
-    assert(!kernel_vfs_create_at(root,root,"rename-order-source",0600,&source) &&
-           !kernel_vfs_create_at(root,root,"rename-order-victim",0600,&victim));
-    assert(!kernel_vfs_mkdir_at(root,root,"rename-order-left",0700) &&
-           !kernel_vfs_mkdir_at(root,root,"rename-order-right",0700));
+    assert(!kernel_vfs_create_at(root,root,"rename-order-source",0600,&source,0) &&
+           !kernel_vfs_create_at(root,root,"rename-order-victim",0600,&victim,0));
+    assert(!kernel_vfs_mkdir_at(root,root,"rename-order-left",0700,0) &&
+           !kernel_vfs_mkdir_at(root,root,"rename-order-right",0700,0));
     struct kernel_vfs_path *parents[2]={NULL,NULL};
     assert(!kernel_vfs_path_lookup(root,"rename-order-left",17,&parents[0]) &&
            !kernel_vfs_path_lookup(root,"rename-order-right",18,&parents[1]));
@@ -67,7 +67,7 @@ static void rename_order_directory_case(struct lwext4_mount_adapter *adapter,
     struct kernel_vfs_path *paths[4]={0};
     const char *ordered_names[4];
     for(unsigned i=0;i<4;i++) {
-        assert(!kernel_vfs_mkdir_at(root,root,names[i],0700));
+        assert(!kernel_vfs_mkdir_at(root,root,names[i],0700,0));
         assert(!kernel_vfs_path_lookup(root,names[i],strlen(names[i]),&paths[i]));
         ordered_names[i]=names[i];
     }
