@@ -673,6 +673,7 @@ static int release_clone_resources(struct kernel_task *thread)
 {
     int cleanup_failed = 0;
     kernel_sem_exit(thread);
+    kernel_ioprio_exit(thread);
 
     if (kernel_signal_release_table(thread) !=
         KERNEL_SIGNAL_STATUS_OK) {
@@ -830,6 +831,9 @@ enum kernel_scheduler_status arch_process_clone_current(
     int sem_result=kernel_sem_clone(parent,child,(flags & UINT64_C(0x40000))!=0);
     if (sem_result)
         return finish_clone_failure(child,sem_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    int io_result=kernel_ioprio_clone(parent,child,(flags & UINT64_C(0x80000000))!=0);
+    if(io_result)
+        return finish_clone_failure(child,io_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->no_new_privs=parent->no_new_privs;
     child->arch.user_mode = 1U;
 #if BOAROS_USER_SMP
@@ -1729,6 +1733,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     cleanup_task_io_requests(thread);
+    kernel_ioprio_exit(thread);
     kernel_sem_exit(thread);
     kernel_posix_timers_exit(thread);
     kernel_signal_pending_cleanup(thread);

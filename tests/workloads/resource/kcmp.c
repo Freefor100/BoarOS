@@ -49,7 +49,7 @@ static long different(pid_t a,pid_t b,int type,unsigned long x,unsigned long y)
 static void self_abi(int fd)
 {
     pid_t me=getpid();
-    for(int type=VM_OBJECT;type<=SEM_OBJECT;type++)if(type!=IO_OBJECT)
+    for(int type=VM_OBJECT;type<=SEM_OBJECT;type++)
         CHECK(!compare(me,me,type,UINT64_MAX,UINT64_MAX));
     ERROR(compare(0,me,999,0,0),ESRCH);ERROR(compare(me,-1,FILE_OBJECT,-1UL,-1UL),ESRCH);
     ERROR(compare(me,me,999,0,0),EINVAL);ERROR(compare(me,me,-1,0,0),EINVAL);
@@ -57,7 +57,7 @@ static void self_abi(int fd)
     ERROR(compare(me,me,FILE_OBJECT,fd,UINT32_MAX),EBADF);
     CHECK(!compare(me,me,FILE_OBJECT,((unsigned long)1<<32)|(unsigned)fd,fd));
     CHECK(!compare(me,me,FILE_OBJECT,fd,((unsigned long)1<<32)|(unsigned)fd));
-    if(boaros){ERROR(compare(me,me,IO_OBJECT,0,0),EOPNOTSUPP);ERROR(compare(me,me,EPOLL_OBJECT,0,UINT64_MAX),EOPNOTSUPP);}
+    if(boaros)ERROR(compare(me,me,EPOLL_OBJECT,0,UINT64_MAX),EOPNOTSUPP);
     pass("abi-lookup-type-fd-width");
 }
 static void ofd(int fd)

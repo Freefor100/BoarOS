@@ -70,6 +70,8 @@ struct kernel_scheduler {
     struct kernel_stack_statistics stack_statistics;
 };
 struct signal_queue_record;
+int kernel_ioprio_clone(struct kernel_task *,struct kernel_task *,int);
+void kernel_ioprio_exit(struct kernel_task *);
 void signal_timer_notify(struct kernel_task *,unsigned);
 int signal_timer_post_locked(struct kernel_pid *,int,struct signal_queue_record *,struct kernel_wait_cursor *,struct kernel_task **);
 int signal_timer_disposition_ignored_locked(struct kernel_pid *,int,unsigned);

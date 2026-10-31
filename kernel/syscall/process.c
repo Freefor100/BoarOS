@@ -253,7 +253,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
 {
     uint64_t flags = request->arguments[0];
     const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x800) | UINT64_C(0x10000);
-    const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x1000) |
+    const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) |
         UINT64_C(0x100000) | UINT64_C(0x200000) | UINT64_C(0x400000) |
         UINT64_C(0x1000000);
@@ -278,7 +278,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x1000) |
+    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&
