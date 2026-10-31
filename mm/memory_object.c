@@ -37,6 +37,7 @@ struct kernel_memory_object {
     struct kernel_memory_object_page **buckets;
     size_t bucket_count;
     size_t page_count;
+    uint64_t mapping_size;
     uint32_t references;
 };
 
@@ -142,9 +143,23 @@ enum kernel_memory_object_status kernel_memory_object_create(
     result->heap = heap;
     result->allocator = allocator;
     result->bucket_count = SHARED_ANON_INITIAL_BUCKETS;
+    result->mapping_size = UINT64_MAX;
     result->references = 1U;
     *object = result;
     return KERNEL_MEMORY_OBJECT_OK;
+}
+
+void kernel_memory_object_set_mapping_size(struct kernel_memory_object *object, uint64_t size)
+{
+    if (!object || !size || object->mapping_size != UINT64_MAX ||
+        object->page_count || object->references != 1) __builtin_trap();
+    object->mapping_size = size;
+}
+
+int kernel_memory_object_contains_offset(const struct kernel_memory_object *object, uint64_t offset)
+{
+    if (!object) __builtin_trap();
+    return offset < object->mapping_size;
 }
 
 enum kernel_memory_object_status kernel_memory_object_acquire(

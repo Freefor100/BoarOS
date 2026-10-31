@@ -25,6 +25,7 @@ struct kernel_shm_table {
 };
 
 static struct kernel_shm_table shm_table;
+static uint64_t next_shm_file_identity = 1;
 
 static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_shmid64_ds *ds)
 {
@@ -217,6 +218,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
         return mem_status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM
                                                             : -KERNEL_ENOSPC;
     }
+    kernel_memory_object_set_mapping_size(mem, aligned_size);
 
     int32_t shmid = slot_idx + (int32_t)new_seg->seq * (int32_t)KERNEL_SHMMNI;
     new_seg->shmid = shmid;
@@ -351,12 +353,15 @@ static void attachment_valid(const struct kernel_shm_attachment *attachment)
 
 enum kernel_shm_status kernel_shm_attachment_create(
     struct kernel_shm_segment *segment, uint64_t start, uint64_t end,
+    const struct kernel_shm_attachment *source,
     struct kernel_shm_attachment **owner)
 {
     struct kernel_shm_attachment *attachment = 0;
     uintptr_t irq = arch_interrupt_save();
     if (!owner || *owner || !segment || !segment->active || !segment->memory ||
-        start >= end || segment->attachments == UINT32_MAX) __builtin_trap();
+        start >= end || segment->attachments == UINT32_MAX ||
+        (source && (source->segment != segment || !source->file_identity)) ||
+        (!source && !next_shm_file_identity)) __builtin_trap();
     enum kernel_heap_status status = kernel_heap_allocate_zeroed(
         shm_table.heap, 1, sizeof(*attachment), (void **)&attachment);
     if (status != KERNEL_HEAP_STATUS_OK) {
@@ -369,6 +374,7 @@ enum kernel_shm_status kernel_shm_attachment_create(
     *attachment = (struct kernel_shm_attachment){
         .heap = shm_table.heap, .segment = segment, .memory = segment->memory,
         .start = start, .end = end, .shmid = segment->shmid, .references = 1,
+        .file_identity = source ? source->file_identity : next_shm_file_identity++,
     };
     /* 预备 owner 也保住槽身份，但不伪增用户可见 nattch。 */
     segment->attachments++;

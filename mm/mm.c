@@ -2573,6 +2573,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
             return shared_status == KERNEL_MEMORY_OBJECT_NO_MEMORY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
+        kernel_memory_object_set_mapping_size(shared_object, aligned_length);
         enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
             record->vma_heap, 1U, sizeof(*shared_entry),
             (void **)&shared_entry);
@@ -3044,7 +3045,7 @@ enum kernel_mm_status kernel_mm_shmat(
     if (!may_map_memory(record, start, end, normalized, 1, flags & KERNEL_SHM_REMAP)) return KERNEL_MM_STATUS_NO_MEMORY;
     status = admit_mapping_lock(record, start, end, (flags & KERNEL_SHM_REMAP) ? KERNEL_MM_MAP_FIXED : 0);
     if (status) return status;
-    if (kernel_shm_attachment_create(segment, start, end, &attachment) !=
+    if (kernel_shm_attachment_create(segment, start, end, 0, &attachment) !=
             KERNEL_SHM_STATUS_OK) return KERNEL_MM_STATUS_NO_MEMORY;
 
     int already_tracked = 0;
@@ -3160,8 +3161,7 @@ enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
     KERNEL_SERVICE_SCOPE(service);
     KERNEL_NO_RECLAIM_IO;
     struct kernel_mm_record *record;
-    if (mm == 0 || (address & BOAROS_PAGE_MASK) ||
-        address < ARCH_MMU_PAGE_SIZE || address >= ARCH_MMU_USER_LIMIT)
+    if (mm == 0 || (address & BOAROS_PAGE_MASK) || address >= ARCH_MMU_USER_LIMIT)
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     enum kernel_mm_status status = mutable_vma_record(mm, &record);
     if (status != KERNEL_MM_STATUS_OK) return status;
@@ -3174,20 +3174,27 @@ enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
     for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas); i++) {
         if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
             __builtin_trap();
-        if (vma.shm_attachment && vma.shm_attachment->start == address) {
+        if (vma.shm_attachment && vma.start >= vma.backing_offset &&
+            vma.start - vma.backing_offset == address) {
             attachment = vma.shm_attachment;
             kernel_shm_attachment_acquire(attachment);
             break;
         }
     }
     if (!attachment) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
-    /* 起始页可以已被撤销；仅移除同一附件片段，不吞掉洞内的新映射。 */
+    uint64_t file_identity = attachment->file_identity;
+    uint64_t segment_size = attachment->segment->aligned_size;
+    int first = 1;
+    /* mremap 可产生多个附件；只撤同一 shmat 文件和偏移关系匹配的片段。 */
     for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas);) {
         if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
             __builtin_trap();
-        if (vma.shm_attachment != attachment) { i++; continue; }
+        if (vma.start < address || vma.start - address != vma.backing_offset ||
+            !vma.shm_attachment || vma.shm_attachment->file_identity != file_identity ||
+            (!first && vma.end - address > segment_size)) { i++; continue; }
         status = mm_munmap_impl(mm, vma.start, vma.end - vma.start);
         if (status != KERNEL_MM_STATUS_OK) return status;
+        first = 0;
         i = 0; /* 后备清理可睡眠，重取集合而不保存数组下标。 */
     }
     return KERNEL_MM_STATUS_OK;
@@ -4006,7 +4013,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         if (new_address > ARCH_MMU_USER_LIMIT - new_size ||
             (new_address & BOAROS_PAGE_MASK) || !(flags & 1U) ||
             ((flags & 4U) && old_size != new_size)) return -KERNEL_EINVAL;
-        if (old_size && old_address < new_address + new_size &&
+        if (old_address < new_address + new_size &&
             (old_address > UINT64_MAX - old_size || new_address < old_address + old_size))
             return -KERNEL_EINVAL;
     }
@@ -4014,9 +4021,11 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
     uint64_t tail_length = new_size < old_size && old_address < ARCH_MMU_USER_LIMIT &&
         old_size <= ARCH_MMU_USER_LIMIT - old_address ? old_size - new_size : 0;
+    int preserve = !old_size || (flags & 4U);
     enum kernel_mm_status status = mm_ranges_operation_begin(mm, new_address,
-        (flags & 2U) ? new_size : 0, tail_length ? old_address + new_size : 0,
-        tail_length, &operation, &service);
+        (flags & 2U) ? new_size : 0,
+        preserve ? old_address : tail_length ? old_address + new_size : 0,
+        preserve ? BOAROS_PAGE_SIZE : tail_length, &operation, &service);
     if (status) return status == KERNEL_MM_STATUS_CONFLICT ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
     struct kernel_mm_record *record;
     if (mutable_vma_record(mm, &record)) return -KERNEL_ENOMEM;
@@ -4041,9 +4050,8 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         }
         return -KERNEL_EFAULT;
     }
-    if (flags & 4U) return -KERNEL_EOPNOTSUPP;
-    if (!old_size) return (flags & 1U) ? -KERNEL_EOPNOTSUPP : -KERNEL_ENOMEM;
-    if (!(flags & 2U) && new_size <= old_size) {
+    if (!old_size && !(flags & 1U)) return -KERNEL_ENOMEM;
+    if (!(flags & 6U) && old_size && new_size <= old_size) {
         if (new_size < old_size) {
             status = mm_munmap_impl(mm, old_address + new_size, old_size - new_size);
             if (status) return status == KERNEL_MM_STATUS_INVALID_ARGUMENT ? -KERNEL_EINVAL : -KERNEL_ENOMEM;
@@ -4057,19 +4065,24 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         return -KERNEL_EAGAIN;
     if (!(flags & 2U)) {
         int overlaps = 1;
-        if (old_address <= ARCH_MMU_USER_LIMIT - new_size &&
+        if ((flags & 4U) && new_address >= BOAROS_PAGE_SIZE &&
+            kernel_vma_set_overlaps(record->vmas, new_address,
+                new_address + new_size, &overlaps)) __builtin_trap();
+        if (!(flags & 4U) && old_size && old_address <= ARCH_MMU_USER_LIMIT - new_size &&
             old_address + old_size == source.end &&
             kernel_vma_set_overlaps(record->vmas, source.end,
                 old_address + new_size, &overlaps)) __builtin_trap();
-        if (!overlaps) new_address = old_address;
-        else {
+        if (!overlaps) {
+            if (!(flags & 4U)) new_address = old_address;
+        } else {
             if (!(flags & 1U)) return -KERNEL_ENOMEM;
             enum kernel_vma_status vs = kernel_vma_set_find_topdown_gap(record->vmas,
                 0, BOAROS_PAGE_SIZE, record->mmap_base, new_size, &new_address);
             if (vs) return -KERNEL_ENOMEM;
         }
     }
-    if (source.role != KERNEL_VMA_ROLE_MMAP || source.kind == KERNEL_VMA_KIND_SYSV_SHM ||
+    if ((source.role != KERNEL_VMA_ROLE_MMAP &&
+         !(preserve && source.role == KERNEL_VMA_ROLE_SYSV_SHM)) ||
         source.kind == KERNEL_VMA_KIND_ELF_PRIVATE) return -KERNEL_EOPNOTSUPP;
     uint64_t offset = source.kind == KERNEL_VMA_KIND_ANONYMOUS ? 0 :
         source.backing_offset + old_address - source.start;
@@ -4087,14 +4100,29 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         }
         if (kernel_vma_set_lookup(record->vmas, old_address, &source)) return -KERNEL_EFAULT;
     }
+    if ((flags & 4U) && !may_expand_current(record, &source, new_size))
+        return -KERNEL_ENOMEM;
     struct kernel_vma replacement = source;
     replacement.start = new_address;
     replacement.end = new_address + new_size;
     replacement.backing_offset = offset;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
+    if (source.kind == KERNEL_VMA_KIND_SYSV_SHM) {
+        if (kernel_shm_attachment_create(source.shm_attachment->segment,
+                new_address, new_address + new_size, source.shm_attachment,
+                &attachment) != KERNEL_SHM_STATUS_OK)
+            return -KERNEL_ENOMEM;
+        replacement.shm_attachment = attachment;
+    }
     struct kernel_vma_remap edit;
-    if (kernel_vma_set_prepare_remap(record->vmas, old_address, old_address + old_size,
-        &replacement, &edit)) return -KERNEL_ENOMEM;
-    if (new_address != old_address) {
+    enum kernel_vma_status prepared = preserve ?
+        kernel_vma_set_prepare_duplicate(record->vmas, old_address, old_address + old_size,
+            &replacement, (flags & 4U) && (source.flags & KERNEL_VMA_LOCK_MASK), &edit) :
+        kernel_vma_set_prepare_remap(record->vmas, old_address, old_address + old_size,
+            &replacement, &edit);
+    if (prepared) return -KERNEL_ENOMEM;
+    if (old_size && new_address != old_address) {
         if (current_pins(mm)) return -KERNEL_EAGAIN;
         close_pins(&operation, 0);
         int error = prepare_remap_tables(record, old_address, old_size, new_address);
@@ -4479,6 +4507,8 @@ lookup:
     int created = 0;
     enum kernel_mm_status status = KERNEL_MM_STATUS_OK;
     address &= ~BOAROS_PAGE_MASK;
+    if (object && !kernel_memory_object_contains_offset(object,
+            vma.backing_offset + address - vma.start)) return KERNEL_MM_STATUS_BUS_FAULT;
     uint64_t generation = kernel_vma_set_generation(record->vmas), cookie = 0, old = 0, object_epoch = 0;
     uint64_t replacement = KERNEL_MM_NO_PAGE;
     uint64_t shared_preparation = KERNEL_MM_NO_PAGE;
