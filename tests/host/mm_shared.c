@@ -223,6 +223,50 @@ static void concurrent_disjoint_anon(void)
     assert(kernel_mm_lookup(&parent, addr1, &m) == KERNEL_MM_STATUS_NOT_MAPPED);
     assert(kernel_mm_lookup(&parent, addr2, &m) == KERNEL_MM_STATUS_NOT_MAPPED);
 }
+struct mlock_worker_arg {
+    unsigned id;
+    uint64_t addr;
+    volatile int ready;
+    volatile int go;
+    int mlock_status;
+    int munlock_status;
+};
+static void *disjoint_mlock_worker(void *arg_ptr)
+{
+    struct mlock_worker_arg *arg = arg_ptr;
+    mm_test_attach(arg->id);
+    mm_test_context = roots[arg->id];
+    __atomic_store_n(&arg->ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&arg->go, __ATOMIC_ACQUIRE)) sched_yield();
+    arg->mlock_status = kernel_mm_mlock(&parent, arg->addr, 2 * BOAROS_PAGE_SIZE, 0);
+    arg->munlock_status = kernel_mm_munlock(&parent, arg->addr, 2 * BOAROS_PAGE_SIZE);
+    return 0;
+}
+static void concurrent_disjoint_mlock(void)
+{
+    uint64_t addr1 = 0, addr2 = 0;
+    mm_test_context = roots[1];
+    assert(!kernel_mm_mmap_anonymous(&parent, 0, 2 * BOAROS_PAGE_SIZE, RW, 0, &addr1));
+    mm_test_context = roots[3];
+    assert(!kernel_mm_mmap_anonymous(&parent, 0, 2 * BOAROS_PAGE_SIZE, RW, 0, &addr2));
+    assert(addr1 != 0 && addr2 != 0 && addr1 != addr2);
+
+    struct mlock_worker_arg w1 = {.id = 1, .addr = addr1};
+    struct mlock_worker_arg w2 = {.id = 3, .addr = addr2};
+    pthread_t t1, t2;
+    assert(!pthread_create(&t1, 0, disjoint_mlock_worker, &w1));
+    assert(!pthread_create(&t2, 0, disjoint_mlock_worker, &w2));
+    while (!__atomic_load_n(&w1.ready, __ATOMIC_ACQUIRE) ||
+           !__atomic_load_n(&w2.ready, __ATOMIC_ACQUIRE)) sched_yield();
+    __atomic_store_n(&w1.go, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&w2.go, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(t1, 0) && !pthread_join(t2, 0));
+    assert(w1.mlock_status == 0 && w1.munlock_status == 0);
+    assert(w2.mlock_status == 0 && w2.munlock_status == 0);
+
+    assert(!kernel_mm_munmap(&parent, addr1, 2 * BOAROS_PAGE_SIZE));
+    assert(!kernel_mm_munmap(&parent, addr2, 2 * BOAROS_PAGE_SIZE));
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -254,6 +298,7 @@ int main(void)
     write_byte(&parent,PRIVATE,77); mm_test_context=roots[2]; assert(read_byte(&child,PRIVATE)==31); mm_test_context=roots[1];
     stale(0); stale(1); oom(); retire();
     concurrent_disjoint_anon();
+    concurrent_disjoint_mlock();
     mm_test_context=0; /* 末次销毁前切回可信内核地址空间。 */
     for(unsigned i=1;i<=4;i++) assert(!kernel_mm_release(&views[i]));
     assert(!kernel_mm_release(&child) && !kernel_mm_release(&parent));
