@@ -235,9 +235,9 @@ commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引�
 
 每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及进程资源限制。每个用户任务持有一个含 Linux 16 项限额的 `kernel_resource_limits` 引用；组内线程共享记录，普通 fork 在调度域下复制取值，exec 和非组长 exec 保留该记录。最后任务存储引用回收时在锁外释放，内核 worker 不分配限额记录。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
-普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
+普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 共享 MM 和 disposition，files 与 fs 分别按 CLONE_FILES、CLONE_FS 选择共享或复制；跨线程组的 clone 也可独立选择共享 MM、files 和 fs。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 
-同组 fd 变更立即可见。阻塞 read/write/writev 在睡眠期间持有 OFD 引用；即使其他线程 close/dup 替换槽位，也不能提前回收正在使用的端点。退出请求必须使调用栈完成清理，不能直接释放阻塞任务页。
+共享文件表的任务立即看到 fd 变更；复制文件表后各自维护槽位，原有 OFD 及 offset 仍共享。阻塞 read/write/writev 在睡眠期间持有 OFD 引用；即使其他线程 close/dup 替换槽位，也不能提前回收正在使用的端点。退出请求必须使调用栈完成清理，不能直接释放阻塞任务页。
 
 ## 会话与进程组
 
@@ -257,11 +257,11 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
 `make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 
-RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持普通 SIGCHLD fork/vfork（可指定CLONE_FS共享cwd/root、CHILD_SETTID/CHILD_CLEARTID管理子进程TID，或CLONE_SYSVSEM共享独立撤销组），以及共享VM/FS/FILES/SIGHAND/THREAD的线程组合和SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID/SYSVSEM/DETACHED标志。CLONE_SYSVSEM具有实际引用与最后共享者退出补偿，机制见[SysV信号量](sysv-sem.md)。非法依赖及NEWIPC与SYSVSEM冲突返回EINVAL，其他尚未支持的合法资源组合返回ENOTSUP。
+RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持 SIGCHLD 进程的 CLONE_VM、CLONE_FILES、CLONE_FS 组合，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。已有 CHILD_SETTID/CHILD_CLEARTID、线程 SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 规则继续适用。CLONE_SYSVSEM具有实际引用与最后共享者退出补偿，机制见[SysV信号量](sysv-sem.md)。非法依赖及NEWIPC与SYSVSEM冲突返回EINVAL，其他尚未支持的合法资源组合返回ENOTSUP。
 
 子线程继承完整 FP、整数现场和 mask；a0 为 0，PC 越过 ecall，非零 child_stack 替换 sp，SETTLS 设置 tp。CHILD_SETTID 在子任务首次返回用户态前、子 MM 激活后写入，因此可正常处理 COW 和缺页；PARENT_SETTID 仍在父任务发布 clone 时写入。SETTID 用户存储失败不回滚已经创建的任务，与固定 Linux clone 路径一致。所有内核分配失败都在发布前回滚；若回滚触及真实 VFS/block I/O owner，则由所属文件或 mount 记录，物理页和堆释放不另建重试状态；不会发布半构造子进程。
 
-vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。父线程和具体子进程保持双向完成关联；子进程释放共享 MM 引用后一次性完成等待。普通信号不解除等待。组退出/exec 的致命取消先断开双向关联，再唤醒父线程；子进程自己的 MM 引用仍有效，之后完成也不能访问已释放父任务。
+vfork 共享 MM；files、fs 及 disposition 分别按 CLONE_FILES、CLONE_FS 和 CLONE_SIGHAND 选择共享或复制。父线程和具体子进程保持双向完成关联；子进程释放共享 MM 引用后一次性完成等待。普通信号不解除等待。组退出/exec 的致命取消先断开双向关联，再唤醒父线程；子进程自己的 MM 引用仍有效，之后完成也不能访问已释放父任务。
 
 跨核软件事件发布与硬件IPI发送分开：发送者以release原子操作合入事件位，
 同类事件已经待处理时复用现有通知；接收者以原子交换取走事件后，新发布重新请求IPI。

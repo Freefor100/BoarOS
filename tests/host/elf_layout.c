@@ -8,6 +8,7 @@
 #include <kernel/errno.h>
 #include <kernel/open_file.h>
 #include <kernel/tmpfs.h>
+#include <kernel/task_state.h>
 #include "../../kernel/exec_internal.h"
 #include "../../fs/open_file_internal.h"
 #include <assert.h>
@@ -21,6 +22,19 @@ static struct physical_page_allocator pages;
 static struct kernel_heap heap;
 static struct arch_mmu_page_table kernel;
 static unsigned close_failures;
+static struct kernel_task files_closer;
+static unsigned files_cleanup_failures;
+enum kernel_files_status kernel_files_release_for_task(struct kernel_files *files,
+                                                        struct kernel_task *task)
+{
+    assert(task==&files_closer);
+    if (files_cleanup_failures) {
+        files_cleanup_failures--;files->state=KERNEL_FILES_CLEANUP;
+        return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+    }
+    assert(files->state==KERNEL_FILES_CLEANUP);
+    files->state=KERNEL_FILES_RELEASED;return KERNEL_FILES_STATUS_OK;
+}
 void kernel_task_account_read(uint64_t bytes) { (void)bytes;abort(); }
 void kernel_task_account_write(uint64_t bytes) { (void)bytes;abort(); }
 void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
@@ -137,6 +151,9 @@ static void cleanup_transaction(void)
     assert(!kernel_open_file_create_mode(&heap,mount,"/image",0700,&file,&error) && !error);
     assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&written) && written==sizeof(bytes));
     struct kernel_exec_transaction transaction={.heap=&heap,.state=KERNEL_EXEC_TRANSACTION_PREPARING};
+    transaction.retired_files.state=KERNEL_FILES_LIVE;
+    transaction.files_closer=&files_closer;
+    files_cleanup_failures=1;
     assert(!kernel_elf64_source_create(&heap,&file,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,
         &transaction.executable_source) && !file);
     assert(!kernel_open_file_create_mode(&heap,mount,"/other-owner",0700,
@@ -156,12 +173,14 @@ static void cleanup_transaction(void)
     close_failures=3;
     assert(kernel_exec_transaction_cleanup(&transaction)==KERNEL_EXEC_STATUS_CLEANUP_REQUIRED);
     assert(!close_failures && transaction.executable_source && transaction.interpreter_file && transaction.path_file);
+    assert(transaction.retired_files.state==KERNEL_FILES_CLEANUP);
     assert(transaction.image.mm.state==KERNEL_MM_RELEASED);
     assert(!transaction.original_path && !transaction.string_bytes &&
         !transaction.arguments && !transaction.environment);
     assert(!kernel_exec_transaction_cleanup(&transaction));
     assert(transaction.state==KERNEL_EXEC_TRANSACTION_EMPTY_CLEANUP &&
         !transaction.executable_source && !transaction.interpreter_file && !transaction.path_file);
+    assert(transaction.retired_files.state==KERNEL_FILES_RELEASED);
     assert(!kernel_exec_transaction_cleanup(&transaction));
     assert(!kernel_vfs_unmount(mount));
     struct kernel_heap_statistics stats;

@@ -112,10 +112,27 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     thread->fork_no_exec = 0U;
-    /* The prepared image is committed, but the old MM remains owned by
-     * this task until the transaction takes it. Use the TID from before
-     * a non-leader exec adopted the group leader's identity. */
+    /* The caller may have adopted the leader's TID. Release robust owners
+     * under their old TID before any later allocation can fail. */
     kernel_futex_release_robust(thread, old_tid);
+    enum kernel_signal_status signal_status=kernel_signal_unshare_for_exec(thread);
+    if (signal_status != KERNEL_SIGNAL_STATUS_OK)
+        kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,UINT64_C(0x45584543),signal_status);
+    if (kernel_files_is_shared(&thread->files)) {
+        /* A process outside this thread group may retain the old table. */
+        transaction->files_closer=thread;
+        files_status=kernel_files_fork(&transaction->prepared_files,&thread->files);
+        if (files_status != KERNEL_FILES_STATUS_OK)
+            kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,UINT64_C(0x45584543),files_status);
+        {
+            KERNEL_RAW_SCOPE(access,&thread->files_access);
+            transaction->retired_files=thread->files;
+            thread->files=transaction->prepared_files;
+            transaction->prepared_files=(struct kernel_files){0};
+        }
+    }
+    /* Keep the old MM user registered through the allocations above so an
+     * exec failure can remove that user through the normal exit path. */
     kernel_futex_release_mm(thread);
     /* 身份/MM 发布前撤下 CLOEXEC 槽；保留清理 owner 处理后端释放失败。 */
     files_status = kernel_files_close_on_exec(&thread->files);
@@ -153,6 +170,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     transaction->state = KERNEL_EXEC_TRANSACTION_COMMITTED_CLEANUP;
 
     exec_status = kernel_exec_transaction_cleanup(transaction);
+    /* The parent needs the shared MM back, not completion of unrelated
+     * executable or descriptor cleanup that may have to be retried. */
+    if (transaction->retired_mm.state == KERNEL_MM_RELEASED)
+        process_complete_vfork(thread);
     if (exec_status == KERNEL_EXEC_STATUS_OK) {
         (void)kernel_task_exec_finish(thread, transaction);
     } else if (exec_status != KERNEL_EXEC_STATUS_CLEANUP_REQUIRED) {
