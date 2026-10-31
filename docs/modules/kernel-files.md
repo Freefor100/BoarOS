@@ -10,7 +10,7 @@
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
 - pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有16个片段槽、按需分配的单页后备、端点引用和等待队列。metadata raw 保护 ring、端点、代次与 readiness；用户复制、缺页和通知在 raw 外执行。关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格。核心分别返回接纳前缀和断端事实，SIGPIPE/重启由真实用户调用层处理。受控任务创建仍检查当前支持的消费者；这项检查不切换 pipe 同步方式；复制资格与页归还规则见下文 [pipe2](#pipe2-与-fifo-endpoint)。
 - socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
-- `kernel_fs_context` 在共同 VFS 状态短保护下读取和交换 umask，并为使用者生成带独立引用的 root/cwd 快照；cwd 替换、记录共享、移动和退出使用同一保护。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
+- `kernel_fs_context` 在共同 VFS 状态短保护下读取和交换 umask，并为使用者生成带独立引用的 root/cwd 快照；cwd 替换、记录共享、移动和退出使用同一保护。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/chroot/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
 用它把文件生命周期从 fd 槽中分离：映射成功后 MM 消耗该引用，之后即使所有 fd 都关闭，
@@ -98,7 +98,9 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 该标志行为依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/include/linux/fcntl.h`、`references/linux/fs/open.c` 与 `references/linux/fs/fcntl.c`。固定 musl 1.2.5（`references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`）的 `src/dirent/opendir.c` 使用 `O_RDONLY|O_DIRECTORY|O_CLOEXEC`，不依赖 `O_NONBLOCK`；因此本改动不把 musl `opendir` 作为新增能力。
 
-`getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
+`chroot` 按最终目录检查类型、搜索权限和 `CAP_SYS_CHROOT`，在共同短保护内替换 root 引用，保留 cwd。fork复制记录，CLONE_FS共享记录中的 root/cwd；已有 dirfd 和 OFD 保持原对象及已打开权利，绝对路径与后续解释器从新root开始解析。
+
+`getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 
 `renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。后端操作事务成功接受后发布内存目录项变化，异步 journal mount 的持久化由组提交及目录同步保证；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
 
@@ -279,7 +281,7 @@ linkat和readlinkat使用原身份，NOFOLLOW可持有链接自身。数据、se
 直接fd改权/所有权/时间与同步入口先返回EBADF；网络ioctl/socket入口同样先检查资格。
 poll显示POLLNVAL；select按固定Linux的POLLIN/OUT/EX_SET将它映射到所请求的集合，
 不把有效路径fd误当成已经关闭的fd。
-unlink/rename及同名重建不会替换句柄身份。execveat、openat2仍未交付。
+unlink/rename及同名重建不会替换句柄身份。execveat以实际OFD/path重新检查执行权限，复用现有exec事务，见[执行模块](kernel-exec.md)；openat2仍未交付。
 `make build/diff-abi/path-rv`配`tests/diff-abi/path-cases.txt`可聚焦差分；完整ABI仍包含同一记录。
 `O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。
 固定 Linux

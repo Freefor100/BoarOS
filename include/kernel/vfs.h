@@ -68,6 +68,9 @@ struct kernel_vfs_mount {
  * 最后 view 归还只排队，reap 在所有 VFS/MM 资格释放后于 CPU0 执行。 */
 void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount);
 int kernel_vfs_bind_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target, int recursive);
+/* Transfer the attached source view and its children; existing owners retain
+ * their exact mount and inode identities. Both input paths remain borrowed. */
+int kernel_vfs_move_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target);
 int kernel_vfs_umount(struct kernel_vfs_path *root, unsigned flags);
 /* User-return/exit drains fresh retirements; explicit cleanup also retries failures. */
 int kernel_vfs_reap_mounts(void);
@@ -128,6 +131,7 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner);
 uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path);
+int kernel_vfs_path_is_mount_root(const struct kernel_vfs_path *path);
 int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
     struct kernel_vfs_size_limit *limit);
 uint32_t kernel_vfs_path_mode(const struct kernel_vfs_path *path);
@@ -160,9 +164,19 @@ struct kernel_vfs_file {
  * Absolute paths start at root. */
 int kernel_vfs_path_open(struct kernel_vfs_path *path,
                          struct kernel_vfs_file *file);
+/* Reopen this exact path as executable, checking current permissions and
+ * retaining its mount view and an independent executable lease on success. */
+int kernel_vfs_path_open_executable(struct kernel_vfs_path *path,
+                                    struct kernel_vfs_file *file);
 int kernel_vfs_path_string(const struct kernel_vfs_path *path,
                            const struct kernel_vfs_path *root,
                            char *buffer, size_t capacity);
+/* getcwd additionally reports a connected cwd outside root as (unreachable). */
+int kernel_vfs_path_cwd_string(const struct kernel_vfs_path *path,
+                               const struct kernel_vfs_path *root,
+                               char *buffer, size_t capacity);
+/* proc display keeps an absolute name outside root or in a detached view,
+ * and appends (deleted) when the held entry has been removed. */
 int kernel_vfs_path_link_string(const struct kernel_vfs_path *path,
                                 const struct kernel_vfs_path *root,
                                 char *buffer, size_t capacity);

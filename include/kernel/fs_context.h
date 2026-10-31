@@ -77,6 +77,8 @@ int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
                                     uint32_t requested, uint32_t *previous);
 int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
                               struct kernel_vfs_path *path);
+int kernel_fs_context_set_root(const struct kernel_fs_context *fs,
+                               struct kernel_vfs_path *path);
 
 /* Legacy kernel pathname adapter for an existing object (root boot).
  * User operations use owned root/cwd snapshots and VFS *at APIs directly.

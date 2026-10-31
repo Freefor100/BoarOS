@@ -1047,9 +1047,9 @@ enum kernel_files_status kernel_files_unlinkat(
     return KERNEL_FILES_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_chdir(
+static enum kernel_files_status change_directory_path(
     struct kernel_files *files, const struct kernel_fs_context *fs,
-    struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result)
+    struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result, int root)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     char *path;
@@ -1074,11 +1074,26 @@ enum kernel_files_status kernel_files_chdir(
     }
     if (!result) result = kernel_vfs_path_resolve(start,
                             fs_paths.root, path, 1, &resolved);
-    if (!result) result = kernel_fs_context_set_cwd(fs, resolved);
+    if (!result) result = root ? kernel_fs_context_set_root(fs, resolved)
+                              : kernel_fs_context_set_cwd(fs, resolved);
     if (resolved) (void)kernel_vfs_path_release(&resolved);
     kernel_files_release_allocation(files, path);
     *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_chdir(struct kernel_files *files,
+    const struct kernel_fs_context *fs, struct kernel_mm *mm,
+    uint64_t user_path, int64_t *linux_result)
+{
+    return change_directory_path(files, fs, mm, user_path, linux_result, 0);
+}
+
+enum kernel_files_status kernel_files_chroot(struct kernel_files *files,
+    const struct kernel_fs_context *fs, struct kernel_mm *mm,
+    uint64_t user_path, int64_t *linux_result)
+{
+    return change_directory_path(files, fs, mm, user_path, linux_result, 1);
 }
 
 enum kernel_files_status kernel_files_fchdir(
@@ -1112,7 +1127,7 @@ enum kernel_files_status kernel_files_getcwd(
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_FILES_STATUS_OK;
     }
-    int result = kernel_vfs_path_string(fs_paths.cwd,
+    int result = kernel_vfs_path_cwd_string(fs_paths.cwd,
                          fs_paths.root, path, KERNEL_FS_PATH_MAX);
     if (result == -KERNEL_ERANGE) result = -KERNEL_ENAMETOOLONG;
     size_t length = result ? 0U : strlen(path) + 1U;

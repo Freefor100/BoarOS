@@ -38,6 +38,8 @@ struct kernel_exec_transaction {
     /* Until source creation succeeds, these are the retryable OFD owners. */
     struct kernel_open_file_description *executable_file;
     struct kernel_open_file_description *interpreter_file;
+    /* A dirfd pin remains retryable if its final backend close fails. */
+    struct kernel_open_file_description *path_file;
     struct kernel_elf64_source *executable_source;
     struct kernel_elf64_source *interpreter_source;
     struct kernel_exec_image image;

@@ -183,6 +183,9 @@ enum kernel_files_status kernel_files_fstatfs(
 enum kernel_files_status kernel_files_chdir(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result);
+enum kernel_files_status kernel_files_chroot(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result);
 enum kernel_files_status kernel_files_fchdir(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     int64_t fd, int64_t *linux_result);
@@ -508,6 +511,10 @@ enum kernel_files_status kernel_files_pin(
     struct kernel_files *files,
     int64_t fd,
     struct kernel_open_file_description **owner,
+    int64_t *linux_result);
+enum kernel_files_status kernel_files_pin_exec(
+    struct kernel_files *files, int64_t fd,
+    struct kernel_open_file_description **owner, uint32_t *fd_flags,
     int64_t *linux_result);
 /* Reject path-only descriptors before accessing operation buffers. */
 enum kernel_files_status kernel_files_pin_data(
