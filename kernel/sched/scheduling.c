@@ -439,14 +439,12 @@ void ready_enqueue_locked(struct kernel_task *task, int head)
         }
 #endif
         if (!target->current || target->current->idle) {
-            if (task->cpu == target) {
+            unsigned requested = kernel_cpu_schedule_requested(target);
+            if (!target_to_kick ||
+                (target_to_kick->current && !target_to_kick->current->idle) ||
+                (kernel_cpu_schedule_requested(target_to_kick) && !requested) ||
+                (kernel_cpu_schedule_requested(target_to_kick) == requested && task->cpu == target)) {
                 target_to_kick = target;
-            } else if (!target_to_kick || (target_to_kick->current && !target_to_kick->current->idle)) {
-                if (!kernel_cpu_schedule_requested(target)) {
-                    target_to_kick = target;
-                } else if (!target_to_kick) {
-                    target_to_kick = target;
-                }
             }
         } else if (!target_to_kick && target->current->scheduling.priority < lowest_prio) {
             lowest_prio = target->current->scheduling.priority;

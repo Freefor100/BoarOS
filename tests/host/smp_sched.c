@@ -127,6 +127,22 @@ int main(void)
         scheduler_cpu_initialize(active, &idles[i], 1);
     }
     active = &cpus[0];
+    /* Two newly ready tasks last ran on the same now-idle CPU. The second
+     * request must also wake the other idle CPU rather than duplicate it. */
+    kernel_cpu_consume_schedule(&cpus[0]);
+    kernel_cpu_consume_schedule(&cpus[1]);
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+      for (unsigned i=0; i<2; i++) {
+          tasks[i]=(struct kernel_task){.accounted=1,.cpu_mask=3,
+              .state=KERNEL_THREAD_STATE_READY,.cpu=&cpus[0]};
+          assert(!kernel_sched_policy_set(&tasks[i].scheduling,KERNEL_SCHED_OTHER,0,0));
+          ready_enqueue_locked(&tasks[i],0);
+      }
+      assert(kernel_cpu_schedule_requested(&cpus[0]));
+      assert(kernel_cpu_schedule_requested(&cpus[1]));
+      ready_remove_locked(&tasks[0]); ready_remove_locked(&tasks[1]); }
+    kernel_cpu_consume_schedule(&cpus[0]);
+    kernel_cpu_consume_schedule(&cpus[1]);
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       setup_task(0, 1, 99); setup_task(1, 2, 10); setup_task(2, 2, 10);
       assert(ready_best_locked() == &tasks[0]); }
