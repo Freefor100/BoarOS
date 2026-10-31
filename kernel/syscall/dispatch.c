@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
 #include <kernel/kcmp.h>
+#include <kernel/ioprio.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
@@ -260,6 +261,10 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number==30U || request->number==31U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_ioprio_call(caller,request->number==30U,
+            (int32_t)request->arguments[0],(int32_t)request->arguments[1],(int32_t)request->arguments[2]);
     } else if (request->number>=180U && request->number<=185U) {
         if (syscall_handle_mqueue(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -764,6 +769,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
     } else if (request->number == LINUX_SYSCALL_CLONE) {
+        /* The legacy syscall consumes only the low 32 flag bits; libc's
+         * signed int CLONE_IO argument may be sign-extended in registers. */
+        request->arguments[0]=(uint32_t)request->arguments[0];
         if ((request->arguments[0] & UINT64_C(0x101000)) == UINT64_C(0x101000)) {
             decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
             decoded.value = -KERNEL_EINVAL;

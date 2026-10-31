@@ -101,7 +101,7 @@ static void semantics(void)
     assert(query(11,10,KCMP_FILE,1,0)==3-order);
     assert(query(10,11,KCMP_SYSVSEM,0,0)==0);
     assert(query(10,11,KCMP_FILE,4,0)==-KERNEL_EBADF);
-    assert(query(10,11,KCMP_IO,0,0)==-KERNEL_EOPNOTSUPP);
+    assert(query(10,11,KCMP_IO,0,0)==0);
     assert(query(10,11,KCMP_EPOLL_TFD,0,UINT64_MAX)==-KERNEL_EOPNOTSUPP);
     assert(query(-1,11,999,0,0)==-KERNEL_ESRCH);
     denied=1;assert(query(10,11,999,0,0)==-KERNEL_EPERM);denied=0;

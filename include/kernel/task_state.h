@@ -39,6 +39,7 @@ struct kernel_sem_undo;
 struct kernel_sem_request;
 struct kernel_msg_request;
 struct kernel_mqueue_request;
+struct kernel_io_priority_context;
 struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
 struct kernel_futex_request;
@@ -264,6 +265,7 @@ struct kernel_task {
     struct kernel_raw_lock files_access;
     struct kernel_mqueue_request *mqueue_request;
     uint8_t exit_signal;
+    struct kernel_io_priority_context *io_priority;
 } __attribute__((aligned(16)));
 
 #endif

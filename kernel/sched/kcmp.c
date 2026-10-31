@@ -45,6 +45,7 @@ static uint64_t object_locked(const struct kernel_task *task, unsigned type)
     case KCMP_VM: return (uintptr_t)task->mm.record;
     case KCMP_FILES: return (uintptr_t)task->files.record;
     case KCMP_FS: return (uintptr_t)task->fs.record;
+    case KCMP_IO: return (uintptr_t)task->io_priority;
     case KCMP_SYSVSEM: return (uintptr_t)task->sem_undo;
     default: __builtin_trap();
     }
@@ -83,7 +84,7 @@ int64_t kernel_kcmp(struct kernel_task *caller, int32_t pid1, int32_t pid2,
         int error=access_locked(caller,a,b,pid1,pid2);
         if (error) return error;
         if (type<0 || type>=KCMP_TYPES) return -KERNEL_EINVAL;
-        if (type==KCMP_IO || type==KCMP_EPOLL_TFD) return -KERNEL_EOPNOTSUPP;
+        if (type==KCMP_EPOLL_TFD) return -KERNEL_EOPNOTSUPP;
         if (type==KCMP_FILE) {
             if (a->proc_exiting || b->proc_exiting) return -KERNEL_EBADF;
             files1=kernel_files_is_live(&a->files)?a->files.record:0;
