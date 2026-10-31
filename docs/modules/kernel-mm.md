@@ -43,7 +43,7 @@ SHM_LOCK/UNLOCK 在既有CPU0共享内存控制路径执行。段保存首次LOC
 
 LOCK保留按需装页，当前memory_object已经持有已驻留页。UID或owner改变后，UNLOCK或RMID后的最后attachment销毁向原账户归还。共享段的UID额度与普通mlock的MM虚拟字节、VmLck分别统计。
 
-共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`shm_lock.c`，宿主入口为`tests/mm-resource-limits-host.sh`、`tests/madvise-remove-host.sh`、`tests/shm-lock-host.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
+共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`vdso_dontneed.c`、`shm_lock.c`，可通过 `tests/network_runner.py --workload madvise` 或 `--workload vdso_dontneed` 选择；宿主入口为`tests/mm-resource-limits-host.sh`、`tests/madvise-remove-host.sh`、`tests/shm-lock-host.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
 
 ```sh
 python3 tests/loongarch/prepare.py --component linux --profile platform-noswap
