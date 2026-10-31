@@ -2297,7 +2297,7 @@ prepare-oscomp-inputs:
 test-sync-host:
 	@mkdir -p build/host
 	@set -e; for cpus in 1 2; do for debug in 0 1; do \
-		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=$$cpus -DBOAROS_LOCK_DEBUG=$$debug \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=$$cpus -DBOAROS_PAGE_SHIFT=12 -DBOAROS_LOCK_DEBUG=$$debug \
 		-Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -o build/host/sync-$$cpus-$$debug; \
 		build/host/sync-$$cpus-$$debug; \
 	done; done

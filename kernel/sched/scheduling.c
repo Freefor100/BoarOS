@@ -425,17 +425,36 @@ void ready_enqueue_locked(struct kernel_task *task, int head)
         enqueue_task(&scheduler.rt_services,&task->service_node,task,head);
 #endif
     uint32_t mask = effective_cpu_mask(task);
+    struct kernel_cpu *target_to_kick = 0;
+    struct kernel_cpu *lowest_cpu = 0;
+    int lowest_prio = task->scheduling.priority;
     for (struct kernel_cpu *target = scheduler.cpus; target; target = target->scheduler_next) {
         if (!(mask & (1U << target->logical_id))) continue;
         enqueue_task(&target->eligible, &task->eligible_nodes[target->logical_id],task,head);
-        if (!target->current || target->current->idle ||
 #if BOAROS_USER_SMP
-            (!target->logical_id && is_rt_service(task) && !is_rt_service(target->current)) ||
+        if (!target->logical_id && is_rt_service(task)) {
+            if (!target->current || !is_rt_service(target->current))
+                target_to_kick = target;
+            continue;
+        }
 #endif
-            task->scheduling.priority > target->current->scheduling.priority) {
-            kernel_cpu_request_schedule(target);
+        if (!target->current || target->current->idle) {
+            if (task->cpu == target) {
+                target_to_kick = target;
+            } else if (!target_to_kick || (target_to_kick->current && !target_to_kick->current->idle)) {
+                if (!kernel_cpu_schedule_requested(target)) {
+                    target_to_kick = target;
+                } else if (!target_to_kick) {
+                    target_to_kick = target;
+                }
+            }
+        } else if (!target_to_kick && target->current->scheduling.priority < lowest_prio) {
+            lowest_prio = target->current->scheduling.priority;
+            lowest_cpu = target;
         }
     }
+    if (!target_to_kick && lowest_cpu) target_to_kick = lowest_cpu;
+    if (target_to_kick) kernel_cpu_request_schedule(target_to_kick);
 #else
     struct kernel_cpu *target = task->cpu ? task->cpu : kernel_cpu_current();
     if (!target->current || target->current->idle ||
