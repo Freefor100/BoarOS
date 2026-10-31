@@ -63,6 +63,55 @@ static uint64_t test_reclaim(uint64_t target)
 static struct kernel_mm retiring_mm;
 static uint64_t reclaimed_count;
 static enum kernel_mm_status release_result;
+static _Thread_local int scan_actor;
+static _Thread_local unsigned scan_checks;
+static atomic_uint scan_max_checks;
+static atomic_int scan_paused,scan_resume,scan_a_done,scan_b_done;
+static _Thread_local int pressure_gate_hold;
+static atomic_int pressure_gate_entered,pressure_gate_resume,pressure_gate_done,pressure_alloc_done;
+static uint64_t pressure_alloc_page;
+static enum physical_page_status pressure_alloc_result;
+static int pressure_gate_result;
+static uint64_t scan_a_released,scan_a_detached,scan_b_released,scan_b_detached;
+enum kernel_vma_status __real_kernel_vma_set_lookup(const struct kernel_vma_set *,uint64_t,struct kernel_vma *);
+enum kernel_vma_status __wrap_kernel_vma_set_lookup(const struct kernel_vma_set *set,uint64_t address,struct kernel_vma *out)
+{
+    if (scan_actor) scan_checks++;
+    if (pressure_gate_hold) {
+        pressure_gate_hold=0;
+        atomic_store(&pressure_gate_entered,1);
+        while (!atomic_load(&pressure_gate_resume)) sched_yield();
+    }
+    return __real_kernel_vma_set_lookup(set,address,out);
+}
+void __real_kernel_lock_release(struct kernel_lock_guard *);
+void __wrap_kernel_lock_release(struct kernel_lock_guard *guard)
+{
+    int gate=scan_actor && guard && guard->lock && guard->lock->rank==25;
+    unsigned checks=scan_checks;
+    __real_kernel_lock_release(guard);
+    if (!gate) return;
+    unsigned previous=atomic_load(&scan_max_checks);
+    while (previous<checks && !atomic_compare_exchange_weak(&scan_max_checks,&previous,checks)) {}
+    scan_checks=0;
+    if (scan_actor==1 && checks>=16 && !atomic_exchange(&scan_paused,1))
+        while (!atomic_load(&scan_resume)) sched_yield();
+}
+static void *bounded_scan_actor(void *unused)
+{
+    (void)unused;mm_test_attach(1);scan_actor=1;
+    scan_a_released=kernel_mm_reclaim_lazy(&pages,1,&scan_a_detached);
+    atomic_store(&scan_a_done,1);return NULL;
+}
+static void *concurrent_scan_actor(void *unused)
+{
+    (void)unused;mm_test_attach(2);scan_actor=2;
+    struct kernel_mm_user_pin pin={0};
+    assert(!kernel_mm_pin_user_page(&mm,BASE,KERNEL_MM_READ,&pin));
+    scan_b_released=kernel_mm_reclaim_lazy(&pages,1,&scan_b_detached);
+    kernel_mm_unpin_user_page(&pin);
+    atomic_store(&scan_b_done,1);return NULL;
+}
 static void *reclaim_actor(void *unused)
 {
     (void)unused;mm_test_attach(1);pause_reclaim_fence=1;
@@ -74,6 +123,20 @@ static void *release_actor(void *unused)
     (void)unused;mm_test_attach(2);
     release_result=kernel_mm_release(&retiring_mm);
     atomic_store(&release_done,1);return NULL;
+}
+static void *pressure_gate_actor(void *mode)
+{
+    mm_test_attach(3);
+    if (mode) pressure_gate_result=kernel_mm_mprotect(&mm,BASE,P,KERNEL_MM_READ);
+    else { pressure_gate_hold=1;pressure_gate_result=kernel_mm_madvise(&mm,BASE,P,KERNEL_MM_ADVICE_NORMAL); }
+    atomic_store(&pressure_gate_done,1);
+    return NULL;
+}
+static void *pressure_alloc_actor(void *unused)
+{
+    (void)unused;mm_test_attach(4);
+    pressure_alloc_result=physical_page_allocate(&pages,&pressure_alloc_page);
+    atomic_store(&pressure_alloc_done,1);return NULL;
 }
 int main(void)
 {
@@ -121,20 +184,24 @@ int main(void)
     kernel_mm_get_concurrency_state(&mm,&lazy_state);
     CHECK(lazy_state.lazy_pages==3&&lazy_state.lazy_index_bytes&&lazy_state.lazy_registered);
     CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==30);
-    struct kernel_mm_user_pin lazy_pin={0};
-    CHECK(!kernel_mm_pin_user_page(&mm,BASE+P,KERNEL_MM_READ,&lazy_pin));
-    CHECK(!test_reclaim(3));
-    kernel_mm_unpin_user_page(&lazy_pin);
     CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
     CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping));
     *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=99;
-    CHECK(!kernel_mm_mlock(&mm,BASE+P,P,1));
-    CHECK(test_reclaim(3)==1);
+    struct kernel_mm_user_pin lazy_pin={0};
+    CHECK(!kernel_mm_pin_user_page(&mm,BASE+P,KERNEL_MM_READ,&lazy_pin));
+    CHECK(test_reclaim(1)==1&&test_detached==1);
     CHECK(kernel_mm_lookup(&mm,BASE+2*P,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_lookup(&mm,BASE+P,&lazy_mapping));
+    kernel_mm_unpin_user_page(&lazy_pin);
+    CHECK(!kernel_mm_mlock(&mm,BASE+P,P,1));
+    CHECK(!test_reclaim(3)&&!test_detached);
     CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==99);
     CHECK(!kernel_mm_munlock(&mm,BASE+P,P));
-    CHECK(test_reclaim(3)==1);
+    CHECK(!kernel_mm_pin_user_page(&mm,BASE+P,KERNEL_MM_READ,&lazy_pin));
+    CHECK(!test_reclaim(3)&&test_detached==1);
+    CHECK(*(unsigned char *)lazy_pin.page==31);
     CHECK(kernel_mm_lookup(&mm,BASE+P,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    kernel_mm_unpin_user_page(&lazy_pin);
     kernel_mm_get_concurrency_state(&mm,&lazy_state);
     CHECK(!lazy_state.lazy_pages&&!lazy_state.lazy_index_bytes&&!lazy_state.lazy_registered);
     CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+P,KERNEL_MM_READ));
@@ -221,6 +288,116 @@ int main(void)
     CHECK(!lazy_state.lazy_pages&&!child_state.lazy_pages);
     CHECK(physical_page_available(&pages)>before_shared_reclaim);
     CHECK(!kernel_mm_release(&sharing_child)&&!kernel_mm_munmap(&mm,BASE,SHARED_BATCH_PAGES*P));
+    /* The first 48 candidates are locked. Pause exactly after a 16-entry
+     * qualification, remove the saved next candidate and start a competing
+     * scanner while its first scan still owns the round. */
+    enum { BOUNDED_SCAN_PAGES=64 };
+    assert(!map(BASE,BOUNDED_SCAN_PAGES*P,RW,0));
+    for (unsigned i=0;i<BOUNDED_SCAN_PAGES;i++)
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,BOUNDED_SCAN_PAGES*P,8));
+    CHECK(!kernel_mm_mlock(&mm,BASE+16*P,48*P,1));
+    pthread_t scan_a,scan_b;
+    assert(!pthread_create(&scan_a,NULL,bounded_scan_actor,NULL));
+    while (!atomic_load(&scan_paused)&&!atomic_load(&scan_a_done)) sched_yield();
+    CHECK(atomic_load(&scan_paused)&&!atomic_load(&scan_a_done));
+    CHECK(!kernel_mm_munmap(&mm,BASE+47*P,P));
+    uint64_t scan_moved=0;
+    CHECK(!kernel_mm_mremap(&mm,BASE+46*P,P,P,3,BASE+80*P,&scan_moved)&&scan_moved==BASE+80*P);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+45*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_lookup(&mm,BASE+45*P,&lazy_mapping));
+    *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=0x52;
+    CHECK(!kernel_mm_munlock(&mm,BASE+44*P,P));
+    struct kernel_mm scan_child={0};CHECK(!kernel_mm_fork(&scan_child,&mm));
+    unsigned scan_b_before=mm_test_parked(2);
+    assert(!pthread_create(&scan_b,NULL,concurrent_scan_actor,NULL));
+    while(mm_test_parked(2)==scan_b_before&&!atomic_load(&scan_b_done)) sched_yield();
+    CHECK(mm_test_parked(2)>scan_b_before&&!atomic_load(&scan_b_done));
+    atomic_store(&scan_resume,1);
+    assert(!pthread_join(scan_a,NULL)&&!pthread_join(scan_b,NULL));
+    CHECK(atomic_load(&scan_max_checks)<=16);
+    CHECK(scan_a_released==0&&scan_a_detached>0&&scan_a_detached<=16);
+    CHECK(scan_b_released<=1&&scan_b_detached>0&&scan_b_detached<=16);
+    CHECK(!kernel_mm_lookup(&mm,BASE+45*P,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==0x52);
+    CHECK(!kernel_mm_lookup(&scan_child,BASE+45*P,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==0x52);
+    CHECK(!kernel_mm_release(&scan_child));
+    CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_munmap(&mm,BASE,BOUNDED_SCAN_PAGES*P));
+    CHECK(!kernel_mm_munmap(&mm,scan_moved,P));
+    /* While scanner A is between batches, scanner B waits for the round
+     * with a read pin and a gate holder waits for B's pin. A must release
+     * the scan lock before it waits for that gate. */
+    assert(!map(BASE,BOUNDED_SCAN_PAGES*P,RW,0));
+    for (unsigned i=0;i<BOUNDED_SCAN_PAGES;i++)
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,BOUNDED_SCAN_PAGES*P,8));
+    CHECK(!kernel_mm_mlock(&mm,BASE+16*P,48*P,1));
+    atomic_store(&scan_paused,0);atomic_store(&scan_resume,0);
+    atomic_store(&scan_a_done,0);atomic_store(&scan_b_done,0);
+    atomic_store(&scan_max_checks,0);scan_a_released=scan_a_detached=scan_b_released=scan_b_detached=0;
+    assert(!pthread_create(&scan_a,NULL,bounded_scan_actor,NULL));
+    while(!atomic_load(&scan_paused)) sched_yield();
+    scan_b_before=mm_test_parked(2);
+    assert(!pthread_create(&scan_b,NULL,concurrent_scan_actor,NULL));
+    while(mm_test_parked(2)==scan_b_before&&!atomic_load(&scan_b_done)) sched_yield();
+    CHECK(mm_test_parked(2)>scan_b_before&&!atomic_load(&scan_b_done));
+    pthread_t chained_gate;
+    unsigned chained_before=mm_test_parked(3);
+    assert(!pthread_create(&chained_gate,NULL,pressure_gate_actor,(void *)1));
+    while(mm_test_parked(3)==chained_before) sched_yield();
+    atomic_store(&scan_resume,1);
+    assert(!pthread_join(scan_a,NULL)&&!pthread_join(scan_b,NULL)&&!pthread_join(chained_gate,NULL));
+    CHECK(!pressure_gate_result&&scan_a_released==1&&scan_a_detached==1);
+    CHECK(!scan_b_released&&!scan_b_detached&&atomic_load(&scan_max_checks)<=16);
+    CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_munmap(&mm,BASE,BOUNDED_SCAN_PAGES*P));
+    /* A round is bounded by its initial candidates and MM registrations.
+     * Add candidates to the current MM and repeatedly publish new MMs while
+     * its cursor is paused; all are available on the next pressure round. */
+    assert(!map(BASE,32*P,RW,0));
+    for (unsigned i=0;i<32;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,32*P,8)&&!kernel_mm_mlock(&mm,BASE,32*P,1));
+    atomic_store(&scan_paused,0);atomic_store(&scan_resume,0);atomic_store(&scan_a_done,0);
+    atomic_store(&scan_max_checks,0);scan_a_released=scan_a_detached=0;
+    assert(!pthread_create(&scan_a,NULL,bounded_scan_actor,NULL));
+    while(!atomic_load(&scan_paused)&&!atomic_load(&scan_a_done)) sched_yield();
+    CHECK(atomic_load(&scan_paused)&&!atomic_load(&scan_a_done));
+    struct kernel_mm newborn[4]={{0}};
+    for (unsigned i=0;i<4;i++) {
+        uint64_t address=BASE+(uint64_t)(40+i)*P;
+        assert(!map(address,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,address,KERNEL_MM_WRITE));
+        CHECK(!kernel_mm_madvise(&mm,address,P,8));
+        CHECK(!kernel_mm_fork(&newborn[i],&mm));
+    }
+    atomic_store(&scan_resume,1);assert(!pthread_join(scan_a,NULL));
+    CHECK(!scan_a_released&&!scan_a_detached&&atomic_load(&scan_max_checks)<=16);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(lazy_state.lazy_pages==36&&lazy_state.lazy_registered);
+    CHECK(!kernel_mm_lookup(&mm,BASE+43*P,&lazy_mapping));
+    (void)test_reclaim(1);CHECK(test_detached>0&&test_detached<=16);
+    for (unsigned i=0;i<4;i++) CHECK(!kernel_mm_release(&newborn[i]));
+    CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_munmap(&mm,BASE,32*P));
+    CHECK(!kernel_mm_munmap(&mm,BASE+40*P,4*P));
+    /* A full pass of locked candidates ends without a made-up progress; once
+     * unlocked the same real pages are reclaimable. */
+    assert(!map(BASE,32*P,RW,0));
+    for (unsigned i=0;i<32;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,32*P,8)&&!kernel_mm_mlock(&mm,BASE,32*P,1));
+    CHECK(!test_reclaim(1)&&!test_detached);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(lazy_state.lazy_pages==32&&lazy_state.lazy_registered);
+    CHECK(!kernel_mm_munlockall(&mm)&&test_reclaim(1)==1&&test_detached==1);
+    CHECK(!kernel_mm_munmap(&mm,BASE,32*P));
+    /* A locked first MM cannot hide another live MM's eligible mapping. */
+    assert(!map(BASE,32*P,RW,0));
+    for (unsigned i=0;i<32;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,32*P,8)&&!kernel_mm_mlock(&mm,BASE,32*P,1));
+    sharing_child=(struct kernel_mm){0};CHECK(!kernel_mm_fork(&sharing_child,&mm));
+    CHECK(!test_reclaim(1)&&test_detached==16);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    kernel_mm_get_concurrency_state(&sharing_child,&child_state);
+    CHECK(lazy_state.lazy_pages==32&&child_state.lazy_pages==16);
+    CHECK(!kernel_mm_release(&sharing_child)&&!kernel_mm_munlockall(&mm));
+    CHECK(test_reclaim(1)==1&&test_detached==1);
+    CHECK(!kernel_mm_munmap(&mm,BASE,32*P));
     /* PROT_NONE retains an owned physical page; FREE may reclaim it without
      * making the mapping accessible or losing its VMA protection. */
     assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
@@ -296,22 +473,69 @@ int main(void)
     kernel_mm_get_concurrency_state(&mm,&lazy_state);
     CHECK(!lazy_state.lazy_pages&&!lazy_state.lazy_index_bytes&&!lazy_state.lazy_registered);
     CHECK(!kernel_mm_munmap(&mm,BASE,(uint64_t)LAZY_SCALE_PAGES*P));
-    /* Allocate all remaining pages: allocator pressure invokes the same
-     * registered reclaimer, not an isolated test-only reclamation path. */
+    /* A caller holding this MM's pin cannot wait for a gate owner that is
+     * itself draining that pin. */
     assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
     CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    CHECK(!kernel_mm_pin_user_page(&mm,BASE,KERNEL_MM_READ,&lazy_pin));
+    pthread_t pressure_gate,pressure_alloc;
+    unsigned gate_parked=mm_test_parked(3);
+    assert(!pthread_create(&pressure_gate,NULL,pressure_gate_actor,(void *)1));
+    while(mm_test_parked(3)==gate_parked) sched_yield();
+    CHECK(!test_reclaim(1)&&!test_detached);
+    kernel_mm_unpin_user_page(&lazy_pin);
+    assert(!pthread_join(pressure_gate,NULL));CHECK(!pressure_gate_result);
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    /* Allocate all remaining pages: allocator pressure invokes the same
+     * registered reclaimer; a temporarily busy MM gate must be waited for. */
+    assert(!map(BASE,64*P,RW,0));
+    for (unsigned i=0;i<64;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,64*P,8)&&!kernel_mm_mlock(&mm,BASE+16*P,48*P,1));
+    struct kernel_mm available_child={0};CHECK(!kernel_mm_fork(&available_child,&mm));
+    CHECK(!kernel_mm_resolve_user_fault(&available_child,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&available_child,BASE,P,8));
     uint64_t available=physical_page_available(&pages);
-    uint64_t *held_pages=calloc(available+1,sizeof(*held_pages));assert(held_pages);
+    uint64_t *held_pages=calloc(pages.total_pages+1,sizeof(*held_pages));assert(held_pages);
     uint64_t held_count=0;
-    for (;held_count<=available;held_count++)
+    for (;held_count<available;held_count++)
         if (physical_page_allocate(&pages,&held_pages[held_count])) break;
+    CHECK(held_count==available);
+    atomic_store(&pressure_gate_done,0);
+    assert(!pthread_create(&pressure_gate,NULL,pressure_gate_actor,NULL));
+    while(!atomic_load(&pressure_gate_entered)) sched_yield();
+    unsigned allocation_parked=mm_test_parked(4);
+    assert(!pthread_create(&pressure_alloc,NULL,pressure_alloc_actor,NULL));
+    while(mm_test_parked(4)==allocation_parked&&!atomic_load(&pressure_alloc_done)) sched_yield();
+    CHECK(atomic_load(&pressure_alloc_done)&&!atomic_load(&pressure_gate_done));
+    atomic_store(&pressure_gate_resume,1);
+    assert(!pthread_join(pressure_gate,NULL)&&!pthread_join(pressure_alloc,NULL));
+    CHECK(!pressure_gate_result&&atomic_load(&pressure_alloc_done)&&pressure_alloc_result==PHYSICAL_PAGE_STATUS_OK);
+    if (pressure_alloc_result==PHYSICAL_PAGE_STATUS_OK) held_pages[held_count++]=pressure_alloc_page;
     CHECK(held_count==available+1);
-    CHECK(kernel_mm_lookup(&mm,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(kernel_mm_lookup(&available_child,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_release(&available_child));
+    while (physical_page_available(&pages)>0) {
+        assert(held_count<pages.total_pages+1);
+        assert(!physical_page_allocate(&pages,&held_pages[held_count++]));
+    }
+    atomic_store(&pressure_gate_entered,0);atomic_store(&pressure_gate_resume,0);
+    atomic_store(&pressure_gate_done,0);atomic_store(&pressure_alloc_done,0);
+    assert(!pthread_create(&pressure_gate,NULL,pressure_gate_actor,NULL));
+    while(!atomic_load(&pressure_gate_entered)) sched_yield();
+    allocation_parked=mm_test_parked(4);
+    assert(!pthread_create(&pressure_alloc,NULL,pressure_alloc_actor,NULL));
+    while(mm_test_parked(4)==allocation_parked&&!atomic_load(&pressure_alloc_done)) sched_yield();
+    CHECK(mm_test_parked(4)>allocation_parked&&!atomic_load(&pressure_alloc_done));
+    atomic_store(&pressure_gate_resume,1);
+    assert(!pthread_join(pressure_gate,NULL)&&!pthread_join(pressure_alloc,NULL));
+    CHECK(!pressure_gate_result&&atomic_load(&pressure_alloc_done)&&pressure_alloc_result==PHYSICAL_PAGE_STATUS_OK);
+    if (pressure_alloc_result==PHYSICAL_PAGE_STATUS_OK) held_pages[held_count++]=pressure_alloc_page;
+    CHECK(kernel_mm_lookup(&mm,BASE+15*P,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
     for (uint64_t i=0;i<held_count;i++) CHECK(!physical_page_release(&pages,held_pages[i]));
     free(held_pages);
-    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_READ));
-    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&!*(unsigned char *)(uintptr_t)lazy_mapping.physical_address);
-    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_resolve_user_fault(&mm,BASE+15*P,KERNEL_MM_READ));
+    CHECK(!kernel_mm_lookup(&mm,BASE+15*P,&lazy_mapping)&&!*(unsigned char *)(uintptr_t)lazy_mapping.physical_address);
+    CHECK(!kernel_mm_munmap(&mm,BASE,64*P));
     /* Fork policy controls actual child leaves and refs, not just a VMA flag. */
     assert(!map(BASE,4*P,RW,0));
     struct kernel_mm_mapping fork_page, original_page;

@@ -98,14 +98,22 @@ struct kernel_mm_elf_source {
 
 struct mm_lazy_page {
     struct mm_lazy_page *next, **previous, *hash_next;
-    uint64_t address, physical;
+    uint64_t address, physical, birth;
 };
+
+struct mm_lazy_scan_cursor { struct mm_lazy_page *next; };
 
 static struct kernel_raw_lock lazy_registry_lock = {
     .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED,
 };
 static struct kernel_mm_record *lazy_registry;
 static unsigned lazy_registry_count;
+/* One pressure round owns registry traversal; no MM gate is held while
+ * waiting for this qualification. */
+static struct kernel_mutex lazy_scan_lock;
+static int lazy_scan_initialized;
+static uint64_t lazy_scan_round;
+static uint64_t lazy_birth_sequence;
 
 struct kernel_mm_record {
     uint64_t futex_id;
@@ -151,10 +159,12 @@ struct kernel_mm_record {
     struct kernel_open_file_description *executable_file;
     uint32_t future_lock_flags;
     struct mm_lazy_page *lazy_pages, *lazy_retired, **lazy_buckets;
+    struct mm_lazy_scan_cursor *lazy_scan_cursor;
     size_t lazy_capacity, lazy_count;
     struct kernel_mm_record *lazy_next, *lazy_previous;
     struct kernel_wait_queue lazy_drained;
     uint32_t lazy_borrows, lazy_registered;
+    uint64_t lazy_seen_round, lazy_birth;
 };
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
@@ -182,6 +192,13 @@ _Static_assert(sizeof(struct kernel_mm_record) <= BOAROS_PAGE_SIZE,
                "RISC-V MM record must fit in one physical page");
 
 static size_t resident_bucket(uint64_t address,size_t capacity);
+
+static uint64_t lazy_next_birth(void)
+{
+    uint64_t birth=__atomic_add_fetch(&lazy_birth_sequence,1,__ATOMIC_ACQ_REL);
+    if (!birth) __builtin_trap();
+    return birth;
+}
 
 /* The caller holds exclusive MM qualification (or constructs an unpublished
  * child), so other users cannot follow hash links while they are rebuilt. */
@@ -235,6 +252,7 @@ static struct mm_lazy_page *lazy_find(struct kernel_mm_record *record, uint64_t 
 static void lazy_insert(struct kernel_mm_record *record,struct mm_lazy_page *page)
 {
     if (record->lazy_count>=record->lazy_capacity || lazy_find(record,page->address)) __builtin_trap();
+    page->birth=lazy_next_birth();
     size_t bucket=resident_bucket(page->address,record->lazy_capacity);
     page->hash_next=record->lazy_buckets[bucket];record->lazy_buckets[bucket]=page;
     page->next=record->lazy_pages;page->previous=&record->lazy_pages;
@@ -247,6 +265,8 @@ static void lazy_retire(struct kernel_mm_record *record, struct mm_lazy_page *pa
     while (*link && *link!=page) link=&(*link)->hash_next;
     if (!*link || !page->previous) __builtin_trap();
     *link=page->hash_next;
+    if (record->lazy_scan_cursor && record->lazy_scan_cursor->next==page)
+        record->lazy_scan_cursor->next=page->next;
     *page->previous=page->next;
     if (page->next) page->next->previous=page->previous;
     page->next=record->lazy_retired;
@@ -282,6 +302,10 @@ static void lazy_register(struct kernel_mm_record *record)
 {
     __atomic_store_n(&record->space.allocator->lazy_reclaim,kernel_mm_reclaim_lazy,__ATOMIC_RELEASE);
     KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+    if (!lazy_scan_initialized) {
+        kernel_mutex_init(&lazy_scan_lock,24,(uintptr_t)&lazy_scan_lock);
+        lazy_scan_initialized=1;
+    }
     if (record->lazy_registered) return;
     if (!lazy_registry) {
         lazy_registry=record;
@@ -293,6 +317,8 @@ static void lazy_register(struct kernel_mm_record *record)
         lazy_registry->lazy_previous=record;
     }
     record->lazy_registered=1;
+    record->lazy_seen_round=0;
+    record->lazy_birth=lazy_next_birth();
     if (++lazy_registry_count==0) __builtin_trap();
 }
 static void lazy_unregister(struct kernel_mm_record *record)
@@ -309,6 +335,16 @@ static void lazy_unregister(struct kernel_mm_record *record)
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token,&reason)!=KERNEL_SCHEDULER_STATUS_OK ||
             kernel_wait_finish(&token)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
+}
+static void lazy_borrow_put(struct kernel_mm_record *record)
+{
+    KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+    if (!record->lazy_borrows) __builtin_trap();
+    if (!--record->lazy_borrows && !record->lazy_registered) {
+        enum kernel_scheduler_status status=kernel_wait_queue_wake_all(&record->lazy_drained);
+        if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
+            __builtin_trap();
     }
 }
 
@@ -2576,36 +2612,75 @@ uint64_t kernel_mm_reclaim_lazy(struct physical_page_allocator *allocator,uint64
     enum { LAZY_RECLAIM_BATCH = 16 };
     *mappings_detached=0;
     struct kernel_lock_guard *held=kernel_io_context_current()->locks;
-    if (!target || (held && held->lock->rank>=25)) return 0;
+    if (!target || (held && held->lock->rank>=24)) return 0;
+    {
+        KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+        if (!lazy_registry) return 0;
+        if (!lazy_scan_initialized) __builtin_trap();
+    }
+    /* A contender waits for the current traversal, then retries the real
+     * allocation. A busy MM gate is waited for only after dropping the scan
+     * lock and only when the caller owns neither a pin nor another lock. */
+    KERNEL_LOCK_SCOPE(scan);
+    uint64_t round,cutoff=0;
+    int snapshot_taken=0;
     unsigned remaining;
-    { KERNEL_RAW_SCOPE(guard,&lazy_registry_lock); remaining=lazy_registry_count; }
+restart_round:
+    kernel_mutex_lock(&lazy_scan_lock,&scan);
+    {
+        KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+        if (++lazy_scan_round==0) __builtin_trap();
+        round=lazy_scan_round;
+        if (!snapshot_taken) {
+            cutoff=__atomic_load_n(&lazy_birth_sequence,__ATOMIC_ACQUIRE);
+            snapshot_taken=1;
+        }
+        remaining=lazy_registry_count;
+    }
     uint64_t released=0;
-    /* One progressing MM per call: its borrowed candidates cannot hold the
-     * operation qualification across an unbounded shared-page range. */
+    struct kernel_mm_record *waiting=NULL;
+    /* A round visits the registry snapshot until it finds work or reaches
+     * the end. Each MM qualification inspects at most sixteen candidates. */
     while (remaining-- && released<target && !*mappings_detached) {
         struct kernel_mm_record *record;
         {
             KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
             record=lazy_registry;
-            if (!record) break;
+            if (!record || record->lazy_seen_round==round) break;
             lazy_registry=record->lazy_next;
+            record->lazy_seen_round=round;
+            if (record->lazy_birth>cutoff) continue;
             if (record->lazy_borrows==UINT32_MAX) __builtin_trap();
             record->lazy_borrows++;
         }
-        KERNEL_LOCK_SCOPE(gate);
-        if (record->space.allocator==allocator && kernel_rwlock_try_write(&record->operations,&gate)) {
-            int closed=0;
+        struct mm_lazy_scan_cursor cursor={0};
+        int registered=0,busy=0;
+        while (record->space.allocator==allocator) {
+            KERNEL_LOCK_SCOPE(gate);
+            if (!kernel_rwlock_try_write(&record->operations,&gate)) { busy=1;break; }
+            int closed=0,more=0;
             {
                 KERNEL_RAW_SCOPE(guard,&record->metadata);
-                if (record->stage==KERNEL_MM_RECORD_LIVE && !record->access_closed && !record->access_pins) {
+                if (record->stage==KERNEL_MM_RECORD_LIVE && !record->access_closed) {
+                    /* FREE 排空旧写 pin 并撤可写权限；之后写 pin 必须先
+                     * 取消候选。已有读 pin 自持物理引用，可跨撤映射存活。 */
                     record->access_closed=1;
                     closed=1;
+                    if (!registered) {
+                        if (record->lazy_scan_cursor) __builtin_trap();
+                        cursor.next=record->lazy_pages;
+                        record->lazy_scan_cursor=&cursor;
+                        registered=1;
+                    }
                 }
             }
             if (closed) {
-                struct mm_lazy_page *page=record->lazy_pages;
-                while (page && released<target && *mappings_detached<LAZY_RECLAIM_BATCH) {
-                    struct mm_lazy_page *next=page->next;
+                unsigned examined=0;
+                while (cursor.next && examined++<LAZY_RECLAIM_BATCH &&
+                       released<target && *mappings_detached<LAZY_RECLAIM_BATCH) {
+                    struct mm_lazy_page *page=cursor.next;
+                    cursor.next=page->next;
+                    if (page->birth>cutoff) continue;
                     struct kernel_vma vma;
                     uint64_t physical;uint32_t refs;int cow;
                     if (!kernel_vma_set_lookup(record->vmas,page->address,&vma) &&
@@ -2615,27 +2690,41 @@ uint64_t kernel_mm_reclaim_lazy(struct physical_page_allocator *allocator,uint64
                         !physical_page_reference_count(allocator,physical,&refs)) {
                         if (unmap_space_range(record,page->address,page->address+BOAROS_PAGE_SIZE)) __builtin_trap();
                         (*mappings_detached)++;
-                        /* With the sole mapping closed to new pins and forks,
-                         * its last reference is returned after TLB completion.
-                         * A shared PTE removal is progress, not a free page. */
+                        /* A shared PTE removal is progress, not a free page. */
                         if (refs==1) released++;
                     }
-                    page=next;
                 }
-                { KERNEL_RAW_SCOPE(guard,&record->metadata); record->access_closed=0; }
+                {
+                    KERNEL_RAW_SCOPE(guard,&record->metadata);
+                    record->access_closed=0;
+                    more=cursor.next!=NULL;
+                }
             }
             mm_gate_release(record,&gate);
             if (closed) wake_pin_waiters(record);
+            if (!closed || !more || released || *mappings_detached) break;
         }
-        {
-            KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
-            if (!record->lazy_borrows) __builtin_trap();
-            if (!--record->lazy_borrows && !record->lazy_registered) {
-                enum kernel_scheduler_status status=kernel_wait_queue_wake_all(&record->lazy_drained);
-                if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
-                    __builtin_trap();
-            }
+        if (registered) {
+            KERNEL_RAW_SCOPE(guard,&record->metadata);
+            if (record->lazy_scan_cursor!=&cursor) __builtin_trap();
+            record->lazy_scan_cursor=NULL;
         }
+        if (busy && !held && !kernel_io_context_current()->user_pins && !waiting)
+            waiting=record; /* The borrow covers the later gate wait. */
+        else lazy_borrow_put(record);
+    }
+    if (waiting) {
+        if (!released && !*mappings_detached) {
+            /* First inspect other MMs; then let any pinned scanner finish
+             * before waiting for the real busy gate. */
+            kernel_lock_release(&scan);
+            KERNEL_LOCK_SCOPE(wait_gate);
+            kernel_rwlock_write(&waiting->operations,&wait_gate);
+            mm_gate_release(waiting,&wait_gate);
+            lazy_borrow_put(waiting);
+            goto restart_round;
+        }
+        lazy_borrow_put(waiting);
     }
     return released;
 }
