@@ -546,7 +546,7 @@ enum kernel_signal_status kernel_signal_set_action(
 
 enum kernel_signal_status kernel_signal_fork(
     struct kernel_task *child,
-    const struct kernel_task *parent)
+    const struct kernel_task *parent,int clear_sighand)
 {
     const struct kernel_signal_table *parent_table;
     struct kernel_signal_table *child_table;
@@ -594,6 +594,14 @@ enum kernel_signal_status kernel_signal_fork(
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         child_table->magic=KERNEL_SIGNAL_TABLE_MAGIC;
         memcpy(child_table->actions,parent_table->actions,sizeof(child_table->actions));
+    }
+    if (clear_sighand) {
+        for (uint32_t i=0;i<KERNEL_SIGNAL_COUNT;i++) {
+            struct kernel_signal_action *action=&child_table->actions[i];
+            if (action->handler!=KERNEL_SIGNAL_IGN) action->handler=KERNEL_SIGNAL_DFL;
+            action->flags=0;
+            action->mask=0;
+        }
     }
     child_table->identity=process_identity(child,KERNEL_PID_TID)->generation;
     child_table->references = 1U;

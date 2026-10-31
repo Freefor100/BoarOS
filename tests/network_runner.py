@@ -38,7 +38,7 @@ def mremap_output(raw,cpus):
 
 def clone_resources_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('CLONE-RES ')]
-    return lines==['CLONE-RES CASE thread-files-fs PASS','CLONE-RES CASE process-vm-files-exec PASS','CLONE-RES CASE clone3 PASS','CLONE-RES CASE pidfd PASS','CLONE-RES END 4']
+    return lines==['CLONE-RES CASE thread-files-fs PASS','CLONE-RES CASE process-vm-files-exec PASS','CLONE-RES CASE clear-sighand PASS','CLONE-RES CASE clone3 PASS','CLONE-RES CASE pidfd PASS','CLONE-RES END 5']
 
 
 def proc_thread_resources_output(raw):

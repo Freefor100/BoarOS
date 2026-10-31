@@ -225,11 +225,11 @@ enum kernel_signal_status kernel_signal_set_action(
     const struct kernel_linux_sigaction *action,
     struct kernel_linux_sigaction *old_action);
 
-/* Fork inheritance: dispositions and blocked mask are copied, pending
- * signals are cleared, and an allocated disposition page is duplicated. */
+/* Fork copies the blocked mask and a private disposition page, with no pending
+ * signals. clear_sighand resets caught dispositions and clears action flags. */
 enum kernel_signal_status kernel_signal_fork(
     struct kernel_task *child,
-    const struct kernel_task *parent);
+    const struct kernel_task *parent,int clear_sighand);
 enum kernel_signal_status kernel_signal_share(
     struct kernel_task *child, struct kernel_task *parent);
 

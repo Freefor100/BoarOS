@@ -25,6 +25,7 @@ static void lookup_end(struct kernel_task **task)
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
+#define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
@@ -278,7 +279,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
+    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&

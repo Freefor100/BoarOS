@@ -62,6 +62,7 @@
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
+#define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_THREAD UINT64_C(0x10000)
 #define LINUX_CLONE_SETTLS UINT64_C(0x80000)
@@ -936,7 +937,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     kernel_wait_queue_init(&child->child_exit_queue);
     kernel_wait_queue_init(&child->vfork_done_queue);
     signal_status = (flags & LINUX_CLONE_SIGHAND) ? kernel_signal_share(child, parent)
-                                 : kernel_signal_fork(child, parent);
+                                 : kernel_signal_fork(child, parent,(flags & LINUX_CLONE_CLEAR_SIGHAND)!=0);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
         return finish_clone_failure(
             child,

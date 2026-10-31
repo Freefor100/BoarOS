@@ -236,6 +236,76 @@ struct test_clone_args {
     uint64_t flags, pidfd, child_tid, parent_tid, exit_signal;
     uint64_t stack, stack_size, tls, set_tid, set_tid_size, cgroup;
 };
+/* Native RV64/LA64 rt_sigaction layout; libc sigaction has a different layout. */
+struct raw_action { uint64_t handler,flags,mask; };
+struct clear_result { int report; uint64_t blocked; };
+static int clear_sighand_child(void *opaque)
+{
+    struct clear_result *result=opaque;
+    const int signals[3]={SIGUSR1,SIGUSR2,SIGWINCH};
+    const uint64_t handlers[3]={0,1,0};
+    for (unsigned i=0;i<3;i++) {
+        struct raw_action action={0};
+        if (syscall(SYS_rt_sigaction,signals[i],NULL,&action,8) ||
+            action.handler!=handlers[i] || action.flags || action.mask) return 91+(int)i;
+    }
+    uint64_t mask=0,pending=0;
+    if (syscall(SYS_rt_sigprocmask,SIG_SETMASK,NULL,&mask,8) || mask!=result->blocked ||
+        syscall(SYS_rt_sigpending,&pending,8) || (pending & (UINT64_C(1)<<(SIGUSR1-1)))) return 94;
+    return write(result->report,"C",1)==1 ? 0 : 95;
+}
+static void clear_sighand_case(void)
+{
+    const int signals[3]={SIGUSR1,SIGUSR2,SIGWINCH};
+    struct raw_action old[3],before[3];
+    struct raw_action actions[3]={
+        {(uintptr_t)first_handler,SA_RESTART,UINT64_C(1)<<(SIGUSR2-1)},
+        {1,SA_RESTART,UINT64_C(1)<<(SIGWINCH-1)},
+        {0,SA_RESTART,UINT64_C(1)<<(SIGUSR2-1)},
+    };
+    for (unsigned i=0;i<3;i++) {
+        CHECK(!syscall(SYS_rt_sigaction,signals[i],&actions[i],&old[i],8));
+        CHECK(!syscall(SYS_rt_sigaction,signals[i],NULL,&before[i],8));
+    }
+    uint64_t blocked=UINT64_C(1)<<(SIGUSR1-1),old_mask=0;
+    CHECK(!syscall(SYS_rt_sigprocmask,SIG_BLOCK,&blocked,&old_mask,8));
+    blocked|=old_mask;
+    CHECK(!kill(getpid(),SIGUSR1));
+    int report[2];CHECK(!pipe(report));
+    struct clear_result result={report[1],blocked};
+    const uint64_t clear=UINT64_C(0x100000000);
+    struct test_clone_args args={.flags=clear|CLONE_VM|CLONE_SIGHAND,.exit_signal=SIGCHLD};
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    args=(struct test_clone_args){.flags=clear,.exit_signal=SIGCHLD};
+    pid_t child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);
+    if (!child) _exit(clear_sighand_child(&result));
+    int status;CHECK(read_one(report[0])=='C');
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    char *stack=malloc(131072);CHECK(stack);
+    for (int vfork=0;vfork<2;vfork++) {
+        uintptr_t *top=(uintptr_t *)(stack+131072-16);
+        top[0]=(uintptr_t)clear_sighand_child;top[1]=(uintptr_t)&result;
+        args=(struct test_clone_args){.flags=clear|CLONE_VM|(vfork?CLONE_VFORK:0),
+            .exit_signal=SIGCHLD,.stack=(uintptr_t)stack,.stack_size=131072-16};
+        child=(pid_t)test_clone3_stack(&args,sizeof(args));CHECK(child>0);
+        CHECK(read_one(report[0])=='C');
+        CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    }
+    free(stack);
+    for (unsigned i=0;i<3;i++) {
+        struct raw_action action;
+        CHECK(!syscall(SYS_rt_sigaction,signals[i],NULL,&action,8));
+        CHECK(!memcmp(&action,&before[i],sizeof(action)));
+    }
+    uint64_t pending=0;
+    CHECK(!syscall(SYS_rt_sigpending,&pending,8) && (pending & (UINT64_C(1)<<(SIGUSR1-1))));
+    struct timespec timeout={0};siginfo_t info={0};
+    uint64_t awaited=UINT64_C(1)<<(SIGUSR1-1);
+    CHECK(syscall(SYS_rt_sigtimedwait,&awaited,&info,&timeout,8)==SIGUSR1);
+    CHECK(!syscall(SYS_rt_sigprocmask,SIG_SETMASK,&old_mask,NULL,8));
+    for (unsigned i=0;i<3;i++) CHECK(!syscall(SYS_rt_sigaction,signals[i],&old[i],NULL,8));
+    CHECK(!close(report[0])&&!close(report[1]));
+}
 static volatile int shared_pidfd_result;
 static int clone_tls_child(void *opaque)
 {
@@ -412,8 +482,9 @@ int main(int argc,char **argv)
     CHECK(!sched_setaffinity(0,sizeof(original),&original));
     puts("CLONE-RES CASE thread-files-fs PASS");
     process_cases();puts("CLONE-RES CASE process-vm-files-exec PASS");
+    clear_sighand_case();puts("CLONE-RES CASE clear-sighand PASS");
     clone3_case();puts("CLONE-RES CASE clone3 PASS");
     clone_pidfd_case();puts("CLONE-RES CASE pidfd PASS");
     CHECK(!unlink("/clone-resource-file")&&!rmdir("/clone-resource-dir"));
-    puts("CLONE-RES END 4");return 0;
+    puts("CLONE-RES END 5");return 0;
 }
