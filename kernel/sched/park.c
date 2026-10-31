@@ -255,6 +255,14 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
     KERNEL_IRQ_SCOPE(park_irq);
     if (!token || !reason || !token->task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (token->task != kernel_wait_current_task()) __builtin_trap();
+#if BOAROS_MAX_CPUS > 1
+    struct kernel_wait_record *record_fast = kernel_wait_record_of(token->task);
+    uint64_t state_fast = kernel_wait_record_load(record_fast);
+    if ((state_fast >> 4) == token->generation && (state_fast & 3U) == KERNEL_WAIT_NOTIFIED) {
+        *reason = (enum kernel_wait_wake_reason)((state_fast >> 2) & 3U);
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+#endif
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         if (!matches(token)) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
