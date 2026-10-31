@@ -24,6 +24,7 @@
 #define LINUX_MS_NOEXEC UINT64_C(8)
 #define LINUX_MS_REMOUNT UINT64_C(32)
 #define LINUX_MS_BIND UINT64_C(4096)
+#define LINUX_MS_MOVE UINT64_C(8192)
 #define LINUX_MS_REC UINT64_C(16384)
 #define LINUX_MS_SILENT UINT64_C(32768)
 
@@ -51,7 +52,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     int result;
     uint64_t source_device = 0;
 
-    if (!(flags & LINUX_MS_BIND) && request->arguments[2]) {
+    if (!(flags & (LINUX_MS_BIND|LINUX_MS_MOVE)) && request->arguments[2]) {
         result = import_string(mm, type, sizeof(type), request->arguments[2]);
         if (result) return result;
     }
@@ -65,15 +66,32 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     char *source_name = target + KERNEL_FS_PATH_MAX;
+    /* bind/move不解释type，但Linux仍在解析路径前导入该字符串。 */
+    if ((flags & (LINUX_MS_BIND|LINUX_MS_MOVE)) && request->arguments[2]) {
+        result = import_string(mm, target, KERNEL_FS_PATH_MAX,
+                               request->arguments[2]);
+        if (result) goto Finish;
+    }
     if (request->arguments[0]) {
         result = import_string(mm, source_name, KERNEL_FS_PATH_MAX,
                                request->arguments[0]);
         if (result) goto Finish;
     }
-    if (!(flags & LINUX_MS_BIND) && request->arguments[4]) {
+    if (!(flags & (LINUX_MS_BIND|LINUX_MS_MOVE)) && request->arguments[4]) {
         result = import_string(mm, options, sizeof(options),
                                request->arguments[4]);
         if (result) goto Finish;
+    }
+    if ((flags & (LINUX_MS_BIND|LINUX_MS_MOVE)) && request->arguments[4]) {
+        unsigned char first;
+        size_t copied = 0;
+        /* copy_mount_options接受可读前缀；未使用的选项无需复制其余页。 */
+        enum kernel_uaccess_status status = kernel_copy_from_user(mm, &first,
+            request->arguments[4], sizeof(first), &copied);
+        if (status != KERNEL_UACCESS_STATUS_OK || copied != sizeof(first)) {
+            result = status == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : -KERNEL_EIO;
+            goto Finish;
+        }
     }
     result = import_string(mm, target, KERNEL_FS_PATH_MAX,
                            request->arguments[1]);
@@ -82,7 +100,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
-    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_REC)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC)) {result=-KERNEL_ENOTSUP;goto Finish;}
     if (flags & LINUX_MS_REMOUNT) {
         result=kernel_vfs_remount(covered,flags,options);
         goto Finish;
@@ -92,6 +110,14 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         if (!request->arguments[0]) {result=-KERNEL_EINVAL;goto Finish;}
         result=kernel_vfs_path_resolve(fs_paths.cwd,fs_paths.root,source_name,1,&source);
         if (!result) result=kernel_vfs_bind_mount(source,covered,!!(flags & LINUX_MS_REC));
+        if (source && kernel_vfs_path_release(&source)) __builtin_trap();
+        goto Finish;
+    }
+    if (flags & LINUX_MS_MOVE) {
+        struct kernel_vfs_path *source=NULL;
+        if (!request->arguments[0] || !source_name[0]) {result=-KERNEL_EINVAL;goto Finish;}
+        result=kernel_vfs_path_resolve(fs_paths.cwd,fs_paths.root,source_name,1,&source);
+        if (!result) result=kernel_vfs_move_mount(source,covered);
         if (source && kernel_vfs_path_release(&source)) __builtin_trap();
         goto Finish;
     }
@@ -145,7 +171,7 @@ static int unmount_filesystem(struct kernel_mm *mm,
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     unsigned flags=(uint32_t)request->arguments[1];
-    if (flags & ~2U) return -KERNEL_ENOTSUP;
+    if (flags & ~(2U|8U)) return -KERNEL_ENOTSUP;
     if (!request->arguments[0]) return -KERNEL_EFAULT;
     char *target = 0;
     struct kernel_vfs_path *root = 0;
@@ -157,18 +183,19 @@ static int unmount_filesystem(struct kernel_mm *mm,
                                request->arguments[0]);
     if (result) goto Finish;
     result = kernel_vfs_path_resolve(fs_paths.cwd,
-             fs_paths.root, target, 1, &root);
+             fs_paths.root, target, !(flags & 8U), &root);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
+    flags &= ~8U;
     struct kernel_vfs_mount *mount = kernel_vfs_path_mount(root);
-    if (!flags && !mount->parent && root==fs_paths.root) {
+    if (!kernel_vfs_path_is_mount_root(root)) {
+        result = -KERNEL_EINVAL;
+        goto Finish;
+    }
+    if (!flags && mount==kernel_vfs_path_mount(fs_paths.root)) {
         uint64_t flags=1U|(mount->nosuid?2U:0U)|(mount->nodev?4U:0U)|
             (mount->noexec?8U:0U)|(mount->silent?32768U:0U);
         result=kernel_vfs_remount(root,flags,NULL);
-        goto Finish;
-    }
-    if (mount->root_path != root) {
-        result = -KERNEL_EINVAL;
         goto Finish;
     }
     result=kernel_vfs_umount(root,flags);

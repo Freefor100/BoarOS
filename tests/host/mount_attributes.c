@@ -579,6 +579,7 @@ static void mount_sync_owner(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_umount(child,0)&&!kernel_vfs_path_release(&child)&&!kernel_vfs_reap_mounts());
     assert(!kernel_vfs_path_release(&root));
 }
+#include "mount_move_cases.h"
 int main(int argc,char **argv)
 {
     assert(argc==2);mm_test_attach(0);
@@ -591,7 +592,10 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"views"))mount_views(mount);
+    if(!strcmp(argv[1],"executable-path"))mount_executable_path(mount);
+    else if(!strcmp(argv[1],"move"))mount_move(mount);
+    else if(!strcmp(argv[1],"cwd-unreachable"))mount_cwd_unreachable(mount);
+    else if(!strcmp(argv[1],"views"))mount_views(mount);
     else if(!strcmp(argv[1],"view-tree"))mount_view_tree(mount);
     else if(!strcmp(argv[1],"view-cleanup"))mount_cleanup_failure(mount);
     else if(!strcmp(argv[1],"view-sync"))mount_detached_sync(mount);

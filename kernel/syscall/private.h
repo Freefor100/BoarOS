@@ -65,10 +65,10 @@ enum kernel_syscall_status syscall_handle_statfs(
     struct kernel_syscall_result *decoded, int by_fd);
 
 
-enum kernel_syscall_status syscall_handle_chdir(
+enum kernel_syscall_status syscall_handle_directory_change(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
-    struct kernel_syscall_result *decoded, int by_fd);
+    struct kernel_syscall_result *decoded);
 
 enum kernel_syscall_status syscall_handle_getcwd(
     struct kernel_task *caller,

@@ -1,5 +1,6 @@
 #include "vfs_internal.h"
 #include <kernel/errno.h>
+#include <kernel/credentials.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/task.h>
@@ -209,8 +210,8 @@ int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
     return 0;
 }
 
-int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
-                              struct kernel_vfs_path *path)
+static int set_directory(const struct kernel_fs_context *fs,
+                         struct kernel_vfs_path *path, int root)
 {
     struct kernel_vfs_stat stat;
     if (!kernel_fs_context_is_live(fs) || !path) return -KERNEL_EINVAL;
@@ -220,17 +221,34 @@ int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
         return -KERNEL_ENOTDIR;
     result = kernel_vfs_path_permission(path,KERNEL_VFS_MAY_EXEC);
     if (result) return result;
+    if (root && !kernel_credentials_capable(kernel_credentials_current(),
+                                            KERNEL_CAP_SYS_CHROOT))
+        return -KERNEL_EPERM;
     result = kernel_vfs_path_acquire(path);
     if (result) return result;
     struct kernel_vfs_path *previous;
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
         if (!kernel_fs_context_is_live(fs)) __builtin_trap();
-        previous = fs->record->cwd;
-        fs->record->cwd = path;
+        previous = root ? fs->record->root : fs->record->cwd;
+        if (root) fs->record->root = path;
+        else fs->record->cwd = path;
     }
     if (kernel_vfs_path_release(&previous)) __builtin_trap();
     return 0;
+}
+
+int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
+                              struct kernel_vfs_path *path)
+{
+    return set_directory(fs, path, 0);
+}
+
+int kernel_fs_context_set_root(const struct kernel_fs_context *fs,
+                               struct kernel_vfs_path *path)
+{
+    /* root与cwd各自持有路径；chroot保留原cwd，包括它仍位于新根外的情况。 */
+    return set_directory(fs, path, 1);
 }
 
 enum kernel_fs_context_status kernel_fs_context_resolve_user_path(

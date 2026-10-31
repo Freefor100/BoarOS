@@ -183,6 +183,9 @@ enum kernel_files_status kernel_files_fstatfs(
 enum kernel_files_status kernel_files_chdir(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result);
+enum kernel_files_status kernel_files_chroot(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result);
 enum kernel_files_status kernel_files_fchdir(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     int64_t fd, int64_t *linux_result);

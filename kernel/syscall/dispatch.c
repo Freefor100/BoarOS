@@ -28,6 +28,7 @@
 #define LINUX_SYSCALL_MOUNT 40U
 #define LINUX_SYSCALL_CHDIR 49U
 #define LINUX_SYSCALL_FCHDIR 50U
+#define LINUX_SYSCALL_CHROOT 51U
 #define LINUX_SYSCALL_RENAMEAT2 276U
 #define LINUX_SYSCALL_EVENTFD2 19U
 #define LINUX_SYSCALL_EPOLL_CREATE1 20U
@@ -427,9 +428,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
         if (syscall_handle_getcwd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_CHDIR ||
-               request->number == LINUX_SYSCALL_FCHDIR) {
-        if (syscall_handle_chdir(caller, request, &decoded,
-                request->number == LINUX_SYSCALL_FCHDIR) != KERNEL_SYSCALL_STATUS_OK)
+               request->number == LINUX_SYSCALL_FCHDIR ||
+               request->number == LINUX_SYSCALL_CHROOT) {
+        if (syscall_handle_directory_change(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_LINKAT) {
         if (syscall_handle_linkat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)

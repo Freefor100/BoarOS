@@ -13,7 +13,7 @@ for shift in ${MOUNT_ATTRIBUTES_HOST_SHIFTS:-12 14}; do
         kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
         kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
         -Wl,--gc-sections,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_allocate,--wrap=kernel_vfs_mount_initialize -o "$build_dir/check-$shift"
-    for group in ${MOUNT_ATTRIBUTES_HOST_GROUPS:-execute devices mapping admission locking remount remount-race remount-sync views view-tree view-cleanup view-sync view-sync-publish view-deep view-chain view-sync-owner}; do
+    for group in ${MOUNT_ATTRIBUTES_HOST_GROUPS:-move cwd-unreachable executable-path execute devices mapping admission locking remount remount-race remount-sync views view-tree view-cleanup view-sync view-sync-publish view-deep view-chain view-sync-owner}; do
         timeout 30s "$build_dir/check-$shift" "$group"
     done
 done
