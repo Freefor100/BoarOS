@@ -40,6 +40,12 @@ libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序，使用 POSI
 完整源码打印自己的 `ACL TESTS RESULTS`，而原 judge 读取 LTP `Summary:`，
 两者的结果格式也需要分别解释。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/nfsv4/acl/acl1.c)
 
+真实程序另以 libacl 2.3.2 和 attr 2.5.2 静态构建，并在独立盘中提供参数及测试身份。
+RV、LA 分别使用同一 ELF 对照 Linux 与 BoarOS，`acl1` 均输出 15 passed、0 failed；
+附加消费者验证用户／组权限、mask、chmod 和默认 ACL 继承，两次启动检查 ext4 重启读回。
+该源码无论结果如何都返回 1，因此按原输出区分结果。此定向结果与原发布程序 0/0 分开记录；
+复现入口见[真实 libacl 消费者](../modules/vfs-ext4.md#通用边界)。
+
 ### LA glibc setxattr01：clone3 的 CLONE_CLEAR_SIGHAND 缺口（已修复）
 
 本次原程序在准备阶段报告 `mkfs.ext4 does not exist` 并以 TCONF 退出。
@@ -212,12 +218,16 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 
 | 项目 | 实际问题 | 当前状态／依据 |
 |---|---|---|
-| `madvise01`的扩展建议 | 五种基础操作及DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK通过；其余11种建议返回EINVAL，原程序记TCONF。 | 四配置各9/20。REMOVE、dump策略、KSM/大页、FREE、COLD/PAGEOUT等为真实功能缺口；详见[本批结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。 |
+| `madvise01`的扩展建议 | 10月25日原程序中五种基础操作及DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK通过；其余11种建议返回EINVAL，原程序记TCONF。 | 当时四配置各9/20，见[原结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。之后实现 REMOVE 和匿名 FREE；原程序定向重跑四配置均 **11/20**，11项通过、9项TCONF，FREE实际通过。dump策略、KSM/大页、COLD/PAGEOUT仍是功能缺口。 |
 | `madvise02`的WILLNEED/EBADF项 | 固定源码`tcases_filter()`因历史swap-prefetch变更主动将该条标为skip，与这次实际syscall结果无关。 | 四配置12/13。另有FREE、KSM、WIPEONFORK等负向输入得到EINVAL；这些TPASS仅验证该输入的错误，不表示正向操作已实现。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/madvise/madvise02.c)。 |
 | 自有WILLNEED对照的swap配置 | 固定Linux在CONFIG_SWAP=n时对普通匿名/纯BSS的WILLNEED返回EBADF；LA原platform参考为SWAP=y，RV及BoarOS无swap，首次LA对照因此结果不同。 | madvise消费者使用独立`platform-noswap`的16 KiB LA参考缓存，保留原platform。不是替换官方libc/ELF，也不改变原测例判分。真实文件缓存装入、无PTE与最后unmap/close握手另有直接检查。 |
 | `shmctl01`的枚举前置查询 | 原先在`get_shm_idx_from_id()`的SHM_INFO(14)返回EINVAL；INFO/STAT/ANY和最高槽返回值已接入。 | 第一阶段四配置均进入主体并12/12通过；包含20个子进程的附加、解除和fork统计。STAT_ANY及槽复用另由直接消费者验证，见[本阶段结果](oscomp-ltp-analysis.md#fork策略与shm查询原程序结果2026-10-25)。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/shmctl/shmctl01.c)。 |
 
-`shmctl02`的nobody输入问题统一列于前面的运行库和原盘依赖表。普通映射DONTNEED、私有COW与共享后备内容由直接程序验证；当前VDSO DONTNEED返回EINVAL，Linux特殊映射可重装，这是仍保留的内核兼容缺口。
+补齐 FREE 后的原 `madvise01` 定向运行保留原 ELF、参数和 judge：RV glibc／musl
+分别耗时 0.197／0.114 秒，LA glibc／musl 分别耗时 0.174／0.104 秒。四项均退出 0、
+无超时，根盘及第二盘各分区的八次检查全部正常。
+
+`shmctl02`的nobody输入问题统一列于前面的运行库和原盘依赖表。普通映射DONTNEED、私有COW与共享后备内容由直接程序验证；vDSO 的 DONTNEED 已支持重新装入信号返回代码，两架构单核及多核短例覆盖重装与实际信号返回。
 
 ## 原盘futex覆盖范围
 
