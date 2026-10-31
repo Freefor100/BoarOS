@@ -76,6 +76,12 @@ enum kernel_open_file_status kernel_open_file_create_at(
     const struct kernel_vfs_open_request *request,
     struct kernel_open_file_description **owner, int *created, int *linux_result);
 
+/* Recheck current execute permission and acquire an independent executable
+ * owner from the actual path identity, including an unlinked O_PATH file. */
+enum kernel_open_file_status kernel_open_file_create_executable_path(
+    struct kernel_heap *heap, struct kernel_vfs_path *path,
+    struct kernel_open_file_description **owner, int *linux_result);
+
 enum kernel_open_file_status kernel_open_file_create(
     struct kernel_heap *heap,
     struct kernel_vfs_mount *mount,

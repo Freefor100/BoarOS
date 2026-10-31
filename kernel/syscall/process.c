@@ -219,11 +219,13 @@ enum kernel_syscall_status syscall_handle_execve(
 #endif
     int64_t linux_result;
 
-    if (kernel_execve_prepare(caller,
-                              request->arguments[0],
-                              request->arguments[1],
-                              request->arguments[2],
-                              &linux_result) != KERNEL_EXEC_STATUS_OK) {
+    enum kernel_exec_status status = request->number == 281
+        ? kernel_execveat_prepare(caller, (int32_t)request->arguments[0],
+            request->arguments[1], request->arguments[2], request->arguments[3],
+            (uint32_t)request->arguments[4], &linux_result)
+        : kernel_execve_prepare(caller, request->arguments[0],
+            request->arguments[1], request->arguments[2], &linux_result);
+    if (status != KERNEL_EXEC_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = linux_result == 0

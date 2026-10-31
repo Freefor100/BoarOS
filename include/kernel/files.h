@@ -509,6 +509,10 @@ enum kernel_files_status kernel_files_pin(
     int64_t fd,
     struct kernel_open_file_description **owner,
     int64_t *linux_result);
+enum kernel_files_status kernel_files_pin_exec(
+    struct kernel_files *files, int64_t fd,
+    struct kernel_open_file_description **owner, uint32_t *fd_flags,
+    int64_t *linux_result);
 /* Reject path-only descriptors before accessing operation buffers. */
 enum kernel_files_status kernel_files_pin_data(
     struct kernel_files *files,

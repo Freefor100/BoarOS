@@ -160,6 +160,10 @@ struct kernel_vfs_file {
  * Absolute paths start at root. */
 int kernel_vfs_path_open(struct kernel_vfs_path *path,
                          struct kernel_vfs_file *file);
+/* Reopen this exact path as executable, checking current permissions and
+ * retaining its mount view and an independent executable lease on success. */
+int kernel_vfs_path_open_executable(struct kernel_vfs_path *path,
+                                    struct kernel_vfs_file *file);
 int kernel_vfs_path_string(const struct kernel_vfs_path *path,
                            const struct kernel_vfs_path *root,
                            char *buffer, size_t capacity);

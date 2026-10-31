@@ -190,6 +190,19 @@ static void release_record_locks(struct kernel_open_file_description *file)
                                &file->record_locks, file->heap);
 }
 
+static void initialize_path_description(struct kernel_open_file_description *file,
+    struct kernel_heap *heap)
+{
+    file->heap = heap;
+    file->references = 1U;
+    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+    if (kernel_vfs_file_generated(&file->file))
+        file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
+    file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
+}
+
 static enum kernel_open_file_status create_open_file(
     struct kernel_heap *heap,
     struct kernel_vfs_mount *mount,
@@ -227,14 +240,7 @@ static enum kernel_open_file_status create_open_file(
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    file->heap = heap;
-    file->references = 1U;
-    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
-    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
-    if (kernel_vfs_file_generated(&file->file))
-        file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
-    file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
-    file->credentials = kernel_credentials_get(kernel_credentials_current());
+    initialize_path_description(file, heap);
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -263,15 +269,32 @@ enum kernel_open_file_status kernel_open_file_create_at(
     if (result) {
         kernel_heap_release(heap, file);
     } else {
-        file->heap = heap;
-        file->references = 1U;
-        file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
-        kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
-        if (kernel_vfs_file_generated(&file->file))
-            file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
-        file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
-        file->credentials = kernel_credentials_get(kernel_credentials_current());
-    *owner = file;
+        initialize_path_description(file, heap);
+        *owner = file;
+    }
+    *linux_result = result;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+enum kernel_open_file_status kernel_open_file_create_executable_path(
+    struct kernel_heap *heap, struct kernel_vfs_path *path,
+    struct kernel_open_file_description **owner, int *linux_result)
+{
+    if (!heap || !path || !owner || *owner || !linux_result)
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap,
+        1U, sizeof(*file), (void **)&file);
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_OPEN_FILE_STATUS_STATE;
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_OPEN_FILE_STATUS_OK;
+    }
+    int result = kernel_vfs_path_open_executable(path, &file->file);
+    if (result) kernel_heap_release(heap, file);
+    else {
+        initialize_path_description(file, heap);
+        *owner = file;
     }
     *linux_result = result;
     return KERNEL_OPEN_FILE_STATUS_OK;

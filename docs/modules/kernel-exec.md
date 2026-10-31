@@ -1,6 +1,6 @@
 # 进程映像替换模块
 
-本文描述 Linux `execve(221)` 的准备事务、共用映像策略和 scheduler 提交边界。ELF source 与缺页规则见[用户 ELF64 装载模块](user-elf.md)，任务与 MM 生命周期见[内核调度与进程生命周期模块](kernel-scheduler.md)。
+本文描述 Linux `execve(221)`、`execveat(281)` 的准备事务、共用映像策略和 scheduler 提交边界。ELF source 与缺页规则见[用户 ELF64 装载模块](user-elf.md)，任务与 MM 生命周期见[内核调度与进程生命周期模块](kernel-scheduler.md)。
 
 ## 入口与职责
 
@@ -11,9 +11,13 @@
 | `include/arch/elf.h`、`include/arch/task.h` | machine/HWCAP/trampoline 与初始、clone、exec 寄存器操作 |
 | `kernel/sched/exec.c` | 撤下 CLOEXEC 后一致发布 MM 与凭据，重建 Trap Frame 并处理旧资源 |
 | `kernel/exec_credentials.c` | 从实际执行 ELF 的属性计算 set-ID、文件 capability、AT_SECURE 和 dumpable |
-| `kernel/syscall/process.c`、`arch/riscv/trap.c` | 解码 syscall 221 和提交动作 |
+| `kernel/syscall/process.c`、架构 trap 入口 | 解码 syscall 221/281 和提交动作 |
 
-通用入口 `kernel_execve_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA已通过内存reader、PCI根盘、原版LP64S静态和LP64D动态musl同一image/exec契约的双侧验收。
+共用入口 `kernel_execveat_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_execve_prepare()` 以 `AT_FDCWD` 和零 flags 调用该入口。`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA已通过内存reader、PCI根盘、原版LP64S静态和LP64D动态musl同一image/exec契约的双侧验收。
+
+`execveat` 的 dirfd 和 flags 按 Linux `int` 截断为 32 位。绝对路径忽略 dirfd；相对路径从实际目录 OFD 开始，`AT_FDCWD` 使用 cwd。支持 `AT_EMPTY_PATH` 和 `AT_SYMLINK_NOFOLLOW`，未知 flags 返回 EINVAL。名字先导入，但 NPROC 和未知 flags 错误先于名字错误返回；flags 有效时，未指定 `AT_EMPTY_PATH` 的空名返回 ENOENT。路径与 fd 的打开错误先于 argv/envp 导入错误。
+
+空名执行使用真实普通文件或 `O_PATH` OFD 的 path identity，重新检查当前执行者的权限和该 mount view 的 noexec，并取得独立执行租约。打开时的凭据不代替执行时权限；文件被 rename、unlink 或所属 mount view 被移动后，仍执行该 OFD 持有的对象。它不构造 proc 路径再解析。非空相对路径使用相同目录身份；fd 与 `FD_CLOEXEC` 在同一次 FD 表锁下捕获，临时 OFD owner 在成功打开后归还，真实关闭错误仍由事务保留。
 
 ## 准备事务
 
@@ -21,7 +25,7 @@
 
 ```text
 清理上次仍有 owner 的事务
--> 捕获 filename 并解析 cwd
+-> 捕获 filename，检查 flags 并选择 root/cwd/dirfd identity
 -> 打开 regular executable OFD
 -> 捕获 argv/envp 内核快照
 -> 按 #! 转换解释器与 argv，最多五次
@@ -34,7 +38,7 @@
 
 主程序支持 RISC-V `ET_EXEC` 和 `ET_DYN`；解释器支持非递归 `ET_EXEC`/`ET_DYN`。动态 source 的 `PT_DYNAMIC`/`PT_TLS` 等元数据留给用户动态链接器。主文件格式或架构错误映射为 `-ENOEXEC`；解释器路径不存在时保留路径 errno，不足64字节的解释器header按Linux elf_read返回 `-EIO`，完整header的格式或架构不正确映射为 `-ELIBBAD`；资源、I/O 和参数限制分别返回 `-ENOMEM`、`-EIO`、`-E2BIG`。解析、打开或构造失败时保留旧 MM、凭据、dumpable 和 FD 状态。
 
-事务中的 `executable_file`/`interpreter_file` 是 source 创建前的 OFD owners；source 创建成功后由 source 持有 OFD，事务改为持有 source owner。映像构造给 MM 增加各 source 的引用，事务在提交后释放自己的引用。解析、打开或真实 VFS/I/O 清理失败时保留准确 owner；物理页、VMA metadata 和堆的合法释放完成即结束，分配器不变量错误进入 fatal。参数字符串、向量和路径的纯堆清理直接释放并清空指针，不生成 `CLEANUP_REQUIRED`；重试只处理仍持有的 MM、source 或 OFD。
+事务中的 `executable_file`/`interpreter_file` 是 source 创建前的 OFD owners；`path_file` 只持有打开期间的 dirfd pin。source 创建成功后由 source 持有 OFD，事务改为持有 source owner。映像构造给 MM 增加各 source 的引用，事务在提交后释放自己的引用。解析、打开或真实 VFS/I/O 清理失败时保留准确 owner；物理页、VMA metadata 和堆的合法释放完成即结束，分配器不变量错误进入 fatal。参数字符串、向量和路径的纯堆清理直接释放并清空指针，不生成 `CLEANUP_REQUIRED`；重试只处理仍持有的 MM、source 或 OFD。
 
 ## 执行凭据
 
@@ -87,7 +91,9 @@ make test-glibc-riscv
 make test-riscv
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵与 `execveat` 留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。有效参数的指针表及 auxv 也计入 128 KiB 序列化限制，超限返回 E2BIG，构造不发布新 MM、也不执行 CLOEXEC；`test-elf-boundary-riscv/loongarch` 对照失败后 PID、数据及 CLOEXEC owner 保持。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。有效参数的指针表及 auxv 也计入 128 KiB 序列化限制，超限返回 E2BIG，构造不发布新 MM、也不执行 CLOEXEC；`test-elf-boundary-riscv/loongarch` 对照失败后 PID、数据及 CLOEXEC owner 保持。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+
+`python3 tests/network_runner.py --workload execveat --arch riscv --cpus 1 --memory 512M --kernel <kernel> --output <目录>` 运行原版 musl ELF 的 Linux/BoarOS 对照；`--arch loongarch` 使用 LA 后端。用例检查路径与 fd 身份、错误先后、argv/envp/auxv、CLOEXEC、解释器、当前权限、noexec、写入排斥、非组长 exec、set-ID/filecap、NNP、nosuid 和 unsafe CLONE_FS。
 
 凭据规则的宿主直接反例使用 `sh tests/credentials-host.sh`，覆盖 4/16 KiB 页配置和候选／账户归还。`tests/workloads/credentials/exec.c` 用同一真实 ELF 检查 set-ID、filecap、auxv、安全加载、失败 exec、非组长 exec、CLONE_FS、CLOEXEC 与权限清除；`tests/credentials-fixture.py` 向独立 ext4 测试盘写入数字 UID/GID 和固定 EA 样本，并读回校验。固定 Linux 对照须启用 `CONFIG_EXT4_FS_SECURITY`，否则 ext4 不提供文件 capability 属性。
 
@@ -96,7 +102,12 @@ make test-riscv
 `#!` 首行读取窗口为 256 字节，空格/tab 分隔解释器路径，剩余去尾空格/tab的内容
 作为一个可选参数。没有换行时解释器路径必须完整；允许截断可选参数。
 每次转换删除旧 argv[0]，前置解释器、可选参数和当前脚本路径；保留 envp，
-`AT_EXECFN` 保留最初用户路径。最多五次转换，超过返回 ELOOP；打开解释器保留
+`AT_EXECFN` 保留最初执行名。普通路径保留用户原始拼写；非 `AT_FDCWD` 的相对
+`execveat` 路径使用 `/dev/fd/<fd>/<原路径>`，空名使用 `/dev/fd/<fd>`。这些名字
+同时作为最初脚本的 argv 名，后续脚本层使用自己的解释器路径。若该名字依赖
+`FD_CLOEXEC` 的 fd，脚本返回 ENOENT；ELF 可直接映射已打开文件，允许 CLOEXEC fd。
+`#!` 指定的解释器及 ELF 的 `PT_INTERP` 仍按进程 root/cwd 解析，不相对于 dirfd。
+最多五次转换，超过返回 ELOOP；打开解释器保留
 ENOENT/EACCES 等错误，无 shebang 文本仍返回 ENOEXEC，由用户 shell 决定回退。
 
 脚本 OFD 在打开下一解释器前释放，释放失败仍由 exec 事务持有；字符串与向量仍使用

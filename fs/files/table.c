@@ -578,10 +578,11 @@ enum kernel_files_status kernel_files_pin_data(
     return status;
 }
 
-enum kernel_files_status kernel_files_pin(
+static enum kernel_files_status pin_file(
     struct kernel_files *files,
     int64_t fd,
     struct kernel_open_file_description **owner,
+    uint32_t *fd_flags,
     int64_t *linux_result)
 {
     struct kernel_open_file_description *description;
@@ -601,8 +602,24 @@ enum kernel_files_status kernel_files_pin(
         return KERNEL_FILES_STATUS_STATE;
     }
     *owner = description;
+    if (fd_flags) *fd_flags = files->record->slots[fd].flags;
     *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_pin(struct kernel_files *files, int64_t fd,
+    struct kernel_open_file_description **owner, int64_t *linux_result)
+{
+    return pin_file(files, fd, owner, NULL, linux_result);
+}
+
+enum kernel_files_status kernel_files_pin_exec(struct kernel_files *files, int64_t fd,
+    struct kernel_open_file_description **owner, uint32_t *fd_flags,
+    int64_t *linux_result)
+{
+    if (!fd_flags) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    /* 描述符复用或修改CLOEXEC时，文件身份和标志来自同一次表内查询。 */
+    return pin_file(files, fd, owner, fd_flags, linux_result);
 }
 
 enum kernel_files_status kernel_files_open_console(

@@ -1646,6 +1646,29 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,struct kernel_vfs_file *fi
     return path_open_locked(path,file);
 }
 
+static int path_open_executable_locked(struct kernel_vfs_path *path,struct kernel_vfs_file *file,unsigned access)
+{
+    uint32_t type=path->file.mode & KERNEL_VFS_S_IFMT;
+    if (type==KERNEL_VFS_S_IFLNK) return -KERNEL_ELOOP;
+    if (type!=KERNEL_VFS_S_IFREG || path->file.mount->noexec) return -KERNEL_EACCES;
+    int result=kernel_vfs_path_permission(path,access|KERNEL_VFS_MAY_EXEC);
+    return result ? result : path_open_locked(path,file);
+}
+
+int kernel_vfs_path_open_executable(struct kernel_vfs_path *path,struct kernel_vfs_file *file)
+{
+    if (!path || !path->references || !path->file.mount || !path->file.mount->private_data ||
+        !file || file->state || file->private_data || file->path) return -KERNEL_EINVAL;
+    KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(path->file.mount));
+    int result;
+    {
+        KERNEL_LOCK_SCOPE(guard);namespace_node_lock(path->file.private_data,&guard,0);
+        result=((struct kernel_vfs_instance *)path->file.mount->private_data)->quiescing ? -KERNEL_EIO :
+            path_open_executable_locked(path,file,0);
+    }
+    return finish_executable_open(file,result);
+}
+
 static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint32_t mode,
     struct kernel_vfs_file *file,struct kernel_vfs_path **path_owner)
 {
@@ -1719,16 +1742,12 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                 result=-KERNEL_EISDIR;
             else if ((request->access & 2U) &&
                 (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) result=-KERNEL_EISDIR;
-            else if ((flags & KERNEL_VFS_OPEN_EXECUTABLE) &&
-                (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) result=-KERNEL_EACCES;
+            else if (flags & KERNEL_VFS_OPEN_EXECUTABLE) result=path_open_executable_locked(resolved,file,request->access);
             else if (resolved->file.mount->nodev &&
                 ((resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFCHR ||
                  (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)) result=-KERNEL_EACCES;
-            else if ((flags & KERNEL_VFS_OPEN_EXECUTABLE) && resolved->file.mount->noexec)
-                result=-KERNEL_EACCES;
             else {
-                result=kernel_vfs_path_permission(resolved,request->access |
-                    ((flags & KERNEL_VFS_OPEN_EXECUTABLE) ? KERNEL_VFS_MAY_EXEC : 0));
+                result=kernel_vfs_path_permission(resolved,request->access);
                 if (!result) result=path_open_locked(resolved,file);
             }
         } else {

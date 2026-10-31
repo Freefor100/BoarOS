@@ -118,6 +118,7 @@
 #define LINUX_SYSCALL_MREMAP 216U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
+#define LINUX_SYSCALL_EXECVEAT 281U
 #define LINUX_SYSCALL_MMAP 222U
 #define LINUX_SYSCALL_MSYNC 227U
 #define LINUX_SYSCALL_MPROTECT 226U
@@ -755,7 +756,8 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
-    } else if (request->number == LINUX_SYSCALL_EXECVE) {
+    } else if (request->number == LINUX_SYSCALL_EXECVE ||
+               request->number == LINUX_SYSCALL_EXECVEAT) {
         if (syscall_handle_execve(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

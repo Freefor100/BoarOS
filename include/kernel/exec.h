@@ -21,4 +21,13 @@ enum kernel_exec_status kernel_execve_prepare(
     uint64_t user_envp,
     int64_t *linux_result);
 
+enum kernel_exec_status kernel_execveat_prepare(
+    struct kernel_task *task,
+    int32_t dirfd,
+    uint64_t user_filename,
+    uint64_t user_argv,
+    uint64_t user_envp,
+    uint32_t flags,
+    int64_t *linux_result);
+
 #endif

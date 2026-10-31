@@ -24,6 +24,7 @@
     (KERNEL_EXEC_STRING_LIMIT / sizeof(uint64_t))
 #define KERNEL_EXEC_INITIAL_STRING_CAPACITY 256U
 #define KERNEL_EXEC_INITIAL_VECTOR_CAPACITY 8U
+#define KERNEL_EXEC_FD_NAME_PREFIX 32U
 
 enum exec_capture_status {
     EXEC_CAPTURE_OK = 0,
@@ -43,6 +44,7 @@ static int transaction_resources_empty(
 {
     return transaction->executable_file == 0 &&
            transaction->interpreter_file == 0 &&
+           transaction->path_file == 0 &&
            transaction->executable_source == 0 &&
            transaction->interpreter_source == 0 &&
            mm_owner_absent(&transaction->image.mm) &&
@@ -108,6 +110,11 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
             KERNEL_OPEN_FILE_STATUS_OK) {
             failed = 1;
         }
+    }
+    if (transaction->path_file != 0 &&
+        kernel_open_file_release(&transaction->path_file) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+        failed = 1;
     }
     release_allocation(transaction, (void **)&transaction->environment);
     release_allocation(transaction, (void **)&transaction->arguments);
@@ -438,7 +445,7 @@ static void discard_arg_zero(struct kernel_exec_transaction *transaction)
 /* 只消费首行的 256 字节；解释器路径不得截断，可选参数保持一个 argv。 */
 static enum exec_capture_status expand_scripts(
     struct kernel_exec_transaction *transaction, const struct kernel_fs_context *fs,
-    int64_t *error)
+    int path_inaccessible, int64_t *error)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     char header[256], next_path[256];
@@ -484,6 +491,11 @@ static enum exec_capture_status expand_scripts(
         if (has_argument) {
             *arg++ = 0;
             while (*arg == ' ' || *arg == '\t') arg++;
+        }
+        /* ELF 已映射文件；脚本解释器还要按这个 fd 名重新打开脚本。 */
+        if (path_inaccessible) {
+            *error = -KERNEL_ENOENT;
+            return EXEC_CAPTURE_LINUX_ERROR;
         }
         size_t extra = has_argument ? 3U : 2U;
         discard_arg_zero(transaction);
@@ -558,6 +570,90 @@ enum kernel_exec_status kernel_execve_prepare(
     uint64_t user_envp,
     int64_t *linux_result)
 {
+    return kernel_execveat_prepare(task, KERNEL_FS_AT_FDCWD,
+        user_filename, user_argv, user_envp, 0, linux_result);
+}
+
+/* 只生成 Linux 向解释器/AT_EXECFN 暴露的名字，文件打开从不解析此名字。 */
+static size_t prepend_fd_name(char *path, size_t length, int32_t dirfd)
+{
+    char prefix[KERNEL_EXEC_FD_NAME_PREFIX], digits[10];
+    size_t used = 8, count = 0;
+    uint32_t value = (uint32_t)dirfd;
+    memcpy(prefix, "/dev/fd/", used);
+    do {
+        digits[count++] = (char)('0' + value % 10U);
+        value /= 10U;
+    } while (value);
+    while (count) prefix[used++] = digits[--count];
+    if (length) prefix[used++] = '/';
+    memmove(path + used, path, length + 1);
+    memcpy(path, prefix, used);
+    return length + used;
+}
+
+static enum exec_capture_status open_executable_at(
+    struct kernel_exec_transaction *transaction, struct kernel_files *files,
+    const struct kernel_fs_paths *paths, int32_t dirfd, uint32_t flags,
+    int *path_inaccessible, int64_t *error)
+{
+    const char *name = transaction->original_path;
+    struct kernel_vfs_path *start = name[0] == '/' ? paths->root : paths->cwd;
+    uint32_t fd_flags = 0;
+    int result;
+    enum kernel_open_file_status status;
+
+    if (name[0] != '/' && dirfd != KERNEL_FS_AT_FDCWD) {
+        if (kernel_files_pin_exec(files, dirfd, &transaction->path_file,
+                &fd_flags, error) != KERNEL_FILES_STATUS_OK)
+            return EXEC_CAPTURE_STATE;
+        if (*error) return EXEC_CAPTURE_LINUX_ERROR;
+        start = kernel_open_file_path(transaction->path_file);
+        if (name[0] && (kernel_open_file_mode(transaction->path_file) &
+                KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
+            *error = -KERNEL_ENOTDIR;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        if (!start) {
+            *error = -KERNEL_EACCES;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        *path_inaccessible = !!(fd_flags & 1U);
+    }
+    if (!name[0]) {
+        status = kernel_open_file_create_executable_path(transaction->heap,
+            start, &transaction->executable_file, &result);
+    } else {
+        struct kernel_vfs_open_request request = {
+            .flags = KERNEL_VFS_OPEN_EXECUTABLE |
+                ((flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW) ? 0 : KERNEL_VFS_OPEN_FOLLOW),
+        };
+        status = kernel_open_file_create_at(transaction->heap, start,
+            paths->root, name, &request, &transaction->executable_file,
+            NULL, &result);
+    }
+    if (status != KERNEL_OPEN_FILE_STATUS_OK) return EXEC_CAPTURE_STATE;
+    if (result) {
+        *error = result;
+        return EXEC_CAPTURE_LINUX_ERROR;
+    }
+    if (transaction->path_file &&
+        kernel_open_file_release(&transaction->path_file) != KERNEL_OPEN_FILE_STATUS_OK) {
+        *error = -KERNEL_EIO;
+        return EXEC_CAPTURE_LINUX_ERROR;
+    }
+    return EXEC_CAPTURE_OK;
+}
+
+enum kernel_exec_status kernel_execveat_prepare(
+    struct kernel_task *task,
+    int32_t dirfd,
+    uint64_t user_filename,
+    uint64_t user_argv,
+    uint64_t user_envp,
+    uint32_t flags,
+    int64_t *linux_result)
+{
     struct kernel_mm *mm;
     struct kernel_files *files;
     const struct kernel_fs_context *fs;
@@ -567,6 +663,7 @@ enum kernel_exec_status kernel_execve_prepare(
     struct kernel_exec_image_request image_request={0};
     size_t filename_length;
     int path_result;
+    int path_inaccessible = 0;
     enum kernel_exec_image_status image_status;
     enum kernel_heap_status heap_status;
     enum kernel_uaccess_status access_status;
@@ -605,8 +702,10 @@ enum kernel_exec_status kernel_execve_prepare(
         kernel_heap_release(files->heap, transaction);
         return KERNEL_EXEC_STATUS_STATE;
     }
+    /* 只有dirfd命名可能添加前缀；普通exec保留原有路径容量。 */
     heap_status = kernel_heap_allocate(transaction->heap,
-                                       KERNEL_FS_PATH_MAX,
+                                       KERNEL_FS_PATH_MAX +
+                                           (dirfd == KERNEL_FS_AT_FDCWD ? 0U : KERNEL_EXEC_FD_NAME_PREFIX),
                                        (void **)&transaction->original_path);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
         return heap_status == KERNEL_HEAP_STATUS_EMPTY
@@ -622,6 +721,11 @@ enum kernel_exec_status kernel_execve_prepare(
         user_filename,
         KERNEL_FS_PATH_MAX,
         &filename_length);
+    /* Linux 先导入名字，但 NPROC 和 open_execat flags 错误先于名字错误返回。 */
+    int nproc=kernel_nproc_exec(task);
+    if(nproc)return finish_prepare_failure(task,transaction,nproc,linux_result);
+    if (flags & ~(KERNEL_FILES_AT_EMPTY_PATH | KERNEL_FILES_AT_SYMLINK_NOFOLLOW))
+        return finish_prepare_failure(task, transaction, -KERNEL_EINVAL, linux_result);
     if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
         return finish_prepare_failure(task,
                                       transaction,
@@ -637,22 +741,18 @@ enum kernel_exec_status kernel_execve_prepare(
     if (access_status != KERNEL_UACCESS_STATUS_OK) {
         return finish_prepare_state(task, transaction);
     }
-    int nproc=kernel_nproc_exec(task);
-    if(nproc)return finish_prepare_failure(task,transaction,nproc,linux_result);
+    if (!filename_length && !(flags & KERNEL_FILES_AT_EMPTY_PATH))
+        return finish_prepare_failure(task, transaction, -KERNEL_ENOENT, linux_result);
     transaction->unsafe_fs=kernel_fs_context_exec_begin(fs,task);
     if (!transaction->unsafe_fs) transaction->exec_fs=fs;
     KERNEL_FS_PATHS(fs_paths, fs);
-    if (kernel_open_file_create_at(transaction->heap,
-            fs_paths.cwd, fs_paths.root,
-            transaction->original_path, &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW | KERNEL_VFS_OPEN_EXECUTABLE},
-            &transaction->executable_file, NULL, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
-        return finish_prepare_state(task, transaction);
-    if (path_result != 0) {
-        return finish_prepare_failure(task,
-                                      transaction,
-                                      path_result,
-                                      linux_result);
-    }
+    capture_status = open_executable_at(transaction, files, &fs_paths, dirfd,
+        flags, &path_inaccessible, linux_result);
+    if (capture_status == EXEC_CAPTURE_LINUX_ERROR)
+        return finish_prepare_failure(task, transaction, *linux_result, linux_result);
+    if (capture_status != EXEC_CAPTURE_OK) return finish_prepare_state(task, transaction);
+    if (dirfd != KERNEL_FS_AT_FDCWD && transaction->original_path[0] != '/')
+        filename_length = prepend_fd_name(transaction->original_path, filename_length, dirfd);
     capture_status = capture_vector(transaction,
                                     mm,
                                     user_argv,
@@ -681,7 +781,7 @@ enum kernel_exec_status kernel_execve_prepare(
     if (capture_status != EXEC_CAPTURE_OK) {
         return finish_prepare_state(task, transaction);
     }
-    capture_status = expand_scripts(transaction, fs, linux_result);
+    capture_status = expand_scripts(transaction, fs, path_inaccessible, linux_result);
     if (capture_status == EXEC_CAPTURE_LINUX_ERROR)
         return finish_prepare_failure(task, transaction, *linux_result, linux_result);
     if (capture_status != EXEC_CAPTURE_OK)
