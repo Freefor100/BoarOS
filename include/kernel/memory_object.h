@@ -6,6 +6,17 @@
 struct kernel_heap;
 struct physical_page_allocator;
 struct kernel_memory_object;
+/* MM owns this node and an actual object reference. stop only unlinks; drain
+ * runs after dropping the MM gate. Notifications borrow nodes, drop metadata
+ * protection and may sleep while acquiring one MM gate; never enter from the
+ * page-index mutex. */
+struct kernel_memory_mapping {
+    struct kernel_memory_mapping *next, **previous, *retired_next;
+    struct kernel_memory_object *object;
+    void *owner;
+    void (*invalidate)(void *, struct kernel_memory_object *, uint64_t, uint64_t);
+    uint32_t borrows;
+};
 struct kernel_memory_budget { uint64_t limit, used; };
 /* limit/budget绑定仅在私有构造期设置；used由对象原子收费，读取用atomic load。 */
 void kernel_memory_object_set_budget(struct kernel_memory_object *, struct kernel_memory_budget *);
@@ -63,6 +74,18 @@ void kernel_memory_object_discard_new_page(
 enum kernel_memory_object_status kernel_memory_object_find_page(
     struct kernel_memory_object *object, uint64_t page_index, uint64_t *physical_address);
 void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t size);
+/* The mutation owner has stopped affected mapping publication and invalidated
+ * PTEs. Remove full backing pages; clear only retained boundary fragments. */
+void kernel_memory_object_punch(struct kernel_memory_object *, uint64_t start, uint64_t end);
+/* Registrations belong to actual MM object owners. A zero expected epoch is
+ * for an empty mapping; nonzero rejects stale fork leaves before publication. */
+int kernel_memory_object_mapping_register(struct kernel_memory_mapping *, uint64_t expected_epoch);
+void kernel_memory_object_mapping_stop(struct kernel_memory_mapping *);
+void kernel_memory_object_mapping_drain(struct kernel_memory_mapping *);
+int kernel_memory_object_epoch(struct kernel_memory_object *, uint64_t *);
+void kernel_memory_object_wait(struct kernel_memory_object *);
+/* The caller drops MM qualification and keeps an actual object reference. */
+void kernel_memory_object_remove(struct kernel_memory_object *, uint64_t start, uint64_t end);
 uint64_t kernel_memory_object_resident_pages(const struct kernel_memory_object *object);
 
 #endif

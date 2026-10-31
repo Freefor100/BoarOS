@@ -135,6 +135,50 @@ static void remote(void)
     for(unsigned i=0;i<cpus;i++){CHECK(!pthread_join(threads[i],0)&&p[i]==i+1);}
     CHECK(!pthread_barrier_destroy(&barrier)&&!munmap(p,page));pass("remote-tlb-refault-shared-mm");
 }
+static void remove_shared_memory(void)
+{
+    unsigned char *p=area(3,MAP_SHARED);memset(p,63,3*page);
+    CHECK(!mprotect(p+page,page,PROT_READ));
+    int to[2],from[2];CHECK(!pipe(to)&&!pipe(from));pid_t c=fork();CHECK(c>=0);
+    if(!c){CHECK(p[page]==63);token(from[1]);expect(to[0]);CHECK(!p[page]&&p[0]==63&&p[2*page]==63);_exit(0);}
+    expect(from[0]);CHECK(!madvise(p+page,1,MADV_REMOVE)&&!p[page]);token(to[1]);joined(c);
+    CHECK(!close(to[0])&&!close(to[1])&&!close(from[0])&&!close(from[1])&&!munmap(p,3*page));
+    int id=shmget(IPC_PRIVATE,2*page,IPC_CREAT|0600);CHECK(id>=0);
+    p=shmat(id,0,0);unsigned char *alias=shmat(id,0,SHM_RDONLY);CHECK(p!=(void*)-1&&alias!=(void*)-1);
+    p[page]=71;CHECK(alias[page]==71);ERROR(madvise(alias+page,page,MADV_REMOVE),EACCES);
+    CHECK(!shmctl(id,IPC_RMID,0)&&!madvise(p+page,page,MADV_REMOVE)&&!alias[page]);
+    CHECK(!shmdt(p)&&!shmdt(alias));pass("remove-shared-anonymous-and-sysv");
+}
+static void remove_file(const char *path,const char *name)
+{
+    int fd=open(path,O_CREAT|O_TRUNC|O_RDWR,0600);CHECK(fd>=0);
+    unsigned char *bytes=malloc(4*page);CHECK(bytes);memset(bytes,83,4*page);
+    CHECK(write(fd,bytes,4*page)==(ssize_t)(4*page));free(bytes);
+    unsigned char *s=mmap(0,3*page,PROT_READ|PROT_WRITE,MAP_SHARED,fd,page);
+    unsigned char *p=mmap(0,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,page);CHECK(s!=MAP_FAILED&&p!=MAP_FAILED);
+    p[page]=97;ERROR(madvise(p,page,MADV_REMOVE),EACCES);
+    int readonly=open(path,O_RDONLY);CHECK(readonly>=0);
+    unsigned char *r=mmap(0,page,PROT_READ,MAP_SHARED,readonly,0);CHECK(r!=MAP_FAILED);
+    ERROR(madvise(r,page,MADV_REMOVE),EACCES);CHECK(!munmap(r,page)&&!close(readonly));
+    CHECK(!mlock(s,page));ERROR(madvise(s,page,MADV_REMOVE),EINVAL);CHECK(!munlock(s,page));
+    off_t offset=lseek(fd,0,SEEK_CUR);CHECK(!mprotect(s,3*page,PROT_READ));
+    CHECK(!madvise(s+page,1,MADV_REMOVE)&&!s[page]&&p[page]==97&&s[0]==83&&s[2*page]==83);
+    struct stat st;CHECK(!fstat(fd,&st)&&st.st_size==(off_t)(4*page)&&lseek(fd,0,SEEK_CUR)==offset);
+    unsigned char byte=1;CHECK(pread(fd,&byte,1,2*page)==1&&!byte);
+    CHECK(!close(fd)&&!unlink(path)&&!madvise(s,page,MADV_REMOVE)&&!s[0]);
+    CHECK(!munmap(p,3*page)&&!munmap(s,3*page));pass(name);
+}
+static void remove_hole(void)
+{
+    unsigned char *p=area(3,MAP_SHARED);memset(p,59,3*page);CHECK(!munmap(p+page,page));
+    ERROR(madvise(p,3*page,MADV_REMOVE),ENOMEM);CHECK(!p[0]&&!p[2*page]);CHECK(!munmap(p,3*page));
+    p=area(1,MAP_PRIVATE);p[0]=73;ERROR(madvise(p,page,MADV_REMOVE),EINVAL);CHECK(p[0]==73);
+    CHECK(!madvise(p,0,MADV_REMOVE));ERROR(madvise(p+1,0,MADV_REMOVE),EINVAL);
+    uintptr_t text=(uintptr_t)remove_hole&~(page-1);
+    ERROR(madvise((void *)text,page,MADV_REMOVE),EACCES);
+    ERROR(madvise(bss+page,page,MADV_REMOVE),EINVAL);
+    CHECK(!munmap(p,page));pass("remove-hole-partial-and-private-anonymous-error");
+}
 static void fork_absent(void)
 {
     unsigned char *p=area(4,MAP_PRIVATE);memset(p,61,4*page);
@@ -221,6 +265,8 @@ int main(void)
     CHECK(!mkdir("/tmp",0755)||errno==EEXIST);CHECK(!mount("tmpfs","/tmp","tmpfs",0,0));
     abi();anonymous();cow();shared();file_case("/tmp/madvise","tmpfs-private-shared-data");
     file_case("/madvise","ext4-private-shared-data");locked();hole();willneed();remote();
+    remove_shared_memory();remove_file("/tmp/remove","remove-tmpfs-shared-file");
+    remove_file("/remove","remove-ext4-shared-file");remove_hole();
     fork_absent();fork_wipe();fork_backing();fork_file("/tmp/fork-policy","dontfork-tmpfs-private-owner");
     fork_file("/fork-policy","dontfork-ext4-private-owner");fork_hole_remap();fork_bss();fork_remote();
     CHECK(!umount("/tmp"));printf("MADVISE END %u\n",cases);

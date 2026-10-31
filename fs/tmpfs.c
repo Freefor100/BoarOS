@@ -502,6 +502,21 @@ static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actu
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->size=size; i->ctime=i->mtime=time; *actual=size; *changed=1; return 0;
 }
+static int punch_inode(struct kernel_vfs_node *n,unsigned mode,uint64_t offset,
+    uint64_t length,uint64_t *actual,int *changed)
+{
+    struct tmp_inode *i=ti(n);
+    *actual=i->size; *changed=0;
+    if (mode != (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE))
+        return -KERNEL_EOPNOTSUPP;
+    uint64_t end=offset+length;
+    if (end>i->size) end=i->size;
+    if (offset<end) kernel_memory_object_punch(i->memory,offset,end);
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->ctime=i->mtime=time; *changed=1;
+    return 0;
+}
 static int pread_inode(struct kernel_vfs_node *n,uint64_t offset,void *buffer,size_t size,size_t *read)
 {
     struct tmp_mount *m=tm(n->instance); struct tmp_inode *i=ti(n); *read=0;
@@ -670,6 +685,7 @@ static void initialize_ops(void)
     o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_node; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
+    o->fallocate=punch_inode;
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->killpriv=killpriv; o->writeback_allowed=no_writeback;
     o->flush=error; o->unmount=unmount; o->xattr=xattr_inode; o->exec_metadata=exec_metadata;

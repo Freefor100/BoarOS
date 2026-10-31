@@ -220,6 +220,33 @@ static void sequential(void)
     assert(!kernel_memory_object_resident_pages(objects[0]) && !pages.shared_anon_pages);
     kernel_memory_object_release(&objects[0]);
 }
+static void punch(void)
+{
+    assert(!kernel_memory_object_create(&heap,&pages,&objects[0]));
+    budget=(struct kernel_memory_budget){.limit=3};kernel_memory_object_set_budget(objects[0],&budget);
+    for(unsigned i=0;i<3;i++) {
+        uint64_t page;int created;
+        assert(!kernel_memory_object_get_page(objects[0],i,&page,&created)&&created);
+        memset(access(page),0x6b,BOAROS_PAGE_SIZE);assert(!physical_page_release(&pages,page));
+    }
+    kernel_memory_object_punch(objects[0],13,2*BOAROS_PAGE_SIZE+29);
+    assert(budget.used==2&&pages.shared_anon_pages==2&&kernel_memory_object_resident_pages(objects[0])==2);
+    for(unsigned i=0;i<3;i++) {
+        uint64_t page;enum kernel_memory_object_status status=kernel_memory_object_find_page(objects[0],i,&page);
+        if(i==1){assert(status==KERNEL_MEMORY_OBJECT_NOT_FOUND);continue;}
+        assert(!status);
+        for(size_t n=0;n<BOAROS_PAGE_SIZE;n++) assert(((unsigned char *)access(page))[n]==
+            ((i==0?n<13:n>=29)?0x6b:0));
+        assert(!physical_page_release(&pages,page));
+    }
+    /* Punch removes the index owner while rejected old preparations keep their
+     * own page references; their finish cannot revive a removed slot. */
+    uint64_t prepared;int created;assert(!kernel_memory_object_prepare_page(objects[0],1,&prepared,&created)&&created);
+    kernel_memory_object_punch(objects[0],BOAROS_PAGE_SIZE,2*BOAROS_PAGE_SIZE);
+    kernel_memory_object_finish_page(objects[0],1,prepared,0);
+    assert(budget.used==2&&kernel_memory_object_resident_pages(objects[0])==2);
+    kernel_memory_object_release(&objects[0]);assert(!budget.used&&!pages.shared_anon_pages);
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -233,7 +260,7 @@ int main(void)
     for(actors=2;actors<=4;actors+=2) {
         parallel_pages(1); parallel_pages(0); references(); preparations(0); preparations(1);
     }
-    sequential();
+    sequential();punch();
     struct kernel_heap_statistics s; kernel_heap_get_statistics(&heap,&s);
     assert(!s.live_allocations && !s.current_pages && physical_page_available(&pages)==baseline);
     assert(!physical_page_allocator_audit(&pages));

@@ -3,6 +3,8 @@
 #include <kernel/physical_page.h>
 #include <kernel/memory_object.h>
 #include <kernel/sync.h>
+#include <kernel/errno.h>
+#include <kernel/irq.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -22,6 +24,13 @@ struct kernel_memory_object_page {
 
 struct kernel_memory_object {
     struct kernel_mutex lock;
+    struct kernel_mutex mutation;
+    struct kernel_raw_lock mapping_metadata;
+    struct kernel_wait_queue mapping_changed;
+    struct kernel_memory_mapping *mappings;
+    uint64_t epoch;
+    uint32_t mapping_borrows;
+    unsigned closing;
     struct kernel_memory_budget *budget;
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
@@ -126,6 +135,10 @@ enum kernel_memory_object_status kernel_memory_object_create(
                    : KERNEL_MEMORY_OBJECT_STATE;
     }
     kernel_mutex_init(&result->lock, 35, (uintptr_t)result);
+    kernel_mutex_init(&result->mutation, 20, (uintptr_t)result);
+    kernel_raw_lock_init(&result->mapping_metadata, KERNEL_RAW_RANK_FILE_MAPPING);
+    kernel_wait_queue_init(&result->mapping_changed);
+    result->epoch = 1;
     result->heap = heap;
     result->allocator = allocator;
     result->bucket_count = SHARED_ANON_INITIAL_BUCKETS;
@@ -155,6 +168,7 @@ void kernel_memory_object_release(struct kernel_memory_object **object)
     owner = *object;
     *object = 0;
     if (__atomic_fetch_sub(&owner->references, 1, __ATOMIC_ACQ_REL) != 1) return;
+    if (owner->mappings || owner->mapping_borrows || owner->closing) __builtin_trap();
     /* 末次owner唯一负责销毁；所有操作的实际对象引用都已结束。 */
     for (size_t bucket = 0U; bucket < owner->bucket_count; bucket++) {
         struct kernel_memory_object_page *page = owner->buckets[bucket];
@@ -375,6 +389,156 @@ void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t
             link = &page->next;
         }
     }
+}
+
+void kernel_memory_object_punch(struct kernel_memory_object *object, uint64_t start, uint64_t end)
+{
+    if (!object || start >= end || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE))
+        __builtin_trap();
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    for (size_t i = 0; i < object->bucket_count; i++) {
+        struct kernel_memory_object_page **link = &object->buckets[i];
+        while (*link) {
+            struct kernel_memory_object_page *page = *link;
+            uint64_t offset = page->index << BOAROS_PAGE_SHIFT;
+            if (offset >= end || (start >= offset && start - offset >= BOAROS_PAGE_SIZE)) {
+                link = &page->next;
+                continue;
+            }
+            size_t first = start > offset ? (size_t)(start - offset) : 0;
+            size_t last = end - offset < BOAROS_PAGE_SIZE ? (size_t)(end - offset) : BOAROS_PAGE_SIZE;
+            if (!first && last == BOAROS_PAGE_SIZE) {
+                *link = page->next;
+                __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
+                unaccount_page(object);
+                if (physical_page_release(object->allocator, page->physical_address)) __builtin_trap();
+                kernel_heap_release(object->heap, page);
+                continue;
+            }
+            void *bytes;
+            if (physical_page_resolve(object->allocator, page->physical_address, &bytes)) __builtin_trap();
+            memset((unsigned char *)bytes + first, 0, last - first);
+            link = &page->next;
+        }
+    }
+}
+
+static void mapping_changed(struct kernel_memory_object *object)
+{
+    KERNEL_IRQ_SCOPE(irq);
+    enum kernel_scheduler_status status=kernel_wait_queue_wake_all(&object->mapping_changed);
+    if (status != KERNEL_SCHEDULER_STATUS_OK &&
+        !(status == KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED &&
+          !object->mapping_changed.registrations && !object->mapping_changed.borrows))
+        __builtin_trap();
+}
+
+static void mapping_borrow(struct kernel_memory_object *object,struct kernel_memory_mapping *mapping)
+{
+    if (!mapping) return;
+    if (mapping->object!=object || mapping->borrows==UINT32_MAX || object->mapping_borrows==UINT32_MAX)
+        __builtin_trap();
+    mapping->borrows++;object->mapping_borrows++;
+}
+
+static void mapping_put(struct kernel_memory_object *object,struct kernel_memory_mapping *mapping)
+{
+    do {
+        { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+          for (unsigned count=0;mapping && count<16;count++) {
+              if (mapping->object!=object || !mapping->borrows || !object->mapping_borrows) __builtin_trap();
+              object->mapping_borrows--;
+              if (--mapping->borrows || mapping->previous) {mapping=0;break;}
+              struct kernel_memory_mapping *next=mapping->retired_next;
+              mapping->next=mapping->retired_next=0;mapping=next;
+          } }
+        mapping_changed(object);
+    } while (mapping);
+}
+
+int kernel_memory_object_mapping_register(struct kernel_memory_mapping *mapping,uint64_t expected_epoch)
+{
+    if (!mapping || !mapping->object || !mapping->owner || !mapping->invalidate ||
+        mapping->previous || mapping->borrows || mapping->retired_next) __builtin_trap();
+    struct kernel_memory_object *object=mapping->object;
+    KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+    if (expected_epoch && (object->closing || object->epoch!=expected_epoch)) return -KERNEL_EBUSY;
+    mapping->next=object->mappings;mapping->previous=&object->mappings;
+    if (mapping->next) mapping->next->previous=&mapping->next;
+    object->mappings=mapping;return 0;
+}
+
+void kernel_memory_object_mapping_stop(struct kernel_memory_mapping *mapping)
+{
+    struct kernel_memory_object *object=mapping->object;
+    KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+    if (!mapping->previous) return;
+    if (*mapping->previous!=mapping || mapping->retired_next) __builtin_trap();
+    *mapping->previous=mapping->next;
+    if (mapping->next) mapping->next->previous=mapping->previous;
+    mapping->previous=0;
+    if (mapping->borrows) {
+        mapping->retired_next=mapping->next;mapping_borrow(object,mapping->retired_next);
+    } else mapping->next=0;
+}
+
+void kernel_memory_object_mapping_drain(struct kernel_memory_mapping *mapping)
+{
+    struct kernel_memory_object *object=mapping->object;
+    KERNEL_IRQ_SCOPE(irq);
+    for (;;) {
+        { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+          if (mapping->previous) __builtin_trap();
+          if (!mapping->borrows) return; }
+        enum kernel_wait_wake_reason reason;
+        int busy;
+        struct kernel_wait_token token;
+        if (kernel_wait_prepare(&object->mapping_changed,0,0,&token)) __builtin_trap();
+        { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);busy=mapping->borrows!=0; }
+        if (busy && kernel_wait_park(&token,&reason)) __builtin_trap();
+        if (kernel_wait_finish(&token)) __builtin_trap();
+    }
+}
+
+int kernel_memory_object_epoch(struct kernel_memory_object *object,uint64_t *epoch)
+{
+    KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+    *epoch=object->epoch;return object->closing ? -KERNEL_EBUSY : 0;
+}
+
+void kernel_memory_object_wait(struct kernel_memory_object *object)
+{
+    KERNEL_IRQ_SCOPE(irq);
+    uint64_t epoch;
+    while (kernel_memory_object_epoch(object,&epoch)) {
+        enum kernel_wait_wake_reason reason;
+        if (KERNEL_WAIT_RECHECK(&object->mapping_changed,0,0,&reason,
+                kernel_memory_object_epoch(object,&epoch))) __builtin_trap();
+    }
+}
+
+void kernel_memory_object_remove(struct kernel_memory_object *object,uint64_t start,uint64_t end)
+{
+    KERNEL_LOCK_SCOPE(mutation);
+    kernel_mutex_lock(&object->mutation,&mutation);
+    struct kernel_memory_mapping *mapping;
+    { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+      if (object->closing || object->epoch==UINT64_MAX) __builtin_trap();
+      object->closing=1;object->epoch++;
+      mapping=object->mappings;mapping_borrow(object,mapping); }
+    while (mapping) {
+        int active;
+        { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);active=mapping->previous!=0; }
+        if (active) mapping->invalidate(mapping->owner,object,start,end);
+        struct kernel_memory_mapping *next;
+        { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);
+          next=mapping->previous?mapping->next:mapping->retired_next;mapping_borrow(object,next); }
+        mapping_put(object,mapping);mapping=next;
+    }
+    kernel_memory_object_punch(object,start,end);
+    { KERNEL_RAW_SCOPE(guard,&object->mapping_metadata);object->closing=0; }
+    mapping_changed(object);
 }
 
 void kernel_memory_object_set_budget(struct kernel_memory_object *object,

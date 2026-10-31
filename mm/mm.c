@@ -64,6 +64,8 @@ struct kernel_mm_file_source {
 struct kernel_mm_shared_anon {
     struct kernel_mm_shared_anon *next;
     struct kernel_memory_object *object;
+    struct kernel_memory_mapping registration;
+    uint64_t fork_epoch;
 };
 
 struct mm_file_mapping {
@@ -121,6 +123,7 @@ struct kernel_mm_record {
     struct kernel_mm_file_source *file_sources;
     _Atomic(struct kernel_mm_file_source *) retired_file_sources;
     struct kernel_mm_shared_anon *shared_anon;
+    struct kernel_mm_shared_anon *retired_shared_anon;
     struct mm_file_mapping *file_mappings;
     struct mm_file_mapping *retired_file_mappings;
     struct mm_file_resident *file_residents;
@@ -143,6 +146,20 @@ static uint32_t note_tlb_change_locked(struct kernel_mm_record *,
     const struct kernel_mm_retirement *, int);
 static void finish_tlb_change(struct kernel_mm_record *,
     struct kernel_mm_retirement *, uint32_t, uint64_t, uint64_t, int);
+static void invalidate_object_residents(void *,struct kernel_memory_object *,uint64_t,uint64_t);
+static void unmap_object_ranges(struct kernel_mm_record *,struct kernel_memory_object *,uint64_t,uint64_t);
+
+static void prepare_shared_registration(struct kernel_mm_shared_anon *entry,struct kernel_mm_record *record)
+{
+    entry->registration.object=entry->object;
+    entry->registration.owner=record;
+    entry->registration.invalidate=invalidate_object_residents;
+}
+static void register_shared_anon(struct kernel_mm_shared_anon *entry,struct kernel_mm_record *record)
+{
+    prepare_shared_registration(entry,record);
+    if (kernel_memory_object_mapping_register(&entry->registration,0)) __builtin_trap();
+}
 
 _Static_assert(sizeof(struct kernel_mm_record) <= BOAROS_PAGE_SIZE,
                "RISC-V MM record must fit in one physical page");
@@ -996,8 +1013,14 @@ static void drain_shared_anon(struct kernel_mm_record *record,
             continue;
         }
         *link = entry->next;
-        kernel_memory_object_release(&entry->object);
-        kernel_heap_release(record->vma_heap, entry);
+        kernel_memory_object_mapping_stop(&entry->registration);
+        if (record->stage==KERNEL_MM_RECORD_LIVE && kernel_lock_held(&record->operations,1)) {
+            entry->next=record->retired_shared_anon;record->retired_shared_anon=entry;
+        } else {
+            kernel_memory_object_mapping_drain(&entry->registration);
+            kernel_memory_object_release(&entry->object);
+            kernel_heap_release(record->vma_heap,entry);
+        }
     }
 }
 
@@ -1028,6 +1051,8 @@ static enum kernel_mm_status clone_shared_anon(
             return KERNEL_MM_STATUS_STATE;
         }
         copy->object = source->object;
+        prepare_shared_registration(copy,destination_record);
+        (void)kernel_memory_object_epoch(copy->object,&copy->fork_epoch);
         copy->next = destination_record->shared_anon;
         destination_record->shared_anon = copy;
     }
@@ -1358,6 +1383,14 @@ static enum kernel_mm_status mm_fork_impl(
         destination_record->vdso_address = source_record->vdso_address;
         destination_record->brk_initialized =
             source_record->brk_initialized;
+        for (struct kernel_mm_shared_anon *entry=destination_record->shared_anon;entry;entry=entry->next) {
+            if (kernel_memory_object_mapping_register(&entry->registration,entry->fork_epoch)) {
+                /* 已关闭的对象不能接纳刚复制的旧叶；child尚未发布，撤掉它
+                 * 的共享叶后再登记，首访沿当前对象重新缺页。 */
+                unmap_object_ranges(destination_record,entry->object,0,UINT64_MAX);
+                if (kernel_memory_object_mapping_register(&entry->registration,0)) __builtin_trap();
+            }
+        }
         /* 可失败准备和父失效已完成。inode读保护阻止关闭新登记，回调只会
          * 看到完整的child来源/VMA/页表/驻留记录，不存在半构造发布。 */
         for (struct mm_file_mapping *entry=destination_record->file_mappings; entry; entry=entry->next)
@@ -1530,6 +1563,8 @@ static void mm_operation_end(struct mm_operation *operation)
         if (files) record->retired_file_sources=0;
         struct kernel_mm_elf_source *elfs=record->retired_elf_sources;
         if (elfs) record->retired_elf_sources=0;
+        struct kernel_mm_shared_anon *shared=record->retired_shared_anon;
+        record->retired_shared_anon=0;
         if (record->access_closed) {
             KERNEL_RAW_SCOPE(guard, &record->metadata);
             record->access_closed = 0;
@@ -1538,6 +1573,12 @@ static void mm_operation_end(struct mm_operation *operation)
         }
         mm_operation_release(operation);
         drain_retired_residents(record,residents);
+        while (shared) {
+            struct kernel_mm_shared_anon *entry=shared;shared=entry->next;
+            kernel_memory_object_mapping_drain(&entry->registration);
+            kernel_memory_object_release(&entry->object);
+            kernel_heap_release(record->vma_heap,entry);
+        }
         while (retired) {
             struct mm_file_mapping *entry=retired;
             retired=entry->next;
@@ -1632,22 +1673,51 @@ static void wait_pin_condition(struct kernel_mm_record *record, int drain)
             kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
 }
-static void close_pins(struct mm_operation *operation, int writers_only)
+static void close_record_pins(struct kernel_mm_record *record,int writers_only)
 {
-    if (!operation->guard.lock) return;
     /* 不等待自身尚未结束的片段；munmap不排空pin，仍允许同owner撤映射。 */
     for (struct kernel_mm_user_pin *pin = kernel_io_context_current()->user_pins;
          pin; pin = pin->owner_next)
-        if (pin->mm->allocator == operation->mm->allocator &&
-            pin->mm->record == operation->mm->record &&
+        if (pin->mm->record == record &&
             (!writers_only || (pin->access & KERNEL_MM_WRITE)))
             __builtin_trap();
     {
-        KERNEL_RAW_SCOPE(guard, &operation->record->metadata);
-        if (operation->record->access_closed) __builtin_trap();
-        operation->record->access_closed = writers_only ? 2 : 1;
+        KERNEL_RAW_SCOPE(guard, &record->metadata);
+        if (record->access_closed) __builtin_trap();
+        record->access_closed = writers_only ? 2 : 1;
     }
-    wait_pin_condition(operation->record, 1);
+    wait_pin_condition(record, 1);
+}
+static void close_pins(struct mm_operation *operation,int writers_only)
+{
+    if (operation->guard.lock) close_record_pins(operation->record,writers_only);
+}
+static void unmap_object_ranges(struct kernel_mm_record *record,struct kernel_memory_object *object,
+    uint64_t start,uint64_t end)
+{
+    for (uint32_t i=0;i<kernel_vma_set_count(record->vmas);i++) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_get_at(record->vmas,i,&vma)) __builtin_trap();
+        if ((vma.kind!=KERNEL_VMA_KIND_ANON_SHARED && vma.kind!=KERNEL_VMA_KIND_SYSV_SHM) ||
+            vma.backing!=object || vma.backing_offset>=end) continue;
+        uint64_t offset=vma.backing_offset, length=vma.end-vma.start;
+        if (offset<=start && start-offset>=length) continue;
+        uint64_t first=start>offset?start-offset:0;
+        uint64_t last=end-offset<length?end-offset:length;
+        if (unmap_space_range(record,vma.start+first,vma.start+last)) __builtin_trap();
+    }
+}
+static void invalidate_object_residents(void *owner,struct kernel_memory_object *object,
+    uint64_t start,uint64_t end)
+{
+    struct kernel_mm_record *record=owner;
+    struct mm_gate_scope operation __attribute__((cleanup(mm_gate_scope_end)))={.record=record};
+    kernel_rwlock_write(&record->operations,&operation.guard);
+    if (record->stage!=KERNEL_MM_RECORD_LIVE) return;
+    close_record_pins(record,0);
+    unmap_object_ranges(record,object,start,end);
+    { KERNEL_RAW_SCOPE(guard,&record->metadata);record->access_closed=0; }
+    wake_pin_waiters(record);
 }
 
 enum kernel_mm_status kernel_mm_lookup(const struct kernel_mm *mm,
@@ -2536,6 +2606,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
             if (shared_entry != 0) {
                 shared_entry->next = record->shared_anon;
                 record->shared_anon = shared_entry;
+                register_shared_anon(shared_entry,record);
             }
             *address = start;
         } else {
@@ -2564,6 +2635,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     if (shared_entry != 0) {
         shared_entry->next = record->shared_anon;
         record->shared_anon = shared_entry;
+        register_shared_anon(shared_entry,record);
     }
     drain_shared_anon(record, 1);
     (void)drain_file_sources(record, 1);
@@ -3024,6 +3096,7 @@ enum kernel_mm_status kernel_mm_shmat(
             if (shared_entry != 0) {
                 shared_entry->next = record->shared_anon;
                 record->shared_anon = shared_entry;
+                register_shared_anon(shared_entry,record);
             }
             *out_address = start;
         } else {
@@ -3070,6 +3143,7 @@ enum kernel_mm_status kernel_mm_shmat(
     if (shared_entry != 0) {
         shared_entry->next = record->shared_anon;
         record->shared_anon = shared_entry;
+        register_shared_anon(shared_entry,record);
     }
     drain_shared_anon(record, 1);
     (void)drain_file_sources(record, 1);
@@ -3428,7 +3502,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         KERNEL_LOCK_SCOPE(retire);
         kernel_rwlock_write(&record->operations,&retire);
         if (record->access_pins || record->write_pins || record->active_cpus ||
-            record->pending_retirement || record->retired_file_mappings) __builtin_trap();
+            record->pending_retirement || record->retired_file_mappings || record->retired_shared_anon) __builtin_trap();
         if (record->vmas == 0 && record->shared_anon == 0 &&
             record->file_sources == 0 &&
             record->elf_sources == 0 && record->executable_file == 0 &&
@@ -4405,7 +4479,7 @@ lookup:
     int created = 0;
     enum kernel_mm_status status = KERNEL_MM_STATUS_OK;
     address &= ~BOAROS_PAGE_MASK;
-    uint64_t generation = kernel_vma_set_generation(record->vmas), cookie = 0, old = 0;
+    uint64_t generation = kernel_vma_set_generation(record->vmas), cookie = 0, old = 0, object_epoch = 0;
     uint64_t replacement = KERNEL_MM_NO_PAGE;
     uint64_t shared_preparation = KERNEL_MM_NO_PAGE;
     void *old_pointer = 0, *new_pointer;
@@ -4463,6 +4537,14 @@ lookup:
     /* VMA注册覆盖此处取得实际后备owner；放gate后不再借用registry节点。 */
     if (object && kernel_memory_object_acquire(object) != KERNEL_MEMORY_OBJECT_OK)
         return KERNEL_MM_STATUS_STATE;
+    if (object && kernel_memory_object_epoch(object,&object_epoch)) {
+        mm_operation_release(operation);
+        /* 关闭者随后要排空本MM的pin；持pin的缺页者须先返回冲突归还它，
+         * 不能等待仍依赖该pin的对象重新开放。 */
+        if (!current_pins(operation->mm)) kernel_memory_object_wait(object);
+        kernel_memory_object_release(&object);
+        return KERNEL_MM_STATUS_CONFLICT;
+    }
     if (elf && !cookie) {
         source = vma.backing;
         source_owner = find_elf_source(record, source);
@@ -4531,7 +4613,9 @@ prepare_memory_tables:
         struct kernel_mm_mapping current;
         KERNEL_RAW_SCOPE(guard, &record->metadata);
         struct kernel_vma latest;
-        if (generation != kernel_vma_set_generation(record->vmas) ||
+        uint64_t latest_epoch=0;
+        if ((object && (kernel_memory_object_epoch(object,&latest_epoch) || latest_epoch!=object_epoch)) ||
+            generation != kernel_vma_set_generation(record->vmas) ||
             kernel_vma_set_lookup(record->vmas, address, &latest) != KERNEL_VMA_STATUS_OK ||
             latest.backing != vma.backing || latest.backing_offset != vma.backing_offset ||
             latest.start != vma.start || latest.permissions != vma.permissions ||
@@ -5076,11 +5160,60 @@ static int advise_fork(struct kernel_mm_record *record, const struct kernel_vma 
     return 0;
 }
 
+static int advise_remove(struct mm_operation *operation,const struct kernel_vma *vma,
+    uint64_t address,uint64_t end)
+{
+    if (vma->flags & KERNEL_VMA_LOCKED) return -KERNEL_EINVAL;
+    if (vma->kind==KERNEL_VMA_KIND_ELF_PRIVATE) {
+        struct kernel_elf64_source *source=vma->backing;
+        if (!kernel_elf64_source_file(source)) return -KERNEL_EINVAL;
+        uint64_t offset=vma->backing_offset+address-vma->start;
+        for (uint32_t i=0;i<kernel_elf64_source_run_count(source);i++) {
+            const struct kernel_elf64_source_run *run=kernel_elf64_source_run_at(source,i);
+            if (run->start<=offset && offset<run->end)
+                return run->kind==KERNEL_ELF64_SOURCE_RUN_ZERO ? -KERNEL_EINVAL : -KERNEL_EACCES;
+        }
+        __builtin_trap();
+    }
+    if (vma->kind==KERNEL_VMA_KIND_ANON_SHARED || vma->kind==KERNEL_VMA_KIND_SYSV_SHM) {
+        if (!(vma->maximum_permissions & KERNEL_MM_WRITE)) return -KERNEL_EACCES;
+        struct kernel_memory_object *object=vma->backing;
+        if (kernel_memory_object_acquire(object)) __builtin_trap();
+        uint64_t offset=vma->backing_offset+address-vma->start;
+        const struct kernel_mm *mm=operation->mm;
+        mm_operation_end(operation);
+        kernel_memory_object_remove(object,offset,offset+end-address);
+        kernel_memory_object_release(&object);
+        return mm_operation_begin(mm,operation) ? -KERNEL_EAGAIN : 0;
+    }
+    if (vma->kind != KERNEL_VMA_KIND_FILE_SHARED && vma->kind != KERNEL_VMA_KIND_FILE_PRIVATE)
+        return -KERNEL_EINVAL;
+    if (vma->kind != KERNEL_VMA_KIND_FILE_SHARED || !(vma->maximum_permissions & KERNEL_MM_WRITE))
+        return -KERNEL_EACCES;
+    struct kernel_mm_record *record=operation->record;
+    struct kernel_open_file_description *file=vma->backing;
+    struct kernel_mm_file_source *source=find_file_source(record,file);
+    if (!source || source->operations==UINT32_MAX) __builtin_trap();
+    source->operations++;
+    uint64_t offset=vma->backing_offset+address-vma->start;
+    const struct kernel_mm *mm=operation->mm;
+    /* 打洞会回调所有映射的MM；真实来源借用覆盖最后unmap/close，不能
+     * 带MM资格进入inode写路径，也不重新按地址查找可能已替换的文件。 */
+    mm_operation_end(operation);
+    int error=kernel_open_file_fallocate(file,KERNEL_VFS_FALLOC_PUNCH_HOLE|KERNEL_VFS_FALLOC_KEEP_SIZE,
+        (int64_t)offset,(int64_t)(end-address),NULL);
+    if (!__atomic_fetch_sub(&source->operations,1,__ATOMIC_RELEASE)) __builtin_trap();
+    if (mm_operation_begin(mm,operation)) return error ? error : -KERNEL_EAGAIN;
+    (void)drain_file_sources(record,1);
+    return error;
+}
+
 int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, int32_t advice)
 {
     int fork_policy = advice == KERNEL_MM_ADVICE_DONTFORK || advice == KERNEL_MM_ADVICE_DOFORK ||
         advice == KERNEL_MM_ADVICE_WIPEONFORK || advice == KERNEL_MM_ADVICE_KEEPONFORK;
-    if ((!fork_policy && (advice < KERNEL_MM_ADVICE_NORMAL || advice > KERNEL_MM_ADVICE_DONTNEED)) ||
+    if ((!fork_policy && advice != KERNEL_MM_ADVICE_REMOVE &&
+        (advice < KERNEL_MM_ADVICE_NORMAL || advice > KERNEL_MM_ADVICE_DONTNEED)) ||
         (address & BOAROS_PAGE_MASK) || length > UINT64_MAX - BOAROS_PAGE_MASK) return -KERNEL_EINVAL;
     uint64_t rounded = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
     if (rounded > UINT64_MAX - address) return -KERNEL_EINVAL;
@@ -5108,6 +5241,8 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
             if (unmap_space_range(record, address, finish)) __builtin_trap();
         } else if (advice == KERNEL_MM_ADVICE_WILLNEED)
             error = advise_file(&operation, &vma, address, &finish, &budget);
+        else if (advice == KERNEL_MM_ADVICE_REMOVE)
+            error = advise_remove(&operation, &vma, address, finish);
         else if (fork_policy) error = advise_fork(record, &vma, address, &finish, advice);
         /* NORMAL/RANDOM/SEQUENTIAL are advisory: keep the existing global
          * cache policy, validate the complete mapped range, and store no hint. */

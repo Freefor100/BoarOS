@@ -59,6 +59,18 @@ int main(void)
         CHECK(!kernel_mm_acquire(&held, &mm));
     }
     CHECK(!kernel_mm_release(&held));
+    CHECK(!kernel_mm_madvise(&mm,BASE,0,9));
+    assert(!map(BASE,3*P,RW,KERNEL_MM_MAP_SHARED));
+    struct kernel_mm_mapping removed;
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_lookup(&mm,BASE+P,&removed));
+    *(unsigned char *)(uintptr_t)removed.physical_address=0x62;
+    struct kernel_mm removal_child={0};CHECK(!kernel_mm_fork(&removal_child,&mm));
+    CHECK(!kernel_mm_madvise(&mm,BASE+P,1,9));
+    CHECK(kernel_mm_lookup(&removal_child,BASE+P,&removed)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_resolve_user_fault(&removal_child,BASE+P,KERNEL_MM_READ));
+    CHECK(!kernel_mm_lookup(&removal_child,BASE+P,&removed)&&!*(unsigned char *)(uintptr_t)removed.physical_address);
+    CHECK(!kernel_mm_release(&removal_child)&&!kernel_mm_munmap(&mm,BASE,3*P));
     /* Fork policy controls actual child leaves and refs, not just a VMA flag. */
     assert(!map(BASE,4*P,RW,0));
     struct kernel_mm_mapping fork_page, original_page;

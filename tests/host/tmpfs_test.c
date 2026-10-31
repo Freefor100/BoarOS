@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-struct kernel_raw_lock kernel_vfs_state_lock = {.rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED};
 void mm_test_attach(unsigned);
 static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
@@ -17,7 +16,6 @@ void mm_test_fence(uint64_t v, int i) { (void)v; (void)i; }
 static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 uint64_t kernel_time_realtime_ns(void) { return ++clock_ns; }
-uint64_t kernel_vfs_allocate_mount_id(void) { static uint64_t id; return ++id; }
 
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *, size_t, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,
@@ -30,24 +28,24 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
 /* Only VFS publication is adapted: tmpfs, memory objects, heap and physical
  * pages are production implementations. Full path integration is tested by
  * the file-I/O and guest suites. */
-struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *i, uint64_t id)
+struct kernel_vfs_node *__wrap_kernel_vfs_node_find(struct kernel_vfs_instance *i, uint64_t id)
 {
     for (struct kernel_vfs_node *n = i->nodes; n; n = n->next)
         if (n->inode == id && !n->retired && !n->closed) return n;
     return 0;
 }
-void kernel_vfs_node_lock(struct kernel_vfs_node *n, struct kernel_lock_guard *g, int write)
+void __wrap_kernel_vfs_node_lock(struct kernel_vfs_node *n, struct kernel_lock_guard *g, int write)
 {
     if (write) kernel_rwlock_write(&n->io_lock, g);
     else kernel_rwlock_read(&n->io_lock, g);
 }
-int kernel_vfs_publish_node(struct kernel_vfs_mount *m, struct kernel_vfs_node *n,
+int __wrap_kernel_vfs_publish_node(struct kernel_vfs_mount *m, struct kernel_vfs_node *n,
     struct kernel_vfs_file *f, int creating)
 {
     (void)creating;
     struct kernel_vfs_instance *i = m->private_data;
     kernel_rwlock_init(&n->io_lock, 30, (uintptr_t)n);
-    n->instance = i; n->mount = m; n->references = n->open_files = 1;
+    n->instance = i; n->mount = &i->backend_mount; n->references = n->open_files = 1;
     n->next = i->nodes; i->nodes = n; i->external_files++;
     *f = (struct kernel_vfs_file){.mount = m, .private_data = n,
         .mode = n->mode, .state = VFS_FILE_STATE_LIVE};
@@ -56,7 +54,7 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *m, struct kernel_vfs_node *
 static const struct kernel_vfs_backend *ops(struct kernel_vfs_mount *m)
 { return ((struct kernel_vfs_instance *)m->private_data)->ops; }
 static struct kernel_vfs_instance *instance(struct kernel_vfs_mount *m) { return m->private_data; }
-int kernel_vfs_nodes_idle(struct kernel_vfs_instance *i, struct kernel_vfs_node *root)
+int __wrap_kernel_vfs_nodes_idle(struct kernel_vfs_instance *i, struct kernel_vfs_node *root)
 { return !i->retiring_nodes && i->nodes == root && (!root || !root->next); }
 static void close_file(struct kernel_vfs_file *f)
 {
@@ -282,6 +280,30 @@ static void cookie_exhaustion(void)
     assert(!ops(m)->unmount(m));
     puts("PASS tmpfs exhausted cookies reject create/link/rename without replacing names");
 }
+static void punch_boundaries(void)
+{
+    struct kernel_vfs_mount *mount=0;assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=3",&mount));
+    struct kernel_vfs_file file={0};assert(!ops(mount)->create(mount,1,"punched",0600,&file));
+    struct kernel_vfs_node *node=file.private_data;
+    for(unsigned i=0;i<3;i++) {
+        uint64_t page;int created;assert(!kernel_memory_object_get_page(node->memory,i,&page,&created)&&created);
+        memset(access_page(page),0x71,BOAROS_PAGE_SIZE);assert(!physical_page_release(&pages,page));
+    }
+    ops(mount)->memory_written(node,3*BOAROS_PAGE_SIZE);
+    uint64_t actual;int changed;
+    assert(ops(mount)->fallocate(node,0,0,BOAROS_PAGE_SIZE,&actual,&changed)==-KERNEL_EOPNOTSUPP);
+    assert(!changed&&actual==3*BOAROS_PAGE_SIZE&&!space(mount).free_blocks);
+    assert(!ops(mount)->fallocate(node,3,13,2*BOAROS_PAGE_SIZE+16,&actual,&changed)&&changed);
+    assert(actual==3*BOAROS_PAGE_SIZE&&space(mount).free_blocks==1&&pages.shared_anon_pages==2);
+    unsigned char bytes[3*BOAROS_PAGE_SIZE];size_t done;
+    assert(!ops(mount)->pread(node,0,bytes,sizeof(bytes),&done)&&done==sizeof(bytes));
+    for(size_t i=0;i<sizeof(bytes);i++)assert(bytes[i]==(i<13||i>=2*BOAROS_PAGE_SIZE+29?0x71:0));
+    assert(!ops(mount)->fallocate(node,3,2*BOAROS_PAGE_SIZE,2*BOAROS_PAGE_SIZE,&actual,&changed)&&changed);
+    assert(actual==3*BOAROS_PAGE_SIZE&&space(mount).free_blocks==2);
+    assert(!ops(mount)->unlink(mount,1,"punched"));close_file(&file);
+    assert(space(mount).free_blocks==3&&!ops(mount)->unmount(mount));
+    puts("PASS tmpfs punch: preserved EOF and boundary bytes, full-page quota return, unsupported preallocation");
+}
 
 int main(void)
 {
@@ -291,7 +313,7 @@ int main(void)
     assert(!physical_page_allocator_bind_access(&pages, access_page));
     assert(!physical_page_allocator_finalize(&pages) && !kernel_heap_init(&heap, &pages, page_address));
     uint64_t baseline = physical_page_available(&pages);
-    mixed_directories(); cookies_and_rename(); rollback_and_budgets(); cookie_exhaustion();
+    mixed_directories(); cookies_and_rename(); rollback_and_budgets(); cookie_exhaustion();punch_boundaries();
     struct kernel_heap_statistics s; kernel_heap_get_statistics(&heap, &s);
     assert(!s.live_allocations && !s.current_pages && !pages.shared_anon_pages);
     assert(physical_page_available(&pages) == baseline && !physical_page_allocator_audit(&pages));

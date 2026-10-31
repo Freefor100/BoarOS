@@ -17,7 +17,7 @@ import harness
 from arch_profiles import PROFILES
 
 def workload_source(name):
-    return ROOT / ({'futex_vector':'tests/workloads/futex/vector.c','pi':'tests/workloads/futex/pi.c','remount':'tests/workloads/resource/remount.c','mount_attributes':'tests/workloads/resource/mount_attributes.c','shm_query':'tests/workloads/resource/shm_query.c','shm_lock':'tests/workloads/resource/shm_lock.c','madvise':'tests/workloads/resource/madvise.c','kcmp':'tests/workloads/resource/kcmp.c','memlock':'tests/workloads/resource/memlock.c','pidfd':'tests/workloads/resource/pidfd.c','nproc':'tests/workloads/resource/nproc.c','rt':'tests/workloads/resource/rt.c','cpu':'tests/workloads/resource/cpu.c','ipc_proc':'tests/workloads/ipc/proc_sysvipc.c','memory':'tests/workloads/resource/memory.c','mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
+    return ROOT / ({'futex_vector':'tests/workloads/futex/vector.c','pi':'tests/workloads/futex/pi.c','mount_bind':'tests/workloads/resource/mount_bind.c','remount':'tests/workloads/resource/remount.c','mount_attributes':'tests/workloads/resource/mount_attributes.c','shm_query':'tests/workloads/resource/shm_query.c','shm_lock':'tests/workloads/resource/shm_lock.c','madvise':'tests/workloads/resource/madvise.c','kcmp':'tests/workloads/resource/kcmp.c','memlock':'tests/workloads/resource/memlock.c','pidfd':'tests/workloads/resource/pidfd.c','nproc':'tests/workloads/resource/nproc.c','rt':'tests/workloads/resource/rt.c','cpu':'tests/workloads/resource/cpu.c','ipc_proc':'tests/workloads/ipc/proc_sysvipc.c','memory':'tests/workloads/resource/memory.c','mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
 
 def futex_lines(raw,cpus):
     names=['abi','atomics']+[f'compare-{cmp}-old-{value}' for cmp in range(6) for value in (-1,0,1)]+['requeue-near','requeue-offset','wake-zero','wake-negative','wake-both','shared','robust']
@@ -250,6 +250,14 @@ def remount_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('REMOUNT ')]
     return lines==[*(f'REMOUNT CASE {name} PASS' for name in REMOUNT_CASES),'REMOUNT END 4']
 
+BIND_CASES=('directory-file-bind-and-unlinked-owner','alias-rename-held-dirfd-cwd-and-parent',
+    'independent-readonly-nodev-noexec-nosuid','recursive-clone-and-lazy-child-owner',
+    'source-target-type-and-nonmount-errors','original-unmount-keeps-bind-instance',
+    'lazy-final-dirfd-mmap-remove-and-cow','devpts-ptmx-file-bind-peer-and-last-owner')
+def mount_bind_output(raw):
+    lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('BIND ')]
+    return lines==[*(f'BIND CASE {name} PASS' for name in BIND_CASES),'BIND END 8']
+
 MOUNT_ATTR_CASES=('new-mount-flags-statfs-mounts', 'exec-script-format-writer-order', 'elf-interpreter-final-mount', 'symlinks-and-child-use-final-mount', 'access-directory-empty-fd-and-privilege', 'nodev-special-types-path-only-and-aliases', 'nodev-block-mount-source-and-type-order', 'mmap-noexec-mprotect-fork-remap-and-fixed-content', 'mmap-fd-rights-validation-and-no-mmap-order', 'overmount-proc-dirfd-and-prior-fd-rights', 'prior-pty-master-peer-path-and-io','mapping-owner-survives-close-and-fork-until-release')
 def mount_attributes_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MOUNT-ATTR ')]
@@ -274,12 +282,14 @@ MADVISE_CASES=('abi-width-alignment-zero-overflow','private-zero-rounding-protec
     'private-cow-child-preserved','shared-anonymous-and-sysv-content','tmpfs-private-shared-data',
     'ext4-private-shared-data','locked-and-onfault-reject-after-prefix','hole-keeps-mapped-side-effects',
     'willneed-no-swap-and-file-types','remote-tlb-refault-shared-mm',
+    'remove-shared-anonymous-and-sysv','remove-tmpfs-shared-file','remove-ext4-shared-file',
+    'remove-hole-partial-and-private-anonymous-error',
     'dontfork-partial-dofork-cow','wipe-child-grandchild-and-keep','dontfork-shared-and-shm-attachment',
     'dontfork-tmpfs-private-owner','dontfork-ext4-private-owner','fork-policy-hole-prefix-and-remap',
     'wipe-pure-bss-zero-source','fork-remote-parent-cow-and-wipe')
 def madvise_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MADVISE ')]
-    return lines==[*(f'MADVISE CASE {name} PASS' for name in MADVISE_CASES),'MADVISE END 18']
+    return lines==[*(f'MADVISE CASE {name} PASS' for name in MADVISE_CASES),'MADVISE END 22']
 
 KCMP_CASES=('abi-lookup-type-fd-width','real-ofd-dup-offset-stable-order',
     'fork-empty-sighand-lazy-identity','vfork-shared-vm-independent-tables','clone-fs-shared-object',
@@ -339,7 +349,7 @@ def run_loongarch(args):
         for cpus in args.cpus or (1,):
             for memory in args.memory or ('512M','1G'):
                 case=work/(f'{platform}-{memory}'+(f'-{cpus}cpu' if args.cpus else ''));case.mkdir()
-                image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','pi','futex_vector') else disk(case,program)
+                image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','pi','futex_vector') else disk(case,program)
                 kernel=profile.linux_kernel(noswap=args.workload=='madvise') if platform=='linux' else args.kernel or ROOT/profile.kernel
                 snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
                 command=profile.boot(qemu,snapshot,memory)+['-drive',f'file={image},if=none,format=raw,id=root',
@@ -364,6 +374,7 @@ def run_loongarch(args):
                 if args.workload=='futex_vector':passed=not code and futex_vector_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='pi':passed=not code and pi_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='remount':passed=not code and remount_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='mount_bind':passed=not code and mount_bind_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='mount_attributes':passed=not code and mount_attributes_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='shm_query':passed=not code and shm_query_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='shm_lock':passed=not code and shm_lock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -469,6 +480,7 @@ def run_smp(args):
                     if args.workload=='futex_vector':passed=not record['returncode'] and futex_vector_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='pi':passed=not record['returncode'] and pi_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='remount':passed=not record['returncode'] and remount_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='mount_bind':passed=not record['returncode'] and mount_bind_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='mount_attributes':passed=not record['returncode'] and mount_attributes_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='shm_query':passed=not record['returncode'] and shm_query_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='shm_lock':passed=not record['returncode'] and shm_lock_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -477,7 +489,7 @@ def run_smp(args):
                     if args.workload=='memlock':passed=not record['returncode'] and memlock_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='pidfd':passed=not record['returncode'] and pidfd_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='rt':passed=not record['returncode'] and rt_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
-                    if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','pi','futex_vector'):
+                    if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','pi','futex_vector'):
                         online=[int(v) for v in re.findall(r'^BoarOS: SMP online logical=(\d+) hart=0x[0-9a-f]+\r?$',raw,re.M)]
                         passed=passed and online==list(range(1,cpus))
                     if args.workload=='ipc_proc':passed=not record['returncode'] and ipc_proc_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -485,7 +497,7 @@ def run_smp(args):
                     if sysv_sem:passed=sysv_sem_output(raw,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload and args.workload not in ('ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','pi','futex_vector'):
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload and args.workload not in ('ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','pi','futex_vector'):
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -535,7 +547,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','pi','futex_vector'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','pi','futex_vector'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -551,7 +563,7 @@ def main(default_arch="riscv"):
     if args.dynamic and args.libc=='glibc':parser.error('glibc direct consumer uses the static target toolchain')
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
     if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','pi','futex_vector') and args.arch=='riscv':return run_smp(args)
+    if args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','kcmp','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','pi','futex_vector') and args.arch=='riscv':return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)
