@@ -132,7 +132,7 @@ static void loop_mount_case(struct kernel_heap *heap,struct kernel_vfs_mount *mo
     assert(outer_path && inner_path);
     KERNEL_FS_PATHS(paths, local_fs);
     struct kernel_vfs_path *root=paths.root;
-    assert(!kernel_vfs_mknod_at(root,root,"/loop1",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(1)));
+    assert(!kernel_vfs_mknod_at(root,root,"/loop1",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(1),0));
     int backing=loop_backing_image(local,local_fs,"/outer-backing",outer_path);
     int first=loop_test_open(local,local_fs,"/loop0",2);assert(first>=0);
     struct kernel_block_device *probe=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(0));assert(probe);
@@ -350,7 +350,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     assert(!kernel_fs_context_create(&local_fs,mount,heap) && !kernel_files_create(&local,heap));
     KERNEL_FS_PATHS(paths, &local_fs);
     struct kernel_vfs_path *root=paths.root;
-    assert(!kernel_vfs_mknod_at(root,root,"/loop0",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(0)));
+    assert(!kernel_vfs_mknod_at(root,root,"/loop0",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(0),0));
     int backing=loop_test_open(&local,&local_fs,"/loop-backing",0102|2); assert(backing>=0);
     int64_t result;assert(!kernel_files_ftruncate(&local,backing,2*1024*1024,&result) && !result);
     int loop=loop_test_open(&local,&local_fs,"/loop0",2); assert(loop>=0);
@@ -391,7 +391,7 @@ static void loop_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
     loop=loop_test_open(&local,&local_fs,"/loop0",2);assert(loop>=0);
     assert(loop_test_ioctl(&local,loop,0x4c05,0x200400)==-KERNEL_ENXIO);
     assert(loop_test_ioctl(&local,loop,0x4c00,loop)==-KERNEL_ELOOP);
-    assert(!kernel_vfs_mknod_at(root,root,"/loop7",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(7)));
+    assert(!kernel_vfs_mknod_at(root,root,"/loop7",KERNEL_VFS_S_IFBLK|0600,KERNEL_LOOP_DEVICE_NUMBER(7),0));
     int unbound=loop_test_open(&local,&local_fs,"/loop7",2);assert(unbound>=0);
     assert(loop_test_ioctl(&local,loop,0x4c00,unbound)==-KERNEL_EINVAL);
     loop_test_close(&local,unbound);loop_test_close(&local,loop);

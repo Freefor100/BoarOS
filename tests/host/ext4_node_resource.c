@@ -111,14 +111,14 @@ int main(int argc,char **argv)
            !!adapter->instance.namespace_parallel==(mm_test_boot_cpus>1));
     if(mm_test_boot_cpus==1) {
         struct kernel_vfs_file serial={0};struct kernel_vfs_stat stat;
-        assert(!kernel_vfs_create_at(root,root,"serial-owner",0600,&serial));
+        assert(!kernel_vfs_create_at(root,root,"serial-owner",0600,&serial,0));
         for(unsigned i=0;i<8;i++)assert(!kernel_vfs_file_set_mode(&serial,0600|(i&1?040:020)) &&
                                      !kernel_vfs_fstat(&serial,&stat));
         assert(!kernel_vfs_close(&serial) && !inode_allocation_count && !qualified);
         puts("PASS actual one-CPU journal workers retain serial namespace/backend with zero resource owners");
         goto Cleanup;
     }
-    struct kernel_vfs_file file={0};assert(!kernel_vfs_create_at(root,root,"node-owner",0600,&file));
+    struct kernel_vfs_file file={0};assert(!kernel_vfs_create_at(root,root,"node-owner",0600,&file,0));
     checked_inode=kernel_vfs_file_inode(&file);unsigned before=allocations_for(checked_inode);
     for(unsigned i=0;i<inode_allocation_count;i++)if(inode_allocations[i].inode==checked_inode)watched_owner=inode_allocations[i].owner;
     printf("created inode=%u resource object allocations=%u owner=%p\n",checked_inode,before,watched_owner);
@@ -143,10 +143,10 @@ int main(int argc,char **argv)
     assert(adapter->instance.ops->open(&mount,NULL,kernel_vfs_file_inode(&file),file.mode,&candidate)==-KERNEL_EOVERFLOW);
     adapter->instance.external_files=external;assert(!candidate.private_data && !watched_frees);
     fail_bind=ENOMEM;
-    assert(kernel_vfs_create_at(root,root,"failed-pin",0600,&candidate)==-KERNEL_ENOMEM);
+    assert(kernel_vfs_create_at(root,root,"failed-pin",0600,&candidate,0)==-KERNEL_ENOMEM);
     assert(!candidate.private_data && kernel_vfs_stat_at(root,root,"failed-pin",1,&stat)==-KERNEL_ENOENT);
     replay_create=1;
-    assert(!kernel_vfs_create_at(root,root,"replayed-pin",0600,&candidate) && replayed==1);
+    assert(!kernel_vfs_create_at(root,root,"replayed-pin",0600,&candidate,0) && replayed==1);
     assert(!kernel_vfs_close(&candidate) && !kernel_vfs_unlink_at(root,root,"replayed-pin",0));
     puts("PASS candidate loser/overflow, pre-accept pin ENOMEM rollback and same-constructor abort/replay return their references");
     struct kernel_vfs_node *closing=file.private_data;close_fault=lwext4_node_file(closing);

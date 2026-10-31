@@ -14,6 +14,8 @@
 #include <kernel/page_cache.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/credentials.h>
+#include <kernel/posix_acl.h>
 #include <kernel/vfs.h>
 #include <kernel/time.h>
 #include <arch/context.h>
@@ -29,6 +31,7 @@
 #include <ext4_misc.h>
 #include <ext4_super.h>
 #include <ext4_types.h>
+#include <ext4_xattr.h>
 #include <string.h>
 
 #include <stddef.h>
@@ -81,6 +84,7 @@ static int prepare_journal_mount(struct lwext4_mount_adapter *adapter);
 static void complete_sync_waiters(struct lwext4_mount_adapter *adapter);
 static bool vfs_realtime(struct ext4_timestamp *now);
 static int lwext4_error(int error);
+static int ext4_acl_read(struct kernel_vfs_node *,const char *,void **,size_t *);
 static int block_open(struct ext4_blockdev *device);
 static int block_read(struct ext4_blockdev *device,
                       void *buffer,
@@ -135,7 +139,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
 static int ext4_backend_create(struct kernel_vfs_mount *mount,
                           uint64_t parent_inode, const char *path,
                           uint32_t mode,
-                          struct kernel_vfs_file *file);
+                          struct kernel_vfs_file *file,uint32_t umask);
 static void ext4_backend_accessed(struct kernel_vfs_file *file);
 static int ext4_backend_modified(struct kernel_vfs_file *file,
                               uint64_t offset, int append);
@@ -143,7 +147,7 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
                      struct kernel_vfs_stat *stat);
 static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
                          uint64_t parent_inode, const char *path,
-                         uint32_t mode);
+                         uint32_t mode,uint32_t umask);
 /* The namespace lock holds names, not cache-only registry ancestors. Pin the
  * indexed target before reclaim can rotate the tree or retire its last owner. */
 static struct kernel_vfs_node *pin_linked_node(struct lwext4_mount_adapter *adapter, uint32_t inode)
@@ -1852,7 +1856,24 @@ static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode)
     int allowed=kernel_vfs_chmod_allowed(node->uid,node->gid,&mode); if (allowed) return allowed;
     int result = mount_error(lwext4_instance(node->instance));
     if (result) return lwext4_error(result);
-    result = lwext4_error(ext4_file_set_mode(lwext4_node_file(node), mode & 07777U));
+    void *acl=NULL;size_t acl_size=0;
+    result=ext4_acl_read(node,KERNEL_ACL_ACCESS,&acl,&acl_size);
+    if (result==-KERNEL_ENODATA)
+        result=lwext4_error(ext4_file_set_mode(lwext4_node_file(node),mode & 07777U));
+    else if (!result) {
+        result=kernel_acl_chmod(acl,acl_size,mode);
+        size_t disk_size=0;void *disk=NULL;
+        if (!result) result=kernel_acl_to_ext4(acl,acl_size,NULL,0,&disk_size);
+        if (!result) {
+            enum kernel_heap_status status=kernel_heap_allocate(node->instance->heap,disk_size,&disk);
+            if (status) result=status==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        }
+        if (!result) result=kernel_acl_to_ext4(acl,acl_size,disk,disk_size,&disk_size);
+        if (!result) result=lwext4_error(ext4_file_set_acl(lwext4_node_file(node),
+            EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,disk,disk_size,false,true,mode));
+        if (disk) kernel_heap_release(node->instance->heap,disk);
+        kernel_heap_release(node->instance->heap,acl);
+    }
     if (!result) {
         node->mode = (node->mode & ~07777U) | (mode & 07777U);
         file->mode = node->mode;
@@ -2006,12 +2027,15 @@ struct namespace_create {
     struct kernel_vfs_node *node;
     struct ext4_inode *initial;
     uint32_t parent, mode, type, device;
-    uint32_t uid,gid;
+    uint32_t uid,gid,umask;
+    void *access_acl,*default_acl;
+    size_t access_size,default_size;
 };
 static int apply_namespace_create(void *context)
 {
     struct namespace_create *request = context;
-    ext4_file *file=request->node?lwext4_node_file(request->node):NULL;
+    ext4_file temporary={0};
+    ext4_file *file=request->node?lwext4_node_file(request->node):&temporary;
     if (file && file->mp) {
         int result = close_node_file(request->node);
         if (result) return result;
@@ -2020,23 +2044,71 @@ static int apply_namespace_create(void *context)
     int result=ext4_create_child(request->mount, request->parent, request->path,
         request->mode | request->type, request->device, request->target, file,
         request->initial, request->uid, request->gid);
+    if (!result && request->access_acl)
+        result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,
+            request->access_acl,request->access_size,false,false,0);
+    if (!result && request->default_acl)
+        result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
+            request->default_acl,request->default_size,false,false,0);
+    /* The live node's time cache must include the inherited ACL updates. */
+    if (!result && request->initial && (request->access_acl || request->default_acl))
+        result=ext4_fraw_inode_fill(file,request->initial);
     /* Bind before the outer operation accepts the new directory entry, so
      * allocation failure aborts create instead of following a committed name. */
     if(!result && request->node)result=retain_node_inode(request->node);
+    if (!request->node && file->mp) {
+        int close_result=ext4_fclose(file);
+        if (!result) result=close_result;
+    }
     return result;
+}
+static int namespace_acl_encode(struct kernel_heap *heap,const void *acl,size_t size,
+                                void **out,size_t *length)
+{
+    int result=kernel_acl_to_ext4(acl,size,NULL,0,length);
+    if (result) return -result;
+    enum kernel_heap_status status=kernel_heap_allocate(heap,*length,out);
+    if (status) return status==KERNEL_HEAP_STATUS_EMPTY ? ENOMEM : EIO;
+    result=kernel_acl_to_ext4(acl,size,*out,*length,length);
+    return result ? -result : EOK;
 }
 static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct namespace_create *request)
 {
     struct kernel_vfs_node *parent=kernel_vfs_node_pin(&adapter->instance,request->parent);
     if (!parent) return EIO;
     uint32_t mode=request->mode|request->type;
+    int result=EOK;void *def=NULL,*access=NULL;size_t size=0;
     {
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(parent,&io,0);
         kernel_vfs_creation_identity(parent->mode,parent->gid,&mode,&request->uid,&request->gid);
+        if (request->type!=KERNEL_VFS_S_IFLNK) {
+            int error=ext4_acl_read(parent,KERNEL_ACL_DEFAULT,&def,&size);
+            if (error==-KERNEL_ENODATA) mode &= ~request->umask;
+            else if (error) result=-error;
+            else {
+                enum kernel_heap_status status=kernel_heap_allocate(adapter->instance.heap,size,&access);
+                if (status) result=status==KERNEL_HEAP_STATUS_EMPTY ? ENOMEM : EIO;
+                else {
+                    memcpy(access,def,size);
+                    int extended=kernel_acl_create(access,size,&mode);
+                    if (extended<0) result=EIO;
+                    else if (extended) result=namespace_acl_encode(adapter->instance.heap,access,size,
+                                                &request->access_acl,&request->access_size);
+                    if (!result && request->type==KERNEL_VFS_S_IFDIR)
+                        result=namespace_acl_encode(adapter->instance.heap,def,size,
+                                                &request->default_acl,&request->default_size);
+                }
+            }
+        }
     }
     if (kernel_vfs_node_release(&parent)) __builtin_trap();
     request->mode=mode;
-    return ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
+    if (def) kernel_heap_release(adapter->instance.heap,def);
+    if (access) kernel_heap_release(adapter->instance.heap,access);
+    if (!result) result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
+    if (request->access_acl) kernel_heap_release(adapter->instance.heap,request->access_acl);
+    if (request->default_acl) kernel_heap_release(adapter->instance.heap,request->default_acl);
+    return result;
 }
 
 struct namespace_remove {
@@ -2076,7 +2148,7 @@ static int apply_namespace_link(void *context)
 static int ext4_backend_create(struct kernel_vfs_mount *mount,
                           uint64_t parent_inode, const char *path,
                           uint32_t mode,
-                          struct kernel_vfs_file *file)
+                          struct kernel_vfs_file *file,uint32_t umask)
 {
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_node *node;
@@ -2108,7 +2180,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     struct ext4_inode initial;
     uint32_t type=mode & KERNEL_VFS_S_IFMT;
     if (!type) type=KERNEL_VFS_S_IFREG;
-    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=type};
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=type,.umask=umask};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any
@@ -2183,10 +2255,83 @@ static int ext4_backend_exec_metadata(struct kernel_vfs_node *node,struct kernel
     out->filecap_size=size;out->filecap_present=1;
     return 0;
 }
+/* The inode qualification keeps the ACL and mode stable across both reads. */
+static int ext4_acl_read(struct kernel_vfs_node *node,const char *name,void **out,size_t *length)
+{
+    size_t raw_size=0,converted_size=0;
+    int result=ext4_file_getxattr(lwext4_node_file(node),name,strlen(name),NULL,0,&raw_size);
+    if (result) return lwext4_error(result);
+    if (raw_size>KERNEL_XATTR_SIZE_MAX) return -KERNEL_EIO;
+    void *raw=NULL,*converted=NULL;
+    enum kernel_heap_status status=kernel_heap_allocate(node->instance->heap,raw_size,&raw);
+    if (status) return status==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    size_t actual=0;
+    result=lwext4_error(ext4_file_getxattr(lwext4_node_file(node),name,strlen(name),raw,raw_size,&actual));
+    if (!result) result=kernel_acl_from_ext4(raw,actual,NULL,0,&converted_size);
+    if (!result && converted_size>KERNEL_XATTR_SIZE_MAX) result=-KERNEL_EIO;
+    if (!result) {
+        status=kernel_heap_allocate(node->instance->heap,converted_size,&converted);
+        if (status) result=status==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    }
+    if (!result) result=kernel_acl_from_ext4(raw,actual,converted,converted_size,&converted_size);
+    kernel_heap_release(node->instance->heap,raw);
+    if (result) {if (converted) kernel_heap_release(node->instance->heap,converted);return result;}
+    *out=converted;*length=converted_size;return 0;
+}
+static int ext4_backend_permission(struct kernel_vfs_node *node,const struct kernel_credentials *cred,unsigned access)
+{
+    if (cred->fsuid==node->uid || !(node->mode & 0070U))
+        return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
+    void *acl=NULL;size_t length=0;
+    int result=ext4_acl_read(node,KERNEL_ACL_ACCESS,&acl,&length);
+    if (result==-KERNEL_ENODATA)
+        return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
+    if (result) return result;
+    result=kernel_acl_dac_permission(acl,length,node->mode,node->uid,node->gid,cred,access);
+    kernel_heap_release(node->instance->heap,acl);
+    return result;
+}
 static int ext4_backend_xattr(struct kernel_vfs_node *node,enum kernel_xattr_operation op,
     const char *name,void *value,size_t size,uint32_t flags)
 {
     ext4_file *file=lwext4_node_file(node);size_t count=0;int result;
+    int acl=op!=KERNEL_XATTR_LIST && (!strcmp(name,KERNEL_ACL_ACCESS) ||
+                                      !strcmp(name,KERNEL_ACL_DEFAULT));
+    if (acl) {
+        bool access=!strcmp(name,KERNEL_ACL_ACCESS);
+        uint8_t index=access ? EXT4_XATTR_INDEX_POSIX_ACL_ACCESS : EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT;
+        if (op==KERNEL_XATTR_GET) {
+            void *data=NULL;size_t length=0;
+            result=ext4_acl_read(node,name,&data,&length);
+            if (result) return result;
+            if (size && size<length) result=-KERNEL_ERANGE;
+            else if (size) memcpy(value,data,length);
+            kernel_heap_release(node->instance->heap,data);
+            return result ? result : (int)length;
+        }
+        uint32_t mode=node->mode;int extended=1;
+        if (access && op==KERNEL_XATTR_SET) {
+            extended=kernel_acl_mode(value,size,&mode);
+            if (extended<0) return extended;
+            result=kernel_vfs_chmod_allowed(node->uid,node->gid,&mode);
+            if (result) return result;
+        }
+        bool remove=op==KERNEL_XATTR_REMOVE || !extended;
+        void *disk=NULL;size_t length=0;
+        if (!remove) {
+            result=kernel_acl_to_ext4(value,size,NULL,0,&length);
+            if (result) return result;
+            enum kernel_heap_status status=kernel_heap_allocate(node->instance->heap,length,&disk);
+            if (status) return status==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+            result=kernel_acl_to_ext4(value,size,disk,length,&length);
+            if (result) {kernel_heap_release(node->instance->heap,disk);return result;}
+        }
+        result=lwext4_error(ext4_file_set_acl(file,index,disk,length,remove,
+                                             access && op==KERNEL_XATTR_SET,mode));
+        if (disk) kernel_heap_release(node->instance->heap,disk);
+        if (!result && access && op==KERNEL_XATTR_SET) node->mode=mode;
+        return result;
+    }
     switch (op) {
     case KERNEL_XATTR_SET: result=ext4_file_setxattr(file,name,strlen(name),value,size,flags);break;
     case KERNEL_XATTR_GET: result=ext4_file_getxattr(file,name,strlen(name),value,size,&count);break;
@@ -2281,7 +2426,7 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
 
 static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
                          uint64_t parent_inode, const char *path,
-                         uint32_t mode)
+                         uint32_t mode,uint32_t umask)
 {
     struct lwext4_mount_adapter *adapter;
     int result;
@@ -2296,7 +2441,7 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
     }
 
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
-    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR};
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR,.umask=umask};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) return lwext4_error(result);
     return 0;
@@ -2756,13 +2901,13 @@ static int ext4_backend_symlink(struct kernel_vfs_instance *instance,
     return lwext4_error(namespace_create_execute(adapter,&request));
 }
 static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
-    uint64_t parent_inode, const char *name, uint32_t type, uint32_t mode, uint32_t device)
+    uint64_t parent_inode, const char *name, uint32_t type, uint32_t mode, uint32_t device,uint32_t umask)
 {
     if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
-        .path=name, .type=type, .mode=mode & 07777U, .device=device};
+        .path=name, .type=type, .mode=mode & 07777U, .device=device,.umask=umask};
     return lwext4_error(namespace_create_execute(adapter,&request));
 }
 static int ext4_backend_rename(struct kernel_vfs_instance *instance,
@@ -2829,6 +2974,7 @@ static void initialize_backend(void)
     ops->set_times = ext4_backend_set_times;
     ops->set_mode = ext4_backend_set_mode;
     ops->set_owner = ext4_backend_set_owner;
+    ops->acl_permission = ext4_backend_permission;
     ops->exec_metadata=ext4_backend_exec_metadata;
     ops->xattr=ext4_backend_xattr;
     ops->killpriv=ext4_backend_killpriv;

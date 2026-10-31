@@ -142,7 +142,7 @@ static int create_file(struct kernel_vfs_mount *mount,const char *name,uint32_t 
     assert(!kernel_vfs_path_root(mount,adapter->instance.heap, &root));
     const uint32_t types[]={KERNEL_VFS_S_IFREG,KERNEL_VFS_S_IFIFO,KERNEL_VFS_S_IFCHR};
     for (unsigned i=0;i<sizeof(types)/sizeof(types[0]);i++) {
-        assert(kernel_vfs_mknod_at(root,root,"/nojournal-denied",types[i]|0600,0)==-KERNEL_EOPNOTSUPP);
+        assert(kernel_vfs_mknod_at(root,root,"/nojournal-denied",types[i]|0600,0,0)==-KERNEL_EOPNOTSUPP);
         struct kernel_vfs_file missing={0};
         assert(kernel_vfs_open(mount,"/nojournal-denied",&missing)==-KERNEL_ENOENT);
     }
@@ -803,7 +803,7 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
         switch (operation) {
         case 0:result=create_file(mount,"/budget-created",0640,&file);break;
         case 1:result=kernel_vfs_mkdir(mount,"/budget-created-dir",0710);break;
-        case 2:result=kernel_vfs_mknod_at(root,root,"/budget-created-fifo",KERNEL_VFS_S_IFIFO|0620,0);break;
+        case 2:result=kernel_vfs_mknod_at(root,root,"/budget-created-fifo",KERNEL_VFS_S_IFIFO|0620,0,0);break;
         case 3:result=kernel_vfs_rename_at(root,root,root,"/budget-left/source","/budget-right/victim",0);break;
         case 4:result=kernel_vfs_link_at(source.path,root,root,"/budget-hardlink");break;
         case 5:result=kernel_vfs_symlink_at(root,root,"/budget-hardlink","/budget-symlink");break;
@@ -1184,7 +1184,7 @@ static void *credential_create_thread(void *argument)
     struct credential_create_race *race=argument;cache_test_attach(1);
     (void)kernel_credentials_override(&race->user);
     struct kernel_vfs_file file={0};
-    race->create_result=kernel_vfs_create_at(race->root,race->root,"/qualified/accepted",0600,&file);
+    race->create_result=kernel_vfs_create_at(race->root,race->root,"/qualified/accepted",0600,&file,0);
     if (!race->create_result) assert(!kernel_vfs_close(&file));
     (void)kernel_credentials_override(NULL);return NULL;
 }
@@ -1206,7 +1206,7 @@ static void credential_namespace_race(struct kernel_vfs_mount *mount)
     race.user.gid=race.user.egid=race.user.sgid=race.user.fsgid=100;
     race.user.effective=race.user.permitted=0;
     assert(!kernel_vfs_path_root(mount,adapter->instance.heap,&race.root));
-    assert(!kernel_vfs_mkdir_at(race.root,race.root,"/qualified",0777));
+    assert(!kernel_vfs_mkdir_at(race.root,race.root,"/qualified",0777,0));
     assert(!kernel_vfs_path_resolve(race.root,race.root,"/qualified",1,&race.directory));
     credential_create_pause=1;credential_create_entered=credential_create_resume=credential_chmod_done=0;
     pthread_t creator,changer;
@@ -1224,7 +1224,7 @@ static void credential_namespace_race(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_stat_at(race.root,race.root,"/qualified/accepted",1,&stat) && stat.uid==1000 && stat.gid==100);
     (void)kernel_credentials_override(&race.user);
     struct kernel_vfs_file denied={0};
-    assert(kernel_vfs_create_at(race.root,race.root,"/qualified/denied",0600,&denied)==-KERNEL_EACCES);
+    assert(kernel_vfs_create_at(race.root,race.root,"/qualified/denied",0600,&denied,0)==-KERNEL_EACCES);
     (void)kernel_credentials_override(NULL);
     assert(!kernel_vfs_path_release(&race.directory) && !kernel_vfs_path_release(&race.root));
     assert(!ext4_journal_group_drain(adapter->mount_point));
@@ -1349,16 +1349,16 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
     other=user;other.uid=other.euid=other.suid=other.fsuid=1001;
     struct kernel_vfs_path *path=NULL;
     assert(!kernel_vfs_path_root(mount,((struct kernel_vfs_instance *)mount->private_data)->heap,&path));
-    assert(!kernel_vfs_mkdir_at(path,path,"/identities",0777));
-    assert(!kernel_vfs_mkdir_at(path,path,"/sticky",01777));
-    assert(!kernel_vfs_mkdir_at(path,path,"/group",02777));
+    assert(!kernel_vfs_mkdir_at(path,path,"/identities",0777,0));
+    assert(!kernel_vfs_mkdir_at(path,path,"/sticky",01777,0));
+    assert(!kernel_vfs_mkdir_at(path,path,"/group",02777,0));
     struct kernel_vfs_path *group=NULL;
     assert(!kernel_vfs_path_resolve(path,path,"/group",1,&group));
     assert(!kernel_vfs_path_set_owner(group,UINT32_MAX,200));
     assert(!kernel_vfs_path_set_mode(group,02777));
     assert(!kernel_vfs_path_release(&group));
     struct kernel_vfs_file root_file={0};
-    assert(!kernel_vfs_create_at(path,path,"/sticky/root",0600,&root_file));
+    assert(!kernel_vfs_create_at(path,path,"/sticky/root",0600,&root_file,0));
     assert(!kernel_vfs_close(&root_file));
     (void)kernel_credentials_override(&user);
     struct kernel_vfs_open_request create={.flags=KERNEL_VFS_OPEN_CREATE|KERNEL_VFS_OPEN_EXCLUSIVE|KERNEL_VFS_OPEN_FOLLOW,.access=6};
@@ -1381,10 +1381,10 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
     assert(kernel_vfs_file_set_owner(&file,0,UINT32_MAX)==-KERNEL_EPERM);
     assert(kernel_vfs_file_set_owner(&file,UINT32_MAX,200)==-KERNEL_EPERM);
     assert(kernel_vfs_unlink_at(path,path,"/sticky/root",0)==-KERNEL_EPERM);
-    assert(!kernel_vfs_create_at(path,path,"/sticky/own",0600,&denied));
+    assert(!kernel_vfs_create_at(path,path,"/sticky/own",0600,&denied,0));
     assert(!kernel_vfs_close(&denied));
     assert(!kernel_vfs_unlink_at(path,path,"/sticky/own",0));
-    assert(!kernel_vfs_create_at(path,path,"/group/inherited",02770,&denied));
+    assert(!kernel_vfs_create_at(path,path,"/group/inherited",02770,&denied,0));
     assert(!kernel_vfs_fstat(&denied,&stat) && stat.uid==1000 && stat.gid==200 && !(stat.mode&02000));
     assert(!kernel_vfs_close(&denied));
     (void)kernel_credentials_override(&other);

@@ -361,7 +361,7 @@ static void run_mount_tree_regression(struct kernel_vfs_mount *root_mount,
     if (kernel_vfs_symlink_at(first_root, root, "mount-anchor", "/cross-symlink") ||
         kernel_vfs_unlink(root_mount, "/cross-symlink"))
         fail_vfs(128U, 0, -1);
-    if (kernel_vfs_mkdir_at(root, root, "/mount-anchor/new", 0755U) !=
+    if (kernel_vfs_mkdir_at(root, root, "/mount-anchor/new", 0755U,0) !=
             -KERNEL_EROFS ||
         kernel_vfs_rmdir(root_mount, "/mount-anchor") != -KERNEL_EBUSY ||
         kernel_vfs_rename_at(root, root, root, "/mount-anchor",
@@ -798,8 +798,8 @@ static void run_rename_path_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_path_resolve(root, root, "/renamed/child", 1, &alias) ||
         alias != child || kernel_vfs_path_release(&alias))
         fail_vfs(82U, 0, -1);
-    if (kernel_vfs_create_at(child, root, "source", 0600, &source) ||
-        kernel_vfs_create_at(root, root, "/target", 0600, &target) ||
+    if (kernel_vfs_create_at(child, root, "source", 0600, &source,0) ||
+        kernel_vfs_create_at(root, root, "/target", 0600, &target,0) ||
         kernel_vfs_pwrite(&target, 0, "old", 3, &count) || count != 3 ||
         kernel_vfs_pwrite(&source, 0, "new", 3, &count) || count != 3 ||
         kernel_vfs_rename_at(child, root, root, "source", "/target", 1) !=
@@ -841,18 +841,18 @@ static void run_deep_relative_path_regression(struct kernel_vfs_mount *mount,
     memset(component, 'd', 255U);
     component[255] = 0;
     if (kernel_vfs_path_root(mount, heap, &root) ||
-        kernel_vfs_mkdir_at(root, root, "deep-chain", 0700) ||
+        kernel_vfs_mkdir_at(root, root, "deep-chain", 0700,0) ||
         kernel_vfs_path_lookup(root, "deep-chain", 10, &current))
         fail_vfs(85U, 0, -1);
     for (unsigned i = 0; i < 17; i++) {
-        int result = kernel_vfs_mkdir_at(current, root, component, 0700);
+        int result = kernel_vfs_mkdir_at(current, root, component, 0700,0);
         if (result || kernel_vfs_path_lookup(current, component, 255U, &next))
             fail_vfs(86U, 0, result);
         (void)kernel_vfs_path_release(&current);
         current = next;
         next = 0;
     }
-    if (kernel_vfs_create_at(current, root, "leaf", 0600, &file) ||
+    if (kernel_vfs_create_at(current, root, "leaf", 0600, &file,0) ||
         kernel_vfs_close(&file) ||
         kernel_vfs_symlink_at(current, root, "leaf", "link") ||
         kernel_vfs_open_at(current, root, "link", &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW}, &file, NULL) ||

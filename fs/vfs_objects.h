@@ -187,7 +187,7 @@ struct kernel_vfs_backend {
     int (*flush)(struct kernel_vfs_instance *instance);
     int (*symlink)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
-        uint32_t type, uint32_t mode, uint32_t device);
+        uint32_t type, uint32_t mode, uint32_t device, uint32_t umask);
     int (*link)(struct kernel_vfs_instance *instance, uint64_t source_inode,
         uint64_t target_parent, const char *name);
     int (*rename)(struct kernel_vfs_instance *instance,
@@ -204,6 +204,8 @@ struct kernel_vfs_backend {
     int (*set_mode)(struct kernel_vfs_file *file, uint32_t mode);
     int (*set_owner)(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid);
     int (*permission)(struct kernel_vfs_node *, const struct kernel_credentials *, unsigned);
+    /* ACL-aware DAC on backends that store per-inode access ACLs. */
+    int (*acl_permission)(struct kernel_vfs_node *, const struct kernel_credentials *, unsigned);
     int (*exec_metadata)(struct kernel_vfs_node *, struct kernel_vfs_exec_metadata *);
     int (*killpriv)(struct kernel_vfs_node *, uint32_t mode);
     int (*open)(struct kernel_vfs_mount *mount,
@@ -213,7 +215,7 @@ struct kernel_vfs_backend {
     int (*create)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path,
         uint32_t mode,
-        struct kernel_vfs_file *file);
+        struct kernel_vfs_file *file, uint32_t umask);
     /* The backend takes mutation qualification only when it publishes atime. */
     void (*accessed)(struct kernel_vfs_file *file);
     int (*modified)(struct kernel_vfs_file *file,
@@ -222,7 +224,7 @@ struct kernel_vfs_backend {
         struct kernel_vfs_stat *stat);
     int (*mkdir)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path,
-        uint32_t mode);
+        uint32_t mode, uint32_t umask);
     int (*unlink)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path);
     int (*rmdir)(struct kernel_vfs_mount *mount,

@@ -59,7 +59,7 @@ static void worker_notification_case(struct lwext4_mount_adapter *adapter,struct
 {
     if(!worker_mode)return;
     struct kernel_vfs_file file={0};
-    assert(!kernel_vfs_create_at(root,root,"worker-notify",0600,&file) &&
+    assert(!kernel_vfs_create_at(root,root,"worker-notify",0600,&file,0) &&
            !ext4_journal_group_drain(adapter->mount_point));
     while(!__atomic_load_n(&adapter->journal_work.head,__ATOMIC_ACQUIRE) ||
           !__atomic_load_n(&adapter->checkpoint_work.head,__ATOMIC_ACQUIRE))sched_yield();

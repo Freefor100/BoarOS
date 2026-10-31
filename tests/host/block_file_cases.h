@@ -250,7 +250,7 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     assert(!kernel_fs_context_create(&local_fs, mount, heap) && !kernel_files_create(&local, heap));
     KERNEL_FS_PATHS(paths, &local_fs);
     struct kernel_vfs_path *root = paths.root;
-    assert(!kernel_vfs_mknod_at(root, root, "/raw-block", KERNEL_VFS_S_IFBLK | 0600, number));
+    assert(!kernel_vfs_mknod_at(root, root, "/raw-block", KERNEL_VFS_S_IFBLK | 0600, number,0));
     size_t done; int64_t result;
     struct kernel_open_file_description *node = 0; int node_error;
     struct kernel_vfs_stat node_stat;
@@ -258,7 +258,7 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     assert(!kernel_vfs_fstat(&node->file, &node_stat) && node_stat.rdev == number &&
         !node_stat.size && !node_stat.blocks && !kernel_vfs_file_memory(&node->file));
     assert(!kernel_open_file_release(&node));
-    assert(!kernel_vfs_mknod_at(root, root, "/raw-char", KERNEL_VFS_S_IFCHR | 0600, 0x103));
+    assert(!kernel_vfs_mknod_at(root, root, "/raw-char", KERNEL_VFS_S_IFCHR | 0600, 0x103,0));
     assert(!kernel_open_file_create(heap, mount, "/raw-char", &node, &node_error) && !node_error);
     assert(!kernel_vfs_fstat(&node->file, &node_stat) && node_stat.rdev == 0x103 &&
         !node_stat.size && !node_stat.blocks && !kernel_vfs_file_memory(&node->file));
@@ -380,7 +380,7 @@ static void raw_mounted_flush_case(struct kernel_heap *heap, struct kernel_vfs_m
     assert(!kernel_fs_context_create(&local_fs, mount, heap) && !kernel_files_create(&local, heap));
     KERNEL_FS_PATHS(paths, &local_fs);
     struct kernel_vfs_path *root = paths.root;
-    assert(!kernel_vfs_mknod_at(root, root, "/mounted-block", KERNEL_VFS_S_IFBLK | 0600, device->device_number));
+    assert(!kernel_vfs_mknod_at(root, root, "/mounted-block", KERNEL_VFS_S_IFBLK | 0600, device->device_number,0));
     size_t done; int64_t result; int error;
     assert(!kernel_copy_to_user(&mm, 0x200000, "/mounted-block", 15, &done) && done == 15);
     assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, 2, 0, &result) && result == 0);

@@ -54,8 +54,6 @@
 
 /* Name indexes */
 #define EXT4_XATTR_INDEX_USER           1
-#define EXT4_XATTR_INDEX_POSIX_ACL_ACCESS   2
-#define EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT  3
 #define EXT4_XATTR_INDEX_TRUSTED        4
 #define EXT4_XATTR_INDEX_LUSTRE         5
 #define EXT4_XATTR_INDEX_SECURITY           6
@@ -598,7 +596,9 @@ static bool ext4_xattr_is_ibody_valid(struct ext4_inode_ref *inode_ref)
 
 	iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
 	entry = EXT4_XATTR_IFIRST(iheader);
-	base = iheader;
+	/* Inline value offsets are relative to the first entry, after the
+	 * four-byte header. Using the header rejects tightly packed ACLs. */
+	base = EXT4_XATTR_IFIRST(iheader);
 	end = (char *)inode_ref->inode + inode_size;
 	min_offs = (char *)end - (char *)base;
 
@@ -1500,7 +1500,12 @@ static int ext4_xattr_block_remove(struct ext4_inode_ref *inode_ref,
 		block = new_block;
 	}
 
-	ext4_xattr_block_find_entry(inode_ref, &finder, &block);
+	finder.i = *i;
+	ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
+	if (ret != EOK) {
+		ext4_block_set(fs->bdev, &block);
+		goto out;
+	}
 
 	if (!finder.s.not_found) {
 		i->value = NULL;
@@ -1513,10 +1518,13 @@ static int ext4_xattr_block_remove(struct ext4_inode_ref *inode_ref,
 		ext4_xattr_set_block_checksum(inode_ref,
 					      block.lb_id,
 					      header);
-		ext4_trans_set_block_dirty(block.buf);
+		if (ret == EOK) ret = ext4_trans_set_block_dirty(block.buf);
 	}
 
-	ext4_block_set(fs->bdev, &block);
+	{
+		int release = ext4_block_set(fs->bdev, &block);
+		if (ret == EOK) ret = release;
+	}
 out:
 	return ret;
 }
@@ -1592,24 +1600,31 @@ int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 	try_insert:
 		/* Only try to set entry in ibody if inode is sufficiently large */
 		if (extra_isize)
-			ret = ext4_xattr_set_entry(&i, &ibody_finder.s, false);
+			ret = ext4_xattr_set_entry(&i, &ibody_finder.s, true);
 		else
 			ret = ENOSPC;
 
 		if (ret == ENOSPC) {
 			if (!block_found) {
 				ret = ext4_xattr_block_set(inode_ref, &i, false);
-				ibody_finder.i.value = NULL;
-				ext4_xattr_set_entry(&ibody_finder.i,
-						     &ibody_finder.s, false);
-				inode_ref->dirty = true;
+				/* Keep the old inline value if the new block failed. */
+				if (ret == EOK && extra_isize) {
+					ibody_finder.i.value = NULL;
+					ret = ext4_xattr_set_entry(&ibody_finder.i,
+								   &ibody_finder.s, false);
+					inode_ref->dirty = true;
+				}
 			}
 
 		} else if (ret == EOK) {
+			/* Verify space before retiring the external copy; an error
+			 * there must leave the original inline bytes untouched. */
 			if (block_found)
 				ret = ext4_xattr_block_remove(inode_ref, &i);
-
-			inode_ref->dirty = true;
+			if (ret == EOK) {
+				ret = ext4_xattr_set_entry(&i, &ibody_finder.s, false);
+				inode_ref->dirty = true;
+			}
 		}
 	}
 

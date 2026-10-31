@@ -190,7 +190,7 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_PATH_ONLY = 1U << 4,
     KERNEL_VFS_OPEN_DIRECTORY = 1U << 5,
 };
-struct kernel_vfs_open_request { unsigned flags; uint32_t mode; unsigned access; };
+struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access; };
 #define KERNEL_VFS_MAY_EXEC 1U
 #define KERNEL_VFS_MAY_WRITE 2U
 #define KERNEL_VFS_MAY_READ 4U
@@ -219,21 +219,21 @@ int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
     uint32_t flags, struct kernel_open_file_description **owner);
 int kernel_vfs_create_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
-                         uint32_t mode, struct kernel_vfs_file *file);
+                         uint32_t mode, struct kernel_vfs_file *file, uint32_t umask);
 int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *path,
-                        uint32_t mode, uint32_t device);
+                        uint32_t mode, uint32_t device, uint32_t umask);
 /* Bind creates and retains one socket inode under the parent namespace lock.
- * mode already includes the caller's umask. Lookup follows symlinks and checks
+ * Lookup follows symlinks and checks
  * target write permission; both results own a normal path reference. */
 int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path, uint32_t mode,
-    struct kernel_vfs_path **owner);
+    struct kernel_vfs_path **owner, uint32_t umask);
 int kernel_vfs_socket_lookup_at(struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path, struct kernel_vfs_path **owner);
 int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *path,
-                        uint32_t mode);
+                        uint32_t mode, uint32_t umask);
 int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          int directory);
@@ -256,6 +256,8 @@ int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          unsigned mode, int follow_final);
 int kernel_vfs_access_check(const struct kernel_vfs_stat *stat,
                              const struct kernel_vfs_mount *mount, unsigned mode);
+int kernel_vfs_file_access_check(const struct kernel_vfs_file *file,
+                                 const struct kernel_vfs_stat *stat,unsigned mode);
 int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                          struct kernel_vfs_path *new_start,
                          struct kernel_vfs_path *root,

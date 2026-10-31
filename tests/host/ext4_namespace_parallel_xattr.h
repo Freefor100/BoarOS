@@ -94,8 +94,8 @@ static void namespace_parallel_xattr_case(struct lwext4_mount_adapter *adapter,s
     for(unsigned action=0;action<3;action++)for(unsigned abort=0;abort<2;abort++) {
         bool removing=action==1,truncating=action==2;
         struct kernel_vfs_file files[2]={{0},{0}};
-        assert(!kernel_vfs_create_at(root,root,"ea-parallel-a",0600,&files[0]) &&
-               !kernel_vfs_create_at(root,root,"ea-parallel-b",0600,&files[1]));
+        assert(!kernel_vfs_create_at(root,root,"ea-parallel-a",0600,&files[0],0) &&
+               !kernel_vfs_create_at(root,root,"ea-parallel-b",0600,&files[1],0));
         if(truncating) {
             static const char payload[4096]="shared EA truncate payload";
             size_t written;

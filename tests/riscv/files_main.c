@@ -2608,7 +2608,7 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
     struct kernel_vfs_path *root = 0;
     struct kernel_open_file_description *file = 0;
     if (kernel_tmpfs_create(heap, 0, 0, &mount) || kernel_vfs_path_root(mount, heap, &root) ||
-        kernel_vfs_mknod_at(root, root, "/fifo", KERNEL_VFS_S_IFIFO | 0600, 0))
+        kernel_vfs_mknod_at(root, root, "/fifo", KERNEL_VFS_S_IFIFO | 0600, 0,0))
         fail_files(600U, 0, -1);
     int result;
     if (kernel_open_file_create_at(heap, root, root, "/fifo", &(const struct kernel_vfs_open_request){.flags=KERNEL_VFS_OPEN_FOLLOW},

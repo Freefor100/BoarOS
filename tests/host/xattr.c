@@ -24,7 +24,7 @@ int __wrap_ext4_xattr_set(struct ext4_inode_ref *ref,uint8_t index,const char *n
 static void attributes(struct kernel_vfs_path *root)
 {
     struct kernel_vfs_file file={0};char output[512];
-    assert(!kernel_vfs_create_at(root,root,"attrs",0600,&file));
+    assert(!kernel_vfs_create_at(root,root,"attrs",0600,&file,0));
     assert(kernel_vfs_file_xattr(&file,KERNEL_XATTR_GET,"user.a",NULL,0,0)==-KERNEL_ENODATA);
     assert(!kernel_vfs_file_xattr(&file,KERNEL_XATTR_SET,"user.a","abc",3,KERNEL_XATTR_CREATE));
     assert(kernel_vfs_file_xattr(&file,KERNEL_XATTR_SET,"user.a","bad",3,KERNEL_XATTR_CREATE)==-KERNEL_EEXIST);

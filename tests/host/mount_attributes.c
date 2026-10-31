@@ -51,7 +51,7 @@ static void devices(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_path *root=0;struct kernel_vfs_file file={0};
     assert(!kernel_vfs_path_root(mount,&heap,&root));
-    assert(!kernel_vfs_mknod_at(root,root,"/device",KERNEL_VFS_S_IFCHR|0666,0x103));
+    assert(!kernel_vfs_mknod_at(root,root,"/device",KERNEL_VFS_S_IFCHR|0666,0x103,0));
     assert(kernel_vfs_open(mount,"/device",&file)==-KERNEL_EACCES);
     const struct kernel_vfs_open_request path={.flags=KERNEL_VFS_OPEN_PATH_ONLY|KERNEL_VFS_OPEN_FOLLOW};
     assert(!kernel_vfs_open_at(root,root,"/device",&path,&file,0));
@@ -246,9 +246,9 @@ static void mount_views(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_path *root=0,*source=0,*covered=0,*bound=0,*held=0,*resolved=0;
     assert(!kernel_vfs_path_root(mount,&heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"/source",0755));
-    assert(!kernel_vfs_mkdir_at(root,root,"/source/child",0755));
-    assert(!kernel_vfs_mkdir_at(root,root,"/bind",0755));
+    assert(!kernel_vfs_mkdir_at(root,root,"/source",0755,0));
+    assert(!kernel_vfs_mkdir_at(root,root,"/source/child",0755,0));
+    assert(!kernel_vfs_mkdir_at(root,root,"/bind",0755,0));
     assert(!kernel_vfs_path_resolve(root,root,"/source",1,&source));
     assert(!kernel_vfs_path_resolve(root,root,"/bind",1,&covered));
     int result=kernel_vfs_bind_mount(source,covered,0);
@@ -271,8 +271,8 @@ static void mount_views(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_resolve(root,root,"/source/renamed",1,&point));
     assert(!kernel_vfs_umount(point,0)&&!kernel_vfs_path_release(&point));
     assert(!kernel_vfs_remount(bound,4096U|1U,NULL));
-    assert(kernel_vfs_mkdir_at(bound,root,"readonly",0700)==-KERNEL_EROFS);
-    assert(!kernel_vfs_mkdir_at(source,root,"writable",0700));
+    assert(kernel_vfs_mkdir_at(bound,root,"readonly",0700,0)==-KERNEL_EROFS);
+    assert(!kernel_vfs_mkdir_at(source,root,"writable",0700,0));
     assert(kernel_vfs_umount(bound,0)==-KERNEL_EBUSY);
     assert(!kernel_vfs_umount(bound,2));
     struct kernel_vfs_mount *unattached=NULL;
@@ -327,17 +327,17 @@ static void mount_view_tree(struct kernel_vfs_mount *mount)
     struct kernel_vfs_mount *first=0,*second=0;
     assert(!kernel_vfs_path_root(mount,&heap,&root));
     const char *directories[]={"/instance","/copy","/tree","/failed"};
-    for (unsigned i=0;i<4;i++) assert(!kernel_vfs_mkdir_at(root,root,directories[i],0755));
+    for (unsigned i=0;i<4;i++) assert(!kernel_vfs_mkdir_at(root,root,directories[i],0755,0));
     assert(!kernel_tmpfs_create(&heap,0,NULL,&first));
     assert(!kernel_vfs_path_resolve(root,root,"/instance",1,&covered));
     assert(!kernel_vfs_mount_attach(first,covered)&&!kernel_vfs_path_release(&covered));
     assert(!kernel_vfs_path_resolve(root,root,"/instance",1,&source));
-    assert(!kernel_vfs_mkdir_at(source,root,"child",0755));
+    assert(!kernel_vfs_mkdir_at(source,root,"child",0755,0));
     struct kernel_vfs_file file={0};
-    assert(!kernel_vfs_create_at(source,root,"data",0644,&file));
+    assert(!kernel_vfs_create_at(source,root,"data",0644,&file,0));
     size_t done=0;assert(!kernel_vfs_pwrite(&file,0,"ok",2,&done)&&done==2);
     assert(!kernel_vfs_close(&file));
-    assert(!kernel_vfs_create_at(root,root,"/single",0644,&file)&&!kernel_vfs_close(&file));
+    assert(!kernel_vfs_create_at(root,root,"/single",0644,&file,0)&&!kernel_vfs_close(&file));
     assert(!kernel_vfs_path_resolve(source,root,"data",1,&path));
     assert(!kernel_vfs_path_resolve(root,root,"/single",1,&covered));
     assert(!kernel_vfs_bind_mount(path,covered,0));
@@ -350,7 +350,7 @@ static void mount_view_tree(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_resolve(source,root,"child",1,&covered));
     assert(!kernel_vfs_mount_attach(second,covered)&&!kernel_vfs_path_release(&covered));
     assert(!kernel_vfs_path_resolve(source,root,"child",1,&nested));
-    assert(!kernel_vfs_create_at(nested,root,"marker",0644,&file)&&!kernel_vfs_close(&file));
+    assert(!kernel_vfs_create_at(nested,root,"marker",0644,&file,0)&&!kernel_vfs_close(&file));
     assert(!kernel_vfs_path_resolve(root,root,"/copy",1,&covered));
     assert(!kernel_vfs_bind_mount(source,covered,0)&&!kernel_vfs_path_release(&covered));
     assert(!kernel_vfs_path_resolve(root,root,"/copy",1,&copy));
@@ -396,7 +396,7 @@ static void mount_cleanup_failure(struct kernel_vfs_mount *mount)
     struct kernel_vfs_path *root=0,*covered=0,*child=0;
     struct kernel_vfs_mount *memory=0;
     assert(!kernel_vfs_path_root(mount,&heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"/cleanup",0755));
+    assert(!kernel_vfs_mkdir_at(root,root,"/cleanup",0755,0));
     assert(!kernel_vfs_path_resolve(root,root,"/cleanup",1,&covered));
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
     struct kernel_vfs_instance *instance=memory->private_data;
@@ -430,11 +430,11 @@ static void mount_detached_sync(struct kernel_vfs_mount *mount)
     const struct kernel_vfs_backend *original=visible->ops;
     struct kernel_vfs_backend visible_observer=*original;
     visible_observer.sync_filesystem=visible_sync;visible->ops=&visible_observer;
-    assert(!kernel_vfs_mkdir_at(root,root,"sync-alias",0755));
+    assert(!kernel_vfs_mkdir_at(root,root,"sync-alias",0755,0));
     assert(!kernel_vfs_path_resolve(root,root,"sync-alias",1,&covered));
     assert(!kernel_vfs_bind_mount(root,covered,0)&&!kernel_vfs_path_release(&covered));
     assert(!kernel_vfs_path_resolve(root,root,"sync-alias",1,&alias));
-    assert(!kernel_vfs_mkdir_at(root,root,"detached-sync",0755));
+    assert(!kernel_vfs_mkdir_at(root,root,"detached-sync",0755,0));
     assert(!kernel_vfs_path_resolve(root,root,"detached-sync",1,&covered));
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
     struct kernel_vfs_instance *instance=memory->private_data;
@@ -444,7 +444,7 @@ static void mount_detached_sync(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_resolve(root,root,"detached-sync",1,&child));
     assert(!kernel_vfs_umount(child,2));
     struct kernel_vfs_file file={0};size_t done;
-    assert(!kernel_vfs_create_at(child,root,"after-detach",0600,&file));
+    assert(!kernel_vfs_create_at(child,root,"after-detach",0600,&file,0));
     assert(!kernel_vfs_pwrite(&file,0,"sync",4,&done)&&done==4);
     kernel_vfs_sync_all(root);assert(detached_sync_calls==1&&visible_sync_calls==1);
     detached_sync_calls=visible_sync_calls=0;plain_allocation_fail=1;
@@ -488,7 +488,7 @@ static void mount_deep_views(struct kernel_vfs_mount *mount)
     struct kernel_vfs_path *root=NULL,*covered=NULL,*source=NULL,*cursor=NULL,*target=NULL;
     struct kernel_vfs_mount *memory=NULL;
     assert(!kernel_vfs_path_root(mount,&heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"deep-source",0755)&&!kernel_vfs_mkdir_at(root,root,"deep-target",0755));
+    assert(!kernel_vfs_mkdir_at(root,root,"deep-source",0755,0)&&!kernel_vfs_mkdir_at(root,root,"deep-target",0755,0));
     assert(!kernel_vfs_path_resolve(root,root,"deep-source",1,&covered));
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory)&&!kernel_vfs_mount_attach(memory,covered));
     assert(!kernel_vfs_path_release(&covered)&&!kernel_vfs_path_root(memory,&heap,&source));
@@ -527,7 +527,7 @@ static void mount_cleanup_chain(struct kernel_vfs_mount *mount)
     struct kernel_vfs_path *root=NULL,*covered=NULL,*a=NULL,*b=NULL;
     struct kernel_vfs_mount *first=NULL,*second=NULL;
     assert(!kernel_vfs_path_root(mount,&heap,&root));
-    assert(!kernel_vfs_mkdir_at(root,root,"chain-a",0755)&&!kernel_vfs_mkdir_at(root,root,"chain-b",0755));
+    assert(!kernel_vfs_mkdir_at(root,root,"chain-a",0755,0)&&!kernel_vfs_mkdir_at(root,root,"chain-b",0755,0));
     assert(!kernel_tmpfs_create(&heap,0,NULL,&first)&&!kernel_tmpfs_create(&heap,0,NULL,&second));
     struct kernel_vfs_instance *ai=first->private_data,*bi=second->private_data;
     chain_original=ai->ops;
@@ -565,7 +565,7 @@ static void mount_sync_owner(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_path *root=NULL,*covered=NULL,*child=NULL;
     struct kernel_vfs_mount *memory=NULL;
-    assert(!kernel_vfs_path_root(mount,&heap,&root)&&!kernel_vfs_mkdir_at(root,root,"snapshot-owner",0755));
+    assert(!kernel_vfs_path_root(mount,&heap,&root)&&!kernel_vfs_mkdir_at(root,root,"snapshot-owner",0755,0));
     assert(!kernel_vfs_path_resolve(root,root,"snapshot-owner",1,&covered));
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory)&&!kernel_vfs_mount_attach(memory,covered));
     assert(!kernel_vfs_path_release(&covered));

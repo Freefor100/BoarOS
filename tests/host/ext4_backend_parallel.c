@@ -223,7 +223,7 @@ int main(int argc,char **argv)
     unsigned first=UINT32_MAX,second=UINT32_MAX;
     for(unsigned i=0;i<8;i++) {
         snprintf(names[i],sizeof(names[i]),"packed-%u",i);
-        assert(!kernel_vfs_create_at(root,root,names[i],0600,&files[i]));
+        assert(!kernel_vfs_create_at(root,root,names[i],0600,&files[i],0));
         inode_location(adapter,kernel_vfs_file_inode(&files[i]),&lbas[i],&offsets[i]);
         for(unsigned j=0;j<i;j++)if(lbas[j]==lbas[i] && first==UINT32_MAX) {first=j;second=i;}
     }

@@ -298,7 +298,7 @@ struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context
 void kernel_fs_paths_release(struct kernel_fs_paths *paths)
 { CHECK(!paths->root && !paths->cwd); }
 int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,struct kernel_vfs_path *root,
-    const char *path,uint32_t mode,struct kernel_vfs_path **owner)
+    const char *path,uint32_t mode,struct kernel_vfs_path **owner,0)
 { (void)start;(void)root;(void)path;(void)mode;CHECK(!*owner);return -KERNEL_ENOENT; }
 int kernel_vfs_socket_lookup_at(struct kernel_vfs_path *start,struct kernel_vfs_path *root,
     const char *path,struct kernel_vfs_path **owner)

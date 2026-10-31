@@ -65,7 +65,7 @@ int main(int argc,char **argv)
     assert(!kernel_vfs_remount(root,0,NULL) && !adapter->instance.read_only && !adapter->device.fs->read_only);
     assert(adapter->journal_started && adapter->instance.writeback.domain);
     struct kernel_vfs_file writer={0},reader={0};size_t done;char bytes[8]={0};
-    assert(!kernel_vfs_create_at(root,root,"/remount-stable",0600,&writer));
+    assert(!kernel_vfs_create_at(root,root,"/remount-stable",0600,&writer,0));
     assert(!kernel_vfs_file_acquire_write(&writer));
     assert(!kernel_vfs_pwrite(&writer,0,"stable",6,&done)&&done==6);
     assert(kernel_vfs_remount(root,1|2|4,NULL)==-KERNEL_EBUSY && !adapter->instance.read_only);

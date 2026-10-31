@@ -5951,7 +5951,15 @@ static int ext4_attribute_name(const char *name,size_t length,uint8_t *index,con
 {
     bool found;
     *suffix=ext4_extract_xattr_name(name,length,index,count,&found);
-    return found && *count ? EOK : EINVAL;
+    if (!found) return EINVAL;
+    if (*index==EXT4_XATTR_INDEX_POSIX_ACL_ACCESS ||
+        *index==EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT) {
+        if (*count) return EINVAL;
+        /* ACLs use an empty on-disk name, not the system. suffix. */
+        *suffix="";
+        return EOK;
+    }
+    return *count ? EOK : EINVAL;
 }
 static int ext4_apply_attribute(void *argument)
 {
@@ -6000,6 +6008,50 @@ int ext4_file_removexattr(ext4_file *file,const char *name,size_t length)
     struct ext4_attribute_change change={file,name,length,NULL,0,0,true};
     return ext4_change_attribute(&change);
 }
+struct ext4_acl_change {
+    ext4_file *file;
+    const void *value;
+    size_t size;
+    uint32_t mode;
+    uint8_t index;
+    bool remove,update_mode;
+};
+static int ext4_apply_acl(void *argument)
+{
+    struct ext4_acl_change *change=argument;
+    struct ext4_mountpoint *mp=change->file->mp;
+    int result=ext4_trans_start(mp);
+    if (result) return result;
+    struct ext4_inode_ref ref;
+    result=ext4_fs_get_inode_ref(&mp->fs,change->file->inode,&ref);
+    if (!result) {
+        if (change->remove) {
+            result=ext4_xattr_remove(&ref,change->index,"",0);
+            if (result==ENODATA) result=EOK;
+        } else result=ext4_xattr_set(&ref,change->index,"",0,change->value,change->size);
+        if (!result && change->update_mode) {
+            uint32_t previous=ext4_inode_get_mode(ext4_fs_super(&mp->fs),ref.inode);
+            ext4_inode_set_mode(ext4_fs_super(&mp->fs),ref.inode,
+                                (previous & ~07777U) | (change->mode & 07777U));
+            ref.dirty=true;
+        }
+        if (!result) ext4_touch_inode(mp,&ref,EXT4_TIME_CTIME,change->file->time_owner);
+        result=ext4_result(result,ext4_fs_put_inode_ref(&ref));
+    }
+    return ext4_trans_finish(mp,result);
+}
+int ext4_file_set_acl(ext4_file *file,uint8_t index,const void *value,size_t size,
+                      bool remove,bool update_mode,uint32_t mode)
+{
+    if (!file || !file->mp || (index!=EXT4_XATTR_INDEX_POSIX_ACL_ACCESS &&
+        index!=EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT) || (!remove && !value)) return EINVAL;
+    struct ext4_acl_change change={file,value,size,mode,index,remove,update_mode};
+    EXT4_MP_LOCK(file->mp);
+    int result=file->mp->fs.read_only ? EROFS :
+        ext4_metadata_execute_locked(file->mp,ext4_apply_acl,&change);
+    EXT4_MP_UNLOCK(file->mp);
+    return result;
+}
 int ext4_file_getxattr(ext4_file *file,const char *name,size_t length,void *value,size_t capacity,size_t *size)
 {
     if (!file || !file->mp || !size) return EINVAL;
@@ -6035,7 +6087,8 @@ int ext4_file_listxattr(ext4_file *file,char *output,size_t capacity,size_t *siz
             else result=ext4_xattr_list(&ref,list,&length);
         }
         if (!result) for (struct ext4_xattr_list_entry *entry=list;entry;entry=entry->next) {
-            if (entry->name_index!=1 && entry->name_index!=6 && !(trusted && entry->name_index==4)) continue;
+            if (entry->name_index!=1 && entry->name_index!=2 && entry->name_index!=3 &&
+                entry->name_index!=6 && !(trusted && entry->name_index==4)) continue;
             size_t prefix_size;const char *prefix=ext4_get_xattr_name_prefix(entry->name_index,&prefix_size);
             size_t count=prefix_size+entry->name_len+1;
             if (capacity && capacity-*size<count) {result=ERANGE;break;}

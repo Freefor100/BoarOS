@@ -6,7 +6,7 @@ struct socket_path_race {
 static void *socket_bind_thread(void *argument)
 {
     struct socket_path_race *race=argument;cache_test_attach(1);
-    assert(!kernel_vfs_socket_bind_at(race->root,race->root,"/socket-race",0600,&race->bound));
+    assert(!kernel_vfs_socket_bind_at(race->root,race->root,"/socket-race",0600,&race->bound,0));
     race->original=kernel_vfs_path_inode(race->bound);
     return NULL;
 }
@@ -14,7 +14,7 @@ static void *socket_replace_thread(void *argument)
 {
     struct socket_path_race *race=argument;cache_test_attach(2);
     assert(!kernel_vfs_unlink_at(race->root,race->root,"/socket-race",0));
-    assert(!kernel_vfs_mknod_at(race->root,race->root,"/socket-race",KERNEL_VFS_S_IFSOCK|0666,0));
+    assert(!kernel_vfs_mknod_at(race->root,race->root,"/socket-race",KERNEL_VFS_S_IFSOCK|0666,0,0));
     __atomic_store_n(&socket_replace_done,1,__ATOMIC_RELEASE);
     return NULL;
 }
@@ -56,14 +56,14 @@ static void vfs_socket_paths(struct kernel_vfs_mount *mount)
     struct kernel_vfs_instance *instance=mount->private_data;
     assert(!kernel_vfs_path_root(mount,instance->heap,&root));
     if (!kernel_tmpfs_is_mount(mount) && !lwext4_instance(instance)->device.fs->jbd_journal) {
-        assert(kernel_vfs_mknod_at(root,root,"/socket-node",KERNEL_VFS_S_IFSOCK|0620,0)==-KERNEL_EOPNOTSUPP);
-        assert(kernel_vfs_socket_bind_at(root,root,"/socket-node",0620,&bound)==-KERNEL_EOPNOTSUPP && !bound);
+        assert(kernel_vfs_mknod_at(root,root,"/socket-node",KERNEL_VFS_S_IFSOCK|0620,0,0)==-KERNEL_EOPNOTSUPP);
+        assert(kernel_vfs_socket_bind_at(root,root,"/socket-node",0620,&bound,0)==-KERNEL_EOPNOTSUPP && !bound);
         assert(kernel_vfs_socket_lookup_at(root,root,"/socket-node",&lookup)==-KERNEL_ENOENT && !lookup);
         assert(!kernel_vfs_path_release(&root));
         puts("PASS socket pathname: nonjournal creation refusal leaves no node or owner");
         return;
     }
-    assert(!kernel_vfs_mknod_at(root,root,"/socket-node",KERNEL_VFS_S_IFSOCK|0620,0));
+    assert(!kernel_vfs_mknod_at(root,root,"/socket-node",KERNEL_VFS_S_IFSOCK|0620,0,0));
     struct kernel_vfs_stat stat;
     assert(!kernel_vfs_stat_at(root,root,"/socket-node",1,&stat));
     assert((stat.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFSOCK && (stat.mode & 0777)==0620);
@@ -73,11 +73,11 @@ static void vfs_socket_paths(struct kernel_vfs_mount *mount)
     assert(kernel_vfs_open(mount,"/socket-node",&file)==-KERNEL_ENXIO && !file.private_data && !file.path);
     assert(!kernel_vfs_unlink_at(root,root,"/socket-node",0));
 
-    assert(!kernel_vfs_socket_bind_at(root,root,"/socket-node",0620,&bound));
+    assert(!kernel_vfs_socket_bind_at(root,root,"/socket-node",0620,&bound,0));
     assert(!kernel_vfs_path_stat(bound,&stat));
     uint64_t original=stat.ino;
     assert((stat.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFSOCK && (stat.mode & 0777)==0620);
-    assert(kernel_vfs_socket_bind_at(root,root,"/socket-node",0600,&replacement)==-KERNEL_EEXIST && !replacement);
+    assert(kernel_vfs_socket_bind_at(root,root,"/socket-node",0600,&replacement,0)==-KERNEL_EEXIST && !replacement);
     assert(!kernel_vfs_path_stat(bound,&stat) && stat.ino==original && (stat.mode & 0777)==0620);
     assert(!kernel_vfs_link_at(bound,root,root,"/socket-alias"));
     assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-alias",&alias));
@@ -92,18 +92,18 @@ static void vfs_socket_paths(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_unlink_at(root,root,"/socket-alias",0));
     assert(!kernel_vfs_path_stat(bound,&stat) && stat.ino==original && !stat.nlink);
     assert(kernel_vfs_socket_lookup_at(root,root,"/socket-link",&lookup)==-KERNEL_ENOENT && !lookup);
-    assert(!kernel_vfs_socket_bind_at(root,root,"/socket-moved",0600,&replacement));
+    assert(!kernel_vfs_socket_bind_at(root,root,"/socket-moved",0600,&replacement,0));
     assert(kernel_vfs_path_inode(replacement)!=original);
     assert(!kernel_vfs_path_release(&bound) && !kernel_vfs_path_release(&alias));
     assert(!kernel_vfs_unlink_at(root,root,"/socket-moved",0));
     assert(!kernel_vfs_path_release(&replacement));
     assert(!kernel_vfs_unlink_at(root,root,"/socket-link",0));
 
-    assert(!kernel_vfs_create_at(root,root,"/regular",0666,&file));
+    assert(!kernel_vfs_create_at(root,root,"/regular",0666,&file,0));
     assert(!kernel_vfs_close(&file));
     assert(kernel_vfs_socket_lookup_at(root,root,"/regular",&lookup)==-KERNEL_ECONNREFUSED && !lookup);
     assert(!kernel_vfs_unlink_at(root,root,"/regular",0));
-    assert(!kernel_vfs_mkdir_at(root,root,"/socket-dir",02777));
+    assert(!kernel_vfs_mkdir_at(root,root,"/socket-dir",02777,0));
     struct kernel_vfs_path *directory=NULL;
     assert(!kernel_vfs_path_resolve(root,root,"/socket-dir",1,&directory));
     assert(!kernel_vfs_path_set_owner(directory,UINT32_MAX,200));
@@ -115,7 +115,7 @@ static void vfs_socket_paths(struct kernel_vfs_mount *mount)
     user.effective=user.permitted=user.inheritable=user.ambient=0;
     other=user;other.uid=other.euid=other.suid=other.fsuid=1001;
     (void)kernel_credentials_override(&user);
-    assert(!kernel_vfs_socket_bind_at(root,root,"/socket-dir/owned",0600,&bound));
+    assert(!kernel_vfs_socket_bind_at(root,root,"/socket-dir/owned",0600,&bound,0));
     assert(!kernel_vfs_path_stat(bound,&stat) && stat.uid==1000 && stat.gid==200 && (stat.mode&0777)==0600);
     assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-dir/owned",&lookup));
     assert(!kernel_vfs_path_release(&lookup));
@@ -126,16 +126,16 @@ static void vfs_socket_paths(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_set_mode(directory,0700));
     (void)kernel_credentials_override(&other);
     assert(kernel_vfs_socket_lookup_at(root,root,"/socket-dir/owned",&lookup)==-KERNEL_EACCES && !lookup);
-    assert(kernel_vfs_socket_bind_at(root,root,"/socket-dir/denied",0600,&replacement)==-KERNEL_EACCES && !replacement);
+    assert(kernel_vfs_socket_bind_at(root,root,"/socket-dir/denied",0600,&replacement,0)==-KERNEL_EACCES && !replacement);
     (void)kernel_credentials_override(privileged);
     assert(!kernel_vfs_path_set_mode(directory,0555));
     (void)kernel_credentials_override(&user);
-    assert(kernel_vfs_socket_bind_at(root,root,"/socket-dir/denied",0600,&replacement)==-KERNEL_EACCES && !replacement);
+    assert(kernel_vfs_socket_bind_at(root,root,"/socket-dir/denied",0600,&replacement,0)==-KERNEL_EACCES && !replacement);
     (void)kernel_credentials_override(privileged);
     instance->read_only=1;
     assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-dir/owned",&lookup));
     assert(!kernel_vfs_path_release(&lookup));
-    assert(kernel_vfs_socket_bind_at(root,root,"/readonly-socket",0600,&replacement)==-KERNEL_EROFS && !replacement);
+    assert(kernel_vfs_socket_bind_at(root,root,"/readonly-socket",0600,&replacement,0)==-KERNEL_EROFS && !replacement);
     instance->read_only=0;
     assert(!kernel_vfs_unlink_at(root,root,"/socket-dir/owned",0));
     assert(!kernel_vfs_path_release(&bound) && !kernel_vfs_path_release(&directory));

@@ -50,8 +50,9 @@ static int open_inode(struct kernel_vfs_mount *mount,const char *path,uint64_t i
 static int close_node(struct kernel_vfs_node *node)
 {if(node->backend_data)kernel_mqueue_put(node->backend_data);return 0;}
 static int create(struct kernel_vfs_mount *mount,uint64_t parent,const char *name,
-    uint32_t mode,struct kernel_vfs_file *file)
+    uint32_t mode,struct kernel_vfs_file *file,uint32_t umask)
 {
+    mode &= ~umask;
     if(parent!=1)return -KERNEL_ENOTDIR;
     if((mode&KERNEL_VFS_S_IFMT)&&(mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)return -KERNEL_EPERM;
     struct kernel_mqueue *q=0;int made=0;
@@ -99,8 +100,8 @@ static int set_times(struct kernel_vfs_file *file,const struct kernel_vfs_timesp
     struct kernel_mqueue *q=kernel_mqueue_fs_file_queue(file);
     return q?kernel_mqueue_queue_set_times(q,times):kernel_mqueue_root_set_times(times);
 }
-static int no_mkdir(struct kernel_vfs_mount *mount,uint64_t parent,const char *name,uint32_t mode)
-{(void)mount;(void)parent;(void)name;(void)mode;return -KERNEL_EPERM;}
+static int no_mkdir(struct kernel_vfs_mount *mount,uint64_t parent,const char *name,uint32_t mode,uint32_t umask)
+{(void)mount;(void)parent;(void)name;(void)mode;(void)umask;return -KERNEL_EPERM;}
 static int no_rmdir(struct kernel_vfs_mount *mount,uint64_t parent,const char *name)
 {(void)mount;(void)parent;(void)name;return -KERNEL_ENOTDIR;}
 static int no_truncate(struct kernel_vfs_node *node,uint64_t size,uint64_t *actual,int *changed)
