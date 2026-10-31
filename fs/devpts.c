@@ -186,7 +186,7 @@ int kernel_devpts_publish(struct kernel_vfs_mount *mount, void *pair,
     {
         e->mount = m; e->number = index; e->references = 1;
         e->binding = pair; e->published = e->reserved = 1;
-        e->stat = (struct kernel_vfs_stat){.dev = mount->id,
+        e->stat = (struct kernel_vfs_stat){.dev = m->instance.backend_mount.id,
             .ino = m->next_inode++, .mode = KERNEL_VFS_S_IFCHR | m->slave_mode,
             .uid = m->uid_set ? m->uid : kernel_credentials_current()->fsuid,
             .gid = m->gid_set ? m->gid : kernel_credentials_current()->fsgid, .nlink = 1,
@@ -237,7 +237,7 @@ void *kernel_devpts_entry_binding(const struct kernel_devpts_entry *entry)
 struct kernel_vfs_mount *kernel_devpts_file_mount(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *n = kernel_vfs_file_node(file);
-    return n && devpts(n->mount) ? n->mount : 0;
+    return n && devpts(file->mount) ? file->mount : 0;
 }
 struct kernel_devpts_entry *kernel_devpts_file_entry(const struct kernel_vfs_file *file)
 {
@@ -249,20 +249,73 @@ int kernel_devpts_file_is_ptmx(const struct kernel_vfs_file *file)
     struct kernel_vfs_node *n = kernel_vfs_file_node(file);
     return n && devpts(n->mount) && n->inode == DEVPTS_PTMX_INODE;
 }
-int kernel_devpts_mount_root(struct kernel_vfs_mount *mount, struct kernel_vfs_path **owner)
+int kernel_devpts_mount_root(struct kernel_vfs_mount *mount,struct kernel_vfs_path **owner)
 {
-    struct devpts_mount *m = devpts(mount);
+    struct devpts_mount *m=devpts(mount);
     if (!m || !owner || *owner) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(guard);
-    kernel_vfs_namespace_lock(mount, &guard);
-    if (m->instance.quiescing) return -KERNEL_EIO;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_vfs_path *root_path = mount->root_path;
-    int result = root_path ? kernel_vfs_path_acquire(root_path) : -KERNEL_ENODEV;
-    if (!result) *owner = root_path;
-    arch_interrupt_restore(irq);
+    struct kernel_vfs_path *path=NULL;
+    int result=kernel_vfs_path_root(mount,m->instance.heap,&path);
+    if (result) return result;
+    /* ptmx 单文件 bind 的视图根不是 slave 目录；共享目录项保留实际父链。 */
+    for (;;) {
+        struct kernel_vfs_path *parent=NULL;
+        result=kernel_vfs_path_parent_pin(path,&parent);
+        if (result || !parent) break;
+        if (kernel_vfs_path_release(&path)) __builtin_trap();
+        path=parent;
+    }
+    if (result) {(void)kernel_vfs_path_release(&path);return result;}
+    *owner=path;return 0;
+}
+int kernel_devpts_peer_path(const struct kernel_vfs_file *master,struct kernel_devpts_entry *entry,
+    struct kernel_vfs_path **owner)
+{
+    if (!master || !master->path || !entry || !owner || *owner) return -KERNEL_EINVAL;
+    struct kernel_vfs_path *path=master->path;
+    if (kernel_vfs_path_acquire(path)) __builtin_trap();
+    for (;;) {
+        struct kernel_vfs_path *covered=NULL;
+        {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            struct kernel_vfs_mount *mount=path->file.mount;
+            if (path->dentry==mount->root_dentry && mount->covered_path) {
+                covered=mount->covered_path;if (kernel_vfs_path_acquire(covered)) __builtin_trap();
+            }
+        }
+        if (!covered) break;
+        if (kernel_vfs_path_release(&path)) __builtin_trap();
+        path=covered;
+    }
+    struct kernel_vfs_instance *instance=&entry->mount->instance;
+    struct kernel_vfs_path *root_path=NULL;
+    int result=0;
+    if (path->file.mount->private_data==instance) result=kernel_devpts_mount_root(path->file.mount,&root_path);
+    else {
+        struct kernel_vfs_path *parent=NULL;
+        result=kernel_vfs_path_parent_pin(path,&parent);
+        if (!result && parent) {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            struct kernel_vfs_dentry *ancestor=parent->dentry;
+            while (ancestor && ancestor!=parent->file.mount->root_dentry) ancestor=ancestor->parent;
+            if (!ancestor) result=-KERNEL_ENOENT;
+        }
+        if (!result) result=parent ? kernel_vfs_path_lookup_object(parent,"pts",3,&root_path) : -KERNEL_ENOENT;
+        if (parent && kernel_vfs_path_release(&parent)) __builtin_trap();
+        if (!result && (root_path->file.mount->private_data!=instance ||
+            root_path->dentry!=root_path->file.mount->root_dentry || kernel_vfs_path_inode(root_path)!=DEVPTS_ROOT_INODE))
+            result=-KERNEL_ENODEV;
+    }
+    if (kernel_vfs_path_release(&path)) __builtin_trap();
+    if (!result) {
+        uint32_t number=entry->number;char name[12];size_t length=0;
+        do {name[length++]=(char)('0'+number%10);number/=10;} while (number);
+        for (size_t i=0;i<length/2;i++) {char c=name[i];name[i]=name[length-i-1];name[length-i-1]=c;}
+        result=kernel_vfs_path_lookup_object(root_path,name,length,owner);
+    }
+    if (root_path && kernel_vfs_path_release(&root_path)) __builtin_trap();
     return result;
 }
+
 void *kernel_devpts_mount_private(const struct kernel_vfs_mount *mount)
 { struct devpts_mount *m = devpts(mount); return m ? m->pty_private : 0; }
 void kernel_devpts_mount_set_private(struct kernel_vfs_mount *mount, void *private_data)
@@ -556,7 +609,8 @@ int kernel_devpts_create(struct kernel_heap *heap, uint64_t flags,
     m->ptmx.stat.blksize = DEVPTS_BLOCK_SIZE;
     m->ptmx.stat.atime = m->ptmx.stat.mtime = m->ptmx.stat.ctime = time;
     m->next_inode = 3U;
-    result = kernel_pty_mount_start(&m->mount);
+    kernel_vfs_mount_initialize(&m->mount);
+    result = kernel_pty_mount_start(&m->instance.backend_mount);
     if (result) { if (m->pty_private) __builtin_trap(); dispose(m, m); return result; }
     m->worker_started = 1;
     *owner = &m->mount;

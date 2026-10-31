@@ -38,6 +38,7 @@ uint32_t kernel_vfs_write_mode(uint32_t mode, uint32_t gid);
 
 uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
+struct kernel_vfs_dentry;
 struct kernel_open_file_description;
 struct kernel_vfs_mount {
     void *private_data;
@@ -56,10 +57,21 @@ struct kernel_vfs_mount {
     void (*release_owner)(struct kernel_vfs_mount *mount);
     /* 路径借用实际挂载；重配置成功后在状态锁内发布。 */
     uint8_t nosuid, nodev, noexec, silent;
+    uint8_t read_only, dynamic_view, retired, backend_owner;
+    uint32_t references, write_openers;
+    struct kernel_vfs_dentry *root_dentry;
+    struct kernel_vfs_path *paths, *path_index; /* Weak mount-location registry and identity index. */
+    struct kernel_vfs_mount *instance_next, **instance_previous;
 };
 
-/* Attachment transfers owned root/covered-path references to the tree.
- * Detach accepts the single caller-owned root used to name the mount. */
+/* 连接由挂载树持有 root/covered 引用；路径与打开文件分别保留实际视图。
+ * 最后 view 归还只排队，reap 在所有 VFS/MM 资格释放后于 CPU0 执行。 */
+void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount);
+int kernel_vfs_bind_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target, int recursive);
+int kernel_vfs_umount(struct kernel_vfs_path *root, unsigned flags);
+/* User-return/exit drains fresh retirements; explicit cleanup also retries failures. */
+int kernel_vfs_reap_mounts(void);
+int kernel_vfs_cleanup_pending(void);
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path *covered);
 int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char *options);
@@ -139,6 +151,7 @@ struct kernel_vfs_file {
     uint32_t state;
     uint32_t write_lease;
     uint32_t exec_lease;
+    uint8_t location_owner;
 };
 
 /* Paths are borrowed for the duration of a call; successful opens own a path
@@ -244,8 +257,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount,
     struct kernel_page_cache *page_cache, int read_only);
 int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
     int read_only, const char *source, const char *type, struct kernel_vfs_mount **owner);
-/* Shutdown-only, after user tasks have exited: drain real I/O cleanup
- * retained by failed, unpublished disk mounts. */
+/* Shutdown-only: retry retained filesystem/disk cleanup after user owners exit. */
 int kernel_vfs_disk_cleanup_pending(void);
 void kernel_vfs_disk_defer_cleanup(struct kernel_vfs_mount *mount);
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,

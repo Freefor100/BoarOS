@@ -11,6 +11,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/vfs.h>
 #include <kernel/msg.h>
 #include <kernel/mqueue.h>
 #include <kernel/tick.h>
@@ -1952,6 +1953,8 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
                        : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
+    /* MM/FD/cwd已归还，脱树挂载的最后owner可在此安全停止后端。 */
+    (void)kernel_vfs_reap_mounts();
     if (thread->mm.state == KERNEL_MM_RELEASED) {
         process_complete_vfork(thread);
     }
@@ -2676,6 +2679,7 @@ int kernel_task_prepare_user_return(void)
     if (task == 0 || task->arch.user_mode != 1U) return 0;
     if (task->files.state==KERNEL_FILES_LIVE) (void)kernel_files_drain_file_cleanup(&task->files);
     kernel_mm_drain_sources(&task->mm);
+    (void)kernel_vfs_reap_mounts();
 #if BOAROS_USER_SMP
     /* 业务准备已持有当前执行者；共用一次通知读取，普通返回不另作信号查询。 */
     uint32_t work=__atomic_load_n(&task->user_return_pending,__ATOMIC_ACQUIRE);

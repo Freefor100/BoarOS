@@ -465,7 +465,7 @@ static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
-    *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
+    *s=(struct kernel_vfs_stat){.dev=n->instance->backend_mount.id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
         .size=i->size,.blksize=BOAROS_PAGE_SIZE,
         .blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*(BOAROS_PAGE_SIZE/512) : 0,
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
@@ -477,7 +477,7 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
         .free_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .available_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
-        .fsid=mount->id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
+        .fsid=m->instance.backend_mount.id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
 }
 static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint64_t *id,
                        uint8_t *type,char *name,size_t capacity)
@@ -769,5 +769,6 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance; m->mount.id=kernel_vfs_allocate_mount_id(); m->mount.state=VFS_MOUNT_STATE_LIVE;
+    kernel_vfs_mount_initialize(&m->mount);
     *owner=&m->mount; return 0;
 }

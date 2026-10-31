@@ -4,6 +4,11 @@
 #include "../../fs/pty_internal.h"
 #include "../../fs/vfs_objects.h"
 #include <kernel/devpts.h>
+#include <kernel/credentials.h>
+const struct kernel_credentials *kernel_credentials_current(void)
+{ static const struct kernel_credentials root={.effective=KERNEL_CAP_VALID_MASK};return &root; }
+int kernel_credentials_capable(const struct kernel_credentials *credentials,unsigned capability)
+{ return capability<64 && !!(credentials->effective & (UINT64_C(1)<<capability)); }
 
 /* 模型只替代VFS身份与调度；传输和行规程执行生产代码。 */
 struct kernel_devpts_entry {
@@ -33,6 +38,10 @@ void kernel_devpts_mount_set_private(struct kernel_vfs_mount *m, void *p)
 { ((struct model_mount *)m)->pty = p; }
 int kernel_devpts_mount_root(struct kernel_vfs_mount *m, struct kernel_vfs_path **p)
 { *p = &((struct model_mount *)m)->root; (*p)->references++; return 0; }
+const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *file)
+{ (void)file;return NULL; }
+int kernel_devpts_peer_path(const struct kernel_vfs_file *master,struct kernel_devpts_entry *entry,struct kernel_vfs_path **owner)
+{ (void)master;(void)entry;(void)owner;return -KERNEL_ENODEV; }
 int kernel_devpts_publish(struct kernel_vfs_mount *m, void *p,
     struct kernel_devpts_entry **owner)
 {
@@ -85,6 +94,8 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *p, const char *name, size_t n
     assert(kernel_devpts_entry_acquire(m->entries[number]) == 0);
     return 0;
 }
+int kernel_vfs_path_lookup_object(struct kernel_vfs_path *parent,const char *name,size_t n,struct kernel_vfs_path **owner)
+{ return kernel_vfs_path_lookup(parent,name,n,owner); }
 int kernel_vfs_path_release(struct kernel_vfs_path **p)
 {
     assert((*p)->references);

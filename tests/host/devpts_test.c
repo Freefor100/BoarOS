@@ -79,6 +79,30 @@ struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *instanc
 }
 int kernel_vfs_path_acquire(struct kernel_vfs_path *p)
 { p->references++; return 0; }
+void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_instance *instance=mount->private_data;
+    instance->backend_mount=*mount;instance->backend_mount.backend_owner=1;
+}
+static struct kernel_vfs_path *fixture_filesystem_root;
+int kernel_vfs_path_root(struct kernel_vfs_mount *mount,struct kernel_heap *heap,struct kernel_vfs_path **owner)
+{
+    (void)heap;
+    if (!mount->root_path) return -KERNEL_ENODEV;
+    *owner=mount->root_path;return kernel_vfs_path_acquire(*owner);
+}
+int kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path,struct kernel_vfs_path **owner)
+{
+    if (!path->dentry->parent) return 0;
+    assert(fixture_filesystem_root && path->dentry->parent==fixture_filesystem_root->dentry);
+    *owner=fixture_filesystem_root;return kernel_vfs_path_acquire(*owner);
+}
+int kernel_vfs_path_release(struct kernel_vfs_path **owner)
+{ assert(owner && *owner && (*owner)->references>1);(*owner)->references--;*owner=NULL;return 0; }
+uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path)
+{ return ((struct kernel_vfs_node *)path->file.private_data)->inode; }
+int kernel_vfs_path_lookup_object(struct kernel_vfs_path *parent,const char *name,size_t n,struct kernel_vfs_path **owner)
+{ (void)parent;(void)name;(void)n;(void)owner;abort(); }
 int kernel_pty_mount_start(struct kernel_vfs_mount *m)
 { (void)m; return start_error; }
 int kernel_pty_mount_stop(struct kernel_vfs_mount *m)
@@ -91,7 +115,7 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *m, struct kernel_vfs_node *
 {
     (void)creating;
     struct kernel_vfs_instance *i = m->private_data;
-    n->instance = i; n->mount = m; n->references = n->open_files = 1;
+    n->instance = i; n->mount = &i->backend_mount; n->references = n->open_files = 1;
     kernel_mutex_init(&n->write_operation,15,(uintptr_t)n);
     n->next = i->nodes; i->nodes = n; i->external_files++;
     *f = (struct kernel_vfs_file){.private_data = n, .mount = m,
@@ -286,10 +310,17 @@ static void readonly_and_root_owner(struct kernel_heap *heap)
     assert(!kernel_devpts_create(heap, 1, "ptmxmode=0666", &m));
     struct kernel_vfs_path *pin = 0;
     assert(kernel_devpts_mount_root(m, &pin) == -KERNEL_ENODEV && !pin);
-    struct kernel_vfs_path attached_root = {.references = 1};
+    struct kernel_vfs_dentry root_entry={0};
+    struct kernel_vfs_path attached_root = {.references=1,.dentry=&root_entry};
     m->root_path = &attached_root;
     assert(!kernel_devpts_mount_root(m, &pin) && pin == &attached_root && pin->references == 2);
     attached_root.references--; pin = 0;
+    struct kernel_vfs_dentry ptmx_entry={.parent=&root_entry};
+    struct kernel_vfs_path ptmx_root={.references=1,.dentry=&ptmx_entry};
+    struct kernel_vfs_mount file_view={.private_data=m->private_data,.root_path=&ptmx_root};
+    fixture_filesystem_root=&attached_root;
+    assert(!kernel_devpts_mount_root(&file_view,&pin)&&pin==&attached_root&&ptmx_root.references==1);
+    assert(!kernel_vfs_path_release(&pin));fixture_filesystem_root=NULL;
     m->root_path = 0;
     struct kernel_devpts_entry *entry = 0; int pair;
     assert(!kernel_devpts_publish(m, &pair, &entry));

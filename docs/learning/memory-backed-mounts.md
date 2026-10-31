@@ -18,13 +18,13 @@ RV64、QEMU virt、单 hart；共用挂载/syscall 路径现也由 LA 的完整 
 定义各自 flags。`ksys_umount` 先校验允许的 flags，再按 `UMOUNT_NOFOLLOW` 决定
 路径跟随；`do_umount` 的 expiry、lazy detach 和后端 force 是不同操作。
 当前支持的普通挂载属性与卸载范围统一见 [VFS 模块](../modules/vfs-ext4.md)。
-扩展仍未实现，非法 flags 与坏指针/路径的错误优先级也须随相应能力独立核对。
+bind/rbind、原位重配置和延迟卸载的当前实现见该模块；其他 flags 与坏指针/路径的错误优先级随相应能力独立核对。
 绝对根挂载另有边界：固定 Linux 的 `do_umount` 在未请求 lazy detach 时进入
 `do_umount_root` 尝试只读重配置；BoarOS 的根挂载没有 parent/covered 边，
-普通用户态卸载返回 `EINVAL`，该路径尚未接入。
+flags=0 的普通用户态卸载同样尝试只读重配置；无 parent 的根对 lazy detach 返回 `EINVAL`。
 
 普通卸载先拒绝忙引用，再停 worker、完成 I/O 和持久化，失败保留可达挂载与真实
-错误 owner。lazy detach 则需要让摘树后的实例由存活的 fd/cwd/MM 引用继续持有；
+错误 owner。lazy detach 让摘树后的实例由存活的 fd/cwd/MM 引用继续持有；
 force 也不能等同于绕过用户引用或 DMA 停止确认。基础卸载的回收证据不自动覆盖
 这些新生命周期，剩余任务集中在[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 

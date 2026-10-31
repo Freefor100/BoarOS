@@ -71,7 +71,7 @@ static int stat_inode(const struct kernel_vfs_file *file,struct kernel_vfs_stat 
 }
 static int statfs(struct kernel_vfs_mount *mount,struct kernel_vfs_statfs *stat)
 {
-    struct mq_mount *m=(void *)mount;
+    struct mq_mount *m=((struct kernel_vfs_instance *)mount->private_data)->backend_data;
     *stat=(struct kernel_vfs_statfs){.type=0x19800202U,.block_size=BOAROS_PAGE_SIZE,
         .fsid=0x19800202U,.name_length=255,.flags=m->instance.read_only?1U:0U};return 0;
 }
@@ -128,7 +128,7 @@ static int pread_inode(struct kernel_vfs_node *node,uint64_t offset,void *buffer
 }
 static int unmount(struct kernel_vfs_mount *mount)
 {
-    struct mq_mount *m=(void *)mount;struct kernel_vfs_instance *i=&m->instance;
+    struct mq_mount *m=((struct kernel_vfs_instance *)mount->private_data)->backend_data;struct kernel_vfs_instance *i=&m->instance;
     if(mount->covered_path||mount->root_path||mount->child_mounts||i->external_files||
        !kernel_vfs_nodes_idle(i,0)||i->paths)return -KERNEL_EBUSY;
     kernel_heap_release(i->heap,m);return 0;
@@ -160,5 +160,6 @@ int kernel_mqueue_fs_create(struct kernel_heap *heap,uint64_t flags,struct kerne
     kernel_raw_lock_init(&m->instance.error_lock,KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance;m->mount.id=kernel_vfs_allocate_mount_id();
     m->mount.state=VFS_MOUNT_STATE_LIVE;m->mount.nosuid=!!(flags&2U);
+    kernel_vfs_mount_initialize(&m->mount);
     *owner=&m->mount;return 0;
 }

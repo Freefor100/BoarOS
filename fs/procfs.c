@@ -483,7 +483,7 @@ static int proc_stat(const struct kernel_vfs_file *file,
     }
     *stat = (struct kernel_vfs_stat){
         .uid=uid,.gid=gid,
-        .dev = file->mount->id,
+        .dev = ((struct kernel_vfs_instance *)file->mount->private_data)->backend_mount.id,
         .ino = inode,
         .mode = mode,
         .nlink = (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ? 2U : 1U,
@@ -495,7 +495,7 @@ static int proc_stat(const struct kernel_vfs_file *file,
 static int proc_statfs(struct kernel_vfs_mount *mount,
                        struct kernel_vfs_statfs *stat)
 {
-    struct procfs_mount *proc = (struct procfs_mount *)mount;
+    struct procfs_mount *proc = ((struct kernel_vfs_instance *)mount->private_data)->backend_data;
     *stat = (struct kernel_vfs_statfs){
         .type = PROC_SUPER_MAGIC,
         .block_size = BOAROS_PAGE_SIZE,
@@ -1050,13 +1050,14 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                                 struct kernel_heap *heap,
                                 char **buffer, size_t *length)
 {
+    (void)node;
     const struct kernel_fs_context *fs = 0;
     if (kernel_task_fs_context_borrow(kernel_task_current(), &fs) !=
         KERNEL_TASK_STATUS_OK) return -KERNEL_ENOENT;
     KERNEL_FS_PATHS(paths, fs);
     struct kernel_vfs_path *root_path = paths.root;
     if (!root_path) return -KERNEL_ENOENT;
-    struct kernel_vfs_mount *top = node->mount;
+    struct kernel_vfs_mount *top = root_path->file.mount;
     while (top->parent) top = top->parent;
     struct proc_mount_entry *entries = 0;
     size_t captured = 0U;
@@ -1103,7 +1104,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             entries[captured].nodev=it->nodev;
             entries[captured].noexec=it->noexec;
             entries[captured].read_only =
-                ((struct kernel_vfs_instance *)it->private_data)->read_only;
+                kernel_vfs_mount_is_readonly(it);
             captured++;
         }
         arch_interrupt_restore(irq);
@@ -1686,7 +1687,7 @@ static void proc_accessed(struct kernel_vfs_file *file) { (void)file; }
 
 static int proc_unmount(struct kernel_vfs_mount *mount)
 {
-    struct procfs_mount *proc = (struct procfs_mount *)mount;
+    struct procfs_mount *proc = ((struct kernel_vfs_instance *)mount->private_data)->backend_data;
     struct kernel_vfs_instance *instance = &proc->instance;
     if (mount->covered_path || mount->root_path || mount->child_mounts ||
         instance->external_files || !kernel_vfs_nodes_idle(instance, NULL) || instance->paths)
@@ -1735,6 +1736,7 @@ int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
     initialize_backend();
     proc->instance.ops = &proc_backend;
     proc->instance.heap = heap;
+    proc->instance.backend_data = proc;
     proc->instance.read_only = (flags & 1U) != 0U;
     kernel_rwlock_init(&proc->instance.reconfiguration, 19, (uintptr_t)&proc->instance);
     kernel_mutex_init(&proc->instance.namespace_lock, 20U,
@@ -1744,6 +1746,7 @@ int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
     proc->mount.nosuid=!!(flags&2U);
     proc->mount.private_data = &proc->instance;
     proc->mount.state = VFS_MOUNT_STATE_LIVE;
+    kernel_vfs_mount_initialize(&proc->mount);
     *owner = &proc->mount;
     return 0;
 }

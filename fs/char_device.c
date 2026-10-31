@@ -257,9 +257,9 @@ int kernel_char_device_open(struct kernel_open_file_description *file,
         error = pty_category ? (file->file.private_data ?
             kernel_vfs_fstat(&file->file, &stat) : -KERNEL_EIO) : 0;
         if (!error && pty_category && file->file.private_data && stat.rdev == 0x502) {
-            struct kernel_vfs_path *parent = kernel_vfs_path_parent_pin(file->file.path);
-            struct kernel_vfs_path *pts = 0;
-            error = parent ? kernel_vfs_path_lookup(parent, "pts", 3, &pts) : -KERNEL_ENODEV;
+            struct kernel_vfs_path *parent=NULL,*pts=NULL;
+            error=kernel_vfs_path_parent_pin(file->file.path,&parent);
+            if (!error) error=parent ? kernel_vfs_path_lookup(parent,"pts",3,&pts) : -KERNEL_ENODEV;
             if (!error) error = kernel_pty_open_ptmx(kernel_vfs_path_mount(pts), file->heap,
                 kernel_task_current(), flags, &file->device_instance, &file->device);
             if (pts && kernel_vfs_path_release(&pts)) __builtin_trap();

@@ -212,7 +212,6 @@ static int ioctl(void *owner, struct kernel_task *caller, struct kernel_files *f
     struct kernel_open_file_description **file, struct kernel_mm *mm,
     uint64_t command, uint64_t argument)
 {
-    (void)file;
     struct pty_end *end = owner;
     if (end->side != PTY_MASTER) return -KERNEL_ENOTTY;
     struct pty_pair *pair = end->pair;
@@ -233,13 +232,13 @@ static int ioctl(void *owner, struct kernel_task *caller, struct kernel_files *f
     case UINT64_C(0x80045439): /* TIOCGPTLCK */
         value = pair->slave_locked;
         return copy_int(mm, argument, &value, 1);
-    case UINT64_C(0x5441): { /* TIOCGPTPEER:只使用既有slave路径身份。 */
-        struct kernel_vfs_path *path = pair->slave_path;
-        if (!path || pair->master_closed) return -KERNEL_EIO;
-        int result = kernel_vfs_path_acquire(path);
-        if (result) return result;
-        result = kernel_files_open_pty_peer(files, caller, path, (uint32_t)argument);
-        if (kernel_vfs_path_release(&path)) __builtin_trap();
+    case UINT64_C(0x5441): { /* TIOCGPTPEER follows the master's current mount connection. */
+        if (pair->master_closed) return -KERNEL_EIO;
+        struct kernel_vfs_path *path=NULL;
+        const struct kernel_vfs_file *master=file && *file ? kernel_open_file_vfs_borrow(*file) : NULL;
+        int result=kernel_devpts_peer_path(master,pair->entry,&path);
+        if (!result) result=kernel_files_open_pty_peer(files,caller,path,(uint32_t)argument);
+        if (path && kernel_vfs_path_release(&path)) __builtin_trap();
         return result;
     }
     default: return -KERNEL_ENOTTY;
@@ -453,7 +452,7 @@ int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *hea
         for (size_t j = 0; j < n / 2; j++) {
             char c = name[j]; name[j] = name[n - j - 1]; name[n - j - 1] = c;
         }
-        result = kernel_vfs_path_lookup(pair->root, name, n, &pair->slave_path);
+        result = kernel_vfs_path_lookup_object(pair->root, name, n, &pair->slave_path);
     }
     if (!result) {
         uint32_t number = kernel_devpts_entry_number(pair->entry);

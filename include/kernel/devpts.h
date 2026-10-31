@@ -33,6 +33,9 @@ struct kernel_devpts_entry *kernel_devpts_file_entry(
 int kernel_devpts_file_is_ptmx(const struct kernel_vfs_file *file);
 int kernel_devpts_mount_root(struct kernel_vfs_mount *mount,
     struct kernel_vfs_path **owner);
+/* Resolve peer access from the master's current mount location, as devpts_mntget does. */
+int kernel_devpts_peer_path(const struct kernel_vfs_file *master,struct kernel_devpts_entry *entry,
+    struct kernel_vfs_path **owner);
 void *kernel_devpts_mount_private(const struct kernel_vfs_mount *mount);
 void kernel_devpts_mount_set_private(struct kernel_vfs_mount *mount,
     void *private_data);

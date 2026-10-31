@@ -25,17 +25,26 @@ struct kernel_vfs_instance {
     struct kernel_vfs_node *nodes, *node_index;
     size_t node_count;
     struct kernel_vfs_node *cleanup_nodes;
-    struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
+    struct kernel_vfs_dentry *paths; /* Weak canonical directory-entry registry. */
     uint32_t external_files;
     uint64_t writeback_error_sequence;
     int writeback_error;
     uint8_t read_only;
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
-    struct kernel_vfs_path *path_index;
+    struct kernel_vfs_dentry *path_index;
     size_t retiring_nodes; /* Removed from weak index; close/free still owns instance. */
     uint8_t namespace_parallel; /* Enabled only after this mount's metadata owners are ready. */
     struct kernel_writeback_owner writeback;
+    struct kernel_vfs_mount backend_mount; /* Instance lifetime, independent of caller view storage. */
+    uint32_t mount_views;
+    struct kernel_vfs_mount *views;
+    struct kernel_vfs_instance *active_next, **active_previous;
+    struct kernel_vfs_instance *cleanup_next;
+    struct kernel_vfs_mount *owner_storage;
+    void (*release_storage)(struct kernel_vfs_mount *);
+    uint8_t cleanup_queued, cleanup_running;
+    struct kernel_vfs_mount *retry_view;
 };
 
 struct kernel_vfs_node {
@@ -76,19 +85,29 @@ struct kernel_vfs_node {
     uint8_t metadata_immutable; /* Immutable/append-only inode flags, read with DAC fields. */
 };
 
+/* A dentry owns its inode and canonical parent; mount aliases share mutations. */
+struct kernel_vfs_dentry {
+    struct kernel_vfs_file file;
+    struct kernel_heap *heap;
+    struct kernel_vfs_dentry *parent, *next, **previous;
+    uint32_t references;
+    uint8_t detached;
+    uint32_t mountpoints;
+    char *name;
+    struct kernel_vfs_dentry *index_left, *index_right;
+    uint8_t index_height;
+    char initial_name[];
+};
+/* A path owns one mount view and dentry. Its file borrows the dentry inode. */
 struct kernel_vfs_path {
     struct kernel_vfs_file file;
     struct kernel_heap *heap;
-    struct kernel_vfs_path *parent;
-    struct kernel_vfs_path *next;
-    struct kernel_vfs_path **previous;
-    struct kernel_vfs_mount *mounted_here;
-    uint32_t references;
-    uint8_t detached;
-    char *name;
+    struct kernel_vfs_dentry *dentry;
+    struct kernel_vfs_path *next, **previous;
     struct kernel_vfs_path *index_left, *index_right;
     uint8_t index_height;
-    char initial_name[];
+    struct kernel_vfs_mount *mounted_here;
+    uint32_t references;
 };
 
 struct kernel_vfs_rename_result {
