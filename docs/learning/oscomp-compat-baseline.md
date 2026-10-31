@@ -12,6 +12,26 @@
 
 集成后默认`make all`生成`kernel-rv`、`kernel-la`、`disk.img`及`disk-la.img`；两张第二盘均为2304MiB，工具／VFAT／scratch三分区布局保持既定值，六个分区的e2fsck或fsck.fat均返回0，两架构具有独立的新启动种子。原评测输入、默认单核、跳过表及监督配置沿用现状；原程序得分继续按各次实际运行记录读取。
 
+## 2026-10-31：bind/rbind、延迟卸载与 MADV_REMOVE
+
+本次从 main 单向集成挂载视图与后端实例分离、bind/rbind、MNT_DETACH，以及共享后备的 MADV_REMOVE。当前所有权与操作边界见 [VFS](../modules/vfs-ext4.md) 和 [MM](../modules/kernel-mm.md)。原输入、默认单核、跳过表和监督配置沿用现状。
+
+验证程序为 `mount_bind`（8项）与 `madvise`（22项）。前者检查文件和目录绑定、别名改名、独立挂载属性、递归子挂载、原视图先卸载、延迟卸载后的 FD/cwd/mmap，以及 devpts 文件绑定；后者包含共享匿名、SysV、tmpfs/ext4 删除与私有 COW 保留。每个配置运行同一源码生成的原生 ELF，并在固定 Linux 下对照返回值和实际副作用。
+
+| main 最终配置 | libc／装载 | 检查通过 |
+|---|---|---:|
+| RV 单核／512 MiB | 静态 musl、glibc | 60/60 |
+| RV 双核／1 GiB | 动态 musl，同一四核容量内核 | 30/30 |
+| RV 四核／512 MiB | 静态 musl | 30/30 |
+| LA 单核／512 MiB | 静态 musl、glibc | 60/60 |
+| LA 双核／512 MiB | 静态 musl | 30/30 |
+
+共210项，固定 Linux 的相同配置与程序也通过210项。RV观测到的最小空闲内核栈为1512字节；glibc两个程序均为2416字节。全部客机正常退出、对象归还和运行盘 e2fsck 检查通过，检查后的运行盘由原 runner 删除。
+
+宿主直接检查覆盖4/16 KiB页、1/4 KiB ext4块，包含64层递归绑定、构造中OOM回滚、最后引用与失败清理、已摘树实例参与sync，以及打洞与缺页、fork和用户页pin的握手交错。VFS模块与同步fallocate检查通过。`MADV_REMOVE`对文件来源复用真实OFD的打洞操作；共享内存使用后备对象代次排空旧映射，归还被删除页和配额，文件长度和私有COW内容保留。
+
+合入后的 oscomp-compat 两架构单核另运行上述两个消费者，60/60项通过，运行盘检查正常。默认 `make all` 已完成，恢复两架构单核内核及两张独立第二盘。原始记录与ELF保留于 `build/mount-remove-20261031/`。
+
 ## 2026-10-17 CPU0 存储分批与同步等待集成
 
 从 main `ad4d546` 单向集成范围写回的队尾续批、调用者持久化等待和有界退休清理，
