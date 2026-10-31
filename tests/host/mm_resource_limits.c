@@ -55,6 +55,29 @@ enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *h,void *ol
 { return fail_resize ? KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_resize(h,old,size,out); }
 static unsigned checks,failures;
 #define CHECK(x) do { checks++; if (!(x)) { fprintf(stderr,"FAIL %s:%u: %s\n",__FILE__,__LINE__,#x); failures++; } } while(0)
+static _Thread_local int pause_lock_admission;
+static atomic_int lock_admission_entered, lock_admission_resume, lock_second_done;
+static int lock_admission_result[2];
+uint64_t __real_kernel_vma_set_locked_range(const struct kernel_vma_set *,uint64_t,uint64_t);
+uint64_t __wrap_kernel_vma_set_locked_range(const struct kernel_vma_set *set,uint64_t start,uint64_t end)
+{
+    uint64_t result=__real_kernel_vma_set_locked_range(set,start,end);
+    if (pause_lock_admission) {
+        atomic_store(&lock_admission_entered,1);
+        while (!atomic_load(&lock_admission_resume)) sched_yield();
+    }
+    return result;
+}
+static void *lock_admission_actor(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    mm_test_attach(id+1);
+    assert(!kernel_mm_context(&mm,&mm_test_context));
+    pause_lock_admission=id==0;
+    lock_admission_result[id]=kernel_mm_mlock(&mm,BASE+id*P,P,1);
+    if (id==1) atomic_store(&lock_second_done,1);
+    return 0;
+}
 static enum kernel_mm_status map(uint64_t at,uint64_t len,uint32_t prot,uint32_t flags)
 { uint64_t out=0; return kernel_mm_mmap_anonymous(&mm,at,len,prot,KERNEL_MM_MAP_FIXED|flags,&out); }
 static uint64_t test_detached;
@@ -798,6 +821,34 @@ int main(void)
     memlock_limit=5*P;CHECK(!kernel_mm_resolve_user_fault(&mm,top-5*P,KERNEL_MM_WRITE));
     CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory)&&memory.locked_bytes==5*P);
     CHECK(!kernel_mm_munlockall(&mm));memlock_limit=UINT64_MAX;
+    /* Two disjoint ranges share one MM quota. Pause the first admission while
+     * the second either completes or waits for the actual quota owner. */
+    assert(!map(BASE,2*P,RW,0));
+    memlock_limit=P;
+    pthread_t lock_threads[2];
+    unsigned second_parked=mm_test_parked(2);
+    assert(!pthread_create(&lock_threads[0],0,lock_admission_actor,(void *)(uintptr_t)0));
+    while (!atomic_load(&lock_admission_entered)) sched_yield();
+    assert(!pthread_create(&lock_threads[1],0,lock_admission_actor,(void *)(uintptr_t)1));
+    while (!atomic_load(&lock_second_done) && mm_test_parked(2)==second_parked) sched_yield();
+    atomic_store(&lock_admission_resume,1);
+    assert(!pthread_join(lock_threads[0],0) && !pthread_join(lock_threads[1],0));
+    CHECK((lock_admission_result[0]==0 && lock_admission_result[1]==-KERNEL_ENOMEM) ||
+          (lock_admission_result[1]==0 && lock_admission_result[0]==-KERNEL_ENOMEM));
+    CHECK(!kernel_mm_proc_memory_snapshot(&mm,&memory) && memory.locked_bytes==P);
+    CHECK(!kernel_mm_munlockall(&mm) && !kernel_mm_munmap(&mm,BASE,2*P));
+    memlock_limit=UINT64_MAX;
+    CHECK(!map(BASE,P,RW,KERNEL_MM_MAP_LOCKED));
+    CHECK(!kernel_mm_mincore(&mm,BASE,1,residency,&completed) && residency[0]);
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    uint64_t locked_address=0;
+    CHECK(!kernel_mm_mmap_anonymous(&mm,0,P,RW,KERNEL_MM_MAP_LOCKED,&locked_address));
+    CHECK(!kernel_mm_mincore(&mm,locked_address,1,residency,&completed) && residency[0]);
+    CHECK(!kernel_mm_munmap(&mm,locked_address,P));
+    CHECK(!kernel_mm_mlockall(&mm,2));
+    CHECK(!kernel_mm_mmap_anonymous(&mm,0,P,RW,0,&locked_address));
+    CHECK(!kernel_mm_mincore(&mm,locked_address,1,residency,&completed) && residency[0]);
+    CHECK(!kernel_mm_munlockall(&mm) && !kernel_mm_munmap(&mm,locked_address,P));
     mm_test_context=0; assert(!kernel_mm_release(&mm));
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     CHECK(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);

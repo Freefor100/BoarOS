@@ -3,9 +3,9 @@
 本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
 普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用分层并发协调协议：
-- `record->operations`（rank 25 读写锁）：私有匿名映射创建（`mmap`）与撤销（`munmap`）、纯匿名锁页与解锁（`mlock` / `munlock`）、匿名/COW 缺页处理取得共享读资格；全局结构变更（fork、销毁、mremap）、VMA 权限变更（`mprotect`）以及文件/ELF/SysV 映射保留独占写资格。文件来源、resident 与 alias 仍由写者维护，文件 I/O 和等待释放资格后执行，恢复后重新查找和分派。默认 UP 使用独占资格。
-- 范围协调机制（`struct kernel_mm_range_claim`）：在 `record->metadata`（raw 自旋锁）保护下登记活动地址区间。不相交区间的私有匿名 `mmap`、`munmap`、`mlock`、`munlock` 与缺页在不同核心上并行推进，避免在无关地址范围上全局串行化；重叠区间的操作通过 `record->range_changed` 等待队列进行有序等待与排他协调。当发起任务自身仍持有未归还的用户页借用（`current_pins(mm)`）时，范围认领与缺页等待采用非阻塞尝试（`mm_range_claim_try_acquire`），冲突立即返回 `KERNEL_MM_STATUS_CONFLICT` 避免与正在排空 pin 的写者死锁。
-- VMA 局部锁（`record->vma_lock`，rank 31 读写锁）：仅在修改或检索 `record->vmas` 数组（查找空洞、插入、替换、更新锁页标记或检索 VMA）时短暂持有纳秒级锁，在锁外执行页表解绑、远端 TLB 广播和物理页归还。
+- `record->operations`（rank 25 读写锁）：非固定私有匿名映射创建、纯匿名撤销、锁页属性修改和匿名/COW 缺页可取得共享读资格；固定地址映射、fork、销毁、mremap、mprotect 和文件/ELF/SysV 映射使用独占写资格。撤销前在操作资格内判断映射类型；文件来源、resident 与 alias 仍由写者维护。默认 UP 使用独占资格。
+- 范围协调机制（`struct kernel_mm_range_claim`）：在 `record->metadata`（raw 自旋锁）保护下登记活动地址区间。不相交区间的匿名撤销、锁页及缺页可并行推进；重叠区间通过 `record->range_changed` 等待与排他协调。持有用户页借用的调用者非阻塞尝试范围资格，避免与排空 pin 的修改者相互等待。UP 的独占操作不重复登记范围。
+- VMA 局部锁（`record->vma_lock`，rank 31 读写锁）保护共享操作中的数组、用量及代次；锁页额度检查和属性提交使用同一次写资格。页表解绑、远端 TLB 广播和物理页归还在锁外执行。UP 的独占操作可直接使用 VMA 状态。
 - 并发缺页局部校验：私有匿名缺页在提交硬件页表前，在 `vma_lock` 保护下只校验目标地址对应的 VMA 一致性并检查范围认领冲突，其他核心对无关地址区间的 VMA 增删不会迫使当前缺页发生假冲突重试。
 - 匿名缺页和驻留用户复制可在发起 CPU 完成，ext4 普通文件冷页在发起 CPU 完成缓存装入与请求提交，日志和后台写回由 CPU0 推进。非叶变更同步全范围，退休页在本地与远端 TLB 确认后才归还。实际执行边界见[RV 两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
