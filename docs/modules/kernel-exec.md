@@ -71,8 +71,9 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 提交前 scheduler 验证当前 task、新 MM 的 `satp`、入口可执行 VMA/PTE、栈 RW PTE 和 SP 对齐。线程组 exec 先终止其他成员并等待其调用栈与资源清理完成；非组长调用者接管原 TGID 和父子树位置。竞争 exec 的未提交事务由退出路径清理。随后：
 
 ```text
-旧 MM 上完成 robust-list、清 TID 并注销活跃 MM 使用者
--> 撤下所有 FD_CLOEXEC 槽，保留尚待清理的 OFD owner
+旧 MM 上使用原 TID 清理 robust-list
+-> 分离仍被其他进程共享的信号动作表和文件表
+-> 清 TID 并注销旧 MM 使用者，撤下 FD_CLOEXEC 槽，保留尚待清理的 OFD owner
 -> 激活新地址空间
 -> 在调度短锁内将 old MM 移入待清理 owner，同时发布新 MM 与候选凭据
 -> 安装缓存地址空间信息，清零并重建 Trap Frame
@@ -80,7 +81,7 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 -> sret 到新入口
 ```
 
-提交后不撤销新映像。TGID、cwd、files、fs context、线程组的完整资源限额记录和非 `FD_CLOEXEC` fd/OFD offset 保留；新栈布局按保留的软限制建立。非组长执行 exec 时调用线程接管原 TGID 作为 TID，旧 TID 释放。信号 disposition 按 exec 规则重置，F/D 状态清零。旧 MM 或 source 的真实 VFS/I/O 清理错误由持久 owner 继续处理，不改写新映像已经成功的结果。
+提交后不撤销新映像。TGID、调用线程的 cwd 和 fs context、线程组的完整资源限额记录和非 `FD_CLOEXEC` fd/OFD offset 保留；共享文件表按实际槽位复制，旧表和复制失败时的 owner 由事务清理；新栈布局按保留的软限制建立。非组长执行 exec 时调用线程接管原 TGID 作为 TID，旧 TID 释放。信号 disposition 按 exec 规则重置，F/D 状态清零。vfork 的旧 MM 引用归还后即唤醒父进程，其余 source 或文件表的清理错误由事务继续重试，不延误父进程，也不改写新映像已经成功的结果。
 
 ## 验证与边界
 

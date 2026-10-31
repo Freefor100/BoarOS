@@ -44,7 +44,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
-| 信号、线程与事件 | futex2 的NUMA/MPOL等扩展；扩展 clone 组合（当前线程要求共享文件表和文件系统上下文）；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
+| 信号、线程与事件 | futex2 的NUMA/MPOL等扩展；clone3、CLONE_PIDFD 及其他扩展 clone 标志；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；事件对象按实际需求接 OFD |
 | 用户内存 | mremap 的多VMA批量及特殊映射搬移；madvise 的 FREE、dump策略、回收/预装等扩展，VDSO 的 DONTNEED 重装；/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射支持缩小、扩大、搬移和DONTUNMAP，零旧长度可复制共享映射；madvise五种基础操作、四种fork策略与共享后备REMOVE、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则 |
 | 进程查询与 IPC | pidfd 的扩展 ioctl、clone 创建 pidfd、kcmp 的 IO／EPOLL_TFD、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2 的扩展标志 | execve/execveat及按FD执行、chroot；getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/SYSVSEM、pidfd_open/send_signal/getfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |

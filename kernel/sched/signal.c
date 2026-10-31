@@ -35,6 +35,8 @@ static enum kernel_signal_status signal_send_one(
     const struct kernel_signal_wait_info *, int queued, uint64_t thread_generation);
 
 static struct kernel_task *real_timers;
+/* PID-derived identities occupy the low generation range. */
+static uint64_t unshared_signal_identity = UINT64_C(1) << 63U;
 
 static uint64_t timer_add(uint64_t a, uint64_t b)
 { return b > UINT64_MAX - a ? UINT64_MAX : a + b; }
@@ -615,15 +617,14 @@ enum kernel_signal_status kernel_signal_share(
     if (status != KERNEL_SIGNAL_STATUS_OK) {
         return status;
     }
-    table = signal_table_of(parent);
-    if (table == 0) {
-        return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        table = signal_table_of(parent);
+        if (table == 0) return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+        if (table->references == UINT32_MAX) return KERNEL_SIGNAL_STATUS_NO_MEMORY;
+        table->references++;
+        child->signal_table_address = parent->signal_table_address;
     }
-    if (table->references == UINT32_MAX) {
-        return KERNEL_SIGNAL_STATUS_NO_MEMORY;
-    }
-    table->references++;
-    child->signal_table_address = parent->signal_table_address;
     child->signal_blocked = parent->signal_blocked;
     child->signal_fault = (struct kernel_signal_fault){0};
     child->signal_pending = 0U;
@@ -809,6 +810,45 @@ void kernel_signal_wait_end(struct kernel_task *task)
         task->signal_wait_mask=0;
     }
     signal_retarget_shared(task,retarget);
+}
+
+enum kernel_signal_status kernel_signal_unshare_for_exec(struct kernel_task *task)
+{
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_signal_table *table=signal_table_of(task);
+        if (!table || table->references == 1) return KERNEL_SIGNAL_STATUS_OK;
+    }
+    uint64_t address; void *page;
+    enum physical_page_status status=physical_page_allocate(scheduler.allocator,&address);
+    if (status != PHYSICAL_PAGE_STATUS_OK)
+        return status == PHYSICAL_PAGE_STATUS_EMPTY ? KERNEL_SIGNAL_STATUS_NO_MEMORY : KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    if (physical_page_resolve(scheduler.allocator,address,&page) != PHYSICAL_PAGE_STATUS_OK) {
+        (void)physical_page_release(scheduler.allocator,address);
+        return KERNEL_SIGNAL_STATUS_INVALID_STATE;
+    }
+    clear_page(page);
+    struct kernel_signal_table *replacement=page;
+    replacement->magic=KERNEL_SIGNAL_TABLE_MAGIC;
+    replacement->references=1;
+    kernel_wait_queue_init(&replacement->signalfd_waiters);
+    int installed=0;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_signal_table *old=signal_table_of(task);
+        if (!old || !old->references) __builtin_trap();
+        if (old->references > 1) {
+            if (!unshared_signal_identity) __builtin_trap();
+            replacement->identity=unshared_signal_identity++;
+            memcpy(replacement->actions,old->actions,sizeof(replacement->actions));
+            old->references--;
+            task->signal_table_address=(uintptr_t)replacement;
+            installed=1;
+        }
+    }
+    if (!installed && physical_page_release(scheduler.allocator,address) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    return KERNEL_SIGNAL_STATUS_OK;
 }
 
 void kernel_signal_reset_on_exec(struct kernel_task *task)

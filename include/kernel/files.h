@@ -144,6 +144,9 @@ enum kernel_files_status kernel_files_fork(
     struct kernel_files *destination,
     const struct kernel_files *source);
 
+/* The current owner remains live while this checks table sharing. */
+int kernel_files_is_shared(const struct kernel_files *files);
+
 enum kernel_files_status kernel_files_move(
     struct kernel_files *destination,
     struct kernel_files *source);

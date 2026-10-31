@@ -22,6 +22,8 @@ static void lookup_end(struct kernel_task **task)
 #define LINUX_SIGCHLD UINT64_C(17)
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
+#define LINUX_CLONE_FILES UINT64_C(0x400)
+#define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
@@ -242,17 +244,16 @@ enum kernel_syscall_status syscall_handle_execve(
  * address space and suspends the parent until the child execs or exits.
  * Both process forms may share the fs context with CLONE_FS and the
  * independent semaphore undo group with CLONE_SYSVSEM.
- * The thread form shares MM/files/fs/dispositions with its group and
- * accepts the TLS and TID lifecycle flags. Other resource-sharing forms
- * require their own complete lifecycle before they can be enabled.
+ * Threads share MM and dispositions; their files and fs contexts follow
+ * CLONE_FILES and CLONE_FS. Processes may also share files or MM.
  */
 void syscall_decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded)
 {
     uint64_t flags = request->arguments[0];
-    const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x200) |
-        UINT64_C(0x400) | UINT64_C(0x800) | UINT64_C(0x10000);
-    const uint64_t thread_optional = UINT64_C(0x40000) | UINT64_C(0x80000) |
+    const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x800) | UINT64_C(0x10000);
+    const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES |
+        UINT64_C(0x40000) | UINT64_C(0x80000) |
         UINT64_C(0x100000) | UINT64_C(0x200000) | UINT64_C(0x400000) |
         UINT64_C(0x1000000);
 
@@ -276,9 +277,12 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_FS | UINT64_C(0x40000) |
-        LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
+    uint64_t process_flags = flags & ~(LINUX_CLONE_FS | LINUX_CLONE_FILES |
+        UINT64_C(0x40000) | LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != LINUX_SIGCHLD &&
+        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM) &&
+        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_SIGHAND) &&
+        process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_CLONE_SIGHAND) &&
         process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK)) {
         decoded->value = -KERNEL_ENOTSUP;
         return;

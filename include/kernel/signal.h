@@ -261,6 +261,7 @@ void kernel_signal_wait_end(struct kernel_task *task);
 
 /* execve resets installed handlers to DFL, retaining IGN and pending. */
 void kernel_signal_reset_on_exec(struct kernel_task *task);
+enum kernel_signal_status kernel_signal_unshare_for_exec(struct kernel_task *task);
 
 /* Exit notification and zombie retention are separate decisions. */
 int kernel_signal_wants_sigchld(const struct kernel_task *parent);

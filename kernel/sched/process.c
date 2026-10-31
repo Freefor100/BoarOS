@@ -60,6 +60,8 @@
      LINUX_WCONTINUED | LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
+#define LINUX_CLONE_FILES UINT64_C(0x400)
+#define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_THREAD UINT64_C(0x10000)
 #define LINUX_CLONE_SETTLS UINT64_C(0x80000)
@@ -834,10 +836,8 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->completion.kind = KERNEL_THREAD_KIND_USER;
     child->completion.reason = KERNEL_THREAD_EXIT_USER_FAULT;
 
-    /* vfork shares the parent address space instead of cloning it; the
-     * shared record reference keeps the parent's handle valid across the
-     * child's exec or exit. */
-    if (vfork || thread_clone) {
+    /* The MM owner follows CLONE_VM, independently of thread-group identity. */
+    if (flags & LINUX_CLONE_VM) {
         mm_status = kernel_mm_acquire(&child->mm, &parent->mm);
     } else {
         mm_status = kernel_mm_fork(&child->mm, &parent->mm);
@@ -858,12 +858,12 @@ enum kernel_scheduler_status arch_process_clone_current(
                               : KERNEL_SCHEDULER_STATUS_INVALID_STATE)));
     }
     /* dumpable 随实际共享的映像变化，任务退出释放 MM 后仍保留该引用。 */
-    child->exec_security=(vfork || thread_clone)?kernel_exec_security_get(parent->exec_security):
+    child->exec_security=(flags & LINUX_CLONE_VM)?kernel_exec_security_get(parent->exec_security):
         kernel_exec_security_create(parent->files.heap,kernel_exec_security_dumpable(parent->exec_security));
     if(!child->exec_security)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     if (parent->files.state != KERNEL_FILES_EMPTY) {
-        files_status = thread_clone
+        files_status = (flags & LINUX_CLONE_FILES)
             ? kernel_files_acquire(&child->files, &parent->files)
             : kernel_files_fork(&child->files, &parent->files);
         if (files_status != KERNEL_FILES_STATUS_OK) {
@@ -926,7 +926,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->completion.tgid = tid;
     kernel_wait_queue_init(&child->child_exit_queue);
     kernel_wait_queue_init(&child->vfork_done_queue);
-    signal_status = thread_clone ? kernel_signal_share(child, parent)
+    signal_status = (flags & LINUX_CLONE_SIGHAND) ? kernel_signal_share(child, parent)
                                  : kernel_signal_fork(child, parent);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
         return finish_clone_failure(
@@ -1883,15 +1883,43 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
     }
 }
 
+static enum kernel_scheduler_status cleanup_user_mm(struct kernel_task *thread)
+{
+    enum kernel_mm_status mm_status;
+    if (thread->mm.state != KERNEL_MM_LIVE && thread->mm.state != KERNEL_MM_CLEANUP)
+        return KERNEL_SCHEDULER_STATUS_OK;
+    scheduler_usage_save_mm(thread);
+    mm_status = kernel_mm_release(&thread->mm);
+    if (mm_status == KERNEL_MM_STATUS_OK) return KERNEL_SCHEDULER_STATUS_OK;
+    if (mm_status == KERNEL_MM_STATUS_PAGE_ACCESS) return KERNEL_SCHEDULER_STATUS_PAGE_ACCESS;
+    if (mm_status == KERNEL_MM_STATUS_CLEANUP_REQUIRED) return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
+    return mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE
+               ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE
+               : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+}
+
 static enum kernel_scheduler_status cleanup_user_task_resources(
     struct kernel_task *thread)
 {
-    enum kernel_mm_status mm_status;
+    enum kernel_scheduler_status mm_status;
     enum kernel_exec_status exec_status;
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
     cleanup_task_io_requests(thread);
+
+    int vfork_waiter;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        vfork_waiter=thread->vfork_child && thread->vfork_parent;
+    }
+    if (vfork_waiter) {
+        /* User execution and pins have stopped; unrelated close retries must
+         * not keep the parent waiting for this shared-MM owner. */
+        mm_status=cleanup_user_mm(thread);
+        if (mm_status != KERNEL_SCHEDULER_STATUS_OK) return mm_status;
+        if (thread->mm.state == KERNEL_MM_RELEASED) process_complete_vfork(thread);
+    }
 
     if (thread->exec_transaction != 0) {
         struct kernel_exec_transaction *transaction =
@@ -1937,22 +1965,8 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
         thread->fs.state != KERNEL_FS_CONTEXT_RELEASED) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (thread->mm.state == KERNEL_MM_LIVE ||
-        thread->mm.state == KERNEL_MM_CLEANUP) {
-        scheduler_usage_save_mm(thread);
-        mm_status = kernel_mm_release(&thread->mm);
-        if (mm_status != KERNEL_MM_STATUS_OK) {
-            if (mm_status == KERNEL_MM_STATUS_PAGE_ACCESS) {
-                return KERNEL_SCHEDULER_STATUS_PAGE_ACCESS;
-            }
-            if (mm_status == KERNEL_MM_STATUS_CLEANUP_REQUIRED) {
-                return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
-            }
-            return mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE
-                       ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE
-                       : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        }
-    }
+    mm_status=cleanup_user_mm(thread);
+    if (mm_status != KERNEL_SCHEDULER_STATUS_OK) return mm_status;
     /* MM/FD/cwd已归还，脱树挂载的最后owner可在此安全停止后端。 */
     (void)kernel_vfs_reap_mounts();
     if (thread->mm.state == KERNEL_MM_RELEASED) {

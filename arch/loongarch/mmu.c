@@ -408,16 +408,18 @@ enum arch_mmu_status arch_mmu_user_detach_range(
     const uint64_t leaf_span=UINT64_C(1)<<25, middle_span=UINT64_C(1)<<36;
     if (cursor->phase==3 || start==end) return ARCH_MMU_STATUS_NOT_MAPPED;
     if (!cursor->phase) { cursor->address=start & ~(leaf_span-1); cursor->phase=1; }
+    /* MM metadata protection keeps these table pages owned for this call;
+     * detached pages are not released until after the caller drops it. */
+    uint64_t *root=table(s,s->root_address), *middle=0, *leaves=0;
+    uint64_t middle_physical=0, leaf_physical=0;
     unsigned visits=0;
     while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
-        uint64_t *root;
-        root=table(s,s->root_address);
         if (cursor->phase==2) {
             unsigned r=cursor->middle_address>>36;
             if (!root[r]) return ARCH_MMU_STATUS_STATE;
-
-            uint64_t *middle;
-            middle=table(s,root[r]);
+            if (middle_physical!=root[r]) {
+                middle_physical=root[r]; middle=table(s,middle_physical);
+            }
             /* 摘叶表后只在本middle段结束时检查一次；扫描同样受16项预算约束。 */
             visits++;
             if (middle[cursor->scan++]) { cursor->phase=1; cursor->scan=0; continue; }
@@ -437,15 +439,17 @@ enum arch_mmu_status arch_mmu_user_detach_range(
             visits++; continue;
         }
 
-        uint64_t *middle;
-        middle=table(s,root[r]);
+        if (middle_physical!=root[r]) {
+            middle_physical=root[r]; middle=table(s,middle_physical);
+        }
         if (!middle[m]) {
             cursor->address=(address & ~(leaf_span-1))+leaf_span;
             visits++;
         } else {
 
-            uint64_t *leaves;
-            leaves=table(s,middle[m]);
+            if (leaf_physical!=middle[m]) {
+                leaf_physical=middle[m]; leaves=table(s,leaf_physical);
+            }
             uint64_t old=leaves[l];
             visits++;
             if (old && address>=start && address<end) {

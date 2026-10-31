@@ -48,7 +48,11 @@ static int transaction_resources_empty(
            transaction->executable_source == 0 &&
            transaction->interpreter_source == 0 &&
            mm_owner_absent(&transaction->image.mm) &&
-           mm_owner_absent(&transaction->retired_mm);
+           mm_owner_absent(&transaction->retired_mm) &&
+           (transaction->prepared_files.state == KERNEL_FILES_EMPTY ||
+            transaction->prepared_files.state == KERNEL_FILES_RELEASED) &&
+           (transaction->retired_files.state == KERNEL_FILES_EMPTY ||
+            transaction->retired_files.state == KERNEL_FILES_RELEASED);
 }
 
 static void release_allocation(struct kernel_exec_transaction *transaction,
@@ -75,6 +79,14 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     transaction->credentials=0;
     kernel_exec_security_put(transaction->exec_security);
     transaction->exec_security=0;
+    if ((transaction->prepared_files.state == KERNEL_FILES_LIVE ||
+         transaction->prepared_files.state == KERNEL_FILES_CLEANUP) &&
+        kernel_files_release_for_task(&transaction->prepared_files,
+                                      transaction->files_closer)) failed = 1;
+    if ((transaction->retired_files.state == KERNEL_FILES_LIVE ||
+         transaction->retired_files.state == KERNEL_FILES_CLEANUP) &&
+        kernel_files_release_for_task(&transaction->retired_files,
+                                      transaction->files_closer)) failed = 1;
     if (kernel_exec_image_cleanup(transaction->heap,
                                   &transaction->image) !=
         KERNEL_EXEC_IMAGE_STATUS_OK) {

@@ -62,6 +62,12 @@ int kernel_files_is_live(const struct kernel_files *files)
         return 0;
     return 1;
 }
+int kernel_files_is_shared(const struct kernel_files *files)
+{
+    if (!kernel_files_is_live(files)) __builtin_trap();
+    KERNEL_FILES_SCOPE(guard, files);
+    return files->record->references > 1;
+}
 static struct kernel_open_file_description *lookup_locked(
     const struct kernel_files *files, int64_t fd)
 {

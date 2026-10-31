@@ -4,6 +4,7 @@
 #include <kernel/exec_image.h>
 #include <kernel/elf64_source.h>
 #include <kernel/mm.h>
+#include <kernel/files.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -44,6 +45,8 @@ struct kernel_exec_transaction {
     struct kernel_elf64_source *interpreter_source;
     struct kernel_exec_image image;
     struct kernel_mm retired_mm;
+    struct kernel_files prepared_files, retired_files;
+    struct kernel_task *files_closer;
     enum kernel_exec_transaction_state state;
     struct kernel_credentials *credentials;
     struct kernel_exec_security *exec_security;
