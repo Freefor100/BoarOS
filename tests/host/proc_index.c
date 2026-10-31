@@ -147,6 +147,45 @@ static void setup(void)
 }
 static void borrows_returned(void)
 { for (unsigned i = 0; i < 6; i++) assert(!tasks[i].storage_borrows); }
+/* Each thread can own a distinct fs/files wrapper. Proc must borrow the
+ * selected TID rather than silently redirecting to its group leader. */
+struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *fs)
+{
+    assert(fs == &tasks[1].fs || fs == &tasks[2].fs);
+    return (struct kernel_fs_paths){.root = (void *)(uintptr_t)1,
+        .cwd = (void *)(uintptr_t)(fs == &tasks[1].fs ? 2 : 3)};
+}
+void kernel_fs_paths_release(struct kernel_fs_paths *paths) { (void)paths; }
+int kernel_vfs_path_acquire(struct kernel_vfs_path *path)
+{ assert((uintptr_t)path >= 1 && (uintptr_t)path <= 3); return 0; }
+int kernel_vfs_path_release(struct kernel_vfs_path **path) { *path = 0; return 0; }
+enum kernel_mm_status kernel_mm_executable_path_acquire(const struct kernel_mm *mm,
+    struct kernel_vfs_path **path) { (void)mm; (void)path; return KERNEL_MM_STATUS_INVALID_ARGUMENT; }
+int kernel_files_is_live(const struct kernel_files *files)
+{ return files == &tasks[1].files || files == &tasks[2].files; }
+int kernel_files_next_open_fd(const struct kernel_files *files, int after, int *fd)
+{ int n = files == &tasks[1].files ? 41 : 42; if (after >= n) return -KERNEL_ENOENT; *fd = n; return 0; }
+static void thread_resources_case(void)
+{
+    setup(); active->current = &tasks[1];
+    uint64_t leader = ids[1].generation, thread = ids[2].generation | KERNEL_PROC_THREAD_TARGET;
+    struct kernel_vfs_path *path = 0;
+    assert(!kernel_proc_process_path_acquire(2, leader, KERNEL_PROC_PATH_CWD, 0, &path));
+    assert((uintptr_t)path == 2); assert(!kernel_vfs_path_release(&path));
+    assert(!kernel_proc_process_path_acquire(3, thread, KERNEL_PROC_PATH_CWD, 0, &path));
+    assert((uintptr_t)path == 3); assert(!kernel_vfs_path_release(&path));
+    int fd; assert(!kernel_proc_next_fd(2, leader, -1, &fd) && fd == 41);
+    assert(!kernel_proc_next_fd(3, thread, -1, &fd) && fd == 42);
+    assert(kernel_proc_next_fd(3, thread + 1, -1, &fd) == -KERNEL_ENOENT);
+    assert(!kernel_proc_thread_resources_live(3, ids[2].generation));
+    tasks[2].proc_exiting = 1;
+    uint64_t still_visible;
+    assert(!kernel_proc_thread_identity(2, ids[1].generation, 3, &still_visible));
+    assert(kernel_proc_thread_resources_live(3, ids[2].generation) == -KERNEL_ENOENT);
+    assert(kernel_proc_next_fd(3, thread, -1, &fd) == -KERNEL_ENOENT);
+    tasks[2].proc_exiting = 0; borrows_returned(); active->current = 0;
+    puts("PASS proc selected TID owns files and cwd; stale and exiting identities rejected");
+}
 static void lookup_cases(void)
 {
     setup();
@@ -349,7 +388,7 @@ int main(int argc, char **argv)
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
-    else {lookup_cases();access_case();maps_access_cases();memory_owner_case();}
+    else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();}
     for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     return 0;
 }

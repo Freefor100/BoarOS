@@ -1,8 +1,8 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录中除 `stat/status` 外的文件、Linux 全量进程字段与无路径 console 的链接尚未接入；不能把这批入口当作完整 procfs。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root` 和 `maps`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
-`mount(2)` 接受类型 `proc` 和[普通新挂载属性](vfs-ext4.md)；源字符串只作用户地址验证，不选择设备。用户态负责创建挂载点。其他挂载模式显式拒绝。`umount2(2)` 只接受 flags 0，要求名称解析到 proc 实例根且无 cwd、文件、子挂载或其他路径引用。挂载实例持有根及覆盖路径，失败创建或发布不会改变原树；成功卸载先摘树、释放根，最后销毁无 I/O 的 proc 实例。PID 1 及后代全部退出后，根盘清理由最深子挂载开始迭代拆除 proc，不依赖用户态逐个卸载。当前所有任务共享一棵挂载树。
+`mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；当前任务共享一棵挂载树。
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空读取形成快照，短读、readv 和 pread 使用它，seek 到零后释放并在下一次读取重新取值，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 
@@ -29,6 +29,8 @@ stat 的 CPU/starttime 单位是 100 Hz scheduler ticks；utime/stime 汇总存�
 PID 数字目录的 inode 编入单调分配代次；进程退出后旧目录对象不能通过复用的 PID 转向新任务。`/proc/self` 的链接文本在每次调用时读取当前任务 TGID，`/proc/thread-self` 返回当前调用者的 `TGID/task/TID`，不缓存首个访问者的目标。`exe` 来自主程序 MM 单独持有的 OFD 引用，动态解释器不取代它；fork 的子 MM 取得独立引用，共享 MM 则共享原 owner。`cwd/root` 来自目标任务当前 fs context。VFS 跟随这三个链接时直接取得活路径引用，避免对展示字符串重新解析；readlink 仅生成展示文本，已删除对象标注 `(deleted)`。任务查询在短 wait 域内取得元数据快照或路径引用；任务存储借用跨越域外检查，不钉住任务栈。生成文本和对象链接的聚焦对照为 `make test-diff-abi-riscv`；未实现链接不返回伪造内容。
 
 `/proc/<tgid>/task` 枚举属于该线程组的可见 TID，目录继续遍历以 TID 为 cookie；每项沿同一 PID 位图及哈希取得 TID 角色，在 wait 域内检查所属线程组及其代次。组长先退出时，可见代表只沿该组的成员游标寻找，不扫描其他任务；数字 cookie、inode 代次和用户复制提交后才推进目录位置的规则保持一致。`task/<tid>/stat` 与 `status` 的 inode 绑定 TID 自身的身份代次。查找、打开和快照重新检查身份，退出或 TID 复用后，旧节点不能读取新线程；已生成的 OFD 文本仍遵循普通快照及 rewind 规则。失效的线程 status/stat 首次读取返回 `ESRCH`，旧线程目录下继续查找返回 `ENOENT`；进程目录的旧身份查找仍返回 `ESRCH`。组长先退出时，组员目录仍可查询。非组长 exec 释放原 TID 并承接组长身份，所以旧成员节点失效，已打开的 TGID 目录及组长身份节点继续指向 exec 后的进程。
+
+线程目录中的 `fd/fdinfo`、`exe/cwd/root` 和 `maps` 也按 TID 查找其真实 files、fs 和 MM，权限按该线程的凭据及执行安全状态检查。取得路径、OFD 或 MM 后再次核对目标状态；线程退出或身份代次变化后，旧节点不会转向新任务。FD 目录 cookie 与进程目录一致。当前线程 clone 入口要求共享 files 和 fs，但 proc 查询不依赖这一限制。
 
 进程与线程使用同一快照字段和格式化路径。线程的 state、comm、starttime、调度策略、优先级、信号 mask 及 utime/stime/minflt/majflt 来自指定 TID，usage 只统计该线程；Threads、子进程统计、会话及终端仍取线程组，MM 字段取目标线程当前共享 MM。线程 stat 的 wchan 不应用进程的多线程强制零规则，exit_signal 为 -1。status 的 Pid 为 TID、Tgid 为组身份；SigPnd 为线程私有 pending，ShdPnd 为组共享 pending，五个信号位图均输出完整 64 位。SigIgn/SigCgt 在捕获其他信号字段的同一 wait 域内从动作表计算，与远端修改信号动作共用保护；文本格式化在域外执行。所有 proc 后端调用仍在 CPU0 内核服务上下文中执行，任务存储借用覆盖查询，MM 句柄只在这次调用中使用，不保存裸任务或 MM 指针。
 

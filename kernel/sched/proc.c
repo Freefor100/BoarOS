@@ -114,10 +114,15 @@ static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
     return leader;
 }
 
+static struct kernel_task *find_thread(kernel_pid_t tid, uint64_t identity);
+
 static struct kernel_task *find_resource_owner(kernel_pid_t pid,
                                                 uint64_t identity)
 {
-    struct kernel_task *leader = find_member(pid, identity);
+    int thread = !!(identity & KERNEL_PROC_THREAD_TARGET);
+    identity &= ~KERNEL_PROC_THREAD_TARGET;
+    struct kernel_task *leader = thread ? find_thread(pid, identity) :
+        find_member(pid, identity);
     int departing;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -137,6 +142,14 @@ static struct kernel_task *find_thread(kernel_pid_t tid, uint64_t identity)
         task->retirement || !proc_visible(task)) return 0;
     scheduler_task_get_locked(task);
     return task;
+}
+
+int kernel_proc_thread_resources_live(kernel_pid_t tid, uint64_t identity)
+{
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task,
+        find_resource_owner(tid, identity | KERNEL_PROC_THREAD_TARGET));
+    return task ? 0 : -KERNEL_ENOENT;
 }
 
 int kernel_proc_thread_identity(kernel_pid_t tgid, uint64_t group_identity,
@@ -308,6 +321,17 @@ int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
     return task ? proc_task_snapshot(task, identity, 1, result) : -KERNEL_ESRCH;
 }
 
+static int proc_resource_matches_locked(struct kernel_task *task, kernel_pid_t pid,
+                                        uint64_t target)
+{
+    enum kernel_pid_role role = (target & KERNEL_PROC_THREAD_TARGET) ?
+        KERNEL_PID_TID : KERNEL_PID_TGID;
+    struct kernel_pid *id = process_identity(task, role);
+    return task->accounted && !task->retirement && !task->proc_exiting &&
+        process_find_identity(pid, role) == task && id &&
+        id->generation == (target & ~KERNEL_PROC_THREAD_TARGET);
+}
+
 int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
     struct kernel_heap *heap, struct kernel_mm_proc_map **rows, uint32_t *count)
 {
@@ -320,9 +344,7 @@ int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
     struct kernel_mm mm = {0};
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (!task->accounted || task->retirement || task->proc_exiting ||
-            process_find_identity(pid, KERNEL_PID_TGID) != task ||
-            process_identity_generation(task) != identity) return -KERNEL_ENOENT;
+        if (!proc_resource_matches_locked(task, pid, identity)) return -KERNEL_ENOENT;
         if (!kernel_credentials_may_access_locked(kernel_task_current(), task, 1))
             return -KERNEL_EACCES;
         if (task->mm.state != KERNEL_MM_LIVE) { *count = 0; return 0; }
@@ -337,9 +359,7 @@ int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
                 status ? -KERNEL_EIO : 0;
     if (!error) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (!task->accounted || task->retirement || task->proc_exiting ||
-            process_find_identity(pid, KERNEL_PID_TGID) != task ||
-            process_identity_generation(task) != identity) error = -KERNEL_ENOENT;
+        if (!proc_resource_matches_locked(task, pid, identity)) error = -KERNEL_ENOENT;
         else if (task->mm.record != access.mm || task->exec_security != access.security ||
             kernel_credentials_task_locked(task) != access.credentials ||
             !kernel_credentials_may_access_locked(kernel_task_current(), task, 1))
