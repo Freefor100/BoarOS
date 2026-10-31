@@ -30,6 +30,15 @@ pre-20250615，盘内 LTP 报告版本为 20240524。运行和交付方式见
 因此它不能反映内核 ACL 实现。ACL 权限、继承和属性语义由同一 ELF 的
 Linux／BoarOS 直接消费者检查，原程序保持原样。
 
+固定 LTP 源码在未定义 `HAVE_LIBACL` 时编译上述提示分支；发布 ELF 的动态依赖也只有
+libc，没有 libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序，使用 POSIX ACL 接口，直接使用文件和目录两个参数，
+并通过 `user1`～`user5`、`grp1`～`grp5` 及 601～605 的数字身份进行检查。
+原评测脚本对测试目录中的可执行文件直接无参调用；两架构原根盘均没有
+`/etc/passwd` 和 `/etc/group`。因此另建有效消费者时，需要同时提供目标文件、
+目录和对应身份；运行时补库也无法把现有桩变成完整程序。
+完整源码打印自己的 `ACL TESTS RESULTS`，而原 judge 读取 LTP `Summary:`，
+两者的结果格式也需要分别解释。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/nfsv4/acl/acl1.c)
+
 ### LA glibc setxattr01：clone3 的 CLONE_CLEAR_SIGHAND 缺口
 
 本次原程序在准备阶段报告 `mkfs.ext4 does not exist` 并以 TCONF 退出。
