@@ -3902,7 +3902,7 @@ static int flush_cache_mount(struct kernel_page_cache *cache,const struct kernel
             CACHE_SCOPE(guard,cache);
             for (struct kernel_page_cache_dirty *dirty=cache->record->dirty_head;dirty;dirty=dirty->queue_next) {
                 struct kernel_page_cache_entry *entry=RB_MIN(kernel_page_cache_dirty_tree,&dirty->tree);
-                if (!entry || (mount && kernel_vfs_node_mount(entry->node)!=mount)) continue;
+                if (!entry || (mount && kernel_vfs_node_mount(entry->node)->private_data!=mount->private_data)) continue;
                 node=entry->node;
                 if (kernel_vfs_node_acquire(node)) __builtin_trap();
                 break;
@@ -3925,7 +3925,7 @@ enum kernel_page_cache_status kernel_page_cache_purge_mount(
         struct kernel_page_cache_entry *entry=cache->record->lru_tail;
         while (entry) {
             struct kernel_page_cache_entry *previous=entry->lru_previous;
-            if (kernel_vfs_node_mount(entry->node)==mount) {
+            if (kernel_vfs_node_mount(entry->node)->private_data==mount->private_data) {
                 uint32_t references;
                 if (physical_page_reference_count(cache->allocator,entry->physical_address,&references)) __builtin_trap();
                 if (references!=1 || entry->users || entry_loading(entry) || entry->writeback || entry->aliases ||

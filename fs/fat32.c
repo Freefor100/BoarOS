@@ -1178,16 +1178,15 @@ static int remount(struct kernel_vfs_mount *mount, int read_only)
 static int prepare_unmount(struct kernel_vfs_mount *mount)
 {
     struct fat_mount *m = fm(mount->private_data);
-    struct kernel_vfs_node *root_node = mount->root_path ? mount->root_path->file.private_data : 0;
     if (m->prepared) return 0;
-    if (m->instance.external_files != (root_node ? 1U : 0U)) return -KERNEL_EBUSY;
+    if (m->instance.external_files != kernel_vfs_internal_file_count(&m->instance)) return -KERNEL_EBUSY;
     m->instance.quiescing = 1;
     kernel_page_cache_stop_worker(m->instance.page_cache);
     if (m->error) return m->error;
     enum kernel_page_cache_status status = kernel_page_cache_purge_mount(m->instance.page_cache, mount);
     if (status != KERNEL_PAGE_CACHE_STATUS_OK)
         return status == KERNEL_PAGE_CACHE_STATUS_STATE ? -KERNEL_EBUSY : -KERNEL_EIO;
-    if (!kernel_vfs_nodes_idle(&m->instance, root_node)) return -KERNEL_EBUSY;
+    if (!kernel_vfs_nodes_internal_idle(&m->instance)) return -KERNEL_EBUSY;
     while (m->instance.cleanup_nodes) {
         struct kernel_vfs_node *node = m->instance.cleanup_nodes;
         if (node->unlinked && !node->retired) {
@@ -1202,7 +1201,7 @@ static int prepare_unmount(struct kernel_vfs_mount *mount)
         if (!node->closed) close_node(node);
         kernel_file_mapping_destroy(node); dispose(m, node);
     }
-    if (!kernel_vfs_nodes_idle(&m->instance, root_node)) return -KERNEL_EBUSY;
+    if (!kernel_vfs_nodes_internal_idle(&m->instance)) return -KERNEL_EBUSY;
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     struct fat_inode *i;
     RB_FOREACH(i, fat_id_tree, &m->inodes) if (i->times_dirty) {
@@ -1215,7 +1214,13 @@ static int prepare_unmount(struct kernel_vfs_mount *mount)
         if (!r) r = fail(m, block_error(kernel_block_flush(m->block)));
         if (r) return r;
     }
-    if (root_node && !root_node->closed) { close_node(root_node); root_node->closed = 1; }
+    for (struct kernel_vfs_node *node=m->instance.nodes;node;node=node->next) {
+        if (node->unlinked && !node->retired) {
+            int error=trim_chain(m,fi(node),0);if (error) return error;
+            fi(node)->size=0;node->retired=1;
+        }
+        if (!node->closed) {close_node(node);node->closed=1;}
+    }
     m->prepared = 1; return 0;
 }
 static int unmount(struct kernel_vfs_mount *mount)
@@ -1224,7 +1229,7 @@ static int unmount(struct kernel_vfs_mount *mount)
     int r = prepare_unmount(mount); if (r) return r;
     if (m->instance.external_files || m->instance.nodes || mount->root_path) return -KERNEL_EBUSY;
     kernel_page_cache_unbind_writeback(&m->instance.writeback);
-    kernel_block_release_claim(m->block, mount);
+    kernel_block_release_claim(m->block, &m->instance.backend_mount);
     struct fat_inode *i;
     while ((i = RB_MIN(fat_id_tree, &m->inodes))) {
         if (__atomic_load_n(&i->handles, __ATOMIC_RELAXED)) __builtin_trap();
@@ -1232,8 +1237,8 @@ static int unmount(struct kernel_vfs_mount *mount)
         if (i->linked && i->id != 1) RB_REMOVE(fat_entry_tree, &m->entries, i);
         dispose(m, i);
     }
-    dispose(m, m->sector); dispose(m, m->zeros); dispose(m, m);
     mount->private_data = 0; mount->state = VFS_MOUNT_STATE_EMPTY; mount->id = 0;
+    dispose(m, m->sector); dispose(m, m->zeros); dispose(m, m);
     return 0;
 }
 static int check_domain(const struct kernel_vfs_node *node, const struct kernel_heap *heap,
@@ -1264,17 +1269,17 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     if (!mount || mount->state || mount->private_data || !block || !block->logical_block_size || !heap || !cache ||
         cache->state != KERNEL_PAGE_CACHE_LIVE) return -KERNEL_EINVAL;
     if (!read_only && kernel_block_read_only(block)) return -KERNEL_EROFS;
-    int r = kernel_block_claim(block, mount); if (r) return r;
+    struct fat_mount *m=NULL;
+    enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(heap,1,sizeof(*m),(void **)&m);
+    if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    m->block=block;m->instance.heap=heap;m->instance.page_cache=cache;
+    m->instance.backend_data=m;m->instance.ops=&fat_ops;m->instance.read_only=read_only!=0;
+    mount->private_data=&m->instance;mount->id=kernel_vfs_allocate_mount_id();mount->state=VFS_MOUNT_STATE_CLEANUP;
+    kernel_vfs_mount_initialize(mount);m->mount=&m->instance.backend_mount;
+    int r=kernel_block_claim(block,m->mount);
+    if (r) {mount->private_data=NULL;mount->id=mount->state=0;dispose(m,m);return r;}
     uint8_t boot[512];
-    r = block_error(kernel_block_read_at(block, 0, boot, sizeof(boot)));
-    struct fat_mount *m = 0;
-    if (!r) {
-        enum kernel_heap_status a = kernel_heap_allocate_zeroed(heap, 1, sizeof(*m), (void **)&m);
-        if (a != KERNEL_HEAP_STATUS_OK) r = a == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-    }
-    if (r) { kernel_block_release_claim(block, mount); return r; }
-    m->mount = mount; m->block = block; m->instance.heap = heap; m->instance.page_cache = cache;
-    m->instance.backend_data = m; m->instance.ops = &fat_ops; m->instance.read_only = read_only != 0;
+    r=block_error(kernel_block_read_at(block,0,boot,sizeof(boot)));if (r) goto invalid;
     m->sector_at = UINT64_MAX; m->next_id = 2;
     unsigned bps = le16(boot + 11), spc = boot[13], reserved = le16(boot + 14);
     unsigned fats = boot[16]; uint32_t sectors = le32(boot + 32), fat_sectors = le32(boot + 36);
@@ -1348,20 +1353,22 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->instance.writeback_block_size = bps;
     r=kernel_page_cache_bind_writeback(cache,block,!read_only,&m->instance.writeback);if (r) goto invalid;
-    mount->private_data = &m->instance; mount->id = kernel_vfs_allocate_mount_id(); mount->state = VFS_MOUNT_STATE_CLEANUP;
+
     if (!read_only) {
         r = fat_set(m, 1, state & ~0x08000000U);
         if (!r) r = fail(m, block_error(kernel_block_flush(block)));
         if (r) return r; /* The failing mount still owns uncertain media I/O. */
     }
-    mount->state = VFS_MOUNT_STATE_LIVE;
+    mount->state = VFS_MOUNT_STATE_LIVE;m->instance.backend_mount.state=VFS_MOUNT_STATE_LIVE;
+    kernel_vfs_mount_initialize(mount);
     return 0;
 invalid:
     kernel_page_cache_unbind_writeback(&m->instance.writeback);
     while (!RB_EMPTY(&m->inodes)) {
         struct fat_inode *i = RB_MIN(fat_id_tree, &m->inodes); RB_REMOVE(fat_id_tree, &m->inodes, i); dispose(m, i);
     }
+    kernel_block_release_claim(block,&m->instance.backend_mount);
+    mount->private_data=NULL;mount->id=mount->state=0;
     dispose(m, m->sector); dispose(m, m->zeros); dispose(m, m);
-    kernel_block_release_claim(block, mount);
     return r;
 }

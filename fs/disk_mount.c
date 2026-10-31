@@ -37,7 +37,7 @@ static void release_disk(struct kernel_vfs_mount *mount)
 
 int kernel_vfs_disk_cleanup_pending(void)
 {
-    int first = 0;
+    int first = kernel_vfs_cleanup_pending();
     for (;;) {
         uintptr_t irq = arch_interrupt_save();
         struct disk_mount *disk = disk_mounts;
@@ -97,12 +97,13 @@ int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
                      : kernel_vfs_mount_fat32(&disk->mount, block, heap, &disk->cache, read_only);
     /* 后端失败可能仍持有日志和 I/O；发布到清理注册表而非丢失真实 owner。 */
     disk->mount.release_owner = release_disk;
+    if (disk->mount.private_data) kernel_vfs_mount_initialize(&disk->mount);
     if (!result) result = kernel_page_cache_start_worker(&disk->cache);
     if (!result && ext4) result = kernel_vfs_start_journal_worker(&disk->mount);
     if (result) {
         if (disk->mount.private_data) {
             int cleanup = kernel_vfs_unmount(&disk->mount);
-            if (cleanup) disk->pending = 1;
+            if (cleanup && !disk->mount.retired) disk->pending = 1;
         }
         else release_disk(&disk->mount);
         return result;
@@ -114,6 +115,6 @@ int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
 
 void kernel_vfs_disk_defer_cleanup(struct kernel_vfs_mount *mount)
 {
-    if (mount && mount->release_owner == release_disk)
+    if (mount && !mount->retired && mount->release_owner == release_disk)
         ((struct disk_mount *)mount)->pending = 1;
 }

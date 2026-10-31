@@ -103,12 +103,14 @@ enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 { (void)pin; excluded(); }
 #endif
+#ifndef MADVISE_REMOVE_CASES
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
 struct kernel_shm_attachment;
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 { if (owner && *owner) excluded(); }
+#endif
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)

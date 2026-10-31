@@ -1761,6 +1761,10 @@ test-fat32-host:
 test-remount-host:
 	sh tests/remount-host.sh
 
+.PHONY: test-madvise-remove-host
+test-madvise-remove-host:
+	sh tests/madvise-remove-host.sh
+
 FAT32_USER_RV := $(BUILD_DIR)/tests/user/fat32-rv
 $(FAT32_USER_RV): tests/userland/fat32.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)

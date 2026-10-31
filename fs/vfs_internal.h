@@ -12,7 +12,9 @@
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_vfs_path;
 /* Capture a mutable parent edge and its owner in the same state protection. */
-struct kernel_vfs_path *kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path);
+int kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path,struct kernel_vfs_path **owner);
+/* Existing object capability (PTY master) selects kernel-owned children without new DAC search. */
+int kernel_vfs_path_lookup_object(struct kernel_vfs_path *,const char *,size_t,struct kernel_vfs_path **);
 #include <stdint.h>
 
 struct kernel_vfs_file;
@@ -58,6 +60,9 @@ struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *, uint6
 struct kernel_vfs_node *kernel_vfs_node_pin(struct kernel_vfs_instance *, uint64_t inode);
 void kernel_vfs_cleanup_node(struct kernel_vfs_node *);
 /* Terminal node snapshot; includes final releases already removed from the index. */
+int kernel_vfs_nodes_internal_idle(struct kernel_vfs_instance *);
+uint32_t kernel_vfs_internal_file_count(struct kernel_vfs_instance *);
+void kernel_vfs_mount_view_release(struct kernel_vfs_mount *);
 int kernel_vfs_nodes_idle(struct kernel_vfs_instance *, struct kernel_vfs_node *root);
 
 #define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX

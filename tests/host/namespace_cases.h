@@ -367,6 +367,11 @@ static void *namespace_parallel_thread(void *argument)
     __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);
     return NULL;
 }
+static int namespace_parallel_unmount(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_instance *instance=mount->private_data;
+    return instance->external_files || instance->nodes || instance->paths || instance->retiring_nodes ? -KERNEL_EBUSY : 0;
+}
 static void namespace_parallel_publication_case(struct kernel_heap *heap)
 {
     struct kernel_vfs_backend ops={.namespace_execution=KERNEL_VFS_EXECUTION_CALLER,
@@ -374,10 +379,12 @@ static void namespace_parallel_publication_case(struct kernel_heap *heap)
         .root=namespace_parallel_root,.lookup=namespace_parallel_lookup,.open=namespace_parallel_open,
         .create=namespace_parallel_create,.rmdir=namespace_parallel_rmdir,.rename=namespace_parallel_rename,
         .unlink=namespace_parallel_unlink,.link=namespace_parallel_link,.truncate=namespace_parallel_truncate,
-        .release_unlinked=namespace_parallel_release_unlinked};
+        .release_unlinked=namespace_parallel_release_unlinked,.unmount=namespace_parallel_unmount};
     struct kernel_vfs_instance instance={.ops=&ops,.heap=heap,.namespace_parallel=1};
     struct kernel_vfs_mount mount={.private_data=&instance,.state=VFS_MOUNT_STATE_LIVE,.id=900};
+    kernel_rwlock_init(&instance.reconfiguration,19,(uintptr_t)&instance);
     kernel_mutex_init(&instance.namespace_lock,20,(uintptr_t)&instance);
+    kernel_vfs_mount_initialize(&mount);
     namespace_parallel_instance=&instance;namespace_parallel_closed=0;
     struct namespace_parallel_request requests[2]={{.mount=&mount,.actor=0},{.mount=&mount,.actor=1}};
     pthread_t threads[2];
@@ -555,13 +562,15 @@ static void namespace_parallel_publication_case(struct kernel_heap *heap)
     struct kernel_vfs_node retired={.instance=&instance,.mount=&mount,.inode=20,
         .references=1,.mode=KERNEL_VFS_S_IFDIR|0700,.unlinked=1,.retired=1};
     kernel_rwlock_init(&retired.namespace_lock,21,20);
-    struct kernel_vfs_path retired_path={.file={.mount=&mount,.private_data=&retired,
-        .mode=KERNEL_VFS_S_IFDIR|0700,.state=VFS_FILE_STATE_LIVE},.heap=heap,
+    struct kernel_vfs_dentry retired_entry={.file={.mount=&instance.backend_mount,.private_data=&retired},
         .references=1,.name="retired"};
+    struct kernel_vfs_path retired_path={.dentry=&retired_entry,.file={.mount=&mount,.private_data=&retired,
+        .mode=KERNEL_VFS_S_IFDIR|0700,.state=VFS_FILE_STATE_LIVE},.heap=heap,
+        .references=1};
     assert(kernel_vfs_rename_at(&retired_path,parents[1],root,"created","different",0)==-KERNEL_ENOENT &&
            retired_path.references==1 && retired.references==1);
     for(unsigned i=0;i<2;i++)assert(!kernel_vfs_path_release(&parents[i]));
-    assert(!kernel_vfs_path_release(&root) && !instance.nodes && !instance.paths &&
+    assert(!kernel_vfs_path_release(&root) && !kernel_vfs_unmount(&mount) && !instance.nodes && !instance.paths &&
            !instance.node_count && !instance.external_files && !instance.retiring_nodes);
     namespace_parallel_instance=NULL;
     puts("PASS parallel shared lookup and unique inode/path candidate publication; losing candidates and all owners returned");
@@ -914,7 +923,7 @@ static void namespace_parent_snapshot_case(struct kernel_heap *heap,
     assert(!kernel_vfs_create_at(root,root,"/namespace-old-parent/child",0600,&file));
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_path_resolve(root,root,"/namespace-old-parent/child",1,&child));
-    parent=kernel_vfs_path_parent_pin(child);assert(parent);
+    parent=NULL;assert(!kernel_vfs_path_parent_pin(child,&parent)&&parent);
     uint64_t inode=kernel_vfs_path_inode(parent);
     struct namespace_parent_move move={.root=root};pthread_t thread;
     assert(!pthread_barrier_init(&move.gate,NULL,2));
@@ -922,7 +931,7 @@ static void namespace_parent_snapshot_case(struct kernel_heap *heap,
     pthread_barrier_wait(&move.gate);
     assert(!pthread_join(thread,NULL) && !pthread_barrier_destroy(&move.gate));
     assert(!kernel_vfs_path_stat(parent,&stat) && stat.ino==inode && !stat.nlink);
-    struct kernel_vfs_path *next=kernel_vfs_path_parent_pin(child);
+    struct kernel_vfs_path *next=NULL;assert(!kernel_vfs_path_parent_pin(child,&next));
     assert(next && kernel_vfs_path_inode(next)!=inode);
     assert(!kernel_vfs_path_release(&next) && !kernel_vfs_path_release(&parent));
     assert(!kernel_vfs_path_release(&child));
@@ -1011,7 +1020,7 @@ static void namespace_retiring_mount_case(struct kernel_heap *heap)
     assert(!pthread_create(&thread,NULL,namespace_retire_node,&node));
     while (!__atomic_load_n(&namespace_retire_entered,__ATOMIC_ACQUIRE)) sched_yield();
     /* The weak index is empty, but close still borrows the backend and heap. */
-    assert(!instance->nodes && !instance->external_files);
+    assert(instance->retiring_nodes==1 && !kernel_vfs_node_find(instance,node->inode));
     assert(kernel_vfs_unmount(mount)==-KERNEL_EBUSY);
     __atomic_store_n(&namespace_retire_resume,1,__ATOMIC_RELEASE);
     assert(!pthread_join(thread,NULL) && !node);

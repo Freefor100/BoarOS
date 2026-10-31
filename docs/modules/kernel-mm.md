@@ -21,9 +21,13 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 ## madvise 与共享段锁定
 
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
 
 DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。当前 VDSO 缺少特殊缺页重装路径，DONTNEED 对它返回 EINVAL；Linux VDSO 可重装，这一差异保留为缺口。
+
+REMOVE 删除范围的共享后备数据，保留 VMA 和文件长度。锁定范围返回 EINVAL；私有匿名或无文件后备的范围返回 EINVAL；私有文件（含 ELF 文件范围）或最大权限不含写的共享映射返回 EACCES，纯 BSS 零后备按匿名范围处理。最大权限沿用 mmap/shmat 时的来源许可，随后 mprotect 降为只读仍可删除。文件来源借用固定原 OFD 和文件偏移，释放 MM 资格后复用普通 fallocate 的 PUNCH_HOLE|KEEP_SIZE 路径；只读挂载、后端不支持或 I/O 失败返回实际错误。文件失效回调撤销同 inode 在各 MM 中的共享页和未写私有页，保留独立私有 COW。tmpfs 释放完整后备页及配额，非整页打洞只清除保留页的边缘字节；ext4 沿原磁盘事务、缓存失效与写回协议。
+
+共享匿名和 SysV 的 MM 来源节点向真实内存对象登记；REMOVE 持有对象引用，在 MM 资格外关闭对象映射代次，逐个 MM 排空用户 pin、撤销对应 PTE，再删除对象页并重新开放缺页。节点摘除后在 MM 资格外等待已有通知借用结束，再归还对象。缺页准备保存对象代次，发布前拒绝已删除的旧页。持有该 MM 的用户 pin 时若遇对象关闭，缺页返回 CONFLICT，让调用者先归还 pin；无 pin 才等待对象开放，避免打洞与 pin 排空相互等待；fork 只在子 VMA、页表都构造完成后登记，代次发生变化时撤销子共享叶，由首次访问重新装入。范围空洞两侧仍执行并最终返回 ENOMEM；后续 VMA 或后端失败保留先前已经完成的删除。
 
 WILLNEED 使用已有文件缓存装入过程，单次建议至多准备16个数据页，不安装用户 PTE、不改变OFD offset。文件/ELF来源借用覆盖锁外I/O，最后一个映射或原FD关闭后，来源在建议结束时归还。返回0表示接纳建议；装入失败采用 Linux 忽略 fadvise 返回值的规则，实际读取/缺页继续处理其实际I/O结果。无swap时私有匿名、纯BSS和无文件身份的ELF来源返回EBADF，共享内存没有swap-in工作。
 
@@ -35,7 +39,7 @@ SHM_LOCK/UNLOCK 在既有CPU0共享内存控制路径执行。段保存首次LOC
 
 LOCK保留按需装页，当前memory_object已经持有已驻留页。UID或owner改变后，UNLOCK或RMID后的最后attachment销毁向原账户归还。共享段的UID额度与普通mlock的MM虚拟字节、VmLck分别统计。
 
-共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`shm_lock.c`，宿主入口为`tests/mm-resource-limits-host.sh`、`tests/shm-lock-host.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
+共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`shm_lock.c`，宿主入口为`tests/mm-resource-limits-host.sh`、`tests/madvise-remove-host.sh`、`tests/shm-lock-host.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
 
 ```sh
 python3 tests/loongarch/prepare.py --component linux --profile platform-noswap

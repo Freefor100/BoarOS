@@ -465,7 +465,7 @@ static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
-    *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
+    *s=(struct kernel_vfs_stat){.dev=n->instance->backend_mount.id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
         .size=i->size,.blksize=BOAROS_PAGE_SIZE,
         .blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*(BOAROS_PAGE_SIZE/512) : 0,
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
@@ -477,7 +477,7 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
         .free_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .available_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
-        .fsid=mount->id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
+        .fsid=m->instance.backend_mount.id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
 }
 static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint64_t *id,
                        uint8_t *type,char *name,size_t capacity)
@@ -501,6 +501,21 @@ static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actu
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->size=size; i->ctime=i->mtime=time; *actual=size; *changed=1; return 0;
+}
+static int punch_inode(struct kernel_vfs_node *n,unsigned mode,uint64_t offset,
+    uint64_t length,uint64_t *actual,int *changed)
+{
+    struct tmp_inode *i=ti(n);
+    *actual=i->size; *changed=0;
+    if (mode != (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE))
+        return -KERNEL_EOPNOTSUPP;
+    uint64_t end=offset+length;
+    if (end>i->size) end=i->size;
+    if (offset<end) kernel_memory_object_punch(i->memory,offset,end);
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    i->ctime=i->mtime=time; *changed=1;
+    return 0;
 }
 static int pread_inode(struct kernel_vfs_node *n,uint64_t offset,void *buffer,size_t size,size_t *read)
 {
@@ -670,6 +685,7 @@ static void initialize_ops(void)
     o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_node; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
+    o->fallocate=punch_inode;
     o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->killpriv=killpriv; o->writeback_allowed=no_writeback;
     o->flush=error; o->unmount=unmount; o->xattr=xattr_inode; o->exec_metadata=exec_metadata;
@@ -769,5 +785,6 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance; m->mount.id=kernel_vfs_allocate_mount_id(); m->mount.state=VFS_MOUNT_STATE_LIVE;
+    kernel_vfs_mount_initialize(&m->mount);
     *owner=&m->mount; return 0;
 }

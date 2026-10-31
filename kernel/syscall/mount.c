@@ -23,6 +23,8 @@
 #define LINUX_MS_NODEV UINT64_C(4)
 #define LINUX_MS_NOEXEC UINT64_C(8)
 #define LINUX_MS_REMOUNT UINT64_C(32)
+#define LINUX_MS_BIND UINT64_C(4096)
+#define LINUX_MS_REC UINT64_C(16384)
 #define LINUX_MS_SILENT UINT64_C(32768)
 
 static int import_string(struct kernel_mm *mm, char *buffer, size_t capacity,
@@ -49,7 +51,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     int result;
     uint64_t source_device = 0;
 
-    if (request->arguments[2]) {
+    if (!(flags & LINUX_MS_BIND) && request->arguments[2]) {
         result = import_string(mm, type, sizeof(type), request->arguments[2]);
         if (result) return result;
     }
@@ -68,7 +70,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
                                request->arguments[0]);
         if (result) goto Finish;
     }
-    if (request->arguments[4]) {
+    if (!(flags & LINUX_MS_BIND) && request->arguments[4]) {
         result = import_string(mm, options, sizeof(options),
                                request->arguments[4]);
         if (result) goto Finish;
@@ -80,11 +82,20 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
-    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_REC)) {result=-KERNEL_ENOTSUP;goto Finish;}
     if (flags & LINUX_MS_REMOUNT) {
         result=kernel_vfs_remount(covered,flags,options);
         goto Finish;
     }
+    if (flags & LINUX_MS_BIND) {
+        struct kernel_vfs_path *source=NULL;
+        if (!request->arguments[0]) {result=-KERNEL_EINVAL;goto Finish;}
+        result=kernel_vfs_path_resolve(fs_paths.cwd,fs_paths.root,source_name,1,&source);
+        if (!result) result=kernel_vfs_bind_mount(source,covered,!!(flags & LINUX_MS_REC));
+        if (source && kernel_vfs_path_release(&source)) __builtin_trap();
+        goto Finish;
+    }
+    if (flags & LINUX_MS_REC) {result=-KERNEL_ENOTSUP;goto Finish;}
     if(!tmpfs && !disk && !devpts && !mqueue && strcmp(type,"proc")) {result=-KERNEL_ENODEV;goto Finish;}
     if(!tmpfs && !devpts && options[0]) {result=-KERNEL_ENOTSUP;goto Finish;}
     if(disk) {
@@ -133,7 +144,8 @@ static int unmount_filesystem(struct kernel_mm *mm,
                         const struct kernel_syscall_request *request)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
-    if (request->arguments[1]) return -KERNEL_ENOTSUP;
+    unsigned flags=(uint32_t)request->arguments[1];
+    if (flags & ~2U) return -KERNEL_ENOTSUP;
     if (!request->arguments[0]) return -KERNEL_EFAULT;
     char *target = 0;
     struct kernel_vfs_path *root = 0;
@@ -149,7 +161,7 @@ static int unmount_filesystem(struct kernel_mm *mm,
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
     struct kernel_vfs_mount *mount = kernel_vfs_path_mount(root);
-    if (!mount->parent && root==fs_paths.root) {
+    if (!flags && !mount->parent && root==fs_paths.root) {
         uint64_t flags=1U|(mount->nosuid?2U:0U)|(mount->nodev?4U:0U)|
             (mount->noexec?8U:0U)|(mount->silent?32768U:0U);
         result=kernel_vfs_remount(root,flags,NULL);
@@ -159,13 +171,7 @@ static int unmount_filesystem(struct kernel_mm *mm,
         result = -KERNEL_EINVAL;
         goto Finish;
     }
-    result = kernel_vfs_mount_prepare_detach(mount, root);
-    if (result) goto Finish;
-    result = kernel_vfs_mount_detach(mount, root);
-    if (result) goto Finish;
-    if (kernel_vfs_path_release(&root)) __builtin_trap();
-    result = kernel_vfs_unmount(mount);
-    if (result) kernel_vfs_disk_defer_cleanup(mount);
+    result=kernel_vfs_umount(root,flags);
 Finish:
     if (root && kernel_vfs_path_release(&root)) __builtin_trap();
     kernel_heap_release(fs->heap, target);
