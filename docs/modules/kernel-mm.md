@@ -3,15 +3,15 @@
 本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
 普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用分层并发协调协议：
-- `record->operations`（rank 25 读写锁）：私有匿名映射创建（`mmap`）与撤销（`munmap`）、匿名/COW 缺页处理取得共享读资格；全局结构变更（fork、销毁、mremap）以及文件/ELF/SysV 映射保留独占写资格。文件来源、resident 与 alias 仍由写者维护，文件 I/O 和等待释放资格后执行，恢复后重新查找和分派。默认 UP 使用独占资格。
-- 范围协调机制（`struct kernel_mm_range_claim`）：在 `record->metadata`（raw 自旋锁）保护下登记活动地址区间。不相交区间的私有匿名 `mmap`、`munmap` 与缺页在不同核心上并行推进，避免在无关地址范围上全局串行化；重叠区间的操作通过 `record->range_changed` 等待队列进行有序等待与排他协调。
-- VMA 局部锁（`record->vma_lock`，rank 31 读写锁）：仅在修改或检索 `record->vmas` 数组（查找空洞、插入、替换或检索 VMA）时短暂持有纳秒级锁，在锁外执行页表解绑、远端 TLB 广播和物理页归还。
+- `record->operations`（rank 25 读写锁）：私有匿名映射创建（`mmap`）与撤销（`munmap`）、纯匿名锁页与解锁（`mlock` / `munlock`）、匿名/COW 缺页处理取得共享读资格；全局结构变更（fork、销毁、mremap）、VMA 权限变更（`mprotect`）以及文件/ELF/SysV 映射保留独占写资格。文件来源、resident 与 alias 仍由写者维护，文件 I/O 和等待释放资格后执行，恢复后重新查找和分派。默认 UP 使用独占资格。
+- 范围协调机制（`struct kernel_mm_range_claim`）：在 `record->metadata`（raw 自旋锁）保护下登记活动地址区间。不相交区间的私有匿名 `mmap`、`munmap`、`mlock`、`munlock` 与缺页在不同核心上并行推进，避免在无关地址范围上全局串行化；重叠区间的操作通过 `record->range_changed` 等待队列进行有序等待与排他协调。当发起任务自身仍持有未归还的用户页借用（`current_pins(mm)`）时，范围认领与缺页等待采用非阻塞尝试（`mm_range_claim_try_acquire`），冲突立即返回 `KERNEL_MM_STATUS_CONFLICT` 避免与正在排空 pin 的写者死锁。
+- VMA 局部锁（`record->vma_lock`，rank 31 读写锁）：仅在修改或检索 `record->vmas` 数组（查找空洞、插入、替换、更新锁页标记或检索 VMA）时短暂持有纳秒级锁，在锁外执行页表解绑、远端 TLB 广播和物理页归还。
 - 并发缺页局部校验：私有匿名缺页在提交硬件页表前，在 `vma_lock` 保护下只校验目标地址对应的 VMA 一致性并检查范围认领冲突，其他核心对无关地址区间的 VMA 增删不会迫使当前缺页发生假冲突重试。
 - 匿名缺页和驻留用户复制可在发起 CPU 完成，ext4 普通文件冷页在发起 CPU 完成缓存装入与请求提交，日志和后台写回由 CPU0 推进。非叶变更同步全范围，退休页在本地与远端 TLB 确认后才归还。实际执行边界见[RV 两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
 ## 锁页、MEMLOCK 与驻留查询
 
-`mlock`、`mlock2`、`munlock`、`mlockall`、`munlockall` 和 `MAP_LOCKED` 使用同一份 VMA 属性。`LOCKED` 表示锁定范围，`ONFAULT` 表示保留按需装入；MM 保存未来映射策略。VMA 分裂、合并、替换、搬移和删除同时维护锁定虚拟字节数，合并必须具有相同锁定策略。`/proc/<pid>/status` 的 `VmLck` 包含尚未触页的 ONFAULT 范围。
+`mlock`、`mlock2`、`munlock`、`mlockall`、`munlockall` 和 `MAP_LOCKED` 使用同一份 VMA 属性。`LOCKED` 表示锁定范围，`ONFAULT` 表示保留按需装入；MM 保存未来映射策略。VMA 分裂、合并、替换、搬移和删除同时维护锁定虚拟字节数，合并必须具有相同锁定策略。`/proc/<pid>/status` 的 `VmLck` 包含尚未触页的 ONFAULT 范围。纯匿名范围的 `mlock` 与 `munlock` 接入范围协调并在 `vma_lock` 保护下更新锁定标记，互不重叠范围可在不同核心并发推进。
 
 接纳使用实际调用线程组的 MEMLOCK 软限额，按架构页取整，`CAP_IPC_LOCK` 豁免。锁定重叠范围只计一次；下调限额保留已有范围。mmap（含固定替换）、brk、新增栈范围、mremap 扩大和 SysV attach 在修改前检查额度。mmap 按 Linux 将本次完整长度加入旧锁定用量后检查，额度拒绝保留固定替换的旧映射；brk 拒绝返回旧 break，锁定映射的 mremap 扩大超限返回 EAGAIN。mprotect 保留策略。
 
