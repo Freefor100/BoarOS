@@ -242,12 +242,16 @@ CPU记账的旧成本、资源限制一轮的功能净影响及定时器启用�
 | LA glibc | 0/0 | 0/1，0.109 秒 | 4/4，0.113 秒 | 32/32，0.067 秒 | 36/37 |
 | LA musl | 0/0 | 9/9，8.043 秒 | 4/4，0.064 秒 | 32/32，0.084 秒 | 45/45 |
 
-`acl1` 是缺少 ACL 库的发布程序桩，四项均退出32；LA glibc 的 `setxattr01`
-因 `clone3` 尚未支持 `CLONE_CLEAR_SIGHAND` 而在工具探测时 TCONF，其余程序退出0。
+`acl1` 是缺少 ACL 库的发布程序桩，四项均退出32；上表 LA glibc 的 `setxattr01`
+因当时 `clone3` 尚未支持 `CLONE_CLEAR_SIGHAND` 而在工具探测时 TCONF，其余程序退出0。
 本批均无超时。
 这两个输入／准备情况见[统一问题记录](oscomp-test-issues.md#acl1发布程序未包含-acl-测试)；
 原 xattr 和 chmod 程序本身不覆盖完整 ACL 语义，权限、继承、错误和并发由同 ELF
 的 Linux／BoarOS 直接消费者检查。正常退出后两架构根盘及第二盘三个分区检查均正常。
+
+补齐 `CLONE_CLEAR_SIGHAND` 后，使用原 LA glibc ELF 和原 judge 定向重跑
+`setxattr01`：测试成功格式化并挂载 scratch，9 项通过，得分 **9/9**，退出 0，
+耗时 6.531 秒，无超时。正常退出后 LA 根盘及第二盘三个分区检查均正常。
 
 ## 目录、路径与文件 I/O 当前结果
 

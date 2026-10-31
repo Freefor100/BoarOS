@@ -30,8 +30,9 @@ pre-20250615，盘内 LTP 报告版本为 20240524。运行和交付方式见
 因此它不能反映内核 ACL 实现。ACL 权限、继承和属性语义由同一 ELF 的
 Linux／BoarOS 直接消费者检查，原程序保持原样。
 
-固定 LTP 源码在未定义 `HAVE_LIBACL` 时编译上述提示分支；发布 ELF 的动态依赖也只有
-libc，没有 libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序，使用 POSIX ACL 接口，直接使用文件和目录两个参数，
+固定 LTP 源码在未定义 `HAVE_LIBACL` 时编译上述提示分支，以便缺少这项可选依赖的环境
+仍能构建 LTP，并在执行时明确报告该测试不可用；发布 ELF 的动态依赖也只有 libc，没有
+libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序，使用 POSIX ACL 接口，直接使用文件和目录两个参数，
 并通过 `user1`～`user5`、`grp1`～`grp5` 及 601～605 的数字身份进行检查。
 原评测脚本对测试目录中的可执行文件直接无参调用；两架构原根盘均没有
 `/etc/passwd` 和 `/etc/group`。因此另建有效消费者时，需要同时提供目标文件、
@@ -39,7 +40,7 @@ libc，没有 libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序
 完整源码打印自己的 `ACL TESTS RESULTS`，而原 judge 读取 LTP `Summary:`，
 两者的结果格式也需要分别解释。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/nfsv4/acl/acl1.c)
 
-### LA glibc setxattr01：clone3 的 CLONE_CLEAR_SIGHAND 缺口
+### LA glibc setxattr01：clone3 的 CLONE_CLEAR_SIGHAND 缺口（已修复）
 
 本次原程序在准备阶段报告 `mkfs.ext4 does not exist` 并以 TCONF 退出。
 该 LTP 版本通过 `system("mkfs.ext4 >/dev/null 2>&1")` 的退出状态 127 得出这一提示；
@@ -49,9 +50,13 @@ libc，没有 libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序
 
 原 LA glibc 的 `posix_spawn` 反汇编显示，它以
 `CLONE_CLEAR_SIGHAND|CLONE_VM|CLONE_VFORK` 调用 `clone3`；该组合的直接 syscall
-同样返回 `EOPNOTSUPP`（95）。当前 [clone 解码](../../kernel/syscall/process.c)没有
-接纳 `CLONE_CLEAR_SIGHAND`，而这版 glibc 仅在 `EINVAL` 或 `ENOSYS` 时尝试旧入口。
-所以这是进程接口缺口，并非格式化工具缺失或 ACL 测例失败；该能力安排后续补齐。
+同样返回 `EOPNOTSUPP`（95）。当时的内核没有接纳 `CLONE_CLEAR_SIGHAND`，
+而这版 glibc 仅在 `EINVAL` 或 `ENOSYS` 时尝试旧入口。这是进程接口缺口，
+并非格式化工具缺失或 ACL 测例失败。
+
+内核现已在子进程独立信号表中实现该标志：保留被忽略的信号、重置其他处理动作，
+并清除动作 flags 和 mask。修复后使用原 LA glibc ELF、原工具和原 judge 重跑，
+成功格式化并挂载 scratch，九项全部通过，退出 0，得分 **9/9**，耗时 6.531 秒。
 [固定 LTP 工具探测](https://github.com/linux-test-project/ltp/blob/20240524/lib/tst_supported_fs_types.c)
 
 ### basic/brk：发布 ELF 截断了返回地址
@@ -162,6 +167,7 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 | `pidfd_getfd01` 的 kcmp 比较助手 | 原先`include/lapi/kcmp.h:36`的`kcmp(272)`返回ENOSYS，LTP将程序记为TCONF；六类kcmp已实现。 | 2026-10-25原四配置均已进入主体，`pidfd_getfd01.c:69`通过，原judge各1/1。共享OFD、offset、CLOEXEC、真实内容与REALCREDS权限同时由数字身份短例覆盖；见[本批结果](oscomp-ltp-analysis.md#共享mm锁页与kcmp原程序结果2026-10-25)。 |
 | `kcmp03` 的clone前置能力（已解决） | 四分项依次请求独立CLONE_VM、CLONE_FS、CLONE_IO、CLONE_SYSVSEM。相关clone和KCMP_IO现已接入。 | 原程序在RV／LA、glibc／musl四配置均4/4；此前的2/4、3/4是旧内核结果。I/O优先级状态与块设备服务策略的边界见[调度模块](../modules/kernel-scheduler.md#clone-与-vfork)。 |
 | 自有差分使用的LA musl vfork | 固定musl1.2.5的`src/process/vfork.c`在LA无专属汇编的配置中执行`clone(SIGCHLD,0)`；反汇编为a7=220、a0=17，实际采用独立MM。 | 直接消费者使用独立子栈及显式`CLONE_VM|CLONE_VFORK|SIGCHLD`验证共享关系，固定Linux与BoarOS均10/10；两种libc运行同一源码。线程撤号另等PIDFD_THREAD的HUP再检查ESRCH，覆盖pthread_join完成后TID仍短暂存在的Linux交错。原LTP结果按其实际clone输入另列。 |
+| 自有 LA glibc 备用栈短例 | `pthread_attr_setstack` 检查及两项帧宽度检查在固定 Linux、修复前后 BoarOS 均失败；程序只打印 errno，未打印 pthread 接口直接返回的错误编号。 | 相同输入在固定 Linux 也失败，不作为本次 clone3 回归。LA musl 备用栈短例通过；上述检查的具体原因待独立定位。 |
 | `eventfd01/02` 的Kconfig输入 | 原ELF请求`CONFIG_EVENTFD`，LTP在解析Linux `.config`时TBROK，退出2；当前启动环境没有该配置文件。 | 四配置均未进入主体，原judge为0/0。eventfd接口差分及原eventfd2测例通过；逐程序得分/耗时见[eventfd与timerfd结果](data-path-budget-experiments.md#eventfd与timerfd2026-10-22)。 |
 | `futex_waitv01/02/03` 的内核版本检查 | 四配置均在 `tst_test.c:913` 因要求Linux版本至少5.16而TCONF、退出32；BoarOS的uname release是`0.1.0-boaros-dev`。 | waitv入口已实现，但这批原程序未调用它，原judge各0/0、0分。保留原ELF、参数和版本身份；直接同ELF检查覆盖实际入口、队列、超时及退出。详见[本批结果](oscomp-ltp-analysis.md#futex多地址等待与pi重排原程序结果2026-10-25)。 |
 | `getdents01` 的四种入口 | 旧 getdents syscall 在两种架构上无入口，部分 libc 也没有导出相应 wrapper；这些分项记 TCONF。 | 四配置共七条 TCONF；有效 getdents64 分项通过。对应分项、得分和时间见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)。 |
