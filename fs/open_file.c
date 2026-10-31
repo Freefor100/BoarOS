@@ -21,6 +21,7 @@
 #include <kernel/task.h>
 #include <kernel/page_cache.h>
 #include <kernel/file_mapping.h>
+#include <kernel/files.h>
 #include <kernel/memory_object.h>
 #include <kernel/tmpfs.h>
 #include <kernel/socket.h>
@@ -31,6 +32,59 @@
 
 static int open_file_live(
     const struct kernel_open_file_description *file);
+
+struct fallocate_call {
+    const struct kernel_credentials *credentials;
+    struct kernel_vfs_file *file;
+    const struct kernel_lock_guard *operation;
+    struct kernel_vfs_size_limit *size_limit;
+    uint64_t offset, length;
+    unsigned mode;
+    int result;
+};
+static void fallocate_cpu0(void *argument)
+{
+    struct fallocate_call *call=argument;
+    const struct kernel_credentials *previous=kernel_credentials_override(call->credentials);
+    call->result=kernel_vfs_fallocate_borrowing(call->file,call->mode,
+        call->offset,call->length,call->operation,call->size_limit);
+    (void)kernel_credentials_override(previous);
+}
+
+int kernel_open_file_fallocate(struct kernel_open_file_description *file,
+    unsigned mode,int64_t offset,int64_t length,struct kernel_vfs_size_limit *limit)
+{
+    if (!open_file_live(file)) return -KERNEL_EBADF;
+    if (offset<0 || length<=0) return -KERNEL_EINVAL;
+    if (mode!=0 && mode!=KERNEL_VFS_FALLOC_KEEP_SIZE &&
+        mode!=(KERNEL_VFS_FALLOC_KEEP_SIZE|KERNEL_VFS_FALLOC_PUNCH_HOLE))
+        return -KERNEL_EOPNOTSUPP;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_PATH || !(file->open_flags&3U)) return -KERNEL_EBADF;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_PIPE) return -KERNEL_ESPIPE;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY) return -KERNEL_EISDIR;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_BLOCK) return -KERNEL_EOPNOTSUPP;
+    if (file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_ENODEV;
+    if (length>INT64_MAX-offset) return -KERNEL_EFBIG;
+    int result;
+    if (kernel_vfs_file_metadata_requires_cpu0(&file->file)) {
+        struct kernel_io_context *io=kernel_io_context_current();
+        if (io->locks || io->user_pins || io->cache_writes || kernel_cpu_current()->raw_locks ||
+            !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) __builtin_trap();
+        KERNEL_LOCK_SCOPE(operation);
+        kernel_vfs_file_write_lock(&file->file,&operation);
+        struct fallocate_call call={.credentials=kernel_credentials_current(),.file=&file->file,
+            .operation=&operation,.offset=(uint64_t)offset,.length=(uint64_t)length,
+            .mode=mode,.result=-KERNEL_EIO,.size_limit=limit};
+        if (kernel_page_cache_run_cpu0_borrowing(kernel_open_file_page_cache(file),
+            fallocate_cpu0,&call,&operation)) __builtin_trap();
+        result=call.result;
+    } else result=kernel_vfs_fallocate_borrowing(&file->file,mode,(uint64_t)offset,
+        (uint64_t)length,NULL,limit);
+    /* 同步写的持久目标在归还写操作资格后等待，MM来源借用仍保活OFD。 */
+    if (!result && (file->open_flags&KERNEL_FILES_O_DSYNC))
+        result=kernel_vfs_sync(&file->file,0,&file->observed_writeback_error);
+    return result;
+}
 
 static void reset_read_prediction(struct kernel_open_file_description *file)
 {

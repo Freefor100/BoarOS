@@ -8,6 +8,11 @@
 
 struct kernel_heap;
 struct kernel_open_file_description;
+struct kernel_vfs_size_limit;
+/* The caller retains the OFD and enters without MM/user-page qualifications.
+ * Mapping advice and FD range operations share authorization and handoff. */
+int kernel_open_file_fallocate(struct kernel_open_file_description *, unsigned,
+    int64_t offset, int64_t length, struct kernel_vfs_size_limit *);
 uint32_t kernel_open_file_references(const struct kernel_open_file_description *);
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
