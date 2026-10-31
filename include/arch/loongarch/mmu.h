@@ -92,6 +92,8 @@ enum arch_mmu_status arch_mmu_user_cow_commit(
     struct kernel_mm_retirement *);
 enum arch_mmu_status arch_mmu_user_next_owned(
     struct arch_mmu_user_space *, uint64_t *, uint64_t end, uint64_t *);
+enum arch_mmu_status arch_mmu_user_owned_snapshot(
+    struct arch_mmu_user_space *, uint64_t, uint64_t *, int *);
 enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *, uint64_t);
 enum arch_mmu_status arch_mmu_user_space_fork_prepare(
     struct arch_mmu_user_space *, struct arch_mmu_user_space *,

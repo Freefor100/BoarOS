@@ -196,6 +196,8 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit(
     struct kernel_mm_retirement *);
 enum riscv_sv39_status riscv_sv39_user_next_owned(
     struct riscv_sv39_user_space *, uint64_t *, uint64_t end, uint64_t *);
+enum riscv_sv39_status riscv_sv39_user_owned_snapshot(
+    struct riscv_sv39_user_space *, uint64_t, uint64_t *, int *);
 enum riscv_sv39_status riscv_sv39_user_mark_cow_page(
     struct riscv_sv39_user_space *, uint64_t);
 enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(

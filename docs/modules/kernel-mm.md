@@ -21,9 +21,13 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 ## madvise 与共享段锁定
 
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
 
-DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。当前 VDSO 缺少特殊缺页重装路径，DONTNEED 对它返回 EINVAL；Linux VDSO 可重装，这一差异保留为缺口。
+DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中。vDSO 保留特殊映射身份，缺页从内核中的架构信号返回代码重新装入，并完成指令缓存与 TLB 同步。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
+
+FREE 作用于私有匿名页及纯 BSS 零后备，登记时保留原内容；共享或文件后备及锁定范围返回 EINVAL。登记先排空已有写 pin，把当前页标记为写时故障，完成 TLB 确认后才接入回收。之后用户写或内核向用户页写成功时撤销该页候选，原有 COW 用实际引用处理 fork 后的独立写；fork 为继承页面复制回收候选，mremap 随页表叶移动候选，unmap 和退出归还登记。候选页和 PROT_NONE 页都保留真实 PTE owner。
+
+物理分配失败时，回收器遍历登记了候选的 MM，以非阻塞方式取得各自修改资格；遇到 pin、锁页或忙碌 MM 则让出。一次取得进展后最多撤除同一 MM 的 16 个映射，下一轮从下一个 MM 继续；同一 MM 中大量暂不可回收的候选仍会在一次扫描内逐个检查。撤 PTE 后等待所有活动 CPU 确认失效，再归还物理引用：共享页的映射撤除与最后一份物理页归还分开计数，前者只表示继续扫描有进展。每个 MM 按实际候选数量扩展哈希索引；最后候选退休时归还索引并摘出扫描链，已有扫描借用仍持续到真实结束。最后 MM owner 在销毁页表前排空扫描借用。候选按实际驻留页分配元数据，分配失败返回 ENOMEM；已处理的前缀保留。
 
 REMOVE 删除范围的共享后备数据，保留 VMA 和文件长度。锁定范围返回 EINVAL；私有匿名或无文件后备的范围返回 EINVAL；私有文件（含 ELF 文件范围）或最大权限不含写的共享映射返回 EACCES，纯 BSS 零后备按匿名范围处理。最大权限沿用 mmap/shmat 时的来源许可，随后 mprotect 降为只读仍可删除。文件来源借用固定原 OFD 和文件偏移，释放 MM 资格后复用普通 fallocate 的 PUNCH_HOLE|KEEP_SIZE 路径；只读挂载、后端不支持或 I/O 失败返回实际错误。文件失效回调撤销同 inode 在各 MM 中的共享页和未写私有页，保留独立私有 COW。tmpfs 释放完整后备页及配额，非整页打洞只清除保留页的边缘字节；ext4 沿原磁盘事务、缓存失效与写回协议。
 

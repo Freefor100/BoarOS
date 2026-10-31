@@ -1599,6 +1599,20 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
     *cursor = end;
     return RISCV_SV39_STATUS_NOT_MAPPED;
 }
+enum riscv_sv39_status riscv_sv39_user_owned_snapshot(struct riscv_sv39_user_space *s,
+    uint64_t address,uint64_t *physical,int *cow)
+{
+    if (!s || !physical || !cow || (address & BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
+    uint64_t *leaf;
+    enum riscv_sv39_status status=resolve_existing_user_leaf(s,address,&leaf,0);
+    if (status) return status;
+    uint64_t entry=*leaf;
+    if (!valid_user_leaf_entry(entry) && !valid_protected_entry(entry)) return RISCV_SV39_STATUS_STATE;
+    *physical=entry_address(entry);
+    *cow=present_cow_entry(entry)||protected_cow_entry(entry);
+    return RISCV_SV39_STATUS_OK;
+}
+
 enum riscv_sv39_status riscv_sv39_user_mark_cow_page(struct riscv_sv39_user_space *s, uint64_t address)
 {
     uint64_t *leaf;

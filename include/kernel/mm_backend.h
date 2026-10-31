@@ -21,6 +21,8 @@ struct kernel_mm_concurrency_state {
     uint32_t record_bytes, pin_bytes;
     uint64_t generation, pin_acquisitions, prepared_pages, fault_retries;
     uint64_t retirement_batches, retired_pages, pin_waits;
+    uint64_t lazy_pages, lazy_index_bytes;
+    uint32_t lazy_registered, lazy_borrows;
 };
 /* 持LIVE MM owner的值快照，不能在调度锁内调用；不新增引用。 */
 void kernel_mm_get_concurrency_state(const struct kernel_mm *, struct kernel_mm_concurrency_state *);

@@ -53,6 +53,8 @@ struct physical_page_range {
 struct physical_page_allocator {
     struct kernel_raw_lock lock;
     struct physical_page_reclaim_hooks reclaim_hooks;
+    /* Optional anonymous-page reclaim, installed when MADV_FREE first has work. */
+    uint64_t (*lazy_reclaim)(struct physical_page_allocator *, uint64_t, uint64_t *);
     uint64_t shared_anon_pages;
     uint64_t (*buffer_bytes)(void *);
     void *buffer_context;

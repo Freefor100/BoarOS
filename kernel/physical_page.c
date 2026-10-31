@@ -355,6 +355,7 @@ enum physical_page_status physical_page_allocator_init(
 
     kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_PAGE);
     result.reclaim_hooks = (struct physical_page_reclaim_hooks){0};
+    result.lazy_reclaim = 0;
     result.shared_anon_pages = 0;
     result.buffer_bytes = 0;
     result.buffer_context = 0;
@@ -1276,7 +1277,10 @@ enum physical_page_status physical_page_allocate_order(
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address,&hooks);
     if (hooks.notify) hooks.notify(hooks.context);
-    if (status == PHYSICAL_PAGE_STATUS_EMPTY && hooks.reclaim) {
+    if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
+        uint64_t (*lazy_reclaim)(struct physical_page_allocator *,uint64_t,uint64_t *)=
+            __atomic_load_n(&allocator->lazy_reclaim,__ATOMIC_ACQUIRE);
+        if (!hooks.reclaim && !lazy_reclaim) goto reclaim_done;
         uint32_t *depth = hooks.depth ? hooks.depth() : &allocator->reclaiming;
         int entered;
         if (hooks.depth) { entered = !*depth; if (entered) *depth = 1; }
@@ -1286,13 +1290,16 @@ enum physical_page_status physical_page_allocate_order(
                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         }
         if (entered) {
-            uint64_t released;
+            uint64_t released,detached;
             do {
-                released=hooks.reclaim(hooks.context,order_page_count(order));
+                detached=0;
+                released=lazy_reclaim ? lazy_reclaim(allocator,order_page_count(order),&detached) : 0;
+                if (released<order_page_count(order) && hooks.reclaim)
+                    released+=hooks.reclaim(hooks.context,order_page_count(order)-released);
                 status=physical_page_allocate_order_once(allocator,order,address,NULL);
                 /* LRU归还的页不保证物理相邻；有实际进展就继续尝试所需
                  * order，不能用空闲页总数代替连续块是否已经形成。 */
-            } while (status==PHYSICAL_PAGE_STATUS_EMPTY && released);
+            } while (status==PHYSICAL_PAGE_STATUS_EMPTY && (released || detached));
             if (hooks.depth) *depth = 0;
             else __atomic_store_n(depth, 0, __ATOMIC_RELEASE);
             if (status==PHYSICAL_PAGE_STATUS_EMPTY &&
@@ -1302,6 +1309,7 @@ enum physical_page_status physical_page_allocate_order(
             }
         }
     }
+reclaim_done:
     reclaim_hooks_release(&hooks);
 
     if (status == PHYSICAL_PAGE_STATUS_OK) {

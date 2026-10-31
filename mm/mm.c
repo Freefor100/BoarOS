@@ -18,6 +18,7 @@
 #include <kernel/vma.h>
 #include <kernel/vfs.h>
 #include <kernel/tmpfs.h>
+#include <arch/elf.h>
 #include "../fs/vfs_internal.h"
 
 #include <stddef.h>
@@ -95,6 +96,17 @@ struct kernel_mm_elf_source {
     int draining;
 };
 
+struct mm_lazy_page {
+    struct mm_lazy_page *next, **previous, *hash_next;
+    uint64_t address, physical;
+};
+
+static struct kernel_raw_lock lazy_registry_lock = {
+    .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED,
+};
+static struct kernel_mm_record *lazy_registry;
+static unsigned lazy_registry_count;
+
 struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
@@ -138,6 +150,11 @@ struct kernel_mm_record {
     _Atomic(struct kernel_mm_elf_source *) retired_elf_sources;
     struct kernel_open_file_description *executable_file;
     uint32_t future_lock_flags;
+    struct mm_lazy_page *lazy_pages, *lazy_retired, **lazy_buckets;
+    size_t lazy_capacity, lazy_count;
+    struct kernel_mm_record *lazy_next, *lazy_previous;
+    struct kernel_wait_queue lazy_drained;
+    uint32_t lazy_borrows, lazy_registered;
 };
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
@@ -163,6 +180,137 @@ static void register_shared_anon(struct kernel_mm_shared_anon *entry,struct kern
 
 _Static_assert(sizeof(struct kernel_mm_record) <= BOAROS_PAGE_SIZE,
                "RISC-V MM record must fit in one physical page");
+
+static size_t resident_bucket(uint64_t address,size_t capacity);
+
+/* The caller holds exclusive MM qualification (or constructs an unpublished
+ * child), so other users cannot follow hash links while they are rebuilt. */
+static enum kernel_heap_status lazy_reserve(struct kernel_mm_record *record,size_t needed)
+{
+    if (needed<=record->lazy_capacity) return KERNEL_HEAP_STATUS_OK;
+    size_t capacity=record->lazy_capacity?record->lazy_capacity:16;
+    while (capacity<needed) {
+        if (capacity>SIZE_MAX/2) return KERNEL_HEAP_STATUS_EMPTY;
+        capacity*=2;
+    }
+    struct mm_lazy_page **buckets;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(record->vma_heap,capacity,
+        sizeof(*buckets),(void **)&buckets);
+    if (status) return status;
+    for (struct mm_lazy_page *page=record->lazy_pages;page;page=page->next) {
+        size_t bucket=resident_bucket(page->address,capacity);
+        page->hash_next=buckets[bucket];buckets[bucket]=page;
+    }
+    struct mm_lazy_page **old;
+    {
+        KERNEL_RAW_SCOPE(guard,&record->metadata);
+        old=record->lazy_buckets;record->lazy_buckets=buckets;record->lazy_capacity=capacity;
+    }
+    if (old) kernel_heap_release(record->vma_heap,old);
+    return KERNEL_HEAP_STATUS_OK;
+}
+
+static void lazy_remove_registration_locked(struct kernel_mm_record *record)
+{
+    if (!record->lazy_registered) return;
+    if (!lazy_registry_count--) __builtin_trap();
+    if (record->lazy_next==record) lazy_registry=NULL;
+    else {
+        record->lazy_next->lazy_previous=record->lazy_previous;
+        record->lazy_previous->lazy_next=record->lazy_next;
+        if (lazy_registry==record) lazy_registry=record->lazy_next;
+    }
+    record->lazy_next=record->lazy_previous=NULL;
+    record->lazy_registered=0;
+}
+
+/* Callers hold the MM raw lock; retiring never frees under that lock. */
+static struct mm_lazy_page *lazy_find(struct kernel_mm_record *record, uint64_t address)
+{
+    if (!record->lazy_capacity) return NULL;
+    for (struct mm_lazy_page *page=record->lazy_buckets[resident_bucket(address,record->lazy_capacity)]; page; page=page->hash_next)
+        if (page->address==address) return page;
+    return NULL;
+}
+static void lazy_insert(struct kernel_mm_record *record,struct mm_lazy_page *page)
+{
+    if (record->lazy_count>=record->lazy_capacity || lazy_find(record,page->address)) __builtin_trap();
+    size_t bucket=resident_bucket(page->address,record->lazy_capacity);
+    page->hash_next=record->lazy_buckets[bucket];record->lazy_buckets[bucket]=page;
+    page->next=record->lazy_pages;page->previous=&record->lazy_pages;
+    if (page->next) page->next->previous=&page->next;
+    record->lazy_pages=page;record->lazy_count++;
+}
+static void lazy_retire(struct kernel_mm_record *record, struct mm_lazy_page *page)
+{
+    struct mm_lazy_page **link=&record->lazy_buckets[resident_bucket(page->address,record->lazy_capacity)];
+    while (*link && *link!=page) link=&(*link)->hash_next;
+    if (!*link || !page->previous) __builtin_trap();
+    *link=page->hash_next;
+    *page->previous=page->next;
+    if (page->next) page->next->previous=page->previous;
+    page->next=record->lazy_retired;
+    record->lazy_retired=page;
+    if (!record->lazy_count--) __builtin_trap();
+    if (!record->lazy_count) {
+        KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+        lazy_remove_registration_locked(record);
+    }
+}
+static void lazy_drain(struct kernel_mm_record *record)
+{
+    struct mm_lazy_page *pages,**buckets=NULL;
+    {
+        KERNEL_RAW_SCOPE(guard,&record->metadata);
+        pages=record->lazy_retired;
+        record->lazy_retired=NULL;
+        if (!record->lazy_count) {
+            buckets=record->lazy_buckets;record->lazy_buckets=NULL;record->lazy_capacity=0;
+        }
+    }
+    while (pages) {
+        struct mm_lazy_page *page=pages;
+        pages=page->next;
+        kernel_heap_release(record->vma_heap,page);
+    }
+    if (buckets) kernel_heap_release(record->vma_heap,buckets);
+}
+
+/* The registry borrows records only while a scan is in progress. Exit removes
+ * the record first, then drains these borrows before tearing down its MM. */
+static void lazy_register(struct kernel_mm_record *record)
+{
+    __atomic_store_n(&record->space.allocator->lazy_reclaim,kernel_mm_reclaim_lazy,__ATOMIC_RELEASE);
+    KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+    if (record->lazy_registered) return;
+    if (!lazy_registry) {
+        lazy_registry=record;
+        record->lazy_next=record->lazy_previous=record;
+    } else {
+        record->lazy_next=lazy_registry;
+        record->lazy_previous=lazy_registry->lazy_previous;
+        record->lazy_previous->lazy_next=record;
+        lazy_registry->lazy_previous=record;
+    }
+    record->lazy_registered=1;
+    if (++lazy_registry_count==0) __builtin_trap();
+}
+static void lazy_unregister(struct kernel_mm_record *record)
+{
+    for (;;) {
+        struct kernel_wait_token token={0};
+        {
+            KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+            lazy_remove_registration_locked(record);
+            if (!record->lazy_borrows) return;
+            if (kernel_wait_prepare(&record->lazy_drained,0,0,&token)!=KERNEL_SCHEDULER_STATUS_OK)
+                __builtin_trap();
+        }
+        enum kernel_wait_wake_reason reason;
+        if (kernel_wait_park(&token,&reason)!=KERNEL_SCHEDULER_STATUS_OK ||
+            kernel_wait_finish(&token)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
+}
 
 static int empty_handle(const struct kernel_mm *mm)
 {
@@ -275,6 +423,7 @@ enum kernel_mm_status kernel_mm_create(
     kernel_raw_lock_init(&record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&record->operations, 25, (uintptr_t)record);
     kernel_wait_queue_init(&record->pins_changed);
+    kernel_wait_queue_init(&record->lazy_drained);
     record->stage = KERNEL_MM_RECORD_LIVE;
     if (arch_mmu_user_space_move(&record->space, space) !=
         ARCH_MMU_STATUS_OK) {
@@ -1208,6 +1357,7 @@ static enum kernel_mm_status mm_fork_impl(
     kernel_raw_lock_init(&destination_record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&destination_record->operations, 25, (uintptr_t)destination_record);
     kernel_wait_queue_init(&destination_record->pins_changed);
+    kernel_wait_queue_init(&destination_record->lazy_drained);
     destination_record->stage = KERNEL_MM_RECORD_LIVE;
     destination_record->vma_heap = source_record->vma_heap;
 
@@ -1294,6 +1444,17 @@ static enum kernel_mm_status mm_fork_impl(
         copy->cache_retry_registered=0; copy->cache_retry_next=0;
         { KERNEL_RAW_SCOPE(guard, &destination_record->metadata);
           publish_file_resident(destination_record, copy); }
+    }
+    for (struct mm_lazy_page *page=source_record->lazy_pages;
+         page && status==KERNEL_MM_STATUS_OK;page=page->next) {
+        if (source_record->vmas && fork_leaf_action(source_record->vmas,page->address)==ARCH_MMU_FORK_SKIP)
+            continue;
+        struct mm_lazy_page *copy;
+        enum kernel_heap_status hs=lazy_reserve(destination_record,destination_record->lazy_count+1);
+        if (!hs) hs=kernel_heap_allocate_zeroed(destination_record->vma_heap,1,sizeof(*copy),(void **)&copy);
+        if (hs) { status=hs==KERNEL_HEAP_STATUS_EMPTY?KERNEL_MM_STATUS_NO_MEMORY:KERNEL_MM_STATUS_STATE;break; }
+        copy->address=page->address;copy->physical=page->physical;
+        lazy_insert(destination_record,copy);
     }
     if (status == KERNEL_MM_STATUS_OK)
         status = clone_elf_sources(source_record, destination_record);
@@ -1400,6 +1561,7 @@ static enum kernel_mm_status mm_fork_impl(
         destination->record_page_address = record_page_address;
         destination->state = KERNEL_MM_LIVE;
         destination->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
+        if (destination_record->lazy_pages) lazy_register(destination_record);
         return KERNEL_MM_STATUS_OK;
     }
 
@@ -2361,10 +2523,17 @@ static enum kernel_mm_status mutable_vma_record(
 struct mm_unmap_residents {
     struct kernel_mm_record *record;
     struct mm_file_resident *removed;
+    int lazy_removed;
 };
 static void unmap_resident_before_pte(void *owner,uint64_t address,uint64_t physical)
 {
     struct mm_unmap_residents *residents=owner;
+    struct mm_lazy_page *lazy=lazy_find(residents->record,address);
+    if (lazy) {
+        if (lazy->physical!=physical) __builtin_trap();
+        lazy_retire(residents->record,lazy);
+        residents->lazy_removed=1;
+    }
     struct mm_file_resident *page=find_file_resident(residents->record,address);
     if (!page) return;
     if (page->physical_address!=physical) __builtin_trap();
@@ -2391,6 +2560,7 @@ static enum kernel_mm_status unmap_space_range(
         }
         if (batch.count) finish_tlb_change(record,&batch,targets,
             batch.nonleaf?0:start,batch.nonleaf?UINT64_MAX:end-start,0);
+        if (residents.lazy_removed) lazy_drain(record);
         while (residents.removed) {
             struct mm_file_resident *page=residents.removed;
             residents.removed=page->next;
@@ -2398,6 +2568,76 @@ static enum kernel_mm_status unmap_space_range(
         }
     } while (status==ARCH_MMU_STATUS_OK);
     return KERNEL_MM_STATUS_OK;
+}
+
+uint64_t kernel_mm_reclaim_lazy(struct physical_page_allocator *allocator,uint64_t target,
+                               uint64_t *mappings_detached)
+{
+    enum { LAZY_RECLAIM_BATCH = 16 };
+    *mappings_detached=0;
+    struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+    if (!target || (held && held->lock->rank>=25)) return 0;
+    unsigned remaining;
+    { KERNEL_RAW_SCOPE(guard,&lazy_registry_lock); remaining=lazy_registry_count; }
+    uint64_t released=0;
+    /* One progressing MM per call: its borrowed candidates cannot hold the
+     * operation qualification across an unbounded shared-page range. */
+    while (remaining-- && released<target && !*mappings_detached) {
+        struct kernel_mm_record *record;
+        {
+            KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+            record=lazy_registry;
+            if (!record) break;
+            lazy_registry=record->lazy_next;
+            if (record->lazy_borrows==UINT32_MAX) __builtin_trap();
+            record->lazy_borrows++;
+        }
+        KERNEL_LOCK_SCOPE(gate);
+        if (record->space.allocator==allocator && kernel_rwlock_try_write(&record->operations,&gate)) {
+            int closed=0;
+            {
+                KERNEL_RAW_SCOPE(guard,&record->metadata);
+                if (record->stage==KERNEL_MM_RECORD_LIVE && !record->access_closed && !record->access_pins) {
+                    record->access_closed=1;
+                    closed=1;
+                }
+            }
+            if (closed) {
+                struct mm_lazy_page *page=record->lazy_pages;
+                while (page && released<target && *mappings_detached<LAZY_RECLAIM_BATCH) {
+                    struct mm_lazy_page *next=page->next;
+                    struct kernel_vma vma;
+                    uint64_t physical;uint32_t refs;int cow;
+                    if (!kernel_vma_set_lookup(record->vmas,page->address,&vma) &&
+                        !(vma.flags & KERNEL_VMA_LOCKED) &&
+                        !arch_mmu_user_owned_snapshot(&record->space,page->address,&physical,&cow) &&
+                        cow && physical==page->physical &&
+                        !physical_page_reference_count(allocator,physical,&refs)) {
+                        if (unmap_space_range(record,page->address,page->address+BOAROS_PAGE_SIZE)) __builtin_trap();
+                        (*mappings_detached)++;
+                        /* With the sole mapping closed to new pins and forks,
+                         * its last reference is returned after TLB completion.
+                         * A shared PTE removal is progress, not a free page. */
+                        if (refs==1) released++;
+                    }
+                    page=next;
+                }
+                { KERNEL_RAW_SCOPE(guard,&record->metadata); record->access_closed=0; }
+            }
+            mm_gate_release(record,&gate);
+            if (closed) wake_pin_waiters(record);
+        }
+        {
+            KERNEL_RAW_SCOPE(guard,&lazy_registry_lock);
+            if (!record->lazy_borrows) __builtin_trap();
+            if (!--record->lazy_borrows && !record->lazy_registered) {
+                enum kernel_scheduler_status status=kernel_wait_queue_wake_all(&record->lazy_drained);
+                if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
+                    __builtin_trap();
+            }
+        }
+    }
+    return released;
 }
 
 /* 调用者拥有资源限制；MM只拥有用量。检查和提交都在同一个操作锁内。 */
@@ -3506,6 +3746,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
             }
         }
         if (!references) __builtin_trap();
+        lazy_unregister(record);
         KERNEL_LOCK_SCOPE(retire);
         kernel_rwlock_write(&record->operations,&retire);
         if (record->access_pins || record->write_pins || record->active_cpus ||
@@ -3542,6 +3783,11 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
     }
 
     if (record->stage == KERNEL_MM_RECORD_VMAS_CLEANUP) {
+        {
+            KERNEL_RAW_SCOPE(guard,&record->metadata);
+            while (record->lazy_pages) lazy_retire(record,record->lazy_pages);
+        }
+        lazy_drain(record);
         drain_file_registrations(record, 0);
         forget_file_residents(record);
         struct mm_file_resident *retired=record->retired_file_residents;
@@ -3642,7 +3888,10 @@ void kernel_mm_get_concurrency_state(const struct kernel_mm *mm,
         .prepared_pages = record->prepared_pages, .fault_retries = record->fault_retries,
         .retirement_batches = record->retirement_batches, .retired_pages = record->retired_pages,
         .pin_waits = record->pin_waits,
+        .lazy_pages = record->lazy_count, .lazy_index_bytes = record->lazy_capacity*sizeof(*record->lazy_buckets),
     };
+    { KERNEL_RAW_SCOPE(registry,&lazy_registry_lock);
+      state->lazy_registered=record->lazy_registered;state->lazy_borrows=record->lazy_borrows; }
 }
 
 /* 入口均在已有MM owner下借用record；句柄不能被另一执行者并发move/release。 */
@@ -3982,6 +4231,17 @@ static void move_remap_leaves(struct kernel_mm_record *record,
         if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
         if (status || arch_mmu_user_move_leaf(&record->space, address, to + address - from))
             __builtin_trap();
+        struct mm_lazy_page *lazy=lazy_find(record,address);
+        if (lazy) {
+            struct mm_lazy_page **link=&record->lazy_buckets[resident_bucket(address,record->lazy_capacity)];
+            while (*link && *link!=lazy) link=&(*link)->hash_next;
+            if (!*link) __builtin_trap();
+            *link=lazy->hash_next;
+            lazy->address=to+address-from;
+            size_t bucket=resident_bucket(lazy->address,record->lazy_capacity);
+            lazy->hash_next=record->lazy_buckets[bucket];
+            record->lazy_buckets[bucket]=lazy;
+        }
         struct mm_file_resident *page = find_file_resident(record, address);
         if (page) {
             unindex_file_resident(record, page);
@@ -4546,8 +4806,11 @@ lookup:
                 if (arch_mmu_user_cow_commit(&record->space, address, cookie, KERNEL_MM_NO_PAGE,
                     backend_permissions_from_mm(vma.permissions), &batch) != ARCH_MMU_STATUS_OK)
                     __builtin_trap();
+                struct mm_lazy_page *lazy=lazy_find(record,address);
+                if (lazy) lazy_retire(record,lazy);
                 targets = note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
                 kernel_raw_lock_release(&guard);
+                if (lazy) lazy_drain(record);
                 finish_tlb_change(record, &batch, targets, address, BOAROS_PAGE_SIZE,
                     (vma.permissions & KERNEL_MM_EXECUTE) != 0);
                 return KERNEL_MM_STATUS_OK;
@@ -4559,7 +4822,8 @@ lookup:
                 return KERNEL_MM_STATUS_PAGE_ACCESS;
             }
         } else if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
-            if (!shared && !elf && vma.fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO) return status;
+            if (!shared && !elf && vma.role != KERNEL_VMA_ROLE_VDSO &&
+                vma.fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO) return status;
             if (arch_mmu_user_leaf_missing(&record->space, address, &missing) != ARCH_MMU_STATUS_OK)
                 return KERNEL_MM_STATUS_ADDRESS_SPACE;
         } else return status;
@@ -4620,7 +4884,14 @@ lookup:
             MM_DIAGNOSTIC(prepared_count++);
             if (cookie) {
                 memcpy(new_pointer, old_pointer, BOAROS_PAGE_SIZE);
-            } else clear_page(new_pointer);
+            } else {
+                clear_page(new_pointer);
+                if (vma.role == KERNEL_VMA_ROLE_VDSO) {
+                    size_t size = (size_t)(arch_elf_trampoline_end - arch_elf_trampoline_start);
+                    if (size > BOAROS_PAGE_SIZE) __builtin_trap();
+                    memcpy(new_pointer, arch_elf_trampoline_start, size);
+                }
+            }
         }
     }
 prepare_memory_tables:
@@ -4638,7 +4909,7 @@ prepare_memory_tables:
 #if BOAROS_COST_DIAGNOSTICS
     { KERNEL_RAW_SCOPE(guard, &record->metadata); record->prepared_pages += prepared_count; prepared_count=0; }
 #endif
-    int refill = 0;
+    int refill = 0, lazy_retired = 0;
     if (status == KERNEL_MM_STATUS_OK) {
         struct kernel_mm_mapping current;
         KERNEL_RAW_SCOPE(guard, &record->metadata);
@@ -4672,11 +4943,16 @@ prepare_memory_tables:
                 backend == ARCH_MMU_STATUS_CONFLICT || backend == ARCH_MMU_STATUS_NOT_MAPPED ?
                 KERNEL_MM_STATUS_CONFLICT : KERNEL_MM_STATUS_ADDRESS_SPACE;
             if (status == KERNEL_MM_STATUS_OK) {
+                if (cookie) {
+                    struct mm_lazy_page *lazy=lazy_find(record,address);
+                    if (lazy) { lazy_retire(record,lazy);lazy_retired=1; }
+                }
                 replacement = KERNEL_MM_NO_PAGE;
                 targets = note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
             }
         }
     }
+    if (lazy_retired) lazy_drain(record);
 memory_tables_changed:
     if (refill) {
         mm_operation_release(operation);
@@ -5238,11 +5514,67 @@ static int advise_remove(struct mm_operation *operation,const struct kernel_vma 
     return error;
 }
 
+static int advise_free(struct mm_operation *operation,const struct kernel_vma *vma,
+    uint64_t address,uint64_t *end)
+{
+    struct kernel_mm_record *record=operation->record;
+    if ((vma->flags & KERNEL_VMA_LOCKED) || vma->role==KERNEL_VMA_ROLE_VDSO)
+        return -KERNEL_EINVAL;
+    if (vma->kind==KERNEL_VMA_KIND_ELF_PRIVATE) {
+        struct kernel_elf64_source *source=vma->backing;
+        uint64_t offset=vma->backing_offset+address-vma->start;
+        const struct kernel_elf64_source_run *run=NULL;
+        for (uint32_t i=0;i<kernel_elf64_source_run_count(source);i++) {
+            const struct kernel_elf64_source_run *candidate=kernel_elf64_source_run_at(source,i);
+            if (candidate->start<=offset && offset<candidate->end) { run=candidate;break; }
+        }
+        if (!run) __builtin_trap();
+        if (run->kind!=KERNEL_ELF64_SOURCE_RUN_ZERO) return -KERNEL_EINVAL;
+        uint64_t finish=address+run->end-offset;
+        if (*end>finish) *end=finish;
+    } else if (vma->kind!=KERNEL_VMA_KIND_ANONYMOUS) return -KERNEL_EINVAL;
+    if (!record->access_closed) close_pins(operation,1);
+    uint64_t cursor=address,leaf;
+    enum arch_mmu_status status;
+    int error=0,changed=0;
+    while ((status=arch_mmu_user_next_owned(&record->space,&cursor,*end,&leaf))==ARCH_MMU_STATUS_OK) {
+        struct mm_lazy_page *page=NULL;
+        uint64_t physical;int cow;
+        {
+            KERNEL_RAW_SCOPE(guard,&record->metadata);
+            if (lazy_find(record,leaf)) continue;
+            if (arch_mmu_user_owned_snapshot(&record->space,leaf,&physical,&cow)) __builtin_trap();
+        }
+        enum kernel_heap_status hs=lazy_reserve(record,record->lazy_count+1);
+        if (hs) { error=hs==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EINVAL;break; }
+        hs=kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*page),(void **)&page);
+        if (hs) { error=hs==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EINVAL;break; }
+        {
+            KERNEL_RAW_SCOPE(guard,&record->metadata);
+            /* The exclusive MM operation keeps the page and VMA stable. */
+            if (arch_mmu_user_mark_cow_page(&record->space,leaf)) __builtin_trap();
+            page->address=leaf;page->physical=physical;
+            lazy_insert(record,page);
+            changed=1;
+        }
+    }
+    if (status!=ARCH_MMU_STATUS_NOT_MAPPED && !error) __builtin_trap();
+    if (changed) {
+        struct kernel_mm_retirement batch={0};uint32_t targets;
+        { KERNEL_RAW_SCOPE(guard,&record->metadata); targets=note_tlb_change_locked(record,&batch,0); }
+        finish_tlb_change(record,&batch,targets,address,*end-address,0);
+        lazy_register(record);
+    }
+    /* A bucket table can exist before the first candidate is allocated. */
+    if (error && !record->lazy_count) lazy_drain(record);
+    return error;
+}
+
 int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, int32_t advice)
 {
     int fork_policy = advice == KERNEL_MM_ADVICE_DONTFORK || advice == KERNEL_MM_ADVICE_DOFORK ||
         advice == KERNEL_MM_ADVICE_WIPEONFORK || advice == KERNEL_MM_ADVICE_KEEPONFORK;
-    if ((!fork_policy && advice != KERNEL_MM_ADVICE_REMOVE &&
+    if ((!fork_policy && advice != KERNEL_MM_ADVICE_REMOVE && advice != KERNEL_MM_ADVICE_FREE &&
         (advice < KERNEL_MM_ADVICE_NORMAL || advice > KERNEL_MM_ADVICE_DONTNEED)) ||
         (address & BOAROS_PAGE_MASK) || length > UINT64_MAX - BOAROS_PAGE_MASK) return -KERNEL_EINVAL;
     uint64_t rounded = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
@@ -5267,12 +5599,14 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
         uint64_t finish = vma.end < end ? vma.end : end;
         int error = 0;
         if (advice == KERNEL_MM_ADVICE_DONTNEED) {
-            if ((vma.flags & KERNEL_VMA_LOCKED) || vma.role == KERNEL_VMA_ROLE_VDSO) return -KERNEL_EINVAL;
+            if (vma.flags & KERNEL_VMA_LOCKED) return -KERNEL_EINVAL;
             if (unmap_space_range(record, address, finish)) __builtin_trap();
         } else if (advice == KERNEL_MM_ADVICE_WILLNEED)
             error = advise_file(&operation, &vma, address, &finish, &budget);
         else if (advice == KERNEL_MM_ADVICE_REMOVE)
             error = advise_remove(&operation, &vma, address, finish);
+        else if (advice == KERNEL_MM_ADVICE_FREE)
+            error = advise_free(&operation,&vma,address,&finish);
         else if (fork_policy) error = advise_fork(record, &vma, address, &finish, advice);
         /* NORMAL/RANDOM/SEQUENTIAL are advisory: keep the existing global
          * cache policy, validate the complete mapped range, and store no hint. */
