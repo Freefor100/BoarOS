@@ -3,6 +3,12 @@
 #include <sched.h>
 #include <pthread.h>
 
+/* 宿主无法汇编目标架构指令；ELF 布局测试可用自己的强符号覆盖。 */
+__asm__(".pushsection .rodata\n"
+        ".weak arch_elf_trampoline_start,arch_elf_trampoline_end\n"
+        "arch_elf_trampoline_start:\n.byte 0x73,0,0,0\n"
+        "arch_elf_trampoline_end:\n.popsection\n");
+
 _Thread_local uintptr_t sync_test_irq = 1;
 _Thread_local uint64_t mm_test_context;
 _Thread_local int mm_test_wrong_owner;

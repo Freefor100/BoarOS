@@ -6,11 +6,15 @@
 #include <kernel/vma.h>
 #include <kernel/errno.h>
 #include <assert.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 extern _Thread_local uint64_t mm_test_context;
 void mm_test_attach(unsigned);
-static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
+unsigned mm_test_parked(unsigned);
+static unsigned char pool[64*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
 static struct kernel_mm mm;
@@ -22,13 +26,27 @@ static unsigned limit_reads;
 void kernel_task_current_memory_limits(struct kernel_memory_limits *out) { limit_reads++; *out=limits; }
 void kernel_console_putc(char c) { fputc(c,stderr); }
 void mm_test_unavailable(void) { abort(); }
-void mm_test_fence(uint64_t v,int instructions) { (void)v; (void)instructions; }
+static _Thread_local int pause_reclaim_fence;
+static atomic_int fence_entered,fence_continue,release_done;
+void mm_test_fence(uint64_t v,int instructions)
+{
+    (void)v;(void)instructions;
+    if (pause_reclaim_fence) {
+        atomic_store(&fence_entered,1);
+        while (!atomic_load(&fence_continue)) sched_yield();
+    }
+}
 static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1; }
 #define P BOAROS_PAGE_SIZE
 #define RW (KERNEL_MM_READ|KERNEL_MM_WRITE)
 #define BASE UINT64_C(0x400000)
 static unsigned fail_resize, fail_page, fail_page_after;
+static unsigned fail_heap_zero,fail_heap_zero_after;
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t s,void **out)
+{ return fail_heap_zero || (fail_heap_zero_after && !--fail_heap_zero_after) ?
+    KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_allocate_zeroed(h,n,s,out); }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
 { return fail_page || (fail_page_after && !--fail_page_after) ? PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out); }
@@ -39,6 +57,24 @@ static unsigned checks,failures;
 #define CHECK(x) do { checks++; if (!(x)) { fprintf(stderr,"FAIL %s:%u: %s\n",__FILE__,__LINE__,#x); failures++; } } while(0)
 static enum kernel_mm_status map(uint64_t at,uint64_t len,uint32_t prot,uint32_t flags)
 { uint64_t out=0; return kernel_mm_mmap_anonymous(&mm,at,len,prot,KERNEL_MM_MAP_FIXED|flags,&out); }
+static uint64_t test_detached;
+static uint64_t test_reclaim(uint64_t target)
+{ return kernel_mm_reclaim_lazy(&pages,target,&test_detached); }
+static struct kernel_mm retiring_mm;
+static uint64_t reclaimed_count;
+static enum kernel_mm_status release_result;
+static void *reclaim_actor(void *unused)
+{
+    (void)unused;mm_test_attach(1);pause_reclaim_fence=1;
+    reclaimed_count=test_reclaim(1);
+    return NULL;
+}
+static void *release_actor(void *unused)
+{
+    (void)unused;mm_test_attach(2);
+    release_result=kernel_mm_release(&retiring_mm);
+    atomic_store(&release_done,1);return NULL;
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -71,6 +107,211 @@ int main(void)
     CHECK(!kernel_mm_resolve_user_fault(&removal_child,BASE+P,KERNEL_MM_READ));
     CHECK(!kernel_mm_lookup(&removal_child,BASE+P,&removed)&&!*(unsigned char *)(uintptr_t)removed.physical_address);
     CHECK(!kernel_mm_release(&removal_child)&&!kernel_mm_munmap(&mm,BASE,3*P));
+    /* Lazy pages remain readable, dirty writes cancel eligibility, and the
+     * reclaimer observes pins and mlock before detaching real PTE owners. */
+    assert(!map(BASE,3*P,RW,0));
+    struct kernel_mm_mapping lazy_mapping;
+    for (unsigned i=0;i<3;i++) {
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+        assert(!kernel_mm_lookup(&mm,BASE+i*P,&lazy_mapping));
+        *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=(unsigned char)(30+i);
+    }
+    CHECK(!kernel_mm_madvise(&mm,BASE,3*P,8));
+    struct kernel_mm_concurrency_state lazy_state;
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(lazy_state.lazy_pages==3&&lazy_state.lazy_index_bytes&&lazy_state.lazy_registered);
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==30);
+    struct kernel_mm_user_pin lazy_pin={0};
+    CHECK(!kernel_mm_pin_user_page(&mm,BASE+P,KERNEL_MM_READ,&lazy_pin));
+    CHECK(!test_reclaim(3));
+    kernel_mm_unpin_user_page(&lazy_pin);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping));
+    *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=99;
+    CHECK(!kernel_mm_mlock(&mm,BASE+P,P,1));
+    CHECK(test_reclaim(3)==1);
+    CHECK(kernel_mm_lookup(&mm,BASE+2*P,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==99);
+    CHECK(!kernel_mm_munlock(&mm,BASE+P,P));
+    CHECK(test_reclaim(3)==1);
+    CHECK(kernel_mm_lookup(&mm,BASE+P,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(!lazy_state.lazy_pages&&!lazy_state.lazy_index_bytes&&!lazy_state.lazy_registered);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+P,KERNEL_MM_READ));
+    CHECK(!kernel_mm_lookup(&mm,BASE+P,&lazy_mapping)&&!*(unsigned char *)(uintptr_t)lazy_mapping.physical_address);
+    CHECK(!kernel_mm_munmap(&mm,BASE,3*P));
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    fail_heap_zero=1;CHECK(kernel_mm_madvise(&mm,BASE,P,8)==-KERNEL_ENOMEM);fail_heap_zero=0;
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&(lazy_mapping.permissions & KERNEL_MM_WRITE));
+    CHECK(!test_reclaim(1)&&!kernel_mm_munmap(&mm,BASE,P));
+    /* The first index allocation may succeed while the candidate fails. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    fail_heap_zero_after=2;
+    CHECK(kernel_mm_madvise(&mm,BASE,P,8)==-KERNEL_ENOMEM);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(!lazy_state.lazy_pages&&!lazy_state.lazy_index_bytes&&!lazy_state.lazy_registered);
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&(lazy_mapping.permissions&KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    /* Failure while growing an existing index retains the accepted prefix. */
+    assert(!map(BASE,17*P,RW,0));
+    for (unsigned i=0;i<17;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    fail_heap_zero_after=18;
+    CHECK(kernel_mm_madvise(&mm,BASE,17*P,8)==-KERNEL_ENOMEM);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(lazy_state.lazy_pages==16&&lazy_state.lazy_registered);
+    CHECK(!kernel_mm_lookup(&mm,BASE+16*P,&lazy_mapping)&&(lazy_mapping.permissions&KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,17*P,8));
+    CHECK(test_reclaim(17)==16&&test_detached==16);
+    CHECK(test_reclaim(1)==1&&test_detached==1);
+    CHECK(!kernel_mm_munmap(&mm,BASE,17*P));
+    /* Kernel writes use user-page pins; restoring protection and writes after
+     * fork must not leave the new bytes eligible for later reclaim. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,0)&&!kernel_mm_mprotect(&mm,BASE,P,RW));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_pin_user_page(&mm,BASE,KERNEL_MM_WRITE,&lazy_pin));
+    *(unsigned char *)lazy_pin.page=0x79;kernel_mm_unpin_user_page(&lazy_pin);
+    CHECK(!test_reclaim(1));
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==0x79);
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    struct kernel_mm lazy_child={0};CHECK(!kernel_mm_fork(&lazy_child,&mm));
+    CHECK(!kernel_mm_resolve_user_fault(&lazy_child,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_lookup(&lazy_child,BASE,&lazy_mapping));
+    *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=0x41;
+    CHECK(!kernel_mm_madvise(&lazy_child,BASE,P,8));
+    CHECK(test_reclaim(2)==1&&test_detached==1);
+    CHECK(test_reclaim(2)==1&&test_detached==1);
+    CHECK(kernel_mm_lookup(&mm,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(kernel_mm_lookup(&lazy_child,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_release(&lazy_child)&&!kernel_mm_munmap(&mm,BASE,P));
+    /* FREE before fork must remain reclaimable with both mappings alive. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    struct kernel_mm sharing_child={0};CHECK(!kernel_mm_fork(&sharing_child,&mm));
+    uint64_t before_shared_reclaim=physical_page_available(&pages);
+    CHECK(!test_reclaim(2)&&test_detached==1);
+    CHECK(test_reclaim(2)==1&&test_detached==1);
+    CHECK(kernel_mm_lookup(&mm,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(kernel_mm_lookup(&sharing_child,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(physical_page_available(&pages)>before_shared_reclaim);
+    CHECK(!kernel_mm_release(&sharing_child)&&!kernel_mm_munmap(&mm,BASE,P));
+    /* One-page pressure must not detach a whole shared range while holding
+     * a single MM's write qualification; successive calls rotate owners. */
+    enum { SHARED_BATCH_PAGES=64 };
+    assert(!map(BASE,SHARED_BATCH_PAGES*P,RW,0));
+    for (unsigned i=0;i<SHARED_BATCH_PAGES;i++)
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,SHARED_BATCH_PAGES*P,8));
+    sharing_child=(struct kernel_mm){0};CHECK(!kernel_mm_fork(&sharing_child,&mm));
+    before_shared_reclaim=physical_page_available(&pages);
+    (void)test_reclaim(1);
+    CHECK(test_detached>0&&test_detached<=16);
+    struct kernel_mm_concurrency_state child_state;
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    kernel_mm_get_concurrency_state(&sharing_child,&child_state);
+    CHECK(lazy_state.lazy_pages>=SHARED_BATCH_PAGES-16&&child_state.lazy_pages>=SHARED_BATCH_PAGES-16);
+    CHECK(lazy_state.lazy_pages+child_state.lazy_pages==2*SHARED_BATCH_PAGES-test_detached);
+    for (unsigned round=0;round<16 && (lazy_state.lazy_pages||child_state.lazy_pages);round++) {
+        (void)test_reclaim(SHARED_BATCH_PAGES);
+        CHECK(test_detached>0&&test_detached<=16);
+        kernel_mm_get_concurrency_state(&mm,&lazy_state);
+        kernel_mm_get_concurrency_state(&sharing_child,&child_state);
+    }
+    CHECK(!lazy_state.lazy_pages&&!child_state.lazy_pages);
+    CHECK(physical_page_available(&pages)>before_shared_reclaim);
+    CHECK(!kernel_mm_release(&sharing_child)&&!kernel_mm_munmap(&mm,BASE,SHARED_BATCH_PAGES*P));
+    /* PROT_NONE retains an owned physical page; FREE may reclaim it without
+     * making the mapping accessible or losing its VMA protection. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,0)&&!kernel_mm_madvise(&mm,BASE,P,8));
+    CHECK(test_reclaim(1)==1&&test_detached==1);
+    CHECK(!kernel_mm_mprotect(&mm,BASE,P,RW)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_READ));
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&!*(unsigned char *)(uintptr_t)lazy_mapping.physical_address);
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    /* FREE after fork affects just the caller; a sibling mapping stays intact. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    assert(!kernel_mm_lookup(&mm,BASE,&lazy_mapping));
+    *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=0x37;
+    sharing_child=(struct kernel_mm){0};CHECK(!kernel_mm_fork(&sharing_child,&mm));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    CHECK(!test_reclaim(1)&&test_detached==1);
+    CHECK(kernel_mm_lookup(&mm,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_lookup(&sharing_child,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==0x37);
+    CHECK(!kernel_mm_release(&sharing_child)&&!kernel_mm_munmap(&mm,BASE,P));
+    /* A moved PTE carries the reclaim candidate to its new virtual address. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    uint64_t lazy_moved=0;
+    CHECK(!kernel_mm_mremap(&mm,BASE,P,P,3,BASE+4*P,&lazy_moved)&&lazy_moved==BASE+4*P);
+    CHECK(test_reclaim(1)==1);
+    CHECK(kernel_mm_lookup(&mm,lazy_moved,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,lazy_moved,P));
+    /* The last MM owner waits until a scanner has completed its TLB
+     * confirmation and stopped touching the registered record. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    assert(!kernel_mm_fork(&retiring_mm,&mm));
+    assert(!kernel_mm_resolve_user_fault(&retiring_mm,BASE,KERNEL_MM_WRITE));
+    assert(!kernel_mm_madvise(&retiring_mm,BASE,P,8));
+    assert(!kernel_mm_lookup(&retiring_mm,BASE,&lazy_mapping));
+    uint64_t retiring_physical=lazy_mapping.physical_address;
+    pthread_t reclaim_thread,release_thread;
+    assert(!pthread_create(&reclaim_thread,NULL,reclaim_actor,NULL));
+    while(!atomic_load(&fence_entered)) sched_yield();
+    kernel_mm_get_concurrency_state(&retiring_mm,&lazy_state);
+    CHECK(!lazy_state.lazy_pages&&!lazy_state.lazy_registered&&lazy_state.lazy_borrows==1);
+    unsigned parked_before=mm_test_parked(2);
+    assert(!pthread_create(&release_thread,NULL,release_actor,NULL));
+    while(mm_test_parked(2)==parked_before&&!atomic_load(&release_done)) sched_yield();
+    CHECK(mm_test_parked(2)>parked_before&&!atomic_load(&release_done));
+    uint32_t retiring_refs=0;
+    CHECK(!physical_page_reference_count(&pages,retiring_physical,&retiring_refs)&&retiring_refs);
+    atomic_store(&fence_continue,1);
+    assert(!pthread_join(reclaim_thread,NULL)&&!pthread_join(release_thread,NULL));
+    CHECK(reclaimed_count==1&&release_result==KERNEL_MM_STATUS_OK&&atomic_load(&release_done));
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    /* A large advised range exercises index growth, lookup, cancellation and
+     * retirement using actual resident pages, rather than a fixed test key. */
+    enum { LAZY_SCALE_PAGES=8192 };
+    assert(!map(BASE,(uint64_t)LAZY_SCALE_PAGES*P,RW,0));
+    for (unsigned i=0;i<LAZY_SCALE_PAGES;i++) {
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+(uint64_t)i*P,KERNEL_MM_WRITE));
+        assert(!kernel_mm_lookup(&mm,BASE+(uint64_t)i*P,&lazy_mapping));
+        *(unsigned char *)(uintptr_t)lazy_mapping.physical_address=0x31;
+    }
+    CHECK(!kernel_mm_madvise(&mm,BASE,(uint64_t)LAZY_SCALE_PAGES*P,8));
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(lazy_state.lazy_pages==LAZY_SCALE_PAGES&&lazy_state.lazy_registered);
+    for (unsigned i=0;i<LAZY_SCALE_PAGES;i+=2)
+        assert(!kernel_mm_resolve_user_fault(&mm,BASE+(uint64_t)i*P,KERNEL_MM_WRITE));
+    uint64_t scale_released=0;
+    while (scale_released<LAZY_SCALE_PAGES/2) {
+        uint64_t released=test_reclaim(LAZY_SCALE_PAGES/2-scale_released);
+        assert(released&&test_detached<=16);
+        scale_released+=released;
+    }
+    CHECK(scale_released==LAZY_SCALE_PAGES/2);
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&*(unsigned char *)(uintptr_t)lazy_mapping.physical_address==0x31);
+    CHECK(kernel_mm_lookup(&mm,BASE+P,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    kernel_mm_get_concurrency_state(&mm,&lazy_state);
+    CHECK(!lazy_state.lazy_pages&&!lazy_state.lazy_index_bytes&&!lazy_state.lazy_registered);
+    CHECK(!kernel_mm_munmap(&mm,BASE,(uint64_t)LAZY_SCALE_PAGES*P));
+    /* Allocate all remaining pages: allocator pressure invokes the same
+     * registered reclaimer, not an isolated test-only reclamation path. */
+    assert(!map(BASE,P,RW,0)&&!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,8));
+    uint64_t available=physical_page_available(&pages);
+    uint64_t *held_pages=calloc(available+1,sizeof(*held_pages));assert(held_pages);
+    uint64_t held_count=0;
+    for (;held_count<=available;held_count++)
+        if (physical_page_allocate(&pages,&held_pages[held_count])) break;
+    CHECK(held_count==available+1);
+    CHECK(kernel_mm_lookup(&mm,BASE,&lazy_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    for (uint64_t i=0;i<held_count;i++) CHECK(!physical_page_release(&pages,held_pages[i]));
+    free(held_pages);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_READ));
+    CHECK(!kernel_mm_lookup(&mm,BASE,&lazy_mapping)&&!*(unsigned char *)(uintptr_t)lazy_mapping.physical_address);
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
     /* Fork policy controls actual child leaves and refs, not just a VMA flag. */
     assert(!map(BASE,4*P,RW,0));
     struct kernel_mm_mapping fork_page, original_page;

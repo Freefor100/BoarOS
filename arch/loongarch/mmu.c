@@ -322,6 +322,18 @@ enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
     }
     *cursor = end; return ARCH_MMU_STATUS_NOT_MAPPED;
 }
+enum arch_mmu_status arch_mmu_user_owned_snapshot(struct arch_mmu_user_space *s,
+    uint64_t v,uint64_t *physical,int *cow)
+{
+    if (!live(s) || !physical || !cow || (v&BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
+    uint64_t *slot;
+    enum arch_mmu_status status=walk(s,v,0,&slot);
+    if (status) return status;
+    if (!(*slot&PTE_PRESENT)) return ARCH_MMU_STATUS_NOT_MAPPED;
+    *physical=*slot&PTE_ADDRESS;*cow=!!(*slot&PTE_COW);
+    return ARCH_MMU_STATUS_OK;
+}
+
 enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *s, uint64_t v)
 {
     uint64_t *slot;

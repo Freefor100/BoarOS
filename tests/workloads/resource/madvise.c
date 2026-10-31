@@ -51,6 +51,38 @@ static void anonymous(void)
     CHECK(!mprotect(p,page,PROT_READ|PROT_WRITE)&&!p[0]);
     CHECK(!munmap(p,3*page));pass("private-zero-rounding-protection");
 }
+static void lazy_free(void)
+{
+    unsigned char *p=area(3,MAP_PRIVATE);memset(p,73,3*page);
+    CHECK(!madvise(p+page,1,MADV_FREE));
+    CHECK(p[0]==73&&p[page]==73&&p[2*page]==73);
+    pid_t c=fork();CHECK(c>=0);
+    if(!c){CHECK(p[page]==73);p[page]=92;_exit(0);}joined(c);
+    CHECK(p[page]==73);
+    p[page]=81;
+    CHECK(!mprotect(p+page,page,PROT_READ)&&!mprotect(p+page,page,PROT_READ|PROT_WRITE));
+    CHECK(p[page]==81);
+    c=fork();CHECK(c>=0);
+    if(!c){CHECK(p[page]==81);p[page]=91;_exit(0);}joined(c);
+    CHECK(p[page]==81);
+    CHECK(!madvise(p+page,page,MADV_FREE));
+    int fds[2];CHECK(!pipe(fds)&&write(fds[1],"X",1)==1&&read(fds[0],p+page,1)==1);
+    CHECK(p[page]=='X'&&!close(fds[0])&&!close(fds[1])&&!munmap(p,3*page));
+    pass("free-private-content-write-and-cow");
+}
+static void lazy_free_errors(void)
+{
+    unsigned char *p=area(1,MAP_PRIVATE),*s=area(1,MAP_SHARED);
+    CHECK(!madvise(p,0,MADV_FREE));ERROR(madvise(p+1,0,MADV_FREE),EINVAL);
+    ERROR(madvise(s,page,MADV_FREE),EINVAL);
+    int fd=open("/tmp/free-test",O_CREAT|O_TRUNC|O_RDWR,0600);CHECK(fd>=0&&!ftruncate(fd,page));
+    void *f=mmap(0,page,PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);CHECK(f!=MAP_FAILED);
+    ERROR(madvise(f,page,MADV_FREE),EINVAL);
+    CHECK(!mlock(p,page));ERROR(madvise(p,page,MADV_FREE),EINVAL);
+    CHECK(!munlock(p,page)&&!munmap(p,page)&&!munmap(s,page)&&!munmap(f,page));
+    CHECK(!close(fd)&&!unlink("/tmp/free-test"));
+    pass("free-types-lock-and-alignment");
+}
 static void cow(void)
 {
     unsigned char *p=area(2,MAP_PRIVATE);memset(p,42,2*page);
@@ -259,11 +291,29 @@ static void fork_remote(void)
     CHECK(p[0]==41&&p[page]==71&&!close(done[0])&&!close(done[1])&&!munmap(p,2*page));
     pass("fork-remote-parent-cow-and-wipe");
 }
+static void *remote_free_writer(void *arg)
+{
+    struct remote *r=arg;cpu_set_t set;CPU_ZERO(&set);CPU_SET(r->cpu,&set);
+    CHECK(!sched_setaffinity(0,sizeof(set),&set));CHECK(r->p[r->cpu]==91);
+    gate(r->gate);gate(r->gate);r->p[r->cpu]=(unsigned char)(r->cpu+1);return 0;
+}
+static void remote_free(void)
+{
+    cpu_set_t set;CHECK(!sched_getaffinity(0,sizeof(set),&set));unsigned cpus=0;
+    for(unsigned i=0;i<4;i++)if(CPU_ISSET(i,&set))cpus++;
+    unsigned char *p=area(1,MAP_PRIVATE);memset(p,91,page);
+    pthread_barrier_t barrier;CHECK(!pthread_barrier_init(&barrier,0,cpus+1));
+    pthread_t threads[4];struct remote args[4];
+    for(unsigned i=0;i<cpus;i++){args[i]=(struct remote){p,i,&barrier};CHECK(!pthread_create(&threads[i],0,remote_free_writer,&args[i]));}
+    gate(&barrier);CHECK(!madvise(p,page,MADV_FREE));gate(&barrier);
+    for(unsigned i=0;i<cpus;i++)CHECK(!pthread_join(threads[i],0)&&p[i]==i+1);
+    CHECK(!pthread_barrier_destroy(&barrier)&&!munmap(p,page));pass("free-remote-writes");
+}
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);page=(size_t)sysconf(_SC_PAGESIZE);CHECK(page==4096||page==16384);
     CHECK(!mkdir("/tmp",0755)||errno==EEXIST);CHECK(!mount("tmpfs","/tmp","tmpfs",0,0));
-    abi();anonymous();cow();shared();file_case("/tmp/madvise","tmpfs-private-shared-data");
+    abi();lazy_free();lazy_free_errors();remote_free();anonymous();cow();shared();file_case("/tmp/madvise","tmpfs-private-shared-data");
     file_case("/madvise","ext4-private-shared-data");locked();hole();willneed();remote();
     remove_shared_memory();remove_file("/tmp/remove","remove-tmpfs-shared-file");
     remove_file("/remove","remove-ext4-shared-file");remove_hole();

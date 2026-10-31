@@ -49,6 +49,7 @@ EXCLUDED(kernel_file_mapping_stop)
 EXCLUDED(kernel_file_mapping_drain)
 EXCLUDED(kernel_tmpfs_check_domain)
 EXCLUDED(kernel_shm_attachment_acquire)
+EXCLUDED(kernel_shm_attachment_create)
 struct kernel_shm_attachment;
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 { if (owner && *owner) mm_test_unavailable(); }
