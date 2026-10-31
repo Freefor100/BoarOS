@@ -179,6 +179,26 @@ static void expect_bus(volatile unsigned char *p)
     int status; CHECK(waitpid(child,&status,0)==child);
     CHECK(WIFSIGNALED(status)&&WTERMSIG(status)==SIGBUS);
 }
+static void sparse_detach_case(void)
+{
+    /* Cross a LoongArch leaf-table boundary while leaving both neighbours live. */
+    const size_t span=64U*1024U*1024U;
+    unsigned char *base=mmap(0,span,PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(base!=MAP_FAILED);
+    uintptr_t edge=((uintptr_t)base+(32U*1024U*1024U)-1)&~((uintptr_t)(32U*1024U*1024U)-1);
+    if(edge<(uintptr_t)base+2*page)edge+=32U*1024U*1024U;
+    CHECK(edge+2*page<=(uintptr_t)base+span);
+    unsigned char *p=(unsigned char *)edge;
+    p[-2*page]=11;p[-page]=22;p[0]=33;p[page]=44;
+    CHECK(!munmap(p-page,2*page));
+    CHECK(p[-2*page]==11 && p[page]==44);
+    CHECK(mmap(p-page,2*page,PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==p-page);
+    CHECK(p[-page]==0 && p[0]==0 && p[-2*page]==11 && p[page]==44);
+    CHECK(!munmap(base,span));
+    passed("sparse-detach-boundary");
+}
 static void extended_case(void)
 {
     pin(cpus-1);
@@ -261,12 +281,13 @@ int main(int argc,char **argv)
     if(argc>1) { char *end; unsigned long requested=strtoul(argv[1],&end,10); CHECK(!*end&&(requested==1||requested==2||requested==4)&&requested<=available); cpus=(unsigned)requested; }
     long size=sysconf(_SC_PAGESIZE); CHECK(size>0); page=(size_t)size;
     const char *which=argc>2?argv[2]:"all";
-    CHECK(!strcmp(which,"all")||!strcmp(which,"realloc")||!strcmp(which,"remote")||!strcmp(which,"file")||!strcmp(which,"sysv")||!strcmp(which,"extended"));
+    CHECK(!strcmp(which,"all")||!strcmp(which,"realloc")||!strcmp(which,"remote")||!strcmp(which,"file")||!strcmp(which,"sysv")||!strcmp(which,"extended")||!strcmp(which,"sparse"));
     printf("MREMAP BEGIN cpus=%u page=%zu case=%s affinity_source=sched_getaffinity\n",cpus,page,which);
     if(!strcmp(which,"all")||!strcmp(which,"realloc"))realloc_case();
     if(!strcmp(which,"all")||!strcmp(which,"remote"))remote_case();
     if(!strcmp(which,"all")||!strcmp(which,"file"))file_case();
     if(!strcmp(which,"all")||!strcmp(which,"sysv"))sysv_case();
     if(!strcmp(which,"all")||!strcmp(which,"extended"))extended_case();
+    if(!strcmp(which,"all")||!strcmp(which,"sparse"))sparse_detach_case();
     printf("MREMAP END %u\n",cases); return 0;
 }

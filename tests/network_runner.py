@@ -28,7 +28,7 @@ def futex_lines(raw,cpus):
 def mremap_output(raw,cpus):
     lines=raw.replace('\r','').splitlines()
     actual=[line for line in lines if line.startswith(('MREMAP CASE ','MREMAP END '))]
-    expected=[f'MREMAP CASE {name} PASS' for name in ('realloc','remote-move-reuse','shared-file-msync-truncate','sysv-shrink-ownership','duplicate-and-dontunmap')]+['MREMAP END 5']
+    expected=[f'MREMAP CASE {name} PASS' for name in ('realloc','remote-move-reuse','shared-file-msync-truncate','sysv-shrink-ownership','duplicate-and-dontunmap','sparse-detach-boundary')]+['MREMAP END 6']
     remote=re.findall(r'^MREMAP CPU remote index=(\d+) affinity=(\d+) role=(?:mover|reader) content=PASS$',raw.replace('\r',''),re.M)
     return (actual==expected and [(int(i),int(a)) for i,a in remote]==[(i,i) for i in range(cpus)] and
             len([line for line in lines if line.startswith(f'MREMAP BEGIN cpus={cpus} ')])==1 and
