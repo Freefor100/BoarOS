@@ -814,6 +814,8 @@ set-ID、filecap与实际权限执行还由独立数字UID/GID样本验证：两
 
 `kcmp03`的四个分项按原顺序分别为独立CLONE_VM、CLONE_FS、CLONE_IO、CLONE_SYSVSEM；后两类比较中IO本轮范围外，实际运行更早停在clone入口。这里保留真实内核能力缺口，没有将其归为输入故障。六类kcmp的对象身份、真实凭据、退出/exec和僵尸查询另由十项同ELF直接消费者验证。
 
+10月31日接入独立CLONE_VM并完成clone3与pidfd后，只复测原`kcmp03`：RV glibc/musl和LA glibc/musl均为**3/4**、退出1、无超时，程序耗时分别为146、87、140、64 ms。VM、FS、SYSVSEM通过；CLONE_IO仍在clone入口返回EINVAL，未进入KCMP_IO。固定官方容器和原QEMU设备参数，两架构并行；本次八个根盘／分区检查均为0。上表保留10月25日旧结果。
+
 正常退出后，两架构根盘、工具ext4、VFAT及scratch ext4共八对象检查均为0。RV/LA整次启动约8.399/7.100秒，PID1状态0，最终heap-live=0；默认交付内核已恢复并按保存的SHA逐字节核对。运行副本清理后保留输入/ELF/内核身份、逐条输出、judge结果和必要日志于`build/mm-kcmp-20261025/original/`。
 
 原盘程序问题及当前处理统一维护在[测例问题](oscomp-test-issues.md)，包括kcmp03的clone范围和自有LA musl消费者的vfork入口差异。
