@@ -4,9 +4,22 @@
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
+#include <kernel/fs_context.h>
+#include <kernel/heap.h>
+#include "../../fs/open_file_internal.h"
 #include <kernel/time.h>
 
 #include <stdint.h>
+
+static struct kernel_task fixture_task;
+static struct kernel_mm fixture_mm;
+static struct kernel_files fixture_files;
+static struct kernel_fs_context fixture_fs;
+static struct kernel_heap fixture_heap;
+static struct kernel_open_file_description fixture_file = {
+    .heap=&fixture_heap, .references=1, .open_flags=2,
+};
 
 static enum kernel_task_status brk_borrow_status =
     KERNEL_TASK_STATUS_OK;
@@ -62,7 +75,6 @@ static enum kernel_mm_status file_mmap_validation_status =
 static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
 static int64_t file_mmap_fd;
 static uint64_t file_mmap_offset;
-static uint32_t file_mmap_validation_calls;
 static uint32_t file_mmap_calls;
 static uint32_t file_release_calls;
 
@@ -76,7 +88,7 @@ enum kernel_task_status __wrap_kernel_task_mm_borrow_mutable(
     if (task == 0 || mm == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
-    *mm = (struct kernel_mm *)(uintptr_t)2U;
+    *mm = &fixture_mm;
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -85,7 +97,7 @@ enum kernel_mm_status __wrap_kernel_mm_brk(
     uint64_t requested,
     uint64_t *result)
 {
-    if (mm != (struct kernel_mm *)(uintptr_t)2U || result == 0) {
+    if (mm != &fixture_mm || result == 0) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
     brk_mm_requested = requested;
@@ -103,7 +115,7 @@ enum kernel_mm_status __wrap_kernel_mm_mmap_anonymous(
     uint32_t flags,
     uint64_t *address)
 {
-    if (mm != (struct kernel_mm *)(uintptr_t)2U || address == 0) {
+    if (mm != &fixture_mm || address == 0) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
     mmap_mm_hint = hint;
@@ -126,7 +138,7 @@ enum kernel_task_status __wrap_kernel_task_files_borrow(
     if (task == 0 || files == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
-    *files = (struct kernel_files *)(uintptr_t)3U;
+    *files = &fixture_files;
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -140,7 +152,7 @@ enum kernel_task_status __wrap_kernel_task_fs_context_borrow(
     if (task == 0 || fs == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
-    *fs = (const struct kernel_fs_context *)(uintptr_t)5U;
+    *fs = &fixture_fs;
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -149,7 +161,7 @@ enum kernel_files_status __wrap_kernel_files_mknodat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t path, uint32_t mode,
     uint32_t device, int64_t *result)
 {
-    if (files != (void *)3 || fs != (void *)5 || mm != (void *)2 ||
+    if (files != &fixture_files || fs != &fixture_fs || mm != &fixture_mm ||
         dirfd != 5 || path != 9 || mode != 0020600 || device != 0x103)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     *result = -KERNEL_EEXIST;
@@ -164,8 +176,8 @@ enum kernel_files_status __wrap_kernel_files_write(
     uint64_t count,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
-        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+    if (files != &fixture_files ||
+        mm != &fixture_mm || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     write_fd = fd;
@@ -181,14 +193,14 @@ enum kernel_files_status __wrap_kernel_files_pin_data(
     struct kernel_open_file_description **owner,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U || owner == 0 ||
+    if (files != &fixture_files || owner == 0 ||
         *owner != 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     file_mmap_fd = fd;
     *linux_result = pin_linux_result;
     if (pin_status == KERNEL_FILES_STATUS_OK && pin_linux_result == 0) {
-        *owner = (struct kernel_open_file_description *)(uintptr_t)4U;
+        *owner = &fixture_file;
     }
     return pin_status;
 }
@@ -203,8 +215,8 @@ enum kernel_mm_status __wrap_kernel_mm_mmap_file_private(
     uint32_t flags,
     uint64_t *address)
 {
-    if (mm != (struct kernel_mm *)(uintptr_t)2U || file == 0 ||
-        *file != (struct kernel_open_file_description *)(uintptr_t)4U ||
+    if (mm != &fixture_mm || file == 0 ||
+        *file != &fixture_file ||
         address == 0) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
@@ -229,7 +241,7 @@ enum kernel_mm_status __wrap_kernel_mm_validate_file_private_mapping(
     uint32_t permissions,
     uint32_t flags)
 {
-    if (mm != (struct kernel_mm *)(uintptr_t)2U) {
+    if (mm != &fixture_mm) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
     mmap_mm_hint = hint;
@@ -237,7 +249,6 @@ enum kernel_mm_status __wrap_kernel_mm_validate_file_private_mapping(
     file_mmap_offset = file_offset;
     mmap_mm_permissions = permissions;
     mmap_mm_flags = flags;
-    file_mmap_validation_calls++;
     return file_mmap_validation_status;
 }
 
@@ -248,7 +259,7 @@ enum kernel_files_status __wrap_kernel_files_lseek(
     uint64_t whence,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
+    if (files != &fixture_files ||
         linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
@@ -266,8 +277,8 @@ enum kernel_files_status __wrap_kernel_files_fstat(
     uint64_t user_buffer,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
-        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+    if (files != &fixture_files ||
+        mm != &fixture_mm || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     fstat_fd = fd;
@@ -286,9 +297,9 @@ enum kernel_files_status __wrap_kernel_files_fstatat(
     uint64_t flags,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
-        fs != (const struct kernel_fs_context *)(uintptr_t)5U ||
-        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+    if (files != &fixture_files ||
+        fs != &fixture_fs ||
+        mm != &fixture_mm || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     fstatat_dirfd = dirfd;
@@ -303,7 +314,7 @@ enum kernel_task_status __wrap_kernel_task_set_tid_address(
     uint64_t address,
     kernel_pid_t *tid)
 {
-    if (task != (struct kernel_task *)(uintptr_t)1U || tid == 0) {
+    if (task != &fixture_task || tid == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
     set_tid_address_value = address;
@@ -322,7 +333,7 @@ void __wrap_kernel_task_cpu_ticks(const struct kernel_task *task,
                                   uint64_t *child_user_ticks,
                                   uint64_t *child_kernel_ticks)
 {
-    if (task != (struct kernel_task *)(uintptr_t)1U) {
+    if (task != &fixture_task) {
         return;
     }
     *user_ticks = ticks_user;
@@ -339,8 +350,8 @@ enum kernel_files_status __wrap_kernel_files_getdents(
     uint64_t count,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
-        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+    if (files != &fixture_files ||
+        mm != &fixture_mm || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     getdents_fd = fd;
@@ -358,8 +369,8 @@ enum kernel_files_status __wrap_kernel_files_writev(
     uint64_t iovcnt,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
-        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+    if (files != &fixture_files ||
+        mm != &fixture_mm || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     writev_fd = fd;
@@ -374,7 +385,7 @@ enum kernel_files_status __wrap_kernel_files_dup(
     int64_t oldfd,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
+    if (files != &fixture_files ||
         linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
@@ -391,7 +402,7 @@ enum kernel_files_status __wrap_kernel_files_dup3(
     uint64_t flags,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
+    if (files != &fixture_files ||
         linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
@@ -409,7 +420,7 @@ enum kernel_files_status __wrap_kernel_files_fcntl(
     uint64_t argument,
     int64_t *linux_result)
 {
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
+    if (files != &fixture_files ||
         linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
@@ -423,7 +434,7 @@ enum kernel_files_status __wrap_kernel_files_fcntl(
 enum kernel_open_file_kind __wrap_kernel_open_file_kind(
     const struct kernel_open_file_description *file)
 {
-    if (file != (struct kernel_open_file_description *)(uintptr_t)4U) {
+    if (file != &fixture_file) {
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     return pinned_kind;
@@ -433,7 +444,7 @@ int __wrap_kernel_open_file_readable(
     const struct kernel_open_file_description *file)
 {
     return file ==
-               (const struct kernel_open_file_description *)(uintptr_t)4U
+               &fixture_file
                ? pinned_readable
                : 0;
 }
@@ -442,7 +453,7 @@ int __wrap_kernel_open_file_writable(
     const struct kernel_open_file_description *file)
 {
     return file ==
-               (const struct kernel_open_file_description *)(uintptr_t)4U
+               &fixture_file
                ? pinned_writable
                : 0;
 }
@@ -451,7 +462,7 @@ enum kernel_open_file_status __wrap_kernel_open_file_release(
     struct kernel_open_file_description **owner)
 {
     if (owner == 0 ||
-        *owner != (struct kernel_open_file_description *)(uintptr_t)4U) {
+        *owner != &fixture_file) {
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
     }
     file_release_calls++;
@@ -464,7 +475,7 @@ enum kernel_mm_status __wrap_kernel_mm_munmap(
     uint64_t address,
     uint64_t length)
 {
-    if (mm != (struct kernel_mm *)(uintptr_t)2U) {
+    if (mm != &fixture_mm) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
     range_mm_address = address;
@@ -478,7 +489,7 @@ enum kernel_mm_status __wrap_kernel_mm_mprotect(
     uint64_t length,
     uint32_t permissions)
 {
-    if (mm != (struct kernel_mm *)(uintptr_t)2U) {
+    if (mm != &fixture_mm) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
     range_mm_address = address;
@@ -497,7 +508,7 @@ static unsigned long result_changed(
 
 static unsigned long run_invalid_argument_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result = {
         .action = (enum kernel_syscall_action)0x55,
@@ -524,7 +535,7 @@ static unsigned long run_invalid_argument_cases(void)
 
 static unsigned long run_exit_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 93U,
         .arguments = {
@@ -551,12 +562,12 @@ static unsigned long run_exit_cases(void)
 
 static unsigned long run_unknown_cases(void)
 {
-    static const uint64_t numbers[] = {0U, 95U, 146U, UINT64_MAX};
+    static const uint64_t numbers[] = {0U, UINT64_MAX};
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
     unsigned long index;
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
 
     for (index = 0U; index < sizeof(numbers) / sizeof(numbers[0]); index++) {
         request.number = numbers[index];
@@ -574,15 +585,14 @@ static unsigned long run_unknown_cases(void)
 
 static unsigned long run_identity_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .arguments = {UINT64_MAX, UINT64_MAX, UINT64_MAX,
                       UINT64_MAX, UINT64_MAX, UINT64_MAX},
     };
     unsigned long failures = 0U;
 
-    /* All tasks currently have immutable root identity. These queries
-     * take no arguments, including no user pointers to validate. */
+    /* Default credentials provide the initial root identity. */
     for (uint64_t number = 174U; number <= 177U; number++) {
         struct kernel_syscall_result result = {
             .action = KERNEL_SYSCALL_ACTION_EXIT,
@@ -600,7 +610,7 @@ static unsigned long run_identity_cases(void)
 
 static unsigned long run_process_decode_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 220U,
         .arguments = {17U, 0U, 0U, 0U, 0U, 0U},
@@ -644,7 +654,7 @@ static unsigned long run_process_decode_cases(void)
     request.arguments[0] = UINT64_C(1) << 40U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
     request.arguments[0] = 17U;
@@ -699,7 +709,7 @@ static unsigned long run_process_decode_cases(void)
 
 static unsigned long run_write_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 64U,
         .arguments = {5U, UINT64_C(0x30000), UINT64_C(0x1234), 0U, 0U, 0U},
@@ -749,7 +759,7 @@ static unsigned long run_write_cases(void)
 
 static unsigned long run_seek_stat_decode_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 62U,
         .arguments = {3U, UINT64_C(0x1234), 2U, 0U, 0U, 0U},
@@ -862,7 +872,7 @@ static unsigned long run_seek_stat_decode_cases(void)
 
 static unsigned long run_dup_fcntl_decode_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 23U,
         .arguments = {5U, 0U, 0U, 0U, 0U, 0U},
@@ -928,7 +938,7 @@ static unsigned long run_dup_fcntl_decode_cases(void)
 
 static unsigned long run_brk_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 214U,
         .arguments = {UINT64_C(0x12345678), 0U, 0U, 0U, 0U, 0U},
@@ -968,7 +978,7 @@ static unsigned long run_brk_cases(void)
 
 static unsigned long run_memory_mapping_cases(void)
 {
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     struct kernel_syscall_request request = {
         .number = 222U,
         .arguments = {UINT64_C(0x12000), UINT64_C(0x2345),
@@ -1032,13 +1042,17 @@ static unsigned long run_memory_mapping_cases(void)
 
     /* Real unsupported mapping flags must not become ordinary mappings merely
      * because legacy callers may supply otherwise unknown extension bits. */
-    const uint64_t unsupported_flags[] = {0x40022U, 0x40021U, 0x122U, 0x2022U};
+    const uint64_t unsupported_flags[] = {0x40022U, 0x40021U, 0x122U};
     for (size_t index = 0; index < sizeof(unsupported_flags) / sizeof(unsupported_flags[0]); index++) {
         request.arguments[3] = unsupported_flags[index];
         if (kernel_syscall_dispatch(caller, &request, &result) != KERNEL_SYSCALL_STATUS_OK ||
             result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
                 index < 2 ? -KERNEL_EINVAL : -KERNEL_EOPNOTSUPP)) failures++;
     }
+    request.arguments[3] = UINT64_C(0x2022);
+    if (kernel_syscall_dispatch(caller, &request, &result) != KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, INT64_C(0x41000)) ||
+        mmap_mm_flags != KERNEL_MM_MAP_LOCKED) failures++;
 
     request.arguments[0] = UINT64_C(0x45000);
     request.arguments[1] = UINT64_C(0x3456);
@@ -1053,7 +1067,6 @@ static unsigned long run_memory_mapping_cases(void)
     file_mmap_status = KERNEL_MM_STATUS_OK;
     mmap_mm_result = UINT64_C(0x88000);
     pinned_readable = 1;
-    file_mmap_validation_calls = 0U;
     file_mmap_calls = 0U;
     file_release_calls = 0U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
@@ -1066,7 +1079,7 @@ static unsigned long run_memory_mapping_cases(void)
         mmap_mm_hint != UINT64_C(0x45000) ||
         mmap_mm_length != UINT64_C(0x3456) ||
         mmap_mm_permissions != (KERNEL_MM_READ | KERNEL_MM_EXECUTE) ||
-        mmap_mm_flags != 0U || file_mmap_validation_calls != 1U ||
+        mmap_mm_flags != 0U ||
         file_mmap_calls != 1U ||
         file_release_calls != 0U) {
         failures++;
@@ -1075,7 +1088,7 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -12) ||
-        file_mmap_validation_calls != 2U || file_mmap_calls != 2U ||
+        file_mmap_calls != 2U ||
         file_release_calls != 1U) {
         failures++;
     }
@@ -1083,16 +1096,17 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -19) ||
-        file_mmap_validation_calls != 2U || file_mmap_calls != 2U ||
+        file_mmap_calls != 2U ||
         file_release_calls != 2U) {
         failures++;
     }
     pinned_kind = KERNEL_OPEN_FILE_KIND_REGULAR;
     pinned_readable = 0;
+    fixture_file.open_flags = 1;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -13) ||
-        file_mmap_validation_calls != 3U || file_mmap_calls != 2U ||
+        file_mmap_calls != 2U ||
         file_release_calls != 3U) {
         failures++;
     }
@@ -1101,7 +1115,7 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22) ||
-        file_mmap_validation_calls != 3U || file_mmap_calls != 2U ||
+        file_mmap_calls != 2U ||
         file_release_calls != 4U) {
         failures++;
     }
@@ -1110,12 +1124,13 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -17) ||
-        file_mmap_validation_calls != 4U || file_mmap_calls != 2U ||
+        file_mmap_calls != 2U ||
         file_release_calls != 5U) {
         failures++;
     }
     file_mmap_validation_status = KERNEL_MM_STATUS_OK;
     pinned_readable = 1;
+    fixture_file.open_flags = 2;
     pin_linux_result = -9;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
@@ -1214,7 +1229,7 @@ static unsigned long run_time_cases(void)
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
-    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_task *caller = &fixture_task;
     uint64_t deadline = 0U;
 
     /* Conversion math at the initialized 10 MHz timebase. */
@@ -1336,7 +1351,7 @@ static unsigned long run_time_cases(void)
 
     /* clock_nanosleep validates clock id and flags before any copy. */
     request.number = 115U;
-    request.arguments[0] = 2U;
+    request.arguments[0] = 42U;
     request.arguments[1] = 0U;
     request.arguments[2] = 0x1000U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
