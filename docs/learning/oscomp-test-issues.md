@@ -23,6 +23,28 @@ pre-20250615，盘内 LTP 报告版本为 20240524。运行和交付方式见
 
 ## 发布程序与版本预期
 
+### acl1：发布程序未包含 ACL 测试
+
+两架构、两种 libc 的原 `acl1` 都输出 `The acl library was missing upon compilation.`，
+退出 32，没有执行 ACL 操作，也没有 LTP Summary；原 judge 计为 0/0。
+因此它不能反映内核 ACL 实现。ACL 权限、继承和属性语义由同一 ELF 的
+Linux／BoarOS 直接消费者检查，原程序保持原样。
+
+### LA glibc setxattr01：clone3 的 CLONE_CLEAR_SIGHAND 缺口
+
+本次原程序在准备阶段报告 `mkfs.ext4 does not exist` 并以 TCONF 退出。
+该 LTP 版本通过 `system("mkfs.ext4 >/dev/null 2>&1")` 的退出状态 127 得出这一提示；
+同次启动中随后执行的 LA musl 原程序成功运行 mke2fs 并进入测例主体。
+针对相同环境的短诊断中，`/bin/sh` 与 `/bin/mkfs.ext4` 的执行权限检查均成功，
+直接 `fork`／`exec` 能运行 mkfs；原 glibc 的 `system("exit 0")` 返回 127，errno 为 95。
+
+原 LA glibc 的 `posix_spawn` 反汇编显示，它以
+`CLONE_CLEAR_SIGHAND|CLONE_VM|CLONE_VFORK` 调用 `clone3`；该组合的直接 syscall
+同样返回 `EOPNOTSUPP`（95）。当前 [clone 解码](../../kernel/syscall/process.c)没有
+接纳 `CLONE_CLEAR_SIGHAND`，而这版 glibc 仅在 `EINVAL` 或 `ENOSYS` 时尝试旧入口。
+所以这是进程接口缺口，并非格式化工具缺失或 ACL 测例失败；该能力安排后续补齐。
+[固定 LTP 工具探测](https://github.com/linux-test-project/ltp/blob/20240524/lib/tst_supported_fs_types.c)
+
 ### basic/brk：发布 ELF 截断了返回地址
 
 raw `brk(0)` 返回当前堆顶地址。原 RV ELF 在 syscall 后执行 `sext.w a0,a0`，

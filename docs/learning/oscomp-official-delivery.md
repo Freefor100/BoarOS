@@ -230,6 +230,25 @@ CPU记账的旧成本、资源限制一轮的功能净影响及定时器启用�
 
 原始输出、逐项结果、实际kernel/init/QEMU身份与fsck分别位于`build/resource-limits-timers/original/`、`original-capget02/`及`build/signal-local-rv/original/`。最新汇总`build/signal-local-rv/current-original-results.json`逐项保存来源；信号最终通用回归位于同目录`*-return/`，限额/查询的既有独立回归仍保留在前一目录。构建缓存、ELF和必要日志保留，检查后的运行盘清理。
 
+## POSIX ACL 接入后的原程序短例
+
+2026-10-31 使用固定官方容器、原 QEMU 参数、原 ELF 和 judge，定向运行 `acl1`、
+`setxattr01`、`getxattr01`、`chmod01`；两架构分别使用独立根盘和第二盘。
+
+| 配置 | acl1 | setxattr01 | getxattr01 | chmod01 | 合计 |
+|---|---:|---:|---:|---:|---:|
+| RV glibc | 0/0 | 9/9，8.871 秒 | 4/4，0.086 秒 | 32/32，0.084 秒 | 45/45 |
+| RV musl | 0/0 | 9/9，8.323 秒 | 4/4，0.063 秒 | 32/32，0.084 秒 | 45/45 |
+| LA glibc | 0/0 | 0/1，0.109 秒 | 4/4，0.113 秒 | 32/32，0.067 秒 | 36/37 |
+| LA musl | 0/0 | 9/9，8.043 秒 | 4/4，0.064 秒 | 32/32，0.084 秒 | 45/45 |
+
+`acl1` 是缺少 ACL 库的发布程序桩，四项均退出32；LA glibc 的 `setxattr01`
+因 `clone3` 尚未支持 `CLONE_CLEAR_SIGHAND` 而在工具探测时 TCONF，其余程序退出0。
+本批均无超时。
+这两个输入／准备情况见[统一问题记录](oscomp-test-issues.md#acl1发布程序未包含-acl-测试)；
+原 xattr 和 chmod 程序本身不覆盖完整 ACL 语义，权限、继承、错误和并发由同 ELF
+的 Linux／BoarOS 直接消费者检查。正常退出后两架构根盘及第二盘三个分区检查均正常。
+
 ## 目录、路径与文件 I/O 当前结果
 
 本表完成于 2026-10-21，通用源码 main `a2bf9b1`，经 `8b46e5e` 合入兼容分支。固定官方容器离线构建与 85 项适配检查通过；两架构实际 QEMU 10.0.2，原 1 CPU/1 GiB 双盘参数。RV、LA 并行，各架构先 glibc 后 musl；外层仅枚举下表 13 项，原 ELF、libc、内部时限、输入与 judge 保留。
