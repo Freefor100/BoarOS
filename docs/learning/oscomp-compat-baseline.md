@@ -12,6 +12,20 @@
 
 集成后默认`make all`生成`kernel-rv`、`kernel-la`、`disk.img`及`disk-la.img`；两张第二盘均为2304MiB，工具／VFAT／scratch三分区布局保持既定值，六个分区的e2fsck或fsck.fat均返回0，两架构具有独立的新启动种子。原评测输入、默认单核、跳过表及监督配置沿用现状；原程序得分继续按各次实际运行记录读取。
 
+## 2026-10-31：执行FD、进程根与挂载移动
+
+main单向集成execveat(281)、MS_MOVE、UMOUNT_NOFOLLOW和chroot(51)。execve与execveat共用实际事务，FD身份、当前执行权限、脚本、CLOEXEC、set-ID/filecap和失败回滚沿同一机制；chroot保留原cwd与已打开FD，进程根和挂载连接各自持有真实路径。当前机制分别见[执行](../modules/kernel-exec.md)、[文件接口](../modules/kernel-files.md)与[VFS](../modules/vfs-ext4.md)。
+
+直接功能流为mount_move的7项、execveat的12项、chroot的13项。RV单核musl/glibc、双核动态musl／1 GiB、四核静态musl／512 MiB，LA单核musl/glibc及双核musl均通过这32项基础流；随后针对proc展示、fexecve和正常卸载清理补充核对。实际BusyBox执行chroot，jail内没有proc时两种libc的fexecve仍通过原生入口成功。原始记录集中在 `build/exec-root-20261031/`。
+
+固定Linux使用相同消费者。LA参考启动器的初始根位于命名空间/root，进入测试jail后，外部proc路径会保留此前不可见的祖先；测试按实际unreachable cwd和原目录身份取得此拓扑前缀，不使用架构固定字符串。exec消费者补齐实际子挂载清理后，原Linux LA supervisor的根卸载与完成检查通过。准备与完成失败的首份输出保留，最终通过单独记录。
+
+宿主4/16 KiB相关组覆盖移动、根路径、exec资格、别名、OOM前置回滚和真实owner归还；proc根外/摘树名称的直接反例先失败后通过，严格路径与getcwd保持各自语义。VFS ext4模块、ELF/MM/source和失败关闭重试通过；运行盘fsck正常。RV glibc的最小空闲内核栈为1680字节，SMP exec观察最低1368字节。
+
+兼容分支最终两架构单核再次运行三个消费者，64/64项通过，正常退出和磁盘检查通过；默认make all已恢复两架构内核和两张独立第二盘。
+
+旧路径固定八次与两次最终版定向复核见[CPU成本文档](cpu-accounting-cost.md#2026-10-31execveatchroot与挂载移动后的普通路径)。首批回退、最终单次观察均保留。沿用官方输入、默认单核、跳过表及监督设置。
+
 ## 2026-10-31：bind/rbind、延迟卸载与 MADV_REMOVE
 
 本次从 main 单向集成挂载视图与后端实例分离、bind/rbind、MNT_DETACH，以及共享后备的 MADV_REMOVE。当前所有权与操作边界见 [VFS](../modules/vfs-ext4.md) 和 [MM](../modules/kernel-mm.md)。原输入、默认单核、跳过表和监督配置沿用现状。
