@@ -942,3 +942,17 @@ POSIX MQ、libc通知和管道容量于10月28日14:48～14:50完成；16:25的�
 原BusyBox四组合均54/55，`sort test.txt | ./busybox uniq`各1/1，原`cat busybox_cmd.txt | while read`完整消费命令；唯一缺分仍是原judge的`kill 10`标签与发布脚本实际命令不同，见统一问题文档。管道容量另由真实libc直接消费者检查环绕扩缩、FIFO、额度和失败副作用。
 
 八个文件系统对象（两架构根盘及p1/p2/p3）检查状态全部为0，启动种子槽检查已完成；检查后清除四张运行副本。恢复默认`make all`交付，最终两内核与运行前保存的默认内核逐字节一致；兼容分支原有`oscomp-official-delivery.md`修改SHA保持不变。源码机制见[POSIX消息队列](../modules/posix-mqueue.md)，性能和四核MQ慢于双核的剩余问题见[成本记录](cpu-accounting-cost.md#posix消息队列线程通知与管道容量2026-10-28)。
+
+
+## 用户栈限额修复后的 mincore01
+
+固定 LTP 20240524 的 `mincore01` 在第 2 项准备中将用户栈软／硬限额设为 10 MiB；此前 8 MiB 硬上限使设置返回 EPERM，后续检查中止。用户栈限额修复后，保留原 ELF、两种 libc、参数、judge 和内部时限，在固定官方容器以原 QEMU 设备参数运行；两架构并行、各一次启动。
+
+| 架构与库 | 测例实际结果 | 原 judge | 程序耗时 |
+|---|---|---:|---:|
+| RV glibc | 4 条 TPASS，退出 0 | 0/0 | 126 ms |
+| RV musl | 4 条 TPASS，退出 0 | 0/0 | 66 ms |
+| LA glibc | 4 条 TPASS，退出 0 | 0/0 | 129 ms |
+| LA musl | 4 条 TPASS，退出 0 | 0/0 | 67 ms |
+
+四项依次检查未对齐地址、无效输出地址、范围中的未映射页面和地址范围溢出，均返回程序期望的错误；四配置均无超时。原程序采用旧 LTP 输出，只打印 TPASS，没有原 judge 读取的 `Summary:`，因此原 judge 均记 0/0。两架构根盘和第二盘三个分区共八对象检查均为 0，启动种子槽检查通过；默认交付内核已恢复，运行盘已清理。原始日志、ELF 和判分结果见主工作区 `build/stack-limits-20261101/original/`。
