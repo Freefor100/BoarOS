@@ -384,6 +384,24 @@ static void fault_candidates(void)
     assert(!kernel_mm_munmap(&mm[0], race_address, BOAROS_PAGE_SIZE));
     assert(physical_page_available(&allocator) == baseline);
 
+    /* The delayed anonymous candidate must not overwrite a new shared VMA. */
+    assert(!kernel_mm_mmap_anonymous(&mm[0], race_address, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &mapped));
+    memset(prepare_entered, 0, sizeof(prepare_entered)); prepare_release = 0; capture_mask = 2;
+    assert(!pthread_create(&one, 0, race_fault, (void *)(uintptr_t)1)); prepared(1);
+    assert(!kernel_mm_mmap_anonymous(&mm[0], race_address, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED, &mapped));
+    __atomic_store_n(&prepare_release, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(one, 0) && race_status[1] == KERNEL_UACCESS_STATUS_OK);
+    struct kernel_vma replaced;
+    assert(!kernel_mm_vma_lookup(&mm[0], race_address, &replaced));
+    assert(replaced.kind == KERNEL_VMA_KIND_ANON_SHARED);
+    unsigned char observed; size_t length;
+    assert(!kernel_copy_from_user(&mm[0], &observed, race_address + 1, 1, &length));
+    assert(length == 1 && observed == 0x91);
+    assert(!kernel_mm_munmap(&mm[0], race_address, BOAROS_PAGE_SIZE));
+    assert(physical_page_available(&allocator) == baseline);
+
     /* 新root分支需要data+两级表；只留两页，第二张表OOM后全部回滚。 */
     race_address = UINT64_C(0x40000000);
     assert(!kernel_mm_mmap_anonymous(&mm[0], race_address, BOAROS_PAGE_SIZE,
@@ -500,6 +518,34 @@ static void population_batches(void)
     assert(!kernel_mm_munmap(&mm[0], population_start, 33 * BOAROS_PAGE_SIZE));
     population_start = 0;
     puts("MM shared population preparation and bounded writer admission verified");
+}
+static int population_unmap_result;
+static void *populate_unmapped(void *unused)
+{
+    (void)unused; mm_test_attach(1); mm_test_context = context;
+    population_unmap_result=kernel_mm_mlock(&mm[1],population_start,BOAROS_PAGE_SIZE,0);
+    return 0;
+}
+static void population_unmap(void)
+{
+    uint64_t mapped;
+    population_start=UINT64_C(0xb0000000);
+    assert(!kernel_mm_mmap_anonymous(&mm[0],population_start,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&mapped));
+    uint64_t available=physical_page_available(&allocator);
+    population_capture=1; population_entered=population_release=0;
+    pthread_t population;
+    assert(!pthread_create(&population,0,populate_unmapped,0));
+    while (!__atomic_load_n(&population_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_mm_munmap(&mm[0],population_start,BOAROS_PAGE_SIZE));
+    __atomic_store_n(&population_release,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(population,0));
+    assert(population_unmap_result==-KERNEL_ENOMEM);
+    struct kernel_mm_mapping mapping;
+    assert(kernel_mm_lookup(&mm[0],population_start,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(physical_page_available(&allocator)==available);
+    population_start=0;
+    puts("MM population discards its candidate after concurrent unmap");
 }
 struct pressure_case { uint64_t pages[4096]; unsigned count, locked, progressed; };
 static uint64_t pressure_reclaim(void *context, uint64_t target)
@@ -655,6 +701,7 @@ int main(void)
     population_confirmation();
     parallel_publication();
     population_batches();
+    population_unmap();
     population_pressure();
     self_pin_fault();
     fault_candidates();

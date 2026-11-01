@@ -95,7 +95,7 @@ static void stale(int replace)
     pthread_t worker; assert(!pthread_create(&worker,0,fault,(void *)(uintptr_t)1)); prepared(1);
     assert(pages.shared_anon_pages==charged+1);
     assert(!kernel_mm_munmap(&parent,target,BOAROS_PAGE_SIZE));
-    if(replace) map(&parent,target,BOAROS_PAGE_SIZE,RW,1);
+    if(replace) map(&parent,target,BOAROS_PAGE_SIZE,RW,replace==1);
     __atomic_store_n(&resume,UINT32_MAX,__ATOMIC_RELEASE);
     assert(!pthread_join(worker,0));
     if(replace) {
@@ -296,7 +296,8 @@ int main(void)
     mm_test_context=roots[2]; write_byte(&child,SHARED+1,44); mm_test_context=roots[1]; assert(read_byte(&parent,SHARED+1)==44);
     assert(!kernel_mm_mprotect(&parent,SHARED,BOAROS_PAGE_SIZE,RW));
     write_byte(&parent,PRIVATE,77); mm_test_context=roots[2]; assert(read_byte(&child,PRIVATE)==31); mm_test_context=roots[1];
-    stale(0); stale(1); oom(); retire();
+    /* A stalled shared fault must retry on the new private anonymous VMA. */
+    stale(0); stale(1); stale(2); oom(); retire();
     concurrent_disjoint_anon();
     concurrent_disjoint_mlock();
     mm_test_context=0; /* 末次销毁前切回可信内核地址空间。 */
