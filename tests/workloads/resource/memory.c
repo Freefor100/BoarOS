@@ -278,6 +278,51 @@ static void stack_denial(int resource)
 }
 static void stack_as(void){stack_denial(RLIMIT_AS);}
 static void stack_soft(void){stack_denial(RLIMIT_STACK);}
+#define LARGE_STACK (UINT64_C(10)*1024*1024)
+static void stack_large_touch(void)
+{
+    struct usage u=usage();
+    check(u.stack_end>9*1024*1024,"large-stack-map");
+    volatile char *p=(void *)(uintptr_t)(u.stack_end-9*1024*1024);
+    *p=73;check(*p==73,"large-stack-growth");
+}
+static void stack_large(void)
+{
+    struct rlimit limit={LARGE_STACK,LARGE_STACK},current;
+    check(!setrlimit(RLIMIT_STACK,&limit),"large-stack-set");
+    check(!getrlimit(RLIMIT_STACK,&current) && current.rlim_cur==LARGE_STACK &&
+        current.rlim_max==LARGE_STACK,"large-stack-get");
+    stack_large_touch();
+    struct usage u=usage();
+    pid_t child=fork();check(child>=0,"large-stack-boundary-fork");
+    if(!child){*(volatile char *)(uintptr_t)(u.stack_end-LARGE_STACK-page)=12;_exit(98);}
+    int status;check(waitpid(child,&status,0)==child,"large-stack-boundary-wait");
+    check(WIFSIGNALED(status)&&WTERMSIG(status)==SIGSEGV,"large-stack-boundary-signal");
+    child=fork();check(child>=0,"large-stack-exec-fork");
+    if(!child){execl("/proc/self/exe","memory","--large-stack-exec",(char *)0);_exit(98);}
+    check(waitpid(child,&status,0)==child&&!status,"large-stack-exec-wait");
+}
+static void stack_guard_case(uintptr_t target,uintptr_t obstacle,int prot,int should_grow)
+{
+    void *p=mmap((void *)obstacle,page,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+    check(p==(void *)obstacle,"stack-guard-map");
+    pid_t child=fork();check(child>=0,"stack-guard-fork");
+    if(!child){*(volatile char *)target=42;_exit(0);}
+    int status;check(waitpid(child,&status,0)==child,"stack-guard-wait");
+    if(should_grow)check(WIFEXITED(status)&&!WEXITSTATUS(status),"stack-guard-allowed");
+    else check(WIFSIGNALED(status)&&WTERMSIG(status)==SIGSEGV,"stack-guard-refused");
+    check(!munmap(p,page),"stack-guard-unmap");
+}
+static void stack_guard(void)
+{
+    struct usage u=usage();
+    uintptr_t target=u.stack_start-page, gap=256*page;
+    check(target>gap+2*page,"stack-guard-range");
+    stack_guard_case(target,target-gap,PROT_READ,0);
+    stack_guard_case(target,target-gap-page,PROT_READ,1);
+    stack_guard_case(target,target-2*page,PROT_NONE,1);
+}
+#undef LARGE_STACK
 #define EXEC_AS (UINT64_C(64)*1024*1024)
 #define EXEC_DATA (UINT64_C(32)*1024*1024)
 static void expect_limit(int resource,uint64_t soft,uint64_t hard)
@@ -359,6 +404,13 @@ int main(int argc,char **argv)
         expect_limit(RLIMIT_AS,EXEC_AS,UINT64_MAX);expect_limit(RLIMIT_DATA,EXEC_DATA,UINT64_MAX);
         return 0;
     }
+    if(argc==2&&!strcmp(argv[1],"--large-stack-exec")){
+        struct rlimit limit;
+        check(!getrlimit(RLIMIT_STACK,&limit) && limit.rlim_cur==10*1024*1024 &&
+            limit.rlim_max==10*1024*1024,"large-stack-exec-limit");
+        stack_large_touch();
+        return 0;
+    }
     int proc=open("/proc/self/maps",O_RDONLY);
     if(proc<0){
         check(errno==ENOENT,"proc-probe");
@@ -371,7 +423,7 @@ int main(int argc,char **argv)
         {"data-zero",data_zero},{"data-fixed",data_fixed},{"protect-prefix",protect_prefix},
         {"protect-hole",protect_hole},{"remap-growth",remap_growth},{"remap-fixed",remap_fixed},
         {"brk-same-page",brk_same_page},{"shm-as",shm_as},{"stack-initial",stack_initial},
-        {"stack-as",stack_as},{"stack-soft",stack_soft},
+        {"stack-as",stack_as},{"stack-soft",stack_soft},{"stack-large",stack_large},{"stack-guard",stack_guard},
         {"file-shm-data",file_and_shm_data},{"caller-limits",caller_limits},
         {"shared-admission",shared_admission},
         {"limit-abi",limit_abi},{"limit-thread-fork",limit_thread_fork},

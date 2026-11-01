@@ -28,6 +28,17 @@ int main(void)
         struct kernel_rlimit64 value;
         assert(!kernel_task_get_rlimit(&task,i,&value)&&value.current==defaults[i]);
     }
+    struct kernel_rlimit64 stack;
+    assert(!kernel_task_get_rlimit(&task,KERNEL_RLIMIT_STACK,&stack));
+    assert(stack.maximum==KERNEL_RLIM_INFINITY);
+    stack=(struct kernel_rlimit64){10*1024*1024,10*1024*1024};
+    assert(!kernel_task_set_rlimit(&task,KERNEL_RLIMIT_STACK,&stack));
+    assert(!kernel_task_get_rlimit(&task,KERNEL_RLIMIT_STACK,&stack));
+    assert(stack.current==10*1024*1024 && stack.maximum==10*1024*1024);
+    stack=(struct kernel_rlimit64){KERNEL_RLIM_INFINITY,KERNEL_RLIM_INFINITY};
+    assert(!kernel_task_set_rlimit(&task,KERNEL_RLIMIT_STACK,&stack));
+    assert(!kernel_task_get_rlimit(&task,KERNEL_RLIMIT_STACK,&stack));
+    assert(stack.current==KERNEL_RLIM_INFINITY && stack.maximum==KERNEL_RLIM_INFINITY);
     struct kernel_task sibling=task;sibling.group_leader=&task;
     sibling.limits=kernel_resource_limits_get(task.limits);
     struct kernel_task child=task;child.group_leader=&child;

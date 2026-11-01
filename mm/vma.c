@@ -241,6 +241,17 @@ enum kernel_vma_status kernel_vma_set_next(
     return KERNEL_VMA_STATUS_OK;
 }
 
+enum kernel_vma_status kernel_vma_set_previous(
+    const struct kernel_vma_set *set, uint64_t address,
+    struct kernel_vma *vma)
+{
+    if (!set_valid(set) || !vma) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    uint32_t index = lower_bound(set, address);
+    if (!index) return KERNEL_VMA_STATUS_NOT_FOUND;
+    *vma = set->entries[index - 1];
+    return KERNEL_VMA_STATUS_OK;
+}
+
 static enum kernel_vma_status reserve_entries(struct kernel_vma_set *set,
                                                uint32_t required)
 {

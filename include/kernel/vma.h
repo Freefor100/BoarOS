@@ -8,6 +8,7 @@ struct kernel_vma_set;
 struct kernel_vma;
 struct kernel_shm_attachment;
 #define KERNEL_VMA_ALL_PERMISSIONS UINT32_C(7)
+#define KERNEL_VMA_STACK_GUARD_PAGES UINT64_C(256)
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set);
 /* Sum of currently mapped virtual bytes; updated with each committed edit. */
 uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set);
@@ -148,6 +149,11 @@ enum kernel_vma_status kernel_vma_set_get_at(
 
 /* First VMA whose start is at or after address. */
 enum kernel_vma_status kernel_vma_set_next(
+    const struct kernel_vma_set *set, uint64_t address,
+    struct kernel_vma *vma);
+
+/* Last VMA whose start is strictly below address. */
+enum kernel_vma_status kernel_vma_set_previous(
     const struct kernel_vma_set *set, uint64_t address,
     struct kernel_vma *vma);
 
