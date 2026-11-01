@@ -2487,8 +2487,6 @@ enum kernel_task_status kernel_task_set_rlimit(
     if (limit == 0 || limit->current > limit->maximum ||
         (resource == KERNEL_RLIMIT_NOFILE &&
          limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
-        (resource == KERNEL_RLIMIT_STACK &&
-         limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
         resource >= KERNEL_RLIMIT_COUNT)
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     {
@@ -2552,7 +2550,7 @@ uint64_t kernel_task_current_memlock_limit(void)
 uint64_t kernel_task_current_stack_limit(void)
 {
     struct kernel_task *task = kernel_task_current();
-    if (!kernel_task_has_user_context(task)) return KERNEL_RLIMIT_STACK_CAP;
+    if (!kernel_task_has_user_context(task)) return KERNEL_RLIMIT_STACK_DEFAULT;
     return __atomic_load_n(&task->limits->values[KERNEL_RLIMIT_STACK].current,__ATOMIC_RELAXED);
 }
 

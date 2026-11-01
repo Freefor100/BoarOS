@@ -21,7 +21,7 @@ struct kernel_resource_limits *kernel_resource_limits_create(struct kernel_heap 
         for(unsigned i=0;i<KERNEL_RLIMIT_COUNT;i++)
             limits->values[i]=(struct kernel_rlimit64){KERNEL_RLIM_INFINITY,KERNEL_RLIM_INFINITY};
         limits->values[KERNEL_RLIMIT_CORE].current=0;
-        limits->values[KERNEL_RLIMIT_STACK]=(struct kernel_rlimit64){KERNEL_RLIMIT_STACK_CAP,KERNEL_RLIMIT_STACK_CAP};
+        limits->values[KERNEL_RLIMIT_STACK]=(struct kernel_rlimit64){KERNEL_RLIMIT_STACK_DEFAULT,KERNEL_RLIM_INFINITY};
         limits->values[KERNEL_RLIMIT_NOFILE]=(struct kernel_rlimit64){KERNEL_RLIMIT_NOFILE_CAP,KERNEL_RLIMIT_NOFILE_CAP};
         limits->values[KERNEL_RLIMIT_NPROC]=(struct kernel_rlimit64){4096,4096};
         limits->values[KERNEL_RLIMIT_SIGPENDING]=(struct kernel_rlimit64){KERNEL_RLIMIT_SIGPENDING_DEFAULT,KERNEL_RLIMIT_SIGPENDING_DEFAULT};

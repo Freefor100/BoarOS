@@ -47,11 +47,11 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 
 参数限制必须针对最终初始栈，而不只是字符串字节。`argc`、两个指针向量、NULL 分隔、auxv、`AT_EXECFN` 和 16 字节对齐都会消耗空间；若只限制字符串，攻击者仍可用大量空字符串扩大指针表。BoarOS 当前把整个序列化栈镜像限制为 128 KiB，因此这个值是项目实现边界，不等于 Linux 完整的 `ARG_MAX` 策略。
 
-虚拟地址预留与物理页提交是两件不同的事。先在用户地址上界下方保留一个较大的连续栈区间，可以阻止 ELF 段占据未来扩栈范围；初次只映射覆盖参数镜像和一段运行余量的后缀，则不会为每个进程立即消耗整个预留区对应的物理页。向下增长的栈应把永久 guard 放在预留区底部以下；若只把 guard 放在当前已提交页下方，未来扩栈时就必须移动 guard 并处理竞态。BoarOS 现以固定 8 MiB 栈 VMA 作为上限，reserve 内的用户 load/store fault 按 4 KiB 提交零页，底部以下 guard 没有 VMA，因而不会被扩展逻辑接受。
+虚拟地址布局与物理页提交是两件不同的事。栈的初始 VMA 覆盖参数及额外 128 KiB，只为实际初始内容和一段余量提交物理页；以后缺页按当前 `RLIMIT_STACK`、地址空间限额和前一映射检查，再扩展 VMA 并按需分配页面。有限的大栈限额影响 mmap 基址与栈的间隔，默认软限额为 8 MiB，硬限额为无限。
 
 ## BoarOS 当前选择
 
-通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，接受非 PIE `ET_EXEC`、PIE/无解释器 `ET_DYN` 以及非递归 `PT_INTERP`；`PT_DYNAMIC`、`PT_TLS` 和 GNU 扩展元数据保留在 source 中，供用户态动态链接器消费。它按页预检 W^X，建立 `ELF_PRIVATE` VMA，并按 FILE/COW、COMPOSITE 或 ZERO 规则在缺页时物化 `PT_LOAD`。入口要求 2 字节对齐并位于可执行文件字节；栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
+通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，接受非 PIE `ET_EXEC`、PIE/无解释器 `ET_DYN` 以及非递归 `PT_INTERP`；`PT_DYNAMIC`、`PT_TLS` 和 GNU 扩展元数据保留在 source 中，供用户态动态链接器消费。它按页预检 W^X，建立 `ELF_PRIVATE` VMA，并按 FILE/COW、COMPOSITE 或 ZERO 规则在缺页时物化 `PT_LOAD`。入口要求 2 字节对齐并位于可执行文件字节；初始参数、指针和对齐合计限制为 128 KiB，初始栈 VMA 再向下留出 128 KiB，实际预装最多 64 KiB 余量；后续按需增长，并与可访问的相邻映射保持 256 个架构页的间隔。LoongArch64 复用 ELF 和栈内容规则，使用 16 KiB 页及对应的三级页表。
 
 当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间。生产启动把已打开的 ext4 `/init` 转成不可变 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。source 由 MM/VMA 持有引用，重复映射不累积历史引用，fork 后子 MM 获得自己的引用；最后一个相关 VMA 消失时释放 source。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；scheduler 在提交点替换旧 MM。RISC-V image 同时建立独立随机或无任何混种材料时确定性降级的 PIE/解释器、mmap、brk、栈和 vDSO 布局，并在可用种子时把独立字节放入 `AT_RANDOM`。真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS；内核仍不执行重定位或分配 TLS，固定 glibc 五形态矩阵与 `getrandom` 已交付；更广动态 libc/DSO 仍需消费者证据。DTB 材料可支持早期非安全布局，但只有可信输入计数达到门槛才使 RNG ready，见[随机源](random-source.md)。
 

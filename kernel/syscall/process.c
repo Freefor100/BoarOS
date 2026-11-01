@@ -92,8 +92,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     if (task_status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if (new_address != 0U) {
         uint64_t capacity = resource == KERNEL_RLIMIT_NOFILE
-                                ? KERNEL_RLIMIT_NOFILE_CAP
-                                : resource == KERNEL_RLIMIT_STACK ? KERNEL_RLIMIT_STACK_CAP : KERNEL_RLIM_INFINITY;
+                                ? KERNEL_RLIMIT_NOFILE_CAP : KERNEL_RLIM_INFINITY;
         if (replacement.current > replacement.maximum) {
             decoded->value = -KERNEL_EINVAL;
             return KERNEL_SYSCALL_STATUS_OK;

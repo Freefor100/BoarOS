@@ -7,12 +7,15 @@
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/random.h>
+#include <kernel/rlimit.h>
+#include <kernel/vma.h>
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define KERNEL_ELF_STACK_RESERVE UINT64_C(0x800000)
+#define KERNEL_ELF_STACK_LAYOUT_HEADROOM KERNEL_RLIMIT_STACK_DEFAULT
 #define KERNEL_ELF_STACK_GUARD BOAROS_PAGE_SIZE
+#define KERNEL_ELF_STACK_GUARD_GAP (KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE)
 #define KERNEL_ELF_STACK_EXPAND UINT64_C(131072)
 #define KERNEL_ELF_STACK_HEADROOM UINT64_C(0x10000)
 #define KERNEL_ELF_STACK_IMAGE_LIMIT KERNEL_EXEC_STRING_LIMIT
@@ -805,6 +808,8 @@ enum kernel_elf_image_status kernel_elf_image_build(
     uint64_t interpreter_alignment;
     uint64_t random_value;
     uint64_t stack_limit;
+    uint64_t stack_request;
+    uint64_t mmap_gap;
     uint8_t stack_random[16];
     uint64_t image_ceiling;
     enum kernel_elf_image_status status;
@@ -818,12 +823,10 @@ enum kernel_elf_image_status kernel_elf_image_build(
         kernel_table->state != ARCH_MMU_STATE_ACTIVE) {
         return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
     }
-    stack_limit = request->stack_limit_valid != 0U
-                      ? request->stack_limit : KERNEL_ELF_STACK_RESERVE;
-    if (stack_limit > KERNEL_ELF_STACK_RESERVE)
-        stack_limit = KERNEL_ELF_STACK_RESERVE;
+    stack_request = request->stack_limit_valid != 0U
+                      ? request->stack_limit : KERNEL_RLIMIT_STACK_DEFAULT;
     /* Initial stack pages and the fault-time limit are page-granular. */
-    stack_limit &= ~BOAROS_PAGE_MASK;
+    stack_limit = stack_request & ~BOAROS_PAGE_MASK;
     main_header = kernel_elf64_source_header(request->executable_source);
     if (main_header == 0 ||
         main_header->machine != ARCH_ELF_MACHINE ||
@@ -882,23 +885,32 @@ enum kernel_elf_image_status kernel_elf_image_build(
     }
     base.stack_top = ARCH_MMU_USER_LIMIT -
                      random_value * BOAROS_PAGE_SIZE;
-    if (base.stack_top < KERNEL_ELF_STACK_RESERVE + KERNEL_ELF_STACK_GUARD +
+    if (base.stack_top < KERNEL_ELF_STACK_LAYOUT_HEADROOM + KERNEL_ELF_STACK_GUARD +
                              BOAROS_PAGE_SIZE) {
         base.stack_top = ARCH_MMU_USER_LIMIT -
-                         KERNEL_ELF_STACK_RESERVE - KERNEL_ELF_STACK_GUARD;
+                         KERNEL_ELF_STACK_LAYOUT_HEADROOM - KERNEL_ELF_STACK_GUARD;
     }
-    base.stack_base = base.stack_top - KERNEL_ELF_STACK_RESERVE;
+    if (stack_limit > base.stack_top - BOAROS_PAGE_SIZE)
+        stack_limit = base.stack_top - BOAROS_PAGE_SIZE;
+    base.stack_base = base.stack_top - KERNEL_ELF_STACK_LAYOUT_HEADROOM;
     base.stack_soft_base = base.stack_top - stack_limit;
     base.stack_guard = base.stack_base - KERNEL_ELF_STACK_GUARD;
-    if (base.stack_guard <= BOAROS_PAGE_SIZE + KERNEL_ELF_MMAP_GAP) {
+    mmap_gap = KERNEL_ELF_STACK_LAYOUT_HEADROOM + KERNEL_ELF_STACK_GUARD + KERNEL_ELF_MMAP_GAP;
+    if (stack_request != KERNEL_RLIM_INFINITY) {
+        uint64_t max_gap = (base.stack_top / 6 * 5) & ~BOAROS_PAGE_MASK;
+        uint64_t requested = stack_limit > max_gap - KERNEL_ELF_STACK_GUARD_GAP ?
+            max_gap : stack_limit + KERNEL_ELF_STACK_GUARD_GAP;
+        if (requested > mmap_gap) mmap_gap = requested;
+    }
+    if (base.stack_top <= BOAROS_PAGE_SIZE + mmap_gap) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     if (!random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, &random_value) ||
-        random_value > (base.stack_guard - KERNEL_ELF_MMAP_GAP) /
+        random_value > (base.stack_top - mmap_gap - BOAROS_PAGE_SIZE) /
                            BOAROS_PAGE_SIZE) {
         random_value = 0U;
     }
-    base.mmap_base = base.stack_guard - KERNEL_ELF_MMAP_GAP -
+    base.mmap_base = base.stack_top - mmap_gap -
                      random_value * BOAROS_PAGE_SIZE;
     /* Leave a nonempty heap interval and room for an ET_DYN interpreter.
      * Independent random draws must select legal holes, not occasionally

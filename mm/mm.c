@@ -138,7 +138,7 @@ struct kernel_mm_record {
     uint64_t retirement_batches, retired_pages, pin_waits;
     enum kernel_mm_record_stage stage;
     uint64_t start_code, end_code, start_stack;
-    uint64_t start_data, end_data, stack_top;
+    uint64_t start_data, end_data;
     uint64_t start_brk;
     uint64_t current_brk;
     uint64_t brk_limit;
@@ -1586,7 +1586,6 @@ static enum kernel_mm_status mm_fork_impl(
         destination_record->start_stack = source_record->start_stack;
         destination_record->start_data = source_record->start_data;
         destination_record->end_data = source_record->end_data;
-        destination_record->stack_top = source_record->stack_top;
         destination_record->start_brk = source_record->start_brk;
         destination_record->current_brk = source_record->current_brk;
         destination_record->brk_limit = source_record->brk_limit;
@@ -2264,7 +2263,6 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     vma.fault_policy = fault_policy;
     vma.backing = 0;
     status = status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
-    if (!status && role == KERNEL_VMA_ROLE_STACK) record->stack_top = end;
     return status;
 }
 
@@ -5214,18 +5212,26 @@ lookup:
         uint64_t page = address & ~BOAROS_PAGE_MASK;
         if (kernel_vma_set_next(record->vmas, page, &vma) ||
             vma.role != KERNEL_VMA_ROLE_STACK || !(vma.permissions & access) ||
-            !record->stack_top || record->stack_top < page ||
-            record->stack_top - page > KERNEL_RLIMIT_STACK_CAP ||
-            record->stack_top - page > kernel_task_current_stack_limit() ||
+            vma.end - page > kernel_task_current_stack_limit() ||
             !may_expand_current(record, &vma, vma.start - page) ||
             ((vma.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, vma.start - page))) {
             kernel_lock_release(&vma_guard);
             return KERNEL_MM_STATUS_NOT_MAPPED;
         }
         int overlaps;
-        /* 保持栈前的一页guard；下一VMA检索也阻止跨越已有映射。 */
+        /* Linux 栈增长与可访问的前一映射保留 256 个架构页的间隔。 */
         if (page < 2 * BOAROS_PAGE_SIZE ||
-            kernel_vma_set_overlaps(record->vmas, page - BOAROS_PAGE_SIZE, vma.start, &overlaps) || overlaps) {
+            kernel_vma_set_overlaps(record->vmas, page, vma.start, &overlaps) || overlaps) {
+            kernel_lock_release(&vma_guard);
+            return KERNEL_MM_STATUS_NOT_MAPPED;
+        }
+        struct kernel_vma previous;
+        enum kernel_vma_status prev_status = kernel_vma_set_previous(record->vmas, page, &previous);
+        if (prev_status != KERNEL_VMA_STATUS_OK && prev_status != KERNEL_VMA_STATUS_NOT_FOUND)
+            __builtin_trap();
+        if (prev_status == KERNEL_VMA_STATUS_OK && previous.role != KERNEL_VMA_ROLE_STACK &&
+            (previous.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)) &&
+            page - previous.end < KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE) {
             kernel_lock_release(&vma_guard);
             return KERNEL_MM_STATUS_NOT_MAPPED;
         }

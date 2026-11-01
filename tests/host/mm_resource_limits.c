@@ -709,8 +709,13 @@ int main(void)
     limits.data_soft=UINT64_MAX;
     assert(!kernel_mm_brk(&mm,0x10000,&result));
 
-    const uint64_t top=UINT64_C(0x1000000);
+    const uint64_t top=UINT64_C(0x4000000);
     assert(!kernel_mm_vma_insert_anon(&mm,top-2*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
+    stack_limit=2*P;
+    assert(!kernel_mm_mprotect(&mm,top-P,P,KERNEL_MM_READ));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,top-3*P,KERNEL_MM_WRITE));
+    assert(!kernel_mm_munmap(&mm,top-3*P,P));
+    assert(!kernel_mm_mprotect(&mm,top-P,P,RW));
     stack_limit=4*P; limits.address_space=3*P; limits.data_soft=1;
     CHECK(!kernel_mm_resolve_user_fault(&mm,top-3*P,KERNEL_MM_WRITE));
     struct kernel_mm_proc_memory snapshot;
@@ -725,7 +730,26 @@ int main(void)
     CHECK(kernel_mm_resolve_user_fault(&mm,top-4*P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
     assert(!kernel_mm_munmap(&mm,top-5*P,P));
     CHECK(!kernel_mm_resolve_user_fault(&mm,top-4*P,KERNEL_MM_WRITE));
-    CHECK(kernel_mm_resolve_user_fault(&mm,top-KERNEL_RLIMIT_STACK_CAP-P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    uint64_t stack_next=top-5*P, guard_gap=256*P;
+    assert(!map(stack_next-guard_gap,P,KERNEL_MM_READ,0));
+    CHECK(kernel_mm_resolve_user_fault(&mm,stack_next,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_munmap(&mm,stack_next-guard_gap,P));
+    assert(!map(stack_next-guard_gap-P,P,KERNEL_MM_READ,0));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,stack_next,KERNEL_MM_WRITE));
+    assert(!kernel_mm_munmap(&mm,stack_next,P));
+    assert(!kernel_mm_munmap(&mm,stack_next-guard_gap-P,P));
+    assert(!map(stack_next-2*P,P,0,0));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,stack_next,KERNEL_MM_WRITE));
+    assert(!kernel_mm_munmap(&mm,stack_next,P));
+    assert(!kernel_mm_munmap(&mm,stack_next-2*P,P));
+    stack_limit=UINT64_C(10)*1024*1024;
+    CHECK(kernel_mm_resolve_user_fault(&mm,top-stack_limit-P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    uint64_t stack_pages=physical_page_available(&pages);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,top-UINT64_C(9)*1024*1024,KERNEL_MM_WRITE));
+    CHECK(stack_pages-physical_page_available(&pages)<=4);
+    CHECK(!kernel_mm_vma_lookup(&mm,top-UINT64_C(9)*1024*1024,&vma) && vma.role==KERNEL_VMA_ROLE_STACK);
+    assert(!kernel_mm_munmap(&mm,top-UINT64_C(9)*1024*1024,UINT64_C(9)*1024*1024-4*P));
+    stack_limit=UINT64_MAX;
     /* 独立共享对象阻止VMA合并，验证一次保护不按碎片数重复完成TLB。 */
     for (unsigned i=0;i<32;i++) {
         assert(!map(BASE+i*P,P,RW,KERNEL_MM_MAP_SHARED));

@@ -137,6 +137,34 @@ static void build_case(uint16_t main_type,uint64_t main_address,uint16_t interpr
     fprintf(stderr,"ELF actual build main=%u interp=%u overlap=%d: OK\n",main_type,interpreter_type,overlap);
 }
 
+static void large_stack_layout(uint64_t limit)
+{
+    uint64_t before=physical_page_available(&pages);
+    unsigned char main_bytes[256];
+    struct kernel_elf64_source *main=source(main_bytes,2,0x40000000,0x31,0);
+    struct kernel_exec_string name={"/layout",7};
+    struct kernel_exec_image_request request={.executable_source=main,.executable=name,
+        .arguments=&name,.argument_count=1,.stack_limit_valid=1,.stack_limit=limit};
+    struct kernel_exec_image image={0};
+    enum kernel_elf_image_status result=kernel_elf_image_build(&request,&heap,&pages,&kernel,&image);
+    if(result) fprintf(stderr,"large stack limit=%llu image status=%d\n",(unsigned long long)limit,result);
+    assert(!result);
+    assert(!kernel_mm_context(&image.mm,&mm_test_context));
+    struct kernel_vma stack;
+    assert(!kernel_mm_vma_lookup(&image.mm,image.stack_pointer,&stack));
+    assert(stack.role==KERNEL_VMA_ROLE_STACK && stack.end-stack.start<1024*1024);
+    assert(!kernel_mm_resolve_user_fault(&image.mm,stack.end-9*1024*1024,KERNEL_MM_WRITE));
+    uint64_t mapped;
+    assert(!kernel_mm_mmap_anonymous(&image.mm,0,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,0,&mapped));
+    if (limit<stack.end/2) assert(stack.end-mapped>=limit);
+    assert(!kernel_mm_munmap(&image.mm,mapped,BOAROS_PAGE_SIZE));
+    mm_test_context=0;
+    assert(!kernel_mm_release(&image.mm));
+    assert(!kernel_elf64_source_release(&main));
+    assert(physical_page_available(&pages)==before && !physical_page_allocator_audit(&pages));
+}
+
 static void cleanup_transaction(void)
 {
     uint64_t before=physical_page_available(&pages);
@@ -201,6 +229,9 @@ int main(void)
     build_case(2,0x40000000,2,0x40000000,1);
     build_case(2,0x40000000,0,0,0);
     build_case(3,0x20000,3,0x10000,0);
+    large_stack_layout(UINT64_C(512)*1024*1024);
+    large_stack_layout(UINT64_MAX-4096);
+    large_stack_layout(UINT64_MAX);
     cleanup_transaction();
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);

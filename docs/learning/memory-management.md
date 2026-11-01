@@ -330,7 +330,7 @@ VMA 存在   + PTE 存在    -> 当前可由硬件翻译
 VMA 不存在 + active PTE 存在 -> 内核错误；撤销必须先让 PTE/TLB 失效再收紧 VMA
 ```
 
-BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。只读普通文件的 private mmap 使用 `FILE_PRIVATE`，VMA 保存文件页对齐 offset 并借用由 MM 独立持有的 OFD。ELF `PT_LOAD` 使用专用 `ELF_PRIVATE`：完整文件页从 page cache 取得并以 COW 发布，文件/BSS 边界页和纯 BSS 页由 fault 路径私有分配、清零和填充；MM 对 source 保留引用。其余合法页由真实 U-mode page fault 或当前 MM 的 uaccess 首次访问时提交。reserve 下方的一页 guard 没有 VMA，因此不会因“靠近栈”被隐式扩展。
+BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 初始覆盖参数及额外 128 KiB，PTE 只覆盖参数栈和最多 64 KiB 余量；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。只读普通文件的 private mmap 使用 `FILE_PRIVATE`，VMA 保存文件页对齐 offset 并借用由 MM 独立持有的 OFD。ELF `PT_LOAD` 使用专用 `ELF_PRIVATE`：完整文件页从 page cache 取得并以 COW 发布，文件/BSS 边界页和纯 BSS 页由 fault 路径私有分配、清零和填充；MM 对 source 保留引用。其余合法页由真实 U-mode page fault 或当前 MM 的 uaccess 首次访问时提交。栈向下增长时检查当前限额和相邻映射；与可访问的前一映射保持 256 个架构页的间隔。
 
 一次当前用户任务的页故障按互斥状态分类：
 

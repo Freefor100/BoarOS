@@ -246,13 +246,13 @@ def cpu_output(raw,cpus):
 
 MEMORY_CASES=('as-map','as-fixed','data-private','data-zero','data-fixed','protect-prefix',
     'protect-hole','remap-growth','remap-fixed','brk-same-page','shm-as','stack-initial',
-    'stack-as','stack-soft','file-shm-data','caller-limits','shared-admission','limit-abi','limit-thread-fork',
+    'stack-as','stack-soft','stack-large','stack-guard','file-shm-data','caller-limits','shared-admission','limit-abi','limit-thread-fork',
     'limit-exec','limit-nonleader-exec')
 def memory_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MEMORY ')]
     cases=[re.fullmatch(r'MEMORY CASE (\S+) PASS checks=([1-9][0-9]*)',line) for line in lines[:-1]]
     return (len(cases)==len(MEMORY_CASES) and all(cases) and
-        tuple(case[1] for case in cases)==MEMORY_CASES and lines[-1]=='MEMORY END cases=21 failures=0')
+        tuple(case[1] for case in cases)==MEMORY_CASES and lines[-1]=='MEMORY END cases=23 failures=0')
 
 def digest(path):
     with Path(path).open('rb') as stream:
