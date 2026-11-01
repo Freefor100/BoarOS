@@ -5153,7 +5153,7 @@ finish:
     return status;
 }
 static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_operation *operation,
-    uint64_t address, uint32_t access)
+    uint64_t address, uint32_t access, const struct kernel_vma *population_vma)
 {
     struct kernel_mm_record *record = operation->record;
     struct physical_page_allocator *allocator = record->space.allocator;
@@ -5164,14 +5164,23 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
         return KERNEL_MM_STATUS_NOT_MAPPED;
     if (!record->vmas) return KERNEL_MM_STATUS_NOT_MAPPED;
 
-    enum kernel_mm_status claim_status = mm_wait_range_claim(record, operation->mm, address);
-    if (claim_status != KERNEL_MM_STATUS_OK) return claim_status;
+    if (!population_vma) {
+        enum kernel_mm_status claim_status = mm_wait_range_claim(record, operation->mm, address);
+        if (claim_status != KERNEL_MM_STATUS_OK) return claim_status;
+    }
 
     enum kernel_vma_status vs;
     uint64_t generation = 0;
 #if BOAROS_MAX_CPUS > 1
 lookup:
 #endif
+    if (population_vma) {
+        /* The caller checked this anonymous page's range before taking the
+         * snapshot. Publication still rechecks the actual VMA and PTE. */
+        vma = *population_vma;
+        vs = KERNEL_VMA_STATUS_OK;
+        goto found;
+    }
     {
 #if BOAROS_MAX_CPUS > 1
         struct kernel_lock_guard vma_guard = {0};
@@ -5526,7 +5535,7 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
             kernel_lock_release(&vma_guard);
         }
         enum kernel_mm_status status = file ? mapped_file_fault(&operation, address, access) :
-            memory_fault(&operation, address, access);
+            memory_fault(&operation, address, access, 0);
         if (status != KERNEL_MM_STATUS_CONFLICT || current_pins(mm)) return status;
 #if BOAROS_COST_DIAGNOSTICS
         { KERNEL_RAW_SCOPE(guard, &operation.record->metadata); operation.record->fault_retries++; }
@@ -5860,16 +5869,27 @@ static int populate_locked(struct kernel_mm *mm, uint64_t start, uint64_t end)
     while (start < end) {
         if (!operation.guard.lock && mm_fault_operation_begin(mm, start, &operation)) return -KERNEL_EAGAIN;
         struct kernel_vma vma;
-        enum kernel_vma_status vs;
+        enum kernel_vma_status vs = KERNEL_VMA_STATUS_NOT_FOUND;
+        int conflict = 0;
         {
 #if BOAROS_MAX_CPUS > 1
             struct kernel_lock_guard vma_guard = {0};
             kernel_rwlock_read(&operation.record->vma_lock, &vma_guard);
+            {
+                KERNEL_RAW_SCOPE(metadata, &operation.record->metadata);
+                for (struct kernel_mm_range_claim *c = operation.record->range_claims; c; c = c->next)
+                    if (start >= c->start && start < c->end) { conflict = 1; break; }
+            }
 #endif
-            vs = kernel_vma_set_lookup(operation.record->vmas, start, &vma);
+            if (!conflict) vs = kernel_vma_set_lookup(operation.record->vmas, start, &vma);
 #if BOAROS_MAX_CPUS > 1
             kernel_lock_release(&vma_guard);
 #endif
+        }
+        if (conflict) {
+            enum kernel_mm_status claim = mm_wait_range_claim(operation.record, mm, start);
+            if (claim) return -KERNEL_ENOMEM;
+            continue;
         }
         if (vs != KERNEL_VMA_STATUS_OK) return -KERNEL_ENOMEM;
         if ((vma.flags & KERNEL_VMA_LOCK_MASK) != KERNEL_VMA_LOCKED) {
@@ -5886,7 +5906,8 @@ static int populate_locked(struct kernel_mm *mm, uint64_t start, uint64_t end)
             (vma.permissions & KERNEL_MM_READ) ? KERNEL_MM_READ : KERNEL_MM_EXECUTE;
         int file = vma.kind == KERNEL_VMA_KIND_FILE_SHARED || vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE;
         enum kernel_mm_status status = file ? mapped_file_fault(&operation, start, access) :
-            memory_fault(&operation, start, access);
+            memory_fault(&operation, start, access,
+                vma.kind == KERNEL_VMA_KIND_ANONYMOUS ? &vma : 0);
         if (status == KERNEL_MM_STATUS_CONFLICT && !current_pins(mm)) {
             mm_operation_end(&operation); pages = 0;
             fault_retry(operation.record, start);
